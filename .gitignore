@@ -1,3 +1,15 @@
 .zig-cache/
 zig-out/
 *.o
+*.bin
+*.iso
+*.elf
+limine/
+iso_root/
+user_bin/
+3rd/
+.sisyphus/
+asm_test*
+check_tss
+test
+test_asm9

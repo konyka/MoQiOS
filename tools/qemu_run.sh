@@ -1,0 +1,106 @@
+#!/bin/bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_DIR"
+
+KERNEL="zig-out/bin/moqi-kernel.elf"
+LIMINE_DIR="limine"
+ISO_DIR="iso_root"
+ISO_FILE="moqios.iso"
+
+# Check kernel exists
+if [ ! -f "$KERNEL" ]; then
+    echo "ERROR: Kernel not found at $KERNEL"
+    echo "Run 'zig build' first."
+    exit 1
+fi
+
+# Download Limine if needed
+if [ ! -d "$LIMINE_DIR" ]; then
+    echo "[limine] Downloading Limine v8.x..."
+    git clone https://github.com/limine-bootloader/limine.git \
+        --branch=v8.x-binary --depth=1 "$LIMINE_DIR" 2>/dev/null
+fi
+
+# Build limine utility if needed
+if [ ! -f "$LIMINE_DIR/limine" ]; then
+    echo "[limine] Building utility..."
+    make -C "$LIMINE_DIR" 2>/dev/null
+fi
+
+# Create ISO structure
+rm -rf "$ISO_DIR"
+mkdir -p "$ISO_DIR/boot/limine"
+mkdir -p "$ISO_DIR/EFI/BOOT"
+
+# Copy kernel and config
+cp "$KERNEL" "$ISO_DIR/boot/moqi-kernel.elf"
+cp limine.conf "$ISO_DIR/boot/limine/"
+
+USER_BIN_DIR="user_bin"
+rm -rf "$USER_BIN_DIR"
+mkdir -p "$USER_BIN_DIR"
+if [ -f "user/init.bin" ]; then
+    cp "user/init.bin" "$USER_BIN_DIR/init"
+else
+    echo "WARNING: user/init.bin not found, building anyway..."
+fi
+if [ -f "user/hello2.bin" ]; then
+    cp "user/hello2.bin" "$USER_BIN_DIR/hello2"
+fi
+if [ -d "$USER_BIN_DIR" ] && [ "$(ls -A $USER_BIN_DIR)" ]; then
+    ./tools/mkramdisk.sh "$USER_BIN_DIR" "$ISO_DIR/boot/ramdisk.bin"
+else
+    echo "WARNING: No user programs to package"
+fi
+
+# Copy Limine binaries
+cp "$LIMINE_DIR/limine-bios.sys" "$ISO_DIR/boot/limine/" 2>/dev/null || true
+cp "$LIMINE_DIR/limine-bios-cd.bin" "$ISO_DIR/boot/limine/" 2>/dev/null || true
+cp "$LIMINE_DIR/limine-uefi-cd.bin" "$ISO_DIR/boot/limine/" 2>/dev/null || true
+cp "$LIMINE_DIR/BOOTX64.EFI" "$ISO_DIR/EFI/BOOT/" 2>/dev/null || true
+
+# Create ISO
+if ! command -v xorriso &>/dev/null; then
+    echo "ERROR: xorriso not found. Install with:"
+    echo "  dnf install xorriso    # Fedora"
+    echo "  apt install xorriso     # Debian/Ubuntu"
+    exit 1
+fi
+
+xorriso -as mkisofs \
+    -b boot/limine/limine-bios-cd.bin \
+    -no-emul-boot -boot-load-size 4 -boot-info-table \
+    --efi-boot boot/limine/limine-uefi-cd.bin \
+    -efi-boot-part --efi-boot-image --protective-msdos-label \
+    "$ISO_DIR" -o "$ISO_FILE" 2>/dev/null
+
+# Install Limine BIOS stages
+"$LIMINE_DIR/limine" bios-install "$ISO_FILE" 2>/dev/null || true
+
+# Launch QEMU
+echo "========================================="
+echo " MoQiOS — Launching QEMU"
+echo " Press Ctrl-A X to exit"
+
+# GDB debug support
+QEMU_DEBUG_FLAGS=""
+if [ "${MOQI_DEBUG:-}" = "1" ]; then
+    QEMU_DEBUG_FLAGS="-s -S"
+    echo " GDB stub active on :1234"
+    echo " Connect: gdb zig-out/bin/moqi-kernel.elf -ex 'target remote :1234'"
+fi
+
+echo "========================================="
+
+qemu-system-x86_64 \
+    -M q35 \
+    -m 512M \
+    -cdrom "$ISO_FILE" \
+    -serial stdio \
+    -display none \
+    -no-reboot \
+    -no-shutdown \
+    ${QEMU_DEBUG_FLAGS}
