@@ -59,6 +59,9 @@ fi
 if [ -f "user/hello5.bin" ]; then
     cp "user/hello5.bin" "$USER_BIN_DIR/hello5"
 fi
+if [ -f "user/hello6.bin" ]; then
+    cp "user/hello6.bin" "$USER_BIN_DIR/hello6"
+fi
 if [ -d "$USER_BIN_DIR" ] && [ "$(ls -A $USER_BIN_DIR)" ]; then
     ./tools/mkramdisk.sh "$USER_BIN_DIR" "$ISO_DIR/boot/ramdisk.bin"
 else

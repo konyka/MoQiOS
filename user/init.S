@@ -189,6 +189,32 @@ _start:
     movq $12, %rdx
     syscall
 
+    # Spawn hello6 via syscall #5
+    movq $5, %rax
+    leaq hello6_name(%rip), %rdi
+    syscall
+
+    # Write "spawned hello6\n"
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn6_msg(%rip), %rsi
+    movq $15, %rdx
+    syscall
+
+    # Wait for hello6
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    # Write "hello6 done\n"
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done6_msg(%rip), %rsi
+    movq $12, %rdx
+    syscall
+
     # Exit with code 0
     movq $2, %rax
     xorq %rdi, %rdi
@@ -231,3 +257,10 @@ spawn5_msg:
     .ascii "spawned hello5\n"
 done5_msg:
     .ascii "hello5 done\n"
+hello6_name:
+    .ascii "hello6"
+    .byte 0
+spawn6_msg:
+    .ascii "spawned hello6\n"
+done6_msg:
+    .ascii "hello6 done\n"

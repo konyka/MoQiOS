@@ -57,6 +57,10 @@ export fn _start() callconv(.c) noreturn {
     idt.init();
     klog.log(.info, "IDT loaded");
 
+    // PS/2 keyboard driver
+    const keyboard = @import("drivers/keyboard.zig");
+    keyboard.init();
+
     // VGA text mode uses MMIO at 0xB8000 which may not be HHDM-mapped;
     // skip for now, rely on serial output instead
     klog.log(.info, "VGA skipped (serial-only mode)");

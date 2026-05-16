@@ -454,8 +454,16 @@ fn handleLapicTimer(frame: *InterruptFrame) void {
 /// Handle legacy PIC IRQ (IRQ 0-15).
 fn handleIrq(frame: *InterruptFrame, irq: u8) void {
     _ = frame;
-    _ = irq;
-    // Legacy PIC is masked in LAPIC mode; shouldn't get here
+    if (irq == 1) {
+        const keyboard = @import("../../drivers/keyboard.zig");
+        keyboard.handleInterrupt();
+    }
+    // Send EOI to both PIC chips for cascade
+    const io = @import("io.zig");
+    io.outb(0x20, 0x20); // EOI to master PIC
+    if (irq >= 8) {
+        io.outb(0xA0, 0x20); // EOI to slave PIC
+    }
 }
 
 fn writeHex(value: u64) void {
@@ -510,4 +518,27 @@ pub fn init() void {
         :
         : [idt_ptr] "r" (&idt_ptr),
     );
+
+    // Remap PIC: master IRQ 0-7 → vectors 32-39, slave IRQ 8-15 → vectors 40-47
+    const io = @import("io.zig");
+    // Mask all IRQs first
+    io.outb(0xA1, 0xFF);
+    io.outb(0x21, 0xFF);
+
+    // ICW1: start initialization in cascade mode
+    io.outb(0x20, 0x11);
+    io.outb(0xA0, 0x11);
+    // ICW2: vector offsets
+    io.outb(0x21, 32); // Master: IRQ 0-7 → INT 32-39
+    io.outb(0xA1, 40); // Slave:  IRQ 8-15 → INT 40-47
+    // ICW3: cascade wiring
+    io.outb(0x21, 0x04); // Master has slave on IRQ2
+    io.outb(0xA1, 0x02); // Slave cascade identity
+    // ICW4: 8086 mode
+    io.outb(0x21, 0x01);
+    io.outb(0xA1, 0x01);
+
+    // Unmask IRQ1 (keyboard) only, keep rest masked
+    io.outb(0x21, 0xFD); // Master: unmask IRQ1 only (bit 1 = 0)
+    io.outb(0xA1, 0xFF); // Slave: all masked
 }

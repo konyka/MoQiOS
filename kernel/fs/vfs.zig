@@ -81,7 +81,16 @@ pub const FdTable = struct {
 
         switch (desc.fd_type) {
             .none => return -1, // EBADF
-            .special => return 0, // stdin: no input for now
+            .special => {
+                // stdin (fd 0): read from keyboard buffer
+                if (fd == FD_STDIN) {
+                    const keyboard = @import("../drivers/keyboard.zig");
+                    const n = keyboard.read(buf[0..count]);
+                    return @intCast(n);
+                }
+                // stdout/stderr: write-only
+                return -1;
+            },
             .ramdisk_file => {
                 const remaining = desc.file_size - desc.offset;
                 if (remaining == 0) return 0; // EOF

@@ -183,6 +183,35 @@ pub fn build(b: *std.Build) void {
 
     b.getInstallStep().dependOn(&hello5_strip.step);
 
+    // --- hello6 user program (C, tests keyboard stdin read) ---
+    const hello6_elf = b.addSystemCommand(&.{
+        "zig", "cc",
+        "-target", "x86_64-freestanding-none",
+        "-static",
+        "-nostdlib",
+        "-ffreestanding",
+        "-O2",
+        "-mno-sse",
+        "-mno-sse2",
+        "-Wl,--gc-sections",
+        "-Wl,-z,norelro",
+        "-o",
+    });
+    hello6_elf.addArg("user/hello6.elf");
+    hello6_elf.addFileArg(b.path("user/hello6.c"));
+    hello6_elf.setName("compile hello6.c -> ELF");
+
+    const hello6_strip = b.addSystemCommand(&.{
+        "strip",
+        "-o",
+    });
+    hello6_strip.addArg("user/hello6.bin");
+    hello6_strip.addArg("user/hello6.elf");
+    hello6_strip.step.dependOn(&hello6_elf.step);
+    hello6_strip.setName("strip hello6.elf");
+
+    b.getInstallStep().dependOn(&hello6_strip.step);
+
     // Build and run in QEMU with Limine
     const run_step = b.step("run", "Build and run in QEMU");
     const run_cmd = b.addSystemCommand(&.{"./tools/qemu_run.sh"});
