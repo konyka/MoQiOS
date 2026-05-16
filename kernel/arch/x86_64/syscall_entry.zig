@@ -206,9 +206,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             const fd: u64 = frame.rdi;
             const buf: u64 = frame.rsi;
             const count: u64 = frame.rdx;
-            _ = fd;
-            syscallWrite(buf, count);
-            frame.rax = count;
+            syscallWrite(frame, fd, buf, count);
         },
         2 => {
             const status: u64 = frame.rdi;
@@ -243,6 +241,15 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         11 => {
             syscallClose(frame);
         },
+        12 => {
+            syscallMunmap(frame);
+        },
+        96 => {
+            syscallGettimeofday(frame);
+        },
+        228 => {
+            syscallClock_gettime(frame);
+        },
         else => {
             serial.writeString("[syscall] unknown syscall: 0x");
             writeHex(syscall_nr);
@@ -253,25 +260,34 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
 }
 
 /// Syscall #1: write(fd, buf, count)
-/// For M5, writes directly to serial (fd ignored).
-/// Uses copy_from_user for safe user memory access.
-fn syscallWrite(buf: u64, count: u64) void {
-    if (buf >= 0x0000_8000_0000_0000) return;
-    const end = buf + count;
-    if (end < buf or end > 0x0000_8000_0000_0000) return;
+/// Routes through VFS: stdout/stderr → serial, other fds → VFS write.
+fn syscallWrite(frame: *SyscallFrame, fd: u64, buf: u64, count: u64) void {
+    if (buf >= 0x0000_8000_0000_0000 or count > 0x7FFFFFFF) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+    const n: usize = @intCast(count);
 
-    const max_write: u64 = 4096;
-    const n: usize = @intCast(if (count > max_write) max_write else count);
-
-    // Copy to kernel buffer, then write to serial
+    // Copy from user space
     var kbuf: [256]u8 = undefined;
     const copy = @import("../../mm/copy_from_user.zig");
-    const copied = copy.copyFromUser(kbuf[0..], @ptrFromInt(buf), n);
-    if (copied == 0) return;
-
-    for (0..copied) |i| {
-        serial.writeByte(kbuf[i]);
+    const copied = copy.copyFromUser(kbuf[0..], @ptrFromInt(buf), if (n > 256) @as(usize, 256) else n);
+    if (copied == 0) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
     }
+
+    // stdout (1) and stderr (2) → serial
+    if (fd == 1 or fd == 2) {
+        for (0..copied) |i| {
+            serial.writeByte(kbuf[i]);
+        }
+        frame.rax = @intCast(copied);
+        return;
+    }
+
+    // Other fds: not yet supported for write
+    frame.rax = @bitCast(@as(i64, -1));
 }
 
 fn syscallExit(status: u64) void {
@@ -723,4 +739,69 @@ pub fn init() void {
     wrmsr(MSR_KERNEL_GS_BASE, @intFromPtr(&bsp_percpu));
 
     serial.writeString("[syscall] SYSCALL/SYSRET enabled, GSBase configured\n");
+}
+
+/// Syscall #12: munmap(addr, length)
+fn syscallMunmap(frame: *SyscallFrame) void {
+    const addr: u64 = frame.rdi;
+    const length: u64 = frame.rsi;
+    _ = addr;
+    _ = length;
+    // Stub: always succeed
+    frame.rax = 0;
+}
+
+/// Syscall #96: gettimeofday(tv, tz)
+/// RDI = pointer to struct timeval in user space, RSI = timezone (ignored)
+fn syscallGettimeofday(frame: *SyscallFrame) void {
+    const tv_ptr: u64 = frame.rdi;
+    _ = frame.rsi;
+
+    if (tv_ptr == 0 or tv_ptr >= 0x0000_8000_0000_0000) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    const tsc = @import("../../arch/x86_64/tsc.zig");
+    const ns = tsc.nanos();
+    const sec = ns / 1_000_000_000;
+    const usec = (ns % 1_000_000_000) / 1000;
+
+    // struct timeval { tv_sec: i64, tv_usec: i64 }
+    var tv_bytes: [16]u8 = undefined;
+    @memcpy(tv_bytes[0..8], @as([*]const u8, @ptrCast(&sec))[0..8]);
+    const usec_i64: i64 = @intCast(usec);
+    @memcpy(tv_bytes[8..16], @as([*]const u8, @ptrCast(&usec_i64))[0..8]);
+
+    const copy = @import("../../mm/copy_from_user.zig");
+    _ = copy.copyToUser(@ptrFromInt(tv_ptr), tv_bytes[0..16], 16);
+    frame.rax = 0;
+}
+
+/// Syscall #228: clock_gettime(clockid, tp)
+/// RDI = clockid, RSI = pointer to struct timespec in user space
+fn syscallClock_gettime(frame: *SyscallFrame) void {
+    const clockid: u64 = frame.rdi;
+    const tp_ptr: u64 = frame.rsi;
+    _ = clockid;
+
+    if (tp_ptr == 0 or tp_ptr >= 0x0000_8000_0000_0000) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    const tsc = @import("../../arch/x86_64/tsc.zig");
+    const ns = tsc.nanos();
+    const sec = ns / 1_000_000_000;
+    const nsec = ns % 1_000_000_000;
+
+    // struct timespec { tv_sec: i64, tv_nsec: i64 }
+    var ts_bytes: [16]u8 = undefined;
+    @memcpy(ts_bytes[0..8], @as([*]const u8, @ptrCast(&sec))[0..8]);
+    const nsec_i64: i64 = @intCast(nsec);
+    @memcpy(ts_bytes[8..16], @as([*]const u8, @ptrCast(&nsec_i64))[0..8]);
+
+    const copy = @import("../../mm/copy_from_user.zig");
+    _ = copy.copyToUser(@ptrFromInt(tp_ptr), ts_bytes[0..16], 16);
+    frame.rax = 0;
 }
