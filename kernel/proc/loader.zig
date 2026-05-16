@@ -52,6 +52,135 @@ const Elf64_Phdr = extern struct {
     p_align: u64,
 };
 
+// Auxiliary vector types (Linux ABI)
+const AT_NULL: u64 = 0;
+const AT_PHDR: u64 = 3;
+const AT_PHNUM: u64 = 5;
+const AT_PAGESZ: u64 = 6;
+const AT_ENTRY: u64 = 9;
+const AT_UID: u64 = 11;
+const AT_EUID: u64 = 12;
+const AT_GID: u64 = 13;
+const AT_EGID: u64 = 14;
+
+const Elf64_auxv_t = extern struct {
+    a_type: u64,
+    a_val: u64,
+};
+
+/// Information needed to build the initial user stack.
+const StackInfo = struct {
+    /// ELF program header table virtual address (0 for flat binaries).
+    phdr_addr: u64 = 0,
+    /// Number of program headers (0 for flat binaries).
+    phnum: u64 = 0,
+    /// Entry point virtual address.
+    entry: u64 = 0,
+};
+
+/// Build the initial user stack with argc/argv/envp/auxv per Linux x86_64 ABI.
+/// Writes directly to the physical stack page via HHDM.
+/// Returns the new RSP value for the user process.
+///
+/// Stack layout (high address to low, RSP points at argc):
+///   [string area: argv strings, env strings]  ← bottom of stack page
+///   ... padding to 16-byte alignment ...
+///   AT_NULL entry (16 bytes)
+///   auxv entries (16 bytes each)
+///   NULL (envp terminator, 8 bytes)
+///   envp pointers (8 bytes each, currently none)
+///   NULL (argv terminator, 8 bytes)
+///   argv[0..argc-1] pointers (8 bytes each)
+///   argc (8 bytes)                             ← RSP
+pub fn buildUserStack(
+    stack_phys: u64,
+    stack_top: u64,
+    program_name: []const u8,
+    info: StackInfo,
+) u64 {
+    // Access the stack page via HHDM
+    const page_base: [*]u8 = @ptrFromInt(hhdm.physToVirt(stack_phys));
+    const page_size: u64 = user_space.PAGE_SIZE;
+
+    // Phase 1: Write string data at the bottom of the stack page.
+    // Offset 0 = start of the page (lowest address).
+    var str_offset: u64 = 0;
+
+    // Write argv[0] = program name string
+    const argv0_offset = str_offset;
+    @memcpy(page_base[str_offset .. str_offset + program_name.len], program_name);
+    str_offset += program_name.len;
+    page_base[str_offset] = 0; // null terminator
+    str_offset += 1;
+
+    // Phase 2: Build the structure from the top of the page downward.
+    // We'll compute offsets relative to the start of the page, then
+    // convert to user-virtual addresses at the end.
+    var pos: u64 = page_size;
+
+    // Helper: push a u64 value (decrement pos by 8, write value)
+    const push64 = struct {
+        fn f(p: *u64, base: [*]u8, val: u64) void {
+            p.* -= 8;
+            @atomicStore(u64, @as(*u64, @ptrFromInt(@intFromPtr(base + p.*))), val, .monotonic);
+        }
+    }.f;
+
+    // AT_NULL entry (auxv terminator)
+    push64(&pos, page_base, 0); // a_val = 0
+    push64(&pos, page_base, AT_NULL); // a_type = AT_NULL
+
+    // auxv entries (pushed in reverse order)
+    // AT_EGID
+    push64(&pos, page_base, 0);
+    push64(&pos, page_base, AT_EGID);
+    // AT_GID
+    push64(&pos, page_base, 0);
+    push64(&pos, page_base, AT_GID);
+    // AT_EUID
+    push64(&pos, page_base, 0);
+    push64(&pos, page_base, AT_EUID);
+    // AT_UID
+    push64(&pos, page_base, 0);
+    push64(&pos, page_base, AT_UID);
+    // AT_ENTRY
+    push64(&pos, page_base, info.entry);
+    push64(&pos, page_base, AT_ENTRY);
+    // AT_PAGESZ
+    push64(&pos, page_base, page_size);
+    push64(&pos, page_base, AT_PAGESZ);
+    // AT_PHNUM
+    if (info.phnum > 0) {
+        push64(&pos, page_base, info.phnum);
+        push64(&pos, page_base, AT_PHNUM);
+    }
+    // AT_PHDR
+    if (info.phdr_addr != 0) {
+        push64(&pos, page_base, info.phdr_addr);
+        push64(&pos, page_base, AT_PHDR);
+    }
+
+    // envp terminator (no env vars yet)
+    push64(&pos, page_base, 0);
+
+    // argv terminator
+    push64(&pos, page_base, 0);
+
+    // argv[0] pointer — convert page-relative offset to user virtual address
+    const argv0_user_addr: u64 = stack_top - page_size + argv0_offset;
+    push64(&pos, page_base, argv0_user_addr);
+
+    // argc
+    push64(&pos, page_base, 1);
+
+    // Align RSP down to 16 bytes
+    pos &= ~@as(u64, 0xF);
+
+    // The user RSP is stack_top - (page_size - pos) = stack_top - page_size + pos
+    const user_rsp: u64 = stack_top - page_size + pos;
+    return user_rsp;
+}
+
 /// Load a program from ramdisk. Detects ELF vs flat binary automatically.
 pub fn loadProgram(name: []const u8, parent_tid: u32) ?u32 {
     const file = ramdisk.findFile(name) orelse {
@@ -235,10 +364,17 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
         return null;
     };
 
+    // Build initial user stack with argc/argv/auxv
+    const user_rsp = buildUserStack(stack_phys, user_space.USER_STACK_TOP, name, .{
+        .phdr_addr = 0, // TODO: compute from ELF segments
+        .phnum = ehdr.e_phnum,
+        .entry = ehdr.e_entry,
+    });
+
     // Create task with ELF entry point
     const new_task = task.createUserProcess(
         ehdr.e_entry,
-        user_space.USER_STACK_TOP,
+        user_rsp,
         user_pml4,
         parent_tid,
     ) orelse {
@@ -331,9 +467,14 @@ fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32) 
         return null;
     };
 
+    // Build initial user stack with argc/argv/auxv
+    const user_rsp = buildUserStack(stack_phys, user_space.USER_STACK_TOP, name, .{
+        .entry = user_space.USER_CODE_BASE,
+    });
+
     const new_task = task.createUserProcess(
         user_space.USER_CODE_BASE,
-        user_space.USER_STACK_TOP,
+        user_rsp,
         user_pml4,
         parent_tid,
     ) orelse {

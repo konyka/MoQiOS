@@ -154,6 +154,35 @@ pub fn build(b: *std.Build) void {
 
     b.getInstallStep().dependOn(&hello4_strip.step);
 
+    // --- hello5 user program (C, tests argc/argv) ---
+    const hello5_elf = b.addSystemCommand(&.{
+        "zig", "cc",
+        "-target", "x86_64-freestanding-none",
+        "-static",
+        "-nostdlib",
+        "-ffreestanding",
+        "-O2",
+        "-mno-sse",
+        "-mno-sse2",
+        "-Wl,--gc-sections",
+        "-Wl,-z,norelro",
+        "-o",
+    });
+    hello5_elf.addArg("user/hello5.elf");
+    hello5_elf.addFileArg(b.path("user/hello5.c"));
+    hello5_elf.setName("compile hello5.c -> ELF");
+
+    const hello5_strip = b.addSystemCommand(&.{
+        "strip",
+        "-o",
+    });
+    hello5_strip.addArg("user/hello5.bin");
+    hello5_strip.addArg("user/hello5.elf");
+    hello5_strip.step.dependOn(&hello5_elf.step);
+    hello5_strip.setName("strip hello5.elf");
+
+    b.getInstallStep().dependOn(&hello5_strip.step);
+
     // Build and run in QEMU with Limine
     const run_step = b.step("run", "Build and run in QEMU");
     const run_cmd = b.addSystemCommand(&.{"./tools/qemu_run.sh"});
