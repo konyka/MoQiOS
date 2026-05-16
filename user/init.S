@@ -96,11 +96,11 @@ _start:
     movq $15, %rdx
     syscall
 
-    # Wait for child to exit via syscall #6: waitpid(-1, NULL, 0)
-    # RDI = -1 (any child), RSI = NULL (don't write status), RDX = 0
+    # Wait for child to exit via syscall #6: waitpid(-1, &status, 0)
+    subq $8, %rsp
     movq $6, %rax
     movq $-1, %rdi
-    xorq %rsi, %rsi
+    movq %rsp, %rsi           # status_ptr on stack
     xorq %rdx, %rdx
     syscall
 

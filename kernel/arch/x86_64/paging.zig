@@ -159,6 +159,7 @@ fn ensureTable(pte: *PTE) !u64 {
     @memset(bytes[0..@sizeOf(PageTable)], 0);
     pte.* = .{ .present = true, .writable = true, .user = true };
     pte.setPhysAddr(phys);
+
     return phys;
 }
 

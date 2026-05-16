@@ -64,106 +64,49 @@ pub fn destroyUserSpace(pml4_phys: u64) void {
     const pml4_virt = hhdm.physToVirt(pml4_phys);
     const pml4: [*]u64 = @ptrFromInt(pml4_virt);
 
-    // Walk entries 0-255 (user space), free page tables and mapped pages
-    for (0..256) |i| {
-        const pdpe_entry = pml4[i];
-        if (pdpe_entry & paging.PRESENT == 0) continue;
-
-        const pdpt_phys = pdpe_entry & paging.ADDR_MASK;
-        if (pdpt_phys == 0) continue;
-        if (pdpt_phys < 512 * 4096) continue;
+    // Walk user-space entries (0-255) and free all allocated tables/pages
+    for (0..256) |pml4_idx| {
+        if (pml4[pml4_idx] & paging.PRESENT == 0) continue;
+        const pdpt_phys = pml4[pml4_idx] & paging.ADDR_MASK;
         const pdpt_virt = hhdm.physToVirt(pdpt_phys);
         const pdpt: [*]u64 = @ptrFromInt(pdpt_virt);
 
-        for (0..512) |j| {
-            const pd_entry = pdpt[j];
-            if (pd_entry & paging.PRESENT == 0) continue;
-            // Check for 1GB huge page
-            if (pd_entry & (1 << 7) != 0) continue;
+        for (0..512) |pdpt_idx| {
+            if (pdpt[pdpt_idx] & paging.PRESENT == 0) continue;
+            // Check for 1GB huge page in PDPT
+            if (pdpt[pdpt_idx] & (1 << 7) != 0) {
+                pmm.freePage(pdpt[pdpt_idx] & paging.ADDR_MASK);
+                continue;
+            }
 
-            const pd_phys = pd_entry & paging.ADDR_MASK;
-            if (pd_phys == 0) continue;
-            if (pd_phys < 512 * 4096) continue;
+            const pd_phys = pdpt[pdpt_idx] & paging.ADDR_MASK;
             const pd_virt = hhdm.physToVirt(pd_phys);
             const pd: [*]u64 = @ptrFromInt(pd_virt);
 
-            for (0..512) |k| {
-                const pt_entry = pd[k];
-                if (pt_entry & paging.PRESENT == 0) continue;
-                // Check for 2MB huge page
-                if (pt_entry & (1 << 7) != 0) {
-                    const page_phys = pt_entry & paging.ADDR_MASK;
-                    if (page_phys != 0) pmm.freePage(page_phys);
+            for (0..512) |pd_idx| {
+                if (pd[pd_idx] & paging.PRESENT == 0) continue;
+                // Check for 2MB huge page in PD
+                if (pd[pd_idx] & (1 << 7) != 0) {
+                    pmm.freePage(pd[pd_idx] & paging.ADDR_MASK);
                     continue;
                 }
 
-                const pt_phys = pt_entry & paging.ADDR_MASK;
-                if (pt_phys == 0) continue;
-                if (pt_phys < 512 * 4096) continue;
-
+                const pt_phys = pd[pd_idx] & paging.ADDR_MASK;
                 const pt_virt = hhdm.physToVirt(pt_phys);
                 const pt: [*]u64 = @ptrFromInt(pt_virt);
 
-                for (0..512) |l| {
-                    const page_entry = pt[l];
-                    if (page_entry & paging.PRESENT == 0) continue;
-
-                    // Free the mapped physical page
-                    const page_phys = page_entry & paging.ADDR_MASK;
-                    if (page_phys == 0) continue;
-                    if (page_phys < 512 * 4096) continue;
-                    pmm.freePage(page_phys);
+                for (0..512) |pt_idx| {
+                    if (pt[pt_idx] & paging.PRESENT == 0) continue;
+                    const page_phys = pt[pt_idx] & paging.ADDR_MASK;
+                    if (page_phys != 0 and page_phys >= 512 * 4096) pmm.freePage(page_phys);
                 }
-                // Free the page table page
                 pmm.freePage(pt_phys);
             }
-            // Free the page directory page
             pmm.freePage(pd_phys);
         }
-        // Free the PDPT page
         pmm.freePage(pdpt_phys);
     }
-
-    // Free the PML4 itself
     pmm.freePage(pml4_phys);
-}
-
-fn fmtHex(val: u64) []const u8 {
-    const chars = "0123456789abcdef";
-    var buf: [18]u8 = undefined;
-    buf[0..2].* = .{ '0', 'x' };
-    var k: usize = 2;
-    var started = false;
-    for (0..16) |i| {
-        const nibble = (val >> @intCast(60 - i * 4)) & 0xF;
-        if (nibble != 0 or started or i == 15) {
-            buf[k] = chars[@intCast(nibble)];
-            k += 1;
-            started = true;
-        }
-    }
-    return buf[0..k];
-}
-
-fn fmtInt(val: u64) []const u8 {
-    var buf: [20]u8 = undefined;
-    if (val == 0) {
-        buf[0] = '0';
-        return buf[0..1];
-    }
-    var v = val;
-    var i: usize = 0;
-    while (v > 0) : (v /= 10) {
-        buf[i] = @intCast(v % 10 + '0');
-        i += 1;
-    }
-    var j: usize = 0;
-    while (j < i / 2) : (j += 1) {
-        const tmp = buf[j];
-        buf[j] = buf[i - 1 - j];
-        buf[i - 1 - j] = tmp;
-    }
-    return buf[0..i];
 }
 
 /// Get the PML4 virtual address for a user space.

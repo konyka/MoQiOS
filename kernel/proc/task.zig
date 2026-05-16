@@ -16,7 +16,8 @@ const hhdm = @import("../mm/hhdm.zig");
 const serial = @import("../arch/x86_64/serial.zig");
 
 const PAGE_SIZE: u64 = 4096;
-const KERNEL_STACK_PAGES: u64 = 1; // 4KB — keep small, use small buffers in syscall handlers
+const KERNEL_STACK_PAGES: u64 = 4; // 16KB — syscall handlers can be deep, and loadProgram
+// allocates large arrays on the stack (e.g., code_pages[256]?u64 = 2KB).
 // NOTE: Pages are allocated via PMM and mapped contiguously via HHDM.
 // The stack grows downward from kernel_stack_top.
 
@@ -84,24 +85,23 @@ fn allocSlot() ?u32 {
 }
 
 /// Allocate a virtually-contiguous kernel stack.
+/// Allocate a virtually-contiguous kernel stack.
 /// Maps KERNEL_STACK_PAGES physical pages into the kernel address space
-/// at a contiguous virtual range.
+/// at a contiguous virtual range using the kernel PML4.
 fn allocKernelStack() ?u64 {
-    // For now, use HHDM mapping of a single page (KERNEL_STACK_PAGES must be 1-2).
-    // For larger stacks, we'd need a proper VM allocator.
-    // With 2 pages: allocate 2 phys pages and map them contiguously.
+    // Allocate first page — use its HHDM address as the base.
     const phys0 = pmm.allocPage() orelse return null;
-    if (KERNEL_STACK_PAGES <= 1) {
-        return hhdm.physToVirt(phys0);
-    }
-    const phys1 = pmm.allocPage() orelse {
-        pmm.freePage(phys0);
-        return null;
-    };
-
-    // Map both pages contiguously using the HHDM virtual address of the first page.
-    // This works because we map phys1 at virt0 + PAGE_SIZE in the kernel page table.
     const virt0 = hhdm.physToVirt(phys0);
+
+    if (KERNEL_STACK_PAGES <= 1) {
+        return virt0;
+    }
+
+    // For multi-page stacks, map additional pages contiguously after virt0.
+    // phys0 is already mapped via HHDM at virt0, but we need phys1..physN
+    // mapped at virt0+PAGE_SIZE..virt0+(N-1)*PAGE_SIZE.
+    // Note: these virtual addresses may not have HHDM mappings for those
+    // specific physical pages, so we must explicitly map them in the kernel PML4.
     const kernel_pml4 = paging.getKernelPml4();
     const flags = paging.MapFlags{
         .writable = true,
@@ -109,23 +109,74 @@ fn allocKernelStack() ?u64 {
         .no_execute = true,
         .global = true,
     };
-    paging.mapPage(kernel_pml4, virt0 + PAGE_SIZE, phys1, flags) catch {
-        pmm.freePage(phys1);
-        pmm.freePage(phys0);
-        return null;
-    };
+
+    // Allocate and map remaining pages
+    var phys_pages: [KERNEL_STACK_PAGES]?u64 = [_]?u64{null} ** KERNEL_STACK_PAGES;
+    phys_pages[0] = phys0;
+
+    var i: u64 = 1;
+    while (i < KERNEL_STACK_PAGES) : (i += 1) {
+        const phys = pmm.allocPage() orelse {
+            // Cleanup: free all allocated pages
+            for (0..i) |j| {
+                if (phys_pages[j]) |p| pmm.freePage(p);
+            }
+            // Unmap already-mapped pages from kernel PML4
+            for (1..i) |j| {
+                paging.unmapPage(kernel_pml4, virt0 + j * PAGE_SIZE);
+            }
+            return null;
+        };
+        phys_pages[i] = phys;
+        paging.mapPage(kernel_pml4, virt0 + i * PAGE_SIZE, phys, flags) catch {
+            pmm.freePage(phys);
+            // Cleanup
+            for (0..i) |j| {
+                if (phys_pages[j]) |p| pmm.freePage(p);
+            }
+            for (1..i) |j| {
+                paging.unmapPage(kernel_pml4, virt0 + j * PAGE_SIZE);
+            }
+            return null;
+        };
+    }
+
     return virt0;
 }
 
 /// Free a kernel stack allocated by allocKernelStack.
 fn freeKernelStack(stack_virt: u64) void {
     // For KERNEL_STACK_PAGES=1, the stack is a single HHDM-mapped page.
-    // Reverse the HHDM mapping to get the physical address directly.
-    // This avoids walking page tables (which may use huge pages from Limine).
+    // For multi-page stacks, page 0 is HHDM-mapped and pages 1+ are
+    // explicitly mapped in the kernel PML4. We track physical pages
+    // by walking the page table for pages 1+.
+    const kernel_pml4 = paging.getKernelPml4();
+    const pml4: [*]u64 = @ptrFromInt(hhdm.physToVirt(kernel_pml4));
+
     for (0..KERNEL_STACK_PAGES) |i| {
         const v = stack_virt + i * PAGE_SIZE;
-        const phys = hhdm.virtToPhys(v);
-        pmm.freePage(phys);
+        if (i == 0) {
+            // Page 0 is HHDM-mapped — use direct conversion
+            const phys = hhdm.virtToPhys(v);
+            pmm.freePage(phys);
+        } else {
+            // Pages 1+ were explicitly mapped via mapPage.
+            // Walk page table to find the physical address.
+            const pml4_idx = (v >> 39) & 0x1FF;
+            if (pml4[pml4_idx] & 1 == 0) continue;
+            const pdpt: [*]u64 = @ptrFromInt(hhdm.physToVirt(pml4[pml4_idx] & 0x000FFFFFFFFFF000));
+            const pdpt_idx = (v >> 30) & 0x1FF;
+            if (pdpt[pdpt_idx] & 1 == 0) continue;
+            const pd: [*]u64 = @ptrFromInt(hhdm.physToVirt(pdpt[pdpt_idx] & 0x000FFFFFFFFFF000));
+            const pd_idx = (v >> 21) & 0x1FF;
+            if (pd[pd_idx] & 1 == 0) continue;
+            const pt: [*]u64 = @ptrFromInt(hhdm.physToVirt(pd[pd_idx] & 0x000FFFFFFFFFF000));
+            const pt_idx = (v >> 12) & 0x1FF;
+            if (pt[pt_idx] & 1 == 0) continue;
+            const phys = pt[pt_idx] & 0x000FFFFFFFFFF000;
+            pmm.freePage(phys);
+            pt[pt_idx] = 0; // unmap
+        }
     }
 }
 

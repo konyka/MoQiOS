@@ -133,6 +133,12 @@ pub fn init(memmap: *const limine.MemmapResponse) void {
     serial.writeString(formatInt(&buf, total_pages));
     serial.writeString(", free: ");
     serial.writeString(formatInt(&buf, free_pages));
+    serial.writeString("\n[PMM] bitmap_phys=0x");
+    serial.writeString(formatHex(&buf, bitmap_phys));
+    serial.writeString(" metadata_pages=");
+    serial.writeString(formatInt(&buf, metadata_pages));
+    serial.writeString(" metadata_end=0x");
+    serial.writeString(formatHex(&buf, bitmap_phys + metadata_pages * PAGE_SIZE));
     serial.writeString("\n");
 
     klog.log(.info, "PMM initialized");
@@ -143,6 +149,10 @@ pub fn allocPage() ?u64 {
     var i: u64 = next_free_hint;
     while (i < total_pages) : (i += 1) {
         if (isBitSet(i)) {
+            if (ref_counts[i] > 0) {
+                clearBit(i);
+                continue;
+            }
             clearBit(i);
             ref_counts[i] = 1;
             free_pages -= 1;
@@ -153,6 +163,10 @@ pub fn allocPage() ?u64 {
     i = MIN_ALLOC_PAGE;
     while (i < next_free_hint) : (i += 1) {
         if (isBitSet(i)) {
+            if (ref_counts[i] > 0) {
+                clearBit(i);
+                continue;
+            }
             clearBit(i);
             ref_counts[i] = 1;
             free_pages -= 1;
