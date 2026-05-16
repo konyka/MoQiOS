@@ -128,6 +128,10 @@ export fn _start() callconv(.c) noreturn {
     const fat32 = @import("fs/fat32.zig");
     fat32.init();
 
+    // M8: e1000 NIC driver
+    const e1000 = @import("drivers/e1000.zig");
+    e1000.init();
+
     // M3: LAPIC timer — use LAPIC address from ACPI MADT, fallback to 0xFEE00000
     const lapic_addr = if (acpi.info.lapic_address != 0) acpi.info.lapic_address else 0xFEE00000;
     lapic.init(lapic_addr);
