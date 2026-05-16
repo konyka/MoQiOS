@@ -225,6 +225,24 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         5 => {
             syscallSpawn(frame);
         },
+        6 => {
+            syscallWaitpid(frame);
+        },
+        7 => {
+            syscallBrk(frame);
+        },
+        8 => {
+            syscallMmap(frame);
+        },
+        9 => {
+            syscallOpen(frame);
+        },
+        10 => {
+            syscallRead(frame);
+        },
+        11 => {
+            syscallClose(frame);
+        },
         else => {
             serial.writeString("[syscall] unknown syscall: 0x");
             writeHex(syscall_nr);
@@ -309,7 +327,18 @@ fn syscallSpawn(frame: *SyscallFrame) void {
 
     // Load the program from ramdisk
     const loader = @import("../../proc/loader.zig");
-    if (loader.loadProgram(name)) |task_idx| {
+    const sched = @import("../../proc/sched.zig");
+    const task_mod = @import("../../proc/task.zig");
+
+    // Get caller's TID for parent_tid
+    var caller_tid: u32 = 0;
+    if (sched.currentTaskIndex()) |idx| {
+        if (task_mod.getTask(idx)) |cur| {
+            caller_tid = cur.tid;
+        }
+    }
+
+    if (loader.loadProgram(name, caller_tid)) |task_idx| {
         const t = @import("../../proc/task.zig");
         if (t.getTask(task_idx)) |new_task| {
             frame.rax = new_task.tid;
@@ -320,6 +349,318 @@ fn syscallSpawn(frame: *SyscallFrame) void {
     serial.writeString("[spawn] failed\n");
     frame.rax = @bitCast(@as(i64, -1));
 }
+
+/// Syscall #6: waitpid(pid, status_ptr, options)
+/// RDI = pid (-1 for any child, >0 for specific child)
+/// RSI = pointer to i32 in user space to receive exit code
+/// RDX = options (bit 0 = WNOHANG)
+/// Returns child TID on success, 0 if WNOHANG and no child exited, -1 on error.
+fn syscallWaitpid(frame: *SyscallFrame) void {
+    const pid_raw: u64 = frame.rdi;
+    const status_ptr: u64 = frame.rsi;
+    _ = frame.rdx; // options — currently only supports WNOHANG-like behavior
+
+    // pid: -1 (any child) or >0 (specific child). Treat as signed i64.
+    const pid: i32 = if (pid_raw == @as(u64, @bitCast(@as(i64, -1))))
+        @as(i32, -1)
+    else if (pid_raw > 0x7FFFFFFF)
+        @as(i32, -1) // invalid — treat as any child
+    else
+        @intCast(pid_raw);
+
+    const sched_mod = @import("../../proc/sched.zig");
+    const task_mod = @import("../../proc/task.zig");
+
+    const cur_idx = sched_mod.currentTaskIndex() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    // Check if caller has any children at all
+    if (!task_mod.hasChildren(cur_idx)) {
+        frame.rax = @bitCast(@as(i64, -10)); // -ECHILD
+        return;
+    }
+
+    var exit_code: i32 = 0;
+    if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {
+        if (status_ptr != 0 and status_ptr < 0x0000_8000_0000_0000) {
+            const copy = @import("../../mm/copy_from_user.zig");
+            _ = copy.copyToUser(@ptrFromInt(status_ptr), @as([*]const u8, @ptrCast(&exit_code))[0..4], 4);
+        }
+        frame.rax = child_tid;
+    } else {
+        // No zombie child yet — busy-wait with hlt to yield CPU.
+        // Timer ticks will context-switch to other tasks.
+        asm volatile ("sti");
+        while (true) {
+            asm volatile ("hlt");
+            if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {
+                if (status_ptr != 0 and status_ptr < 0x0000_8000_0000_0000) {
+                    const copy = @import("../../mm/copy_from_user.zig");
+                    _ = copy.copyToUser(@ptrFromInt(status_ptr), @as([*]const u8, @ptrCast(&exit_code))[0..4], 4);
+                }
+                frame.rax = child_tid;
+                return;
+            }
+        }
+    }
+}
+
+/// Syscall #7: brk(addr)
+/// RDI = new program break address (0 = return current break)
+/// Returns new break on success, current break on failure.
+fn syscallBrk(frame: *SyscallFrame) void {
+    const addr: u64 = frame.rdi;
+    const sched_mod = @import("../../proc/sched.zig");
+    const task_mod = @import("../../proc/task.zig");
+
+    const cur_idx = sched_mod.currentTaskIndex() orelse {
+        frame.rax = 0;
+        return;
+    };
+    const cur = task_mod.getTask(cur_idx) orelse {
+        frame.rax = 0;
+        return;
+    };
+
+    // If addr == 0, just return current brk
+    if (addr == 0) {
+        frame.rax = cur.brk_current;
+        return;
+    }
+
+    // Validate: addr must be above code region and below user stack
+    const user_space = @import("../../mm/user_space.zig");
+    const code_end = user_space.USER_CODE_BASE + paging.PAGE_SIZE; // at least 1 page of code
+    if (addr < code_end) {
+        frame.rax = cur.brk_current;
+        return;
+    }
+    // Don't let brk grow into the stack region
+    const stack_base = user_space.USER_STACK_TOP - user_space.PAGE_SIZE;
+    if (addr >= stack_base) {
+        frame.rax = cur.brk_current;
+        return;
+    }
+
+    // Allocate pages between current brk and new addr
+    const old_page = (cur.brk_current + user_space.PAGE_SIZE - 1) / user_space.PAGE_SIZE;
+    const new_page = (addr + user_space.PAGE_SIZE - 1) / user_space.PAGE_SIZE;
+
+    const pmm_mod = @import("../../mm/pmm.zig");
+    const paging_mod = @import("../../arch/x86_64/paging.zig");
+
+    for (old_page..new_page) |p| {
+        const virt = p * user_space.PAGE_SIZE;
+        const phys = pmm_mod.allocPage() orelse {
+            // OOM — return current brk (partial allocation)
+            frame.rax = cur.brk_current;
+            return;
+        };
+        const flags = paging_mod.MapFlags{
+            .writable = true,
+            .user = true,
+            .no_execute = true,
+            .global = false,
+        };
+        paging_mod.mapPage(cur.page_table_phys, virt, phys, flags) catch {
+            pmm_mod.freePage(phys);
+            frame.rax = cur.brk_current;
+            return;
+        };
+    }
+
+    cur.brk_current = addr;
+    frame.rax = addr;
+}
+
+/// Syscall #8: mmap(addr, length, prot, flags, fd, offset)
+/// RDI = addr (hint, 0 = kernel chooses), RSI = length, RDX = prot,
+/// R10 = flags, R8 = fd (-1 for anonymous), R9 = offset
+/// For now: only supports MAP_ANONYMOUS | MAP_PRIVATE with addr=0.
+/// Returns mapped address or -1 on failure.
+fn syscallMmap(frame: *SyscallFrame) void {
+    _ = frame.rdi; // addr hint — not used, kernel chooses placement
+    const length: u64 = frame.rsi;
+    const prot: u64 = frame.rdx; // PROT_READ=1, PROT_WRITE=2, PROT_EXEC=4
+    const flags: u64 = frame.r10;
+    const fd: i64 = @bitCast(frame.r8);
+    _ = frame.r9; // offset
+
+    // Only support anonymous private mappings for now
+    const MAP_ANONYMOUS: u64 = 0x20;
+    const MAP_PRIVATE: u64 = 0x2;
+    if (flags & MAP_ANONYMOUS == 0 or flags & MAP_PRIVATE == 0 or fd != -1) {
+        frame.rax = @bitCast(@as(i64, -38)); // -ENOSYS
+        return;
+    }
+    if (length == 0) {
+        frame.rax = @bitCast(@as(i64, -22)); // -EINVAL
+        return;
+    }
+
+    const sched_mod = @import("../../proc/sched.zig");
+    const task_mod = @import("../../proc/task.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+    const cur = task_mod.getTask(cur_idx) orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    const user_space = @import("../../mm/user_space.zig");
+    const pmm_mod = @import("../../mm/pmm.zig");
+    const paging_mod = @import("../../arch/x86_64/paging.zig");
+
+    // Use brk_current as the allocation hint for where to place the mapping.
+    // Align up to page boundary and allocate from there.
+    const base = (cur.brk_current + user_space.PAGE_SIZE - 1) / user_space.PAGE_SIZE * user_space.PAGE_SIZE;
+    const num_pages = (length + user_space.PAGE_SIZE - 1) / user_space.PAGE_SIZE;
+
+    // Validate: don't overflow into stack
+    const stack_base = user_space.USER_STACK_TOP - user_space.PAGE_SIZE;
+    if (base + num_pages * user_space.PAGE_SIZE >= stack_base) {
+        frame.rax = @bitCast(@as(i64, -12)); // -ENOMEM
+        return;
+    }
+
+    // Allocate and map pages
+    for (0..num_pages) |p| {
+        const virt = base + p * user_space.PAGE_SIZE;
+        const phys = pmm_mod.allocPage() orelse {
+            // OOM — return what we have so far (partial mapping leaked, but OK for now)
+            frame.rax = @bitCast(@as(i64, -12));
+            return;
+        };
+        // Zero the page (security: don't leak kernel data)
+        const hhdm_mod = @import("../../mm/hhdm.zig");
+        const page_ptr: [*]u8 = @ptrFromInt(hhdm_mod.physToVirt(phys));
+        @memset(page_ptr[0..user_space.PAGE_SIZE], 0);
+
+        const writable = (prot & 2) != 0;
+        const executable = (prot & 4) != 0;
+        const map_flags = paging_mod.MapFlags{
+            .writable = writable,
+            .user = true,
+            .no_execute = !executable,
+            .global = false,
+        };
+        paging_mod.mapPage(cur.page_table_phys, virt, phys, map_flags) catch {
+            pmm_mod.freePage(phys);
+            frame.rax = @bitCast(@as(i64, -12));
+            return;
+        };
+    }
+
+    // Advance brk so subsequent allocations don't overlap
+    cur.brk_current = base + num_pages * user_space.PAGE_SIZE;
+    frame.rax = base;
+}
+
+/// Syscall #9: open(name, flags, mode)
+/// RDI = filename pointer in user space, RSI = flags, RDX = mode
+/// Returns fd on success, -1 on failure.
+fn syscallOpen(frame: *SyscallFrame) void {
+    const name_ptr: u64 = frame.rdi;
+    _ = frame.rsi; // flags (O_RDONLY etc — ignored, always read-only)
+    _ = frame.rdx; // mode
+
+    if (name_ptr >= 0x0000_8000_0000_0000 or name_ptr == 0) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    // Copy filename from user space
+    var name_buf: [256]u8 = undefined;
+    const copy = @import("../../mm/copy_from_user.zig");
+    const copied = copy.copyFromUser(name_buf[0..], @ptrFromInt(name_ptr), 255);
+    if (copied == 0) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+    name_buf[if (copied < 255) copied else 255] = 0;
+
+    // Find null terminator
+    var len: usize = 0;
+    while (len < copied and name_buf[len] != 0) : (len += 1) {}
+    const name = name_buf[0..len];
+
+    const sched_mod = @import("../../proc/sched.zig");
+    const task_mod = @import("../../proc/task.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+    const cur = task_mod.getTask(cur_idx) orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    const result = cur.fd_table.open(name);
+    frame.rax = @bitCast(result);
+}
+
+/// Syscall #10: read(fd, buf, count)
+/// RDI = fd, RSI = buffer pointer in user space, RDX = count
+/// Returns bytes read on success, 0 on EOF, -1 on error.
+fn syscallRead(frame: *SyscallFrame) void {
+    const fd: u32 = @intCast(frame.rdi);
+    const buf_ptr: u64 = frame.rsi;
+    const count: u64 = frame.rdx;
+
+    if (fd < 0 or buf_ptr >= 0x0000_8000_0000_0000) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    const sched_mod = @import("../../proc/sched.zig");
+    const task_mod = @import("../../proc/task.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+    const cur = task_mod.getTask(cur_idx) orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    // Read into a kernel buffer, then copy to user
+    var kbuf: [256]u8 = undefined;
+    const to_read = if (count > 256) @as(usize, 256) else @as(usize, @intCast(count));
+
+    const result = cur.fd_table.read(fd, &kbuf, to_read);
+    if (result > 0) {
+        const copy = @import("../../mm/copy_from_user.zig");
+        _ = copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..@intCast(result)], @intCast(result));
+    }
+    frame.rax = @bitCast(result);
+}
+
+/// Syscall #11: close(fd)
+/// RDI = fd
+/// Returns 0 on success, -1 on error.
+fn syscallClose(frame: *SyscallFrame) void {
+    const fd: u32 = @intCast(frame.rdi);
+
+    const sched_mod = @import("../../proc/sched.zig");
+    const task_mod = @import("../../proc/task.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+    const cur = task_mod.getTask(cur_idx) orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    const result = cur.fd_table.close(fd);
+    frame.rax = @bitCast(result);
+}
+
+const paging = @import("../../arch/x86_64/paging.zig");
 
 fn writeHex(value: u64) void {
     const hex = "0123456789abcdef";

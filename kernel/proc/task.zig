@@ -58,6 +58,15 @@ pub const Task = struct {
     user_entry: u64,
     /// User-space stack top (RSP for ring3).
     user_stack_top: u64,
+    /// TID of the parent process (0 if spawned by kernel). Used by waitpid.
+    parent_tid: u32,
+    /// Whether this task is waiting for a child to exit (for blocking waitpid).
+    waiting_for_child: bool,
+    /// Current program break (end of heap). 0 = not initialized.
+    /// brk syscall uses this to manage the heap region.
+    brk_current: u64,
+    /// Per-process file descriptor table.
+    fd_table: @import("../fs/vfs.zig").FdTable,
 };
 
 pub const MAX_TASKS: u32 = 64;
@@ -155,6 +164,10 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
         .is_user = false,
         .user_entry = 0,
         .user_stack_top = 0,
+        .parent_tid = 0,
+        .waiting_for_child = false,
+        .brk_current = 0,
+        .fd_table = @import("../fs/vfs.zig").FdTable.init(),
     };
 
     task_count += 1;
@@ -170,40 +183,68 @@ pub fn getTask(idx: u32) ?*Task {
 
 /// Mark the current task as exiting (zombie). Called from the task itself.
 /// The scheduler will skip zombie tasks. Use reapZombies() to free resources.
+/// If the parent is waiting (waitpid), unblock it so it can collect the exit code.
 pub fn exitTask(exit_code: i32) void {
     const sched = @import("sched.zig");
     const idx = sched.currentTaskIndex() orelse return;
     const t = getTask(idx) orelse return;
     t.exit_code = exit_code;
     t.state = .zombie;
+
+    // If parent is waiting for a child, unblock it
+    if (t.parent_tid != 0) {
+        if (findTaskByTid(t.parent_tid)) |parent_idx| {
+            const parent = getTask(parent_idx) orelse return;
+            if (parent.waiting_for_child) {
+                parent.waiting_for_child = false;
+                parent.state = .ready;
+            }
+        }
+    }
+
     asm volatile ("sti");
     while (true) {
         asm volatile ("hlt");
     }
 }
 
-/// Reap all zombie tasks — free their stacks and clear slots.
+/// Reap orphaned zombie tasks — those whose parent has already exited.
+/// Zombies with a living parent are left for waitpid() to collect.
 pub fn reapZombies() u32 {
-    const sched = @import("sched.zig");
-    const cur = sched.currentTaskIndex();
     var reaped: u32 = 0;
     for (0..MAX_TASKS) |i| {
         if (tasks[i]) |*t| {
-            if (t.state == .zombie) {
-                if (cur != null and cur.? == @as(u32, @intCast(i))) continue;
-                serial.writeString("[task] reaping zombie\n");
-                if (t.page_table_phys != 0) {
-                    @import("../mm/user_space.zig").destroyUserSpace(t.page_table_phys);
+            if (t.state != .zombie) continue;
+
+            // Check if parent is still alive
+            if (t.parent_tid != 0) {
+                if (findTaskByTid(t.parent_tid) != null) {
+                    // Parent still alive — leave for waitpid
+                    continue;
                 }
-                freeKernelStack(t.kernel_stack);
-                serial.writeString("[task] zombie reaped\n");
-                tasks[i] = null;
-                task_count -= 1;
-                reaped += 1;
+                // Parent gone — orphan, reap it
             }
+
+            if (t.page_table_phys != 0) {
+                @import("../mm/user_space.zig").destroyUserSpace(t.page_table_phys);
+            }
+            freeKernelStack(t.kernel_stack);
+            tasks[i] = null;
+            task_count -= 1;
+            reaped += 1;
         }
     }
     return reaped;
+}
+
+/// Find a task by its TID. Returns the task slot index or null.
+pub fn findTaskByTid(tid: u32) ?u32 {
+    for (0..MAX_TASKS) |i| {
+        if (tasks[i]) |t| {
+            if (t.tid == tid and t.state != .zombie) return @intCast(i);
+        }
+    }
+    return null;
 }
 
 /// Block a task — sets state to blocked. The scheduler will skip it.
@@ -235,6 +276,7 @@ pub fn createUserProcess(
     user_entry: u64,
     user_stack_top: u64,
     page_table_phys: u64,
+    parent_tid_val: u32,
 ) ?u32 {
     const slot = allocSlot() orelse {
         serial.writeString("[task] no free task slots\n");
@@ -266,8 +308,53 @@ pub fn createUserProcess(
         .is_user = true,
         .user_entry = user_entry,
         .user_stack_top = user_stack_top,
+        .parent_tid = parent_tid_val,
+        .waiting_for_child = false,
+        .brk_current = 0,
+        .fd_table = @import("../fs/vfs.zig").FdTable.init(),
     };
 
     task_count += 1;
     return slot;
+}
+
+/// Wait for a child process to exit. Returns the child's TID, or 0 if no
+/// child has exited yet (WNOHANG behavior). Writes the exit code to *status.
+/// pid == -1 means wait for any child; pid > 0 means wait for specific child.
+pub fn waitpid(parent_idx: u32, pid: i32, status: *i32) ?u32 {
+    const parent = getTask(parent_idx) orelse return null;
+    const parent_tid_val = parent.tid;
+
+    // Search for a matching zombie child
+    for (0..MAX_TASKS) |i| {
+        if (tasks[i]) |*t| {
+            if (t.parent_tid != parent_tid_val) continue;
+            if (t.state != .zombie) continue;
+            if (pid > 0 and t.tid != @as(u32, @intCast(pid))) continue;
+
+            // Found a zombie child — collect its exit code and reap it
+            status.* = t.exit_code;
+            const child_tid = t.tid;
+            if (t.page_table_phys != 0) {
+                @import("../mm/user_space.zig").destroyUserSpace(t.page_table_phys);
+            }
+            freeKernelStack(t.kernel_stack);
+            tasks[i] = null;
+            task_count -= 1;
+            return child_tid;
+        }
+    }
+    return null;
+}
+
+/// Check if the given task has any children (for waitpid validation).
+pub fn hasChildren(parent_idx: u32) bool {
+    const parent = getTask(parent_idx) orelse return false;
+    const parent_tid_val = parent.tid;
+    for (0..MAX_TASKS) |i| {
+        if (tasks[i]) |t| {
+            if (t.parent_tid == parent_tid_val) return true;
+        }
+    }
+    return false;
 }

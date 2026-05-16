@@ -11,7 +11,7 @@ const paging = @import("../arch/x86_64/paging.zig");
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 
-const PAGE_SIZE: u64 = 4096;
+pub const PAGE_SIZE: u64 = 4096;
 
 /// User-space virtual address layout:
 ///   0x0000_0000_0000_0000 - 0x0000_7FFF_FFFF_FFFF : user space (lower half)
