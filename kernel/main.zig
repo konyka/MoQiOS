@@ -97,6 +97,10 @@ export fn _start() callconv(.c) noreturn {
     // M2: DMA stubs
     dma.init();
 
+    // M6.0: PCI enumeration
+    const pci = @import("drivers/pci.zig");
+    pci.init();
+
     // M3: LAPIC timer — use LAPIC address from ACPI MADT, fallback to 0xFEE00000
     const lapic_addr = if (acpi.info.lapic_address != 0) acpi.info.lapic_address else 0xFEE00000;
     lapic.init(lapic_addr);
@@ -136,7 +140,7 @@ export fn _start() callconv(.c) noreturn {
     klog.log(.info, "Idle thread created");
 
     // M5.5: Load init program from ramdisk as the first user process (pid 1)
-    if (loader.loadProgram("init")) |task_idx| {
+    if (loader.loadProgram("init", 0)) |task_idx| {
         serial.writeString("[kernel] init launched as task ");
         var buf: [16]u8 = undefined;
         serial.writeString(formatInt(&buf, task_idx));
