@@ -62,6 +62,9 @@ fi
 if [ -f "user/hello6.bin" ]; then
     cp "user/hello6.bin" "$USER_BIN_DIR/hello6"
 fi
+if [ -f "user/hello7.bin" ]; then
+    cp "user/hello7.bin" "$USER_BIN_DIR/hello7"
+fi
 if [ -d "$USER_BIN_DIR" ] && [ "$(ls -A $USER_BIN_DIR)" ]; then
     ./tools/mkramdisk.sh "$USER_BIN_DIR" "$ISO_DIR/boot/ramdisk.bin"
 else
@@ -111,6 +114,9 @@ qemu-system-x86_64 \
     -M q35 \
     -m 512M \
     -cdrom "$ISO_FILE" \
+    -boot order=d \
+    -drive file=disk.img,format=raw,if=none,id=disk0 \
+    -device virtio-blk-pci,drive=disk0 \
     -serial stdio \
     -display none \
     -no-reboot \

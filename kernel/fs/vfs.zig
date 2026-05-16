@@ -23,18 +23,17 @@ pub const FD_STDERR: u32 = 2;
 pub const FdType = enum(u8) {
     none = 0,
     ramdisk_file = 1,
-    special = 2, // stdin/stdout/stderr — redirects to serial
+    special = 2,
+    fat32_file = 3,
 };
 
 /// Open file descriptor.
 pub const FileDescriptor = struct {
     fd_type: FdType = .none,
-    /// For ramdisk_file: offset into the file data for sequential reads.
     offset: u64 = 0,
-    /// For ramdisk_file: total file size.
     file_size: u64 = 0,
-    /// For ramdisk_file: pointer to the file data (kernel HHDM address).
     file_data: u64 = 0,
+    fat32_file_idx: u32 = 0,
 };
 
 /// Per-process FD table.
@@ -54,23 +53,40 @@ pub const FdTable = struct {
 
     /// Open a file by name. Returns fd index or -1 on failure.
     pub fn open(self: *FdTable, name: []const u8) i64 {
-        // Find a free FD (skip 0,1,2 reserved for stdio)
         var slot: u32 = 3;
         while (slot < MAX_FDS) : (slot += 1) {
             if (self.fds[slot].fd_type == .none) break;
         }
-        if (slot >= MAX_FDS) return -1; // EMFILE
+        if (slot >= MAX_FDS) return -1;
 
-        // Look up in ramdisk
-        const file = ramdisk.findFile(name) orelse return -1; // ENOENT
+        // Try ramdisk first
+        if (ramdisk.findFile(name)) |file| {
+            self.fds[slot] = .{
+                .fd_type = .ramdisk_file,
+                .offset = 0,
+                .file_size = file.size,
+                .file_data = @intFromPtr(file.data),
+            };
+            return @intCast(slot);
+        }
 
-        self.fds[slot] = .{
-            .fd_type = .ramdisk_file,
-            .offset = 0,
-            .file_size = file.size,
-            .file_data = @intFromPtr(file.data),
-        };
-        return @intCast(slot);
+        // Try FAT32 filesystem
+        const fat32 = @import("fat32.zig");
+        if (fat32.isActive()) {
+            const fi = fat32.openFile(name);
+            if (fi >= 0) {
+                const idx: u32 = @intCast(fi);
+                self.fds[slot] = .{
+                    .fd_type = .fat32_file,
+                    .offset = 0,
+                    .file_size = fat32.getFileSize(idx),
+                    .fat32_file_idx = idx,
+                };
+                return @intCast(slot);
+            }
+        }
+
+        return -1;
     }
 
     /// Read from a file descriptor into a kernel buffer.
@@ -93,12 +109,19 @@ pub const FdTable = struct {
             },
             .ramdisk_file => {
                 const remaining = desc.file_size - desc.offset;
-                if (remaining == 0) return 0; // EOF
+                if (remaining == 0) return 0;
                 const to_read = if (@as(u64, count) > remaining) @as(usize, @intCast(remaining)) else count;
                 const src: [*]const u8 = @ptrFromInt(desc.file_data + desc.offset);
                 @memcpy(buf[0..to_read], src[0..to_read]);
                 desc.offset += to_read;
                 return @intCast(to_read);
+            },
+            .fat32_file => {
+                if (desc.offset >= desc.file_size) return 0;
+                const fat32 = @import("fat32.zig");
+                const n = fat32.readFile(desc.fat32_file_idx, @intCast(desc.offset), buf, @intCast(count));
+                if (n > 0) desc.offset += @intCast(n);
+                return n;
             },
         }
     }

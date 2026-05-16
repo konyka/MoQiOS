@@ -105,6 +105,29 @@ export fn _start() callconv(.c) noreturn {
     const pci = @import("drivers/pci.zig");
     pci.init();
 
+    // M7: AHCI SATA driver
+    const ahci = @import("drivers/ahci.zig");
+    ahci.init();
+
+    // M7: Virtio-blk driver
+    const virtio_blk = @import("drivers/virtio_blk.zig");
+    virtio_blk.init();
+
+    // M7: Test block read
+    if (virtio_blk.hasActiveDisk()) {
+        const test_buf_phys = pmm.allocPage() orelse @panic("OOM");
+        const test_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(test_buf_phys));
+        const n = virtio_blk.readSectors(0, 1, test_buf);
+        if (n > 0) {
+            klog.log(.info, "Block device read OK");
+        }
+        pmm.freePage(test_buf_phys);
+    }
+
+    // M7: FAT32 filesystem
+    const fat32 = @import("fs/fat32.zig");
+    fat32.init();
+
     // M3: LAPIC timer — use LAPIC address from ACPI MADT, fallback to 0xFEE00000
     const lapic_addr = if (acpi.info.lapic_address != 0) acpi.info.lapic_address else 0xFEE00000;
     lapic.init(lapic_addr);

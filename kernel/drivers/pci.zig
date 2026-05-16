@@ -73,8 +73,8 @@ pub const PciDevice = struct {
 };
 
 /// List of discovered PCI devices.
-var devices: [MAX_PCI_DEVICES]PciDevice = undefined;
-var device_count: u32 = 0;
+pub var devices: [MAX_PCI_DEVICES]PciDevice = undefined;
+pub var device_count: u32 = 0;
 
 /// PCIe MMIO base address (from MCFG). 0 means use legacy I/O ports.
 var pcie_ecam_base: u64 = 0;

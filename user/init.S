@@ -189,29 +189,29 @@ _start:
     movq $12, %rdx
     syscall
 
-    # Spawn hello6 via syscall #5
+    # Spawn hello7 via syscall #5 (skip hello6 which blocks on keyboard)
     movq $5, %rax
-    leaq hello6_name(%rip), %rdi
+    leaq hello7_name(%rip), %rdi
     syscall
 
-    # Write "spawned hello6\n"
+    # Write "spawned hello7\n"
     movq $1, %rax
     movq $1, %rdi
-    leaq spawn6_msg(%rip), %rsi
+    leaq spawn7_msg(%rip), %rsi
     movq $15, %rdx
     syscall
 
-    # Wait for hello6
+    # Wait for hello7
     movq $6, %rax
     movq $-1, %rdi
     xorq %rsi, %rsi
     xorq %rdx, %rdx
     syscall
 
-    # Write "hello6 done\n"
+    # Write "hello7 done\n"
     movq $1, %rax
     movq $1, %rdi
-    leaq done6_msg(%rip), %rsi
+    leaq done7_msg(%rip), %rsi
     movq $12, %rdx
     syscall
 
@@ -264,3 +264,10 @@ spawn6_msg:
     .ascii "spawned hello6\n"
 done6_msg:
     .ascii "hello6 done\n"
+hello7_name:
+    .ascii "hello7"
+    .byte 0
+spawn7_msg:
+    .ascii "spawned hello7\n"
+done7_msg:
+    .ascii "hello7 done\n"
