@@ -93,6 +93,67 @@ pub fn build(b: *std.Build) void {
 
     b.getInstallStep().dependOn(&hello2_bin.step);
 
+    // --- hello3 user program ---
+    const hello3_obj = b.addSystemCommand(&.{
+        "zig", "cc",
+        "-target", "x86_64-freestanding-none",
+        "-c",
+        "-o",
+    });
+    hello3_obj.addArg("user/hello3.o");
+    hello3_obj.addFileArg(b.path("user/hello3.S"));
+    hello3_obj.setName("assemble hello3.S");
+
+    const hello3_elf = b.addSystemCommand(&.{
+        "ld.lld",
+        "-T", "user/user.ld",
+        "-o",
+    });
+    hello3_elf.addArg("user/hello3.elf");
+    hello3_elf.addArg("user/hello3.o");
+    hello3_elf.step.dependOn(&hello3_obj.step);
+    hello3_elf.setName("link hello3.elf");
+
+    const hello3_bin = b.addSystemCommand(&.{
+        "objcopy",
+        "-O", "binary",
+    });
+    hello3_bin.addArg("user/hello3.elf");
+    hello3_bin.addArg("user/hello3.bin");
+    hello3_bin.step.dependOn(&hello3_elf.step);
+    hello3_bin.setName("objcopy hello3 -> raw binary");
+
+    b.getInstallStep().dependOn(&hello3_bin.step);
+
+    // --- hello4 user program (C, compiled as ELF) ---
+    const hello4_elf = b.addSystemCommand(&.{
+        "zig", "cc",
+        "-target", "x86_64-freestanding-none",
+        "-static",
+        "-nostdlib",
+        "-ffreestanding",
+        "-O2",
+        "-mno-sse",
+        "-mno-sse2",
+        "-Wl,--gc-sections",
+        "-Wl,-z,norelro",
+        "-o",
+    });
+    hello4_elf.addArg("user/hello4.elf");
+    hello4_elf.addFileArg(b.path("user/hello4.c"));
+    hello4_elf.setName("compile hello4.c -> ELF");
+
+    const hello4_strip = b.addSystemCommand(&.{
+        "strip",
+        "-o",
+    });
+    hello4_strip.addArg("user/hello4.bin");
+    hello4_strip.addArg("user/hello4.elf");
+    hello4_strip.step.dependOn(&hello4_elf.step);
+    hello4_strip.setName("strip hello4.elf");
+
+    b.getInstallStep().dependOn(&hello4_strip.step);
+
     // Build and run in QEMU with Limine
     const run_step = b.step("run", "Build and run in QEMU");
     const run_cmd = b.addSystemCommand(&.{"./tools/qemu_run.sh"});

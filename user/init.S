@@ -96,6 +96,73 @@ _start:
     movq $15, %rdx
     syscall
 
+    # Wait for child to exit via syscall #6: waitpid(-1, NULL, 0)
+    # RDI = -1 (any child), RSI = NULL (don't write status), RDX = 0
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    # Write "child exited\n"
+    movq $1, %rax
+    movq $1, %rdi
+    leaq wait_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
+    # Spawn hello3 via syscall #5
+    movq $5, %rax
+    leaq hello3_name(%rip), %rdi
+    syscall
+
+    # Write "spawned hello3\n"
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn3_msg(%rip), %rsi
+    movq $15, %rdx
+    syscall
+
+    # Wait for hello3
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    # Write "hello3 done\n"
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done3_msg(%rip), %rsi
+    movq $12, %rdx
+    syscall
+
+    # Spawn hello4 via syscall #5
+    movq $5, %rax
+    leaq hello4_name(%rip), %rdi
+    syscall
+
+    # Write "spawned hello4\n"
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn4_msg(%rip), %rsi
+    movq $15, %rdx
+    syscall
+
+    # Wait for hello4
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    # Write "hello4 done\n"
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done4_msg(%rip), %rsi
+    movq $12, %rdx
+    syscall
+
     # Exit with code 0
     movq $2, %rax
     xorq %rdi, %rdi
@@ -115,3 +182,19 @@ hello2_name:
     .byte 0
 spawn_msg:
     .ascii "spawned hello2\n"
+wait_msg:
+    .ascii "child exited\n"
+hello3_name:
+    .ascii "hello3"
+    .byte 0
+spawn3_msg:
+    .ascii "spawned hello3\n"
+done3_msg:
+    .ascii "hello3 done\n"
+hello4_name:
+    .ascii "hello4"
+    .byte 0
+spawn4_msg:
+    .ascii "spawned hello4\n"
+done4_msg:
+    .ascii "hello4 done\n"
