@@ -244,6 +244,12 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         12 => {
             syscallMunmap(frame);
         },
+        22 => {
+            syscallPipe(frame);
+        },
+        33 => {
+            syscallDup2(frame);
+        },
         96 => {
             syscallGettimeofday(frame);
         },
@@ -268,7 +274,6 @@ fn syscallWrite(frame: *SyscallFrame, fd: u64, buf: u64, count: u64) void {
     }
     const n: usize = @intCast(count);
 
-    // Copy from user space
     var kbuf: [256]u8 = undefined;
     const copy = @import("../../mm/copy_from_user.zig");
     const copied = copy.copyFromUser(kbuf[0..], @ptrFromInt(buf), if (n > 256) @as(usize, 256) else n);
@@ -277,7 +282,6 @@ fn syscallWrite(frame: *SyscallFrame, fd: u64, buf: u64, count: u64) void {
         return;
     }
 
-    // stdout (1) and stderr (2) → serial
     if (fd == 1 or fd == 2) {
         for (0..copied) |i| {
             serial.writeByte(kbuf[i]);
@@ -286,7 +290,15 @@ fn syscallWrite(frame: *SyscallFrame, fd: u64, buf: u64, count: u64) void {
         return;
     }
 
-    // Other fds: not yet supported for write
+    const sched = @import("../../proc/sched.zig");
+    const task_mod = @import("../../proc/task.zig");
+    if (sched.currentTaskIndex()) |cur_idx| {
+        if (task_mod.getTask(cur_idx)) |cur| {
+            const result = cur.fd_table.write(@intCast(fd), &kbuf, copied);
+            frame.rax = @bitCast(result);
+            return;
+        }
+    }
     frame.rax = @bitCast(@as(i64, -1));
 }
 
@@ -804,4 +816,58 @@ fn syscallClock_gettime(frame: *SyscallFrame) void {
     const copy = @import("../../mm/copy_from_user.zig");
     _ = copy.copyToUser(@ptrFromInt(tp_ptr), ts_bytes[0..16], 16);
     frame.rax = 0;
+}
+
+/// Syscall #22: pipe(pipefd) — create a pipe
+/// RDI = pointer to int[2] in user space: [0]=read_fd, [1]=write_fd
+fn syscallPipe(frame: *SyscallFrame) void {
+    const pipefd_ptr: u64 = frame.rdi;
+    if (pipefd_ptr == 0 or pipefd_ptr >= 0x0000_8000_0000_0000) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    const sched = @import("../../proc/sched.zig");
+    const task_mod = @import("../../proc/task.zig");
+
+    if (sched.currentTaskIndex()) |cur_idx| {
+        if (task_mod.getTask(cur_idx)) |cur| {
+            const result = cur.fd_table.createPipe();
+            if (result < 0) {
+                frame.rax = @bitCast(@as(i64, -1));
+                return;
+            }
+            const read_fd: u32 = @intCast(result & 0xFFFF);
+            const write_fd: u32 = @intCast(@as(u64, @intCast(result)) >> 16);
+
+            // Write [read_fd, write_fd] to user memory
+            var pipefd_bytes: [8]u8 = undefined;
+            @memcpy(pipefd_bytes[0..4], @as([*]const u8, @ptrCast(&read_fd))[0..4]);
+            @memcpy(pipefd_bytes[4..8], @as([*]const u8, @ptrCast(&write_fd))[0..4]);
+
+            const copy = @import("../../mm/copy_from_user.zig");
+            _ = copy.copyToUser(@ptrFromInt(pipefd_ptr), pipefd_bytes[0..8], 8);
+            frame.rax = 0;
+            return;
+        }
+    }
+    frame.rax = @bitCast(@as(i64, -1));
+}
+
+/// Syscall #33: dup2(oldfd, newfd)
+/// RDI = oldfd, RSI = newfd
+fn syscallDup2(frame: *SyscallFrame) void {
+    const oldfd: u32 = @intCast(frame.rdi);
+    const newfd: u32 = @intCast(frame.rsi);
+
+    const sched = @import("../../proc/sched.zig");
+    const task_mod = @import("../../proc/task.zig");
+    if (sched.currentTaskIndex()) |cur_idx| {
+        if (task_mod.getTask(cur_idx)) |cur| {
+            const result = cur.fd_table.dup2(oldfd, newfd);
+            frame.rax = @bitCast(result);
+            return;
+        }
+    }
+    frame.rax = @bitCast(@as(i64, -1));
 }

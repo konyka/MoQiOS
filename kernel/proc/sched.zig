@@ -50,7 +50,17 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
     }
 
     const count = task.getTaskCount();
-    if (count <= 1) return;
+    if (count == 0) return;
+
+    if (current_idx) |ci| {
+        if (task.getTask(ci)) |ct| {
+            if (count == 1 and ct.state != .zombie and ct.state != .blocked) {
+                return;
+            }
+        } else {
+            current_idx = null;
+        }
+    }
 
     slice_remaining -|= 1;
     if (slice_remaining > 0) return;
@@ -103,12 +113,12 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
     current_idx = next_idx;
 
     if (new_task.page_table_phys != 0) {
-        if (old_task.page_table_phys != new_task.page_table_phys) {
-            asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
-                :
-                : [cr3] "r" (new_task.page_table_phys),
-                : .{ .rax = true, .memory = true });
-        }
+    if (old_task.page_table_phys != new_task.page_table_phys) {
+                asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
+                    :
+                    : [cr3] "r" (new_task.page_table_phys),
+                    : .{ .rax = true, .memory = true });
+            }
         gdt.setRsp0(new_task.kernel_stack_top);
         syscall_entry.getPerCpu().kernel_rsp = new_task.kernel_stack_top;
 
@@ -167,7 +177,6 @@ fn pickNext() ?u32 {
     var best_idx: ?u32 = null;
     var best_prio: u8 = 255;
 
-    // Scan all task slots, starting after current for round-robin fairness
     var scan_pos: u32 = start;
     var count: u32 = 0;
     while (count < task.MAX_TASKS) : (count += 1) {

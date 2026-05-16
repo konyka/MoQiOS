@@ -215,7 +215,36 @@ _start:
     movq $12, %rdx
     syscall
 
-    # Exit with code 0
+    # Spawn hello8 (pipe test)
+    movq $5, %rax
+    leaq hello8_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn8_msg(%rip), %rsi
+    movq $15, %rdx
+    syscall
+
+    # Wait for hello8
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done8_msg(%rip), %rsi
+    movq $12, %rdx
+    syscall
+
+    # Spawn shell (interactive, runs forever)
+    movq $5, %rax
+    leaq sh_name(%rip), %rdi
+    syscall
+
+    # If shell fails to spawn, just exit
     movq $2, %rax
     xorq %rdi, %rdi
     syscall
@@ -271,3 +300,13 @@ spawn7_msg:
     .ascii "spawned hello7\n"
 done7_msg:
     .ascii "hello7 done\n"
+hello8_name:
+    .ascii "hello8"
+    .byte 0
+spawn8_msg:
+    .ascii "spawned hello8\n"
+done8_msg:
+    .ascii "hello8 done\n"
+sh_name:
+    .ascii "sh"
+    .byte 0

@@ -240,6 +240,62 @@ pub fn build(b: *std.Build) void {
 
     b.getInstallStep().dependOn(&hello7_strip.step);
 
+    const hello8_elf = b.addSystemCommand(&.{
+        "zig", "cc",
+        "-target", "x86_64-freestanding-none",
+        "-static",
+        "-nostdlib",
+        "-ffreestanding",
+        "-O2",
+        "-mno-sse",
+        "-mno-sse2",
+        "-Wl,--gc-sections",
+        "-Wl,-z,norelro",
+        "-o",
+    });
+    hello8_elf.addArg("user/hello8.elf");
+    hello8_elf.addFileArg(b.path("user/hello8.c"));
+    hello8_elf.setName("compile hello8.c -> ELF");
+
+    const hello8_strip = b.addSystemCommand(&.{
+        "strip",
+        "-o",
+    });
+    hello8_strip.addArg("user/hello8.bin");
+    hello8_strip.addArg("user/hello8.elf");
+    hello8_strip.step.dependOn(&hello8_elf.step);
+    hello8_strip.setName("strip hello8.elf");
+
+    b.getInstallStep().dependOn(&hello8_strip.step);
+
+    const sh_elf = b.addSystemCommand(&.{
+        "zig", "cc",
+        "-target", "x86_64-freestanding-none",
+        "-static",
+        "-nostdlib",
+        "-ffreestanding",
+        "-O2",
+        "-mno-sse",
+        "-mno-sse2",
+        "-Wl,--gc-sections",
+        "-Wl,-z,norelro",
+        "-o",
+    });
+    sh_elf.addArg("user/sh.elf");
+    sh_elf.addFileArg(b.path("user/sh.c"));
+    sh_elf.setName("compile sh.c -> ELF");
+
+    const sh_strip = b.addSystemCommand(&.{
+        "strip",
+        "-o",
+    });
+    sh_strip.addArg("user/sh.bin");
+    sh_strip.addArg("user/sh.elf");
+    sh_strip.step.dependOn(&sh_elf.step);
+    sh_strip.setName("strip sh.elf");
+
+    b.getInstallStep().dependOn(&sh_strip.step);
+
     // Build and run in QEMU with Limine
     const run_step = b.step("run", "Build and run in QEMU");
     const run_cmd = b.addSystemCommand(&.{"./tools/qemu_run.sh"});
