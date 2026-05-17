@@ -253,6 +253,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         57 => {
             syscallFork(frame);
         },
+        59 => {
+            syscallExecve(frame);
+        },
         96 => {
             syscallGettimeofday(frame);
         },
@@ -960,6 +963,113 @@ fn syscallFork(frame: *SyscallFrame) void {
     serial.writeString("\n");
 
     frame.rax = child.tid;
+}
+
+/// Syscall #59: execve(filename) — replace current process with new program
+fn syscallExecve(frame: *SyscallFrame) void {
+    const name_ptr: u64 = frame.rdi;
+    if (name_ptr >= 0x0000_8000_0000_0000) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    var name_buf: [64]u8 = undefined;
+    const copy = @import("../../mm/copy_from_user.zig");
+    const copied = copy.copyFromUser(name_buf[0..], @ptrFromInt(name_ptr), 63);
+    if (copied == 0) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+    name_buf[if (copied < 63) copied else 63] = 0;
+    var len: usize = 0;
+    while (len < copied and name_buf[len] != 0) : (len += 1) {}
+    const name = name_buf[0..len];
+
+    serial.writeString("[execve] loading '");
+    serial.writeString(name);
+    serial.writeString("'\n");
+
+    const loader = @import("../../proc/loader.zig");
+    const result = loader.loadProgramForExec(name) orelse {
+        serial.writeString("[execve] failed\n");
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    const sched = @import("../../proc/sched.zig");
+    const task_mod = @import("../../proc/task.zig");
+    const user_space = @import("../../mm/user_space.zig");
+    const cur_idx = sched.currentTaskIndex() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+    const cur = task_mod.getTask(cur_idx) orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    if (cur.page_table_phys != 0) {
+        user_space.destroyUserSpace(cur.page_table_phys);
+    }
+
+    cur.page_table_phys = result.pml4;
+    cur.user_entry = result.entry;
+    cur.user_stack_top = result.stack_top;
+    cur.brk_current = result.brk;
+
+    asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
+        :
+        : [cr3] "r" (result.pml4),
+        : .{ .rax = true, .memory = true });
+    @import("../../arch/x86_64/gdt.zig").setRsp0(cur.kernel_stack_top);
+    getPerCpu().kernel_rsp = cur.kernel_stack_top;
+
+    const stack_top = cur.kernel_stack_top;
+    const frame_addr = stack_top - @sizeOf(@import("idt.zig").InterruptFrame);
+    const new_frame: *@import("idt.zig").InterruptFrame = @ptrFromInt(frame_addr);
+    const bytes: [*]u8 = @ptrCast(new_frame);
+    @memset(bytes[0..@sizeOf(@import("idt.zig").InterruptFrame)], 0);
+
+    new_frame.rip = result.entry;
+    new_frame.cs = 0x1B;
+    new_frame.rflags = 0x202;
+    new_frame.rsp = result.stack_top;
+    new_frame.ss = 0x23;
+    new_frame.vector = 0;
+    new_frame.error_code = 0;
+
+    cur.saved_rsp = frame_addr;
+    cur.started = true;
+
+    getPerCpu().saved_user_rsp = result.stack_top;
+
+    @import("../../proc/sched.zig").saved_stack_anchor = frame_addr;
+
+    asm volatile (
+        \\movq %[anchor], %%rsp
+        \\popq %%r15
+        \\popq %%r14
+        \\popq %%r13
+        \\popq %%r12
+        \\popq %%r11
+        \\popq %%r10
+        \\popq %%r9
+        \\popq %%r8
+        \\popq %%rbp
+        \\popq %%rdi
+        \\popq %%rsi
+        \\popq %%rdx
+        \\popq %%rcx
+        \\popq %%rbx
+        \\popq %%rax
+        \\addq $16, %%rsp
+        \\swapgs
+        \\iretq
+        :
+        : [anchor] "r" (frame_addr),
+        : .{ .memory = true }
+    );
+    unreachable;
 }
 
 fn cloneUserPages(parent_pml4_phys: u64) ?u64 {

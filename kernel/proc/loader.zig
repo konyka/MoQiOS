@@ -15,6 +15,13 @@ const paging = @import("../arch/x86_64/paging.zig");
 const user_space = @import("../mm/user_space.zig");
 const serial = @import("../arch/x86_64/serial.zig");
 
+pub const ExecResult = struct {
+    pml4: u64,
+    entry: u64,
+    stack_top: u64,
+    brk: u64,
+};
+
 // ELF64 structures
 const EI_NIDENT = 16;
 const ELF_MAGIC = 0x464C457F; // \x7fELF in little-endian
@@ -544,7 +551,6 @@ fn formatHex(buf: []u8, value: u64) []const u8 {
         buf[i] = if (nibble < 10) '0' + nibble else 'a' + nibble - 10;
         i += 1;
     }
-    // Reverse
     var j: usize = 0;
     while (j < i / 2) : (j += 1) {
         const tmp = buf[j];
@@ -552,4 +558,97 @@ fn formatHex(buf: []u8, value: u64) []const u8 {
         buf[i - 1 - j] = tmp;
     }
     return buf[0..i];
+}
+
+pub fn loadProgramForExec(name: []const u8) ?ExecResult {
+    const file = ramdisk.findFile(name) orelse return null;
+    const binary_size = file.size;
+    if (binary_size == 0 or binary_size > 4 * 1024 * 1024) return null;
+    if (binary_size < @sizeOf(Elf64_Ehdr)) return null;
+    if (!(file.data[0] == 0x7F and file.data[1] == 'E' and file.data[2] == 'L' and file.data[3] == 'F')) return null;
+
+    var ehdr_buf: [@sizeOf(Elf64_Ehdr)]u8 align(@alignOf(Elf64_Ehdr)) = undefined;
+    @memcpy(ehdr_buf[0..@sizeOf(Elf64_Ehdr)], file.data[0..@sizeOf(Elf64_Ehdr)]);
+    const ehdr: *const Elf64_Ehdr = @ptrCast(&ehdr_buf);
+
+    if (ehdr.e_ident[4] != 2 or ehdr.e_ident[5] != 1 or ehdr.e_machine != 0x3E) return null;
+    if (ehdr.e_type != 2 and ehdr.e_type != 3) return null;
+
+    const new_pml4 = user_space.createUserSpace() orelse return null;
+    var highest_addr: u64 = 0;
+    var success = true;
+    var loaded_segments: u32 = 0;
+    const phnum = ehdr.e_phnum;
+    const phentsize = ehdr.e_phentsize;
+    const phoff = ehdr.e_phoff;
+
+    for (0..phnum) |i| {
+        if (phoff + (i + 1) * phentsize > file.size) break;
+        var phdr_buf: [@sizeOf(Elf64_Phdr)]u8 align(@alignOf(Elf64_Phdr)) = undefined;
+        const start = phoff + i * phentsize;
+        const clen = @min(phentsize, @sizeOf(Elf64_Phdr));
+        @memcpy(phdr_buf[0..clen], file.data[start .. start + clen]);
+        if (clen < @sizeOf(Elf64_Phdr)) @memset(phdr_buf[clen..], 0);
+        const phdr: *const Elf64_Phdr = @ptrCast(&phdr_buf);
+        if (phdr.p_type != PT_LOAD) continue;
+
+        const seg_vaddr = phdr.p_vaddr;
+        const seg_filesz = phdr.p_filesz;
+        const seg_memsz = phdr.p_memsz;
+        const seg_offset = phdr.p_offset;
+        if (seg_vaddr >= 0x0000_8000_0000_0000) { success = false; break; }
+
+        const seg_start = seg_vaddr & ~(paging.PAGE_SIZE - 1);
+        const seg_end_page = (seg_vaddr + seg_memsz + paging.PAGE_SIZE - 1) & ~(paging.PAGE_SIZE - 1);
+        const num_pages = (seg_end_page - seg_start) / paging.PAGE_SIZE;
+        if (num_pages == 0 or num_pages > 512) continue;
+
+        for (0..num_pages) |p| {
+            const page_vaddr = seg_start + p * paging.PAGE_SIZE;
+            const phys = pmm.allocPage() orelse { success = false; break; };
+            const dst: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+            @memset(dst[0..paging.PAGE_SIZE], 0);
+
+            const ps = page_vaddr -| seg_vaddr;
+            const pe = ps + paging.PAGE_SIZE;
+            const fcs = if (ps < seg_filesz) ps else seg_filesz;
+            const fce = @min(pe, seg_filesz);
+            if (fce > fcs) {
+                const cl = fce - fcs;
+                const soff = seg_offset + fcs;
+                const poff: usize = if (page_vaddr < seg_vaddr) @intCast(seg_vaddr - page_vaddr) else 0;
+                if (soff + cl <= file.size) {
+                    @memcpy(dst[poff .. poff + cl], file.data[soff .. soff + cl]);
+                }
+            }
+            user_space.mapUserPage(new_pml4, page_vaddr, phys, true) catch { success = false; break; };
+        }
+        const seg_end = seg_vaddr + seg_memsz;
+        if (seg_end > highest_addr) highest_addr = seg_end;
+        loaded_segments += 1;
+    }
+
+    if (!success or loaded_segments == 0) {
+        user_space.destroyUserSpace(new_pml4);
+        return null;
+    }
+
+    const stack_phys = pmm.allocPage() orelse {
+        user_space.destroyUserSpace(new_pml4);
+        return null;
+    };
+    const user_stack_base = user_space.USER_STACK_TOP - paging.PAGE_SIZE;
+    user_space.mapUserPage(new_pml4, user_stack_base, stack_phys, true) catch {
+        user_space.destroyUserSpace(new_pml4);
+        return null;
+    };
+
+    const user_rsp = buildUserStack(stack_phys, user_space.USER_STACK_TOP, name, .{});
+
+    return ExecResult{
+        .pml4 = new_pml4,
+        .entry = ehdr.e_entry,
+        .stack_top = user_rsp,
+        .brk = highest_addr,
+    };
 }
