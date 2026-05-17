@@ -239,6 +239,29 @@ _start:
     movq $12, %rdx
     syscall
 
+    # Spawn hello9 (fork test)
+    movq $5, %rax
+    leaq hello9_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn9_msg(%rip), %rsi
+    movq $15, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done9_msg(%rip), %rsi
+    movq $12, %rdx
+    syscall
+
     # Spawn shell (interactive, runs forever)
     movq $5, %rax
     leaq sh_name(%rip), %rdi
@@ -307,6 +330,13 @@ spawn8_msg:
     .ascii "spawned hello8\n"
 done8_msg:
     .ascii "hello8 done\n"
+hello9_name:
+    .ascii "hello9"
+    .byte 0
+spawn9_msg:
+    .ascii "spawned hello9\n"
+done9_msg:
+    .ascii "hello9 done\n"
 sh_name:
     .ascii "sh"
     .byte 0

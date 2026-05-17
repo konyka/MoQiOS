@@ -38,7 +38,7 @@ pub const PipeBuffer = struct {
     ref_count: u32,
 };
 
-var pipes: [16]PipeBuffer = @splat(.{
+pub var pipes: [16]PipeBuffer = @splat(.{
     .buf = @splat(0),
     .head = 0,
     .tail = 0,
