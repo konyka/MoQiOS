@@ -162,7 +162,10 @@ MoQiOS/
 │   ├── qemu_run.sh      # QEMU launch script
 │   └── mkramdisk.sh     # Ramdisk packaging tool
 ├── boot/                # Limine boot configuration
-├── docs/                # Design documents
+├── docs/
+│   ├── moqios-architecture-current.md  # Current implementation architecture (Chinese)
+│   ├── moqios-design.md                # Long-term design goals (Chinese)
+│   └── moqios-implementation-plan.md   # Implementation plan (Chinese)
 ├── build.zig            # Build configuration
 └── kernel/linker.ld     # Kernel linker script
 ```

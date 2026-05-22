@@ -160,7 +160,10 @@ MoQiOS/
 │   ├── qemu_run.sh      # QEMU 启动脚本
 │   └── mkramdisk.sh     # ramdisk 打包工具
 ├── boot/                # Limine 引导配置
-├── docs/                # 设计文档
+├── docs/
+│   ├── moqios-architecture-current.md  # 当前实现架构 (中文)
+│   ├── moqios-design.md                # 长期设计目标 (中文)
+│   └── moqios-implementation-plan.md   # 实施计划 (中文)
 ├── build.zig            # 构建配置
 └── kernel/linker.ld     # 内核链接脚本
 ```
