@@ -100,6 +100,7 @@ pub const FileDescriptor = struct {
     file_data: u64 = 0,
     fat32_file_idx: u32 = 0,
     pipe_idx: u32 = 0,
+    writable: bool = false,
 };
 
 /// Per-process FD table.
@@ -118,28 +119,30 @@ pub const FdTable = struct {
     }
 
     /// Open a file by name. Returns fd index or -1 on failure.
-    pub fn open(self: *FdTable, name: []const u8) i64 {
+    pub fn open(self: *FdTable, name: []const u8, flags: u32) i64 {
         var slot: u32 = 3;
         while (slot < MAX_FDS) : (slot += 1) {
             if (self.fds[slot].fd_type == .none) break;
         }
         if (slot >= MAX_FDS) return -1;
 
-        // Try ramdisk first
+        const is_writable = (flags & 0x03) != 0;
+        const o_creat = (flags & 0x40) != 0;
+
         if (ramdisk.findFile(name)) |file| {
             self.fds[slot] = .{
                 .fd_type = .ramdisk_file,
                 .offset = 0,
                 .file_size = file.size,
                 .file_data = @intFromPtr(file.data),
+                .writable = is_writable,
             };
             return @intCast(slot);
         }
 
-        // Try FAT32 filesystem
         const fat32 = @import("fat32.zig");
         if (fat32.isActive()) {
-            const fi = fat32.openFile(name);
+            var fi = fat32.openFile(name);
             if (fi >= 0) {
                 const idx: u32 = @intCast(fi);
                 self.fds[slot] = .{
@@ -147,8 +150,24 @@ pub const FdTable = struct {
                     .offset = 0,
                     .file_size = fat32.getFileSize(idx),
                     .fat32_file_idx = idx,
+                    .writable = is_writable,
                 };
                 return @intCast(slot);
+            }
+
+            if (o_creat) {
+                fi = fat32.createFile(name);
+                if (fi >= 0) {
+                    const idx: u32 = @intCast(fi);
+                    self.fds[slot] = .{
+                        .fd_type = .fat32_file,
+                        .offset = 0,
+                        .file_size = 0,
+                        .fat32_file_idx = idx,
+                        .writable = true,
+                    };
+                    return @intCast(slot);
+                }
             }
         }
 
@@ -212,8 +231,18 @@ pub const FdTable = struct {
             .pipe_write => {
                 return pipeWrite(desc.pipe_idx, buf, count);
             },
-            .pipe_read => return -1, // can't write to read end
-            .ramdisk_file, .fat32_file => return -1, // no file write yet
+            .pipe_read => return -1,
+            .fat32_file => {
+                if (!desc.writable) return -1;
+                const fat32 = @import("fat32.zig");
+                const n = fat32.writeFile(desc.fat32_file_idx, @intCast(desc.offset), buf, @intCast(count));
+                if (n > 0) {
+                    desc.offset += @intCast(n);
+                    desc.file_size = fat32.getFileSize(desc.fat32_file_idx);
+                }
+                return n;
+            },
+            .ramdisk_file => return -1,
         }
     }
 

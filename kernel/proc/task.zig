@@ -16,7 +16,7 @@ const hhdm = @import("../mm/hhdm.zig");
 const serial = @import("../arch/x86_64/serial.zig");
 
 const PAGE_SIZE: u64 = 4096;
-const KERNEL_STACK_PAGES: u64 = 4; // 16KB — syscall handlers can be deep, and loadProgram
+const KERNEL_STACK_PAGES: u64 = 16;
 // allocates large arrays on the stack (e.g., code_pages[256]?u64 = 2KB).
 // NOTE: Pages are allocated via PMM and mapped contiguously via HHDM.
 // The stack grows downward from kernel_stack_top.
@@ -68,6 +68,32 @@ pub const Task = struct {
     brk_current: u64,
     /// Per-process file descriptor table.
     fd_table: @import("../fs/vfs.zig").FdTable,
+
+    /// Bitmask of pending signals (bit N = signal N+1 is pending).
+    /// Signals 1-31 supported. Bit 0 = SIGHUP (1), bit 30 = SIGUSR2 (31).
+    pending_signals: u32,
+
+    /// Signal mask — blocked signals (bit N = signal N+1 is blocked).
+    /// SIGKILL (9) and SIGSTOP (19) cannot be blocked.
+    signal_mask: u32,
+
+    /// Signal handler addresses. 0 = default (terminate for now).
+    /// Index 0 = signal 1 (SIGHUP), ..., index 30 = signal 31 (SIGUSR2).
+    signal_handlers: [31]u64,
+
+    /// Alternate signal stack base address (0 = not set, use user RSP).
+    sigaltstack_base: u64,
+
+    /// Alternate signal stack size.
+    sigaltstack_size: u64,
+
+    /// Environment variables (key=value pairs).
+    env_vars: [32][128]u8,
+    env_count: u32,
+
+    /// Current working directory (null-terminated, max 256 chars).
+    cwd: [256]u8,
+    cwd_len: u32,
 };
 
 pub const MAX_TASKS: u32 = 64;
@@ -219,7 +245,19 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
         .waiting_for_child = false,
         .brk_current = 0,
         .fd_table = @import("../fs/vfs.zig").FdTable.init(),
+.pending_signals = 0,
+.signal_mask = 0,
+.signal_handlers = @splat(0),
+.sigaltstack_base = 0,
+.sigaltstack_size = 0,
+.env_vars = @splat(@splat(0)),
+.env_count = 0,
+.cwd = @splat(0),
+.cwd_len = 0,
     };
+
+    tasks[slot].?.cwd[0] = '/';
+    tasks[slot].?.cwd_len = 1;
 
     task_count += 1;
     return slot;
@@ -363,7 +401,22 @@ pub fn createUserProcess(
         .waiting_for_child = false,
         .brk_current = 0,
         .fd_table = @import("../fs/vfs.zig").FdTable.init(),
+.pending_signals = 0,
+.signal_mask = 0,
+.signal_handlers = @splat(0),
+.sigaltstack_base = 0,
+.sigaltstack_size = 0,
+.env_vars = @splat(@splat(0)),
+.env_count = 0,
+.cwd = @splat(0),
+.cwd_len = 0,
     };
+
+    tasks[slot].?.cwd[0] = '/';
+    tasks[slot].?.cwd_len = 1;
+
+    const sig_mod = @import("signal.zig");
+    sig_mod.setupSigreturnTrampoline(page_table_phys);
 
     task_count += 1;
     return slot;

@@ -77,6 +77,30 @@ fi
 if [ -f "user/hello10.bin" ]; then
     cp "user/hello10.bin" "$USER_BIN_DIR/hello10"
 fi
+if [ -f "user/hello11.bin" ]; then
+    cp "user/hello11.bin" "$USER_BIN_DIR/hello11"
+fi
+if [ -f "user/hello12.bin" ]; then
+    cp "user/hello12.bin" "$USER_BIN_DIR/hello12"
+fi
+if [ -f "user/hello13.bin" ]; then
+    cp "user/hello13.bin" "$USER_BIN_DIR/hello13"
+fi
+if [ -f "user/hello14.bin" ]; then
+    cp "user/hello14.bin" "$USER_BIN_DIR/hello14"
+fi
+if [ -f "user/hello15.bin" ]; then
+    cp "user/hello15.bin" "$USER_BIN_DIR/hello15"
+fi
+if [ -f "user/hello16.bin" ]; then
+    cp "user/hello16.bin" "$USER_BIN_DIR/hello16"
+fi
+if [ -f "user/hello17.bin" ]; then
+    cp "user/hello17.bin" "$USER_BIN_DIR/hello17"
+fi
+if [ -f "user/hello18.bin" ]; then
+    cp "user/hello18.bin" "$USER_BIN_DIR/hello18"
+fi
 if [ -d "$USER_BIN_DIR" ] && [ "$(ls -A $USER_BIN_DIR)" ]; then
     ./tools/mkramdisk.sh "$USER_BIN_DIR" "$ISO_DIR/boot/ramdisk.bin"
 else
@@ -129,6 +153,8 @@ qemu-system-x86_64 \
     -boot order=d \
     -drive file=disk.img,format=raw,if=none,id=disk0 \
     -device virtio-blk-pci,drive=disk0 \
+    -netdev user,id=net0 \
+    -device e1000,netdev=net0 \
     -serial stdio \
     -display none \
     -no-reboot \

@@ -372,8 +372,17 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
         serial.writeString(")\n");
 
         const task_mod = @import("../../proc/task.zig");
-        task_mod.exitTask(139); // SIGSEGV-like exit code
-        return; // unreachable (exitTask doesn't return)
+        const sched_mod = @import("../../proc/sched.zig");
+        if (sched_mod.currentTaskIndex()) |idx| {
+            if (task_mod.getTask(idx)) |cur| {
+                if (cur.tid == 12) {
+                    serial.writeString("  [SEGFAULT from tid=12]\n");
+                }
+            }
+        }
+
+        task_mod.exitTask(139);
+        return;
     }
 
     // Path 4: Kernel-mode fault without guard — fatal

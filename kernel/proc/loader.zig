@@ -102,7 +102,7 @@ const StackInfo = struct {
 pub fn buildUserStack(
     stack_phys: u64,
     stack_top: u64,
-    program_name: []const u8,
+    argv: []const []const u8,
     info: StackInfo,
 ) u64 {
     // Access the stack page via HHDM
@@ -110,15 +110,18 @@ pub fn buildUserStack(
     const page_size: u64 = user_space.PAGE_SIZE;
 
     // Phase 1: Write string data at the bottom of the stack page.
-    // Offset 0 = start of the page (lowest address).
     var str_offset: u64 = 0;
+    var argv_offsets: [16]u64 = @splat(0);
 
-    // Write argv[0] = program name string
-    const argv0_offset = str_offset;
-    @memcpy(page_base[str_offset .. str_offset + program_name.len], program_name);
-    str_offset += program_name.len;
-    page_base[str_offset] = 0; // null terminator
-    str_offset += 1;
+    for (argv, 0..) |arg, i| {
+        if (i >= 16) break;
+        argv_offsets[i] = str_offset;
+        @memcpy(page_base[str_offset .. str_offset + arg.len], arg);
+        str_offset += arg.len;
+        page_base[str_offset] = 0;
+        str_offset += 1;
+    }
+    const argc = @min(argv.len, @as(usize, 16));
 
     // Phase 2: Build the structure from the top of the page downward.
     // We'll compute offsets relative to the start of the page, then
@@ -170,20 +173,29 @@ pub fn buildUserStack(
     // envp terminator (no env vars yet)
     push64(&pos, page_base, 0);
 
+    // Pad to ensure 16-byte alignment of final RSP.
+    {
+        const remaining_pushes: u64 = argc + 2;
+        const final_pos = pos - remaining_pushes * 8;
+        if (final_pos % 16 != 0) {
+            push64(&pos, page_base, 0);
+        }
+    }
+
     // argv terminator
     push64(&pos, page_base, 0);
 
-    // argv[0] pointer — convert page-relative offset to user virtual address
-    const argv0_user_addr: u64 = stack_top - page_size + argv0_offset;
-    push64(&pos, page_base, argv0_user_addr);
+    // argv pointers (in reverse order)
+    var ai: usize = argc;
+    while (ai > 0) {
+        ai -= 1;
+        const arg_user_addr: u64 = stack_top - page_size + argv_offsets[ai];
+        push64(&pos, page_base, arg_user_addr);
+    }
 
     // argc
-    push64(&pos, page_base, 1);
+    push64(&pos, page_base, argc);
 
-    // Align RSP down to 16 bytes
-    pos &= ~@as(u64, 0xF);
-
-    // The user RSP is stack_top - (page_size - pos) = stack_top - page_size + pos
     const user_rsp: u64 = stack_top - page_size + pos;
     return user_rsp;
 }
@@ -372,7 +384,7 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
     };
 
     // Build initial user stack with argc/argv/auxv
-    const user_rsp = buildUserStack(stack_phys, user_space.USER_STACK_TOP, name, .{
+    const user_rsp = buildUserStack(stack_phys, user_space.USER_STACK_TOP, &.{name}, .{
         .phdr_addr = 0, // TODO: compute from ELF segments
         .phnum = ehdr.e_phnum,
         .entry = ehdr.e_entry,
@@ -475,7 +487,7 @@ fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32) 
     };
 
     // Build initial user stack with argc/argv/auxv
-    const user_rsp = buildUserStack(stack_phys, user_space.USER_STACK_TOP, name, .{
+    const user_rsp = buildUserStack(stack_phys, user_space.USER_STACK_TOP, &.{name}, .{
         .entry = user_space.USER_CODE_BASE,
     });
 
@@ -560,7 +572,7 @@ fn formatHex(buf: []u8, value: u64) []const u8 {
     return buf[0..i];
 }
 
-pub fn loadProgramForExec(name: []const u8) ?ExecResult {
+pub fn loadProgramForExec(name: []const u8, argv: []const []const u8) ?ExecResult {
     const file = ramdisk.findFile(name) orelse return null;
     const binary_size = file.size;
     if (binary_size == 0 or binary_size > 4 * 1024 * 1024) return null;
@@ -598,6 +610,10 @@ pub fn loadProgramForExec(name: []const u8) ?ExecResult {
         const seg_offset = phdr.p_offset;
         if (seg_vaddr >= 0x0000_8000_0000_0000) { success = false; break; }
 
+        const seg_flags = phdr.p_flags;
+        const seg_writable = (seg_flags & 0x2) != 0;
+        const seg_executable = (seg_flags & 0x1) != 0;
+
         const seg_start = seg_vaddr & ~(paging.PAGE_SIZE - 1);
         const seg_end_page = (seg_vaddr + seg_memsz + paging.PAGE_SIZE - 1) & ~(paging.PAGE_SIZE - 1);
         const num_pages = (seg_end_page - seg_start) / paging.PAGE_SIZE;
@@ -621,7 +637,14 @@ pub fn loadProgramForExec(name: []const u8) ?ExecResult {
                     @memcpy(dst[poff .. poff + cl], file.data[soff .. soff + cl]);
                 }
             }
-            user_space.mapUserPage(new_pml4, page_vaddr, phys, true) catch { success = false; break; };
+            // Map with correct permissions: code pages must NOT have NX bit set
+            const map_flags = paging.MapFlags{
+                .writable = seg_writable,
+                .user = true,
+                .no_execute = !seg_executable,
+                .global = false,
+            };
+            paging.mapPage(new_pml4, page_vaddr, phys, map_flags) catch { success = false; break; };
         }
         const seg_end = seg_vaddr + seg_memsz;
         if (seg_end > highest_addr) highest_addr = seg_end;
@@ -643,7 +666,16 @@ pub fn loadProgramForExec(name: []const u8) ?ExecResult {
         return null;
     };
 
-    const user_rsp = buildUserStack(stack_phys, user_space.USER_STACK_TOP, name, .{});
+    const user_rsp = buildUserStack(stack_phys, user_space.USER_STACK_TOP, argv, .{});
+
+    {
+        var buf2: [32]u8 = undefined;
+        serial.writeString("[loader-exec] entry=0x");
+        serial.writeString(formatHex(&buf2, ehdr.e_entry));
+        serial.writeString(" phnum=");
+        serial.writeString(formatInt(&buf2, ehdr.e_phnum));
+        serial.writeString("\n");
+    }
 
     return ExecResult{
         .pml4 = new_pml4,

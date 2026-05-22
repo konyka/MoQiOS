@@ -143,6 +143,14 @@ pub fn getFileCount() u32 {
     return state.file_count;
 }
 
+pub fn getFileName(index: u32) ?[]const u8 {
+    if (!state.initialized or index >= state.file_count) return null;
+    const entry_base = state.base + state.entries_off + @as(u64, index) * 80;
+    const entry_name: [*]const u8 = entry_base;
+    const entry_name_len = stdStrnLen(entry_name, MAX_NAME_LEN);
+    return entry_name[0..entry_name_len];
+}
+
 // --- Helpers (no stdlib) ---
 
 fn stdMemEqual(a: []const u8, b: []const u8) bool {

@@ -85,6 +85,16 @@ pub const Personality = enum(u8) {
     windows = 2,
 };
 
+pub const ExecResult = extern struct {
+    pending: u64,
+    new_entry: u64,
+    new_stack: u64,
+};
+
+export var exec_result: ExecResult = .{ .pending = 0, .new_entry = 0, .new_stack = 0 };
+
+export var fork_parent_ret: u64 = 0;
+
 /// Single BSP per-cpu data (single-core for now).
 var bsp_percpu: PerCpu = .{
     .kernel_rsp = 0,
@@ -168,6 +178,13 @@ pub fn syscallEntry() callconv(.naked) void {
         \\// Restore RSP (scheduler may have switched stacks via interrupt)
         \\movq %%rbp, %%rsp
         \\
+        \\movq fork_parent_ret(%%rip), %%rax
+        \\testq %%rax, %%rax
+        \\jz 4f
+        \\movq %%rax, (%%rsp)
+        \\movq $0, fork_parent_ret(%%rip)
+        \\4:
+        \\
         \\// Pop GPRs
         \\popq %%rax
         \\popq %%rbx
@@ -185,8 +202,23 @@ pub fn syscallEntry() callconv(.naked) void {
         \\popq %%r14
         \\popq %%r15
         \\
-        \\// Restore user RSP from PerCpu.saved_user_rsp (offset 8)
+        \\// Save return value (RAX) before exec_result check clobbers registers
+        \\pushq %%rax
+        \\
+        \\movq exec_result(%%rip), %%rax
+        \\testq %%rax, %%rax
+        \\jz 2f
+        \\addq $8, %%rsp   // discard saved RAX — exec/signal provides new context
+        \\movq exec_result+8(%%rip), %%rcx
+        \\movq exec_result+16(%%rip), %%rax
+        \\movq $0x202, %%r11
+        \\movq %%rax, %%rsp
+        \\movq $0, exec_result(%%rip)
+        \\jmp 3f
+        \\2:
+        \\popq %%rax       // restore return value
         \\movq %%gs:8, %%rsp
+        \\3:
         \\
         \\// Swap GS back to user GSBase
         \\swapgs
@@ -225,6 +257,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         6 => {
             syscallWaitpid(frame);
+            checkSignalsOnSyscallReturn(frame);
         },
         7 => {
             syscallBrk(frame);
@@ -244,6 +277,15 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         12 => {
             syscallMunmap(frame);
         },
+        13 => {
+            syscallSigaction(frame);
+        },
+        14 => {
+            syscallSigprocmask(frame);
+        },
+        15 => {
+            syscallSigreturn(frame);
+        },
         22 => {
             syscallPipe(frame);
         },
@@ -256,8 +298,50 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         59 => {
             syscallExecve(frame);
         },
+        62 => {
+            syscallKill(frame);
+        },
         96 => {
             syscallGettimeofday(frame);
+        },
+        100 => {
+            syscallNetSend(frame);
+        },
+        101 => {
+            syscallNetRecv(frame);
+        },
+        102 => {
+            syscallUdpSend(frame);
+        },
+        103 => {
+            syscallUdpRecv(frame);
+        },
+        104 => {
+            syscallNetPoll(frame);
+        },
+        105 => {
+            syscallGetenv(frame);
+        },
+        106 => {
+            syscallSetenv(frame);
+        },
+        107 => {
+            syscallListdir(frame);
+        },
+        63 => {
+            syscallUname(frame);
+        },
+        108 => {
+            syscallChdir(frame);
+        },
+        109 => {
+            syscallGetcwd(frame);
+        },
+        110 => {
+            syscallFstat(frame);
+        },
+        111 => {
+            syscallUnlink(frame);
         },
         228 => {
             syscallClock_gettime(frame);
@@ -274,25 +358,31 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
 /// Syscall #1: write(fd, buf, count)
 /// Routes through VFS: stdout/stderr → serial, other fds → VFS write.
 fn syscallWrite(frame: *SyscallFrame, fd: u64, buf: u64, count: u64) void {
-    if (buf >= 0x0000_8000_0000_0000 or count > 0x7FFFFFFF) {
+    if (buf == 0 or buf >= 0x0000_8000_0000_0000 or count > 0x7FFFFFFF) {
         frame.rax = @bitCast(@as(i64, -1));
         return;
     }
     const n: usize = @intCast(count);
-
-    var kbuf: [256]u8 = undefined;
-    const copy = @import("../../mm/copy_from_user.zig");
-    const copied = copy.copyFromUser(kbuf[0..], @ptrFromInt(buf), if (n > 256) @as(usize, 256) else n);
-    if (copied == 0) {
-        frame.rax = @bitCast(@as(i64, -1));
+    if (n == 0) {
+        frame.rax = 0;
         return;
     }
 
     if (fd == 1 or fd == 2) {
-        for (0..copied) |i| {
-            serial.writeByte(kbuf[i]);
+        const copy = @import("../../mm/copy_from_user.zig");
+        var pos: usize = 0;
+        while (pos < n) {
+            const chunk = @min(n - pos, 4096);
+            var kbuf: [4096]u8 = undefined;
+            const copied = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(buf + pos), chunk);
+            if (copied == 0) break;
+            for (0..copied) |i| {
+                serial.writeByte(kbuf[i]);
+            }
+            pos += copied;
+            if (copied < chunk) break;
         }
-        frame.rax = @intCast(copied);
+        frame.rax = @intCast(pos);
         return;
     }
 
@@ -300,8 +390,19 @@ fn syscallWrite(frame: *SyscallFrame, fd: u64, buf: u64, count: u64) void {
     const task_mod = @import("../../proc/task.zig");
     if (sched.currentTaskIndex()) |cur_idx| {
         if (task_mod.getTask(cur_idx)) |cur| {
-            const result = cur.fd_table.write(@intCast(fd), &kbuf, copied);
-            frame.rax = @bitCast(result);
+            const copy = @import("../../mm/copy_from_user.zig");
+            var pos: usize = 0;
+            while (pos < n) {
+                const chunk = @min(n - pos, 4096);
+                var kbuf: [4096]u8 = undefined;
+                const copied = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(buf + pos), chunk);
+                if (copied == 0) break;
+                const result = cur.fd_table.write(@intCast(fd), &kbuf, copied);
+                if (result <= 0) break;
+                pos += @intCast(result);
+                if (result < @as(i64, @intCast(copied))) break;
+            }
+            frame.rax = @intCast(pos);
             return;
         }
     }
@@ -424,8 +525,6 @@ fn syscallWaitpid(frame: *SyscallFrame) void {
         }
         frame.rax = child_tid;
     } else {
-        // No zombie child yet — busy-wait with hlt to yield CPU.
-        // Timer ticks will context-switch to other tasks.
         asm volatile ("sti");
         while (true) {
             asm volatile ("hlt");
@@ -599,7 +698,7 @@ fn syscallMmap(frame: *SyscallFrame) void {
 /// Returns fd on success, -1 on failure.
 fn syscallOpen(frame: *SyscallFrame) void {
     const name_ptr: u64 = frame.rdi;
-    _ = frame.rsi; // flags (O_RDONLY etc — ignored, always read-only)
+    const flags: u32 = @truncate(frame.rsi);
     _ = frame.rdx; // mode
 
     if (name_ptr >= 0x0000_8000_0000_0000 or name_ptr == 0) {
@@ -633,7 +732,7 @@ fn syscallOpen(frame: *SyscallFrame) void {
         return;
     };
 
-    const result = cur.fd_table.open(name);
+    const result = cur.fd_table.open(name, flags);
     frame.rax = @bitCast(result);
 }
 
@@ -645,8 +744,13 @@ fn syscallRead(frame: *SyscallFrame) void {
     const buf_ptr: u64 = frame.rsi;
     const count: u64 = frame.rdx;
 
-    if (fd < 0 or buf_ptr >= 0x0000_8000_0000_0000) {
+    if (buf_ptr == 0 or buf_ptr >= 0x0000_8000_0000_0000 or count > 0x7FFFFFFF) {
         frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+    const n: usize = @intCast(count);
+    if (n == 0) {
+        frame.rax = 0;
         return;
     }
 
@@ -661,16 +765,27 @@ fn syscallRead(frame: *SyscallFrame) void {
         return;
     };
 
-    // Read into a kernel buffer, then copy to user
-    var kbuf: [256]u8 = undefined;
-    const to_read = if (count > 256) @as(usize, 256) else @as(usize, @intCast(count));
+    const copy = @import("../../mm/copy_from_user.zig");
+    var pos: usize = 0;
+    while (pos < n) {
+        const chunk = @min(n - pos, 4096);
+        var kbuf: [4096]u8 = undefined;
 
-    const result = cur.fd_table.read(fd, &kbuf, to_read);
-    if (result > 0) {
-        const copy = @import("../../mm/copy_from_user.zig");
-        _ = copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..@intCast(result)], @intCast(result));
+        const result = cur.fd_table.read(fd, &kbuf, chunk);
+        if (result <= 0) break;
+        const written = copy.copyToUser(@ptrFromInt(buf_ptr + pos), kbuf[0..@intCast(result)], @intCast(result));
+        pos += @intCast(result);
+        if (result < @as(i64, @intCast(chunk))) break;
+        if (written < @as(usize, @intCast(result))) break;
     }
-    frame.rax = @bitCast(result);
+    if (pos == 0 and n > 0) {
+        // If we read nothing, return the error from fd_table
+        var tmp: [1]u8 = undefined;
+        const r = cur.fd_table.read(fd, &tmp, 1);
+        frame.rax = @bitCast(r);
+        return;
+    }
+    frame.rax = @intCast(pos);
 }
 
 /// Syscall #11: close(fd)
@@ -922,6 +1037,17 @@ fn syscallFork(frame: *SyscallFrame) void {
         }
     }
 
+    for (0..31) |i| {
+        child.signal_handlers[i] = parent.signal_handlers[i];
+    }
+    child.signal_mask = parent.signal_mask;
+    child.env_count = parent.env_count;
+    for (0..parent.env_count) |i| {
+        @memcpy(child.env_vars[i][0..128], parent.env_vars[i][0..128]);
+    }
+    @memcpy(child.cwd[0..256], parent.cwd[0..256]);
+    child.cwd_len = parent.cwd_len;
+
     const child_stack_top = child.kernel_stack_top;
     const child_frame_addr = child_stack_top - @sizeOf(@import("idt.zig").InterruptFrame);
     const child_frame: *@import("idt.zig").InterruptFrame = @ptrFromInt(child_frame_addr);
@@ -968,7 +1094,9 @@ fn syscallFork(frame: *SyscallFrame) void {
 /// Syscall #59: execve(filename) — replace current process with new program
 fn syscallExecve(frame: *SyscallFrame) void {
     const name_ptr: u64 = frame.rdi;
-    if (name_ptr >= 0x0000_8000_0000_0000) {
+    const argv_ptr: u64 = frame.rsi;
+
+    if (name_ptr == 0 or name_ptr >= 0x0000_8000_0000_0000) {
         frame.rax = @bitCast(@as(i64, -1));
         return;
     }
@@ -989,8 +1117,31 @@ fn syscallExecve(frame: *SyscallFrame) void {
     serial.writeString(name);
     serial.writeString("'\n");
 
+    // Build argv array from user-space argv pointer
+    var argv_buffers: [16][128]u8 = undefined;
+    var argv_slices: [16][]const u8 = undefined;
+    var argc: usize = 1;
+    argv_slices[0] = name;
+
+    if (argv_ptr != 0 and argv_ptr < 0x0000_8000_0000_0000) {
+        for (1..16) |i| {
+            var ptr_bytes: [8]u8 = undefined;
+            const pc = copy.copyFromUser(ptr_bytes[0..], @ptrFromInt(argv_ptr + i * 8), 8);
+            if (pc < 8) break;
+            const arg_ptr: u64 = @bitCast(ptr_bytes);
+            if (arg_ptr == 0 or arg_ptr >= 0x0000_8000_0000_0000) break;
+            const ac = copy.copyFromUser(argv_buffers[i][0..], @ptrFromInt(arg_ptr), 127);
+            if (ac == 0) break;
+            argv_buffers[i][if (ac < 127) ac else 127] = 0;
+            var al: usize = 0;
+            while (al < ac and argv_buffers[i][al] != 0) : (al += 1) {}
+            argv_slices[i] = argv_buffers[i][0..al];
+            argc = i + 1;
+        }
+    }
+
     const loader = @import("../../proc/loader.zig");
-    const result = loader.loadProgramForExec(name) orelse {
+    const result = loader.loadProgramForExec(name, argv_slices[0..argc]) orelse {
         serial.writeString("[execve] failed\n");
         frame.rax = @bitCast(@as(i64, -1));
         return;
@@ -1150,4 +1301,769 @@ fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
     }
 
     return child_pml4_phys;
+}
+
+fn syscallSigaction(frame: *SyscallFrame) void {
+    const signum: u32 = @truncate(frame.rdi);
+    const handler: u64 = frame.rsi;
+
+    if (signum == 0 or signum > 31) {
+        frame.rax = @bitCast(@as(i64, -22));
+        return;
+    }
+
+    const sched = @import("../../proc/sched.zig");
+    const current = sched.currentTask() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    current.signal_handlers[signum - 1] = handler;
+    frame.rax = 0;
+}
+
+fn syscallSigprocmask(frame: *SyscallFrame) void {
+    const how: u32 = @truncate(frame.rdi);
+    const set_ptr: u64 = frame.rsi;
+    const oldset_ptr: u64 = frame.rdx;
+
+    const sched = @import("../../proc/sched.zig");
+    const current = sched.currentTask() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    const old_mask = current.signal_mask;
+
+    if (oldset_ptr != 0 and oldset_ptr < 0x0000_8000_0000_0000) {
+        const copy = @import("../../mm/copy_from_user.zig");
+        _ = copy.copyToUser(@ptrFromInt(oldset_ptr), @as([*]const u8, @ptrCast(&old_mask))[0..4], 4);
+    }
+
+    if (set_ptr != 0 and set_ptr < 0x0000_8000_0000_0000) {
+        const copy = @import("../../mm/copy_from_user.zig");
+        var new_set: u32 = 0;
+        const new_set_bytes: [*]u8 = @ptrCast(&new_set);
+        _ = copy.copyFromUser(new_set_bytes[0..4], @ptrFromInt(set_ptr), 4);
+
+        const sigkill_mask = @as(u32, 1) << 8;
+        const sigstop_mask = @as(u32, 1) << 18;
+        const unblockable = sigkill_mask | sigstop_mask;
+
+        switch (how) {
+            0 => {
+                current.signal_mask |= new_set;
+                current.signal_mask &= ~unblockable;
+            },
+            1 => {
+                current.signal_mask &= ~new_set;
+            },
+            2 => {
+                current.signal_mask = new_set & ~unblockable;
+            },
+            else => {
+                frame.rax = @bitCast(@as(i64, -22));
+                return;
+            },
+        }
+    }
+
+    frame.rax = 0;
+}
+
+fn syscallSigreturn(frame: *SyscallFrame) void {
+    const sig_mod = @import("../../proc/signal.zig");
+
+    const user_rsp = getPerCpu().saved_user_rsp;
+    const sig_frame: *sig_mod.SignalFrame = @ptrFromInt(user_rsp);
+
+    frame.rax = sig_frame.rax;
+    frame.rbx = sig_frame.rbx;
+    frame.rcx = sig_frame.rcx;
+    frame.rdx = sig_frame.rdx;
+    frame.rsi = sig_frame.rsi;
+    frame.rdi = sig_frame.rdi;
+    frame.rbp = sig_frame.rbp;
+    frame.r8 = sig_frame.r8;
+    frame.r9 = sig_frame.r9;
+    frame.r10 = sig_frame.r10;
+    frame.r11 = sig_frame.r11;
+    frame.r12 = sig_frame.r12;
+    frame.r13 = sig_frame.r13;
+    frame.r14 = sig_frame.r14;
+    frame.r15 = sig_frame.r15;
+
+    exec_result.pending = 2;
+    exec_result.new_entry = sig_frame.rip;
+    exec_result.new_stack = sig_frame.rsp;
+
+    frame.r11 = sig_frame.rflags;
+}
+
+fn syscallKill(frame: *SyscallFrame) void {
+    const target_tid: u32 = @truncate(frame.rdi);
+    const signum: u32 = @truncate(frame.rsi);
+
+    const sig_mod = @import("../../proc/signal.zig");
+    if (sig_mod.sendSignal(target_tid, signum)) {
+        frame.rax = 0;
+    } else {
+        frame.rax = @bitCast(@as(i64, -1));
+    }
+}
+
+fn syscallNetSend(frame: *SyscallFrame) void {
+    const buf: u64 = frame.rdi;
+    const len: u64 = frame.rsi;
+
+    if (buf == 0 or len == 0 or len > 2048 or buf >= 0x0000_8000_0000_0000) {
+        frame.rax = @bitCast(@as(i64, -22));
+        return;
+    }
+
+    const e1000 = @import("../../drivers/e1000.zig");
+    if (!e1000.isActive()) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    if (e1000.sendPacket(@ptrFromInt(buf), @intCast(len))) {
+        frame.rax = len;
+    } else {
+        frame.rax = 0;
+    }
+}
+
+fn syscallNetRecv(frame: *SyscallFrame) void {
+    const buf: u64 = frame.rdi;
+    const max_len: u64 = frame.rsi;
+
+    if (buf == 0 or max_len == 0 or buf >= 0x0000_8000_0000_0000) {
+        frame.rax = @bitCast(@as(i64, -22));
+        return;
+    }
+
+    const e1000_mod = @import("../../drivers/e1000.zig");
+    if (!e1000_mod.isActive()) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    const received = e1000_mod.receivePacket(@ptrFromInt(buf), @intCast(max_len));
+    frame.rax = @as(u64, received);
+}
+
+fn syscallUdpSend(frame: *SyscallFrame) void {
+    const dst_ip_be: u32 = @truncate(frame.rdi);
+    const dst_port: u16 = @truncate(frame.rsi);
+    const src_port: u16 = @truncate(frame.rdx);
+    const buf: u64 = frame.r10;
+    const len: u64 = frame.r8;
+
+    if (buf == 0 or len == 0 or len > 1472 or buf >= 0x0000_8000_0000_0000) {
+        frame.rax = @bitCast(@as(i64, -22));
+        return;
+    }
+
+    const e1000_mod = @import("../../drivers/e1000.zig");
+    if (!e1000_mod.isActive()) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    const dst_ip: [4]u8 = .{
+        @truncate(dst_ip_be >> 24),
+        @truncate(dst_ip_be >> 16),
+        @truncate(dst_ip_be >> 8),
+        @truncate(dst_ip_be),
+    };
+
+    const udp = @import("../../net/udp.zig");
+    if (udp.sendTo(dst_ip, dst_port, src_port, @ptrFromInt(buf), @intCast(len))) {
+        frame.rax = len;
+    } else {
+        frame.rax = 0;
+    }
+}
+
+fn syscallUdpRecv(frame: *SyscallFrame) void {
+    const port: u16 = @truncate(frame.rdi);
+    const buf: u64 = frame.rsi;
+    const max_len: u64 = frame.rdx;
+    const src_ip_out: u64 = frame.r10;
+    const src_port_out: u64 = frame.r8;
+
+    if (buf == 0 or max_len == 0 or buf >= 0x0000_8000_0000_0000) {
+        frame.rax = @bitCast(@as(i64, -22));
+        return;
+    }
+
+    const e1000_mod = @import("../../drivers/e1000.zig");
+    _ = e1000_mod;
+
+    var out_ip: [4]u8 = @splat(0);
+    var out_port: u16 = 0;
+
+    const udp = @import("../../net/udp.zig");
+    const n = udp.recvFrom(port, @ptrFromInt(buf), &out_ip, &out_port);
+
+    if (n > 0) {
+        if (src_ip_out != 0 and src_ip_out < 0x0000_8000_0000_0000) {
+            const ip_be: u32 = (@as(u32, out_ip[0]) << 24) |
+                (@as(u32, out_ip[1]) << 16) |
+                (@as(u32, out_ip[2]) << 8) |
+                @as(u32, out_ip[3]);
+            const copy = @import("../../mm/copy_from_user.zig");
+            _ = copy.copyToUser(@ptrFromInt(src_ip_out), @ptrCast(&ip_be), 4);
+        }
+        if (src_port_out != 0 and src_port_out < 0x0000_8000_0000_0000) {
+            const copy = @import("../../mm/copy_from_user.zig");
+            _ = copy.copyToUser(@ptrFromInt(src_port_out), @ptrCast(&out_port), 2);
+        }
+    }
+
+    frame.rax = @bitCast(n);
+}
+
+fn syscallNetPoll(frame: *SyscallFrame) void {
+    const e1000_mod = @import("../../drivers/e1000.zig");
+    if (!e1000_mod.isActive()) {
+        frame.rax = 0;
+        return;
+    }
+
+    const net = @import("../../net/mod.zig");
+    var rx_tmp: [2048]u8 = undefined;
+    var count: u64 = 0;
+    var poll_limit: u32 = 0;
+    while (poll_limit < 16) {
+        const n = e1000_mod.receivePacket(&rx_tmp, 2048);
+        if (n == 0) break;
+        net.handleRxPacket(&rx_tmp, n);
+        count += 1;
+        poll_limit += 1;
+    }
+    frame.rax = count;
+}
+
+pub fn checkSignalsOnSyscallReturn(frame: *SyscallFrame) void {
+    const sig_mod = @import("../../proc/signal.zig");
+    const sched = @import("../../proc/sched.zig");
+
+    const current = sched.currentTask() orelse return;
+    if (!current.is_user) return;
+    if (current.pending_signals == 0) return;
+    if (current.pending_signals & ~current.signal_mask == 0) return;
+
+    const signum = sig_mod.dequeueSignal(current) orelse return;
+
+    const handler_addr = current.signal_handlers[signum - 1];
+
+    if (handler_addr == 0) {
+        if (!sig_mod.defaultSignalAction(signum)) {
+            current.state = .zombie;
+            current.exit_code = 128 + @as(i32, @intCast(signum));
+        }
+        return;
+    }
+
+    if (handler_addr == 1) return;
+
+    const user_rsp = getPerCpu().saved_user_rsp;
+    const user_rip = frame.rcx;
+    const user_rflags = frame.r11;
+
+    const result = sig_mod.pushSignalFrame(current, signum, user_rsp, user_rip, user_rflags);
+
+    frame.rdi = signum;
+    frame.rcx = handler_addr;
+    exec_result.pending = 3;
+    exec_result.new_entry = handler_addr;
+    exec_result.new_stack = result.new_rsp;
+}
+
+fn syscallGetenv(frame: *SyscallFrame) void {
+    const key_ptr: u64 = frame.rdi;
+    const val_ptr: u64 = frame.rsi;
+    const val_max: u64 = frame.rdx;
+
+    if (key_ptr == 0 or key_ptr >= 0x0000_8000_0000_0000) {
+        frame.rax = @bitCast(@as(i64, -22));
+        return;
+    }
+
+    var key_buf: [128]u8 = undefined;
+    const copy = @import("../../mm/copy_from_user.zig");
+    const copied = copy.copyFromUser(key_buf[0..], @ptrFromInt(key_ptr), 127);
+    if (copied == 0) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+    key_buf[if (copied < 127) copied else 127] = 0;
+    var key_len: usize = 0;
+    while (key_len < copied and key_buf[key_len] != 0) : (key_len += 1) {}
+
+    const sched = @import("../../proc/sched.zig");
+    const current = sched.currentTask() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    for (0..current.env_count) |i| {
+        const entry = current.env_vars[i][0..];
+        var j: usize = 0;
+        while (j < 127 and entry[j] != 0 and entry[j] != '=' and j < key_len) : (j += 1) {
+            if (entry[j] != key_buf[j]) break;
+        }
+        if (j == key_len and entry[j] == '=') {
+            const val_start = j + 1;
+            var val_len: usize = 0;
+            while (val_start + val_len < 127 and entry[val_start + val_len] != 0) : (val_len += 1) {}
+
+            if (val_ptr != 0 and val_ptr < 0x0000_8000_0000_0000 and val_max > 0) {
+                const to_copy = @min(val_len, val_max - 1);
+                _ = copy.copyToUser(@ptrFromInt(val_ptr), entry[val_start .. val_start + to_copy], to_copy);
+                const zero: u8 = 0;
+                _ = copy.copyToUser(@ptrFromInt(val_ptr + to_copy), @as([*]const u8, @ptrCast(&zero))[0..1], 1);
+            }
+            frame.rax = val_len;
+            return;
+        }
+    }
+
+    frame.rax = @bitCast(@as(i64, -1));
+}
+
+fn syscallSetenv(frame: *SyscallFrame) void {
+    const kvp_ptr: u64 = frame.rdi;
+
+    if (kvp_ptr == 0 or kvp_ptr >= 0x0000_8000_0000_0000) {
+        frame.rax = @bitCast(@as(i64, -22));
+        return;
+    }
+
+    var kvp_buf: [128]u8 = undefined;
+    const copy = @import("../../mm/copy_from_user.zig");
+    const copied = copy.copyFromUser(kvp_buf[0..], @ptrFromInt(kvp_ptr), 127);
+    if (copied == 0) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+    kvp_buf[if (copied < 127) copied else 127] = 0;
+
+    var has_eq = false;
+    for (kvp_buf[0..copied]) |c| {
+        if (c == '=') {
+            has_eq = true;
+            break;
+        }
+    }
+    if (!has_eq) {
+        frame.rax = @bitCast(@as(i64, -22));
+        return;
+    }
+
+    const sched = @import("../../proc/sched.zig");
+    const current = sched.currentTask() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    var key_len: usize = 0;
+    while (key_len < copied and kvp_buf[key_len] != '=') : (key_len += 1) {}
+
+    var found: ?usize = null;
+    for (0..current.env_count) |i| {
+        const entry = current.env_vars[i][0..];
+        var j: usize = 0;
+        while (j < key_len and j < 127 and entry[j] != 0 and entry[j] != '=') : (j += 1) {
+            if (entry[j] != kvp_buf[j]) break;
+        }
+        if (j == key_len and entry[j] == '=') {
+            found = i;
+            break;
+        }
+    }
+
+    const slot = found orelse blk: {
+        if (current.env_count >= 32) {
+            frame.rax = @bitCast(@as(i64, -12));
+            return;
+        }
+        const s = current.env_count;
+        current.env_count += 1;
+        break :blk s;
+    };
+
+    @memset(current.env_vars[slot][0..128], 0);
+    var total_len: usize = 0;
+    while (total_len < 127 and kvp_buf[total_len] != 0) : (total_len += 1) {}
+    @memcpy(current.env_vars[slot][0..total_len], kvp_buf[0..total_len]);
+
+    frame.rax = 0;
+}
+
+fn syscallListdir(frame: *SyscallFrame) void {
+    const buf_ptr: u64 = frame.rdi;
+    const buf_size: u64 = frame.rsi;
+
+    if (buf_ptr == 0 or buf_ptr >= 0x0000_8000_0000_0000 or buf_size == 0) {
+        frame.rax = @bitCast(@as(i64, -22));
+        return;
+    }
+
+    const copy = @import("../../mm/copy_from_user.zig");
+    const ramdisk = @import("../../fs/ramdisk.zig");
+    const fat32 = @import("../../fs/fat32.zig");
+
+    var kbuf: [4096]u8 = undefined;
+    var pos: usize = 0;
+    const max = @min(buf_size, 4096);
+
+    const rd_count = ramdisk.getFileCount();
+    for (0..rd_count) |i| {
+        const fname = ramdisk.getFileName(@intCast(i)) orelse continue;
+        const needed = fname.len + 1;
+        if (pos + needed > max) break;
+        @memcpy(kbuf[pos .. pos + fname.len], fname);
+        pos += fname.len;
+        kbuf[pos] = '\n';
+        pos += 1;
+    }
+
+    if (fat32.isActive()) {
+        const f32_count = fat32.getFileCount();
+        for (0..f32_count) |i| {
+            const fname = fat32.getFileName(@intCast(i)) orelse continue;
+            const needed = fname.len + 1;
+            if (pos + needed > max) break;
+            @memcpy(kbuf[pos .. pos + fname.len], fname);
+            pos += fname.len;
+            kbuf[pos] = '\n';
+            pos += 1;
+        }
+    }
+
+    if (pos > 0) {
+        _ = copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..pos], pos);
+    }
+    frame.rax = @intCast(pos);
+}
+
+/// Syscall #63: uname(buf)
+/// RDI = pointer to user buffer (390 bytes: 6 fields × 65 bytes)
+/// Returns 0 on success, -1 on failure.
+/// Fields: sysname, nodename, release, version, machine, domainname
+fn syscallUname(frame: *SyscallFrame) void {
+    const buf_ptr: u64 = frame.rdi;
+    if (buf_ptr == 0 or buf_ptr >= 0x0000_8000_0000_0000) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    const copy = @import("../../mm/copy_from_user.zig");
+
+    var ubuf: [390]u8 = undefined;
+    @memset(&ubuf, 0);
+
+    const fields = [_][]const u8{
+        "MoQiOS",           // sysname
+        "moqios",           // nodename
+        "0.1.0",            // release
+        "MoQiOS 0.1.0",    // version
+        "x86_64",           // machine
+        "",                 // domainname
+    };
+
+    var offset: usize = 0;
+    for (fields) |f| {
+        const copy_len = @min(f.len, 64);
+        @memcpy(ubuf[offset .. offset + copy_len], f[0..copy_len]);
+        offset += 65;
+    }
+
+    _ = copy.copyToUser(@ptrFromInt(buf_ptr), &ubuf, 390);
+    frame.rax = 0;
+}
+
+/// Syscall #108: chdir(path)
+/// RDI = path pointer in user space
+/// Returns 0 on success, -1 on failure.
+fn syscallChdir(frame: *SyscallFrame) void {
+    const path_ptr: u64 = frame.rdi;
+    if (path_ptr == 0 or path_ptr >= 0x0000_8000_0000_0000) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    const copy = @import("../../mm/copy_from_user.zig");
+    var path_buf: [256]u8 = undefined;
+    const copied = copy.copyFromUser(path_buf[0..], @ptrFromInt(path_ptr), 255);
+    if (copied == 0) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+    path_buf[if (copied < 255) copied else 255] = 0;
+    var path_len: usize = 0;
+    while (path_len < copied and path_buf[path_len] != 0) : (path_len += 1) {}
+
+    if (path_len == 0 or path_len >= 256) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    const sched_mod = @import("../../proc/sched.zig");
+    const task_mod = @import("../../proc/task.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+    const cur = task_mod.getTask(cur_idx) orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    // Resolve path: if absolute, use as-is; if relative, append to cwd
+    var resolved: [256]u8 = undefined;
+    var resolved_len: usize = 0;
+
+    if (path_buf[0] == '/') {
+        @memcpy(resolved[0..path_len], path_buf[0..path_len]);
+        resolved_len = path_len;
+    } else {
+        // Append "/" + path to cwd
+        if (cur.cwd_len > 0) {
+            @memcpy(resolved[0..cur.cwd_len], cur.cwd[0..cur.cwd_len]);
+            resolved_len = cur.cwd_len;
+        }
+        if (resolved_len > 0 and resolved[resolved_len - 1] != '/') {
+            if (resolved_len < 255) {
+                resolved[resolved_len] = '/';
+                resolved_len += 1;
+            }
+        }
+        const to_copy = @min(path_len, 256 - resolved_len);
+        @memcpy(resolved[resolved_len .. resolved_len + to_copy], path_buf[0..to_copy]);
+        resolved_len += to_copy;
+    }
+
+    // Normalize: remove trailing slash (except root)
+    while (resolved_len > 1 and resolved[resolved_len - 1] == '/') {
+        resolved_len -= 1;
+    }
+
+    // Handle ".." components
+    var pos: usize = 0;
+    var write_pos: usize = 0;
+    var out_buf: [256]u8 = undefined;
+
+    while (pos < resolved_len) {
+        // Skip slashes
+        while (pos < resolved_len and resolved[pos] == '/') : (pos += 1) {}
+        if (pos >= resolved_len) break;
+
+        // Find end of component
+        const start = pos;
+        while (pos < resolved_len and resolved[pos] != '/') : (pos += 1) {}
+        const component = resolved[start..pos];
+
+        if (component.len == 1 and component[0] == '.') {
+            continue;
+        } else if (component.len == 2 and component[0] == '.' and component[1] == '.') {
+            // Go up one level
+            if (write_pos > 1) {
+                write_pos -= 1;
+                while (write_pos > 0 and out_buf[write_pos - 1] != '/') : (write_pos -= 1) {}
+            }
+        } else {
+            // Normal component
+            if (write_pos > 0 and out_buf[write_pos - 1] != '/') {
+                out_buf[write_pos] = '/';
+                write_pos += 1;
+            } else if (write_pos == 0) {
+                out_buf[write_pos] = '/';
+                write_pos += 1;
+            }
+            @memcpy(out_buf[write_pos .. write_pos + component.len], component);
+            write_pos += component.len;
+        }
+    }
+
+    if (write_pos == 0) {
+        out_buf[0] = '/';
+        write_pos = 1;
+    }
+
+    @memcpy(cur.cwd[0..write_pos], out_buf[0..write_pos]);
+    cur.cwd[write_pos] = 0;
+    cur.cwd_len = @intCast(write_pos);
+    frame.rax = 0;
+}
+
+/// Syscall #109: getcwd(buf, size)
+/// RDI = buffer pointer, RSI = buffer size
+/// Returns number of bytes written (including null), or -1 on failure.
+fn syscallGetcwd(frame: *SyscallFrame) void {
+    const buf_ptr: u64 = frame.rdi;
+    const buf_size: u64 = frame.rsi;
+
+    if (buf_ptr == 0 or buf_ptr >= 0x0000_8000_0000_0000 or buf_size == 0) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    const sched_mod = @import("../../proc/sched.zig");
+    const task_mod = @import("../../proc/task.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+    const cur = task_mod.getTask(cur_idx) orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    const cwd_len: usize = cur.cwd_len;
+    const total = cwd_len + 1; // +1 for null terminator
+    if (total > buf_size) {
+        frame.rax = @bitCast(@as(i64, -34)); // -ERANGE
+        return;
+    }
+
+    var tmp: [257]u8 = undefined;
+    @memcpy(tmp[0..cwd_len], cur.cwd[0..cwd_len]);
+    tmp[cwd_len] = 0;
+
+    const copy = @import("../../mm/copy_from_user.zig");
+    _ = copy.copyToUser(@ptrFromInt(buf_ptr), tmp[0..total], total);
+    frame.rax = @intCast(total);
+}
+
+/// Syscall #110: fstat(fd, stat_buf)
+/// RDI = fd, RSI = pointer to stat buffer in user space (144 bytes)
+/// struct stat { u64 dev, ino, nlink; u32 mode; u32 pad1; u64 uid, gid, rdev; i64 size; ... }
+/// Simplified: we fill dev=0, ino=fd, mode, size.
+fn syscallFstat(frame: *SyscallFrame) void {
+    const fd: u64 = frame.rdi;
+    const stat_ptr: u64 = frame.rsi;
+
+    if (stat_ptr == 0 or stat_ptr >= 0x0000_8000_0000_0000) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    const sched_mod = @import("../../proc/sched.zig");
+    const task_mod = @import("../../proc/task.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+    const cur = task_mod.getTask(cur_idx) orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    if (fd >= @import("../../fs/vfs.zig").MAX_FDS) {
+        frame.rax = @bitCast(@as(i64, -9)); // -EBADF
+        return;
+    }
+
+    const fdesc = cur.fd_table.fds[fd];
+    if (fdesc.fd_type == .none) {
+        frame.rax = @bitCast(@as(i64, -9)); // -EBADF
+        return;
+    }
+
+    // struct stat layout (Linux x86_64, 144 bytes):
+    // 0:  dev (u64)
+    // 8:  ino (u64)
+    // 16: nlink (u64)
+    // 24: mode (u32) + pad (u32)
+    // 32: uid (u32) + gid (u32)
+    // 40: rdev (u64)
+    // 48: size (i64) -> pad to 64
+    // 56: blksize (i32) + pad
+    // 64: blocks (i64)
+    // 72-143: atim, mtim, ctim (each 16 bytes)
+    var stat_buf: [144]u8 = undefined;
+    @memset(&stat_buf, 0);
+
+    // dev = 0 (no device numbers yet)
+    // ino = fd index as pseudo-inode
+    const ino: u64 = fd;
+    @memcpy(stat_buf[8..16], @as([*]const u8, @ptrCast(&ino))[0..8]);
+
+    // mode: regular file (0o100000) or directory (0o040000) or pipe (0o010000)
+    var mode: u32 = 0o100000; // S_IFREG
+    if (fdesc.fd_type == .special) {
+        mode = 0o020000; // S_IFCHR (char device for stdin/stdout)
+    } else if (fdesc.fd_type == .pipe_read or fdesc.fd_type == .pipe_write) {
+        mode = 0o010000; // S_IFIFO
+    }
+    mode |= 0o444; // r--r--r-- (read for all)
+    if (fdesc.writable) mode |= 0o222; // -w--w--w-
+    @memcpy(stat_buf[24..28], @as([*]const u8, @ptrCast(&mode))[0..4]);
+
+    // size
+    const size: i64 = @intCast(fdesc.file_size);
+    @memcpy(stat_buf[48..56], @as([*]const u8, @ptrCast(&size))[0..8]);
+
+    const copy = @import("../../mm/copy_from_user.zig");
+    _ = copy.copyToUser(@ptrFromInt(stat_ptr), &stat_buf, 144);
+    frame.rax = 0;
+}
+
+/// Syscall #111: unlink(path)
+/// RDI = path pointer in user space
+/// Returns 0 on success, -1 on failure.
+fn syscallUnlink(frame: *SyscallFrame) void {
+    const path_ptr: u64 = frame.rdi;
+    if (path_ptr == 0 or path_ptr >= 0x0000_8000_0000_0000) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    const copy = @import("../../mm/copy_from_user.zig");
+    var name_buf: [64]u8 = undefined;
+    const copied = copy.copyFromUser(name_buf[0..], @ptrFromInt(path_ptr), 63);
+    if (copied == 0) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+    name_buf[if (copied < 63) copied else 63] = 0;
+    var name_len: usize = 0;
+    while (name_len < copied and name_buf[name_len] != 0) : (name_len += 1) {}
+    const name = name_buf[0..name_len];
+
+    // Only support deleting from FAT32
+    const fat32 = @import("../../fs/fat32.zig");
+    if (!fat32.isActive()) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    // Find the file
+    const file_count = fat32.getFileCount();
+    var found_idx: ?u32 = null;
+    for (0..file_count) |i| {
+        const fname = fat32.getFileName(@intCast(i)) orelse continue;
+        if (fname.len == name.len) {
+            var match = true;
+            for (fname, 0..) |c, j| {
+                if (c != name[j]) { match = false; break; }
+            }
+            if (match) { found_idx = @intCast(i); break; }
+        }
+    }
+
+    if (found_idx == null) {
+        frame.rax = @bitCast(@as(i64, -2)); // -ENOENT
+        return;
+    }
+
+    if (fat32.deleteFile(found_idx.?)) {
+        frame.rax = 0;
+    } else {
+        frame.rax = @bitCast(@as(i64, -1));
+    }
 }

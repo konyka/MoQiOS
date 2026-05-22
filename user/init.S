@@ -239,6 +239,97 @@ _start:
     movq $12, %rdx
     syscall
 
+    # Spawn hello12 (FAT32 write test)
+    movq $5, %rax
+    leaq hello12_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn12_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done12_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
+    # Spawn hello13 (signal test)
+    movq $5, %rax
+    leaq hello13_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn13_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    # Spawn hello14 (network test)
+    movq $5, %rax
+    leaq hello14_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn14_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    # Spawn hello15 (network stack test)
+    movq $5, %rax
+    leaq hello15_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn15_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    # Spawn hello16 (env var test)
+    movq $5, %rax
+    leaq hello16_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn16_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
     # Spawn hello9 (fork test)
     movq $5, %rax
     leaq hello9_name(%rip), %rdi
@@ -353,6 +444,49 @@ spawn8_msg:
     .ascii "spawned hello8\n"
 done8_msg:
     .ascii "hello8 done\n"
+hello12_name:
+    .ascii "hello12"
+    .byte 0
+spawn12_msg:
+    .ascii "spawned hello12\n"
+done12_msg:
+    .ascii "hello12 done\n"
+hello13_name:
+    .ascii "hello13"
+    .byte 0
+spawn13_msg:
+    .ascii "spawned hello13\n"
+done13_msg:
+    .ascii "hello13 done\n"
+hello14_name:
+    .ascii "hello14"
+    .byte 0
+spawn14_msg:
+    .ascii "spawned hello14\n"
+done14_msg:
+    .ascii "hello14 done\n"
+hello15_name:
+    .ascii "hello15"
+    .byte 0
+spawn15_msg:
+    .ascii "spawned hello15\n"
+done15_msg:
+    .ascii "hello15 done\n"
+hello16_name:
+    .ascii "hello16"
+    .byte 0
+spawn16_msg:
+    .ascii "spawned hello16\n"
+hello17_name:
+    .ascii "hello17"
+    .byte 0
+spawn17_msg:
+    .ascii "spawned hello17\n"
+hello18_name:
+    .ascii "hello18"
+    .byte 0
+spawn18_msg:
+    .ascii "spawned hello18\n"
 hello9_name:
     .ascii "hello9"
     .byte 0

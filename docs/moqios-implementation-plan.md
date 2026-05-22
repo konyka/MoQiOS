@@ -1,11 +1,52 @@
 # MoQiOS 实施计划
 
-> **版本**: v0.2 (审计修正版)  
-> **日期**: 2026-05-13  
+> **版本**: v0.3 (进度更新)  
+> **日期**: 2026-05-22  
 > **配套文档**: [moqios-design.md](./moqios-design.md)  
 > **总目标**: 从零开始实现一个微内核操作系统，支持 Linux + Windows 双二进制兼容  
 > **总代码量估算**: ~40,000 行 (含内核、服务、驱动、ntdll、测试框架)  
 > **预计总工期**: ~40 周 (约 10 个月，含审计新增子系统)
+
+---
+
+## 实施进度 (截至 2026-05-22)
+
+**M1–M10 全部完成，M11+ 扩展功能已完成。内核代码 ~11,600 行，18 个自动化测试全部通过。**
+
+### 已完成功能清单
+
+| 功能 | 里程碑 | 说明 |
+|---|---|---|
+| 内核启动 + 串口输出 | M1 | Limine 引导，GDT/IDT 初始化 |
+| 物理内存管理 + 分页 | M2 | PMM 页分配，4 级页表，HHDM |
+| 调度器 + 上下文切换 | M3 | 轮转调度，内核线程 + 用户进程 |
+| 用户空间进程 + syscall | M4 | syscall/sysret，MSR LSTAR |
+| 多进程 + ELF 加载器 | M5 | argc/argv/auxv 栈构建 |
+| PCI 设备枚举 | M6 | PCI 配置空间读写 |
+| virtio-blk + FAT32 | M7 | FAT32 读写，文件创建/删除 |
+| e1000 + 网络协议栈 | M8 | ARP/IPv4/ICMP/UDP |
+| 管道 + Shell | M9 | pipe/dup2，I/O 重定向，交互式 Shell |
+| fork + execve | M10 | COW 地址空间克隆，argv 传递 |
+| 信号处理 | M11+ | kill/sigaction/sigreturn/sigprocmask，Ctrl+C |
+| 环境变量 | M11+ | getenv/setenv，fork 继承，Shell export |
+| 目录操作 | M11+ | chdir/getcwd/listdir，路径规范化 |
+| 文件元数据 | M11+ | fstat (mode/size/type)，uname |
+| 文件删除 | M11+ | unlink FAT32 文件，FAT 簇链释放 |
+
+### 已实现系统调用 (35 个)
+
+```
+1=write  2=exit  4=getpid  5=spawn  6=waitpid  7=brk  8=mmap
+9=open  10=read  11=close  12=munmap  13=sigaction  14=sigprocmask
+15=sigreturn  22=pipe  33=dup2  57=fork  59=execve  62=kill
+63=uname  96=gettimeofday  100-104=net_*  105=getenv  106=setenv
+107=listdir  108=chdir  109=getcwd  110=fstat  111=unlink
+228=clock_gettime
+```
+
+### 测试覆盖
+
+18 个自动化测试 (hello2–hello18) + 交互式 Shell，覆盖：ramdisk 读写、多进程、ELF 加载、管道、fork、execve、FAT32 写入、信号处理、网络 ARP/UDP、环境变量、argv 传递、目录操作、文件元数据。
 
 ---
 

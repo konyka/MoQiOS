@@ -352,6 +352,230 @@ pub fn build(b: *std.Build) void {
 
     b.getInstallStep().dependOn(&hello10_strip.step);
 
+    const hello11_elf = b.addSystemCommand(&.{
+        "zig", "cc",
+        "-target", "x86_64-freestanding-none",
+        "-static",
+        "-nostdlib",
+        "-ffreestanding",
+        "-O2",
+        "-mno-sse",
+        "-mno-sse2",
+        "-Wl,--gc-sections",
+        "-Wl,-z,norelro",
+        "-o",
+    });
+    hello11_elf.addArg("user/hello11.elf");
+    hello11_elf.addFileArg(b.path("user/hello11.c"));
+    hello11_elf.setName("compile hello11.c -> ELF");
+
+    const hello11_strip = b.addSystemCommand(&.{
+        "strip",
+        "-o",
+    });
+    hello11_strip.addArg("user/hello11.bin");
+    hello11_strip.addArg("user/hello11.elf");
+    hello11_strip.step.dependOn(&hello11_elf.step);
+    hello11_strip.setName("strip hello11.elf");
+
+    b.getInstallStep().dependOn(&hello11_strip.step);
+
+    const hello12_elf = b.addSystemCommand(&.{
+        "zig", "cc",
+        "-target", "x86_64-freestanding-none",
+        "-static",
+        "-nostdlib",
+        "-ffreestanding",
+        "-O2",
+        "-mno-sse",
+        "-mno-sse2",
+        "-Wl,--gc-sections",
+        "-Wl,-z,norelro",
+        "-o",
+    });
+    hello12_elf.addArg("user/hello12.elf");
+    hello12_elf.addFileArg(b.path("user/hello12.c"));
+    hello12_elf.setName("compile hello12.c -> ELF");
+
+    const hello12_strip = b.addSystemCommand(&.{
+        "strip",
+        "-o",
+    });
+    hello12_strip.addArg("user/hello12.bin");
+    hello12_strip.addArg("user/hello12.elf");
+    hello12_strip.step.dependOn(&hello12_elf.step);
+    hello12_strip.setName("strip hello12.elf");
+
+    b.getInstallStep().dependOn(&hello12_strip.step);
+
+    const hello13_elf = b.addSystemCommand(&.{
+        "zig", "cc",
+        "-target", "x86_64-freestanding-none",
+        "-static",
+        "-nostdlib",
+        "-ffreestanding",
+        "-O2",
+        "-mno-sse",
+        "-mno-sse2",
+        "-Wl,--gc-sections",
+        "-Wl,-z,norelro",
+        "-o",
+    });
+    hello13_elf.addArg("user/hello13.elf");
+    hello13_elf.addFileArg(b.path("user/hello13.c"));
+    hello13_elf.setName("compile hello13.c -> ELF");
+
+    const hello13_strip = b.addSystemCommand(&.{
+        "strip",
+        "-o",
+    });
+    hello13_strip.addArg("user/hello13.bin");
+    hello13_strip.addArg("user/hello13.elf");
+    hello13_strip.step.dependOn(&hello13_elf.step);
+    hello13_strip.setName("strip hello13.elf");
+
+    b.getInstallStep().dependOn(&hello13_strip.step);
+
+    const hello14_elf = b.addSystemCommand(&.{
+        "zig", "cc",
+        "-target", "x86_64-freestanding-none",
+        "-static",
+        "-nostdlib",
+        "-ffreestanding",
+        "-O2",
+        "-mno-sse",
+        "-mno-sse2",
+        "-Wl,--gc-sections",
+        "-Wl,-z,norelro",
+        "-o",
+    });
+    hello14_elf.addArg("user/hello14.elf");
+    hello14_elf.addFileArg(b.path("user/hello14.c"));
+    hello14_elf.setName("compile hello14.c -> ELF");
+
+    const hello14_strip = b.addSystemCommand(&.{
+        "strip",
+        "-o",
+    });
+    hello14_strip.addArg("user/hello14.bin");
+    hello14_strip.addArg("user/hello14.elf");
+    hello14_strip.step.dependOn(&hello14_elf.step);
+    hello14_strip.setName("strip hello14.elf");
+
+    b.getInstallStep().dependOn(&hello14_strip.step);
+
+    const hello15_elf = b.addSystemCommand(&.{
+        "zig", "cc",
+        "-target", "x86_64-freestanding-none",
+        "-static",
+        "-nostdlib",
+        "-ffreestanding",
+        "-O2",
+        "-mno-sse",
+        "-mno-sse2",
+        "-Wl,--gc-sections",
+        "-Wl,-z,norelro",
+        "-o",
+    });
+    hello15_elf.addArg("user/hello15.elf");
+    hello15_elf.addFileArg(b.path("user/hello15.c"));
+    hello15_elf.setName("compile hello15.c -> ELF");
+
+    const hello15_strip = b.addSystemCommand(&.{
+        "strip",
+        "-o",
+    });
+    hello15_strip.addArg("user/hello15.bin");
+    hello15_strip.addArg("user/hello15.elf");
+    hello15_strip.step.dependOn(&hello15_elf.step);
+    hello15_strip.setName("strip hello15.elf");
+
+    b.getInstallStep().dependOn(&hello15_strip.step);
+
+    const hello16_elf = b.addSystemCommand(&.{
+        "zig", "cc",
+        "-target", "x86_64-freestanding-none",
+        "-static",
+        "-nostdlib",
+        "-ffreestanding",
+        "-O2",
+        "-mno-sse",
+        "-mno-sse2",
+        "-Wl,--gc-sections",
+        "-Wl,-z,norelro",
+        "-o",
+    });
+    hello16_elf.addArg("user/hello16.elf");
+    hello16_elf.addFileArg(b.path("user/hello16.c"));
+    hello16_elf.setName("compile hello16.c -> ELF");
+
+    const hello16_strip = b.addSystemCommand(&.{
+        "strip",
+        "-o",
+    });
+    hello16_strip.addArg("user/hello16.bin");
+    hello16_strip.addArg("user/hello16.elf");
+    hello16_strip.step.dependOn(&hello16_elf.step);
+    hello16_strip.setName("strip hello16.elf");
+
+    b.getInstallStep().dependOn(&hello16_strip.step);
+
+    const hello17_elf = b.addSystemCommand(&.{
+        "zig", "cc",
+        "-target", "x86_64-freestanding-none",
+        "-static",
+        "-nostdlib",
+        "-ffreestanding",
+        "-O2",
+        "-mno-sse",
+        "-mno-sse2",
+        "-Wl,--gc-sections",
+        "-Wl,-z,norelro",
+        "-o",
+    });
+    hello17_elf.addArg("user/hello17.elf");
+    hello17_elf.addFileArg(b.path("user/hello17.c"));
+    hello17_elf.setName("compile hello17.c -> ELF");
+
+    const hello17_strip = b.addSystemCommand(&.{
+        "strip",
+        "-o",
+    });
+    hello17_strip.addArg("user/hello17.bin");
+    hello17_strip.addArg("user/hello17.elf");
+    hello17_strip.step.dependOn(&hello17_elf.step);
+    hello17_strip.setName("strip hello17.elf");
+
+    b.getInstallStep().dependOn(&hello17_strip.step);
+
+    const hello18_elf = b.addSystemCommand(&.{
+        "zig", "cc",
+        "-target", "x86_64-freestanding-none",
+        "-static",
+        "-nostdlib",
+        "-ffreestanding",
+        "-O2",
+        "-mno-sse",
+        "-mno-sse2",
+        "-Wl,--gc-sections",
+        "-Wl,-z,norelro",
+        "-o",
+    });
+    hello18_elf.addArg("user/hello18.elf");
+    hello18_elf.addFileArg(b.path("user/hello18.c"));
+    hello18_elf.setName("compile hello18.c -> ELF");
+
+    const hello18_strip = b.addSystemCommand(&.{
+        "strip",
+        "-o",
+    });
+    hello18_strip.addArg("user/hello18.bin");
+    hello18_strip.addArg("user/hello18.elf");
+    hello18_strip.step.dependOn(&hello18_elf.step);
+    hello18_strip.setName("strip hello18.elf");
+
+    b.getInstallStep().dependOn(&hello18_strip.step);
+
     // Build and run in QEMU with Limine
     const run_step = b.step("run", "Build and run in QEMU");
     const run_cmd = b.addSystemCommand(&.{"./tools/qemu_run.sh"});

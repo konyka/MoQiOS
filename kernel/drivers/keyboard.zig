@@ -118,6 +118,23 @@ pub fn handleInterrupt() void {
         if (ctrl_pressed and ch >= 'a' and ch <= 'z') {
             ch = ch - 'a' + 1; // Ctrl+A = 0x01, etc.
         }
+
+        // Ctrl+C (0x03): send SIGINT to all user tasks and push char to buffer
+        if (ch == 0x03) {
+            const signal = @import("../proc/signal.zig");
+            const task_mod = @import("../proc/task.zig");
+
+            for (0..task_mod.MAX_TASKS) |i| {
+                const t = task_mod.getTask(@intCast(i)) orelse continue;
+                if (!t.is_user or t.state == .zombie) continue;
+                _ = signal.sendSignal(t.tid, signal.SIGINT);
+            }
+
+            push(ch);
+            extended = false;
+            return;
+        }
+
         if (ch != 0) {
             push(ch);
         }

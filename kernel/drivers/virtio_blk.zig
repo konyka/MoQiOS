@@ -101,6 +101,9 @@ const VirtioBlkDevice = struct {
     req_header_virt: u64,
     status_phys: u64,
     status_virt: u64,
+    pci_bus: u8,
+    pci_dev: u8,
+    pci_func: u8,
 };
 
 var device: VirtioBlkDevice = .{
@@ -116,6 +119,9 @@ var device: VirtioBlkDevice = .{
     .req_header_virt = 0,
     .status_phys = 0,
     .status_virt = 0,
+    .pci_bus = 0,
+    .pci_dev = 0,
+    .pci_func = 0,
 };
 
 fn readReg8(offset: u32) u8 {
@@ -172,6 +178,17 @@ pub fn init() void {
 }
 
 fn initDevice(dev: *const pci.PciDevice) !void {
+    device.pci_bus = dev.bus;
+    device.pci_dev = dev.device;
+    device.pci_func = dev.function;
+
+    // Disable INTx (bit 10 = 0x400) and enable bus mastering (bit 2 = 0x4)
+    // in the PCI command register (offset 0x04). This prevents the virtio
+    // device from asserting INTx when completing write requests, which was
+    // causing sysretq hangs when writeSectors was called from syscall context.
+    const cmd = pci.configRead32(dev.bus, dev.device, dev.function, 0x04);
+    pci.configWrite32(dev.bus, dev.device, dev.function, 0x04, cmd | 0x404);
+
     // Use BAR0 (I/O ports) for legacy/transitional virtio
     const bar0 = dev.bars[0];
     if (bar0 == 0) {
@@ -362,7 +379,7 @@ pub fn readSectors(lba: u64, count: u32, buf: [*]u8) i64 {
 }
 
 /// Write sectors to the virtio-blk device.
-pub fn writeSectors(lba: u64, count: u32, buf: [*]const u8) i64 {
+pub noinline fn writeSectors(lba: u64, count: u32, buf: [*]const u8) i64 {
     if (!device.active) return -1;
     if (count == 0 or count > 128) return -1;
 
@@ -417,8 +434,14 @@ pub fn writeSectors(lba: u64, count: u32, buf: [*]const u8) i64 {
         asm volatile ("pause");
     }
 
-    if (timeout == 0) return -1;
-    if (status_byte.* != VIRTIO_BLK_S_OK) return -1;
+    if (timeout == 0) {
+        serial.writeString("[virtio-blk] write timeout\n");
+        return -1;
+    }
+    if (status_byte.* != VIRTIO_BLK_S_OK) {
+        serial.writeString("[virtio-blk] write error\n");
+        return -1;
+    }
 
     return @intCast(count * SECTOR_SIZE);
 }

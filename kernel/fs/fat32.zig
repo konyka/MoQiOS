@@ -50,6 +50,10 @@ var fat32_fat_start: u32 = 0;
 var fat32_data_start: u32 = 0;
 var fat32_total_sectors: u32 = 0;
 var fat32_sector_mask: u32 = 0;
+var fat32_fat_size_sectors: u32 = 0;
+var write_buf_phys: u64 = 0;
+var write_buf_virt: u64 = 0;
+var fat32_total_data_clusters: u32 = 0;
 
 var files: [MAX_FILES]FileInfo = @splat(.{
     .name = @splat(0),
@@ -70,6 +74,9 @@ pub fn init() void {
     // Allocate sector buffer
     sector_buf_phys = pmm.allocPage() orelse return;
     sector_buf_virt = hhdm.physToVirt(sector_buf_phys);
+
+    write_buf_phys = pmm.allocPage() orelse return;
+    write_buf_virt = hhdm.physToVirt(write_buf_phys);
 
     if (!virtio_blk.hasActiveDisk()) {
         serial.writeString("[fs] No block device available\n");
@@ -192,6 +199,9 @@ fn tryMountFAT32() void {
     fat32_fat_start = lba + reserved_sectors;
     fat32_data_start = fat32_fat_start + @as(u32, num_fats) * fat_size_32;
     fat32_sector_mask = sectors_per_cluster - 1;
+    fat32_fat_size_sectors = fat_size_32;
+    const data_sectors = fat32_total_sectors - @as(u32, reserved_sectors) - @as(u32, num_fats) * fat_size_32;
+    fat32_total_data_clusters = data_sectors / @as(u32, sectors_per_cluster);
     fat32_active = true;
 
     serial.writeString("[fs] FAT32 mounted: ");
@@ -381,6 +391,295 @@ pub fn getFileSize(idx: u32) u64 {
     return @intCast(files[idx].size);
 }
 
+pub fn getFileCount() u32 {
+    return file_count;
+}
+
+pub fn getFileName(idx: u32) ?[]const u8 {
+    if (idx >= file_count) return null;
+    const len = files[idx].name_len;
+    if (len == 0) return null;
+    return files[idx].name[0..len];
+}
+
+pub fn setFileSize(idx: u32, size: u32) void {
+    if (idx >= file_count) return;
+    files[idx].size = size;
+}
+
+/// Wrapper around virtio_blk.writeSectors that disables interrupts during
+/// the write. Without CLI/STI, writeSectors called from syscall context
+/// prevents sysretq from returning to user space — the virtio-blk write
+/// completion triggers an interrupt that corrupts the syscall return path.
+fn safeWriteSectors(lba: u64, count: u32, buf: [*]const u8) i64 {
+    asm volatile ("cli" ::: .{ .memory = true });
+    const ret = virtio_blk.writeSectors(lba, count, buf);
+    asm volatile ("sti" ::: .{ .memory = true });
+    return ret;
+}
+
+fn setFATEntry(cluster: u32, value: u32) void {
+    const fat_offset = cluster * 4;
+    const sector = fat32_fat_start + fat_offset / @as(u32, fat32_bytes_per_sector);
+    const offset = fat_offset % @as(u32, fat32_bytes_per_sector);
+
+    const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
+    _ = virtio_blk.readSectors(sector, 1, buf);
+    buf[offset] = @truncate(value);
+    buf[offset + 1] = @truncate(value >> 8);
+    buf[offset + 2] = @truncate(value >> 16);
+    buf[offset + 3] = (buf[offset + 3] & 0xF0) | @as(u8, @truncate(value >> 24));
+    _ = safeWriteSectors(sector, 1, buf);
+}
+
+fn allocCluster() ?u32 {
+    const entries_per_sector = @as(u32, fat32_bytes_per_sector) / 4;
+    const total_fat_entries = fat32_fat_size_sectors * entries_per_sector;
+    const max_cluster = if (fat32_total_data_clusters + 2 < total_fat_entries) fat32_total_data_clusters + 2 else total_fat_entries;
+
+    var cluster: u32 = 2;
+    while (cluster < max_cluster) : (cluster += 1) {
+        const entry = getFATEntry(cluster);
+        if (entry == 0) {
+            setFATEntry(cluster, 0x0FFFFFFF);
+            return cluster;
+        }
+    }
+    return null;
+}
+
+fn zeroCluster(cluster: u32) void {
+    const lba = clusterToLBA(cluster);
+    const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
+    @memset(buf[0..SECTOR_SIZE], 0);
+    var s: u32 = 0;
+    while (s < fat32_sectors_per_cluster) : (s += 1) {
+        _ = safeWriteSectors(lba + s, 1, buf);
+    }
+}
+
+pub fn createFile(name: []const u8) i64 {
+    if (!fat32_active) return -1;
+    if (file_count >= MAX_FILES) return -1;
+    if (name.len == 0 or name.len > 12) return -1;
+
+    for (0..file_count) |i| {
+        if (files[i].name_len == name.len) {
+            var match = true;
+            for (0..name.len) |j| {
+                if (files[i].name[j] != name[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return @intCast(i);
+        }
+    }
+
+    const new_cluster = allocCluster() orelse return -1;
+    zeroCluster(new_cluster);
+
+    var basename: [8]u8 = @splat(0x20);
+    var ext: [3]u8 = @splat(0x20);
+    var dot_pos: usize = name.len;
+    for (0..name.len) |j| {
+        if (name[j] == '.') {
+            dot_pos = j;
+            break;
+        }
+    }
+    for (0..if (dot_pos < 8) dot_pos else @as(usize, 8)) |j| {
+        const c = name[j];
+        basename[j] = if (c >= 'a' and c <= 'z') c - 32 else c;
+    }
+    if (dot_pos < name.len) {
+        const ext_start = dot_pos + 1;
+        for (0..3) |j| {
+            if (ext_start + j < name.len) {
+                const c = name[ext_start + j];
+                ext[j] = if (c >= 'a' and c <= 'z') c - 32 else c;
+            }
+        }
+    }
+
+    const root_lba = clusterToLBA(fat32_root_cluster);
+    const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
+    _ = virtio_blk.readSectors(root_lba, 1, buf);
+
+    var free_entry: u32 = 16;
+    for (0..16) |i| {
+        const off: u32 = @intCast(i * 32);
+        if (buf[off] == 0x00 or buf[off] == 0xE5) {
+            free_entry = @intCast(i);
+            break;
+        }
+    }
+    if (free_entry >= 16) return -1;
+
+    const eoff = free_entry * 32;
+    for (0..8) |j| buf[eoff + j] = basename[j];
+    for (0..3) |j| buf[eoff + 8 + j] = ext[j];
+    buf[eoff + 11] = 0x20;
+    buf[eoff + 12] = 0;
+    buf[eoff + 13] = 0;
+    const create_time: u16 = 0;
+    const create_date: u16 = 0;
+    buf[eoff + 14] = @truncate(create_time);
+    buf[eoff + 15] = @truncate(create_time >> 8);
+    buf[eoff + 16] = @truncate(create_date);
+    buf[eoff + 17] = @truncate(create_date >> 8);
+    buf[eoff + 18] = @truncate(create_date);
+    buf[eoff + 19] = @truncate(create_date >> 8);
+    buf[eoff + 20] = @truncate(new_cluster >> 16);
+    buf[eoff + 21] = @truncate(new_cluster >> 24);
+    buf[eoff + 22] = @truncate(create_time);
+    buf[eoff + 23] = @truncate(create_time >> 8);
+    buf[eoff + 24] = @truncate(create_date);
+    buf[eoff + 25] = @truncate(create_date >> 8);
+    buf[eoff + 26] = @truncate(new_cluster);
+    buf[eoff + 27] = @truncate(new_cluster >> 8);
+    buf[eoff + 28] = 0;
+    buf[eoff + 29] = 0;
+    buf[eoff + 30] = 0;
+    buf[eoff + 31] = 0;
+
+    _ = safeWriteSectors(root_lba, 1, buf);
+
+    var fi = FileInfo{
+        .name = @splat(0),
+        .name_len = @intCast(name.len),
+        .size = 0,
+        .first_cluster = new_cluster,
+        .is_dir = false,
+    };
+    for (0..name.len) |j| fi.name[j] = name[j];
+    const idx = file_count;
+    files[idx] = fi;
+    file_count += 1;
+    return @intCast(idx);
+}
+
+pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
+    if (!fat32_active or file_idx >= file_count) return -1;
+    const fi = &files[file_idx];
+
+    const cluster_size = @as(u32, fat32_sectors_per_cluster) * SECTOR_SIZE;
+
+    // Allocate additional clusters if needed
+    var needed_clusters: u32 = (offset + count + cluster_size - 1) / cluster_size;
+    if (needed_clusters == 0) needed_clusters = 1;
+    var current_clusters: u32 = 0;
+    if (fi.size > 0) {
+        current_clusters = (fi.size + cluster_size - 1) / cluster_size;
+    }
+
+    while (current_clusters < needed_clusters) : (current_clusters += 1) {
+        var c: u32 = fi.first_cluster;
+        if (c < 2 or c >= 0x0FFFFFF8) {
+            const nc = allocCluster() orelse return -1;
+            zeroCluster(nc);
+            fi.first_cluster = nc;
+            continue;
+        }
+        var last: u32 = c;
+        while (c >= 2 and c < 0x0FFFFFF8) {
+            last = c;
+            c = getFATEntry(c);
+        }
+        const nc = allocCluster() orelse return -1;
+        zeroCluster(nc);
+        setFATEntry(last, nc);
+    }
+
+    // Write data: iterate over clusters, copying buf into the right sectors.
+    // For each sector touched, read-modify-write (read the sector, overlay the
+    // user data at the right offset, write it back).
+    var bytes_written: u32 = 0;
+    var cluster: u32 = fi.first_cluster;
+    var file_offset: u32 = 0;
+    const wbuf: [*]u8 = @ptrFromInt(write_buf_virt);
+
+    while (bytes_written < count) {
+        if (cluster < 2 or cluster >= 0x0FFFFFF8) break;
+
+        const cluster_start_lba = clusterToLBA(cluster);
+        const cluster_end_offset = file_offset + cluster_size;
+
+        // Does this cluster overlap the [offset, offset+count) range?
+        if (cluster_end_offset > offset and file_offset < offset + count) {
+            // Compute the overlap within this cluster
+            const overlap_start = if (offset > file_offset) offset - file_offset else 0;
+            const overlap_end = if (offset + count < cluster_end_offset) offset + count - file_offset else cluster_size;
+
+            var sec: u32 = 0;
+            while (sec < fat32_sectors_per_cluster) : (sec += 1) {
+                const sec_start = sec * SECTOR_SIZE;
+                const sec_end = sec_start + SECTOR_SIZE;
+
+                // Does this sector overlap?
+                if (sec_end <= overlap_start or sec_start >= overlap_end) continue;
+
+                const lba = cluster_start_lba + sec;
+
+                // Determine the byte range to modify within this sector
+                const mod_start = if (overlap_start > sec_start) overlap_start - sec_start else 0;
+                const mod_end = if (overlap_end < sec_end) overlap_end - sec_start else SECTOR_SIZE;
+
+                // If writing the full sector, no need to read first
+                if (mod_start == 0 and mod_end == SECTOR_SIZE) {
+                    @memcpy(wbuf[0..SECTOR_SIZE], buf[bytes_written .. bytes_written + SECTOR_SIZE]);
+                } else {
+                    // Read-modify-write
+                    _ = virtio_blk.readSectors(lba, 1, wbuf);
+                    @memcpy(wbuf[mod_start..mod_end], buf[bytes_written .. bytes_written + (mod_end - mod_start)]);
+                }
+
+                _ = safeWriteSectors(lba, 1, wbuf);
+                bytes_written += @intCast(mod_end - mod_start);
+            }
+        }
+
+        file_offset = cluster_end_offset;
+        cluster = getFATEntry(cluster);
+    }
+
+    if (offset + count > fi.size) {
+        fi.size = offset + count;
+        updateDirEntry(file_idx);
+    }
+
+    return @intCast(bytes_written);
+}
+
+fn updateDirEntry(file_idx: u32) void {
+    if (file_idx >= file_count) return;
+    const fi = files[file_idx];
+
+    const root_lba = clusterToLBA(fat32_root_cluster);
+    const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
+    _ = virtio_blk.readSectors(root_lba, 1, buf);
+
+    for (0..16) |i| {
+        const off: u32 = @intCast(i * 32);
+        if (buf[off] == 0x00) break;
+        if (buf[off] == 0xE5) continue;
+        if (buf[off + 11] == 0x0F) continue;
+        if (buf[off + 11] == 0x08) continue;
+
+        const entry_cluster = @as(u32, @as(u16, @bitCast([2]u8{ buf[off + 26], buf[off + 27] }))) |
+            (@as(u32, @as(u16, @bitCast([2]u8{ buf[off + 20], buf[off + 21] }))) << 16);
+
+        if (entry_cluster == fi.first_cluster) {
+            buf[off + 28] = @truncate(fi.size);
+            buf[off + 29] = @truncate(fi.size >> 8);
+            buf[off + 30] = @truncate(fi.size >> 16);
+            buf[off + 31] = @truncate(fi.size >> 24);
+            _ = safeWriteSectors(root_lba, 1, buf);
+            return;
+        }
+    }
+}
+
 fn writeHexByte(v: u8) void {
     const hex = "0123456789abcdef";
     var buf: [2]u8 = undefined;
@@ -408,4 +707,65 @@ fn writeDecimal32(v: u32) void {
         buf[i - 1 - j] = tmp;
     }
     serial.writeString(buf[0..i]);
+}
+
+pub fn deleteFile(file_idx: u32) bool {
+    if (!fat32_active or file_idx >= file_count) return false;
+    const fi = files[file_idx];
+
+    // Mark directory entry as deleted (0xE5)
+    const root_lba = clusterToLBA(fat32_root_cluster);
+    const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
+    _ = virtio_blk.readSectors(root_lba, 1, buf);
+
+    for (0..16) |i| {
+        const off: u32 = @intCast(i * 32);
+        if (buf[off] == 0x00) break;
+        if (buf[off] == 0xE5) continue;
+        if (buf[off + 11] == 0x0F) continue;
+        if (buf[off + 11] == 0x08) continue;
+
+        const entry_cluster = @as(u32, @as(u16, @bitCast([2]u8{ buf[off + 26], buf[off + 27] }))) |
+            (@as(u32, @as(u16, @bitCast([2]u8{ buf[off + 20], buf[off + 21] }))) << 16);
+
+        if (entry_cluster == fi.first_cluster) {
+            buf[off] = 0xE5;
+            _ = safeWriteSectors(root_lba, 1, buf);
+            break;
+        }
+    }
+
+    // Free the cluster chain in FAT
+    var cluster: u32 = fi.first_cluster;
+    var safety: u32 = 0;
+    while (cluster >= 2 and cluster < 0x0FFFFFF8 and safety < 65536) : (safety += 1) {
+        const fat_offset = cluster * 4;
+        const sector = fat32_fat_start + fat_offset / @as(u32, fat32_bytes_per_sector);
+        const offset = fat_offset % @as(u32, fat32_bytes_per_sector);
+
+        const fbuf: [*]u8 = @ptrFromInt(sector_buf_virt);
+        _ = virtio_blk.readSectors(sector, 1, fbuf);
+        const next_cluster_0 = fbuf[offset];
+        const next_cluster_1 = fbuf[offset + 1];
+        const next_cluster_2 = fbuf[offset + 2];
+        const next_cluster_3 = fbuf[offset + 3] & 0x0F;
+        const next_cluster: u32 = @as(u32, next_cluster_0) | (@as(u32, next_cluster_1) << 8) | (@as(u32, next_cluster_2) << 16) | (@as(u32, next_cluster_3) << 24);
+
+        // Mark cluster as free (0)
+        fbuf[offset] = 0;
+        fbuf[offset + 1] = 0;
+        fbuf[offset + 2] = 0;
+        fbuf[offset + 3] = fbuf[offset + 3] & 0xF0;
+        _ = safeWriteSectors(sector, 1, fbuf);
+
+        cluster = next_cluster;
+    }
+
+    // Remove from in-memory file array
+    for (file_idx..file_count - 1) |i| {
+        files[i] = files[i + 1];
+    }
+    file_count -= 1;
+
+    return true;
 }

@@ -49,6 +49,15 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         _ = task.reapZombies();
     }
 
+    // Check for pending signals on current task
+    if (current_idx) |ci| {
+        if (task.getTask(ci)) |ct| {
+            if (ct.is_user and ct.pending_signals != 0 and ct.pending_signals & ~ct.signal_mask != 0) {
+                deliverSignalToRunningTask(ct);
+            }
+        }
+    }
+
     const count = task.getTaskCount();
     if (count == 0) return;
 
@@ -113,7 +122,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
     current_idx = next_idx;
 
     if (new_task.page_table_phys != 0) {
-    if (old_task.page_table_phys != new_task.page_table_phys) {
+        if (old_task.page_table_phys != new_task.page_table_phys) {
                 asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
                     :
                     : [cr3] "r" (new_task.page_table_phys),
@@ -192,4 +201,61 @@ fn pickNext() ?u32 {
     }
 
     return best_idx;
+}
+
+fn fmtDec(buf: []u8, value: u64) []const u8 {
+    if (value == 0) {
+        buf[0] = '0';
+        return buf[0..1];
+    }
+    var i: usize = 0;
+    var v = value;
+    while (v > 0) : (v /= 10) {
+        buf[i] = @intCast(v % 10 + '0');
+        i += 1;
+    }
+    var j: usize = 0;
+    while (j < i / 2) : (j += 1) {
+        const tmp = buf[j];
+        buf[j] = buf[i - 1 - j];
+        buf[i - 1 - j] = tmp;
+    }
+    return buf[0..i];
+}
+
+/// Deliver a pending signal to the currently running user task.
+/// Modifies the InterruptFrame on the kernel stack to redirect execution
+/// to the signal handler with a signal frame pushed onto the user stack.
+pub fn deliverSignalToRunningTask(t: *task.Task) void {
+    // Only deliver to tasks returning to user mode.
+    // Check this BEFORE dequeuing the signal to avoid losing it.
+    const iframe: *idt.InterruptFrame = @ptrFromInt(saved_stack_anchor);
+    if (iframe.cs != 0x1B) return;
+
+    const sig_mod = @import("signal.zig");
+
+    const signum = sig_mod.dequeueSignal(t) orelse return;
+
+    const handler_addr = t.signal_handlers[signum - 1];
+
+    if (handler_addr == 0) {
+        if (!sig_mod.defaultSignalAction(signum)) {
+            t.state = .zombie;
+            t.exit_code = 128 + @as(i32, @intCast(signum));
+        }
+        return;
+    }
+
+    if (handler_addr == 1) return;
+
+    const user_rsp = iframe.rsp;
+    const user_rip = iframe.rip;
+    const user_rflags = iframe.rflags;
+
+    const result = sig_mod.pushSignalFrame(t, signum, user_rsp, user_rip, user_rflags);
+
+    // Modify the InterruptFrame to jump to the signal handler
+    iframe.rip = handler_addr;
+    iframe.rsp = result.new_rsp;
+    iframe.rdi = signum;
 }

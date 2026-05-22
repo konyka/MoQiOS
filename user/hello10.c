@@ -23,7 +23,7 @@ static void print_num(long n) {
     if (n == 0) { print("0"); return; }
     char buf[20];
     int i = 0;
-    while (n > 0) { buf[i++] = '0' + (n % 10); n /= 10; }
+    while (n > 0) { buf[i++] = '0' + (n % 10); n = n / 10; }
     char out[20];
     for (int j = 0; j < i; j++) out[j] = buf[i - 1 - j];
     out[i] = '\0';
@@ -31,7 +31,7 @@ static void print_num(long n) {
 }
 
 void _start(void) {
-    print("hello10: fork test\n");
+    print("hello10: fork+execve test\n");
 
     long pid = syscall1(57, 0);
     if (pid < 0) {
@@ -40,8 +40,10 @@ void _start(void) {
     }
 
     if (pid == 0) {
-        print("hello10: I am child\n");
-        syscall1(2, 0);
+        print("hello10: child calling execve...\n");
+        long ret = syscall1(59, (long)"hello11");
+        print("hello10: execve failed!\n");
+        syscall1(2, 1);
     }
 
     print("hello10: parent, child=");

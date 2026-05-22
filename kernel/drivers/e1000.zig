@@ -4,7 +4,6 @@
 /// Uses polling mode (no interrupts for now).
 
 const serial = @import("../arch/x86_64/serial.zig");
-const io = @import("../arch/x86_64/io.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const paging = @import("../arch/x86_64/paging.zig");
 const pmm = @import("../mm/pmm.zig");
@@ -27,7 +26,7 @@ const REG_TXDESCHI: u32 = 0x3804;
 const REG_TXDESCLEN: u32 = 0x3808;
 const REG_TXDESCHEAD: u32 = 0x3810;
 const REG_TXDESCTAIL: u32 = 0x3818;
-const REG_RDTR: u32 = 0x2820;
+const REG_TIPG: u32 = 0x0410;
 const REG_RAL: u32 = 0x5400;
 const REG_RAH: u32 = 0x5404;
 const REG_MTA: u32 = 0x5200;
@@ -38,14 +37,8 @@ const CTRL_SLU: u32 = 1 << 6;
 
 // RCTRL bits
 const RCTRL_EN: u32 = 1 << 1;
-const RCTRL_SBP: u32 = 1 << 2;
-const RCTRL_UPE: u32 = 1 << 3;
-const RCTRL_MPE: u32 = 1 << 4;
-const RCTRL_LPE: u32 = 1 << 5;
 const RCTRL_BAM: u32 = 1 << 15;
 const RCTRL_BSIZE_2048: u32 = 0;
-const RCTRL_BSIZE_1024: u32 = 1 << 16;
-const RCTRL_BSIZE_512: u32 = 2 << 16;
 const RCTRL_SECRC: u32 = 1 << 26;
 
 // TCTRL bits
@@ -54,34 +47,40 @@ const TCTRL_PSP: u32 = 1 << 3;
 
 // Descriptor status bits
 const RX_DESC_DD: u16 = 0x01;
-const RX_DESC_EOP: u16 = 0x02;
-const TX_DESC_DD: u16 = 0x01;
-const TX_DESC_EOP: u16 = 0x02;
-const TX_DESC_IFCS: u16 = 0x02;
-const TX_DESC_RS: u16 = 0x08;
+const TX_DESC_DD: u8 = 0x01;
+const TX_DESC_EOP: u8 = 0x01;
+const TX_DESC_IFCS: u8 = 0x02;
+const TX_DESC_RS: u8 = 0x08;
 
 const NUM_RX_DESC: u32 = 32;
 const NUM_TX_DESC: u32 = 32;
-const PKT_BUF_SIZE: u32 = 2048;
 
+/// Legacy RX descriptor (16 bytes).
 pub const RxDesc = extern struct {
     addr: u64,
     length: u16,
     checksum: u16,
-    status: u16,
-    errors: u16,
+    status: u8,
+    errors: u8,
     special: u16,
 };
+comptime {
+    if (@sizeOf(RxDesc) != 16) @compileError("RxDesc must be 16 bytes");
+}
 
+/// Legacy TX descriptor (16 bytes).
 pub const TxDesc = extern struct {
     addr: u64,
     length: u16,
     cso: u8,
     cmd: u8,
-    status: u16,
+    status: u8,
     css: u8,
-    _reserved: u8,
+    special: u16,
 };
+comptime {
+    if (@sizeOf(TxDesc) != 16) @compileError("TxDesc must be 16 bytes");
+}
 
 var mmio_base: u64 = 0;
 var mac_addr: [6]u8 = @splat(0);
@@ -115,7 +114,7 @@ pub fn init() void {
 
     for (0..pci.device_count) |i| {
         const dev = pci.devices[i];
-        if (dev.vendor_id == pci.VENDOR_INTEL and dev.device_id == 0x10D3) {
+        if (dev.vendor_id == pci.VENDOR_INTEL and (dev.device_id == 0x100E or dev.device_id == 0x10D3)) {
             serial.writeString("[e1000] Found at ");
             writeHex8(dev.bus);
             serial.writeString(":");
@@ -135,6 +134,10 @@ pub fn init() void {
 }
 
 fn initDevice(dev: *const pci.PciDevice) !void {
+    // Enable bus mastering (bit 2) and disable INTx (bit 10) in PCI command register
+    const cmd = pci.configRead32(dev.bus, dev.device, dev.function, 0x04);
+    pci.configWrite32(dev.bus, dev.device, dev.function, 0x04, cmd | 0x404);
+
     // Map BAR0 (MMIO)
     const bar0 = dev.bars[0];
     if (bar0 == 0) return error.NoBAR;
@@ -187,15 +190,30 @@ fn initDevice(dev: *const pci.PciDevice) !void {
     }
     serial.writeString("\n");
 
-    // Setup RX
+    // Program Receive Address Register (RAL/RAH) with our MAC + AV bit
+    const ral: u32 = @as(u32, mac_addr[0]) | (@as(u32, mac_addr[1]) << 8) |
+        (@as(u32, mac_addr[2]) << 16) | (@as(u32, mac_addr[3]) << 24);
+    const rah: u32 = @as(u32, mac_addr[4]) | (@as(u32, mac_addr[5]) << 8) | 0x80000000;
+    writeReg(REG_RAL, ral);
+    writeReg(REG_RAH, rah);
+
+    // Clear Multicast Table Array (128 entries)
+    for (0..128) |i| {
+        writeReg(REG_MTA + @as(u32, @intCast(i)) * 4, 0);
+    }
+
+    // Setup RX and TX descriptor rings
     try setupRX();
     try setupTX();
 
-    // Enable receive
+    // Enable receive: EN | BAM | BSIZE_2048 | SECRC
     writeReg(REG_RCTRL, readReg(REG_RCTRL) | RCTRL_EN | RCTRL_BAM | RCTRL_BSIZE_2048 | RCTRL_SECRC);
 
-    // Enable transmit
+    // Enable transmit: EN | PSP
     writeReg(REG_TCTRL, readReg(REG_TCTRL) | TCTRL_EN | TCTRL_PSP);
+
+    // Program TX Inter-Packet Gap
+    writeReg(REG_TIPG, 10 | (4 << 10) | (6 << 20));
 
     initialized = true;
     serial.writeString("[e1000] Initialized\n");
@@ -326,12 +344,14 @@ pub fn receivePacket(buf: [*]u8, max_len: u32) u32 {
 
 /// Send a raw packet.
 pub fn sendPacket(data: [*]const u8, len: u32) bool {
-    if (!initialized or len == 0 or len > PKT_BUF_SIZE) return false;
+    if (!initialized or len == 0 or len > 2048) return false;
 
     const desc: *volatile TxDesc = @ptrFromInt(tx_desc_virt + tx_tail * @sizeOf(TxDesc));
 
     // Wait for descriptor to be available
-    if ((desc.status & TX_DESC_DD) == 0) return false;
+    if ((desc.status & TX_DESC_DD) == 0) {
+        return false;
+    }
 
     // Copy data to TX buffer
     const dst: [*]u8 = @ptrFromInt(tx_buf_virt[tx_tail]);
@@ -339,8 +359,11 @@ pub fn sendPacket(data: [*]const u8, len: u32) bool {
 
     desc.addr = tx_buf_phys[tx_tail];
     desc.length = @intCast(len);
+    desc.cso = 0;
     desc.cmd = TX_DESC_EOP | TX_DESC_IFCS | TX_DESC_RS;
     desc.status = 0;
+    desc.css = 0;
+    desc.special = 0;
 
     tx_tail = (tx_tail + 1) % NUM_TX_DESC;
     writeReg(REG_TXDESCTAIL, tx_tail);
