@@ -136,6 +136,10 @@ export fn _start() callconv(.c) noreturn {
     const net_mod = @import("net/mod.zig");
     net_mod.init();
 
+    // ext2 filesystem (on first virtio-blk disk at LBA offset 32768)
+    const ext2 = @import("fs/ext2.zig");
+    ext2.init();
+
     // M3: LAPIC timer — use LAPIC address from ACPI MADT, fallback to 0xFEE00000
     const lapic_addr = if (acpi.info.lapic_address != 0) acpi.info.lapic_address else 0xFEE00000;
     lapic.init(lapic_addr);

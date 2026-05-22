@@ -27,6 +27,7 @@ pub const FdType = enum(u8) {
     fat32_file = 3,
     pipe_read = 4,
     pipe_write = 5,
+    ext2_file = 6,
 };
 
 pub const PIPE_BUF_SIZE: u32 = 4096;
@@ -99,6 +100,7 @@ pub const FileDescriptor = struct {
     file_size: u64 = 0,
     file_data: u64 = 0,
     fat32_file_idx: u32 = 0,
+    ext2_file_idx: u32 = 0,
     pipe_idx: u32 = 0,
     writable: bool = false,
 };
@@ -171,6 +173,21 @@ pub const FdTable = struct {
             }
         }
 
+        const ext2 = @import("ext2.zig");
+        if (ext2.isActive()) {
+            const fi = ext2.openFile(name);
+            if (fi >= 0) {
+                const idx: u32 = @intCast(fi);
+                self.fds[slot] = .{
+                    .fd_type = .ext2_file,
+                    .offset = 0,
+                    .file_size = ext2.getFileSize(idx),
+                    .ext2_file_idx = idx,
+                };
+                return @intCast(slot);
+            }
+        }
+
         return -1;
     }
 
@@ -205,6 +222,13 @@ pub const FdTable = struct {
                 if (desc.offset >= desc.file_size) return 0;
                 const fat32 = @import("fat32.zig");
                 const n = fat32.readFile(desc.fat32_file_idx, @intCast(desc.offset), buf, @intCast(count));
+                if (n > 0) desc.offset += @intCast(n);
+                return n;
+            },
+            .ext2_file => {
+                if (desc.offset >= desc.file_size) return 0;
+                const ext2 = @import("ext2.zig");
+                const n = ext2.readFile(desc.ext2_file_idx, @intCast(desc.offset), buf, @intCast(count));
                 if (n > 0) desc.offset += @intCast(n);
                 return n;
             },
@@ -243,6 +267,7 @@ pub const FdTable = struct {
                 return n;
             },
             .ramdisk_file => return -1,
+            .ext2_file => return -1,
         }
     }
 
@@ -254,6 +279,10 @@ pub const FdTable = struct {
         if (desc.fd_type == .none) return -1;
         if (desc.fd_type == .pipe_read or desc.fd_type == .pipe_write) {
             pipeClose(desc.pipe_idx);
+        }
+        if (desc.fd_type == .ext2_file) {
+            const ext2 = @import("ext2.zig");
+            ext2.closeFile(desc.ext2_file_idx);
         }
         desc.* = .{};
         return 0;

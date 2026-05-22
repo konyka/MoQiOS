@@ -124,6 +124,24 @@ var device: VirtioBlkDevice = .{
     .pci_func = 0,
 };
 
+var device2: VirtioBlkDevice = .{
+    .io_base = 0,
+    .config_base = 0,
+    .queue_phys = 0,
+    .queue_virt = 0,
+    .queue_num = 0,
+    .capacity_sectors = 0,
+    .active = false,
+    .last_used_idx = 0,
+    .req_header_phys = 0,
+    .req_header_virt = 0,
+    .status_phys = 0,
+    .status_virt = 0,
+    .pci_bus = 0,
+    .pci_dev = 0,
+    .pci_func = 0,
+};
+
 fn readReg8(offset: u32) u8 {
     return io.inb(@intCast(device.io_base + offset));
 }
@@ -155,9 +173,9 @@ fn readConfig32(offset: u32) u32 {
 pub fn init() void {
     serial.writeString("[virtio-blk] Scanning for virtio-blk devices...\n");
 
+    var found: u32 = 0;
     for (0..pci.device_count) |i| {
         const dev = pci.devices[i];
-        // Virtio-blk: vendor 0x1AF4, device 0x1001 (transitional) or 0x1042 (non-transitional)
         if (dev.vendor_id == pci.VENDOR_QEMU_VIRTIO and (dev.device_id == 0x1001 or dev.device_id == 0x1042)) {
             serial.writeString("[virtio-blk] Found at ");
             writeHex8(dev.bus);
@@ -166,81 +184,83 @@ pub fn init() void {
             serial.writeString(".");
             writeHex8(dev.function);
             serial.writeString("\n");
-            initDevice(&dev) catch |err| {
-                serial.writeString("[virtio-blk] Init failed: ");
-                serial.writeString(@errorName(err));
-                serial.writeString("\n");
-            };
-            return;
+
+            if (found == 0) {
+                initDevice(&dev, &device) catch |err| {
+                    serial.writeString("[virtio-blk] Init failed: ");
+                    serial.writeString(@errorName(err));
+                    serial.writeString("\n");
+                };
+            } else if (found == 1) {
+                initDevice(&dev, &device2) catch |err| {
+                    serial.writeString("[virtio-blk] Device 2 init failed: ");
+                    serial.writeString(@errorName(err));
+                    serial.writeString("\n");
+                };
+            }
+            found += 1;
+            if (found >= 2) break;
         }
     }
-    serial.writeString("[virtio-blk] No device found\n");
+    if (found == 0) serial.writeString("[virtio-blk] No device found\n");
 }
 
-fn initDevice(dev: *const pci.PciDevice) !void {
-    device.pci_bus = dev.bus;
-    device.pci_dev = dev.device;
-    device.pci_func = dev.function;
+fn initDevice(dev: *const pci.PciDevice, out: *VirtioBlkDevice) !void {
+    out.pci_bus = dev.bus;
+    out.pci_dev = dev.device;
+    out.pci_func = dev.function;
 
     // Disable INTx (bit 10 = 0x400) and enable bus mastering (bit 2 = 0x4)
-    // in the PCI command register (offset 0x04). This prevents the virtio
-    // device from asserting INTx when completing write requests, which was
-    // causing sysretq hangs when writeSectors was called from syscall context.
     const cmd = pci.configRead32(dev.bus, dev.device, dev.function, 0x04);
     pci.configWrite32(dev.bus, dev.device, dev.function, 0x04, cmd | 0x404);
 
-    // Use BAR0 (I/O ports) for legacy/transitional virtio
     const bar0 = dev.bars[0];
     if (bar0 == 0) {
         serial.writeString("[virtio-blk] BAR0 is null\n");
         return error.NoBAR;
     }
-    device.io_base = bar0 & 0xFFFFFFFC;
+    out.io_base = bar0 & 0xFFFFFFFC;
+    out.config_base = out.io_base + VIRTIO_PCI_CONFIG_OFFSET;
 
-    // BAR1 + config offset for device-specific config
-    // For virtio-blk legacy, config is at io_base + 0x38
-    device.config_base = device.io_base + VIRTIO_PCI_CONFIG_OFFSET;
-
-    // Map I/O region is not needed for port I/O — we use in/out instructions
+    const base = out.io_base;
 
     // Reset device
-    writeReg8(VIRTIO_PCI_STATUS, 0);
+    io.outb(@intCast(base + VIRTIO_PCI_STATUS), 0);
 
     // Acknowledge
-    writeReg8(VIRTIO_PCI_STATUS, VIRTIO_STATUS_ACK);
-    writeReg8(VIRTIO_PCI_STATUS, VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER);
+    io.outb(@intCast(base + VIRTIO_PCI_STATUS), VIRTIO_STATUS_ACK);
+    io.outb(@intCast(base + VIRTIO_PCI_STATUS), VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER);
 
-    // Negotiate features — accept none for simplicity (no barriers, etc.)
-    const device_features = readReg32(VIRTIO_PCI_DEVICE_FEATURES);
-    _ = device_features;
-    writeReg32(VIRTIO_PCI_DRIVER_FEATURES, 0);
+    // Negotiate features — accept none
+    _ = io.inl(@intCast(base + VIRTIO_PCI_DEVICE_FEATURES));
+    io.outl(@intCast(base + VIRTIO_PCI_DRIVER_FEATURES), 0);
 
-    writeReg8(VIRTIO_PCI_STATUS, VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
-    const status = readReg8(VIRTIO_PCI_STATUS);
+    io.outb(@intCast(base + VIRTIO_PCI_STATUS), VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
+    const status = io.inb(@intCast(base + VIRTIO_PCI_STATUS));
     if ((status & VIRTIO_STATUS_FEATURES_OK) == 0) {
         serial.writeString("[virtio-blk] Feature negotiation failed\n");
         return error.FeatureNegotiation;
     }
 
-    // Read capacity from config (first 8 bytes = capacity in 512-byte sectors)
-    const cap_lo = readConfig32(0);
-    const cap_hi = readConfig32(4);
-    device.capacity_sectors = (@as(u64, cap_hi) << 32) | cap_lo;
+    // Read capacity from config
+    const cap_lo = io.inl(@intCast(base + VIRTIO_PCI_CONFIG_OFFSET));
+    const cap_hi = io.inl(@intCast(base + VIRTIO_PCI_CONFIG_OFFSET + 4));
+    out.capacity_sectors = (@as(u64, cap_hi) << 32) | cap_lo;
 
     serial.writeString("[virtio-blk] Capacity: ");
-    writeDecimal64(device.capacity_sectors);
+    writeDecimal64(out.capacity_sectors);
     serial.writeString(" sectors (");
-    writeDecimal64(device.capacity_sectors / 2);
+    writeDecimal64(out.capacity_sectors / 2);
     serial.writeString(" KB)\n");
 
     // Set up virtqueue 0 (request queue)
-    writeReg16(VIRTIO_PCI_QUEUE_SEL, 0);
-    const queue_size = readReg16(VIRTIO_PCI_QUEUE_NUM);
+    io.outw(@intCast(base + VIRTIO_PCI_QUEUE_SEL), 0);
+    const queue_size = io.inw(@intCast(base + VIRTIO_PCI_QUEUE_NUM));
     if (queue_size == 0) {
         serial.writeString("[virtio-blk] Queue 0 has size 0\n");
         return error.BadQueue;
     }
-    device.queue_num = queue_size;
+    out.queue_num = queue_size;
 
     // Allocate queue memory (3 pages for desc+avail+used)
     const queue_phys = pmm.allocPage() orelse return error.OutOfMemory;
@@ -268,32 +288,32 @@ fn initDevice(dev: *const pci.PciDevice) !void {
     var qptr: [*]u8 = @ptrFromInt(queue_virt);
     @memset(qptr[0 .. paging.PAGE_SIZE * 3], 0);
 
-    device.queue_phys = queue_phys;
-    device.queue_virt = queue_virt;
+    out.queue_phys = queue_phys;
+    out.queue_virt = queue_virt;
 
     // Register the queue (legacy: write page frame number = phys / 4096)
-    writeReg32(VIRTIO_PCI_QUEUE_PFN, @truncate(queue_phys / paging.PAGE_SIZE));
+    io.outl(@intCast(base + VIRTIO_PCI_QUEUE_PFN), @truncate(queue_phys / paging.PAGE_SIZE));
 
     // Allocate request header and status bytes
     const req_phys = pmm.allocPage() orelse return error.OutOfMemory;
     const req_virt = hhdm.physToVirt(req_phys);
     var rptr: [*]u8 = @ptrFromInt(req_virt);
     @memset(rptr[0..paging.PAGE_SIZE], 0);
-    device.req_header_phys = req_phys;
-    device.req_header_virt = req_virt;
+    out.req_header_phys = req_phys;
+    out.req_header_virt = req_virt;
 
     const stat_phys = pmm.allocPage() orelse return error.OutOfMemory;
     const stat_virt = hhdm.physToVirt(stat_phys);
     var sptr: [*]u8 = @ptrFromInt(stat_virt);
     @memset(sptr[0..paging.PAGE_SIZE], 0);
-    device.status_phys = stat_phys;
-    device.status_virt = stat_virt;
+    out.status_phys = stat_phys;
+    out.status_virt = stat_virt;
 
     // Driver OK
-    writeReg8(VIRTIO_PCI_STATUS, VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
+    io.outb(@intCast(base + VIRTIO_PCI_STATUS), VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
 
-    device.active = true;
-    device.last_used_idx = 0;
+    out.active = true;
+    out.last_used_idx = 0;
 
     serial.writeString("[virtio-blk] Initialized, queue size=");
     writeDecimal(queue_size);
@@ -372,6 +392,72 @@ pub fn readSectors(lba: u64, count: u32, buf: [*]u8) i64 {
         serial.writeString("[virtio-blk] Read error status=");
         writeHex8(status_byte.*);
         serial.writeString("\n");
+        return -1;
+    }
+
+    return @intCast(count * SECTOR_SIZE);
+}
+
+pub fn readSectorsDisk(disk_id: u32, lba: u64, count: u32, buf: [*]u8) i64 {
+    if (disk_id == 0) return readSectorsFromDev(&device, lba, count, buf);
+    if (disk_id == 1) return readSectorsFromDev(&device2, lba, count, buf);
+    return -1;
+}
+
+fn readSectorsFromDev(dev: *VirtioBlkDevice, lba: u64, count: u32, buf: [*]u8) i64 {
+    if (!dev.active) return -1;
+    if (count == 0 or count > 128) return -1;
+
+    const buf_phys = virtToPhys(@intFromPtr(buf));
+
+    const req: *volatile BlkReqHeader = @ptrFromInt(dev.req_header_virt);
+    req.type = VIRTIO_BLK_T_IN;
+    req.reserved = 0;
+    req.sector = lba;
+
+    const status_byte: *volatile u8 = @ptrFromInt(dev.status_virt);
+    status_byte.* = 0xFF;
+
+    const d0 = getDesc(dev.queue_virt, 0);
+    d0.addr = dev.req_header_phys;
+    d0.len = @sizeOf(BlkReqHeader);
+    d0.flags = 1 << 0;
+    d0.next = 1;
+
+    const d1 = getDesc(dev.queue_virt, 1);
+    d1.addr = buf_phys;
+    d1.len = count * SECTOR_SIZE;
+    d1.flags = (1 << 0) | (1 << 1);
+    d1.next = 2;
+
+    const d2 = getDesc(dev.queue_virt, 2);
+    d2.addr = dev.status_phys;
+    d2.len = 1;
+    d2.flags = 0;
+    d2.next = 0;
+
+    const avail = getAvail(dev.queue_virt);
+    const avail_idx = avail.idx;
+    avail.ring[avail_idx % dev.queue_num] = 0;
+    asm volatile ("" ::: .{ .memory = true });
+    avail.idx = avail_idx + 1;
+
+    io.outw(@intCast(dev.io_base + VIRTIO_PCI_QUEUE_NOTIFY), 0);
+
+    const used = getUsed(dev.queue_virt);
+    var timeout: u32 = 10_000_000;
+    while (timeout > 0) : (timeout -= 1) {
+        if (used.idx != dev.last_used_idx) {
+            dev.last_used_idx = used.idx;
+            break;
+        }
+    }
+    if (timeout == 0) {
+        serial.writeString("[virtio-blk] read timeout\n");
+        return -1;
+    }
+    if (status_byte.* != VIRTIO_BLK_S_OK) {
+        serial.writeString("[virtio-blk] read error\n");
         return -1;
     }
 

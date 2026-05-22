@@ -399,6 +399,29 @@ _start:
     movq $13, %rdx
     syscall
 
+    # Spawn hello20 (ext2 test)
+    movq $5, %rax
+    leaq hello20_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn20_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done20_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
     # Spawn hello9 (fork test)
     movq $5, %rax
     leaq hello9_name(%rip), %rdi
@@ -567,6 +590,13 @@ spawn19_msg:
     .ascii "spawned hello19\n"
 done19_msg:
     .ascii "hello19 done\n"
+hello20_name:
+    .ascii "hello20"
+    .byte 0
+spawn20_msg:
+    .ascii "spawned hello20\n"
+done20_msg:
+    .ascii "hello20 done\n"
 hello9_name:
     .ascii "hello9"
     .byte 0

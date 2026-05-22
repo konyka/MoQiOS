@@ -281,6 +281,12 @@ fn initController(dev: *const pci.PciDevice) !void {
                     serial.writeString(" INIT FAILED: ");
                     serial.writeString(@errorName(err));
                 };
+            } else if (sig == 0xFFFFFFFF) {
+                serial.writeString(" (initializing...)");
+                initPort(port_idx, port_base) catch |err| {
+                    serial.writeString(" INIT FAILED: ");
+                    serial.writeString(@errorName(err));
+                };
             }
         }
         serial.writeString("\n");
@@ -425,7 +431,10 @@ fn readSectorsFromPort(port_idx: u32, lba: u64, count: u32, buf: [*]u8) i64 {
     const ct: *volatile CmdTable = @ptrFromInt(ct_virt);
 
     // Build H2D register FIS
-    @memset(@as([*]u8, @ptrCast(&ct.cfis))[0..64], 0);
+    {
+        const cfis_ptr: [*]u8 = @volatileCast(@ptrCast(&ct.cfis));
+        @memset(cfis_ptr[0..64], 0);
+    }
     ct.cfis[0] = FIS_TYPE_REG_H2D;
     ct.cfis[1] = 0x80; // C=1 (command)
     ct.cfis[2] = ATA_READ_DMA_EXT;
@@ -513,7 +522,10 @@ fn writeSectorsToPort(port_idx: u32, lba: u64, count: u32, buf: [*]const u8) i64
     const ct_phys = ports[port_idx].cmd_tables_phys[slot];
     const ct: *volatile CmdTable = @ptrFromInt(ct_virt);
 
-    @memset(@as([*]u8, @ptrCast(&ct.cfis))[0..64], 0);
+    {
+        const cfis_ptr: [*]u8 = @volatileCast(@ptrCast(&ct.cfis));
+        @memset(cfis_ptr[0..64], 0);
+    }
     ct.cfis[0] = FIS_TYPE_REG_H2D;
     ct.cfis[1] = 0x80;
     ct.cfis[2] = ATA_WRITE_DMA_EXT;

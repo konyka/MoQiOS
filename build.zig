@@ -604,6 +604,34 @@ pub fn build(b: *std.Build) void {
 
     b.getInstallStep().dependOn(&hello19_strip.step);
 
+    const hello20_elf = b.addSystemCommand(&.{
+        "zig", "cc",
+        "-target", "x86_64-freestanding-none",
+        "-static",
+        "-nostdlib",
+        "-ffreestanding",
+        "-O2",
+        "-mno-sse",
+        "-mno-sse2",
+        "-Wl,--gc-sections",
+        "-Wl,-z,norelro",
+        "-o",
+    });
+    hello20_elf.addArg("user/hello20.elf");
+    hello20_elf.addFileArg(b.path("user/hello20.c"));
+    hello20_elf.setName("compile hello20.c -> ELF");
+
+    const hello20_strip = b.addSystemCommand(&.{
+        "strip",
+        "-o",
+    });
+    hello20_strip.addArg("user/hello20.bin");
+    hello20_strip.addArg("user/hello20.elf");
+    hello20_strip.step.dependOn(&hello20_elf.step);
+    hello20_strip.setName("strip hello20.elf");
+
+    b.getInstallStep().dependOn(&hello20_strip.step);
+
     // Build and run in QEMU with Limine
     const run_step = b.step("run", "Build and run in QEMU");
     const run_cmd = b.addSystemCommand(&.{"./tools/qemu_run.sh"});
