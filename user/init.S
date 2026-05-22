@@ -330,6 +330,52 @@ _start:
     xorq %rdx, %rdx
     syscall
 
+    # Spawn hello17 (argv test)
+    movq $5, %rax
+    leaq hello17_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn17_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done17_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
+    # Spawn hello18 (chdir/getcwd/fstat test)
+    movq $5, %rax
+    leaq hello18_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn18_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done18_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
     # Spawn hello9 (fork test)
     movq $5, %rax
     leaq hello9_name(%rip), %rdi
@@ -482,11 +528,15 @@ hello17_name:
     .byte 0
 spawn17_msg:
     .ascii "spawned hello17\n"
+done17_msg:
+    .ascii "hello17 done\n"
 hello18_name:
     .ascii "hello18"
     .byte 0
 spawn18_msg:
     .ascii "spawned hello18\n"
+done18_msg:
+    .ascii "hello18 done\n"
 hello9_name:
     .ascii "hello9"
     .byte 0

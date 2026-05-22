@@ -524,19 +524,39 @@ fn syscallWaitpid(frame: *SyscallFrame) void {
             _ = copy.copyToUser(@ptrFromInt(status_ptr), @as([*]const u8, @ptrCast(&exit_code))[0..4], 4);
         }
         frame.rax = child_tid;
-    } else {
+        return;
+    }
+
+    // No zombie child yet — block this task until a child exits.
+    // Disable interrupts to prevent race between setting blocked and child exit.
+    asm volatile ("cli");
+    const parent = task_mod.getTask(cur_idx) orelse {
         asm volatile ("sti");
-        while (true) {
-            asm volatile ("hlt");
-            if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {
-                if (status_ptr != 0 and status_ptr < 0x0000_8000_0000_0000) {
-                    const copy = @import("../../mm/copy_from_user.zig");
-                    _ = copy.copyToUser(@ptrFromInt(status_ptr), @as([*]const u8, @ptrCast(&exit_code))[0..4], 4);
-                }
-                frame.rax = child_tid;
-                return;
-            }
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+    parent.waiting_for_child = true;
+    parent.state = .blocked;
+    asm volatile ("sti");
+
+    // Wait for wakeup from exitTask(). The scheduler will skip us while blocked.
+    // When a child exits, exitTask() sets parent.state = .ready and the scheduler
+    // will context-switch back to us, resuming at the hlt instruction.
+    while (parent.waiting_for_child) {
+        asm volatile ("hlt");
+    }
+
+    // Woken up — a child has exited. Now reap it.
+    if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {
+        if (status_ptr != 0 and status_ptr < 0x0000_8000_0000_0000) {
+            const copy = @import("../../mm/copy_from_user.zig");
+            _ = copy.copyToUser(@ptrFromInt(status_ptr), @as([*]const u8, @ptrCast(&exit_code))[0..4], 4);
         }
+        frame.rax = child_tid;
+    } else {
+        // Spurious wakeup — no zombie found. Should not happen normally,
+        // but handle gracefully by returning 0 (like WNOHANG).
+        frame.rax = 0;
     }
 }
 
