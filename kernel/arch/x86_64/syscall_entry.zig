@@ -343,6 +343,21 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         111 => {
             syscallUnlink(frame);
         },
+        112 => {
+            syscallTcpConnect(frame);
+        },
+        113 => {
+            syscallTcpSend(frame);
+        },
+        114 => {
+            syscallTcpRecv(frame);
+        },
+        115 => {
+            syscallTcpClose(frame);
+        },
+        116 => {
+            syscallTcpPoll(frame);
+        },
         228 => {
             syscallClock_gettime(frame);
         },
@@ -2086,4 +2101,114 @@ fn syscallUnlink(frame: *SyscallFrame) void {
     } else {
         frame.rax = @bitCast(@as(i64, -1));
     }
+}
+
+/// Syscall #112: tcp_connect(ip_ptr, port)
+/// RDI = pointer to 4-byte IP address in user space
+/// RSI = remote port (u16)
+/// Returns TCB index (>= 0) on success, -1 on error.
+fn syscallTcpConnect(frame: *SyscallFrame) void {
+    const ip_ptr: u64 = frame.rdi;
+    const port: u16 = @truncate(frame.rsi);
+
+    if (ip_ptr == 0 or ip_ptr >= 0x0000_8000_0000_0000) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    // Copy IP from user space
+    var ip: [4]u8 = undefined;
+    const copy = @import("../../mm/copy_from_user.zig");
+    const n = copy.copyFromUser(&ip, @ptrFromInt(ip_ptr), 4);
+    if (n < 4) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    const sched_mod = @import("../../proc/sched.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    const net_mod = @import("../../net/mod.zig");
+    const result = net_mod.tcp.tcpConnect(ip, port, cur_idx);
+    frame.rax = @bitCast(result);
+}
+
+/// Syscall #113: tcp_send(tcb_idx, buf, len)
+/// RDI = TCB index
+/// RSI = data buffer pointer (user space)
+/// RDX = data length
+/// Returns bytes sent, or -1 on error.
+fn syscallTcpSend(frame: *SyscallFrame) void {
+    const tcb_idx: u32 = @truncate(frame.rdi);
+    const buf: u64 = frame.rsi;
+    const len: u32 = @truncate(frame.rdx);
+
+    if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    // Copy data from user space to kernel buffer
+    var tmp_buf: [1460]u8 = undefined;
+    const copy = @import("../../mm/copy_from_user.zig");
+    const to_copy = @min(len, 1460);
+    const n = copy.copyFromUser(&tmp_buf, @ptrFromInt(buf), to_copy);
+    if (n == 0) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    const net_mod = @import("../../net/mod.zig");
+    const result = net_mod.tcp.tcpSend(tcb_idx, &tmp_buf, @intCast(n));
+    frame.rax = @bitCast(result);
+}
+
+/// Syscall #114: tcp_recv(tcb_idx, buf, len)
+/// RDI = TCB index
+/// RSI = buffer pointer (user space)
+/// RDX = buffer length
+/// Returns bytes received (0 = none yet), -1 on error/closed.
+fn syscallTcpRecv(frame: *SyscallFrame) void {
+    const tcb_idx: u32 = @truncate(frame.rdi);
+    const buf: u64 = frame.rsi;
+    const len: u32 = @truncate(frame.rdx);
+
+    if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    var tmp_buf: [4096]u8 = undefined;
+    const to_read = @min(len, 4096);
+
+    const net_mod = @import("../../net/mod.zig");
+    const result = net_mod.tcp.tcpRecv(tcb_idx, &tmp_buf, to_read);
+    if (result > 0) {
+        const copy = @import("../../mm/copy_from_user.zig");
+        _ = copy.copyToUser(@ptrFromInt(buf), &tmp_buf, @intCast(result));
+    }
+    frame.rax = @bitCast(result);
+}
+
+/// Syscall #115: tcp_close(tcb_idx)
+/// RDI = TCB index
+/// Returns 0 on success, -1 on error.
+fn syscallTcpClose(frame: *SyscallFrame) void {
+    const tcb_idx: u32 = @truncate(frame.rdi);
+    const net_mod = @import("../../net/mod.zig");
+    const result = net_mod.tcp.tcpClose(tcb_idx);
+    frame.rax = @bitCast(result);
+}
+
+/// Syscall #116: tcp_poll(tcb_idx)
+/// RDI = TCB index
+/// Returns 0 = connecting, 1 = established, -1 = error/closed.
+fn syscallTcpPoll(frame: *SyscallFrame) void {
+    const tcb_idx: u32 = @truncate(frame.rdi);
+    const net_mod = @import("../../net/mod.zig");
+    const result = net_mod.tcp.tcpPoll(tcb_idx);
+    frame.rax = @bitCast(result);
 }

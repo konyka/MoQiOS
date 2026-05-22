@@ -4,10 +4,12 @@ const arp = @import("arp.zig");
 const ipv4 = @import("ipv4.zig");
 const icmp = @import("icmp.zig");
 const udp = @import("udp.zig");
+pub const tcp = @import("tcp.zig");
 
 pub fn init() void {
     netif.ensureInit();
     arp.init();
+    tcp.initTcbs();
 }
 
 pub fn handleRxPacket(data: [*]const u8, len: u32) void {
@@ -28,6 +30,9 @@ pub fn handleRxPacket(data: [*]const u8, len: u32) void {
             switch (info.protocol) {
                 ipv4.PROTO_ICMP => {
                     icmp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len);
+                },
+                ipv4.PROTO_TCP => {
+                    tcp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len);
                 },
                 ipv4.PROTO_UDP => {
                     udp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len);
