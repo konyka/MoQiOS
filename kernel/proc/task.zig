@@ -279,19 +279,20 @@ pub fn exitTask(exit_code: i32) void {
     const t = getTask(idx) orelse return;
     t.exit_code = exit_code;
     t.state = .zombie;
+    asm volatile ("" ::: .{ .memory = true });
 
-    // If parent is waiting for a child, unblock it
     if (t.parent_tid != 0) {
         if (findTaskByTid(t.parent_tid)) |parent_idx| {
             const parent = getTask(parent_idx) orelse return;
             if (parent.waiting_for_child) {
                 parent.waiting_for_child = false;
+                asm volatile ("" ::: .{ .memory = true });
                 parent.state = .ready;
             }
         }
     }
 
-    asm volatile ("sti");
+    asm volatile ("sti" ::: .{ .memory = true });
     while (true) {
         asm volatile ("hlt");
     }

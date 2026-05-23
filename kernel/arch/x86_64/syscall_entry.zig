@@ -552,6 +552,7 @@ fn syscallWaitpid(frame: *SyscallFrame) void {
     };
     parent.waiting_for_child = true;
     parent.state = .blocked;
+    asm volatile ("" ::: .{ .memory = true });
     asm volatile ("sti");
 
     // Wait for wakeup from exitTask(). The scheduler will skip us while blocked.
