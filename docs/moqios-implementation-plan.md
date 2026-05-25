@@ -1,6 +1,6 @@
 # MoQiOS 实施计划
 
-> **版本**: v0.7
+> **版本**: v0.8
 > **日期**: 2026-05-25
 > **说明**: 本文档记录 MoQiOS 的实际实施进度和已完成里程碑。
 > 长期设计目标参见 [moqios-design.md](./moqios-design.md)，当前架构参见 [moqios-architecture-current.md](./moqios-architecture-current.md)。
@@ -9,11 +9,10 @@
 
 ## 当前状态
 
-- **内核**: 14,634 行 Zig, 54 个源文件
-- **用户空间**: 1,828 行 C/ASM
-- **系统调用**: 46 个
-- **自动化测试**: 25 个 (hello2-hello22, init.S) + 交互式 Shell
-- **测试稳定性**: 25/25 通过 (-smp 2)
+- **内核**: 15,033 行 Zig, 54 个源文件
+- **系统调用**: 47 个
+- **自动化测试**: 26 个 (hello2-hello23, init.S) + 交互式 Shell
+- **测试稳定性**: 26/26 通过 (-smp 2)
 - **最大进程数**: 64
 - **文件系统**: FAT32 (virtio-blk) + ramdisk + ext2 (读写)
 - **网络**: e1000 (ARP/IPv4/ICMP/UDP/TCP + Socket API)
@@ -391,6 +390,7 @@
 
 - ~~ext2 创建文件 (createFile)~~ → hello21 测试通过 (24/24)
 - ~~TCP socket API 验证~~ → hello22 测试通过: socket/bind/listen/accept 全部正确 (25/25)
+- ~~ext2 mkdir~~ → hello23 测试通过: createDir + mkdir syscall #123 (26/26)
 - 网络服务器 (echo server / HTTP server)
 - 文件系统缓存
 - 多核调度 (需要 AP 定时器)
@@ -402,6 +402,7 @@
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| v0.8 | 2026-05-25 | Phase 6 进展: ext2 mkdir (createDir + syscall #123), hello23 测试通过, 26/26 测试, 47 syscalls |
 | v0.7 | 2026-05-25 | Phase 6 进展: ext2 createFile 修复完成 (hello21), TCP socket API 验证 (hello22), 25/25 测试通过 |
 | v0.5 | 2026-05-24 | 添加 M12 (TCP), M13 (ext2), M14 (SMP); 更新统计数据; 更新下一步方向 |
 | v0.4 | 2026-05-22 | 重写：反映实际实现状态，移除未实现的微内核/Windows 计划 |

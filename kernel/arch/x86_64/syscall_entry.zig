@@ -410,6 +410,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         122 => {
             syscallRecvfrom(frame);
         },
+        123 => {
+            syscallMkdir(frame);
+        },
         228 => {
             syscallClock_gettime(frame);
         },
@@ -2567,4 +2570,56 @@ fn allocTcpFd(fd_table: *@import("../../fs/vfs.zig").FdTable, tcb_idx: u32) i64 
         .writable = true,
     };
     return @intCast(slot);
+}
+
+/// Syscall #123: mkdir(path, mode)
+/// RDI = path pointer (user space)
+/// RSI = mode (ignored, always 0777 for dirs)
+/// Returns 0 on success, -1 on failure.
+fn syscallMkdir(frame: *SyscallFrame) void {
+    const name_ptr: u64 = frame.rdi;
+    _ = frame.rsi; // mode
+
+    if (name_ptr >= 0x0000_8000_0000_0000 or name_ptr == 0) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    var name_buf: [256]u8 = undefined;
+    const copy = @import("../../mm/copy_from_user.zig");
+    const copied = copy.copyFromUser(name_buf[0..], @ptrFromInt(name_ptr), 255);
+    if (copied == 0) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+    name_buf[if (copied < 255) copied else 255] = 0;
+
+    var len: usize = 0;
+    while (len < copied and name_buf[len] != 0) : (len += 1) {}
+    const name = name_buf[0..len];
+
+    // Try FAT32 first
+    const fat32 = @import("../../fs/fat32.zig");
+    if (fat32.isActive()) {
+        // FAT32 doesn't support mkdir yet — skip
+    }
+
+    // Try ext2
+    const ext2 = @import("../../fs/ext2.zig");
+    if (ext2.isActive()) {
+        const result = ext2.createDir(name);
+        if (result > 0) {
+            // Close the internal file handle (mkdir returns success/failure, not fd)
+            ext2.closeFile(@intCast(result));
+            frame.rax = 0;
+            return;
+        }
+        if (result == 0) {
+            // Directory already exists (idempotent success)
+            frame.rax = 0;
+            return;
+        }
+    }
+
+    frame.rax = @bitCast(@as(i64, -1));
 }

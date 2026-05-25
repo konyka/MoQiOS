@@ -445,6 +445,29 @@ _start:
     movq $13, %rdx
     syscall
 
+    # Spawn hello23 (mkdir test)
+    movq $5, %rax
+    leaq hello23_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn23_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done23_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
     # Spawn hello9 (fork test)
     movq $5, %rax
     leaq hello9_name(%rip), %rdi
@@ -657,6 +680,13 @@ spawn22_msg:
     .ascii "spawned hello22\n"
 done22_msg:
     .ascii "hello22 done\n"
+hello23_name:
+    .ascii "hello23"
+    .byte 0
+spawn23_msg:
+    .ascii "spawned hello23\n"
+done23_msg:
+    .ascii "hello23 done\n"
 hello9_name:
     .ascii "hello9"
     .byte 0

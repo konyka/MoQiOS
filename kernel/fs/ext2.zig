@@ -903,3 +903,104 @@ fn addDirEntry(dir_inode_num: u32, target_inode: u32, entry_name: []const u8, fi
     if (!writeBlock(new_block, buf)) return false;
     return writeInode(dir_inode_num, &dir_inode);
 }
+
+// ─── Directory creation ────────────────────────────────────────────────────
+
+/// Create a new directory in the root directory of the ext2 filesystem.
+/// Returns file index (>= 0) on success, -1 on failure.
+pub fn createDir(name: []const u8) i64 {
+    if (!active) return -1;
+
+    // Check if already exists
+    const existing_idx = walkPath(2, name);
+    if (existing_idx >= 0) {
+        // Already exists — return 0 (idempotent mkdir)
+        return 0;
+    }
+
+    // Allocate a new inode (from group 0)
+    const new_inode_num = allocInode(0);
+    if (new_inode_num == 0) return -1;
+
+    // Initialize as a directory inode
+    var new_inode: Ext2Inode = undefined;
+    @memset(@as([*]u8, @ptrCast(&new_inode))[0..@sizeOf(Ext2Inode)], 0);
+    new_inode.mode = 0x41FF; // directory, 0777 permissions
+    new_inode.links_count = 2; // "." + parent's entry
+    new_inode.blocks = 0;
+    new_inode.size = 0;
+    new_inode.block = @splat(0);
+
+    // Allocate a data block for the directory entries (. and ..)
+    const dir_block = allocBlock(0);
+    if (dir_block == 0) return -1;
+
+    new_inode.block[0] = dir_block;
+    new_inode.blocks = block_size / 512;
+    new_inode.size = block_size;
+
+    // Write "." and ".." entries into the new directory block
+    const buf_phys = pmm.allocPage() orelse return -1;
+    defer pmm.freePage(buf_phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+    @memset(buf[0..block_size], 0);
+
+    // "." entry: inode=this, rec_len=12, name_len=1, type=2 (dir)
+    const dot: *Ext2DirEntry = @ptrCast(@alignCast(buf));
+    dot.inode = new_inode_num;
+    dot.rec_len = 12;
+    dot.name_len = 1;
+    dot.file_type = 2;
+    buf[@sizeOf(Ext2DirEntry)] = '.';
+
+    // ".." entry: inode=parent(2=root), rec_len=rest of block, name_len=2, type=2
+    const dotdot: *Ext2DirEntry = @ptrCast(@alignCast(buf + 12));
+    dotdot.inode = 2; // root directory
+    dotdot.rec_len = @intCast(block_size - 12);
+    dotdot.name_len = 2;
+    dotdot.file_type = 2;
+    buf[12 + @sizeOf(Ext2DirEntry)] = '.';
+    buf[12 + @sizeOf(Ext2DirEntry) + 1] = '.';
+
+    if (!writeBlock(dir_block, buf)) return -1;
+
+    // Write the new inode
+    if (!writeInode(new_inode_num, &new_inode)) return -1;
+
+    // Extract directory name
+    var name_start: usize = 0;
+    if (name.len > 0) {
+        var j: usize = name.len;
+        while (j > 0) : (j -= 1) {
+            if (name[j - 1] == '/') {
+                name_start = j;
+                break;
+            }
+        }
+    }
+    const dirname = name[name_start..];
+
+    // Add entry to parent directory (inode 2 = root)
+    if (!addDirEntry(2, new_inode_num, dirname, 2)) return -1; // file_type=2 (dir)
+
+    // Increment parent links count (for ".." pointing to parent)
+    var parent_inode: Ext2Inode = undefined;
+    if (readInode(2, &parent_inode)) {
+        parent_inode.links_count += 1;
+        _ = writeInode(2, &parent_inode);
+    }
+
+    // Open the new directory (as a file-like handle)
+    for (0..MAX_OPEN_FILES) |i| {
+        if (i >= open_count or open_files[i].inode_num == 0) {
+            open_files[i] = .{
+                .inode_num = new_inode_num,
+                .inode = new_inode,
+                .offset = 0,
+            };
+            if (i >= open_count) open_count = @intCast(i + 1);
+            return @intCast(i);
+        }
+    }
+    return -1;
+}
