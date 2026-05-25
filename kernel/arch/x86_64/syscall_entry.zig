@@ -2126,7 +2126,17 @@ fn syscallUnlink(frame: *SyscallFrame) void {
     while (name_len < copied and name_buf[name_len] != 0) : (name_len += 1) {}
     const name = name_buf[0..name_len];
 
-    // Only support deleting from FAT32
+    // Try ext2 first
+    const ext2 = @import("../../fs/ext2.zig");
+    if (ext2.isActive()) {
+        if (ext2.unlinkFile(name)) {
+            frame.rax = 0;
+            return;
+        }
+        // Fall through to try FAT32
+    }
+
+    // Try FAT32
     const fat32 = @import("../../fs/fat32.zig");
     if (!fat32.isActive()) {
         frame.rax = @bitCast(@as(i64, -1));

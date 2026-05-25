@@ -744,6 +744,34 @@ pub fn build(b: *std.Build) void {
 
     b.getInstallStep().dependOn(&hello23_strip.step);
 
+    const hello24_elf = b.addSystemCommand(&.{
+        "zig", "cc",
+        "-target", "x86_64-freestanding-none",
+        "-static",
+        "-nostdlib",
+        "-ffreestanding",
+        "-O2",
+        "-mno-sse",
+        "-mno-sse2",
+        "-Wl,--gc-sections",
+        "-Wl,-z,norelro",
+        "-o",
+    });
+    hello24_elf.addArg("user/hello24.elf");
+    hello24_elf.addFileArg(b.path("user/hello24.c"));
+    hello24_elf.setName("compile hello24.c -> ELF");
+
+    const hello24_strip = b.addSystemCommand(&.{
+        "strip",
+        "-o",
+    });
+    hello24_strip.addArg("user/hello24.bin");
+    hello24_strip.addArg("user/hello24.elf");
+    hello24_strip.step.dependOn(&hello24_elf.step);
+    hello24_strip.setName("strip hello24.elf");
+
+    b.getInstallStep().dependOn(&hello24_strip.step);
+
     // Build and run in QEMU with Limine
     const run_step = b.step("run", "Build and run in QEMU");
     const run_cmd = b.addSystemCommand(&.{"./tools/qemu_run.sh"});

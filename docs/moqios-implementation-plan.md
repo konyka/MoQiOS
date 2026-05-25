@@ -177,7 +177,7 @@
 | 环境变量 | getenv(105), setenv(106) | fork 继承, Shell export/env |
 | 目录操作 | chdir(108), getcwd(109), listdir(107) | 路径规范化, Shell cd/pwd |
 | 文件元数据 | fstat(110), uname(63) | mode/size/type, 系统信息 |
-| 文件删除 | unlink(111) | FAT32 目录项标记 0xE5, FAT 簇链释放 |
+| 文件删除 | unlink(111) | ext2: freeBlock + freeInode + removeDirEntry + unlinkFile; FAT32: 目录项标记 0xE5, FAT 簇链释放 |
 | 时间 | gettimeofday(96), clock_gettime(228) | TSC 高精度计时 |
 
 **关键文件**: signal.zig (199 行), syscall_entry.zig (新增处理函数)
@@ -391,6 +391,7 @@
 - ~~ext2 创建文件 (createFile)~~ → hello21 测试通过 (24/24)
 - ~~TCP socket API 验证~~ → hello22 测试通过: socket/bind/listen/accept 全部正确 (25/25)
 - ~~ext2 mkdir~~ → hello23 测试通过: createDir + mkdir syscall #123 (26/26)
+- ~~ext2 unlink~~ → hello24 测试通过: freeBlock + freeInode + removeDirEntry + unlinkFile, syscall #111 ext2 支持 (27/27)
 - 网络服务器 (echo server / HTTP server)
 - 文件系统缓存
 - 多核调度 (需要 AP 定时器)
@@ -402,6 +403,7 @@
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| v0.9 | 2026-05-25 | Phase 6 进展: ext2 unlink (freeBlock + freeInode + removeDirEntry + unlinkFile), syscall #111 ext2 支持, hello24 测试通过, 27/27 测试, 48 syscalls |
 | v0.8 | 2026-05-25 | Phase 6 进展: ext2 mkdir (createDir + syscall #123), hello23 测试通过, 26/26 测试, 47 syscalls |
 | v0.7 | 2026-05-25 | Phase 6 进展: ext2 createFile 修复完成 (hello21), TCP socket API 验证 (hello22), 25/25 测试通过 |
 | v0.5 | 2026-05-24 | 添加 M12 (TCP), M13 (ext2), M14 (SMP); 更新统计数据; 更新下一步方向 |

@@ -1004,3 +1004,194 @@ pub fn createDir(name: []const u8) i64 {
     }
     return -1;
 }
+
+// ─── Block / inode deallocation ────────────────────────────────────────────
+
+/// Mark a data block as free in the bitmap.
+fn freeBlock(block_num: u32) void {
+    const group = (block_num - first_data_block) / sb.blocks_per_group;
+    const index = (block_num - first_data_block) % sb.blocks_per_group;
+
+    const gds: [*]Ext2GroupDesc = @ptrFromInt(group_descs_virt);
+    const gd = &gds[group];
+    const bitmap_block = gd.bg_block_bitmap;
+
+    const buf_phys = pmm.allocPage() orelse return;
+    defer pmm.freePage(buf_phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+
+    if (!readBlock(bitmap_block, buf)) return;
+
+    const byte_idx = index / 8;
+    const bit_idx: u3 = @intCast(index % 8);
+    buf[byte_idx] &= ~(@as(u8, 1) << bit_idx);
+
+    if (!writeBlock(bitmap_block, buf)) return;
+
+    gd.bg_free_blocks_count += 1;
+    writeGroupDescs();
+
+    sb.free_blocks_count += 1;
+    writeSuperblock();
+}
+
+/// Mark an inode as free in the bitmap.
+fn freeInode(inode_num: u32) void {
+    const group = (inode_num - 1) / inodes_per_group;
+    const index = (inode_num - 1) % inodes_per_group;
+
+    const gds: [*]Ext2GroupDesc = @ptrFromInt(group_descs_virt);
+    const gd = &gds[group];
+    const bitmap_block = gd.bg_inode_bitmap;
+
+    const buf_phys = pmm.allocPage() orelse return;
+    defer pmm.freePage(buf_phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+
+    if (!readBlock(bitmap_block, buf)) return;
+
+    const byte_idx = index / 8;
+    const bit_idx: u3 = @intCast(index % 8);
+    buf[byte_idx] &= ~(@as(u8, 1) << bit_idx);
+
+    if (!writeBlock(bitmap_block, buf)) return;
+
+    gd.bg_free_inodes_count += 1;
+    writeGroupDescs();
+
+    sb.free_inodes_count += 1;
+    writeSuperblock();
+}
+
+// ─── Directory entry removal ───────────────────────────────────────────────
+
+/// Remove a named entry from a parent directory.
+/// Merges the deleted entry's rec_len into the previous entry if possible.
+fn removeDirEntry(parent_inode_num: u32, name: []const u8) bool {
+    var parent_inode: Ext2Inode = undefined;
+    if (!readInode(parent_inode_num, &parent_inode)) return false;
+
+    const dir_size = parent_inode.size;
+    var offset: u32 = 0;
+
+    const buf_phys = pmm.allocPage() orelse return false;
+    defer pmm.freePage(buf_phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+
+    while (offset < dir_size) {
+        const block_num = offset / block_size;
+        const phys_block = resolveBlock(&parent_inode, block_num);
+
+        if (phys_block == 0) {
+            offset += block_size;
+            continue;
+        }
+        if (!readBlock(phys_block, buf)) return false;
+
+        var pos: u32 = 0;
+        var prev_pos: u32 = 0xFFFF_FFFF; // sentinel: no previous entry
+
+        while (pos < block_size and offset + pos < dir_size) {
+            const entry: *Ext2DirEntry = @ptrCast(@alignCast(buf + pos));
+            if (entry.rec_len == 0) break;
+
+            if (entry.inode != 0 and entry.name_len == name.len) {
+                const entry_name = buf[pos + @sizeOf(Ext2DirEntry) .. pos + @sizeOf(Ext2DirEntry) + name.len];
+                var match = true;
+                for (name, 0..) |c, j| {
+                    if (entry_name[j] != c) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    // Found — remove by merging with previous or zeroing inode
+                    if (prev_pos != 0xFFFF_FFFF) {
+                        const prev: *Ext2DirEntry = @ptrCast(@alignCast(buf + prev_pos));
+                        prev.rec_len += entry.rec_len;
+                    } else {
+                        // First entry in block — just zero inode
+                        entry.inode = 0;
+                    }
+
+                    if (!writeBlock(phys_block, buf)) return false;
+                    return true;
+                }
+            }
+
+            prev_pos = pos;
+            pos += entry.rec_len;
+        }
+        offset += block_size;
+    }
+
+    return false; // not found
+}
+
+// ─── File unlink ────────────────────────────────────────────────────────────
+
+/// Unlink (delete) a file from the ext2 filesystem.
+/// Currently only supports files in the root directory (parent inode 2).
+pub fn unlinkFile(path: []const u8) bool {
+    if (!active) return false;
+
+    // Extract filename (after last '/')
+    var name_start: usize = 0;
+    if (path.len > 0) {
+        var j: usize = path.len;
+        while (j > 0) : (j -= 1) {
+            if (path[j - 1] == '/') {
+                name_start = j;
+                break;
+            }
+        }
+    }
+    const filename = path[name_start..];
+
+    // Find the file's inode number via findDirEntry on root
+    var root_inode: Ext2Inode = undefined;
+    if (!readInode(2, &root_inode)) return false;
+    const file_inode_num = findDirEntry(&root_inode, filename) orelse return false;
+
+    // Read file inode
+    var file_inode: Ext2Inode = undefined;
+    if (!readInode(file_inode_num, &file_inode)) return false;
+
+    // Free data blocks (direct 0-11)
+    for (0..EXT2_INODE_DIRECT) |i| {
+        if (file_inode.block[i] != 0) {
+            freeBlock(file_inode.block[i]);
+        }
+    }
+
+    // Free single indirect block (block[12]) and all blocks it points to
+    if (file_inode.block[12] != 0) {
+        const ib_phys = pmm.allocPage() orelse return false;
+        const ib: [*]u8 = @ptrFromInt(hhdm.physToVirt(ib_phys));
+        if (readBlock(file_inode.block[12], ib)) {
+            const ptrs_per_block = block_size / 4;
+            const ptrs: [*]const u32 = @ptrCast(@alignCast(ib));
+            for (0..ptrs_per_block) |i| {
+                if (ptrs[i] != 0) freeBlock(ptrs[i]);
+            }
+        }
+        pmm.freePage(ib_phys);
+        freeBlock(file_inode.block[12]);
+    }
+
+    // Free double indirect block (block[13]) — for now just free the block itself
+    if (file_inode.block[13] != 0) {
+        freeBlock(file_inode.block[13]);
+    }
+
+    // Free the inode
+    freeInode(file_inode_num);
+
+    // Remove directory entry from parent (root, inode 2)
+    if (!removeDirEntry(2, filename)) return false;
+
+    serial.writeString("[ext2] unlinked: ");
+    serial.writeString(filename);
+    serial.writeString("\n");
+    return true;
+}

@@ -468,6 +468,29 @@ _start:
     movq $13, %rdx
     syscall
 
+    # Spawn hello24 (ext2 unlink test)
+    movq $5, %rax
+    leaq hello24_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn24_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done24_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
     # Spawn hello9 (fork test)
     movq $5, %rax
     leaq hello9_name(%rip), %rdi
@@ -687,7 +710,14 @@ spawn23_msg:
     .ascii "spawned hello23\n"
 done23_msg:
     .ascii "hello23 done\n"
-hello9_name:
+    hello24_name:
+    .ascii "hello24"
+    .byte 0
+    spawn24_msg:
+    .ascii "spawned hello24\n"
+    done24_msg:
+    .ascii "hello24 done\n"
+    hello9_name:
     .ascii "hello9"
     .byte 0
 spawn9_msg:
