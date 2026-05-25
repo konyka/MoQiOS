@@ -393,6 +393,7 @@
 - ~~ext2 mkdir~~ → hello23 测试通过: createDir + mkdir syscall #123 (26/26)
 - ~~ext2 unlink~~ → hello24 测试通过: freeBlock + freeInode + removeDirEntry + unlinkFile, syscall #111 ext2 支持 (27/27)
 - ~~ext2 多级路径支持~~ → resolveParent 辅助函数, createFile/createDir/unlinkFile 支持子目录操作, hello25 测试
+- ~~文件系统缓存~~ → 64 条目写穿缓冲区, readBlockCached/writeBlockCached, 时钟替换策略
 - 网络服务器 (echo server / HTTP server)
 - 文件系统缓存
 - 多核调度 (需要 AP 定时器)
@@ -404,6 +405,7 @@
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| v1.1 | 2026-05-25 | Phase 6: ext2 块缓存 (64条目写穿缓冲区, readBlockCached/writeBlockCached, 时钟替换策略) |
 | v1.0 | 2026-05-25 | Phase 6 进展: ext2 多级路径支持 (resolveParent), createFile/createDir/unlinkFile 支持子目录, hello25 测试 |
 | v0.9 | 2026-05-25 | Phase 6 进展: ext2 unlink (freeBlock + freeInode + removeDirEntry + unlinkFile), syscall #111 ext2 支持, hello24 测试通过, 27/27 测试, 48 syscalls |
 | v0.8 | 2026-05-25 | Phase 6 进展: ext2 mkdir (createDir + syscall #123), hello23 测试通过, 26/26 测试, 47 syscalls |

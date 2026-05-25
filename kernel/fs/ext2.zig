@@ -207,9 +207,95 @@ fn readSectorsToBuf(lba: u64, count: u32, dest: [*]u8) bool {
 
 // ─── Block I/O ─────────────────────────────────────────────────────────────
 
-fn readBlock(block_num: u32, buf: [*]u8) bool {
+/// Read a block from disk (uncached, direct I/O).
+fn readBlockUncached(block_num: u32, buf: [*]u8) bool {
     const lba = @as(u64, block_num) * (block_size / SECTOR_SIZE);
     return readSectorsToBuf(lba, block_size / SECTOR_SIZE, buf);
+}
+
+/// Read a block through the cache (all existing callers use this).
+fn readBlock(block_num: u32, buf: [*]u8) bool {
+    return readBlockCached(block_num, buf);
+}
+
+// ─── Block cache ──────────────────────────────────────────────────────────
+
+const CACHE_ENTRIES: usize = 64;
+const CACHE_BLOCK_SIZE: usize = 1024; // must match block_size for revision 0
+
+const CacheEntry = struct {
+    block_num: u32 = 0,
+    valid: bool = false,
+    dirty: bool = false,
+    data: [CACHE_BLOCK_SIZE]u8 = @splat(0),
+};
+
+var cache: [CACHE_ENTRIES]CacheEntry = @splat(.{});
+var cache_next: usize = 0; // clock hand for replacement
+var cache_hits: u64 = 0;
+var cache_misses: u64 = 0;
+
+fn cacheLookup(block_num: u32) ?usize {
+    for (0..CACHE_ENTRIES) |i| {
+        if (cache[i].valid and cache[i].block_num == block_num) return i;
+    }
+    return null;
+}
+
+/// Read a block through the cache. On miss, reads from disk and caches.
+fn readBlockCached(block_num: u32, buf: [*]u8) bool {
+    if (block_size != CACHE_BLOCK_SIZE) return readBlockUncached(block_num, buf);
+
+    if (cacheLookup(block_num)) |idx| {
+        @memcpy(buf[0..block_size], cache[idx].data[0..block_size]);
+        cache_hits += 1;
+        return true;
+    }
+
+    cache_misses += 1;
+
+    if (!readBlockUncached(block_num, buf)) return false;
+
+    // Store in cache (overwrite slot at clock hand)
+    const slot = cache_next;
+    cache_next = (cache_next + 1) % CACHE_ENTRIES;
+    cache[slot].block_num = block_num;
+    cache[slot].valid = true;
+    cache[slot].dirty = false;
+    @memcpy(cache[slot].data[0..block_size], buf[0..block_size]);
+    return true;
+}
+
+/// Write a block to disk and update the cache.
+fn writeBlockCached(block_num: u32, buf: [*]const u8) bool {
+    if (block_size == CACHE_BLOCK_SIZE) {
+        if (cacheLookup(block_num)) |idx| {
+            @memcpy(cache[idx].data[0..block_size], buf[0..block_size]);
+            cache[idx].dirty = false;
+        } else {
+            const slot = cache_next;
+            cache_next = (cache_next + 1) % CACHE_ENTRIES;
+            cache[slot].block_num = block_num;
+            cache[slot].valid = true;
+            cache[slot].dirty = false;
+            @memcpy(cache[slot].data[0..block_size], buf[0..block_size]);
+        }
+    }
+    return writeBlockUncached(block_num, buf);
+}
+
+/// Flush all dirty cache entries to disk.
+pub fn cacheFlush() void {
+    for (0..CACHE_ENTRIES) |i| {
+        if (cache[i].valid and cache[i].dirty) {
+            _ = writeBlockUncached(cache[i].block_num, &cache[i].data);
+            cache[i].dirty = false;
+        }
+    }
+}
+
+pub fn cacheStats() struct { hits: u64, misses: u64 } {
+    return .{ .hits = cache_hits, .misses = cache_misses };
 }
 
 // ─── Inode operations ─────────────────────────────────────────────────────
@@ -541,10 +627,15 @@ pub fn getFileName(file_idx: u32) ?[]const u8 {
 
 // ─── Write support ──────────────────────────────────────────────────────────
 
-fn writeBlock(block_num: u32, buf: [*]const u8) bool {
+fn writeBlockUncached(block_num: u32, buf: [*]const u8) bool {
     const lba = @as(u64, block_num) * (block_size / SECTOR_SIZE);
     const n = virtio_blk.writeSectors(DISK_LBA_OFFSET + lba, block_size / SECTOR_SIZE, buf);
     return n > 0;
+}
+
+/// Write a block to disk and update cache (write-through).
+fn writeBlock(block_num: u32, buf: [*]const u8) bool {
+    return writeBlockCached(block_num, buf);
 }
 
 fn writeInode(inode_num: u32, inode: *const Ext2Inode) bool {
