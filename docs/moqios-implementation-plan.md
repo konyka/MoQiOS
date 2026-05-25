@@ -11,8 +11,8 @@
 
 - **内核**: 15,400 行 Zig, 54 个源文件
 - **系统调用**: 49 个
-- **自动化测试**: 28 个 (hello2-hello26, init.S) + 交互式 Shell
-- **测试稳定性**: 28/28 通过 (KVM -smp 1)
+- **自动化测试**: 29 个 (hello2-hello27, init.S) + 交互式 Shell
+- **测试稳定性**: 29/29 通过 (KVM -smp 1)
 - **最大进程数**: 64
 - **文件系统**: FAT32 (virtio-blk) + ramdisk + ext2 (读写)
 - **网络**: e1000 (ARP/IPv4/ICMP/UDP/TCP + Socket API)
@@ -324,6 +324,7 @@
 | hello24 | ext2 unlink (create→write→verify→unlink→verify gone) |
 | hello25 | ext2 多级路径 (testdir/subfile.txt) |
 | hello26 | TCP echo server (socket/bind/listen/accept/sendto/recvfrom) |
+| hello27 | TCP connect() syscall #124 验证 (socket/connect/sendto/recvfrom) |
 
 ### 手动测试 (从 shell 运行, 功能验证通过)
 
@@ -405,7 +406,7 @@
 - ~~ext2 创建文件 (createFile)~~ → hello21 测试通过 (24/24)
 - ~~TCP socket API 验证~~ → hello22 测试通过: socket/bind/listen/accept 全部正确 (25/25)
 - ~~TCP echo server 测试~~ → hello26 测试通过: socket/bind/listen/accept/sendto/recvfrom 完整服务端 API 验证 (28/28)
-- ~~connect() syscall~~ → syscall #124: TCP socket 连接, tcpConnectSocket() 实现复用现有 TCB
+- ~~connect() syscall~~ → syscall #124: TCP socket 连接, tcpConnectSocket() 实现复用现有 TCB, hello27 验证通过 (29/29)
 - ~~ext2 mkdir~~ → hello23 测试通过: createDir + mkdir syscall #123 (26/26)
 - ~~ext2 unlink~~ → hello24 测试通过: freeBlock + freeInode + removeDirEntry + unlinkFile, syscall #111 ext2 支持 (27/27)
 - ~~ext2 多级路径支持~~ → resolveParent 辅助函数, createFile/createDir/unlinkFile 支持子目录操作, hello25 测试
@@ -420,6 +421,7 @@
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| v1.4 | 2026-05-25 | Phase 6: connect() syscall 测试 (hello27), 29/29 tests, 49 syscalls |
 | v1.3 | 2026-05-25 | Phase 6: connect() syscall #124 (TCP socket 连接), tcpConnectSocket() 复用现有 TCB, 49 syscalls |
 | v1.2 | 2026-05-25 | Phase 6: TCP echo server 测试 (hello26), socket/bind/listen/accept/sendto/recvfrom 完整服务端 API, 28/28 tests |
 | v1.1 | 2026-05-25 | Phase 6: ext2 块缓存 (64条目写穿缓冲区, readBlockCached/writeBlockCached, 时钟替换策略) |
