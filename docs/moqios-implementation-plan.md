@@ -1,7 +1,7 @@
 # MoQiOS 实施计划
 
-> **版本**: v0.6
-> **日期**: 2026-05-24
+> **版本**: v0.7
+> **日期**: 2026-05-25
 > **说明**: 本文档记录 MoQiOS 的实际实施进度和已完成里程碑。
 > 长期设计目标参见 [moqios-design.md](./moqios-design.md)，当前架构参见 [moqios-architecture-current.md](./moqios-architecture-current.md)。
 
@@ -12,8 +12,8 @@
 - **内核**: 14,634 行 Zig, 54 个源文件
 - **用户空间**: 1,828 行 C/ASM
 - **系统调用**: 46 个
-- **自动化测试**: 23 个 (hello2-hello20, init.S) + 交互式 Shell
-- **测试稳定性**: 23/23 通过 (-smp 2)
+- **自动化测试**: 25 个 (hello2-hello22, init.S) + 交互式 Shell
+- **测试稳定性**: 25/25 通过 (-smp 2)
 - **最大进程数**: 64
 - **文件系统**: FAT32 (virtio-blk) + ramdisk + ext2 (读写)
 - **网络**: e1000 (ARP/IPv4/ICMP/UDP/TCP + Socket API)
@@ -389,7 +389,8 @@
 
 ### Phase 6: 下一步
 
-- ext2 创建文件 (createFile: 分配 inode + 创建目录项)
+- ~~ext2 创建文件 (createFile)~~ → hello21 测试通过 (24/24)
+- ~~TCP socket API 验证~~ → hello22 测试通过: socket/bind/listen/accept 全部正确 (25/25)
 - 网络服务器 (echo server / HTTP server)
 - 文件系统缓存
 - 多核调度 (需要 AP 定时器)
@@ -401,7 +402,7 @@
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
-| v0.6 | 2026-05-24 | Phase 5 完成: 内核自旋锁 (IrqSpinlock), TCP socket syscalls (117-122), ext2 写入支持, PerCpu 调度器字段 |
+| v0.7 | 2026-05-25 | Phase 6 进展: ext2 createFile 修复完成 (hello21), TCP socket API 验证 (hello22), 25/25 测试通过 |
 | v0.5 | 2026-05-24 | 添加 M12 (TCP), M13 (ext2), M14 (SMP); 更新统计数据; 更新下一步方向 |
 | v0.4 | 2026-05-22 | 重写：反映实际实现状态，移除未实现的微内核/Windows 计划 |
 | v0.3 | 2026-05-22 | 添加 M11+ 进度，更新系统调用表 |

@@ -46,10 +46,10 @@
 <!-- ================================================================ -->
 <h2>Project Stats</h2>
 <div class="grid">
-  <div class="card"><div class="label">Kernel</div><div class="value">14,876</div><div class="label">lines of Zig, 54 files</div></div>
+  <div class="card"><div class="label">Kernel</div><div class="value">14,877</div><div class="label">lines of Zig, 54 files</div></div>
   <div class="card"><div class="label">Userspace</div><div class="value">1,828</div><div class="label">lines of C/ASM</div></div>
   <div class="card"><div class="label">Syscalls</div><div class="value">46</div><div class="label">system calls</div></div>
-  <div class="card"><div class="label">Tests</div><div class="value">24/24</div><div class="label">passing with -smp 2</div></div>
+  <div class="card"><div class="label">Tests</div><div class="value">25/25</div><div class="label">passing with -smp 2</div></div>
 </div>
 
 <!-- ================================================================ -->
@@ -73,7 +73,7 @@
 </table>
 
 <div class="progress-bar"><div class="fill" style="width:95%; background: linear-gradient(90deg, var(--green) 0%, var(--green) 90%, var(--yellow) 90%, var(--yellow) 100%);"></div></div>
-<p style="color:var(--dim); font-size:0.85rem; margin-top:0.3rem;">14 milestones: 13 complete, 1 partial (SMP multi-core scheduler). Phase 5 complete: spinlocks, TCP sockets, ext2 read-write with file creation. 24/24 tests pass.</p>
+<p style="color:var(--dim); font-size:0.85rem; margin-top:0.3rem;">14 milestones: 13 complete, 1 partial (SMP multi-core scheduler). Phase 6 in progress: TCP socket API validated, ext2 read-write complete. 25/25 tests pass.</p>
 
 <!-- ================================================================ -->
 <h2>M14: SMP Status (Current Work)</h2>
@@ -87,7 +87,7 @@
   <li>Per-CPU data: <code>percpu_array[N]</code> with cpu_id, apic_id, current_tid</li>
   <li>GS base MSR configured per CPU</li>
   <li>AP enters idle loop (<code>sti; hlt</code>)</li>
-  <li>24/24 tests pass with <code>-smp 2</code></li>
+  <li>25/25 tests pass with <code>-smp 2</code></li>
 </ul>
 
 <h3>Known Limitations</h3>
@@ -166,6 +166,7 @@
 <table>
   <tr><th>Priority</th><th>Task</th><th>Dependencies</th><th>Status</th></tr>
   <tr><td>P0</td><td>Multi-core scheduler (AP enters scheduler)</td><td>PerCpu fields added, commonStub change deferred</td><td><span class="badge partial">PARTIAL</span></td></tr>
+  <tr><td>P1</td><td>TCP socket API validation (hello22)</td><td>syscalls 117-122</td><td><span class="badge done">DONE</span></td></tr>
   <tr><td>P2</td><td>AP LAPIC timer (needs QEMU fix or KVM)</td><td>AP LAPIC MMIO</td><td><span class="badge todo">TODO</span></td></tr>
   <tr><td>P2</td><td>Network server (echo/http)</td><td>TCP socket</td><td><span class="badge todo">TODO</span></td></tr>
   <tr><td>P2</td><td>ext2 directory creation (mkdir)</td><td>createFile works</td><td><span class="badge todo">TODO</span></td></tr>
@@ -188,6 +189,7 @@ bash tools/qemu_run.sh       # Build ISO + run QEMU (512MB RAM, 2 CPUs)</code></
 <!-- ================================================================ -->
 <h2>Changelog</h2>
 <ul class="changelog">
+  <li><span class="date">2026-05-25</span> <strong>hello22 TCP socket API test</strong> — validates socket(117)/bind(118)/listen(119)/accept(120) server-side API. All return correct values. 25/25 tests pass.</li>
   <li><span class="date">2026-05-25</span> <strong>Bug fix: allocBlock reversed memcpy</strong> — allocBlock had memcpy direction reversed, corrupting the in-memory superblock with garbage. Replaced inline superblock/group-descriptor writes with calls to writeSuperblock()/writeGroupDescs().</li>
   <li><span class="date">2026-05-25</span> <strong>Bug fix: findDirEntryByPath page fault</strong> — findDirEntryByPath crashed at RIP=0x0 due to a Zig codegen issue with ?u32 optional return type. Replaced with walkPath (i64 return, proven stable).</li>
   <li><span class="date">2026-05-25</span> <strong>ext2 createFile working</strong> — hello21 test now passes: creates /writetest.txt, writes 22 bytes, reads back, verifies content. All 24 tests pass.</li>

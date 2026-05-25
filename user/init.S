@@ -422,6 +422,29 @@ _start:
     movq $13, %rdx
     syscall
 
+    # Spawn hello22 (TCP socket API test)
+    movq $5, %rax
+    leaq hello22_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn22_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done22_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
     # Spawn hello9 (fork test)
     movq $5, %rax
     leaq hello9_name(%rip), %rdi
@@ -627,6 +650,13 @@ spawn21_msg:
     .ascii "spawned hello21\n"
 done21_msg:
     .ascii "hello21 done\n"
+hello22_name:
+    .ascii "hello22"
+    .byte 0
+spawn22_msg:
+    .ascii "spawned hello22\n"
+done22_msg:
+    .ascii "hello22 done\n"
 hello9_name:
     .ascii "hello9"
     .byte 0
