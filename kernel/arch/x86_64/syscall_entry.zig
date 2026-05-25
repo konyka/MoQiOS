@@ -73,9 +73,25 @@ pub const SyscallFrame = extern struct {
 /// Per-CPU data accessible via GS segment in kernel mode.
 /// In user mode, GSBase points to user-space TLS (unused for now).
 /// In kernel mode (after swapgs), GSBase points to this struct.
+pub const MAX_CPUS: u32 = 4;
+
 pub const PerCpu = extern struct {
     kernel_rsp: u64, // Kernel RSP0 to switch to on syscall
     saved_user_rsp: u64, // User RSP saved across syscall
+    saved_stack_anchor: u64, // RSP anchor for context switch (commonStub)
+    slice_remaining: u64, // Timeslice ticks remaining
+    cpu_id: u32, // Logical CPU index (0 = BSP)
+    apic_id: u32, // LAPIC APIC ID
+    current_tid: u32, // Currently running task TID on this CPU (0 = idle)
+    current_task_idx: u32, // Index of currently running task (0xFFFFFFFF = none)
+};
+
+/// Per-CPU data array, indexed by CPU logical ID.
+pub var percpu_array: [MAX_CPUS]PerCpu = .{
+    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 0, .cpu_id = 0, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF },
+    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 0, .cpu_id = 1, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF },
+    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 0, .cpu_id = 2, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF },
+    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 0, .cpu_id = 3, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF },
 };
 
 /// Personality type for ABI routing.
@@ -99,6 +115,12 @@ export var fork_parent_ret: u64 = 0;
 var bsp_percpu: PerCpu = .{
     .kernel_rsp = 0,
     .saved_user_rsp = 0,
+    .saved_stack_anchor = 0,
+    .slice_remaining = 0,
+    .cpu_id = 0,
+    .apic_id = 0,
+    .current_tid = 0,
+    .current_task_idx = 0xFFFFFFFF,
 };
 
 /// Global pointer to syscall dispatch function, used by syscallEntry
@@ -106,9 +128,21 @@ var bsp_percpu: PerCpu = .{
 /// Exported with C linkage so the asm template can reference it by name.
 export var dispatch_handler: *const fn (*SyscallFrame) callconv(.c) void = &syscallDispatch;
 
-/// Get pointer to BSP per-cpu data.
+/// Get pointer to current CPU's per-cpu data via GS base.
 pub fn getPerCpu() *PerCpu {
-    return &bsp_percpu;
+    // In kernel mode, GS_BASE points to our PerCpu struct (set via wrmsr)
+    const gs_base = rdmsr(0xC0000101); // MSR_GS_BASE
+    return @ptrFromInt(gs_base);
+}
+
+/// Compile-time offset of saved_stack_anchor in PerCpu (used by commonStub asm).
+pub const PERCPU_ANCHOR_OFFSET = @offsetOf(PerCpu, "saved_stack_anchor");
+
+/// Set GS base for the given CPU (used during CPU init).
+pub fn setPerCpuGsBase(cpu_id: u32) void {
+    const addr = @intFromPtr(&percpu_array[cpu_id]);
+    wrmsr(0xC0000101, addr); // GS_BASE (kernel mode)
+    wrmsr(0xC0000102, addr); // KERNEL_GS_BASE (loaded by swapgs)
 }
 
 /// The naked syscall entry point — loaded into IA32_LSTAR.
@@ -357,6 +391,24 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         116 => {
             syscallTcpPoll(frame);
+        },
+        117 => {
+            syscallSocket(frame);
+        },
+        118 => {
+            syscallBind(frame);
+        },
+        119 => {
+            syscallListen(frame);
+        },
+        120 => {
+            syscallAccept(frame);
+        },
+        121 => {
+            syscallSendto(frame);
+        },
+        122 => {
+            syscallRecvfrom(frame);
         },
         228 => {
             syscallClock_gettime(frame);
@@ -900,12 +952,12 @@ pub fn init() void {
     const efer = rdmsr(MSR_EFER);
     wrmsr(MSR_EFER, efer | 1);
 
-    // Set kernel GSBase to point to PerCpu struct.
+    // Set kernel GSBase to point to PerCpu struct for BSP (CPU 0).
     // swapgs swaps GS_BASE and KERNEL_GS_BASE.
-    // In user mode: GS_BASE = user TLS (0 for now), KERNEL_GS_BASE = &bsp_percpu
-    // In kernel mode (after swapgs): GS_BASE = &bsp_percpu
-    // So we set KERNEL_GS_BASE to &bsp_percpu (loaded by swapgs in syscallEntry)
-    wrmsr(MSR_KERNEL_GS_BASE, @intFromPtr(&bsp_percpu));
+    // In user mode: GS_BASE = user TLS (0 for now), KERNEL_GS_BASE = &percpu_array[0]
+    // In kernel mode (after swapgs): GS_BASE = &percpu_array[0]
+    wrmsr(MSR_KERNEL_GS_BASE, @intFromPtr(&percpu_array[0]));
+    wrmsr(MSR_GS_BASE, @intFromPtr(&percpu_array[0]));
 
     serial.writeString("[syscall] SYSCALL/SYSRET enabled, GSBase configured\n");
 }
@@ -1208,7 +1260,7 @@ fn syscallExecve(frame: *SyscallFrame) void {
         :
         : [cr3] "r" (result.pml4),
         : .{ .rax = true, .memory = true });
-    @import("../../arch/x86_64/gdt.zig").setRsp0(cur.kernel_stack_top);
+    @import("../../arch/x86_64/gdt.zig").setRsp0Bsp(cur.kernel_stack_top);
     getPerCpu().kernel_rsp = cur.kernel_stack_top;
 
     const stack_top = cur.kernel_stack_top;
@@ -2212,4 +2264,307 @@ fn syscallTcpPoll(frame: *SyscallFrame) void {
     const net_mod = @import("../../net/mod.zig");
     const result = net_mod.tcp.tcpPoll(tcb_idx);
     frame.rax = @bitCast(result);
+}
+
+/// Syscall #117: socket(domain, type, protocol)
+/// RDI = domain (AF_INET = 2)
+/// RSI = type (SOCK_STREAM = 1)
+/// RDX = protocol (0 = default)
+/// Returns fd index or -1 on failure.
+fn syscallSocket(frame: *SyscallFrame) void {
+    const domain: u32 = @truncate(frame.rdi);
+    const sock_type: u32 = @truncate(frame.rsi);
+    _ = frame.rdx; // protocol (ignored, TCP always)
+
+    // Only support AF_INET (2) + SOCK_STREAM (1) = TCP
+    if (domain != 2 or sock_type != 1) {
+        frame.rax = @bitCast(@as(i64, -38)); // ENOSYS
+        return;
+    }
+
+    const sched_mod = @import("../../proc/sched.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+    const task_mod = @import("../../proc/task.zig");
+    const t = task_mod.getTask(cur_idx) orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    // Allocate a TCP socket
+    const net_mod = @import("../../net/mod.zig");
+    const tcb_idx = net_mod.tcp.tcpSocket(cur_idx);
+    if (tcb_idx < 0) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    // Allocate an fd
+    const fd = allocTcpFd(&t.fd_table, @intCast(tcb_idx));
+    if (fd < 0) {
+        // Clean up TCB
+        _ = net_mod.tcp.tcpClose(@intCast(tcb_idx));
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+    frame.rax = @bitCast(fd);
+}
+
+/// Syscall #118: bind(fd, addr_ptr, addr_len)
+/// RDI = fd
+/// RSI = pointer to sockaddr_in (user space)
+/// RDX = addr_len
+/// Returns 0 on success, -1 on failure.
+fn syscallBind(frame: *SyscallFrame) void {
+    const fd: u32 = @truncate(frame.rdi);
+    const addr_ptr: u64 = frame.rsi;
+    _ = frame.rdx; // addr_len
+
+    const sched_mod = @import("../../proc/sched.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+    const task_mod = @import("../../proc/task.zig");
+    const t = task_mod.getTask(cur_idx) orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    if (fd >= 32 or t.fd_table.fds[fd].fd_type != .tcp_socket) {
+        frame.rax = @bitCast(@as(i64, -88)); // ENOTSOCK
+        return;
+    }
+    const tcb_idx = t.fd_table.fds[fd].tcb_idx;
+
+    // Parse sockaddr_in: { family: u16, port: u16 (network order), ip: u32 }
+    if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+    var sock_addr: [8]u8 = undefined;
+    const copy = @import("../../mm/copy_from_user.zig");
+    _ = copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), 8);
+
+    // Port is in network byte order (big-endian)
+    const port = (@as(u16, sock_addr[2]) << 8) | @as(u16, sock_addr[3]);
+
+    const net_mod = @import("../../net/mod.zig");
+    const result = net_mod.tcp.tcpBind(tcb_idx, port);
+    frame.rax = @bitCast(result);
+}
+
+/// Syscall #119: listen(fd, backlog)
+/// RDI = fd
+/// RSI = backlog (ignored)
+/// Returns 0 on success, -1 on failure.
+fn syscallListen(frame: *SyscallFrame) void {
+    const fd: u32 = @truncate(frame.rdi);
+    _ = frame.rsi; // backlog
+
+    const sched_mod = @import("../../proc/sched.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+    const task_mod = @import("../../proc/task.zig");
+    const t = task_mod.getTask(cur_idx) orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    if (fd >= 32 or t.fd_table.fds[fd].fd_type != .tcp_socket) {
+        frame.rax = @bitCast(@as(i64, -88)); // ENOTSOCK
+        return;
+    }
+    const tcb_idx = t.fd_table.fds[fd].tcb_idx;
+
+    const net_mod = @import("../../net/mod.zig");
+    const result = net_mod.tcp.tcpListen(tcb_idx);
+    frame.rax = @bitCast(result);
+}
+
+/// Syscall #120: accept(fd, addr_ptr, addr_len_ptr)
+/// RDI = fd (listening socket)
+/// RSI = addr_ptr (user space, to write peer address) — can be 0
+/// RDX = addr_len_ptr (user space) — can be 0
+/// Returns new fd for accepted connection, or -1 on failure / 0 if none pending.
+fn syscallAccept(frame: *SyscallFrame) void {
+    const fd: u32 = @truncate(frame.rdi);
+    _ = frame.rsi; // addr_ptr (not filled for now)
+    _ = frame.rdx; // addr_len_ptr
+
+    const sched_mod = @import("../../proc/sched.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+    const task_mod = @import("../../proc/task.zig");
+    const t = task_mod.getTask(cur_idx) orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    if (fd >= 32 or t.fd_table.fds[fd].fd_type != .tcp_socket) {
+        frame.rax = @bitCast(@as(i64, -88)); // ENOTSOCK
+        return;
+    }
+    const listen_tcb_idx = t.fd_table.fds[fd].tcb_idx;
+
+    const net_mod = @import("../../net/mod.zig");
+    const new_tcb_idx = net_mod.tcp.tcpAccept(listen_tcb_idx, cur_idx);
+    if (new_tcb_idx <= 0) {
+        frame.rax = @bitCast(new_tcb_idx);
+        return;
+    }
+
+    // Allocate a new fd for the accepted connection
+    const new_fd = allocTcpFd(&t.fd_table, @intCast(new_tcb_idx));
+    if (new_fd < 0) {
+        // Can't allocate fd — close the accepted connection
+        _ = net_mod.tcp.tcpClose(@intCast(new_tcb_idx));
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+    frame.rax = @bitCast(new_fd);
+}
+
+/// Syscall #121: sendto(fd, buf, len, flags, addr_ptr, addr_len)
+/// For TCP sockets, ignores destination (already connected).
+/// RDI = fd
+/// RSI = data buffer (user space)
+/// RDX = data length
+/// Returns bytes sent, -1 on error.
+fn syscallSendto(frame: *SyscallFrame) void {
+    const fd: u32 = @truncate(frame.rdi);
+    const buf: u64 = frame.rsi;
+    const len: u32 = @truncate(frame.rdx);
+    _ = frame.rcx; // flags
+    _ = frame.r8; // addr_ptr
+    _ = frame.r9; // addr_len
+
+    const sched_mod = @import("../../proc/sched.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+    const task_mod = @import("../../proc/task.zig");
+    const t = task_mod.getTask(cur_idx) orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    if (fd >= 32) {
+        frame.rax = @bitCast(@as(i64, -9)); // EBADF
+        return;
+    }
+
+    if (t.fd_table.fds[fd].fd_type == .tcp_socket) {
+        if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) {
+            frame.rax = @bitCast(@as(i64, -1));
+            return;
+        }
+        var tmp_buf: [1460]u8 = undefined;
+        const copy = @import("../../mm/copy_from_user.zig");
+        const to_copy = @min(len, 1460);
+        const n = copy.copyFromUser(&tmp_buf, @ptrFromInt(buf), to_copy);
+        if (n == 0) {
+            frame.rax = @bitCast(@as(i64, -1));
+            return;
+        }
+        const tcb_idx = t.fd_table.fds[fd].tcb_idx;
+        const net_mod = @import("../../net/mod.zig");
+        const result = net_mod.tcp.tcpSend(tcb_idx, &tmp_buf, @intCast(n));
+        frame.rax = @bitCast(result);
+    } else {
+        // Not a socket — use regular write
+        const vfs_mod = @import("../../fs/vfs.zig");
+        var tmp_buf: [4096]u8 = undefined;
+        const copy = @import("../../mm/copy_from_user.zig");
+        const to_copy = @min(len, 4096);
+        const n = copy.copyFromUser(&tmp_buf, @ptrFromInt(buf), to_copy);
+        if (n == 0) {
+            frame.rax = @bitCast(@as(i64, -1));
+            return;
+        }
+        const result = vfs_mod.FdTable.write(&t.fd_table, fd, &tmp_buf, n);
+        frame.rax = @bitCast(result);
+    }
+}
+
+/// Syscall #122: recvfrom(fd, buf, len, flags, addr_ptr, addr_len_ptr)
+/// For TCP sockets, ignores source address.
+/// RDI = fd
+/// RSI = buffer (user space)
+/// RDX = buffer length
+/// Returns bytes received (0 = none), -1 on error/closed.
+fn syscallRecvfrom(frame: *SyscallFrame) void {
+    const fd: u32 = @truncate(frame.rdi);
+    const buf: u64 = frame.rsi;
+    const len: u32 = @truncate(frame.rdx);
+    _ = frame.rcx; // flags
+    _ = frame.r8; // addr_ptr
+    _ = frame.r9; // addr_len_ptr
+
+    const sched_mod = @import("../../proc/sched.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+    const task_mod = @import("../../proc/task.zig");
+    const t = task_mod.getTask(cur_idx) orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    if (fd >= 32) {
+        frame.rax = @bitCast(@as(i64, -9)); // EBADF
+        return;
+    }
+
+    if (t.fd_table.fds[fd].fd_type == .tcp_socket) {
+        if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) {
+            frame.rax = @bitCast(@as(i64, -1));
+            return;
+        }
+        var tmp_buf: [4096]u8 = undefined;
+        const to_read = @min(len, 4096);
+        const tcb_idx = t.fd_table.fds[fd].tcb_idx;
+        const net_mod = @import("../../net/mod.zig");
+        const result = net_mod.tcp.tcpRecv(tcb_idx, &tmp_buf, to_read);
+        if (result > 0) {
+            const copy = @import("../../mm/copy_from_user.zig");
+            _ = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf))[0..@intCast(result)], @intCast(result));
+        }
+        frame.rax = @bitCast(result);
+    } else {
+        // Not a socket — use regular read
+        const vfs_mod = @import("../../fs/vfs.zig");
+        var tmp_buf: [4096]u8 = undefined;
+        const to_read = @min(len, 4096);
+        const result = vfs_mod.FdTable.read(&t.fd_table, fd, &tmp_buf, to_read);
+        if (result > 0) {
+            const copy = @import("../../mm/copy_from_user.zig");
+            _ = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf))[0..@intCast(result)], @intCast(result));
+        }
+        frame.rax = @bitCast(result);
+    }
+}
+
+/// Helper: allocate a TCP socket fd in the task's fd table.
+fn allocTcpFd(fd_table: *@import("../../fs/vfs.zig").FdTable, tcb_idx: u32) i64 {
+    var slot: u32 = 3;
+    while (slot < 32) : (slot += 1) {
+        if (fd_table.fds[slot].fd_type == .none) break;
+    }
+    if (slot >= 32) return -1;
+
+    fd_table.fds[slot] = .{
+        .fd_type = .tcp_socket,
+        .tcb_idx = tcb_idx,
+        .writable = true,
+    };
+    return @intCast(slot);
 }

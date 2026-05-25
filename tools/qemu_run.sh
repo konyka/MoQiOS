@@ -107,6 +107,9 @@ fi
 if [ -f "user/hello20.bin" ]; then
     cp "user/hello20.bin" "$USER_BIN_DIR/hello20"
 fi
+if [ -f "user/hello21.bin" ]; then
+    cp "user/hello21.bin" "$USER_BIN_DIR/hello21"
+fi
 if [ -d "$USER_BIN_DIR" ] && [ "$(ls -A $USER_BIN_DIR)" ]; then
     ./tools/mkramdisk.sh "$USER_BIN_DIR" "$ISO_DIR/boot/ramdisk.bin"
 else
@@ -161,6 +164,7 @@ qemu-system-x86_64 \
     -device virtio-blk-pci,drive=disk0 \
     -netdev user,id=net0 \
     -device e1000,netdev=net0 \
+    -smp 2 \
     -serial stdio \
     -display none \
     -no-reboot \

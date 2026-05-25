@@ -97,6 +97,32 @@ pub fn mapPage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void {
     invlpg(virt);
 }
 
+/// Check if a virtual address is already mapped (present in page tables).
+/// Returns true if the page is mapped (either as a 4KB page or 2MB huge page).
+pub fn isPageMapped(pml4_phys: u64, virt: u64) bool {
+    const pml4_idx = (virt >> 39) & 0x1FF;
+    const pdpt_idx = (virt >> 30) & 0x1FF;
+    const pd_idx = (virt >> 21) & 0x1FF;
+    const pt_idx = (virt >> 12) & 0x1FF;
+
+    const pml4: *PageTable = hhdm.physToPtr(PageTable, pml4_phys);
+    const pml4e = pml4.entries[pml4_idx];
+    if (!pml4e.present) return false;
+
+    const pdpt: *PageTable = hhdm.physToPtr(PageTable, pml4e.getPhysAddr());
+    const pdpte = pdpt.entries[pdpt_idx];
+    if (!pdpte.present) return false;
+    if (pdpte.huge_page) return true; // 1GB page
+
+    const pd: *PageTable = hhdm.physToPtr(PageTable, pdpte.getPhysAddr());
+    const pde = pd.entries[pd_idx];
+    if (!pde.present) return false;
+    if (pde.huge_page) return true; // 2MB huge page
+
+    const pt: *PageTable = hhdm.physToPtr(PageTable, pde.getPhysAddr());
+    return pt.entries[pt_idx].present;
+}
+
 /// Map a 2MB huge page via PD entry (no PT needed).
 pub fn mapHugePage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void {
     const pml4_idx = (virt >> 39) & 0x1FF;
@@ -180,7 +206,7 @@ pub fn reloadCR3() void {
     asm volatile (
         \\mov %%cr3, %%rax
         \\mov %%rax, %%cr3
-        ::: "rax");
+        ::: .{ .rax = true });
 }
 
 fn writeHex(value: u64) void {

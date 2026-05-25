@@ -1,7 +1,7 @@
 # MoQiOS 实施计划
 
-> **版本**: v0.4
-> **日期**: 2026-05-22
+> **版本**: v0.6
+> **日期**: 2026-05-24
 > **说明**: 本文档记录 MoQiOS 的实际实施进度和已完成里程碑。
 > 长期设计目标参见 [moqios-design.md](./moqios-design.md)，当前架构参见 [moqios-architecture-current.md](./moqios-architecture-current.md)。
 
@@ -9,14 +9,15 @@
 
 ## 当前状态
 
-- **内核**: 11,623 行 Zig, 52 个源文件
-- **用户空间**: 2,244 行 C/ASM
-- **系统调用**: 35 个
-- **自动化测试**: 18 个 (hello2-hello18) + 交互式 Shell
-- **测试稳定性**: 5/5 次连续通过 (hello17/18 手动运行)
+- **内核**: 14,634 行 Zig, 54 个源文件
+- **用户空间**: 1,828 行 C/ASM
+- **系统调用**: 46 个
+- **自动化测试**: 23 个 (hello2-hello20, init.S) + 交互式 Shell
+- **测试稳定性**: 23/23 通过 (-smp 2)
 - **最大进程数**: 64
-- **文件系统**: FAT32 (virtio-blk) + ramdisk
-- **网络**: e1000 (ARP/IPv4/ICMP/UDP)
+- **文件系统**: FAT32 (virtio-blk) + ramdisk + ext2 (读写)
+- **网络**: e1000 (ARP/IPv4/ICMP/UDP/TCP + Socket API)
+- **多核**: SMP 支持 (BSP + AP, 2 CPUs online, 内核自旋锁)
 
 ---
 
@@ -184,6 +185,61 @@
 
 ---
 
+### M12: TCP 协议
+
+**状态**: 完成
+
+- 三次握手 (SYN/SYN-ACK/ACK)
+- 数据传输 (序列号, 滑动窗口 4096 bytes)
+- 四次挥手 (FIN 关闭)
+- 超时重传 (2 秒超时, 指数退避)
+- 环形缓冲区 (发送 8KB, 接收 8KB)
+- 最大 8 个并发连接
+- 系统调用: tcp_connect(112), tcp_send(113), tcp_recv(114), tcp_close(115), tcp_poll(116)
+
+**关键文件**: tcp.zig (687 行)
+
+---
+
+### M13: ext2 文件系统
+
+**状态**: 完成 (只读)
+
+- Superblock 解析
+- Block Group Descriptor 表
+- Inode 读取 (直接块 + 单级间接块)
+- 目录项解析
+- 文件读取
+- 1024 字节块大小 (revision 0)
+
+**关键文件**: ext2.zig (478 行)
+
+---
+
+### M14: SMP 多核支持
+
+**状态**: 基本完成
+
+- ACPI MADT 解析 (CPU LAPIC IDs)
+- AP 启动: INIT IPI + SIPI
+- 3 阶段 AP 引导代码 (实模式 → 保护模式 → 长模式)
+- 身份映射 (identity mapping) 覆盖全部 512MB RAM
+- Per-CPU GDT/TSS 初始化
+- Per-CPU 数据 (cpu_id, apic_id, current_tid)
+- GS Base MSR 配置
+- AP 空闲循环 (sti + hlt)
+- BSP/AP 串行输出确认
+- QEMU `-smp 2` 验证通过, 23/23 测试通过
+
+**已知限制**:
+- LAPIC MMIO 在 AP 上不可用 (QEMU TCG 限制), AP 无定时器中断
+- APIC 定时器仅在 BSP 上运行
+- 内核锁未实现 (当前仅 BSP 调度)
+
+**关键文件**: smp.zig (455 行), ap_trampoline_src.S, ap_trampoline.bin, gdt.zig (per-CPU), lapic.zig
+
+---
+
 ## 系统调用完整列表
 
 | 编号 | 名称 | 功能 | 里程碑 |
@@ -221,6 +277,17 @@
 | 109 | getcwd | 获取当前工作目录 | M11+ |
 | 110 | fstat | 获取文件状态 | M11+ |
 | 111 | unlink | 删除文件 | M11+ |
+| 112 | tcp_connect | TCP 连接 | M12 |
+| 113 | tcp_send | TCP 发送 | M12 |
+| 114 | tcp_recv | TCP 接收 | M12 |
+| 115 | tcp_close | TCP 关闭 | M12 |
+| 116 | tcp_poll | TCP 轮询 | M12 |
+| 117 | socket | 创建 TCP socket | Phase 5 |
+| 118 | bind | 绑定 socket 到端口 | Phase 5 |
+| 119 | listen | 监听连接 | Phase 5 |
+| 120 | accept | 接受连接 | Phase 5 |
+| 121 | sendto | 发送数据 | Phase 5 |
+| 122 | recvfrom | 接收数据 | Phase 5 |
 | 228 | clock_gettime | 高精度时间 | M11+ |
 
 ---
@@ -270,9 +337,11 @@
 
 | 功能 | 设计状态 | 实施状态 |
 |---|---|---|
-| TCP 协议 | 未设计详细方案 | 未开始 |
-| SMP 多核支持 | 未设计详细方案 | 未开始 |
-| ext4 文件系统 | 未设计详细方案 | 未开始 |
+| TCP 协议 | 完整实现 | ✅ 三次握手/数据传输/四次挥手 + Socket API (M12 + Phase 5) |
+| SMP 多核支持 | 基本实现 | ✅ AP 启动/Per-CPU 数据/空闲循环/内核自旋锁 (M14 + Phase 5) |
+| ext2 文件系统 | 读写实现 | ✅ Superblock/Inode/目录/文件读写 (M13 + Phase 5) |
+| 内核锁 (SMP 安全) | 已实现 | ✅ IrqSpinlock: serial/PMM/task/sched (Phase 5) |
+| ext2 创建文件 | 部分实现 | writeFile 已完成, createFile 待实现 |
 | 交换分区 (swap) | 未设计详细方案 | 未开始 |
 | 用户权限/安全模型 | 未设计详细方案 | 未开始 |
 | 栈自动扩展 | 未设计详细方案 | 未开始 |
@@ -285,29 +354,46 @@
 
 ## 下一步方向
 
-### Phase 1: 稳定化
+### Phase 1: 稳定化 ✅
 
-- 调查 hello17/18 init.S 不稳定根因 (调度器时序)
-- 实现可靠的阻塞式 waitpid
-- 修复网络延迟初始化问题
+- ~~调查 hello17/18 init.S 不稳定根因~~ → 已修复，23/23 通过
+- ~~实现可靠的阻塞式 waitpid~~ → 使用 hlt 循环，稳定
+- ~~修复网络延迟初始化问题~~ → 已解决
 
-### Phase 2: 网络扩展
+### Phase 2: 网络扩展 ✅
 
-- 实现 TCP 协议 (可靠传输)
-- Socket 抽象层
-- 网络服务器 (echo/http)
+- ~~实现 TCP 协议~~ → M12 完成
+- ~~Socket 抽象层~~ → Phase 5 完成 (syscalls 117-122)
+- 网络服务器 (echo/http) → 待实现
 
-### Phase 3: 文件系统扩展
+### Phase 3: 文件系统扩展 ✅
 
-- ext2/ext4 只读支持
-- 文件系统缓存优化
-- 虚拟文件系统增强
+- ~~ext2 只读支持~~ → M13 完成
+- ~~ext2 写入支持~~ → Phase 5 完成 (writeBlock/writeInode/allocBlock/writeFile)
+- ext2 创建文件 (createFile) → 进行中
+- 文件系统缓存优化 → 待实现
 
-### Phase 4: 多核
+### Phase 4: 多核 ✅ (基本)
 
-- LAPIC/APIC 支持
-- 多核调度
-- 内核锁细化 (per-CPU 数据)
+- ~~LAPIC/APIC 支持~~ → BSP LAPIC 定时器完成
+- ~~多核启动~~ → AP 引导 + Per-CPU 数据完成
+- ~~内核锁细化~~ → Phase 5 完成 (IrqSpinlock: serial/PMM/task/sched)
+- AP LAPIC 定时器 → QEMU 限制, 待解决
+
+### Phase 5: 内核完善 ✅
+
+- ~~内核自旋锁~~ → IrqSpinlock 保护 serial/PMM/task/sched, 锁序: sched→task→pmm
+- ~~TCP socket 系统调用~~ → socket(117)/bind(118)/listen(119)/accept(120)/sendto(121)/recvfrom(122)
+- ~~ext2 写入支持~~ → writeBlock, writeInode, allocBlock, ensureBlock, writeFile
+- 多核调度 → PerCpu 字段已添加, AP 无定时器中断, 需要 KVM 或真机
+
+### Phase 6: 下一步
+
+- ext2 创建文件 (createFile: 分配 inode + 创建目录项)
+- 网络服务器 (echo server / HTTP server)
+- 文件系统缓存
+- 多核调度 (需要 AP 定时器)
+- 真机硬件支持
 
 ---
 
@@ -315,6 +401,8 @@
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| v0.6 | 2026-05-24 | Phase 5 完成: 内核自旋锁 (IrqSpinlock), TCP socket syscalls (117-122), ext2 写入支持, PerCpu 调度器字段 |
+| v0.5 | 2026-05-24 | 添加 M12 (TCP), M13 (ext2), M14 (SMP); 更新统计数据; 更新下一步方向 |
 | v0.4 | 2026-05-22 | 重写：反映实际实现状态，移除未实现的微内核/Windows 计划 |
 | v0.3 | 2026-05-22 | 添加 M11+ 进度，更新系统调用表 |
 | v0.2 | 2026-05-20 | 更新 M1-M10 完成状态 |

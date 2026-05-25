@@ -60,12 +60,12 @@ const Tss = extern struct {
 
 /// Total GDT entries: null, kcode, kdata, ucode, udata, ucode_dup, tss_low, tss_high = 8
 const GDT_ENTRIES: usize = 8;
+const MAX_CPUS: usize = 4;
 
-var gdt_entries: [GDT_ENTRIES]GdtEntry = undefined;
-var gdt_ptr: GdtPtr = undefined;
-
-/// Single TSS for the BSP (bootstrap processor).
-var tss: Tss = undefined;
+/// Per-CPU GDT and TSS arrays.
+var gdt_entries: [MAX_CPUS][GDT_ENTRIES]GdtEntry = undefined;
+var gdt_ptr: [MAX_CPUS]GdtPtr = undefined;
+var tss: [MAX_CPUS]Tss = undefined;
 
 fn makeEntry(base: u32, limit: u20, access: u8, flags: u4) GdtEntry {
     return .{
@@ -101,47 +101,49 @@ fn makeTssEntry(tss_addr: u64, limit: u20) [2]GdtEntry {
     };
 }
 
-/// Set the RSP0 value in the TSS (kernel stack for ring3→ring0 transitions).
-pub fn setRsp0(rsp0: u64) void {
-    tss.rsp0 = rsp0;
+/// Set the RSP0 value in the TSS for a given CPU.
+pub fn setRsp0(cpu_id: usize, rsp0: u64) void {
+    tss[cpu_id].rsp0 = rsp0;
 }
 
-/// Get the TSS pointer (for address space setup).
-pub fn getTssPtr() *Tss {
-    return &tss;
+/// Get the TSS pointer for a given CPU.
+pub fn getTssPtr(cpu_id: usize) *Tss {
+    return &tss[cpu_id];
 }
 
-pub fn init() void {
+/// Legacy compat: set RSP0 for CPU 0 (BSP).
+pub fn setRsp0Bsp(rsp0: u64) void {
+    setRsp0(0, rsp0);
+}
+
+/// Initialize GDT/TSS data for a specific CPU (without loading).
+fn initCpuGdtData(cpu_id: usize) void {
     // Initialize TSS
-    @memset(@as([*]u8, @ptrCast(&tss))[0..@sizeOf(Tss)], 0);
-    tss.iomap_base = @sizeOf(Tss);
+    @memset(@as([*]u8, @ptrCast(&tss[cpu_id]))[0..@sizeOf(Tss)], 0);
+    tss[cpu_id].iomap_base = @sizeOf(Tss);
 
-    // Build GDT:
-    //   [0] null descriptor
-    //   [1] kernel code  (0x08) — 64-bit, ring0, execute/read
-    //   [2] kernel data  (0x10) — ring0, read/write
-    //   [3] user code    (0x18) — 64-bit, ring3, execute/read
-    //   [4] user data    (0x20) — ring3, read/write
-    //   [5] user code    (0x28) — 64-bit, ring3, execute/read (duplicate for SYSRET CS=0x2B)
-    //   [6] TSS low      (0x30) — 64-bit TSS descriptor (two entries)
-    //   [7] TSS high     (0x38)
-    gdt_entries[0] = makeEntry(0, 0, 0, 0); // null
-    gdt_entries[1] = makeEntry(0, 0xFFFFF, 0x9A, 0xA); // kernel code (64-bit, ring0)
-    gdt_entries[2] = makeEntry(0, 0xFFFFF, 0x92, 0xC); // kernel data (ring0)
-    gdt_entries[3] = makeEntry(0, 0xFFFFF, 0xFA, 0xA); // user code (64-bit, ring3)
-    gdt_entries[4] = makeEntry(0, 0xFFFFF, 0xF2, 0xC); // user data (ring3)
-    gdt_entries[5] = makeEntry(0, 0xFFFFF, 0xFA, 0xA); // user code duplicate (64-bit, ring3) — SYSRET CS=0x2B
+    // Build GDT entries
+    gdt_entries[cpu_id][0] = makeEntry(0, 0, 0, 0); // null
+    gdt_entries[cpu_id][1] = makeEntry(0, 0xFFFFF, 0x9A, 0xA); // kernel code
+    gdt_entries[cpu_id][2] = makeEntry(0, 0xFFFFF, 0x92, 0xC); // kernel data
+    gdt_entries[cpu_id][3] = makeEntry(0, 0xFFFFF, 0xFA, 0xA); // user code
+    gdt_entries[cpu_id][4] = makeEntry(0, 0xFFFFF, 0xF2, 0xC); // user data
+    gdt_entries[cpu_id][5] = makeEntry(0, 0xFFFFF, 0xFA, 0xA); // user code dup (SYSRET)
 
-    // TSS descriptor (two entries, at index 6-7, selector 0x30)
-    const tss_entries = makeTssEntry(@intFromPtr(&tss), @as(u20, @intCast(@sizeOf(Tss) - 1)));
-    gdt_entries[6] = tss_entries[0];
-    gdt_entries[7] = tss_entries[1];
+    // TSS descriptor (two entries)
+    const tss_entries = makeTssEntry(@intFromPtr(&tss[cpu_id]), @as(u20, @intCast(@sizeOf(Tss) - 1)));
+    gdt_entries[cpu_id][6] = tss_entries[0];
+    gdt_entries[cpu_id][7] = tss_entries[1];
 
-    gdt_ptr = .{
-        .limit = @sizeOf(@TypeOf(gdt_entries)) - 1,
-        .base = @intFromPtr(&gdt_entries),
+    gdt_ptr[cpu_id] = .{
+        .limit = @sizeOf(@TypeOf(gdt_entries[cpu_id])) - 1,
+        .base = @intFromPtr(&gdt_entries[cpu_id]),
     };
+}
 
+/// Load GDT and TSS for the calling CPU.
+fn loadCpuGdt(cpu_id: usize) void {
+    // Load GDT
     asm volatile (
         \\lgdt (%[gdt_ptr])
         \\pushq $0x08
@@ -156,7 +158,7 @@ pub fn init() void {
         \\movw %%ax, %%gs
         \\movw %%ax, %%ss
         :
-        : [gdt_ptr] "r" (&gdt_ptr),
+        : [gdt_ptr] "r" (&gdt_ptr[cpu_id]),
     );
 
     // Load TSS
@@ -165,4 +167,32 @@ pub fn init() void {
         :
         : [sel] "r" (TSS_SEL),
     );
+}
+
+/// Set up GDT and TSS for a specific CPU (init data + load).
+fn setupCpuGdt(cpu_id: usize) void {
+    initCpuGdtData(cpu_id);
+    loadCpuGdt(cpu_id);
+}
+
+/// Initialize GDT/TSS for BSP (CPU 0).
+pub fn init() void {
+    setupCpuGdt(0);
+}
+
+/// Initialize GDT/TSS for an AP.
+pub fn initAp(cpu_id: usize) void {
+    setupCpuGdt(cpu_id);
+}
+
+/// Public wrapper for per-CPU GDT DATA initialization (used by SMP module).
+/// Only initializes the GDT entries, TSS, and GDT pointer — does NOT load them.
+/// The AP will load them itself via the trampoline.
+pub fn setupCpuGdtPublic(cpu_id: u32) void {
+    initCpuGdtData(cpu_id);
+}
+
+/// Get the virtual address of a CPU's GDT entries (for trampoline setup).
+pub fn getGdtEntriesAddr(cpu_id: usize) u64 {
+    return @intFromPtr(&gdt_entries[cpu_id]);
 }

@@ -7,6 +7,7 @@ const hhdm = @import("hhdm.zig");
 const serial = @import("../arch/x86_64/serial.zig");
 const klog = @import("../klog.zig");
 const page_frame = @import("page_frame.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 const PAGE_SIZE: u64 = 4096;
 
@@ -17,6 +18,7 @@ var total_pages: u64 = 0;
 var free_pages: u64 = 0;
 var highest_phys: u64 = 0;
 var ref_counts: [*]u16 = undefined;
+var lock: IrqSpinlock = .{};
 
 /// Skip first 2 MB (512 pages) — legacy BIOS area.
 const MIN_ALLOC_PAGE: u64 = 512;
@@ -146,6 +148,9 @@ pub fn init(memmap: *const limine.MemmapResponse) void {
 
 /// Allocate a single 4KB physical page. Returns physical address or null.
 pub fn allocPage() ?u64 {
+    const flags = lock.acquire();
+    defer lock.release(flags);
+
     var i: u64 = next_free_hint;
     while (i < total_pages) : (i += 1) {
         if (isBitSet(i)) {
@@ -178,11 +183,31 @@ pub fn allocPage() ?u64 {
     return null;
 }
 
+/// Reserve a physical page (mark as used). Used to protect page table pages
+/// that are already in use by Limine's mapping but might not be in the
+/// kernel_and_modules memory map entry.
+pub fn reservePage(phys: u64) void {
+    const flags = lock.acquire();
+    defer lock.release(flags);
+
+    const page = phys / PAGE_SIZE;
+    if (page >= total_pages) return;
+    if (isBitSet(page)) {
+        clearBit(page);
+        if (free_pages > 0) free_pages -= 1;
+    }
+}
+
 /// Free a physical page (decrement ref count, free if zero).
 pub fn freePage(addr: u64) void {
+    const flags = lock.acquire();
+    defer lock.release(flags);
+
     const page = addr / PAGE_SIZE;
     if (page >= total_pages) return;
     if (ref_counts[page] == 0) {
+        // Release lock before serial output (serial has its own lock)
+        lock.release(flags);
         serial.writeString("[PMM] BUG: double-free of page ");
         var buf: [20]u8 = undefined;
         serial.writeString(formatInt(&buf, page));
@@ -201,12 +226,16 @@ pub fn freePage(addr: u64) void {
 
 /// Increment reference count (for CoW).
 pub fn addRef(addr: u64) void {
+    const flags = lock.acquire();
+    defer lock.release(flags);
     const page = addr / PAGE_SIZE;
     if (page < total_pages) ref_counts[page] +|= 1;
 }
 
 /// Decrement reference count, return new count.
 pub fn decRef(addr: u64) u16 {
+    const flags = lock.acquire();
+    defer lock.release(flags);
     const page = addr / PAGE_SIZE;
     if (page >= total_pages) return 0;
     if (ref_counts[page] > 0) ref_counts[page] -= 1;

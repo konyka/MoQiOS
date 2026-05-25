@@ -2,8 +2,11 @@
 /// Uses I/O port 0x3F8
 
 const ports = @import("io.zig");
+const IrqSpinlock = @import("../../sync/irq_spinlock.zig").IrqSpinlock;
 
 const COM1 = 0x3F8;
+
+var lock: IrqSpinlock = .{};
 
 pub fn init() void {
     // Disable interrupts
@@ -22,14 +25,21 @@ pub fn init() void {
 }
 
 pub fn writeByte(byte: u8) void {
-    // Wait for transmit buffer to be empty
+    const flags = lock.acquire();
+    defer lock.release(flags);
     while ((ports.inb(COM1 + 5) & 0x20) == 0) {}
     ports.outb(COM1, byte);
 }
 
 pub fn writeString(s: []const u8) void {
+    const flags = lock.acquire();
+    defer lock.release(flags);
     for (s) |byte| {
-        if (byte == '\n') writeByte('\r');
-        writeByte(byte);
+        if (byte == '\n') {
+            while ((ports.inb(COM1 + 5) & 0x20) == 0) {}
+            ports.outb(COM1, '\r');
+        }
+        while ((ports.inb(COM1 + 5) & 0x20) == 0) {}
+        ports.outb(COM1, byte);
     }
 }

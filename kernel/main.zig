@@ -144,6 +144,10 @@ export fn _start() callconv(.c) noreturn {
     const lapic_addr = if (acpi.info.lapic_address != 0) acpi.info.lapic_address else 0xFEE00000;
     lapic.init(lapic_addr);
 
+    // SMP: Start Application Processors
+    const smp = @import("smp.zig");
+    smp.init();
+
     // M4: IPC engine + capability system
     ipc.init();
     capability.init();
@@ -224,17 +228,25 @@ fn mapAcpiRegion() void {
 }
 
 /// Map a single physical page containing an ACPI table at the given physical address.
+/// Skips mapping if the page is already mapped (to avoid splitting huge pages).
+/// Map a single physical page for ACPI/MMIO access.
+/// Uses 2MB huge page mapping to avoid splitting existing huge pages.
 pub fn mapAcpiPage(phys_addr: u64) void {
     const page = phys_addr & ~@as(u64, paging.PAGE_SIZE - 1);
     const virt = hhdm.physToVirt(page);
+    if (paging.isPageMapped(paging.getKernelPml4(), virt)) return;
+    // Use 2MB huge page mapping to avoid splitting
+    const huge_page_base = phys_addr & ~@as(u64, paging.PAGE_2MB - 1);
     const pml4 = paging.getKernelPml4();
     const flags = paging.MapFlags{
-        .writable = false,
+        .writable = true,
         .user = false,
         .no_execute = true,
         .global = true,
+        .write_through = true,
+        .cache_disable = true,
     };
-    paging.mapPage(pml4, virt, page, flags) catch {};
+    paging.mapHugePage(pml4, hhdm.physToVirt(huge_page_base), huge_page_base, flags) catch {};
 }
 
 fn formatInt(buf: []u8, value: u64) []const u8 {

@@ -28,6 +28,7 @@ pub const FdType = enum(u8) {
     pipe_read = 4,
     pipe_write = 5,
     ext2_file = 6,
+    tcp_socket = 7,
 };
 
 pub const PIPE_BUF_SIZE: u32 = 4096;
@@ -102,6 +103,7 @@ pub const FileDescriptor = struct {
     fat32_file_idx: u32 = 0,
     ext2_file_idx: u32 = 0,
     pipe_idx: u32 = 0,
+    tcb_idx: u32 = 0,
     writable: bool = false,
 };
 
@@ -183,8 +185,25 @@ pub const FdTable = struct {
                     .offset = 0,
                     .file_size = ext2.getFileSize(idx),
                     .ext2_file_idx = idx,
+                    .writable = is_writable,
                 };
                 return @intCast(slot);
+            }
+
+            // ext2 create file if O_CREAT
+            if (o_creat) {
+                const ci = ext2.createFile(name);
+                if (ci >= 0) {
+                    const idx: u32 = @intCast(ci);
+                    self.fds[slot] = .{
+                        .fd_type = .ext2_file,
+                        .offset = 0,
+                        .file_size = 0,
+                        .ext2_file_idx = idx,
+                        .writable = true,
+                    };
+                    return @intCast(slot);
+                }
             }
         }
 
@@ -236,6 +255,7 @@ pub const FdTable = struct {
                 return pipeRead(desc.pipe_idx, buf, count);
             },
             .pipe_write => return -1, // can't read from write end
+            .tcp_socket => return -1, // TCP sockets use sendto/recvfrom syscalls
         }
     }
 
@@ -267,7 +287,17 @@ pub const FdTable = struct {
                 return n;
             },
             .ramdisk_file => return -1,
-            .ext2_file => return -1,
+            .ext2_file => {
+                if (!desc.writable) return -1;
+                const ext2 = @import("ext2.zig");
+                const n = ext2.writeFile(desc.ext2_file_idx, @intCast(desc.offset), buf, @intCast(count));
+                if (n > 0) {
+                    desc.offset += @intCast(n);
+                    desc.file_size = ext2.getFileSize(desc.ext2_file_idx);
+                }
+                return n;
+            },
+            .tcp_socket => return -1, // TCP sockets use sendto/recvfrom syscalls
         }
     }
 
@@ -283,6 +313,10 @@ pub const FdTable = struct {
         if (desc.fd_type == .ext2_file) {
             const ext2 = @import("ext2.zig");
             ext2.closeFile(desc.ext2_file_idx);
+        }
+        if (desc.fd_type == .tcp_socket) {
+            const tcp = @import("../net/tcp.zig");
+            _ = tcp.tcpClose(desc.tcb_idx);
         }
         desc.* = .{};
         return 0;

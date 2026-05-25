@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MoQiOS Development Notes</title>
+<style>
+  :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #e6edf3; --dim: #8b949e; --accent: #58a6ff; --green: #3fb950; --yellow: #d29922; --red: #f85149; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; padding: 2rem; max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 1.8rem; margin-bottom: 0.5rem; }
+  h2 { font-size: 1.3rem; color: var(--accent); margin: 2rem 0 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.3rem; }
+  h3 { font-size: 1.1rem; margin: 1rem 0 0.5rem; }
+  .subtitle { color: var(--dim); margin-bottom: 2rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1.2rem; }
+  .card .label { color: var(--dim); font-size: 0.85rem; }
+  .card .value { font-size: 1.8rem; font-weight: 700; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 1.5rem; }
+  th, td { text-align: left; padding: 0.5rem 0.8rem; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+  th { color: var(--dim); font-weight: 600; }
+  .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 12px; font-size: 0.75rem; font-weight: 600; }
+  .badge.done { background: #1a3a2a; color: var(--green); }
+  .badge.partial { background: #3a2a1a; color: var(--yellow); }
+  .badge.todo { background: #2a1a1a; color: var(--red); }
+  .badge.next { background: #1a2a3a; color: var(--accent); }
+  pre { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; overflow-x: auto; font-size: 0.85rem; margin-bottom: 1rem; }
+  code { font-family: 'Fira Code', 'Consolas', monospace; }
+  .note { background: var(--card); border-left: 3px solid var(--accent); padding: 0.8rem 1rem; margin-bottom: 1rem; border-radius: 0 6px 6px 0; }
+  .note.warn { border-left-color: var(--yellow); }
+  .note.error { border-left-color: var(--red); }
+  .progress-bar { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; margin-top: 0.5rem; }
+  .progress-bar .fill { height: 100%; border-radius: 4px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .changelog { list-style: none; }
+  .changelog li { padding: 0.3rem 0; border-bottom: 1px solid var(--border); }
+  .changelog .date { color: var(--dim); font-size: 0.85rem; margin-right: 0.5rem; }
+</style>
+</head>
+<body>
+
+<h1>MoQiOS Development Notes</h1>
+<p class="subtitle">x86_64 kernel in Zig &mdash; <a href="docs/moqios-implementation-plan.md">Implementation Plan</a> &middot; <a href="docs/moqios-design.md">Design Doc</a></p>
+
+<!-- ================================================================ -->
+<h2>Project Stats</h2>
+<div class="grid">
+  <div class="card"><div class="label">Kernel</div><div class="value">14,876</div><div class="label">lines of Zig, 54 files</div></div>
+  <div class="card"><div class="label">Userspace</div><div class="value">1,828</div><div class="label">lines of C/ASM</div></div>
+  <div class="card"><div class="label">Syscalls</div><div class="value">46</div><div class="label">system calls</div></div>
+  <div class="card"><div class="label">Tests</div><div class="value">24/24</div><div class="label">passing with -smp 2</div></div>
+</div>
+
+<!-- ================================================================ -->
+<h2>Milestone Progress</h2>
+<table>
+  <tr><th>Milestone</th><th>Feature</th><th>Status</th><th>Key Files</th></tr>
+  <tr><td>M1</td><td>Boot + Serial</td><td><span class="badge done">DONE</span></td><td>main.zig, gdt.zig, idt.zig, serial.zig</td></tr>
+  <tr><td>M2</td><td>PMM + Paging</td><td><span class="badge done">DONE</span></td><td>pmm.zig, paging.zig</td></tr>
+  <tr><td>M3</td><td>Scheduler + Context Switch</td><td><span class="badge done">DONE</span></td><td>sched.zig, task.zig</td></tr>
+  <tr><td>M4</td><td>System Calls</td><td><span class="badge done">DONE</span></td><td>syscall_entry.zig</td></tr>
+  <tr><td>M5</td><td>ELF Loader</td><td><span class="badge done">DONE</span></td><td>loader.zig, user_mode.zig</td></tr>
+  <tr><td>M6</td><td>PCI Enumeration</td><td><span class="badge done">DONE</span></td><td>pci.zig</td></tr>
+  <tr><td>M7</td><td>Storage + FS</td><td><span class="badge done">DONE</span></td><td>virtio_blk.zig, fat32.zig, vfs.zig</td></tr>
+  <tr><td>M8</td><td>Network Stack</td><td><span class="badge done">DONE</span></td><td>e1000.zig, eth/arp/ipv4/icmp/udp</td></tr>
+  <tr><td>M9</td><td>Pipes + Shell</td><td><span class="badge done">DONE</span></td><td>ipc.zig, sh.c</td></tr>
+  <tr><td>M10</td><td>fork + execve</td><td><span class="badge done">DONE</span></td><td>addr_space.zig</td></tr>
+  <tr><td>M11+</td><td>Signals, Env, Dir ops</td><td><span class="badge done">DONE</span></td><td>signal.zig</td></tr>
+  <tr><td>M12</td><td>TCP Protocol + Sockets</td><td><span class="badge done">DONE</span></td><td>tcp.zig (870 lines), syscalls 117-122</td></tr>
+  <tr><td>M13</td><td>ext2 Filesystem (rw)</td><td><span class="badge done">DONE</span></td><td>ext2.zig (904 lines)</td></tr>
+  <tr><td>M14</td><td>SMP Multi-core</td><td><span class="badge partial">PARTIAL</span></td><td>smp.zig, ap_trampoline.S</td></tr>
+</table>
+
+<div class="progress-bar"><div class="fill" style="width:95%; background: linear-gradient(90deg, var(--green) 0%, var(--green) 90%, var(--yellow) 90%, var(--yellow) 100%);"></div></div>
+<p style="color:var(--dim); font-size:0.85rem; margin-top:0.3rem;">14 milestones: 13 complete, 1 partial (SMP multi-core scheduler). Phase 5 complete: spinlocks, TCP sockets, ext2 read-write with file creation. 24/24 tests pass.</p>
+
+<!-- ================================================================ -->
+<h2>M14: SMP Status (Current Work)</h2>
+
+<h3>What Works</h3>
+<ul>
+  <li>ACPI MADT parsing &mdash; detects 2 CPUs, LAPIC IDs</li>
+  <li>3-stage AP trampoline: real &rarr; protected &rarr; long mode</li>
+  <li>Identity mapping covering all 512MB RAM (256 PD entries)</li>
+  <li>Per-CPU GDT/TSS initialization</li>
+  <li>Per-CPU data: <code>percpu_array[N]</code> with cpu_id, apic_id, current_tid</li>
+  <li>GS base MSR configured per CPU</li>
+  <li>AP enters idle loop (<code>sti; hlt</code>)</li>
+  <li>24/24 tests pass with <code>-smp 2</code></li>
+</ul>
+
+<h3>Known Limitations</h3>
+<div class="note warn">
+  <strong>LAPIC MMIO on AP</strong>: Accessing LAPIC MMIO (HHDM or identity-mapped) crashes the AP in QEMU TCG.
+  Tried: 2MB huge page, 4KB page, identity mapping, MSR 0x1B enablement &mdash; all fail.
+  AP runs without LAPIC timer interrupts (uses <code>sti; hlt</code> idle loop).
+</div>
+<div class="note">
+  <strong>Kernel spinlocks integrated</strong>: Serial, PMM, task array, and scheduler now use <code>IrqSpinlock</code>.
+  IPC and syscall handlers still modify task state directly (safe: only BSP runs syscalls).
+  Lock order: sched_lock &rarr; task_lock &rarr; pmm.lock. CR3 reloads done outside lock.
+</div>
+
+<h3>Key Technical Decisions</h3>
+<ul>
+  <li><strong>Identity-mapped entry point</strong>: AP's TLB is empty; using physical address for <code>apEntry</code> avoids walking kernel mapping (PML4[511]) for instruction fetch</li>
+  <li><strong>CPU ID via <code>@ptrFromInt(0x7040)</code></strong>: Zig <code>callconv(.c)</code> calling convention unreliable; reading from trampoline data area avoids register mismatch</li>
+  <li><strong>Precompiled flat binary trampoline</strong>: <code>as --32</code> + <code>ld -melf_i386</code> + <code>objcopy -O binary</code></li>
+  <li><strong>Zig 0.16 register clobbers</strong>: Use <code>.{ .rax = true }</code> struct syntax, NOT <code>"rax"</code> strings</li>
+</ul>
+
+<!-- ================================================================ -->
+<h2>Syscall Reference</h2>
+<table>
+  <tr><th>#</th><th>Name</th><th>Description</th><th>Milestone</th></tr>
+  <tr><td>1</td><td>write</td><td>Write to fd</td><td>M4</td></tr>
+  <tr><td>2</td><td>exit</td><td>Terminate process</td><td>M4</td></tr>
+  <tr><td>4</td><td>getpid</td><td>Get process ID</td><td>M4</td></tr>
+  <tr><td>5</td><td>spawn</td><td>Create and execute new process</td><td>M4</td></tr>
+  <tr><td>6</td><td>waitpid</td><td>Wait for child</td><td>M4</td></tr>
+  <tr><td>7</td><td>brk</td><td>Adjust program break</td><td>M4</td></tr>
+  <tr><td>8</td><td>mmap</td><td>Map anonymous memory</td><td>M4</td></tr>
+  <tr><td>9</td><td>open</td><td>Open file</td><td>M7</td></tr>
+  <tr><td>10</td><td>read</td><td>Read from fd</td><td>M4</td></tr>
+  <tr><td>11</td><td>close</td><td>Close fd</td><td>M4</td></tr>
+  <tr><td>12</td><td>munmap</td><td>Unmap memory</td><td>M4</td></tr>
+  <tr><td>13</td><td>sigaction</td><td>Set signal handler</td><td>M11+</td></tr>
+  <tr><td>14</td><td>sigprocmask</td><td>Modify signal mask</td><td>M11+</td></tr>
+  <tr><td>15</td><td>sigreturn</td><td>Return from signal handler</td><td>M11+</td></tr>
+  <tr><td>22</td><td>pipe</td><td>Create pipe</td><td>M9</td></tr>
+  <tr><td>33</td><td>dup2</td><td>Duplicate fd</td><td>M9</td></tr>
+  <tr><td>57</td><td>fork</td><td>Clone process (COW)</td><td>M10</td></tr>
+  <tr><td>59</td><td>execve</td><td>Execute new program</td><td>M10</td></tr>
+  <tr><td>62</td><td>kill</td><td>Send signal</td><td>M11+</td></tr>
+  <tr><td>63</td><td>uname</td><td>System info</td><td>M11+</td></tr>
+  <tr><td>96</td><td>gettimeofday</td><td>Current time</td><td>M11+</td></tr>
+  <tr><td>100</td><td>net_send</td><td>Send raw frame</td><td>M8</td></tr>
+  <tr><td>101</td><td>net_recv</td><td>Receive raw frame</td><td>M8</td></tr>
+  <tr><td>102</td><td>udp_send</td><td>Send UDP datagram</td><td>M8</td></tr>
+  <tr><td>103</td><td>udp_recv</td><td>Receive UDP datagram</td><td>M8</td></tr>
+  <tr><td>104</td><td>net_poll</td><td>Poll network events</td><td>M8</td></tr>
+  <tr><td>105</td><td>getenv</td><td>Get environment variable</td><td>M11+</td></tr>
+  <tr><td>106</td><td>setenv</td><td>Set environment variable</td><td>M11+</td></tr>
+  <tr><td>107</td><td>listdir</td><td>List directory</td><td>M11+</td></tr>
+  <tr><td>108</td><td>chdir</td><td>Change directory</td><td>M11+</td></tr>
+  <tr><td>109</td><td>getcwd</td><td>Get working directory</td><td>M11+</td></tr>
+  <tr><td>110</td><td>fstat</td><td>File status</td><td>M11+</td></tr>
+  <tr><td>111</td><td>unlink</td><td>Delete file</td><td>M11+</td></tr>
+  <tr><td>112</td><td>tcp_connect</td><td>TCP connect</td><td>M12</td></tr>
+  <tr><td>113</td><td>tcp_send</td><td>TCP send</td><td>M12</td></tr>
+  <tr><td>114</td><td>tcp_recv</td><td>TCP receive</td><td>M12</td></tr>
+  <tr><td>115</td><td>tcp_close</td><td>TCP close</td><td>M12</td></tr>
+  <tr><td>116</td><td>tcp_poll</td><td>TCP poll</td><td>M12</td></tr>
+  <tr><td>117</td><td>socket</td><td>Create TCP socket</td><td>Phase 5</td></tr>
+  <tr><td>118</td><td>bind</td><td>Bind socket to port</td><td>Phase 5</td></tr>
+  <tr><td>119</td><td>listen</td><td>Listen for connections</td><td>Phase 5</td></tr>
+  <tr><td>120</td><td>accept</td><td>Accept incoming connection</td><td>Phase 5</td></tr>
+  <tr><td>121</td><td>sendto</td><td>Send data to socket</td><td>Phase 5</td></tr>
+  <tr><td>122</td><td>recvfrom</td><td>Receive data from socket</td><td>Phase 5</td></tr>
+  <tr><td>228</td><td>clock_gettime</td><td>High-precision time</td><td>M11+</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2>Next Steps (Phase 6)</h2>
+<table>
+  <tr><th>Priority</th><th>Task</th><th>Dependencies</th><th>Status</th></tr>
+  <tr><td>P0</td><td>Multi-core scheduler (AP enters scheduler)</td><td>PerCpu fields added, commonStub change deferred</td><td><span class="badge partial">PARTIAL</span></td></tr>
+  <tr><td>P2</td><td>AP LAPIC timer (needs QEMU fix or KVM)</td><td>AP LAPIC MMIO</td><td><span class="badge todo">TODO</span></td></tr>
+  <tr><td>P2</td><td>Network server (echo/http)</td><td>TCP socket</td><td><span class="badge todo">TODO</span></td></tr>
+  <tr><td>P2</td><td>ext2 directory creation (mkdir)</td><td>createFile works</td><td><span class="badge todo">TODO</span></td></tr>
+  <tr><td>P2</td><td>ext2 file deletion (unlink)</td><td>Directory entry removal</td><td><span class="badge todo">TODO</span></td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2>Build &amp; Run</h2>
+<pre><code>zig build                    # Build kernel
+bash tools/qemu_run.sh       # Build ISO + run QEMU (512MB RAM, 2 CPUs)</code></pre>
+
+<h3>QEMU Flags</h3>
+<pre><code>qemu-system-x86_64 \
+  -cdrom moqios.iso \
+  -m 512M \
+  -smp 2 \
+  -serial file:serial.log \
+  -display none</code></pre>
+
+<!-- ================================================================ -->
+<h2>Changelog</h2>
+<ul class="changelog">
+  <li><span class="date">2026-05-25</span> <strong>Bug fix: allocBlock reversed memcpy</strong> — allocBlock had memcpy direction reversed, corrupting the in-memory superblock with garbage. Replaced inline superblock/group-descriptor writes with calls to writeSuperblock()/writeGroupDescs().</li>
+  <li><span class="date">2026-05-25</span> <strong>Bug fix: findDirEntryByPath page fault</strong> — findDirEntryByPath crashed at RIP=0x0 due to a Zig codegen issue with ?u32 optional return type. Replaced with walkPath (i64 return, proven stable).</li>
+  <li><span class="date">2026-05-25</span> <strong>ext2 createFile working</strong> — hello21 test now passes: creates /writetest.txt, writes 22 bytes, reads back, verifies content. All 24 tests pass.</li>
+  <li><span class="date">2026-05-24</span> TCP socket syscalls (117-122): socket/bind/listen/accept/sendto/recvfrom. Server-side TCP with listen backlog and incoming SYN handling.</li>
+  <li><span class="date">2026-05-24</span> ext2 write support: writeBlock, writeInode, allocBlock (bitmap allocator), ensureBlock (direct + single indirect), writeFile. Block/group descriptor/superblock metadata updates.</li>
+  <li><span class="date">2026-05-24</span> ext2 createFile: allocInode (bitmap), createFile (inode + dir entry), VFS O_CREAT integration. addDirEntry needs further debugging.</li>
+  <li><span class="date">2026-05-24</span> hello21 ext2 write test program created. Plan updated to v0.6 with Phase 5 + Phase 6 roadmap.</li>
+  <li><span class="date">2026-05-24</span> SMP kernel spinlocks: IrqSpinlock added to serial, PMM (allocPage/freePage/reservePage/addRef/decRef), task array (create/exit/reap/waitpid/block/unblock/find), scheduler (timerTick). Lock order: sched→task→pmm. 23/23 tests pass.</li>
+  <li><span class="date">2026-05-24</span> SMP multi-core support (M14): AP boot, per-CPU GDT/data, identity mapping, 23/23 tests with -smp 2</li>
+  <li><span class="date">2026-05-24</span> Fixed Zig 0.16 inline asm register clobber bug (caused AP bounds-check panic with index 76='L')</li>
+  <li><span class="date">2026-05-24</span> Fixed cpu_id calling convention: read from trampoline data area instead of .c ABI parameter</li>
+  <li><span class="date">2026-05-22</span> TCP protocol (M12): three-way handshake, data transfer, four-way close, retransmission</li>
+  <li><span class="date">2026-05-22</span> ext2 filesystem (M13): read-only, superblock/inode/directory/file reading</li>
+  <li><span class="date">2026-05-22</span> Signals, env vars, dir ops, fstat, unlink (M11+)</li>
+  <li><span class="date">2026-05-20</span> fork + execve (M10): COW address space cloning, ELF reload</li>
+  <li><span class="date">2026-05-18</span> Pipes + Shell (M9): ring buffer, sh.c with pipes/env/builtins</li>
+  <li><span class="date">2026-05-16</span> Network stack (M8): e1000 driver, ARP/IPv4/ICMP/UDP</li>
+  <li><span class="date">2026-05-15</span> Project started: M1-M7 (boot, PMM, scheduler, syscalls, ELF, PCI, FS)</li>
+</ul>
+
+</body>
+</html>

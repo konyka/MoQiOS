@@ -45,6 +45,7 @@ const TcpState = enum(u8) {
     time_wait,
     close_wait,
     last_ack,
+    listen,
 };
 
 // ─── TCP Control Block (TCB) ──────────────────────────────────────────────
@@ -311,6 +312,57 @@ fn tcpChecksum(src_ip: [4]u8, dst_ip: [4]u8, tcp_hdr: [*]const u8, tcp_len: u16)
 // ─── Incoming Packet Handling ─────────────────────────────────────────────
 
 /// Called from net/mod.zig when an IPv4 packet with protocol=6 is received.
+/// Handle an incoming SYN for a listening socket.
+/// Creates a new TCB in SYN_RECEIVED state, sends SYN-ACK,
+/// and queues it in the listen backlog.
+fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16) void {
+    _ = _w;
+    // Find listen slot for this port
+    var slot: ?*ListenSlot = null;
+    for (0..MAX_CONNECTIONS) |i| {
+        if (listen_slots[i].active and listen_slots[i].local_port == dst_port) {
+            slot = &listen_slots[i];
+            break;
+        }
+    }
+    const ls = slot orelse return;
+
+    // Check backlog capacity
+    if (ls.pending_count >= LISTEN_BACKLOG) return;
+
+    // Allocate a new TCB for this connection
+    const new_tcb = allocTcb() orelse return;
+    new_tcb.local_port = dst_port;
+    new_tcb.remote_port = src_port;
+    new_tcb.remote_ip = src_ip;
+    new_tcb.owner_task = ls.owner_task;
+    new_tcb.iss = generateIss();
+    new_tcb.snd_una = new_tcb.iss;
+    new_tcb.snd_nxt = new_tcb.iss;
+    new_tcb.snd_wnd = TCP_WINDOW;
+    new_tcb.irs = seq_num;
+    new_tcb.rcv_nxt = seq_num + 1;
+    new_tcb.rcv_wnd = TCP_WINDOW;
+    new_tcb.state = .syn_received;
+
+    // Send SYN-ACK
+    _ = sendSegment(new_tcb, SYN | ACK, undefined, 0);
+    serial.writeString("[tcp] SYN-ACK sent for incoming connection\n");
+
+    // Find the index of the new TCB
+    var new_idx: u32 = 0;
+    for (0..MAX_CONNECTIONS) |i| {
+        if (&tcbs[i] == new_tcb) {
+            new_idx = @intCast(i);
+            break;
+        }
+    }
+
+    // Queue in listen backlog (will be moved to established when ACK arrives)
+    ls.pending_tpbs[ls.pending_count] = new_idx;
+    ls.pending_count += 1;
+}
+
 pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) void {
     _ = dst_ip;
     if (len < 20) return;
@@ -333,7 +385,11 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
 
     // Find matching TCB
     const tcb = findTcbByTuple(dst_port, src_port, src_ip) orelse {
-        // No matching connection — send RST
+        // No matching connection — check if any socket is listening on this port
+        if (flags & SYN != 0) {
+            handleIncomingSyn(src_ip, src_port, dst_port, seq_num, window);
+        }
+        // Otherwise send RST (or just ignore)
         return;
     };
 
@@ -354,6 +410,16 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                 serial.writeString("[tcp] connection established\n");
             } else if (flags & SYN != 0) {
                 // Simultaneous open — not supported, send RST
+            }
+        },
+        .syn_received => {
+            // Third ACK of three-way handshake (from client)
+            if (flags & ACK != 0) {
+                tcb.snd_una = ack_num;
+                tcb.snd_wnd = window;
+                tcb.state = .established;
+                tcb.retransmit_timer = 0;
+                serial.writeString("[tcp] server: connection established (ACK received)\n");
             }
         },
         .established => {
@@ -684,4 +750,121 @@ pub fn timerTick(ms_elapsed: u32) void {
             }
         }
     }
+}
+
+// ─── Listening / Server Socket Support ──────────────────────────────────────
+
+const LISTEN_BACKLOG: u32 = 4;
+
+const ListenSlot = struct {
+    active: bool = false,
+    local_port: u16 = 0,
+    owner_task: u32 = 0,
+    pending_tpbs: [LISTEN_BACKLOG]u32, // TCB indices of pending connections (SYN_RECEIVED)
+    pending_count: u32 = 0,
+};
+
+var listen_slots: [MAX_CONNECTIONS]ListenSlot = @splat(.{
+    .active = false,
+    .local_port = 0,
+    .owner_task = 0,
+    .pending_tpbs = @splat(0),
+    .pending_count = 0,
+});
+
+/// Create a TCP socket (allocate a TCB in closed state).
+/// Returns TCB index (>= 0) on success, -1 on failure.
+pub fn tcpSocket(owner_task: u32) i64 {
+    const tcb = allocTcb() orelse return -1;
+    tcb.owner_task = owner_task;
+    tcb.state = .closed;
+
+    // Return index
+    for (0..MAX_CONNECTIONS) |i| {
+        if (&tcbs[i] == tcb) return @intCast(i);
+    }
+    return -1;
+}
+
+/// Bind a TCB to a local port.
+/// Returns 0 on success, -1 on failure.
+pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
+    if (tcb_idx >= MAX_CONNECTIONS) return -1;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active or tcb.state != .closed) return -1;
+
+    // Check if port is already in use
+    if (findTcbByLocalPort(port) != null) return -1;
+
+    tcb.local_port = port;
+    return 0;
+}
+
+/// Start listening for connections on a bound TCB.
+/// Returns 0 on success, -1 on failure.
+pub fn tcpListen(tcb_idx: u32) i64 {
+    if (tcb_idx >= MAX_CONNECTIONS) return -1;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active or tcb.local_port == 0) return -1;
+
+    tcb.state = .listen;
+
+    // Set up listen slot for incoming SYN tracking
+    for (0..MAX_CONNECTIONS) |i| {
+        if (!listen_slots[i].active) {
+            listen_slots[i].active = true;
+            listen_slots[i].local_port = tcb.local_port;
+            listen_slots[i].owner_task = tcb.owner_task;
+            listen_slots[i].pending_count = 0;
+            listen_slots[i].pending_tpbs = @splat(0);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/// Accept a pending connection on a listening socket.
+/// Returns new TCB index (>= 0) for the accepted connection, -1 if none pending.
+pub fn tcpAccept(tcb_idx: u32, owner_task: u32) i64 {
+    if (tcb_idx >= MAX_CONNECTIONS) return -1;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active or tcb.state != .listen) return -1;
+
+    // Find the listen slot for this TCB
+    var slot: ?*ListenSlot = null;
+    for (0..MAX_CONNECTIONS) |i| {
+        if (listen_slots[i].active and listen_slots[i].local_port == tcb.local_port) {
+            slot = &listen_slots[i];
+            break;
+        }
+    }
+    const ls = slot orelse return -1;
+
+    if (ls.pending_count == 0) return 0; // No pending connections
+
+    // Get the first pending TCB
+    const pending_idx = ls.pending_tpbs[0];
+
+    // Shift the queue
+    var j: u32 = 0;
+    while (j < ls.pending_count - 1) : (j += 1) {
+        ls.pending_tpbs[j] = ls.pending_tpbs[j + 1];
+    }
+    ls.pending_count -= 1;
+
+    if (pending_idx >= MAX_CONNECTIONS) return -1;
+    const new_tcb = &tcbs[pending_idx];
+    if (!new_tcb.active or new_tcb.state != .established) return -1;
+
+    // Transfer ownership to the accepting task
+    new_tcb.owner_task = owner_task;
+
+    return @intCast(pending_idx);
+}
+
+/// Get the TCB index for a socket fd.
+pub fn getTcbIdx(tcb_idx: u32) ?u32 {
+    if (tcb_idx >= MAX_CONNECTIONS) return null;
+    if (!tcbs[tcb_idx].active) return null;
+    return tcb_idx;
 }

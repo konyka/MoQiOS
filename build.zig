@@ -27,6 +27,34 @@ pub fn build(b: *std.Build) void {
 
     kernel.setLinkerScript(b.path("kernel/linker.ld"));
 
+    // AP trampoline: precompiled flat binary, embedded via @embedFile in smp.zig
+    // Build step to assemble the trampoline source into a raw binary
+    const trampoline_obj = b.addSystemCommand(&.{
+        "as", "--32", "-o",
+    });
+    trampoline_obj.addArg("/tmp/ap_trampoline.o");
+    trampoline_obj.addFileArg(b.path("kernel/arch/x86_64/ap_trampoline_src.S"));
+    trampoline_obj.setName("assemble ap_trampoline.S");
+
+    const trampoline_elf = b.addSystemCommand(&.{
+        "ld", "-melf_i386", "-Ttext", "0x8000", "-o",
+    });
+    trampoline_elf.addArg("/tmp/ap_trampoline.elf");
+    trampoline_elf.addArg("/tmp/ap_trampoline.o");
+    trampoline_elf.step.dependOn(&trampoline_obj.step);
+    trampoline_elf.setName("link ap_trampoline.elf");
+
+    const trampoline_bin = b.addSystemCommand(&.{
+        "objcopy", "-O", "binary",
+    });
+    trampoline_bin.addArg("/tmp/ap_trampoline.elf");
+    trampoline_bin.addArg("kernel/arch/x86_64/ap_trampoline.bin");
+    trampoline_bin.step.dependOn(&trampoline_elf.step);
+    trampoline_bin.setName("objcopy ap_trampoline -> raw binary");
+
+    // Make kernel depend on trampoline binary being up-to-date
+    kernel.step.dependOn(&trampoline_bin.step);
+
     b.installArtifact(kernel);
 
     // --- User programs (compiled as freestanding flat binaries via as/ld/objcopy) ---
@@ -631,6 +659,34 @@ pub fn build(b: *std.Build) void {
     hello20_strip.setName("strip hello20.elf");
 
     b.getInstallStep().dependOn(&hello20_strip.step);
+
+    const hello21_elf = b.addSystemCommand(&.{
+        "zig", "cc",
+        "-target", "x86_64-freestanding-none",
+        "-static",
+        "-nostdlib",
+        "-ffreestanding",
+        "-O2",
+        "-mno-sse",
+        "-mno-sse2",
+        "-Wl,--gc-sections",
+        "-Wl,-z,norelro",
+        "-o",
+    });
+    hello21_elf.addArg("user/hello21.elf");
+    hello21_elf.addFileArg(b.path("user/hello21.c"));
+    hello21_elf.setName("compile hello21.c -> ELF");
+
+    const hello21_strip = b.addSystemCommand(&.{
+        "strip",
+        "-o",
+    });
+    hello21_strip.addArg("user/hello21.bin");
+    hello21_strip.addArg("user/hello21.elf");
+    hello21_strip.step.dependOn(&hello21_elf.step);
+    hello21_strip.setName("strip hello21.elf");
+
+    b.getInstallStep().dependOn(&hello21_strip.step);
 
     // Build and run in QEMU with Limine
     const run_step = b.step("run", "Build and run in QEMU");

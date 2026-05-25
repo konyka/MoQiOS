@@ -20,6 +20,7 @@ const idt = @import("../arch/x86_64/idt.zig");
 const gdt = @import("../arch/x86_64/gdt.zig");
 const paging = @import("../arch/x86_64/paging.zig");
 const syscall_entry = @import("../arch/x86_64/syscall_entry.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 const TIMESLICE_TICKS: u64 = 10;
 
@@ -29,6 +30,7 @@ var current_idx: ?u32 = null;
 var slice_remaining: u64 = TIMESLICE_TICKS;
 var reap_counter: u64 = 0;
 const REAP_INTERVAL: u64 = TIMESLICE_TICKS;
+var sched_lock: IrqSpinlock = .{};
 
 pub fn currentTaskIndex() ?u32 {
     return current_idx;
@@ -43,27 +45,40 @@ pub fn currentTask() ?*task.Task {
 pub fn timerTick(frame: *idt.InterruptFrame) void {
     _ = frame;
 
+    const flags = sched_lock.acquire();
+
     reap_counter +|= 1;
     if (reap_counter >= REAP_INTERVAL) {
         reap_counter = 0;
+        // reapZombies acquires task_lock internally — different lock, safe.
+        // freeKernelStack → pmm.freePage also acquires pmm.lock — also safe.
+        // Lock order: sched_lock → task_lock → pmm.lock (always this order).
+        sched_lock.release(flags);
         _ = task.reapZombies();
+        return;
     }
 
     // Check for pending signals on current task
     if (current_idx) |ci| {
         if (task.getTask(ci)) |ct| {
             if (ct.is_user and ct.pending_signals != 0 and ct.pending_signals & ~ct.signal_mask != 0) {
+                sched_lock.release(flags);
                 deliverSignalToRunningTask(ct);
+                return;
             }
         }
     }
 
     const count = task.getTaskCount();
-    if (count == 0) return;
+    if (count == 0) {
+        sched_lock.release(flags);
+        return;
+    }
 
     if (current_idx) |ci| {
         if (task.getTask(ci)) |ct| {
             if (count == 1 and ct.state != .zombie and ct.state != .blocked) {
+                sched_lock.release(flags);
                 return;
             }
         } else {
@@ -72,16 +87,23 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
     }
 
     slice_remaining -|= 1;
-    if (slice_remaining > 0) return;
+    if (slice_remaining > 0) {
+        sched_lock.release(flags);
+        return;
+    }
     slice_remaining = TIMESLICE_TICKS;
 
     const next_idx = pickNext() orelse {
+        sched_lock.release(flags);
         return;
     };
 
     // First ever schedule
     if (current_idx == null) {
-        const t = task.getTask(next_idx) orelse return;
+        const t = task.getTask(next_idx) orelse {
+            sched_lock.release(flags);
+            return;
+        };
         if (!t.started) {
             setupInitialFrame(t);
         }
@@ -91,21 +113,33 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
 
         // Set up CPU state for the first scheduled task
         if (t.page_table_phys != 0) {
+            sched_lock.release(flags);
             asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
                 :
                 : [cr3] "r" (t.page_table_phys),
                 : .{ .rax = true, .memory = true });
-            gdt.setRsp0(t.kernel_stack_top);
+            gdt.setRsp0Bsp(t.kernel_stack_top);
             syscall_entry.getPerCpu().kernel_rsp = t.kernel_stack_top;
+            return;
         }
+        sched_lock.release(flags);
         return;
     }
 
     const cur_idx = current_idx.?;
-    if (next_idx == cur_idx) return;
+    if (next_idx == cur_idx) {
+        sched_lock.release(flags);
+        return;
+    }
 
-    const old_task = task.getTask(cur_idx) orelse return;
-    const new_task = task.getTask(next_idx) orelse return;
+    const old_task = task.getTask(cur_idx) orelse {
+        sched_lock.release(flags);
+        return;
+    };
+    const new_task = task.getTask(next_idx) orelse {
+        sched_lock.release(flags);
+        return;
+    };
 
     old_task.saved_rsp = saved_stack_anchor;
 
@@ -123,27 +157,33 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
 
     if (new_task.page_table_phys != 0) {
         if (old_task.page_table_phys != new_task.page_table_phys) {
-                asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
-                    :
-                    : [cr3] "r" (new_task.page_table_phys),
-                    : .{ .rax = true, .memory = true });
-            }
-        gdt.setRsp0(new_task.kernel_stack_top);
+            const pt = new_task.page_table_phys;
+            sched_lock.release(flags);
+            asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
+                :
+                : [cr3] "r" (pt),
+                : .{ .rax = true, .memory = true });
+            gdt.setRsp0Bsp(new_task.kernel_stack_top);
+            syscall_entry.getPerCpu().kernel_rsp = new_task.kernel_stack_top;
+            // Ensure KERNEL_GS_BASE points to PerCpu struct before entering user mode.
+            syscall_entry.wrmsr(0xC0000102, @intFromPtr(syscall_entry.getPerCpu()));
+            return;
+        }
+        sched_lock.release(flags);
+        gdt.setRsp0Bsp(new_task.kernel_stack_top);
         syscall_entry.getPerCpu().kernel_rsp = new_task.kernel_stack_top;
-
-        // Ensure KERNEL_GS_BASE points to PerCpu struct before entering user mode.
-        // When a new user task is first scheduled via iretq (not SYSRETQ), the
-        // swapgs state may be incorrect, causing GS_BASE=0 in kernel after swapgs.
-        // Fix: explicitly set KERNEL_GS_BASE = &bsp_percpu via WRMSR.
         syscall_entry.wrmsr(0xC0000102, @intFromPtr(syscall_entry.getPerCpu()));
     } else {
         if (old_task.page_table_phys != 0) {
             const kernel_pml4 = paging.getKernelPml4();
+            sched_lock.release(flags);
             asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
                 :
                 : [cr3] "r" (kernel_pml4),
                 : .{ .rax = true, .memory = true });
+            return;
         }
+        sched_lock.release(flags);
     }
 }
 
@@ -257,5 +297,14 @@ pub fn deliverSignalToRunningTask(t: *task.Task) void {
     // Modify the InterruptFrame to jump to the signal handler
     iframe.rip = handler_addr;
     iframe.rsp = result.new_rsp;
-    iframe.rdi = signum;
+     iframe.rdi = signum;
+}
+
+/// AP idle loop — APs enter this after initialization.
+/// They spin with interrupts enabled, ready to run tasks.
+pub fn apIdleLoop() noreturn {
+    while (true) {
+        asm volatile ("sti");
+        asm volatile ("hlt");
+    }
 }

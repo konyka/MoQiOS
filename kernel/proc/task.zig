@@ -14,6 +14,7 @@
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const serial = @import("../arch/x86_64/serial.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 const PAGE_SIZE: u64 = 4096;
 const KERNEL_STACK_PAGES: u64 = 16;
@@ -101,6 +102,7 @@ pub const MAX_TASKS: u32 = 64;
 var tasks: [MAX_TASKS]?Task = [_]?Task{null} ** MAX_TASKS;
 var next_tid: u32 = 1;
 var task_count: u32 = 0;
+var task_lock: IrqSpinlock = .{};
 
 /// Find a free task slot.
 fn allocSlot() ?u32 {
@@ -211,12 +213,15 @@ const paging = @import("../arch/x86_64/paging.zig");
 /// Create a kernel thread. Returns the task index or null on failure.
 /// The new task starts in .ready state with the given priority (0 = highest).
 pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+
     const slot = allocSlot() orelse {
         serial.writeString("[task] no free task slots\n");
         return null;
     };
 
-    // Allocate kernel stack pages
+    // Allocate kernel stack pages (PMM has its own lock)
     const stack_virt = allocKernelStack() orelse {
         serial.writeString("[task] OOM allocating kernel stack\n");
         return null;
@@ -277,13 +282,21 @@ pub fn exitTask(exit_code: i32) void {
     const sched = @import("sched.zig");
     const idx = sched.currentTaskIndex() orelse return;
     const t = getTask(idx) orelse return;
+
+    const flags = task_lock.acquire();
     t.exit_code = exit_code;
     t.state = .zombie;
     asm volatile ("" ::: .{ .memory = true });
 
     if (t.parent_tid != 0) {
-        if (findTaskByTid(t.parent_tid)) |parent_idx| {
-            const parent = getTask(parent_idx) orelse return;
+        if (findTaskByTidLocked(t.parent_tid)) |parent_idx| {
+            const parent = getTask(parent_idx) orelse {
+                task_lock.release(flags);
+                asm volatile ("sti" ::: .{ .memory = true });
+                while (true) {
+                    asm volatile ("hlt");
+                }
+            };
             if (parent.waiting_for_child) {
                 parent.waiting_for_child = false;
                 asm volatile ("" ::: .{ .memory = true });
@@ -291,6 +304,7 @@ pub fn exitTask(exit_code: i32) void {
             }
         }
     }
+    task_lock.release(flags);
 
     asm volatile ("sti" ::: .{ .memory = true });
     while (true) {
@@ -301,6 +315,9 @@ pub fn exitTask(exit_code: i32) void {
 /// Reap orphaned zombie tasks — those whose parent has already exited.
 /// Zombies with a living parent are left for waitpid() to collect.
 pub fn reapZombies() u32 {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+
     var reaped: u32 = 0;
     for (0..MAX_TASKS) |i| {
         if (tasks[i]) |*t| {
@@ -308,7 +325,7 @@ pub fn reapZombies() u32 {
 
             // Check if parent is still alive
             if (t.parent_tid != 0) {
-                if (findTaskByTid(t.parent_tid) != null) {
+                if (findTaskByTidLocked(t.parent_tid) != null) {
                     // Parent still alive — leave for waitpid
                     continue;
                 }
@@ -328,7 +345,8 @@ pub fn reapZombies() u32 {
 }
 
 /// Find a task by its TID. Returns the task slot index or null.
-pub fn findTaskByTid(tid: u32) ?u32 {
+/// Internal version — caller must hold task_lock.
+fn findTaskByTidLocked(tid: u32) ?u32 {
     for (0..MAX_TASKS) |i| {
         if (tasks[i]) |t| {
             if (t.tid == tid and t.state != .zombie) return @intCast(i);
@@ -337,8 +355,18 @@ pub fn findTaskByTid(tid: u32) ?u32 {
     return null;
 }
 
+/// Find a task by its TID. Returns the task slot index or null.
+/// Public version — acquires task_lock.
+pub fn findTaskByTid(tid: u32) ?u32 {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    return findTaskByTidLocked(tid);
+}
+
 /// Block a task — sets state to blocked. The scheduler will skip it.
 pub fn blockTask(idx: u32) void {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
     const t = getTask(idx) orelse return;
     if (t.state == .running) {
         t.state = .blocked;
@@ -347,6 +375,8 @@ pub fn blockTask(idx: u32) void {
 
 /// Unblock a task — sets state back to ready.
 pub fn unblockTask(idx: u32) void {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
     const t = getTask(idx) orelse return;
     if (t.state == .blocked) {
         t.state = .ready;
@@ -368,12 +398,15 @@ pub fn createUserProcess(
     page_table_phys: u64,
     parent_tid_val: u32,
 ) ?u32 {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+
     const slot = allocSlot() orelse {
         serial.writeString("[task] no free task slots\n");
         return null;
     };
 
-    // Allocate kernel stack
+    // Allocate kernel stack (PMM has its own lock)
     const stack_virt = allocKernelStack() orelse {
         serial.writeString("[task] OOM allocating kernel stack\n");
         return null;
@@ -427,6 +460,9 @@ pub fn createUserProcess(
 /// child has exited yet (WNOHANG behavior). Writes the exit code to *status.
 /// pid == -1 means wait for any child; pid > 0 means wait for specific child.
 pub fn waitpid(parent_idx: u32, pid: i32, status: *i32) ?u32 {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+
     const parent = getTask(parent_idx) orelse return null;
     const parent_tid_val = parent.tid;
 
@@ -454,6 +490,8 @@ pub fn waitpid(parent_idx: u32, pid: i32, status: *i32) ?u32 {
 
 /// Check if the given task has any children (for waitpid validation).
 pub fn hasChildren(parent_idx: u32) bool {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
     const parent = getTask(parent_idx) orelse return false;
     const parent_tid_val = parent.tid;
     for (0..MAX_TASKS) |i| {

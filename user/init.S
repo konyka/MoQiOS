@@ -468,6 +468,29 @@ _start:
     movq $13, %rdx
     syscall
 
+    # Spawn hello21 (ext2 write test — last, slow disk I/O)
+    movq $5, %rax
+    leaq hello21_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn21_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done21_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
     # Spawn shell (interactive, runs forever)
     movq $5, %rax
     leaq sh_name(%rip), %rdi
@@ -597,6 +620,13 @@ spawn20_msg:
     .ascii "spawned hello20\n"
 done20_msg:
     .ascii "hello20 done\n"
+hello21_name:
+    .ascii "hello21"
+    .byte 0
+spawn21_msg:
+    .ascii "spawned hello21\n"
+done21_msg:
+    .ascii "hello21 done\n"
 hello9_name:
     .ascii "hello9"
     .byte 0
