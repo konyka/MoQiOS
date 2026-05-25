@@ -305,6 +305,43 @@ fn walkPath(start_inode: u32, path: []const u8) i64 {
     return -1;
 }
 
+/// Resolve a path to its parent directory inode and the final filename component.
+/// Returns (parent_inode_num, filename) or null on failure.
+fn resolveParent(path: []const u8) ?struct { parent: u32, name: []const u8 } {
+    // Find the last '/' to split parent path from filename
+    var last_slash: usize = 0;
+    for (0..path.len) |i| {
+        if (path[i] == '/') last_slash = i + 1;
+    }
+
+    const filename = path[last_slash..];
+    if (filename.len == 0) return null; // trailing '/' or empty
+
+    // Walk to parent directory
+    var parent_inode: u32 = 2; // start from root
+    if (last_slash > 0) {
+        const parent_path = path[0 .. last_slash - 1]; // strip trailing '/'
+        var pos: usize = 0;
+
+        while (pos < parent_path.len) {
+            while (pos < parent_path.len and parent_path[pos] == '/') pos += 1;
+            if (pos >= parent_path.len) break;
+
+            const start = pos;
+            while (pos < parent_path.len and parent_path[pos] != '/') pos += 1;
+            const component = parent_path[start..pos];
+
+            var inode: Ext2Inode = undefined;
+            if (!readInode(parent_inode, &inode)) return null;
+            if (inode.mode & 0xF000 != 0x4000) return null;
+
+            parent_inode = findDirEntry(&inode, component) orelse return null;
+        }
+    }
+
+    return .{ .parent = parent_inode, .name = filename };
+}
+
 fn findDirEntry(inode: *const Ext2Inode, name: []const u8) ?u32 {
     const dir_size = inode.size;
     var offset: u32 = 0;
@@ -777,6 +814,11 @@ pub fn createFile(name: []const u8) i64 {
         return existing_idx;
     }
 
+    // Resolve parent directory and filename
+    const resolved = resolveParent(name) orelse return -1;
+    const parent_inode_num = resolved.parent;
+    const filename = resolved.name;
+
     // Allocate a new inode (from group 0)
     const new_inode_num = allocInode(0);
     if (new_inode_num == 0) return -1;
@@ -792,21 +834,8 @@ pub fn createFile(name: []const u8) i64 {
 
     if (!writeInode(new_inode_num, &new_inode)) return -1;
 
-    // Extract the filename component (last part of the path)
-    var name_start: usize = 0;
-    if (name.len > 0) {
-        var j: usize = name.len;
-        while (j > 0) : (j -= 1) {
-            if (name[j - 1] == '/') {
-                name_start = j;
-                break;
-            }
-        }
-    }
-    const filename = name[name_start..];
-
-    // Add directory entry to root directory (inode 2)
-    if (!addDirEntry(2, new_inode_num, filename, 1)) { // file_type=1 (regular file)
+    // Add directory entry to parent directory
+    if (!addDirEntry(parent_inode_num, new_inode_num, filename, 1)) { // file_type=1 (regular file)
         return -1;
     }
 
@@ -906,8 +935,9 @@ fn addDirEntry(dir_inode_num: u32, target_inode: u32, entry_name: []const u8, fi
 
 // ─── Directory creation ────────────────────────────────────────────────────
 
-/// Create a new directory in the root directory of the ext2 filesystem.
-/// Returns file index (>= 0) on success, -1 on failure.
+/// Create a new directory in the ext2 filesystem.
+/// Supports multi-level paths (e.g., "testdir/subdir").
+/// Returns file index (>= 0) on success, 0 if already exists, -1 on failure.
 pub fn createDir(name: []const u8) i64 {
     if (!active) return -1;
 
@@ -917,6 +947,11 @@ pub fn createDir(name: []const u8) i64 {
         // Already exists — return 0 (idempotent mkdir)
         return 0;
     }
+
+    // Resolve parent directory and directory name
+    const resolved = resolveParent(name) orelse return -1;
+    const parent_inode_num = resolved.parent;
+    const dirname = resolved.name;
 
     // Allocate a new inode (from group 0)
     const new_inode_num = allocInode(0);
@@ -953,9 +988,9 @@ pub fn createDir(name: []const u8) i64 {
     dot.file_type = 2;
     buf[@sizeOf(Ext2DirEntry)] = '.';
 
-    // ".." entry: inode=parent(2=root), rec_len=rest of block, name_len=2, type=2
+    // ".." entry: inode=parent, rec_len=rest of block, name_len=2, type=2
     const dotdot: *Ext2DirEntry = @ptrCast(@alignCast(buf + 12));
-    dotdot.inode = 2; // root directory
+    dotdot.inode = parent_inode_num;
     dotdot.rec_len = @intCast(block_size - 12);
     dotdot.name_len = 2;
     dotdot.file_type = 2;
@@ -967,27 +1002,14 @@ pub fn createDir(name: []const u8) i64 {
     // Write the new inode
     if (!writeInode(new_inode_num, &new_inode)) return -1;
 
-    // Extract directory name
-    var name_start: usize = 0;
-    if (name.len > 0) {
-        var j: usize = name.len;
-        while (j > 0) : (j -= 1) {
-            if (name[j - 1] == '/') {
-                name_start = j;
-                break;
-            }
-        }
-    }
-    const dirname = name[name_start..];
-
-    // Add entry to parent directory (inode 2 = root)
-    if (!addDirEntry(2, new_inode_num, dirname, 2)) return -1; // file_type=2 (dir)
+    // Add entry to parent directory
+    if (!addDirEntry(parent_inode_num, new_inode_num, dirname, 2)) return -1; // file_type=2 (dir)
 
     // Increment parent links count (for ".." pointing to parent)
     var parent_inode: Ext2Inode = undefined;
-    if (readInode(2, &parent_inode)) {
+    if (readInode(parent_inode_num, &parent_inode)) {
         parent_inode.links_count += 1;
-        _ = writeInode(2, &parent_inode);
+        _ = writeInode(parent_inode_num, &parent_inode);
     }
 
     // Open the new directory (as a file-like handle)
@@ -1131,27 +1153,19 @@ fn removeDirEntry(parent_inode_num: u32, name: []const u8) bool {
 // ─── File unlink ────────────────────────────────────────────────────────────
 
 /// Unlink (delete) a file from the ext2 filesystem.
-/// Currently only supports files in the root directory (parent inode 2).
+/// Supports multi-level paths (e.g., "testdir/file.txt").
 pub fn unlinkFile(path: []const u8) bool {
     if (!active) return false;
 
-    // Extract filename (after last '/')
-    var name_start: usize = 0;
-    if (path.len > 0) {
-        var j: usize = path.len;
-        while (j > 0) : (j -= 1) {
-            if (path[j - 1] == '/') {
-                name_start = j;
-                break;
-            }
-        }
-    }
-    const filename = path[name_start..];
+    // Resolve parent directory and filename
+    const resolved = resolveParent(path) orelse return false;
+    const parent_inode_num = resolved.parent;
+    const filename = resolved.name;
 
-    // Find the file's inode number via findDirEntry on root
-    var root_inode: Ext2Inode = undefined;
-    if (!readInode(2, &root_inode)) return false;
-    const file_inode_num = findDirEntry(&root_inode, filename) orelse return false;
+    // Find the file's inode number via findDirEntry on parent
+    var parent_inode: Ext2Inode = undefined;
+    if (!readInode(parent_inode_num, &parent_inode)) return false;
+    const file_inode_num = findDirEntry(&parent_inode, filename) orelse return false;
 
     // Read file inode
     var file_inode: Ext2Inode = undefined;
@@ -1187,8 +1201,8 @@ pub fn unlinkFile(path: []const u8) bool {
     // Free the inode
     freeInode(file_inode_num);
 
-    // Remove directory entry from parent (root, inode 2)
-    if (!removeDirEntry(2, filename)) return false;
+    // Remove directory entry from parent
+    if (!removeDirEntry(parent_inode_num, filename)) return false;
 
     serial.writeString("[ext2] unlinked: ");
     serial.writeString(filename);

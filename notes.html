@@ -73,7 +73,7 @@
 </table>
 
 <div class="progress-bar"><div class="fill" style="width:95%; background: linear-gradient(90deg, var(--green) 0%, var(--green) 90%, var(--yellow) 90%, var(--yellow) 100%);"></div></div>
-<p style="color:var(--dim); font-size:0.85rem; margin-top:0.3rem;">14 milestones: 13 complete, 1 partial (SMP multi-core scheduler). Phase 6 in progress: ext2 unlink, ext2 mkdir, TCP socket API validated, 48 syscalls. 27/27 tests pass (KVM SMP=1).</p>
+<p style="color:var(--dim); font-size:0.85rem; margin-top:0.3rem;">14 milestones: 13 complete, 1 partial (SMP multi-core scheduler). Phase 6 in progress: ext2 multi-level paths, ext2 unlink, 48 syscalls. 27/27 tests pass (KVM SMP=1).</p>
 
 <!-- ================================================================ -->
 <h2>M14: SMP Status (Current Work)</h2>
@@ -171,8 +171,9 @@
   <tr><td>P1</td><td>ext2 mkdir (createDir + mkdir syscall)</td><td>hello23 test</td><td><span class="badge done">DONE</span></td></tr>
   <tr><td>P2</td><td>AP LAPIC timer (needs QEMU fix or KVM)</td><td>AP LAPIC MMIO</td><td><span class="badge todo">TODO</span></td></tr>
   <tr><td>P2</td><td>Network server (echo/http)</td><td>TCP socket</td><td><span class="badge todo">TODO</span></td></tr>
-  <tr><td>P2</td><td>ext2 directory creation (mkdir)</td><td>createFile works</td><td><span class="badge todo">TODO</span></td></tr>
+  <tr><td>P2</td><td>ext2 directory creation (mkdir)</td><td>hello23 test</td><td><span class="badge done">DONE</span></td></tr>
   <tr><td>P2</td><td>ext2 file deletion (unlink)</td><td>hello24 test</td><td><span class="badge done">DONE</span></td></tr>
+  <tr><td>P2</td><td>ext2 multi-level path support</td><td>resolveParent, hello25 test</td><td><span class="badge done">DONE</span></td></tr>
 </table>
 
 <!-- ================================================================ -->
@@ -191,7 +192,8 @@ bash tools/qemu_run.sh       # Build ISO + run QEMU (512MB RAM, 2 CPUs)</code></
 <!-- ================================================================ -->
 <h2>Changelog</h2>
 <ul class="changelog">
-  <li><span class="date">2026-05-25</span> <strong>ext2 unlink + syscall #111 ext2 support</strong> — freeBlock (bitmap deallocation), freeInode (inode bitmap deallocation), removeDirEntry (directory entry removal with rec_len merge), unlinkFile (full file deletion: free data blocks, free inode, remove dir entry). syscallUnlink now tries ext2 first, falls back to FAT32. hello24 test: create file, write data, verify content, unlink, verify gone. 27/27 tests pass.</li>
+  <li><span class="date">2026-05-25</span> <strong>ext2 multi-level path support</strong> — Added resolveParent() helper that walks path to find parent directory inode. Updated createFile, createDir, unlinkFile to use resolveParent instead of hardcoding inode 2. Files/dirs can now be created/deleted in subdirectories. hello25 test: create/write/read/unlink file in testdir/.</li>
+<li><span class="date">2026-05-25</span> <strong>ext2 unlink + syscall #111 ext2 support</strong> — freeBlock (bitmap deallocation), freeInode (inode bitmap deallocation), removeDirEntry (directory entry removal with rec_len merge), unlinkFile (full file deletion: free data blocks, free inode, remove dir entry). syscallUnlink now tries ext2 first, falls back to FAT32. hello24 test: create file, write data, verify content, unlink, verify gone. 27/27 tests pass.</li>
 <li><span class="date">2026-05-25</span> <strong>ext2 mkdir + syscall #123</strong> — createDir: allocInode, allocBlock for dir entries (./..), addDirEntry to parent. Idempotent mkdir. hello23 test: mkdir, mkdir-again, mkdir2 all pass. 26/26 tests.</li>
   <li><span class="date">2026-05-25</span> <strong>hello22 TCP socket API test</strong> — validates socket(117)/bind(118)/listen(119)/accept(120) server-side API. All return correct values. 25/25 tests pass.</li>
   <li><span class="date">2026-05-25</span> <strong>Bug fix: allocBlock reversed memcpy</strong> — allocBlock had memcpy direction reversed, corrupting the in-memory superblock with garbage. Replaced inline superblock/group-descriptor writes with calls to writeSuperblock()/writeGroupDescs().</li>
