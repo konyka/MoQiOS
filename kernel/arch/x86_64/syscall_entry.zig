@@ -1838,6 +1838,12 @@ fn syscallListdir(frame: *SyscallFrame) void {
         }
     }
 
+    const ext2 = @import("../../fs/ext2.zig");
+    if (ext2.isActive()) {
+        const ext2_bytes = ext2.listDirRoot(kbuf[pos .. max]);
+        pos += ext2_bytes;
+    }
+
     if (pos > 0) {
         _ = copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..pos], pos);
     }

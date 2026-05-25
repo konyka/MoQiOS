@@ -411,7 +411,7 @@
 - ~~ext2 unlink~~ → hello24 测试通过: freeBlock + freeInode + removeDirEntry + unlinkFile, syscall #111 ext2 支持 (27/27)
 - ~~ext2 多级路径支持~~ → resolveParent 辅助函数, createFile/createDir/unlinkFile 支持子目录操作, hello25 测试
 - ~~文件系统缓存~~ → 64 条目写穿缓冲区, readBlockCached/writeBlockCached, 时钟替换策略
-- 网络服务器 (echo server / HTTP server) → 待实现
+- ~~ext2 listdir~~ → listDirRoot + listDirInode 实现, syscallListdir 集成 ext2 根目录枚举 (未自动化测试, virtio-blk 时序问题)
 - 多核调度 (需要 AP 定时器) → 阻塞
 - 真机硬件支持 → 未开始
 
@@ -421,6 +421,7 @@
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| v1.5 | 2026-05-25 | Phase 6: ext2 listdir 集成 (listDirRoot/listDirInode, syscallListdir), hello28 user binary |
 | v1.4 | 2026-05-25 | Phase 6: connect() syscall 测试 (hello27), 29/29 tests, 49 syscalls |
 | v1.3 | 2026-05-25 | Phase 6: connect() syscall #124 (TCP socket 连接), tcpConnectSocket() 复用现有 TCB, 49 syscalls |
 | v1.2 | 2026-05-25 | Phase 6: TCP echo server 测试 (hello26), socket/bind/listen/accept/sendto/recvfrom 完整服务端 API, 28/28 tests |

@@ -625,6 +625,56 @@ pub fn getFileName(file_idx: u32) ?[]const u8 {
     return null; // ext2 doesn't store name in inode
 }
 
+/// List directory entries of root (inode 2) into a buffer.
+/// Writes filenames separated by '\n'. Returns bytes written.
+pub fn listDirRoot(buf: []u8) usize {
+    if (!active) return 0;
+    return listDirInode(2, buf);
+}
+
+fn listDirInode(inode_num: u32, buf: []u8) usize {
+    var inode: Ext2Inode = undefined;
+    if (!readInode(inode_num, &inode)) return 0;
+    if (inode.mode & 0xF000 != 0x4000) return 0;
+
+    const dir_size = inode.size;
+    if (dir_size == 0 or dir_size > 65536) return 0;
+
+    const blk: [*]u8 = @ptrFromInt(sector_buf_virt);
+
+    var offset: u32 = 0;
+    var pos: usize = 0;
+
+    while (offset < dir_size) {
+        const block_num = offset / block_size;
+        const phys_block = resolveBlock(&inode, block_num);
+        if (phys_block == 0) break;
+        if (!readBlock(phys_block, blk)) break;
+
+        var bpos: u32 = 0;
+        while (bpos < block_size) {
+            const entry: *const Ext2DirEntry = @ptrCast(@alignCast(blk + bpos));
+            if (entry.rec_len == 0) break;
+
+            if (entry.inode != 0 and entry.name_len > 0) {
+                const name = blk + bpos + @sizeOf(Ext2DirEntry);
+                const name_len: usize = entry.name_len;
+                if (pos + name_len + 1 <= buf.len) {
+                    @memcpy(buf[pos .. pos + name_len], name[0..name_len]);
+                    pos += name_len;
+                    buf[pos] = '\n';
+                    pos += 1;
+                }
+            }
+
+            bpos += entry.rec_len;
+            if (bpos >= block_size) break;
+        }
+        offset += block_size;
+    }
+    return pos;
+}
+
 // ─── Write support ──────────────────────────────────────────────────────────
 
 fn writeBlockUncached(block_num: u32, buf: [*]const u8) bool {
