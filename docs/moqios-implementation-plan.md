@@ -9,10 +9,10 @@
 
 ## 当前状态
 
-- **内核**: 15,033 行 Zig, 54 个源文件
-- **系统调用**: 47 个
-- **自动化测试**: 26 个 (hello2-hello23, init.S) + 交互式 Shell
-- **测试稳定性**: 26/26 通过 (-smp 2)
+- **内核**: 15,400 行 Zig, 54 个源文件
+- **系统调用**: 48 个
+- **自动化测试**: 28 个 (hello2-hello26, init.S) + 交互式 Shell
+- **测试稳定性**: 28/28 通过 (KVM -smp 1)
 - **最大进程数**: 64
 - **文件系统**: FAT32 (virtio-blk) + ramdisk + ext2 (读写)
 - **网络**: e1000 (ARP/IPv4/ICMP/UDP/TCP + Socket API)
@@ -311,6 +311,18 @@
 | hello10 x2 | execve + 管道 |
 | shell | 交互式 Shell |
 
+### ext2/网络测试 (init.S, KVM -smp 1 通过)
+
+| 程序 | 测试内容 |
+|---|---|
+| hello20 | ext2 文件读取 |
+| hello21 | ext2 文件创建+写入+读取验证 |
+| hello22 | TCP socket API (socket/bind/listen/accept) |
+| hello23 | ext2 mkdir (createDir + mkdir syscall #123) |
+| hello24 | ext2 unlink (create→write→verify→unlink→verify gone) |
+| hello25 | ext2 多级路径 (testdir/subfile.txt) |
+| hello26 | TCP echo server (socket/bind/listen/accept/sendto/recvfrom) |
+
 ### 手动测试 (从 shell 运行, 功能验证通过)
 
 | 程序 | 测试内容 | 不在 init.S 中的原因 |
@@ -340,7 +352,7 @@
 | SMP 多核支持 | 基本实现 | ✅ AP 启动/Per-CPU 数据/空闲循环/内核自旋锁 (M14 + Phase 5) |
 | ext2 文件系统 | 读写实现 | ✅ Superblock/Inode/目录/文件读写 (M13 + Phase 5) |
 | 内核锁 (SMP 安全) | 已实现 | ✅ IrqSpinlock: serial/PMM/task/sched (Phase 5) |
-| ext2 创建文件 | 部分实现 | writeFile 已完成, createFile 待实现 |
+| ext2 创建文件 | 完整实现 | ✅ createFile + writeFile + unlinkFile + createDir (Phase 6) |
 | 交换分区 (swap) | 未设计详细方案 | 未开始 |
 | 用户权限/安全模型 | 未设计详细方案 | 未开始 |
 | 栈自动扩展 | 未设计详细方案 | 未开始 |
@@ -390,14 +402,14 @@
 
 - ~~ext2 创建文件 (createFile)~~ → hello21 测试通过 (24/24)
 - ~~TCP socket API 验证~~ → hello22 测试通过: socket/bind/listen/accept 全部正确 (25/25)
+- ~~TCP echo server 测试~~ → hello26 测试通过: socket/bind/listen/accept/sendto/recvfrom 完整服务端 API 验证 (28/28)
 - ~~ext2 mkdir~~ → hello23 测试通过: createDir + mkdir syscall #123 (26/26)
 - ~~ext2 unlink~~ → hello24 测试通过: freeBlock + freeInode + removeDirEntry + unlinkFile, syscall #111 ext2 支持 (27/27)
 - ~~ext2 多级路径支持~~ → resolveParent 辅助函数, createFile/createDir/unlinkFile 支持子目录操作, hello25 测试
 - ~~文件系统缓存~~ → 64 条目写穿缓冲区, readBlockCached/writeBlockCached, 时钟替换策略
-- 网络服务器 (echo server / HTTP server)
-- 文件系统缓存
-- 多核调度 (需要 AP 定时器)
-- 真机硬件支持
+- 网络服务器 (echo server / HTTP server) → 待实现
+- 多核调度 (需要 AP 定时器) → 阻塞
+- 真机硬件支持 → 未开始
 
 ---
 
@@ -405,6 +417,7 @@
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| v1.2 | 2026-05-25 | Phase 6: TCP echo server 测试 (hello26), socket/bind/listen/accept/sendto/recvfrom 完整服务端 API, 28/28 tests |
 | v1.1 | 2026-05-25 | Phase 6: ext2 块缓存 (64条目写穿缓冲区, readBlockCached/writeBlockCached, 时钟替换策略) |
 | v1.0 | 2026-05-25 | Phase 6 进展: ext2 多级路径支持 (resolveParent), createFile/createDir/unlinkFile 支持子目录, hello25 测试 |
 | v0.9 | 2026-05-25 | Phase 6 进展: ext2 unlink (freeBlock + freeInode + removeDirEntry + unlinkFile), syscall #111 ext2 支持, hello24 测试通过, 27/27 测试, 48 syscalls |

@@ -445,6 +445,29 @@ _start:
     movq $13, %rdx
     syscall
 
+    # Spawn hello26 (TCP echo server test)
+    movq $5, %rax
+    leaq hello26_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn26_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done26_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
     # Spawn hello23 (mkdir test)
     movq $5, %rax
     leaq hello23_name(%rip), %rdi
@@ -747,6 +770,13 @@ done23_msg:
     .ascii "spawned hello25\n"
     done25_msg:
     .ascii "hello25 done\n"
+    hello26_name:
+    .ascii "hello26"
+    .byte 0
+    spawn26_msg:
+    .ascii "spawned hello26\n"
+    done26_msg:
+    .ascii "hello26 done\n"
     hello9_name:
     .ascii "hello9"
     .byte 0
