@@ -413,6 +413,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         123 => {
             syscallMkdir(frame);
         },
+        124 => {
+            syscallConnect(frame);
+        },
         228 => {
             syscallClock_gettime(frame);
         },
@@ -2632,4 +2635,48 @@ fn syscallMkdir(frame: *SyscallFrame) void {
     }
 
     frame.rax = @bitCast(@as(i64, -1));
+}
+
+/// Syscall #124: connect(fd, addr_ptr, addr_len)
+/// RDI = fd (TCP socket)
+/// RSI = pointer to sockaddr_in (user space)
+/// RDX = addr_len
+/// Returns 0 on success (SYN sent), -1 on failure.
+fn syscallConnect(frame: *SyscallFrame) void {
+    const fd: u32 = @truncate(frame.rdi);
+    const addr_ptr: u64 = frame.rsi;
+    _ = frame.rdx; // addr_len
+
+    const sched_mod = @import("../../proc/sched.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+    const task_mod = @import("../../proc/task.zig");
+    const t = task_mod.getTask(cur_idx) orelse {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    };
+
+    if (fd >= 32 or t.fd_table.fds[fd].fd_type != .tcp_socket) {
+        frame.rax = @bitCast(@as(i64, -88)); // ENOTSOCK
+        return;
+    }
+    const tcb_idx = t.fd_table.fds[fd].tcb_idx;
+
+    if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) {
+        frame.rax = @bitCast(@as(i64, -1));
+        return;
+    }
+
+    var sock_addr: [8]u8 = undefined;
+    const copy = @import("../../mm/copy_from_user.zig");
+    _ = copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), 8);
+
+    const port = (@as(u16, sock_addr[2]) << 8) | @as(u16, sock_addr[3]);
+    const ip = [4]u8{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] };
+
+    const net_mod = @import("../../net/mod.zig");
+    const result = net_mod.tcp.tcpConnectSocket(tcb_idx, ip, port);
+    frame.rax = @bitCast(result);
 }

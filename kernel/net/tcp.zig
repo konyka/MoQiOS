@@ -567,6 +567,37 @@ pub fn tcpConnect(remote_ip: [4]u8, remote_port: u16, owner_task: u32) i64 {
     return -1;
 }
 
+// Connect an existing socket TCB to a remote address.
+// Returns 0 on success (SYN sent), -1 on failure.
+pub fn tcpConnectSocket(tcb_idx: u32, remote_ip: [4]u8, remote_port: u16) i64 {
+    if (tcb_idx >= MAX_CONNECTIONS) return -1;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active or tcb.state != .closed) return -1;
+
+    if (tcb.local_port == 0) {
+        tcb.local_port = allocEphemeralPort();
+        if (tcb.local_port == 0) return -1;
+    }
+
+    tcb.remote_port = remote_port;
+    tcb.remote_ip = remote_ip;
+    tcb.iss = generateIss();
+    tcb.snd_una = tcb.iss;
+    tcb.snd_nxt = tcb.iss;
+    tcb.snd_wnd = TCP_WINDOW;
+    tcb.rcv_nxt = 0;
+    tcb.rcv_wnd = TCP_WINDOW;
+    tcb.state = .syn_sent;
+
+    if (!sendSegment(tcb, SYN, undefined, 0)) {
+        tcb.state = .closed;
+        return -1;
+    }
+
+    serial.writeString("[tcp] connect: SYN sent\n");
+    return 0;
+}
+
 /// Poll for connection state. Returns:
 ///  0 = still connecting
 ///  1 = established
