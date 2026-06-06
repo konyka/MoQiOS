@@ -43,20 +43,39 @@ const GdtPtr = packed struct {
 };
 
 /// Task State Segment — used for IST and kernel stack switching on syscall/interrupt.
-const Tss = extern struct {
-    reserved0: u32,
-    /// Ring 0-2 stack pointers (RSP0 used for user→kernel transitions).
-    rsp0: u64,
-    rsp1: u64,
-    rsp2: u64,
-    reserved1: u64,
-    /// Interrupt Stack Table pointers (IST1-7).
-    ist: [7]u64,
-    reserved2: u64,
-    reserved3: u16,
+///
+/// MUST be `packed` (not `extern`): the hardware 64-bit TSS places RSP0 at byte
+/// offset 4 (immediately after a single u32), i.e. the u64 stack pointers are
+/// 4-byte — NOT 8-byte — aligned. An `extern struct` would insert 4 bytes of
+/// padding after `reserved0` to 8-byte-align `rsp0`, shifting RSP0/RSP1/RSP2 and
+/// all IST entries by 4 bytes. The CPU would then read a misaligned, garbage
+/// (non-canonical) RSP0/IST on any user→kernel interrupt delivery and #SS →
+/// #DF → triple fault. `packed` gives the exact byte layout the CPU expects.
+const Tss = packed struct {
+    reserved0: u32 = 0,
+    /// Ring 0-2 stack pointers (RSP0 used for user→kernel transitions). Offset 4.
+    rsp0: u64 = 0,
+    rsp1: u64 = 0,
+    rsp2: u64 = 0,
+    reserved1: u64 = 0,
+    /// Interrupt Stack Table pointers (IST1-7). IST1 at offset 0x24.
+    ist1: u64 = 0,
+    ist2: u64 = 0,
+    ist3: u64 = 0,
+    ist4: u64 = 0,
+    ist5: u64 = 0,
+    ist6: u64 = 0,
+    ist7: u64 = 0,
+    reserved2: u64 = 0,
+    reserved3: u16 = 0,
     /// I/O Map Base Address.
-    iomap_base: u16,
+    iomap_base: u16 = 0,
 };
+
+/// Hardware-correct TSS size in bytes (104). @sizeOf of a packed struct may be
+/// rounded up for the backing-integer alignment, so use this explicit constant
+/// for the descriptor limit and IOPB base.
+const TSS_HW_SIZE: u20 = 104;
 
 /// Total GDT entries: null, kcode, kdata, ucode, udata, ucode_dup, tss_low, tss_high = 8
 const GDT_ENTRIES: usize = 8;
@@ -66,6 +85,20 @@ const MAX_CPUS: usize = 4;
 var gdt_entries: [MAX_CPUS][GDT_ENTRIES]GdtEntry = undefined;
 var gdt_ptr: [MAX_CPUS]GdtPtr = undefined;
 var tss: [MAX_CPUS]Tss = undefined;
+
+/// Dedicated Interrupt Stack Table (IST) stacks.
+///
+/// Critical exceptions (#DF, #SS, #GP, NMI, #MC) are routed (via the IDT `ist`
+/// field) to one of these fixed, always-mapped stacks instead of TSS RSP0.
+/// This guarantees that even if RSP0 is stale/bad — e.g. a fault while the CPU
+/// is loading RSP0 on a user→kernel transition — exception delivery still has a
+/// valid stack and the handler can run (and dump diagnostics / kill the task)
+/// instead of escalating #SS→#DF→triple-fault.
+///
+/// These live in .bss (zeroed by the bootloader); only their addresses matter.
+const IST_STACK_SIZE: usize = 16 * 1024;
+const NUM_IST: usize = 3; // IST1=#DF, IST2=#SS/#GP, IST3=NMI/#MC
+var ist_stacks: [MAX_CPUS][NUM_IST][IST_STACK_SIZE]u8 align(16) = undefined;
 
 fn makeEntry(base: u32, limit: u20, access: u8, flags: u4) GdtEntry {
     return .{
@@ -103,6 +136,18 @@ fn makeTssEntry(tss_addr: u64, limit: u20) [2]GdtEntry {
 
 /// Set the RSP0 value in the TSS for a given CPU.
 pub fn setRsp0(cpu_id: usize, rsp0: u64) void {
+    // DIAGNOSTIC: warn if a non-canonical RSP0 is ever installed — a bad RSP0
+    // makes every user→kernel interrupt delivery raise #SS → #DF → triple fault.
+    const hi = rsp0 >> 47;
+    if (hi != 0 and hi != 0x1FFFF) {
+        const serial = @import("serial.zig");
+        const fmt = @import("../../lib/fmt.zig");
+        serial.writeString("[gdt] WARN non-canonical RSP0 cpu=");
+        fmt.writeDecimal64(cpu_id);
+        serial.writeString(" rsp0=0x");
+        fmt.writeHex(rsp0);
+        serial.writeString("\n");
+    }
     tss[cpu_id].rsp0 = rsp0;
 }
 
@@ -120,7 +165,14 @@ pub fn setRsp0Bsp(rsp0: u64) void {
 fn initCpuGdtData(cpu_id: usize) void {
     // Initialize TSS
     @memset(@as([*]u8, @ptrCast(&tss[cpu_id]))[0..@sizeOf(Tss)], 0);
-    tss[cpu_id].iomap_base = @sizeOf(Tss);
+    tss[cpu_id].iomap_base = TSS_HW_SIZE;
+
+    // Point IST1..IST3 at their dedicated stacks (stacks grow downward, so the
+    // pointer is the TOP of each region). The IDT routes #DF→IST1, #SS/#GP→IST2,
+    // NMI/#MC→IST3.
+    tss[cpu_id].ist1 = @intFromPtr(&ist_stacks[cpu_id][0]) + IST_STACK_SIZE;
+    tss[cpu_id].ist2 = @intFromPtr(&ist_stacks[cpu_id][1]) + IST_STACK_SIZE;
+    tss[cpu_id].ist3 = @intFromPtr(&ist_stacks[cpu_id][2]) + IST_STACK_SIZE;
 
     // Build GDT entries
     gdt_entries[cpu_id][0] = makeEntry(0, 0, 0, 0); // null
@@ -130,8 +182,9 @@ fn initCpuGdtData(cpu_id: usize) void {
     gdt_entries[cpu_id][4] = makeEntry(0, 0xFFFFF, 0xF2, 0xC); // user data
     gdt_entries[cpu_id][5] = makeEntry(0, 0xFFFFF, 0xFA, 0xA); // user code dup (SYSRET)
 
-    // TSS descriptor (two entries)
-    const tss_entries = makeTssEntry(@intFromPtr(&tss[cpu_id]), @as(u20, @intCast(@sizeOf(Tss) - 1)));
+    // TSS descriptor (two entries). Limit MUST be the hardware TSS size, not
+    // @sizeOf(Tss) (which may be padded for the packed backing integer).
+    const tss_entries = makeTssEntry(@intFromPtr(&tss[cpu_id]), TSS_HW_SIZE - 1);
     gdt_entries[cpu_id][6] = tss_entries[0];
     gdt_entries[cpu_id][7] = tss_entries[1];
 

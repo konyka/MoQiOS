@@ -2,9 +2,9 @@
 /// commonStub is returnable: it saves all GPRs, calls interruptDispatch,
 /// then restores and iretqs. This allows IRQ handlers (timer) to return
 /// and enables context switching by modifying the frame in-place.
-
 const serial = @import("serial.zig");
 const exception = @import("exception.zig");
+const fmt = @import("../../lib/fmt.zig");
 
 const IdtEntry = packed struct {
     offset_low: u16,
@@ -115,13 +115,14 @@ fn makeStub(comptime vector: u8) *const fn () callconv(.naked) void {
                 }
                 break :blk buf[0..len];
             };
-            asm volatile (
-                (if (!hasErrorCode(vector)) "pushq $0\n" else "") ++
-                    "pushq $" ++ vec_str ++ "\n" ++
-                    "jmp *%[stub]\n"
-                :
-                : [stub] "r" (&commonStub),
-            );
+            // Jump to commonStub via a direct RIP-relative branch. Using a
+            // `"r"` input for the target would make the compiler load
+            // &commonStub into a GPR (e.g. RAX) BEFORE these pushes, clobbering
+            // the interrupted task's register before commonStub can save it.
+            // `commonStub` has C linkage (`export fn`) so the symbol resolves.
+            asm volatile ((if (!hasErrorCode(vector)) "pushq $0\n" else "") ++
+                "pushq $" ++ vec_str ++ "\n" ++
+                "jmp commonStub\n");
         }
     }.stub;
 }
@@ -190,9 +191,19 @@ pub const InterruptFrame = extern struct {
 //   Per-CPU data must be accessed via kernel virtual addresses (not %%gs:).
 //   Only syscallEntry/sysretq use swapgs and %%gs: access.
 
+/// Handler pointer with C linkage so the naked stub can call it via a
+/// RIP-relative indirect call *after* all GPRs are saved. Passing it as an
+/// `"r"` input instead would make the compiler materialize it into a register
+/// (RAX in practice) *before* the first `pushq`, silently corrupting the
+/// interrupted task's RAX (it would be saved/restored as the handler address).
+export var interrupt_handler_ptr: *const fn (*InterruptFrame) callconv(.c) void = &interruptDispatch;
+
 export fn commonStub() callconv(.naked) void {
-    const handler = &interruptDispatch;
-    const anchor_addr = @intFromPtr(&@import("../../proc/sched.zig").saved_stack_anchor);
+    // CRITICAL: the very first instruction must save an interrupted register.
+    // Do NOT use asm `"r"` inputs here — they are loaded before this template
+    // runs and would clobber RAX/RCX of the interrupted code before we push it.
+    // The handler and the stack anchor are referenced RIP-relative *after* the
+    // GPR saves (same pattern as syscallEntry).
     asm volatile (
         \\pushq %%rax
         \\pushq %%rbx
@@ -210,8 +221,8 @@ export fn commonStub() callconv(.naked) void {
         \\pushq %%r14
         \\pushq %%r15
         \\
-        \\// Now load anchor address into R12 (original R12 already saved on stack)
-        \\movq %[anchor_addr_reg], %%r12
+        \\// Load anchor address into R12 (original R12 already saved on stack)
+        \\leaq saved_stack_anchor(%%rip), %%r12
         \\
         \\// Save stack pointer to anchor
         \\movq %%rsp, (%%r12)
@@ -222,7 +233,7 @@ export fn commonStub() callconv(.naked) void {
         \\movq %%rsp, %%rbp
         \\andq $-16, %%rsp
         \\
-        \\call *%[handler]
+        \\call *interrupt_handler_ptr(%%rip)
         \\
         \\// Restore stack from anchor (scheduler may have switched stacks)
         \\movq (%%r12), %%rsp
@@ -245,11 +256,7 @@ export fn commonStub() callconv(.naked) void {
         \\
         \\addq $16, %%rsp
         \\iretq
-    :
-    : [handler] "r" (handler),
-      [anchor_addr_reg] "r" (anchor_addr),
-    : .{ .memory = true }
-    );
+        ::: .{ .memory = true });
 }
 
 /// Central interrupt dispatch — called from commonStub with pointer to InterruptFrame.
@@ -270,13 +277,18 @@ pub fn interruptDispatch(frame: *InterruptFrame) callconv(.c) void {
     } else if (vector == 240) {
         // LAPIC timer vector
         handleLapicTimer(frame);
+    } else if (vector == 241) {
+        // AHCI interrupt vector
+        handleAhci(frame);
     }
     // Other vectors: ignored for now
 }
 
 fn handleException(frame: *InterruptFrame) void {
     const vector: u8 = @truncate(frame.vector);
-    const cr2: u64 = asm volatile ("movq %%cr2, %[cr2]" : [cr2] "=r" (-> u64));
+    const cr2: u64 = asm volatile ("movq %%cr2, %[cr2]"
+        : [cr2] "=r" (-> u64),
+    );
 
     // Page fault (vector 14) gets special handling — non-fatal for copy_from_user
     // recovery and user-space demand paging.
@@ -289,7 +301,7 @@ fn handleException(frame: *InterruptFrame) void {
     exception.ring.record(vector, frame.error_code, frame.rip, frame.rflags, cr2);
 
     serial.writeString("\n!!! EXCEPTION #");
-    writeDecimal(vector);
+    fmt.writeDecimal64(vector);
     if (vector < 32) {
         serial.writeString(" (");
         serial.writeString(exception_names[vector]);
@@ -297,21 +309,57 @@ fn handleException(frame: *InterruptFrame) void {
     }
     serial.writeString(" !!!\n");
     serial.writeString("  error_code: 0x");
-    writeHex(frame.error_code);
+    fmt.writeHex(frame.error_code);
     serial.writeString("\n  RIP: 0x");
-    writeHex(frame.rip);
+    fmt.writeHex(frame.rip);
     serial.writeString("\n  CS: 0x");
-    writeHex(frame.cs);
+    fmt.writeHex(frame.cs);
     serial.writeString("\n  RSP: 0x");
-    writeHex(frame.rsp);
+    fmt.writeHex(frame.rsp);
     serial.writeString("\n  SS: 0x");
-    writeHex(frame.ss);
+    fmt.writeHex(frame.ss);
     serial.writeString("\n  RFLAGS: 0x");
-    writeHex(frame.rflags);
+    fmt.writeHex(frame.rflags);
     if (vector == 14) {
         serial.writeString("\n  CR2 (fault address): 0x");
-        writeHex(cr2);
+        fmt.writeHex(cr2);
     }
+    // Diagnostics for stack-related faults: dump the TSS RSP0 the CPU would have
+    // switched to, plus the current task's kernel stack bounds. A mismatch /
+    // non-canonical RSP0 explains #SS-on-interrupt-delivery cascades.
+    if (vector == 8 or vector == 12 or vector == 13) {
+        const gdt = @import("gdt.zig");
+        serial.writeString("\n  TSS.RSP0: 0x");
+        fmt.writeHex(gdt.getTssPtr(0).rsp0);
+        const sched = @import("../../proc/sched.zig");
+        const task = @import("../../proc/task.zig");
+        if (sched.currentTaskIndex()) |ci| {
+            serial.writeString("\n  cur task idx: ");
+            fmt.writeDecimal64(ci);
+            if (task.getTask(ci)) |ct| {
+                serial.writeString(" tid: ");
+                fmt.writeDecimal64(ct.tid);
+                serial.writeString(" kstack: 0x");
+                fmt.writeHex(ct.kernel_stack);
+                serial.writeString("..0x");
+                fmt.writeHex(ct.kernel_stack_top);
+                serial.writeString(" is_user: ");
+                fmt.writeDecimal64(@intFromBool(ct.is_user));
+            }
+        }
+    }
+    // User-mode CPU exceptions (other than #DF) are not fatal to the kernel:
+    // kill the offending process and let the scheduler move on, mirroring the
+    // #PF segfault path. Only genuine kernel-mode faults — or a #DF, which means
+    // exception delivery itself failed — halt the whole system.
+    const from_user = (frame.cs & 0x3) == 0x3;
+    if (from_user and vector != 8) {
+        serial.writeString("\n  [user fault] killing process\n");
+        const task_mod = @import("../../proc/task.zig");
+        task_mod.exitTask(128 + @as(i32, @intCast(vector)));
+        return;
+    }
+
     serial.writeString("\n  system halted\n");
     while (true) {
         asm volatile ("cli");
@@ -351,7 +399,15 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
         return;
     }
 
-    // Path 2: User-mode demand paging (page not present, from user space)
+    // Path 2: User-mode COW fault (page present, write attempt, COW bit set)
+    if (user_mode and present and write) {
+        if (handleCowFault(frame, cr2)) {
+            return; // Successfully handled COW
+        }
+        // Not a COW fault — fall through to segfault
+    }
+
+    // Path 3: User-mode demand paging (page not present, from user space)
     if (user_mode and !present) {
         if (handleDemandPage(frame, cr2)) {
             return; // Successfully handled
@@ -359,13 +415,13 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
         // Failed demand page — fall through to segfault
     }
 
-    // Path 3: User-mode segfault — kill the process
+    // Path 4: User-mode segfault — kill the process
     if (user_mode) {
         serial.writeString("\n[SEGFAULT] User process killed\n");
         serial.writeString("  fault addr: 0x");
-        writeHex(cr2);
+        fmt.writeHex(cr2);
         serial.writeString(" at RIP: 0x");
-        writeHex(frame.rip);
+        fmt.writeHex(frame.rip);
         serial.writeString(" (");
         if (write) serial.writeString("write") else serial.writeString("read");
         if (present) serial.writeString(", protection");
@@ -388,15 +444,37 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
     // Path 4: Kernel-mode fault without guard — fatal
     serial.writeString("\n!!! EXCEPTION #14 (Page Fault) !!!\n");
     serial.writeString("  error_code: 0x");
-    writeHex(err);
+    fmt.writeHex(err);
     serial.writeString("\n  RIP: 0x");
-    writeHex(frame.rip);
+    fmt.writeHex(frame.rip);
     serial.writeString("\n  CR2 (fault address): 0x");
-    writeHex(cr2);
+    fmt.writeHex(cr2);
     serial.writeString("\n  ");
     if (write) serial.writeString("write") else serial.writeString("read");
     if (present) serial.writeString(", protection violation") else serial.writeString(", page not present");
-    serial.writeString(" in kernel mode\n  system halted\n");
+    serial.writeString(" in kernel mode\n");
+    // Dump the kernel stack: print return-address-looking values (kernel image
+    // 0xffffffff8... or HHDM 0xffff8000...) to reconstruct the call chain.
+    serial.writeString("  RSP: 0x");
+    fmt.writeHex(frame.rsp);
+    serial.writeString("\n  stack (candidate return addrs):\n");
+    {
+        const sp: [*]const u64 = @ptrFromInt(frame.rsp & ~@as(u64, 7));
+        var i: usize = 0;
+        var printed: usize = 0;
+        while (i < 64 and printed < 16) : (i += 1) {
+            const v = sp[i];
+            if (v >= 0xffffffff80000000) {
+                serial.writeString("    [");
+                fmt.writeDecimal64(i);
+                serial.writeString("] 0x");
+                fmt.writeHex(v);
+                serial.writeString("\n");
+                printed += 1;
+            }
+        }
+    }
+    serial.writeString("  system halted\n");
     while (true) {
         asm volatile ("cli");
         asm volatile ("hlt");
@@ -417,14 +495,46 @@ fn handleDemandPage(frame: *InterruptFrame, fault_addr: u64) bool {
     // Align fault address down to page boundary
     const page_addr = fault_addr & ~@as(u64, paging_mod.PAGE_SIZE - 1);
 
-    // Only handle faults in valid user regions:
-    //   Stack: growable region below USER_STACK_TOP
-    //   Code:  [USER_CODE_BASE, USER_CODE_BASE + MAX_CODE_PAGES * PAGE_SIZE)
+    // Check valid user regions
     const user_space = @import("../../mm/user_space.zig");
-    const in_stack_range = page_addr >= (user_space.USER_STACK_TOP - 64 * paging_mod.PAGE_SIZE) and page_addr < user_space.USER_STACK_TOP;
+
+    // Stack: auto-growing region below USER_STACK_TOP down to USER_STACK_BOTTOM
+    const in_stack_range = page_addr >= user_space.USER_STACK_BOTTOM and page_addr < user_space.USER_STACK_TOP;
+    // Code:  [USER_CODE_BASE, USER_CODE_BASE + MAX_CODE_PAGES * PAGE_SIZE)
     const in_code_range = page_addr >= user_space.USER_CODE_BASE and page_addr < user_space.USER_CODE_BASE + 16 * paging_mod.PAGE_SIZE;
 
     if (!in_stack_range and !in_code_range) return false;
+
+    // Check if this is a swap-in (page was swapped out)
+    const swap = @import("../../mm/swap.zig");
+    if (swap.isEnabled()) {
+        const pte_or_null = paging_mod.getPageEntryRaw(current.page_table_phys, page_addr);
+        if (pte_or_null) |pte_val| {
+            if (swap.isSwapEntry(pte_val)) {
+                // Swap in: read the page back from disk
+                const new_pte = swap.swapIn(pte_val) orelse return false;
+                // Update the PTE
+                paging_mod.setPageEntryRaw(current.page_table_phys, page_addr, new_pte);
+                // Flush TLB
+                asm volatile ("invlpg (%[addr])"
+                    :
+                    : [addr] "r" (page_addr),
+                );
+                return true;
+            }
+        }
+    }
+
+    // Stack auto-growth: extend stack_limit when fault is below current limit
+    if (in_stack_range and page_addr < current.stack_limit) {
+        // Check we don't grow below USER_STACK_BOTTOM
+        if (page_addr < user_space.USER_STACK_BOTTOM) return false;
+        // Check we don't grow into the heap region (brk)
+        if (page_addr < current.brk_current + 4096) return false;
+        // Extend stack_limit — grow in chunks of 32 pages (128KB) for efficiency
+        const new_limit = page_addr & ~@as(u64, 32 * paging_mod.PAGE_SIZE - 1);
+        current.stack_limit = @max(new_limit, user_space.USER_STACK_BOTTOM);
+    }
 
     // Allocate a physical page
     const phys = pmm.allocPage() orelse return false;
@@ -449,6 +559,69 @@ fn handleDemandPage(frame: *InterruptFrame, fault_addr: u64) bool {
     return true;
 }
 
+/// Copy-on-Write fault handler.
+/// When a user process writes to a COW-shared page (present + read-only + COW bit):
+/// - If ref_count == 1: just make the page writable (sole owner optimization)
+/// - If ref_count > 1: allocate new page, copy content, update PTE
+/// Returns true if the fault was a COW fault and was handled.
+fn handleCowFault(frame: *InterruptFrame, fault_addr: u64) bool {
+    const pmm_mod = @import("../../mm/pmm.zig");
+    const hhdm_mod = @import("../../mm/hhdm.zig");
+    const paging_mod = @import("paging.zig");
+    const sched = @import("../../proc/sched.zig");
+
+    const COW_BIT: u64 = 1 << 9;
+
+    const current = sched.currentTask() orelse return false;
+    if (current.page_table_phys == 0) return false;
+
+    const page_addr = fault_addr & ~@as(u64, paging_mod.PAGE_SIZE - 1);
+
+    // Get the PTE for this page
+    const pte = paging_mod.getPageEntry(current.page_table_phys, page_addr) orelse return false;
+    const pte_val: u64 = @bitCast(pte.*);
+
+    // Check COW bit is set
+    if (pte_val & COW_BIT == 0) return false;
+
+    const old_phys = pte_val & paging_mod.ADDR_MASK;
+
+    // Check ref count: if we're the sole owner, just make writable
+    const count = pmm_mod.getRefCount(old_phys);
+    if (count <= 1) {
+        // Sole owner — make writable, clear COW bit
+        const updated: u64 = (pte_val & ~COW_BIT) | paging_mod.WRITABLE;
+        paging_mod.setPageEntryRaw(current.page_table_phys, page_addr, updated);
+        paging_mod.invlpg(page_addr);
+        _ = frame;
+        return true;
+    }
+
+    // Multiple owners: allocate a new private page and copy
+    const new_phys = pmm_mod.allocPage() orelse return false;
+    const src: [*]const u8 = @ptrFromInt(hhdm_mod.physToVirt(old_phys));
+    const dst: [*]u8 = @ptrFromInt(hhdm_mod.physToVirt(new_phys));
+    @memcpy(dst[0..paging_mod.PAGE_SIZE], src[0..paging_mod.PAGE_SIZE]);
+
+    // Update PTE: point to new page, make writable, clear COW bit
+    const updated_pte = (pte_val & paging_mod.ADDR_MASK & ~@as(u64, COW_BIT)) | new_phys | paging_mod.WRITABLE;
+    paging_mod.setPageEntryRaw(current.page_table_phys, page_addr, updated_pte);
+    paging_mod.invlpg(page_addr);
+
+    _ = frame;
+    return true;
+}
+
+/// Handle AHCI interrupt (vector 241).
+fn handleAhci(frame: *InterruptFrame) void {
+    _ = frame;
+    const ahci = @import("../../drivers/ahci.zig");
+    ahci.handleInterrupt();
+    // Send EOI to LAPIC (MSI interrupts still require LAPIC EOI)
+    const lapic = @import("lapic.zig");
+    lapic.eoi();
+}
+
 /// Handle LAPIC timer interrupt (vector 240).
 fn handleLapicTimer(frame: *InterruptFrame) void {
     incrementTick();
@@ -467,6 +640,20 @@ fn handleIrq(frame: *InterruptFrame, irq: u8) void {
         const keyboard = @import("../../drivers/keyboard.zig");
         keyboard.handleInterrupt();
     }
+    // e1000 NIC interrupt (typically IRQ 11 in QEMU)
+    {
+        const e1000 = @import("../../drivers/e1000.zig");
+        if (e1000.isActive() and e1000.getIrqLine() == irq) {
+            e1000.handleInterrupt();
+        }
+    }
+    // virtio-net NIC interrupt
+    {
+        const vnet = @import("../../drivers/virtio_net.zig");
+        if (vnet.isActive() and vnet.getIrqLine() == irq) {
+            vnet.handleInterrupt();
+        }
+    }
     // Send EOI to both PIC chips for cascade
     const io = @import("io.zig");
     io.outb(0x20, 0x20); // EOI to master PIC
@@ -475,38 +662,14 @@ fn handleIrq(frame: *InterruptFrame, irq: u8) void {
     }
 }
 
-fn writeHex(value: u64) void {
-    const hex = "0123456789abcdef";
-    var buf: [16]u8 = undefined;
-    var v = value;
-    var i: usize = 16;
-    while (i > 0) {
-        i -= 1;
-        buf[i] = hex[@as(usize, @intCast(v & 0xf))];
-        v >>= 4;
-    }
-    serial.writeString(&buf);
-}
-
-fn writeDecimal(value: u64) void {
-    var buf: [20]u8 = undefined;
-    if (value == 0) {
-        serial.writeString("0");
-        return;
-    }
-    var v = value;
-    var i: usize = 0;
-    while (v > 0) : (v /= 10) {
-        buf[i] = @intCast(v % 10 + '0');
-        i += 1;
-    }
-    var j: usize = 0;
-    while (j < i / 2) : (j += 1) {
-        const tmp = buf[j];
-        buf[j] = buf[i - 1 - j];
-        buf[i - 1 - j] = tmp;
-    }
-    serial.writeString(buf[0..i]);
+/// Load the (shared) IDT register on the calling CPU.
+/// The IDT table is global; each CPU must execute its own `lidt`.
+/// APs call this after `init()` has built the table on the BSP.
+pub fn loadOnThisCpu() void {
+    asm volatile ("lidt (%[idt_ptr])"
+        :
+        : [idt_ptr] "r" (&idt_ptr),
+    );
 }
 
 pub fn init() void {
@@ -514,7 +677,15 @@ pub fn init() void {
 
     for (0..256) |i| {
         const vec: u8 = @intCast(i);
-        const ist: u3 = if (vec == 8) 1 else 0; // Double Fault uses IST1
+        // Route stack-sensitive exceptions to dedicated IST stacks so a bad/stale
+        // RSP0 (e.g. fault while loading RSP0 on a user→kernel transition) cannot
+        // escalate to a triple fault. See gdt.zig for the IST stack definitions.
+        const ist: u3 = switch (vec) {
+            8 => 1, // #DF  → IST1
+            12, 13 => 2, // #SS, #GP → IST2
+            2, 18 => 3, // NMI, #MC → IST3
+            else => 0,
+        };
         idt_entries[vec] = makeGate(@intFromPtr(stubs[vec]), ist);
     }
 

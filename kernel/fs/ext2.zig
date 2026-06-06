@@ -10,7 +10,6 @@
 ///   - Block allocation from bitmap
 ///
 /// Designed for ext2 with 1024-byte blocks (revision 0 / "good old ext2").
-
 const serial = @import("../arch/x86_64/serial.zig");
 const virtio_blk = @import("../drivers/virtio_blk.zig");
 const pmm = @import("../mm/pmm.zig");
@@ -19,26 +18,6 @@ const hhdm = @import("../mm/hhdm.zig");
 const SECTOR_SIZE: u32 = 512;
 const MAX_OPEN_FILES: u32 = 16;
 const MAX_FILENAME: u32 = 256;
-
-/// Write a u64 value as decimal to serial (for debug).
-fn serialWriteU64(val: u64) void {
-    if (val == 0) {
-        serial.writeByte('0');
-        return;
-    }
-    var buf: [20]u8 = undefined;
-    var n = val;
-    var i: usize = 0;
-    while (n > 0) {
-        buf[i] = @intCast(n % 10 + '0');
-        n /= 10;
-        i += 1;
-    }
-    while (i > 0) {
-        i -= 1;
-        serial.writeByte(buf[i]);
-    }
-}
 
 // ─── ext2 on-disk structures ──────────────────────────────────────────────
 
@@ -314,23 +293,28 @@ fn readInode(inode_num: u32, out: *Ext2Inode) bool {
 
     const target_block = inode_table_block + block_offset;
 
+    // `inode_size` is the on-disk *stride* between inodes (256 on rev>=1
+    // filesystems), but our `Ext2Inode` only models the 128-byte base inode.
+    // Clamp the copy to the struct size so we never overflow `out` (the extra
+    // bytes of a 256-byte inode are extended fields we don't use).
+    const out_bytes: [*]u8 = @ptrCast(out);
+    const copy_len = @min(inode_size, @as(u32, @sizeOf(Ext2Inode)));
+
     const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
     if (!readBlock(target_block, buf)) return false;
 
-    if (offset_in_block + inode_size > block_size) {
-        // Inode spans two blocks — read second block too
+    if (offset_in_block + copy_len > block_size) {
+        // Inode straddles a block boundary — read the second block too.
         const buf2_phys = pmm.allocPage() orelse return false;
         defer pmm.freePage(buf2_phys);
         const buf2: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf2_phys));
         if (!readBlock(target_block + 1, buf2)) return false;
 
         const first_part = block_size - offset_in_block;
-        var inode_buf: [256]u8 = undefined;
-        @memcpy(inode_buf[0..first_part], buf[offset_in_block .. offset_in_block + first_part]);
-        @memcpy(inode_buf[first_part .. first_part + inode_size - first_part], buf2[0 .. inode_size - first_part]);
-        @memcpy(@as([*]u8, @ptrCast(out))[0..inode_size], inode_buf[0..inode_size]);
+        @memcpy(out_bytes[0..first_part], buf[offset_in_block .. offset_in_block + first_part]);
+        @memcpy(out_bytes[first_part..copy_len], buf2[0 .. copy_len - first_part]);
     } else {
-        @memcpy(@as([*]u8, @ptrCast(out))[0..inode_size], buf[offset_in_block .. offset_in_block + inode_size]);
+        @memcpy(out_bytes[0..copy_len], buf[offset_in_block .. offset_in_block + copy_len]);
     }
     return true;
 }
@@ -455,7 +439,10 @@ fn findDirEntry(inode: *const Ext2Inode, name: []const u8) ?u32 {
                 const entry_name = buf[pos + @sizeOf(Ext2DirEntry) .. pos + @sizeOf(Ext2DirEntry) + name.len];
                 var match = true;
                 for (name, 0..) |c, j| {
-                    if (entry_name[j] != c) { match = false; break; }
+                    if (entry_name[j] != c) {
+                        match = false;
+                        break;
+                    }
                 }
                 if (match) return entry.inode;
             }
@@ -505,14 +492,27 @@ fn resolveBlock(inode: *const Ext2Inode, logical_block: u32) u32 {
         const idx1 = rel / ptrs_per_block;
         const idx2 = rel % ptrs_per_block;
 
-        if (!readBlock(dbl_block, buf)) { pmm.freePage(buf_phys); return 0; }
+        if (!readBlock(dbl_block, buf)) {
+            pmm.freePage(buf_phys);
+            return 0;
+        }
         const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
         const single_indirect = ptrs[idx1];
-        if (single_indirect == 0) { pmm.freePage(buf_phys); return 0; }
+        if (single_indirect == 0) {
+            pmm.freePage(buf_phys);
+            return 0;
+        }
 
-        const buf2_phys = pmm.allocPage() orelse { pmm.freePage(buf_phys); return 0; };
+        const buf2_phys = pmm.allocPage() orelse {
+            pmm.freePage(buf_phys);
+            return 0;
+        };
         const buf2: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf2_phys));
-        if (!readBlock(single_indirect, buf2)) { pmm.freePage(buf2_phys); pmm.freePage(buf_phys); return 0; }
+        if (!readBlock(single_indirect, buf2)) {
+            pmm.freePage(buf2_phys);
+            pmm.freePage(buf_phys);
+            return 0;
+        }
         const ptrs2: [*]const u32 = @ptrCast(@alignCast(buf2));
         const result = ptrs2[idx2];
         pmm.freePage(buf2_phys);
@@ -539,26 +539,44 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
 
     var read_total: u32 = 0;
     var current_offset = offset;
-    const tmp_phys = pmm.allocPage() orelse return -1;
-    defer pmm.freePage(tmp_phys);
-    const tmp: [*]u8 = @ptrFromInt(hhdm.physToVirt(tmp_phys));
+    const page_cache = @import("page_cache.zig");
+    const inode_id: u64 = 0x3000_0000_0000_0000 + @as(u64, f.inode_num);
 
     while (read_total < to_read) {
         const logical_block = current_offset / block_size;
         const block_offset = current_offset % block_size;
         const chunk = @min(to_read - read_total, block_size - block_offset);
 
-        const phys_block = resolveBlock(&f.inode, logical_block);
-        if (phys_block == 0) break;
-
-        if (!readBlock(phys_block, tmp)) break;
-
-        @memcpy(buf[read_total .. read_total + chunk], tmp[block_offset .. block_offset + chunk]);
+        // Try page cache first
+        const page_idx = logical_block; // page_offset in pages
+        if (page_cache.readPage(inode_id, page_idx)) |cached| {
+            @memcpy(buf[read_total .. read_total + chunk], cached[block_offset .. block_offset + chunk]);
+        } else {
+            // Cache miss — read from disk
+            const phys_block = resolveBlock(&f.inode, logical_block);
+            if (phys_block == 0) break;
+            const tmp_phys = pmm.allocPage() orelse break;
+            const tmp: [*]u8 = @ptrFromInt(hhdm.physToVirt(tmp_phys));
+            if (!readBlock(phys_block, tmp)) {
+                pmm.freePage(tmp_phys);
+                break;
+            }
+            @memcpy(buf[read_total .. read_total + chunk], tmp[block_offset .. block_offset + chunk]);
+            // Insert into page cache
+            const page_data: *const [4096]u8 = tmp[0..4096];
+            _ = page_cache.insertPage(inode_id, page_idx, page_data);
+            pmm.freePage(tmp_phys);
+        }
         read_total += chunk;
         current_offset += chunk;
     }
 
     return if (read_total == 0) -1 else @intCast(read_total);
+}
+
+pub fn getInodeNum(file_idx: u32) u32 {
+    if (file_idx >= MAX_OPEN_FILES) return 0;
+    return open_files[file_idx].inode_num;
 }
 
 pub fn getFileSize(file_idx: u32) u64 {
@@ -578,14 +596,13 @@ pub fn listDir(path: []const u8, callback: *const fn ([*]const u8, u32) void) vo
 
     const inode_num = if (path.len == 0 or (path.len == 1 and path[0] == '/'))
         @as(u32, 2)
-    else
-        blk: {
-            const r = walkPath(2, path);
-            break :blk if (r >= 0) open_files[@intCast(r)].inode_num else {
-                if (r >= 0) closeFile(@intCast(r));
-                return;
-            };
+    else blk: {
+        const r = walkPath(2, path);
+        break :blk if (r >= 0) open_files[@intCast(r)].inode_num else {
+            if (r >= 0) closeFile(@intCast(r));
+            return;
         };
+    };
 
     var inode: Ext2Inode = undefined;
     if (!readInode(inode_num, &inode)) return;
@@ -675,6 +692,165 @@ fn listDirInode(inode_num: u32, buf: []u8) usize {
     return pos;
 }
 
+/// Read directory entries starting from `offset` byte position within the directory.
+/// Returns entries as (name, name_len, inode_num, file_type, next_offset) tuples.
+/// `out_offset` is updated to the next offset for subsequent reads.
+/// Returns the number of entries written to the output arrays.
+pub fn readDirEntries(file_idx: u32, start_offset: u32, names: [*][*]u8, name_lens: [*]u32, inodes: [*]u32, file_types: [*]u8, next_offsets: [*]u32, max_entries: u32) struct { count: u32, new_offset: u32 } {
+    if (!active) return .{ .count = 0, .new_offset = start_offset };
+    if (file_idx >= open_count) return .{ .count = 0, .new_offset = start_offset };
+    const f = &open_files[file_idx];
+    if (f.inode_num == 0) return .{ .count = 0, .new_offset = start_offset };
+    if (f.inode.mode & 0xF000 != 0x4000) return .{ .count = 0, .new_offset = start_offset };
+
+    const dir_size = f.inode.size;
+    if (start_offset >= dir_size) return .{ .count = 0, .new_offset = start_offset };
+
+    const buf_phys = pmm.allocPage() orelse return .{ .count = 0, .new_offset = start_offset };
+    defer pmm.freePage(buf_phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+
+    var offset = start_offset;
+    var count: u32 = 0;
+
+    while (offset < dir_size and count < max_entries) {
+        const block_num = offset / block_size;
+        const phys_block = resolveBlock(&f.inode, block_num);
+        if (phys_block == 0) break;
+        if (!readBlock(phys_block, buf)) break;
+
+        const pos_in_block = offset % block_size;
+        var pos: u32 = pos_in_block;
+
+        while (pos < block_size and count < max_entries) {
+            const entry: *const Ext2DirEntry = @ptrCast(@alignCast(buf + pos));
+            if (entry.rec_len == 0) break;
+
+            if (entry.inode != 0 and entry.name_len > 0) {
+                const name_ptr = buf + pos + @sizeOf(Ext2DirEntry);
+                names[count] = name_ptr;
+                name_lens[count] = entry.name_len;
+                inodes[count] = entry.inode;
+                file_types[count] = entry.file_type;
+                const next_off = offset - pos_in_block + pos + entry.rec_len;
+                next_offsets[count] = next_off;
+                count += 1;
+            }
+
+            const new_pos = pos + entry.rec_len;
+            offset = offset - pos_in_block + new_pos;
+            pos = new_pos;
+            if (pos >= block_size) break;
+        }
+
+        // Move to next block boundary
+        offset = (offset / block_size + 1) * block_size;
+    }
+
+    return .{ .count = count, .new_offset = offset };
+}
+
+/// Truncate a file to the given length. Frees blocks beyond the new size.
+pub fn truncateFile(file_idx: u32, new_size: u32) bool {
+    if (!active) return false;
+    if (file_idx >= open_count) return false;
+    const f = &open_files[file_idx];
+    if (f.inode_num == 0) return false;
+
+    if (new_size >= f.inode.size) {
+        // Growing: just update size (blocks will be allocated on write)
+        f.inode.size = new_size;
+        _ = writeInode(f.inode_num, &f.inode);
+        return true;
+    }
+
+    // Shrinking: free blocks beyond new_size
+    const new_blocks_needed = if (new_size == 0) 0 else (new_size + block_size - 1) / block_size;
+
+    // Free direct blocks beyond needed
+    for (new_blocks_needed..EXT2_INODE_DIRECT) |i| {
+        if (i < EXT2_INODE_DIRECT and f.inode.block[i] != 0) {
+            freeBlock(f.inode.block[i]);
+            f.inode.block[i] = 0;
+        }
+    }
+
+    // If new_blocks_needed < EXT2_INODE_DIRECT, free indirect blocks entirely
+    if (new_blocks_needed <= EXT2_INODE_DIRECT) {
+        if (f.inode.block[12] != 0) {
+            // Free all blocks pointed to by single indirect
+            const ib_phys = pmm.allocPage() orelse return false;
+            const ib: [*]u8 = @ptrFromInt(hhdm.physToVirt(ib_phys));
+            if (readBlock(f.inode.block[12], ib)) {
+                const ptrs_per_block = block_size / 4;
+                const ptrs: [*]const u32 = @ptrCast(@alignCast(ib));
+                for (0..ptrs_per_block) |j| {
+                    if (ptrs[j] != 0) freeBlock(ptrs[j]);
+                }
+            }
+            pmm.freePage(ib_phys);
+            freeBlock(f.inode.block[12]);
+            f.inode.block[12] = 0;
+        }
+    }
+
+    // Free double indirect entirely if not needed
+    if (f.inode.block[13] != 0 and new_blocks_needed <= EXT2_INODE_DIRECT + block_size / 4) {
+        freeBlock(f.inode.block[13]);
+        f.inode.block[13] = 0;
+    }
+
+    f.inode.size = new_size;
+    f.inode.blocks = new_blocks_needed * (block_size / 512);
+    _ = writeInode(f.inode_num, &f.inode);
+    return true;
+}
+
+/// Rename a file: remove old entry from source dir, add entry in dest dir.
+/// Supports cross-directory rename (old_path and new_path can be in different dirs).
+pub fn renameFile(old_path: []const u8, new_path: []const u8) bool {
+    if (!active) return false;
+
+    // Resolve source: parent dir + old filename
+    const old_resolved = resolveParent(old_path) orelse return false;
+    const old_parent_inode = old_resolved.parent;
+    const old_filename = old_resolved.name;
+
+    // Resolve destination: parent dir + new filename
+    const new_resolved = resolveParent(new_path) orelse return false;
+    const new_parent_inode = new_resolved.parent;
+    const new_filename = new_resolved.name;
+
+    // Find the file's inode
+    var old_parent_ino_data: Ext2Inode = undefined;
+    if (!readInode(old_parent_inode, &old_parent_ino_data)) return false;
+    const file_inode_num = findDirEntry(&old_parent_ino_data, old_filename) orelse return false;
+
+    // Read file inode to get file_type
+    var file_inode: Ext2Inode = undefined;
+    if (!readInode(file_inode_num, &file_inode)) return false;
+    const file_type: u8 = if (file_inode.mode & 0xF000 == 0x4000) 2 else 1;
+
+    // If destination exists, remove it first (overwrite semantics)
+    var new_parent_inode_data: Ext2Inode = undefined;
+    if (readInode(new_parent_inode, &new_parent_inode_data)) {
+        if (findDirEntry(&new_parent_inode_data, new_filename)) |_| {
+            _ = removeDirEntry(new_parent_inode, new_filename);
+        }
+    }
+
+    // Remove old directory entry
+    if (!removeDirEntry(old_parent_inode, old_filename)) return false;
+
+    // Add new directory entry (possibly in a different directory)
+    if (!addDirEntry(new_parent_inode, file_inode_num, new_filename, file_type)) return false;
+
+    serial.writeString("[ext2] renamed to: ");
+    serial.writeString(new_filename);
+    serial.writeString("\n");
+    return true;
+}
+
 // ─── Write support ──────────────────────────────────────────────────────────
 
 fn writeBlockUncached(block_num: u32, buf: [*]const u8) bool {
@@ -707,12 +883,17 @@ fn writeInode(inode_num: u32, inode: *const Ext2Inode) bool {
 
     if (!readBlock(target_block, buf)) return false;
 
+    // Read-modify-write: only overwrite the 128-byte base inode we model,
+    // preserving the on-disk extended portion (rev>=1 inodes are 256 bytes).
+    // Reading `inode_size` bytes from our 128-byte struct would also be an
+    // out-of-bounds read that leaks adjacent memory onto disk.
     const inode_bytes: [*]const u8 = @ptrCast(inode);
-    if (offset_in_block + inode_size <= block_size) {
-        @memcpy(buf[offset_in_block .. offset_in_block + inode_size], inode_bytes[0..inode_size]);
+    const copy_len = @min(inode_size, @as(u32, @sizeOf(Ext2Inode)));
+    if (offset_in_block + copy_len <= block_size) {
+        @memcpy(buf[offset_in_block .. offset_in_block + copy_len], inode_bytes[0..copy_len]);
         if (!writeBlock(target_block, buf)) return false;
     } else {
-        // Inode spans two blocks
+        // Inode straddles a block boundary
         const first_part = block_size - offset_in_block;
         @memcpy(buf[offset_in_block .. offset_in_block + first_part], inode_bytes[0..first_part]);
         if (!writeBlock(target_block, buf)) return false;
@@ -721,7 +902,7 @@ fn writeInode(inode_num: u32, inode: *const Ext2Inode) bool {
         defer pmm.freePage(buf2_phys);
         const buf2: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf2_phys));
         if (!readBlock(target_block + 1, buf2)) return false;
-        @memcpy(buf2[0 .. inode_size - first_part], inode_bytes[first_part .. inode_size]);
+        @memcpy(buf2[0 .. copy_len - first_part], inode_bytes[first_part..copy_len]);
         if (!writeBlock(target_block + 1, buf2)) return false;
     }
     return true;
@@ -783,7 +964,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
     // Check direct blocks first
     if (logical_block < EXT2_INODE_DIRECT) {
         if (inode.block[logical_block] != 0) return inode.block[logical_block];
-        const blk = allocBlock(0) ; // allocate from group 0 for simplicity
+        const blk = allocBlock(0); // allocate from group 0 for simplicity
         if (blk == 0) return 0;
         inode.block[logical_block] = blk;
         inode.blocks += block_size / 512;
@@ -824,7 +1005,62 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
         return ptrs[index];
     }
 
-    // Double indirect — not supported for writes yet
+    // Double indirect: block[13] -> single indirect blocks -> data blocks
+    const dbl_base = indirect_base + ptrs_per_block;
+    if (logical_block < dbl_base + ptrs_per_block * ptrs_per_block) {
+        const buf_phys = pmm.allocPage() orelse return 0;
+        defer pmm.freePage(buf_phys);
+        const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+
+        // Ensure double indirect block exists
+        if (inode.block[13] == 0) {
+            const dbl_blk = allocBlock(0);
+            if (dbl_blk == 0) return 0;
+            inode.block[13] = dbl_blk;
+            inode.blocks += block_size / 512;
+            @memset(buf[0..block_size], 0);
+        } else {
+            if (!readBlock(inode.block[13], buf)) return 0;
+        }
+
+        const rel = logical_block - dbl_base;
+        const idx1 = rel / ptrs_per_block;
+        const idx2 = rel % ptrs_per_block;
+        const dbl_ptrs: [*]u32 = @ptrCast(@alignCast(buf));
+
+        // Ensure single indirect block at idx1
+        if (dbl_ptrs[idx1] == 0) {
+            const si_blk = allocBlock(0);
+            if (si_blk == 0) return 0;
+            dbl_ptrs[idx1] = si_blk;
+            inode.blocks += block_size / 512;
+            _ = writeBlock(inode.block[13], buf);
+            // Allocate zeroed single indirect block
+            const si_buf_phys = pmm.allocPage() orelse return 0;
+            defer pmm.freePage(si_buf_phys);
+            const si_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(si_buf_phys));
+            @memset(si_buf[0..block_size], 0);
+            _ = writeBlock(si_blk, si_buf);
+        }
+
+        // Read single indirect block
+        const si_buf_phys = pmm.allocPage() orelse return 0;
+        defer pmm.freePage(si_buf_phys);
+        const si_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(si_buf_phys));
+        if (!readBlock(dbl_ptrs[idx1], si_buf)) return 0;
+
+        const si_ptrs: [*]u32 = @ptrCast(@alignCast(si_buf));
+        if (si_ptrs[idx2] == 0) {
+            const blk = allocBlock(0);
+            if (blk == 0) return 0;
+            si_ptrs[idx2] = blk;
+            inode.blocks += block_size / 512;
+            _ = writeBlock(dbl_ptrs[idx1], si_buf);
+        }
+        _ = writeInode(inode_num, inode);
+        return si_ptrs[idx2];
+    }
+
     return 0;
 }
 
@@ -838,9 +1074,8 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
 
     var written: u32 = 0;
     var current_offset = offset;
-    const tmp_phys = pmm.allocPage() orelse return -1;
-    defer pmm.freePage(tmp_phys);
-    const tmp: [*]u8 = @ptrFromInt(hhdm.physToVirt(tmp_phys));
+    const page_cache = @import("page_cache.zig");
+    const inode_id: u64 = 0x3000_0000_0000_0000 + @as(u64, f.inode_num);
 
     while (written < count) {
         const logical_block = current_offset / block_size;
@@ -850,15 +1085,27 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
         const phys_block = ensureBlock(&f.inode, f.inode_num, logical_block);
         if (phys_block == 0) break;
 
-        // Read-modify-write: read the block, patch our data, write back
-        if (block_offset != 0 or chunk < block_size) {
-            if (!readBlock(phys_block, tmp)) break;
+        // Build the full block data
+        var block_data: [4096]u8 = undefined;
+
+        // Check page cache for existing data
+        if (page_cache.readPage(inode_id, logical_block)) |cached| {
+            @memcpy(&block_data, cached);
         } else {
-            @memset(tmp[0..block_size], 0);
+            // Read-modify-write: read the block from disk, patch our data
+            if (block_offset != 0 or chunk < block_size) {
+                if (!readBlock(phys_block, &block_data)) break;
+            } else {
+                @memset(&block_data, 0);
+            }
         }
 
-        @memcpy(tmp[block_offset .. block_offset + chunk], buf[written .. written + chunk]);
-        if (!writeBlock(phys_block, tmp)) break;
+        @memcpy(block_data[block_offset .. block_offset + chunk], buf[written .. written + chunk]);
+
+        // Write through page cache (marks dirty for writeback)
+        _ = page_cache.writePage(inode_id, logical_block, &block_data);
+        // Also write directly to disk for now (write-through)
+        _ = writeBlock(phys_block, &block_data);
 
         written += chunk;
         current_offset += chunk;
