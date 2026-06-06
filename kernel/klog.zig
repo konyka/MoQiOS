@@ -1,6 +1,6 @@
 /// Kernel log system — outputs to serial with level prefixes.
-
 const serial = @import("arch/x86_64/serial.zig");
+const fmt = @import("lib/fmt.zig");
 
 pub const Level = enum(u8) {
     err = 0,
@@ -38,19 +38,6 @@ pub fn logHex(comptime level: Level, comptime prefix: []const u8, value: u64) vo
     });
     serial.writeString(prefix);
     serial.writeString("0x");
-    writeHex(value);
+    fmt.writeHex(value);
     serial.writeString("\n");
-}
-
-fn writeHex(value: u64) void {
-    const hex = "0123456789abcdef";
-    var buf: [16]u8 = undefined;
-    var v = value;
-    var i: usize = 16;
-    while (i > 0) {
-        i -= 1;
-        buf[i] = hex[@as(usize, @intCast(v & 0xf))];
-        v >>= 4;
-    }
-    serial.writeString(&buf);
 }

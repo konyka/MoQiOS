@@ -3,28 +3,43 @@
 /// Supports: three-way handshake, data transfer with sequence numbers,
 /// four-way close, retransmission, and sliding window.
 ///
+/// Congestion control: TCP Reno (slow start, congestion avoidance,
+/// fast retransmit, fast recovery).
+///
+/// Extensions: Window Scaling (RFC 1323), Timestamps (RFC 1323),
+/// RTT measurement via Jacobson/Karels algorithm.
+///
 /// Design constraints:
 /// - No heap allocation — all state in static arrays (BSS)
 /// - Single-core, no lock needed for TCB table
 /// - Max 8 simultaneous connections
-/// - Window size: 4096 bytes
-/// - Retransmission: simple timeout-based (no SACK, no fast retransmit yet)
-
+/// - Window size: 4096 bytes (before scaling)
+/// - MSS: 1460 bytes
 const e1000 = @import("../drivers/e1000.zig");
 const netif = @import("netif.zig");
 const eth = @import("eth.zig");
 const ipv4 = @import("ipv4.zig");
 const arp = @import("arp.zig");
 const serial = @import("../arch/x86_64/serial.zig");
+const socket_opt = @import("socket_opt.zig");
+const bo = @import("../lib/byte_order.zig");
 
 // ─── Constants ────────────────────────────────────────────────────────────
 
-const MAX_CONNECTIONS: u32 = 8;
-const TCP_WINDOW: u32 = 4096;
+const MAX_CONNECTIONS: u32 = 32;
+const TCP_WINDOW: u32 = 32768;
 const TCP_MSS: u16 = 1460;
-const SEND_BUF_SIZE: u32 = 8192;
-const RECV_BUF_SIZE: u32 = 8192;
-const RETRANSMIT_MS: u32 = 2000; // 2 second retransmit timeout
+const SEND_BUF_SIZE: u32 = 32768;
+const RECV_BUF_SIZE: u32 = 32768;
+const RETRANSMIT_MS: u32 = 2000; // initial RTO (ms), overridden by Jacobson/Karels
+const TCP_RTO_MIN: u32 = 200; // minimum RTO (ms)
+const TCP_RTO_MAX: u32 = 60000; // maximum RTO (ms)
+
+/// SACK block: [left, right) sequence number range.
+pub const SackBlock = struct {
+    left: u32, // first sequence number in block
+    right: u32, // one past last sequence number in block
+};
 
 // TCP header flags
 const FIN: u8 = 0x01;
@@ -81,12 +96,56 @@ const TcpTcb = struct {
     retransmit_timer: u32, // ms since last ack
     retransmit_count: u8,
 
+    // Congestion control (TCP Reno)
+    cwnd: u32, // congestion window (bytes)
+    ssthresh: u32, // slow start threshold (bytes)
+    dup_ack_count: u3, // duplicate ACK counter
+    in_recovery: bool, // fast recovery active
+    recover_seq: u32, // seq number at recovery entry
+
+    // Window Scaling (RFC 1323)
+    snd_wnd_scale: u4, // send window scale shift count
+    rcv_wnd_scale: u4, // receive window scale shift count
+    ws_requested: u4, // window scale we requested in SYN
+    ws_enabled: bool, // window scaling negotiated
+
+    // Timestamps (RFC 1323) & RTT measurement
+    ts_recent: u32, // most recent timestamp received
+    ts_val_last: u32, // TSVAL we sent in last segment (for RTT)
+    ts_enabled: bool, // timestamps negotiated
+    // Jacobson/Karels RTO estimation
+    srtt: u32, // smoothed RTT (ms), 0 = no sample yet
+    rttvar: u32, // RTT variance (ms)
+    rto: u32, // current retransmission timeout (ms)
+
+    // Keepalive state
+    idle_ms: u32, // ms since last data received
+    keepalive_probes: u32, // number of keepalive probes sent without response
+    nagle_pending: bool, // Nagle: data is pending but held for ACK
+
+    // SACK (Selective Acknowledgment) state
+    sack_permitted: bool, // SACK negotiated
+    // Receiver side: out-of-order blocks to report in ACKs
+    sack_blocks: [4]SackBlock,
+    sack_block_count: u3,
+    // Sender side: SACK info received from peer (scoreboard)
+    sack_scoreboard: [4]SackBlock,
+    sack_scoreboard_count: u3,
+
     // Connection metadata
     active: bool, // slot in use
     owner_task: u32, // task index that owns this connection
+    options: socket_opt.SocketOptions,
 };
 
 var tcbs: [MAX_CONNECTIONS]TcpTcb = undefined;
+
+/// Compute the pool index of a TCB from its pointer.
+fn tcbIdx(tcb: *const TcpTcb) u32 {
+    const base: usize = @intFromPtr(&tcbs[0]);
+    const elem: usize = @intFromPtr(tcb);
+    return @intCast((elem - base) / @sizeOf(TcpTcb));
+}
 
 pub fn initTcbs() void {
     for (0..MAX_CONNECTIONS) |i| {
@@ -111,8 +170,32 @@ pub fn initTcbs() void {
             .recv_tail = 0,
             .retransmit_timer = 0,
             .retransmit_count = 0,
+            .cwnd = TCP_MSS,
+            .ssthresh = 65535,
+            .dup_ack_count = 0,
+            .in_recovery = false,
+            .recover_seq = 0,
+            .snd_wnd_scale = 0,
+            .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
+            .ws_requested = 2,
+            .ws_enabled = false,
+            .ts_recent = 0,
+            .ts_val_last = 0,
+            .ts_enabled = false,
+            .srtt = 0,
+            .rttvar = 0,
+            .rto = RETRANSMIT_MS,
+            .idle_ms = 0,
+            .keepalive_probes = 0,
+            .nagle_pending = false,
+            .sack_permitted = false,
+            .sack_blocks = @splat(.{ .left = 0, .right = 0 }),
+            .sack_block_count = 0,
+            .sack_scoreboard = @splat(.{ .left = 0, .right = 0 }),
+            .sack_scoreboard_count = 0,
             .active = false,
             .owner_task = 0,
+            .options = .{},
         };
     }
 }
@@ -133,6 +216,25 @@ fn allocTcb() ?*TcpTcb {
             tcbs[i].recv_tail = 0;
             tcbs[i].retransmit_timer = 0;
             tcbs[i].retransmit_count = 0;
+            tcbs[i].cwnd = TCP_MSS;
+            tcbs[i].ssthresh = 65535;
+            tcbs[i].dup_ack_count = 0;
+            tcbs[i].in_recovery = false;
+            tcbs[i].recover_seq = 0;
+            tcbs[i].snd_wnd_scale = 0;
+            tcbs[i].rcv_wnd_scale = 2;
+            tcbs[i].ws_requested = 2;
+            tcbs[i].ws_enabled = false;
+            tcbs[i].ts_recent = 0;
+            tcbs[i].ts_val_last = 0;
+            tcbs[i].ts_enabled = false;
+            tcbs[i].srtt = 0;
+            tcbs[i].rttvar = 0;
+            tcbs[i].rto = RETRANSMIT_MS;
+            tcbs[i].idle_ms = 0;
+            tcbs[i].keepalive_probes = 0;
+            tcbs[i].nagle_pending = false;
+            tcbs[i].options = .{};
             return &tcbs[i];
         }
     }
@@ -144,10 +246,7 @@ fn findTcbByTuple(local_port: u16, remote_port: u16, remote_ip: [4]u8) ?*TcpTcb 
         if (tcbs[i].active and
             tcbs[i].local_port == local_port and
             tcbs[i].remote_port == remote_port and
-            tcbs[i].remote_ip[0] == remote_ip[0] and
-            tcbs[i].remote_ip[1] == remote_ip[1] and
-            tcbs[i].remote_ip[2] == remote_ip[2] and
-            tcbs[i].remote_ip[3] == remote_ip[3])
+            @as(u32, @bitCast(tcbs[i].remote_ip)) == @as(u32, @bitCast(remote_ip)))
         {
             return &tcbs[i];
         }
@@ -169,6 +268,14 @@ fn allocEphemeralPort() u16 {
     next_ephemeral_port +|= 1;
     if (next_ephemeral_port < 49152) next_ephemeral_port = 49152;
     return port;
+}
+
+/// Get a mutable pointer to the socket options for a TCB.
+/// Returns null if tcb_idx is invalid or TCB is inactive.
+pub fn tcpGetOptionsPtr(tcb_idx: u32) ?*socket_opt.SocketOptions {
+    if (tcb_idx >= MAX_CONNECTIONS) return null;
+    if (!tcbs[tcb_idx].active) return null;
+    return &tcbs[tcb_idx].options;
 }
 
 fn generateIss() u32 {
@@ -199,6 +306,8 @@ fn ringDataLen(head: u32, tail: u32, comptime size: u32) u32 {
 var send_pkt: [1518]u8 = @splat(0);
 
 /// Build and send a TCP segment.
+/// When `include_options` is true (SYN/SYN-ACK segments), TCP options are
+/// included: Window Scaling option (kind 3) and Timestamps option (kind 8).
 fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
     const dst_mac = arp.resolve(tcb.remote_ip) orelse {
         serial.writeString("[tcp] ARP resolution failed\n");
@@ -212,49 +321,117 @@ fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
     const tcp_off = 34;
     const seq = tcb.snd_nxt;
     const ack = if (flags & ACK != 0) tcb.rcv_nxt else 0;
-    const data_offset_val: u8 = 5; // 20 bytes, no options
-    const window: u16 = @truncate(tcb.rcv_wnd);
+
+    // Build TCP options if this is a SYN segment
+    var opt_buf: [48]u8 = @splat(0); // max options: 48 bytes (SACK blocks need space)
+    var opt_len: u8 = 0;
+    const is_syn = (flags & SYN) != 0;
+
+    if (is_syn) {
+        // Window Scaling option: kind=3, len=3, shift_count
+        opt_buf[opt_len] = 3; // kind
+        opt_buf[opt_len + 1] = 3; // length
+        opt_buf[opt_len + 2] = @intCast(tcb.ws_requested); // shift count
+        opt_len += 3;
+
+        // Timestamps option: kind=8, len=10, TSVAL, TSECR
+        const now_ms = timestampMs();
+        tcb.ts_val_last = now_ms;
+        opt_buf[opt_len] = 8; // kind
+        opt_buf[opt_len + 1] = 10; // length
+        bo.writeU32BeAt(&opt_buf, opt_len + 2, now_ms);
+        // TSECR = ts_recent
+        bo.writeU32BeAt(&opt_buf, opt_len + 6, tcb.ts_recent);
+        opt_len += 10;
+
+        // SACK-Permitted: kind=4, len=2
+        opt_buf[opt_len] = 4;
+        opt_buf[opt_len + 1] = 2;
+        opt_len += 2;
+
+        // Pad to 4-byte boundary
+        while (opt_len % 4 != 0) : (opt_len += 1) {
+            opt_buf[opt_len] = 1; // NOP
+        }
+    } else {
+        // Non-SYN: timestamps if enabled
+        if (tcb.ts_enabled) {
+            const now_ms = timestampMs();
+            tcb.ts_val_last = now_ms;
+            opt_buf[opt_len] = 8; // kind
+            opt_buf[opt_len + 1] = 10; // length
+            bo.writeU32BeAt(&opt_buf, opt_len + 2, now_ms);
+            bo.writeU32BeAt(&opt_buf, opt_len + 6, tcb.ts_recent);
+            opt_len += 10;
+        }
+
+        // SACK blocks: kind=5, len=2+8*N (only if SACK negotiated and blocks available)
+        if (tcb.sack_permitted and tcb.sack_block_count > 0 and (flags & ACK != 0)) {
+            const num_blocks = tcb.sack_block_count;
+            const sack_len: u8 = 2 + @as(u8, num_blocks) * 8;
+            opt_buf[opt_len] = 5; // kind
+            opt_buf[opt_len + 1] = sack_len;
+            opt_len += 2;
+            var bi: u3 = 0;
+            while (bi < num_blocks) : (bi += 1) {
+                const blk = &tcb.sack_blocks[bi];
+                bo.writeU32BeAt(&opt_buf, opt_len, blk.left);
+                bo.writeU32BeAt(&opt_buf, opt_len + 4, blk.right);
+                opt_len += 8;
+            }
+            // Clear SACK blocks after sending (they are one-time reports)
+            tcb.sack_block_count = 0;
+        }
+
+        // Pad to 4-byte boundary
+        while (opt_len % 4 != 0) : (opt_len += 1) {
+            opt_buf[opt_len] = 1; // NOP
+        }
+    }
+
+    const data_offset_val: u8 = @intCast((20 + opt_len) / 4); // in 32-bit words
+
+    // Window: apply receive window scaling
+    const raw_window: u16 = if (tcb.ws_enabled) blk: {
+        const scaled = tcb.rcv_wnd >> @intCast(tcb.snd_wnd_scale);
+        break :blk if (scaled > 0xFFFF) 0xFFFF else @intCast(scaled);
+    } else @truncate(tcb.rcv_wnd);
 
     // Source port
-    send_pkt[tcp_off + 0] = @intCast((tcb.local_port >> 8) & 0xFF);
-    send_pkt[tcp_off + 1] = @intCast(tcb.local_port & 0xFF);
+    bo.writeU16BeAt(&send_pkt, tcp_off + 0, tcb.local_port);
     // Destination port
-    send_pkt[tcp_off + 2] = @intCast((tcb.remote_port >> 8) & 0xFF);
-    send_pkt[tcp_off + 3] = @intCast(tcb.remote_port & 0xFF);
+    bo.writeU16BeAt(&send_pkt, tcp_off + 2, tcb.remote_port);
     // Sequence number
-    send_pkt[tcp_off + 4] = @intCast((seq >> 24) & 0xFF);
-    send_pkt[tcp_off + 5] = @intCast((seq >> 16) & 0xFF);
-    send_pkt[tcp_off + 6] = @intCast((seq >> 8) & 0xFF);
-    send_pkt[tcp_off + 7] = @intCast(seq & 0xFF);
+    bo.writeU32BeAt(&send_pkt, tcp_off + 4, seq);
     // Acknowledgment number
-    send_pkt[tcp_off + 8] = @intCast((ack >> 24) & 0xFF);
-    send_pkt[tcp_off + 9] = @intCast((ack >> 16) & 0xFF);
-    send_pkt[tcp_off + 10] = @intCast((ack >> 8) & 0xFF);
-    send_pkt[tcp_off + 11] = @intCast(ack & 0xFF);
+    bo.writeU32BeAt(&send_pkt, tcp_off + 8, ack);
     // Data offset (4 bits) + reserved (4 bits)
     send_pkt[tcp_off + 12] = data_offset_val << 4;
     // Flags
     send_pkt[tcp_off + 13] = flags;
     // Window
-    send_pkt[tcp_off + 14] = @intCast((window >> 8) & 0xFF);
-    send_pkt[tcp_off + 15] = @intCast(window & 0xFF);
-    // Checksum placeholder
+    bo.writeU16BeAt(&send_pkt, tcp_off + 14, raw_window);
+    // Checksum placeholder + Urgent pointer
     send_pkt[tcp_off + 16] = 0;
     send_pkt[tcp_off + 17] = 0;
-    // Urgent pointer
     send_pkt[tcp_off + 18] = 0;
     send_pkt[tcp_off + 19] = 0;
 
-    // Copy data after TCP header
+    // Copy options after fixed header
+    if (opt_len > 0) {
+        @memcpy(send_pkt[tcp_off + 20 .. tcp_off + 20 + opt_len], opt_buf[0..opt_len]);
+    }
+
+    // Copy data after header + options
+    const hdr_total = 20 + opt_len;
     if (data_len > 0) {
-        @memcpy(send_pkt[tcp_off + 20 .. tcp_off + 20 + data_len], data[0..data_len]);
+        @memcpy(send_pkt[tcp_off + hdr_total .. tcp_off + hdr_total + data_len], data[0..data_len]);
     }
 
     // Calculate TCP checksum (with pseudo-header)
-    const tcp_total: u16 = 20 + data_len;
-    const csum = tcpChecksum(our_ip, tcb.remote_ip, send_pkt[tcp_off ..].ptr, tcp_total);
-    send_pkt[tcp_off + 16] = @intCast((csum >> 8) & 0xFF);
-    send_pkt[tcp_off + 17] = @intCast(csum & 0xFF);
+    const tcp_total: u16 = @intCast(hdr_total + data_len);
+    const csum = tcpChecksum(our_ip, tcb.remote_ip, send_pkt[tcp_off..].ptr, tcp_total);
+    bo.writeU16BeAt(&send_pkt, tcp_off + 16, csum);
 
     // Build IPv4 header
     ipv4.buildHeader(send_pkt[14..].ptr, our_ip, tcb.remote_ip, ipv4.PROTO_TCP, tcp_total);
@@ -279,43 +456,126 @@ fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
     return true;
 }
 
-/// TCP checksum with IPv4 pseudo-header.
+/// Get a monotonically increasing millisecond timestamp for TCP timestamps.
+fn timestampMs() u32 {
+    const idt = @import("../arch/x86_64/idt.zig");
+    return @truncate(idt.getTickCount() * 10); // ticks are ~10ms each, convert to ms
+}
+
+/// TCP checksum with IPv4 pseudo-header — uses optimized ipv4.checksum.
 fn tcpChecksum(src_ip: [4]u8, dst_ip: [4]u8, tcp_hdr: [*]const u8, tcp_len: u16) u16 {
-    var sum: u32 = 0;
+    // Build pseudo-header for checksum computation
+    var pseudo: [12]u8 = undefined;
+    @memcpy(pseudo[0..4], &src_ip);
+    @memcpy(pseudo[4..8], &dst_ip);
+    pseudo[8] = 0; // zero
+    pseudo[9] = 6; // TCP protocol
+    bo.writeU16BeAt(&pseudo, 10, tcp_len);
 
-    // Pseudo-header
-    sum +%= (@as(u32, src_ip[0]) << 8) | @as(u32, src_ip[1]);
-    sum +%= (@as(u32, src_ip[2]) << 8) | @as(u32, src_ip[3]);
-    sum +%= (@as(u32, dst_ip[0]) << 8) | @as(u32, dst_ip[1]);
-    sum +%= (@as(u32, dst_ip[2]) << 8) | @as(u32, dst_ip[3]);
-    sum +%= @as(u32, 6); // protocol
-    sum +%= @as(u32, tcp_len);
+    const pseudo_csum = ipv4.checksum(&pseudo, 12);
+    const data_csum = ipv4.checksum(tcp_hdr, tcp_len);
 
-    // TCP header + data
-    const words = tcp_len / 2;
-    for (0..words) |i| {
-        sum +%= (@as(u32, tcp_hdr[i * 2]) << 8) | @as(u32, tcp_hdr[i * 2 + 1]);
-    }
-    if (tcp_len % 2 == 1) {
-        sum +%= @as(u32, tcp_hdr[tcp_len - 1]) << 8;
-    }
-
-    // Fold
-    while (sum > 0xFFFF) {
-        const carry = sum >> 16;
-        sum = (sum & 0xFFFF) + carry;
-        if (carry == 0) break;
-    }
+    // Combine: ~(~pseudo + ~data) = fold sum of both
+    var sum: u32 = @as(u32, ~pseudo_csum & 0xFFFF) + @as(u32, ~data_csum & 0xFFFF);
+    sum = (sum & 0xFFFF) + (sum >> 16);
     return @truncate(~sum);
 }
 
 // ─── Incoming Packet Handling ─────────────────────────────────────────────
 
+/// Parsed TCP options from an incoming segment.
+const TcpOptions = struct {
+    ws_shift: ?u4 = null, // window scale shift count (kind 3)
+    ts_val: ?u32 = null, // timestamp value (kind 8)
+    ts_ecr: ?u32 = null, // timestamp echo reply (kind 8)
+    sack_permitted: bool = false, // SACK-Permitted (kind 4)
+    sack_blocks: [4]SackBlock = @splat(.{ .left = 0, .right = 0 }),
+    sack_block_count: u3 = 0,
+};
+
+/// Parse TCP options from the header (between byte 20 and data_offset).
+fn parseTcpOptions(data: [*]const u8, data_offset: u16) TcpOptions {
+    var opts = TcpOptions{};
+    var pos: u16 = 20; // start of options
+    while (pos + 1 < data_offset) {
+        const kind = data[pos];
+        switch (kind) {
+            0 => break, // End of Options List
+            1 => pos += 1, // NOP — no length field
+            3 => { // Window Scale
+                if (pos + 2 < data_offset and data[pos + 1] == 3) {
+                    opts.ws_shift = @intCast(data[pos + 2] & 0x0F);
+                }
+                pos += 3;
+            },
+            8 => { // Timestamps
+                if (pos + 9 < data_offset and data[pos + 1] == 10) {
+                    opts.ts_val = bo.readU32BeAt(data, pos + 2);
+                    opts.ts_ecr = bo.readU32BeAt(data, pos + 6);
+                }
+                pos += 10;
+            },
+            4 => { // SACK-Permitted (kind=4, len=2)
+                if (pos + 1 < data_offset and data[pos + 1] == 2) {
+                    opts.sack_permitted = true;
+                }
+                pos += 2;
+            },
+            5 => { // SACK blocks (kind=5, len=2+8*N)
+                if (pos + 1 < data_offset) {
+                    const sack_len = data[pos + 1];
+                    if (sack_len >= 10) { // at least 1 block
+                        const num_blocks: u3 = @intCast(@min((sack_len - 2) / 8, 4));
+                        var b: u3 = 0;
+                        while (b < num_blocks) : (b += 1) {
+                            const boff = pos + 2 + @as(u16, b) * 8;
+                            if (boff + 7 < data_offset) {
+                                const left = bo.readU32BeAt(data, boff);
+                                const right = bo.readU32BeAt(data, boff + 4);
+                                opts.sack_blocks[b] = .{ .left = left, .right = right };
+                            }
+                        }
+                        opts.sack_block_count = num_blocks;
+                    }
+                    pos += sack_len;
+                } else break;
+            },
+            else => {
+                // Unknown option: read length and skip
+                if (pos + 1 < data_offset) {
+                    const len = data[pos + 1];
+                    if (len < 2) break; // malformed
+                    pos += len;
+                } else break;
+            },
+        }
+    }
+    return opts;
+}
+
+/// Update RTT estimation using Jacobson/Karels algorithm.
+/// `m` is the measured RTT sample in milliseconds.
+fn updateRtt(tcb: *TcpTcb, m: u32) void {
+    if (tcb.srtt == 0) {
+        // First measurement
+        tcb.srtt = m;
+        tcb.rttvar = m / 2;
+    } else {
+        // Jacobson/Karels
+        const delta = if (m >= tcb.srtt) m - tcb.srtt else tcb.srtt - m;
+        tcb.rttvar = (3 * tcb.rttvar + delta) / 4;
+        tcb.srtt = (7 * tcb.srtt + m) / 8;
+    }
+    tcb.rto = tcb.srtt + @max(200, 4 * tcb.rttvar);
+    if (tcb.rto < TCP_RTO_MIN) tcb.rto = TCP_RTO_MIN;
+    if (tcb.rto > TCP_RTO_MAX) tcb.rto = TCP_RTO_MAX;
+}
+
 /// Called from net/mod.zig when an IPv4 packet with protocol=6 is received.
 /// Handle an incoming SYN for a listening socket.
 /// Creates a new TCB in SYN_RECEIVED state, sends SYN-ACK,
 /// and queues it in the listen backlog.
-fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16) void {
+fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions) void {
     _ = _w;
     // Find listen slot for this port
     var slot: ?*ListenSlot = null;
@@ -326,6 +586,44 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
         }
     }
     const ls = slot orelse return;
+
+    // T17: Allow TCB reuse for TIME_WAIT connections (if ISN is larger)
+    for (0..MAX_CONNECTIONS) |i| {
+        if (tcbs[i].active and tcbs[i].state == .time_wait and
+            tcbs[i].local_port == dst_port and
+            tcbs[i].remote_port == src_port and
+            @as(u32, @bitCast(seq_num -% tcbs[i].irs)) > 0)
+        {
+            // Reuse this TIME_WAIT TCB
+            const reuse_tcb = &tcbs[i];
+            reuse_tcb.iss = generateIss();
+            reuse_tcb.snd_una = reuse_tcb.iss;
+            reuse_tcb.snd_nxt = reuse_tcb.iss;
+            reuse_tcb.irs = seq_num;
+            reuse_tcb.rcv_nxt = seq_num + 1;
+            reuse_tcb.rcv_wnd = TCP_WINDOW;
+            reuse_tcb.state = .syn_received;
+            reuse_tcb.retransmit_timer = 0;
+            reuse_tcb.sack_block_count = 0;
+            reuse_tcb.sack_scoreboard_count = 0;
+
+            if (opts.ws_shift) |peer_ws| {
+                reuse_tcb.snd_wnd_scale = peer_ws;
+                reuse_tcb.ws_enabled = true;
+            }
+            if (opts.ts_val) |tv| {
+                reuse_tcb.ts_recent = tv;
+                reuse_tcb.ts_enabled = true;
+            }
+            if (opts.sack_permitted) {
+                reuse_tcb.sack_permitted = true;
+            }
+
+            _ = sendSegment(reuse_tcb, SYN | ACK, undefined, 0);
+            serial.writeString("[tcp] TIME_WAIT reuse → SYN-ACK\n");
+            return;
+        }
+    }
 
     // Check backlog capacity
     if (ls.pending_count >= LISTEN_BACKLOG) return;
@@ -344,6 +642,23 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
     new_tcb.rcv_nxt = seq_num + 1;
     new_tcb.rcv_wnd = TCP_WINDOW;
     new_tcb.state = .syn_received;
+
+    // Negotiate Window Scaling
+    if (opts.ws_shift) |peer_ws| {
+        new_tcb.snd_wnd_scale = peer_ws; // peer's scale → we apply when reading their window
+        new_tcb.ws_enabled = true;
+    }
+
+    // Negotiate Timestamps
+    if (opts.ts_val) |tv| {
+        new_tcb.ts_recent = tv;
+        new_tcb.ts_enabled = true;
+    }
+
+    // Negotiate SACK-Permitted
+    if (opts.sack_permitted) {
+        new_tcb.sack_permitted = true;
+    }
 
     // Send SYN-ACK
     _ = sendSegment(new_tcb, SYN | ACK, undefined, 0);
@@ -368,17 +683,18 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
     if (len < 20) return;
 
     // Parse TCP header
-    const src_port = (@as(u16, data[0]) << 8) | @as(u16, data[1]);
-    const dst_port = (@as(u16, data[2]) << 8) | @as(u16, data[3]);
-    const seq_num = (@as(u32, data[4]) << 24) | (@as(u32, data[5]) << 16) |
-        (@as(u32, data[6]) << 8) | @as(u32, data[7]);
-    const ack_num = (@as(u32, data[8]) << 24) | (@as(u32, data[9]) << 16) |
-        (@as(u32, data[10]) << 8) | @as(u32, data[11]);
+    const src_port = bo.readU16BeAt(data, 0);
+    const dst_port = bo.readU16BeAt(data, 2);
+    const seq_num = bo.readU32BeAt(data, 4);
+    const ack_num = bo.readU32BeAt(data, 8);
     const data_offset = (@as(u16, data[12]) >> 4) * 4;
     const flags = data[13];
-    const window = (@as(u16, data[14]) << 8) | @as(u16, data[15]);
+    const raw_window = bo.readU16BeAt(data, 14);
 
     if (data_offset < 20 or data_offset > len) return;
+
+    // Parse TCP options
+    const opts = parseTcpOptions(data, data_offset);
 
     const payload_offset = data_offset;
     const payload_len: u32 = if (len > data_offset) len - data_offset else 0;
@@ -387,11 +703,22 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
     const tcb = findTcbByTuple(dst_port, src_port, src_ip) orelse {
         // No matching connection — check if any socket is listening on this port
         if (flags & SYN != 0) {
-            handleIncomingSyn(src_ip, src_port, dst_port, seq_num, window);
+            handleIncomingSyn(src_ip, src_port, dst_port, seq_num, raw_window, opts);
         }
         // Otherwise send RST (or just ignore)
         return;
     };
+
+    // Update ts_recent for PAWS
+    if (opts.ts_val) |tv| {
+        tcb.ts_recent = tv;
+    }
+
+    // Apply window scaling to the received window value
+    const window: u32 = if (tcb.ws_enabled)
+        @as(u32, raw_window) << @intCast(tcb.snd_wnd_scale)
+    else
+        raw_window;
 
     // State machine processing
     switch (tcb.state) {
@@ -404,10 +731,46 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                 tcb.snd_wnd = window;
                 tcb.state = .established;
 
+                // Negotiate Window Scaling from SYN-ACK options
+                if (opts.ws_shift) |peer_ws| {
+                    tcb.snd_wnd_scale = peer_ws;
+                    tcb.ws_enabled = true;
+                }
+
+                // Negotiate Timestamps from SYN-ACK options
+                if (opts.ts_val) |tv| {
+                    tcb.ts_recent = tv;
+                    tcb.ts_enabled = true;
+                }
+
+                // Negotiate SACK-Permitted
+                if (opts.sack_permitted) {
+                    tcb.sack_permitted = true;
+                }
+
+                // RTT measurement: if our SYN carried ts_val_last and
+                // the ACK echoes it back, measure initial RTT.
+                if (opts.ts_ecr) |ecr| {
+                    if (ecr == tcb.ts_val_last) {
+                        const now = timestampMs();
+                        const rtt_sample = now -% ecr;
+                        updateRtt(tcb, rtt_sample);
+                    }
+                }
+
+                // Initialize cwnd after handshake
+                tcb.cwnd = TCP_MSS;
+                tcb.dup_ack_count = 0;
+                tcb.in_recovery = false;
+
                 // Send ACK to complete handshake
                 _ = sendSegment(tcb, ACK, undefined, 0);
 
                 serial.writeString("[tcp] connection established\n");
+
+                // epoll: connection is now writable (EPOLLOUT).
+                const epoll_mod = @import("epoll.zig");
+                epoll_mod.epollNotify(.tcp_socket, tcbIdx(tcb), epoll_mod.EPOLLOUT);
             } else if (flags & SYN != 0) {
                 // Simultaneous open — not supported, send RST
             }
@@ -420,6 +783,10 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                 tcb.state = .established;
                 tcb.retransmit_timer = 0;
                 serial.writeString("[tcp] server: connection established (ACK received)\n");
+
+                // epoll: server-side connection established.
+                const epoll_mod2 = @import("epoll.zig");
+                epoll_mod2.epollNotify(.tcp_socket, tcbIdx(tcb), epoll_mod2.EPOLLOUT);
             }
         },
         .established => {
@@ -433,6 +800,97 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                         tcb.send_unacked = (tcb.send_unacked + acked) % SEND_BUF_SIZE;
                         tcb.retransmit_timer = 0;
                         tcb.retransmit_count = 0;
+                        // Clear SACK scoreboard — all data up to ack_num is acknowledged
+                        tcb.sack_scoreboard_count = 0;
+
+                        // Keepalive: reset idle timer and probe count on new ACK
+                        tcb.idle_ms = 0;
+                        tcb.keepalive_probes = 0;
+
+                        // Nagle: if data was pending and in-flight is now empty, flush
+                        // This is also handled in timerTick, but check here for faster response
+                        if (tcb.nagle_pending and tcb.snd_nxt == tcb.snd_una) {
+                            tcb.nagle_pending = false;
+                            flushSendBuffer(tcb);
+                        }
+
+                        // RTT measurement via timestamps
+                        if (tcb.ts_enabled) {
+                            if (opts.ts_ecr) |ecr| {
+                                if (ecr == tcb.ts_val_last) {
+                                    const now = timestampMs();
+                                    const rtt_sample = now -% ecr;
+                                    updateRtt(tcb, rtt_sample);
+                                }
+                            }
+                        }
+
+                        // TCP Reno: congestion control on new ACK
+                        if (tcb.in_recovery) {
+                            // Fast recovery: partial ACK
+                            // Shrink cwnd by the amount acked (Reno partial)
+                            if (tcb.cwnd > acked) {
+                                tcb.cwnd -= @intCast(acked);
+                            } else {
+                                tcb.cwnd = TCP_MSS;
+                            }
+                            // If this ACK covers recover_seq, exit recovery
+                            if (ack_num -% 1 >= tcb.recover_seq) {
+                                tcb.in_recovery = false;
+                                // Set cwnd to ssthresh (deflate)
+                                tcb.cwnd = tcb.ssthresh;
+                                tcb.dup_ack_count = 0;
+                            }
+                        } else {
+                            // Normal: increase cwnd
+                            if (tcb.cwnd < tcb.ssthresh) {
+                                // Slow start: exponential growth
+                                tcb.cwnd += @intCast(acked);
+                            } else {
+                                // Congestion avoidance: additive increase
+                                // cwnd += MSS * MSS / cwnd per full MSS acked
+                                const inc = (@as(u32, TCP_MSS) * @as(u32, TCP_MSS)) / @max(tcb.cwnd, 1);
+                                tcb.cwnd += inc;
+                            }
+                            tcb.dup_ack_count = 0;
+                        }
+
+                        // epoll: send buffer space freed.
+                        const epoll_ack = @import("epoll.zig");
+                        epoll_ack.epollNotify(.tcp_socket, tcbIdx(tcb), epoll_ack.EPOLLOUT);
+                    }
+                } else {
+                    // Duplicate ACK (ack_num == snd_una)
+                    if (payload_len == 0) {
+                        // Update SACK scoreboard from received SACK blocks
+                        if (opts.sack_block_count > 0) {
+                            tcb.sack_scoreboard_count = opts.sack_block_count;
+                            for (0..opts.sack_block_count) |si| {
+                                tcb.sack_scoreboard[si] = opts.sack_blocks[si];
+                            }
+                        }
+
+                        tcb.dup_ack_count += 1;
+
+                        if (!tcb.in_recovery and tcb.dup_ack_count >= 3) {
+                            // Fast retransmit + fast recovery
+                            tcb.in_recovery = true;
+                            tcb.recover_seq = tcb.snd_nxt;
+                            tcb.ssthresh = @max(tcb.cwnd / 2, 2 * @as(u32, TCP_MSS));
+                            tcb.cwnd = tcb.ssthresh + 3 * @as(u32, TCP_MSS);
+
+                            // Retransmit the first non-SACKed segment
+                            tcb.snd_nxt = tcb.snd_una;
+                            const unacked = tcb.send_tail -% tcb.send_head;
+                            if (unacked > 0 and unacked <= SEND_BUF_SIZE) {
+                                tcb.send_unacked = tcb.send_head;
+                                flushSendBuffer(tcb);
+                            }
+                            serial.writeString("[tcp] fast retransmit\n");
+                        } else if (tcb.in_recovery) {
+                            // Fast recovery: inflate cwnd by 1 MSS per dup ACK
+                            tcb.cwnd += @as(u32, TCP_MSS);
+                        }
                     }
                 }
                 tcb.snd_wnd = window;
@@ -441,14 +899,20 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
             // Process incoming data
             if (payload_len > 0) {
                 processIncomingData(tcb, data + payload_offset, payload_len, seq_num);
+                // epoll: data available to read.
+                const epoll_in = @import("epoll.zig");
+                epoll_in.epollNotify(.tcp_socket, tcbIdx(tcb), epoll_in.EPOLLIN);
             }
 
             // Handle FIN
             if (flags & FIN != 0) {
-                tcb.rcv_nxt +%= 1; // FIN consumes one seq number
+                tcb.rcv_nxt +%= 1;
                 tcb.state = .close_wait;
                 _ = sendSegment(tcb, ACK, undefined, 0);
                 serial.writeString("[tcp] remote closed (FIN received)\n");
+                // epoll: peer closed.
+                const epoll_fin = @import("epoll.zig");
+                epoll_fin.epollNotify(.tcp_socket, tcbIdx(tcb), epoll_fin.EPOLLIN | epoll_fin.EPOLLHUP);
             }
         },
         .fin_wait_1 => {
@@ -470,6 +934,8 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
         .fin_wait_2 => {
             if (payload_len > 0) {
                 processIncomingData(tcb, data + payload_offset, payload_len, seq_num);
+                const epoll_fw2 = @import("epoll.zig");
+                epoll_fw2.epollNotify(.tcp_socket, tcbIdx(tcb), epoll_fw2.EPOLLIN);
             }
             if (flags & FIN != 0) {
                 tcb.rcv_nxt +%= 1;
@@ -486,9 +952,10 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
             }
         },
         .close_wait => {
-            // Already in close_wait, waiting for app to close
             if (payload_len > 0) {
                 processIncomingData(tcb, data + payload_offset, payload_len, seq_num);
+                const epoll_cw = @import("epoll.zig");
+                epoll_cw.epollNotify(.tcp_socket, tcbIdx(tcb), epoll_cw.EPOLLIN);
             }
         },
         .closing => {
@@ -512,7 +979,12 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
 fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) void {
     // Check if this is the expected sequence
     if (seq != tcb.rcv_nxt) {
-        // Out-of-order — not supported, just ACK with expected seq
+        // Out-of-order segment — record SACK block if SACK is negotiated
+        if (tcb.sack_permitted and len > 0) {
+            // Add/update SACK block for this out-of-order segment
+            addSackBlock(tcb, seq, seq + len);
+        }
+        // Send ACK with expected seq (and SACK blocks if available)
         _ = sendSegment(tcb, ACK, undefined, 0);
         return;
     }
@@ -637,14 +1109,23 @@ pub fn tcpSend(tcb_idx: u32, data: [*]const u8, len: u32) i64 {
 }
 
 /// Flush pending send data as TCP segments.
+/// Uses min(cwnd, snd_wnd) as the effective send window.
 fn flushSendBuffer(tcb: *TcpTcb) void {
     while (true) {
         const pending = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
         const in_flight = tcb.snd_nxt -% tcb.snd_una;
-        const window_avail = if (tcb.snd_wnd > in_flight) tcb.snd_wnd - in_flight else 0;
+        const effective_wnd = @min(tcb.cwnd, tcb.snd_wnd);
+        const window_avail = if (effective_wnd > in_flight) effective_wnd - in_flight else 0;
         const can_send = @min(pending, window_avail, TCP_MSS);
 
         if (can_send == 0) break;
+
+        // Nagle algorithm: if TCP_NODELAY is disabled and there is unacknowledged
+        // data in flight, only send a full MSS segment (coalesce small writes).
+        if (!tcb.options.tcp_nodelay and in_flight > 0 and can_send < TCP_MSS) {
+            tcb.nagle_pending = true;
+            break;
+        }
 
         // Collect data from ring buffer
         var seg_buf: [TCP_MSS]u8 = undefined;
@@ -683,6 +1164,12 @@ pub fn tcpRecv(tcb_idx: u32, buf: [*]u8, len: u32) i64 {
     }
 
     tcb.rcv_wnd = TCP_WINDOW - ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
+
+    // T15: Send window update ACK if window grew significantly (> 1 MSS)
+    // This helps the sender know about available buffer space promptly.
+    if (to_read > TCP_MSS and tcb.state == .established) {
+        _ = sendSegment(tcb, ACK, undefined, 0);
+    }
 
     return @intCast(to_read);
 }
@@ -732,15 +1219,16 @@ pub fn isClosed(tcb_idx: u32) bool {
 }
 
 /// Timer tick — called periodically to handle retransmission.
+/// Uses the per-TCB RTO (Jacobson/Karels) instead of a fixed timeout.
 pub fn timerTick(ms_elapsed: u32) void {
     for (0..MAX_CONNECTIONS) |i| {
         const tcb = &tcbs[i];
         if (!tcb.active) continue;
         if (tcb.state == .closed or tcb.state == .time_wait) {
-            // Clean up TIME_WAIT after 30 seconds
+            // Clean up TIME_WAIT after 15 seconds (reduced from 2*MSL=60s)
             if (tcb.state == .time_wait) {
                 tcb.retransmit_timer +%= ms_elapsed;
-                if (tcb.retransmit_timer >= 30000) {
+                if (tcb.retransmit_timer >= 15000) {
                     tcb.state = .closed;
                     tcb.active = false;
                     serial.writeString("[tcp] TIME_WAIT → CLOSED (timeout)\n");
@@ -752,7 +1240,9 @@ pub fn timerTick(ms_elapsed: u32) void {
         // Check for unacknowledged data
         if (tcb.snd_nxt != tcb.snd_una) {
             tcb.retransmit_timer +%= ms_elapsed;
-            if (tcb.retransmit_timer >= RETRANSMIT_MS) {
+            // Use per-TCB RTO if available, otherwise fall back to RETRANSMIT_MS
+            const current_rto = if (tcb.rto > 0) tcb.rto else RETRANSMIT_MS;
+            if (tcb.retransmit_timer >= current_rto) {
                 tcb.retransmit_timer = 0;
                 tcb.retransmit_count += 1;
                 if (tcb.retransmit_count > 5) {
@@ -762,6 +1252,15 @@ pub fn timerTick(ms_elapsed: u32) void {
                     tcb.active = false;
                     continue;
                 }
+                // RTO timeout: Reno behavior — ssthresh = cwnd/2, cwnd = 1 MSS
+                tcb.ssthresh = @max(tcb.cwnd / 2, 2 * @as(u32, TCP_MSS));
+                tcb.cwnd = @as(u32, TCP_MSS); // back to slow start
+                tcb.in_recovery = false;
+                tcb.dup_ack_count = 0;
+
+                // Exponential backoff for RTO
+                tcb.rto = @min(tcb.rto * 2, TCP_RTO_MAX);
+
                 // Retransmit: reset snd_nxt back to snd_una and re-flush
                 tcb.snd_nxt = tcb.snd_una;
                 // Reset send_unacked to send_head to resend buffered data
@@ -777,15 +1276,47 @@ pub fn timerTick(ms_elapsed: u32) void {
                     // Retransmit FIN
                     _ = sendSegment(tcb, FIN | ACK, undefined, 0);
                 }
-                serial.writeString("[tcp] retransmit\n");
+                serial.writeString("[tcp] RTO retransmit\n");
             }
+        }
+
+        // ── Keepalive logic ──────────────────────────────────────────────
+        // Only for established connections with SO_KEEPALIVE enabled
+        if (tcb.state == .established and tcb.options.keep_alive) {
+            tcb.idle_ms +%= ms_elapsed;
+            const keep_idle_ms = tcb.options.keep_idle * 1000;
+            const keep_intvl_ms = tcb.options.keep_intvl * 1000;
+
+            if (tcb.idle_ms >= keep_idle_ms and tcb.keepalive_probes == 0) {
+                // First keepalive probe
+                tcb.keepalive_probes = 1;
+                _ = sendSegment(tcb, ACK, undefined, 0); // Send empty ACK as probe
+            } else if (tcb.keepalive_probes > 0 and tcb.idle_ms >= keep_idle_ms + tcb.keepalive_probes * keep_intvl_ms) {
+                if (tcb.keepalive_probes >= tcb.options.keep_cnt) {
+                    // Max probes reached — connection is dead
+                    serial.writeString("[tcp] keepalive timeout, closing\n");
+                    tcb.state = .closed;
+                    tcb.active = false;
+                    continue;
+                }
+                tcb.keepalive_probes += 1;
+                _ = sendSegment(tcb, ACK, undefined, 0); // Send probe
+            }
+        }
+
+        // ── Nagle delayed data flush ──────────────────────────────────────
+        // If Nagle held data (nagle_pending), and all in-flight data is now ACKed,
+        // flush the pending data.
+        if (tcb.nagle_pending and tcb.snd_nxt == tcb.snd_una) {
+            tcb.nagle_pending = false;
+            flushSendBuffer(tcb);
         }
     }
 }
 
 // ─── Listening / Server Socket Support ──────────────────────────────────────
 
-const LISTEN_BACKLOG: u32 = 4;
+const LISTEN_BACKLOG: u32 = 32;
 
 const ListenSlot = struct {
     active: bool = false,
@@ -825,7 +1356,16 @@ pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
     if (!tcb.active or tcb.state != .closed) return -1;
 
     // Check if port is already in use
-    if (findTcbByLocalPort(port) != null) return -1;
+    // SO_REUSEADDR allows binding to a port in TIME_WAIT state
+    for (0..MAX_CONNECTIONS) |i| {
+        if (tcbs[i].active and tcbs[i].local_port == port) {
+            // Allow if SO_REUSEADDR is set and the existing connection is TIME_WAIT
+            if (tcb.options.reuse_addr and tcbs[i].state == .time_wait) {
+                continue;
+            }
+            return -1;
+        }
+    }
 
     tcb.local_port = port;
     return 0;
@@ -898,4 +1438,141 @@ pub fn getTcbIdx(tcb_idx: u32) ?u32 {
     if (tcb_idx >= MAX_CONNECTIONS) return null;
     if (!tcbs[tcb_idx].active) return null;
     return tcb_idx;
+}
+
+/// Return the number of bytes available to read in the receive buffer.
+pub fn tcpRecvAvailable(tcb_idx: u32) u32 {
+    if (tcb_idx >= MAX_CONNECTIONS) return 0;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active) return 0;
+    return ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
+}
+
+/// Return the number of bytes of free space in the send buffer.
+pub fn tcpSendSpace(tcb_idx: u32) u32 {
+    if (tcb_idx >= MAX_CONNECTIONS) return 0;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active) return 0;
+    return ringAvailable(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
+}
+
+/// Check if the TCP connection is in a closing state.
+pub fn tcpIsClosing(tcb_idx: u32) bool {
+    if (tcb_idx >= MAX_CONNECTIONS) return true;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active) return true;
+    return switch (tcb.state) {
+        .fin_wait_1, .fin_wait_2, .closing, .time_wait, .close_wait, .last_ack, .closed => true,
+        else => false,
+    };
+}
+
+/// Socket address info returned by tcpGetAddrInfo.
+pub const AddrInfo = struct {
+    local_port: u16,
+    remote_port: u16,
+    remote_ip: [4]u8,
+    local_ip: [4]u8,
+};
+
+/// Get address info for a TCB (for getsockname/getpeername).
+pub fn tcpGetAddrInfo(tcb_idx: u32) ?AddrInfo {
+    if (tcb_idx >= MAX_CONNECTIONS) return null;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active) return null;
+    const netif_mod = @import("netif.zig");
+    return .{
+        .local_port = tcb.local_port,
+        .remote_port = tcb.remote_port,
+        .remote_ip = tcb.remote_ip,
+        .local_ip = netif_mod.getOurIp(),
+    };
+}
+
+/// Shutdown one direction of a TCP connection.
+/// how: 0=SHUT_RD, 1=SHUT_WR, 2=SHUT_RDWR
+pub fn tcpShutdown(tcb_idx: u32, how: u32) i64 {
+    if (tcb_idx >= MAX_CONNECTIONS) return -1;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active) return -1;
+
+    switch (how) {
+        0 => {
+            // SHUT_RD: discard further received data
+            // Just advance rcv_nxt to effectively ignore future data
+            tcb.recv_head = tcb.recv_tail; // drain recv buffer
+        },
+        1 => {
+            // SHUT_WR: send FIN
+            switch (tcb.state) {
+                .established => {
+                    tcb.state = .fin_wait_1;
+                    _ = sendSegment(tcb, FIN | ACK, undefined, 0);
+                    serial.writeString("[tcp] shutdown FIN → FIN_WAIT_1\n");
+                },
+                .close_wait => {
+                    tcb.state = .last_ack;
+                    _ = sendSegment(tcb, FIN | ACK, undefined, 0);
+                    serial.writeString("[tcp] shutdown FIN → LAST_ACK\n");
+                },
+                else => {},
+            }
+        },
+        2 => {
+            // SHUT_RDWR: shutdown both directions
+            tcb.recv_head = tcb.recv_tail;
+            switch (tcb.state) {
+                .established => {
+                    tcb.state = .fin_wait_1;
+                    _ = sendSegment(tcb, FIN | ACK, undefined, 0);
+                    serial.writeString("[tcp] shutdown RDWR FIN → FIN_WAIT_1\n");
+                },
+                .close_wait => {
+                    tcb.state = .last_ack;
+                    _ = sendSegment(tcb, FIN | ACK, undefined, 0);
+                    serial.writeString("[tcp] shutdown RDWR FIN → LAST_ACK\n");
+                },
+                else => {
+                    tcb.state = .closed;
+                    tcb.active = false;
+                },
+            }
+        },
+        else => return -1,
+    }
+    return 0;
+}
+
+// ─── SACK Helpers ───────────────────────────────────────────────────────────
+
+/// Add or merge a SACK block on the receiver side.
+fn addSackBlock(tcb: *TcpTcb, left: u32, right: u32) void {
+    // Try to merge with existing blocks
+    for (0..tcb.sack_block_count) |i| {
+        const blk = &tcb.sack_blocks[i];
+        if (blk.left == right or blk.right == left) {
+            // Merge
+            if (left < blk.left) blk.left = left;
+            if (right > blk.right) blk.right = right;
+            return;
+        }
+        if (left >= blk.left and right <= blk.right) return; // already covered
+    }
+    // Add new block
+    if (tcb.sack_block_count < 4) {
+        tcb.sack_blocks[tcb.sack_block_count] = .{ .left = left, .right = right };
+        tcb.sack_block_count += 1;
+    } else {
+        // Replace the oldest (last) block
+        tcb.sack_blocks[3] = .{ .left = left, .right = right };
+    }
+}
+
+/// Check if a sequence number is covered by the SACK scoreboard (sender side).
+fn isSacked(tcb: *const TcpTcb, seq: u32) bool {
+    for (0..tcb.sack_scoreboard_count) |i| {
+        const blk = &tcb.sack_scoreboard[i];
+        if (seq -% blk.left < blk.right -% blk.left) return true;
+    }
+    return false;
 }

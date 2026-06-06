@@ -1,9 +1,11 @@
 /// ACPI parser — RSDP/XSDT/MADT/MCFG parsing.
-
 const hhdm = @import("../mm/hhdm.zig");
 const serial = @import("../arch/x86_64/serial.zig");
 const tables = @import("acpi_tables.zig");
 const main = @import("../main.zig");
+const fmt = @import("../lib/fmt.zig");
+const str = @import("../lib/str.zig");
+const bo = @import("../lib/byte_order.zig");
 
 pub const AcpiInfo = struct {
     rsdp: ?*const tables.RSDP,
@@ -43,13 +45,13 @@ pub fn init(rsdp_phys: u64) void {
     const rsdp: *const tables.RSDP = hhdm.physToPtr(tables.RSDP, rsdp_phys);
     info.rsdp = rsdp;
 
-    if (!memEql(rsdp.signature[0..], "RSD PTR ")) {
+    if (!str.eql(rsdp.signature[0..], "RSD PTR ")) {
         serial.writeString("[ACPI] Invalid RSDP signature\n");
         return;
     }
 
     serial.writeString("[ACPI] RSDP found, revision: ");
-    writeDecimal(rsdp.revision);
+    fmt.writeDecimal(rsdp.revision);
     serial.writeString("\n");
 
     const rsdt_addr = rsdp.rsdt_address;
@@ -85,17 +87,13 @@ fn parseRsdt(rsdt_phys: u64) void {
 
     const entry_count = (len - @sizeOf(tables.SdtHeader)) / 4;
 
-        main.mapAcpiPage(rsdt_phys);
+    main.mapAcpiPage(rsdt_phys);
 
     // Read entries using byte array
     var i: u32 = 0;
     while (i < entry_count) : (i += 1) {
         const off = @sizeOf(tables.SdtHeader) + i * 4;
-        const b0 = bytes[off];
-        const b1 = bytes[off + 1];
-        const b2 = bytes[off + 2];
-        const b3 = bytes[off + 3];
-        const raw_entry: u32 = @as(u32, b0) | (@as(u32, b1) << 8) | (@as(u32, b2) << 16) | (@as(u32, b3) << 24);
+        const raw_entry: u32 = bo.readU32Le(bytes[off .. off + 4]);
         if (raw_entry == 0) continue;
         const entry_phys: u64 = raw_entry;
 
@@ -134,9 +132,9 @@ fn parseXsdt(xsdt_phys: u64) void {
         main.mapAcpiPage(entry_phys);
         const header: *const tables.SdtHeader = hhdm.physToPtr(tables.SdtHeader, entry_phys);
 
-        if (memEql(header.signature[0..], "APIC")) {
+        if (str.eql(header.signature[0..], "APIC")) {
             parseMadt(entry_phys);
-        } else if (memEql(header.signature[0..], "MCFG")) {
+        } else if (str.eql(header.signature[0..], "MCFG")) {
             parseMcfg(entry_phys);
         }
     }
@@ -190,11 +188,11 @@ fn parseMadt(madt_phys: u64) void {
     }
 
     serial.writeString("[ACPI] MADT: ");
-    writeDecimal(info.cpu_count);
+    fmt.writeDecimal(info.cpu_count);
     serial.writeString(" CPUs, LAPIC=0x");
-    writeHex(info.lapic_address);
+    fmt.writeHex(info.lapic_address);
     serial.writeString(", IOAPIC=0x");
-    writeHex(info.ioapic_address);
+    fmt.writeHex(info.ioapic_address);
     serial.writeString("\n");
 }
 
@@ -209,8 +207,8 @@ fn parseMcfg(mcfg_phys: u64) void {
     var offset: u32 = @sizeOf(tables.Mcfg);
     while (offset + @sizeOf(tables.McfgAllocation) <= hdr_len) {
         // Read MCFG allocation entry fields manually
-        const base_addr = readU64(bytes, offset);
-        const seg_group = @as(u16, bytes[offset + 8]) | (@as(u16, bytes[offset + 9]) << 8);
+        const base_addr = bo.readU64At(bytes, offset);
+        const seg_group = bo.readU16Le(bytes[offset + 8 .. offset + 10]);
         const start_bus = bytes[offset + 10];
         const end_bus = bytes[offset + 11];
 
@@ -225,58 +223,6 @@ fn parseMcfg(mcfg_phys: u64) void {
     }
 
     serial.writeString("[ACPI] MCFG: base=0x");
-    writeHex(info.mcfg_base);
+    fmt.writeHex(info.mcfg_base);
     serial.writeString("\n");
-}
-
-fn memEql(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| if (ca != cb) return false;
-    return true;
-}
-
-/// Read a little-endian u64 from byte array at given offset.
-fn readU64(bytes: [*]const u8, off: usize) u64 {
-    return @as(u64, bytes[off]) |
-        (@as(u64, bytes[off + 1]) << 8) |
-        (@as(u64, bytes[off + 2]) << 16) |
-        (@as(u64, bytes[off + 3]) << 24) |
-        (@as(u64, bytes[off + 4]) << 32) |
-        (@as(u64, bytes[off + 5]) << 40) |
-        (@as(u64, bytes[off + 6]) << 48) |
-        (@as(u64, bytes[off + 7]) << 56);
-}
-
-fn writeDecimal(value: u32) void {
-    var buf: [10]u8 = undefined;
-    if (value == 0) {
-        serial.writeString("0");
-        return;
-    }
-    var v = value;
-    var i: usize = 0;
-    while (v > 0) : (v /= 10) {
-        buf[i] = @intCast(v % 10 + '0');
-        i += 1;
-    }
-    var j: usize = 0;
-    while (j < i / 2) : (j += 1) {
-        const tmp = buf[j];
-        buf[j] = buf[i - 1 - j];
-        buf[i - 1 - j] = tmp;
-    }
-    serial.writeString(buf[0..i]);
-}
-
-fn writeHex(value: u64) void {
-    const hex = "0123456789abcdef";
-    var buf: [16]u8 = undefined;
-    var v = value;
-    var i: usize = 16;
-    while (i > 0) {
-        i -= 1;
-        buf[i] = hex[@as(usize, @intCast(v & 0xf))];
-        v >>= 4;
-    }
-    serial.writeString(&buf);
 }

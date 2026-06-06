@@ -9,11 +9,11 @@
 ///   - Vendor/device ID, class code extraction
 ///   - BAR (Base Address Register) detection
 ///   - Device listing for driver matching
-
 const serial = @import("../arch/x86_64/serial.zig");
 const io = @import("../arch/x86_64/io.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const acpi = @import("../acpi/acpi_parser.zig");
+const fmt = @import("../lib/fmt.zig");
 
 pub const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
 pub const PCI_CONFIG_DATA: u16 = 0xCFC;
@@ -84,7 +84,7 @@ pub fn init() void {
     pcie_ecam_base = acpi.info.mcfg_base;
     if (pcie_ecam_base != 0) {
         serial.writeString("[PCI] Using PCIe ECAM at 0x");
-        writeHex(pcie_ecam_base);
+        fmt.writeHex(pcie_ecam_base);
         serial.writeString("\n");
     } else {
         serial.writeString("[PCI] Using legacy I/O port configuration\n");
@@ -93,7 +93,7 @@ pub fn init() void {
     device_count = 0;
     enumerateBuses();
     serial.writeString("[PCI] Found ");
-    writeDecimal(device_count);
+    fmt.writeDecimal(device_count);
     serial.writeString(" devices\n");
 }
 
@@ -253,7 +253,7 @@ fn probeFunction(bus: u8, dev: u8, func: u8) void {
         const secondary_bus: u8 = @truncate(bridge_reg >> 8);
         if (secondary_bus > bus and secondary_bus < PCI_MAX_BUSES) {
             serial.writeString("[PCI] Bridge to secondary bus ");
-            writeDecimal(secondary_bus);
+            fmt.writeDecimal(secondary_bus);
             serial.writeString("\n");
             enumerateBus(secondary_bus);
         }
@@ -361,105 +361,31 @@ pub fn findByClass(class: u8, subclass: u8) ?*const PciDevice {
 /// Print device information.
 fn printDevice(dev: *const PciDevice) void {
     serial.writeString("  [PCI] ");
-    writeDecimal(dev.bus);
+    fmt.writeDecimal(dev.bus);
     serial.writeString(":");
-    writeDecimal(dev.device);
+    fmt.writeDecimal(dev.device);
     serial.writeString(".");
-    writeDecimal(dev.function);
+    fmt.writeDecimal(dev.function);
     serial.writeString(" ");
-    writeHex16(dev.vendor_id);
+    fmt.writeHex16(dev.vendor_id);
     serial.writeString(":");
-    writeHex16(dev.device_id);
+    fmt.writeHex16(dev.device_id);
     serial.writeString(" class=");
-    writeHex8(dev.class_code);
+    fmt.writeHex8(dev.class_code);
     serial.writeString(":");
-    writeHex8(dev.subclass);
+    fmt.writeHex8(dev.subclass);
     if (dev.irq_pin != 0) {
         serial.writeString(" irq=");
-        writeDecimal(dev.irq_line);
+        fmt.writeDecimal(dev.irq_line);
     }
     // Print BAR info
     for (0..6) |i| {
         if (dev.bars[i] != 0) {
             serial.writeString(" bar");
-            serial.writeString(&[_]u8{ '0' + @as(u8, @intCast(i)) });
+            serial.writeString(&[_]u8{'0' + @as(u8, @intCast(i))});
             serial.writeString("=0x");
-            writeHex(dev.bars[i]);
+            fmt.writeHex(dev.bars[i]);
         }
     }
     serial.writeString("\n");
-}
-
-// Formatting helpers — write directly to serial
-fn writeHex(value: u64) void {
-    var buf: [16]u8 = @splat('0');
-    var v = value;
-    var start: usize = 0;
-    // Find first non-zero nibble (or use last position if value is 0)
-    if (value != 0) {
-        const tmp = value;
-        var leading = true;
-        for (0..16) |idx| {
-            const shift_amt: u6 = @intCast((15 - idx) * 4);
-            const nibble: u8 = @intCast((tmp >> shift_amt) & 0xF);
-            if (leading and nibble == 0) continue;
-            leading = false;
-            start = idx;
-            break;
-        }
-    }
-    // Fill from end
-    var i: usize = 15;
-    while (true) : (i -= 1) {
-        const nibble: u8 = @intCast(v & 0xF);
-        buf[i] = if (nibble < 10) '0' + nibble else 'a' + nibble - 10;
-        v >>= 4;
-        if (i == 0) break;
-    }
-    serial.writeString(buf[start..16]);
-}
-
-fn writeHex16(value: u16) void {
-    var buf: [4]u8 = @splat('0');
-    var v = value;
-    var i: usize = 3;
-    while (true) : (i -= 1) {
-        const nibble: u8 = @intCast(v & 0xF);
-        buf[i] = if (nibble < 10) '0' + nibble else 'a' + nibble - 10;
-        v >>= 4;
-        if (i == 0) break;
-    }
-    serial.writeString(&buf);
-}
-
-fn writeHex8(value: u8) void {
-    const hi: u8 = value >> 4;
-    const lo: u8 = value & 0xF;
-    const buf = [2]u8{
-        if (hi < 10) '0' + hi else 'a' + hi - 10,
-        if (lo < 10) '0' + lo else 'a' + lo - 10,
-    };
-    serial.writeString(&buf);
-}
-
-fn writeDecimal(value: u32) void {
-    if (value == 0) {
-        serial.writeString("0");
-        return;
-    }
-    var buf: [10]u8 = undefined;
-    var v = value;
-    var i: usize = 0;
-    while (v > 0 and i < 10) : (i += 1) {
-        buf[i] = @intCast(v % 10 + '0');
-        v /= 10;
-    }
-    // Reverse in place
-    var j: usize = 0;
-    while (j < i / 2) : (j += 1) {
-        const tmp = buf[j];
-        buf[j] = buf[i - 1 - j];
-        buf[i - 1 - j] = tmp;
-    }
-    serial.writeString(buf[0..i]);
 }

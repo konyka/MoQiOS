@@ -1,12 +1,12 @@
 /// Local APIC driver — per-CPU timer, EOI, spurious interrupt handling.
 /// The LAPIC is at physical 0xFEE00000, accessed via HHDM.
 /// Timer uses vector 240, calibrated via PIT channel 2.
-
 const hhdm = @import("../../mm/hhdm.zig");
 const serial = @import("serial.zig");
 const io = @import("io.zig");
 const paging = @import("../../arch/x86_64/paging.zig");
 const main_mod = @import("../../main.zig");
+const fmt = @import("../../lib/fmt.zig");
 
 /// LAPIC timer fires on this vector.
 pub const TIMER_VECTOR: u8 = 240;
@@ -73,6 +73,13 @@ pub fn sendStartupIpi(apic_id: u8, vector_page: u8) void {
     }
 }
 
+/// Enable this AP's Local APIC (spurious-interrupt vector register) WITHOUT
+/// starting the periodic timer. Used during initial SMP bring-up so APs can
+/// park safely without driving the (not-yet-SMP-aware) scheduler via timer IRQs.
+pub fn enableApNoTimer() void {
+    writeReg(REG_SVR, 0x100 | 0xFF);
+}
+
 /// Initialize LAPIC for an AP (no timer calibration — reuse BSP calibrated value).
 pub fn initAp() void {
     // Enable APIC: set bit 8 in SVR, spurious vector 0xFF
@@ -131,7 +138,7 @@ pub fn init(lapic_phys: u64) void {
     writeReg(REG_TIMER_INIT, ticks_per_10ms);
 
     serial.writeString("[lapic] BSP APIC enabled, timer at ~100Hz (ticks=");
-    writeDecimal(ticks_per_10ms);
+    fmt.writeDecimal(ticks_per_10ms);
     serial.writeString(")\n");
 }
 
@@ -180,25 +187,4 @@ fn calibrateTimer() void {
 
     // elapsed ticks in ~10ms → use directly for 100Hz period
     ticks_per_10ms = elapsed;
-}
-
-fn writeDecimal(value: u32) void {
-    if (value == 0) {
-        serial.writeString("0");
-        return;
-    }
-    var buf: [10]u8 = undefined;
-    var v = value;
-    var i: usize = 0;
-    while (v > 0) : (v /= 10) {
-        buf[i] = @intCast(v % 10 + '0');
-        i += 1;
-    }
-    var j: usize = 0;
-    while (j < i / 2) : (j += 1) {
-        const tmp = buf[j];
-        buf[j] = buf[i - 1 - j];
-        buf[i - 1 - j] = tmp;
-    }
-    serial.writeString(buf[0..i]);
 }

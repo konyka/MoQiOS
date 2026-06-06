@@ -1,6 +1,7 @@
 const e1000 = @import("../drivers/e1000.zig");
 const netif = @import("netif.zig");
 const eth = @import("eth.zig");
+const bo = @import("../lib/byte_order.zig");
 
 const MAX_ARP_ENTRIES: usize = 16;
 
@@ -21,9 +22,9 @@ pub fn init() void {
 pub fn handlePacket(data: [*]const u8, len: u32) void {
     if (len < 42) return;
 
-    const htype = (@as(u16, data[14]) << 8) | @as(u16, data[15]);
-    const ptype = (@as(u16, data[16]) << 8) | @as(u16, data[17]);
-    const opcode = (@as(u16, data[20]) << 8) | @as(u16, data[21]);
+    const htype = bo.readU16BeAt(data, 14);
+    const ptype = bo.readU16BeAt(data, 16);
+    const opcode = bo.readU16BeAt(data, 20);
 
     if (htype != 1 or ptype != 0x0800) return;
 
@@ -37,9 +38,7 @@ pub fn handlePacket(data: [*]const u8, len: u32) void {
     if (opcode == 1) {
         // ARP request — is it for our IP?
         const our_ip = netif.getOurIp();
-        if (target_ip[0] == our_ip[0] and target_ip[1] == our_ip[1] and
-            target_ip[2] == our_ip[2] and target_ip[3] == our_ip[3])
-        {
+        if (@as(u32, @bitCast(target_ip)) == @as(u32, @bitCast(our_ip))) {
             sendArpReply(sender_ip, sender_mac);
         }
     }
@@ -47,10 +46,7 @@ pub fn handlePacket(data: [*]const u8, len: u32) void {
 
 pub fn resolve(ip: [4]u8) ?[6]u8 {
     for (0..MAX_ARP_ENTRIES) |i| {
-        if (cache[i].valid and
-            cache[i].ip[0] == ip[0] and cache[i].ip[1] == ip[1] and
-            cache[i].ip[2] == ip[2] and cache[i].ip[3] == ip[3])
-        {
+        if (cache[i].valid and @as(u32, @bitCast(cache[i].ip)) == @as(u32, @bitCast(ip))) {
             return cache[i].mac;
         }
     }
@@ -69,11 +65,14 @@ pub fn sendArpRequest(target_ip: [4]u8) void {
     pkt[13] = 0x06; // Ethertype ARP
 
     // ARP payload
-    pkt[14] = 0x00; pkt[15] = 0x01; // HTYPE=Ethernet
-    pkt[16] = 0x08; pkt[17] = 0x00; // PTYPE=IPv4
+    pkt[14] = 0x00;
+    pkt[15] = 0x01; // HTYPE=Ethernet
+    pkt[16] = 0x08;
+    pkt[17] = 0x00; // PTYPE=IPv4
     pkt[18] = 6; // HLEN
     pkt[19] = 4; // PLEN
-    pkt[20] = 0x00; pkt[21] = 0x01; // Opcode=request
+    pkt[20] = 0x00;
+    pkt[21] = 0x01; // Opcode=request
     @memcpy(pkt[22..28], &our_mac);
     @memcpy(pkt[28..32], &our_ip);
     for (32..38) |i| pkt[i] = 0; // Target MAC = 0
@@ -85,10 +84,7 @@ pub fn sendArpRequest(target_ip: [4]u8) void {
 fn addToCache(ip: [4]u8, mac: [6]u8) void {
     // Update existing entry
     for (0..MAX_ARP_ENTRIES) |i| {
-        if (cache[i].valid and
-            cache[i].ip[0] == ip[0] and cache[i].ip[1] == ip[1] and
-            cache[i].ip[2] == ip[2] and cache[i].ip[3] == ip[3])
-        {
+        if (cache[i].valid and @as(u32, @bitCast(cache[i].ip)) == @as(u32, @bitCast(ip))) {
             cache[i].mac = mac;
             return;
         }
@@ -112,11 +108,14 @@ fn sendArpReply(target_ip: [4]u8, target_mac: [6]u8) void {
     pkt[12] = 0x08;
     pkt[13] = 0x06;
 
-    pkt[14] = 0x00; pkt[15] = 0x01;
-    pkt[16] = 0x08; pkt[17] = 0x00;
+    pkt[14] = 0x00;
+    pkt[15] = 0x01;
+    pkt[16] = 0x08;
+    pkt[17] = 0x00;
     pkt[18] = 6;
     pkt[19] = 4;
-    pkt[20] = 0x00; pkt[21] = 0x02; // Opcode=reply
+    pkt[20] = 0x00;
+    pkt[21] = 0x02; // Opcode=reply
     @memcpy(pkt[22..28], &our_mac);
     @memcpy(pkt[28..32], &our_ip);
     @memcpy(pkt[32..38], &target_mac);

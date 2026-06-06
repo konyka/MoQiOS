@@ -1,13 +1,13 @@
 /// Physical Memory Manager — bitmap allocator for 4KB page frames.
 /// Reads Limine memory map, creates bitmap + ref_counts in usable memory.
 /// Tracks free/used pages with per-page reference counting.
-
 const limine = @import("../limine.zig");
 const hhdm = @import("hhdm.zig");
 const serial = @import("../arch/x86_64/serial.zig");
 const klog = @import("../klog.zig");
 const page_frame = @import("page_frame.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+const fmt = @import("../lib/fmt.zig");
 
 const PAGE_SIZE: u64 = 4096;
 
@@ -22,6 +22,16 @@ var lock: IrqSpinlock = .{};
 
 /// Skip first 2 MB (512 pages) — legacy BIOS area.
 const MIN_ALLOC_PAGE: u64 = 512;
+
+/// Return total number of physical pages.
+pub fn totalPages() u64 {
+    return total_pages;
+}
+
+/// Return number of free physical pages.
+pub fn freePages() u64 {
+    return free_pages;
+}
 
 var next_free_hint: u64 = 0;
 
@@ -131,55 +141,114 @@ pub fn init(memmap: *const limine.MemmapResponse) void {
     next_free_hint = MIN_ALLOC_PAGE;
 
     serial.writeString("[PMM] Total pages: ");
-    var buf: [20]u8 = undefined;
-    serial.writeString(formatInt(&buf, total_pages));
+    fmt.writeDecimal64(total_pages);
     serial.writeString(", free: ");
-    serial.writeString(formatInt(&buf, free_pages));
+    fmt.writeDecimal64(free_pages);
     serial.writeString("\n[PMM] bitmap_phys=0x");
-    serial.writeString(formatHex(&buf, bitmap_phys));
+    fmt.writeHex(bitmap_phys);
     serial.writeString(" metadata_pages=");
-    serial.writeString(formatInt(&buf, metadata_pages));
+    fmt.writeDecimal64(metadata_pages);
     serial.writeString(" metadata_end=0x");
-    serial.writeString(formatHex(&buf, bitmap_phys + metadata_pages * PAGE_SIZE));
+    fmt.writeHex(bitmap_phys + metadata_pages * PAGE_SIZE);
     serial.writeString("\n");
 
     klog.log(.info, "PMM initialized");
 }
 
 /// Allocate a single 4KB physical page. Returns physical address or null.
+/// Uses word-at-a-time bitmap scanning for performance (64 pages per iteration).
 pub fn allocPage() ?u64 {
     const flags = lock.acquire();
     defer lock.release(flags);
 
-    var i: u64 = next_free_hint;
-    while (i < total_pages) : (i += 1) {
-        if (isBitSet(i)) {
-            if (ref_counts[i] > 0) {
-                clearBit(i);
-                continue;
+    const result = allocPageLocked();
+    return result;
+}
+
+/// Inner allocation — caller must hold lock.
+/// Word-at-a-time bitmap scanning: reads 64 bits at once, skips empty
+/// 64-page blocks in a single iteration. Uses @ctz for fast bit scan.
+fn allocPageLocked() ?u64 {
+    const words: [*]const u64 = @ptrCast(@alignCast(bitmap));
+    const total_words = bitmap_size / 8;
+    const start_word = next_free_hint / 64;
+
+    // Phase 1: scan forward from hint
+    var w: u64 = start_word;
+    while (w < total_words) : (w += 1) {
+        var word = words[w];
+        while (word != 0) {
+            const bit = @ctz(word);
+            const page = w * 64 + bit;
+            if (page >= total_pages) return null;
+            if (page >= MIN_ALLOC_PAGE and ref_counts[page] == 0) {
+                clearBit(page);
+                ref_counts[page] = 1;
+                free_pages -= 1;
+                next_free_hint = page + 1;
+                return page * PAGE_SIZE;
             }
-            clearBit(i);
-            ref_counts[i] = 1;
-            free_pages -= 1;
-            next_free_hint = i + 1;
-            return i * PAGE_SIZE;
+            // Stale bit — clear and try next bit in same word
+            clearBit(page);
+            word &= word - 1; // clear lowest set bit
         }
     }
-    i = MIN_ALLOC_PAGE;
-    while (i < next_free_hint) : (i += 1) {
-        if (isBitSet(i)) {
-            if (ref_counts[i] > 0) {
-                clearBit(i);
-                continue;
+
+    // Phase 2: wrap around from MIN_ALLOC_PAGE to hint
+    const end_word = @min(start_word + 1, total_words);
+    w = MIN_ALLOC_PAGE / 64;
+    while (w < end_word) : (w += 1) {
+        var word = words[w];
+        while (word != 0) {
+            const bit = @ctz(word);
+            const page = w * 64 + bit;
+            if (page >= total_pages) return null;
+            if (page >= MIN_ALLOC_PAGE and ref_counts[page] == 0) {
+                clearBit(page);
+                ref_counts[page] = 1;
+                free_pages -= 1;
+                next_free_hint = page + 1;
+                return page * PAGE_SIZE;
             }
-            clearBit(i);
-            ref_counts[i] = 1;
-            free_pages -= 1;
-            next_free_hint = i + 1;
-            return i * PAGE_SIZE;
+            clearBit(page);
+            word &= word - 1;
         }
     }
+
     next_free_hint = MIN_ALLOC_PAGE;
+    return null;
+}
+
+/// Allocate `count` physically contiguous pages. Returns base physical address or null.
+pub fn allocContiguous(count: usize) ?u64 {
+    if (count == 0) return null;
+    if (count == 1) return allocPage();
+
+    const flags = lock.acquire();
+    defer lock.release(flags);
+
+    var start: u64 = MIN_ALLOC_PAGE;
+    while (start + count <= total_pages) : (start += 1) {
+        // Check if all pages [start, start+count) are free
+        var all_free = true;
+        for (0..count) |j| {
+            if (!isBitSet(start + j) or ref_counts[start + j] > 0) {
+                all_free = false;
+                start += j; // skip ahead past the used page
+                break;
+            }
+        }
+        if (!all_free) continue;
+
+        // Found contiguous free range — allocate all pages
+        for (0..count) |j| {
+            const page = start + j;
+            clearBit(page);
+            ref_counts[page] = 1;
+        }
+        free_pages -= count;
+        return start * PAGE_SIZE;
+    }
     return null;
 }
 
@@ -209,10 +278,9 @@ pub fn freePage(addr: u64) void {
         // Release lock before serial output (serial has its own lock)
         lock.release(flags);
         serial.writeString("[PMM] BUG: double-free of page ");
-        var buf: [20]u8 = undefined;
-        serial.writeString(formatInt(&buf, page));
+        fmt.writeDecimal64(page);
         serial.writeString(" at addr 0x");
-        serial.writeString(formatHex(&buf, addr));
+        fmt.writeHex(addr);
         serial.writeString("\n");
         return;
     }
@@ -242,6 +310,15 @@ pub fn decRef(addr: u64) u16 {
     return ref_counts[page];
 }
 
+/// Get current reference count for a physical page.
+pub fn getRefCount(addr: u64) u16 {
+    const flags = lock.acquire();
+    defer lock.release(flags);
+    const page = addr / PAGE_SIZE;
+    if (page >= total_pages) return 0;
+    return ref_counts[page];
+}
+
 pub fn getFreePages() u64 {
     return free_pages;
 }
@@ -261,36 +338,4 @@ fn clearBit(page: u64) void {
 
 fn isBitSet(page: u64) bool {
     return (bitmap[page / 8] & (@as(u8, 1) << @intCast(page % 8))) != 0;
-}
-
-fn formatInt(buf: []u8, value: u64) []const u8 {
-    if (value == 0) {
-        buf[0] = '0';
-        return buf[0..1];
-    }
-    var i: usize = 0;
-    var v = value;
-    while (v > 0) : (v /= 10) {
-        buf[i] = @intCast(v % 10 + '0');
-        i += 1;
-    }
-    var j: usize = 0;
-    while (j < i / 2) : (j += 1) {
-        const tmp = buf[j];
-        buf[j] = buf[i - 1 - j];
-        buf[i - 1 - j] = tmp;
-    }
-    return buf[0..i];
-}
-
-fn formatHex(buf: []u8, value: u64) []const u8 {
-    const hex = "0123456789abcdef";
-    var i: usize = 16;
-    var v = value;
-    while (i > 0) {
-        i -= 1;
-        buf[i] = hex[@as(usize, @intCast(v & 0xf))];
-        v >>= 4;
-    }
-    return buf[0..16];
 }

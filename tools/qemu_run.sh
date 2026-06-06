@@ -176,6 +176,14 @@ fi
 
 echo "========================================="
 
+# Overridable for diagnostics:
+#   MOQI_SERIAL      serial target (default: stdio; e.g. file:/tmp/serial.log)
+#   MOQI_SMP         number of CPUs (default: 2)
+#   MOQI_EXTRA_QEMU  extra QEMU args (e.g. "-d int,cpu_reset -D /tmp/qint.log")
+SERIAL_TARGET="${MOQI_SERIAL:-stdio}"
+SMP_COUNT="${MOQI_SMP:-2}"
+EXTRA_QEMU="${MOQI_EXTRA_QEMU:-}"
+
 qemu-system-x86_64 \
     -M q35 \
     -m 512M \
@@ -185,9 +193,9 @@ qemu-system-x86_64 \
     -device virtio-blk-pci,drive=disk0 \
     -netdev user,id=net0 \
     -device e1000,netdev=net0 \
-    -smp 2 \
-    -serial stdio \
+    -smp "$SMP_COUNT" \
+    -serial "$SERIAL_TARGET" \
     -display none \
     -no-reboot \
     -no-shutdown \
-    ${QEMU_DEBUG_FLAGS}
+    ${QEMU_DEBUG_FLAGS} ${EXTRA_QEMU}

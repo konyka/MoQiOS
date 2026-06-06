@@ -3,6 +3,7 @@ const netif = @import("netif.zig");
 const eth = @import("eth.zig");
 const ipv4 = @import("ipv4.zig");
 const arp = @import("arp.zig");
+const bo = @import("../lib/byte_order.zig");
 
 const MAX_PORTS = 16;
 const QUEUE_DEPTH = 8;
@@ -35,7 +36,7 @@ fn findPortIdx(port: u16) ?u16 {
     return null;
 }
 
-fn ensurePort(port: u16) u16 {
+pub fn ensurePort(port: u16) u16 {
     if (findPortIdx(port)) |idx| return idx;
     if (num_ports >= MAX_PORTS) return 0xFFFF;
     const idx = num_ports;
@@ -47,9 +48,9 @@ fn ensurePort(port: u16) u16 {
 pub fn handlePacket(src_ip: [4]u8, _: [4]u8, data: [*]const u8, len: u32) void {
     if (len < 8) return;
 
-    const src_port = (@as(u16, data[0]) << 8) | @as(u16, data[1]);
-    const dst_port = (@as(u16, data[2]) << 8) | @as(u16, data[3]);
-    const udp_len = (@as(u16, data[4]) << 8) | @as(u16, data[5]);
+    const src_port = bo.readU16BeAt(data, 0);
+    const dst_port = bo.readU16BeAt(data, 2);
+    const udp_len = bo.readU16BeAt(data, 4);
 
     const payload_offset: u16 = 8;
     const payload_len = if (udp_len > 8) udp_len - 8 else 0;
@@ -103,17 +104,14 @@ pub fn sendTo(dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, da
     const udp_total: u16 = 8 + data_len;
 
     // Build UDP header at offset 34 (14 eth + 20 ipv4)
-    send_pkt[34] = @intCast((src_port >> 8) & 0xFF);
-    send_pkt[35] = @intCast(src_port & 0xFF);
-    send_pkt[36] = @intCast((dst_port >> 8) & 0xFF);
-    send_pkt[37] = @intCast(dst_port & 0xFF);
-    send_pkt[38] = @intCast((udp_total >> 8) & 0xFF);
-    send_pkt[39] = @intCast(udp_total & 0xFF);
+    bo.writeU16BeAt(&send_pkt, 34, src_port);
+    bo.writeU16BeAt(&send_pkt, 36, dst_port);
+    bo.writeU16BeAt(&send_pkt, 38, udp_total);
     send_pkt[40] = 0x00;
     send_pkt[41] = 0x00;
 
     // Copy payload after UDP header
-    @memcpy(send_pkt[42..42 + data_len], data[0..data_len]);
+    @memcpy(send_pkt[42 .. 42 + data_len], data[0..data_len]);
 
     // Build IPv4 header at offset 14 (after ethernet header)
     ipv4.buildHeader(send_pkt[14..].ptr, our_ip, dst_ip, ipv4.PROTO_UDP, udp_total);

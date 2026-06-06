@@ -27,11 +27,3 @@ pub fn getMac() [6]u8 {
     ensureInit();
     return our_mac;
 }
-
-fn writeHex8(v: u8) void {
-    const hex = "0123456789abcdef";
-    var buf: [2]u8 = undefined;
-    buf[0] = hex[(v >> 4) & 0xF];
-    buf[1] = hex[v & 0xF];
-    serial.writeString(&buf);
-}

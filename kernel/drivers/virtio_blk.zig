@@ -2,13 +2,13 @@
 ///
 /// Provides sector read/write operations via the virtio transport.
 /// Detects virtio-blk devices via PCI vendor 0x1AF4, device 0x1001.
-
 const serial = @import("../arch/x86_64/serial.zig");
 const io = @import("../arch/x86_64/io.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const paging = @import("../arch/x86_64/paging.zig");
 const pmm = @import("../mm/pmm.zig");
 const pci = @import("pci.zig");
+const fmt = @import("../lib/fmt.zig");
 
 pub const SECTOR_SIZE: u32 = 512;
 
@@ -178,11 +178,11 @@ pub fn init() void {
         const dev = pci.devices[i];
         if (dev.vendor_id == pci.VENDOR_QEMU_VIRTIO and (dev.device_id == 0x1001 or dev.device_id == 0x1042)) {
             serial.writeString("[virtio-blk] Found at ");
-            writeHex8(dev.bus);
+            fmt.writeHex8(dev.bus);
             serial.writeString(":");
-            writeHex8(dev.device);
+            fmt.writeHex8(dev.device);
             serial.writeString(".");
-            writeHex8(dev.function);
+            fmt.writeHex8(dev.function);
             serial.writeString("\n");
 
             if (found == 0) {
@@ -248,9 +248,9 @@ fn initDevice(dev: *const pci.PciDevice, out: *VirtioBlkDevice) !void {
     out.capacity_sectors = (@as(u64, cap_hi) << 32) | cap_lo;
 
     serial.writeString("[virtio-blk] Capacity: ");
-    writeDecimal64(out.capacity_sectors);
+    fmt.writeDecimal64(out.capacity_sectors);
     serial.writeString(" sectors (");
-    writeDecimal64(out.capacity_sectors / 2);
+    fmt.writeDecimal64(out.capacity_sectors / 2);
     serial.writeString(" KB)\n");
 
     // Set up virtqueue 0 (request queue)
@@ -316,7 +316,7 @@ fn initDevice(dev: *const pci.PciDevice, out: *VirtioBlkDevice) !void {
     out.last_used_idx = 0;
 
     serial.writeString("[virtio-blk] Initialized, queue size=");
-    writeDecimal(queue_size);
+    fmt.writeDecimal(queue_size);
     serial.writeString("\n");
 }
 
@@ -383,14 +383,14 @@ pub fn readSectors(lba: u64, count: u32, buf: [*]u8) i64 {
 
     if (timeout == 0) {
         serial.writeString("[virtio-blk] Read timeout at LBA ");
-        writeHex64(lba);
+        fmt.writeHex64(lba);
         serial.writeString("\n");
         return -1;
     }
 
     if (status_byte.* != VIRTIO_BLK_S_OK) {
         serial.writeString("[virtio-blk] Read error status=");
-        writeHex8(status_byte.*);
+        fmt.writeHex8(status_byte.*);
         serial.writeString("\n");
         return -1;
     }
@@ -542,67 +542,4 @@ pub fn getCapacity() u64 {
 
 fn virtToPhys(virt: u64) u64 {
     return hhdm.virtToPhys(virt);
-}
-
-fn writeHex8(v: u8) void {
-    const hex = "0123456789abcdef";
-    var buf: [2]u8 = undefined;
-    buf[0] = hex[(v >> 4) & 0xF];
-    buf[1] = hex[v & 0xF];
-    serial.writeString(&buf);
-}
-
-fn writeHex64(v: u64) void {
-    const hex = "0123456789abcdef";
-    var buf: [16]u8 = undefined;
-    var i: usize = 16;
-    var val = v;
-    while (i > 0) {
-        i -= 1;
-        buf[i] = hex[@as(usize, @intCast(val & 0xF))];
-        val >>= 4;
-    }
-    serial.writeString(&buf);
-}
-
-fn writeDecimal(v: u32) void {
-    if (v == 0) {
-        serial.writeString("0");
-        return;
-    }
-    var buf: [10]u8 = undefined;
-    var val = v;
-    var i: usize = 0;
-    while (val > 0) : (val /= 10) {
-        buf[i] = @intCast(val % 10 + '0');
-        i += 1;
-    }
-    var j: usize = 0;
-    while (j < i / 2) : (j += 1) {
-        const tmp = buf[j];
-        buf[j] = buf[i - 1 - j];
-        buf[i - 1 - j] = tmp;
-    }
-    serial.writeString(buf[0..i]);
-}
-
-fn writeDecimal64(v: u64) void {
-    if (v == 0) {
-        serial.writeString("0");
-        return;
-    }
-    var buf: [20]u8 = undefined;
-    var val = v;
-    var i: usize = 0;
-    while (val > 0) : (val /= 10) {
-        buf[i] = @intCast(val % 10 + '0');
-        i += 1;
-    }
-    var j: usize = 0;
-    while (j < i / 2) : (j += 1) {
-        const tmp = buf[j];
-        buf[j] = buf[i - 1 - j];
-        buf[i - 1 - j] = tmp;
-    }
-    serial.writeString(buf[0..i]);
 }

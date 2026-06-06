@@ -40,10 +40,20 @@ void sigusr1_handler(int sig) {
     print("hello13: signal handler called!\n");
 }
 
+// Matches the kernel's expected layout: the handler pointer is the first
+// 8 bytes of the struct passed to sigaction.
+struct ksigaction {
+    void (*handler)(int);
+    unsigned long mask;
+    unsigned long flags;
+    void *restorer;
+};
+
 void _start(void) {
     print("hello13: step 1 - register SIGUSR1 handler\n");
 
-    long ret = syscall2(SYS_sigaction, 10, (long)sigusr1_handler);
+    struct ksigaction act = { sigusr1_handler, 0, 0, 0 };
+    long ret = syscall3(SYS_sigaction, 10, (long)&act, 0);
     if (ret != 0) {
         print("hello13: sigaction failed\n");
         syscall3(SYS_exit, 1, 0, 0);

@@ -4,7 +4,8 @@
 
 ## 项目状态
 
-**当前进度**: M11+ (已完成 M1–M10 全部里程碑及多项扩展功能)
+**当前进度**: M11+ 及多项扩展 (TCP、ext2、AHCI/NVMe、tmpfs/procfs、SMP 尝试)。
+系统可正常引导至调度器并跑通 `init` + `hello2`–`hello26` 全部用户态测试 (QEMU 串口验证)。
 
 | 里程碑 | 功能 | 状态 |
 |---|---|---|
@@ -14,13 +15,26 @@
 | M4 | 用户空间进程 + syscall 入口 (syscall/sysret) | ✅ |
 | M5 | 多进程 + spawn + ELF 加载器 | ✅ |
 | M6 | PCI 设备枚举 | ✅ |
-| M7 | virtio-blk 驱动 + FAT32 文件系统 (读写) | ✅ |
-| M8 | e1000 网卡驱动 + ARP/IPv4/ICMP/UDP 网络协议栈 | ✅ |
+| M7 | virtio-blk / AHCI / NVMe 驱动 + FAT32 文件系统 (读写) | ✅ |
+| M8 | e1000 / virtio-net 网卡 + ARP/IPv4/ICMP/UDP/TCP 协议栈 | ✅ |
 | M9 | 管道 (pipe) + dup2 + 交互式 Shell | ✅ |
 | M10 | fork + execve + 进程地址空间克隆 | ✅ |
 | M11+ | 信号处理、环境变量、目录操作、chdir/getcwd、fstat/unlink | ✅ |
+| 扩展 | ext2 (读写)、tmpfs、procfs、统一页缓存、TCP socket API | ✅ |
+| 扩展 | SMP / AP 启动 | ⚠️ 暂禁用 (LAPIC 崩溃已修复，仍受更深层问题门控，见下) |
 
-**内核代码**: ~11,600 行 Zig | **用户程序**: ~2,300 行 C/ASM | **测试**: 18 个自动化测试 + Shell
+> **2026-06 引导稳定性修复**：修复了 4 个会导致内核无法启动或健壮性不足的缺陷
+> (SMP AP 启动死锁、内核栈多页映射破坏大页 HHDM、`Task` 巨型结构体导致引导栈溢出、
+> 用户态坏指针拖垮内核)。详见 [docs/moqios-architecture-current.md](docs/moqios-architecture-current.md)
+> 第 1.5 节。
+>
+> **2026-06 SMP 进展**：查明并修复了长期存在的 "LAPIC-on-AP 崩溃" 根因——AP trampoline 未启用
+> `EFER.NXE`，导致 AP 冷 TLB walk 到内核 NX 页时触发保留位缺页→三重故障。修复后 AP 可稳定上线
+> (`2 CPUs online`)。但完整启用 SMP 仍受更深层问题门控 (调度器非 SMP 安全 + 一个单核下也存在的
+> 用户态崩溃)，故默认仍 `smp.enable_ap_startup = false` 单处理器运行。详见架构文档第 1.6 节。
+
+**用户程序**: ~2,300 行 C/ASM | **测试**: `hello2`–`hello28` 运行时测试 + 交互式 Shell
+(注: `zig build test` 当前为占位，实测以 QEMU 运行 `hello*` 为准)
 
 ## 功能特性
 
@@ -119,6 +133,12 @@
 | hello16 | 环境变量 (setenv/getenv/fork 继承) |
 | hello17 | execve argv 传递验证 |
 | hello18 | chdir/getcwd/fstat/uname |
+| hello19 | TCP 连接 (connect + SYN) |
+| hello20 | ext2 文件读取 |
+| hello22 | TCP socket API (socket/bind/listen/accept) |
+| hello23–25 | ext2 多级路径 / unlink / mkdir |
+| hello26–27 | TCP echo server / connect() |
+| hello28 | ext2 目录列举 (listdir) |
 
 ## 快速开始
 

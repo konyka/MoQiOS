@@ -6,7 +6,6 @@
 ///   - Entry point from ELF header (not offset 0)
 ///
 /// Falls back to flat binary loading if the file is not ELF.
-
 const ramdisk = @import("../fs/ramdisk.zig");
 const task = @import("task.zig");
 const pmm = @import("../mm/pmm.zig");
@@ -14,6 +13,7 @@ const hhdm = @import("../mm/hhdm.zig");
 const paging = @import("../arch/x86_64/paging.zig");
 const user_space = @import("../mm/user_space.zig");
 const serial = @import("../arch/x86_64/serial.zig");
+const fmt = @import("../lib/fmt.zig");
 
 pub const ExecResult = struct {
     pml4: u64,
@@ -44,6 +44,7 @@ const Elf64_Ehdr = extern struct {
 };
 
 const PT_LOAD = 1;
+const PT_INTERP = 3;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
@@ -64,11 +65,17 @@ const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;
 const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
+const AT_BASE: u64 = 7; // base address of interpreter
+const AT_FLAGS: u64 = 8;
 const AT_ENTRY: u64 = 9;
 const AT_UID: u64 = 11;
 const AT_EUID: u64 = 12;
 const AT_GID: u64 = 13;
 const AT_EGID: u64 = 14;
+const AT_HWCAP: u64 = 16;
+const AT_CLKTCK: u64 = 17;
+const AT_SECURE: u64 = 23;
+const AT_RANDOM: u64 = 25; // address of 16 random bytes
 
 const Elf64_auxv_t = extern struct {
     a_type: u64,
@@ -83,6 +90,8 @@ const StackInfo = struct {
     phnum: u64 = 0,
     /// Entry point virtual address.
     entry: u64 = 0,
+    /// Dynamic linker base address (0 if no interpreter).
+    interp_base: u64 = 0,
 };
 
 /// Build the initial user stack with argc/argv/envp/auxv per Linux x86_64 ABI.
@@ -153,6 +162,21 @@ pub fn buildUserStack(
     // AT_UID
     push64(&pos, page_base, 0);
     push64(&pos, page_base, AT_UID);
+    // AT_SECURE
+    push64(&pos, page_base, 0);
+    push64(&pos, page_base, AT_SECURE);
+    // AT_HWCAP (basic: FPU + SSE)
+    push64(&pos, page_base, 0x1 | 0x200);
+    push64(&pos, page_base, AT_HWCAP);
+    // AT_CLKTCK
+    push64(&pos, page_base, 100);
+    push64(&pos, page_base, AT_CLKTCK);
+    // AT_FLAGS
+    push64(&pos, page_base, 0);
+    push64(&pos, page_base, AT_FLAGS);
+    // AT_BASE (dynamic linker base, 0 = no interpreter loaded)
+    push64(&pos, page_base, info.interp_base);
+    push64(&pos, page_base, AT_BASE);
     // AT_ENTRY
     push64(&pos, page_base, info.entry);
     push64(&pos, page_base, AT_ENTRY);
@@ -267,6 +291,27 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
     const phentsize = ehdr.e_phentsize;
     const phoff = ehdr.e_phoff;
 
+    // Scan for PT_INTERP (dynamic linker) and PT_PHDR
+    var phdr_addr: u64 = 0;
+    for (0..phnum) |i| {
+        if (phoff + (i + 1) * phentsize > file.size) break;
+        var phdr_buf: [@sizeOf(Elf64_Phdr)]u8 align(@alignOf(Elf64_Phdr)) = undefined;
+        const phdr_src_start = phoff + i * phentsize;
+        const phdr_copy_len = @min(phentsize, @sizeOf(Elf64_Phdr));
+        @memcpy(phdr_buf[0..phdr_copy_len], file.data[phdr_src_start .. phdr_src_start + phdr_copy_len]);
+        if (phdr_copy_len < @sizeOf(Elf64_Phdr)) {
+            @memset(phdr_buf[phdr_copy_len..], 0);
+        }
+        const phdr: *const Elf64_Phdr = @ptrCast(&phdr_buf);
+        if (phdr.p_type == PT_INTERP) {
+            serial.writeString("[loader] PT_INTERP detected (dynamic linking not yet supported)\n");
+            // Don't break — continue scanning for PT_PHDR
+        }
+        if (phdr.p_type == 6) { // PT_PHDR
+            phdr_addr = phdr.p_vaddr;
+        }
+    }
+
     for (0..phnum) |i| {
         if (phoff + (i + 1) * phentsize > file.size) break;
         // Copy program header to aligned buffer for safe access
@@ -347,7 +392,7 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
                 .no_execute = !executable,
                 .global = false,
             };
-            paging.mapPage(user_pml4, page_vaddr, phys, map_flags) catch {
+            paging.mapPageNoFlush(user_pml4, page_vaddr, phys, map_flags) catch {
                 serial.writeString("[loader] Failed to map ELF page\n");
                 pmm.freePage(phys);
                 success = false;
@@ -376,16 +421,23 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
         return null;
     };
     const user_stack_base = user_space.USER_STACK_TOP - paging.PAGE_SIZE;
-    user_space.mapUserPage(user_pml4, user_stack_base, stack_phys, true) catch {
+    user_space.mapUserPageNoFlush(user_pml4, user_stack_base, stack_phys, true) catch {
         serial.writeString("[loader] Failed to map stack\n");
         pmm.freePage(stack_phys);
         user_space.destroyUserSpace(user_pml4);
         return null;
     };
 
+    // Compute phdr_addr if no PT_PHDR segment found
+    // For ET_EXEC: phdr is at e_phoff in the file, mapped at e_phoff virtual
+    // For ET_DYN: phdr_addr is relative to load base (already set by PT_PHDR above)
+    if (phdr_addr == 0 and phoff > 0) {
+        phdr_addr = phoff; // file offset = virtual address for non-PIE executables
+    }
+
     // Build initial user stack with argc/argv/auxv
     const user_rsp = buildUserStack(stack_phys, user_space.USER_STACK_TOP, &.{name}, .{
-        .phdr_addr = 0, // TODO: compute from ELF segments
+        .phdr_addr = phdr_addr,
         .phnum = ehdr.e_phnum,
         .entry = ehdr.e_entry,
     });
@@ -410,12 +462,11 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
     serial.writeString("[loader] Loaded ");
     serial.writeString(name);
     serial.writeString(" as task ");
-    var buf: [16]u8 = undefined;
-    serial.writeString(formatInt(&buf, new_task));
+    fmt.writeDecimal(new_task);
     serial.writeString(" (ELF, entry=0x");
-    serial.writeString(formatHex(&buf, ehdr.e_entry));
+    fmt.writeHex(ehdr.e_entry);
     serial.writeString(", ");
-    serial.writeString(formatInt(&buf, loaded_segments));
+    fmt.writeDecimal(loaded_segments);
     serial.writeString(" segments)\n");
 
     return new_task;
@@ -463,7 +514,7 @@ fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32) 
             .no_execute = false,
             .global = false,
         };
-        paging.mapPage(user_pml4, virt_addr, code_pages[p].?, code_flags) catch {
+        paging.mapPageNoFlush(user_pml4, virt_addr, code_pages[p].?, code_flags) catch {
             serial.writeString("[loader] Failed to map code page\n");
             user_space.destroyUserSpace(user_pml4);
             freePages(&code_pages, allocated);
@@ -478,7 +529,7 @@ fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32) 
         return null;
     };
     const user_stack_base = user_space.USER_STACK_TOP - paging.PAGE_SIZE;
-    user_space.mapUserPage(user_pml4, user_stack_base, stack_phys, true) catch {
+    user_space.mapUserPageNoFlush(user_pml4, user_stack_base, stack_phys, true) catch {
         serial.writeString("[loader] Failed to map stack\n");
         pmm.freePage(stack_phys);
         user_space.destroyUserSpace(user_pml4);
@@ -511,12 +562,11 @@ fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32) 
     serial.writeString("[loader] Loaded ");
     serial.writeString(name);
     serial.writeString(" as task ");
-    var buf: [16]u8 = undefined;
-    serial.writeString(formatInt(&buf, new_task));
+    fmt.writeDecimal(new_task);
     serial.writeString(" (");
-    serial.writeString(formatInt(&buf, binary_size));
+    fmt.writeDecimal64(binary_size);
     serial.writeString(" bytes, ");
-    serial.writeString(formatInt(&buf, pages_needed));
+    fmt.writeDecimal64(pages_needed);
     serial.writeString(" pages)\n");
 
     return new_task;
@@ -529,47 +579,6 @@ fn freePages(pages: *[256]?u64, count: u64) void {
             pages[i] = null;
         }
     }
-}
-
-fn formatInt(buf: []u8, value: u64) []const u8 {
-    if (value == 0) {
-        buf[0] = '0';
-        return buf[0..1];
-    }
-    var i: usize = 0;
-    var v = value;
-    while (v > 0) : (v /= 10) {
-        buf[i] = @intCast(v % 10 + '0');
-        i += 1;
-    }
-    var j: usize = 0;
-    while (j < i / 2) : (j += 1) {
-        const tmp = buf[j];
-        buf[j] = buf[i - 1 - j];
-        buf[i - 1 - j] = tmp;
-    }
-    return buf[0..i];
-}
-
-fn formatHex(buf: []u8, value: u64) []const u8 {
-    if (value == 0) {
-        buf[0] = '0';
-        return buf[0..1];
-    }
-    var i: usize = 0;
-    var v = value;
-    while (v > 0 and i < buf.len) : (v >>= 4) {
-        const nibble: u8 = @intCast(v & 0xF);
-        buf[i] = if (nibble < 10) '0' + nibble else 'a' + nibble - 10;
-        i += 1;
-    }
-    var j: usize = 0;
-    while (j < i / 2) : (j += 1) {
-        const tmp = buf[j];
-        buf[j] = buf[i - 1 - j];
-        buf[i - 1 - j] = tmp;
-    }
-    return buf[0..i];
 }
 
 pub fn loadProgramForExec(name: []const u8, argv: []const []const u8) ?ExecResult {
@@ -608,7 +617,10 @@ pub fn loadProgramForExec(name: []const u8, argv: []const []const u8) ?ExecResul
         const seg_filesz = phdr.p_filesz;
         const seg_memsz = phdr.p_memsz;
         const seg_offset = phdr.p_offset;
-        if (seg_vaddr >= 0x0000_8000_0000_0000) { success = false; break; }
+        if (seg_vaddr >= 0x0000_8000_0000_0000) {
+            success = false;
+            break;
+        }
 
         const seg_flags = phdr.p_flags;
         const seg_writable = (seg_flags & 0x2) != 0;
@@ -621,7 +633,10 @@ pub fn loadProgramForExec(name: []const u8, argv: []const []const u8) ?ExecResul
 
         for (0..num_pages) |p| {
             const page_vaddr = seg_start + p * paging.PAGE_SIZE;
-            const phys = pmm.allocPage() orelse { success = false; break; };
+            const phys = pmm.allocPage() orelse {
+                success = false;
+                break;
+            };
             const dst: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
             @memset(dst[0..paging.PAGE_SIZE], 0);
 
@@ -644,7 +659,10 @@ pub fn loadProgramForExec(name: []const u8, argv: []const []const u8) ?ExecResul
                 .no_execute = !seg_executable,
                 .global = false,
             };
-            paging.mapPage(new_pml4, page_vaddr, phys, map_flags) catch { success = false; break; };
+            paging.mapPageNoFlush(new_pml4, page_vaddr, phys, map_flags) catch {
+                success = false;
+                break;
+            };
         }
         const seg_end = seg_vaddr + seg_memsz;
         if (seg_end > highest_addr) highest_addr = seg_end;
@@ -661,7 +679,7 @@ pub fn loadProgramForExec(name: []const u8, argv: []const []const u8) ?ExecResul
         return null;
     };
     const user_stack_base = user_space.USER_STACK_TOP - paging.PAGE_SIZE;
-    user_space.mapUserPage(new_pml4, user_stack_base, stack_phys, true) catch {
+    user_space.mapUserPageNoFlush(new_pml4, user_stack_base, stack_phys, true) catch {
         user_space.destroyUserSpace(new_pml4);
         return null;
     };
@@ -669,11 +687,10 @@ pub fn loadProgramForExec(name: []const u8, argv: []const []const u8) ?ExecResul
     const user_rsp = buildUserStack(stack_phys, user_space.USER_STACK_TOP, argv, .{});
 
     {
-        var buf2: [32]u8 = undefined;
         serial.writeString("[loader-exec] entry=0x");
-        serial.writeString(formatHex(&buf2, ehdr.e_entry));
+        fmt.writeHex(ehdr.e_entry);
         serial.writeString(" phnum=");
-        serial.writeString(formatInt(&buf2, ehdr.e_phnum));
+        fmt.writeDecimal(ehdr.e_phnum);
         serial.writeString("\n");
     }
 

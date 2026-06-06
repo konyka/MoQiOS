@@ -65,10 +65,14 @@ pm_entry:
     or $(1 << 5), %eax
     mov %eax, %cr4
 
-    /* Enable long mode (EFER.LME) */
+    /* Enable long mode (EFER.LME) + No-Execute Enable (EFER.NXE).
+       NXE (bit 11) is REQUIRED: the kernel page tables set the NX bit (63) on
+       non-executable pages (e.g. the LAPIC MMIO mapping). With NXE=0 bit 63 is
+       reserved, so the AP would take a reserved-bit page fault when its cold TLB
+       walks any NX entry — the BSP avoids this only because it set NXE at boot. */
     mov $0xC0000080, %ecx
     rdmsr
-    or $(1 << 8), %eax
+    or $((1 << 8) | (1 << 11)), %eax
     wrmsr
 
     /* Enable paging */

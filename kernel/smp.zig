@@ -4,23 +4,52 @@
 /// 1. Copying the AP trampoline to physical address 0x8000
 /// 2. Filling the trampoline data area at 0x7000
 /// 3. Sending INIT IPI + SIPI via LAPIC
-/// 4. AP boots through real→protected→long mode, initializes GDT/per-CPU data,
-///    and enters the idle loop.
+/// 4. AP boots through real→protected→long mode, initializes GDT/IDT/per-CPU
+///    data, enables its LAPIC, and parks (see apParkLoop).
 ///
-/// Known limitation: LAPIC MMIO access crashes on AP via HHDM-mapped address.
-/// Root cause unknown; APIC timer interrupts deferred until resolved.
-
+/// History / status (2026-06):
+///   - FIXED: the long-standing "LAPIC MMIO access crashes on AP" bug. Root
+///     cause was that the trampoline enabled EFER.LME but NOT EFER.NXE, so when
+///     the AP's cold TLB walked any page-table entry with the NX bit set (e.g.
+///     the LAPIC MMIO mapping, which is no_execute), bit 63 was treated as a
+///     reserved bit → reserved-bit page fault → #DF → triple fault. The BSP set
+///     NXE at boot and never saw it; the AP did not. The trampoline now sets
+///     EFER.NXE alongside LME. APs also now load the IDT (idt.loadOnThisCpu).
+///     With these fixes APs reliably reach "[SMP] AP N initialized".
+///   - GATED: `enable_ap_startup` is still false by default. Bringing an AP
+///     fully online (even parked) currently destabilizes the BSP's user
+///     processes: they triple-fault nondeterministically (varying user RIPs).
+///     An attribution test (do all BSP-side setup but skip INIT/SIPI) stays
+///     stable, so the trigger is an AP *running*, not the page-table/PMM setup.
+///     This points to the per-CPU/scheduler infrastructure not yet being
+///     SMP-safe (global scheduler state, no TLB shootdown), likely amplifying a
+///     pre-existing user-space fault that also triggers uniprocessor (~hello26).
+///     Resolving that is tracked separately; until then we run uniprocessor.
 const acpi = @import("acpi/acpi_parser.zig");
 const lapic = @import("arch/x86_64/lapic.zig");
 const gdt = @import("arch/x86_64/gdt.zig");
+const idt = @import("arch/x86_64/idt.zig");
 const paging = @import("arch/x86_64/paging.zig");
 const hhdm = @import("mm/hhdm.zig");
 const pmm = @import("mm/pmm.zig");
 const serial = @import("arch/x86_64/serial.zig");
 const sched = @import("proc/sched.zig");
 const syscall_entry = @import("arch/x86_64/syscall_entry.zig");
+const fmt = @import("lib/fmt.zig");
 
 const KERNEL_STACK_PAGES: u64 = 16;
+
+/// Master switch for Application Processor (AP) bring-up.
+///
+/// Disabled by default. The original LAPIC-on-AP crash that hung boot is FIXED
+/// (EFER.NXE + AP IDT load; see the module doc comment), and APs now reach
+/// "[SMP] AP N initialized" and park cleanly. However, with an AP actually
+/// running the BSP's user processes triple-fault nondeterministically, so we
+/// keep running uniprocessor (fully functional) until the per-CPU/scheduler
+/// infrastructure is made SMP-safe. Flip to `true` to bring APs online for
+/// further SMP work (expect user-space instability until the scheduler is
+/// per-CPU).
+pub const enable_ap_startup: bool = false;
 
 /// Number of CPUs currently online (1 = BSP only).
 pub var cpu_count: u32 = 1;
@@ -31,21 +60,6 @@ pub var bsp_apic_id: u32 = 0;
 /// AP trampoline binary (precompiled flat binary, embedded at compile time).
 const trampoline_bin = @embedFile("arch/x86_64/ap_trampoline.bin");
 
-/// Write a hex value to serial
-fn writeHex(value: u64) void {
-    var shift: u64 = 60;
-    var started = false;
-    while (shift > 0) : (shift -= 4) {
-        const nibble = (value >> @intCast(shift)) & 0xF;
-        if (nibble != 0 or started) {
-            serial.writeByte(if (nibble > 9) 'A' + @as(u8, @intCast(nibble - 10)) else '0' + @as(u8, @intCast(nibble)));
-            started = true;
-        }
-    }
-    const last = value & 0xF;
-    serial.writeByte(if (last > 9) 'A' + @as(u8, @intCast(last - 10)) else '0' + @as(u8, @intCast(last)));
-}
-
 /// Small delay loop (approximate, not precise).
 fn microDelay(us: u32) void {
     var count: u32 = us * 250;
@@ -54,37 +68,60 @@ fn microDelay(us: u32) void {
     }
 }
 
+/// Lock-free raw COM1 byte output — safe to call from an AP before any kernel
+/// lock infrastructure is known-good for this CPU. Used for bring-up markers so
+/// a crash never deadlocks on the shared serial lock.
+fn rawPutc(c: u8) void {
+    asm volatile ("outb %[ch], %[port]"
+        :
+        : [ch] "{al}" (c),
+          [port] "N{dx}" (@as(u16, 0x3F8)),
+    );
+}
+
 /// Entry point for APs — called from identity-mapped stub in 64-bit long mode.
 /// cpu_id is read from the trampoline data area at physical 0x7040.
+///
+/// Bring-up markers (lock-free, COM1): E=entered, F=GDT, G=IDT, H=per-CPU,
+/// I=LAPIC, J=GS base — then the locked "[SMP] AP N initialized" line.
 pub fn apEntry() callconv(.c) noreturn {
+    rawPutc('E');
+
     // Read cpu_id from trampoline data area (avoids calling convention issues)
     const id_ptr: *volatile u32 = @ptrFromInt(0x7040);
     const actual_cpu_id: u32 = id_ptr.*;
 
-    // Initialize per-CPU GDT and TSS
+    // Initialize per-CPU GDT and TSS, then load this CPU's IDT register.
     gdt.initAp(actual_cpu_id);
+    rawPutc('F');
+
+    // Each CPU must execute its own lidt for the shared IDT, otherwise the
+    // first fault/interrupt triple-faults the AP.
+    idt.loadOnThisCpu();
+    rawPutc('G');
 
     // Set up per-CPU data
     syscall_entry.percpu_array[actual_cpu_id].cpu_id = actual_cpu_id;
     syscall_entry.percpu_array[actual_cpu_id].apic_id = @truncate(actual_cpu_id);
     syscall_entry.percpu_array[actual_cpu_id].current_tid = 0;
+    rawPutc('H');
 
-    // TODO: LAPIC MMIO access crashes on AP regardless of mapping method
-    // (HHDM, identity-mapped 2MB, identity-mapped 4KB all fail).
-    // The APIC MSR enable works, but any MMIO read/write causes a triple fault.
-    // This is likely a QEMU TCG limitation with LAPIC MMIO on APs.
-    // Without LAPIC timer, the AP uses sti+hlt in the idle loop (no preemption).
+    // Enable this AP's LAPIC (inherit the BSP-mapped MMIO base). No timer yet:
+    // the scheduler is not SMP-aware, so APs must not drive it via timer IRQs.
+    lapic.setBase(lapic.getBase());
+    lapic.enableApNoTimer();
+    rawPutc('I');
 
     syscall_entry.setPerCpuGsBase(actual_cpu_id);
+    rawPutc('J');
 
     // Signal BSP that we're alive
     serial.writeString("[SMP] AP ");
     serial.writeByte('0' + @as(u8, @truncate(actual_cpu_id)));
     serial.writeString(" initialized\n");
 
-    // Enable interrupts and enter idle loop
-    asm volatile ("sti");
-    sched.apIdleLoop();
+    // Park: come online but do not participate in scheduling (see apParkLoop).
+    sched.apParkLoop();
 }
 
 /// Ensure all page table pages are mapped through HHDM.
@@ -155,21 +192,30 @@ fn makeHhdmWritable(pml4_phys: u64) void {
         if (!pdpt.entries[pdpt_idx].present) continue;
         if (pdpt.entries[pdpt_idx].huge_page) {
             pdpt.entries[pdpt_idx].writable = true;
-            asm volatile ("invlpg (%[addr])" :: [addr] "r" (virt_addr));
+            asm volatile ("invlpg (%[addr])"
+                :
+                : [addr] "r" (virt_addr),
+            );
             continue;
         }
         const pd: *paging.PageTable = hhdm.physToPtr(paging.PageTable, pdpt.entries[pdpt_idx].getPhysAddr());
         if (!pd.entries[pd_idx].present) continue;
         if (pd.entries[pd_idx].huge_page) {
             pd.entries[pd_idx].writable = true;
-            asm volatile ("invlpg (%[addr])" :: [addr] "r" (virt_addr));
+            asm volatile ("invlpg (%[addr])"
+                :
+                : [addr] "r" (virt_addr),
+            );
             continue;
         }
         const pt: *paging.PageTable = hhdm.physToPtr(paging.PageTable, pd.entries[pd_idx].getPhysAddr());
         if (!pt.entries[pt_idx].present) continue;
         if (!pt.entries[pt_idx].writable) {
             pt.entries[pt_idx].writable = true;
-            asm volatile ("invlpg (%[addr])" :: [addr] "r" (virt_addr));
+            asm volatile ("invlpg (%[addr])"
+                :
+                : [addr] "r" (virt_addr),
+            );
         }
     }
 }
@@ -182,6 +228,11 @@ pub fn init() void {
     syscall_entry.percpu_array[0].cpu_id = 0;
     syscall_entry.percpu_array[0].apic_id = bsp_apic_id;
     syscall_entry.percpu_array[0].current_tid = 0;
+
+    if (!enable_ap_startup) {
+        serial.writeString("[SMP] AP startup disabled (uniprocessor mode); running on BSP only\n");
+        return;
+    }
 
     if (acpi.info.cpu_count <= 1) {
         serial.writeString("[SMP] Single CPU system\n");
@@ -205,7 +256,7 @@ pub fn init() void {
     // This prevents our identity mapping allocation from returning pages
     // that are part of the kernel's page table hierarchy.
     const pml4_tbl: *paging.PageTable = hhdm.physToPtr(paging.PageTable, pml4_phys);
-    
+
     // Walk all used PML4 entries and reserve their page table pages in PMM.
     // Also ensure all page table pages are mapped through HHDM so the AP
     // can access kernel data structures through the high-half direct map.
@@ -215,14 +266,14 @@ pub fn init() void {
     for (&pml4_tbl.entries) |*entry| {
         if (!entry.present) continue;
         pmm.reservePage(entry.getPhysAddr()); // PDPT page
-        
+
         // Walk PDPT
         const pdpt: *paging.PageTable = hhdm.physToPtr(paging.PageTable, entry.getPhysAddr());
         for (&pdpt.entries) |*pdpt_entry| {
             if (!pdpt_entry.present) continue;
             if (pdpt_entry.huge_page) continue; // 1GB page, no deeper tables
             pmm.reservePage(pdpt_entry.getPhysAddr()); // PD page
-            
+
             // Walk PD
             const pd: *paging.PageTable = hhdm.physToPtr(paging.PageTable, pdpt_entry.getPhysAddr());
             for (&pd.entries) |*pd_entry| {
@@ -249,11 +300,11 @@ pub fn init() void {
         // Kernel PDPT is at PML4[511].getPhysAddr()
         const kernel_pdpt_phys = pml4_tbl.entries[511].getPhysAddr();
         serial.writeString("[SMP] Kernel PDPT phys=");
-        writeHex(kernel_pdpt_phys);
+        fmt.writeHex(kernel_pdpt_phys);
         serial.writeString(" id_pdpt=");
-        writeHex(id_pdpt_phys);
+        fmt.writeHex(id_pdpt_phys);
         serial.writeString(" id_pd=");
-        writeHex(id_pd_phys);
+        fmt.writeHex(id_pd_phys);
         serial.writeString("\n");
 
         if (id_pdpt_phys == kernel_pdpt_phys or id_pdpt_phys == pml4_phys or
@@ -302,7 +353,10 @@ pub fn init() void {
         pml4_tbl.entries[0].setPhysAddr(id_pdpt_phys);
 
         // Flush TLB for identity-mapped region
-        asm volatile ("invlpg (%[addr])" :: [addr] "r" (@as(u64, 0)));
+        asm volatile ("invlpg (%[addr])"
+            :
+            : [addr] "r" (@as(u64, 0)),
+        );
 
         serial.writeString("[SMP] Identity mapping created\n");
     } else {
@@ -351,9 +405,9 @@ pub fn init() void {
         const stack_top = mapApStack(stack_phys, KERNEL_STACK_PAGES);
 
         serial.writeString("[SMP] AP stack: phys=0x");
-        writeHex(stack_phys);
+        fmt.writeHex(stack_phys);
         serial.writeString(" top=0x");
-        writeHex(stack_top);
+        fmt.writeHex(stack_top);
         serial.writeString("\n");
 
         // Store AP stack in trampoline data
@@ -362,44 +416,57 @@ pub fn init() void {
         const stack_ptr: *u64 = @ptrFromInt(hhdm.physToVirt(0x7010));
         stack_ptr.* = stack_phys + KERNEL_STACK_PAGES * paging.PAGE_SIZE;
 
-    // Store kernel entry point at 0x7030 (AP will jump here after paging)
-    // Compute identity-mapped address: apEntry_virt - kernel_virt_base + kernel_phys_base
-    // This avoids the AP needing to walk the kernel mapping (PML4[511]) which
-    // might have issues with empty TLB on some configurations.
-    const kernel_pdpt_phys = pml4_tbl.entries[511].getPhysAddr();
-    const kernel_pdpt: *paging.PageTable = hhdm.physToPtr(paging.PageTable, kernel_pdpt_phys);
-    const kernel_pd_phys = kernel_pdpt.entries[510].getPhysAddr();
-    const kernel_pd: *paging.PageTable = hhdm.physToPtr(paging.PageTable, kernel_pd_phys);
-    const kernel_pt_phys = kernel_pd.entries[0].getPhysAddr();
-    const kernel_pt: *paging.PageTable = hhdm.physToPtr(paging.PageTable, kernel_pt_phys);
-    const kernel_phys_base = kernel_pt.entries[0].getPhysAddr();
-    const apentry_phys = kernel_phys_base + (@intFromPtr(&apEntry) - 0xFFFFFFFF80000000);
+        // Store kernel entry point at 0x7030 (AP will jump here after paging)
+        // Compute identity-mapped address: apEntry_virt - kernel_virt_base + kernel_phys_base
+        // This avoids the AP needing to walk the kernel mapping (PML4[511]) which
+        // might have issues with empty TLB on some configurations.
+        const kernel_pdpt_phys = pml4_tbl.entries[511].getPhysAddr();
+        const kernel_pdpt: *paging.PageTable = hhdm.physToPtr(paging.PageTable, kernel_pdpt_phys);
+        const kernel_pd_phys = kernel_pdpt.entries[510].getPhysAddr();
+        const kernel_pd: *paging.PageTable = hhdm.physToPtr(paging.PageTable, kernel_pd_phys);
+        const kernel_pt_phys = kernel_pd.entries[0].getPhysAddr();
+        const kernel_pt: *paging.PageTable = hhdm.physToPtr(paging.PageTable, kernel_pt_phys);
+        const kernel_phys_base = kernel_pt.entries[0].getPhysAddr();
+        const apentry_phys = kernel_phys_base + (@intFromPtr(&apEntry) - 0xFFFFFFFF80000000);
 
-    serial.writeString("[SMP] kernel_phys_base=0x");
-    writeHex(kernel_phys_base);
-    serial.writeString(" apentry_phys=0x");
-    writeHex(apentry_phys);
-    serial.writeString("\n");
+        serial.writeString("[SMP] kernel_phys_base=0x");
+        fmt.writeHex(kernel_phys_base);
+        serial.writeString(" apentry_phys=0x");
+        fmt.writeHex(apentry_phys);
+        serial.writeString("\n");
 
-    const entry_ptr: *u64 = @ptrFromInt(hhdm.physToVirt(0x7030));
-    entry_ptr.* = apentry_phys;
+        const entry_ptr: *u64 = @ptrFromInt(hhdm.physToVirt(0x7030));
+        entry_ptr.* = apentry_phys;
 
-    // Write a small 64-bit jump stub at physical 0x6000 that:
-    // 1. Passes cpu_id in rdi (from 0x7040)
-    // 2. Jumps to the real apEntry (from 0x7030)
-    // This stub runs at identity-mapped addresses and bridges to kernel space.
-    const stub_base = hhdm.physToVirt(0x6000);
-    const stub: [*]u8 = @ptrFromInt(stub_base);
-    // mov rdi, [0x7040]  -> 48 8B 3C 25 40 70 00 00
-    stub[0] = 0x48; stub[1] = 0x8B; stub[2] = 0x3C; stub[3] = 0x25;
-    stub[4] = 0x40; stub[5] = 0x70; stub[6] = 0x00; stub[7] = 0x00;
-    // jmp [0x7030]  -> FF 25 30 70 00 00 (rip-relative, but we need absolute)
-    // Actually use: mov rax, [0x7030]; jmp rax
-    // mov rax, [0x7030]  -> 48 8B 04 25 30 70 00 00
-    stub[8] = 0x48; stub[9] = 0x8B; stub[10] = 0x04; stub[11] = 0x25;
-    stub[12] = 0x30; stub[13] = 0x70; stub[14] = 0x00; stub[15] = 0x00;
-    // jmp rax  -> FF E0
-    stub[16] = 0xFF; stub[17] = 0xE0;
+        // Write a small 64-bit jump stub at physical 0x6000 that:
+        // 1. Passes cpu_id in rdi (from 0x7040)
+        // 2. Jumps to the real apEntry (from 0x7030)
+        // This stub runs at identity-mapped addresses and bridges to kernel space.
+        const stub_base = hhdm.physToVirt(0x6000);
+        const stub: [*]u8 = @ptrFromInt(stub_base);
+        // mov rdi, [0x7040]  -> 48 8B 3C 25 40 70 00 00
+        stub[0] = 0x48;
+        stub[1] = 0x8B;
+        stub[2] = 0x3C;
+        stub[3] = 0x25;
+        stub[4] = 0x40;
+        stub[5] = 0x70;
+        stub[6] = 0x00;
+        stub[7] = 0x00;
+        // jmp [0x7030]  -> FF 25 30 70 00 00 (rip-relative, but we need absolute)
+        // Actually use: mov rax, [0x7030]; jmp rax
+        // mov rax, [0x7030]  -> 48 8B 04 25 30 70 00 00
+        stub[8] = 0x48;
+        stub[9] = 0x8B;
+        stub[10] = 0x04;
+        stub[11] = 0x25;
+        stub[12] = 0x30;
+        stub[13] = 0x70;
+        stub[14] = 0x00;
+        stub[15] = 0x00;
+        // jmp rax  -> FF E0
+        stub[16] = 0xFF;
+        stub[17] = 0xE0;
 
         // Store CPU ID (write as u64 to avoid garbage in upper 32 bits)
         const cpu_id_ptr: *u64 = @ptrFromInt(hhdm.physToVirt(0x7040));

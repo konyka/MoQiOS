@@ -1,8 +1,8 @@
 /// TSC (Time Stamp Counter) — frequency detection and timestamp utilities.
 /// Detects TSC frequency via CPUID 0x15 (Intel) or falls back to QEMU default.
-
 const serial = @import("serial.zig");
 const klog = @import("../../klog.zig");
+const fmt = @import("../../lib/fmt.zig");
 
 /// TSC frequency in MHz.
 pub var tsc_freq_mhz: u64 = 0;
@@ -34,8 +34,7 @@ pub fn init() void {
     }
 
     serial.writeString("[tsc] Frequency: ");
-    var buf: [20]u8 = undefined;
-    serial.writeString(formatInt(&buf, tsc_freq_mhz));
+    fmt.writeDecimal64(tsc_freq_mhz);
     serial.writeString(" MHz\n");
 
     klog.log(.info, "TSC initialized");
@@ -46,7 +45,8 @@ pub fn read() u64 {
     var low: u32 = undefined;
     var high: u32 = undefined;
     asm volatile ("rdtsc"
-        : [low] "={eax}" (low), [high] "={edx}" (high),
+        : [low] "={eax}" (low),
+          [high] "={edx}" (high),
     );
     return (@as(u64, high) << 32) | @as(u64, low);
 }
@@ -63,28 +63,12 @@ fn cpuid(leaf: u32, subleaf: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u3
     var ecx: u32 = undefined;
     var edx: u32 = undefined;
     asm volatile ("cpuid"
-        : [eax] "={eax}" (eax), [ebx] "={ebx}" (ebx), [ecx] "={ecx}" (ecx), [edx] "={edx}" (edx)
-        : [leaf] "{eax}" (leaf), [subleaf] "{ecx}" (subleaf),
+        : [eax] "={eax}" (eax),
+          [ebx] "={ebx}" (ebx),
+          [ecx] "={ecx}" (ecx),
+          [edx] "={edx}" (edx),
+        : [leaf] "{eax}" (leaf),
+          [subleaf] "{ecx}" (subleaf),
     );
     return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
-}
-
-fn formatInt(buf: []u8, value: u64) []const u8 {
-    if (value == 0) {
-        buf[0] = '0';
-        return buf[0..1];
-    }
-    var i: usize = 0;
-    var v = value;
-    while (v > 0) : (v /= 10) {
-        buf[i] = @intCast(v % 10 + '0');
-        i += 1;
-    }
-    var j: usize = 0;
-    while (j < i / 2) : (j += 1) {
-        const tmp = buf[j];
-        buf[j] = buf[i - 1 - j];
-        buf[i - 1 - j] = tmp;
-    }
-    return buf[0..i];
 }

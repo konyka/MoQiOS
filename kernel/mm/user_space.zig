@@ -6,7 +6,6 @@
 ///
 /// The kernel PML4 entries are shared (not copied), so kernel mappings
 /// are automatically visible in every user address space.
-
 const paging = @import("../arch/x86_64/paging.zig");
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
@@ -20,9 +19,10 @@ pub const PAGE_SIZE: u64 = 4096;
 /// Specific regions within user space:
 ///   0x0000_0000_0040_0000 (4MB)    : code region (load address)
 ///   0x0000_0000_7FC0_0000 (~2GB-64MB): stack region (grows down from ~2GB)
-
 pub const USER_CODE_BASE: u64 = 0x0040_0000; // 4MB — where programs are loaded
 pub const USER_STACK_TOP: u64 = 0x0080_0000; // 8MB — stack grows down from here
+pub const USER_STACK_BOTTOM: u64 = 0x0001_0000; // 64KB — minimum stack address
+pub const USER_STACK_INITIAL: u64 = 64 * PAGE_SIZE; // 256KB — initial stack allocation
 
 /// Create a new user address space (PML4).
 /// Copies kernel-space entries (256-511) from the kernel PML4.
@@ -48,14 +48,25 @@ pub fn createUserSpace() ?u64 {
 
 /// Map a page into a user address space.
 pub fn mapUserPage(pml4_phys: u64, virt: u64, phys: u64, writable: bool) !void {
+    try mapUserPageInner(pml4_phys, virt, phys, writable, true);
+}
+
+/// Map a user page without TLB flush — for building new page tables.
+pub fn mapUserPageNoFlush(pml4_phys: u64, virt: u64, phys: u64, writable: bool) !void {
+    try mapUserPageInner(pml4_phys, virt, phys, writable, false);
+}
+
+fn mapUserPageInner(pml4_phys: u64, virt: u64, phys: u64, writable: bool, flush: bool) !void {
     const flags = paging.MapFlags{
         .writable = writable,
-        .user = true, // User-accessible
+        .user = true,
         .no_execute = true,
-        .global = false, // Not global (per-process)
+        .global = false,
     };
-
-    try paging.mapPage(pml4_phys, virt, phys, flags);
+    if (flush)
+        try paging.mapPage(pml4_phys, virt, phys, flags)
+    else
+        try paging.mapPageNoFlush(pml4_phys, virt, phys, flags);
 }
 
 /// Destroy a user address space — free all user-space page tables and mapped pages.

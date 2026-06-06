@@ -2,7 +2,6 @@
 /// Booted via Limine protocol. Initializes: GDT, IDT, HHDM, klog,
 /// TSC, symbol table, PMM, paging, ACPI, slab allocator, DMA stubs,
 /// LAPIC timer, scheduler, IPC engine, user-space support.
-
 const limine = @import("limine.zig");
 const serial = @import("arch/x86_64/serial.zig");
 const gdt = @import("arch/x86_64/gdt.zig");
@@ -25,6 +24,7 @@ const capability = @import("ipc/capability.zig");
 const syscall_entry = @import("arch/x86_64/syscall_entry.zig");
 const ramdisk = @import("fs/ramdisk.zig");
 const loader = @import("proc/loader.zig");
+const fmt = @import("lib/fmt.zig");
 
 pub const panic = @import("panic.zig").panic;
 
@@ -89,9 +89,8 @@ export fn _start() callconv(.c) noreturn {
     }
     acpi.init(rsdp_phys);
     if (acpi.info.cpu_count > 0) {
-        var buf: [64]u8 = undefined;
         serial.writeString("[INF] ACPI: ");
-        serial.writeString(formatInt(&buf, acpi.info.cpu_count));
+        fmt.writeDecimal(acpi.info.cpu_count);
         serial.writeString(" CPUs detected\n");
     }
 
@@ -100,6 +99,10 @@ export fn _start() callconv(.c) noreturn {
 
     // M2: DMA stubs
     dma.init();
+
+    // Framebuffer graphics driver
+    const framebuffer = @import("drivers/framebuffer.zig");
+    framebuffer.init();
 
     // M6.0: PCI enumeration
     const pci = @import("drivers/pci.zig");
@@ -112,6 +115,49 @@ export fn _start() callconv(.c) noreturn {
     // M7: Virtio-blk driver
     const virtio_blk = @import("drivers/virtio_blk.zig");
     virtio_blk.init();
+
+    // M7: NVMe driver
+    const nvme = @import("drivers/nvme.zig");
+    nvme.init();
+
+    // M7: Block device abstraction layer — register all block devices
+    const page_cache = @import("fs/page_cache.zig");
+    page_cache.init();
+    const block_dev = @import("drivers/block_dev.zig");
+    if (virtio_blk.hasActiveDisk()) {
+        var vb_name: [16]u8 = @splat(0);
+        vb_name[0] = 'v';
+        vb_name[1] = 'b';
+        vb_name[2] = 'l';
+        vb_name[3] = 'k';
+        vb_name[4] = '0';
+        _ = block_dev.registerDevice(.{
+            .dev_type = .virtio_blk,
+            .sector_size = 512,
+            .total_sectors = virtio_blk.getCapacity(),
+            .name = vb_name,
+            .name_len = 5,
+            .supports_flush = false,
+            .max_transfer_sectors = 128,
+        }, 0);
+    }
+    if (ahci.hasActiveDisk()) {
+        var ahci_name: [16]u8 = @splat(0);
+        ahci_name[0] = 's';
+        ahci_name[1] = 'd';
+        ahci_name[2] = 'a';
+        _ = block_dev.registerDevice(.{
+            .dev_type = .ahci,
+            .sector_size = ahci.getSectorSize(),
+            .total_sectors = ahci.getTotalSectors(),
+            .name = ahci_name,
+            .name_len = 3,
+            .supports_flush = true,
+            .max_transfer_sectors = 128,
+        }, 0);
+    }
+    // NVMe registration is handled inside nvme.init()
+    klog.log(.info, "Block device layer initialized");
 
     // M7: Test block read
     if (virtio_blk.hasActiveDisk()) {
@@ -132,6 +178,10 @@ export fn _start() callconv(.c) noreturn {
     const e1000 = @import("drivers/e1000.zig");
     e1000.init();
 
+    // Virtio-net driver (high-performance NIC)
+    const virtio_net = @import("drivers/virtio_net.zig");
+    virtio_net.init();
+
     // M8: Network protocol stack (ARP cache init, MAC address setup)
     const net_mod = @import("net/mod.zig");
     net_mod.init();
@@ -139,6 +189,14 @@ export fn _start() callconv(.c) noreturn {
     // ext2 filesystem (on first virtio-blk disk at LBA offset 32768)
     const ext2 = @import("fs/ext2.zig");
     ext2.init();
+
+    // tmpfs in-memory filesystem
+    const tmpfs = @import("fs/tmpfs.zig");
+    tmpfs.init();
+
+    // /dev/urandom PRNG
+    const random = @import("drivers/random.zig");
+    random.init();
 
     // M3: LAPIC timer — use LAPIC address from ACPI MADT, fallback to 0xFEE00000
     const lapic_addr = if (acpi.info.lapic_address != 0) acpi.info.lapic_address else 0xFEE00000;
@@ -162,8 +220,7 @@ export fn _start() callconv(.c) noreturn {
             const path_len = strnLen(mod_file.path, 256);
             serial.writeString(mod_file.path[0..path_len]);
             serial.writeString(" (");
-            var buf: [16]u8 = undefined;
-            serial.writeString(formatInt(&buf, mod_file.size));
+            fmt.writeDecimal64(mod_file.size);
             serial.writeString(" bytes)\n");
             if (!ramdisk.init(mod_file.address, mod_file.size)) {
                 klog.log(.info, "Failed to parse ramdisk");
@@ -185,8 +242,7 @@ export fn _start() callconv(.c) noreturn {
     // M5.5: Load init program from ramdisk as the first user process (pid 1)
     if (loader.loadProgram("init", 0)) |task_idx| {
         serial.writeString("[kernel] init launched as task ");
-        var buf: [16]u8 = undefined;
-        serial.writeString(formatInt(&buf, task_idx));
+        fmt.writeDecimal(task_idx);
         serial.writeString("\n");
     } else {
         klog.log(.info, "Failed to load init from ramdisk — system halted");
@@ -247,26 +303,6 @@ pub fn mapAcpiPage(phys_addr: u64) void {
         .cache_disable = true,
     };
     paging.mapHugePage(pml4, hhdm.physToVirt(huge_page_base), huge_page_base, flags) catch {};
-}
-
-fn formatInt(buf: []u8, value: u64) []const u8 {
-    if (value == 0) {
-        buf[0] = '0';
-        return buf[0..1];
-    }
-    var i: usize = 0;
-    var v = value;
-    while (v > 0) : (v /= 10) {
-        buf[i] = @intCast(v % 10 + '0');
-        i += 1;
-    }
-    var j: usize = 0;
-    while (j < i / 2) : (j += 1) {
-        const tmp = buf[j];
-        buf[j] = buf[i - 1 - j];
-        buf[i - 1 - j] = tmp;
-    }
-    return buf[0..i];
 }
 
 fn strnLen(s: [*:0]u8, max: usize) usize {

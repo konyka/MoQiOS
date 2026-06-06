@@ -4,11 +4,11 @@
 ///   - MBR partition table parsing (primary partitions only)
 ///   - FAT32 filesystem: BPB parsing, cluster chain traversal, file listing
 ///   - Falls back to raw FAT32 if no MBR partition table found
-
 const serial = @import("../arch/x86_64/serial.zig");
 const virtio_blk = @import("../drivers/virtio_blk.zig");
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
+const fmt = @import("../lib/fmt.zig");
 
 pub const SECTOR_SIZE: u32 = 512;
 pub const MAX_PARTITIONS: u32 = 4;
@@ -124,11 +124,11 @@ fn parseMBR(buf: [*]const u8) void {
         serial.writeString("[fs] Partition ");
         serial.writeByte('0' + @as(u8, @intCast(partition_count - 1)));
         serial.writeString(": type=0x");
-        writeHexByte(ptype);
+        fmt.writeHex8(ptype);
         serial.writeString(" lba=");
-        writeDecimal32(lba_start);
+        fmt.writeDecimal(lba_start);
         serial.writeString(" size=");
-        writeDecimal32(sector_count);
+        fmt.writeDecimal(sector_count);
         serial.writeString(" sectors\n");
     }
 
@@ -205,11 +205,11 @@ fn tryMountFAT32() void {
     fat32_active = true;
 
     serial.writeString("[fs] FAT32 mounted: ");
-    writeDecimal32(fat32_total_sectors);
+    fmt.writeDecimal(fat32_total_sectors);
     serial.writeString(" sectors, cluster=");
-    writeDecimal32(@as(u32, sectors_per_cluster));
+    fmt.writeDecimal(@as(u32, sectors_per_cluster));
     serial.writeString(" sectors, root_cluster=");
-    writeDecimal32(root_cluster);
+    fmt.writeDecimal(root_cluster);
     serial.writeString("\n");
 
     // List root directory
@@ -298,9 +298,9 @@ fn listRootDir() void {
                 serial.writeString(fi.name[0..ni]);
                 if (is_dir) serial.writeString("/");
                 serial.writeString(" size=");
-                writeDecimal32(fi.size);
+                fmt.writeDecimal(fi.size);
                 serial.writeString(" cluster=");
-                writeDecimal32(fi.first_cluster);
+                fmt.writeDecimal(fi.first_cluster);
                 serial.writeString("\n");
             }
         }
@@ -308,7 +308,7 @@ fn listRootDir() void {
         cluster = getFATEntry(cluster);
     }
     serial.writeString("[fs] ");
-    writeDecimal32(file_count);
+    fmt.writeDecimal(file_count);
     serial.writeString(" files in root directory\n");
 }
 
@@ -342,6 +342,9 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
     const to_read = if (count > remaining) remaining else count;
     if (to_read == 0) return 0;
 
+    const page_cache = @import("page_cache.zig");
+    const inode_id: u64 = 0x2000_0000_0000_0000 + @as(u64, fi.first_cluster);
+
     // Walk cluster chain to find the right cluster
     const cluster_size = @as(u32, fat32_sectors_per_cluster) * SECTOR_SIZE;
     const start_cluster_idx = offset / cluster_size;
@@ -361,25 +364,45 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
 
     while (total_read < to_read and cluster >= 2 and cluster < 0x0FFFFFF8) {
         const lba = clusterToLBA(cluster);
-        const sector_buf: [*]u8 = @ptrFromInt(sector_buf_virt);
+        const cluster_page_idx: u64 = @as(u64, cluster) * @as(u64, fat32_sectors_per_cluster) / 8; // pages per cluster
 
-        // Read entire cluster
-        var s: u32 = 0;
-        while (s < fat32_sectors_per_cluster) : (s += 1) {
-            _ = virtio_blk.readSectors(lba + s, 1, sector_buf);
+        // Try page cache for this cluster
+        if (page_cache.readPage(inode_id, cluster_page_idx)) |cached| {
+            const avail = cluster_size - current_offset_in_cluster;
+            const chunk = if (total_read + avail > to_read) to_read - total_read else avail;
+            @memcpy(buf[total_read .. total_read + chunk], cached[current_offset_in_cluster .. current_offset_in_cluster + chunk]);
+            total_read += chunk;
+        } else {
+            // Cache miss — read from disk
+            const sector_buf: [*]u8 = @ptrFromInt(sector_buf_virt);
+            var s: u32 = 0;
+            while (s < fat32_sectors_per_cluster) : (s += 1) {
+                _ = virtio_blk.readSectors(lba + s, 1, sector_buf);
+            }
+
+            // Copy from cluster to output buffer
+            const avail = cluster_size - current_offset_in_cluster;
+            const chunk = if (total_read + avail > to_read) to_read - total_read else avail;
+            @memcpy(buf[total_read .. total_read + chunk], sector_buf[current_offset_in_cluster .. current_offset_in_cluster + chunk]);
+            total_read += chunk;
+
+            // Insert into page cache (only if cluster fits in 4KB or we cache first 4KB)
+            if (cluster_size <= 4096) {
+                const page_data: *const [4096]u8 = sector_buf[0..4096];
+                _ = page_cache.insertPage(inode_id, cluster_page_idx, page_data);
+            }
         }
-
-        // Copy from cluster to output buffer
-        const avail = cluster_size - current_offset_in_cluster;
-        const chunk = if (total_read + avail > to_read) to_read - total_read else avail;
-        @memcpy(buf[total_read .. total_read + chunk], sector_buf[current_offset_in_cluster .. current_offset_in_cluster + chunk]);
-        total_read += chunk;
         current_offset_in_cluster = 0;
 
         cluster = getFATEntry(cluster);
     }
 
     return @intCast(total_read);
+}
+
+pub fn getFirstCluster(file_idx: u32) u32 {
+    if (file_idx >= MAX_FILES) return 0;
+    return files[file_idx].first_cluster;
 }
 
 pub fn isActive() bool {
@@ -678,35 +701,6 @@ fn updateDirEntry(file_idx: u32) void {
             return;
         }
     }
-}
-
-fn writeHexByte(v: u8) void {
-    const hex = "0123456789abcdef";
-    var buf: [2]u8 = undefined;
-    buf[0] = hex[(v >> 4) & 0xF];
-    buf[1] = hex[v & 0xF];
-    serial.writeString(&buf);
-}
-
-fn writeDecimal32(v: u32) void {
-    if (v == 0) {
-        serial.writeString("0");
-        return;
-    }
-    var buf: [10]u8 = undefined;
-    var val = v;
-    var i: usize = 0;
-    while (val > 0) : (val /= 10) {
-        buf[i] = @intCast(val % 10 + '0');
-        i += 1;
-    }
-    var j: usize = 0;
-    while (j < i / 2) : (j += 1) {
-        const tmp = buf[j];
-        buf[j] = buf[i - 1 - j];
-        buf[i - 1 - j] = tmp;
-    }
-    serial.writeString(buf[0..i]);
 }
 
 pub fn deleteFile(file_idx: u32) bool {

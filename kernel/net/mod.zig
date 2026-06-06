@@ -5,6 +5,9 @@ const ipv4 = @import("ipv4.zig");
 const icmp = @import("icmp.zig");
 const udp = @import("udp.zig");
 pub const tcp = @import("tcp.zig");
+pub const epoll = @import("epoll.zig");
+pub const unix_socket = @import("unix_socket.zig");
+pub const socket_opt = @import("socket_opt.zig");
 
 pub fn init() void {
     netif.ensureInit();

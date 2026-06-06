@@ -1,6 +1,6 @@
 /// Kernel symbol table — parses ELF .symtab for panic backtraces.
-
 const serial = @import("../arch/x86_64/serial.zig");
+const fmt = @import("../lib/fmt.zig");
 
 pub const Symbol = struct {
     addr: u64 = 0,
@@ -76,48 +76,13 @@ pub fn sort() void {
 pub fn printBacktrace(addrs: []const u64) void {
     for (addrs, 0..) |addr, i| {
         serial.writeString("  #");
-        writeDecimal(@intCast(i));
+        fmt.writeDecimal(@intCast(i));
         serial.writeString(" 0x");
-        writeHex(addr);
+        fmt.writeHex(addr);
         if (lookup(addr)) |name| {
             serial.writeString(" ");
             serial.writeString(name);
         }
         serial.writeString("\n");
     }
-}
-
-fn writeHex(value: u64) void {
-    const hex = "0123456789abcdef";
-    var buf: [16]u8 = undefined;
-    var v = value;
-    var i: usize = 16;
-    while (i > 0) {
-        i -= 1;
-        buf[i] = hex[@as(usize, @intCast(v & 0xf))];
-        v >>= 4;
-    }
-    serial.writeString(&buf);
-}
-
-fn writeDecimal(value: u32) void {
-    var buf: [10]u8 = undefined;
-    if (value == 0) {
-        buf[0] = '0';
-        serial.writeString(buf[0..1]);
-        return;
-    }
-    var v = value;
-    var len: usize = 0;
-    while (v > 0) : (v /= 10) {
-        buf[len] = @intCast(v % 10 + '0');
-        len += 1;
-    }
-    var j: usize = 0;
-    while (j < len / 2) : (j += 1) {
-        const tmp = buf[j];
-        buf[j] = buf[len - 1 - j];
-        buf[len - 1 - j] = tmp;
-    }
-    serial.writeString(buf[0..len]);
 }

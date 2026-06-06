@@ -7,9 +7,11 @@
 ///
 /// This is generated at build time by tools/mkramdisk.sh and loaded as a
 /// Limine module. The kernel parses it once at boot and provides lookup by name.
-
 const serial = @import("../arch/x86_64/serial.zig");
+const str = @import("../lib/str.zig");
 const klog = @import("../klog.zig");
+const fmt = @import("../lib/fmt.zig");
+const bo = @import("../lib/byte_order.zig");
 
 /// Max files in the ramdisk index.
 pub const MAX_FILES: u32 = 32;
@@ -82,25 +84,24 @@ pub fn init(base: [*]const u8, size: u64) bool {
         .initialized = true,
     };
 
-    var buf: [16]u8 = undefined;
     klog.log(.info, "Ramdisk initialized");
     serial.writeString("  ");
-    serial.writeString(formatInt(&buf, file_count));
+    fmt.writeDecimal(file_count);
     serial.writeString(" files, data offset ");
-    serial.writeString(formatInt(&buf, data_off));
+    fmt.writeDecimal64(data_off);
     serial.writeString("\n");
 
     for (0..file_count) |i| {
         const entry_base = base + entries_off + @as(u64, i) * entry_size;
         const name_ptr: [*]const u8 = entry_base;
-        const name_len = stdStrnLen(name_ptr, MAX_NAME_LEN);
-        const entry_size_field: u64 = readU64(entry_base + 72);
+        const name_len = str.strnlen(name_ptr, MAX_NAME_LEN);
+        const entry_size_field: u64 = bo.readU64Ptr(entry_base + 72);
         serial.writeString("  [");
-        serial.writeString(formatInt(&buf, i));
+        fmt.writeDecimal64(@intCast(i));
         serial.writeString("] ");
         serial.writeString(name_ptr[0..name_len]);
         serial.writeString(" (");
-        serial.writeString(formatInt(&buf, entry_size_field));
+        fmt.writeDecimal64(entry_size_field);
         serial.writeString(" bytes)\n");
     }
 
@@ -116,10 +117,10 @@ pub fn findFile(name: []const u8) ?RamdiskFile {
     for (0..count) |i| {
         const entry_base = state.base + state.entries_off + i * entry_size;
         const entry_name: [*]const u8 = entry_base;
-        const entry_name_len = stdStrnLen(entry_name, MAX_NAME_LEN);
-        if (entry_name_len == name.len and stdMemEqual(entry_name[0..entry_name_len], name)) {
-            const offset = readU64(entry_base + 64);
-            const size = readU64(entry_base + 72);
+        const entry_name_len = str.strnlen(entry_name, MAX_NAME_LEN);
+        if (entry_name_len == name.len and str.eql(entry_name[0..entry_name_len], name)) {
+            const offset = bo.readU64Ptr(entry_base + 64);
+            const size = bo.readU64Ptr(entry_base + 72);
             return .{
                 .data = state.base + state.data_offset + offset,
                 .size = size,
@@ -147,50 +148,8 @@ pub fn getFileName(index: u32) ?[]const u8 {
     if (!state.initialized or index >= state.file_count) return null;
     const entry_base = state.base + state.entries_off + @as(u64, index) * 80;
     const entry_name: [*]const u8 = entry_base;
-    const entry_name_len = stdStrnLen(entry_name, MAX_NAME_LEN);
+    const entry_name_len = str.strnlen(entry_name, MAX_NAME_LEN);
     return entry_name[0..entry_name_len];
 }
 
 // --- Helpers (no stdlib) ---
-
-fn stdMemEqual(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (ca != cb) return false;
-    }
-    return true;
-}
-
-fn readU64(ptr: [*]const u8) u64 {
-    var result: u64 = 0;
-    inline for (0..8) |i| {
-        result |= @as(u64, ptr[i]) << @intCast(i * 8);
-    }
-    return result;
-}
-
-fn stdStrnLen(s: [*]const u8, max: usize) usize {
-    var i: usize = 0;
-    while (i < max and s[i] != 0) : (i += 1) {}
-    return i;
-}
-
-fn formatInt(buf: []u8, value: u64) []const u8 {
-    if (value == 0) {
-        buf[0] = '0';
-        return buf[0..1];
-    }
-    var i: usize = 0;
-    var v = value;
-    while (v > 0) : (v /= 10) {
-        buf[i] = @intCast(v % 10 + '0');
-        i += 1;
-    }
-    var j: usize = 0;
-    while (j < i / 2) : (j += 1) {
-        const tmp = buf[j];
-        buf[j] = buf[i - 1 - j];
-        buf[i - 1 - j] = tmp;
-    }
-    return buf[0..i];
-}

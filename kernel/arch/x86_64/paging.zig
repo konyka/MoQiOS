@@ -1,9 +1,9 @@
 /// x86_64 4-level paging — PML4 → PDPT → PD → PT.
 /// Provides map/unmap operations for 4KB and 2MB pages.
-
 const hhdm = @import("../../mm/hhdm.zig");
 const pmm = @import("../../mm/pmm.zig");
 const serial = @import("serial.zig");
+const fmt = @import("../../lib/fmt.zig");
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const PAGE_2MB: u64 = 2 * 1024 * 1024;
@@ -57,7 +57,7 @@ var kernel_pml4_phys: u64 = 0;
 pub fn init() void {
     kernel_pml4_phys = readCR3();
     serial.writeString("[paging] Kernel PML4 at phys 0x");
-    writeHex(kernel_pml4_phys);
+    fmt.writeHex(kernel_pml4_phys);
     serial.writeString("\n");
 }
 
@@ -67,6 +67,18 @@ pub fn getKernelPml4() u64 {
 
 /// Map a 4KB virtual page to a physical frame.
 pub fn mapPage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void {
+    try mapPageInner(pml4_phys, virt, phys, flags, true);
+}
+
+/// Map a page without TLB invalidation — for building new page tables
+/// that aren't yet loaded in CR3. The caller must do reloadCR3() or
+/// CR3 switch after all mappings are complete.
+pub fn mapPageNoFlush(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void {
+    try mapPageInner(pml4_phys, virt, phys, flags, false);
+}
+
+/// Internal map implementation. `flush_tlb` controls whether invlpg is called.
+fn mapPageInner(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags, flush_tlb: bool) !void {
     const pml4_idx = (virt >> 39) & 0x1FF;
     const pdpt_idx = (virt >> 30) & 0x1FF;
     const pd_idx = (virt >> 21) & 0x1FF;
@@ -94,7 +106,7 @@ pub fn mapPage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void {
         .cache_disable = flags.cache_disable,
     };
     pte.setPhysAddr(phys);
-    invlpg(virt);
+    if (flush_tlb) invlpg(virt);
 }
 
 /// Check if a virtual address is already mapped (present in page tables).
@@ -152,30 +164,39 @@ pub fn mapHugePage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void 
     invlpg(virt);
 }
 
-/// Unmap a virtual page.
-pub fn unmapPage(pml4_phys: u64, virt: u64) void {
+/// Unmap a virtual page. Returns the physical address of the unmapped page, or null.
+pub fn unmapPage(pml4_phys: u64, virt: u64) ?u64 {
     const pml4_idx = (virt >> 39) & 0x1FF;
     const pdpt_idx = (virt >> 30) & 0x1FF;
     const pd_idx = (virt >> 21) & 0x1FF;
     const pt_idx = (virt >> 12) & 0x1FF;
 
     const pml4: *PageTable = hhdm.physToPtr(PageTable, pml4_phys);
-    if (!pml4.entries[pml4_idx].present) return;
+    if (!pml4.entries[pml4_idx].present) return null;
 
     const pdpt: *PageTable = hhdm.physToPtr(PageTable, pml4.entries[pml4_idx].getPhysAddr());
-    if (!pdpt.entries[pdpt_idx].present) return;
+    if (!pdpt.entries[pdpt_idx].present) return null;
 
     const pd: *PageTable = hhdm.physToPtr(PageTable, pdpt.entries[pdpt_idx].getPhysAddr());
-    if (!pd.entries[pd_idx].present) return;
+    if (!pd.entries[pd_idx].present) return null;
 
     const pt: *PageTable = hhdm.physToPtr(PageTable, pd.entries[pd_idx].getPhysAddr());
+    if (!pt.entries[pt_idx].present) return null;
+    const phys = pt.entries[pt_idx].getPhysAddr();
     pt.entries[pt_idx] = .{}; // Zero = not present
     invlpg(virt);
+    return phys;
 }
 
 /// Ensure a page table exists at the given PTE, allocating if needed.
 fn ensureTable(pte: *PTE) !u64 {
     if (pte.present) {
+        // A present huge-page entry is a data frame, NOT a next-level page
+        // table. Descending into it would treat RAM data as a page table and
+        // corrupt memory (this used to crash early boot). Refuse instead so
+        // callers fail loudly rather than silently corrupting the address
+        // space. Splitting huge pages on demand is not supported here.
+        if (pte.huge_page) return error.HugePagePresent;
         return pte.getPhysAddr();
     }
     const phys = pmm.allocPage() orelse return error.OutOfMemory;
@@ -209,15 +230,177 @@ pub fn reloadCR3() void {
         ::: .{ .rax = true });
 }
 
-fn writeHex(value: u64) void {
-    const hex = "0123456789abcdef";
-    var buf: [16]u8 = undefined;
-    var v = value;
-    var i: usize = 16;
-    while (i > 0) {
-        i -= 1;
-        buf[i] = hex[@as(usize, @intCast(v & 0xf))];
-        v >>= 4;
+/// Get a mutable pointer to the PTE for a given virtual address.
+/// Returns null if any level of the page table walk encounters a not-present entry.
+pub fn getPageEntry(pml4_phys: u64, virt: u64) ?*PTE {
+    const pml4_idx = (virt >> 39) & 0x1FF;
+    const pdpt_idx = (virt >> 30) & 0x1FF;
+    const pd_idx = (virt >> 21) & 0x1FF;
+    const pt_idx = (virt >> 12) & 0x1FF;
+
+    const pml4: *PageTable = hhdm.physToPtr(PageTable, pml4_phys);
+    if (!pml4.entries[pml4_idx].present) return null;
+
+    const pdpt: *PageTable = hhdm.physToPtr(PageTable, pml4.entries[pml4_idx].getPhysAddr());
+    if (!pdpt.entries[pdpt_idx].present) return null;
+    if (pdpt.entries[pdpt_idx].huge_page) return null; // 1GB page
+
+    const pd: *PageTable = hhdm.physToPtr(PageTable, pdpt.entries[pdpt_idx].getPhysAddr());
+    if (!pd.entries[pd_idx].present) return null;
+    if (pd.entries[pd_idx].huge_page) return null; // 2MB page
+
+    const pt: *PageTable = hhdm.physToPtr(PageTable, pd.entries[pd_idx].getPhysAddr());
+    if (!pt.entries[pt_idx].present) return null;
+
+    return &pt.entries[pt_idx];
+}
+
+/// Get the raw PTE value for a virtual address, even if not present.
+/// Returns null if the page table structure itself doesn't exist.
+pub fn getPageEntryRaw(pml4_phys: u64, virt: u64) ?u64 {
+    const pml4_idx = (virt >> 39) & 0x1FF;
+    const pdpt_idx = (virt >> 30) & 0x1FF;
+    const pd_idx = (virt >> 21) & 0x1FF;
+    const pt_idx = (virt >> 12) & 0x1FF;
+
+    const pml4: *PageTable = hhdm.physToPtr(PageTable, pml4_phys);
+    if (!pml4.entries[pml4_idx].present) return null;
+
+    const pdpt: *PageTable = hhdm.physToPtr(PageTable, pml4.entries[pml4_idx].getPhysAddr());
+    if (!pdpt.entries[pdpt_idx].present) return null;
+
+    const pd: *PageTable = hhdm.physToPtr(PageTable, pdpt.entries[pdpt_idx].getPhysAddr());
+    if (!pd.entries[pd_idx].present) return null;
+
+    const pt: *PageTable = hhdm.physToPtr(PageTable, pd.entries[pd_idx].getPhysAddr());
+    // Return the raw value even if not present
+    return @bitCast(pt.entries[pt_idx]);
+}
+
+/// Set the raw PTE value for a virtual address.
+pub fn setPageEntryRaw(pml4_phys: u64, virt: u64, value: u64) void {
+    const pml4_idx = (virt >> 39) & 0x1FF;
+    const pdpt_idx = (virt >> 30) & 0x1FF;
+    const pd_idx = (virt >> 21) & 0x1FF;
+    const pt_idx = (virt >> 12) & 0x1FF;
+
+    const pml4: *PageTable = hhdm.physToPtr(PageTable, pml4_phys);
+    if (!pml4.entries[pml4_idx].present) return;
+
+    const pdpt: *PageTable = hhdm.physToPtr(PageTable, pml4.entries[pml4_idx].getPhysAddr());
+    if (!pdpt.entries[pdpt_idx].present) return;
+
+    const pd: *PageTable = hhdm.physToPtr(PageTable, pdpt.entries[pdpt_idx].getPhysAddr());
+    if (!pd.entries[pd_idx].present) return;
+
+    const pt: *PageTable = hhdm.physToPtr(PageTable, pd.entries[pd_idx].getPhysAddr());
+    pt.entries[pt_idx] = @bitCast(value);
+}
+
+/// VMA region info returned by enumerateVMAs.
+pub const VMAEntry = struct {
+    start: u64,
+    end: u64,
+    flags: u8, // bit0=r, bit1=w, bit2=x
+};
+
+/// Walk the user-space page table and collect VMA ranges (up to max_vmas).
+/// Returns number of VMAs found.
+pub fn enumerateVMAs(pml4_phys: u64, out: []VMAEntry) u32 {
+    const hhdm_mod = hhdm;
+    const pml4: *PageTable = hhdm_mod.physToPtr(PageTable, pml4_phys);
+    var count: u32 = 0;
+    var cur_start: u64 = 0;
+    var cur_flags: u8 = 0;
+    var in_range = false;
+
+    // Only scan user-space: PML4 entries 0..255 (0x0000_0000_0000_0000 .. 0x0000_7FFF_FFFF_FFFF)
+    for (0..256) |pml4_i| {
+        if (!pml4.entries[pml4_i].present) {
+            if (in_range and count < out.len) {
+                out[count] = .{ .start = cur_start, .end = @as(u64, pml4_i) << 39, .flags = cur_flags };
+                count += 1;
+                in_range = false;
+            }
+            continue;
+        }
+        const pdpt: *PageTable = hhdm_mod.physToPtr(PageTable, pml4.entries[pml4_i].getPhysAddr());
+        for (0..512) |pdpt_i| {
+            if (!pdpt.entries[pdpt_i].present) {
+                if (in_range and count < out.len) {
+                    const addr = (@as(u64, pml4_i) << 39) | (@as(u64, pdpt_i) << 30);
+                    out[count] = .{ .start = cur_start, .end = addr, .flags = cur_flags };
+                    count += 1;
+                    in_range = false;
+                }
+                continue;
+            }
+            if (pdpt.entries[pdpt_i].huge_page) continue; // skip 1GB pages
+            const pd: *PageTable = hhdm_mod.physToPtr(PageTable, pdpt.entries[pdpt_i].getPhysAddr());
+            for (0..512) |pd_i| {
+                if (!pd.entries[pd_i].present) {
+                    if (in_range and count < out.len) {
+                        const addr = (@as(u64, pml4_i) << 39) | (@as(u64, pdpt_i) << 30) | (@as(u64, pd_i) << 21);
+                        out[count] = .{ .start = cur_start, .end = addr, .flags = cur_flags };
+                        count += 1;
+                        in_range = false;
+                    }
+                    continue;
+                }
+                if (pd.entries[pd_i].huge_page) {
+                    // 2MB huge page
+                    const addr = (@as(u64, pml4_i) << 39) | (@as(u64, pdpt_i) << 30) | (@as(u64, pd_i) << 21);
+                    var f: u8 = 1; // readable
+                    if (pd.entries[pd_i].writable) f |= 2;
+                    if (!pd.entries[pd_i].no_execute) f |= 4;
+                    if (in_range and f == cur_flags) {
+                        // extend range
+                    } else {
+                        if (in_range and count < out.len) {
+                            out[count] = .{ .start = cur_start, .end = addr, .flags = cur_flags };
+                            count += 1;
+                        }
+                        cur_start = addr;
+                        cur_flags = f;
+                        in_range = true;
+                    }
+                    continue;
+                }
+                const pt: *PageTable = hhdm_mod.physToPtr(PageTable, pd.entries[pd_i].getPhysAddr());
+                for (0..512) |pt_i| {
+                    if (!pt.entries[pt_i].present) {
+                        if (in_range and count < out.len) {
+                            const addr = (@as(u64, pml4_i) << 39) | (@as(u64, pdpt_i) << 30) | (@as(u64, pd_i) << 21) | (@as(u64, pt_i) << 12);
+                            out[count] = .{ .start = cur_start, .end = addr, .flags = cur_flags };
+                            count += 1;
+                            in_range = false;
+                        }
+                        continue;
+                    }
+                    const addr = (@as(u64, pml4_i) << 39) | (@as(u64, pdpt_i) << 30) | (@as(u64, pd_i) << 21) | (@as(u64, pt_i) << 12);
+                    var f: u8 = 1; // readable
+                    if (pt.entries[pt_i].writable) f |= 2;
+                    if (!pt.entries[pt_i].no_execute) f |= 4;
+                    if (in_range and f == cur_flags and addr == cur_start + (count * 0)) {
+                        // continue range (approximate: just check adjacency by addr)
+                        // For simplicity, merge adjacent pages with same flags
+                    } else {
+                        if (in_range and count < out.len) {
+                            out[count] = .{ .start = cur_start, .end = addr, .flags = cur_flags };
+                            count += 1;
+                        }
+                        cur_start = addr;
+                        cur_flags = f;
+                        in_range = true;
+                    }
+                }
+            }
+        }
     }
-    serial.writeString(&buf);
+    // Close final range
+    if (in_range and count < out.len) {
+        out[count] = .{ .start = cur_start, .end = cur_start + 0x1000, .flags = cur_flags };
+        count += 1;
+    }
+    return count;
 }

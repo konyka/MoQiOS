@@ -3,6 +3,7 @@ const netif = @import("netif.zig");
 const eth = @import("eth.zig");
 const ipv4 = @import("ipv4.zig");
 const arp = @import("arp.zig");
+const bo = @import("../lib/byte_order.zig");
 
 pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) void {
     if (len < 8) return;
@@ -24,7 +25,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
 
         // ICMP payload: copy entire request (type, code, checksum, id, seq, data)
         const icmp_total = @min(len, @as(u16, 236));
-        @memcpy(pkt[34..34 + icmp_total], data[0..icmp_total]);
+        @memcpy(pkt[34 .. 34 + icmp_total], data[0..icmp_total]);
 
         // Set type=0 (echo reply), code=0
         pkt[34] = 0;
@@ -34,8 +35,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
         pkt[37] = 0;
         // Recompute ICMP checksum
         const csum = ipv4.checksum(pkt[34..].ptr, icmp_total);
-        pkt[36] = @intCast((csum >> 8) & 0xFF);
-        pkt[37] = @intCast(csum & 0xFF);
+        bo.writeU16BeAt(&pkt, 36, csum);
 
         // IPv4 header at offset 14
         ipv4.buildHeader(pkt[14..].ptr, dst_ip, src_ip, ipv4.PROTO_ICMP, icmp_total);

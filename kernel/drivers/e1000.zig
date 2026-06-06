@@ -1,19 +1,21 @@
 /// Intel e1000 NIC driver for QEMU.
 ///
 /// Provides basic packet send/receive via the e1000 MMIO interface.
-/// Uses polling mode (no interrupts for now).
-
+/// Interrupt-driven RX: packets are processed in the IRQ handler.
 const serial = @import("../arch/x86_64/serial.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const paging = @import("../arch/x86_64/paging.zig");
 const pmm = @import("../mm/pmm.zig");
 const pci = @import("pci.zig");
+const fmt = @import("../lib/fmt.zig");
 
 // e1000 MMIO register offsets
 const REG_CTRL: u32 = 0x0000;
 const REG_STATUS: u32 = 0x0008;
 const REG_EEPROM: u32 = 0x0014;
 const REG_IMASK: u32 = 0x00D0;
+const REG_ICR: u32 = 0x00C0; // Interrupt Cause Read
+const REG_ITR: u32 = 0x00C4; // Interrupt Throttling Rate
 const REG_RCTRL: u32 = 0x0100;
 const REG_RXDESCLO: u32 = 0x2800;
 const REG_RXDESCHI: u32 = 0x2804;
@@ -51,6 +53,13 @@ const TX_DESC_DD: u8 = 0x01;
 const TX_DESC_EOP: u8 = 0x01;
 const TX_DESC_IFCS: u8 = 0x02;
 const TX_DESC_RS: u8 = 0x08;
+
+// IMASK bits
+const IMS_TXDW: u32 = 1 << 0; // Transmit Descriptor Writeback
+const IMS_TXQE: u32 = 1 << 1; // Transmit Queue Empty
+const IMS_LSC: u32 = 1 << 2; // Link Status Change
+const IMS_RXO: u32 = 1 << 6; // Receiver Overrun
+const IMS_RXT0: u32 = 1 << 7; // Receiver Timer Interrupt
 
 const NUM_RX_DESC: u32 = 32;
 const NUM_TX_DESC: u32 = 32;
@@ -98,6 +107,7 @@ var tx_buf_virt: [NUM_TX_DESC]u64 = @splat(0);
 var tx_tail: u32 = 0;
 
 var initialized: bool = false;
+var irq_line: u8 = 0; // PCI IRQ line for this device
 
 fn readReg(offset: u32) u32 {
     const addr: *volatile u32 = @ptrFromInt(mmio_base + offset);
@@ -116,11 +126,11 @@ pub fn init() void {
         const dev = pci.devices[i];
         if (dev.vendor_id == pci.VENDOR_INTEL and (dev.device_id == 0x100E or dev.device_id == 0x10D3)) {
             serial.writeString("[e1000] Found at ");
-            writeHex8(dev.bus);
+            fmt.writeHex8(dev.bus);
             serial.writeString(":");
-            writeHex8(dev.device);
+            fmt.writeHex8(dev.device);
             serial.writeString(".");
-            writeHex8(dev.function);
+            fmt.writeHex8(dev.function);
             serial.writeString("\n");
             initDevice(&dev) catch |err| {
                 serial.writeString("[e1000] Init failed: ");
@@ -134,9 +144,12 @@ pub fn init() void {
 }
 
 fn initDevice(dev: *const pci.PciDevice) !void {
-    // Enable bus mastering (bit 2) and disable INTx (bit 10) in PCI command register
+    // Enable bus mastering (bit 2) in PCI command register, keep INTx enabled
     const cmd = pci.configRead32(dev.bus, dev.device, dev.function, 0x04);
-    pci.configWrite32(dev.bus, dev.device, dev.function, 0x04, cmd | 0x404);
+    pci.configWrite32(dev.bus, dev.device, dev.function, 0x04, (cmd & ~@as(u32, 0x400)) | 0x04);
+
+    // Read IRQ line from PCI config
+    irq_line = @truncate(pci.configRead32(dev.bus, dev.device, dev.function, 0x3C));
 
     // Map BAR0 (MMIO)
     const bar0 = dev.bars[0];
@@ -177,8 +190,10 @@ fn initDevice(dev: *const pci.PciDevice) !void {
     // Set Set Link Up
     writeReg(REG_CTRL, readReg(REG_CTRL) | CTRL_SLU);
 
-    // Disable interrupts
-    writeReg(REG_IMASK, 0);
+    // Enable RX/TX interrupts
+    writeReg(REG_IMASK, IMS_RXT0 | IMS_RXO | IMS_TXQE | IMS_TXDW | IMS_LSC);
+    // Clear any pending interrupts
+    _ = readReg(REG_ICR);
 
     // Read MAC address from EEPROM
     readMAC();
@@ -186,7 +201,7 @@ fn initDevice(dev: *const pci.PciDevice) !void {
     serial.writeString("[e1000] MAC: ");
     for (0..6) |i| {
         if (i > 0) serial.writeByte(':');
-        writeHexByte(mac_addr[i]);
+        fmt.writeHex8(mac_addr[i]);
     }
     serial.writeString("\n");
 
@@ -379,35 +394,27 @@ pub fn getMAC() [6]u8 {
     return mac_addr;
 }
 
-fn writeHex8(v: u8) void {
-    const hex = "0123456789abcdef";
-    var buf: [2]u8 = undefined;
-    buf[0] = hex[(v >> 4) & 0xF];
-    buf[1] = hex[v & 0xF];
-    serial.writeString(&buf);
+pub fn getIrqLine() u8 {
+    return irq_line;
 }
 
-fn writeHexByte(v: u8) void {
-    writeHex8(v);
-}
+/// IRQ handler — called from idt.zig when e1000 raises an interrupt.
+/// Reads ICR to clear interrupts, processes received packets,
+/// and feeds them into the network stack.
+pub fn handleInterrupt() void {
+    if (!initialized) return;
 
-fn writeDecimal(v: u32) void {
-    if (v == 0) {
-        serial.writeString("0");
-        return;
+    // Read and clear interrupt cause
+    const icr = readReg(REG_ICR);
+    if (icr == 0) return;
+
+    // Process all available received packets
+    const net = @import("../net/mod.zig");
+    var rx_tmp: [2048]u8 = undefined;
+    var count: u32 = 0;
+    while (count < NUM_RX_DESC) : (count += 1) {
+        const n = receivePacket(&rx_tmp, 2048);
+        if (n == 0) break;
+        net.handleRxPacket(&rx_tmp, n);
     }
-    var buf: [10]u8 = undefined;
-    var val = v;
-    var i: usize = 0;
-    while (val > 0) : (val /= 10) {
-        buf[i] = @intCast(val % 10 + '0');
-        i += 1;
-    }
-    var j: usize = 0;
-    while (j < i / 2) : (j += 1) {
-        const tmp = buf[j];
-        buf[j] = buf[i - 1 - j];
-        buf[i - 1 - j] = tmp;
-    }
-    serial.writeString(buf[0..i]);
 }
