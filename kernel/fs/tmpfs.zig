@@ -1,0 +1,376 @@
+/// tmpfs — pure in-memory filesystem.
+/// Files are stored in kernel-allocated physical pages.
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+const pmm = @import("../mm/pmm.zig");
+const hhdm = @import("../mm/hhdm.zig");
+
+const MAX_FILES = 64;
+const MAX_NAME_LEN = 60;
+const PAGES_PER_FILE = 64;
+const PAGE_SIZE = 4096;
+const MAX_FILE_SIZE = PAGES_PER_FILE * PAGE_SIZE; // 256KB
+
+const TmpfsEntry = struct {
+    active: bool,
+    name: [MAX_NAME_LEN]u8,
+    name_len: u8,
+    is_dir: bool,
+    parent_idx: u8, // 255 = root
+    size: u32,
+    pages: [PAGES_PER_FILE]?u64, // physical page addresses
+    page_count: u8,
+    mode: u32,
+    uid: u16,
+    gid: u16,
+    ctime: u64,
+};
+
+var entries: [MAX_FILES]TmpfsEntry = undefined;
+var tmpfs_lock: IrqSpinlock = .{};
+var next_ctime: u64 = 1;
+
+fn allocEntry() ?u8 {
+    for (1..MAX_FILES) |i| {
+        if (!entries[i].active) {
+            return @intCast(i);
+        }
+    }
+    return null;
+}
+
+fn freeEntryPages(idx: u8) void {
+    const entry = &entries[idx];
+    for (0..PAGES_PER_FILE) |p| {
+        if (entry.pages[p]) |phys| {
+            pmm.freePage(phys);
+            entry.pages[p] = null;
+        }
+    }
+    entry.page_count = 0;
+    entry.size = 0;
+}
+
+fn findEntry(name: []const u8, parent: u8) ?u8 {
+    for (1..MAX_FILES) |i| {
+        if (!entries[i].active) continue;
+        if (entries[i].parent_idx != parent) continue;
+        if (entries[i].name_len != name.len) continue;
+        if (nameEql(entries[i].name[0..entries[i].name_len], name)) {
+            return @intCast(i);
+        }
+    }
+    return null;
+}
+
+/// Strip "/tmp" prefix and return the inner path.
+fn stripPrefix(path: []const u8) []const u8 {
+    if (path.len >= 4 and path[0] == '/' and path[1] == 't' and path[2] == 'm' and path[3] == 'p') {
+        if (path.len == 4) return "/";
+        return path[4..];
+    }
+    return path;
+}
+
+/// Split path into components (naive: split by '/').
+/// Returns the final component name and its parent directory index.
+fn resolvePath(path: []const u8, out_name: *[MAX_NAME_LEN]u8, out_name_len: *u8) ?u8 {
+    const inner = stripPrefix(path);
+    if (inner.len == 0 or (inner.len == 1 and inner[0] == '/')) {
+        // root directory
+        out_name_len.* = 1;
+        out_name[0] = '/';
+        return 0;
+    }
+
+    var parent: u8 = 0;
+    var start: usize = 0;
+    if (inner[0] == '/') start = 1;
+
+    var i = start;
+    while (i <= inner.len) : (i += 1) {
+        if (i == inner.len or inner[i] == '/') {
+            const comp = inner[start..i];
+            if (comp.len == 0) {
+                start = i + 1;
+                continue;
+            }
+            if (i == inner.len) {
+                // last component
+                const len = @min(comp.len, MAX_NAME_LEN);
+                @memcpy(out_name[0..len], comp[0..len]);
+                out_name_len.* = @intCast(len);
+                return parent;
+            }
+            // intermediate directory component
+            if (findEntry(comp, parent)) |dir_idx| {
+                if (!entries[dir_idx].is_dir) return null;
+                parent = dir_idx;
+            } else {
+                return null;
+            }
+            start = i + 1;
+        }
+    }
+    return null;
+}
+
+pub fn init() void {
+    for (0..MAX_FILES) |i| {
+        entries[i] = .{
+            .active = false,
+            .name = @splat(0),
+            .name_len = 0,
+            .is_dir = false,
+            .parent_idx = 255,
+            .size = 0,
+            .pages = [_]?u64{null} ** PAGES_PER_FILE,
+            .page_count = 0,
+            .mode = 0,
+            .uid = 0,
+            .gid = 0,
+            .ctime = 0,
+        };
+    }
+    // Root directory (index 0)
+    entries[0] = .{
+        .active = true,
+        .name = @splat(0),
+        .name_len = 1,
+        .is_dir = true,
+        .parent_idx = 255,
+        .size = 0,
+        .pages = [_]?u64{null} ** PAGES_PER_FILE,
+        .page_count = 0,
+        .mode = 0o755,
+        .uid = 0,
+        .gid = 0,
+        .ctime = 0,
+    };
+    entries[0].name[0] = '/';
+}
+
+/// Open a file under /tmp/. Creates if it does not exist.
+/// Returns entry index on success, -1 on error.
+pub fn tmpfsOpen(path: []const u8, create: bool, is_dir: bool) i64 {
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+
+    var name_buf: [MAX_NAME_LEN]u8 = undefined;
+    var name_len: u8 = 0;
+    const parent = resolvePath(path, &name_buf, &name_len) orelse return -1;
+
+    // root directory open
+    if (name_len == 1 and name_buf[0] == '/') {
+        return 0;
+    }
+
+    const name = name_buf[0..name_len];
+    if (findEntry(name, parent)) |idx| {
+        return @intCast(idx);
+    }
+
+    if (create) {
+        const idx = allocEntry() orelse return -1;
+        entries[idx] = .{
+            .active = true,
+            .name = @splat(0),
+            .name_len = name_len,
+            .is_dir = is_dir,
+            .parent_idx = parent,
+            .size = 0,
+            .pages = [_]?u64{null} ** PAGES_PER_FILE,
+            .page_count = 0,
+            .mode = if (is_dir) 0o755 else 0o644,
+            .uid = 0,
+            .gid = 0,
+            .ctime = next_ctime,
+        };
+        next_ctime +%= 1;
+        @memcpy(entries[idx].name[0..name_len], name[0..name_len]);
+        return @intCast(idx);
+    }
+
+    return -1;
+}
+
+/// Read from a tmpfs file.
+pub fn tmpfsRead(idx: u8, offset: u64, buf: [*]u8, count: u32) i64 {
+    if (idx >= MAX_FILES) return -1;
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+
+    const entry = &entries[idx];
+    if (!entry.active or entry.is_dir) return -1;
+    if (offset >= entry.size) return 0;
+
+    const to_read = @min(count, entry.size - @as(u32, @intCast(offset)));
+    var remaining = to_read;
+    var pos: u32 = @intCast(offset);
+    var dst: u32 = 0;
+
+    while (remaining > 0) {
+        const page_idx = pos / PAGE_SIZE;
+        const page_off = pos % PAGE_SIZE;
+        const chunk = @min(remaining, PAGE_SIZE - page_off);
+        if (page_idx >= PAGES_PER_FILE) break;
+        if (entry.pages[page_idx]) |phys| {
+            const src: [*]const u8 = @ptrFromInt(hhdm.physToVirt(phys) + page_off);
+            for (0..chunk) |j| {
+                buf[dst + j] = src[j];
+            }
+        } else {
+            // Unallocated page = zeros
+            for (0..chunk) |j| {
+                buf[dst + j] = 0;
+            }
+        }
+        dst += chunk;
+        pos += chunk;
+        remaining -= chunk;
+    }
+
+    return @intCast(dst);
+}
+
+/// Write to a tmpfs file.
+pub fn tmpfsWrite(idx: u8, offset: u64, data: [*]const u8, count: u32) i64 {
+    if (idx >= MAX_FILES) return -1;
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+
+    const entry = &entries[idx];
+    if (!entry.active or entry.is_dir) return -1;
+    if (offset >= MAX_FILE_SIZE) return -1;
+
+    const start: u32 = @intCast(offset);
+    const to_write = @min(count, MAX_FILE_SIZE - start);
+    var remaining = to_write;
+    var pos = start;
+    var src: u32 = 0;
+
+    while (remaining > 0) {
+        const page_idx = pos / PAGE_SIZE;
+        const page_off = pos % PAGE_SIZE;
+        const chunk = @min(remaining, PAGE_SIZE - page_off);
+        if (page_idx >= PAGES_PER_FILE) break;
+
+        if (entry.pages[page_idx] == null) {
+            const phys = pmm.allocPage() orelse break;
+            entry.pages[page_idx] = phys;
+            entry.page_count += 1;
+            // Zero the page
+            const page_ptr: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+            @memset(page_ptr[0..PAGE_SIZE], 0);
+        }
+
+        const phys = entry.pages[page_idx].?;
+        const dst: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys) + page_off);
+        for (0..chunk) |j| {
+            dst[j] = data[src + j];
+        }
+
+        src += chunk;
+        pos += chunk;
+        remaining -= chunk;
+    }
+
+    if (pos > entry.size) {
+        entry.size = pos;
+    }
+
+    return @intCast(src);
+}
+
+/// Close a tmpfs file (no-op; file persists until unlink).
+pub fn tmpfsClose(idx: u8) void {
+    _ = idx;
+}
+
+/// Unlink (delete) a file or empty directory.
+pub fn tmpfsUnlink(path: []const u8) i64 {
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+
+    var name_buf: [MAX_NAME_LEN]u8 = undefined;
+    var name_len: u8 = 0;
+    const parent = resolvePath(path, &name_buf, &name_len) orelse return -1;
+
+    if (name_len == 1 and name_buf[0] == '/') return -1; // cannot unlink root
+
+    const name = name_buf[0..name_len];
+    const idx = findEntry(name, parent) orelse return -1;
+    const entry = &entries[idx];
+
+    if (entry.is_dir) {
+        // directory must be empty
+        for (1..MAX_FILES) |i| {
+            if (entries[i].active and entries[i].parent_idx == idx) {
+                return -1; // ENOTEMPTY
+            }
+        }
+    }
+
+    freeEntryPages(@intCast(idx));
+    entry.active = false;
+    return 0;
+}
+
+/// Create a directory.
+pub fn tmpfsMkdir(path: []const u8) i64 {
+    const result = tmpfsOpen(path, true, true);
+    if (result < 0) return result;
+    // tmpfsOpen already created as dir; just return success
+    return 0;
+}
+
+/// Get file size.
+pub fn tmpfsGetSize(idx: u8) u32 {
+    if (idx >= MAX_FILES) return 0;
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    if (!entries[idx].active) return 0;
+    return entries[idx].size;
+}
+
+pub const TmpfsDirEntry = struct {
+    name: []const u8,
+    is_dir: bool,
+};
+
+pub const TmpfsDirListing = struct {
+    entries: []const TmpfsDirEntry,
+    count: u32,
+};
+
+var dir_listing_buf: [MAX_FILES]TmpfsDirEntry = undefined;
+
+/// List directory entries for a given tmpfs directory index.
+pub fn tmpfsListDir(idx: u8) TmpfsDirListing {
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    if (idx >= MAX_FILES or !entries[idx].active or !entries[idx].is_dir) {
+        return .{ .entries = &[_]TmpfsDirEntry{}, .count = 0 };
+    }
+    var count: u32 = 0;
+    for (1..MAX_FILES) |i| {
+        if (!entries[i].active) continue;
+        if (entries[i].parent_idx != idx) continue;
+        if (count >= MAX_FILES) break;
+        const nlen: usize = entries[i].name_len;
+        dir_listing_buf[count] = .{
+            .name = entries[i].name[0..nlen],
+            .is_dir = entries[i].is_dir,
+        };
+        count += 1;
+    }
+    return .{ .entries = dir_listing_buf[0..count], .count = count };
+}
+
+/// Compare two name slices for equality.
+fn nameEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (0..a.len) |i| {
+        if (a[i] != b[i]) return false;
+    }
+    return true;
+}

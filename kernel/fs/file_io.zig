@@ -1,0 +1,107 @@
+/// kernel/fs/file_io.zig — Core file I/O syscall implementations (read/write/open/close)
+///
+/// Extracted from syscall_entry.zig (v19.1).
+const serial = @import("../arch/x86_64/serial.zig");
+const sched_mod = @import("../proc/sched.zig");
+const task_mod = @import("../proc/task.zig");
+const copy = @import("../mm/copy_from_user.zig");
+
+/// write(fd, buf, count) → bytes written or -errno
+pub fn write(fd: u64, buf: u64, count: u64) i64 {
+    if (buf == 0 or buf >= 0x0000_8000_0000_0000 or count > 0x7FFFFFFF) return -1;
+    const n: usize = @intCast(count);
+    if (n == 0) return 0;
+
+    // stdout/stderr → serial
+    if (fd == 1 or fd == 2) {
+        var pos: usize = 0;
+        while (pos < n) {
+            const chunk = @min(n - pos, 4096);
+            var kbuf: [4096]u8 = undefined;
+            const copied = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(buf + pos), chunk);
+            if (copied == 0) break;
+            for (0..copied) |i| {
+                serial.writeByte(kbuf[i]);
+            }
+            pos += copied;
+            if (copied < chunk) break;
+        }
+        return @intCast(pos);
+    }
+
+    // VFS write
+    if (sched_mod.currentTaskIndex()) |cur_idx| {
+        if (task_mod.getTask(cur_idx)) |cur| {
+            var pos: usize = 0;
+            while (pos < n) {
+                const chunk = @min(n - pos, 4096);
+                var kbuf: [4096]u8 = undefined;
+                const copied = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(buf + pos), chunk);
+                if (copied == 0) break;
+                const result = cur.fd_table.write(@intCast(fd), &kbuf, copied);
+                if (result <= 0) break;
+                pos += @intCast(result);
+                if (result < @as(i64, @intCast(copied))) break;
+            }
+            return @intCast(pos);
+        }
+    }
+    return -1;
+}
+
+/// open(name_ptr, flags) → fd or -1
+pub fn open(name_ptr: u64, flags: u32) i64 {
+    if (name_ptr >= 0x0000_8000_0000_0000 or name_ptr == 0) return -1;
+
+    var name_buf: [256]u8 = undefined;
+    const copied = copy.copyFromUser(name_buf[0..], @ptrFromInt(name_ptr), 255);
+    if (copied == 0) return -1;
+    name_buf[if (copied < 255) copied else 255] = 0;
+
+    var len: usize = 0;
+    while (len < copied and name_buf[len] != 0) : (len += 1) {}
+    const name = name_buf[0..len];
+
+    const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
+    const cur = task_mod.getTask(cur_idx) orelse return -1;
+
+    const result = cur.fd_table.open(name, flags);
+    return @bitCast(result);
+}
+
+/// read(fd, buf_ptr, count) → bytes read or -errno
+pub fn read(fd: u32, buf_ptr: u64, count: u64) i64 {
+    if (buf_ptr == 0 or buf_ptr >= 0x0000_8000_0000_0000 or count > 0x7FFFFFFF) return -1;
+    const n: usize = @intCast(count);
+    if (n == 0) return 0;
+
+    const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
+    const cur = task_mod.getTask(cur_idx) orelse return -1;
+
+    var pos: usize = 0;
+    while (pos < n) {
+        const chunk = @min(n - pos, 4096);
+        var kbuf: [4096]u8 = undefined;
+
+        const result = cur.fd_table.read(fd, &kbuf, chunk);
+        if (result <= 0) break;
+        const written = copy.copyToUser(@ptrFromInt(buf_ptr + pos), kbuf[0..@intCast(result)], @intCast(result));
+        pos += @intCast(result);
+        if (result < @as(i64, @intCast(chunk))) break;
+        if (written < @as(usize, @intCast(result))) break;
+    }
+    if (pos == 0 and n > 0) {
+        var tmp: [1]u8 = undefined;
+        const r = cur.fd_table.read(fd, &tmp, 1);
+        return @bitCast(r);
+    }
+    return @intCast(pos);
+}
+
+/// close(fd) → 0 or -1
+pub fn close(fd: u32) i64 {
+    const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
+    const cur = task_mod.getTask(cur_idx) orelse return -1;
+    const result = cur.fd_table.close(fd);
+    return @bitCast(result);
+}

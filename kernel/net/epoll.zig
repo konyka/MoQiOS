@@ -1,0 +1,517 @@
+/// epoll — Linux-compatible event multiplexing.
+///
+/// Provides epoll_create1, epoll_ctl, and epoll_wait system calls.
+/// Uses a simple array-based fd management (max 64 fds per instance)
+/// instead of a red-black tree, which is adequate for the typical
+/// number of concurrent connections in MoQiOS.
+///
+/// Modes:
+///   - Level Triggered (LT, default): reports events as long as the
+///     condition holds; items stay on the ready list until the fd is
+///     no longer ready.
+///   - Edge Triggered (ET, EPOLLET): only reports on state transitions;
+///     items are removed from the ready list after being returned once.
+///   - One-shot (EPOLLONESHOT): disables the item after one event
+///     delivery; must be re-armed with EPOLL_CTL_MOD.
+///
+/// Notification flow:
+///   Resource state change -> epollNotify() -> scan all active epoll
+///   instances for matching items -> add to ready list -> wake waiter.
+const sched = @import("../proc/sched.zig");
+const task_mod = @import("../proc/task.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+const vfs = @import("../fs/vfs.zig");
+const tcp = @import("tcp.zig");
+const idt = @import("../arch/x86_64/idt.zig");
+
+// ---- Event type constants (Linux ABI) ----
+
+pub const EPOLLIN: u32 = 0x001;
+pub const EPOLLOUT: u32 = 0x004;
+pub const EPOLLERR: u32 = 0x008;
+pub const EPOLLHUP: u32 = 0x010;
+pub const EPOLLET: u32 = 0x80000000;
+pub const EPOLLONESHOT: u32 = 0x40000000;
+
+/// epoll_ctl operations (matching Linux ABI).
+pub const EPOLL_CTL_ADD: i32 = 1;
+pub const EPOLL_CTL_DEL: i32 = 2;
+pub const EPOLL_CTL_MOD: i32 = 3;
+
+/// Error codes (Linux-compatible negative values).
+const errno = @import("../lib/errno.zig");
+const EBADF = errno.EBADF;
+const EEXIST = errno.EEXIST;
+const EINVAL = errno.EINVAL;
+const ENOENT = errno.ENOENT;
+const ENOSPC = errno.ENOSPC;
+const EMFILE = errno.EMFILE;
+
+/// Limits.
+pub const MAX_EPOLL_INSTANCES: u32 = 32;
+pub const MAX_EPOLL_ITEMS: u8 = 128;
+
+/// Approximate timer tick interval (ms).
+const TICK_MS: u64 = 10;
+
+/// EpollEvent — matches Linux struct epoll_event (8 bytes payload).
+pub const EpollEvent = extern struct {
+    events: u32,
+    data: u64,
+};
+
+/// WaitNode for epoll_wait blocking — stack-allocated on the
+/// waiter's kernel stack, modelled after eventfd.zig.
+const WaitNode = struct {
+    task_idx: u32,
+    granted: bool = false,
+    next: ?*WaitNode = null,
+};
+
+/// EpollItem — per-fd registration within an epoll instance.
+pub const EpollItem = struct {
+    fd: i32 = -1,
+    events: u32 = 0,
+    data: u64 = 0,
+    fd_type: vfs.FdType = .none,
+    resource_idx: u32 = 0,
+    is_et: bool = false,
+    is_oneshot: bool = false,
+    is_disabled: bool = false,
+    on_ready: bool = false,
+    ready_next: ?u8 = null,
+    last_reported: u32 = 0,
+    in_use: bool = false,
+};
+
+/// EpollInstance — represents one epoll fd.
+pub const EpollInstance = struct {
+    items: [MAX_EPOLL_ITEMS]EpollItem = @splat(.{}),
+    item_count: u8 = 0,
+    ready_head: ?u8 = null,
+    ready_tail: ?u8 = null,
+    spin: IrqSpinlock = .{},
+    waiter: ?*WaitNode = null,
+    owner_task_idx: u32 = 0,
+    valid: bool = false,
+};
+
+// ---- Global pool ----
+
+var epoll_pool: [MAX_EPOLL_INSTANCES]EpollInstance = @splat(.{});
+
+/// Obtain a pointer to an epoll instance by index.
+pub fn getInstance(idx: u32) ?*EpollInstance {
+    if (idx >= MAX_EPOLL_INSTANCES) return null;
+    const inst = &epoll_pool[idx];
+    if (!inst.valid) return null;
+    return inst;
+}
+
+// ---- Public API ----
+
+/// Create a new epoll instance.
+/// Returns the pool index or a negative errno on failure.
+pub fn epollCreate() i32 {
+    const cur_idx = sched.currentTaskIndex() orelse return @intCast(EMFILE);
+    for (&epoll_pool, 0..) |*inst, i| {
+        if (!inst.valid) {
+            inst.* = .{
+                .owner_task_idx = cur_idx,
+                .valid = true,
+            };
+            return @intCast(i);
+        }
+    }
+    return @intCast(EMFILE);
+}
+
+/// Control an epoll instance — add, modify, or delete an fd registration.
+pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
+    const inst = getInstance(epfd_idx) orelse return EBADF;
+    if (fd < 0) return EBADF;
+
+    const cur_idx = sched.currentTaskIndex() orelse return EBADF;
+    const cur = task_mod.getTask(cur_idx) orelse return EBADF;
+    if (fd >= @as(i32, @intCast(vfs.MAX_FDS))) return EBADF;
+    const desc = &cur.fd_table.fds[@as(u32, @intCast(fd))];
+    if (desc.fd_type == .none) return EBADF;
+
+    const saved = inst.spin.acquire();
+    defer inst.spin.release(saved);
+
+    switch (op) {
+        EPOLL_CTL_ADD => {
+            for (&inst.items) |*item| {
+                if (item.in_use and item.fd == fd) return EEXIST;
+            }
+            var slot: ?u8 = null;
+            for (&inst.items, 0..) |*item, i| {
+                if (!item.in_use) {
+                    slot = @intCast(i);
+                    break;
+                }
+            }
+            const s = slot orelse return ENOSPC;
+            const ev = copyEventFromUser(event_ptr) orelse return EINVAL;
+
+            inst.items[s] = .{
+                .fd = fd,
+                .events = ev.events,
+                .data = ev.data,
+                .fd_type = desc.fd_type,
+                .resource_idx = resourceIdxFromDesc(desc),
+                .is_et = (ev.events & EPOLLET) != 0,
+                .is_oneshot = (ev.events & EPOLLONESHOT) != 0,
+                .in_use = true,
+            };
+            inst.item_count += 1;
+
+            const current = computeCurrentEvents(desc.fd_type, resourceIdxFromDesc(desc));
+            if (current & (ev.events & ~EPOLLET & ~EPOLLONESHOT) != 0) {
+                addToReadyList(inst, @intCast(s));
+            }
+        },
+        EPOLL_CTL_MOD => {
+            var found = false;
+            for (&inst.items, 0..) |*item, i| {
+                if (item.in_use and item.fd == fd) {
+                    const ev = copyEventFromUser(event_ptr) orelse return EINVAL;
+                    item.events = ev.events;
+                    item.data = ev.data;
+                    item.is_et = (ev.events & EPOLLET) != 0;
+                    item.is_oneshot = (ev.events & EPOLLONESHOT) != 0;
+                    item.is_disabled = false;
+                    item.last_reported = 0;
+                    found = true;
+                    if (!item.on_ready) {
+                        const current = computeCurrentEvents(item.fd_type, item.resource_idx);
+                        if (current & (ev.events & ~EPOLLET & ~EPOLLONESHOT) != 0) {
+                            addToReadyList(inst, @intCast(i));
+                        }
+                    }
+                    break;
+                }
+            }
+            if (!found) return ENOENT;
+        },
+        EPOLL_CTL_DEL => {
+            var found = false;
+            for (&inst.items) |*item| {
+                if (item.in_use and item.fd == fd) {
+                    if (item.on_ready) removeFromReadyList(inst, item.fd);
+                    item.* = .{};
+                    inst.item_count -= 1;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return ENOENT;
+        },
+        else => return EINVAL,
+    }
+    return 0;
+}
+
+/// Wait for events on an epoll instance.
+pub fn epollWait(epfd_idx: u32, events_buf: u64, max_events: u32, timeout_ms: i32) i64 {
+    if (max_events == 0 or max_events > MAX_EPOLL_ITEMS) return EINVAL;
+    const inst = getInstance(epfd_idx) orelse return EBADF;
+    const max_out: u32 = @min(max_events, MAX_EPOLL_ITEMS);
+
+    var start_tick: u64 = undefined;
+    if (timeout_ms >= 0) start_tick = idt.getTickCount();
+
+    while (true) {
+        var out_events: [MAX_EPOLL_ITEMS]EpollEvent = undefined;
+        const n = collectEvents(inst, &out_events, max_out);
+        if (n > 0) {
+            const bytes: usize = @as(usize, n) * @sizeOf(EpollEvent);
+            const copy = @import("../mm/copy_from_user.zig");
+            _ = copy.copyToUser(@ptrFromInt(events_buf), @ptrCast(&out_events), bytes);
+            return @intCast(n);
+        }
+        if (timeout_ms == 0) return 0;
+        if (timeout_ms > 0) {
+            const elapsed_ms = (idt.getTickCount() - start_tick) * TICK_MS;
+            if (elapsed_ms >= @as(u64, @intCast(timeout_ms))) return 0;
+        }
+        blockOnEpoll(inst);
+    }
+}
+
+/// Notification callback — called by TCP, pipe, etc. when state changes.
+pub fn epollNotify(fd_type: vfs.FdType, resource_idx: u32, ready_events: u32) void {
+    for (&epoll_pool) |*inst| {
+        if (!inst.valid) continue;
+        const saved = inst.spin.acquire();
+
+        for (&inst.items, 0..) |*item, i| {
+            if (!item.in_use) continue;
+            if (item.is_disabled) continue;
+            if (item.fd_type != fd_type) continue;
+
+            switch (fd_type) {
+                .pipe_read => {
+                    if (item.fd_type != .pipe_read) continue;
+                    if (item.resource_idx != resource_idx) continue;
+                },
+                .pipe_write => {
+                    if (item.fd_type != .pipe_write) continue;
+                    if (item.resource_idx != resource_idx) continue;
+                },
+                else => {
+                    if (item.resource_idx != resource_idx) continue;
+                },
+            }
+
+            const interest = item.events & ~EPOLLET & ~EPOLLONESHOT;
+            const matched = ready_events & interest;
+            if (matched == 0) continue;
+
+            if (item.is_et) {
+                if (matched == item.last_reported) continue;
+                item.last_reported = matched;
+            }
+
+            if (!item.on_ready) {
+                addToReadyListLocked(inst, @intCast(i));
+            }
+        }
+
+        wakeWaiterLocked(inst);
+        inst.spin.release(saved);
+    }
+}
+
+// ---- Internal helpers ----
+
+fn copyEventFromUser(event_ptr: u64) ?EpollEvent {
+    if (event_ptr == 0 or event_ptr >= 0x0000_8000_0000_0000) return null;
+    const copy = @import("../mm/copy_from_user.zig");
+    var ev: EpollEvent = undefined;
+    const got = copy.copyFromUser(@as([*]u8, @ptrCast(&ev))[0..@sizeOf(EpollEvent)], @ptrFromInt(event_ptr), @sizeOf(EpollEvent));
+    if (got != @sizeOf(EpollEvent)) return null;
+    return ev;
+}
+
+fn resourceIdxFromDesc(desc: *const vfs.FileDescriptor) u32 {
+    return switch (desc.fd_type) {
+        .tcp_socket => desc.tcb_idx,
+        .pipe_read => desc.pipe_idx,
+        .pipe_write => desc.pipe_idx,
+        .epoll => desc.epoll_idx,
+        .eventfd => desc.eventfd_idx,
+        .timerfd => desc.timerfd_idx,
+        else => 0,
+    };
+}
+
+fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32) u32 {
+    var revents: u32 = 0;
+    switch (fd_type) {
+        .tcp_socket => {
+            const tcb_idx = resource_idx;
+            if (tcp.tcpIsClosing(tcb_idx)) {
+                revents |= EPOLLHUP;
+                if (tcp.tcpRecvAvailable(tcb_idx) > 0) revents |= EPOLLIN;
+                revents |= EPOLLERR;
+                return revents;
+            }
+            if (tcp.tcpRecvAvailable(tcb_idx) > 0) revents |= EPOLLIN;
+            if (tcp.isEstablished(tcb_idx) and tcp.tcpSendSpace(tcb_idx) > 0) {
+                revents |= EPOLLOUT;
+            }
+            revents |= EPOLLERR;
+        },
+        .pipe_read => {
+            if (resource_idx >= 16) return EPOLLERR;
+            const pipe = &vfs.pipes[resource_idx];
+            if (pipe.head != pipe.tail) revents |= EPOLLIN;
+            if (pipe.head == pipe.tail and pipe.ref_count <= 1) revents |= EPOLLHUP;
+        },
+        .pipe_write => {
+            if (resource_idx >= 16) return EPOLLERR;
+            const pipe = &vfs.pipes[resource_idx];
+            const next = (pipe.tail + 1) % vfs.PIPE_BUF_SIZE;
+            if (next != pipe.head) revents |= EPOLLOUT;
+            if (pipe.ref_count <= 1) revents |= EPOLLERR;
+        },
+        .special => {
+            revents |= EPOLLIN | EPOLLOUT;
+        },
+        .ramdisk_file, .fat32_file, .ext2_file, .proc_file => {
+            revents |= EPOLLIN | EPOLLOUT;
+        },
+        .epoll => {
+            const inst = getInstance(resource_idx) orelse return EPOLLERR;
+            if (inst.ready_head != null) revents |= EPOLLIN;
+            revents |= EPOLLOUT;
+        },
+        .eventfd => {
+            revents |= EPOLLIN | EPOLLOUT;
+        },
+        .timerfd => {
+            const timerfd_mod = @import("../ipc/timerfd.zig");
+            if (timerfd_mod.timerfdGetExpirations(resource_idx) > 0) revents |= EPOLLIN;
+            revents |= EPOLLOUT;
+        },
+        .unix_socket => {},
+        .none => {},
+        .random => {
+            revents |= EPOLLIN;
+        },
+        .tmpfs_file => {
+            revents |= EPOLLIN | EPOLLOUT;
+        },
+        .udp_socket => {
+            revents |= EPOLLIN | EPOLLOUT;
+        },
+        .inotify => {
+            revents |= EPOLLIN | EPOLLOUT;
+        },
+    }
+    return revents;
+}
+
+fn addToReadyList(inst: *EpollInstance, slot: u8) void {
+    const saved = inst.spin.acquire();
+    addToReadyListLocked(inst, slot);
+    inst.spin.release(saved);
+}
+
+fn addToReadyListLocked(inst: *EpollInstance, slot: u8) void {
+    if (inst.items[slot].on_ready) return;
+    inst.items[slot].on_ready = true;
+    inst.items[slot].ready_next = null;
+    if (inst.ready_tail) |tail| {
+        inst.items[tail].ready_next = slot;
+    } else {
+        inst.ready_head = slot;
+    }
+    inst.ready_tail = slot;
+}
+
+fn removeFromReadyList(inst: *EpollInstance, fd: i32) void {
+    var prev: ?u8 = null;
+    var cur = inst.ready_head;
+    while (cur) |idx| {
+        const next = inst.items[idx].ready_next;
+        if (inst.items[idx].fd == fd) {
+            if (prev) |p| {
+                inst.items[p].ready_next = next;
+            } else {
+                inst.ready_head = next;
+            }
+            if (idx == inst.ready_tail.?) {
+                inst.ready_tail = if (prev) |p| p else null;
+                if (inst.ready_tail == null) inst.ready_head = null;
+            }
+            inst.items[idx].on_ready = false;
+            inst.items[idx].ready_next = null;
+            return;
+        }
+        prev = idx;
+        cur = next;
+    }
+}
+
+fn collectEvents(inst: *EpollInstance, out: []EpollEvent, max_out: u32) u32 {
+    const saved = inst.spin.acquire();
+
+    const scan_head = inst.ready_head;
+    inst.ready_head = null;
+    inst.ready_tail = null;
+    var cur = scan_head;
+    while (cur) |idx| {
+        inst.items[idx].on_ready = false;
+        const next = inst.items[idx].ready_next;
+        inst.items[idx].ready_next = null;
+        cur = next;
+    }
+
+    var count: u32 = 0;
+    cur = scan_head;
+    while (cur) |idx| {
+        const next = inst.items[idx].ready_next;
+        const item = &inst.items[idx];
+
+        if (item.is_disabled) {
+            cur = next;
+            continue;
+        }
+
+        const current = computeCurrentEvents(item.fd_type, item.resource_idx);
+        const interest = item.events & ~EPOLLET & ~EPOLLONESHOT;
+        const matched = current & interest;
+        const always_report = current & (EPOLLERR | EPOLLHUP);
+        const final_events = matched | always_report;
+
+        if (final_events != 0 and count < max_out) {
+            out[count] = .{
+                .events = final_events,
+                .data = item.data,
+            };
+            count += 1;
+
+            if (item.is_oneshot) {
+                item.is_disabled = true;
+            } else if (!item.is_et) {
+                if (matched != 0) {
+                    addToReadyListLocked(inst, @intCast(idx));
+                }
+            }
+        }
+        cur = next;
+    }
+
+    inst.spin.release(saved);
+    return count;
+}
+
+fn blockOnEpoll(inst: *EpollInstance) void {
+    const my_idx = sched.currentTaskIndex() orelse {
+        asm volatile ("sti; hlt");
+        return;
+    };
+
+    const saved = inst.spin.acquire();
+
+    if (inst.ready_head != null) {
+        inst.spin.release(saved);
+        return;
+    }
+
+    var node = WaitNode{
+        .task_idx = my_idx,
+        .granted = false,
+        .next = inst.waiter,
+    };
+    inst.waiter = &node;
+
+    if (task_mod.getTask(my_idx)) |t| {
+        t.state = .blocked;
+        asm volatile ("" ::: .{ .memory = true });
+    }
+
+    inst.spin.release(saved);
+
+    while (!@atomicLoad(bool, &node.granted, .acquire)) {
+        asm volatile ("sti; hlt");
+    }
+}
+
+fn wakeWaiterLocked(inst: *EpollInstance) void {
+    if (inst.waiter) |node| {
+        inst.waiter = node.next;
+        node.next = null;
+        @atomicStore(bool, &node.granted, true, .release);
+        task_mod.unblockTask(node.task_idx);
+    }
+}
+
+/// Destroy an epoll instance by pool index (used by VFS close).
+pub fn epollDestroy(epoll_idx: u32) void {
+    if (epoll_idx >= MAX_EPOLL_INSTANCES) return;
+    epoll_pool[epoll_idx] = .{};
+}
