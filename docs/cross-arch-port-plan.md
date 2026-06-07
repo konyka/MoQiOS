@@ -103,7 +103,8 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 | **M8-3** | per-CPU 上下文切换 anchor：`commonStub` 经 `%gs` 取 per-CPU anchor（无需 swapgs） | ✅ 完成（单核回归一致，386 行启动到 shell） |
 | **M8-4** | per-CPU TSS RSP0：`setRsp0` 作用于当前 CPU 而非固定 BSP | ✅ 完成（单核回归一致，386 行启动到 shell） |
 | **M8-5a** | AP 上线 + 开定时器 + `enable_ap_startup=true`，但仍 BSP-only 调度（AP 空闲取中断） | ✅ 完成（`-smp 2`：2 CPUs online，BSP 跑完全部测试到 shell，零故障） |
-| **M8-5b** | AP 参与调度：per-CPU idle 任务 + 全核 `timerTick` 调度（真正并行） | 🔬 已调查，发现深层阻塞（见 M8-5b 调查）；待定方向 |
+| **M8-5b-2** | 亲和调度（无迁移）+ AP 参与 `timerTick` + AP 绑核 idle 引导 | 🚧 基础设施已落地；`-smp 2` 可到 hello3，AP 用户 syscall 待修（见下） |
+| **M8-5b** | （父项）AP 真正并行调度 | 🚧 5b-0/5b-1 ✅；5b-2 进行中；5b-3 FPU 待办 |
 | **M8-6** | 跨核 TLB shootdown：per-CPU shootdown 描述符 + 范围 `invlpg`（取代 M8-1 的 CR3 全刷回退） | ⬜ 待办 |
 
 ### M8-1 设计要点
@@ -211,12 +212,18 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   `-smp 2`：2 CPUs online + BSP 到 shell，零故障）。
 - **M8-5b-1｜全局态 per-CPU 化**：`exec_result` 迁入 `PerCpu`（`%%gs:48/56/64` 相对访问），消除第 3 点。**✅ 已完成**
   （`-smp 2`：hello13 信号/sigreturn 正常，到 shell 零故障）。
-- **M8-5b-2｜亲和调度（无迁移）**：所有任务创建时**绑核**（round-robin），`pickNext` 已支持 `pinned` 过滤。
-  无迁移 ⇒ 每核行为等价于“已验证的单核”，从根上回避第 2 点（`saved_user_rsp` 永不跨核）。先交付**可用的并行**
-  （不同核跑不同任务），代价是暂无负载均衡/work-stealing。
+- **M8-5b-2｜亲和调度（无迁移）**：所有任务创建时**绑核**（round-robin），`pickNext` 按 `cpu_affinity`
+  过滤；fork 继承父核。无迁移 ⇒ 回避第 2 点（`saved_user_rsp` 永不跨核）。**已落地**：
+  - `createKernelThreadAffinity` + `smp.init` 为每个 AP 预建绑核 idle；
+  - `apBootstrapIdle`：AP 在启用定时器前 `iretq` 进入绑核 idle（`cur_idx` 永不为 null）；
+  - `pickBootstrapKernel`：`cur_idx==null` 时优先选本核内核线程；
+  - **AP 进用户态**：`commonStub` 假帧 `iretq` 在 AP 切用户 CR3 后失效 → `enterUserOnAp` 直接构造
+    `iretq` 帧（与 `user_mode.zig` 同布局）。
+  - **验证**：`MOQI_SMP=1` 仍到 shell；`MOQI_SMP=2` BSP 跑 init，AP 可进用户态但 `hello2` 在 AP 上
+    `#PF`（`copy_from_user`/syscall 路径，待 5b-2 后续小步）；`hello4` ELF 在 AP 上挂起。
 - **M8-5b-3｜FPU/SSE 对齐 + 按任务保存**（第 4 点）：作为迁移的前置。
 - **M8-5b-4｜可迁移调度**：在 2/3 之上引入安全迁移（迁移点限定在“非 syscall 持栈”态，或把 `saved_user_rsp`
   随任务保存），并配合 M8-6 的 TLB shootdown。
 
-> 当前进度：**M8-5b-0 已提交**；M8-5b-1 → M8-5b-2 按序推进。亲和模型（先放弃迁移/负载均衡）为
-> 推荐路径，以“能稳定落地的真并行”为最短路径。
+> 当前进度：**M8-5b-0/5b-1 已提交**；**M8-5b-2 基础设施已提交**（亲和+AP 引导+`enterUserOnAp`）。
+> 下一小步：修 AP 上 `copy_from_user`/syscall 使 `-smp 2` 完整到 shell，再推进 5b-3 FPU。

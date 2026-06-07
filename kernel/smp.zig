@@ -25,7 +25,8 @@
 ///     (M8-4). APs come online with their LAPIC timer running and take interrupts
 ///     on per-CPU state; verified with -smp 2 the BSP runs all user tests to the
 ///     shell with zero faults. M8-5a keeps scheduling BSP-only (APs idle); M8-5b
-///     will let APs run tasks for true parallelism, M8-6 adds TLB shootdown.
+///     M8-5b-2 adds affinity scheduling (APs run pinned user tasks); M8-6 adds
+///     ranged TLB shootdown.
 const acpi = @import("acpi/acpi_parser.zig");
 const lapic = @import("arch/x86_64/lapic.zig");
 const gdt = @import("arch/x86_64/gdt.zig");
@@ -35,6 +36,7 @@ const hhdm = @import("mm/hhdm.zig");
 const pmm = @import("mm/pmm.zig");
 const serial = @import("arch/x86_64/serial.zig");
 const sched = @import("proc/sched.zig");
+const task = @import("proc/task.zig");
 const syscall_entry = @import("arch/x86_64/syscall_entry.zig");
 const fmt = @import("lib/fmt.zig");
 
@@ -49,7 +51,7 @@ const KERNEL_STACK_PAGES: u64 = 16;
 /// running and take interrupts on their own per-CPU state (idle loop). For M8-5a
 /// only the BSP schedules tasks (see sched.timerTick) — this validates that an AP
 /// actively running + taking timer IRQs no longer destabilizes the BSP, which was
-/// the historical blocker. M8-5b will let APs run tasks for true parallelism.
+/// the historical blocker. M8-5b-2 lets APs run affinity-pinned user tasks.
 pub const enable_ap_startup: bool = true;
 
 /// Number of CPUs currently online (1 = BSP only).
@@ -90,9 +92,22 @@ fn rawPutc(c: u8) void {
 pub fn apEntry() callconv(.c) noreturn {
     rawPutc('E');
 
-    // Read cpu_id from trampoline data area (avoids calling convention issues)
-    const id_ptr: *volatile u32 = @ptrFromInt(0x7040);
+    // Read cpu_id from trampoline data area (HHDM alias — AP runs in high-half only).
+    const id_ptr: *volatile u32 = @ptrFromInt(hhdm.physToVirt(0x7040));
     const actual_cpu_id: u32 = id_ptr.*;
+
+    // Match BSP feature bits needed for ring-3 execution on this AP:
+    //   CR4.OSFXSR (bit 9) — SSE in user/C code
+    //   EFER.SCE   (bit 0) — SYSCALL instruction in user code
+    asm volatile (
+        \\mov %%cr4, %%rax
+        \\bts $9, %%eax
+        \\mov %%rax, %%cr4
+        \\mov $0xC0000080, %%ecx
+        \\rdmsr
+        \\bts $0, %%eax
+        \\wrmsr
+        ::: .{ .rax = true, .rcx = true, .rdx = true, .memory = true });
 
     // Initialize per-CPU GDT and TSS, then load this CPU's IDT register.
     gdt.initAp(actual_cpu_id);
@@ -118,7 +133,6 @@ pub fn apEntry() callconv(.c) noreturn {
     syscall_entry.setPerCpuGsBase(actual_cpu_id);
     rawPutc('I');
 
-    lapic.initAp();
     rawPutc('J');
 
     // Signal BSP that we're alive
@@ -126,9 +140,11 @@ pub fn apEntry() callconv(.c) noreturn {
     serial.writeByte('0' + @as(u8, @truncate(actual_cpu_id)));
     serial.writeString(" initialized\n");
 
-    // Enter the idle loop: come online, take timer IRQs on per-CPU state, but
-    // (M8-5a) leave task scheduling to the BSP. M8-5b switches APs onto tasks.
-    sched.apIdleLoop();
+    // M8-5b-2: join scheduler via per-CPU kernel idle, then enable timer.
+    // CLI until idle's kernelIdleLoop sti's — avoids timer IRQ before cur_idx exists.
+    asm volatile ("cli");
+    lapic.initAp();
+    sched.apBootstrapIdle();
 }
 
 /// Ensure all page table pages are mapped through HHDM.
@@ -250,6 +266,16 @@ pub fn init() void {
     serial.writeString("[SMP] Starting ");
     serial.writeByte('0' + @as(u8, @truncate(num_aps)));
     serial.writeString(" APs...\n");
+
+    // M8-5b-2: per-CPU idle kernel threads (affinity = cpu_id) so each AP's first
+    // schedule is a kernel idle task — never a direct first-ever user schedule
+    // from cur_idx==null (which lacks a stable prior anchor / context-switch path).
+    for (1..acpi.info.cpu_count) |i| {
+        const cpu_id: u8 = @intCast(i);
+        _ = task.createKernelThreadAffinity(sched.kernelIdleLoop, 255, cpu_id) orelse {
+            serial.writeString("[SMP] WARN: failed to create AP idle thread\n");
+        };
+    }
 
     // Set up trampoline infrastructure
     const trampoline_virt = hhdm.physToVirt(0x8000);

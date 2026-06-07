@@ -90,6 +90,51 @@ fn currentCpuId() u32 {
     return pc.cpu_id;
 }
 
+/// Program per-CPU syscall/interrupt stack targets for a user task.
+fn setupUserCpuState(t: *task.Task) void {
+    gdt.setRsp0(currentCpuId(), t.kernel_stack_top);
+    syscall_entry.getPerCpu().kernel_rsp = t.kernel_stack_top;
+    syscall_entry.setPerCpuGsBase(currentCpuId());
+}
+
+/// APs: enter ring-3 via a direct iretq frame (same layout as user_mode.zig).
+/// commonStub's fake-frame epilogue mis-returns on AP after a user CR3 switch.
+fn enterUserOnAp(t: *task.Task) noreturn {
+    const entry = t.user_entry;
+    const ustack = t.user_stack_top;
+    asm volatile (
+        \\movw $0x23, %%ax
+        \\movw %%ax, %%ds
+        \\movw %%ax, %%es
+        \\movw %%ax, %%fs
+        \\pushq $0x23
+        \\pushq %[ustack]
+        \\pushq $0x202
+        \\pushq $0x1B
+        \\pushq %[entry]
+        \\xorq %%rax, %%rax
+        \\xorq %%rbx, %%rbx
+        \\xorq %%rcx, %%rcx
+        \\xorq %%rdx, %%rdx
+        \\xorq %%rsi, %%rsi
+        \\xorq %%rdi, %%rdi
+        \\xorq %%rbp, %%rbp
+        \\xorq %%r8, %%r8
+        \\xorq %%r9, %%r9
+        \\xorq %%r10, %%r10
+        \\xorq %%r11, %%r11
+        \\xorq %%r12, %%r12
+        \\xorq %%r13, %%r13
+        \\xorq %%r14, %%r14
+        \\xorq %%r15, %%r15
+        \\iretq
+        :
+        : [entry] "r" (entry),
+          [ustack] "r" (ustack),
+        : .{ .memory = true });
+    unreachable;
+}
+
 pub fn currentTaskIndex() ?u32 {
     return getCurrentIdx();
 }
@@ -99,19 +144,33 @@ pub fn currentTask() ?*task.Task {
     return task.getTask(idx);
 }
 
-/// Called from timer IRQ handler on every tick.
+/// Count non-zombie/non-blocked tasks pinned to this CPU (for single-task fast-path).
+fn countActiveOnThisCpu() u32 {
+    var n: u32 = 0;
+    var bits = task.getSlotBitmap();
+    const cpu: u8 = @intCast(currentCpuId());
+    while (bits != 0) {
+        const i: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const t = task.getTask(i) orelse continue;
+        if (t.cpu_affinity == cpu and t.state != .zombie and t.state != .blocked) {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// Called from timer IRQ handler on every tick (all online CPUs — M8-5b-2).
 pub fn timerTick(frame: *idt.InterruptFrame) void {
     _ = frame;
 
-    // M8-5a: APs are online and taking timer interrupts (proving the per-CPU
-    // interrupt/anchor/GS infrastructure is SMP-stable), but only the BSP drives
-    // task scheduling for now. M8-5b lets APs schedule their own tasks.
-    if (currentCpuId() != 0) return;
-
     const flags = sched_lock.acquire();
 
-    reap_counter +|= 1;
-    if (reap_counter >= REAP_INTERVAL) {
+    // Global periodic maintenance — BSP only (one tick source for the whole system).
+    if (currentCpuId() == 0) {
+        reap_counter +|= 1;
+    }
+    if (currentCpuId() == 0 and reap_counter >= REAP_INTERVAL) {
         reap_counter = 0;
         // reapZombies acquires task_lock internally — different lock, safe.
         // freeKernelStack → pmm.freePage also acquires pmm.lock — also safe.
@@ -141,15 +200,14 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         }
     }
 
-    const count = task.getTaskCount();
-    if (count == 0) {
+    if (task.getTaskCount() == 0) {
         sched_lock.release(flags);
         return;
     }
 
     if (getCurrentIdx()) |ci| {
         if (task.getTask(ci)) |ct| {
-            if (count == 1 and ct.state != .zombie and ct.state != .blocked) {
+            if (countActiveOnThisCpu() == 1 and ct.state != .zombie and ct.state != .blocked) {
                 sched_lock.release(flags);
                 return;
             }
@@ -184,15 +242,15 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         t.state = .running;
         setCurrentIdx(next_idx);
 
-        // Set up CPU state for the first scheduled task
+        // Set up CPU state for the first scheduled task (mirror context-switch path).
         if (t.page_table_phys != 0) {
             sched_lock.release(flags);
             asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
                 :
                 : [cr3] "r" (t.page_table_phys),
                 : .{ .rax = true, .memory = true });
-            gdt.setRsp0(currentCpuId(), t.kernel_stack_top);
-            syscall_entry.getPerCpu().kernel_rsp = t.kernel_stack_top;
+            setupUserCpuState(t);
+            if (currentCpuId() != 0) enterUserOnAp(t);
             return;
         }
         sched_lock.release(flags);
@@ -251,16 +309,13 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
                 :
                 : [cr3] "r" (pt),
                 : .{ .rax = true, .memory = true });
-            gdt.setRsp0(currentCpuId(), new_task.kernel_stack_top);
-            syscall_entry.getPerCpu().kernel_rsp = new_task.kernel_stack_top;
-            // Ensure KERNEL_GS_BASE points to PerCpu struct before entering user mode.
-            syscall_entry.wrmsr(0xC0000102, @intFromPtr(syscall_entry.getPerCpu()));
+            setupUserCpuState(new_task);
+            if (currentCpuId() != 0) enterUserOnAp(new_task);
             return;
         }
         sched_lock.release(flags);
-        gdt.setRsp0(currentCpuId(), new_task.kernel_stack_top);
-        syscall_entry.getPerCpu().kernel_rsp = new_task.kernel_stack_top;
-        syscall_entry.wrmsr(0xC0000102, @intFromPtr(syscall_entry.getPerCpu()));
+        setupUserCpuState(new_task);
+        if (currentCpuId() != 0) enterUserOnAp(new_task);
     } else {
         if (old_task.page_table_phys != 0) {
             const kernel_pml4 = paging.getKernelPml4();
@@ -305,10 +360,30 @@ fn setupInitialFrame(t: *task.Task) void {
     t.started = true;
 }
 
+/// When this CPU has no running task, prefer a ready kernel thread pinned here.
+/// Avoids first-ever scheduling straight into user mode (unstable on AP bring-up).
+fn pickBootstrapKernel() ?u32 {
+    const cpu: u8 = @intCast(currentCpuId());
+    var bits = task.getSlotBitmap();
+    while (bits != 0) {
+        const i: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const t = task.getTask(i) orelse continue;
+        if (t.state == .ready and !t.is_user and t.cpu_affinity == cpu) {
+            return i;
+        }
+    }
+    return null;
+}
+
 /// Pick the next ready task — priority-aware round-robin with bitmap fast-path.
 /// Uses task slot bitmap to skip empty slots in O(1) via @ctz.
 /// Among equal priority, uses round-robin (start after current).
 fn pickNext() ?u32 {
+    if (getCurrentIdx() == null) {
+        if (pickBootstrapKernel()) |k| return k;
+    }
+
     const start = if (getCurrentIdx()) |ci| (ci + 1) % task.MAX_TASKS else 0;
     const bitmap = task.getSlotBitmap();
 
@@ -330,7 +405,7 @@ fn pickNext() ?u32 {
         pos = idx + 1;
 
         const t = task.getTask(idx) orelse continue;
-        if (t.state == .ready and t.priority < best_prio) {
+        if (t.state == .ready and t.cpu_affinity == @as(u8, @truncate(currentCpuId())) and t.priority < best_prio) {
             best_prio = t.priority;
             best_idx = idx;
             // Priority 0 is highest — early exit if found
@@ -347,7 +422,7 @@ fn pickNext() ?u32 {
             const idx: u32 = @intCast(@ctz(bits));
             bits &= bits - 1;
             const t = task.getTask(idx) orelse continue;
-            if (t.state == .ready and t.priority < best_prio) {
+            if (t.state == .ready and t.cpu_affinity == @as(u8, @truncate(currentCpuId())) and t.priority < best_prio) {
                 best_prio = t.priority;
                 best_idx = idx;
                 if (best_prio == 0) break;
@@ -395,13 +470,56 @@ pub fn deliverSignalToRunningTask(t: *task.Task) void {
     iframe.rdi = signum;
 }
 
-/// AP idle loop — an online AP runs this when it has no task to execute.
-///
-/// It simply enables interrupts and halts; the LAPIC timer wakes it each tick.
-/// In M8-5a the AP's timerTick is a no-op (BSP-only scheduling), so the AP idles
-/// here harmlessly while taking timer interrupts. In M8-5b the AP's timerTick
-/// will switch it onto a ready task (timer-driven, like the BSP), and back to
-/// this loop (its per-CPU idle task) when nothing is ready.
+/// Shared kernel idle body — lowest priority, sti+hlt between timer ticks.
+pub fn kernelIdleLoop() callconv(.c) void {
+    while (true) {
+        asm volatile ("sti");
+        asm volatile ("hlt");
+    }
+}
+
+/// Enter the per-CPU kernel idle task without waiting for a timer tick.
+/// Called from apEntry after GS/LAPIC setup so cur_idx is never null when the
+/// first user task is scheduled (context-switch path, not first-ever user).
+pub fn apBootstrapIdle() noreturn {
+    const idx = pickBootstrapKernel() orelse {
+        const serial = @import("../arch/x86_64/serial.zig");
+        serial.writeString("[sched] AP bootstrap: no kernel idle for this CPU\n");
+        apIdleLoop();
+    };
+
+    const t = task.getTask(idx) orelse apIdleLoop();
+    if (!t.started) setupInitialFrame(t);
+    setCurrentIdx(idx);
+    setSlice(TIMESLICE_TICKS);
+    t.state = .running;
+    setAnchor(t.saved_rsp);
+
+    // Transfer into the idle task (same epilogue as commonStub).
+    asm volatile (
+        \\movq %%gs:16, %%rsp
+        \\popq %%r15
+        \\popq %%r14
+        \\popq %%r13
+        \\popq %%r12
+        \\popq %%r11
+        \\popq %%r10
+        \\popq %%r9
+        \\popq %%r8
+        \\popq %%rbp
+        \\popq %%rdi
+        \\popq %%rsi
+        \\popq %%rdx
+        \\popq %%rcx
+        \\popq %%rbx
+        \\popq %%rax
+        \\addq $16, %%rsp
+        \\iretq
+        ::: .{ .memory = true });
+    unreachable;
+}
+
+/// AP idle loop — fallback when bootstrap cannot find a per-CPU kernel idle.
 pub fn apIdleLoop() noreturn {
     while (true) {
         asm volatile ("sti");
@@ -439,8 +557,7 @@ fn tryStealTask() void {
         const i: u32 = @intCast(@ctz(bits));
         bits &= bits - 1;
         const t = task.getTask(i) orelse continue;
-        if (t.state == .ready) {
-            // Found a stealable task — run it
+        if (t.state == .ready and t.cpu_affinity == @as(u8, @truncate(currentCpuId()))) {
             const next_idx: u32 = i;
 
             if (!t.started) {

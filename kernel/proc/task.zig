@@ -43,6 +43,8 @@ pub const Task = struct {
     tid: u32,
     state: TaskState,
     priority: u8,
+    /// Logical CPU this task is pinned to (M8-5b-2 affinity scheduling; no migration).
+    cpu_affinity: u8,
     /// Kernel stack base (lowest address, page-aligned).
     kernel_stack: u64,
     /// Kernel stack top (highest address — this is where RSP starts).
@@ -233,9 +235,19 @@ fn freeKernelStack(stack_virt: u64) void {
     }
 }
 
-/// Create a kernel thread. Returns the task index or null on failure.
-/// The new task starts in .ready state with the given priority (0 = highest).
-pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
+var next_assign_cpu: u32 = 0;
+
+/// Round-robin CPU pin for new user tasks (kernel threads stay on BSP / cpu 0).
+pub fn assignCpuAffinity() u8 {
+    const smp_mod = @import("../smp.zig");
+    const n = @max(smp_mod.cpu_count, 1);
+    const cpu = next_assign_cpu % n;
+    next_assign_cpu +%= 1;
+    return @intCast(cpu);
+}
+
+/// Create a kernel thread pinned to a specific CPU (M8-5b-2).
+pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?u32 {
     const flags = task_lock.acquire();
     defer task_lock.release(flags);
 
@@ -244,7 +256,6 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
         return null;
     };
 
-    // Allocate kernel stack pages (PMM has its own lock)
     const stack_virt = allocKernelStack() orelse {
         serial.writeString("[task] OOM allocating kernel stack\n");
         return null;
@@ -254,9 +265,6 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     const tid = next_tid;
     next_tid += 1;
 
-    // Build the (large) Task in place in its slot: zero it byte-wise and then
-    // set only the non-default fields, so no multi-KB Task value is ever
-    // materialised on the kernel stack.
     zeroSlot(slot);
     tasks[slot].tid = tid;
     tasks[slot].state = .ready;
@@ -268,10 +276,17 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     tasks[slot].fd_table = @import("../fs/vfs.zig").FdTable.init();
     tasks[slot].cwd[0] = '/';
     tasks[slot].cwd_len = 1;
+    tasks[slot].cpu_affinity = affinity;
 
     slot_bitmap |= @as(u64, 1) << @intCast(slot);
     task_count += 1;
     return slot;
+}
+
+/// Create a kernel thread on BSP (cpu 0). Returns the task index or null on failure.
+/// The new task starts in .ready state with the given priority (0 = highest).
+pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
+    return createKernelThreadAffinity(entry, priority, 0);
 }
 
 /// Get task by index. Returns null if slot is empty or out of range.
@@ -453,6 +468,7 @@ pub fn createUserProcess(
     tasks[slot].fd_table = @import("../fs/vfs.zig").FdTable.init();
     tasks[slot].cwd[0] = '/';
     tasks[slot].cwd_len = 1;
+    tasks[slot].cpu_affinity = assignCpuAffinity();
 
     const sig_mod = @import("signal.zig");
     sig_mod.setupSigreturnTrampoline(page_table_phys);

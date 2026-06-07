@@ -482,6 +482,14 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
 
     // Path 4: Kernel-mode fault without guard — fatal
     serial.writeString("\n!!! EXCEPTION #14 (Page Fault) !!!\n");
+    {
+        const sc = @import("syscall_entry.zig");
+        if (sc.getPerCpuOrNull()) |pc| {
+            serial.writeString("  CPU: ");
+            serial.writeByte('0' + @as(u8, @truncate(pc.cpu_id)));
+            serial.writeString("\n");
+        }
+    }
     serial.writeString("  error_code: 0x");
     fmt.writeHex(err);
     serial.writeString("\n  RIP: 0x");

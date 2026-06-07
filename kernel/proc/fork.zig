@@ -25,6 +25,9 @@ pub fn fork(frame: *SyscallFrame) i64 {
     ) orelse return -1;
     const child = task_mod.getTask(child_idx).?;
 
+    // Inherit parent's CPU pin — fork must not migrate (M8-5b-2).
+    child.cpu_affinity = parent.cpu_affinity;
+
     child.brk_current = parent.brk_current;
 
     for (0..vfs_mod.MAX_FDS) |i| {

@@ -110,7 +110,9 @@ AP 冷 walk 才暴露。
 ### SMP 当前状态（2026-06，M8 进行中）
 
 历史阻塞点（TSS 错位、中断 stub 寄存器破坏、调度器全局状态）均已修复。**`enable_ap_startup=true`**，
-`-smp 2` 下 AP 稳定上线并取定时器中断；BSP 跑完全部 `hello*` 到 `MoQiOS shell`，零故障。
+`-smp 2` 下 AP 稳定上线；M8-5a 时 BSP 跑完全部 `hello*` 到 shell。M8-5b-2 起 AP 参与亲和调度，
+`MOQI_SMP=1` 仍完整到 shell；`MOQI_SMP=2` 并行路径已通（init@BSP、子进程可绑 AP），AP 用户
+syscall/`copy_from_user` 仍在修（见 cross-arch-port-plan M8-5b-2）。
 
 | 子里程碑 | 状态 | 说明 |
 |---|---|---|
@@ -119,7 +121,7 @@ AP 冷 walk 才暴露。
 | M8-5a | ✅ | AP 上线 + 定时器，BSP-only 调度 |
 | M8-5b-0 | ✅ | AP 高半区执行（trampoline 直跳 HHDM `apEntry`） |
 | M8-5b-1 | ✅ | `exec_result` 迁入 `PerCpu`（`%%gs:48/56/64`） |
-| M8-5b-2 | ⬜ | 亲和调度（无迁移）+ AP 参与 `timerTick` |
+| M8-5b-2 | 🚧 | 亲和调度 + AP 绑核 idle 引导 + `enterUserOnAp`；`-smp 2` AP 用户 syscall 待修 |
 | M8-6 | ⬜ | 范围 TLB shootdown |
 
 详见 `docs/cross-arch-port-plan.md` M8 节。
