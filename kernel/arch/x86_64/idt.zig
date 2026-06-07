@@ -280,8 +280,44 @@ pub fn interruptDispatch(frame: *InterruptFrame) callconv(.c) void {
     } else if (vector == 241) {
         // AHCI interrupt vector
         handleAhci(frame);
+    } else if (vector == 253) {
+        // Reschedule IPI (lapic.RESCHEDULE_VECTOR)
+        handleReschedule(frame);
+    } else if (vector == 254) {
+        // TLB shootdown IPI (lapic.TLB_SHOOTDOWN_VECTOR)
+        handleTlbShootdown(frame);
     }
     // Other vectors: ignored for now
+}
+
+/// Reschedule IPI (vector 253) — another CPU asked this CPU to re-run its
+/// scheduler (e.g. a newly-ready higher-priority task, or a yielding remote
+/// task). We acknowledge and drive a scheduler pass on the local CPU.
+///
+/// Dormant until APs participate in scheduling (M8-5); nobody sends this vector
+/// in uniprocessor mode, so single-core behavior is unchanged.
+fn handleReschedule(frame: *InterruptFrame) void {
+    const lapic = @import("lapic.zig");
+    lapic.eoi();
+    const sched = @import("../../proc/sched.zig");
+    sched.timerTick(frame);
+}
+
+/// TLB shootdown IPI (vector 254) — another CPU changed a shared mapping and
+/// asked this CPU to invalidate its stale TLB entries.
+///
+/// M8-1 ships the coarse fallback: reload CR3 to flush all non-global entries
+/// (user mappings are never global, so this covers cross-CPU user page changes).
+/// M8-6 refines this to ranged `invlpg` via a per-CPU shootdown descriptor.
+/// Dormant until APs are online; nobody sends this vector in uniprocessor mode.
+fn handleTlbShootdown(frame: *InterruptFrame) void {
+    _ = frame;
+    asm volatile (
+        \\movq %%cr3, %%rax
+        \\movq %%rax, %%cr3
+        ::: .{ .rax = true, .memory = true });
+    const lapic = @import("lapic.zig");
+    lapic.eoi();
 }
 
 fn handleException(frame: *InterruptFrame) void {

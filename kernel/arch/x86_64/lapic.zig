@@ -11,6 +11,12 @@ const fmt = @import("../../lib/fmt.zig");
 /// LAPIC timer fires on this vector.
 pub const TIMER_VECTOR: u8 = 240;
 
+/// Inter-Processor Interrupt (IPI) vectors for cross-CPU coordination.
+/// Chosen in the high range, clear of the PIC remap (32-47), the LAPIC timer
+/// (240) and AHCI (241), and below the spurious vector (0xFF).
+pub const RESCHEDULE_VECTOR: u8 = 0xFD; // ask a CPU to re-run its scheduler
+pub const TLB_SHOOTDOWN_VECTOR: u8 = 0xFE; // ask a CPU to flush its TLB
+
 /// LAPIC MMIO base (virtual address via HHDM)
 var lapic_base: u64 = 0;
 
@@ -68,6 +74,31 @@ pub fn sendStartupIpi(apic_id: u8, vector_page: u8) void {
     writeReg(REG_ICR_HIGH, @as(u32, apic_id) << 24);
     // Delivery mode=Startup (0b110), assert level, vector = page frame
     writeReg(REG_ICR_LOW, 0x00004600 | @as(u32, vector_page));
+    while (read(REG_ICR_LOW) & (1 << 12) != 0) {
+        asm volatile ("pause");
+    }
+}
+
+/// Send a fixed-delivery IPI carrying `vector` to the CPU with LAPIC `apic_id`.
+///
+/// Delivery mode = Fixed (000), destination = physical, level = assert (bit 14),
+/// trigger = edge. The vector occupies the low 8 bits. Spins on the delivery-
+/// status bit (bit 12) until the LAPIC accepts the request. Safe to target the
+/// caller's own APIC ID (self-IPI) — useful for forcing a local reschedule.
+pub fn sendIpi(apic_id: u8, vector: u8) void {
+    writeReg(REG_ICR_HIGH, @as(u32, apic_id) << 24);
+    writeReg(REG_ICR_LOW, 0x00004000 | @as(u32, vector));
+    while (read(REG_ICR_LOW) & (1 << 12) != 0) {
+        asm volatile ("pause");
+    }
+}
+
+/// Broadcast a fixed-delivery IPI to all CPUs except the sender.
+/// Uses the ICR "all excluding self" shorthand (destination shorthand = 0b11).
+pub fn sendIpiAllButSelf(vector: u8) void {
+    writeReg(REG_ICR_HIGH, 0);
+    // bits 19:18 = 0b11 (all excluding self) → 0x000C0000, plus assert + vector.
+    writeReg(REG_ICR_LOW, 0x000C4000 | @as(u32, vector));
     while (read(REG_ICR_LOW) & (1 << 12) != 0) {
         asm volatile ("pause");
     }

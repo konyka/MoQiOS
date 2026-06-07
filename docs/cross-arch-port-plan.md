@@ -58,7 +58,7 @@
 | **M5** | riscv64 定时器 + 上下文切换 + 调度器接入（复用 `proc/sched.zig` 上层逻辑） | riscv64 跑多内核线程轮转 | ⬜ 待办 |
 | **M6** | riscv64 用户态：U-mode 进入、syscall（`ecall`）入口、地址空间隔离 | riscv64 跑 `hello*` 用户程序 | ⬜ 待办 |
 | **M7** | riscv64 驱动：virtio-blk/virtio-net（virtio 与 ISA 无关，复用大部分逻辑）+ 块/网/FS 上线 | riscv64 跑 ext2 读写、网络自测 | ⬜ 待办 |
-| **M8** | **SMP（先 x86_64，后 riscv64）**：per-CPU 调度器（per-CPU 运行队列+work-stealing+per-CPU TSS/anchor）、通用 IPI、TLB shootdown；启用 `enable_ap_startup` | QEMU 多核：用户任务真正并行；零崩溃 | ⬜ 待办 |
+| **M8** | **SMP（先 x86_64，后 riscv64）**：per-CPU 调度器（per-CPU 运行队列+work-stealing+per-CPU TSS/anchor）、通用 IPI、TLB shootdown；启用 `enable_ap_startup` | QEMU 多核：用户任务真正并行；零崩溃 | 🚧 进行中（见 §4） |
 | **M9** | aarch64 后端（复用 M4 抽象 + Limine 引导 + GIC/generic timer/PL011） | QEMU aarch64 启动 → 用户态 | ⬜ 待办 |
 
 > SMP（M8）与第二 ISA（M2–M7）相对独立，可并行；M8 的 per-CPU 改造也会反哺 riscv64/aarch64 的
@@ -88,3 +88,29 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 #   MoQiOS riscv64 skeleton: booted in S-mode via OpenSBI
 #   [riscv64] arch skeleton online; halting (Milestone 1)
 ```
+
+---
+
+## 4. M8 进度（x86_64 SMP）
+
+把 M8 拆成可单独验证、可单独提交的小步；每步保持 **x86_64 单核不回归**（构建 + 启动到
+`MoQiOS shell`），多核相关行为在 AP 上线（M8-5）后用 `-smp N` 验证。
+
+| 子步 | 内容 | 状态 |
+|---|---|---|
+| **M8-1** | 通用 IPI 基础设施：`lapic.sendIpi(apic_id, vector)` + `sendIpiAllButSelf`；reschedule(0xFD)/TLB-shootdown(0xFE) 向量与 `interruptDispatch` 分发 + 处理器 | ✅ 完成（单核休眠态，未改调度行为） |
+| **M8-2** | per-CPU 当前任务/时间片状态：`current_idx`/`slice_remaining` 迁入 `PerCpu`（单核等价 BSP） | ⬜ 待办 |
+| **M8-3** | per-CPU 上下文切换 anchor：`commonStub` 按来源 CS `swapgs` + 经 `%gs` 取 per-CPU anchor | ⬜ 待办 |
+| **M8-4** | per-CPU TSS RSP0：`setRsp0` 作用于当前 CPU 而非固定 BSP | ⬜ 待办 |
+| **M8-5** | AP 参与调度：per-CPU 运行队列 / work-stealing + AP 开定时器 + `enable_ap_startup=true` | ⬜ 待办 |
+| **M8-6** | 跨核 TLB shootdown：per-CPU shootdown 描述符 + 范围 `invlpg`（取代 M8-1 的 CR3 全刷回退） | ⬜ 待办 |
+
+### M8-1 设计要点
+
+- **向量选择**：`0xFD`（reschedule）、`0xFE`（TLB shootdown），避开 PIC 重映射区（32–47）、LAPIC
+  定时器（240）、AHCI（241），且低于 spurious（`0xFF`）。256 个 IDT stub 在 `idt.init()` 已全部安装，
+  因此无需新增门，只需在 `interruptDispatch` 增加分发分支。
+- **`sendIpi`**：Fixed 投递（000）、物理目的、assert（bit14）、edge；轮询 ICR delivery-status（bit12）。
+  允许 self-IPI（目标为自身 APIC ID），用于强制本核 reschedule。
+- **休眠态安全**：单核下无人发送 IPI，两个处理器分支不会触发，调度行为与之前逐字节一致；故
+  本步唯一验证目标是「仍构建并启动到 shell」。后续 M8-5 上线 AP 后这些原语才真正被驱动。
