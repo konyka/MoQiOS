@@ -101,7 +101,7 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 | **M8-1** | 通用 IPI 基础设施：`lapic.sendIpi(apic_id, vector)` + `sendIpiAllButSelf`；reschedule(0xFD)/TLB-shootdown(0xFE) 向量与 `interruptDispatch` 分发 + 处理器 | ✅ 完成（单核休眠态，未改调度行为） |
 | **M8-2** | per-CPU 当前任务/时间片状态：`current_idx`/`slice_remaining` 迁入 `PerCpu`（单核等价 BSP） | ✅ 完成（单核回归一致，386 行启动到 shell） |
 | **M8-3** | per-CPU 上下文切换 anchor：`commonStub` 经 `%gs` 取 per-CPU anchor（无需 swapgs） | ✅ 完成（单核回归一致，386 行启动到 shell） |
-| **M8-4** | per-CPU TSS RSP0：`setRsp0` 作用于当前 CPU 而非固定 BSP | ⬜ 待办 |
+| **M8-4** | per-CPU TSS RSP0：`setRsp0` 作用于当前 CPU 而非固定 BSP | ✅ 完成（单核回归一致，386 行启动到 shell） |
 | **M8-5** | AP 参与调度：per-CPU 运行队列 / work-stealing + AP 开定时器 + `enable_ap_startup=true` | ⬜ 待办 |
 | **M8-6** | 跨核 TLB shootdown：per-CPU shootdown 描述符 + 范围 `invlpg`（取代 M8-1 的 CR3 全刷回退） | ⬜ 待办 |
 
@@ -142,3 +142,12 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **为何不用 swapgs-on-CS**：鉴于上面的 GS 不变量，swapgs 在本内核里是 no-op 基址交换，加之只会增加
   复杂度与风险；故采用更精简且等价的「直接 `%gs`」方案。代价：用户态 `%gs` 被内核占用（用户程序不能用
   `%gs` 做 TLS）——当前 `hello*` 程序均不使用，符合现状。
+
+### M8-4 设计要点
+
+- **TSS RSP0 按当前核**：调度器/`execve` 原先调用 `gdt.setRsp0Bsp`（固定写 `tss[0]`），改为
+  `gdt.setRsp0(currentCpuId(), ...)`，写「本核」的 `tss[cpu_id].rsp0`。
+- **硬件正确性**：每核加载自己的 GDT（`gdt_entries[cpu_id]`），其 entry 6（`TSS_SEL=0x30`）指向
+  `tss[cpu_id]`，故 `ltr 0x30` 在第 N 核加载 `tss[N]`；写本核 `tss[cpu_id].rsp0` 即影响该核用户→内核
+  中断投递所用栈。`PerCpu.kernel_rsp`（syscall 路径用栈）此前已是 per-CPU。
+- **单核等价**：`currentCpuId()==0`，与 `setRsp0Bsp` 完全一致；回归零非规范 RSP0 告警。

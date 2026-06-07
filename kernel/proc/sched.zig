@@ -83,6 +83,13 @@ fn setSlice(v: u64) void {
     pc.slice_remaining = v;
 }
 
+/// Logical id of the CPU currently executing (0 = BSP). Used to target this
+/// CPU's own TSS RSP0 on context switch (M8-4) rather than always the BSP's.
+fn currentCpuId() u32 {
+    const pc = thisCpu() orelse return 0;
+    return pc.cpu_id;
+}
+
 pub fn currentTaskIndex() ?u32 {
     return getCurrentIdx();
 }
@@ -179,7 +186,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
                 :
                 : [cr3] "r" (t.page_table_phys),
                 : .{ .rax = true, .memory = true });
-            gdt.setRsp0Bsp(t.kernel_stack_top);
+            gdt.setRsp0(currentCpuId(), t.kernel_stack_top);
             syscall_entry.getPerCpu().kernel_rsp = t.kernel_stack_top;
             return;
         }
@@ -239,14 +246,14 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
                 :
                 : [cr3] "r" (pt),
                 : .{ .rax = true, .memory = true });
-            gdt.setRsp0Bsp(new_task.kernel_stack_top);
+            gdt.setRsp0(currentCpuId(), new_task.kernel_stack_top);
             syscall_entry.getPerCpu().kernel_rsp = new_task.kernel_stack_top;
             // Ensure KERNEL_GS_BASE points to PerCpu struct before entering user mode.
             syscall_entry.wrmsr(0xC0000102, @intFromPtr(syscall_entry.getPerCpu()));
             return;
         }
         sched_lock.release(flags);
-        gdt.setRsp0Bsp(new_task.kernel_stack_top);
+        gdt.setRsp0(currentCpuId(), new_task.kernel_stack_top);
         syscall_entry.getPerCpu().kernel_rsp = new_task.kernel_stack_top;
         syscall_entry.wrmsr(0xC0000102, @intFromPtr(syscall_entry.getPerCpu()));
     } else {
@@ -396,13 +403,14 @@ pub fn apIdleLoop() noreturn {
 
 /// Park an AP without participating in scheduling.
 ///
-/// SMP migration status: the running-task index, timeslice (M8-2) and the
-/// context-switch stack anchor (M8-3) are now PER-CPU (in PerCpu, reached via
-/// %gs). Still BSP-pinned and not yet AP-safe: the TSS RSP0 (`setRsp0Bsp`;
-/// per-CPU in M8-4) and AP scheduling participation (M8-5). Until those land,
-/// APs come online and halt here — this proves multi-core bring-up works without
-/// destabilizing the uniprocessor scheduler. Interrupts stay disabled so no
-/// timer IRQ drives the scheduler from an AP.
+/// SMP migration status: the running-task index, timeslice (M8-2), the context-
+/// switch stack anchor (M8-3) and the TSS RSP0 target (M8-4, per-CPU via
+/// gdt.setRsp0(currentCpuId(), ..)) are now all PER-CPU. What remains for AP
+/// scheduling participation (M8-5): a per-CPU/stealable run queue path and
+/// enabling AP timers + `enable_ap_startup`. Until then, APs come online and halt
+/// here — this proves multi-core bring-up works without destabilizing the
+/// uniprocessor scheduler. Interrupts stay disabled so no timer IRQ drives the
+/// scheduler from an AP.
 pub fn apParkLoop() noreturn {
     while (true) {
         asm volatile ("hlt");
@@ -443,7 +451,7 @@ fn tryStealTask() void {
                     :
                     : [cr3] "r" (t.page_table_phys),
                     : .{ .rax = true, .memory = true });
-                gdt.setRsp0Bsp(t.kernel_stack_top);
+                gdt.setRsp0(currentCpuId(), t.kernel_stack_top);
                 syscall_entry.getPerCpu().kernel_rsp = t.kernel_stack_top;
                 return;
             }

@@ -72,7 +72,7 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64) ?u64 {
         :
         : [cr3] "r" (result.pml4),
         : .{ .rax = true, .memory = true });
-    @import("../arch/x86_64/gdt.zig").setRsp0Bsp(cur.kernel_stack_top);
+    @import("../arch/x86_64/gdt.zig").setRsp0(getPerCpu().cpu_id, cur.kernel_stack_top);
     getPerCpu().kernel_rsp = cur.kernel_stack_top;
 
     // Build interrupt frame for new program
