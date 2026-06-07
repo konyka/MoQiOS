@@ -103,6 +103,11 @@ pub fn currentTask() ?*task.Task {
 pub fn timerTick(frame: *idt.InterruptFrame) void {
     _ = frame;
 
+    // M8-5a: APs are online and taking timer interrupts (proving the per-CPU
+    // interrupt/anchor/GS infrastructure is SMP-stable), but only the BSP drives
+    // task scheduling for now. M8-5b lets APs schedule their own tasks.
+    if (currentCpuId() != 0) return;
+
     const flags = sched_lock.acquire();
 
     reap_counter +|= 1;
@@ -390,12 +395,15 @@ pub fn deliverSignalToRunningTask(t: *task.Task) void {
     iframe.rdi = signum;
 }
 
-/// AP idle loop — APs enter this after initialization.
-/// They check for stealable tasks with interrupts enabled.
+/// AP idle loop — an online AP runs this when it has no task to execute.
+///
+/// It simply enables interrupts and halts; the LAPIC timer wakes it each tick.
+/// In M8-5a the AP's timerTick is a no-op (BSP-only scheduling), so the AP idles
+/// here harmlessly while taking timer interrupts. In M8-5b the AP's timerTick
+/// will switch it onto a ready task (timer-driven, like the BSP), and back to
+/// this loop (its per-CPU idle task) when nothing is ready.
 pub fn apIdleLoop() noreturn {
     while (true) {
-        // Try to steal a task from another CPU's run queue
-        tryStealTask();
         asm volatile ("sti");
         asm volatile ("hlt");
     }

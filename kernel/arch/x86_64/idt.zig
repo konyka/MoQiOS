@@ -662,11 +662,21 @@ fn handleAhci(frame: *InterruptFrame) void {
 }
 
 /// Handle LAPIC timer interrupt (vector 240).
+///
+/// Every CPU EOIs its own LAPIC. The global tick (which drives timerfd/POSIX
+/// timers and the reap interval) is advanced by the BSP only, so wall-clock time
+/// does not run N× faster on an N-CPU system. timerTick is called on every CPU;
+/// it internally decides what scheduling work this CPU performs (M8-5a: APs do
+/// nothing; M8-5b: APs schedule their own tasks).
 fn handleLapicTimer(frame: *InterruptFrame) void {
-    incrementTick();
     // Import LAPIC and scheduler here to avoid circular deps at comptime
     const lapic = @import("lapic.zig");
     lapic.eoi();
+
+    const sc = @import("syscall_entry.zig");
+    if (sc.getPerCpu().cpu_id == 0) {
+        incrementTick();
+    }
 
     const sched = @import("../../proc/sched.zig");
     sched.timerTick(frame);

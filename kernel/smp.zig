@@ -16,15 +16,16 @@
 ///     NXE at boot and never saw it; the AP did not. The trampoline now sets
 ///     EFER.NXE alongside LME. APs also now load the IDT (idt.loadOnThisCpu).
 ///     With these fixes APs reliably reach "[SMP] AP N initialized".
-///   - GATED: `enable_ap_startup` is still false by default. Bringing an AP
-///     fully online (even parked) currently destabilizes the BSP's user
-///     processes: they triple-fault nondeterministically (varying user RIPs).
-///     An attribution test (do all BSP-side setup but skip INIT/SIPI) stays
-///     stable, so the trigger is an AP *running*, not the page-table/PMM setup.
-///     This points to the per-CPU/scheduler infrastructure not yet being
-///     SMP-safe (global scheduler state, no TLB shootdown), likely amplifying a
-///     pre-existing user-space fault that also triggers uniprocessor (~hello26).
-///     Resolving that is tracked separately; until then we run uniprocessor.
+///   - ENABLED (M8-5a): `enable_ap_startup` is now true. The historical blocker
+///     ("an AP running triple-faults the BSP's user processes") is resolved. Its
+///     two root causes are fixed: (1) the TSS misalignment that broke user-mode
+///     interrupt delivery (now a packed TSS, see gdt.zig), and (2) the scheduler
+///     keeping run state in shared globals — now per-CPU: running-task index +
+///     timeslice (M8-2), context-switch anchor via %gs (M8-3) and TSS RSP0
+///     (M8-4). APs come online with their LAPIC timer running and take interrupts
+///     on per-CPU state; verified with -smp 2 the BSP runs all user tests to the
+///     shell with zero faults. M8-5a keeps scheduling BSP-only (APs idle); M8-5b
+///     will let APs run tasks for true parallelism, M8-6 adds TLB shootdown.
 const acpi = @import("acpi/acpi_parser.zig");
 const lapic = @import("arch/x86_64/lapic.zig");
 const gdt = @import("arch/x86_64/gdt.zig");
@@ -41,15 +42,15 @@ const KERNEL_STACK_PAGES: u64 = 16;
 
 /// Master switch for Application Processor (AP) bring-up.
 ///
-/// Disabled by default. The original LAPIC-on-AP crash that hung boot is FIXED
-/// (EFER.NXE + AP IDT load; see the module doc comment), and APs now reach
-/// "[SMP] AP N initialized" and park cleanly. However, with an AP actually
-/// running the BSP's user processes triple-fault nondeterministically, so we
-/// keep running uniprocessor (fully functional) until the per-CPU/scheduler
-/// infrastructure is made SMP-safe. Flip to `true` to bring APs online for
-/// further SMP work (expect user-space instability until the scheduler is
-/// per-CPU).
-pub const enable_ap_startup: bool = false;
+/// ENABLED (M8-5a). The per-CPU scheduler infrastructure is now in place:
+/// running-task index + timeslice (M8-2), context-switch anchor via %gs (M8-3)
+/// and TSS RSP0 (M8-4) are all per-CPU, and the earlier user-space triple-fault
+/// (TSS misalignment) is fixed. APs now come online with their LAPIC timer
+/// running and take interrupts on their own per-CPU state (idle loop). For M8-5a
+/// only the BSP schedules tasks (see sched.timerTick) — this validates that an AP
+/// actively running + taking timer IRQs no longer destabilizes the BSP, which was
+/// the historical blocker. M8-5b will let APs run tasks for true parallelism.
+pub const enable_ap_startup: bool = true;
 
 /// Number of CPUs currently online (1 = BSP only).
 pub var cpu_count: u32 = 1;
@@ -106,13 +107,16 @@ pub fn apEntry() callconv(.c) noreturn {
     syscall_entry.percpu_array[actual_cpu_id].current_tid = 0;
     rawPutc('H');
 
-    // Enable this AP's LAPIC (inherit the BSP-mapped MMIO base). No timer yet:
-    // the scheduler is not SMP-aware, so APs must not drive it via timer IRQs.
+    // Enable this AP's LAPIC (inherit the BSP-mapped MMIO base) AND start its
+    // periodic timer (M8-5a). The per-CPU scheduler state (anchor via %gs, TSS
+    // RSP0, running-task/timeslice) is now SMP-safe, so it is safe for the AP to
+    // take timer IRQs. GS base must be set before any timer IRQ so commonStub's
+    // %gs:anchor is valid — set it first, then enable the timer.
     lapic.setBase(lapic.getBase());
-    lapic.enableApNoTimer();
+    syscall_entry.setPerCpuGsBase(actual_cpu_id);
     rawPutc('I');
 
-    syscall_entry.setPerCpuGsBase(actual_cpu_id);
+    lapic.initAp();
     rawPutc('J');
 
     // Signal BSP that we're alive
@@ -120,8 +124,9 @@ pub fn apEntry() callconv(.c) noreturn {
     serial.writeByte('0' + @as(u8, @truncate(actual_cpu_id)));
     serial.writeString(" initialized\n");
 
-    // Park: come online but do not participate in scheduling (see apParkLoop).
-    sched.apParkLoop();
+    // Enter the idle loop: come online, take timer IRQs on per-CPU state, but
+    // (M8-5a) leave task scheduling to the BSP. M8-5b switches APs onto tasks.
+    sched.apIdleLoop();
 }
 
 /// Ensure all page table pages are mapped through HHDM.

@@ -102,7 +102,8 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 | **M8-2** | per-CPU 当前任务/时间片状态：`current_idx`/`slice_remaining` 迁入 `PerCpu`（单核等价 BSP） | ✅ 完成（单核回归一致，386 行启动到 shell） |
 | **M8-3** | per-CPU 上下文切换 anchor：`commonStub` 经 `%gs` 取 per-CPU anchor（无需 swapgs） | ✅ 完成（单核回归一致，386 行启动到 shell） |
 | **M8-4** | per-CPU TSS RSP0：`setRsp0` 作用于当前 CPU 而非固定 BSP | ✅ 完成（单核回归一致，386 行启动到 shell） |
-| **M8-5** | AP 参与调度：per-CPU 运行队列 / work-stealing + AP 开定时器 + `enable_ap_startup=true` | ⬜ 待办 |
+| **M8-5a** | AP 上线 + 开定时器 + `enable_ap_startup=true`，但仍 BSP-only 调度（AP 空闲取中断） | ✅ 完成（`-smp 2`：2 CPUs online，BSP 跑完全部测试到 shell，零故障） |
+| **M8-5b** | AP 参与调度：per-CPU idle 任务 + 全核 `timerTick` 调度（真正并行） | ⬜ 待办 |
 | **M8-6** | 跨核 TLB shootdown：per-CPU shootdown 描述符 + 范围 `invlpg`（取代 M8-1 的 CR3 全刷回退） | ⬜ 待办 |
 
 ### M8-1 设计要点
@@ -151,3 +152,18 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   `tss[cpu_id]`，故 `ltr 0x30` 在第 N 核加载 `tss[N]`；写本核 `tss[cpu_id].rsp0` 即影响该核用户→内核
   中断投递所用栈。`PerCpu.kernel_rsp`（syscall 路径用栈）此前已是 per-CPU。
 - **单核等价**：`currentCpuId()==0`，与 `setRsp0Bsp` 完全一致；回归零非规范 RSP0 告警。
+
+### M8-5a 设计要点（解除历史阻塞点）
+
+- **历史阻塞点**：此前「AP 一旦真正运行，BSP 用户进程就随机三重故障」。两个根因均已修复：
+  (1) TSS 错位致用户态中断投递从未工作（已改 packed TSS）；(2) 调度状态用共享全局——M8-2~M8-4 已全部
+  下沉为 per-CPU。故现在可安全 `enable_ap_startup=true`。
+- **AP 上线路径**：`apEntry` 顺序调整为「设 `GS_BASE` → 开 LAPIC 定时器(`initAp`)」，保证首个定时器中断进入
+  `commonStub` 时 `%gs:anchor` 已有效；随后进入 `apIdleLoop`(`sti;hlt`)。
+- **BSP-only 调度（本步）**：`timerTick` 开头 `if (currentCpuId()!=0) return;`，AP 取定时器中断但不调度；
+  全局 tick（`incrementTick`）仅 BSP 自增，避免多核下时钟走快 N 倍（`handleLapicTimer` 中按核门控）。
+- **CPL0 中断不需 RSP0**：AP 空闲时处于内核态(CPL0)，定时器中断不切栈（无特权级变化），直接用 AP 当前内核栈；
+  故 M8-5a AP 不触及 TSS RSP0。
+- **验证**：`-smp 2` 下 `[SMP] 2 CPUs online`，AP 走完 B–J 全部 bring-up 标记并 `AP 1 initialized`，BSP 跑完
+  `hello2`–`hello28`（含 hello26 TCP echo、fork/execve、ext2）到 `MoQiOS shell`，**零故障/零非规范 RSP0**
+  （串口 395 行，比单核多 9 行 SMP bring-up 信息）。
