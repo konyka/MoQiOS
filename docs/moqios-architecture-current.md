@@ -118,7 +118,8 @@ AP 冷 walk 才暴露。
 | M8-2~M8-4 | ✅ | per-CPU 运行任务/时间片/anchor/TSS RSP0 |
 | M8-5a | ✅ | AP 上线 + 定时器，BSP-only 调度 |
 | M8-5b-0 | ✅ | AP 高半区执行（trampoline 直跳 HHDM `apEntry`） |
-| M8-5b-1~2 | ⬜ | `exec_result` per-CPU 化 + 亲和调度（真并行） |
+| M8-5b-1 | ✅ | `exec_result` 迁入 `PerCpu`（`%%gs:48/56/64`） |
+| M8-5b-2 | ⬜ | 亲和调度（无迁移）+ AP 参与 `timerTick` |
 | M8-6 | ⬜ | 范围 TLB shootdown |
 
 详见 `docs/cross-arch-port-plan.md` M8 节。

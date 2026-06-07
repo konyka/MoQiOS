@@ -108,10 +108,11 @@ pub fn sigreturn() SigreturnResult {
     const user_rsp = syscall_entry.getPerCpu().saved_user_rsp;
     const sig_frame: *sig_mod.SignalFrame = @ptrFromInt(user_rsp);
 
-    // Set exec_result for the syscall return path
-    syscall_entry.exec_result.pending = 2;
-    syscall_entry.exec_result.new_entry = sig_frame.rip;
-    syscall_entry.exec_result.new_stack = sig_frame.rsp;
+    // M8-5b-1: per-CPU exec redirect for the syscall return path
+    const pc = syscall_entry.getPerCpu();
+    pc.exec_pending = 2;
+    pc.exec_new_entry = sig_frame.rip;
+    pc.exec_new_stack = sig_frame.rsp;
 
     return .{
         .rip = sig_frame.rip,

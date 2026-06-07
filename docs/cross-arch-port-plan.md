@@ -209,7 +209,8 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **M8-5b-0｜AP 高半区执行修复**（上面第 1 点）：自洽且必须，先单独落地+多核验证（AP 仅空闲，不调度）。**✅ 已完成**
   （`ap_trampoline` 在分页后直接 `jmp` HHDM 虚拟 `apEntry`；`0x7010`/`0x7030` 存虚拟栈顶/入口；
   `-smp 2`：2 CPUs online + BSP 到 shell，零故障）。
-- **M8-5b-1｜全局态 per-CPU 化**：`exec_result` 迁入 `PerCpu`（`%gs` 相对访问），消除第 3 点。
+- **M8-5b-1｜全局态 per-CPU 化**：`exec_result` 迁入 `PerCpu`（`%%gs:48/56/64` 相对访问），消除第 3 点。**✅ 已完成**
+  （`-smp 2`：hello13 信号/sigreturn 正常，到 shell 零故障）。
 - **M8-5b-2｜亲和调度（无迁移）**：所有任务创建时**绑核**（round-robin），`pickNext` 已支持 `pinned` 过滤。
   无迁移 ⇒ 每核行为等价于“已验证的单核”，从根上回避第 2 点（`saved_user_rsp` 永不跨核）。先交付**可用的并行**
   （不同核跑不同任务），代价是暂无负载均衡/work-stealing。

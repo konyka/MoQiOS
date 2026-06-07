@@ -85,16 +85,21 @@ pub const PerCpu = extern struct {
     apic_id: u32, // LAPIC APIC ID
     current_tid: u32, // Currently running task TID on this CPU (0 = idle)
     current_task_idx: u32, // Index of currently running task (0xFFFFFFFF = none)
+    // M8-5b-1: signal/exec return path — per-CPU so concurrent CPUs don't stomp
+    // each other's pending handler redirect (was a single global exec_result).
+    exec_pending: u64,
+    exec_new_entry: u64,
+    exec_new_stack: u64,
 };
 
 /// Per-CPU data array, indexed by CPU logical ID.
 /// slice_remaining starts at the scheduler timeslice (sched.TIMESLICE_TICKS = 10)
 /// so a freshly-brought-up CPU behaves like the old global default.
 pub var percpu_array: [MAX_CPUS]PerCpu = .{
-    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 0, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF },
-    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 1, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF },
-    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 2, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF },
-    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 3, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF },
+    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 0, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF, .exec_pending = 0, .exec_new_entry = 0, .exec_new_stack = 0 },
+    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 1, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF, .exec_pending = 0, .exec_new_entry = 0, .exec_new_stack = 0 },
+    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 2, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF, .exec_pending = 0, .exec_new_entry = 0, .exec_new_stack = 0 },
+    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 3, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF, .exec_pending = 0, .exec_new_entry = 0, .exec_new_stack = 0 },
 };
 
 /// Personality type for ABI routing.
@@ -103,14 +108,6 @@ pub const Personality = enum(u8) {
     linux = 1,
     windows = 2,
 };
-
-pub const ExecResult = extern struct {
-    pending: u64,
-    new_entry: u64,
-    new_stack: u64,
-};
-
-pub export var exec_result: ExecResult = .{ .pending = 0, .new_entry = 0, .new_stack = 0 };
 
 export var fork_parent_ret: u64 = 0;
 
@@ -149,6 +146,16 @@ pub fn getPerCpuOrNull() ?*PerCpu {
 
 /// Compile-time offset of saved_stack_anchor in PerCpu (used by commonStub asm).
 pub const PERCPU_ANCHOR_OFFSET = @offsetOf(PerCpu, "saved_stack_anchor");
+pub const PERCPU_EXEC_PENDING_OFFSET = @offsetOf(PerCpu, "exec_pending");
+pub const PERCPU_EXEC_ENTRY_OFFSET = @offsetOf(PerCpu, "exec_new_entry");
+pub const PERCPU_EXEC_STACK_OFFSET = @offsetOf(PerCpu, "exec_new_stack");
+
+comptime {
+    // syscallEntry naked asm bakes these offsets as immediates (like %%gs:8).
+    if (PERCPU_EXEC_PENDING_OFFSET != 48 or PERCPU_EXEC_ENTRY_OFFSET != 56 or PERCPU_EXEC_STACK_OFFSET != 64) {
+        @compileError("PerCpu exec_* layout changed — update syscallEntry %%gs offsets");
+    }
+}
 
 /// Set GS base for the given CPU (used during CPU init).
 pub fn setPerCpuGsBase(cpu_id: u32) void {
@@ -170,6 +177,7 @@ pub fn setPerCpuGsBase(cpu_id: u32) void {
 /// PerCpu layout (accessed via %%gs:offset):
 ///   offset 0: kernel_rsp (u64)
 ///   offset 8: saved_user_rsp (u64)
+///   offset 48/56/64: exec_pending / exec_new_entry / exec_new_stack (M8-5b-1)
 pub fn syscallEntry() callconv(.naked) void {
     // No input operands needed. The handler address is loaded AFTER all GPR
     // saves via an indirect call through RAX. We save/restore RAX from the frame.
@@ -251,15 +259,16 @@ pub fn syscallEntry() callconv(.naked) void {
         \\// Save return value (RAX) before exec_result check clobbers registers
         \\pushq %%rax
         \\
-        \\movq exec_result(%%rip), %%rax
+        \\// M8-5b-1: per-CPU exec redirect (signal/sigreturn) via %%gs:48/56/64
+        \\movq %%gs:48, %%rax
         \\testq %%rax, %%rax
         \\jz 2f
-        \\addq $8, %%rsp   // discard saved RAX — exec/signal provides new context
-        \\movq exec_result+8(%%rip), %%rcx
-        \\movq exec_result+16(%%rip), %%rax
+        \\addq $8, %%rsp
+        \\movq %%gs:56, %%rcx
+        \\movq %%gs:64, %%rax
         \\movq $0x202, %%r11
         \\movq %%rax, %%rsp
-        \\movq $0, exec_result(%%rip)
+        \\movq $0, %%gs:48
         \\jmp 3f
         \\2:
         \\popq %%rax       // restore return value
@@ -699,9 +708,10 @@ pub fn checkSignalsOnSyscallReturn(frame: *SyscallFrame) void {
 
     frame.rdi = signum;
     frame.rcx = handler_addr;
-    exec_result.pending = 3;
-    exec_result.new_entry = handler_addr;
-    exec_result.new_stack = result.new_rsp;
+    const pc = getPerCpu();
+    pc.exec_pending = 3;
+    pc.exec_new_entry = handler_addr;
+    pc.exec_new_stack = result.new_rsp;
 }
 
 fn syscallGetenv(frame: *SyscallFrame) void {
