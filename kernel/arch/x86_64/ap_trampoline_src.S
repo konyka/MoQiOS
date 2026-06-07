@@ -12,6 +12,7 @@
  *   7040: CPU ID (u32)
  *   7050: PerCpu virtual address (u64)
  *   7060: Magic write area (u32, pre-paging)
+ *   7070: HHDM offset (u64, M8-5b-0 — reserved for naked apEntry relocation)
  */
 
 .code16
@@ -99,8 +100,10 @@ lm_entry:
     mov $'D', %al
     outb %al, %dx
 
-    /* Jump to identity-mapped stub at 0x6000 */
-    mov $0x6000, %rax
+    /* Jump directly to the kernel entry (HHDM virtual address at 0x7030).
+     * M8-5b-0: BSP stores the high-half virt entry + stack so the AP never
+     * executes in the identity-mapped low region after this point. */
+    mov 0x7030, %rax
     jmp *%rax
 
 .org 0x140

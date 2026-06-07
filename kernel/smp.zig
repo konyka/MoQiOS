@@ -80,7 +80,9 @@ fn rawPutc(c: u8) void {
     );
 }
 
-/// Entry point for APs — called from identity-mapped stub in 64-bit long mode.
+/// Entry point for APs — entered from the trampoline in 64-bit long mode at this
+/// function's HHDM virtual address (M8-5b-0). The AP never executes in the
+/// identity-mapped low region after paging is enabled.
 /// cpu_id is read from the trampoline data area at physical 0x7040.
 ///
 /// Bring-up markers (lock-free, COM1): E=entered, F=GDT, G=IDT, H=per-CPU,
@@ -415,63 +417,23 @@ pub fn init() void {
         fmt.writeHex(stack_top);
         serial.writeString("\n");
 
-        // Store AP stack in trampoline data
-        // Use physical address since the trampoline runs in identity-mapped space
-        // and the AP will access the stack through identity mapping initially
+        // M8-5b-0: store HHDM *virtual* stack top and entry so the AP lands in the
+        // high-half immediately after the trampoline enables paging. The kernel
+        // mapping (PML4[511]) is present in every process page table, so AP code
+        // that stays in the high-half remains valid after a user CR3 switch.
         const stack_ptr: *u64 = @ptrFromInt(hhdm.physToVirt(0x7010));
-        stack_ptr.* = stack_phys + KERNEL_STACK_PAGES * paging.PAGE_SIZE;
-
-        // Store kernel entry point at 0x7030 (AP will jump here after paging)
-        // Compute identity-mapped address: apEntry_virt - kernel_virt_base + kernel_phys_base
-        // This avoids the AP needing to walk the kernel mapping (PML4[511]) which
-        // might have issues with empty TLB on some configurations.
-        const kernel_pdpt_phys = pml4_tbl.entries[511].getPhysAddr();
-        const kernel_pdpt: *paging.PageTable = hhdm.physToPtr(paging.PageTable, kernel_pdpt_phys);
-        const kernel_pd_phys = kernel_pdpt.entries[510].getPhysAddr();
-        const kernel_pd: *paging.PageTable = hhdm.physToPtr(paging.PageTable, kernel_pd_phys);
-        const kernel_pt_phys = kernel_pd.entries[0].getPhysAddr();
-        const kernel_pt: *paging.PageTable = hhdm.physToPtr(paging.PageTable, kernel_pt_phys);
-        const kernel_phys_base = kernel_pt.entries[0].getPhysAddr();
-        const apentry_phys = kernel_phys_base + (@intFromPtr(&apEntry) - 0xFFFFFFFF80000000);
-
-        serial.writeString("[SMP] kernel_phys_base=0x");
-        fmt.writeHex(kernel_phys_base);
-        serial.writeString(" apentry_phys=0x");
-        fmt.writeHex(apentry_phys);
-        serial.writeString("\n");
+        stack_ptr.* = stack_top;
 
         const entry_ptr: *u64 = @ptrFromInt(hhdm.physToVirt(0x7030));
-        entry_ptr.* = apentry_phys;
+        entry_ptr.* = @intFromPtr(&apEntry);
 
-        // Write a small 64-bit jump stub at physical 0x6000 that:
-        // 1. Passes cpu_id in rdi (from 0x7040)
-        // 2. Jumps to the real apEntry (from 0x7030)
-        // This stub runs at identity-mapped addresses and bridges to kernel space.
-        const stub_base = hhdm.physToVirt(0x6000);
-        const stub: [*]u8 = @ptrFromInt(stub_base);
-        // mov rdi, [0x7040]  -> 48 8B 3C 25 40 70 00 00
-        stub[0] = 0x48;
-        stub[1] = 0x8B;
-        stub[2] = 0x3C;
-        stub[3] = 0x25;
-        stub[4] = 0x40;
-        stub[5] = 0x70;
-        stub[6] = 0x00;
-        stub[7] = 0x00;
-        // jmp [0x7030]  -> FF 25 30 70 00 00 (rip-relative, but we need absolute)
-        // Actually use: mov rax, [0x7030]; jmp rax
-        // mov rax, [0x7030]  -> 48 8B 04 25 30 70 00 00
-        stub[8] = 0x48;
-        stub[9] = 0x8B;
-        stub[10] = 0x04;
-        stub[11] = 0x25;
-        stub[12] = 0x30;
-        stub[13] = 0x70;
-        stub[14] = 0x00;
-        stub[15] = 0x00;
-        // jmp rax  -> FF E0
-        stub[16] = 0xFF;
-        stub[17] = 0xE0;
+        serial.writeString("[SMP] apentry_virt=0x");
+        fmt.writeHex(entry_ptr.*);
+        serial.writeString("\n");
+
+        // HHDM offset for optional naked relocation paths (documented at 0x7070).
+        const hhdm_ptr: *u64 = @ptrFromInt(hhdm.physToVirt(0x7070));
+        hhdm_ptr.* = hhdm.get();
 
         // Store CPU ID (write as u64 to avoid garbage in upper 32 bits)
         const cpu_id_ptr: *u64 = @ptrFromInt(hhdm.physToVirt(0x7040));

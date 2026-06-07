@@ -107,27 +107,21 @@ AP 冷 walk 才暴露。
 修复后实测：AP 稳定走完 `BCDEFGHIJ` 标记 → `[SMP] AP 1 initialized` → `[SMP] 2 CPUs online`，
 不再崩在 LAPIC 访问。
 
-### 仍门控的更深层问题（`enable_ap_startup` 默认仍为 false）
+### SMP 当前状态（2026-06，M8 进行中）
 
-一旦 AP **真正运行**（即便只是 park 在 `hlt`），BSP 上的用户进程会**非确定性三重故障**（多次运行
-故障用户 RIP 各不相同：hello7 / hello2 / …）。归因实验表明：
+历史阻塞点（TSS 错位、中断 stub 寄存器破坏、调度器全局状态）均已修复。**`enable_ap_startup=true`**，
+`-smp 2` 下 AP 稳定上线并取定时器中断；BSP 跑完全部 `hello*` 到 `MoQiOS shell`，零故障。
 
-- 仅做 BSP 端全部 SMP 设置（identity 映射、PMM 预留、trampoline 拷贝）但**不发 INIT/SIPI** →
-  系统稳定跑到 hello26（与单核基线一致）；
-- 一旦真正启动 AP → 早期即非确定性崩溃。
+| 子里程碑 | 状态 | 说明 |
+|---|---|---|
+| M8-1 | ✅ | 通用 IPI + reschedule/TLB-shootdown 向量 |
+| M8-2~M8-4 | ✅ | per-CPU 运行任务/时间片/anchor/TSS RSP0 |
+| M8-5a | ✅ | AP 上线 + 定时器，BSP-only 调度 |
+| M8-5b-0 | ✅ | AP 高半区执行（trampoline 直跳 HHDM `apEntry`） |
+| M8-5b-1~2 | ⬜ | `exec_result` per-CPU 化 + 亲和调度（真并行） |
+| M8-6 | ⬜ | 范围 TLB shootdown |
 
-因此触发因素是"**AP 在运行**"而非 BSP 端页表/内存设置。当时推测它放大了一个**单核下也存在**的
-用户态崩溃（单核模式同样会在 ~hello26 处三重故障）。
-
-> **2026-06 更新**：上文怀疑的"单核 ~hello26 既有用户态三重故障"已**查明并修复**——根因是
-> **TSS 结构体布局错位**（`extern struct` 把 RSP0/IST 整体后移 4 字节），导致**用户态硬件中断
-> 投递从未工作过**。详见新增 **1.7 节**。这极可能也是 SMP 下"AP 一运行就崩"的主因之一（AP 带来
-> 更密集的中断/调度活动，更早触发用户态被中断的场景）。修复后单核已无三重故障，SMP 仍需 per-CPU
-> 改造（见下）后再行验证。
-
-**后续路线**（解除 SMP 门控所需）：(a) 调度器改为 per-CPU（运行队列、`current`、时间片、TSS RSP0
-均 per-CPU）；(b) 跨核 TLB shootdown IPI；(c) ~~排查并修复单核下 ~hello26 的既有用户态三重故障~~
-（**已完成**，见 1.7）。在 per-CPU 改造完成前保持单处理器模式（功能完整）。
+详见 `docs/cross-arch-port-plan.md` M8 节。
 
 > 复现/诊断辅助：`tools/qemu_run.sh` 现支持 `MOQI_SERIAL`（串口目标）、`MOQI_SMP`（核数）、
 > `MOQI_EXTRA_QEMU`（如 `-d int,cpu_reset -D /tmp/qint.log`）三个环境变量覆盖。
