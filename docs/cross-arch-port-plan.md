@@ -99,7 +99,7 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 | 子步 | 内容 | 状态 |
 |---|---|---|
 | **M8-1** | 通用 IPI 基础设施：`lapic.sendIpi(apic_id, vector)` + `sendIpiAllButSelf`；reschedule(0xFD)/TLB-shootdown(0xFE) 向量与 `interruptDispatch` 分发 + 处理器 | ✅ 完成（单核休眠态，未改调度行为） |
-| **M8-2** | per-CPU 当前任务/时间片状态：`current_idx`/`slice_remaining` 迁入 `PerCpu`（单核等价 BSP） | ⬜ 待办 |
+| **M8-2** | per-CPU 当前任务/时间片状态：`current_idx`/`slice_remaining` 迁入 `PerCpu`（单核等价 BSP） | ✅ 完成（单核回归一致，386 行启动到 shell） |
 | **M8-3** | per-CPU 上下文切换 anchor：`commonStub` 按来源 CS `swapgs` + 经 `%gs` 取 per-CPU anchor | ⬜ 待办 |
 | **M8-4** | per-CPU TSS RSP0：`setRsp0` 作用于当前 CPU 而非固定 BSP | ⬜ 待办 |
 | **M8-5** | AP 参与调度：per-CPU 运行队列 / work-stealing + AP 开定时器 + `enable_ap_startup=true` | ⬜ 待办 |
@@ -114,3 +114,15 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   允许 self-IPI（目标为自身 APIC ID），用于强制本核 reschedule。
 - **休眠态安全**：单核下无人发送 IPI，两个处理器分支不会触发，调度行为与之前逐字节一致；故
   本步唯一验证目标是「仍构建并启动到 shell」。后续 M8-5 上线 AP 后这些原语才真正被驱动。
+
+### M8-2 设计要点
+
+- **存储下沉**：运行任务索引 `current_task_idx`（`0xFFFFFFFF`=无）与剩余时间片 `slice_remaining`
+  从 `sched.zig` 模块全局变量改为 `PerCpu` 字段，经 `GS_BASE` 访问。`sched` 内新增
+  `getCurrentIdx/setCurrentIdx/getSlice/setSlice` 访问器，调度器所有读写改走访问器。
+- **早期启动安全**：新增 `syscall_entry.getPerCpuOrNull()`，当 `GS_BASE==0`（`syscall_entry.init()`
+  之前）返回 null；`currentTask()/currentTaskIndex()` 在 per-CPU 数据就绪前安全返回「无任务」。
+  初始化序列保证 `GS_BASE` 在 `sti`（首个定时器中断）之前已设好。
+- **单核等价**：uniprocessor 下 `GS_BASE` 恒指向 `percpu_array[0]`，访问器与旧全局变量逐字节等价；
+  `slice_remaining` 初值置为 `TIMESLICE_TICKS`(10) 以匹配旧默认。`saved_stack_anchor` 仍为全局
+  （M8-3 下沉），TSS 仍绑 BSP（M8-4 下沉），故 AP 仍停泊。

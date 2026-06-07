@@ -88,11 +88,13 @@ pub const PerCpu = extern struct {
 };
 
 /// Per-CPU data array, indexed by CPU logical ID.
+/// slice_remaining starts at the scheduler timeslice (sched.TIMESLICE_TICKS = 10)
+/// so a freshly-brought-up CPU behaves like the old global default.
 pub var percpu_array: [MAX_CPUS]PerCpu = .{
-    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 0, .cpu_id = 0, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF },
-    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 0, .cpu_id = 1, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF },
-    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 0, .cpu_id = 2, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF },
-    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 0, .cpu_id = 3, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF },
+    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 0, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF },
+    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 1, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF },
+    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 2, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF },
+    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 3, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF },
 };
 
 /// Personality type for ABI routing.
@@ -133,6 +135,15 @@ export var dispatch_handler: *const fn (*SyscallFrame) callconv(.c) void = &sysc
 pub fn getPerCpu() *PerCpu {
     // In kernel mode, GS_BASE points to our PerCpu struct (set via wrmsr)
     const gs_base = rdmsr(0xC0000101); // MSR_GS_BASE
+    return @ptrFromInt(gs_base);
+}
+
+/// Like getPerCpu, but returns null if GS_BASE is unset (0) — i.e. during very
+/// early boot before syscall_entry.init()/per-CPU bring-up. Callers that may run
+/// before per-CPU data exists (e.g. sched.currentTask) use this to stay safe.
+pub fn getPerCpuOrNull() ?*PerCpu {
+    const gs_base = rdmsr(0xC0000101); // MSR_GS_BASE
+    if (gs_base == 0) return null;
     return @ptrFromInt(gs_base);
 }
 

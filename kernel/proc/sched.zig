@@ -29,18 +29,50 @@ const TIMESLICE_TICKS: u64 = 10;
 // register before it is pushed — see idt.commonStub).
 pub export var saved_stack_anchor: u64 = 0;
 
-var current_idx: ?u32 = null;
-var slice_remaining: u64 = TIMESLICE_TICKS;
+pub const TIMESLICE_TICKS_PUB: u64 = TIMESLICE_TICKS;
+
 var reap_counter: u64 = 0;
 const REAP_INTERVAL: u64 = TIMESLICE_TICKS;
 var sched_lock: IrqSpinlock = .{};
 
+// M8-2: the running task index and remaining timeslice are now PER-CPU state,
+// stored in syscall_entry.PerCpu (current_task_idx / slice_remaining) and reached
+// via GS_BASE. In uniprocessor mode GS_BASE always points at percpu_array[0], so
+// these accessors are behaviorally identical to the old module-global variables.
+// `0xFFFFFFFF` is the "no current task" sentinel (maps to the old `?u32` null).
+const NO_TASK_IDX: u32 = 0xFFFFFFFF;
+
+inline fn thisCpu() ?*syscall_entry.PerCpu {
+    return syscall_entry.getPerCpuOrNull();
+}
+
+fn getCurrentIdx() ?u32 {
+    const pc = thisCpu() orelse return null;
+    const v = pc.current_task_idx;
+    return if (v == NO_TASK_IDX) null else v;
+}
+
+fn setCurrentIdx(v: ?u32) void {
+    const pc = thisCpu() orelse return;
+    pc.current_task_idx = v orelse NO_TASK_IDX;
+}
+
+fn getSlice() u64 {
+    const pc = thisCpu() orelse return TIMESLICE_TICKS;
+    return pc.slice_remaining;
+}
+
+fn setSlice(v: u64) void {
+    const pc = thisCpu() orelse return;
+    pc.slice_remaining = v;
+}
+
 pub fn currentTaskIndex() ?u32 {
-    return current_idx;
+    return getCurrentIdx();
 }
 
 pub fn currentTask() ?*task.Task {
-    const idx = current_idx orelse return null;
+    const idx = getCurrentIdx() orelse return null;
     return task.getTask(idx);
 }
 
@@ -71,7 +103,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
     }
 
     // Check for pending signals on current task
-    if (current_idx) |ci| {
+    if (getCurrentIdx()) |ci| {
         if (task.getTask(ci)) |ct| {
             if (ct.is_user and ct.pending_signals != 0 and ct.pending_signals & ~ct.signal_mask != 0) {
                 sched_lock.release(flags);
@@ -87,23 +119,24 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         return;
     }
 
-    if (current_idx) |ci| {
+    if (getCurrentIdx()) |ci| {
         if (task.getTask(ci)) |ct| {
             if (count == 1 and ct.state != .zombie and ct.state != .blocked) {
                 sched_lock.release(flags);
                 return;
             }
         } else {
-            current_idx = null;
+            setCurrentIdx(null);
         }
     }
 
-    slice_remaining -|= 1;
-    if (slice_remaining > 0) {
+    const new_slice = getSlice() -| 1;
+    setSlice(new_slice);
+    if (new_slice > 0) {
         sched_lock.release(flags);
         return;
     }
-    slice_remaining = TIMESLICE_TICKS;
+    setSlice(TIMESLICE_TICKS);
 
     const next_idx = pickNext() orelse {
         sched_lock.release(flags);
@@ -111,7 +144,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
     };
 
     // First ever schedule
-    if (current_idx == null) {
+    if (getCurrentIdx() == null) {
         const t = task.getTask(next_idx) orelse {
             sched_lock.release(flags);
             return;
@@ -121,7 +154,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         }
         saved_stack_anchor = t.saved_rsp;
         t.state = .running;
-        current_idx = next_idx;
+        setCurrentIdx(next_idx);
 
         // Set up CPU state for the first scheduled task
         if (t.page_table_phys != 0) {
@@ -138,7 +171,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         return;
     }
 
-    const cur_idx = current_idx.?;
+    const cur_idx = getCurrentIdx().?;
     if (next_idx == cur_idx) {
         sched_lock.release(flags);
         return;
@@ -180,7 +213,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
 
     saved_stack_anchor = new_task.saved_rsp;
     new_task.state = .running;
-    current_idx = next_idx;
+    setCurrentIdx(next_idx);
 
     if (new_task.page_table_phys != 0) {
         if (old_task.page_table_phys != new_task.page_table_phys) {
@@ -248,7 +281,7 @@ fn setupInitialFrame(t: *task.Task) void {
 /// Uses task slot bitmap to skip empty slots in O(1) via @ctz.
 /// Among equal priority, uses round-robin (start after current).
 fn pickNext() ?u32 {
-    const start = if (current_idx) |ci| (ci + 1) % task.MAX_TASKS else 0;
+    const start = if (getCurrentIdx()) |ci| (ci + 1) % task.MAX_TASKS else 0;
     const bitmap = task.getSlotBitmap();
 
     var best_idx: ?u32 = null;
@@ -347,12 +380,12 @@ pub fn apIdleLoop() noreturn {
 
 /// Park an AP without participating in scheduling.
 ///
-/// The current scheduler keeps run state in BSP-global variables
-/// (`current_idx`, `saved_stack_anchor`, `slice_remaining`) and pins the TSS to
-/// the BSP (`setRsp0Bsp`), so it is NOT yet safe to run/steal user tasks on APs.
-/// Until the scheduler is made per-CPU, APs come online and halt here. This
-/// proves multi-core bring-up works without destabilizing uniprocessor
-/// scheduling. Interrupts stay disabled so no timer IRQ drives the global
+/// SMP migration status: the running-task index and timeslice are now PER-CPU
+/// (M8-2, in PerCpu). Still shared/BSP-pinned and not yet AP-safe: the context-
+/// switch `saved_stack_anchor` (global; per-CPU in M8-3) and the TSS RSP0
+/// (`setRsp0Bsp`; per-CPU in M8-4). Until those land, APs come online and halt
+/// here — this proves multi-core bring-up works without destabilizing the
+/// uniprocessor scheduler. Interrupts stay disabled so no timer IRQ drives the
 /// scheduler from an AP.
 pub fn apParkLoop() noreturn {
     while (true) {
@@ -384,8 +417,8 @@ fn tryStealTask() void {
 
             saved_stack_anchor = t.saved_rsp;
             t.state = .running;
-            current_idx = next_idx;
-            slice_remaining = TIMESLICE_TICKS;
+            setCurrentIdx(next_idx);
+            setSlice(TIMESLICE_TICKS);
 
             // Set up CPU state for the task
             if (t.page_table_phys != 0) {
@@ -429,7 +462,7 @@ pub fn sleepOn(queue: *?*task.WaitNode, node: *task.WaitNode) bool {
     cur.wait_queue = queue;
 
     // Yield: force a reschedule
-    slice_remaining = 0;
+    setSlice(0);
 
     // When we are woken, we return here. Check if granted.
     // The waker sets node.granted = true before making the task ready.
@@ -489,7 +522,7 @@ pub fn wakeAll(queue: *?*task.WaitNode) void {
 /// Force an immediate reschedule. Used by blocking primitives (futex, etc.)
 /// after marking the current task as blocked.
 pub fn forceReschedule() void {
-    slice_remaining = 0;
+    setSlice(0);
     // Trigger a timer tick to force the scheduler to switch away from this task.
     // Since the current task is blocked, pickNext() will choose another.
     const iframe: *idt.InterruptFrame = @ptrFromInt(saved_stack_anchor);
