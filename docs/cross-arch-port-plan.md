@@ -103,7 +103,7 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 | **M8-3** | per-CPU 上下文切换 anchor：`commonStub` 经 `%gs` 取 per-CPU anchor（无需 swapgs） | ✅ 完成（单核回归一致，386 行启动到 shell） |
 | **M8-4** | per-CPU TSS RSP0：`setRsp0` 作用于当前 CPU 而非固定 BSP | ✅ 完成（单核回归一致，386 行启动到 shell） |
 | **M8-5a** | AP 上线 + 开定时器 + `enable_ap_startup=true`，但仍 BSP-only 调度（AP 空闲取中断） | ✅ 完成（`-smp 2`：2 CPUs online，BSP 跑完全部测试到 shell，零故障） |
-| **M8-5b** | AP 参与调度：per-CPU idle 任务 + 全核 `timerTick` 调度（真正并行） | ⬜ 待办 |
+| **M8-5b** | AP 参与调度：per-CPU idle 任务 + 全核 `timerTick` 调度（真正并行） | 🔬 已调查，发现深层阻塞（见 M8-5b 调查）；待定方向 |
 | **M8-6** | 跨核 TLB shootdown：per-CPU shootdown 描述符 + 范围 `invlpg`（取代 M8-1 的 CR3 全刷回退） | ⬜ 待办 |
 
 ### M8-1 设计要点
@@ -167,3 +167,53 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **验证**：`-smp 2` 下 `[SMP] 2 CPUs online`，AP 走完 B–J 全部 bring-up 标记并 `AP 1 initialized`，BSP 跑完
   `hello2`–`hello28`（含 hello26 TCP echo、fork/execve、ext2）到 `MoQiOS shell`，**零故障/零非规范 RSP0**
   （串口 395 行，比单核多 9 行 SMP bring-up 信息）。
+
+### M8-5b 调查（让 AP 真正参与调度的阻塞点）
+
+> 结论：**M8-5b 不是“一个小任务”**。让 AP 真正运行用户任务会连锁暴露该内核多个「SMP 未就绪」缺口。
+> 已实现过一版（per-CPU idle 任务 + 调度门 `ap_sched_enabled` + BSP-only 周期维护 + `pickNext` 亲和过滤
+> + AP 高半区跳转修复），**单核回归通过**，但 `-smp 2` 仍崩溃。已逐一定位根因如下；这一版代码已回退，
+> 工作树恢复到稳定的 M8-5a，待与维护者确认方向后再按下面的“推荐路线”重做。
+
+逐个定位到的阻塞点（按发现顺序）：
+
+1. **AP 在低半区身份映射中执行 → 三重故障**（已找到修复法）。
+   - 现象：`-d int,cpu_reset` 显示 AP（CPU 1）的 RIP/RSP/GDT/TSS 全在低物理地址（trampoline 身份映射区）。
+     一旦 AP 调度到用户任务并加载该任务 CR3，用户页表里**没有**这段低地址的身份映射 → `#PF`→`#DF`→三重故障。
+   - 修复法（已验证可编译）：在 `smp.init()` 把 HHDM offset 存到 trampoline 数据区（如 phys `0x7070`）；
+     `apEntry` 改成 naked，先把 `RSP`/`RIP` 重定位到 HHDM 高半别名再跳进 `apEntryHigh()`。此后 AP 始终在
+     高半区执行——高半区在**所有**进程页表中共享，切到任意用户 CR3 都安全。**此修复是后续一切的前置条件。**
+
+2. **`saved_user_rsp` 是 per-CPU，但语义是 per-task**（迁移致命）。
+   - syscall 进入时把用户 `RSP` 存进 `PerCpu.saved_user_rsp`（`%gs:8`），返回时 `movq %gs:8,%rsp; sysretq`。
+   - 阻塞型 syscall（`waitpid`/`futex` 等）会 `sti` 后 `hlt` 自旋等待，期间**可被抢占并迁移到另一核**。
+     任务在 A 核进 syscall（`saved_user_rsp`写到 A 核 PerCpu），迁移到 B 核恢复并 `sysretq` 时读的是
+     **B 核**的 `saved_user_rsp`（可能已被 B 核上别的任务覆盖）→ 返回到错误用户栈 → 用户态 `#UD` / `#GP`。
+   - 注：单核下该值“跨任务复用同一 PerCpu”也存在覆盖，但因为单核恢复点严格配对、且 `clone` 用同核值，
+     恰好不出错；多核迁移打破了这个隐式不变量。
+
+3. **`exec_result` 是真正的共享全局**（信号返回路径，需 per-CPU 化）。
+   - `syscall_entry.exec_result`（3×u64）由信号投递写、由 syscall/中断返回路径消费。多核并发下两核互相踩。
+   - （`fork_parent_ret` 经核查**从未被写非零**，恒为 0，并非并发问题，可不动。）
+
+4. **FPU/SSE 状态未随上下文切换保存/恢复**。
+   - 上下文切换不保存 FPU/SSE；用户程序默认带 SSE。任务迁移到另一核后会用到别的任务残留的 FPU 状态，
+     或 AP 的 `CR4.OSFXSR`/`CR0` 配置与 BSP 不一致时直接 `#UD`。需确认 AP 的 `CR4.OSFXSR`、`CR0.MP/EM`
+     与 BSP 对齐，并最终引入按任务的 FXSAVE/FXRSTOR。
+
+5. **缺少跨核 TLB shootdown（M8-6）**。
+   - 多核共享地址空间改页表后需广播 `invlpg`；当前无此机制，并行跑会有 TLB 不一致风险（M8-6 专门解决）。
+
+**推荐路线（把 M8-5b 拆成更小、风险可控的步骤）**
+
+- **M8-5b-0｜AP 高半区执行修复**（上面第 1 点）：自洽且必须，先单独落地+多核验证（AP 仅空闲，不调度）。
+- **M8-5b-1｜全局态 per-CPU 化**：`exec_result` 迁入 `PerCpu`（`%gs` 相对访问），消除第 3 点。
+- **M8-5b-2｜亲和调度（无迁移）**：所有任务创建时**绑核**（round-robin），`pickNext` 已支持 `pinned` 过滤。
+  无迁移 ⇒ 每核行为等价于“已验证的单核”，从根上回避第 2 点（`saved_user_rsp` 永不跨核）。先交付**可用的并行**
+  （不同核跑不同任务），代价是暂无负载均衡/work-stealing。
+- **M8-5b-3｜FPU/SSE 对齐 + 按任务保存**（第 4 点）：作为迁移的前置。
+- **M8-5b-4｜可迁移调度**：在 2/3 之上引入安全迁移（迁移点限定在“非 syscall 持栈”态，或把 `saved_user_rsp`
+  随任务保存），并配合 M8-6 的 TLB shootdown。
+
+> 当前进度：上述均**未提交**（已回退）。建议优先按 M8-5b-0 → M8-5b-1 → M8-5b-2 推进；这是“能稳定落地的
+> 真并行”的最短路径。是否采用亲和模型（先放弃迁移/负载均衡）属于设计取舍，待确认。
