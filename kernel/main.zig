@@ -57,6 +57,12 @@ export fn _start() callconv(.c) noreturn {
     idt.init();
     klog.log(.info, "IDT loaded");
 
+    // M8-3: set the BSP's GS_BASE early so commonStub's per-CPU context-switch
+    // anchor (%gs:16 = PerCpu.saved_stack_anchor) is valid for any exception that
+    // fires during the rest of boot, before syscall_entry.init() runs. smp.init()
+    // and syscall_entry.init() re-set this idempotently.
+    syscall_entry.setPerCpuGsBase(0);
+
     // PS/2 keyboard driver
     const keyboard = @import("drivers/keyboard.zig");
     keyboard.init();

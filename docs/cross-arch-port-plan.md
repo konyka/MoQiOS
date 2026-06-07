@@ -100,7 +100,7 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 |---|---|---|
 | **M8-1** | 通用 IPI 基础设施：`lapic.sendIpi(apic_id, vector)` + `sendIpiAllButSelf`；reschedule(0xFD)/TLB-shootdown(0xFE) 向量与 `interruptDispatch` 分发 + 处理器 | ✅ 完成（单核休眠态，未改调度行为） |
 | **M8-2** | per-CPU 当前任务/时间片状态：`current_idx`/`slice_remaining` 迁入 `PerCpu`（单核等价 BSP） | ✅ 完成（单核回归一致，386 行启动到 shell） |
-| **M8-3** | per-CPU 上下文切换 anchor：`commonStub` 按来源 CS `swapgs` + 经 `%gs` 取 per-CPU anchor | ⬜ 待办 |
+| **M8-3** | per-CPU 上下文切换 anchor：`commonStub` 经 `%gs` 取 per-CPU anchor（无需 swapgs） | ✅ 完成（单核回归一致，386 行启动到 shell） |
 | **M8-4** | per-CPU TSS RSP0：`setRsp0` 作用于当前 CPU 而非固定 BSP | ⬜ 待办 |
 | **M8-5** | AP 参与调度：per-CPU 运行队列 / work-stealing + AP 开定时器 + `enable_ap_startup=true` | ⬜ 待办 |
 | **M8-6** | 跨核 TLB shootdown：per-CPU shootdown 描述符 + 范围 `invlpg`（取代 M8-1 的 CR3 全刷回退） | ⬜ 待办 |
@@ -126,3 +126,19 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **单核等价**：uniprocessor 下 `GS_BASE` 恒指向 `percpu_array[0]`，访问器与旧全局变量逐字节等价；
   `slice_remaining` 初值置为 `TIMESLICE_TICKS`(10) 以匹配旧默认。`saved_stack_anchor` 仍为全局
   （M8-3 下沉），TSS 仍绑 BSP（M8-4 下沉），故 AP 仍停泊。
+
+### M8-3 设计要点（关键）
+
+- **GS 不变量（本内核特性）**：`GS_BASE` 在**所有模式**下都指向「本核」的 `PerCpu`。`init`/`apEntry`
+  把 `GS_BASE` 与 `KERNEL_GS_BASE` 都设为 `&percpu_array[cpu]`；syscall 路径的 `swapgs` 只是
+  percpu↔percpu（基址不变），上下文切换更新的是 `KERNEL_GS_BASE` 而非 `GS_BASE`。故
+  **`commonStub` 中可直接用 `%gs` 而无需 swapgs**，即使中断来自用户态。
+- **anchor 下沉**：`commonStub` 用 `movq %rsp, %gs:16` / `movq %gs:16, %rsp` 存取本核
+  `PerCpu.saved_stack_anchor`（偏移 16，`sched.zig` 用 `comptime` 断言守护）。删除原 `pub export var
+  saved_stack_anchor` 全局；`sched`/`execve` 改用 `sched.getAnchor()/setAnchor()`。
+- **早期启动安全**：在 `idt.init()` 之后立即设 BSP `GS_BASE`（`setPerCpuGsBase(0)`），保证启动后续任何
+  异常进入 `commonStub` 时 `%gs` 有效（否则 `GS_BASE==0` 会让 stub 自身写 `0x10` 触发三重故障，丢诊断）。
+- **多核可扩展**：每核有独立 `GS_BASE` → 各自的 anchor，互不干扰；这是让 AP 能跑上下文切换的前置条件。
+- **为何不用 swapgs-on-CS**：鉴于上面的 GS 不变量，swapgs 在本内核里是 no-op 基址交换，加之只会增加
+  复杂度与风险；故采用更精简且等价的「直接 `%gs`」方案。代价：用户态 `%gs` 被内核占用（用户程序不能用
+  `%gs` 做 TLS）——当前 `hello*` 程序均不使用，符合现状。

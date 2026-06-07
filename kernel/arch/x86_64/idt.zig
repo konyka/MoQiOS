@@ -182,14 +182,17 @@ pub const InterruptFrame = extern struct {
 //   RSP+160 : RSP
 //   RSP+168 : SS
 //
-// IMPORTANT SwapGS CONSTRAINT:
-//   This stub does NOT do swapgs. GSBase state on entry:
-//     - Interrupt from kernel mode (CS=0x08): GSBase = &bsp_percpu (correct)
-//     - Interrupt from user mode (CS=0x1B): GSBase = 0 (user GSBase)
-//   Therefore: DO NOT access %%gs: in this stub or any function it calls
-//   (interruptDispatch, handleLapicTimer, timerTick, etc.).
-//   Per-CPU data must be accessed via kernel virtual addresses (not %%gs:).
-//   Only syscallEntry/sysretq use swapgs and %%gs: access.
+// SwapGS / per-CPU access:
+//   This stub does NOT swapgs, and does not need to. By design this kernel keeps
+//   GS_BASE pointing at *this CPU's* PerCpu in ALL modes — init/apEntry set both
+//   GS_BASE and KERNEL_GS_BASE to &percpu_array[cpu], and the syscall-path swapgs
+//   only ever swaps percpu↔percpu (a no-op for the base value), while context
+//   switches update KERNEL_GS_BASE (not GS_BASE). Therefore %%gs is valid here
+//   even when interrupted from user mode, and we use it to reach this CPU's
+//   context-switch anchor (PerCpu.saved_stack_anchor @ %%gs:16, M8-3). This holds
+//   per-CPU on SMP because each CPU has its own GS_BASE.
+//   NOTE: the BSP's GS_BASE is set early (right after idt.init in main) so that
+//   even an early-boot exception finds a valid %%gs here.
 
 /// Handler pointer with C linkage so the naked stub can call it via a
 /// RIP-relative indirect call *after* all GPRs are saved. Passing it as an
@@ -221,11 +224,10 @@ export fn commonStub() callconv(.naked) void {
         \\pushq %%r14
         \\pushq %%r15
         \\
-        \\// Load anchor address into R12 (original R12 already saved on stack)
-        \\leaq saved_stack_anchor(%%rip), %%r12
-        \\
-        \\// Save stack pointer to anchor
-        \\movq %%rsp, (%%r12)
+        \\// Save RSP to this CPU's per-CPU anchor: PerCpu.saved_stack_anchor is at
+        \\// %%gs:16 (offset guarded at comptime in sched.zig). GS_BASE points at
+        \\// this CPU's PerCpu in all modes, so %%gs is valid without swapgs.
+        \\movq %%rsp, %%gs:16
         \\
         \\movq %%rsp, %%rdi
         \\
@@ -235,8 +237,9 @@ export fn commonStub() callconv(.naked) void {
         \\
         \\call *interrupt_handler_ptr(%%rip)
         \\
-        \\// Restore stack from anchor (scheduler may have switched stacks)
-        \\movq (%%r12), %%rsp
+        \\// Restore stack from the per-CPU anchor (scheduler may have switched
+        \\// stacks by rewriting %%gs:16 to a new task's frame).
+        \\movq %%gs:16, %%rsp
         \\
         \\popq %%r15
         \\popq %%r14

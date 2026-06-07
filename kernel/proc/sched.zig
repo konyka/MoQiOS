@@ -24,10 +24,26 @@ const fmt = @import("../lib/fmt.zig");
 
 const TIMESLICE_TICKS: u64 = 10;
 
-// Exported with C linkage so `commonStub`'s naked asm can reference it via a
-// RIP-relative `lea` *after* saving GPRs (avoids clobbering an interrupted
-// register before it is pushed — see idt.commonStub).
-pub export var saved_stack_anchor: u64 = 0;
+// M8-3: the context-switch stack anchor is now PER-CPU. `commonStub` reads/writes
+// it directly via `%gs:16` (PerCpu.saved_stack_anchor); the scheduler reaches the
+// same per-CPU slot through these accessors. GS_BASE always points at this CPU's
+// PerCpu (set in init/apEntry, never swapped to a different value), so a single
+// CPU's anchor is never touched by another CPU.
+comptime {
+    if (syscall_entry.PERCPU_ANCHOR_OFFSET != 16) {
+        @compileError("commonStub hardcodes %gs:16 for PerCpu.saved_stack_anchor; offset changed — update idt.commonStub");
+    }
+}
+
+pub fn getAnchor() u64 {
+    const pc = thisCpu() orelse return 0;
+    return pc.saved_stack_anchor;
+}
+
+pub fn setAnchor(v: u64) void {
+    const pc = thisCpu() orelse return;
+    pc.saved_stack_anchor = v;
+}
 
 pub const TIMESLICE_TICKS_PUB: u64 = TIMESLICE_TICKS;
 
@@ -152,7 +168,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         if (!t.started) {
             setupInitialFrame(t);
         }
-        saved_stack_anchor = t.saved_rsp;
+        setAnchor(t.saved_rsp);
         t.state = .running;
         setCurrentIdx(next_idx);
 
@@ -186,7 +202,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         return;
     };
 
-    old_task.saved_rsp = saved_stack_anchor;
+    old_task.saved_rsp = getAnchor();
 
     // CPU time accounting: accumulate time spent in this task
     const tsc_mod = @import("../arch/x86_64/tsc.zig");
@@ -211,7 +227,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         setupInitialFrame(new_task);
     }
 
-    saved_stack_anchor = new_task.saved_rsp;
+    setAnchor(new_task.saved_rsp);
     new_task.state = .running;
     setCurrentIdx(next_idx);
 
@@ -336,7 +352,7 @@ fn pickNext() ?u32 {
 pub fn deliverSignalToRunningTask(t: *task.Task) void {
     // Only deliver to tasks returning to user mode.
     // Check this BEFORE dequeuing the signal to avoid losing it.
-    const iframe: *idt.InterruptFrame = @ptrFromInt(saved_stack_anchor);
+    const iframe: *idt.InterruptFrame = @ptrFromInt(getAnchor());
     if (iframe.cs != 0x1B) return;
 
     const sig_mod = @import("signal.zig");
@@ -380,13 +396,13 @@ pub fn apIdleLoop() noreturn {
 
 /// Park an AP without participating in scheduling.
 ///
-/// SMP migration status: the running-task index and timeslice are now PER-CPU
-/// (M8-2, in PerCpu). Still shared/BSP-pinned and not yet AP-safe: the context-
-/// switch `saved_stack_anchor` (global; per-CPU in M8-3) and the TSS RSP0
-/// (`setRsp0Bsp`; per-CPU in M8-4). Until those land, APs come online and halt
-/// here — this proves multi-core bring-up works without destabilizing the
-/// uniprocessor scheduler. Interrupts stay disabled so no timer IRQ drives the
-/// scheduler from an AP.
+/// SMP migration status: the running-task index, timeslice (M8-2) and the
+/// context-switch stack anchor (M8-3) are now PER-CPU (in PerCpu, reached via
+/// %gs). Still BSP-pinned and not yet AP-safe: the TSS RSP0 (`setRsp0Bsp`;
+/// per-CPU in M8-4) and AP scheduling participation (M8-5). Until those land,
+/// APs come online and halt here — this proves multi-core bring-up works without
+/// destabilizing the uniprocessor scheduler. Interrupts stay disabled so no
+/// timer IRQ drives the scheduler from an AP.
 pub fn apParkLoop() noreturn {
     while (true) {
         asm volatile ("hlt");
@@ -415,7 +431,7 @@ fn tryStealTask() void {
                 setupInitialFrame(t);
             }
 
-            saved_stack_anchor = t.saved_rsp;
+            setAnchor(t.saved_rsp);
             t.state = .running;
             setCurrentIdx(next_idx);
             setSlice(TIMESLICE_TICKS);
@@ -525,7 +541,7 @@ pub fn forceReschedule() void {
     setSlice(0);
     // Trigger a timer tick to force the scheduler to switch away from this task.
     // Since the current task is blocked, pickNext() will choose another.
-    const iframe: *idt.InterruptFrame = @ptrFromInt(saved_stack_anchor);
+    const iframe: *idt.InterruptFrame = @ptrFromInt(getAnchor());
     timerTick(iframe);
 }
 

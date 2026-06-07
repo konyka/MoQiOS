@@ -94,7 +94,7 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64) ?u64 {
     cur.started = true;
 
     getPerCpu().saved_user_rsp = result.stack_top;
-    sched.saved_stack_anchor = frame_addr;
+    sched.setAnchor(frame_addr);
 
     return frame_addr;
 }
