@@ -195,6 +195,82 @@ pub fn getSlotBitmap() u64 {
     return slot_bitmap;
 }
 
+fn considerReady(idx: u32, cpu: u8, best_idx: *?u32, best_prio: *u8) void {
+    const t = getTask(idx) orelse return;
+    if (t.state == .ready and t.cpu_affinity == cpu and t.priority < best_prio.*) {
+        best_prio.* = t.priority;
+        best_idx.* = idx;
+    }
+}
+
+/// Priority round-robin pick under one task_lock snapshot (SMP-safe).
+pub fn pickReadyForCpu(cpu: u8, after_idx: ?u32) ?u32 {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+
+    const start = if (after_idx) |a| (a + 1) % MAX_TASKS else 0;
+    var best_idx: ?u32 = null;
+    var best_prio: u8 = 255;
+
+    var pos: u32 = start;
+    var remaining: u32 = MAX_TASKS;
+    while (remaining > 0) {
+        const mask: u64 = if (pos == 0) ~@as(u64, 0) else ~@as(u64, 0) << @intCast(pos);
+        const available = slot_bitmap & mask;
+        const next_slot = if (available != 0) @ctz(available) else null;
+        if (next_slot == null or next_slot.? >= MAX_TASKS) break;
+        const idx: u32 = @intCast(next_slot.?);
+        remaining -= (idx - pos) + 1;
+        pos = idx + 1;
+        considerReady(idx, cpu, &best_idx, &best_prio);
+        if (best_prio == 0) break;
+    }
+
+    if (best_idx == null and start > 0) {
+        const wrap_mask: u64 = if (start >= 64) 0 else (~@as(u64, 0)) >> @intCast(64 - start);
+        var bits = slot_bitmap & wrap_mask;
+        while (bits != 0) {
+            const idx: u32 = @intCast(@ctz(bits));
+            bits &= bits - 1;
+            considerReady(idx, cpu, &best_idx, &best_prio);
+            if (best_prio == 0) break;
+        }
+    }
+
+    return best_idx;
+}
+
+/// Prefer a ready kernel thread on `cpu` when this CPU has no current task.
+pub fn pickKernelBootstrapForCpu(cpu: u8) ?u32 {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    var bits = slot_bitmap;
+    while (bits != 0) {
+        const i: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const t = getTask(i) orelse continue;
+        if (t.state == .ready and !t.is_user and t.cpu_affinity == cpu) return i;
+    }
+    return null;
+}
+
+/// Count active (non-zombie/non-blocked) tasks on `cpu` under task_lock.
+pub fn countActiveOnCpu(cpu: u8) u32 {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    var n: u32 = 0;
+    var bits = slot_bitmap;
+    while (bits != 0) {
+        const i: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const t = getTask(i) orelse continue;
+        if (t.cpu_affinity == cpu and t.state != .zombie and t.state != .blocked) {
+            n += 1;
+        }
+    }
+    return n;
+}
+
 /// Find a free task slot using bitmap fast-path.
 fn allocSlot() ?u32 {
     const free_bits = ~slot_bitmap;
@@ -280,6 +356,7 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
 
     slot_bitmap |= @as(u64, 1) << @intCast(slot);
     task_count += 1;
+    asm volatile ("" ::: .{ .memory = true });
     return slot;
 }
 
@@ -327,8 +404,12 @@ pub fn exitTask(exit_code: i32) void {
             };
             if (parent.waiting_for_child) {
                 parent.waiting_for_child = false;
-                asm volatile ("" ::: .{ .memory = true });
                 parent.state = .ready;
+                asm volatile ("" ::: .{ .memory = true });
+                const se = @import("../arch/x86_64/syscall_entry.zig");
+                const parent_cpu = parent.cpu_affinity;
+                const here: u8 = @intCast(se.getPerCpu().cpu_id);
+                if (parent_cpu != here) sched.kickCpu(parent_cpu);
             }
         }
     }
@@ -336,7 +417,7 @@ pub fn exitTask(exit_code: i32) void {
 
     asm volatile ("sti" ::: .{ .memory = true });
     while (true) {
-        asm volatile ("hlt");
+        asm volatile ("hlt" ::: .{ .memory = true });
     }
 }
 
@@ -475,6 +556,7 @@ pub fn createUserProcess(
 
     slot_bitmap |= @as(u64, 1) << @intCast(slot);
     task_count += 1;
+    asm volatile ("" ::: .{ .memory = true });
     return slot;
 }
 

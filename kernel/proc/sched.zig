@@ -92,47 +92,11 @@ fn currentCpuId() u32 {
 
 /// Program per-CPU syscall/interrupt stack targets for a user task.
 fn setupUserCpuState(t: *task.Task) void {
+    const pc = syscall_entry.getPerCpu();
     gdt.setRsp0(currentCpuId(), t.kernel_stack_top);
-    syscall_entry.getPerCpu().kernel_rsp = t.kernel_stack_top;
+    pc.kernel_rsp = t.kernel_stack_top;
+    pc.current_tid = t.tid;
     syscall_entry.setPerCpuGsBase(currentCpuId());
-}
-
-/// APs: enter ring-3 via a direct iretq frame (same layout as user_mode.zig).
-/// commonStub's fake-frame epilogue mis-returns on AP after a user CR3 switch.
-fn enterUserOnAp(t: *task.Task) noreturn {
-    const entry = t.user_entry;
-    const ustack = t.user_stack_top;
-    asm volatile (
-        \\movw $0x23, %%ax
-        \\movw %%ax, %%ds
-        \\movw %%ax, %%es
-        \\movw %%ax, %%fs
-        \\pushq $0x23
-        \\pushq %[ustack]
-        \\pushq $0x202
-        \\pushq $0x1B
-        \\pushq %[entry]
-        \\xorq %%rax, %%rax
-        \\xorq %%rbx, %%rbx
-        \\xorq %%rcx, %%rcx
-        \\xorq %%rdx, %%rdx
-        \\xorq %%rsi, %%rsi
-        \\xorq %%rdi, %%rdi
-        \\xorq %%rbp, %%rbp
-        \\xorq %%r8, %%r8
-        \\xorq %%r9, %%r9
-        \\xorq %%r10, %%r10
-        \\xorq %%r11, %%r11
-        \\xorq %%r12, %%r12
-        \\xorq %%r13, %%r13
-        \\xorq %%r14, %%r14
-        \\xorq %%r15, %%r15
-        \\iretq
-        :
-        : [entry] "r" (entry),
-          [ustack] "r" (ustack),
-        : .{ .memory = true });
-    unreachable;
 }
 
 pub fn currentTaskIndex() ?u32 {
@@ -146,18 +110,7 @@ pub fn currentTask() ?*task.Task {
 
 /// Count non-zombie/non-blocked tasks pinned to this CPU (for single-task fast-path).
 fn countActiveOnThisCpu() u32 {
-    var n: u32 = 0;
-    var bits = task.getSlotBitmap();
-    const cpu: u8 = @intCast(currentCpuId());
-    while (bits != 0) {
-        const i: u32 = @intCast(@ctz(bits));
-        bits &= bits - 1;
-        const t = task.getTask(i) orelse continue;
-        if (t.cpu_affinity == cpu and t.state != .zombie and t.state != .blocked) {
-            n += 1;
-        }
-    }
-    return n;
+    return task.countActiveOnCpu(@intCast(currentCpuId()));
 }
 
 /// Called from timer IRQ handler on every tick (all online CPUs — M8-5b-2).
@@ -250,7 +203,6 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
                 : [cr3] "r" (t.page_table_phys),
                 : .{ .rax = true, .memory = true });
             setupUserCpuState(t);
-            if (currentCpuId() != 0) enterUserOnAp(t);
             return;
         }
         sched_lock.release(flags);
@@ -310,12 +262,10 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
                 : [cr3] "r" (pt),
                 : .{ .rax = true, .memory = true });
             setupUserCpuState(new_task);
-            if (currentCpuId() != 0) enterUserOnAp(new_task);
             return;
         }
         sched_lock.release(flags);
         setupUserCpuState(new_task);
-        if (currentCpuId() != 0) enterUserOnAp(new_task);
     } else {
         if (old_task.page_table_phys != 0) {
             const kernel_pml4 = paging.getKernelPml4();
@@ -363,74 +313,31 @@ fn setupInitialFrame(t: *task.Task) void {
 /// When this CPU has no running task, prefer a ready kernel thread pinned here.
 /// Avoids first-ever scheduling straight into user mode (unstable on AP bring-up).
 fn pickBootstrapKernel() ?u32 {
-    const cpu: u8 = @intCast(currentCpuId());
-    var bits = task.getSlotBitmap();
-    while (bits != 0) {
-        const i: u32 = @intCast(@ctz(bits));
-        bits &= bits - 1;
-        const t = task.getTask(i) orelse continue;
-        if (t.state == .ready and !t.is_user and t.cpu_affinity == cpu) {
-            return i;
-        }
-    }
-    return null;
+    return task.pickKernelBootstrapForCpu(@intCast(currentCpuId()));
 }
 
 /// Pick the next ready task — priority-aware round-robin with bitmap fast-path.
-/// Uses task slot bitmap to skip empty slots in O(1) via @ctz.
-/// Among equal priority, uses round-robin (start after current).
 fn pickNext() ?u32 {
     if (getCurrentIdx() == null) {
         if (pickBootstrapKernel()) |k| return k;
     }
+    return task.pickReadyForCpu(@intCast(currentCpuId()), getCurrentIdx());
+}
 
-    const start = if (getCurrentIdx()) |ci| (ci + 1) % task.MAX_TASKS else 0;
-    const bitmap = task.getSlotBitmap();
+/// Called from the reschedule IPI — force an immediate scheduler pass.
+pub fn forceRescheduleFromIpi(frame: *idt.InterruptFrame) void {
+    setSlice(0);
+    timerTick(frame);
+}
 
-    var best_idx: ?u32 = null;
-    var best_prio: u8 = 255;
-
-    // Scan occupied slots using bitmap, starting from 'start'
-    var pos: u32 = start;
-    var remaining: u32 = task.MAX_TASKS;
-    while (remaining > 0) {
-        // Build mask for bits [pos, 63] (slots at or after current position)
-        const mask: u64 = if (pos == 0) ~@as(u64, 0) else ~@as(u64, 0) << @intCast(pos);
-        const available = bitmap & mask;
-        const next_slot = if (available != 0) @ctz(available) else null;
-
-        if (next_slot == null or next_slot.? >= task.MAX_TASKS) break;
-        const idx: u32 = @intCast(next_slot.?);
-        remaining -= (idx - pos) + 1;
-        pos = idx + 1;
-
-        const t = task.getTask(idx) orelse continue;
-        if (t.state == .ready and t.cpu_affinity == @as(u8, @truncate(currentCpuId())) and t.priority < best_prio) {
-            best_prio = t.priority;
-            best_idx = idx;
-            // Priority 0 is highest — early exit if found
-            if (best_prio == 0) break;
-        }
-    }
-
-    // If not found after start, wrap around [0, start)
-    if (best_idx == null and start > 0) {
-        const wrap_mask: u64 = if (start >= 64) 0 else (~@as(u64, 0)) >> @intCast(64 - start);
-        const available = bitmap & wrap_mask;
-        var bits = available;
-        while (bits != 0) {
-            const idx: u32 = @intCast(@ctz(bits));
-            bits &= bits - 1;
-            const t = task.getTask(idx) orelse continue;
-            if (t.state == .ready and t.cpu_affinity == @as(u8, @truncate(currentCpuId())) and t.priority < best_prio) {
-                best_prio = t.priority;
-                best_idx = idx;
-                if (best_prio == 0) break;
-            }
-        }
-    }
-
-    return best_idx;
+/// Ask another CPU to run its scheduler (after a remote task becomes ready).
+pub fn kickCpu(cpu_id: u8) void {
+    const lapic_mod = @import("../arch/x86_64/lapic.zig");
+    const se = @import("../arch/x86_64/syscall_entry.zig");
+    if (cpu_id >= se.MAX_CPUS) return;
+    const apic_id: u8 = @truncate(se.percpu_array[cpu_id].apic_id);
+    asm volatile ("" ::: .{ .memory = true });
+    lapic_mod.sendIpi(apic_id, lapic_mod.RESCHEDULE_VECTOR);
 }
 
 /// Deliver a pending signal to the currently running user task.

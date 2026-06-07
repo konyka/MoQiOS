@@ -38,8 +38,11 @@ pub fn waitpid(pid_raw: u64, status_ptr: u64) i64 {
     asm volatile ("" ::: .{ .memory = true });
     asm volatile ("sti");
 
-    while (parent.waiting_for_child) {
-        asm volatile ("hlt");
+    while (true) {
+        // SMP: child may exit on another CPU — must reload from memory each lap.
+        if (!@as(*volatile bool, @ptrCast(&parent.waiting_for_child)).*) break;
+        asm volatile ("pause" ::: .{ .memory = true });
+        asm volatile ("hlt" ::: .{ .memory = true });
     }
 
     // Woken up — a child has exited. Now reap it.

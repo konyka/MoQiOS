@@ -103,7 +103,7 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 | **M8-3** | per-CPU 上下文切换 anchor：`commonStub` 经 `%gs` 取 per-CPU anchor（无需 swapgs） | ✅ 完成（单核回归一致，386 行启动到 shell） |
 | **M8-4** | per-CPU TSS RSP0：`setRsp0` 作用于当前 CPU 而非固定 BSP | ✅ 完成（单核回归一致，386 行启动到 shell） |
 | **M8-5a** | AP 上线 + 开定时器 + `enable_ap_startup=true`，但仍 BSP-only 调度（AP 空闲取中断） | ✅ 完成（`-smp 2`：2 CPUs online，BSP 跑完全部测试到 shell，零故障） |
-| **M8-5b-2** | 亲和调度（无迁移）+ AP 参与 `timerTick` + AP 绑核 idle 引导 | 🚧 基础设施已落地；`-smp 2` 可到 hello3，AP 用户 syscall 待修（见下） |
+| **M8-5b-2** | 亲和调度（无迁移）+ AP 参与 `timerTick` + AP 绑核 idle 引导 | 🚧 AP 用户态已通（hello2@AP）；跨核 spawn/waitpid 同步仍偶发挂起（hello4+） |
 | **M8-5b** | （父项）AP 真正并行调度 | 🚧 5b-0/5b-1 ✅；5b-2 进行中；5b-3 FPU 待办 |
 | **M8-6** | 跨核 TLB shootdown：per-CPU shootdown 描述符 + 范围 `invlpg`（取代 M8-1 的 CR3 全刷回退） | ⬜ 待办 |
 
@@ -225,5 +225,7 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **M8-5b-4｜可迁移调度**：在 2/3 之上引入安全迁移（迁移点限定在“非 syscall 持栈”态，或把 `saved_user_rsp`
   随任务保存），并配合 M8-6 的 TLB shootdown。
 
-> 当前进度：**M8-5b-0/5b-1 已提交**；**M8-5b-2 基础设施已提交**（亲和+AP 引导+`enterUserOnAp`）。
+> 当前进度：**M8-5b-0/5b-1 已提交**；**M8-5b-2a**（AP syscall MSR、commonStub 用户入口、跨核
+> reschedule IPI、`waitpid` 内存可见性、`pickReadyForCpu` 快照）已落地；`-smp 2` 下 hello2@AP
+> 稳定，`init` 全量测试到 shell 仍偶发超时（M8-5b-2b 待办）。
 > 下一小步：修 AP 上 `copy_from_user`/syscall 使 `-smp 2` 完整到 shell，再推进 5b-3 FPU。

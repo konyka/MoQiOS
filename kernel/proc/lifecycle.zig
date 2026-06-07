@@ -42,6 +42,11 @@ pub fn spawn(name_ptr: u64) i64 {
     if (loader.loadProgram(name, caller_tid)) |task_idx| {
         const t = @import("task.zig");
         if (t.getTask(task_idx)) |new_task| {
+            const se = @import("../arch/x86_64/syscall_entry.zig");
+            const my_cpu: u8 = @intCast(se.getPerCpu().cpu_id);
+            if (new_task.cpu_affinity != my_cpu) {
+                sched.kickCpu(new_task.cpu_affinity);
+            }
             return @intCast(new_task.tid);
         }
     }

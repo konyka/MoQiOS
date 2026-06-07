@@ -109,6 +109,9 @@ pub fn apEntry() callconv(.c) noreturn {
         \\wrmsr
         ::: .{ .rax = true, .rcx = true, .rdx = true, .memory = true });
 
+    // STAR/LSTAR/SFMASK are per-logical-processor; AP must not rely on BSP values.
+    syscall_entry.initSyscallMsrsOnThisCpu();
+
     // Initialize per-CPU GDT and TSS, then load this CPU's IDT register.
     gdt.initAp(actual_cpu_id);
     rawPutc('F');

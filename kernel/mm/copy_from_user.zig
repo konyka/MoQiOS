@@ -16,6 +16,18 @@ inline fn currentPml4() u64 {
     return cr3 & 0x000F_FFFF_FFFF_F000;
 }
 
+/// Prefer the running task's page table when available (SMP/AP syscall path).
+inline fn activePml4() u64 {
+    const sched = @import("../proc/sched.zig");
+    const task_mod = @import("../proc/task.zig");
+    if (sched.currentTaskIndex()) |idx| {
+        if (task_mod.getTask(idx)) |t| {
+            if (t.page_table_phys != 0) return t.page_table_phys;
+        }
+    }
+    return currentPml4();
+}
+
 /// Verify every page in [addr, addr+len) is present and user-accessible in the
 /// current address space. This is essential: copyFromUser/copyToUser access
 /// user pointers with a plain @memcpy, and there is no per-instruction fault
@@ -24,7 +36,7 @@ inline fn currentPml4() u64 {
 /// is missing or not user-accessible.
 fn userRangeMapped(addr: u64, len: usize) bool {
     if (len == 0) return true;
-    const pml4 = currentPml4();
+    const pml4 = activePml4();
     var page = addr & ~@as(u64, 0xFFF);
     const end = addr + len;
     while (page < end) : (page += 0x1000) {

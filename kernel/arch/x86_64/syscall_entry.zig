@@ -283,9 +283,42 @@ pub fn syscallEntry() callconv(.naked) void {
         ::: .{ .memory = true });
 }
 
+/// Program IA32_STAR / LSTAR / SFMASK on the CPU currently executing.
+/// Required on every logical processor — these MSRs are per-core, not inherited
+/// reliably across AP INIT/SIPI.
+pub fn initSyscallMsrsOnThisCpu() void {
+    const star: u64 = (@as(u64, 0x08) << 32) | (@as(u64, 0x1B) << 48);
+    wrmsr(MSR_STAR, star);
+    wrmsr(MSR_LSTAR, @intFromPtr(&syscallEntry));
+    wrmsr(MSR_SFMASK, 0x300); // TF | IF
+}
+
+/// Ensure this CPU's syscall/interrupt stacks and CR3 match the running user task.
+/// APs enter user mode via `enterUserOnAp` (not commonStub), so the first syscall on
+/// a freshly-scheduled task must re-sync `kernel_rsp`/TSS RSP0 if still zero/stale.
+fn prepareSyscallCpu() void {
+    const sched = @import("../../proc/sched.zig");
+    const gdt_mod = @import("gdt.zig");
+    const pc = getPerCpu();
+    const t = sched.currentTask() orelse return;
+    if (!t.is_user or t.page_table_phys == 0) return;
+
+    if (pc.kernel_rsp != t.kernel_stack_top) {
+        pc.kernel_rsp = t.kernel_stack_top;
+        gdt_mod.setRsp0(pc.cpu_id, t.kernel_stack_top);
+    }
+    pc.current_tid = t.tid;
+
+    asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
+        :
+        : [cr3] "r" (t.page_table_phys),
+        : .{ .rax = true, .memory = true });
+}
+
 /// Central syscall dispatch — called from the entry stub with the frame.
 /// Routes based on the current process's personality field.
 pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
+    prepareSyscallCpu();
     const syscall_nr = frame.rax;
 
     switch (syscall_nr) {
@@ -534,17 +567,7 @@ const execve_mod = @import("../../proc/execve.zig");
 /// Sets up IA32_STAR and IA32_LSTAR MSRs, enables EFER.SCE,
 /// and configures kernel GSBase for per-CPU data.
 pub fn init() void {
-    // IA32_STAR[32:47] = kernel CS for SYSCALL
-    // IA32_STAR[48:63] = user CS base for SYSRET (SYSRET adds 0 for CS, +8 for SS)
-    // Standard: STAR = (0x08 << 32) | (0x1B << 48)
-    const star: u64 = (@as(u64, 0x08) << 32) | (@as(u64, 0x1B) << 48);
-    wrmsr(MSR_STAR, star);
-
-    // LSTAR = address of syscallEntry
-    wrmsr(MSR_LSTAR, @intFromPtr(&syscallEntry));
-
-    // SFMASK = flags to clear on SYSCALL (clear IF and TF)
-    wrmsr(MSR_SFMASK, 0x300); // TF (0x100) | IF (0x200)
+    initSyscallMsrsOnThisCpu();
 
     // Enable SYSCALL/SYSRET via EFER.SCE (bit 0)
     const efer = rdmsr(MSR_EFER);

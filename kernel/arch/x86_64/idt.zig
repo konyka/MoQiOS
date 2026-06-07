@@ -303,7 +303,7 @@ fn handleReschedule(frame: *InterruptFrame) void {
     const lapic = @import("lapic.zig");
     lapic.eoi();
     const sched = @import("../../proc/sched.zig");
-    sched.timerTick(frame);
+    sched.forceRescheduleFromIpi(frame);
 }
 
 /// TLB shootdown IPI (vector 254) — another CPU changed a shared mapping and
