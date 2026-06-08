@@ -307,7 +307,7 @@ Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需�
 
 **验证**：`for i in 1 2 3; do MOQI_SMP=2 timeout 120 ...; done` 要求 3/3 shell。
 
-### 5.5 未集成脚手架接入优先级
+### 5.6 未集成脚手架接入优先级
 
 仅当 Phase A–E 完成或有明确应用需求时接入；接入模式：`syscall_entry` 分发 → 模块实现 → `hello*` 回归。
 
