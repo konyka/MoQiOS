@@ -90,16 +90,18 @@ pub const PerCpu = extern struct {
     exec_pending: u64,
     exec_new_entry: u64,
     exec_new_stack: u64,
+    /// Non-zero while handling a reschedule IPI — bypass single-task fast-path.
+    force_reschedule: u8,
 };
 
 /// Per-CPU data array, indexed by CPU logical ID.
 /// slice_remaining starts at the scheduler timeslice (sched.TIMESLICE_TICKS = 10)
 /// so a freshly-brought-up CPU behaves like the old global default.
 pub var percpu_array: [MAX_CPUS]PerCpu = .{
-    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 0, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF, .exec_pending = 0, .exec_new_entry = 0, .exec_new_stack = 0 },
-    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 1, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF, .exec_pending = 0, .exec_new_entry = 0, .exec_new_stack = 0 },
-    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 2, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF, .exec_pending = 0, .exec_new_entry = 0, .exec_new_stack = 0 },
-    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 3, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF, .exec_pending = 0, .exec_new_entry = 0, .exec_new_stack = 0 },
+    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 0, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF, .exec_pending = 0, .exec_new_entry = 0, .exec_new_stack = 0, .force_reschedule = 0 },
+    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 1, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF, .exec_pending = 0, .exec_new_entry = 0, .exec_new_stack = 0, .force_reschedule = 0 },
+    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 2, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF, .exec_pending = 0, .exec_new_entry = 0, .exec_new_stack = 0, .force_reschedule = 0 },
+    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 3, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF, .exec_pending = 0, .exec_new_entry = 0, .exec_new_stack = 0, .force_reschedule = 0 },
 };
 
 /// Personality type for ABI routing.

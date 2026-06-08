@@ -145,6 +145,8 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
     // Check for pending signals on current task
     if (getCurrentIdx()) |ci| {
         if (task.getTask(ci)) |ct| {
+            // Exited tasks stay cur_idx until we switch away — don't burn timeslice.
+            if (ct.state == .zombie) setSlice(0);
             if (ct.is_user and ct.pending_signals != 0 and ct.pending_signals & ~ct.signal_mask != 0) {
                 sched_lock.release(flags);
                 deliverSignalToRunningTask(ct);
@@ -153,6 +155,9 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         }
     }
 
+    const pc_force = thisCpu();
+    const force_pick = pc_force != null and pc_force.?.force_reschedule != 0;
+
     if (task.getTaskCount() == 0) {
         sched_lock.release(flags);
         return;
@@ -160,7 +165,13 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
 
     if (getCurrentIdx()) |ci| {
         if (task.getTask(ci)) |ct| {
-            if (countActiveOnThisCpu() == 1 and ct.state != .zombie and ct.state != .blocked) {
+            const cpu: u8 = @intCast(currentCpuId());
+            if (!force_pick and countActiveOnThisCpu() == 1 and ct.state != .zombie and ct.state != .blocked) {
+                sched_lock.release(flags);
+                return;
+            }
+            // Blocked parent in waitpid still holds cur_idx — run peers on this CPU.
+            if (!force_pick and ct.state == .blocked and !task.hasReadyOnCpu(cpu)) {
                 sched_lock.release(flags);
                 return;
             }
@@ -326,8 +337,11 @@ fn pickNext() ?u32 {
 
 /// Called from the reschedule IPI — force an immediate scheduler pass.
 pub fn forceRescheduleFromIpi(frame: *idt.InterruptFrame) void {
+    const pc = thisCpu();
+    if (pc) |p| p.force_reschedule = 1;
     setSlice(0);
     timerTick(frame);
+    if (pc) |p| p.force_reschedule = 0;
 }
 
 /// Ask another CPU to run its scheduler (after a remote task becomes ready).

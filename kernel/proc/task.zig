@@ -75,6 +75,8 @@ pub const Task = struct {
     parent_tid: u32,
     /// Whether this task is waiting for a child to exit (for blocking waitpid).
     waiting_for_child: bool,
+    /// CPU where the task blocked in waitpid (for cross-core wake IPI).
+    wait_cpu: u8,
     /// Current program break (end of heap). 0 = not initialized.
     /// brk syscall uses this to manage the heap region.
     brk_current: u64,
@@ -271,6 +273,20 @@ pub fn countActiveOnCpu(cpu: u8) u32 {
     return n;
 }
 
+/// True if any ready task is pinned to `cpu` (scheduler fast-path helper).
+pub fn hasReadyOnCpu(cpu: u8) bool {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    var bits = slot_bitmap;
+    while (bits != 0) {
+        const i: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const t = getTask(i) orelse continue;
+        if (t.state == .ready and t.cpu_affinity == cpu) return true;
+    }
+    return false;
+}
+
 /// Find a free task slot using bitmap fast-path.
 fn allocSlot() ?u32 {
     const free_bits = ~slot_bitmap;
@@ -313,13 +329,10 @@ fn freeKernelStack(stack_virt: u64) void {
 
 var next_assign_cpu: u32 = 0;
 
-/// Round-robin CPU pin for new user tasks (kernel threads stay on BSP / cpu 0).
+/// M8-5b-2b: user tasks pinned to BSP; round-robin restored in M8-5b-2c.
 pub fn assignCpuAffinity() u8 {
-    const smp_mod = @import("../smp.zig");
-    const n = @max(smp_mod.cpu_count, 1);
-    const cpu = next_assign_cpu % n;
-    next_assign_cpu +%= 1;
-    return @intCast(cpu);
+    _ = next_assign_cpu;
+    return 0;
 }
 
 /// Create a kernel thread pinned to a specific CPU (M8-5b-2).
@@ -406,14 +419,15 @@ pub fn exitTask(exit_code: i32) void {
                 parent.waiting_for_child = false;
                 parent.state = .ready;
                 asm volatile ("" ::: .{ .memory = true });
-                const se = @import("../arch/x86_64/syscall_entry.zig");
-                const parent_cpu = parent.cpu_affinity;
-                const here: u8 = @intCast(se.getPerCpu().cpu_id);
-                if (parent_cpu != here) sched.kickCpu(parent_cpu);
+                sched.kickCpu(parent.wait_cpu);
             }
         }
     }
     task_lock.release(flags);
+
+    // Prompt scheduler to switch away from this zombie on the local CPU.
+    const se = @import("../arch/x86_64/syscall_entry.zig");
+    sched.kickCpu(@intCast(se.getPerCpu().cpu_id));
 
     asm volatile ("sti" ::: .{ .memory = true });
     while (true) {
@@ -558,6 +572,41 @@ pub fn createUserProcess(
     task_count += 1;
     asm volatile ("" ::: .{ .memory = true });
     return slot;
+}
+
+/// Kick each CPU running a live child of `parent_tid` (waitpid wake helper).
+pub fn kickChildCpus(parent_tid: u32) void {
+    const sched = @import("sched.zig");
+    const max_cpus: u8 = @intCast(@import("../arch/x86_64/syscall_entry.zig").MAX_CPUS);
+    var cpus: [4]u8 = undefined;
+    var cpu_count: u8 = 0;
+    {
+        const flags = task_lock.acquire();
+        defer task_lock.release(flags);
+        var bits = slot_bitmap;
+        while (bits != 0) {
+            const i: u32 = @intCast(@ctz(bits));
+            bits &= bits - 1;
+            const t = &tasks[i];
+            if (t.parent_tid != parent_tid) continue;
+            if (t.state != .ready and t.state != .running) continue;
+            const cpu = t.cpu_affinity;
+            var seen = false;
+            for (cpus[0..cpu_count]) |c| {
+                if (c == cpu) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen and cpu_count < max_cpus) {
+                cpus[cpu_count] = cpu;
+                cpu_count += 1;
+            }
+        }
+    }
+    for (cpus[0..cpu_count]) |cpu| {
+        sched.kickCpu(cpu);
+    }
 }
 
 /// Wait for a child process to exit. Returns the child's TID, or 0 if no

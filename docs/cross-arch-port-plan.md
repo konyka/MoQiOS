@@ -103,9 +103,13 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 | **M8-3** | per-CPU 上下文切换 anchor：`commonStub` 经 `%gs` 取 per-CPU anchor（无需 swapgs） | ✅ 完成（单核回归一致，386 行启动到 shell） |
 | **M8-4** | per-CPU TSS RSP0：`setRsp0` 作用于当前 CPU 而非固定 BSP | ✅ 完成（单核回归一致，386 行启动到 shell） |
 | **M8-5a** | AP 上线 + 开定时器 + `enable_ap_startup=true`，但仍 BSP-only 调度（AP 空闲取中断） | ✅ 完成（`-smp 2`：2 CPUs online，BSP 跑完全部测试到 shell，零故障） |
-| **M8-5b-2** | 亲和调度（无迁移）+ AP 参与 `timerTick` + AP 绑核 idle 引导 | 🚧 AP 用户态已通（hello2@AP）；跨核 spawn/waitpid 同步仍偶发挂起（hello4+） |
-| **M8-5b** | （父项）AP 真正并行调度 | 🚧 5b-0/5b-1 ✅；5b-2 进行中；5b-3 FPU 待办 |
+| **M8-5b-2** | 亲和调度（无迁移）+ AP 参与 `timerTick` + AP 绑核 idle 引导 | ✅ 2b 完成（用户任务暂绑 BSP，`MOQI_SMP=2` 稳定到 shell）；2c round-robin@AP 待办 |
+| **M8-5b-2c** | AP 上 ELF 用户任务 + round-robin 亲和恢复 | ⬜ 待办 |
+| **M8-5b-3** | FPU/SSE 按任务保存 + AP `CR4.OSFXSR` 对齐 | ⬜ 待办 |
+| **M8-5b-4** | 可迁移调度（`saved_user_rsp` 随任务） | ⬜ 待办 |
+| **M8-5b** | （父项）AP 真正并行调度 | 🚧 5b-0~2b ✅；5b-2c/5b-3 待办 |
 | **M8-6** | 跨核 TLB shootdown：per-CPU shootdown 描述符 + 范围 `invlpg`（取代 M8-1 的 CR3 全刷回退） | ⬜ 待办 |
+| **M8-7** | per-CPU 运行队列 + work-stealing（取代全局 `sched_lock` 瓶颈） | ⬜ 待办 |
 
 ### M8-1 设计要点
 
@@ -225,7 +229,80 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **M8-5b-4｜可迁移调度**：在 2/3 之上引入安全迁移（迁移点限定在“非 syscall 持栈”态，或把 `saved_user_rsp`
   随任务保存），并配合 M8-6 的 TLB shootdown。
 
-> 当前进度：**M8-5b-0/5b-1 已提交**；**M8-5b-2a**（AP syscall MSR、commonStub 用户入口、跨核
-> reschedule IPI、`waitpid` 内存可见性、`pickReadyForCpu` 快照）已落地；`-smp 2` 下 hello2@AP
-> 稳定，`init` 全量测试到 shell 仍偶发超时（M8-5b-2b 待办）。
-> 下一小步：修 AP 上 `copy_from_user`/syscall 使 `-smp 2` 完整到 shell，再推进 5b-3 FPU。
+> 当前进度：**M8-5b-0/5b-1/5b-2a/5b-2b 已提交或待提交**。
+> - **5b-2a**：AP syscall MSR、commonStub 用户入口、跨核 reschedule IPI、`waitpid` 可见性。
+> - **5b-2b**：APIC id 修复、`wait_cpu`/`kickChildCpus`、IPI `force_reschedule` 旁路、
+>   用户任务暂绑 BSP；`MOQI_SMP=1/2` 均稳定到 shell（2026-06-07 验证）。
+> - **5b-2c**（下一小步）：恢复 round-robin 亲和，修 AP 上 ELF 首次调度的竞态（syscall 阻塞
+>   路径不能靠 `forceReschedule`——anchor 指向 timer 帧而非 syscall 栈）。
+> - 再后：**5b-3 FPU** → **M8-6 范围 invlpg** → **M8-7 per-CPU 运行队列**。
+
+---
+
+## 5. 未实现功能清单与性能优先执行计划（2026-06-07）
+
+### 5.1 分类概览
+
+| 类别 | 代表项 | 状态 | 性能影响 |
+|---|---|---|---|
+| **SMP 调度** | round-robin@AP、任务迁移、per-CPU 运行队列 | 🚧 部分 | **极高**（锁竞争、cache 颠簸） |
+| **SMP 内存** | 范围 TLB shootdown（`invlpg`） | ⬜ | **高**（CR3 全刷代价大） |
+| **SMP 浮点** | FXSAVE/FXRSTOR 按任务 | ⬜ | 中（迁移前置） |
+| **arch 抽象** | `kernel/arch/arch.zig` 多 ISA 接口 | ⬜ | 中（移植效率，非热路径） |
+| **riscv64** | M2–M7（trap/PMM/调度/用户态/virtio） | ⬜ | N/A（第二 ISA） |
+| **未集成脚手架** | `futex`/`select`/`inotify`/`clone`/`mprotect`/SysV IPC/`aio`/`splice`/`dhcp`/`dns` 等 | 🧩 源文件在树中，未 `@import` | 低（按需接入） |
+| **缺页恢复** | 内核态 per-instruction fixup | ⚠️ 页表预检替代 | 中 |
+| **单元测试** | `zig build test` 空操作 | ⬜ | 低（质量门） |
+
+### 5.2 性能优先原则
+
+1. **热路径零全局锁**：调度器从单一 `sched_lock` 迁到 per-CPU 就绪队列 + 偷取（M8-7）。
+2. **IPI 精确投递**：APIC id 必须来自 MADT/`lapic.id()`，kick 目标用 `wait_cpu` 而非 affinity 猜测。
+3. **TLB 最小失效**：共享映射改动用范围 `invlpg` + shootdown 描述符（M8-6），禁止 CR3 全刷热路径。
+4. **无迁移直到 FPU 就绪**：亲和绑核（5b-2）回避 `saved_user_rsp` 跨核；迁移（5b-4）在 FXSAVE 之后。
+5. **syscall 阻塞不 corrupt anchor**：`waitpid` 等不能在 syscall 栈上调用 `forceReschedule()`；须 timer 中断
+   切走（`sti`+`hlt`）或把 `saved_user_rsp` 迁入 `Task`（5b-4 一并解决）。
+
+### 5.3 执行顺序（推荐）
+
+```
+Phase A — SMP 稳定基线          ✅ M8-5b-2b（BSP 绑核，MOQI_SMP=2→shell）
+Phase B — AP 并行用户态         ⬜ M8-5b-2c（round-robin + AP ELF 调度竞态）
+Phase C — 浮点与迁移前置        ⬜ M8-5b-3（FXSAVE/FXRSTOR）
+Phase D — TLB 性能              ⬜ M8-6（shootdown 描述符 + invlpg 范围）
+Phase E — 调度器扩展性          ⬜ M8-7（per-CPU runqueue + work-stealing）
+Phase F — 第二 ISA              ⬜ M2–M7 riscv64（与 x86 SMP 可并行）
+Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
+```
+
+### 5.4 M8-5b-2c 详细设计（下一执行项）
+
+**目标**：恢复 `assignCpuAffinity()` round-robin，`MOQI_SMP=2` 全量 init 3/3 到 shell。
+
+**根因**（已定位）：
+- `waitpid` 在 syscall 上下文 `hlt` 自旋时仍占 `cur_idx`；同核子任务需 timer IRQ 切走父进程。
+- 跨核时 AP reschedule IPI 偶发在 `hello4`（ELF）就绪前到达，单任务 fast-path 跳过调度。
+- `forceReschedule()` 从 syscall 调用会破坏 anchor（指向 timer 帧），不可用作 wait 路径。
+
+**修复步骤**（按性能影响排序）：
+1. `forceRescheduleFromIpi` 已设 `PerCpu.force_reschedule` 旁路 fast-path ✅
+2. `waitpid` 阻塞后 `kickChildCpus(parent_tid)` 二次 kick AP ✅
+3. `exitTask` 用 `parent.wait_cpu` 精确 kick 等待核 ✅
+4. **待做**：syscall 阻塞统一走 `Task.saved_user_rsp` 字段（5b-4 预研），或
+   `waitpid` 在标记 blocked 后依赖 timer 切走且禁止 blocked+同核 fast-path 早退
+5. **待做**：spawn 后对 remote CPU 双 kick（spawn + waitpid 各一次）+ `mfence` 发布顺序
+
+**验证**：`for i in 1 2 3; do MOQI_SMP=2 timeout 120 ...; done` 要求 3/3 shell。
+
+### 5.5 未集成脚手架接入优先级
+
+仅当 Phase A–E 完成或有明确应用需求时接入；接入模式：`syscall_entry` 分发 → 模块实现 → `hello*` 回归。
+
+| 优先级 | 模块 | 理由 |
+|---|---|---|
+| P1 | `sync/futex.zig` | 用户态 pthread/同步基础 |
+| P1 | `fs/select.zig` / `fs/poll.zig` | 网络/IO 多路复用（hello26 已有 poll 路径） |
+| P2 | `arch/x86_64/clone.zig` | 线程库前置 |
+| P2 | `mm/mprotect.zig` | W^X / JIT |
+| P3 | SysV IPC、`inotify`、`aio`、`splice` | 兼容层，非热路径 |
+| P3 | `net/dhcp.zig` / `net/dns.zig` | 网络自动化，非内核热路径 |

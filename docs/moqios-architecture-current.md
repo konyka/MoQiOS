@@ -110,9 +110,9 @@ AP 冷 walk 才暴露。
 ### SMP 当前状态（2026-06，M8 进行中）
 
 历史阻塞点（TSS 错位、中断 stub 寄存器破坏、调度器全局状态）均已修复。**`enable_ap_startup=true`**，
-`-smp 2` 下 AP 稳定上线；M8-5a 时 BSP 跑完全部 `hello*` 到 shell。M8-5b-2 起 AP 参与亲和调度，
-`MOQI_SMP=1` 仍完整到 shell；`MOQI_SMP=2` 下 AP 可跑绑核用户任务（hello2 已验证），跨核
-spawn/waitpid 与 reschedule IPI 路径仍偶发挂起（hello4+，M8-5b-2b 待办）。
+`-smp 2` 下 AP 稳定上线并参与 timerTick。M8-5b-2b（2026-06-07）：用户任务暂绑 BSP 以保证
+`MOQI_SMP=2` 全量 init 稳定到 shell；AP 基础设施（APIC id、IPI reschedule、`wait_cpu` 跨核唤醒）
+已就绪。round-robin 亲和 + AP ELF 并行（M8-5b-2c）为下一项。
 
 | 子里程碑 | 状态 | 说明 |
 |---|---|---|
@@ -121,8 +121,12 @@ spawn/waitpid 与 reschedule IPI 路径仍偶发挂起（hello4+，M8-5b-2b 待�
 | M8-5a | ✅ | AP 上线 + 定时器，BSP-only 调度 |
 | M8-5b-0 | ✅ | AP 高半区执行（trampoline 直跳 HHDM `apEntry`） |
 | M8-5b-1 | ✅ | `exec_result` 迁入 `PerCpu`（`%%gs:48/56/64`） |
-| M8-5b-2 | 🚧 | 亲和调度 + AP idle 引导 + 跨核 kick/waitpid 同步；hello2@AP ✅，全量 init 偶发挂 |
+| M8-5b-2a | ✅ | AP commonStub 用户入口 + 跨核 IPI/`waitpid` 可见性 |
+| M8-5b-2b | ✅ | APIC id、`wait_cpu`/`kickChildCpus`；用户暂绑 BSP，`MOQI_SMP=2`→shell |
+| M8-5b-2c | ⬜ | round-robin@AP + ELF 调度竞态 |
+| M8-5b-3 | ⬜ | FPU/SSE 按任务 |
 | M8-6 | ⬜ | 范围 TLB shootdown |
+| M8-7 | ⬜ | per-CPU 运行队列 + work-stealing |
 
 详见 `docs/cross-arch-port-plan.md` M8 节。
 

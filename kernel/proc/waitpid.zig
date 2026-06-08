@@ -4,6 +4,7 @@
 const copy = @import("../mm/copy_from_user.zig");
 const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
+const se = @import("../arch/x86_64/syscall_entry.zig");
 
 /// waitpid(pid, status_ptr) -> child tid or -errno.
 /// pid: -1 (any child) or >0 (specific child).
@@ -27,23 +28,21 @@ pub fn waitpid(pid_raw: u64, status_ptr: u64) i64 {
         return child_tid;
     }
 
-    // No zombie child yet — block this task until a child exits.
-    asm volatile ("cli");
-    const parent = task_mod.getTask(cur_idx) orelse {
-        asm volatile ("sti");
-        return -1;
-    };
+    // No zombie child yet — block until a child exits.
+    const parent = task_mod.getTask(cur_idx) orelse return -1;
     parent.waiting_for_child = true;
+    parent.wait_cpu = @intCast(se.getPerCpu().cpu_id);
     parent.state = .blocked;
     asm volatile ("" ::: .{ .memory = true });
+    task_mod.kickChildCpus(parent.tid);
     asm volatile ("sti");
 
-    while (true) {
-        // SMP: child may exit on another CPU — must reload from memory each lap.
-        if (!@as(*volatile bool, @ptrCast(&parent.waiting_for_child)).*) break;
+    while (@as(*volatile bool, @ptrCast(&parent.waiting_for_child)).*) {
         asm volatile ("pause" ::: .{ .memory = true });
         asm volatile ("hlt" ::: .{ .memory = true });
     }
+
+    parent.state = .running;
 
     // Woken up — a child has exited. Now reap it.
     if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {

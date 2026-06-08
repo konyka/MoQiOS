@@ -121,9 +121,8 @@ pub fn apEntry() callconv(.c) noreturn {
     idt.loadOnThisCpu();
     rawPutc('G');
 
-    // Set up per-CPU data
+    // Set up per-CPU data (logical id from trampoline; LAPIC id after initAp).
     syscall_entry.percpu_array[actual_cpu_id].cpu_id = actual_cpu_id;
-    syscall_entry.percpu_array[actual_cpu_id].apic_id = @truncate(actual_cpu_id);
     syscall_entry.percpu_array[actual_cpu_id].current_tid = 0;
     rawPutc('H');
 
@@ -147,6 +146,8 @@ pub fn apEntry() callconv(.c) noreturn {
     // CLI until idle's kernelIdleLoop sti's — avoids timer IRQ before cur_idx exists.
     asm volatile ("cli");
     lapic.initAp();
+    // Authoritative LAPIC id for IPI targeting (must not assume id == cpu_id).
+    syscall_entry.percpu_array[actual_cpu_id].apic_id = lapic.id();
     sched.apBootstrapIdle();
 }
 
@@ -423,6 +424,9 @@ pub fn init() void {
         if (apic_id == bsp_apic_id) continue;
 
         const cpu_id: u32 = @truncate(i);
+
+        // Pre-seed APIC id from MADT (apEntry refreshes via lapic.id() after initAp).
+        syscall_entry.percpu_array[cpu_id].apic_id = apic_id;
 
         // Allocate AP kernel stack (16 pages = 64KB)
         var stack_phys: u64 = 0;
