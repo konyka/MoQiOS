@@ -171,9 +171,13 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
                 return;
             }
             // Blocked parent in waitpid still holds cur_idx — run peers on this CPU.
-            if (!force_pick and ct.state == .blocked and !task.hasReadyOnCpu(cpu)) {
-                sched_lock.release(flags);
-                return;
+            if (!force_pick and ct.state == .blocked) {
+                if (task.hasReadyOnCpu(cpu)) {
+                    setSlice(0);
+                } else {
+                    sched_lock.release(flags);
+                    return;
+                }
             }
         } else {
             setCurrentIdx(null);
@@ -350,7 +354,7 @@ pub fn kickCpu(cpu_id: u8) void {
     const se = @import("../arch/x86_64/syscall_entry.zig");
     if (cpu_id >= se.MAX_CPUS) return;
     const apic_id: u8 = @truncate(se.percpu_array[cpu_id].apic_id);
-    asm volatile ("" ::: .{ .memory = true });
+    asm volatile ("mfence" ::: .{ .memory = true });
     lapic_mod.sendIpi(apic_id, lapic_mod.RESCHEDULE_VECTOR);
 }
 

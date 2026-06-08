@@ -329,10 +329,18 @@ fn freeKernelStack(stack_virt: u64) void {
 
 var next_assign_cpu: u32 = 0;
 
-/// M8-5b-2b: user tasks pinned to BSP; round-robin restored in M8-5b-2c.
-pub fn assignCpuAffinity() u8 {
+/// CPU pin for new user tasks. All user tasks on BSP until AP ELF is stable (M8-5b-2c).
+/// Round-robin for flat binaries is prepared via `elf` flag but currently forced to BSP.
+pub fn assignCpuAffinity(elf: bool) u8 {
+    _ = elf;
     _ = next_assign_cpu;
     return 0;
+    // const smp_mod = @import("../smp.zig");
+    // const n = @max(smp_mod.cpu_count, 1);
+    // const cpu = next_assign_cpu % n;
+    // next_assign_cpu +%= 1;
+    // if (elf or n == 1) return 0;
+    // return @intCast(cpu);
 }
 
 /// Create a kernel thread pinned to a specific CPU (M8-5b-2).
@@ -525,6 +533,7 @@ pub fn createUserProcess(
     user_stack_top: u64,
     page_table_phys: u64,
     parent_tid_val: u32,
+    elf: bool,
 ) ?u32 {
     const flags = task_lock.acquire();
     defer task_lock.release(flags);
@@ -563,19 +572,20 @@ pub fn createUserProcess(
     tasks[slot].fd_table = @import("../fs/vfs.zig").FdTable.init();
     tasks[slot].cwd[0] = '/';
     tasks[slot].cwd_len = 1;
-    tasks[slot].cpu_affinity = assignCpuAffinity();
+    tasks[slot].cpu_affinity = assignCpuAffinity(elf);
 
     const sig_mod = @import("signal.zig");
     sig_mod.setupSigreturnTrampoline(page_table_phys);
 
     slot_bitmap |= @as(u64, 1) << @intCast(slot);
     task_count += 1;
-    asm volatile ("" ::: .{ .memory = true });
+    asm volatile ("mfence" ::: .{ .memory = true });
     return slot;
 }
 
-/// Kick each CPU running a live child of `parent_tid` (waitpid wake helper).
-pub fn kickChildCpus(parent_tid: u32) void {
+/// Kick remote CPUs running live children of `parent_tid`.
+/// Skips `parent_cpu` — same-CPU children rely on timer preemption of blocked parent.
+pub fn kickChildCpus(parent_tid: u32, parent_cpu: u8) void {
     const sched = @import("sched.zig");
     const max_cpus: u8 = @intCast(@import("../arch/x86_64/syscall_entry.zig").MAX_CPUS);
     var cpus: [4]u8 = undefined;
@@ -591,6 +601,7 @@ pub fn kickChildCpus(parent_tid: u32) void {
             if (t.parent_tid != parent_tid) continue;
             if (t.state != .ready and t.state != .running) continue;
             const cpu = t.cpu_affinity;
+            if (cpu == parent_cpu) continue;
             var seen = false;
             for (cpus[0..cpu_count]) |c| {
                 if (c == cpu) {
@@ -607,6 +618,18 @@ pub fn kickChildCpus(parent_tid: u32) void {
     for (cpus[0..cpu_count]) |cpu| {
         sched.kickCpu(cpu);
     }
+}
+
+/// After a user task is published ready, kick its remote affinity CPU.
+pub fn kickRemoteForTask(slot: u32) void {
+    const t = getTask(slot) orelse return;
+    const sched = @import("sched.zig");
+    const se = @import("../arch/x86_64/syscall_entry.zig");
+    const affinity = t.cpu_affinity;
+    const here: u8 = @intCast(se.getPerCpu().cpu_id);
+    if (affinity == here) return;
+    asm volatile ("mfence" ::: .{ .memory = true });
+    sched.kickCpu(affinity);
 }
 
 /// Wait for a child process to exit. Returns the child's TID, or 0 if no

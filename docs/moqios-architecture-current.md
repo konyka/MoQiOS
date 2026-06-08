@@ -122,8 +122,9 @@ AP 冷 walk 才暴露。
 | M8-5b-0 | ✅ | AP 高半区执行（trampoline 直跳 HHDM `apEntry`） |
 | M8-5b-1 | ✅ | `exec_result` 迁入 `PerCpu`（`%%gs:48/56/64`） |
 | M8-5b-2a | ✅ | AP commonStub 用户入口 + 跨核 IPI/`waitpid` 可见性 |
-| M8-5b-2b | ✅ | APIC id、`wait_cpu`/`kickChildCpus`；用户暂绑 BSP，`MOQI_SMP=2`→shell |
-| M8-5b-2c | ⬜ | round-robin@AP + ELF 调度竞态 |
+| M8-5b-2b | ✅ | APIC id、`wait_cpu`/`kickChildCpus`；用户暂绑 BSP |
+| M8-5b-2c | ✅ | 跨核唤醒加固 + `assignCpuAffinity(elf)`；3/3 `MOQI_SMP=2`→shell |
+| M8-5b-2d | ⬜ | round-robin flat@AP + ELF@AP |
 | M8-5b-3 | ⬜ | FPU/SSE 按任务 |
 | M8-6 | ⬜ | 范围 TLB shootdown |
 | M8-7 | ⬜ | per-CPU 运行队列 + work-stealing |

@@ -22,6 +22,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
         parent.user_stack_top,
         child_pml4,
         parent.tid,
+        true,
     ) orelse return -1;
     const child = task_mod.getTask(child_idx).?;
 

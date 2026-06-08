@@ -734,7 +734,7 @@ const TicketSpinlock = struct {
 
 源码: `kernel/smp.zig`, `kernel/proc/{sched,task,waitpid}.zig`, `kernel/arch/x86_64/{gdt,idt,lapic,syscall_entry}.zig`
 
-### 9.1 当前状态（M8-5b-2b，2026-06-07） ✅ 双核稳定到 shell
+### 9.1 当前状态（M8-5b-2c，2026-06-07） ✅ 双核 3/3 稳定到 shell
 
 | 能力 | 状态 |
 |---|---|
@@ -743,7 +743,7 @@ const TicketSpinlock = struct {
 | reschedule IPI（0xFD）+ `force_reschedule` fast-path 旁路 | ✅ |
 | APIC id 来自 MADT + `lapic.id()` 刷新 | ✅ |
 | 跨核 `waitpid`（`wait_cpu` + `kickChildCpus`） | ✅ |
-| round-robin 用户任务亲和 | ⬜ 暂绑 BSP（5b-2c） |
+| round-robin 用户任务亲和 | ⬜ 暂绑 BSP（5b-2d 启用 flat round-robin） |
 | AP 上 ELF 用户任务并行 | ⬜ 5b-2c |
 | FPU/SSE 按任务 | ⬜ 5b-3 |
 | 范围 TLB shootdown | ⬜ M8-6 |

@@ -448,11 +448,14 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
         user_rsp,
         user_pml4,
         parent_tid,
+        true,
     ) orelse {
         serial.writeString("[loader] Failed to create task\n");
         user_space.destroyUserSpace(user_pml4);
         return null;
     };
+
+    task.kickRemoteForTask(new_task);
 
     // Set initial brk to just after the highest loaded segment
     if (task.getTask(new_task)) |t| {
@@ -547,12 +550,15 @@ fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32) 
         user_rsp,
         user_pml4,
         parent_tid,
+        false,
     ) orelse {
         serial.writeString("[loader] Failed to create task\n");
         user_space.destroyUserSpace(user_pml4);
         freePages(&code_pages, allocated);
         return null;
     };
+
+    task.kickRemoteForTask(new_task);
 
     const heap_start = user_space.USER_CODE_BASE + allocated * paging.PAGE_SIZE;
     if (task.getTask(new_task)) |t| {

@@ -34,7 +34,7 @@ pub fn waitpid(pid_raw: u64, status_ptr: u64) i64 {
     parent.wait_cpu = @intCast(se.getPerCpu().cpu_id);
     parent.state = .blocked;
     asm volatile ("" ::: .{ .memory = true });
-    task_mod.kickChildCpus(parent.tid);
+    task_mod.kickChildCpus(parent.tid, parent.wait_cpu);
     asm volatile ("sti");
 
     while (@as(*volatile bool, @ptrCast(&parent.waiting_for_child)).*) {
