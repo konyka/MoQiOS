@@ -295,6 +295,18 @@ pub fn initSyscallMsrsOnThisCpu() void {
     wrmsr(MSR_SFMASK, 0x300); // TF | IF
 }
 
+/// Pull PerCpu.saved_user_rsp (%gs:8) into the running user task (after syscall entry).
+pub fn syncUserRspToTask(t: *@import("../../proc/task.zig").Task) void {
+    if (!t.is_user) return;
+    t.saved_user_rsp = getPerCpu().saved_user_rsp;
+}
+
+/// Push task.saved_user_rsp into PerCpu for sysret (%gs:8 restore path).
+pub fn syncUserRspFromTask(t: *@import("../../proc/task.zig").Task) void {
+    if (!t.is_user) return;
+    getPerCpu().saved_user_rsp = t.saved_user_rsp;
+}
+
 /// Ensure this CPU's syscall/interrupt stacks and CR3 match the running user task.
 /// APs enter user mode via `enterUserOnAp` (not commonStub), so the first syscall on
 /// a freshly-scheduled task must re-sync `kernel_rsp`/TSS RSP0 if still zero/stale.
@@ -315,6 +327,7 @@ fn prepareSyscallCpu() void {
         :
         : [cr3] "r" (t.page_table_phys),
         : .{ .rax = true, .memory = true });
+    syncUserRspToTask(t);
 }
 
 /// Central syscall dispatch — called from the entry stub with the frame.

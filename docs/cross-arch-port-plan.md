@@ -104,7 +104,8 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 | **M8-4** | per-CPU TSS RSP0：`setRsp0` 作用于当前 CPU 而非固定 BSP | ✅ 完成（单核回归一致，386 行启动到 shell） |
 | **M8-5a** | AP 上线 + 开定时器 + `enable_ap_startup=true`，但仍 BSP-only 调度（AP 空闲取中断） | ✅ 完成（`-smp 2`：2 CPUs online，BSP 跑完全部测试到 shell，零故障） |
 | **M8-5b-2** | 亲和调度（无迁移）+ AP 参与 `timerTick` + AP 绑核 idle 引导 | ✅ 2b 完成（用户任务暂绑 BSP，`MOQI_SMP=2` 稳定到 shell）；2c round-robin@AP 待办 |
-| **M8-5b-2c** | 跨核唤醒加固 + `assignCpuAffinity(elf)` API；用户任务暂绑 BSP | ✅ 3/3 `MOQI_SMP=2`→shell；round-robin@AP 待 5b-2d |
+| **M8-5b-2d** | `saved_user_rsp` 迁入 Task + 上下文切换同步 | ✅ 3/3 `MOQI_SMP=2`→shell（用户仍绑 BSP） |
+| **M8-5b-2e** | flat round-robin@AP（`assignCpuAffinity` flat 分支） | ⬜ 待办 |
 | **M8-5b-3** | FPU/SSE 按任务保存 + AP `CR4.OSFXSR` 对齐 | ⬜ 待办 |
 | **M8-5b-4** | 可迁移调度（`saved_user_rsp` 随任务） | ⬜ 待办 |
 | **M8-5b** | （父项）AP 真正并行调度 | 🚧 5b-0~2c ✅；5b-2d round-robin@AP / 5b-3 FPU 待办 |
@@ -233,10 +234,9 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 > - **5b-2a**：AP syscall MSR、commonStub 用户入口、跨核 reschedule IPI、`waitpid` 可见性。
 > - **5b-2b**：APIC id 修复、`wait_cpu`/`kickChildCpus`、IPI `force_reschedule` 旁路、
 >   用户任务暂绑 BSP；`MOQI_SMP=1/2` 均稳定到 shell（2026-06-07 验证）。
-> - **5b-2c**（2026-06-07）：`kickChildCpus` 跳过父核（避免 waitpid 自 IPI）、
->   `kickRemoteForTask`、blocked 父进程同核 `setSlice(0)`、`assignCpuAffinity(elf)` API；
->   用户任务仍绑 BSP，`MOQI_SMP=2` 3/3 到 shell。
-> - **5b-2d**（下一小步）：恢复 flat round-robin@AP，再解 ELF@AP（需 `saved_user_rsp` 迁移预研）。
+> - **5b-2d**（2026-06-07）：`Task.saved_user_rsp` + 上下文切换/`prepareSyscallCpu` 同步；
+>   fork/execve 使用 per-task 字段；`MOQI_SMP=2` 3/3 到 shell（用户仍绑 BSP）。
+> - **5b-2e**（下一小步）：启用 flat `assignCpuAffinity` round-robin@AP。
 > - 再后：**5b-3 FPU** → **M8-6 范围 invlpg** → **M8-7 per-CPU 运行队列**。
 
 ---

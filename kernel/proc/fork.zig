@@ -77,10 +77,12 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child_frame.rip = frame.rcx;
     child_frame.cs = 0x1B;
     child_frame.rflags = frame.r11;
-    child_frame.rsp = getPerCpu().saved_user_rsp;
+    child_frame.rsp = parent.saved_user_rsp;
     child_frame.ss = 0x23;
     child_frame.vector = 0;
     child_frame.error_code = 0;
+
+    child.saved_user_rsp = parent.saved_user_rsp;
 
     child.saved_rsp = child_frame_addr;
     child.started = true;

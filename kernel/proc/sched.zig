@@ -96,6 +96,7 @@ fn setupUserCpuState(t: *task.Task) void {
     gdt.setRsp0(currentCpuId(), t.kernel_stack_top);
     pc.kernel_rsp = t.kernel_stack_top;
     pc.current_tid = t.tid;
+    syscall_entry.syncUserRspFromTask(t);
     syscall_entry.setPerCpuGsBase(currentCpuId());
 }
 
@@ -240,6 +241,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
     };
 
     old_task.saved_rsp = getAnchor();
+    if (old_task.is_user) syscall_entry.syncUserRspToTask(old_task);
 
     // CPU time accounting: accumulate time spent in this task
     const tsc_mod = @import("../arch/x86_64/tsc.zig");
@@ -311,6 +313,7 @@ fn setupInitialFrame(t: *task.Task) void {
         new_frame.rflags = 0x202;
         new_frame.rsp = t.user_stack_top;
         new_frame.ss = 0x23;
+        t.saved_user_rsp = t.user_stack_top;
     } else {
         new_frame.rip = @intFromPtr(t.entry);
         new_frame.cs = 0x08;

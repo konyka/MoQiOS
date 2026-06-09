@@ -69,6 +69,8 @@ pub const Task = struct {
     user_entry: u64,
     /// User-space stack top (RSP for ring3).
     user_stack_top: u64,
+    /// User RSP saved across syscall/block (M8-5b-2d — per-task, not per-CPU).
+    saved_user_rsp: u64,
     /// Stack limit (lowest address the stack may grow to). Auto-extended on page fault.
     stack_limit: u64,
     /// TID of the parent process (0 if spawned by kernel). Used by waitpid.
@@ -329,18 +331,12 @@ fn freeKernelStack(stack_virt: u64) void {
 
 var next_assign_cpu: u32 = 0;
 
-/// CPU pin for new user tasks. All user tasks on BSP until AP ELF is stable (M8-5b-2c).
-/// Round-robin for flat binaries is prepared via `elf` flag but currently forced to BSP.
+/// CPU pin for new user tasks. ELF stays on BSP; flat round-robin in M8-5b-2e.
 pub fn assignCpuAffinity(elf: bool) u8 {
-    _ = elf;
+    _ = @import("../smp.zig");
     _ = next_assign_cpu;
+    _ = elf;
     return 0;
-    // const smp_mod = @import("../smp.zig");
-    // const n = @max(smp_mod.cpu_count, 1);
-    // const cpu = next_assign_cpu % n;
-    // next_assign_cpu +%= 1;
-    // if (elf or n == 1) return 0;
-    // return @intCast(cpu);
 }
 
 /// Create a kernel thread pinned to a specific CPU (M8-5b-2).
