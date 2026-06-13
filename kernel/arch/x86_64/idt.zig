@@ -121,8 +121,8 @@ fn makeStub(comptime vector: u8) *const fn () callconv(.naked) void {
             // the interrupted task's register before commonStub can save it.
             // `commonStub` has C linkage (`export fn`) so the symbol resolves.
             asm volatile ((if (!hasErrorCode(vector)) "pushq $0\n" else "") ++
-                "pushq $" ++ vec_str ++ "\n" ++
-                "jmp commonStub\n");
+                    "pushq $" ++ vec_str ++ "\n" ++
+                    "jmp commonStub\n");
         }
     }.stub;
 }
@@ -315,12 +315,14 @@ fn handleReschedule(frame: *InterruptFrame) void {
 /// Dormant until APs are online; nobody sends this vector in uniprocessor mode.
 fn handleTlbShootdown(frame: *InterruptFrame) void {
     _ = frame;
+    // EOI first: acknowledge the IPI so the LAPIC can accept further interrupts
+    // while we perform the (potentially slow) CR3 reload TLB flush.
+    const lapic = @import("lapic.zig");
+    lapic.eoi();
     asm volatile (
         \\movq %%cr3, %%rax
         \\movq %%rax, %%cr3
         ::: .{ .rax = true, .memory = true });
-    const lapic = @import("lapic.zig");
-    lapic.eoi();
 }
 
 fn handleException(frame: *InterruptFrame) void {
@@ -654,6 +656,9 @@ fn handleCowFault(frame: *InterruptFrame, fault_addr: u64) bool {
     const updated_pte = (pte_val & paging_mod.ADDR_MASK & ~@as(u64, COW_BIT)) | new_phys | paging_mod.WRITABLE;
     paging_mod.setPageEntryRaw(current.page_table_phys, page_addr, updated_pte);
     paging_mod.invlpg(page_addr);
+
+    // Release our reference to the old shared page (other owner still holds it).
+    _ = pmm_mod.decRef(old_phys);
 
     _ = frame;
     return true;
