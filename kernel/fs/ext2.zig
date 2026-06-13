@@ -100,6 +100,9 @@ const Ext2DirEntry = extern struct {
 
 var active: bool = false;
 
+// Static buffer for long symlink targets (avoid returning slice to stack/temp buffer)
+var symlink_buf: [256]u8 = undefined;
+
 var sb: Ext2Superblock = undefined;
 var block_size: u32 = 0;
 var groups_count: u32 = 0;
@@ -197,7 +200,7 @@ fn readBlock(block_num: u32, buf: [*]u8) bool {
     return readBlockCached(block_num, buf);
 }
 
-// ─── Block cache ──────────────────────────────────────────────────────────
+// ─── Block cache (hash-indexed) ──────────────────────────────────────────
 
 const CACHE_ENTRIES: usize = 64;
 const CACHE_BLOCK_SIZE: usize = 1024; // must match block_size for revision 0
@@ -207,18 +210,60 @@ const CacheEntry = struct {
     valid: bool = false,
     dirty: bool = false,
     data: [CACHE_BLOCK_SIZE]u8 = @splat(0),
+    hash_next: ?u8 = null, // chain link in hash bucket
 };
 
 var cache: [CACHE_ENTRIES]CacheEntry = @splat(.{});
+var cache_hash: [CACHE_ENTRIES]?u8 = @splat(null); // hash buckets
 var cache_next: usize = 0; // clock hand for replacement
 var cache_hits: u64 = 0;
 var cache_misses: u64 = 0;
 
+fn cacheHashFn(block_num: u32) usize {
+    // Mix bits for better distribution
+    var h = block_num;
+    h ^= h >> 16;
+    h *%= 0x45d9f3b;
+    h ^= h >> 16;
+    return @intCast(h % CACHE_ENTRIES);
+}
+
+/// O(1) hash-based cache lookup.
 fn cacheLookup(block_num: u32) ?usize {
-    for (0..CACHE_ENTRIES) |i| {
+    const bucket = cacheHashFn(block_num);
+    var idx = cache_hash[bucket];
+    while (idx) |i| {
         if (cache[i].valid and cache[i].block_num == block_num) return i;
+        idx = cache[i].hash_next;
     }
     return null;
+}
+
+/// Insert a cache entry into the hash table.
+fn cacheHashInsert(slot: usize) void {
+    const bucket = cacheHashFn(cache[slot].block_num);
+    cache[slot].hash_next = cache_hash[bucket];
+    cache_hash[bucket] = @intCast(slot);
+}
+
+/// Remove a cache entry from the hash table (for eviction).
+fn cacheHashRemove(slot: usize) void {
+    const bucket = cacheHashFn(cache[slot].block_num);
+    var prev: ?u8 = null;
+    var idx = cache_hash[bucket];
+    while (idx) |i| {
+        if (i == slot) {
+            if (prev) |p| {
+                cache[p].hash_next = cache[slot].hash_next;
+            } else {
+                cache_hash[bucket] = cache[slot].hash_next;
+            }
+            cache[slot].hash_next = null;
+            return;
+        }
+        prev = i;
+        idx = cache[i].hash_next;
+    }
 }
 
 /// Read a block through the cache. On miss, reads from disk and caches.
@@ -238,10 +283,19 @@ fn readBlockCached(block_num: u32, buf: [*]u8) bool {
     // Store in cache (overwrite slot at clock hand)
     const slot = cache_next;
     cache_next = (cache_next + 1) % CACHE_ENTRIES;
+
+    // Remove old entry from hash table if it was valid
+    if (cache[slot].valid) {
+        cacheHashRemove(slot);
+    }
+
     cache[slot].block_num = block_num;
     cache[slot].valid = true;
     cache[slot].dirty = false;
     @memcpy(cache[slot].data[0..block_size], buf[0..block_size]);
+
+    // Insert new entry into hash table
+    cacheHashInsert(slot);
     return true;
 }
 
@@ -254,10 +308,14 @@ fn writeBlockCached(block_num: u32, buf: [*]const u8) bool {
         } else {
             const slot = cache_next;
             cache_next = (cache_next + 1) % CACHE_ENTRIES;
+            if (cache[slot].valid) {
+                cacheHashRemove(slot);
+            }
             cache[slot].block_num = block_num;
             cache[slot].valid = true;
             cache[slot].dirty = false;
             @memcpy(cache[slot].data[0..block_size], buf[0..block_size]);
+            cacheHashInsert(slot);
         }
     }
     return writeBlockUncached(block_num, buf);
@@ -271,6 +329,16 @@ pub fn cacheFlush() void {
             cache[i].dirty = false;
         }
     }
+}
+
+/// Return a read-only pointer to a cached block's data (zero-copy lookup).
+/// Returns null on cache miss. Caller must not hold the pointer across
+/// any other cache operation (eviction may invalidate it).
+fn cacheLookupPtr(block_num: u32) ?[*]const u8 {
+    if (cacheLookup(block_num)) |idx| {
+        return &cache[idx].data;
+    }
+    return null;
 }
 
 pub fn cacheStats() struct { hits: u64, misses: u64 } {
@@ -300,15 +368,22 @@ fn readInode(inode_num: u32, out: *Ext2Inode) bool {
     const out_bytes: [*]u8 = @ptrCast(out);
     const copy_len = @min(inode_size, @as(u32, @sizeOf(Ext2Inode)));
 
-    const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
-    if (!readBlock(target_block, buf)) return false;
+    // Try zero-copy cache lookup first, fall back to sector_buf_virt
+    const buf: [*]const u8 = cacheLookupPtr(target_block) orelse blk: {
+        const tmp: [*]u8 = @ptrFromInt(sector_buf_virt);
+        if (!readBlock(target_block, tmp)) return false;
+        break :blk tmp;
+    };
 
     if (offset_in_block + copy_len > block_size) {
         // Inode straddles a block boundary — read the second block too.
-        const buf2_phys = pmm.allocPage() orelse return false;
-        defer pmm.freePage(buf2_phys);
-        const buf2: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf2_phys));
-        if (!readBlock(target_block + 1, buf2)) return false;
+        const buf2: [*]const u8 = cacheLookupPtr(target_block + 1) orelse blk: {
+            const buf2_phys = pmm.allocPage() orelse return false;
+            defer pmm.freePage(buf2_phys);
+            const tmp: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf2_phys));
+            if (!readBlock(target_block + 1, tmp)) return false;
+            break :blk cacheLookupPtr(target_block + 1) orelse return false;
+        };
 
         const first_part = block_size - offset_in_block;
         @memcpy(out_bytes[0..first_part], buf[offset_in_block .. offset_in_block + first_part]);
@@ -329,6 +404,13 @@ pub fn openFile(name: []const u8) i64 {
 }
 
 fn walkPath(start_inode: u32, path: []const u8) i64 {
+    return walkPathInner(start_inode, path, 0);
+}
+
+/// Inner walkPath with symlink depth tracking (max 8 levels).
+fn walkPathInner(start_inode: u32, path: []const u8, depth: u32) i64 {
+    if (depth > 8) return -40; // ELOOP: too many symlinks
+
     var current_inode = start_inode;
     var pos: u32 = 0;
 
@@ -341,6 +423,7 @@ fn walkPath(start_inode: u32, path: []const u8) i64 {
         const start = pos;
         while (pos < path.len and path[pos] != '/') pos += 1;
         const component = path[start..pos];
+        const is_last = (pos >= path.len);
 
         // Read inode
         var inode: Ext2Inode = undefined;
@@ -351,6 +434,31 @@ fn walkPath(start_inode: u32, path: []const u8) i64 {
 
         // Search directory entries for component
         const found = findDirEntry(&inode, component) orelse return -1;
+
+        // Check if the found entry is a symlink
+        var found_inode: Ext2Inode = undefined;
+        if (readInode(found, &found_inode) and found_inode.mode & 0xF000 == 0xA000) {
+            // It's a symlink — read target
+            const target = readSymlinkTarget(&found_inode) orelse return -5;
+
+            // Resolve from root if absolute, or from current dir if relative
+            const new_start: u32 = if (target.len > 0 and target[0] == '/') 2 else current_inode;
+            if (is_last) {
+                // Final component: resolve symlink target and open it
+                return walkPathInner(new_start, target, depth + 1);
+            } else {
+                // Intermediate: resolve symlink, then continue with remaining path
+                const remaining = path[pos..];
+                // First resolve symlink to get intermediate inode
+                const resolved_fd = walkPathInner(new_start, target, depth + 1);
+                if (resolved_fd < 0) return resolved_fd;
+                // Get the inode from the opened file, then close it
+                const resolved_inode = open_files[@intCast(resolved_fd)].inode_num;
+                open_files[@intCast(resolved_fd)].inode_num = 0; // close
+                return walkPathInner(resolved_inode, remaining, depth + 1);
+            }
+        }
+
         current_inode = found;
     }
 
@@ -375,7 +483,34 @@ fn walkPath(start_inode: u32, path: []const u8) i64 {
     return -1;
 }
 
+/// Read the target of a symlink inode.
+/// Short symlinks: inline in i_block. Long symlinks: in data block → static buffer.
+fn readSymlinkTarget(inode: *const Ext2Inode) ?[]const u8 {
+    const size = inode.size;
+    if (size == 0) return null;
+
+    // Short symlink: target stored inline in i_block (up to 60 bytes)
+    if (inode.blocks == 0) {
+        const block_bytes: [*]const u8 = @ptrCast(&inode.block);
+        return block_bytes[0..size];
+    }
+
+    // Long symlink: target stored in data block — copy to static buffer
+    const phys_block = inode.block[0];
+    if (phys_block == 0) return null;
+
+    const buf_phys = pmm.allocPage() orelse return null;
+    defer pmm.freePage(buf_phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+    if (!readBlock(phys_block, buf)) return null;
+
+    const copy_len = @min(size, @as(u32, 255));
+    @memcpy(symlink_buf[0..copy_len], buf[0..copy_len]);
+    return symlink_buf[0..copy_len];
+}
+
 /// Resolve a path to its parent directory inode and the final filename component.
+/// Resolves symlinks in intermediate directory components (v50.0).
 /// Returns (parent_inode_num, filename) or null on failure.
 fn resolveParent(path: []const u8) ?struct { parent: u32, name: []const u8 } {
     // Find the last '/' to split parent path from filename
@@ -405,7 +540,23 @@ fn resolveParent(path: []const u8) ?struct { parent: u32, name: []const u8 } {
             if (!readInode(parent_inode, &inode)) return null;
             if (inode.mode & 0xF000 != 0x4000) return null;
 
+            const dir_inode_num = parent_inode; // directory containing this component
             parent_inode = findDirEntry(&inode, component) orelse return null;
+
+            // v50.0: resolve symlinks in intermediate components
+            var found_inode: Ext2Inode = undefined;
+            if (readInode(parent_inode, &found_inode) and
+                found_inode.mode & 0xF000 == 0xA000)
+            {
+                if (readSymlinkTarget(&found_inode)) |target| {
+                    const new_start: u32 = if (target.len > 0 and target[0] == '/') 2 else dir_inode_num;
+                    const inner = walkPathInner(new_start, target, 1);
+                    if (inner < 0) return null;
+                    parent_inode = @intCast(inner);
+                } else {
+                    return null;
+                }
+            }
         }
     }
 
@@ -416,10 +567,6 @@ fn findDirEntry(inode: *const Ext2Inode, name: []const u8) ?u32 {
     const dir_size = inode.size;
     var offset: u32 = 0;
 
-    const buf_phys = pmm.allocPage() orelse return null;
-    defer pmm.freePage(buf_phys);
-    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
-
     while (offset < dir_size) {
         const block_num = offset / block_size;
         const phys_block = resolveBlock(inode, block_num);
@@ -428,7 +575,16 @@ fn findDirEntry(inode: *const Ext2Inode, name: []const u8) ?u32 {
             offset += block_size;
             continue;
         }
-        if (!readBlock(phys_block, buf)) return null;
+
+        // Try zero-copy cache first, fall back to allocPage + readBlock
+        const buf: [*]const u8 = cacheLookupPtr(phys_block) orelse blk: {
+            const buf_phys = pmm.allocPage() orelse return null;
+            defer pmm.freePage(buf_phys);
+            const tmp: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+            if (!readBlock(phys_block, tmp)) return null;
+            // readBlockCached stores it; now get zero-copy pointer
+            break :blk cacheLookupPtr(phys_block) orelse return null;
+        };
 
         var pos: u32 = 0;
         while (pos < block_size and offset + pos < dir_size) {
@@ -469,12 +625,19 @@ fn resolveBlock(inode: *const Ext2Inode, logical_block: u32) u32 {
         const indirect_block = inode.block[12];
         if (indirect_block == 0) return 0;
 
+        const index = logical_block - indirect_base;
+
+        // Fast path: zero-copy cache lookup (avoids allocPage + memcpy)
+        if (cacheLookupPtr(indirect_block)) |buf| {
+            const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
+            return ptrs[index];
+        }
+
+        // Cache miss: allocate temp buffer, read, insert into cache
         const buf_phys = pmm.allocPage() orelse return 0;
         defer pmm.freePage(buf_phys);
         const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
         if (!readBlock(indirect_block, buf)) return 0;
-
-        const index = logical_block - indirect_base;
         const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
         return ptrs[index];
     }
@@ -485,39 +648,36 @@ fn resolveBlock(inode: *const Ext2Inode, logical_block: u32) u32 {
         const dbl_block = inode.block[13];
         if (dbl_block == 0) return 0;
 
-        const buf_phys = pmm.allocPage() orelse return 0;
-        const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
-
         const rel = logical_block - dbl_base;
         const idx1 = rel / ptrs_per_block;
         const idx2 = rel % ptrs_per_block;
 
-        if (!readBlock(dbl_block, buf)) {
-            pmm.freePage(buf_phys);
-            return 0;
-        }
-        const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
-        const single_indirect = ptrs[idx1];
-        if (single_indirect == 0) {
-            pmm.freePage(buf_phys);
-            return 0;
+        // Fast path for double indirect block: zero-copy
+        const single_indirect: u32 = if (cacheLookupPtr(dbl_block)) |buf| blk: {
+            const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
+            break :blk ptrs[idx1];
+        } else blk: {
+            const buf_phys = pmm.allocPage() orelse return 0;
+            defer pmm.freePage(buf_phys);
+            const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+            if (!readBlock(dbl_block, buf)) return 0;
+            const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
+            break :blk ptrs[idx1];
+        };
+        if (single_indirect == 0) return 0;
+
+        // Fast path for single indirect: zero-copy
+        if (cacheLookupPtr(single_indirect)) |buf| {
+            const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
+            return ptrs[idx2];
         }
 
-        const buf2_phys = pmm.allocPage() orelse {
-            pmm.freePage(buf_phys);
-            return 0;
-        };
+        const buf2_phys = pmm.allocPage() orelse return 0;
+        defer pmm.freePage(buf2_phys);
         const buf2: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf2_phys));
-        if (!readBlock(single_indirect, buf2)) {
-            pmm.freePage(buf2_phys);
-            pmm.freePage(buf_phys);
-            return 0;
-        }
+        if (!readBlock(single_indirect, buf2)) return 0;
         const ptrs2: [*]const u32 = @ptrCast(@alignCast(buf2));
-        const result = ptrs2[idx2];
-        pmm.freePage(buf2_phys);
-        pmm.freePage(buf_phys);
-        return result;
+        return ptrs2[idx2];
     }
 
     return 0;
@@ -547,10 +707,16 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
         const block_offset = current_offset % block_size;
         const chunk = @min(to_read - read_total, block_size - block_offset);
 
-        // Try page cache first
+        // Try page cache first (with sequential prefetch)
         const page_idx = logical_block; // page_offset in pages
         if (page_cache.readPage(inode_id, page_idx)) |cached| {
             @memcpy(buf[read_total .. read_total + chunk], cached[block_offset .. block_offset + chunk]);
+            // Track access for prefetch hint (on cache hit too, to maintain pattern)
+            const pf_count = page_cache.recordAccess(inode_id, page_idx);
+            if (pf_count > 0) {
+                // Prefetch next pages (already cached? skip)
+                prefetchPages(&f.inode, inode_id, page_idx + 1, pf_count);
+            }
         } else {
             // Cache miss — read from disk
             const phys_block = resolveBlock(&f.inode, logical_block);
@@ -566,12 +732,44 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
             const page_data: *const [4096]u8 = tmp[0..4096];
             _ = page_cache.insertPage(inode_id, page_idx, page_data);
             pmm.freePage(tmp_phys);
+            // Record access and prefetch on sequential pattern
+            const pf_count = page_cache.recordAccess(inode_id, page_idx);
+            if (pf_count > 0) {
+                prefetchPages(&f.inode, inode_id, page_idx + 1, pf_count);
+            }
         }
         read_total += chunk;
         current_offset += chunk;
     }
 
     return if (read_total == 0) -1 else @intCast(read_total);
+}
+
+/// Prefetch sequential pages into the page cache.
+/// Reads up to `count` pages starting from `start_page` for the given inode.
+/// Skips pages that are already cached. Best-effort: stops on first I/O error.
+fn prefetchPages(inode: *const Ext2Inode, inode_id: u64, start_page: u64, count: u32) void {
+    const page_cache = @import("page_cache.zig");
+    const total_pages = (inode.size + block_size - 1) / block_size;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const pg = start_page + @as(u64, i);
+        if (pg >= total_pages) break;
+        // Skip if already cached
+        if (page_cache.isCached(inode_id, pg)) continue;
+        // Resolve physical block and read
+        const phys_block = resolveBlock(inode, @intCast(pg));
+        if (phys_block == 0) break;
+        const tmp_phys = pmm.allocPage() orelse break;
+        const tmp: [*]u8 = @ptrFromInt(hhdm.physToVirt(tmp_phys));
+        if (!readBlock(phys_block, tmp)) {
+            pmm.freePage(tmp_phys);
+            break;
+        }
+        const page_data: *const [4096]u8 = tmp[0..4096];
+        _ = page_cache.insertPage(inode_id, pg, page_data);
+        pmm.freePage(tmp_phys);
+    }
 }
 
 pub fn getInodeNum(file_idx: u32) u32 {
@@ -611,14 +809,19 @@ pub fn listDir(path: []const u8, callback: *const fn ([*]const u8, u32) void) vo
     const dir_size = inode.size;
     var offset: u32 = 0;
 
-    const buf_phys = pmm.allocPage() orelse return;
-    defer pmm.freePage(buf_phys);
-    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
-
     while (offset < dir_size) {
         const block_num = offset / block_size;
+        const phys_block = resolveBlock(&inode, block_num);
+        if (phys_block == 0) break;
 
-        if (!readBlock(resolveBlock(&inode, block_num), buf)) break;
+        // Zero-copy cache lookup, fall back to allocPage
+        const buf: [*]const u8 = cacheLookupPtr(phys_block) orelse blk: {
+            const buf_phys = pmm.allocPage() orelse break :blk null;
+            defer pmm.freePage(buf_phys);
+            const tmp: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+            if (!readBlock(phys_block, tmp)) break :blk null;
+            break :blk cacheLookupPtr(phys_block) orelse break :blk null;
+        } orelse break;
 
         var pos: u32 = 0;
         while (pos < block_size) {
@@ -926,34 +1129,41 @@ fn allocBlock(group: u32) u32 {
     const total_blocks_in_group = if (group < groups_count - 1) sb.blocks_per_group else sb.blocks_count - group * sb.blocks_per_group;
     const first_block = group * sb.blocks_per_group + first_data_block;
 
-    // Scan bitmap for a free bit (0 = free)
-    var i: u32 = 0;
-    while (i < total_blocks_in_group) : (i += 1) {
+    // Scan bitmap for a free bit (0 = free) using 64-bit word scanning.
+    // Inverted word + @ctz skips 64 used blocks per iteration.
+    const words: [*]const u64 = @ptrCast(@alignCast(buf));
+    const total_bytes = (total_blocks_in_group + 7) / 8;
+    const total_words = (total_bytes + 7) / 8;
+    var w: u32 = 0;
+    while (w < total_words) : (w += 1) {
+        const inv = ~words[w]; // flip: 1 = free
+        if (inv == 0) continue; // all 64 blocks used
+        const bit = @ctz(inv);
+        const i = w * 64 + @as(u32, bit);
+        if (i >= total_blocks_in_group) break;
+        // Found a free block — mark as used
         const byte_idx = i / 8;
         const bit_idx: u3 = @intCast(i % 8);
-        if (buf[byte_idx] & (@as(u8, 1) << bit_idx) == 0) {
-            // Found a free block — mark as used
-            buf[byte_idx] |= @as(u8, 1) << bit_idx;
-            if (!writeBlock(bitmap_block, buf)) return 0;
+        buf[byte_idx] |= @as(u8, 1) << bit_idx;
+        if (!writeBlock(bitmap_block, buf)) return 0;
 
-            // Update group descriptor
-            gd.bg_free_blocks_count -= 1;
-            writeGroupDescs();
+        // Update group descriptor
+        gd.bg_free_blocks_count -= 1;
+        writeGroupDescs();
 
-            // Update superblock free block count
-            sb.free_blocks_count -= 1;
-            writeSuperblock();
+        // Update superblock free block count
+        sb.free_blocks_count -= 1;
+        writeSuperblock();
 
-            // Zero the newly allocated block
-            const zero_phys = pmm.allocPage() orelse return 0;
-            defer pmm.freePage(zero_phys);
-            const zero_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(zero_phys));
-            @memset(zero_buf[0..block_size], 0);
-            const block_num = first_block + i;
-            _ = writeBlock(block_num, zero_buf);
+        // Zero the newly allocated block
+        const zero_phys = pmm.allocPage() orelse return 0;
+        defer pmm.freePage(zero_phys);
+        const zero_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(zero_phys));
+        @memset(zero_buf[0..block_size], 0);
+        const block_num = first_block + i;
+        _ = writeBlock(block_num, zero_buf);
 
-            return block_num;
-        }
+        return block_num;
     }
     return 0;
 }
@@ -1142,26 +1352,33 @@ fn allocInode(group: u32) u32 {
 
     const total_inodes_in_group = if (group < groups_count - 1) inodes_per_group else sb.inodes_count - group * inodes_per_group;
 
-    var i: u32 = 0;
-    while (i < total_inodes_in_group) : (i += 1) {
+    // Scan bitmap for a free inode (0 = free) using 64-bit word scanning.
+    const words: [*]const u64 = @ptrCast(@alignCast(buf));
+    const total_bytes = (total_inodes_in_group + 7) / 8;
+    const total_words = (total_bytes + 7) / 8;
+    var w: u32 = 0;
+    while (w < total_words) : (w += 1) {
+        const inv = ~words[w];
+        if (inv == 0) continue;
+        const bit = @ctz(inv);
+        const i = w * 64 + @as(u32, bit);
+        if (i >= total_inodes_in_group) break;
+        // Found a free inode — mark as used
         const byte_idx = i / 8;
         const bit_idx: u3 = @intCast(i % 8);
-        if (buf[byte_idx] & (@as(u8, 1) << bit_idx) == 0) {
-            // Found a free inode — mark as used
-            buf[byte_idx] |= @as(u8, 1) << bit_idx;
-            if (!writeBlock(bitmap_block, buf)) return 0;
+        buf[byte_idx] |= @as(u8, 1) << bit_idx;
+        if (!writeBlock(bitmap_block, buf)) return 0;
 
-            // Update group descriptor
-            gd.bg_free_inodes_count -= 1;
-            writeGroupDescs();
+        // Update group descriptor
+        gd.bg_free_inodes_count -= 1;
+        writeGroupDescs();
 
-            // Update superblock
-            sb.free_inodes_count -= 1;
-            writeSuperblock();
+        // Update superblock
+        sb.free_inodes_count -= 1;
+        writeSuperblock();
 
-            // Inode numbers are 1-based
-            return group * inodes_per_group + i + 1;
-        }
+        // Inode numbers are 1-based
+        return group * inodes_per_group + i + 1;
     }
     return 0;
 }
@@ -1541,7 +1758,7 @@ fn removeDirEntry(parent_inode_num: u32, name: []const u8) bool {
 // ─── File unlink ────────────────────────────────────────────────────────────
 
 /// Unlink (delete) a file from the ext2 filesystem.
-/// Supports multi-level paths (e.g., "testdir/file.txt").
+/// Supports multi-level paths, hardlinks, and symlinks (v50.0).
 pub fn unlinkFile(path: []const u8) bool {
     if (!active) return false;
 
@@ -1559,35 +1776,53 @@ pub fn unlinkFile(path: []const u8) bool {
     var file_inode: Ext2Inode = undefined;
     if (!readInode(file_inode_num, &file_inode)) return false;
 
-    // Free data blocks (direct 0-11)
-    for (0..EXT2_INODE_DIRECT) |i| {
-        if (file_inode.block[i] != 0) {
-            freeBlock(file_inode.block[i]);
-        }
-    }
+    const is_symlink = (file_inode.mode & 0xF000 == 0xA000);
 
-    // Free single indirect block (block[12]) and all blocks it points to
-    if (file_inode.block[12] != 0) {
-        const ib_phys = pmm.allocPage() orelse return false;
-        const ib: [*]u8 = @ptrFromInt(hhdm.physToVirt(ib_phys));
-        if (readBlock(file_inode.block[12], ib)) {
-            const ptrs_per_block = block_size / 4;
-            const ptrs: [*]const u32 = @ptrCast(@alignCast(ib));
-            for (0..ptrs_per_block) |i| {
-                if (ptrs[i] != 0) freeBlock(ptrs[i]);
+    // v50.0: decrement links_count for hardlinked files
+    if (file_inode.links_count > 1) {
+        file_inode.links_count -= 1;
+        _ = writeInode(file_inode_num, &file_inode);
+    } else {
+        // Last link: free data blocks
+        if (is_symlink and file_inode.blocks == 0) {
+            // Short symlink: target inline in i_block, no data blocks to free
+        } else if (is_symlink) {
+            // Long symlink: only block[0] is used
+            if (file_inode.block[0] != 0) {
+                freeBlock(file_inode.block[0]);
+            }
+        } else {
+            // Regular file: free direct blocks (0-11)
+            for (0..EXT2_INODE_DIRECT) |i| {
+                if (file_inode.block[i] != 0) {
+                    freeBlock(file_inode.block[i]);
+                }
+            }
+
+            // Free single indirect block (block[12]) and all blocks it points to
+            if (file_inode.block[12] != 0) {
+                const ib_phys = pmm.allocPage() orelse return false;
+                const ib: [*]u8 = @ptrFromInt(hhdm.physToVirt(ib_phys));
+                if (readBlock(file_inode.block[12], ib)) {
+                    const ptrs_per_block = block_size / 4;
+                    const ptrs: [*]const u32 = @ptrCast(@alignCast(ib));
+                    for (0..ptrs_per_block) |i| {
+                        if (ptrs[i] != 0) freeBlock(ptrs[i]);
+                    }
+                }
+                pmm.freePage(ib_phys);
+                freeBlock(file_inode.block[12]);
+            }
+
+            // Free double indirect block (block[13])
+            if (file_inode.block[13] != 0) {
+                freeBlock(file_inode.block[13]);
             }
         }
-        pmm.freePage(ib_phys);
-        freeBlock(file_inode.block[12]);
-    }
 
-    // Free double indirect block (block[13]) — for now just free the block itself
-    if (file_inode.block[13] != 0) {
-        freeBlock(file_inode.block[13]);
+        // Free the inode
+        freeInode(file_inode_num);
     }
-
-    // Free the inode
-    freeInode(file_inode_num);
 
     // Remove directory entry from parent
     if (!removeDirEntry(parent_inode_num, filename)) return false;
@@ -1596,4 +1831,204 @@ pub fn unlinkFile(path: []const u8) bool {
     serial.writeString(filename);
     serial.writeString("\n");
     return true;
+}
+
+// ─── Hard link creation ────────────────────────────────────────────────────
+
+/// Create a hard link: newpath → same inode as oldpath.
+/// Returns 0 on success, -errno on failure.
+pub fn createHardlink(oldpath: []const u8, newpath: []const u8) i64 {
+    if (!active) return -5; // EIO
+
+    // 1. Resolve oldpath to its inode number
+    const old_inode = walkPathToInode(oldpath) orelse return -2; // ENOENT
+
+    // Read the old inode to check it's not a directory
+    var old_inode_data: Ext2Inode = undefined;
+    if (!readInode(old_inode, &old_inode_data)) return -5;
+
+    if (old_inode_data.mode & 0xF000 == 0x4000) return -1; // EPERM: cannot hardlink directories
+
+    // 2. Resolve newpath's parent directory + filename
+    const resolved = resolveParent(newpath) orelse return -2;
+    if (resolved.name.len == 0) return -2;
+
+    // Check that newpath doesn't already exist
+    var parent_check: Ext2Inode = undefined;
+    if (readInode(resolved.parent, &parent_check)) {
+        if (findDirEntry(&parent_check, resolved.name) != null) return -17; // EEXIST
+    }
+
+    // 3. Add directory entry pointing to old_inode with same file_type
+    const ft: u8 = if (old_inode_data.mode & 0xF000 == 0x4000) 2 else 1;
+    if (!addDirEntry(resolved.parent, old_inode, resolved.name, ft)) return -28; // ENOSPC
+
+    // 4. Increment links_count
+    old_inode_data.links_count +|= 1;
+    _ = writeInode(old_inode, &old_inode_data);
+
+    return 0;
+}
+
+// ─── Symbolic link creation ────────────────────────────────────────────────
+
+/// Create a symbolic link: linkpath → target.
+/// Returns 0 on success, -errno on failure.
+pub fn createSymlink(target: []const u8, linkpath: []const u8) i64 {
+    if (!active) return -5;
+
+    // 1. Resolve linkpath's parent directory + filename
+    const resolved = resolveParent(linkpath) orelse return -2;
+    if (resolved.name.len == 0) return -2;
+
+    // Check that linkpath doesn't already exist
+    var parent_check: Ext2Inode = undefined;
+    if (readInode(resolved.parent, &parent_check)) {
+        if (findDirEntry(&parent_check, resolved.name) != null) return -17; // EEXIST
+    }
+
+    // 2. Allocate a new inode for the symlink
+    const new_inode_num = allocInode(0);
+    if (new_inode_num == 0) return -28; // ENOSPC
+
+    var new_inode: Ext2Inode = undefined;
+    // Zero the inode first
+    const inode_bytes: [*]u8 = @ptrCast(&new_inode);
+    @memset(inode_bytes[0..@sizeOf(Ext2Inode)], 0);
+    // ext2 stores mode as u16 with permission bits; symlink = 0xA000
+    new_inode.mode = 0xA1FF; // S_IFLNK | 0777
+    new_inode.size = @intCast(target.len);
+    new_inode.links_count = 1;
+
+    // For short symlinks (≤ 60 bytes), store target inline in i_block
+    if (target.len <= EXT2_INODE_DIRECT * 4) { // 12 * 4 = 48 bytes, but ext2 allows up to 60
+        const block_bytes: [*]u8 = @ptrCast(&new_inode.block);
+        @memcpy(block_bytes[0..target.len], target);
+        new_inode.blocks = 0;
+    } else {
+        // Long symlink: allocate a data block and store target there
+        const data_block = allocBlock(0);
+        if (data_block == 0) return -28;
+        const buf_phys = pmm.allocPage() orelse return -12;
+        defer pmm.freePage(buf_phys);
+        const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+        @memset(buf[0..block_size], 0);
+        @memcpy(buf[0..target.len], target);
+        if (!writeBlock(data_block, buf)) return -5;
+        new_inode.block[0] = data_block;
+        new_inode.blocks = @intCast(block_size / 512);
+    }
+
+    // 3. Write the new inode
+    if (!writeInode(new_inode_num, &new_inode)) return -5;
+
+    // 4. Add directory entry: file_type = 7 (EXT2_FT_SYMLINK)
+    if (!addDirEntry(resolved.parent, new_inode_num, resolved.name, 7)) return -28;
+
+    return 0;
+}
+
+/// Resolve a path to its inode number (without opening a file descriptor).
+fn walkPathToInode(path: []const u8) ?u32 {
+    var current_inode: u32 = 2; // root
+    var pos: u32 = 0;
+
+    while (pos < path.len) {
+        while (pos < path.len and path[pos] == '/') pos += 1;
+        if (pos >= path.len) break;
+
+        const start = pos;
+        while (pos < path.len and path[pos] != '/') pos += 1;
+        const component = path[start..pos];
+
+        var inode: Ext2Inode = undefined;
+        if (!readInode(current_inode, &inode)) return null;
+        if (inode.mode & 0xF000 != 0x4000) return null; // not a directory
+
+        current_inode = findDirEntry(&inode, component) orelse return null;
+    }
+    if (current_inode == 2 and path.len > 1) return null;
+    return current_inode;
+}
+
+// ─── Public symlink target read (v50.0) ────────────────────────────────────
+
+/// Read symlink target by path. Returns target slice or null.
+/// Uses static symlink_buf for long symlinks (caller must copy before next call).
+pub fn readSymlinkByPath(path: []const u8) ?[]const u8 {
+    if (!active) return null;
+
+    // Resolve parent and find the entry
+    const resolved = resolveParent(path) orelse return null;
+    var parent_inode: Ext2Inode = undefined;
+    if (!readInode(resolved.parent, &parent_inode)) return null;
+    const entry_inode_num = findDirEntry(&parent_inode, resolved.name) orelse return null;
+
+    // Read the entry's inode and check it's a symlink
+    var entry_inode: Ext2Inode = undefined;
+    if (!readInode(entry_inode_num, &entry_inode)) return null;
+    if (entry_inode.mode & 0xF000 != 0xA000) return null; // not a symlink
+
+    return readSymlinkTarget(&entry_inode);
+}
+
+// ─── chown/chmod inode persistence (v51.0) ─────────────────────────────────
+
+/// Set owner (uid/gid) for a path. Returns 0 on success, -errno on failure.
+/// Pass -1 (0xFFFF) to leave uid or gid unchanged.
+pub fn setOwner(path: []const u8, uid: u16, gid: u16) i64 {
+    if (!active) return -5; // EIO
+
+    const inode_num = walkPathToInode(path) orelse return -2; // ENOENT
+    var inode: Ext2Inode = undefined;
+    if (!readInode(inode_num, &inode)) return -5;
+
+    if (uid != 0xFFFF) inode.uid = uid;
+    if (gid != 0xFFFF) inode.gid = gid;
+    if (!writeInode(inode_num, &inode)) return -5;
+    return 0;
+}
+
+/// Set owner (uid/gid) for an inode by number. Used by fchown via fd→inode mapping.
+pub fn setOwnerByInode(inode_num: u32, uid: u16, gid: u16) i64 {
+    if (!active) return -5;
+    var inode: Ext2Inode = undefined;
+    if (!readInode(inode_num, &inode)) return -5;
+
+    if (uid != 0xFFFF) inode.uid = uid;
+    if (gid != 0xFFFF) inode.gid = gid;
+    if (!writeInode(inode_num, &inode)) return -5;
+    return 0;
+}
+
+/// Set permission mode for a path. Returns 0 on success, -errno on failure.
+/// mode is the lower 12 bits (file type preserved).
+pub fn setMode(path: []const u8, new_mode: u16) i64 {
+    if (!active) return -5;
+
+    const inode_num = walkPathToInode(path) orelse return -2;
+    var inode: Ext2Inode = undefined;
+    if (!readInode(inode_num, &inode)) return -5;
+
+    // Preserve file type bits (upper 4), replace permission bits (lower 12)
+    inode.mode = (inode.mode & 0xF000) | (new_mode & 0x0FFF);
+    if (!writeInode(inode_num, &inode)) return -5;
+    return 0;
+}
+
+/// Set permission mode for an inode by number. Used by fchmod via fd→inode mapping.
+pub fn setModeByInode(inode_num: u32, new_mode: u16) i64 {
+    if (!active) return -5;
+    var inode: Ext2Inode = undefined;
+    if (!readInode(inode_num, &inode)) return -5;
+
+    inode.mode = (inode.mode & 0xF000) | (new_mode & 0x0FFF);
+    if (!writeInode(inode_num, &inode)) return -5;
+    return 0;
+}
+
+/// Get inode number from an open ext2 file index.
+pub fn getInodeNumFromOpen(file_idx: u32) u32 {
+    if (file_idx >= MAX_OPEN_FILES) return 0;
+    return open_files[file_idx].inode_num;
 }
