@@ -1,8 +1,8 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.16.6
+> **版本**: v0.41.0
 > **日期**: 2026-05-29
-> **代码统计**: 内核 30,260 行 Zig / 121 源文件，用户空间 2,244 行 C/ASM
+> **代码统计**: 内核 36,184 行 Zig / 122 源文件，用户空间 2,244 行 C/ASM
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
@@ -26,10 +26,10 @@ MoQiOS 是一个运行在 x86_64 架构上的**单体内核** (Monolithic Kernel
 | 内核栈大小 | 16 页 = 64KB (KERNEL_STACK_PAGES) |
 | 用户代码段基址 | 0x00400000 (4MB) |
 | 用户栈顶 | 0x00800000 (8MB) |
-| 系统调用数量 | 432 (293 独立函数, ENOSYS ~14) |
-| 文件系统 | FAT32 + ext2 + tmpfs + procfs + ramdisk + 统一页缓存 |
+| 系统调用数量 | 383 dispatch 条目 (max #471, #0-#330 连续 + Linux #424-#471 完全连续) |
+| 文件系统 | FAT32 + ext2 (完整 symlink/hardlink/chown/chmod) + tmpfs + procfs + ramdisk + 统一页缓存 (命中/未中统计) |
 | 网络设备 | e1000 (中断驱动) + virtio-net (Virtqueue) |
-| 内核代码量 | 32,866 行 Zig / 81 文件 |
+| 内核代码量 | 36,184 行 Zig / 122 文件 |
 | 用户代码量 | 2,244 行 C/ASM |
 
 ---
@@ -59,8 +59,9 @@ ext2 多级目录读写删，QEMU 串口验证，零异常、零三重故障）�
 
 ### 已知限制 / 待办
 
-- **SMP 暂为单处理器模式**：`smp.enable_ap_startup = false`。LAPIC-on-AP 崩溃根因已查明并修复
-  （见 **1.6 节**），但完整启用仍受更深层问题门控；当前所有逻辑运行于 BSP，功能完整。
+- **SMP 启用中**：`smp.enable_ap_startup = true`，AP 稳定上线并参与 timerTick。
+  用户任务暂绑 BSP（M8-5b-2b），AP 基础设施（per-CPU 状态/IPI reschedule/跨核唤醒）已就绪。
+  v27.0 修复 AP 栈连续性、调度间隙等基础问题。待办：FPU/SSE 按任务、范围 TLB shootdown、per-CPU 运行队列。
 - **用户指针缺页恢复**：已通过"访问前页表校验"避免内核崩溃，但仍非真正的 per-instruction
   缺页恢复（RIP fixup）。对 COW 只读页的内核态写入依赖缺页处理器支持。
 - ~~**ext2 多级目录写内存破坏**~~（**已修复**）：根因是 ext2 inode 越界与中断 stub 寄存器破坏
@@ -100,9 +101,11 @@ AP 冷 walk 才暴露。
    （`or $((1<<8)|(1<<11)), %eax`）。
 2. `kernel/smp.zig` `apEntry`：补上 **`idt.loadOnThisCpu()`**（每个 CPU 必须各自 `lidt` 共享 IDT，
    否则首个异常/中断即三重故障——这是 NXE 之后的下一个必然崩溃点）。
-3. AP 仅启用 LAPIC 而**不开定时器**（`lapic.enableApNoTimer()`），并进入 `sched.apParkLoop()`
-   安全驻留，**不参与调度**——因为现调度器使用 BSP 全局状态（`current_idx` 等）且 TSS 绑定 BSP，
-   尚不能在 AP 上跑用户任务。
+3. AP 启用 LAPIC **并开启定时器**（`lapic.initAp()`），通过 `sched.apBootstrapIdle()` 进入
+   per-CPU idle 循环参与调度。M8-5b-2 基础设施就绪。
+4. v27.0：AP 栈改用 `pmm.allocContiguous` 保证物理连续（防跨页 #PF）；BSP reap 路径
+   `setSlice(1)` 防调度间隙；TLB shootdown EOI 先于 CR3 reload；`sleepOn` 调用
+   `forceReschedule` 与 futex/file_lock 阻塞模式统一。
 
 修复后实测：AP 稳定走完 `BCDEFGHIJ` 标记 → `[SMP] AP 1 initialized` → `[SMP] 2 CPUs online`，
 不再崩在 LAPIC 访问。
@@ -110,9 +113,8 @@ AP 冷 walk 才暴露。
 ### SMP 当前状态（2026-06，M8 进行中）
 
 历史阻塞点（TSS 错位、中断 stub 寄存器破坏、调度器全局状态）均已修复。**`enable_ap_startup=true`**，
-`-smp 2` 下 AP 稳定上线并参与 timerTick。M8-5b-2b（2026-06-07）：用户任务暂绑 BSP 以保证
-`MOQI_SMP=2` 全量 init 稳定到 shell；AP 基础设施（APIC id、IPI reschedule、`wait_cpu` 跨核唤醒）
-已就绪。round-robin 亲和 + AP ELF 并行（M8-5b-2c）为下一项。
+`-smp 2` 下 AP 稳定上线并参与 timerTick。v27.0 修复 AP 栈物理连续性、BSP reap 调度间隙、
+TLB shootdown EOI 顺序、sleepOn 阻塞延迟等 SMP 基础设施问题。
 
 | 子里程碑 | 状态 | 说明 |
 |---|---|---|
@@ -124,7 +126,7 @@ AP 冷 walk 才暴露。
 | M8-5b-2a | ✅ | AP commonStub 用户入口 + 跨核 IPI/`waitpid` 可见性 |
 | M8-5b-2b | ✅ | APIC id、`wait_cpu`/`kickChildCpus`；用户暂绑 BSP |
 | M8-5b-2d | ✅ | `Task.saved_user_rsp` + 上下文切换同步；3/3 `MOQI_SMP=2`→shell |
-| M8-5b-2e | ⬜ | flat round-robin@AP |
+| M8-5b-2e | ✅ | AP 栈 allocContiguous 物理连续 + BSP reap setSlice(1) + TLB EOI 先于 CR3 + sleepOn forceReschedule |
 | M8-5b-3 | ⬜ | FPU/SSE 按任务 |
 | M8-6 | ⬜ | 范围 TLB shootdown |
 | M8-7 | ⬜ | per-CPU 运行队列 + work-stealing |
@@ -357,7 +359,7 @@ QEMU / 真机
 - 页表标志: Present, Read/Write, User/Supervisor, No-Execute
 - `mapPage(pml4, virt, phys, flags)`: 映射单个虚拟页
 - `unmapPage(pml4, virt)`: 取消映射
-- COW fork 时使用写保护 (Read-Only + COW 标志)
+- COW fork: `cloneUserPagesCow` 共享物理页 + 标记 RO + COW bit (bit 9), #PF handler 首次写时分配私有页 (v46.0 实现, v47.0 修复 decRef 内存泄漏)
 
 ### 3.3 用户地址空间
 
@@ -389,7 +391,7 @@ QEMU / 真机
 
 ### 4.1 Task 结构体
 
-**源文件**: `kernel/proc/task.zig` (464 行)
+**源文件**: `kernel/proc/task.zig` (704 行)
 
 Task 结构体约 6000 字节，包含：
 
@@ -415,6 +417,11 @@ Task 结构体约 6000 字节，包含：
 | signal_mask | u64 | 信号掩码 |
 | waiting_for_child | bool | 是否在等待子进程 |
 | exit_status | u32 | 退出状态码 |
+| alarm_deadline | u64 | alarm() SIGALRM 截止时间 (ns, 0=无) |
+| itimer_real_value | u64 | ITIMER_REAL 下次触发截止时间 (ns) |
+| itimer_real_interval | u64 | ITIMER_REAL 重复触发间隔 (ns) |
+| pdeathsig | u32 | 父进程死亡时发送给子进程的信号 (0=无) |
+| sched_policy | u32 | 调度策略 (SCHED_OTHER/FIFO/RR/BATCH/DEADLINE) |
 
 ### 4.2 进程状态
 
@@ -493,7 +500,7 @@ LAPIC Timer 中断
 
 ## 6. 系统调用
 
-**源文件**: `kernel/arch/x86_64/syscall_entry.zig` (9691 行)
+**源文件**: `kernel/arch/x86_64/syscall_entry.zig` (4,542 行)
 
 ### 6.1 系统调用机制
 
@@ -502,7 +509,25 @@ LAPIC Timer 中断
 - SyscallFrame 结构保存所有寄存器
 - 返回值通过 rax 传递，错误通过 rax = -errno 表示
 
-### 6.2 系统调用表 (263 个 dispatch, 220 个独立函数)
+### 6.2 系统调用表 (383 dispatch 条目, max #471)
+
+> v49.0 ext2 符号链接/硬链接: link()#86/symlink()#88从accept升级为真实ext2实现(createHardlink/createSymlink); walkPathInner递归symlink解析(深度限制8级ELOOP); readSymlinkTarget(短链接i_block内联+长链接静态缓冲区)。
+> v48.0 性能容量全面提升: page_cache 4x扩容 (MAX_PAGES 256→1024, 4MB缓存/CACHE_SLOTS 128→512/INODE_LIST_SLOTS 64→256/MAX_PREFETCH_TRACK 8→32/dirty_bm参数化); writeback BUFFER_COUNT 128→512; TCP MAX_CONNECTIONS 32→64 (u64 bitmap)/收发缓冲 32KB→64KB。
+> v47.0 COW 正确性修复: handleCowFault 在分配新页后正确 decRef 旧共享页 (修复内存泄漏); 新增 #463-#466 (xattr-at ENOSYS)/#467-#469 (file attr accept)/#470 listns/#471 rseq_slice_yield。**424-471 完全连续无缺口**。
+> v46.0 COW fork 性能优化: fork() 从深拷贝改为 Copy-on-Write (cloneUserPagesCow 共享物理页 + 标记 RO+COW bit, 首次写时由 #PF handler 分配私有页); 新增 #457-#462 (statmount/listmount/lsm_*/mseal)。
+> v45.0 修正 Linux 标准编号 424-456: 删除错误的 v44.0 MoQiOS 自定义编号 (#335-#343); 修正 #424→pidfd_send_signal/#425→io_uring_setup; 新增 #426-#433 (io_uring_enter/register + mount API 全系列); 新增 #440 process_madvise/#444-#448 landlock 系列+memfd_secret+process_mrelease(正确编号)/#450 set_mempolicy_home_node(正确编号); 新增 #452 fchmodat2/#453 map_shadow_stack/#454-#456 futex2 API (wake/wait/requeue→委托 futex_mod.futex)。**424-456 完全连续无缺口**。
+> v44.0 新增 13 个 Linux 标准编号 dispatch (#335-#451): io_uring 系列 ENOSYS (io_uring_setup/enter/register); 新 mount API 系列 (open_tree/move_mount/fsopen/fsconfig/fsmount/fspick); 高级 syscall (mount_setattr/quotactl_fd/process_mrelease/set_mempolicy_home_node)。
+> v43.0 alarm/itimer 定时器集成: alarm() 仅设 deadline (不立即 sendSignal); BSP timer tick 遍历所有任务检查 alarm_deadline/itimer_real_value 过期，通过 signal.sendSignal(tid, 14) 延迟触发 SIGALRM; ITIMER_REAL interval 自动重调度。
+> v42.0 新增 15 个 Linux 标准编号 dispatch (#331-#451): 别名接线 statx/io_pgetevents/pidfd_send_signal/pidfd_getfd/faccessat2/pidfd_open/close_range/openat2; 新实现 clone3(clone_args解析)/epoll_pwait2(timespec→ms)/futex_waitv(接线futexWaitv)/cachestat(page_cache统计)/rseq(注册接受)。
+> v41.0 替换 5 个 no-op/stub 为真实实现: madvise WILLNEED/SEQUENTIAL→page_cache.recordAccess 预热缓存+DONTNEED→解锁 MmapRegion; posix_fadvise DONTNEED→page_cache.invalidateInode 真实驱逐; execveat(AT_FDCWD)→委托 syscallExecve; fallocate(mode=0)→ext2.truncateFile 预分配; prctl PR_SET_PDEATHSIG→存储到 Task+新增 PR_GET_PDEATHSIG。Task 新增 pdeathsig 字段。
+> v40.0 新增 25 个 dispatch 条目，**全面消除所有缺口**。补齐 SysV IPC Linux 标准编号别名 (shmget/shmat/shmctl/semget/semop/semctl/shmdt/msgget/msgsnd/msgrcv/msgctl)、文件操作 (fcntl/getdents/link/symlink/chown/fchown/lchown)、新实现 getitimer/setitimer (ITIMER_REAL TSC deadline+interval)、pause (forceReschedule+EINTR)。fchdir 从 no-op 升级为真实实现。
+> v37.0 新增 14 个 dispatch 条目 (#297-#310)，接线 MoQiOS 原生 IPC (moqipc_create_ep/destroy_ep/send/recv/call/reply/notify/get_notify) + kcmp/capget/capset/sched_setattr/sched_getattr/membarrier。替换 3 个 no-op 为真实实现：msync→vfs.syncAll / mlock+munlock→MmapRegion.locked / posix_fadvise→page_cache.recordAccess。Task 新增 sched_policy，MmapRegion 新增 locked。
+> v36.0 新增 16 个 dispatch 条目 (#238, #282-#296)，覆盖 prlimit64/unshare/process_vm_readv/process_vm_writev/memfd_create/get_robust_list/set_robust_list/mount/umount2/sync_file_range/readahead/ioprio_set/ioprio_get/vmsplice/name_to_handle_at/open_by_handle_at。性能优化：page_cache.recordAccess 接入 ext2/fat32 读路径，AHCI 注册 io_sched 设备。
+> v34.0 新增 20 个 dispatch 条目 (#262-#281)，覆盖 vfork/wait4/sethostname/gethostname/setdomainname/getdomainname/personality/clock_getres/clock_settime/mlockall/munlockall/sched_setaffinity/fallocate/posix_fadvise/statfs/fstatfs/syslog/reboot/chroot/acct。
+> v33.0 新增 20 个 dispatch 条目 (#242-#261)，覆盖 getrandom/clone/fsync/fdatasync/sync/clock_nanosleep/epoll_pwait/getcpu/pipe2/mincore/mlock/munlock/msync/openat/unlinkat/mkdirat/faccessat/readlinkat/fchmodat/renameat2。
+> v32.0 新增 27 个 dispatch 条目 (#213-#241,跳过#238)，覆盖 AIO(io_setup/destroy/submit/getevents/cancel)/信号扩展(sigaltstack/rt_sigpending/rt_sigsuspend/rt_sigtimedwait/rt_sigqueueinfo/tkill/pidfd_send_signal/signalfd4/rt_tgsigqueueinfo)/sched_getaffinity/getcomm/closefrom/move_pages/getpriority/setpriority/fchdir/madvise/getrlimit/setrlimit/umask/sysinfo/prctl。
+> v31.0 新增 51 个 dispatch 条目 (#162-#212)，覆盖 poll/select/mprotect/ioctl/inotify/eventfd/timerfd/getdents/credentials/readlink/statx/copy_file_range/flock/posix_mq/posix_timer/lseek/access/nanosleep/sched_yield/getuid/getgid/geteuid/getegid/getppid/setsid/setpgid/getpgid/getsid/truncate/ftruncate/rename。
+> v30.0 新增 37 个 dispatch 条目 (#125-#161)，覆盖 epoll/futex/fcntl/sendfile/splice/SysV IPC/pread/pwrite/readv/writev/setsockopt/getsockopt/accept4/shutdown/getsockname/getpeername/socketpair/sendmsg/recvmsg/dup/dup3/recvmmsg/sendmmsg。
 
 | 编号 | 名称 | 功能 |
 |---|---|---|
@@ -577,11 +602,162 @@ LAPIC Timer 中断
 | 121 | getpgid | 获取进程组ID |
 | 122 | recvfrom | 接收数据 |
 | 123 | mkdir | 创建目录 |
-| 124 | getsid | 获取会话ID |
-| 140 | getpriority | 获取进程优先级 |
-| 141 | setpriority | 设置进程优先级 |
-| 202 | futex | 快速用户空间互斥锁 |
-| 213 | epoll_create1 | 创建epoll实例 |
+| 124 | connect | TCP socket连接 |
+| 125 | shutdown | 半关闭TCP连接 |
+| 126 | getsockname | 获取本地socket地址 |
+| 127 | getpeername | 获取远端socket地址 |
+| 128 | socketpair | 创建socket对 |
+| 129 | sendmsg | 发送消息 (msghdr+iov) |
+| 130 | recvmsg | 接收消息 (msghdr+iov) |
+| 131 | accept4 | 接受连接 (带标志) |
+| 132 | setsockopt | 设置socket选项 |
+| 133 | getsockopt | 获取socket选项 |
+| 134 | recvmmsg | 批量接收消息 |
+| 135 | sendmmsg | 批量发送消息 |
+| 136 | pread64 | 定位读取 |
+| 137 | pwrite64 | 定位写入 |
+| 138 | readv | 向量读取 (scatter I/O) |
+| 139 | writev | 向量写入 (gather I/O) |
+| 140 | preadv | 向量定位读取 |
+| 141 | pwritev | 向量定位写入 |
+| 142 | fcntl | 文件控制 |
+| 143 | futex | 快速用户空间互斥锁 |
+| 144 | sendfile | 零拷贝文件传输 |
+| 145 | splice | 管道数据拼接 |
+| 146 | epoll_create1 | 创建epoll实例 |
+| 147 | epoll_ctl | 控制epoll监视集 |
+| 148 | epoll_wait | 等待epoll事件 |
+| 149 | shmget | SysV 共享内存获取 |
+| 150 | shmat | SysV 共享内存附加 |
+| 151 | shmdt | SysV 共享内存分离 |
+| 152 | shmctl | SysV 共享内存控制 |
+| 153 | semget | SysV 信号量获取 |
+| 154 | semop | SysV 信号量操作 |
+| 155 | semctl | SysV 信号量控制 |
+| 156 | msgget | SysV 消息队列获取 |
+| 157 | msgsnd | SysV 消息队列发送 |
+| 158 | msgrcv | SysV 消息队列接收 |
+| 159 | msgctl | SysV 消息队列控制 |
+| 160 | dup | 复制文件描述符 |
+| 161 | dup3 | 复制fd (带O_CLOEXEC) |
+| 162 | poll | I/O多路复用 |
+| 163 | select | I/O多路复用 (fd_set) |
+| 164 | mprotect | 修改内存保护属性 |
+| 165 | ioctl | 设备控制 (terminal/FIONREAD/FIONBIO) |
+| 166 | inotify_init1 | 创建inotify实例 |
+| 167 | inotify_add_watch | 添加inotify监视 |
+| 168 | inotify_rm_watch | 移除inotify监视 |
+| 169 | eventfd | 创建eventfd |
+| 170 | timerfd_create | 创建定时器fd |
+| 171 | timerfd_settime | 设置定时器 |
+| 172 | timerfd_gettime | 获取定时器 |
+| 173 | getdents64 | 目录枚举 (linux_dirent64) |
+| 174 | setuid | 设置用户ID |
+| 175 | setgid | 设置组ID |
+| 176 | setreuid | 设置真实/有效用户ID |
+| 177 | setregid | 设置真实/有效组ID |
+| 178 | setresuid | 设置真实/有效/保存用户ID |
+| 179 | getresuid | 获取真实/有效/保存用户ID |
+| 180 | setresgid | 设置真实/有效/保存组ID |
+| 181 | getresgid | 获取真实/有效/保存组ID |
+| 182 | readlink | 读取符号链接 |
+| 183 | statx | 扩展文件状态查询 |
+| 184 | copy_file_range | 内核空间文件复制 |
+| 185 | flock | 文件锁 |
+| 186 | mq_open | POSIX消息队列打开 |
+| 187 | mq_unlink | POSIX消息队列取消链接 |
+| 188 | mq_timedsend | POSIX消息队列定时发送 |
+| 189 | mq_timedreceive | POSIX消息队列定时接收 |
+| 190 | mq_notify | POSIX消息队列通知 |
+| 191 | mq_getsetattr | POSIX消息队列属性 |
+| 192 | timer_create | 创建POSIX定时器 |
+| 193 | timer_settime | 设置POSIX定时器 |
+| 194 | timer_gettime | 获取POSIX定时器 |
+| 195 | timer_getoverrun | 获取定时器超期次数 |
+| 196 | timer_delete | 删除POSIX定时器 |
+| 197 | lseek | 文件定位 (SEEK_SET/CUR/END) |
+| 198 | access | 检查文件可访问性 |
+| 199 | nanosleep | TSC高精度睡眠 |
+| 200 | sched_yield | 让出CPU |
+| 201 | getuid | 获取用户ID |
+| 202 | getgid | 获取组ID |
+| 203 | geteuid | 获取有效用户ID |
+| 204 | getegid | 获取有效组ID |
+| 205 | getppid | 获取父进程ID |
+| 206 | setsid | 创建新会话 |
+| 207 | setpgid | 设置进程组ID |
+| 208 | getpgid | 获取进程组ID |
+| 209 | getsid | 获取会话ID |
+| 210 | truncate | 截断文件 (路径) |
+| 211 | ftruncate | 截断文件 (fd) |
+| 212 | rename | 重命名文件 |
+| 213 | io_setup | 创建AIO上下文 |
+| 214 | io_destroy | 销毁AIO上下文 |
+| 215 | io_submit | 提交AIO请求 |
+| 216 | io_getevents | 获取AIO完成事件 |
+| 217 | io_cancel | 取消AIO请求 |
+| 218 | sigaltstack | 设置/获取信号栈 |
+| 219 | rt_sigpending | 查询挂起信号 |
+| 220 | rt_sigsuspend | 挂起等待信号 |
+| 221 | rt_sigtimedwait | 等待信号 (带超时) |
+| 222 | rt_sigqueueinfo | 排队信号到进程 |
+| 223 | tkill | 发送信号到线程 |
+| 224 | pidfd_send_signal | 通过pidfd发信号 |
+| 225 | signalfd4 | 创建signalfd |
+| 226 | rt_tgsigqueueinfo | 排队信号到线程 |
+| 227 | sched_getaffinity | 获取CPU亲和性 |
+| 229 | getcomm | 获取进程名 |
+| 230 | closefrom | 批量关闭fd |
+| 231 | move_pages | NUMA页迁移 |
+| 232 | getpriority | 获取进程优先级 |
+| 233 | setpriority | 设置进程优先级 |
+| 234 | fchdir | 切换工作目录 (fd) |
+| 235 | madvise | 内存使用建议 |
+| 236 | getrlimit | 获取资源限制 |
+| 237 | setrlimit | 设置资源限制 |
+| 239 | umask | 设置文件创建掩码 |
+| 240 | sysinfo | 系统信息 |
+| 241 | prctl | 进程控制 (PR_SET/GET_NAME) |
+| 242 | getrandom | 获取随机数 (xoshiro256**) |
+| 243 | clone | 克隆进程/线程 (CLONE_VM/FILES/SETTLS) |
+| 244 | fsync | 同步文件到磁盘 |
+| 245 | fdatasync | 同步文件数据到磁盘 |
+| 246 | sync | 同步所有文件系统 |
+| 247 | clock_nanosleep | 时钟睡眠 (相对/绝对) |
+| 248 | epoll_pwait | epoll等待 (带信号掩码) |
+| 249 | getcpu | 获取当前CPU/NUMA节点 |
+| 250 | pipe2 | 创建管道 (O_CLOEXEC) |
+| 251 | mincore | 检查页面驻留 |
+| 252 | mlock | 锁定页面 |
+| 253 | munlock | 解锁页面 |
+| 254 | msync | 同步内存映射 |
+| 255 | openat | 打开文件 (相对dirfd) |
+| 256 | unlinkat | 删除文件 (相对dirfd) |
+| 257 | mkdirat | 创建目录 (相对dirfd) |
+| 258 | faccessat | 检查文件可访问 (*at) |
+| 259 | readlinkat | 读符号链接 (*at) |
+| 260 | fchmodat | 修改权限 (*at) |
+| 261 | renameat2 | 重命名 (带flags) |
+| 262 | vfork | 虚拟fork (委托fork) |
+| 263 | wait4 | 等待子进程 (含rusage) |
+| 264 | sethostname | 设置主机名 |
+| 265 | gethostname | 获取主机名 |
+| 266 | setdomainname | 设置域名 |
+| 267 | getdomainname | 获取域名 |
+| 268 | personality | 获取/设置进程personality |
+| 269 | clock_getres | 获取时钟精度 |
+| 270 | clock_settime | 设置时钟 (stub) |
+| 271 | mlockall | 锁定全部内存 (no-op) |
+| 272 | munlockall | 解锁全部内存 (no-op) |
+| 273 | sched_setaffinity | 设置CPU亲和性 |
+| 274 | fallocate | 预分配文件空间 (no-op) |
+| 275 | posix_fadvise | 文件访问建议 (no-op) |
+| 276 | statfs | 文件系统统计 |
+| 277 | fstatfs | 文件系统统计 (fd) |
+| 278 | syslog | 内核日志控制 |
+| 279 | reboot | 系统重启/停机 |
+| 280 | chroot | 改变根目录 |
+| 281 | acct | 进程记账 (no-op) |
 | 228 | clock_gettime | 获取高精度时间 |
 | 230 | clock_nanosleep | 时钟睡眠 |
 | 232 | epoll_wait | 等待epoll事件 |
@@ -912,7 +1088,7 @@ kernel/main.zig
   │   ├── ipv4.zig         — IPv4 协议
   │   ├── icmp.zig         — ICMP 协议
   │   ├── udp.zig          — UDP 协议
-  │   ├── tcp.zig          — TCP 协议 (1630行, Reno/SACK/WS/TS)
+  │   ├── tcp.zig          — TCP 协议 (Reno/SACK/WS/TS/CORK/QUICKACK)
   │   ├── socket.zig       — Socket 抽象层
   │   └── dhcp.zig / dns.zig — DHCP/DNS 客户端
   │
@@ -938,8 +1114,10 @@ kernel/main.zig
 4. **e1000/virtio-net 仅 QEMU**: 未测试真实硬件
 5. **无 Windows 兼容**: 当前仅支持 Linux ELF 二进制格式
 6. **无 IPv6**: 网络协议栈仅支持 IPv4
-7. **TCP 连接数限制**: 最大 16 个并发 TCP 连接 (32K 发送/接收缓冲)
+7. **TCP 连接数限制**: 最大 32 个并发 TCP 连接 (32K 发送/接收缓冲)
 8. **无分片重组**: IPv4 不支持分片重组 (MTU 1500 单帧)
+9. **AIO 同步执行**: io_submit 在持有 aio_lock 期间同步执行 I/O，不支持真正异步
+10. **copy_from_user 无 fault recovery**: 用户空间地址访问无 RIP-range guard (TODO)
 
 ---
 
@@ -949,25 +1127,27 @@ kernel/main.zig
 
 | 文件 | 行数 | 功能 |
 |---|---|---|
-| kernel/arch/x86_64/syscall_entry.zig | 7,082 | 系统调用入口 + 240 个处理函数 (薄 wrapper 模式) |
-| kernel/net/tcp.zig | 1,630 | TCP 协议 (Reno/SACK/WS/TS) |
-| kernel/fs/vfs.zig | 708 | 虚拟文件系统 + MAX_FDS=64 + procfs 路由 + inotify + allocFd |
-| kernel/arch/x86_64/idt.zig | 672 | 中断描述符表 + IRQ 分发 + COW #PF 处理 |
+| kernel/arch/x86_64/syscall_entry.zig | 4,542 | 系统调用入口 + 383 dispatch 条目 |
+| kernel/net/tcp.zig | 1,682 | TCP 协议 (Reno/SACK/WS/TS/CORK/QUICKACK + @memcpy环形缓冲区) |
+| kernel/fs/vfs.zig | ~720 | 虚拟文件系统 + MAX_FDS=64 + procfs 路由 + inotify + allocFd |
+| kernel/arch/x86_64/idt.zig | 786 | 中断描述符表 + IRQ 分发 + COW #PF 处理 |
 | kernel/drivers/virtio_net.zig | 548 | virtio-net 网卡驱动 |
 | kernel/drivers/e1000.zig | 453 | e1000 网卡驱动 (中断驱动) |
+| kernel/net/epoll.zig | 547 | epoll 事件多路复用 (LT/ET/ONESHOT + 位图优化) |
+| kernel/fs/page_cache.zig | ~556 | 统一页缓存 (1024页/512哈希槽/Clock替换+命中统计/8页预取) |
 | kernel/main.zig | 329 | 内核主函数 |
 | kernel/arch/x86_64/paging.zig | 293 | 页表管理 + getPagePhysAddr |
-| kernel/fs/ext2.zig | ~900 | ext2 文件系统 |
+| kernel/fs/ext2.zig | ~2035 | ext2 文件系统 (hardlink/symlink/unlink/chown/chmod) |
 | kernel/fs/fat32.zig | ~900 | FAT32 文件系统 |
 | kernel/proc/scheduler.zig | ~500 | O(1) 位图调度器 |
-| kernel/proc/task.zig | ~600 | Task 结构体 + 进程管理 |
+| kernel/proc/task.zig | ~704 | Task 结构体 + 进程管理 |
 | kernel/drivers/virtio_blk.zig | ~550 | virtio-blk 块设备驱动 |
 | kernel/drivers/nvme.zig | ~400 | NVMe SSD 驱动 |
 | kernel/mm/pmm.zig | 347 | 物理内存管理 (两级位图 + refcount + COW API) |
 | kernel/mm/slab.zig | ~200 | Slab 分配器 |
-| kernel/mm/swap.zig | ~300 | Swap 页面置换 (Clock算法) |
+| kernel/mm/swap.zig | ~267 | Swap 页面置换 (Clock算法 + u64位图@ctz分配) |
 | kernel/fs/eventfd.zig | 165 | eventfd 事件通知 |
 | kernel/fs/procfs.zig | 333 | procfs 11种虚拟文件 |
 | kernel/sync/ | ~600 | IrqSpinlock/TicketLock/Mutex/RwLock/SeqLock/MPMC |
 
-**总计: 102 个 .zig 文件, 35,899 行**
+**总计: 122 个 .zig 文件, 35,727 行**

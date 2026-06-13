@@ -81,6 +81,8 @@ const SlabClass = struct {
 | `kalloc(size) ?[]u8` | 在合适大小类分配 |
 | `kfree(ptr)` | 归还到对应大小类空闲链表 |
 
+**大分配 (v26.2)**: >1024 字节走 allocLarge 路径，单页用 pmm.allocPage，多页用 pmm.allocContiguous，header._pad 存页数供 kfree 释放。
+
 ### 1.3 分页 ✅ mapPages()/unmapPages() 批量接口，flushTlbAll()
 
 文件: `arch/x86_64/paging.zig`
@@ -156,12 +158,12 @@ const AddressSpace = struct {
 - 配套 munmap 解除映射和 msync 同步脏页
 - syscall mmap: 支持匿名映射 + 文件映射 (MAP_PRIVATE)，读取文件内容到物理页
 
-### 1.9 Swap 页面置换 (Clock算法 + 16MB swap + 水位线) ✅
+### 1.9 Swap 页面置换 (Clock算法 + u64位图分配 + 256MB swap) ✅
 
 文件: `swap.zig`, `arch/x86_64/paging.zig`
 
 - Clock二次机会算法页面回收
-- 4096槽swap位图管理16MB交换空间
+- 65536槽swap位图管理256MB交换空间，u64字级扫描+@ctz O(1)分配
 - virtio-blk后端读写swap页
 - 水位线自动触发内存回收
 - #PF缺页时自动swap-in
@@ -412,11 +414,11 @@ e1000 (中断驱动) / virtio-net (Virtqueue)
 - 校验和
 - 收发缓冲
 
-### 4.7 TCP ✅ Reno + SACK + Window Scaling + Timestamps + TIME_WAIT优化 + 扩容
+### 4.7 TCP ✅ Reno + SACK + Window Scaling + Timestamps + CORK + QUICKACK + TIME_WAIT优化
 
-文件: `tcp.zig` (1630 行)
+文件: `tcp.zig`
 
-- 16 个并发连接 (MAX_CONNECTIONS=16)，32KB 发送/接收缓冲区，32KB 窗口
+- 32 个并发连接 (MAX_CONNECTIONS=32)，32KB 发送/接收缓冲区，32KB 窗口
 - 完整 11 状态机：CLOSED / LISTEN / SYN_SENT / SYN_RCVD / ESTABLISHED / FIN_WAIT_1 / FIN_WAIT_2 / CLOSE_WAIT / CLOSING / LAST_ACK / TIME_WAIT
 - 序列号 / ACK / 窗口
 - Reno 拥塞控制：慢启动 / 拥塞避免 / 快速重传（3 个重复 ACK）/ 快速恢复
@@ -425,11 +427,15 @@ e1000 (中断驱动) / virtio-net (Virtqueue)
 - Window Scaling (RFC 7323)：SYN阶段协商窗口缩放因子（shift=7，最大窗口4MB）
 - Timestamps + PAWS：精确RTT测量，防止序列号环绕误判
 - Keepalive + Nagle 算法
+- TCP_CORK：合并小写入为满MSS段，uncork时flushSendBuffer发送所有待发数据 (v29.0)
+- TCP_QUICKACK：禁用延迟ACK，每个收到段立即发送ACK (v29.0)
+- SO_LINGER：linger=0时tcpClose发RST替代FIN（abortive close）(v29.0)
+- @memcpy批量环形缓冲区I/O：tcpSend/flushSendBuffer/processIncomingData/tcpRecv 4处逐字节→ringWrite/ringRead (v29.0)
 - TIME_WAIT 优化：30s→15s，新连接可复用 TIME_WAIT TCB (若序号更大)
 - 窗口更新ACK：应用读取数据后发送窗口更新ACK (超过 1 MSS 时)
-- 8 个并发连接，每连接 8KB 收发缓冲
-- TCB（Transmission Control Block）数组
-- 公开 API: `tcpGetAddrInfo()` (getsockname/getpeername), `tcpIsClosing()`
+- 延迟ACK：every-other-segment规则 + 100ms超时 + ACK捎带
+- TCB（Transmission Control Block）数组 + active_bitmap位图查找
+- 公开 API: `tcpGetAddrInfo()` (getsockname/getpeername), `tcpIsClosing()`, `tcpFlushCork()`, `tcpFlushAck()`
 
 ### 4.9 poll() 多路复用 ✅
 
@@ -448,6 +454,17 @@ e1000 (中断驱动) / virtio-net (Virtqueue)
 - sendmsg/recvmsg: 解析 msghdr，遍历 msg_iov 收发数据
 - getsockname/getpeername: 从 TCB 构造 sockaddr_in
 - accept4: 带 SOCK_NONBLOCK/SOCK_CLOEXEC 标志的 accept
+
+### 4.9 Unix Domain Socket ✅ (AF_UNIX, v28.0 @memcpy优化)
+
+文件: `unix_socket.zig`
+
+- SOCK_STREAM (连接可靠字节流) + SOCK_DGRAM (数据报)
+- 32 个套接字上限，8KB 环形缓冲区/套接字
+- bind/listen/accept/connect/send/recv 完整操作
+- @memcpy 批量环形缓冲区 I/O：ringWrite/ringRead 处理环形缓冲区边界，逐字节循环替换为 2 段 @memcpy（STREAM/DGRAM 读写各 2 处）
+- 阻塞 I/O：read_waiters/write_waiters 等待队列
+- 系统调用: socket(AF_UNIX) / socketpair
 
 ---
 
@@ -503,36 +520,37 @@ const CapTable = [32]Capability; // 每任务
 - poll集成：支持POLLIN/POLLOUT事件检测
 - 系统调用：#290 (eventfd2)
 
-### 5.4 SysV 共享内存 ✅ (v18.0)
+### 5.4 SysV 共享内存 ✅ (v18.0, v28.0优化)
 
-文件: `sysv_shm.zig` (426 行)
+文件: `sysv_shm.zig`
 
 - 32 个共享内存段上限，256 页/段 (1MB)
 - shmget: 创建/查找段，分配物理页并清零
 - shmat: 4 级页表映射到进程地址空间 (0x70000000 基址)，支持 SHM_RDONLY
-- shmdt: 解除映射，支持延迟删除 (IPC_RMID 标记)
-- shmctl: IPC_STAT/IPC_RMID/IPC_SET
+- shmdt: 解除映射，isMappedAt() 4级页表walk验证物理地址匹配，支持延迟删除 (IPC_RMID 标记)
+- shmctl: IPC_STAT/IPC_RMID/IPC_SET (权限mode更新)
+- findFreeRegion: next_free_hint O(n) 扫描，freeSegment 自动重置 hint
 - 系统调用: #29 (shmget), #30 (shmat), #31 (shmctl), #67 (shmdt)
 
-### 5.5 SysV 信号量 ✅ (v18.0)
+### 5.5 SysV 信号量 ✅ (v18.0, v28.0 IPC_SET)
 
-文件: `sysv_sem.zig` (179 行)
+文件: `sysv_sem.zig`
 
 - 16 个信号量集上限，32 信号量/集
 - semget: 创建/查找信号量集，IPC_CREAT/IPC_EXCL
-- semop: 简化 P/V 操作，会阻塞时返回 EAGAIN
-- semctl: IPC_RMID/IPC_STAT/SETVAL/GETVAL
+- semop: P/V 操作，P 操作用 sched.sleepOn 阻塞等待，V 操作用 wakeOne 唤醒等待者，IPC_RMID 用 wakeAll 通知
+- semctl: IPC_RMID/IPC_STAT/IPC_SET (权限mode更新)/SETVAL/GETVAL
 - 系统调用: #64 (semget), #65 (semop), #66 (semctl)
 
-### 5.5b SysV 消息队列 ✅ (v18.1)
+### 5.5b SysV 消息队列 ✅ (v18.1, v28.0 IPC_SET)
 
-文件: `sysv_msg.zig` (350 行)
+文件: `sysv_msg.zig`
 
 - 16 个队列上限，8 消息/队列，512 字节/消息
 - msgget: 创建/查找消息队列
 - msgsnd: 发送消息 (含 mtype 类型字段)
 - msgrcv: 接收消息，支持按类型过滤 (正/负/零)
-- msgctl: IPC_STAT/IPC_RMID/IPC_SET
+- msgctl: IPC_STAT/IPC_RMID/IPC_SET (权限mode更新)
 - 系统调用: #68 (msgget), #69 (msgsnd), #70 (msgrcv), #71 (msgctl)
 
 ### 5.6 POSIX 消息队列 ✅ (v18.0)
@@ -734,7 +752,7 @@ const TicketSpinlock = struct {
 
 源码: `kernel/smp.zig`, `kernel/proc/{sched,task,waitpid}.zig`, `kernel/arch/x86_64/{gdt,idt,lapic,syscall_entry}.zig`
 
-### 9.1 当前状态（M8-5b-2d，2026-06-07） ✅ 双核 3/3 稳定到 shell
+### 9.1 当前状态（v27.0，2026-05-29） ✅ 双核稳定到 shell
 
 | 能力 | 状态 |
 |---|---|
@@ -744,7 +762,7 @@ const TicketSpinlock = struct {
 | APIC id 来自 MADT + `lapic.id()` 刷新 | ✅ |
 | 跨核 `waitpid`（`wait_cpu` + `kickChildCpus`） | ✅ |
 | `Task.saved_user_rsp` + 切换同步 | ✅ 5b-2d |
-| round-robin flat@AP | ⬜ 5b-2e |
+| AP 栈 allocContiguous + BSP reap setSlice(1) + TLB EOI + sleepOn forceReschedule | ✅ v27.0 |
 | AP 上 ELF 用户任务并行 | ⬜ 5b-2c |
 | FPU/SSE 按任务 | ⬜ 5b-3 |
 | 范围 TLB shootdown | ⬜ M8-6 |

@@ -1,6 +1,6 @@
 # MoQiOS 实施计划
 
-> **版本**: v21.7
+> **版本**: v51.0
 > **日期**: 2026-05-29
 > **说明**: 本文档记录 MoQiOS 的实际实施进度和已完成里程碑。
 > 长期设计目标参见 [moqios-design.md](./moqios-design.md)，当前架构参见 [moqios-architecture-current.md](./moqios-architecture-current.md)。
@@ -9,15 +9,15 @@
 
 ## 当前状态
 
-- **内核**: 30,362 行 Zig, 121 个源文件
-- **系统调用**: ~40 个 dispatch 条目 (MoQiOS 自定义编号), 48 个函数已提取到独立模块
+- **内核**: 36,184 行 Zig, 122 个源文件
+- **系统调用**: 383 个 dispatch 条目 (max #471, #0-#330 连续 + #424-#471 Linux标准编号完全连续), 58 个函数已提取到独立模块
 - **模块提取**: 26 个独立模块文件 (fs/mm/proc/net/sync/arch)
 - **自动化测试**: 29 个 (hello2-hello27, init.S) + 交互式 Shell
 - **测试稳定性**: 29/29 通过 (KVM -smp 1)
 - **最大进程数**: 64
 - **每进程文件描述符**: 64
-- **文件系统**: FAT32 (virtio-blk) + ramdisk + ext2 (读写) + tmpfs + procfs (11种虚拟文件) + 统一页缓存
-- **网络**: e1000 (中断驱动) + virtio-net + TCP Reno/SACK/WS/TS (16连接/32K缓冲/16 backlog) + Socket API + epoll (128项/32实例) + eventfd + timerfd + UDP sendto/recvfrom
+- **文件系统**: FAT32 (virtio-blk) + ramdisk + ext2 (读写, 完整 symlink/hardlink/chown/chmod) + tmpfs + procfs (11种虚拟文件) + 统一页缓存
+- **网络**: e1000 (中断驱动) + virtio-net + TCP Reno/SACK/WS/TS/CORK/QUICKACK (32连接/32K缓冲/32 backlog) + Socket API + epoll (128项/32实例/位图优化) + eventfd + timerfd + UDP sendto/recvfrom/bind/connect
 - **多核**: SMP 支持 (BSP + AP, O(1)位图调度器, Per-CPU 队列, Work Stealing)
 - **同步**: IrqSpinlock + TicketLock + Mutex + RwLock + SeqLock + futex + 无锁MPMC
 
@@ -782,6 +782,49 @@
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| v24.0 | 2026-05-29 | listen_slots bitmap: 添加listen_active_bitmap, tcpListen/handleIncomingSyn/tcpAccept三处listen_slots线性扫描改为@ctz位图迭代, 31309行内核 |
+| v25.0 | 2026-05-29 | writeback位图优化: 添加in_use_bm/dirty_bm(2×u64), 11处BUFFER_COUNT=128线性扫描改为@ctz位图迭代, getDirtyCount用@popCount O(1), 31378行内核 |
+| v25.1 | 2026-05-29 | epoll collectEvents bug修复: ready list遍历在清除ready_next前先保存next指针, 修复只处理链表首元素的bug |
+| v25.2 | 2026-05-29 | TCP ringAvailable修复: 移除有bug的ringUsed死代码, ringAvailable改为基于ringDataLen的正确计算(size-used-1), 消除tail<head时的溢出 |
+| v25.3 | 2026-05-29 | epoll位图优化: 添加valid_epoll_bm(u32)和per-instance in_use_bm(2×u64), epollNotify/epollCtl全路径位图迭代, 跳过空实例和空槽位, 31405行内核 |
+| v26.0 | 2026-05-29 | tmpfs零拷贝: 3处byte-by-byte循环替换为@memcpy/@memset(tmpfsRead读/零填充/tmpfsWrite写), 编译器SIMD优化, 31405行内核 |
+| v26.1 | 2026-05-29 | tmpfs active_bitmap: 添加active_bm(u64)位图+bmSet/bmClr, allocEntry用@ctz(~active_bm)O(1)分配, findEntry/unlink/listDir全路径位图迭代, 31450行内核 |
+| v26.2 | 2026-05-29 | slab多页分配: allocLarge支持>1024字节的大分配, 多页用pmm.allocContiguous, header._pad存页数, kfree多页释放读_pad循环freePage, 31480行内核 |
+| v26.3 | 2026-05-29 | page_cache dirty位图: 添加dirty_bm[4×u64]256位, flushAll/getStats从O(256)线性扫描优化为@ctz位图迭代+@popCount, writePage/flushInode/removePage维护位图, 31620行内核 |
+| v26.4 | 2026-05-29 | sysv_sem semop阻塞: 添加wait_queue到SemSet, semop P操作用sched.sleepOn阻塞替代EAGAIN, V操作用wakeOne唤醒, IPC_RMID用wakeAll通知等待者, 31747行内核 |
+| v33.0 | 2026-05-29 | syscall dispatch 第三轮补全+POSIX *at()系列: 新增20个dispatch条目(#242-#261), 接线getrandom(xoshiro256** PRNG)+clone(CLONE_VM/CLONE_FILES/CLONE_SETTLS); 新实现fsync/fdatasync(VFS syncFile)/sync(syncAll)/clock_nanosleep(TSC+TIMER_ABSTIME)/epoll_pwait/getcpu(PerCpu)/pipe2(O_CLOEXEC)/mincore/mlock/munlock/msync; *at()系列openat/unlinkat/mkdirat/faccessat/readlinkat/fchmodat/renameat2; 修复clone.zig createUserProcess 5参数签名; 32958行内核 |
+| v34.0 | 2026-05-29 | syscall dispatch 第四轮补全: 新增20个dispatch条目(#262-#281), vfork→fork/wait4(rusage置零)/sethostname+gethostname+setdomainname+getdomainname(全局64字节存储)/personality(读写Task.personality)/clock_getres(1ns精度)/clock_settime(stub)/mlockall+munlockall(no-op)/sched_setaffinity(最低set bit→cpu_affinity u8)/fallocate+posix_fadvise(no-op)/statfs+fstatfs(ext2 120字节struct)/syslog(类型分发)/reboot(triple fault重启或hlt停机)/chroot(接受并记录)/acct(no-op); 33319行内核 |
+| v35.0 | 2026-05-29 | 全面消除ENOSYS缺口: socket() SOCK_RAW(新增raw_socket fd_type+e1000 sendPacket/receivePacket读写); futex PI(FUTEX_LOCK_PI CAS+阻塞/UNLOCK_PI 写0+唤醒/TRYLOCK_PI 非阻塞CAS/WAIT_REQUEUE_PI+CMP_REQUEUE_PI no-op); AIO扩展(IOCB_CMD_FSYNC+FDSYNC writeback刷盘/IOCB_CMD_NOOP); wait4 WNOHANG支持(waitpidWithOptions分离阻塞/非阻塞路径); IPC receive事件阻塞(forceReschedule+pending_msg投递替代自旋); epoll raw_socket case; 清理FUTEX_BITSET错位常量+AIO ENOSYS未用导入; 33486行内核 |
+| v36.0 | 2026-05-29 | 性能最优先功能补全: 新增16个syscall dispatch(#238 prlimit64跨进程资源限制/#282 unshare/#283-284 process_vm_readv/writev跨进程内存访问/#285 memfd_create匿名管道fd/#286-287 get/set_robust_list/#288-289 mount/umount2接线vfs.mountFs+umountFs/#290 sync_file_range/#291 readahead/#292-293 ioprio_set/get实际映射task.priority/#294 vmsplice用户页拼接管道/#295 name_to_handle_at路径哈希句柄/#296 open_by_handle_at EOPNOTSUPP); Task结构体新增robust_list_head/robust_list_len; vfs.allocPipe公开化+page_cache.recordAccess接入ext2/fat32读路径(顺序检测+预取提示); AHCI注册io_sched设备(端口级I/O调度器); 34024行内核, 221 dispatch条目 |
+| v37.0 | 2026-05-29 | MoQiOS原生IPC接线+性能优化补全: 新增14个syscall dispatch(#297-#310), 接线MoQiOS原生IPC模块(ipc.zig全量8个syscall: moqipc_create_ep/destroy_ep/send/recv/call/reply/notify/get_notify, 256字节Message端点消息传递+死锁检测+call depth限制); kcmp(进程资源比较: KCMP_FILE/VM/FILES/FS); capget/capset(POSIX capability读写); sched_setattr/sched_getattr(SCHED_FIFO/RR/OTHER/BATCH/DEADLINE策略+priority映射); membarrier(x86_64 MFENCE指令); 替换3个no-op为真实实现: msync→vfs.syncAll脏缓冲刷盘/mlock+munlock→MmapRegion.locked标记/posix_fadvise→page_cache.recordAccess顺序检测; Task新增sched_policy字段+MmapRegion新增locked字段; 34472行内核, 235 dispatch条目 |
+| v51.0 | 2026-05-29 | ext2 chown/chmod持久化+预取性能优化: 新增setOwner/setOwnerByInode/setMode/setModeByInode/getInodeNumFromOpen公开函数; chmod(#90)/fchmod(#91)从accept升级为真实ext2 mode写入(保留文件类型位,替换权限位); chown(#92)/fchown(#93)/lchown(#94)从accept升级为真实ext2 uid/gid写入(0xFFFF保持不变); fchmodat2(#452)从accept升级为委托chmod; page_cache PREFETCH_WINDOW 4→8(顺序读预取窗口翻倍,提升大文件吞吐); 36184行内核, 383 dispatch条目 |
+| v50.0 | 2026-05-29 | ext2 symlink基础设施完善: resolveParent新增中间路径组件符号链接解析(walkPathInner递归,绝对/相对路径正确起始inode)/readSymlinkByPath公开接口(路径→symlink target)/unlinkFile正确支持symlink(短链接不释放block[]inline目标,长链接只释放block[0])+hardlink(links_count>1只递减不释放blocks/inode)/readlink.zig ext2支持(readSymlinkByPath fallback); 36043行内核, 383 dispatch条目 |
+| v49.0 | 2026-05-29 | ext2 hardlink+symlink+symlink解析: 新增createHardlink(解析oldpath→inode+addDirEntry+links_count递增)/createSymlink(分配inode mode=0xA1FF+i_block内联短符号链接/data block长符号链接+file_type=7)/walkPathInner(递归symlink解析,深度限制8级ELOOP)/readSymlinkTarget(短链接i_block内联+长链接静态缓冲区)/walkPathToInode(路径→inode号); link()#86/symlink()#88从accept升级为真实ext2实现(copyFromUser+ext2调用); 35978行内核, 383 dispatch条目 |
+| v48.0 | 2026-05-29 | 性能容量全面提升: page_cache MAX_PAGES 256→1024(4MB缓存数据)/CACHE_SLOTS 128→512(哈希表4x)/INODE_LIST_SLOTS 64→256/MAX_PREFETCH_TRACK 8→32/dirty_bm [4]→[16]u64参数化; writeback BUFFER_COUNT 128→512(4x写合并); TCP MAX_CONNECTIONS 32→64(u32→u64 bitmap)/SEND_BUF_SIZE+RECV_BUF_SIZE 32KB→64KB; 35759行内核, 383 dispatch条目 |
+| v47.0 | 2026-05-29 | COW正确性修复+Linux#463-471: 修复handleCowFault关键bug(COW分配新页后未decRef旧共享页→内存泄漏,现正确释放引用计数); 新增9个Linux标准编号(#463-466 xattr-at系列ENOSYS/#467open_tree_attr/#468file_getattr/#469file_setattr/#470listns ENOSYS/#471rseq_slice_yield); #424-#471完全连续; 35758行内核, 383 dispatch条目 |
+| v46.0 | 2026-05-29 | COW fork性能优化+Linux#457-462: fork()从深拷贝改为Copy-on-Write(cloneUserPagesCow共享物理页+标记RO+COW bit,首次写时由#PF handler分配私有页,fork延迟从O(pages*4KB)降至O(页表项)); 新增6个Linux标准编号(#457statmount/#458listmount/#459-461lsm_get/set/list_self_attr/#462mseal内存封印); #424-#462完全连续; 35727行内核, 374 dispatch条目 |
+| v45.0 | 2026-05-29 | Linux标准编号424-456修正+完整覆盖: 删除v44.0错误MoQiOS自定义编号(#335-#343,与Linux uretprobe/uprobe冲突); 修正#424→pidfd_send_signal(原错设pidfd_getfd)/#425→io_uring_setup(原错设faccessat2); 新增#426-#433(io_uring_enter/register+open_tree/move_mount/fsopen/fsconfig/fsmount/fspick); 新增#440process_madvise/#444landlock_create_ruleset/#445landlock_add_rule/#446landlock_restrict_self/#447memfd_secret/#448process_mrelease(移至正确编号)/#450set_mempolicy_home_node(移至正确编号); 新增#452fchmodat2/#453map_shadow_stack/#454futex_wake→futex(op=1)/#455futex_wait→futex(op=0)/#456futex_requeue→futex(op=3); 424-456完全连续无缺口; 35607行内核, 368 dispatch条目 |
+| v44.0 | 2026-05-29 | Linux标准编号335-451扩展: 新增13个dispatch条目(359总计, max#451), io_uring系列ENOSYS(#335io_uring_setup/#336io_uring_enter/#337io_uring_register); 新mount API系列(#338open_tree/#339move_mount/#340fsopen/#341fsconfig/#342fsmount/#343fspick); 高级syscall(mount_setattr#442/quotactl_fd#443/process_mrelease#445/set_mempolicy_home_node#447); 35587行内核, 359 dispatch条目 |
+| v43.0 | 2026-05-29 | alarm/itimer定时器集成修复: alarm()移除立即sendSignal调用(仅设deadline); BSP timer tick新增alarm_deadline/itimer_real_value过期检查(遍历所有任务,TSC纳秒精度); ITIMER_REAL interval自动重调度(now_ns+interval); SIGALRM(signal 14)通过signal.sendSignal正确延迟触发; sched.zig新增tsc+signal模块导入; 35534行内核, 346 dispatch条目 |
+| v42.0 | 2026-05-29 | Linux标准编号331+扩展: 新增15个dispatch条目(346总计, max#451), 扩展Linux x86_64 ABI至#451; 别名接线(statx#331/io_pgetevents#332/pidfd_send_signal#334/pidfd_getfd#424/faccessat2#425/pidfd_open#434/close_range#436/openat2#437/pidfd_getfd#438/faccessat2#439); 新实现clone3(#435,clone_args结构体解析+委托clone_mod)/epoll_pwait2(#441,timespec→ms转换+委托epollWait)/futex_waitv(#449,接线futex.futexWaitv)/cachestat(#451,page_cache.getStats查询)/rseq(#333,注册接受); 35510行内核, 346 dispatch条目 |
+| v41.0 | 2026-05-29 | no-op替换为真实实现: madvise→WILLNEED/SEQUENTIAL预热页缓存(page_cache.recordAccess)+DONTNEED解锁MmapRegion; posix_fadvise DONTNEED→page_cache.invalidateInode真实驱逐; execveat(AT_FDCWD,flags=0)→委托syscallExecve实现; fallocate(mode=0)→ext2.truncateFile预分配空间; prctl PR_SET_PDEATHSIG→存储pdeathsig到Task+新增PR_GET_PDEATHSIG(#2)读回; Task新增pdeathsig字段; 35369行内核, 331 dispatch条目, 0缺口 |
+| v40.0 | 2026-05-29 | 全面消除dispatch缺口(0缺口): 新增25个dispatch条目(331总计, max#330), Linux标准编号#0-#330完全连续覆盖; 补齐SysV IPC别名(#29shmget/#30shmat/#31shmctl/#64semget/#65semop/#66semctl/#67shmdt/#68msgget/#69msgsnd/#70msgrcv/#71msgctl); 补齐文件操作(#72fcntl/#78getdents→getdents64/#86link/#88symlink/#92chown/#93fchown/#94lchown); 新实现getitimer/setitimer(ITIMER_REAL TSC deadline+interval)/pause(forceReschedule+EINTR); fchdir(#81)从no-op升级为chdir_mod.fchdir真实实现; Task新增itimer_real_value/itimer_real_interval字段; 35272行内核, 331 dispatch条目, 0缺口 |
+| v39.0 | 2026-05-29 | Linux标准syscall编号兼容+新功能实现: 新增59个dispatch条目(306总计, max#326), 大规模添加Linux x86_64标准编号别名(#17pread64/#18pwrite64/#19readv/#20writev/#21access/#23select/#24sched_yield/#25mremap/#26msync/#27mincore/#28madvise/#32dup/#35nanosleep/#37alarm/#39getpid/#40sendfile/#41-55全部socket系列/#56clone/#58vfork/#60exit/#61wait4/#73flock/#74fsync/#75fdatasync/#76truncate/#77ftruncate/#79getcwd/#80chdir/#81fchdir/#82rename/#83mkdir/#84rmdir/#85creat/#87unlink/#89readlink/#90chmod/#91fchmod/#95umask/#97getrlimit/#98getrusage/#99sysinfo); 新实现mremap(MmapRegion缩扩容)/getrusage(TSC时间+70/30用户/系统分割+maxrss)/dup(allocFd+dup2)/alarm(SIGALRM信号); Task新增alarm_deadline字段; fchmodat从no-op升级为实际接受; 35077行内核, 306 dispatch条目 |
+| v38.0 | 2026-05-29 | capability接线+pidfd+现代syscall: 新增12个dispatch(#311-#322), 接线MoQiOS capability模块(capability.zig全量3个syscall: moqipc_grant_cap/revoke_cap/check_cap, 基于端点的capability权限控制); close_range批量关闭fd; pidfd_open/send_signal/getfd(进程文件描述符API); swapon/swapoff接线swap.zig; openat2/faccessat2/execveat现代*at()变体; 替换3个no-op为真实实现: clock_settime→TSC偏移+wall_clock_offset/mlockall→MmapRegion.locked全标记/munlockall→全清除; time_syscall.zig新增wallClockNanos()统一墙钟时间; 34740行内核, 247 dispatch条目 |
+| v32.0 | 2026-05-29 | syscall dispatch 第二轮大规模补全: 新增27个dispatch条目(#213-#241,跳过#238), 接线AIO(io_setup/destroy/submit/getevents/cancel)+信号扩展(sigaltstack/rt_sigpending/rt_sigsuspend/rt_sigtimedwait/rt_sigqueueinfo/tkill/pidfd_send_signal/signalfd4/rt_tgsigqueueinfo)+misc(sched_getaffinity/getcomm/closefrom/move_pages)+优先级(getpriority/setpriority)+fchdir; 新实现madvise/getrlimit/setrlimit/umask/sysinfo/prctl(PR_SET_NAME/PR_GET_NAME); 4个新模块导入; 32709行内核 |
+| v31.0 | 2026-05-29 | syscall dispatch 大规模补全: 新增51个dispatch条目(#162-#212), 接线15个已有模块(poll/select/mprotect/ioctl/inotify/eventfd/timerfd/getdents/credentials/readlink/statx/copy_file_range/flock/posix_mq/posix_timer) + 新增实现16个syscall(lseek SEEK_SET/CUR/END/access F_OK文件存在性检查/nanosleep TSC精确睡眠/sched_yield forceReschedule/getuid/getgid/geteuid/getegid/getppid 从Task字段读取/setsid 新建会话/setpgid/getpgid/getsid 进程组管理/truncate/ftruncate ext2截断/rename ext2重命名); 15个新模块导入; 32421行内核 |
+| v30.0 | 2026-05-29 | syscall dispatch大规模接线: 新增37个dispatch条目(#125-#161+228)涵盖shutdown/getsockname/getpeername/socketpair/sendmsg/recvmsg/accept4/setsockopt/getsockopt/recvmmsg/sendmmsg/pread64/pwrite64/readv/writev/preadv/pwritev/fcntl/futex/sendfile/splice/epoll_create1/epoll_ctl/epoll_wait/shmget/shmat/shmdt/shmctl/semget/semop/semctl/msgget/msgsnd/msgrcv/msgctl/dup/dup3; pread/pwrite独立实现; AIO executePread/Pwrite接入真实VFS I/O; page cache命中/未中统计; UDP bind/connect+connected send; Task.wait_queue类型修复; ringDataLen comptime移除; 31968行内核 |
+| v29.0 | 2026-05-29 | TCP性能增强: 环形缓冲区@memcpy批量I/O(tcpSend/flushSendBuffer/processIncomingData/tcpRecv 4处逐字节→ringWrite/ringRead), TCP_CORK合并小包为MSS段(HTTP关键), TCP_QUICKACK禁用延迟ACK(降低RTT), SO_LINGER linger=0发RST替代FIN(abortive close), 31629行内核 |
+| v28.0 | 2026-05-29 | 性能优化v4: swap.zig allocSlot/freeSlot u64位图+@ctz(65536 slots, 比字节级扫描快8x), sysv_shm.zig isMappedAt()4级页表walk替代stub返回true+findFreeRegion next_free_hint O(n²→O(n)), unix_socket.zig @memcpy批量环形缓冲区I/O(STREAM/DGRAM读写4处逐字节→2段@memcpy), SysV IPC三件套IPC_SET实现(sem/shm/msg权限mode更新), 31540行内核 |
+| v27.0 | 2026-05-29 | SMP多核修复: AP栈allocContiguous物理连续(防跨页#PF), BSP timerTick reap路径setSlice(1)防调度间隙, TLB shootdown EOI先于CR3 reload, sleepOn调用forceReschedule立即阻塞, 移除废弃mapApStack, 31734行内核 |
+| v23.2 | 2026-05-29 | 页缓存per-inode链表: flushInode/invalidateInode从O(MAX_PAGES=256)线性扫描优化为O(inode_pages)链表遍历, 新增inode_list_heads+inodeListInsert/inodeListRemove, 31300行内核 |
+| v23.1 | 2026-05-29 | ext2位图64位字扫描: allocBlock/allocInode从逐位扫描优化为@ctz(~word)64位块扫描, 速度提升~64x, 31286行内核 |
+| v23.0 | 2026-05-29 | TCP active_bitmap: 添加tcb_active_bitmap位图, 13处TCB线性扫描改为@ctz位图迭代(findTcbByTuple/findTcbByLocalPort/timerTick/allocTcb/tcpBind等), deactivateTcb统一管理释放, 指针→索引用tcbIdx, 31232行内核 |
+| v22.4 | 2026-05-29 | TCP延迟ACK: every-other-segment规则+100ms超时+ACK捎带(piggyback), 减少约50%ACK包, processIncomingData/timerTick/tcpRecv/flushSendBuffer/FIN全路径集成, 31220行内核 |
+| v22.3 | 2026-05-29 | ext2零拷贝缓存: cacheLookupPtr直接返回缓存内部指针, resolveBlock/findDirEntry/listDir/readInode消除allocPage+memcpy+freePage开销, 31181行内核 |
+| v22.2 | 2026-05-29 | ext2块缓存哈希索引: 64条目块缓存从O(n)线性扫描升级为O(1)哈希查找(cacheHashFn+cacheHashInsert+cacheHashRemove), 31142行内核 |
+| v22.1 | 2026-05-29 | 页缓存顺序预读: page_cache.zig添加PrefetchTracker顺序访问检测, ext2.zig集成prefetchPages预读后续4页, 31097行内核 |
+| v22.0 | 2026-05-29 | SMP用户任务轮询分配: assignCpuAffinity改为round-robin跨CPU分配用户任务, 31050行内核 |
 | v21.7 | 2026-05-29 | @memcpy/ptrCast消除: 8个文件34处ptrCast内存读写替换为bo.writeU32Le/writeU64Le/readU64Le, 新增writeI64Le, 代码更清晰, 30260行内核(-2行) |
 | v21.6 | 2026-05-29 | fcntl FD复制去重: 提取dupFd辅助函数统一F_DUPFD/F_DUPFD_CLOEXEC重复逻辑(槽位扫描+fd复制+pipe引用计数), 30262行内核(-12行) |
 | v21.5 | 2026-05-29 | FD分配去重: allocTcpFd/allocUnixFd/vfs.open/inotify_init1复用FdTable.allocFd(), 消除4处重复FD槽位扫描, 30274行内核(-16行) |
