@@ -12,15 +12,15 @@
 /// The page cache sits between VFS and block device drivers:
 ///   readPage(inode, offset) → check cache → miss → read from disk → cache
 ///   writePage(inode, offset, data) → write to cache → mark dirty → writeback
-
 const serial = @import("../arch/x86_64/serial.zig");
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 const PAGE_SIZE: u64 = 4096;
-const CACHE_SLOTS: u32 = 128;
-const MAX_PAGES: u32 = 256; // Max cached pages
+const CACHE_SLOTS: u32 = 512;
+const MAX_PAGES: u32 = 1024; // Max cached pages (4MB cached data)
+const DIRTY_BM_WORDS: u32 = (MAX_PAGES + 63) / 64;
 
 pub const CacheKey = struct {
     inode_id: u64,
@@ -35,6 +35,7 @@ pub const CachedPage = struct {
     referenced: bool = true, // For clock algorithm
     valid: bool = false,
     hash_next: ?u16 = null, // Chain link in hash bucket
+    inode_next: ?u16 = null, // Chain link in per-inode list
     lru_next: ?u16 = null, // LRU list link
     lru_prev: ?u16 = null,
 };
@@ -42,8 +43,61 @@ pub const CachedPage = struct {
 var pages: [MAX_PAGES]CachedPage = undefined;
 var page_count: u32 = 0;
 
+// Dirty bitmap: DIRTY_BM_WORDS x u64 = 1024 bits for MAX_PAGES slots
+var dirty_bm: [DIRTY_BM_WORDS]u64 = @splat(0);
+
+inline fn dirtySet(slot: u16) void {
+    const idx: u8 = @intCast(slot);
+    dirty_bm[idx / 64] |= @as(u64, 1) << @intCast(idx % 64);
+}
+
+inline fn dirtyClr(slot: u16) void {
+    const idx: u8 = @intCast(slot);
+    dirty_bm[idx / 64] &= ~(@as(u64, 1) << @intCast(idx % 64));
+}
+
+inline fn dirtyTest(slot: u16) bool {
+    const idx: u8 = @intCast(slot);
+    return (dirty_bm[idx / 64] & (@as(u64, 1) << @intCast(idx % 64))) != 0;
+}
+
 // Hash table
 var hash_buckets: [CACHE_SLOTS]?u16 = @splat(null);
+
+// Per-inode page lists: inode_list_heads[inode_id % INODE_LIST_SLOTS] → slot chain
+const INODE_LIST_SLOTS: u32 = 256;
+var inode_list_heads: [INODE_LIST_SLOTS]?u16 = @splat(null);
+
+fn inodeListSlot(inode_id: u64) u32 {
+    return @intCast(inode_id % INODE_LIST_SLOTS);
+}
+
+fn inodeListInsert(slot: u16) void {
+    const s: usize = slot;
+    const ls = inodeListSlot(pages[s].key.inode_id);
+    pages[s].inode_next = inode_list_heads[ls];
+    inode_list_heads[ls] = slot;
+}
+
+fn inodeListRemove(slot: u16) void {
+    const s: usize = slot;
+    const ls = inodeListSlot(pages[s].key.inode_id);
+    var prev: ?u16 = null;
+    var cur = inode_list_heads[ls];
+    while (cur) |c| {
+        if (c == slot) {
+            if (prev) |p| {
+                pages[p].inode_next = pages[s].inode_next;
+            } else {
+                inode_list_heads[ls] = pages[s].inode_next;
+            }
+            pages[s].inode_next = null;
+            return;
+        }
+        prev = cur;
+        cur = pages[c].inode_next;
+    }
+}
 
 // LRU list (doubly-linked, most-recent at head)
 var lru_head: ?u16 = null;
@@ -57,6 +111,10 @@ var free_head: ?u16 = null;
 
 var cache_lock: IrqSpinlock = .{};
 
+// Hit/miss counters
+var cache_hits: u64 = 0;
+var cache_misses: u64 = 0;
+
 /// Initialize the page cache.
 pub fn init() void {
     // Initialize all pages as free
@@ -66,6 +124,7 @@ pub fn init() void {
         pages[i].data = undefined;
         pages[i].dirty = false;
         pages[i].hash_next = null;
+        pages[i].inode_next = null;
         pages[i].lru_prev = null;
         if (i + 1 < MAX_PAGES) {
             pages[i].lru_next = @intCast(i + 1);
@@ -78,6 +137,10 @@ pub fn init() void {
     lru_head = null;
     lru_tail = null;
     clock_hand = 0;
+    dirty_bm = @splat(0);
+    cache_hits = 0;
+    cache_misses = 0;
+    for (0..INODE_LIST_SLOTS) |i| inode_list_heads[i] = null;
 }
 
 /// Hash function for cache key.
@@ -108,6 +171,7 @@ pub fn readPage(inode_id: u64, page_offset: u64) ?*[PAGE_SIZE]u8 {
             pages[s].key.page_offset == page_offset)
         {
             // Cache hit
+            cache_hits += 1;
             pages[s].referenced = true;
             // Move to LRU head
             moveToHead(s);
@@ -116,6 +180,7 @@ pub fn readPage(inode_id: u64, page_offset: u64) ?*[PAGE_SIZE]u8 {
         slot = pages[s].hash_next;
     }
 
+    cache_misses += 1;
     return null;
 }
 
@@ -139,6 +204,7 @@ pub fn writePage(inode_id: u64, page_offset: u64, src_data: *const [PAGE_SIZE]u8
             @memcpy(pages[s].data, src_data);
             pages[s].dirty = true;
             pages[s].referenced = true;
+            dirtySet(s);
             moveToHead(s);
             return pages[s].data;
         }
@@ -153,6 +219,7 @@ pub fn writePage(inode_id: u64, page_offset: u64, src_data: *const [PAGE_SIZE]u8
     pages[new_slot].valid = true;
     pages[new_slot].dirty = true;
     pages[new_slot].referenced = true;
+    dirtySet(new_slot);
 
     // Copy data
     @memcpy(pages[new_slot].data, src_data);
@@ -160,6 +227,9 @@ pub fn writePage(inode_id: u64, page_offset: u64, src_data: *const [PAGE_SIZE]u8
     // Insert into hash bucket (at head)
     pages[new_slot].hash_next = hash_buckets[bucket];
     hash_buckets[bucket] = @intCast(new_slot);
+
+    // Insert into per-inode list
+    inodeListInsert(new_slot);
 
     // Insert into LRU list at head
     moveToHead(new_slot);
@@ -188,6 +258,8 @@ pub fn insertPage(inode_id: u64, page_offset: u64, data: *const [PAGE_SIZE]u8) ?
     pages[new_slot].hash_next = hash_buckets[bucket];
     hash_buckets[bucket] = @intCast(new_slot);
 
+    inodeListInsert(new_slot);
+
     moveToHead(new_slot);
     page_count += 1;
 
@@ -196,18 +268,23 @@ pub fn insertPage(inode_id: u64, page_offset: u64, data: *const [PAGE_SIZE]u8) ?
 
 /// Flush all dirty pages for a given inode.
 /// Calls the provided writeback function for each dirty page.
+/// Uses per-inode linked list for O(pages_of_inode) instead of O(MAX_PAGES).
 pub fn flushInode(inode_id: u64, writeback_fn: *const fn (u64, u64, *[PAGE_SIZE]u8) bool) u32 {
     const flags = cache_lock.acquire();
     defer cache_lock.release(flags);
 
     var flushed: u32 = 0;
-    for (0..MAX_PAGES) |i| {
-        if (pages[i].valid and pages[i].dirty and pages[i].key.inode_id == inode_id) {
-            if (writeback_fn(inode_id, pages[i].key.page_offset, pages[i].data)) {
-                pages[i].dirty = false;
+    var slot = inode_list_heads[inodeListSlot(inode_id)];
+    while (slot) |s| {
+        const next = pages[s].inode_next;
+        if (pages[s].valid and pages[s].dirty and pages[s].key.inode_id == inode_id) {
+            if (writeback_fn(inode_id, pages[s].key.page_offset, pages[s].data)) {
+                pages[s].dirty = false;
+                dirtyClr(s);
                 flushed += 1;
             }
         }
+        slot = next;
     }
     return flushed;
 }
@@ -218,10 +295,17 @@ pub fn flushAll(writeback_fn: *const fn (u64, u64, *[PAGE_SIZE]u8) bool) u32 {
     defer cache_lock.release(flags);
 
     var flushed: u32 = 0;
-    for (0..MAX_PAGES) |i| {
-        if (pages[i].valid and pages[i].dirty) {
+    // Iterate dirty bitmap: skip entire u64 groups with no dirty pages
+    for (0..dirty_bm.len) |grp| {
+        var bm = dirty_bm[grp];
+        while (bm != 0) {
+            const bit = @ctz(bm);
+            bm &= bm - 1;
+            const i: u16 = @intCast(grp * 64 + bit);
+            if (!pages[i].valid or !pages[i].dirty) continue;
             if (writeback_fn(pages[i].key.inode_id, pages[i].key.page_offset, pages[i].data)) {
                 pages[i].dirty = false;
+                dirtyClr(i);
                 flushed += 1;
             }
         }
@@ -230,24 +314,28 @@ pub fn flushAll(writeback_fn: *const fn (u64, u64, *[PAGE_SIZE]u8) bool) u32 {
 }
 
 /// Invalidate all cached pages for a given inode.
+/// Uses per-inode linked list for O(pages_of_inode) instead of O(MAX_PAGES).
 pub fn invalidateInode(inode_id: u64) void {
     const flags = cache_lock.acquire();
     defer cache_lock.release(flags);
 
-    for (0..MAX_PAGES) |i| {
-        if (pages[i].valid and pages[i].key.inode_id == inode_id) {
-            removePage(@intCast(i));
+    var slot = inode_list_heads[inodeListSlot(inode_id)];
+    while (slot) |s| {
+        const next = pages[s].inode_next;
+        if (pages[s].valid and pages[s].key.inode_id == inode_id) {
+            removePage(@intCast(s));
         }
+        slot = next;
     }
 }
 
 /// Get cache statistics.
 pub fn getStats() struct { total: u32, dirty: u32, hits: u64, misses: u64 } {
     var dirty_count: u32 = 0;
-    for (0..MAX_PAGES) |i| {
-        if (pages[i].valid and pages[i].dirty) dirty_count += 1;
+    for (0..dirty_bm.len) |grp| {
+        dirty_count += @popCount(dirty_bm[grp]);
     }
-    return .{ .total = page_count, .dirty = dirty_count, .hits = 0, .misses = 0 };
+    return .{ .total = page_count, .dirty = dirty_count, .hits = cache_hits, .misses = cache_misses };
 }
 
 /// Allocate a cache slot, evicting if necessary using clock algorithm.
@@ -324,6 +412,9 @@ fn removePage(slot: u16) void {
         current = pages[c].hash_next;
     }
 
+    // Remove from per-inode list
+    inodeListRemove(slot);
+
     // Remove from LRU list
     if (pages[s].lru_prev) |p| {
         pages[p].lru_next = pages[s].lru_next;
@@ -344,6 +435,7 @@ fn removePage(slot: u16) void {
     pages[s].valid = false;
     pages[s].phys = 0;
     pages[s].dirty = false;
+    dirtyClr(slot);
     pages[s].hash_next = null;
     pages[s].lru_next = free_head;
     pages[s].lru_prev = null;
@@ -352,6 +444,86 @@ fn removePage(slot: u16) void {
     }
     free_head = slot;
     page_count -= 1;
+}
+
+/// Prefetch window: number of pages to prefetch on sequential access detection.
+/// v51.0: doubled from 4 to 8 for better large-file sequential read throughput.
+const PREFETCH_WINDOW: u32 = 8;
+
+/// Per-inode sequential access tracker (lightweight, max 8 tracked inodes).
+const PrefetchTracker = struct {
+    inode_id: u64 = 0,
+    last_page: u64 = 0,
+    sequential_count: u32 = 0, // consecutive sequential hits
+    active: bool = false,
+};
+const MAX_PREFETCH_TRACK: u32 = 32;
+var prefetch_trackers: [MAX_PREFETCH_TRACK]PrefetchTracker = @splat(.{});
+
+/// Record a page access and return a prefetch hint.
+/// Returns the number of pages ahead to prefetch (0 if no prefetch needed).
+/// Detects sequential access: 2+ consecutive page offsets trigger prefetch.
+pub fn recordAccess(inode_id: u64, page_offset: u64) u32 {
+    // Find or allocate tracker for this inode
+    var tracker: ?*PrefetchTracker = null;
+    for (&prefetch_trackers) |*t| {
+        if (t.active and t.inode_id == inode_id) {
+            tracker = t;
+            break;
+        }
+    }
+    if (tracker == null) {
+        // Allocate a new tracker (overwrite oldest inactive or first)
+        for (&prefetch_trackers) |*t| {
+            if (!t.active) {
+                tracker = t;
+                break;
+            }
+        }
+        if (tracker == null) tracker = &prefetch_trackers[0]; // overwrite first
+        tracker.?.* = .{
+            .inode_id = inode_id,
+            .last_page = page_offset,
+            .sequential_count = 0,
+            .active = true,
+        };
+        return 0; // First access, no prefetch
+    }
+
+    const t = tracker.?;
+    const expected = t.last_page + 1;
+    t.last_page = page_offset;
+
+    if (page_offset == expected) {
+        // Sequential access detected
+        t.sequential_count += 1;
+        if (t.sequential_count >= 1) {
+            // Prefetch PREFETCH_WINDOW pages ahead
+            return PREFETCH_WINDOW;
+        }
+    } else {
+        // Non-sequential — reset counter
+        t.sequential_count = 0;
+    }
+    return 0;
+}
+
+/// Check if a page is already cached (without updating LRU/referenced).
+pub fn isCached(inode_id: u64, page_offset: u64) bool {
+    const key = CacheKey{ .inode_id = inode_id, .page_offset = page_offset };
+    const bucket = hashKey(key);
+
+    var slot = hash_buckets[bucket];
+    while (slot) |s| {
+        if (pages[s].valid and
+            pages[s].key.inode_id == inode_id and
+            pages[s].key.page_offset == page_offset)
+        {
+            return true;
+        }
+        slot = pages[s].hash_next;
+    }
+    return false;
 }
 
 /// Move a page to the head of the LRU list.

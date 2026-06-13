@@ -26,14 +26,41 @@ const bo = @import("../lib/byte_order.zig");
 
 // ─── Constants ────────────────────────────────────────────────────────────
 
-const MAX_CONNECTIONS: u32 = 32;
+const MAX_CONNECTIONS: u32 = 64;
 const TCP_WINDOW: u32 = 32768;
 const TCP_MSS: u16 = 1460;
-const SEND_BUF_SIZE: u32 = 32768;
-const RECV_BUF_SIZE: u32 = 32768;
+const SEND_BUF_SIZE: u32 = 65536;
+const RECV_BUF_SIZE: u32 = 65536;
 const RETRANSMIT_MS: u32 = 2000; // initial RTO (ms), overridden by Jacobson/Karels
 const TCP_RTO_MIN: u32 = 200; // minimum RTO (ms)
 const TCP_RTO_MAX: u32 = 60000; // maximum RTO (ms)
+const DELAYED_ACK_MS: u32 = 100; // delay ACK by 100ms (reduces ACK count ~50%)
+
+/// Write `count` bytes from `src` into a ring buffer at `write_pos`.
+/// Uses @memcpy for contiguous chunks (handles wraparound at buffer boundary).
+inline fn ringWrite(buffer: [*]u8, buf_size: u32, write_pos: u32, src: [*]const u8, count: u32) void {
+    if (count == 0) return;
+    const tail = buf_size - write_pos;
+    if (tail >= count) {
+        @memcpy(buffer[write_pos .. write_pos + count], src[0..count]);
+    } else {
+        @memcpy(buffer[write_pos .. write_pos + tail], src[0..tail]);
+        @memcpy(buffer[0 .. count - tail], src[tail..count]);
+    }
+}
+
+/// Read `count` bytes from a ring buffer at `read_pos` into `dst`.
+/// Uses @memcpy for contiguous chunks (handles wraparound at buffer boundary).
+inline fn ringRead(buffer: [*]const u8, buf_size: u32, read_pos: u32, dst: [*]u8, count: u32) void {
+    if (count == 0) return;
+    const tail = buf_size - read_pos;
+    if (tail >= count) {
+        @memcpy(dst[0..count], buffer[read_pos .. read_pos + count]);
+    } else {
+        @memcpy(dst[0..tail], buffer[read_pos .. read_pos + tail]);
+        @memcpy(dst[tail..count], buffer[0 .. count - tail]);
+    }
+}
 
 /// SACK block: [left, right) sequence number range.
 pub const SackBlock = struct {
@@ -132,6 +159,10 @@ const TcpTcb = struct {
     sack_scoreboard: [4]SackBlock,
     sack_scoreboard_count: u3,
 
+    // Delayed ACK state
+    delayed_ack_pending: bool, // ACK is being held
+    delayed_ack_ms: u32, // ms since first unacked data arrived
+
     // Connection metadata
     active: bool, // slot in use
     owner_task: u32, // task index that owns this connection
@@ -140,6 +171,10 @@ const TcpTcb = struct {
 
 var tcbs: [MAX_CONNECTIONS]TcpTcb = undefined;
 
+/// Bitmap tracking active TCB slots (1 = active, 0 = free).
+/// Enables O(1) skip of empty slots via @ctz instead of linear scan.
+var tcb_active_bitmap: u64 = 0;
+
 /// Compute the pool index of a TCB from its pointer.
 fn tcbIdx(tcb: *const TcpTcb) u32 {
     const base: usize = @intFromPtr(&tcbs[0]);
@@ -147,7 +182,15 @@ fn tcbIdx(tcb: *const TcpTcb) u32 {
     return @intCast((elem - base) / @sizeOf(TcpTcb));
 }
 
+/// Deactivate a TCB and clear its bitmap bit (single call site for consistency).
+inline fn deactivateTcb(tcb: *TcpTcb) void {
+    const idx: u6 = @intCast(tcbIdx(tcb));
+    tcb_active_bitmap &= ~(@as(u64, 1) << idx);
+    tcb.active = false;
+}
+
 pub fn initTcbs() void {
+    tcb_active_bitmap = 0;
     for (0..MAX_CONNECTIONS) |i| {
         tcbs[i] = .{
             .local_port = 0,
@@ -193,6 +236,8 @@ pub fn initTcbs() void {
             .sack_block_count = 0,
             .sack_scoreboard = @splat(.{ .left = 0, .right = 0 }),
             .sack_scoreboard_count = 0,
+            .delayed_ack_pending = false,
+            .delayed_ack_ms = 0,
             .active = false,
             .owner_task = 0,
             .options = .{},
@@ -205,46 +250,51 @@ var next_ephemeral_port: u16 = 49152;
 // ─── Utilities ────────────────────────────────────────────────────────────
 
 fn allocTcb() ?*TcpTcb {
-    for (0..MAX_CONNECTIONS) |i| {
-        if (!tcbs[i].active) {
-            tcbs[i].active = true;
-            tcbs[i].state = .closed;
-            tcbs[i].send_head = 0;
-            tcbs[i].send_tail = 0;
-            tcbs[i].send_unacked = 0;
-            tcbs[i].recv_head = 0;
-            tcbs[i].recv_tail = 0;
-            tcbs[i].retransmit_timer = 0;
-            tcbs[i].retransmit_count = 0;
-            tcbs[i].cwnd = TCP_MSS;
-            tcbs[i].ssthresh = 65535;
-            tcbs[i].dup_ack_count = 0;
-            tcbs[i].in_recovery = false;
-            tcbs[i].recover_seq = 0;
-            tcbs[i].snd_wnd_scale = 0;
-            tcbs[i].rcv_wnd_scale = 2;
-            tcbs[i].ws_requested = 2;
-            tcbs[i].ws_enabled = false;
-            tcbs[i].ts_recent = 0;
-            tcbs[i].ts_val_last = 0;
-            tcbs[i].ts_enabled = false;
-            tcbs[i].srtt = 0;
-            tcbs[i].rttvar = 0;
-            tcbs[i].rto = RETRANSMIT_MS;
-            tcbs[i].idle_ms = 0;
-            tcbs[i].keepalive_probes = 0;
-            tcbs[i].nagle_pending = false;
-            tcbs[i].options = .{};
-            return &tcbs[i];
-        }
-    }
-    return null;
+    // Use inverted bitmap to find first free slot (0 bit = free)
+    const all_mask: u64 = if (MAX_CONNECTIONS >= 64) 0xFFFFFFFFFFFFFFFF else (@as(u64, 1) << MAX_CONNECTIONS) - 1;
+    const free_bitmap = ~tcb_active_bitmap & all_mask;
+    if (free_bitmap == 0) return null;
+    const i: u6 = @intCast(@ctz(free_bitmap));
+    tcb_active_bitmap |= @as(u64, 1) << i;
+    tcbs[i].active = true;
+    tcbs[i].state = .closed;
+    tcbs[i].send_head = 0;
+    tcbs[i].send_tail = 0;
+    tcbs[i].send_unacked = 0;
+    tcbs[i].recv_head = 0;
+    tcbs[i].recv_tail = 0;
+    tcbs[i].retransmit_timer = 0;
+    tcbs[i].retransmit_count = 0;
+    tcbs[i].cwnd = TCP_MSS;
+    tcbs[i].ssthresh = 65535;
+    tcbs[i].dup_ack_count = 0;
+    tcbs[i].in_recovery = false;
+    tcbs[i].recover_seq = 0;
+    tcbs[i].snd_wnd_scale = 0;
+    tcbs[i].rcv_wnd_scale = 2;
+    tcbs[i].ws_requested = 2;
+    tcbs[i].ws_enabled = false;
+    tcbs[i].ts_recent = 0;
+    tcbs[i].ts_val_last = 0;
+    tcbs[i].ts_enabled = false;
+    tcbs[i].srtt = 0;
+    tcbs[i].rttvar = 0;
+    tcbs[i].rto = RETRANSMIT_MS;
+    tcbs[i].idle_ms = 0;
+    tcbs[i].keepalive_probes = 0;
+    tcbs[i].nagle_pending = false;
+    tcbs[i].delayed_ack_pending = false;
+    tcbs[i].delayed_ack_ms = 0;
+    tcbs[i].options = .{};
+    return &tcbs[i];
 }
 
 fn findTcbByTuple(local_port: u16, remote_port: u16, remote_ip: [4]u8) ?*TcpTcb {
-    for (0..MAX_CONNECTIONS) |i| {
-        if (tcbs[i].active and
-            tcbs[i].local_port == local_port and
+    var bm = tcb_active_bitmap;
+    while (bm != 0) {
+        const i = @ctz(bm);
+        bm &= bm - 1; // clear lowest set bit
+        if (tcbs[i].local_port == local_port and
             tcbs[i].remote_port == remote_port and
             @as(u32, @bitCast(tcbs[i].remote_ip)) == @as(u32, @bitCast(remote_ip)))
         {
@@ -255,8 +305,11 @@ fn findTcbByTuple(local_port: u16, remote_port: u16, remote_ip: [4]u8) ?*TcpTcb 
 }
 
 fn findTcbByLocalPort(local_port: u16) ?*TcpTcb {
-    for (0..MAX_CONNECTIONS) |i| {
-        if (tcbs[i].active and tcbs[i].local_port == local_port) {
+    var bm = tcb_active_bitmap;
+    while (bm != 0) {
+        const i = @ctz(bm);
+        bm &= bm - 1;
+        if (tcbs[i].local_port == local_port) {
             return &tcbs[i];
         }
     }
@@ -288,16 +341,12 @@ fn generateIss() u32 {
 }
 
 // Ring buffer helpers
-fn ringUsed(head: u32, tail: u32, size: u32) u32 {
-    return (tail +% head) % size; // wrong — we need (tail - head) mod size
-}
-
 fn ringAvailable(head: u32, tail: u32, size: u32) u32 {
-    if (tail >= head) return size - (tail - head) - 1;
-    return head - tail - 1;
+    const used = ringDataLen(head, tail, size);
+    return size - used - 1;
 }
 
-fn ringDataLen(head: u32, tail: u32, comptime size: u32) u32 {
+fn ringDataLen(head: u32, tail: u32, size: u32) u32 {
     return (tail -% head) % size;
 }
 
@@ -577,10 +626,13 @@ fn updateRtt(tcb: *TcpTcb, m: u32) void {
 /// and queues it in the listen backlog.
 fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions) void {
     _ = _w;
-    // Find listen slot for this port
+    // Find listen slot for this port (bitmap-driven)
     var slot: ?*ListenSlot = null;
-    for (0..MAX_CONNECTIONS) |i| {
-        if (listen_slots[i].active and listen_slots[i].local_port == dst_port) {
+    var lbm = listen_active_bitmap;
+    while (lbm != 0) {
+        const i = @ctz(lbm);
+        lbm &= lbm - 1;
+        if (listen_slots[i].local_port == dst_port) {
             slot = &listen_slots[i];
             break;
         }
@@ -588,8 +640,11 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
     const ls = slot orelse return;
 
     // T17: Allow TCB reuse for TIME_WAIT connections (if ISN is larger)
-    for (0..MAX_CONNECTIONS) |i| {
-        if (tcbs[i].active and tcbs[i].state == .time_wait and
+    var tw_bm = tcb_active_bitmap;
+    while (tw_bm != 0) {
+        const i = @ctz(tw_bm);
+        tw_bm &= tw_bm - 1;
+        if (tcbs[i].state == .time_wait and
             tcbs[i].local_port == dst_port and
             tcbs[i].remote_port == src_port and
             @as(u32, @bitCast(seq_num -% tcbs[i].irs)) > 0)
@@ -665,13 +720,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
     serial.writeString("[tcp] SYN-ACK sent for incoming connection\n");
 
     // Find the index of the new TCB
-    var new_idx: u32 = 0;
-    for (0..MAX_CONNECTIONS) |i| {
-        if (&tcbs[i] == new_tcb) {
-            new_idx = @intCast(i);
-            break;
-        }
-    }
+    const new_idx = tcbIdx(new_tcb);
 
     // Queue in listen backlog (will be moved to established when ACK arrives)
     ls.pending_tpbs[ls.pending_count] = new_idx;
@@ -908,6 +957,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
             if (flags & FIN != 0) {
                 tcb.rcv_nxt +%= 1;
                 tcb.state = .close_wait;
+                tcb.delayed_ack_pending = false; // ACK is immediate for FIN
                 _ = sendSegment(tcb, ACK, undefined, 0);
                 serial.writeString("[tcp] remote closed (FIN received)\n");
                 // epoll: peer closed.
@@ -947,7 +997,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
         .last_ack => {
             if (flags & ACK != 0) {
                 tcb.state = .closed;
-                tcb.active = false;
+                deactivateTcb(tcb);
                 serial.writeString("[tcp] LAST_ACK → CLOSED\n");
             }
         },
@@ -989,20 +1039,31 @@ fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) void
         return;
     }
 
-    // Copy to receive ring buffer
-    var i: u32 = 0;
-    while (i < len) : (i += 1) {
-        const next_tail = (tcb.recv_tail + 1) % RECV_BUF_SIZE;
-        if (next_tail == tcb.recv_head) break; // buffer full
-        tcb.recv_buf[tcb.recv_tail] = data[i];
-        tcb.recv_tail = next_tail;
-    }
+    // Copy to receive ring buffer (batched @memcpy)
+    const recv_free = RECV_BUF_SIZE - 1 - ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
+    const to_copy = @min(len, recv_free);
+    ringWrite(&tcb.recv_buf, RECV_BUF_SIZE, tcb.recv_tail, data, to_copy);
+    tcb.recv_tail = (tcb.recv_tail + to_copy) % RECV_BUF_SIZE;
 
     tcb.rcv_nxt +%= len;
     tcb.rcv_wnd = TCP_WINDOW - ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
 
-    // Send ACK
-    _ = sendSegment(tcb, ACK, undefined, 0);
+    // Delayed ACK: every-other-segment rule (disabled by TCP_QUICKACK)
+    if (tcb.options.tcp_quickack) {
+        // TCP_QUICKACK: always ACK immediately
+        tcb.delayed_ack_pending = false;
+        tcb.delayed_ack_ms = 0;
+        _ = sendSegment(tcb, ACK, undefined, 0);
+    } else if (tcb.delayed_ack_pending) {
+        // Second segment arrived while ACK pending — send immediately
+        tcb.delayed_ack_pending = false;
+        tcb.delayed_ack_ms = 0;
+        _ = sendSegment(tcb, ACK, undefined, 0);
+    } else {
+        // First segment — hold ACK for DELAYED_ACK_MS
+        tcb.delayed_ack_pending = true;
+        tcb.delayed_ack_ms = 0;
+    }
 }
 
 // ─── Public API (called from syscalls) ────────────────────────────────────
@@ -1026,17 +1087,14 @@ pub fn tcpConnect(remote_ip: [4]u8, remote_port: u16, owner_task: u32) i64 {
 
     // Send SYN
     if (!sendSegment(tcb, SYN, undefined, 0)) {
-        tcb.active = false;
+        deactivateTcb(tcb);
         return -1;
     }
 
     serial.writeString("[tcp] SYN sent\n");
 
     // Return the index
-    for (0..MAX_CONNECTIONS) |i| {
-        if (&tcbs[i] == tcb) return @intCast(i);
-    }
-    return -1;
+    return @intCast(tcbIdx(tcb));
 }
 
 // Connect an existing socket TCB to a remote address.
@@ -1092,15 +1150,13 @@ pub fn tcpSend(tcb_idx: u32, data: [*]const u8, len: u32) i64 {
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active or tcb.state != .established) return -1;
 
-    // Copy data to send ring buffer
-    var queued: u32 = 0;
-    while (queued < len) {
-        const next_tail = (tcb.send_tail + 1) % SEND_BUF_SIZE;
-        if (next_tail == tcb.send_head) break;
-        tcb.send_buf[tcb.send_tail] = data[queued];
-        tcb.send_tail = next_tail;
-        queued += 1;
-    }
+    // Copy data to send ring buffer (batched @memcpy)
+    const used = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
+    const free_space = SEND_BUF_SIZE - 1 - used;
+    const to_copy = @min(len, free_space);
+    ringWrite(&tcb.send_buf, SEND_BUF_SIZE, tcb.send_tail, data, to_copy);
+    tcb.send_tail = (tcb.send_tail + to_copy) % SEND_BUF_SIZE;
+    const queued: u32 = to_copy;
 
     // Send as much as we can from the buffer
     flushSendBuffer(tcb);
@@ -1110,6 +1166,7 @@ pub fn tcpSend(tcb_idx: u32, data: [*]const u8, len: u32) i64 {
 
 /// Flush pending send data as TCP segments.
 /// Uses min(cwnd, snd_wnd) as the effective send window.
+/// When TCP_CORK is set, only full MSS segments are sent (partial segments are held).
 fn flushSendBuffer(tcb: *TcpTcb) void {
     while (true) {
         const pending = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
@@ -1120,25 +1177,24 @@ fn flushSendBuffer(tcb: *TcpTcb) void {
 
         if (can_send == 0) break;
 
+        // TCP_CORK: only send full MSS segments (coalesce small writes)
+        if (tcb.options.tcp_cork and can_send < TCP_MSS) break;
+
         // Nagle algorithm: if TCP_NODELAY is disabled and there is unacknowledged
         // data in flight, only send a full MSS segment (coalesce small writes).
-        if (!tcb.options.tcp_nodelay and in_flight > 0 and can_send < TCP_MSS) {
+        if (!tcb.options.tcp_nodelay and !tcb.options.tcp_cork and in_flight > 0 and can_send < TCP_MSS) {
             tcb.nagle_pending = true;
             break;
         }
 
-        // Collect data from ring buffer
+        // Collect data from ring buffer (batched @memcpy)
         var seg_buf: [TCP_MSS]u8 = undefined;
-        var pos = tcb.send_unacked;
-        var i: u32 = 0;
-        while (i < can_send) : (i += 1) {
-            seg_buf[i] = tcb.send_buf[pos];
-            pos = (pos + 1) % SEND_BUF_SIZE;
-        }
-
-        // Advance send pointer before sending (sendSegment updates snd_nxt)
-        tcb.send_unacked = pos;
+        ringRead(&tcb.send_buf, SEND_BUF_SIZE, tcb.send_unacked, &seg_buf, can_send);
+        tcb.send_unacked = (tcb.send_unacked + can_send) % SEND_BUF_SIZE;
         _ = sendSegment(tcb, ACK | PSH, &seg_buf, @intCast(can_send));
+        // ACK piggybacked on data — clear any pending delayed ACK
+        tcb.delayed_ack_pending = false;
+        tcb.delayed_ack_ms = 0;
     }
 }
 
@@ -1157,28 +1213,58 @@ pub fn tcpRecv(tcb_idx: u32, buf: [*]u8, len: u32) i64 {
     }
 
     const to_read = @min(available, len);
-    var i: u32 = 0;
-    while (i < to_read) : (i += 1) {
-        buf[i] = tcb.recv_buf[tcb.recv_head];
-        tcb.recv_head = (tcb.recv_head + 1) % RECV_BUF_SIZE;
-    }
+    ringRead(&tcb.recv_buf, RECV_BUF_SIZE, tcb.recv_head, buf, to_read);
+    tcb.recv_head = (tcb.recv_head + to_read) % RECV_BUF_SIZE;
 
     tcb.rcv_wnd = TCP_WINDOW - ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
 
-    // T15: Send window update ACK if window grew significantly (> 1 MSS)
-    // This helps the sender know about available buffer space promptly.
-    if (to_read > TCP_MSS and tcb.state == .established) {
+    // Flush delayed ACK when app reads data (advertises updated window promptly).
+    // Also sends a window update if a significant amount was consumed.
+    if (tcb.delayed_ack_pending or (to_read > TCP_MSS and tcb.state == .established)) {
+        tcb.delayed_ack_pending = false;
+        tcb.delayed_ack_ms = 0;
         _ = sendSegment(tcb, ACK, undefined, 0);
     }
 
     return @intCast(to_read);
 }
 
+/// Flush corked data — called when TCP_CORK is disabled (uncorked).
+/// Sends any pending partial segment immediately.
+pub fn tcpFlushCork(tcb_idx: u32) void {
+    if (tcb_idx >= MAX_CONNECTIONS) return;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active or tcb.state != .established) return;
+    flushSendBuffer(tcb);
+}
+
+/// Flush pending delayed ACK — called when TCP_QUICKACK is enabled.
+pub fn tcpFlushAck(tcb_idx: u32) void {
+    if (tcb_idx >= MAX_CONNECTIONS) return;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active) return;
+    if (tcb.delayed_ack_pending) {
+        tcb.delayed_ack_pending = false;
+        tcb.delayed_ack_ms = 0;
+        _ = sendSegment(tcb, ACK, undefined, 0);
+    }
+}
+
 /// Close a TCP connection (initiates four-way close).
+/// When SO_LINGER is set with l_onoff=1 and l_linger=0, sends RST (abortive close).
 pub fn tcpClose(tcb_idx: u32) i64 {
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return -1;
+
+    // SO_LINGER with linger=0: abortive close — send RST, discard unsent data
+    if (tcb.options.linger_on and tcb.options.linger_sec == 0) {
+        _ = sendSegment(tcb, RST | ACK, undefined, 0);
+        serial.writeString("[tcp] SO_LINGER(0) → RST sent, abortive close\n");
+        tcb.state = .closed;
+        deactivateTcb(tcb);
+        return 0;
+    }
 
     switch (tcb.state) {
         .established => {
@@ -1193,7 +1279,7 @@ pub fn tcpClose(tcb_idx: u32) i64 {
         },
         else => {
             tcb.state = .closed;
-            tcb.active = false;
+            deactivateTcb(tcb);
         },
     }
     return 0;
@@ -1221,16 +1307,18 @@ pub fn isClosed(tcb_idx: u32) bool {
 /// Timer tick — called periodically to handle retransmission.
 /// Uses the per-TCB RTO (Jacobson/Karels) instead of a fixed timeout.
 pub fn timerTick(ms_elapsed: u32) void {
-    for (0..MAX_CONNECTIONS) |i| {
-        const tcb = &tcbs[i];
-        if (!tcb.active) continue;
+    var bm = tcb_active_bitmap;
+    while (bm != 0) {
+        const idx = @ctz(bm);
+        bm &= bm - 1;
+        const tcb = &tcbs[idx];
         if (tcb.state == .closed or tcb.state == .time_wait) {
             // Clean up TIME_WAIT after 15 seconds (reduced from 2*MSL=60s)
             if (tcb.state == .time_wait) {
                 tcb.retransmit_timer +%= ms_elapsed;
                 if (tcb.retransmit_timer >= 15000) {
                     tcb.state = .closed;
-                    tcb.active = false;
+                    deactivateTcb(tcb);
                     serial.writeString("[tcp] TIME_WAIT → CLOSED (timeout)\n");
                 }
             }
@@ -1249,7 +1337,7 @@ pub fn timerTick(ms_elapsed: u32) void {
                     // Give up
                     serial.writeString("[tcp] retransmit timeout, closing\n");
                     tcb.state = .closed;
-                    tcb.active = false;
+                    deactivateTcb(tcb);
                     continue;
                 }
                 // RTO timeout: Reno behavior — ssthresh = cwnd/2, cwnd = 1 MSS
@@ -1280,6 +1368,17 @@ pub fn timerTick(ms_elapsed: u32) void {
             }
         }
 
+        // ── Delayed ACK timeout ──────────────────────────────────────
+        // If ACK has been held for > DELAYED_ACK_MS, send it now.
+        if (tcb.delayed_ack_pending) {
+            tcb.delayed_ack_ms +%= ms_elapsed;
+            if (tcb.delayed_ack_ms >= DELAYED_ACK_MS) {
+                tcb.delayed_ack_pending = false;
+                tcb.delayed_ack_ms = 0;
+                _ = sendSegment(tcb, ACK, undefined, 0);
+            }
+        }
+
         // ── Keepalive logic ──────────────────────────────────────────────
         // Only for established connections with SO_KEEPALIVE enabled
         if (tcb.state == .established and tcb.options.keep_alive) {
@@ -1296,7 +1395,7 @@ pub fn timerTick(ms_elapsed: u32) void {
                     // Max probes reached — connection is dead
                     serial.writeString("[tcp] keepalive timeout, closing\n");
                     tcb.state = .closed;
-                    tcb.active = false;
+                    deactivateTcb(tcb);
                     continue;
                 }
                 tcb.keepalive_probes += 1;
@@ -1334,6 +1433,9 @@ var listen_slots: [MAX_CONNECTIONS]ListenSlot = @splat(.{
     .pending_count = 0,
 });
 
+/// Bitmap tracking active listen slots (1 = active).
+var listen_active_bitmap: u64 = 0;
+
 /// Create a TCP socket (allocate a TCB in closed state).
 /// Returns TCB index (>= 0) on success, -1 on failure.
 pub fn tcpSocket(owner_task: u32) i64 {
@@ -1341,11 +1443,7 @@ pub fn tcpSocket(owner_task: u32) i64 {
     tcb.owner_task = owner_task;
     tcb.state = .closed;
 
-    // Return index
-    for (0..MAX_CONNECTIONS) |i| {
-        if (&tcbs[i] == tcb) return @intCast(i);
-    }
-    return -1;
+    return @intCast(tcbIdx(tcb));
 }
 
 /// Bind a TCB to a local port.
@@ -1355,11 +1453,13 @@ pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active or tcb.state != .closed) return -1;
 
-    // Check if port is already in use
+    // Check if port is already in use (bitmap-driven scan)
     // SO_REUSEADDR allows binding to a port in TIME_WAIT state
-    for (0..MAX_CONNECTIONS) |i| {
-        if (tcbs[i].active and tcbs[i].local_port == port) {
-            // Allow if SO_REUSEADDR is set and the existing connection is TIME_WAIT
+    var bm = tcb_active_bitmap;
+    while (bm != 0) {
+        const i = @ctz(bm);
+        bm &= bm - 1;
+        if (tcbs[i].local_port == port) {
             if (tcb.options.reuse_addr and tcbs[i].state == .time_wait) {
                 continue;
             }
@@ -1380,18 +1480,18 @@ pub fn tcpListen(tcb_idx: u32) i64 {
 
     tcb.state = .listen;
 
-    // Set up listen slot for incoming SYN tracking
-    for (0..MAX_CONNECTIONS) |i| {
-        if (!listen_slots[i].active) {
-            listen_slots[i].active = true;
-            listen_slots[i].local_port = tcb.local_port;
-            listen_slots[i].owner_task = tcb.owner_task;
-            listen_slots[i].pending_count = 0;
-            listen_slots[i].pending_tpbs = @splat(0);
-            return 0;
-        }
-    }
-    return -1;
+    // Set up listen slot for incoming SYN tracking (bitmap-driven free slot search)
+    const all_listen_mask: u64 = if (MAX_CONNECTIONS >= 64) 0xFFFFFFFFFFFFFFFF else (@as(u64, 1) << MAX_CONNECTIONS) - 1;
+    const free_mask = ~listen_active_bitmap & all_listen_mask;
+    if (free_mask == 0) return -1;
+    const i: u6 = @intCast(@ctz(free_mask));
+    listen_active_bitmap |= @as(u64, 1) << i;
+    listen_slots[i].active = true;
+    listen_slots[i].local_port = tcb.local_port;
+    listen_slots[i].owner_task = tcb.owner_task;
+    listen_slots[i].pending_count = 0;
+    listen_slots[i].pending_tpbs = @splat(0);
+    return 0;
 }
 
 /// Accept a pending connection on a listening socket.
@@ -1401,10 +1501,13 @@ pub fn tcpAccept(tcb_idx: u32, owner_task: u32) i64 {
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active or tcb.state != .listen) return -1;
 
-    // Find the listen slot for this TCB
+    // Find the listen slot for this TCB (bitmap-driven)
     var slot: ?*ListenSlot = null;
-    for (0..MAX_CONNECTIONS) |i| {
-        if (listen_slots[i].active and listen_slots[i].local_port == tcb.local_port) {
+    var lbm = listen_active_bitmap;
+    while (lbm != 0) {
+        const i = @ctz(lbm);
+        lbm &= lbm - 1;
+        if (listen_slots[i].local_port == tcb.local_port) {
             slot = &listen_slots[i];
             break;
         }
@@ -1534,7 +1637,7 @@ pub fn tcpShutdown(tcb_idx: u32, how: u32) i64 {
                 },
                 else => {
                     tcb.state = .closed;
-                    tcb.active = false;
+                    deactivateTcb(tcb);
                 },
             }
         },
