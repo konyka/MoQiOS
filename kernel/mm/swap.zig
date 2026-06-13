@@ -27,7 +27,7 @@ const SWAP_MARKER_BIT: u64 = 0x2; // Bit 1 set = swap entry
 const MAX_SWAP_SLOTS: u64 = 65536; // 256MB of swap
 const SECTORS_PER_PAGE: u32 = 8; // 4KB / 512B
 
-var swap_bitmap: [MAX_SWAP_SLOTS / 8]u8 = @splat(0); // 8KB bitmap
+var swap_bitmap: [MAX_SWAP_SLOTS / 64]u64 = @splat(0); // 1024 u64 words = 8KB bitmap
 var swap_lock: IrqSpinlock = .{};
 var swap_dev: u8 = 0xFF; // Block device index for swap
 var swap_start_lba: u64 = 0; // Starting LBA of swap area
@@ -71,22 +71,19 @@ pub fn init(dev: u8, start_lba: u64) void {
 }
 
 /// Allocate a swap slot. Returns slot index or null if full.
+/// Uses u64 word-level scanning with @ctz for amortized O(1) allocation.
 fn allocSlot() ?u64 {
     const flags = swap_lock.acquire();
     defer swap_lock.release(flags);
 
-    for (0..MAX_SWAP_SLOTS / 8) |byte_idx| {
-        if (swap_bitmap[byte_idx] != 0xFF) {
-            // Find first free bit
-            for (0..8) |bit| {
-                if (swap_bitmap[byte_idx] & (@as(u8, 1) << @intCast(bit)) == 0) {
-                    const slot = @as(u64, byte_idx) * 8 + bit;
-                    swap_bitmap[byte_idx] |= @as(u8, 1) << @intCast(bit);
-                    swap_used += 1;
-                    return slot;
-                }
-            }
-        }
+    for (&swap_bitmap, 0..) |*word_ptr, word_idx| {
+        const word = word_ptr.*;
+        if (word == ~@as(u64, 0)) continue; // all 64 bits used
+        const free_bits = ~word;
+        const bit: u6 = @intCast(@ctz(free_bits));
+        word_ptr.* |= @as(u64, 1) << bit;
+        swap_used += 1;
+        return @as(u64, word_idx) * 64 + bit;
     }
     return null;
 }
@@ -96,10 +93,10 @@ fn freeSlot(slot: u64) void {
     const flags = swap_lock.acquire();
     defer swap_lock.release(flags);
 
-    const byte_idx = slot / 8;
-    const bit: u3 = @intCast(slot % 8);
-    if (byte_idx < MAX_SWAP_SLOTS / 8) {
-        swap_bitmap[byte_idx] &= ~(@as(u8, 1) << bit);
+    const word_idx = slot / 64;
+    const bit: u6 = @intCast(slot % 64);
+    if (word_idx < MAX_SWAP_SLOTS / 64) {
+        swap_bitmap[word_idx] &= ~(@as(u64, 1) << bit);
         if (swap_used > 0) swap_used -= 1;
     }
 }

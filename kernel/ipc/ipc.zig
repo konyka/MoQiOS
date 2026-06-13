@@ -12,7 +12,6 @@
 ///
 /// For M4, this operates kernel-to-kernel only. User-space syscall
 /// integration comes in M5.
-
 const task = @import("../proc/task.zig");
 const sched = @import("../proc/sched.zig");
 const serial = @import("../arch/x86_64/serial.zig");
@@ -308,17 +307,21 @@ pub fn receive(ep: EndpointId, buf: *Message) IpcError {
         return .success;
     }
 
-    // No sender waiting — block the receiver
+    // No sender waiting — block the receiver until a sender arrives
     const recv_task = task.getTask(caller_idx) orelse return .not_ready;
     endpoints[ep].waiting_receiver = caller_idx;
     recv_task.state = .blocked;
-    // Receiver will be descheduled on next tick
 
-    // When sender arrives later, the message will be written to this buf.
-    // For simplicity in kernel-kernel IPC, we'll use a different approach:
-    // the receiver spins on a flag. This is OK for kernel threads.
-    // TODO: proper event-based blocking for user-space
-    return .success;
+    // Force context switch — the task will resume when send() wakes us
+    sched.forceReschedule();
+
+    // Resumed after send() delivered message and set state = .ready
+    if (endpoints[ep].pending_msg) |msg| {
+        buf.* = msg;
+        endpoints[ep].pending_msg = null;
+        return .success;
+    }
+    return .not_ready;
 }
 
 /// Call = send + wait for reply. Transactional IPC.

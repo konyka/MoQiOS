@@ -15,6 +15,7 @@ const serial = @import("../arch/x86_64/serial.zig");
 const readahead = @import("readahead.zig");
 const str = @import("../lib/str.zig");
 const writeback = @import("writeback.zig");
+const page_cache = @import("page_cache.zig");
 
 pub const MAX_FDS: u32 = 64;
 pub const FD_STDIN: u32 = 0;
@@ -40,6 +41,7 @@ pub const FdType = enum(u8) {
     proc_file = 14,
     udp_socket = 15,
     inotify = 16,
+    raw_socket = 17,
 };
 
 pub const PIPE_BUF_SIZE: u32 = 4096;
@@ -59,7 +61,7 @@ pub var pipes: [16]PipeBuffer = @splat(.{
 });
 var pipe_count: u32 = 0;
 
-fn allocPipe() ?u32 {
+pub fn allocPipe() ?u32 {
     for (0..16) |i| {
         if (pipes[i].ref_count == 0) {
             pipes[i] = .{ .buf = @splat(0), .head = 0, .tail = 0, .ref_count = 2 };
@@ -133,6 +135,9 @@ pub const FileDescriptor = struct {
     inotify_idx: u32 = 0,
     tmpfs_idx: u32 = 0,
     udp_port: u16 = 0,
+    udp_connected: bool = false,
+    udp_dst_ip: [4]u8 = .{ 0, 0, 0, 0 },
+    udp_dst_port: u16 = 0,
     writable: bool = false,
     fd_flags: u32 = 0,
     status_flags: u32 = 0,
@@ -411,6 +416,7 @@ pub const FdTable = struct {
                 const cached = readahead.copyFromCache(&desc.readahead_state, block_num, block_offset, buf, @intCast(count));
                 if (cached > 0) {
                     desc.offset += cached;
+                    _ = page_cache.recordAccess(desc.inode_id, block_num);
                     return cached;
                 }
                 // 3. Fall back to FS readFile
@@ -420,6 +426,9 @@ pub const FdTable = struct {
                     desc.offset += @intCast(n);
                     // 4. Update readahead state and trigger prefetch
                     readahead.checkAndPrefetch(&desc.readahead_state, desc.offset, 4096, fat32ReadBlock);
+                    // 5. Track access pattern for page cache hints
+                    const cur_page = desc.offset / 4096;
+                    _ = page_cache.recordAccess(desc.inode_id, cur_page);
                 }
                 return n;
             },
@@ -437,6 +446,8 @@ pub const FdTable = struct {
                 const cached = readahead.copyFromCache(&desc.readahead_state, block_num, block_offset, buf, @intCast(count));
                 if (cached > 0) {
                     desc.offset += cached;
+                    // Track access for page cache replacement decisions
+                    _ = page_cache.recordAccess(desc.inode_id, block_num);
                     return cached;
                 }
                 // 3. Fall back to FS readFile
@@ -446,6 +457,10 @@ pub const FdTable = struct {
                     desc.offset += @intCast(n);
                     // 4. Update readahead state and trigger prefetch
                     readahead.checkAndPrefetch(&desc.readahead_state, desc.offset, 4096, ext2ReadBlock);
+                    // 5. Track access pattern for page cache hints
+                    const cur_page = desc.offset / 4096;
+                    const prefetch_hint = page_cache.recordAccess(desc.inode_id, cur_page);
+                    _ = prefetch_hint; // used by future aggressive prefetch
                 }
                 return n;
             },
@@ -491,6 +506,14 @@ pub const FdTable = struct {
                 return @intCast(to_copy);
             },
             .inotify => return -1, // inotify uses read via special syscall path
+            .raw_socket => {
+                // Raw socket: receive raw ethernet frame
+                const e1000 = @import("../drivers/e1000.zig");
+                if (!e1000.isActive()) return -1;
+                const max: u32 = @intCast(@min(count, 2048));
+                const n = e1000.receivePacket(buf, max);
+                return @intCast(n);
+            },
         }
     }
 
@@ -549,6 +572,17 @@ pub const FdTable = struct {
             },
             .proc_file => return -1, // proc files are read-only
             .inotify => return -1, // inotify is read-only via special path
+            .raw_socket => {
+                // Raw socket: send raw ethernet frame
+                const e1000 = @import("../drivers/e1000.zig");
+                if (!e1000.isActive()) return -1;
+                if (count > 2048) return -22; // EMSGSIZE
+                const len: u32 = @intCast(count);
+                if (e1000.sendPacket(buf, len)) {
+                    return @intCast(count);
+                }
+                return -1;
+            },
         }
     }
 

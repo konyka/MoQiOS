@@ -189,6 +189,8 @@ const AhciPort = struct {
     pci_func: u8,
     irq_pin: u8,
     irq_line: u8,
+    // I/O scheduler registration (v36.0)
+    io_sched_idx: u8 = 0xFF, // 0xFF = not registered
 };
 
 var hba_base: u64 = 0;
@@ -522,6 +524,15 @@ fn initPort(idx: u32, port_base: u64) !void {
         ports[idx].tag_bitmap = bm;
     } else {
         ports[idx].tag_bitmap = 0; // Not used in non-NCQ mode
+    }
+
+    // Register with I/O scheduler for request ordering (v36.0)
+    const io_sched = @import("../fs/io_sched.zig");
+    if (io_sched.registerDevice(@intCast(idx))) |sched_idx| {
+        ports[idx].io_sched_idx = @intCast(sched_idx);
+        serial.writeString("[ahci] port ");
+        fmt.writeHex8(@intCast(idx));
+        serial.writeString(" registered with io_sched\n");
     }
 }
 

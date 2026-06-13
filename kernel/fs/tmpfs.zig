@@ -26,16 +26,24 @@ const TmpfsEntry = struct {
 };
 
 var entries: [MAX_FILES]TmpfsEntry = undefined;
+var active_bm: u64 = 0; // Bitmap: bit i = entries[i].active
 var tmpfs_lock: IrqSpinlock = .{};
 var next_ctime: u64 = 1;
 
+inline fn bmSet(idx: u6) void {
+    active_bm |= @as(u64, 1) << idx;
+}
+inline fn bmClr(idx: u6) void {
+    active_bm &= ~(@as(u64, 1) << idx);
+}
+
 fn allocEntry() ?u8 {
-    for (1..MAX_FILES) |i| {
-        if (!entries[i].active) {
-            return @intCast(i);
-        }
-    }
-    return null;
+    const inv = ~active_bm & ~@as(u64, 1); // skip bit 0 (root), mask free slots
+    if (inv == 0) return null;
+    const i: u8 = @intCast(@ctz(inv));
+    if (i >= MAX_FILES) return null;
+    bmSet(@intCast(i));
+    return i;
 }
 
 fn freeEntryPages(idx: u8) void {
@@ -48,15 +56,19 @@ fn freeEntryPages(idx: u8) void {
     }
     entry.page_count = 0;
     entry.size = 0;
+    bmClr(@intCast(idx));
 }
 
 fn findEntry(name: []const u8, parent: u8) ?u8 {
-    for (1..MAX_FILES) |i| {
-        if (!entries[i].active) continue;
+    var bm = active_bm;
+    while (bm != 0) {
+        const bit = @ctz(bm);
+        bm &= bm - 1;
+        const i: u8 = @intCast(bit);
         if (entries[i].parent_idx != parent) continue;
         if (entries[i].name_len != name.len) continue;
         if (nameEql(entries[i].name[0..entries[i].name_len], name)) {
-            return @intCast(i);
+            return i;
         }
     }
     return null;
@@ -147,6 +159,7 @@ pub fn init() void {
         .ctime = 0,
     };
     entries[0].name[0] = '/';
+    active_bm = 1; // bit 0 = root
 }
 
 /// Open a file under /tmp/. Creates if it does not exist.
@@ -215,14 +228,10 @@ pub fn tmpfsRead(idx: u8, offset: u64, buf: [*]u8, count: u32) i64 {
         if (page_idx >= PAGES_PER_FILE) break;
         if (entry.pages[page_idx]) |phys| {
             const src: [*]const u8 = @ptrFromInt(hhdm.physToVirt(phys) + page_off);
-            for (0..chunk) |j| {
-                buf[dst + j] = src[j];
-            }
+            @memcpy(buf[dst .. dst + chunk], src[0..chunk]);
         } else {
             // Unallocated page = zeros
-            for (0..chunk) |j| {
-                buf[dst + j] = 0;
-            }
+            @memset(buf[dst .. dst + chunk], 0);
         }
         dst += chunk;
         pos += chunk;
@@ -265,9 +274,7 @@ pub fn tmpfsWrite(idx: u8, offset: u64, data: [*]const u8, count: u32) i64 {
 
         const phys = entry.pages[page_idx].?;
         const dst: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys) + page_off);
-        for (0..chunk) |j| {
-            dst[j] = data[src + j];
-        }
+        @memcpy(dst[0..chunk], data[src .. src + chunk]);
 
         src += chunk;
         pos += chunk;
@@ -302,9 +309,13 @@ pub fn tmpfsUnlink(path: []const u8) i64 {
     const entry = &entries[idx];
 
     if (entry.is_dir) {
-        // directory must be empty
-        for (1..MAX_FILES) |i| {
-            if (entries[i].active and entries[i].parent_idx == idx) {
+        // directory must be empty — bitmap scan
+        var bm = active_bm;
+        while (bm != 0) {
+            const bit = @ctz(bm);
+            bm &= bm - 1;
+            const ci: u8 = @intCast(bit);
+            if (entries[ci].parent_idx == idx) {
                 return -1; // ENOTEMPTY
             }
         }
@@ -352,8 +363,11 @@ pub fn tmpfsListDir(idx: u8) TmpfsDirListing {
         return .{ .entries = &[_]TmpfsDirEntry{}, .count = 0 };
     }
     var count: u32 = 0;
-    for (1..MAX_FILES) |i| {
-        if (!entries[i].active) continue;
+    var bm = active_bm;
+    while (bm != 0) {
+        const bit = @ctz(bm);
+        bm &= bm - 1;
+        const i: u8 = @intCast(bit);
         if (entries[i].parent_idx != idx) continue;
         if (count >= MAX_FILES) break;
         const nlen: usize = entries[i].name_len;

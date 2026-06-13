@@ -2,7 +2,6 @@
 /// Uses intrusive free lists within pages allocated from PMM.
 /// Each allocation stores a SlabHeader before the returned pointer so that
 /// kfree(ptr) can determine the size class without the caller passing it.
-
 const pmm = @import("pmm.zig");
 const hhdm = @import("hhdm.zig");
 const serial = @import("../arch/x86_64/serial.zig");
@@ -131,9 +130,19 @@ pub fn kfree(ptr: *anyopaque) void {
     const pool_idx = header_ptr.pool_idx;
 
     if (pool_idx == LARGE_ALLOC_MARKER) {
-        // Large allocation — free the page
-        const phys = hhdm.virtToPhys(user_addr);
-        pmm.freePage(phys);
+        // Large allocation — free all contiguous pages
+        const pages_count: u64 = header_ptr._pad;
+        const virt_base = user_addr - HEADER_ALIGNED;
+        const phys_base = hhdm.virtToPhys(virt_base);
+        if (pages_count <= 1) {
+            pmm.freePage(phys_base);
+        } else {
+            // Free contiguous pages (phys_base must be page-aligned)
+            var p: u64 = 0;
+            while (p < pages_count) : (p += 1) {
+                pmm.freePage(phys_base + p * PAGE_SIZE);
+            }
+        }
         return;
     }
 
@@ -180,11 +189,22 @@ fn allocLarge(size: usize) ?*anyopaque {
         // Write large alloc marker header
         const header: *SlabHeader = @ptrCast(@alignCast(base));
         header.pool_idx = LARGE_ALLOC_MARKER;
+        header._pad = 1; // 1 page for kfree
         // Return pointer after header
         return @ptrFromInt(@intFromPtr(base) + HEADER_ALIGNED);
     }
-    serial.writeString("[slab] Large multi-page alloc not yet supported\n");
-    return null;
+    // Multi-page allocation: use contiguous pages from PMM
+    const phys = pmm.allocContiguous(pages_needed) orelse {
+        serial.writeString("[slab] OOM: cannot allocate contiguous pages\n");
+        return null;
+    };
+    const base: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+    // Write large alloc marker header with page count for freeing
+    const header: *SlabHeader = @ptrCast(@alignCast(base));
+    header.pool_idx = LARGE_ALLOC_MARKER;
+    // Store page count in _pad field for freeing
+    header._pad = @intCast(@min(pages_needed, 255));
+    return @ptrFromInt(@intFromPtr(base) + HEADER_ALIGNED);
 }
 
 pub fn getStats() struct { total_allocs: u32, total_pages: u32 } {
