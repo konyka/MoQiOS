@@ -23,6 +23,8 @@ pub const SO_LINGER: u64 = 13;
 // ─── SOL_TCP Options ──────────────────────────────────────────────────────
 
 pub const TCP_NODELAY: u64 = 1;
+pub const TCP_CORK: u64 = 3;
+pub const TCP_QUICKACK: u64 = 12;
 pub const TCP_KEEPIDLE: u64 = 4;
 pub const TCP_KEEPINTVL: u64 = 5;
 pub const TCP_KEEPCNT: u64 = 6;
@@ -33,6 +35,8 @@ pub const SocketOptions = struct {
     reuse_addr: bool = false,
     keep_alive: bool = false,
     tcp_nodelay: bool = false, // disable Nagle (default: off → Nagle enabled)
+    tcp_cork: bool = false, // coalesce writes into full MSS segments
+    tcp_quickack: bool = false, // disable delayed ACK
     rcv_timeout_ms: u32 = 0, // 0 = no timeout
     snd_timeout_ms: u32 = 0,
     rcv_buf_size: u32 = 16384,
@@ -47,18 +51,19 @@ pub const SocketOptions = struct {
 
 // ─── Resolve fd → SocketOptions pointer ───────────────────────────────────
 
-fn resolveTcpOpts(fd: u64) ?*SocketOptions {
+fn resolveTcpIdx(fd: u64) ?u32 {
     const fd_u32: u32 = @truncate(fd);
     if (fd_u32 >= 32) return null;
-
     const sched_mod = @import("../proc/sched.zig");
     const cur_idx = sched_mod.currentTaskIndex() orelse return null;
     const task_mod = @import("../proc/task.zig");
     const t = task_mod.getTask(cur_idx) orelse return null;
-
     if (t.fd_table.fds[fd_u32].fd_type != .tcp_socket) return null;
-    const tcb_idx = t.fd_table.fds[fd_u32].tcb_idx;
+    return t.fd_table.fds[fd_u32].tcb_idx;
+}
 
+fn resolveTcpOpts(fd: u64) ?*SocketOptions {
+    const tcb_idx = resolveTcpIdx(fd) orelse return null;
     const tcp_mod = @import("tcp.zig");
     return tcp_mod.tcpGetOptionsPtr(tcb_idx);
 }
@@ -67,6 +72,7 @@ fn resolveTcpOpts(fd: u64) ?*SocketOptions {
 
 pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen: u64) i64 {
     const opts = resolveTcpOpts(fd) orelse return -88; // ENOTSOCK
+    const tcb_idx = resolveTcpIdx(fd).?; // guaranteed valid since resolveTcpOpts succeeded
 
     // Validate optval pointer
     if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT
@@ -138,6 +144,31 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
                 var buf: [4]u8 = undefined;
                 _ = copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4);
                 opts.tcp_nodelay = bo.readU32Le(&buf) != 0;
+            },
+            TCP_CORK => {
+                if (optlen < 4) return -22;
+                var buf: [4]u8 = undefined;
+                _ = copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4);
+                const new_cork = bo.readU32Le(&buf) != 0;
+                // Uncorking triggers flush of any pending data
+                if (opts.tcp_cork and !new_cork) {
+                    opts.tcp_cork = false;
+                    const tcp_mod = @import("tcp.zig");
+                    tcp_mod.tcpFlushCork(tcb_idx);
+                } else {
+                    opts.tcp_cork = new_cork;
+                }
+            },
+            TCP_QUICKACK => {
+                if (optlen < 4) return -22;
+                var buf: [4]u8 = undefined;
+                _ = copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4);
+                opts.tcp_quickack = bo.readU32Le(&buf) != 0;
+                // Setting quickack immediately flushes any pending delayed ACK
+                if (opts.tcp_quickack) {
+                    const tcp_mod = @import("tcp.zig");
+                    tcp_mod.tcpFlushAck(tcb_idx);
+                }
             },
             TCP_KEEPIDLE => {
                 if (optlen < 4) return -22;
@@ -236,6 +267,14 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
             TCP_NODELAY => {
                 val_len = 4;
                 bo.writeU32Le(val_buf[0..4], if (opts.tcp_nodelay) 1 else 0);
+            },
+            TCP_CORK => {
+                val_len = 4;
+                bo.writeU32Le(val_buf[0..4], if (opts.tcp_cork) 1 else 0);
+            },
+            TCP_QUICKACK => {
+                val_len = 4;
+                bo.writeU32Le(val_buf[0..4], if (opts.tcp_quickack) 1 else 0);
             },
             TCP_KEEPIDLE => {
                 val_len = 4;

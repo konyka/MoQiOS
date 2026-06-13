@@ -81,7 +81,28 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
         return -1;
     }
 
-    if (domain != 2 or sock_type != 1) return -38; // ENOSYS
+    if (domain != 2 or sock_type != 1) {
+        // AF_INET + SOCK_RAW (type=3): raw packet socket
+        if (domain == 2 and sock_type == 3) {
+            // Allocate raw socket fd
+            var fd_slot: u32 = undefined;
+            var found = false;
+            for (3..t.fd_table.fds.len) |i| {
+                if (t.fd_table.fds[i].fd_type == .none) {
+                    fd_slot = @intCast(i);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return -24; // EMFILE
+            t.fd_table.fds[fd_slot] = .{
+                .fd_type = .raw_socket,
+                .writable = true,
+            };
+            return @intCast(fd_slot);
+        }
+        return -38; // ENOSYS
+    }
 
     // AF_INET + TCP
     const tcb_idx = net_mod.tcp.tcpSocket(cur_idx);
@@ -116,6 +137,18 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         }
         const result = net_mod.unix_socket.unixBind(unix_idx, @ptrCast(sock_addr_buf[2 .. 2 + path_len].ptr), path_len);
         return @as(i64, result);
+    }
+
+    // UDP bind
+    if (t.fd_table.fds[fd].fd_type == .udp_socket) {
+        if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -1;
+        var sock_addr: [8]u8 = undefined;
+        _ = copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), 8);
+        const new_port = bo.readU16BeAt(&sock_addr, 2);
+        const idx = udp.ensurePort(new_port);
+        if (idx == 0xFFFF) return -98; // EADDRINUSE
+        t.fd_table.fds[fd].udp_port = new_port;
+        return 0;
     }
 
     if (t.fd_table.fds[fd].fd_type != .tcp_socket) return -88; // ENOTSOCK
@@ -233,6 +266,10 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
                 dst_port = bo.readU16BeAt(&sa_buf, 2);
                 dst_ip = .{ sa_buf[4], sa_buf[5], sa_buf[6], sa_buf[7] };
             }
+        } else if (t.fd_table.fds[fd].udp_connected) {
+            // Use connected destination when no address provided (send() on connected UDP)
+            dst_ip = t.fd_table.fds[fd].udp_dst_ip;
+            dst_port = t.fd_table.fds[fd].udp_dst_port;
         }
         const src_port = t.fd_table.fds[fd].udp_port;
         if (udp.sendTo(dst_ip, dst_port, src_port, &tmp_buf2, @intCast(n2))) {
@@ -339,7 +376,22 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
 
-    if (fd >= vfs_mod.MAX_FDS or t.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
+    if (fd >= vfs_mod.MAX_FDS) return -88;
+
+    // UDP connect: set default destination
+    if (t.fd_table.fds[fd].fd_type == .udp_socket) {
+        if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -1;
+        var sock_addr: [8]u8 = undefined;
+        _ = copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), 8);
+        const dst_port = bo.readU16BeAt(&sock_addr, 2);
+        const dst_ip = [4]u8{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] };
+        t.fd_table.fds[fd].udp_connected = true;
+        t.fd_table.fds[fd].udp_dst_ip = dst_ip;
+        t.fd_table.fds[fd].udp_dst_port = dst_port;
+        return 0;
+    }
+
+    if (t.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
     const tcb_idx = t.fd_table.fds[fd].tcb_idx;
 
     if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -1;

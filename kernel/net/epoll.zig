@@ -87,6 +87,7 @@ pub const EpollItem = struct {
 /// EpollInstance — represents one epoll fd.
 pub const EpollInstance = struct {
     items: [MAX_EPOLL_ITEMS]EpollItem = @splat(.{}),
+    in_use_bm: [2]u64 = @splat(0), // Bitmap: 128 items = 2 x u64
     item_count: u8 = 0,
     ready_head: ?u8 = null,
     ready_tail: ?u8 = null,
@@ -99,6 +100,8 @@ pub const EpollInstance = struct {
 // ---- Global pool ----
 
 var epoll_pool: [MAX_EPOLL_INSTANCES]EpollInstance = @splat(.{});
+/// Bitmap of valid epoll instances (1 = valid).
+var valid_epoll_bm: u32 = 0;
 
 /// Obtain a pointer to an epoll instance by index.
 pub fn getInstance(idx: u32) ?*EpollInstance {
@@ -114,16 +117,16 @@ pub fn getInstance(idx: u32) ?*EpollInstance {
 /// Returns the pool index or a negative errno on failure.
 pub fn epollCreate() i32 {
     const cur_idx = sched.currentTaskIndex() orelse return @intCast(EMFILE);
-    for (&epoll_pool, 0..) |*inst, i| {
-        if (!inst.valid) {
-            inst.* = .{
-                .owner_task_idx = cur_idx,
-                .valid = true,
-            };
-            return @intCast(i);
-        }
-    }
-    return @intCast(EMFILE);
+    const all_mask: u32 = if (MAX_EPOLL_INSTANCES >= 32) 0xFFFFFFFF else (@as(u32, 1) << MAX_EPOLL_INSTANCES) - 1;
+    const free_mask = ~valid_epoll_bm & all_mask;
+    if (free_mask == 0) return @intCast(EMFILE);
+    const i: u5 = @intCast(@ctz(free_mask));
+    valid_epoll_bm |= @as(u32, 1) << i;
+    epoll_pool[i] = .{
+        .owner_task_idx = cur_idx,
+        .valid = true,
+    };
+    return @intCast(i);
 }
 
 /// Control an epoll instance — add, modify, or delete an fd registration.
@@ -142,15 +145,26 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
 
     switch (op) {
         EPOLL_CTL_ADD => {
-            for (&inst.items) |*item| {
-                if (item.in_use and item.fd == fd) return EEXIST;
+            // Check for duplicate fd via bitmap iteration
+            for (0..2) |w| {
+                var bits = inst.in_use_bm[w];
+                while (bits != 0) {
+                    const bit = @ctz(bits);
+                    bits &= bits - 1;
+                    const i: u8 = @intCast(w * 64 + @as(u32, bit));
+                    if (inst.items[i].fd == fd) return EEXIST;
+                }
             }
             var slot: ?u8 = null;
-            for (&inst.items, 0..) |*item, i| {
-                if (!item.in_use) {
-                    slot = @intCast(i);
-                    break;
-                }
+            // Find free slot via inverted in_use bitmap
+            for (0..2) |w| {
+                const inv = ~inst.in_use_bm[w];
+                if (inv == 0) continue;
+                const bit = @ctz(inv);
+                const idx: u8 = @intCast(w * 64 + @as(u32, bit));
+                if (idx >= MAX_EPOLL_ITEMS) break;
+                slot = idx;
+                break;
             }
             const s = slot orelse return ENOSPC;
             const ev = copyEventFromUser(event_ptr) orelse return EINVAL;
@@ -166,6 +180,7 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
                 .in_use = true,
             };
             inst.item_count += 1;
+            inst.in_use_bm[s >> 6] |= @as(u64, 1) << @intCast(s & 63);
 
             const current = computeCurrentEvents(desc.fd_type, resourceIdxFromDesc(desc));
             if (current & (ev.events & ~EPOLLET & ~EPOLLONESHOT) != 0) {
@@ -174,37 +189,53 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
         },
         EPOLL_CTL_MOD => {
             var found = false;
-            for (&inst.items, 0..) |*item, i| {
-                if (item.in_use and item.fd == fd) {
-                    const ev = copyEventFromUser(event_ptr) orelse return EINVAL;
-                    item.events = ev.events;
-                    item.data = ev.data;
-                    item.is_et = (ev.events & EPOLLET) != 0;
-                    item.is_oneshot = (ev.events & EPOLLONESHOT) != 0;
-                    item.is_disabled = false;
-                    item.last_reported = 0;
-                    found = true;
-                    if (!item.on_ready) {
-                        const current = computeCurrentEvents(item.fd_type, item.resource_idx);
-                        if (current & (ev.events & ~EPOLLET & ~EPOLLONESHOT) != 0) {
-                            addToReadyList(inst, @intCast(i));
+            for (0..2) |w| {
+                var bits = inst.in_use_bm[w];
+                while (bits != 0) {
+                    const bit = @ctz(bits);
+                    bits &= bits - 1;
+                    const i: u8 = @intCast(w * 64 + @as(u32, bit));
+                    const item = &inst.items[i];
+                    if (item.fd == fd) {
+                        const ev = copyEventFromUser(event_ptr) orelse return EINVAL;
+                        item.events = ev.events;
+                        item.data = ev.data;
+                        item.is_et = (ev.events & EPOLLET) != 0;
+                        item.is_oneshot = (ev.events & EPOLLONESHOT) != 0;
+                        item.is_disabled = false;
+                        item.last_reported = 0;
+                        found = true;
+                        if (!item.on_ready) {
+                            const current = computeCurrentEvents(item.fd_type, item.resource_idx);
+                            if (current & (ev.events & ~EPOLLET & ~EPOLLONESHOT) != 0) {
+                                addToReadyList(inst, i);
+                            }
                         }
+                        break;
                     }
-                    break;
                 }
+                if (found) break;
             }
             if (!found) return ENOENT;
         },
         EPOLL_CTL_DEL => {
             var found = false;
-            for (&inst.items) |*item| {
-                if (item.in_use and item.fd == fd) {
-                    if (item.on_ready) removeFromReadyList(inst, item.fd);
-                    item.* = .{};
-                    inst.item_count -= 1;
-                    found = true;
-                    break;
+            for (0..2) |w| {
+                var bits = inst.in_use_bm[w];
+                while (bits != 0) {
+                    const bit = @ctz(bits);
+                    bits &= bits - 1;
+                    const i: u8 = @intCast(w * 64 + @as(u32, bit));
+                    if (inst.items[i].fd == fd) {
+                        if (inst.items[i].on_ready) removeFromReadyList(inst, inst.items[i].fd);
+                        inst.items[i] = .{};
+                        inst.in_use_bm[w] &= ~(@as(u64, 1) << @intCast(bit));
+                        inst.item_count -= 1;
+                        found = true;
+                        break;
+                    }
                 }
+                if (found) break;
             }
             if (!found) return ENOENT;
         },
@@ -242,40 +273,36 @@ pub fn epollWait(epfd_idx: u32, events_buf: u64, max_events: u32, timeout_ms: i3
 
 /// Notification callback — called by TCP, pipe, etc. when state changes.
 pub fn epollNotify(fd_type: vfs.FdType, resource_idx: u32, ready_events: u32) void {
-    for (&epoll_pool) |*inst| {
-        if (!inst.valid) continue;
+    var ebm = valid_epoll_bm;
+    while (ebm != 0) {
+        const ei = @ctz(ebm);
+        ebm &= ebm - 1;
+        const inst = &epoll_pool[ei];
         const saved = inst.spin.acquire();
 
-        for (&inst.items, 0..) |*item, i| {
-            if (!item.in_use) continue;
-            if (item.is_disabled) continue;
-            if (item.fd_type != fd_type) continue;
+        for (0..2) |w| {
+            var bits = inst.in_use_bm[w];
+            while (bits != 0) {
+                const bit = @ctz(bits);
+                bits &= bits - 1;
+                const i: u8 = @intCast(w * 64 + @as(u32, bit));
+                const item = &inst.items[i];
+                if (item.is_disabled) continue;
+                if (item.fd_type != fd_type) continue;
+                if (item.resource_idx != resource_idx) continue;
 
-            switch (fd_type) {
-                .pipe_read => {
-                    if (item.fd_type != .pipe_read) continue;
-                    if (item.resource_idx != resource_idx) continue;
-                },
-                .pipe_write => {
-                    if (item.fd_type != .pipe_write) continue;
-                    if (item.resource_idx != resource_idx) continue;
-                },
-                else => {
-                    if (item.resource_idx != resource_idx) continue;
-                },
-            }
+                const interest = item.events & ~EPOLLET & ~EPOLLONESHOT;
+                const matched = ready_events & interest;
+                if (matched == 0) continue;
 
-            const interest = item.events & ~EPOLLET & ~EPOLLONESHOT;
-            const matched = ready_events & interest;
-            if (matched == 0) continue;
+                if (item.is_et) {
+                    if (matched == item.last_reported) continue;
+                    item.last_reported = matched;
+                }
 
-            if (item.is_et) {
-                if (matched == item.last_reported) continue;
-                item.last_reported = matched;
-            }
-
-            if (!item.on_ready) {
-                addToReadyListLocked(inst, @intCast(i));
+                if (!item.on_ready) {
+                    addToReadyListLocked(inst, i);
+                }
             }
         }
 
@@ -370,6 +397,9 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32) u32 {
         .inotify => {
             revents |= EPOLLIN | EPOLLOUT;
         },
+        .raw_socket => {
+            revents |= EPOLLIN | EPOLLOUT;
+        },
     }
     return revents;
 }
@@ -422,12 +452,11 @@ fn collectEvents(inst: *EpollInstance, out: []EpollEvent, max_out: u32) u32 {
     const scan_head = inst.ready_head;
     inst.ready_head = null;
     inst.ready_tail = null;
+    // First pass: only clear on_ready flag (preserve ready_next for second pass)
     var cur = scan_head;
     while (cur) |idx| {
         inst.items[idx].on_ready = false;
-        const next = inst.items[idx].ready_next;
-        inst.items[idx].ready_next = null;
-        cur = next;
+        cur = inst.items[idx].ready_next;
     }
 
     var count: u32 = 0;
@@ -514,4 +543,7 @@ fn wakeWaiterLocked(inst: *EpollInstance) void {
 pub fn epollDestroy(epoll_idx: u32) void {
     if (epoll_idx >= MAX_EPOLL_INSTANCES) return;
     epoll_pool[epoll_idx] = .{};
+    if (epoll_idx < 32) {
+        valid_epoll_bm &= ~(@as(u32, 1) << @intCast(epoll_idx));
+    }
 }

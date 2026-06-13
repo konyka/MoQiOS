@@ -12,7 +12,6 @@
 ///   - Each socket has its own 8KB ring buffer
 ///   - STREAM sockets: connect establishes a peer pair; send writes to peer's buffer
 ///   - DGRAM sockets: send writes to peer's buffer directly (no connect required if bound)
-
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 pub const AF_UNIX: u32 = 1;
@@ -23,6 +22,32 @@ pub const UNIX_SOCK_BUF_SIZE: u32 = 8192;
 pub const MAX_UNIX_SOCKETS: u32 = 32;
 pub const UNIX_PATH_MAX: u8 = 108;
 pub const UNIX_BACKLOG_MAX: u8 = 4;
+
+/// Write `count` bytes from `src` into ring buffer at `write_pos`.
+/// Uses @memcpy for contiguous chunks (handles wraparound at buffer boundary).
+inline fn ringWrite(buffer: *[UNIX_SOCK_BUF_SIZE]u8, write_pos: u32, src: [*]const u8, count: usize) void {
+    if (count == 0) return;
+    const tail = UNIX_SOCK_BUF_SIZE - write_pos;
+    if (tail >= count) {
+        @memcpy(buffer[write_pos .. write_pos + @as(u32, @intCast(count))], src[0..count]);
+    } else {
+        @memcpy(buffer[write_pos..UNIX_SOCK_BUF_SIZE], src[0..tail]);
+        @memcpy(buffer[0..@as(u32, @intCast(count - tail))], src[tail..count]);
+    }
+}
+
+/// Read `count` bytes from ring buffer at `read_pos` into `dst`.
+/// Uses @memcpy for contiguous chunks (handles wraparound at buffer boundary).
+inline fn ringRead(buffer: *const [UNIX_SOCK_BUF_SIZE]u8, read_pos: u32, dst: [*]u8, count: usize) void {
+    if (count == 0) return;
+    const tail = UNIX_SOCK_BUF_SIZE - read_pos;
+    if (tail >= count) {
+        @memcpy(dst[0..count], buffer[read_pos .. read_pos + @as(u32, @intCast(count))]);
+    } else {
+        @memcpy(dst[0..tail], buffer[read_pos..UNIX_SOCK_BUF_SIZE]);
+        @memcpy(dst[tail..count], buffer[0..@as(u32, @intCast(count - tail))]);
+    }
+}
 
 /// WaitNode for blocking operations — stack-allocated on the waiter's kernel stack.
 pub const WaitNode = struct {
@@ -262,13 +287,10 @@ pub fn unixSend(idx: u32, data: [*]const u8, len: usize) i64 {
         if (peer_i >= MAX_UNIX_SOCKETS or !unix_sockets[peer_i].active) return -32; // EPIPE
 
         const peer = &unix_sockets[peer_i];
-        var n: usize = 0;
-        while (n < len and peer.buf_count < UNIX_SOCK_BUF_SIZE) {
-            peer.buffer[peer.buf_write] = data[n];
-            peer.buf_write = (peer.buf_write + 1) % UNIX_SOCK_BUF_SIZE;
-            peer.buf_count += 1;
-            n += 1;
-        }
+        const n: usize = @min(len, UNIX_SOCK_BUF_SIZE - peer.buf_count);
+        ringWrite(&peer.buffer, peer.buf_write, data, n);
+        peer.buf_write = (peer.buf_write + @as(u32, @intCast(n))) % UNIX_SOCK_BUF_SIZE;
+        peer.buf_count += @as(u32, @intCast(n));
 
         // Wake any read waiter on peer
         if (n > 0 and peer.read_waiters) |node| {
@@ -300,11 +322,9 @@ pub fn unixSend(idx: u32, data: [*]const u8, len: usize) i64 {
         peer.buf_count += 2;
 
         // Write data
-        for (0..len) |j| {
-            peer.buffer[peer.buf_write] = data[j];
-            peer.buf_write = (peer.buf_write + 1) % UNIX_SOCK_BUF_SIZE;
-            peer.buf_count += 1;
-        }
+        ringWrite(&peer.buffer, peer.buf_write, data, len);
+        peer.buf_write = (peer.buf_write + @as(u32, @intCast(len))) % UNIX_SOCK_BUF_SIZE;
+        peer.buf_count += @as(u32, @intCast(len));
 
         // Wake any read waiter on peer
         if (peer.read_waiters) |node| {
@@ -334,13 +354,10 @@ pub fn unixRecv(idx: u32, buf: [*]u8, len: usize) i64 {
     if (sock.buf_count == 0) return -11; // EAGAIN
 
     if (sock.sock_type == SOCK_STREAM) {
-        var n: usize = 0;
-        while (n < len and sock.buf_count > 0) {
-            buf[n] = sock.buffer[sock.buf_read];
-            sock.buf_read = (sock.buf_read + 1) % UNIX_SOCK_BUF_SIZE;
-            sock.buf_count -= 1;
-            n += 1;
-        }
+        const n: usize = @min(len, sock.buf_count);
+        ringRead(&sock.buffer, sock.buf_read, buf, n);
+        sock.buf_read = (sock.buf_read + @as(u32, @intCast(n))) % UNIX_SOCK_BUF_SIZE;
+        sock.buf_count -= @as(u32, @intCast(n));
 
         if (n > 0 and sock.peer_idx < MAX_UNIX_SOCKETS) {
             const peer = &unix_sockets[sock.peer_idx];
@@ -369,17 +386,15 @@ pub fn unixRecv(idx: u32, buf: [*]u8, len: usize) i64 {
         const dgram_len: usize = @as(usize, lo) | (@as(usize, hi) << 8);
 
         const to_read = @min(len, dgram_len);
-        for (0..to_read) |j| {
-            buf[j] = sock.buffer[sock.buf_read];
-            sock.buf_read = (sock.buf_read + 1) % UNIX_SOCK_BUF_SIZE;
-            sock.buf_count -= 1;
-        }
+        ringRead(&sock.buffer, sock.buf_read, buf, to_read);
+        sock.buf_read = (sock.buf_read + @as(u32, @intCast(to_read))) % UNIX_SOCK_BUF_SIZE;
+        sock.buf_count -= @as(u32, @intCast(to_read));
         // Discard remaining bytes of this datagram if buf was too small
-        var discard: usize = dgram_len - to_read;
-        while (discard > 0 and sock.buf_count > 0) {
-            sock.buf_read = (sock.buf_read + 1) % UNIX_SOCK_BUF_SIZE;
-            sock.buf_count -= 1;
-            discard -= 1;
+        const discard: usize = dgram_len - to_read;
+        if (discard > 0) {
+            const actual_discard = @min(discard, sock.buf_count);
+            sock.buf_read = (sock.buf_read + @as(u32, @intCast(actual_discard))) % UNIX_SOCK_BUF_SIZE;
+            sock.buf_count -= @as(u32, @intCast(actual_discard));
         }
 
         // Wake any write waiter on peer
