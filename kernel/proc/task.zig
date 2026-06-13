@@ -132,7 +132,7 @@ pub const Task = struct {
 
     /// Wait queue for blocking operations (waitpid, pipe, etc.).
     /// The task sleeps on this queue until woken.
-    wait_queue: ?*WaitNode,
+    wait_queue: ?*?*WaitNode,
 
     /// Wait queue for parent waitpid — woken when this task exits.
     exit_waiters: ?*WaitNode,
@@ -158,6 +158,24 @@ pub const Task = struct {
 
     /// Process name (for prctl PR_SET_NAME / /proc/<pid>/comm).
     comm: [16]u8 = [_]u8{0} ** 16,
+
+    /// Robust futex list head (set by set_robust_list syscall).
+    robust_list_head: u64 = 0,
+    /// Robust futex list length (set by set_robust_list syscall).
+    robust_list_len: u32 = 0,
+
+    /// Scheduling policy: 0=OTHER, 1=FIFO, 2=RR, 3=BATCH, 6=DEADLINE.
+    sched_policy: u8 = 0,
+
+    /// alarm() deadline in TSC nanoseconds (0 = no alarm set).
+    alarm_deadline: u64 = 0,
+
+    /// ITIMER_REAL: next expiration deadline (ns) and recurring interval (ns).
+    itimer_real_value: u64 = 0,
+    itimer_real_interval: u64 = 0,
+
+    /// Parent death signal (0 = none). Delivered to child when parent exits.
+    pdeathsig: u32 = 0,
 };
 
 /// Tracked mmap region for munmap support.
@@ -166,6 +184,8 @@ pub const MmapRegion = struct {
     num_pages: u64 = 0,
     /// 0 = free slot
     active: bool = false,
+    /// Whether this region is mlock'd (non-swappable).
+    locked: bool = false,
 };
 
 pub const MAX_TASKS: u32 = 64;
@@ -331,12 +351,17 @@ fn freeKernelStack(stack_virt: u64) void {
 
 var next_assign_cpu: u32 = 0;
 
-/// CPU pin for new user tasks. ELF stays on BSP; flat round-robin in M8-5b-2e.
+/// CPU pin for new user tasks: flat round-robin across online CPUs.
+/// Each task gets its own PML4, so no cross-CPU TLB shootdown is needed.
+/// fork inherits parent's affinity (handled in fork.zig).
 pub fn assignCpuAffinity(elf: bool) u8 {
-    _ = @import("../smp.zig");
-    _ = next_assign_cpu;
+    const smp = @import("../smp.zig");
     _ = elf;
-    return 0;
+    const ncpus = @as(u32, @truncate(smp.cpu_count));
+    if (ncpus <= 1) return 0;
+    const cpu: u8 = @truncate(next_assign_cpu % ncpus);
+    next_assign_cpu += 1;
+    return cpu;
 }
 
 /// Create a kernel thread pinned to a specific CPU (M8-5b-2).

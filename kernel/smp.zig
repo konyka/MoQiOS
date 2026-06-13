@@ -186,23 +186,6 @@ fn ensureHhdmForPageTables(pml4_phys: u64) void {
     }
 }
 
-/// Map a contiguous range of physical pages into the kernel virtual space.
-fn mapApStack(phys_base: u64, pages: u64) u64 {
-    const pml4 = paging.getKernelPml4();
-    const flags = paging.MapFlags{
-        .writable = true,
-        .user = false,
-        .no_execute = true,
-        .global = true,
-    };
-    for (0..pages) |i| {
-        const phys = phys_base + i * paging.PAGE_SIZE;
-        const virt = hhdm.physToVirt(phys);
-        paging.mapPage(pml4, virt, phys, flags) catch {};
-    }
-    return hhdm.physToVirt(phys_base + pages * paging.PAGE_SIZE);
-}
-
 /// Make HHDM pages for the first 64KB writable (for trampoline data area).
 fn makeHhdmWritable(pml4_phys: u64) void {
     var phys_page: u64 = 0x0000;
@@ -428,21 +411,14 @@ pub fn init() void {
         // Pre-seed APIC id from MADT (apEntry refreshes via lapic.id() after initAp).
         syscall_entry.percpu_array[cpu_id].apic_id = apic_id;
 
-        // Allocate AP kernel stack (16 pages = 64KB)
-        var stack_phys: u64 = 0;
-        {
-            var page_idx: u64 = 0;
-            while (page_idx < KERNEL_STACK_PAGES) : (page_idx += 1) {
-                const p = pmm.allocPage() orelse {
-                    serial.writeString("[SMP] ERROR: out of memory for AP stack\n");
-                    return;
-                };
-                if (page_idx == 0) stack_phys = p;
-            }
-        }
-
-        // Map AP stack pages (ensures pages are mapped in page tables for HHDM access)
-        const stack_top = mapApStack(stack_phys, KERNEL_STACK_PAGES);
+        // Allocate AP kernel stack (16 pages = 64KB) — MUST be physically contiguous
+        // so that HHDM (linear phys→virt) gives a contiguous virtual range for the stack.
+        // Non-contiguous pages would leave unmapped gaps → #PF when RSP crosses a boundary.
+        const stack_phys = pmm.allocContiguous(KERNEL_STACK_PAGES) orelse {
+            serial.writeString("[SMP] ERROR: out of contiguous memory for AP stack\n");
+            return;
+        };
+        const stack_top = hhdm.physToVirt(stack_phys + KERNEL_STACK_PAGES * 4096);
 
         serial.writeString("[SMP] AP stack: phys=0x");
         fmt.writeHex(stack_phys);

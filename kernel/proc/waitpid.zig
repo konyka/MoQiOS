@@ -9,6 +9,12 @@ const se = @import("../arch/x86_64/syscall_entry.zig");
 /// waitpid(pid, status_ptr) -> child tid or -errno.
 /// pid: -1 (any child) or >0 (specific child).
 pub fn waitpid(pid_raw: u64, status_ptr: u64) i64 {
+    return waitpidWithOptions(pid_raw, status_ptr, 0);
+}
+
+/// waitpidWithOptions — core implementation with WNOHANG support.
+/// options: bit 0 = WNOHANG (return 0 immediately if no zombie child)
+pub fn waitpidWithOptions(pid_raw: u64, status_ptr: u64, options: u32) i64 {
     const pid: i32 = if (pid_raw == @as(u64, @bitCast(@as(i64, -1))))
         @as(i32, -1)
     else if (pid_raw > 0x7FFFFFFF)
@@ -28,11 +34,15 @@ pub fn waitpid(pid_raw: u64, status_ptr: u64) i64 {
         return child_tid;
     }
 
+    // WNOHANG: return 0 immediately if no zombie child
+    if (options & 1 != 0) return 0;
+
     // No zombie child yet — block until a child exits.
     const parent = task_mod.getTask(cur_idx) orelse return -1;
     parent.waiting_for_child = true;
     parent.wait_cpu = @intCast(se.getPerCpu().cpu_id);
     parent.state = .blocked;
+    se.syncUserRspToTask(parent);
     asm volatile ("" ::: .{ .memory = true });
     task_mod.kickChildCpus(parent.tid, parent.wait_cpu);
     asm volatile ("sti");
@@ -43,6 +53,7 @@ pub fn waitpid(pid_raw: u64, status_ptr: u64) i64 {
     }
 
     parent.state = .running;
+    se.syncUserRspFromTask(parent);
 
     // Woken up — a child has exited. Now reap it.
     if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {

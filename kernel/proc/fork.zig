@@ -15,7 +15,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
     const parent_idx = sched.currentTaskIndex() orelse return -1;
     const parent = task_mod.getTask(parent_idx) orelse return -1;
 
-    const child_pml4 = cloneUserPages(parent.page_table_phys) orelse return -1;
+    const child_pml4 = cloneUserPagesCow(parent.page_table_phys) orelse return -1;
 
     const child_idx = task_mod.createUserProcess(
         parent.user_entry,
@@ -169,6 +169,99 @@ pub fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
 
                     const flags = pte & 0xFFF;
                     child_pt[pt_idx] = dst_phys | flags;
+                }
+            }
+        }
+    }
+
+    return child_pml4_phys;
+}
+
+/// COW (Copy-on-Write) fork: share physical pages between parent and child.
+/// Instead of allocating + copying 4KB per page, both processes share the same
+/// physical page marked read-only with COW bit. The #PF handler (handleCowFault
+/// in idt.zig) allocates a private copy on first write.
+/// This makes fork() O(page-table-entries) instead of O(total-pages * 4KB).
+pub fn cloneUserPagesCow(parent_pml4_phys: u64) ?u64 {
+    const pmm_mod = @import("../mm/pmm.zig");
+    const hhdm_mod = @import("../mm/hhdm.zig");
+    const paging_mod = @import("../arch/x86_64/paging.zig");
+
+    const ADDR_MASK: u64 = 0xFFFFFFFFF000;
+    const COW_BIT: u64 = 1 << 9;
+    const WRITABLE: u64 = paging_mod.WRITABLE;
+
+    const child_pml4_phys = pmm_mod.allocPage() orelse return null;
+    const child_pml4: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(child_pml4_phys));
+    @memset(child_pml4[0..512], 0);
+
+    // Copy kernel page table entries (upper half, entries 256..511)
+    const kernel_pml4_phys = paging_mod.getKernelPml4();
+    const kernel_pml4: [*]const u64 = @ptrFromInt(hhdm_mod.physToVirt(kernel_pml4_phys));
+    for (256..512) |i| {
+        child_pml4[i] = kernel_pml4[i];
+    }
+
+    const parent_pml4: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(parent_pml4_phys));
+
+    for (0..256) |pml4_idx| {
+        const pml4e = parent_pml4[pml4_idx];
+        if (pml4e == 0 or pml4e & 1 == 0) continue;
+
+        const parent_pdpt_phys = pml4e & ADDR_MASK;
+        const child_pdpt_phys = pmm_mod.allocPage() orelse return null;
+        const child_pdpt: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(child_pdpt_phys));
+        @memset(child_pdpt[0..512], 0);
+        child_pml4[pml4_idx] = child_pdpt_phys | 0x07; // present+writable+user
+
+        const parent_pdpt: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(parent_pdpt_phys));
+
+        for (0..512) |pdpt_idx| {
+            const pdpte = parent_pdpt[pdpt_idx];
+            if (pdpte == 0 or pdpte & 1 == 0) continue;
+
+            const parent_pd_phys = pdpte & ADDR_MASK;
+            const child_pd_phys = pmm_mod.allocPage() orelse return null;
+            const child_pd: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(child_pd_phys));
+            @memset(child_pd[0..512], 0);
+            child_pdpt[pdpt_idx] = child_pd_phys | 0x07;
+
+            const parent_pd: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(parent_pd_phys));
+
+            for (0..512) |pd_idx| {
+                const pde = parent_pd[pd_idx];
+                if (pde == 0 or pde & 1 == 0) continue;
+
+                const parent_pt_phys = pde & ADDR_MASK;
+                const child_pt_phys = pmm_mod.allocPage() orelse return null;
+                const child_pt: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(child_pt_phys));
+                @memset(child_pt[0..512], 0);
+                child_pd[pd_idx] = child_pt_phys | 0x07;
+
+                const parent_pt: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(parent_pt_phys));
+
+                for (0..512) |pt_idx| {
+                    const pte = parent_pt[pt_idx];
+                    if (pte == 0 or pte & 1 == 0) continue;
+
+                    const phys = pte & ADDR_MASK;
+                    const flags = pte & 0xFFF;
+
+                    // Share the physical page: increment ref count
+                    pmm_mod.addRef(phys);
+
+                    // Mark parent PTE as read-only + COW (if not already COW)
+                    if (flags & COW_BIT == 0) {
+                        const cow_pte = (pte & ~WRITABLE) | COW_BIT;
+                        parent_pt[pt_idx] = cow_pte;
+                        // Invalidate parent TLB for this page
+                        const virt = (pml4_idx << 39) | (pdpt_idx << 30) |
+                            (pd_idx << 21) | (pt_idx << 12);
+                        paging_mod.invlpg(virt);
+                    }
+
+                    // Child gets the same physical page with COW + read-only
+                    child_pt[pt_idx] = phys | (flags & ~WRITABLE) | COW_BIT;
                 }
             }
         }

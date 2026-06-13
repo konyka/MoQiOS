@@ -140,6 +140,35 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         // Drive POSIX timer expiration checks
         const posix_timer = @import("../ipc/posix_timer.zig");
         posix_timer.timerTick(idt.getTickCount());
+        // Drive alarm() / setitimer(ITIMER_REAL) expiration checks
+        {
+            const tsc = @import("../arch/x86_64/tsc.zig");
+            const signal = @import("signal.zig");
+            const now_ns = tsc.nanos();
+            for (0..task.MAX_TASKS) |i| {
+                const t = task.getTask(@intCast(i)) orelse continue;
+                if (t.state == .zombie) continue;
+                // Check alarm() deadline
+                if (t.alarm_deadline != 0 and now_ns >= t.alarm_deadline) {
+                    t.alarm_deadline = 0; // One-shot: clear after firing
+                    _ = signal.sendSignal(t.tid, 14); // SIGALRM
+                }
+                // Check ITIMER_REAL deadline
+                if (t.itimer_real_value != 0 and now_ns >= t.itimer_real_value) {
+                    _ = signal.sendSignal(t.tid, 14); // SIGALRM
+                    if (t.itimer_real_interval != 0) {
+                        // Recurring: reschedule next expiration
+                        t.itimer_real_value = now_ns + t.itimer_real_interval;
+                    } else {
+                        // One-shot: clear after firing
+                        t.itimer_real_value = 0;
+                    }
+                }
+            }
+        }
+        // Force scheduling on the very next tick so the BSP doesn't idle a full
+        // timeslice after this maintenance pass (which skipped scheduling).
+        setSlice(1);
         return;
     }
 
@@ -523,7 +552,9 @@ fn tryStealTask() void {
 /// Sleep the current task on a wait queue.
 /// The caller must allocate a WaitNode on its kernel stack.
 /// After calling this, the task will not be scheduled until woken.
-/// Returns true if woken normally, false if interrupted by a signal.
+/// Calls forceReschedule() to ensure the scheduler runs ASAP (matching the
+/// pattern used by futex/file_lock — other blocking paths call forceReschedule
+/// directly). Returns true if woken normally, false if interrupted by a signal.
 pub fn sleepOn(queue: *?*task.WaitNode, node: *task.WaitNode) bool {
     const cur_idx = currentTaskIndex() orelse return false;
     const cur = task.getTask(cur_idx) orelse return false;
@@ -538,8 +569,9 @@ pub fn sleepOn(queue: *?*task.WaitNode, node: *task.WaitNode) bool {
     cur.state = .blocked;
     cur.wait_queue = queue;
 
-    // Yield: force a reschedule
-    setSlice(0);
+    // Force immediate reschedule: set force_reschedule so the next timerTick
+    // bypasses the single-task fast-path and picks a different task.
+    forceReschedule();
 
     // When we are woken, we return here. Check if granted.
     // The waker sets node.granted = true before making the task ready.
