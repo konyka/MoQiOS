@@ -21,7 +21,7 @@
 | M10 | fork + execve + 进程地址空间克隆 | ✅ |
 | M11+ | 信号处理、环境变量、目录操作、chdir/getcwd、fstat/unlink | ✅ |
 | 扩展 | ext2 (读写)、tmpfs、procfs、统一页缓存、TCP socket API | ✅ |
-| 扩展 | SMP / AP 启动 | ⚠️ 暂禁用 (LAPIC 崩溃已修复，仍受更深层问题门控，见下) |
+| 扩展 | SMP / AP 启动 | ✅ 启用 (`enable_ap_startup=true`, AP 上线 + timer + idle 调度) |
 
 > **2026-06 引导稳定性修复**：修复了 4 个会导致内核无法启动或健壮性不足的缺陷
 > (SMP AP 启动死锁、内核栈多页映射破坏大页 HHDM、`Task` 巨型结构体导致引导栈溢出、
@@ -30,8 +30,9 @@
 >
 > **2026-06 SMP 进展**：查明并修复了长期存在的 "LAPIC-on-AP 崩溃" 根因——AP trampoline 未启用
 > `EFER.NXE`，导致 AP 冷 TLB walk 到内核 NX 页时触发保留位缺页→三重故障。修复后 AP 可稳定上线
-> (`2 CPUs online`)。但完整启用 SMP 仍受更深层问题门控 (调度器非 SMP 安全 + 一个单核下也存在的
-> 用户态崩溃)，故默认仍 `smp.enable_ap_startup = false` 单处理器运行。详见架构文档第 1.6 节。
+> (`2 CPUs online`)。v27.0 进一步修复 AP 栈物理连续性、BSP reap 调度间隙、TLB shootdown EOI
+> 顺序、sleepOn 阻塞延迟等 SMP 基础设施问题。`smp.enable_ap_startup = true`，用户任务暂绑 BSP。
+> 详见架构文档第 1.6 节。
 
 **用户程序**: ~2,300 行 C/ASM | **测试**: `hello2`–`hello28` 运行时测试 + 交互式 Shell
 (注: `zig build test` 当前为占位，实测以 QEMU 运行 `hello*` 为准)
