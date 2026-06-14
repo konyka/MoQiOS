@@ -2316,9 +2316,10 @@ pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
     const new_val_aligned = if (value.len > 0) (value.len + 3) & ~@as(usize, 3) else 0;
     const new_val_off = if (value.len > 0) min_value_off - new_val_aligned else 0;
 
-    // v52.7: Scan for reusable tombstone slot — best-fit (>=) with mini-tombstone padding
-    // When a larger tombstone is reused, the leftover space is filled with a mini-tombstone
-    // entry (e_name_index=0, e_name_len=leftover-name-bytes) so the scanner can skip it.
+    // v52.8: Scan for reusable tombstone slot — best-fit with safe leftover
+    // Only reuse when leftover == 0 (exact fit) or >= Ext2XattrEntry (can create
+    // mini-tombstone). Leftover of 4/8/12 bytes creates zero dead-zone that
+    // terminates the scanner, making subsequent entries invisible.
     var reuse_off: usize = 0;
     var reuse_tombstone_sz: usize = 0; // size of the tombstone at reuse_off
     {
@@ -2330,10 +2331,13 @@ pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
             if (te.e_name_index == 0) { // tombstone
                 const tombstone_sz = (@sizeOf(Ext2XattrEntry) + te.e_name_len + 3) & ~@as(usize, 3);
                 if (tombstone_sz >= new_entry_size) {
-                    // Best-fit: prefer smallest tombstone that fits
-                    if (reuse_off == 0 or tombstone_sz < reuse_tombstone_sz) {
-                        reuse_off = scan_off;
-                        reuse_tombstone_sz = tombstone_sz;
+                    const leftover = tombstone_sz - new_entry_size;
+                    if (leftover == 0 or leftover >= @sizeOf(Ext2XattrEntry)) {
+                        // Best-fit: prefer smallest tombstone that fits safely
+                        if (reuse_off == 0 or tombstone_sz < reuse_tombstone_sz) {
+                            reuse_off = scan_off;
+                            reuse_tombstone_sz = tombstone_sz;
+                        }
                     }
                 }
             }
@@ -2368,26 +2372,21 @@ pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
     new_entry.e_hash = 0;
     @memcpy(buf[write_off + @sizeOf(Ext2XattrEntry) ..][0..name.len], name);
 
-    // v52.7: If tombstone was larger than new entry, fill leftover with mini-tombstone
-    // This prevents dead-zone zeros from terminating the scanner
+    // v52.8: If tombstone was larger than new entry, fill leftover with mini-tombstone
+    // (leftover is guaranteed >= Ext2XattrEntry by the best-fit filter above)
     if (reuse_off != 0 and reuse_tombstone_sz > new_entry_size) {
         const leftover_off = write_off + new_entry_size;
         const leftover_sz = reuse_tombstone_sz - new_entry_size;
-        if (leftover_sz >= @sizeOf(Ext2XattrEntry)) {
-            // Create mini-tombstone entry for the leftover space
-            const leftover: *Ext2XattrEntry = @ptrCast(@alignCast(buf + leftover_off));
-            const leftover_name_len: u8 = @intCast(leftover_sz - @sizeOf(Ext2XattrEntry));
-            leftover.e_name_len = leftover_name_len;
-            leftover.e_name_index = 0; // tombstone marker
-            leftover.e_value_offs = 0;
-            leftover.e_value_block = 0;
-            leftover.e_value_size = 0;
-            leftover.e_hash = 0;
-            @memset(buf[leftover_off + @sizeOf(Ext2XattrEntry)..][0..leftover_name_len], 0);
-        }
-        // If leftover_sz < @sizeOf(Ext2XattrEntry), the remaining bytes (1-15)
-        // are within the 4-byte aligned padding of the new entry — already zero,
-        // and the next entry starts at reuse_off + reuse_tombstone_sz which is aligned.
+        // leftover_sz >= @sizeOf(Ext2XattrEntry) is guaranteed by best-fit filter
+        const leftover: *Ext2XattrEntry = @ptrCast(@alignCast(buf + leftover_off));
+        const leftover_name_len: u8 = @intCast(leftover_sz - @sizeOf(Ext2XattrEntry));
+        leftover.e_name_len = leftover_name_len;
+        leftover.e_name_index = 0; // tombstone marker
+        leftover.e_value_offs = 0;
+        leftover.e_value_block = 0;
+        leftover.e_value_size = 0;
+        leftover.e_hash = 0;
+        @memset(buf[leftover_off + @sizeOf(Ext2XattrEntry) ..][0..leftover_name_len], 0);
     }
 
     // Write back EA block

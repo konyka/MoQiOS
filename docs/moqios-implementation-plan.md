@@ -1,6 +1,6 @@
 # MoQiOS 实施计划
 
-> **版本**: v52.7
+> **版本**: v52.8
 > **日期**: 2026-05-29
 > **说明**: 本文档记录 MoQiOS 的实际实施进度和已完成里程碑。
 > 长期设计目标参见 [moqios-design.md](./moqios-design.md)，当前架构参见 [moqios-architecture-current.md](./moqios-architecture-current.md)。
@@ -9,7 +9,7 @@
 
 ## 当前状态
 
-- **内核**: 37,329 行 Zig, 125 个源文件
+- **内核**: 37,328 行 Zig, 125 个源文件
 - **系统调用**: 383 个 dispatch 条目 (max #471, #0-#330 连续 + #424-#471 Linux标准编号完全连续), 58 个函数已提取到独立模块
 - **模块提取**: 26 个独立模块文件 (fs/mm/proc/net/sync/arch)
 - **自动化测试**: 29 个 (hello2-hello27, init.S) + 交互式 Shell
@@ -802,6 +802,7 @@
 | v52.5 | 2026-05-29 | Code Review v3 Critical+Warning修复6项: C1-NVMe PRP列表阈值修复(bytes→page_offset+bytes,修复非页对齐缓冲区3+页传输数据丢失)/C2-NVMe selectQueue原子化(@atomicRmw替代非原子+%=?SMP安全)/W1-setXattr valued→flag-only降级清理e_value_offs+清零旧值空间/W2-setXattr tombstone slot复用(扫描墓碑条目size>=新条目size时就地覆盖)/W3-getXattr防护e_value_offs==0且size>0(返回EIO而非读取头部垃圾)/W4-NVMe队列创建失败时释放已分配页面(防内存泄漏); 37265行内核, 383 dispatch条目 |
 | v52.6 | 2026-05-29 | Code Review v4 Critical+Warning修复10项: C1-IdentifyController结构体偏移修复(rsvd1:[257]→[178]+rsvd2:[246]→[248],修复OACS/SQES/CQES/NN全部从错误偏移读取)/C2-tombstone复用改精确匹配(>=→==,避免死区零截断后续条目扫描)/C3-setxattrat系统调用vsize==0不再误返回EFAULT(支持flag-only xattr)/C4-NVMe SQ创建失败时deleteCompletionQueue删除孤立CQ(新增函数)/C5-setXattr EA块分配顺序修复(pmm先于allocBlock+writeBlock回滚)/W1-listXattr添加非user命名空间过滤(与set/get/remove一致)/W2-setXattr tombstone复用时空间检查修正(effective_end)/W3-selectQueue .monotonic→.acq_rel(提供获取释放语义)/W4-xattr命名空间检查nlen>5→nlen>=5(处理"user."空后缀)/W5-NVMe驱动顶部注释更新; 37299行内核, 383 dispatch条目 |
 | v52.7 | 2026-05-29 | Code Review v5 Warning修复2项: W1-setXattr EA块writeInode失败时添加freeBlock回滚(防磁盘块永久泄漏)/W2-tombstone复用从精确匹配改为最佳适配+mini-tombstone填充(复用>=的tombstone时在残留空间创建mini-tombstone条目e_name_index=0/e_name_len=leftover-name-bytes供扫描器跳过,大幅提升空间复用率同时避免死区零截断); 37329行内核, 383 dispatch条目 |
+| v52.8 | 2026-05-29 | Code Review v6 Critical修复1项: C1-mini-tombstone残留空间<16字节死区修复(v52.7的best-fit在leftover_sz为4/8/12/16字节时未填充导致扫描器提前终止后续条目不可见,修复为best-fit搜索时仅接受leftover==0精确匹配或leftover>=16可创建mini-tombstone的tombstone,从根源杜绝零死区); 37328行内核, 383 dispatch条目 |
 | v52.2 | 2026-05-29 | Bug修复+功能补全6项: walkPathToInodePublic改用walkPathToInodeResolve(不分配fd,正确返回inode号)/新增walkPathToInodeNoFollow(中间组件解析symlink但最终组件不跟随,供lchown/lstat使用)/lchown(#94)改用setOwnerNoFollow(不再跟随最终symlink)/fchmodat(#260)从accept升级为真实setMode实现(支持AT_SYMLINK_NOFOLLOW)/#329 link和#330 symlink从accept升级为createHardlink+createSymlink/resolveParent用walkPathToInodeResolve替代walkPathToInodePublic(支持相对路径symlink); 37044行内核, 383 dispatch条目 |
 | v52.1 | 2026-05-29 | Bug修复9项: walkPathToInodePublic改用walkPathInner解析symlink(xattr/chown/chmod经过symlink目录不再失败)/setXattr替换同名属性就地更新value而非remove+re-add(修复旧value残留和覆盖)/listDir关闭walkPath打开的fd(修复fd泄漏)/closeFile清理open_file_paths(修复路径残留)/walkPathInner中间symlink关闭用closeFile/resolveParent改用walkPathToInodePublic(修复fd索引误当inode号)/createHardlink+setOwner+setMode改用walkPathToInodePublic/getXattr添加value_offs越界检查(防止损坏xattr块越界读); 36895行内核, 383 dispatch条目 |
 | v52.0 | 2026-05-29 | ext2 xattr+execveat完整路径+NVMe多队列: xattr(#463-#466)ext2底层实现(setXattr/getXattr/listXattr/removeXattr使用inode扩展属性块,短属性内联+长属性独立block); execveat(#322)非AT_FDCWD支持(ext2 open_file_paths全局路径表+buildCombinedPath拼接+prepareExecWithKernelPath内核路径exec); NVMe多队列(MAX_IO_QUEUES=4个SQ/CQ对,per-queue PRP列表,round-robin队列选择,graceful降级到更少队列); 36864行内核, 383 dispatch条目 |
