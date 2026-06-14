@@ -2198,7 +2198,10 @@ pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
         pmm.freePage(init_phys);
         // Only write inode AFTER EA block is successfully initialized
         inode.file_acl = ea_block;
-        if (!writeInode(inode_num, &inode)) return -5;
+        if (!writeInode(inode_num, &inode)) {
+            freeBlock(ea_block); // v52.7: rollback disk block on writeInode failure
+            return -5;
+        }
     }
 
     // Read existing EA block
@@ -2313,10 +2316,11 @@ pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
     const new_val_aligned = if (value.len > 0) (value.len + 3) & ~@as(usize, 3) else 0;
     const new_val_off = if (value.len > 0) min_value_off - new_val_aligned else 0;
 
-    // v52.6: Scan for reusable tombstone slot — exact size match only
-    // (larger tombstones leave dead-zone zeros that terminate the scanner,
-    //  making subsequent entries invisible; exact match avoids internal fragmentation)
+    // v52.7: Scan for reusable tombstone slot — best-fit (>=) with mini-tombstone padding
+    // When a larger tombstone is reused, the leftover space is filled with a mini-tombstone
+    // entry (e_name_index=0, e_name_len=leftover-name-bytes) so the scanner can skip it.
     var reuse_off: usize = 0;
+    var reuse_tombstone_sz: usize = 0; // size of the tombstone at reuse_off
     {
         var scan_off: usize = @sizeOf(Ext2XattrHeader);
         while (scan_off < entries_end) {
@@ -2325,8 +2329,12 @@ pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
             if (te.e_name_len == 0) break;
             if (te.e_name_index == 0) { // tombstone
                 const tombstone_sz = (@sizeOf(Ext2XattrEntry) + te.e_name_len + 3) & ~@as(usize, 3);
-                if (tombstone_sz == new_entry_size and reuse_off == 0) {
-                    reuse_off = scan_off;
+                if (tombstone_sz >= new_entry_size) {
+                    // Best-fit: prefer smallest tombstone that fits
+                    if (reuse_off == 0 or tombstone_sz < reuse_tombstone_sz) {
+                        reuse_off = scan_off;
+                        reuse_tombstone_sz = tombstone_sz;
+                    }
                 }
             }
             const esz = (@sizeOf(Ext2XattrEntry) + te.e_name_len + 3) & ~@as(usize, 3);
@@ -2359,6 +2367,28 @@ pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
     new_entry.e_value_size = @intCast(value.len);
     new_entry.e_hash = 0;
     @memcpy(buf[write_off + @sizeOf(Ext2XattrEntry) ..][0..name.len], name);
+
+    // v52.7: If tombstone was larger than new entry, fill leftover with mini-tombstone
+    // This prevents dead-zone zeros from terminating the scanner
+    if (reuse_off != 0 and reuse_tombstone_sz > new_entry_size) {
+        const leftover_off = write_off + new_entry_size;
+        const leftover_sz = reuse_tombstone_sz - new_entry_size;
+        if (leftover_sz >= @sizeOf(Ext2XattrEntry)) {
+            // Create mini-tombstone entry for the leftover space
+            const leftover: *Ext2XattrEntry = @ptrCast(@alignCast(buf + leftover_off));
+            const leftover_name_len: u8 = @intCast(leftover_sz - @sizeOf(Ext2XattrEntry));
+            leftover.e_name_len = leftover_name_len;
+            leftover.e_name_index = 0; // tombstone marker
+            leftover.e_value_offs = 0;
+            leftover.e_value_block = 0;
+            leftover.e_value_size = 0;
+            leftover.e_hash = 0;
+            @memset(buf[leftover_off + @sizeOf(Ext2XattrEntry)..][0..leftover_name_len], 0);
+        }
+        // If leftover_sz < @sizeOf(Ext2XattrEntry), the remaining bytes (1-15)
+        // are within the 4-byte aligned padding of the new entry — already zero,
+        // and the next entry starts at reuse_off + reuse_tombstone_sz which is aligned.
+    }
 
     // Write back EA block
     if (!writeBlock(ea_block, buf)) return -5;
