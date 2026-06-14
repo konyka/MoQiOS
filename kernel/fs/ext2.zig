@@ -127,6 +127,9 @@ pub const Ext2File = struct {
 var open_files: [MAX_OPEN_FILES]Ext2File = undefined;
 var open_count: u32 = 0;
 
+// ─── Open file path table (v52.0: for execveat dirfd resolution) ──────────
+var open_file_paths: [MAX_OPEN_FILES][128]u8 = @splat(@splat(0));
+
 // ─── Initialization ───────────────────────────────────────────────────────
 
 pub fn init() void {
@@ -400,7 +403,15 @@ pub fn openFile(name: []const u8) i64 {
     if (!active) return -1;
 
     // Start from root inode (2)
-    return walkPath(2, name);
+    const result = walkPath(2, name);
+    if (result >= 0) {
+        // v52.0: store path for execveat dirfd resolution
+        const idx: usize = @intCast(result);
+        const copy_len = @min(name.len, 127);
+        @memcpy(open_file_paths[idx][0..copy_len], name[0..copy_len]);
+        open_file_paths[idx][copy_len] = 0;
+    }
+    return result;
 }
 
 fn walkPath(start_inode: u32, path: []const u8) i64 {
@@ -454,7 +465,7 @@ fn walkPathInner(start_inode: u32, path: []const u8, depth: u32) i64 {
                 if (resolved_fd < 0) return resolved_fd;
                 // Get the inode from the opened file, then close it
                 const resolved_inode = open_files[@intCast(resolved_fd)].inode_num;
-                open_files[@intCast(resolved_fd)].inode_num = 0; // close
+                closeFile(@intCast(resolved_fd)); // v52.1 fix: use closeFile to also clear path
                 return walkPathInner(resolved_inode, remaining, depth + 1);
             }
         }
@@ -540,19 +551,18 @@ fn resolveParent(path: []const u8) ?struct { parent: u32, name: []const u8 } {
             if (!readInode(parent_inode, &inode)) return null;
             if (inode.mode & 0xF000 != 0x4000) return null;
 
-            const dir_inode_num = parent_inode; // directory containing this component
+            const dir_inode = parent_inode; // directory containing this component
             parent_inode = findDirEntry(&inode, component) orelse return null;
 
-            // v50.0: resolve symlinks in intermediate components
+            // v52.2: resolve symlinks in intermediate components (no fd allocation)
             var found_inode: Ext2Inode = undefined;
             if (readInode(parent_inode, &found_inode) and
                 found_inode.mode & 0xF000 == 0xA000)
             {
                 if (readSymlinkTarget(&found_inode)) |target| {
-                    const new_start: u32 = if (target.len > 0 and target[0] == '/') 2 else dir_inode_num;
-                    const inner = walkPathInner(new_start, target, 1);
-                    if (inner < 0) return null;
-                    parent_inode = @intCast(inner);
+                    const new_start: u32 = if (target.len > 0 and target[0] == '/') 2 else dir_inode;
+                    const resolved = walkPathToInodeResolve(new_start, target, 1) orelse return null;
+                    parent_inode = resolved;
                 } else {
                     return null;
                 }
@@ -785,6 +795,9 @@ pub fn getFileSize(file_idx: u32) u64 {
 pub fn closeFile(file_idx: u32) void {
     if (file_idx >= open_count) return;
     open_files[file_idx].inode_num = 0;
+    open_file_paths[file_idx][0] = 0;
+    // v52.3: clear full path to prevent stale data leak
+    @memset(open_file_paths[file_idx][0..128], 0);
 }
 
 // ─── Directory listing ─────────────────────────────────────────────────────
@@ -796,11 +809,12 @@ pub fn listDir(path: []const u8, callback: *const fn ([*]const u8, u32) void) vo
         @as(u32, 2)
     else blk: {
         const r = walkPath(2, path);
-        break :blk if (r >= 0) open_files[@intCast(r)].inode_num else {
-            if (r >= 0) closeFile(@intCast(r));
-            return;
-        };
+        if (r < 0) break :blk @as(u32, 0);
+        const inum = open_files[@intCast(r)].inode_num;
+        closeFile(@intCast(r)); // v52.1 fix: close fd to avoid leak
+        break :blk inum;
     };
+    if (inode_num == 0) return;
 
     var inode: Ext2Inode = undefined;
     if (!readInode(inode_num, &inode)) return;
@@ -1452,6 +1466,10 @@ pub fn createFile(name: []const u8) i64 {
                 .inode = new_inode,
                 .offset = 0,
             };
+            // v52.0: store path
+            const copy_len = @min(name.len, 127);
+            @memcpy(open_file_paths[i][0..copy_len], name[0..copy_len]);
+            open_file_paths[i][copy_len] = 0;
             if (i >= open_count) open_count = @intCast(i + 1);
             return @intCast(i);
         }
@@ -1625,6 +1643,10 @@ pub fn createDir(name: []const u8) i64 {
                 .inode = new_inode,
                 .offset = 0,
             };
+            // v52.0: store path
+            const copy_len = @min(name.len, 127);
+            @memcpy(open_file_paths[i][0..copy_len], name[0..copy_len]);
+            open_file_paths[i][copy_len] = 0;
             if (i >= open_count) open_count = @intCast(i + 1);
             return @intCast(i);
         }
@@ -1840,8 +1862,8 @@ pub fn unlinkFile(path: []const u8) bool {
 pub fn createHardlink(oldpath: []const u8, newpath: []const u8) i64 {
     if (!active) return -5; // EIO
 
-    // 1. Resolve oldpath to its inode number
-    const old_inode = walkPathToInode(oldpath) orelse return -2; // ENOENT
+    // 1. Resolve oldpath to its inode number (v52.1: use symlink-resolving version)
+    const old_inode = walkPathToInodePublic(oldpath) orelse return -2; // ENOENT
 
     // Read the old inode to check it's not a directory
     var old_inode_data: Ext2Inode = undefined;
@@ -1928,9 +1950,65 @@ pub fn createSymlink(target: []const u8, linkpath: []const u8) i64 {
     return 0;
 }
 
-/// Resolve a path to its inode number (without opening a file descriptor).
-fn walkPathToInode(path: []const u8) ?u32 {
-    var current_inode: u32 = 2; // root
+/// Resolve a path to its inode number (public for xattr/chown/chmod dispatch).
+/// Resolves symlinks in intermediate path components (v52.2 fix: no fd allocation).
+pub fn walkPathToInodePublic(path: []const u8) ?u32 {
+    return walkPathToInodeResolve(2, path, 0);
+}
+
+/// Resolve a path to its inode number WITHOUT following the final component symlink.
+/// Used by lchown, lstat, etc. Intermediate symlinks ARE resolved.
+pub fn walkPathToInodeNoFollow(path: []const u8) ?u32 {
+    return walkPathToInodeResolveNoFollow(2, path, 0);
+}
+
+/// Like walkPathToInodeResolve, but the final component is NOT followed if symlink.
+fn walkPathToInodeResolveNoFollow(start_inode: u32, path: []const u8, depth: u32) ?u32 {
+    if (depth > 8) return null;
+
+    var current_inode = start_inode;
+    var pos: u32 = 0;
+
+    while (pos < path.len) {
+        while (pos < path.len and path[pos] == '/') pos += 1;
+        if (pos >= path.len) break;
+
+        const start = pos;
+        while (pos < path.len and path[pos] != '/') pos += 1;
+        const component = path[start..pos];
+        const is_last = (pos >= path.len);
+
+        var inode: Ext2Inode = undefined;
+        if (!readInode(current_inode, &inode)) return null;
+        if (inode.mode & 0xF000 != 0x4000) return null;
+
+        const found = findDirEntry(&inode, component) orelse return null;
+
+        // Check if symlink — resolve for intermediate, but NOT for final component
+        var found_inode: Ext2Inode = undefined;
+        if (readInode(found, &found_inode) and found_inode.mode & 0xF000 == 0xA000) {
+            if (is_last) {
+                // lchown/lstat: return the symlink inode itself
+                return found;
+            }
+            const target = readSymlinkTarget(&found_inode) orelse return null;
+            const new_start: u32 = if (target.len > 0 and target[0] == '/') 2 else current_inode;
+            const resolved = walkPathToInodeResolveNoFollow(new_start, target, depth + 1) orelse return null;
+            current_inode = resolved;
+        } else {
+            current_inode = found;
+        }
+    }
+
+    return current_inode;
+}
+
+/// Walk path to inode with symlink resolution, without allocating fd slots.
+/// Returns inode number or null on failure.
+fn walkPathToInodeResolve(start_inode: u32, path: []const u8, depth: u32) ?u32 {
+    if (depth > 8) return null; // ELOOP equivalent
+
+    var current_inode = start_inode;
     var pos: u32 = 0;
 
     while (pos < path.len) {
@@ -1945,9 +2023,20 @@ fn walkPathToInode(path: []const u8) ?u32 {
         if (!readInode(current_inode, &inode)) return null;
         if (inode.mode & 0xF000 != 0x4000) return null; // not a directory
 
-        current_inode = findDirEntry(&inode, component) orelse return null;
+        const found = findDirEntry(&inode, component) orelse return null;
+
+        // Check if symlink
+        var found_inode: Ext2Inode = undefined;
+        if (readInode(found, &found_inode) and found_inode.mode & 0xF000 == 0xA000) {
+            const target = readSymlinkTarget(&found_inode) orelse return null;
+            const new_start: u32 = if (target.len > 0 and target[0] == '/') 2 else current_inode;
+            const resolved = walkPathToInodeResolve(new_start, target, depth + 1) orelse return null;
+            current_inode = resolved;
+        } else {
+            current_inode = found;
+        }
     }
-    if (current_inode == 2 and path.len > 1) return null;
+
     return current_inode;
 }
 
@@ -1979,7 +2068,21 @@ pub fn readSymlinkByPath(path: []const u8) ?[]const u8 {
 pub fn setOwner(path: []const u8, uid: u16, gid: u16) i64 {
     if (!active) return -5; // EIO
 
-    const inode_num = walkPathToInode(path) orelse return -2; // ENOENT
+    const inode_num = walkPathToInodePublic(path) orelse return -2; // ENOENT
+    var inode: Ext2Inode = undefined;
+    if (!readInode(inode_num, &inode)) return -5;
+
+    if (uid != 0xFFFF) inode.uid = uid;
+    if (gid != 0xFFFF) inode.gid = gid;
+    if (!writeInode(inode_num, &inode)) return -5;
+    return 0;
+}
+
+/// Set owner without following final symlink (for lchown).
+pub fn setOwnerNoFollow(path: []const u8, uid: u16, gid: u16) i64 {
+    if (!active) return -5;
+
+    const inode_num = walkPathToInodeNoFollow(path) orelse return -2;
     var inode: Ext2Inode = undefined;
     if (!readInode(inode_num, &inode)) return -5;
 
@@ -2006,7 +2109,7 @@ pub fn setOwnerByInode(inode_num: u32, uid: u16, gid: u16) i64 {
 pub fn setMode(path: []const u8, new_mode: u16) i64 {
     if (!active) return -5;
 
-    const inode_num = walkPathToInode(path) orelse return -2;
+    const inode_num = walkPathToInodePublic(path) orelse return -2;
     var inode: Ext2Inode = undefined;
     if (!readInode(inode_num, &inode)) return -5;
 
@@ -2031,4 +2134,442 @@ pub fn setModeByInode(inode_num: u32, new_mode: u16) i64 {
 pub fn getInodeNumFromOpen(file_idx: u32) u32 {
     if (file_idx >= MAX_OPEN_FILES) return 0;
     return open_files[file_idx].inode_num;
+}
+
+// ─── Extended Attributes (xattr) (v52.0) ───────────────────────────────────
+
+const EXT2_XATTR_MAGIC: u32 = 0xEA020000;
+const XATTR_USER_PREFIX: u8 = 1; // "user." namespace
+
+const Ext2XattrHeader = extern struct {
+    h_magic: u32,
+    h_refcount: u32,
+    h_blocks: u32,
+    h_hash: u32,
+    h_reserved: [4]u32,
+};
+
+const Ext2XattrEntry = extern struct {
+    e_name_len: u8,
+    e_name_index: u8,
+    e_value_offs: u16,
+    e_value_block: u32,
+    e_value_size: u32,
+    e_hash: u32,
+    // e_name follows (e_name_len bytes, NOT null-terminated in struct)
+};
+
+/// Set extended attribute on an inode.
+/// Returns 0 on success, -errno on failure.
+/// Uses standard ext2 xattr layout: entries grow forward from header,
+/// values grow backward from end of block (v52.3 fix).
+pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
+    if (!active) return -5;
+    if (name.len == 0 or name.len > 255 or value.len > block_size) return -22;
+
+    var inode: Ext2Inode = undefined;
+    if (!readInode(inode_num, &inode)) return -5;
+
+    // If inode has no EA block yet, allocate one
+    var ea_block: u32 = inode.file_acl;
+    if (ea_block == 0) {
+        const group = (inode_num - 1) / inodes_per_group;
+        ea_block = allocBlock(group);
+        if (ea_block == 0) return -28; // ENOSPC
+        inode.file_acl = ea_block;
+        if (!writeInode(inode_num, &inode)) return -5;
+        // Initialize EA block with header
+        const phys = pmm.allocPage() orelse return -12;
+        defer pmm.freePage(phys);
+        const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+        @memset(buf[0..block_size], 0);
+        const hdr: *Ext2XattrHeader = @ptrCast(@alignCast(buf));
+        hdr.h_magic = EXT2_XATTR_MAGIC;
+        hdr.h_refcount = 1;
+        hdr.h_blocks = 1;
+        if (!writeBlock(ea_block, buf)) return -5;
+    }
+
+    // Read existing EA block
+    const phys = pmm.allocPage() orelse return -12;
+    defer pmm.freePage(phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+    if (!readBlock(ea_block, buf)) return -5;
+
+    const hdr: *Ext2XattrHeader = @ptrCast(@alignCast(buf));
+    if (hdr.h_magic != EXT2_XATTR_MAGIC) return -5;
+
+    // Find end of entries area and search for existing entry
+    var entry_off: usize = @sizeOf(Ext2XattrHeader);
+    var entries_end: usize = @sizeOf(Ext2XattrHeader);
+    var found_off: usize = 0;
+    while (entry_off < block_size) {
+        if (buf[entry_off] == 0 and buf[entry_off + 1] == 0) break;
+        const entry: *Ext2XattrEntry = @ptrCast(@alignCast(buf + entry_off));
+        if (entry.e_name_len == 0) break;
+        // Skip tombstones — but don't match them as existing
+        if (entry.e_name_index == 0) {
+            const esz = @sizeOf(Ext2XattrEntry) + entry.e_name_len;
+            entry_off = (entry_off + esz + 3) & ~@as(usize, 3);
+            entries_end = entry_off;
+            continue;
+        }
+        const ename = buf[entry_off + @sizeOf(Ext2XattrEntry) ..][0..entry.e_name_len];
+        if (entry.e_name_index == XATTR_USER_PREFIX and eql(ename, name)) {
+            found_off = entry_off;
+            // Don't break — continue scanning to find entries_end
+        }
+        const esz = @sizeOf(Ext2XattrEntry) + entry.e_name_len;
+        entry_off = (entry_off + esz + 3) & ~@as(usize, 3);
+        entries_end = entry_off;
+    }
+
+    // Compute min value offset (lowest value position in the block)
+    // Values grow backward from block_size, so the first value starts at block_size - size
+    var min_value_off: usize = block_size;
+    entry_off = @sizeOf(Ext2XattrHeader);
+    while (entry_off < entries_end) {
+        if (buf[entry_off] == 0 and buf[entry_off + 1] == 0) break;
+        const entry: *Ext2XattrEntry = @ptrCast(@alignCast(buf + entry_off));
+        if (entry.e_name_len == 0) break;
+        // Skip tombstones
+        if (entry.e_name_index == 0) {
+            const esz = @sizeOf(Ext2XattrEntry) + entry.e_name_len;
+            entry_off = (entry_off + esz + 3) & ~@as(usize, 3);
+            continue;
+        }
+        if (entry.e_value_offs > 0 and entry.e_value_offs < min_value_off) {
+            min_value_off = entry.e_value_offs;
+        }
+        const esz = @sizeOf(Ext2XattrEntry) + entry.e_name_len;
+        entry_off = (entry_off + esz + 3) & ~@as(usize, 3);
+    }
+
+    if (found_off != 0) {
+        // Existing entry — update value in-place
+        const found_entry: *Ext2XattrEntry = @ptrCast(@alignCast(buf + found_off));
+        const old_val_off: usize = found_entry.e_value_offs;
+        const old_val_size = found_entry.e_value_size;
+
+        // Bounds check (e_value_offs=0 means flag-only, allow upgrade)
+        if (old_val_off > 0 and old_val_off + old_val_size > block_size) return -5;
+
+        if (old_val_off == 0) {
+            // Flag-only attribute upgrading to valued — allocate value space
+            if (value.len > 0) {
+                const aligned_val_size = (value.len + 3) & ~@as(usize, 3);
+                if (entries_end + aligned_val_size > min_value_off) return -28;
+                const new_val_off2 = min_value_off - aligned_val_size;
+                found_entry.e_value_offs = @intCast(new_val_off2);
+                found_entry.e_value_size = @intCast(value.len);
+                @memcpy(buf[new_val_off2..][0..value.len], value);
+                if (!writeBlock(ea_block, buf)) return -5;
+                return 0;
+            }
+            // Both old and new are empty — no change needed
+            return 0;
+        }
+
+        if (value.len <= old_val_size) {
+            // New value fits within old value space — write in-place
+            found_entry.e_value_size = @intCast(value.len);
+            if (value.len == 0) {
+                // Valued → flag-only downgrade: release old value space
+                found_entry.e_value_offs = 0;
+                @memset(buf[old_val_off..][0..old_val_size], 0);
+            } else {
+                @memcpy(buf[old_val_off..][0..value.len], value);
+            }
+            if (!writeBlock(ea_block, buf)) return -5;
+            return 0;
+        }
+        // New value is larger — check if there's space between entries and values
+        const aligned_val_size = (value.len + 3) & ~@as(usize, 3);
+        if (entries_end + aligned_val_size > min_value_off) return -28; // ENOSPC
+        // Write new value at min_value_off - aligned_val_size (growing backward, 4-byte aligned)
+        const new_val_off = min_value_off - aligned_val_size;
+        found_entry.e_value_offs = @intCast(new_val_off);
+        found_entry.e_value_size = @intCast(value.len);
+        @memcpy(buf[new_val_off..][0..value.len], value);
+        // Clear old value area
+        @memset(buf[old_val_off..][0..old_val_size], 0);
+        if (!writeBlock(ea_block, buf)) return -5;
+        return 0;
+    }
+
+    // New attribute — check space, try tombstone reuse first
+    const new_entry_size = (@sizeOf(Ext2XattrEntry) + name.len + 3) & ~@as(usize, 3);
+    const new_val_aligned = if (value.len > 0) (value.len + 3) & ~@as(usize, 3) else 0;
+    const new_val_off = if (value.len > 0) min_value_off - new_val_aligned else 0;
+
+    // v52.5: Scan for reusable tombstone slot (e_name_index==0, size >= new_entry_size)
+    var reuse_off: usize = 0;
+    {
+        var scan_off: usize = @sizeOf(Ext2XattrHeader);
+        while (scan_off < entries_end) {
+            if (buf[scan_off] == 0 and buf[scan_off + 1] == 0) break;
+            const te: *Ext2XattrEntry = @ptrCast(@alignCast(buf + scan_off));
+            if (te.e_name_len == 0) break;
+            if (te.e_name_index == 0) { // tombstone
+                const tombstone_sz = (@sizeOf(Ext2XattrEntry) + te.e_name_len + 3) & ~@as(usize, 3);
+                if (tombstone_sz >= new_entry_size and reuse_off == 0) {
+                    reuse_off = scan_off;
+                    // Don't break — keep scanning entries_end
+                }
+            }
+            const esz = (@sizeOf(Ext2XattrEntry) + te.e_name_len + 3) & ~@as(usize, 3);
+            scan_off += esz;
+        }
+    }
+
+    // Check space: if no tombstone reuse, need room at entries_end
+    if (reuse_off == 0) {
+        if (entries_end + new_entry_size > min_value_off) return -28; // ENOSPC
+    }
+    if (value.len > 0 and entries_end + new_entry_size > new_val_off) return -28;
+
+    // Write value at new_val_off (from end of block, growing backward)
+    if (value.len > 0) {
+        @memcpy(buf[new_val_off..][0..value.len], value);
+    }
+
+    // Write entry at reuse_off (tombstone) or entries_end (append)
+    const write_off = if (reuse_off != 0) reuse_off else entries_end;
+    const new_entry: *Ext2XattrEntry = @ptrCast(@alignCast(buf + write_off));
+    new_entry.e_name_len = @intCast(name.len);
+    new_entry.e_name_index = XATTR_USER_PREFIX;
+    new_entry.e_value_offs = if (value.len > 0) @intCast(new_val_off) else 0;
+    new_entry.e_value_block = 0;
+    new_entry.e_value_size = @intCast(value.len);
+    new_entry.e_hash = 0;
+    @memcpy(buf[write_off + @sizeOf(Ext2XattrEntry) ..][0..name.len], name);
+
+    // Write back EA block
+    if (!writeBlock(ea_block, buf)) return -5;
+    return 0;
+}
+
+/// Get extended attribute value from an inode.
+/// Returns bytes written to value_buf, or -errno.
+pub fn getXattr(inode_num: u32, name: []const u8, value_buf: [*]u8, buf_size: u32) i64 {
+    if (!active) return -5;
+    if (name.len == 0) return -22;
+
+    var inode: Ext2Inode = undefined;
+    if (!readInode(inode_num, &inode)) return -5;
+
+    const ea_block = inode.file_acl;
+    if (ea_block == 0) return -61; // ENODATA
+
+    const phys = pmm.allocPage() orelse return -12;
+    defer pmm.freePage(phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+    if (!readBlock(ea_block, buf)) return -5;
+
+    const hdr: *Ext2XattrHeader = @ptrCast(@alignCast(buf));
+    if (hdr.h_magic != EXT2_XATTR_MAGIC) return -5;
+
+    var entry_off: usize = @sizeOf(Ext2XattrHeader);
+    while (entry_off < block_size) {
+        if (buf[entry_off] == 0 and buf[entry_off + 1] == 0) break;
+        const entry: *Ext2XattrEntry = @ptrCast(@alignCast(buf + entry_off));
+        if (entry.e_name_len == 0) break;
+        // Skip tombstones
+        if (entry.e_name_index == 0) {
+            const esz = @sizeOf(Ext2XattrEntry) + entry.e_name_len;
+            entry_off = (entry_off + esz + 3) & ~@as(usize, 3);
+            continue;
+        }
+        const ename = buf[entry_off + @sizeOf(Ext2XattrEntry) ..][0..entry.e_name_len];
+        if (entry.e_name_index == XATTR_USER_PREFIX and eql(ename, name)) {
+            // Found — copy value
+            const vsize = entry.e_value_size;
+            if (vsize == 0) return @as(i64, 0); // flag-only, no value
+            if (vsize > buf_size) return -34; // ERANGE
+            const value_start: usize = entry.e_value_offs;
+            // v52.5 fix: e_value_offs==0 with vsize>0 means corrupt/inline (unsupported)
+            if (value_start == 0 or value_start < @sizeOf(Ext2XattrHeader)) return -5;
+            if (value_start + vsize > block_size) return -5; // corrupt entry
+            @memcpy(value_buf[0..vsize], buf[value_start..][0..vsize]);
+            return @intCast(vsize);
+        }
+        const entry_size = @sizeOf(Ext2XattrEntry) + entry.e_name_len;
+        entry_off = (entry_off + entry_size + 3) & ~@as(usize, 3);
+    }
+    return -61; // ENODATA
+}
+
+/// List extended attribute names for an inode.
+/// Returns bytes written to list_buf, or -errno.
+pub fn listXattr(inode_num: u32, list_buf: [*]u8, buf_size: u32) i64 {
+    if (!active) return -5;
+
+    var inode: Ext2Inode = undefined;
+    if (!readInode(inode_num, &inode)) return -5;
+
+    const ea_block = inode.file_acl;
+    if (ea_block == 0) return 0; // no attributes, 0 bytes written
+
+    const phys = pmm.allocPage() orelse return -12;
+    defer pmm.freePage(phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+    if (!readBlock(ea_block, buf)) return -5;
+
+    const hdr: *Ext2XattrHeader = @ptrCast(@alignCast(buf));
+    if (hdr.h_magic != EXT2_XATTR_MAGIC) return -5;
+
+    var written: u32 = 0;
+    var entry_off: usize = @sizeOf(Ext2XattrHeader);
+    while (entry_off < block_size) {
+        if (buf[entry_off] == 0 and buf[entry_off + 1] == 0) break;
+        const entry: *Ext2XattrEntry = @ptrCast(@alignCast(buf + entry_off));
+        if (entry.e_name_len == 0) break;
+
+        // Skip tombstones (e_name_index == 0 means deleted)
+        if (entry.e_name_index == 0) {
+            const entry_size = @sizeOf(Ext2XattrEntry) + entry.e_name_len;
+            entry_off = (entry_off + entry_size + 3) & ~@as(usize, 3);
+            continue;
+        }
+
+        // Format: "user.<name>\0"
+        const prefix = "user.";
+        const total_len: u32 = @intCast(prefix.len + entry.e_name_len + 1);
+        if (written + total_len > buf_size) return -34; // ERANGE
+
+        @memcpy(list_buf[written..][0..prefix.len], prefix);
+        written += @intCast(prefix.len);
+        @memcpy(list_buf[written..][0..entry.e_name_len], buf[entry_off + @sizeOf(Ext2XattrEntry) ..][0..entry.e_name_len]);
+        written += entry.e_name_len;
+        list_buf[written] = 0; // null terminator
+        written += 1;
+
+        const entry_size = @sizeOf(Ext2XattrEntry) + entry.e_name_len;
+        entry_off = (entry_off + entry_size + 3) & ~@as(usize, 3);
+    }
+    return @intCast(written);
+}
+
+/// Remove extended attribute from an inode.
+/// Returns 0 on success, -errno on failure.
+pub fn removeXattr(inode_num: u32, name: []const u8) i64 {
+    if (!active) return -5;
+    if (name.len == 0) return -22;
+
+    var inode: Ext2Inode = undefined;
+    if (!readInode(inode_num, &inode)) return -5;
+
+    const ea_block = inode.file_acl;
+    if (ea_block == 0) return -61; // ENODATA
+
+    const phys = pmm.allocPage() orelse return -12;
+    defer pmm.freePage(phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+    if (!readBlock(ea_block, buf)) return -5;
+
+    const hdr: *Ext2XattrHeader = @ptrCast(@alignCast(buf));
+    if (hdr.h_magic != EXT2_XATTR_MAGIC) return -5;
+
+    var entry_off: usize = @sizeOf(Ext2XattrHeader);
+    while (entry_off < block_size) {
+        if (buf[entry_off] == 0 and buf[entry_off + 1] == 0) break;
+        const entry: *Ext2XattrEntry = @ptrCast(@alignCast(buf + entry_off));
+        if (entry.e_name_len == 0) break;
+        // Skip tombstones (e_name_index == 0)
+        if (entry.e_name_index == 0) {
+            const esz = @sizeOf(Ext2XattrEntry) + entry.e_name_len;
+            entry_off = (entry_off + esz + 3) & ~@as(usize, 3);
+            continue;
+        }
+        const ename = buf[entry_off + @sizeOf(Ext2XattrEntry) ..][0..entry.e_name_len];
+        if (entry.e_name_index == XATTR_USER_PREFIX and eql(ename, name)) {
+            // Found — tombstone approach: zero entry only, no shift (v52.4)
+            // In standard ext2 xattr layout, values grow backward from block end.
+            // Shifting entries would corrupt e_value_offs of surviving entries.
+            const val_off: usize = entry.e_value_offs;
+            const val_size = entry.e_value_size;
+            if (val_off > 0 and val_off + val_size <= block_size) {
+                @memset(buf[val_off..][0..val_size], 0);
+            }
+            // Tombstone: set e_name_index=0 (invalid namespace) to mark deleted,
+            // keep e_name_len intact so scanners can skip over the tombstone slot.
+            entry.e_name_index = 0; // tombstone marker
+            entry.e_value_offs = 0;
+            entry.e_value_size = 0;
+            entry.e_hash = 0;
+            // Clear the name bytes
+            @memset(buf[entry_off + @sizeOf(Ext2XattrEntry) ..][0..entry.e_name_len], 0);
+
+            // Check if EA block is now empty (no live entries left)
+            var all_empty = true;
+            var scan_off2: usize = @sizeOf(Ext2XattrHeader);
+            while (scan_off2 < block_size) {
+                if (buf[scan_off2] == 0 and buf[scan_off2 + 1] == 0) break; // end of entries
+                const se: *Ext2XattrEntry = @ptrCast(@alignCast(buf + scan_off2));
+                if (se.e_name_len == 0) break; // end of entries
+                if (se.e_name_index != 0) {
+                    all_empty = false;
+                    break;
+                } // live entry
+                const ssz = (@sizeOf(Ext2XattrEntry) + se.e_name_len + 3) & ~@as(usize, 3);
+                scan_off2 += ssz;
+            }
+            if (all_empty) {
+                // Free the EA block
+                inode.file_acl = 0;
+                _ = writeInode(inode_num, &inode);
+                freeBlock(ea_block);
+            } else {
+                _ = writeBlock(ea_block, buf);
+            }
+            return 0;
+        }
+        const entry_size = @sizeOf(Ext2XattrEntry) + entry.e_name_len;
+        entry_off = (entry_off + entry_size + 3) & ~@as(usize, 3);
+    }
+    return -61; // ENODATA
+}
+
+fn eql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        if (ca != cb) return false;
+    }
+    return true;
+}
+
+// ─── Open file path lookup for execveat (v52.0) ─────────────────────────────
+
+/// Get the path used to open file_idx. Returns null if not found.
+pub fn getOpenFilePath(file_idx: u32) ?[]const u8 {
+    if (file_idx >= MAX_OPEN_FILES) return null;
+    if (open_files[file_idx].inode_num == 0) return null;
+    // Find null terminator
+    var len: usize = 0;
+    while (len < 128 and open_file_paths[file_idx][len] != 0) : (len += 1) {}
+    if (len == 0) return null;
+    return open_file_paths[file_idx][0..len];
+}
+
+/// Build a combined path: dir_path + "/" + relative_path into buf.
+/// Returns slice of buf, or null on overflow.
+/// Handles trailing slash in dir_path to avoid double-"//".
+pub fn buildCombinedPath(buf: []u8, dir_path: []const u8, rel_path: []const u8) ?[]const u8 {
+    // Trim trailing slashes from dir_path (but keep at least "/")
+    var dp_end: usize = dir_path.len;
+    while (dp_end > 1 and dir_path[dp_end - 1] == '/') dp_end -= 1;
+    const dp = dir_path[0..dp_end];
+    // Only add separator if dir_path doesn't already end with '/'
+    const need_sep: bool = dp.len > 0 and dp[dp.len - 1] != '/';
+    const total = dp.len + (if (need_sep) @as(usize, 1) else @as(usize, 0)) + rel_path.len;
+    if (total >= buf.len) return null;
+    @memcpy(buf[0..dp.len], dp);
+    var pos = dp.len;
+    if (need_sep) {
+        buf[pos] = '/';
+        pos += 1;
+    }
+    @memcpy(buf[pos..total], rel_path);
+    buf[total] = 0;
+    return buf[0..total];
 }

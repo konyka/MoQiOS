@@ -1074,10 +1074,34 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             _ = frame.rdi;
             frame.rax = @bitCast(readlink_mod.readlink(frame.rsi, frame.rdx, frame.r10));
         },
-        260 => { // fchmodat(dirfd, pathname, mode, flags) — delegate to chmod
-            _ = frame.rdi; // dirfd ignored (AT_FDCWD assumed)
-            _ = frame.r10; // flags ignored
-            frame.rax = 0; // ext2 doesn't enforce permissions — accept
+        260 => { // fchmodat(dirfd, pathname, mode, flags) — chmod via path
+            const copy = @import("../../mm/copy_from_user.zig");
+            const ext2_mod = @import("../../fs/ext2.zig");
+            var path_buf: [256]u8 = undefined;
+            const pc = copy.copyFromUser(path_buf[0..], @ptrFromInt(frame.rsi), 255);
+            if (pc == 0) {
+                frame.rax = @bitCast(@as(i64, -14));
+                return;
+            }
+            path_buf[if (pc < 255) pc else 255] = 0;
+            var plen: usize = 0;
+            while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
+            // AT_SYMLINK_NOFOLLOW (0x100) — if set, don't follow final symlink
+            const flags: u32 = @truncate(frame.r10);
+            // Reject unknown flags (only AT_SYMLINK_NOFOLLOW is valid for fchmodat)
+            if (flags & ~@as(u32, 0x100) != 0) {
+                frame.rax = @bitCast(@as(i64, -22)); // EINVAL
+                return;
+            }
+            if (flags & 0x100 != 0) {
+                const inode_num = ext2_mod.walkPathToInodeNoFollow(path_buf[0..plen]) orelse {
+                    frame.rax = @bitCast(@as(i64, -2));
+                    return;
+                };
+                frame.rax = @bitCast(ext2_mod.setModeByInode(inode_num, @truncate(frame.rdx)));
+            } else {
+                frame.rax = @bitCast(ext2_mod.setMode(path_buf[0..plen], @truncate(frame.rdx)));
+            }
         },
         261 => { // renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
             _ = frame.rdi;
@@ -1316,12 +1340,15 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 // Equivalent to execve(pathname, argv, envp) — delegate
                 frame.rdi = frame.rsi; // pathname
                 frame.rsi = frame.rdx; // argv
-                // rdx already has envp → need to swap for execve frame
                 syscallExecve(frame);
                 return;
             }
-            // Non-AT_FDCWD or non-zero flags not yet supported
-            frame.rax = @bitCast(@as(i64, -38)); // ENOSYS
+            // v52.0: non-AT_FDCWD dirfd — resolve dir path and concatenate
+            if (dirfd > 0 and flags == 0) {
+                execveatWithDirfd(frame, dirfd);
+                return;
+            }
+            frame.rax = @bitCast(@as(i64, -38)); // ENOSYS for unsupported flags
         },
         // ── v39.0: Linux standard syscall number aliases (x86_64 ABI) ──────
         // Programs compiled against standard Linux headers use these numbers.
@@ -1710,7 +1737,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             const inode_num = ext2_mod.getInodeNum(t.fd_table.fds[fd].ext2_file_idx);
             frame.rax = @bitCast(ext2_mod.setOwnerByInode(inode_num, @truncate(frame.rsi), @truncate(frame.rdx)));
         },
-        94 => { // lchown(pathname, owner, group) — same as chown (no symlink ownership change)
+        94 => { // lchown(pathname, owner, group) — does NOT follow symlink
             const copy = @import("../../mm/copy_from_user.zig");
             const ext2_mod = @import("../../fs/ext2.zig");
             var path_buf: [256]u8 = undefined;
@@ -1722,7 +1749,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             path_buf[if (pc < 255) pc else 255] = 0;
             var plen: usize = 0;
             while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
-            frame.rax = @bitCast(ext2_mod.setOwner(path_buf[0..plen], @truncate(frame.rsi), @truncate(frame.rdx)));
+            frame.rax = @bitCast(ext2_mod.setOwnerNoFollow(path_buf[0..plen], @truncate(frame.rsi), @truncate(frame.rdx)));
         },
         // ── v40.0: New MoQiOS syscalls (#327-#330) ─────────────────────────
         327 => { // getitimer(which, curr_value)
@@ -1731,11 +1758,43 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         328 => { // setitimer(which, new_value, old_value)
             frame.rax = @bitCast(syscallSetitimer(@truncate(frame.rdi), frame.rsi, frame.rdx));
         },
-        329 => { // link(oldpath, newpath)
-            frame.rax = 0; // accept
+        329 => { // link(oldpath, newpath) — same as #86
+            const copy = @import("../../mm/copy_from_user.zig");
+            const ext2_mod = @import("../../fs/ext2.zig");
+            var old_buf: [256]u8 = undefined;
+            var new_buf: [256]u8 = undefined;
+            const oc = copy.copyFromUser(old_buf[0..], @ptrFromInt(frame.rdi), 255);
+            const nc = copy.copyFromUser(new_buf[0..], @ptrFromInt(frame.rsi), 255);
+            if (oc == 0 or nc == 0) {
+                frame.rax = @bitCast(@as(i64, -14));
+                return;
+            }
+            old_buf[if (oc < 255) oc else 255] = 0;
+            new_buf[if (nc < 255) nc else 255] = 0;
+            var ol: usize = 0;
+            while (ol < 256 and old_buf[ol] != 0) : (ol += 1) {}
+            var nl: usize = 0;
+            while (nl < 256 and new_buf[nl] != 0) : (nl += 1) {}
+            frame.rax = @bitCast(ext2_mod.createHardlink(old_buf[0..ol], new_buf[0..nl]));
         },
-        330 => { // symlink(target, linkpath)
-            frame.rax = 0; // accept
+        330 => { // symlink(target, linkpath) — same as #88
+            const copy = @import("../../mm/copy_from_user.zig");
+            const ext2_mod = @import("../../fs/ext2.zig");
+            var tgt_buf: [256]u8 = undefined;
+            var lnk_buf: [256]u8 = undefined;
+            const tc = copy.copyFromUser(tgt_buf[0..], @ptrFromInt(frame.rdi), 255);
+            const lc = copy.copyFromUser(lnk_buf[0..], @ptrFromInt(frame.rsi), 255);
+            if (tc == 0 or lc == 0) {
+                frame.rax = @bitCast(@as(i64, -14));
+                return;
+            }
+            tgt_buf[if (tc < 255) tc else 255] = 0;
+            lnk_buf[if (lc < 255) lc else 255] = 0;
+            var tl: usize = 0;
+            while (tl < 256 and tgt_buf[tl] != 0) : (tl += 1) {}
+            var ll: usize = 0;
+            while (ll < 256 and lnk_buf[ll] != 0) : (ll += 1) {}
+            frame.rax = @bitCast(ext2_mod.createSymlink(tgt_buf[0..tl], lnk_buf[0..ll]));
         },
         // ── v42.0: Linux standard number aliases (331+) + new implementations ──
         331 => { // statx(dirfd, pathname, flags, mask, statxbuf) — alias of #183
@@ -1902,7 +1961,6 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallCachestat(@truncate(frame.rdi), frame.rsi, frame.rdx, @truncate(frame.r10)));
         },
         452 => { // fchmodat2(dfd, filename, mode, flags) — Linux #452
-            // Delegate to chmod (flags ignored — ext2 doesn't use SYMLINK_NOFOLLOW etc.)
             const copy = @import("../../mm/copy_from_user.zig");
             const ext2_mod = @import("../../fs/ext2.zig");
             _ = frame.rdi; // dfd (AT_FDCWD or dirfd — simplified)
@@ -1915,7 +1973,21 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             path_buf[if (pc < 255) pc else 255] = 0;
             var plen: usize = 0;
             while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
-            frame.rax = @bitCast(ext2_mod.setMode(path_buf[0..plen], @truncate(frame.rdx)));
+            // v52.4: flags handling consistent with fchmodat #260
+            const flags: u32 = @truncate(frame.r10);
+            if (flags & ~@as(u32, 0x100) != 0) {
+                frame.rax = @bitCast(@as(i64, -22)); // EINVAL
+                return;
+            }
+            if (flags & 0x100 != 0) {
+                const inode_num = ext2_mod.walkPathToInodeNoFollow(path_buf[0..plen]) orelse {
+                    frame.rax = @bitCast(@as(i64, -2));
+                    return;
+                };
+                frame.rax = @bitCast(ext2_mod.setModeByInode(inode_num, @truncate(frame.rdx)));
+            } else {
+                frame.rax = @bitCast(ext2_mod.setMode(path_buf[0..plen], @truncate(frame.rdx)));
+            }
         },
         453 => { // map_shadow_stack(addr, size, flags) — Linux #453
             frame.rax = @bitCast(@as(i64, -38)); // ENOSYS (requires CET-SS support)
@@ -1959,18 +2031,159 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 frame.rax = 0;
             }
         },
-        // ── v47.0: Linux 463-471 (xattr-at / file_attr / misc) ────────────────
+        // ── v52.0: xattr-at real implementation ────────────────────────────────
         463 => { // setxattrat(dfd, path, flags, name, value, size)
-            frame.rax = @bitCast(@as(i64, -38)); // ENOSYS (xattr not supported)
+            const copy = @import("../../mm/copy_from_user.zig");
+            const ext2_mod = @import("../../fs/ext2.zig");
+            _ = frame.rdi; // dfd
+            _ = frame.rdx; // flags
+            // Copy path
+            var path_buf: [256]u8 = undefined;
+            const pc = copy.copyFromUser(path_buf[0..], @ptrFromInt(frame.rsi), 255);
+            if (pc == 0) {
+                frame.rax = @bitCast(@as(i64, -14));
+                return;
+            }
+            path_buf[if (pc < 255) pc else 255] = 0;
+            var plen: usize = 0;
+            while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
+            // Copy name (skip "user." prefix if present)
+            var name_buf: [256]u8 = undefined;
+            const nc = copy.copyFromUser(name_buf[0..], @ptrFromInt(frame.r10), 255);
+            if (nc == 0) {
+                frame.rax = @bitCast(@as(i64, -14));
+                return;
+            }
+            name_buf[if (nc < 255) nc else 255] = 0;
+            var nlen: usize = 0;
+            while (nlen < 256 and name_buf[nlen] != 0) : (nlen += 1) {}
+            var actual_name = name_buf[0..nlen];
+            if (nlen > 5 and name_buf[0] == 'u' and name_buf[1] == 's' and name_buf[2] == 'e' and name_buf[3] == 'r' and name_buf[4] == '.') {
+                actual_name = name_buf[5..nlen];
+            } else if (nlen >= 1) {
+                // v52.4: reject non-"user." namespace (only user xattr supported)
+                frame.rax = @bitCast(@as(i64, -1)); // EPERM
+                return;
+            }
+            // Copy value
+            const vsize: u32 = @truncate(frame.r8);
+            var val_buf: [4096]u8 = undefined;
+            const vc = copy.copyFromUser(val_buf[0..], @ptrFromInt(frame.r9), @min(vsize, 4096));
+            if (vc == 0) {
+                frame.rax = @bitCast(@as(i64, -14));
+                return;
+            }
+            // Resolve path to inode and set xattr
+            const inode_num = ext2_mod.walkPathToInodePublic(path_buf[0..plen]) orelse {
+                frame.rax = @bitCast(@as(i64, -2));
+                return;
+            };
+            frame.rax = @bitCast(ext2_mod.setXattr(inode_num, actual_name, val_buf[0..vc]));
         },
         464 => { // getxattrat(dfd, path, flags, name, value, size)
-            frame.rax = @bitCast(@as(i64, -38)); // ENOSYS (xattr not supported)
+            const copy = @import("../../mm/copy_from_user.zig");
+            const ext2_mod = @import("../../fs/ext2.zig");
+            _ = frame.rdi; // dfd
+            _ = frame.rdx; // flags
+            var path_buf: [256]u8 = undefined;
+            const pc = copy.copyFromUser(path_buf[0..], @ptrFromInt(frame.rsi), 255);
+            if (pc == 0) {
+                frame.rax = @bitCast(@as(i64, -14));
+                return;
+            }
+            path_buf[if (pc < 255) pc else 255] = 0;
+            var plen: usize = 0;
+            while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
+            var name_buf: [256]u8 = undefined;
+            const nc = copy.copyFromUser(name_buf[0..], @ptrFromInt(frame.r10), 255);
+            if (nc == 0) {
+                frame.rax = @bitCast(@as(i64, -14));
+                return;
+            }
+            name_buf[if (nc < 255) nc else 255] = 0;
+            var nlen: usize = 0;
+            while (nlen < 256 and name_buf[nlen] != 0) : (nlen += 1) {}
+            var actual_name = name_buf[0..nlen];
+            if (nlen > 5 and name_buf[0] == 'u' and name_buf[1] == 's' and name_buf[2] == 'e' and name_buf[3] == 'r' and name_buf[4] == '.') {
+                actual_name = name_buf[5..nlen];
+            } else if (nlen >= 1) {
+                frame.rax = @bitCast(@as(i64, -1)); // EPERM
+                return;
+            }
+            const inode_num = ext2_mod.walkPathToInodePublic(path_buf[0..plen]) orelse {
+                frame.rax = @bitCast(@as(i64, -2));
+                return;
+            };
+            // Get value into temp buffer, then copy to user
+            var val_buf: [4096]u8 = undefined;
+            const bsize: u32 = @truncate(frame.r8);
+            const result = ext2_mod.getXattr(inode_num, actual_name, &val_buf, @min(bsize, 4096));
+            if (result > 0) {
+                _ = copy.copyToUser(@ptrFromInt(frame.r9), val_buf[0..@intCast(result)], @intCast(result));
+            }
+            frame.rax = @bitCast(result);
         },
         465 => { // listxattrat(dfd, path, flags, list, size)
-            frame.rax = @bitCast(@as(i64, -38)); // ENOSYS (xattr not supported)
+            const copy = @import("../../mm/copy_from_user.zig");
+            const ext2_mod = @import("../../fs/ext2.zig");
+            _ = frame.rdi; // dfd
+            _ = frame.rdx; // flags
+            var path_buf: [256]u8 = undefined;
+            const pc = copy.copyFromUser(path_buf[0..], @ptrFromInt(frame.rsi), 255);
+            if (pc == 0) {
+                frame.rax = @bitCast(@as(i64, -14));
+                return;
+            }
+            path_buf[if (pc < 255) pc else 255] = 0;
+            var plen: usize = 0;
+            while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
+            const inode_num = ext2_mod.walkPathToInodePublic(path_buf[0..plen]) orelse {
+                frame.rax = @bitCast(@as(i64, -2));
+                return;
+            };
+            var list_buf: [4096]u8 = undefined;
+            const bsize: u32 = @truncate(frame.r8);
+            const result = ext2_mod.listXattr(inode_num, &list_buf, @min(bsize, 4096));
+            if (result > 0) {
+                _ = copy.copyToUser(@ptrFromInt(frame.r10), list_buf[0..@intCast(result)], @intCast(result));
+            }
+            frame.rax = @bitCast(result);
         },
         466 => { // removexattrat(dfd, path, flags, name)
-            frame.rax = @bitCast(@as(i64, -38)); // ENOSYS (xattr not supported)
+            const copy = @import("../../mm/copy_from_user.zig");
+            const ext2_mod = @import("../../fs/ext2.zig");
+            _ = frame.rdi; // dfd
+            _ = frame.rdx; // flags
+            var path_buf: [256]u8 = undefined;
+            const pc = copy.copyFromUser(path_buf[0..], @ptrFromInt(frame.rsi), 255);
+            if (pc == 0) {
+                frame.rax = @bitCast(@as(i64, -14));
+                return;
+            }
+            path_buf[if (pc < 255) pc else 255] = 0;
+            var plen: usize = 0;
+            while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
+            var name_buf: [256]u8 = undefined;
+            const nc = copy.copyFromUser(name_buf[0..], @ptrFromInt(frame.r10), 255);
+            if (nc == 0) {
+                frame.rax = @bitCast(@as(i64, -14));
+                return;
+            }
+            name_buf[if (nc < 255) nc else 255] = 0;
+            var nlen: usize = 0;
+            while (nlen < 256 and name_buf[nlen] != 0) : (nlen += 1) {}
+            var actual_name = name_buf[0..nlen];
+            if (nlen > 5 and name_buf[0] == 'u' and name_buf[1] == 's' and name_buf[2] == 'e' and name_buf[3] == 'r' and name_buf[4] == '.') {
+                actual_name = name_buf[5..nlen];
+            } else if (nlen >= 1) {
+                frame.rax = @bitCast(@as(i64, -1)); // EPERM
+                return;
+            }
+            const inode_num = ext2_mod.walkPathToInodePublic(path_buf[0..plen]) orelse {
+                frame.rax = @bitCast(@as(i64, -2));
+                return;
+            };
+            frame.rax = @bitCast(ext2_mod.removeXattr(inode_num, actual_name));
         },
         467 => { // open_tree_attr(dfd, path, flags, attr)
             frame.rax = 0; // accept (simplified)
@@ -2164,6 +2377,116 @@ fn syscallFork(frame: *SyscallFrame) void {
 fn syscallExecve(frame: *SyscallFrame) void {
     const frame_addr = execve_mod.prepareExec(frame.rdi, frame.rsi) orelse {
         frame.rax = @bitCast(errno.EPERM);
+        return;
+    };
+
+    asm volatile (
+        \\movq %[anchor], %%rsp
+        \\popq %%r15
+        \\popq %%r14
+        \\popq %%r13
+        \\popq %%r12
+        \\popq %%r11
+        \\popq %%r10
+        \\popq %%r9
+        \\popq %%r8
+        \\popq %%rbp
+        \\popq %%rdi
+        \\popq %%rsi
+        \\popq %%rdx
+        \\popq %%rcx
+        \\popq %%rbx
+        \\popq %%rax
+        \\addq $16, %%rsp
+        \\swapgs
+        \\iretq
+        :
+        : [anchor] "r" (frame_addr),
+        : .{ .memory = true });
+    unreachable;
+}
+
+/// v52.0: execveat helper for non-AT_FDCWD dirfd resolution.
+/// Resolves dirfd to its stored path, concatenates with relative pathname,
+/// and calls prepareExecWithKernelPath.
+fn execveatWithDirfd(frame: *SyscallFrame, dirfd: i32) void {
+    const copy = @import("../../mm/copy_from_user.zig");
+    const ext2_mod = @import("../../fs/ext2.zig");
+    const sched_m = @import("../../proc/sched.zig");
+    const task_m = @import("../../proc/task.zig");
+    const vfs_m = @import("../../fs/vfs.zig");
+
+    const cur_idx = sched_m.currentTaskIndex() orelse {
+        frame.rax = @bitCast(@as(i64, -9));
+        return;
+    };
+    const t = task_m.getTask(cur_idx) orelse {
+        frame.rax = @bitCast(@as(i64, -9));
+        return;
+    };
+    const fd: u32 = @intCast(dirfd);
+    if (fd >= vfs_m.MAX_FDS or t.fd_table.fds[fd].fd_type != .ext2_file) {
+        frame.rax = @bitCast(@as(i64, -9));
+        return;
+    }
+    const ext2_idx = t.fd_table.fds[fd].ext2_file_idx;
+    const dir_path = ext2_mod.getOpenFilePath(ext2_idx) orelse {
+        frame.rax = @bitCast(@as(i64, -9));
+        return;
+    };
+
+    // v52.3: use stack buffers (512 bytes safe for kernel stack, avoids SMP race)
+    var rel_buf: [256]u8 = undefined;
+    var combined: [256]u8 = undefined;
+
+    const rc = copy.copyFromUser(rel_buf[0..], @ptrFromInt(frame.rsi), 255);
+    if (rc == 0) {
+        frame.rax = @bitCast(@as(i64, -14));
+        return;
+    }
+    rel_buf[if (rc < 255) rc else 255] = 0;
+    var rlen: usize = 0;
+    while (rlen < 256 and rel_buf[rlen] != 0) : (rlen += 1) {}
+
+    // v52.4: absolute pathname — dirfd is ignored per POSIX/Linux semantics
+    if (rlen > 0 and rel_buf[0] == '/') {
+        const frame_addr = execve_mod.prepareExecWithKernelPath(rel_buf[0..rlen], frame.rdx) orelse {
+            frame.rax = @bitCast(@as(i64, -13));
+            return;
+        };
+        asm volatile (
+            \\movq %[anchor], %%rsp
+            \\popq %%r15
+            \\popq %%r14
+            \\popq %%r13
+            \\popq %%r12
+            \\popq %%r11
+            \\popq %%r10
+            \\popq %%r9
+            \\popq %%r8
+            \\popq %%rbp
+            \\popq %%rdi
+            \\popq %%rsi
+            \\popq %%rdx
+            \\popq %%rcx
+            \\popq %%rbx
+            \\popq %%rax
+            \\addq $16, %%rsp
+            \\swapgs
+            \\iretq
+            :
+            : [anchor] "r" (frame_addr),
+            : .{ .memory = true });
+        unreachable;
+    }
+
+    const path = ext2_mod.buildCombinedPath(&combined, dir_path, rel_buf[0..rlen]) orelse {
+        frame.rax = @bitCast(@as(i64, -36));
+        return;
+    };
+
+    const frame_addr = execve_mod.prepareExecWithKernelPath(path, frame.rdx) orelse {
+        frame.rax = @bitCast(@as(i64, -13));
         return;
     };
 

@@ -1,8 +1,8 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.41.0
+> **版本**: v0.42.5
 > **日期**: 2026-05-29
-> **代码统计**: 内核 36,184 行 Zig / 122 源文件，用户空间 2,244 行 C/ASM
+> **代码统计**: 内核 37,265 行 Zig / 125 源文件，用户空间 2,244 行 C/ASM
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
@@ -29,7 +29,7 @@ MoQiOS 是一个运行在 x86_64 架构上的**单体内核** (Monolithic Kernel
 | 系统调用数量 | 383 dispatch 条目 (max #471, #0-#330 连续 + Linux #424-#471 完全连续) |
 | 文件系统 | FAT32 + ext2 (完整 symlink/hardlink/chown/chmod) + tmpfs + procfs + ramdisk + 统一页缓存 (命中/未中统计) |
 | 网络设备 | e1000 (中断驱动) + virtio-net (Virtqueue) |
-| 内核代码量 | 36,184 行 Zig / 122 文件 |
+| 内核代码量 | 36,405 行 Zig / 125 文件 |
 | 用户代码量 | 2,244 行 C/ASM |
 
 ---
@@ -500,7 +500,7 @@ LAPIC Timer 中断
 
 ## 6. 系统调用
 
-**源文件**: `kernel/arch/x86_64/syscall_entry.zig` (4,542 行)
+**源文件**: `kernel/arch/x86_64/syscall_entry.zig` (4,886 行)
 
 ### 6.1 系统调用机制
 
@@ -1042,7 +1042,7 @@ kernel/main.zig
   │   ├── gdt.zig          — GDT/TSS 设置 (Per-CPU)
   │   ├── idt.zig          — IDT/中断处理 + e1000/virtio-net IRQ分发
   │   ├── paging.zig       — 页表管理 + getPagePhysAddr
-  │   └── syscall_entry.zig — 系统调用入口 + 240 个处理函数 + COW fork
+  │   └── syscall_entry.zig — 系统调用入口 + 383 个处理函数 + COW fork
   │   ├── tsc.zig          — TSC 时钟
   │   └── exception.zig    — 异常处理器
   │
@@ -1063,7 +1063,7 @@ kernel/main.zig
   ├── fs/
   │   ├── vfs.zig          — 虚拟文件系统 + syncFile
   │   ├── fat32.zig        — FAT32 实现
-  │   ├── ext2.zig         — ext2 实现
+  │   ├── ext2.zig         — ext2 实现 (hardlink/symlink/chown/chmod/xattr)
   │   ├── tmpfs.zig        — 内存文件系统
   │   ├── procfs.zig       — 进程文件系统 (11种虚拟文件)
   │   ├── ramdisk.zig      — ramdisk 设备
@@ -1076,7 +1076,7 @@ kernel/main.zig
   │   ├── virtio_blk.zig   — virtio 块设备
   │   ├── virtio_net.zig   — virtio-net 网卡 (548行)
   │   ├── ahci.zig         — AHCI/SATA
-  │   ├── nvme.zig         — NVMe SSD
+  │   ├── nvme.zig         — NVMe SSD (多队列, 最多4 I/O SQ/CQ对)
   │   ├── e1000.zig        — e1000 网卡 (中断驱动)
   │   └── keyboard.zig     — PS/2 键盘
   │
@@ -1127,7 +1127,7 @@ kernel/main.zig
 
 | 文件 | 行数 | 功能 |
 |---|---|---|
-| kernel/arch/x86_64/syscall_entry.zig | 4,542 | 系统调用入口 + 383 dispatch 条目 |
+| kernel/arch/x86_64/syscall_entry.zig | 4,886 | 系统调用入口 + 383 dispatch 条目 |
 | kernel/net/tcp.zig | 1,682 | TCP 协议 (Reno/SACK/WS/TS/CORK/QUICKACK + @memcpy环形缓冲区) |
 | kernel/fs/vfs.zig | ~720 | 虚拟文件系统 + MAX_FDS=64 + procfs 路由 + inotify + allocFd |
 | kernel/arch/x86_64/idt.zig | 786 | 中断描述符表 + IRQ 分发 + COW #PF 处理 |
@@ -1137,12 +1137,12 @@ kernel/main.zig
 | kernel/fs/page_cache.zig | ~556 | 统一页缓存 (1024页/512哈希槽/Clock替换+命中统计/8页预取) |
 | kernel/main.zig | 329 | 内核主函数 |
 | kernel/arch/x86_64/paging.zig | 293 | 页表管理 + getPagePhysAddr |
-| kernel/fs/ext2.zig | ~2035 | ext2 文件系统 (hardlink/symlink/unlink/chown/chmod) |
+| kernel/fs/ext2.zig | ~2500 | ext2 文件系统 (hardlink/symlink/unlink/chown/chmod/xattr/walkPathResolve) |
 | kernel/fs/fat32.zig | ~900 | FAT32 文件系统 |
 | kernel/proc/scheduler.zig | ~500 | O(1) 位图调度器 |
 | kernel/proc/task.zig | ~704 | Task 结构体 + 进程管理 |
 | kernel/drivers/virtio_blk.zig | ~550 | virtio-blk 块设备驱动 |
-| kernel/drivers/nvme.zig | ~400 | NVMe SSD 驱动 |
+| kernel/drivers/nvme.zig | ~690 | NVMe SSD 驱动 (多队列, 最多4 I/O SQ/CQ对) |
 | kernel/mm/pmm.zig | 347 | 物理内存管理 (两级位图 + refcount + COW API) |
 | kernel/mm/slab.zig | ~200 | Slab 分配器 |
 | kernel/mm/swap.zig | ~267 | Swap 页面置换 (Clock算法 + u64位图@ctz分配) |

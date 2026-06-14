@@ -47,6 +47,9 @@ const NVME_CMD_READ = 0x02;
 
 const QUEUE_DEPTH = 64;
 
+/// Maximum I/O queue pairs for parallel throughput (v52.0 multi-queue).
+const MAX_IO_QUEUES = 4;
+
 // ─── NVMe Command Structure (64 bytes) ───────────────────────────────────
 
 const NvmeCommand = extern struct {
@@ -141,19 +144,23 @@ var enabled: bool = false;
 // Queue memory (physically contiguous)
 var admin_sq_phys: u64 = 0; // Admin Submission Queue
 var admin_cq_phys: u64 = 0; // Admin Completion Queue
-var io_sq_phys: u64 = 0; // I/O Submission Queue
-var io_cq_phys: u64 = 0; // I/O Completion Queue
-var prp_list_phys: u64 = 0; // PRP list page for large transfers
+var io_sq_phys: [MAX_IO_QUEUES]u64 = @splat(0); // I/O Submission Queues
+var io_cq_phys: [MAX_IO_QUEUES]u64 = @splat(0); // I/O Completion Queues
+var prp_list_phys: [MAX_IO_QUEUES]u64 = @splat(0); // PRP list pages per queue
 
 var admin_sq_tail: u16 = 0;
 var admin_cq_head: u16 = 0;
+var admin_cq_phase: bool = true; // Phase bit for admin CQ (v52.4)
 var admin_sq_doorbell: u64 = 0;
 var admin_cq_doorbell: u64 = 0;
 
-var io_sq_tail: u16 = 0;
-var io_cq_head: u16 = 0;
-var io_sq_doorbell: u64 = 0;
-var io_cq_doorbell: u64 = 0;
+var io_sq_tail: [MAX_IO_QUEUES]u16 = @splat(0);
+var io_cq_head: [MAX_IO_QUEUES]u16 = @splat(0);
+var io_cq_phase: [MAX_IO_QUEUES]bool = @splat(true); // Phase bit per CQ (v52.3)
+var io_sq_doorbell: [MAX_IO_QUEUES]u64 = @splat(0);
+var io_cq_doorbell: [MAX_IO_QUEUES]u64 = @splat(0);
+var num_io_queues: u32 = 0; // Actual number of I/O queues created
+var io_queue_rr: u32 = 0; // Round-robin queue selector
 
 var nsid: u32 = 1; // Active namespace ID
 var lba_size: u32 = 512; // Logical Block Size
@@ -285,19 +292,45 @@ pub fn init() void {
     // Allocate admin queue memory (physically contiguous)
     admin_sq_phys = pmm.allocPage() orelse return; // 4KB = 64 entries × 64 bytes
     admin_cq_phys = pmm.allocPage() orelse return; // 4KB = 64 entries × 16 bytes × 4 (padded)
-    io_sq_phys = pmm.allocPage() orelse return;
-    io_cq_phys = pmm.allocPage() orelse return;
-    prp_list_phys = pmm.allocPage() orelse return; // For large transfers
+
+    // v52.0: Allocate multiple I/O queue pairs for parallel throughput
+    for (0..MAX_IO_QUEUES) |q| {
+        io_sq_phys[q] = pmm.allocPage() orelse break;
+        io_cq_phys[q] = pmm.allocPage() orelse {
+            pmm.freePage(io_sq_phys[q]);
+            io_sq_phys[q] = 0;
+            break;
+        };
+        prp_list_phys[q] = pmm.allocPage() orelse {
+            pmm.freePage(io_cq_phys[q]);
+            pmm.freePage(io_sq_phys[q]);
+            io_cq_phys[q] = 0;
+            io_sq_phys[q] = 0;
+            break;
+        };
+    }
+    // Count successfully allocated queues (at least 1 required)
+    for (0..MAX_IO_QUEUES) |q| {
+        if (io_sq_phys[q] != 0 and io_cq_phys[q] != 0) {
+            num_io_queues = @intCast(q + 1);
+        }
+    }
+    if (num_io_queues == 0) {
+        serial.writeString("[NVMe] Failed to allocate I/O queues\n");
+        return;
+    }
 
     // Zero out queue memory
     const admin_sq: [*]u8 = @ptrFromInt(hhdm.physToVirt(admin_sq_phys));
     const admin_cq: [*]u8 = @ptrFromInt(hhdm.physToVirt(admin_cq_phys));
-    const io_sq: [*]u8 = @ptrFromInt(hhdm.physToVirt(io_sq_phys));
-    const io_cq: [*]u8 = @ptrFromInt(hhdm.physToVirt(io_cq_phys));
     @memset(admin_sq[0..4096], 0);
     @memset(admin_cq[0..4096], 0);
-    @memset(io_sq[0..4096], 0);
-    @memset(io_cq[0..4096], 0);
+    for (0..num_io_queues) |q| {
+        const sq: [*]u8 = @ptrFromInt(hhdm.physToVirt(io_sq_phys[q]));
+        const cq: [*]u8 = @ptrFromInt(hhdm.physToVirt(io_cq_phys[q]));
+        @memset(sq[0..4096], 0);
+        @memset(cq[0..4096], 0);
+    }
 
     // Configure Admin Queue
     const aqa: u32 = (QUEUE_DEPTH - 1) | ((QUEUE_DEPTH - 1) << 16); // ASQS | ACQS
@@ -347,20 +380,108 @@ pub fn init() void {
     fmt.writeDecimal(id_ctrl.nn);
     serial.writeString("\n");
 
-    // Create I/O Completion Queue (CQ 1)
-    if (!createCompletionQueue(1, io_cq_phys, QUEUE_DEPTH)) {
-        serial.writeString("[NVMe] Failed to create I/O CQ\n");
-        return;
+    // Create I/O queue pairs (v52.4: negotiate via Set Features first)
+    // NVMe spec requires Set Features (Feature ID 0x07) to request queue count
+    var requested_queues: u32 = num_io_queues;
+    // Check OACS bit 1: Set Features support (v52.4)
+    if ((id_ctrl.oacs & 0x2) != 0) {
+        var cmd_sf = zeroCommand();
+        cmd_sf.opcode = 0x09; // Set Features
+        cmd_sf.cdw10 = 0x07; // Feature ID: Number of Queues
+        cmd_sf.cdw11 = (@as(u32, requested_queues - 1) << 16) | (requested_queues - 1); // NSQR | NCQR (0-based)
+        if (submitAdminCmd(&cmd_sf)) |sf_cpl| {
+            if (((sf_cpl.status >> 1) & 0xFF) == 0) {
+                const granted = @min(
+                    ((sf_cpl.cdw0 >> 16) & 0xFFFF) + 1,
+                    (sf_cpl.cdw0 & 0xFFFF) + 1,
+                );
+                if (granted < requested_queues) {
+                    serial.writeString("[NVMe] Controller granted ");
+                    fmt.writeDecimal(granted);
+                    serial.writeString(" queues (requested ");
+                    fmt.writeDecimal(requested_queues);
+                    serial.writeString(")\n");
+                }
+                requested_queues = @min(granted, MAX_IO_QUEUES);
+            } else {
+                requested_queues = 1;
+            }
+        } else {
+            serial.writeString("[NVMe] Set Features # queues failed, falling back to 1 queue\n");
+            requested_queues = 1;
+        }
+    } else {
+        serial.writeString("[NVMe] Controller does not support Set Features, using 1 queue\n");
+        requested_queues = 1;
     }
-    // Create I/O Submission Queue (SQ 1, mapped to CQ 1)
-    if (!createSubmissionQueue(1, io_sq_phys, QUEUE_DEPTH, 1)) {
-        serial.writeString("[NVMe] Failed to create I/O SQ\n");
+    num_io_queues = requested_queues;
+
+    // v52.4: Free excess queue pages that were allocated but not needed
+    for (requested_queues..MAX_IO_QUEUES) |q| {
+        if (io_sq_phys[q] != 0) {
+            pmm.freePage(io_sq_phys[q]);
+            io_sq_phys[q] = 0;
+        }
+        if (io_cq_phys[q] != 0) {
+            pmm.freePage(io_cq_phys[q]);
+            io_cq_phys[q] = 0;
+        }
+        if (prp_list_phys[q] != 0) {
+            pmm.freePage(prp_list_phys[q]);
+            prp_list_phys[q] = 0;
+        }
+    }
+
+    var created_queues: u32 = 0;
+    for (0..num_io_queues) |q| {
+        const qid: u16 = @intCast(q + 1); // Queue IDs are 1-based
+        // Create I/O Completion Queue
+        if (!createCompletionQueue(qid, io_cq_phys[q], QUEUE_DEPTH)) {
+            serial.writeString("[NVMe] Failed to create I/O CQ ");
+            fmt.writeDecimal(qid);
+            serial.writeString("\n");
+            break;
+        }
+        // Create I/O Submission Queue (mapped to corresponding CQ)
+        if (!createSubmissionQueue(qid, io_sq_phys[q], QUEUE_DEPTH, qid)) {
+            serial.writeString("[NVMe] Failed to create I/O SQ ");
+            fmt.writeDecimal(qid);
+            serial.writeString("\n");
+            break;
+        }
+        // Set I/O doorbell addresses
+        // SQ doorbell: 0x1000 + (2 * qid) * stride
+        // CQ doorbell: 0x1000 + (2 * qid + 1) * stride
+        io_sq_doorbell[q] = 0x1000 + @as(u64, @as(u32, qid) * 2) * doorbell_stride;
+        io_cq_doorbell[q] = 0x1000 + @as(u64, @as(u32, qid) * 2 + 1) * doorbell_stride;
+        created_queues = @intCast(q + 1);
+    }
+    num_io_queues = created_queues;
+
+    // v52.5: Free pages for queues that failed to create
+    for (created_queues..MAX_IO_QUEUES) |q| {
+        if (io_sq_phys[q] != 0) {
+            pmm.freePage(io_sq_phys[q]);
+            io_sq_phys[q] = 0;
+        }
+        if (io_cq_phys[q] != 0) {
+            pmm.freePage(io_cq_phys[q]);
+            io_cq_phys[q] = 0;
+        }
+        if (prp_list_phys[q] != 0) {
+            pmm.freePage(prp_list_phys[q]);
+            prp_list_phys[q] = 0;
+        }
+    }
+
+    if (num_io_queues == 0) {
+        serial.writeString("[NVMe] Failed to create any I/O queues\n");
         return;
     }
 
-    // Set I/O doorbell addresses
-    io_sq_doorbell = 0x1000 + 2 * doorbell_stride; // SQ1 doorbell
-    io_cq_doorbell = 0x1000 + 3 * doorbell_stride; // CQ1 doorbell
+    serial.writeString("[NVMe] Created ");
+    fmt.writeDecimal(num_io_queues);
+    serial.writeString(" I/O queue pair(s)\n");
 
     // Identify Namespace 1
     if (!identifyNamespace(1)) {
@@ -407,21 +528,20 @@ fn submitAdminCmd(cmd: *const NvmeCommand) ?NvmeCompletion {
     admin_sq_tail = (admin_sq_tail + 1) % QUEUE_DEPTH;
     writeDoorbell(admin_sq_doorbell, admin_sq_tail);
 
-    // Poll for completion
+    // Poll for completion using phase bit (v52.4)
     var timeout: u32 = 2000000;
+    const expected_phase = admin_cq_phase;
     while (timeout > 0) : (timeout -= 1) {
         const cq: [*]NvmeCompletion = @ptrFromInt(hhdm.physToVirt(admin_cq_phys));
         const cpl = cq[admin_cq_head];
         const phase = (cpl.status & 0x1) != 0;
-        // On first pass after reset, phase = 1. Track expected phase.
-        // Simplification: check if cid matches and status is valid
-        if (cpl.cid != 0 or phase) {
-            const status = (cpl.status >> 1) & 0x7FF;
-            if (status != 0 or cpl.cid != 0) {
-                admin_cq_head = (admin_cq_head + 1) % QUEUE_DEPTH;
-                writeDoorbell(admin_cq_doorbell, admin_cq_head);
-                return cpl;
+        if (phase == expected_phase) {
+            admin_cq_head = (admin_cq_head + 1) % QUEUE_DEPTH;
+            if (admin_cq_head == 0) {
+                admin_cq_phase = !admin_cq_phase;
             }
+            writeDoorbell(admin_cq_doorbell, admin_cq_head);
+            return cpl;
         }
         asm volatile ("pause");
     }
@@ -462,7 +582,7 @@ fn identifyNamespace(ns: u32) bool {
     cmd.cdw10 = 0; // CNS=0 (Identify Namespace)
 
     const cpl = submitAdminCmd(&cmd) orelse return false;
-    const status = (cpl.status >> 1) & 0x7FF;
+    const status = (cpl.status >> 1) & 0xFF;
     if (status != 0) return false;
 
     const ns_data: *IdentifyNamespace = @ptrFromInt(hhdm.physToVirt(id_buf_phys));
@@ -484,7 +604,7 @@ fn createCompletionQueue(cq_id: u16, phys: u64, depth: u16) bool {
     cmd.cdw11 = 1; // PC=1 (Physically Contiguous), IEN=1
 
     const cpl = submitAdminCmd(&cmd) orelse return false;
-    return (cpl.status >> 1) & 0x7FF == 0;
+    return (cpl.status >> 1) & 0xFF == 0;
 }
 
 fn createSubmissionQueue(sq_id: u16, phys: u64, depth: u16, cq_id: u16) bool {
@@ -495,35 +615,34 @@ fn createSubmissionQueue(sq_id: u16, phys: u64, depth: u16, cq_id: u16) bool {
     cmd.cdw11 = (1 << 0) | (@as(u32, cq_id) << 16); // PC=1, CQID
 
     const cpl = submitAdminCmd(&cmd) orelse return false;
-    return (cpl.status >> 1) & 0x7FF == 0;
+    return (cpl.status >> 1) & 0xFF == 0;
 }
 
 // ─── I/O Commands ────────────────────────────────────────────────────────
 
-fn submitIoCmd(cmd: *const NvmeCommand) ?NvmeCompletion {
-    const sq: [*]NvmeCommand = @ptrFromInt(hhdm.physToVirt(io_sq_phys));
-    const tail = io_sq_tail;
+fn submitIoCmd(queue_idx: u32, cmd: *const NvmeCommand) ?NvmeCompletion {
+    const q = queue_idx;
+    const sq: [*]NvmeCommand = @ptrFromInt(hhdm.physToVirt(io_sq_phys[q]));
+    const tail = io_sq_tail[q];
     sq[tail] = cmd.*;
 
-    io_sq_tail = (io_sq_tail + 1) % QUEUE_DEPTH;
-    writeDoorbell(io_sq_doorbell, io_sq_tail);
+    io_sq_tail[q] = (io_sq_tail[q] + 1) % QUEUE_DEPTH;
+    writeDoorbell(io_sq_doorbell[q], io_sq_tail[q]);
 
-    // Poll for completion
+    // Poll for completion using phase bit (v52.3 fix)
     var timeout: u32 = 5000000;
-    const prev_head = io_cq_head;
+    const expected_phase = io_cq_phase[q];
     while (timeout > 0) : (timeout -= 1) {
-        const cq: [*]NvmeCompletion = @ptrFromInt(hhdm.physToVirt(io_cq_phys));
-        const cpl = cq[io_cq_head];
-        if (cpl.sq_head != 0 or io_cq_head != prev_head or (cpl.status >> 1) != 0) {
-            // Check if this is a new entry (phase bit flip)
-            io_cq_head = (io_cq_head + 1) % QUEUE_DEPTH;
-            writeDoorbell(io_cq_doorbell, io_cq_head);
-            return cpl;
-        }
-        // Alternate check: if sq_head advanced
-        if (io_cq_head != prev_head) {
-            io_cq_head = (io_cq_head + 1) % QUEUE_DEPTH;
-            writeDoorbell(io_cq_doorbell, io_cq_head);
+        const cq: [*]NvmeCompletion = @ptrFromInt(hhdm.physToVirt(io_cq_phys[q]));
+        const cpl = cq[io_cq_head[q]];
+        const phase = (cpl.status & 0x1) != 0;
+        if (phase == expected_phase) {
+            io_cq_head[q] = (io_cq_head[q] + 1) % QUEUE_DEPTH;
+            // Phase toggles when CQ wraps around
+            if (io_cq_head[q] == 0) {
+                io_cq_phase[q] = !io_cq_phase[q];
+            }
+            writeDoorbell(io_cq_doorbell[q], io_cq_head[q]);
             return cpl;
         }
         asm volatile ("pause");
@@ -531,10 +650,19 @@ fn submitIoCmd(cmd: *const NvmeCommand) ?NvmeCompletion {
     return null;
 }
 
+/// Select next I/O queue via round-robin (v52.0).
+inline fn selectQueue() u32 {
+    if (num_io_queues <= 1) return 0;
+    // v52.5: atomic increment for SMP safety
+    const old = @atomicRmw(u32, &io_queue_rr, .Add, 1, .monotonic);
+    return old % num_io_queues;
+}
+
 /// Read sectors from NVMe device.
 /// Returns number of sectors read, or negative error.
 pub fn readSectors(lba: u64, count: u32, buf: [*]u8) i32 {
     if (!enabled) return -1;
+    const q = selectQueue();
 
     // Determine buffer physical address
     const buf_phys = hhdm.virtToPhys(@intFromPtr(buf));
@@ -556,9 +684,10 @@ pub fn readSectors(lba: u64, count: u32, buf: [*]u8) i32 {
         cmd.prp2 = page2_phys;
     }
 
-    // For larger transfers, use PRP list
-    if (bytes > 8192) {
-        const prp_list: [*]u64 = @ptrFromInt(hhdm.physToVirt(prp_list_phys));
+    // For larger transfers (crossing >2 pages), use PRP list
+    // v52.5 fix: use page_offset+bytes instead of bytes alone for non-page-aligned buffers
+    if (page_offset + bytes > 8192) {
+        const prp_list: [*]u64 = @ptrFromInt(hhdm.physToVirt(prp_list_phys[q]));
         @memset(@as([*]u8, @ptrCast(prp_list))[0..4096], 0);
         var prp_count: u32 = 0;
         var cur_phys = (buf_phys + 4096) & ~@as(u64, 0xFFF);
@@ -566,11 +695,11 @@ pub fn readSectors(lba: u64, count: u32, buf: [*]u8) i32 {
             prp_list[prp_count] = cur_phys;
             cur_phys += 4096;
         }
-        cmd.prp2 = prp_list_phys;
+        cmd.prp2 = prp_list_phys[q];
     }
 
-    const cpl = submitIoCmd(&cmd) orelse return -1;
-    const status = (cpl.status >> 1) & 0x7FF;
+    const cpl = submitIoCmd(q, &cmd) orelse return -1;
+    const status = (cpl.status >> 1) & 0xFF;
     if (status != 0) {
         serial.writeString("[NVMe] Read error: status=0x");
         fmt.writeHex32(status);
@@ -584,6 +713,7 @@ pub fn readSectors(lba: u64, count: u32, buf: [*]u8) i32 {
 /// Returns number of sectors written, or negative error.
 pub fn writeSectors(lba: u64, count: u32, buf: [*]const u8) i32 {
     if (!enabled) return -1;
+    const q = selectQueue();
 
     const buf_phys = hhdm.virtToPhys(@intFromPtr(buf));
 
@@ -601,8 +731,9 @@ pub fn writeSectors(lba: u64, count: u32, buf: [*]const u8) i32 {
         const page2_phys = (buf_phys + 4096) & ~@as(u64, 0xFFF);
         cmd.prp2 = page2_phys;
     }
-    if (bytes > 8192) {
-        const prp_list: [*]u64 = @ptrFromInt(hhdm.physToVirt(prp_list_phys));
+    // v52.5 fix: use page_offset+bytes for non-page-aligned buffers
+    if (page_offset + bytes > 8192) {
+        const prp_list: [*]u64 = @ptrFromInt(hhdm.physToVirt(prp_list_phys[q]));
         @memset(@as([*]u8, @ptrCast(prp_list))[0..4096], 0);
         var prp_count: u32 = 0;
         var cur_phys = (buf_phys + 4096) & ~@as(u64, 0xFFF);
@@ -610,11 +741,11 @@ pub fn writeSectors(lba: u64, count: u32, buf: [*]const u8) i32 {
             prp_list[prp_count] = cur_phys;
             cur_phys += 4096;
         }
-        cmd.prp2 = prp_list_phys;
+        cmd.prp2 = prp_list_phys[q];
     }
 
-    const cpl = submitIoCmd(&cmd) orelse return -1;
-    const status = (cpl.status >> 1) & 0x7FF;
+    const cpl = submitIoCmd(q, &cmd) orelse return -1;
+    const status = (cpl.status >> 1) & 0xFF;
     if (status != 0) {
         return -1;
     }

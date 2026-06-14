@@ -1,6 +1,6 @@
 # MoQiOS 实施计划
 
-> **版本**: v51.0
+> **版本**: v52.5
 > **日期**: 2026-05-29
 > **说明**: 本文档记录 MoQiOS 的实际实施进度和已完成里程碑。
 > 长期设计目标参见 [moqios-design.md](./moqios-design.md)，当前架构参见 [moqios-architecture-current.md](./moqios-architecture-current.md)。
@@ -9,15 +9,15 @@
 
 ## 当前状态
 
-- **内核**: 36,184 行 Zig, 122 个源文件
+- **内核**: 37,265 行 Zig, 125 个源文件
 - **系统调用**: 383 个 dispatch 条目 (max #471, #0-#330 连续 + #424-#471 Linux标准编号完全连续), 58 个函数已提取到独立模块
 - **模块提取**: 26 个独立模块文件 (fs/mm/proc/net/sync/arch)
 - **自动化测试**: 29 个 (hello2-hello27, init.S) + 交互式 Shell
 - **测试稳定性**: 29/29 通过 (KVM -smp 1)
 - **最大进程数**: 64
 - **每进程文件描述符**: 64
-- **文件系统**: FAT32 (virtio-blk) + ramdisk + ext2 (读写, 完整 symlink/hardlink/chown/chmod) + tmpfs + procfs (11种虚拟文件) + 统一页缓存
-- **网络**: e1000 (中断驱动) + virtio-net + TCP Reno/SACK/WS/TS/CORK/QUICKACK (32连接/32K缓冲/32 backlog) + Socket API + epoll (128项/32实例/位图优化) + eventfd + timerfd + UDP sendto/recvfrom/bind/connect
+- **文件系统**: FAT32 (virtio-blk) + ramdisk + ext2 (读写, 完整 symlink/hardlink/chown/chmod/xattr) + tmpfs + procfs (11种虚拟文件) + 统一页缓存
+- **网络**: e1000 (中断驱动) + virtio-net + TCP Reno/SACK/WS/TS/CORK/QUICKACK (64连接/64K缓冲) + Socket API + epoll (128项/32实例/位图优化) + eventfd + timerfd + UDP sendto/recvfrom/bind/connect
 - **多核**: SMP 支持 (BSP + AP, O(1)位图调度器, Per-CPU 队列, Work Stealing)
 - **同步**: IrqSpinlock + TicketLock + Mutex + RwLock + SeqLock + futex + 无锁MPMC
 
@@ -797,6 +797,12 @@
 | v35.0 | 2026-05-29 | 全面消除ENOSYS缺口: socket() SOCK_RAW(新增raw_socket fd_type+e1000 sendPacket/receivePacket读写); futex PI(FUTEX_LOCK_PI CAS+阻塞/UNLOCK_PI 写0+唤醒/TRYLOCK_PI 非阻塞CAS/WAIT_REQUEUE_PI+CMP_REQUEUE_PI no-op); AIO扩展(IOCB_CMD_FSYNC+FDSYNC writeback刷盘/IOCB_CMD_NOOP); wait4 WNOHANG支持(waitpidWithOptions分离阻塞/非阻塞路径); IPC receive事件阻塞(forceReschedule+pending_msg投递替代自旋); epoll raw_socket case; 清理FUTEX_BITSET错位常量+AIO ENOSYS未用导入; 33486行内核 |
 | v36.0 | 2026-05-29 | 性能最优先功能补全: 新增16个syscall dispatch(#238 prlimit64跨进程资源限制/#282 unshare/#283-284 process_vm_readv/writev跨进程内存访问/#285 memfd_create匿名管道fd/#286-287 get/set_robust_list/#288-289 mount/umount2接线vfs.mountFs+umountFs/#290 sync_file_range/#291 readahead/#292-293 ioprio_set/get实际映射task.priority/#294 vmsplice用户页拼接管道/#295 name_to_handle_at路径哈希句柄/#296 open_by_handle_at EOPNOTSUPP); Task结构体新增robust_list_head/robust_list_len; vfs.allocPipe公开化+page_cache.recordAccess接入ext2/fat32读路径(顺序检测+预取提示); AHCI注册io_sched设备(端口级I/O调度器); 34024行内核, 221 dispatch条目 |
 | v37.0 | 2026-05-29 | MoQiOS原生IPC接线+性能优化补全: 新增14个syscall dispatch(#297-#310), 接线MoQiOS原生IPC模块(ipc.zig全量8个syscall: moqipc_create_ep/destroy_ep/send/recv/call/reply/notify/get_notify, 256字节Message端点消息传递+死锁检测+call depth限制); kcmp(进程资源比较: KCMP_FILE/VM/FILES/FS); capget/capset(POSIX capability读写); sched_setattr/sched_getattr(SCHED_FIFO/RR/OTHER/BATCH/DEADLINE策略+priority映射); membarrier(x86_64 MFENCE指令); 替换3个no-op为真实实现: msync→vfs.syncAll脏缓冲刷盘/mlock+munlock→MmapRegion.locked标记/posix_fadvise→page_cache.recordAccess顺序检测; Task新增sched_policy字段+MmapRegion新增locked字段; 34472行内核, 235 dispatch条目 |
+| v52.3 | 2026-05-29 | Code Review Critical+Warning修复8项: C1-ext2 xattr标准布局重写(value从块末向前增长,修复扫描器误读value字节为entry)/C2-NVMe Set Features(Feature ID 0x07)协商(创建I/O队列前协商队列数,控制器返回实际授予数)/C3-NVMe submitIoCmd添加per-CQ phase bit追踪(修复完成轮询损坏,环绕时翻转phase)/C4-removeXattr清除value数据+@memcpy替代字节循环/C5-execveatWithDirfd静态缓冲区改栈变量(SMP安全)/W1-删除walkPathToInode死代码+错误inode==2检查/W2-open_file_paths零初始化+closeFile完整清零128字节/W3-fchmodat未知flags拒绝(EINVAL)+buildCombinedPath处理尾斜杠; 37067行内核, 383 dispatch条目 |
+| v52.4 | 2026-05-29 | Code Review v2 Critical+Warning修复10项: C1-removeXattr改用tombstone方案(e_name_index=0标记删除,保留e_name_len供扫描器跳过,不再shift导致e_value_offs失效)/C2-NVMe submitAdminCmd添加phase bit追踪(修复cid=0成功命令永远超时)/C3-xattr代码硬编码4096→block_size(兼容1024字节块)+e_value_offs 4字节对齐/W1-setXattr支持flag-only属性升级为有值属性(e_value_offs=0时分配新value空间)/W2-execveatWithDirfd绝对路径名处理(POSIX语义:绝对路径忽略dirfd)/W3-fchmodat2(#452)添加flags处理(与#260一致)/W5-buildCombinedPath修复根目录"//"双斜杠/W6-NVMe Set Features检查OACS bit1(不支持则回退1队列)/W7-xattr syscall拒绝非user namespace(EPERM)/S1-NVMe释放超出队列数的已分配页面; 37205行内核, 383 dispatch条目 |
+| v52.5 | 2026-05-29 | Code Review v3 Critical+Warning修复6项: C1-NVMe PRP列表阈值修复(bytes→page_offset+bytes,修复非页对齐缓冲区3+页传输数据丢失)/C2-NVMe selectQueue原子化(@atomicRmw替代非原子+%=?SMP安全)/W1-setXattr valued→flag-only降级清理e_value_offs+清零旧值空间/W2-setXattr tombstone slot复用(扫描墓碑条目size>=新条目size时就地覆盖)/W3-getXattr防护e_value_offs==0且size>0(返回EIO而非读取头部垃圾)/W4-NVMe队列创建失败时释放已分配页面(防内存泄漏); 37265行内核, 383 dispatch条目 |
+| v52.2 | 2026-05-29 | Bug修复+功能补全6项: walkPathToInodePublic改用walkPathToInodeResolve(不分配fd,正确返回inode号)/新增walkPathToInodeNoFollow(中间组件解析symlink但最终组件不跟随,供lchown/lstat使用)/lchown(#94)改用setOwnerNoFollow(不再跟随最终symlink)/fchmodat(#260)从accept升级为真实setMode实现(支持AT_SYMLINK_NOFOLLOW)/#329 link和#330 symlink从accept升级为createHardlink+createSymlink/resolveParent用walkPathToInodeResolve替代walkPathToInodePublic(支持相对路径symlink); 37044行内核, 383 dispatch条目 |
+| v52.1 | 2026-05-29 | Bug修复9项: walkPathToInodePublic改用walkPathInner解析symlink(xattr/chown/chmod经过symlink目录不再失败)/setXattr替换同名属性就地更新value而非remove+re-add(修复旧value残留和覆盖)/listDir关闭walkPath打开的fd(修复fd泄漏)/closeFile清理open_file_paths(修复路径残留)/walkPathInner中间symlink关闭用closeFile/resolveParent改用walkPathToInodePublic(修复fd索引误当inode号)/createHardlink+setOwner+setMode改用walkPathToInodePublic/getXattr添加value_offs越界检查(防止损坏xattr块越界读); 36895行内核, 383 dispatch条目 |
+| v52.0 | 2026-05-29 | ext2 xattr+execveat完整路径+NVMe多队列: xattr(#463-#466)ext2底层实现(setXattr/getXattr/listXattr/removeXattr使用inode扩展属性块,短属性内联+长属性独立block); execveat(#322)非AT_FDCWD支持(ext2 open_file_paths全局路径表+buildCombinedPath拼接+prepareExecWithKernelPath内核路径exec); NVMe多队列(MAX_IO_QUEUES=4个SQ/CQ对,per-queue PRP列表,round-robin队列选择,graceful降级到更少队列); 36864行内核, 383 dispatch条目 |
 | v51.0 | 2026-05-29 | ext2 chown/chmod持久化+预取性能优化: 新增setOwner/setOwnerByInode/setMode/setModeByInode/getInodeNumFromOpen公开函数; chmod(#90)/fchmod(#91)从accept升级为真实ext2 mode写入(保留文件类型位,替换权限位); chown(#92)/fchown(#93)/lchown(#94)从accept升级为真实ext2 uid/gid写入(0xFFFF保持不变); fchmodat2(#452)从accept升级为委托chmod; page_cache PREFETCH_WINDOW 4→8(顺序读预取窗口翻倍,提升大文件吞吐); 36184行内核, 383 dispatch条目 |
 | v50.0 | 2026-05-29 | ext2 symlink基础设施完善: resolveParent新增中间路径组件符号链接解析(walkPathInner递归,绝对/相对路径正确起始inode)/readSymlinkByPath公开接口(路径→symlink target)/unlinkFile正确支持symlink(短链接不释放block[]inline目标,长链接只释放block[0])+hardlink(links_count>1只递减不释放blocks/inode)/readlink.zig ext2支持(readSymlinkByPath fallback); 36043行内核, 383 dispatch条目 |
 | v49.0 | 2026-05-29 | ext2 hardlink+symlink+symlink解析: 新增createHardlink(解析oldpath→inode+addDirEntry+links_count递增)/createSymlink(分配inode mode=0xA1FF+i_block内联短符号链接/data block长符号链接+file_type=7)/walkPathInner(递归symlink解析,深度限制8级ELOOP)/readSymlinkTarget(短链接i_block内联+长链接静态缓冲区)/walkPathToInode(路径→inode号); link()#86/symlink()#88从accept升级为真实ext2实现(copyFromUser+ext2调用); 35978行内核, 383 dispatch条目 |
