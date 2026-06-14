@@ -9,7 +9,7 @@
 ///   - Integration with block_dev abstraction layer
 ///
 /// Limitations:
-///   - Single I/O queue pair (sufficient for kernel use)
+///   - Up to 4 I/O queue pairs (configurable via MAX_IO_QUEUES)
 ///   - PRP only (no SGL)
 ///   - Polling mode (no MSI-X interrupt for completion yet)
 const serial = @import("../arch/x86_64/serial.zig");
@@ -93,15 +93,15 @@ const IdentifyController = extern struct {
     ieee: [3]u8, // IEEE OUI Identifier
     cmic: u8, // Controller Multi-Path I/O and Sharing
     mdts: u8, // Maximum Data Transfer Size
-    rsvd1: [257]u8,
-    oacs: u16, // Optional Admin Command Support
+    rsvd1: [178]u8, // bytes 78-255 (v52.6: was [257], off by 79)
+    oacs: u16, // Optional Admin Command Support (byte 256)
     acl: u8, // Abort Command Limit
     aerl: u8, // Asynchronous Event Request Limit
     frmw: u8, // Firmware Updates
     lpa: u8, // Log Page Attributes
     elpe: u8, // Error Log Page Entries
     npss: u8, // Number of Power States
-    rsvd2: [246]u8,
+    rsvd2: [248]u8, // bytes 264-511 (v52.6: was [246], off by 2)
     sqes: u8, // SQ Entry Size (bits 7:4 = max, 3:0 = min)
     cqes: u8, // CQ Entry Size (bits 7:4 = max, 3:0 = min)
     rsvd3: [2]u8,
@@ -447,6 +447,8 @@ pub fn init() void {
             serial.writeString("[NVMe] Failed to create I/O SQ ");
             fmt.writeDecimal(qid);
             serial.writeString("\n");
+            // v52.6: Delete the orphaned CQ before breaking
+            _ = deleteCompletionQueue(qid);
             break;
         }
         // Set I/O doorbell addresses
@@ -618,6 +620,15 @@ fn createSubmissionQueue(sq_id: u16, phys: u64, depth: u16, cq_id: u16) bool {
     return (cpl.status >> 1) & 0xFF == 0;
 }
 
+/// Delete an I/O Completion Queue from the controller (v52.6)
+fn deleteCompletionQueue(cq_id: u16) bool {
+    var cmd = zeroCommand();
+    cmd.opcode = NVME_CMD_DELETE_CQ;
+    cmd.cdw10 = cq_id; // CQID
+    const cpl = submitAdminCmd(&cmd) orelse return false;
+    return (cpl.status >> 1) & 0xFF == 0;
+}
+
 // ─── I/O Commands ────────────────────────────────────────────────────────
 
 fn submitIoCmd(queue_idx: u32, cmd: *const NvmeCommand) ?NvmeCompletion {
@@ -653,8 +664,8 @@ fn submitIoCmd(queue_idx: u32, cmd: *const NvmeCommand) ?NvmeCompletion {
 /// Select next I/O queue via round-robin (v52.0).
 inline fn selectQueue() u32 {
     if (num_io_queues <= 1) return 0;
-    // v52.5: atomic increment for SMP safety
-    const old = @atomicRmw(u32, &io_queue_rr, .Add, 1, .monotonic);
+    // v52.6: atomic increment for SMP safety (.acq_rel for proper ordering)
+    const old = @atomicRmw(u32, &io_queue_rr, .Add, 1, .acq_rel);
     return old % num_io_queues;
 }
 

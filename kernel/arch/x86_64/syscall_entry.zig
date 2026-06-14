@@ -2058,18 +2058,18 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             var nlen: usize = 0;
             while (nlen < 256 and name_buf[nlen] != 0) : (nlen += 1) {}
             var actual_name = name_buf[0..nlen];
-            if (nlen > 5 and name_buf[0] == 'u' and name_buf[1] == 's' and name_buf[2] == 'e' and name_buf[3] == 'r' and name_buf[4] == '.') {
+            if (nlen >= 5 and name_buf[0] == 'u' and name_buf[1] == 's' and name_buf[2] == 'e' and name_buf[3] == 'r' and name_buf[4] == '.') {
                 actual_name = name_buf[5..nlen];
             } else if (nlen >= 1) {
                 // v52.4: reject non-"user." namespace (only user xattr supported)
                 frame.rax = @bitCast(@as(i64, -1)); // EPERM
                 return;
             }
-            // Copy value
+            // Copy value (v52.6: vsize==0 is legal — flag-only xattr)
             const vsize: u32 = @truncate(frame.r8);
             var val_buf: [4096]u8 = undefined;
-            const vc = copy.copyFromUser(val_buf[0..], @ptrFromInt(frame.r9), @min(vsize, 4096));
-            if (vc == 0) {
+            const vc = if (vsize == 0) @as(u32, 0) else copy.copyFromUser(val_buf[0..], @ptrFromInt(frame.r9), @min(vsize, 4096));
+            if (vsize > 0 and vc == 0) {
                 frame.rax = @bitCast(@as(i64, -14));
                 return;
             }
@@ -2104,7 +2104,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             var nlen: usize = 0;
             while (nlen < 256 and name_buf[nlen] != 0) : (nlen += 1) {}
             var actual_name = name_buf[0..nlen];
-            if (nlen > 5 and name_buf[0] == 'u' and name_buf[1] == 's' and name_buf[2] == 'e' and name_buf[3] == 'r' and name_buf[4] == '.') {
+            if (nlen >= 5 and name_buf[0] == 'u' and name_buf[1] == 's' and name_buf[2] == 'e' and name_buf[3] == 'r' and name_buf[4] == '.') {
                 actual_name = name_buf[5..nlen];
             } else if (nlen >= 1) {
                 frame.rax = @bitCast(@as(i64, -1)); // EPERM
@@ -2173,7 +2173,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             var nlen: usize = 0;
             while (nlen < 256 and name_buf[nlen] != 0) : (nlen += 1) {}
             var actual_name = name_buf[0..nlen];
-            if (nlen > 5 and name_buf[0] == 'u' and name_buf[1] == 's' and name_buf[2] == 'e' and name_buf[3] == 'r' and name_buf[4] == '.') {
+            if (nlen >= 5 and name_buf[0] == 'u' and name_buf[1] == 's' and name_buf[2] == 'e' and name_buf[3] == 'r' and name_buf[4] == '.') {
                 actual_name = name_buf[5..nlen];
             } else if (nlen >= 1) {
                 frame.rax = @bitCast(@as(i64, -1)); // EPERM

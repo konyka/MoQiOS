@@ -2173,21 +2173,32 @@ pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
     // If inode has no EA block yet, allocate one
     var ea_block: u32 = inode.file_acl;
     if (ea_block == 0) {
+        // v52.6: allocate memory page BEFORE disk block to avoid leaking on OOM
+        const init_phys = pmm.allocPage() orelse return -12;
+        const init_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(init_phys));
         const group = (inode_num - 1) / inodes_per_group;
         ea_block = allocBlock(group);
-        if (ea_block == 0) return -28; // ENOSPC
+        if (ea_block == 0) {
+            pmm.freePage(init_phys);
+            return -28;
+        }
+        // Initialize EA block with header
+        @memset(init_buf[0..block_size], 0);
+        const init_hdr: *Ext2XattrHeader = @ptrCast(@alignCast(init_buf));
+        init_hdr.h_magic = EXT2_XATTR_MAGIC;
+        init_hdr.h_refcount = 1;
+        init_hdr.h_blocks = 1;
+        if (!writeBlock(ea_block, init_buf)) {
+            pmm.freePage(init_phys);
+            // Roll back: free the allocated disk block
+            inode.file_acl = 0;
+            freeBlock(ea_block);
+            return -5;
+        }
+        pmm.freePage(init_phys);
+        // Only write inode AFTER EA block is successfully initialized
         inode.file_acl = ea_block;
         if (!writeInode(inode_num, &inode)) return -5;
-        // Initialize EA block with header
-        const phys = pmm.allocPage() orelse return -12;
-        defer pmm.freePage(phys);
-        const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
-        @memset(buf[0..block_size], 0);
-        const hdr: *Ext2XattrHeader = @ptrCast(@alignCast(buf));
-        hdr.h_magic = EXT2_XATTR_MAGIC;
-        hdr.h_refcount = 1;
-        hdr.h_blocks = 1;
-        if (!writeBlock(ea_block, buf)) return -5;
     }
 
     // Read existing EA block
@@ -2302,7 +2313,9 @@ pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
     const new_val_aligned = if (value.len > 0) (value.len + 3) & ~@as(usize, 3) else 0;
     const new_val_off = if (value.len > 0) min_value_off - new_val_aligned else 0;
 
-    // v52.5: Scan for reusable tombstone slot (e_name_index==0, size >= new_entry_size)
+    // v52.6: Scan for reusable tombstone slot — exact size match only
+    // (larger tombstones leave dead-zone zeros that terminate the scanner,
+    //  making subsequent entries invisible; exact match avoids internal fragmentation)
     var reuse_off: usize = 0;
     {
         var scan_off: usize = @sizeOf(Ext2XattrHeader);
@@ -2312,9 +2325,8 @@ pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
             if (te.e_name_len == 0) break;
             if (te.e_name_index == 0) { // tombstone
                 const tombstone_sz = (@sizeOf(Ext2XattrEntry) + te.e_name_len + 3) & ~@as(usize, 3);
-                if (tombstone_sz >= new_entry_size and reuse_off == 0) {
+                if (tombstone_sz == new_entry_size and reuse_off == 0) {
                     reuse_off = scan_off;
-                    // Don't break — keep scanning entries_end
                 }
             }
             const esz = (@sizeOf(Ext2XattrEntry) + te.e_name_len + 3) & ~@as(usize, 3);
@@ -2326,7 +2338,11 @@ pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
     if (reuse_off == 0) {
         if (entries_end + new_entry_size > min_value_off) return -28; // ENOSPC
     }
-    if (value.len > 0 and entries_end + new_entry_size > new_val_off) return -28;
+    // v52.6: When tombstone reuse, entry goes inside entries_end, so only check value space
+    if (value.len > 0) {
+        const effective_end = if (reuse_off != 0) entries_end else entries_end + new_entry_size;
+        if (effective_end > new_val_off) return -28;
+    }
 
     // Write value at new_val_off (from end of block, growing backward)
     if (value.len > 0) {
@@ -2427,6 +2443,13 @@ pub fn listXattr(inode_num: u32, list_buf: [*]u8, buf_size: u32) i64 {
 
         // Skip tombstones (e_name_index == 0 means deleted)
         if (entry.e_name_index == 0) {
+            const entry_size = @sizeOf(Ext2XattrEntry) + entry.e_name_len;
+            entry_off = (entry_off + entry_size + 3) & ~@as(usize, 3);
+            continue;
+        }
+
+        // v52.6: Only list user namespace entries (consistent with set/get/remove EPERM rejection)
+        if (entry.e_name_index != XATTR_USER_PREFIX) {
             const entry_size = @sizeOf(Ext2XattrEntry) + entry.e_name_len;
             entry_off = (entry_off + entry_size + 3) & ~@as(usize, 3);
             continue;
