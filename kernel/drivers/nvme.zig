@@ -126,7 +126,7 @@ const IdentifyNamespace = extern struct {
     fpi: u8, // Format Progress Indicator
     rsvd1: [95]u8, // bytes 33-127 (v53.0: was [298], off by 203)
     lbaf: [16]LbaFormat, // bytes 128-191
-    rsvd2: [256]u8, // bytes 192-511
+    rsvd2: [320]u8, // bytes 192-511 (v53.1: was [256], off by 64)
 };
 
 const LbaFormat = extern struct {
@@ -593,6 +593,8 @@ fn identifyNamespace(ns: u32) bool {
 
     // Determine LBA size from flbas
     const lbaf_idx = ns_data.flbas & 0xF;
+    // v53.1: lbads==0 means unused/unsupported LBA format
+    if (ns_data.lbaf[lbaf_idx].lbads == 0) return false;
     lba_size = @as(u32, 1) << @as(u5, @intCast(ns_data.lbaf[lbaf_idx].lbads));
 
     return true;

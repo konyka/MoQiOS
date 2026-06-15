@@ -2570,9 +2570,11 @@ pub fn removeXattr(inode_num: u32, name: []const u8) i64 {
                 scan_off2 += ssz;
             }
             if (all_empty) {
-                // Free the EA block
+                // v53.1: Only free EA block after successful writeInode
+                // If writeInode fails, disk inode still references the EA block;
+                // freeing it would create a dangling reference (data corruption)
                 inode.file_acl = 0;
-                _ = writeInode(inode_num, &inode);
+                if (!writeInode(inode_num, &inode)) return -5;
                 freeBlock(ea_block);
             } else {
                 _ = writeBlock(ea_block, buf);
