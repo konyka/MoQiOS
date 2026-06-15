@@ -124,9 +124,9 @@ const IdentifyNamespace = extern struct {
     nmic: u8, // Namespace Multi-path I/O and Sharing
     rescap: u8, // Reservation Capabilities
     fpi: u8, // Format Progress Indicator
-    rsvd1: [298]u8,
-    lbaf: [16]LbaFormat,
-    rsvd2: [192]u8,
+    rsvd1: [95]u8, // bytes 33-127 (v53.0: was [298], off by 203)
+    lbaf: [16]LbaFormat, // bytes 128-191
+    rsvd2: [256]u8, // bytes 192-511
 };
 
 const LbaFormat = extern struct {
@@ -390,7 +390,7 @@ pub fn init() void {
         cmd_sf.cdw10 = 0x07; // Feature ID: Number of Queues
         cmd_sf.cdw11 = (@as(u32, requested_queues - 1) << 16) | (requested_queues - 1); // NSQR | NCQR (0-based)
         if (submitAdminCmd(&cmd_sf)) |sf_cpl| {
-            if (((sf_cpl.status >> 1) & 0xFF) == 0) {
+            if (((sf_cpl.status >> 1) & 0x7FF) == 0) {
                 const granted = @min(
                     ((sf_cpl.cdw0 >> 16) & 0xFFFF) + 1,
                     (sf_cpl.cdw0 & 0xFFFF) + 1,
@@ -584,7 +584,7 @@ fn identifyNamespace(ns: u32) bool {
     cmd.cdw10 = 0; // CNS=0 (Identify Namespace)
 
     const cpl = submitAdminCmd(&cmd) orelse return false;
-    const status = (cpl.status >> 1) & 0xFF;
+    const status = (cpl.status >> 1) & 0x7FF;
     if (status != 0) return false;
 
     const ns_data: *IdentifyNamespace = @ptrFromInt(hhdm.physToVirt(id_buf_phys));
@@ -606,7 +606,7 @@ fn createCompletionQueue(cq_id: u16, phys: u64, depth: u16) bool {
     cmd.cdw11 = 1; // PC=1 (Physically Contiguous), IEN=1
 
     const cpl = submitAdminCmd(&cmd) orelse return false;
-    return (cpl.status >> 1) & 0xFF == 0;
+    return (cpl.status >> 1) & 0x7FF == 0;
 }
 
 fn createSubmissionQueue(sq_id: u16, phys: u64, depth: u16, cq_id: u16) bool {
@@ -617,7 +617,7 @@ fn createSubmissionQueue(sq_id: u16, phys: u64, depth: u16, cq_id: u16) bool {
     cmd.cdw11 = (1 << 0) | (@as(u32, cq_id) << 16); // PC=1, CQID
 
     const cpl = submitAdminCmd(&cmd) orelse return false;
-    return (cpl.status >> 1) & 0xFF == 0;
+    return (cpl.status >> 1) & 0x7FF == 0;
 }
 
 /// Delete an I/O Completion Queue from the controller (v52.6)
@@ -626,7 +626,7 @@ fn deleteCompletionQueue(cq_id: u16) bool {
     cmd.opcode = NVME_CMD_DELETE_CQ;
     cmd.cdw10 = cq_id; // CQID
     const cpl = submitAdminCmd(&cmd) orelse return false;
-    return (cpl.status >> 1) & 0xFF == 0;
+    return (cpl.status >> 1) & 0x7FF == 0;
 }
 
 // ─── I/O Commands ────────────────────────────────────────────────────────
@@ -710,7 +710,7 @@ pub fn readSectors(lba: u64, count: u32, buf: [*]u8) i32 {
     }
 
     const cpl = submitIoCmd(q, &cmd) orelse return -1;
-    const status = (cpl.status >> 1) & 0xFF;
+    const status = (cpl.status >> 1) & 0x7FF;
     if (status != 0) {
         serial.writeString("[NVMe] Read error: status=0x");
         fmt.writeHex32(status);
@@ -756,7 +756,7 @@ pub fn writeSectors(lba: u64, count: u32, buf: [*]const u8) i32 {
     }
 
     const cpl = submitIoCmd(q, &cmd) orelse return -1;
-    const status = (cpl.status >> 1) & 0xFF;
+    const status = (cpl.status >> 1) & 0x7FF;
     if (status != 0) {
         return -1;
     }
