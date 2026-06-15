@@ -846,6 +846,9 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                     const acked = ack_num -% tcb.snd_una;
                     if (acked <= SEND_BUF_SIZE) {
                         tcb.snd_una = ack_num;
+                        // v53.2: advance send_head to free acknowledged buffer space
+                        // Without this, the ring buffer permanently fills → connection deadlock
+                        tcb.send_head = (tcb.send_head + acked) % SEND_BUF_SIZE;
                         tcb.send_unacked = (tcb.send_unacked + acked) % SEND_BUF_SIZE;
                         tcb.retransmit_timer = 0;
                         tcb.retransmit_count = 0;
@@ -930,8 +933,9 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
 
                             // Retransmit the first non-SACKed segment
                             tcb.snd_nxt = tcb.snd_una;
-                            const unacked = tcb.send_tail -% tcb.send_head;
-                            if (unacked > 0 and unacked <= SEND_BUF_SIZE) {
+                            // v53.2: use ringDataLen instead of raw subtraction (handles wrap-around)
+                            const unacked = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
+                            if (unacked > 0) {
                                 tcb.send_unacked = tcb.send_head;
                                 flushSendBuffer(tcb);
                             }
@@ -1351,9 +1355,9 @@ pub fn timerTick(ms_elapsed: u32) void {
 
                 // Retransmit: reset snd_nxt back to snd_una and re-flush
                 tcb.snd_nxt = tcb.snd_una;
-                // Reset send_unacked to send_head to resend buffered data
-                const unacked = tcb.send_tail -% tcb.send_head;
-                if (unacked > 0 and unacked <= SEND_BUF_SIZE) {
+                // v53.2: use ringDataLen instead of raw subtraction (handles wrap-around)
+                const unacked = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
+                if (unacked > 0) {
                     // Re-send from beginning of pending data
                     tcb.send_unacked = tcb.send_head;
                     flushSendBuffer(tcb);

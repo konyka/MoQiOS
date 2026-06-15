@@ -1011,8 +1011,33 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
         }
     }
 
-    // Free double indirect entirely if not needed
+    // Free double indirect entirely if not needed (v53.2: free all sub-blocks)
     if (f.inode.block[13] != 0 and new_blocks_needed <= EXT2_INODE_DIRECT + block_size / 4) {
+        const dib_phys = pmm.allocPage() orelse {
+            freeBlock(f.inode.block[13]);
+            f.inode.block[13] = 0;
+            return true;
+        }; // best-effort: at least free the double indirect block
+        const dib: [*]u8 = @ptrFromInt(hhdm.physToVirt(dib_phys));
+        if (readBlock(f.inode.block[13], dib)) {
+            const ptrs_per_block = block_size / 4;
+            const dib_ptrs: [*]const u32 = @ptrCast(@alignCast(dib));
+            for (0..ptrs_per_block) |k| {
+                if (dib_ptrs[k] != 0) {
+                    const sib_phys = pmm.allocPage() orelse break;
+                    const sib: [*]u8 = @ptrFromInt(hhdm.physToVirt(sib_phys));
+                    if (readBlock(dib_ptrs[k], sib)) {
+                        const sib_ptrs: [*]const u32 = @ptrCast(@alignCast(sib));
+                        for (0..ptrs_per_block) |m| {
+                            if (sib_ptrs[m] != 0) freeBlock(sib_ptrs[m]);
+                        }
+                    }
+                    pmm.freePage(sib_phys);
+                    freeBlock(dib_ptrs[k]);
+                }
+            }
+        }
+        pmm.freePage(dib_phys);
         freeBlock(f.inode.block[13]);
         f.inode.block[13] = 0;
     }
@@ -1836,8 +1861,30 @@ pub fn unlinkFile(path: []const u8) bool {
                 freeBlock(file_inode.block[12]);
             }
 
-            // Free double indirect block (block[13])
+            // Free double indirect block (block[13]) and all blocks it points to
+            // v53.2: recurse through single indirect blocks, free their data blocks
             if (file_inode.block[13] != 0) {
+                const dib_phys = pmm.allocPage() orelse return false;
+                const dib: [*]u8 = @ptrFromInt(hhdm.physToVirt(dib_phys));
+                if (readBlock(file_inode.block[13], dib)) {
+                    const ptrs_per_block = block_size / 4;
+                    const dib_ptrs: [*]const u32 = @ptrCast(@alignCast(dib));
+                    for (0..ptrs_per_block) |k| {
+                        if (dib_ptrs[k] != 0) {
+                            const sib_phys = pmm.allocPage() orelse break;
+                            const sib: [*]u8 = @ptrFromInt(hhdm.physToVirt(sib_phys));
+                            if (readBlock(dib_ptrs[k], sib)) {
+                                const sib_ptrs: [*]const u32 = @ptrCast(@alignCast(sib));
+                                for (0..ptrs_per_block) |m| {
+                                    if (sib_ptrs[m] != 0) freeBlock(sib_ptrs[m]);
+                                }
+                            }
+                            pmm.freePage(sib_phys);
+                            freeBlock(dib_ptrs[k]);
+                        }
+                    }
+                }
+                pmm.freePage(dib_phys);
                 freeBlock(file_inode.block[13]);
             }
         }

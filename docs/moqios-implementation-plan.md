@@ -1,6 +1,6 @@
 # MoQiOS 实施计划
 
-> **版本**: v53.1
+> **版本**: v53.2
 > **日期**: 2026-05-29
 > **说明**: 本文档记录 MoQiOS 的实际实施进度和已完成里程碑。
 > 长期设计目标参见 [moqios-design.md](./moqios-design.md)，当前架构参见 [moqios-architecture-current.md](./moqios-architecture-current.md)。
@@ -9,7 +9,7 @@
 
 ## 当前状态
 
-- **内核**: 37,340 行 Zig, 125 个源文件
+- **内核**: 37,397 行 Zig, 125 个源文件
 - **系统调用**: 383 个 dispatch 条目 (max #471, #0-#330 连续 + #424-#471 Linux标准编号完全连续), 58 个函数已提取到独立模块
 - **模块提取**: 26 个独立模块文件 (fs/mm/proc/net/sync/arch)
 - **自动化测试**: 29 个 (hello2-hello27, init.S) + 交互式 Shell
@@ -803,7 +803,8 @@
 | v52.6 | 2026-05-29 | Code Review v4 Critical+Warning修复10项: C1-IdentifyController结构体偏移修复(rsvd1:[257]→[178]+rsvd2:[246]→[248],修复OACS/SQES/CQES/NN全部从错误偏移读取)/C2-tombstone复用改精确匹配(>=→==,避免死区零截断后续条目扫描)/C3-setxattrat系统调用vsize==0不再误返回EFAULT(支持flag-only xattr)/C4-NVMe SQ创建失败时deleteCompletionQueue删除孤立CQ(新增函数)/C5-setXattr EA块分配顺序修复(pmm先于allocBlock+writeBlock回滚)/W1-listXattr添加非user命名空间过滤(与set/get/remove一致)/W2-setXattr tombstone复用时空间检查修正(effective_end)/W3-selectQueue .monotonic→.acq_rel(提供获取释放语义)/W4-xattr命名空间检查nlen>5→nlen>=5(处理"user."空后缀)/W5-NVMe驱动顶部注释更新; 37299行内核, 383 dispatch条目 |
 | v52.7 | 2026-05-29 | Code Review v5 Warning修复2项: W1-setXattr EA块writeInode失败时添加freeBlock回滚(防磁盘块永久泄漏)/W2-tombstone复用从精确匹配改为最佳适配+mini-tombstone填充(复用>=的tombstone时在残留空间创建mini-tombstone条目e_name_index=0/e_name_len=leftover-name-bytes供扫描器跳过,大幅提升空间复用率同时避免死区零截断); 37329行内核, 383 dispatch条目 |
 | v52.8 | 2026-05-29 | Code Review v6 Critical修复1项: C1-mini-tombstone残留空间<16字节死区修复(v52.7的best-fit在leftover_sz为4/8/12/16字节时未填充导致扫描器提前终止后续条目不可见,修复为best-fit搜索时仅接受leftover==0精确匹配或leftover>=16可创建mini-tombstone的tombstone,从根源杜绝零死区); 37328行内核, 383 dispatch条目 |
-| v53.1 | 2026-05-29 | Code Review v9 Warning+建议修复3项: W1-IdentifyNamespace rsvd2 [256]→[320]修正(结构体总大小448→512匹配NVMe规范bytes 192-511,与v53.0的rsvd1修复合并后完整修正偏移链)/W2-removeXattr writeInode失败回滚(与setXattr v52.7回滚模式一致,writeInode失败时不释放EA块防止磁盘inode悬空引用数据损坏)/S1-identifyNamespace lbads==0防护(NVMe规范lbads==0表示未使用格式,跳过防止lba_size=1字节无意义值); 37340行内核, 383 dispatch条目 |
+| v53.2 | 2026-05-29 | Code Review v10 Critical+Warning修复5项: C1-ext2双间接块释放遗漏修复(unlinkFile/truncateFile仅释放block[13]自身未递归释放其指向的单间接块和数据块,导致大文件删除后磁盘块永久泄漏,现递归遍历双间接块→单间接块→数据块完整释放)/C2-TCP send_head在ACK后永不推进导致连接死锁(环形缓冲区空间永不释放,send_tail达到SEND_BUF_SIZE后tcpSend返回0字节,连接永久阻塞,现ACK处理中同步推进send_head释放已确认数据空间)/W1-TCP重传路径原始减法改为ringDataLen(环形缓冲区回绕时send_tail-%send_head产生接近u32_max的巨大值导致unacked<=SEND_BUF_SIZE检查失败重传被静默跳过)/W2-mmap length溢出防护(接近u64_max时length+PAGE_SIZE-1溢出为小值导致num_pages远小于实际需要映射不足页面)/W3-fork继承mmap_regions(子进程mmap_regions为空导致munmap/madvise/mlock/munlock功能失效); 37397行内核, 383 dispatch条目 |
+| v53.1 | 2026-05-29 | Code Review v9 Warning+建议修复3项: W1-IdentifyNamespace rsvd2 [256]→[320]修正(结构体总大小448→512匹配NVMe规范bytes 192-511)/W2-removeXattr writeInode失败回滚(与setXattr v52.7回滚模式一致)/S1-identifyNamespace lbads==0防护; 37340行内核, 383 dispatch条目 |
 | v53.0 | 2026-05-29 | Code Review v8 Critical+Warning修复2项: C1-IdentifyNamespace结构体rsvd1偏移修复([298]→[95]使lbaf从偏移334修正到128匹配NVMe规范,与v52.6修复的IdentifyController同类bug但被遗漏,rsvd2同步修正[192]→[256];v52.9之前lba_size从错误偏移读取垃圾lbads值导致扇区大小错误)/W1-NVMe完成状态掩码0xFF→0x7FF(cpl.status>>1后SCT(2bit)+Reserved(1bit)+SC(8bit)=11bit,旧掩码0xFF仅捕获8bit丢失SC高3位,SC>=32的vendor-specific错误被误判为成功); 37336行内核, 383 dispatch条目 |
 | v52.9 | 2026-05-29 | Code Review v7 Critical+Warning修复2项: C1-leftover==16时e_name_len=0修复(v52.8的过滤器允许leftover==16但此时mini-tombstone的e_name_len=0等同于条目终止标记导致扫描器提前终止,修复为leftover>Ext2XattrEntry即leftover>=20保证e_name_len>=4)/W1-setxattrat系统调用vsize>4096返回E2BIG(防止值被静默截断为前4096字节+移除@min截断); 37336行内核, 383 dispatch条目 |
 | v52.2 | 2026-05-29 | Bug修复+功能补全6项: walkPathToInodePublic改用walkPathToInodeResolve(不分配fd,正确返回inode号)/新增walkPathToInodeNoFollow(中间组件解析symlink但最终组件不跟随,供lchown/lstat使用)/lchown(#94)改用setOwnerNoFollow(不再跟随最终symlink)/fchmodat(#260)从accept升级为真实setMode实现(支持AT_SYMLINK_NOFOLLOW)/#329 link和#330 symlink从accept升级为createHardlink+createSymlink/resolveParent用walkPathToInodeResolve替代walkPathToInodePublic(支持相对路径symlink); 37044行内核, 383 dispatch条目 |

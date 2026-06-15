@@ -52,6 +52,10 @@ pub fn fork(frame: *SyscallFrame) i64 {
     @memcpy(child.cwd[0..256], parent.cwd[0..256]);
     child.cwd_len = parent.cwd_len;
 
+    // v53.2: inherit mmap regions so munmap/madvise/mlock work in child
+    child.mmap_regions = parent.mmap_regions;
+    child.mmap_count = parent.mmap_count;
+
     const child_stack_top = child.kernel_stack_top;
     const child_frame_addr = child_stack_top - @sizeOf(idt.InterruptFrame);
     const child_frame: *idt.InterruptFrame = @ptrFromInt(child_frame_addr);

@@ -1,8 +1,8 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.43.1
+> **版本**: v0.43.2
 > **日期**: 2026-05-29
-> **代码统计**: 内核 37,340 行 Zig / 125 源文件，用户空间 2,244 行 C/ASM
+> **代码统计**: 内核 37,397 行 Zig / 125 源文件，用户空间 2,244 行 C/ASM
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
@@ -29,7 +29,7 @@ MoQiOS 是一个运行在 x86_64 架构上的**单体内核** (Monolithic Kernel
 | 系统调用数量 | 383 dispatch 条目 (max #471, #0-#330 连续 + Linux #424-#471 完全连续) |
 | 文件系统 | FAT32 + ext2 (完整 symlink/hardlink/chown/chmod) + tmpfs + procfs + ramdisk + 统一页缓存 (命中/未中统计) |
 | 网络设备 | e1000 (中断驱动) + virtio-net (Virtqueue) |
-| 内核代码量 | 36,480 行 Zig / 125 文件 |
+| 内核代码量 | 36,537 行 Zig / 125 文件 |
 | 用户代码量 | 2,244 行 C/ASM |
 
 ---

@@ -64,6 +64,8 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
+    // v53.2: reject overflow-inducing length values
+    if (length > 0xFFFFFFFF_FFFFF000) return -12; // ENOMEM
     const num_pages = (length + user_space.PAGE_SIZE - 1) / user_space.PAGE_SIZE;
 
     // Determine base address
