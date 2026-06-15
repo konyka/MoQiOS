@@ -2067,8 +2067,13 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             }
             // Copy value (v52.6: vsize==0 is legal — flag-only xattr)
             const vsize: u32 = @truncate(frame.r8);
+            // v52.9: reject values larger than our buffer (prevent silent truncation)
+            if (vsize > 4096) {
+                frame.rax = @bitCast(@as(i64, -7)); // E2BIG
+                return;
+            }
             var val_buf: [4096]u8 = undefined;
-            const vc = if (vsize == 0) @as(u32, 0) else copy.copyFromUser(val_buf[0..], @ptrFromInt(frame.r9), @min(vsize, 4096));
+            const vc = if (vsize == 0) @as(u32, 0) else copy.copyFromUser(val_buf[0..], @ptrFromInt(frame.r9), vsize);
             if (vsize > 0 and vc == 0) {
                 frame.rax = @bitCast(@as(i64, -14));
                 return;

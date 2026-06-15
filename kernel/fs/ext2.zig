@@ -2332,7 +2332,10 @@ pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
                 const tombstone_sz = (@sizeOf(Ext2XattrEntry) + te.e_name_len + 3) & ~@as(usize, 3);
                 if (tombstone_sz >= new_entry_size) {
                     const leftover = tombstone_sz - new_entry_size;
-                    if (leftover == 0 or leftover >= @sizeOf(Ext2XattrEntry)) {
+                    // v52.9: leftover must be 0 (exact) or > Ext2XattrEntry (>=20)
+                    // leftover==16 would make e_name_len=0, which is the
+                    // entry termination marker — same dead-zone bug
+                    if (leftover == 0 or leftover > @sizeOf(Ext2XattrEntry)) {
                         // Best-fit: prefer smallest tombstone that fits safely
                         if (reuse_off == 0 or tombstone_sz < reuse_tombstone_sz) {
                             reuse_off = scan_off;
@@ -2373,7 +2376,7 @@ pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
     @memcpy(buf[write_off + @sizeOf(Ext2XattrEntry) ..][0..name.len], name);
 
     // v52.8: If tombstone was larger than new entry, fill leftover with mini-tombstone
-    // (leftover is guaranteed >= Ext2XattrEntry by the best-fit filter above)
+    // v52.9: (leftover is guaranteed > Ext2XattrEntry by the best-fit filter above)
     if (reuse_off != 0 and reuse_tombstone_sz > new_entry_size) {
         const leftover_off = write_off + new_entry_size;
         const leftover_sz = reuse_tombstone_sz - new_entry_size;
