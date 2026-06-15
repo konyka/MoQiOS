@@ -913,7 +913,7 @@ fn listDirInode(inode_num: u32, buf: []u8) usize {
 /// Returns entries as (name, name_len, inode_num, file_type, next_offset) tuples.
 /// `out_offset` is updated to the next offset for subsequent reads.
 /// Returns the number of entries written to the output arrays.
-pub fn readDirEntries(file_idx: u32, start_offset: u32, names: [*][*]u8, name_lens: [*]u32, inodes: [*]u32, file_types: [*]u8, next_offsets: [*]u32, max_entries: u32) struct { count: u32, new_offset: u32 } {
+pub fn readDirEntries(file_idx: u32, start_offset: u32, names: [*][256]u8, name_lens: [*]u32, inodes: [*]u32, file_types: [*]u8, next_offsets: [*]u32, max_entries: u32) struct { count: u32, new_offset: u32 } {
     if (!active) return .{ .count = 0, .new_offset = start_offset };
     if (file_idx >= open_count) return .{ .count = 0, .new_offset = start_offset };
     const f = &open_files[file_idx];
@@ -944,8 +944,10 @@ pub fn readDirEntries(file_idx: u32, start_offset: u32, names: [*][*]u8, name_le
             if (entry.rec_len == 0) break;
 
             if (entry.inode != 0 and entry.name_len > 0) {
-                const name_ptr = buf + pos + @sizeOf(Ext2DirEntry);
-                names[count] = name_ptr;
+                // v53.3: copy name data instead of storing dangling pointer
+                // (buf is freed by defer pmm.freePage after function returns)
+                const nlen: usize = @intCast(entry.name_len);
+                @memcpy(names[count][0..nlen], buf[pos + @sizeOf(Ext2DirEntry) ..][0..nlen]);
                 name_lens[count] = entry.name_len;
                 inodes[count] = entry.inode;
                 file_types[count] = entry.file_type;
@@ -1045,6 +1047,90 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
     f.inode.size = new_size;
     f.inode.blocks = new_blocks_needed * (block_size / 512);
     _ = writeInode(f.inode_num, &f.inode);
+    return true;
+}
+
+/// Truncate a file by inode number (v53.3: for truncate syscall).
+/// Works directly on disk inode without going through open_files table.
+pub fn truncateByInode(inode_num: u32, new_size: u32) bool {
+    if (!active) return false;
+    if (inode_num == 0) return false;
+
+    var inode: Ext2Inode = undefined;
+    if (!readInode(inode_num, &inode)) return false;
+
+    if (new_size >= inode.size) {
+        // Growing: just update size (blocks allocated on write)
+        inode.size = new_size;
+        _ = writeInode(inode_num, &inode);
+        return true;
+    }
+
+    const new_blocks_needed = if (new_size == 0) @as(u32, 0) else @as(u32, (new_size + block_size - 1) / block_size);
+
+    // Free direct blocks beyond needed
+    for (new_blocks_needed..EXT2_INODE_DIRECT) |i| {
+        if (i < EXT2_INODE_DIRECT and inode.block[i] != 0) {
+            freeBlock(inode.block[i]);
+            inode.block[i] = 0;
+        }
+    }
+
+    // Free single indirect block entirely if not needed
+    if (new_blocks_needed <= EXT2_INODE_DIRECT) {
+        if (inode.block[12] != 0) {
+            const ib_phys = pmm.allocPage() orelse return false;
+            const ib: [*]u8 = @ptrFromInt(hhdm.physToVirt(ib_phys));
+            if (readBlock(inode.block[12], ib)) {
+                const ptrs_per_block = block_size / 4;
+                const ptrs: [*]const u32 = @ptrCast(@alignCast(ib));
+                for (0..ptrs_per_block) |j| {
+                    if (ptrs[j] != 0) freeBlock(ptrs[j]);
+                }
+            }
+            pmm.freePage(ib_phys);
+            freeBlock(inode.block[12]);
+            inode.block[12] = 0;
+        }
+    }
+
+    // Free double indirect block entirely if not needed (v53.2: recursive free)
+    if (inode.block[13] != 0 and new_blocks_needed <= EXT2_INODE_DIRECT + block_size / 4) {
+        const dib_phys = pmm.allocPage() orelse {
+            freeBlock(inode.block[13]);
+            inode.block[13] = 0;
+            inode.size = new_size;
+            inode.blocks = new_blocks_needed * (block_size / 512);
+            _ = writeInode(inode_num, &inode);
+            return true;
+        }; // best-effort
+        const dib: [*]u8 = @ptrFromInt(hhdm.physToVirt(dib_phys));
+        if (readBlock(inode.block[13], dib)) {
+            const ptrs_per_block = block_size / 4;
+            const dib_ptrs: [*]const u32 = @ptrCast(@alignCast(dib));
+            for (0..ptrs_per_block) |k| {
+                if (dib_ptrs[k] != 0) {
+                    const sib_phys = pmm.allocPage() orelse break;
+                    const sib: [*]u8 = @ptrFromInt(hhdm.physToVirt(sib_phys));
+                    if (readBlock(dib_ptrs[k], sib)) {
+                        const sib_ptrs: [*]const u32 = @ptrCast(@alignCast(sib));
+                        for (0..ptrs_per_block) |m| {
+                            if (sib_ptrs[m] != 0) freeBlock(sib_ptrs[m]);
+                        }
+                    }
+                    pmm.freePage(sib_phys);
+                    freeBlock(dib_ptrs[k]);
+                }
+            }
+        }
+        pmm.freePage(dib_phys);
+        freeBlock(inode.block[13]);
+        inode.block[13] = 0;
+    }
+
+    inode.size = new_size;
+    inode.blocks = new_blocks_needed * (block_size / 512);
+    _ = writeInode(inode_num, &inode);
     return true;
 }
 

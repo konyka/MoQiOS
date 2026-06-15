@@ -145,6 +145,12 @@ pub fn munmap(addr: u64, length: u64) i64 {
     if (length == 0) return -22; // EINVAL
 
     const PAGE: u64 = 4096;
+    // v53.3: reject kernel-space addresses and overflow
+    const USER_SPACE_MAX = 0x0000_8000_0000_0000;
+    if (addr >= USER_SPACE_MAX) return -22; // EINVAL — kernel address
+    if (length > USER_SPACE_MAX) return -22; // EINVAL — length overflow
+    if (addr + length > USER_SPACE_MAX) return -22; // EINVAL — range overflow
+
     const base = addr / PAGE * PAGE;
     const end = (addr + length + PAGE - 1) / PAGE * PAGE;
     const num_pages = (end - base) / PAGE;

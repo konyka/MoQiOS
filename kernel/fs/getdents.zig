@@ -36,7 +36,7 @@ pub fn getdents64(fd: u32, buf_ptr: u64, buf_size: u64) i64 {
 }
 
 fn getdents64Ext2(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i64 {
-    var names: [64][*]u8 = undefined;
+    var names: [64][256]u8 = undefined;
     var name_lens: [64]u32 = undefined;
     var inodes_arr: [64]u32 = undefined;
     var ftypes: [64]u8 = undefined;

@@ -147,9 +147,12 @@ pub fn swapOut(pml4_phys: u64, virt_addr: u64, pte_ptr: *u64) bool {
 
     // Update PTE: clear present bit, set swap entry
     const swap_pte = encodeSwapEntry(slot);
-    // Preserve NX bit (bit 63) if set
+    // v53.3: preserve NX bit (bit 63), writable bit (bit 1), and COW bit (bit 9)
+    // Store in swap entry reserved bits: writable → bit 2, COW → bit 3
     const nx_bit = pte & (1 << 63);
-    pte_ptr.* = swap_pte | nx_bit;
+    const writable_bit = if ((pte & 0x02) != 0) @as(u64, 1 << 2) else @as(u64, 0);
+    const cow_bit = if ((pte & (1 << 9)) != 0) @as(u64, 1 << 3) else @as(u64, 0);
+    pte_ptr.* = swap_pte | nx_bit | writable_bit | cow_bit;
 
     // Free the physical page
     pmm.freePage(phys_addr);
@@ -190,9 +193,12 @@ pub fn swapIn(pte_val: u64) ?u64 {
     // Free the swap slot
     freeSlot(slot);
 
-    // Reconstruct PTE: present=1, writable (preserve original), user, physical addr
+    // Reconstruct PTE: present=1, user=1, restore original writable and COW
+    // v53.3: read preserved bits from swap entry reserved bits 2-3
     const nx_bit = pte_val & (1 << 63);
-    const new_pte = new_phys | 0x07 | nx_bit; // Present + Writable + User
+    const writable_bit = if ((pte_val & (1 << 2)) != 0) @as(u64, 0x02) else @as(u64, 0);
+    const cow_bit = if ((pte_val & (1 << 3)) != 0) @as(u64, 1 << 9) else @as(u64, 0);
+    const new_pte = new_phys | 0x05 | writable_bit | cow_bit | nx_bit; // Present + User + (restored writable/COW) + NX
 
     return new_pte;
 }

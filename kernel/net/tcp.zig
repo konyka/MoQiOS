@@ -839,12 +839,26 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
             }
         },
         .established => {
+            // v53.3: Handle RST per RFC 793 — abort connection immediately
+            if (flags & RST != 0) {
+                // RST is valid if seq_num is within window
+                const in_window = seq_num -% tcb.rcv_nxt < tcb.rcv_wnd;
+                if (in_window) {
+                    tcb.state = .closed;
+                    deactivateTcb(tcb);
+                    serial.writeString("[tcp] RST received, connection reset\n");
+                    return;
+                }
+            }
+
             // Process ACK
             if (flags & ACK != 0) {
                 if (ack_num != tcb.snd_una) {
                     // New ACK — advance send window
                     const acked = ack_num -% tcb.snd_una;
-                    if (acked <= SEND_BUF_SIZE) {
+                    // v53.3: ack_num must be within [snd_una+1, snd_nxt] range
+                    const in_flight = tcb.snd_nxt -% tcb.snd_una;
+                    if (acked > 0 and acked <= in_flight and acked <= SEND_BUF_SIZE) {
                         tcb.snd_una = ack_num;
                         // v53.2: advance send_head to free acknowledged buffer space
                         // Without this, the ring buffer permanently fills → connection deadlock
@@ -1049,7 +1063,9 @@ fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) void
     ringWrite(&tcb.recv_buf, RECV_BUF_SIZE, tcb.recv_tail, data, to_copy);
     tcb.recv_tail = (tcb.recv_tail + to_copy) % RECV_BUF_SIZE;
 
-    tcb.rcv_nxt +%= len;
+    // v53.3: only advance rcv_nxt by actually buffered bytes
+    // (if recv_buf is full, to_copy < len, so we don't skip unbuffered seq nums)
+    tcb.rcv_nxt +%= to_copy;
     tcb.rcv_wnd = TCP_WINDOW - ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
 
     // Delayed ACK: every-other-segment rule (disabled by TCP_QUICKACK)

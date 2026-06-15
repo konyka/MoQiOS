@@ -1486,11 +1486,29 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             vfs_mod.syncAll();
             frame.rax = 0;
         },
-        76 => { // truncate(path, length) — accept (ext2 manages size internally)
+        76 => { // truncate(path, length) — v53.3: real implementation
+            const ext2_mod = @import("../../fs/ext2.zig");
+            const copy = @import("../../mm/copy_from_user.zig");
+            var path_buf: [256]u8 = undefined;
+            const plen = copy.copyFromUser(path_buf[0..], @ptrFromInt(frame.rdi), 255);
+            if (plen == 0) {
+                frame.rax = @bitCast(@as(i64, -14));
+                return;
+            } // EFAULT
+            const inode_num = ext2_mod.walkPathToInodePublic(path_buf[0..plen]) orelse {
+                frame.rax = @bitCast(@as(i64, -2));
+                return; // ENOENT
+            }; // v53.3: truncate by inode directly, no open_files needed
+            if (!ext2_mod.truncateByInode(inode_num, @truncate(frame.rsi))) {
+                frame.rax = @bitCast(@as(i64, -5)); // EIO
+                return;
+            }
             frame.rax = 0;
         },
-        77 => { // ftruncate(fd, length) — accept
-            frame.rax = 0;
+        77 => { // ftruncate(fd, length) — v53.3: call real implementation
+            const fd: u32 = @truncate(frame.rdi);
+            const result = syscallFtruncate(fd, frame.rsi);
+            frame.rax = @bitCast(result);
         },
         79 => { // getcwd(buf, size)
             syscallGetcwd(frame);
