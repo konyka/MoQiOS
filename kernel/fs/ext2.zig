@@ -690,6 +690,59 @@ fn resolveBlock(inode: *const Ext2Inode, logical_block: u32) u32 {
         return ptrs2[idx2];
     }
 
+    // v53.5: Triple indirect (block[14])
+    const tri_base = dbl_base + ptrs_per_block * ptrs_per_block;
+    if (logical_block < tri_base + ptrs_per_block * ptrs_per_block * ptrs_per_block) {
+        const tri_block = inode.block[14];
+        if (tri_block == 0) return 0;
+
+        const rel = logical_block - tri_base;
+        const idx1 = rel / (ptrs_per_block * ptrs_per_block);
+        const rem1 = rel % (ptrs_per_block * ptrs_per_block);
+        const idx2 = rem1 / ptrs_per_block;
+        const idx3 = rem1 % ptrs_per_block;
+
+        // Level 1: triple indirect → double indirect
+        const dbl_indirect: u32 = if (cacheLookupPtr(tri_block)) |buf| blk: {
+            const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
+            break :blk ptrs[idx1];
+        } else blk: {
+            const buf_phys = pmm.allocPage() orelse return 0;
+            defer pmm.freePage(buf_phys);
+            const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+            if (!readBlock(tri_block, buf)) return 0;
+            const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
+            break :blk ptrs[idx1];
+        };
+        if (dbl_indirect == 0) return 0;
+
+        // Level 2: double indirect → single indirect
+        const single_indirect: u32 = if (cacheLookupPtr(dbl_indirect)) |buf| blk: {
+            const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
+            break :blk ptrs[idx2];
+        } else blk: {
+            const buf_phys = pmm.allocPage() orelse return 0;
+            defer pmm.freePage(buf_phys);
+            const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+            if (!readBlock(dbl_indirect, buf)) return 0;
+            const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
+            break :blk ptrs[idx2];
+        };
+        if (single_indirect == 0) return 0;
+
+        // Level 3: single indirect → data block
+        if (cacheLookupPtr(single_indirect)) |buf| {
+            const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
+            return ptrs[idx3];
+        }
+        const buf3_phys = pmm.allocPage() orelse return 0;
+        defer pmm.freePage(buf3_phys);
+        const buf3: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf3_phys));
+        if (!readBlock(single_indirect, buf3)) return 0;
+        const ptrs3: [*]const u32 = @ptrCast(@alignCast(buf3));
+        return ptrs3[idx3];
+    }
+
     return 0;
 }
 
@@ -1959,6 +2012,10 @@ pub fn unlinkFile(path: []const u8) bool {
         _ = writeInode(file_inode_num, &file_inode);
     } else {
         // Last link: free data blocks
+        // v53.5: invalidate page cache before freeing blocks
+        const page_cache = @import("page_cache.zig");
+        page_cache.invalidateInode(file_inode_num);
+
         if (is_symlink and file_inode.blocks == 0) {
             // Short symlink: target inline in i_block, no data blocks to free
         } else if (is_symlink) {
@@ -2014,6 +2071,45 @@ pub fn unlinkFile(path: []const u8) bool {
                 }
                 pmm.freePage(dib_phys);
                 freeBlock(file_inode.block[13]);
+            }
+
+            // v53.5: Free triple indirect block (block[14]) and all blocks it points to
+            if (file_inode.block[14] != 0) {
+                const tib_phys = pmm.allocPage() orelse return false;
+                const tib: [*]u8 = @ptrFromInt(hhdm.physToVirt(tib_phys));
+                if (readBlock(file_inode.block[14], tib)) {
+                    const ptrs_per_block = block_size / 4;
+                    const tib_ptrs: [*]const u32 = @ptrCast(@alignCast(tib));
+                    for (0..ptrs_per_block) |i| {
+                        if (tib_ptrs[i] != 0) {
+                            // Level 2: double indirect block
+                            const dib_phys2 = pmm.allocPage() orelse break;
+                            const dib2: [*]u8 = @ptrFromInt(hhdm.physToVirt(dib_phys2));
+                            if (readBlock(tib_ptrs[i], dib2)) {
+                                const dib2_ptrs: [*]const u32 = @ptrCast(@alignCast(dib2));
+                                for (0..ptrs_per_block) |j| {
+                                    if (dib2_ptrs[j] != 0) {
+                                        // Level 3: single indirect block
+                                        const sib_phys2 = pmm.allocPage() orelse break;
+                                        const sib2: [*]u8 = @ptrFromInt(hhdm.physToVirt(sib_phys2));
+                                        if (readBlock(dib2_ptrs[j], sib2)) {
+                                            const sib2_ptrs: [*]const u32 = @ptrCast(@alignCast(sib2));
+                                            for (0..ptrs_per_block) |k| {
+                                                if (sib2_ptrs[k] != 0) freeBlock(sib2_ptrs[k]);
+                                            }
+                                        }
+                                        pmm.freePage(sib_phys2);
+                                        freeBlock(dib2_ptrs[j]);
+                                    }
+                                }
+                            }
+                            pmm.freePage(dib_phys2);
+                            freeBlock(tib_ptrs[i]);
+                        }
+                    }
+                }
+                pmm.freePage(tib_phys);
+                freeBlock(file_inode.block[14]);
             }
         }
 

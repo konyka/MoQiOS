@@ -4730,33 +4730,7 @@ fn syscallSwapoff(path_ptr: u64) i64 {
 /// Simplified: only supports shrinking or same-size (no page table manipulation).
 /// For grow: returns old_addr if within same region capacity, else ENOMEM.
 fn syscallMremap(old_addr: u64, old_size: u64, new_size: u64, flags: u32, new_addr: u64) i64 {
-    _ = new_addr;
-    _ = flags;
-    const sched = @import("../../proc/sched.zig");
-    const tm = @import("../../proc/task.zig");
-    const cur_idx = sched.currentTaskIndex() orelse return -1;
-    const cur = tm.getTask(cur_idx) orelse return -1;
-
-    const old_pages = (old_size + 0xFFF) / 0x1000;
-    const new_pages = (new_size + 0xFFF) / 0x1000;
-
-    // Find the mapping
-    for (&cur.mmap_regions) |*r| {
-        if (r.active and r.base == old_addr and r.num_pages >= old_pages) {
-            if (new_pages <= r.num_pages) {
-                // Shrink or same size — just update
-                r.num_pages = new_pages;
-                return @intCast(old_addr);
-            }
-            // Grow: accept if within 4x original allocation (simplified)
-            if (new_pages <= r.num_pages * 4) {
-                r.num_pages = new_pages;
-                return @intCast(old_addr);
-            }
-            return -12; // ENOMEM
-        }
-    }
-    return -22; // EINVAL: old_addr not found
+    return mmap_mod.mremap(old_addr, old_size, new_size, flags, new_addr);
 }
 
 /// getrusage(who, usage_ptr) — get resource usage.

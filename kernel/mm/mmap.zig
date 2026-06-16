@@ -197,3 +197,74 @@ pub fn munmap(addr: u64, length: u64) i64 {
 
     return 0;
 }
+
+/// Core mremap implementation. Returns new base address or -errno.
+/// v53.5: properly operate on page tables (map new pages, unmap shrunk pages).
+pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr_hint: u64) i64 {
+    _ = mflags; // TODO: MREMAP_MAYMOVE / MREMAP_FIXED
+    _ = new_addr_hint;
+
+    const PAGE: u64 = 4096;
+    if (old_size == 0 and new_size == 0) return -22; // EINVAL
+
+    const old_pages = (old_size + PAGE - 1) / PAGE;
+    const new_pages = (new_size + PAGE - 1) / PAGE;
+
+    const cur_idx = sched.currentTaskIndex() orelse return -1;
+    const cur = task_mod.getTask(cur_idx) orelse return -1;
+
+    // Find the mapping region
+    for (&cur.mmap_regions) |*r| {
+        if (r.active and r.base == old_addr and r.num_pages >= old_pages) {
+            if (new_pages <= old_pages) {
+                // Shrink: unmap pages beyond new_size
+                if (new_pages < r.num_pages) {
+                    unmapRange(cur, old_addr + new_pages * PAGE, r.num_pages - new_pages);
+                }
+                r.num_pages = new_pages;
+                return @bitCast(old_addr);
+            }
+            // Grow: map new pages in the virtual range [old_addr + old_pages*PAGE, ...)
+            // Check that the virtual range is available (no other region overlaps)
+            const grow_base = old_addr + old_pages * PAGE;
+            const grow_pages = new_pages - old_pages;
+            var can_grow = true;
+            for (&cur.mmap_regions) |r2| {
+                if (r2.active and r2.base != old_addr) {
+                    const r2_end = r2.base + r2.num_pages * PAGE;
+                    if (r2.base < grow_base + grow_pages * PAGE and r2_end > grow_base) {
+                        can_grow = false;
+                        break;
+                    }
+                }
+            }
+            if (!can_grow) return -12; // ENOMEM — virtual range not available
+
+            // Map new pages
+            for (0..grow_pages) |p| {
+                const virt = grow_base + p * PAGE;
+                const phys = pmm_mod.allocPage() orelse {
+                    // Rollback: unmap any pages we already mapped in this grow
+                    unmapRange(cur, grow_base, p);
+                    return -12; // ENOMEM
+                };
+                const map_flags = paging_mod.MapFlags{
+                    .writable = true,
+                    .user = true,
+                    .no_execute = false,
+                };
+                paging_mod.mapPage(cur.page_table_phys, virt, phys, map_flags) catch {
+                    pmm_mod.freePage(phys);
+                    unmapRange(cur, grow_base, p);
+                    return -12; // ENOMEM
+                };
+                // Zero-fill new page (security: prevent data leaks)
+                const dst: [*]u8 = @ptrFromInt(hhdm_mod.physToVirt(phys));
+                @memset(dst[0..PAGE], 0);
+            }
+            r.num_pages = new_pages;
+            return @bitCast(old_addr);
+        }
+    }
+    return -22; // EINVAL: old_addr not found
+}

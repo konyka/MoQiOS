@@ -769,6 +769,32 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
     else
         raw_window;
 
+    // v53.5: Handle RST per RFC 793 in all non-closed/non-listen states
+    // RST with valid sequence number immediately terminates the connection.
+    // .syn_sent has special RST handling (must match our SYN's ACK).
+    // .established already has its own RST handler (v53.3) with in_window check
+    // that also handles ACK processing — we skip it here to avoid double-processing.
+    if (flags & RST != 0 and tcb.state != .closed and tcb.state != .listen and tcb.state != .established) {
+        if (tcb.state == .syn_sent) {
+            // RFC 793 §3.4: RST in SYN_SENT is valid if ack_num == iss+1
+            if (ack_num == tcb.iss +% 1) {
+                tcb.state = .closed;
+                deactivateTcb(tcb);
+                serial.writeString("[tcp] RST in SYN_SENT, connection reset\n");
+                return;
+            }
+        } else {
+            // RFC 793: RST is valid if seq_num is within the receive window
+            const in_window = seq_num -% tcb.rcv_nxt < tcb.rcv_wnd;
+            if (in_window) {
+                tcb.state = .closed;
+                deactivateTcb(tcb);
+                serial.writeString("[tcp] RST received, connection reset\n");
+                return;
+            }
+        }
+    }
+
     // State machine processing
     switch (tcb.state) {
         .syn_sent => {
@@ -821,7 +847,10 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                 const epoll_mod = @import("epoll.zig");
                 epoll_mod.epollNotify(.tcp_socket, tcbIdx(tcb), epoll_mod.EPOLLOUT);
             } else if (flags & SYN != 0) {
-                // Simultaneous open — not supported, send RST
+                // v53.5: Simultaneous open not supported — send RST and close
+                _ = sendSegment(tcb, RST, undefined, 0);
+                tcb.state = .closed;
+                deactivateTcb(tcb);
             }
         },
         .syn_received => {
