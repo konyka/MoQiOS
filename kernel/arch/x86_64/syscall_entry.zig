@@ -1489,6 +1489,11 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         76 => { // truncate(path, length) — v53.3: real implementation
             const ext2_mod = @import("../../fs/ext2.zig");
             const copy = @import("../../mm/copy_from_user.zig");
+            const length: u64 = frame.rsi;
+            if (length > 0xFFFFFFFF) { // v53.4: reject lengths that don't fit in u32
+                frame.rax = @bitCast(@as(i64, -22)); // EINVAL
+                return;
+            }
             var path_buf: [256]u8 = undefined;
             const plen = copy.copyFromUser(path_buf[0..], @ptrFromInt(frame.rdi), 255);
             if (plen == 0) {
@@ -1499,7 +1504,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 frame.rax = @bitCast(@as(i64, -2));
                 return; // ENOENT
             }; // v53.3: truncate by inode directly, no open_files needed
-            if (!ext2_mod.truncateByInode(inode_num, @truncate(frame.rsi))) {
+            if (!ext2_mod.truncateByInode(inode_num, @truncate(length))) {
                 frame.rax = @bitCast(@as(i64, -5)); // EIO
                 return;
             }

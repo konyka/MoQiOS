@@ -10,7 +10,9 @@
 /// PTE swap entry format (when present=0):
 ///   Bit 0:     present = 0
 ///   Bit 1:     swap marker = 1 (distinguishes from unmapped)
-///   Bits 2-11: reserved
+///   Bit 2:     preserved writable flag (from PTE bit 1)
+///   Bit 3:     preserved COW flag (from PTE bit 9)
+///   Bits 4-11: reserved
 ///   Bits 12-51: swap slot index (up to 2^40 slots = 4TB swap)
 ///   Bits 52-62: reserved
 ///   Bit 63:    NX (no-execute, preserved)

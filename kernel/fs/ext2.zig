@@ -1011,6 +1011,25 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
             freeBlock(f.inode.block[12]);
             f.inode.block[12] = 0;
         }
+    } else if (new_blocks_needed < EXT2_INODE_DIRECT + block_size / 4) {
+        // v53.4: partial single indirect — free entries beyond new_blocks_needed
+        if (f.inode.block[12] != 0) {
+            const ptrs_per_block = block_size / 4;
+            const ib_phys = pmm.allocPage() orelse return false;
+            const ib: [*]u8 = @ptrFromInt(hhdm.physToVirt(ib_phys));
+            if (readBlock(f.inode.block[12], ib)) {
+                const keep = new_blocks_needed - EXT2_INODE_DIRECT;
+                const ptrs: [*]u32 = @ptrCast(@alignCast(ib));
+                for (keep..ptrs_per_block) |j| {
+                    if (ptrs[j] != 0) {
+                        freeBlock(ptrs[j]);
+                        ptrs[j] = 0;
+                    }
+                }
+                _ = writeBlock(f.inode.block[12], ib); // write back modified indirect block
+            }
+            pmm.freePage(ib_phys);
+        }
     }
 
     // Free double indirect entirely if not needed (v53.2: free all sub-blocks)
@@ -1046,7 +1065,7 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
 
     f.inode.size = new_size;
     f.inode.blocks = new_blocks_needed * (block_size / 512);
-    _ = writeInode(f.inode_num, &f.inode);
+    if (!writeInode(f.inode_num, &f.inode)) return false; // v53.4: check writeInode result
     return true;
 }
 
@@ -1062,9 +1081,13 @@ pub fn truncateByInode(inode_num: u32, new_size: u32) bool {
     if (new_size >= inode.size) {
         // Growing: just update size (blocks allocated on write)
         inode.size = new_size;
-        _ = writeInode(inode_num, &inode);
+        if (!writeInode(inode_num, &inode)) return false; // v53.4: check writeInode result
         return true;
     }
+
+    // v53.4: invalidate page cache for this inode before freeing blocks
+    const page_cache = @import("page_cache.zig");
+    page_cache.invalidateInode(inode_num);
 
     const new_blocks_needed = if (new_size == 0) @as(u32, 0) else @as(u32, (new_size + block_size - 1) / block_size);
 
@@ -1091,6 +1114,25 @@ pub fn truncateByInode(inode_num: u32, new_size: u32) bool {
             pmm.freePage(ib_phys);
             freeBlock(inode.block[12]);
             inode.block[12] = 0;
+        }
+    } else if (new_blocks_needed < EXT2_INODE_DIRECT + block_size / 4) {
+        // v53.4: partial single indirect — free entries beyond new_blocks_needed
+        if (inode.block[12] != 0) {
+            const ptrs_per_block = block_size / 4;
+            const ib_phys = pmm.allocPage() orelse return false;
+            const ib: [*]u8 = @ptrFromInt(hhdm.physToVirt(ib_phys));
+            if (readBlock(inode.block[12], ib)) {
+                const keep = new_blocks_needed - EXT2_INODE_DIRECT;
+                const ptrs: [*]u32 = @ptrCast(@alignCast(ib));
+                for (keep..ptrs_per_block) |j| {
+                    if (ptrs[j] != 0) {
+                        freeBlock(ptrs[j]);
+                        ptrs[j] = 0;
+                    }
+                }
+                _ = writeBlock(inode.block[12], ib); // write back modified indirect block
+            }
+            pmm.freePage(ib_phys);
         }
     }
 
@@ -1130,7 +1172,7 @@ pub fn truncateByInode(inode_num: u32, new_size: u32) bool {
 
     inode.size = new_size;
     inode.blocks = new_blocks_needed * (block_size / 512);
-    _ = writeInode(inode_num, &inode);
+    if (!writeInode(inode_num, &inode)) return false; // v53.4: check writeInode result
     return true;
 }
 

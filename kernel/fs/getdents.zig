@@ -36,13 +36,21 @@ pub fn getdents64(fd: u32, buf_ptr: u64, buf_size: u64) i64 {
 }
 
 fn getdents64Ext2(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i64 {
-    var names: [64][256]u8 = undefined;
+    // v53.4: dynamically allocate names array to avoid 16KB stack usage
+    // 64 entries × 256 bytes = 16384 bytes = 4 pages
+    const pmm = @import("../mm/pmm.zig");
+    const hhdm = @import("../mm/hhdm.zig");
+    const names_pages = pmm.allocContiguous(4) orelse return -12; // ENOMEM
+    defer {
+        for (0..4) |p| pmm.freePage(names_pages + p * 4096);
+    }
+    const names: [*][256]u8 = @ptrFromInt(hhdm.physToVirt(names_pages));
     var name_lens: [64]u32 = undefined;
     var inodes_arr: [64]u32 = undefined;
     var ftypes: [64]u8 = undefined;
     var next_offs: [64]u32 = undefined;
     const off32: u32 = @intCast(@min(desc.offset, 0xFFFFFFFF));
-    const result = ext2.readDirEntries(desc.ext2_file_idx, off32, &names, &name_lens, &inodes_arr, &ftypes, &next_offs, 64);
+    const result = ext2.readDirEntries(desc.ext2_file_idx, off32, names, &name_lens, &inodes_arr, &ftypes, &next_offs, 64);
     if (result.count == 0) return 0;
 
     var written: u64 = 0;

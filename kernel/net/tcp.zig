@@ -971,16 +971,24 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                 epoll_in.epollNotify(.tcp_socket, tcbIdx(tcb), epoll_in.EPOLLIN);
             }
 
-            // Handle FIN
+            // Handle FIN — v53.4: only accept FIN after all data is buffered
+            // If recv_buf was full and we couldn't buffer all data, rcv_nxt
+            // hasn't advanced past the data segment, so the FIN seq would be
+            // wrong and the peer would retransmit. Defer FIN until data drains.
             if (flags & FIN != 0) {
-                tcb.rcv_nxt +%= 1;
-                tcb.state = .close_wait;
-                tcb.delayed_ack_pending = false; // ACK is immediate for FIN
-                _ = sendSegment(tcb, ACK, undefined, 0);
-                serial.writeString("[tcp] remote closed (FIN received)\n");
-                // epoll: peer closed.
-                const epoll_fin = @import("epoll.zig");
-                epoll_fin.epollNotify(.tcp_socket, tcbIdx(tcb), epoll_fin.EPOLLIN | epoll_fin.EPOLLHUP);
+                const fin_seq = seq_num +% payload_len;
+                const data_fully_buffered = (tcb.rcv_nxt -% seq_num >= payload_len);
+                if (data_fully_buffered and fin_seq == tcb.rcv_nxt) {
+                    tcb.rcv_nxt +%= 1;
+                    tcb.state = .close_wait;
+                    tcb.delayed_ack_pending = false; // ACK is immediate for FIN
+                    _ = sendSegment(tcb, ACK, undefined, 0);
+                    serial.writeString("[tcp] remote closed (FIN received)\n");
+                    // epoll: peer closed.
+                    const epoll_fin = @import("epoll.zig");
+                    epoll_fin.epollNotify(.tcp_socket, tcbIdx(tcb), epoll_fin.EPOLLIN | epoll_fin.EPOLLHUP);
+                }
+                // else: FIN deferred — peer will retransmit after we ACK the partial data
             }
         },
         .fin_wait_1 => {
