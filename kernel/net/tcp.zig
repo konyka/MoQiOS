@@ -11,10 +11,10 @@
 ///
 /// Design constraints:
 /// - No heap allocation — all state in static arrays (BSS)
-/// - Single-core, no lock needed for TCB table
-/// - Max 8 simultaneous connections
-/// - Window size: 4096 bytes (before scaling)
+/// - Max 64 simultaneous connections
+/// - Window size: 32768 bytes (before scaling)
 /// - MSS: 1460 bytes
+/// - SMP send safety: per-call packet buffer, e1000 serializes TX ring submit
 const e1000 = @import("../drivers/e1000.zig");
 const netif = @import("netif.zig");
 const eth = @import("eth.zig");
@@ -352,12 +352,11 @@ fn ringDataLen(head: u32, tail: u32, size: u32) u32 {
 
 // ─── TCP Header Construction ──────────────────────────────────────────────
 
-var send_pkt: [1518]u8 = @splat(0);
-
 /// Build and send a TCP segment.
 /// When `include_options` is true (SYN/SYN-ACK segments), TCP options are
 /// included: Window Scaling option (kind 3) and Timestamps option (kind 8).
 fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
+    var send_pkt: [1518]u8 = @splat(0);
     const dst_mac = arp.resolve(tcb.remote_ip) orelse {
         serial.writeString("[tcp] ARP resolution failed\n");
         return false;
@@ -1022,18 +1021,24 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
         },
         .fin_wait_1 => {
             if (flags & FIN != 0) {
-                // Simultaneous close or ACK+FIN
+                // v53.6: RFC 793 — FIN+ACK (our FIN confirmed) → TIME_WAIT; FIN only (simultaneous close) → CLOSING
                 tcb.rcv_nxt +%= 1;
-                if (flags & ACK != 0) {
+                if (flags & ACK != 0 and ack_num -% 1 >= tcb.snd_una) {
+                    // Our FIN was ACKed → TIME_WAIT
                     tcb.snd_una = ack_num;
+                    tcb.state = .time_wait;
+                    _ = sendSegment(tcb, ACK, undefined, 0);
+                    serial.writeString("[tcp] FIN+ACK in FIN_WAIT_1 → TIME_WAIT\n");
+                } else {
+                    // Simultaneous close, our FIN not yet ACKed → CLOSING
+                    tcb.state = .closing;
+                    _ = sendSegment(tcb, ACK, undefined, 0);
+                    serial.writeString("[tcp] FIN (no ACK) in FIN_WAIT_1 → CLOSING\n");
                 }
-                tcb.state = .time_wait;
-                _ = sendSegment(tcb, ACK, undefined, 0);
-                serial.writeString("[tcp] simultaneous close → TIME_WAIT\n");
             } else if (flags & ACK != 0) {
                 tcb.snd_una = ack_num;
                 tcb.state = .fin_wait_2;
-                serial.writeString("[tcp] FIN-ACK received → FIN_WAIT_2\n");
+                serial.writeString("[tcp] ACK in FIN_WAIT_1 → FIN_WAIT_2\n");
             }
         },
         .fin_wait_2 => {
@@ -1070,8 +1075,9 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
             }
         },
         .time_wait => {
-            // Retransmitted FIN — re-ACK
+            // Retransmitted FIN — re-ACK and reset 2MSL timer per RFC 793
             if (flags & FIN != 0) {
+                tcb.retransmit_timer = 0; // v53.6: Restart 2MSL timer
                 _ = sendSegment(tcb, ACK, undefined, 0);
             }
         },
@@ -1369,15 +1375,26 @@ pub fn timerTick(ms_elapsed: u32) void {
         const idx = @ctz(bm);
         bm &= bm - 1;
         const tcb = &tcbs[idx];
-        if (tcb.state == .closed or tcb.state == .time_wait) {
-            // Clean up TIME_WAIT after 15 seconds (reduced from 2*MSL=60s)
-            if (tcb.state == .time_wait) {
-                tcb.retransmit_timer +%= ms_elapsed;
-                if (tcb.retransmit_timer >= 15000) {
-                    tcb.state = .closed;
-                    deactivateTcb(tcb);
-                    serial.writeString("[tcp] TIME_WAIT → CLOSED (timeout)\n");
-                }
+        if (tcb.state == .closed) continue;
+
+        // v53.6: FIN_WAIT_2 timeout — prevent orphaned TCBs if peer crashes without FIN
+        if (tcb.state == .fin_wait_2) {
+            tcb.retransmit_timer +%= ms_elapsed;
+            if (tcb.retransmit_timer >= 60_000) { // 60s timeout (Linux tcp_fin_timeout default)
+                tcb.state = .closed;
+                deactivateTcb(tcb);
+                serial.writeString("[tcp] FIN_WAIT_2 timeout → CLOSED\n");
+                continue;
+            }
+        }
+
+        // TIME_WAIT: clean up after 15 seconds (reduced from 2*MSL=60s)
+        if (tcb.state == .time_wait) {
+            tcb.retransmit_timer +%= ms_elapsed;
+            if (tcb.retransmit_timer >= 15000) {
+                tcb.state = .closed;
+                deactivateTcb(tcb);
+                serial.writeString("[tcp] TIME_WAIT → CLOSED (timeout)\n");
             }
             continue;
         }

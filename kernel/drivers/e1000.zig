@@ -8,6 +8,7 @@ const paging = @import("../arch/x86_64/paging.zig");
 const pmm = @import("../mm/pmm.zig");
 const pci = @import("pci.zig");
 const fmt = @import("../lib/fmt.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 // e1000 MMIO register offsets
 const REG_CTRL: u32 = 0x0000;
@@ -105,6 +106,7 @@ var tx_desc_virt: u64 = 0;
 var tx_buf_phys: [NUM_TX_DESC]u64 = @splat(0);
 var tx_buf_virt: [NUM_TX_DESC]u64 = @splat(0);
 var tx_tail: u32 = 0;
+var tx_lock: IrqSpinlock = .{};
 
 var initialized: bool = false;
 var irq_line: u8 = 0; // PCI IRQ line for this device
@@ -360,6 +362,9 @@ pub fn receivePacket(buf: [*]u8, max_len: u32) u32 {
 /// Send a raw packet.
 pub fn sendPacket(data: [*]const u8, len: u32) bool {
     if (!initialized or len == 0 or len > 2048) return false;
+
+    const flags = tx_lock.acquire();
+    defer tx_lock.release(flags);
 
     const desc: *volatile TxDesc = @ptrFromInt(tx_desc_virt + tx_tail * @sizeOf(TxDesc));
 

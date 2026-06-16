@@ -1022,6 +1022,126 @@ pub fn readDirEntries(file_idx: u32, start_offset: u32, names: [*][256]u8, name_
     return .{ .count = count, .new_offset = offset };
 }
 
+fn freeSingleIndirectTree(block_num: u32, ptrs_per_block: u32) bool {
+    const phys = pmm.allocPage() orelse return false;
+    defer pmm.freePage(phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+    if (!readBlock(block_num, buf)) return false;
+
+    const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
+    for (0..ptrs_per_block) |idx| {
+        if (ptrs[idx] != 0) freeBlock(ptrs[idx]);
+    }
+    freeBlock(block_num);
+    return true;
+}
+
+fn truncateSingleIndirectTree(block_num: u32, keep_blocks: u32, ptrs_per_block: u32) bool {
+    if (keep_blocks >= ptrs_per_block) return true;
+    if (keep_blocks == 0) return freeSingleIndirectTree(block_num, ptrs_per_block);
+
+    const phys = pmm.allocPage() orelse return false;
+    defer pmm.freePage(phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+    if (!readBlock(block_num, buf)) return false;
+
+    const ptrs: [*]u32 = @ptrCast(@alignCast(buf));
+    for (keep_blocks..ptrs_per_block) |idx| {
+        if (ptrs[idx] != 0) {
+            freeBlock(ptrs[idx]);
+            ptrs[idx] = 0;
+        }
+    }
+    return writeBlock(block_num, buf);
+}
+
+fn freeDoubleIndirectTree(block_num: u32, ptrs_per_block: u32) bool {
+    const phys = pmm.allocPage() orelse return false;
+    defer pmm.freePage(phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+    if (!readBlock(block_num, buf)) return false;
+
+    const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
+    for (0..ptrs_per_block) |idx| {
+        if (ptrs[idx] != 0 and !freeSingleIndirectTree(ptrs[idx], ptrs_per_block)) return false;
+    }
+    freeBlock(block_num);
+    return true;
+}
+
+fn truncateDoubleIndirectTree(block_num: u32, keep_blocks: u32, ptrs_per_block: u32) bool {
+    const capacity = ptrs_per_block * ptrs_per_block;
+    if (keep_blocks >= capacity) return true;
+    if (keep_blocks == 0) return freeDoubleIndirectTree(block_num, ptrs_per_block);
+
+    const phys = pmm.allocPage() orelse return false;
+    defer pmm.freePage(phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+    if (!readBlock(block_num, buf)) return false;
+
+    const ptrs: [*]u32 = @ptrCast(@alignCast(buf));
+    const keep_tree = keep_blocks / ptrs_per_block;
+    const keep_in_tree = keep_blocks % ptrs_per_block;
+    var first_free_tree = keep_tree;
+
+    if (keep_in_tree > 0) {
+        if (ptrs[keep_tree] != 0 and !truncateSingleIndirectTree(ptrs[keep_tree], keep_in_tree, ptrs_per_block)) return false;
+        first_free_tree = keep_tree + 1;
+    }
+
+    for (first_free_tree..ptrs_per_block) |idx| {
+        if (ptrs[idx] != 0) {
+            if (!freeSingleIndirectTree(ptrs[idx], ptrs_per_block)) return false;
+            ptrs[idx] = 0;
+        }
+    }
+    return writeBlock(block_num, buf);
+}
+
+fn freeTripleIndirectTree(block_num: u32, ptrs_per_block: u32) bool {
+    const phys = pmm.allocPage() orelse return false;
+    defer pmm.freePage(phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+    if (!readBlock(block_num, buf)) return false;
+
+    const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
+    for (0..ptrs_per_block) |idx| {
+        if (ptrs[idx] != 0 and !freeDoubleIndirectTree(ptrs[idx], ptrs_per_block)) return false;
+    }
+    freeBlock(block_num);
+    return true;
+}
+
+fn truncateTripleIndirectTree(block_num: u32, keep_blocks: u32, ptrs_per_block: u32) bool {
+    const dbl_capacity = ptrs_per_block * ptrs_per_block;
+    const capacity = dbl_capacity * ptrs_per_block;
+    if (keep_blocks >= capacity) return true;
+    if (keep_blocks == 0) return freeTripleIndirectTree(block_num, ptrs_per_block);
+
+    const phys = pmm.allocPage() orelse return false;
+    defer pmm.freePage(phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+    if (!readBlock(block_num, buf)) return false;
+
+    const ptrs: [*]u32 = @ptrCast(@alignCast(buf));
+    const keep_tree = keep_blocks / dbl_capacity;
+    const keep_in_tree = keep_blocks % dbl_capacity;
+    var first_free_tree = keep_tree;
+
+    if (keep_in_tree > 0) {
+        if (ptrs[keep_tree] != 0 and !truncateDoubleIndirectTree(ptrs[keep_tree], keep_in_tree, ptrs_per_block)) return false;
+        first_free_tree = keep_tree + 1;
+    }
+
+    for (first_free_tree..ptrs_per_block) |idx| {
+        if (ptrs[idx] != 0) {
+            if (!freeDoubleIndirectTree(ptrs[idx], ptrs_per_block)) return false;
+            ptrs[idx] = 0;
+        }
+    }
+    return writeBlock(block_num, buf);
+}
+
 /// Truncate a file to the given length. Frees blocks beyond the new size.
 pub fn truncateFile(file_idx: u32, new_size: u32) bool {
     if (!active) return false;
@@ -1038,6 +1158,9 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
 
     // Shrinking: free blocks beyond new_size
     const new_blocks_needed = if (new_size == 0) 0 else (new_size + block_size - 1) / block_size;
+    const ptrs_per_block = block_size / 4;
+    const page_cache = @import("page_cache.zig");
+    page_cache.invalidateInode(f.inode_num);
 
     // Free direct blocks beyond needed
     for (new_blocks_needed..EXT2_INODE_DIRECT) |i| {
@@ -1047,73 +1170,27 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
         }
     }
 
-    // If new_blocks_needed < EXT2_INODE_DIRECT, free indirect blocks entirely
-    if (new_blocks_needed <= EXT2_INODE_DIRECT) {
-        if (f.inode.block[12] != 0) {
-            // Free all blocks pointed to by single indirect
-            const ib_phys = pmm.allocPage() orelse return false;
-            const ib: [*]u8 = @ptrFromInt(hhdm.physToVirt(ib_phys));
-            if (readBlock(f.inode.block[12], ib)) {
-                const ptrs_per_block = block_size / 4;
-                const ptrs: [*]const u32 = @ptrCast(@alignCast(ib));
-                for (0..ptrs_per_block) |j| {
-                    if (ptrs[j] != 0) freeBlock(ptrs[j]);
-                }
-            }
-            pmm.freePage(ib_phys);
-            freeBlock(f.inode.block[12]);
-            f.inode.block[12] = 0;
-        }
-    } else if (new_blocks_needed < EXT2_INODE_DIRECT + block_size / 4) {
-        // v53.4: partial single indirect — free entries beyond new_blocks_needed
-        if (f.inode.block[12] != 0) {
-            const ptrs_per_block = block_size / 4;
-            const ib_phys = pmm.allocPage() orelse return false;
-            const ib: [*]u8 = @ptrFromInt(hhdm.physToVirt(ib_phys));
-            if (readBlock(f.inode.block[12], ib)) {
-                const keep = new_blocks_needed - EXT2_INODE_DIRECT;
-                const ptrs: [*]u32 = @ptrCast(@alignCast(ib));
-                for (keep..ptrs_per_block) |j| {
-                    if (ptrs[j] != 0) {
-                        freeBlock(ptrs[j]);
-                        ptrs[j] = 0;
-                    }
-                }
-                _ = writeBlock(f.inode.block[12], ib); // write back modified indirect block
-            }
-            pmm.freePage(ib_phys);
-        }
+    // Trim single, double, and triple indirect tails with shared boundary logic.
+    const single_base = EXT2_INODE_DIRECT;
+    const dbl_base = EXT2_INODE_DIRECT + ptrs_per_block;
+    const tri_base = dbl_base + ptrs_per_block * ptrs_per_block;
+
+    if (f.inode.block[12] != 0 and new_blocks_needed < dbl_base) {
+        const keep = if (new_blocks_needed <= single_base) 0 else new_blocks_needed - single_base;
+        if (!truncateSingleIndirectTree(f.inode.block[12], keep, ptrs_per_block)) return false;
+        if (keep == 0) f.inode.block[12] = 0;
     }
 
-    // Free double indirect entirely if not needed (v53.2: free all sub-blocks)
-    if (f.inode.block[13] != 0 and new_blocks_needed <= EXT2_INODE_DIRECT + block_size / 4) {
-        const dib_phys = pmm.allocPage() orelse {
-            freeBlock(f.inode.block[13]);
-            f.inode.block[13] = 0;
-            return true;
-        }; // best-effort: at least free the double indirect block
-        const dib: [*]u8 = @ptrFromInt(hhdm.physToVirt(dib_phys));
-        if (readBlock(f.inode.block[13], dib)) {
-            const ptrs_per_block = block_size / 4;
-            const dib_ptrs: [*]const u32 = @ptrCast(@alignCast(dib));
-            for (0..ptrs_per_block) |k| {
-                if (dib_ptrs[k] != 0) {
-                    const sib_phys = pmm.allocPage() orelse break;
-                    const sib: [*]u8 = @ptrFromInt(hhdm.physToVirt(sib_phys));
-                    if (readBlock(dib_ptrs[k], sib)) {
-                        const sib_ptrs: [*]const u32 = @ptrCast(@alignCast(sib));
-                        for (0..ptrs_per_block) |m| {
-                            if (sib_ptrs[m] != 0) freeBlock(sib_ptrs[m]);
-                        }
-                    }
-                    pmm.freePage(sib_phys);
-                    freeBlock(dib_ptrs[k]);
-                }
-            }
-        }
-        pmm.freePage(dib_phys);
-        freeBlock(f.inode.block[13]);
-        f.inode.block[13] = 0;
+    if (f.inode.block[13] != 0) {
+        const keep = if (new_blocks_needed <= dbl_base) 0 else new_blocks_needed - dbl_base;
+        if (!truncateDoubleIndirectTree(f.inode.block[13], keep, ptrs_per_block)) return false;
+        if (keep == 0) f.inode.block[13] = 0;
+    }
+
+    if (f.inode.block[14] != 0) {
+        const keep = if (new_blocks_needed <= tri_base) 0 else new_blocks_needed - tri_base;
+        if (!truncateTripleIndirectTree(f.inode.block[14], keep, ptrs_per_block)) return false;
+        if (keep == 0) f.inode.block[14] = 0;
     }
 
     f.inode.size = new_size;
@@ -1143,6 +1220,7 @@ pub fn truncateByInode(inode_num: u32, new_size: u32) bool {
     page_cache.invalidateInode(inode_num);
 
     const new_blocks_needed = if (new_size == 0) @as(u32, 0) else @as(u32, (new_size + block_size - 1) / block_size);
+    const ptrs_per_block = block_size / 4;
 
     // Free direct blocks beyond needed
     for (new_blocks_needed..EXT2_INODE_DIRECT) |i| {
@@ -1152,75 +1230,26 @@ pub fn truncateByInode(inode_num: u32, new_size: u32) bool {
         }
     }
 
-    // Free single indirect block entirely if not needed
-    if (new_blocks_needed <= EXT2_INODE_DIRECT) {
-        if (inode.block[12] != 0) {
-            const ib_phys = pmm.allocPage() orelse return false;
-            const ib: [*]u8 = @ptrFromInt(hhdm.physToVirt(ib_phys));
-            if (readBlock(inode.block[12], ib)) {
-                const ptrs_per_block = block_size / 4;
-                const ptrs: [*]const u32 = @ptrCast(@alignCast(ib));
-                for (0..ptrs_per_block) |j| {
-                    if (ptrs[j] != 0) freeBlock(ptrs[j]);
-                }
-            }
-            pmm.freePage(ib_phys);
-            freeBlock(inode.block[12]);
-            inode.block[12] = 0;
-        }
-    } else if (new_blocks_needed < EXT2_INODE_DIRECT + block_size / 4) {
-        // v53.4: partial single indirect — free entries beyond new_blocks_needed
-        if (inode.block[12] != 0) {
-            const ptrs_per_block = block_size / 4;
-            const ib_phys = pmm.allocPage() orelse return false;
-            const ib: [*]u8 = @ptrFromInt(hhdm.physToVirt(ib_phys));
-            if (readBlock(inode.block[12], ib)) {
-                const keep = new_blocks_needed - EXT2_INODE_DIRECT;
-                const ptrs: [*]u32 = @ptrCast(@alignCast(ib));
-                for (keep..ptrs_per_block) |j| {
-                    if (ptrs[j] != 0) {
-                        freeBlock(ptrs[j]);
-                        ptrs[j] = 0;
-                    }
-                }
-                _ = writeBlock(inode.block[12], ib); // write back modified indirect block
-            }
-            pmm.freePage(ib_phys);
-        }
+    const single_base = EXT2_INODE_DIRECT;
+    const dbl_base = EXT2_INODE_DIRECT + ptrs_per_block;
+    const tri_base = dbl_base + ptrs_per_block * ptrs_per_block;
+
+    if (inode.block[12] != 0 and new_blocks_needed < dbl_base) {
+        const keep = if (new_blocks_needed <= single_base) 0 else new_blocks_needed - single_base;
+        if (!truncateSingleIndirectTree(inode.block[12], keep, ptrs_per_block)) return false;
+        if (keep == 0) inode.block[12] = 0;
     }
 
-    // Free double indirect block entirely if not needed (v53.2: recursive free)
-    if (inode.block[13] != 0 and new_blocks_needed <= EXT2_INODE_DIRECT + block_size / 4) {
-        const dib_phys = pmm.allocPage() orelse {
-            freeBlock(inode.block[13]);
-            inode.block[13] = 0;
-            inode.size = new_size;
-            inode.blocks = new_blocks_needed * (block_size / 512);
-            _ = writeInode(inode_num, &inode);
-            return true;
-        }; // best-effort
-        const dib: [*]u8 = @ptrFromInt(hhdm.physToVirt(dib_phys));
-        if (readBlock(inode.block[13], dib)) {
-            const ptrs_per_block = block_size / 4;
-            const dib_ptrs: [*]const u32 = @ptrCast(@alignCast(dib));
-            for (0..ptrs_per_block) |k| {
-                if (dib_ptrs[k] != 0) {
-                    const sib_phys = pmm.allocPage() orelse break;
-                    const sib: [*]u8 = @ptrFromInt(hhdm.physToVirt(sib_phys));
-                    if (readBlock(dib_ptrs[k], sib)) {
-                        const sib_ptrs: [*]const u32 = @ptrCast(@alignCast(sib));
-                        for (0..ptrs_per_block) |m| {
-                            if (sib_ptrs[m] != 0) freeBlock(sib_ptrs[m]);
-                        }
-                    }
-                    pmm.freePage(sib_phys);
-                    freeBlock(dib_ptrs[k]);
-                }
-            }
-        }
-        pmm.freePage(dib_phys);
-        freeBlock(inode.block[13]);
-        inode.block[13] = 0;
+    if (inode.block[13] != 0) {
+        const keep = if (new_blocks_needed <= dbl_base) 0 else new_blocks_needed - dbl_base;
+        if (!truncateDoubleIndirectTree(inode.block[13], keep, ptrs_per_block)) return false;
+        if (keep == 0) inode.block[13] = 0;
+    }
+
+    if (inode.block[14] != 0) {
+        const keep = if (new_blocks_needed <= tri_base) 0 else new_blocks_needed - tri_base;
+        if (!truncateTripleIndirectTree(inode.block[14], keep, ptrs_per_block)) return false;
+        if (keep == 0) inode.block[14] = 0;
     }
 
     inode.size = new_size;

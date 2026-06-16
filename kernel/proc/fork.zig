@@ -56,6 +56,22 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.mmap_regions = parent.mmap_regions;
     child.mmap_count = parent.mmap_count;
 
+    // v53.6: inherit POSIX-required process attributes (credentials, umask, process group)
+    child.uid = parent.uid;
+    child.gid = parent.gid;
+    child.euid = parent.euid;
+    child.egid = parent.egid;
+    child.suid = parent.suid;
+    child.sgid = parent.sgid;
+    child.umask_val = parent.umask_val;
+    child.pgid = parent.pgid;
+    child.sid = parent.sid;
+    child.personality = parent.personality;
+    child.stack_limit = parent.stack_limit;
+    @memcpy(child.comm[0..16], parent.comm[0..16]);
+    child.sched_policy = parent.sched_policy;
+    child.pdeathsig = parent.pdeathsig;
+
     const child_stack_top = child.kernel_stack_top;
     const child_frame_addr = child_stack_top - @sizeOf(idt.InterruptFrame);
     const child_frame: *idt.InterruptFrame = @ptrFromInt(child_frame_addr);

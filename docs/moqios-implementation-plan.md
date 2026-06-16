@@ -1,7 +1,7 @@
 # MoQiOS 实施计划
 
-> **版本**: v53.5
-> **日期**: 2026-05-29
+> **版本**: v53.6
+> **日期**: 2026-06-16
 > **说明**: 本文档记录 MoQiOS 的实际实施进度和已完成里程碑。
 > 长期设计目标参见 [moqios-design.md](./moqios-design.md)，当前架构参见 [moqios-architecture-current.md](./moqios-architecture-current.md)。
 
@@ -782,6 +782,7 @@
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| v53.6 | 2026-06-16 | Code Review v14 构建+性能修复: C1-ext2 truncateFile 新增双/三级间接截断代码存在编译阻断(ptrs_per_block作用域/非循环break/i1遮蔽primitive), 修复后抽取free/truncate Single/Double/TripleIndirectTree helper统一释放逻辑; C2-truncateByInode未同步双/三级间接部分截断, truncate(path)大文件缩小时仍泄漏尾部间接树, 现与ftruncate共用边界逻辑; W1-truncateFile缺page_cache.invalidateInode, ftruncate后可能读到旧缓存页, 现缩小时统一失效inode缓存; P1-TCP用全局send_pkt+spinlock保护构包导致SMP发送热路径串行化且未保护真正共享的e1000 TX ring, 现TCP改栈上包缓冲, e1000.sendPacket在TX descriptor/tail提交处加IrqSpinlock; 验证: zig build通过, zig build test受当前Zig freestanding soft-float标准库/编译器问题阻断 |
 | v24.0 | 2026-05-29 | listen_slots bitmap: 添加listen_active_bitmap, tcpListen/handleIncomingSyn/tcpAccept三处listen_slots线性扫描改为@ctz位图迭代, 31309行内核 |
 | v25.0 | 2026-05-29 | writeback位图优化: 添加in_use_bm/dirty_bm(2×u64), 11处BUFFER_COUNT=128线性扫描改为@ctz位图迭代, getDirtyCount用@popCount O(1), 31378行内核 |
 | v25.1 | 2026-05-29 | epoll collectEvents bug修复: ready list遍历在清除ready_next前先保存next指针, 修复只处理链表首元素的bug |

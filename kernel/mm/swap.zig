@@ -240,7 +240,7 @@ pub fn reclaimPages(pml4_phys: u64, target: u32) u32 {
                     if (swapped >= target) break;
                     const pte = pt[pt_idx];
                     if ((pte & 1) == 0) continue; // Not present
-                    if (pte & (1 << 63) != 0) continue; // Don't swap NX pages (code)
+                    if (pte & (1 << 63) == 0) continue; // v53.6: Skip executable pages (NX=0 means code, NX=1 means data — swap data pages only)
                     if (pte & (1 << 6) != 0) continue; // Don't swap dirty pages (write them back first)
 
                     // Second-chance: check accessed bit

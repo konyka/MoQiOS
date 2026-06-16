@@ -1,7 +1,7 @@
 # MoQiOS 内核子系统详细设计
 
 > **文档定位**: 描述 MoQiOS 内核各子系统的核心数据结构、API、实现状态与依赖关系。
-> **修订日期**: 2026-05-29
+> **修订日期**: 2026-06-16
 > **关联文档**: [moqios-architecture-current.md](./moqios-architecture-current.md)
 
 ---
@@ -308,6 +308,7 @@ const FdTable = struct {
 - Inode（直接块 + 单级间接块）
 - 块缓存：256 条目 + 64 桶哈希表加速查找，dirty write-back
 - 间接块指针缓存：16 条目，避免重复读取间接块
+- 截断释放：`truncateFile` / `truncateByInode` 共用单/双/三级间接块 tail-trim helper，缩小时释放尾部数据块和空的间接树并失效 inode 页缓存
 - 目录条目读写
 - 多级路径解析（`resolveParent`）
 - 操作: `readFile` / `writeFile` / `createFile` / `createDir` / `unlinkFile` / `listDirInode` / `truncate`
@@ -418,7 +419,7 @@ e1000 (中断驱动) / virtio-net (Virtqueue)
 
 文件: `tcp.zig`
 
-- 32 个并发连接 (MAX_CONNECTIONS=32)，32KB 发送/接收缓冲区，32KB 窗口
+- 64 个并发连接 (MAX_CONNECTIONS=64)，64KB 发送/接收缓冲区，32KB 窗口
 - 完整 11 状态机：CLOSED / LISTEN / SYN_SENT / SYN_RCVD / ESTABLISHED / FIN_WAIT_1 / FIN_WAIT_2 / CLOSE_WAIT / CLOSING / LAST_ACK / TIME_WAIT
 - 序列号 / ACK / 窗口
 - Reno 拥塞控制：慢启动 / 拥塞避免 / 快速重传（3 个重复 ACK）/ 快速恢复
@@ -434,7 +435,7 @@ e1000 (中断驱动) / virtio-net (Virtqueue)
 - TIME_WAIT 优化：30s→15s，新连接可复用 TIME_WAIT TCB (若序号更大)
 - 窗口更新ACK：应用读取数据后发送窗口更新ACK (超过 1 MSS 时)
 - 延迟ACK：every-other-segment规则 + 100ms超时 + ACK捎带
-- TCB（Transmission Control Block）数组 + active_bitmap位图查找
+- TCB（Transmission Control Block）数组 + active_bitmap位图查找；发送构包使用栈上缓冲，避免全局包缓冲锁串行化
 - 公开 API: `tcpGetAddrInfo()` (getsockname/getpeername), `tcpIsClosing()`, `tcpFlushCork()`, `tcpFlushAck()`
 
 ### 4.9 poll() 多路复用 ✅
@@ -601,6 +602,7 @@ const CapTable = [32]Capability; // 每任务
 
 - MMIO 寄存器（CTRL, STATUS, IMS, ICR, RDBAL/RDBAH, TDBAL/TDBAH 等）
 - RX/TX 描述符环（连续 DMA 缓冲）
+- TX ring 提交路径使用 `IrqSpinlock` 保护 descriptor 与 `tx_tail`，允许上层协议并发构包，仅硬件队列提交串行化
 - 中断驱动模式：INTx 启用，IMASK 配置 (RXT0/RXO/TXQE/TXDW/LSC)
 - IRQ handler: 读取 ICR 清除 pending，循环处理 RX 队列
 - IDT 中注册 IRQ 分发，动态读取 PCI IRQ line

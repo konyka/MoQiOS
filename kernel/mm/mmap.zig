@@ -251,7 +251,7 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
                 const map_flags = paging_mod.MapFlags{
                     .writable = true,
                     .user = true,
-                    .no_execute = false,
+                    .no_execute = true, // v53.6: W^X — grown pages non-executable by default
                 };
                 paging_mod.mapPage(cur.page_table_phys, virt, phys, map_flags) catch {
                     pmm_mod.freePage(phys);
