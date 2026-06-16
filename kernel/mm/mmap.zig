@@ -15,6 +15,8 @@ const MAP_PRIVATE: u64 = 0x2;
 const MAP_SHARED: u64 = 0x1;
 const MAP_FIXED: u64 = 0x10;
 const MAP_POPULATE: u64 = 0x8000;
+const MREMAP_MAYMOVE: u32 = 0x1;
+const MREMAP_FIXED: u32 = 0x2;
 
 /// Unmap pages in a range and free physical memory.
 pub fn unmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
@@ -49,6 +51,118 @@ pub fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64) void {
         }
     }
     // Table full — region leaked (will be freed on process exit via destroyUserSpace)
+}
+
+fn rangesOverlap(a_base: u64, a_pages: u64, b_base: u64, b_pages: u64) bool {
+    const page = user_space.PAGE_SIZE;
+    const a_end = a_base + a_pages * page;
+    const b_end = b_base + b_pages * page;
+    return a_base < b_end and b_base < a_end;
+}
+
+fn rangeAvailable(task: *task_mod.Task, base: u64, num_pages: u64, ignore_base: ?u64) bool {
+    const stack_base = user_space.USER_STACK_TOP - user_space.PAGE_SIZE;
+    if (num_pages == 0) return false;
+    if (base % user_space.PAGE_SIZE != 0) return false;
+    if (base >= stack_base) return false;
+    if (num_pages > (stack_base - base) / user_space.PAGE_SIZE) return false;
+
+    for (task.mmap_regions) |r| {
+        if (!r.active) continue;
+        if (ignore_base != null and r.base == ignore_base.?) continue;
+        if (rangesOverlap(base, num_pages, r.base, r.num_pages)) return false;
+    }
+    return true;
+}
+
+fn findFreeMmapRange(task: *task_mod.Task, num_pages: u64, ignore_base: u64) ?u64 {
+    const page = user_space.PAGE_SIZE;
+    const stack_base = user_space.USER_STACK_TOP - page;
+    var base = (task.brk_current + page - 1) / page * page;
+    if (base < user_space.USER_CODE_BASE + page) base = user_space.USER_CODE_BASE + page;
+
+    while (base < stack_base and num_pages <= (stack_base - base) / page) : (base += page) {
+        if (rangeAvailable(task, base, num_pages, ignore_base)) return base;
+    }
+    return null;
+}
+
+fn allocZeroedPage() ?u64 {
+    const phys = pmm_mod.allocPage() orelse return null;
+    const page_ptr: [*]u8 = @ptrFromInt(hhdm_mod.physToVirt(phys));
+    @memset(page_ptr[0..user_space.PAGE_SIZE], 0);
+    return phys;
+}
+
+fn mapZeroedPage(task: *task_mod.Task, virt: u64, flags: paging_mod.MapFlags) bool {
+    const phys = allocZeroedPage() orelse return false;
+    paging_mod.mapPage(task.page_table_phys, virt, phys, flags) catch {
+        pmm_mod.freePage(phys);
+        return false;
+    };
+    return true;
+}
+
+fn moveMapping(task: *task_mod.Task, region: *task_mod.MmapRegion, new_base: u64, old_pages: u64, new_pages: u64) i64 {
+    const page = user_space.PAGE_SIZE;
+    const default_flags = paging_mod.MapFlags{ .writable = true, .user = true, .no_execute = true };
+    const old_base = region.base;
+    if (rangesOverlap(old_base, old_pages, new_base, new_pages)) return -22;
+    var mapped: u64 = 0;
+
+    while (mapped < new_pages) : (mapped += 1) {
+        const dst_virt = new_base + mapped * page;
+        if (mapped < old_pages) {
+            const src_virt = old_base + mapped * page;
+            if (paging_mod.getPageEntry(task.page_table_phys, src_virt)) |src_pte| {
+                const src_pte_val: u64 = @bitCast(src_pte.*);
+                const src_phys = src_pte.getPhysAddr();
+                const new_phys = pmm_mod.allocPage() orelse {
+                    unmapRange(task, new_base, mapped);
+                    return -12;
+                };
+                const src: [*]const u8 = @ptrFromInt(hhdm_mod.physToVirt(src_phys));
+                const dst: [*]u8 = @ptrFromInt(hhdm_mod.physToVirt(new_phys));
+                @memcpy(dst[0..page], src[0..page]);
+
+                const new_pte_val = (src_pte_val & ~paging_mod.ADDR_MASK) | new_phys;
+                paging_mod.mapPage(task.page_table_phys, dst_virt, new_phys, .{
+                    .writable = (new_pte_val & paging_mod.WRITABLE) != 0,
+                    .user = (new_pte_val & paging_mod.USER) != 0,
+                    .no_execute = (new_pte_val & (1 << 63)) != 0,
+                    .global = false,
+                }) catch {
+                    pmm_mod.freePage(new_phys);
+                    unmapRange(task, new_base, mapped);
+                    return -12;
+                };
+                paging_mod.setPageEntryRaw(task.page_table_phys, dst_virt, new_pte_val);
+                paging_mod.invlpg(dst_virt);
+            } else if (!mapZeroedPage(task, dst_virt, default_flags)) {
+                unmapRange(task, new_base, mapped);
+                return -12;
+            }
+        } else if (!mapZeroedPage(task, dst_virt, default_flags)) {
+            unmapRange(task, new_base, mapped);
+            return -12;
+        }
+    }
+
+    unmapRange(task, old_base, old_pages);
+    region.base = new_base;
+    region.num_pages = new_pages;
+    return @bitCast(new_base);
+}
+
+fn moveOrNoMem(task: *task_mod.Task, region: *task_mod.MmapRegion, old_pages: u64, new_pages: u64, mflags: u32, new_addr_hint: u64) i64 {
+    if ((mflags & MREMAP_MAYMOVE) == 0) return -12; // ENOMEM
+    const new_base = if ((mflags & MREMAP_FIXED) != 0)
+        new_addr_hint
+    else
+        (findFreeMmapRange(task, new_pages, region.base) orelse return -12);
+    if (rangesOverlap(region.base, old_pages, new_base, new_pages)) return -22; // EINVAL
+    if (!rangeAvailable(task, new_base, new_pages, region.base)) return -12;
+    return moveMapping(task, region, new_base, old_pages, new_pages);
 }
 
 /// Core mmap implementation. Returns mapped base address or -errno.
@@ -201,14 +315,15 @@ pub fn munmap(addr: u64, length: u64) i64 {
 /// Core mremap implementation. Returns new base address or -errno.
 /// v53.5: properly operate on page tables (map new pages, unmap shrunk pages).
 pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr_hint: u64) i64 {
-    _ = mflags; // TODO: MREMAP_MAYMOVE / MREMAP_FIXED
-    _ = new_addr_hint;
-
     const PAGE: u64 = 4096;
     if (old_size == 0 and new_size == 0) return -22; // EINVAL
+    if ((mflags & ~(MREMAP_MAYMOVE | MREMAP_FIXED)) != 0) return -22; // EINVAL
+    if ((mflags & MREMAP_FIXED) != 0 and (mflags & MREMAP_MAYMOVE) == 0) return -22; // EINVAL
+    if ((mflags & MREMAP_FIXED) != 0 and new_addr_hint % PAGE != 0) return -22; // EINVAL
 
     const old_pages = (old_size + PAGE - 1) / PAGE;
     const new_pages = (new_size + PAGE - 1) / PAGE;
+    if (new_pages == 0) return -22; // EINVAL
 
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
@@ -224,6 +339,8 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
                 r.num_pages = new_pages;
                 return @bitCast(old_addr);
             }
+            if ((mflags & MREMAP_FIXED) != 0) return moveOrNoMem(cur, r, old_pages, new_pages, mflags, new_addr_hint);
+
             // Grow: map new pages in the virtual range [old_addr + old_pages*PAGE, ...)
             // Check that the virtual range is available (no other region overlaps)
             const grow_base = old_addr + old_pages * PAGE;
@@ -238,7 +355,7 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
                     }
                 }
             }
-            if (!can_grow) return -12; // ENOMEM — virtual range not available
+            if (!can_grow) return moveOrNoMem(cur, r, old_pages, new_pages, mflags, new_addr_hint);
 
             // Map new pages
             for (0..grow_pages) |p| {
@@ -264,7 +381,14 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
             }
             r.num_pages = new_pages;
             return @bitCast(old_addr);
+        } else if (r.active and r.base == old_addr and r.num_pages < old_pages) {
+            return -22; // EINVAL: old_size exceeds mapping
         }
+    }
+
+    for (&cur.mmap_regions) |*r| {
+        if (!r.active or r.base != old_addr) continue;
+        return moveOrNoMem(cur, r, old_pages, new_pages, mflags, new_addr_hint);
     }
     return -22; // EINVAL: old_addr not found
 }

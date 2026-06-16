@@ -4727,8 +4727,9 @@ fn syscallSwapoff(path_ptr: u64) i64 {
 /// mremap(old_addr, old_size, new_size, flags, new_addr) — resize a memory mapping.
 /// MREMAP_MAYMOVE (1): allow moving the mapping to a new address.
 /// MREMAP_FIXED (2): use new_addr as the target (requires MAYMOVE).
-/// Simplified: only supports shrinking or same-size (no page table manipulation).
-/// For grow: returns old_addr if within same region capacity, else ENOMEM.
+/// Fast path grows/shrinks in place. With MREMAP_MAYMOVE, falls back to
+/// allocating a new user range, copying mapped pages, and releasing the old
+/// range when the adjacent virtual range is unavailable.
 fn syscallMremap(old_addr: u64, old_size: u64, new_size: u64, flags: u32, new_addr: u64) i64 {
     return mmap_mod.mremap(old_addr, old_size, new_size, flags, new_addr);
 }

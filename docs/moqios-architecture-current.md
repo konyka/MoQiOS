@@ -806,6 +806,8 @@ LAPIC Timer 中断
 - **execve**: 完全替换地址空间，释放旧页表，加载 ELF，构建新栈
 - **waitpid**: 阻塞式等待，使用 WaitNode 睡眠唤醒机制
 - **mmap**: 支持匿名映射 (MAP_ANONYMOUS) 和文件映射 (MAP_PRIVATE)
+- **mremap**: 优先原地缩放映射；原地扩展被占用且设置 `MREMAP_MAYMOVE` 时，分配新的用户虚拟区、
+  复制旧页内容并释放旧映射；`MREMAP_FIXED` 要求同时设置 `MREMAP_MAYMOVE` 且目标页对齐。
 - **readv/writev**: scatter-gather I/O，复用 VFS read/write 路径
 - **pread64/pwrite64**: 定位 I/O，不修改 fd offset
 - **shutdown**: SHUT_RD/SHUT_WR/SHUT_RDWR，发送 FIN 半关闭 TCP
