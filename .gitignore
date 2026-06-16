@@ -15,3 +15,6 @@ test
 test_asm9
 disk.img filter=lf
 disk.img
+disk.img.bak
+serial_*.log
+.qoder/

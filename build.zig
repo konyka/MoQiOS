@@ -4,10 +4,9 @@ const std = @import("std");
 /// Used for hand-written entry stubs that rely on `user/user.ld`.
 fn addAsmUserProgram(b: *std.Build, name: []const u8) void {
     const obj = b.addSystemCommand(&.{
-        "zig", "cc",
+        "zig",     "cc",
         "-target", "x86_64-freestanding-none",
-        "-c",
-        "-o",
+        "-c",      "-o",
     });
     obj.addArg(b.fmt("user/{s}.o", .{name}));
     obj.addFileArg(b.path(b.fmt("user/{s}.S", .{name})));
@@ -15,7 +14,8 @@ fn addAsmUserProgram(b: *std.Build, name: []const u8) void {
 
     const elf = b.addSystemCommand(&.{
         "ld.lld",
-        "-T", "user/user.ld",
+        "-T",
+        "user/user.ld",
         "-o",
     });
     elf.addArg(b.fmt("user/{s}.elf", .{name}));
@@ -25,7 +25,8 @@ fn addAsmUserProgram(b: *std.Build, name: []const u8) void {
 
     const bin = b.addSystemCommand(&.{
         "objcopy",
-        "-O", "binary",
+        "-O",
+        "binary",
     });
     bin.addArg(b.fmt("user/{s}.elf", .{name}));
     bin.addArg(b.fmt("user/{s}.bin", .{name}));
@@ -38,11 +39,11 @@ fn addAsmUserProgram(b: *std.Build, name: []const u8) void {
 /// C user program: `.c` -> static freestanding ELF -> stripped binary.
 fn addCUserProgram(b: *std.Build, name: []const u8) void {
     const elf = b.addSystemCommand(&.{
-        "zig",            "cc",
-        "-target",        "x86_64-freestanding-none",
-        "-static",        "-nostdlib",
-        "-ffreestanding", "-O2",
-        "-mno-sse",       "-mno-sse2",
+        "zig",               "cc",
+        "-target",           "x86_64-freestanding-none",
+        "-static",           "-nostdlib",
+        "-ffreestanding",    "-O2",
+        "-mno-sse",          "-mno-sse2",
         "-Wl,--gc-sections", "-Wl,-z,norelro",
         "-o",
     });
@@ -198,11 +199,28 @@ pub fn build(b: *std.Build) void {
     debug_step.dependOn(&debug_cmd.step);
 
     // Tests
+    // Unit tests run on the host. The freestanding kernel target cannot host
+    // Zig's standard test runner, which pulls in compiler-rt/std test helpers.
     const test_module = b.createModule(.{
         .root_source_file = b.path("tests/main.zig"),
-        .target = target,
+        .target = b.graph.host,
         .optimize = optimize,
     });
+    test_module.addImport("byte_order", b.createModule(.{
+        .root_source_file = b.path("kernel/lib/byte_order.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }));
+    test_module.addImport("fmt_core", b.createModule(.{
+        .root_source_file = b.path("kernel/lib/fmt_core.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }));
+    test_module.addImport("str", b.createModule(.{
+        .root_source_file = b.path("kernel/lib/str.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }));
     const lib_test = b.addTest(.{
         .root_module = test_module,
     });

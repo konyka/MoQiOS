@@ -70,8 +70,9 @@ ext2 多级目录读写删，QEMU 串口验证，零异常、零三重故障）�
 - **大量未接入源文件**：`kernel/` 下有数十个新增 `.zig`（如 `mm/mprotect.zig`、`proc/clone.zig`、
   `ipc/sysv_*.zig`、`fs/select.zig` 等）未被任何模块 `@import`，因此不会被编译/检查，属未集成
   脚手架，详见构建文档。
-- **`zig build test` 为空操作**：`tests/main.zig` 仅对空文件做 `refAllDecls`，未导入内核模块。
-  现有"测试"实为 QEMU 中运行的 `hello*` 运行时测试。
+- **测试分层**：`zig build test` 已作为主机侧单元测试入口，覆盖可脱离硬件执行的共享库逻辑
+  （如字节序、字符串、整数格式化边界）；真正的内核/用户态集成仍以 QEMU 中运行的 `hello*`
+  运行时测试为准。
 
 ---
 
@@ -1117,7 +1118,8 @@ kernel/main.zig
 7. **TCP 连接数限制**: 最大 32 个并发 TCP 连接 (32K 发送/接收缓冲)
 8. **无分片重组**: IPv4 不支持分片重组 (MTU 1500 单帧)
 9. **AIO 同步执行**: io_submit 在持有 aio_lock 期间同步执行 I/O，不支持真正异步
-10. **copy_from_user 无 fault recovery**: 用户空间地址访问无 RIP-range guard (TODO)
+10. **copy_from_user 无 per-instruction fault recovery**: 当前已先做用户页表 present/user 校验以避免
+    普通坏指针触发内核缺页崩溃，但仍没有 RIP-range fixup；COW 只读页等需要真正缺页恢复的路径仍待完善。
 
 ---
 

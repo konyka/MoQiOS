@@ -1,7 +1,7 @@
 # MoQiOS 构建系统与工具链
 
 > **文档定位**: 描述 MoQiOS 的编译、链接、镜像打包与启动流程。
-> **修订日期**: 2026-05-28
+> **修订日期**: 2026-06-16
 > **关联文档**: [moqios-architecture-current.md](./moqios-architecture-current.md)
 
 ---
@@ -237,7 +237,7 @@ qemu-system-x86_64 \
 | `zig build` | 仅编译：生成内核镜像、用户程序、ramdisk、ISO |
 | `zig build run` | 编译并启动 QEMU 仿真 |
 | `zig build debug` | 启动 QEMU 并在 1234 端口监听 GDB（`-s -S`） |
-| `zig build test` | 运行 `tests/main.zig` 内核单元测试 |
+| `zig build test` | 在主机目标运行 `tests/main.zig` 单元测试，覆盖可脱离硬件执行的共享库逻辑 |
 
 调试连接：
 
@@ -270,6 +270,8 @@ gdb zig-out/bin/kernel.elf
 - `zig build run` 在无 KVM 环境下，AP LAPIC 定时器可能不工作（多核调度无法测试，应使用 `-enable-kvm` 或真机）。
 - `disk.img` 与 `disk.img.bak` 需手动维护（参见 `tools/mkimage/`）。
 - 用户程序起始地址为 `0x0`，与某些链接器默认行为冲突，汇编程序必须显式 `-T user/user.ld`。
+- `zig build test` 使用主机目标，适合验证无硬件副作用的共享库函数；真正的内核/用户态集成仍以
+  `zig build run` 下的 QEMU `hello*` 运行时测试为准。
 
 ---
 
