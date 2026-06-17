@@ -53,6 +53,44 @@ pub fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64) void {
     // Table full — region leaked (will be freed on process exit via destroyUserSpace)
 }
 
+fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
+    const page = user_space.PAGE_SIZE;
+    const end = base + num_pages * page;
+
+    for (&task.mmap_regions) |*r| {
+        if (!r.active) continue;
+        const r_end = r.base + r.num_pages * page;
+        if (r.base >= end or r_end <= base) continue; // no overlap
+
+        if (base <= r.base and end >= r_end) {
+            r.active = false;
+            if (task.mmap_count > 0) task.mmap_count -= 1;
+        } else if (base <= r.base and end < r_end) {
+            const removed = (end - r.base) / page;
+            r.base = end;
+            r.num_pages -= removed;
+        } else if (base > r.base and end >= r_end) {
+            r.num_pages = (base - r.base) / page;
+        } else {
+            const tail_base = end;
+            const tail_pages = (r_end - end) / page;
+            r.num_pages = (base - r.base) / page;
+            for (&task.mmap_regions) |*r2| {
+                if (!r2.active) {
+                    r2.* = .{
+                        .base = tail_base,
+                        .num_pages = tail_pages,
+                        .active = true,
+                        .locked = r.locked,
+                    };
+                    task.mmap_count += 1;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn rangesOverlap(a_base: u64, a_pages: u64, b_base: u64, b_pages: u64) bool {
     const page = user_space.PAGE_SIZE;
     const a_end = a_base + a_pages * page;
@@ -187,6 +225,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     if (is_fixed and addr_hint != 0) {
         base = addr_hint / user_space.PAGE_SIZE * user_space.PAGE_SIZE;
         unmapRange(cur, base, num_pages);
+        untrackMmapRange(cur, base, num_pages);
     } else if (addr_hint != 0 and addr_hint >= user_space.PAGE_SIZE) {
         base = (addr_hint + user_space.PAGE_SIZE - 1) / user_space.PAGE_SIZE * user_space.PAGE_SIZE;
     } else {
@@ -274,40 +313,7 @@ pub fn munmap(addr: u64, length: u64) i64 {
 
     // Unmap pages and free physical memory
     unmapRange(cur, base, num_pages);
-
-    // Remove or split tracking regions that overlap [base, end)
-    for (&cur.mmap_regions) |*r| {
-        if (!r.active) continue;
-        const r_end = r.base + r.num_pages * PAGE;
-        if (r.base >= end or r_end <= base) continue; // no overlap
-
-        if (base <= r.base and end >= r_end) {
-            // Fully covered — remove
-            r.active = false;
-            if (cur.mmap_count > 0) cur.mmap_count -= 1;
-        } else if (base <= r.base and end < r_end) {
-            // Overlaps start — shrink from front
-            const removed = (end - r.base) / PAGE;
-            r.base = end;
-            r.num_pages -= removed;
-        } else if (base > r.base and end >= r_end) {
-            // Overlaps end — shrink from back
-            r.num_pages = (base - r.base) / PAGE;
-        } else {
-            // Split: middle removed, leaving head and tail
-            const tail_base = end;
-            const tail_pages = (r_end - end) / PAGE;
-            r.num_pages = (base - r.base) / PAGE;
-            // Try to store tail in a free slot
-            for (&cur.mmap_regions) |*r2| {
-                if (!r2.active) {
-                    r2.* = .{ .base = tail_base, .num_pages = tail_pages, .active = true };
-                    cur.mmap_count += 1;
-                    break;
-                }
-            }
-        }
-    }
+    untrackMmapRange(cur, base, num_pages);
 
     return 0;
 }

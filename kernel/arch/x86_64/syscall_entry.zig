@@ -1826,8 +1826,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         332 => { // io_pgetevents(ctx_id, min_nr, nr, events, timeout, usig) — alias of #216
             frame.rax = @bitCast(aio_mod.ioGetevents(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8));
         },
-        333 => { // rseq(rseq, rseq_len, flags, sig) — restartable sequences (accept registration)
-            frame.rax = 0; // accept
+        333 => { // rseq(rseq, rseq_len, flags, sig) — restartable sequences
+            // v53.6: Return ENOSYS so glibc falls back to non-rseq path instead of relying on unimplemented semantics
+            frame.rax = @bitCast(@as(i64, -38)); // -ENOSYS
         },
         334 => { // pidfd_send_signal(pidfd, sig, info, flags) — alias of #316
             frame.rax = @bitCast(syscallPidfdSendSignal(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, @truncate(frame.r10)));

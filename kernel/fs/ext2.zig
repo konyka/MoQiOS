@@ -1520,6 +1520,88 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
         return si_ptrs[idx2];
     }
 
+    // v53.6: Triple indirect: block[14] -> double indirect -> single indirect -> data blocks
+    const tri_base = dbl_base + ptrs_per_block * ptrs_per_block;
+    if (logical_block < tri_base + ptrs_per_block * ptrs_per_block * ptrs_per_block) {
+        // Ensure triple indirect block (block[14]) exists
+        if (inode.block[14] == 0) {
+            const tri_blk = allocBlock(0);
+            if (tri_blk == 0) return 0;
+            inode.block[14] = tri_blk;
+            inode.blocks += block_size / 512;
+            const z_phys = pmm.allocPage() orelse return 0;
+            defer pmm.freePage(z_phys);
+            const z_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(z_phys));
+            @memset(z_buf[0..block_size], 0);
+            _ = writeBlock(tri_blk, z_buf);
+        }
+
+        const tib_phys = pmm.allocPage() orelse return 0;
+        defer pmm.freePage(tib_phys);
+        const tib: [*]u8 = @ptrFromInt(hhdm.physToVirt(tib_phys));
+        if (!readBlock(inode.block[14], tib)) return 0;
+        const tib_ptrs: [*]u32 = @ptrCast(@alignCast(tib));
+
+        const rel = logical_block - tri_base;
+        const idx1 = rel / (ptrs_per_block * ptrs_per_block);
+        const rem1 = rel % (ptrs_per_block * ptrs_per_block);
+        const idx2 = rem1 / ptrs_per_block;
+        const idx3 = rem1 % ptrs_per_block;
+
+        // Ensure double indirect block at idx1
+        if (tib_ptrs[idx1] == 0) {
+            const dbl_blk = allocBlock(0);
+            if (dbl_blk == 0) return 0;
+            tib_ptrs[idx1] = dbl_blk;
+            inode.blocks += block_size / 512;
+            _ = writeBlock(inode.block[14], tib);
+            const z_phys = pmm.allocPage() orelse return 0;
+            defer pmm.freePage(z_phys);
+            const z_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(z_phys));
+            @memset(z_buf[0..block_size], 0);
+            _ = writeBlock(dbl_blk, z_buf);
+        }
+
+        // Read double indirect block
+        const dib_phys = pmm.allocPage() orelse return 0;
+        defer pmm.freePage(dib_phys);
+        const dib: [*]u8 = @ptrFromInt(hhdm.physToVirt(dib_phys));
+        if (!readBlock(tib_ptrs[idx1], dib)) return 0;
+        const dib_ptrs: [*]u32 = @ptrCast(@alignCast(dib));
+
+        // Ensure single indirect block at idx2
+        if (dib_ptrs[idx2] == 0) {
+            const si_blk = allocBlock(0);
+            if (si_blk == 0) return 0;
+            dib_ptrs[idx2] = si_blk;
+            inode.blocks += block_size / 512;
+            _ = writeBlock(tib_ptrs[idx1], dib);
+            const z_phys = pmm.allocPage() orelse return 0;
+            defer pmm.freePage(z_phys);
+            const z_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(z_phys));
+            @memset(z_buf[0..block_size], 0);
+            _ = writeBlock(si_blk, z_buf);
+        }
+
+        // Read single indirect block
+        const sib_phys = pmm.allocPage() orelse return 0;
+        defer pmm.freePage(sib_phys);
+        const sib: [*]u8 = @ptrFromInt(hhdm.physToVirt(sib_phys));
+        if (!readBlock(dib_ptrs[idx2], sib)) return 0;
+        const sib_ptrs: [*]u32 = @ptrCast(@alignCast(sib));
+
+        // Ensure data block at idx3
+        if (sib_ptrs[idx3] == 0) {
+            const blk = allocBlock(0);
+            if (blk == 0) return 0;
+            sib_ptrs[idx3] = blk;
+            inode.blocks += block_size / 512;
+            _ = writeBlock(dib_ptrs[idx2], sib);
+        }
+        _ = writeInode(inode_num, inode);
+        return sib_ptrs[idx3];
+    }
+
     return 0;
 }
 
