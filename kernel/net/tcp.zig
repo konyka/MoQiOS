@@ -1021,11 +1021,12 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
         },
         .fin_wait_1 => {
             if (flags & FIN != 0) {
-                // v53.6: RFC 793 — FIN+ACK (our FIN confirmed) → TIME_WAIT; FIN only (simultaneous close) → CLOSING
+                // v53.6/v53.10: RFC 793 — FIN+ACK (our FIN confirmed) → TIME_WAIT; FIN only (simultaneous close) → CLOSING
                 tcb.rcv_nxt +%= 1;
-                if (flags & ACK != 0 and ack_num -% 1 >= tcb.snd_una) {
-                    // Our FIN was ACKed → TIME_WAIT
+                if (flags & ACK != 0 and ack_num >= tcb.snd_nxt) {
+                    // Our FIN was ACKed (ack covers snd_nxt which includes FIN seq) → TIME_WAIT
                     tcb.snd_una = ack_num;
+                    tcb.retransmit_timer = 0; // v53.10: Reset for TIME_WAIT 2MSL
                     tcb.state = .time_wait;
                     _ = sendSegment(tcb, ACK, undefined, 0);
                     serial.writeString("[tcp] FIN+ACK in FIN_WAIT_1 → TIME_WAIT\n");
@@ -1037,6 +1038,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                 }
             } else if (flags & ACK != 0) {
                 tcb.snd_una = ack_num;
+                tcb.retransmit_timer = 0; // v53.10: Reset for FIN_WAIT_2 timeout
                 tcb.state = .fin_wait_2;
                 serial.writeString("[tcp] ACK in FIN_WAIT_1 → FIN_WAIT_2\n");
             }
@@ -1049,6 +1051,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
             }
             if (flags & FIN != 0) {
                 tcb.rcv_nxt +%= 1;
+                tcb.retransmit_timer = 0; // v53.10: Reset for TIME_WAIT 2MSL
                 tcb.state = .time_wait;
                 _ = sendSegment(tcb, ACK, undefined, 0);
                 serial.writeString("[tcp] FIN received → TIME_WAIT\n");
@@ -1070,6 +1073,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
         },
         .closing => {
             if (flags & ACK != 0) {
+                tcb.retransmit_timer = 0; // v53.10: Reset for TIME_WAIT 2MSL
                 tcb.state = .time_wait;
                 serial.writeString("[tcp] CLOSING → TIME_WAIT\n");
             }
@@ -1386,6 +1390,7 @@ pub fn timerTick(ms_elapsed: u32) void {
                 serial.writeString("[tcp] FIN_WAIT_2 timeout → CLOSED\n");
                 continue;
             }
+            continue; // v53.10: Don't fall through to retransmit logic
         }
 
         // TIME_WAIT: clean up after 15 seconds (reduced from 2*MSL=60s)

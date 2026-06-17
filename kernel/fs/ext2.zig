@@ -1525,15 +1525,10 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
     if (logical_block < tri_base + ptrs_per_block * ptrs_per_block * ptrs_per_block) {
         // Ensure triple indirect block (block[14]) exists
         if (inode.block[14] == 0) {
-            const tri_blk = allocBlock(0);
+            const tri_blk = allocBlock(0); // allocBlock already zeroes the block
             if (tri_blk == 0) return 0;
             inode.block[14] = tri_blk;
             inode.blocks += block_size / 512;
-            const z_phys = pmm.allocPage() orelse return 0;
-            defer pmm.freePage(z_phys);
-            const z_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(z_phys));
-            @memset(z_buf[0..block_size], 0);
-            _ = writeBlock(tri_blk, z_buf);
         }
 
         const tib_phys = pmm.allocPage() orelse return 0;
@@ -1550,16 +1545,11 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
 
         // Ensure double indirect block at idx1
         if (tib_ptrs[idx1] == 0) {
-            const dbl_blk = allocBlock(0);
+            const dbl_blk = allocBlock(0); // allocBlock already zeroes the block
             if (dbl_blk == 0) return 0;
             tib_ptrs[idx1] = dbl_blk;
             inode.blocks += block_size / 512;
             _ = writeBlock(inode.block[14], tib);
-            const z_phys = pmm.allocPage() orelse return 0;
-            defer pmm.freePage(z_phys);
-            const z_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(z_phys));
-            @memset(z_buf[0..block_size], 0);
-            _ = writeBlock(dbl_blk, z_buf);
         }
 
         // Read double indirect block
@@ -1571,16 +1561,11 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
 
         // Ensure single indirect block at idx2
         if (dib_ptrs[idx2] == 0) {
-            const si_blk = allocBlock(0);
+            const si_blk = allocBlock(0); // allocBlock already zeroes the block
             if (si_blk == 0) return 0;
             dib_ptrs[idx2] = si_blk;
             inode.blocks += block_size / 512;
             _ = writeBlock(tib_ptrs[idx1], dib);
-            const z_phys = pmm.allocPage() orelse return 0;
-            defer pmm.freePage(z_phys);
-            const z_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(z_phys));
-            @memset(z_buf[0..block_size], 0);
-            _ = writeBlock(si_blk, z_buf);
         }
 
         // Read single indirect block
