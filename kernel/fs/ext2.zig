@@ -299,8 +299,9 @@ fn readBlockCached(block_num: u32, buf: [*]u8) bool {
         // v53.15: Write back dirty entry on eviction (fixes latent data-loss bug
         // and enables write-back mode for batch freeBlock)
         if (cache[slot].dirty) {
-            _ = writeBlockUncached(cache[slot].block_num, &cache[slot].data);
-            cache[slot].dirty = false;
+            if (writeBlockUncached(cache[slot].block_num, &cache[slot].data)) {
+                cache[slot].dirty = false;
+            }
         }
     }
 
@@ -325,6 +326,12 @@ fn writeBlockCached(block_num: u32, buf: [*]const u8) bool {
             cache_next = (cache_next + 1) % CACHE_ENTRIES;
             if (cache[slot].valid) {
                 cacheHashRemove(slot);
+                // v53.16: Write back dirty entry on eviction (same as readBlockCached/writeBlockBatch)
+                if (cache[slot].dirty) {
+                    if (writeBlockUncached(cache[slot].block_num, &cache[slot].data)) {
+                        cache[slot].dirty = false;
+                    }
+                }
             }
             cache[slot].block_num = block_num;
             cache[slot].valid = true;
@@ -339,15 +346,14 @@ fn writeBlockCached(block_num: u32, buf: [*]const u8) bool {
 /// v53.15: Write a block to cache only (mark dirty, no synchronous write-through).
 /// Used by freeBlock in batch mode to coalesce bitmap writes. Caller must call
 /// cacheFlush() to persist dirty entries.
-fn writeBlockBatch(block_num: u32, buf: [*]const u8) void {
+fn writeBlockBatch(block_num: u32, buf: [*]const u8) bool {
     if (block_size != CACHE_BLOCK_SIZE) {
-        _ = writeBlockUncached(block_num, buf);
-        return;
+        return writeBlockUncached(block_num, buf);
     }
     if (cacheLookup(block_num)) |idx| {
         @memcpy(cache[idx].data[0..block_size], buf[0..block_size]);
         cache[idx].dirty = true;
-        return;
+        return true;
     }
     // Not in cache — insert new entry marked dirty
     const slot = cache_next;
@@ -355,7 +361,9 @@ fn writeBlockBatch(block_num: u32, buf: [*]const u8) void {
     if (cache[slot].valid) {
         cacheHashRemove(slot);
         if (cache[slot].dirty) {
-            _ = writeBlockUncached(cache[slot].block_num, &cache[slot].data);
+            if (writeBlockUncached(cache[slot].block_num, &cache[slot].data)) {
+                cache[slot].dirty = false;
+            }
         }
     }
     cache[slot].block_num = block_num;
@@ -363,14 +371,16 @@ fn writeBlockBatch(block_num: u32, buf: [*]const u8) void {
     cache[slot].dirty = true;
     @memcpy(cache[slot].data[0..block_size], buf[0..block_size]);
     cacheHashInsert(slot);
+    return true;
 }
 
 /// Flush all dirty cache entries to disk.
 pub fn cacheFlush() void {
     for (0..CACHE_ENTRIES) |i| {
         if (cache[i].valid and cache[i].dirty) {
-            _ = writeBlockUncached(cache[i].block_num, &cache[i].data);
-            cache[i].dirty = false;
+            if (writeBlockUncached(cache[i].block_num, &cache[i].data)) {
+                cache[i].dirty = false;
+            }
         }
     }
 }
@@ -2059,7 +2069,7 @@ fn freeBlock(block_num: u32) void {
     buf[byte_idx] &= ~(@as(u8, 1) << bit_idx);
 
     if (batch_free_depth > 0) {
-        writeBlockBatch(bitmap_block, buf);
+        if (!writeBlockBatch(bitmap_block, buf)) return;
     } else {
         if (!writeBlock(bitmap_block, buf)) return;
     }
@@ -2093,13 +2103,20 @@ fn freeInode(inode_num: u32) void {
     const bit_idx: u3 = @intCast(index % 8);
     buf[byte_idx] &= ~(@as(u8, 1) << bit_idx);
 
-    if (!writeBlock(bitmap_block, buf)) return;
+    if (batch_free_depth > 0) {
+        if (!writeBlockBatch(bitmap_block, buf)) return;
+    } else {
+        if (!writeBlock(bitmap_block, buf)) return;
+    }
 
     gd.bg_free_inodes_count += 1;
-    writeGroupDescs();
-
     sb.free_inodes_count += 1;
-    writeSuperblock();
+
+    // v53.16: Skip flushes during batch operations (caller flushes at end)
+    if (batch_free_depth == 0) {
+        writeGroupDescs();
+        writeSuperblock();
+    }
 }
 
 // ─── Directory entry removal ───────────────────────────────────────────────
