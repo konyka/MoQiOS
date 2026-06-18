@@ -1462,14 +1462,50 @@ fn allocBlock(group: u32) u32 {
     if (gd.bg_free_blocks_count == 0) return 0;
 
     const bitmap_block = gd.bg_block_bitmap;
+    const total_blocks_in_group = if (group < groups_count - 1) sb.blocks_per_group else sb.blocks_count - group * sb.blocks_per_group;
+    const first_block = group * sb.blocks_per_group + first_data_block;
+
+    // v53.20: Zero-copy path — if bitmap block is cached, scan/modify directly
+    if (cacheLookup(bitmap_block)) |idx| {
+        const words: [*]u64 = @ptrCast(@alignCast(&cache[idx].data));
+        const total_bytes = (total_blocks_in_group + 7) / 8;
+        const total_words = (total_bytes + 7) / 8;
+        var w: u32 = 0;
+        while (w < total_words) : (w += 1) {
+            const inv = ~words[w];
+            if (inv == 0) continue;
+            const bit = @ctz(inv);
+            const i = w * 64 + @as(u32, bit);
+            if (i >= total_blocks_in_group) break;
+            const byte_idx = i / 8;
+            const bit_idx: u3 = @intCast(i % 8);
+            cache[idx].data[byte_idx] |= @as(u8, 1) << bit_idx;
+            if (!writeBlockUncached(bitmap_block, &cache[idx].data)) {
+                cache[idx].dirty = true;
+                return 0;
+            }
+            cache[idx].dirty = false;
+            gd.bg_free_blocks_count -= 1;
+            writeGroupDescs();
+            sb.free_blocks_count -= 1;
+            writeSuperblock();
+            const zero_phys = pmm.allocPage() orelse return 0;
+            defer pmm.freePage(zero_phys);
+            const zero_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(zero_phys));
+            @memset(zero_buf[0..block_size], 0);
+            const block_num = first_block + i;
+            _ = writeBlock(block_num, zero_buf);
+            return block_num;
+        }
+        return 0;
+    }
+
+    // Not cached — fall back to alloc-page-read-modify-write
     const buf_phys = pmm.allocPage() orelse return 0;
     defer pmm.freePage(buf_phys);
     const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
 
     if (!readBlock(bitmap_block, buf)) return 0;
-
-    const total_blocks_in_group = if (group < groups_count - 1) sb.blocks_per_group else sb.blocks_count - group * sb.blocks_per_group;
-    const first_block = group * sb.blocks_per_group + first_data_block;
 
     // Scan bitmap for a free bit (0 = free) using 64-bit word scanning.
     // Inverted word + @ctz skips 64 used blocks per iteration.
@@ -2092,6 +2128,11 @@ fn freeBlock(block_num: u32) void {
         } else {
             if (writeBlockUncached(bitmap_block, &cache[idx].data)) {
                 cache[idx].dirty = false;
+            } else {
+                // v53.20: Writeback failed — mark dirty for retry + return early
+                // to avoid incrementing counters when bitmap write failed
+                cache[idx].dirty = true;
+                return;
             }
         }
     } else {
@@ -2140,6 +2181,10 @@ fn freeInode(inode_num: u32) void {
         } else {
             if (writeBlockUncached(bitmap_block, &cache[idx].data)) {
                 cache[idx].dirty = false;
+            } else {
+                // v53.20: Writeback failed — mark dirty for retry + return early
+                cache[idx].dirty = true;
+                return;
             }
         }
     } else {
