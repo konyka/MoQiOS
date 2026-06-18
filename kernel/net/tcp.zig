@@ -25,6 +25,7 @@ const bo = @import("../lib/byte_order.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 // v53.13: Global TCP lock — protects TCB array, tcb_active_bitmap, and all TCB fields.
+// v53.15: tcb_active_bitmap uses atomic RMW for all accesses (lock-free snapshot in timerTick).
 // Lock order: tcp_lock → e1000.tx_lock (sendSegment acquires tx_lock internally).
 // Acquired at the entry of every public function; private helpers (sendSegment, flushSendBuffer,
 // processIncomingData, allocTcb, deactivateTcb) are called from within the lock and must NOT re-acquire.
@@ -187,6 +188,7 @@ var tcbs: [MAX_CONNECTIONS]TcpTcb = undefined;
 
 /// Bitmap tracking active TCB slots (1 = active, 0 = free).
 /// Enables O(1) skip of empty slots via @ctz instead of linear scan.
+// v53.15: All accesses use @atomicLoad/@atomicRmw for SMP-safe lock-free snapshot in timerTick.
 var tcb_active_bitmap: u64 = 0;
 
 /// Compute the pool index of a TCB from its pointer.
@@ -199,12 +201,12 @@ fn tcbIdx(tcb: *const TcpTcb) u32 {
 /// Deactivate a TCB and clear its bitmap bit (single call site for consistency).
 inline fn deactivateTcb(tcb: *TcpTcb) void {
     const idx: u6 = @intCast(tcbIdx(tcb));
-    tcb_active_bitmap &= ~(@as(u64, 1) << idx);
+    _ = @atomicRmw(u64, &tcb_active_bitmap, .And, ~(@as(u64, 1) << idx), .release);
     tcb.active = false;
 }
 
 pub fn initTcbs() void {
-    tcb_active_bitmap = 0;
+    @atomicStore(u64, &tcb_active_bitmap, 0, .release);
     for (0..MAX_CONNECTIONS) |i| {
         tcbs[i] = .{
             .local_port = 0,
@@ -266,10 +268,10 @@ var next_ephemeral_port: u16 = 49152;
 fn allocTcb() ?*TcpTcb {
     // Use inverted bitmap to find first free slot (0 bit = free)
     const all_mask: u64 = if (MAX_CONNECTIONS >= 64) 0xFFFFFFFFFFFFFFFF else (@as(u64, 1) << MAX_CONNECTIONS) - 1;
-    const free_bitmap = ~tcb_active_bitmap & all_mask;
+    const free_bitmap = ~@atomicLoad(u64, &tcb_active_bitmap, .acquire) & all_mask;
     if (free_bitmap == 0) return null;
     const i: u6 = @intCast(@ctz(free_bitmap));
-    tcb_active_bitmap |= @as(u64, 1) << i;
+    _ = @atomicRmw(u64, &tcb_active_bitmap, .Or, @as(u64, 1) << i, .release);
     tcbs[i].active = true;
     tcbs[i].state = .closed;
     tcbs[i].send_head = 0;
@@ -304,7 +306,7 @@ fn allocTcb() ?*TcpTcb {
 }
 
 fn findTcbByTuple(local_port: u16, remote_port: u16, remote_ip: [4]u8) ?*TcpTcb {
-    var bm = tcb_active_bitmap;
+    var bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
     while (bm != 0) {
         const i = @ctz(bm);
         bm &= bm - 1; // clear lowest set bit
@@ -319,7 +321,7 @@ fn findTcbByTuple(local_port: u16, remote_port: u16, remote_ip: [4]u8) ?*TcpTcb 
 }
 
 fn findTcbByLocalPort(local_port: u16) ?*TcpTcb {
-    var bm = tcb_active_bitmap;
+    var bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
     while (bm != 0) {
         const i = @ctz(bm);
         bm &= bm - 1;
@@ -675,7 +677,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
     const ls = slot orelse return;
 
     // T17: Allow TCB reuse for TIME_WAIT connections (if ISN is larger)
-    var tw_bm = tcb_active_bitmap;
+    var tw_bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
     while (tw_bm != 0) {
         const i = @ctz(tw_bm);
         tw_bm &= tw_bm - 1;
@@ -1625,7 +1627,7 @@ pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
 
     // Check if port is already in use (bitmap-driven scan)
     // SO_REUSEADDR allows binding to a port in TIME_WAIT state
-    var bm = tcb_active_bitmap;
+    var bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
     while (bm != 0) {
         const i = @ctz(bm);
         bm &= bm - 1;

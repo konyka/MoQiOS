@@ -110,10 +110,11 @@ var inodes_per_group: u32 = 0;
 var inode_size: u32 = 0;
 var first_data_block: u32 = 0;
 
-// v53.14: Batch mode flag — when true, freeBlock skips writeGroupDescs/writeSuperblock.
-// Callers set this before批量释放块, then flush once at the end. Saves O(N) disk I/O for
-// large file deletion/truncation (100MB file: 128K I/O → 2 I/O).
-var batch_free_mode: bool = false;
+// v53.15: Batch depth counter — when > 0, freeBlock uses writeBlockBatch (cache-only,
+// no sync write-through) and skips writeGroupDescs/writeSuperblock. Callers increment
+// before batch block-freeing, then defer-flush cacheFlush+writeGroupDescs+writeSuperblock.
+// Depth counter (not bool) supports nested batch contexts and is SMP-tolerant.
+var batch_free_depth: u32 = 0;
 
 const DISK_LBA_OFFSET: u64 = 32768;
 
@@ -295,6 +296,12 @@ fn readBlockCached(block_num: u32, buf: [*]u8) bool {
     // Remove old entry from hash table if it was valid
     if (cache[slot].valid) {
         cacheHashRemove(slot);
+        // v53.15: Write back dirty entry on eviction (fixes latent data-loss bug
+        // and enables write-back mode for batch freeBlock)
+        if (cache[slot].dirty) {
+            _ = writeBlockUncached(cache[slot].block_num, &cache[slot].data);
+            cache[slot].dirty = false;
+        }
     }
 
     cache[slot].block_num = block_num;
@@ -327,6 +334,35 @@ fn writeBlockCached(block_num: u32, buf: [*]const u8) bool {
         }
     }
     return writeBlockUncached(block_num, buf);
+}
+
+/// v53.15: Write a block to cache only (mark dirty, no synchronous write-through).
+/// Used by freeBlock in batch mode to coalesce bitmap writes. Caller must call
+/// cacheFlush() to persist dirty entries.
+fn writeBlockBatch(block_num: u32, buf: [*]const u8) void {
+    if (block_size != CACHE_BLOCK_SIZE) {
+        _ = writeBlockUncached(block_num, buf);
+        return;
+    }
+    if (cacheLookup(block_num)) |idx| {
+        @memcpy(cache[idx].data[0..block_size], buf[0..block_size]);
+        cache[idx].dirty = true;
+        return;
+    }
+    // Not in cache — insert new entry marked dirty
+    const slot = cache_next;
+    cache_next = (cache_next + 1) % CACHE_ENTRIES;
+    if (cache[slot].valid) {
+        cacheHashRemove(slot);
+        if (cache[slot].dirty) {
+            _ = writeBlockUncached(cache[slot].block_num, &cache[slot].data);
+        }
+    }
+    cache[slot].block_num = block_num;
+    cache[slot].valid = true;
+    cache[slot].dirty = true;
+    @memcpy(cache[slot].data[0..block_size], buf[0..block_size]);
+    cacheHashInsert(slot);
 }
 
 /// Flush all dirty cache entries to disk.
@@ -1162,12 +1198,15 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
     }
 
     // Shrinking: free blocks beyond new_size
-    // v53.14: Batch mode — defer writeGroupDescs/writeSuperblock
-    batch_free_mode = true;
+    // v53.15: Batch mode — defer cacheFlush+writeGroupDescs+writeSuperblock
+    batch_free_depth += 1;
     defer {
-        batch_free_mode = false;
-        writeGroupDescs();
-        writeSuperblock();
+        batch_free_depth -= 1;
+        if (batch_free_depth == 0) {
+            cacheFlush();
+            writeGroupDescs();
+            writeSuperblock();
+        }
     }
     const new_blocks_needed = if (new_size == 0) 0 else (new_size + block_size - 1) / block_size;
     const ptrs_per_block = block_size / 4;
@@ -1227,12 +1266,15 @@ pub fn truncateByInode(inode_num: u32, new_size: u32) bool {
         return true;
     }
 
-    // v53.14: Batch mode — defer writeGroupDescs/writeSuperblock
-    batch_free_mode = true;
+    // v53.15: Batch mode — defer cacheFlush+writeGroupDescs+writeSuperblock
+    batch_free_depth += 1;
     defer {
-        batch_free_mode = false;
-        writeGroupDescs();
-        writeSuperblock();
+        batch_free_depth -= 1;
+        if (batch_free_depth == 0) {
+            cacheFlush();
+            writeGroupDescs();
+            writeSuperblock();
+        }
     }
     // v53.4: invalidate page cache for this inode before freeing blocks
     const page_cache = @import("page_cache.zig");
@@ -1996,8 +2038,8 @@ pub fn createDir(name: []const u8) i64 {
 // ─── Block / inode deallocation ────────────────────────────────────────────
 
 /// Mark a data block as free in the bitmap.
-/// v53.14: When batch_free_mode is true, skips writeGroupDescs/writeSuperblock.
-/// Caller must call writeGroupDescs() + writeSuperblock() after batch operations.
+/// v53.15: When batch_free_depth > 0, uses writeBlockBatch (cache-only dirty) and
+/// skips writeGroupDescs/writeSuperblock. Caller must cacheFlush+writeGroupDescs+writeSuperblock.
 fn freeBlock(block_num: u32) void {
     const group = (block_num - first_data_block) / sb.blocks_per_group;
     const index = (block_num - first_data_block) % sb.blocks_per_group;
@@ -2016,13 +2058,17 @@ fn freeBlock(block_num: u32) void {
     const bit_idx: u3 = @intCast(index % 8);
     buf[byte_idx] &= ~(@as(u8, 1) << bit_idx);
 
-    if (!writeBlock(bitmap_block, buf)) return;
+    if (batch_free_depth > 0) {
+        writeBlockBatch(bitmap_block, buf);
+    } else {
+        if (!writeBlock(bitmap_block, buf)) return;
+    }
 
     gd.bg_free_blocks_count += 1;
     sb.free_blocks_count += 1;
 
-    // v53.14: Skip expensive disk flushes during batch operations
-    if (!batch_free_mode) {
+    // v53.15: Skip expensive disk flushes during batch operations (caller flushes at end)
+    if (batch_free_depth == 0) {
         writeGroupDescs();
         writeSuperblock();
     }
@@ -2150,12 +2196,15 @@ pub fn unlinkFile(path: []const u8) bool {
         _ = writeInode(file_inode_num, &file_inode);
     } else {
         // Last link: free data blocks
-        // v53.14: Batch mode — defer writeGroupDescs/writeSuperblock to end of block-freeing
-        batch_free_mode = true;
+        // v53.15: Batch mode — defer cacheFlush+writeGroupDescs+writeSuperblock
+        batch_free_depth += 1;
         defer {
-            batch_free_mode = false;
-            writeGroupDescs();
-            writeSuperblock();
+            batch_free_depth -= 1;
+            if (batch_free_depth == 0) {
+                cacheFlush();
+                writeGroupDescs();
+                writeSuperblock();
+            }
         }
         // v53.5: invalidate page cache before freeing blocks
         const page_cache = @import("page_cache.zig");
