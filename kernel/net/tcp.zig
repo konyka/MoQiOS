@@ -20,7 +20,6 @@ const netif = @import("netif.zig");
 const eth = @import("eth.zig");
 const ipv4 = @import("ipv4.zig");
 const arp = @import("arp.zig");
-const serial = @import("../arch/x86_64/serial.zig");
 const socket_opt = @import("socket_opt.zig");
 const bo = @import("../lib/byte_order.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
@@ -30,6 +29,14 @@ const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 // Acquired at the entry of every public function; private helpers (sendSegment, flushSendBuffer,
 // processIncomingData, allocTcb, deactivateTcb) are called from within the lock and must NOT re-acquire.
 var tcp_lock: IrqSpinlock = .{};
+
+// v53.14: Debug logging no-op — avoids serial I/O (87μs/char polling UART) inside
+// tcp_lock critical sections. Serial polling in locked code caused ~170ms lock hold
+// time for 64 connections, leading to e1000 RX ring overflow and packet drops.
+// To re-enable: replace body with tcpLog(msg).
+inline fn tcpLog(comptime msg: []const u8) void {
+    _ = msg;
+}
 
 // ─── Constants ────────────────────────────────────────────────────────────
 
@@ -330,12 +337,34 @@ fn allocEphemeralPort() u16 {
     return port;
 }
 
-/// Get a mutable pointer to the socket options for a TCB.
+/// Get a copy of socket options for a TCB (v53.14: locked — no raw pointer escape).
 /// Returns null if tcb_idx is invalid or TCB is inactive.
-pub fn tcpGetOptionsPtr(tcb_idx: u32) ?*socket_opt.SocketOptions {
+pub fn tcpGetOptions(tcb_idx: u32) ?socket_opt.SocketOptions {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return null;
     if (!tcbs[tcb_idx].active) return null;
-    return &tcbs[tcb_idx].options;
+    return tcbs[tcb_idx].options;
+}
+
+/// Set socket options for a TCB from a copy (v53.14: locked).
+/// Returns false if tcb_idx is invalid or TCB is inactive.
+pub fn tcpSetOptions(tcb_idx: u32, opts: socket_opt.SocketOptions) bool {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS) return false;
+    if (!tcbs[tcb_idx].active) return false;
+    tcbs[tcb_idx].options = opts;
+    return true;
+}
+
+/// Clear SO_ERROR for a TCB (v53.14: locked — SO_ERROR is one-shot, cleared on read).
+pub fn tcpClearSoError(tcb_idx: u32) void {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx < MAX_CONNECTIONS and tcbs[tcb_idx].active) {
+        tcbs[tcb_idx].options.so_error = 0;
+    }
 }
 
 fn generateIss() u32 {
@@ -365,7 +394,7 @@ fn ringDataLen(head: u32, tail: u32, size: u32) u32 {
 fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
     var send_pkt: [1518]u8 = @splat(0);
     const dst_mac = arp.resolve(tcb.remote_ip) orelse {
-        serial.writeString("[tcp] ARP resolution failed\n");
+        tcpLog("[tcp] ARP resolution failed\n");
         return false;
     };
 
@@ -681,7 +710,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
             }
 
             _ = sendSegment(reuse_tcb, SYN | ACK, undefined, 0);
-            serial.writeString("[tcp] TIME_WAIT reuse → SYN-ACK\n");
+            tcpLog("[tcp] TIME_WAIT reuse → SYN-ACK\n");
             return;
         }
     }
@@ -723,7 +752,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
 
     // Send SYN-ACK
     _ = sendSegment(new_tcb, SYN | ACK, undefined, 0);
-    serial.writeString("[tcp] SYN-ACK sent for incoming connection\n");
+    tcpLog("[tcp] SYN-ACK sent for incoming connection\n");
 
     // Find the index of the new TCB
     const new_idx = tcbIdx(new_tcb);
@@ -790,7 +819,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
             if (ack_num == tcb.iss +% 1) {
                 tcb.state = .closed;
                 deactivateTcb(tcb);
-                serial.writeString("[tcp] RST in SYN_SENT, connection reset\n");
+                tcpLog("[tcp] RST in SYN_SENT, connection reset\n");
                 return;
             }
         } else {
@@ -799,7 +828,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
             if (in_window) {
                 tcb.state = .closed;
                 deactivateTcb(tcb);
-                serial.writeString("[tcp] RST received, connection reset\n");
+                tcpLog("[tcp] RST received, connection reset\n");
                 return;
             }
         }
@@ -851,7 +880,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                 // Send ACK to complete handshake
                 _ = sendSegment(tcb, ACK, undefined, 0);
 
-                serial.writeString("[tcp] connection established\n");
+                tcpLog("[tcp] connection established\n");
 
                 // epoll: connection is now writable (EPOLLOUT).
                 const epoll_mod = @import("epoll.zig");
@@ -870,7 +899,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                 tcb.snd_wnd = window;
                 tcb.state = .established;
                 tcb.retransmit_timer = 0;
-                serial.writeString("[tcp] server: connection established (ACK received)\n");
+                tcpLog("[tcp] server: connection established (ACK received)\n");
 
                 // epoll: server-side connection established.
                 const epoll_mod2 = @import("epoll.zig");
@@ -885,7 +914,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                 if (in_window) {
                     tcb.state = .closed;
                     deactivateTcb(tcb);
-                    serial.writeString("[tcp] RST received, connection reset\n");
+                    tcpLog("[tcp] RST received, connection reset\n");
                     return;
                 }
             }
@@ -992,7 +1021,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                                 tcb.send_unacked = tcb.send_head;
                                 flushSendBuffer(tcb);
                             }
-                            serial.writeString("[tcp] fast retransmit\n");
+                            tcpLog("[tcp] fast retransmit\n");
                         } else if (tcb.in_recovery) {
                             // Fast recovery: inflate cwnd by 1 MSS per dup ACK
                             tcb.cwnd += @as(u32, TCP_MSS);
@@ -1022,7 +1051,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                     tcb.state = .close_wait;
                     tcb.delayed_ack_pending = false; // ACK is immediate for FIN
                     _ = sendSegment(tcb, ACK, undefined, 0);
-                    serial.writeString("[tcp] remote closed (FIN received)\n");
+                    tcpLog("[tcp] remote closed (FIN received)\n");
                     // epoll: peer closed.
                     const epoll_fin = @import("epoll.zig");
                     epoll_fin.epollNotify(.tcp_socket, tcbIdx(tcb), epoll_fin.EPOLLIN | epoll_fin.EPOLLHUP);
@@ -1040,18 +1069,18 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                     tcb.retransmit_timer = 0; // v53.10: Reset for TIME_WAIT 2MSL
                     tcb.state = .time_wait;
                     _ = sendSegment(tcb, ACK, undefined, 0);
-                    serial.writeString("[tcp] FIN+ACK in FIN_WAIT_1 → TIME_WAIT\n");
+                    tcpLog("[tcp] FIN+ACK in FIN_WAIT_1 → TIME_WAIT\n");
                 } else {
                     // Simultaneous close, our FIN not yet ACKed → CLOSING
                     tcb.state = .closing;
                     _ = sendSegment(tcb, ACK, undefined, 0);
-                    serial.writeString("[tcp] FIN (no ACK) in FIN_WAIT_1 → CLOSING\n");
+                    tcpLog("[tcp] FIN (no ACK) in FIN_WAIT_1 → CLOSING\n");
                 }
             } else if (flags & ACK != 0) {
                 tcb.snd_una = ack_num;
                 tcb.retransmit_timer = 0; // v53.10: Reset for FIN_WAIT_2 timeout
                 tcb.state = .fin_wait_2;
-                serial.writeString("[tcp] ACK in FIN_WAIT_1 → FIN_WAIT_2\n");
+                tcpLog("[tcp] ACK in FIN_WAIT_1 → FIN_WAIT_2\n");
             }
         },
         .fin_wait_2 => {
@@ -1065,14 +1094,14 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                 tcb.retransmit_timer = 0; // v53.10: Reset for TIME_WAIT 2MSL
                 tcb.state = .time_wait;
                 _ = sendSegment(tcb, ACK, undefined, 0);
-                serial.writeString("[tcp] FIN received → TIME_WAIT\n");
+                tcpLog("[tcp] FIN received → TIME_WAIT\n");
             }
         },
         .last_ack => {
             if (flags & ACK != 0) {
                 tcb.state = .closed;
                 deactivateTcb(tcb);
-                serial.writeString("[tcp] LAST_ACK → CLOSED\n");
+                tcpLog("[tcp] LAST_ACK → CLOSED\n");
             }
         },
         .close_wait => {
@@ -1087,7 +1116,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
             if (flags & ACK != 0 and ack_num >= tcb.snd_nxt) {
                 tcb.retransmit_timer = 0; // v53.10: Reset for TIME_WAIT 2MSL
                 tcb.state = .time_wait;
-                serial.writeString("[tcp] CLOSING → TIME_WAIT\n");
+                tcpLog("[tcp] CLOSING → TIME_WAIT\n");
             }
         },
         .time_wait => {
@@ -1172,7 +1201,7 @@ pub fn tcpConnect(remote_ip: [4]u8, remote_port: u16, owner_task: u32) i64 {
         return -1;
     }
 
-    serial.writeString("[tcp] SYN sent\n");
+    tcpLog("[tcp] SYN sent\n");
 
     // Return the index
     return @intCast(tcbIdx(tcb));
@@ -1207,7 +1236,7 @@ pub fn tcpConnectSocket(tcb_idx: u32, remote_ip: [4]u8, remote_port: u16) i64 {
         return -1;
     }
 
-    serial.writeString("[tcp] connect: SYN sent\n");
+    tcpLog("[tcp] connect: SYN sent\n");
     return 0;
 }
 
@@ -1355,7 +1384,7 @@ pub fn tcpClose(tcb_idx: u32) i64 {
     // SO_LINGER with linger=0: abortive close — send RST, discard unsent data
     if (tcb.options.linger_on and tcb.options.linger_sec == 0) {
         _ = sendSegment(tcb, RST | ACK, undefined, 0);
-        serial.writeString("[tcp] SO_LINGER(0) → RST sent, abortive close\n");
+        tcpLog("[tcp] SO_LINGER(0) → RST sent, abortive close\n");
         tcb.state = .closed;
         deactivateTcb(tcb);
         return 0;
@@ -1365,12 +1394,12 @@ pub fn tcpClose(tcb_idx: u32) i64 {
         .established => {
             tcb.state = .fin_wait_1;
             _ = sendSegment(tcb, FIN | ACK, undefined, 0);
-            serial.writeString("[tcp] FIN sent → FIN_WAIT_1\n");
+            tcpLog("[tcp] FIN sent → FIN_WAIT_1\n");
         },
         .close_wait => {
             tcb.state = .last_ack;
             _ = sendSegment(tcb, FIN | ACK, undefined, 0);
-            serial.writeString("[tcp] FIN sent → LAST_ACK\n");
+            tcpLog("[tcp] FIN sent → LAST_ACK\n");
         },
         else => {
             tcb.state = .closed;
@@ -1407,100 +1436,34 @@ pub fn isClosed(tcb_idx: u32) bool {
 
 /// Timer tick — called periodically to handle retransmission.
 /// Uses the per-TCB RTO (Jacobson/Karels) instead of a fixed timeout.
+/// v53.14: Per-TCB locking — releases tcp_lock between TCBs so handlePacket
+/// and syscall paths are not blocked for the entire 64-TCB sweep.
 pub fn timerTick(ms_elapsed: u32) void {
-    // v53.13: Acquire TCP lock for the entire timer tick
-    const lock_flags = tcp_lock.acquire();
-    defer tcp_lock.release(lock_flags);
-    var bm = tcb_active_bitmap;
+    var bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
     while (bm != 0) {
         const idx = @ctz(bm);
         bm &= bm - 1;
-        const tcb = &tcbs[idx];
-        if (tcb.state == .closed) continue;
+        const lock_flags = tcp_lock.acquire();
+        timerTickOne(idx, ms_elapsed);
+        tcp_lock.release(lock_flags);
+    }
+}
 
-        // v53.6: FIN_WAIT_2 timeout — prevent orphaned TCBs if peer crashes without FIN
-        if (tcb.state == .fin_wait_2) {
-            tcb.retransmit_timer +%= ms_elapsed;
-            if (tcb.retransmit_timer >= 60_000) { // 60s timeout (Linux tcp_fin_timeout default)
-                tcb.state = .closed;
-                deactivateTcb(tcb);
-                serial.writeString("[tcp] FIN_WAIT_2 timeout → CLOSED\n");
-                continue;
-            }
-            // v53.11: Handle delayed ACK for half-close data (peer can still send in FIN_WAIT_2)
-            if (tcb.delayed_ack_pending) {
-                tcb.delayed_ack_ms +%= ms_elapsed;
-                if (tcb.delayed_ack_ms >= DELAYED_ACK_MS) {
-                    tcb.delayed_ack_pending = false;
-                    tcb.delayed_ack_ms = 0;
-                    _ = sendSegment(tcb, ACK, undefined, 0);
-                }
-            }
-            continue; // v53.10: Don't fall through to retransmit logic
+/// Process timer events for a single TCB. Must be called with tcp_lock held.
+fn timerTickOne(idx: u32, ms_elapsed: u32) void {
+    const tcb = &tcbs[idx];
+    if (tcb.state == .closed) return;
+
+    // v53.6: FIN_WAIT_2 timeout — prevent orphaned TCBs if peer crashes without FIN
+    if (tcb.state == .fin_wait_2) {
+        tcb.retransmit_timer +%= ms_elapsed;
+        if (tcb.retransmit_timer >= 60_000) { // 60s timeout (Linux tcp_fin_timeout default)
+            tcb.state = .closed;
+            deactivateTcb(tcb);
+            tcpLog("[tcp] FIN_WAIT_2 timeout → CLOSED\n");
+            return;
         }
-
-        // TIME_WAIT: clean up after 15 seconds (reduced from 2*MSL=60s)
-        if (tcb.state == .time_wait) {
-            tcb.retransmit_timer +%= ms_elapsed;
-            if (tcb.retransmit_timer >= 15000) {
-                tcb.state = .closed;
-                deactivateTcb(tcb);
-                serial.writeString("[tcp] TIME_WAIT → CLOSED (timeout)\n");
-            }
-            continue;
-        }
-
-        // Check for unacknowledged data
-        if (tcb.snd_nxt != tcb.snd_una) {
-            tcb.retransmit_timer +%= ms_elapsed;
-            // Use per-TCB RTO if available, otherwise fall back to RETRANSMIT_MS
-            const current_rto = if (tcb.rto > 0) tcb.rto else RETRANSMIT_MS;
-            if (tcb.retransmit_timer >= current_rto) {
-                tcb.retransmit_timer = 0;
-                tcb.retransmit_count += 1;
-                if (tcb.retransmit_count > 5) {
-                    // Give up
-                    serial.writeString("[tcp] retransmit timeout, closing\n");
-                    tcb.state = .closed;
-                    deactivateTcb(tcb);
-                    continue;
-                }
-                // RTO timeout: Reno behavior — ssthresh = cwnd/2, cwnd = 1 MSS
-                tcb.ssthresh = @max(tcb.cwnd / 2, 2 * @as(u32, TCP_MSS));
-                tcb.cwnd = @as(u32, TCP_MSS); // back to slow start
-                tcb.in_recovery = false;
-                tcb.dup_ack_count = 0;
-
-                // Exponential backoff for RTO
-                tcb.rto = @min(tcb.rto * 2, TCP_RTO_MAX);
-
-                // Retransmit: reset snd_nxt back to snd_una and re-flush
-                tcb.snd_nxt = tcb.snd_una;
-                // v53.2: use ringDataLen instead of raw subtraction (handles wrap-around)
-                const unacked = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
-                if (unacked > 0) {
-                    // Re-send from beginning of pending data
-                    tcb.send_unacked = tcb.send_head;
-                    flushSendBuffer(tcb);
-                    // v53.13: If all pending data has been retransmitted, also retransmit FIN
-                    if (tcb.send_unacked == tcb.send_tail) {
-                        if (tcb.state == .fin_wait_1 or tcb.state == .last_ack or tcb.state == .closing) {
-                            _ = sendSegment(tcb, FIN | ACK, undefined, 0);
-                        }
-                    }
-                } else if (tcb.state == .syn_sent) {
-                    // Retransmit SYN
-                    _ = sendSegment(tcb, SYN, undefined, 0);
-                } else if (tcb.state == .fin_wait_1 or tcb.state == .last_ack or tcb.state == .closing) {
-                    // v53.12: Include .closing — FIN must be retransmitted if ACK is lost
-                    _ = sendSegment(tcb, FIN | ACK, undefined, 0);
-                }
-                serial.writeString("[tcp] RTO retransmit\n");
-            }
-        }
-
-        // ── Delayed ACK timeout ──────────────────────────────────────
-        // If ACK has been held for > DELAYED_ACK_MS, send it now.
+        // v53.11: Handle delayed ACK for half-close data (peer can still send in FIN_WAIT_2)
         if (tcb.delayed_ack_pending) {
             tcb.delayed_ack_ms +%= ms_elapsed;
             if (tcb.delayed_ack_ms >= DELAYED_ACK_MS) {
@@ -1509,38 +1472,110 @@ pub fn timerTick(ms_elapsed: u32) void {
                 _ = sendSegment(tcb, ACK, undefined, 0);
             }
         }
+        return; // v53.10: Don't fall through to retransmit logic
+    }
 
-        // ── Keepalive logic ──────────────────────────────────────────────
-        // Only for established connections with SO_KEEPALIVE enabled
-        if (tcb.state == .established and tcb.options.keep_alive) {
-            tcb.idle_ms +%= ms_elapsed;
-            const keep_idle_ms = tcb.options.keep_idle * 1000;
-            const keep_intvl_ms = tcb.options.keep_intvl * 1000;
+    // TIME_WAIT: clean up after 15 seconds (reduced from 2*MSL=60s)
+    if (tcb.state == .time_wait) {
+        tcb.retransmit_timer +%= ms_elapsed;
+        if (tcb.retransmit_timer >= 15000) {
+            tcb.state = .closed;
+            deactivateTcb(tcb);
+            tcpLog("[tcp] TIME_WAIT → CLOSED (timeout)\n");
+        }
+        return;
+    }
 
-            if (tcb.idle_ms >= keep_idle_ms and tcb.keepalive_probes == 0) {
-                // First keepalive probe
-                tcb.keepalive_probes = 1;
-                _ = sendSegment(tcb, ACK, undefined, 0); // Send empty ACK as probe
-            } else if (tcb.keepalive_probes > 0 and tcb.idle_ms >= keep_idle_ms + tcb.keepalive_probes * keep_intvl_ms) {
-                if (tcb.keepalive_probes >= tcb.options.keep_cnt) {
-                    // Max probes reached — connection is dead
-                    serial.writeString("[tcp] keepalive timeout, closing\n");
-                    tcb.state = .closed;
-                    deactivateTcb(tcb);
-                    continue;
-                }
-                tcb.keepalive_probes += 1;
-                _ = sendSegment(tcb, ACK, undefined, 0); // Send probe
+    // Check for unacknowledged data
+    if (tcb.snd_nxt != tcb.snd_una) {
+        tcb.retransmit_timer +%= ms_elapsed;
+        // Use per-TCB RTO if available, otherwise fall back to RETRANSMIT_MS
+        const current_rto = if (tcb.rto > 0) tcb.rto else RETRANSMIT_MS;
+        if (tcb.retransmit_timer >= current_rto) {
+            tcb.retransmit_timer = 0;
+            tcb.retransmit_count += 1;
+            if (tcb.retransmit_count > 5) {
+                // Give up
+                tcpLog("[tcp] retransmit timeout, closing\n");
+                tcb.state = .closed;
+                deactivateTcb(tcb);
+                return;
             }
-        }
+            // RTO timeout: Reno behavior — ssthresh = cwnd/2, cwnd = 1 MSS
+            tcb.ssthresh = @max(tcb.cwnd / 2, 2 * @as(u32, TCP_MSS));
+            tcb.cwnd = @as(u32, TCP_MSS); // back to slow start
+            tcb.in_recovery = false;
+            tcb.dup_ack_count = 0;
 
-        // ── Nagle delayed data flush ──────────────────────────────────────
-        // If Nagle held data (nagle_pending), and all in-flight data is now ACKed,
-        // flush the pending data.
-        if (tcb.nagle_pending and tcb.snd_nxt == tcb.snd_una) {
-            tcb.nagle_pending = false;
-            flushSendBuffer(tcb);
+            // Exponential backoff for RTO
+            tcb.rto = @min(tcb.rto * 2, TCP_RTO_MAX);
+
+            // Retransmit: reset snd_nxt back to snd_una and re-flush
+            tcb.snd_nxt = tcb.snd_una;
+            // v53.2: use ringDataLen instead of raw subtraction (handles wrap-around)
+            const unacked = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
+            if (unacked > 0) {
+                // Re-send from beginning of pending data
+                tcb.send_unacked = tcb.send_head;
+                flushSendBuffer(tcb);
+                // v53.13: If all pending data has been retransmitted, also retransmit FIN
+                if (tcb.send_unacked == tcb.send_tail) {
+                    if (tcb.state == .fin_wait_1 or tcb.state == .last_ack or tcb.state == .closing) {
+                        _ = sendSegment(tcb, FIN | ACK, undefined, 0);
+                    }
+                }
+            } else if (tcb.state == .syn_sent) {
+                // Retransmit SYN
+                _ = sendSegment(tcb, SYN, undefined, 0);
+            } else if (tcb.state == .fin_wait_1 or tcb.state == .last_ack or tcb.state == .closing) {
+                // v53.12: Include .closing — FIN must be retransmitted if ACK is lost
+                _ = sendSegment(tcb, FIN | ACK, undefined, 0);
+            }
+            tcpLog("[tcp] RTO retransmit\n");
         }
+    }
+
+    // ── Delayed ACK timeout ──────────────────────────────────────
+    // If ACK has been held for > DELAYED_ACK_MS, send it now.
+    if (tcb.delayed_ack_pending) {
+        tcb.delayed_ack_ms +%= ms_elapsed;
+        if (tcb.delayed_ack_ms >= DELAYED_ACK_MS) {
+            tcb.delayed_ack_pending = false;
+            tcb.delayed_ack_ms = 0;
+            _ = sendSegment(tcb, ACK, undefined, 0);
+        }
+    }
+
+    // ── Keepalive logic ──────────────────────────────────────────────
+    // Only for established connections with SO_KEEPALIVE enabled
+    if (tcb.state == .established and tcb.options.keep_alive) {
+        tcb.idle_ms +%= ms_elapsed;
+        const keep_idle_ms = tcb.options.keep_idle * 1000;
+        const keep_intvl_ms = tcb.options.keep_intvl * 1000;
+
+        if (tcb.idle_ms >= keep_idle_ms and tcb.keepalive_probes == 0) {
+            // First keepalive probe
+            tcb.keepalive_probes = 1;
+            _ = sendSegment(tcb, ACK, undefined, 0); // Send empty ACK as probe
+        } else if (tcb.keepalive_probes > 0 and tcb.idle_ms >= keep_idle_ms + tcb.keepalive_probes * keep_intvl_ms) {
+            if (tcb.keepalive_probes >= tcb.options.keep_cnt) {
+                // Max probes reached — connection is dead
+                tcpLog("[tcp] keepalive timeout, closing\n");
+                tcb.state = .closed;
+                deactivateTcb(tcb);
+                return;
+            }
+            tcb.keepalive_probes += 1;
+            _ = sendSegment(tcb, ACK, undefined, 0); // Send probe
+        }
+    }
+
+    // ── Nagle delayed data flush ──────────────────────────────────────
+    // If Nagle held data (nagle_pending), and all in-flight data is now ACKed,
+    // flush the pending data.
+    if (tcb.nagle_pending and tcb.snd_nxt == tcb.snd_una) {
+        tcb.nagle_pending = false;
+        flushSendBuffer(tcb);
     }
 }
 
@@ -1570,6 +1605,8 @@ var listen_active_bitmap: u64 = 0;
 /// Create a TCP socket (allocate a TCB in closed state).
 /// Returns TCB index (>= 0) on success, -1 on failure.
 pub fn tcpSocket(owner_task: u32) i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     const tcb = allocTcb() orelse return -1;
     tcb.owner_task = owner_task;
     tcb.state = .closed;
@@ -1760,12 +1797,12 @@ pub fn tcpShutdown(tcb_idx: u32, how: u32) i64 {
                 .established => {
                     tcb.state = .fin_wait_1;
                     _ = sendSegment(tcb, FIN | ACK, undefined, 0);
-                    serial.writeString("[tcp] shutdown FIN → FIN_WAIT_1\n");
+                    tcpLog("[tcp] shutdown FIN → FIN_WAIT_1\n");
                 },
                 .close_wait => {
                     tcb.state = .last_ack;
                     _ = sendSegment(tcb, FIN | ACK, undefined, 0);
-                    serial.writeString("[tcp] shutdown FIN → LAST_ACK\n");
+                    tcpLog("[tcp] shutdown FIN → LAST_ACK\n");
                 },
                 else => {},
             }
@@ -1777,12 +1814,12 @@ pub fn tcpShutdown(tcb_idx: u32, how: u32) i64 {
                 .established => {
                     tcb.state = .fin_wait_1;
                     _ = sendSegment(tcb, FIN | ACK, undefined, 0);
-                    serial.writeString("[tcp] shutdown RDWR FIN → FIN_WAIT_1\n");
+                    tcpLog("[tcp] shutdown RDWR FIN → FIN_WAIT_1\n");
                 },
                 .close_wait => {
                     tcb.state = .last_ack;
                     _ = sendSegment(tcb, FIN | ACK, undefined, 0);
-                    serial.writeString("[tcp] shutdown RDWR FIN → LAST_ACK\n");
+                    tcpLog("[tcp] shutdown RDWR FIN → LAST_ACK\n");
                 },
                 else => {
                     tcb.state = .closed;

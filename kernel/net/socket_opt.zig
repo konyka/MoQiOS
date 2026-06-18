@@ -62,17 +62,17 @@ fn resolveTcpIdx(fd: u64) ?u32 {
     return t.fd_table.fds[fd_u32].tcb_idx;
 }
 
-fn resolveTcpOpts(fd: u64) ?*SocketOptions {
-    const tcb_idx = resolveTcpIdx(fd) orelse return null;
-    const tcp_mod = @import("tcp.zig");
-    return tcp_mod.tcpGetOptionsPtr(tcb_idx);
-}
+// v53.14: resolveTcpOpts removed — use resolveTcpIdx + tcpGetOptions/tcpSetOptions instead
 
 // ─── setsockopt syscall ───────────────────────────────────────────────────
 
 pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen: u64) i64 {
-    const opts = resolveTcpOpts(fd) orelse return -88; // ENOTSOCK
-    const tcb_idx = resolveTcpIdx(fd).?; // guaranteed valid since resolveTcpOpts succeeded
+    const tcb_idx = resolveTcpIdx(fd) orelse return -88; // ENOTSOCK
+    const tcp_mod = @import("tcp.zig");
+    // v53.14: Work on a copy, write back under lock at the end — no raw pointer escape
+    var opts = tcp_mod.tcpGetOptions(tcb_idx) orelse return -88;
+    var need_flush_cork = false;
+    var need_flush_ack = false;
 
     // Validate optval pointer
     if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT
@@ -153,8 +153,7 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
                 // Uncorking triggers flush of any pending data
                 if (opts.tcp_cork and !new_cork) {
                     opts.tcp_cork = false;
-                    const tcp_mod = @import("tcp.zig");
-                    tcp_mod.tcpFlushCork(tcb_idx);
+                    need_flush_cork = true;
                 } else {
                     opts.tcp_cork = new_cork;
                 }
@@ -166,8 +165,7 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
                 opts.tcp_quickack = bo.readU32Le(&buf) != 0;
                 // Setting quickack immediately flushes any pending delayed ACK
                 if (opts.tcp_quickack) {
-                    const tcp_mod = @import("tcp.zig");
-                    tcp_mod.tcpFlushAck(tcb_idx);
+                    need_flush_ack = true;
                 }
             },
             TCP_KEEPIDLE => {
@@ -194,13 +192,20 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
         return -92; // ENOPROTOOPT — unknown level
     }
 
+    // v53.14: Write back options under tcp_lock, then flush outside the option lock
+    _ = tcp_mod.tcpSetOptions(tcb_idx, opts);
+    if (need_flush_cork) tcp_mod.tcpFlushCork(tcb_idx);
+    if (need_flush_ack) tcp_mod.tcpFlushAck(tcb_idx);
     return 0;
 }
 
 // ─── getsockopt syscall ───────────────────────────────────────────────────
 
 pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_ptr: u64) i64 {
-    const opts = resolveTcpOpts(fd) orelse return -88; // ENOTSOCK
+    const tcb_idx = resolveTcpIdx(fd) orelse return -88; // ENOTSOCK
+    const tcp_mod = @import("tcp.zig");
+    // v53.14: Work on a locked copy — no raw pointer escape
+    const opts = tcp_mod.tcpGetOptions(tcb_idx) orelse return -88;
 
     if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT
 
@@ -253,7 +258,7 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
             SO_ERROR => {
                 val_len = 4;
                 bo.writeI32Le(val_buf[0..4], opts.so_error);
-                opts.so_error = 0; // SO_ERROR is one-shot: reading clears it
+                tcp_mod.tcpClearSoError(tcb_idx); // v53.14: Clear under lock (one-shot)
             },
             SO_LINGER => {
                 val_len = 8;

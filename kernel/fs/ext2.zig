@@ -110,6 +110,11 @@ var inodes_per_group: u32 = 0;
 var inode_size: u32 = 0;
 var first_data_block: u32 = 0;
 
+// v53.14: Batch mode flag — when true, freeBlock skips writeGroupDescs/writeSuperblock.
+// Callers set this before批量释放块, then flush once at the end. Saves O(N) disk I/O for
+// large file deletion/truncation (100MB file: 128K I/O → 2 I/O).
+var batch_free_mode: bool = false;
+
 const DISK_LBA_OFFSET: u64 = 32768;
 
 var group_descs_phys: u64 = 0;
@@ -1157,6 +1162,13 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
     }
 
     // Shrinking: free blocks beyond new_size
+    // v53.14: Batch mode — defer writeGroupDescs/writeSuperblock
+    batch_free_mode = true;
+    defer {
+        batch_free_mode = false;
+        writeGroupDescs();
+        writeSuperblock();
+    }
     const new_blocks_needed = if (new_size == 0) 0 else (new_size + block_size - 1) / block_size;
     const ptrs_per_block = block_size / 4;
     const page_cache = @import("page_cache.zig");
@@ -1215,6 +1227,13 @@ pub fn truncateByInode(inode_num: u32, new_size: u32) bool {
         return true;
     }
 
+    // v53.14: Batch mode — defer writeGroupDescs/writeSuperblock
+    batch_free_mode = true;
+    defer {
+        batch_free_mode = false;
+        writeGroupDescs();
+        writeSuperblock();
+    }
     // v53.4: invalidate page cache for this inode before freeing blocks
     const page_cache = @import("page_cache.zig");
     page_cache.invalidateInode(inode_num);
@@ -1977,6 +1996,8 @@ pub fn createDir(name: []const u8) i64 {
 // ─── Block / inode deallocation ────────────────────────────────────────────
 
 /// Mark a data block as free in the bitmap.
+/// v53.14: When batch_free_mode is true, skips writeGroupDescs/writeSuperblock.
+/// Caller must call writeGroupDescs() + writeSuperblock() after batch operations.
 fn freeBlock(block_num: u32) void {
     const group = (block_num - first_data_block) / sb.blocks_per_group;
     const index = (block_num - first_data_block) % sb.blocks_per_group;
@@ -1998,10 +2019,13 @@ fn freeBlock(block_num: u32) void {
     if (!writeBlock(bitmap_block, buf)) return;
 
     gd.bg_free_blocks_count += 1;
-    writeGroupDescs();
-
     sb.free_blocks_count += 1;
-    writeSuperblock();
+
+    // v53.14: Skip expensive disk flushes during batch operations
+    if (!batch_free_mode) {
+        writeGroupDescs();
+        writeSuperblock();
+    }
 }
 
 /// Mark an inode as free in the bitmap.
@@ -2126,6 +2150,13 @@ pub fn unlinkFile(path: []const u8) bool {
         _ = writeInode(file_inode_num, &file_inode);
     } else {
         // Last link: free data blocks
+        // v53.14: Batch mode — defer writeGroupDescs/writeSuperblock to end of block-freeing
+        batch_free_mode = true;
+        defer {
+            batch_free_mode = false;
+            writeGroupDescs();
+            writeSuperblock();
+        }
         // v53.5: invalidate page cache before freeing blocks
         const page_cache = @import("page_cache.zig");
         page_cache.invalidateInode(file_inode_num);

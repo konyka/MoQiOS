@@ -209,11 +209,32 @@ pub fn swapIn(pte_val: u64) ?u64 {
 /// Scans user page tables for candidate pages to swap out.
 /// Returns the number of pages swapped out.
 /// v53.11: Uses clock_hand for persistent scan position — distributes swap pressure across address space.
+/// v53.14: Two-pass scan — pass 1 clears Accessed bits (second chance), pass 2 swaps
+/// pages whose Accessed bits were cleared. Prevents OOM when working set is large.
 pub fn reclaimPages(pml4_phys: u64, target: u32) u32 {
     if (!swap_enabled) return 0;
 
     var swapped: u32 = 0;
-    var pte_scanned: u32 = 0; // v53.13: Limit total PTEs scanned to avoid blocking allocPage caller too long
+
+    var pass: u32 = 0;
+    while (pass < 2 and swapped < target) : (pass += 1) {
+        swapped += reclaimScanPass(pml4_phys, target - swapped);
+    }
+
+    if (swapped > 0) {
+        serial.writeString("[swap] Reclaimed ");
+        fmt.writeDecimal(swapped);
+        serial.writeString(" pages\n");
+    }
+
+    return swapped;
+}
+
+/// Single-pass scan for reclaimable pages.
+/// v53.13: MAX_PTE_SCAN limits total PTEs scanned per pass to avoid blocking allocPage caller.
+fn reclaimScanPass(pml4_phys: u64, target: u32) u32 {
+    var swapped: u32 = 0;
+    var pte_scanned: u32 = 0;
     const MAX_PTE_SCAN: u32 = 65536; // ~256MB of virtual address space per reclaim pass
     const pml4: [*]u64 = @ptrFromInt(hhdm.physToVirt(pml4_phys));
 
@@ -275,12 +296,6 @@ pub fn reclaimPages(pml4_phys: u64, target: u32) u32 {
                 }
             }
         }
-    }
-
-    if (swapped > 0) {
-        serial.writeString("[swap] Reclaimed ");
-        fmt.writeDecimal(swapped);
-        serial.writeString(" pages\n");
     }
 
     return swapped;
