@@ -151,7 +151,7 @@ pub const RcvdFis = extern struct {
 pub const AhciRequest = struct {
     lba: u64,
     sector_count: u32,
-    buffer: [*]u8,
+    buffer: [*]const u8,
     is_write: bool,
     completed: bool,
     has_error: bool,
@@ -1149,7 +1149,7 @@ fn writeSectorsToPort(port_idx: u32, lba: u64, count: u32, buf: [*]const u8) i64
     const port_base = ports[port_idx].port_base;
 
     if (ports[port_idx].ncq_supported) {
-        return writeNcq(port_idx, lba, count, @ptrCast(buf));
+        return writeNcq(port_idx, lba, count, @constCast(buf));
     }
 
     // Non-NCQ fallback: legacy DMA polling
@@ -1209,7 +1209,7 @@ fn writeSectorsToPort(port_idx: u32, lba: u64, count: u32, buf: [*]const u8) i64
 }
 
 /// NCQ write: uses WRITE FPDMA QUEUED command.
-fn writeNcq(port_idx: u32, lba: u64, count: u32, buf: [*]u8) i64 {
+fn writeNcq(port_idx: u32, lba: u64, count: u32, buf: [*]const u8) i64 {
     const port_base = ports[port_idx].port_base;
 
     // Allocate NCQ tag

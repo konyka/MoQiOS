@@ -140,6 +140,10 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         // Drive POSIX timer expiration checks
         const posix_timer = @import("../ipc/posix_timer.zig");
         posix_timer.timerTick(idt.getTickCount());
+        // v53.12: Drive TCP timer (retransmission, TIME_WAIT/FIN_WAIT_2 timeout, delayed ACK)
+        // LAPIC fires at ~100Hz (10ms/tick), REAP_INTERVAL=10 ticks → ~100ms per maintenance pass
+        const tcp = @import("../net/tcp.zig");
+        tcp.timerTick(100);
         // Drive alarm() / setitimer(ITIMER_REAL) expiration checks
         {
             const tsc = @import("../arch/x86_64/tsc.zig");

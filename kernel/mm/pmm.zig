@@ -20,6 +20,9 @@ var highest_phys: u64 = 0;
 var ref_counts: [*]u16 = undefined;
 var lock: IrqSpinlock = .{};
 
+// v53.12: Guard against recursive swap reclaim (reclaimPages → swapOut → allocPage)
+var in_swap_reclaim: bool = false;
+
 /// Skip first 2 MB (512 pages) — legacy BIOS area.
 const MIN_ALLOC_PAGE: u64 = 512;
 
@@ -157,12 +160,37 @@ pub fn init(memmap: *const limine.MemmapResponse) void {
 
 /// Allocate a single 4KB physical page. Returns physical address or null.
 /// Uses word-at-a-time bitmap scanning for performance (64 pages per iteration).
+/// v53.12: On OOM, attempts swap reclaim before returning null.
 pub fn allocPage() ?u64 {
-    const flags = lock.acquire();
-    defer lock.release(flags);
+    {
+        const flags = lock.acquire();
+        const result = allocPageLocked();
+        lock.release(flags);
+        if (result != null) return result;
+    }
 
-    const result = allocPageLocked();
-    return result;
+    // v53.12: OOM — try swap reclaim before giving up
+    if (!in_swap_reclaim) {
+        const swap = @import("swap.zig");
+        if (swap.isEnabled()) {
+            in_swap_reclaim = true;
+            defer in_swap_reclaim = false;
+
+            const sched = @import("../proc/sched.zig");
+            if (sched.currentTask()) |t| {
+                if (t.page_table_phys != 0) {
+                    _ = swap.reclaimPages(t.page_table_phys, 32);
+                    // Retry allocation after reclaim
+                    const flags = lock.acquire();
+                    const result = allocPageLocked();
+                    lock.release(flags);
+                    return result;
+                }
+            }
+        }
+    }
+
+    return null;
 }
 
 /// Inner allocation — caller must hold lock.

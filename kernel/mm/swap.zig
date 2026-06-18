@@ -216,9 +216,11 @@ pub fn reclaimPages(pml4_phys: u64, target: u32) u32 {
     const pml4: [*]u64 = @ptrFromInt(hhdm.physToVirt(pml4_phys));
 
     // v53.11: Start from clock_hand and wrap around — ensures fair page reclaim across address space
+    // v53.12: Use atomic access for SMP safety
+    const hand = @atomicLoad(u32, &clock_hand, .acquire);
     for (0..256) |offset| {
         if (swapped >= target) break;
-        const pml4_idx = (clock_hand + @as(u32, @intCast(offset))) % 256;
+        const pml4_idx = (hand + @as(u32, @intCast(offset))) % 256;
         if (pml4[pml4_idx] & 1 == 0) continue;
 
         const pdpt_phys = pml4[pml4_idx] & 0xFFFF_FFFF_F000;
@@ -261,8 +263,8 @@ pub fn reclaimPages(pml4_phys: u64, target: u32) u32 {
 
                     if (swapOut(pml4_phys, virt_addr, &pt[pt_idx])) {
                         swapped += 1;
-                        // v53.11: Advance clock hand — next reclaim starts from here
-                        clock_hand = (pml4_idx + 1) % 256;
+                        // v53.12: Advance clock hand atomically — next reclaim starts from here
+                        @atomicStore(u32, &clock_hand, (pml4_idx + 1) % 256, .release);
                     }
                 }
             }

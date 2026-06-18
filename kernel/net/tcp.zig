@@ -1449,8 +1449,8 @@ pub fn timerTick(ms_elapsed: u32) void {
                 } else if (tcb.state == .syn_sent) {
                     // Retransmit SYN
                     _ = sendSegment(tcb, SYN, undefined, 0);
-                } else if (tcb.state == .fin_wait_1 or tcb.state == .last_ack) {
-                    // Retransmit FIN
+                } else if (tcb.state == .fin_wait_1 or tcb.state == .last_ack or tcb.state == .closing) {
+                    // v53.12: Include .closing — FIN must be retransmitted if ACK is lost
                     _ = sendSegment(tcb, FIN | ACK, undefined, 0);
                 }
                 serial.writeString("[tcp] RTO retransmit\n");
