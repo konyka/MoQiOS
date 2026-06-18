@@ -170,12 +170,12 @@ pub fn allocPage() ?u64 {
     }
 
     // v53.12: OOM — try swap reclaim before giving up
-    if (!in_swap_reclaim) {
+    // v53.13: Use atomic CAS to ensure only one CPU enters reclaim at a time
+    if (@cmpxchgStrong(bool, &in_swap_reclaim, false, true, .acquire, .monotonic) == null) {
+        defer @atomicStore(bool, &in_swap_reclaim, false, .release);
+
         const swap = @import("swap.zig");
         if (swap.isEnabled()) {
-            in_swap_reclaim = true;
-            defer in_swap_reclaim = false;
-
             const sched = @import("../proc/sched.zig");
             if (sched.currentTask()) |t| {
                 if (t.page_table_phys != 0) {

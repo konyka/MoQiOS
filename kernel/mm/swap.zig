@@ -213,6 +213,8 @@ pub fn reclaimPages(pml4_phys: u64, target: u32) u32 {
     if (!swap_enabled) return 0;
 
     var swapped: u32 = 0;
+    var pte_scanned: u32 = 0; // v53.13: Limit total PTEs scanned to avoid blocking allocPage caller too long
+    const MAX_PTE_SCAN: u32 = 65536; // ~256MB of virtual address space per reclaim pass
     const pml4: [*]u64 = @ptrFromInt(hhdm.physToVirt(pml4_phys));
 
     // v53.11: Start from clock_hand and wrap around — ensures fair page reclaim across address space
@@ -228,6 +230,7 @@ pub fn reclaimPages(pml4_phys: u64, target: u32) u32 {
 
         for (0..512) |pdpt_idx| {
             if (swapped >= target) break;
+            if (pte_scanned >= MAX_PTE_SCAN) break; // v53.13: Scan limit
             if (pdpt[pdpt_idx] & 1 == 0) continue;
 
             const pd_phys = pdpt[pdpt_idx] & 0xFFFF_FFFF_F000;
@@ -235,6 +238,7 @@ pub fn reclaimPages(pml4_phys: u64, target: u32) u32 {
 
             for (0..512) |pd_idx| {
                 if (swapped >= target) break;
+                if (pte_scanned >= MAX_PTE_SCAN) break; // v53.13: Scan limit
                 if (pd[pd_idx] & 1 == 0) continue;
 
                 const pt_phys = pd[pd_idx] & 0xFFFF_FFFF_F000;
@@ -242,6 +246,8 @@ pub fn reclaimPages(pml4_phys: u64, target: u32) u32 {
 
                 for (0..512) |pt_idx| {
                     if (swapped >= target) break;
+                    if (pte_scanned >= MAX_PTE_SCAN) break; // v53.13: Scan limit
+                    pte_scanned += 1;
                     const pte = pt[pt_idx];
                     if ((pte & 1) == 0) continue; // Not present
                     if (pte & (1 << 63) == 0) continue; // v53.6: Skip executable pages (NX=0 means code, NX=1 means data — swap data pages only)

@@ -23,6 +23,13 @@ const arp = @import("arp.zig");
 const serial = @import("../arch/x86_64/serial.zig");
 const socket_opt = @import("socket_opt.zig");
 const bo = @import("../lib/byte_order.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+
+// v53.13: Global TCP lock — protects TCB array, tcb_active_bitmap, and all TCB fields.
+// Lock order: tcp_lock → e1000.tx_lock (sendSegment acquires tx_lock internally).
+// Acquired at the entry of every public function; private helpers (sendSegment, flushSendBuffer,
+// processIncomingData, allocTcb, deactivateTcb) are called from within the lock and must NOT re-acquire.
+var tcp_lock: IrqSpinlock = .{};
 
 // ─── Constants ────────────────────────────────────────────────────────────
 
@@ -730,6 +737,10 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
     _ = dst_ip;
     if (len < 20) return;
 
+    // v53.13: Acquire TCP lock for the entire packet processing
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+
     // Parse TCP header
     const src_port = bo.readU16BeAt(data, 0);
     const dst_port = bo.readU16BeAt(data, 2);
@@ -1139,6 +1150,8 @@ fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) void
 /// Create a new TCP connection (client connect).
 /// Returns tcb index (0-based) or -1 on error.
 pub fn tcpConnect(remote_ip: [4]u8, remote_port: u16, owner_task: u32) i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     const tcb = allocTcb() orelse return -1;
 
     tcb.local_port = allocEphemeralPort();
@@ -1168,6 +1181,8 @@ pub fn tcpConnect(remote_ip: [4]u8, remote_port: u16, owner_task: u32) i64 {
 // Connect an existing socket TCB to a remote address.
 // Returns 0 on success (SYN sent), -1 on failure.
 pub fn tcpConnectSocket(tcb_idx: u32, remote_ip: [4]u8, remote_port: u16) i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active or tcb.state != .closed) return -1;
@@ -1201,6 +1216,8 @@ pub fn tcpConnectSocket(tcb_idx: u32, remote_ip: [4]u8, remote_port: u16) i64 {
 ///  1 = established
 /// -1 = error / closed
 pub fn tcpPoll(tcb_idx: u32) i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return -1;
@@ -1214,6 +1231,8 @@ pub fn tcpPoll(tcb_idx: u32) i64 {
 /// Send data on an established connection.
 /// Returns number of bytes queued, or -1 on error.
 pub fn tcpSend(tcb_idx: u32, data: [*]const u8, len: u32) i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active or tcb.state != .established) return -1;
@@ -1269,6 +1288,8 @@ fn flushSendBuffer(tcb: *TcpTcb) void {
 /// Receive data from an established connection.
 /// Returns number of bytes read, 0 if none available, -1 on error/closed.
 pub fn tcpRecv(tcb_idx: u32, buf: [*]u8, len: u32) i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return -1;
@@ -1300,6 +1321,8 @@ pub fn tcpRecv(tcb_idx: u32, buf: [*]u8, len: u32) i64 {
 /// Flush corked data — called when TCP_CORK is disabled (uncorked).
 /// Sends any pending partial segment immediately.
 pub fn tcpFlushCork(tcb_idx: u32) void {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active or tcb.state != .established) return;
@@ -1308,6 +1331,8 @@ pub fn tcpFlushCork(tcb_idx: u32) void {
 
 /// Flush pending delayed ACK — called when TCP_QUICKACK is enabled.
 pub fn tcpFlushAck(tcb_idx: u32) void {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return;
@@ -1321,6 +1346,8 @@ pub fn tcpFlushAck(tcb_idx: u32) void {
 /// Close a TCP connection (initiates four-way close).
 /// When SO_LINGER is set with l_onoff=1 and l_linger=0, sends RST (abortive close).
 pub fn tcpClose(tcb_idx: u32) i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return -1;
@@ -1355,6 +1382,8 @@ pub fn tcpClose(tcb_idx: u32) i64 {
 
 /// Get TCP connection state as integer.
 pub fn tcpState(tcb_idx: u32) u8 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return 0;
     if (!tcbs[tcb_idx].active) return 0;
     return @intFromEnum(tcbs[tcb_idx].state);
@@ -1362,12 +1391,16 @@ pub fn tcpState(tcb_idx: u32) u8 {
 
 /// Check if connection is established.
 pub fn isEstablished(tcb_idx: u32) bool {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return false;
     return tcbs[tcb_idx].active and tcbs[tcb_idx].state == .established;
 }
 
 /// Check if connection is fully closed.
 pub fn isClosed(tcb_idx: u32) bool {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return true;
     return !tcbs[tcb_idx].active or tcbs[tcb_idx].state == .closed;
 }
@@ -1375,6 +1408,9 @@ pub fn isClosed(tcb_idx: u32) bool {
 /// Timer tick — called periodically to handle retransmission.
 /// Uses the per-TCB RTO (Jacobson/Karels) instead of a fixed timeout.
 pub fn timerTick(ms_elapsed: u32) void {
+    // v53.13: Acquire TCP lock for the entire timer tick
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     var bm = tcb_active_bitmap;
     while (bm != 0) {
         const idx = @ctz(bm);
@@ -1446,6 +1482,12 @@ pub fn timerTick(ms_elapsed: u32) void {
                     // Re-send from beginning of pending data
                     tcb.send_unacked = tcb.send_head;
                     flushSendBuffer(tcb);
+                    // v53.13: If all pending data has been retransmitted, also retransmit FIN
+                    if (tcb.send_unacked == tcb.send_tail) {
+                        if (tcb.state == .fin_wait_1 or tcb.state == .last_ack or tcb.state == .closing) {
+                            _ = sendSegment(tcb, FIN | ACK, undefined, 0);
+                        }
+                    }
                 } else if (tcb.state == .syn_sent) {
                     // Retransmit SYN
                     _ = sendSegment(tcb, SYN, undefined, 0);
@@ -1538,6 +1580,8 @@ pub fn tcpSocket(owner_task: u32) i64 {
 /// Bind a TCB to a local port.
 /// Returns 0 on success, -1 on failure.
 pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active or tcb.state != .closed) return -1;
@@ -1563,6 +1607,8 @@ pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
 /// Start listening for connections on a bound TCB.
 /// Returns 0 on success, -1 on failure.
 pub fn tcpListen(tcb_idx: u32) i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active or tcb.local_port == 0) return -1;
@@ -1586,6 +1632,8 @@ pub fn tcpListen(tcb_idx: u32) i64 {
 /// Accept a pending connection on a listening socket.
 /// Returns new TCB index (>= 0) for the accepted connection, -1 if none pending.
 pub fn tcpAccept(tcb_idx: u32, owner_task: u32) i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active or tcb.state != .listen) return -1;
@@ -1627,6 +1675,8 @@ pub fn tcpAccept(tcb_idx: u32, owner_task: u32) i64 {
 
 /// Get the TCB index for a socket fd.
 pub fn getTcbIdx(tcb_idx: u32) ?u32 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return null;
     if (!tcbs[tcb_idx].active) return null;
     return tcb_idx;
@@ -1634,6 +1684,8 @@ pub fn getTcbIdx(tcb_idx: u32) ?u32 {
 
 /// Return the number of bytes available to read in the receive buffer.
 pub fn tcpRecvAvailable(tcb_idx: u32) u32 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return 0;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return 0;
@@ -1642,6 +1694,8 @@ pub fn tcpRecvAvailable(tcb_idx: u32) u32 {
 
 /// Return the number of bytes of free space in the send buffer.
 pub fn tcpSendSpace(tcb_idx: u32) u32 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return 0;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return 0;
@@ -1650,6 +1704,8 @@ pub fn tcpSendSpace(tcb_idx: u32) u32 {
 
 /// Check if the TCP connection is in a closing state.
 pub fn tcpIsClosing(tcb_idx: u32) bool {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return true;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return true;
@@ -1669,6 +1725,8 @@ pub const AddrInfo = struct {
 
 /// Get address info for a TCB (for getsockname/getpeername).
 pub fn tcpGetAddrInfo(tcb_idx: u32) ?AddrInfo {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return null;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return null;
@@ -1684,6 +1742,8 @@ pub fn tcpGetAddrInfo(tcb_idx: u32) ?AddrInfo {
 /// Shutdown one direction of a TCP connection.
 /// how: 0=SHUT_RD, 1=SHUT_WR, 2=SHUT_RDWR
 pub fn tcpShutdown(tcb_idx: u32, how: u32) i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return -1;
