@@ -301,6 +301,10 @@ fn readBlockCached(block_num: u32, buf: [*]u8) bool {
         if (cache[slot].dirty) {
             if (writeBlockUncached(cache[slot].block_num, &cache[slot].data)) {
                 cache[slot].dirty = false;
+            } else {
+                // v53.18: Writeback failed — re-insert old entry, skip caching
+                cacheHashInsert(slot);
+                return readBlockUncached(block_num, buf);
             }
         }
     }
@@ -330,6 +334,10 @@ fn writeBlockCached(block_num: u32, buf: [*]const u8) bool {
                 if (cache[slot].dirty) {
                     if (writeBlockUncached(cache[slot].block_num, &cache[slot].data)) {
                         cache[slot].dirty = false;
+                    } else {
+                        // v53.18: Writeback failed — re-insert old entry, skip caching
+                        cacheHashInsert(slot);
+                        return writeBlockUncached(block_num, buf);
                     }
                 }
             }
@@ -363,6 +371,10 @@ fn writeBlockBatch(block_num: u32, buf: [*]const u8) bool {
         if (cache[slot].dirty) {
             if (writeBlockUncached(cache[slot].block_num, &cache[slot].data)) {
                 cache[slot].dirty = false;
+            } else {
+                // v53.18: Writeback failed — re-insert old entry, fall back to sync write
+                cacheHashInsert(slot);
+                return writeBlockUncached(block_num, buf);
             }
         }
     }
@@ -2251,85 +2263,21 @@ pub fn unlinkFile(path: []const u8) bool {
                 }
             }
 
-            // Free single indirect block (block[12]) and all blocks it points to
+            // v53.18: Use helper functions instead of inlined code — fixes orelse break
+            // silent space leak on OOM (helper functions use orelse return false)
+            const ptrs_per_block = block_size / 4;
             if (file_inode.block[12] != 0) {
-                const ib_phys = pmm.allocPage() orelse return false;
-                const ib: [*]u8 = @ptrFromInt(hhdm.physToVirt(ib_phys));
-                if (readBlock(file_inode.block[12], ib)) {
-                    const ptrs_per_block = block_size / 4;
-                    const ptrs: [*]const u32 = @ptrCast(@alignCast(ib));
-                    for (0..ptrs_per_block) |i| {
-                        if (ptrs[i] != 0) freeBlock(ptrs[i]);
-                    }
-                }
-                pmm.freePage(ib_phys);
-                freeBlock(file_inode.block[12]);
+                if (!freeSingleIndirectTree(file_inode.block[12], ptrs_per_block)) return false;
             }
 
             // Free double indirect block (block[13]) and all blocks it points to
-            // v53.2: recurse through single indirect blocks, free their data blocks
             if (file_inode.block[13] != 0) {
-                const dib_phys = pmm.allocPage() orelse return false;
-                const dib: [*]u8 = @ptrFromInt(hhdm.physToVirt(dib_phys));
-                if (readBlock(file_inode.block[13], dib)) {
-                    const ptrs_per_block = block_size / 4;
-                    const dib_ptrs: [*]const u32 = @ptrCast(@alignCast(dib));
-                    for (0..ptrs_per_block) |k| {
-                        if (dib_ptrs[k] != 0) {
-                            const sib_phys = pmm.allocPage() orelse break;
-                            const sib: [*]u8 = @ptrFromInt(hhdm.physToVirt(sib_phys));
-                            if (readBlock(dib_ptrs[k], sib)) {
-                                const sib_ptrs: [*]const u32 = @ptrCast(@alignCast(sib));
-                                for (0..ptrs_per_block) |m| {
-                                    if (sib_ptrs[m] != 0) freeBlock(sib_ptrs[m]);
-                                }
-                            }
-                            pmm.freePage(sib_phys);
-                            freeBlock(dib_ptrs[k]);
-                        }
-                    }
-                }
-                pmm.freePage(dib_phys);
-                freeBlock(file_inode.block[13]);
+                if (!freeDoubleIndirectTree(file_inode.block[13], ptrs_per_block)) return false;
             }
 
             // v53.5: Free triple indirect block (block[14]) and all blocks it points to
             if (file_inode.block[14] != 0) {
-                const tib_phys = pmm.allocPage() orelse return false;
-                const tib: [*]u8 = @ptrFromInt(hhdm.physToVirt(tib_phys));
-                if (readBlock(file_inode.block[14], tib)) {
-                    const ptrs_per_block = block_size / 4;
-                    const tib_ptrs: [*]const u32 = @ptrCast(@alignCast(tib));
-                    for (0..ptrs_per_block) |i| {
-                        if (tib_ptrs[i] != 0) {
-                            // Level 2: double indirect block
-                            const dib_phys2 = pmm.allocPage() orelse break;
-                            const dib2: [*]u8 = @ptrFromInt(hhdm.physToVirt(dib_phys2));
-                            if (readBlock(tib_ptrs[i], dib2)) {
-                                const dib2_ptrs: [*]const u32 = @ptrCast(@alignCast(dib2));
-                                for (0..ptrs_per_block) |j| {
-                                    if (dib2_ptrs[j] != 0) {
-                                        // Level 3: single indirect block
-                                        const sib_phys2 = pmm.allocPage() orelse break;
-                                        const sib2: [*]u8 = @ptrFromInt(hhdm.physToVirt(sib_phys2));
-                                        if (readBlock(dib2_ptrs[j], sib2)) {
-                                            const sib2_ptrs: [*]const u32 = @ptrCast(@alignCast(sib2));
-                                            for (0..ptrs_per_block) |k| {
-                                                if (sib2_ptrs[k] != 0) freeBlock(sib2_ptrs[k]);
-                                            }
-                                        }
-                                        pmm.freePage(sib_phys2);
-                                        freeBlock(dib2_ptrs[j]);
-                                    }
-                                }
-                            }
-                            pmm.freePage(dib_phys2);
-                            freeBlock(tib_ptrs[i]);
-                        }
-                    }
-                }
-                pmm.freePage(tib_phys);
-                freeBlock(file_inode.block[14]);
+                if (!freeTripleIndirectTree(file_inode.block[14], ptrs_per_block)) return false;
             }
         }
 
