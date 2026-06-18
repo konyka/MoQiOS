@@ -303,8 +303,9 @@ fn readBlockCached(block_num: u32, buf: [*]u8) bool {
                 cache[slot].dirty = false;
             } else {
                 // v53.18: Writeback failed — re-insert old entry, skip caching
+                // v53.19: buf already filled at L290, no need to re-read
                 cacheHashInsert(slot);
-                return readBlockUncached(block_num, buf);
+                return true;
             }
         }
     }
@@ -2079,20 +2080,34 @@ fn freeBlock(block_num: u32) void {
     const gd = &gds[group];
     const bitmap_block = gd.bg_block_bitmap;
 
-    const buf_phys = pmm.allocPage() orelse return;
-    defer pmm.freePage(buf_phys);
-    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
-
-    if (!readBlock(bitmap_block, buf)) return;
-
     const byte_idx = index / 8;
     const bit_idx: u3 = @intCast(index % 8);
-    buf[byte_idx] &= ~(@as(u8, 1) << bit_idx);
 
-    if (batch_free_depth > 0) {
-        if (!writeBlockBatch(bitmap_block, buf)) return;
+    // v53.19: Zero-copy path — if bitmap block is cached, modify directly in cache
+    // (eliminates allocPage/freePage + 2 memcpy per call; ~25K calls for 100MB file)
+    if (cacheLookup(bitmap_block)) |idx| {
+        cache[idx].data[byte_idx] &= ~(@as(u8, 1) << bit_idx);
+        if (batch_free_depth > 0) {
+            cache[idx].dirty = true;
+        } else {
+            if (writeBlockUncached(bitmap_block, &cache[idx].data)) {
+                cache[idx].dirty = false;
+            }
+        }
     } else {
-        if (!writeBlock(bitmap_block, buf)) return;
+        // Not cached — fall back to alloc-page-read-modify-write
+        const buf_phys = pmm.allocPage() orelse return;
+        defer pmm.freePage(buf_phys);
+        const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+
+        if (!readBlock(bitmap_block, buf)) return;
+        buf[byte_idx] &= ~(@as(u8, 1) << bit_idx);
+
+        if (batch_free_depth > 0) {
+            if (!writeBlockBatch(bitmap_block, buf)) return;
+        } else {
+            if (!writeBlock(bitmap_block, buf)) return;
+        }
     }
 
     gd.bg_free_blocks_count += 1;
@@ -2114,20 +2129,33 @@ fn freeInode(inode_num: u32) void {
     const gd = &gds[group];
     const bitmap_block = gd.bg_inode_bitmap;
 
-    const buf_phys = pmm.allocPage() orelse return;
-    defer pmm.freePage(buf_phys);
-    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
-
-    if (!readBlock(bitmap_block, buf)) return;
-
     const byte_idx = index / 8;
     const bit_idx: u3 = @intCast(index % 8);
-    buf[byte_idx] &= ~(@as(u8, 1) << bit_idx);
 
-    if (batch_free_depth > 0) {
-        if (!writeBlockBatch(bitmap_block, buf)) return;
+    // v53.19: Zero-copy path — if bitmap block is cached, modify directly in cache
+    if (cacheLookup(bitmap_block)) |idx| {
+        cache[idx].data[byte_idx] &= ~(@as(u8, 1) << bit_idx);
+        if (batch_free_depth > 0) {
+            cache[idx].dirty = true;
+        } else {
+            if (writeBlockUncached(bitmap_block, &cache[idx].data)) {
+                cache[idx].dirty = false;
+            }
+        }
     } else {
-        if (!writeBlock(bitmap_block, buf)) return;
+        // Not cached — fall back to alloc-page-read-modify-write
+        const buf_phys = pmm.allocPage() orelse return;
+        defer pmm.freePage(buf_phys);
+        const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+
+        if (!readBlock(bitmap_block, buf)) return;
+        buf[byte_idx] &= ~(@as(u8, 1) << bit_idx);
+
+        if (batch_free_depth > 0) {
+            if (!writeBlockBatch(bitmap_block, buf)) return;
+        } else {
+            if (!writeBlock(bitmap_block, buf)) return;
+        }
     }
 
     gd.bg_free_inodes_count += 1;
