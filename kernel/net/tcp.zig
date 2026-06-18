@@ -1072,7 +1072,8 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
             }
         },
         .closing => {
-            if (flags & ACK != 0) {
+            // v53.11: Only transition to TIME_WAIT when our FIN is actually ACKed (ack_num >= snd_nxt)
+            if (flags & ACK != 0 and ack_num >= tcb.snd_nxt) {
                 tcb.retransmit_timer = 0; // v53.10: Reset for TIME_WAIT 2MSL
                 tcb.state = .time_wait;
                 serial.writeString("[tcp] CLOSING → TIME_WAIT\n");
@@ -1389,6 +1390,15 @@ pub fn timerTick(ms_elapsed: u32) void {
                 deactivateTcb(tcb);
                 serial.writeString("[tcp] FIN_WAIT_2 timeout → CLOSED\n");
                 continue;
+            }
+            // v53.11: Handle delayed ACK for half-close data (peer can still send in FIN_WAIT_2)
+            if (tcb.delayed_ack_pending) {
+                tcb.delayed_ack_ms +%= ms_elapsed;
+                if (tcb.delayed_ack_ms >= DELAYED_ACK_MS) {
+                    tcb.delayed_ack_pending = false;
+                    tcb.delayed_ack_ms = 0;
+                    _ = sendSegment(tcb, ACK, undefined, 0);
+                }
             }
             continue; // v53.10: Don't fall through to retransmit logic
         }

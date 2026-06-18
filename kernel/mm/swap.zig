@@ -36,7 +36,7 @@ var swap_start_lba: u64 = 0; // Starting LBA of swap area
 var swap_enabled: bool = false;
 var swap_used: u64 = 0;
 
-// Clock hand for victim selection
+// Clock hand for victim selection — encodes pml4_idx (0-255) as starting scan position
 var clock_hand: u32 = 0;
 
 pub fn isEnabled() bool {
@@ -208,15 +208,17 @@ pub fn swapIn(pte_val: u64) ?u64 {
 /// Attempt to reclaim pages when memory is low.
 /// Scans user page tables for candidate pages to swap out.
 /// Returns the number of pages swapped out.
+/// v53.11: Uses clock_hand for persistent scan position — distributes swap pressure across address space.
 pub fn reclaimPages(pml4_phys: u64, target: u32) u32 {
     if (!swap_enabled) return 0;
 
     var swapped: u32 = 0;
     const pml4: [*]u64 = @ptrFromInt(hhdm.physToVirt(pml4_phys));
 
-    // Scan PML4 entries (user space: 0-255)
-    for (0..256) |pml4_idx| {
+    // v53.11: Start from clock_hand and wrap around — ensures fair page reclaim across address space
+    for (0..256) |offset| {
         if (swapped >= target) break;
+        const pml4_idx = (clock_hand + @as(u32, @intCast(offset))) % 256;
         if (pml4[pml4_idx] & 1 == 0) continue;
 
         const pdpt_phys = pml4[pml4_idx] & 0xFFFF_FFFF_F000;
@@ -241,7 +243,8 @@ pub fn reclaimPages(pml4_phys: u64, target: u32) u32 {
                     const pte = pt[pt_idx];
                     if ((pte & 1) == 0) continue; // Not present
                     if (pte & (1 << 63) == 0) continue; // v53.6: Skip executable pages (NX=0 means code, NX=1 means data — swap data pages only)
-                    if (pte & (1 << 6) != 0) continue; // Don't swap dirty pages (write them back first)
+                    // v53.11: Don't skip dirty pages — swapOut saves page content (dirty or not) to swap slot.
+                    // Previously dirty pages were skipped making swap ineffective for modified anonymous pages.
 
                     // Second-chance: check accessed bit
                     if (pte & (1 << 5) != 0) {
@@ -258,6 +261,8 @@ pub fn reclaimPages(pml4_phys: u64, target: u32) u32 {
 
                     if (swapOut(pml4_phys, virt_addr, &pt[pt_idx])) {
                         swapped += 1;
+                        // v53.11: Advance clock hand — next reclaim starts from here
+                        clock_hand = (pml4_idx + 1) % 256;
                     }
                 }
             }

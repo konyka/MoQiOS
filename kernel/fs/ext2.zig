@@ -1523,18 +1523,24 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
     // v53.6: Triple indirect: block[14] -> double indirect -> single indirect -> data blocks
     const tri_base = dbl_base + ptrs_per_block * ptrs_per_block;
     if (logical_block < tri_base + ptrs_per_block * ptrs_per_block * ptrs_per_block) {
-        // Ensure triple indirect block (block[14]) exists
+        // v53.11: Track just-allocated state to skip redundant readBlock (allocBlock already zeroed the block)
+        var tib_new = false;
         if (inode.block[14] == 0) {
             const tri_blk = allocBlock(0); // allocBlock already zeroes the block
             if (tri_blk == 0) return 0;
             inode.block[14] = tri_blk;
             inode.blocks += block_size / 512;
+            tib_new = true;
         }
 
         const tib_phys = pmm.allocPage() orelse return 0;
         defer pmm.freePage(tib_phys);
         const tib: [*]u8 = @ptrFromInt(hhdm.physToVirt(tib_phys));
-        if (!readBlock(inode.block[14], tib)) return 0;
+        if (tib_new) {
+            @memset(tib[0..block_size], 0); // v53.11: Skip readBlock — block just allocated and zeroed
+        } else {
+            if (!readBlock(inode.block[14], tib)) return 0;
+        }
         const tib_ptrs: [*]u32 = @ptrCast(@alignCast(tib));
 
         const rel = logical_block - tri_base;
@@ -1544,35 +1550,47 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
         const idx3 = rem1 % ptrs_per_block;
 
         // Ensure double indirect block at idx1
+        var dib_new = false;
         if (tib_ptrs[idx1] == 0) {
             const dbl_blk = allocBlock(0); // allocBlock already zeroes the block
             if (dbl_blk == 0) return 0;
             tib_ptrs[idx1] = dbl_blk;
             inode.blocks += block_size / 512;
             _ = writeBlock(inode.block[14], tib);
+            dib_new = true;
         }
 
-        // Read double indirect block
+        // Read (or zero) double indirect block
         const dib_phys = pmm.allocPage() orelse return 0;
         defer pmm.freePage(dib_phys);
         const dib: [*]u8 = @ptrFromInt(hhdm.physToVirt(dib_phys));
-        if (!readBlock(tib_ptrs[idx1], dib)) return 0;
+        if (dib_new) {
+            @memset(dib[0..block_size], 0); // v53.11: Skip readBlock
+        } else {
+            if (!readBlock(tib_ptrs[idx1], dib)) return 0;
+        }
         const dib_ptrs: [*]u32 = @ptrCast(@alignCast(dib));
 
         // Ensure single indirect block at idx2
+        var sib_new = false;
         if (dib_ptrs[idx2] == 0) {
             const si_blk = allocBlock(0); // allocBlock already zeroes the block
             if (si_blk == 0) return 0;
             dib_ptrs[idx2] = si_blk;
             inode.blocks += block_size / 512;
             _ = writeBlock(tib_ptrs[idx1], dib);
+            sib_new = true;
         }
 
-        // Read single indirect block
+        // Read (or zero) single indirect block
         const sib_phys = pmm.allocPage() orelse return 0;
         defer pmm.freePage(sib_phys);
         const sib: [*]u8 = @ptrFromInt(hhdm.physToVirt(sib_phys));
-        if (!readBlock(dib_ptrs[idx2], sib)) return 0;
+        if (sib_new) {
+            @memset(sib[0..block_size], 0); // v53.11: Skip readBlock
+        } else {
+            if (!readBlock(dib_ptrs[idx2], sib)) return 0;
+        }
         const sib_ptrs: [*]u32 = @ptrCast(@alignCast(sib));
 
         // Ensure data block at idx3
