@@ -385,6 +385,15 @@ pub fn cacheFlush() void {
     }
 }
 
+/// v53.17: Write a block using batch mode (cache-only dirty) when in batch context,
+/// otherwise synchronous write-through. Used by writeInode and truncate*IndirectTree.
+fn writeBlockMaybeBatch(block_num: u32, buf: [*]const u8) bool {
+    if (batch_free_depth > 0) {
+        return writeBlockBatch(block_num, buf);
+    }
+    return writeBlock(block_num, buf);
+}
+
 /// Return a read-only pointer to a cached block's data (zero-copy lookup).
 /// Returns null on cache miss. Caller must not hold the pointer across
 /// any other cache operation (eviction may invalidate it).
@@ -1103,7 +1112,7 @@ fn truncateSingleIndirectTree(block_num: u32, keep_blocks: u32, ptrs_per_block: 
             ptrs[idx] = 0;
         }
     }
-    return writeBlock(block_num, buf);
+    return writeBlockMaybeBatch(block_num, buf);
 }
 
 fn freeDoubleIndirectTree(block_num: u32, ptrs_per_block: u32) bool {
@@ -1146,7 +1155,7 @@ fn truncateDoubleIndirectTree(block_num: u32, keep_blocks: u32, ptrs_per_block: 
             ptrs[idx] = 0;
         }
     }
-    return writeBlock(block_num, buf);
+    return writeBlockMaybeBatch(block_num, buf);
 }
 
 fn freeTripleIndirectTree(block_num: u32, ptrs_per_block: u32) bool {
@@ -1190,7 +1199,7 @@ fn truncateTripleIndirectTree(block_num: u32, keep_blocks: u32, ptrs_per_block: 
             ptrs[idx] = 0;
         }
     }
-    return writeBlock(block_num, buf);
+    return writeBlockMaybeBatch(block_num, buf);
 }
 
 /// Truncate a file to the given length. Frees blocks beyond the new size.
@@ -1414,19 +1423,19 @@ fn writeInode(inode_num: u32, inode: *const Ext2Inode) bool {
     const copy_len = @min(inode_size, @as(u32, @sizeOf(Ext2Inode)));
     if (offset_in_block + copy_len <= block_size) {
         @memcpy(buf[offset_in_block .. offset_in_block + copy_len], inode_bytes[0..copy_len]);
-        if (!writeBlock(target_block, buf)) return false;
+        if (!writeBlockMaybeBatch(target_block, buf)) return false;
     } else {
         // Inode straddles a block boundary
         const first_part = block_size - offset_in_block;
         @memcpy(buf[offset_in_block .. offset_in_block + first_part], inode_bytes[0..first_part]);
-        if (!writeBlock(target_block, buf)) return false;
+        if (!writeBlockMaybeBatch(target_block, buf)) return false;
 
         const buf2_phys = pmm.allocPage() orelse return false;
         defer pmm.freePage(buf2_phys);
         const buf2: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf2_phys));
         if (!readBlock(target_block + 1, buf2)) return false;
         @memcpy(buf2[0 .. copy_len - first_part], inode_bytes[first_part..copy_len]);
-        if (!writeBlock(target_block + 1, buf2)) return false;
+        if (!writeBlockMaybeBatch(target_block + 1, buf2)) return false;
     }
     return true;
 }
