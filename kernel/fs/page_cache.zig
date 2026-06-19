@@ -238,6 +238,35 @@ pub fn writePage(inode_id: u64, page_offset: u64, src_data: *const [PAGE_SIZE]u8
     return pages[new_slot].data;
 }
 
+/// Update a cached page if it exists (no allocation, no PMM locks).
+/// Atomically checks + updates under cache_lock — fixes SMP TOCTOU race
+/// where readPage returns null but a concurrent insertPage caches stale data.
+/// Returns true if the page was found and updated, false if not cached.
+pub fn updateIfCached(inode_id: u64, page_offset: u64, src_data: *const [PAGE_SIZE]u8) bool {
+    const flags = cache_lock.acquire();
+    defer cache_lock.release(flags);
+
+    const key = CacheKey{ .inode_id = inode_id, .page_offset = page_offset };
+    const bucket = hashKey(key);
+
+    var slot = hash_buckets[bucket];
+    while (slot) |s| {
+        if (pages[s].valid and
+            pages[s].key.inode_id == inode_id and
+            pages[s].key.page_offset == page_offset)
+        {
+            @memcpy(pages[s].data, src_data);
+            pages[s].dirty = true;
+            pages[s].referenced = true;
+            dirtySet(s);
+            moveToHead(s);
+            return true;
+        }
+        slot = pages[s].hash_next;
+    }
+    return false;
+}
+
 /// Insert a page into the cache from a disk read (not dirty).
 pub fn insertPage(inode_id: u64, page_offset: u64, data: *const [PAGE_SIZE]u8) ?*[PAGE_SIZE]u8 {
     const flags = cache_lock.acquire();

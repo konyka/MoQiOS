@@ -1802,30 +1802,25 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
         // Build the full block data
         var block_data: [4096]u8 = undefined;
 
-        // Check page cache for existing data
-        const page_cached = page_cache.readPage(inode_id, logical_block);
-        if (page_cached) |cached| {
-            @memcpy(&block_data, cached);
+        if (is_full_block) {
+            // v53.26: Full-block write - skip readPage (data fully overwritten, saves 102K spinlock acquisitions)
+            @memcpy(block_data[0..block_size], buf[written .. written + chunk]);
         } else {
-            // Read-modify-write: read the block from disk, patch our data
-            if (block_offset != 0 or chunk < block_size) {
+            // Partial write - need existing block data for read-modify-write
+            const page_cached = page_cache.readPage(inode_id, logical_block);
+            if (page_cached) |cached| {
+                @memcpy(&block_data, cached);
+            } else {
                 // v53.23: Use readBlockUncached to avoid polluting cache with data blocks
                 if (!readBlockUncached(phys_block, &block_data)) break;
-            } else {
-                @memset(&block_data, 0);
             }
+            @memcpy(block_data[block_offset .. block_offset + chunk], buf[written .. written + chunk]);
         }
 
-        @memcpy(block_data[block_offset .. block_offset + chunk], buf[written .. written + chunk]);
-
-        // v53.25: Only update page_cache if page was already cached — avoids PMM allocPage
-        // per block for sequential writes (writePage → allocSlot → pmm.allocPage = 204K locks for 100MB)
-        if (page_cached != null) {
-            _ = page_cache.writePage(inode_id, logical_block, &block_data);
-        }
-        // v53.22: Write directly to disk (page_cache manages data; avoid cache pollution)
-        // Update cache only if block already cached (keeps cached entries fresh)
+        // v53.22: Write directly to disk (avoids cache pollution)
         _ = writeBlockUncached(phys_block, &block_data);
+        // v53.26: Atomically update page_cache if cached (fixes SMP TOCTOU race, no PMM alloc)
+        _ = page_cache.updateIfCached(inode_id, logical_block, &block_data);
         if (cacheLookup(phys_block)) |cidx| {
             @memcpy(cache[cidx].data[0..block_size], block_data[0..block_size]);
             cache[cidx].dirty = false;
