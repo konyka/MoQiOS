@@ -47,18 +47,15 @@ var page_count: u32 = 0;
 var dirty_bm: [DIRTY_BM_WORDS]u64 = @splat(0);
 
 inline fn dirtySet(slot: u16) void {
-    const idx: u8 = @intCast(slot);
-    dirty_bm[idx / 64] |= @as(u64, 1) << @intCast(idx % 64);
+    dirty_bm[slot / 64] |= @as(u64, 1) << @intCast(slot % 64);
 }
 
 inline fn dirtyClr(slot: u16) void {
-    const idx: u8 = @intCast(slot);
-    dirty_bm[idx / 64] &= ~(@as(u64, 1) << @intCast(idx % 64));
+    dirty_bm[slot / 64] &= ~(@as(u64, 1) << @intCast(slot % 64));
 }
 
 inline fn dirtyTest(slot: u16) bool {
-    const idx: u8 = @intCast(slot);
-    return (dirty_bm[idx / 64] & (@as(u64, 1) << @intCast(idx % 64))) != 0;
+    return (dirty_bm[slot / 64] & (@as(u64, 1) << @intCast(slot % 64))) != 0;
 }
 
 // Hash table

@@ -867,7 +867,8 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
             if (phys_block == 0) break;
             const tmp_phys = pmm.allocPage() orelse break;
             const tmp: [*]u8 = @ptrFromInt(hhdm.physToVirt(tmp_phys));
-            if (!readBlock(phys_block, tmp)) {
+            // v53.28: Use readBlockUncached to avoid polluting ext2 block cache with data blocks
+            if (!readBlockUncached(phys_block, tmp)) {
                 pmm.freePage(tmp_phys);
                 break;
             }
@@ -906,7 +907,8 @@ fn prefetchPages(inode: *const Ext2Inode, inode_id: u64, start_page: u64, count:
         if (phys_block == 0) break;
         const tmp_phys = pmm.allocPage() orelse break;
         const tmp: [*]u8 = @ptrFromInt(hhdm.physToVirt(tmp_phys));
-        if (!readBlock(phys_block, tmp)) {
+        // v53.28: Use readBlockUncached to avoid polluting ext2 block cache with data blocks
+        if (!readBlockUncached(phys_block, tmp)) {
             pmm.freePage(tmp_phys);
             break;
         }
@@ -1251,7 +1253,7 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
     const new_blocks_needed = if (new_size == 0) 0 else (new_size + block_size - 1) / block_size;
     const ptrs_per_block = block_size / 4;
     const page_cache = @import("page_cache.zig");
-    page_cache.invalidateInode(f.inode_num);
+    page_cache.invalidateInode(0x3000_0000_0000_0000 + @as(u64, f.inode_num));
 
     // Free direct blocks beyond needed
     for (new_blocks_needed..EXT2_INODE_DIRECT) |i| {
@@ -1318,7 +1320,7 @@ pub fn truncateByInode(inode_num: u32, new_size: u32) bool {
     }
     // v53.4: invalidate page cache for this inode before freeing blocks
     const page_cache = @import("page_cache.zig");
-    page_cache.invalidateInode(inode_num);
+    page_cache.invalidateInode(0x3000_0000_0000_0000 + @as(u64, inode_num));
 
     const new_blocks_needed = if (new_size == 0) @as(u32, 0) else @as(u32, (new_size + block_size - 1) / block_size);
     const ptrs_per_block = block_size / 4;
@@ -1818,11 +1820,9 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
         }
 
         // v53.22: Write directly to disk (avoids cache pollution)
+        // v53.28: Removed per-block cacheLookup — after v53.28 readFile uses
+        // readBlockUncached, data blocks never enter ext2 block cache.
         _ = writeBlockUncached(phys_block, &block_data);
-        if (cacheLookup(phys_block)) |cidx| {
-            @memcpy(cache[cidx].data[0..block_size], block_data[0..block_size]);
-            cache[cidx].dirty = false;
-        }
 
         written += chunk;
         current_offset += chunk;
@@ -2371,7 +2371,7 @@ pub fn unlinkFile(path: []const u8) bool {
         }
         // v53.5: invalidate page cache before freeing blocks
         const page_cache = @import("page_cache.zig");
-        page_cache.invalidateInode(file_inode_num);
+        page_cache.invalidateInode(0x3000_0000_0000_0000 + @as(u64, file_inode_num));
 
         if (is_symlink and file_inode.blocks == 0) {
             // Short symlink: target inline in i_block, no data blocks to free
