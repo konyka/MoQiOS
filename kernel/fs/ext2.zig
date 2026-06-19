@@ -230,7 +230,7 @@ const zero_block_buf: [4096]u8 = @splat(0);
 // v53.22: Static buffer for superblock I/O — eliminates allocPage/freePage per writeSuperblock call
 var sb_io_buf: [2048]u8 = undefined;
 // v53.23: Static buffers for ensureBlock indirect block I/O — eliminates allocPage/freePage per call
-var ensure_ind_buf: [3][4096]u8 = undefined;
+var ensure_ind_buf: [3][4096]u8 align(8) = undefined;
 var cache_hash: [CACHE_ENTRIES]?u8 = @splat(null); // hash buckets
 var cache_next: usize = 0; // clock hand for replacement
 var cache_hits: u64 = 0;
@@ -1480,7 +1480,7 @@ fn writeInode(inode_num: u32, inode: *const Ext2Inode) bool {
 
 /// Allocate a data block from the block bitmap of the given group.
 /// Returns block number, or 0 on failure.
-fn allocBlock(group: u32) u32 {
+fn allocBlock(group: u32, skip_zero: bool) u32 {
     const gds: [*]Ext2GroupDesc = @ptrFromInt(group_descs_virt);
     const gd = &gds[group];
 
@@ -1524,8 +1524,11 @@ fn allocBlock(group: u32) u32 {
                 writeSuperblock();
             }
             // v53.21: Static zero buffer — no allocPage/freePage/memset, no cache pollution
+            // v53.24: Skip zeroing when caller will overwrite entire block (full-block writes)
             const block_num = first_block + i;
-            _ = writeBlockUncached(block_num, zero_block_buf[0..block_size].ptr);
+            if (!skip_zero) {
+                _ = writeBlockUncached(block_num, zero_block_buf[0..block_size].ptr);
+            }
             return block_num;
         }
         return 0;
@@ -1566,8 +1569,11 @@ fn allocBlock(group: u32) u32 {
         }
 
         // v53.21: Static zero buffer — no allocPage/freePage/memset, no cache pollution
+        // v53.24: Skip zeroing when caller will overwrite entire block (full-block writes)
         const block_num = first_block + i;
-        _ = writeBlockUncached(block_num, zero_block_buf[0..block_size].ptr);
+        if (!skip_zero) {
+            _ = writeBlockUncached(block_num, zero_block_buf[0..block_size].ptr);
+        }
 
         return block_num;
     }
@@ -1576,11 +1582,11 @@ fn allocBlock(group: u32) u32 {
 
 /// Ensure a logical block is allocated for the given inode.
 /// Returns the physical block number, allocating if necessary.
-fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
+fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32, skip_zero: bool) u32 {
     // Check direct blocks first
     if (logical_block < EXT2_INODE_DIRECT) {
         if (inode.block[logical_block] != 0) return inode.block[logical_block];
-        const blk = allocBlock(0); // allocate from group 0 for simplicity
+        const blk = allocBlock(0, skip_zero); // allocate from group 0 for simplicity
         if (blk == 0) return 0;
         inode.block[logical_block] = blk;
         inode.blocks += block_size / 512;
@@ -1598,7 +1604,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
 
         if (inode.block[12] == 0) {
             // Allocate indirect block
-            const ind_blk = allocBlock(0);
+            const ind_blk = allocBlock(0, skip_zero);
             if (ind_blk == 0) return 0;
             inode.block[12] = ind_blk;
             inode.blocks += block_size / 512;
@@ -1610,7 +1616,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
         const index = logical_block - indirect_base;
         const ptrs: [*]u32 = @ptrCast(@alignCast(buf));
         if (ptrs[index] == 0) {
-            const blk = allocBlock(0);
+            const blk = allocBlock(0, skip_zero);
             if (blk == 0) return 0;
             ptrs[index] = blk;
             inode.blocks += block_size / 512;
@@ -1629,7 +1635,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
         // Ensure double indirect block exists
         var dib_new = false;
         if (inode.block[13] == 0) {
-            const dbl_blk = allocBlock(0);
+            const dbl_blk = allocBlock(0, skip_zero);
             if (dbl_blk == 0) return 0;
             inode.block[13] = dbl_blk;
             inode.blocks += block_size / 512;
@@ -1649,7 +1655,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
         // Ensure single indirect block at idx1
         var sib_new = false;
         if (dbl_ptrs[idx1] == 0) {
-            const si_blk = allocBlock(0);
+            const si_blk = allocBlock(0, skip_zero);
             if (si_blk == 0) return 0;
             dbl_ptrs[idx1] = si_blk;
             inode.blocks += block_size / 512;
@@ -1667,7 +1673,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
 
         const si_ptrs: [*]u32 = @ptrCast(@alignCast(si_buf));
         if (si_ptrs[idx2] == 0) {
-            const blk = allocBlock(0);
+            const blk = allocBlock(0, skip_zero);
             if (blk == 0) return 0;
             si_ptrs[idx2] = blk;
             inode.blocks += block_size / 512;
@@ -1684,7 +1690,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
         // v53.23: Static buffers — eliminates allocPage/freePage per call
         var tib_new = false;
         if (inode.block[14] == 0) {
-            const tri_blk = allocBlock(0); // allocBlock already zeroes the block
+            const tri_blk = allocBlock(0, skip_zero); // @memset zeros buffer locally (disk zero skipped when skip_zero)
             if (tri_blk == 0) return 0;
             inode.block[14] = tri_blk;
             inode.blocks += block_size / 512;
@@ -1708,7 +1714,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
         // Ensure double indirect block at idx1
         var dib_new = false;
         if (tib_ptrs[idx1] == 0) {
-            const dbl_blk = allocBlock(0); // allocBlock already zeroes the block
+            const dbl_blk = allocBlock(0, skip_zero); // @memset zeros buffer locally (disk zero skipped when skip_zero)
             if (dbl_blk == 0) return 0;
             tib_ptrs[idx1] = dbl_blk;
             inode.blocks += block_size / 512;
@@ -1728,7 +1734,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
         // Ensure single indirect block at idx2
         var sib_new = false;
         if (dib_ptrs[idx2] == 0) {
-            const si_blk = allocBlock(0); // allocBlock already zeroes the block
+            const si_blk = allocBlock(0, skip_zero); // @memset zeros buffer locally (disk zero skipped when skip_zero)
             if (si_blk == 0) return 0;
             dib_ptrs[idx2] = si_blk;
             inode.blocks += block_size / 512;
@@ -1747,7 +1753,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
 
         // Ensure data block at idx3
         if (sib_ptrs[idx3] == 0) {
-            const blk = allocBlock(0);
+            const blk = allocBlock(0, skip_zero);
             if (blk == 0) return 0;
             sib_ptrs[idx3] = blk;
             inode.blocks += block_size / 512;
@@ -1788,7 +1794,9 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
         const block_offset = current_offset % block_size;
         const chunk = @min(count - written, block_size - block_offset);
 
-        const phys_block = ensureBlock(&f.inode, f.inode_num, logical_block);
+        // v53.24: Skip zeroing new blocks for full-block writes (writeFile overwrites entirely)
+        const is_full_block = (block_offset == 0 and chunk == block_size);
+        const phys_block = ensureBlock(&f.inode, f.inode_num, logical_block, is_full_block);
         if (phys_block == 0) break;
 
         // Build the full block data
@@ -2016,7 +2024,7 @@ fn addDirEntry(dir_inode_num: u32, target_inode: u32, entry_name: []const u8, fi
     }
 
     // No space to split — allocate a new block
-    const new_block = allocBlock(0);
+    const new_block = allocBlock(0, false);
     if (new_block == 0) return false;
 
     // Add block to directory inode
@@ -2073,7 +2081,7 @@ pub fn createDir(name: []const u8) i64 {
     new_inode.block = @splat(0);
 
     // Allocate a data block for the directory entries (. and ..)
-    const dir_block = allocBlock(0);
+    const dir_block = allocBlock(0, false);
     if (dir_block == 0) return -1;
 
     new_inode.block[0] = dir_block;
@@ -2481,7 +2489,7 @@ pub fn createSymlink(target: []const u8, linkpath: []const u8) i64 {
         new_inode.blocks = 0;
     } else {
         // Long symlink: allocate a data block and store target there
-        const data_block = allocBlock(0);
+        const data_block = allocBlock(0, false);
         if (data_block == 0) return -28;
         const buf_phys = pmm.allocPage() orelse return -12;
         defer pmm.freePage(buf_phys);
@@ -2729,7 +2737,7 @@ pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
         const init_phys = pmm.allocPage() orelse return -12;
         const init_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(init_phys));
         const group = (inode_num - 1) / inodes_per_group;
-        ea_block = allocBlock(group);
+        ea_block = allocBlock(group, false);
         if (ea_block == 0) {
             pmm.freePage(init_phys);
             return -28;
