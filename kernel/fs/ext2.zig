@@ -1604,7 +1604,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32, skip_zero:
 
         if (inode.block[12] == 0) {
             // Allocate indirect block
-            const ind_blk = allocBlock(0, skip_zero);
+            const ind_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk (safe on alloc failure)
             if (ind_blk == 0) return 0;
             inode.block[12] = ind_blk;
             inode.blocks += block_size / 512;
@@ -1635,7 +1635,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32, skip_zero:
         // Ensure double indirect block exists
         var dib_new = false;
         if (inode.block[13] == 0) {
-            const dbl_blk = allocBlock(0, skip_zero);
+            const dbl_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk (safe on alloc failure)
             if (dbl_blk == 0) return 0;
             inode.block[13] = dbl_blk;
             inode.blocks += block_size / 512;
@@ -1655,7 +1655,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32, skip_zero:
         // Ensure single indirect block at idx1
         var sib_new = false;
         if (dbl_ptrs[idx1] == 0) {
-            const si_blk = allocBlock(0, skip_zero);
+            const si_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk (safe on alloc failure)
             if (si_blk == 0) return 0;
             dbl_ptrs[idx1] = si_blk;
             inode.blocks += block_size / 512;
@@ -1690,7 +1690,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32, skip_zero:
         // v53.23: Static buffers — eliminates allocPage/freePage per call
         var tib_new = false;
         if (inode.block[14] == 0) {
-            const tri_blk = allocBlock(0, skip_zero); // @memset zeros buffer locally (disk zero skipped when skip_zero)
+            const tri_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk (safe on alloc failure)
             if (tri_blk == 0) return 0;
             inode.block[14] = tri_blk;
             inode.blocks += block_size / 512;
@@ -1714,7 +1714,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32, skip_zero:
         // Ensure double indirect block at idx1
         var dib_new = false;
         if (tib_ptrs[idx1] == 0) {
-            const dbl_blk = allocBlock(0, skip_zero); // @memset zeros buffer locally (disk zero skipped when skip_zero)
+            const dbl_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk (safe on alloc failure)
             if (dbl_blk == 0) return 0;
             tib_ptrs[idx1] = dbl_blk;
             inode.blocks += block_size / 512;
@@ -1734,7 +1734,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32, skip_zero:
         // Ensure single indirect block at idx2
         var sib_new = false;
         if (dib_ptrs[idx2] == 0) {
-            const si_blk = allocBlock(0, skip_zero); // @memset zeros buffer locally (disk zero skipped when skip_zero)
+            const si_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk (safe on alloc failure)
             if (si_blk == 0) return 0;
             dib_ptrs[idx2] = si_blk;
             inode.blocks += block_size / 512;
@@ -1803,7 +1803,8 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
         var block_data: [4096]u8 = undefined;
 
         // Check page cache for existing data
-        if (page_cache.readPage(inode_id, logical_block)) |cached| {
+        const page_cached = page_cache.readPage(inode_id, logical_block);
+        if (page_cached) |cached| {
             @memcpy(&block_data, cached);
         } else {
             // Read-modify-write: read the block from disk, patch our data
@@ -1817,8 +1818,11 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
 
         @memcpy(block_data[block_offset .. block_offset + chunk], buf[written .. written + chunk]);
 
-        // Write through page cache (marks dirty for writeback)
-        _ = page_cache.writePage(inode_id, logical_block, &block_data);
+        // v53.25: Only update page_cache if page was already cached — avoids PMM allocPage
+        // per block for sequential writes (writePage → allocSlot → pmm.allocPage = 204K locks for 100MB)
+        if (page_cached != null) {
+            _ = page_cache.writePage(inode_id, logical_block, &block_data);
+        }
         // v53.22: Write directly to disk (page_cache manages data; avoid cache pollution)
         // Update cache only if block already cached (keeps cached entries fresh)
         _ = writeBlockUncached(phys_block, &block_data);
