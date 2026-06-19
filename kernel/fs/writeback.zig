@@ -53,7 +53,7 @@ pub fn writeBuffered(file_idx: u32, byte_offset: u64, data: [*]const u8, len: u3
         bmSet(&dirty_bm, idx);
         return;
     }
-    buf = findOrAllocBufferLocked(file_idx, byte_offset, fs_type);
+    buf = findOrAllocBufferLocked(file_idx, byte_offset, fs_type, flags);
     if (buf) |b| {
         @memcpy(b.data[0..copy_len], data[0..copy_len]);
         b.data_len = copy_len;
@@ -75,7 +75,7 @@ fn findBufferLocked(file_idx: u32, byte_offset: u64, fs_type: FsType) ?*DirtyBuf
     }
     return null;
 }
-fn findOrAllocBufferLocked(file_idx: u32, byte_offset: u64, fs_type: FsType) ?*DirtyBuffer {
+fn findOrAllocBufferLocked(file_idx: u32, byte_offset: u64, fs_type: FsType, flags: u64) ?*DirtyBuffer {
     // Find free slot via inverted in_use bitmap
     for (0..BM_WORDS) |w| {
         const inv = ~in_use_bm[w];
@@ -87,7 +87,7 @@ fn findOrAllocBufferLocked(file_idx: u32, byte_offset: u64, fs_type: FsType) ?*D
         bmSet(&in_use_bm, i);
         return &dirty_buffers[i];
     }
-    // Evict oldest dirty buffer — flush to disk first to prevent data loss (v53.33)
+    // Evict oldest dirty buffer — flush outside lock to prevent data loss + SMP stalls (v53.35)
     var oldest_idx: u32 = 0;
     var oldest_time: u64 = @as(u64, 1) << 63;
     for (0..BM_WORDS) |w| {
@@ -102,17 +102,42 @@ fn findOrAllocBufferLocked(file_idx: u32, byte_offset: u64, fs_type: FsType) ?*D
             }
         }
     }
-    // Flush oldest dirty buffer before overwriting (prevents silent data loss)
+    // v53.35: Copy evict data to stack, release lock for I/O, check flush return.
+    // Fixes W2 (ignored flush failure → data loss) + W3 (spinlock held during I/O).
     const evict = &dirty_buffers[oldest_idx];
-    if (flush_callbacks[@intFromEnum(evict.fs_type)]) |cb| {
-        _ = cb(evict.file_idx, evict.byte_offset, &evict.data, evict.data_len);
-    }
+    var evict_data: [PAGE_SIZE]u8 = undefined;
+    @memcpy(evict_data[0..evict.data_len], evict.data[0..evict.data_len]);
+    const evict_len = evict.data_len;
+    const evict_offset = evict.byte_offset;
+    const evict_file_idx = evict.file_idx;
+    const evict_fs = evict.fs_type;
+    evict.dirty = false;
     bmClr(&dirty_bm, oldest_idx);
+    // Keep in_use during flush so readBuffered can still serve reads (W1 fix)
+    wb_lock.release(flags);
+    const flush_ok = if (flush_callbacks[@intFromEnum(evict_fs)]) |cb|
+        cb(evict_file_idx, evict_offset, &evict_data, evict_len)
+    else
+        true;
+    _ = wb_lock.acquire();
+    if (!flush_ok) {
+        // Flush failed — restore dirty state, refuse allocation
+        dirty_buffers[oldest_idx].dirty = true;
+        bmSet(&dirty_bm, oldest_idx);
+        return null;
+    }
+    if (dirty_buffers[oldest_idx].dirty) {
+        // Buffer was re-dirtied during flush — refuse allocation
+        return null;
+    }
     dirty_buffers[oldest_idx] = .{ .in_use = true, .file_idx = file_idx, .byte_offset = byte_offset, .fs_type = fs_type };
     bmSet(&in_use_bm, oldest_idx);
     return &dirty_buffers[oldest_idx];
 }
-pub fn readBuffered(file_idx: u32, byte_offset: u64, buf: [*]u8, len: u32, fs_type: FsType) bool {
+pub fn readBuffered(file_idx: u32, byte_offset: u64, buf: [*]u8, len: u32, fs_type: FsType) u32 {
+    // v53.35: Return actual bytes copied (0 = miss) instead of bool.
+    // Fixes W4: VFS was returning min(count,4096) regardless of data_len,
+    // causing garbage data when write < 4096 bytes.
     const copy_len = @min(len, @as(u32, 4096));
     const flags = wb_lock.acquire();
     defer wb_lock.release(flags);
@@ -125,11 +150,11 @@ pub fn readBuffered(file_idx: u32, byte_offset: u64, buf: [*]u8, len: u32, fs_ty
             if (dirty_buffers[i].fs_type == fs_type and dirty_buffers[i].file_idx == file_idx and dirty_buffers[i].byte_offset == byte_offset) {
                 const n = @min(copy_len, dirty_buffers[i].data_len);
                 @memcpy(buf[0..n], dirty_buffers[i].data[0..n]);
-                return true;
+                return n;
             }
         }
     }
-    return false;
+    return 0;
 }
 pub fn flushFile(file_idx: u32, fs_type: FsType, comptime write_fn: fn (u32, u64, [*]const u8, u32) bool) void {
     const flags = wb_lock.acquire();
@@ -142,43 +167,55 @@ pub fn flushFile(file_idx: u32, fs_type: FsType, comptime write_fn: fn (u32, u64
             const i: u32 = @intCast(w * 64 + @as(u32, bit));
             if (dirty_buffers[i].fs_type == fs_type and dirty_buffers[i].file_idx == file_idx) {
                 const b = &dirty_buffers[i];
+                if (!b.dirty) continue; // v53.35: skip already-flushed (stale snapshot)
                 var tmp_data: [PAGE_SIZE]u8 = undefined;
                 @memcpy(tmp_data[0..b.data_len], b.data[0..b.data_len]);
                 const tmp_len = b.data_len;
                 const tmp_offset = b.byte_offset;
                 const tmp_file_idx = b.file_idx;
                 b.dirty = false;
-                b.in_use = false;
                 dirty_bm[w] &= ~(@as(u64, 1) << @intCast(bit));
-                bmClr(&in_use_bm, i);
+                // v53.35: keep in_use during flush for read-after-write consistency (W1)
                 wb_lock.release(flags);
                 _ = write_fn(tmp_file_idx, tmp_offset, &tmp_data, tmp_len);
                 _ = wb_lock.acquire();
+                if (!b.dirty) {
+                    b.in_use = false;
+                    bmClr(&in_use_bm, i);
+                }
             }
         }
     }
 }
-pub fn flushAll(comptime write_fn: fn (u32, u64, [*]const u8, u32) bool) void {
+pub fn flushAllByType(fs_type: FsType, comptime write_fn: fn (u32, u64, [*]const u8, u32) bool) void {
+    // v53.35: Rename flushAll → flushAllByType + add fs_type filter (C1 fix).
+    // Previously dirty_bm[w] = 0 cleared ALL dirty bits (including other fs_type),
+    // causing fat32 data loss when syncAll called flushAll(ext2WriteFlush) first.
     const flags = wb_lock.acquire();
     for (0..BM_WORDS) |w| {
         var bits = dirty_bm[w];
-        dirty_bm[w] = 0;
         while (bits != 0) {
             const bit = @ctz(bits);
             bits &= bits - 1;
             const i: u32 = @intCast(w * 64 + @as(u32, bit));
+            if (dirty_buffers[i].fs_type != fs_type) continue;
             const b = &dirty_buffers[i];
+            if (!b.dirty) continue; // v53.35: skip already-flushed (stale snapshot)
             var tmp_data: [PAGE_SIZE]u8 = undefined;
             @memcpy(tmp_data[0..b.data_len], b.data[0..b.data_len]);
             const tmp_len = b.data_len;
             const tmp_offset = b.byte_offset;
             const tmp_file_idx = b.file_idx;
             b.dirty = false;
-            b.in_use = false;
-            bmClr(&in_use_bm, i);
+            dirty_bm[w] &= ~(@as(u64, 1) << @intCast(bit));
+            // v53.35: keep in_use during flush for read-after-write consistency (W1)
             wb_lock.release(flags);
             _ = write_fn(tmp_file_idx, tmp_offset, &tmp_data, tmp_len);
             _ = wb_lock.acquire();
+            if (!b.dirty) {
+                b.in_use = false;
+                bmClr(&in_use_bm, i);
+            }
         }
     }
     wb_lock.release(flags);
@@ -234,18 +271,22 @@ pub fn flushExpiredByFs(fs_type: FsType, comptime write_fn: fn (u32, u64, [*]con
             const i: u32 = @intCast(w * 64 + @as(u32, bit));
             if (dirty_buffers[i].fs_type == fs_type and wb_tick - dirty_buffers[i].dirty_time >= DEFAULT_MAX_AGE_TICKS) {
                 const b = &dirty_buffers[i];
+                if (!b.dirty) continue; // v53.35: skip already-flushed (stale snapshot)
                 var tmp_data: [PAGE_SIZE]u8 = undefined;
                 @memcpy(tmp_data[0..b.data_len], b.data[0..b.data_len]);
                 const tmp_len = b.data_len;
                 const tmp_offset = b.byte_offset;
                 const tmp_file_idx = b.file_idx;
                 b.dirty = false;
-                b.in_use = false;
                 dirty_bm[w] &= ~(@as(u64, 1) << @intCast(bit));
-                bmClr(&in_use_bm, i);
+                // v53.35: keep in_use during flush for read-after-write consistency (W1)
                 wb_lock.release(flags);
                 _ = write_fn(tmp_file_idx, tmp_offset, &tmp_data, tmp_len);
                 _ = wb_lock.acquire();
+                if (!b.dirty) {
+                    b.in_use = false;
+                    bmClr(&in_use_bm, i);
+                }
             }
         }
     }

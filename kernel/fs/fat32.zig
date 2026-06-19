@@ -375,21 +375,30 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
         } else {
             // Cache miss — read from disk
             const sector_buf: [*]u8 = @ptrFromInt(sector_buf_virt);
-            var s: u32 = 0;
-            while (s < fat32_sectors_per_cluster) : (s += 1) {
-                _ = virtio_blk.readSectors(lba + s, 1, sector_buf);
-            }
-
-            // Copy from cluster to output buffer
-            const avail = cluster_size - current_offset_in_cluster;
-            const chunk = if (total_read + avail > to_read) to_read - total_read else avail;
-            @memcpy(buf[total_read .. total_read + chunk], sector_buf[current_offset_in_cluster .. current_offset_in_cluster + chunk]);
-            total_read += chunk;
-
-            // Insert into page cache (only if cluster fits in 4KB or we cache first 4KB)
-            if (cluster_size <= 4096) {
+            // v53.35: Single multi-sector read instead of per-sector loop (C2 fix).
+            // Previously each sector overwrote the same buffer address, corrupting
+            // multi-sector clusters (only last sector survived). Also reduces I/O
+            // requests from N to 1 (8-sector cluster = 87.5% I/O reduction).
+            if (fat32_sectors_per_cluster <= 8) {
+                // Cluster fits in 4KB buffer — read full cluster
+                _ = virtio_blk.readSectors(lba, fat32_sectors_per_cluster, sector_buf);
+                const avail = cluster_size - current_offset_in_cluster;
+                const chunk = if (total_read + avail > to_read) to_read - total_read else avail;
+                @memcpy(buf[total_read .. total_read + chunk], sector_buf[current_offset_in_cluster .. current_offset_in_cluster + chunk]);
+                total_read += chunk;
                 const page_data: *const [4096]u8 = sector_buf[0..4096];
                 _ = page_cache.insertPage(inode_id, cluster_page_idx, page_data, cluster_size);
+            } else {
+                // Cluster > 4KB — read only needed sectors to avoid buffer overflow
+                const sector_in_cluster = current_offset_in_cluster / SECTOR_SIZE;
+                const offset_in_sector = current_offset_in_cluster % SECTOR_SIZE;
+                const sectors_to_read = @min(fat32_sectors_per_cluster - sector_in_cluster, 8);
+                _ = virtio_blk.readSectors(lba + sector_in_cluster, sectors_to_read, sector_buf);
+                const buf_avail = sectors_to_read * SECTOR_SIZE - offset_in_sector;
+                const avail = @min(cluster_size - current_offset_in_cluster, buf_avail);
+                const chunk = if (total_read + avail > to_read) to_read - total_read else avail;
+                @memcpy(buf[total_read .. total_read + chunk], sector_buf[offset_in_sector .. offset_in_sector + chunk]);
+                total_read += chunk;
             }
         }
         current_offset_in_cluster = 0;

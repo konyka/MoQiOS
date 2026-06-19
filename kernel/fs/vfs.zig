@@ -405,10 +405,10 @@ pub const FdTable = struct {
             .fat32_file => {
                 if (desc.offset >= desc.file_size) return 0;
                 // 1. Check writeback cache (read-after-write consistency)
-                if (writeback.readBuffered(desc.fat32_file_idx, desc.offset, buf, @intCast(count), .fat32)) {
-                    const n = @min(count, @as(usize, 4096));
-                    desc.offset += n;
-                    return @intCast(n);
+                const n_cached = writeback.readBuffered(desc.fat32_file_idx, desc.offset, buf, @intCast(count), .fat32);
+                if (n_cached > 0) {
+                    desc.offset += @as(u64, n_cached);
+                    return @intCast(n_cached);
                 }
                 // 2. Check readahead cache
                 const block_num = desc.offset / 4096;
@@ -435,10 +435,10 @@ pub const FdTable = struct {
             .ext2_file => {
                 if (desc.offset >= desc.file_size) return 0;
                 // 1. Check writeback cache (read-after-write consistency)
-                if (writeback.readBuffered(desc.ext2_file_idx, desc.offset, buf, @intCast(count), .ext2)) {
-                    const n = @min(count, @as(usize, 4096));
-                    desc.offset += n;
-                    return @intCast(n);
+                const n_cached = writeback.readBuffered(desc.ext2_file_idx, desc.offset, buf, @intCast(count), .ext2);
+                if (n_cached > 0) {
+                    desc.offset += @as(u64, n_cached);
+                    return @intCast(n_cached);
                 }
                 // v53.32: Removed VFS-level readahead for ext2 — ext2ReadBlock was
                 // missing DISK_LBA_OFFSET (read from disk start, not ext2 partition)
@@ -710,8 +710,8 @@ pub fn writebackTimerTick() bool {
 
 /// Public API: Sync all dirty buffers to disk (fsync/sync).
 pub fn syncAll() void {
-    writeback.flushAll(ext2WriteFlush);
-    writeback.flushAll(fat32WriteFlush);
+    writeback.flushAllByType(.ext2, ext2WriteFlush);
+    writeback.flushAllByType(.fat32, fat32WriteFlush);
 }
 
 /// Sync a specific file's dirty buffers to disk.

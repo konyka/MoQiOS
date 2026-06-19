@@ -1,8 +1,8 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.43.34
+> **版本**: v0.43.35
 > **日期**: 2026-06-16
-> **代码统计**: 内核 38,510 行 Zig / 123 源文件，用户空间 2,244 行 C/ASM
+> **代码统计**: 内核 38,560 行 Zig / 123 源文件，用户空间 2,244 行 C/ASM
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
@@ -1154,4 +1154,4 @@ kernel/main.zig
 | kernel/fs/procfs.zig | 333 | procfs 11种虚拟文件 |
 | kernel/sync/ | ~600 | IrqSpinlock/TicketLock/Mutex/RwLock/SeqLock/MPMC |
 
-**总计: 122 个 .zig 文件, 35,727 行**
+**总计: 122 个 .zig 文件, 38,560 行**
