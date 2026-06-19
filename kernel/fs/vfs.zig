@@ -440,27 +440,17 @@ pub const FdTable = struct {
                     desc.offset += n;
                     return @intCast(n);
                 }
-                // 2. Check readahead cache
-                const block_num = desc.offset / 4096;
-                const block_offset: u32 = @intCast(desc.offset % 4096);
-                const cached = readahead.copyFromCache(&desc.readahead_state, block_num, block_offset, buf, @intCast(count));
-                if (cached > 0) {
-                    desc.offset += cached;
-                    // Track access for page cache replacement decisions
-                    _ = page_cache.recordAccess(desc.inode_id, block_num);
-                    return cached;
-                }
-                // 3. Fall back to FS readFile
+                // v53.32: Removed VFS-level readahead for ext2 — ext2ReadBlock was
+                // missing DISK_LBA_OFFSET (read from disk start, not ext2 partition)
+                // and bypassed ext2 block mapping (assumed contiguous layout).
+                // ext2.readFile has its own page_cache prefetch (prefetchPages) that
+                // correctly uses resolveBlock + readBlockUncached with LBA offset.
+                // Also removed VFS-level recordAccess which used 4KB page numbers
+                // conflicting with ext2's 1KB block numbers in the same tracker.
                 const ext2 = @import("ext2.zig");
                 const n = ext2.readFile(desc.ext2_file_idx, @intCast(desc.offset), buf, @intCast(count));
                 if (n > 0) {
                     desc.offset += @intCast(n);
-                    // 4. Update readahead state and trigger prefetch
-                    readahead.checkAndPrefetch(&desc.readahead_state, desc.offset, 4096, ext2ReadBlock);
-                    // 5. Track access pattern for page cache hints
-                    const cur_page = desc.offset / 4096;
-                    const prefetch_hint = page_cache.recordAccess(desc.inode_id, cur_page);
-                    _ = prefetch_hint; // used by future aggressive prefetch
                 }
                 return n;
             },
@@ -597,7 +587,6 @@ pub const FdTable = struct {
         }
         if (desc.fd_type == .ext2_file) {
             writeback.invalidateFile(desc.ext2_file_idx, .ext2, ext2WriteFlush);
-            readahead.invalidateCache(&desc.readahead_state);
             const ext2 = @import("ext2.zig");
             ext2.closeFile(desc.ext2_file_idx);
         }
@@ -681,14 +670,7 @@ pub const FdTable = struct {
     }
 };
 
-/// Block read callbacks for readahead — read a 4KB block from disk.
-fn ext2ReadBlock(block_num: u64, buf: [*]u8) bool {
-    const virtio_blk = @import("../drivers/virtio_blk.zig");
-    const lba = block_num * 8; // 4KB/512=8 sectors
-    const result = virtio_blk.readSectors(lba, 8, buf);
-    return result > 0;
-}
-
+/// Block read callback for readahead — read a 4KB block from disk.
 fn fat32ReadBlock(block_num: u64, buf: [*]u8) bool {
     const virtio_blk = @import("../drivers/virtio_blk.zig");
     const lba = block_num * 8; // 4KB/512=8 sectors

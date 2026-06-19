@@ -1855,7 +1855,9 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
             var block_data: [4096]u8 = undefined;
             const page_cached = page_cache.readPage(inode_id, logical_block);
             if (page_cached) |cached| {
-                @memcpy(&block_data, cached);
+                // v53.32: Only copy block_size bytes, not full PAGE_SIZE (4096).
+                // block_size is typically 1024, saves 3072 bytes per partial write.
+                @memcpy(block_data[0..block_size], cached[0..block_size]);
             } else {
                 // v53.23: Use readBlockUncached to avoid polluting cache with data blocks
                 if (!readBlockUncached(phys_block, &block_data)) break;
