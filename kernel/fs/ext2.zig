@@ -876,11 +876,11 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
             // v53.33: Zero remaining bytes — readBlockUncached reads block_size bytes,
             // but page_cache stores 4096-byte pages. Without zeroing, garbage data
             // from the physical page contaminates the cache entry.
-            @memset(tmp[block_size..4096], 0);
+            // v53.34: Zero-fill moved into insertPage (data_len parameter).
             @memcpy(buf[read_total .. read_total + chunk], tmp[block_offset .. block_offset + chunk]);
             // Insert into page cache
             const page_data: *const [4096]u8 = tmp[0..4096];
-            _ = page_cache.insertPage(inode_id, page_idx, page_data);
+            _ = page_cache.insertPage(inode_id, page_idx, page_data, block_size);
             pmm.freePage(tmp_phys);
             // Record access and prefetch on sequential pattern
             const pf_count = page_cache.recordAccess(inode_id, page_idx);
@@ -918,9 +918,9 @@ fn prefetchPages(inode: *const Ext2Inode, inode_id: u64, start_page: u64, count:
             break;
         }
         // v53.33: Zero remaining bytes to prevent garbage in page cache
-        @memset(tmp[block_size..4096], 0);
+        // v53.34: Zero-fill moved into insertPage (data_len parameter).
         const page_data: *const [4096]u8 = tmp[0..4096];
-        _ = page_cache.insertPage(inode_id, pg, page_data);
+        _ = page_cache.insertPage(inode_id, pg, page_data, block_size);
         pmm.freePage(tmp_phys);
     }
 }

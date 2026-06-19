@@ -265,7 +265,7 @@ pub fn updateIfCached(inode_id: u64, page_offset: u64, src_data: *const [PAGE_SI
 }
 
 /// Insert a page into the cache from a disk read (not dirty).
-pub fn insertPage(inode_id: u64, page_offset: u64, data: *const [PAGE_SIZE]u8) ?*[PAGE_SIZE]u8 {
+pub fn insertPage(inode_id: u64, page_offset: u64, data: *const [PAGE_SIZE]u8, data_len: u32) ?*[PAGE_SIZE]u8 {
     const flags = cache_lock.acquire();
     defer cache_lock.release(flags);
 
@@ -279,7 +279,11 @@ pub fn insertPage(inode_id: u64, page_offset: u64, data: *const [PAGE_SIZE]u8) ?
     pages[new_slot].dirty = false;
     pages[new_slot].referenced = true;
 
-    @memcpy(pages[new_slot].data, data);
+    // v53.34: Only copy data_len bytes, zero-fill the rest.
+    @memcpy(pages[new_slot].data[0..data_len], data[0..data_len]);
+    if (data_len < PAGE_SIZE) {
+        @memset(pages[new_slot].data[data_len..PAGE_SIZE], 0);
+    }
 
     pages[new_slot].hash_next = hash_buckets[bucket];
     hash_buckets[bucket] = @intCast(new_slot);

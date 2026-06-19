@@ -389,7 +389,7 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
             // Insert into page cache (only if cluster fits in 4KB or we cache first 4KB)
             if (cluster_size <= 4096) {
                 const page_data: *const [4096]u8 = sector_buf[0..4096];
-                _ = page_cache.insertPage(inode_id, cluster_page_idx, page_data);
+                _ = page_cache.insertPage(inode_id, cluster_page_idx, page_data, cluster_size);
             }
         }
         current_offset_in_cluster = 0;
