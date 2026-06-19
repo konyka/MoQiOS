@@ -229,6 +229,8 @@ var cache: [CACHE_ENTRIES]CacheEntry = @splat(.{});
 const zero_block_buf: [4096]u8 = @splat(0);
 // v53.22: Static buffer for superblock I/O — eliminates allocPage/freePage per writeSuperblock call
 var sb_io_buf: [2048]u8 = undefined;
+// v53.23: Static buffers for ensureBlock indirect block I/O — eliminates allocPage/freePage per call
+var ensure_ind_buf: [3][4096]u8 = undefined;
 var cache_hash: [CACHE_ENTRIES]?u8 = @splat(null); // hash buckets
 var cache_next: usize = 0; // clock hand for replacement
 var cache_hits: u64 = 0;
@@ -1503,12 +1505,17 @@ fn allocBlock(group: u32) u32 {
             const byte_idx = i / 8;
             const bit_idx: u3 = @intCast(i % 8);
             cache[idx].data[byte_idx] |= @as(u8, 1) << bit_idx;
-            if (!writeBlockUncached(bitmap_block, &cache[idx].data)) {
-                // v53.21: Roll back bit — block stays free, matching fallback behavior
-                cache[idx].data[byte_idx] &= ~(@as(u8, 1) << bit_idx);
-                return 0;
+            // v53.23: Batch mode — defer bitmap write to cacheFlush (matches freeBlock pattern)
+            if (batch_free_depth > 0) {
+                cache[idx].dirty = true;
+            } else {
+                if (!writeBlockUncached(bitmap_block, &cache[idx].data)) {
+                    // v53.21: Roll back bit — block stays free, matching fallback behavior
+                    cache[idx].data[byte_idx] &= ~(@as(u8, 1) << bit_idx);
+                    return 0;
+                }
+                cache[idx].dirty = false;
             }
-            cache[idx].dirty = false;
             gd.bg_free_blocks_count -= 1;
             sb.free_blocks_count -= 1;
             // v53.22: Skip expensive disk flushes during batch operations
@@ -1586,9 +1593,8 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
     const ptrs_per_block = block_size / 4;
 
     if (logical_block < indirect_base + ptrs_per_block) {
-        const buf_phys = pmm.allocPage() orelse return 0;
-        defer pmm.freePage(buf_phys);
-        const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+        // v53.23: Static buffer — eliminates allocPage/freePage per call
+        const buf: [*]u8 = &ensure_ind_buf[0];
 
         if (inode.block[12] == 0) {
             // Allocate indirect block
@@ -1608,7 +1614,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
             if (blk == 0) return 0;
             ptrs[index] = blk;
             inode.blocks += block_size / 512;
-            _ = writeBlock(inode.block[12], buf);
+            _ = writeBlockMaybeBatch(inode.block[12], buf);
         }
         _ = writeInode(inode_num, inode);
         return ptrs[index];
@@ -1617,17 +1623,20 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
     // Double indirect: block[13] -> single indirect blocks -> data blocks
     const dbl_base = indirect_base + ptrs_per_block;
     if (logical_block < dbl_base + ptrs_per_block * ptrs_per_block) {
-        const buf_phys = pmm.allocPage() orelse return 0;
-        defer pmm.freePage(buf_phys);
-        const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+        // v53.23: Static buffers — eliminates allocPage/freePage per call
+        const buf: [*]u8 = &ensure_ind_buf[0];
 
         // Ensure double indirect block exists
+        var dib_new = false;
         if (inode.block[13] == 0) {
             const dbl_blk = allocBlock(0);
             if (dbl_blk == 0) return 0;
             inode.block[13] = dbl_blk;
             inode.blocks += block_size / 512;
-            @memset(buf[0..block_size], 0);
+            dib_new = true;
+        }
+        if (dib_new) {
+            @memset(buf[0..block_size], 0); // allocBlock already zeroed on disk
         } else {
             if (!readBlock(inode.block[13], buf)) return 0;
         }
@@ -1638,25 +1647,23 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
         const dbl_ptrs: [*]u32 = @ptrCast(@alignCast(buf));
 
         // Ensure single indirect block at idx1
+        var sib_new = false;
         if (dbl_ptrs[idx1] == 0) {
             const si_blk = allocBlock(0);
             if (si_blk == 0) return 0;
             dbl_ptrs[idx1] = si_blk;
             inode.blocks += block_size / 512;
-            _ = writeBlock(inode.block[13], buf);
-            // Allocate zeroed single indirect block
-            const si_buf_phys = pmm.allocPage() orelse return 0;
-            defer pmm.freePage(si_buf_phys);
-            const si_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(si_buf_phys));
-            @memset(si_buf[0..block_size], 0);
-            _ = writeBlock(si_blk, si_buf);
+            _ = writeBlockMaybeBatch(inode.block[13], buf);
+            sib_new = true;
         }
 
-        // Read single indirect block
-        const si_buf_phys = pmm.allocPage() orelse return 0;
-        defer pmm.freePage(si_buf_phys);
-        const si_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(si_buf_phys));
-        if (!readBlock(dbl_ptrs[idx1], si_buf)) return 0;
+        // v53.23: Read (or zero) single indirect block — skip redundant writeBlock (allocBlock already zeroed)
+        const si_buf: [*]u8 = &ensure_ind_buf[1];
+        if (sib_new) {
+            @memset(si_buf[0..block_size], 0);
+        } else {
+            if (!readBlock(dbl_ptrs[idx1], si_buf)) return 0;
+        }
 
         const si_ptrs: [*]u32 = @ptrCast(@alignCast(si_buf));
         if (si_ptrs[idx2] == 0) {
@@ -1664,7 +1671,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
             if (blk == 0) return 0;
             si_ptrs[idx2] = blk;
             inode.blocks += block_size / 512;
-            _ = writeBlock(dbl_ptrs[idx1], si_buf);
+            _ = writeBlockMaybeBatch(dbl_ptrs[idx1], si_buf);
         }
         _ = writeInode(inode_num, inode);
         return si_ptrs[idx2];
@@ -1674,6 +1681,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
     const tri_base = dbl_base + ptrs_per_block * ptrs_per_block;
     if (logical_block < tri_base + ptrs_per_block * ptrs_per_block * ptrs_per_block) {
         // v53.11: Track just-allocated state to skip redundant readBlock (allocBlock already zeroed the block)
+        // v53.23: Static buffers — eliminates allocPage/freePage per call
         var tib_new = false;
         if (inode.block[14] == 0) {
             const tri_blk = allocBlock(0); // allocBlock already zeroes the block
@@ -1683,9 +1691,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
             tib_new = true;
         }
 
-        const tib_phys = pmm.allocPage() orelse return 0;
-        defer pmm.freePage(tib_phys);
-        const tib: [*]u8 = @ptrFromInt(hhdm.physToVirt(tib_phys));
+        const tib: [*]u8 = &ensure_ind_buf[0];
         if (tib_new) {
             @memset(tib[0..block_size], 0); // v53.11: Skip readBlock — block just allocated and zeroed
         } else {
@@ -1706,14 +1712,12 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
             if (dbl_blk == 0) return 0;
             tib_ptrs[idx1] = dbl_blk;
             inode.blocks += block_size / 512;
-            _ = writeBlock(inode.block[14], tib);
+            _ = writeBlockMaybeBatch(inode.block[14], tib);
             dib_new = true;
         }
 
         // Read (or zero) double indirect block
-        const dib_phys = pmm.allocPage() orelse return 0;
-        defer pmm.freePage(dib_phys);
-        const dib: [*]u8 = @ptrFromInt(hhdm.physToVirt(dib_phys));
+        const dib: [*]u8 = &ensure_ind_buf[1];
         if (dib_new) {
             @memset(dib[0..block_size], 0); // v53.11: Skip readBlock
         } else {
@@ -1728,14 +1732,12 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
             if (si_blk == 0) return 0;
             dib_ptrs[idx2] = si_blk;
             inode.blocks += block_size / 512;
-            _ = writeBlock(tib_ptrs[idx1], dib);
+            _ = writeBlockMaybeBatch(tib_ptrs[idx1], dib);
             sib_new = true;
         }
 
         // Read (or zero) single indirect block
-        const sib_phys = pmm.allocPage() orelse return 0;
-        defer pmm.freePage(sib_phys);
-        const sib: [*]u8 = @ptrFromInt(hhdm.physToVirt(sib_phys));
+        const sib: [*]u8 = &ensure_ind_buf[2];
         if (sib_new) {
             @memset(sib[0..block_size], 0); // v53.11: Skip readBlock
         } else {
@@ -1749,7 +1751,7 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32) u32 {
             if (blk == 0) return 0;
             sib_ptrs[idx3] = blk;
             inode.blocks += block_size / 512;
-            _ = writeBlock(dib_ptrs[idx2], sib);
+            _ = writeBlockMaybeBatch(dib_ptrs[idx2], sib);
         }
         _ = writeInode(inode_num, inode);
         return sib_ptrs[idx3];
@@ -1798,7 +1800,8 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
         } else {
             // Read-modify-write: read the block from disk, patch our data
             if (block_offset != 0 or chunk < block_size) {
-                if (!readBlock(phys_block, &block_data)) break;
+                // v53.23: Use readBlockUncached to avoid polluting cache with data blocks
+                if (!readBlockUncached(phys_block, &block_data)) break;
             } else {
                 @memset(&block_data, 0);
             }
