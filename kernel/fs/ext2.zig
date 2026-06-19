@@ -218,11 +218,15 @@ const CacheEntry = struct {
     block_num: u32 = 0,
     valid: bool = false,
     dirty: bool = false,
-    data: [CACHE_BLOCK_SIZE]u8 = @splat(0),
+    data: [CACHE_BLOCK_SIZE]u8 align(8) = @splat(0),
     hash_next: ?u8 = null, // chain link in hash bucket
 };
 
 var cache: [CACHE_ENTRIES]CacheEntry = @splat(.{});
+
+// v53.21: Static zero buffer for block zeroing — eliminates allocPage/freePage/memset
+// per allocBlock call and avoids cache pollution (writeBlockUncached doesn't touch cache)
+const zero_block_buf: [4096]u8 = @splat(0);
 var cache_hash: [CACHE_ENTRIES]?u8 = @splat(null); // hash buckets
 var cache_next: usize = 0; // clock hand for replacement
 var cache_hits: u64 = 0;
@@ -1481,7 +1485,8 @@ fn allocBlock(group: u32) u32 {
             const bit_idx: u3 = @intCast(i % 8);
             cache[idx].data[byte_idx] |= @as(u8, 1) << bit_idx;
             if (!writeBlockUncached(bitmap_block, &cache[idx].data)) {
-                cache[idx].dirty = true;
+                // v53.21: Roll back bit — block stays free, matching fallback behavior
+                cache[idx].data[byte_idx] &= ~(@as(u8, 1) << bit_idx);
                 return 0;
             }
             cache[idx].dirty = false;
@@ -1489,12 +1494,9 @@ fn allocBlock(group: u32) u32 {
             writeGroupDescs();
             sb.free_blocks_count -= 1;
             writeSuperblock();
-            const zero_phys = pmm.allocPage() orelse return 0;
-            defer pmm.freePage(zero_phys);
-            const zero_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(zero_phys));
-            @memset(zero_buf[0..block_size], 0);
+            // v53.21: Static zero buffer — no allocPage/freePage/memset, no cache pollution
             const block_num = first_block + i;
-            _ = writeBlock(block_num, zero_buf);
+            _ = writeBlockUncached(block_num, zero_block_buf[0..block_size].ptr);
             return block_num;
         }
         return 0;
@@ -1533,13 +1535,9 @@ fn allocBlock(group: u32) u32 {
         sb.free_blocks_count -= 1;
         writeSuperblock();
 
-        // Zero the newly allocated block
-        const zero_phys = pmm.allocPage() orelse return 0;
-        defer pmm.freePage(zero_phys);
-        const zero_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(zero_phys));
-        @memset(zero_buf[0..block_size], 0);
+        // v53.21: Static zero buffer — no allocPage/freePage/memset, no cache pollution
         const block_num = first_block + i;
-        _ = writeBlock(block_num, zero_buf);
+        _ = writeBlockUncached(block_num, zero_block_buf[0..block_size].ptr);
 
         return block_num;
     }
