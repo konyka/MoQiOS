@@ -1582,6 +1582,53 @@ fn allocBlock(group: u32, skip_zero: bool) u32 {
     return 0;
 }
 
+/// v53.30: Zero-copy indirect block access helper.
+/// On cache hit: directly accesses cache[idx].data (0 memcpy, ~337MB saved for 100MB write).
+/// On cache miss: reads to provided buffer (readBlock inserts into cache for future calls).
+const IndirectRef = struct {
+    ptrs: [*]u32,
+    cache_idx: ?usize, // non-null = zero-copy cache path
+    block_num: u32,
+};
+
+fn getIndirectMutable(block_num: u32, is_new: bool, buf: [*]u8) ?IndirectRef {
+    if (cacheLookup(block_num)) |idx| {
+        return .{ .ptrs = @ptrCast(@alignCast(&cache[idx].data)), .cache_idx = idx, .block_num = block_num };
+    }
+    if (is_new) {
+        @memset(buf[0..block_size], 0);
+    } else {
+        if (!readBlock(block_num, buf)) return null;
+    }
+    return .{ .ptrs = @ptrCast(@alignCast(buf)), .cache_idx = null, .block_num = block_num };
+}
+
+fn flushIndirect(ref: IndirectRef) void {
+    if (ref.cache_idx) |idx| {
+        if (batch_free_depth > 0) {
+            cache[idx].dirty = true;
+        } else {
+            _ = writeBlockUncached(ref.block_num, &cache[idx].data);
+            cache[idx].dirty = false;
+        }
+    } else {
+        _ = writeBlockMaybeBatch(ref.block_num, @ptrCast(ref.ptrs));
+    }
+}
+
+/// v53.30: Re-validate cache reference after a potentially cache-evicting operation
+/// (e.g., allocBlock fallback path calls readBlock which may evict cache entries).
+/// If the cache entry was evicted, re-reads the block to buf and switches to buffer-backed.
+fn revalidateIndirect(ref: *IndirectRef, buf: [*]u8) bool {
+    if (ref.cache_idx) |idx| {
+        if (!cache[idx].valid or cache[idx].block_num != ref.block_num) {
+            if (!readBlock(ref.block_num, buf)) return false;
+            ref.* = .{ .ptrs = @ptrCast(@alignCast(buf)), .cache_idx = null, .block_num = ref.block_num };
+        }
+    }
+    return true;
+}
+
 /// Ensure a logical block is allocated for the given inode.
 /// Returns the physical block number, allocating if necessary.
 fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32, skip_zero: bool) u32 {
@@ -1601,111 +1648,92 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32, skip_zero:
     const ptrs_per_block = block_size / 4;
 
     if (logical_block < indirect_base + ptrs_per_block) {
-        // v53.23: Static buffer — eliminates allocPage/freePage per call
-        const buf: [*]u8 = &ensure_ind_buf[0];
-
+        var ind_new = false;
         if (inode.block[12] == 0) {
-            // Allocate indirect block
-            const ind_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk (safe on alloc failure)
+            const ind_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk
             if (ind_blk == 0) return 0;
             inode.block[12] = ind_blk;
             inode.blocks += block_size / 512;
-            @memset(buf[0..block_size], 0);
-        } else {
-            if (!readBlock(inode.block[12], buf)) return 0;
+            ind_new = true;
         }
 
         const index = logical_block - indirect_base;
-        const ptrs: [*]u32 = @ptrCast(@alignCast(buf));
-        if (ptrs[index] == 0) {
+        const buf: [*]u8 = &ensure_ind_buf[0];
+        var ref = getIndirectMutable(inode.block[12], ind_new, buf) orelse return 0;
+
+        if (ref.ptrs[index] == 0) {
             const blk = allocBlock(0, skip_zero);
             if (blk == 0) return 0;
-            ptrs[index] = blk;
+            if (!revalidateIndirect(&ref, buf)) return 0;
+            ref.ptrs[index] = blk;
             inode.blocks += block_size / 512;
-            _ = writeBlockMaybeBatch(inode.block[12], buf);
+            flushIndirect(ref);
         }
+        const result = ref.ptrs[index];
         _ = writeInode(inode_num, inode);
-        return ptrs[index];
+        return result;
     }
 
     // Double indirect: block[13] -> single indirect blocks -> data blocks
     const dbl_base = indirect_base + ptrs_per_block;
     if (logical_block < dbl_base + ptrs_per_block * ptrs_per_block) {
-        // v53.23: Static buffers — eliminates allocPage/freePage per call
-        const buf: [*]u8 = &ensure_ind_buf[0];
-
-        // Ensure double indirect block exists
         var dib_new = false;
         if (inode.block[13] == 0) {
-            const dbl_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk (safe on alloc failure)
+            const dbl_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk
             if (dbl_blk == 0) return 0;
             inode.block[13] = dbl_blk;
             inode.blocks += block_size / 512;
             dib_new = true;
         }
-        if (dib_new) {
-            @memset(buf[0..block_size], 0); // allocBlock already zeroed on disk
-        } else {
-            if (!readBlock(inode.block[13], buf)) return 0;
-        }
 
         const rel = logical_block - dbl_base;
         const idx1 = rel / ptrs_per_block;
         const idx2 = rel % ptrs_per_block;
-        const dbl_ptrs: [*]u32 = @ptrCast(@alignCast(buf));
+
+        // v53.30: Zero-copy access to double indirect block
+        const buf: [*]u8 = &ensure_ind_buf[0];
+        var dib_ref = getIndirectMutable(inode.block[13], dib_new, buf) orelse return 0;
 
         // Ensure single indirect block at idx1
         var sib_new = false;
-        if (dbl_ptrs[idx1] == 0) {
-            const si_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk (safe on alloc failure)
+        if (dib_ref.ptrs[idx1] == 0) {
+            const si_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk
             if (si_blk == 0) return 0;
-            dbl_ptrs[idx1] = si_blk;
+            if (!revalidateIndirect(&dib_ref, buf)) return 0;
+            dib_ref.ptrs[idx1] = si_blk;
             inode.blocks += block_size / 512;
-            _ = writeBlockMaybeBatch(inode.block[13], buf);
+            flushIndirect(dib_ref);
             sib_new = true;
         }
 
-        // v53.23: Read (or zero) single indirect block — skip redundant writeBlock (allocBlock already zeroed)
+        // v53.30: Zero-copy access to single indirect block
         const si_buf: [*]u8 = &ensure_ind_buf[1];
-        if (sib_new) {
-            @memset(si_buf[0..block_size], 0);
-        } else {
-            if (!readBlock(dbl_ptrs[idx1], si_buf)) return 0;
-        }
+        var si_ref = getIndirectMutable(dib_ref.ptrs[idx1], sib_new, si_buf) orelse return 0;
 
-        const si_ptrs: [*]u32 = @ptrCast(@alignCast(si_buf));
-        if (si_ptrs[idx2] == 0) {
+        if (si_ref.ptrs[idx2] == 0) {
             const blk = allocBlock(0, skip_zero);
             if (blk == 0) return 0;
-            si_ptrs[idx2] = blk;
+            if (!revalidateIndirect(&si_ref, si_buf)) return 0;
+            si_ref.ptrs[idx2] = blk;
             inode.blocks += block_size / 512;
-            _ = writeBlockMaybeBatch(dbl_ptrs[idx1], si_buf);
+            flushIndirect(si_ref);
         }
+        const result = si_ref.ptrs[idx2];
         _ = writeInode(inode_num, inode);
-        return si_ptrs[idx2];
+        return result;
     }
 
     // v53.6: Triple indirect: block[14] -> double indirect -> single indirect -> data blocks
     const tri_base = dbl_base + ptrs_per_block * ptrs_per_block;
     if (logical_block < tri_base + ptrs_per_block * ptrs_per_block * ptrs_per_block) {
-        // v53.11: Track just-allocated state to skip redundant readBlock (allocBlock already zeroed the block)
-        // v53.23: Static buffers — eliminates allocPage/freePage per call
         var tib_new = false;
         if (inode.block[14] == 0) {
-            const tri_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk (safe on alloc failure)
+            const tri_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk
             if (tri_blk == 0) return 0;
             inode.block[14] = tri_blk;
             inode.blocks += block_size / 512;
             tib_new = true;
         }
-
-        const tib: [*]u8 = &ensure_ind_buf[0];
-        if (tib_new) {
-            @memset(tib[0..block_size], 0); // v53.11: Skip readBlock — block just allocated and zeroed
-        } else {
-            if (!readBlock(inode.block[14], tib)) return 0;
-        }
-        const tib_ptrs: [*]u32 = @ptrCast(@alignCast(tib));
 
         const rel = logical_block - tri_base;
         const idx1 = rel / (ptrs_per_block * ptrs_per_block);
@@ -1713,56 +1741,54 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32, skip_zero:
         const idx2 = rem1 / ptrs_per_block;
         const idx3 = rem1 % ptrs_per_block;
 
+        // v53.30: Zero-copy access to triple indirect block
+        const tib_buf: [*]u8 = &ensure_ind_buf[0];
+        var tib_ref = getIndirectMutable(inode.block[14], tib_new, tib_buf) orelse return 0;
+
         // Ensure double indirect block at idx1
         var dib_new = false;
-        if (tib_ptrs[idx1] == 0) {
-            const dbl_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk (safe on alloc failure)
+        if (tib_ref.ptrs[idx1] == 0) {
+            const dbl_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk
             if (dbl_blk == 0) return 0;
-            tib_ptrs[idx1] = dbl_blk;
+            if (!revalidateIndirect(&tib_ref, tib_buf)) return 0;
+            tib_ref.ptrs[idx1] = dbl_blk;
             inode.blocks += block_size / 512;
-            _ = writeBlockMaybeBatch(inode.block[14], tib);
+            flushIndirect(tib_ref);
             dib_new = true;
         }
 
-        // Read (or zero) double indirect block
-        const dib: [*]u8 = &ensure_ind_buf[1];
-        if (dib_new) {
-            @memset(dib[0..block_size], 0); // v53.11: Skip readBlock
-        } else {
-            if (!readBlock(tib_ptrs[idx1], dib)) return 0;
-        }
-        const dib_ptrs: [*]u32 = @ptrCast(@alignCast(dib));
+        // v53.30: Zero-copy access to double indirect block
+        const dib_buf: [*]u8 = &ensure_ind_buf[1];
+        var dib_ref = getIndirectMutable(tib_ref.ptrs[idx1], dib_new, dib_buf) orelse return 0;
 
         // Ensure single indirect block at idx2
         var sib_new = false;
-        if (dib_ptrs[idx2] == 0) {
-            const si_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk (safe on alloc failure)
+        if (dib_ref.ptrs[idx2] == 0) {
+            const si_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk
             if (si_blk == 0) return 0;
-            dib_ptrs[idx2] = si_blk;
+            if (!revalidateIndirect(&dib_ref, dib_buf)) return 0;
+            dib_ref.ptrs[idx2] = si_blk;
             inode.blocks += block_size / 512;
-            _ = writeBlockMaybeBatch(tib_ptrs[idx1], dib);
+            flushIndirect(dib_ref);
             sib_new = true;
         }
 
-        // Read (or zero) single indirect block
-        const sib: [*]u8 = &ensure_ind_buf[2];
-        if (sib_new) {
-            @memset(sib[0..block_size], 0); // v53.11: Skip readBlock
-        } else {
-            if (!readBlock(dib_ptrs[idx2], sib)) return 0;
-        }
-        const sib_ptrs: [*]u32 = @ptrCast(@alignCast(sib));
+        // v53.30: Zero-copy access to single indirect block
+        const sib_buf: [*]u8 = &ensure_ind_buf[2];
+        var sib_ref = getIndirectMutable(dib_ref.ptrs[idx2], sib_new, sib_buf) orelse return 0;
 
         // Ensure data block at idx3
-        if (sib_ptrs[idx3] == 0) {
+        if (sib_ref.ptrs[idx3] == 0) {
             const blk = allocBlock(0, skip_zero);
             if (blk == 0) return 0;
-            sib_ptrs[idx3] = blk;
+            if (!revalidateIndirect(&sib_ref, sib_buf)) return 0;
+            sib_ref.ptrs[idx3] = blk;
             inode.blocks += block_size / 512;
-            _ = writeBlockMaybeBatch(dib_ptrs[idx2], sib);
+            flushIndirect(sib_ref);
         }
+        const result = sib_ref.ptrs[idx3];
         _ = writeInode(inode_num, inode);
-        return sib_ptrs[idx3];
+        return result;
     }
 
     return 0;
