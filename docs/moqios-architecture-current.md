@@ -1,8 +1,8 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.43.26
+> **版本**: v0.43.27
 > **日期**: 2026-06-16
-> **代码统计**: 内核 38,444 行 Zig / 123 源文件，用户空间 2,244 行 C/ASM
+> **代码统计**: 内核 38,449 行 Zig / 123 源文件，用户空间 2,244 行 C/ASM
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
@@ -1141,7 +1141,7 @@ kernel/main.zig
 | kernel/fs/page_cache.zig | ~584 | 统一页缓存 (1024页/512哈希槽/Clock替换+命中统计/8页预取/updateIfCached原子更新) |
 | kernel/main.zig | 329 | 内核主函数 |
 | kernel/arch/x86_64/paging.zig | 293 | 页表管理 + getPagePhysAddr |
-| kernel/fs/ext2.zig | ~3200 | ext2 文件系统 (hardlink/symlink/unlink/chown/chmod/xattr/walkPathResolve) |
+| kernel/fs/ext2.zig | ~3200 | ext2 文件系统 (hardlink/symlink/unlink/chown/chmod/xattr/walkPathResolve/writeFile零拷贝+invalidateInode) |
 | kernel/fs/fat32.zig | ~900 | FAT32 文件系统 |
 | kernel/proc/scheduler.zig | ~500 | O(1) 位图调度器 |
 | kernel/proc/task.zig | ~704 | Task 结构体 + 进程管理 |

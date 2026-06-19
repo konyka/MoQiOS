@@ -1803,7 +1803,7 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
         var block_data: [4096]u8 = undefined;
 
         if (is_full_block) {
-            // v53.26: Full-block write - skip readPage (data fully overwritten, saves 102K spinlock acquisitions)
+            // v53.26: Full-block write - skip readPage + @memset (data fully overwritten, eliminates ~400MB redundant memset for 100MB write)
             @memcpy(block_data[0..block_size], buf[written .. written + chunk]);
         } else {
             // Partial write - need existing block data for read-modify-write
@@ -1819,8 +1819,6 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
 
         // v53.22: Write directly to disk (avoids cache pollution)
         _ = writeBlockUncached(phys_block, &block_data);
-        // v53.26: Atomically update page_cache if cached (fixes SMP TOCTOU race, no PMM alloc)
-        _ = page_cache.updateIfCached(inode_id, logical_block, &block_data);
         if (cacheLookup(phys_block)) |cidx| {
             @memcpy(cache[cidx].data[0..block_size], block_data[0..block_size]);
             cache[cidx].dirty = false;
@@ -1831,6 +1829,13 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
     }
 
     if (written == 0) return -1;
+
+    // v53.27: Invalidate page_cache for this inode after write loop.
+    // writeBlockUncached already wrote new data to disk synchronously, so any
+    // cached entries are stale. One invalidateInode (1 lock) replaces per-block
+    // updateIfCached (102K locks for 100MB write). Also fixes SMP TOCTOU race:
+    // stale entries inserted by concurrent readFile during the loop are removed.
+    page_cache.invalidateInode(inode_id);
 
     // Update file size if we extended the file
     const new_end = offset + written;
