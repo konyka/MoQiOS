@@ -227,6 +227,8 @@ var cache: [CACHE_ENTRIES]CacheEntry = @splat(.{});
 // v53.21: Static zero buffer for block zeroing — eliminates allocPage/freePage/memset
 // per allocBlock call and avoids cache pollution (writeBlockUncached doesn't touch cache)
 const zero_block_buf: [4096]u8 = @splat(0);
+// v53.22: Static buffer for superblock I/O — eliminates allocPage/freePage per writeSuperblock call
+var sb_io_buf: [2048]u8 = undefined;
 var cache_hash: [CACHE_ENTRIES]?u8 = @splat(null); // hash buckets
 var cache_next: usize = 0; // clock hand for replacement
 var cache_hits: u64 = 0;
@@ -1426,18 +1428,35 @@ fn writeInode(inode_num: u32, inode: *const Ext2Inode) bool {
     const offset_in_block = byte_offset % block_size;
     const target_block = inode_table_block + block_offset;
 
+    const inode_bytes: [*]const u8 = @ptrCast(inode);
+    const copy_len = @min(inode_size, @as(u32, @sizeOf(Ext2Inode)));
+
+    // v53.22: Zero-copy path — if inode table block is cached, modify directly
+    // (eliminates allocPage/freePage + 2 memcpy per call; ~102K calls for 100MB file)
+    if (cacheLookup(target_block)) |idx| {
+        if (offset_in_block + copy_len <= block_size) {
+            @memcpy(cache[idx].data[offset_in_block .. offset_in_block + copy_len], inode_bytes[0..copy_len]);
+            if (batch_free_depth > 0) {
+                cache[idx].dirty = true;
+            } else {
+                if (writeBlockUncached(target_block, &cache[idx].data)) {
+                    cache[idx].dirty = false;
+                } else {
+                    cache[idx].dirty = true;
+                }
+            }
+            return true;
+        }
+        // Inode straddles block boundary — fall through to allocPage path
+    }
+
+    // Fallback: alloc-page-read-modify-write
     const buf_phys = pmm.allocPage() orelse return false;
     defer pmm.freePage(buf_phys);
     const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
 
     if (!readBlock(target_block, buf)) return false;
 
-    // Read-modify-write: only overwrite the 128-byte base inode we model,
-    // preserving the on-disk extended portion (rev>=1 inodes are 256 bytes).
-    // Reading `inode_size` bytes from our 128-byte struct would also be an
-    // out-of-bounds read that leaks adjacent memory onto disk.
-    const inode_bytes: [*]const u8 = @ptrCast(inode);
-    const copy_len = @min(inode_size, @as(u32, @sizeOf(Ext2Inode)));
     if (offset_in_block + copy_len <= block_size) {
         @memcpy(buf[offset_in_block .. offset_in_block + copy_len], inode_bytes[0..copy_len]);
         if (!writeBlockMaybeBatch(target_block, buf)) return false;
@@ -1491,9 +1510,12 @@ fn allocBlock(group: u32) u32 {
             }
             cache[idx].dirty = false;
             gd.bg_free_blocks_count -= 1;
-            writeGroupDescs();
             sb.free_blocks_count -= 1;
-            writeSuperblock();
+            // v53.22: Skip expensive disk flushes during batch operations
+            if (batch_free_depth == 0) {
+                writeGroupDescs();
+                writeSuperblock();
+            }
             // v53.21: Static zero buffer — no allocPage/freePage/memset, no cache pollution
             const block_num = first_block + i;
             _ = writeBlockUncached(block_num, zero_block_buf[0..block_size].ptr);
@@ -1527,13 +1549,14 @@ fn allocBlock(group: u32) u32 {
         buf[byte_idx] |= @as(u8, 1) << bit_idx;
         if (!writeBlock(bitmap_block, buf)) return 0;
 
-        // Update group descriptor
+        // Update group descriptor and superblock free block count
         gd.bg_free_blocks_count -= 1;
-        writeGroupDescs();
-
-        // Update superblock free block count
         sb.free_blocks_count -= 1;
-        writeSuperblock();
+        // v53.22: Skip expensive disk flushes during batch operations
+        if (batch_free_depth == 0) {
+            writeGroupDescs();
+            writeSuperblock();
+        }
 
         // v53.21: Static zero buffer — no allocPage/freePage/memset, no cache pollution
         const block_num = first_block + i;
@@ -1745,6 +1768,16 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
 
     var written: u32 = 0;
     var current_offset = offset;
+    // v53.22: Batch mode — defer cacheFlush+writeGroupDescs+writeSuperblock
+    batch_free_depth += 1;
+    defer {
+        batch_free_depth -= 1;
+        if (batch_free_depth == 0) {
+            cacheFlush();
+            writeGroupDescs();
+            writeSuperblock();
+        }
+    }
     const page_cache = @import("page_cache.zig");
     const inode_id: u64 = 0x3000_0000_0000_0000 + @as(u64, f.inode_num);
 
@@ -1775,8 +1808,13 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
 
         // Write through page cache (marks dirty for writeback)
         _ = page_cache.writePage(inode_id, logical_block, &block_data);
-        // Also write directly to disk for now (write-through)
-        _ = writeBlock(phys_block, &block_data);
+        // v53.22: Write directly to disk (page_cache manages data; avoid cache pollution)
+        // Update cache only if block already cached (keeps cached entries fresh)
+        _ = writeBlockUncached(phys_block, &block_data);
+        if (cacheLookup(phys_block)) |cidx| {
+            @memcpy(cache[cidx].data[0..block_size], block_data[0..block_size]);
+            cache[cidx].dirty = false;
+        }
 
         written += chunk;
         current_offset += chunk;
@@ -1855,16 +1893,11 @@ fn writeGroupDescs() void {
 
 /// Write superblock back to disk.
 fn writeSuperblock() void {
-    const sb_buf_phys = pmm.allocPage() orelse return;
-    defer pmm.freePage(sb_buf_phys);
-    const sb_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(sb_buf_phys));
-    // Superblock is at byte offset 1024. We need to preserve bytes 0-1023.
+    // v53.22: Use static buffer instead of allocPage/freePage per call
     const sb_lba: u64 = 1024 / SECTOR_SIZE;
-    // Read existing 1024 bytes of boot area
-    if (!readSectorsToBuf(sb_lba, 2, sb_buf)) return;
-    // Overlay superblock at offset 0 within the sector buffer (superblock starts at byte 1024, sector 2, offset 0)
-    @memcpy(sb_buf[0..@sizeOf(Ext2Superblock)], @as([*]const u8, @ptrCast(&sb))[0..@sizeOf(Ext2Superblock)]);
-    _ = virtio_blk.writeSectors(DISK_LBA_OFFSET + sb_lba, 2, sb_buf);
+    if (!readSectorsToBuf(sb_lba, 2, &sb_io_buf)) return;
+    @memcpy(sb_io_buf[0..@sizeOf(Ext2Superblock)], @as([*]const u8, @ptrCast(&sb))[0..@sizeOf(Ext2Superblock)]);
+    _ = virtio_blk.writeSectors(DISK_LBA_OFFSET + sb_lba, 2, &sb_io_buf);
 }
 
 // ─── Create file ────────────────────────────────────────────────────────────
@@ -2107,6 +2140,12 @@ pub fn createDir(name: []const u8) i64 {
 /// v53.15: When batch_free_depth > 0, uses writeBlockBatch (cache-only dirty) and
 /// skips writeGroupDescs/writeSuperblock. Caller must cacheFlush+writeGroupDescs+writeSuperblock.
 fn freeBlock(block_num: u32) void {
+    // v53.22: Invalidate cache entry for freed data block
+    // (prevents stale data when block is reallocated + frees cache slot for reuse)
+    if (cacheLookup(block_num)) |cidx| {
+        cacheHashRemove(cidx);
+        cache[cidx].valid = false;
+    }
     const group = (block_num - first_data_block) / sb.blocks_per_group;
     const index = (block_num - first_data_block) % sb.blocks_per_group;
 
