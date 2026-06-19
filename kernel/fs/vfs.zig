@@ -691,6 +691,13 @@ fn fat32WriteFlush(file_idx: u32, byte_offset: u64, data: [*]const u8, len: u32)
     return n > 0;
 }
 
+/// v53.33: Register flush callbacks so writeback can flush dirty buffers
+/// during eviction (prevents data loss when all 512 buffer slots are full).
+pub fn initWritebackCallbacks() void {
+    writeback.setFlushCallback(.ext2, ext2WriteFlush);
+    writeback.setFlushCallback(.fat32, fat32WriteFlush);
+}
+
 /// Public API: Drive writeback timer from scheduler tick.
 pub fn writebackTimerTick() bool {
     const expired = writeback.writebackTimerTick();

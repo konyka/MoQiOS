@@ -196,6 +196,10 @@ export fn _start() callconv(.c) noreturn {
     const ext2 = @import("fs/ext2.zig");
     ext2.init();
 
+    // v53.33: Register writeback flush callbacks for eviction-time flushing
+    const vfs = @import("fs/vfs.zig");
+    vfs.initWritebackCallbacks();
+
     // tmpfs in-memory filesystem
     const tmpfs = @import("fs/tmpfs.zig");
     tmpfs.init();

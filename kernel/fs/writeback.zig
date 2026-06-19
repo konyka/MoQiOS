@@ -24,6 +24,14 @@ var wb_lock: IrqSpinlock = .{};
 var wb_tick: u64 = 0;
 var next_check: u64 = TIMER_CHECK_INTERVAL;
 
+// v53.33: Global flush callbacks for eviction-time flushing (prevents data loss)
+const FlushFn = *const fn (u32, u64, [*]const u8, u32) bool;
+var flush_callbacks: [3]?FlushFn = @splat(null);
+
+pub fn setFlushCallback(fs_type: FsType, callback: FlushFn) void {
+    flush_callbacks[@intFromEnum(fs_type)] = callback;
+}
+
 inline fn bmSet(bm: *[BM_WORDS]u64, idx: u32) void {
     bm[idx >> 6] |= @as(u64, 1) << @intCast(idx & 63);
 }
@@ -79,7 +87,7 @@ fn findOrAllocBufferLocked(file_idx: u32, byte_offset: u64, fs_type: FsType) ?*D
         bmSet(&in_use_bm, i);
         return &dirty_buffers[i];
     }
-    // Evict oldest dirty buffer
+    // Evict oldest dirty buffer — flush to disk first to prevent data loss (v53.33)
     var oldest_idx: u32 = 0;
     var oldest_time: u64 = @as(u64, 1) << 63;
     for (0..BM_WORDS) |w| {
@@ -93,6 +101,11 @@ fn findOrAllocBufferLocked(file_idx: u32, byte_offset: u64, fs_type: FsType) ?*D
                 oldest_idx = i;
             }
         }
+    }
+    // Flush oldest dirty buffer before overwriting (prevents silent data loss)
+    const evict = &dirty_buffers[oldest_idx];
+    if (flush_callbacks[@intFromEnum(evict.fs_type)]) |cb| {
+        _ = cb(evict.file_idx, evict.byte_offset, &evict.data, evict.data_len);
     }
     bmClr(&dirty_bm, oldest_idx);
     dirty_buffers[oldest_idx] = .{ .in_use = true, .file_idx = file_idx, .byte_offset = byte_offset, .fs_type = fs_type };
@@ -135,7 +148,9 @@ pub fn flushFile(file_idx: u32, fs_type: FsType, comptime write_fn: fn (u32, u64
                 const tmp_offset = b.byte_offset;
                 const tmp_file_idx = b.file_idx;
                 b.dirty = false;
+                b.in_use = false;
                 dirty_bm[w] &= ~(@as(u64, 1) << @intCast(bit));
+                bmClr(&in_use_bm, i);
                 wb_lock.release(flags);
                 _ = write_fn(tmp_file_idx, tmp_offset, &tmp_data, tmp_len);
                 _ = wb_lock.acquire();
@@ -159,6 +174,8 @@ pub fn flushAll(comptime write_fn: fn (u32, u64, [*]const u8, u32) bool) void {
             const tmp_offset = b.byte_offset;
             const tmp_file_idx = b.file_idx;
             b.dirty = false;
+            b.in_use = false;
+            bmClr(&in_use_bm, i);
             wb_lock.release(flags);
             _ = write_fn(tmp_file_idx, tmp_offset, &tmp_data, tmp_len);
             _ = wb_lock.acquire();
@@ -223,7 +240,9 @@ pub fn flushExpiredByFs(fs_type: FsType, comptime write_fn: fn (u32, u64, [*]con
                 const tmp_offset = b.byte_offset;
                 const tmp_file_idx = b.file_idx;
                 b.dirty = false;
+                b.in_use = false;
                 dirty_bm[w] &= ~(@as(u64, 1) << @intCast(bit));
+                bmClr(&in_use_bm, i);
                 wb_lock.release(flags);
                 _ = write_fn(tmp_file_idx, tmp_offset, &tmp_data, tmp_len);
                 _ = wb_lock.acquire();
