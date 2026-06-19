@@ -235,6 +235,7 @@ var cache_hash: [CACHE_ENTRIES]?u8 = @splat(null); // hash buckets
 var cache_next: usize = 0; // clock hand for replacement
 var cache_hits: u64 = 0;
 var cache_misses: u64 = 0;
+var last_alloc_word: u32 = 0; // v53.31: allocBlock bitmap scan cursor (O(n) vs O(n²))
 
 fn cacheHashFn(block_num: u32) usize {
     // Mix bits for better distribution
@@ -1497,13 +1498,21 @@ fn allocBlock(group: u32, skip_zero: bool) u32 {
         const words: [*]u64 = @ptrCast(@alignCast(&cache[idx].data));
         const total_bytes = (total_blocks_in_group + 7) / 8;
         const total_words = (total_bytes + 7) / 8;
-        var w: u32 = 0;
-        while (w < total_words) : (w += 1) {
+        var w: u32 = last_alloc_word;
+        var scanned: u32 = 0;
+        while (scanned < total_words) : (scanned += 1) {
+            if (w >= total_words) w = 0;
             const inv = ~words[w];
-            if (inv == 0) continue;
+            if (inv == 0) {
+                w += 1;
+                continue;
+            }
             const bit = @ctz(inv);
             const i = w * 64 + @as(u32, bit);
-            if (i >= total_blocks_in_group) break;
+            if (i >= total_blocks_in_group) {
+                w += 1;
+                continue;
+            }
             const byte_idx = i / 8;
             const bit_idx: u3 = @intCast(i % 8);
             cache[idx].data[byte_idx] |= @as(u8, 1) << bit_idx;
@@ -1531,6 +1540,7 @@ fn allocBlock(group: u32, skip_zero: bool) u32 {
             if (!skip_zero) {
                 _ = writeBlockUncached(block_num, zero_block_buf[0..block_size].ptr);
             }
+            last_alloc_word = w;
             return block_num;
         }
         return 0;
@@ -1548,13 +1558,21 @@ fn allocBlock(group: u32, skip_zero: bool) u32 {
     const words: [*]const u64 = @ptrCast(@alignCast(buf));
     const total_bytes = (total_blocks_in_group + 7) / 8;
     const total_words = (total_bytes + 7) / 8;
-    var w: u32 = 0;
-    while (w < total_words) : (w += 1) {
+    var w: u32 = last_alloc_word;
+    var scanned: u32 = 0;
+    while (scanned < total_words) : (scanned += 1) {
+        if (w >= total_words) w = 0;
         const inv = ~words[w]; // flip: 1 = free
-        if (inv == 0) continue; // all 64 blocks used
+        if (inv == 0) {
+            w += 1;
+            continue;
+        } // all 64 blocks used
         const bit = @ctz(inv);
         const i = w * 64 + @as(u32, bit);
-        if (i >= total_blocks_in_group) break;
+        if (i >= total_blocks_in_group) {
+            w += 1;
+            continue;
+        }
         // Found a free block — mark as used
         const byte_idx = i / 8;
         const bit_idx: u3 = @intCast(i % 8);
@@ -1577,6 +1595,7 @@ fn allocBlock(group: u32, skip_zero: bool) u32 {
             _ = writeBlockUncached(block_num, zero_block_buf[0..block_size].ptr);
         }
 
+        last_alloc_word = w;
         return block_num;
     }
     return 0;
