@@ -1801,14 +1801,13 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
         const phys_block = ensureBlock(&f.inode, f.inode_num, logical_block, is_full_block);
         if (phys_block == 0) break;
 
-        // Build the full block data
-        var block_data: [4096]u8 = undefined;
-
         if (is_full_block) {
-            // v53.26: Full-block write - skip readPage + @memset (data fully overwritten, eliminates ~400MB redundant memset for 100MB write)
-            @memcpy(block_data[0..block_size], buf[written .. written + chunk]);
+            // v53.29: Direct write from source buffer — eliminates ~100MB intermediate
+            // memcpy for 100MB sequential write (buf is kernel buffer in HHDM, DMA-safe).
+            _ = writeBlockUncached(phys_block, buf + written);
         } else {
             // Partial write - need existing block data for read-modify-write
+            var block_data: [4096]u8 = undefined;
             const page_cached = page_cache.readPage(inode_id, logical_block);
             if (page_cached) |cached| {
                 @memcpy(&block_data, cached);
@@ -1817,12 +1816,8 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
                 if (!readBlockUncached(phys_block, &block_data)) break;
             }
             @memcpy(block_data[block_offset .. block_offset + chunk], buf[written .. written + chunk]);
+            _ = writeBlockUncached(phys_block, &block_data);
         }
-
-        // v53.22: Write directly to disk (avoids cache pollution)
-        // v53.28: Removed per-block cacheLookup — after v53.28 readFile uses
-        // readBlockUncached, data blocks never enter ext2 block cache.
-        _ = writeBlockUncached(phys_block, &block_data);
 
         written += chunk;
         current_offset += chunk;
