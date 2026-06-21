@@ -75,6 +75,11 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.sched_policy = parent.sched_policy;
     child.pdeathsig = parent.pdeathsig;
 
+    // Task #8: inherit POSIX capability sets verbatim.
+    child.effective_caps = parent.effective_caps;
+    child.permitted_caps = parent.permitted_caps;
+    child.inheritable_caps = parent.inheritable_caps;
+
     const child_stack_top = child.kernel_stack_top;
     const child_frame_addr = child_stack_top - @sizeOf(idt.InterruptFrame);
     const child_frame: *idt.InterruptFrame = @ptrFromInt(child_frame_addr);

@@ -196,6 +196,14 @@ pub const Task = struct {
     /// #NM lazy-restore; cleared by the #NM handler of a different task that
     /// claims the FPU on the same CPU.
     fpu_owned: bool = false,
+
+    // --- POSIX system capabilities (Task #8) ---
+    /// Effective capabilities — currently active permissions.
+    effective_caps: @import("../ipc/capability.zig").SysCap = @import("../ipc/capability.zig").ALL_CAPS,
+    /// Permitted capabilities — upper bound of what can be effective.
+    permitted_caps: @import("../ipc/capability.zig").SysCap = @import("../ipc/capability.zig").ALL_CAPS,
+    /// Inheritable capabilities — passed across fork/exec.
+    inheritable_caps: @import("../ipc/capability.zig").SysCap = @import("../ipc/capability.zig").ALL_CAPS,
 };
 
 /// Tracked mmap region for munmap support.
@@ -422,6 +430,13 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     tasks[slot].cpu_affinity = @intCast(affinity);
     tasks[slot].last_cpu = affinity;
 
+    // Task #8: POSIX caps default to ALL_CAPS (zeroSlot would leave them at
+    // NO_CAPS, which would break every existing capability-checked syscall).
+    const _cap_init_kt_aff = @import("../ipc/capability.zig");
+    tasks[slot].effective_caps = _cap_init_kt_aff.ALL_CAPS;
+    tasks[slot].permitted_caps = _cap_init_kt_aff.ALL_CAPS;
+    tasks[slot].inheritable_caps = _cap_init_kt_aff.ALL_CAPS;
+
     slot_bitmap |= @as(u64, 1) << @intCast(slot);
     task_count += 1;
     asm volatile ("" ::: .{ .memory = true });
@@ -458,6 +473,11 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     tasks[slot].cwd_len = 1;
     tasks[slot].cpu_affinity = -1;
     tasks[slot].last_cpu = 0;
+    // Task #8: POSIX caps default to ALL_CAPS (see createKernelThreadAffinity).
+    const _cap_init_kt = @import("../ipc/capability.zig");
+    tasks[slot].effective_caps = _cap_init_kt.ALL_CAPS;
+    tasks[slot].permitted_caps = _cap_init_kt.ALL_CAPS;
+    tasks[slot].inheritable_caps = _cap_init_kt.ALL_CAPS;
     slot_bitmap |= @as(u64, 1) << @intCast(slot);
     task_count += 1;
     asm volatile ("" ::: .{ .memory = true });
@@ -656,6 +676,12 @@ pub fn createUserProcess(
     // work-stealing. last_cpu seeds initial run-queue placement (round-robin).
     tasks[slot].cpu_affinity = -1;
     tasks[slot].last_cpu = assignCpuAffinity(elf);
+
+    // Task #8: POSIX caps default to ALL_CAPS (zeroSlot wipes them otherwise).
+    const _cap_init_up = @import("../ipc/capability.zig");
+    tasks[slot].effective_caps = _cap_init_up.ALL_CAPS;
+    tasks[slot].permitted_caps = _cap_init_up.ALL_CAPS;
+    tasks[slot].inheritable_caps = _cap_init_up.ALL_CAPS;
 
     const sig_mod = @import("signal.zig");
     sig_mod.setupSigreturnTrampoline(page_table_phys);

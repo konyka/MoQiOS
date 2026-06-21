@@ -720,10 +720,18 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         // ── v31.2: credentials/readlink/statx/copy_file_range/flock ──
         174 => { // setuid(uid)
-            frame.rax = @bitCast(cred_mod.setuid(@truncate(frame.rdi)));
+            if (!checkCapForCurrent("cap_setuid")) {
+                frame.rax = @bitCast(@as(i64, -1)); // EPERM
+            } else {
+                frame.rax = @bitCast(cred_mod.setuid(@truncate(frame.rdi)));
+            }
         },
         175 => { // setgid(gid)
-            frame.rax = @bitCast(cred_mod.setgid(@truncate(frame.rdi)));
+            if (!checkCapForCurrent("cap_setgid")) {
+                frame.rax = @bitCast(@as(i64, -1)); // EPERM
+            } else {
+                frame.rax = @bitCast(cred_mod.setgid(@truncate(frame.rdi)));
+            }
         },
         176 => { // setreuid(ruid, euid)
             frame.rax = @bitCast(cred_mod.setreuid(@truncate(frame.rdi), @truncate(frame.rsi)));
@@ -1192,7 +1200,11 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallSyslog(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));
         },
         279 => { // reboot(cmd)
-            frame.rax = @bitCast(syscallReboot(@truncate(frame.rdi)));
+            if (!checkCapForCurrent("cap_sys_reboot")) {
+                frame.rax = @bitCast(@as(i64, -1)); // EPERM
+            } else {
+                frame.rax = @bitCast(syscallReboot(@truncate(frame.rdi)));
+            }
         },
         280 => { // chroot(path) — set root path
             frame.rax = @bitCast(syscallChroot(frame.rdi));
@@ -1225,7 +1237,11 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallSetRobustList(frame.rdi, @truncate(frame.rsi)));
         },
         288 => { // mount(source, target, fs_type, flags)
-            frame.rax = @bitCast(syscallMount(frame.rdi, frame.rsi, frame.rdx, frame.r10));
+            if (!checkCapForCurrent("cap_sys_mount")) {
+                frame.rax = @bitCast(@as(i64, -1)); // EPERM
+            } else {
+                frame.rax = @bitCast(syscallMount(frame.rdi, frame.rsi, frame.rdx, frame.r10));
+            }
         },
         289 => { // umount2(target, flags)
             frame.rax = @bitCast(syscallUmount2(frame.rdi, @truncate(frame.rsi)));
@@ -2348,6 +2364,9 @@ const pgrp_mod = @import("../../proc/pgrp.zig");
 const unix_sock_mod = @import("../../net/unix_socket.zig");
 const random_mod = @import("../../drivers/random.zig");
 const clone_mod = @import("../../arch/x86_64/clone.zig");
+const cap_check = @import("../../proc/cap_check.zig");
+const capability_mod = @import("../../ipc/capability.zig");
+const task_mod_caps = @import("../../proc/task.zig");
 
 /// Initialize the syscall entry point.
 /// Sets up IA32_STAR and IA32_LSTAR MSRs, enables EFER.SCE,
@@ -2573,6 +2592,14 @@ fn syscallSigreturn(frame: *SyscallFrame) void {
 }
 
 fn syscallKill(frame: *SyscallFrame) void {
+    // Task #8: cap_kill required when targeting a different process.
+    const target_pid: u32 = @truncate(frame.rdi);
+    if (currentTaskCaps()) |info| {
+        if (info.tid != target_pid and !@field(info.t.effective_caps, "cap_kill")) {
+            frame.rax = @bitCast(@as(i64, -1)); // EPERM
+            return;
+        }
+    }
     frame.rax = @bitCast(lifecycle_mod.kill(@truncate(frame.rdi), @truncate(frame.rsi)));
 }
 
@@ -2715,6 +2742,22 @@ fn syscallSocket(frame: *SyscallFrame) void {
 /// RDX = addr_len
 /// Returns 0 on success, -1 on failure.
 fn syscallBind(frame: *SyscallFrame) void {
+    // Task #8: cap_net_bind required for privileged ports (< 1024).
+    if (frame.rsi != 0 and frame.rsi < 0x0000_8000_0000_0000) {
+        // sockaddr layout: [u16 family][u16 port_be]...
+        var sa: [4]u8 = undefined;
+        const copy = @import("../../mm/copy_from_user.zig");
+        const got = copy.copyFromUser(&sa, @ptrFromInt(frame.rsi), 4);
+        if (got == 4) {
+            const port: u16 = (@as(u16, sa[2]) << 8) | @as(u16, sa[3]);
+            if (port != 0 and port < 1024) {
+                if (!checkCapForCurrent("cap_net_bind")) {
+                    frame.rax = @bitCast(@as(i64, -1)); // EPERM
+                    return;
+                }
+            }
+        }
+    }
     frame.rax = @bitCast(socket_mod.bind(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));
 }
 
@@ -4344,26 +4387,38 @@ fn syscallKcmp(pid1: u32, pid2: u32, kcmp_type: u32, idx1: u64, idx2: u64) i64 {
 fn syscallCapget(hdr_ptr: u64, data_ptr: u64) i64 {
     const copy = @import("../../mm/copy_from_user.zig");
     const bo = @import("../../lib/byte_order.zig");
+    const sched_local = @import("../../proc/sched.zig");
 
-    // Read header
+    // Read header (version + pid)
     var hdr: [8]u8 = undefined;
     if (hdr_ptr != 0) {
         const copied = copy.copyFromUser(&hdr, @ptrFromInt(hdr_ptr), 8);
         if (copied != 8) return -14;
     }
+    const target_pid: u32 = if (hdr_ptr != 0)
+        (@as(u32, hdr[4]) | (@as(u32, hdr[5]) << 8) | (@as(u32, hdr[6]) << 16) | (@as(u32, hdr[7]) << 24))
+    else
+        0;
 
-    // Write capability data (root has all capabilities)
+    // Resolve target task: pid==0 means "current".
+    var target_idx: u32 = 0;
+    if (target_pid == 0) {
+        target_idx = sched_local.currentTaskIndex() orelse return -3; // ESRCH
+    } else {
+        target_idx = task_mod_caps.findTaskByTid(target_pid) orelse return -3; // ESRCH
+    }
+    const t = task_mod_caps.getTask(target_idx) orelse return -3;
+
     if (data_ptr != 0) {
         var cap_data: [24]u8 = undefined;
-        // cap_data[0]: effective = 0xFFFFFFFF (all caps for root)
-        bo.writeU32Le(cap_data[0..4], 0xFFFF_FFFF);
-        // cap_data[1]: permitted = 0xFFFFFFFF
-        bo.writeU32Le(cap_data[4..8], 0xFFFF_FFFF);
-        // cap_data[2]: inheritable = 0
-        bo.writeU32Le(cap_data[8..12], 0);
-        // Second set (caps 32-63): all zero for now
+        const eff: u32 = @bitCast(t.effective_caps);
+        const per: u32 = @bitCast(t.permitted_caps);
+        const inh: u32 = @bitCast(t.inheritable_caps);
+        bo.writeU32Le(cap_data[0..4], eff);
+        bo.writeU32Le(cap_data[4..8], per);
+        bo.writeU32Le(cap_data[8..12], inh);
+        // Second 32-bit set (caps 32-63): unused.
         @memset(cap_data[12..24], 0);
-
         const written = copy.copyToUser(@ptrFromInt(data_ptr), &cap_data, 24);
         if (written != 24) return -14;
     }
@@ -4371,24 +4426,64 @@ fn syscallCapget(hdr_ptr: u64, data_ptr: u64) i64 {
 }
 
 /// capset(hdr_ptr, data_ptr) — set process capabilities.
-/// Accepts but doesn't enforce (single-user kernel for now).
+/// Enforces the POSIX rule: new effective \subseteq new permitted \subseteq old permitted.
+/// Only the calling process (pid==0 or pid==self) may have its caps modified.
 fn syscallCapset(hdr_ptr: u64, data_ptr: u64) i64 {
     const copy = @import("../../mm/copy_from_user.zig");
+    const bo = @import("../../lib/byte_order.zig");
+    const sched_local = @import("../../proc/sched.zig");
 
-    // Validate we can read the header
-    if (hdr_ptr != 0) {
-        var hdr: [8]u8 = undefined;
-        const copied = copy.copyFromUser(&hdr, @ptrFromInt(hdr_ptr), 8);
-        if (copied != 8) return -14;
-    }
-    // Validate we can read the data
-    if (data_ptr != 0) {
-        var cap_data: [24]u8 = undefined;
-        const copied = copy.copyFromUser(&cap_data, @ptrFromInt(data_ptr), 24);
-        if (copied != 24) return -14;
-    }
-    // Accept: capabilities are stored but not enforced yet
+    var hdr: [8]u8 = undefined;
+    if (hdr_ptr == 0) return -14;
+    const hcopied = copy.copyFromUser(&hdr, @ptrFromInt(hdr_ptr), 8);
+    if (hcopied != 8) return -14;
+    const target_pid: u32 = (@as(u32, hdr[4]) | (@as(u32, hdr[5]) << 8) | (@as(u32, hdr[6]) << 16) | (@as(u32, hdr[7]) << 24));
+
+    const cur_idx = sched_local.currentTaskIndex() orelse return -1;
+    const cur = task_mod_caps.getTask(cur_idx) orelse return -1;
+    if (target_pid != 0 and target_pid != cur.tid) return -1; // EPERM — cannot set other tasks
+
+    if (data_ptr == 0) return -14;
+    var cap_data: [24]u8 = undefined;
+    const dcopied = copy.copyFromUser(&cap_data, @ptrFromInt(data_ptr), 24);
+    if (dcopied != 24) return -14;
+    const new_eff: u32 = bo.readU32Le(cap_data[0..4]);
+    const new_per: u32 = bo.readU32Le(cap_data[4..8]);
+    const new_inh: u32 = bo.readU32Le(cap_data[8..12]);
+
+    const old_per: u32 = @bitCast(cur.permitted_caps);
+    const old_inh: u32 = @bitCast(cur.inheritable_caps);
+
+    // Cannot grant what we don't already have in permitted.
+    if ((new_per & ~old_per) != 0) return -1; // EPERM
+    // Effective must be a subset of new permitted.
+    if ((new_eff & ~new_per) != 0) return -1; // EPERM
+    // Inheritable must be a subset of (old_per | old_inh).
+    if ((new_inh & ~(old_per | old_inh)) != 0) return -1; // EPERM
+
+    cur.permitted_caps = @bitCast(new_per);
+    cur.effective_caps = @bitCast(new_eff);
+    cur.inheritable_caps = @bitCast(new_inh);
     return 0;
+}
+
+/// Look up the current task and return both the task pointer and its TID.
+/// Returns null when there is no current task (early boot / kernel-only path).
+fn currentTaskCaps() ?struct { t: *task_mod_caps.Task, tid: u32 } {
+    const sched_local = @import("../../proc/sched.zig");
+    const idx = sched_local.currentTaskIndex() orelse return null;
+    const t = task_mod_caps.getTask(idx) orelse return null;
+    return .{ .t = t, .tid = t.tid };
+}
+
+/// Capability gate for the current task. Returns true when the current task
+/// has the named capability in its effective set, OR when there is no current
+/// task (kernel-internal callers — should never reach a syscall path anyway).
+fn checkCapForCurrent(comptime cap_field: []const u8) bool {
+    const sched_local = @import("../../proc/sched.zig");
+    const idx = sched_local.currentTaskIndex() orelse return true;
+    const t = task_mod_caps.getTask(idx) orelse return true;
+    return cap_check.capable(t, cap_field);
 }
 
 /// sched_attr structure for sched_setattr/sched_getattr:

@@ -14,6 +14,14 @@
 
 const BOOT_STACK_SIZE: usize = 64 * 1024;
 
+// M4 cross-arch abstraction: even though the riscv64 build still roots at this
+// skeleton (not the full kernel/main.zig), we force-compile arch_impl.zig so
+// the riscv64 backend stays type-checked and in sync with the contract in
+// kernel/arch/arch.zig.
+comptime {
+    _ = @import("arch_impl.zig");
+}
+
 /// Boot stack in .bss. Exported (C linkage) so the naked `_start` can take its
 /// address with a RIP/PC-relative `la` (medany code model).
 export var boot_stack: [BOOT_STACK_SIZE]u8 align(16) = undefined;

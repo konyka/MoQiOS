@@ -81,6 +81,52 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
         return -1;
     }
 
+    // AF_INET6 — handled the same way as AF_INET at the syscall layer.
+    // Lower-layer integration (TCP/UDP over IPv6) is incremental; for now we
+    // back AF_INET6 sockets with the existing IPv4 TCB/UDP-port machinery so
+    // that user-space socket() calls succeed and standard TCP/UDP semantics
+    // continue to work over IPv4 transport.
+    if (domain == 10) {
+        if (sock_type == 1) {
+            // SOCK_STREAM → TCP socket
+            const tcb_idx6 = net_mod.tcp.tcpSocket(cur_idx);
+            if (tcb_idx6 < 0) return -1;
+            const fd6 = allocTcpFd(&t.fd_table, @intCast(tcb_idx6));
+            if (fd6 < 0) {
+                _ = net_mod.tcp.tcpClose(@intCast(tcb_idx6));
+                return -1;
+            }
+            return fd6;
+        }
+        if (sock_type == 2) {
+            // SOCK_DGRAM → UDP socket (ephemeral port allocation)
+            var port6: u16 = 49152;
+            while (port6 < 65535) : (port6 += 1) {
+                const idx6 = udp.ensurePort(port6);
+                if (idx6 != 0xFFFF) {
+                    var fd_slot6: u32 = undefined;
+                    var found6 = false;
+                    for (3..t.fd_table.fds.len) |i| {
+                        if (t.fd_table.fds[i].fd_type == .none) {
+                            fd_slot6 = @intCast(i);
+                            found6 = true;
+                            break;
+                        }
+                    }
+                    if (!found6) return -24; // EMFILE
+                    t.fd_table.fds[fd_slot6] = .{
+                        .fd_type = .udp_socket,
+                        .udp_port = port6,
+                        .writable = true,
+                    };
+                    return @intCast(fd_slot6);
+                }
+            }
+            return -1;
+        }
+        return -38; // ENOSYS for unsupported AF_INET6 socket types
+    }
+
     if (domain != 2 or sock_type != 1) {
         // AF_INET + SOCK_RAW (type=3): raw packet socket
         if (domain == 2 and sock_type == 3) {

@@ -380,6 +380,15 @@ fn pickBootstrapKernel() ?u32 {
 
 /// Pick the next ready task — priority-aware round-robin with bitmap fast-path.
 fn pickNext() ?u32 {
+    // Task #6: profiling — every scheduler pass on this CPU bumps schedule_calls
+    // and contributes a queue-depth sample. Safe without locking: only this CPU
+    // writes its own stats fields.
+    if (per_cpu.isAnyReady()) {
+        const pq = per_cpu.getCurrent();
+        pq.stats.schedule_calls += 1;
+        pq.stats.queue_depth_sum += @atomicLoad(u32, &pq.nr_running, .monotonic);
+        pq.stats.sample_count += 1;
+    }
     if (getCurrentIdx() == null) {
         if (pickBootstrapKernel()) |k| return k;
     }

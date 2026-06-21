@@ -13,6 +13,7 @@ pub const ProcFile = enum(u8) {
     loadavg,
     filesystems,
     stat,
+    sched_stats,
 };
 
 /// Generate proc file content into the provided buffer.
@@ -32,6 +33,7 @@ pub fn procRead(file: ProcFile, pid: u16, buf: [*]u8, max_len: u32) u32 {
         .loadavg => generateLoadavg(buf, max_len),
         .filesystems => generateFilesystems(buf, max_len),
         .stat => generateStat(buf, max_len),
+        .sched_stats => generateSchedStats(buf, max_len),
     };
 }
 
@@ -266,6 +268,48 @@ fn generateStat(buf: [*]u8, max_len: u32) u32 {
     pos = appendStr(buf, pos, max_len, "intr 0\nprocesses 0\nprocs_running ");
     pos = appendDec(buf, pos, max_len, 1);
     pos = appendStr(buf, pos, max_len, "\nprocs_blocked 0\n");
+    return pos;
+}
+
+/// Generate /proc/sched_stats — Task #6 per-CPU scheduler profiling dump.
+///
+/// One line per online CPU:
+///   cpuN: enq=.. deq=.. steal_try=.. steal_ok=.. stolen=.. idle=.. sched=.. avg_depth=..
+fn generateSchedStats(buf: [*]u8, max_len: u32) u32 {
+    const per_cpu = @import("../proc/per_cpu.zig");
+    const smp = @import("../smp.zig");
+    var ncpus: u32 = smp.cpu_count;
+    if (ncpus == 0) ncpus = 1;
+    if (ncpus > per_cpu.MAX_CPUS) ncpus = per_cpu.MAX_CPUS;
+
+    var pos: u32 = 0;
+    var c: u32 = 0;
+    while (c < ncpus) : (c += 1) {
+        const stats = per_cpu.getStats(@intCast(c)) orelse continue;
+        pos = appendStr(buf, pos, max_len, "cpu");
+        pos = appendDec(buf, pos, max_len, c);
+        pos = appendStr(buf, pos, max_len, ": enq=");
+        pos = appendDec(buf, pos, max_len, stats.local_enqueues);
+        pos = appendStr(buf, pos, max_len, " deq=");
+        pos = appendDec(buf, pos, max_len, stats.local_dequeues);
+        pos = appendStr(buf, pos, max_len, " steal_try=");
+        pos = appendDec(buf, pos, max_len, stats.steal_attempts);
+        pos = appendStr(buf, pos, max_len, " steal_ok=");
+        pos = appendDec(buf, pos, max_len, stats.steal_successes);
+        pos = appendStr(buf, pos, max_len, " stolen=");
+        pos = appendDec(buf, pos, max_len, stats.tasks_stolen);
+        pos = appendStr(buf, pos, max_len, " idle=");
+        pos = appendDec(buf, pos, max_len, stats.idle_cycles);
+        pos = appendStr(buf, pos, max_len, " sched=");
+        pos = appendDec(buf, pos, max_len, stats.schedule_calls);
+        pos = appendStr(buf, pos, max_len, " avg_depth=");
+        const avg: u64 = if (stats.sample_count == 0)
+            0
+        else
+            stats.queue_depth_sum / stats.sample_count;
+        pos = appendDec(buf, pos, max_len, avg);
+        pos = appendChar(buf, pos, max_len, '\n');
+    }
     return pos;
 }
 

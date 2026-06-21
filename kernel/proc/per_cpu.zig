@@ -23,6 +23,27 @@ const tsc = @import("../arch/x86_64/tsc.zig");
 pub const MAX_CPUS: u32 = syscall_entry.MAX_CPUS;
 pub const QUEUE_SIZE: u32 = 256;
 
+/// Task #6: Per-CPU scheduler profiling counters.
+///
+/// Each counter is only mutated by its owning CPU while it holds the queue's
+/// `IrqSpinlock` (the local-write invariant), so plain non-atomic addition is
+/// safe on the producer side. Readers (e.g. /proc/sched_stats) may observe
+/// torn 64-bit reads on architectures lacking aligned 64-bit atomicity, which
+/// is acceptable for a profiling surface — the next sample corrects it.
+pub const SchedStats = struct {
+    local_enqueues: u64 = 0,
+    local_dequeues: u64 = 0,
+    steal_attempts: u64 = 0,
+    steal_successes: u64 = 0,
+    tasks_stolen: u64 = 0,
+    idle_cycles: u64 = 0,
+    schedule_calls: u64 = 0,
+    /// Accumulated queue depth sampled on each schedule pass; divide by
+    /// `sample_count` to obtain the average runnable depth on this CPU.
+    queue_depth_sum: u64 = 0,
+    sample_count: u64 = 0,
+};
+
 pub const PerCpuRunQueue = struct {
     /// Ring buffer of ready tasks (capacity = QUEUE_SIZE).
     tasks: [QUEUE_SIZE]?*task_mod.Task = [_]?*task_mod.Task{null} ** QUEUE_SIZE,
@@ -40,6 +61,9 @@ pub const PerCpuRunQueue = struct {
     cpu_id: u8 = 0,
     /// Number of tasks currently sitting in the ring (head - tail).
     nr_running: u32 = 0,
+    /// Task #6: per-CPU profiling counters. Mutated under `lock` on the
+    /// owning CPU; sampled lock-free by /proc/sched_stats.
+    stats: SchedStats = .{},
 
     /// Push a task onto the local end of the queue. Returns false if full.
     pub fn push(self: *PerCpuRunQueue, t: *task_mod.Task) bool {
@@ -51,6 +75,7 @@ pub const PerCpuRunQueue = struct {
         self.head +%= 1;
         self.nr_running += 1;
         t.last_cpu = self.cpu_id;
+        self.stats.local_enqueues += 1;
         return true;
     }
 
@@ -64,6 +89,7 @@ pub const PerCpuRunQueue = struct {
         const t = self.tasks[slot];
         self.tasks[slot] = null;
         self.nr_running -= 1;
+        self.stats.local_dequeues += 1;
         return t;
     }
 
@@ -71,6 +97,10 @@ pub const PerCpuRunQueue = struct {
     /// Tasks pinned via `cpu_affinity >= 0` to a different CPU are skipped.
     pub fn steal_half(self: *PerCpuRunQueue, target: *PerCpuRunQueue) u32 {
         if (self.cpu_id == target.cpu_id) return 0;
+        // Task #6: count the attempt on the thief side regardless of outcome.
+        // `self` is the current CPU's queue, so the bare increment is safe
+        // without taking self.lock (single-writer invariant).
+        self.stats.steal_attempts += 1;
         const flags = target.lock.acquire();
         defer target.lock.release(flags);
         const want: u32 = target.nr_running / 2;
@@ -116,6 +146,11 @@ pub const PerCpuRunQueue = struct {
             self.nr_running += 1;
             tt.last_cpu = self.cpu_id;
             stolen += 1;
+        }
+        if (stolen > 0) {
+            // Task #6: record the successful steal on the thief.
+            self.stats.steal_successes += 1;
+            self.stats.tasks_stolen += stolen;
         }
         return stolen;
     }
@@ -217,5 +252,22 @@ pub fn tryStealForCurrent() u32 {
             if (n > 0) return n;
         }
     }
+    // Task #6: scanned every peer and found nothing stealable.
+    my.stats.idle_cycles += 1;
     return 0;
+}
+
+/// Task #6: read-only snapshot of one CPU's profiling counters. Returned
+/// pointer aliases the live struct — callers must treat fields as volatile.
+pub fn getStats(cpu_id: u8) ?*const SchedStats {
+    if (cpu_id >= MAX_CPUS) return null;
+    return &run_queues[cpu_id].stats;
+}
+
+/// Task #6: zero a CPU's profiling counters (e.g. after dumping). No lock —
+/// the owning CPU may observe a partial reset, which is acceptable for
+/// profiling.
+pub fn resetStats(cpu_id: u8) void {
+    if (cpu_id >= MAX_CPUS) return;
+    run_queues[cpu_id].stats = .{};
 }

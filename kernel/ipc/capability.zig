@@ -104,3 +104,62 @@ pub fn clearCapabilities(task_idx: u32) void {
 pub fn init() void {
     // Tables are zero-initialized (all invalid) already
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POSIX-style system capabilities (Task #8)
+//
+// Independent from the IPC `Capability` table above. Stored per-task on the
+// Task struct as three bitmasks (effective / permitted / inheritable) following
+// the Linux capability(7) model.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// POSIX-style system capabilities (Linux-compatible bitmask).
+pub const SysCap = packed struct(u32) {
+    cap_net_raw: bool = false,
+    cap_net_bind: bool = false,
+    cap_sys_admin: bool = false,
+    cap_sys_ptrace: bool = false,
+    cap_kill: bool = false,
+    cap_setuid: bool = false,
+    cap_setgid: bool = false,
+    cap_chown: bool = false,
+    cap_dac_override: bool = false,
+    cap_fowner: bool = false,
+    cap_mknod: bool = false,
+    cap_sys_mount: bool = false,
+    cap_sys_reboot: bool = false,
+    cap_sys_resource: bool = false,
+    cap_net_admin: bool = false,
+    cap_ipc_lock: bool = false,
+    _pad: u16 = 0,
+};
+
+/// All capabilities enabled (for init/root processes).
+pub const ALL_CAPS: SysCap = .{
+    .cap_net_raw = true,
+    .cap_net_bind = true,
+    .cap_sys_admin = true,
+    .cap_sys_ptrace = true,
+    .cap_kill = true,
+    .cap_setuid = true,
+    .cap_setgid = true,
+    .cap_chown = true,
+    .cap_dac_override = true,
+    .cap_fowner = true,
+    .cap_mknod = true,
+    .cap_sys_mount = true,
+    .cap_sys_reboot = true,
+    .cap_sys_resource = true,
+    .cap_net_admin = true,
+    .cap_ipc_lock = true,
+};
+
+/// No capabilities (for unprivileged processes).
+pub const NO_CAPS: SysCap = .{};
+
+/// Check if a task has a specific system capability (queries the effective set).
+/// `field` is the field name on `SysCap`, e.g. "cap_kill".
+pub fn hasSysCap(task_idx: u32, comptime field: []const u8) bool {
+    const t = task.getTask(task_idx) orelse return false;
+    return @field(t.effective_caps, field);
+}

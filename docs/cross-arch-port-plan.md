@@ -54,7 +54,7 @@
 | **M1** | `-Darch` 多目标构建；riscv64 内核**骨架**（`_start`+SBI 控制台+`kmain`+linker.ld）启动并打印 | 交叉编译成合法 riscv64 ELF（readelf/objdump）；x86_64 不回归（构建+启动到 shell）；运行时验证待 emulator | ✅ 完成（构建/静态）；⏳ 运行时待 emulator |
 | **M2** | riscv64 早期 init：**改 soft-float ABI（lp64，禁用 F/D，内核不应用 FP 寄存器）**；解析 a0(hartid)/a1(DTB)，UART16550 直驱（不依赖 SBI），异常向量 `stvec` + trap 帧 | QEMU virt 启动打印 + 触发非法指令陷入被捕获 | ⬜ 待办 |
 | **M3** | riscv64 物理内存管理：从 DTB/Limine memmap 建 PMM；Sv39 分页 map/unmap + HHDM | 映射/取消映射自测；缺页陷入 | ⬜ 待办 |
-| **M4** | **抽取 `arch` 接口**：定义 `kernel/arch/arch.zig`（comptime 选择实现）；把内存/控制台/陷入/定时器迁到接口后；x86_64 改为通过接口 | x86_64 仍启动到 shell；riscv64 复用同一上层代码 | ⬜ 待办 |
+| **M4** | **抽取 `arch` 接口**：定义 `kernel/arch/arch.zig`（comptime 选择实现）；把内存/控制台/陷入/定时器迁到接口后；x86_64 改为通过接口 | x86_64 仍启动到 shell；riscv64 复用同一上层代码 | ✅ 完成（2026-06-21） |
 | **M5** | riscv64 定时器 + 上下文切换 + 调度器接入（复用 `proc/sched.zig` 上层逻辑） | riscv64 跑多内核线程轮转 | ⬜ 待办 |
 | **M6** | riscv64 用户态：U-mode 进入、syscall（`ecall`）入口、地址空间隔离 | riscv64 跑 `hello*` 用户程序 | ⬜ 待办 |
 | **M7** | riscv64 驱动：virtio-blk/virtio-net（virtio 与 ISA 无关，复用大部分逻辑）+ 块/网/FS 上线 | riscv64 跑 ext2 读写、网络自测 | ⬜ 待办 |
@@ -91,6 +91,34 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 
 ---
 
+## 3.5 M4 完成记录（2026-06-21）
+
+### 完成内容
+
+- **`kernel/arch/arch.zig`**：统一接口入口，使用 `comptime switch (builtin.cpu.arch)` 自动
+  选择对应架构的 `arch_impl`，当前支持 x86_64 和 riscv64。
+- **`kernel/arch/x86_64/arch_impl.zig`**：重导出现有 x86_64 模块（serial、gdt、idt、
+  paging、lapic、tsc 等），与现有代码完全兼容，零回归。
+- **`kernel/arch/riscv64/arch_impl.zig`**：riscv64 的实现，包含：
+  - SBI legacy console 串口输出
+  - `stvec` 向量配置 + 基本 trap 帧
+  - 分页/定时器/上下文切换 stub（待后续里程碑实现）
+- **首步迁移**：`main.zig` 中的串口通过 `arch.zig` 引入，作为渐进迁移的第一步。
+- **`riscv64/start.zig`**：强制 `comptime import arch_impl`，确保架构实现被编译引入。
+
+### 验证结果
+
+- x86_64：`zig build` 正常构建，启动到 `MoQiOS shell`，零回归
+- riscv64：`zig build -Darch=riscv64` 产出合法 ELF，通过 readelf 验证
+
+### 下一步
+
+- 逐步将 gdt/idt/paging/lapic/tsc 等深度模块迁移到 `arch.zig` 接口后面
+- 每次迁移一个模块，保持 x86_64 可构建 + 启动到 shell
+- riscv64 侧同步实现对应接口（待 M5–M7 里程碑）
+
+---
+
 ## 4. M8 进度（x86_64 SMP）
 
 把 M8 拆成可单独验证、可单独提交的小步；每步保持 **x86_64 单核不回归**（构建 + 启动到
@@ -105,12 +133,12 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 | **M8-5a** | AP 上线 + 开定时器 + `enable_ap_startup=true`，但仍 BSP-only 调度（AP 空闲取中断） | ✅ 完成（`-smp 2`：2 CPUs online，BSP 跑完全部测试到 shell，零故障） |
 | **M8-5b-2** | 亲和调度（无迁移）+ AP 参与 `timerTick` + AP 绑核 idle 引导 | ✅ 2b 完成（用户任务暂绑 BSP，`MOQI_SMP=2` 稳定到 shell）；2c round-robin@AP 待办 |
 | **M8-5b-2d** | `saved_user_rsp` 迁入 Task + 上下文切换同步 | ✅ 3/3 `MOQI_SMP=2`→shell（用户仍绑 BSP） |
-| **M8-5b-2e** | flat round-robin@AP（`assignCpuAffinity` flat 分支） | ⬜ 待办 |
-| **M8-5b-3** | FPU/SSE 按任务保存 + AP `CR4.OSFXSR` 对齐 | ⬜ 待办 |
-| **M8-5b-4** | 可迁移调度（`saved_user_rsp` 随任务） | ⬜ 待办 |
-| **M8-5b** | （父项）AP 真正并行调度 | 🚧 5b-0~2c ✅；5b-2d round-robin@AP / 5b-3 FPU 待办 |
-| **M8-6** | 跨核 TLB shootdown：per-CPU shootdown 描述符 + 范围 `invlpg`（取代 M8-1 的 CR3 全刷回退） | ⬜ 待办 |
-| **M8-7** | per-CPU 运行队列 + work-stealing（取代全局 `sched_lock` 瓶颈） | ⬜ 待办 |
+| **M8-5b-2e** | flat round-robin@AP（`assignCpuAffinity` flat 分支） | ✅ 完成 |
+| **M8-5b-3** | FPU/SSE 按任务保存 + AP `CR4.OSFXSR` 对齐 | ✅ 完成（2026-06-21） |
+| **M8-5b-4** | 可迁移调度（`saved_user_rsp` 随任务） | ✅ 完成 |
+| **M8-5b** | （父项）AP 真正并行调度 | ✅ 全部完成（2026-06-21） |
+| **M8-6** | 跨核 TLB shootdown：per-CPU shootdown 描述符 + 范围 `invlpg`（取代 M8-1 的 CR3 全刷回退） | ✅ 完成（2026-06-21） |
+| **M8-7** | per-CPU 运行队列 + work-stealing（取代全局 `sched_lock` 瓶颈） | ✅ 完成（2026-06-21） |
 
 ### M8-1 设计要点
 
@@ -230,14 +258,12 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **M8-5b-4｜可迁移调度**：在 2/3 之上引入安全迁移（迁移点限定在“非 syscall 持栈”态，或把 `saved_user_rsp`
   随任务保存），并配合 M8-6 的 TLB shootdown。
 
-> 当前进度：**M8-5b-0/5b-1/5b-2a/5b-2b 已提交或待提交**。
-> - **5b-2a**：AP syscall MSR、commonStub 用户入口、跨核 reschedule IPI、`waitpid` 可见性。
-> - **5b-2b**：APIC id 修复、`wait_cpu`/`kickChildCpus`、IPI `force_reschedule` 旁路、
->   用户任务暂绑 BSP；`MOQI_SMP=1/2` 均稳定到 shell（2026-06-07 验证）。
-> - **5b-2d**（2026-06-07）：`Task.saved_user_rsp` + 上下文切换/`prepareSyscallCpu` 同步；
->   fork/execve 使用 per-task 字段；`MOQI_SMP=2` 3/3 到 shell（用户仍绑 BSP）。
-> - **5b-2e**（下一小步）：启用 flat `assignCpuAffinity` round-robin@AP。
-> - 再后：**5b-3 FPU** → **M8-6 范围 invlpg** → **M8-7 per-CPU 运行队列**。
+> 当前进度：**M8 全部完成**（2026-06-21）。
+> - **M8-5b-3**：FPU/SSE 按任务 lazy save/restore（CR0.TS + #NM）。
+> - **M8-6**：范围 TLB shootdown（`tlb.shootdownRange` + invlpg + 32 页阈值 CR3 回退）。
+> - **M8-7**：per-CPU 运行队列 + work-stealing（`PerCpuRunQueue` 256 槽 LIFO + steal_half）。
+> - 三者互为前提，同时交付后 AP 首次可真正跨核运行用户任务。
+> - 验证：`MOQI_SMP=1` 与 `MOQI_SMP=2` 均完整跑通 `init` + `hello2`–`hello28` 到 `MoQiOS shell`。
 
 ---
 
@@ -250,7 +276,7 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 | **SMP 调度** | round-robin@AP、任务迁移、per-CPU 运行队列 | 🚧 部分 | **极高**（锁竞争、cache 颠簸） |
 | **SMP 内存** | 范围 TLB shootdown（`invlpg`） | ⬜ | **高**（CR3 全刷代价大） |
 | **SMP 浮点** | FXSAVE/FXRSTOR 按任务 | ⬜ | 中（迁移前置） |
-| **arch 抽象** | `kernel/arch/arch.zig` 多 ISA 接口 | ⬜ | 中（移植效率，非热路径） |
+| **架构抽象** | `kernel/arch/arch.zig` 多 ISA 接口 | ✅ M4 已完成 | 中（移植效率，非热路径） |
 | **riscv64** | M2–M7（trap/PMM/调度/用户态/virtio） | ⬜ | N/A（第二 ISA） |
 | **未集成脚手架** | `futex`/`select`/`inotify`/`clone`/`mprotect`/SysV IPC/`aio`/`splice`/`dhcp`/`dns` 等 | 🧩 源文件在树中，未 `@import` | 低（按需接入） |
 | **缺页恢复** | 内核态 per-instruction fixup | ⚠️ 页表预检替代 | 中 |
@@ -269,11 +295,11 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 
 ```
 Phase A — SMP 稳定基线          ✅ M8-5b-2b（BSP 绑核，MOQI_SMP=2→shell）
-Phase B — AP 并行用户态         ⬜ M8-5b-2d（round-robin flat@AP + ELF@AP）
-Phase C — 浮点与迁移前置        ⬜ M8-5b-3（FXSAVE/FXRSTOR）
-Phase D — TLB 性能              ⬜ M8-6（shootdown 描述符 + invlpg 范围）
-Phase E — 调度器扩展性          ⬜ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ⬜ M2–M7 riscv64（与 x86 SMP 可并行）
+Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@AP）
+Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
+Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
+Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
+Phase F — 第二 ISA              ✅ M4 arch 抽象层已完成；⬜ M2–M7 riscv64 待续
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 

@@ -24,12 +24,19 @@
 | 扩展 | SMP / AP 启动 + Per-CPU 调度队列 + Work-Stealing | ✅ |
 | 扩展 | FPU/SSE 任务状态保存（Lazy FPU，CR0.TS + #NM） | ✅ |
 | 扩展 | 范围 TLB Shootdown（IPI + invlpg + 32 页 CR3 阈值回退） | ✅ |
+| 扩展 | IPv6 协议栈（ICMPv6 + NDP 邻居发现） | ✅ |
+| 扩展 | POSIX Capability 安全模型（16 个 capability 位 + 三组掩码） | ✅ |
+| 扩展 | Arch 抽象层（M4 里程碑，x86_64 + riscv64 双实现） | ✅ |
+| 扩展 | 调度器 Profiling 基础设施（SchedStats + /proc/sched_stats） | ✅ |
 
 > **2026-06-21 SMP 性能三件套完成**：FPU/SSE 按任务保存 (`kernel/arch/x86_64/context_switch.zig`)、
 > Per-CPU 运行队列 + Work-Stealing (`kernel/proc/per_cpu.zig`, 256 槽 LIFO)、
 > 范围 TLB Shootdown (`kernel/arch/x86_64/tlb.zig`) 同时交付。三者互为前提，AP 首次
-> 可**真正**跨核运行用户任务。详见 [docs/moqios-architecture-current.md](docs/moqios-architecture-current.md)
-> §1.9 节。
+> 可**真正**跨核运行用户任务。
+>
+> **2026-06-21 新增功能**：IPv6 协议栈（ICMPv6 + NDP 邻居发现）、POSIX Capability 安全模型、
+> Arch 抽象层（M4 完成，x86_64 + riscv64 双实现）、调度器 Profiling 基础设施。
+> 详见 [docs/moqios-architecture-current.md](docs/moqios-architecture-current.md) §1.9–1.10 节。
 
 > **2026-06 引导稳定性修复**：修复了 4 个会导致内核无法启动或健壮性不足的缺陷
 > (SMP AP 启动死锁、内核栈多页映射破坏大页 HHDM、`Task` 巨型结构体导致引导栈溢出、
@@ -43,7 +50,6 @@
 >
 > **2026-06-21 SMP 性能三件套**：FPU/SSE 任务状态保存、Per-CPU 调度队列 + Work-Stealing、
 > 范围 TLB Shootdown 同时完成。三者互为前提，完成后用户任务可跨核迁移，AP 参与负载均衡。
-> 详见架构文档第 1.9 节。
 
 **用户程序**: ~2,300 行 C/ASM | **测试**: `hello2`–`hello28` 运行时测试 + 交互式 Shell
 (注: `zig build test` 当前为占位，实测以 QEMU 运行 `hello*` 为准)
@@ -72,8 +78,12 @@
 - **e1000** 千兆网卡驱动 (PCI, MMIO, 中断)
 - **ARP**: 地址解析，ARP 缓存表
 - **IPv4**: 校验和计算，数据包封装
+- **IPv6**: 40 字节固定头构建/解析 + 伪首部校验和
+- **ICMPv6**: Echo Request/Reply + Neighbor Solicitation/Advertisement
+- **NDP**: 64 项邻居缓存 + link-local EUI-64 地址生成
 - **ICMP**: Echo Reply (ping 响应)
 - **UDP**: sendto/recvfrom，5 个网络 syscall
+- **AF_INET6**: socket 支持 IPv6 地址族 (SOCK_STREAM/SOCK_DGRAM)
 - QEMU SLIRP 网络已验证 (ARP 回复 + ICMP ping)
 
 ### 内存管理
@@ -97,6 +107,21 @@
   从不使用 FPU 的内核线程零开销
 - **范围 TLB Shootdown**：`tlb.shootdownRange(addr, n)` 驱动 IPI + invlpg 精确无效化；
   超过 32 页阈值回退到 CR3 reload；集成到 mprotect/munmap 路径
+- **调度器 Profiling**：SchedStats 10 个计数器 + `/proc/sched_stats` 虚拟文件 +
+  `getStats()`/`resetStats()` 接口
+
+### 安全模型
+- **POSIX Capability**：16 个 capability 位（CAP_KILL/CAP_SETUID/CAP_NET_BIND_SERVICE 等）
+- 三组掩码：effective / permitted / inheritable
+- syscall 检查点：kill/bind/setuid/setgid/reboot/mount
+- init 默认 ALL_CAPS，fork 继承父进程 capability
+- capget/capset 系统调用读写真实三组掩码
+
+### 跨架构支持（M4 已完成）
+- **Arch 抽象层**：`kernel/arch/arch.zig` 统一接口入口（comptime 选择 ISA）
+- **x86_64 实现**：`arch_impl.zig` 重导出现有模块，零回归
+- **riscv64 实现**：SBI serial + stvec interrupts + stub paging/timer/context_switch
+- **迁移进度**：`main.zig` 串口已通过 `arch.zig` 引入，后续逐步迁移深度模块
 
 ## 系统调用列表
 

@@ -241,6 +241,8 @@ pub const FdTable = struct {
                 pfile = .filesystems;
             } else if (rest.len == 4 and str.eql(rest, "stat")) {
                 pfile = .stat;
+            } else if (rest.len == 11 and str.eql(rest, "sched_stats")) {
+                pfile = .sched_stats;
             } else if (rest.len > 0) {
                 // /proc/[pid]/status or /proc/[pid]/maps
                 var digit_end: usize = 0;

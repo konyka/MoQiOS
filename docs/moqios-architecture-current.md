@@ -1,15 +1,19 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.44.0（SMP 性能三件套）
+> **版本**: v0.45.0（SMP 性能三件套 + IPv6 + Capability + Arch 抽象层 + 调度器 Profiling）
 > **日期**: 2026-06-21
-> **代码统计**: 内核 ~38,900 行 Zig / 126 源文件（新增 `arch/x86_64/context_switch.zig`、
->   `arch/x86_64/tlb.zig`、`proc/per_cpu.zig`），用户空间 2,244 行 C/ASM
+> **代码统计**: 内核 ~40,500 行 Zig / 132 源文件（新增 `kernel/net/ipv6.zig`、
+>   `kernel/net/icmpv6.zig`、`kernel/net/ndp.zig`、`kernel/proc/cap_check.zig`、
+>   `kernel/arch/arch.zig`、`kernel/arch/x86_64/arch_impl.zig`、`kernel/arch/riscv64/arch_impl.zig`），
+>   用户空间 2,244 行 C/ASM
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
 >
 > **2026-06-21 更新**：SMP 性能三件套已全部完成（FPU/SSE 任务状态、Per-CPU 运行队列 +
-> Work-Stealing、范围 TLB Shootdown）。详见 **§1.9 节**。代码级审查以
+> Work-Stealing、范围 TLB Shootdown）。同日新增：调度器 Profiling 基础设施、IPv6 协议栈
+> （ICMPv6 + NDP）、POSIX Capability 安全模型、Arch 抽象层（M4 里程碑完成）。
+> 详见 **§1.9 节**、**§1.10 节**。代码级审查以
 > [current-code-review-and-fix-plan.md](./current-code-review-and-fix-plan.md) 为准。
 
 ---
@@ -34,7 +38,7 @@ MoQiOS 是一个运行在 x86_64 架构上的**单体内核** (Monolithic Kernel
 | 系统调用数量 | 383 dispatch 条目 (max #471, #0-#330 连续 + Linux #424-#471 完全连续) |
 | 文件系统 | FAT32 + ext2 (完整 symlink/hardlink/chown/chmod) + tmpfs + procfs + ramdisk + 统一页缓存 (命中/未中统计) |
 | 网络设备 | e1000 (中断驱动) + virtio-net (Virtqueue) |
-| 内核代码量 | 36,537 行 Zig / 125 文件 |
+| 内核代码量 | ~40,500 行 Zig / 132 文件 |
 | 用户代码量 | 2,244 行 C/ASM |
 
 ---
@@ -361,9 +365,66 @@ M8 路线图的最后三项重要 SMP 性能优化同时落地，**考虑到三�
 ### 1.9.4 总体意义
 
 三项优化互为前提：只有完整保存 FPU/SSE，任务才能跨核迁移；只有页表修改能精确传到
-其他核，多核共享地址空间才可靠；只有 work-stealing 拉起 AP，多核才从 "AP 上线但闲着"
-变为 "多核真并行"。本次三项同时交付后，MoQiOS 首次在 SMP 模式下拥有完整的 "多核调度 +
-独立 FPU 状态 + 页表同步" 三位一体。
+其他核，多核共享地址空间才可靠；只有 work-stealing 拉起 AP，多核才从 “AP 上线但闲着”
+变为 “多核真并行”。本次三项同时交付后，MoQiOS 首次在 SMP 模式下拥有完整的 “多核调度 +
+独立 FPU 状态 + 页表同步” 三位一体。
+
+### 1.9.5 调度器 Profiling 基础设施（2026-06-21 完成）
+
+文件：`kernel/proc/per_cpu.zig`, `kernel/fs/procfs.zig`
+
+- **SchedStats 结构**：每 CPU 一份，含 10 个计数器（`local_enqueues` / `local_dequeues` /
+  `steal_attempts` / `steal_successes` / `tasks_stolen` / `idle_cycles` /
+  `schedule_calls` / `queue_depth_sum` / `sample_count`）。
+- **自动计数**：`push`/`pop`/`steal_half`/`tryStealForCurrent`/`pickNext` 关键路径
+  透明递增对应计数器。
+- **procfs 导出**：`/proc/sched_stats` 虚拟文件，每 CPU 一行统计。
+- **公共接口**：`getStats()` 获取快照、`resetStats()` 重置计数器。
+- **用途**：性能调优、负载均衡行为可观测性、工作窃取策略效果验证。
+
+---
+
+## 1.10 新增功能（2026-06-21，v0.45.0）
+
+### 1.10.1 IPv6 协议栈
+
+文件：`kernel/net/ipv6.zig`、`kernel/net/icmpv6.zig`、`kernel/net/ndp.zig`
+
+- **IPv6**：40 字节固定头构建/解析 + 伪首部校验和
+- **ICMPv6**：Echo Request/Reply + Neighbor Solicitation/Advertisement
+- **NDP**：64 项邻居缓存 + link-local EUI-64 地址生成
+- **集成**：`eth.zig` 新增 ETHERTYPE_IPV6 = 0x86DD；`mod.zig` `handleRxPacket` 增加
+  IPv6 分发；`socket_syscall.zig` 支持 AF_INET6 = 10（SOCK_STREAM/SOCK_DGRAM）
+
+### 1.10.2 POSIX Capability 安全模型
+
+文件：`kernel/ipc/capability.zig`、`kernel/proc/cap_check.zig`、`kernel/proc/task.zig`
+
+- **SysCap packed struct**：16 个 POSIX capability 位（CAP_KILL/CAP_SETUID/CAP_NET_BIND_SERVICE 等）
+- **Task 三组字段**：`effective_caps` / `permitted_caps` / `inheritable_caps`
+- **cap_check.zig**：`capable()` / `requireCap()` / `dropCap()` / `computeExecCaps()`
+- **syscall 检查点**：kill/bind/setuid/setgid/reboot/mount 插入 capability 检查
+- **capget/capset**：重写为真实三组掩码读写
+- **继承策略**：fork 继承父进程三组 capability；init 默认 ALL_CAPS 向下兼容
+
+### 1.10.3 Arch 抽象层（M4 里程碑完成）
+
+文件：`kernel/arch/arch.zig`、`kernel/arch/x86_64/arch_impl.zig`、`kernel/arch/riscv64/arch_impl.zig`
+
+- **统一入口**：`arch.zig` 根据 `builtin.cpu.arch` comptime 选择实现
+- **x86_64 实现**：`arch_impl.zig` 重导出现有模块，零回归
+- **riscv64 实现**：SBI serial + stvec interrupts + stub paging/timer/context_switch
+- **首步迁移**：`main.zig` 串口通过 `arch.zig` 引入
+- **下一步**：逐步迁移 gdt/idt/paging 等深度模块
+
+### 1.10.4 调度器 Profiling 基础设施
+
+文件：`kernel/proc/per_cpu.zig`、`kernel/fs/procfs.zig`
+
+- **SchedStats**：10 个计数器的 per-CPU 统计结构
+- **自动计数**：push/pop/steal_half/tryStealForCurrent/pickNext 关键路径透明统计
+- **procfs 导出**：`/proc/sched_stats` 虚拟文件，每 CPU 一行
+- **接口**：`getStats()` / `resetStats()`
 
 ---
 
@@ -971,8 +1032,11 @@ LAPIC Timer 中断
   ├─ UDP 层 (udp.zig) — 端口复用，校验和计算
   ├─ ICMP 层 (icmp.zig) — Echo Reply 响应
   ├─ IPv4 层 (ipv4.zig) — 校验和，路由
+  ├─ IPv6 层 (ipv6.zig) — 40字节固定头 + 伪首部校验和
+  ├─ ICMPv6 层 (icmpv6.zig) — Echo + Neighbor Solicitation/Advertisement
+  ├─ NDP 层 (ndp.zig) — 64项邻居缓存 + EUI-64 link-local
   ├─ ARP 层 (arp.zig) — 地址解析缓存
-  ├─ Ethernet 层 (eth.zig) — 帧封装
+  ├─ Ethernet 层 (eth.zig) — 帧封装 (IPv4/ARP/IPv6)
   │
   ├─ 网络接口层 (netif.zig) — 接口管理
   ├─ e1000 驱动 (drivers/e1000.zig, 453 行)
@@ -1120,6 +1184,10 @@ kernel/main.zig
   │   ├── tsc.zig          — TSC 时钟
   │   └── exception.zig    — 异常处理器
   │
+  ├── arch/arch.zig          — Arch 抽象层统一入口 (comptime ISA 选择)
+  ├── arch/x86_64/arch_impl.zig — x86_64 实现 (重导出现有模块)
+  ├── arch/riscv64/arch_impl.zig — riscv64 实现 (SBI serial + stvec + stubs)
+  │
   ├── mm/
   │   ├── pmm.zig          — 物理内存分配器 (两级位图)
   │   ├── slab.zig         — Slab 分配器
@@ -1129,9 +1197,10 @@ kernel/main.zig
   │   └── copy_from_user.zig — 用户空间安全访问
   │
   ├── proc/
-  │   ├── task.zig         — Task 结构体 + 进程管理
+  │   ├── task.zig         — Task 结构体 + 进程管理 + capability 字段
   │   ├── scheduler.zig    — O(1) 位图调度器 + Work Stealing
   │   ├── loader.zig       — ELF 加载器 + 栈构建
+  │   ├── cap_check.zig    — Capability 检查 (capable/requireCap/dropCap)
   │   └── signal.zig       — 信号投递
   │
   ├── fs/
@@ -1139,7 +1208,7 @@ kernel/main.zig
   │   ├── fat32.zig        — FAT32 实现
   │   ├── ext2.zig         — ext2 实现 (hardlink/symlink/chown/chmod/xattr)
   │   ├── tmpfs.zig        — 内存文件系统
-  │   ├── procfs.zig       — 进程文件系统 (11种虚拟文件)
+  │   ├── procfs.zig       — 进程文件系统 (12种虚拟文件, 含 /proc/sched_stats)
   │   ├── ramdisk.zig      — ramdisk 设备
   │   ├── eventfd.zig      — eventfd 事件通知
   │   ├── writeback.zig    — 写回缓存
@@ -1157,10 +1226,13 @@ kernel/main.zig
   ├── net/
   │   ├── mod.zig          — 网络模块初始化
   │   ├── netif.zig        — 网络接口
-  │   ├── eth.zig          — Ethernet 帧
+  │   ├── eth.zig          — Ethernet 帧 (IPv4/ARP/IPv6)
   │   ├── arp.zig          — ARP 协议
   │   ├── ipv4.zig         — IPv4 协议
+  │   ├── ipv6.zig         — IPv6 协议 (40B 头 + 伪首部校验和)
   │   ├── icmp.zig         — ICMP 协议
+  │   ├── icmpv6.zig       — ICMPv6 (Echo + NDP 消息)
+  │   ├── ndp.zig          — NDP 邻居发现 (64项缓存 + EUI-64)
   │   ├── udp.zig          — UDP 协议
   │   ├── tcp.zig          — TCP 协议 (Reno/SACK/WS/TS/CORK/QUICKACK)
   │   ├── socket.zig       — Socket 抽象层
@@ -1175,6 +1247,7 @@ kernel/main.zig
   │
   └── ipc/
       ├── ipc.zig          — 消息传递 + 能力系统
+      ├── capability.zig   — SysCap packed struct (16 POSIX capability 位)
       └── pipe.zig         — 管道实现
 ```
 
@@ -1184,11 +1257,11 @@ kernel/main.zig
 
 1. **AP 定时器**: AP 无 LAPIC 定时器中断 (QEMU TCG 限制)，需要 KVM 或真机
 2. **调度器时序敏感**: 增加进程数量会导致其他进程间歇性挂起
-3. **无安全模型**: 无用户权限、capability 等安全机制
+3. **无安全模型**: ~~无用户权限、capability 等安全机制~~ **已实现 POSIX Capability 模型**（v0.45.0）16 个 capability 位 + 三组掩码 + syscall 检查点
 4. **e1000/virtio-net 仅 QEMU**: 未测试真实硬件
 5. **无 Windows 兼容**: 当前仅支持 Linux ELF 二进制格式
-6. **无 IPv6**: 网络协议栈仅支持 IPv4
-7. **TCP 连接数限制**: 最大 32 个并发 TCP 连接 (32K 发送/接收缓冲)
+6. **~~无 IPv6~~**: 网络协议栈已支持 IPv6（v0.45.0），含 ICMPv6 + NDP 邻居发现
+7. **TCP 连接数限制**: 最大 64 个并发 TCP 连接 (64KB 发送/接收缓冲)
 8. **无分片重组**: IPv4 不支持分片重组 (MTU 1500 单帧)
 9. **AIO 同步执行**: io_submit 在持有 aio_lock 期间同步执行 I/O，不支持真正异步
 10. **copy_from_user 无 per-instruction fault recovery**: 当前已先做用户页表 present/user 校验以避免
@@ -1222,7 +1295,7 @@ kernel/main.zig
 | kernel/mm/slab.zig | ~200 | Slab 分配器 |
 | kernel/mm/swap.zig | ~267 | Swap 页面置换 (Clock算法 + u64位图@ctz分配) |
 | kernel/fs/eventfd.zig | 165 | eventfd 事件通知 |
-| kernel/fs/procfs.zig | 333 | procfs 11种虚拟文件 |
+| kernel/fs/procfs.zig | ~380 | procfs 12种虚拟文件 (含 /proc/sched_stats) |
 | kernel/sync/ | ~600 | IrqSpinlock/TicketLock/Mutex/RwLock/SeqLock/MPMC |
 
-**总计: 122 个 .zig 文件, 38,560 行**
+**总计: 132 个 .zig 文件, ~40,500 行**

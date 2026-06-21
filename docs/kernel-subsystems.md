@@ -8,6 +8,9 @@
 > Work-Stealing、范围 TLB Shootdown）已全部实现并集成，本文相关章节（§2.2 调度器、
 > §2.7 FPU/SSE 状态管理、§9 SMP 多核）均已更新。代码级审查与历史修复顺序仍见
 > [current-code-review-and-fix-plan.md](./current-code-review-and-fix-plan.md)。
+>
+> **2026-06-21 新增功能**: 调度器 Profiling 基础设施（§2.8）、IPv6 协议栈（§4.10–4.12）、
+> POSIX Capability 安全模型（§5.9）、Arch 抽象层（§11）。
 
 ---
 
@@ -23,6 +26,7 @@
 8. [ACPI 子系统](#8-acpi-子系统)
 9. [SMP 多核](#9-smp-多核)
 10. [子系统依赖关系](#10-子系统依赖关系)
+11. [Arch 抽象层](#11-arch-抽象层)
 
 实现状态图例: ✅ 完整 / ⚠️ 部分 / 🧩 框架
 
@@ -228,11 +232,52 @@ const Task = struct {
   `switchContext(prev, next)`（`arch/x86_64/context.S`）。
 
 **API**：`schedule()` / `yield()` / `wakeup(task)` / `sleep(ms)` / `addTask(task)` /
-`per_cpu.enqueueTask(t)` / `per_cpu.tryStealForCurrent()`。
+`per_cpu.enqueueTask(t)` / `per_cpu.tryStealForCurrent()`.
 
 **意义**：在此之前 SMP 模式下所有 CPU 共享一把全局 `sched_lock` + 静态任务表的亲和性
 扫描，AP 只能跑被显式绑定到自己的任务；现在 AP 通过 work-stealing **真正参与用户任务并行**，
 忙 CPU 主动卸载、闲 CPU 主动拉取。
+
+### 2.8 调度器 Profiling 基础设施 ✅（2026-06-21 完成）
+
+文件: `proc/per_cpu.zig`, `fs/procfs.zig`
+
+**SchedStats 结构体**
+
+```zig
+const SchedStats = struct {
+    local_enqueues: u64,      // 本地入队次数
+    local_dequeues: u64,      // 本地出队次数
+    steal_attempts: u64,      // 窃取尝试次数
+    steal_successes: u64,     // 窃取成功次数
+    tasks_stolen: u64,        // 被窃取的任务总数
+    idle_cycles: u64,         // 空闲周期计数
+    schedule_calls: u64,      // schedule() 调用次数
+    queue_depth_sum: u64,     // 队列深度累加（用于计算平均）
+    sample_count: u64,        // 采样次数
+};
+```
+
+**关键路径自动计数**
+
+- `push`：递增 `local_enqueues`
+- `pop`：递增 `local_dequeues`
+- `steal_half`：递增 `steal_attempts`；成功时递增 `steal_successes` + 累加 `tasks_stolen`
+- `tryStealForCurrent`：窃取扫描入口统计
+- `pickNext`：递增 `schedule_calls`，累加当前 `queue_depth_sum` / `sample_count`
+
+**procfs 导出**
+
+- 虚拟文件路径：`/proc/sched_stats`
+- 格式：每 CPU 一行，包含所有 10 个计数器的当前值
+- 用途：性能调优、负载均衡行为可观测性
+
+**公共 API**
+
+| 函数 | 描述 |
+|---|---|
+| `getStats() SchedStats` | 获取当前 CPU 的调度统计快照 |
+| `resetStats()` | 重置当前 CPU 的所有统计计数器 |
 
 ### 2.3 ELF 加载器 ✅
 
@@ -441,7 +486,7 @@ e1000 (中断驱动) / virtio-net (Virtqueue)
 文件: `eth.zig`
 
 - 14 字节帧头（dst MAC + src MAC + ethertype）
-- ethertype: 0x0800 (IPv4) / 0x0806 (ARP) / 0x86DD (IPv6, 未实现)
+- ethertype: 0x0800 (IPv4) / 0x0806 (ARP) / 0x86DD (IPv6)
 
 ### 4.3 ARP ✅
 
@@ -502,6 +547,42 @@ e1000 (中断驱动) / virtio-net (Virtqueue)
 
 - 支持TCP socket事件检测（POLLIN/POLLOUT/POLLHUP）
 - 集成poll()系统调用，单线程监听多连接
+
+### 4.10 IPv6 协议栈 ✅（2026-06-21 完成）
+
+文件: `kernel/net/ipv6.zig`
+
+- 40 字节固定头部构建与解析（Version/Traffic Class/Flow Label/Payload Length/Next Header/Hop Limit）
+- 伪首部校验和计算（供 ICMPv6/TCP/UDP over IPv6 使用）
+- `mod.zig` `handleRxPacket` 增加 IPv6（ETHERTYPE_IPV6 = 0x86DD）分发路径
+- `eth.zig` 新增 `ETHERTYPE_IPV6 = 0x86DD` 常量
+
+### 4.11 ICMPv6 ✅（2026-06-21 完成）
+
+文件: `kernel/net/icmpv6.zig`
+
+- Echo Request / Echo Reply（IPv6 ping）
+- Neighbor Solicitation（邻居请求）
+- Neighbor Advertisement（邻居通告）
+- ICMPv6 校验和（含 IPv6 伪首部）
+
+### 4.12 NDP 邻居发现协议 ✅（2026-06-21 完成）
+
+文件: `kernel/net/ndp.zig`
+
+- 64 项邻居缓存表（IPv6 地址 → MAC 地址映射）
+- link-local 地址自动生成（EUI-64 从 MAC 地址派生）
+- Neighbor Solicitation 发送与处理
+- Neighbor Advertisement 响应
+- 缓存老化机制
+
+### 4.13 AF_INET6 Socket 支持 ✅（2026-06-21 完成）
+
+文件: `socket_syscall.zig`
+
+- `AF_INET6 = 10` 地址族支持
+- SOCK_STREAM（TCP over IPv6）与 SOCK_DGRAM（UDP over IPv6）创建
+- 与现有 socket API（bind/connect/send/recv）集成
 
 ### 4.8 Socket API ✅ 完整 BSD-like Socket 接口
 
@@ -639,6 +720,62 @@ const CapTable = [32]Capability; // 每任务
 - timer_getoverrun: 读取超时计数
 - timer_delete: 删除定时器
 - 系统调用: #222-226 (x86_64 标准编号)
+
+### 5.9 POSIX Capability 安全模型 ✅（2026-06-21 完成）
+
+文件: `kernel/ipc/capability.zig`, `kernel/proc/cap_check.zig`, `kernel/proc/task.zig`, `kernel/arch/x86_64/syscall_entry.zig`
+
+**SysCap packed struct（16 个 POSIX capability 位）**
+
+```zig
+const SysCap = packed struct {
+    cap_chown: bool,
+    cap_dac_override: bool,
+    cap_fowner: bool,
+    cap_kill: bool,
+    cap_setgid: bool,
+    cap_setuid: bool,
+    cap_net_bind_service: bool,
+    cap_net_raw: bool,
+    cap_sys_boot: bool,
+    cap_sys_admin: bool,
+    cap_sys_resource: bool,
+    cap_sys_time: bool,
+    cap_mknod: bool,
+    cap_audit_write: bool,
+    cap_setfcap: bool,
+    cap_mac_admin: bool,
+};
+```
+
+**Task 字段扩展**
+
+- `effective_caps: SysCap`：当前有效 capability 集
+- `permitted_caps: SysCap`：允许持有的 capability 上限
+- `inheritable_caps: SysCap`：可继承给子进程的 capability 集
+
+**cap_check.zig 核心 API**
+
+| 函数 | 描述 |
+|---|---|
+| `capable(task, cap) bool` | 检查任务是否持有指定 capability |
+| `requireCap(task, cap) !void` | 要求 capability，缺失则返回 EPERM |
+| `dropCap(task, cap)` | 从 effective 集中移除指定 capability |
+| `computeExecCaps(parent, child)` | execve 时计算子进程 capability（继承规则） |
+
+**syscall 检查点集成**
+
+- `kill`：要求 `CAP_KILL`
+- `bind`（特权端口 <1024）：要求 `CAP_NET_BIND_SERVICE`
+- `setuid` / `setgid`：要求 `CAP_SETUID` / `CAP_SETGID`
+- `reboot`：要求 `CAP_SYS_BOOT`
+- `mount`：要求 `CAP_SYS_ADMIN`
+
+**继承与初始化**
+
+- init 进程默认 `ALL_CAPS`（所有位为 1），向下兼容现有行为
+- `fork.zig`：子进程继承父进程三组 capability
+- `capget` / `capset` 系统调用：读写真实三组掩码（effective/permitted/inheritable）
 
 ---
 
@@ -957,6 +1094,45 @@ pub fn shootdownRange(addr_start: u64, page_count: u32) void
 - `fs` 依赖 `drivers/virtio_blk` 或 `ramdisk`。
 - `proc` 依赖 `mm`、`fs`（FD 表 / ELF 文件读取）。
 - `ipc` 在 `proc` 之上构建。
+
+---
+
+## 11. Arch 抽象层
+
+源码: `kernel/arch/arch.zig`, `kernel/arch/x86_64/arch_impl.zig`, `kernel/arch/riscv64/arch_impl.zig`
+
+### 11.1 统一接口入口 ✅（2026-06-21 完成 / M4 里程碑）
+
+文件: `kernel/arch/arch.zig`
+
+- `comptime` 根据 `builtin.cpu.arch` 自动选择对应架构实现
+- 当前支持 x86_64 和 riscv64 两种架构
+- 内核上层代码通过 `@import("arch/arch.zig")` 引入，无需关心具体 ISA
+- 首步迁移：`main.zig` 串口通过 `arch.zig` 引入（渐进式迁移策略）
+
+### 11.2 x86_64 实现 ✅
+
+文件: `kernel/arch/x86_64/arch_impl.zig`
+
+- 重导出现有模块（serial、gdt、idt、paging、lapic、tsc 等）
+- 与现有代码完全兼容，零回归
+
+### 11.3 riscv64 实现 ✅
+
+文件: `kernel/arch/riscv64/arch_impl.zig`
+
+- **串口**：SBI legacy console 输出
+- **中断**：`stvec` 向量配置 + 基本 trap 帧
+- **分页**：stub（待 M3 里程碑实现 Sv39）
+- **定时器**：stub（待 M5 里程碑接入 CLINT/SBI timer）
+- **上下文切换**：stub（待 M5 里程碑实现）
+
+### 11.4 设计原则
+
+- **渐进迁移**：不做大爆炸重构，每次迁移一个模块到 `arch.zig` 接口后面
+- **x86_64 不回归**：每步保持可构建、x86_64 启动到 shell
+- **薄接口**：仅抽象「硬件相关、其余内核必须调用」的能力
+- **下一步**：逐步迁移 gdt/idt/paging 等深度模块到 arch 接口后面
 
 ---
 

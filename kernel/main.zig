@@ -3,7 +3,10 @@
 /// TSC, symbol table, PMM, paging, ACPI, slab allocator, DMA stubs,
 /// LAPIC timer, scheduler, IPC engine, user-space support.
 const limine = @import("limine.zig");
-const serial = @import("arch/x86_64/serial.zig");
+const arch = @import("arch/arch.zig");
+// M4: route serial through the arch abstraction layer (still x86_64-only behind
+// the scenes; gdt/idt/etc. remain direct imports until later milestones).
+const serial = arch.serial;
 const gdt = @import("arch/x86_64/gdt.zig");
 const idt = @import("arch/x86_64/idt.zig");
 const hhdm = @import("mm/hhdm.zig");
