@@ -44,9 +44,14 @@ pub fn spawn(name_ptr: u64) i64 {
         if (t.getTask(task_idx)) |new_task| {
             const se = @import("../arch/x86_64/syscall_entry.zig");
             const my_cpu: u8 = @intCast(se.getPerCpu().cpu_id);
-            if (new_task.cpu_affinity != my_cpu) {
+            // Task #2: prefer hard affinity, fall back to last_cpu (initial placement).
+            const target_cpu: u8 = if (new_task.cpu_affinity >= 0)
+                @intCast(new_task.cpu_affinity)
+            else
+                new_task.last_cpu;
+            if (target_cpu != my_cpu) {
                 asm volatile ("mfence" ::: .{ .memory = true });
-                sched.kickCpu(new_task.cpu_affinity);
+                sched.kickCpu(target_cpu);
             }
             return @intCast(new_task.tid);
         }

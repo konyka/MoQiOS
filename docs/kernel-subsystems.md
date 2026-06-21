@@ -1,11 +1,12 @@
 # MoQiOS 内核子系统详细设计
 
 > **文档定位**: 描述 MoQiOS 内核各子系统的核心数据结构、API、实现状态与依赖关系。
-> **修订日期**: 2026-06-16
+> **修订日期**: 2026-06-21
 > **关联文档**: [moqios-architecture-current.md](./moqios-architecture-current.md)
 >
-> **2026-06-21 review 注记**: 本文部分章节仍混有目标设计和历史计划，例如调度器、work stealing
-> 与若干 syscall/helper 模块的完成度。当前代码级审查和修复顺序见
+> **2026-06-21 更新**: SMP 性能三件套（FPU/SSE 按任务 lazy save、Per-CPU 运行队列 +
+> Work-Stealing、范围 TLB Shootdown）已全部实现并集成，本文相关章节（§2.2 调度器、
+> §2.7 FPU/SSE 状态管理、§9 SMP 多核）均已更新。代码级审查与历史修复顺序仍见
 > [current-code-review-and-fix-plan.md](./current-code-review-and-fix-plan.md)。
 
 ---
@@ -204,18 +205,34 @@ const Task = struct {
 
 最多 64 个任务（静态数组）。凭证字段在 fork/clone 时继承，默认值 0 (root)。
 
-### 2.2 调度器 ✅ O(1) 优先级位图 + Per-CPU 队列 + Work Stealing
+### 2.2 调度器 ✅ Per-CPU 运行队列 + Work-Stealing（2026-06-21 完成）
 
-文件: `scheduler.zig`
+文件: `proc/sched.zig`, `proc/per_cpu.zig`, `proc/task.zig`
 
-- O(1) 优先级位图调度：32 级优先级，每级一个双向链表
-- `pickNext() = @ctz(bitmap) + popFront() = O(1)`
-- Per-CPU 运行队列：每 CPU 独立优先级位图 + 队列
-- 任务窃取（Work Stealing）：空闲 CPU 从其他 CPU 队列尾部窃取任务，平衡负载
-- 时间片 10 个 tick（100ms），抢占式
-- LAPIC timer ISR 触发 `schedule()`，调用 `switchContext(prev, next)`（`arch/x86_64/context.S`）
+**当前实现（M8-7 已完成 ✅）**
 
-**API**: `schedule()` / `yield()` / `wakeup(task)` / `sleep(ms)` / `addTask(task)` / `stealTask(cpu)`。
+- **Per-CPU 运行队列**：`proc/per_cpu.zig` 定义 `PerCpuRunQueue` 结构，每 CPU 一份；
+  256 槽环形缓冲区（`QUEUE_SIZE=256`），由 `IrqSpinlock` 保护。
+- **本地 LIFO 操作**：`push` / `pop` 在 `head` 端 O(1) 操作（最近压入的任务先出，
+  最大化 L1/L2 缓存复用）。
+- **Work-Stealing**：仅当本地队列为空（idle）时触发，`tryStealForCurrent` 以
+  TSC 派生的随机 CPU 为起点扫描其他 CPU 的队列，调用 `steal_half` 从对端 `tail`
+  端窃取约一半任务（>1 才偷，留 1 给被偷者避免乒乓）。
+- **CPU 亲和性尊重**：`Task.cpu_affinity: i8`（`-1` = 不绑定，可被偷；`>=0` = 绑定到
+  指定 CPU），`steal_half` 跳过被绑定到其他 CPU 的任务并将其放回原队列。
+- **`Task.last_cpu: u8`**：记录任务最近一次运行的 CPU，作为 enqueue 时的归位提示
+  （warm cache hint）。
+- **调度入口 `pickNext` 三段式回退**：① 本地 `pop` → ② `tryStealForCurrent` 跨核
+  窃取 → ③ 全局位图回退（`task.pickReadyForCpu`，与亲和性扫描兼容）。
+- 时间片 10 个 tick（100ms），LAPIC timer ISR 触发 `schedule()`，调用
+  `switchContext(prev, next)`（`arch/x86_64/context.S`）。
+
+**API**：`schedule()` / `yield()` / `wakeup(task)` / `sleep(ms)` / `addTask(task)` /
+`per_cpu.enqueueTask(t)` / `per_cpu.tryStealForCurrent()`。
+
+**意义**：在此之前 SMP 模式下所有 CPU 共享一把全局 `sched_lock` + 静态任务表的亲和性
+扫描，AP 只能跑被显式绑定到自己的任务；现在 AP 通过 work-stealing **真正参与用户任务并行**，
+忙 CPU 主动卸载、闲 CPU 主动拉取。
 
 ### 2.3 ELF 加载器 ✅
 
@@ -255,6 +272,43 @@ const Task = struct {
 - 支持TCP socket / 管道 / 文件描述符
 - 事件类型：POLLIN / POLLOUT / POLLHUP / POLLNVAL
 - 带超时机制（毫秒级）
+
+### 2.7 FPU/SSE 任务状态管理（Lazy FPU） ✅（2026-06-21 完成 / M8-5b-3）
+
+文件: `arch/x86_64/context_switch.zig`, `proc/task.zig`, `arch/x86_64/idt.zig`
+
+**目标**：让 FPU/SSE 寄存器作为任务私有状态，使任务可在 CPU 间安全迁移（解锁 work-stealing
+中的用户任务跨核搬运），同时对**从不**触碰 FPU 的内核线程零开销。
+
+**Task 字段扩展**
+
+```zig
+fpu_state: [512]u8 align(16) = ...,  // FXSAVE 区，16 字节对齐
+fpu_initialized: bool = false,        // 是否曾经触发过 #NM（有效 fpu_state）
+fpu_owned: bool = false,              // 当前是否在某 CPU 上"持有" FPU
+```
+
+**Per-CPU 状态**：`context_switch.fpu_owners: [MAX_CPUS]?*Task` 追踪每个 CPU 当前
+FPU 持有者（仅本地 CPU 在自己的 #NM handler 中读写，无锁）。
+
+**初始化（per CPU）**：`context_switch.initCpu()` 设置 CR4.OSFXSR | CR4.OSXMMEXCPT，
+清 CR0.EM、置 CR0.MP | CR0.TS。BSP 在 `main.zig`、AP 在 `smp.zig` `apEntry` 各自调用一次。
+
+**Lazy 切换流程**
+
+1. **上下文切换出**（`onContextSwitch(old)`）：若 `old.fpu_owned`，eager `fxsave` 到
+   `old.fpu_state`；然后 `setTs()` 置 CR0.TS，给即将上 CPU 的新任务下一道"如果敢碰
+   FPU 就 #NM"的安全网。
+2. **新任务首次访问 FPU** → CPU 抛 `#NM`（vector 7） →
+   `idt.handleException` 路由到 `context_switch.handleDeviceNotAvailable()`：
+   - `clts` 清 CR0.TS；
+   - 若该 CPU 的 `fpu_owners[cpu]` 不是当前任务，将旧 owner `fpu_owned = false`；
+   - 当前任务 `fpu_initialized` ? `fxrstor` 还原 : `fninit` 重置；
+   - 标记当前任务 `fpu_owned = true`，更新 `fpu_owners[cpu]`。
+
+**正确性要点**：`#NM` 处理路径**绝不获取调度器/任务锁**——它可能在内核临界区中被触发
+（如某段内核代码恰好用了 SSE）。所有状态都通过"本 CPU 独占的 fpu_owners 槽 + 任务自身字段"
+避免锁。
 
 ---
 
@@ -758,7 +812,7 @@ const TicketSpinlock = struct {
 
 源码: `kernel/smp.zig`, `kernel/proc/{sched,task,waitpid}.zig`, `kernel/arch/x86_64/{gdt,idt,lapic,syscall_entry}.zig`
 
-### 9.1 当前状态（v27.0，2026-05-29） ✅ 双核稳定到 shell
+### 9.1 当前状态（2026-06-21） ✅ SMP 性能三件套全部完成
 
 | 能力 | 状态 |
 |---|---|
@@ -769,10 +823,10 @@ const TicketSpinlock = struct {
 | 跨核 `waitpid`（`wait_cpu` + `kickChildCpus`） | ✅ |
 | `Task.saved_user_rsp` + 切换同步 | ✅ 5b-2d |
 | AP 栈 allocContiguous + BSP reap setSlice(1) + TLB EOI + sleepOn forceReschedule | ✅ v27.0 |
-| AP 上 ELF 用户任务并行 | ⬜ 5b-2c |
-| FPU/SSE 按任务 | ⬜ 5b-3 |
-| 范围 TLB shootdown | ⬜ M8-6 |
-| per-CPU 运行队列 + work-stealing | ⬜ M8-7 |
+| AP 上 ELF 用户任务并行（通过 work-stealing 真正生效） | ✅ 5b-2c |
+| FPU/SSE 按任务（lazy save/restore via CR0.TS + #NM） | ✅ 5b-3（2026-06-21）|
+| 范围 TLB shootdown（IPI + invlpg loop + 阈值 CR3 回退） | ✅ M8-6（2026-06-21）|
+| per-CPU 运行队列 + work-stealing | ✅ M8-7（2026-06-21）|
 
 验证：`MOQI_SMP=1` 与 `MOQI_SMP=2` 均完整跑通 `init` + `hello2`–`hello28` 到 `MoQiOS shell`。
 
@@ -801,15 +855,49 @@ const TicketSpinlock = struct {
 - `stealTask()` / `dequeueTask()` 改用运行时 `activeCpuCount()`，避免越界访问 Per-CPU 数组
 - 优雅降级：MADT 报告超出 `MAX_CPUS` 的核心被截断而非崩溃
 
-### 9.5 TLB shootdown IPI ⚠️（CR3 全刷，M8-6 待范围 invlpg）
+### 9.5 范围 TLB Shootdown ✅（2026-06-21 完成 / M8-6）
 
-文件: `idt.zig`, `lapic.zig`, `paging.zig`
+文件: `arch/x86_64/tlb.zig`, `idt.zig`, `lapic.zig`, `mm/mprotect.zig`, `mm/mmap.zig`
 
-- 向量号 `0xFE`（高端未占用，避免与设备 IRQ 冲突）
-- 发起方：`lapic.sendIpiAllExcludingSelf(0xFE)` 广播
-- 同步：原子计数器（`AtomicU32`），主 CPU 等待所有 AP 完成（最多 1M 次 pause 超时保护，防止单核挂死整个系统）
-- 接收端 ISR：CR3 重载（整页 TLB 刷新）+ `fetchSub` 递减计数 + EOI
-- `idt.zig` 中向量 `0xFE` 分发到 `handleTlbShootdown()`
+**目标**：替换原来的 "广播 IPI → 远端 CR3 全刷" 粗粒度方案为按页范围 invlpg
+精确无效化，避免 mprotect / munmap 单页操作导致整张 TLB 报废，同时保证多核共享地址
+空间下的页表修改一致性。
+
+**核心 API**
+
+```zig
+pub fn shootdownRange(addr_start: u64, page_count: u32) void
+```
+
+**结构**
+
+- 单一全局请求槽 `shootdown_req: TlbShootdownReq`（`addr_start` / `page_count` /
+  `completion` 原子计数器 / `active` 标志）。
+- 多发起方串行化通过自定义 **`TlbLock`**（不是 `IrqSpinlock`）：等待时**主动
+  开中断**，避免两个 CPU 互相等对方接收 IPI 导致的跨核死锁。
+- 向量号沿用既有 `TLB_SHOOTDOWN_VECTOR = 0xFE`。
+
+**算法（发起方）**
+
+1. 本地 `flushLocal(addr, n)`（≤32 页 → invlpg 循环；>32 页 → CR3 reload）。
+2. SMP 未上线（`smp.cpu_count <= 1`）直接返回。
+3. 持 `shootdown_lock`，发布请求到全局槽，把 `completion` 设为远端 CPU 数。
+4. `lapic.sendIpiAllButSelf(0xFE)` 广播。
+5. `sti` 后 `pause` 自旋等 `completion == 0`；`cli` 后释放锁。
+
+**算法（IPI 接收方）**
+
+1. 内联 EOI（直接写 LAPIC EOI 寄存器，避免在 IPI 快路径上拉入 lapic helpers）。
+2. acquire 加载 `addr_start` / `page_count`，调用 `flushLocal`。
+3. `@atomicRmw(.Sub, 1)` 递减 `completion`。
+4. **不获取任何锁**，仅原子，对中断重入安全。
+
+**阈值策略**：`FLUSH_THRESHOLD = 32`。超过 32 页改用 CR3 reload（用户页面非 global，
+语义等价但比长串 invlpg 快）。
+
+**集成点**：
+- `mm/mprotect.zig` 修改 PTE 标志后调用 `tlb.shootdownRange`。
+- `mm/mmap.zig` 的 unmap 路径在解映射后调用 `tlb.shootdownRange`。
 
 ---
 

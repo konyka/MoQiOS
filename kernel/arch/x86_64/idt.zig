@@ -268,6 +268,14 @@ pub fn interruptDispatch(frame: *InterruptFrame) callconv(.c) void {
     const vector: u8 = @truncate(frame.vector);
 
     if (vector < 32) {
+        // Vector 7 (#NM, Device Not Available) drives the lazy FPU/SSE
+        // restore path — NOT a fatal exception. Handle it here and let the
+        // offending instruction re-execute via iretq.
+        if (vector == 7) {
+            const context_switch = @import("context_switch.zig");
+            context_switch.handleDeviceNotAvailable();
+            return;
+        }
         // CPU exception — fatal for now
         handleException(frame);
         return; // unreachable (noreturn inside), but satisfies type checker
@@ -309,20 +317,15 @@ fn handleReschedule(frame: *InterruptFrame) void {
 /// TLB shootdown IPI (vector 254) — another CPU changed a shared mapping and
 /// asked this CPU to invalidate its stale TLB entries.
 ///
-/// M8-1 ships the coarse fallback: reload CR3 to flush all non-global entries
-/// (user mappings are never global, so this covers cross-CPU user page changes).
-/// M8-6 refines this to ranged `invlpg` via a per-CPU shootdown descriptor.
-/// Dormant until APs are online; nobody sends this vector in uniprocessor mode.
+/// M8-6: delegated to `tlb.handleShootdownIpi` which reads the published
+/// shootdown range, performs ranged `invlpg` (or CR3 reload above the
+/// threshold), then acknowledges by decrementing the global completion
+/// counter. EOI happens inside the handler so the LAPIC can deliver more
+/// interrupts while the flush is in progress.
 fn handleTlbShootdown(frame: *InterruptFrame) void {
     _ = frame;
-    // EOI first: acknowledge the IPI so the LAPIC can accept further interrupts
-    // while we perform the (potentially slow) CR3 reload TLB flush.
-    const lapic = @import("lapic.zig");
-    lapic.eoi();
-    asm volatile (
-        \\movq %%cr3, %%rax
-        \\movq %%rax, %%cr3
-        ::: .{ .rax = true, .memory = true });
+    const tlb = @import("tlb.zig");
+    tlb.handleShootdownIpi();
 }
 
 fn handleException(frame: *InterruptFrame) void {

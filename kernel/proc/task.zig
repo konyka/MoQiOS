@@ -43,8 +43,13 @@ pub const Task = struct {
     tid: u32,
     state: TaskState,
     priority: u8,
-    /// Logical CPU this task is pinned to (M8-5b-2 affinity scheduling; no migration).
-    cpu_affinity: u8,
+    /// CPU affinity. -1 = no pin (eligible for any CPU / work-stealing);
+    /// >=0 = hard-pinned to that logical CPU (Task #2: pinned tasks are
+    /// never stolen by another CPU's run queue).
+    cpu_affinity: i8 = -1,
+    /// Last CPU this task ran on. Used by Task #2 for run-queue placement
+    /// preference (warm cache) and as the fallback target when not pinned.
+    last_cpu: u8 = 0,
     /// Kernel stack base (lowest address, page-aligned).
     kernel_stack: u64,
     /// Kernel stack top (highest address — this is where RSP starts).
@@ -176,6 +181,21 @@ pub const Task = struct {
 
     /// Parent death signal (0 = none). Delivered to child when parent exits.
     pdeathsig: u32 = 0,
+
+    // --- FPU / SSE state (Task #1: lazy save/restore via CR0.TS + #NM) ---
+    /// FXSAVE/FXRSTOR area. Hardware requires 16-byte alignment; the
+    /// `align(16)` directive forces Task itself to 16-byte alignment so the
+    /// field is well-aligned in every slot of the static `tasks` array.
+    fpu_state: [512]u8 align(16) = [_]u8{0} ** 512,
+    /// Whether this task has ever issued an FPU/SSE instruction (and thus
+    /// has meaningful state in `fpu_state`). Set on the first #NM, never
+    /// cleared — once a task has used FPU it always restores from its area.
+    fpu_initialized: bool = false,
+    /// Whether this task currently "owns" the FPU on the CPU it last ran on.
+    /// Drives onContextSwitch's eager fxsave: only set after a successful
+    /// #NM lazy-restore; cleared by the #NM handler of a different task that
+    /// claims the FPU on the same CPU.
+    fpu_owned: bool = false,
 };
 
 /// Tracked mmap region for munmap support.
@@ -219,9 +239,14 @@ pub fn getSlotBitmap() u64 {
     return slot_bitmap;
 }
 
+/// True if `t`'s affinity allows it to run on `cpu` (-1 = no pin).
+fn matchesCpu(t: *Task, cpu: u8) bool {
+    return t.cpu_affinity < 0 or t.cpu_affinity == @as(i8, @intCast(cpu));
+}
+
 fn considerReady(idx: u32, cpu: u8, best_idx: *?u32, best_prio: *u8) void {
     const t = getTask(idx) orelse return;
-    if (t.state == .ready and t.cpu_affinity == cpu and t.priority < best_prio.*) {
+    if (t.state == .ready and matchesCpu(t, cpu) and t.priority < best_prio.*) {
         best_prio.* = t.priority;
         best_idx.* = idx;
     }
@@ -273,7 +298,7 @@ pub fn pickKernelBootstrapForCpu(cpu: u8) ?u32 {
         const i: u32 = @intCast(@ctz(bits));
         bits &= bits - 1;
         const t = getTask(i) orelse continue;
-        if (t.state == .ready and !t.is_user and t.cpu_affinity == cpu) return i;
+        if (t.state == .ready and !t.is_user and matchesCpu(t, cpu)) return i;
     }
     return null;
 }
@@ -288,7 +313,7 @@ pub fn countActiveOnCpu(cpu: u8) u32 {
         const i: u32 = @intCast(@ctz(bits));
         bits &= bits - 1;
         const t = getTask(i) orelse continue;
-        if (t.cpu_affinity == cpu and t.state != .zombie and t.state != .blocked) {
+        if (matchesCpu(t, cpu) and t.state != .zombie and t.state != .blocked) {
             n += 1;
         }
     }
@@ -304,7 +329,7 @@ pub fn hasReadyOnCpu(cpu: u8) bool {
         const i: u32 = @intCast(@ctz(bits));
         bits &= bits - 1;
         const t = getTask(i) orelse continue;
-        if (t.state == .ready and t.cpu_affinity == cpu) return true;
+        if (t.state == .ready and matchesCpu(t, cpu)) return true;
     }
     return false;
 }
@@ -394,7 +419,8 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     tasks[slot].fd_table = @import("../fs/vfs.zig").FdTable.init();
     tasks[slot].cwd[0] = '/';
     tasks[slot].cwd_len = 1;
-    tasks[slot].cpu_affinity = affinity;
+    tasks[slot].cpu_affinity = @intCast(affinity);
+    tasks[slot].last_cpu = affinity;
 
     slot_bitmap |= @as(u64, 1) << @intCast(slot);
     task_count += 1;
@@ -402,10 +428,40 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     return slot;
 }
 
-/// Create a kernel thread on BSP (cpu 0). Returns the task index or null on failure.
-/// The new task starts in .ready state with the given priority (0 = highest).
+/// Create an unpinned kernel thread (cpu_affinity = -1, eligible for stealing).
+/// Returns the task index or null on failure. Starts in .ready state.
 pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
-    return createKernelThreadAffinity(entry, priority, 0);
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+
+    const slot = allocSlot() orelse {
+        serial.writeString("[task] no free task slots\n");
+        return null;
+    };
+    const stack_virt = allocKernelStack() orelse {
+        serial.writeString("[task] OOM allocating kernel stack\n");
+        return null;
+    };
+    const stack_top = stack_virt + KERNEL_STACK_PAGES * PAGE_SIZE;
+    const tid = next_tid;
+    next_tid += 1;
+    zeroSlot(slot);
+    tasks[slot].tid = tid;
+    tasks[slot].state = .ready;
+    tasks[slot].priority = priority;
+    tasks[slot].kernel_stack = stack_virt;
+    tasks[slot].kernel_stack_top = stack_top;
+    tasks[slot].entry = entry;
+    tasks[slot].personality = .native;
+    tasks[slot].fd_table = @import("../fs/vfs.zig").FdTable.init();
+    tasks[slot].cwd[0] = '/';
+    tasks[slot].cwd_len = 1;
+    tasks[slot].cpu_affinity = -1;
+    tasks[slot].last_cpu = 0;
+    slot_bitmap |= @as(u64, 1) << @intCast(slot);
+    task_count += 1;
+    asm volatile ("" ::: .{ .memory = true });
+    return slot;
 }
 
 /// Get task by index. Returns null if slot is empty or out of range.
@@ -537,6 +593,9 @@ pub fn unblockTask(idx: u32) void {
     const t = getTask(idx) orelse return;
     if (t.state == .blocked) {
         t.state = .ready;
+        // Task #2: republish to per-CPU queue (best-effort, full → bitmap fallback).
+        const per_cpu = @import("per_cpu.zig");
+        if (per_cpu.isAnyReady()) _ = per_cpu.enqueueTask(t);
     }
 }
 
@@ -593,7 +652,10 @@ pub fn createUserProcess(
     tasks[slot].fd_table = @import("../fs/vfs.zig").FdTable.init();
     tasks[slot].cwd[0] = '/';
     tasks[slot].cwd_len = 1;
-    tasks[slot].cpu_affinity = assignCpuAffinity(elf);
+    // Task #2: user processes are NOT pinned by default — they participate in
+    // work-stealing. last_cpu seeds initial run-queue placement (round-robin).
+    tasks[slot].cpu_affinity = -1;
+    tasks[slot].last_cpu = assignCpuAffinity(elf);
 
     const sig_mod = @import("signal.zig");
     sig_mod.setupSigreturnTrampoline(page_table_phys);
@@ -621,7 +683,9 @@ pub fn kickChildCpus(parent_tid: u32, parent_cpu: u8) void {
             const t = &tasks[i];
             if (t.parent_tid != parent_tid) continue;
             if (t.state != .ready and t.state != .running) continue;
-            const cpu = t.cpu_affinity;
+            // Task #2: prefer last_cpu (where the child actually runs) over
+            // affinity, which may be -1 (unpinned) and tell us nothing.
+            const cpu = if (t.cpu_affinity >= 0) @as(u8, @intCast(t.cpu_affinity)) else t.last_cpu;
             if (cpu == parent_cpu) continue;
             var seen = false;
             for (cpus[0..cpu_count]) |c| {
@@ -646,11 +710,12 @@ pub fn kickRemoteForTask(slot: u32) void {
     const t = getTask(slot) orelse return;
     const sched = @import("sched.zig");
     const se = @import("../arch/x86_64/syscall_entry.zig");
-    const affinity = t.cpu_affinity;
+    // Task #2: target the queued CPU. Prefer hard affinity if set, else last_cpu.
+    const target_cpu: u8 = if (t.cpu_affinity >= 0) @intCast(t.cpu_affinity) else t.last_cpu;
     const here: u8 = @intCast(se.getPerCpu().cpu_id);
-    if (affinity == here) return;
+    if (target_cpu == here) return;
     asm volatile ("mfence" ::: .{ .memory = true });
-    sched.kickCpu(affinity);
+    sched.kickCpu(target_cpu);
 }
 
 /// Wait for a child process to exit. Returns the child's TID, or 0 if no

@@ -9,6 +9,7 @@ const user_space = @import("user_space.zig");
 const pmm_mod = @import("pmm.zig");
 const hhdm_mod = @import("hhdm.zig");
 const paging_mod = @import("../arch/x86_64/paging.zig");
+const tlb_mod = @import("../arch/x86_64/tlb.zig");
 
 const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_PRIVATE: u64 = 0x2;
@@ -20,12 +21,17 @@ const MREMAP_FIXED: u32 = 0x2;
 
 /// Unmap pages in a range and free physical memory.
 pub fn unmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
+    if (num_pages == 0) return;
     for (0..num_pages) |p| {
         const virt = base + p * 4096;
         if (paging_mod.unmapPage(task.page_table_phys, virt)) |phys| {
             pmm_mod.freePage(phys);
         }
     }
+    // M8-6: broadcast a single ranged shootdown for the whole unmap. The
+    // per-page `unmapPage` already invalidated the local TLB; this call also
+    // hits remote CPUs that may share the same page table (CLONE_VM threads).
+    tlb_mod.shootdownRange(base, @intCast(num_pages));
 }
 
 /// Track an mmap region in the task's mmap_regions table.

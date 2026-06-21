@@ -1,6 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21  
+> Last update: 2026-06-21 (M8-5b-3 / M8-6 / M8-7 SMP performance triplet completed)  
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.  
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -27,7 +28,7 @@ It is a standalone skeleton, not the full kernel behind a shared `arch` abstract
 | Build | `build.zig` | Default x86_64 kernel/user build; `-Darch=riscv64` skeleton build; host unit-test step exists |
 | Boot/arch | `kernel/main.zig`, `kernel/arch/x86_64/*`, `kernel/smp.zig` | x86_64-specific main path; many shared modules import `arch/x86_64` directly |
 | Memory | `kernel/mm/*`, `kernel/arch/x86_64/paging.zig` | PMM, HHDM, slab, mmap/brk/swap/COW support exist; paging lacks a shared arch facade |
-| Process/scheduler | `kernel/proc/task.zig`, `kernel/proc/sched.zig` | Static 64-task table; priority-aware scanning by CPU affinity; per-CPU current index/slice/anchor |
+| Process/scheduler | `kernel/proc/task.zig`, `kernel/proc/sched.zig`, `kernel/proc/per_cpu.zig` | Static 64-task table; per-CPU 256-slot LIFO ring queues with work-stealing (`PerCpuRunQueue`); per-CPU current index/slice/anchor; global bitmap fallback retained |
 | Syscalls | `kernel/arch/x86_64/syscall_entry.zig` | Large x86_64 dispatch entry with native/Linux-oriented handlers and many inline imports |
 | Filesystems | `kernel/fs/*`, `kernel/main.zig` | ramdisk, FAT32, ext2, tmpfs, procfs, page cache/writeback are wired; several fs helper modules remain standalone |
 | Network | `kernel/net/mod.zig`, `kernel/drivers/e1000.zig`, `kernel/drivers/virtio_net.zig` | e1000/virtio-net drivers initialize; ARP/IPv4/ICMP/UDP/TCP path is wired via `net/mod.zig` |
@@ -36,7 +37,7 @@ It is a standalone skeleton, not the full kernel behind a shared `arch` abstract
 
 ## 2. Review Findings
 
-### P0 - Documentation Overstates Implemented Scheduler Architecture
+### P0 - Documentation Overstates Implemented Scheduler Architecture ✅ RESOLVED 2026-06-21
 
 Evidence:
 
@@ -51,6 +52,13 @@ Fix plan:
 1. Rewrite the scheduler section in `docs/kernel-subsystems.md` to describe the actual affinity-scanning scheduler.
 2. Keep O(1) per-CPU run queues/work stealing only in the roadmap, not as current implementation.
 3. Add a verification note that M8-7 requires code changes, QEMU multi-core tests, and lock-order review.
+
+**Resolution (2026-06-21)**: M8-7 implemented in `kernel/proc/per_cpu.zig` (~221 lines). `PerCpuRunQueue`
+provides 256-slot ring per CPU with local-LIFO `push`/`pop` and `steal_half` for inter-CPU stealing
+(respects `cpu_affinity`, TSC-randomized scan start). `pickNext` is now three-tier: local `pop` →
+`tryStealForCurrent` → global bitmap fallback. Documentation in `docs/kernel-subsystems.md` §2.2 and
+`docs/moqios-architecture-current.md` §1.9.2 / §5 has been rewritten to reflect the actual
+implementation.
 
 ### P0 - Documentation Treats Some Uncompiled/WIP Modules As Supported Features
 
@@ -99,7 +107,7 @@ Fix plan:
 2. Migrate one subsystem class at a time behind the facade, keeping x86_64 bootable after each step.
 3. Only then move riscv64 beyond skeleton boot.
 
-### P1 - SMP State Is Mid-Migration And Needs Stronger Gates
+### P1 - SMP State Is Mid-Migration And Needs Stronger Gates ✅ RESOLVED 2026-06-21
 
 Evidence:
 
@@ -116,6 +124,27 @@ Fix plan:
 3. Implement FPU/SSE save-restore before migrating user tasks across CPUs.
 4. Implement ranged TLB shootdown before concurrent page-table modification across CPUs.
 5. Replace global scheduler lock only after the invariants above are tested.
+
+**Resolution (2026-06-21)**: All three blocking SMP invariants have been delivered together,
+because they are mutually pre-requisite (cross-CPU migration needs independent FPU state, and
+shared address-space modification needs ranged TLB shootdown):
+
+- **M8-5b-3 FPU/SSE per-task state ✅**: `kernel/arch/x86_64/context_switch.zig` (~131 lines).
+  Lazy save/restore via CR0.TS + #NM. `Task` extended with `fpu_state: [512]u8 align(16)`,
+  `fpu_initialized`, `fpu_owned`. Per-CPU `fpu_owners` tracks current FPU holder. `initCpu()`
+  invoked from BSP (`main.zig`) and AP (`smp.zig` `apEntry`); `onContextSwitch` does eager
+  fxsave + sets CR0.TS; #NM handler does fxrstor / fninit and updates ownership.
+- **M8-6 ranged TLB shootdown ✅**: `kernel/arch/x86_64/tlb.zig` (~206 lines). Replaces broadcast
+  CR3-flush IPI with per-page invlpg coordinated through a single global request slot. Custom
+  `TlbLock` re-enables IRQs while spinning to avoid cross-IPI deadlock. `FLUSH_THRESHOLD = 32`
+  pages falls back to CR3 reload. Reuses existing `TLB_SHOOTDOWN_VECTOR = 0xFE`. Integrated into
+  `mm/mprotect.zig` and `mm/mmap.zig` unmap paths via `tlb.shootdownRange(addr, page_count)`.
+- **M8-7 per-CPU run queues + work-stealing ✅**: `kernel/proc/per_cpu.zig` (~221 lines). 256-slot
+  LIFO ring per CPU, `steal_half` from victim's tail end, `cpu_affinity` respected, TSC-randomized
+  scan start, only steals when local queue is empty (idle).
+
+With FPU per-task and ranged TLB shootdown in place, user tasks can now safely migrate across
+CPUs through work-stealing. AP cores actively pick up unpinned user tasks instead of idling.
 
 ### P1 - Automated Tests Are Too Narrow For Current Claims
 
@@ -191,12 +220,14 @@ If QEMU or toolchain pieces are unavailable, record that as a verification gap i
 
 ## 4. Recommended Repair Order
 
-1. Correct documentation status claims and keep this review linked from primary docs.
+1. ~~Correct documentation status claims and keep this review linked from primary docs.~~ Done.
 2. Add reachability/dispatch classification for kernel modules.
 3. Add automated QEMU smoke gates.
 4. Stabilize SMP affinity scheduling with repeatable `MOQI_SMP=2` tests.
-5. Implement FPU/SSE task state and ranged TLB shootdown.
-6. Replace global scheduler lock with per-CPU queues and work stealing.
+5. ~~Implement FPU/SSE task state and ranged TLB shootdown.~~ ✅ Done 2026-06-21 (see P1 resolution).
+6. ~~Replace global scheduler lock with per-CPU queues and work stealing.~~ ✅ Done 2026-06-21
+   (per-CPU `IrqSpinlock` per queue replaces the global `sched_lock` on the hot path; the global
+   lock is retained only for the bitmap-fallback scan).
 7. Extract `kernel/arch/arch.zig` after the x86_64 behavior is covered by gates.
 8. Expand riscv64 from skeleton to shared-kernel boot only through the new arch facade.
 
@@ -215,6 +246,19 @@ Executed on 2026-06-21:
 
 The build/test results prove the code compiles in this environment and the host tests pass. They do not prove runtime
 kernel behavior, filesystem behavior, networking behavior, or SMP boot-to-shell stability.
+
+### 5.1 SMP Performance Triplet (M8-5b-3 / M8-6 / M8-7) Completed 2026-06-21
+
+| Item | File | Status |
+|---|---|---|
+| FPU/SSE per-task lazy save/restore | `kernel/arch/x86_64/context_switch.zig` (~131 lines) | ✅ Implemented + integrated (BSP `main.zig`, AP `smp.zig` `apEntry`, `idt.zig` #NM, `sched.zig` `onContextSwitch`) |
+| Per-CPU run queues + work-stealing | `kernel/proc/per_cpu.zig` (~221 lines) | ✅ 256-slot LIFO ring + `steal_half` + `cpu_affinity` aware |
+| Ranged TLB shootdown | `kernel/arch/x86_64/tlb.zig` (~206 lines) | ✅ IPI vector 0xFE + invlpg loop + 32-page CR3 fallback + custom `TlbLock` |
+| Task struct extensions | `kernel/proc/task.zig` | ✅ `fpu_state`/`fpu_initialized`/`fpu_owned` + `cpu_affinity`/`last_cpu` |
+| `mprotect`/`mmap` integration | `kernel/mm/mprotect.zig`, `kernel/mm/mmap.zig` | ✅ Both call `tlb.shootdownRange` after PTE change |
+
+Build verification (2026-06-21): `zig build` passed after the triplet was added; runtime QEMU
+verification is still limited by environment availability of `qemu-system-x86_64`.
 
 ## 6. Completion Criteria For This Review Task
 

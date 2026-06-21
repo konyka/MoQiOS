@@ -7,6 +7,7 @@
 /// while the physical frame number is preserved so the mapping can be
 /// restored later.
 const paging = @import("../arch/x86_64/paging.zig");
+const tlb = @import("../arch/x86_64/tlb.zig");
 const sched = @import("../proc/sched.zig");
 const task = @import("../proc/task.zig");
 
@@ -58,10 +59,13 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
             // Always user-accessible for user-space mprotect
             pte.user = true;
         }
-
-        // Flush TLB entry for this page
-        paging.invlpg(v);
     }
+
+    // M8-6: one ranged TLB shootdown covers the whole rewrite — cheaper than
+    // per-page invlpg on the local CPU and crucial for cross-CPU correctness
+    // when the same address space is mapped on another core (CLONE_VM thread).
+    const num_pages: u32 = @intCast((end - addr) / paging.PAGE_SIZE);
+    tlb.shootdownRange(addr, num_pages);
 
     return 0;
 }

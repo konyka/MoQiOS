@@ -57,6 +57,14 @@ export fn _start() callconv(.c) noreturn {
     idt.init();
     klog.log(.info, "IDT loaded");
 
+    // Task #1: enable lazy FPU/SSE on BSP. Sets CR4.OSFXSR | CR4.OSXMMEXCPT,
+    // clears CR0.EM, sets CR0.MP and arms CR0.TS so the first FPU/SSE use
+    // takes a #NM (vector 7) for lazy restore. Must come AFTER idt.init so
+    // the #NM handler is wired up before any code can trip over CR0.TS.
+    const context_switch = @import("arch/x86_64/context_switch.zig");
+    context_switch.initCpu();
+    klog.log(.info, "FPU/SSE lazy switch armed (BSP)");
+
     // M8-3: set the BSP's GS_BASE early so commonStub's per-CPU context-switch
     // anchor (%gs:16 = PerCpu.saved_stack_anchor) is valid for any exception that
     // fires during the rest of boot, before syscall_entry.init() runs. smp.init()
@@ -211,6 +219,13 @@ export fn _start() callconv(.c) noreturn {
     // M3: LAPIC timer — use LAPIC address from ACPI MADT, fallback to 0xFEE00000
     const lapic_addr = if (acpi.info.lapic_address != 0) acpi.info.lapic_address else 0xFEE00000;
     lapic.init(lapic_addr);
+
+    // Task #2: initialise the BSP's per-CPU run queue BEFORE smp.init creates
+    // any kernel threads (createKernelThread/createKernelThreadAffinity may
+    // observe the queue via subsequent enqueue paths). AP queues are
+    // initialised in smp.apEntry.
+    const per_cpu = @import("proc/per_cpu.zig");
+    per_cpu.init(0);
 
     // SMP: Start Application Processors
     const smp = @import("smp.zig");

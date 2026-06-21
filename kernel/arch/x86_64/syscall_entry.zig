@@ -3504,8 +3504,8 @@ fn syscallSchedSetaffinity(pid: u32, cpusetsize: u32, mask_ptr: u64) i64 {
     const copied = copy.copyFromUser(mask_buf[0..to_copy], @ptrFromInt(mask_ptr), to_copy);
     if (copied < to_copy) return -14;
 
-    // Store as cpu_affinity (u8 — CPU index, extract lowest set bit)
-    var affinity: u8 = 0;
+    // Store as cpu_affinity (i8 — CPU index, extract lowest set bit; -1 = unpinned)
+    var affinity: i8 = -1;
     if (to_copy > 0) {
         // Find lowest set bit in mask
         var b: u32 = 0;

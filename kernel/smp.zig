@@ -38,6 +38,7 @@ const serial = @import("arch/x86_64/serial.zig");
 const sched = @import("proc/sched.zig");
 const task = @import("proc/task.zig");
 const syscall_entry = @import("arch/x86_64/syscall_entry.zig");
+const context_switch = @import("arch/x86_64/context_switch.zig");
 const fmt = @import("lib/fmt.zig");
 
 const KERNEL_STACK_PAGES: u64 = 16;
@@ -109,6 +110,11 @@ pub fn apEntry() callconv(.c) noreturn {
         \\wrmsr
         ::: .{ .rax = true, .rcx = true, .rdx = true, .memory = true });
 
+    // Task #1: enable lazy FPU/SSE on this AP. Mirrors the BSP's
+    // context_switch.initCpu(): also sets CR4.OSXMMEXCPT, clears CR0.EM,
+    // sets CR0.MP and arms CR0.TS. Re-setting OSFXSR is idempotent.
+    context_switch.initCpu();
+
     // STAR/LSTAR/SFMASK are per-logical-processor; AP must not rely on BSP values.
     syscall_entry.initSyscallMsrsOnThisCpu();
 
@@ -125,6 +131,11 @@ pub fn apEntry() callconv(.c) noreturn {
     syscall_entry.percpu_array[actual_cpu_id].cpu_id = actual_cpu_id;
     syscall_entry.percpu_array[actual_cpu_id].current_tid = 0;
     rawPutc('H');
+
+    // Task #2: initialise this AP's per-CPU run queue. Must come BEFORE
+    // apBootstrapIdle so any subsequent enqueue path sees a primed queue.
+    const per_cpu = @import("proc/per_cpu.zig");
+    per_cpu.init(@intCast(actual_cpu_id));
 
     // Enable this AP's LAPIC (inherit the BSP-mapped MMIO base) AND start its
     // periodic timer (M8-5a). The per-CPU scheduler state (anchor via %gs, TSS

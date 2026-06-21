@@ -27,7 +27,10 @@ pub fn fork(frame: *SyscallFrame) i64 {
     const child = task_mod.getTask(child_idx).?;
 
     // Inherit parent's CPU pin — fork must not migrate (M8-5b-2).
+    // Task #2: also inherit last_cpu so the child first runs on the same
+    // CPU as the parent (warm cache), then participates in work-stealing.
     child.cpu_affinity = parent.cpu_affinity;
+    child.last_cpu = parent.last_cpu;
 
     child.brk_current = parent.brk_current;
 

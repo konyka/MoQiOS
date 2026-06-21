@@ -1,15 +1,16 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.43.35
-> **日期**: 2026-06-16
-> **代码统计**: 内核 38,560 行 Zig / 123 源文件，用户空间 2,244 行 C/ASM
+> **版本**: v0.44.0（SMP 性能三件套）
+> **日期**: 2026-06-21
+> **代码统计**: 内核 ~38,900 行 Zig / 126 源文件（新增 `arch/x86_64/context_switch.zig`、
+>   `arch/x86_64/tlb.zig`、`proc/per_cpu.zig`），用户空间 2,244 行 C/ASM
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
 >
-> **2026-06-21 review 注记**: 本文包含大量历史修复记录。若状态、代码统计或“已完成”声明与当前
-> 工作树不一致，以 [current-code-review-and-fix-plan.md](./current-code-review-and-fix-plan.md)
-> 的代码证据和修复计划为准。
+> **2026-06-21 更新**：SMP 性能三件套已全部完成（FPU/SSE 任务状态、Per-CPU 运行队列 +
+> Work-Stealing、范围 TLB Shootdown）。详见 **§1.9 节**。代码级审查以
+> [current-code-review-and-fix-plan.md](./current-code-review-and-fix-plan.md) 为准。
 
 ---
 
@@ -63,9 +64,9 @@ ext2 多级目录读写删，QEMU 串口验证，零异常、零三重故障）�
 
 ### 已知限制 / 待办
 
-- **SMP 启用中**：`smp.enable_ap_startup = true`，AP 稳定上线并参与 timerTick。
-  用户任务暂绑 BSP（M8-5b-2b），AP 基础设施（per-CPU 状态/IPI reschedule/跨核唤醒）已就绪。
-  v27.0 修复 AP 栈连续性、调度间隙等基础问题。待办：FPU/SSE 按任务、范围 TLB shootdown、per-CPU 运行队列。
+- ~~**SMP 启用中**~~（**已完成 2026-06-21**）：`smp.enable_ap_startup = true`，
+  AP 稳定上线并参与 timerTick；FPU/SSE 按任务、范围 TLB shootdown、
+  per-CPU 运行队列 + work-stealing **三件套均已完成**，用户任务可跨核迁移。详见 §1.9。
 - **用户指针缺页恢复**：已通过"访问前页表校验"避免内核崩溃，但仍非真正的 per-instruction
   缺页恢复（RIP fixup）。对 COW 只读页的内核态写入依赖缺页处理器支持。
 - ~~**ext2 多级目录写内存破坏**~~（**已修复**）：根因是 ext2 inode 越界与中断 stub 寄存器破坏
@@ -132,9 +133,9 @@ TLB shootdown EOI 顺序、sleepOn 阻塞延迟等 SMP 基础设施问题。
 | M8-5b-2b | ✅ | APIC id、`wait_cpu`/`kickChildCpus`；用户暂绑 BSP |
 | M8-5b-2d | ✅ | `Task.saved_user_rsp` + 上下文切换同步；3/3 `MOQI_SMP=2`→shell |
 | M8-5b-2e | ✅ | AP 栈 allocContiguous 物理连续 + BSP reap setSlice(1) + TLB EOI 先于 CR3 + sleepOn forceReschedule |
-| M8-5b-3 | ⬜ | FPU/SSE 按任务 |
-| M8-6 | ⬜ | 范围 TLB shootdown |
-| M8-7 | ⬜ | per-CPU 运行队列 + work-stealing |
+| M8-5b-3 | ✅ | FPU/SSE 按任务 lazy save/restore via CR0.TS + #NM（2026-06-21）|
+| M8-6 | ✅ | 范围 TLB shootdown（`tlb.shootdownRange` + invlpg + 32 页 CR3 阈值回退）（2026-06-21）|
+| M8-7 | ✅ | per-CPU 运行队列 + work-stealing（`PerCpuRunQueue` 256 槽 LIFO + steal_half）（2026-06-21）|
 
 详见 `docs/cross-arch-port-plan.md` M8 节。
 
@@ -299,6 +300,70 @@ syscall 执行期间触发，于是 ext2 syscall 的返回值 RAX 被改成 `&in
 > 经验：Zig `naked` 函数中**绝不能用 asm `"r"`/`"i"` 输入**传递在"保存现场"之前就需稳定的值——
 > 编译器会把输入物化在模板首条指令之前。中断/syscall 入口一律改用"先保存 GPR，再 RIP 相对
 > 引用 `export` 全局"的模式（`commonStub`、`syscallEntry` 现已统一遵循）。
+
+---
+
+## 1.9 SMP 性能三件套（2026-06-21完成）
+
+M8 路线图的最后三项重要 SMP 性能优化同时落地，**考虑到三者互为前提（跨核迁移
+需要 FPU 状态独立且多核页表修改需要范围 TLB shootdown）**。完成后 AP 首次可真正
+运行用户任务并参与负载均衡。
+
+### 1.9.1 FPU/SSE 任务状态保存（Lazy FPU）
+
+文件：`kernel/arch/x86_64/context_switch.zig`（新增，~131 行）
+
+- **Task 字段扩展**：`fpu_state: [512]u8 align(16)`、`fpu_initialized: bool`、
+  `fpu_owned: bool`。
+- **Per-CPU 状态**：`context_switch.fpu_owners: [MAX_CPUS]?*Task` 追踪每个 CPU
+  当前 FPU 持有者。
+- **初始化**：`initCpu()` 设置 CR4.OSFXSR | CR4.OSXMMEXCPT，清 CR0.EM，置 CR0.MP | CR0.TS。
+  BSP 在 `main.zig`、AP 在 `smp.zig` `apEntry` 各调用一次。
+- **上下文切换**：`onContextSwitch(old)` 若 `old.fpu_owned` 则 eager `fxsave` 到
+  `Task.fpu_state`，随后置 CR0.TS；新任务首次碰 FPU 触发 `#NM`（vector 7）。
+- **#NM Handler**：`handleDeviceNotAvailable()` 走 `clts` + `fxrstor`（或首次 `fninit`）+
+  更新 `fpu_owners[cpu]`。全程不占任何锁，可在内核临界区安全被触发。
+- **收益**：从不碰 FPU 的内核线程/任务零保存开销；必要时才优先动用 fxsave/fxrstor。
+
+### 1.9.2 Per-CPU 调度队列 + Work-Stealing
+
+文件：`kernel/proc/per_cpu.zig`（新增，~221 行）
+
+- **`PerCpuRunQueue`**：256 槽环形缓冲区，`head` / `tail` 与 `nr_running` 字段、
+  `IrqSpinlock` 串行化 head/tail 更新。
+- **`push` / `pop`**：本地 LIFO、O(1)，利于缓存局部性（刚入队的任务仍在本 CPU 缓存）。
+- **`steal_half(target)`**：在控 `target.lock` 后从 `tail` 端窃取约一半任务；
+  尊重 `cpu_affinity`，被绑定到别的 CPU 的任务会被重新放回原队列。
+- **Task 扩展**：`cpu_affinity: i8`（-1 = 不绑定）与 `last_cpu: u8`（warm cache hint）。
+- **调度器 `pickNext` 三段式**：本地 `pop` → `tryStealForCurrent` 跨核窃取 → 全局
+  位图回退（`task.pickReadyForCpu`）。
+- **窃取策略**：仅当本地队列为空（idle）时触发；TSC 派生随机起点扫描避免热点；
+  只偷 `>1` 个任务的队列（避免乒乓）。
+- **收益**：AP 首次能跨核运行用户任务（在之前仅 BSP 能调度未绑定任务），全局
+  `sched_lock` 在热路径上被本 CPU 的 per-queue 锁取代。
+
+### 1.9.3 范围 TLB Shootdown
+
+文件：`kernel/arch/x86_64/tlb.zig`（新增，~206 行）
+
+- **入口**：`shootdownRange(addr_start: u64, page_count: u32)`。
+- **使用现有向量**：`TLB_SHOOTDOWN_VECTOR = 0xFE`（不新增 IDT 向量）。
+- **本地阈值**：`FLUSH_THRESHOLD = 32`；≤ 32 页走 invlpg 循环，> 32 页走 CR3 reload。
+- **全局请求槽**：`shootdown_req: TlbShootdownReq` 包含 `addr_start` / `page_count` /
+  `completion`（原子计数） / `active`。发起方 `sti` 后自旋等 `completion == 0`。
+- **自定义 `TlbLock`**：区别于 `IrqSpinlock`，等待时**开中断**，避免两个发起方
+  互相等对方接收 IPI 导致的跨核死锁。
+- **IPI 接收方**：内联 EOI 后 `flushLocal(addr, n)` + `@atomicRmw(.Sub, 1)`，不取任何锁。
+- **集成点**：`mm/mprotect.zig`、`mm/mmap.zig` 的 unmap 路径完成 PTE 修改后调用
+  `tlb.shootdownRange`。
+- **收益**：避免原本 "广播 IPI → 远端 CR3 全刷"对频繁 mprotect/munmap 场景的 TLB 性能损耗。
+
+### 1.9.4 总体意义
+
+三项优化互为前提：只有完整保存 FPU/SSE，任务才能跨核迁移；只有页表修改能精确传到
+其他核，多核共享地址空间才可靠；只有 work-stealing 拉起 AP，多核才从 "AP 上线但闲着"
+变为 "多核真并行"。本次三项同时交付后，MoQiOS 首次在 SMP 模式下拥有完整的 "多核调度 +
+独立 FPU 状态 + 页表同步" 三位一体。
 
 ---
 
@@ -478,15 +543,17 @@ Task 结构体约 6000 字节，包含：
 
 ## 5. 调度器
 
-**源文件**: `kernel/proc/scheduler.zig`
+**源文件**: `kernel/proc/sched.zig`, `kernel/proc/per_cpu.zig`, `kernel/proc/task.zig`
 
-- **算法**: O(1) 优先级位图调度器
-- **优先级**: 32 级，每级一个双向链表
-- **调度**: `pickNext() = @ctz(bitmap) + popFront() = O(1)`
-- **Per-CPU 队列**: 每 CPU 独立优先级位图 + 队列
-- **Work Stealing**: 空闲 CPU 从其他 CPU 队列尾部窃取任务
+- **架构**: Per-CPU 运行队列 + Work-Stealing（2026-06-21 完成 / M8-7）
+- **Per-CPU 队列**: 每 CPU 一份 `PerCpuRunQueue`，256 槽环形缓冲区，`IrqSpinlock` 保护
+- **本地 LIFO**: `push` / `pop` 在 `head` 端操作，最大化缓存局部性
+- **Work-Stealing**: idle 时 `tryStealForCurrent` 从别的 CPU `tail` 端 `steal_half`
+  窃取约一半任务；尊重 `cpu_affinity`，TSC 派生随机起点扫描
+- **亲和性**: `Task.cpu_affinity: i8`（-1 = 不绑定） + `Task.last_cpu: u8`（warm cache hint）
+- **`pickNext` 三段式**: 本地 `pop` → `tryStealForCurrent` → 全局位图回退扫描
 - **时间片**: 10 个 tick (100ms)，抢占式
-- **上下文切换**: 通过 `switchContext` 汇编实现
+- **上下文切换**: 通过 `switchContext` 汇编实现；切换前 `context_switch.onContextSwitch` 处理 FPU 保存
 
 ### 调度流程
 

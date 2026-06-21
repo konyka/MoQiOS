@@ -21,7 +21,15 @@
 | M10 | fork + execve + 进程地址空间克隆 | ✅ |
 | M11+ | 信号处理、环境变量、目录操作、chdir/getcwd、fstat/unlink | ✅ |
 | 扩展 | ext2 (读写)、tmpfs、procfs、统一页缓存、TCP socket API | ✅ |
-| 扩展 | SMP / AP 启动 | ✅ 启用 (`enable_ap_startup=true`, AP 上线 + timer + idle 调度) |
+| 扩展 | SMP / AP 启动 + Per-CPU 调度队列 + Work-Stealing | ✅ |
+| 扩展 | FPU/SSE 任务状态保存（Lazy FPU，CR0.TS + #NM） | ✅ |
+| 扩展 | 范围 TLB Shootdown（IPI + invlpg + 32 页 CR3 阈值回退） | ✅ |
+
+> **2026-06-21 SMP 性能三件套完成**：FPU/SSE 按任务保存 (`kernel/arch/x86_64/context_switch.zig`)、
+> Per-CPU 运行队列 + Work-Stealing (`kernel/proc/per_cpu.zig`, 256 槽 LIFO)、
+> 范围 TLB Shootdown (`kernel/arch/x86_64/tlb.zig`) 同时交付。三者互为前提，AP 首次
+> 可**真正**跨核运行用户任务。详见 [docs/moqios-architecture-current.md](docs/moqios-architecture-current.md)
+> §1.9 节。
 
 > **2026-06 引导稳定性修复**：修复了 4 个会导致内核无法启动或健壮性不足的缺陷
 > (SMP AP 启动死锁、内核栈多页映射破坏大页 HHDM、`Task` 巨型结构体导致引导栈溢出、
@@ -31,8 +39,11 @@
 > **2026-06 SMP 进展**：查明并修复了长期存在的 "LAPIC-on-AP 崩溃" 根因——AP trampoline 未启用
 > `EFER.NXE`，导致 AP 冷 TLB walk 到内核 NX 页时触发保留位缺页→三重故障。修复后 AP 可稳定上线
 > (`2 CPUs online`)。v27.0 进一步修复 AP 栈物理连续性、BSP reap 调度间隙、TLB shootdown EOI
-> 顺序、sleepOn 阻塞延迟等 SMP 基础设施问题。`smp.enable_ap_startup = true`，用户任务暂绑 BSP。
-> 详见架构文档第 1.6 节。
+> 顺序、sleepOn 阻塞延迟等 SMP 基础设施问题。
+>
+> **2026-06-21 SMP 性能三件套**：FPU/SSE 任务状态保存、Per-CPU 调度队列 + Work-Stealing、
+> 范围 TLB Shootdown 同时完成。三者互为前提，完成后用户任务可跨核迁移，AP 参与负载均衡。
+> 详见架构文档第 1.9 节。
 
 **用户程序**: ~2,300 行 C/ASM | **测试**: `hello2`–`hello28` 运行时测试 + 交互式 Shell
 (注: `zig build test` 当前为占位，实测以 QEMU 运行 `hello*` 为准)
@@ -78,6 +89,14 @@
 - 内置命令: `echo`、`ls`、`cd`、`pwd`、`export`、`env`、`help`、`pid`、`exit`
 - 环境变量: `export VAR=value`、`$VAR` 展开
 - Ctrl+C 信号处理
+
+### 调度与 SMP（2026-06-21 三件套完成）
+- **Per-CPU 运行队列 + Work-Stealing**：256 槽环形缓冲区/CPU，本地 LIFO 保证缓存局部性，
+  idle 时从其他 CPU `tail` 端窃取一半任务；尊重 `cpu_affinity`
+- **FPU/SSE 按任务保存**：Lazy FPU 制度，CR0.TS + #NM 驱动，仅在任务首次碰 FPU 时 fxrstor；
+  从不使用 FPU 的内核线程零开销
+- **范围 TLB Shootdown**：`tlb.shootdownRange(addr, n)` 驱动 IPI + invlpg 精确无效化；
+  超过 32 页阈值回退到 CR3 reload；集成到 mprotect/munmap 路径
 
 ## 系统调用列表
 

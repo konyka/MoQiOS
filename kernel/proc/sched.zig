@@ -15,10 +15,12 @@
 /// Priority: lower number = higher priority (0 = highest).
 /// Among tasks of equal priority, round-robin is used.
 const task = @import("task.zig");
+const per_cpu = @import("per_cpu.zig");
 const idt = @import("../arch/x86_64/idt.zig");
 const gdt = @import("../arch/x86_64/gdt.zig");
 const paging = @import("../arch/x86_64/paging.zig");
 const syscall_entry = @import("../arch/x86_64/syscall_entry.zig");
+const context_switch = @import("../arch/x86_64/context_switch.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const fmt = @import("../lib/fmt.zig");
 
@@ -276,6 +278,11 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
     old_task.saved_rsp = getAnchor();
     if (old_task.is_user) syscall_entry.syncUserRspToTask(old_task);
 
+    // Task #1: eager fxsave on context switch (only if old_task currently
+    // owns the FPU on this CPU) + arm CR0.TS so the new task takes a lazy
+    // #NM the first time it touches FPU/SSE state.
+    context_switch.onContextSwitch(old_task);
+
     // CPU time accounting: accumulate time spent in this task
     const tsc_mod = @import("../arch/x86_64/tsc.zig");
     const now_tsc = tsc_mod.read();
@@ -293,6 +300,10 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
 
     if (old_task.state == .running) {
         old_task.state = .ready;
+        // Task #2: re-publish to its target per-CPU queue so the next
+        // pickNext picks it up from the local fast-path. Best-effort —
+        // a full queue just falls back to the bitmap scan.
+        if (per_cpu.isAnyReady()) _ = per_cpu.enqueueTask(old_task);
     }
 
     if (!new_task.started) {
@@ -372,7 +383,45 @@ fn pickNext() ?u32 {
     if (getCurrentIdx() == null) {
         if (pickBootstrapKernel()) |k| return k;
     }
+    // Task #2: try the per-CPU run queue first. The queue holds *Task pointers;
+    // we translate back to a slot index for the rest of the scheduler. If the
+    // local queue is empty, attempt to steal from another CPU's queue. Only
+    // when both fail do we fall back to the legacy bitmap scan, which still
+    // serves as a safety net for tasks that became ready before per-CPU
+    // queues were primed (e.g. early boot, blocked→ready transitions that
+    // skip enqueueTask).
+    if (per_cpu.isAnyReady()) {
+        const q = per_cpu.getCurrent();
+        if (q.pop()) |t| {
+            if (taskIndexOf(t)) |i| return i;
+        }
+        const stolen = per_cpu.tryStealForCurrent();
+        if (stolen > 0) {
+            if (q.pop()) |t| {
+                if (taskIndexOf(t)) |i| return i;
+            }
+        }
+    }
     return task.pickReadyForCpu(@intCast(currentCpuId()), getCurrentIdx());
+}
+
+/// Reverse-lookup a Task pointer to its slot index in the global table.
+fn taskIndexOf(t: *task.Task) ?u32 {
+    var i: u32 = 0;
+    while (i < task.MAX_TASKS) : (i += 1) {
+        if (task.getTask(i)) |s| {
+            if (s == t) return i;
+        }
+    }
+    return null;
+}
+
+/// Place a ready task on its target CPU's run queue (Task #2). Falls back
+/// silently when the queue is full — the legacy bitmap scan inside
+/// `task.pickReadyForCpu` will still find the task.
+pub fn enqueue(t: *task.Task) void {
+    if (!per_cpu.isAnyReady()) return;
+    _ = per_cpu.enqueueTask(t);
 }
 
 /// Called from the reschedule IPI — force an immediate scheduler pass.
@@ -518,7 +567,9 @@ fn tryStealTask() void {
         const i: u32 = @intCast(@ctz(bits));
         bits &= bits - 1;
         const t = task.getTask(i) orelse continue;
-        if (t.state == .ready and t.cpu_affinity == @as(u8, @truncate(currentCpuId()))) {
+        const my_cpu: u8 = @truncate(currentCpuId());
+        const ok = t.cpu_affinity < 0 or t.cpu_affinity == @as(i8, @intCast(my_cpu));
+        if (t.state == .ready and ok) {
             const next_idx: u32 = i;
 
             if (!t.started) {
@@ -598,6 +649,7 @@ pub fn wakeOne(queue: *?*task.WaitNode) ?u32 {
             if (t.state == .blocked) {
                 t.state = .ready;
                 t.wait_queue = null;
+                if (per_cpu.isAnyReady()) _ = per_cpu.enqueueTask(t);
             }
             // Remove from list
             if (prev) |p| {
@@ -626,6 +678,7 @@ pub fn wakeAll(queue: *?*task.WaitNode) void {
         if (t.state == .blocked) {
             t.state = .ready;
             t.wait_queue = null;
+            if (per_cpu.isAnyReady()) _ = per_cpu.enqueueTask(t);
         }
         current = node.next;
     }
