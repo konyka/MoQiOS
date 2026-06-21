@@ -6,6 +6,10 @@
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
+>
+> **2026-06-21 review 注记**: 本文包含大量历史修复记录。若状态、代码统计或“已完成”声明与当前
+> 工作树不一致，以 [current-code-review-and-fix-plan.md](./current-code-review-and-fix-plan.md)
+> 的代码证据和修复计划为准。
 
 ---
 

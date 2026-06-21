@@ -3,6 +3,10 @@
 > **文档定位**: 描述 MoQiOS 内核各子系统的核心数据结构、API、实现状态与依赖关系。
 > **修订日期**: 2026-06-16
 > **关联文档**: [moqios-architecture-current.md](./moqios-architecture-current.md)
+>
+> **2026-06-21 review 注记**: 本文部分章节仍混有目标设计和历史计划，例如调度器、work stealing
+> 与若干 syscall/helper 模块的完成度。当前代码级审查和修复顺序见
+> [current-code-review-and-fix-plan.md](./current-code-review-and-fix-plan.md)。
 
 ---
 

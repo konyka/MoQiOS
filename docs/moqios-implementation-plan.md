@@ -4,6 +4,10 @@
 > **日期**: 2026-06-29
 > **说明**: 本文档记录 MoQiOS 的实际实施进度和已完成里程碑。
 > 长期设计目标参见 [moqios-design.md](./moqios-design.md)，当前架构参见 [moqios-architecture-current.md](./moqios-architecture-current.md)。
+>
+> **2026-06-21 review 注记**: 本文的部分版本号、日期、完成度和代码统计需要重新校准。当前以
+> [current-code-review-and-fix-plan.md](./current-code-review-and-fix-plan.md) 作为问题 review、
+> 修复计划和验证门禁的权威入口。
 
 ---
 

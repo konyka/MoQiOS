@@ -24,6 +24,7 @@ fn addAsmUserProgram(b: *std.Build, name: []const u8) void {
     elf.setName(b.fmt("link {s}.elf", .{name}));
 
     const bin = b.addSystemCommand(&.{
+        "zig",
         "objcopy",
         "-O",
         "binary",
@@ -36,31 +37,21 @@ fn addAsmUserProgram(b: *std.Build, name: []const u8) void {
     b.getInstallStep().dependOn(&bin.step);
 }
 
-/// C user program: `.c` -> static freestanding ELF -> stripped binary.
+/// C user program: `.c` -> static freestanding ELF stored as `.bin`.
 fn addCUserProgram(b: *std.Build, name: []const u8) void {
     const elf = b.addSystemCommand(&.{
         "zig",               "cc",
         "-target",           "x86_64-freestanding-none",
         "-static",           "-nostdlib",
         "-ffreestanding",    "-O2",
-        "-mno-sse",          "-mno-sse2",
         "-Wl,--gc-sections", "-Wl,-z,norelro",
         "-o",
     });
-    elf.addArg(b.fmt("user/{s}.elf", .{name}));
+    elf.addArg(b.fmt("user/{s}.bin", .{name}));
     elf.addFileArg(b.path(b.fmt("user/{s}.c", .{name})));
-    elf.setName(b.fmt("compile {s}.c -> ELF", .{name}));
+    elf.setName(b.fmt("compile {s}.c -> ELF bin", .{name}));
 
-    const strip = b.addSystemCommand(&.{
-        "strip",
-        "-o",
-    });
-    strip.addArg(b.fmt("user/{s}.bin", .{name}));
-    strip.addArg(b.fmt("user/{s}.elf", .{name}));
-    strip.step.dependOn(&elf.step);
-    strip.setName(b.fmt("strip {s}.elf", .{name}));
-
-    b.getInstallStep().dependOn(&strip.step);
+    b.getInstallStep().dependOn(&elf.step);
 }
 
 /// Build the RISC-V 64 kernel skeleton (cross-ISA port, Milestone 1).
@@ -143,24 +134,26 @@ pub fn build(b: *std.Build) void {
     // AP trampoline: precompiled flat binary, embedded via @embedFile in smp.zig
     // Build step to assemble the trampoline source into a raw binary
     const trampoline_obj = b.addSystemCommand(&.{
-        "as", "--32", "-o",
+        "zig",     "cc",
+        "-target", "x86-freestanding-none",
+        "-c",      "-o",
     });
-    trampoline_obj.addArg("/tmp/ap_trampoline.o");
+    trampoline_obj.addArg(".zig-cache/ap_trampoline.o");
     trampoline_obj.addFileArg(b.path("kernel/arch/x86_64/ap_trampoline_src.S"));
     trampoline_obj.setName("assemble ap_trampoline.S");
 
     const trampoline_elf = b.addSystemCommand(&.{
-        "ld", "-melf_i386", "-Ttext", "0x8000", "-o",
+        "ld.lld", "-m", "elf_i386", "--image-base=0", "-Ttext", "0x8000", "-o",
     });
-    trampoline_elf.addArg("/tmp/ap_trampoline.elf");
-    trampoline_elf.addArg("/tmp/ap_trampoline.o");
+    trampoline_elf.addArg(".zig-cache/ap_trampoline.elf");
+    trampoline_elf.addArg(".zig-cache/ap_trampoline.o");
     trampoline_elf.step.dependOn(&trampoline_obj.step);
     trampoline_elf.setName("link ap_trampoline.elf");
 
     const trampoline_bin = b.addSystemCommand(&.{
-        "objcopy", "-O", "binary",
+        "zig", "objcopy", "-O", "binary",
     });
-    trampoline_bin.addArg("/tmp/ap_trampoline.elf");
+    trampoline_bin.addArg(".zig-cache/ap_trampoline.elf");
     trampoline_bin.addArg("kernel/arch/x86_64/ap_trampoline.bin");
     trampoline_bin.step.dependOn(&trampoline_elf.step);
     trampoline_bin.setName("objcopy ap_trampoline -> raw binary");
@@ -175,7 +168,7 @@ pub fn build(b: *std.Build) void {
     const asm_programs = [_][]const u8{ "init", "hello2", "hello3" };
     for (asm_programs) |name| addAsmUserProgram(b, name);
 
-    // C programs (.c -> static freestanding ELF -> stripped binary)
+    // C programs (.c -> static freestanding ELF stored as .bin)
     const c_programs = [_][]const u8{
         "hello4",  "hello5",  "hello6",  "hello7",  "hello8",  "sh",
         "hello9",  "hello10", "hello11", "hello12", "hello13", "hello14",

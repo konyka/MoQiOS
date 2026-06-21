@@ -13,8 +13,8 @@
 | Zig | 0.16+ | 内核编译、`zig cc` 交叉编译用户 C 程序、构建驱动（`build.zig`） |
 | `zig cc` | 内置 | 编译用户态 C 程序（封装 clang） |
 | LLD | 内置 (`ld.lld`) | 链接内核与用户程序 |
-| `as` (Zig/LLVM) | 内置 | 汇编 `init.S`、`hello*.S`、`ap_trampoline.S` |
-| `objcopy` | binutils | 提取二进制段（trampoline 等） |
+| `zig cc` (assembler mode) | 内置 | 汇编 `init.S`、`hello*.S`、`ap_trampoline_src.S` |
+| `zig objcopy` | 内置 | 提取二进制段（用户汇编程序、trampoline 等） |
 | `xorriso` | 系统包 | 生成 ISO 镜像 |
 | `limine` | 仓库 `limine/` 子目录 | 安装 BIOS/UEFI 引导器 |
 | QEMU (x86_64) | 系统包 | 仿真运行 |
@@ -96,20 +96,21 @@ SECTIONS {
 
 ### 4.1 C 程序（hello4–hello28, sh）
 
-`addCUserProgram(b, name)`：用 `zig cc` 交叉编译为静态 freestanding ELF，再 `strip` 输出二进制。
+`addCUserProgram(b, name)`：用 `zig cc` 交叉编译为静态 freestanding ELF，并直接输出到
+`user/<name>.bin`。这些 `.bin` 文件实际仍是 ELF，内核 loader 会自动识别 ELF/flat binary。
+Windows 兼容构建路径不再依赖外部 `strip`；后续可在 CI 中按工具可用性重新启用体积优化。
 
 ```
 zig cc \
     -target x86_64-freestanding-none \
     -static -nostdlib -ffreestanding -O2 \
-    -mno-sse -mno-sse2 \
     -Wl,--gc-sections -Wl,-z,norelro \
-    -o user/<name>.elf user/<name>.c
-strip -o user/<name>.bin user/<name>.elf
+    -o user/<name>.bin user/<name>.c
 ```
 
-注意：C 程序**不使用** `user/user.ld`，由 `zig cc` 默认链接（内置自定义 `_start`）。`.elf`
-用于内核 ELF 加载，`.bin` 为 strip 后产物。
+注意：C 程序**不使用** `user/user.ld`，由 `zig cc` 默认链接（内置自定义 `_start`）。内核目标仍禁用
+SSE；用户态 C 程序不再传 `-mno-sse/-mno-sse2`，因为 Zig 0.15.2 的 compiler-rt 在该组合下会触发
+half-float SSE 返回错误。启用跨核用户任务迁移前仍需补齐 FPU/SSE 上下文保存验证。
 
 ### 4.2 汇编程序（init.S, hello2.S, hello3.S）
 
@@ -119,7 +120,7 @@ strip -o user/<name>.bin user/<name>.elf
 ```
 zig cc -target x86_64-freestanding-none -c -o user/<name>.o user/<name>.S
 ld.lld -T user/user.ld -o user/<name>.elf user/<name>.o
-objcopy -O binary user/<name>.elf user/<name>.bin
+zig objcopy -O binary user/<name>.elf user/<name>.bin
 ```
 
 ### 4.3 用户链接脚本 `user/user.ld`
@@ -131,14 +132,14 @@ objcopy -O binary user/<name>.elf user/<name>.bin
 
 ## 5. AP Trampoline
 
-文件：`kernel/arch/x86_64/ap_trampoline.S`
+文件：`kernel/arch/x86_64/ap_trampoline_src.S`
 
 - 16 位实模式 → 32 位保护模式 → 64 位长模式
 - 链接到固定物理地址 `0x8000`（页表起始下方）
 - 流程：
-  1. `as` 汇编 → `.o`
-  2. 链接（自定义 `-Ttext 0x8000`） → ELF
-  3. `objcopy -O binary` → `ap_trampoline.bin`
+  1. `zig cc -target x86-freestanding-none -c` 汇编 → `.o`
+  2. `ld.lld -m elf_i386 --image-base=0 -Ttext 0x8000` 链接 → ELF
+  3. `zig objcopy -O binary` → `ap_trampoline.bin`
   4. 内核启动时 BSP 通过 `memcpy` 把 `.bin` 复制到 `0x8000`，再发 INIT/SIPI
 
 ---
