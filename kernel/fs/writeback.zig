@@ -118,7 +118,7 @@ fn findOrAllocBufferLocked(file_idx: u32, byte_offset: u64, fs_type: FsType, fla
     const flush_ok = if (flush_callbacks[@intFromEnum(evict_fs)]) |cb|
         cb(evict_file_idx, evict_offset, &evict_data, evict_len)
     else
-        true;
+        false; // v53.36: no callback = cannot flush = refuse eviction (W3 fix)
     _ = wb_lock.acquire();
     if (!flush_ok) {
         // Flush failed — restore dirty state, refuse allocation
@@ -177,8 +177,13 @@ pub fn flushFile(file_idx: u32, fs_type: FsType, comptime write_fn: fn (u32, u64
                 dirty_bm[w] &= ~(@as(u64, 1) << @intCast(bit));
                 // v53.35: keep in_use during flush for read-after-write consistency (W1)
                 wb_lock.release(flags);
-                _ = write_fn(tmp_file_idx, tmp_offset, &tmp_data, tmp_len);
+                const write_ok = write_fn(tmp_file_idx, tmp_offset, &tmp_data, tmp_len);
                 _ = wb_lock.acquire();
+                if (!write_ok) { // v53.36: restore dirty on flush failure (W2 fix)
+                    b.dirty = true;
+                    dirty_bm[w] |= (@as(u64, 1) << @intCast(bit));
+                    continue;
+                }
                 if (!b.dirty) {
                     b.in_use = false;
                     bmClr(&in_use_bm, i);
@@ -210,8 +215,13 @@ pub fn flushAllByType(fs_type: FsType, comptime write_fn: fn (u32, u64, [*]const
             dirty_bm[w] &= ~(@as(u64, 1) << @intCast(bit));
             // v53.35: keep in_use during flush for read-after-write consistency (W1)
             wb_lock.release(flags);
-            _ = write_fn(tmp_file_idx, tmp_offset, &tmp_data, tmp_len);
+            const write_ok = write_fn(tmp_file_idx, tmp_offset, &tmp_data, tmp_len);
             _ = wb_lock.acquire();
+            if (!write_ok) { // v53.36: restore dirty on flush failure (W2 fix)
+                b.dirty = true;
+                dirty_bm[w] |= (@as(u64, 1) << @intCast(bit));
+                continue;
+            }
             if (!b.dirty) {
                 b.in_use = false;
                 bmClr(&in_use_bm, i);
@@ -281,8 +291,13 @@ pub fn flushExpiredByFs(fs_type: FsType, comptime write_fn: fn (u32, u64, [*]con
                 dirty_bm[w] &= ~(@as(u64, 1) << @intCast(bit));
                 // v53.35: keep in_use during flush for read-after-write consistency (W1)
                 wb_lock.release(flags);
-                _ = write_fn(tmp_file_idx, tmp_offset, &tmp_data, tmp_len);
+                const write_ok = write_fn(tmp_file_idx, tmp_offset, &tmp_data, tmp_len);
                 _ = wb_lock.acquire();
+                if (!write_ok) { // v53.36: restore dirty on flush failure (W2 fix)
+                    b.dirty = true;
+                    dirty_bm[w] |= (@as(u64, 1) << @intCast(bit));
+                    continue;
+                }
                 if (!b.dirty) {
                     b.in_use = false;
                     bmClr(&in_use_bm, i);

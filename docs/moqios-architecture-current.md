@@ -1,8 +1,8 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.45.0（SMP 性能三件套 + IPv6 + Capability + Arch 抽象层 + 调度器 Profiling）
+> **版本**: v0.45.0（SMP 性能三件套 + IPv6 + Capability + Arch 抽象层 + 调度器 Profiling + v53.36 fat32/writeback 修复）
 > **日期**: 2026-06-21
-> **代码统计**: 内核 ~40,500 行 Zig / 132 源文件（新增 `kernel/net/ipv6.zig`、
+> **代码统计**: 内核 40,390 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
 >   `kernel/net/icmpv6.zig`、`kernel/net/ndp.zig`、`kernel/proc/cap_check.zig`、
 >   `kernel/arch/arch.zig`、`kernel/arch/x86_64/arch_impl.zig`、`kernel/arch/riscv64/arch_impl.zig`），
 >   用户空间 2,244 行 C/ASM
@@ -1298,4 +1298,4 @@ kernel/main.zig
 | kernel/fs/procfs.zig | ~380 | procfs 12种虚拟文件 (含 /proc/sched_stats) |
 | kernel/sync/ | ~600 | IrqSpinlock/TicketLock/Mutex/RwLock/SeqLock/MPMC |
 
-**总计: 132 个 .zig 文件, ~40,500 行**
+**总计: 133 个 .zig 文件, 40,390 行**

@@ -27,6 +27,7 @@ pub const FileInfo = struct {
     name_len: u32,
     size: u32,
     first_cluster: u32,
+    last_cluster: u32, // v53.36: cached last cluster for O(n) append (P3 fix)
     is_dir: bool,
 };
 
@@ -54,12 +55,16 @@ var fat32_fat_size_sectors: u32 = 0;
 var write_buf_phys: u64 = 0;
 var write_buf_virt: u64 = 0;
 var fat32_total_data_clusters: u32 = 0;
+// v53.36: Single-sector FAT cache — 128x I/O reduction for sequential reads (P2 fix)
+var fat_cache_sector: u32 = 0xFFFFFFFF;
+var fat_cache_buf: [512]u8 = @splat(0);
 
 var files: [MAX_FILES]FileInfo = @splat(.{
     .name = @splat(0),
     .name_len = 0,
     .size = 0,
     .first_cluster = 0,
+    .last_cluster = 0,
     .is_dir = false,
 });
 var file_count: u32 = 0;
@@ -225,9 +230,12 @@ fn getFATEntry(cluster: u32) u32 {
     const sector = fat32_fat_start + fat_offset / @as(u32, fat32_bytes_per_sector);
     const offset = fat_offset % @as(u32, fat32_bytes_per_sector);
 
-    const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
-    _ = virtio_blk.readSectors(sector, 1, buf);
-    const result: u32 = @bitCast([4]u8{ buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3] });
+    // v53.36: Single-sector FAT cache (P2 fix — 128x I/O reduction)
+    if (sector != fat_cache_sector) {
+        _ = virtio_blk.readSectors(sector, 1, &fat_cache_buf);
+        fat_cache_sector = sector;
+    }
+    const result: u32 = @bitCast([4]u8{ fat_cache_buf[offset], fat_cache_buf[offset + 1], fat_cache_buf[offset + 2], fat_cache_buf[offset + 3] });
     return result & 0x0FFFFFFF;
 }
 
@@ -267,6 +275,7 @@ fn listRootDir() void {
                 .size = @bitCast([4]u8{ buf[entry_off + 28], buf[entry_off + 29], buf[entry_off + 30], buf[entry_off + 31] }),
                 .first_cluster = @as(u32, @as(u16, @bitCast([2]u8{ buf[entry_off + 26], buf[entry_off + 27] }))) |
                     (@as(u32, @as(u16, @bitCast([2]u8{ buf[entry_off + 20], buf[entry_off + 21] }))) << 16),
+                .last_cluster = 0,
                 .is_dir = is_dir,
             };
 
@@ -364,28 +373,25 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
 
     while (total_read < to_read and cluster >= 2 and cluster < 0x0FFFFFF8) {
         const lba = clusterToLBA(cluster);
-        const cluster_page_idx: u64 = @as(u64, cluster) * @as(u64, fat32_sectors_per_cluster) / 8; // pages per cluster
+        // v53.36: Use cluster number directly as cache key (P1 fix — prevents
+        // key collision when sectors_per_cluster < 8).
+        const cluster_page_idx: u64 = @as(u64, cluster);
+        var chunk: u32 = 0;
 
         // Try page cache for this cluster
         if (page_cache.readPage(inode_id, cluster_page_idx)) |cached| {
             const avail = cluster_size - current_offset_in_cluster;
-            const chunk = if (total_read + avail > to_read) to_read - total_read else avail;
+            chunk = if (total_read + avail > to_read) to_read - total_read else avail;
             @memcpy(buf[total_read .. total_read + chunk], cached[current_offset_in_cluster .. current_offset_in_cluster + chunk]);
-            total_read += chunk;
         } else {
             // Cache miss — read from disk
             const sector_buf: [*]u8 = @ptrFromInt(sector_buf_virt);
-            // v53.35: Single multi-sector read instead of per-sector loop (C2 fix).
-            // Previously each sector overwrote the same buffer address, corrupting
-            // multi-sector clusters (only last sector survived). Also reduces I/O
-            // requests from N to 1 (8-sector cluster = 87.5% I/O reduction).
             if (fat32_sectors_per_cluster <= 8) {
                 // Cluster fits in 4KB buffer — read full cluster
                 _ = virtio_blk.readSectors(lba, fat32_sectors_per_cluster, sector_buf);
                 const avail = cluster_size - current_offset_in_cluster;
-                const chunk = if (total_read + avail > to_read) to_read - total_read else avail;
+                chunk = if (total_read + avail > to_read) to_read - total_read else avail;
                 @memcpy(buf[total_read .. total_read + chunk], sector_buf[current_offset_in_cluster .. current_offset_in_cluster + chunk]);
-                total_read += chunk;
                 const page_data: *const [4096]u8 = sector_buf[0..4096];
                 _ = page_cache.insertPage(inode_id, cluster_page_idx, page_data, cluster_size);
             } else {
@@ -396,14 +402,19 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
                 _ = virtio_blk.readSectors(lba + sector_in_cluster, sectors_to_read, sector_buf);
                 const buf_avail = sectors_to_read * SECTOR_SIZE - offset_in_sector;
                 const avail = @min(cluster_size - current_offset_in_cluster, buf_avail);
-                const chunk = if (total_read + avail > to_read) to_read - total_read else avail;
+                chunk = if (total_read + avail > to_read) to_read - total_read else avail;
                 @memcpy(buf[total_read .. total_read + chunk], sector_buf[offset_in_sector .. offset_in_sector + chunk]);
-                total_read += chunk;
             }
         }
-        current_offset_in_cluster = 0;
-
-        cluster = getFATEntry(cluster);
+        total_read += chunk;
+        // v53.36: Advance offset within cluster; only advance to next cluster
+        // when current cluster fully consumed (C1 fix — prevents data loss for
+        // clusters > 4KB where only part of cluster is read per iteration).
+        current_offset_in_cluster += chunk;
+        if (current_offset_in_cluster >= cluster_size) {
+            current_offset_in_cluster = 0;
+            cluster = getFATEntry(cluster);
+        }
     }
 
     return @intCast(total_read);
@@ -462,6 +473,7 @@ fn setFATEntry(cluster: u32, value: u32) void {
     buf[offset + 2] = @truncate(value >> 16);
     buf[offset + 3] = (buf[offset + 3] & 0xF0) | @as(u8, @truncate(value >> 24));
     _ = safeWriteSectors(sector, 1, buf);
+    fat_cache_sector = 0xFFFFFFFF; // v53.36: invalidate FAT cache after modification (P2 consistency)
 }
 
 fn allocCluster() ?u32 {
@@ -582,6 +594,7 @@ pub fn createFile(name: []const u8) i64 {
         .name_len = @intCast(name.len),
         .size = 0,
         .first_cluster = new_cluster,
+        .last_cluster = new_cluster,
         .is_dir = false,
     };
     for (0..name.len) |j| fi.name[j] = name[j];
@@ -611,16 +624,22 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
             const nc = allocCluster() orelse return -1;
             zeroCluster(nc);
             fi.first_cluster = nc;
+            fi.last_cluster = nc;
             continue;
         }
-        var last: u32 = c;
-        while (c >= 2 and c < 0x0FFFFFF8) {
+        // v53.36: Use cached last_cluster to avoid O(n²) chain traversal (P3 fix)
+        var last: u32 = fi.last_cluster;
+        if (last < 2 or last >= 0x0FFFFFF8) {
             last = c;
-            c = getFATEntry(c);
+            while (c >= 2 and c < 0x0FFFFFF8) {
+                last = c;
+                c = getFATEntry(c);
+            }
         }
         const nc = allocCluster() orelse return -1;
         zeroCluster(nc);
         setFATEntry(last, nc);
+        fi.last_cluster = nc;
     }
 
     // Write data: iterate over clusters, copying buf into the right sectors.
@@ -643,31 +662,39 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
             const overlap_start = if (offset > file_offset) offset - file_offset else 0;
             const overlap_end = if (offset + count < cluster_end_offset) offset + count - file_offset else cluster_size;
 
-            var sec: u32 = 0;
-            while (sec < fat32_sectors_per_cluster) : (sec += 1) {
-                const sec_start = sec * SECTOR_SIZE;
-                const sec_end = sec_start + SECTOR_SIZE;
+            // v53.36: Full cluster write — single multi-sector I/O (P4 fix, 87.5% I/O reduction)
+            if (overlap_start == 0 and overlap_end == cluster_size and fat32_sectors_per_cluster <= 8) {
+                @memcpy(wbuf[0..cluster_size], buf[bytes_written .. bytes_written + cluster_size]);
+                _ = safeWriteSectors(cluster_start_lba, fat32_sectors_per_cluster, wbuf);
+                bytes_written += cluster_size;
+            } else {
+                // Partial cluster write — per-sector read-modify-write
+                var sec: u32 = 0;
+                while (sec < fat32_sectors_per_cluster) : (sec += 1) {
+                    const sec_start = sec * SECTOR_SIZE;
+                    const sec_end = sec_start + SECTOR_SIZE;
 
-                // Does this sector overlap?
-                if (sec_end <= overlap_start or sec_start >= overlap_end) continue;
+                    // Does this sector overlap?
+                    if (sec_end <= overlap_start or sec_start >= overlap_end) continue;
 
-                const lba = cluster_start_lba + sec;
+                    const lba = cluster_start_lba + sec;
 
-                // Determine the byte range to modify within this sector
-                const mod_start = if (overlap_start > sec_start) overlap_start - sec_start else 0;
-                const mod_end = if (overlap_end < sec_end) overlap_end - sec_start else SECTOR_SIZE;
+                    // Determine the byte range to modify within this sector
+                    const mod_start = if (overlap_start > sec_start) overlap_start - sec_start else 0;
+                    const mod_end = if (overlap_end < sec_end) overlap_end - sec_start else SECTOR_SIZE;
 
-                // If writing the full sector, no need to read first
-                if (mod_start == 0 and mod_end == SECTOR_SIZE) {
-                    @memcpy(wbuf[0..SECTOR_SIZE], buf[bytes_written .. bytes_written + SECTOR_SIZE]);
-                } else {
-                    // Read-modify-write
-                    _ = virtio_blk.readSectors(lba, 1, wbuf);
-                    @memcpy(wbuf[mod_start..mod_end], buf[bytes_written .. bytes_written + (mod_end - mod_start)]);
+                    // If writing the full sector, no need to read first
+                    if (mod_start == 0 and mod_end == SECTOR_SIZE) {
+                        @memcpy(wbuf[0..SECTOR_SIZE], buf[bytes_written .. bytes_written + SECTOR_SIZE]);
+                    } else {
+                        // Read-modify-write
+                        _ = virtio_blk.readSectors(lba, 1, wbuf);
+                        @memcpy(wbuf[mod_start..mod_end], buf[bytes_written .. bytes_written + (mod_end - mod_start)]);
+                    }
+
+                    _ = safeWriteSectors(lba, 1, wbuf);
+                    bytes_written += @intCast(mod_end - mod_start);
                 }
-
-                _ = safeWriteSectors(lba, 1, wbuf);
-                bytes_written += @intCast(mod_end - mod_start);
             }
         }
 
@@ -763,6 +790,7 @@ pub fn deleteFile(file_idx: u32) bool {
 
         cluster = next_cluster;
     }
+    fat_cache_sector = 0xFFFFFFFF; // v53.36: invalidate FAT cache after deleteFile bypasses setFATEntry
 
     // Remove from in-memory file array
     for (file_idx..file_count - 1) |i| {
