@@ -433,7 +433,7 @@ fn readSectorsFromDev(dev: *VirtioBlkDevice, lba: u64, count: u32, buf: [*]u8) i
     const d2 = getDesc(dev.queue_virt, 2);
     d2.addr = dev.status_phys;
     d2.len = 1;
-    d2.flags = 0;
+    d2.flags = 1 << 1; // v53.38: WRITE — device writes status byte (W1 fix)
     d2.next = 0;
 
     const avail = getAvail(dev.queue_virt);

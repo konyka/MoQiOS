@@ -1,14 +1,18 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.46.0（v53.37 ICMPv6校验和验证 + NDP Solicited NA + FAT缓存DMA安全 + setFATEntry缓存优化 + zeroCluster多扇区写）
+> **版本**: v0.47.0（v53.38 ext2 DMA安全 + virtio_blk WRITE标志 + allocCluster游标 + readFile簇链缓存 + deleteFile FAT缓存复用）
 > **日期**: 2026-05-29
-> **代码统计**: 内核 40,414 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
+> **代码统计**: 内核 40,439 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
 >   `kernel/net/icmpv6.zig`、`kernel/net/ndp.zig`、`kernel/proc/cap_check.zig`、
 >   `kernel/arch/arch.zig`、`kernel/arch/x86_64/arch_impl.zig`、`kernel/arch/riscv64/arch_impl.zig`），
 >   用户空间 2,244 行 C/ASM
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
+>
+> **2026-05-29 更新 (v53.38)**：ext2 BSS全局缓冲区DMA安全修复 (cache[].data/zero_block_buf/ensure_ind_buf/sb_io_buf
+> → io_buf_virt PMM/HHDM分配中间缓冲区)、virtio_blk readSectorsFromDev WRITE标志修复 (d2.flags=0→1<<1)、
+> allocCluster游标优化 (O(N×M)→O(N)摊还)、readFile簇链缓存 (O(N²)→O(N))、deleteFile FAT缓存复用 (N→ceil(N/128))。
 >
 > **2026-05-29 更新 (v53.37)**：ICMPv6 入站校验和验证 (RFC 4443 §2.3)、NDP NA Solicited 标志修复
 > (RFC 4861 §7.2.4)、FAT 缓存缓冲区 DMA 安全修复 (BSS→PMM/HHDM 分配，修复 virtio-blk DMA 物理地址
@@ -42,7 +46,7 @@ MoQiOS 是一个运行在 x86_64 架构上的**单体内核** (Monolithic Kernel
 | 系统调用数量 | 383 dispatch 条目 (max #471, #0-#330 连续 + Linux #424-#471 完全连续) |
 | 文件系统 | FAT32 + ext2 (完整 symlink/hardlink/chown/chmod) + tmpfs + procfs + ramdisk + 统一页缓存 (命中/未中统计) |
 | 网络设备 | e1000 (中断驱动) + virtio-net (Virtqueue) |
-| 内核代码量 | ~40,414 行 Zig / 133 文件 |
+| 内核代码量 | ~40,439 行 Zig / 133 文件 |
 | 用户代码量 | 2,244 行 C/ASM |
 
 ---
@@ -988,14 +992,16 @@ LAPIC Timer 中断
 
 ### 7.2 FAT32 文件系统
 
-**源文件**: `kernel/fs/fat32.zig` (824 行)
+**源文件**: `kernel/fs/fat32.zig` (826 行)
 
 - 基于 virtio-blk 块设备驱动
 - 支持: open, read, write, create, delete, stat, listdir
-- `deleteFile()`: 标记目录项为 0xE5，遍历 FAT 簇链释放所有簇
+- `deleteFile()`: 标记目录项为 0xE5，遍历 FAT 簇链释放所有簇 (v53.38: FAT缓存复用)
 - **FAT 缓存** (v53.36/v53.37): 单扇区 FAT 缓存 — PMM 分配的 HHDM 映射缓冲区 (DMA 安全)，128x I/O 减少
 - **setFATEntry 缓存优化** (v53.37): 缓存命中直接修改 (0次读)，未命中 1 次读 — N 次分配从 2N 次读降为 N 次
 - **zeroCluster 多扇区写** (v53.37): spc≤8 时单次 safeWriteSectors，减少 I/O 次数
+- **allocCluster 游标** (v53.38): last_free_cluster 游标 — O(N×M)→O(N) 摊还
+- **readFile 簇链缓存** (v53.38): last_walk_cluster/last_walk_idx — O(N²)→O(N) 顺序读
 - 缓存: 在内存中维护打开文件数组，避免频繁磁盘 I/O
 - 路径解析: 支持绝对路径和相对路径 (相对于 cwd)
 
@@ -1292,11 +1298,11 @@ kernel/main.zig
 | kernel/fs/page_cache.zig | ~581 | 统一页缓存 (1024页/512哈希槽/Clock替换+命中统计/8页预取/invalidateInode批量失效) |
 | kernel/main.zig | 329 | 内核主函数 |
 | kernel/arch/x86_64/paging.zig | 293 | 页表管理 + getPagePhysAddr |
-| kernel/fs/ext2.zig | ~3200 | ext2 文件系统 (hardlink/symlink/unlink/chown/chmod/xattr/walkPathResolve/writeFile零拷贝+invalidateInode) |
-| kernel/fs/fat32.zig | 824 | FAT32 文件系统 (FAT缓存+DMA安全+多扇区写) |
+| kernel/fs/ext2.zig | 3267 | ext2 文件系统 (DMA安全I/O+hardlink/symlink/unlink/chown/chmod/xattr/walkPathResolve/writeFile零拷贝+invalidateInode) |
+| kernel/fs/fat32.zig | 826 | FAT32 文件系统 (FAT缓存+DMA安全+多扇区写+allocCluster游标+readFile簇链缓存) |
 | kernel/proc/scheduler.zig | ~500 | O(1) 位图调度器 |
 | kernel/proc/task.zig | ~704 | Task 结构体 + 进程管理 |
-| kernel/drivers/virtio_blk.zig | ~550 | virtio-blk 块设备驱动 |
+| kernel/drivers/virtio_blk.zig | 545 | virtio-blk 块设备驱动 (多设备+DMA安全) |
 | kernel/drivers/nvme.zig | ~690 | NVMe SSD 驱动 (多队列, 最多4 I/O SQ/CQ对) |
 | kernel/mm/pmm.zig | 347 | 物理内存管理 (两级位图 + refcount + COW API) |
 | kernel/mm/slab.zig | ~200 | Slab 分配器 |

@@ -28,6 +28,8 @@ pub const FileInfo = struct {
     size: u32,
     first_cluster: u32,
     last_cluster: u32, // v53.36: cached last cluster for O(n) append (P3 fix)
+    last_walk_cluster: u32 = 0, // v53.38: cached cluster for readFile chain walk (P1 fix)
+    last_walk_idx: u32 = 0, // v53.38: cluster index of last_walk_cluster
     is_dir: bool,
 };
 
@@ -60,6 +62,7 @@ var fat32_total_data_clusters: u32 = 0;
 var fat_cache_sector: u32 = 0xFFFFFFFF;
 var fat_cache_phys: u64 = 0;
 var fat_cache_buf_virt: u64 = 0;
+var last_free_cluster: u32 = 2; // v53.38: allocCluster scan cursor (O(N) vs O(N×M))
 
 var files: [MAX_FILES]FileInfo = @splat(.{
     .name = @splat(0),
@@ -369,9 +372,19 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
 
     var cluster: u32 = fi.first_cluster;
     var ci: u32 = 0;
+    // v53.38: Resume from cached walk position — O(N) vs O(N²) for sequential reads
+    if (fi.last_walk_cluster >= 2 and fi.last_walk_cluster < 0x0FFFFFF8 and fi.last_walk_idx <= start_cluster_idx) {
+        cluster = fi.last_walk_cluster;
+        ci = fi.last_walk_idx;
+    }
     while (ci < start_cluster_idx and cluster >= 2 and cluster < 0x0FFFFFF8) {
         cluster = getFATEntry(cluster);
         ci += 1;
+    }
+    // v53.38: Update walk cache for sequential read optimization
+    if (cluster >= 2 and cluster < 0x0FFFFFF8) {
+        files[file_idx].last_walk_cluster = cluster;
+        files[file_idx].last_walk_idx = ci;
     }
     if (cluster < 2 or cluster >= 0x0FFFFFF8) return -1;
 
@@ -496,13 +509,18 @@ fn allocCluster() ?u32 {
     const total_fat_entries = fat32_fat_size_sectors * entries_per_sector;
     const max_cluster = if (fat32_total_data_clusters + 2 < total_fat_entries) fat32_total_data_clusters + 2 else total_fat_entries;
 
-    var cluster: u32 = 2;
-    while (cluster < max_cluster) : (cluster += 1) {
+    // v53.38: Resume scan from cursor — O(N) amortized vs O(N×M) from cluster 2
+    var cluster: u32 = last_free_cluster;
+    var scanned: u32 = 0;
+    while (scanned < max_cluster) : (scanned += 1) {
+        if (cluster >= max_cluster) cluster = 2;
         const entry = getFATEntry(cluster);
         if (entry == 0) {
             setFATEntry(cluster, 0x0FFFFFFF);
+            last_free_cluster = cluster + 1;
             return cluster;
         }
+        cluster += 1;
     }
     return null;
 }
@@ -788,31 +806,15 @@ pub fn deleteFile(file_idx: u32) bool {
     }
 
     // Free the cluster chain in FAT
+    // v53.38: Use getFATEntry/setFATEntry for FAT cache reuse (P3 fix — N reads → ceil(N/128))
     var cluster: u32 = fi.first_cluster;
     var safety: u32 = 0;
     while (cluster >= 2 and cluster < 0x0FFFFFF8 and safety < 65536) : (safety += 1) {
-        const fat_offset = cluster * 4;
-        const sector = fat32_fat_start + fat_offset / @as(u32, fat32_bytes_per_sector);
-        const offset = fat_offset % @as(u32, fat32_bytes_per_sector);
-
-        const fbuf: [*]u8 = @ptrFromInt(sector_buf_virt);
-        _ = virtio_blk.readSectors(sector, 1, fbuf);
-        const next_cluster_0 = fbuf[offset];
-        const next_cluster_1 = fbuf[offset + 1];
-        const next_cluster_2 = fbuf[offset + 2];
-        const next_cluster_3 = fbuf[offset + 3] & 0x0F;
-        const next_cluster: u32 = @as(u32, next_cluster_0) | (@as(u32, next_cluster_1) << 8) | (@as(u32, next_cluster_2) << 16) | (@as(u32, next_cluster_3) << 24);
-
-        // Mark cluster as free (0)
-        fbuf[offset] = 0;
-        fbuf[offset + 1] = 0;
-        fbuf[offset + 2] = 0;
-        fbuf[offset + 3] = fbuf[offset + 3] & 0xF0;
-        _ = safeWriteSectors(sector, 1, fbuf);
-
+        const next_cluster = getFATEntry(cluster);
+        setFATEntry(cluster, 0);
         cluster = next_cluster;
     }
-    fat_cache_sector = 0xFFFFFFFF; // v53.36: invalidate FAT cache after deleteFile bypasses setFATEntry
+    // No cache invalidation needed — setFATEntry keeps cache consistent
 
     // Remove from in-memory file array
     for (file_idx..file_count - 1) |i| {

@@ -124,6 +124,13 @@ var group_descs_virt: u64 = 0;
 var sector_buf_phys: u64 = 0;
 var sector_buf_virt: u64 = 0;
 
+// v53.38: DMA-safe I/O buffer for readBlockUncached/writeBlockUncached (Critical fix)
+// BSS globals (cache[].data, zero_block_buf, ensure_ind_buf) are at
+// 0xFFFFFFFF80xxxxxx — outside HHDM, virtToPhys returns invalid physical address.
+// All block I/O now goes through this PMM-allocated HHDM-mapped buffer.
+var io_buf_phys: u64 = 0;
+var io_buf_virt: u64 = 0;
+
 pub const Ext2File = struct {
     inode_num: u32,
     inode: Ext2Inode,
@@ -155,6 +162,15 @@ pub fn init() void {
     }
 
     block_size = @as(u32, 1024) << @intCast(sb.log_block_size);
+
+    // v53.38: Allocate DMA-safe I/O buffer (must fit block_size, max 4KB per page)
+    if (block_size > 4096) {
+        serial.writeString("[ext2] block_size > 4KB unsupported with DMA-safe I/O\n");
+        return;
+    }
+    io_buf_phys = pmm.allocPage() orelse return;
+    io_buf_virt = hhdm.physToVirt(io_buf_phys);
+
     groups_count = (sb.blocks_count + sb.blocks_per_group - 1) / sb.blocks_per_group;
     inodes_per_group = sb.inodes_per_group;
     inode_size = if (sb.rev_level >= 1) sb.inode_size else 128;
@@ -201,7 +217,11 @@ fn readSectorsToBuf(lba: u64, count: u32, dest: [*]u8) bool {
 /// Read a block from disk (uncached, direct I/O).
 fn readBlockUncached(block_num: u32, buf: [*]u8) bool {
     const lba = @as(u64, block_num) * (block_size / SECTOR_SIZE);
-    return readSectorsToBuf(lba, block_size / SECTOR_SIZE, buf);
+    // v53.38: DMA via HHDM-mapped buffer — buf may be BSS/stack (not DMA-safe)
+    const dma_buf: [*]u8 = @ptrFromInt(io_buf_virt);
+    if (!readSectorsToBuf(lba, block_size / SECTOR_SIZE, dma_buf)) return false;
+    @memcpy(buf[0..block_size], dma_buf[0..block_size]);
+    return true;
 }
 
 /// Read a block through the cache (all existing callers use this).
@@ -227,8 +247,7 @@ var cache: [CACHE_ENTRIES]CacheEntry = @splat(.{});
 // v53.21: Static zero buffer for block zeroing — eliminates allocPage/freePage/memset
 // per allocBlock call and avoids cache pollution (writeBlockUncached doesn't touch cache)
 const zero_block_buf: [4096]u8 = @splat(0);
-// v53.22: Static buffer for superblock I/O — eliminates allocPage/freePage per writeSuperblock call
-var sb_io_buf: [2048]u8 = undefined;
+// v53.38: sb_io_buf removed — writeSuperblock now uses DMA-safe io_buf_virt
 // v53.23: Static buffers for ensureBlock indirect block I/O — eliminates allocPage/freePage per call
 var ensure_ind_buf: [3][4096]u8 align(8) = undefined;
 var cache_hash: [CACHE_ENTRIES]?u8 = @splat(null); // hash buckets
@@ -1417,7 +1436,10 @@ pub fn renameFile(old_path: []const u8, new_path: []const u8) bool {
 
 fn writeBlockUncached(block_num: u32, buf: [*]const u8) bool {
     const lba = @as(u64, block_num) * (block_size / SECTOR_SIZE);
-    const n = virtio_blk.writeSectors(DISK_LBA_OFFSET + lba, block_size / SECTOR_SIZE, buf);
+    // v53.38: DMA via HHDM-mapped buffer — buf may be BSS/stack (not DMA-safe)
+    const dma_buf: [*]u8 = @ptrFromInt(io_buf_virt);
+    @memcpy(dma_buf[0..block_size], buf[0..block_size]);
+    const n = virtio_blk.writeSectors(DISK_LBA_OFFSET + lba, block_size / SECTOR_SIZE, dma_buf);
     return n > 0;
 }
 
@@ -1956,11 +1978,12 @@ fn writeGroupDescs() void {
 
 /// Write superblock back to disk.
 fn writeSuperblock() void {
-    // v53.22: Use static buffer instead of allocPage/freePage per call
     const sb_lba: u64 = 1024 / SECTOR_SIZE;
-    if (!readSectorsToBuf(sb_lba, 2, &sb_io_buf)) return;
-    @memcpy(sb_io_buf[0..@sizeOf(Ext2Superblock)], @as([*]const u8, @ptrCast(&sb))[0..@sizeOf(Ext2Superblock)]);
-    _ = virtio_blk.writeSectors(DISK_LBA_OFFSET + sb_lba, 2, &sb_io_buf);
+    // v53.38: Use DMA-safe io_buf instead of BSS sb_io_buf (Critical fix)
+    const dma_buf: [*]u8 = @ptrFromInt(io_buf_virt);
+    if (!readSectorsToBuf(sb_lba, 2, dma_buf)) return;
+    @memcpy(dma_buf[0..@sizeOf(Ext2Superblock)], @as([*]const u8, @ptrCast(&sb))[0..@sizeOf(Ext2Superblock)]);
+    _ = virtio_blk.writeSectors(DISK_LBA_OFFSET + sb_lba, 2, dma_buf);
 }
 
 // ─── Create file ────────────────────────────────────────────────────────────
