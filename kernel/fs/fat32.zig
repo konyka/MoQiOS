@@ -56,8 +56,10 @@ var write_buf_phys: u64 = 0;
 var write_buf_virt: u64 = 0;
 var fat32_total_data_clusters: u32 = 0;
 // v53.36: Single-sector FAT cache — 128x I/O reduction for sequential reads (P2 fix)
+// v53.37: DMA-safe buffer via PMM (Critical fix — BSS not in HHDM, virtToPhys invalid)
 var fat_cache_sector: u32 = 0xFFFFFFFF;
-var fat_cache_buf: [512]u8 = @splat(0);
+var fat_cache_phys: u64 = 0;
+var fat_cache_buf_virt: u64 = 0;
 
 var files: [MAX_FILES]FileInfo = @splat(.{
     .name = @splat(0),
@@ -82,6 +84,10 @@ pub fn init() void {
 
     write_buf_phys = pmm.allocPage() orelse return;
     write_buf_virt = hhdm.physToVirt(write_buf_phys);
+
+    // v53.37: FAT cache buffer — PMM-allocated for DMA safety (Critical fix)
+    fat_cache_phys = pmm.allocPage() orelse return;
+    fat_cache_buf_virt = hhdm.physToVirt(fat_cache_phys);
 
     if (!virtio_blk.hasActiveDisk()) {
         serial.writeString("[fs] No block device available\n");
@@ -231,11 +237,13 @@ fn getFATEntry(cluster: u32) u32 {
     const offset = fat_offset % @as(u32, fat32_bytes_per_sector);
 
     // v53.36: Single-sector FAT cache (P2 fix — 128x I/O reduction)
+    // v53.37: DMA-safe HHDM buffer (Critical fix — BSS globals not DMA-safe)
+    const fbuf: [*]u8 = @ptrFromInt(fat_cache_buf_virt);
     if (sector != fat_cache_sector) {
-        _ = virtio_blk.readSectors(sector, 1, &fat_cache_buf);
+        _ = virtio_blk.readSectors(sector, 1, fbuf);
         fat_cache_sector = sector;
     }
-    const result: u32 = @bitCast([4]u8{ fat_cache_buf[offset], fat_cache_buf[offset + 1], fat_cache_buf[offset + 2], fat_cache_buf[offset + 3] });
+    const result: u32 = @bitCast([4]u8{ fbuf[offset], fbuf[offset + 1], fbuf[offset + 2], fbuf[offset + 3] });
     return result & 0x0FFFFFFF;
 }
 
@@ -466,14 +474,21 @@ fn setFATEntry(cluster: u32, value: u32) void {
     const sector = fat32_fat_start + fat_offset / @as(u32, fat32_bytes_per_sector);
     const offset = fat_offset % @as(u32, fat32_bytes_per_sector);
 
-    const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
-    _ = virtio_blk.readSectors(sector, 1, buf);
-    buf[offset] = @truncate(value);
-    buf[offset + 1] = @truncate(value >> 8);
-    buf[offset + 2] = @truncate(value >> 16);
-    buf[offset + 3] = (buf[offset + 3] & 0xF0) | @as(u8, @truncate(value >> 24));
-    _ = safeWriteSectors(sector, 1, buf);
-    fat_cache_sector = 0xFFFFFFFF; // v53.36: invalidate FAT cache after modification (P2 consistency)
+    // v53.37: Use FAT cache directly — avoid redundant sector read (P1 perf fix).
+    // Previously read sector_buf + wrote + invalidated cache → 2N reads for N allocations.
+    // Now: cache hit → modify in-place (0 reads); cache miss → read into cache (1 read).
+    // v53.37: DMA-safe HHDM buffer (Critical fix — BSS globals not DMA-safe)
+    const fbuf: [*]u8 = @ptrFromInt(fat_cache_buf_virt);
+    if (sector != fat_cache_sector) {
+        _ = virtio_blk.readSectors(sector, 1, fbuf);
+        fat_cache_sector = sector;
+    }
+    fbuf[offset] = @truncate(value);
+    fbuf[offset + 1] = @truncate(value >> 8);
+    fbuf[offset + 2] = @truncate(value >> 16);
+    fbuf[offset + 3] = (fbuf[offset + 3] & 0xF0) | @as(u8, @truncate(value >> 24));
+    _ = safeWriteSectors(sector, 1, fbuf);
+    // Cache stays valid — no invalidation needed
 }
 
 fn allocCluster() ?u32 {
@@ -495,10 +510,17 @@ fn allocCluster() ?u32 {
 fn zeroCluster(cluster: u32) void {
     const lba = clusterToLBA(cluster);
     const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
-    @memset(buf[0..SECTOR_SIZE], 0);
-    var s: u32 = 0;
-    while (s < fat32_sectors_per_cluster) : (s += 1) {
-        _ = safeWriteSectors(lba + s, 1, buf);
+    // v53.37: Multi-sector write for spc<=8 (P2 perf fix, same pattern as P4 writeFile)
+    if (fat32_sectors_per_cluster <= 8) {
+        const cluster_size = @as(u32, fat32_sectors_per_cluster) * SECTOR_SIZE;
+        @memset(buf[0..cluster_size], 0);
+        _ = safeWriteSectors(lba, fat32_sectors_per_cluster, buf);
+    } else {
+        @memset(buf[0..SECTOR_SIZE], 0);
+        var s: u32 = 0;
+        while (s < fat32_sectors_per_cluster) : (s += 1) {
+            _ = safeWriteSectors(lba + s, 1, buf);
+        }
     }
 }
 

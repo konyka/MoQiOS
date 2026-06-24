@@ -59,6 +59,8 @@ pub fn handlePacket(
     len: u16,
 ) void {
     if (len < 8) return;
+    // v53.37: Verify ICMPv6 checksum (RFC 4443 §2.3). checksum() returns 0 for valid packets.
+    if (checksum(src_ip, dst_ip, data, len) != 0) return;
     const icmp_type = data[0];
 
     switch (icmp_type) {
@@ -139,7 +141,7 @@ fn handleNeighborSolicitation(
     const our_ll = ndp.generateLinkLocal(our_mac);
     if (!ipv6.addrEq(target, our_ll)) return;
 
-    sendNeighborAdvertisement(src_ip, target, false);
+    sendNeighborAdvertisement(src_ip, target, true); // v53.37: solicited NA — set S flag (W1 fix, RFC 4861 §7.2.4)
 }
 
 fn handleNeighborAdvertisement(src_ip: [16]u8, data: [*]const u8, len: u16) void {
