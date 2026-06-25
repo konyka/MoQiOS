@@ -479,7 +479,7 @@ fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
 
     // Window: apply receive window scaling
     const raw_window: u16 = if (tcb.ws_enabled) blk: {
-        const scaled = tcb.rcv_wnd >> @intCast(tcb.snd_wnd_scale);
+        const scaled = tcb.rcv_wnd >> @intCast(tcb.rcv_wnd_scale);
         break :blk if (scaled > 0xFFFF) 0xFFFF else @intCast(scaled);
     } else @truncate(tcb.rcv_wnd);
 

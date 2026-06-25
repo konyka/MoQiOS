@@ -1,14 +1,20 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.47.0（v53.38 ext2 DMA安全 + virtio_blk WRITE标志 + allocCluster游标 + readFile簇链缓存 + deleteFile FAT缓存复用）
+> **版本**: v0.48.0（v53.39 page_cache脏页保护 + LRU移除 + TCP窗口缩放 + pmm双重释放锁 + slab页数截断 + readBlockDirect）
 > **日期**: 2026-05-29
-> **代码统计**: 内核 40,439 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
+> **代码统计**: 内核 40,396 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
 >   `kernel/net/icmpv6.zig`、`kernel/net/ndp.zig`、`kernel/proc/cap_check.zig`、
 >   `kernel/arch/arch.zig`、`kernel/arch/x86_64/arch_impl.zig`、`kernel/arch/riscv64/arch_impl.zig`），
 >   用户空间 2,244 行 C/ASM
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
+>
+> **2026-05-29 更新 (v53.39)**：page_cache脏页驱逐保护 (allocSlot跳过dirty页防止数据丢失)、
+> page_cache LRU双向链表移除 (Clock算法唯一驱逐策略，-67行死代码)、TCP窗口缩放修复
+> (snd_wnd_scale→rcv_wnd_scale，RFC 1323)、pmm freePage双重释放锁修复 (defer+手动release)、
+> slab大分配页数截断修复 (_pad u8→u16，255→65535页)、recordAccess/isCached SMP加锁、
+> ext2 readBlockDirect (DMA安全缓冲区跳过io_buf_virt中间拷贝)。
 >
 > **2026-05-29 更新 (v53.38)**：ext2 BSS全局缓冲区DMA安全修复 (cache[].data/zero_block_buf/ensure_ind_buf/sb_io_buf
 > → io_buf_virt PMM/HHDM分配中间缓冲区)、virtio_blk readSectorsFromDev WRITE标志修复 (d2.flags=0→1<<1)、
@@ -46,7 +52,7 @@ MoQiOS 是一个运行在 x86_64 架构上的**单体内核** (Monolithic Kernel
 | 系统调用数量 | 383 dispatch 条目 (max #471, #0-#330 连续 + Linux #424-#471 完全连续) |
 | 文件系统 | FAT32 + ext2 (完整 symlink/hardlink/chown/chmod) + tmpfs + procfs + ramdisk + 统一页缓存 (命中/未中统计) |
 | 网络设备 | e1000 (中断驱动) + virtio-net (Virtqueue) |
-| 内核代码量 | ~40,439 行 Zig / 133 文件 |
+| 内核代码量 | ~40,396 行 Zig / 133 文件 |
 | 用户代码量 | 2,244 行 C/ASM |
 
 ---
@@ -1289,26 +1295,26 @@ kernel/main.zig
 | 文件 | 行数 | 功能 |
 |---|---|---|
 | kernel/arch/x86_64/syscall_entry.zig | 4,886 | 系统调用入口 + 383 dispatch 条目 |
-| kernel/net/tcp.zig | 1,682 | TCP 协议 (Reno/SACK/WS/TS/CORK/QUICKACK + @memcpy环形缓冲区) |
+| kernel/net/tcp.zig | 1,869 | TCP 协议 (Reno/SACK/WS/TS/CORK/QUICKACK + @memcpy环形缓冲区) |
 | kernel/fs/vfs.zig | ~720 | 虚拟文件系统 + MAX_FDS=64 + procfs 路由 + inotify + allocFd |
 | kernel/arch/x86_64/idt.zig | 786 | 中断描述符表 + IRQ 分发 + COW #PF 处理 |
 | kernel/drivers/virtio_net.zig | 548 | virtio-net 网卡驱动 |
 | kernel/drivers/e1000.zig | 453 | e1000 网卡驱动 (中断驱动) |
 | kernel/net/epoll.zig | 547 | epoll 事件多路复用 (LT/ET/ONESHOT + 位图优化) |
-| kernel/fs/page_cache.zig | ~581 | 统一页缓存 (1024页/512哈希槽/Clock替换+命中统计/8页预取/invalidateInode批量失效) |
+| kernel/fs/page_cache.zig | 533 | 统一页缓存 (1024页/512哈希槽/Clock替换+脏页保护+命中统计/8页预取/invalidateInode批量失效，v53.39 LRU移除) |
 | kernel/main.zig | 329 | 内核主函数 |
 | kernel/arch/x86_64/paging.zig | 293 | 页表管理 + getPagePhysAddr |
-| kernel/fs/ext2.zig | 3267 | ext2 文件系统 (DMA安全I/O+hardlink/symlink/unlink/chown/chmod/xattr/walkPathResolve/writeFile零拷贝+invalidateInode) |
+| kernel/fs/ext2.zig | 3,276 | ext2 文件系统 (DMA安全I/O+readBlockDirect零拷贝+hardlink/symlink/unlink/chown/chmod/xattr/walkPathResolve/writeFile零拷贝+invalidateInode) |
 | kernel/fs/fat32.zig | 826 | FAT32 文件系统 (FAT缓存+DMA安全+多扇区写+allocCluster游标+readFile簇链缓存) |
 | kernel/proc/scheduler.zig | ~500 | O(1) 位图调度器 |
 | kernel/proc/task.zig | ~704 | Task 结构体 + 进程管理 |
 | kernel/drivers/virtio_blk.zig | 545 | virtio-blk 块设备驱动 (多设备+DMA安全) |
 | kernel/drivers/nvme.zig | ~690 | NVMe SSD 驱动 (多队列, 最多4 I/O SQ/CQ对) |
-| kernel/mm/pmm.zig | 347 | 物理内存管理 (两级位图 + refcount + COW API) |
-| kernel/mm/slab.zig | ~200 | Slab 分配器 |
+| kernel/mm/pmm.zig | 369 | 物理内存管理 (两级位图 + refcount + COW API，v53.39 修复双重释放锁) |
+| kernel/mm/slab.zig | 218 | Slab 分配器 (v53.39 _pad u16修复大分配页数截断) |
 | kernel/mm/swap.zig | ~267 | Swap 页面置换 (Clock算法 + u64位图@ctz分配) |
 | kernel/fs/eventfd.zig | 165 | eventfd 事件通知 |
 | kernel/fs/procfs.zig | ~380 | procfs 12种虚拟文件 (含 /proc/sched_stats) |
 | kernel/sync/ | ~600 | IrqSpinlock/TicketLock/Mutex/RwLock/SeqLock/MPMC |
 
-**总计: 133 个 .zig 文件, 40,390 行**
+**总计: 133 个 .zig 文件, 40,396 行**

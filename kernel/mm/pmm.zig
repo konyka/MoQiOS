@@ -303,8 +303,8 @@ pub fn freePage(addr: u64) void {
     const page = addr / PAGE_SIZE;
     if (page >= total_pages) return;
     if (ref_counts[page] == 0) {
-        // Release lock before serial output (serial has its own lock)
-        lock.release(flags);
+        // v53.39: Don't manually release lock — defer handles it (W fix: double-release)
+        // serial has its own lock; holding PMM lock briefly is acceptable
         serial.writeString("[PMM] BUG: double-free of page ");
         fmt.writeDecimal64(page);
         serial.writeString(" at addr 0x");

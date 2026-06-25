@@ -18,7 +18,7 @@ const NUM_CLASSES: usize = SIZE_CLASSES.len;
 /// Stores the pool index so kfree can find the right free list.
 const SlabHeader = extern struct {
     pool_idx: u8,
-    _pad: u8 = 0,
+    _pad: u16 = 0,
 };
 
 /// Marker for large (direct-page) allocations.
@@ -203,7 +203,7 @@ fn allocLarge(size: usize) ?*anyopaque {
     const header: *SlabHeader = @ptrCast(@alignCast(base));
     header.pool_idx = LARGE_ALLOC_MARKER;
     // Store page count in _pad field for freeing
-    header._pad = @intCast(@min(pages_needed, 255));
+    header._pad = @intCast(@min(pages_needed, 65535));
     return @ptrFromInt(@intFromPtr(base) + HEADER_ALIGNED);
 }
 

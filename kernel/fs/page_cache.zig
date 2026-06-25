@@ -36,8 +36,7 @@ pub const CachedPage = struct {
     valid: bool = false,
     hash_next: ?u16 = null, // Chain link in hash bucket
     inode_next: ?u16 = null, // Chain link in per-inode list
-    lru_next: ?u16 = null, // LRU list link
-    lru_prev: ?u16 = null,
+    lru_next: ?u16 = null, // Free list link (v53.39: LRU removed, Clock-only)
 };
 
 var pages: [MAX_PAGES]CachedPage = undefined;
@@ -96,10 +95,6 @@ fn inodeListRemove(slot: u16) void {
     }
 }
 
-// LRU list (doubly-linked, most-recent at head)
-var lru_head: ?u16 = null;
-var lru_tail: ?u16 = null;
-
 // Clock hand for replacement
 var clock_hand: u32 = 0;
 
@@ -122,7 +117,6 @@ pub fn init() void {
         pages[i].dirty = false;
         pages[i].hash_next = null;
         pages[i].inode_next = null;
-        pages[i].lru_prev = null;
         if (i + 1 < MAX_PAGES) {
             pages[i].lru_next = @intCast(i + 1);
         } else {
@@ -131,8 +125,6 @@ pub fn init() void {
     }
     free_head = 0;
     page_count = 0;
-    lru_head = null;
-    lru_tail = null;
     clock_hand = 0;
     dirty_bm = @splat(0);
     cache_hits = 0;
@@ -170,8 +162,6 @@ pub fn readPage(inode_id: u64, page_offset: u64) ?*[PAGE_SIZE]u8 {
             // Cache hit
             cache_hits += 1;
             pages[s].referenced = true;
-            // Move to LRU head
-            moveToHead(s);
             return pages[s].data;
         }
         slot = pages[s].hash_next;
@@ -202,7 +192,6 @@ pub fn writePage(inode_id: u64, page_offset: u64, src_data: *const [PAGE_SIZE]u8
             pages[s].dirty = true;
             pages[s].referenced = true;
             dirtySet(s);
-            moveToHead(s);
             return pages[s].data;
         }
         slot = pages[s].hash_next;
@@ -227,9 +216,6 @@ pub fn writePage(inode_id: u64, page_offset: u64, src_data: *const [PAGE_SIZE]u8
 
     // Insert into per-inode list
     inodeListInsert(new_slot);
-
-    // Insert into LRU list at head
-    moveToHead(new_slot);
 
     page_count += 1;
     return pages[new_slot].data;
@@ -256,7 +242,6 @@ pub fn updateIfCached(inode_id: u64, page_offset: u64, src_data: *const [PAGE_SI
             pages[s].dirty = true;
             pages[s].referenced = true;
             dirtySet(s);
-            moveToHead(s);
             return true;
         }
         slot = pages[s].hash_next;
@@ -290,7 +275,6 @@ pub fn insertPage(inode_id: u64, page_offset: u64, data: *const [PAGE_SIZE]u8, d
 
     inodeListInsert(new_slot);
 
-    moveToHead(new_slot);
     page_count += 1;
 
     return pages[new_slot].data;
@@ -378,9 +362,6 @@ fn allocSlot() ?u16 {
         pages[slot].phys = phys;
         pages[slot].data = @ptrFromInt(hhdm.physToVirt(phys));
         free_head = pages[slot].lru_next;
-        if (free_head) |fh| {
-            pages[fh].lru_prev = null;
-        }
         return slot;
     }
 
@@ -399,6 +380,9 @@ fn allocSlot() ?u16 {
             continue;
         }
 
+        // v53.39: Don't evict dirty pages — data would be lost (Critical fix)
+        if (dirtyTest(@intCast(i))) continue;
+
         // Evict this page (removePage frees the physical page and returns slot to free list)
         removePage(@intCast(i));
 
@@ -409,9 +393,6 @@ fn allocSlot() ?u16 {
             pages[slot].phys = phys;
             pages[slot].data = @ptrFromInt(hhdm.physToVirt(phys));
             free_head = pages[slot].lru_next;
-            if (free_head) |fh| {
-                pages[fh].lru_prev = null;
-            }
             return slot;
         }
     }
@@ -419,7 +400,7 @@ fn allocSlot() ?u16 {
     return null; // All pages are referenced
 }
 
-/// Remove a page from the cache (hash bucket + LRU list).
+/// Remove a page from the cache (hash bucket + free list).
 fn removePage(slot: u16) void {
     const s: usize = slot;
 
@@ -445,17 +426,7 @@ fn removePage(slot: u16) void {
     // Remove from per-inode list
     inodeListRemove(slot);
 
-    // Remove from LRU list
-    if (pages[s].lru_prev) |p| {
-        pages[p].lru_next = pages[s].lru_next;
-    } else {
-        lru_head = pages[s].lru_next;
-    }
-    if (pages[s].lru_next) |n| {
-        pages[n].lru_prev = pages[s].lru_prev;
-    } else {
-        lru_tail = pages[s].lru_prev;
-    }
+    // v53.39: LRU list removed — Clock algorithm is sole eviction policy
 
     // Free physical page
     if (pages[s].phys != 0) {
@@ -467,11 +438,8 @@ fn removePage(slot: u16) void {
     pages[s].dirty = false;
     dirtyClr(slot);
     pages[s].hash_next = null;
+    // v53.39: Add to free list (single-linked via lru_next)
     pages[s].lru_next = free_head;
-    pages[s].lru_prev = null;
-    if (free_head) |fh| {
-        pages[fh].lru_prev = slot;
-    }
     free_head = slot;
     page_count -= 1;
 }
@@ -494,6 +462,10 @@ var prefetch_trackers: [MAX_PREFETCH_TRACK]PrefetchTracker = @splat(.{});
 /// Returns the number of pages ahead to prefetch (0 if no prefetch needed).
 /// Detects sequential access: 2+ consecutive page offsets trigger prefetch.
 pub fn recordAccess(inode_id: u64, page_offset: u64) u32 {
+    // v53.39: Acquire cache_lock — prefetch_trackers is global (SMP race fix)
+    const flags = cache_lock.acquire();
+    defer cache_lock.release(flags);
+
     // Find or allocate tracker for this inode
     var tracker: ?*PrefetchTracker = null;
     for (&prefetch_trackers) |*t| {
@@ -540,6 +512,10 @@ pub fn recordAccess(inode_id: u64, page_offset: u64) u32 {
 
 /// Check if a page is already cached (without updating LRU/referenced).
 pub fn isCached(inode_id: u64, page_offset: u64) bool {
+    // v53.39: Acquire cache_lock — hash_buckets is global (SMP race fix)
+    const flags = cache_lock.acquire();
+    defer cache_lock.release(flags);
+
     const key = CacheKey{ .inode_id = inode_id, .page_offset = page_offset };
     const bucket = hashKey(key);
 
@@ -554,32 +530,4 @@ pub fn isCached(inode_id: u64, page_offset: u64) bool {
         slot = pages[s].hash_next;
     }
     return false;
-}
-
-/// Move a page to the head of the LRU list.
-fn moveToHead(slot: u16) void {
-    const s: usize = slot;
-
-    // Remove from current position
-    if (pages[s].lru_prev) |p| {
-        pages[p].lru_next = pages[s].lru_next;
-    } else {
-        lru_head = pages[s].lru_next;
-    }
-    if (pages[s].lru_next) |n| {
-        pages[n].lru_prev = pages[s].lru_prev;
-    } else {
-        lru_tail = pages[s].lru_prev;
-    }
-
-    // Insert at head
-    pages[s].lru_prev = null;
-    pages[s].lru_next = lru_head;
-    if (lru_head) |h| {
-        pages[h].lru_prev = slot;
-    }
-    lru_head = slot;
-    if (lru_tail == null) {
-        lru_tail = slot;
-    }
 }

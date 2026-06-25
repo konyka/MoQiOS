@@ -224,6 +224,13 @@ fn readBlockUncached(block_num: u32, buf: [*]u8) bool {
     return true;
 }
 
+/// v53.39: Direct DMA read for DMA-safe buffers (PMM/HHDM allocated).
+/// Skips io_buf_virt intermediate copy — caller must ensure buf is DMA-safe.
+fn readBlockDirect(block_num: u32, buf: [*]u8) bool {
+    const lba = @as(u64, block_num) * (block_size / SECTOR_SIZE);
+    return readSectorsToBuf(lba, block_size / SECTOR_SIZE, buf);
+}
+
 /// Read a block through the cache (all existing callers use this).
 fn readBlock(block_num: u32, buf: [*]u8) bool {
     return readBlockCached(block_num, buf);
@@ -888,7 +895,8 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
             const tmp_phys = pmm.allocPage() orelse break;
             const tmp: [*]u8 = @ptrFromInt(hhdm.physToVirt(tmp_phys));
             // v53.28: Use readBlockUncached to avoid polluting ext2 block cache with data blocks
-            if (!readBlockUncached(phys_block, tmp)) {
+            // v53.39: Use readBlockDirect — tmp is PMM/HHDM allocated (DMA-safe), skip io_buf copy
+            if (!readBlockDirect(phys_block, tmp)) {
                 pmm.freePage(tmp_phys);
                 break;
             }
@@ -932,7 +940,8 @@ fn prefetchPages(inode: *const Ext2Inode, inode_id: u64, start_page: u64, count:
         const tmp_phys = pmm.allocPage() orelse break;
         const tmp: [*]u8 = @ptrFromInt(hhdm.physToVirt(tmp_phys));
         // v53.28: Use readBlockUncached to avoid polluting ext2 block cache with data blocks
-        if (!readBlockUncached(phys_block, tmp)) {
+        // v53.39: Use readBlockDirect — tmp is PMM/HHDM allocated (DMA-safe), skip io_buf copy
+        if (!readBlockDirect(phys_block, tmp)) {
             pmm.freePage(tmp_phys);
             break;
         }
