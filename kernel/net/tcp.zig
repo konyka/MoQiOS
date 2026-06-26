@@ -768,6 +768,16 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
     _ = dst_ip;
     if (len < 20) return;
 
+    // v53.41: Collect epoll events — notify after releasing tcp_lock to avoid blocking all TCP connections
+    const epoll = @import("epoll.zig");
+    var pending_events: u32 = 0;
+    var pending_idx: u32 = 0;
+    defer {
+        if (pending_events != 0) {
+            epoll.epollNotify(.tcp_socket, pending_idx, pending_events);
+        }
+    }
+
     // v53.13: Acquire TCP lock for the entire packet processing
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
@@ -884,9 +894,9 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
 
                 tcpLog("[tcp] connection established\n");
 
-                // epoll: connection is now writable (EPOLLOUT).
-                const epoll_mod = @import("epoll.zig");
-                epoll_mod.epollNotify(.tcp_socket, tcbIdx(tcb), epoll_mod.EPOLLOUT);
+                // v53.41: Defer epoll notification outside tcp_lock
+                pending_events |= epoll.EPOLLOUT;
+                pending_idx = tcbIdx(tcb);
             } else if (flags & SYN != 0) {
                 // v53.5: Simultaneous open not supported — send RST and close
                 _ = sendSegment(tcb, RST, undefined, 0);
@@ -903,9 +913,9 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                 tcb.retransmit_timer = 0;
                 tcpLog("[tcp] server: connection established (ACK received)\n");
 
-                // epoll: server-side connection established.
-                const epoll_mod2 = @import("epoll.zig");
-                epoll_mod2.epollNotify(.tcp_socket, tcbIdx(tcb), epoll_mod2.EPOLLOUT);
+                // v53.41: Defer epoll notification outside tcp_lock
+                pending_events |= epoll.EPOLLOUT;
+                pending_idx = tcbIdx(tcb);
             }
         },
         .established => {
@@ -991,9 +1001,9 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                             tcb.dup_ack_count = 0;
                         }
 
-                        // epoll: send buffer space freed.
-                        const epoll_ack = @import("epoll.zig");
-                        epoll_ack.epollNotify(.tcp_socket, tcbIdx(tcb), epoll_ack.EPOLLOUT);
+                        // v53.41: Defer epoll notification outside tcp_lock
+                        pending_events |= epoll.EPOLLOUT;
+                        pending_idx = tcbIdx(tcb);
                     }
                 } else {
                     // Duplicate ACK (ack_num == snd_una)
@@ -1036,9 +1046,9 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
             // Process incoming data
             if (payload_len > 0) {
                 processIncomingData(tcb, data + payload_offset, payload_len, seq_num);
-                // epoll: data available to read.
-                const epoll_in = @import("epoll.zig");
-                epoll_in.epollNotify(.tcp_socket, tcbIdx(tcb), epoll_in.EPOLLIN);
+                // v53.41: Defer epoll notification outside tcp_lock
+                pending_events |= epoll.EPOLLIN;
+                pending_idx = tcbIdx(tcb);
             }
 
             // Handle FIN — v53.4: only accept FIN after all data is buffered
@@ -1054,9 +1064,9 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                     tcb.delayed_ack_pending = false; // ACK is immediate for FIN
                     _ = sendSegment(tcb, ACK, undefined, 0);
                     tcpLog("[tcp] remote closed (FIN received)\n");
-                    // epoll: peer closed.
-                    const epoll_fin = @import("epoll.zig");
-                    epoll_fin.epollNotify(.tcp_socket, tcbIdx(tcb), epoll_fin.EPOLLIN | epoll_fin.EPOLLHUP);
+                    // v53.41: Defer epoll notification outside tcp_lock
+                    pending_events |= epoll.EPOLLIN | epoll.EPOLLHUP;
+                    pending_idx = tcbIdx(tcb);
                 }
                 // else: FIN deferred — peer will retransmit after we ACK the partial data
             }
@@ -1088,8 +1098,8 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
         .fin_wait_2 => {
             if (payload_len > 0) {
                 processIncomingData(tcb, data + payload_offset, payload_len, seq_num);
-                const epoll_fw2 = @import("epoll.zig");
-                epoll_fw2.epollNotify(.tcp_socket, tcbIdx(tcb), epoll_fw2.EPOLLIN);
+                pending_events |= epoll.EPOLLIN;
+                pending_idx = tcbIdx(tcb);
             }
             if (flags & FIN != 0) {
                 tcb.rcv_nxt +%= 1;
@@ -1109,8 +1119,8 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
         .close_wait => {
             if (payload_len > 0) {
                 processIncomingData(tcb, data + payload_offset, payload_len, seq_num);
-                const epoll_cw = @import("epoll.zig");
-                epoll_cw.epollNotify(.tcp_socket, tcbIdx(tcb), epoll_cw.EPOLLIN);
+                pending_events |= epoll.EPOLLIN;
+                pending_idx = tcbIdx(tcb);
             }
         },
         .closing => {

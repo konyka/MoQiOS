@@ -880,13 +880,11 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
 
         // Try page cache first (with sequential prefetch)
         const page_idx = logical_block; // page_offset in pages
-        if (page_cache.readPage(inode_id, page_idx)) |cached| {
-            @memcpy(buf[read_total .. read_total + chunk], cached[block_offset .. block_offset + chunk]);
-            // Track access for prefetch hint (on cache hit too, to maintain pattern)
-            const pf_count = page_cache.recordAccess(inode_id, page_idx);
-            if (pf_count > 0) {
-                // Prefetch next pages (already cached? skip)
-                prefetchPages(&f.inode, inode_id, page_idx + 1, pf_count);
+        if (page_cache.readPageAndRecord(inode_id, page_idx)) |result| {
+            @memcpy(buf[read_total .. read_total + chunk], result.data[block_offset .. block_offset + chunk]);
+            // v53.41: Prefetch hint from combined read+record (single lock acquisition)
+            if (result.prefetch > 0) {
+                prefetchPages(&f.inode, inode_id, page_idx + 1, result.prefetch);
             }
         } else {
             // Cache miss — read from disk

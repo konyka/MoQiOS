@@ -383,18 +383,9 @@ fn allocSlot() ?u16 {
         // v53.39: Don't evict dirty pages — data would be lost (Critical fix)
         if (dirtyTest(@intCast(i))) continue;
 
-        // Evict this page (removePage frees the physical page and returns slot to free list)
-        removePage(@intCast(i));
-
-        // Now allocate from free list (should succeed since we just freed one)
-        if (free_head) |s| {
-            const slot = s;
-            const phys = pmm.allocPage() orelse return null;
-            pages[slot].phys = phys;
-            pages[slot].data = @ptrFromInt(hhdm.physToVirt(phys));
-            free_head = pages[slot].lru_next;
-            return slot;
-        }
+        // v53.41: Evict but keep physical page — avoids free+alloc pair (2 PMM lock ops)
+        removePageKeepPhys(@intCast(i));
+        return @intCast(i);
     }
 
     return null; // All pages are referenced
@@ -444,6 +435,41 @@ fn removePage(slot: u16) void {
     page_count -= 1;
 }
 
+/// Remove a page from the cache but keep its physical page allocated (v53.41).
+/// Used by allocSlot eviction path to avoid free+alloc pair.
+fn removePageKeepPhys(slot: u16) void {
+    const s: usize = slot;
+
+    if (!pages[s].valid) return;
+
+    // Remove from hash bucket
+    const bucket = hashKey(pages[s].key);
+    var prev: ?u16 = null;
+    var current = hash_buckets[bucket];
+    while (current) |c| {
+        if (c == slot) {
+            if (prev) |p| {
+                pages[p].hash_next = pages[s].hash_next;
+            } else {
+                hash_buckets[bucket] = pages[s].hash_next;
+            }
+            break;
+        }
+        prev = current;
+        current = pages[c].hash_next;
+    }
+
+    // Remove from per-inode list
+    inodeListRemove(slot);
+
+    // Keep physical page (pages[s].phys and pages[s].data unchanged)
+    pages[s].valid = false;
+    pages[s].dirty = false;
+    dirtyClr(slot);
+    pages[s].hash_next = null;
+    page_count -= 1;
+}
+
 /// Prefetch window: number of pages to prefetch on sequential access detection.
 /// v51.0: doubled from 4 to 8 for better large-file sequential read throughput.
 const PREFETCH_WINDOW: u32 = 8;
@@ -461,11 +487,8 @@ var prefetch_trackers: [MAX_PREFETCH_TRACK]PrefetchTracker = @splat(.{});
 /// Record a page access and return a prefetch hint.
 /// Returns the number of pages ahead to prefetch (0 if no prefetch needed).
 /// Detects sequential access: 2+ consecutive page offsets trigger prefetch.
-pub fn recordAccess(inode_id: u64, page_offset: u64) u32 {
-    // v53.39: Acquire cache_lock — prefetch_trackers is global (SMP race fix)
-    const flags = cache_lock.acquire();
-    defer cache_lock.release(flags);
-
+/// Record a page access and return a prefetch hint (internal — caller must hold cache_lock).
+fn recordAccessLocked(inode_id: u64, page_offset: u64) u32 {
     // Find or allocate tracker for this inode
     var tracker: ?*PrefetchTracker = null;
     for (&prefetch_trackers) |*t| {
@@ -508,6 +531,44 @@ pub fn recordAccess(inode_id: u64, page_offset: u64) u32 {
         t.sequential_count = 0;
     }
     return 0;
+}
+
+/// Record a page access and return a prefetch hint.
+/// Returns the number of pages ahead to prefetch (0 if no prefetch needed).
+/// Detects sequential access: 2+ consecutive page offsets trigger prefetch.
+pub fn recordAccess(inode_id: u64, page_offset: u64) u32 {
+    // v53.39: Acquire cache_lock — prefetch_trackers is global (SMP race fix)
+    const flags = cache_lock.acquire();
+    defer cache_lock.release(flags);
+    return recordAccessLocked(inode_id, page_offset);
+}
+
+/// Read a page from cache and record access in a single lock acquisition (v53.41).
+/// Returns the cached data pointer and prefetch hint, or null if not cached.
+pub fn readPageAndRecord(inode_id: u64, page_offset: u64) ?struct { data: *[PAGE_SIZE]u8, prefetch: u32 } {
+    const flags = cache_lock.acquire();
+    defer cache_lock.release(flags);
+
+    const key = CacheKey{ .inode_id = inode_id, .page_offset = page_offset };
+    const bucket = hashKey(key);
+
+    var slot = hash_buckets[bucket];
+    while (slot) |s| {
+        if (pages[s].valid and
+            pages[s].key.inode_id == inode_id and
+            pages[s].key.page_offset == page_offset)
+        {
+            // Cache hit
+            cache_hits += 1;
+            pages[s].referenced = true;
+            const pf_count = recordAccessLocked(inode_id, page_offset);
+            return .{ .data = pages[s].data, .prefetch = pf_count };
+        }
+        slot = pages[s].hash_next;
+    }
+
+    cache_misses += 1;
+    return null;
 }
 
 /// Check if a page is already cached (without updating LRU/referenced).

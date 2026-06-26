@@ -1,14 +1,18 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.49.0（v53.40 NDP加锁 + writeFile簇链缓存 + allocInode零拷贝 + 部分簇批量化I/O）
+> **版本**: v0.50.0（v53.41 TCP epollNotify锁外延迟 + page_cache readPageAndRecord + allocSlot物理页复用）
 > **日期**: 2026-05-29
-> **代码统计**: 内核 40,480 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
+> **代码统计**: 内核 40,549 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
 >   `kernel/net/icmpv6.zig`、`kernel/net/ndp.zig`、`kernel/proc/cap_check.zig`、
 >   `kernel/arch/arch.zig`、`kernel/arch/x86_64/arch_impl.zig`、`kernel/arch/riscv64/arch_impl.zig`），
 >   用户空间 2,244 行 C/ASM
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
+>
+> **2026-05-29 更新 (v53.41)**：TCP handlePacket epollNotify延迟到tcp_lock释放后 (7处通知从锁内移到锁外，避免阻塞所有TCP连接)、
+> page_cache readPageAndRecord组合函数 (readPage+recordAccess合并为单次锁获取，消除缓存命中路径双重锁)、
+> page_cache allocSlot物理页复用 (驱逐时不释放物理页，消除free+alloc对2次PMM锁操作)。
 >
 > **2026-05-29 更新 (v53.40)**：NDP邻居缓存IrqSpinlock加锁 (lookup/update/markIncomplete防中断vs系统调用竞态)、
 > fat32 writeFile簇链遍历O(n²)→O(n) (复用last_walk_cluster缓存)、ext2 allocInode零拷贝缓存路径
@@ -1044,7 +1048,7 @@ LAPIC Timer 中断
   │
   ├─ syscall: socket/bind/listen/accept/connect/sendto/recvfrom/sendmsg/recvmsg/shutdown
   │
-  ├─ TCP 层 (tcp.zig, 1630 行)
+  ├─ TCP 层 (tcp.zig, 1879 行)
   │   ├─ Reno 拥塞控制 (慢启动/拥塞避免/快速重传/快速恢复)
   │   ├─ SACK 选择性确认 (RFC 2018)
   │   ├─ Window Scaling (RFC 7323, shift=7, 最大窗口4MB)
@@ -1300,16 +1304,16 @@ kernel/main.zig
 | 文件 | 行数 | 功能 |
 |---|---|---|
 | kernel/arch/x86_64/syscall_entry.zig | 4,886 | 系统调用入口 + 383 dispatch 条目 |
-| kernel/net/tcp.zig | 1,869 | TCP 协议 (Reno/SACK/WS/TS/CORK/QUICKACK + @memcpy环形缓冲区) |
+| kernel/net/tcp.zig | 1,879 | TCP 协议 (Reno/SACK/WS/TS/CORK/QUICKACK + @memcpy环形缓冲区 + v53.41 epollNotify锁外延迟) |
 | kernel/fs/vfs.zig | ~720 | 虚拟文件系统 + MAX_FDS=64 + procfs 路由 + inotify + allocFd |
 | kernel/arch/x86_64/idt.zig | 786 | 中断描述符表 + IRQ 分发 + COW #PF 处理 |
 | kernel/drivers/virtio_net.zig | 548 | virtio-net 网卡驱动 |
 | kernel/drivers/e1000.zig | 453 | e1000 网卡驱动 (中断驱动) |
 | kernel/net/epoll.zig | 547 | epoll 事件多路复用 (LT/ET/ONESHOT + 位图优化) |
-| kernel/fs/page_cache.zig | 533 | 统一页缓存 (1024页/512哈希槽/Clock替换+脏页保护+命中统计/8页预取/invalidateInode批量失效，v53.39 LRU移除) |
+| kernel/fs/page_cache.zig | 594 | 统一页缓存 (1024页/512哈希槽/Clock替换+脏页保护+命中统计/8页预取/invalidateInode批量失效，v53.39 LRU移除，v53.41 readPageAndRecord+allocSlot物理页复用) |
 | kernel/main.zig | 329 | 内核主函数 |
 | kernel/arch/x86_64/paging.zig | 293 | 页表管理 + getPagePhysAddr |
-| kernel/fs/ext2.zig | 3,314 | ext2 文件系统 (DMA安全I/O+readBlockDirect+allocInode零拷贝+hardlink/symlink/unlink/chown/chmod/xattr/walkPathResolve/writeFile零拷贝+invalidateInode) |
+| kernel/fs/ext2.zig | 3,312 | ext2 文件系统 (DMA安全I/O+readBlockDirect+allocInode零拷贝+readPageAndRecord+hardlink/symlink/unlink/chown/chmod/xattr/walkPathResolve/writeFile零拷贝+invalidateInode) |
 | kernel/fs/fat32.zig | 859 | FAT32 文件系统 (FAT缓存+DMA安全+多扇区写+allocCluster游标+readFile/writeFile簇链缓存+部分簇批量化I/O) |
 | kernel/proc/scheduler.zig | ~500 | O(1) 位图调度器 |
 | kernel/proc/task.zig | ~704 | Task 结构体 + 进程管理 |
@@ -1322,4 +1326,4 @@ kernel/main.zig
 | kernel/fs/procfs.zig | ~380 | procfs 12种虚拟文件 (含 /proc/sched_stats) |
 | kernel/sync/ | ~600 | IrqSpinlock/TicketLock/Mutex/RwLock/SeqLock/MPMC |
 
-**总计: 133 个 .zig 文件, 40,480 行**
+**总计: 133 个 .zig 文件, 40,549 行**
