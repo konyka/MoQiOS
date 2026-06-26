@@ -688,7 +688,27 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
     var bytes_written: u32 = 0;
     var cluster: u32 = fi.first_cluster;
     var file_offset: u32 = 0;
+    var ci: u32 = 0;
     const wbuf: [*]u8 = @ptrFromInt(write_buf_virt);
+
+    // v53.40: Resume from cached walk position — O(n) vs O(n²) for sequential writes
+    const start_cluster_idx = offset / cluster_size;
+    if (fi.last_walk_cluster >= 2 and fi.last_walk_cluster < 0x0FFFFFF8 and fi.last_walk_idx <= start_cluster_idx) {
+        cluster = fi.last_walk_cluster;
+        ci = fi.last_walk_idx;
+        file_offset = ci * cluster_size;
+    }
+    // Fast-forward to the first overlapping cluster
+    while (ci < start_cluster_idx and cluster >= 2 and cluster < 0x0FFFFFF8) {
+        cluster = getFATEntry(cluster);
+        ci += 1;
+        file_offset += cluster_size;
+    }
+    // Update walk cache
+    if (cluster >= 2 and cluster < 0x0FFFFFF8) {
+        files[file_idx].last_walk_cluster = cluster;
+        files[file_idx].last_walk_idx = ci;
+    }
 
     while (bytes_written < count) {
         if (cluster < 2 or cluster >= 0x0FFFFFF8) break;
@@ -707,8 +727,15 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
                 @memcpy(wbuf[0..cluster_size], buf[bytes_written .. bytes_written + cluster_size]);
                 _ = safeWriteSectors(cluster_start_lba, fat32_sectors_per_cluster, wbuf);
                 bytes_written += cluster_size;
+            } else if (fat32_sectors_per_cluster <= 8) {
+                // v53.40: Batch partial cluster write — read entire cluster, modify overlap, write back
+                // Reduces N sector I/Os to 2 cluster I/Os (read + write)
+                _ = virtio_blk.readSectors(cluster_start_lba, fat32_sectors_per_cluster, wbuf);
+                @memcpy(wbuf[overlap_start..overlap_end], buf[bytes_written .. bytes_written + (overlap_end - overlap_start)]);
+                _ = safeWriteSectors(cluster_start_lba, fat32_sectors_per_cluster, wbuf);
+                bytes_written += overlap_end - overlap_start;
             } else {
-                // Partial cluster write — per-sector read-modify-write
+                // Partial cluster write — per-sector read-modify-write (spc > 8)
                 var sec: u32 = 0;
                 while (sec < fat32_sectors_per_cluster) : (sec += 1) {
                     const sec_start = sec * SECTOR_SIZE;
@@ -740,6 +767,12 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
 
         file_offset = cluster_end_offset;
         cluster = getFATEntry(cluster);
+        ci += 1;
+        // v53.40: Update walk cache
+        if (cluster >= 2 and cluster < 0x0FFFFFF8) {
+            files[file_idx].last_walk_cluster = cluster;
+            files[file_idx].last_walk_idx = ci;
+        }
     }
 
     if (offset + count > fi.size) {

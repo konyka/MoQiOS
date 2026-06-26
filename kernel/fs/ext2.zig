@@ -1937,6 +1937,44 @@ fn allocInode(group: u32) u32 {
     if (gd.bg_free_inodes_count == 0) return 0;
 
     const bitmap_block = gd.bg_inode_bitmap;
+
+    // v53.40: Zero-copy path — if bitmap block is cached, scan/modify directly
+    if (cacheLookup(bitmap_block)) |idx| {
+        const total_inodes_in_group = if (group < groups_count - 1) inodes_per_group else sb.inodes_count - group * inodes_per_group;
+        const words: [*]u64 = @ptrCast(@alignCast(&cache[idx].data));
+        const total_bytes = (total_inodes_in_group + 7) / 8;
+        const total_words = (total_bytes + 7) / 8;
+        var w: u32 = 0;
+        while (w < total_words) : (w += 1) {
+            const inv = ~words[w];
+            if (inv == 0) continue;
+            const bit = @ctz(inv);
+            const i = w * 64 + @as(u32, bit);
+            if (i >= total_inodes_in_group) break;
+            const byte_idx = i / 8;
+            const bit_idx: u3 = @intCast(i % 8);
+            cache[idx].data[byte_idx] |= @as(u8, 1) << bit_idx;
+            if (batch_free_depth > 0) {
+                cache[idx].dirty = true;
+            } else {
+                if (!writeBlockUncached(bitmap_block, &cache[idx].data)) {
+                    cache[idx].data[byte_idx] &= ~(@as(u8, 1) << bit_idx);
+                    return 0;
+                }
+                cache[idx].dirty = false;
+            }
+            gd.bg_free_inodes_count -= 1;
+            sb.free_inodes_count -= 1;
+            if (batch_free_depth == 0) {
+                writeGroupDescs();
+                writeSuperblock();
+            }
+            return group * inodes_per_group + i + 1;
+        }
+        return 0;
+    }
+
+    // Not cached — fall back to alloc-page-read-modify-write
     const buf_phys = pmm.allocPage() orelse return 0;
     defer pmm.freePage(buf_phys);
     const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));

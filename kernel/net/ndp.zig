@@ -6,6 +6,7 @@
 //   - Lookup/update helpers used by upper layers and ICMPv6.
 
 const ipv6 = @import("ipv6.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 pub const MAX_NEIGHBORS: u32 = 64;
 
@@ -26,6 +27,9 @@ pub const NeighborEntry = struct {
 
 var neighbor_cache: [MAX_NEIGHBORS]NeighborEntry = @splat(.{});
 
+// v53.40: Protect neighbor_cache against interrupt vs syscall races
+var ndp_lock: IrqSpinlock = .{};
+
 /// Reset/clear the neighbor cache. Called from net.init().
 pub fn init() void {
     for (0..MAX_NEIGHBORS) |i| {
@@ -36,6 +40,9 @@ pub fn init() void {
 /// Lookup the cached MAC for a given IPv6 unicast address.
 /// Returns null when no valid (reachable/stale/etc.) entry exists.
 pub fn lookup(ipv6_addr: [16]u8) ?[6]u8 {
+    // v53.40: Acquire lock — neighbor_cache accessed from interrupt + syscall contexts
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
     for (0..MAX_NEIGHBORS) |i| {
         const e = &neighbor_cache[i];
         if (!e.valid) continue;
@@ -48,6 +55,9 @@ pub fn lookup(ipv6_addr: [16]u8) ?[6]u8 {
 /// Insert or refresh an entry, marking it as `reachable`.
 /// Mirrors the simple "always overwrite" cache strategy used by ARP.
 pub fn update(ipv6_addr: [16]u8, mac_addr: [6]u8) void {
+    // v53.40: Acquire lock — neighbor_cache accessed from interrupt + syscall contexts
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
     // Refresh existing.
     for (0..MAX_NEIGHBORS) |i| {
         const e = &neighbor_cache[i];
@@ -82,6 +92,9 @@ pub fn update(ipv6_addr: [16]u8, mac_addr: [6]u8) void {
 /// Mark an entry as `incomplete` placeholder while NS is in flight.
 /// Returns true on success.
 pub fn markIncomplete(ipv6_addr: [16]u8) void {
+    // v53.40: Acquire lock — neighbor_cache accessed from interrupt + syscall contexts
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
     for (0..MAX_NEIGHBORS) |i| {
         const e = &neighbor_cache[i];
         if (e.valid and ipv6.addrEq(e.ipv6_addr, ipv6_addr)) return;
