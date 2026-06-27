@@ -610,6 +610,7 @@ fn parseTcpOptions(data: [*]const u8, data_offset: u16) TcpOptions {
             5 => { // SACK blocks (kind=5, len=2+8*N)
                 if (pos + 1 < data_offset) {
                     const sack_len = data[pos + 1];
+                    if (sack_len < 2) break; // v53.46: Prevent infinite loop on malformed SACK
                     if (sack_len >= 10) { // at least 1 block
                         const num_blocks: u3 = @intCast(@min((sack_len - 2) / 8, 4));
                         var b: u3 = 0;
@@ -1257,8 +1258,7 @@ pub fn tcpConnectSocket(tcb_idx: u32, remote_ip: [4]u8, remote_port: u16) i64 {
 ///  1 = established
 /// -1 = error / closed
 pub fn tcpPoll(tcb_idx: u32) i64 {
-    const lock_flags = tcp_lock.acquire();
-    defer tcp_lock.release(lock_flags);
+    // v53.46: Lock-free read — status query, stale values acceptable on x86_64.
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return -1;
@@ -1423,8 +1423,7 @@ pub fn tcpClose(tcb_idx: u32) i64 {
 
 /// Get TCP connection state as integer.
 pub fn tcpState(tcb_idx: u32) u8 {
-    const lock_flags = tcp_lock.acquire();
-    defer tcp_lock.release(lock_flags);
+    // v53.46: Lock-free read — status query.
     if (tcb_idx >= MAX_CONNECTIONS) return 0;
     if (!tcbs[tcb_idx].active) return 0;
     return @intFromEnum(tcbs[tcb_idx].state);
@@ -1432,16 +1431,14 @@ pub fn tcpState(tcb_idx: u32) u8 {
 
 /// Check if connection is established.
 pub fn isEstablished(tcb_idx: u32) bool {
-    const lock_flags = tcp_lock.acquire();
-    defer tcp_lock.release(lock_flags);
+    // v53.46: Lock-free read — status query.
     if (tcb_idx >= MAX_CONNECTIONS) return false;
     return tcbs[tcb_idx].active and tcbs[tcb_idx].state == .established;
 }
 
 /// Check if connection is fully closed.
 pub fn isClosed(tcb_idx: u32) bool {
-    const lock_flags = tcp_lock.acquire();
-    defer tcp_lock.release(lock_flags);
+    // v53.46: Lock-free read — status query.
     if (tcb_idx >= MAX_CONNECTIONS) return true;
     return !tcbs[tcb_idx].active or tcbs[tcb_idx].state == .closed;
 }
@@ -1733,8 +1730,7 @@ pub fn getTcbIdx(tcb_idx: u32) ?u32 {
 
 /// Return the number of bytes available to read in the receive buffer.
 pub fn tcpRecvAvailable(tcb_idx: u32) u32 {
-    const lock_flags = tcp_lock.acquire();
-    defer tcp_lock.release(lock_flags);
+    // v53.46: Lock-free read — may return slightly stale count, acceptable for epoll/poll.
     if (tcb_idx >= MAX_CONNECTIONS) return 0;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return 0;
@@ -1743,8 +1739,7 @@ pub fn tcpRecvAvailable(tcb_idx: u32) u32 {
 
 /// Return the number of bytes of free space in the send buffer.
 pub fn tcpSendSpace(tcb_idx: u32) u32 {
-    const lock_flags = tcp_lock.acquire();
-    defer tcp_lock.release(lock_flags);
+    // v53.46: Lock-free read — may return slightly stale count, acceptable for epoll/poll.
     if (tcb_idx >= MAX_CONNECTIONS) return 0;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return 0;
@@ -1753,8 +1748,7 @@ pub fn tcpSendSpace(tcb_idx: u32) u32 {
 
 /// Check if the TCP connection is in a closing state.
 pub fn tcpIsClosing(tcb_idx: u32) bool {
-    const lock_flags = tcp_lock.acquire();
-    defer tcp_lock.release(lock_flags);
+    // v53.46: Lock-free read — status query.
     if (tcb_idx >= MAX_CONNECTIONS) return true;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return true;

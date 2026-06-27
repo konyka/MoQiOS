@@ -4923,8 +4923,10 @@ fn syscallAlarm(seconds: u32) i64 {
 
     if (seconds == 0) {
         cur.alarm_deadline = 0; // Cancel alarm
+        sched.alarm_bm &= ~(@as(u64, 1) << @intCast(cur_idx));
     } else {
         cur.alarm_deadline = now_ns + @as(u64, seconds) * 1_000_000_000;
+        sched.alarm_bm |= @as(u64, 1) << @intCast(cur_idx);
         // SIGALRM will be delivered by BSP timer tick when deadline expires
     }
 
@@ -5008,8 +5010,10 @@ fn syscallSetitimer(which: u32, new_value_ptr: u64, old_value_ptr: u64) i64 {
 
         if (val_ns == 0) {
             cur.itimer_real_value = 0; // Disarm
+            sched.itimer_bm &= ~(@as(u64, 1) << @intCast(cur_idx));
         } else {
             cur.itimer_real_value = tsc.nanos() + val_ns;
+            sched.itimer_bm |= @as(u64, 1) << @intCast(cur_idx);
         }
     }
     // ITIMER_VIRTUAL/PROF: accept but don't track

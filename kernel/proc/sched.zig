@@ -53,6 +53,11 @@ var reap_counter: u64 = 0;
 const REAP_INTERVAL: u64 = TIMESLICE_TICKS;
 var sched_lock: IrqSpinlock = .{};
 
+// v53.46: Active timer bitmaps — timerTick only scans tasks with active timers
+// instead of all 64 task slots. Set by alarm/setitimer syscalls, cleared on fire/cancel.
+pub var alarm_bm: u64 = 0;
+pub var itimer_bm: u64 = 0;
+
 // M8-2: the running task index and remaining timeslice are now PER-CPU state,
 // stored in syscall_entry.PerCpu (current_task_idx / slice_remaining) and reached
 // via GS_BASE. In uniprocessor mode GS_BASE always points at percpu_array[0], so
@@ -147,21 +152,24 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         const tcp = @import("../net/tcp.zig");
         tcp.timerTick(100);
         // Drive alarm() / setitimer(ITIMER_REAL) expiration checks
+        // v53.46: Bitmap scan — only check tasks with active timers (O(active) vs O(64)).
         {
             const tsc = @import("../arch/x86_64/tsc.zig");
             const now_ns = tsc.nanos();
-            for (0..task.MAX_TASKS) |i| {
+            var bm = alarm_bm | itimer_bm;
+            while (bm != 0) {
+                const i: u6 = @truncate(@ctz(bm));
+                bm &= bm - 1;
                 const t = task.getTask(@intCast(i)) orelse continue;
                 if (t.state == .zombie) continue;
                 // Check alarm() deadline
                 if (t.alarm_deadline != 0 and now_ns >= t.alarm_deadline) {
                     t.alarm_deadline = 0; // One-shot: clear after firing
-                    // v53.44: Set SIGALRM bit directly — avoids sendSignal's O(n) task scan
+                    alarm_bm &= ~(@as(u64, 1) << i);
                     _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
                 }
                 // Check ITIMER_REAL deadline
                 if (t.itimer_real_value != 0 and now_ns >= t.itimer_real_value) {
-                    // v53.44: Set SIGALRM bit directly — avoids sendSignal's O(n) task scan
                     _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
                     if (t.itimer_real_interval != 0) {
                         // Recurring: reschedule next expiration
@@ -169,6 +177,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
                     } else {
                         // One-shot: clear after firing
                         t.itimer_real_value = 0;
+                        itimer_bm &= ~(@as(u64, 1) << i);
                     }
                 }
             }

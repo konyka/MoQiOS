@@ -1,14 +1,16 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.51.0（v53.45 正确性修复+性能优化 — read()数据丢失+信号活锁+taskIndexOf O(1)+pmm锁I/O）
+> **版本**: v0.51.0（v53.46 TCP锁优化+alarm位图+SACK安全修复）
 > **日期**: 2026-05-29
-> **代码统计**: 内核 40,815 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
+> **代码统计**: 内核 40,822 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
 >   `kernel/net/icmpv6.zig`、`kernel/net/ndp.zig`、`kernel/proc/cap_check.zig`、
 >   `kernel/arch/arch.zig`、`kernel/arch/x86_64/arch_impl.zig`、`kernel/arch/riscv64/arch_impl.zig`），
 >   用户空间 2,244 行 C/ASM
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
+>
+> **2026-05-29 更新 (v53.46)**：TCP锁优化+SACK安全+alarm位图 — TCP 7个只读状态查询函数移除tcp_lock (tcpPoll/tcpState/isEstablished/isClosed/tcpRecvAvailable/tcpSendSpace/tcpIsClosing无锁读取，x86_64对齐读天然原子，epoll collectEvents路径消除4N次tcp_lock获取)、SACK解析死循环修复 (sack_len<2时break，防畸形包DoS)、alarm/itimer位图优化 (新增alarm_bm/itimer_bm位图，timerTick从O(64)全量扫描改为O(active)位图扫描)。
 >
 > **2026-05-29 更新 (v53.45)**：正确性修复+性能优化 — file_io read() 1字节未copyToUser到用户空间修复 (数据丢失bug)、signal dequeueSignal @ctz越界防护 (bit 31掩码0x7FFFFFFF防signal_handlers[31]越界)、信号投递活锁修复 (pushSignalFrame失败时不再re-queue，避免用户栈永久不可用时无限重试)、taskIndexOf O(1)优化 (Task新增self_idx字段，pickNext热路径从O(64)线性扫描改为O(1)直接返回)、pmm freePage持锁serial I/O修复 (double-free告警释放锁后再打印，避免~4ms阻塞所有CPU页面分配)。
 >
@@ -1309,8 +1311,8 @@ kernel/main.zig
 
 | 文件 | 行数 | 功能 |
 |---|---|---|
-| kernel/arch/x86_64/syscall_entry.zig | 5,049 | 系统调用入口 + 383 dispatch 条目 (v53.44 futex参数映射修正+pushSignalFrame调用方检查，v53.45 信号投递活锁修复) |
-| kernel/net/tcp.zig | 1,879 | TCP 协议 (Reno/SACK/WS/TS/CORK/QUICKACK + @memcpy环形缓冲区 + v53.41 epollNotify锁外延迟) |
+| kernel/arch/x86_64/syscall_entry.zig | 5,053 | 系统调用入口 + 383 dispatch 条目 (v53.44 futex参数修正+pushSignalFrame检查，v53.45 信号活锁修复，v53.46 alarm/itimer位图) |
+| kernel/net/tcp.zig | 1,873 | TCP 协议 (Reno/SACK/WS/TS/CORK/QUICKACK + @memcpy环形缓冲区 + v53.41 epollNotify锁外延迟，v53.46 只读查询无锁化+SACK防DoS) |
 | kernel/fs/vfs.zig | ~720 | 虚拟文件系统 + MAX_FDS=64 + procfs 路由 + inotify + allocFd |
 | kernel/arch/x86_64/idt.zig | 786 | 中断描述符表 + IRQ 分发 + COW #PF 处理 |
 | kernel/drivers/virtio_net.zig | 548 | virtio-net 网卡驱动 |
