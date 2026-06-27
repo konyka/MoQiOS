@@ -146,6 +146,64 @@ pub fn getPerCpuOrNull() ?*PerCpu {
     return @ptrFromInt(gs_base);
 }
 
+// v53.48: Comptime assertions — verify PerCpu field offsets for %gs: direct access.
+// If a field is added/removed/reordered, these will fail at compile time.
+comptime {
+    if (@offsetOf(PerCpu, "current_task_idx") != 44)
+        @compileError("PerCpu.current_task_idx offset changed — update %gs: offset");
+    if (@offsetOf(PerCpu, "cpu_id") != 32)
+        @compileError("PerCpu.cpu_id offset changed — update %gs: offset");
+    if (@offsetOf(PerCpu, "slice_remaining") != 24)
+        @compileError("PerCpu.slice_remaining offset changed — update %gs: offset");
+}
+
+// v53.48: Fast per-CPU field access via %gs:offset — eliminates rdmsr
+// serialization instruction (~150 cycles) on every syscall/scheduler hot path.
+// Safe after GS_BASE is set during sched.init() (before any task runs).
+
+/// Read current_task_idx directly via %gs:44 — no rdmsr needed.
+pub inline fn gsReadCurrentTaskIdx() u32 {
+    var v: u32 = undefined;
+    asm volatile ("movl %%gs:44, %[v]"
+        : [v] "=r" (v),
+    );
+    return v;
+}
+
+/// Write current_task_idx directly via %gs:44.
+pub inline fn gsWriteCurrentTaskIdx(v: u32) void {
+    asm volatile ("movl %[v], %%gs:44"
+        :
+        : [v] "r" (v),
+    );
+}
+
+/// Read cpu_id directly via %gs:32.
+pub inline fn gsReadCpuId() u32 {
+    var v: u32 = undefined;
+    asm volatile ("movl %%gs:32, %[v]"
+        : [v] "=r" (v),
+    );
+    return v;
+}
+
+/// Read slice_remaining directly via %gs:24.
+pub inline fn gsReadSliceRemaining() u64 {
+    var v: u64 = undefined;
+    asm volatile ("movq %%gs:24, %[v]"
+        : [v] "=r" (v),
+    );
+    return v;
+}
+
+/// Write slice_remaining directly via %gs:24.
+pub inline fn gsWriteSliceRemaining(v: u64) void {
+    asm volatile ("movq %[v], %%gs:24"
+        :
+        : [v] "r" (v),
+    );
+}
+
 /// Compile-time offset of saved_stack_anchor in PerCpu (used by commonStub asm).
 pub const PERCPU_ANCHOR_OFFSET = @offsetOf(PerCpu, "saved_stack_anchor");
 pub const PERCPU_EXEC_PENDING_OFFSET = @offsetOf(PerCpu, "exec_pending");

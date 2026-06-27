@@ -106,11 +106,23 @@ pub fn destroyUserSpace(pml4_phys: u64) void {
                 const pt_virt = hhdm.physToVirt(pt_phys);
                 const pt: [*]u64 = @ptrFromInt(pt_virt);
 
+                // v53.48: Batch free user pages — collect phys addresses and
+                // flush every 128 to reduce pmm.lock acquisitions from O(N) to O(N/128).
+                var free_buf: [128]u64 = undefined;
+                var free_count: u32 = 0;
                 for (0..512) |pt_idx| {
                     if (pt[pt_idx] & paging.PRESENT == 0) continue;
                     const page_phys = pt[pt_idx] & paging.ADDR_MASK;
-                    if (page_phys != 0 and page_phys >= 512 * 4096) pmm.freePage(page_phys);
+                    if (page_phys != 0 and page_phys >= 512 * 4096) {
+                        free_buf[free_count] = page_phys;
+                        free_count += 1;
+                        if (free_count == 128) {
+                            pmm.freePageBatch(free_buf[0..free_count]);
+                            free_count = 0;
+                        }
+                    }
                 }
+                if (free_count > 0) pmm.freePageBatch(free_buf[0..free_count]);
                 pmm.freePage(pt_phys);
             }
             pmm.freePage(pd_phys);

@@ -1,14 +1,16 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.51.0（v53.47 dup2 UAF修复+alarm位图原子化+dup syscall修复+fork COW批量优化）
+> **版本**: v0.51.0（v53.48 exitTask fd泄漏修复+getPerCpu %gs优化+destroyUserSpace批量释放）
 > **日期**: 2026-05-29
-> **代码统计**: 内核 40,888 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
+> **代码统计**: 内核 40,989 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
 >   `kernel/net/icmpv6.zig`、`kernel/net/ndp.zig`、`kernel/proc/cap_check.zig`、
 >   `kernel/arch/arch.zig`、`kernel/arch/x86_64/arch_impl.zig`、`kernel/arch/riscv64/arch_impl.zig`），
 >   用户空间 2,244 行 C/ASM
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
+>
+> **2026-05-29 更新 (v53.48)**：exitTask fd泄漏修复+getPerCpu %gs优化+destroyUserSpace批量释放 — exitTask新增fd批量关闭循环防止进程退出时TCP/pipe/ext2/epoll资源永久泄漏 (fd 3..MAX_FDS逐个close，hasSharedRef正确处理dup2共享)、getPerCpu rdmsr序列化指令消除 (5个热路径函数getCurrentIdx/setCurrentIdx/getSlice/setSlice/currentCpuId从rdmsr(~150 cycles)改为%gs:offset直接访问(~5 cycles)，30×加速，comptime断言验证PerCpu偏移量)、pmm.freePageBatch批量释放 (单次锁批量释放多个物理页，双重释放静默跳过)、destroyUserSpace批量freePage优化 (128项栈缓冲区分批释放用户页，O(N)锁操作降为O(N/128))。
 >
 > **2026-05-29 更新 (v53.47)**：dup2 UAF修复+alarm位图原子化+dup syscall修复+fork COW批量优化 — vfs close()新增hasSharedRef扫描防止dup2后close导致use-after-free (ext2/fat32/tcp/epoll/unix_socket/timerfd/tmpfs_file/eventfd/ramdisk_file全类型覆盖，pipe保持独立ref_count机制)、alarm_bm/itimer_bm原子化修复v53.46引入的非原子RMW竞态 (@atomicLoad(.acquire)读取+@atomicRmw(.And/.Or,.seq_cst)修改，防止BSP timerTick与syscall上下文丢失位)、dup syscall #160修复 (从dup2(fd,fd)空操作改为syscallDup正确分配新fd)、fork COW批量addRef优化 (新增pmm.addRefBatch单次锁批量递增引用计数，fork从O(N)锁操作降为O(N/128)，4MB进程从~1024次降至~8次)。
 >

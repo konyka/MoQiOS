@@ -343,6 +343,25 @@ pub fn addRefBatch(addrs: []const u64) void {
     }
 }
 
+/// v53.48: Batch free physical pages — single lock acquisition for multiple
+/// pages. Used by destroyUserSpace to avoid N separate lock ops on process exit.
+/// Double-frees are silently skipped (cannot do serial I/O mid-batch).
+pub fn freePageBatch(addrs: []const u64) void {
+    const flags = lock.acquire();
+    defer lock.release(flags);
+    for (addrs) |addr| {
+        const page = addr / PAGE_SIZE;
+        if (page >= total_pages) continue;
+        if (ref_counts[page] == 0) continue; // Skip double-free silently
+        ref_counts[page] -= 1;
+        if (ref_counts[page] == 0) {
+            setBit(page);
+            free_pages += 1;
+            if (page < next_free_hint) next_free_hint = page;
+        }
+    }
+}
+
 /// Decrement reference count, return new count.
 pub fn decRef(addr: u64) u16 {
     const flags = lock.acquire();

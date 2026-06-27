@@ -503,6 +503,19 @@ pub fn exitTask(exit_code: i32) void {
     const idx = sched.currentTaskIndex() orelse return;
     const t = getTask(idx) orelse return;
 
+    // v53.48: Close all open file descriptors before becoming a zombie.
+    // Without this, TCP connections, pipes, ext2/fat32 files, and epoll
+    // instances permanently leak their underlying resources.
+    {
+        const vfs = @import("../fs/vfs.zig");
+        var fd: u32 = 3;
+        while (fd < vfs.MAX_FDS) : (fd += 1) {
+            if (t.fd_table.fds[fd].fd_type != .none) {
+                _ = t.fd_table.close(fd);
+            }
+        }
+    }
+
     const flags = task_lock.acquire();
     t.exit_code = exit_code;
     t.state = .zombie;

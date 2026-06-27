@@ -69,32 +69,31 @@ inline fn thisCpu() ?*syscall_entry.PerCpu {
     return syscall_entry.getPerCpuOrNull();
 }
 
+// v53.48: Hot-path per-CPU accessors use %gs:offset inline asm (~5 cycles)
+// instead of rdmsr via getPerCpuOrNull (~155 cycles). Safe after GS_BASE
+// is set during sched.init() — all these functions are called post-init only.
+
 fn getCurrentIdx() ?u32 {
-    const pc = thisCpu() orelse return null;
-    const v = pc.current_task_idx;
+    const v = syscall_entry.gsReadCurrentTaskIdx();
     return if (v == NO_TASK_IDX) null else v;
 }
 
 fn setCurrentIdx(v: ?u32) void {
-    const pc = thisCpu() orelse return;
-    pc.current_task_idx = v orelse NO_TASK_IDX;
+    syscall_entry.gsWriteCurrentTaskIdx(v orelse NO_TASK_IDX);
 }
 
 fn getSlice() u64 {
-    const pc = thisCpu() orelse return TIMESLICE_TICKS;
-    return pc.slice_remaining;
+    return syscall_entry.gsReadSliceRemaining();
 }
 
 fn setSlice(v: u64) void {
-    const pc = thisCpu() orelse return;
-    pc.slice_remaining = v;
+    syscall_entry.gsWriteSliceRemaining(v);
 }
 
 /// Logical id of the CPU currently executing (0 = BSP). Used to target this
 /// CPU's own TSS RSP0 on context switch (M8-4) rather than always the BSP's.
 fn currentCpuId() u32 {
-    const pc = thisCpu() orelse return 0;
-    return pc.cpu_id;
+    return syscall_entry.gsReadCpuId();
 }
 
 /// Program per-CPU syscall/interrupt stack targets for a user task.
