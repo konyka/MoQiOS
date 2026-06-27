@@ -1,14 +1,16 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.50.0（v53.41 TCP epollNotify锁外延迟 + page_cache readPageAndRecord + allocSlot物理页复用）
+> **版本**: v0.51.0（v53.42 insertPageOwned页面所有权转移 + 零拷贝缓存插入）
 > **日期**: 2026-05-29
-> **代码统计**: 内核 40,549 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
+> **代码统计**: 内核 40,622 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
 >   `kernel/net/icmpv6.zig`、`kernel/net/ndp.zig`、`kernel/proc/cap_check.zig`、
 >   `kernel/arch/arch.zig`、`kernel/arch/x86_64/arch_impl.zig`、`kernel/arch/riscv64/arch_impl.zig`），
 >   用户空间 2,244 行 C/ASM
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
+>
+> **2026-05-29 更新 (v53.42)**：page_cache insertPageOwned页面所有权转移API (缓存未命中路径从allocPage+readDirect+insertPage(内部再allocPage+memcpy)+freePage优化为allocPage+readDirect+insertPageOwned零拷贝转移，消除2次PMM锁+1次memcpy冗余，readFile和prefetchPages两处调用点均优化)。
 >
 > **2026-05-29 更新 (v53.41)**：TCP handlePacket epollNotify延迟到tcp_lock释放后 (7处通知从锁内移到锁外，避免阻塞所有TCP连接)、
 > page_cache readPageAndRecord组合函数 (readPage+recordAccess合并为单次锁获取，消除缓存命中路径双重锁)、
@@ -1310,10 +1312,10 @@ kernel/main.zig
 | kernel/drivers/virtio_net.zig | 548 | virtio-net 网卡驱动 |
 | kernel/drivers/e1000.zig | 453 | e1000 网卡驱动 (中断驱动) |
 | kernel/net/epoll.zig | 547 | epoll 事件多路复用 (LT/ET/ONESHOT + 位图优化) |
-| kernel/fs/page_cache.zig | 594 | 统一页缓存 (1024页/512哈希槽/Clock替换+脏页保护+命中统计/8页预取/invalidateInode批量失效，v53.39 LRU移除，v53.41 readPageAndRecord+allocSlot物理页复用) |
+| kernel/fs/page_cache.zig | 668 | 统一页缓存 (1024页/512哈希槽/Clock替换+脏页保护+命中统计/8页预取/invalidateInode批量失效，v53.39 LRU移除，v53.41 readPageAndRecord+allocSlot物理页复用，v53.42 insertPageOwned零拷贝转移) |
 | kernel/main.zig | 329 | 内核主函数 |
 | kernel/arch/x86_64/paging.zig | 293 | 页表管理 + getPagePhysAddr |
-| kernel/fs/ext2.zig | 3,312 | ext2 文件系统 (DMA安全I/O+readBlockDirect+allocInode零拷贝+readPageAndRecord+hardlink/symlink/unlink/chown/chmod/xattr/walkPathResolve/writeFile零拷贝+invalidateInode) |
+| kernel/fs/ext2.zig | 3,311 | ext2 文件系统 (DMA安全I/O+readBlockDirect+allocInode零拷贝+readPageAndRecord+insertPageOwned零拷贝+hardlink/symlink/unlink/chown/chmod/xattr/walkPathResolve/writeFile零拷贝+invalidateInode) |
 | kernel/fs/fat32.zig | 859 | FAT32 文件系统 (FAT缓存+DMA安全+多扇区写+allocCluster游标+readFile/writeFile簇链缓存+部分簇批量化I/O) |
 | kernel/proc/scheduler.zig | ~500 | O(1) 位图调度器 |
 | kernel/proc/task.zig | ~704 | Task 结构体 + 进程管理 |
@@ -1326,4 +1328,4 @@ kernel/main.zig
 | kernel/fs/procfs.zig | ~380 | procfs 12种虚拟文件 (含 /proc/sched_stats) |
 | kernel/sync/ | ~600 | IrqSpinlock/TicketLock/Mutex/RwLock/SeqLock/MPMC |
 
-**总计: 133 个 .zig 文件, 40,549 行**
+**总计: 133 个 .zig 文件, 40,622 行**

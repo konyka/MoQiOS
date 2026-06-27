@@ -903,10 +903,10 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
             // from the physical page contaminates the cache entry.
             // v53.34: Zero-fill moved into insertPage (data_len parameter).
             @memcpy(buf[read_total .. read_total + chunk], tmp[block_offset .. block_offset + chunk]);
-            // Insert into page cache
-            const page_data: *const [4096]u8 = tmp[0..4096];
-            _ = page_cache.insertPage(inode_id, page_idx, page_data, block_size);
-            pmm.freePage(tmp_phys);
+            // v53.42: Transfer page ownership to cache — avoids redundant allocPage+memcpy+freePage
+            if (page_cache.insertPageOwned(inode_id, page_idx, tmp_phys, block_size) == null) {
+                pmm.freePage(tmp_phys); // Cache full — couldn't insert
+            }
             // Record access and prefetch on sequential pattern
             const pf_count = page_cache.recordAccess(inode_id, page_idx);
             if (pf_count > 0) {
@@ -943,11 +943,10 @@ fn prefetchPages(inode: *const Ext2Inode, inode_id: u64, start_page: u64, count:
             pmm.freePage(tmp_phys);
             break;
         }
-        // v53.33: Zero remaining bytes to prevent garbage in page cache
-        // v53.34: Zero-fill moved into insertPage (data_len parameter).
-        const page_data: *const [4096]u8 = tmp[0..4096];
-        _ = page_cache.insertPage(inode_id, pg, page_data, block_size);
-        pmm.freePage(tmp_phys);
+        // v53.42: Transfer page ownership to cache — avoids redundant allocPage+memcpy+freePage
+        if (page_cache.insertPageOwned(inode_id, pg, tmp_phys, block_size) == null) {
+            pmm.freePage(tmp_phys); // Cache full — couldn't insert
+        }
     }
 }
 

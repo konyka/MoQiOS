@@ -280,6 +280,39 @@ pub fn insertPage(inode_id: u64, page_offset: u64, data: *const [PAGE_SIZE]u8, d
     return pages[new_slot].data;
 }
 
+/// Insert a page using a pre-allocated physical page (ownership transfer, v53.42).
+/// Avoids redundant pmm.allocPage + memcpy in the caller.
+/// On failure (cache full), returns null — caller must freePage(phys).
+pub fn insertPageOwned(inode_id: u64, page_offset: u64, phys: u64, data_len: u32) ?*[PAGE_SIZE]u8 {
+    const flags = cache_lock.acquire();
+    defer cache_lock.release(flags);
+
+    const key = CacheKey{ .inode_id = inode_id, .page_offset = page_offset };
+    const bucket = hashKey(key);
+
+    const new_slot = allocSlotOwned(phys) orelse return null;
+
+    pages[new_slot].key = key;
+    pages[new_slot].valid = true;
+    pages[new_slot].dirty = false;
+    pages[new_slot].referenced = true;
+
+    // No memcpy needed — data is already in the physical page.
+    // Zero-fill the remainder (data_len..PAGE_SIZE).
+    if (data_len < PAGE_SIZE) {
+        @memset(pages[new_slot].data[data_len..PAGE_SIZE], 0);
+    }
+
+    pages[new_slot].hash_next = hash_buckets[bucket];
+    hash_buckets[bucket] = @intCast(new_slot);
+
+    inodeListInsert(new_slot);
+
+    page_count += 1;
+
+    return pages[new_slot].data;
+}
+
 /// Flush all dirty pages for a given inode.
 /// Calls the provided writeback function for each dirty page.
 /// Uses per-inode linked list for O(pages_of_inode) instead of O(MAX_PAGES).
@@ -389,6 +422,47 @@ fn allocSlot() ?u16 {
     }
 
     return null; // All pages are referenced
+}
+
+/// Allocate a cache slot using a pre-allocated physical page (v53.42).
+/// Used by insertPageOwned to avoid redundant pmm.allocPage + memcpy.
+fn allocSlotOwned(phys: u64) ?u16 {
+    // First, try the free list
+    if (free_head) |s| {
+        const slot = s;
+        pages[slot].phys = phys;
+        pages[slot].data = @ptrFromInt(hhdm.physToVirt(phys));
+        free_head = pages[slot].lru_next;
+        return slot;
+    }
+
+    // No free slots — evict using clock algorithm
+    var attempts: u32 = 0;
+    while (attempts < MAX_PAGES * 2) : (attempts += 1) {
+        if (clock_hand >= MAX_PAGES) clock_hand = 0;
+        const i = clock_hand;
+        clock_hand += 1;
+
+        if (!pages[i].valid) continue;
+
+        if (pages[i].referenced) {
+            pages[i].referenced = false;
+            continue;
+        }
+
+        if (dirtyTest(@intCast(i))) continue;
+
+        // v53.42: Evict, free old physical page, then use caller's page
+        removePageKeepPhys(@intCast(i));
+        if (pages[i].phys != 0) {
+            pmm.freePage(pages[i].phys);
+        }
+        pages[i].phys = phys;
+        pages[i].data = @ptrFromInt(hhdm.physToVirt(phys));
+        return @intCast(i);
+    }
+
+    return null;
 }
 
 /// Remove a page from the cache (hash bucket + free list).
