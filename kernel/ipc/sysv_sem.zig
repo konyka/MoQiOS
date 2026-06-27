@@ -123,11 +123,26 @@ pub fn semop(semid: u32, sem_num: u32, op: i16) i64 {
         const new_val = s.values[sem_num] + val;
 
         if (new_val < 0) {
-            // Would block — sleep on wait queue, then retry
+            // v53.44: Add to wait queue while holding lock to prevent lost wakeup.
+            // Previously: released lock first, then called sleepOn — V operation
+            // could fire wakeOne before we joined the queue, losing the wakeup.
             var node: task.WaitNode = .{ .task_idx = 0 };
+            const cur_idx = sched.currentTaskIndex() orelse {
+                sem_lock.release(flags);
+                return -1;
+            };
+            node.task_idx = cur_idx;
+            node.granted = false;
+            node.next = s.wait_queue;
+            s.wait_queue = &node;
+            const cur_task = task.getTask(cur_idx) orelse {
+                sem_lock.release(flags);
+                return -1;
+            };
+            cur_task.state = .blocked;
             sem_lock.release(flags);
-            const woken = sched.sleepOn(&s.wait_queue, &node);
-            if (!woken) return -43; // interrupted (EIDRM / signal)
+            sched.forceReschedule();
+            if (!node.granted) return -43; // interrupted (EIDRM / signal)
             continue; // re-acquire lock and re-check condition
         }
 

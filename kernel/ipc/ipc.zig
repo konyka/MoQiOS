@@ -15,6 +15,10 @@
 const task = @import("../proc/task.zig");
 const sched = @import("../proc/sched.zig");
 const serial = @import("../arch/x86_64/serial.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+
+// v53.44: Global lock protecting all endpoint operations (SMP safety)
+var ipc_lock: IrqSpinlock = .{};
 
 // --- Deadlock prevention limits ---
 const MAX_CALL_DEPTH: u32 = 8; // Maximum nested IPC call chain depth
@@ -192,6 +196,9 @@ pub fn createEndpoint(owner_task_idx: u32) ?EndpointId {
     // Verify the task exists
     _ = task.getTask(owner_task_idx) orelse return null;
 
+    const flags = ipc_lock.acquire();
+    defer ipc_lock.release(flags);
+
     // Find a free slot
     for (1..MAX_ENDPOINTS) |i| {
         if (!endpoints[i].active) {
@@ -212,6 +219,9 @@ pub fn createEndpoint(owner_task_idx: u32) ?EndpointId {
 /// Destroy an endpoint.
 pub fn destroyEndpoint(ep: EndpointId) void {
     if (ep == 0 or ep >= MAX_ENDPOINTS) return;
+    const flags = ipc_lock.acquire();
+    defer ipc_lock.release(flags);
+
     // Unblock any tasks waiting on this endpoint
     if (endpoints[ep].waiting_sender) |sender_idx| {
         const t = task.getTask(sender_idx) orelse return;
@@ -230,6 +240,8 @@ pub fn destroyEndpoint(ep: EndpointId) void {
 /// Get the task index that owns an endpoint.
 pub fn getEndpointOwner(ep: EndpointId) ?u32 {
     if (ep == 0 or ep >= MAX_ENDPOINTS) return null;
+    const flags = ipc_lock.acquire();
+    defer ipc_lock.release(flags);
     if (!endpoints[ep].active) return null;
     return endpoints[ep].owner_task_idx;
 }
@@ -240,9 +252,14 @@ pub fn getEndpointOwner(ep: EndpointId) ?u32 {
 /// For kernel-to-kernel IPC, the sender's task index is determined from the scheduler.
 pub fn send(target_ep: EndpointId, msg: *const Message) IpcError {
     if (target_ep == 0 or target_ep >= MAX_ENDPOINTS) return .invalid_endpoint;
-    if (!endpoints[target_ep].active) return .invalid_endpoint;
 
     const sender_idx = sched.currentTaskIndex() orelse return .not_ready;
+
+    // v53.44: SMP-safe endpoint access
+    const flags = ipc_lock.acquire();
+    defer ipc_lock.release(flags);
+
+    if (!endpoints[target_ep].active) return .invalid_endpoint;
     const sender_ep = findEndpointForTask(sender_idx) orelse return .not_ready;
 
     // Check for self-send deadlock
@@ -261,12 +278,7 @@ pub fn send(target_ep: EndpointId, msg: *const Message) IpcError {
         // Receiver is already waiting — deliver immediately
         const recv_task = task.getTask(recv_idx) orelse return .not_ready;
 
-        // Copy message to receiver's buffer
-        if (endpoints[target_ep].pending_msg) |*pending| {
-            pending.* = out_msg;
-        } else {
-            endpoints[target_ep].pending_msg = out_msg;
-        }
+        endpoints[target_ep].pending_msg = out_msg;
 
         // Wake up receiver
         recv_task.state = .ready;
@@ -287,11 +299,20 @@ pub fn send(target_ep: EndpointId, msg: *const Message) IpcError {
 /// Receive a message from any sender on this endpoint. Blocks until one arrives.
 pub fn receive(ep: EndpointId, buf: *Message) IpcError {
     if (ep == 0 or ep >= MAX_ENDPOINTS) return .invalid_endpoint;
-    if (!endpoints[ep].active) return .invalid_endpoint;
 
-    // Verify caller owns this endpoint
     const caller_idx = sched.currentTaskIndex() orelse return .not_ready;
-    if (endpoints[ep].owner_task_idx != caller_idx) return .not_ready;
+
+    // v53.44: SMP-safe endpoint access
+    const flags = ipc_lock.acquire();
+
+    if (!endpoints[ep].active) {
+        ipc_lock.release(flags);
+        return .invalid_endpoint;
+    }
+    if (endpoints[ep].owner_task_idx != caller_idx) {
+        ipc_lock.release(flags);
+        return .not_ready;
+    }
 
     if (endpoints[ep].waiting_sender) |sender_idx| {
         // Sender is waiting — pick up the message
@@ -301,26 +322,37 @@ pub fn receive(ep: EndpointId, buf: *Message) IpcError {
         }
 
         // Wake up sender
-        const sender_task = task.getTask(sender_idx) orelse return .not_ready;
+        const sender_task = task.getTask(sender_idx) orelse {
+            ipc_lock.release(flags);
+            return .not_ready;
+        };
         sender_task.state = .ready;
         endpoints[ep].waiting_sender = null;
+        ipc_lock.release(flags);
         return .success;
     }
 
     // No sender waiting — block the receiver until a sender arrives
-    const recv_task = task.getTask(caller_idx) orelse return .not_ready;
+    const recv_task = task.getTask(caller_idx) orelse {
+        ipc_lock.release(flags);
+        return .not_ready;
+    };
     endpoints[ep].waiting_receiver = caller_idx;
     recv_task.state = .blocked;
+    ipc_lock.release(flags);
 
-    // Force context switch — the task will resume when send() wakes us
+    // Force context switch — must release lock first to avoid deadlock
     sched.forceReschedule();
 
     // Resumed after send() delivered message and set state = .ready
+    const flags2 = ipc_lock.acquire();
     if (endpoints[ep].pending_msg) |msg| {
         buf.* = msg;
         endpoints[ep].pending_msg = null;
+        ipc_lock.release(flags2);
         return .success;
     }
+    ipc_lock.release(flags2);
     return .not_ready;
 }
 
@@ -334,9 +366,14 @@ pub fn call(target_ep: EndpointId, msg: *Message) IpcError {
         return .would_deadlock;
     }
 
-    const caller_ep = findEndpointForTask(caller_idx) orelse return .not_ready;
-
+    // v53.44: Lock for findEndpointForTask (send acquires its own lock)
+    const flags = ipc_lock.acquire();
+    const caller_ep = findEndpointForTask(caller_idx) orelse {
+        ipc_lock.release(flags);
+        return .not_ready;
+    };
     msg.reply_to = @intCast(caller_ep);
+    ipc_lock.release(flags);
 
     // Increment call depth
     task_ipc_state[caller_idx].call_depth += 1;
@@ -360,6 +397,11 @@ pub fn call(target_ep: EndpointId, msg: *Message) IpcError {
 /// Decrements the caller's IPC call depth.
 pub fn reply(caller_ep: EndpointId, reply_msg: *const Message) IpcError {
     if (caller_ep == 0 or caller_ep >= MAX_ENDPOINTS) return .invalid_endpoint;
+
+    // v53.44: SMP-safe endpoint access
+    const flags = ipc_lock.acquire();
+    defer ipc_lock.release(flags);
+
     if (!endpoints[caller_ep].active) return .invalid_endpoint;
 
     // Unblock the caller
@@ -383,6 +425,11 @@ pub fn reply(caller_ep: EndpointId, reply_msg: *const Message) IpcError {
 /// Notify an endpoint — async, non-blocking. Sets bits in the notification bitmap.
 pub fn notify(target_ep: EndpointId, bits: NotifyBitmap) IpcError {
     if (target_ep == 0 or target_ep >= MAX_ENDPOINTS) return .invalid_endpoint;
+
+    // v53.44: SMP-safe endpoint access
+    const flags = ipc_lock.acquire();
+    defer ipc_lock.release(flags);
+
     if (!endpoints[target_ep].active) return .invalid_endpoint;
 
     endpoints[target_ep].pending_notify |= bits;
@@ -400,6 +447,9 @@ pub fn notify(target_ep: EndpointId, bits: NotifyBitmap) IpcError {
 /// Get pending notifications and clear them.
 pub fn getNotify(ep: EndpointId) NotifyBitmap {
     if (ep == 0 or ep >= MAX_ENDPOINTS) return 0;
+    // v53.44: SMP-safe notification read
+    const flags = ipc_lock.acquire();
+    defer ipc_lock.release(flags);
     const bits = endpoints[ep].pending_notify;
     endpoints[ep].pending_notify = 0;
     return bits;

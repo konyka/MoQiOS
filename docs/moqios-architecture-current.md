@@ -1,14 +1,16 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.51.0（v53.42 insertPageOwned页面所有权转移 + 零拷贝缓存插入）
+> **版本**: v0.51.0（v53.44 SMP并发安全修复 — slab/futex/ipc/signal原子化+UAF修复+CLOEXEC）
 > **日期**: 2026-05-29
-> **代码统计**: 内核 40,622 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
+> **代码统计**: 内核 40,812 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
 >   `kernel/net/icmpv6.zig`、`kernel/net/ndp.zig`、`kernel/proc/cap_check.zig`、
 >   `kernel/arch/arch.zig`、`kernel/arch/x86_64/arch_impl.zig`、`kernel/arch/riscv64/arch_impl.zig`），
 >   用户空间 2,244 行 C/ASM
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
+>
+> **2026-05-29 更新 (v53.44)**：SMP并发安全大修复 — slab分配器IrqSpinlock保护free_list (SMP数据竞争)、futex WaitNode UAF修复 (非授权唤醒removeWaitNode清理+REQUEUE同bucket死锁+地址排序锁防AB-BA+CMP_REQUEUE检查addr+Linux ABI参数修正r10/r8/r9)、IPC全局ipc_lock保护endpoint操作 (receive锁释放→forceReschedule→重获)、sendSignal@atomicRmw(.Or)原子化+dequeueSignal@ctz O(1)查找+pushSignalFrame copyToUser验证+调用方检查、sysv_sem持锁加入队列防丢失唤醒、execve O_CLOEXEC FD调用close()资源回收、sched alarm/itimer直接设置pending_signals消除O(n)sendSignal。
 >
 > **2026-05-29 更新 (v53.42)**：page_cache insertPageOwned页面所有权转移API (缓存未命中路径从allocPage+readDirect+insertPage(内部再allocPage+memcpy)+freePage优化为allocPage+readDirect+insertPageOwned零拷贝转移，消除2次PMM锁+1次memcpy冗余，readFile和prefetchPages两处调用点均优化)。
 >
@@ -658,7 +660,7 @@ LAPIC Timer 中断
 
 ## 6. 系统调用
 
-**源文件**: `kernel/arch/x86_64/syscall_entry.zig` (4,886 行)
+**源文件**: `kernel/arch/x86_64/syscall_entry.zig` (5,052 行)
 
 ### 6.1 系统调用机制
 
@@ -1105,7 +1107,7 @@ LAPIC Timer 中断
 
 ## 9. 信号处理
 
-**源文件**: `kernel/proc/signal.zig` (199 行)
+**源文件**: `kernel/proc/signal.zig` (204 行)
 
 - 支持信号: SIGINT (2), SIGILL (4), SIGFPE (8), SIGKILL (9), SIGSEGV (11), SIGTERM (15), SIGUSR1 (10), SIGUSR2 (12), SIGPIPE (13), SIGCHLD (20) 等
 - `sigaction()`: 注册信号处理函数
@@ -1119,7 +1121,7 @@ LAPIC Timer 中断
 
 ## 10. 管道与 I/O
 
-**源文件**: `kernel/ipc/ipc.zig` (443 行)
+**源文件**: `kernel/ipc/ipc.zig` (496 行)
 
 - `pipe()`: 创建一对文件描述符 (读端 + 写端)
 - 内部使用环形缓冲区 (4096 字节)
@@ -1305,7 +1307,7 @@ kernel/main.zig
 
 | 文件 | 行数 | 功能 |
 |---|---|---|
-| kernel/arch/x86_64/syscall_entry.zig | 4,886 | 系统调用入口 + 383 dispatch 条目 |
+| kernel/arch/x86_64/syscall_entry.zig | 5,052 | 系统调用入口 + 383 dispatch 条目 (v53.44 futex参数映射修正+pushSignalFrame调用方检查) |
 | kernel/net/tcp.zig | 1,879 | TCP 协议 (Reno/SACK/WS/TS/CORK/QUICKACK + @memcpy环形缓冲区 + v53.41 epollNotify锁外延迟) |
 | kernel/fs/vfs.zig | ~720 | 虚拟文件系统 + MAX_FDS=64 + procfs 路由 + inotify + allocFd |
 | kernel/arch/x86_64/idt.zig | 786 | 中断描述符表 + IRQ 分发 + COW #PF 处理 |
@@ -1322,7 +1324,7 @@ kernel/main.zig
 | kernel/drivers/virtio_blk.zig | 545 | virtio-blk 块设备驱动 (多设备+DMA安全) |
 | kernel/drivers/nvme.zig | ~690 | NVMe SSD 驱动 (多队列, 最多4 I/O SQ/CQ对) |
 | kernel/mm/pmm.zig | 369 | 物理内存管理 (两级位图 + refcount + COW API，v53.39 修复双重释放锁) |
-| kernel/mm/slab.zig | 218 | Slab 分配器 (v53.39 _pad u16修复大分配页数截断) |
+| kernel/mm/slab.zig | 232 | Slab 分配器 (v53.39 _pad u16修复大分配页数截断，v53.44 IrqSpinlock保护free_list) |
 | kernel/mm/swap.zig | ~267 | Swap 页面置换 (Clock算法 + u64位图@ctz分配) |
 | kernel/fs/eventfd.zig | 165 | eventfd 事件通知 |
 | kernel/fs/procfs.zig | ~380 | procfs 12种虚拟文件 (含 /proc/sched_stats) |

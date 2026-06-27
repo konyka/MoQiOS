@@ -58,6 +58,20 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64) ?u64 {
     const cur_idx = sched.currentTaskIndex() orelse return null;
     const cur = task_mod.getTask(cur_idx) orelse return null;
 
+    // v53.44: Close FD_CLOEXEC file descriptors before destroying old address space.
+    // POSIX requires exec to auto-close FDs with O_CLOEXEC/FD_CLOEXEC flag.
+    {
+        const vfs_mod = @import("../fs/vfs.zig");
+        const fcntl_mod = @import("../fs/fcntl.zig");
+        for (0..vfs_mod.MAX_FDS) |i| {
+            if (cur.fd_table.fds[i].fd_type != .none and
+                (cur.fd_table.fds[i].fd_flags & fcntl_mod.FD_CLOEXEC) != 0)
+            {
+                _ = cur.fd_table.close(@intCast(i));
+            }
+        }
+    }
+
     if (cur.page_table_phys != 0) {
         user_space.destroyUserSpace(cur.page_table_phys);
     }
@@ -145,6 +159,19 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64) ?u64 {
     const user_space = @import("../mm/user_space.zig");
     const cur_idx = sched.currentTaskIndex() orelse return null;
     const cur = task_mod.getTask(cur_idx) orelse return null;
+
+    // v53.44: Close FD_CLOEXEC file descriptors before destroying old address space.
+    {
+        const vfs_mod = @import("../fs/vfs.zig");
+        const fcntl_mod = @import("../fs/fcntl.zig");
+        for (0..vfs_mod.MAX_FDS) |i| {
+            if (cur.fd_table.fds[i].fd_type != .none and
+                (cur.fd_table.fds[i].fd_flags & fcntl_mod.FD_CLOEXEC) != 0)
+            {
+                _ = cur.fd_table.close(@intCast(i));
+            }
+        }
+    }
 
     if (cur.page_table_phys != 0) {
         user_space.destroyUserSpace(cur.page_table_phys);

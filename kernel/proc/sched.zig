@@ -149,7 +149,6 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         // Drive alarm() / setitimer(ITIMER_REAL) expiration checks
         {
             const tsc = @import("../arch/x86_64/tsc.zig");
-            const signal = @import("signal.zig");
             const now_ns = tsc.nanos();
             for (0..task.MAX_TASKS) |i| {
                 const t = task.getTask(@intCast(i)) orelse continue;
@@ -157,11 +156,13 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
                 // Check alarm() deadline
                 if (t.alarm_deadline != 0 and now_ns >= t.alarm_deadline) {
                     t.alarm_deadline = 0; // One-shot: clear after firing
-                    _ = signal.sendSignal(t.tid, 14); // SIGALRM
+                    // v53.44: Set SIGALRM bit directly — avoids sendSignal's O(n) task scan
+                    _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
                 }
                 // Check ITIMER_REAL deadline
                 if (t.itimer_real_value != 0 and now_ns >= t.itimer_real_value) {
-                    _ = signal.sendSignal(t.tid, 14); // SIGALRM
+                    // v53.44: Set SIGALRM bit directly — avoids sendSignal's O(n) task scan
+                    _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
                     if (t.itimer_real_interval != 0) {
                         // Recurring: reschedule next expiration
                         t.itimer_real_value = now_ns + t.itimer_real_interval;
@@ -482,6 +483,13 @@ pub fn deliverSignalToRunningTask(t: *task.Task) void {
     const user_rflags = iframe.rflags;
 
     const result = sig_mod.pushSignalFrame(t, signum, user_rsp, user_rip, user_rflags);
+
+    // v53.44: Check if signal delivery failed (user stack unmapped/too small)
+    if (result.new_rsp == 0) {
+        // Re-queue the signal for next attempt and skip delivery
+        _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << @intCast(signum - 1), .seq_cst);
+        return;
+    }
 
     // Modify the InterruptFrame to jump to the signal handler
     iframe.rip = handler_addr;

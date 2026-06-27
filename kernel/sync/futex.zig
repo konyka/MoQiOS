@@ -44,6 +44,67 @@ pub fn hash(addr: u64) u32 {
     return @truncate((addr >> 12) % FUTEX_HASH_BUCKETS);
 }
 
+/// v53.44: Remove a WaitNode from a bucket's wait list.
+/// Used by wait paths to clean up nodes that were not granted (e.g. signaled
+/// or timed out). Without this, the stack-allocated node remains in the
+/// linked list after the function returns, causing use-after-free.
+fn removeWaitNode(bucket: *FutexBucket, node: *task_mod.WaitNode) void {
+    const irq_flags = bucket.lock.acquire();
+    defer bucket.lock.release(irq_flags);
+    var prev: ?*task_mod.WaitNode = null;
+    var current = bucket.head;
+    while (current) |n| {
+        if (n == node) {
+            if (prev) |p| {
+                p.next = n.next;
+            } else {
+                bucket.head = n.next;
+            }
+            return;
+        }
+        prev = n;
+        current = n.next;
+    }
+}
+
+/// v53.44: Requeue waiters from source to dest bucket. Caller must hold locks.
+/// If bucket == dst_bucket, nodes stay in place (just counted).
+fn doRequeue(bucket: *FutexBucket, dst_bucket: *FutexBucket, requeue_count: u32) u64 {
+    var requeued: u64 = 0;
+    var prev: ?*task_mod.WaitNode = null;
+    var current = bucket.head;
+    while (current) |node| {
+        if (requeued >= requeue_count) break;
+        const next = node.next;
+        const t = task_mod.getTask(node.task_idx) orelse {
+            prev = node;
+            current = next;
+            continue;
+        };
+        if (t.state == .blocked) {
+            if (bucket != dst_bucket) {
+                // Remove from source bucket
+                if (prev) |p| {
+                    p.next = next;
+                } else {
+                    bucket.head = next;
+                }
+                // Insert into destination bucket
+                node.next = dst_bucket.head;
+                dst_bucket.head = node;
+            } else {
+                // Same bucket: leave node in place, update prev
+                prev = node;
+            }
+            requeued += 1;
+        } else {
+            prev = node;
+        }
+        current = next;
+    }
+    return requeued;
+}
+
 /// Read a u32 from user space safely.
 pub fn copyUserU32(addr: u64) u32 {
     var buf: [4]u8 = @splat(0);
@@ -133,6 +194,11 @@ pub fn futexWaitv(waiters_ptr: u64, nr_waiters: u64) i64 {
 
             sched_mod.forceReschedule();
 
+            // v53.44: Clean up node if not granted (prevents UAF)
+            if (!node.granted) {
+                removeWaitNode(bucket, &node);
+                return -11;
+            }
             return @bitCast(@as(u64, i));
         }
     }
@@ -142,9 +208,10 @@ pub fn futexWaitv(waiters_ptr: u64, nr_waiters: u64) i64 {
 
 // ── Core futex syscall ──
 
-/// futex(addr, op, val, uaddr2, val3) -> result or -errno.
+/// futex(addr, op, val, val2, uaddr2, val3) -> result or -errno.
 /// Core logic for syscall #202.
-pub fn futex(addr: u64, raw_op: i64, val: u64, uaddr2: u64, val3: u64) i64 {
+/// v53.44: added val2 param for Linux ABI correctness (r10 = val2/timeout).
+pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64) i64 {
     const op: i64 = raw_op & ~FUTEX_PRIVATE; // strip private flag
 
     if (addr == 0 or addr >= 0x0000_8000_0000_0000) {
@@ -178,7 +245,12 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, uaddr2: u64, val3: u64) i64 {
 
             sched_mod.forceReschedule();
 
-            return if (node.granted) @as(i64, 0) else -11;
+            // v53.44: Clean up node if not granted (prevents UAF)
+            if (!node.granted) {
+                removeWaitNode(bucket, &node);
+                return -11;
+            }
+            return 0;
         },
         FUTEX_WAKE => {
             const count: u32 = @truncate(val);
@@ -204,7 +276,12 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, uaddr2: u64, val3: u64) i64 {
             cur.state = .blocked;
             bucket.lock.release(irq_flags);
             sched_mod.forceReschedule();
-            return if (node.granted) @as(i64, 0) else -11;
+            // v53.44: Clean up node if not granted (prevents UAF)
+            if (!node.granted) {
+                removeWaitNode(bucket, &node);
+                return -11;
+            }
+            return 0;
         },
         FUTEX_WAKE_BITSET => {
             const count: u32 = @truncate(val);
@@ -212,90 +289,63 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, uaddr2: u64, val3: u64) i64 {
         },
         FUTEX_REQUEUE => {
             const wake_count: u32 = @truncate(val);
-            const requeue_count: u32 = @truncate(val3);
+            const requeue_count: u32 = @truncate(val2); // v53.44: val2 not val3
             const woken = wakeN(bucket, wake_count);
             var requeued: u64 = 0;
             if (requeue_count > 0 and uaddr2 != 0 and uaddr2 < 0x0000_8000_0000_0000) {
                 const dst_bucket = &buckets[hash(uaddr2)];
-                const irq_flags = bucket.lock.acquire();
-                var prev: ?*task_mod.WaitNode = null;
-                var current = bucket.head;
-                while (current) |node| {
-                    if (requeued >= requeue_count) break;
-                    const next = node.next;
-                    const t = task_mod.getTask(node.task_idx) orelse {
-                        prev = node;
-                        current = next;
-                        continue;
-                    };
-                    if (t.state == .blocked) {
-                        if (prev) |p| {
-                            p.next = next;
-                        } else {
-                            bucket.head = next;
-                        }
-                        const dst_flags = dst_bucket.lock.acquire();
-                        node.next = dst_bucket.head;
-                        dst_bucket.head = node;
-                        dst_bucket.lock.release(dst_flags);
-                        requeued += 1;
-                    } else {
-                        prev = node;
-                    }
-                    current = next;
+                // v53.44: Same-bucket check prevents double-acquire deadlock
+                if (bucket == dst_bucket) {
+                    const f1 = bucket.lock.acquire();
+                    requeued = doRequeue(bucket, dst_bucket, requeue_count);
+                    bucket.lock.release(f1);
+                } else {
+                    const src_first = @intFromPtr(bucket) <= @intFromPtr(dst_bucket);
+                    const b1 = if (src_first) bucket else dst_bucket;
+                    const b2 = if (src_first) dst_bucket else bucket;
+                    const f1 = b1.lock.acquire();
+                    const f2 = b2.lock.acquire();
+                    requeued = doRequeue(bucket, dst_bucket, requeue_count);
+                    b2.lock.release(f2);
+                    b1.lock.release(f1);
                 }
-                bucket.lock.release(irq_flags);
             }
             return @intCast(woken + requeued);
         },
         FUTEX_CMP_REQUEUE => {
             const cmp_val: u32 = @truncate(val3);
-            if (uaddr2 != 0 and uaddr2 < 0x0000_8000_0000_0000) {
-                const user_val2: u32 = copyUserU32(uaddr2);
-                if (user_val2 != cmp_val) {
-                    return -11; // EAGAIN
-                }
+            // v53.44: Check *addr (not *uaddr2) per Linux CMP_REQUEUE semantics
+            const user_val: u32 = copyUserU32(addr);
+            if (user_val != cmp_val) {
+                return -11; // EAGAIN
             }
             const wake_count: u32 = @truncate(val);
-            const requeue_count: u32 = @truncate(val3 >> 32);
+            const requeue_count: u32 = @truncate(val2); // v53.44: val2 not val3>>32
             const woken = wakeN(bucket, wake_count);
             var requeued: u64 = 0;
             if (requeue_count > 0 and uaddr2 != 0 and uaddr2 < 0x0000_8000_0000_0000) {
                 const dst_bucket = &buckets[hash(uaddr2)];
-                const irq_flags = bucket.lock.acquire();
-                var prev: ?*task_mod.WaitNode = null;
-                var current = bucket.head;
-                while (current) |node| {
-                    if (requeued >= requeue_count) break;
-                    const next = node.next;
-                    const t = task_mod.getTask(node.task_idx) orelse {
-                        prev = node;
-                        current = next;
-                        continue;
-                    };
-                    if (t.state == .blocked) {
-                        if (prev) |p| {
-                            p.next = next;
-                        } else {
-                            bucket.head = next;
-                        }
-                        const dst_flags = dst_bucket.lock.acquire();
-                        node.next = dst_bucket.head;
-                        dst_bucket.head = node;
-                        dst_bucket.lock.release(dst_flags);
-                        requeued += 1;
-                    } else {
-                        prev = node;
-                    }
-                    current = next;
+                // v53.44: Same-bucket check prevents double-acquire deadlock
+                if (bucket == dst_bucket) {
+                    const f1 = bucket.lock.acquire();
+                    requeued = doRequeue(bucket, dst_bucket, requeue_count);
+                    bucket.lock.release(f1);
+                } else {
+                    const src_first = @intFromPtr(bucket) <= @intFromPtr(dst_bucket);
+                    const b1 = if (src_first) bucket else dst_bucket;
+                    const b2 = if (src_first) dst_bucket else bucket;
+                    const f1 = b1.lock.acquire();
+                    const f2 = b2.lock.acquire();
+                    requeued = doRequeue(bucket, dst_bucket, requeue_count);
+                    b2.lock.release(f2);
+                    b1.lock.release(f1);
                 }
-                bucket.lock.release(irq_flags);
             }
             return @intCast(woken + requeued);
         },
         FUTEX_WAKE_OP => {
             const wake_count1: u32 = @truncate(val);
-            const wake_count2: u32 = @truncate(val3 >> 32);
+            const wake_count2: u32 = @truncate(val2); // v53.44: val2 not val3>>32
             const woken1 = wakeN(bucket, wake_count1);
             var woken2: u64 = 0;
             if (uaddr2 != 0 and uaddr2 < 0x0000_8000_0000_0000 and wake_count2 > 0) {
@@ -342,7 +392,12 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, uaddr2: u64, val3: u64) i64 {
                 bo.writeU32Le(&new_buf, tid);
                 _ = copy.copyToUser(@ptrFromInt(addr), &new_buf, 4);
             }
-            return if (node.granted) @as(i64, 0) else -11;
+            // v53.44: Clean up node if not granted (prevents UAF)
+            if (!node.granted) {
+                removeWaitNode(bucket, &node);
+                return -11;
+            }
+            return 0;
         },
         FUTEX_UNLOCK_PI => {
             // Set futex word to 0, wake one waiter

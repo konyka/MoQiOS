@@ -36,11 +36,18 @@ pub fn fork(frame: *SyscallFrame) i64 {
 
     for (0..vfs_mod.MAX_FDS) |i| {
         child.fd_table.fds[i] = parent.fd_table.fds[i];
-        if (child.fd_table.fds[i].fd_type == .pipe_read or child.fd_table.fds[i].fd_type == .pipe_write) {
-            const pidx = child.fd_table.fds[i].pipe_idx;
-            if (pidx < 16) {
-                vfs_mod.pipes[pidx].ref_count += 1;
-            }
+        switch (child.fd_table.fds[i].fd_type) {
+            .pipe_read, .pipe_write => {
+                const pidx = child.fd_table.fds[i].pipe_idx;
+                if (pidx < 16) {
+                    vfs_mod.pipes[pidx].ref_count += 1;
+                }
+            },
+            // v53.44: TODO — tcp_socket/epoll/eventfd/timerfd/unix_socket FDs are
+            // shared between parent and child without refcounting. Closing in one
+            // process frees the underlying resource while the other still holds a
+            // dangling index. Full fix requires per-type refcount in each subsystem.
+            else => {},
         }
     }
 

@@ -6,6 +6,7 @@ const pmm = @import("pmm.zig");
 const hhdm = @import("hhdm.zig");
 const serial = @import("../arch/x86_64/serial.zig");
 const klog = @import("../klog.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 const PAGE_SIZE: u64 = 4096;
 
@@ -40,6 +41,7 @@ const SlabPool = struct {
     free_list: ?*FreeNode,
     page_count: u32,
     allocated_count: u32,
+    lock: IrqSpinlock = .{}, // v53.44: SMP-safe free list access
 };
 
 /// Global slab pools.
@@ -72,7 +74,8 @@ fn findPool(size: usize) ?usize {
     return null;
 }
 
-fn refillPool(pool_idx: usize) bool {
+/// v53.44: refillPoolLocked — must be called with pool lock held.
+fn refillPoolLocked(pool_idx: usize) bool {
     var pool = &pools[pool_idx];
     const phys = pmm.allocPage() orelse {
         serial.writeString("[slab] OOM: cannot allocate page\n");
@@ -99,8 +102,12 @@ pub fn kmalloc(size: usize) ?*anyopaque {
         return allocLarge(size);
     };
 
+    // v53.44: SMP-safe free list access
+    const flags = pools[pool_idx].lock.acquire();
+    defer pools[pool_idx].lock.release(flags);
+
     if (pools[pool_idx].free_list == null) {
-        if (!refillPool(pool_idx)) return null;
+        if (!refillPoolLocked(pool_idx)) return null;
     }
 
     const node = pools[pool_idx].free_list.?;
@@ -154,6 +161,10 @@ pub fn kfree(ptr: *anyopaque) void {
         serial.writeString("\n");
         return;
     }
+
+    // v53.44: SMP-safe free list access
+    const flags = pools[pool_idx].lock.acquire();
+    defer pools[pool_idx].lock.release(flags);
 
     // Return the slot (including header) to the free list
     const slot_ptr: [*]u8 = @ptrFromInt(user_addr - HEADER_ALIGNED);
@@ -211,8 +222,11 @@ pub fn getStats() struct { total_allocs: u32, total_pages: u32 } {
     var allocs: u32 = 0;
     var pages: u32 = 0;
     for (0..NUM_CLASSES) |i| {
+        // v53.44: acquire lock for safe counter read
+        const flags = pools[i].lock.acquire();
         allocs += pools[i].allocated_count;
         pages += pools[i].page_count;
+        pools[i].lock.release(flags);
     }
     return .{ .total_allocs = allocs, .total_pages = pages };
 }

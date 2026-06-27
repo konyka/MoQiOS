@@ -539,8 +539,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         142 => { // fcntl(fd, cmd, arg)
             frame.rax = @bitCast(fcntl_mod.sysFcntl(frame.rdi, frame.rsi, frame.rdx));
         },
-        143 => { // futex(uaddr, op, val, uaddr2, val3)
-            frame.rax = @bitCast(futex_mod.futex(frame.rdi, @bitCast(frame.rsi), frame.rdx, frame.r10, frame.r8));
+        143 => { // futex(uaddr, op, val, val2, uaddr2, val3)
+            // v53.44: Linux x86_64 ABI: r10=val2/timeout, r8=uaddr2, r9=val3
+            frame.rax = @bitCast(futex_mod.futex(frame.rdi, @bitCast(frame.rsi), frame.rdx, frame.r10, frame.r8, frame.r9));
         },
         144 => { // sendfile(out_fd, in_fd, offset_ptr, count)
             frame.rax = @bitCast(splice_mod.sysSendfile(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, frame.r10));
@@ -2034,15 +2035,16 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         454 => { // futex_wake(futex, val, mask) — Linux #454 (new futex2 API)
             // Delegate to old futex() with FUTEX_WAKE (op=1)
-            frame.rax = @bitCast(futex_mod.futex(frame.rdi, 1, @truncate(frame.rsi), 0, 0));
+            frame.rax = @bitCast(futex_mod.futex(frame.rdi, 1, @truncate(frame.rsi), 0, 0, 0));
         },
         455 => { // futex_wait(futex, val, timeout, flags) — Linux #455 (new futex2 API)
             // Delegate to old futex() with FUTEX_WAIT (op=0)
-            frame.rax = @bitCast(futex_mod.futex(frame.rdi, 0, @truncate(frame.rsi), @bitCast(frame.rdx), 0));
+            frame.rax = @bitCast(futex_mod.futex(frame.rdi, 0, @truncate(frame.rsi), @bitCast(frame.rdx), 0, 0));
         },
         456 => { // futex_requeue(futex1, futex2, nr_wake, nr_requeue) — Linux #456
             // Delegate to old futex() with FUTEX_REQUEUE (op=3)
-            frame.rax = @bitCast(futex_mod.futex(frame.rdi, 3, @truncate(frame.rsi), @bitCast(frame.r10), 0));
+            // v53.44: Fixed param mapping — futex2_requeue(futex1=rdi, futex2=rsi, nr_wake=rdx, nr_requeue=r10)
+            frame.rax = @bitCast(futex_mod.futex(frame.rdi, 3, frame.rdx, frame.r10, frame.rsi, 0));
         },
         457 => { // statmount(mnt_id, buf, bufsize, flags) — query mount info — Linux #457
             frame.rax = @bitCast(@as(i64, -38)); // ENOSYS (mount info not tracked)
@@ -2651,6 +2653,13 @@ pub fn checkSignalsOnSyscallReturn(frame: *SyscallFrame) void {
     const user_rflags = frame.r11;
 
     const result = sig_mod.pushSignalFrame(current, signum, user_rsp, user_rip, user_rflags);
+
+    // v53.44: Check if signal delivery failed (user stack unmapped/too small)
+    if (result.new_rsp == 0) {
+        // Re-queue the signal for next attempt and skip delivery
+        _ = @atomicRmw(u32, &current.pending_signals, .Or, @as(u32, 1) << @intCast(signum - 1), .seq_cst);
+        return;
+    }
 
     frame.rdi = signum;
     frame.rcx = handler_addr;

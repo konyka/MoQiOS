@@ -8,7 +8,6 @@
 /// Delivery mechanism: push a signal frame onto the user stack containing
 /// the saved register state, then modify the return RIP to point to the
 /// user's signal handler. The sigreturn syscall restores the original context.
-
 const task = @import("task.zig");
 
 pub const SIGKILL: u32 = 9;
@@ -61,13 +60,14 @@ pub const SIGRETURN_TRAMPOLINE: [17]u8 = .{
 pub const SIGRETURN_TRAMPOLINE_ADDR: u64 = 0x7FFFF0000000;
 
 /// Send a signal to a process. Returns true on success.
+/// v53.44: Uses atomic OR for SMP-safe signal bit setting.
 pub fn sendSignal(target_tid: u32, signum: u32) bool {
     if (signum == 0 or signum > 31) return false;
 
     for (0..task.MAX_TASKS) |i| {
         const t = task.getTask(@intCast(i)) orelse continue;
         if (t.tid == target_tid and t.state != .zombie) {
-            t.pending_signals |= @as(u32, 1) << @intCast(signum - 1);
+            _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << @intCast(signum - 1), .seq_cst);
             return true;
         }
     }
@@ -76,19 +76,14 @@ pub fn sendSignal(target_tid: u32, signum: u32) bool {
 
 /// Check if a task has any pending, non-blocked signals.
 /// Returns the lowest signal number, or null if none.
+/// v53.44: O(1) with @ctz instead of O(31) linear scan.
 pub fn dequeueSignal(t: *task.Task) ?u32 {
-    const pending = t.pending_signals & ~t.signal_mask;
+    const pending = @atomicLoad(u32, &t.pending_signals, .seq_cst) & ~t.signal_mask;
     if (pending == 0) return null;
 
-    var signum: u32 = 1;
-    while (signum <= 31) : (signum += 1) {
-        const mask = @as(u32, 1) << @intCast(signum - 1);
-        if (pending & mask != 0) {
-            t.pending_signals &= ~mask;
-            return signum;
-        }
-    }
-    return null;
+    const bit: u5 = @intCast(@ctz(pending));
+    _ = @atomicRmw(u32, &t.pending_signals, .And, ~(@as(u32, 1) << bit), .seq_cst);
+    return @as(u32, bit) + 1;
 }
 
 /// Map the sigreturn trampoline into user address space.
@@ -167,20 +162,30 @@ pub fn pushSignalFrame(
 
     const frame_addr = handler_rsp - @sizeOf(SignalFrame);
 
-    // Write SignalFrame
-    const frame: *SignalFrame = @ptrFromInt(frame_addr);
-    const bytes: [*]u8 = @ptrCast(frame);
-    @memset(bytes[0..@sizeOf(SignalFrame)], 0);
-
+    // v53.44: Build frame on kernel stack, then copyToUser for safe write.
+    // Prevents kernel page fault if user stack is near limit or unmapped.
+    var frame: SignalFrame = undefined;
+    const fb: [*]u8 = @ptrCast(&frame);
+    @memset(fb[0..@sizeOf(SignalFrame)], 0);
     frame.rax = 0;
     frame.rip = user_rip;
     frame.rflags = user_rflags;
     frame.rsp = user_rsp;
     frame.signum = signum;
 
+    const copy = @import("../mm/copy_from_user.zig");
+    const frame_src: [*]const u8 = @ptrCast(&frame);
+    if (copy.copyToUser(@ptrFromInt(frame_addr), frame_src[0..@sizeOf(SignalFrame)], @sizeOf(SignalFrame)) != @sizeOf(SignalFrame)) {
+        // Stack too small or unmapped — signal delivery fails
+        return .{ .new_rsp = 0, .handler = 0 };
+    }
+
     // Write return address (sigreturn trampoline)
-    const ret_addr_ptr: *u64 = @ptrFromInt(handler_rsp);
-    ret_addr_ptr.* = SIGRETURN_TRAMPOLINE_ADDR;
+    var ret_val: u64 = SIGRETURN_TRAMPOLINE_ADDR;
+    const ret_src: [*]const u8 = @ptrCast(&ret_val);
+    if (copy.copyToUser(@ptrFromInt(handler_rsp), ret_src[0..8], 8) != 8) {
+        return .{ .new_rsp = 0, .handler = 0 };
+    }
 
     return .{ .new_rsp = handler_rsp, .handler = handler_addr };
 }
