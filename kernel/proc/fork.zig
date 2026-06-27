@@ -275,15 +275,31 @@ pub fn cloneUserPagesCow(parent_pml4_phys: u64) ?u64 {
 
                 const parent_pt: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(parent_pt_phys));
 
+                // v53.47: Two-pass COW — batch addRef to reduce pmm.lock acquisitions
+                // from O(N) to O(N/128). For a 4MB process (~1024 pages), this
+                // reduces ~1024 lock ops to ~8.
+                // Pass 1: Collect physical addresses for batch ref count increment
+                var cow_phys: [128]u64 = undefined;
+                var cow_count: u32 = 0;
+                for (0..512) |pt_idx| {
+                    const pte = parent_pt[pt_idx];
+                    if (pte == 0 or pte & 1 == 0) continue;
+                    cow_phys[cow_count] = pte & ADDR_MASK;
+                    cow_count += 1;
+                    if (cow_count == 128) {
+                        pmm_mod.addRefBatch(cow_phys[0..cow_count]);
+                        cow_count = 0;
+                    }
+                }
+                if (cow_count > 0) pmm_mod.addRefBatch(cow_phys[0..cow_count]);
+
+                // Pass 2: Set PTEs (mark COW, invalidate parent TLB, copy to child)
                 for (0..512) |pt_idx| {
                     const pte = parent_pt[pt_idx];
                     if (pte == 0 or pte & 1 == 0) continue;
 
                     const phys = pte & ADDR_MASK;
                     const flags = pte & 0xFFF;
-
-                    // Share the physical page: increment ref count
-                    pmm_mod.addRef(phys);
 
                     // Mark parent PTE as read-only + COW (if not already COW)
                     if (flags & COW_BIT == 0) {

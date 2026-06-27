@@ -1,14 +1,16 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.51.0（v53.46 TCP锁优化+alarm位图+SACK安全修复）
+> **版本**: v0.51.0（v53.47 dup2 UAF修复+alarm位图原子化+dup syscall修复+fork COW批量优化）
 > **日期**: 2026-05-29
-> **代码统计**: 内核 40,822 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
+> **代码统计**: 内核 40,888 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
 >   `kernel/net/icmpv6.zig`、`kernel/net/ndp.zig`、`kernel/proc/cap_check.zig`、
 >   `kernel/arch/arch.zig`、`kernel/arch/x86_64/arch_impl.zig`、`kernel/arch/riscv64/arch_impl.zig`），
 >   用户空间 2,244 行 C/ASM
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
+>
+> **2026-05-29 更新 (v53.47)**：dup2 UAF修复+alarm位图原子化+dup syscall修复+fork COW批量优化 — vfs close()新增hasSharedRef扫描防止dup2后close导致use-after-free (ext2/fat32/tcp/epoll/unix_socket/timerfd/tmpfs_file/eventfd/ramdisk_file全类型覆盖，pipe保持独立ref_count机制)、alarm_bm/itimer_bm原子化修复v53.46引入的非原子RMW竞态 (@atomicLoad(.acquire)读取+@atomicRmw(.And/.Or,.seq_cst)修改，防止BSP timerTick与syscall上下文丢失位)、dup syscall #160修复 (从dup2(fd,fd)空操作改为syscallDup正确分配新fd)、fork COW批量addRef优化 (新增pmm.addRefBatch单次锁批量递增引用计数，fork从O(N)锁操作降为O(N/128)，4MB进程从~1024次降至~8次)。
 >
 > **2026-05-29 更新 (v53.46)**：TCP锁优化+SACK安全+alarm位图 — TCP 7个只读状态查询函数移除tcp_lock (tcpPoll/tcpState/isEstablished/isClosed/tcpRecvAvailable/tcpSendSpace/tcpIsClosing无锁读取，x86_64对齐读天然原子，epoll collectEvents路径消除4N次tcp_lock获取)、SACK解析死循环修复 (sack_len<2时break，防畸形包DoS)、alarm/itimer位图优化 (新增alarm_bm/itimer_bm位图，timerTick从O(64)全量扫描改为O(active)位图扫描)。
 >

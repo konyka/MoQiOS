@@ -627,8 +627,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             const cmd: i32 = @bitCast(@as(u32, @truncate(frame.rsi)));
             frame.rax = @bitCast(msg_mod.msgctl(@truncate(frame.rdi), cmd, frame.rdx));
         },
-        160 => { // dup(oldfd)
-            frame.rax = @bitCast(proc_mgmt_mod.dup2(@intCast(frame.rdi), @intCast(frame.rdi)));
+        160 => { // dup(oldfd) — v53.47: Use syscallDup (allocFd + dup2), not dup2(fd,fd)
+            frame.rax = @bitCast(syscallDup(@truncate(frame.rdi)));
         },
         161 => { // dup3(oldfd, newfd, flags)
             const dup_result = proc_mgmt_mod.dup2(@intCast(frame.rdi), @intCast(frame.rsi));
@@ -4923,10 +4923,11 @@ fn syscallAlarm(seconds: u32) i64 {
 
     if (seconds == 0) {
         cur.alarm_deadline = 0; // Cancel alarm
-        sched.alarm_bm &= ~(@as(u64, 1) << @intCast(cur_idx));
+        // v53.47: Atomic RMW — alarm_bm is read by BSP timerTick on another CPU
+        _ = @atomicRmw(u64, &sched.alarm_bm, .And, ~(@as(u64, 1) << @intCast(cur_idx)), .seq_cst);
     } else {
         cur.alarm_deadline = now_ns + @as(u64, seconds) * 1_000_000_000;
-        sched.alarm_bm |= @as(u64, 1) << @intCast(cur_idx);
+        _ = @atomicRmw(u64, &sched.alarm_bm, .Or, @as(u64, 1) << @intCast(cur_idx), .seq_cst);
         // SIGALRM will be delivered by BSP timer tick when deadline expires
     }
 
@@ -5010,10 +5011,11 @@ fn syscallSetitimer(which: u32, new_value_ptr: u64, old_value_ptr: u64) i64 {
 
         if (val_ns == 0) {
             cur.itimer_real_value = 0; // Disarm
-            sched.itimer_bm &= ~(@as(u64, 1) << @intCast(cur_idx));
+            // v53.47: Atomic RMW — itimer_bm is read by BSP timerTick on another CPU
+            _ = @atomicRmw(u64, &sched.itimer_bm, .And, ~(@as(u64, 1) << @intCast(cur_idx)), .seq_cst);
         } else {
             cur.itimer_real_value = tsc.nanos() + val_ns;
-            sched.itimer_bm |= @as(u64, 1) << @intCast(cur_idx);
+            _ = @atomicRmw(u64, &sched.itimer_bm, .Or, @as(u64, 1) << @intCast(cur_idx), .seq_cst);
         }
     }
     // ITIMER_VIRTUAL/PROF: accept but don't track

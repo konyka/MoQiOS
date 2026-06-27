@@ -156,7 +156,10 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         {
             const tsc = @import("../arch/x86_64/tsc.zig");
             const now_ns = tsc.nanos();
-            var bm = alarm_bm | itimer_bm;
+            // v53.47: Atomic load — alarm_bm/itimer_bm are modified from syscall context
+            // on other CPUs. Non-atomic read-modify-write could lose newly set bits.
+            var bm = @atomicLoad(u64, &alarm_bm, .acquire) |
+                @atomicLoad(u64, &itimer_bm, .acquire);
             while (bm != 0) {
                 const i: u6 = @truncate(@ctz(bm));
                 bm &= bm - 1;
@@ -165,7 +168,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
                 // Check alarm() deadline
                 if (t.alarm_deadline != 0 and now_ns >= t.alarm_deadline) {
                     t.alarm_deadline = 0; // One-shot: clear after firing
-                    alarm_bm &= ~(@as(u64, 1) << i);
+                    _ = @atomicRmw(u64, &alarm_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
                     _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
                 }
                 // Check ITIMER_REAL deadline
@@ -177,7 +180,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
                     } else {
                         // One-shot: clear after firing
                         t.itimer_real_value = 0;
-                        itimer_bm &= ~(@as(u64, 1) << i);
+                        _ = @atomicRmw(u64, &itimer_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
                     }
                 }
             }

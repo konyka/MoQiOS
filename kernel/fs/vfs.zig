@@ -578,12 +578,46 @@ pub const FdTable = struct {
         }
     }
 
+    /// v53.47: Check if another fd in this table shares the same underlying
+    /// resource (via dup2). Used by close() to avoid freeing resources still
+    /// referenced by a dup'd fd — prevents use-after-free.
+    /// Pipes are excluded — they use a separate ref_count in the Pipe struct.
+    fn hasSharedRef(self: *FdTable, fd: u32) bool {
+        const desc = &self.fds[fd];
+        for (0..MAX_FDS) |i| {
+            if (i == fd) continue;
+            const other = &self.fds[i];
+            if (other.fd_type != desc.fd_type) continue;
+            switch (desc.fd_type) {
+                .ext2_file => if (other.ext2_file_idx == desc.ext2_file_idx) return true,
+                .fat32_file => if (other.fat32_file_idx == desc.fat32_file_idx) return true,
+                .tcp_socket => if (other.tcb_idx == desc.tcb_idx) return true,
+                .epoll => if (other.epoll_idx == desc.epoll_idx) return true,
+                .unix_socket => if (other.unix_sock_idx == desc.unix_sock_idx) return true,
+                .timerfd => if (other.timerfd_idx == desc.timerfd_idx) return true,
+                .tmpfs_file => if (other.tmpfs_idx == desc.tmpfs_idx) return true,
+                .eventfd => if (other.eventfd_idx == desc.eventfd_idx) return true,
+                .ramdisk_file => if (other.file_data == desc.file_data) return true,
+                else => {},
+            }
+        }
+        return false;
+    }
+
     /// Close a file descriptor.
     pub fn close(self: *FdTable, fd: u32) i64 {
         if (fd >= MAX_FDS) return -1;
         if (fd <= FD_STDERR) return 0;
         const desc = &self.fds[fd];
         if (desc.fd_type == .none) return -1;
+        // v53.47: If another fd shares the same underlying resource (via dup2),
+        // skip resource cleanup — only clear this fd entry.
+        if (desc.fd_type != .pipe_read and desc.fd_type != .pipe_write) {
+            if (self.hasSharedRef(fd)) {
+                desc.* = .{};
+                return 0;
+            }
+        }
         if (desc.fd_type == .pipe_read or desc.fd_type == .pipe_write) {
             pipeClose(desc.pipe_idx);
         }

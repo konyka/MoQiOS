@@ -332,6 +332,17 @@ pub fn addRef(addr: u64) void {
     if (page < total_pages) ref_counts[page] +|= 1;
 }
 
+/// v53.47: Batch increment reference counts — single lock acquisition for
+/// multiple pages. Used by fork COW to avoid N separate lock ops.
+pub fn addRefBatch(addrs: []const u64) void {
+    const flags = lock.acquire();
+    defer lock.release(flags);
+    for (addrs) |addr| {
+        const page = addr / PAGE_SIZE;
+        if (page < total_pages) ref_counts[page] +|= 1;
+    }
+}
+
 /// Decrement reference count, return new count.
 pub fn decRef(addr: u64) u16 {
     const flags = lock.acquire();
