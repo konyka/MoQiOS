@@ -56,8 +56,10 @@ pub fn handlePacket(src_ip: [4]u8, _: [4]u8, data: [*]const u8, len: u32) void {
     const payload_len = if (udp_len > 8) udp_len - 8 else 0;
     const actual_payload = @min(payload_len, @as(u16, MAX_UDP_PAYLOAD));
 
-    const port_idx = ensurePort(dst_port);
-    if (port_idx == 0xFFFF) return;
+    // v53.49: Only deliver to bound ports — do NOT create new port entries
+    // on receive. Previously this called ensurePort() which accepted packets
+    // for unbound ports (security issue) and did an O(16) scan per packet.
+    const port_idx = findPortIdx(dst_port) orelse return;
 
     for (0..QUEUE_DEPTH) |i| {
         if (!queues[port_idx][i].valid) {

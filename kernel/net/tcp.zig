@@ -1445,17 +1445,21 @@ pub fn isClosed(tcb_idx: u32) bool {
 
 /// Timer tick — called periodically to handle retransmission.
 /// Uses the per-TCB RTO (Jacobson/Karels) instead of a fixed timeout.
-/// v53.14: Per-TCB locking — releases tcp_lock between TCBs so handlePacket
-/// and syscall paths are not blocked for the entire 64-TCB sweep.
+/// v53.49: Single tcp_lock acquisition for the entire active-TCB sweep.
+/// Lock order tcp_lock -> e1000.tx_lock is maintained inside timerTickOne
+/// via sendSegment, so batch processing does not violate lock ordering.
+/// Worst-case hold time for 64 TCBs with retransmits: ~64-320us, well
+/// within the 10ms tick budget.
 pub fn timerTick(ms_elapsed: u32) void {
     var bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
+    if (bm == 0) return;
+    const lock_flags = tcp_lock.acquire();
     while (bm != 0) {
         const idx = @ctz(bm);
         bm &= bm - 1;
-        const lock_flags = tcp_lock.acquire();
         timerTickOne(idx, ms_elapsed);
-        tcp_lock.release(lock_flags);
     }
+    tcp_lock.release(lock_flags);
 }
 
 /// Process timer events for a single TCB. Must be called with tcp_lock held.

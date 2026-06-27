@@ -60,16 +60,8 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
         while (port < 65535) : (port += 1) {
             const idx = udp.ensurePort(port);
             if (idx != 0xFFFF) {
-                var fd_slot: u32 = undefined;
-                var found = false;
-                for (3..t.fd_table.fds.len) |i| {
-                    if (t.fd_table.fds[i].fd_type == .none) {
-                        fd_slot = @intCast(i);
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) return -24; // EMFILE
+                // v53.49: Use allocFd() O(1) bitmap instead of duplicated linear scan
+                const fd_slot = t.fd_table.allocFd() orelse return -24; // EMFILE
                 t.fd_table.fds[fd_slot] = .{
                     .fd_type = .udp_socket,
                     .udp_port = port,
@@ -104,16 +96,8 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
             while (port6 < 65535) : (port6 += 1) {
                 const idx6 = udp.ensurePort(port6);
                 if (idx6 != 0xFFFF) {
-                    var fd_slot6: u32 = undefined;
-                    var found6 = false;
-                    for (3..t.fd_table.fds.len) |i| {
-                        if (t.fd_table.fds[i].fd_type == .none) {
-                            fd_slot6 = @intCast(i);
-                            found6 = true;
-                            break;
-                        }
-                    }
-                    if (!found6) return -24; // EMFILE
+                    // v53.49: Use allocFd() O(1) bitmap instead of duplicated linear scan
+                    const fd_slot6 = t.fd_table.allocFd() orelse return -24; // EMFILE
                     t.fd_table.fds[fd_slot6] = .{
                         .fd_type = .udp_socket,
                         .udp_port = port6,
@@ -131,16 +115,8 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
         // AF_INET + SOCK_RAW (type=3): raw packet socket
         if (domain == 2 and sock_type == 3) {
             // Allocate raw socket fd
-            var fd_slot: u32 = undefined;
-            var found = false;
-            for (3..t.fd_table.fds.len) |i| {
-                if (t.fd_table.fds[i].fd_type == .none) {
-                    fd_slot = @intCast(i);
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) return -24; // EMFILE
+            // v53.49: Use allocFd() O(1) bitmap instead of duplicated linear scan
+            const fd_slot = t.fd_table.allocFd() orelse return -24; // EMFILE
             t.fd_table.fds[fd_slot] = .{
                 .fd_type = .raw_socket,
                 .writable = true,

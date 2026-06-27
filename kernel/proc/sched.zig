@@ -475,8 +475,11 @@ pub fn deliverSignalToRunningTask(t: *task.Task) void {
 
     if (handler_addr == 0) {
         if (!sig_mod.defaultSignalAction(signum)) {
-            t.state = .zombie;
-            t.exit_code = 128 + @as(i32, @intCast(signum));
+            // v53.49: Route through exitTask for proper fd cleanup and parent
+            // wakeup. Previously this directly set zombie state, leaking all
+            // open fds and deadlocking any parent blocked in waitpid().
+            task.exitTask(128 + @as(i32, @intCast(signum)));
+            // exitTask never returns (ends in sti+hlt loop)
         }
         return;
     }

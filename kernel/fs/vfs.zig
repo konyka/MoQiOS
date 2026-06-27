@@ -152,6 +152,9 @@ pub const FileDescriptor = struct {
 /// Per-process FD table.
 pub const FdTable = struct {
     fds: [MAX_FDS]FileDescriptor,
+    /// v53.49: Bitmap tracking free fd slots — bit set = free, bit clear = occupied.
+    /// MAX_FDS=64 fits exactly in one u64. Eliminates O(N) linear scan in allocFd.
+    free_bm: u64 = ~@as(u64, 0b111), // bits 0-2 clear (stdin/stdout/stderr occupied)
 
     /// Comptime-computed default table (stdin/stdout/stderr wired to the
     /// special console). Living in .rodata means init() is just a copy and
@@ -169,13 +172,19 @@ pub const FdTable = struct {
         return default_table;
     }
 
-    /// Allocate a free fd slot. Returns the slot index or null if none available.
+    /// Allocate a free fd slot — O(1) via @ctz on the free bitmap.
+    /// Returns the slot index or null if none available.
     pub fn allocFd(self: *FdTable) ?u32 {
-        var slot: u32 = 3;
-        while (slot < MAX_FDS) : (slot += 1) {
-            if (self.fds[slot].fd_type == .none) return slot;
-        }
-        return null;
+        if (self.free_bm == 0) return null;
+        const slot: u6 = @truncate(@ctz(self.free_bm));
+        self.free_bm &= ~(@as(u64, 1) << slot);
+        return @intCast(slot);
+    }
+
+    /// Release an fd slot back to the free pool. Called by close() and
+    /// on failure paths in open()/createPipe() that allocated but didn't use a slot.
+    pub fn freeFd(self: *FdTable, fd: u32) void {
+        self.free_bm |= @as(u64, 1) << @intCast(fd);
     }
 
     /// Open a file by name. Returns fd index or -1 on failure.
@@ -215,6 +224,7 @@ pub const FdTable = struct {
                 };
                 return @intCast(slot);
             }
+            self.freeFd(slot);
             return -1;
         }
 
@@ -261,12 +271,15 @@ pub const FdTable = struct {
                     } else if (str.eql(file_part, "cmdline")) {
                         pfile = .pid_cmdline;
                     } else {
+                        self.freeFd(slot);
                         return -1;
                     }
                 } else {
+                    self.freeFd(slot);
                     return -1;
                 }
             } else {
+                self.freeFd(slot);
                 return -1;
             }
 
@@ -364,6 +377,7 @@ pub const FdTable = struct {
             }
         }
 
+        self.freeFd(slot);
         return -1;
     }
 
@@ -615,6 +629,7 @@ pub const FdTable = struct {
         if (desc.fd_type != .pipe_read and desc.fd_type != .pipe_write) {
             if (self.hasSharedRef(fd)) {
                 desc.* = .{};
+                self.freeFd(fd);
                 return 0;
             }
         }
@@ -655,6 +670,7 @@ pub const FdTable = struct {
         }
         // proc_file needs no special cleanup
         desc.* = .{};
+        self.freeFd(fd);
         return 0;
     }
 
@@ -662,24 +678,15 @@ pub const FdTable = struct {
     pub fn createPipe(self: *FdTable) i64 {
         const pipe_idx = allocPipe() orelse return -1;
 
-        // Find two free fds
-        var read_fd: u32 = MAX_FDS;
-        var write_fd: u32 = MAX_FDS;
-        var slot: u32 = 3;
-        while (slot < MAX_FDS) : (slot += 1) {
-            if (self.fds[slot].fd_type == .none) {
-                if (read_fd == MAX_FDS) {
-                    read_fd = slot;
-                } else {
-                    write_fd = slot;
-                    break;
-                }
-            }
-        }
-        if (write_fd == MAX_FDS) {
+        const read_fd = self.allocFd() orelse {
             pipeClose(pipe_idx);
             return -1;
-        }
+        };
+        const write_fd = self.allocFd() orelse {
+            self.freeFd(read_fd);
+            pipeClose(pipe_idx);
+            return -1;
+        };
 
         self.fds[read_fd] = .{ .fd_type = .pipe_read, .pipe_idx = pipe_idx };
         self.fds[write_fd] = .{ .fd_type = .pipe_write, .pipe_idx = pipe_idx };
@@ -696,6 +703,7 @@ pub const FdTable = struct {
             _ = self.close(newfd);
         }
         self.fds[newfd] = self.fds[oldfd];
+        self.free_bm &= ~(@as(u64, 1) << @intCast(newfd)); // v53.49: mark newfd occupied
         // Increment pipe ref count if it's a pipe
         if (self.fds[newfd].fd_type == .pipe_read or self.fds[newfd].fd_type == .pipe_write) {
             if (self.fds[newfd].pipe_idx < 16) {

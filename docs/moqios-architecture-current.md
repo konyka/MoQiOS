@@ -1,14 +1,16 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.51.0（v53.48 exitTask fd泄漏修复+getPerCpu %gs优化+destroyUserSpace批量释放）
+> **版本**: v0.51.0（v53.49 信号杀死路径exitTask+UDP安全修复+TCP批量锁+FdTable位图）
 > **日期**: 2026-05-29
-> **代码统计**: 内核 40,989 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
+> **代码统计**: 内核 40,982 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
 >   `kernel/net/icmpv6.zig`、`kernel/net/ndp.zig`、`kernel/proc/cap_check.zig`、
 >   `kernel/arch/arch.zig`、`kernel/arch/x86_64/arch_impl.zig`、`kernel/arch/riscv64/arch_impl.zig`），
 >   用户空间 2,244 行 C/ASM
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
+>
+> **2026-05-29 更新 (v53.49)**：信号杀死路径exitTask+UDP安全修复+TCP批量锁+FdTable位图优化 — 信号杀死路径路由到exitTask修复fd泄漏和waitpid死锁 (deliverSignalToRunningTask在handler_addr==0且defaultSignalAction返回false时，从直接设置zombie改为调用task.exitTask()，确保fd关闭/父进程唤醒/kickCpu全部执行)、UDP handlePacket安全修复 (从ensurePort改为findPortIdx，不再为未绑定端口创建表目，丢弃未绑定端口包防安全漏洞)、TCP timerTick单次锁优化 (从逐TCB获取/释放tcp_lock改为单次锁覆盖全扫描，消除63次冗余锁操作，bm==0提前返回)、FdTable free_bm位图优化 (新增u64位图字段+freeFd方法，allocFd从O(N)线性扫描改为O(1) @ctz位操作，close/dup2/createPipe/open全路径正确维护位图一致性，socket_syscall.zig 3处重复内联扫描统一替换为allocFd()调用)。
 >
 > **2026-05-29 更新 (v53.48)**：exitTask fd泄漏修复+getPerCpu %gs优化+destroyUserSpace批量释放 — exitTask新增fd批量关闭循环防止进程退出时TCP/pipe/ext2/epoll资源永久泄漏 (fd 3..MAX_FDS逐个close，hasSharedRef正确处理dup2共享)、getPerCpu rdmsr序列化指令消除 (5个热路径函数getCurrentIdx/setCurrentIdx/getSlice/setSlice/currentCpuId从rdmsr(~150 cycles)改为%gs:offset直接访问(~5 cycles)，30×加速，comptime断言验证PerCpu偏移量)、pmm.freePageBatch批量释放 (单次锁批量释放多个物理页，双重释放静默跳过)、destroyUserSpace批量freePage优化 (128项栈缓冲区分批释放用户页，O(N)锁操作降为O(N/128))。
 >
