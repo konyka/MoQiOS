@@ -78,7 +78,9 @@ pub fn sendSignal(target_tid: u32, signum: u32) bool {
 /// Returns the lowest signal number, or null if none.
 /// v53.44: O(1) with @ctz instead of O(31) linear scan.
 pub fn dequeueSignal(t: *task.Task) ?u32 {
-    const pending = @atomicLoad(u32, &t.pending_signals, .seq_cst) & ~t.signal_mask;
+    // v53.45: Mask bit 31 — signals 1-31 only, @ctz returning 31 would
+    // index signal_handlers[31] which is out of bounds (array has 31 slots, 0-30).
+    const pending = (@atomicLoad(u32, &t.pending_signals, .seq_cst) & ~t.signal_mask) & 0x7FFFFFFF;
     if (pending == 0) return null;
 
     const bit: u5 = @intCast(@ctz(pending));

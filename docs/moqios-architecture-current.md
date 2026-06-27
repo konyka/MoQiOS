@@ -1,14 +1,16 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.51.0（v53.44 SMP并发安全修复 — slab/futex/ipc/signal原子化+UAF修复+CLOEXEC）
+> **版本**: v0.51.0（v53.45 正确性修复+性能优化 — read()数据丢失+信号活锁+taskIndexOf O(1)+pmm锁I/O）
 > **日期**: 2026-05-29
-> **代码统计**: 内核 40,812 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
+> **代码统计**: 内核 40,815 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
 >   `kernel/net/icmpv6.zig`、`kernel/net/ndp.zig`、`kernel/proc/cap_check.zig`、
 >   `kernel/arch/arch.zig`、`kernel/arch/x86_64/arch_impl.zig`、`kernel/arch/riscv64/arch_impl.zig`），
 >   用户空间 2,244 行 C/ASM
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
+>
+> **2026-05-29 更新 (v53.45)**：正确性修复+性能优化 — file_io read() 1字节未copyToUser到用户空间修复 (数据丢失bug)、signal dequeueSignal @ctz越界防护 (bit 31掩码0x7FFFFFFF防signal_handlers[31]越界)、信号投递活锁修复 (pushSignalFrame失败时不再re-queue，避免用户栈永久不可用时无限重试)、taskIndexOf O(1)优化 (Task新增self_idx字段，pickNext热路径从O(64)线性扫描改为O(1)直接返回)、pmm freePage持锁serial I/O修复 (double-free告警释放锁后再打印，避免~4ms阻塞所有CPU页面分配)。
 >
 > **2026-05-29 更新 (v53.44)**：SMP并发安全大修复 — slab分配器IrqSpinlock保护free_list (SMP数据竞争)、futex WaitNode UAF修复 (非授权唤醒removeWaitNode清理+REQUEUE同bucket死锁+地址排序锁防AB-BA+CMP_REQUEUE检查addr+Linux ABI参数修正r10/r8/r9)、IPC全局ipc_lock保护endpoint操作 (receive锁释放→forceReschedule→重获)、sendSignal@atomicRmw(.Or)原子化+dequeueSignal@ctz O(1)查找+pushSignalFrame copyToUser验证+调用方检查、sysv_sem持锁加入队列防丢失唤醒、execve O_CLOEXEC FD调用close()资源回收、sched alarm/itimer直接设置pending_signals消除O(n)sendSignal。
 >
@@ -1107,7 +1109,7 @@ LAPIC Timer 中断
 
 ## 9. 信号处理
 
-**源文件**: `kernel/proc/signal.zig` (204 行)
+**源文件**: `kernel/proc/signal.zig` (206 行)
 
 - 支持信号: SIGINT (2), SIGILL (4), SIGFPE (8), SIGKILL (9), SIGSEGV (11), SIGTERM (15), SIGUSR1 (10), SIGUSR2 (12), SIGPIPE (13), SIGCHLD (20) 等
 - `sigaction()`: 注册信号处理函数
@@ -1307,7 +1309,7 @@ kernel/main.zig
 
 | 文件 | 行数 | 功能 |
 |---|---|---|
-| kernel/arch/x86_64/syscall_entry.zig | 5,052 | 系统调用入口 + 383 dispatch 条目 (v53.44 futex参数映射修正+pushSignalFrame调用方检查) |
+| kernel/arch/x86_64/syscall_entry.zig | 5,049 | 系统调用入口 + 383 dispatch 条目 (v53.44 futex参数映射修正+pushSignalFrame调用方检查，v53.45 信号投递活锁修复) |
 | kernel/net/tcp.zig | 1,879 | TCP 协议 (Reno/SACK/WS/TS/CORK/QUICKACK + @memcpy环形缓冲区 + v53.41 epollNotify锁外延迟) |
 | kernel/fs/vfs.zig | ~720 | 虚拟文件系统 + MAX_FDS=64 + procfs 路由 + inotify + allocFd |
 | kernel/arch/x86_64/idt.zig | 786 | 中断描述符表 + IRQ 分发 + COW #PF 处理 |
@@ -1320,10 +1322,10 @@ kernel/main.zig
 | kernel/fs/ext2.zig | 3,311 | ext2 文件系统 (DMA安全I/O+readBlockDirect+allocInode零拷贝+readPageAndRecord+insertPageOwned零拷贝+hardlink/symlink/unlink/chown/chmod/xattr/walkPathResolve/writeFile零拷贝+invalidateInode) |
 | kernel/fs/fat32.zig | 859 | FAT32 文件系统 (FAT缓存+DMA安全+多扇区写+allocCluster游标+readFile/writeFile簇链缓存+部分簇批量化I/O) |
 | kernel/proc/scheduler.zig | ~500 | O(1) 位图调度器 |
-| kernel/proc/task.zig | ~704 | Task 结构体 + 进程管理 |
+| kernel/proc/task.zig | 800 | Task 结构体 + 进程管理 (v53.45 self_idx字段O(1)反查) |
 | kernel/drivers/virtio_blk.zig | 545 | virtio-blk 块设备驱动 (多设备+DMA安全) |
 | kernel/drivers/nvme.zig | ~690 | NVMe SSD 驱动 (多队列, 最多4 I/O SQ/CQ对) |
-| kernel/mm/pmm.zig | 369 | 物理内存管理 (两级位图 + refcount + COW API，v53.39 修复双重释放锁) |
+| kernel/mm/pmm.zig | 373 | 物理内存管理 (两级位图 + refcount + COW API，v53.39 修复双重释放锁，v53.45 freePage锁释放后serial I/O) |
 | kernel/mm/slab.zig | 232 | Slab 分配器 (v53.39 _pad u16修复大分配页数截断，v53.44 IrqSpinlock保护free_list) |
 | kernel/mm/swap.zig | ~267 | Swap 页面置换 (Clock算法 + u64位图@ctz分配) |
 | kernel/fs/eventfd.zig | 165 | eventfd 事件通知 |

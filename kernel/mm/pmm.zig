@@ -298,13 +298,16 @@ pub fn reservePage(phys: u64) void {
 /// Free a physical page (decrement ref count, free if zero).
 pub fn freePage(addr: u64) void {
     const flags = lock.acquire();
-    defer lock.release(flags);
 
     const page = addr / PAGE_SIZE;
-    if (page >= total_pages) return;
+    if (page >= total_pages) {
+        lock.release(flags);
+        return;
+    }
     if (ref_counts[page] == 0) {
-        // v53.39: Don't manually release lock — defer handles it (W fix: double-release)
-        // serial has its own lock; holding PMM lock briefly is acceptable
+        // v53.45: Release lock before serial I/O — holding pmm.lock during
+        // UART output (~4ms for 50+ chars) blocks all CPUs' page alloc/free.
+        lock.release(flags);
         serial.writeString("[PMM] BUG: double-free of page ");
         fmt.writeDecimal64(page);
         serial.writeString(" at addr 0x");
@@ -318,6 +321,7 @@ pub fn freePage(addr: u64) void {
         free_pages += 1;
         if (page < next_free_hint) next_free_hint = page;
     }
+    lock.release(flags);
 }
 
 /// Increment reference count (for CoW).

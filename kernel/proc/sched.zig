@@ -415,15 +415,9 @@ fn pickNext() ?u32 {
     return task.pickReadyForCpu(@intCast(currentCpuId()), getCurrentIdx());
 }
 
-/// Reverse-lookup a Task pointer to its slot index in the global table.
-fn taskIndexOf(t: *task.Task) ?u32 {
-    var i: u32 = 0;
-    while (i < task.MAX_TASKS) : (i += 1) {
-        if (task.getTask(i)) |s| {
-            if (s == t) return i;
-        }
-    }
-    return null;
+/// v53.45: O(1) reverse lookup via Task.self_idx (set at creation time).
+inline fn taskIndexOf(t: *task.Task) ?u32 {
+    return t.self_idx;
 }
 
 /// Place a ready task on its target CPU's run queue (Task #2). Falls back
@@ -484,12 +478,9 @@ pub fn deliverSignalToRunningTask(t: *task.Task) void {
 
     const result = sig_mod.pushSignalFrame(t, signum, user_rsp, user_rip, user_rflags);
 
-    // v53.44: Check if signal delivery failed (user stack unmapped/too small)
-    if (result.new_rsp == 0) {
-        // Re-queue the signal for next attempt and skip delivery
-        _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << @intCast(signum - 1), .seq_cst);
-        return;
-    }
+    // v53.45: Drop signal if delivery fails — avoids livelock when user stack
+    // is permanently unmapped. Signal was already dequeued by dequeueSignal.
+    if (result.new_rsp == 0) return;
 
     // Modify the InterruptFrame to jump to the signal handler
     iframe.rip = handler_addr;

@@ -2654,12 +2654,9 @@ pub fn checkSignalsOnSyscallReturn(frame: *SyscallFrame) void {
 
     const result = sig_mod.pushSignalFrame(current, signum, user_rsp, user_rip, user_rflags);
 
-    // v53.44: Check if signal delivery failed (user stack unmapped/too small)
-    if (result.new_rsp == 0) {
-        // Re-queue the signal for next attempt and skip delivery
-        _ = @atomicRmw(u32, &current.pending_signals, .Or, @as(u32, 1) << @intCast(signum - 1), .seq_cst);
-        return;
-    }
+    // v53.45: Drop signal if delivery fails — avoids livelock when user stack
+    // is permanently unmapped. Signal was already dequeued by dequeueSignal.
+    if (result.new_rsp == 0) return;
 
     frame.rdi = signum;
     frame.rcx = handler_addr;

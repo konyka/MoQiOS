@@ -91,8 +91,12 @@ pub fn read(fd: u32, buf_ptr: u64, count: u64) i64 {
         if (written < @as(usize, @intCast(result))) break;
     }
     if (pos == 0 and n > 0) {
+        // v53.45: Fix 1-byte read not being copied to user space
         var tmp: [1]u8 = undefined;
         const r = cur.fd_table.read(fd, &tmp, 1);
+        if (r > 0) {
+            _ = copy.copyToUser(@ptrFromInt(buf_ptr), &tmp, 1);
+        }
         return @bitCast(r);
     }
     return @intCast(pos);

@@ -41,6 +41,8 @@ pub const WaitNode = struct {
 
 pub const Task = struct {
     tid: u32,
+    /// v53.45: Slot index for O(1) reverse lookup (set by create functions).
+    self_idx: u32 = 0,
     state: TaskState,
     priority: u8,
     /// CPU affinity. -1 = no pin (eligible for any CPU / work-stealing);
@@ -417,6 +419,7 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     next_tid += 1;
 
     zeroSlot(slot);
+    tasks[slot].self_idx = slot;
     tasks[slot].tid = tid;
     tasks[slot].state = .ready;
     tasks[slot].priority = priority;
@@ -461,6 +464,7 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     const tid = next_tid;
     next_tid += 1;
     zeroSlot(slot);
+    tasks[slot].self_idx = slot;
     tasks[slot].tid = tid;
     tasks[slot].state = .ready;
     tasks[slot].priority = priority;
@@ -656,6 +660,7 @@ pub fn createUserProcess(
     // Build the (large) Task in place in its slot (see the note on
     // createKernelThread) to avoid overflowing the kernel stack.
     zeroSlot(slot);
+    tasks[slot].self_idx = slot;
     tasks[slot].tid = tid;
     tasks[slot].state = .ready;
     tasks[slot].priority = 1;
