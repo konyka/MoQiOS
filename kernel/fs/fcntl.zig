@@ -26,11 +26,15 @@ pub const O_APPEND: u32 = 0x400;
 /// Returns new fd or negative errno.
 fn dupFd(fd_table: *vfs.FdTable, fd: u32, min_fd: u32, new_flags: u32) i64 {
     if (min_fd >= vfs.MAX_FDS) return -22; // EINVAL
-    var slot: u32 = min_fd;
-    while (slot < vfs.MAX_FDS) : (slot += 1) {
-        if (fd_table.fds[slot].fd_type == .none) break;
-    }
-    if (slot >= vfs.MAX_FDS) return -24; // EMFILE
+    // v53.50: Use free_bm bitmap — find first free slot >= min_fd (O(1)).
+    // Previously used linear scan (fds[slot].fd_type == .none) which bypassed
+    // the bitmap, causing allocFd() to later return the same slot.
+    const min_shift: u6 = @intCast(min_fd);
+    const mask: u64 = ~((@as(u64, 1) << min_shift) - 1);
+    const avail = fd_table.free_bm & mask;
+    if (avail == 0) return -24; // EMFILE
+    const slot: u6 = @truncate(@ctz(avail));
+    fd_table.free_bm &= ~(@as(u64, 1) << slot);
     fd_table.fds[slot] = fd_table.fds[fd];
     fd_table.fds[slot].fd_flags = new_flags;
     // Increment pipe ref count if it's a pipe

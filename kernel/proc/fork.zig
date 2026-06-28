@@ -34,6 +34,11 @@ pub fn fork(frame: *SyscallFrame) i64 {
 
     child.brk_current = parent.brk_current;
 
+    // v53.50: Copy free_bm bitmap — child inherits parent's fd occupancy state.
+    // Without this, child's free_bm stays at default (only bits 0-2 occupied),
+    // causing allocFd() to return already-occupied slots and corrupt fds.
+    child.fd_table.free_bm = parent.fd_table.free_bm;
+
     for (0..vfs_mod.MAX_FDS) |i| {
         child.fd_table.fds[i] = parent.fd_table.fds[i];
         switch (child.fd_table.fds[i].fd_type) {

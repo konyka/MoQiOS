@@ -406,17 +406,30 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
             @memcpy(buf[total_read .. total_read + chunk], cached[current_offset_in_cluster .. current_offset_in_cluster + chunk]);
         } else {
             // Cache miss — read from disk
-            const sector_buf: [*]u8 = @ptrFromInt(sector_buf_virt);
             if (fat32_sectors_per_cluster <= 8) {
-                // Cluster fits in 4KB buffer — read full cluster
-                _ = virtio_blk.readSectors(lba, fat32_sectors_per_cluster, sector_buf);
-                const avail = cluster_size - current_offset_in_cluster;
-                chunk = if (total_read + avail > to_read) to_read - total_read else avail;
-                @memcpy(buf[total_read .. total_read + chunk], sector_buf[current_offset_in_cluster .. current_offset_in_cluster + chunk]);
-                const page_data: *const [4096]u8 = sector_buf[0..4096];
-                _ = page_cache.insertPage(inode_id, cluster_page_idx, page_data, cluster_size);
+                // v53.50: Use insertPageOwned to avoid cache_lock→pmm.lock nested lock.
+                // Allocate page outside cache_lock, read directly into it, transfer ownership.
+                const tmp_phys = pmm.allocPage();
+                if (tmp_phys) |tp| {
+                    const tmp: [*]u8 = @ptrFromInt(hhdm.physToVirt(tp));
+                    _ = virtio_blk.readSectors(lba, fat32_sectors_per_cluster, tmp);
+                    const avail = cluster_size - current_offset_in_cluster;
+                    chunk = if (total_read + avail > to_read) to_read - total_read else avail;
+                    @memcpy(buf[total_read .. total_read + chunk], tmp[current_offset_in_cluster .. current_offset_in_cluster + chunk]);
+                    if (page_cache.insertPageOwned(inode_id, cluster_page_idx, tp, cluster_size) == null) {
+                        pmm.freePage(tp); // Cache full
+                    }
+                } else {
+                    // OOM fallback: use global buffer without caching
+                    const sector_buf: [*]u8 = @ptrFromInt(sector_buf_virt);
+                    _ = virtio_blk.readSectors(lba, fat32_sectors_per_cluster, sector_buf);
+                    const avail = cluster_size - current_offset_in_cluster;
+                    chunk = if (total_read + avail > to_read) to_read - total_read else avail;
+                    @memcpy(buf[total_read .. total_read + chunk], sector_buf[current_offset_in_cluster .. current_offset_in_cluster + chunk]);
+                }
             } else {
                 // Cluster > 4KB — read only needed sectors to avoid buffer overflow
+                const sector_buf: [*]u8 = @ptrFromInt(sector_buf_virt);
                 const sector_in_cluster = current_offset_in_cluster / SECTOR_SIZE;
                 const offset_in_sector = current_offset_in_cluster % SECTOR_SIZE;
                 const sectors_to_read = @min(fat32_sectors_per_cluster - sector_in_cluster, 8);

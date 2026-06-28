@@ -3907,15 +3907,14 @@ fn syscallMemfdCreate(name_ptr: u64, flags: u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = tm.getTask(cur_idx) orelse return -1;
 
-    // Find free fd slot
-    var fd_slot: u32 = 0;
-    while (fd_slot < vfs_mod.MAX_FDS) : (fd_slot += 1) {
-        if (t.fd_table.fds[fd_slot].fd_type == .none) break;
-    }
-    if (fd_slot >= vfs_mod.MAX_FDS) return -24; // EMFILE
+    // v53.50: Use allocFd() — previously used linear scan bypassing free_bm bitmap
+    const fd_slot = t.fd_table.allocFd() orelse return -24; // EMFILE
 
     // Allocate an anonymous pipe as memfd (reusing pipe infrastructure)
-    const pipe_idx = vfs_mod.allocPipe() orelse return -28; // ENOSPC
+    const pipe_idx = vfs_mod.allocPipe() orelse {
+        t.fd_table.freeFd(fd_slot); // v53.50: restore fd slot on allocPipe failure
+        return -28; // ENOSPC
+    };
     // allocPipe sets ref_count=2 (for read+write ends), but memfd is a single fd.
     // Reduce ref_count to 1 since we only hold one reference.
     vfs_mod.pipes[pipe_idx].ref_count = 1;

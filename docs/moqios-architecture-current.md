@@ -1,14 +1,16 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.51.0（v53.49 信号杀死路径exitTask+UDP安全修复+TCP批量锁+FdTable位图）
+> **版本**: v0.51.0（v53.50 free_bm同步修复+fat32嵌套锁消除+TCP accept环形队列+ext2零拷贝）
 > **日期**: 2026-05-29
-> **代码统计**: 内核 40,982 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
+> **代码统计**: 内核 41,008 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
 >   `kernel/net/icmpv6.zig`、`kernel/net/ndp.zig`、`kernel/proc/cap_check.zig`、
 >   `kernel/arch/arch.zig`、`kernel/arch/x86_64/arch_impl.zig`、`kernel/arch/riscv64/arch_impl.zig`），
 >   用户空间 2,244 行 C/ASM
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
+>
+> **2026-05-29 更新 (v53.50)**：free_bm同步修复+fat32嵌套锁消除+TCP accept环形队列+ext2零拷贝目录遍历 — v53.49引入的free_bm位图在fork/clone/fcntl/memfd_create 4处绕过allocFd的路径未同步修复 (fork.zig和clone.zig复制free_bm到子进程、fcntl.zig dupFd改用free_bm位图O(1)查找、syscall_entry.zig syscallMemfdCreate改用allocFd()，allocPipe失败时freeFd回滚)、fat32 readFile缓存插入路径从insertPage改为insertPageOwned (消除cache_lock→pmm.lock嵌套锁，数据直接读入PMM页面后零拷贝转移所有权，OOM时fallback到全局缓冲区不缓存)、TCP accept队列从O(N)数组移位改为O(1)环形缓冲区 (pending_head/pending_tail+取模索引，LISTEN_BACKLOG=32)、ext2 readDirEntries从函数级allocPage/freePage改为per-block cacheLookupPtr零拷贝模式 (cache命中时直接使用缓存指针，cache未命中时临时页读取后释放，与findDirEntry一致)。
 >
 > **2026-05-29 更新 (v53.49)**：信号杀死路径exitTask+UDP安全修复+TCP批量锁+FdTable位图优化 — 信号杀死路径路由到exitTask修复fd泄漏和waitpid死锁 (deliverSignalToRunningTask在handler_addr==0且defaultSignalAction返回false时，从直接设置zombie改为调用task.exitTask()，确保fd关闭/父进程唤醒/kickCpu全部执行)、UDP handlePacket安全修复 (从ensurePort改为findPortIdx，不再为未绑定端口创建表目，丢弃未绑定端口包防安全漏洞)、TCP timerTick单次锁优化 (从逐TCB获取/释放tcp_lock改为单次锁覆盖全扫描，消除63次冗余锁操作，bm==0提前返回)、FdTable free_bm位图优化 (新增u64位图字段+freeFd方法，allocFd从O(N)线性扫描改为O(1) @ctz位操作，close/dup2/createPipe/open全路径正确维护位图一致性，socket_syscall.zig 3处重复内联扫描统一替换为allocFd()调用)。
 >

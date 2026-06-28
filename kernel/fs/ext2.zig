@@ -1091,10 +1091,6 @@ pub fn readDirEntries(file_idx: u32, start_offset: u32, names: [*][256]u8, name_
     const dir_size = f.inode.size;
     if (start_offset >= dir_size) return .{ .count = 0, .new_offset = start_offset };
 
-    const buf_phys = pmm.allocPage() orelse return .{ .count = 0, .new_offset = start_offset };
-    defer pmm.freePage(buf_phys);
-    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
-
     var offset = start_offset;
     var count: u32 = 0;
 
@@ -1102,7 +1098,20 @@ pub fn readDirEntries(file_idx: u32, start_offset: u32, names: [*][256]u8, name_
         const block_num = offset / block_size;
         const phys_block = resolveBlock(&f.inode, block_num);
         if (phys_block == 0) break;
-        if (!readBlock(phys_block, buf)) break;
+
+        // v53.50: Zero-copy cache lookup — avoids per-call allocPage/freePage.
+        // Same pattern as findDirEntry: cache hit → direct pointer; cache miss →
+        // alloc temp page, readBlock inserts into cache, get pointer, free temp.
+        var buf: [*]const u8 = undefined;
+        if (cacheLookupPtr(phys_block)) |cached| {
+            buf = cached;
+        } else {
+            const buf_phys = pmm.allocPage() orelse break;
+            defer pmm.freePage(buf_phys);
+            const tmp: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+            if (!readBlock(phys_block, tmp)) break;
+            buf = cacheLookupPtr(phys_block) orelse break;
+        }
 
         const pos_in_block = offset % block_size;
         var pos: u32 = pos_in_block;
@@ -1112,8 +1121,7 @@ pub fn readDirEntries(file_idx: u32, start_offset: u32, names: [*][256]u8, name_
             if (entry.rec_len == 0) break;
 
             if (entry.inode != 0 and entry.name_len > 0) {
-                // v53.3: copy name data instead of storing dangling pointer
-                // (buf is freed by defer pmm.freePage after function returns)
+                // v53.3: copy name data to caller's output array
                 const nlen: usize = @intCast(entry.name_len);
                 @memcpy(names[count][0..nlen], buf[pos + @sizeOf(Ext2DirEntry) ..][0..nlen]);
                 name_lens[count] = entry.name_len;

@@ -719,7 +719,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
     }
 
     // Check backlog capacity
-    if (ls.pending_count >= LISTEN_BACKLOG) return;
+    if (ls.pending_tail -% ls.pending_head >= LISTEN_BACKLOG) return;
 
     // Allocate a new TCB for this connection
     const new_tcb = allocTcb() orelse return;
@@ -761,8 +761,8 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
     const new_idx = tcbIdx(new_tcb);
 
     // Queue in listen backlog (will be moved to established when ACK arrives)
-    ls.pending_tpbs[ls.pending_count] = new_idx;
-    ls.pending_count += 1;
+    ls.pending_tpbs[ls.pending_tail % LISTEN_BACKLOG] = new_idx;
+    ls.pending_tail += 1;
 }
 
 pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) void {
@@ -1601,7 +1601,9 @@ const ListenSlot = struct {
     local_port: u16 = 0,
     owner_task: u32 = 0,
     pending_tpbs: [LISTEN_BACKLOG]u32, // TCB indices of pending connections (SYN_RECEIVED)
-    pending_count: u32 = 0,
+    // v53.50: Ring buffer indices — O(1) enqueue/dequeue instead of O(N) array shift
+    pending_head: u32 = 0,
+    pending_tail: u32 = 0,
 };
 
 var listen_slots: [MAX_CONNECTIONS]ListenSlot = @splat(.{
@@ -1609,7 +1611,8 @@ var listen_slots: [MAX_CONNECTIONS]ListenSlot = @splat(.{
     .local_port = 0,
     .owner_task = 0,
     .pending_tpbs = @splat(0),
-    .pending_count = 0,
+    .pending_head = 0,
+    .pending_tail = 0,
 });
 
 /// Bitmap tracking active listen slots (1 = active).
@@ -1674,7 +1677,8 @@ pub fn tcpListen(tcb_idx: u32) i64 {
     listen_slots[i].active = true;
     listen_slots[i].local_port = tcb.local_port;
     listen_slots[i].owner_task = tcb.owner_task;
-    listen_slots[i].pending_count = 0;
+    listen_slots[i].pending_head = 0;
+    listen_slots[i].pending_tail = 0;
     listen_slots[i].pending_tpbs = @splat(0);
     return 0;
 }
@@ -1701,17 +1705,11 @@ pub fn tcpAccept(tcb_idx: u32, owner_task: u32) i64 {
     }
     const ls = slot orelse return -1;
 
-    if (ls.pending_count == 0) return 0; // No pending connections
+    if (ls.pending_head == ls.pending_tail) return 0; // No pending connections
 
-    // Get the first pending TCB
-    const pending_idx = ls.pending_tpbs[0];
-
-    // Shift the queue
-    var j: u32 = 0;
-    while (j < ls.pending_count - 1) : (j += 1) {
-        ls.pending_tpbs[j] = ls.pending_tpbs[j + 1];
-    }
-    ls.pending_count -= 1;
+    // v53.50: O(1) ring buffer dequeue — no array shift needed
+    const pending_idx = ls.pending_tpbs[ls.pending_head % LISTEN_BACKLOG];
+    ls.pending_head += 1;
 
     if (pending_idx >= MAX_CONNECTIONS) return -1;
     const new_tcb = &tcbs[pending_idx];

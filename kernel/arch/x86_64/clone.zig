@@ -174,6 +174,8 @@ pub fn clone(
     child.stack_limit = parent.stack_limit;
 
     // CLONE_FILES: share fd table (currently always copies)
+    // v53.50: Copy free_bm bitmap — child inherits parent's fd occupancy state.
+    child.fd_table.free_bm = parent.fd_table.free_bm;
     for (0..vfs_mod.MAX_FDS) |i| {
         child.fd_table.fds[i] = parent.fd_table.fds[i];
         if (child.fd_table.fds[i].fd_type == .pipe_read or child.fd_table.fds[i].fd_type == .pipe_write) {
