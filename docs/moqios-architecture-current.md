@@ -71,7 +71,7 @@ MoQiOS 是一个运行在 x86_64 架构上的**单体内核** (Monolithic Kernel
 | 引导协议 | Limine Boot Protocol |
 | 地址空间模型 | HHDM (Higher-Half Direct Map) |
 | 最大进程数 | 64 (MAX_TASKS) |
-| 内核栈大小 | 16 页 = 64KB (KERNEL_STACK_PAGES) |
+| 内核栈大小 | 32 页 = 128KB (KERNEL_STACK_PAGES) |
 | 用户代码段基址 | 0x00400000 (4MB) |
 | 用户栈顶 | 0x00800000 (8MB) |
 | 系统调用数量 | 383 dispatch 条目 (max #471, #0-#330 连续 + Linux #424-#471 完全连续) |
@@ -551,8 +551,10 @@ QEMU / 真机
 
 ### 3.4 内核栈
 
-每个任务分配 KERNEL_STACK_PAGES=16 页 (64KB) 内核栈。
-64KB 是必要的，因为网络系统调用链中的缓冲区可达 2048 字节，
+每个任务分配 KERNEL_STACK_PAGES=32 页 (128KB) 内核栈。
+栈位于固定高半区虚拟窗口，物理页逐页分配并映射到 kernel PML4，避免任务创建热路径依赖
+`pmm.allocContiguous(16)` 的长扫描/碎片化风险，也避免重映射 HHDM 大页。
+128KB 是必要的，因为网络系统调用链中的缓冲区可达 2048 字节，
 嵌套调用会超过 32KB 栈空间。
 
 ---

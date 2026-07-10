@@ -192,8 +192,8 @@ iso_root/
 ├── boot/
 │   ├── limine/
 │   │   └── limine.conf
-│   ├── kernel.elf
-│   └── ramdisk.mrd
+│   ├── moqi-kernel.elf
+│   └── ramdisk.bin
 └── EFI/BOOT/
     └── BOOTX64.EFI
 ```
@@ -239,11 +239,13 @@ qemu-system-x86_64 \
 | `zig build run` | 编译并启动 QEMU 仿真 |
 | `zig build debug` | 启动 QEMU 并在 1234 端口监听 GDB（`-s -S`） |
 | `zig build test` | 在主机目标运行 `tests/main.zig` 单元测试，覆盖可脱离硬件执行的共享库逻辑 |
+| `zig build smoke` | 单核 QEMU 限时冒烟测试，串口日志需出现当前 init 自动序列末尾 `hello21 done` 和 `MoQiOS shell` |
+| `zig build smoke-smp` | 双核 QEMU 限时冒烟测试，验证 AP/SMP 启动路径仍能跑完整个 init 测试序列 |
 
 调试连接：
 
 ```
-gdb zig-out/bin/kernel.elf
+gdb zig-out/bin/moqi-kernel.elf
 (gdb) target remote :1234
 (gdb) c
 ```
@@ -254,11 +256,12 @@ gdb zig-out/bin/kernel.elf
 
 | 路径 | 说明 |
 |---|---|
-| `zig-out/bin/kernel.elf` | 内核镜像 |
+| `zig-out/bin/moqi-kernel.elf` | x86_64 内核镜像 |
+| `zig-out/bin/moqi-kernel-riscv64.elf` | riscv64 skeleton 内核镜像 |
 | `user/*.elf` | 用户程序 ELF |
-| `user/*.bin` | 用户程序纯二进制（无 ELF 头） |
+| `user/*.bin` | 用户程序装载镜像；C 程序当前为静态 freestanding ELF，汇编入口程序为 flat binary |
 | `user_bin/` | 复制后的可执行文件目录 |
-| `iso_root/boot/ramdisk.mrd` | 打包好的 ramdisk |
+| `iso_root/boot/ramdisk.bin` | 打包好的 ramdisk |
 | `moqios.iso` | 最终 ISO |
 | `disk.img` | virtio-blk 后端磁盘镜像 |
 | `ext2.img` | ext2 测试镜像 |

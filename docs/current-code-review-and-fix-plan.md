@@ -1,8 +1,8 @@
 # MoQiOS Current Code Review And Fix Plan
 
-> Review date: 2026-06-21  
-> Last update: 2026-06-21 (M8-5b-3 / M8-6 / M8-7 SMP performance triplet completed)  
-> Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.  
+> Review date: 2026-06-21
+> Last update: 2026-07-10 (bounded x86_64 smoke gates added)
+> Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
 ## 1. Current Architecture From Code
@@ -146,7 +146,7 @@ shared address-space modification needs ranged TLB shootdown):
 With FPU per-task and ranged TLB shootdown in place, user tasks can now safely migrate across
 CPUs through work-stealing. AP cores actively pick up unpinned user tasks instead of idling.
 
-### P1 - Automated Tests Are Too Narrow For Current Claims
+### P1 - Automated Tests Are Too Narrow For Current Claims ✅ PARTIALLY RESOLVED 2026-07-10
 
 Evidence:
 
@@ -160,6 +160,17 @@ Fix plan:
 1. Keep host unit tests for pure library code.
 2. Add a bounded serial-log QEMU smoke test script that checks for `MoQiOS shell` and expected `hello*` completion markers.
 3. Add separate gates for `MOQI_SMP=1`, `MOQI_SMP=2`, and `-Darch=riscv64` build.
+
+**Resolution (2026-07-10)**: Added `tools/qemu_smoke.sh` plus `zig build smoke` and
+`zig build smoke-smp`. The smoke wrapper builds the x86_64 image, runs QEMU with serial output
+captured to a file, waits for the current init auto-test tail marker `hello21 done` plus
+`MoQiOS shell`, then terminates QEMU instead
+of leaving the interactive shell running forever. `tools/qemu_run.sh` now packages user programs
+through one `USER_PROGRAMS` loop instead of 29 repeated `if`/`cp` branches, keeping the runtime image
+manifest maintainable and avoiding branch-heavy script drift as tests are added.
+
+Remaining gap: these smoke gates still depend on local QEMU/Limine/xorriso availability and are not
+yet wired to a hosted CI runner.
 
 ### P2 - Version And Date Metadata Is Inconsistent
 
@@ -213,8 +224,8 @@ Run these gates before claiming the repository is healthy:
 | Host unit tests | `zig build test` | Pure library helpers still pass |
 | x86_64 build | `zig build` | Main kernel, user programs, AP trampoline build |
 | riscv64 skeleton build | `zig build -Darch=riscv64` | Cross-ISA skeleton still builds |
-| QEMU single-core smoke | `MOQI_SMP=1 zig build run` or script wrapper | Kernel reaches shell and runs user tests |
-| QEMU dual-core smoke | `MOQI_SMP=2 zig build run` or script wrapper | AP bring-up path remains stable |
+| QEMU single-core smoke | `zig build smoke` | Kernel reaches shell after current init auto-test tail marker `hello21 done` |
+| QEMU dual-core smoke | `zig build smoke-smp` | AP bring-up path remains stable through the full init sequence |
 
 If QEMU or toolchain pieces are unavailable, record that as a verification gap instead of treating host tests as a substitute.
 
@@ -222,7 +233,7 @@ If QEMU or toolchain pieces are unavailable, record that as a verification gap i
 
 1. ~~Correct documentation status claims and keep this review linked from primary docs.~~ Done.
 2. Add reachability/dispatch classification for kernel modules.
-3. Add automated QEMU smoke gates.
+3. ~~Add automated QEMU smoke gates.~~ ✅ Done 2026-07-10 (`zig build smoke`, `zig build smoke-smp`).
 4. Stabilize SMP affinity scheduling with repeatable `MOQI_SMP=2` tests.
 5. ~~Implement FPU/SSE task state and ranged TLB shootdown.~~ ✅ Done 2026-06-21 (see P1 resolution).
 6. ~~Replace global scheduler lock with per-CPU queues and work stealing.~~ ✅ Done 2026-06-21
@@ -232,6 +243,40 @@ If QEMU or toolchain pieces are unavailable, record that as a verification gap i
 8. Expand riscv64 from skeleton to shared-kernel boot only through the new arch facade.
 
 ## 5. Verification Results For This Update
+
+Executed on 2026-07-10:
+
+| Gate | Result | Notes |
+|---|---|---|
+| `git status --short --branch` | Passed | Branch `main...origin/main`; clean before this update |
+| `zig build test` | Passed | Host unit tests for pure helper modules |
+| `zig build` | Passed | x86_64 kernel, user programs, and AP trampoline build |
+| `zig build -Darch=riscv64` | Passed | riscv64 skeleton still builds |
+| `zig build smoke` | Passed | Reached `MoQiOS shell` after current `init.S` auto-test tail marker `hello21 done` |
+| `zig build smoke-smp` | Passed | Dual-core QEMU reached the same shell marker with `MOQI_SMP=2` |
+
+The new smoke gates are now executable, but they prove the repository is not yet runtime-clean.
+Do not treat the passing host builds as proof of boot-to-shell health until `zig build smoke` passes.
+
+### 5.1 Runtime Fixes From 2026-07-10 Smoke Testing
+
+The new single-core smoke gate exposed a runtime hang at `spawn("hello2")`. The fix set is:
+
+| Area | Change | Performance/safety impact |
+|---|---|---|
+| PMM contiguous allocation | `allocContiguous` now starts from `next_free_hint` and skips to the first page after a failed run | Avoids repeated low-memory scans for contiguous allocations |
+| Kernel stacks | Task stacks moved from physically contiguous HHDM runs to fixed high-half virtual stack windows backed by per-page PMM allocations; stack size raised to 32 pages / 128KB | Removes task creation dependence on contiguous physical memory and avoids stack-probe double faults |
+| Signal trampoline | `setupSigreturnTrampoline` now reuses one shared trampoline physical page and maps it with `mapPageNoFlush` into new user page tables | Avoids one PMM allocation and unnecessary TLB invalidation per user process |
+| `waitpid` | Blocking wait now queues the parent on child exit waiters and yields via scheduler instead of `hlt`-spinning in the syscall | Fixes single-core parent/child progress and removes polling |
+| COW/copy_to_user | Kernel-mode writes to current user COW pages now resolve through the COW fault path; private-page PTE replacement preserves flags while replacing the physical address | Fixes fork wait-status writes to COW user stacks |
+| User-space teardown | `destroyUserSpace` skips the shared sigreturn trampoline mapping | Prevents repeated frees of the one shared trampoline page |
+
+The 2026-07-10 rerun passed both single-core and dual-core smoke after the COW/copy_to_user and
+shared-trampoline teardown fixes. The remaining documentation gap is broader: older architecture docs
+still describe `hello28` as part of the automatic `init.S` sequence even though current `init.S` enters
+the shell after `hello21`.
+
+### 5.2 Historical Verification
 
 Executed on 2026-06-21:
 
@@ -247,7 +292,7 @@ Executed on 2026-06-21:
 The build/test results prove the code compiles in this environment and the host tests pass. They do not prove runtime
 kernel behavior, filesystem behavior, networking behavior, or SMP boot-to-shell stability.
 
-### 5.1 SMP Performance Triplet (M8-5b-3 / M8-6 / M8-7) Completed 2026-06-21
+### 5.3 SMP Performance Triplet (M8-5b-3 / M8-6 / M8-7) Completed 2026-06-21
 
 | Item | File | Status |
 |---|---|---|

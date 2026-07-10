@@ -184,6 +184,18 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     run_step.dependOn(&run_cmd.step);
 
+    const smoke_step = b.step("smoke", "Run bounded single-core QEMU smoke test");
+    const smoke_cmd = b.addSystemCommand(&.{ "./tools/qemu_smoke.sh", "1" });
+    smoke_cmd.step.dependOn(b.getInstallStep());
+    smoke_cmd.setEnvironmentVariable("MOQI_SMOKE_SKIP_BUILD", "1");
+    smoke_step.dependOn(&smoke_cmd.step);
+
+    const smoke_smp_step = b.step("smoke-smp", "Run bounded dual-core QEMU smoke test");
+    const smoke_smp_cmd = b.addSystemCommand(&.{ "./tools/qemu_smoke.sh", "2" });
+    smoke_smp_cmd.step.dependOn(b.getInstallStep());
+    smoke_smp_cmd.setEnvironmentVariable("MOQI_SMOKE_SKIP_BUILD", "1");
+    smoke_smp_step.dependOn(&smoke_smp_cmd.step);
+
     // Debug with GDB
     const debug_step = b.step("debug", "Build and run in QEMU with GDB stub");
     const debug_cmd = b.addSystemCommand(&.{"./tools/qemu_run.sh"});

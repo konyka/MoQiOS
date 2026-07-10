@@ -255,29 +255,46 @@ pub fn allocContiguous(count: usize) ?u64 {
     const flags = lock.acquire();
     defer lock.release(flags);
 
-    var start: u64 = MIN_ALLOC_PAGE;
-    while (start + count <= total_pages) : (start += 1) {
-        // Check if all pages [start, start+count) are free
-        var all_free = true;
-        for (0..count) |j| {
-            if (!isBitSet(start + j) or ref_counts[start + j] > 0) {
-                all_free = false;
-                start += j; // skip ahead past the used page
-                break;
-            }
-        }
-        if (!all_free) continue;
+    const first = if (next_free_hint >= MIN_ALLOC_PAGE and next_free_hint + count <= total_pages)
+        next_free_hint
+    else
+        MIN_ALLOC_PAGE;
 
-        // Found contiguous free range — allocate all pages
-        for (0..count) |j| {
-            const page = start + j;
-            clearBit(page);
-            ref_counts[page] = 1;
+    var pass: u8 = 0;
+    var start: u64 = first;
+    while (pass < 2) {
+        const limit = if (pass == 0) total_pages else first;
+        while (start + count <= limit) {
+            const candidate = start;
+            var skip_to = start + 1;
+            if (tryAllocContiguousAt(candidate, count, &skip_to)) |phys| return phys;
+            start = skip_to;
         }
-        free_pages -= count;
-        return start * PAGE_SIZE;
+        pass += 1;
+        start = MIN_ALLOC_PAGE;
     }
     return null;
+}
+
+fn tryAllocContiguousAt(start: u64, count: usize, skip_to: *u64) ?u64 {
+    // Check if all pages [start, start+count) are free.
+    for (0..count) |j| {
+        const page = start + j;
+        if (!isBitSet(page) or ref_counts[page] > 0) {
+            skip_to.* = page + 1;
+            return null;
+        }
+    }
+
+    // Found contiguous free range — allocate all pages.
+    for (0..count) |j| {
+        const page = start + j;
+        clearBit(page);
+        ref_counts[page] = 1;
+    }
+    free_pages -= count;
+    next_free_hint = start + @as(u64, @intCast(count));
+    return start * PAGE_SIZE;
 }
 
 /// Reserve a physical page (mark as used). Used to protect page table pages

@@ -59,6 +59,8 @@ pub const SIGRETURN_TRAMPOLINE: [17]u8 = .{
 /// Fixed address where the sigreturn trampoline is mapped in user space.
 pub const SIGRETURN_TRAMPOLINE_ADDR: u64 = 0x7FFFF0000000;
 
+var sigreturn_trampoline_phys: u64 = 0;
+
 /// Send a signal to a process. Returns true on success.
 /// v53.44: Uses atomic OR for SMP-safe signal bit setting.
 pub fn sendSignal(target_tid: u32, signum: u32) bool {
@@ -88,21 +90,24 @@ pub fn dequeueSignal(t: *task.Task) ?u32 {
     return @as(u32, bit) + 1;
 }
 
-/// Map the sigreturn trampoline into user address space.
-/// Called once during kernel init.
+/// Map the shared sigreturn trampoline into a user address space.
 pub fn setupSigreturnTrampoline(user_pml4: u64) void {
     const paging = @import("../arch/x86_64/paging.zig");
     const pmm = @import("../mm/pmm.zig");
     const hhdm_mod = @import("../mm/hhdm.zig");
 
-    const phys = pmm.allocPage() orelse return;
-    const virt = hhdm_mod.physToVirt(phys);
+    if (@atomicLoad(u64, &sigreturn_trampoline_phys, .acquire) == 0) {
+        const new_phys = pmm.allocPage() orelse return;
+        const virt = hhdm_mod.physToVirt(new_phys);
 
-    var ptr: [*]u8 = @ptrFromInt(virt);
-    @memset(ptr[0..4096], 0);
-    @memcpy(ptr[0..SIGRETURN_TRAMPOLINE.len], &SIGRETURN_TRAMPOLINE);
+        var ptr: [*]u8 = @ptrFromInt(virt);
+        @memset(ptr[0..4096], 0);
+        @memcpy(ptr[0..SIGRETURN_TRAMPOLINE.len], &SIGRETURN_TRAMPOLINE);
+        @atomicStore(u64, &sigreturn_trampoline_phys, new_phys, .release);
+    }
 
-    paging.mapPage(user_pml4, SIGRETURN_TRAMPOLINE_ADDR, phys, .{
+    const phys = @atomicLoad(u64, &sigreturn_trampoline_phys, .acquire);
+    paging.mapPageNoFlush(user_pml4, SIGRETURN_TRAMPOLINE_ADDR, phys, .{
         .writable = false,
         .user = true,
         .no_execute = false,

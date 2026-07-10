@@ -280,6 +280,7 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
         serial.writeString("[loader] OOM for user PML4\n");
         return null;
     };
+    serial.writeString("[loader] Flat address space ready\n");
 
     // Track highest loaded address for brk initialization
     var highest_addr: u64 = 0;

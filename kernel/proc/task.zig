@@ -13,10 +13,13 @@
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const serial = @import("../arch/x86_64/serial.zig");
+const paging = @import("../arch/x86_64/paging.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 const PAGE_SIZE: u64 = 4096;
-const KERNEL_STACK_PAGES: u64 = 16;
+const KERNEL_STACK_PAGES: u64 = 32;
+const KERNEL_STACK_VIRT_BASE: u64 = 0xffffffff90000000;
+const KERNEL_STACK_STRIDE: u64 = 256 * 1024;
 // allocates large arrays on the stack (e.g., code_pages[256]?u64 = 2KB).
 // NOTE: Pages are allocated via PMM and mapped contiguously via HHDM.
 // The stack grows downward from kernel_stack_top.
@@ -353,34 +356,58 @@ fn allocSlot() ?u32 {
     return @intCast(slot);
 }
 
-/// Allocate a virtually-contiguous kernel stack.
-/// Allocate a virtually-contiguous kernel stack.
-/// Maps KERNEL_STACK_PAGES physical pages into the kernel address space
-/// at a contiguous virtual range using the kernel PML4.
-fn allocKernelStack() ?u64 {
-    // Allocate KERNEL_STACK_PAGES physically-contiguous pages and return the
-    // HHDM virtual address of the run's base.
-    //
-    // The HHDM is a linear physical->virtual map set up by Limine, so a
-    // contiguous physical run is automatically contiguous (and already mapped)
-    // in the HHDM window. We therefore do NOT touch the page tables at all.
-    //
-    // (The previous implementation tried to remap individual HHDM pages with
-    // mapPage(). That corrupted kernel memory: Limine maps the HHDM with huge
-    // pages, and mapPage()/ensureTable() cannot descend into a huge-page
-    // entry, so the "new" PTEs were written into the middle of huge-page data
-    // frames — eventually causing a #PF during early boot.)
-    const phys_base = pmm.allocContiguous(KERNEL_STACK_PAGES) orelse return null;
-    return hhdm.physToVirt(phys_base);
+fn reserveSlotLocked() ?u32 {
+    const slot = allocSlot() orelse return null;
+    slot_bitmap |= @as(u64, 1) << @intCast(slot);
+    return slot;
+}
+
+fn stackVirtForSlot(slot: u32) u64 {
+    return KERNEL_STACK_VIRT_BASE + @as(u64, slot) * KERNEL_STACK_STRIDE;
+}
+
+/// Allocate a virtually contiguous kernel stack without requiring contiguous
+/// physical pages. The stack lives in a fixed high-half virtual window per task
+/// slot, avoiding HHDM huge-page remapping while keeping task creation O(pages).
+fn allocKernelStackForSlot(slot: u32) ?u64 {
+    const stack_virt = stackVirtForSlot(slot);
+    var allocated: [KERNEL_STACK_PAGES]u64 = undefined;
+    var count: usize = 0;
+    while (count < KERNEL_STACK_PAGES) : (count += 1) {
+        const phys = pmm.allocPage() orelse {
+            freeKernelStackPages(stack_virt, allocated[0..count]);
+            return null;
+        };
+        allocated[count] = phys;
+        const page_virt = stack_virt + @as(u64, count) * PAGE_SIZE;
+        paging.mapPage(paging.getKernelPml4(), page_virt, phys, .{
+            .writable = true,
+            .user = false,
+            .no_execute = true,
+            .global = true,
+        }) catch {
+            pmm.freePage(phys);
+            freeKernelStackPages(stack_virt, allocated[0..count]);
+            return null;
+        };
+    }
+    return stack_virt;
 }
 
 /// Free a kernel stack allocated by allocKernelStack.
 fn freeKernelStack(stack_virt: u64) void {
-    // The stack is a contiguous physical run mapped through the HHDM, so each
-    // page's physical address is a simple HHDM reverse-translation.
-    const phys_base = hhdm.virtToPhys(stack_virt);
     for (0..KERNEL_STACK_PAGES) |i| {
-        pmm.freePage(phys_base + i * PAGE_SIZE);
+        const page_virt = stack_virt + @as(u64, i) * PAGE_SIZE;
+        if (paging.unmapPage(paging.getKernelPml4(), page_virt)) |phys| {
+            pmm.freePage(phys);
+        }
+    }
+}
+
+fn freeKernelStackPages(stack_virt: u64, pages: []const u64) void {
+    for (pages, 0..) |phys, i| {
+        _ = paging.unmapPage(paging.getKernelPml4(), stack_virt + @as(u64, i) * PAGE_SIZE);
+        pmm.freePage(phys);
     }
 }
 
@@ -404,13 +431,14 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     const flags = task_lock.acquire();
     defer task_lock.release(flags);
 
-    const slot = allocSlot() orelse {
+    const slot = reserveSlotLocked() orelse {
         serial.writeString("[task] no free task slots\n");
         return null;
     };
 
-    const stack_virt = allocKernelStack() orelse {
+    const stack_virt = allocKernelStackForSlot(slot) orelse {
         serial.writeString("[task] OOM allocating kernel stack\n");
+        slot_bitmap &= ~(@as(u64, 1) << @intCast(slot));
         return null;
     };
     const stack_top = stack_virt + KERNEL_STACK_PAGES * PAGE_SIZE;
@@ -440,7 +468,6 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     tasks[slot].permitted_caps = _cap_init_kt_aff.ALL_CAPS;
     tasks[slot].inheritable_caps = _cap_init_kt_aff.ALL_CAPS;
 
-    slot_bitmap |= @as(u64, 1) << @intCast(slot);
     task_count += 1;
     asm volatile ("" ::: .{ .memory = true });
     return slot;
@@ -452,12 +479,13 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     const flags = task_lock.acquire();
     defer task_lock.release(flags);
 
-    const slot = allocSlot() orelse {
+    const slot = reserveSlotLocked() orelse {
         serial.writeString("[task] no free task slots\n");
         return null;
     };
-    const stack_virt = allocKernelStack() orelse {
+    const stack_virt = allocKernelStackForSlot(slot) orelse {
         serial.writeString("[task] OOM allocating kernel stack\n");
+        slot_bitmap &= ~(@as(u64, 1) << @intCast(slot));
         return null;
     };
     const stack_top = stack_virt + KERNEL_STACK_PAGES * PAGE_SIZE;
@@ -482,7 +510,6 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     tasks[slot].effective_caps = _cap_init_kt.ALL_CAPS;
     tasks[slot].permitted_caps = _cap_init_kt.ALL_CAPS;
     tasks[slot].inheritable_caps = _cap_init_kt.ALL_CAPS;
-    slot_bitmap |= @as(u64, 1) << @intCast(slot);
     task_count += 1;
     asm volatile ("" ::: .{ .memory = true });
     return slot;
@@ -547,10 +574,11 @@ pub fn exitTask(exit_code: i32) void {
     }
     task_lock.release(flags);
 
-    // Prompt scheduler to switch away from this zombie on the local CPU.
-    const se = @import("../arch/x86_64/syscall_entry.zig");
-    sched.kickCpu(@intCast(se.getPerCpu().cpu_id));
-
+    // Prompt the next timer interrupt to switch away from this zombie. Avoid
+    // calling timerTick recursively from inside syscall/fault exit paths: that
+    // can resume a different task while the current kernel stack is still deep
+    // in exitTask.
+    sched.requestReschedule();
     asm volatile ("sti" ::: .{ .memory = true });
     while (true) {
         asm volatile ("hlt" ::: .{ .memory = true });
@@ -652,61 +680,65 @@ pub fn createUserProcess(
     parent_tid_val: u32,
     elf: bool,
 ) ?u32 {
-    const flags = task_lock.acquire();
-    defer task_lock.release(flags);
+    const slot = blk: {
+        const flags = task_lock.acquire();
+        defer task_lock.release(flags);
 
-    const slot = allocSlot() orelse {
-        serial.writeString("[task] no free task slots\n");
-        return null;
+        const slot = reserveSlotLocked() orelse {
+            serial.writeString("[task] no free task slots\n");
+            return null;
+        };
+        break :blk slot;
     };
 
-    // Allocate kernel stack (PMM has its own lock)
-    const stack_virt = allocKernelStack() orelse {
+    const stack_virt = allocKernelStackForSlot(slot) orelse {
         serial.writeString("[task] OOM allocating kernel stack\n");
+        const flags = task_lock.acquire();
+        slot_bitmap &= ~(@as(u64, 1) << @intCast(slot));
+        task_lock.release(flags);
         return null;
     };
     const stack_top = stack_virt + KERNEL_STACK_PAGES * PAGE_SIZE;
 
-    const tid = next_tid;
-    next_tid += 1;
+    {
+        const flags = task_lock.acquire();
+        defer task_lock.release(flags);
+        const tid = next_tid;
+        next_tid += 1;
 
-    // Build the (large) Task in place in its slot (see the note on
-    // createKernelThread) to avoid overflowing the kernel stack.
-    zeroSlot(slot);
-    tasks[slot].self_idx = slot;
-    tasks[slot].tid = tid;
-    tasks[slot].state = .ready;
-    tasks[slot].priority = 1;
-    tasks[slot].kernel_stack = stack_virt;
-    tasks[slot].kernel_stack_top = stack_top;
-    tasks[slot].entry = null;
-    tasks[slot].page_table_phys = page_table_phys;
-    tasks[slot].personality = .native;
-    tasks[slot].is_user = true;
-    tasks[slot].user_entry = user_entry;
-    tasks[slot].user_stack_top = user_stack_top;
-    tasks[slot].stack_limit = user_stack_top - 64 * 4096; // 64 pages below stack top
-    tasks[slot].parent_tid = parent_tid_val;
-    tasks[slot].fd_table = @import("../fs/vfs.zig").FdTable.init();
-    tasks[slot].cwd[0] = '/';
-    tasks[slot].cwd_len = 1;
-    // Task #2: user processes are NOT pinned by default — they participate in
-    // work-stealing. last_cpu seeds initial run-queue placement (round-robin).
-    tasks[slot].cpu_affinity = -1;
-    tasks[slot].last_cpu = assignCpuAffinity(elf);
+        // Build the large Task in place to avoid overflowing the kernel stack.
+        zeroSlot(slot);
+        tasks[slot].self_idx = slot;
+        tasks[slot].tid = tid;
+        tasks[slot].state = .ready;
+        tasks[slot].priority = 1;
+        tasks[slot].kernel_stack = stack_virt;
+        tasks[slot].kernel_stack_top = stack_top;
+        tasks[slot].entry = null;
+        tasks[slot].page_table_phys = page_table_phys;
+        tasks[slot].personality = .native;
+        tasks[slot].is_user = true;
+        tasks[slot].user_entry = user_entry;
+        tasks[slot].user_stack_top = user_stack_top;
+        tasks[slot].stack_limit = user_stack_top - 64 * 4096;
+        tasks[slot].parent_tid = parent_tid_val;
+        tasks[slot].fd_table = @import("../fs/vfs.zig").FdTable.init();
+        tasks[slot].cwd[0] = '/';
+        tasks[slot].cwd_len = 1;
+        // User processes are not pinned by default; last_cpu seeds placement.
+        tasks[slot].cpu_affinity = -1;
+        tasks[slot].last_cpu = assignCpuAffinity(elf);
 
-    // Task #8: POSIX caps default to ALL_CAPS (zeroSlot wipes them otherwise).
-    const _cap_init_up = @import("../ipc/capability.zig");
-    tasks[slot].effective_caps = _cap_init_up.ALL_CAPS;
-    tasks[slot].permitted_caps = _cap_init_up.ALL_CAPS;
-    tasks[slot].inheritable_caps = _cap_init_up.ALL_CAPS;
+        const _cap_init_up = @import("../ipc/capability.zig");
+        tasks[slot].effective_caps = _cap_init_up.ALL_CAPS;
+        tasks[slot].permitted_caps = _cap_init_up.ALL_CAPS;
+        tasks[slot].inheritable_caps = _cap_init_up.ALL_CAPS;
 
-    const sig_mod = @import("signal.zig");
-    sig_mod.setupSigreturnTrampoline(page_table_phys);
+        task_count += 1;
+        asm volatile ("mfence" ::: .{ .memory = true });
+    }
 
-    slot_bitmap |= @as(u64, 1) << @intCast(slot);
-    task_count += 1;
-    asm volatile ("mfence" ::: .{ .memory = true });
+    @import("signal.zig").setupSigreturnTrampoline(page_table_phys);
     return slot;
 }
 

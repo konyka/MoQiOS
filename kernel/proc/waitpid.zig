@@ -37,23 +37,25 @@ pub fn waitpidWithOptions(pid_raw: u64, status_ptr: u64, options: u32) i64 {
     // WNOHANG: return 0 immediately if no zombie child
     if (options & 1 != 0) return 0;
 
-    // No zombie child yet — block until a child exits.
+    // No zombie child yet — block on each matching child's exit queue. The
+    // previous waitpid path hlt-spun in the syscall until a child exited, which
+    // deadlocked on a single CPU because the newly spawned child never ran.
     const parent = task_mod.getTask(cur_idx) orelse return -1;
     parent.waiting_for_child = true;
     parent.wait_cpu = @intCast(se.getPerCpu().cpu_id);
-    parent.state = .blocked;
     se.syncUserRspToTask(parent);
-    asm volatile ("" ::: .{ .memory = true });
-    task_mod.kickChildCpus(parent.tid, parent.wait_cpu);
-    asm volatile ("sti");
 
+    task_mod.kickChildCpus(parent.tid, parent.wait_cpu);
+    parent.state = .blocked;
+    sched_mod.requestReschedule();
     while (@as(*volatile bool, @ptrCast(&parent.waiting_for_child)).*) {
-        asm volatile ("pause" ::: .{ .memory = true });
+        asm volatile ("sti");
         asm volatile ("hlt" ::: .{ .memory = true });
     }
-
-    parent.state = .running;
+    parent.waiting_for_child = false;
     se.syncUserRspFromTask(parent);
+    se.getPerCpu().kernel_rsp = parent.kernel_stack_top;
+    @import("../arch/x86_64/gdt.zig").setRsp0(se.getPerCpu().cpu_id, parent.kernel_stack_top);
 
     // Woken up — a child has exited. Now reap it.
     if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {

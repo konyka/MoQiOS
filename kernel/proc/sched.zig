@@ -90,6 +90,10 @@ fn setSlice(v: u64) void {
     syscall_entry.gsWriteSliceRemaining(v);
 }
 
+pub fn requestReschedule() void {
+    setSlice(0);
+}
+
 /// Logical id of the CPU currently executing (0 = BSP). Used to target this
 /// CPU's own TSS RSP0 on context switch (M8-4) rather than always the BSP's.
 fn currentCpuId() u32 {

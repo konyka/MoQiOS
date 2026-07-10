@@ -112,6 +112,11 @@ pub fn destroyUserSpace(pml4_phys: u64) void {
                 var free_count: u32 = 0;
                 for (0..512) |pt_idx| {
                     if (pt[pt_idx] & paging.PRESENT == 0) continue;
+                    const virt = (@as(u64, pml4_idx) << 39) |
+                        (@as(u64, pdpt_idx) << 30) |
+                        (@as(u64, pd_idx) << 21) |
+                        (@as(u64, pt_idx) << 12);
+                    if (virt == @import("../proc/signal.zig").SIGRETURN_TRAMPOLINE_ADDR) continue;
                     const page_phys = pt[pt_idx] & paging.ADDR_MASK;
                     if (page_phys != 0 and page_phys >= 512 * 4096) {
                         free_buf[free_count] = page_phys;

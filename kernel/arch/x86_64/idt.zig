@@ -451,6 +451,14 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
         // Not a COW fault — fall through to segfault
     }
 
+    // Kernel copy_to_user can legitimately write to a current task's COW user
+    // page. Resolve it here instead of crashing on a supervisor-mode page fault.
+    if (!user_mode and present and write and cr2 < 0x0000_8000_0000_0000) {
+        if (handleCowFault(frame, cr2)) {
+            return;
+        }
+    }
+
     // Path 3: User-mode demand paging (page not present, from user space)
     if (user_mode and !present) {
         if (handleDemandPage(frame, cr2)) {
@@ -656,7 +664,7 @@ fn handleCowFault(frame: *InterruptFrame, fault_addr: u64) bool {
     @memcpy(dst[0..paging_mod.PAGE_SIZE], src[0..paging_mod.PAGE_SIZE]);
 
     // Update PTE: point to new page, make writable, clear COW bit
-    const updated_pte = (pte_val & paging_mod.ADDR_MASK & ~@as(u64, COW_BIT)) | new_phys | paging_mod.WRITABLE;
+    const updated_pte = (pte_val & ~paging_mod.ADDR_MASK & ~@as(u64, COW_BIT)) | new_phys | paging_mod.WRITABLE;
     paging_mod.setPageEntryRaw(current.page_table_phys, page_addr, updated_pte);
     paging_mod.invlpg(page_addr);
 
