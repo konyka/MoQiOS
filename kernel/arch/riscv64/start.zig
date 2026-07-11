@@ -94,6 +94,7 @@ fn sbiShutdown() void {
 export fn kmain(hartid: usize, dtb: usize) callconv(.c) noreturn {
     uart.init();
     @import("../../shared/sk2.zig").announce();
+    @import("../../shared/sk3.zig").announce();
     putStr("MoQiOS riscv64: M3 bring-up (PMM + Sv39)\n");
 
     putStr("  hartid=");

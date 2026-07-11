@@ -12,9 +12,9 @@
 ## 0. 现状基线（移植起点 → 2026-07 更新）
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
-  **SK-1**：`main.zig` 经 facade 使用 gdt/tsc/syscall；`panic` 经 arch。
-  **SK-2（2026-07-11）**：`lib/fmt` 改走 facade；`kernel/shared/sk2.zig` + `klog`/`panic`
-  链入 riscv64/aarch64（构建根上移为 `kernel/*_root.zig`）。完整 `main.zig` 仍未在非 x86 链接。
+  **SK-2**：`lib/fmt` + `shared/sk2` + `klog`/`panic` 链入 riscv/aarch64（`*_root.zig`）。
+  **SK-3（2026-07-11）**：共享 allowlist 扩至 `mm/hhdm` + `lib/fmt_core`（`shared/sk3.zig`）。
+  完整 `main.zig` / Limine 驱动仍未在非 x86 链接。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
 - **riscv64**：M0–M7 完成（…PMM/Sv39、timer/sched、U-mode/`ecall`、virtio-mmio blk + net MAC）。
@@ -183,7 +183,7 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **M9-7**：双 EL1 内核线程 + CNTV 抢占切换；IRQ 帧保存 ELR/SPSR 以支持换栈；
   `preemptive switches=` 达标后打印 `M9-7 complete`。
 - **门禁**：`smoke-aarch64`（…`hello from U` + `M9-6` + `preemptive switches=` + `M9-7 complete`）。
-- **后续**：SK-3 扩大共享子集（comptime 隔离 Limine/x86 驱动）。
+- **后续**：SK-4 comptime 隔离 Limine/x86 驱动，扩大可链接共享子集。
 
 ---
 
@@ -369,16 +369,16 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1/SK-2；⬜ SK-3 扩大共享子集
-Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1/SK-2；⬜ SK-3 扩大共享子集
+Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-3；⬜ SK-4 comptime 隔离驱动
+Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-3；⬜ SK-4 comptime 隔离驱动
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**SK-3** — comptime 隔离 Limine/x86 驱动，扩大共享子集（mm 入口等）；
-> SK-1（facade）与 SK-2（共享 klog/fmt/panic 链入 riscv/aarch64）已完成。
+> 当前下一执行项：**SK-4** — comptime 隔离 Limine/PCI/ACPI 等 x86 专用路径，尝试链接更大共享子集；
+> SK-1…SK-3 已完成。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。
