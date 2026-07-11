@@ -370,15 +370,15 @@ Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
 Phase F — 第二 ISA              ✅ M2–M7（…/virtio-blk+net）；⬜ 共享内核复用待续
-Phase F2 — 第三 ISA             🟡 M9-5（GIC+IRQ）；⬜ U-mode
+Phase F2 — 第三 ISA             ✅ M9-6（EL0/SVC）；⬜ 共享内核 / sched
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**M9-6 aarch64 U-mode**，或 **riscv64 共享内核复用**。
-> M3–M7（blk+net）与 M9-1…M9-5 已于 2026-07-11 完成。
+> 当前下一执行项：**riscv64/aarch64 共享内核复用**，或 aarch64 抢占调度。
+> M3–M7（blk+net）与 M9-1…M9-6 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。
 
