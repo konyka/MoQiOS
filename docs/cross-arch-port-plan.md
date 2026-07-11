@@ -17,8 +17,8 @@
   `start.zig` 骨架，**尚未**链接完整 `main.zig`。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
-- **riscv64**：M0–M7(blk) 完成（…PMM/Sv39、timer/sched、U-mode/`ecall`、virtio-mmio blk）。
-  门禁：`zig build -Darch=riscv64 smoke-riscv`。后续：共享内核复用 / virtio-net。
+- **riscv64**：M0–M7 完成（…PMM/Sv39、timer/sched、U-mode/`ecall`、virtio-mmio blk + net MAC）。
+  门禁：`zig build -Darch=riscv64 smoke-riscv`。后续：共享内核复用 / TX-RX 网栈 / M9 aarch64。
 - **引导**：x86_64 经 Limine；riscv64 经 OpenSBI `-kernel`（链接地址 `0x80200000`）。
 
 ### 环境约束（影响验证手段）
@@ -57,7 +57,7 @@
 | **M4** | **抽取 `arch` 接口**：定义 `kernel/arch/arch.zig`（comptime 选择实现）；x86 侧经 facade 重导出；riscv64 提供同名 stub/实装 | x86_64 仍启动到 shell；riscv64 后端可编译（完整 `main.zig` 复用待 M5+） | ✅ 接口完成（渐进迁移进行中） |
 | **M5** | riscv64 定时器（`stimecmp`）+ 最小抢占调度（双内核线程轮转） | QEMU virt：`preemptive switches=` + `M5 complete` | ✅ 完成（2026-07-11） |
 | **M6** | riscv64 用户态：U-mode `sret`、用户页 U 位隔离、`ecall`（sys_write/sys_exit） | QEMU virt：`hello from U` + `M6 complete` | ✅ 完成（2026-07-11） |
-| **M7** | riscv64 virtio-mmio blk 驱动（探测/virtqueue/轮询读扇区 + 磁盘魔数自测） | QEMU virt：`disk magic: OK` + `M7 complete` | ✅ blk 完成（2026-07-11）；net/FS 集成待共享内核 |
+| **M7** | riscv64 virtio-mmio blk + net 探测（blk 读扇区魔数；net 协商 MAC） | QEMU virt：`disk magic: OK` + `virtio-net MAC: OK` | ✅ 完成（2026-07-11）；TX/RX 与 FS 待共享内核 |
 | **M8** | **SMP（先 x86_64，后 riscv64）**：per-CPU 调度器（per-CPU 运行队列+work-stealing+per-CPU TSS/anchor）、通用 IPI、TLB shootdown；启用 `enable_ap_startup` | QEMU 多核：用户任务真正并行；零崩溃 | ✅ x86_64 完成（见 §4）；riscv64 SMP 待 M5+ |
 | **M9** | aarch64 后端（复用 M4 抽象 + Limine 引导 + GIC/generic timer/PL011） | QEMU aarch64 启动 → 用户态 | ⬜ 待办 |
 
@@ -161,16 +161,17 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **流程**：M3 → M6（U-mode）→ `sys_exit` → M5（sched）→ shutdown。
 - **门禁**：串口含 `hello from U`、`M6 complete`、`M5 complete`。
 
-### 3.10 M7 完成记录（2026-07-11，virtio-blk）
+### 3.10 M7 完成记录（2026-07-11，virtio-blk + virtio-net）
 
 - **`virtio_blk.zig`**：virtio-mmio 探测（8 槽 `0x10001000+`）；legacy(v1)/modern(v2) 双布局；
   单 virtqueue（8 描述符）+ 轮询 used ring；`readSector` 同步读。
 - **队列内存**：BSS 双页（desc+avail | used 物理连续，满足 legacy 对齐）+ 请求页。
-- **QEMU**：`qemu_run_riscv64.sh` 自动建测试盘（扇区 0 写 `MOQI_RV64_DISK` 魔数）并挂
-  `virtio-blk-device`。
-- **自测**：读扇区 0 → 校验魔数 → `disk magic: OK` + `M7 complete`。
-- **流程**：M3 → **M7（blk）** → M6（U-mode）→ M5（sched）→ shutdown。
-- **说明**：virtio-net 与 ext2/FS 集成推迟至共享内核复用阶段（x86 侧驱动逻辑届时可迁移）。
+- **`virtio_net.zig`**：同槽位探测 DeviceID=1；协商 `VIRTIO_NET_F_MAC`；读 config MAC。
+- **QEMU**：`qemu_run_riscv64.sh` 挂 `virtio-blk-device`（测试盘魔数 `MOQI_RV64_DISK`）+
+  `virtio-net-device`（user netdev）。
+- **自测**：`disk magic: OK` / `M7 complete`；`virtio-net MAC: OK` / `M7-net complete`。
+- **流程**：M3 → **M7（blk+net）** → M6（U-mode）→ M5（sched）→ shutdown。
+- **说明**：net TX/RX 与 ext2/FS 集成推迟至共享内核复用阶段。
 
 ---
 
@@ -333,7 +334,7 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 | **SMP 内存** | 范围 TLB shootdown（`invlpg`） | ✅ M8-6 | **高**（已落地） |
 | **SMP 浮点** | FXSAVE/FXRSTOR 按任务 | ✅ M8-5b-3 | 中（已落地） |
 | **架构抽象** | `kernel/arch/arch.zig` 多 ISA 接口 | ✅ M4；渐进迁移中 | 中（移植效率，非热路径） |
-| **riscv64** | M2–M7(blk) ✅；共享内核复用待续 | ✅ M7 blk | N/A（第二 ISA） |
+| **riscv64** | M2–M7 ✅；共享内核复用待续 | ✅ M7 blk+net | N/A（第二 ISA） |
 | **未集成脚手架** | `futex`/`select`/`inotify`/`clone`/`mprotect`/SysV IPC/`aio`/`splice`/`dhcp`/`dns` 等 | 🧩 源文件在树中，未 `@import` | 低（按需接入） |
 | **缺页恢复** | 内核态 per-instruction fixup | ⚠️ 页表预检替代 | 中 |
 | **单元测试** | `zig build test`（host helpers） | ✅ 有基础用例 | 低（质量门） |
@@ -355,7 +356,7 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7（…/U-mode/ecall/virtio-blk）；⬜ 共享内核复用待续
+Phase F — 第二 ISA              ✅ M2–M7（…/virtio-blk+net）；⬜ 共享内核复用待续
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
@@ -363,7 +364,7 @@ Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需�
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
 > 当前下一执行项：**riscv64 共享内核复用**（arch facade 深度迁移，让 `-Darch=riscv64` 链接
-> `main.zig` 子系统）或 **M9 aarch64**。M3–M7(blk) 已于 2026-07-11 完成。
+> `main.zig` 子系统）或 **M9 aarch64**。M3–M7（blk+net）已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。
 

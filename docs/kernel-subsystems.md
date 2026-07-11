@@ -1126,6 +1126,7 @@ pub fn shootdownRange(addr_start: u64, page_count: u32) void
 - **分页**：Sv39 恒等映射 + map/unmap（M3）；完整 HHDM/共享内核复用待后续
 - **定时器**：Sstc `stimecmp` 周期 tick（M5）
 - **上下文切换**：骨架内双线程抢占切换（M5）；完整 `proc/sched.zig` 复用待后续
+- **设备**：virtio-mmio blk 读扇区 + net MAC 探测（M7）；TX/RX/FS 待共享内核
 
 ### 11.4 设计原则
 

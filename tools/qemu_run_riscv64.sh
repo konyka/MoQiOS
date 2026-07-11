@@ -52,6 +52,8 @@ exec qemu-system-riscv64 \
     -smp "$SMP_COUNT" \
     -drive file="$DISK_IMAGE",format=raw,if=none,id=disk0 \
     -device virtio-blk-device,drive=disk0 \
+    -netdev user,id=net0 \
+    -device virtio-net-device,netdev=net0 \
     -serial "$SERIAL_TARGET" \
     -display none \
     -no-reboot
