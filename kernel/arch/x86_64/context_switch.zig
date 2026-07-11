@@ -22,6 +22,9 @@ const builtin = @import("builtin");
 const task = @import("../../proc/task.zig");
 const syscall_entry = @import("syscall_entry.zig");
 
+/// x86 uses hardware iretq frames via commonStub (not software-only).
+pub const uses_software_frame: bool = false;
+
 /// Per-CPU current FPU owner. `null` = no task on this CPU has touched the
 /// FPU since the last init. Indexed by logical cpu id (0 = BSP). Updated
 /// only by the local CPU's #NM handler / context-switch path, so no lock

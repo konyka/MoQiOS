@@ -26,9 +26,32 @@ pub const interrupts = struct {
     pub fn enableIrq() void {}
     pub fn disableIrq() void {}
 
-    /// Placeholder frame shape so shared `sched` can type-check (SK-11).
+    /// Software interrupt frame for shared `sched` (SK-13).
+    /// Field names mirror x86_64 so `setupInitialFrame` is portable; the
+    /// arch-local trap path still uses its own TrapFrame until a later SK.
     pub const InterruptFrame = extern struct {
-        pad: [20]u64 = .{0} ** 20,
+        r15: u64 = 0,
+        r14: u64 = 0,
+        r13: u64 = 0,
+        r12: u64 = 0,
+        r11: u64 = 0,
+        r10: u64 = 0,
+        r9: u64 = 0,
+        r8: u64 = 0,
+        rbp: u64 = 0,
+        rdi: u64 = 0,
+        rsi: u64 = 0,
+        rdx: u64 = 0,
+        rcx: u64 = 0,
+        rbx: u64 = 0,
+        rax: u64 = 0,
+        vector: u64 = 0,
+        error_code: u64 = 0,
+        rip: u64 = 0,
+        cs: u64 = 0,
+        rflags: u64 = 0,
+        rsp: u64 = 0,
+        ss: u64 = 0,
     };
 
     var tick_count: u64 = 0;
@@ -106,6 +129,9 @@ pub const context_switch = struct {
     pub fn onContextSwitch(old: anytype) void {
         _ = old;
     }
+
+    /// SK-13: shared sched owns software InterruptFrames; arch restore TBD.
+    pub const uses_software_frame: bool = true;
 };
 
 pub const cpu = struct {

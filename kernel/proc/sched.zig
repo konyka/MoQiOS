@@ -359,7 +359,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
 }
 
 /// Build a fake InterruptFrame at the top of a new task's kernel stack.
-/// When commonStub restores from this frame and iretqs, it jumps to the task entry.
+/// When the arch restore path loads this frame, it jumps to the task entry.
 fn setupInitialFrame(t: *task.Task) void {
     const stack_top = t.kernel_stack_top;
     const frame_addr = stack_top - @sizeOf(idt.InterruptFrame);
@@ -387,6 +387,15 @@ fn setupInitialFrame(t: *task.Task) void {
 
     t.saved_rsp = frame_addr;
     t.started = true;
+}
+
+/// SK-13: build the initial InterruptFrame for a created kernel/user task and
+/// publish it as this CPU's switch anchor (without entering the task).
+pub fn prepareTaskFrame(idx: u32) bool {
+    const t = task.getTask(idx) orelse return false;
+    if (!t.started) setupInitialFrame(t);
+    setAnchor(t.saved_rsp);
+    return t.started and t.saved_rsp != 0;
 }
 
 /// When this CPU has no running task, prefer a ready kernel thread pinned here.
