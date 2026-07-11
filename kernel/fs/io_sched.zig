@@ -8,7 +8,7 @@
 ///   - Batch: serve reads before writes (read-priority, anti-write-starvation)
 ///   - Elevator merge: consecutive LBA requests merged into single large request
 
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const idt = @import("../arch/x86_64/idt.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 

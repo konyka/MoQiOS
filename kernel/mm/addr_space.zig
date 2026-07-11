@@ -1,7 +1,7 @@
 /// Kernel virtual address space manager.
 /// Tracks which virtual address ranges are mapped in the kernel.
 
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const klog = @import("../klog.zig");
 
 pub const KERNEL_BASE: u64 = 0xFFFFFFFF80000000;

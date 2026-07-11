@@ -1,6 +1,6 @@
 /// Writeback — delayed write coalescing (buffer cache).
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const PAGE_SIZE: u64 = 4096;
 const BUFFER_COUNT: u32 = 512;
 const BM_WORDS: u32 = (BUFFER_COUNT + 63) / 64; // = 2

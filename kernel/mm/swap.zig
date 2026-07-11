@@ -16,7 +16,7 @@
 ///   Bits 12-51: swap slot index (up to 2^40 slots = 4TB swap)
 ///   Bits 52-62: reserved
 ///   Bit 63:    NX (no-execute, preserved)
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const idt = @import("../arch/x86_64/idt.zig");

@@ -12,7 +12,7 @@ const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const paging = @import("../arch/x86_64/paging.zig");
 const user_space = @import("../mm/user_space.zig");
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const fmt = @import("../lib/fmt.zig");
 
 pub const ExecResult = struct {

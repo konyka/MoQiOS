@@ -2,7 +2,7 @@
 ///
 /// Completes the SysV IPC trilogy alongside sysv_shm.zig and sysv_sem.zig.
 /// Used by legacy applications and some message-passing architectures.
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const fmt = @import("../lib/fmt.zig");
 const bo = @import("../lib/byte_order.zig");

@@ -3,7 +3,7 @@ const slab = @import("../mm/slab.zig");
 const task = @import("../proc/task.zig");
 const sched = @import("../proc/sched.zig");
 const idt = @import("../arch/x86_64/idt.zig");
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const paging = @import("../arch/x86_64/paging.zig");
 
 pub fn dumpMemory() void {

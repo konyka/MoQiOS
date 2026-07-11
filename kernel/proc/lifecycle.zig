@@ -1,4 +1,4 @@
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const fmt = @import("../lib/fmt.zig");
 
 /// Syscall #2: exit(status)

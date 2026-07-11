@@ -5,7 +5,7 @@
 /// read/write/flush calls to the appropriate driver based on device type.
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const klog = @import("../klog.zig");
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const virtio_blk = @import("virtio_blk.zig");
 const ahci = @import("ahci.zig");
 const nvme = @import("nvme.zig");

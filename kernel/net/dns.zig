@@ -5,7 +5,7 @@
 ///   - Response parsing with header, question, answer sections
 ///   - Simple 16-entry LRU cache with TTL expiry
 ///   - Kernel API: dnsResolve(hostname) → [4]u8
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const udp = @import("udp.zig");
 const netif = @import("netif.zig");
 const idt = @import("../arch/x86_64/idt.zig");

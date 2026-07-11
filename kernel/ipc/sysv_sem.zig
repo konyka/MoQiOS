@@ -2,7 +2,7 @@
 ///
 /// Provides basic counting semaphore support for process synchronization.
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const fmt = @import("../lib/fmt.zig");
 const task = @import("../proc/task.zig");
 const sched = @import("../proc/sched.zig");

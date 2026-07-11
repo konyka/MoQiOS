@@ -1,7 +1,7 @@
 /// kernel/proc/process_mgmt.zig — Process management syscall implementations
 ///
 /// Extracted from syscall_entry.zig (v19.1): getpid, getenv, pipe, dup2.
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const sched_mod = @import("sched.zig");
 const task_mod = @import("task.zig");
 const copy = @import("../mm/copy_from_user.zig");

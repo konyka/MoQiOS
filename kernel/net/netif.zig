@@ -1,5 +1,5 @@
 const e1000 = @import("../drivers/e1000.zig");
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 
 var our_mac: [6]u8 = @splat(0);
 var mac_initialized: bool = false;

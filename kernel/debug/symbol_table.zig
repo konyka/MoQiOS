@@ -1,5 +1,5 @@
 /// Kernel symbol table — parses ELF .symtab for panic backtraces.
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const fmt = @import("../lib/fmt.zig");
 
 pub const Symbol = struct {

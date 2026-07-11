@@ -11,7 +11,7 @@
 ///   - No seeking (sequential read only)
 ///   - Single-process focused (FD table per task)
 const ramdisk = @import("ramdisk.zig");
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const readahead = @import("readahead.zig");
 const str = @import("../lib/str.zig");
 const writeback = @import("writeback.zig");

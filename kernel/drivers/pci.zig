@@ -9,7 +9,7 @@
 ///   - Vendor/device ID, class code extraction
 ///   - BAR (Base Address Register) detection
 ///   - Device listing for driver matching
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const io = @import("../arch/x86_64/io.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const acpi = @import("../acpi/acpi_parser.zig");

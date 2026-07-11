@@ -192,6 +192,7 @@ export fn kmain(x0_dtb: usize) callconv(.c) noreturn {
 
     // SK-6 after MMU + SCTLR.A clear: Zig Debug may emit `str q` for `?u64`.
     sk6.announce(@intCast(share_base), @intCast(share_len));
+    @import("../../shared/sk7.zig").announce();
 
     // Map a fresh page at a non-identity VA, write/read, then unmap + #PF.
     const test_va: usize = 0x80000000;

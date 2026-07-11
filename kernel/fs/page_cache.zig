@@ -12,7 +12,7 @@
 /// The page cache sits between VFS and block device drivers:
 ///   readPage(inode, offset) → check cache → miss → read from disk → cache
 ///   writePage(inode, offset, data) → write to cache → mark dirty → writeback
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;

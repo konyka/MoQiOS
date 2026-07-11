@@ -1,6 +1,6 @@
 /// ACPI parser — RSDP/XSDT/MADT/MCFG parsing.
 const hhdm = @import("../mm/hhdm.zig");
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const tables = @import("acpi_tables.zig");
 const main = @import("../main.zig");
 const fmt = @import("../lib/fmt.zig");

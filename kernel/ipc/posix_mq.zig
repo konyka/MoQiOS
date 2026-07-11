@@ -2,7 +2,7 @@
 ///
 /// Provides mq_open, mq_unlink, mq_timedsend, mq_timedreceive, mq_notify, mq_getsetattr.
 /// Messages are stored in a ring buffer per queue. Max 16 queues, 8 messages per queue.
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const fmt = @import("../lib/fmt.zig");
 const str = @import("../lib/str.zig");

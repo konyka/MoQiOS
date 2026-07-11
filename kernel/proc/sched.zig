@@ -519,7 +519,7 @@ pub fn kernelIdleLoop() callconv(.c) void {
 /// first user task is scheduled (context-switch path, not first-ever user).
 pub fn apBootstrapIdle() noreturn {
     const idx = pickBootstrapKernel() orelse {
-        const serial = @import("../arch/x86_64/serial.zig");
+        const serial = @import("../arch/arch.zig").serial;
         serial.writeString("[sched] AP bootstrap: no kernel idle for this CPU\n");
         apIdleLoop();
     };

@@ -12,7 +12,7 @@
 ///   - Up to 4 I/O queue pairs (configurable via MAX_IO_QUEUES)
 ///   - PRP only (no SGL)
 ///   - Polling mode (no MSI-X interrupt for completion yet)
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const paging = @import("../arch/x86_64/paging.zig");

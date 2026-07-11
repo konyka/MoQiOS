@@ -11,7 +11,7 @@
 ///   - Lease time (Option 51)
 ///
 /// Updates netif.zig with the acquired configuration.
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const udp = @import("udp.zig");
 const netif = @import("netif.zig");
 const idt = @import("../arch/x86_64/idt.zig");

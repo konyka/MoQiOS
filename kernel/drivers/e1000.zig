@@ -2,7 +2,7 @@
 ///
 /// Provides basic packet send/receive via the e1000 MMIO interface.
 /// Interrupt-driven RX: packets are processed in the IRQ handler.
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const hhdm = @import("../mm/hhdm.zig");
 const paging = @import("../arch/x86_64/paging.zig");
 const pmm = @import("../mm/pmm.zig");

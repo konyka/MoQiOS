@@ -1,4 +1,4 @@
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const syscall_entry = @import("../arch/x86_64/syscall_entry.zig");
 const getPerCpu = syscall_entry.getPerCpu;
 const idt = @import("../arch/x86_64/idt.zig");

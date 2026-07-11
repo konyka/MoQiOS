@@ -6,7 +6,7 @@
 /// Simplified approach: io_submit executes I/O synchronously and
 /// immediately marks events as completed. This satisfies the API
 /// contract while avoiding the complexity of true async dispatch.
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const bo = @import("../lib/byte_order.zig");
 const fmt = @import("../lib/fmt.zig");

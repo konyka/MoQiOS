@@ -181,6 +181,7 @@ export fn kmain(hartid: usize, dtb: usize) callconv(.c) noreturn {
     putStr("  satp Sv39 enabled (identity map)\n");
 
     sk6.announce(@intCast(share_base), @intCast(share_len));
+    @import("../../shared/sk7.zig").announce();
 
     // Map a fresh page at a non-identity VA, write/read, then unmap + #PF.
     const test_va: usize = 0x40000000;

@@ -5,7 +5,7 @@
 /// blit, clear. Optional double-buffering when memory is available.
 const limine = @import("../limine.zig");
 const main_mod = @import("../main.zig");
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const klog = @import("../klog.zig");
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");

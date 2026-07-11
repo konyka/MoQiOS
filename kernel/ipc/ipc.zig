@@ -14,7 +14,7 @@
 /// integration comes in M5.
 const task = @import("../proc/task.zig");
 const sched = @import("../proc/sched.zig");
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 // v53.44: Global lock protecting all endpoint operations (SMP safety)

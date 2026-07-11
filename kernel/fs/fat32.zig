@@ -4,7 +4,7 @@
 ///   - MBR partition table parsing (primary partitions only)
 ///   - FAT32 filesystem: BPB parsing, cluster chain traversal, file listing
 ///   - Falls back to raw FAT32 if no MBR partition table found
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const virtio_blk = @import("../drivers/virtio_blk.zig");
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");

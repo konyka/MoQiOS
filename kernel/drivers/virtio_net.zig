@@ -8,7 +8,7 @@
 ///   - Two virtqueues: RX (queue 0) and TX (queue 1)
 ///   - Interrupt-driven receive
 ///   - Simple synchronous transmit
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const io = @import("../arch/x86_64/io.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const paging = @import("../arch/x86_64/paging.zig");

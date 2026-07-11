@@ -11,7 +11,7 @@
 ///   - Graceful fallback to polling DMA when NCQ / MSI unavailable
 ///
 /// QEMU exposes Intel ICH9 AHCI (8086:2922) at PCI 0:31.2.
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const io = @import("../arch/x86_64/io.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const paging = @import("../arch/x86_64/paging.zig");

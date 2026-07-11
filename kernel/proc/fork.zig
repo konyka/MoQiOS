@@ -1,7 +1,7 @@
 const syscall_entry = @import("../arch/x86_64/syscall_entry.zig");
 const SyscallFrame = syscall_entry.SyscallFrame;
 const getPerCpu = syscall_entry.getPerCpu;
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const idt = @import("../arch/x86_64/idt.zig");
 const fmt = @import("../lib/fmt.zig");
 

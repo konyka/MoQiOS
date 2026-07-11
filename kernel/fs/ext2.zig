@@ -10,7 +10,7 @@
 ///   - Block allocation from bitmap
 ///
 /// Designed for ext2 with 1024-byte blocks (revision 0 / "good old ext2").
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const virtio_blk = @import("../drivers/virtio_blk.zig");
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");

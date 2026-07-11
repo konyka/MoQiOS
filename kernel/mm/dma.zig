@@ -2,7 +2,7 @@
 /// Supports multi-page allocation and single-page mapping.
 const pmm = @import("pmm.zig");
 const hhdm = @import("hhdm.zig");
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const klog = @import("../klog.zig");
 const paging = @import("../arch/x86_64/paging.zig");
 

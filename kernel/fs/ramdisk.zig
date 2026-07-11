@@ -7,7 +7,7 @@
 ///
 /// This is generated at build time by tools/mkramdisk.sh and loaded as a
 /// Limine module. The kernel parses it once at boot and provides lookup by name.
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const str = @import("../lib/str.zig");
 const klog = @import("../klog.zig");
 const fmt = @import("../lib/fmt.zig");
