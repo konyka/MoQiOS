@@ -181,6 +181,9 @@ export fn kmain(x0_dtb: usize) callconv(.c) noreturn {
     }
     putStr("  MMU enabled (identity map)\n");
 
+    // SK-5 after MMU + SCTLR.A clear: Zig Debug may emit `str q` for `?u64`.
+    @import("../../shared/sk5.zig").announce();
+
     // Map a fresh page at a non-identity VA, write/read, then unmap + #PF.
     const test_va: usize = 0x80000000;
     const test_pa = pmm.allocPage();

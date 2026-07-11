@@ -171,6 +171,9 @@ export fn kmain(hartid: usize, dtb: usize) callconv(.c) noreturn {
     }
     putStr("  satp Sv39 enabled (identity map)\n");
 
+    // SK-5 after Sv39 identity map (matches aarch64: shared slab after MMU).
+    @import("../../shared/sk5.zig").announce();
+
     // Map a fresh page at a non-identity VA, write/read, then unmap + #PF.
     const test_va: usize = 0x40000000;
     const test_pa = pmm.allocPage() orelse {

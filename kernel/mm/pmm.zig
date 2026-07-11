@@ -1,6 +1,6 @@
 /// Physical Memory Manager — bitmap allocator for 4KB page frames.
-/// Reads Limine memory map, creates bitmap + ref_counts in usable memory.
-/// Tracks free/used pages with per-page reference counting.
+/// Limine memmap init (x86) or compact arena init (SK-5 shared path).
+const builtin = @import("builtin");
 const limine = @import("../limine.zig");
 const hhdm = @import("hhdm.zig");
 const serial = @import("../arch/arch.zig").serial;
@@ -23,8 +23,26 @@ var lock: IrqSpinlock = .{};
 // v53.12: Guard against recursive swap reclaim (reclaimPages → swapOut → allocPage)
 var in_swap_reclaim: bool = false;
 
-/// Skip first 2 MB (512 pages) — legacy BIOS area.
-const MIN_ALLOC_PAGE: u64 = 512;
+/// Skip first 2 MB (512 pages) on Limine boots — legacy BIOS area.
+/// Arena mode (SK-5) sets this to 0.
+var min_alloc_page: u64 = 512;
+
+/// When true, page indices are relative to `arena_base` (compact shared PMM).
+var arena_mode: bool = false;
+var arena_base: u64 = 0;
+
+fn physFromPage(page: u64) u64 {
+    if (arena_mode) return arena_base + page * PAGE_SIZE;
+    return page * PAGE_SIZE;
+}
+
+fn pageFromPhys(phys: u64) u64 {
+    if (arena_mode) {
+        if (phys < arena_base) return total_pages;
+        return (phys - arena_base) / PAGE_SIZE;
+    }
+    return phys / PAGE_SIZE;
+}
 
 /// Return total number of physical pages.
 pub fn totalPages() u64 {
@@ -41,6 +59,10 @@ var next_free_hint: u64 = 0;
 // --- Public API ---
 
 pub fn init(memmap: *const limine.MemmapResponse) void {
+    arena_mode = false;
+    arena_base = 0;
+    min_alloc_page = 512;
+
     const entry_count = memmap.entry_count;
     const entries = memmap.entries;
 
@@ -141,7 +163,7 @@ pub fn init(memmap: *const limine.MemmapResponse) void {
         }
     }
 
-    next_free_hint = MIN_ALLOC_PAGE;
+    next_free_hint = min_alloc_page;
 
     serial.writeString("[PMM] Total pages: ");
     fmt.writeDecimal64(total_pages);
@@ -158,6 +180,67 @@ pub fn init(memmap: *const limine.MemmapResponse) void {
     klog.log(.info, "PMM initialized");
 }
 
+/// SK-5: compact PMM over a contiguous identity-mapped arena (no Limine).
+/// Page indices are relative to `phys_base`; suitable for non-x86 shared-kernel smoke.
+pub fn initArena(phys_base: u64, length: u64) void {
+    arena_mode = true;
+    arena_base = phys_base;
+    min_alloc_page = 0;
+    highest_phys = phys_base + length;
+
+    total_pages = length / PAGE_SIZE;
+    if (total_pages == 0) {
+        serial.writeString("[PMM] FATAL: arena too small\n");
+        return;
+    }
+    bitmap_size = (total_pages + 7) / 8;
+    const ref_counts_size = total_pages * 2;
+    const page_frames_size = total_pages * @sizeOf(page_frame.PageFrame);
+    const alignment_padding: u64 = 3;
+    const metadata_size = ((bitmap_size + 7) & ~@as(u64, 7)) + ref_counts_size + alignment_padding + page_frames_size;
+    if (metadata_size + PAGE_SIZE > length) {
+        serial.writeString("[PMM] FATAL: arena too small for metadata\n");
+        return;
+    }
+
+    const bitmap_phys = phys_base;
+    bitmap = @ptrFromInt(hhdm.physToVirt(bitmap_phys));
+    const ref_counts_phys = (bitmap_phys + bitmap_size + 7) & ~@as(u64, 7);
+    ref_counts = @ptrFromInt(@as(usize, @truncate(hhdm.physToVirt(ref_counts_phys))));
+
+    @memset(bitmap[0..bitmap_size], 0);
+    const rc_bytes: [*]u8 = @ptrCast(ref_counts);
+    @memset(rc_bytes[0 .. total_pages * 2], 0);
+
+    const page_frames_phys = (ref_counts_phys + ref_counts_size + 3) & ~@as(u64, 3);
+    const page_frames_ptr: [*]page_frame.PageFrame = @ptrFromInt(@as(usize, @truncate(hhdm.physToVirt(page_frames_phys))));
+    page_frame.init(total_pages, page_frames_ptr);
+
+    free_pages = 0;
+    var p: u64 = 0;
+    while (p < total_pages) : (p += 1) {
+        setBit(p);
+        free_pages += 1;
+    }
+
+    const metadata_pages = (metadata_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    p = 0;
+    while (p < metadata_pages) : (p += 1) {
+        if (isBitSet(p)) {
+            clearBit(p);
+            if (free_pages > 0) free_pages -= 1;
+        }
+    }
+
+    next_free_hint = 0;
+    serial.writeString("[PMM] arena pages: ");
+    fmt.writeDecimal64(total_pages);
+    serial.writeString(", free: ");
+    fmt.writeDecimal64(free_pages);
+    serial.writeString("\n");
+    klog.log(.info, "PMM arena initialized");
+}
+
 /// Allocate a single 4KB physical page. Returns physical address or null.
 /// Uses word-at-a-time bitmap scanning for performance (64 pages per iteration).
 /// v53.12: On OOM, attempts swap reclaim before returning null.
@@ -169,22 +252,22 @@ pub fn allocPage() ?u64 {
         if (result != null) return result;
     }
 
-    // v53.12: OOM — try swap reclaim before giving up
-    // v53.13: Use atomic CAS to ensure only one CPU enters reclaim at a time
-    if (@cmpxchgStrong(bool, &in_swap_reclaim, false, true, .acquire, .monotonic) == null) {
-        defer @atomicStore(bool, &in_swap_reclaim, false, .release);
+    // v53.12: OOM — try swap reclaim before giving up (x86 shared-kernel path only).
+    if (comptime builtin.cpu.arch == .x86_64) {
+        if (@cmpxchgStrong(bool, &in_swap_reclaim, false, true, .acquire, .monotonic) == null) {
+            defer @atomicStore(bool, &in_swap_reclaim, false, .release);
 
-        const swap = @import("swap.zig");
-        if (swap.isEnabled()) {
-            const sched = @import("../proc/sched.zig");
-            if (sched.currentTask()) |t| {
-                if (t.page_table_phys != 0) {
-                    _ = swap.reclaimPages(t.page_table_phys, 32);
-                    // Retry allocation after reclaim
-                    const flags = lock.acquire();
-                    const result = allocPageLocked();
-                    lock.release(flags);
-                    return result;
+            const swap = @import("swap.zig");
+            if (swap.isEnabled()) {
+                const sched = @import("../proc/sched.zig");
+                if (sched.currentTask()) |t| {
+                    if (t.page_table_phys != 0) {
+                        _ = swap.reclaimPages(t.page_table_phys, 32);
+                        const flags = lock.acquire();
+                        const result = allocPageLocked();
+                        lock.release(flags);
+                        return result;
+                    }
                 }
             }
         }
@@ -209,12 +292,12 @@ fn allocPageLocked() ?u64 {
             const bit = @ctz(word);
             const page = w * 64 + bit;
             if (page >= total_pages) return null;
-            if (page >= MIN_ALLOC_PAGE and ref_counts[page] == 0) {
+            if (page >= min_alloc_page and ref_counts[page] == 0) {
                 clearBit(page);
                 ref_counts[page] = 1;
                 free_pages -= 1;
                 next_free_hint = page + 1;
-                return page * PAGE_SIZE;
+                return physFromPage(page);
             }
             // Stale bit — clear and try next bit in same word
             clearBit(page);
@@ -222,28 +305,28 @@ fn allocPageLocked() ?u64 {
         }
     }
 
-    // Phase 2: wrap around from MIN_ALLOC_PAGE to hint
+    // Phase 2: wrap around from min_alloc_page to hint
     const end_word = @min(start_word + 1, total_words);
-    w = MIN_ALLOC_PAGE / 64;
+    w = min_alloc_page / 64;
     while (w < end_word) : (w += 1) {
         var word = words[w];
         while (word != 0) {
             const bit = @ctz(word);
             const page = w * 64 + bit;
             if (page >= total_pages) return null;
-            if (page >= MIN_ALLOC_PAGE and ref_counts[page] == 0) {
+            if (page >= min_alloc_page and ref_counts[page] == 0) {
                 clearBit(page);
                 ref_counts[page] = 1;
                 free_pages -= 1;
                 next_free_hint = page + 1;
-                return page * PAGE_SIZE;
+                return physFromPage(page);
             }
             clearBit(page);
             word &= word - 1;
         }
     }
 
-    next_free_hint = MIN_ALLOC_PAGE;
+    next_free_hint = min_alloc_page;
     return null;
 }
 
@@ -255,10 +338,10 @@ pub fn allocContiguous(count: usize) ?u64 {
     const flags = lock.acquire();
     defer lock.release(flags);
 
-    const first = if (next_free_hint >= MIN_ALLOC_PAGE and next_free_hint + count <= total_pages)
+    const first = if (next_free_hint >= min_alloc_page and next_free_hint + count <= total_pages)
         next_free_hint
     else
-        MIN_ALLOC_PAGE;
+        min_alloc_page;
 
     var pass: u8 = 0;
     var start: u64 = first;
@@ -271,7 +354,7 @@ pub fn allocContiguous(count: usize) ?u64 {
             start = skip_to;
         }
         pass += 1;
-        start = MIN_ALLOC_PAGE;
+        start = min_alloc_page;
     }
     return null;
 }
@@ -294,7 +377,7 @@ fn tryAllocContiguousAt(start: u64, count: usize, skip_to: *u64) ?u64 {
     }
     free_pages -= count;
     next_free_hint = start + @as(u64, @intCast(count));
-    return start * PAGE_SIZE;
+    return physFromPage(start);
 }
 
 /// Reserve a physical page (mark as used). Used to protect page table pages
@@ -304,7 +387,7 @@ pub fn reservePage(phys: u64) void {
     const flags = lock.acquire();
     defer lock.release(flags);
 
-    const page = phys / PAGE_SIZE;
+    const page = pageFromPhys(phys);
     if (page >= total_pages) return;
     if (isBitSet(page)) {
         clearBit(page);
@@ -316,7 +399,7 @@ pub fn reservePage(phys: u64) void {
 pub fn freePage(addr: u64) void {
     const flags = lock.acquire();
 
-    const page = addr / PAGE_SIZE;
+    const page = pageFromPhys(addr);
     if (page >= total_pages) {
         lock.release(flags);
         return;
@@ -345,7 +428,7 @@ pub fn freePage(addr: u64) void {
 pub fn addRef(addr: u64) void {
     const flags = lock.acquire();
     defer lock.release(flags);
-    const page = addr / PAGE_SIZE;
+    const page = pageFromPhys(addr);
     if (page < total_pages) ref_counts[page] +|= 1;
 }
 
@@ -355,7 +438,7 @@ pub fn addRefBatch(addrs: []const u64) void {
     const flags = lock.acquire();
     defer lock.release(flags);
     for (addrs) |addr| {
-        const page = addr / PAGE_SIZE;
+        const page = pageFromPhys(addr);
         if (page < total_pages) ref_counts[page] +|= 1;
     }
 }
@@ -367,7 +450,7 @@ pub fn freePageBatch(addrs: []const u64) void {
     const flags = lock.acquire();
     defer lock.release(flags);
     for (addrs) |addr| {
-        const page = addr / PAGE_SIZE;
+        const page = pageFromPhys(addr);
         if (page >= total_pages) continue;
         if (ref_counts[page] == 0) continue; // Skip double-free silently
         ref_counts[page] -= 1;
@@ -383,7 +466,7 @@ pub fn freePageBatch(addrs: []const u64) void {
 pub fn decRef(addr: u64) u16 {
     const flags = lock.acquire();
     defer lock.release(flags);
-    const page = addr / PAGE_SIZE;
+    const page = pageFromPhys(addr);
     if (page >= total_pages) return 0;
     if (ref_counts[page] > 0) ref_counts[page] -= 1;
     return ref_counts[page];
@@ -393,7 +476,7 @@ pub fn decRef(addr: u64) u16 {
 pub fn getRefCount(addr: u64) u16 {
     const flags = lock.acquire();
     defer lock.release(flags);
-    const page = addr / PAGE_SIZE;
+    const page = pageFromPhys(addr);
     if (page >= total_pages) return 0;
     return ref_counts[page];
 }
