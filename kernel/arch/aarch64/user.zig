@@ -85,7 +85,7 @@ fn handleWrite(frame: *TrapFrame) void {
     frame.x0 = len;
 }
 
-/// Returns 0 → eret to EL0. SYS_EXIT never returns (halts in EL1).
+/// Returns 0 → eret to EL0. SYS_EXIT continues into M9-7 sched (noreturn).
 pub fn handleSvc(frame: *TrapFrame) u64 {
     // AArch64 SVC already sets ELR to the following instruction — do not +4.
     switch (frame.x8) {
@@ -96,7 +96,10 @@ pub fn handleSvc(frame: *TrapFrame) u64 {
         SYS_EXIT => {
             putStr("  user sys_exit: OK\n");
             putStr("[aarch64] M9-6 complete\n");
-            while (true) asm volatile ("wfi");
+            // Continue into M9-7 preemptive sched (noreturn).
+            const sched = @import("sched.zig");
+            sched.init();
+            sched.start();
         },
         else => {
             putStr("  unknown syscall\n");

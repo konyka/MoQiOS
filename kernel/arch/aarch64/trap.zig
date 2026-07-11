@@ -1,4 +1,4 @@
-//! EL1 exception handling for the aarch64 skeleton (Milestone 9-2…9-6).
+//! EL1 exception handling for the aarch64 skeleton (Milestone 9-2…9-7).
 
 const uart = @import("uart.zig");
 
@@ -91,9 +91,18 @@ export fn trapHandleSyncEl0(frame: *anyopaque) callconv(.c) u64 {
     while (true) asm volatile ("wfi");
 }
 
-export fn trapHandleIrq(frame: *anyopaque) callconv(.c) void {
-    _ = frame;
-    _ = @import("gic.zig").handleIrq();
+/// Returns the TrapFrame pointer to resume (may switch stacks under M9-7 sched).
+export fn trapHandleIrq(frame: *anyopaque) callconv(.c) usize {
+    const gic = @import("gic.zig");
+    const intid = gic.handleIrq();
+    if (intid == gic.TIMER_PPI) {
+        const sched = @import("sched.zig");
+        if (sched.isEnabled()) {
+            const tf: *sched.TrapFrame = @ptrCast(@alignCast(frame));
+            return @intFromPtr(sched.onTimer(tf));
+        }
+    }
+    return @intFromPtr(frame);
 }
 
 pub fn init() void {

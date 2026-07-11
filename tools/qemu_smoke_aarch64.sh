@@ -53,20 +53,22 @@ pass_markers() {
         grep -q "timer IRQ firings=" "$LOG_FILE" &&
         grep -q "M9-5 complete" "$LOG_FILE" &&
         grep -q "hello from U" "$LOG_FILE" &&
-        grep -q "M9-6 complete" "$LOG_FILE"
+        grep -q "M9-6 complete" "$LOG_FILE" &&
+        grep -q "preemptive switches=" "$LOG_FILE" &&
+        grep -q "M9-7 complete" "$LOG_FILE"
 }
 
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if pass_markers; then
-        echo "PASS: MoQiOS aarch64 M9-6 smoke (EL0 + SVC)."
+        echo "PASS: MoQiOS aarch64 M9-7 smoke (EL0/SVC + preempt sched)."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         if pass_markers; then
-            echo "PASS: MoQiOS aarch64 M9-6 smoke (EL0 + SVC)."
+            echo "PASS: MoQiOS aarch64 M9-7 smoke (EL0/SVC + preempt sched)."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -80,7 +82,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for aarch64 smoke markers."
-echo "Expected: M9-1..M9-5 markers plus 'hello from U' and 'M9-6 complete'."
+echo "Expected: M9-1..M9-6 markers plus 'preemptive switches=' and 'M9-7 complete'."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

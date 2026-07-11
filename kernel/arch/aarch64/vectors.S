@@ -85,7 +85,8 @@ sync_el1h_entry:
 
 .balign 0x80
 irq_el1h_entry:
-    sub     sp, sp, #176
+    /* 192-byte frame: GPRs + elr/spsr (needed for preemptive stack switch). */
+    sub     sp, sp, #192
     stp     x0, x1, [sp, #0]
     stp     x2, x3, [sp, #16]
     stp     x4, x5, [sp, #32]
@@ -97,8 +98,16 @@ irq_el1h_entry:
     stp     x16, x17, [sp, #128]
     stp     x18, x29, [sp, #144]
     str     x30, [sp, #160]
+    mrs     x1, elr_el1
+    mrs     x2, spsr_el1
+    stp     x1, x2, [sp, #176]
     mov     x0, sp
     bl      trapHandleIrq
+    /* x0 = frame to resume (may differ after sched switch). */
+    mov     sp, x0
+    ldp     x1, x2, [sp, #176]
+    msr     elr_el1, x1
+    msr     spsr_el1, x2
     ldr     x30, [sp, #160]
     ldp     x18, x29, [sp, #144]
     ldp     x16, x17, [sp, #128]
@@ -110,7 +119,7 @@ irq_el1h_entry:
     ldp     x4, x5, [sp, #32]
     ldp     x2, x3, [sp, #16]
     ldp     x0, x1, [sp, #0]
-    add     sp, sp, #176
+    add     sp, sp, #192
     eret
 
 .balign 0x80
