@@ -42,7 +42,7 @@ pub fn spawn(name_ptr: u64) i64 {
     if (loader.loadProgram(name, caller_tid)) |task_idx| {
         const t = @import("task.zig");
         if (t.getTask(task_idx)) |new_task| {
-            const se = @import("../arch/x86_64/syscall_entry.zig");
+            const se = @import("../arch/arch.zig").syscall;
             const my_cpu: u8 = @intCast(se.getPerCpu().cpu_id);
             // Task #2: prefer hard affinity, fall back to last_cpu (initial placement).
             const target_cpu: u8 = if (new_task.cpu_affinity >= 0)

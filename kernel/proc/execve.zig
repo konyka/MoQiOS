@@ -1,7 +1,7 @@
 const serial = @import("../arch/arch.zig").serial;
-const syscall_entry = @import("../arch/x86_64/syscall_entry.zig");
+const syscall_entry = @import("../arch/arch.zig").syscall;
 const getPerCpu = syscall_entry.getPerCpu;
-const idt = @import("../arch/x86_64/idt.zig");
+const idt = @import("../arch/arch.zig").interrupts;
 
 /// Prepare execve: load program, destroy old address space, set up new context.
 /// Returns the frame address for iretq tail, or null if loading fails (before destroying old AS).
@@ -86,7 +86,7 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64) ?u64 {
         :
         : [cr3] "r" (result.pml4),
         : .{ .rax = true, .memory = true });
-    @import("../arch/x86_64/gdt.zig").setRsp0(getPerCpu().cpu_id, cur.kernel_stack_top);
+    @import("../arch/arch.zig").gdt.setRsp0(getPerCpu().cpu_id, cur.kernel_stack_top);
     getPerCpu().kernel_rsp = cur.kernel_stack_top;
 
     // Build interrupt frame for new program
@@ -186,7 +186,7 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64) ?u64 {
         :
         : [cr3] "r" (result.pml4),
         : .{ .rax = true, .memory = true });
-    @import("../arch/x86_64/gdt.zig").setRsp0(getPerCpu().cpu_id, cur.kernel_stack_top);
+    @import("../arch/arch.zig").gdt.setRsp0(getPerCpu().cpu_id, cur.kernel_stack_top);
     getPerCpu().kernel_rsp = cur.kernel_stack_top;
 
     const stack_top = cur.kernel_stack_top;

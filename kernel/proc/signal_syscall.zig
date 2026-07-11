@@ -12,7 +12,7 @@ const vfs_mod = @import("../fs/vfs.zig");
 const bo = @import("../lib/byte_order.zig");
 
 // Access syscall_entry globals for sigreturn
-const syscall_entry = @import("../arch/x86_64/syscall_entry.zig");
+const syscall_entry = @import("../arch/arch.zig").syscall;
 
 /// sigaction(signum, act_ptr, oldact_ptr) → 0 or -errno
 pub fn sigaction(signum: u32, act_ptr: u64, oldact_ptr: u64) i64 {

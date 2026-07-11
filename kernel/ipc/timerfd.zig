@@ -13,7 +13,7 @@
 const sched = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
-const idt = @import("../arch/x86_64/idt.zig");
+const idt = @import("../arch/arch.zig").interrupts;
 const tsc = @import("../arch/arch.zig").tsc;
 const bo = @import("../lib/byte_order.zig");
 

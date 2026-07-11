@@ -544,7 +544,7 @@ fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
 
 /// Get a monotonically increasing millisecond timestamp for TCP timestamps.
 fn timestampMs() u32 {
-    const idt = @import("../arch/x86_64/idt.zig");
+    const idt = @import("../arch/arch.zig").interrupts;
     return @truncate(idt.getTickCount() * 10); // ticks are ~10ms each, convert to ms
 }
 

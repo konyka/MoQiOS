@@ -9,7 +9,7 @@
 ///   - Elevator merge: consecutive LBA requests merged into single large request
 
 const serial = @import("../arch/arch.zig").serial;
-const idt = @import("../arch/x86_64/idt.zig");
+const idt = @import("../arch/arch.zig").interrupts;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 const DEADLINE_MS: u64 = 500; // Request expiry time

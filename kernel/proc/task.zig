@@ -72,7 +72,7 @@ pub const Task = struct {
     /// Physical address of the process's PML4 page table (0 for kernel threads).
     page_table_phys: u64,
     /// Personality: native, linux, or windows ABI.
-    personality: @import("../arch/x86_64/syscall_entry.zig").Personality,
+    personality: @import("../arch/arch.zig").syscall.Personality,
     /// Whether this task runs in user mode.
     is_user: bool,
     /// User-space entry point (RIP).
@@ -746,7 +746,7 @@ pub fn createUserProcess(
 /// Skips `parent_cpu` — same-CPU children rely on timer preemption of blocked parent.
 pub fn kickChildCpus(parent_tid: u32, parent_cpu: u8) void {
     const sched = @import("sched.zig");
-    const max_cpus: u8 = @intCast(@import("../arch/x86_64/syscall_entry.zig").MAX_CPUS);
+    const max_cpus: u8 = @intCast(@import("../arch/arch.zig").syscall.MAX_CPUS);
     var cpus: [4]u8 = undefined;
     var cpu_count: u8 = 0;
     {
@@ -785,7 +785,7 @@ pub fn kickChildCpus(parent_tid: u32, parent_cpu: u8) void {
 pub fn kickRemoteForTask(slot: u32) void {
     const t = getTask(slot) orelse return;
     const sched = @import("sched.zig");
-    const se = @import("../arch/x86_64/syscall_entry.zig");
+    const se = @import("../arch/arch.zig").syscall;
     // Task #2: target the queued CPU. Prefer hard affinity if set, else last_cpu.
     const target_cpu: u8 = if (t.cpu_affinity >= 0) @intCast(t.cpu_affinity) else t.last_cpu;
     const here: u8 = @intCast(se.getPerCpu().cpu_id);

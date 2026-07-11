@@ -28,17 +28,17 @@
 ///     M8-5b-2 adds affinity scheduling (APs run pinned user tasks); M8-6 adds
 ///     ranged TLB shootdown.
 const acpi = @import("acpi/acpi_parser.zig");
-const lapic = @import("arch/x86_64/lapic.zig");
-const gdt = @import("arch/x86_64/gdt.zig");
-const idt = @import("arch/x86_64/idt.zig");
+const lapic = @import("arch/arch.zig").timer;
+const gdt = @import("arch/arch.zig").gdt;
+const idt = @import("arch/arch.zig").interrupts;
 const paging = @import("arch/arch.zig").paging;
 const hhdm = @import("mm/hhdm.zig");
 const pmm = @import("mm/pmm.zig");
 const serial = @import("arch/arch.zig").serial;
 const sched = @import("proc/sched.zig");
 const task = @import("proc/task.zig");
-const syscall_entry = @import("arch/x86_64/syscall_entry.zig");
-const context_switch = @import("arch/x86_64/context_switch.zig");
+const syscall_entry = @import("arch/arch.zig").syscall;
+const context_switch = @import("arch/arch.zig").context_switch;
 const fmt = @import("lib/fmt.zig");
 
 const KERNEL_STACK_PAGES: u64 = 16;

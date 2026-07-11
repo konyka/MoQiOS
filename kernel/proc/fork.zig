@@ -1,8 +1,8 @@
-const syscall_entry = @import("../arch/x86_64/syscall_entry.zig");
+const syscall_entry = @import("../arch/arch.zig").syscall;
 const SyscallFrame = syscall_entry.SyscallFrame;
 const getPerCpu = syscall_entry.getPerCpu;
 const serial = @import("../arch/arch.zig").serial;
-const idt = @import("../arch/x86_64/idt.zig");
+const idt = @import("../arch/arch.zig").interrupts;
 const fmt = @import("../lib/fmt.zig");
 
 /// Syscall #57: fork() — clone the current process.

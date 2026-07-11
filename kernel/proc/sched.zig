@@ -16,11 +16,11 @@
 /// Among tasks of equal priority, round-robin is used.
 const task = @import("task.zig");
 const per_cpu = @import("per_cpu.zig");
-const idt = @import("../arch/x86_64/idt.zig");
-const gdt = @import("../arch/x86_64/gdt.zig");
+const idt = @import("../arch/arch.zig").interrupts;
+const gdt = @import("../arch/arch.zig").gdt;
 const paging = @import("../arch/arch.zig").paging;
-const syscall_entry = @import("../arch/x86_64/syscall_entry.zig");
-const context_switch = @import("../arch/x86_64/context_switch.zig");
+const syscall_entry = @import("../arch/arch.zig").syscall;
+const context_switch = @import("../arch/arch.zig").context_switch;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const fmt = @import("../lib/fmt.zig");
 
@@ -454,8 +454,8 @@ pub fn forceRescheduleFromIpi(frame: *idt.InterruptFrame) void {
 
 /// Ask another CPU to run its scheduler (after a remote task becomes ready).
 pub fn kickCpu(cpu_id: u8) void {
-    const lapic_mod = @import("../arch/x86_64/lapic.zig");
-    const se = @import("../arch/x86_64/syscall_entry.zig");
+    const lapic_mod = @import("../arch/arch.zig").timer;
+    const se = @import("../arch/arch.zig").syscall;
     if (cpu_id >= se.MAX_CPUS) return;
     const apic_id: u8 = @truncate(se.percpu_array[cpu_id].apic_id);
     asm volatile ("mfence" ::: .{ .memory = true });

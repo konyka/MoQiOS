@@ -3,7 +3,7 @@
 /// Provides sector read/write operations via the virtio transport.
 /// Detects virtio-blk devices via PCI vendor 0x1AF4, device 0x1001.
 const serial = @import("../arch/arch.zig").serial;
-const io = @import("../arch/x86_64/io.zig");
+const io = @import("../arch/arch.zig").io;
 const hhdm = @import("../mm/hhdm.zig");
 const paging = @import("../arch/arch.zig").paging;
 const pmm = @import("../mm/pmm.zig");

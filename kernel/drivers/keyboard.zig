@@ -1,5 +1,5 @@
 const serial = @import("../arch/arch.zig").serial;
-const io = @import("../arch/x86_64/io.zig");
+const io = @import("../arch/arch.zig").io;
 
 const PS2_DATA: u16 = 0x60;
 const PS2_STATUS: u16 = 0x64;

@@ -74,7 +74,7 @@ fn generateCpuinfo(buf: [*]u8, max_len: u32) u32 {
 }
 
 fn generateUptime(buf: [*]u8, max_len: u32) u32 {
-    const idt = @import("../arch/x86_64/idt.zig");
+    const idt = @import("../arch/arch.zig").interrupts;
     const ticks = idt.getTickCount();
     const secs = ticks / 100;
     const hundredths = ticks % 100;
@@ -240,7 +240,7 @@ fn generateFilesystems(buf: [*]u8, max_len: u32) u32 {
 /// Generate /proc/stat — basic system statistics
 fn generateStat(buf: [*]u8, max_len: u32) u32 {
     const smp = @import("../smp.zig");
-    const idt = @import("../arch/x86_64/idt.zig");
+    const idt = @import("../arch/arch.zig").interrupts;
     const ticks = idt.getTickCount();
     var pos: u32 = 0;
     // Aggregate CPU line (user/nice/system/idle in jiffies)

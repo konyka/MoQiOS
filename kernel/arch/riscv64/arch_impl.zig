@@ -75,9 +75,14 @@ pub const cpu = struct {
     }
 };
 
-/// Segment/TSS surface — no-op on riscv64 (SK-1 stub).
+/// Segment/TSS surface — no-op on riscv64 (SK-1/SK-9 stub).
 pub const gdt = struct {
     pub fn init() void {}
+
+    pub fn setRsp0(cpu_id: usize, rsp0: u64) void {
+        _ = cpu_id;
+        _ = rsp0;
+    }
 };
 
 /// Monotonic counter — `rdtime` when available (SK-1 stub API).
@@ -96,13 +101,48 @@ pub const tsc = struct {
     }
 };
 
-/// Syscall / per-CPU GS surface — no-op until shared kernel wires ecall (SK-1).
+/// Syscall / per-CPU surface — stub until shared kernel wires ecall (SK-9).
 pub const syscall = struct {
+    pub const MAX_CPUS: u32 = 1;
+
+    pub const Personality = enum(u8) {
+        linux = 0,
+    };
+
     pub fn init() void {}
 
     pub fn setPerCpuGsBase(cpu_id: u32) void {
         _ = cpu_id;
     }
+};
+
+/// Port I/O — not applicable on riscv64 (SK-9 stub).
+pub const io = struct {
+    pub fn outb(port: u16, val: u8) void {
+        _ = port;
+        _ = val;
+    }
+    pub fn outw(port: u16, val: u16) void {
+        _ = port;
+        _ = val;
+    }
+    pub fn outl(port: u16, val: u32) void {
+        _ = port;
+        _ = val;
+    }
+    pub fn inb(port: u16) u8 {
+        _ = port;
+        return 0xff;
+    }
+    pub fn inw(port: u16) u16 {
+        _ = port;
+        return 0xffff;
+    }
+    pub fn inl(port: u16) u32 {
+        _ = port;
+        return 0xffffffff;
+    }
+    pub fn ioWait() void {}
 };
 
 /// Maskable IRQ save/restore (sstatus.SIE).

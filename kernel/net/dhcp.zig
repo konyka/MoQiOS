@@ -14,7 +14,7 @@
 const serial = @import("../arch/arch.zig").serial;
 const udp = @import("udp.zig");
 const netif = @import("netif.zig");
-const idt = @import("../arch/x86_64/idt.zig");
+const idt = @import("../arch/arch.zig").interrupts;
 const fmt = @import("../lib/fmt.zig");
 const bo = @import("../lib/byte_order.zig");
 

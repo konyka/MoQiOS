@@ -17,7 +17,7 @@
 
 const task_mod = @import("task.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
-const syscall_entry = @import("../arch/x86_64/syscall_entry.zig");
+const syscall_entry = @import("../arch/arch.zig").syscall;
 const tsc = @import("../arch/arch.zig").tsc;
 
 pub const MAX_CPUS: u32 = syscall_entry.MAX_CPUS;

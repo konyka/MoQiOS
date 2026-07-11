@@ -12,7 +12,7 @@
 ///
 /// QEMU exposes Intel ICH9 AHCI (8086:2922) at PCI 0:31.2.
 const serial = @import("../arch/arch.zig").serial;
-const io = @import("../arch/x86_64/io.zig");
+const io = @import("../arch/arch.zig").io;
 const hhdm = @import("../mm/hhdm.zig");
 const paging = @import("../arch/arch.zig").paging;
 const pmm = @import("../mm/pmm.zig");

@@ -22,7 +22,7 @@ const task_mod = @import("../proc/task.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const vfs = @import("../fs/vfs.zig");
 const tcp = @import("tcp.zig");
-const idt = @import("../arch/x86_64/idt.zig");
+const idt = @import("../arch/arch.zig").interrupts;
 
 // ---- Event type constants (Linux ABI) ----
 

@@ -4,7 +4,7 @@
 /// Max 16 timers, tick resolution ~10ms (100Hz LAPIC timer).
 /// Signal delivery is simplified: overrun count is tracked, optional SIGEV_SIGNAL queued.
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
-const idt = @import("../arch/x86_64/idt.zig");
+const idt = @import("../arch/arch.zig").interrupts;
 const copy = @import("../mm/copy_from_user.zig");
 
 const MAX_TIMERS: u32 = 16;

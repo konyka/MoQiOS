@@ -4,7 +4,7 @@
 const copy = @import("../mm/copy_from_user.zig");
 const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
-const se = @import("../arch/x86_64/syscall_entry.zig");
+const se = @import("../arch/arch.zig").syscall;
 
 /// waitpid(pid, status_ptr) -> child tid or -errno.
 /// pid: -1 (any child) or >0 (specific child).
@@ -55,7 +55,7 @@ pub fn waitpidWithOptions(pid_raw: u64, status_ptr: u64, options: u32) i64 {
     parent.waiting_for_child = false;
     se.syncUserRspFromTask(parent);
     se.getPerCpu().kernel_rsp = parent.kernel_stack_top;
-    @import("../arch/x86_64/gdt.zig").setRsp0(se.getPerCpu().cpu_id, parent.kernel_stack_top);
+    @import("../arch/arch.zig").gdt.setRsp0(se.getPerCpu().cpu_id, parent.kernel_stack_top);
 
     // Woken up — a child has exited. Now reap it.
     if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {

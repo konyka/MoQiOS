@@ -2,7 +2,7 @@ const pmm = @import("../mm/pmm.zig");
 const slab = @import("../mm/slab.zig");
 const task = @import("../proc/task.zig");
 const sched = @import("../proc/sched.zig");
-const idt = @import("../arch/x86_64/idt.zig");
+const idt = @import("../arch/arch.zig").interrupts;
 const serial = @import("../arch/arch.zig").serial;
 const paging = @import("../arch/arch.zig").paging;
 

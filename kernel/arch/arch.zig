@@ -29,3 +29,4 @@ pub const tsc = impl.tsc;
 pub const syscall = impl.syscall;
 pub const irq = impl.irq;
 pub const tlb = impl.tlb;
+pub const io = impl.io;
