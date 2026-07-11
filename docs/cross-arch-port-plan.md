@@ -12,8 +12,8 @@
 ## 0. 现状基线（移植起点 → 2026-07 更新）
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
-  **SK-4**：`IrqSpinlock` 经 `arch.irq`；`pmm`/`slab` 串口走 facade。
-  **SK-5（2026-07-11）**：`pmm.initArena` + comptime 隔离 swap；非 x86 链入共享 `mm/slab`。
+  **SK-5**：`pmm.initArena` + comptime 隔离 swap；非 x86 链入共享 `mm/slab`（BSS arena）。
+  **SK-6（2026-07-11）**：从内核镜像上方划出 4MiB 真实物理内存给共享 PMM，arch freelist 从 carve 之后开始。
   完整 `main.zig` / Limine 驱动仍未在非 x86 链接。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
@@ -183,7 +183,7 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **M9-7**：双 EL1 内核线程 + CNTV 抢占切换；IRQ 帧保存 ELR/SPSR 以支持换栈；
   `preemptive switches=` 达标后打印 `M9-7 complete`。
 - **门禁**：`smoke-aarch64`（…`hello from U` + `M9-6` + `preemptive switches=` + `M9-7 complete`）。
-- **后续**：SK-6 统一/扩大共享 PMM，继续隔离 x86 专用驱动。
+- **后续**：SK-7 继续 facade 迁移（serial/驱动 comptime 隔离）。
 
 ---
 
@@ -369,16 +369,16 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-5；⬜ SK-6 扩大/统一 PMM
-Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-5；⬜ SK-6 扩大/统一 PMM
+Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-6；⬜ SK-7 serial/驱动 facade
+Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-6；⬜ SK-7 serial/驱动 facade
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**SK-6** — 继续 comptime 隔离驱动/ACPI，或统一 arch-local PMM 与共享 PMM；
-> SK-1…SK-5 已完成。
+> 当前下一执行项：**SK-7** — 继续把高频 `serial` 直连迁到 facade，或 comptime 隔离 ACPI/PCI；
+> SK-1…SK-6 已完成。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。

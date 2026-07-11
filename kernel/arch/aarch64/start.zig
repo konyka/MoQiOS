@@ -15,6 +15,8 @@ const fdt = @import("fdt.zig");
 const pmm = @import("pmm.zig");
 const paging = @import("paging.zig");
 
+extern const __kernel_end: u8;
+
 const BOOT_STACK_SIZE: usize = 64 * 1024;
 /// Must match `qemu_run_aarch64.sh` loader address.
 const DTB_FALLBACK: usize = 0x4a000000;
@@ -166,7 +168,14 @@ export fn kmain(x0_dtb: usize) callconv(.c) noreturn {
         while (true) asm volatile ("wfi");
     }
 
-    pmm.init(regions[0..nreg], dtb, dtb_size);
+    // SK-6: carve 4 MiB above the kernel for shared mm/pmm+slab.
+    const sk6 = @import("../../shared/sk6.zig");
+    const kernel_end = (@intFromPtr(&__kernel_end) + 4095) & ~@as(usize, 4095);
+    const share_base = kernel_end;
+    const share_len = sk6.SHARE_BYTES;
+    const arch_free_start = share_base + share_len;
+
+    pmm.init(regions[0..nreg], dtb, dtb_size, arch_free_start);
     putStr("  pmm free_pages=");
     putDec(pmm.freeCount());
     putStr("\n");
@@ -181,8 +190,8 @@ export fn kmain(x0_dtb: usize) callconv(.c) noreturn {
     }
     putStr("  MMU enabled (identity map)\n");
 
-    // SK-5 after MMU + SCTLR.A clear: Zig Debug may emit `str q` for `?u64`.
-    @import("../../shared/sk5.zig").announce();
+    // SK-6 after MMU + SCTLR.A clear: Zig Debug may emit `str q` for `?u64`.
+    sk6.announce(@intCast(share_base), @intCast(share_len));
 
     // Map a fresh page at a non-identity VA, write/read, then unmap + #PF.
     const test_va: usize = 0x80000000;

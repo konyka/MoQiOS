@@ -14,6 +14,8 @@ const fdt = @import("fdt.zig");
 const pmm = @import("pmm.zig");
 const sv39 = @import("sv39.zig");
 
+extern const __kernel_end: u8;
+
 const BOOT_STACK_SIZE: usize = 64 * 1024;
 
 comptime {
@@ -154,7 +156,14 @@ export fn kmain(hartid: usize, dtb: usize) callconv(.c) noreturn {
         while (true) asm volatile ("wfi");
     }
 
-    pmm.init(regions[0..nreg], dtb, dtb_size);
+    // SK-6: carve 4 MiB above the kernel for shared mm/pmm+slab.
+    const sk6 = @import("../../shared/sk6.zig");
+    const kernel_end = (@intFromPtr(&__kernel_end) + 4095) & ~@as(usize, 4095);
+    const share_base = kernel_end;
+    const share_len = sk6.SHARE_BYTES;
+    const arch_free_start = share_base + share_len;
+
+    pmm.init(regions[0..nreg], dtb, dtb_size, arch_free_start);
     putStr("  pmm free_pages=");
     putDec(pmm.freeCount());
     putStr("\n");
@@ -171,8 +180,7 @@ export fn kmain(hartid: usize, dtb: usize) callconv(.c) noreturn {
     }
     putStr("  satp Sv39 enabled (identity map)\n");
 
-    // SK-5 after Sv39 identity map (matches aarch64: shared slab after MMU).
-    @import("../../shared/sk5.zig").announce();
+    sk6.announce(@intCast(share_base), @intCast(share_len));
 
     // Map a fresh page at a non-identity VA, write/read, then unmap + #PF.
     const test_va: usize = 0x40000000;

@@ -40,19 +40,20 @@ fn addRange(start: usize, end: usize, dtb_lo: usize, dtb_hi: usize) void {
     }
 }
 
-pub fn init(regions: []const @import("fdt.zig").MemRegion, dtb: usize, dtb_size: usize) void {
+pub fn init(regions: []const @import("fdt.zig").MemRegion, dtb: usize, dtb_size: usize, free_start: usize) void {
     free_head = 0;
     free_count = 0;
     total_pages = 0;
 
     const kernel_end = alignUp(@intFromPtr(&__kernel_end), PAGE_SIZE);
+    const start_floor = @max(kernel_end, alignUp(free_start, PAGE_SIZE));
     const dtb_lo = alignDown(dtb, PAGE_SIZE);
     const dtb_hi = alignUp(dtb + dtb_size, PAGE_SIZE);
 
     for (regions) |r| {
         const base: usize = @intCast(r.base);
         const end: usize = @intCast(r.base + r.size);
-        const start = @max(base, kernel_end);
+        const start = @max(base, start_floor);
         if (start < end) addRange(start, end, dtb_lo, dtb_hi);
     }
 }
