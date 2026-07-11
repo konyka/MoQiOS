@@ -10,11 +10,17 @@ pub const interrupts = @import("idt.zig");
 pub const paging = @import("paging.zig");
 pub const timer = @import("lapic.zig");
 pub const context_switch = @import("context_switch.zig");
+pub const gdt = @import("gdt.zig");
+pub const tsc = @import("tsc.zig");
+pub const syscall = @import("syscall_entry.zig");
 
 pub const cpu = struct {
     /// Park the current CPU forever. Used by panic / boot-failure paths.
     pub fn halt() noreturn {
-        while (true) asm volatile ("hlt");
+        while (true) {
+            asm volatile ("cli");
+            asm volatile ("hlt");
+        }
     }
 
     /// Spin-wait hint for busy loops (PAUSE on x86_64).

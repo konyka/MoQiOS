@@ -60,3 +60,36 @@ pub const cpu = struct {
         return 0;
     }
 };
+
+/// Segment/TSS surface — no-op on aarch64 (SK-1 stub).
+pub const gdt = struct {
+    pub fn init() void {}
+};
+
+/// Monotonic counter — CNTVCT_EL0 (SK-1 stub API).
+pub const tsc = struct {
+    pub fn init() void {}
+
+    pub fn read() u64 {
+        return asm volatile ("mrs %[r], cntvct_el0"
+            : [r] "=r" (-> u64),
+        );
+    }
+
+    pub fn nanos() u64 {
+        const frq = asm volatile ("mrs %[r], cntfrq_el0"
+            : [r] "=r" (-> u64),
+        );
+        if (frq == 0) return 0;
+        return (read() *% 1_000_000_000) / frq;
+    }
+};
+
+/// Syscall / per-CPU surface — no-op until shared kernel wires SVC (SK-1).
+pub const syscall = struct {
+    pub fn init() void {}
+
+    pub fn setPerCpuGsBase(cpu_id: u32) void {
+        _ = cpu_id;
+    }
+};

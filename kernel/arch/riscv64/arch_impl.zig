@@ -72,3 +72,33 @@ pub const cpu = struct {
         return 0;
     }
 };
+
+/// Segment/TSS surface — no-op on riscv64 (SK-1 stub).
+pub const gdt = struct {
+    pub fn init() void {}
+};
+
+/// Monotonic counter — `rdtime` when available (SK-1 stub API).
+pub const tsc = struct {
+    pub fn init() void {}
+
+    pub fn read() u64 {
+        return asm volatile ("rdtime %[r]"
+            : [r] "=r" (-> u64),
+        );
+    }
+
+    pub fn nanos() u64 {
+        // QEMU virt typically ~10 MHz timebase; approximate only.
+        return read() * 100;
+    }
+};
+
+/// Syscall / per-CPU GS surface — no-op until shared kernel wires ecall (SK-1).
+pub const syscall = struct {
+    pub fn init() void {}
+
+    pub fn setPerCpuGsBase(cpu_id: u32) void {
+        _ = cpu_id;
+    }
+};

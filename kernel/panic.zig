@@ -1,6 +1,7 @@
 /// Kernel panic handler — Zig's std.builtin.PanicHandler interface.
 const std = @import("std");
-const serial = @import("arch/x86_64/serial.zig");
+const arch = @import("arch/arch.zig");
+const serial = arch.serial;
 const fmt = @import("lib/fmt.zig");
 
 pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
@@ -16,9 +17,5 @@ pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) nor
     }
 
     serial.writeString("  system halted\n");
-
-    while (true) {
-        asm volatile ("cli");
-        asm volatile ("hlt");
-    }
+    arch.cpu.halt();
 }

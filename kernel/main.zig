@@ -4,20 +4,19 @@
 /// LAPIC timer, scheduler, IPC engine, user-space support.
 const limine = @import("limine.zig");
 const arch = @import("arch/arch.zig");
-// Progressive arch migration: serial / interrupts / paging / timer /
-// context_switch go through arch.zig. gdt/tsc/syscall_entry stay x86-direct
-// until those surfaces are added to the arch contract.
+// Progressive arch migration (SK-1): serial / interrupts / paging / timer /
+// context_switch / gdt / tsc / syscall go through arch.zig.
 const serial = arch.serial;
 const idt = arch.interrupts;
 const paging = arch.paging;
 const lapic = arch.timer;
 const context_switch = arch.context_switch;
-const gdt = @import("arch/x86_64/gdt.zig");
+const gdt = arch.gdt;
 const hhdm = @import("mm/hhdm.zig");
 const klog = @import("klog.zig");
 const acpi = @import("acpi/acpi_parser.zig");
 const symbol_table = @import("debug/symbol_table.zig");
-const tsc = @import("arch/x86_64/tsc.zig");
+const tsc = arch.tsc;
 const pmm = @import("mm/pmm.zig");
 const addr_space = @import("mm/addr_space.zig");
 const slab = @import("mm/slab.zig");
@@ -26,7 +25,7 @@ const task = @import("proc/task.zig");
 const sched = @import("proc/sched.zig");
 const ipc = @import("ipc/ipc.zig");
 const capability = @import("ipc/capability.zig");
-const syscall_entry = @import("arch/x86_64/syscall_entry.zig");
+const syscall_entry = arch.syscall;
 const ramdisk = @import("fs/ramdisk.zig");
 const loader = @import("proc/loader.zig");
 const fmt = @import("lib/fmt.zig");

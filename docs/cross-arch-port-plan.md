@@ -11,10 +11,10 @@
 
 ## 0. 现状基线（移植起点 → 2026-07 更新）
 
-- **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 各有 `arch_impl.zig`。
-  共享内核路径仍大量直连 `arch/x86_64/...`；`main.zig` / `klog.zig` 已渐进迁到 facade
-  （serial / interrupts / paging / timer / context_switch）。riscv64 构建根仍是
-  `start.zig` 骨架，**尚未**链接完整 `main.zig`。
+- **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
+  **SK-1（2026-07-11）**：`main.zig` 经 facade 使用 serial/interrupts/paging/timer/context_switch/
+  **gdt/tsc/syscall**；`panic.zig` 经 `arch.serial` + `arch.cpu.halt`。共享内核路径仍大量直连
+  `arch/x86_64/...`（smp/驱动等）；riscv64/aarch64 构建根仍是 `start.zig` 骨架，**尚未**链接完整 `main.zig`。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
 - **riscv64**：M0–M7 完成（…PMM/Sv39、timer/sched、U-mode/`ecall`、virtio-mmio blk + net MAC）。
@@ -183,7 +183,7 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **M9-7**：双 EL1 内核线程 + CNTV 抢占切换；IRQ 帧保存 ELR/SPSR 以支持换栈；
   `preemptive switches=` 达标后打印 `M9-7 complete`。
 - **门禁**：`smoke-aarch64`（…`hello from U` + `M9-6` + `preemptive switches=` + `M9-7 complete`）。
-- **后续**：共享内核复用（链 `main.zig`）/ virtio 等。
+- **后续**：共享内核复用（SK-1 facade 已完成；SK-2 链精简 `main` 子集）。
 
 ---
 
@@ -369,15 +369,16 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7（…/virtio-blk+net）；⬜ 共享内核复用待续
-Phase F2 — 第三 ISA             ✅ M9-7（EL0/SVC + sched）；⬜ 共享内核
+Phase F — 第二 ISA              ✅ M2–M7（…/virtio-blk+net）；🟡 SK-1 facade；⬜ SK-2 链 main
+Phase F2 — 第三 ISA             ✅ M9-7（EL0/SVC + sched）；🟡 SK-1 facade；⬜ SK-2 链 main
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**riscv64/aarch64 共享内核复用**（渐进迁 `main.zig` 到 arch facade）。
+> 当前下一执行项：**SK-2 共享内核** — comptime 隔离 Limine/x86 驱动，使 riscv64 能链接
+> 精简 `main` 子集（或共享 `klog`/mm 入口）；SK-1（gdt/tsc/syscall/panic → facade）已完成。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。
