@@ -346,7 +346,7 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 | **SMP 浮点** | FXSAVE/FXRSTOR 按任务 | ✅ M8-5b-3 | 中（已落地） |
 | **架构抽象** | `kernel/arch/arch.zig` 多 ISA 接口 | ✅ M4；渐进迁移中 | 中（移植效率，非热路径） |
 | **riscv64** | M2–M7 ✅；共享内核复用待续 | ✅ M7 blk+net | N/A（第二 ISA） |
-| **aarch64** | M9-1…M9-3 ✅（PL011 + brk + paging） | ✅ M9-3 | N/A（第三 ISA） |
+| **aarch64** | M9-1…M9-4 ✅（…paging + CNTV） | ✅ M9-4 | N/A（第三 ISA） |
 | **未集成脚手架** | `futex`/`select`/`inotify`/`clone`/`mprotect`/SysV IPC/`aio`/`splice`/`dhcp`/`dns` 等 | 🧩 源文件在树中，未 `@import` | 低（按需接入） |
 | **缺页恢复** | 内核态 per-instruction fixup | ⚠️ 页表预检替代 | 中 |
 | **单元测试** | `zig build test`（host helpers） | ✅ 有基础用例 | 低（质量门） |
@@ -369,15 +369,15 @@ Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
 Phase F — 第二 ISA              ✅ M2–M7（…/virtio-blk+net）；⬜ 共享内核复用待续
-Phase F2 — 第三 ISA             🟡 M9-3（分页）；⬜ 定时器/U-mode
+Phase F2 — 第三 ISA             🟡 M9-4（CNTV）；⬜ GIC IRQ / U-mode
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**M9-4 aarch64 generic timer**，或 **riscv64 共享内核复用**。
-> M3–M7（blk+net）与 M9-1…M9-3 已于 2026-07-11 完成。
+> 当前下一执行项：**M9-5 aarch64 GIC + 中断驱动 timer**，或 **U-mode**，或 **riscv64 共享内核复用**。
+> M3–M7（blk+net）与 M9-1…M9-4 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。
 
