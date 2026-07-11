@@ -8,6 +8,7 @@
 # Overridable:
 #   MOQI_SERIAL  serial target (default: stdio; e.g. file:/tmp/rv.log)
 #   MOQI_SMP     number of harts (default: 1)
+#   MOQI_DISK    raw disk image for virtio-blk (default: auto-created temp)
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -30,6 +31,13 @@ fi
 
 SERIAL_TARGET="${MOQI_SERIAL:-stdio}"
 SMP_COUNT="${MOQI_SMP:-1}"
+DISK_IMAGE="${MOQI_DISK:-/tmp/moqios-riscv64-disk.img}"
+
+# M7: virtio-blk test disk — sector 0 starts with a known magic string.
+if [ ! -f "$DISK_IMAGE" ]; then
+    dd if=/dev/zero of="$DISK_IMAGE" bs=512 count=64 status=none
+    printf 'MOQI_RV64_DISK' | dd of="$DISK_IMAGE" conv=notrunc status=none
+fi
 
 echo "========================================="
 echo " MoQiOS riscv64 — Launching QEMU (virt + OpenSBI)"
@@ -42,6 +50,8 @@ exec qemu-system-riscv64 \
     -kernel "$KERNEL" \
     -m 256M \
     -smp "$SMP_COUNT" \
+    -drive file="$DISK_IMAGE",format=raw,if=none,id=disk0 \
+    -device virtio-blk-device,drive=disk0 \
     -serial "$SERIAL_TARGET" \
     -display none \
     -no-reboot

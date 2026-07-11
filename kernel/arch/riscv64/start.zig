@@ -207,6 +207,12 @@ export fn kmain(hartid: usize, dtb: usize) callconv(.c) noreturn {
 
     putStr("[riscv64] M3 complete\n");
 
+    // ---- M7: virtio-mmio block device read ----
+    const vblk = @import("virtio_blk.zig");
+    if (!vblk.selfTest()) {
+        putStr("  (M7 skipped/failed — continuing)\n");
+    }
+
     // ---- M6: U-mode + ecall (continues into M5 on sys_exit) ----
     const user = @import("user.zig");
     user.enter();

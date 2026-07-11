@@ -1,5 +1,5 @@
 #!/bin/bash
-# Bounded riscv64 QEMU smoke test (Milestone 6+).
+# Bounded riscv64 QEMU smoke test (Milestone 7+).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -42,6 +42,8 @@ trap cleanup EXIT
 
 pass_markers() {
     [ -f "$LOG_FILE" ] &&
+        grep -q "disk magic: OK" "$LOG_FILE" &&
+        grep -q "M7 complete" "$LOG_FILE" &&
         grep -q "hello from U" "$LOG_FILE" &&
         grep -q "M6 complete" "$LOG_FILE" &&
         grep -q "M5 complete" "$LOG_FILE"
@@ -50,14 +52,14 @@ pass_markers() {
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if pass_markers; then
-        echo "PASS: MoQiOS riscv64 M6 smoke (U-mode ecall + M5 sched)."
+        echo "PASS: MoQiOS riscv64 M7 smoke (virtio-blk + U-mode + sched)."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         if pass_markers; then
-            echo "PASS: MoQiOS riscv64 M6 smoke (U-mode ecall + M5 sched)."
+            echo "PASS: MoQiOS riscv64 M7 smoke (virtio-blk + U-mode + sched)."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -71,7 +73,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for riscv64 smoke markers."
-echo "Expected: 'hello from U', 'M6 complete', and 'M5 complete'."
+echo "Expected: 'disk magic: OK', 'M7 complete', 'hello from U', 'M6 complete', 'M5 complete'."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

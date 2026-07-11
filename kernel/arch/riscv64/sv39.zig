@@ -106,8 +106,9 @@ fn mapRangeIdentity(phys_lo: usize, phys_hi: usize, flags: MapFlags) bool {
 pub fn initIdentity(regions: []const @import("fdt.zig").MemRegion) bool {
     root_phys = pmm.allocPage() orelse return false;
 
-    // UART MMIO (NS16550 at 0x10000000 on QEMU virt).
-    if (!mapPage(0x10000000, 0x10000000, .{ .read = true, .write = true, .exec = false }))
+    // MMIO on QEMU virt: UART (0x10000000) + 8 virtio-mmio slots
+    // (0x10001000..0x10008fff). Map the whole 9-page window R/W.
+    if (!mapRangeIdentity(0x10000000, 0x10009000, .{ .read = true, .write = true, .exec = false }))
         return false;
 
     for (regions) |r| {
