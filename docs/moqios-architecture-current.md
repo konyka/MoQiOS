@@ -88,14 +88,15 @@ MoQiOS 是一个运行在 x86_64 架构上的**单体内核** (Monolithic Kernel
 连续查明并修复了三个相互掩盖的深层根因：**TSS 布局错位**（用户态硬件中断投递从未工作，详见
 **1.7 节**）、**ext2 inode 越界**（256B 磁盘 inode 写入 128B 结构体）、**中断 stub 寄存器破坏**
 （被中断代码 RAX/RCX 遭污染，详见 **1.8 节**）。三者全部修复后，系统首次**完整启动至交互式
-`MoQiOS shell`**，依次跑通 `init` + `hello2`–`hello28` 全部用户态测试（含用户态被定时器抢占、
-ext2 多级目录读写删，QEMU 串口验证，零异常、零三重故障）。
+`MoQiOS shell`**，依次跑通 `init` 自动序列（至 `hello21 done`）及后续用户态测试（含用户态被定时器抢占、
+ext2 多级目录读写删，QEMU 串口验证，零异常、零三重故障）。当前 `init.S` 在 hello21 后进入 shell；
+`hello22`–`hello28` 为树内可手动运行的用例，不在自动序列中。
 
 ### 已修复缺陷
 
 | # | 位置 | 问题 | 修复 |
 |---|---|---|---|
-| 1 | `kernel/smp.zig` | AP（应用处理器）启动后在 `apEntry` 访问 LAPIC MMIO 崩溃，导致 BSP 在 `smp.init()` 内卡死、整机引导卡住 | 先增加 `enable_ap_startup` 开关（默认 `false`）以单处理器模式运行保证可用；LAPIC-on-AP 崩溃根因已查明并修复，详见下文 **1.6 节** |
+| 1 | `kernel/smp.zig` | AP（应用处理器）启动后在 `apEntry` 访问 LAPIC MMIO 崩溃，导致 BSP 在 `smp.init()` 内卡死、整机引导卡住 | 曾用 `enable_ap_startup=false` 单核保底；LAPIC-on-AP 根因已修，**现默认 `true`**（见 **1.6** / M8-5a） |
 | 2 | `kernel/proc/task.zig` `allocKernelStack` | 多页内核栈通过 `mapPage` 重映射 HHDM 地址，但 Limine 用大页映射 HHDM，`mapPage`/`ensureTable` 无法下钻大页，导致把假页表写进大页数据帧、破坏内核内存 | 改用 `pmm.allocContiguous` 分配连续物理页，直接返回其 HHDM 基址（连续物理页在 HHDM 中天然连续且已映射，无需改页表） |
 | 3 | `kernel/arch/x86_64/paging.zig` `ensureTable` | 遇到 present 的大页项时当作下一级页表返回基址，会静默破坏内存 | 大页项返回 `error.HugePagePresent`，让调用方显式失败而非破坏地址空间 |
 | 4 | `kernel/proc/task.zig` + `kernel/fs/vfs.zig` | `Task` 结构体约 62KB（每 fd 内联 readahead 缓存 + env/cwd 缓冲），存于 `?Task` 数组时编译器在内核栈上物化整份 `Task` 临时变量，溢出引导栈触发三重故障 | 任务表改为非可选 `[MAX_TASKS]Task`（占用由已有 `slot_bitmap` 跟踪），就地 `@memset`+逐字段构建，绝不在栈上复制整份 Task；`FdTable.init()` 改用 comptime 默认常量，避免 57KB 栈局部 |
@@ -159,11 +160,10 @@ AP 冷 walk 才暴露。
 修复后实测：AP 稳定走完 `BCDEFGHIJ` 标记 → `[SMP] AP 1 initialized` → `[SMP] 2 CPUs online`，
 不再崩在 LAPIC 访问。
 
-### SMP 当前状态（2026-06，M8 进行中）
+### SMP 当前状态（2026-07，M8 x86_64 已完成）
 
 历史阻塞点（TSS 错位、中断 stub 寄存器破坏、调度器全局状态）均已修复。**`enable_ap_startup=true`**，
-`-smp 2` 下 AP 稳定上线并参与 timerTick。v27.0 修复 AP 栈物理连续性、BSP reap 调度间隙、
-TLB shootdown EOI 顺序、sleepOn 阻塞延迟等 SMP 基础设施问题。
+`-smp 2` 下 AP 稳定上线并参与 timerTick / 用户态调度。门禁：`zig build smoke` / `smoke-smp`。
 
 | 子里程碑 | 状态 | 说明 |
 |---|---|---|
@@ -338,7 +338,7 @@ syscall 执行期间触发，于是 ext2 syscall 的返回值 RAX 被改成 `&in
 - `hello21`（ext2 写）：`create=3 write=22`，回读校验 `verify=1`；
 - `hello24`（ext2 unlink）：`unlink=0`（不再是垃圾值）、`verify gone fd=-1`、**PASS**；
 - `hello25`（ext2 多级路径 `testdir/subfile.txt`）：`create/write/reopen/unlink` 全部正确、**PASS**；
-- 全程零 `EXCEPTION`、零 `PANIC`、零三重故障，`init` 跑完 `hello2`–`hello28` 后进入 shell。
+- 全程零 `EXCEPTION`、零 `PANIC`、零三重故障，`init` 跑完自动序列（至 `hello21`）后进入 shell。
 
 > 经验：Zig `naked` 函数中**绝不能用 asm `"r"`/`"i"` 输入**传递在"保存现场"之前就需稳定的值——
 > 编译器会把输入物化在模板首条指令之前。中断/syscall 入口一律改用"先保存 GPR，再 RIP 相对
@@ -452,9 +452,9 @@ M8 路线图的最后三项重要 SMP 性能优化同时落地，**考虑到三�
 
 - **统一入口**：`arch.zig` 根据 `builtin.cpu.arch` comptime 选择实现
 - **x86_64 实现**：`arch_impl.zig` 重导出现有模块，零回归
-- **riscv64 实现**：SBI serial + stvec interrupts + stub paging/timer/context_switch
-- **首步迁移**：`main.zig` 串口通过 `arch.zig` 引入
-- **下一步**：逐步迁移 gdt/idt/paging 等深度模块
+- **riscv64 实现**：UART16550 serial + `stvec` trap（M2）；paging/timer/context_switch 仍为 stub（M3/M5）
+- **首步迁移**：`main.zig` / `klog.zig` 经 `arch.zig`（serial/interrupts/paging/timer/context_switch）
+- **下一步**：继续迁 gdt/tsc/syscall_entry；riscv64 推进 M3（PMM/Sv39）
 
 ### 1.10.4 调度器 Profiling 基础设施
 

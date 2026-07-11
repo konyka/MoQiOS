@@ -71,8 +71,8 @@
 - ✅ M0：本路线图 + 选型 riscv64。
 - ✅ M1：
   - `build.zig` 增加 `-Darch=x86_64|riscv64`（默认 x86_64，行为与之前完全一致）。
-  - `kernel/arch/riscv64/start.zig`：S-mode `_start` → 设栈 → `kmain`，经 SBI legacy 控制台打印，
-    SBI shutdown/`wfi` 停机。
+  - `kernel/arch/riscv64/start.zig`：S-mode `_start` → 设栈 → `kmain`，经控制台打印后停机
+    （M1 用 SBI；**M2 起改 UART16550 直驱**）。
   - `kernel/arch/riscv64/linker.ld`：链接到 `0x80200000`（OpenSBI 之上）。
   - `tools/qemu_run_riscv64.sh`：`qemu-system-riscv64 -machine virt -bios default -kernel ...`。
   - 验证：`zig build -Darch=riscv64` 产出合法 riscv64 ELF（readelf）；`zig build`（x86_64）仍启动到
@@ -100,7 +100,7 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **`kernel/arch/x86_64/arch_impl.zig`**：重导出现有 x86_64 模块（serial、gdt、idt、
   paging、lapic、tsc 等），与现有代码完全兼容，零回归。
 - **`kernel/arch/riscv64/arch_impl.zig`**：riscv64 的实现，包含：
-  - SBI legacy console 串口输出
+  - UART16550 直驱串口（M2；M1 曾用 SBI legacy console）
   - `stvec` 向量配置 + 基本 trap 帧
   - 分页/定时器/上下文切换 stub（待后续里程碑实现）
 - **首步迁移**：`main.zig` 中的串口通过 `arch.zig` 引入，作为渐进迁移的第一步。
@@ -236,8 +236,8 @@ zig build smoke && zig build smoke-smp   # x86_64 不回归
 - **CPL0 中断不需 RSP0**：AP 空闲时处于内核态(CPL0)，定时器中断不切栈（无特权级变化），直接用 AP 当前内核栈；
   故 M8-5a AP 不触及 TSS RSP0。
 - **验证**：`-smp 2` 下 `[SMP] 2 CPUs online`，AP 走完 B–J 全部 bring-up 标记并 `AP 1 initialized`，BSP 跑完
-  `hello2`–`hello28`（含 hello26 TCP echo、fork/execve、ext2）到 `MoQiOS shell`，**零故障/零非规范 RSP0**
-  （串口 395 行，比单核多 9 行 SMP bring-up 信息）。
+  `init` 自动序列（至 `hello21`）到 `MoQiOS shell`，**零故障/零非规范 RSP0**
+  （串口约 395 行，比单核多 9 行 SMP bring-up 信息）。
 
 ### M8-5b 调查（让 AP 真正参与调度的阻塞点）
 
@@ -315,7 +315,7 @@ zig build smoke && zig build smoke-smp   # x86_64 不回归
 | **SMP 内存** | 范围 TLB shootdown（`invlpg`） | ✅ M8-6 | **高**（已落地） |
 | **SMP 浮点** | FXSAVE/FXRSTOR 按任务 | ✅ M8-5b-3 | 中（已落地） |
 | **架构抽象** | `kernel/arch/arch.zig` 多 ISA 接口 | ✅ M4；渐进迁移中 | 中（移植效率，非热路径） |
-| **riscv64** | M2 ✅；M3–M7（PMM/调度/用户态/virtio） | 🚧 M2 完成 | N/A（第二 ISA） |
+| **riscv64** | M2 ✅；M3–M7（PMM/调度/用户态/virtio） | ✅ M2；⬜ M3 下一执行项 | N/A（第二 ISA） |
 | **未集成脚手架** | `futex`/`select`/`inotify`/`clone`/`mprotect`/SysV IPC/`aio`/`splice`/`dhcp`/`dns` 等 | 🧩 源文件在树中，未 `@import` | 低（按需接入） |
 | **缺页恢复** | 内核态 per-instruction fixup | ⚠️ 页表预检替代 | 中 |
 | **单元测试** | `zig build test`（host helpers） | ✅ 有基础用例 | 低（质量门） |

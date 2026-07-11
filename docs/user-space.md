@@ -69,7 +69,8 @@ static inline long sys_write(int fd, const void *buf, unsigned long n) {
 
 职责：
 
-1. 顺序 `spawn` 所有自动化测试程序（`hello2`, `hello3`, …, `hello28`），并 `waitpid` 收回。
+1. 顺序 `spawn` 自动化测试程序（当前至 `hello21`），并 `waitpid` 收回；随后进入交互 shell。
+   （`hello22`–`hello28` 仍在树中，可手动运行，**不**在 `init.S` 自动序列内。）
 2. 测试全部通过后启动交互式 Shell（`sh.elf`）。
 3. 在 Shell 退出后处于阻塞状态（避免内核因 init 退出而 panic）。
 
@@ -79,9 +80,8 @@ static inline long sys_write(int fd, const void *buf, unsigned long n) {
 _start:
     setup_argv_envp
     spawn("hello2");  waitpid;
-    spawn("hello3");  waitpid;
     ...
-    spawn("hello28"); waitpid;
+    spawn("hello21"); waitpid;   // last auto-test
     spawn("sh");      waitpid;
     loop_forever
 ```

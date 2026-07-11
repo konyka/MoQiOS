@@ -51,7 +51,7 @@
 > **2026-06-21 SMP 性能三件套**：FPU/SSE 任务状态保存、Per-CPU 调度队列 + Work-Stealing、
 > 范围 TLB Shootdown 同时完成。三者互为前提，完成后用户任务可跨核迁移，AP 参与负载均衡。
 
-**用户程序**: ~2,300 行 C/ASM | **测试**: `hello2`–`hello28` 运行时测试 + 交互式 Shell
+**用户程序**: ~2,300 行 C/ASM | **测试**: `init` 自动跑 `hello2`–`hello21` + Shell；`hello22`–`hello28` 可手动运行
 (注: `zig build test` 当前为占位，实测以 QEMU 运行 `hello*` 为准)
 
 ## 功能特性
@@ -120,8 +120,8 @@
 ### 跨架构支持（M4 已完成）
 - **Arch 抽象层**：`kernel/arch/arch.zig` 统一接口入口（comptime 选择 ISA）
 - **x86_64 实现**：`arch_impl.zig` 重导出现有模块，零回归
-- **riscv64 实现**：SBI serial + stvec interrupts + stub paging/timer/context_switch
-- **迁移进度**：`main.zig` 串口已通过 `arch.zig` 引入，后续逐步迁移深度模块
+- **riscv64 实现**：UART16550 serial + `stvec` trap（M2）；paging/timer/context_switch stub（M3/M5）
+- **迁移进度**：`main.zig`/`klog.zig` 已走 `arch.zig`；门禁含 `smoke-riscv`
 
 ## 系统调用列表
 

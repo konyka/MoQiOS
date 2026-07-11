@@ -273,9 +273,9 @@ The new single-core smoke gate exposed a runtime hang at `spawn("hello2")`. The 
 | User-space teardown | `destroyUserSpace` skips the shared sigreturn trampoline mapping | Prevents repeated frees of the one shared trampoline page |
 
 The 2026-07-10 rerun passed both single-core and dual-core smoke after the COW/copy_to_user and
-shared-trampoline teardown fixes. The remaining documentation gap is broader: older architecture docs
-still describe `hello28` as part of the automatic `init.S` sequence even though current `init.S` enters
-the shell after `hello21`.
+shared-trampoline teardown fixes. **Doc drift fixed 2026-07-11**: primary docs now state that
+`init.S` auto-sequence ends at `hello21` (shell next); `hello22`–`hello28` are manual. riscv64
+console docs updated from SBI putchar to UART16550 (M2).
 
 ### 5.2 Historical Verification
 
