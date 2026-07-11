@@ -53,7 +53,7 @@
 | **M0** | 路线图文档（本文件）、第二 ISA 选型（riscv64） | 文档评审 | ✅ 完成 |
 | **M1** | `-Darch` 多目标构建；riscv64 内核**骨架**（`_start`+SBI 控制台+`kmain`+linker.ld）启动并打印 | 交叉编译成合法 riscv64 ELF（readelf/objdump）；x86_64 不回归（构建+启动到 shell）；运行时验证待 emulator | ✅ 完成（构建+运行时） |
 | **M2** | riscv64 早期 init：**soft-float ABI（lp64，禁用 F/D）**；解析 a0(hartid)/a1(DTB)；UART16550 直驱；`stvec` + trap 帧；breakpoint 自测 | QEMU virt 启动打印 + `ebreak` 陷入被捕获 | ✅ 完成（2026-07-10） |
-| **M3** | riscv64 物理内存管理：从 DTB/Limine memmap 建 PMM；Sv39 分页 map/unmap + HHDM | 映射/取消映射自测；缺页陷入 | ⬜ 待办 |
+| **M3** | riscv64 物理内存管理：从 DTB `/memory` 建 PMM；Sv39 恒等映射 + map/unmap + 缺页自测 | QEMU virt：`page-fault trap: OK` + `M3 complete` | ✅ 完成（2026-07-11） |
 | **M4** | **抽取 `arch` 接口**：定义 `kernel/arch/arch.zig`（comptime 选择实现）；x86 侧经 facade 重导出；riscv64 提供同名 stub/实装 | x86_64 仍启动到 shell；riscv64 后端可编译（完整 `main.zig` 复用待 M5+） | ✅ 接口完成（渐进迁移进行中） |
 | **M5** | riscv64 定时器 + 上下文切换 + 调度器接入（复用 `proc/sched.zig` 上层逻辑） | riscv64 跑多内核线程轮转 | ⬜ 待办 |
 | **M6** | riscv64 用户态：U-mode 进入、syscall（`ecall`）入口、地址空间隔离 | riscv64 跑 `hello*` 用户程序 | ⬜ 待办 |
@@ -137,22 +137,13 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - `kernel/main.zig` 经 `arch.zig` 使用：`serial`、`interrupts`、`paging`、`timer`、`context_switch`。
 - 仍直连 x86：`gdt`、`tsc`、`syscall_entry`（待后续里程碑纳入 arch 契约）。
 
-### 验证
+### 3.7 M3 完成记录（2026-07-11）
 
-```bash
-zig build -Darch=riscv64
-MOQI_SERIAL=file:/tmp/rv.log ./tools/qemu_run_riscv64.sh
-# 预期：
-#   MoQiOS riscv64: M2 early init (soft-float, UART16550, stvec)
-#   hartid=0
-#   dtb=... magic=0xd00dfeed ... (FDT OK)
-#   stvec installed
-#   [trap] breakpoint caught ...
-#   breakpoint trap: OK
-#   [riscv64] M2 complete; shutting down
-
-zig build smoke && zig build smoke-smp   # x86_64 不回归
-```
+- **`fdt.zig`**：解析 `/memory` `reg`（父节点 `#address-cells/#size-cells` 栈，避免 `/soc` 覆盖）。
+- **`pmm.zig`**：4K 页侵入式 freelist；排除内核镜像与 DTB 页。
+- **`sv39.zig`**：根页表 + DRAM/UART 恒等映射，`satp` MODE=Sv39；`mapPage`/`unmapPage`。
+- **自测**：映射 VA `0x40000000` R/W → unmap → 故意 load → `page-fault trap: OK`。
+- **门禁**：`zig build -Darch=riscv64 smoke-riscv`。
 
 ---
 
@@ -315,7 +306,7 @@ zig build smoke && zig build smoke-smp   # x86_64 不回归
 | **SMP 内存** | 范围 TLB shootdown（`invlpg`） | ✅ M8-6 | **高**（已落地） |
 | **SMP 浮点** | FXSAVE/FXRSTOR 按任务 | ✅ M8-5b-3 | 中（已落地） |
 | **架构抽象** | `kernel/arch/arch.zig` 多 ISA 接口 | ✅ M4；渐进迁移中 | 中（移植效率，非热路径） |
-| **riscv64** | M2 ✅；M3–M7（PMM/调度/用户态/virtio） | ✅ M2；⬜ M3 下一执行项 | N/A（第二 ISA） |
+| **riscv64** | M2–M3 ✅；M5–M7（调度/用户态/virtio） | ✅ M3；⬜ M5 下一执行项 | N/A（第二 ISA） |
 | **未集成脚手架** | `futex`/`select`/`inotify`/`clone`/`mprotect`/SysV IPC/`aio`/`splice`/`dhcp`/`dns` 等 | 🧩 源文件在树中，未 `@import` | 低（按需接入） |
 | **缺页恢复** | 内核态 per-instruction fixup | ⚠️ 页表预检替代 | 中 |
 | **单元测试** | `zig build test`（host helpers） | ✅ 有基础用例 | 低（质量门） |
@@ -337,14 +328,14 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2（soft-float/UART/stvec）；⬜ M3–M7 待续
+Phase F — 第二 ISA              ✅ M2–M3（UART/stvec/PMM/Sv39）；⬜ M5–M7 待续
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**riscv64 M3**（DTB memmap → PMM + Sv39）。
+> 当前下一执行项：**riscv64 M5**（定时器 + 上下文切换 + 调度接入）。M3（PMM/Sv39）已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。
 

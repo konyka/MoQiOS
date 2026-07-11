@@ -1,8 +1,8 @@
 #!/bin/bash
-# Bounded riscv64 QEMU smoke test (Milestone 2+).
+# Bounded riscv64 QEMU smoke test (Milestone 3+).
 #
 # Builds (unless skipped), runs the riscv64 kernel under OpenSBI, and checks
-# for the M2 completion markers on the serial log.
+# for the M3 completion markers on the serial log.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -43,22 +43,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
+pass_markers() {
+    [ -f "$LOG_FILE" ] &&
+        grep -q "page-fault trap: OK" "$LOG_FILE" &&
+        grep -q "M3 complete" "$LOG_FILE"
+}
+
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
-    if [ -f "$LOG_FILE" ] &&
-       grep -q "breakpoint trap: OK" "$LOG_FILE" &&
-       grep -q "M2 complete" "$LOG_FILE"; then
-        echo "PASS: MoQiOS riscv64 M2 smoke (UART16550 + stvec breakpoint)."
+    if pass_markers; then
+        echo "PASS: MoQiOS riscv64 M3 smoke (PMM + Sv39 + page fault)."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
-    # Kernel shuts down via SBI after M2 — QEMU may exit before we poll.
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-        if [ -f "$LOG_FILE" ] &&
-           grep -q "breakpoint trap: OK" "$LOG_FILE" &&
-           grep -q "M2 complete" "$LOG_FILE"; then
-            echo "PASS: MoQiOS riscv64 M2 smoke (UART16550 + stvec breakpoint)."
+        if pass_markers; then
+            echo "PASS: MoQiOS riscv64 M3 smoke (PMM + Sv39 + page fault)."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -72,7 +73,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for riscv64 smoke markers."
-echo "Expected: 'breakpoint trap: OK' and 'M2 complete'."
+echo "Expected: 'page-fault trap: OK' and 'M3 complete'."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

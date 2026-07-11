@@ -1,37 +1,27 @@
-//! RISC-V 64 kernel early bring-up — Milestone 2 of the cross-ISA port.
+//! RISC-V 64 kernel early bring-up — Milestones 2–3 of the cross-ISA port.
 //!
 //! Boot model: QEMU `virt` with `-bios default -kernel kernel.elf`. OpenSBI
 //! enters `_start` in S-mode with:
 //!   a0 = hartid
 //!   a1 = pointer to the flattened device tree (DTB)
 //!
-//! M2 goals (see docs/cross-arch-port-plan.md):
-//!   * soft-float ABI (lp64, no F/D) — enforced by build.zig `-mcpu`
-//!   * preserve/print hartid + DTB magic
-//!   * UART16550 direct-drive console (no SBI putchar)
-//!   * `stvec` + trap frame; catch a deliberate breakpoint (`ebreak`)
-//!     (illegal-instruction is not delegated by default OpenSBI medeleg)
+//! M2: soft-float, UART16550, stvec + ebreak self-test
+//! M3: FDT `/memory` → PMM freelist → Sv39 identity map + map/unmap + #PF test
 
 const uart = @import("uart.zig");
 const trap = @import("trap.zig");
+const fdt = @import("fdt.zig");
+const pmm = @import("pmm.zig");
+const sv39 = @import("sv39.zig");
 
 const BOOT_STACK_SIZE: usize = 64 * 1024;
 
-// Keep the arch_impl contract type-checked even though this skeleton is the
-// build root (not the full kernel/main.zig).
 comptime {
     _ = @import("arch_impl.zig");
 }
 
-/// Boot stack in .bss. Exported so naked `_start` can `la` it (medany).
 export var boot_stack: [BOOT_STACK_SIZE]u8 align(16) = undefined;
 
-/// Kernel entry from OpenSBI (S-mode). Naked: no prologue — we own the stack.
-/// a0/a1 are preserved through the stack setup (only t0 is clobbered) and
-/// become the C arguments to `kmain(hartid, dtb)`.
-///
-/// Must live in `.text.boot` so the linker places it at 0x80200000 — OpenSBI's
-/// `-kernel` handoff jumps to the payload base, not ELF `e_entry`.
 export fn _start() linksection(".text.boot") callconv(.naked) noreturn {
     asm volatile (
         \\la sp, boot_stack
@@ -78,7 +68,6 @@ fn putDec(v: u64) void {
     }
 }
 
-/// Read big-endian u32 (FDT header fields are BE).
 fn readBe32(addr: usize) u32 {
     const p: [*]const u8 = @ptrFromInt(addr);
     return (@as(u32, p[0]) << 24) |
@@ -87,9 +76,7 @@ fn readBe32(addr: usize) u32 {
         @as(u32, p[3]);
 }
 
-/// SBI system reset (SRST extension) — preferred over legacy shutdown.
 fn sbiShutdown() void {
-    // SBI SRST: EID 0x53525354, FID 0, reset_type=0 (shutdown), reason=0
     asm volatile ("ecall"
         :
         : [eid] "{a7}" (@as(usize, 0x53525354)),
@@ -97,7 +84,6 @@ fn sbiShutdown() void {
           [a0] "{a0}" (@as(usize, 0)),
           [a1] "{a1}" (@as(usize, 0)),
         : .{ .memory = true });
-    // Fallback: legacy shutdown EID 0x08
     asm volatile ("ecall"
         :
         : [eid] "{a7}" (@as(usize, 0x08)),
@@ -105,25 +91,25 @@ fn sbiShutdown() void {
         : .{ .memory = true });
 }
 
-/// First C-ABI function on the kernel stack.
 export fn kmain(hartid: usize, dtb: usize) callconv(.c) noreturn {
     uart.init();
-    putStr("MoQiOS riscv64: M2 early init (soft-float, UART16550, stvec)\n");
+    putStr("MoQiOS riscv64: M3 bring-up (PMM + Sv39)\n");
 
     putStr("  hartid=");
     putDec(hartid);
     putStr("\n");
 
+    var dtb_size: u32 = 0;
     putStr("  dtb=");
     putHex(dtb);
     if (dtb != 0) {
         const magic = readBe32(dtb);
         putStr(" magic=");
         putHex(magic);
-        if (magic == 0xd00dfeed) {
-            const totalsize = readBe32(dtb + 4);
+        if (magic == fdt.MAGIC) {
+            dtb_size = readBe32(dtb + 4);
             putStr(" totalsize=");
-            putDec(totalsize);
+            putDec(dtb_size);
             putStr(" (FDT OK)");
         } else {
             putStr(" (bad FDT magic)");
@@ -134,12 +120,8 @@ export fn kmain(hartid: usize, dtb: usize) callconv(.c) noreturn {
     trap.init();
     putStr("  stvec installed\n");
 
-    // Deliberate ebreak — OpenSBI delegates breakpoint (cause 3) to S-mode
-    // (illegal-instruction cause 2 is NOT in the default medeleg mask).
     trap.armBreakpointTest();
     putStr("  triggering breakpoint (ebreak)...\n");
-    // Force the 4-byte encoding so sepc+=4 in the handler is unambiguous
-    // (plain `ebreak` may assemble to compressed c.ebreak).
     asm volatile (".word 0x00100073");
     if (trap.breakpointWasCaught()) {
         putStr("  breakpoint trap: OK\n");
@@ -147,7 +129,83 @@ export fn kmain(hartid: usize, dtb: usize) callconv(.c) noreturn {
         putStr("  breakpoint trap: FAILED\n");
     }
 
-    putStr("[riscv64] M2 complete; shutting down\n");
+    // ---- M3: FDT memory → PMM → Sv39 ----
+    var regions: [4]fdt.MemRegion = undefined;
+    const nreg = fdt.findMemoryRegions(dtb, &regions);
+    putStr("  memory regions=");
+    putDec(nreg);
+    putStr("\n");
+    var ri: usize = 0;
+    while (ri < nreg) : (ri += 1) {
+        putStr("    [");
+        putDec(ri);
+        putStr("] base=");
+        putHex(regions[ri].base);
+        putStr(" size=");
+        putHex(regions[ri].size);
+        putStr("\n");
+    }
+    if (nreg == 0) {
+        putStr("  M3 FAILED: no /memory in DTB\n");
+        sbiShutdown();
+        while (true) asm volatile ("wfi");
+    }
+
+    pmm.init(regions[0..nreg], dtb, dtb_size);
+    putStr("  pmm free_pages=");
+    putDec(pmm.freeCount());
+    putStr("\n");
+    if (pmm.freeCount() == 0) {
+        putStr("  M3 FAILED: PMM empty\n");
+        sbiShutdown();
+        while (true) asm volatile ("wfi");
+    }
+
+    if (!sv39.initIdentity(regions[0..nreg])) {
+        putStr("  M3 FAILED: Sv39 enable\n");
+        sbiShutdown();
+        while (true) asm volatile ("wfi");
+    }
+    putStr("  satp Sv39 enabled (identity map)\n");
+
+    // Map a fresh page at a non-identity VA, write/read, then unmap + #PF.
+    const test_va: usize = 0x40000000;
+    const test_pa = pmm.allocPage() orelse {
+        putStr("  M3 FAILED: alloc for map test\n");
+        sbiShutdown();
+        while (true) asm volatile ("wfi");
+    };
+    if (!sv39.mapPage(test_va, test_pa, .{ .read = true, .write = true, .exec = false })) {
+        putStr("  M3 FAILED: mapPage\n");
+        sbiShutdown();
+        while (true) asm volatile ("wfi");
+    }
+    const cell: *volatile u64 = @ptrFromInt(test_va);
+    cell.* = 0x4d33504147452121; // "M3PAGE!!"
+    if (cell.* != 0x4d33504147452121) {
+        putStr("  M3 FAILED: mapped R/W mismatch\n");
+        sbiShutdown();
+        while (true) asm volatile ("wfi");
+    }
+    putStr("  map/unmap R/W: OK\n");
+
+    sv39.unmapPage(test_va);
+    pmm.freePage(test_pa);
+
+    trap.armPageFaultTest();
+    putStr("  triggering load page fault...\n");
+    // 4-byte `ld t0, 0(a0)` with a0 = test_va (unmapped).
+    asm volatile (
+        \\li a0, 0x40000000
+        \\ld t0, 0(a0)
+        ::: .{ .memory = true });
+    if (trap.pageFaultWasCaught()) {
+        putStr("  page-fault trap: OK\n");
+    } else {
+        putStr("  page-fault trap: FAILED\n");
+    }
+
+    putStr("[riscv64] M3 complete; shutting down\n");
     sbiShutdown();
     while (true) asm volatile ("wfi");
 }

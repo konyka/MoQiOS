@@ -64,6 +64,10 @@ var last_stval: u64 = 0;
 var expect_breakpoint: bool = false;
 var breakpoint_caught: bool = false;
 
+/// Set by the page-fault self-test (M3).
+var expect_page_fault: bool = false;
+var page_fault_caught: bool = false;
+
 const uart = @import("uart.zig");
 
 fn putHex(v: u64) void {
@@ -96,6 +100,15 @@ pub fn breakpointWasCaught() bool {
     return breakpoint_caught;
 }
 
+pub fn armPageFaultTest() void {
+    expect_page_fault = true;
+    page_fault_caught = false;
+}
+
+pub fn pageFaultWasCaught() bool {
+    return page_fault_caught;
+}
+
 pub fn getTrapCount() u64 {
     return trap_count;
 }
@@ -121,6 +134,20 @@ export fn trapHandler(frame: *TrapFrame) callconv(.c) void {
         putHex(frame.scause);
         uart.writeByte('\n');
         // Skip the breakpoint insn (4-byte ebreak = 0x00100073).
+        frame.sepc += 4;
+        return;
+    }
+
+    // M3: deliberate load from an unmapped VA.
+    if (!interrupt and (code == Cause.load_page_fault or code == Cause.store_page_fault) and expect_page_fault) {
+        page_fault_caught = true;
+        expect_page_fault = false;
+        uart.writeString("[trap] page fault caught sepc=");
+        putHex(frame.sepc);
+        uart.writeString(" stval=");
+        putHex(frame.stval);
+        uart.writeByte('\n');
+        // Skip the faulting load/store (4-byte encoding in the self-test).
         frame.sepc += 4;
         return;
     }

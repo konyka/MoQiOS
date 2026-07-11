@@ -39,8 +39,10 @@ pub const interrupts = struct {
 };
 
 pub const paging = struct {
-    /// TODO(M3): allocate root Sv39 PT, populate kernel half, write `satp`.
-    pub fn init() void {}
+    /// Sv39 identity map + satp enable (Milestone 3).
+    pub fn init() void {
+        // Full init needs FDT regions from kmain; start.zig drives sv39 directly.
+    }
 };
 
 pub const timer = struct {
