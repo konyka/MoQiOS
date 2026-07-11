@@ -63,20 +63,21 @@ pass_markers() {
         grep -q "\[SK-7\] serial via arch facade: OK" "$LOG_FILE" &&
         grep -q "\[SK-8\] paging/tsc/tlb via facade: OK" "$LOG_FILE" &&
         grep -q "\[SK-9\] idt/gdt/syscall/io via facade: OK" "$LOG_FILE" &&
-        grep -q "\[SK-10\] smp/acpi/pci isolated: OK" "$LOG_FILE"
+        grep -q "\[SK-10\] smp/acpi/pci isolated: OK" "$LOG_FILE" &&
+        grep -q "\[SK-11\] sched/task via paging+syscall facade: OK" "$LOG_FILE"
 }
 
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if pass_markers; then
-        echo "PASS: MoQiOS aarch64 M9-7+SK-10 smoke (shared subset + EL0/SVC + preempt sched)."
+        echo "PASS: MoQiOS aarch64 M9-7+SK-11 smoke (shared sched subset + EL0/SVC + preempt)."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         if pass_markers; then
-            echo "PASS: MoQiOS aarch64 M9-7+SK-10 smoke (shared subset + EL0/SVC + preempt sched)."
+            echo "PASS: MoQiOS aarch64 M9-7+SK-11 smoke (shared sched subset + EL0/SVC + preempt)."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -90,7 +91,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for aarch64 smoke markers."
-echo "Expected: SK-2..SK-4 + SK-6..SK-10 shared markers + M9-1..M9-7 markers."
+echo "Expected: SK-2..SK-4 + SK-6..SK-11 shared markers + M9-1..M9-7 markers."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

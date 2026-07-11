@@ -36,14 +36,68 @@ pub const interrupts = struct {
     pub fn disableIrq() void {
         asm volatile ("csrci sstatus, 2");
     }
+
+    /// Placeholder frame shape so shared `sched` can type-check (SK-11).
+    pub const InterruptFrame = extern struct {
+        pad: [20]u64 = .{0} ** 20,
+    };
+
+    var tick_count: u64 = 0;
+
+    pub fn getTickCount() u64 {
+        return tick_count;
+    }
 };
 
 pub const paging = struct {
     pub const PAGE_SIZE: u64 = 4096;
+    pub const PAGE_2MB: u64 = 2 * 1024 * 1024;
+
+    /// Shared MapFlags shape (SK-11) — real Sv39 mapping stays in start.zig for now.
+    pub const MapFlags = struct {
+        writable: bool = false,
+        user: bool = false,
+        no_execute: bool = true,
+        global: bool = false,
+        write_through: bool = false,
+        cache_disable: bool = false,
+    };
+
+    var kernel_root_phys: u64 = 0;
 
     /// Sv39 identity map + satp enable (Milestone 3).
     pub fn init() void {
         // Full init needs FDT regions from kmain; start.zig drives sv39 directly.
+    }
+
+    pub fn getKernelPml4() u64 {
+        return kernel_root_phys;
+    }
+
+    pub fn mapPage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void {
+        _ = pml4_phys;
+        _ = virt;
+        _ = phys;
+        _ = flags;
+    }
+
+    pub fn unmapPage(pml4_phys: u64, virt: u64) ?u64 {
+        _ = pml4_phys;
+        _ = virt;
+        return null;
+    }
+
+    pub fn isPageMapped(pml4_phys: u64, virt: u64) bool {
+        _ = pml4_phys;
+        _ = virt;
+        return false;
+    }
+
+    pub fn mapHugePage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void {
+        _ = pml4_phys;
+        _ = virt;
+        _ = phys;
+        _ = flags;
     }
 };
 
@@ -101,18 +155,75 @@ pub const tsc = struct {
     }
 };
 
-/// Syscall / per-CPU surface — stub until shared kernel wires ecall (SK-9).
+/// Syscall / per-CPU surface — stub until shared kernel wires ecall (SK-9/SK-11).
 pub const syscall = struct {
     pub const MAX_CPUS: u32 = 1;
 
+    pub const PerCpu = extern struct {
+        kernel_rsp: u64 = 0,
+        saved_user_rsp: u64 = 0,
+        saved_stack_anchor: u64 = 0,
+        slice_remaining: u64 = 10,
+        cpu_id: u32 = 0,
+        apic_id: u32 = 0,
+        current_tid: u32 = 0,
+        current_task_idx: u32 = 0xFFFFFFFF,
+        exec_pending: u64 = 0,
+        exec_new_entry: u64 = 0,
+        exec_new_stack: u64 = 0,
+        force_reschedule: u8 = 0,
+    };
+
+    pub var percpu_array: [MAX_CPUS]PerCpu = .{.{}};
+
+    pub const PERCPU_ANCHOR_OFFSET = @offsetOf(PerCpu, "saved_stack_anchor");
+
     pub const Personality = enum(u8) {
-        linux = 0,
+        native = 0,
+        linux = 1,
+        windows = 2,
     };
 
     pub fn init() void {}
 
     pub fn setPerCpuGsBase(cpu_id: u32) void {
         _ = cpu_id;
+    }
+
+    pub fn getPerCpu() *PerCpu {
+        return &percpu_array[0];
+    }
+
+    pub fn getPerCpuOrNull() ?*PerCpu {
+        return &percpu_array[0];
+    }
+
+    pub inline fn gsReadCurrentTaskIdx() u32 {
+        return percpu_array[0].current_task_idx;
+    }
+
+    pub inline fn gsWriteCurrentTaskIdx(v: u32) void {
+        percpu_array[0].current_task_idx = v;
+    }
+
+    pub inline fn gsReadCpuId() u32 {
+        return percpu_array[0].cpu_id;
+    }
+
+    pub inline fn gsReadSliceRemaining() u64 {
+        return percpu_array[0].slice_remaining;
+    }
+
+    pub inline fn gsWriteSliceRemaining(v: u64) void {
+        percpu_array[0].slice_remaining = v;
+    }
+
+    pub fn syncUserRspToTask(t: anytype) void {
+        _ = t;
+    }
+
+    pub fn syncUserRspFromTask(t: anytype) void {
+        _ = t;
     }
 };
 
