@@ -99,18 +99,61 @@ fn buildRiscv64(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
     smoke_rv_step.dependOn(&smoke_rv_cmd.step);
 }
 
+/// Build the AArch64 kernel skeleton (cross-ISA port, Milestone 9-1).
+/// QEMU `virt` + PL011 console; separate from x86_64 / riscv64 until the
+/// shared arch path hosts the full kernel.
+fn buildAarch64(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
+    const query = std.Target.Query.parse(.{
+        .arch_os_abi = "aarch64-freestanding-none",
+        .cpu_features = "baseline",
+    }) catch unreachable;
+    const target = b.resolveTargetQuery(query);
+
+    const module = b.createModule(.{
+        .root_source_file = b.path("kernel/arch/aarch64/start.zig"),
+        .target = target,
+        .optimize = optimize,
+        .red_zone = false,
+        .pic = false,
+    });
+
+    const kernel = b.addExecutable(.{
+        .name = "moqi-kernel-aarch64.elf",
+        .root_module = module,
+        .use_lld = true,
+        .use_llvm = true,
+    });
+    kernel.setLinkerScript(b.path("kernel/arch/aarch64/linker.ld"));
+    b.installArtifact(kernel);
+
+    const run_step = b.step("run", "Build and run the aarch64 kernel in QEMU");
+    const run_cmd = b.addSystemCommand(&.{"./tools/qemu_run_aarch64.sh"});
+    run_cmd.step.dependOn(b.getInstallStep());
+    run_step.dependOn(&run_cmd.step);
+
+    const smoke_aa_step = b.step("smoke-aarch64", "Run bounded aarch64 M9 QEMU smoke test");
+    const smoke_aa_cmd = b.addSystemCommand(&.{"./tools/qemu_smoke_aarch64.sh"});
+    smoke_aa_cmd.step.dependOn(b.getInstallStep());
+    smoke_aa_cmd.setEnvironmentVariable("MOQI_SMOKE_SKIP_BUILD", "1");
+    smoke_aa_step.dependOn(&smoke_aa_cmd.step);
+}
+
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Target CPU architecture. Default x86_64 keeps the existing behavior
-    // byte-for-byte; `-Darch=riscv64` builds the cross-ISA port skeleton.
-    const arch = b.option([]const u8, "arch", "Target CPU architecture: x86_64 (default) | riscv64") orelse "x86_64";
+    // byte-for-byte; `-Darch=riscv64` / `-Darch=aarch64` build port skeletons.
+    const arch = b.option([]const u8, "arch", "Target CPU architecture: x86_64 (default) | riscv64 | aarch64") orelse "x86_64";
     if (std.mem.eql(u8, arch, "riscv64")) {
         buildRiscv64(b, optimize);
         return;
     }
+    if (std.mem.eql(u8, arch, "aarch64")) {
+        buildAarch64(b, optimize);
+        return;
+    }
     if (!std.mem.eql(u8, arch, "x86_64")) {
-        std.debug.panic("unsupported -Darch='{s}' (expected x86_64 | riscv64)", .{arch});
+        std.debug.panic("unsupported -Darch='{s}' (expected x86_64 | riscv64 | aarch64)", .{arch});
     }
 
     const query = std.Target.Query.parse(.{

@@ -14,6 +14,7 @@ const builtin = @import("builtin");
 pub const impl = switch (builtin.cpu.arch) {
     .x86_64 => @import("x86_64/arch_impl.zig"),
     .riscv64 => @import("riscv64/arch_impl.zig"),
+    .aarch64 => @import("aarch64/arch_impl.zig"),
     else => @compileError("unsupported architecture"),
 };
 
