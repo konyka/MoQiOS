@@ -37,3 +37,26 @@ pub const cpu = struct {
         return @intCast(pc.cpu_id);
     }
 };
+
+/// Maskable IRQ save/restore for IrqSpinlock and similar critical sections.
+pub const irq = struct {
+    pub inline fn saveAndDisable() u64 {
+        var rflags: u64 = undefined;
+        asm volatile (
+            \\pushfq
+            \\pop %[flags]
+            \\cli
+            : [flags] "=r" (rflags),
+        );
+        return rflags;
+    }
+
+    pub inline fn restore(saved_rflags: u64) void {
+        asm volatile (
+            \\push %[flags]
+            \\popfq
+            :
+            : [flags] "r" (saved_rflags),
+        );
+    }
+};

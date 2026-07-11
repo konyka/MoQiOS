@@ -102,3 +102,19 @@ pub const syscall = struct {
         _ = cpu_id;
     }
 };
+
+/// Maskable IRQ save/restore (sstatus.SIE).
+pub const irq = struct {
+    pub inline fn saveAndDisable() u64 {
+        return asm volatile ("csrrc %[old], sstatus, %[mask]"
+            : [old] "=r" (-> u64),
+            : [mask] "r" (@as(u64, 1 << 1)),
+        );
+    }
+
+    pub inline fn restore(saved: u64) void {
+        if ((saved & (1 << 1)) != 0) {
+            asm volatile ("csrsi sstatus, 2");
+        }
+    }
+};

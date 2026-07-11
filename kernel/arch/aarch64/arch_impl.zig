@@ -93,3 +93,21 @@ pub const syscall = struct {
         _ = cpu_id;
     }
 };
+
+/// Maskable IRQ save/restore (DAIF.I).
+pub const irq = struct {
+    pub inline fn saveAndDisable() u64 {
+        const daif = asm volatile ("mrs %[r], daif"
+            : [r] "=r" (-> u64),
+        );
+        asm volatile ("msr daifset, #2");
+        return daif;
+    }
+
+    pub inline fn restore(saved: u64) void {
+        asm volatile ("msr daif, %[v]"
+            :
+            : [v] "r" (saved),
+        );
+    }
+};

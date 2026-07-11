@@ -4,7 +4,7 @@
 /// kfree(ptr) can determine the size class without the caller passing it.
 const pmm = @import("pmm.zig");
 const hhdm = @import("hhdm.zig");
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const klog = @import("../klog.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 

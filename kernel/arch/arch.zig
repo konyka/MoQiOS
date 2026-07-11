@@ -27,3 +27,4 @@ pub const cpu = impl.cpu;
 pub const gdt = impl.gdt;
 pub const tsc = impl.tsc;
 pub const syscall = impl.syscall;
+pub const irq = impl.irq;

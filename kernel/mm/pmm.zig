@@ -3,7 +3,7 @@
 /// Tracks free/used pages with per-page reference counting.
 const limine = @import("../limine.zig");
 const hhdm = @import("hhdm.zig");
-const serial = @import("../arch/x86_64/serial.zig");
+const serial = @import("../arch/arch.zig").serial;
 const klog = @import("../klog.zig");
 const page_frame = @import("page_frame.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
