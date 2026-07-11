@@ -35,7 +35,7 @@ pub const paging = struct {
 
 pub const timer = struct {
     pub fn init(interval: u64) void {
-        _ = interval;
+        @import("timer.zig").init(interval);
     }
 };
 

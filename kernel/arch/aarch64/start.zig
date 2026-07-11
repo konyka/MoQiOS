@@ -212,5 +212,9 @@ export fn kmain(x0_dtb: usize) callconv(.c) noreturn {
 
     putStr("[aarch64] M9-3 complete\n");
 
+    // ---- M9-4: generic timer (CNTV ISTATUS poll) ----
+    const timer = @import("timer.zig");
+    _ = timer.selfTest();
+
     while (true) asm volatile ("wfi");
 }
