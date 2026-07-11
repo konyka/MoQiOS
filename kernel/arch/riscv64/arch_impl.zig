@@ -46,8 +46,9 @@ pub const paging = struct {
 };
 
 pub const timer = struct {
-    /// TODO(M5): arm initial deadline via SBI Timer or `stimecmp`.
-    pub fn init(_: u64) void {}
+    pub fn init(interval: u64) void {
+        @import("timer.zig").init(interval);
+    }
 };
 
 pub const context_switch = struct {

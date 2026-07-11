@@ -46,14 +46,18 @@ pub const TrapFrame = extern struct {
     sstatus: u64,
 };
 
-/// Exception codes (scause when interrupt bit clear).
+/// Exception / interrupt codes.
 pub const Cause = struct {
     pub const illegal_instruction: u64 = 2;
     pub const breakpoint: u64 = 3;
     pub const load_page_fault: u64 = 13;
     pub const store_page_fault: u64 = 15;
     pub const ecall_from_s: u64 = 9;
+    pub const supervisor_timer: u64 = 5; // interrupt
 };
+
+/// Trap frame allocation size (16-byte aligned; matches trapEntry asm).
+pub const FRAME_BYTES: usize = 288;
 
 var trap_count: u64 = 0;
 var last_scause: u64 = 0;
@@ -84,7 +88,6 @@ fn putHex(v: u64) void {
 /// Install `trapEntry` as the direct-mode supervisor trap vector.
 pub fn init() void {
     const entry: usize = @intFromPtr(&trapEntry);
-    // MODE = 00 (direct): all traps jump to BASE.
     asm volatile ("csrw stvec, %[e]"
         :
         : [e] "r" (entry),
@@ -114,7 +117,8 @@ pub fn getTrapCount() u64 {
 }
 
 /// Called from `trapEntry` with a0 = &TrapFrame.
-export fn trapHandler(frame: *TrapFrame) callconv(.c) void {
+/// Returns the TrapFrame pointer to restore (may be another task's after M5 switch).
+export fn trapHandler(frame: *TrapFrame) callconv(.c) *TrapFrame {
     trap_count += 1;
     last_scause = frame.scause;
     last_sepc = frame.sepc;
@@ -123,8 +127,13 @@ export fn trapHandler(frame: *TrapFrame) callconv(.c) void {
     const interrupt = (frame.scause >> 63) != 0;
     const code = frame.scause & 0xff;
 
-    // OpenSBI's default medeleg does not delegate illegal-instruction (cause 2)
-    // to S-mode, but does delegate breakpoint (cause 3). M2 self-test uses ebreak.
+    if (interrupt and code == Cause.supervisor_timer) {
+        const timer = @import("timer.zig");
+        timer.onInterrupt();
+        const sched = @import("sched.zig");
+        return sched.onTimer(frame);
+    }
+
     if (!interrupt and code == Cause.breakpoint and expect_breakpoint) {
         breakpoint_caught = true;
         expect_breakpoint = false;
@@ -133,12 +142,10 @@ export fn trapHandler(frame: *TrapFrame) callconv(.c) void {
         uart.writeString(" scause=");
         putHex(frame.scause);
         uart.writeByte('\n');
-        // Skip the breakpoint insn (4-byte ebreak = 0x00100073).
         frame.sepc += 4;
-        return;
+        return frame;
     }
 
-    // M3: deliberate load from an unmapped VA.
     if (!interrupt and (code == Cause.load_page_fault or code == Cause.store_page_fault) and expect_page_fault) {
         page_fault_caught = true;
         expect_page_fault = false;
@@ -147,9 +154,8 @@ export fn trapHandler(frame: *TrapFrame) callconv(.c) void {
         uart.writeString(" stval=");
         putHex(frame.stval);
         uart.writeByte('\n');
-        // Skip the faulting load/store (4-byte encoding in the self-test).
         frame.sepc += 4;
-        return;
+        return frame;
     }
 
     uart.writeString("[trap] unhandled scause=");
@@ -163,12 +169,8 @@ export fn trapHandler(frame: *TrapFrame) callconv(.c) void {
 }
 
 /// Naked trap entry: allocate TrapFrame on stack, save GPRs + CSRs, call
-/// trapHandler, restore, sret.
-///
-/// MUST be 4-byte aligned: `stvec.BASE` uses bits [1:0] as MODE, so an
-/// unaligned address corrupts the mode field and the trap never reaches us.
+/// trapHandler (returns frame to restore in a0), restore, sret.
 export fn trapEntry() align(4) callconv(.naked) noreturn {
-    // 288 = 16-byte-aligned frame (35 u64 fields + 1 pad u64).
     asm volatile (
         \\addi sp, sp, -288
         \\sd ra,   0(sp)
@@ -213,6 +215,7 @@ export fn trapEntry() align(4) callconv(.naked) noreturn {
         \\sd t0, 272(sp)
         \\mv a0, sp
         \\call trapHandler
+        \\mv sp, a0
         \\ld t0, 248(sp)
         \\csrw sepc, t0
         \\ld t0, 272(sp)

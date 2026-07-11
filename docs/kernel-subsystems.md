@@ -1124,8 +1124,8 @@ pub fn shootdownRange(addr_start: u64, page_count: u32) void
 - **串口**：UART16550 直驱（QEMU virt `0x10000000`；M2）
 - **中断**：`stvec` 向量 + `TrapFrame`（breakpoint / page-fault 自测）
 - **分页**：Sv39 恒等映射 + map/unmap（M3）；完整 HHDM/共享内核复用待后续
-- **定时器**：stub（待 M5 里程碑接入 CLINT/SBI timer）
-- **上下文切换**：stub（待 M5 里程碑实现）
+- **定时器**：Sstc `stimecmp` 周期 tick（M5）
+- **上下文切换**：骨架内双线程抢占切换（M5）；完整 `proc/sched.zig` 复用待后续
 
 ### 11.4 设计原则
 

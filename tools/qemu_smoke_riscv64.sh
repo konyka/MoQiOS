@@ -1,8 +1,5 @@
 #!/bin/bash
-# Bounded riscv64 QEMU smoke test (Milestone 3+).
-#
-# Builds (unless skipped), runs the riscv64 kernel under OpenSBI, and checks
-# for the M3 completion markers on the serial log.
+# Bounded riscv64 QEMU smoke test (Milestone 5+).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -45,21 +42,21 @@ trap cleanup EXIT
 
 pass_markers() {
     [ -f "$LOG_FILE" ] &&
-        grep -q "page-fault trap: OK" "$LOG_FILE" &&
-        grep -q "M3 complete" "$LOG_FILE"
+        grep -q "preemptive switches=" "$LOG_FILE" &&
+        grep -q "M5 complete" "$LOG_FILE"
 }
 
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if pass_markers; then
-        echo "PASS: MoQiOS riscv64 M3 smoke (PMM + Sv39 + page fault)."
+        echo "PASS: MoQiOS riscv64 M5 smoke (timer + preemptive threads)."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         if pass_markers; then
-            echo "PASS: MoQiOS riscv64 M3 smoke (PMM + Sv39 + page fault)."
+            echo "PASS: MoQiOS riscv64 M5 smoke (timer + preemptive threads)."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -73,7 +70,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for riscv64 smoke markers."
-echo "Expected: 'page-fault trap: OK' and 'M3 complete'."
+echo "Expected: 'preemptive switches=' and 'M5 complete'."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1
