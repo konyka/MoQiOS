@@ -28,7 +28,9 @@ pub const interrupts = struct {
 };
 
 pub const paging = struct {
-    pub fn init() void {}
+    pub fn init() void {
+        // Full init needs FDT regions from kmain; start.zig drives paging directly.
+    }
 };
 
 pub const timer = struct {

@@ -19,8 +19,8 @@
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
 - **riscv64**：M0–M7 完成（…PMM/Sv39、timer/sched、U-mode/`ecall`、virtio-mmio blk + net MAC）。
   门禁：`zig build -Darch=riscv64 smoke-riscv`。后续：共享内核复用 / TX-RX 网栈。
-- **aarch64**：M9-1/M9-2 完成（PL011、loader 固定地址 DTB、VBAR_EL1 + `brk` 自测）。
-  门禁：`zig build -Darch=aarch64 smoke-aarch64`。后续：分页 / 定时器 / U-mode。
+- **aarch64**：M9-1…M9-3 完成（PL011、DTB loader、VBAR/`brk`、PMM + 恒等映射 + #PF）。
+  门禁：`zig build -Darch=aarch64 smoke-aarch64`。后续：定时器 / U-mode。
 - **引导**：x86_64 经 Limine；riscv64 经 OpenSBI `-kernel`（链接地址 `0x80200000`）；
   aarch64 经 QEMU `-kernel`（链接地址 `0x40000000`，EL1；DTB 经 loader @ `0x4a000000`）。
 
@@ -62,7 +62,7 @@
 | **M6** | riscv64 用户态：U-mode `sret`、用户页 U 位隔离、`ecall`（sys_write/sys_exit） | QEMU virt：`hello from U` + `M6 complete` | ✅ 完成（2026-07-11） |
 | **M7** | riscv64 virtio-mmio blk + net 探测（blk 读扇区魔数；net 协商 MAC） | QEMU virt：`disk magic: OK` + `virtio-net MAC: OK` | ✅ 完成（2026-07-11）；TX/RX 与 FS 待共享内核 |
 | **M8** | **SMP（先 x86_64，后 riscv64）**：per-CPU 调度器（per-CPU 运行队列+work-stealing+per-CPU TSS/anchor）、通用 IPI、TLB shootdown；启用 `enable_ap_startup` | QEMU 多核：用户任务真正并行；零崩溃 | ✅ x86_64 完成（见 §4）；riscv64 SMP 待 M5+ |
-| **M9** | aarch64 后端（复用 M4 抽象；骨架 → 异常 → 分页/定时器/用户态） | QEMU aarch64：`M9-2 complete` → 后续用户态 | 🟡 M9-2 完成（2026-07-11） |
+| **M9** | aarch64 后端（骨架 → 异常 → 分页 → 定时器/用户态） | QEMU aarch64：`M9-3 complete` → 后续用户态 | 🟡 M9-3 完成（2026-07-11） |
 
 > SMP（M8）与第二 ISA（M2–M7）相对独立，可并行；M8 的 per-CPU 改造也会反哺 riscv64/aarch64 的
 > 多核。M4 的 `arch` 接口是二者共同地基。
@@ -176,16 +176,16 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **流程**：M3 → **M7（blk+net）** → M6（U-mode）→ M5（sched）→ shutdown。
 - **说明**：net TX/RX 与 ext2/FS 集成推迟至共享内核复用阶段。
 
-### 3.11 M9-1/M9-2 完成记录（2026-07-11，aarch64 骨架 + 异常）
+### 3.11 M9-1…M9-3 完成记录（2026-07-11，aarch64）
 
-- **构建**：`-Darch=aarch64` → `moqi-kernel-aarch64.elf`；链接地址 `0x40000000`。
-- **控制台**：PL011 @ `0x09000000`（QEMU virt）。
-- **DTB**：非 Linux ELF 时 QEMU 不填 x0；`qemu_run_aarch64.sh` dumpdtb +
-  `-device loader` 固定加载到 `0x4a000000`；内核校验 `d00dfeed`。
-- **异常**：`vectors.S` → VBAR_EL1；Current-EL Sync 处理 `brk #0`（ELR+4 返回）。
-- **arch facade**：`aarch64/arch_impl.zig` 接入 `arch.zig`（serial + interrupts.init）。
-- **门禁**：`smoke-aarch64`（`FDT OK` + `M9-1 complete` + `brk trap: OK` + `M9-2 complete`）。
-- **后续**：identity map、generic timer、U-mode（对标 riscv M3–M6）。
+- **构建**：`-Darch=aarch64`（`baseline-neon`，避免 NEON 对齐陷阱）→ ELF @ `0x40000000`。
+- **控制台**：PL011 @ `0x09000000`。
+- **DTB**：loader 固定 `0x4a000000`；校验 `d00dfeed`。
+- **异常**：VBAR_EL1 + `brk`；Data Abort 用于 #PF 自测。
+- **分页**：FDT `/memory` → PMM freelist；2MiB 块恒等映射 DRAM + 4KiB device UART；
+  SCTLR.M 开 MMU；`mapPage`/`unmapPage` + #PF。
+- **门禁**：`smoke-aarch64`（…`page-fault trap: OK` + `M9-3 complete`）。
+- **后续**：generic timer、U-mode（对标 riscv M5–M6）。
 
 ---
 
@@ -349,7 +349,7 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 | **SMP 浮点** | FXSAVE/FXRSTOR 按任务 | ✅ M8-5b-3 | 中（已落地） |
 | **架构抽象** | `kernel/arch/arch.zig` 多 ISA 接口 | ✅ M4；渐进迁移中 | 中（移植效率，非热路径） |
 | **riscv64** | M2–M7 ✅；共享内核复用待续 | ✅ M7 blk+net | N/A（第二 ISA） |
-| **aarch64** | M9-1/M9-2 ✅（PL011 + brk） | ✅ M9-2 | N/A（第三 ISA） |
+| **aarch64** | M9-1…M9-3 ✅（PL011 + brk + paging） | ✅ M9-3 | N/A（第三 ISA） |
 | **未集成脚手架** | `futex`/`select`/`inotify`/`clone`/`mprotect`/SysV IPC/`aio`/`splice`/`dhcp`/`dns` 等 | 🧩 源文件在树中，未 `@import` | 低（按需接入） |
 | **缺页恢复** | 内核态 per-instruction fixup | ⚠️ 页表预检替代 | 中 |
 | **单元测试** | `zig build test`（host helpers） | ✅ 有基础用例 | 低（质量门） |
@@ -372,15 +372,15 @@ Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
 Phase F — 第二 ISA              ✅ M2–M7（…/virtio-blk+net）；⬜ 共享内核复用待续
-Phase F2 — 第三 ISA             🟡 M9-2（PL011 + VBAR/`brk`）；⬜ 分页/定时器/U-mode
+Phase F2 — 第三 ISA             🟡 M9-3（分页）；⬜ 定时器/U-mode
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**M9-3 aarch64 分页/PMM**，或 **riscv64 共享内核复用**。
-> M3–M7（blk+net）与 M9-1/M9-2 已于 2026-07-11 完成。
+> 当前下一执行项：**M9-4 aarch64 generic timer**，或 **riscv64 共享内核复用**。
+> M3–M7（blk+net）与 M9-1…M9-3 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。
 

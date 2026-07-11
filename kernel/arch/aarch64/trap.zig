@@ -1,6 +1,7 @@
-//! EL1 exception handling for the aarch64 skeleton (Milestone 9-2).
+//! EL1 exception handling for the aarch64 skeleton (Milestone 9-2/9-3).
 //!
-//! Installs `exception_vectors` into VBAR_EL1 and self-tests with `brk #0`.
+//! Installs `exception_vectors` into VBAR_EL1; self-tests `brk #0` and data
+//! aborts from deliberate unmapped accesses.
 
 const uart = @import("uart.zig");
 
@@ -8,6 +9,8 @@ extern const exception_vectors: opaque {};
 
 var expect_brk: bool = false;
 var brk_caught: bool = false;
+var expect_page_fault: bool = false;
+var page_fault_caught: bool = false;
 
 fn putStr(s: []const u8) void {
     uart.writeString(s);
@@ -57,6 +60,13 @@ export fn trapHandleSync(frame: *anyopaque) callconv(.c) void {
         return;
     }
 
+    // EC 0x25 = Data Abort, same EL. EC 0x21 = Instruction Abort, same EL.
+    if ((ec == 0x25 or ec == 0x21) and expect_page_fault) {
+        page_fault_caught = true;
+        writeElrEl1(elr + 4);
+        return;
+    }
+
     putStr("  unexpected sync: esr=");
     putHex(esr);
     putStr(" elr=");
@@ -87,4 +97,14 @@ pub fn brkSelfTest() bool {
     }
     putStr("  brk trap: FAILED\n");
     return false;
+}
+
+pub fn armPageFaultTest() void {
+    expect_page_fault = true;
+    page_fault_caught = false;
+}
+
+pub fn pageFaultWasCaught() bool {
+    expect_page_fault = false;
+    return page_fault_caught;
 }

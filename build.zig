@@ -105,7 +105,9 @@ fn buildRiscv64(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
 fn buildAarch64(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
     const query = std.Target.Query.parse(.{
         .arch_os_abi = "aarch64-freestanding-none",
-        .cpu_features = "baseline",
+        // Drop NEON so compiler-rt memcpy never emits aligned `ldr q0` on
+        // unaligned FDT byte streams (would Data-Abort with DFSC=alignment).
+        .cpu_features = "baseline-neon",
     }) catch unreachable;
     const target = b.resolveTargetQuery(query);
 
