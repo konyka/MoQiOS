@@ -12,10 +12,10 @@
 ## 0. 现状基线（移植起点 → 2026-07 更新）
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
-  **SK-8**…**SK-12**：facade、隔离、共享 `createKernelThread`/`idle`。
-  **SK-13（2026-07-11）**：非 x86 软件 `InterruptFrame`（与 x86 字段同名）+
-  `prepareTaskFrame` 写入栈帧并发布 switch anchor。
-  完整 `main.zig` / Limine 驱动仍未在非 x86 链接；真实 sret/ERET 切换待后续。
+  **SK-8**…**SK-13**：facade、共享 create/prepare、软件 `InterruptFrame`。
+  **SK-14（2026-07-11）**：`enterSoftwareFrame` 经 sret/eret 进入共享帧并
+  `resumeAfterSoftwareEnter` 返回 bring-up。
+  完整 `main.zig` / Limine 驱动仍未在非 x86 链接；抢占式共享 sched 切换待后续。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
 - **riscv64**：M0–M7 完成（…PMM/Sv39、timer/sched、U-mode/`ecall`、virtio-mmio blk + net MAC）。
@@ -184,7 +184,7 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **M9-7**：双 EL1 内核线程 + CNTV 抢占切换；IRQ 帧保存 ELR/SPSR 以支持换栈；
   `preemptive switches=` 达标后打印 `M9-7 complete`。
 - **门禁**：`smoke-aarch64`（…`hello from U` + `M9-6` + `preemptive switches=` + `M9-7 complete`）。
-- **后续**：SK-14 用软件帧驱动非 x86 实际进入共享 idle（sret/ERET 或等价 restore）。
+- **后续**：SK-15 共享 `sched` 定时器抢占切换（双共享内核线程）。
 
 ---
 
@@ -370,16 +370,16 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-13；⬜ SK-14 进入共享 idle
-Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-13；⬜ SK-14 进入共享 idle
+Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-14；⬜ SK-15 共享抢占切换
+Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-14；⬜ SK-15 共享抢占切换
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**SK-14** — 非 x86 从软件 InterruptFrame 实际进入共享 idle；
-> SK-1…SK-13 已完成。
+> 当前下一执行项：**SK-15** — 共享 `sched` 定时器抢占切换（双共享内核线程）；
+> SK-1…SK-14 已完成。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。

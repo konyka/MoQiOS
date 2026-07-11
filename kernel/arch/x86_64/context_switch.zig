@@ -25,6 +25,15 @@ const syscall_entry = @import("syscall_entry.zig");
 /// x86 uses hardware iretq frames via commonStub (not software-only).
 pub const uses_software_frame: bool = false;
 
+/// Stub — shared-kernel software-frame enter is non-x86 (SK-14).
+pub fn enterSoftwareFrame(frame_ptr: u64) void {
+    _ = frame_ptr;
+}
+
+pub fn resumeAfterSoftwareEnter() noreturn {
+    while (true) asm volatile ("hlt");
+}
+
 /// Per-CPU current FPU owner. `null` = no task on this CPU has touched the
 /// FPU since the last init. Indexed by logical cpu id (0 = BSP). Updated
 /// only by the local CPU's #NM handler / context-switch path, so no lock

@@ -130,8 +130,49 @@ pub const context_switch = struct {
         _ = old;
     }
 
-    /// SK-13: shared sched owns software InterruptFrames; arch restore TBD.
+    /// SK-13/14: shared sched uses software InterruptFrames; enter via eret.
     pub const uses_software_frame: bool = true;
+
+    var resume_pc: usize = 0;
+    var resume_sp: usize = 0;
+
+    /// `eret` into `InterruptFrame.rip`, then `resumeAfterSoftwareEnter` returns here.
+    pub fn enterSoftwareFrame(frame_ptr: u64) void {
+        const rip_off = @offsetOf(interrupts.InterruptFrame, "rip");
+        asm volatile (
+            \\adr x0, 1f
+            \\str x0, [%[rpc]]
+            \\mov x0, sp
+            \\str x0, [%[rsp]]
+            \\ldr x0, [%[fp], %[roff]]
+            \\msr elr_el1, x0
+            \\mov x0, #0x5
+            \\msr spsr_el1, x0
+            \\mov sp, %[fp]
+            \\isb
+            \\eret
+            \\1:
+            :
+            : [fp] "r" (frame_ptr),
+              [roff] "i" (rip_off),
+              [rpc] "r" (@intFromPtr(&resume_pc)),
+              [rsp] "r" (@intFromPtr(&resume_sp)),
+            : .{ .memory = true, .x0 = true });
+    }
+
+    /// Return to the `enterSoftwareFrame` caller (used by SK-14 probe body).
+    pub fn resumeAfterSoftwareEnter() noreturn {
+        asm volatile (
+            \\ldr x0, [%[rsp]]
+            \\mov sp, x0
+            \\ldr x0, [%[rpc]]
+            \\br x0
+            :
+            : [rpc] "r" (@intFromPtr(&resume_pc)),
+              [rsp] "r" (@intFromPtr(&resume_sp)),
+            : .{ .memory = true, .x0 = true });
+        unreachable;
+    }
 };
 
 pub const cpu = struct {
