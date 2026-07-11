@@ -67,7 +67,7 @@ fn buildRiscv64(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
     const target = b.resolveTargetQuery(query);
 
     const module = b.createModule(.{
-        .root_source_file = b.path("kernel/arch/riscv64/start.zig"),
+        .root_source_file = b.path("kernel/riscv64_root.zig"),
         .target = target,
         .optimize = optimize,
         // medany code model: required for a kernel linked at 0x80200000 (outside
@@ -112,7 +112,7 @@ fn buildAarch64(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
     const target = b.resolveTargetQuery(query);
 
     const module = b.createModule(.{
-        .root_source_file = b.path("kernel/arch/aarch64/start.zig"),
+        .root_source_file = b.path("kernel/aarch64_root.zig"),
         .target = target,
         .optimize = optimize,
         .red_zone = false,

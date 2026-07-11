@@ -55,20 +55,21 @@ pass_markers() {
         grep -q "hello from U" "$LOG_FILE" &&
         grep -q "M9-6 complete" "$LOG_FILE" &&
         grep -q "preemptive switches=" "$LOG_FILE" &&
-        grep -q "M9-7 complete" "$LOG_FILE"
+        grep -q "M9-7 complete" "$LOG_FILE" &&
+        grep -q "\[SK-2\] shared kernel subset: OK" "$LOG_FILE"
 }
 
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if pass_markers; then
-        echo "PASS: MoQiOS aarch64 M9-7 smoke (EL0/SVC + preempt sched)."
+        echo "PASS: MoQiOS aarch64 M9-7+SK-2 smoke (shared klog/fmt + EL0/SVC + preempt sched)."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         if pass_markers; then
-            echo "PASS: MoQiOS aarch64 M9-7 smoke (EL0/SVC + preempt sched)."
+            echo "PASS: MoQiOS aarch64 M9-7+SK-2 smoke (shared klog/fmt + EL0/SVC + preempt sched)."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -82,7 +83,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for aarch64 smoke markers."
-echo "Expected: M9-1..M9-6 markers plus 'preemptive switches=' and 'M9-7 complete'."
+echo "Expected: SK-2 shared subset + M9-1..M9-7 markers."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

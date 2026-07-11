@@ -14,7 +14,7 @@ pub const fmtSignedDec = core.fmtSignedDec;
 // These write formatted values directly to the serial port.
 
 fn serialWriteString(s: []const u8) void {
-    const serial = @import("../arch/x86_64/serial.zig");
+    const serial = @import("../arch/arch.zig").serial;
     serial.writeString(s);
 }
 

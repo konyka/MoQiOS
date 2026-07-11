@@ -120,6 +120,7 @@ export fn kmain(x0_dtb: usize) callconv(.c) noreturn {
 
     uart.init();
     trap.init();
+    @import("../../shared/sk2.zig").announce();
 
     putStr("MoQiOS aarch64: M9 bring-up (PL011 + vectors + paging)\n");
 
