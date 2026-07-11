@@ -1,11 +1,8 @@
-//! S-mode trap entry + frame for the riscv64 skeleton (Milestone 2).
+//! S-mode trap entry + frame for the riscv64 skeleton.
 //!
-//! Direct-mode `stvec`: every trap/interrupt lands at `trapEntry`, which
-//! saves GPRs + CSR snapshot into a `TrapFrame` on the current stack, calls
-//! `trapHandler`, then restores and `sret`s.
-//!
-//! M2 only needs to prove illegal-instruction traps are caught; later
-//! milestones grow this into a full interrupt/syscall path.
+//! Supports S-mode traps (M2–M5) and U-mode traps/syscalls (M6) via `sscratch`
+//! stack switching: when running user code, `sscratch` holds the kernel trap
+//! stack top; when in S-mode it is zero.
 
 /// Saved register state at trap time. Layout must match `trapEntry` asm.
 pub const TrapFrame = extern struct {
@@ -46,17 +43,16 @@ pub const TrapFrame = extern struct {
     sstatus: u64,
 };
 
-/// Exception / interrupt codes.
 pub const Cause = struct {
     pub const illegal_instruction: u64 = 2;
     pub const breakpoint: u64 = 3;
+    pub const ecall_from_u: u64 = 8;
+    pub const ecall_from_s: u64 = 9;
     pub const load_page_fault: u64 = 13;
     pub const store_page_fault: u64 = 15;
-    pub const ecall_from_s: u64 = 9;
-    pub const supervisor_timer: u64 = 5; // interrupt
+    pub const supervisor_timer: u64 = 5;
 };
 
-/// Trap frame allocation size (16-byte aligned; matches trapEntry asm).
 pub const FRAME_BYTES: usize = 288;
 
 var trap_count: u64 = 0;
@@ -64,13 +60,15 @@ var last_scause: u64 = 0;
 var last_sepc: u64 = 0;
 var last_stval: u64 = 0;
 
-/// Set by the breakpoint self-test so the handler can skip the insn.
 var expect_breakpoint: bool = false;
 var breakpoint_caught: bool = false;
-
-/// Set by the page-fault self-test (M3).
 var expect_page_fault: bool = false;
 var page_fault_caught: bool = false;
+
+/// Dedicated kernel stack for traps taken from U-mode.
+var u_trap_stack: [8192]u8 align(16) = undefined;
+/// Exported for trapEntry asm (medany `lla`).
+export var u_trap_stack_top: usize = 0;
 
 const uart = @import("uart.zig");
 
@@ -85,13 +83,18 @@ fn putHex(v: u64) void {
     }
 }
 
-/// Install `trapEntry` as the direct-mode supervisor trap vector.
 pub fn init() void {
+    u_trap_stack_top = @intFromPtr(&u_trap_stack) + u_trap_stack.len;
     const entry: usize = @intFromPtr(&trapEntry);
     asm volatile ("csrw stvec, %[e]"
         :
         : [e] "r" (entry),
         : .{ .memory = true });
+    asm volatile ("csrw sscratch, zero");
+}
+
+pub fn userTrapStackTop() usize {
+    return u_trap_stack_top;
 }
 
 pub fn armBreakpointTest() void {
@@ -116,8 +119,17 @@ pub fn getTrapCount() u64 {
     return trap_count;
 }
 
-/// Called from `trapEntry` with a0 = &TrapFrame.
-/// Returns the TrapFrame pointer to restore (may be another task's after M5 switch).
+fn startM5() noreturn {
+    const timer = @import("timer.zig");
+    const sched = @import("sched.zig");
+    uart.writeString("MoQiOS riscv64: M5 (timer + sched)\n");
+    sched.init();
+    timer.init(50_000);
+    uart.writeString("  stimecmp timer armed; starting threads\n");
+    asm volatile ("csrsi sstatus, 2");
+    sched.start();
+}
+
 export fn trapHandler(frame: *TrapFrame) callconv(.c) *TrapFrame {
     trap_count += 1;
     last_scause = frame.scause;
@@ -132,6 +144,15 @@ export fn trapHandler(frame: *TrapFrame) callconv(.c) *TrapFrame {
         timer.onInterrupt();
         const sched = @import("sched.zig");
         return sched.onTimer(frame);
+    }
+
+    if (!interrupt and code == Cause.ecall_from_u) {
+        const user = @import("user.zig");
+        if (user.handleEcall(frame)) {
+            return frame;
+        }
+        // sys_exit — continue into M5 (noreturn).
+        startM5();
     }
 
     if (!interrupt and code == Cause.breakpoint and expect_breakpoint) {
@@ -168,10 +189,15 @@ export fn trapHandler(frame: *TrapFrame) callconv(.c) *TrapFrame {
     while (true) asm volatile ("wfi");
 }
 
-/// Naked trap entry: allocate TrapFrame on stack, save GPRs + CSRs, call
-/// trapHandler (returns frame to restore in a0), restore, sret.
 export fn trapEntry() align(4) callconv(.naked) noreturn {
     asm volatile (
+        // Swap sp with sscratch. From U: sp:=kstack, sscratch:=user_sp.
+        // From S (sscratch=0): sp:=0, sscratch:=old_sp.
+        \\csrrw sp, sscratch, sp
+        \\bnez sp, 1f
+        \\csrr sp, sscratch
+        \\csrw sscratch, zero
+        \\1:
         \\addi sp, sp, -288
         \\sd ra,   0(sp)
         \\sd gp,  16(sp)
@@ -203,7 +229,11 @@ export fn trapEntry() align(4) callconv(.naked) noreturn {
         \\sd t4, 224(sp)
         \\sd t5, 232(sp)
         \\sd t6, 240(sp)
+        // Original SP: from-U still in sscratch; from-S is sp+288.
+        \\csrr t0, sscratch
+        \\bnez t0, 2f
         \\addi t0, sp, 288
+        \\2:
         \\sd t0, 8(sp)
         \\csrr t0, sepc
         \\sd t0, 248(sp)
@@ -220,6 +250,16 @@ export fn trapEntry() align(4) callconv(.naked) noreturn {
         \\csrw sepc, t0
         \\ld t0, 272(sp)
         \\csrw sstatus, t0
+        // Prepare sscratch for next trap: U→kstack top, S→0.
+        \\andi t1, t0, 0x100
+        \\bnez t1, 3f
+        \\lla t1, u_trap_stack_top
+        \\ld t1, 0(t1)
+        \\csrw sscratch, t1
+        \\j 4f
+        \\3:
+        \\csrw sscratch, zero
+        \\4:
         \\ld ra,   0(sp)
         \\ld gp,  16(sp)
         \\ld tp,  24(sp)
@@ -250,7 +290,8 @@ export fn trapEntry() align(4) callconv(.naked) noreturn {
         \\ld t4, 224(sp)
         \\ld t5, 232(sp)
         \\ld t6, 240(sp)
-        \\addi sp, sp, 288
+        \\ld t0, 8(sp)
+        \\mv sp, t0
         \\sret
     );
 }

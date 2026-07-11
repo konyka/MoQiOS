@@ -207,14 +207,7 @@ export fn kmain(hartid: usize, dtb: usize) callconv(.c) noreturn {
 
     putStr("[riscv64] M3 complete\n");
 
-    // ---- M5: timer + preemptive two-thread switch ----
-    putStr("MoQiOS riscv64: M5 (timer + sched)\n");
-    const timer = @import("timer.zig");
-    const sched = @import("sched.zig");
-    sched.init();
-    timer.init(50_000); // ~5 ms at 10 MHz
-    putStr("  stimecmp timer armed; starting threads\n");
-    // Enable SIE — first timer IRQ will preempt thread0 after start().
-    asm volatile ("csrsi sstatus, 2");
-    sched.start();
+    // ---- M6: U-mode + ecall (continues into M5 on sys_exit) ----
+    const user = @import("user.zig");
+    user.enter();
 }

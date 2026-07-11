@@ -11,6 +11,7 @@ const PTE_V: u64 = 1 << 0;
 const PTE_R: u64 = 1 << 1;
 const PTE_W: u64 = 1 << 2;
 const PTE_X: u64 = 1 << 3;
+const PTE_U: u64 = 1 << 4;
 const PTE_G: u64 = 1 << 5;
 const PTE_A: u64 = 1 << 6;
 const PTE_D: u64 = 1 << 7;
@@ -19,12 +20,18 @@ pub const MapFlags = struct {
     read: bool = true,
     write: bool = true,
     exec: bool = false,
+    user: bool = false,
 };
 
 var root_phys: usize = 0;
 
 fn pteLeaf(phys: usize, flags: MapFlags) u64 {
-    var pte: u64 = PTE_V | PTE_A | PTE_D | PTE_G | (@as(u64, @intCast(phys >> 12)) << 10);
+    var pte: u64 = PTE_V | PTE_A | PTE_D | (@as(u64, @intCast(phys >> 12)) << 10);
+    if (flags.user) {
+        pte |= PTE_U;
+    } else {
+        pte |= PTE_G;
+    }
     if (flags.read) pte |= PTE_R;
     if (flags.write) pte |= PTE_W;
     if (flags.exec) pte |= PTE_X;

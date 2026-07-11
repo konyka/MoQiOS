@@ -241,7 +241,7 @@ qemu-system-x86_64 \
 | `zig build test` | 在主机目标运行 `tests/main.zig` 单元测试，覆盖可脱离硬件执行的共享库逻辑 |
 | `zig build smoke` | 单核 QEMU 限时冒烟测试，串口日志需出现当前 init 自动序列末尾 `hello21 done` 和 `MoQiOS shell` |
 | `zig build smoke-smp` | 双核 QEMU 限时冒烟测试，验证 AP/SMP 启动路径仍能跑完整个 init 测试序列 |
-| `zig build -Darch=riscv64 smoke-riscv` | riscv64 M5 冒烟：timer + 双线程抢占轮转至 `M5 complete` |
+| `zig build -Darch=riscv64 smoke-riscv` | riscv64 M6 冒烟：U-mode `hello from U` + M5 抢占轮转至 `M5 complete` |
 
 调试连接：
 
