@@ -116,6 +116,7 @@ fn buildAarch64(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
         .red_zone = false,
         .pic = false,
     });
+    module.addAssemblyFile(b.path("kernel/arch/aarch64/vectors.S"));
 
     const kernel = b.addExecutable(.{
         .name = "moqi-kernel-aarch64.elf",

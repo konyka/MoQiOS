@@ -13,6 +13,7 @@ SECTIONS
 
     .text : ALIGN(4K) {
         *(.text.boot)
+        *(.text.vectors)
         *(.text .text.*)
     }
 

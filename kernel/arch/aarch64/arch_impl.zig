@@ -20,7 +20,9 @@ pub const serial = struct {
 };
 
 pub const interrupts = struct {
-    pub fn init() void {}
+    pub fn init() void {
+        @import("trap.zig").init();
+    }
     pub fn enableIrq() void {}
     pub fn disableIrq() void {}
 };

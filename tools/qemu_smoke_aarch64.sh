@@ -42,21 +42,23 @@ trap cleanup EXIT
 
 pass_markers() {
     [ -f "$LOG_FILE" ] &&
-        grep -q "MoQiOS aarch64: M9 skeleton" "$LOG_FILE" &&
-        grep -q "M9-1 complete" "$LOG_FILE"
+        grep -q "FDT OK" "$LOG_FILE" &&
+        grep -q "M9-1 complete" "$LOG_FILE" &&
+        grep -q "brk trap: OK" "$LOG_FILE" &&
+        grep -q "M9-2 complete" "$LOG_FILE"
 }
 
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if pass_markers; then
-        echo "PASS: MoQiOS aarch64 M9-1 smoke (PL011 banner)."
+        echo "PASS: MoQiOS aarch64 M9-2 smoke (PL011 + brk vectors)."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         if pass_markers; then
-            echo "PASS: MoQiOS aarch64 M9-1 smoke (PL011 banner)."
+            echo "PASS: MoQiOS aarch64 M9-2 smoke (PL011 + brk vectors)."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -70,7 +72,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for aarch64 smoke markers."
-echo "Expected: 'MoQiOS aarch64: M9 skeleton', 'M9-1 complete'."
+echo "Expected: 'FDT OK', 'M9-1 complete', 'brk trap: OK', 'M9-2 complete'."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1
