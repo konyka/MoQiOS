@@ -185,7 +185,7 @@ export fn kmain(x0_dtb: usize) callconv(.c) noreturn {
         putStr("  M9-3 FAILED: alloc for map test\n");
         while (true) asm volatile ("wfi");
     }
-    if (!paging.mapPage(test_va, test_pa, .{ .read = true, .write = true, .exec = false })) {
+    if (!paging.mapPage(test_va, test_pa, paging.F_WRITE)) {
         putStr("  M9-3 FAILED: mapPage\n");
         while (true) asm volatile ("wfi");
     }
@@ -218,6 +218,10 @@ export fn kmain(x0_dtb: usize) callconv(.c) noreturn {
 
     // ---- M9-5: GICv3 + timer IRQ ----
     _ = timer.irqSelfTest();
+
+    // ---- M9-6: EL0 + SVC ----
+    const user = @import("user.zig");
+    user.enter();
 
     while (true) asm volatile ("wfi");
 }

@@ -1,7 +1,4 @@
-//! EL1 exception handling for the aarch64 skeleton (Milestone 9-2/9-3/9-5).
-//!
-//! Installs `exception_vectors` into VBAR_EL1; self-tests `brk #0`, data
-//! aborts, and GICv3 IRQs (virtual timer PPI).
+//! EL1 exception handling for the aarch64 skeleton (Milestone 9-2…9-6).
 
 const uart = @import("uart.zig");
 
@@ -46,7 +43,7 @@ fn writeElrEl1(v: u64) void {
     );
 }
 
-/// Called from `sync_el1h_entry` with a pointer to the saved register frame.
+/// Current-EL sync (brk / #PF self-tests).
 export fn trapHandleSync(frame: *anyopaque) callconv(.c) void {
     _ = frame;
     const esr = readEsrEl1();
@@ -73,7 +70,27 @@ export fn trapHandleSync(frame: *anyopaque) callconv(.c) void {
     while (true) asm volatile ("wfi");
 }
 
-/// Called from `irq_el1h_entry`.
+/// Lower-EL (EL0) sync — SVC and faults from user mode.
+/// Returns 0 to `eret` back to EL0. SYS_EXIT never returns here.
+export fn trapHandleSyncEl0(frame: *anyopaque) callconv(.c) u64 {
+    const esr = readEsrEl1();
+    const ec = (esr >> 26) & 0x3f;
+
+    // EC 0x15 = SVC instruction from AArch64.
+    if (ec == 0x15) {
+        const user = @import("user.zig");
+        const tf: *user.TrapFrame = @ptrCast(@alignCast(frame));
+        return user.handleSvc(tf);
+    }
+
+    putStr("  unexpected EL0 sync: esr=");
+    putHex(esr);
+    putStr(" elr=");
+    putHex(readElrEl1());
+    putStr("\n");
+    while (true) asm volatile ("wfi");
+}
+
 export fn trapHandleIrq(frame: *anyopaque) callconv(.c) void {
     _ = frame;
     _ = @import("gic.zig").handleIrq();
