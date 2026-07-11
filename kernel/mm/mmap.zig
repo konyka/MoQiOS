@@ -8,8 +8,8 @@ const task_mod = @import("../proc/task.zig");
 const user_space = @import("user_space.zig");
 const pmm_mod = @import("pmm.zig");
 const hhdm_mod = @import("hhdm.zig");
-const paging_mod = @import("../arch/x86_64/paging.zig");
-const tlb_mod = @import("../arch/x86_64/tlb.zig");
+const paging_mod = @import("../arch/arch.zig").paging;
+const tlb_mod = @import("../arch/arch.zig").tlb;
 
 const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_PRIVATE: u64 = 0x2;

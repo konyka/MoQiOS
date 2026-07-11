@@ -311,6 +311,6 @@ pub fn timerTick(current_tick: u64) void {
 /// Get current time in nanoseconds for a given clock ID.
 fn getClockNs(clock_id: u32) u64 {
     _ = clock_id;
-    const tsc = @import("../arch/x86_64/tsc.zig");
+    const tsc = @import("../arch/arch.zig").tsc;
     return tsc.nanos();
 }

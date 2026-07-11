@@ -2,7 +2,7 @@
 ///
 /// Extracted from syscall_entry.zig (v19.1).
 const copy = @import("../mm/copy_from_user.zig");
-const tsc = @import("../arch/x86_64/tsc.zig");
+const tsc = @import("../arch/arch.zig").tsc;
 const bo = @import("../lib/byte_order.zig");
 
 /// Wall-clock offset from boot time (set by clock_settime).

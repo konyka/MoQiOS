@@ -93,13 +93,13 @@ fn readAbsTimeout(timeout_ptr: u64) u64 {
 /// Check if timeout has expired. abs_timeout_ns == 0 means no timeout.
 fn isTimedOut(abs_timeout_ns: u64) bool {
     if (abs_timeout_ns == 0) return false;
-    const tsc = @import("../arch/x86_64/tsc.zig");
+    const tsc = @import("../arch/arch.zig").tsc;
     return tsc.nanos() >= abs_timeout_ns;
 }
 
 /// Sleep approximately 1ms using TSC busy-wait to yield CPU to other tasks.
 fn sleepBrief() void {
-    const tsc = @import("../arch/x86_64/tsc.zig");
+    const tsc = @import("../arch/arch.zig").tsc;
     const start = tsc.nanos();
     while (tsc.nanos() - start < 1_000_000) {
         asm volatile ("pause");

@@ -9,7 +9,7 @@ const serial = @import("../arch/arch.zig").serial;
 const klog = @import("../klog.zig");
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
-const paging = @import("../arch/x86_64/paging.zig");
+const paging = @import("../arch/arch.zig").paging;
 const fmt = @import("../lib/fmt.zig");
 
 var fb_addr: [*]u8 = undefined; // 帧缓冲线性地址

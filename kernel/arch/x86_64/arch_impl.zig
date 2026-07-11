@@ -13,6 +13,7 @@ pub const context_switch = @import("context_switch.zig");
 pub const gdt = @import("gdt.zig");
 pub const tsc = @import("tsc.zig");
 pub const syscall = @import("syscall_entry.zig");
+pub const tlb = @import("tlb.zig");
 
 pub const cpu = struct {
     /// Park the current CPU forever. Used by panic / boot-failure paths.

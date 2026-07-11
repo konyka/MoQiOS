@@ -4,7 +4,7 @@ const pmm = @import("pmm.zig");
 const hhdm = @import("hhdm.zig");
 const serial = @import("../arch/arch.zig").serial;
 const klog = @import("../klog.zig");
-const paging = @import("../arch/x86_64/paging.zig");
+const paging = @import("../arch/arch.zig").paging;
 
 pub const DmaBuffer = struct {
     virt_addr: u64,

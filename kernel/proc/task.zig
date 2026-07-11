@@ -13,7 +13,7 @@
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const serial = @import("../arch/arch.zig").serial;
-const paging = @import("../arch/x86_64/paging.zig");
+const paging = @import("../arch/arch.zig").paging;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 const PAGE_SIZE: u64 = 4096;

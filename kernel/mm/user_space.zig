@@ -6,7 +6,7 @@
 ///
 /// The kernel PML4 entries are shared (not copied), so kernel mappings
 /// are automatically visible in every user address space.
-const paging = @import("../arch/x86_64/paging.zig");
+const paging = @import("../arch/arch.zig").paging;
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 

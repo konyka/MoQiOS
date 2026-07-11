@@ -4,7 +4,7 @@
 /// Used by databases (PostgreSQL), X11, and other applications.
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
-const paging = @import("../arch/x86_64/paging.zig");
+const paging = @import("../arch/arch.zig").paging;
 const serial = @import("../arch/arch.zig").serial;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const fmt = @import("../lib/fmt.zig");

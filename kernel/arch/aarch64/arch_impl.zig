@@ -28,6 +28,8 @@ pub const interrupts = struct {
 };
 
 pub const paging = struct {
+    pub const PAGE_SIZE: u64 = 4096;
+
     pub fn init() void {
         // Full init needs FDT regions from kmain; start.zig drives paging directly.
     }
@@ -109,5 +111,17 @@ pub const irq = struct {
             :
             : [v] "r" (saved),
         );
+    }
+};
+
+/// TLB shootdown surface — local only on uniprocessor aarch64 bring-up (SK-8).
+pub const tlb = struct {
+    pub fn shootdownRange(addr_start: u64, page_count: u32) void {
+        _ = addr_start;
+        _ = page_count;
+        asm volatile ("dsb ish" ::: .{ .memory = true });
+        asm volatile ("tlbi vmalle1" ::: .{ .memory = true });
+        asm volatile ("dsb ish" ::: .{ .memory = true });
+        asm volatile ("isb");
     }
 };

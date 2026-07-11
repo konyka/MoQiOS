@@ -5,7 +5,7 @@ const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const user_space = @import("../mm/user_space.zig");
 const pmm_mod = @import("../mm/pmm.zig");
-const paging_mod = @import("../arch/x86_64/paging.zig");
+const paging_mod = @import("../arch/arch.zig").paging;
 
 /// brk(addr) -> new break address.
 /// addr == 0 returns current break. addr below code or above stack returns current break.

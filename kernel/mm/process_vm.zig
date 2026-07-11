@@ -5,7 +5,7 @@
 /// Extracted from syscall_entry.zig (v18.8).
 const futex_mod = @import("../sync/futex.zig");
 const task_mod = @import("../proc/task.zig");
-const paging_mod = @import("../arch/x86_64/paging.zig");
+const paging_mod = @import("../arch/arch.zig").paging;
 const hhdm_mod = @import("../mm/hhdm.zig");
 
 /// process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags) -> bytes read or -errno.

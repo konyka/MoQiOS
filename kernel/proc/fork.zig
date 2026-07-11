@@ -140,7 +140,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
 pub fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
     const pmm_mod = @import("../mm/pmm.zig");
     const hhdm_mod = @import("../mm/hhdm.zig");
-    const paging_mod = @import("../arch/x86_64/paging.zig");
+    const paging_mod = @import("../arch/arch.zig").paging;
 
     const ADDR_MASK: u64 = 0xFFFFFFFFF000;
 
@@ -225,7 +225,7 @@ pub fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
 pub fn cloneUserPagesCow(parent_pml4_phys: u64) ?u64 {
     const pmm_mod = @import("../mm/pmm.zig");
     const hhdm_mod = @import("../mm/hhdm.zig");
-    const paging_mod = @import("../arch/x86_64/paging.zig");
+    const paging_mod = @import("../arch/arch.zig").paging;
 
     const ADDR_MASK: u64 = 0xFFFFFFFFF000;
     const COW_BIT: u64 = 1 << 9;

@@ -18,7 +18,7 @@ const task = @import("task.zig");
 const per_cpu = @import("per_cpu.zig");
 const idt = @import("../arch/x86_64/idt.zig");
 const gdt = @import("../arch/x86_64/gdt.zig");
-const paging = @import("../arch/x86_64/paging.zig");
+const paging = @import("../arch/arch.zig").paging;
 const syscall_entry = @import("../arch/x86_64/syscall_entry.zig");
 const context_switch = @import("../arch/x86_64/context_switch.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
@@ -157,7 +157,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         // Drive alarm() / setitimer(ITIMER_REAL) expiration checks
         // v53.46: Bitmap scan — only check tasks with active timers (O(active) vs O(64)).
         {
-            const tsc = @import("../arch/x86_64/tsc.zig");
+            const tsc = @import("../arch/arch.zig").tsc;
             const now_ns = tsc.nanos();
             // v53.47: Atomic load — alarm_bm/itimer_bm are modified from syscall context
             // on other CPUs. Non-atomic read-modify-write could lose newly set bits.
@@ -300,7 +300,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
     context_switch.onContextSwitch(old_task);
 
     // CPU time accounting: accumulate time spent in this task
-    const tsc_mod = @import("../arch/x86_64/tsc.zig");
+    const tsc_mod = @import("../arch/arch.zig").tsc;
     const now_tsc = tsc_mod.read();
     if (old_task.sched_in_tsc != 0 and tsc_mod.tsc_freq_mhz != 0) {
         const elapsed_tsc = now_tsc - old_task.sched_in_tsc;

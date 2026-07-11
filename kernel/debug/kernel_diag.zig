@@ -4,7 +4,7 @@ const task = @import("../proc/task.zig");
 const sched = @import("../proc/sched.zig");
 const idt = @import("../arch/x86_64/idt.zig");
 const serial = @import("../arch/arch.zig").serial;
-const paging = @import("../arch/x86_64/paging.zig");
+const paging = @import("../arch/arch.zig").paging;
 
 pub fn dumpMemory() void {
     serial.writeString("\n=== Memory Diagnostics ===\n");

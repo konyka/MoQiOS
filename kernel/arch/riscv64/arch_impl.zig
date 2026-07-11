@@ -39,6 +39,8 @@ pub const interrupts = struct {
 };
 
 pub const paging = struct {
+    pub const PAGE_SIZE: u64 = 4096;
+
     /// Sv39 identity map + satp enable (Milestone 3).
     pub fn init() void {
         // Full init needs FDT regions from kmain; start.zig drives sv39 directly.
@@ -116,5 +118,14 @@ pub const irq = struct {
         if ((saved & (1 << 1)) != 0) {
             asm volatile ("csrsi sstatus, 2");
         }
+    }
+};
+
+/// TLB shootdown surface — no-op on uniprocessor riscv64 bring-up (SK-8).
+pub const tlb = struct {
+    pub fn shootdownRange(addr_start: u64, page_count: u32) void {
+        _ = addr_start;
+        _ = page_count;
+        asm volatile ("sfence.vma" ::: .{ .memory = true });
     }
 };

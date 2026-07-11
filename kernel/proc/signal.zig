@@ -92,7 +92,7 @@ pub fn dequeueSignal(t: *task.Task) ?u32 {
 
 /// Map the shared sigreturn trampoline into a user address space.
 pub fn setupSigreturnTrampoline(user_pml4: u64) void {
-    const paging = @import("../arch/x86_64/paging.zig");
+    const paging = @import("../arch/arch.zig").paging;
     const pmm = @import("../mm/pmm.zig");
     const hhdm_mod = @import("../mm/hhdm.zig");
 

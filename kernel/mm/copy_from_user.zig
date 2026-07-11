@@ -3,7 +3,7 @@
 /// Validates that user pointers are in user space (< USER_LIMIT) before copying.
 /// If the address range extends into kernel space or overflows, returns 0 (no bytes copied).
 /// For truly safe fault recovery, an assembly-level RIP-range guard is needed (TODO).
-const paging = @import("../arch/x86_64/paging.zig");
+const paging = @import("../arch/arch.zig").paging;
 
 /// User-space address limit (canonical hole start).
 pub const USER_LIMIT: u64 = 0x0000_8000_0000_0000;

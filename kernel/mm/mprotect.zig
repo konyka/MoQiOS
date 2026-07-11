@@ -6,8 +6,8 @@
 /// PTE permission bits directly. For PROT_NONE the present bit is cleared
 /// while the physical frame number is preserved so the mapping can be
 /// restored later.
-const paging = @import("../arch/x86_64/paging.zig");
-const tlb = @import("../arch/x86_64/tlb.zig");
+const paging = @import("../arch/arch.zig").paging;
+const tlb = @import("../arch/arch.zig").tlb;
 const sched = @import("../proc/sched.zig");
 const task = @import("../proc/task.zig");
 

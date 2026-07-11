@@ -112,7 +112,7 @@ fn generatePidStatus(pid: u16, buf: [*]u8, max_len: u32) u32 {
 
 fn generatePidMaps(pid: u16, buf: [*]u8, max_len: u32) u32 {
     _ = @import("../proc/task.zig"); // referenced by findTaskByPid
-    const paging_mod = @import("../arch/x86_64/paging.zig");
+    const paging_mod = @import("../arch/arch.zig").paging;
     const t = findTaskByPid(pid) orelse {
         return appendStr(buf, 0, max_len, "# no such process\n");
     };
