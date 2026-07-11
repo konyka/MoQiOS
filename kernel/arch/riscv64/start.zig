@@ -186,6 +186,7 @@ export fn kmain(hartid: usize, dtb: usize) callconv(.c) noreturn {
     @import("../../shared/sk9.zig").announce();
     @import("../../shared/sk10.zig").announce();
     @import("../../shared/sk11.zig").announce();
+    @import("../../shared/sk12.zig").announce();
 
     // Map a fresh page at a non-identity VA, write/read, then unmap + #PF.
     const test_va: usize = 0x40000000;

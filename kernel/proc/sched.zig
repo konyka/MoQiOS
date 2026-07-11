@@ -21,6 +21,7 @@ const gdt = @import("../arch/arch.zig").gdt;
 const paging = @import("../arch/arch.zig").paging;
 const syscall_entry = @import("../arch/arch.zig").syscall;
 const context_switch = @import("../arch/arch.zig").context_switch;
+const arch_cpu = @import("../arch/arch.zig").cpu;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const fmt = @import("../lib/fmt.zig");
 
@@ -506,11 +507,11 @@ pub fn deliverSignalToRunningTask(t: *task.Task) void {
     iframe.rdi = signum;
 }
 
-/// Shared kernel idle body — lowest priority, sti+hlt between timer ticks.
+/// Shared kernel idle body — lowest priority, enable IRQs + wait between ticks.
 pub fn kernelIdleLoop() callconv(.c) void {
     while (true) {
-        asm volatile ("sti");
-        asm volatile ("hlt");
+        idt.enableIrq();
+        arch_cpu.waitForInterrupt();
     }
 }
 
@@ -558,8 +559,8 @@ pub fn apBootstrapIdle() noreturn {
 /// AP idle loop — fallback when bootstrap cannot find a per-CPU kernel idle.
 pub fn apIdleLoop() noreturn {
     while (true) {
-        asm volatile ("sti");
-        asm volatile ("hlt");
+        idt.enableIrq();
+        arch_cpu.waitForInterrupt();
     }
 }
 
@@ -575,7 +576,7 @@ pub fn apIdleLoop() noreturn {
 /// scheduler from an AP.
 pub fn apParkLoop() noreturn {
     while (true) {
-        asm volatile ("hlt");
+        arch_cpu.waitForInterrupt();
     }
 }
 

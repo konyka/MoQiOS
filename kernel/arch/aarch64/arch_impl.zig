@@ -42,7 +42,7 @@ pub const paging = struct {
     pub const PAGE_SIZE: u64 = 4096;
     pub const PAGE_2MB: u64 = 2 * 1024 * 1024;
 
-    /// Shared MapFlags shape (SK-11) — real EL1 mapping stays in start.zig for now.
+    /// Shared MapFlags shape (SK-11) — forwarded to EL1 paging (SK-12).
     pub const MapFlags = struct {
         writable: bool = false,
         user: bool = false,
@@ -52,40 +52,45 @@ pub const paging = struct {
         cache_disable: bool = false,
     };
 
-    var kernel_root_phys: u64 = 0;
+    const a64pag = @import("paging.zig");
 
     pub fn init() void {
         // Full init needs FDT regions from kmain; start.zig drives paging directly.
     }
 
     pub fn getKernelPml4() u64 {
-        return kernel_root_phys;
+        return a64pag.rootPhys();
+    }
+
+    fn toFlags(flags: MapFlags) u8 {
+        var f: u8 = 0;
+        if (flags.writable) f |= a64pag.F_WRITE;
+        if (!flags.no_execute) f |= a64pag.F_EXEC;
+        if (flags.user) f |= a64pag.F_USER;
+        return f;
     }
 
     pub fn mapPage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void {
         _ = pml4_phys;
-        _ = virt;
-        _ = phys;
-        _ = flags;
+        if (!a64pag.mapPage(@intCast(virt), @intCast(phys), toFlags(flags)))
+            return error.OutOfMemory;
     }
 
     pub fn unmapPage(pml4_phys: u64, virt: u64) ?u64 {
         _ = pml4_phys;
-        _ = virt;
+        a64pag.unmapPage(@intCast(virt));
         return null;
     }
 
     pub fn isPageMapped(pml4_phys: u64, virt: u64) bool {
         _ = pml4_phys;
         _ = virt;
+        // a64 paging has no isMapped helper yet.
         return false;
     }
 
     pub fn mapHugePage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void {
-        _ = pml4_phys;
-        _ = virt;
-        _ = phys;
-        _ = flags;
+        try mapPage(pml4_phys, virt, phys, flags);
     }
 };
 
@@ -106,6 +111,11 @@ pub const context_switch = struct {
 pub const cpu = struct {
     pub fn halt() noreturn {
         while (true) asm volatile ("wfi");
+    }
+
+    /// Wait for the next interrupt (single `wfi`). Used by idle loops (SK-12).
+    pub fn waitForInterrupt() void {
+        asm volatile ("wfi");
     }
 
     pub fn pause() void {

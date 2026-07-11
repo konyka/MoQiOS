@@ -35,6 +35,14 @@ pub fn incrementTick() void {
     tick_count += 1;
 }
 
+pub fn enableIrq() void {
+    asm volatile ("sti");
+}
+
+pub fn disableIrq() void {
+    asm volatile ("cli");
+}
+
 const exception_names = [32][]const u8{
     "Division Error",
     "Debug",

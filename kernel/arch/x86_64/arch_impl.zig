@@ -25,6 +25,11 @@ pub const cpu = struct {
         }
     }
 
+    /// Wait for the next interrupt (single `hlt`). Used by idle loops.
+    pub fn waitForInterrupt() void {
+        asm volatile ("hlt");
+    }
+
     /// Spin-wait hint for busy loops (PAUSE on x86_64).
     pub fn pause() void {
         asm volatile ("pause");

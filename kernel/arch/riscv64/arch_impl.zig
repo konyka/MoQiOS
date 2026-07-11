@@ -53,7 +53,7 @@ pub const paging = struct {
     pub const PAGE_SIZE: u64 = 4096;
     pub const PAGE_2MB: u64 = 2 * 1024 * 1024;
 
-    /// Shared MapFlags shape (SK-11) — real Sv39 mapping stays in start.zig for now.
+    /// Shared MapFlags shape (SK-11) — forwarded to Sv39 (SK-12).
     pub const MapFlags = struct {
         writable: bool = false,
         user: bool = false,
@@ -63,7 +63,7 @@ pub const paging = struct {
         cache_disable: bool = false,
     };
 
-    var kernel_root_phys: u64 = 0;
+    const sv39 = @import("sv39.zig");
 
     /// Sv39 identity map + satp enable (Milestone 3).
     pub fn init() void {
@@ -71,33 +71,36 @@ pub const paging = struct {
     }
 
     pub fn getKernelPml4() u64 {
-        return kernel_root_phys;
+        return sv39.rootPhys();
     }
 
     pub fn mapPage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void {
         _ = pml4_phys;
-        _ = virt;
-        _ = phys;
-        _ = flags;
+        const ok = sv39.mapPage(@intCast(virt), @intCast(phys), .{
+            .read = true,
+            .write = flags.writable,
+            .exec = !flags.no_execute,
+            .user = flags.user,
+        });
+        if (!ok) return error.OutOfMemory;
     }
 
     pub fn unmapPage(pml4_phys: u64, virt: u64) ?u64 {
         _ = pml4_phys;
-        _ = virt;
+        if (!sv39.isMapped(@intCast(virt))) return null;
+        // Sv39 unmap does not return the old phys; callers that free must track it.
+        sv39.unmapPage(@intCast(virt));
         return null;
     }
 
     pub fn isPageMapped(pml4_phys: u64, virt: u64) bool {
         _ = pml4_phys;
-        _ = virt;
-        return false;
+        return sv39.isMapped(@intCast(virt));
     }
 
     pub fn mapHugePage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void {
-        _ = pml4_phys;
-        _ = virt;
-        _ = phys;
-        _ = flags;
+        // No Sv39 huge helper yet — fall back to a single 4K map of the base.
+        try mapPage(pml4_phys, virt, phys, flags);
     }
 };
 
@@ -118,6 +121,11 @@ pub const context_switch = struct {
 pub const cpu = struct {
     pub fn halt() noreturn {
         while (true) asm volatile ("wfi");
+    }
+
+    /// Wait for the next interrupt (single `wfi`). Used by idle loops (SK-12).
+    pub fn waitForInterrupt() void {
+        asm volatile ("wfi");
     }
 
     pub fn pause() void {

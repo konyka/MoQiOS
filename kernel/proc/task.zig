@@ -14,7 +14,10 @@ const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const serial = @import("../arch/arch.zig").serial;
 const paging = @import("../arch/arch.zig").paging;
+const arch_cpu = @import("../arch/arch.zig").cpu;
+const arch_irq = @import("../arch/arch.zig").interrupts;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+const builtin = @import("builtin");
 
 const PAGE_SIZE: u64 = 4096;
 const KERNEL_STACK_PAGES: u64 = 32;
@@ -369,37 +372,52 @@ fn stackVirtForSlot(slot: u32) u64 {
 /// Allocate a virtually contiguous kernel stack without requiring contiguous
 /// physical pages. The stack lives in a fixed high-half virtual window per task
 /// slot, avoiding HHDM huge-page remapping while keeping task creation O(pages).
+///
+/// Non-x86 (SK-12): Sv39/EL1 bring-up uses identity maps (hhdm offset 0), so
+/// allocate a contiguous physical run and treat phys==virt.
 fn allocKernelStackForSlot(slot: u32) ?u64 {
-    const stack_virt = stackVirtForSlot(slot);
-    var allocated: [KERNEL_STACK_PAGES]u64 = undefined;
-    var count: usize = 0;
-    while (count < KERNEL_STACK_PAGES) : (count += 1) {
-        const phys = pmm.allocPage() orelse {
-            freeKernelStackPages(stack_virt, allocated[0..count]);
-            return null;
-        };
-        allocated[count] = phys;
-        const page_virt = stack_virt + @as(u64, count) * PAGE_SIZE;
-        paging.mapPage(paging.getKernelPml4(), page_virt, phys, .{
-            .writable = true,
-            .user = false,
-            .no_execute = true,
-            .global = true,
-        }) catch {
-            pmm.freePage(phys);
-            freeKernelStackPages(stack_virt, allocated[0..count]);
-            return null;
-        };
+    if (comptime builtin.cpu.arch != .x86_64) {
+        const stack_phys = pmm.allocContiguous(KERNEL_STACK_PAGES) orelse return null;
+        return hhdm.physToVirt(stack_phys);
+    } else {
+        const stack_virt = stackVirtForSlot(slot);
+        var allocated: [KERNEL_STACK_PAGES]u64 = undefined;
+        var count: usize = 0;
+        while (count < KERNEL_STACK_PAGES) : (count += 1) {
+            const phys = pmm.allocPage() orelse {
+                freeKernelStackPages(stack_virt, allocated[0..count]);
+                return null;
+            };
+            allocated[count] = phys;
+            const page_virt = stack_virt + @as(u64, count) * PAGE_SIZE;
+            paging.mapPage(paging.getKernelPml4(), page_virt, phys, .{
+                .writable = true,
+                .user = false,
+                .no_execute = true,
+                .global = true,
+            }) catch {
+                pmm.freePage(phys);
+                freeKernelStackPages(stack_virt, allocated[0..count]);
+                return null;
+            };
+        }
+        return stack_virt;
     }
-    return stack_virt;
 }
 
 /// Free a kernel stack allocated by allocKernelStack.
 fn freeKernelStack(stack_virt: u64) void {
-    for (0..KERNEL_STACK_PAGES) |i| {
-        const page_virt = stack_virt + @as(u64, i) * PAGE_SIZE;
-        if (paging.unmapPage(paging.getKernelPml4(), page_virt)) |phys| {
-            pmm.freePage(phys);
+    if (comptime builtin.cpu.arch != .x86_64) {
+        var i: u64 = 0;
+        while (i < KERNEL_STACK_PAGES) : (i += 1) {
+            pmm.freePage(hhdm.virtToPhys(stack_virt + i * PAGE_SIZE));
+        }
+    } else {
+        for (0..KERNEL_STACK_PAGES) |i| {
+            const page_virt = stack_virt + @as(u64, i) * PAGE_SIZE;
+            if (paging.unmapPage(paging.getKernelPml4(), page_virt)) |phys| {
+                pmm.freePage(phys);
+            }
         }
     }
 }
@@ -559,9 +577,9 @@ pub fn exitTask(exit_code: i32) void {
         if (findTaskByTidLocked(t.parent_tid)) |parent_idx| {
             const parent = getTask(parent_idx) orelse {
                 task_lock.release(flags);
-                asm volatile ("sti" ::: .{ .memory = true });
+                arch_irq.enableIrq();
                 while (true) {
-                    asm volatile ("hlt");
+                    arch_cpu.waitForInterrupt();
                 }
             };
             if (parent.waiting_for_child) {
@@ -579,9 +597,9 @@ pub fn exitTask(exit_code: i32) void {
     // can resume a different task while the current kernel stack is still deep
     // in exitTask.
     sched.requestReschedule();
-    asm volatile ("sti" ::: .{ .memory = true });
+    arch_irq.enableIrq();
     while (true) {
-        asm volatile ("hlt" ::: .{ .memory = true });
+        arch_cpu.waitForInterrupt();
     }
 }
 
