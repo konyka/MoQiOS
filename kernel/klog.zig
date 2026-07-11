@@ -1,5 +1,5 @@
 /// Kernel log system — outputs to serial with level prefixes.
-const serial = @import("arch/x86_64/serial.zig");
+const serial = @import("arch/arch.zig").serial;
 const fmt = @import("lib/fmt.zig");
 
 pub const Level = enum(u8) {

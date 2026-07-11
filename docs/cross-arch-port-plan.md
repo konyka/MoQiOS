@@ -9,23 +9,23 @@
 
 ---
 
-## 0. 现状基线（移植起点）
+## 0. 现状基线（移植起点 → 2026-07 更新）
 
-- **架构耦合**：内核 100% x86_64，`kernel/arch/` 下仅 `x86_64/`；约 60+ 源文件直接
-  `@import("arch/x86_64/...")`（其中相当一部分是未集成脚手架）。无任何 `arch` 抽象接口。
-- **SMP**：AP 启动链路已打通（到达 `[SMP] AP N initialized` 并停泊），但 `enable_ap_startup=false`。
-  原门控根因（TSS 错位 + 中断 stub 寄存器破坏）**已修复**（见架构文档 1.7/1.8），SMP 重新可推进。
-- **per-CPU 半成品**：`PerCpu` 结构体已含 `kernel_rsp/saved_stack_anchor/slice_remaining/
-  current_task_idx`，但调度器仍用全局变量；`IrqSpinlock` 已是 SMP 安全自旋锁。
-- **引导**：x86_64 经 Limine（提供 HHDM、memmap、framebuffer）。Limine 亦支持 riscv64/aarch64
-  （UEFI 引导）；riscv64 另有更轻的 OpenSBI `-kernel` 直引导路径，适合骨架阶段。
+- **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 各有 `arch_impl.zig`。
+  共享内核路径仍大量直连 `arch/x86_64/...`；`main.zig` / `klog.zig` 已渐进迁到 facade
+  （serial / interrupts / paging / timer / context_switch）。riscv64 构建根仍是
+  `start.zig` 骨架，**尚未**链接完整 `main.zig`。
+- **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
+  TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
+- **riscv64**：M0–M2 完成（soft-float、UART16550、`stvec`+trap、`ebreak` 自测）。
+  门禁：`zig build -Darch=riscv64 smoke-riscv`。M3+（PMM/Sv39/调度/用户态）待办。
+- **引导**：x86_64 经 Limine；riscv64 经 OpenSBI `-kernel`（链接地址 `0x80200000`）。
 
 ### 环境约束（影响验证手段）
 
-- 本开发机仅有 `qemu-system-x86_64`，**无 `qemu-system-riscv64`/`aarch64`，且无 root 安装**。
-- 因此 riscv64/aarch64 在本机只能做**构建级 + 静态验证**（交叉编译成合法 ELF，`readelf`/`objdump`
-  核对）。**运行时启动验证需安装** `qemu-system-riscv`（Fedora：`sudo dnf install qemu-system-riscv`）。
-  运行脚本已备好（`tools/qemu_run_riscv64.sh`），emulator 可用后即可一键运行时验证。
+- 本开发机现已具备 `qemu-system-x86_64` 与 `qemu-system-riscv64`。
+- riscv64 可用 `tools/qemu_run_riscv64.sh` 做运行时验证；x86_64 用 `zig build smoke` /
+  `zig build smoke-smp` 做 boot-to-shell 门禁。
 
 ---
 
@@ -51,14 +51,14 @@
 | 里程碑 | 内容 | 验证方式 | 状态 |
 |---|---|---|---|
 | **M0** | 路线图文档（本文件）、第二 ISA 选型（riscv64） | 文档评审 | ✅ 完成 |
-| **M1** | `-Darch` 多目标构建；riscv64 内核**骨架**（`_start`+SBI 控制台+`kmain`+linker.ld）启动并打印 | 交叉编译成合法 riscv64 ELF（readelf/objdump）；x86_64 不回归（构建+启动到 shell）；运行时验证待 emulator | ✅ 完成（构建/静态）；⏳ 运行时待 emulator |
-| **M2** | riscv64 早期 init：**改 soft-float ABI（lp64，禁用 F/D，内核不应用 FP 寄存器）**；解析 a0(hartid)/a1(DTB)，UART16550 直驱（不依赖 SBI），异常向量 `stvec` + trap 帧 | QEMU virt 启动打印 + 触发非法指令陷入被捕获 | ⬜ 待办 |
+| **M1** | `-Darch` 多目标构建；riscv64 内核**骨架**（`_start`+SBI 控制台+`kmain`+linker.ld）启动并打印 | 交叉编译成合法 riscv64 ELF（readelf/objdump）；x86_64 不回归（构建+启动到 shell）；运行时验证待 emulator | ✅ 完成（构建+运行时） |
+| **M2** | riscv64 早期 init：**soft-float ABI（lp64，禁用 F/D）**；解析 a0(hartid)/a1(DTB)；UART16550 直驱；`stvec` + trap 帧；breakpoint 自测 | QEMU virt 启动打印 + `ebreak` 陷入被捕获 | ✅ 完成（2026-07-10） |
 | **M3** | riscv64 物理内存管理：从 DTB/Limine memmap 建 PMM；Sv39 分页 map/unmap + HHDM | 映射/取消映射自测；缺页陷入 | ⬜ 待办 |
-| **M4** | **抽取 `arch` 接口**：定义 `kernel/arch/arch.zig`（comptime 选择实现）；把内存/控制台/陷入/定时器迁到接口后；x86_64 改为通过接口 | x86_64 仍启动到 shell；riscv64 复用同一上层代码 | ✅ 完成（2026-06-21） |
+| **M4** | **抽取 `arch` 接口**：定义 `kernel/arch/arch.zig`（comptime 选择实现）；x86 侧经 facade 重导出；riscv64 提供同名 stub/实装 | x86_64 仍启动到 shell；riscv64 后端可编译（完整 `main.zig` 复用待 M5+） | ✅ 接口完成（渐进迁移进行中） |
 | **M5** | riscv64 定时器 + 上下文切换 + 调度器接入（复用 `proc/sched.zig` 上层逻辑） | riscv64 跑多内核线程轮转 | ⬜ 待办 |
 | **M6** | riscv64 用户态：U-mode 进入、syscall（`ecall`）入口、地址空间隔离 | riscv64 跑 `hello*` 用户程序 | ⬜ 待办 |
 | **M7** | riscv64 驱动：virtio-blk/virtio-net（virtio 与 ISA 无关，复用大部分逻辑）+ 块/网/FS 上线 | riscv64 跑 ext2 读写、网络自测 | ⬜ 待办 |
-| **M8** | **SMP（先 x86_64，后 riscv64）**：per-CPU 调度器（per-CPU 运行队列+work-stealing+per-CPU TSS/anchor）、通用 IPI、TLB shootdown；启用 `enable_ap_startup` | QEMU 多核：用户任务真正并行；零崩溃 | 🚧 进行中（见 §4） |
+| **M8** | **SMP（先 x86_64，后 riscv64）**：per-CPU 调度器（per-CPU 运行队列+work-stealing+per-CPU TSS/anchor）、通用 IPI、TLB shootdown；启用 `enable_ap_startup` | QEMU 多核：用户任务真正并行；零崩溃 | ✅ x86_64 完成（见 §4）；riscv64 SMP 待 M5+ |
 | **M9** | aarch64 后端（复用 M4 抽象 + Limine 引导 + GIC/generic timer/PL011） | QEMU aarch64 启动 → 用户态 | ⬜ 待办 |
 
 > SMP（M8）与第二 ISA（M2–M7）相对独立，可并行；M8 的 per-CPU 改造也会反哺 riscv64/aarch64 的
@@ -113,9 +113,46 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 
 ### 下一步
 
-- 逐步将 gdt/idt/paging/lapic/tsc 等深度模块迁移到 `arch.zig` 接口后面
+- 逐步将 gdt/tsc/syscall_entry 等剩余 x86 直连模块迁到 `arch.zig` 接口后面
 - 每次迁移一个模块，保持 x86_64 可构建 + 启动到 shell
-- riscv64 侧同步实现对应接口（待 M5–M7 里程碑）
+- riscv64 侧同步实现对应接口（待 M3–M7 里程碑）
+
+---
+
+## 3.6 M2 完成记录（2026-07-10）
+
+### 完成内容
+
+- **soft-float ABI**：`build.zig` 使用 `-mcpu baseline_rv64-f-d`，ELF flags = `RVC, soft-float ABI`。
+- **hartid / DTB**：`_start` 保留 a0/a1 传入 `kmain`；校验 FDT magic `0xd00dfeed`。
+- **UART16550**：`kernel/arch/riscv64/uart.zig` 直驱 QEMU virt `0x10000000`（不再依赖 SBI putchar）。
+- **`stvec` + trap 帧**：`trap.zig` 提供 `TrapFrame`、对齐的 `trapEntry`、`trapHandler`。
+- **陷入自测**：OpenSBI 默认 `medeleg` **不**委托 illegal-instruction（cause 2），改用已委托的
+  breakpoint（cause 3 / `ebreak`）。验证输出含 `breakpoint trap: OK`。
+- **入口对齐**：`_start` 放入 `.text.boot`（OpenSBI 跳到 payload base `0x80200000`，非 ELF e_entry）；
+  `trapEntry` 必须 4 字节对齐（否则 `stvec` MODE 位被污染）。
+
+### arch 渐进迁移（同轮）
+
+- `kernel/main.zig` 经 `arch.zig` 使用：`serial`、`interrupts`、`paging`、`timer`、`context_switch`。
+- 仍直连 x86：`gdt`、`tsc`、`syscall_entry`（待后续里程碑纳入 arch 契约）。
+
+### 验证
+
+```bash
+zig build -Darch=riscv64
+MOQI_SERIAL=file:/tmp/rv.log ./tools/qemu_run_riscv64.sh
+# 预期：
+#   MoQiOS riscv64: M2 early init (soft-float, UART16550, stvec)
+#   hartid=0
+#   dtb=... magic=0xd00dfeed ... (FDT OK)
+#   stvec installed
+#   [trap] breakpoint caught ...
+#   breakpoint trap: OK
+#   [riscv64] M2 complete; shutting down
+
+zig build smoke && zig build smoke-smp   # x86_64 不回归
+```
 
 ---
 
@@ -263,7 +300,8 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 > - **M8-6**：范围 TLB shootdown（`tlb.shootdownRange` + invlpg + 32 页阈值 CR3 回退）。
 > - **M8-7**：per-CPU 运行队列 + work-stealing（`PerCpuRunQueue` 256 槽 LIFO + steal_half）。
 > - 三者互为前提，同时交付后 AP 首次可真正跨核运行用户任务。
-> - 验证：`MOQI_SMP=1` 与 `MOQI_SMP=2` 均完整跑通 `init` + `hello2`–`hello28` 到 `MoQiOS shell`。
+> - 验证：`MOQI_SMP=1` 与 `MOQI_SMP=2` 均完整跑通 `init` 自动序列（至 `hello21 done`）+ `MoQiOS shell`
+>   （`init.S` 当前在 hello21 后进入 shell；hello22–28 为手动/后续用例，非自动序列）。
 
 ---
 
@@ -273,14 +311,14 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 
 | 类别 | 代表项 | 状态 | 性能影响 |
 |---|---|---|---|
-| **SMP 调度** | round-robin@AP、任务迁移、per-CPU 运行队列 | 🚧 部分 | **极高**（锁竞争、cache 颠簸） |
-| **SMP 内存** | 范围 TLB shootdown（`invlpg`） | ⬜ | **高**（CR3 全刷代价大） |
-| **SMP 浮点** | FXSAVE/FXRSTOR 按任务 | ⬜ | 中（迁移前置） |
-| **架构抽象** | `kernel/arch/arch.zig` 多 ISA 接口 | ✅ M4 已完成 | 中（移植效率，非热路径） |
-| **riscv64** | M2–M7（trap/PMM/调度/用户态/virtio） | ⬜ | N/A（第二 ISA） |
+| **SMP 调度** | round-robin@AP、任务迁移、per-CPU 运行队列 | ✅ M8-5b/M8-7 | **极高**（已落地） |
+| **SMP 内存** | 范围 TLB shootdown（`invlpg`） | ✅ M8-6 | **高**（已落地） |
+| **SMP 浮点** | FXSAVE/FXRSTOR 按任务 | ✅ M8-5b-3 | 中（已落地） |
+| **架构抽象** | `kernel/arch/arch.zig` 多 ISA 接口 | ✅ M4；渐进迁移中 | 中（移植效率，非热路径） |
+| **riscv64** | M2 ✅；M3–M7（PMM/调度/用户态/virtio） | 🚧 M2 完成 | N/A（第二 ISA） |
 | **未集成脚手架** | `futex`/`select`/`inotify`/`clone`/`mprotect`/SysV IPC/`aio`/`splice`/`dhcp`/`dns` 等 | 🧩 源文件在树中，未 `@import` | 低（按需接入） |
 | **缺页恢复** | 内核态 per-instruction fixup | ⚠️ 页表预检替代 | 中 |
-| **单元测试** | `zig build test` 空操作 | ⬜ | 低（质量门） |
+| **单元测试** | `zig build test`（host helpers） | ✅ 有基础用例 | 低（质量门） |
 
 ### 5.2 性能优先原则
 
@@ -299,41 +337,24 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M4 arch 抽象层已完成；⬜ M2–M7 riscv64 待续
+Phase F — 第二 ISA              ✅ M2（soft-float/UART/stvec）；⬜ M3–M7 待续
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
-### 5.4 M8-5b-2d 详细设计（下一执行项）
+### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
-**目标**：启用 `assignCpuAffinity(elf)` 中 flat round-robin@AP，再逐步开放 ELF@AP。
+> 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
+> 当前下一执行项：**riscv64 M3**（DTB memmap → PMM + Sv39）。
 
-**前置**：5b-2c 已验证跨核唤醒路径；`forceReschedule()` 仍不可用于 syscall 阻塞。
+**原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。
 
-**步骤**：
-1. 取消 `assignCpuAffinity` 中 `return 0` 强制 BSP，先仅 flat (`elf=false`) round-robin
-2. 将 `saved_user_rsp` 迁入 `Task`（5b-4 预研），使 waitpid 可安全 yield
-3. 3/3 `MOQI_SMP=2` 回归后，再允许 ELF@AP
+**原 5b-2c 根因备忘**：
+- `waitpid` 在 syscall 上下文不可调用 `forceReschedule()`（会破坏 anchor）。
+- 跨核唤醒依赖 `wait_cpu` / `kickChildCpus` / IPI `force_reschedule` 旁路。
 
-### 5.5 原 M8-5b-2c 设计备忘
+**验证**：`zig build smoke` + `zig build smoke-smp`；riscv64：`zig build -Darch=riscv64 smoke-riscv`。
 
-**目标**：恢复 `assignCpuAffinity()` round-robin，`MOQI_SMP=2` 全量 init 3/3 到 shell。
-
-**根因**（已定位）：
-- `waitpid` 在 syscall 上下文 `hlt` 自旋时仍占 `cur_idx`；同核子任务需 timer IRQ 切走父进程。
-- 跨核时 AP reschedule IPI 偶发在 `hello4`（ELF）就绪前到达，单任务 fast-path 跳过调度。
-- `forceReschedule()` 从 syscall 调用会破坏 anchor（指向 timer 帧），不可用作 wait 路径。
-
-**修复步骤**（按性能影响排序）：
-1. `forceRescheduleFromIpi` 已设 `PerCpu.force_reschedule` 旁路 fast-path ✅
-2. `waitpid` 阻塞后 `kickChildCpus(parent_tid)` 二次 kick AP ✅
-3. `exitTask` 用 `parent.wait_cpu` 精确 kick 等待核 ✅
-4. **待做**：syscall 阻塞统一走 `Task.saved_user_rsp` 字段（5b-4 预研），或
-   `waitpid` 在标记 blocked 后依赖 timer 切走且禁止 blocked+同核 fast-path 早退
-5. **待做**：spawn 后对 remote CPU 双 kick（spawn + waitpid 各一次）+ `mfence` 发布顺序
-
-**验证**：`for i in 1 2 3; do MOQI_SMP=2 timeout 120 ...; done` 要求 3/3 shell。
-
-### 5.6 未集成脚手架接入优先级
+### 5.5 未集成脚手架接入优先级
 
 仅当 Phase A–E 完成或有明确应用需求时接入；接入模式：`syscall_entry` 分发 → 模块实现 → `hello*` 回归。
 

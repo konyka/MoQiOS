@@ -54,17 +54,17 @@ fn addCUserProgram(b: *std.Build, name: []const u8) void {
     b.getInstallStep().dependOn(&elf.step);
 }
 
-/// Build the RISC-V 64 kernel skeleton (cross-ISA port, Milestone 1).
-/// Separate from the x86_64 path: at this stage riscv64 builds a minimal
-/// standalone kernel (boot + SBI console), not the full kernel. As the port
-/// matures (see docs/cross-arch-port-plan.md, M4) riscv64 will build the full
-/// kernel behind the shared `arch` interface.
+/// Build the RISC-V 64 kernel skeleton (cross-ISA port, Milestone 2).
+/// Soft-float ABI (lp64): baseline_rv64 with F/D removed so the kernel never
+/// touches FP registers. Separate from the x86_64 path until the shared arch
+/// interface can host the full kernel (see docs/cross-arch-port-plan.md).
 fn buildRiscv64(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
-    const target = b.resolveTargetQuery(.{
-        .cpu_arch = .riscv64,
-        .os_tag = .freestanding,
-        .abi = .none,
-    });
+    const query = std.Target.Query.parse(.{
+        .arch_os_abi = "riscv64-freestanding-none",
+        // Soft-float: drop F/D from baseline_rv64 → ELF flags show soft-float ABI.
+        .cpu_features = "baseline_rv64-f-d",
+    }) catch unreachable;
+    const target = b.resolveTargetQuery(query);
 
     const module = b.createModule(.{
         .root_source_file = b.path("kernel/arch/riscv64/start.zig"),
@@ -91,6 +91,12 @@ fn buildRiscv64(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
     const run_cmd = b.addSystemCommand(&.{"./tools/qemu_run_riscv64.sh"});
     run_cmd.step.dependOn(b.getInstallStep());
     run_step.dependOn(&run_cmd.step);
+
+    const smoke_rv_step = b.step("smoke-riscv", "Run bounded riscv64 M2 QEMU smoke test");
+    const smoke_rv_cmd = b.addSystemCommand(&.{"./tools/qemu_smoke_riscv64.sh"});
+    smoke_rv_cmd.step.dependOn(b.getInstallStep());
+    smoke_rv_cmd.setEnvironmentVariable("MOQI_SMOKE_SKIP_BUILD", "1");
+    smoke_rv_step.dependOn(&smoke_rv_cmd.step);
 }
 
 pub fn build(b: *std.Build) void {

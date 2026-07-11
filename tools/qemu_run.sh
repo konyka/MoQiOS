@@ -105,17 +105,20 @@ echo "========================================="
 # Overridable for diagnostics:
 #   MOQI_SERIAL      serial target (default: stdio; e.g. file:/tmp/serial.log)
 #   MOQI_SMP         number of CPUs (default: 2)
+#   MOQI_DISK        raw disk image path (default: disk.img)
 #   MOQI_EXTRA_QEMU  extra QEMU args (e.g. "-d int,cpu_reset -D /tmp/qint.log")
 SERIAL_TARGET="${MOQI_SERIAL:-stdio}"
 SMP_COUNT="${MOQI_SMP:-2}"
+DISK_IMAGE="${MOQI_DISK:-disk.img}"
 EXTRA_QEMU="${MOQI_EXTRA_QEMU:-}"
 
-qemu-system-x86_64 \
+# exec so callers that background this script get the QEMU PID (not a leftover shell).
+exec qemu-system-x86_64 \
     -M q35 \
     -m 512M \
     -cdrom "$ISO_FILE" \
     -boot order=d \
-    -drive file=disk.img,format=raw,if=none,id=disk0 \
+    -drive file="$DISK_IMAGE",format=raw,if=none,id=disk0 \
     -device virtio-blk-pci,drive=disk0 \
     -netdev user,id=net0 \
     -device e1000,netdev=net0 \

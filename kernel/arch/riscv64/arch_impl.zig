@@ -1,40 +1,31 @@
 //! RISC-V 64 backend for the kernel-wide arch abstraction layer.
 //!
-//! At Milestone 4 of the cross-ISA port most subsystems are still stubs:
-//! they expose the same public surface as the x86_64 backend so that
-//! shared kernel code compiles for both targets, but the actual hardware
-//! bring-up (stvec, Sv39, SBI timer, sret to U-mode, …) lands in later
-//! milestones (see docs/cross-arch-port-plan.md).
-//!
-//! Wherever a stub exists, the body is intentionally minimal — we prefer
-//! "obviously a TODO" over a clever-but-wrong placeholder.
+//! Milestone 2 wires a real UART16550 console and a minimal `stvec` trap
+//! path. Paging / timer / context-switch remain stubs until later milestones
+//! (see docs/cross-arch-port-plan.md).
+
+const uart = @import("uart.zig");
+const trap = @import("trap.zig");
 
 pub const serial = struct {
-    /// Nothing to configure: SBI legacy console is always available.
-    pub fn init() void {}
+    pub fn init() void {
+        uart.init();
+    }
 
     pub fn writeByte(byte: u8) void {
-        sbiPutchar(byte);
+        uart.writeByte(byte);
     }
 
     pub fn writeString(s: []const u8) void {
-        for (s) |c| sbiPutchar(c);
-    }
-
-    /// SBI legacy console putchar (EID 0x01).
-    fn sbiPutchar(c: u8) void {
-        asm volatile ("ecall"
-            :
-            : [eid] "{a7}" (@as(usize, 0x01)),
-              [a0] "{a0}" (@as(usize, c)),
-            : .{ .memory = true });
+        uart.writeString(s);
     }
 };
 
 pub const interrupts = struct {
-    /// TODO(M5): install `stvec` trap vector, set up `sscratch`, and route
-    /// supervisor-software / supervisor-timer / supervisor-external IRQs.
-    pub fn init() void {}
+    /// Install the supervisor trap vector (direct mode).
+    pub fn init() void {
+        trap.init();
+    }
 
     /// Enable supervisor interrupts (sstatus.SIE).
     pub fn enableIrq() void {
@@ -48,41 +39,32 @@ pub const interrupts = struct {
 };
 
 pub const paging = struct {
-    /// TODO(M6): allocate root Sv39 PT, populate kernel half, write `satp`.
+    /// TODO(M3): allocate root Sv39 PT, populate kernel half, write `satp`.
     pub fn init() void {}
 };
 
 pub const timer = struct {
-    /// TODO(M7): arm initial deadline via SBI Timer (EID 0x54494D45) or the
-    /// `stimecmp` CSR on Sstc-capable cores.
+    /// TODO(M5): arm initial deadline via SBI Timer or `stimecmp`.
     pub fn init(_: u64) void {}
 };
 
 pub const context_switch = struct {
-    /// Per-CPU lazy-FPU / saved-anchor setup. No-op on riscv64 today.
     pub fn initCpu() void {}
 
-    /// Hook invoked from the scheduler when switching tasks. `old` is the
-    /// outgoing task pointer (kept generic to mirror x86_64 callsites).
     pub fn onContextSwitch(old: anytype) void {
         _ = old;
     }
 };
 
 pub const cpu = struct {
-    /// Park the current hart in low-power wait forever.
     pub fn halt() noreturn {
         while (true) asm volatile ("wfi");
     }
 
-    /// Spin-wait hint. RISC-V Zihintpause is optional; a plain `nop` is the
-    /// safest portable encoding for now.
     pub fn pause() void {
         asm volatile ("nop");
     }
 
-    /// TODO(M5): once we own the trap path, stash the kernel-relative CPU id
-    /// in `tp` (per the SBI HSM convention) and read it here.
     pub fn getCpuId() u8 {
         return 0;
     }

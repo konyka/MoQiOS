@@ -4,6 +4,9 @@
 # The normal run target intentionally leaves QEMU running for interactive shell
 # use. This wrapper captures serial output, waits for the full init test marker
 # plus shell banner, then terminates QEMU and returns pass/fail.
+#
+# Uses a private disk image copy so consecutive/parallel smoke runs cannot
+# contend on disk.img's write lock.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -14,6 +17,7 @@ SMP_COUNT="${1:-${MOQI_SMP:-1}}"
 TIMEOUT_SECONDS="${MOQI_SMOKE_TIMEOUT:-120}"
 LOG_FILE="${MOQI_SMOKE_LOG:-/tmp/moqios-smoke-smp${SMP_COUNT}.log}"
 RUN_LOG="${MOQI_SMOKE_RUN_LOG:-/tmp/moqios-smoke-smp${SMP_COUNT}.run.log}"
+SMOKE_DISK="${MOQI_SMOKE_DISK:-/tmp/moqios-smoke-smp${SMP_COUNT}.disk.img}"
 
 if ! command -v qemu-system-x86_64 &>/dev/null; then
     echo "ERROR: qemu-system-x86_64 not found."
@@ -28,18 +32,33 @@ if [ "${MOQI_SMOKE_SKIP_BUILD:-0}" != "1" ]; then
     zig build
 fi
 
-rm -f "$LOG_FILE" "$RUN_LOG"
+if [ ! -f disk.img ]; then
+    echo "ERROR: disk.img missing (required by virtio-blk smoke path)."
+    exit 1
+fi
+
+rm -f "$LOG_FILE" "$RUN_LOG" "$SMOKE_DISK"
+cp --reflink=auto disk.img "$SMOKE_DISK"
 
 MOQI_SMP="$SMP_COUNT" \
 MOQI_SERIAL="file:$LOG_FILE" \
+MOQI_DISK="$SMOKE_DISK" \
 ./tools/qemu_run.sh >"$RUN_LOG" 2>&1 &
 QEMU_PID=$!
 
 cleanup() {
     if kill -0 "$QEMU_PID" 2>/dev/null; then
         kill "$QEMU_PID" 2>/dev/null || true
+        for _ in 1 2 3 4 5; do
+            kill -0 "$QEMU_PID" 2>/dev/null || break
+            sleep 0.2
+        done
+        if kill -0 "$QEMU_PID" 2>/dev/null; then
+            kill -9 "$QEMU_PID" 2>/dev/null || true
+        fi
         wait "$QEMU_PID" 2>/dev/null || true
     fi
+    rm -f "$SMOKE_DISK"
 }
 trap cleanup EXIT
 

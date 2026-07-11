@@ -4,22 +4,24 @@
 /// LAPIC timer, scheduler, IPC engine, user-space support.
 const limine = @import("limine.zig");
 const arch = @import("arch/arch.zig");
-// M4: route serial through the arch abstraction layer (still x86_64-only behind
-// the scenes; gdt/idt/etc. remain direct imports until later milestones).
+// Progressive arch migration: serial / interrupts / paging / timer /
+// context_switch go through arch.zig. gdt/tsc/syscall_entry stay x86-direct
+// until those surfaces are added to the arch contract.
 const serial = arch.serial;
+const idt = arch.interrupts;
+const paging = arch.paging;
+const lapic = arch.timer;
+const context_switch = arch.context_switch;
 const gdt = @import("arch/x86_64/gdt.zig");
-const idt = @import("arch/x86_64/idt.zig");
 const hhdm = @import("mm/hhdm.zig");
 const klog = @import("klog.zig");
 const acpi = @import("acpi/acpi_parser.zig");
 const symbol_table = @import("debug/symbol_table.zig");
 const tsc = @import("arch/x86_64/tsc.zig");
 const pmm = @import("mm/pmm.zig");
-const paging = @import("arch/x86_64/paging.zig");
 const addr_space = @import("mm/addr_space.zig");
 const slab = @import("mm/slab.zig");
 const dma = @import("mm/dma.zig");
-const lapic = @import("arch/x86_64/lapic.zig");
 const task = @import("proc/task.zig");
 const sched = @import("proc/sched.zig");
 const ipc = @import("ipc/ipc.zig");
@@ -64,7 +66,6 @@ export fn _start() callconv(.c) noreturn {
     // clears CR0.EM, sets CR0.MP and arms CR0.TS so the first FPU/SSE use
     // takes a #NM (vector 7) for lazy restore. Must come AFTER idt.init so
     // the #NM handler is wired up before any code can trip over CR0.TS.
-    const context_switch = @import("arch/x86_64/context_switch.zig");
     context_switch.initCpu();
     klog.log(.info, "FPU/SSE lazy switch armed (BSP)");
 

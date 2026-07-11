@@ -91,21 +91,22 @@ Fix plan:
 2. Attempt `git push origin main` only after a clean diff and passing checks.
 3. If network/credential approval fails, leave the commit ready and report the exact failed command.
 
-### P1 - x86_64 Coupling Blocks The Cross-Architecture Goal
+### P1 - x86_64 Coupling Blocks The Cross-Architecture Goal 🚧 PARTIAL (2026-07-11)
 
 Evidence:
 
-- `kernel/main.zig`, `kernel/klog.zig`, drivers, fs, mm, proc, net, and IPC files import `arch/x86_64/*` directly.
-- `build.zig` routes riscv64 to `kernel/arch/riscv64/start.zig`, bypassing the full kernel root.
-- `docs/cross-arch-port-plan.md` correctly identifies M4 `arch` facade extraction as pending.
+- `kernel/arch/arch.zig` facade exists (M4); `main.zig` / `klog.zig` route serial/interrupts/paging/timer/context_switch through it.
+- Many drivers/fs/mm/proc/net/IPC files still import `arch/x86_64/*` directly.
+- `build.zig` routes riscv64 to `kernel/arch/riscv64/start.zig` (M2 skeleton), bypassing the full kernel root.
+- riscv64 M2 verified: soft-float ABI, UART16550, `stvec`+breakpoint trap (`zig build -Darch=riscv64 smoke-riscv`).
 
-Risk: riscv64 can build a skeleton but cannot share the real kernel subsystems without a staged HAL/arch interface.
+Risk: riscv64 cannot share the real kernel subsystems until more call sites migrate and M3–M5 land.
 
 Fix plan:
 
-1. Introduce a minimal `kernel/arch/arch.zig` facade for serial/logging, interrupt control, TLB operations, timer, syscall/trap setup, and per-CPU access.
-2. Migrate one subsystem class at a time behind the facade, keeping x86_64 bootable after each step.
-3. Only then move riscv64 beyond skeleton boot.
+1. Continue migrating hot shared sites behind `arch.zig` (gdt/tsc/syscall_entry next).
+2. Keep x86_64 bootable after each step (`smoke` / `smoke-smp`).
+3. Grow riscv64 via M3 (PMM/Sv39) before attempting full `main.zig` reuse.
 
 ### P1 - SMP State Is Mid-Migration And Needs Stronger Gates ✅ RESOLVED 2026-06-21
 
