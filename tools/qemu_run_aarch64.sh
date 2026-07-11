@@ -35,10 +35,10 @@ fi
 SERIAL_TARGET="${MOQI_SERIAL:-stdio}"
 SMP_COUNT="${MOQI_SMP:-1}"
 
-# Refresh DTB when missing (matches -m/-smp used below).
+# Refresh DTB when missing (matches -m/-smp/gic used below).
 if [ ! -f "$DTB_IMAGE" ]; then
     qemu-system-aarch64 \
-        -machine virt,dumpdtb="$DTB_IMAGE" \
+        -machine virt,gic-version=3,dumpdtb="$DTB_IMAGE" \
         -cpu max \
         -m 256M \
         -smp "$SMP_COUNT" \
@@ -51,7 +51,7 @@ echo " Press Ctrl-A X to exit"
 echo "========================================="
 
 exec qemu-system-aarch64 \
-    -machine virt \
+    -machine virt,gic-version=3 \
     -cpu max \
     -kernel "$KERNEL" \
     -device loader,file="$DTB_IMAGE",addr="$DTB_ADDR",force-raw=on \

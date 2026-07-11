@@ -216,5 +216,8 @@ export fn kmain(x0_dtb: usize) callconv(.c) noreturn {
     const timer = @import("timer.zig");
     _ = timer.selfTest();
 
+    // ---- M9-5: GICv3 + timer IRQ ----
+    _ = timer.irqSelfTest();
+
     while (true) asm volatile ("wfi");
 }

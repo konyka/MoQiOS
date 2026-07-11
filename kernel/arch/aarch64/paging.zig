@@ -149,6 +149,11 @@ pub fn initIdentity(regions: []const @import("fdt.zig").MemRegion) bool {
     if (!mapPage(0x09000000, 0x09000000, .{ .read = true, .write = true, .exec = false, .device = true }))
         return false;
 
+    // GICv3 distributor + redistributor (QEMU virt).
+    const gic = @import("gic.zig").mmioRange();
+    if (!mapRange2M(gic.lo, gic.hi, .{ .read = true, .write = true, .exec = false, .device = true }))
+        return false;
+
     for (regions) |r| {
         const lo: usize = @intCast(r.base);
         const hi: usize = @intCast(r.base + r.size);

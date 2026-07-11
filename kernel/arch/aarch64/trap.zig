@@ -1,7 +1,7 @@
-//! EL1 exception handling for the aarch64 skeleton (Milestone 9-2/9-3).
+//! EL1 exception handling for the aarch64 skeleton (Milestone 9-2/9-3/9-5).
 //!
-//! Installs `exception_vectors` into VBAR_EL1; self-tests `brk #0` and data
-//! aborts from deliberate unmapped accesses.
+//! Installs `exception_vectors` into VBAR_EL1; self-tests `brk #0`, data
+//! aborts, and GICv3 IRQs (virtual timer PPI).
 
 const uart = @import("uart.zig");
 
@@ -53,14 +53,12 @@ export fn trapHandleSync(frame: *anyopaque) callconv(.c) void {
     const ec = (esr >> 26) & 0x3f;
     const elr = readElrEl1();
 
-    // EC 0x3c = BRK instruction from AArch64.
     if (ec == 0x3c and expect_brk) {
         brk_caught = true;
         writeElrEl1(elr + 4);
         return;
     }
 
-    // EC 0x25 = Data Abort, same EL. EC 0x21 = Instruction Abort, same EL.
     if ((ec == 0x25 or ec == 0x21) and expect_page_fault) {
         page_fault_caught = true;
         writeElrEl1(elr + 4);
@@ -73,6 +71,12 @@ export fn trapHandleSync(frame: *anyopaque) callconv(.c) void {
     putHex(elr);
     putStr("\n");
     while (true) asm volatile ("wfi");
+}
+
+/// Called from `irq_el1h_entry`.
+export fn trapHandleIrq(frame: *anyopaque) callconv(.c) void {
+    _ = frame;
+    _ = @import("gic.zig").handleIrq();
 }
 
 pub fn init() void {

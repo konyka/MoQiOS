@@ -1,12 +1,13 @@
-//! AArch64 generic timer for the skeleton (Milestone 9-4).
+//! AArch64 generic timer for the skeleton (Milestone 9-4/9-5).
 //!
-//! Programs the virtual timer (CNTV_*_EL0). QEMU virt exposes CNTFRQ; we arm
-//! TVAL and poll ISTATUS so bring-up does not yet depend on a GIC driver.
+//! Programs the virtual timer (CNTV_*_EL0). M9-4 polls ISTATUS; M9-5 delivers
+//! firings via GICv3 PPI 27 + EL1 IRQ.
 
 const uart = @import("uart.zig");
 
 var interval_ticks: u64 = 0;
 var firings: u64 = 0;
+var irq_firings: u64 = 0;
 
 fn putDec(v: u64) void {
     if (v == 0) {
@@ -66,7 +67,7 @@ pub fn init(interval_ns: u64) void {
     }
     writeCntvCtl(0);
     writeCntvTval(interval_ticks);
-    writeCntvCtl(1); // ENABLE
+    writeCntvCtl(1); // ENABLE, IMASK=0
 }
 
 pub fn freqHz() u64 {
@@ -77,9 +78,20 @@ pub fn getFirings() u64 {
     return firings;
 }
 
+pub fn getIrqFirings() u64 {
+    return irq_firings;
+}
+
 fn rearm() void {
     writeCntvTval(interval_ticks);
     writeCntvCtl(1);
+}
+
+/// Called from GIC IRQ path (PPI 27).
+pub fn onInterrupt() void {
+    irq_firings +%= 1;
+    firings +%= 1;
+    rearm();
 }
 
 /// Spin until ISTATUS, then rearm. Returns false on timeout.
@@ -102,6 +114,9 @@ pub fn selfTest() bool {
     putDec(freqHz());
     uart.writeString(" Hz\n");
 
+    // Mask IRQs during poll test so GIC path does not double-count.
+    @import("gic.zig").disableCpuIrq();
+    firings = 0;
     init(0);
     var i: u32 = 0;
     while (i < 3) : (i += 1) {
@@ -114,5 +129,44 @@ pub fn selfTest() bool {
     putDec(firings);
     uart.writeString(" OK\n");
     uart.writeString("[aarch64] M9-4 complete\n");
+    return true;
+}
+
+/// M9-5 self-test: three firings delivered via GICv3 IRQ (yield-polled timeout).
+pub fn irqSelfTest() bool {
+    const gic = @import("gic.zig");
+    uart.writeString("MoQiOS aarch64: M9-5 (GIC + timer IRQ)\n");
+
+    if (!gic.init()) {
+        uart.writeString("  M9-5 FAILED: gic init\n");
+        return false;
+    }
+    uart.writeString("  gicd_iidr=");
+    putDec(gic.distributorIidr());
+    uart.writeString("\n");
+
+    irq_firings = 0;
+    firings = 0;
+    init(0);
+    gic.enableCpuIrq();
+
+    // Do not WFI forever — if the IRQ path is broken, WFI never returns.
+    var spins: u64 = 0;
+    while (irq_firings < 3) {
+        asm volatile ("yield");
+        spins += 1;
+        if (spins > 2_000_000_000) {
+            uart.writeString("  M9-5 FAILED: IRQ timeout (irq_firings=");
+            putDec(irq_firings);
+            uart.writeString(")\n");
+            gic.disableCpuIrq();
+            return false;
+        }
+    }
+    gic.disableCpuIrq();
+    uart.writeString("  timer IRQ firings=");
+    putDec(irq_firings);
+    uart.writeString(" OK\n");
+    uart.writeString("[aarch64] M9-5 complete\n");
     return true;
 }
