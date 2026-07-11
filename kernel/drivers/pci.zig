@@ -9,6 +9,7 @@
 ///   - Vendor/device ID, class code extraction
 ///   - BAR (Base Address Register) detection
 ///   - Device listing for driver matching
+const builtin = @import("builtin");
 const serial = @import("../arch/arch.zig").serial;
 const io = @import("../arch/arch.zig").io;
 const hhdm = @import("../mm/hhdm.zig");
@@ -81,6 +82,15 @@ var pcie_ecam_base: u64 = 0;
 
 /// Initialize PCI subsystem.
 pub fn init() void {
+    if (comptime builtin.cpu.arch != .x86_64) {
+        device_count = 0;
+        serial.writeString("[PCI] non-x86: enumeration stub\n");
+    } else {
+        initX86();
+    }
+}
+
+fn initX86() void {
     pcie_ecam_base = acpi.info.mcfg_base;
     if (pcie_ecam_base != 0) {
         serial.writeString("[PCI] Using PCIe ECAM at 0x");

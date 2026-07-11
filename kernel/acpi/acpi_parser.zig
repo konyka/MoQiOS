@@ -1,11 +1,18 @@
 /// ACPI parser — RSDP/XSDT/MADT/MCFG parsing.
+const builtin = @import("builtin");
 const hhdm = @import("../mm/hhdm.zig");
 const serial = @import("../arch/arch.zig").serial;
 const tables = @import("acpi_tables.zig");
-const main = @import("../main.zig");
 const fmt = @import("../lib/fmt.zig");
 const str = @import("../lib/str.zig");
 const bo = @import("../lib/byte_order.zig");
+
+/// Map a physical page for ACPI table access. x86_64 uses Limine HHDM helpers
+/// in `main.zig`; other arches no-op (SK-10: avoid pulling Limine `main`).
+fn mapAcpiPage(phys_addr: u64) void {
+    if (comptime builtin.cpu.arch != .x86_64) return;
+    @import("../main.zig").mapAcpiPage(phys_addr);
+}
 
 pub const AcpiInfo = struct {
     rsdp: ?*const tables.RSDP,
@@ -34,13 +41,21 @@ pub var info: AcpiInfo = .{
 };
 
 pub fn init(rsdp_phys: u64) void {
+    if (comptime builtin.cpu.arch != .x86_64) {
+        serial.writeString("[ACPI] non-x86: stub (no RSDP path)\n");
+    } else {
+        initX86(rsdp_phys);
+    }
+}
+
+fn initX86(rsdp_phys: u64) void {
     if (rsdp_phys == 0) {
         serial.writeString("[ACPI] No RSDP provided\n");
         return;
     }
 
     // Ensure the RSDP page is mapped (may be in BIOS ROM area)
-    main.mapAcpiPage(rsdp_phys);
+    mapAcpiPage(rsdp_phys);
 
     const rsdp: *const tables.RSDP = hhdm.physToPtr(tables.RSDP, rsdp_phys);
     info.rsdp = rsdp;
@@ -58,7 +73,7 @@ pub fn init(rsdp_phys: u64) void {
 
     if (rsdp.revision >= 2 and rsdp.xsdt_address != 0) {
         // ACPI 2.0+: use XSDT (64-bit entries)
-        main.mapAcpiPage(rsdp.xsdt_address);
+        mapAcpiPage(rsdp.xsdt_address);
         parseXsdt(rsdp.xsdt_address);
     } else if (rsdt_addr != 0) {
         // ACPI 1.0: use RSDT (32-bit entries)
@@ -69,7 +84,7 @@ pub fn init(rsdp_phys: u64) void {
 /// Parse RSDT (ACPI 1.0) — 32-bit entry pointers.
 fn parseRsdt(rsdt_phys: u64) void {
     // Map the page containing the RSDT first
-    main.mapAcpiPage(rsdt_phys);
+    mapAcpiPage(rsdt_phys);
 
     const virt = hhdm.physToVirt(rsdt_phys);
     const bytes: [*]const u8 = @ptrFromInt(virt);
@@ -87,7 +102,7 @@ fn parseRsdt(rsdt_phys: u64) void {
 
     const entry_count = (len - @sizeOf(tables.SdtHeader)) / 4;
 
-    main.mapAcpiPage(rsdt_phys);
+    mapAcpiPage(rsdt_phys);
 
     // Read entries using byte array
     var i: u32 = 0;
@@ -98,7 +113,7 @@ fn parseRsdt(rsdt_phys: u64) void {
         const entry_phys: u64 = raw_entry;
 
         // Map page containing this table
-        main.mapAcpiPage(entry_phys);
+        mapAcpiPage(entry_phys);
 
         // Read table header
         const entry_virt = hhdm.physToVirt(entry_phys);
@@ -129,7 +144,7 @@ fn parseXsdt(xsdt_phys: u64) void {
         const entry_phys = entries[i];
         if (entry_phys == 0) continue;
         // Ensure ACPI table page is mapped (may be in firmware area)
-        main.mapAcpiPage(entry_phys);
+        mapAcpiPage(entry_phys);
         const header: *const tables.SdtHeader = hhdm.physToPtr(tables.SdtHeader, entry_phys);
 
         if (str.eql(header.signature[0..], "APIC")) {

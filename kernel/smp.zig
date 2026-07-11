@@ -40,6 +40,7 @@ const task = @import("proc/task.zig");
 const syscall_entry = @import("arch/arch.zig").syscall;
 const context_switch = @import("arch/arch.zig").context_switch;
 const fmt = @import("lib/fmt.zig");
+const builtin = @import("builtin");
 
 const KERNEL_STACK_PAGES: u64 = 16;
 
@@ -60,9 +61,6 @@ pub var cpu_count: u32 = 1;
 
 /// BSP's LAPIC ID.
 pub var bsp_apic_id: u32 = 0;
-
-/// AP trampoline binary (precompiled flat binary, embedded at compile time).
-const trampoline_bin = @embedFile("arch/x86_64/ap_trampoline.bin");
 
 /// Small delay loop (approximate, not precise).
 fn microDelay(us: u32) void {
@@ -242,7 +240,21 @@ fn makeHhdmWritable(pml4_phys: u64) void {
 }
 
 /// Initialize SMP — start all APs found in MADT.
+/// Non-x86: uniprocessor stub (SK-10); trampoline/IPI path stays x86-only.
 pub fn init() void {
+    if (comptime builtin.cpu.arch != .x86_64) {
+        cpu_count = 1;
+        bsp_apic_id = 0;
+        serial.writeString("[SMP] non-x86: uniprocessor stub\n");
+    } else {
+        initX86();
+    }
+}
+
+fn initX86() void {
+    // AP trampoline binary (precompiled flat binary, embedded at compile time).
+    const trampoline_bin = @embedFile("arch/x86_64/ap_trampoline.bin");
+
     bsp_apic_id = lapic.id();
 
     // Initialize BSP per-CPU data
