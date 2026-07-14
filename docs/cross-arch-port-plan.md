@@ -12,9 +12,9 @@
 ## 0. 现状基线（移植起点 → 2026-07 更新）
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
-  **SK-8**…**SK-16**：facade、共享抢占、M5/M9-7 收敛。
-  **SK-17（2026-07-14）**：`per_cpu.init` + `sched.enqueue` + 优先级 pick（对齐
-  `main.zig` 调度初始化片段）；探针 `[SK-17] shared sched queue+pick: OK`。
+  **SK-8**…**SK-17**：facade、共享抢占、队列/pick。
+  **SK-18（2026-07-14）**：可移植 `wakeOne`/`wakeAll`（无 `forceReschedule`）；
+  探针 `[SK-18] shared sched wake+block: OK`。
   完整 `main.zig` / Limine 驱动仍未在非 x86 链接；`sched.timerTick` 接入待后续。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
@@ -210,7 +210,15 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   priority 内核线程 → `sched.enqueue` → LIFO `pop` + `task.pickReadyForCpu`。
 - **不调用** `sched.timerTick`（仍含 x86 CR3/iretq）；为后续 block/wake 与主路径收敛铺路。
 - **门禁**：`[SK-17] shared sched queue+pick: OK`；三门禁不回归。
-- **后续**：SK-18 — 可移植 wake/block（无 `forceReschedule`）或更多 `main.zig` 引导片段共享。
+- **后续**：SK-18 — 可移植 wake/block（无 `forceReschedule`）。
+
+### 3.15 SK-18 完成记录（2026-07-14）
+
+- **共享** `kernel/shared/sk18.zig`：按 `sleepOn` 同序挂 `WaitNode`，验证 FIFO `wakeOne` +
+  `wakeAll`、blocked 不可 pick、就绪后清 `wait_queue`。
+- **不调用** `sleepOn`/`forceReschedule`/`timerTick`。
+- **门禁**：`[SK-18] shared sched wake+block: OK`；三门禁不回归。
+- **后续**：SK-19 — 更多 `main.zig` 引导片段共享，或可移植 `sleepOn` hook（换出当前任务）。
 
 ---
 
@@ -396,16 +404,16 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-17
-Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-17
+Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-18
+Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-18
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**SK-18** — 可移植 wake/block 或更多 `main.zig` 引导片段共享；
-> SK-1…SK-17 已完成。
+> 当前下一执行项：**SK-19** — 更多 `main.zig` 引导片段共享，或可移植 `sleepOn` hook；
+> SK-1…SK-18 已完成。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。
