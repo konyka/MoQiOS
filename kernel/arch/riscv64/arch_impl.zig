@@ -169,6 +169,27 @@ pub const context_switch = struct {
             : .{ .memory = true, .x5 = true });
     }
 
+    /// Cooperative switch (SK-20): restore `InterruptFrame.rsp` then `sret` to `rip`.
+    /// Does not clobber the SK-14 resume slot used by `resumeAfterSoftwareEnter`.
+    pub fn switchToSoftwareFrame(frame_ptr: u64) noreturn {
+        const rip_off = @offsetOf(interrupts.InterruptFrame, "rip");
+        const rsp_off = @offsetOf(interrupts.InterruptFrame, "rsp");
+        asm volatile (
+            \\ld t0, %[roff](%[fp])
+            \\csrw sepc, t0
+            \\li t0, %[sstat]
+            \\csrw sstatus, t0
+            \\ld sp, %[spoff](%[fp])
+            \\sret
+            :
+            : [fp] "r" (frame_ptr),
+              [roff] "i" (rip_off),
+              [spoff] "i" (rsp_off),
+              [sstat] "i" (@as(usize, (1 << 8) | (1 << 5))),
+            : .{ .memory = true, .x5 = true });
+        unreachable;
+    }
+
     /// Return to the `enterSoftwareFrame` caller (used by SK-14 probe body).
     pub fn resumeAfterSoftwareEnter() noreturn {
         asm volatile (
@@ -265,6 +286,11 @@ pub const cpu = struct {
     /// Wait for the next interrupt (single `wfi`). Used by idle loops (SK-12).
     pub fn waitForInterrupt() void {
         asm volatile ("wfi");
+    }
+
+    pub fn readStackPointer() u64 {
+        return asm volatile ("mv %[r], sp"
+            : [r] "=r" (-> u64));
     }
 
     pub fn pause() void {

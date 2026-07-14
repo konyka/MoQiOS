@@ -656,12 +656,9 @@ fn tryStealTask() void {
 pub fn sleepOn(queue: *?*task.WaitNode, node: *task.WaitNode) bool {
     if (!blockOn(queue, node)) return false;
 
-    // Force immediate reschedule: set force_reschedule so the next timerTick
-    // bypasses the single-task fast-path and picks a different task.
-    forceReschedule();
-
     // When we are woken, we return here. Check if granted.
     // The waker sets node.granted = true before making the task ready.
+    @call(.never_inline, forceReschedule, .{});
     return node.granted;
 }
 
@@ -750,19 +747,75 @@ pub fn wakeAll(queue: *?*task.WaitNode) void {
 /// Force an immediate reschedule. Used by blocking primitives (futex, etc.)
 /// after marking the current task as blocked.
 pub fn forceReschedule() void {
+    // Capture caller continuation before any further calls clobber ra/lr (SK-20).
+    const cont_rip: u64 = if (comptime builtin.cpu.arch == .riscv64)
+        asm volatile ("mv %[r], ra"
+            : [r] "=r" (-> u64))
+    else if (comptime builtin.cpu.arch == .aarch64)
+        asm volatile ("mov %[r], x30"
+            : [r] "=r" (-> u64))
+    else
+        @returnAddress();
+    const caller_sp: u64 = arch_cpu.readStackPointer();
+    forceRescheduleContinue(cont_rip, caller_sp);
+}
+
+fn forceRescheduleContinue(cont_rip: u64, caller_sp: u64) void {
     setSlice(0);
     if (portable_reschedule) |h| {
         h();
         return;
     }
-    // x86: switch via timerTick. Non-x86 must install setPortableReschedule
-    // until a shared switch backend exists (SK-19+).
     if (comptime builtin.cpu.arch == .x86_64) {
         const iframe: *idt.InterruptFrame = @ptrFromInt(getAnchor());
         timerTick(iframe);
-    } else {
-        // No portable switch yet — caller should have setPortableReschedule.
+    } else if (comptime context_switch.uses_software_frame) {
+        portableKernelSwitch(cont_rip, caller_sp);
     }
+}
+
+/// SK-20: cooperative switch on software InterruptFrames (non-x86).
+///
+/// * `.running` → save a continuation frame (yield) then enqueue.
+/// * `.blocked` → leave `saved_rsp` alone (caller installed a resume frame).
+fn portableKernelSwitch(cont_rip: u64, caller_sp: u64) noreturn {
+    const next_idx = pickNext() orelse {
+        while (true) arch_cpu.waitForInterrupt();
+    };
+
+    if (getCurrentIdx()) |cur_idx| {
+        if (cur_idx == next_idx) {
+            while (true) arch_cpu.waitForInterrupt();
+        }
+        const cur = task.getTask(cur_idx) orelse {
+            while (true) arch_cpu.waitForInterrupt();
+        };
+        if (cur.state == .running) {
+            const frame_addr = (cur.kernel_stack_top -% 2 * @sizeOf(idt.InterruptFrame)) & ~@as(u64, 15);
+            const frame: *idt.InterruptFrame = @ptrFromInt(frame_addr);
+            const bytes: [*]u8 = @ptrCast(frame);
+            @memset(bytes[0..@sizeOf(idt.InterruptFrame)], 0);
+            frame.rip = cont_rip;
+            frame.rsp = caller_sp;
+            frame.cs = 0x08;
+            frame.rflags = 0x202;
+            frame.ss = 0x10;
+            cur.saved_rsp = frame_addr;
+            setAnchor(frame_addr);
+            cur.state = .ready;
+            enqueue(cur);
+        }
+        // .blocked: resume frame already in saved_rsp (SK-20 sleepOn path).
+    }
+
+    const new_task = task.getTask(next_idx) orelse {
+        while (true) arch_cpu.waitForInterrupt();
+    };
+    if (!new_task.started) setupInitialFrame(new_task);
+    new_task.state = .running;
+    setCurrentIdx(next_idx);
+    setAnchor(new_task.saved_rsp);
+    context_switch.switchToSoftwareFrame(new_task.saved_rsp);
 }
 
 // ---------------------------------------------------------------------------

@@ -30,6 +30,11 @@ pub fn enterSoftwareFrame(frame_ptr: u64) void {
     _ = frame_ptr;
 }
 
+pub fn switchToSoftwareFrame(frame_ptr: u64) noreturn {
+    _ = frame_ptr;
+    while (true) asm volatile ("hlt");
+}
+
 pub fn resumeAfterSoftwareEnter() noreturn {
     while (true) asm volatile ("hlt");
 }

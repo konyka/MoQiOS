@@ -30,6 +30,11 @@ pub const cpu = struct {
         asm volatile ("hlt");
     }
 
+    pub fn readStackPointer() u64 {
+        return asm volatile ("movq %%rsp, %[r]"
+            : [r] "=r" (-> u64));
+    }
+
     /// Spin-wait hint for busy loops (PAUSE on x86_64).
     pub fn pause() void {
         asm volatile ("pause");
