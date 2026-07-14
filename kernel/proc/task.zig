@@ -24,7 +24,6 @@ const KERNEL_STACK_PAGES: u64 = 32;
 const KERNEL_STACK_VIRT_BASE: u64 = 0xffffffff90000000;
 const KERNEL_STACK_STRIDE: u64 = 256 * 1024;
 // allocates large arrays on the stack (e.g., code_pages[256]?u64 = 2KB).
-// NOTE: Pages are allocated via PMM and mapped contiguously via HHDM.
 // The stack grows downward from kernel_stack_top.
 
 pub const TaskState = enum(u8) {
@@ -237,6 +236,13 @@ var tasks: [MAX_TASKS]Task = undefined;
 var next_tid: u32 = 1;
 var task_count: u32 = 0;
 
+// Kernel stacks live in the shared upper half of every user address space.
+// Reusing a slot must therefore reuse its mapping as well: tearing a stack
+// down and remapping it races with CPUs that still cache the old global TLB
+// entry. The bounded cache costs at most MAX_TASKS * 128KiB (8MiB) and removes
+// PMM/page-table/TLB work from the spawn/reap hot path.
+var kernel_stack_mapped: [MAX_TASKS]bool = [_]bool{false} ** MAX_TASKS;
+
 /// Zero a task slot in place (never via a stack temporary). All Task fields
 /// have a valid all-zero representation, so callers only need to set the
 /// handful of non-default fields afterwards.
@@ -371,7 +377,8 @@ fn stackVirtForSlot(slot: u32) u64 {
 
 /// Allocate a virtually contiguous kernel stack without requiring contiguous
 /// physical pages. The stack lives in a fixed high-half virtual window per task
-/// slot, avoiding HHDM huge-page remapping while keeping task creation O(pages).
+/// slot. Once allocated, a slot keeps its mapping for the life of the kernel so
+/// user CR3s sharing the upper-half page tables never see a stack remap.
 ///
 /// Non-x86 (SK-12): Sv39/EL1 bring-up uses identity maps (hhdm offset 0), so
 /// allocate a contiguous physical run and treat phys==virt.
@@ -381,6 +388,8 @@ fn allocKernelStackForSlot(slot: u32) ?u64 {
         return hhdm.physToVirt(stack_phys);
     } else {
         const stack_virt = stackVirtForSlot(slot);
+        if (kernel_stack_mapped[slot]) return stack_virt;
+
         var allocated: [KERNEL_STACK_PAGES]u64 = undefined;
         var count: usize = 0;
         while (count < KERNEL_STACK_PAGES) : (count += 1) {
@@ -401,23 +410,21 @@ fn allocKernelStackForSlot(slot: u32) ?u64 {
                 return null;
             };
         }
+        kernel_stack_mapped[slot] = true;
         return stack_virt;
     }
 }
 
-/// Free a kernel stack allocated by allocKernelStack.
+/// Release a task's kernel stack.
+///
+/// x86_64 intentionally retains fixed-slot stacks. They are shared upper-half
+/// mappings, so remapping them during task-slot reuse would require a costly
+/// global TLB shootdown and can race with CPUs executing another user CR3.
 fn freeKernelStack(stack_virt: u64) void {
     if (comptime builtin.cpu.arch != .x86_64) {
         var i: u64 = 0;
         while (i < KERNEL_STACK_PAGES) : (i += 1) {
             pmm.freePage(hhdm.virtToPhys(stack_virt + i * PAGE_SIZE));
-        }
-    } else {
-        for (0..KERNEL_STACK_PAGES) |i| {
-            const page_virt = stack_virt + @as(u64, i) * PAGE_SIZE;
-            if (paging.unmapPage(paging.getKernelPml4(), page_virt)) |phys| {
-                pmm.freePage(phys);
-            }
         }
     }
 }

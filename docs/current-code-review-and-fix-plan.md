@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-14 (work-stealing two-queue locking correction verified)
+> Last update: 2026-07-14 (SMP stack-remap race fixed and stress-verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -195,6 +195,36 @@ LIFO fast path. Host tests plus x86_64/riscv64/aarch64 builds and the x86_64 sin
 passed before the correction; the dual-core gate is recorded separately below because it exposed an
 independent runtime regression during the final verification run.
 
+### P0 - Reusing A Task Slot Remapped A Shared Kernel Stack On SMP ✅ RESOLVED 2026-07-14
+
+Evidence:
+
+- On a repeatable dual-core `hello2` -> `hello3` -> `hello4` sequence, QEMU reported the initial
+  fault as `#PF`, error code `0x2`, at the `call getPerCpuOrNull` instruction in
+  `proc.per_cpu.getCurrent`; `CR2=0xffffffff900d8fd8` was on task slot 3's kernel stack.
+  The visible `#DF` was the secondary failure while delivering that page fault.
+- `task.waitpid` reaped slot 3 after each child and `freeKernelStack` unmapped its 32 high-half
+  stack pages. The next child reused slot 3 and remapped those pages through the kernel PML4.
+  User PML4s share that upper-half hierarchy, so another CPU may retain a stale translation during
+  the unmap/remap window.
+
+Fix:
+
+1. Keep each fixed virtual task-stack slot mapped after its first allocation on x86_64.
+2. Reuse its backing pages on later task-slot reuse rather than unmapping, freeing and remapping.
+3. Preserve the existing non-x86 free path; its address-space model does not share this x86_64
+   high-half mapping contract.
+
+Performance and capacity: the cache has a strict `MAX_TASKS * 128KiB = 8MiB` upper bound. It
+removes 32 PMM allocations plus 32 page-table edits at spawn, 32 unmaps/frees at reap, and their
+cross-core TLB-coherency cost from every reused task slot. This is faster and safer than sending a
+global shootdown for every 4KiB stack page.
+
+**Resolution (2026-07-14)**: `kernel/proc/task.zig` now keeps the mapping for each allocated
+x86_64 stack slot. After an isolated-cache rebuild, host tests, x86_64 build, riscv64/aarch64
+builds, the single-core smoke gate, and five consecutive dual-core smoke runs all passed. The
+five-run dual-core sequence exercises the formerly failing `hello4`/slot-3 reuse path repeatedly.
+
 ### P2 - Version And Date Metadata Is Inconsistent
 
 Evidence:
@@ -276,14 +306,12 @@ If QEMU or toolchain pieces are unavailable, record that as a verification gap i
 | `zig build -Darch=riscv64` | Passed | riscv64 build passed. |
 | `zig build -Darch=aarch64` | Passed | aarch64 build passed. |
 | `zig build smoke` | Passed | Reached `hello21 done` and `MoQiOS shell` with `MOQI_SMP=1`. |
-| `zig build smoke-smp` | Failed | Reproducibly reaches `hello4` load then faults with #DF in `proc.per_cpu.getCurrent`; serial log: `/tmp/moqios-smoke-smp2.log`. This is an independent SMP context/stack regression and must remain a release gate. |
-| Rebuild after final source edit | Blocked | Zig reported `manifest_create ReadOnlyFileSystem` while regenerating its cache, despite normal workspace writes succeeding. The existing x86_64 artifact continues to reproduce the dual-core failure; rerun all gates after the cache/toolchain condition is cleared. |
+| `zig build smoke-smp` | Passed (5 consecutive runs) | Repeatedly reached `hello21 done` and `MoQiOS shell` with `MOQI_SMP=2`, including repeated task-slot-3 / `hello4` reuse. |
+| Isolated-cache rebuild | Passed | The default cache intermittently returned `manifest_create ReadOnlyFileSystem`; `ZIG_LOCAL_CACHE_DIR=/tmp/moqios-local-cache ZIG_GLOBAL_CACHE_DIR=/tmp/moqios-global-cache` rebuilt and ran all listed gates. |
 
-The P1 queue-lock correction is source-reviewed and formatted, but it must not be represented as
-dual-core runtime-verified until `zig build smoke-smp` passes from a rebuilt artifact. The #DF's RIP
-maps to `kernel/proc/per_cpu.zig` `getCurrent()` (the call to `getPerCpuOrNull`) while loading
-`hello4`; investigate the preceding SMP user-task context transition, stack mapping, and GS-base
-state before enabling this gate in CI.
+The P1 queue-lock correction and the stack-slot reuse fix are source-reviewed, formatted and
+dual-core runtime-verified. The default Zig cache issue is environmental; use the isolated cache
+variables above for repeatable local verification until its filesystem cause is corrected.
 
 Executed on 2026-07-10:
 
