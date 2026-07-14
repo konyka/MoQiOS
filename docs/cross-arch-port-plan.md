@@ -12,10 +12,10 @@
 ## 0. 现状基线（移植起点 → 2026-07 更新）
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
-  **SK-8**…**SK-15**：facade、共享 create/prepare、软件帧 enter、共享抢占探针。
-  **SK-16（2026-07-14）**：M5/M9-7 收敛到共享 `sk16`（`proc/task` + facade TrapFrame）；
-  arch `sched.zig` 仅保留里程碑完成钩子。
-  完整 `main.zig` / Limine 驱动仍未在非 x86 链接；完整 `proc/sched.zig` SMP 复用待后续。
+  **SK-8**…**SK-16**：facade、共享抢占、M5/M9-7 收敛。
+  **SK-17（2026-07-14）**：`per_cpu.init` + `sched.enqueue` + 优先级 pick（对齐
+  `main.zig` 调度初始化片段）；探针 `[SK-17] shared sched queue+pick: OK`。
+  完整 `main.zig` / Limine 驱动仍未在非 x86 链接；`sched.timerTick` 接入待后续。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
 - **riscv64**：M0–M7 完成（…PMM/Sv39、timer/sched、U-mode/`ecall`、virtio-mmio blk + net MAC）。
@@ -202,7 +202,15 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **riscv64** `sched.zig` / **aarch64** `sched.zig`：删除 BSS 双栈本地调度；保留
   `M5 complete` / `M9-7 complete`（aarch64 仍导出 `TrapFrame` 布局）。
 - **门禁**：`[SK-16] shared milestone preempt: OK` + 既有 M5/M9-7 标记；三门禁不回归。
-- **后续**：SK-17 — 更大 `proc/sched` 复用 / 或共享内核主路径接入。
+- **后续**：SK-17 — `per_cpu` 队列 + `sched.enqueue` / 优先级 pick。
+
+### 3.14 SK-17 完成记录（2026-07-14）
+
+- **共享** `kernel/shared/sk17.zig`：对齐 `main.zig` 的 `per_cpu.init(0)` → 创建不同
+  priority 内核线程 → `sched.enqueue` → LIFO `pop` + `task.pickReadyForCpu`。
+- **不调用** `sched.timerTick`（仍含 x86 CR3/iretq）；为后续 block/wake 与主路径收敛铺路。
+- **门禁**：`[SK-17] shared sched queue+pick: OK`；三门禁不回归。
+- **后续**：SK-18 — 可移植 wake/block（无 `forceReschedule`）或更多 `main.zig` 引导片段共享。
 
 ---
 
@@ -388,16 +396,16 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-16
-Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-16
+Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-17
+Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-17
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**SK-17** — 更大 `proc/sched` 复用 / 共享内核主路径接入；
-> SK-1…SK-16 已完成。
+> 当前下一执行项：**SK-18** — 可移植 wake/block 或更多 `main.zig` 引导片段共享；
+> SK-1…SK-17 已完成。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。
