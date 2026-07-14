@@ -248,6 +248,12 @@ pub fn build(b: *std.Build) void {
     smoke_smp_cmd.setEnvironmentVariable("MOQI_SMOKE_SKIP_BUILD", "1");
     smoke_smp_step.dependOn(&smoke_smp_cmd.step);
 
+    const smoke_smp_stress_step = b.step("smoke-smp-stress", "Run repeated dual-core QEMU smoke tests");
+    const smoke_smp_stress_cmd = b.addSystemCommand(&.{"./tools/qemu_smoke_stress.sh"});
+    smoke_smp_stress_cmd.step.dependOn(b.getInstallStep());
+    smoke_smp_stress_cmd.setEnvironmentVariable("MOQI_SMOKE_SKIP_BUILD", "1");
+    smoke_smp_stress_step.dependOn(&smoke_smp_stress_cmd.step);
+
     // Debug with GDB
     const debug_step = b.step("debug", "Build and run in QEMU with GDB stub");
     const debug_cmd = b.addSystemCommand(&.{"./tools/qemu_run.sh"});

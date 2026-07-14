@@ -224,6 +224,8 @@ global shootdown for every 4KiB stack page.
 x86_64 stack slot. After an isolated-cache rebuild, host tests, x86_64 build, riscv64/aarch64
 builds, the single-core smoke gate, and five consecutive dual-core smoke runs all passed. The
 five-run dual-core sequence exercises the formerly failing `hello4`/slot-3 reuse path repeatedly.
+`zig build smoke-smp-stress` now makes that five-run regression gate executable by default
+(`MOQI_SMOKE_RUNS=N` overrides the run count).
 
 ### P2 - Version And Date Metadata Is Inconsistent
 
@@ -307,6 +309,7 @@ If QEMU or toolchain pieces are unavailable, record that as a verification gap i
 | `zig build -Darch=aarch64` | Passed | aarch64 build passed. |
 | `zig build smoke` | Passed | Reached `hello21 done` and `MoQiOS shell` with `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed (5 consecutive runs) | Repeatedly reached `hello21 done` and `MoQiOS shell` with `MOQI_SMP=2`, including repeated task-slot-3 / `hello4` reuse. |
+| `zig build smoke-smp-stress` | Added | Default five-run dual-core regression gate; run it after scheduler, page-table, task-stack or SMP changes. |
 | Isolated-cache rebuild | Passed | The default cache intermittently returned `manifest_create ReadOnlyFileSystem`; `ZIG_LOCAL_CACHE_DIR=/tmp/moqios-local-cache ZIG_GLOBAL_CACHE_DIR=/tmp/moqios-global-cache` rebuilt and ran all listed gates. |
 
 The P1 queue-lock correction and the stack-slot reuse fix are source-reviewed, formatted and
