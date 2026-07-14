@@ -67,20 +67,21 @@ pass_markers() {
         grep -q "\[SK-18\] shared sched wake+block: OK" "$LOG_FILE" &&
         grep -q "\[SK-19\] shared sleepOn+sched_boot: OK" "$LOG_FILE" &&
         grep -q "\[SK-20\] portable sleepOn switch: OK" "$LOG_FILE" &&
-        grep -q "\[SK-21\] shared subsystem boot: OK" "$LOG_FILE"
+        grep -q "\[SK-21\] shared subsystem boot: OK" "$LOG_FILE" &&
+        grep -q "\[SK-22\] portable timerTick: OK" "$LOG_FILE"
 }
 
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if pass_markers; then
-        echo "PASS: MoQiOS riscv64 M7+SK-21 smoke (shared subsystem boot + virtio + U-mode)."
+        echo "PASS: MoQiOS riscv64 M7+SK-22 smoke (portable timerTick + virtio + U-mode)."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         if pass_markers; then
-            echo "PASS: MoQiOS riscv64 M7+SK-21 smoke (shared subsystem boot + virtio + U-mode)."
+            echo "PASS: MoQiOS riscv64 M7+SK-22 smoke (portable timerTick + virtio + U-mode)."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -94,7 +95,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for riscv64 smoke markers."
-echo "Expected: SK-2..SK-4 + SK-6..SK-21 shared markers + M7 blk/net + M6 + M5 markers."
+echo "Expected: SK-2..SK-4 + SK-6..SK-22 shared markers + M7 blk/net + M6 + M5 markers."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

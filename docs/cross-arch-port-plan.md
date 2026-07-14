@@ -12,9 +12,9 @@
 ## 0. 现状基线（移植起点 → 2026-07 更新）
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
-  **SK-8**…**SK-20**：facade、共享抢占、wake、`sleepOn` 协作切换。
-  **SK-21（2026-07-14）**：共享 `subsystem_boot`（gdt/tsc/ipc/capability/syscall）；
-  探针 `[SK-21] shared subsystem boot: OK`。
+  **SK-8**…**SK-21**：facade、共享抢占、协作 `sleepOn`、subsystem_boot。
+  **SK-22（2026-07-14）**：可移植 `timerTickPortable` 时间片抢占子集；
+  探针 `[SK-22] portable timerTick: OK`。
   完整 `main.zig` / Limine 驱动仍未在非 x86 链接。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
@@ -242,7 +242,14 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **共享** `kernel/shared/subsystem_boot.zig`：`initCpuSurfaces`（gdt/tsc/GS）+
   `initIpcAndSyscall`（对齐 main.zig M4）；`main.zig` 改用后者。
 - **探针** `sk21.zig`：`initAll` + TSC 单调读；`[SK-21] shared subsystem boot: OK`。
-- **后续**：SK-22 — 可移植 `timerTick` 子集，或更多引导路径收敛。
+- **后续**：SK-22 — 可移植 `timerTick` 子集。
+
+### 3.19 SK-22 完成记录（2026-07-14）
+
+- **`sched.timerTickPortable` / `resetTimeslice`**：仅做时间片递减；到期则
+  `forceReschedule`（软件帧协作切换），无 IRQ frame / CR3 / 信号 / 写回。
+- **探针** `sk22.zig`：双同优先级线程经 tick 抢占；`[SK-22] portable timerTick: OK`。
+- **后续**：SK-23 — 将 arch 定时器 IRQ 接到 `timerTickPortable`，或更多引导收敛。
 
 ---
 
@@ -428,16 +435,16 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-21
-Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-21
+Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-22
+Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-22
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**SK-22** — 可移植 `timerTick` 子集，或更多引导路径收敛；
-> SK-1…SK-21 已完成。
+> 当前下一执行项：**SK-23** — arch 定时器 IRQ 接到 `timerTickPortable`，或更多引导收敛；
+> SK-1…SK-22 已完成。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。

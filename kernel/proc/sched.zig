@@ -96,6 +96,31 @@ pub fn requestReschedule() void {
     setSlice(0);
 }
 
+/// SK-22: refill the current CPU timeslice (same value as x86 timer path).
+pub fn resetTimeslice() void {
+    setSlice(TIMESLICE_TICKS);
+}
+
+/// SK-22: portable timeslice tick without IRQ frames / CR3 / signals.
+/// Decrements the slice; when it expires, cooperatively `forceReschedule`s if
+/// another ready task exists. Safe on non-x86 software-frame backends.
+pub fn timerTickPortable() void {
+    if (comptime builtin.cpu.arch == .x86_64) return;
+    if (comptime !context_switch.uses_software_frame) return;
+
+    const new_slice = getSlice() -| 1;
+    setSlice(new_slice);
+    if (new_slice > 0) return;
+
+    setSlice(TIMESLICE_TICKS);
+
+    const cur = getCurrentIdx() orelse return;
+    // Prefer another ready task (round-robin after current).
+    const next = task.pickReadyForCpu(@intCast(currentCpuId()), cur) orelse return;
+    if (next == cur) return;
+    @call(.never_inline, forceReschedule, .{});
+}
+
 /// Logical id of the CPU currently executing (0 = BSP). Used to target this
 /// CPU's own TSS RSP0 on context switch (M8-4) rather than always the BSP's.
 fn currentCpuId() u32 {
