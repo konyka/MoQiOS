@@ -226,7 +226,16 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **`sched.blockOn` / `setPortableReschedule` / `setCurrentTaskIndex`**：`sleepOn` 可在非 x86
   经 hook 停车而不进入 `timerTick`；`kickCpu`/`forceReschedule` 经 comptime 隔离 x86。
 - **探针** `sk19.zig`：`[SK-19] shared sleepOn+sched_boot: OK`。
-- **后续**：SK-20 — 可移植 switch 后端（接 `forceReschedule`）或更多 `main.zig` 子系统 init 共享。
+- **后续**：SK-20 — 可移植协作 switch 后端接 `forceReschedule`。
+
+### 3.17 SK-20 完成记录（2026-07-14）
+
+- **`switchToSoftwareFrame`**：按 `InterruptFrame.rsp` 恢复栈后 sret/eret（不覆盖 SK-14 resume）。
+- **`portableKernelSwitch`**：非 x86 `forceReschedule` 默认路径；`.blocked` 保留调用方
+  安装的 resume 帧，`.running` 保存续体后入队。
+- **探针** `sk20.zig`：`blockOn` → 安装 resume entry → switch → `wakeOne` → switch back。
+- **门禁**：`[SK-20] portable sleepOn switch: OK`；三门禁不回归。
+- **后续**：SK-21 — 更多 `main.zig` 子系统 init 共享，或可移植 `timerTick` 子集。
 
 ---
 
