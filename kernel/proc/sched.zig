@@ -108,10 +108,7 @@ pub fn timerTickPortable() void {
     if (comptime builtin.cpu.arch == .x86_64) return;
     if (comptime !context_switch.uses_software_frame) return;
 
-    const new_slice = getSlice() -| 1;
-    setSlice(new_slice);
-    if (new_slice > 0) return;
-
+    if (!hardwareTimerTick()) return;
     setSlice(TIMESLICE_TICKS);
 
     const cur = getCurrentIdx() orelse return;
@@ -119,6 +116,20 @@ pub fn timerTickPortable() void {
     const next = task.pickReadyForCpu(@intCast(currentCpuId()), cur) orelse return;
     if (next == cur) return;
     @call(.never_inline, forceReschedule, .{});
+}
+
+/// SK-23: account one hardware timer IRQ against the timeslice.
+/// Returns true when the slice has expired (caller / task should preempt).
+/// Safe to call from arch IRQ handlers — does not switch.
+pub fn hardwareTimerTick() bool {
+    const new_slice = getSlice() -| 1;
+    setSlice(new_slice);
+    return new_slice == 0;
+}
+
+/// SK-23: true when the current timeslice is exhausted.
+pub fn timesliceExpired() bool {
+    return getSlice() == 0;
 }
 
 /// Logical id of the CPU currently executing (0 = BSP). Used to target this
