@@ -34,6 +34,18 @@ pub fn resumeAfterSoftwareEnter() noreturn {
     while (true) asm volatile ("hlt");
 }
 
+pub fn buildKernelTrapFrame(stack_top: u64, entry: u64) u64 {
+    _ = stack_top;
+    _ = entry;
+    return 0;
+}
+
+pub fn armSharedPreemptTimer() void {}
+
+pub fn enterTrapFrame(frame_ptr: u64) void {
+    _ = frame_ptr;
+}
+
 /// Per-CPU current FPU owner. `null` = no task on this CPU has touched the
 /// FPU since the last init. Indexed by logical cpu id (0 = BSP). Updated
 /// only by the local CPU's #NM handler / context-switch path, so no lock

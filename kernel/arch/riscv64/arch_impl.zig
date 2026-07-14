@@ -181,6 +181,80 @@ pub const context_switch = struct {
             : .{ .memory = true });
         unreachable;
     }
+
+    /// SK-15: build a native TrapFrame on a shared task stack for sret enter/switch.
+    pub fn buildKernelTrapFrame(stack_top: u64, entry: u64) u64 {
+        const frame_addr = (stack_top - trap.FRAME_BYTES) & ~@as(u64, 15);
+        const frame: *trap.TrapFrame = @ptrFromInt(frame_addr);
+        const bytes: [*]u8 = @ptrCast(frame);
+        @memset(bytes[0..trap.FRAME_BYTES], 0);
+        frame.sepc = entry;
+        frame.sstatus = (1 << 8) | (1 << 5); // SPP=1, SPIE=1
+        // Keep gp/tp for medany/TLS; sp unused by first sret but needed after trap return.
+        frame.gp = asm volatile ("mv %[r], gp"
+            : [r] "=r" (-> u64));
+        frame.tp = asm volatile ("mv %[r], tp"
+            : [r] "=r" (-> u64));
+        frame.sp = frame_addr;
+        return frame_addr;
+    }
+
+    /// SK-15: arm stimecmp so shared preempt can take timer IRQs.
+    /// Does not set sstatus.SIE — the TrapFrame SPIE bit enables IE after sret.
+    pub fn armSharedPreemptTimer() void {
+        @import("timer.zig").init(10_000); // ~1 ms at 10 MHz
+    }
+
+    /// SK-15: `sret` into a TrapFrame (same resume protocol as enterSoftwareFrame).
+    pub fn enterTrapFrame(frame_ptr: u64) void {
+        asm volatile (
+            \\lla t0, 1f
+            \\sd t0, 0(%[rpc])
+            \\sd sp, 0(%[rsp])
+            \\mv sp, %[f]
+            \\ld t0, 248(sp)
+            \\csrw sepc, t0
+            \\ld t0, 272(sp)
+            \\csrw sstatus, t0
+            \\ld ra,   0(sp)
+            \\ld gp,  16(sp)
+            \\ld tp,  24(sp)
+            \\ld t0,  32(sp)
+            \\ld t1,  40(sp)
+            \\ld t2,  48(sp)
+            \\ld s0,  56(sp)
+            \\ld s1,  64(sp)
+            \\ld a0,  72(sp)
+            \\ld a1,  80(sp)
+            \\ld a2,  88(sp)
+            \\ld a3,  96(sp)
+            \\ld a4, 104(sp)
+            \\ld a5, 112(sp)
+            \\ld a6, 120(sp)
+            \\ld a7, 128(sp)
+            \\ld s2, 136(sp)
+            \\ld s3, 144(sp)
+            \\ld s4, 152(sp)
+            \\ld s5, 160(sp)
+            \\ld s6, 168(sp)
+            \\ld s7, 176(sp)
+            \\ld s8, 184(sp)
+            \\ld s9, 192(sp)
+            \\ld s10,200(sp)
+            \\ld s11,208(sp)
+            \\ld t3, 216(sp)
+            \\ld t4, 224(sp)
+            \\ld t5, 232(sp)
+            \\ld t6, 240(sp)
+            \\addi sp, sp, 288
+            \\sret
+            \\1:
+            :
+            : [f] "r" (frame_ptr),
+              [rpc] "r" (@intFromPtr(&resume_pc)),
+              [rsp] "r" (@intFromPtr(&resume_sp)),
+            : .{ .memory = true });
+    }
 };
 
 pub const cpu = struct {

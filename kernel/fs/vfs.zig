@@ -172,6 +172,13 @@ pub const FdTable = struct {
         return default_table;
     }
 
+    /// In-place init — avoids a ~57KB stack temporary when assigning into Task.
+    pub fn initInto(dst: *FdTable) void {
+        const src: [*]const u8 = @ptrCast(&default_table);
+        const out: [*]u8 = @ptrCast(dst);
+        @memcpy(out[0..@sizeOf(FdTable)], src[0..@sizeOf(FdTable)]);
+    }
+
     /// Allocate a free fd slot — O(1) via @ctz on the free bitmap.
     /// Returns the slot index or null if none available.
     pub fn allocFd(self: *FdTable) ?u32 {

@@ -142,6 +142,10 @@ export fn trapHandler(frame: *TrapFrame) callconv(.c) *TrapFrame {
     if (interrupt and code == Cause.supervisor_timer) {
         const timer = @import("timer.zig");
         timer.onInterrupt();
+        const sk15 = @import("../../shared/sk15.zig");
+        if (sk15.isEnabled()) {
+            return @ptrFromInt(sk15.onTimer(@intFromPtr(frame)));
+        }
         const sched = @import("sched.zig");
         return sched.onTimer(frame);
     }

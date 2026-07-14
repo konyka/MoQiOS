@@ -16,7 +16,8 @@ const sv39 = @import("sv39.zig");
 
 extern const __kernel_end: u8;
 
-const BOOT_STACK_SIZE: usize = 64 * 1024;
+// SK-15: bring-up creates several Tasks (FdTable ~57KiB memset each); keep headroom.
+const BOOT_STACK_SIZE: usize = 256 * 1024;
 
 comptime {
     _ = @import("arch_impl.zig");
@@ -27,7 +28,7 @@ export var boot_stack: [BOOT_STACK_SIZE]u8 align(16) = undefined;
 export fn _start() linksection(".text.boot") callconv(.naked) noreturn {
     asm volatile (
         \\la sp, boot_stack
-        \\li t0, 0x10000
+        \\li t0, 0x40000
         \\add sp, sp, t0
         \\andi sp, sp, -16
         \\call kmain
@@ -189,6 +190,7 @@ export fn kmain(hartid: usize, dtb: usize) callconv(.c) noreturn {
     @import("../../shared/sk12.zig").announce();
     @import("../../shared/sk13.zig").announce();
     @import("../../shared/sk14.zig").announce();
+    @import("../../shared/sk15.zig").announce();
 
     // Map a fresh page at a non-identity VA, write/read, then unmap + #PF.
     const test_va: usize = 0x40000000;

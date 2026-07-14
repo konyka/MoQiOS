@@ -173,6 +173,61 @@ pub const context_switch = struct {
             : .{ .memory = true, .x0 = true });
         unreachable;
     }
+
+    /// SK-15: build a native TrapFrame on a shared task stack for eret enter/switch.
+    pub fn buildKernelTrapFrame(stack_top: u64, entry: u64) u64 {
+        const asched = @import("sched.zig");
+        const frame_addr = (stack_top - asched.FRAME_BYTES) & ~@as(u64, 15);
+        const frame: *asched.TrapFrame = @ptrFromInt(frame_addr);
+        const bytes: [*]u8 = @ptrCast(frame);
+        @memset(bytes[0..asched.FRAME_BYTES], 0);
+        frame.elr = entry;
+        frame.spsr = 0x5; // EL1h, IRQs unmasked after eret
+        return frame_addr;
+    }
+
+    /// SK-15: init GICv3 + CNTV so shared preempt can take timer IRQs.
+    /// Leaves CPU IRQs masked until TrapFrame spsr enables them on eret.
+    pub fn armSharedPreemptTimer() void {
+        const gic = @import("gic.zig");
+        _ = gic.init();
+        @import("timer.zig").init(0);
+        // Distributor/CPU iface ready; DAIF.I still set until eret from enterTrapFrame.
+        gic.enableCpuIrq();
+    }
+
+    /// SK-15: `eret` into a TrapFrame (same resume protocol as enterSoftwareFrame).
+    pub fn enterTrapFrame(frame_ptr: u64) void {
+        asm volatile (
+            \\adr x0, 1f
+            \\str x0, [%[rpc]]
+            \\mov x0, sp
+            \\str x0, [%[rsp]]
+            \\mov sp, %[f]
+            \\ldp x1, x2, [sp, #176]
+            \\msr elr_el1, x1
+            \\msr spsr_el1, x2
+            \\ldr x30, [sp, #160]
+            \\ldp x18, x29, [sp, #144]
+            \\ldp x16, x17, [sp, #128]
+            \\ldp x14, x15, [sp, #112]
+            \\ldp x12, x13, [sp, #96]
+            \\ldp x10, x11, [sp, #80]
+            \\ldp x8, x9, [sp, #64]
+            \\ldp x6, x7, [sp, #48]
+            \\ldp x4, x5, [sp, #32]
+            \\ldp x2, x3, [sp, #16]
+            \\ldp x0, x1, [sp, #0]
+            \\add sp, sp, #192
+            \\isb
+            \\eret
+            \\1:
+            :
+            : [f] "r" (frame_ptr),
+              [rpc] "r" (@intFromPtr(&resume_pc)),
+              [rsp] "r" (@intFromPtr(&resume_sp)),
+            : .{ .memory = true });
+    }
 };
 
 pub const cpu = struct {

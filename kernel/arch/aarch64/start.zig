@@ -17,7 +17,8 @@ const paging = @import("paging.zig");
 
 extern const __kernel_end: u8;
 
-const BOOT_STACK_SIZE: usize = 64 * 1024;
+// SK-15: bring-up creates several Tasks (FdTable ~57KiB memset each); keep headroom.
+const BOOT_STACK_SIZE: usize = 256 * 1024;
 /// Must match `qemu_run_aarch64.sh` loader address.
 const DTB_FALLBACK: usize = 0x4a000000;
 const FDT_MAGIC: u32 = 0xd00dfeed;
@@ -32,7 +33,7 @@ export fn _start() linksection(".text.boot") callconv(.naked) noreturn {
     asm volatile (
         \\adrp x1, boot_stack
         \\add  x1, x1, :lo12:boot_stack
-        \\mov  x2, #0x10000
+        \\mov  x2, #0x40000
         \\add  x1, x1, x2
         \\bic  x1, x1, #0xf
         \\mov  sp, x1
@@ -200,6 +201,7 @@ export fn kmain(x0_dtb: usize) callconv(.c) noreturn {
     @import("../../shared/sk12.zig").announce();
     @import("../../shared/sk13.zig").announce();
     @import("../../shared/sk14.zig").announce();
+    @import("../../shared/sk15.zig").announce();
 
     // Map a fresh page at a non-identity VA, write/read, then unmap + #PF.
     const test_va: usize = 0x80000000;

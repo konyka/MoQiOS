@@ -60,20 +60,21 @@ pass_markers() {
         grep -q "\[SK-11\] sched/task via paging+syscall facade: OK" "$LOG_FILE" &&
         grep -q "\[SK-12\] shared sched create+idle callable: OK" "$LOG_FILE" &&
         grep -q "\[SK-13\] shared InterruptFrame+anchor: OK" "$LOG_FILE" &&
-        grep -q "\[SK-14\] software-frame enter: OK" "$LOG_FILE"
+        grep -q "\[SK-14\] software-frame enter: OK" "$LOG_FILE" &&
+        grep -q "\[SK-15\] shared preempt: OK" "$LOG_FILE"
 }
 
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if pass_markers; then
-        echo "PASS: MoQiOS riscv64 M7+SK-14 smoke (software-frame enter + virtio + U-mode)."
+        echo "PASS: MoQiOS riscv64 M7+SK-15 smoke (shared preempt + virtio + U-mode)."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         if pass_markers; then
-            echo "PASS: MoQiOS riscv64 M7+SK-14 smoke (software-frame enter + virtio + U-mode)."
+            echo "PASS: MoQiOS riscv64 M7+SK-15 smoke (shared preempt + virtio + U-mode)."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -87,7 +88,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for riscv64 smoke markers."
-echo "Expected: SK-2..SK-4 + SK-6..SK-14 shared markers + M7 blk/net + M6 + M5 markers."
+echo "Expected: SK-2..SK-4 + SK-6..SK-15 shared markers + M7 blk/net + M6 + M5 markers."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

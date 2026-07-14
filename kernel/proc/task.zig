@@ -480,7 +480,7 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     tasks[slot].kernel_stack_top = stack_top;
     tasks[slot].entry = entry;
     tasks[slot].personality = .native;
-    tasks[slot].fd_table = @import("../fs/vfs.zig").FdTable.init();
+    @import("../fs/vfs.zig").FdTable.initInto(&tasks[slot].fd_table);
     tasks[slot].cwd[0] = '/';
     tasks[slot].cwd_len = 1;
     tasks[slot].cpu_affinity = @intCast(affinity);
@@ -525,7 +525,7 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     tasks[slot].kernel_stack_top = stack_top;
     tasks[slot].entry = entry;
     tasks[slot].personality = .native;
-    tasks[slot].fd_table = @import("../fs/vfs.zig").FdTable.init();
+    @import("../fs/vfs.zig").FdTable.initInto(&tasks[slot].fd_table);
     tasks[slot].cwd[0] = '/';
     tasks[slot].cwd_len = 1;
     tasks[slot].cpu_affinity = -1;
@@ -747,7 +747,7 @@ pub fn createUserProcess(
         tasks[slot].user_stack_top = user_stack_top;
         tasks[slot].stack_limit = user_stack_top - 64 * 4096;
         tasks[slot].parent_tid = parent_tid_val;
-        tasks[slot].fd_table = @import("../fs/vfs.zig").FdTable.init();
+        @import("../fs/vfs.zig").FdTable.initInto(&tasks[slot].fd_table);
         tasks[slot].cwd[0] = '/';
         tasks[slot].cwd_len = 1;
         // User processes are not pinned by default; last_cpu seeds placement.

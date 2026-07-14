@@ -12,10 +12,10 @@
 ## 0. 现状基线（移植起点 → 2026-07 更新）
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
-  **SK-8**…**SK-13**：facade、共享 create/prepare、软件 `InterruptFrame`。
-  **SK-14（2026-07-11）**：`enterSoftwareFrame` 经 sret/eret 进入共享帧并
-  `resumeAfterSoftwareEnter` 返回 bring-up。
-  完整 `main.zig` / Limine 驱动仍未在非 x86 链接；抢占式共享 sched 切换待后续。
+  **SK-8**…**SK-14**：facade、共享 create/prepare、软件帧 enter/resume。
+  **SK-15（2026-07-14）**：双共享内核线程 + 定时器抢占切换（原生 TrapFrame /
+  sret·eret）；探针 `[SK-15] shared preempt: OK`。
+  完整 `main.zig` / Limine 驱动仍未在非 x86 链接；更大共享 sched 收敛待后续。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
 - **riscv64**：M0–M7 完成（…PMM/Sv39、timer/sched、U-mode/`ecall`、virtio-mmio blk + net MAC）。
@@ -184,7 +184,16 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **M9-7**：双 EL1 内核线程 + CNTV 抢占切换；IRQ 帧保存 ELR/SPSR 以支持换栈；
   `preemptive switches=` 达标后打印 `M9-7 complete`。
 - **门禁**：`smoke-aarch64`（…`hello from U` + `M9-6` + `preemptive switches=` + `M9-7 complete`）。
-- **后续**：SK-15 共享 `sched` 定时器抢占切换（双共享内核线程）。
+- **后续**：更大共享 `sched` 与 arch-local M5/M9-7 收敛（SK-16）。
+
+### 3.12 SK-15 完成记录（2026-07-14）
+
+- **共享探针** `kernel/shared/sk15.zig`：`createKernelThread`×2 + `buildKernelTrapFrame` +
+  `armSharedPreemptTimer` + `enterTrapFrame`；timer IRQ 经 arch trap → `sk15.onTimer` 换栈。
+- **riscv64**：`stimecmp`/STIE；TrapFrame 保留 `gp`/`tp`/`sp`；boot stack 256KiB（FdTable memset）。
+- **aarch64**：GICv3 + CNTV；boot stack 256KiB。
+- **门禁**：`smoke-riscv` / `smoke-aarch64` 要求 `[SK-15] shared preempt: OK`；`zig build smoke` 不回归。
+- **后续**：SK-16 — 更大共享 sched / 与 arch-local M5/M9-7 收敛。
 
 ---
 
@@ -370,16 +379,16 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-14；⬜ SK-15 共享抢占切换
-Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-14；⬜ SK-15 共享抢占切换
+Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-15
+Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-15
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**SK-15** — 共享 `sched` 定时器抢占切换（双共享内核线程）；
-> SK-1…SK-14 已完成。
+> 当前下一执行项：**SK-16** — 更大共享 sched / 与 arch-local M5/M9-7 收敛；
+> SK-1…SK-15 已完成。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。
