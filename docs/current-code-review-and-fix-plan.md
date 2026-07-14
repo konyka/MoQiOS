@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-10 (bounded x86_64 smoke gates added)
+> Last update: 2026-07-14 (work-stealing two-queue locking correction verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -173,6 +173,28 @@ manifest maintainable and avoiding branch-heavy script drift as tests are added.
 Remaining gap: these smoke gates still depend on local QEMU/Limine/xorriso availability and are not
 yet wired to a hosted CI runner.
 
+### P1 - Work-Stealing Mutated The Thief Queue Without Its Lock ✅ RESOLVED 2026-07-14
+
+Evidence:
+
+- `kernel/proc/per_cpu.zig` `steal_half` originally held only `target.lock`, then appended stolen
+  tasks by mutating the thief queue's `head`, `nr_running`, and task slots.
+- A concurrent remote wakeup may call `enqueueTask` for the thief queue, and a peer CPU may steal
+  from that same queue. Both paths correctly use the thief queue's lock, so the unlocked mutations
+  could race with them and lose/corrupt runnable entries.
+
+Fix:
+
+1. Acquire both thief and victim queue locks for every steal.
+2. Order the pair by ascending logical CPU ID, which eliminates reciprocal-steal ABBA deadlock.
+3. Keep the lock scope to the bounded ring transfer; local `push`/`pop` remain one-lock O(1) paths.
+
+**Resolution (2026-07-14)**: `steal_half` now takes both queue locks in canonical CPU-ID order.
+This restores queue ownership invariants while retaining the per-CPU design and its cache-local
+LIFO fast path. Host tests plus x86_64/riscv64/aarch64 builds and the x86_64 single-core smoke gate
+passed before the correction; the dual-core gate is recorded separately below because it exposed an
+independent runtime regression during the final verification run.
+
 ### P2 - Version And Date Metadata Is Inconsistent
 
 Evidence:
@@ -244,6 +266,24 @@ If QEMU or toolchain pieces are unavailable, record that as a verification gap i
 8. Expand riscv64 from skeleton to shared-kernel boot only through the new arch facade.
 
 ## 5. Verification Results For This Update
+
+### 5.0 Review Update: 2026-07-14
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build test` | Passed | Host unit tests passed before the work-stealing correction. |
+| `zig build` | Passed | x86_64 kernel, user programs, and AP trampoline passed before the correction. |
+| `zig build -Darch=riscv64` | Passed | riscv64 build passed. |
+| `zig build -Darch=aarch64` | Passed | aarch64 build passed. |
+| `zig build smoke` | Passed | Reached `hello21 done` and `MoQiOS shell` with `MOQI_SMP=1`. |
+| `zig build smoke-smp` | Failed | Reproducibly reaches `hello4` load then faults with #DF in `proc.per_cpu.getCurrent`; serial log: `/tmp/moqios-smoke-smp2.log`. This is an independent SMP context/stack regression and must remain a release gate. |
+| Rebuild after final source edit | Blocked | Zig reported `manifest_create ReadOnlyFileSystem` while regenerating its cache, despite normal workspace writes succeeding. The existing x86_64 artifact continues to reproduce the dual-core failure; rerun all gates after the cache/toolchain condition is cleared. |
+
+The P1 queue-lock correction is source-reviewed and formatted, but it must not be represented as
+dual-core runtime-verified until `zig build smoke-smp` passes from a rebuilt artifact. The #DF's RIP
+maps to `kernel/proc/per_cpu.zig` `getCurrent()` (the call to `getPerCpuOrNull`) while loading
+`hello4`; investigate the preceding SMP user-task context transition, stack mapping, and GS-base
+state before enabling this gate in CI.
 
 Executed on 2026-07-10:
 

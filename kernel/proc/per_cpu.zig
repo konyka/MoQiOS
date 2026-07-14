@@ -5,12 +5,10 @@
 //!
 //! Locking model:
 //!   * `head` / `tail` updates are serialised via the per-queue `lock`.
-//!   * Local push/pop and remote `steal_half` all take the same per-queue
-//!     `IrqSpinlock`. This intentionally diverges from the "lock-free local
-//!     fast path" mentioned in the design doc — the spinlock is irq-safe and
-//!     held only for tens of cycles, so contention is bounded to one CPU pair
-//!     during a steal. The win over the previous global `sched_lock` is that
-//!     a busy CPU's run queue is independent of every other CPU's.
+//!   * Local push/pop take their owning queue's `IrqSpinlock`. `steal_half`
+//!     takes both the thief and victim locks in ascending CPU-id order before
+//!     moving tasks. This makes concurrent steals and remote wakeups safe
+//!     without a global scheduler lock or an ABBA deadlock.
 //!
 //! Tasks pinned via `cpu_affinity >= 0` are still placed in the affinity
 //! CPU's queue and never stolen — see `enqueueTask` / `steal_half`.
@@ -97,12 +95,18 @@ pub const PerCpuRunQueue = struct {
     /// Tasks pinned via `cpu_affinity >= 0` to a different CPU are skipped.
     pub fn steal_half(self: *PerCpuRunQueue, target: *PerCpuRunQueue) u32 {
         if (self.cpu_id == target.cpu_id) return 0;
+
+        // A steal mutates both ring buffers. Always acquire the pair in CPU-id
+        // order so two CPUs stealing from one another cannot deadlock.
+        const first = if (self.cpu_id < target.cpu_id) self else target;
+        const second = if (self.cpu_id < target.cpu_id) target else self;
+        const first_flags = first.lock.acquire();
+        defer first.lock.release(first_flags);
+        const second_flags = second.lock.acquire();
+        defer second.lock.release(second_flags);
+
         // Task #6: count the attempt on the thief side regardless of outcome.
-        // `self` is the current CPU's queue, so the bare increment is safe
-        // without taking self.lock (single-writer invariant).
         self.stats.steal_attempts += 1;
-        const flags = target.lock.acquire();
-        defer target.lock.release(flags);
         const want: u32 = target.nr_running / 2;
         if (want == 0) return 0;
         var stolen: u32 = 0;

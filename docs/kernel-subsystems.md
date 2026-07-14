@@ -216,7 +216,8 @@ const Task = struct {
 **当前实现（M8-7 已完成 ✅）**
 
 - **Per-CPU 运行队列**：`proc/per_cpu.zig` 定义 `PerCpuRunQueue` 结构，每 CPU 一份；
-  256 槽环形缓冲区（`QUEUE_SIZE=256`），由 `IrqSpinlock` 保护。
+  256 槽环形缓冲区（`QUEUE_SIZE=256`），由 `IrqSpinlock` 保护。本地操作只持有本队列锁；
+  跨队列窃取同时按 CPU ID 升序持有 thief/victim 两把锁，避免并发搬运损坏队列或 ABBA 死锁。
 - **本地 LIFO 操作**：`push` / `pop` 在 `head` 端 O(1) 操作（最近压入的任务先出，
   最大化 L1/L2 缓存复用）。
 - **Work-Stealing**：仅当本地队列为空（idle）时触发，`tryStealForCurrent` 以
