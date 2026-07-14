@@ -23,8 +23,6 @@ const slab = @import("mm/slab.zig");
 const dma = @import("mm/dma.zig");
 const task = @import("proc/task.zig");
 const sched = @import("proc/sched.zig");
-const ipc = @import("ipc/ipc.zig");
-const capability = @import("ipc/capability.zig");
 const syscall_entry = arch.syscall;
 const ramdisk = @import("fs/ramdisk.zig");
 const loader = @import("proc/loader.zig");
@@ -235,9 +233,8 @@ export fn _start() callconv(.c) noreturn {
     smp.init();
 
     // M4: IPC engine + capability system
-    ipc.init();
-    capability.init();
-    syscall_entry.init();
+    const subsystem_boot = @import("shared/subsystem_boot.zig");
+    subsystem_boot.initIpcAndSyscall();
     klog.log(.info, "IPC engine + capabilities + syscall entry initialized");
 
     // M5.3: Ramdisk — parse Limine modules
