@@ -101,6 +101,10 @@ export fn trapHandleIrq(frame: *anyopaque) callconv(.c) usize {
         if (sk15.isEnabled()) {
             return sk15.onTimer(@intFromPtr(frame));
         }
+        const sk16 = @import("../../shared/sk16.zig");
+        if (sk16.isEnabled()) {
+            return sk16.onTimer(@intFromPtr(frame));
+        }
         const sched = @import("sched.zig");
         if (sched.isEnabled()) {
             const tf: *sched.TrapFrame = @ptrCast(@alignCast(frame));

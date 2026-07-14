@@ -120,13 +120,9 @@ pub fn getTrapCount() u64 {
 }
 
 fn startM5() noreturn {
-    const timer = @import("timer.zig");
     const sched = @import("sched.zig");
     uart.writeString("MoQiOS riscv64: M5 (timer + sched)\n");
     sched.init();
-    timer.init(50_000);
-    uart.writeString("  stimecmp timer armed; starting threads\n");
-    asm volatile ("csrsi sstatus, 2");
     sched.start();
 }
 
@@ -145,6 +141,10 @@ export fn trapHandler(frame: *TrapFrame) callconv(.c) *TrapFrame {
         const sk15 = @import("../../shared/sk15.zig");
         if (sk15.isEnabled()) {
             return @ptrFromInt(sk15.onTimer(@intFromPtr(frame)));
+        }
+        const sk16 = @import("../../shared/sk16.zig");
+        if (sk16.isEnabled()) {
+            return @ptrFromInt(sk16.onTimer(@intFromPtr(frame)));
         }
         const sched = @import("sched.zig");
         return sched.onTimer(frame);

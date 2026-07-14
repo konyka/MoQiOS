@@ -1,12 +1,11 @@
-//! Minimal preemptive kernel-thread scheduler for aarch64 M9-7.
+//! aarch64 M9-7 milestone glue — shared dual preempt lives in `shared/sk16.zig`.
 //!
-//! Two EL1 threads on private stacks; CNTV PPI IRQs switch between them.
-//! Local to the aarch64 skeleton — full `proc/sched.zig` stays x86-only until
-//! shared-kernel reuse.
+//! `TrapFrame` / `FRAME_BYTES` stay here so `vectors.S` + `arch_impl` keep a
+//! stable layout. Thread stacks and switch state come from `proc/task` + facade.
 
 const uart = @import("uart.zig");
 const gic = @import("gic.zig");
-const timer = @import("timer.zig");
+const sk16 = @import("../../shared/sk16.zig");
 
 pub const FRAME_BYTES: usize = 192;
 
@@ -42,143 +41,24 @@ comptime {
     if (@sizeOf(TrapFrame) != FRAME_BYTES) @compileError("TrapFrame size mismatch");
 }
 
-const STACK_SIZE: usize = 16 * 1024;
-
-const Task = struct {
-    stack: [STACK_SIZE]u8 align(16) = undefined,
-    frame_ptr: usize = 0,
-    entries: u64 = 0,
-    id: u8 = 0,
-};
-
-var tasks: [2]Task = .{ .{ .id = 0 }, .{ .id = 1 } };
-var current: u8 = 0;
-var enabled: bool = false;
-var switches: u64 = 0;
-var m97_done: bool = false;
-
-fn putStr(s: []const u8) void {
-    uart.writeString(s);
-}
-
-fn putDec(v: u64) void {
-    if (v == 0) {
-        uart.writeByte('0');
-        return;
-    }
-    var buf: [20]u8 = undefined;
-    var n: usize = 0;
-    var x = v;
-    while (x > 0) : (n += 1) {
-        buf[n] = @intCast('0' + (x % 10));
-        x /= 10;
-    }
-    while (n > 0) {
-        n -= 1;
-        uart.writeByte(buf[n]);
-    }
-}
-
-fn buildInitialFrame(t: *Task, entry: *const fn () callconv(.c) noreturn) void {
-    const top = @intFromPtr(&t.stack) + STACK_SIZE;
-    const frame_addr = (top - FRAME_BYTES) & ~@as(usize, 15);
-    const frame: *TrapFrame = @ptrFromInt(frame_addr);
-    const bytes: [*]u8 = @ptrCast(frame);
-    @memset(bytes[0..FRAME_BYTES], 0);
-
-    frame.elr = @intFromPtr(entry);
-    // EL1h (M=0b0101), DAIF clear → IRQ enabled after eret.
-    frame.spsr = 0x5;
-    t.frame_ptr = frame_addr;
-}
-
-fn thread0() callconv(.c) noreturn {
-    tasks[0].entries +%= 1;
-    putStr("  [sched] thread0 start\n");
-    while (!m97_done) {
-        asm volatile ("wfi");
-    }
-    putStr("  [sched] thread0 exits (M9-7 done)\n");
+fn m97Complete() callconv(.c) noreturn {
+    uart.writeString("[aarch64] M9-7 complete\n");
+    gic.disableCpuIrq();
     while (true) asm volatile ("wfi");
-}
-
-fn thread1() callconv(.c) noreturn {
-    tasks[1].entries +%= 1;
-    putStr("  [sched] thread1 start\n");
-    while (!m97_done) {
-        asm volatile ("wfi");
-    }
-    putStr("  [sched] thread1 exits (M9-7 done)\n");
-    while (true) asm volatile ("wfi");
-}
-
-pub fn init() void {
-    buildInitialFrame(&tasks[0], &thread0);
-    buildInitialFrame(&tasks[1], &thread1);
-    current = 0;
-    switches = 0;
-    m97_done = false;
-    enabled = false;
-}
-
-/// Timer IRQ hook: save current frame, pick the other task, return its frame.
-pub fn onTimer(frame: *TrapFrame) *TrapFrame {
-    if (!enabled or m97_done) return frame;
-
-    tasks[current].frame_ptr = @intFromPtr(frame);
-    current ^= 1;
-    switches +%= 1;
-
-    if (switches >= 8 and tasks[0].entries >= 1 and tasks[1].entries >= 1) {
-        m97_done = true;
-        putStr("  [sched] preemptive switches=");
-        putDec(switches);
-        putStr(" t0_entries=");
-        putDec(tasks[0].entries);
-        putStr(" t1_entries=");
-        putDec(tasks[1].entries);
-        putStr("\n");
-        putStr("[aarch64] M9-7 complete\n");
-        gic.disableCpuIrq();
-        while (true) asm volatile ("wfi");
-    }
-
-    return @ptrFromInt(tasks[current].frame_ptr);
 }
 
 pub fn isEnabled() bool {
-    return enabled;
+    return sk16.isEnabled();
 }
 
-/// Enable scheduling and `eret` into thread0 (noreturn).
-pub fn start() noreturn {
-    putStr("MoQiOS aarch64: M9-7 (timer + sched)\n");
-    enabled = true;
-    timer.init(0);
-    gic.enableCpuIrq();
+pub fn onTimer(frame: *TrapFrame) *TrapFrame {
+    return @ptrFromInt(sk16.onTimer(@intFromPtr(frame)));
+}
 
-    const frame: *TrapFrame = @ptrFromInt(tasks[0].frame_ptr);
-    asm volatile (
-        \\mov sp, %[f]
-        \\ldp x1, x2, [sp, #176]
-        \\msr elr_el1, x1
-        \\msr spsr_el1, x2
-        \\ldr x30, [sp, #160]
-        \\ldp x18, x29, [sp, #144]
-        \\ldp x16, x17, [sp, #128]
-        \\ldp x14, x15, [sp, #112]
-        \\ldp x12, x13, [sp, #96]
-        \\ldp x10, x11, [sp, #80]
-        \\ldp x8, x9, [sp, #64]
-        \\ldp x6, x7, [sp, #48]
-        \\ldp x4, x5, [sp, #32]
-        \\ldp x2, x3, [sp, #16]
-        \\ldp x0, x1, [sp, #0]
-        \\add sp, sp, #192
-        \\isb
-        \\eret
-        :
-        : [f] "r" (frame),
-        : .{ .memory = true });
-    while (true) asm volatile ("wfi");
+pub fn init() void {}
+
+/// Enter shared dual preempt (noreturn). Timer/GIC armed via facade.
+pub fn start() noreturn {
+    uart.writeString("MoQiOS aarch64: M9-7 (timer + sched)\n");
+    sk16.run(m97Complete);
 }
