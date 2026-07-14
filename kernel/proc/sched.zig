@@ -24,6 +24,7 @@ const context_switch = @import("../arch/arch.zig").context_switch;
 const arch_cpu = @import("../arch/arch.zig").cpu;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const fmt = @import("../lib/fmt.zig");
+const builtin = @import("builtin");
 
 const TIMESLICE_TICKS: u64 = 10;
 
@@ -464,6 +465,12 @@ pub fn forceRescheduleFromIpi(frame: *idt.InterruptFrame) void {
 
 /// Ask another CPU to run its scheduler (after a remote task becomes ready).
 pub fn kickCpu(cpu_id: u8) void {
+    if (comptime builtin.cpu.arch == .x86_64) {
+        kickCpuX86(cpu_id);
+    }
+}
+
+fn kickCpuX86(cpu_id: u8) void {
     const lapic_mod = @import("../arch/arch.zig").timer;
     const se = @import("../arch/arch.zig").syscall;
     if (cpu_id >= se.MAX_CPUS) return;
@@ -647,18 +654,7 @@ fn tryStealTask() void {
 /// pattern used by futex/file_lock — other blocking paths call forceReschedule
 /// directly). Returns true if woken normally, false if interrupted by a signal.
 pub fn sleepOn(queue: *?*task.WaitNode, node: *task.WaitNode) bool {
-    const cur_idx = currentTaskIndex() orelse return false;
-    const cur = task.getTask(cur_idx) orelse return false;
-
-    // Initialize wait node
-    node.task_idx = cur_idx;
-    node.granted = false;
-    node.next = queue.*;
-    queue.* = node;
-
-    // Mark task as blocked
-    cur.state = .blocked;
-    cur.wait_queue = queue;
+    if (!blockOn(queue, node)) return false;
 
     // Force immediate reschedule: set force_reschedule so the next timerTick
     // bypasses the single-task fast-path and picks a different task.
@@ -667,6 +663,36 @@ pub fn sleepOn(queue: *?*task.WaitNode, node: *task.WaitNode) bool {
     // When we are woken, we return here. Check if granted.
     // The waker sets node.granted = true before making the task ready.
     return node.granted;
+}
+
+/// Portable half of `sleepOn`: link WaitNode + mark current task blocked.
+/// Does not switch away — callers that need a reschedule invoke `forceReschedule`
+/// (or install `setPortableReschedule` on non-x86 bring-up).
+pub fn blockOn(queue: *?*task.WaitNode, node: *task.WaitNode) bool {
+    const cur_idx = currentTaskIndex() orelse return false;
+    const cur = task.getTask(cur_idx) orelse return false;
+
+    node.task_idx = cur_idx;
+    node.granted = false;
+    node.next = queue.*;
+    queue.* = node;
+
+    cur.state = .blocked;
+    cur.wait_queue = queue;
+    return true;
+}
+
+/// Optional hook replacing the x86 `timerTick` path inside `forceReschedule`.
+/// Used by non-x86 probes (SK-19) until a portable switch backend exists.
+var portable_reschedule: ?*const fn () void = null;
+
+pub fn setPortableReschedule(hook: ?*const fn () void) void {
+    portable_reschedule = hook;
+}
+
+/// Publish the running task index (bring-up / probes). `null` clears current.
+pub fn setCurrentTaskIndex(idx: ?u32) void {
+    setCurrentIdx(idx);
 }
 
 /// Wake one waiter from a wait queue (FIFO — wake the most recent waiter).
@@ -725,10 +751,18 @@ pub fn wakeAll(queue: *?*task.WaitNode) void {
 /// after marking the current task as blocked.
 pub fn forceReschedule() void {
     setSlice(0);
-    // Trigger a timer tick to force the scheduler to switch away from this task.
-    // Since the current task is blocked, pickNext() will choose another.
-    const iframe: *idt.InterruptFrame = @ptrFromInt(getAnchor());
-    timerTick(iframe);
+    if (portable_reschedule) |h| {
+        h();
+        return;
+    }
+    // x86: switch via timerTick. Non-x86 must install setPortableReschedule
+    // until a shared switch backend exists (SK-19+).
+    if (comptime builtin.cpu.arch == .x86_64) {
+        const iframe: *idt.InterruptFrame = @ptrFromInt(getAnchor());
+        timerTick(iframe);
+    } else {
+        // No portable switch yet — caller should have setPortableReschedule.
+    }
 }
 
 // ---------------------------------------------------------------------------

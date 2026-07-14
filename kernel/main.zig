@@ -227,8 +227,8 @@ export fn _start() callconv(.c) noreturn {
     // any kernel threads (createKernelThread/createKernelThreadAffinity may
     // observe the queue via subsequent enqueue paths). AP queues are
     // initialised in smp.apEntry.
-    const per_cpu = @import("proc/per_cpu.zig");
-    per_cpu.init(0);
+    const sched_boot = @import("shared/sched_boot.zig");
+    sched_boot.initBspRunQueue();
 
     // SMP: Start Application Processors
     const smp = @import("smp.zig");
@@ -261,7 +261,7 @@ export fn _start() callconv(.c) noreturn {
     }
 
     // Create kernel idle thread (priority 255 = lowest, runs when nothing else is ready)
-    _ = task.createKernelThread(idleThread, 255) orelse {
+    _ = sched_boot.createIdleThread(idleThread) orelse {
         klog.log(.info, "Failed to create idle thread");
         while (true) asm volatile ("hlt");
     };
