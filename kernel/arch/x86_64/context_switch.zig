@@ -35,6 +35,16 @@ pub fn switchToSoftwareFrame(frame_ptr: u64) noreturn {
     while (true) asm volatile ("hlt");
 }
 
+pub fn irqInterruptedPc(trap_frame_ptr: u64) u64 {
+    _ = trap_frame_ptr;
+    return 0;
+}
+
+pub fn irqInterruptedSp(trap_frame_ptr: u64) u64 {
+    _ = trap_frame_ptr;
+    return 0;
+}
+
 pub fn resumeAfterSoftwareEnter() noreturn {
     while (true) asm volatile ("hlt");
 }

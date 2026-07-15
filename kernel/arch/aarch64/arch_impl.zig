@@ -181,6 +181,19 @@ pub const context_switch = struct {
         unreachable;
     }
 
+    /// SK-24: PC interrupted by a timer IRQ (TrapFrame.elr).
+    pub fn irqInterruptedPc(trap_frame_ptr: u64) u64 {
+        const asched = @import("sched.zig");
+        const frame: *asched.TrapFrame = @ptrFromInt(trap_frame_ptr);
+        return frame.elr;
+    }
+
+    /// SK-24: SP before the IRQ frame was pushed (frame_ptr + FRAME_BYTES).
+    pub fn irqInterruptedSp(trap_frame_ptr: u64) u64 {
+        const asched = @import("sched.zig");
+        return trap_frame_ptr + asched.FRAME_BYTES;
+    }
+
     /// Return to the `enterSoftwareFrame` caller (used by SK-14 probe body).
     pub fn resumeAfterSoftwareEnter() noreturn {
         asm volatile (

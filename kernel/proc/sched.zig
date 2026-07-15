@@ -854,6 +854,16 @@ fn portableKernelSwitch(cont_rip: u64, caller_sp: u64) noreturn {
     context_switch.switchToSoftwareFrame(new_task.saved_rsp);
 }
 
+/// SK-24: preempt from a hardware timer IRQ. Builds a software continuation
+/// from the native trap frame (interrupted PC/SP) and switches away — never
+/// returns to the IRQ epilogue.
+pub fn preemptFromIrq(trap_frame_ptr: u64) noreturn {
+    const cont_rip = context_switch.irqInterruptedPc(trap_frame_ptr);
+    const caller_sp = context_switch.irqInterruptedSp(trap_frame_ptr);
+    setSlice(TIMESLICE_TICKS);
+    portableKernelSwitch(cont_rip, caller_sp);
+}
+
 // ---------------------------------------------------------------------------
 // Dynamic priority / nice support
 // ---------------------------------------------------------------------------
