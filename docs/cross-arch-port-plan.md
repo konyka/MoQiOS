@@ -12,9 +12,9 @@
 ## 0. 现状基线（移植起点 → 2026-07 更新）
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
-  **SK-8**…**SK-27**：facade、portable mm、K↔U 原生帧抢占。
-  **SK-28（2026-07-16）**：双用户 U↔U 原生 TrapFrame 抢占；
-  探针 `[SK-28] dual-user trapframe preempt: OK`。
+  **SK-8**…**SK-28**：facade、portable mm、K/U 原生帧抢占三角。
+  **SK-29（2026-07-16）**：shared sched enqueue/pick 驱动 U↔U 原生帧抢占；
+  探针 `[SK-29] sched native-user preempt: OK`。
   完整 `main.zig` / Limine 驱动仍未在非 x86 链接。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
@@ -299,6 +299,14 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **探针**：`[SK-28] dual-user trapframe preempt: OK`；退出走 `finishUserIrqProbe`。
 - **后续**：SK-29 — 共享 sched 接入原生用户抢占，或继续引导/`main` 收敛。
 
+### 3.26 SK-29 完成记录（2026-07-16）
+
+- **`sched.nativeTrapFramePreempt`**：先 `pickNext` 再 `enqueue` current（LIFO 安全）；
+  把 live TrapFrame 写入 `Task.saved_rsp`，返回 next 帧指针给 IRQ epilogue。
+- **探针**：双用户任务经 shared runqueue 切换；**不**走 `preemptFromIrq`/软件帧。
+- **标记**：`[SK-29] sched native-user preempt: OK`。
+- **后续**：SK-30 — 时间片/`preemptFromIrq` 原生用户路径，或继续引导/`main` 收敛。
+
 ---
 
 ## 4. M8 进度（x86_64 SMP）
@@ -483,16 +491,16 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-28
-Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-28
+Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-29
+Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-29
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**SK-29** — 共享 sched 接入原生用户抢占，或继续引导/`main` 收敛；
-> SK-1…SK-28 已完成。
+> 当前下一执行项：**SK-30** — 时间片/`preemptFromIrq` 原生用户路径，或继续引导/`main` 收敛；
+> SK-1…SK-29 已完成。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。
