@@ -12,9 +12,9 @@
 ## 0. 现状基线（移植起点 → 2026-07 更新）
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
-  **SK-8**…**SK-23**：facade、协作切换、`timerTickPortable`、IRQ 时间片记账。
-  **SK-24（2026-07-15）**：IRQ 内从 TrapFrame 合成软件续体并 `switchToSoftwareFrame` 抢占；
-  探针 `[SK-24] irq software-frame preempt: OK`。
+  **SK-8**…**SK-24**：facade、协作切换、IRQ 软件帧抢占。
+  **SK-25（2026-07-16）**：共享 `initPortableMm`（addr_space+dma）；
+  探针 `[SK-25] shared portable mm boot: OK`。
   完整 `main.zig` / Limine 驱动仍未在非 x86 链接。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
@@ -268,6 +268,14 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **探针**：任务 `wfi`，IRQ 到期直接抢占到对端；`[SK-24] irq software-frame preempt: OK`。
 - **后续**：更多引导 / `main` 收敛，或用户态 IRQ 抢占路径。
 
+### 3.22 SK-25 完成记录（2026-07-16）
+
+- **`subsystem_boot.initPortableMm`**：对齐 `main.zig` M2 的 `addr_space.init` + `dma.init`。
+- **`main.zig`**：改调该共享入口；`initAll` 亦纳入 portable mm。
+- **探针**：`addRange`/`findRange` + `dma.allocCoherent` 单页往返；
+  `[SK-25] shared portable mm boot: OK`。
+- **后续**：SK-26 — 继续引导收敛，或用户态 IRQ（原生 TrapFrame，非软件帧）。
+
 ---
 
 ## 4. M8 进度（x86_64 SMP）
@@ -452,16 +460,16 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-24
-Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-24
+Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-25
+Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-25
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**SK-25** — 更多引导/`main` 收敛，或用户态 IRQ 抢占；
-> SK-1…SK-24 已完成。
+> 当前下一执行项：**SK-26** — 继续引导/`main` 收敛，或用户态 IRQ（原生 TrapFrame）；
+> SK-1…SK-25 已完成。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。

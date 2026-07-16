@@ -18,9 +18,7 @@ const acpi = @import("acpi/acpi_parser.zig");
 const symbol_table = @import("debug/symbol_table.zig");
 const tsc = arch.tsc;
 const pmm = @import("mm/pmm.zig");
-const addr_space = @import("mm/addr_space.zig");
 const slab = @import("mm/slab.zig");
-const dma = @import("mm/dma.zig");
 const task = @import("proc/task.zig");
 const sched = @import("proc/sched.zig");
 const syscall_entry = arch.syscall;
@@ -93,8 +91,9 @@ export fn _start() callconv(.c) noreturn {
     // M2: Page table operations
     paging.init();
 
-    // M2: Address space manager
-    addr_space.init();
+    // M2: Address space + DMA (shared portable mm boot — SK-25)
+    const subsystem_boot_mm = @import("shared/subsystem_boot.zig");
+    subsystem_boot_mm.initPortableMm();
 
     // ACPI — must come after paging init so we can map non-RAM regions
     var rsdp_phys: u64 = 0;
@@ -111,9 +110,6 @@ export fn _start() callconv(.c) noreturn {
 
     // M2: Slab allocator (kernel heap)
     slab.init();
-
-    // M2: DMA stubs
-    dma.init();
 
     // Framebuffer graphics driver
     const framebuffer = @import("drivers/framebuffer.zig");
