@@ -866,14 +866,19 @@ pub fn preemptFromIrq(trap_frame_ptr: u64) noreturn {
 
 /// SK-29: IRQ-safe native TrapFrame preempt driven by shared enqueue/pick.
 ///
-/// Saves `frame_ptr` into the current task's `saved_rsp`, picks the next ready
-/// task **before** enqueueing the current one (per-CPU queue is LIFO), then
+/// Relocates the live TrapFrame onto the current task's kernel stack when it
+/// still sits on a shared U-mode trap stack (riscv), then picks the next ready
+/// task **before** enqueueing the current one (per-CPU queue is LIFO), and
 /// returns the next task's TrapFrame pointer for the arch IRQ epilogue.
 /// Does **not** call `switchToSoftwareFrame` / `preemptFromIrq`.
 pub fn nativeTrapFramePreempt(frame_ptr: u64) ?u64 {
     const cur_idx = getCurrentIdx() orelse return null;
     const cur = task.getTask(cur_idx) orelse return null;
-    cur.saved_rsp = frame_ptr;
+    cur.saved_rsp = context_switch.relocateNativeTrapFrame(
+        frame_ptr,
+        cur.kernel_stack,
+        cur.kernel_stack_top,
+    );
 
     // Pick while current is still `.running` and not on the ready queue.
     const next_idx = pickNext() orelse return null;

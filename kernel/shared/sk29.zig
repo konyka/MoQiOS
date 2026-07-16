@@ -35,7 +35,8 @@ pub fn onTimer(frame_ptr: u64) u64 {
     const next_frame = sched.nativeTrapFramePreempt(frame_ptr) orelse return frame_ptr;
     switches +%= 1;
 
-    if (switches >= 2 and ran0 and ran1) {
+    // ≥4: prove relocated frames survive a peer U IRQ on the shared trap stack.
+    if (switches >= 4 and ran0 and ran1) {
         done = true;
         enabled = false;
         arch.serial.writeString("[SK-29] switches=");

@@ -311,6 +311,30 @@ pub const context_switch = struct {
         return USER_PROBE_STACK1_TOP;
     }
 
+    pub fn nativeTrapFrameBytes() u64 {
+        const asched = @import("sched.zig");
+        return asched.FRAME_BYTES;
+    }
+
+    /// Relocate a live TrapFrame onto the task kernel stack when needed.
+    /// aarch64 EL0 IRQs usually already land on per-task SP_EL1 — fast path
+    /// returns `frame_ptr` unchanged.
+    pub fn relocateNativeTrapFrame(frame_ptr: u64, kstack_base: u64, kstack_top: u64) u64 {
+        const asched = @import("sched.zig");
+        const nbytes: u64 = asched.FRAME_BYTES;
+        if (frame_ptr >= kstack_base and frame_ptr + nbytes <= kstack_top) {
+            return frame_ptr;
+        }
+        const dest = (kstack_top -% 2 * nbytes) & ~@as(u64, 15);
+        if (dest < kstack_base or dest + nbytes > kstack_top) return frame_ptr;
+        if (dest != frame_ptr) {
+            const dst: [*]u8 = @ptrFromInt(dest);
+            const src: [*]const u8 = @ptrFromInt(frame_ptr);
+            @memcpy(dst[0..nbytes], src[0..nbytes]);
+        }
+        return dest;
+    }
+
     /// SK-28: text + two user stacks (shared busy-loop image, distinct SPs).
     pub fn prepareDualUserIrqProbe() bool {
         if (!prepareUserIrqProbe()) return false;

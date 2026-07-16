@@ -307,6 +307,14 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **标记**：`[SK-29] sched native-user preempt: OK`。
 - **后续**：SK-30 — 时间片/`preemptFromIrq` 原生用户路径，或继续引导/`main` 收敛。
 
+### 3.26b 帧驻留修复（2026-07-16 review）
+
+- **隐患**：riscv U-mode IRQ 共用 `u_trap_stack`；仅保存帧指针时，对端下一次 U IRQ
+  会覆写上一任务的 TrapFrame（SK-28/29 原探针在 switches=2 就退出，未覆盖此路径）。
+- **方案**：`relocateNativeTrapFrame` — 帧已在本任务内核栈则零拷贝；否则 memcpy 到
+  `kstack_top - 2*FRAME`（性能最优：aarch64 快路径几乎总是 no-op）。
+- **验证**：SK-28/29 要求 `switches >= 4`，确保在共享 trap 栈被复用后仍能正确恢复。
+
 ---
 
 ## 4. M8 进度（x86_64 SMP）

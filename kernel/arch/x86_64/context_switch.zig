@@ -93,6 +93,16 @@ pub fn prepareDualUserIrqProbe() bool {
     return false;
 }
 
+pub fn nativeTrapFrameBytes() u64 {
+    return 0;
+}
+
+pub fn relocateNativeTrapFrame(frame_ptr: u64, kstack_base: u64, kstack_top: u64) u64 {
+    _ = kstack_base;
+    _ = kstack_top;
+    return frame_ptr;
+}
+
 pub fn armSharedPreemptTimer() void {}
 
 pub fn enterTrapFrame(frame_ptr: u64) void {

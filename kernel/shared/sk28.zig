@@ -9,6 +9,8 @@ const task = @import("../proc/task.zig");
 const fmt_core = @import("../lib/fmt_core.zig");
 
 var frame_ptrs: [2]u64 = .{ 0, 0 };
+var stack_base: [2]u64 = .{ 0, 0 };
+var stack_top: [2]u64 = .{ 0, 0 };
 var current: u8 = 0;
 var switches: u64 = 0;
 var enabled: bool = false;
@@ -28,11 +30,17 @@ pub fn onTimer(frame_ptr: u64) u64 {
     }
 
     ran[current] = true;
-    frame_ptrs[current] = frame_ptr;
+    // Relocate off shared u_trap_stack before the peer's next U IRQ clobbers it.
+    frame_ptrs[current] = arch.context_switch.relocateNativeTrapFrame(
+        frame_ptr,
+        stack_base[current],
+        stack_top[current],
+    );
     current ^= 1;
     switches +%= 1;
 
-    if (switches >= 2 and ran[0] and ran[1]) {
+    // ≥4 switches: resume a relocated frame after another U IRQ used the shared stack.
+    if (switches >= 4 and ran[0] and ran[1]) {
         done = true;
         enabled = false;
         arch.serial.writeString("[SK-28] switches=");
@@ -78,6 +86,10 @@ pub fn announce() void {
     };
     const t0 = task.getTask(idx0) orelse return;
     const t1 = task.getTask(idx1) orelse return;
+    stack_base[0] = t0.kernel_stack;
+    stack_base[1] = t1.kernel_stack;
+    stack_top[0] = t0.kernel_stack_top;
+    stack_top[1] = t1.kernel_stack_top;
 
     const entry = arch.context_switch.userProbeTextVa();
     frame_ptrs[0] = arch.context_switch.buildUserTrapFrame(

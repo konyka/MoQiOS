@@ -341,6 +341,28 @@ pub const context_switch = struct {
         return USER_PROBE_STACK1_TOP;
     }
 
+    pub fn nativeTrapFrameBytes() u64 {
+        return trap.FRAME_BYTES;
+    }
+
+    /// Relocate a live TrapFrame onto `kstack_top` if it sits outside that
+    /// stack (riscv U-mode IRQs share `u_trap_stack`). No-op copy when already
+    /// local. Destination: `kstack_top - 2*FRAME` (below the synthetic enter frame).
+    pub fn relocateNativeTrapFrame(frame_ptr: u64, kstack_base: u64, kstack_top: u64) u64 {
+        const nbytes: u64 = trap.FRAME_BYTES;
+        if (frame_ptr >= kstack_base and frame_ptr + nbytes <= kstack_top) {
+            return frame_ptr;
+        }
+        const dest = (kstack_top -% 2 * nbytes) & ~@as(u64, 15);
+        if (dest < kstack_base or dest + nbytes > kstack_top) return frame_ptr;
+        if (dest != frame_ptr) {
+            const dst: [*]u8 = @ptrFromInt(dest);
+            const src: [*]const u8 = @ptrFromInt(frame_ptr);
+            @memcpy(dst[0..nbytes], src[0..nbytes]);
+        }
+        return dest;
+    }
+
     /// SK-28: text + two user stacks (shared busy-loop image, distinct SPs).
     pub fn prepareDualUserIrqProbe() bool {
         if (!prepareUserIrqProbe()) return false;
