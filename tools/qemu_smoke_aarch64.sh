@@ -78,20 +78,21 @@ pass_markers() {
         grep -q "\[SK-22\] portable timerTick: OK" "$LOG_FILE" &&
         grep -q "\[SK-23\] irq ticks wired to timeslice: OK" "$LOG_FILE" &&
         grep -q "\[SK-24\] irq software-frame preempt: OK" "$LOG_FILE" &&
-        grep -q "\[SK-25\] shared portable mm boot: OK" "$LOG_FILE"
+        grep -q "\[SK-25\] shared portable mm boot: OK" "$LOG_FILE" &&
+        grep -q "\[SK-26\] user timer IRQ visible: OK" "$LOG_FILE"
 }
 
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if pass_markers; then
-        echo "PASS: MoQiOS aarch64 M9-7+SK-25 smoke (portable mm + EL0/SVC)."
+        echo "PASS: MoQiOS aarch64 M9-7+SK-26 smoke (user IRQ + EL0/SVC)."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         if pass_markers; then
-            echo "PASS: MoQiOS aarch64 M9-7+SK-25 smoke (portable mm + EL0/SVC)."
+            echo "PASS: MoQiOS aarch64 M9-7+SK-26 smoke (user IRQ + EL0/SVC)."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -105,7 +106,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for aarch64 smoke markers."
-echo "Expected: SK-2..SK-4 + SK-6..SK-25 shared markers + M9-1..M9-7 markers."
+echo "Expected: SK-2..SK-4 + SK-6..SK-26 shared markers + M9-1..M9-7 markers."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

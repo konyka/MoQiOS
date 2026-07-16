@@ -194,6 +194,70 @@ pub const context_switch = struct {
         return trap_frame_ptr + asched.FRAME_BYTES;
     }
 
+    /// SK-26: true when the IRQ interrupted EL0 (spsr M[3:0] == 0).
+    pub fn irqFromUserMode(trap_frame_ptr: u64) bool {
+        const asched = @import("sched.zig");
+        const frame: *asched.TrapFrame = @ptrFromInt(trap_frame_ptr);
+        return (frame.spsr & 0xf) == 0;
+    }
+
+    const USER_PROBE_TEXT_VA: usize = 0x00030000;
+    const USER_PROBE_STACK_VA: usize = 0x00040000;
+    const USER_PROBE_STACK_TOP: usize = USER_PROBE_STACK_VA + 4096;
+
+    fn writeU32(page: [*]u8, off: usize, word: u32) void {
+        page[off] = @truncate(word);
+        page[off + 1] = @truncate(word >> 8);
+        page[off + 2] = @truncate(word >> 16);
+        page[off + 3] = @truncate(word >> 24);
+    }
+
+    /// SK-26: map a tiny EL0 `wfi` loop (VA distinct from M9-6).
+    pub fn prepareUserIrqProbe() bool {
+        const pmm = @import("pmm.zig");
+        const a64pag = @import("paging.zig");
+        const text_pa = pmm.allocPage();
+        if (text_pa == 0) return false;
+        const stack_pa = pmm.allocPage();
+        if (stack_pa == 0) return false;
+        const page: [*]u8 = @ptrFromInt(text_pa);
+        @memset(page[0..4096], 0);
+        writeU32(page, 0, 0xD503207F); // wfi
+        writeU32(page, 4, 0x17FFFFFF); // b -4
+        return a64pag.mapPage(USER_PROBE_TEXT_VA, text_pa, a64pag.F_EXEC | a64pag.F_USER) and
+            a64pag.mapPage(USER_PROBE_STACK_VA, stack_pa, a64pag.F_WRITE | a64pag.F_USER);
+    }
+
+    /// SK-26: `eret` into EL0 with IRQs unmasked (spsr=0). Saves resume slot.
+    pub fn enterUserIrqProbe() void {
+        const gic = @import("gic.zig");
+        gic.enableCpuIrq();
+        asm volatile (
+            \\adr x0, 1f
+            \\str x0, [%[rpc]]
+            \\mov x0, sp
+            \\str x0, [%[rsp]]
+            \\msr sp_el0, %[usp]
+            \\msr elr_el1, %[entry]
+            \\mov x0, #0
+            \\msr spsr_el1, x0
+            \\isb
+            \\eret
+            \\1:
+            :
+            : [rpc] "r" (@intFromPtr(&resume_pc)),
+              [rsp] "r" (@intFromPtr(&resume_sp)),
+              [usp] "r" (@as(u64, USER_PROBE_STACK_TOP)),
+              [entry] "r" (@as(u64, USER_PROBE_TEXT_VA)),
+            : .{ .memory = true, .x0 = true });
+    }
+
+    /// SK-26: leave EL0 probe and return to `enterUserIrqProbe` caller.
+    pub fn finishUserIrqProbe() noreturn {
+        @import("gic.zig").disableCpuIrq();
+        resumeAfterSoftwareEnter();
+    }
+
     /// Return to the `enterSoftwareFrame` caller (used by SK-14 probe body).
     pub fn resumeAfterSoftwareEnter() noreturn {
         asm volatile (

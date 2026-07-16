@@ -45,6 +45,21 @@ pub fn irqInterruptedSp(trap_frame_ptr: u64) u64 {
     return 0;
 }
 
+pub fn irqFromUserMode(trap_frame_ptr: u64) bool {
+    _ = trap_frame_ptr;
+    return false;
+}
+
+pub fn prepareUserIrqProbe() bool {
+    return false;
+}
+
+pub fn enterUserIrqProbe() void {}
+
+pub fn finishUserIrqProbe() noreturn {
+    while (true) asm volatile ("hlt");
+}
+
 pub fn resumeAfterSoftwareEnter() noreturn {
     while (true) asm volatile ("hlt");
 }

@@ -202,6 +202,85 @@ pub const context_switch = struct {
         return frame.sp;
     }
 
+    /// SK-26: true when the trap/IRQ interrupted U-mode (sstatus.SPP == 0).
+    pub fn irqFromUserMode(trap_frame_ptr: u64) bool {
+        const frame: *trap.TrapFrame = @ptrFromInt(trap_frame_ptr);
+        return (frame.sstatus & (1 << 8)) == 0;
+    }
+
+    const USER_PROBE_TEXT_VA: usize = 0x00030000;
+    const USER_PROBE_STACK_VA: usize = 0x00040000;
+    const USER_PROBE_STACK_TOP: usize = USER_PROBE_STACK_VA + 4096;
+
+    fn writeU32(page: [*]u8, off: usize, word: u32) void {
+        page[off] = @truncate(word);
+        page[off + 1] = @truncate(word >> 8);
+        page[off + 2] = @truncate(word >> 16);
+        page[off + 3] = @truncate(word >> 24);
+    }
+
+    /// SK-26: map a tiny U-mode `wfi` loop at a VA distinct from M6's pages.
+    pub fn prepareUserIrqProbe() bool {
+        const pmm = @import("pmm.zig");
+        const sv39 = @import("sv39.zig");
+        const text_pa = pmm.allocPage() orelse return false;
+        const stack_pa = pmm.allocPage() orelse return false;
+        const page: [*]u8 = @ptrFromInt(text_pa);
+        @memset(page[0..4096], 0);
+        // U-mode cannot execute WFI (illegal insn on virt); busy-loop instead.
+        writeU32(page, 0, 0x00000013); // addi x0, x0, 0 (nop)
+        writeU32(page, 4, 0xffdff06f); // jal x0, -4
+        if (!sv39.mapPage(USER_PROBE_TEXT_VA, text_pa, .{
+            .read = true,
+            .write = false,
+            .exec = true,
+            .user = true,
+        }) or !sv39.mapPage(USER_PROBE_STACK_VA, stack_pa, .{
+            .read = true,
+            .write = true,
+            .exec = false,
+            .user = true,
+        })) return false;
+        asm volatile ("sfence.vma" ::: .{ .memory = true });
+        return true;
+    }
+
+    /// SK-26: `sret` into U-mode with SPIE (IRQs enable after sret). Saves the
+    /// same resume slot as `enterSoftwareFrame` for `finishUserIrqProbe`.
+    pub fn enterUserIrqProbe() void {
+        const ksp = trap.userTrapStackTop();
+        if (ksp == 0) {
+            while (true) asm volatile ("wfi");
+        }
+        asm volatile (
+            \\lla t0, 1f
+            \\sd t0, 0(%[rpc])
+            \\sd sp, 0(%[rsp])
+            \\li t0, %[entry]
+            \\csrw sepc, t0
+            \\li t0, %[sstat]
+            \\csrw sstatus, t0
+            \\csrw sscratch, %[ks]
+            \\li sp, %[usp]
+            \\sret
+            \\1:
+            :
+            : [rpc] "r" (@intFromPtr(&resume_pc)),
+              [rsp] "r" (@intFromPtr(&resume_sp)),
+              [entry] "i" (USER_PROBE_TEXT_VA),
+              [sstat] "i" (@as(usize, 1 << 5)), // SPIE; SPP=0
+              [ks] "r" (ksp),
+              [usp] "i" (USER_PROBE_STACK_TOP),
+            : .{ .memory = true, .x5 = true });
+    }
+
+    /// SK-26: leave U-mode probe and return to `enterUserIrqProbe` caller.
+    pub fn finishUserIrqProbe() noreturn {
+        asm volatile ("csrw sscratch, zero");
+        asm volatile ("csrci sstatus, 2"); // clear SIE
+        resumeAfterSoftwareEnter();
+    }
+
     /// Return to the `enterSoftwareFrame` caller (used by SK-14 probe body).
     pub fn resumeAfterSoftwareEnter() noreturn {
         asm volatile (
