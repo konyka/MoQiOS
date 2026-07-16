@@ -85,6 +85,14 @@ pub fn userProbeStackTop() u64 {
     return 0;
 }
 
+pub fn userProbeStackTop1() u64 {
+    return 0;
+}
+
+pub fn prepareDualUserIrqProbe() bool {
+    return false;
+}
+
 pub fn armSharedPreemptTimer() void {}
 
 pub fn enterTrapFrame(frame_ptr: u64) void {

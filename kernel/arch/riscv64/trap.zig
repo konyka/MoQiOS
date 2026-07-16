@@ -163,6 +163,10 @@ export fn trapHandler(frame: *TrapFrame) callconv(.c) *TrapFrame {
         if (sk27.isEnabled()) {
             return @ptrFromInt(sk27.onTimer(@intFromPtr(frame)));
         }
+        const sk28 = @import("../../shared/sk28.zig");
+        if (sk28.isEnabled()) {
+            return @ptrFromInt(sk28.onTimer(@intFromPtr(frame)));
+        }
         const sched = @import("sched.zig");
         return sched.onTimer(frame);
     }

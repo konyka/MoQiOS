@@ -211,6 +211,8 @@ pub const context_switch = struct {
     const USER_PROBE_TEXT_VA: usize = 0x00030000;
     const USER_PROBE_STACK_VA: usize = 0x00040000;
     const USER_PROBE_STACK_TOP: usize = USER_PROBE_STACK_VA + 4096;
+    const USER_PROBE_STACK1_VA: usize = 0x00050000;
+    const USER_PROBE_STACK1_TOP: usize = USER_PROBE_STACK1_VA + 4096;
 
     fn writeU32(page: [*]u8, off: usize, word: u32) void {
         page[off] = @truncate(word);
@@ -335,14 +337,38 @@ pub const context_switch = struct {
         return USER_PROBE_STACK_TOP;
     }
 
+    pub fn userProbeStackTop1() u64 {
+        return USER_PROBE_STACK1_TOP;
+    }
+
+    /// SK-28: text + two user stacks (shared busy-loop image, distinct SPs).
+    pub fn prepareDualUserIrqProbe() bool {
+        if (!prepareUserIrqProbe()) return false;
+        const pmm = @import("pmm.zig");
+        const sv39 = @import("sv39.zig");
+        const stack1_pa = pmm.allocPage() orelse return false;
+        if (!sv39.mapPage(USER_PROBE_STACK1_VA, stack1_pa, .{
+            .read = true,
+            .write = true,
+            .exec = false,
+            .user = true,
+        })) return false;
+        asm volatile ("sfence.vma" ::: .{ .memory = true });
+        return true;
+    }
+
     /// SK-15: arm stimecmp so shared preempt can take timer IRQs.
     /// Does not set sstatus.SIE — the TrapFrame SPIE bit enables IE after sret.
     pub fn armSharedPreemptTimer() void {
         @import("timer.zig").init(10_000); // ~1 ms at 10 MHz
     }
 
-    /// SK-15: `sret` into a TrapFrame (same resume protocol as enterSoftwareFrame).
+    /// SK-15/SK-28: `sret` into a TrapFrame (S-mode or U-mode).
+    /// For U-mode frames (SPP=0): arm sscratch and load user SP from the frame.
+    /// `sscratch` must be programmed *before* GPR restore — the frame load
+    /// clobbers the register holding `ksp`.
     pub fn enterTrapFrame(frame_ptr: u64) void {
+        const ksp = trap.userTrapStackTop();
         asm volatile (
             \\lla t0, 1f
             \\sd t0, 0(%[rpc])
@@ -352,6 +378,14 @@ pub const context_switch = struct {
             \\csrw sepc, t0
             \\ld t0, 272(sp)
             \\csrw sstatus, t0
+            // Program sscratch while %[ks] is still live (before GPR restore).
+            \\andi t1, t0, 0x100
+            \\bnez t1, 3f
+            \\csrw sscratch, %[ks]
+            \\j 4f
+            \\3:
+            \\csrw sscratch, zero
+            \\4:
             \\ld ra,   0(sp)
             \\ld gp,  16(sp)
             \\ld tp,  24(sp)
@@ -382,6 +416,14 @@ pub const context_switch = struct {
             \\ld t4, 224(sp)
             \\ld t5, 232(sp)
             \\ld t6, 240(sp)
+            // SPP? U → frame.sp; S → pop TrapFrame.
+            \\csrr t0, sstatus
+            \\andi t1, t0, 0x100
+            \\bnez t1, 2f
+            \\ld t0, 8(sp)
+            \\mv sp, t0
+            \\sret
+            \\2:
             \\addi sp, sp, 288
             \\sret
             \\1:
@@ -389,6 +431,7 @@ pub const context_switch = struct {
             : [f] "r" (frame_ptr),
               [rpc] "r" (@intFromPtr(&resume_pc)),
               [rsp] "r" (@intFromPtr(&resume_sp)),
+              [ks] "r" (ksp),
             : .{ .memory = true });
     }
 };

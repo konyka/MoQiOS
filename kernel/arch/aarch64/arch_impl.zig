@@ -204,6 +204,8 @@ pub const context_switch = struct {
     const USER_PROBE_TEXT_VA: usize = 0x00030000;
     const USER_PROBE_STACK_VA: usize = 0x00040000;
     const USER_PROBE_STACK_TOP: usize = USER_PROBE_STACK_VA + 4096;
+    const USER_PROBE_STACK1_VA: usize = 0x00050000;
+    const USER_PROBE_STACK1_TOP: usize = USER_PROBE_STACK1_VA + 4096;
 
     fn writeU32(page: [*]u8, off: usize, word: u32) void {
         page[off] = @truncate(word);
@@ -305,6 +307,20 @@ pub const context_switch = struct {
         return USER_PROBE_STACK_TOP;
     }
 
+    pub fn userProbeStackTop1() u64 {
+        return USER_PROBE_STACK1_TOP;
+    }
+
+    /// SK-28: text + two user stacks (shared busy-loop image, distinct SPs).
+    pub fn prepareDualUserIrqProbe() bool {
+        if (!prepareUserIrqProbe()) return false;
+        const pmm = @import("pmm.zig");
+        const a64pag = @import("paging.zig");
+        const stack1_pa = pmm.allocPage();
+        if (stack1_pa == 0) return false;
+        return a64pag.mapPage(USER_PROBE_STACK1_VA, stack1_pa, a64pag.F_WRITE | a64pag.F_USER);
+    }
+
     /// SK-15: init GICv3 + CNTV so shared preempt can take timer IRQs.
     /// Leaves CPU IRQs masked until TrapFrame spsr enables them on eret.
     pub fn armSharedPreemptTimer() void {
@@ -315,7 +331,8 @@ pub const context_switch = struct {
         gic.enableCpuIrq();
     }
 
-    /// SK-15: `eret` into a TrapFrame (same resume protocol as enterSoftwareFrame).
+    /// SK-15/SK-28: `eret` into a TrapFrame (kernel or EL0). Restores SP_EL0
+    /// from offset 168 so direct enter into a user frame is valid.
     pub fn enterTrapFrame(frame_ptr: u64) void {
         asm volatile (
             \\adr x0, 1f
@@ -326,6 +343,8 @@ pub const context_switch = struct {
             \\ldp x1, x2, [sp, #176]
             \\msr elr_el1, x1
             \\msr spsr_el1, x2
+            \\ldr x1, [sp, #168]
+            \\msr sp_el0, x1
             \\ldr x30, [sp, #160]
             \\ldp x18, x29, [sp, #144]
             \\ldp x16, x17, [sp, #128]
