@@ -12,9 +12,9 @@
 ## 0. 现状基线（移植起点 → 2026-07 更新）
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
-  **SK-8**…**SK-25**：facade、协作切换、IRQ 软件帧抢占、portable mm boot。
-  **SK-26（2026-07-16）**：U/EL0 开中断可见 timer IRQ（原生 TrapFrame，不抢占）；
-  探针 `[SK-26] user timer IRQ visible: OK`。
+  **SK-8**…**SK-26**：facade、协作切换、portable mm、用户态 IRQ 可见。
+  **SK-27（2026-07-16）**：内核线程↔用户任务原生 TrapFrame 抢占（含 aarch64 SP_EL0）；
+  探针 `[SK-27] user trapframe preempt: OK`。
   完整 `main.zig` / Limine 驱动仍未在非 x86 链接。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
@@ -285,6 +285,13 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **探针**：`[SK-26] user timer IRQ visible: OK`。
 - **后续**：SK-27 — 用户态原生 TrapFrame 抢占，或继续引导/`main` 收敛。
 
+### 3.24 SK-27 完成记录（2026-07-16）
+
+- **换帧**：复用 SK-15 的 `onTimer` 帧指针切换；`buildUserTrapFrame` 造 U/EL0 假帧。
+- **aarch64**：`vectors.S` IRQ 保存/恢复 `SP_EL0` → `TrapFrame.sp_el0`（勿用 frame+192）。
+- **探针**：K→U→U 被打断→完成；`[SK-27] user trapframe preempt: OK`。
+- **后续**：SK-28 — 继续引导/`main` 收敛，或双用户/共享调度接入用户抢占。
+
 ---
 
 ## 4. M8 进度（x86_64 SMP）
@@ -469,16 +476,16 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-26
-Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-26
+Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-27
+Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-27
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**SK-27** — 用户态原生 TrapFrame 抢占，或继续引导/`main` 收敛；
-> SK-1…SK-26 已完成。
+> 当前下一执行项：**SK-28** — 继续引导/`main` 收敛，或双用户/共享调度接入用户抢占；
+> SK-1…SK-27 已完成。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。

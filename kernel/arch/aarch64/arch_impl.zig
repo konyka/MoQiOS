@@ -284,6 +284,27 @@ pub const context_switch = struct {
         return frame_addr;
     }
 
+    /// SK-27: native TrapFrame that `eret`s into EL0 (spsr=0, sp_el0=user_sp).
+    pub fn buildUserTrapFrame(kstack_top: u64, entry: u64, user_sp: u64) u64 {
+        const asched = @import("sched.zig");
+        const frame_addr = (kstack_top - asched.FRAME_BYTES) & ~@as(u64, 15);
+        const frame: *asched.TrapFrame = @ptrFromInt(frame_addr);
+        const bytes: [*]u8 = @ptrCast(frame);
+        @memset(bytes[0..asched.FRAME_BYTES], 0);
+        frame.elr = entry;
+        frame.spsr = 0; // EL0t, DAIF clear
+        frame.sp_el0 = user_sp;
+        return frame_addr;
+    }
+
+    pub fn userProbeTextVa() u64 {
+        return USER_PROBE_TEXT_VA;
+    }
+
+    pub fn userProbeStackTop() u64 {
+        return USER_PROBE_STACK_TOP;
+    }
+
     /// SK-15: init GICv3 + CNTV so shared preempt can take timer IRQs.
     /// Leaves CPU IRQs masked until TrapFrame spsr enables them on eret.
     pub fn armSharedPreemptTimer() void {

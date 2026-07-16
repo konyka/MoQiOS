@@ -32,7 +32,8 @@ pub const TrapFrame = extern struct {
     x18: u64,
     x29: u64,
     x30: u64,
-    _pad: u64 = 0,
+    /// SK-27: saved/restored as SP_EL0 across IRQ preempt (offset 168).
+    sp_el0: u64 = 0,
     elr: u64,
     spsr: u64,
 };

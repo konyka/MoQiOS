@@ -311,6 +311,30 @@ pub const context_switch = struct {
         return frame_addr;
     }
 
+    /// SK-27: native TrapFrame that `sret`s into U-mode (SPP=0, SPIE=1).
+    pub fn buildUserTrapFrame(kstack_top: u64, entry: u64, user_sp: u64) u64 {
+        const frame_addr = (kstack_top - trap.FRAME_BYTES) & ~@as(u64, 15);
+        const frame: *trap.TrapFrame = @ptrFromInt(frame_addr);
+        const bytes: [*]u8 = @ptrCast(frame);
+        @memset(bytes[0..trap.FRAME_BYTES], 0);
+        frame.sepc = entry;
+        frame.sstatus = 1 << 5; // SPIE; SPP=0
+        frame.gp = asm volatile ("mv %[r], gp"
+            : [r] "=r" (-> u64));
+        frame.tp = asm volatile ("mv %[r], tp"
+            : [r] "=r" (-> u64));
+        frame.sp = user_sp;
+        return frame_addr;
+    }
+
+    pub fn userProbeTextVa() u64 {
+        return USER_PROBE_TEXT_VA;
+    }
+
+    pub fn userProbeStackTop() u64 {
+        return USER_PROBE_STACK_TOP;
+    }
+
     /// SK-15: arm stimecmp so shared preempt can take timer IRQs.
     /// Does not set sstatus.SIE — the TrapFrame SPIE bit enables IE after sret.
     pub fn armSharedPreemptTimer() void {

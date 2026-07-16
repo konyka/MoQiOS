@@ -70,6 +70,21 @@ pub fn buildKernelTrapFrame(stack_top: u64, entry: u64) u64 {
     return 0;
 }
 
+pub fn buildUserTrapFrame(kstack_top: u64, entry: u64, user_sp: u64) u64 {
+    _ = kstack_top;
+    _ = entry;
+    _ = user_sp;
+    return 0;
+}
+
+pub fn userProbeTextVa() u64 {
+    return 0;
+}
+
+pub fn userProbeStackTop() u64 {
+    return 0;
+}
+
 pub fn armSharedPreemptTimer() void {}
 
 pub fn enterTrapFrame(frame_ptr: u64) void {
