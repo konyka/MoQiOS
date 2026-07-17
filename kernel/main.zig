@@ -11,19 +11,16 @@ const idt = arch.interrupts;
 const paging = arch.paging;
 const lapic = arch.timer;
 const context_switch = arch.context_switch;
-const gdt = arch.gdt;
 const hhdm = @import("mm/hhdm.zig");
 const klog = @import("klog.zig");
 const acpi = @import("acpi/acpi_parser.zig");
-const symbol_table = @import("debug/symbol_table.zig");
-const tsc = arch.tsc;
 const pmm = @import("mm/pmm.zig");
 const task = @import("proc/task.zig");
 const sched = @import("proc/sched.zig");
-const syscall_entry = arch.syscall;
 const ramdisk = @import("fs/ramdisk.zig");
 const loader = @import("proc/loader.zig");
 const fmt = @import("lib/fmt.zig");
+const subsystem_boot = @import("shared/subsystem_boot.zig");
 
 pub const panic = @import("panic.zig").panic;
 
@@ -50,8 +47,10 @@ export fn _start() callconv(.c) noreturn {
         klog.logHex(.info, "HHDM offset: ", resp.offset);
     }
 
-    gdt.init();
-    klog.log(.info, "GDT loaded");
+    // SK-35: gdt + tsc + BSP GS_BASE via shared fragment (before IDT/FPU).
+    // GS is valid early for commonStub; smp/syscall re-set it later.
+    subsystem_boot.initCpuSurfaces();
+    klog.log(.info, "GDT/TSC/GS loaded");
 
     idt.init();
     klog.log(.info, "IDT loaded");
@@ -63,12 +62,6 @@ export fn _start() callconv(.c) noreturn {
     context_switch.initCpu();
     klog.log(.info, "FPU/SSE lazy switch armed (BSP)");
 
-    // M8-3: set the BSP's GS_BASE early so commonStub's per-CPU context-switch
-    // anchor (%gs:16 = PerCpu.saved_stack_anchor) is valid for any exception that
-    // fires during the rest of boot, before syscall_entry.init() runs. smp.init()
-    // and syscall_entry.init() re-set this idempotently.
-    syscall_entry.setPerCpuGsBase(0);
-
     // PS/2 keyboard driver
     const keyboard = @import("drivers/keyboard.zig");
     keyboard.init();
@@ -77,9 +70,8 @@ export fn _start() callconv(.c) noreturn {
     // skip for now, rely on serial output instead
     klog.log(.info, "VGA skipped (serial-only mode)");
 
-    // M1 additions: TSC, symbol table
-    tsc.init();
-    symbol_table.init();
+    // M1: symbol table (shared boot fragment — SK-35)
+    subsystem_boot.initSymbolTable();
     klog.log(.info, "Symbol table initialized");
 
     // M2: Physical Memory Manager
@@ -91,8 +83,7 @@ export fn _start() callconv(.c) noreturn {
     paging.init();
 
     // M2: Address space + DMA (shared portable mm boot — SK-25)
-    const subsystem_boot_mm = @import("shared/subsystem_boot.zig");
-    subsystem_boot_mm.initPortableMm();
+    subsystem_boot.initPortableMm();
 
     // ACPI — must come after paging init so we can map non-RAM regions
     var rsdp_phys: u64 = 0;
@@ -108,7 +99,7 @@ export fn _start() callconv(.c) noreturn {
     }
 
     // M2: Slab allocator (shared boot fragment — SK-32)
-    subsystem_boot_mm.initSlab();
+    subsystem_boot.initSlab();
 
     // Framebuffer graphics driver
     const framebuffer = @import("drivers/framebuffer.zig");
@@ -132,7 +123,7 @@ export fn _start() callconv(.c) noreturn {
 
     // M7: Block device abstraction layer — register all block devices
     // page_cache via shared boot fragment (SK-33)
-    subsystem_boot_mm.initPageCache();
+    subsystem_boot.initPageCache();
     const block_dev = @import("drivers/block_dev.zig");
     if (virtio_blk.hasActiveDisk()) {
         var vb_name: [16]u8 = @splat(0);
@@ -205,8 +196,8 @@ export fn _start() callconv(.c) noreturn {
     vfs.initWritebackCallbacks();
 
     // tmpfs + /dev/urandom (shared boot fragments — SK-34)
-    subsystem_boot_mm.initTmpfs();
-    subsystem_boot_mm.initRandom();
+    subsystem_boot.initTmpfs();
+    subsystem_boot.initRandom();
 
     // M3: LAPIC timer — use LAPIC address from ACPI MADT, fallback to 0xFEE00000
     const lapic_addr = if (acpi.info.lapic_address != 0) acpi.info.lapic_address else 0xFEE00000;
@@ -224,7 +215,6 @@ export fn _start() callconv(.c) noreturn {
     smp.init();
 
     // M4: IPC engine + capability system
-    const subsystem_boot = @import("shared/subsystem_boot.zig");
     subsystem_boot.initIpcAndSyscall();
     klog.log(.info, "IPC engine + capabilities + syscall entry initialized");
 

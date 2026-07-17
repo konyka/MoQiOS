@@ -18,11 +18,16 @@ pub const SymbolTable = struct {
 
 pub var table: SymbolTable = undefined;
 
+var initialized: bool = false;
+
 pub fn init() void {
+    // Idempotent: subsystem_boot / main / SK-35 may all call this.
+    if (initialized) return;
     table.count = 0;
     for (&table.symbols) |*sym| {
         sym.* = .{};
     }
+    initialized = true;
 }
 
 pub fn addSymbol(addr: u64, size: u32, name: []const u8) void {
