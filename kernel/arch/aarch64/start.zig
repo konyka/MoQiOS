@@ -189,7 +189,7 @@ export fn kmain(x0_dtb: usize) callconv(.c) noreturn {
     }
     putStr("  MMU enabled (identity map)\n");
 
-    // SK-32: shared announce ladder after MMU + SCTLR.A clear
+    // SK-32+: shared announce ladder (sk6..sk36) after MMU + SCTLR.A clear
     // (Zig Debug may emit `str q` for `?u64` inside sk6).
     @import("../../shared/sk_probes.zig").runPostMm(@intCast(share_base), @intCast(share_len));
 

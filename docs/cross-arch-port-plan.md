@@ -13,9 +13,9 @@
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
   **SK-8**…**SK-33**：facade、portable mm、时间片原生用户抢占、探针阶梯、slab/page_cache。
-  **SK-34**…**SK-35（2026-07-17）**：tmpfs/random@`arch.tsc`；`main` 接
-  `initCpuSurfaces`/`initSymbolTable`；探针
-  `[SK-35] shared cpu surfaces+symbol table: OK`。
+  **SK-34**…**SK-36（2026-07-17）**：tmpfs/random、`initCpuSurfaces`/symbol_table、
+  探针阶梯收尾（清 current + disarm timer）；探针
+  `[SK-36] probe ladder cleanup: OK`。
   完整 `main.zig` / Limine 驱动仍未在非 x86 链接。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
@@ -363,7 +363,16 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **`subsystem_boot.initSymbolTable`**：幂等；并入 `initAll`。
 - **探针**：tsc 单调 + addSymbol/sort/lookup；
   `[SK-35] shared cpu surfaces+symbol table: OK`。
-- **后续**：SK-36 — 继续可移植片段（勿整文件搬迁 `main.zig`）。
+- **后续**：SK-36 — 探针阶梯收尾防 M6 误抢占。
+
+### 3.33 SK-36 完成记录（2026-07-17）
+
+- **隐患**：sk29/30 成功或 sk31 早期失败可能留下非空 `current` + 已武装 timer；
+  SK-31 fallthrough 会在后续 M6/`user.enter`（SPIE）上误抢占。
+- **方案**：`disarmSharedPreemptTimer`（riscv 清 STIE + 远 `stimecmp`；aarch64 停 CNTV）；
+  `finishUserIrqProbe` 清 `current`；`sk36` 在 `runPostMm` 末尾再清一次并验证。
+- **探针**：`[SK-36] probe ladder cleanup: OK`。
+- **后续**：SK-37 — 继续可移植片段 / BSS 瘦身（勿整文件搬迁）。
 
 ---
 
@@ -549,16 +558,16 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-35
-Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-35
+Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-36
+Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-36
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**SK-36** — 继续可移植引导片段收敛（勿整文件搬迁）；
-> SK-1…SK-35 已完成。
+> 当前下一执行项：**SK-37** — 可移植片段 / 非 x86 BSS 瘦身（勿整文件搬迁）；
+> SK-1…SK-36 已完成。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。

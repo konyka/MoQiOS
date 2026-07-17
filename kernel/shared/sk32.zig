@@ -1,7 +1,7 @@
 //! SK-32 — shared SK probe ladder + slab boot fragment.
 //!
-//! Proves `sk_probes.runPostMm` ends here and `subsystem_boot.initSlab`
-//! matches `main.zig`'s M2 slab call (idempotent after SK-6).
+//! Proves `subsystem_boot.initSlab` matches `main.zig`'s M2 slab call
+//! (idempotent after SK-6). Ladder continues through SK-36 cleanup.
 
 const arch = @import("../arch/arch.zig");
 const subsystem_boot = @import("subsystem_boot.zig");

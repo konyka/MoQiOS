@@ -10,7 +10,7 @@ pub fn runEarly() void {
     @import("sk4.zig").announce();
 }
 
-/// After shared mm carve: sk6(arena) then sk7..sk35.
+/// After shared mm carve: sk6(arena) then sk7..sk36 (cleanup last).
 pub fn runPostMm(phys_base: u64, length: u64) void {
     @import("sk6.zig").announce(phys_base, length);
     @import("sk7.zig").announce();
@@ -41,4 +41,5 @@ pub fn runPostMm(phys_base: u64, length: u64) void {
     @import("sk33.zig").announce();
     @import("sk34.zig").announce();
     @import("sk35.zig").announce();
+    @import("sk36.zig").announce();
 }

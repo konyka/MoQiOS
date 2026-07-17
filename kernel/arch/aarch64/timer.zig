@@ -70,6 +70,11 @@ pub fn init(interval_ns: u64) void {
     writeCntvCtl(1); // ENABLE, IMASK=0
 }
 
+/// SK-36: stop CNTV after the shared probe ladder (M9-4+ re-inits).
+pub fn disarm() void {
+    writeCntvCtl(0);
+}
+
 pub fn freqHz() u64 {
     return readCntfrq();
 }

@@ -179,7 +179,7 @@ export fn kmain(hartid: usize, dtb: usize) callconv(.c) noreturn {
     }
     putStr("  satp Sv39 enabled (identity map)\n");
 
-    // SK-32: shared announce ladder (sk6..sk32).
+    // SK-32+: shared announce ladder (sk6..sk36 cleanup).
     @import("../../shared/sk_probes.zig").runPostMm(@intCast(share_base), @intCast(share_len));
 
     // Map a fresh page at a non-identity VA, write/read, then unmap + #PF.

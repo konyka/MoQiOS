@@ -278,6 +278,8 @@ pub const context_switch = struct {
 
     /// SK-26: leave U-mode probe and return to `enterUserIrqProbe` caller.
     pub fn finishUserIrqProbe() noreturn {
+        // Drop scheduler current so SK-31 fallthrough cannot preempt M6.
+        @import("../../proc/sched.zig").setCurrentTaskIndex(null);
         asm volatile ("csrw sscratch, zero");
         asm volatile ("csrci sstatus, 2"); // clear SIE
         resumeAfterSoftwareEnter();
@@ -383,6 +385,11 @@ pub const context_switch = struct {
     /// Does not set sstatus.SIE — the TrapFrame SPIE bit enables IE after sret.
     pub fn armSharedPreemptTimer() void {
         @import("timer.zig").init(10_000); // ~1 ms at 10 MHz
+    }
+
+    /// SK-36: clear STIE + far stimecmp after shared user-IRQ probes.
+    pub fn disarmSharedPreemptTimer() void {
+        @import("timer.zig").disarm();
     }
 
     /// SK-15/SK-28: `sret` into a TrapFrame (S-mode or U-mode).

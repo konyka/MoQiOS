@@ -105,6 +105,8 @@ pub fn relocateNativeTrapFrame(frame_ptr: u64, kstack_base: u64, kstack_top: u64
 
 pub fn armSharedPreemptTimer() void {}
 
+pub fn disarmSharedPreemptTimer() void {}
+
 pub fn enterTrapFrame(frame_ptr: u64) void {
     _ = frame_ptr;
 }

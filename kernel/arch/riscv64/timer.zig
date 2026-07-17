@@ -32,6 +32,16 @@ pub fn init(interval: u64) void {
     armNext();
 }
 
+/// SK-36: stop shared-preempt timer IRQs after the probe ladder.
+pub fn disarm() void {
+    asm volatile ("csrc sie, %[b]"
+        :
+        : [b] "r" (STIE),
+        : .{ .memory = true });
+    // Far-future deadline so a stale compare cannot fire if STIE is re-enabled.
+    writeStimecmp(~@as(u64, 0));
+}
+
 pub fn setHook(h: *const fn () void) void {
     hook = h;
 }

@@ -256,6 +256,8 @@ pub const context_switch = struct {
 
     /// SK-26: leave EL0 probe and return to `enterUserIrqProbe` caller.
     pub fn finishUserIrqProbe() noreturn {
+        // Drop scheduler current so SK-31 fallthrough cannot preempt later EL0.
+        @import("../../proc/sched.zig").setCurrentTaskIndex(null);
         @import("gic.zig").disableCpuIrq();
         resumeAfterSoftwareEnter();
     }
@@ -353,6 +355,12 @@ pub const context_switch = struct {
         @import("timer.zig").init(0);
         // Distributor/CPU iface ready; DAIF.I still set until eret from enterTrapFrame.
         gic.enableCpuIrq();
+    }
+
+    /// SK-36: stop CNTV and mask CPU IRQs after shared user-IRQ probes.
+    pub fn disarmSharedPreemptTimer() void {
+        @import("timer.zig").disarm();
+        @import("gic.zig").disableCpuIrq();
     }
 
     /// SK-15/SK-28: `eret` into a TrapFrame (kernel or EL0). Restores SP_EL0
