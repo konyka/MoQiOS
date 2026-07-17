@@ -12,9 +12,9 @@
 ## 0. 现状基线（移植起点 → 2026-07 更新）
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
-  **SK-8**…**SK-32**：facade、portable mm、时间片原生用户抢占、探针阶梯、slab 引导。
-  **SK-33（2026-07-17）**：`subsystem_boot.initPageCache` 与 `main.zig` 对齐；
-  探针 `[SK-33] shared page_cache boot: OK`。
+  **SK-8**…**SK-33**：facade、portable mm、时间片原生用户抢占、探针阶梯、slab/page_cache。
+  **SK-34（2026-07-17）**：`initTmpfs`/`initRandom`；`random` 经 `arch.tsc.read` 取熵；
+  探针 `[SK-34] shared tmpfs+random boot: OK`。
   完整 `main.zig` / Limine 驱动仍未在非 x86 链接。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
@@ -347,6 +347,14 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **探针**：insertOwned → read hit → invalidate；`[SK-33] shared page_cache boot: OK`。
 - **后续**：SK-34 — 继续可移植引导片段（如 `tmpfs` / `random`@`arch.tsc`），勿整文件搬迁。
 
+### 3.31 SK-34 完成记录（2026-07-17）
+
+- **`subsystem_boot.initTmpfs` / `initRandom`**：与 `main.zig` 对齐；二者 init 幂等并入 `initAll`。
+- **`random`**：去掉内联 `rdtsc`，改用 `arch.tsc.read`（riscv `rdtime` / aarch64 `cntvct`）。
+- **探针**：tmpfs open/write/read/unlink + 两次 getRandom 不相等；
+  `[SK-34] shared tmpfs+random boot: OK`。
+- **后续**：SK-35 — 继续可移植片段（如 `main` 接 `initCpuSurfaces`、symbol_table），勿整文件搬迁。
+
 ---
 
 ## 4. M8 进度（x86_64 SMP）
@@ -531,16 +539,16 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-33
-Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-33
+Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-34
+Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-34
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**SK-34** — 继续可移植引导片段（tmpfs / random@arch.tsc 等）；
-> SK-1…SK-33 已完成。
+> 当前下一执行项：**SK-35** — 继续可移植片段（`main`↔`initCpuSurfaces` / symbol_table 等）；
+> SK-1…SK-34 已完成。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。

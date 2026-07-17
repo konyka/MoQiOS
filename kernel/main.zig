@@ -204,13 +204,9 @@ export fn _start() callconv(.c) noreturn {
     const vfs = @import("fs/vfs.zig");
     vfs.initWritebackCallbacks();
 
-    // tmpfs in-memory filesystem
-    const tmpfs = @import("fs/tmpfs.zig");
-    tmpfs.init();
-
-    // /dev/urandom PRNG
-    const random = @import("drivers/random.zig");
-    random.init();
+    // tmpfs + /dev/urandom (shared boot fragments — SK-34)
+    subsystem_boot_mm.initTmpfs();
+    subsystem_boot_mm.initRandom();
 
     // M3: LAPIC timer — use LAPIC address from ACPI MADT, fallback to 0xFEE00000
     const lapic_addr = if (acpi.info.lapic_address != 0) acpi.info.lapic_address else 0xFEE00000;

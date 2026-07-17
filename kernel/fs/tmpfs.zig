@@ -29,6 +29,7 @@ var entries: [MAX_FILES]TmpfsEntry = undefined;
 var active_bm: u64 = 0; // Bitmap: bit i = entries[i].active
 var tmpfs_lock: IrqSpinlock = .{};
 var next_ctime: u64 = 1;
+var initialized: bool = false;
 
 inline fn bmSet(idx: u6) void {
     active_bm |= @as(u64, 1) << idx;
@@ -127,6 +128,8 @@ fn resolvePath(path: []const u8, out_name: *[MAX_NAME_LEN]u8, out_name_len: *u8)
 }
 
 pub fn init() void {
+    // Idempotent: subsystem_boot / main / SK-34 may all call this.
+    if (initialized) return;
     for (0..MAX_FILES) |i| {
         entries[i] = .{
             .active = false,
@@ -160,6 +163,7 @@ pub fn init() void {
     };
     entries[0].name[0] = '/';
     active_bm = 1; // bit 0 = root
+    initialized = true;
 }
 
 /// Open a file under /tmp/. Creates if it does not exist.

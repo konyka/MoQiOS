@@ -1,5 +1,7 @@
 /// /dev/urandom-style high-performance PRNG using xoshiro256**.
+/// Entropy seed via `arch.tsc.read` (SK-34) — portable across x86/riscv/aarch64.
 
+const arch = @import("../arch/arch.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 // xoshiro256** state (256 bit)
@@ -8,11 +10,14 @@ var initialized: bool = false;
 var rng_lock: IrqSpinlock = .{};
 
 pub fn init() void {
-    // Collect entropy seeds from rdtsc
-    state[0] = readTsc() ^ 0x9E3779B97F4A7C15;
-    state[1] = readTsc() ^ 0x6A09E667F3BCC908;
-    state[2] = readTsc() ^ 0xBB67AE8584CAA73B;
-    state[3] = readTsc() ^ 0x3C6EF372FE94F82B;
+    // Idempotent: subsystem_boot / main / SK-34 may all call this.
+    if (initialized) return;
+
+    // Collect entropy seeds from the arch monotonic counter.
+    state[0] = arch.tsc.read() ^ 0x9E3779B97F4A7C15;
+    state[1] = arch.tsc.read() ^ 0x6A09E667F3BCC908;
+    state[2] = arch.tsc.read() ^ 0xBB67AE8584CAA73B;
+    state[3] = arch.tsc.read() ^ 0x3C6EF372FE94F82B;
 
     // Warm-up: skip first 16 outputs
     for (0..16) |_| {
@@ -33,16 +38,6 @@ fn next() u64 {
     state[2] ^= t;
     state[3] = (state[3] << 45) | (state[3] >> 19);
     return result;
-}
-
-fn readTsc() u64 {
-    var lo: u32 = undefined;
-    var hi: u32 = undefined;
-    asm volatile ("rdtsc"
-        : [lo] "={eax}" (lo),
-          [hi] "={edx}" (hi),
-    );
-    return (@as(u64, hi) << 32) | lo;
 }
 
 /// Fill a kernel buffer with random bytes.
