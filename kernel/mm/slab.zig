@@ -49,6 +49,8 @@ var pools: [NUM_CLASSES]SlabPool = undefined;
 var initialized: bool = false;
 
 pub fn init() void {
+    // Idempotent: SK-6 / subsystem_boot / main may all call this.
+    if (initialized) return;
     for (0..NUM_CLASSES) |i| {
         const payload_size = SIZE_CLASSES[i];
         // Total slot size: header + payload, aligned to 8 bytes

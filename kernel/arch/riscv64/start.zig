@@ -96,9 +96,7 @@ fn sbiShutdown() void {
 
 export fn kmain(hartid: usize, dtb: usize) callconv(.c) noreturn {
     uart.init();
-    @import("../../shared/sk2.zig").announce();
-    @import("../../shared/sk3.zig").announce();
-    @import("../../shared/sk4.zig").announce();
+    @import("../../shared/sk_probes.zig").runEarly();
     putStr("MoQiOS riscv64: M3 bring-up (PMM + Sv39)\n");
 
     putStr("  hartid=");
@@ -181,31 +179,8 @@ export fn kmain(hartid: usize, dtb: usize) callconv(.c) noreturn {
     }
     putStr("  satp Sv39 enabled (identity map)\n");
 
-    sk6.announce(@intCast(share_base), @intCast(share_len));
-    @import("../../shared/sk7.zig").announce();
-    @import("../../shared/sk8.zig").announce();
-    @import("../../shared/sk9.zig").announce();
-    @import("../../shared/sk10.zig").announce();
-    @import("../../shared/sk11.zig").announce();
-    @import("../../shared/sk12.zig").announce();
-    @import("../../shared/sk13.zig").announce();
-    @import("../../shared/sk14.zig").announce();
-    @import("../../shared/sk15.zig").announce();
-    @import("../../shared/sk17.zig").announce();
-    @import("../../shared/sk18.zig").announce();
-    @import("../../shared/sk19.zig").announce();
-    @import("../../shared/sk20.zig").announce();
-    @import("../../shared/sk21.zig").announce();
-    @import("../../shared/sk22.zig").announce();
-    @import("../../shared/sk23.zig").announce();
-    @import("../../shared/sk24.zig").announce();
-    @import("../../shared/sk25.zig").announce();
-    @import("../../shared/sk26.zig").announce();
-    @import("../../shared/sk27.zig").announce();
-    @import("../../shared/sk28.zig").announce();
-    @import("../../shared/sk29.zig").announce();
-    @import("../../shared/sk30.zig").announce();
-    @import("../../shared/sk31.zig").announce();
+    // SK-32: shared announce ladder (sk6..sk32).
+    @import("../../shared/sk_probes.zig").runPostMm(@intCast(share_base), @intCast(share_len));
 
     // Map a fresh page at a non-identity VA, write/read, then unmap + #PF.
     const test_va: usize = 0x40000000;

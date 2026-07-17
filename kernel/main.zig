@@ -18,7 +18,6 @@ const acpi = @import("acpi/acpi_parser.zig");
 const symbol_table = @import("debug/symbol_table.zig");
 const tsc = arch.tsc;
 const pmm = @import("mm/pmm.zig");
-const slab = @import("mm/slab.zig");
 const task = @import("proc/task.zig");
 const sched = @import("proc/sched.zig");
 const syscall_entry = arch.syscall;
@@ -108,8 +107,8 @@ export fn _start() callconv(.c) noreturn {
         serial.writeString(" CPUs detected\n");
     }
 
-    // M2: Slab allocator (kernel heap)
-    slab.init();
+    // M2: Slab allocator (shared boot fragment — SK-32)
+    subsystem_boot_mm.initSlab();
 
     // Framebuffer graphics driver
     const framebuffer = @import("drivers/framebuffer.zig");
