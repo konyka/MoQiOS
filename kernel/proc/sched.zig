@@ -894,6 +894,15 @@ pub fn nativeTrapFramePreempt(frame_ptr: u64) ?u64 {
     return next.saved_rsp;
 }
 
+/// SK-30: account one hardware timer tick; when the timeslice expires, preempt
+/// via native TrapFrame switch (not software `preemptFromIrq`).
+/// Returns `null` when the slice has not expired (caller resumes same frame).
+pub fn nativeUserTimerPreempt(frame_ptr: u64) ?u64 {
+    if (!hardwareTimerTick()) return null;
+    setSlice(TIMESLICE_TICKS);
+    return nativeTrapFramePreempt(frame_ptr);
+}
+
 // ---------------------------------------------------------------------------
 // Dynamic priority / nice support
 // ---------------------------------------------------------------------------

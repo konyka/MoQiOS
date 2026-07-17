@@ -10,7 +10,10 @@ const pmm = @import("../mm/pmm.zig");
 const slab = @import("../mm/slab.zig");
 const fmt_core = @import("../lib/fmt_core.zig");
 
-pub const SHARE_BYTES: usize = 4 * 1024 * 1024;
+/// Shared PMM arena carved above the kernel image (identity-mapped).
+/// Sized for the growing SK probe ladder: each non-x86 kernel thread takes a
+/// contiguous 32-page stack from this arena (SK-30 exhaustion at 4 MiB).
+pub const SHARE_BYTES: usize = 8 * 1024 * 1024;
 
 /// `phys_base`/`length` must be identity-mapped and excluded from arch PMM.
 pub fn announce(phys_base: u64, length: u64) void {
