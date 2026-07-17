@@ -1,7 +1,7 @@
-//! Shared SK announce ladder for non-x86 bring-up (SK-32).
+//! Shared SK announce ladder for non-x86 bring-up (SK-32+).
 //!
 //! Keeps riscv64/aarch64 `start.zig` in sync: early probes before the shared
-//! PMM carve, then sk6..sk32 after identity map + arena are live.
+//! PMM carve, then sk6..skN after identity map + arena are live.
 
 /// Before arch PMM / MMU bring-up (serial + shared fmt only).
 pub fn runEarly() void {
@@ -10,7 +10,7 @@ pub fn runEarly() void {
     @import("sk4.zig").announce();
 }
 
-/// After shared mm carve: sk6(arena) then sk7..sk32.
+/// After shared mm carve: sk6(arena) then sk7..sk33.
 pub fn runPostMm(phys_base: u64, length: u64) void {
     @import("sk6.zig").announce(phys_base, length);
     @import("sk7.zig").announce();
@@ -38,4 +38,5 @@ pub fn runPostMm(phys_base: u64, length: u64) void {
     @import("sk30.zig").announce();
     @import("sk31.zig").announce();
     @import("sk32.zig").announce();
+    @import("sk33.zig").announce();
 }

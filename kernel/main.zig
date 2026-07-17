@@ -131,8 +131,8 @@ export fn _start() callconv(.c) noreturn {
     nvme.init();
 
     // M7: Block device abstraction layer — register all block devices
-    const page_cache = @import("fs/page_cache.zig");
-    page_cache.init();
+    // page_cache via shared boot fragment (SK-33)
+    subsystem_boot_mm.initPageCache();
     const block_dev = @import("drivers/block_dev.zig");
     if (virtio_blk.hasActiveDisk()) {
         var vb_name: [16]u8 = @splat(0);

@@ -107,8 +107,12 @@ var cache_lock: IrqSpinlock = .{};
 var cache_hits: u64 = 0;
 var cache_misses: u64 = 0;
 
+var initialized: bool = false;
+
 /// Initialize the page cache.
+/// Idempotent: subsystem_boot / main / SK-33 may all call this.
 pub fn init() void {
+    if (initialized) return;
     // Initialize all pages as free
     for (0..MAX_PAGES) |i| {
         pages[i].valid = false;
@@ -130,6 +134,8 @@ pub fn init() void {
     cache_hits = 0;
     cache_misses = 0;
     for (0..INODE_LIST_SLOTS) |i| inode_list_heads[i] = null;
+    for (0..CACHE_SLOTS) |i| hash_buckets[i] = null;
+    initialized = true;
 }
 
 /// Hash function for cache key.
