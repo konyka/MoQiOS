@@ -12,9 +12,9 @@
 ## 0. 现状基线（移植起点 → 2026-07 更新）
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
-  **SK-8**…**SK-29**：facade、portable mm、sched 驱动原生用户抢占。
-  **SK-30（2026-07-17）**：时间片到期 → `nativeUserTimerPreempt`（非软件帧）；
-  探针 `[SK-30] timeslice native-user preempt: OK`。
+  **SK-8**…**SK-30**：facade、portable mm、时间片原生用户抢占。
+  **SK-31（2026-07-17）**：arch timer 默认 fallthrough → `nativeUserTimerPreempt`；
+  探针 `[SK-31] default timer native-user preempt: OK`。
   完整 `main.zig` / Limine 驱动仍未在非 x86 链接。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
@@ -323,6 +323,15 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **附带**：SK-6 `SHARE_BYTES` 4→8 MiB，避免探针阶梯耗尽 arena 后 M5/`sk16` 栈 OOM。
 - **后续**：SK-31 — 引导/`main` 收敛，或常驻路径把 arch timer 接到 `nativeUserTimerPreempt`。
 
+### 3.28 SK-31 完成记录（2026-07-17）
+
+- **常驻 fallthrough**：trap 在 sk15..sk30 之后调用 `sk31.onDefaultTimer`（**无**
+  `isEnabled` 旁路）；M5/M9-7 仍由早期 `sk16.isEnabled` 截获。
+- **守卫**：仅 U/EL0 + `currentTaskIndex != null` 时调用 `nativeUserTimerPreempt`，
+  避免干扰 M6 裸 `user.enter`。
+- **探针**：与生产同路径；`[SK-31] default timer native-user preempt: OK`。
+- **后续**：SK-32 — `runSharedSkProbes` 阶梯 / slab 引导收敛。
+
 ---
 
 ## 4. M8 进度（x86_64 SMP）
@@ -507,16 +516,16 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-30
-Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-30
+Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-31
+Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-31
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**SK-31** — 引导/`main` 收敛，或常驻 timer→`nativeUserTimerPreempt`；
-> SK-1…SK-30 已完成。
+> 当前下一执行项：**SK-32** — `runSharedSkProbes` 阶梯 / slab 引导收敛；
+> SK-1…SK-31 已完成。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。

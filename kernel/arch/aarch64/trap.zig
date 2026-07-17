@@ -134,11 +134,9 @@ export fn trapHandleIrq(frame: *anyopaque) callconv(.c) usize {
         if (sk30.isEnabled()) {
             return sk30.onTimer(@intFromPtr(frame));
         }
-        const sched = @import("sched.zig");
-        if (sched.isEnabled()) {
-            const tf: *sched.TrapFrame = @ptrCast(@alignCast(frame));
-            return @intFromPtr(sched.onTimer(tf));
-        }
+        // SK-31: default fallthrough when sk15..sk30 (and early sk16) are off.
+        const sk31 = @import("../../shared/sk31.zig");
+        return sk31.onDefaultTimer(@intFromPtr(frame));
     }
     return @intFromPtr(frame);
 }

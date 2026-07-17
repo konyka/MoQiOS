@@ -175,8 +175,9 @@ export fn trapHandler(frame: *TrapFrame) callconv(.c) *TrapFrame {
         if (sk30.isEnabled()) {
             return @ptrFromInt(sk30.onTimer(@intFromPtr(frame)));
         }
-        const sched = @import("sched.zig");
-        return sched.onTimer(frame);
+        // SK-31: default fallthrough (also covers M5 when sk16 is disabled).
+        const sk31 = @import("../../shared/sk31.zig");
+        return @ptrFromInt(sk31.onDefaultTimer(@intFromPtr(frame)));
     }
 
     if (!interrupt and code == Cause.ecall_from_u) {
