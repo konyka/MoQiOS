@@ -23,8 +23,16 @@ pub const interrupts = struct {
     pub fn init() void {
         @import("trap.zig").init();
     }
-    pub fn enableIrq() void {}
-    pub fn disableIrq() void {}
+    /// Unmask IRQs at EL1 (clear DAIF.I). Symmetric with riscv64 sstatus.SIE
+    /// so shared SK probes get real mask/unmask semantics on both arches.
+    pub fn enableIrq() void {
+        asm volatile ("msr daifclr, #2" ::: .{ .memory = true });
+    }
+
+    /// Mask IRQs at EL1 (set DAIF.I) so shared probe setup runs atomically.
+    pub fn disableIrq() void {
+        asm volatile ("msr daifset, #2" ::: .{ .memory = true });
+    }
 
     /// Software interrupt frame for shared `sched` (SK-13).
     /// Field names mirror x86_64 so `setupInitialFrame` is portable; the
@@ -221,13 +229,26 @@ pub const context_switch = struct {
         const text_pa = pmm.allocPage();
         if (text_pa == 0) return false;
         const stack_pa = pmm.allocPage();
-        if (stack_pa == 0) return false;
+        if (stack_pa == 0) {
+            pmm.freePage(text_pa);
+            return false;
+        }
         const page: [*]u8 = @ptrFromInt(text_pa);
         @memset(page[0..4096], 0);
         writeU32(page, 0, 0xD503207F); // wfi
         writeU32(page, 4, 0x17FFFFFF); // b -4
-        return a64pag.mapPage(USER_PROBE_TEXT_VA, text_pa, a64pag.F_EXEC | a64pag.F_USER) and
-            a64pag.mapPage(USER_PROBE_STACK_VA, stack_pa, a64pag.F_WRITE | a64pag.F_USER);
+        if (!a64pag.mapPage(USER_PROBE_TEXT_VA, text_pa, a64pag.F_EXEC | a64pag.F_USER)) {
+            pmm.freePage(text_pa);
+            pmm.freePage(stack_pa);
+            return false;
+        }
+        if (!a64pag.mapPage(USER_PROBE_STACK_VA, stack_pa, a64pag.F_WRITE | a64pag.F_USER)) {
+            a64pag.unmapPage(USER_PROBE_TEXT_VA);
+            pmm.freePage(text_pa);
+            pmm.freePage(stack_pa);
+            return false;
+        }
+        return true;
     }
 
     /// SK-26: `eret` into EL0 with IRQs unmasked (spsr=0). Saves resume slot.
@@ -344,7 +365,11 @@ pub const context_switch = struct {
         const a64pag = @import("paging.zig");
         const stack1_pa = pmm.allocPage();
         if (stack1_pa == 0) return false;
-        return a64pag.mapPage(USER_PROBE_STACK1_VA, stack1_pa, a64pag.F_WRITE | a64pag.F_USER);
+        if (!a64pag.mapPage(USER_PROBE_STACK1_VA, stack1_pa, a64pag.F_WRITE | a64pag.F_USER)) {
+            pmm.freePage(stack1_pa);
+            return false;
+        }
+        return true;
     }
 
     /// SK-15: init GICv3 + CNTV so shared preempt can take timer IRQs.

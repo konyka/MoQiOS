@@ -226,7 +226,10 @@ pub const context_switch = struct {
         const pmm = @import("pmm.zig");
         const sv39 = @import("sv39.zig");
         const text_pa = pmm.allocPage() orelse return false;
-        const stack_pa = pmm.allocPage() orelse return false;
+        const stack_pa = pmm.allocPage() orelse {
+            pmm.freePage(text_pa);
+            return false;
+        };
         const page: [*]u8 = @ptrFromInt(text_pa);
         @memset(page[0..4096], 0);
         // U-mode cannot execute WFI (illegal insn on virt); busy-loop instead.
@@ -237,12 +240,22 @@ pub const context_switch = struct {
             .write = false,
             .exec = true,
             .user = true,
-        }) or !sv39.mapPage(USER_PROBE_STACK_VA, stack_pa, .{
+        })) {
+            pmm.freePage(text_pa);
+            pmm.freePage(stack_pa);
+            return false;
+        }
+        if (!sv39.mapPage(USER_PROBE_STACK_VA, stack_pa, .{
             .read = true,
             .write = true,
             .exec = false,
             .user = true,
-        })) return false;
+        })) {
+            sv39.unmapPage(USER_PROBE_TEXT_VA);
+            pmm.freePage(text_pa);
+            pmm.freePage(stack_pa);
+            return false;
+        }
         asm volatile ("sfence.vma" ::: .{ .memory = true });
         return true;
     }
@@ -376,7 +389,10 @@ pub const context_switch = struct {
             .write = true,
             .exec = false,
             .user = true,
-        })) return false;
+        })) {
+            pmm.freePage(stack1_pa);
+            return false;
+        }
         asm volatile ("sfence.vma" ::: .{ .memory = true });
         return true;
     }
