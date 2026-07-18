@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-14 (SMP stack-remap race fixed and stress-verified)
+> Last update: 2026-07-18 (native-preempt hot path, aarch64 IRQ masking, and probe failure cleanup reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -348,7 +348,34 @@ shared-trampoline teardown fixes. **Doc drift fixed 2026-07-11**: primary docs n
 `init.S` auto-sequence ends at `hello21` (shell next); `hello22`–`hello28` are manual. riscv64
 console docs updated from SBI putchar to UART16550 (M2).
 
-### 5.2 Historical Verification
+### 5.2 Review Update: 2026-07-18
+
+This review re-ran the current runtime gates and inspected the shared native-user preemption path,
+aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault recovery.
+
+| Area | Finding | Resolution / status |
+|---|---|---|
+| Native preemption | `nativeTrapFramePreempt` relocated the live TrapFrame before confirming that another task was ready; the no-switch path did unnecessary work and a bad next-task lookup could follow a state mutation. | Fixed: choose and validate the next task first; relocate only before enqueueing an actual switch. This preserves the steal-safe `saved_rsp` ordering while removing needless frame copies. |
+| Default timer path | `sk31.onDefaultTimer` read `currentTaskIndex()` twice for each user-mode timer interrupt. | Fixed: capture it once and reuse it for the probe accounting path. |
+| aarch64 IRQ masking | `arch.interrupts.enableIrq` and `disableIrq` were no-ops, unlike riscv64 `sstatus.SIE`, so shared probe setup could not enforce its masked critical section. | Fixed: use `daifclr #2` / `daifset #2` for the DAIF.I bit. aarch64 QEMU smoke passed with real masking. |
+| Probe allocation failures | aarch64 and riscv64 user-IRQ probe setup leaked newly allocated pages when the second allocation or a mapping failed. | Fixed: unmap and free every allocation on every failure path. |
+| User-copy fault recovery | `kernel/mm/copy_from_user.zig` still records the need for an assembly RIP-range fault-recovery guard. | Open P0: needs a separately designed exception-table/recovery implementation and fault-injection coverage. |
+| Fork FD ownership | `kernel/proc/fork.zig` copies socket/epoll/eventfd/timerfd/unix-socket descriptors without the required refcount ownership work. | Open P0: needs per-object ownership semantics and fork/close regression coverage. |
+| Scale limits | Static task-table bitmap scans, page-cache clock sweeps, and ext2 directory scans remain linear in their respective structures. | Open P1: profile before replacing bounded structures; no speculative data-structure rewrite in this maintenance pass. |
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build test` | Passed | Host helper tests. |
+| `zig build` | Passed | x86_64 kernel, userspace programs, and AP trampoline. |
+| `zig build -Darch=riscv64` | Passed | riscv64 build. |
+| `zig build -Darch=aarch64` | Passed | aarch64 build with real DAIF IRQ masking. |
+| `zig build smoke` | Passed | x86_64 reached `hello21 done` and `MoQiOS shell` with `MOQI_SMP=1`. |
+| `zig build smoke-smp` | Passed | x86_64 reached the same markers with `MOQI_SMP=2`. |
+| `zig build smoke-smp-stress` | Passed | Five consecutive dual-core runs reached the shell. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Shared probe ladder, virtio, and U-mode smoke. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Shared probe ladder, default timer, EL0/SVC smoke. |
+
+### 5.3 Historical Verification
 
 Executed on 2026-06-21:
 
