@@ -874,20 +874,26 @@ pub fn preemptFromIrq(trap_frame_ptr: u64) noreturn {
 pub fn nativeTrapFramePreempt(frame_ptr: u64) ?u64 {
     const cur_idx = getCurrentIdx() orelse return null;
     const cur = task.getTask(cur_idx) orelse return null;
+
+    // Pick while current is still `.running` and not on the ready queue.
+    // Resolve `next` before mutating `cur`, so a bad pick cannot leave the
+    // running task marked `.ready` on the queue.
+    const next_idx = pickNext() orelse return null;
+    if (next_idx == cur_idx) return null;
+    const next = task.getTask(next_idx) orelse return null;
+
+    // Relocate only when a switch actually happens: the no-switch case above
+    // is the common idle path, and relocation may memcpy the live frame.
+    // Must precede `enqueue(cur)` so a stealing CPU sees a valid saved_rsp.
     cur.saved_rsp = context_switch.relocateNativeTrapFrame(
         frame_ptr,
         cur.kernel_stack,
         cur.kernel_stack_top,
     );
 
-    // Pick while current is still `.running` and not on the ready queue.
-    const next_idx = pickNext() orelse return null;
-    if (next_idx == cur_idx) return null;
-
     cur.state = .ready;
     enqueue(cur);
 
-    const next = task.getTask(next_idx) orelse return null;
     next.state = .running;
     setCurrentIdx(next_idx);
     setAnchor(next.saved_rsp);

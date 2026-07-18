@@ -23,14 +23,13 @@ var ran1: bool = false;
 pub fn onDefaultTimer(frame_ptr: u64) u64 {
     if (!arch.context_switch.irqFromUserMode(frame_ptr)) return frame_ptr;
     // Bare M6/M9-6 user.enter has no sched current — leave the frame alone.
-    if (sched.currentTaskIndex() == null) return frame_ptr;
+    // Single lookup: this is the production per-IRQ hot path.
+    const cur_idx = sched.currentTaskIndex() orelse return frame_ptr;
 
     if (probe_active and !done) {
         irq_ticks +%= 1;
-        if (sched.currentTaskIndex()) |cur| {
-            if (cur == idx0) ran0 = true;
-            if (cur == idx1) ran1 = true;
-        }
+        if (cur_idx == idx0) ran0 = true;
+        if (cur_idx == idx1) ran1 = true;
     }
 
     const next_frame = sched.nativeUserTimerPreempt(frame_ptr) orelse return frame_ptr;
