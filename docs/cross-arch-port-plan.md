@@ -484,6 +484,24 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   3. 专轮方向：审计 enqueue/steal/kick 全部路径，确保任务不可能同时
      位于两个 per-CPU 队列或"队列 + current"双重身份；考虑给 Task 加
      `on_cpu: i8` 断言字段在 debug 构建里捕获双跑。
+- **✅ 已修复（2026-07-19 专轮）——root cause: 唤醒即入队 + 拾取无双跑检查**：
+  1. 根因：`unblockTask`/`wakeOne`/`wakeAll` 在任务转 `.ready` 的**瞬间**
+     就 `enqueueTask` 入 per-CPU 队列，而此刻任务可能仍是宿主 CPU 的
+     `current_task_idx`（blocked 任务要等宿主 CPU 下一次 tick 才切走，
+     期间 cur_idx 不变）。另一 CPU 经队列 pop / steal / 位图扫描把它拾起
+     并置 `.running` → **同一任务、同一 kstack 同时活在两个 CPU 上**，
+     与追加证据 2 的 iretq #GP 形态完全吻合。
+  2. 修法（拾取侧统一设卡，唤醒侧语义不动）：
+     - `task.isCurrentOnOtherCpu(idx, my_cpu)`：扫 `percpu_array`，
+       判断任务是否仍是**其他** CPU 的 current；
+     - 位图路径 `considerReady` 跳过此类任务；
+     - 队列路径新增 `sched.popRunnable`：pop 循环中丢弃非 `.ready` 的
+       陈旧表项与仍双跑的任务（不回插——任务仍 `.ready`，宿主切走后
+       位图回退路径自然重拾），steal 后的本地 pop 也走同一函数。
+  3. 验证：三门禁 + `smoke-smp` + `smoke-smp-stress` 连续 6 轮
+     （= 30 次 SMP=2 全测试启动）零失败；修复前约每 2–4 轮必现一次。
+     形态 1/2（hello27 挂死 / 野跳 #PF）与形态 3 同根：双跑任务互相
+     覆写 kstack 上的返回地址与 IRQ 帧。P1 降级关闭。
 - **后续**：SK-42 — 继续可移植片段（sched/task 剩余 boot 片段收敛）。
 
 ---

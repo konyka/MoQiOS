@@ -464,17 +464,32 @@ fn pickNext() ?u32 {
     // skip enqueueTask).
     if (per_cpu.isAnyReady()) {
         const q = per_cpu.getCurrent();
-        if (q.pop()) |t| {
-            if (taskIndexOf(t)) |i| return i;
-        }
+        if (popRunnable(q)) |i| return i;
         const stolen = per_cpu.tryStealForCurrent();
         if (stolen > 0) {
-            if (q.pop()) |t| {
-                if (taskIndexOf(t)) |i| return i;
-            }
+            if (popRunnable(q)) |i| return i;
         }
     }
     return task.pickReadyForCpu(@intCast(currentCpuId()), getCurrentIdx());
+}
+
+/// Pop queue entries until one is actually runnable *here*. Wake paths
+/// (`unblockTask`/`wakeOne`/`wakeAll`) enqueue a task the moment it turns
+/// `.ready`, but its owner CPU may not have switched away yet — running it
+/// now would put one task (and one kernel stack) live on two CPUs at once
+/// (P1 SMP=2 stress crash: from-user IRQ frame at kstack top shredded by the
+/// second CPU's syscall entry). Skipped entries are NOT requeued: the task is
+/// still `.ready`, so the bitmap fallback rediscovers it once its owner CPU
+/// has moved on; stale non-ready entries are dropped the same way.
+fn popRunnable(q: *per_cpu.PerCpuRunQueue) ?u32 {
+    const my_cpu = currentCpuId();
+    while (q.pop()) |t| {
+        const i = taskIndexOf(t) orelse continue;
+        if (t.state != .ready) continue;
+        if (task.isCurrentOnOtherCpu(i, my_cpu)) continue;
+        return i;
+    }
+    return null;
 }
 
 /// v53.45: O(1) reverse lookup via Task.self_idx (set at creation time).

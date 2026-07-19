@@ -274,6 +274,9 @@ fn matchesCpu(t: *Task, cpu: u8) bool {
 fn considerReady(idx: u32, cpu: u8, best_idx: *?u32, best_prio: *u8) void {
     const t = getTask(idx) orelse return;
     if (t.state == .ready and matchesCpu(t, cpu) and t.priority < best_prio.*) {
+        // Never pick a task that another CPU is still running (see
+        // isCurrentOnOtherCpu) — its kstack/context are live over there.
+        if (isCurrentOnOtherCpu(idx, cpu)) return;
         best_prio.* = t.priority;
         best_idx.* = idx;
     }
@@ -625,6 +628,21 @@ fn isCurrentOnAnyCpu(idx: u32) bool {
     if (comptime builtin.cpu.arch != .x86_64) return false;
     const se = @import("../arch/x86_64/syscall_entry.zig");
     for (&se.percpu_array) |*pc| {
+        if (@atomicLoad(u32, &pc.current_task_idx, .acquire) == idx) return true;
+    }
+    return false;
+}
+
+/// True while a CPU other than `my_cpu` has `idx` as its current task.
+/// A woken (.ready) task can still be another CPU's current (e.g. a blocked
+/// waitpid parent keeps cur_idx until its CPU switches away). Picking it from
+/// here would run one task on two CPUs — two live contexts on one kernel
+/// stack. Pickers must skip such tasks; the owning CPU resumes them itself.
+pub fn isCurrentOnOtherCpu(idx: u32, my_cpu: u32) bool {
+    if (comptime builtin.cpu.arch != .x86_64) return false;
+    const se = @import("../arch/x86_64/syscall_entry.zig");
+    for (&se.percpu_array, 0..) |*pc, cpu| {
+        if (cpu == my_cpu) continue;
         if (@atomicLoad(u32, &pc.current_task_idx, .acquire) == idx) return true;
     }
     return false;
