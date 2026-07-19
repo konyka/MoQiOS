@@ -633,6 +633,28 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   需求接入），或启动上述 NIC/PCI 抽象层 / copy_from_user fixup 两个
   中型专项之一。
 
+### 3.45 NIC 发送 facade（2026-07-19，NIC 抽象层第一步）
+
+- **背景**：3.44 复盘点名网络栈的 x86 驱动耦合是非 x86 复用协议表的
+  前置障碍。第一个具体缺口是**发送路径**：`arp`/`ipv4`/`icmp`/`icmpv6`/
+  `tcp`/`udp`/`netif` 七处全部直接 `@import("drivers/e1000.zig")` 发帧，
+  即使机器只有 virtio-net（x86 上 `virtio_net.init()` 已跑）也永远发不
+  出——协议栈只认 e1000。
+- **方案**：新增 `net/nic.zig` 发送 facade（`sendPacket`/`getMAC`/
+  `isActive`），按 `isActive()` 分发到当前活动 NIC，e1000 优先、
+  virtio-net 兜底。六个协议文件的 TX 调用改走 facade（`arp`/`tcp`/`udp`/
+  `netif`/`icmp`/`icmpv6`）。RX 仍按驱动区分（e1000 由 raw_net/
+  socket_syscall `receivePacket` 轮询；virtio-net 自身路径直推
+  `net.handleRxPacket`），本步不动。
+- **效果**：x86 多 NIC 发送（仅 virtio-net 的机器现在也能发帧）；协议栈
+  发送路径不再硬绑单一驱动，为后续把协议表初始化与 e1000 收发彻底解耦、
+  在非 x86 复用共享网络栈铺路。仅 e1000 在场时（冒烟配置）行为完全不变。
+- **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress`（hello27 TCP 经
+  facade 收发）全绿。
+- **后续**：NIC 抽象层第二步——RX facade（统一轮询/中断两种投递）+ 把
+  `net/*` 与 `drivers/pci.zig`/ACPI 的文件级依赖切断，方能在非 x86 链接
+  协议表。
+
 ---
 
 ## 4. M8 进度（x86_64 SMP）
