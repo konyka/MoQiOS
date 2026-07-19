@@ -62,7 +62,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.signal_mask = parent.signal_mask;
     child.env_count = parent.env_count;
     for (0..parent.env_count) |i| {
-        @memcpy(child.env_vars[i][0..128], parent.env_vars[i][0..128]);
+        child.env_vars[i] = parent.env_vars[i];
     }
     @memcpy(child.cwd[0..256], parent.cwd[0..256]);
     child.cwd_len = parent.cwd_len;

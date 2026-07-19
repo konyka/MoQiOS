@@ -21,10 +21,11 @@ pub fn getpid() i64 {
 pub fn getenv(key_ptr: u64, val_ptr: u64, val_max: u64) i64 {
     if (key_ptr == 0 or key_ptr >= 0x0000_8000_0000_0000) return -22;
 
-    var key_buf: [128]u8 = undefined;
-    const copied = copy.copyFromUser(key_buf[0..], @ptrFromInt(key_ptr), 127);
+    const var_max = task_mod.ENV_VAR_BYTES - 1;
+    var key_buf: [task_mod.ENV_VAR_BYTES]u8 = undefined;
+    const copied = copy.copyFromUser(key_buf[0..], @ptrFromInt(key_ptr), var_max);
     if (copied == 0) return -1;
-    key_buf[if (copied < 127) copied else 127] = 0;
+    key_buf[if (copied < var_max) copied else var_max] = 0;
     var key_len: usize = 0;
     while (key_len < copied and key_buf[key_len] != 0) : (key_len += 1) {}
 
@@ -33,13 +34,13 @@ pub fn getenv(key_ptr: u64, val_ptr: u64, val_max: u64) i64 {
     for (0..current.env_count) |i| {
         const entry = current.env_vars[i][0..];
         var j: usize = 0;
-        while (j < 127 and entry[j] != 0 and entry[j] != '=' and j < key_len) : (j += 1) {
+        while (j < var_max and entry[j] != 0 and entry[j] != '=' and j < key_len) : (j += 1) {
             if (entry[j] != key_buf[j]) break;
         }
         if (j == key_len and entry[j] == '=') {
             const val_start = j + 1;
             var val_len: usize = 0;
-            while (val_start + val_len < 127 and entry[val_start + val_len] != 0) : (val_len += 1) {}
+            while (val_start + val_len < var_max and entry[val_start + val_len] != 0) : (val_len += 1) {}
 
             if (val_ptr != 0 and val_ptr < 0x0000_8000_0000_0000 and val_max > 0) {
                 const to_copy = @min(val_len, val_max - 1);

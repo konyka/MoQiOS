@@ -26,6 +26,11 @@ const KERNEL_STACK_STRIDE: u64 = 256 * 1024;
 // allocates large arrays on the stack (e.g., code_pages[256]?u64 = 2KB).
 // The stack grows downward from kernel_stack_top.
 
+/// SK-38: env storage sizes. Non-x86 bring-up has no exec/env syscalls, so a
+/// minimal table avoids 3.8KB of dead BSS in every task slot.
+pub const ENV_MAX_VARS: u32 = if (builtin.cpu.arch == .x86_64) 32 else 4;
+pub const ENV_VAR_BYTES: u32 = if (builtin.cpu.arch == .x86_64) 128 else 64;
+
 pub const TaskState = enum(u8) {
     ready = 0,
     running = 1,
@@ -116,7 +121,7 @@ pub const Task = struct {
     sigaltstack_size: u64,
 
     /// Environment variables (key=value pairs).
-    env_vars: [32][128]u8,
+    env_vars: [ENV_MAX_VARS][ENV_VAR_BYTES]u8,
     env_count: u32,
 
     /// Current working directory (null-terminated, max 256 chars).

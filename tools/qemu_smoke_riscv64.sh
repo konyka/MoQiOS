@@ -83,20 +83,21 @@ pass_markers() {
         grep -q "\[SK-34\] shared tmpfs+random boot: OK" "$LOG_FILE" &&
         grep -q "\[SK-35\] shared cpu surfaces+symbol table: OK" "$LOG_FILE" &&
         grep -q "\[SK-36\] probe ladder cleanup: OK" "$LOG_FILE" &&
-        grep -q "\[SK-37\] slim task/symbol footprint: OK" "$LOG_FILE"
+        grep -q "\[SK-37\] slim task/symbol footprint: OK" "$LOG_FILE" &&
+        grep -q "\[SK-38\] slim env buffers: OK" "$LOG_FILE"
 }
 
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if pass_markers; then
-        echo "PASS: MoQiOS riscv64 M7+SK-37 smoke (shared probes + slim footprint + virtio + U-mode)."
+        echo "PASS: MoQiOS riscv64 M7+SK-38 smoke (shared probes + slim footprint/env + virtio + U-mode)."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         if pass_markers; then
-            echo "PASS: MoQiOS riscv64 M7+SK-37 smoke (shared probes + slim footprint + virtio + U-mode)."
+            echo "PASS: MoQiOS riscv64 M7+SK-38 smoke (shared probes + slim footprint/env + virtio + U-mode)."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -110,7 +111,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for riscv64 smoke markers."
-echo "Expected: SK-2..SK-4 + SK-6..SK-37 shared markers + M7 blk/net + M6 + M5 markers."
+echo "Expected: SK-2..SK-4 + SK-6..SK-38 shared markers + M7 blk/net + M6 + M5 markers."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1
