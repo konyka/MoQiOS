@@ -914,7 +914,7 @@ pub fn waitpid(parent_idx: u32, pid: i32, status: *i32) ?u32 {
         }
         task_lock.release(flags);
         if (!busy_child) return null;
-        asm volatile ("pause");
+        @import("../arch/arch.zig").cpu.pause();
     }
 }
 

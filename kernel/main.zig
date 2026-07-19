@@ -191,8 +191,8 @@ export fn _start() callconv(.c) noreturn {
     ext2.init();
 
     // v53.33: Register writeback flush callbacks for eviction-time flushing
-    const vfs = @import("fs/vfs.zig");
-    vfs.initWritebackCallbacks();
+    // (SK-46: shared boot fragment).
+    subsystem_boot.initWritebackCallbacks();
 
     // tmpfs + /dev/urandom (shared boot fragments — SK-34)
     subsystem_boot.initTmpfs();

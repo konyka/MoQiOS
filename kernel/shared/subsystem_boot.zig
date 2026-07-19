@@ -70,6 +70,14 @@ pub fn initRamdisk(base: [*]const u8, size: u64) bool {
     return @import("../fs/ramdisk.zig").init(base, size);
 }
 
+/// SK-46: writeback flush-callback registration from main.zig (v53.33).
+/// Wires ext2/fat32 eviction-time flushing; idempotent. x86-only call site:
+/// the flush chain ends in the x86 block drivers, so non-x86 exercises the
+/// writeback cache with a probe-local callback instead (sk46).
+pub fn initWritebackCallbacks() void {
+    @import("../fs/vfs.zig").initWritebackCallbacks();
+}
+
 /// Full portable subsystem boot used by non-x86 SK-21 probes.
 pub fn initAll() void {
     initCpuSurfaces();

@@ -13,16 +13,20 @@
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
   **SK-8**…**SK-33**：facade、portable mm、时间片原生用户抢占、探针阶梯、slab/page_cache。
-  **SK-34**…**SK-44（2026-07-19）**：tmpfs/random、cpu surfaces/symbol_table、
+  **SK-34**…**SK-46（2026-07-19）**：tmpfs/random、cpu surfaces/symbol_table、
   阶梯收尾、非 x86 BSS 瘦身（readahead 窗口 + 符号表 + env 缓冲 + FdTable
   按架构裁剪；非 x86 Task 62KB→**4.5KB**）、copy_from_user 走 arch facade
   （satp/TTBR0 + SUM），M6/M9-6 用户 `sys_write` 复用共享防护；
   main.zig idle 线程 / boot 尾部 idle 循环收敛进 `sched_boot`；
   共享 ramdisk 解析首次在非 x86 运行；loader ELF64 头/phdr 解析抽出
-  共享 `proc/elf.zig`（EM_CURRENT 按 arch 选择）；
+  共享 `proc/elf.zig`（EM_CURRENT 按 arch 选择）；`buildUserStack`
+  （Linux ABI 入口栈）抽出共享 `proc/user_stack.zig`；vfs 写回回调
+  注册收敛进 `subsystem_boot`（共享写回缓存首次在非 x86 运行）；
   探针 `[SK-42] shared idle boot fragment: OK`、
   `[SK-43] shared ramdisk parse: OK`、
-  `[SK-44] shared elf header parse: OK`。
+  `[SK-44] shared elf header parse: OK`、
+  `[SK-45] shared user stack build: OK`、
+  `[SK-46] shared writeback cache: OK`。
   完整 `main.zig` / Limine 驱动仍未在非 x86 链接。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
@@ -571,6 +575,37 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **后续**：SK-45 — 继续可移植片段（vfs 写回回调注册、buildUserStack
   的 auxv 部分等），或 Phase G 按需 syscall。
 
+### 3.42 SK-45 完成记录（2026-07-19）
+
+- **动机**：`loader.zig` 的 `buildUserStack`（Linux ABI 进程入口栈：
+  argc/argv/envp/auxv + 16 字节对齐）布局在 x86_64/riscv64/aarch64 的
+  Linux ABI 中完全一致，但实现内联在 x86 专属的 loader 里。
+- **方案**：抽出 arch-clean 的 `proc/user_stack.zig`（经 `hhdm.physToVirt`
+  写物理页——非 x86 上 HHDM 偏移为 0 即恒等映射；AT_* 常量与 `StackInfo`
+  一并迁移），loader 以 `pub const buildUserStack = user_stack.buildUserStack`
+  再导出，行为零改动。
+- **探针**：`sk45` 在非 x86 上取一页真实内存，令 stack_top == 页尾使
+  用户 VA 可直接解引用，构建假进程入口栈后回读校验：argc/argv 字符串、
+  argv/envp 终止符（含对齐 pad 兼容）、auxv 的 AT_ENTRY/AT_PHNUM/
+  AT_PAGESZ 值、SP 16 字节对齐与页内边界；
+  `[SK-45] shared user stack build: OK`。
+- **随行修复**：`task.waitpid` 的自旋提示从内联 x86 `pause` 改为
+  `arch.cpu.pause()`（riscv64 baseline 无 Zihintpause，直接编译失败；
+  此前该函数未被非 x86 引用故未暴露）。
+
+### 3.43 SK-46 完成记录（2026-07-19）
+
+- **动机**：main.zig v53.33 片段 `vfs.initWritebackCallbacks()`（ext2/
+  fat32 驱逐时写回回调注册）为最后几个未收敛的可移植 boot 片段之一；
+  共享写回缓冲缓存（`fs/writeback.zig`）此前从未在非 x86 编译/运行。
+- **方案**：`subsystem_boot.initWritebackCallbacks()` 收敛入口，
+  main.zig 改调；`writeback.hasFlushCallback()` 作为探针面。
+- **探针**：`sk46` 经共享片段注册回调，校验 ext2/fat32 槽位均已接线，
+  再走 `writeBuffered`/`readBuffered` 做脏缓冲往返（fs_type/offset
+  键控命中与未命中、脏计数）；`[SK-46] shared writeback cache: OK`。
+- **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 1 轮全绿。
+- **后续**：SK-47 — 继续可移植片段，或 Phase G 按需 syscall。
+
 ---
 
 ## 4. M8 进度（x86_64 SMP）
@@ -755,16 +790,16 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-44
-Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-44
+Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-46
+Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-46
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**SK-45** — 继续可移植片段（vfs 写回回调、buildUserStack auxv 等）；
-> SK-1…SK-44 已完成。
+> 当前下一执行项：**SK-47** — 继续可移植片段（main.zig 剩余可共享块）；
+> SK-1…SK-46 已完成。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。
