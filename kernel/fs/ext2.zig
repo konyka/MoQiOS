@@ -135,6 +135,9 @@ pub const Ext2File = struct {
     inode_num: u32,
     inode: Ext2Inode,
     offset: u32,
+    /// Cross-process references (fork/clone). closeFile frees only at 0,
+    /// so a parent closing its fd cannot dangle the child's open-file index.
+    ref_count: u32 = 1,
 };
 
 var open_files: [MAX_OPEN_FILES]Ext2File = undefined;
@@ -962,10 +965,24 @@ pub fn getFileSize(file_idx: u32) u64 {
 
 pub fn closeFile(file_idx: u32) void {
     if (file_idx >= open_count) return;
-    open_files[file_idx].inode_num = 0;
-    open_file_paths[file_idx][0] = 0;
+    const f = &open_files[file_idx];
+    if (f.inode_num == 0) return;
+    // Shared across fork/clone: drop one reference, free only at zero.
+    if (f.ref_count > 1) {
+        f.ref_count -= 1;
+        return;
+    }
+    f.ref_count = 0;
+    f.inode_num = 0;
     // v52.3: clear full path to prevent stale data leak
     @memset(open_file_paths[file_idx][0..128], 0);
+}
+
+/// Add a reference to an open file slot (fork/clone fd-table copy).
+pub fn retainFile(file_idx: u32) void {
+    if (file_idx >= open_count) return;
+    if (open_files[file_idx].inode_num == 0) return;
+    open_files[file_idx].ref_count += 1;
 }
 
 // ─── Directory listing ─────────────────────────────────────────────────────

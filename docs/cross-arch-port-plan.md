@@ -13,10 +13,11 @@
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
   **SK-8**…**SK-33**：facade、portable mm、时间片原生用户抢占、探针阶梯、slab/page_cache。
-  **SK-34**…**SK-40（2026-07-19）**：tmpfs/random、cpu surfaces/symbol_table、
+  **SK-34**…**SK-41（2026-07-19）**：tmpfs/random、cpu surfaces/symbol_table、
   阶梯收尾、非 x86 BSS 瘦身（readahead 窗口 + 符号表 + env 缓冲 + FdTable
   按架构裁剪；非 x86 Task 62KB→**4.5KB**）、copy_from_user 走 arch facade
-  （satp/TTBR0 + SUM）；探针 `[SK-40] portable copy_from_user: OK`。
+  （satp/TTBR0 + SUM），M6/M9-6 用户 `sys_write` 复用共享防护；
+  探针 `[SK-41] user write via shared copy: OK`。
   完整 `main.zig` / Limine 驱动仍未在非 x86 链接。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
@@ -431,6 +432,19 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **后续**：SK-41 — 继续可移植片段（sched/task 剩余 boot 片段，
   或将用户 IRQ 探针之外的 M6 user.enter 复用共享 copy 防护）。
 
+### 3.38 SK-41 完成记录（2026-07-19）
+
+- **动机**：riscv64 M6 / aarch64 M9-6 的 `sys_write` 手写边界检查后经物理
+  地址别名读用户页，绕过了 SK-40 刚移植的共享防护——语义与 x86 syscall
+  路径不一致，也无法拒绝"越界但仍在用户页内"的坏指针形态。
+- **方案**：两个 arch 的 `handleWrite` 改为 `copy.copyFromUser` 进内核栈
+  缓冲再输出（范围检查 + 用户位页表 walk + riscv SUM 括号），删除
+  phys 别名路径；长度上限 256 保持不变。
+- **探针**：首次成功走共享防护时打印
+  `[SK-41] user write via shared copy: OK`（在 `hello from U` 之后），
+  两个非 x86 冒烟脚本断言该标记。
+- **后续**：SK-42 — 继续可移植片段（sched/task 剩余 boot 片段收敛）。
+
 ---
 
 ## 4. M8 进度（x86_64 SMP）
@@ -615,16 +629,16 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-40
-Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-40
+Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-41
+Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-41
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**SK-41** — 继续可移植片段（剩余 boot 片段等）；
-> SK-1…SK-40 已完成。
+> 当前下一执行项：**SK-42** — 继续可移植片段（剩余 boot 片段等）；
+> SK-1…SK-41 已完成。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。

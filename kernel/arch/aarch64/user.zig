@@ -3,6 +3,7 @@
 const pmm = @import("pmm.zig");
 const paging = @import("paging.zig");
 const uart = @import("uart.zig");
+const copy = @import("../../mm/copy_from_user.zig");
 
 pub const SYS_EXIT: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
@@ -69,21 +70,32 @@ fn buildUserImage(page: [*]u8) void {
     writeU32(page, 0x20, 0xD4000001); // svc #0
 }
 
+/// SK-41: sys_write reads user memory through the shared copy_from_user
+/// guard (range check + stage-1 AP[1] walk) instead of hand-rolled bounds +
+/// phys aliasing.
 fn handleWrite(frame: *TrapFrame) void {
-    const ptr = frame.x1;
     const len = frame.x2;
-    if (ptr < USER_TEXT_VA or ptr + len > USER_TEXT_VA + paging.PAGE_SIZE or len > 256) {
+    var buf: [256]u8 = undefined;
+    if (len > buf.len) {
         frame.x0 = @bitCast(@as(i64, -1));
         return;
     }
-    const phys = user_text_pa + (ptr - USER_TEXT_VA);
-    const bytes: [*]const u8 = @ptrFromInt(phys);
-    var i: u64 = 0;
-    while (i < len) : (i += 1) {
-        uart.writeByte(bytes[@intCast(i)]);
+    const n = copy.copyFromUser(buf[0..], @ptrFromInt(frame.x1), @intCast(len));
+    if (n != len) {
+        frame.x0 = @bitCast(@as(i64, -1));
+        return;
+    }
+    for (buf[0..@intCast(n)]) |b| {
+        uart.writeByte(b);
+    }
+    if (!wrote_via_shared) {
+        wrote_via_shared = true;
+        uart.writeString("[SK-41] user write via shared copy: OK\n");
     }
     frame.x0 = len;
 }
+
+var wrote_via_shared: bool = false;
 
 /// Returns 0 → eret to EL0. SYS_EXIT continues into M9-7 sched (noreturn).
 pub fn handleSvc(frame: *TrapFrame) u64 {
