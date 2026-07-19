@@ -533,11 +533,14 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **动机**：`fs/ramdisk.zig`（MRD 扁平归档解析，main.zig M5.3 片段的
   可移植主体）本身已 arch-clean——serial 走 arch facade、无 Limine 类型
   ——但从未在非 x86 上编译/运行过。
-- **方案**：不加包装层（`ramdisk.init(base, size)` 已是共享入口，
-  main.zig 只保留 Limine module 迭代这一 bootloader 专属部分）；新增
-  `sk43` 探针在非 x86 上于栈上合成最小 MRD 归档（header + 2 entries +
-  data），走与 main.zig 相同的 `init` → `findFile` → `getFileCount` /
-  `getFileName` 序列，校验两个文件的 size/内容、缺失名返回 null。
+- **方案**：`subsystem_boot.initRamdisk(base, size)` 作为收敛入口
+  （与 initSlab/initTmpfs 等片段目录一致），main.zig 与探针调用同一
+  函数；main.zig 只保留 Limine module 迭代这一 bootloader 专属部分，
+  顶部 `ramdisk` 直连 import 移除。新增 `sk43` 探针在非 x86 上合成最小
+  MRD 归档（header + 2 entries + data；blob 用静态存储——`ramdisk` 全局
+  state 在 init 后持有其指针，不能放探针栈帧），走与 main.zig 相同的
+  `initRamdisk` → `findFile` → `getFileCount` / `getFileName` 序列，
+  校验两个文件的 size/内容、缺失名返回 null。
 - **探针**：`[SK-43] shared ramdisk parse: OK`（x86 仅打印标记，
   main.zig 每次启动即真实验证）。两个非 x86 冒烟脚本断言该标记。
 - **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 1 轮全绿。
