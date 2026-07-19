@@ -17,7 +17,6 @@ const acpi = @import("acpi/acpi_parser.zig");
 const pmm = @import("mm/pmm.zig");
 const task = @import("proc/task.zig");
 const sched = @import("proc/sched.zig");
-const ramdisk = @import("fs/ramdisk.zig");
 const loader = @import("proc/loader.zig");
 const fmt = @import("lib/fmt.zig");
 const subsystem_boot = @import("shared/subsystem_boot.zig");
@@ -228,7 +227,8 @@ export fn _start() callconv(.c) noreturn {
             serial.writeString(" (");
             fmt.writeDecimal64(mod_file.size);
             serial.writeString(" bytes)\n");
-            if (!ramdisk.init(mod_file.address, mod_file.size)) {
+            // SK-43: shared MRD parse fragment (source stays Limine-specific).
+            if (!subsystem_boot.initRamdisk(mod_file.address, mod_file.size)) {
                 klog.log(.info, "Failed to parse ramdisk");
             }
         } else {

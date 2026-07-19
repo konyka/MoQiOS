@@ -13,12 +13,14 @@
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
   **SK-8**…**SK-33**：facade、portable mm、时间片原生用户抢占、探针阶梯、slab/page_cache。
-  **SK-34**…**SK-42（2026-07-19）**：tmpfs/random、cpu surfaces/symbol_table、
+  **SK-34**…**SK-43（2026-07-19）**：tmpfs/random、cpu surfaces/symbol_table、
   阶梯收尾、非 x86 BSS 瘦身（readahead 窗口 + 符号表 + env 缓冲 + FdTable
   按架构裁剪；非 x86 Task 62KB→**4.5KB**）、copy_from_user 走 arch facade
   （satp/TTBR0 + SUM），M6/M9-6 用户 `sys_write` 复用共享防护；
   main.zig idle 线程 / boot 尾部 idle 循环收敛进 `sched_boot`；
-  探针 `[SK-42] shared idle boot fragment: OK`。
+  共享 ramdisk 解析首次在非 x86 运行；
+  探针 `[SK-42] shared idle boot fragment: OK`、
+  `[SK-43] shared ramdisk parse: OK`。
   完整 `main.zig` / Limine 驱动仍未在非 x86 链接。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
@@ -525,6 +527,22 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 1 轮全绿。
 - **后续**：SK-43 — 继续可移植片段（ramdisk/loader 或 vfs 写回回调等
   main.zig 剩余可共享块），或 Phase G 按需 syscall。
+
+### 3.40 SK-43 完成记录（2026-07-19）
+
+- **动机**：`fs/ramdisk.zig`（MRD 扁平归档解析，main.zig M5.3 片段的
+  可移植主体）本身已 arch-clean——serial 走 arch facade、无 Limine 类型
+  ——但从未在非 x86 上编译/运行过。
+- **方案**：不加包装层（`ramdisk.init(base, size)` 已是共享入口，
+  main.zig 只保留 Limine module 迭代这一 bootloader 专属部分）；新增
+  `sk43` 探针在非 x86 上于栈上合成最小 MRD 归档（header + 2 entries +
+  data），走与 main.zig 相同的 `init` → `findFile` → `getFileCount` /
+  `getFileName` 序列，校验两个文件的 size/内容、缺失名返回 null。
+- **探针**：`[SK-43] shared ramdisk parse: OK`（x86 仅打印标记，
+  main.zig 每次启动即真实验证）。两个非 x86 冒烟脚本断言该标记。
+- **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 1 轮全绿。
+- **后续**：SK-44 — 继续可移植片段（loader ELF 头解析或 vfs 写回回调
+  等 main.zig 剩余可共享块），或 Phase G 按需 syscall。
 
 ---
 

@@ -63,6 +63,13 @@ pub fn initRandom() void {
     random.init();
 }
 
+/// SK-43: ramdisk parse from main.zig. The archive source is arch-specific
+/// (Limine module on x86; probe-built blob on non-x86 for now) but the MRD
+/// parser and file index are fully shared.
+pub fn initRamdisk(base: [*]const u8, size: u64) bool {
+    return @import("../fs/ramdisk.zig").init(base, size);
+}
+
 /// Full portable subsystem boot used by non-x86 SK-21 probes.
 pub fn initAll() void {
     initCpuSurfaces();
