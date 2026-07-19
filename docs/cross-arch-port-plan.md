@@ -651,9 +651,28 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   在非 x86 复用共享网络栈铺路。仅 e1000 在场时（冒烟配置）行为完全不变。
 - **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress`（hello27 TCP 经
   facade 收发）全绿。
-- **后续**：NIC 抽象层第二步——RX facade（统一轮询/中断两种投递）+ 把
-  `net/*` 与 `drivers/pci.zig`/ACPI 的文件级依赖切断，方能在非 x86 链接
-  协议表。
+- **后续**：见 3.46（RX facade，已完成）。
+
+---
+
+### 3.46 NIC 接收 facade（2026-07-19，NIC 抽象层第二步）
+
+- **背景**：3.45 收敛了发送路径，但接收侧仍有两处直连 `drivers/e1000.zig`
+  ——`raw_net.zig`（`netSend`/`netRecv`/`udpSend`/`netPoll`）与
+  `socket_syscall.zig` 的 `netPoll`，直接调 `e1000.isActive/receivePacket`。
+  只要协议栈里还有任何文件级 `@import("drivers/e1000.zig")`，非 x86 就无法
+  链接共享网络栈。
+- **方案**：`net/nic.zig` 增加 `receivePacket(buf, max_len)` facade，活动
+  NIC 为 e1000 时轮询其 RX 环，virtio-net 返回 0（它走自身路径直推
+  `net.handleRxPacket`，无可轮询队列）。`raw_net.zig` 与
+  `socket_syscall.zig` 的收发/轮询/`isActive` 全部改走 `nic`。
+- **效果**：`net/*` 目录内**仅剩 `nic.zig` 一处**直连驱动
+  （`e1000` + `virtio_net`），协议栈其余文件对具体 NIC 驱动零 import。RX
+  语义不变：e1000 轮询、virtio-net 推送两条投递路径保持原样。
+- **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿（hello27 TCP
+  经 facade 收发）。
+- **后续**：让 `nic.zig` 的驱动 import 按架构条件化（非 x86 空实现），再切
+  断 `net/*` → `drivers/pci.zig`/ACPI 的间接依赖，方能在非 x86 链接协议表。
 
 ---
 

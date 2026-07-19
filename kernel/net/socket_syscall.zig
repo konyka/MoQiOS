@@ -591,14 +591,14 @@ pub fn socketpair(domain: u32, sock_type: u32, protocol: u32, sv_ptr: u64) i64 {
 
 /// net_poll() → count of packets processed
 pub fn netPoll() i64 {
-    const e1000_mod = @import("../drivers/e1000.zig");
-    if (!e1000_mod.isActive()) return 0;
+    const nic = @import("nic.zig");
+    if (!nic.isActive()) return 0;
 
     var rx_tmp: [2048]u8 = undefined;
     var count: u64 = 0;
     var poll_limit: u32 = 0;
     while (poll_limit < 16) {
-        const n = e1000_mod.receivePacket(&rx_tmp, 2048);
+        const n = nic.receivePacket(&rx_tmp, 2048);
         if (n == 0) break;
         net_mod.handleRxPacket(&rx_tmp, n);
         count += 1;

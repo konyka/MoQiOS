@@ -30,3 +30,13 @@ pub fn sendPacket(data: [*]const u8, len: u32) bool {
     if (virtio_net.isActive()) return virtio_net.sendPacket(data, len);
     return false;
 }
+
+/// Poll one frame off the active NIC's RX ring into `buf`; returns bytes
+/// copied (0 = nothing ready). Only e1000 is pollable — virtio-net has no
+/// poll API and pushes RX straight into `net.handleRxPacket` from its own
+/// path, so a virtio-net-only machine still receives, it just returns 0
+/// here and callers rely on the driver's push path instead.
+pub fn receivePacket(buf: [*]u8, max_len: u32) u32 {
+    if (e1000.isActive()) return e1000.receivePacket(buf, max_len);
+    return 0;
+}
