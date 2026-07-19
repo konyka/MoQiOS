@@ -17,7 +17,10 @@ const str = @import("../lib/str.zig");
 const writeback = @import("writeback.zig");
 const page_cache = @import("page_cache.zig");
 
-pub const MAX_FDS: u32 = 64;
+/// SK-39: non-x86 bring-up exercises no fd-based syscalls, and the per-fd
+/// descriptor array dominates what is left of Task after SK-37/38. Keep a
+/// minimal table there; x86 stays at 64.
+pub const MAX_FDS: u32 = if (@import("builtin").cpu.arch == .x86_64) 64 else 8;
 pub const FD_STDIN: u32 = 0;
 pub const FD_STDOUT: u32 = 1;
 pub const FD_STDERR: u32 = 2;
@@ -153,8 +156,15 @@ pub const FileDescriptor = struct {
 pub const FdTable = struct {
     fds: [MAX_FDS]FileDescriptor,
     /// v53.49: Bitmap tracking free fd slots — bit set = free, bit clear = occupied.
-    /// MAX_FDS=64 fits exactly in one u64. Eliminates O(N) linear scan in allocFd.
-    free_bm: u64 = ~@as(u64, 0b111), // bits 0-2 clear (stdin/stdout/stderr occupied)
+    /// MAX_FDS<=64 fits in one u64. Eliminates O(N) linear scan in allocFd.
+    /// SK-39: bits >= MAX_FDS stay clear so allocFd never returns an
+    /// out-of-range slot when the table is arch-slimmed.
+    free_bm: u64 = FREE_BM_ALL, // bits 0-2 clear (stdin/stdout/stderr occupied)
+
+    const FREE_BM_ALL: u64 = blk: {
+        const in_range: u64 = if (MAX_FDS >= 64) ~@as(u64, 0) else (@as(u64, 1) << MAX_FDS) - 1;
+        break :blk in_range & ~@as(u64, 0b111);
+    };
 
     /// Comptime-computed default table (stdin/stdout/stderr wired to the
     /// special console). Living in .rodata means init() is just a copy and
