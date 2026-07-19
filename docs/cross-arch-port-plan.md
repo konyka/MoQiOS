@@ -469,6 +469,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
      task 槽复用/退出路径与 AP 调度竞争。
 - **下一步**：专轮排查——先在 tcp timerTick（AP 上跑）与 sendto/close
   的并发面找共享可变状态；再查 task exit 后 kstack 复用窗口。
+- **2026-07-19 追加证据与加固**：
+  1. 已落地加固：reap（`reapZombies`/`waitpid`）现在跳过仍是某 CPU
+     `current_task_idx` 的僵尸（`isCurrentOnAnyCpu`），waitpid 以释放锁的
+     pause 循环等待宿主 CPU 切走——消除"exit 后整整一个 tick 内 kstack
+     被复用"的窗口。
+  2. 但同形态崩溃仍复现：`iretq` #GP(0)，帧位于 `TSS.RSP0`（kstack top
+     − 0x28）即 **from-user** IRQ 帧，而 cur task（idx 3）此时已打印
+     `[exit]` 走完 exit 系统调用——一个 CPU 在内核 exit 路径上，另一个
+     CPU 仍以用户态运行同一任务并在其 kstack 顶收 IRQ 帧；exit 系统调用
+     入口（`kernel_rsp = kstack_top`）会覆写同一栈顶区域 → 帧损毁 →
+     iretq #GP。指向**同一任务同时是两个 CPU 的 current**（疑似
+     work-stealing / 唤醒路径 double-enqueue），而非单纯 reap 时序。
+  3. 专轮方向：审计 enqueue/steal/kick 全部路径，确保任务不可能同时
+     位于两个 per-CPU 队列或"队列 + current"双重身份；考虑给 Task 加
+     `on_cpu: i8` 断言字段在 debug 构建里捕获双跑。
 - **后续**：SK-42 — 继续可移植片段（sched/task 剩余 boot 片段收敛）。
 
 ---

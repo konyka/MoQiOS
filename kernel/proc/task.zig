@@ -615,6 +615,21 @@ pub fn exitTask(exit_code: i32) void {
     }
 }
 
+/// True while some CPU's per-CPU `current_task_idx` still points at `idx`.
+/// A zombie stays "current" on its CPU until that CPU's next timer tick
+/// switches away. Freeing/reusing the slot (and its fixed kernel stack) inside
+/// that window lets the next spawn overwrite IRQ frames the owning CPU is
+/// still using — observed as iretq #GP at kstack top right after
+/// "[exit] task exited" in SMP=2 stress smoke.
+fn isCurrentOnAnyCpu(idx: u32) bool {
+    if (comptime builtin.cpu.arch != .x86_64) return false;
+    const se = @import("../arch/x86_64/syscall_entry.zig");
+    for (&se.percpu_array) |*pc| {
+        if (@atomicLoad(u32, &pc.current_task_idx, .acquire) == idx) return true;
+    }
+    return false;
+}
+
 /// Reap orphaned zombie tasks — those whose parent has already exited.
 /// Zombies with a living parent are left for waitpid() to collect.
 pub fn reapZombies() u32 {
@@ -628,6 +643,9 @@ pub fn reapZombies() u32 {
         bits &= bits - 1;
         const t = &tasks[i];
         if (t.state != .zombie) continue;
+        // Still current on some CPU (owner hasn't switched away yet) —
+        // defer to the next reap interval instead of yanking a live kstack.
+        if (isCurrentOnAnyCpu(i)) continue;
 
         // Check if parent is still alive
         if (t.parent_tid != 0) {
@@ -828,34 +846,52 @@ pub fn kickRemoteForTask(slot: u32) void {
 /// child has exited yet (WNOHANG behavior). Writes the exit code to *status.
 /// pid == -1 means wait for any child; pid > 0 means wait for specific child.
 pub fn waitpid(parent_idx: u32, pid: i32, status: *i32) ?u32 {
-    const flags = task_lock.acquire();
-    defer task_lock.release(flags);
+    // Retry loop: a zombie child may still be "current" on another CPU for up
+    // to one timer tick after exit. Reaping in that window frees a kstack the
+    // owner CPU is still executing on, so wait (lock released) until it has
+    // switched away. Parent and child cannot share a CPU here — the parent is
+    // the one running — so this never spins on itself.
+    while (true) {
+        const flags = task_lock.acquire();
 
-    const parent = getTask(parent_idx) orelse return null;
-    const parent_tid_val = parent.tid;
+        const parent = getTask(parent_idx) orelse {
+            task_lock.release(flags);
+            return null;
+        };
+        const parent_tid_val = parent.tid;
 
-    // Search for a matching zombie child using bitmap
-    var bits = slot_bitmap;
-    while (bits != 0) {
-        const i: u32 = @intCast(@ctz(bits));
-        bits &= bits - 1;
-        const t = &tasks[i];
-        if (t.parent_tid != parent_tid_val) continue;
-        if (t.state != .zombie) continue;
-        if (pid > 0 and t.tid != @as(u32, @intCast(pid))) continue;
+        // Search for a matching zombie child using bitmap
+        var busy_child = false;
+        var bits = slot_bitmap;
+        while (bits != 0) {
+            const i: u32 = @intCast(@ctz(bits));
+            bits &= bits - 1;
+            const t = &tasks[i];
+            if (t.parent_tid != parent_tid_val) continue;
+            if (t.state != .zombie) continue;
+            if (pid > 0 and t.tid != @as(u32, @intCast(pid))) continue;
 
-        // Found a zombie child — collect its exit code and reap it
-        status.* = t.exit_code;
-        const child_tid = t.tid;
-        if (t.page_table_phys != 0) {
-            @import("../mm/user_space.zig").destroyUserSpace(t.page_table_phys);
+            if (isCurrentOnAnyCpu(i)) {
+                busy_child = true;
+                continue;
+            }
+
+            // Found a quiesced zombie child — collect its exit code and reap it
+            status.* = t.exit_code;
+            const child_tid = t.tid;
+            if (t.page_table_phys != 0) {
+                @import("../mm/user_space.zig").destroyUserSpace(t.page_table_phys);
+            }
+            freeKernelStack(t.kernel_stack);
+            slot_bitmap &= ~(@as(u64, 1) << @intCast(i));
+            task_count -= 1;
+            task_lock.release(flags);
+            return child_tid;
         }
-        freeKernelStack(t.kernel_stack);
-        slot_bitmap &= ~(@as(u64, 1) << @intCast(i));
-        task_count -= 1;
-        return child_tid;
+        task_lock.release(flags);
+        if (!busy_child) return null;
+        asm volatile ("pause");
     }
-    return null;
 }
 
 /// Check if the given task has any children (for waitpid validation).
