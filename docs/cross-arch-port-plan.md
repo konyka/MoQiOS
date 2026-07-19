@@ -454,6 +454,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   `vfs.retainSharedResources`（对每进程每类每个不同 index retain 一次，
   与 `hasSharedRef` 的"每进程只 teardown 一次"语义配对）。TCP 语义与
   Linux 对齐：仅最后一个引用 close 才发 FIN/RST。v53.44 TODO 至此关闭。
+
+### 已知问题（P1）：SMP=2 压力冒烟间歇性失败（2026-07-19 记录）
+
+- **现象**：`zig build smoke-smp-stress` 多轮连跑约每 2–4 轮出一次失败；
+  单轮 `smoke-smp` 与三门禁稳定全绿。
+- **证据**：基线 `f89e971`（refcount 修复之前）同样复现（6 轮第 2 轮
+  在 hello27 `connect=0` 后挂死超时），**非** `cf0372a` 引入。
+- **失败形态**（多样，指向 SMP 时序竞争而非单点 bug）：
+  1. hello27（TCP connect/sendto）后挂死；
+  2. hello27 sendto 中内核 #PF：`RIP == CR2 = 0xffffffff80ae1f90`
+     （野跳转到不可执行地址，疑似栈/函数指针被并发覆写）；
+  3. hello4 退出后 `RSP=0x...900dffd8`（内核栈顶附近）#GP —— 疑似
+     task 槽复用/退出路径与 AP 调度竞争。
+- **下一步**：专轮排查——先在 tcp timerTick（AP 上跑）与 sendto/close
+  的并发面找共享可变状态；再查 task exit 后 kstack 复用窗口。
 - **后续**：SK-42 — 继续可移植片段（sched/task 剩余 boot 片段收敛）。
 
 ---
