@@ -448,6 +448,12 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   ext2 open-file index retain 一次（进程内 dup 仍由 `hasSharedRef` 兜底），
   `closeFile` 归零才释放槽位。修复父进程 close 后子进程 fd 悬垂
   （use-after-close）的 v53.44 遗留问题之一。门禁另加 `smoke-smp` 验证。
+- **随行修复补全（v53.44 收尾）**：tcp/epoll/unix_socket/timerfd 四类共享
+  资源同样补上 `ref_count` + retain/teardown-at-zero（`tcpRetain`、
+  `epollRetain`、`unixRetain`、`timerfdRetain`）；fork/clone 统一走
+  `vfs.retainSharedResources`（对每进程每类每个不同 index retain 一次，
+  与 `hasSharedRef` 的"每进程只 teardown 一次"语义配对）。TCP 语义与
+  Linux 对齐：仅最后一个引用 close 才发 FIN/RST。v53.44 TODO 至此关闭。
 - **后续**：SK-42 — 继续可移植片段（sched/task 剩余 boot 片段收敛）。
 
 ---

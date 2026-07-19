@@ -48,28 +48,12 @@ pub fn fork(frame: *SyscallFrame) i64 {
                     vfs_mod.pipes[pidx].ref_count += 1;
                 }
             },
-            // Each process holds ONE ext2 reference per distinct open-file
-            // index (close() frees the slot once per process via hasSharedRef),
-            // so retain only on the first fd that references this index.
-            .ext2_file => {
-                const idx = child.fd_table.fds[i].ext2_file_idx;
-                var seen = false;
-                for (0..i) |j| {
-                    const prior = &child.fd_table.fds[j];
-                    if (prior.fd_type == .ext2_file and prior.ext2_file_idx == idx) {
-                        seen = true;
-                        break;
-                    }
-                }
-                if (!seen) @import("../fs/ext2.zig").retainFile(idx);
-            },
-            // v53.44: TODO — tcp_socket/epoll/eventfd/timerfd/unix_socket FDs are
-            // shared between parent and child without refcounting. Closing in one
-            // process frees the underlying resource while the other still holds a
-            // dangling index. Full fix requires per-type refcount in each subsystem.
             else => {},
         }
     }
+    // v53.44 fix: ext2/tcp/epoll/unix/timerfd resources are now refcounted —
+    // one reference per process per distinct index (see vfs.retainSharedResources).
+    vfs_mod.retainSharedResources(&child.fd_table);
 
     for (0..31) |i| {
         child.signal_handlers[i] = parent.signal_handlers[i];

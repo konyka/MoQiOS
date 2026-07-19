@@ -184,21 +184,10 @@ pub fn clone(
                 vfs_mod.pipes[pidx].ref_count += 1;
             }
         }
-        // One ext2 reference per distinct open-file index per process (see
-        // fork.zig): retain only on the first fd referencing this index.
-        if (child.fd_table.fds[i].fd_type == .ext2_file) {
-            const eidx = child.fd_table.fds[i].ext2_file_idx;
-            var seen = false;
-            for (0..i) |j| {
-                const prior = &child.fd_table.fds[j];
-                if (prior.fd_type == .ext2_file and prior.ext2_file_idx == eidx) {
-                    seen = true;
-                    break;
-                }
-            }
-            if (!seen) @import("../../fs/ext2.zig").retainFile(eidx);
-        }
     }
+    // v53.44 fix: ext2/tcp/epoll/unix/timerfd resources are now refcounted —
+    // one reference per process per distinct index (see vfs.retainSharedResources).
+    vfs_mod.retainSharedResources(&child.fd_table);
 
     // Signal handlers, mask, environment, cwd, pgid, sid
     for (0..31) |i| {

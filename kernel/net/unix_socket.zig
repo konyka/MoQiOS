@@ -58,6 +58,8 @@ pub const WaitNode = struct {
 
 pub const UnixSocket = struct {
     active: bool = false,
+    /// Cross-process references (fork/clone) — unixClose frees at 0 only.
+    ref_count: u32 = 1,
     sock_type: u32 = 0,
     bound: bool = false,
     path: [UNIX_PATH_MAX]u8 = @splat(0),
@@ -100,6 +102,15 @@ pub fn unixSocket(sock_type: u32) i32 {
         }
     }
     return -24; // EMFILE
+}
+
+/// Add a cross-process reference (fork/clone fd-table copy).
+pub fn unixRetain(idx: u32) void {
+    if (idx >= MAX_UNIX_SOCKETS) return;
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+    if (!unix_sockets[idx].active) return;
+    unix_sockets[idx].ref_count += 1;
 }
 
 /// Bind a Unix socket to a filesystem path.
@@ -426,6 +437,13 @@ pub fn unixClose(idx: u32) void {
 
     const sock = &unix_sockets[idx];
     if (!sock.active) return;
+
+    // Shared across fork/clone: drop one reference, free only at zero.
+    if (sock.ref_count > 1) {
+        sock.ref_count -= 1;
+        return;
+    }
+    sock.ref_count = 0;
 
     // Wake any waiters
     {

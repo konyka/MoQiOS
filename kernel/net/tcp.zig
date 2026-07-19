@@ -181,6 +181,8 @@ const TcpTcb = struct {
     // Connection metadata
     active: bool, // slot in use
     owner_task: u32, // task index that owns this connection
+    /// Cross-process references (fork/clone) — tcpClose tears down at 0 only.
+    ref_count: u32 = 1,
     options: socket_opt.SocketOptions,
 };
 
@@ -301,8 +303,18 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].nagle_pending = false;
     tcbs[i].delayed_ack_pending = false;
     tcbs[i].delayed_ack_ms = 0;
+    tcbs[i].ref_count = 1;
     tcbs[i].options = .{};
     return &tcbs[i];
+}
+
+/// Add a cross-process reference (fork/clone fd-table copy).
+pub fn tcpRetain(tcb_idx: u32) void {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS) return;
+    if (!tcbs[tcb_idx].active) return;
+    tcbs[tcb_idx].ref_count += 1;
 }
 
 fn findTcbByTuple(local_port: u16, remote_port: u16, remote_ip: [4]u8) ?*TcpTcb {
@@ -1392,6 +1404,13 @@ pub fn tcpClose(tcb_idx: u32) i64 {
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return -1;
+
+    // Shared across fork/clone: drop one reference, tear down only at zero.
+    if (tcb.ref_count > 1) {
+        tcb.ref_count -= 1;
+        return 0;
+    }
+    tcb.ref_count = 0;
 
     // SO_LINGER with linger=0: abortive close — send RST, discard unsent data
     if (tcb.options.linger_on and tcb.options.linger_sec == 0) {

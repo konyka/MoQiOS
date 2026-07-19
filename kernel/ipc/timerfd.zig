@@ -56,6 +56,8 @@ const WaitNode = struct {
 /// TimerInstance — one active timerfd.
 pub const TimerInstance = struct {
     active: bool = false,
+    /// Cross-process references (fork/clone) — timerfdClose frees at 0 only.
+    ref_count: u32 = 1,
     clock_id: u32 = 0,
     interval_ns: u64 = 0,
     expiry_tick: u64 = 0,
@@ -267,6 +269,15 @@ pub fn timerfdRead(timerfd_idx: u32, buf: [*]u8, count: usize) i64 {
     return 8;
 }
 
+/// Add a cross-process reference (fork/clone fd-table copy).
+pub fn timerfdRetain(timerfd_idx: u32) void {
+    if (timerfd_idx >= MAX_TIMERFD_INSTANCES) return;
+    const saved = timer_lock.acquire();
+    defer timer_lock.release(saved);
+    if (!timer_pool[timerfd_idx].valid) return;
+    timer_pool[timerfd_idx].ref_count += 1;
+}
+
 /// Close a timerfd instance.
 pub fn timerfdClose(timerfd_idx: u32) void {
     if (timerfd_idx >= MAX_TIMERFD_INSTANCES) return;
@@ -276,6 +287,13 @@ pub fn timerfdClose(timerfd_idx: u32) void {
 
     const inst = &timer_pool[timerfd_idx];
     if (!inst.valid) return;
+
+    // Shared across fork/clone: drop one reference, free only at zero.
+    if (inst.ref_count > 1) {
+        inst.ref_count -= 1;
+        return;
+    }
+    inst.ref_count = 0;
 
     // Wake any blocked waiter
     if (inst.waiter) |node| {

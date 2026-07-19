@@ -731,6 +731,45 @@ pub const FdTable = struct {
     }
 };
 
+/// v53.44 fix: fork/clone used to copy fd tables without refcounting shared
+/// resources, so close() in one process dangled the other's indices. Each
+/// process holds ONE reference per distinct underlying resource (close()
+/// runs the subsystem teardown once per process via hasSharedRef), so after
+/// copying a table, retain once per distinct index per type. Pipes keep their
+/// existing per-fd Pipe.ref_count handling at the copy site.
+pub fn retainSharedResources(table: *FdTable) void {
+    for (0..MAX_FDS) |i| {
+        const desc = &table.fds[i];
+        if (desc.fd_type == .none) continue;
+        var seen = false;
+        for (0..i) |j| {
+            const other = &table.fds[j];
+            if (other.fd_type != desc.fd_type) continue;
+            switch (desc.fd_type) {
+                .ext2_file => seen = other.ext2_file_idx == desc.ext2_file_idx,
+                .tcp_socket => seen = other.tcb_idx == desc.tcb_idx,
+                .epoll => seen = other.epoll_idx == desc.epoll_idx,
+                .unix_socket => seen = other.unix_sock_idx == desc.unix_sock_idx,
+                .timerfd => seen = other.timerfd_idx == desc.timerfd_idx,
+                else => {},
+            }
+            if (seen) break;
+        }
+        if (seen) continue;
+        switch (desc.fd_type) {
+            .ext2_file => @import("ext2.zig").retainFile(desc.ext2_file_idx),
+            .tcp_socket => {
+                const tcp = @import("../net/tcp.zig");
+                tcp.tcpRetain(desc.tcb_idx);
+            },
+            .epoll => @import("../net/epoll.zig").epollRetain(desc.epoll_idx),
+            .unix_socket => @import("../net/unix_socket.zig").unixRetain(desc.unix_sock_idx),
+            .timerfd => @import("../ipc/timerfd.zig").timerfdRetain(desc.timerfd_idx),
+            else => {},
+        }
+    }
+}
+
 /// Block read callback for readahead — read a 4KB block from disk.
 fn fat32ReadBlock(block_num: u64, buf: [*]u8) bool {
     const virtio_blk = @import("../drivers/virtio_blk.zig");

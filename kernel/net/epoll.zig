@@ -95,6 +95,8 @@ pub const EpollInstance = struct {
     waiter: ?*WaitNode = null,
     owner_task_idx: u32 = 0,
     valid: bool = false,
+    /// Cross-process references (fork/clone) — epollDestroy frees at 0 only.
+    ref_count: u32 = 1,
 };
 
 // ---- Global pool ----
@@ -539,9 +541,23 @@ fn wakeWaiterLocked(inst: *EpollInstance) void {
     }
 }
 
+/// Add a cross-process reference (fork/clone fd-table copy).
+pub fn epollRetain(epoll_idx: u32) void {
+    if (epoll_idx >= MAX_EPOLL_INSTANCES) return;
+    const inst = &epoll_pool[epoll_idx];
+    if (!inst.valid) return;
+    inst.ref_count += 1;
+}
+
 /// Destroy an epoll instance by pool index (used by VFS close).
 pub fn epollDestroy(epoll_idx: u32) void {
     if (epoll_idx >= MAX_EPOLL_INSTANCES) return;
+    const inst = &epoll_pool[epoll_idx];
+    // Shared across fork/clone: drop one reference, free only at zero.
+    if (inst.valid and inst.ref_count > 1) {
+        inst.ref_count -= 1;
+        return;
+    }
     epoll_pool[epoll_idx] = .{};
     if (epoll_idx < 32) {
         valid_epoll_bm &= ~(@as(u32, 1) << @intCast(epoll_idx));
