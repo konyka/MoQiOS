@@ -692,9 +692,30 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   依赖。
 - **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
   串口打印 `[SK-47] shared ipv4 header/checksum: OK`。
-- **后续**：继续按依赖洁净度把协议表纯逻辑块(ipv6 伪头、tcp/udp 校验和、
-  ethernet/arp 帧构造)逐块用探针搬上非 x86;有状态、依赖驱动/定时器的部分
-  (socket 表、重传、ARP 缓存)留到 `nic.zig` 驱动 import 条件化之后。
+- **后续**：见 3.48（ipv6 头/伪头,已完成）。
+
+---
+
+### 3.48 共享 IPv6 头/伪头校验和/地址判定搬上非 x86（SK-48,2026-07-19）
+
+- **背景**：SK-47 之后继续按依赖洁净度推进。`net/ipv6.zig` 同样只依赖
+  `lib/byte_order.zig`(std-free、arch-clean),含固定 40 字节头构建/解析、
+  RFC 8200 §8.1 伪头部分校验和,以及一批地址判定(link-local/multicast/
+  unspecified/solicited-node),纯字节运算,天然可移植。
+- **方案**：新增 `shared/sk48.zig` 把 `ipv6.zig` 编入非 x86 镜像并实跑。核
+  心验证 `pseudoHeaderChecksum` 的**契约**——它返回*未折叠*的 32 位累加器,
+  供上层(TCP/UDP/ICMPv6)继续累加自身字节后再统一折叠取反。探针照该用法
+  复现:以伪头播种累加器 → 累加 payload → 折叠取反得校验和写回 → 再整体
+  重算,须折叠为 0(RFC 1071 自校验)。另验 header 往返、link-local/组播/
+  unspecified 判定、solicited-node 组播地址构造与匹配。
+- **效果**：协议表第二块纯逻辑在 riscv64/aarch64 实编实跑,伪头校验和契约
+  得到端到端验证;与 SK-47 一道覆盖了 tcp/udp/icmpv6 校验和所依赖的两个底
+  层原语(`ipv4.checksum` + `ipv6.pseudoHeaderChecksum`)。
+- **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
+  打印 `[SK-48] shared ipv6 header/pseudo-csum: OK`。
+- **后续**：ethernet/arp 帧构造、tcp/udp 头组装等纯逻辑块继续逐块搬迁;有状
+  态、依赖驱动/定时器的部分(socket 表、重传、ARP 缓存、`nic.zig` 驱动
+  import 条件化)留到后续。
 
 ---
 
