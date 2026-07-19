@@ -31,6 +31,7 @@ static void print_num(int n) {
 
 void _start(void) {
     __asm__ volatile (
+        "andq $-16, %%rsp\n"
         "xor %%rbp, %%rbp\n"
         "call main\n"
         "movl $2, %%eax\n"

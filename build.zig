@@ -44,6 +44,9 @@ fn addCUserProgram(b: *std.Build, name: []const u8) void {
         "-target",           "x86_64-freestanding-none",
         "-static",           "-nostdlib",
         "-ffreestanding",    "-O2",
+        // C user images enter at _start without a CRT call frame. Realign the
+        // stack so compiler-generated SSE locals remain safe at that entry.
+        "-mstackrealign",
         "-Wl,--gc-sections", "-Wl,-z,norelro",
         "-o",
     });

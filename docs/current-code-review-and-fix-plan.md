@@ -375,6 +375,19 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build -Darch=riscv64 smoke-riscv` | Passed | Shared probe ladder, virtio, and U-mode smoke. |
 | `zig build -Darch=aarch64 smoke-aarch64` | Passed | Shared probe ladder, default timer, EL0/SVC smoke. |
 
+### 5.2b Review Update: 2026-07-19
+
+| Area | Finding | Resolution / status |
+|---|---|---|
+| C user-program entry alignment | C user images enter `_start` without a CRT call frame, so `rsp` is not guaranteed 16-byte aligned; compiler-generated SSE spills in `main` (e.g. `hello8`) could fault on movaps-class stores. | Fixed: `andq $-16, %rsp` in the `hello8` `_start` before `call main`, plus `-mstackrealign` for all C user programs in `build.zig` so every compiled function realigns defensively. |
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build smoke` | Passed | x86_64 reached `hello21 done` and `MoQiOS shell` with `MOQI_SMP=1`. |
+| `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Shared probe ladder through SK-36 + virtio + U-mode. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Shared probe ladder through SK-36 + default timer + EL0/SVC. |
+
 ### 5.3 Historical Verification
 
 Executed on 2026-06-21:
