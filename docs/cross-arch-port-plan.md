@@ -443,6 +443,11 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **探针**：首次成功走共享防护时打印
   `[SK-41] user write via shared copy: OK`（在 `hello from U` 之后），
   两个非 x86 冒烟脚本断言该标记。
+- **随行修复（x86 正确性）**：同提交包含 ext2 open-file 跨进程引用计数——
+  `Ext2File.ref_count` + `retainFile`；fork/clone 复制 fd 表时对每个不同的
+  ext2 open-file index retain 一次（进程内 dup 仍由 `hasSharedRef` 兜底），
+  `closeFile` 归零才释放槽位。修复父进程 close 后子进程 fd 悬垂
+  （use-after-close）的 v53.44 遗留问题之一。门禁另加 `smoke-smp` 验证。
 - **后续**：SK-42 — 继续可移植片段（sched/task 剩余 boot 片段收敛）。
 
 ---
