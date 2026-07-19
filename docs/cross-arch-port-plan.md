@@ -13,9 +13,9 @@
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
   **SK-8**…**SK-33**：facade、portable mm、时间片原生用户抢占、探针阶梯、slab/page_cache。
-  **SK-34**…**SK-36（2026-07-17）**：tmpfs/random、`initCpuSurfaces`/symbol_table、
-  探针阶梯收尾（清 current + disarm timer）；探针
-  `[SK-36] probe ladder cleanup: OK`。
+  **SK-34**…**SK-37（2026-07-19）**：tmpfs/random、cpu surfaces/symbol_table、
+  阶梯收尾、非 x86 BSS 瘦身（readahead 窗口 + 符号表按架构裁剪；BSS 4.8→1.6MB）；
+  探针 `[SK-37] slim task/symbol footprint: OK`。
   完整 `main.zig` / Limine 驱动仍未在非 x86 链接。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
@@ -374,6 +374,17 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **探针**：`[SK-36] probe ladder cleanup: OK`。
 - **后续**：SK-37 — 继续可移植片段 / BSS 瘦身（勿整文件搬迁）。
 
+### 3.34 SK-37 完成记录（2026-07-19）
+
+- **动机**：非 x86 `.bss` ~4.8MB，`tasks[64]`（每个 ~62KB，主体是 per-fd
+  readahead 缓存数组）+ `symbol_table`（320KB）占绝对大头。
+- **方案**：`readahead.MAX_WINDOW` 与 `symbol_table.MAX_SYMBOLS` 按架构 comptime
+  裁剪（x86 不变：32 / 4096；非 x86：2 / 64）。x86 布局与行为零变化。
+- **效果**：riscv64/aarch64 BSS 4.84→**1.57MB**（−67%）；非 x86 `Task` 62KB→**18.2KB**。
+- **探针**：comptime 上限断言 + createKernelThread 往返 + `task_bytes=` 打印；
+  `[SK-37] slim task/symbol footprint: OK`。
+- **后续**：SK-38 — 继续可移植片段（如 env/cwd 缓冲裁剪或 sched_boot 收敛）。
+
 ---
 
 ## 4. M8 进度（x86_64 SMP）
@@ -558,16 +569,16 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-36
-Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-36
+Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-37
+Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-37
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**SK-37** — 可移植片段 / 非 x86 BSS 瘦身（勿整文件搬迁）；
-> SK-1…SK-36 已完成。
+> 当前下一执行项：**SK-38** — 继续可移植片段（env/cwd 裁剪、sched_boot 收敛等）；
+> SK-1…SK-37 已完成。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。

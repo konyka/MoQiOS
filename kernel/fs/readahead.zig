@@ -1,10 +1,14 @@
 /// Sequential readahead — detects sequential access patterns and prefetches
 /// blocks ahead of the current read position.
+const builtin = @import("builtin");
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const PAGE_SIZE: u64 = 4096;
-const MAX_WINDOW: u32 = 32;
+/// SK-37: non-x86 bring-up never streams file reads through vfs, but the
+/// per-fd cache array dominates Task size (64 fds x 64 tasks). Keep the
+/// window minimal there so the static task table stays small.
+const MAX_WINDOW: u32 = if (builtin.cpu.arch == .x86_64) 32 else MIN_WINDOW;
 const MIN_WINDOW: u32 = 2;
 pub const CachedBlock = struct {
     block_num: u64 = 0,
