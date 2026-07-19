@@ -1,4 +1,4 @@
-const e1000 = @import("../drivers/e1000.zig");
+const nic = @import("nic.zig");
 const serial = @import("../arch/arch.zig").serial;
 
 var our_mac: [6]u8 = @splat(0);
@@ -6,7 +6,7 @@ var mac_initialized: bool = false;
 
 pub fn ensureInit() void {
     if (!mac_initialized) {
-        our_mac = e1000.getMAC();
+        our_mac = nic.getMAC();
         mac_initialized = true;
     }
 }

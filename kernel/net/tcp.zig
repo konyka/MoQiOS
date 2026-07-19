@@ -15,7 +15,7 @@
 /// - Window size: 32768 bytes (before scaling)
 /// - MSS: 1460 bytes
 /// - SMP send safety: per-call packet buffer, e1000 serializes TX ring submit
-const e1000 = @import("../drivers/e1000.zig");
+const nic = @import("nic.zig");
 const netif = @import("netif.zig");
 const eth = @import("eth.zig");
 const ipv4 = @import("ipv4.zig");
@@ -537,7 +537,7 @@ fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
     // Build ethernet frame
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, 20 + tcp_total);
 
-    _ = e1000.sendPacket(&send_pkt, frame_len);
+    _ = nic.sendPacket(&send_pkt, frame_len);
 
     // Advance snd_nxt for data payload
     if (data_len > 0) {

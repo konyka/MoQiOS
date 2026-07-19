@@ -1,4 +1,4 @@
-const e1000 = @import("../drivers/e1000.zig");
+const nic = @import("nic.zig");
 const netif = @import("netif.zig");
 const eth = @import("eth.zig");
 const ipv4 = @import("ipv4.zig");
@@ -43,6 +43,6 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
         // Ethernet header at offset 0
         const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, 20 + icmp_total);
 
-        _ = e1000.sendPacket(&pkt, frame_len);
+        _ = nic.sendPacket(&pkt, frame_len);
     }
 }

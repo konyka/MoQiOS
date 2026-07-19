@@ -1,4 +1,4 @@
-const e1000 = @import("../drivers/e1000.zig");
+const nic = @import("nic.zig");
 const netif = @import("netif.zig");
 const eth = @import("eth.zig");
 const bo = @import("../lib/byte_order.zig");
@@ -78,7 +78,7 @@ pub fn sendArpRequest(target_ip: [4]u8) void {
     for (32..38) |i| pkt[i] = 0; // Target MAC = 0
     @memcpy(pkt[38..42], &target_ip);
 
-    _ = e1000.sendPacket(&pkt, 42);
+    _ = nic.sendPacket(&pkt, 42);
 }
 
 fn addToCache(ip: [4]u8, mac: [6]u8) void {
@@ -121,5 +121,5 @@ fn sendArpReply(target_ip: [4]u8, target_mac: [6]u8) void {
     @memcpy(pkt[32..38], &target_mac);
     @memcpy(pkt[38..42], &target_ip);
 
-    _ = e1000.sendPacket(&pkt, 42);
+    _ = nic.sendPacket(&pkt, 42);
 }

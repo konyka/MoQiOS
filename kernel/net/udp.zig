@@ -1,4 +1,4 @@
-const e1000 = @import("../drivers/e1000.zig");
+const nic = @import("nic.zig");
 const netif = @import("netif.zig");
 const eth = @import("eth.zig");
 const ipv4 = @import("ipv4.zig");
@@ -121,6 +121,6 @@ pub fn sendTo(dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, da
     // Build ethernet frame
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, 20 + udp_total);
 
-    const ok = e1000.sendPacket(&send_pkt, frame_len);
+    const ok = nic.sendPacket(&send_pkt, frame_len);
     return ok;
 }

@@ -609,7 +609,29 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   回调路径）校验回调收到正确的 file_idx/offset/内容且脏计数清零；
   `[SK-46] shared writeback cache: OK`。
 - **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 1 轮全绿。
-- **后续**：SK-47 — 继续可移植片段，或 Phase G 按需 syscall。
+- **后续**：见 3.44 收敛复盘。
+
+### 3.44 可移植 boot 片段收敛复盘（2026-07-19 review）
+
+- **结论**：`main.zig` 中**架构无关**的 boot 片段已基本收敛完毕
+  （SK-1…SK-46）。idle 线程/boot 尾部、ramdisk 解析、ELF 头/phdr 解析、
+  用户入口栈构建、写回缓存等均已抽为共享模块并在非 x86 探针中验证。
+- **剩余 `main.zig` 初始化均为硬件/x86/Limine 专属，非探针可收敛**：
+  - ACPI（`rsdp_request` + MADT 解析）、PCI 枚举（端口 `0xCF8/0xCFC`
+    或 MCFG）、AHCI/virtio-blk/NVMe 块驱动、e1000/virtio-net、
+    `block_dev` 设备注册、fat32/ext2 挂载。
+  - 网络协议表（`arp.init`/`ndp.init`/`tcp.initTcbs`）**本身**可移植，
+    但 `net/*.zig` 在文件级 import `drivers/e1000.zig` → `drivers/pci.zig`
+    → `acpi/acpi_parser.zig`，整条链 x86 耦合；非 x86 引入即触发端口 I/O
+    / ACPI 依赖。要在非 x86 复用需先做 **NIC/PCI 驱动抽象层**（把协议表
+    初始化与 e1000 收发路径解耦），属 Phase 级重构而非单步探针。
+- **最高价值健壮性缺口**：`mm/copy_from_user.zig` 仍无逐指令缺页恢复
+  （见文件头 TODO）——坏但在范围内的用户指针目前靠预先 page-walk 校验
+  拦截，缺少异常表/fixup 兜底。三架构统一实现需链接段 + 各自 trap
+  handler 集成，是独立里程碑。
+- **下一执行项建议**：Phase G（按需 syscall：futex/select/clone…按应用
+  需求接入），或启动上述 NIC/PCI 抽象层 / copy_from_user fixup 两个
+  中型专项之一。
 
 ---
 
@@ -803,8 +825,9 @@ Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需�
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**SK-47** — 继续可移植片段（main.zig 剩余可共享块）；
-> SK-1…SK-46 已完成。
+> 当前下一执行项：可移植 boot 片段已收敛（SK-1…SK-46，见 3.44 复盘）；
+> 下一步为 **Phase G 按需 syscall** 或 NIC/PCI 抽象层 / copy_from_user
+> fixup 两个中型专项之一。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。

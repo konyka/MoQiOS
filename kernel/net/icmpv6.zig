@@ -7,7 +7,7 @@
 //
 // All ICMPv6 messages must include the IPv6 pseudo-header in their checksum.
 
-const e1000 = @import("../drivers/e1000.zig");
+const nic = @import("nic.zig");
 const netif = @import("netif.zig");
 const eth = @import("eth.zig");
 const ipv6 = @import("ipv6.zig");
@@ -102,7 +102,7 @@ pub fn sendEchoReply(
     bo.writeU16BeAt(&pkt, icmp_off + 2, csum);
 
     const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + len);
-    _ = e1000.sendPacket(&pkt, frame_len);
+    _ = nic.sendPacket(&pkt, frame_len);
 }
 
 fn handleNeighborSolicitation(
@@ -218,5 +218,5 @@ pub fn sendNeighborAdvertisement(
     bo.writeU16BeAt(&pkt, icmp_off + 2, csum);
 
     const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, total_payload);
-    _ = e1000.sendPacket(&pkt, frame_len);
+    _ = nic.sendPacket(&pkt, frame_len);
 }
