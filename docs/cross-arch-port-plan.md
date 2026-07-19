@@ -671,8 +671,30 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   语义不变：e1000 轮询、virtio-net 推送两条投递路径保持原样。
 - **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿（hello27 TCP
   经 facade 收发）。
-- **后续**：让 `nic.zig` 的驱动 import 按架构条件化（非 x86 空实现），再切
-  断 `net/*` → `drivers/pci.zig`/ACPI 的间接依赖，方能在非 x86 链接协议表。
+- **后续**：见 3.47（协议表首块搬上非 x86，已完成）。
+
+---
+
+### 3.47 共享 IPv4 头/校验和搬上非 x86（SK-47，2026-07-19）
+
+- **背景**：3.45/3.46 把 `net/*` 对具体 NIC 驱动的直连收敛到 `nic.zig` 一处
+  后，协议表里**纯逻辑**部分理论上已可移植，但从未在非 x86 编译过——整个
+  `net/*` 只在 x86 被 `net/mod.zig` 初始化路径拉起，非 x86 从不触及，无从
+  验证「协议逻辑真的架构无关」。
+- **观察**：`net/ipv4.zig` 仅依赖 `lib/byte_order.zig`，两者皆 std-free、
+  无任何 arch/驱动依赖，`buildHeader`/`parseHeader`/`checksum`（RFC 1071）
+  是纯字节运算，天然可移植。
+- **方案**：新增 `shared/sk47.zig` 探针，把 `net/ipv4.zig` 编入非 x86 镜像
+  并实跑：(1) `buildHeader` 产出的头对自身 20 字节做校验和须为 0(RFC 1071
+  自校验)；(2) `parseHeader` 回读 src/dst/protocol/长度一致；(3) 翻转一位
+  后校验和必须非 0(能抓损坏)。这是**协议表第一块真正编译并运行在
+  riscv64/aarch64 上**,同时作为回归护栏,防止日后往 ipv4.zig 里塞进 x86
+  依赖。
+- **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
+  串口打印 `[SK-47] shared ipv4 header/checksum: OK`。
+- **后续**：继续按依赖洁净度把协议表纯逻辑块(ipv6 伪头、tcp/udp 校验和、
+  ethernet/arp 帧构造)逐块用探针搬上非 x86;有状态、依赖驱动/定时器的部分
+  (socket 表、重传、ARP 缓存)留到 `nic.zig` 驱动 import 条件化之后。
 
 ---
 
