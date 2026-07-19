@@ -599,10 +599,15 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   fat32 驱逐时写回回调注册）为最后几个未收敛的可移植 boot 片段之一；
   共享写回缓冲缓存（`fs/writeback.zig`）此前从未在非 x86 编译/运行。
 - **方案**：`subsystem_boot.initWritebackCallbacks()` 收敛入口，
-  main.zig 改调；`writeback.hasFlushCallback()` 作为探针面。
-- **探针**：`sk46` 经共享片段注册回调，校验 ext2/fat32 槽位均已接线，
-  再走 `writeBuffered`/`readBuffered` 做脏缓冲往返（fs_type/offset
-  键控命中与未命中、脏计数）；`[SK-46] shared writeback cache: OK`。
+  main.zig 改调。注意该入口只在 x86 被调用：注册 vfs 回调会把
+  `ext2.writeFile`/`fat32.writeFile` 及其下游 x86 块驱动（含大量内联
+  `pause` 汇编）拉进非 x86 编译，riscv64 baseline 直接编译失败——
+  所以非 x86 探针不走 vfs 注册，改用探针本地回调。
+- **探针**：`sk46` 直接练共享写回缓存：`writeBuffered`/`readBuffered`
+  脏缓冲往返、fs_type/offset 键控命中与未命中、脏计数非零；再以
+  probe-local 回调走 `flushFile`（与 `vfs.syncFile` 同一 comptime
+  回调路径）校验回调收到正确的 file_idx/offset/内容且脏计数清零；
+  `[SK-46] shared writeback cache: OK`。
 - **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 1 轮全绿。
 - **后续**：SK-47 — 继续可移植片段，或 Phase G 按需 syscall。
 
