@@ -93,6 +93,12 @@ pub fn isMapped(va: usize) bool {
     return (slot.pte.* & PTE_V) != 0;
 }
 
+/// SK-40: valid leaf with the U bit — page is user-accessible.
+pub fn isUserMapped(va: usize) bool {
+    const slot = walkAlloc(va, false) orelse return false;
+    return (slot.pte.* & (PTE_V | PTE_U)) == (PTE_V | PTE_U);
+}
+
 fn mapRangeIdentity(phys_lo: usize, phys_hi: usize, flags: MapFlags) bool {
     var p = phys_lo & ~(PAGE_SIZE - 1);
     const end = (phys_hi + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);

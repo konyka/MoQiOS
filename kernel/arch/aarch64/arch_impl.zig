@@ -123,6 +123,24 @@ pub const paging = struct {
     pub fn mapHugePage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void {
         try mapPage(pml4_phys, virt, phys, flags);
     }
+
+    /// SK-40: root table currently loaded in the MMU (TTBR0_EL1).
+    pub fn currentRoot() u64 {
+        const ttbr0 = asm volatile ("mrs %[v], ttbr0_el1"
+            : [v] "=r" (-> u64));
+        return ttbr0 & 0x0000_FFFF_FFFF_FFFE;
+    }
+
+    /// SK-40: bring-up runs a single stage-1 space; root arg kept for parity.
+    pub fn isUserAccessible(root_phys: u64, virt: u64) bool {
+        _ = root_phys;
+        return a64pag.isUserMapped(@intCast(virt));
+    }
+
+    /// SK-40: PSTATE.PAN is not enabled at EL1 — EL1 can already touch
+    /// EL0-accessible pages, so the brackets are no-ops.
+    pub fn userAccessBegin() void {}
+    pub fn userAccessEnd() void {}
 };
 
 pub const timer = struct {

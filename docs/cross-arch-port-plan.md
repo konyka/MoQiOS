@@ -13,10 +13,10 @@
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
   **SK-8**…**SK-33**：facade、portable mm、时间片原生用户抢占、探针阶梯、slab/page_cache。
-  **SK-34**…**SK-39（2026-07-19）**：tmpfs/random、cpu surfaces/symbol_table、
+  **SK-34**…**SK-40（2026-07-19）**：tmpfs/random、cpu surfaces/symbol_table、
   阶梯收尾、非 x86 BSS 瘦身（readahead 窗口 + 符号表 + env 缓冲 + FdTable
-  按架构裁剪；非 x86 Task 62KB→**4.5KB**）；
-  探针 `[SK-39] slim fd table: OK`。
+  按架构裁剪；非 x86 Task 62KB→**4.5KB**）、copy_from_user 走 arch facade
+  （satp/TTBR0 + SUM）；探针 `[SK-40] portable copy_from_user: OK`。
   完整 `main.zig` / Limine 驱动仍未在非 x86 链接。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
@@ -414,6 +414,23 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **后续**：SK-40 — 继续可移植片段（如 sched/task 剩余 boot 片段或
   copy_from_user 边界防护移植准备）。
 
+### 3.37 SK-40 完成记录（2026-07-19）
+
+- **动机**：`mm/copy_from_user.zig` 内联读 CR3 并直接走 x86 页表
+  （`paging.getPageEntry`），是共享内核里最后的硬编码 x86 依赖之一；
+  非 x86 一旦引用任何 fd/env 系统调用路径就无法编译。
+- **方案**：arch facade 增加三组接口并接入 `copy_from_user`：
+  `paging.currentRoot`（x86 CR3 / riscv satp→phys / aarch64 TTBR0_EL1）、
+  `paging.isUserAccessible`（x86 走 PTE.user；riscv Sv39 walk 查 V+U 位；
+  aarch64 walk 查 AP[1]，块/页均覆盖）、`userAccessBegin/End`
+  （riscv 置/清 `sstatus.SUM`，S-mode 才能读写 U 页；x86/aarch64 no-op，
+  SMAP/PAN 未启用）。拷贝逻辑与 x86 行为零变化。
+- **探针**：映射真实用户页后 `copyFromUser`/`copyToUser` 往返，
+  并验证未映射用户地址与内核区指针均被拒绝返回 0；
+  `[SK-40] portable copy_from_user: OK`。
+- **后续**：SK-41 — 继续可移植片段（sched/task 剩余 boot 片段，
+  或将用户 IRQ 探针之外的 M6 user.enter 复用共享 copy 防护）。
+
 ---
 
 ## 4. M8 进度（x86_64 SMP）
@@ -598,16 +615,16 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-39
-Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-39
+Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-40
+Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-40
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**SK-40** — 继续可移植片段（剩余 boot 片段、
-> copy_from_user 防护移植准备等）；SK-1…SK-39 已完成。
+> 当前下一执行项：**SK-41** — 继续可移植片段（剩余 boot 片段等）；
+> SK-1…SK-40 已完成。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。

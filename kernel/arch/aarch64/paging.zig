@@ -145,6 +145,21 @@ pub fn unmapPage(va: usize) void {
     tlbInvalidate(va);
 }
 
+/// SK-40: valid descriptor with AP[1] set — page is EL0-accessible.
+/// Handles both 2M blocks (L2 leaf) and 4K pages (L3 leaf).
+pub fn isUserMapped(va: usize) bool {
+    const l1d = tableAt(root_phys)[idxL1(va)];
+    if ((l1d & (DESC_VALID | DESC_TABLE)) != (DESC_VALID | DESC_TABLE)) return false;
+    const l2d = tableAt(@intCast(l1d & 0x0000fffffffff000))[idxL2(va)];
+    if ((l2d & DESC_VALID) == 0) return false;
+    if ((l2d & DESC_TABLE) == 0) {
+        return (l2d & (@as(u64, 1) << 6)) != 0; // block: AP[1]
+    }
+    const l3d = tableAt(@intCast(l2d & 0x0000fffffffff000))[idxL3(va)];
+    if ((l3d & DESC_VALID) == 0) return false;
+    return (l3d & (@as(u64, 1) << 6)) != 0; // page: AP[1]
+}
+
 fn mapBlock2MIdentity(pa: usize, flags: u8) bool {
     const l1 = tableAt(root_phys);
     const l2p = ensureL2(l1, pa);

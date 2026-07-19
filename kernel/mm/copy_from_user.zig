@@ -2,22 +2,17 @@
 ///
 /// Validates that user pointers are in user space (< USER_LIMIT) before copying.
 /// If the address range extends into kernel space or overflows, returns 0 (no bytes copied).
-/// For truly safe fault recovery, an assembly-level RIP-range guard is needed (TODO).
+/// SK-40: page-walk and root-table reads go through the arch facade
+/// (`paging.currentRoot` / `paging.isUserAccessible`), and copies are
+/// bracketed by `userAccessBegin/End` (riscv64 sstatus.SUM; no-op elsewhere).
+/// For truly safe fault recovery, an instruction-level guard is still TODO.
 const paging = @import("../arch/arch.zig").paging;
 
 /// User-space address limit (canonical hole start).
 pub const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
 
-/// Physical address of the page table currently loaded in CR3.
-inline fn currentPml4() u64 {
-    const cr3 = asm volatile ("mov %%cr3, %[v]"
-        : [v] "=r" (-> u64),
-    );
-    return cr3 & 0x000F_FFFF_FFFF_F000;
-}
-
 /// Prefer the running task's page table when available (SMP/AP syscall path).
-inline fn activePml4() u64 {
+inline fn activeRoot() u64 {
     const sched = @import("../proc/sched.zig");
     const task_mod = @import("../proc/task.zig");
     if (sched.currentTaskIndex()) |idx| {
@@ -25,7 +20,7 @@ inline fn activePml4() u64 {
             if (t.page_table_phys != 0) return t.page_table_phys;
         }
     }
-    return currentPml4();
+    return paging.currentRoot();
 }
 
 /// Verify every page in [addr, addr+len) is present and user-accessible in the
@@ -36,12 +31,11 @@ inline fn activePml4() u64 {
 /// is missing or not user-accessible.
 fn userRangeMapped(addr: u64, len: usize) bool {
     if (len == 0) return true;
-    const pml4 = activePml4();
+    const root = activeRoot();
     var page = addr & ~@as(u64, 0xFFF);
     const end = addr + len;
     while (page < end) : (page += 0x1000) {
-        const pte = paging.getPageEntry(pml4, page) orelse return false;
-        if (!pte.user) return false;
+        if (!paging.isUserAccessible(root, page)) return false;
     }
     return true;
 }
@@ -86,7 +80,9 @@ pub fn copyFromUser(dst: []u8, src_user: [*]const u8, count: usize) usize {
     // touching them, so a bad user pointer returns 0 instead of faulting.
     if (!userRangeMapped(src_addr, copy_len)) return 0;
 
+    paging.userAccessBegin();
     @memcpy(dst[0..copy_len], src_user[0..copy_len]);
+    paging.userAccessEnd();
     return copy_len;
 }
 
@@ -105,6 +101,8 @@ pub fn copyToUser(dst_user: [*]u8, src: []const u8, count: usize) usize {
     // before writing, so a bad user pointer returns 0 instead of faulting.
     if (!userRangeMapped(dst_addr, copy_len)) return 0;
 
+    paging.userAccessBegin();
     @memcpy(dst_user[0..copy_len], src[0..copy_len]);
+    paging.userAccessEnd();
     return copy_len;
 }

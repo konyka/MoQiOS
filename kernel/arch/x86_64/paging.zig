@@ -65,6 +65,24 @@ pub fn getKernelPml4() u64 {
     return kernel_pml4_phys;
 }
 
+/// SK-40: root table currently loaded in the MMU (CR3), for the portable
+/// copy_from_user facade.
+pub fn currentRoot() u64 {
+    return readCR3() & ADDR_MASK;
+}
+
+/// SK-40: true when `virt` is mapped user-accessible under `root_phys`.
+/// Same check copy_from_user did inline: walk present, U/S bit set.
+pub fn isUserAccessible(root_phys: u64, virt: u64) bool {
+    const pte = getPageEntry(root_phys, virt) orelse return false;
+    return pte.user;
+}
+
+/// SK-40: bracket kernel touches of user pages. No-ops on x86 (SMAP is not
+/// enabled); riscv64 toggles sstatus.SUM here.
+pub fn userAccessBegin() void {}
+pub fn userAccessEnd() void {}
+
 /// Map a 4KB virtual page to a physical frame.
 pub fn mapPage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void {
     try mapPageInner(pml4_phys, virt, phys, flags, true);

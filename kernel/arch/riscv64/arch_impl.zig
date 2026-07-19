@@ -125,6 +125,35 @@ pub const paging = struct {
         // No Sv39 huge helper yet — fall back to a single 4K map of the base.
         try mapPage(pml4_phys, virt, phys, flags);
     }
+
+    /// SK-40: root table currently loaded in the MMU (satp PPN → phys).
+    pub fn currentRoot() u64 {
+        const satp = asm volatile ("csrr %[v], satp"
+            : [v] "=r" (-> u64));
+        return (satp & 0xFFF_FFFF_FFFF) << 12;
+    }
+
+    /// SK-40: bring-up runs a single Sv39 address space; the root argument is
+    /// accepted for facade parity with x86 but the shared table is walked.
+    pub fn isUserAccessible(root_phys: u64, virt: u64) bool {
+        _ = root_phys;
+        return sv39.isUserMapped(@intCast(virt));
+    }
+
+    /// SK-40: S-mode loads/stores to U pages trap unless sstatus.SUM is set.
+    pub fn userAccessBegin() void {
+        asm volatile ("csrs sstatus, %[b]"
+            :
+            : [b] "r" (@as(u64, 1) << 18),
+            : .{ .memory = true });
+    }
+
+    pub fn userAccessEnd() void {
+        asm volatile ("csrc sstatus, %[b]"
+            :
+            : [b] "r" (@as(u64, 1) << 18),
+            : .{ .memory = true });
+    }
 };
 
 pub const timer = struct {
