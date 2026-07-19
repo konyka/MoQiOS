@@ -27,7 +27,7 @@ pub fn announce() void {
         return;
     }
 
-    const idle_idx = sched_boot.createIdleThread(stubPark) orelse {
+    const idle_idx = sched_boot.createIdleThreadWith(stubPark) orelse {
         arch.serial.writeString("[SK-19] FAILED: idle\n");
         return;
     };

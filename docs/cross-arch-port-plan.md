@@ -13,11 +13,12 @@
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
   **SK-8**…**SK-33**：facade、portable mm、时间片原生用户抢占、探针阶梯、slab/page_cache。
-  **SK-34**…**SK-41（2026-07-19）**：tmpfs/random、cpu surfaces/symbol_table、
+  **SK-34**…**SK-42（2026-07-19）**：tmpfs/random、cpu surfaces/symbol_table、
   阶梯收尾、非 x86 BSS 瘦身（readahead 窗口 + 符号表 + env 缓冲 + FdTable
   按架构裁剪；非 x86 Task 62KB→**4.5KB**）、copy_from_user 走 arch facade
   （satp/TTBR0 + SUM），M6/M9-6 用户 `sys_write` 复用共享防护；
-  探针 `[SK-41] user write via shared copy: OK`。
+  main.zig idle 线程 / boot 尾部 idle 循环收敛进 `sched_boot`；
+  探针 `[SK-42] shared idle boot fragment: OK`。
   完整 `main.zig` / Limine 驱动仍未在非 x86 链接。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
@@ -504,6 +505,27 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
      覆写 kstack 上的返回地址与 IRQ 帧。P1 降级关闭。
 - **后续**：SK-42 — 继续可移植片段（sched/task 剩余 boot 片段收敛）。
 
+### 3.39 SK-42 完成记录（2026-07-19）
+
+- **动机**：main.zig 仍保留两处本地 x86 boot 片段——私有 `idleThread`
+  （裸 `hlt`，且不与共享 `sched.kernelIdleLoop` 同体）和 `_start` 尾部的
+  内联 `sti`+`hlt` 循环；与非 x86 引导路径不共享。
+- **方案**：`sched_boot` 收敛两个片段：
+  1. `createIdleThread()` 去掉 entry 参数，固定使用共享
+     `sched.kernelIdleLoop`（enableIrq + waitForInterrupt，SK-12 起即为
+     可移植 idle 体，AP idle 也早已用它）；探针阶梯里自带 idle stub 的
+     旧里程碑（sk19/20/22/23/24）改走 `createIdleThreadWith(entry)`。
+  2. 新增 `bootIdleLoop()`：可移植的 `_start` 尾部（enableIrq + wfi 循环），
+     main.zig 删除内联 `sti`/`hlt` 与私有 `idleThread`。
+- **探针**：非 x86 上按 main.zig 完全相同的片段序列
+  `initBspRunQueue()` → `createIdleThread()`，校验 BSP 队列已 prime、
+  优先级 255、`prepareTaskFrame` 后 frame.rip == `kernelIdleLoop`；
+  `[SK-42] shared idle boot fragment: OK`（x86 仅打印标记，main.zig
+  路径本身即验证）。
+- **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 1 轮全绿。
+- **后续**：SK-43 — 继续可移植片段（ramdisk/loader 或 vfs 写回回调等
+  main.zig 剩余可共享块），或 Phase G 按需 syscall。
+
 ---
 
 ## 4. M8 进度（x86_64 SMP）
@@ -688,16 +710,16 @@ Phase B — AP 并行用户态         ✅ M8-5b-2d（round-robin flat@AP + ELF@
 Phase C — 浮点与迁移前置        ✅ M8-5b-3（FXSAVE/FXRSTOR）
 Phase D — TLB 性能              ✅ M8-6（shootdown 描述符 + invlpg 范围）
 Phase E — 调度器扩展性          ✅ M8-7（per-CPU runqueue + work-stealing）
-Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-41
-Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-41
+Phase F — 第二 ISA              ✅ M2–M7；✅ SK-1…SK-42
+Phase F2 — 第三 ISA             ✅ M9-7；✅ SK-1…SK-42
 Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需求逐个接入）
 ```
 
 ### 5.4 历史设计备忘（M8-5b-2d/2c — 已完成）
 
 > 下列步骤在 2026-06 已落地；保留作调查记录，**不再是下一执行项**。
-> 当前下一执行项：**SK-42** — 继续可移植片段（剩余 boot 片段等）；
-> SK-1…SK-41 已完成。
+> 当前下一执行项：**SK-43** — 继续可移植片段（main.zig 剩余可共享块）；
+> SK-1…SK-42 已完成。
 > M3–M7（blk+net）与 M9-1…M9-7 已于 2026-07-11 完成。
 
 **原 5b-2d 目标**（已完成）：flat round-robin@AP → ELF@AP；`saved_user_rsp` 入 Task。

@@ -238,8 +238,9 @@ export fn _start() callconv(.c) noreturn {
         klog.log(.info, "Module request has no response");
     }
 
-    // Create kernel idle thread (priority 255 = lowest, runs when nothing else is ready)
-    _ = sched_boot.createIdleThread(idleThread) orelse {
+    // Create kernel idle thread (priority 255 = lowest, runs when nothing else
+    // is ready) — SK-42: shared portable idle body (sched.kernelIdleLoop).
+    _ = sched_boot.createIdleThread() orelse {
         klog.log(.info, "Failed to create idle thread");
         while (true) asm volatile ("hlt");
     };
@@ -257,19 +258,9 @@ export fn _start() callconv(.c) noreturn {
 
     // Enable interrupts and start scheduler
     klog.log(.info, "Enabling interrupts...");
-    asm volatile ("sti");
-
     klog.log(.info, "=== MoQiOS scheduler active ===");
-    while (true) {
-        asm volatile ("hlt");
-    }
-}
-
-/// Kernel idle thread — lowest priority, halts CPU when no other tasks are runnable.
-fn idleThread() callconv(.c) void {
-    while (true) {
-        asm volatile ("hlt");
-    }
+    // SK-42: portable boot-context idle (enableIrq + waitForInterrupt loop).
+    sched_boot.bootIdleLoop();
 }
 
 /// Map the low memory region (0-1MB) via HHDM so ACPI tables and BIOS data

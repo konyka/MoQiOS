@@ -72,7 +72,7 @@ pub fn announce() void {
     wait_q = null;
     wait_node = .{ .task_idx = 0 };
 
-    const idle_idx = sched_boot.createIdleThread(idleMain) orelse {
+    const idle_idx = sched_boot.createIdleThreadWith(idleMain) orelse {
         arch.serial.writeString("[SK-20] FAILED: idle\n");
         return;
     };

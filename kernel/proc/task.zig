@@ -328,7 +328,13 @@ pub fn pickKernelBootstrapForCpu(cpu: u8) ?u32 {
         const i: u32 = @intCast(@ctz(bits));
         bits &= bits - 1;
         const t = getTask(i) orelse continue;
-        if (t.state == .ready and !t.is_user and matchesCpu(t, cpu)) return i;
+        if (t.state == .ready and !t.is_user and matchesCpu(t, cpu)) {
+            // Same double-current guard as considerReady/popRunnable: an
+            // unpinned kernel thread just woken may still be another CPU's
+            // current until that CPU switches away.
+            if (isCurrentOnOtherCpu(i, cpu)) continue;
+            return i;
+        }
     }
     return null;
 }

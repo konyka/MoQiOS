@@ -88,7 +88,7 @@ pub fn announce() void {
     done = false;
     sched_boot.initBspRunQueue();
 
-    const idle_idx = sched_boot.createIdleThread(idleMain) orelse {
+    const idle_idx = sched_boot.createIdleThreadWith(idleMain) orelse {
         arch.serial.writeString("[SK-23] FAILED: idle\n");
         return;
     };
