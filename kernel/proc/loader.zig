@@ -22,43 +22,15 @@ pub const ExecResult = struct {
     brk: u64,
 };
 
-// ELF64 structures
-const EI_NIDENT = 16;
-const ELF_MAGIC = 0x464C457F; // \x7fELF in little-endian
-
-const Elf64_Ehdr = extern struct {
-    e_ident: [EI_NIDENT]u8,
-    e_type: u16,
-    e_machine: u16,
-    e_version: u32,
-    e_entry: u64,
-    e_phoff: u64,
-    e_shoff: u64,
-    e_flags: u32,
-    e_ehsize: u16,
-    e_phentsize: u16,
-    e_phnum: u16,
-    e_shentsize: u16,
-    e_shnum: u16,
-    e_shstrndx: u16,
-};
-
-const PT_LOAD = 1;
-const PT_INTERP = 3;
-const PF_X: u32 = 1;
-const PF_W: u32 = 2;
-const PF_R: u32 = 4;
-
-const Elf64_Phdr = extern struct {
-    p_type: u32,
-    p_flags: u32,
-    p_offset: u64,
-    p_vaddr: u64,
-    p_paddr: u64,
-    p_filesz: u64,
-    p_memsz: u64,
-    p_align: u64,
-};
+// ELF64 structures + header/phdr parsing live in the shared module (SK-44).
+const elf = @import("elf.zig");
+const Elf64_Ehdr = elf.Elf64_Ehdr;
+const Elf64_Phdr = elf.Elf64_Phdr;
+const PT_LOAD = elf.PT_LOAD;
+const PT_INTERP = elf.PT_INTERP;
+const PF_X = elf.PF_X;
+const PF_W = elf.PF_W;
+const PF_R = elf.PF_R;
 
 // Auxiliary vector types (Linux ABI)
 const AT_NULL: u64 = 0;
@@ -239,43 +211,22 @@ pub fn loadProgram(name: []const u8, parent_tid: u32) ?u32 {
         return null;
     }
 
-    // Check for ELF magic
-    if (binary_size >= @sizeOf(Elf64_Ehdr)) {
-        if (file.data[0] == 0x7F and file.data[1] == 'E' and
-            file.data[2] == 'L' and file.data[3] == 'F')
-        {
-            // Copy ELF header to aligned stack buffer
-            var ehdr_buf: [@sizeOf(Elf64_Ehdr)]u8 align(@alignOf(Elf64_Ehdr)) = undefined;
-            @memcpy(ehdr_buf[0..@sizeOf(Elf64_Ehdr)], file.data[0..@sizeOf(Elf64_Ehdr)]);
-            const ehdr: *const Elf64_Ehdr = @ptrCast(&ehdr_buf);
-            return loadElf(file, ehdr, name, parent_tid);
-        }
+    // ELF path: shared validation (SK-44). A file with ELF magic that fails
+    // validation is an error — never fall through to the flat-binary loader.
+    if (elf.hasMagic(file.data, file.size)) {
+        const ehdr = elf.parseHeader(file.data, file.size) orelse {
+            serial.writeString("[loader] Invalid ELF header\n");
+            return null;
+        };
+        return loadElf(file, &ehdr, name, parent_tid);
     }
 
     // Flat binary fallback
     return loadFlatBinary(file, name, parent_tid);
 }
 
-/// Load an ELF64 executable.
+/// Load an ELF64 executable (header already validated by elf.parseHeader).
 fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8, parent_tid: u32) ?u32 {
-    // Validate ELF header
-    if (ehdr.e_ident[4] != 2) { // ELFCLASS64
-        serial.writeString("[loader] Not a 64-bit ELF\n");
-        return null;
-    }
-    if (ehdr.e_ident[5] != 1) { // ELFDATA2LSB
-        serial.writeString("[loader] Not little-endian ELF\n");
-        return null;
-    }
-    if (ehdr.e_machine != 0x3E) { // EM_X86_64
-        serial.writeString("[loader] Not x86_64 ELF\n");
-        return null;
-    }
-    if (ehdr.e_type != 2 and ehdr.e_type != 3) { // ET_EXEC or ET_DYN
-        serial.writeString("[loader] Not an executable ELF\n");
-        return null;
-    }
-
     const user_pml4 = user_space.createUserSpace() orelse {
         serial.writeString("[loader] OOM for user PML4\n");
         return null;
@@ -289,41 +240,23 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
 
     // Process each PT_LOAD segment
     const phnum = ehdr.e_phnum;
-    const phentsize = ehdr.e_phentsize;
     const phoff = ehdr.e_phoff;
 
     // Scan for PT_INTERP (dynamic linker) and PT_PHDR
     var phdr_addr: u64 = 0;
     for (0..phnum) |i| {
-        if (phoff + (i + 1) * phentsize > file.size) break;
-        var phdr_buf: [@sizeOf(Elf64_Phdr)]u8 align(@alignOf(Elf64_Phdr)) = undefined;
-        const phdr_src_start = phoff + i * phentsize;
-        const phdr_copy_len = @min(phentsize, @sizeOf(Elf64_Phdr));
-        @memcpy(phdr_buf[0..phdr_copy_len], file.data[phdr_src_start .. phdr_src_start + phdr_copy_len]);
-        if (phdr_copy_len < @sizeOf(Elf64_Phdr)) {
-            @memset(phdr_buf[phdr_copy_len..], 0);
-        }
-        const phdr: *const Elf64_Phdr = @ptrCast(&phdr_buf);
+        const phdr = elf.readPhdr(file.data, file.size, ehdr, i) orelse break;
         if (phdr.p_type == PT_INTERP) {
             serial.writeString("[loader] PT_INTERP detected (dynamic linking not yet supported)\n");
             // Don't break — continue scanning for PT_PHDR
         }
-        if (phdr.p_type == 6) { // PT_PHDR
+        if (phdr.p_type == elf.PT_PHDR) {
             phdr_addr = phdr.p_vaddr;
         }
     }
 
     for (0..phnum) |i| {
-        if (phoff + (i + 1) * phentsize > file.size) break;
-        // Copy program header to aligned buffer for safe access
-        var phdr_buf: [@sizeOf(Elf64_Phdr)]u8 align(@alignOf(Elf64_Phdr)) = undefined;
-        const phdr_src_start = phoff + i * phentsize;
-        const phdr_copy_len = @min(phentsize, @sizeOf(Elf64_Phdr));
-        @memcpy(phdr_buf[0..phdr_copy_len], file.data[phdr_src_start .. phdr_src_start + phdr_copy_len]);
-        if (phdr_copy_len < @sizeOf(Elf64_Phdr)) {
-            @memset(phdr_buf[phdr_copy_len..], 0);
-        }
-        const phdr: *const Elf64_Phdr = @ptrCast(&phdr_buf);
+        const phdr = elf.readPhdr(file.data, file.size, ehdr, i) orelse break;
 
         if (phdr.p_type != PT_LOAD) continue;
 
@@ -592,32 +525,18 @@ pub fn loadProgramForExec(name: []const u8, argv: []const []const u8) ?ExecResul
     const file = ramdisk.findFile(name) orelse return null;
     const binary_size = file.size;
     if (binary_size == 0 or binary_size > 4 * 1024 * 1024) return null;
-    if (binary_size < @sizeOf(Elf64_Ehdr)) return null;
-    if (!(file.data[0] == 0x7F and file.data[1] == 'E' and file.data[2] == 'L' and file.data[3] == 'F')) return null;
-
-    var ehdr_buf: [@sizeOf(Elf64_Ehdr)]u8 align(@alignOf(Elf64_Ehdr)) = undefined;
-    @memcpy(ehdr_buf[0..@sizeOf(Elf64_Ehdr)], file.data[0..@sizeOf(Elf64_Ehdr)]);
-    const ehdr: *const Elf64_Ehdr = @ptrCast(&ehdr_buf);
-
-    if (ehdr.e_ident[4] != 2 or ehdr.e_ident[5] != 1 or ehdr.e_machine != 0x3E) return null;
-    if (ehdr.e_type != 2 and ehdr.e_type != 3) return null;
+    // Shared validation (SK-44): magic, class, endianness, machine, type.
+    const ehdr_v = elf.parseHeader(file.data, file.size) orelse return null;
+    const ehdr = &ehdr_v;
 
     const new_pml4 = user_space.createUserSpace() orelse return null;
     var highest_addr: u64 = 0;
     var success = true;
     var loaded_segments: u32 = 0;
     const phnum = ehdr.e_phnum;
-    const phentsize = ehdr.e_phentsize;
-    const phoff = ehdr.e_phoff;
 
     for (0..phnum) |i| {
-        if (phoff + (i + 1) * phentsize > file.size) break;
-        var phdr_buf: [@sizeOf(Elf64_Phdr)]u8 align(@alignOf(Elf64_Phdr)) = undefined;
-        const start = phoff + i * phentsize;
-        const clen = @min(phentsize, @sizeOf(Elf64_Phdr));
-        @memcpy(phdr_buf[0..clen], file.data[start .. start + clen]);
-        if (clen < @sizeOf(Elf64_Phdr)) @memset(phdr_buf[clen..], 0);
-        const phdr: *const Elf64_Phdr = @ptrCast(&phdr_buf);
+        const phdr = elf.readPhdr(file.data, file.size, ehdr, i) orelse break;
         if (phdr.p_type != PT_LOAD) continue;
 
         const seg_vaddr = phdr.p_vaddr;

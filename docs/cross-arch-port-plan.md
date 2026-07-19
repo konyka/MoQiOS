@@ -13,14 +13,16 @@
 
 - **架构抽象**：`kernel/arch/arch.zig` 已存在（M4）；x86_64 / riscv64 / aarch64 各有 `arch_impl.zig`。
   **SK-8**…**SK-33**：facade、portable mm、时间片原生用户抢占、探针阶梯、slab/page_cache。
-  **SK-34**…**SK-43（2026-07-19）**：tmpfs/random、cpu surfaces/symbol_table、
+  **SK-34**…**SK-44（2026-07-19）**：tmpfs/random、cpu surfaces/symbol_table、
   阶梯收尾、非 x86 BSS 瘦身（readahead 窗口 + 符号表 + env 缓冲 + FdTable
   按架构裁剪；非 x86 Task 62KB→**4.5KB**）、copy_from_user 走 arch facade
   （satp/TTBR0 + SUM），M6/M9-6 用户 `sys_write` 复用共享防护；
   main.zig idle 线程 / boot 尾部 idle 循环收敛进 `sched_boot`；
-  共享 ramdisk 解析首次在非 x86 运行；
+  共享 ramdisk 解析首次在非 x86 运行；loader ELF64 头/phdr 解析抽出
+  共享 `proc/elf.zig`（EM_CURRENT 按 arch 选择）；
   探针 `[SK-42] shared idle boot fragment: OK`、
-  `[SK-43] shared ramdisk parse: OK`。
+  `[SK-43] shared ramdisk parse: OK`、
+  `[SK-44] shared elf header parse: OK`。
   完整 `main.zig` / Limine 驱动仍未在非 x86 链接。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
@@ -546,6 +548,28 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 1 轮全绿。
 - **后续**：SK-44 — 继续可移植片段（loader ELF 头解析或 vfs 写回回调
   等 main.zig 剩余可共享块），或 Phase G 按需 syscall。
+
+### 3.41 SK-44 完成记录（2026-07-19）
+
+- **动机**：`proc/loader.zig` 的 ELF64 解析核心（magic/class/endian/
+  machine/type 校验 + 有界、对齐安全的 phdr 读取）在三处内联重复
+  （`loadProgram` / `loadElf` / `loadProgramForExec`），且 e_machine
+  写死 EM_X86_64，非 x86 无法复用。
+- **方案**：抽出共享 `proc/elf.zig`：`hasMagic` / `parseHeader`
+  （拷贝到对齐缓冲 + 全部校验，返回值语义）/ `readPhdr`（越界返回
+  null；短 phentsize 零扩展，与 loader 历史行为一致）；`EM_CURRENT`
+  按 comptime arch 选 EM_X86_64 / EM_RISCV / EM_AARCH64。loader 三处
+  内联全部替换（净 -87 行），页映射等 x86 专属部分不动。语义收紧一处：
+  带 ELF magic 但校验失败的文件现在直接报错，不再落入 flat-binary
+  回退。
+- **探针**：`sk44` 在非 x86 上合成最小 ELF64 镜像（Ehdr + PT_LOAD +
+  PT_PHDR），走 `parseHeader` → `readPhdr` 序列校验字段，并验证
+  wrong-machine / 截断 header / 越界 phdr index 均被拒绝；
+  `[SK-44] shared elf header parse: OK`（x86 仅打印标记，init 加载
+  路径即真实验证）。两个非 x86 冒烟脚本断言该标记。
+- **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 1 轮全绿。
+- **后续**：SK-45 — 继续可移植片段（vfs 写回回调注册、buildUserStack
+  的 auxv 部分等），或 Phase G 按需 syscall。
 
 ---
 
