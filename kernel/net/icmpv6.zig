@@ -28,7 +28,7 @@ const OPT_TARGET_LL_ADDR: u8 = 2;
 
 /// Compute the ICMPv6 checksum over the pseudo-header + ICMPv6 message.
 /// `data` points at the start of the ICMPv6 header (with checksum field zeroed).
-fn checksum(
+pub fn checksum(
     src: [16]u8,
     dst: [16]u8,
     data: [*]const u8,
@@ -171,6 +171,55 @@ fn handleNeighborAdvertisement(src_ip: [16]u8, data: [*]const u8, len: u16) void
     }
 }
 
+/// Build a Neighbor Advertisement frame into `out`, claiming `target` is at
+/// `our_mac`, destined for `dst_mac`. Pure: caller supplies both MACs, no
+/// ndp/netif/nic side effects — arch-clean and testable in isolation.
+/// Returns the total ethernet frame length.
+pub fn buildNeighborAdvertisement(
+    out: [*]u8,
+    requester_ip: [16]u8,
+    target: [16]u8,
+    our_mac: [6]u8,
+    dst_mac: [6]u8,
+    solicited: bool,
+) u16 {
+    // ICMPv6 NA = 24 bytes header + 8-byte Target LL Addr option = 32 bytes
+    const icmp_len: u16 = 32;
+    const total_payload: u16 = ipv6.HEADER_LEN + icmp_len;
+    const eth_len: u16 = 14;
+    const ip_off: u16 = eth_len;
+    const icmp_off: u16 = eth_len + ipv6.HEADER_LEN;
+
+    // ICMPv6 NA fields
+    out[icmp_off + 0] = NEIGHBOR_ADVERTISEMENT;
+    out[icmp_off + 1] = 0; // code
+    out[icmp_off + 2] = 0; // checksum (filled below)
+    out[icmp_off + 3] = 0;
+
+    // Flags: R=0, S=solicited, O=1 (override).
+    var flags: u8 = 0x20; // O bit
+    if (solicited) flags |= 0x40; // S bit
+    out[icmp_off + 4] = flags;
+    out[icmp_off + 5] = 0;
+    out[icmp_off + 6] = 0;
+    out[icmp_off + 7] = 0;
+
+    // Target address
+    @memcpy(out[icmp_off + 8 .. icmp_off + 24], &target);
+
+    // Target Link-Layer Address option (type=2, len=1 unit=8 bytes)
+    out[icmp_off + 24] = OPT_TARGET_LL_ADDR;
+    out[icmp_off + 25] = 1;
+    @memcpy(out[icmp_off + 26 .. icmp_off + 32], &our_mac);
+
+    ipv6.buildHeader(out + ip_off, target, requester_ip, ipv6.PROTO_ICMPV6, icmp_len);
+
+    const csum = checksum(target, requester_ip, out + icmp_off, icmp_len);
+    bo.writeU16BeAt(out, icmp_off + 2, csum);
+
+    return eth.buildFrame(out, dst_mac, our_mac, eth.ETHERTYPE_IPV6, total_payload);
+}
+
 /// Send a Neighbor Advertisement to `requester_ip` claiming `target` is at our MAC.
 /// `solicited` indicates whether this NA is in response to an NS (sets S flag).
 pub fn sendNeighborAdvertisement(
@@ -181,42 +230,7 @@ pub fn sendNeighborAdvertisement(
     const dst_mac = ndp.lookup(requester_ip) orelse return;
     const our_mac = netif.getMac();
 
-    // ICMPv6 NA = 24 bytes header + 8-byte Target LL Addr option = 32 bytes
-    const icmp_len: u16 = 32;
-    const total_payload: u16 = ipv6.HEADER_LEN + icmp_len;
-
     var pkt: [128]u8 = @splat(0);
-    const eth_len: u16 = 14;
-    const ip_off: u16 = eth_len;
-    const icmp_off: u16 = eth_len + ipv6.HEADER_LEN;
-
-    // ICMPv6 NA fields
-    pkt[icmp_off + 0] = NEIGHBOR_ADVERTISEMENT;
-    pkt[icmp_off + 1] = 0; // code
-    pkt[icmp_off + 2] = 0; // checksum (filled below)
-    pkt[icmp_off + 3] = 0;
-
-    // Flags: R=0, S=solicited, O=1 (override).
-    var flags: u8 = 0x20; // O bit
-    if (solicited) flags |= 0x40; // S bit
-    pkt[icmp_off + 4] = flags;
-    pkt[icmp_off + 5] = 0;
-    pkt[icmp_off + 6] = 0;
-    pkt[icmp_off + 7] = 0;
-
-    // Target address
-    @memcpy(pkt[icmp_off + 8 .. icmp_off + 24], &target);
-
-    // Target Link-Layer Address option (type=2, len=1 unit=8 bytes)
-    pkt[icmp_off + 24] = OPT_TARGET_LL_ADDR;
-    pkt[icmp_off + 25] = 1;
-    @memcpy(pkt[icmp_off + 26 .. icmp_off + 32], &our_mac);
-
-    ipv6.buildHeader(pkt[ip_off..].ptr, target, requester_ip, ipv6.PROTO_ICMPV6, icmp_len);
-
-    const csum = checksum(target, requester_ip, pkt[icmp_off..].ptr, icmp_len);
-    bo.writeU16BeAt(&pkt, icmp_off + 2, csum);
-
-    const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, total_payload);
+    const frame_len = buildNeighborAdvertisement(&pkt, requester_ip, target, our_mac, dst_mac, solicited);
     _ = nic.sendPacket(&pkt, frame_len);
 }

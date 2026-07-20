@@ -869,9 +869,30 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   模块上移扫清顾虑。
 - **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
   打印 `[SK-56] ndp neighbor cache/eui64 non-x86: OK`。
-- **后续**:icmpv6 现在依赖(nic/netif/eth/ipv6/ndp/bo)全部就绪,可按 SK-55
-  模式抽出其 echo/NA/NS 回复构造做探针;tcp 剩余状态机/socket 表需先做可移植
-  网络定时器 facade;或转 Phase G 按需 syscall。
+- **后续**:见 3.57（icmpv6 校验和/NA 构造上移,已完成)。
+
+---
+
+### 3.57 ICMPv6 校验和 + 邻居通告构造搬上非 x86（SK-57,2026-07-20）
+
+- **背景**:SK-56 让 `ndp` 就绪后,`icmpv6.zig` 依赖(nic/netif/eth/ipv6/ndp/
+  bo)全部 arch-clean 且无定时器,可编入非 x86;但其 NA 回复埋在
+  `sendNeighborAdvertisement`(ndp.lookup + netif + nic 副作用),校验和为私有。
+- **方案**:按 SK-55 模式把 `checksum` 设为 `pub`、抽出纯的
+  `buildNeighborAdvertisement`(MAC 由调用方传入,无 ndp/netif/nic 副作用),
+  `sendNeighborAdvertisement` 委托它。新增 `shared/sk57.zig` 在非 x86 验证:
+  (1) ICMPv6 伪头校验和自校验(填入 csum 后整体重算为 0);(2) 完整 NA 帧——
+  ethertype、MAC 互换、IPv6 头(next=ICMPv6、src=target、dst=requester)、NA
+  类型/标志(S|O=0x60)、目标地址、Target-LL 选项=本机 MAC、以及 NA 消息的
+  ICMPv6 校验和有效。
+- **效果**:一个完整的 IPv6 邻居发现应答构造器(含伪头校验和)在 riscv64/
+  aarch64 实编实跑并被完整验证。至此 ICMPv4/ICMPv6 两个 echo/NDP 处理器的可移
+  植构造路径均已覆盖。x86 NDP 经委托后不变。
+- **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
+  打印 `[SK-57] icmpv6 checksum/NA builder non-x86: OK`。
+- **后续**:`net/*` 里剩下的主要是耦合定时器/调度的有状态引擎(tcp 状态机/重
+  传/拥塞、socket 表、dhcp/dns 的超时重试)。要继续需先做可移植网络定时器
+  facade(抽象 `idt.getTickCount`/超时轮询);或转 Phase G 按需 syscall。
 
 ---
 
