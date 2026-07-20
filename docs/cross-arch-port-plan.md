@@ -890,9 +890,29 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   植构造路径均已覆盖。x86 NDP 经委托后不变。
 - **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
   打印 `[SK-57] icmpv6 checksum/NA builder non-x86: OK`。
-- **后续**:`net/*` 里剩下的主要是耦合定时器/调度的有状态引擎(tcp 状态机/重
-  传/拥塞、socket 表、dhcp/dns 的超时重试)。要继续需先做可移植网络定时器
-  facade(抽象 `idt.getTickCount`/超时轮询);或转 Phase G 按需 syscall。
+- **后续**:见 3.58（tcp 时间源去 x86 化,已完成)。
+
+---
+
+### 3.58 TCP 时间源改走 arch facade（去掉最后的 rdtsc,SK-58,2026-07-20）
+
+- **背景**:排查 `tcp.zig` 距离编入非 x86 还差什么,发现两处时间相关的 x86 耦
+  合:`generateIss()` 用裸 `asm ("rdtsc")` 生成初始序号(ISS),`nowMs()` 读
+  tick 计数。前者是硬 x86 汇编,后者的 `idt.getTickCount()` 其实三架构都已实现。
+- **方案**:`generateIss()` 改用 `arch.tsc.read()`(x86 `rdtsc` / riscv
+  `rdtime` / aarch64 `cntvct_el0`,facade 早已三架构齐备),去掉 tcp 里最后一
+  处裸 x86 汇编。新增 `shared/sk58.zig` 在非 x86 验证 tcp 新依赖的两个时间源确
+  实可用:`arch.tsc.read()` 跨忙等单调不减、`getTickCount()` 可调用不崩,并按
+  `generateIss` 的方式折叠取 ISS 不崩。
+- **效果**:TCP 的时间路径完全去 x86 化。`tcp.zig` 现存的非可移植阻塞收敛为
+  `socket_opt`(→sched/task/copy_from_user)这一条依赖链,为后续拆分/条件化
+  该链后整体编译 tcp 铺平了时间源这一块。x86 TCP 行为不变(ISS 仍由 TSC 低位
+  生成,hello27+smp-stress 全过)。
+- **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
+  打印 `[SK-58] portable tcp time sources non-x86: OK`。
+- **后续**:tcp 剩余阻塞是 `socket_opt` 及其 sched/task/copy 依赖;可考察把
+  socket_opt 的纯选项存取(TCP_NODELAY 等位标志)与 sched/copy 耦合部分分离;
+  或转 Phase G 按需 syscall。
 
 ---
 

@@ -383,12 +383,10 @@ pub fn tcpClearSoError(tcb_idx: u32) void {
 }
 
 fn generateIss() u32 {
-    // Simple ISS: combine TSC low bits with port numbers
-    var tsc: u64 = 0;
-    asm volatile ("rdtsc"
-        : [result] "={rax}" (tsc),
-    );
-    return @truncate(tsc ^ (tsc >> 32));
+    // Simple ISS from the monotonic timestamp counter (rdtsc / rdtime /
+    // cntvct_el0 behind the arch facade — portable across arches).
+    const ts = @import("../arch/arch.zig").tsc.read();
+    return @truncate(ts ^ (ts >> 32));
 }
 
 // Ring buffer helpers — arch-clean math lives in tcp_util.zig.
