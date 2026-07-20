@@ -832,8 +832,28 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   续拆。x86 TCP 经委托后行为不变(hello27 + smp-stress 全过)。
 - **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
   打印 `[SK-54] tcp_util helpers non-x86: OK`。
-- **后续**:tcp 剩余部分(连接状态机、重传/超时、拥塞控制)与 socket 表耦合
-  定时器/调度,需先有可移植网络定时器 facade;或转 Phase G 按需 syscall。
+- **后续**:见 3.55（icmp echo 回复构造上移,已完成）。
+
+---
+
+### 3.55 ICMP echo 回复帧构造抽出并搬上非 x86（SK-55,2026-07-20）
+
+- **背景**:`icmp.zig` 依赖 `nic`/`netif`/`eth`/`ipv4`/`arp`/`bo`(全 arch-clean)
+  且无定时器,可编入非 x86;但其回复逻辑埋在 `handlePacket` 里(写本地缓冲后
+  接 arp/nic 副作用),不可观测、难验证。
+- **方案**:按既有模式把**回复帧构造**抽成纯函数 `icmp.buildEchoReply`
+  (无 arp/nic 副作用),`handlePacket` 委托它。新增 `shared/sk55.zig` 端到端
+  验证构造出的帧:帧长、ethertype、MAC 互换(dst=请求方/src=本机)、offset 14
+  的 IPv4 头自校验为 0 且协议=ICMP、地址=本机→对端、offset 34 的 ICMP 类型翻
+  为 0(reply)、ICMP 校验和有效(整体折叠为 0)、id/seq/payload 原样回显。
+- **效果**:一个完整的 L4 协议处理器(ICMP echo/ping 回复)在 riscv64/aarch64
+  实编实跑并被完整验证——覆盖 eth+ipv4+icmp 三层构造 + 双校验和。x86 ping 行
+  为不变(经委托)。
+- **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
+  打印 `[SK-55] icmp echo reply builder non-x86: OK`。
+- **后续**:icmpv6 依赖 `ndp`(含 `IrqSpinlock`,需查其 arch 依赖);tcp 剩余状
+  态机/重传/拥塞控制与 socket 表耦合定时器/调度,需先做可移植网络定时器
+  facade;或转 Phase G 按需 syscall。
 
 ---
 

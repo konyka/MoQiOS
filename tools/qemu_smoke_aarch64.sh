@@ -107,20 +107,21 @@ pass_markers() {
         grep -q "\[SK-51\] netif config non-x86: OK" "$LOG_FILE" &&
         grep -q "\[SK-52\] arp cache/state machine non-x86: OK" "$LOG_FILE" &&
         grep -q "\[SK-53\] udp ports/queues non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-54\] tcp_util helpers non-x86: OK" "$LOG_FILE"
+        grep -q "\[SK-54\] tcp_util helpers non-x86: OK" "$LOG_FILE" &&
+        grep -q "\[SK-55\] icmp echo reply builder non-x86: OK" "$LOG_FILE"
 }
 
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if pass_markers; then
-        echo "PASS: MoQiOS aarch64 M9-7+SK-54 smoke (shared probes + slim footprint/env + default timer + EL0/SVC)."
+        echo "PASS: MoQiOS aarch64 M9-7+SK-55 smoke (shared probes + slim footprint/env + default timer + EL0/SVC)."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         if pass_markers; then
-            echo "PASS: MoQiOS aarch64 M9-7+SK-54 smoke (shared probes + slim footprint/env + default timer + EL0/SVC)."
+            echo "PASS: MoQiOS aarch64 M9-7+SK-55 smoke (shared probes + slim footprint/env + default timer + EL0/SVC)."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -134,7 +135,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for aarch64 smoke markers."
-echo "Expected: SK-2..SK-4 + SK-6..SK-54 shared markers + M9-1..M9-7 markers."
+echo "Expected: SK-2..SK-4 + SK-6..SK-55 shared markers + M9-1..M9-7 markers."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1
