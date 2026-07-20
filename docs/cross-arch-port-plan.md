@@ -732,10 +732,33 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   合起来覆盖了非有状态 TX 头构造的全部纯逻辑。
 - **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
   打印 `[SK-49] shared eth framing + L2/L3 compose: OK`。
-- **后续**：剩余 `net/*` 纯逻辑多与状态/驱动耦合(arp 缓存、udp/tcp 走
-  `nic`/`netif`、socket 表、重传定时器)。下一步转向让 `nic.zig` 驱动 import
-  按架构条件化(非 x86 空实现),从而切断 `net/*` → `drivers/pci`/ACPI 间接
-  依赖,方能整体在非 x86 链接协议栈;或转 Phase G 按需 syscall。
+- **后续**：见 3.50（nic facade 架构条件化,已完成）。
+
+---
+
+### 3.50 nic facade 驱动 import 架构条件化（SK-50,2026-07-20）
+
+- **背景**：SK-47/48/49 把 arch-clean 的协议*逻辑*(eth/ipv4/ipv6)搬上了非
+  x86,但更外层的 `net/*`(arp/udp/tcp/netif 等经 `nic` 转发)仍无法在非 x86
+  链接,卡点正是 `nic.zig`:它**无条件** import `drivers/e1000.zig` +
+  `drivers/virtio_net.zig`,二者经 `drivers/pci.zig` → ACPI → 端口 I/O,全不
+  可移植。
+- **方案**：把两个驱动 import 收进 `const drivers = if (arch==x86_64) struct
+  {…} else struct {};`,四个 facade 入口(`isActive`/`getMAC`/`sendPacket`/
+  `receivePacket`)用 `if (comptime arch==x86_64)` 包住驱动分支——非 x86 走
+  comptime 裁剪后的 no-op 路径,零驱动/PCI/ACPI 依赖。新增 `shared/sk50.zig`
+  把 `nic.zig` 编入非 x86 镜像并逐个调用 facade,断言:未链接驱动时 NIC 非
+  active、MAC 全零、TX 安全拒绝、RX 返回 0(不触发缺失驱动的调用)。
+- **效果**：`nic.zig` 现在在非 x86 干净可编且行为安全;`net/*` 里唯一直连驱
+  动的文件已完成架构解耦。这是整体在非 x86 链接协议栈(而不止是单块纯逻辑)
+  的关键一步——上层 arp/udp/netif 的驱动侧依赖至此被 no-op facade 兜住。
+- **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
+  打印 `[SK-50] nic facade non-x86 no-op: OK`;x86 收发路径经 facade 完全不变
+  (hello27 TCP、smp-stress 全过)。
+- **后续**：沿依赖链上移,尝试把 `netif.zig`/`arp.zig` 等经 `nic` 的模块也编
+  入非 x86(它们还依赖 `netif` 配置与 `bo`,需逐个查 `pci`/定时器耦合);有
+  状态部分(socket 表、tcp 重传、arp 缓存 aging)留待引入可移植定时器/驱动
+  之后;或转 Phase G 按需 syscall。
 
 ---
 
