@@ -22,6 +22,7 @@ const ipv4 = @import("ipv4.zig");
 const arp = @import("arp.zig");
 const socket_opt = @import("socket_opt.zig");
 const bo = @import("../lib/byte_order.zig");
+const tcp_util = @import("tcp_util.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 // v53.13: Global TCP lock — protects TCB array, tcb_active_bitmap, and all TCB fields.
@@ -390,14 +391,13 @@ fn generateIss() u32 {
     return @truncate(tsc ^ (tsc >> 32));
 }
 
-// Ring buffer helpers
+// Ring buffer helpers — arch-clean math lives in tcp_util.zig.
 fn ringAvailable(head: u32, tail: u32, size: u32) u32 {
-    const used = ringDataLen(head, tail, size);
-    return size - used - 1;
+    return tcp_util.ringAvailable(head, tail, size);
 }
 
 fn ringDataLen(head: u32, tail: u32, size: u32) u32 {
-    return (tail -% head) % size;
+    return tcp_util.ringDataLen(head, tail, size);
 }
 
 // ─── TCP Header Construction ──────────────────────────────────────────────
@@ -560,23 +560,9 @@ fn timestampMs() u32 {
     return @truncate(idt.getTickCount() * 10); // ticks are ~10ms each, convert to ms
 }
 
-/// TCP checksum with IPv4 pseudo-header — uses optimized ipv4.checksum.
+/// TCP checksum with IPv4 pseudo-header — arch-clean impl in tcp_util.zig.
 fn tcpChecksum(src_ip: [4]u8, dst_ip: [4]u8, tcp_hdr: [*]const u8, tcp_len: u16) u16 {
-    // Build pseudo-header for checksum computation
-    var pseudo: [12]u8 = undefined;
-    @memcpy(pseudo[0..4], &src_ip);
-    @memcpy(pseudo[4..8], &dst_ip);
-    pseudo[8] = 0; // zero
-    pseudo[9] = 6; // TCP protocol
-    bo.writeU16BeAt(&pseudo, 10, tcp_len);
-
-    const pseudo_csum = ipv4.checksum(&pseudo, 12);
-    const data_csum = ipv4.checksum(tcp_hdr, tcp_len);
-
-    // Combine: ~(~pseudo + ~data) = fold sum of both
-    var sum: u32 = @as(u32, ~pseudo_csum & 0xFFFF) + @as(u32, ~data_csum & 0xFFFF);
-    sum = (sum & 0xFFFF) + (sum >> 16);
-    return @truncate(~sum);
+    return tcp_util.checksum(src_ip, dst_ip, tcp_hdr, tcp_len);
 }
 
 // ─── Incoming Packet Handling ─────────────────────────────────────────────
@@ -1888,7 +1874,7 @@ fn addSackBlock(tcb: *TcpTcb, left: u32, right: u32) void {
 fn isSacked(tcb: *const TcpTcb, seq: u32) bool {
     for (0..tcb.sack_scoreboard_count) |i| {
         const blk = &tcb.sack_scoreboard[i];
-        if (seq -% blk.left < blk.right -% blk.left) return true;
+        if (tcp_util.seqInWindow(seq, blk.left, blk.right)) return true;
     }
     return false;
 }

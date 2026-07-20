@@ -812,10 +812,28 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   无连接(udp)的非定时器逻辑均已可移植。
 - **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
   打印 `[SK-53] udp ports/queues non-x86: OK`。
-- **后续**:剩下的 `net/*` 大头是 `tcp.zig`(连接状态机 + 重传/超时定时器)与
-  socket 表/`socket_syscall`——都耦合定时器与调度,需先有可移植的网络定时器
-  facade;可先把 tcp 里纯逻辑(校验和、序号运算、头部构造)拆分探针,或转
-  Phase G 按需 syscall。
+- **后续**:见 3.54（tcp 纯逻辑抽出,已完成）。
+
+---
+
+### 3.54 TCP 纯逻辑抽出 `tcp_util.zig` 并搬上非 x86（SK-54,2026-07-20）
+
+- **背景**:`tcp.zig` 是耦合 idt/调度/锁的大型状态机,整体暂不能编入非 x86;
+  但其中环形缓冲数学、RFC 793 模序号比较、IPv4 伪头 TCP 校验和是**纯逻辑**,
+  不需要任何状态/定时器。
+- **方案**:抽出 `net/tcp_util.zig`(仅依赖 `bo`+`ipv4`,arch-clean):
+  `ringDataLen`/`ringAvailable`、`seqLt`/`seqGt`/`seqLeq`/`seqInWindow`、
+  `checksum`。`tcp.zig` 保留薄委托(13 处调用点不动),并把 `isSacked` 的
+  "序号在窗口内"判断改用 `tcp_util.seqInWindow`。新增 `shared/sk54.zig` 在非
+  x86 实跑:环形占用(含 tail 落后 head 的回绕)、序号比较(跨 32 位回绕边
+  界)、TCP 校验和自校验(填入 checksum 字段后整体重算须为 0)。
+- **效果**:TCP 的可移植纯逻辑(校验和 + 序号 + 环形数学)在 riscv64/aarch64
+  实编实跑并独立验证;剩余状态机部分被隔离,后续引入网络定时器 facade 时可继
+  续拆。x86 TCP 经委托后行为不变(hello27 + smp-stress 全过)。
+- **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
+  打印 `[SK-54] tcp_util helpers non-x86: OK`。
+- **后续**:tcp 剩余部分(连接状态机、重传/超时、拥塞控制)与 socket 表耦合
+  定时器/调度,需先有可移植网络定时器 facade;或转 Phase G 按需 syscall。
 
 ---
 
