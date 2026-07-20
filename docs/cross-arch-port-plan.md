@@ -941,9 +941,35 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   Phase G「按需 syscall」范畴,而非协议逻辑本身。
 - **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
   打印 `[SK-59] tcp engine links non-x86: OK`。
-- **后续**:协议栈纯逻辑面已基本全部搬上非 x86。下一步可转向 Phase G(把
-  socket/tcp 的 syscall 胶水在非 x86 按需接线),或回到 SK 主线继续收敛
-  `main.zig` 其余启动片段。
+- **后续**:见 3.60（DNS/DHCP 上非 x86,已完成)。
+
+---
+
+### 3.60 DNS 解析器 + DHCP 客户端搬上非 x86（含潜藏 bug 修复,SK-60,2026-07-20）
+
+- **背景**:清点 `net/` 剩余未上非 x86 的模块,`dns.zig`/`dhcp.zig` 依赖全是
+  已可移植的 udp/netif/byte_order + serial/getTickCount facade,唯一 x86 耦
+  合是忙等提示用的裸 `asm volatile ("pause")`(dns 一处、dhcp 两处)。
+- **方案**:三处 `pause` 改走 `arch.cpu.pause()`(x86 `pause` / riscv/aarch64
+  各自 hint,facade 早已齐备)。新增 `shared/sk60.zig`,用 `comptime _ = &fn`
+  强制分析两模块**全部 pub 入口**(DHCP DISCOVER/REQUEST 构造 + OFFER/ACK
+  选项解析、DNS 查询编码 + 响应解析 + LRU/TTL 缓存),并实跑非阻塞路径:点分
+  十进制字面量走纯 `isIpV4/parseIpV4`(无网络)、空名被拒为全零、DHCP 未配置时
+  DNS 回退 8.8.8.8、DHCP 默认全零 IP + /24 掩码。走网络轮询的 `queryDns`/
+  `discover`(会 poll getTickCount)只编译验证不实跑,避免 boot 探针里死等。
+- **潜藏 bug**:强制分析立刻暴露 `dns.zig` 的 `addToCache` 里
+  `cache[s].ttl = expiry`——`expiry` 是 u64(getTickCount 域),而 `ttl` 字段
+  声明为 u32,类型不匹配。此前 x86 从未有人引用 `dns.resolve`,整个 `dns.zig`
+  是死代码从未被类型检查,故该 bug 一直潜伏。将 `ttl` 字段改为 u64 修正(tick
+  计数本就是 u64 域,`lookupCache` 里的 `now > ttl` 比较也随之正确)。
+- **效果**:DNS/DHCP 两个应用层网络客户端在 riscv64/aarch64 实编实链,并顺带
+  修掉一个从未编译过的真实类型 bug。至此 `net/` 里的**协议逻辑 + 应用客户端**
+  纯逻辑面已全部搬上非 x86,剩下的只有 socket/tcp 的 syscall 胶水(copy_from_
+  user + sched 解析 fd),属 Phase G。x86 行为不变(pause 语义等价)。
+- **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
+  打印 `[SK-60] dns/dhcp link non-x86: OK`。
+- **后续**:网络栈纯逻辑面收官。下一步转 Phase G(非 x86 按需接 socket/tcp
+  syscall 胶水),或回 SK 主线继续收敛 `main.zig` 其余启动片段。
 
 ---
 

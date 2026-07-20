@@ -12,6 +12,7 @@
 ///
 /// Updates netif.zig with the acquired configuration.
 const serial = @import("../arch/arch.zig").serial;
+const cpu = @import("../arch/arch.zig").cpu;
 const udp = @import("udp.zig");
 const netif = @import("netif.zig");
 const idt = @import("../arch/arch.zig").interrupts;
@@ -111,12 +112,12 @@ pub fn discover() bool {
                     applyConfig();
                     return true;
                 }
-                asm volatile ("pause");
+                cpu.pause();
             }
             serial.writeString("[DHCP] No ACK received\n");
             return false;
         }
-        asm volatile ("pause");
+        cpu.pause();
     }
 
     serial.writeString("[DHCP] No OFFER received\n");

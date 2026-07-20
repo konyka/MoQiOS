@@ -6,6 +6,7 @@
 ///   - Simple 16-entry LRU cache with TTL expiry
 ///   - Kernel API: dnsResolve(hostname) → [4]u8
 const serial = @import("../arch/arch.zig").serial;
+const cpu = @import("../arch/arch.zig").cpu;
 const udp = @import("udp.zig");
 const netif = @import("netif.zig");
 const idt = @import("../arch/arch.zig").interrupts;
@@ -24,7 +25,7 @@ const DnsCacheEntry = struct {
     name: [64]u8,
     name_len: u8,
     ip: [4]u8,
-    ttl: u32, // Expiry tick count
+    ttl: u64, // Expiry tick count
     valid: bool = false,
     last_used: u64 = 0, // For LRU eviction
 };
@@ -127,7 +128,7 @@ fn queryDns(hostname: []const u8, dns_server: [4]u8) [4]u8 {
                 return result;
             }
         }
-        asm volatile ("pause");
+        cpu.pause();
     }
 
     serial.writeString("[DNS] Query timeout for ");
