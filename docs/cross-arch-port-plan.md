@@ -755,10 +755,27 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
   打印 `[SK-50] nic facade non-x86 no-op: OK`;x86 收发路径经 facade 完全不变
   (hello27 TCP、smp-stress 全过)。
-- **后续**：沿依赖链上移,尝试把 `netif.zig`/`arp.zig` 等经 `nic` 的模块也编
-  入非 x86(它们还依赖 `netif` 配置与 `bo`,需逐个查 `pci`/定时器耦合);有
-  状态部分(socket 表、tcp 重传、arp 缓存 aging)留待引入可移植定时器/驱动
-  之后;或转 Phase G 按需 syscall。
+- **后续**：见 3.51（netif 上移,已完成）。
+
+---
+
+### 3.51 网络接口配置（netif）搬上非 x86（SK-51,2026-07-20）
+
+- **背景**：SK-50 把驱动 import 关进 `nic.zig` 的 comptime arch gate 后,第一
+  个受益的上游消费者就是 `netif.zig`——它现在只 import `nic`(已 arch-clean)
+  + `arch.serial`(可移植),不再间接拖 pci/acpi。
+- **方案**：新增 `shared/sk51.zig` 把 `netif.zig` 编入非 x86 镜像并实跑:静态
+  接口配置(IP/网关/掩码为编译期常量,各架构一致)、以及惰性 MAC 缓存——无
+  NIC 时 `getMac()` 经 `nic.getMAC()` 解析为全零,且 `ensureInit()` 多次调用
+  幂等。
+- **效果**：证明 SK-50 的 nic 架构解耦确实**向上传导**——nic 的消费者(而非仅
+  nic 自身)也能在非 x86 链接运行。协议栈"配置层"至此可移植。
+- **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
+  打印 `[SK-51] netif config non-x86: OK`。
+- **后续**：继续沿依赖链上移试编 `arp.zig`(依赖 `nic`/`netif`/`eth`/`bo`,均
+  已就绪,但含 ARP 缓存状态与 aging,需查是否耦合定时器)、`udp.zig`/
+  `ipv4` 收发封装等;有状态/定时器耦合部分(socket 表、tcp 重传、arp 缓存
+  aging)留待可移植定时器之后;或转 Phase G 按需 syscall。
 
 ---
 
