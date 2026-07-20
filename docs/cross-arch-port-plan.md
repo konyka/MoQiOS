@@ -791,10 +791,31 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   辑全程真实执行,仅发送落到 no-op。证明架构解耦已支撑起带状态的协议模块。
 - **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
   打印 `[SK-52] arp cache/state machine non-x86: OK`。
-- **后续**:继续上移试编 `ipv4`/`udp` 收发封装(udp 依赖 `nic`/`netif`/`eth`/
-  `ipv4`/`arp`/`bo`,均已就绪,但 `udpSend`/`recvFrom` 含端口绑定表状态,需查
-  接收队列缓冲);tcp(重传定时器、连接状态机)与 socket 表留待可移植定时器之
-  后;或转 Phase G 按需 syscall。
+- **后续**:见 3.53（udp 端口/队列上移,已完成）。
+
+---
+
+### 3.53 UDP 端口绑定表/接收队列/发送路径搬上非 x86（SK-53,2026-07-20）
+
+- **背景**:SK-52 之后的下一环。`udp.zig` 依赖 `nic`/`netif`/`eth`/`ipv4`/
+  `arp`/`bo`(均已 arch-clean),状态是静态端口表 + 每端口接收队列,**无定时
+  器**,整块可编译运行于非 x86。
+- **方案**:新增 `shared/sk53.zig` 驱动**可观测的接收路径**:`ensurePort` 绑
+  定且幂等;向已绑定端口投递数据报 → `recvFrom` 读回负载/源 IP/源端口且长度
+  正确;队列排空后返回 0;未绑定端口的数据报被丢弃(接收不自动建表);队列
+  深度溢出(压 `QUEUE_DEPTH+1` 只保留 `QUEUE_DEPTH`)。`sendTo` 跑两条分
+  支——未解析 ARP → 返回 false 并发 ARP 请求(no-op);预置 ARP 缓存后 → 跑完
+  整 eth+ipv4+udp 整帧构造经 nic no-op,不崩(TX 在非 x86 尚不可观测,故仅验
+  无故障)。
+- **效果**:UDP 传输层(端口多路复用 + 收队列 + 发送封装)在 riscv64/aarch64
+  实编实跑,接收侧逻辑全程真实验证。至此 L2(eth/arp)+ L3(ipv4/ipv6)+ L4
+  无连接(udp)的非定时器逻辑均已可移植。
+- **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
+  打印 `[SK-53] udp ports/queues non-x86: OK`。
+- **后续**:剩下的 `net/*` 大头是 `tcp.zig`(连接状态机 + 重传/超时定时器)与
+  socket 表/`socket_syscall`——都耦合定时器与调度,需先有可移植的网络定时器
+  facade;可先把 tcp 里纯逻辑(校验和、序号运算、头部构造)拆分探针,或转
+  Phase G 按需 syscall。
 
 ---
 
