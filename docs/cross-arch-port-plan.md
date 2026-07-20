@@ -910,9 +910,40 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   生成,hello27+smp-stress 全过)。
 - **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
   打印 `[SK-58] portable tcp time sources non-x86: OK`。
-- **后续**:tcp 剩余阻塞是 `socket_opt` 及其 sched/task/copy 依赖;可考察把
-  socket_opt 的纯选项存取(TCP_NODELAY 等位标志)与 sched/copy 耦合部分分离;
-  或转 Phase G 按需 syscall。
+- **后续**:见 3.59（整机 tcp 引擎在非 x86 链接,已完成)。
+
+---
+
+### 3.59 整个 TCP 引擎在非 x86 链接（SK-59,2026-07-20）
+
+- **背景**:SK-58 曾把 `tcp.zig` 的剩余阻塞记为 `socket_opt`(→sched/task/
+  copy_from_user)这条依赖链。复查发现 `socket_opt.zig` 里 sched/task/
+  copy_from_user 全是**函数体内的惰性 `@import`**(在 `resolveTcpIdx` /
+  `sysSetSockopt` / `sysGetSockopt` 内),而 `tcp.zig` 只引用了
+  `socket_opt.SocketOptions` 这个纯结构体(顶层只 import `byte_order`)。
+  Zig 只分析被引用到的 decl,因此 tcp 引用 `SocketOptions` **不会**拖入
+  sched/copy_from_user——那条依赖链只有 x86 侧的 socket_syscall 走 setsockopt/
+  getsockopt 时才被实例化。也就是说,SK-58 去掉 rdtsc 后,tcp 引擎理论上已可在
+  非 x86 编译,阻塞判断本身过时了。
+- **方案**:用经验法直接证伪/证实。新增 `shared/sk59.zig`,在非 x86 用
+  `comptime { _ = &tcp.<fn>; }` 强制分析 `tcp.zig` 的**全部 28 个 pub 入口**
+  (handlePacket/tcpConnect/tcpSend/tcpRecv/timerTick/tcpListen/tcpAccept/
+  tcpShutdown/...),等价于把整台 TCP 状态机、重传、拥塞控制、SACK、选项路径
+  都编进 riscv64/aarch64;再在一张全新(全 inactive)的 TCB 表上实跑若干安全只读
+  路径:越界 `getTcbIdx` 返回 null、新 TCB `recvAvailable/sendSpace=0` 且
+  `isClosed`、越界 `tcpIsClosing` 视为关闭、`tcpGetAddrInfo` 对 inactive 返回
+  null、一个 4 字节 runt 包喂给 `handlePacket` 被安全忽略、`timerTick` 空表不崩。
+- **效果**:**整个 TCP 引擎(约 1800 行)在 riscv64/aarch64 干净全量编译并链接
+  通过**,非 x86 网络栈从 L2(eth)/L3(ipv4/ipv6/arp/ndp)/L4-无连接(udp/icmp/
+  icmpv6)一路打通到 **L4-有连接(tcp)** 的可编译面。x86 TCP 行为零改动(仅新增
+  一个 x86 侧直接打印 OK 的探针分支)。剩下真正与 x86/内核耦合的只有 syscall
+  胶水层(socket_syscall/socket_opt 的 copy_from_user + sched 解析 fd),属
+  Phase G「按需 syscall」范畴,而非协议逻辑本身。
+- **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
+  打印 `[SK-59] tcp engine links non-x86: OK`。
+- **后续**:协议栈纯逻辑面已基本全部搬上非 x86。下一步可转向 Phase G(把
+  socket/tcp 的 syscall 胶水在非 x86 按需接线),或回到 SK 主线继续收敛
+  `main.zig` 其余启动片段。
 
 ---
 
