@@ -851,9 +851,27 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   为不变(经委托)。
 - **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
   打印 `[SK-55] icmp echo reply builder non-x86: OK`。
-- **后续**:icmpv6 依赖 `ndp`(含 `IrqSpinlock`,需查其 arch 依赖);tcp 剩余状
-  态机/重传/拥塞控制与 socket 表耦合定时器/调度,需先做可移植网络定时器
-  facade;或转 Phase G 按需 syscall。
+- **后续**:见 3.56（ndp 邻居缓存上移,已完成)。
+
+---
+
+### 3.56 IPv6 邻居发现缓存 + EUI-64 搬上非 x86（SK-56,2026-07-20）
+
+- **背景**:icmpv6 依赖 `ndp`。查明 `ndp.zig` 只依赖 `ipv6`(arch-clean)+
+  `IrqSpinlock`,而后者是 **arch-neutral** 的(用 `arch.irq`/`arch.cpu.pause`
+  facade,SK-4 已中立化),且无定时器——整块邻居缓存可编译运行于非 x86。
+- **方案**:新增 `shared/sk56.zig`(IPv6 版的 SK-52 ARP 探针)在非 x86 实跑:
+  空缓存未命中 → `update`→`lookup` 命中 → 地址键控(异 IP 未命中)→
+  `markIncomplete` 占位态**不被 lookup 返回** → 再 `update` 解析为 reachable →
+  modified EUI-64 链路本地地址生成(fe80:: 前缀、插入 0xFFFE、翻 U/L 位)。
+- **效果**:IPv6 邻居发现的缓存层(带 IrqSpinlock 临界区)在 riscv64/aarch64
+  实编实跑并验证,顺带确认 `IrqSpinlock` 在非 x86 可用——为后续更多带锁网络
+  模块上移扫清顾虑。
+- **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
+  打印 `[SK-56] ndp neighbor cache/eui64 non-x86: OK`。
+- **后续**:icmpv6 现在依赖(nic/netif/eth/ipv6/ndp/bo)全部就绪,可按 SK-55
+  模式抽出其 echo/NA/NS 回复构造做探针;tcp 剩余状态机/socket 表需先做可移植
+  网络定时器 facade;或转 Phase G 按需 syscall。
 
 ---
 
