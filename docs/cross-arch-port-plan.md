@@ -713,9 +713,29 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   层原语(`ipv4.checksum` + `ipv6.pseudoHeaderChecksum`)。
 - **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
   打印 `[SK-48] shared ipv6 header/pseudo-csum: OK`。
-- **后续**：ethernet/arp 帧构造、tcp/udp 头组装等纯逻辑块继续逐块搬迁;有状
-  态、依赖驱动/定时器的部分(socket 表、重传、ARP 缓存、`nic.zig` 驱动
-  import 条件化)留到后续。
+- **后续**：见 3.49（eth 帧构造 + L2/L3 组合,已完成）。
+
+---
+
+### 3.49 共享 Ethernet 帧构造 + L2/L3 组合验证搬上非 x86（SK-49,2026-07-19）
+
+- **背景**：SK-47/48 分别单测了 L3 原语(ipv4/ipv6 头 + 校验和)。`net/eth.zig`
+  是最后一个 L2 帧构造原语,同样只依赖 `lib/byte_order.zig`,arch-clean。
+- **方案**：新增 `shared/sk49.zig`,不仅把 `eth.zig` 编入非 x86,更做**首个
+  组合(composition)测试**——按真实 TX 路径把原语叠起来:`eth.buildFrame`
+  造 14 字节以太头,`ipv4.buildHeader` 在 offset 14 铺 IPv4 头,然后验证分层
+  结果:(1) ethertype 回读为 IPv4;(2) DST/SRC MAC 顺序正确;(3) IPv4 头在
+  **非零偏移**处仍自校验和为 0(证明 `buildHeader` 与偏移无关、可在帧内组
+  合);(4) `parseHeader` 能透过组合帧读回 L3 字段。
+- **效果**：出站帧的 L2 + L3 头构造链路在 riscv64/aarch64 实编实跑,且验证了
+  可移植原语之间能正确互操作(不只是各自单测通过)。这三块(eth/ipv4/ipv6)
+  合起来覆盖了非有状态 TX 头构造的全部纯逻辑。
+- **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
+  打印 `[SK-49] shared eth framing + L2/L3 compose: OK`。
+- **后续**：剩余 `net/*` 纯逻辑多与状态/驱动耦合(arp 缓存、udp/tcp 走
+  `nic`/`netif`、socket 表、重传定时器)。下一步转向让 `nic.zig` 驱动 import
+  按架构条件化(非 x86 空实现),从而切断 `net/*` → `drivers/pci`/ACPI 间接
+  依赖,方能整体在非 x86 链接协议栈;或转 Phase G 按需 syscall。
 
 ---
 
