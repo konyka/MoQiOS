@@ -772,10 +772,29 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   nic 自身)也能在非 x86 链接运行。协议栈"配置层"至此可移植。
 - **验证**：三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
   打印 `[SK-51] netif config non-x86: OK`。
-- **后续**：继续沿依赖链上移试编 `arp.zig`(依赖 `nic`/`netif`/`eth`/`bo`,均
-  已就绪,但含 ARP 缓存状态与 aging,需查是否耦合定时器)、`udp.zig`/
-  `ipv4` 收发封装等;有状态/定时器耦合部分(socket 表、tcp 重传、arp 缓存
-  aging)留待可移植定时器之后;或转 Phase G 按需 syscall。
+- **后续**：见 3.52（arp 状态机上移,已完成）。
+
+---
+
+### 3.52 ARP 缓存/请求-应答状态机搬上非 x86（SK-52,2026-07-20）
+
+- **背景**：SK-51 之后的下一环。`arp.zig` 只 import `nic`/`netif`/`eth`/`bo`
+  (均已 arch-clean),且其缓存**无 aging、不耦合定时器**,整块(报文解析、缓
+  存增改查、请求/应答帧构造)可在非 x86 编译运行。
+- **方案**：新增 `shared/sk52.zig`,**首个在非 x86 驱动真实*有状态*协议模块**
+  的探针(此前都是纯头部数学)。场景:`init()` 清缓存 → 喂一个目标为本机 IP
+  的合成 ARP 请求帧给 `handlePacket()`(缓存 sender 并尝试应答,TX 落到 nic
+  非 x86 no-op)→ `resolve()` 命中缓存 MAC、未知 IP 返回 null → 同 IP 换新
+  MAC 的第二帧就地更新条目 → 过短帧被忽略不崩 → `sendArpRequest()` 经 no-op
+  facade 构帧不崩。
+- **效果**:ARP 层(L2/L3 地址解析)在 riscv64/aarch64 实编实跑,解析与缓存逻
+  辑全程真实执行,仅发送落到 no-op。证明架构解耦已支撑起带状态的协议模块。
+- **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
+  打印 `[SK-52] arp cache/state machine non-x86: OK`。
+- **后续**:继续上移试编 `ipv4`/`udp` 收发封装(udp 依赖 `nic`/`netif`/`eth`/
+  `ipv4`/`arp`/`bo`,均已就绪,但 `udpSend`/`recvFrom` 含端口绑定表状态,需查
+  接收队列缓冲);tcp(重传定时器、连接状态机)与 socket 表留待可移植定时器之
+  后;或转 Phase G 按需 syscall。
 
 ---
 
