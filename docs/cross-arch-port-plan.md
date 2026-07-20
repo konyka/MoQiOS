@@ -968,8 +968,36 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   user + sched 解析 fd),属 Phase G。x86 行为不变(pause 语义等价)。
 - **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
   打印 `[SK-60] dns/dhcp link non-x86: OK`。
-- **后续**:网络栈纯逻辑面收官。下一步转 Phase G(非 x86 按需接 socket/tcp
-  syscall 胶水),或回 SK 主线继续收敛 `main.zig` 其余启动片段。
+- **后续**:见 3.61（FAT32 纯解析/几何抽出上非 x86,已完成)。
+
+---
+
+### 3.61 FAT32 纯解析/几何抽出 `fat32_util.zig` 并搬上非 x86（SK-61,2026-07-20）
+
+- **背景**:网络栈纯逻辑收官后转向 `fs/`。`fat32.zig` 把 MBR 分区表解析、BPB
+  几何计算、簇→LBA / FAT 表项定位、簇分类等**纯逻辑**与 virtio_blk I/O、全局
+  挂载状态、DMA 缓冲混在一起(内联在 `parseMBR`/`tryMountFAT32`/`clusterToLBA`/
+  `getFATEntry`),既不可单测也无法上非 x86。
+- **方案**:仿 `tcp_util` 抽出 `fs/fat32_util.zig` 纯模块,无 driver/allocator/
+  全局依赖:`parsePartition`(MBR 分区项)、`isFat32Type`、`parseBpb`(校验 +
+  派生 fat_start/data_start/sector_mask/total_data_clusters 全套几何)、
+  `clusterToLba`、`fatEntryLocation`、`fatEntryValue`(28-bit 掩码)、
+  `isEndOfChain/isFreeCluster/isBadCluster/isValidDataCluster`。FAT32/MBR 均
+  小端,三架构也都小端,故用 `@bitCast([N]u8→uN)` 直读磁盘字段可移植。
+  `fat32.zig` 的四处内联逻辑改为 1:1 委托该模块(`Partition` 亦别名过去),
+  x86 行为逐字节等价。新增 `shared/sk61.zig` 在非 x86 用内存合成 MBR(一个
+  0x0C FAT32 分区 @LBA 2048)+ BPB(spc=8/reserved=32/2 FAT/fat_size=1009/
+  total=131072),精确校验:分区字段、空槽返回 null、BPB 几何
+  (fat_start=2080、data_start=4098、sector_mask=7、total_data_clusters=16127)、
+  非法 BPB 返回 null、`clusterToLba`、跨扇区 `fatEntryLocation`、带高位噪声的
+  28-bit `fatEntryValue`、以及 EOC/bad/free/valid 四个谓词。
+- **效果**:FAT32 的磁盘解析与几何数学从 I/O 层剥离,成为可单测、可移植的纯
+  模块,并在 riscv64/aarch64 实编实跑逐值验证。x86 FAT32 驱动经委托后行为不变
+  (smoke 全过)。这是 `fs/` 方向可移植化的第一块基石。
+- **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
+  打印 `[SK-61] fat32 parse/geometry non-x86: OK`。
+- **后续**:可继续抽 FAT32 的 8.3/LFN 短长文件名解析为纯函数,或转向 ext2
+  超级块/inode 解析的纯逻辑抽出。
 
 ---
 

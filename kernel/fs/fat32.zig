@@ -9,18 +9,14 @@ const virtio_blk = @import("../drivers/virtio_blk.zig");
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const fmt = @import("../lib/fmt.zig");
+const fat_util = @import("fat32_util.zig");
 
 pub const SECTOR_SIZE: u32 = 512;
 pub const MAX_PARTITIONS: u32 = 4;
 pub const MAX_FILES: u32 = 64;
 pub const MAX_FILENAME: u32 = 256;
 
-pub const Partition = struct {
-    bootable: bool,
-    type: u8,
-    lba_start: u32,
-    sector_count: u32,
-};
+pub const Partition = fat_util.Partition;
 
 pub const FileInfo = struct {
     name: [MAX_FILENAME]u8,
@@ -120,29 +116,19 @@ fn parseMBR(buf: [*]const u8) void {
     partition_count = 0;
     var i: u32 = 0;
     while (i < 4) : (i += 1) {
-        const off = 446 + i * 16;
-        const ptype = buf[off + 4];
-        if (ptype == 0) continue;
+        const part = fat_util.parsePartition(buf, i) orelse continue;
 
-        const lba_start: u32 = @bitCast([4]u8{ buf[off + 8], buf[off + 9], buf[off + 10], buf[off + 11] });
-        const sector_count: u32 = @bitCast([4]u8{ buf[off + 12], buf[off + 13], buf[off + 14], buf[off + 15] });
-
-        partitions[partition_count] = .{
-            .bootable = buf[off] == 0x80,
-            .type = ptype,
-            .lba_start = lba_start,
-            .sector_count = sector_count,
-        };
+        partitions[partition_count] = part;
         partition_count += 1;
 
         serial.writeString("[fs] Partition ");
         serial.writeByte('0' + @as(u8, @intCast(partition_count - 1)));
         serial.writeString(": type=0x");
-        fmt.writeHex8(ptype);
+        fmt.writeHex8(part.type);
         serial.writeString(" lba=");
-        fmt.writeDecimal(lba_start);
+        fmt.writeDecimal(part.lba_start);
         serial.writeString(" size=");
-        fmt.writeDecimal(sector_count);
+        fmt.writeDecimal(part.sector_count);
         serial.writeString(" sectors\n");
     }
 
@@ -158,7 +144,7 @@ fn tryMountFAT32() void {
         // Find FAT32 partition (type 0x0B or 0x0C)
         var found = false;
         for (0..partition_count) |i| {
-            if (partitions[i].type == 0x0B or partitions[i].type == 0x0C) {
+            if (fat_util.isFat32Type(partitions[i].type)) {
                 lba = partitions[i].lba_start;
                 found = true;
                 break;
@@ -178,52 +164,32 @@ fn tryMountFAT32() void {
         return;
     }
 
-    // Check for FAT32 signature
-    const bytes_per_sector: u16 = @bitCast([2]u8{ buf[11], buf[12] });
-    const sectors_per_cluster: u8 = buf[13];
-    const reserved_sectors: u16 = @bitCast([2]u8{ buf[14], buf[15] });
-    const num_fats: u8 = buf[16];
-    const total_sectors_16: u16 = @bitCast([2]u8{ buf[19], buf[20] });
-    const total_sectors_32: u32 = @bitCast([4]u8{ buf[32], buf[33], buf[34], buf[35] });
-    const fat_size_32: u32 = @bitCast([4]u8{ buf[36], buf[37], buf[38], buf[39] });
-    const root_cluster: u32 = @bitCast([4]u8{ buf[44], buf[45], buf[46], buf[47] });
-    const fs_type: [8]u8 = @bitCast([8]u8{ buf[82], buf[83], buf[84], buf[85], buf[86], buf[87], buf[88], buf[89] });
-
-    // Validate FAT32
-    if (bytes_per_sector != 512 or sectors_per_cluster == 0 or reserved_sectors == 0) {
+    // Parse + validate the FAT32 BPB (pure geometry math in fat32_util).
+    const bpb = fat_util.parseBpb(buf, lba) orelse {
         serial.writeString("[fs] Not a valid FAT32 filesystem\n");
         return;
-    }
-
-    if (!(fs_type[0] == 'F' and fs_type[1] == 'A' and fs_type[2] == 'T' and fs_type[3] == '3' and fs_type[4] == '2')) {
-        // Also accept no signature (some FAT32 images don't have it)
-        if (buf[66] != 0x29 and buf[82] != 'F') {
-            serial.writeString("[fs] Not FAT32 (bad FS type signature)\n");
-            return;
-        }
-    }
+    };
 
     fat32_lba_start = lba;
-    fat32_bytes_per_sector = bytes_per_sector;
-    fat32_sectors_per_cluster = sectors_per_cluster;
-    fat32_reserved_sectors = reserved_sectors;
-    fat32_num_fats = num_fats;
-    fat32_root_cluster = root_cluster;
-    fat32_total_sectors = if (total_sectors_32 != 0) total_sectors_32 else total_sectors_16;
-    fat32_fat_start = lba + reserved_sectors;
-    fat32_data_start = fat32_fat_start + @as(u32, num_fats) * fat_size_32;
-    fat32_sector_mask = sectors_per_cluster - 1;
-    fat32_fat_size_sectors = fat_size_32;
-    const data_sectors = fat32_total_sectors - @as(u32, reserved_sectors) - @as(u32, num_fats) * fat_size_32;
-    fat32_total_data_clusters = data_sectors / @as(u32, sectors_per_cluster);
+    fat32_bytes_per_sector = bpb.bytes_per_sector;
+    fat32_sectors_per_cluster = bpb.sectors_per_cluster;
+    fat32_reserved_sectors = bpb.reserved_sectors;
+    fat32_num_fats = bpb.num_fats;
+    fat32_root_cluster = bpb.root_cluster;
+    fat32_total_sectors = bpb.total_sectors;
+    fat32_fat_start = bpb.fat_start;
+    fat32_data_start = bpb.data_start;
+    fat32_sector_mask = bpb.sector_mask;
+    fat32_fat_size_sectors = bpb.fat_size_sectors;
+    fat32_total_data_clusters = bpb.total_data_clusters;
     fat32_active = true;
 
     serial.writeString("[fs] FAT32 mounted: ");
     fmt.writeDecimal(fat32_total_sectors);
     serial.writeString(" sectors, cluster=");
-    fmt.writeDecimal(@as(u32, sectors_per_cluster));
+    fmt.writeDecimal(@as(u32, bpb.sectors_per_cluster));
     serial.writeString(" sectors, root_cluster=");
-    fmt.writeDecimal(root_cluster);
+    fmt.writeDecimal(bpb.root_cluster);
     serial.writeString("\n");
 
     // List root directory
@@ -231,23 +197,20 @@ fn tryMountFAT32() void {
 }
 
 fn clusterToLBA(cluster: u32) u32 {
-    return fat32_data_start + (cluster - 2) * @as(u32, fat32_sectors_per_cluster);
+    return fat_util.clusterToLba(fat32_data_start, fat32_sectors_per_cluster, cluster);
 }
 
 fn getFATEntry(cluster: u32) u32 {
-    const fat_offset = cluster * 4;
-    const sector = fat32_fat_start + fat_offset / @as(u32, fat32_bytes_per_sector);
-    const offset = fat_offset % @as(u32, fat32_bytes_per_sector);
+    const loc = fat_util.fatEntryLocation(fat32_fat_start, fat32_bytes_per_sector, cluster);
 
     // v53.36: Single-sector FAT cache (P2 fix — 128x I/O reduction)
     // v53.37: DMA-safe HHDM buffer (Critical fix — BSS globals not DMA-safe)
     const fbuf: [*]u8 = @ptrFromInt(fat_cache_buf_virt);
-    if (sector != fat_cache_sector) {
-        _ = virtio_blk.readSectors(sector, 1, fbuf);
-        fat_cache_sector = sector;
+    if (loc.sector != fat_cache_sector) {
+        _ = virtio_blk.readSectors(loc.sector, 1, fbuf);
+        fat_cache_sector = loc.sector;
     }
-    const result: u32 = @bitCast([4]u8{ fbuf[offset], fbuf[offset + 1], fbuf[offset + 2], fbuf[offset + 3] });
-    return result & 0x0FFFFFFF;
+    return fat_util.fatEntryValue(fbuf, loc.offset);
 }
 
 fn listRootDir() void {
