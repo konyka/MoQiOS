@@ -1317,7 +1317,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:NUD 主路径完整(reachable/stale/delay/probe/incomplete)。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-81] ndp delay probe unicast non-x86: OK`。
-- **后续**:Router Solicitation/Advertisement;或默认路由/前缀学习。
+- **后续**:见 3.82（RS/RA 默认路由,已完成)。
+
+---
+
+### 3.82 Router Solicitation/Advertisement 默认路由（SK-82,2026-07-22）
+
+- **背景**:NUD 已齐,但主机无默认路由器;ICMPv6 常量有 RS/RA 却未实现。
+- **方案**:`buildRouterSolicitation`→ff02::2;`parseRouterAdvertisement` +
+  `handleRouterAdvertisement` 学习 Source LL 与 Router Lifetime;
+  `ndp.setDefaultRouter`/`getDefaultRouter`。`shared/sk82.zig` 锁定 RS 帧与
+  RA→默认路由/清除。
+- **效果**:可主动探测并缓存默认路由器(前缀学习留待后续)。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-82] ndp router solicit advert non-x86: OK`。
+- **后续**:启动时自动 RS;或 Prefix Information 选项/on-link 前缀表。
 
 ---
 

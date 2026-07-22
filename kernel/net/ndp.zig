@@ -53,6 +53,11 @@ pub const NeighborEntry = struct {
 
 var neighbor_cache: [MAX_NEIGHBORS]NeighborEntry = @splat(.{});
 
+/// SK-82: single default router learned from Router Advertisement.
+var default_router_ip: [16]u8 = @splat(0);
+var default_router_lifetime_sec: u16 = 0;
+var default_router_valid: bool = false;
+
 // v53.40: Protect neighbor_cache against interrupt vs syscall races
 var ndp_lock: IrqSpinlock = .{};
 
@@ -65,6 +70,43 @@ pub fn init() void {
     for (0..MAX_NEIGHBORS) |i| {
         neighbor_cache[i] = .{};
     }
+    default_router_ip = @splat(0);
+    default_router_lifetime_sec = 0;
+    default_router_valid = false;
+}
+
+/// Install or clear the default router from an RA (SK-82).
+/// `lifetime_sec == 0` removes this router if it is the current default.
+pub fn setDefaultRouter(ip: [16]u8, lifetime_sec: u16) void {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    if (lifetime_sec == 0) {
+        if (default_router_valid and ipv6.addrEq(default_router_ip, ip)) {
+            default_router_valid = false;
+            default_router_lifetime_sec = 0;
+            default_router_ip = @splat(0);
+        }
+        return;
+    }
+    default_router_ip = ip;
+    default_router_lifetime_sec = lifetime_sec;
+    default_router_valid = true;
+}
+
+/// Current default router IPv6 address, if any (SK-82).
+pub fn getDefaultRouter() ?[16]u8 {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    if (!default_router_valid) return null;
+    return default_router_ip;
+}
+
+/// Probe helper (SK-82): Router Lifetime seconds, or 0 if none.
+pub fn probeDefaultRouterLifetime() u16 {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    if (!default_router_valid) return 0;
+    return default_router_lifetime_sec;
 }
 
 /// Lookup the cached MAC for a given IPv6 unicast address.

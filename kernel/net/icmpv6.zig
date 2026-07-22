@@ -25,6 +25,7 @@ pub const NEIGHBOR_ADVERTISEMENT: u8 = 136;
 // NDP option types
 const OPT_SOURCE_LL_ADDR: u8 = 1;
 const OPT_TARGET_LL_ADDR: u8 = 2;
+// OPT_PREFIX_INFORMATION = 3 reserved for later prefix learning.
 
 /// Compute the ICMPv6 checksum over the pseudo-header + ICMPv6 message.
 /// `data` points at the start of the ICMPv6 header (with checksum field zeroed).
@@ -65,10 +66,56 @@ pub fn handlePacket(
 
     switch (icmp_type) {
         ECHO_REQUEST => sendEchoReply(src_ip, dst_ip, data, len),
+        ROUTER_ADVERTISEMENT => handleRouterAdvertisement(src_ip, data, len),
         NEIGHBOR_SOLICITATION => handleNeighborSolicitation(src_ip, dst_ip, data, len),
         NEIGHBOR_ADVERTISEMENT => handleNeighborAdvertisement(src_ip, data, len),
         else => {},
     }
+}
+
+/// Parsed Router Advertisement fields used by SK-82 default-router learning.
+pub const RouterAdvert = struct {
+    hop_limit: u8 = 0,
+    router_lifetime_sec: u16 = 0,
+    reachable_ms: u32 = 0,
+    retrans_ms: u32 = 0,
+    source_ll: ?[6]u8 = null,
+};
+
+/// Pure RA parser (RFC 4861 §4.2). Requires at least the 16-byte RA header.
+pub fn parseRouterAdvertisement(data: [*]const u8, len: u16) ?RouterAdvert {
+    if (len < 16) return null;
+    if (data[0] != ROUTER_ADVERTISEMENT or data[1] != 0) return null;
+    var adv: RouterAdvert = .{
+        .hop_limit = data[4],
+        .router_lifetime_sec = bo.readU16BeAt(data, 6),
+        .reachable_ms = bo.readU32BeAt(data, 8),
+        .retrans_ms = bo.readU32BeAt(data, 12),
+    };
+    var off: u16 = 16;
+    while (off + 2 <= len) {
+        const opt_type = data[off];
+        const opt_units = data[off + 1];
+        if (opt_units == 0) break;
+        const opt_len: u16 = @as(u16, opt_units) * 8;
+        if (off + opt_len > len) break;
+        if (opt_type == OPT_SOURCE_LL_ADDR and opt_len >= 8) {
+            adv.source_ll = .{
+                data[off + 2], data[off + 3], data[off + 4],
+                data[off + 5], data[off + 6], data[off + 7],
+            };
+        }
+        off += opt_len;
+    }
+    return adv;
+}
+
+fn handleRouterAdvertisement(src_ip: [16]u8, data: [*]const u8, len: u16) void {
+    const adv = parseRouterAdvertisement(data, len) orelse return;
+    if (adv.source_ll) |mac| {
+        if (!ipv6.isUnspecified(src_ip)) ndp.update(src_ip, mac);
+    }
+    ndp.setDefaultRouter(src_ip, adv.router_lifetime_sec);
 }
 
 /// Echo Reply: copy the request body, swap addresses, recompute checksum.
@@ -310,6 +357,47 @@ pub fn sendNeighborSolicitationUnicast(target: [16]u8, dst_mac: [6]u8) void {
     const our_ip = ndp.generateLinkLocal(our_mac);
     var pkt: [128]u8 = @splat(0);
     const frame_len = buildNeighborSolicitationUnicast(&pkt, our_ip, target, our_mac, dst_mac);
+    _ = nic.sendPacket(&pkt, frame_len);
+}
+
+/// Build a Router Solicitation to all-routers (ff02::2) with Source LL (SK-82).
+/// Pure: no ndp/netif/nic side effects. Returns ethernet frame length.
+pub fn buildRouterSolicitation(
+    out: [*]u8,
+    our_ip: [16]u8,
+    our_mac: [6]u8,
+) u16 {
+    // ICMPv6 RS = 8-byte header + 8-byte Source LL = 16 bytes
+    const icmp_len: u16 = 16;
+    const total_payload: u16 = ipv6.HEADER_LEN + icmp_len;
+    const icmp_off: u16 = 14 + ipv6.HEADER_LEN;
+    const dst_ip = ipv6.allRoutersLinkLocalMulticast();
+    const dst_mac = ipv6.multicastMac(dst_ip);
+
+    out[icmp_off + 0] = ROUTER_SOLICITATION;
+    out[icmp_off + 1] = 0; // code
+    out[icmp_off + 2] = 0; // checksum
+    out[icmp_off + 3] = 0;
+    out[icmp_off + 4] = 0; // reserved
+    out[icmp_off + 5] = 0;
+    out[icmp_off + 6] = 0;
+    out[icmp_off + 7] = 0;
+    out[icmp_off + 8] = OPT_SOURCE_LL_ADDR;
+    out[icmp_off + 9] = 1;
+    @memcpy(out[icmp_off + 10 .. icmp_off + 16], &our_mac);
+
+    ipv6.buildHeader(out + 14, our_ip, dst_ip, ipv6.PROTO_ICMPV6, icmp_len);
+    const csum = checksum(our_ip, dst_ip, out + icmp_off, icmp_len);
+    bo.writeU16BeAt(out, icmp_off + 2, csum);
+    return eth.buildFrame(out, dst_mac, our_mac, eth.ETHERTYPE_IPV6, total_payload);
+}
+
+/// Transmit a Router Solicitation (SK-82).
+pub fn sendRouterSolicitation() void {
+    const our_mac = netif.getMac();
+    const our_ip = ndp.generateLinkLocal(our_mac);
+    var pkt: [128]u8 = @splat(0);
+    const frame_len = buildRouterSolicitation(&pkt, our_ip, our_mac);
     _ = nic.sendPacket(&pkt, frame_len);
 }
 

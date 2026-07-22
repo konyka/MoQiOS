@@ -154,6 +154,15 @@ pub fn solicitedNodeMulticast(target: [16]u8) [16]u8 {
     return out;
 }
 
+/// All-routers link-local multicast (ff02::2) — Router Solicitation dest (SK-82).
+pub fn allRoutersLinkLocalMulticast() [16]u8 {
+    var out: [16]u8 = @splat(0);
+    out[0] = 0xFF;
+    out[1] = 0x02;
+    out[15] = 0x02;
+    return out;
+}
+
 /// Compare two IPv6 addresses for equality.
 pub inline fn addrEq(a: [16]u8, b: [16]u8) bool {
     for (0..16) |i| if (a[i] != b[i]) return false;
