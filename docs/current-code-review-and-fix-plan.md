@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-22 (eventfd fork/close refcount + SK-62 FAT32 8.3/LFN helpers reviewed and verified)
+> Last update: 2026-07-22 (SK-63 ext2_util parse/geometry + prior eventfd/SK-62 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -394,6 +394,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 |---|---|---|
 | eventfd fork/close | `vfs.close` left a stale "no module yet" stub and never called `eventfdClose`; `retainSharedResources` omitted `.eventfd`, so fork + close leaked pool slots or (once wired) would free under the child's feet. | Fixed: `EventfdInstance.ref_count` + `eventfdRetain`/`eventfdClose` (free at 0), wired into `FdTable.close` and `retainSharedResources`. Close no longer resets the held spinlock word. Same O(1) retain path as timerfd — no speculative redesign. |
 | FAT32 name/dir-entry purity | After SK-61, 8.3 encode/decode and dir-entry field math remained inline in the I/O driver. | SK-62: extracted into `fat32_util.zig` + non-x86 probe; x86 driver delegates 1:1. |
+| ext2 parse purity | Superblock/geometry/inode-table math lived only inside the I/O driver. | SK-63: `ext2_util.zig` + non-x86 probe; `init`/`readInode`/`writeInode`/mode predicates delegate. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -403,8 +404,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-62] fat32 8.3/LFN helpers non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-62] fat32 8.3/LFN helpers non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-63] ext2 parse/geometry non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-63] ext2 parse/geometry non-x86: OK`. |
 
 ### 5.3 Historical Verification
 

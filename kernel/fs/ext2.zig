@@ -14,87 +14,18 @@ const serial = @import("../arch/arch.zig").serial;
 const virtio_blk = @import("../drivers/virtio_blk.zig");
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
+const eu = @import("ext2_util.zig");
 
 const SECTOR_SIZE: u32 = 512;
 const MAX_OPEN_FILES: u32 = 16;
 const MAX_FILENAME: u32 = 256;
 
-// ─── ext2 on-disk structures ──────────────────────────────────────────────
-
-const Ext2Superblock = extern struct {
-    inodes_count: u32,
-    blocks_count: u32,
-    r_blocks_count: u32,
-    free_blocks_count: u32,
-    free_inodes_count: u32,
-    first_data_block: u32,
-    log_block_size: u32,
-    log_frag_size: u32,
-    blocks_per_group: u32,
-    frags_per_group: u32,
-    inodes_per_group: u32,
-    mtime: u32,
-    wtime: u32,
-    mnt_count: u16,
-    max_mnt_count: u16,
-    magic: u16,
-    state: u16,
-    errors: u16,
-    minor_rev_level: u16,
-    lastcheck: u32,
-    checkinterval: u32,
-    creator_os: u32,
-    rev_level: u32,
-    def_resuid: u16,
-    def_resgid: u16,
-    first_ino: u32,
-    inode_size: u16,
-    block_group_nr: u16,
-    feature_compat: u32,
-    feature_incompat: u32,
-    feature_ro_compat: u32,
-    uuid: [16]u8,
-    volume_name: [16]u8,
-};
-
-const Ext2GroupDesc = extern struct {
-    bg_block_bitmap: u32,
-    bg_inode_bitmap: u32,
-    bg_inode_table: u32,
-    bg_free_blocks_count: u16,
-    bg_free_inodes_count: u16,
-    bg_used_dirs_count: u16,
-};
-
-const EXT2_INODE_DIRECT = 12;
-
-const Ext2Inode = extern struct {
-    mode: u16,
-    uid: u16,
-    size: u32,
-    atime: u32,
-    ctime: u32,
-    mtime: u32,
-    dtime: u32,
-    gid: u16,
-    links_count: u16,
-    blocks: u32,
-    flags: u32,
-    osd1: u32,
-    block: [15]u32,
-    generation: u32,
-    file_acl: u32,
-    dir_acl: u32,
-    faddr: u32,
-    osd2: [12]u8,
-};
-
-const Ext2DirEntry = extern struct {
-    inode: u32,
-    rec_len: u16,
-    name_len: u8,
-    file_type: u8,
-};
+// On-disk structures + pure geometry live in ext2_util (SK-63).
+const Ext2Superblock = eu.Ext2Superblock;
+const Ext2GroupDesc = eu.Ext2GroupDesc;
+const Ext2Inode = eu.Ext2Inode;
+const Ext2DirEntry = eu.Ext2DirEntry;
+const EXT2_INODE_DIRECT = eu.EXT2_INODE_DIRECT;
 
 // ─── Driver state ─────────────────────────────────────────────────────────
 
@@ -157,14 +88,17 @@ pub fn init() void {
     if (!readSectors(sb_sector, 2)) return;
 
     const sb_ptr: [*]const u8 = @ptrFromInt(sector_buf_virt);
-    @memcpy(@as([*]u8, @ptrCast(&sb))[0..@sizeOf(Ext2Superblock)], sb_ptr[0..@sizeOf(Ext2Superblock)]);
-
-    if (sb.magic != 0xEF53) {
+    sb = eu.parseSuperblock(sb_ptr) orelse {
         serial.writeString("[ext2] bad magic\n");
         return;
-    }
+    };
 
-    block_size = @as(u32, 1024) << @intCast(sb.log_block_size);
+    const geo = eu.deriveGeometry(&sb) orelse {
+        serial.writeString("[ext2] bad geometry\n");
+        return;
+    };
+
+    block_size = geo.block_size;
 
     // v53.38: Allocate DMA-safe I/O buffer (must fit block_size, max 4KB per page)
     if (block_size > 4096) {
@@ -174,14 +108,13 @@ pub fn init() void {
     io_buf_phys = pmm.allocPage() orelse return;
     io_buf_virt = hhdm.physToVirt(io_buf_phys);
 
-    groups_count = (sb.blocks_count + sb.blocks_per_group - 1) / sb.blocks_per_group;
-    inodes_per_group = sb.inodes_per_group;
-    inode_size = if (sb.rev_level >= 1) sb.inode_size else 128;
-    if (inode_size == 0) inode_size = 128;
-    first_data_block = sb.first_data_block;
+    groups_count = geo.groups_count;
+    inodes_per_group = geo.inodes_per_group;
+    inode_size = geo.inode_size;
+    first_data_block = geo.first_data_block;
 
     // Read block group descriptor table (at block first_data_block + 1)
-    const bgdt_block = first_data_block + 1;
+    const bgdt_block = eu.bgdtBlock(first_data_block);
     const bgdt_size = groups_count * @sizeOf(Ext2GroupDesc);
     const bgdt_blocks = (bgdt_size + block_size - 1) / block_size;
     const bgdt_sectors = bgdt_blocks * (block_size / SECTOR_SIZE);
@@ -462,25 +395,18 @@ pub fn cacheStats() struct { hits: u64, misses: u64 } {
 // ─── Inode operations ─────────────────────────────────────────────────────
 
 fn readInode(inode_num: u32, out: *Ext2Inode) bool {
-    const group = (inode_num - 1) / inodes_per_group;
-    const index = (inode_num - 1) % inodes_per_group;
-
     const gds: [*]const Ext2GroupDesc = @ptrFromInt(group_descs_virt);
-    const gd = gds[group];
-
-    const inode_table_block = gd.bg_inode_table;
-    const byte_offset = index * inode_size;
-    const block_offset = byte_offset / block_size;
-    const offset_in_block = byte_offset % block_size;
-
-    const target_block = inode_table_block + block_offset;
+    const group = (inode_num - 1) / inodes_per_group;
+    const loc = eu.inodeLocation(inode_num, inodes_per_group, inode_size, block_size, gds[group].bg_inode_table);
+    const target_block = loc.target_block;
+    const offset_in_block = loc.offset_in_block;
+    const copy_len = loc.copy_len;
 
     // `inode_size` is the on-disk *stride* between inodes (256 on rev>=1
     // filesystems), but our `Ext2Inode` only models the 128-byte base inode.
     // Clamp the copy to the struct size so we never overflow `out` (the extra
     // bytes of a 256-byte inode are extended fields we don't use).
     const out_bytes: [*]u8 = @ptrCast(out);
-    const copy_len = @min(inode_size, @as(u32, @sizeOf(Ext2Inode)));
 
     // Try zero-copy cache lookup first, fall back to sector_buf_virt
     const buf: [*]const u8 = cacheLookupPtr(target_block) orelse blk: {
@@ -552,14 +478,14 @@ fn walkPathInner(start_inode: u32, path: []const u8, depth: u32) i64 {
         if (!readInode(current_inode, &inode)) return -1;
 
         // Must be a directory
-        if (inode.mode & 0xF000 != 0x4000) return -1;
+        if (!eu.isDirectory(inode.mode)) return -1;
 
         // Search directory entries for component
         const found = findDirEntry(&inode, component) orelse return -1;
 
         // Check if the found entry is a symlink
         var found_inode: Ext2Inode = undefined;
-        if (readInode(found, &found_inode) and found_inode.mode & 0xF000 == 0xA000) {
+        if (readInode(found, &found_inode) and eu.isSymlink(found_inode.mode)) {
             // It's a symlink — read target
             const target = readSymlinkTarget(&found_inode) orelse return -5;
 
@@ -660,7 +586,7 @@ fn resolveParent(path: []const u8) ?struct { parent: u32, name: []const u8 } {
 
             var inode: Ext2Inode = undefined;
             if (!readInode(parent_inode, &inode)) return null;
-            if (inode.mode & 0xF000 != 0x4000) return null;
+            if (!eu.isDirectory(inode.mode)) return null;
 
             const dir_inode = parent_inode; // directory containing this component
             parent_inode = findDirEntry(&inode, component) orelse return null;
@@ -668,7 +594,7 @@ fn resolveParent(path: []const u8) ?struct { parent: u32, name: []const u8 } {
             // v52.2: resolve symlinks in intermediate components (no fd allocation)
             var found_inode: Ext2Inode = undefined;
             if (readInode(parent_inode, &found_inode) and
-                found_inode.mode & 0xF000 == 0xA000)
+                eu.isSymlink(found_inode.mode))
             {
                 if (readSymlinkTarget(&found_inode)) |target| {
                     const new_start: u32 = if (target.len > 0 and target[0] == '/') 2 else dir_inode;
@@ -713,15 +639,8 @@ fn findDirEntry(inode: *const Ext2Inode, name: []const u8) ?u32 {
             if (entry.rec_len == 0) break;
 
             if (entry.inode != 0 and entry.name_len == name.len) {
-                const entry_name = buf[pos + @sizeOf(Ext2DirEntry) .. pos + @sizeOf(Ext2DirEntry) + name.len];
-                var match = true;
-                for (name, 0..) |c, j| {
-                    if (entry_name[j] != c) {
-                        match = false;
-                        break;
-                    }
-                }
-                if (match) return entry.inode;
+                const entry_name = eu.dirEntryNameSlice(buf + pos, entry.name_len);
+                if (eu.namesEqual(entry_name, name)) return entry.inode;
             }
 
             pos += entry.rec_len;
@@ -1003,7 +922,7 @@ pub fn listDir(path: []const u8, callback: *const fn ([*]const u8, u32) void) vo
 
     var inode: Ext2Inode = undefined;
     if (!readInode(inode_num, &inode)) return;
-    if (inode.mode & 0xF000 != 0x4000) return;
+    if (!eu.isDirectory(inode.mode)) return;
 
     const dir_size = inode.size;
     var offset: u32 = 0;
@@ -1054,7 +973,7 @@ pub fn listDirRoot(buf: []u8) usize {
 fn listDirInode(inode_num: u32, buf: []u8) usize {
     var inode: Ext2Inode = undefined;
     if (!readInode(inode_num, &inode)) return 0;
-    if (inode.mode & 0xF000 != 0x4000) return 0;
+    if (!eu.isDirectory(inode.mode)) return 0;
 
     const dir_size = inode.size;
     if (dir_size == 0 or dir_size > 65536) return 0;
@@ -1103,7 +1022,7 @@ pub fn readDirEntries(file_idx: u32, start_offset: u32, names: [*][256]u8, name_
     if (file_idx >= open_count) return .{ .count = 0, .new_offset = start_offset };
     const f = &open_files[file_idx];
     if (f.inode_num == 0) return .{ .count = 0, .new_offset = start_offset };
-    if (f.inode.mode & 0xF000 != 0x4000) return .{ .count = 0, .new_offset = start_offset };
+    if (!eu.isDirectory(f.inode.mode)) return .{ .count = 0, .new_offset = start_offset };
 
     const dir_size = f.inode.size;
     if (start_offset >= dir_size) return .{ .count = 0, .new_offset = start_offset };
@@ -1441,7 +1360,7 @@ pub fn renameFile(old_path: []const u8, new_path: []const u8) bool {
     // Read file inode to get file_type
     var file_inode: Ext2Inode = undefined;
     if (!readInode(file_inode_num, &file_inode)) return false;
-    const file_type: u8 = if (file_inode.mode & 0xF000 == 0x4000) 2 else 1;
+    const file_type: u8 = if (eu.isDirectory(file_inode.mode)) 2 else 1;
 
     // If destination exists, remove it first (overwrite semantics)
     var new_parent_inode_data: Ext2Inode = undefined;
@@ -1480,20 +1399,14 @@ fn writeBlock(block_num: u32, buf: [*]const u8) bool {
 }
 
 fn writeInode(inode_num: u32, inode: *const Ext2Inode) bool {
-    const group = (inode_num - 1) / inodes_per_group;
-    const index = (inode_num - 1) % inodes_per_group;
-
     const gds: [*]const Ext2GroupDesc = @ptrFromInt(group_descs_virt);
-    const gd = gds[group];
-
-    const inode_table_block = gd.bg_inode_table;
-    const byte_offset = index * inode_size;
-    const block_offset = byte_offset / block_size;
-    const offset_in_block = byte_offset % block_size;
-    const target_block = inode_table_block + block_offset;
+    const group = (inode_num - 1) / inodes_per_group;
+    const loc = eu.inodeLocation(inode_num, inodes_per_group, inode_size, block_size, gds[group].bg_inode_table);
+    const target_block = loc.target_block;
+    const offset_in_block = loc.offset_in_block;
+    const copy_len = loc.copy_len;
 
     const inode_bytes: [*]const u8 = @ptrCast(inode);
-    const copy_len = @min(inode_size, @as(u32, @sizeOf(Ext2Inode)));
 
     // v53.22: Zero-copy path — if inode table block is cached, modify directly
     // (eliminates allocPage/freePage + 2 memcpy per call; ~102K calls for 100MB file)
@@ -2491,7 +2404,7 @@ pub fn unlinkFile(path: []const u8) bool {
     var file_inode: Ext2Inode = undefined;
     if (!readInode(file_inode_num, &file_inode)) return false;
 
-    const is_symlink = (file_inode.mode & 0xF000 == 0xA000);
+    const is_symlink = (eu.isSymlink(file_inode.mode));
 
     // v50.0: decrement links_count for hardlinked files
     if (file_inode.links_count > 1) {
@@ -2573,7 +2486,7 @@ pub fn createHardlink(oldpath: []const u8, newpath: []const u8) i64 {
     var old_inode_data: Ext2Inode = undefined;
     if (!readInode(old_inode, &old_inode_data)) return -5;
 
-    if (old_inode_data.mode & 0xF000 == 0x4000) return -1; // EPERM: cannot hardlink directories
+    if (eu.isDirectory(old_inode_data.mode)) return -1; // EPERM: cannot hardlink directories
 
     // 2. Resolve newpath's parent directory + filename
     const resolved = resolveParent(newpath) orelse return -2;
@@ -2586,7 +2499,7 @@ pub fn createHardlink(oldpath: []const u8, newpath: []const u8) i64 {
     }
 
     // 3. Add directory entry pointing to old_inode with same file_type
-    const ft: u8 = if (old_inode_data.mode & 0xF000 == 0x4000) 2 else 1;
+    const ft: u8 = if (eu.isDirectory(old_inode_data.mode)) 2 else 1;
     if (!addDirEntry(resolved.parent, old_inode, resolved.name, ft)) return -28; // ENOSPC
 
     // 4. Increment links_count
@@ -2684,13 +2597,13 @@ fn walkPathToInodeResolveNoFollow(start_inode: u32, path: []const u8, depth: u32
 
         var inode: Ext2Inode = undefined;
         if (!readInode(current_inode, &inode)) return null;
-        if (inode.mode & 0xF000 != 0x4000) return null;
+        if (!eu.isDirectory(inode.mode)) return null;
 
         const found = findDirEntry(&inode, component) orelse return null;
 
         // Check if symlink — resolve for intermediate, but NOT for final component
         var found_inode: Ext2Inode = undefined;
-        if (readInode(found, &found_inode) and found_inode.mode & 0xF000 == 0xA000) {
+        if (readInode(found, &found_inode) and eu.isSymlink(found_inode.mode)) {
             if (is_last) {
                 // lchown/lstat: return the symlink inode itself
                 return found;
@@ -2725,13 +2638,13 @@ fn walkPathToInodeResolve(start_inode: u32, path: []const u8, depth: u32) ?u32 {
 
         var inode: Ext2Inode = undefined;
         if (!readInode(current_inode, &inode)) return null;
-        if (inode.mode & 0xF000 != 0x4000) return null; // not a directory
+        if (!eu.isDirectory(inode.mode)) return null; // not a directory
 
         const found = findDirEntry(&inode, component) orelse return null;
 
         // Check if symlink
         var found_inode: Ext2Inode = undefined;
-        if (readInode(found, &found_inode) and found_inode.mode & 0xF000 == 0xA000) {
+        if (readInode(found, &found_inode) and eu.isSymlink(found_inode.mode)) {
             const target = readSymlinkTarget(&found_inode) orelse return null;
             const new_start: u32 = if (target.len > 0 and target[0] == '/') 2 else current_inode;
             const resolved = walkPathToInodeResolve(new_start, target, depth + 1) orelse return null;
@@ -2760,7 +2673,7 @@ pub fn readSymlinkByPath(path: []const u8) ?[]const u8 {
     // Read the entry's inode and check it's a symlink
     var entry_inode: Ext2Inode = undefined;
     if (!readInode(entry_inode_num, &entry_inode)) return null;
-    if (entry_inode.mode & 0xF000 != 0xA000) return null; // not a symlink
+    if (!eu.isSymlink(entry_inode.mode)) return null; // not a symlink
 
     return readSymlinkTarget(&entry_inode);
 }

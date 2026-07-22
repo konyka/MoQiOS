@@ -1017,7 +1017,28 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   且不增加热路径开销（仍是内联数学，无额外分配）。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-62] fat32 8.3/LFN helpers non-x86: OK`。
-- **后续**:可装配多槽 LFN→UTF-8 名，或转向 ext2 超级块/inode 纯解析抽出。
+- **后续**:见 3.63（ext2 超级块/几何/inode 定位纯解析,已完成)。
+
+---
+
+### 3.63 ext2 超级块/几何/inode 定位抽出 `ext2_util.zig` 并搬上非 x86（SK-63,2026-07-22）
+
+- **背景**:FAT32 纯层（SK-61/62）收官后转向 `ext2.zig`。超级块 magic/几何、
+  inode 表寻址、mode 谓词、逻辑块分类与 I/O/缓存缠在一起，无法在非 x86 单测。
+- **方案**:新增 `fs/ext2_util.zig`：公开 on-disk 结构体、`parseSuperblock`/
+  `deriveGeometry`/`bgdtBlock`/`ptrsPerBlock`、`inodeLocation`、
+  `classifyLogicalBlock`、`isDirectory`/`isSymlink`/`isRegular`、目录项名
+  切片比较。`ext2.zig` 的 `init`/`readInode`/`writeInode`/mode 判定/
+  `findDirEntry` 名比较改为委托；I/O 与缓存路径不动。新增 `shared/sk63.zig`：
+  合成 1KiB/rev1/256-byte-inode 超级块，校验几何（groups=1、bgdt=2）、
+  非法 magic/零 bpg 拒绝、inode 3/5 跨块定位、mode 谓词、direct/single/
+  double/triple 分类，以及目录项 `"foo"` 名切片。
+- **效果**:ext2 解析与寻址成为可移植纯模块；x86 驱动行为保持等价且无额外
+  热路径分配。为后续把 `resolveBlock` 整段切到分类器铺路。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-63] ext2 parse/geometry non-x86: OK`。
+- **后续**:可将 `resolveBlock` 改为消费 `classifyLogicalBlock`，或装配
+  FAT32 多槽 LFN→UTF-8。
 
 ---
 
