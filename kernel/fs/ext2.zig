@@ -650,130 +650,44 @@ fn findDirEntry(inode: *const Ext2Inode, name: []const u8) ?u32 {
     return null;
 }
 
-// ─── Block resolution (direct + single indirect) ──────────────────────────
+// ─── Block resolution (direct + single/double/triple indirect) ─────────────
 
-fn resolveBlock(inode: *const Ext2Inode, logical_block: u32) u32 {
-    if (logical_block < EXT2_INODE_DIRECT) {
-        return inode.block[logical_block];
-    }
-
-    // Single indirect (block[12])
-    const indirect_base = EXT2_INODE_DIRECT;
-    const ptrs_per_block = block_size / 4;
-
-    if (logical_block < indirect_base + ptrs_per_block) {
-        const indirect_block = inode.block[12];
-        if (indirect_block == 0) return 0;
-
-        const index = logical_block - indirect_base;
-
-        // Fast path: zero-copy cache lookup (avoids allocPage + memcpy)
-        if (cacheLookupPtr(indirect_block)) |buf| {
-            const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
-            return ptrs[index];
-        }
-
-        // Cache miss: allocate temp buffer, read, insert into cache
-        const buf_phys = pmm.allocPage() orelse return 0;
-        defer pmm.freePage(buf_phys);
-        const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
-        if (!readBlock(indirect_block, buf)) return 0;
+/// Load one u32 pointer from an indirect block. Cache hit is zero-copy;
+/// miss allocates a temp page, reads via `readBlock` (which populates cache),
+/// then returns the entry. Returns 0 on missing block / I/O failure.
+fn loadIndirectPtr(block_num: u32, index: u32) u32 {
+    if (block_num == 0) return 0;
+    if (cacheLookupPtr(block_num)) |buf| {
         const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
         return ptrs[index];
     }
+    const buf_phys = pmm.allocPage() orelse return 0;
+    defer pmm.freePage(buf_phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+    if (!readBlock(block_num, buf)) return 0;
+    const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
+    return ptrs[index];
+}
 
-    // Double indirect (block[13])
-    const dbl_base = indirect_base + ptrs_per_block;
-    if (logical_block < dbl_base + ptrs_per_block * ptrs_per_block) {
-        const dbl_block = inode.block[13];
-        if (dbl_block == 0) return 0;
-
-        const rel = logical_block - dbl_base;
-        const idx1 = rel / ptrs_per_block;
-        const idx2 = rel % ptrs_per_block;
-
-        // Fast path for double indirect block: zero-copy
-        const single_indirect: u32 = if (cacheLookupPtr(dbl_block)) |buf| blk: {
-            const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
-            break :blk ptrs[idx1];
-        } else blk: {
-            const buf_phys = pmm.allocPage() orelse return 0;
-            defer pmm.freePage(buf_phys);
-            const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
-            if (!readBlock(dbl_block, buf)) return 0;
-            const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
-            break :blk ptrs[idx1];
-        };
-        if (single_indirect == 0) return 0;
-
-        // Fast path for single indirect: zero-copy
-        if (cacheLookupPtr(single_indirect)) |buf| {
-            const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
-            return ptrs[idx2];
-        }
-
-        const buf2_phys = pmm.allocPage() orelse return 0;
-        defer pmm.freePage(buf2_phys);
-        const buf2: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf2_phys));
-        if (!readBlock(single_indirect, buf2)) return 0;
-        const ptrs2: [*]const u32 = @ptrCast(@alignCast(buf2));
-        return ptrs2[idx2];
+/// SK-64: compose `classifyLogicalBlock` + cached pointer walks. Addressing
+/// math matches `eu.resolveLogicalPure`; only the pointer-table source differs
+/// (block cache / disk vs in-memory tables).
+fn resolveBlock(inode: *const Ext2Inode, logical_block: u32) u32 {
+    const ppb = eu.ptrsPerBlock(block_size);
+    switch (eu.classifyLogicalBlock(logical_block, ppb)) {
+        .direct => |i| return inode.block[i],
+        .single => |i| return loadIndirectPtr(inode.block[12], i),
+        .double => |d| {
+            const single = loadIndirectPtr(inode.block[13], d.idx1);
+            return loadIndirectPtr(single, d.idx2);
+        },
+        .triple => |t| {
+            const dbl = loadIndirectPtr(inode.block[14], t.idx1);
+            const single = loadIndirectPtr(dbl, t.idx2);
+            return loadIndirectPtr(single, t.idx3);
+        },
+        .out_of_range => return 0,
     }
-
-    // v53.5: Triple indirect (block[14])
-    const tri_base = dbl_base + ptrs_per_block * ptrs_per_block;
-    if (logical_block < tri_base + ptrs_per_block * ptrs_per_block * ptrs_per_block) {
-        const tri_block = inode.block[14];
-        if (tri_block == 0) return 0;
-
-        const rel = logical_block - tri_base;
-        const idx1 = rel / (ptrs_per_block * ptrs_per_block);
-        const rem1 = rel % (ptrs_per_block * ptrs_per_block);
-        const idx2 = rem1 / ptrs_per_block;
-        const idx3 = rem1 % ptrs_per_block;
-
-        // Level 1: triple indirect → double indirect
-        const dbl_indirect: u32 = if (cacheLookupPtr(tri_block)) |buf| blk: {
-            const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
-            break :blk ptrs[idx1];
-        } else blk: {
-            const buf_phys = pmm.allocPage() orelse return 0;
-            defer pmm.freePage(buf_phys);
-            const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
-            if (!readBlock(tri_block, buf)) return 0;
-            const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
-            break :blk ptrs[idx1];
-        };
-        if (dbl_indirect == 0) return 0;
-
-        // Level 2: double indirect → single indirect
-        const single_indirect: u32 = if (cacheLookupPtr(dbl_indirect)) |buf| blk: {
-            const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
-            break :blk ptrs[idx2];
-        } else blk: {
-            const buf_phys = pmm.allocPage() orelse return 0;
-            defer pmm.freePage(buf_phys);
-            const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
-            if (!readBlock(dbl_indirect, buf)) return 0;
-            const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
-            break :blk ptrs[idx2];
-        };
-        if (single_indirect == 0) return 0;
-
-        // Level 3: single indirect → data block
-        if (cacheLookupPtr(single_indirect)) |buf| {
-            const ptrs: [*]const u32 = @ptrCast(@alignCast(buf));
-            return ptrs[idx3];
-        }
-        const buf3_phys = pmm.allocPage() orelse return 0;
-        defer pmm.freePage(buf3_phys);
-        const buf3: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf3_phys));
-        if (!readBlock(single_indirect, buf3)) return 0;
-        const ptrs3: [*]const u32 = @ptrCast(@alignCast(buf3));
-        return ptrs3[idx3];
-    }
-
-    return 0;
 }
 
 // ─── File read ─────────────────────────────────────────────────────────────

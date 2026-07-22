@@ -68,4 +68,5 @@ pub fn runPostMm(phys_base: u64, length: u64) void {
     @import("sk61.zig").announce();
     @import("sk62.zig").announce();
     @import("sk63.zig").announce();
+    @import("sk64.zig").announce();
 }

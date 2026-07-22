@@ -241,3 +241,48 @@ pub fn namesEqual(a: []const u8, b: []const u8) bool {
     }
     return true;
 }
+
+// ─── Pure logical-block resolve (for probes / driver composition) ──────────
+
+/// One in-memory pointer block used by `resolveLogicalPure`.
+pub const PtrTable = struct {
+    block: u32,
+    ptrs: [*]const u32,
+    len: u32,
+};
+
+fn lookupPtr(tables: []const PtrTable, block: u32, index: u32) u32 {
+    if (block == 0) return 0;
+    for (tables) |t| {
+        if (t.block != block) continue;
+        if (index >= t.len) return 0;
+        return t.ptrs[index];
+    }
+    return 0;
+}
+
+/// Resolve a logical file block against `i_block[0..15]` and an explicit set of
+/// pointer tables. Same addressing rules as the driver's `resolveBlock`, but
+/// with no I/O — used by SK-64 probes and as the reference composition for the
+/// classify → walk path.
+pub fn resolveLogicalPure(
+    i_block: *const [15]u32,
+    logical_block: u32,
+    ptrs_per_block: u32,
+    tables: []const PtrTable,
+) u32 {
+    switch (classifyLogicalBlock(logical_block, ptrs_per_block)) {
+        .direct => |i| return i_block[i],
+        .single => |i| return lookupPtr(tables, i_block[12], i),
+        .double => |d| {
+            const si = lookupPtr(tables, i_block[13], d.idx1);
+            return lookupPtr(tables, si, d.idx2);
+        },
+        .triple => |t| {
+            const di = lookupPtr(tables, i_block[14], t.idx1);
+            const si = lookupPtr(tables, di, t.idx2);
+            return lookupPtr(tables, si, t.idx3);
+        },
+        .out_of_range => return 0,
+    }
+}

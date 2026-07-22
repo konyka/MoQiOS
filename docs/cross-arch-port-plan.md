@@ -1037,8 +1037,26 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   热路径分配。为后续把 `resolveBlock` 整段切到分类器铺路。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-63] ext2 parse/geometry non-x86: OK`。
-- **后续**:可将 `resolveBlock` 改为消费 `classifyLogicalBlock`，或装配
-  FAT32 多槽 LFN→UTF-8。
+- **后续**:见 3.64（`resolveBlock` 消费 classify + 纯 resolve,已完成)。
+
+---
+
+### 3.64 ext2 `resolveBlock` 消费 `classifyLogicalBlock`（SK-64,2026-07-22）
+
+- **背景**:SK-63 抽出分类器后,驱动里的 `resolveBlock` 仍手写四套
+  direct/single/double/triple 边界与索引算术,与 util 双份维护,且 cache
+  miss 路径复制了六段几乎相同的 `allocPage`+`readBlock` 样板。
+- **方案**:`resolveBlock` 改为 `switch (classifyLogicalBlock)` + 共享
+  `loadIndirectPtr`(cache 命中零拷贝,miss 读盘入缓存)。新增
+  `resolveLogicalPure`——同样 compose 路径,指针表由调用方提供,供非 x86
+  探针在无 I/O 条件下验证。`shared/sk64.zig` 用 ppb=4 的微型表覆盖
+  direct/single/double/triple、空洞与越界。
+- **效果**:寻址数学单点维护;热路径 cache 命中次数不变,去掉重复样板;
+  纯 resolve 可在 riscv64/aarch64 实跑断言。`ensureBlock` 仍用旧边界
+  (分配副作用更大,留待后续对称改造)。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-64] ext2 resolve via classify non-x86: OK`。
+- **后续**:对称改造 `ensureBlock` 消费 classify,或装配 FAT32 多槽 LFN→UTF-8。
 
 ---
 
