@@ -64,12 +64,16 @@ var default_router_valid: bool = false;
 
 /// SK-83: on-link / PIO prefixes from Router Advertisement.
 pub const MAX_PREFIXES: u32 = 8;
+/// RFC 4861: Valid Lifetime 0xffffffff means infinity (no aging).
+pub const PREFIX_LIFETIME_INFINITY: u32 = 0xffff_ffff;
 pub const PrefixEntry = struct {
     prefix: [16]u8 = @splat(0),
     prefix_len: u8 = 0,
     on_link: bool = false,
     autonomous: bool = false,
     valid_lifetime: u32 = 0,
+    /// SK-90: ms accumulated toward the next whole-second lifetime tick.
+    age_ms: u32 = 0,
     valid: bool = false,
 };
 var prefix_table: [MAX_PREFIXES]PrefixEntry = @splat(.{});
@@ -196,11 +200,13 @@ pub fn setPrefix(
         if (!e.valid) continue;
         if (e.prefix_len == prefix_len and ipv6.addrEq(e.prefix, prefix)) {
             if (valid_lifetime == 0) {
+                clearSlaacForPrefixLocked(e.prefix, e.prefix_len);
                 e.* = .{};
             } else {
                 e.on_link = on_link;
                 e.autonomous = autonomous;
                 e.valid_lifetime = valid_lifetime;
+                e.age_ms = 0;
             }
             return;
         }
@@ -217,6 +223,7 @@ pub fn setPrefix(
                 .on_link = on_link,
                 .autonomous = autonomous,
                 .valid_lifetime = valid_lifetime,
+                .age_ms = 0,
                 .valid = true,
             };
             return;
@@ -246,6 +253,53 @@ pub fn probePrefixCount() u32 {
         if (prefix_table[i].valid) n += 1;
     }
     return n;
+}
+
+/// Probe helper (SK-90): remaining Valid Lifetime seconds, or 0 if absent.
+pub fn probePrefixLifetime(prefix: [16]u8, prefix_len: u8) u32 {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    for (0..MAX_PREFIXES) |i| {
+        const e = &prefix_table[i];
+        if (!e.valid) continue;
+        if (e.prefix_len == prefix_len and ipv6.addrEq(e.prefix, prefix)) {
+            return e.valid_lifetime;
+        }
+    }
+    return 0;
+}
+
+fn clearSlaacForPrefixLocked(prefix: [16]u8, prefix_len: u8) void {
+    for (0..MAX_LOCAL_ADDRS) |i| {
+        const e = &local_addrs[i];
+        if (!e.valid) continue;
+        if (e.prefix_len == prefix_len and ipv6.prefixMatch(e.addr, prefix, prefix_len)) {
+            e.* = .{};
+        }
+    }
+}
+
+/// Age Prefix Information Valid Lifetimes (SK-90).
+/// Expired prefixes are cleared; matching SLAAC addresses are abandoned.
+pub fn prefixLifetimeTimerTick(ms_elapsed: u32) void {
+    if (ms_elapsed == 0) return;
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    for (0..MAX_PREFIXES) |i| {
+        const e = &prefix_table[i];
+        if (!e.valid) continue;
+        if (e.valid_lifetime == 0 or e.valid_lifetime == PREFIX_LIFETIME_INFINITY) continue;
+
+        e.age_ms +%= ms_elapsed;
+        while (e.age_ms >= 1000 and e.valid_lifetime > 0 and e.valid_lifetime != PREFIX_LIFETIME_INFINITY) {
+            e.age_ms -= 1000;
+            e.valid_lifetime -= 1;
+        }
+        if (e.valid_lifetime == 0) {
+            clearSlaacForPrefixLocked(e.prefix, e.prefix_len);
+            e.* = .{};
+        }
+    }
 }
 
 /// Form a /64 SLAAC address: prefix[0..8] || EUI-64(mac) (SK-84).

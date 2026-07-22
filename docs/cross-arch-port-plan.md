@@ -1427,7 +1427,22 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:过期默认路由不再劫持离链路下一跳;可再次发 RS 学习新路由器。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-89] ndp router lifetime aging non-x86: OK`。
-- **后续**:多默认路由器选择;或前缀 Valid Lifetime 老化。
+- **后续**:见 3.90（前缀 Valid Lifetime 老化,已完成)。
+
+---
+
+### 3.90 前缀 Valid Lifetime 老化（SK-90,2026-07-23）
+
+- **背景**:RA PIO 写入 `valid_lifetime` 后从不递减,过期前缀仍被 `isOnLink`
+  视为在链路,对应 SLAAC 地址也不失效。
+- **方案**:`ndp.prefixLifetimeTimerTick` 按秒老化各前缀剩余 lifetime;`0xffffffff`
+  表示无穷不老化;归零时清除前缀并 `clearSlaacForPrefix`。RA 刷新重置 age。
+  接入 `icmpv6.neighborTimerTick`。`shared/sk90.zig` 锁定老化、刷新、无穷与
+  SLAAC 清除。
+- **效果**:过期前缀不再误判 on-link;SLAAC 地址随前缀失效。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-90] ndp prefix lifetime aging non-x86: OK`。
+- **后续**:多默认路由器选择;或 Preferred Lifetime / 地址弃用。
 
 ---
 

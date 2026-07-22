@@ -569,4 +569,6 @@ pub fn neighborTimerTick(ms_elapsed: u32) void {
     if (ndp.routerLifetimeTimerTick(ms_elapsed)) {
         startRouterSolicit();
     }
+    // SK-90: expire on-link / SLAAC prefixes when Valid Lifetime hits zero.
+    ndp.prefixLifetimeTimerTick(ms_elapsed);
 }
