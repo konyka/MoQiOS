@@ -1423,7 +1423,7 @@ pub fn tcpConnectSocket(tcb_idx: u32, remote_ip: [4]u8, remote_port: u16) i64 {
     defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
-    if (!tcb.active or tcb.state != .closed) return -1;
+    if (!tcb.active or tcb.state != .closed or tcb.is_v6) return -1;
 
     if (tcb.local_port == 0) {
         tcb.local_port = allocEphemeralPort();
@@ -1446,6 +1446,38 @@ pub fn tcpConnectSocket(tcb_idx: u32, remote_ip: [4]u8, remote_port: u16) i64 {
     }
 
     tcpLog("[tcp] connect: SYN sent\n");
+    return 0;
+}
+
+/// Connect an IPv6 TCP socket (SK-78). Requires `tcpSetIpv6` first.
+pub fn tcpConnectSocketV6(tcb_idx: u32, remote_ip6: [16]u8, remote_port: u16) i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS) return -1;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active or tcb.state != .closed or !tcb.is_v6) return -1;
+
+    if (tcb.local_port == 0) {
+        tcb.local_port = allocEphemeralPort();
+        if (tcb.local_port == 0) return -1;
+    }
+
+    tcb.remote_port = remote_port;
+    tcb.remote_ip6 = remote_ip6;
+    tcb.iss = generateIss();
+    tcb.snd_una = tcb.iss;
+    tcb.snd_nxt = tcb.iss;
+    tcb.snd_wnd = TCP_WINDOW;
+    tcb.rcv_nxt = 0;
+    tcb.rcv_wnd = TCP_WINDOW;
+    tcb.state = .syn_sent;
+
+    if (!sendSegment(tcb, SYN, undefined, 0)) {
+        tcb.state = .closed;
+        return -1;
+    }
+
+    tcpLog("[tcp] connect v6: SYN sent\n");
     return 0;
 }
 
@@ -2036,6 +2068,10 @@ pub const AddrInfo = struct {
     remote_port: u16,
     remote_ip: [4]u8,
     local_ip: [4]u8,
+    /// SK-78: dual-stack name queries.
+    is_v6: bool = false,
+    remote_ip6: [16]u8 = @splat(0),
+    local_ip6: [16]u8 = @splat(0),
 };
 
 /// Get address info for a TCB (for getsockname/getpeername).
@@ -2046,12 +2082,24 @@ pub fn tcpGetAddrInfo(tcb_idx: u32) ?AddrInfo {
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return null;
     const netif_mod = @import("netif.zig");
+    const ndp_mod = @import("ndp.zig");
     return .{
         .local_port = tcb.local_port,
         .remote_port = tcb.remote_port,
         .remote_ip = tcb.remote_ip,
         .local_ip = netif_mod.getOurIp(),
+        .is_v6 = tcb.is_v6,
+        .remote_ip6 = tcb.remote_ip6,
+        .local_ip6 = ndp_mod.generateLinkLocal(netif_mod.getMac()),
     };
+}
+
+/// Probe helper (SK-78): IPv6 tuple is in syn_sent.
+pub fn tcpProbeIsSynSentV6(local_port: u16, remote_port: u16, remote_ip6: [16]u8) bool {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    const tcb = findTcbByTupleV6(local_port, remote_port, remote_ip6) orelse return false;
+    return tcb.state == .syn_sent;
 }
 
 /// Shutdown one direction of a TCP connection.

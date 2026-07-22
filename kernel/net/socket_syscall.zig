@@ -195,11 +195,18 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     const tcb_idx = t.fd_table.fds[fd].tcb_idx;
 
     if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -1;
+    const info = net_mod.tcp.tcpGetAddrInfo(tcb_idx) orelse return -1;
+    if (info.is_v6) {
+        var sa6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
+        if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) < sa.SOCKADDR_IN6_LEN)
+            return -22;
+        const parsed = sa.parseInet6(&sa6) orelse return -97; // EAFNOSUPPORT
+        return net_mod.tcp.tcpBind(tcb_idx, parsed.port);
+    }
     var sock_addr: [8]u8 = undefined;
     _ = copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), 8);
     const port = bo.readU16BeAt(&sock_addr, 2);
-    const result = net_mod.tcp.tcpBind(tcb_idx, port);
-    return result;
+    return net_mod.tcp.tcpBind(tcb_idx, port);
 }
 
 /// listen(fd, backlog) → 0 or -errno
@@ -223,8 +230,6 @@ pub fn listen(fd: u32, backlog: u32) i64 {
 
 /// accept(fd, addr_ptr, addr_len_ptr) → new fd or -errno
 pub fn accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) i64 {
-    _ = addr_ptr;
-    _ = addr_len_ptr;
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
 
@@ -251,6 +256,16 @@ pub fn accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) i64 {
     if (new_fd < 0) {
         _ = net_mod.tcp.tcpClose(@intCast(new_tcb_idx));
         return -1;
+    }
+    // SK-78: optionally fill peer sockaddr (IPv4 or IPv6).
+    if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000 and
+        addr_len_ptr != 0 and addr_len_ptr < 0x0000_8000_0000_0000)
+    {
+        if (net_mod.tcp.tcpGetAddrInfo(@intCast(new_tcb_idx))) |ainfo| {
+            var sa_buf: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
+            const alen = sa.encodeInetName(ainfo.is_v6, ainfo.remote_port, ainfo.remote_ip, ainfo.remote_ip6, &sa_buf);
+            if (alen != 0) _ = copySockaddrToUser(addr_ptr, addr_len_ptr, sa_buf[0..alen], alen);
+        }
     }
     return new_fd;
 }
@@ -495,12 +510,19 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     const tcb_idx = t.fd_table.fds[fd].tcb_idx;
 
     if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -1;
+    const info = net_mod.tcp.tcpGetAddrInfo(tcb_idx) orelse return -1;
+    if (info.is_v6) {
+        var sa6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
+        if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) < sa.SOCKADDR_IN6_LEN)
+            return -22;
+        const parsed = sa.parseInet6(&sa6) orelse return -97;
+        return net_mod.tcp.tcpConnectSocketV6(tcb_idx, parsed.addr, parsed.port);
+    }
     var sock_addr: [8]u8 = undefined;
     _ = copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), 8);
     const port = bo.readU16BeAt(&sock_addr, 2);
     const ip = [4]u8{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] };
-    const result = net_mod.tcp.tcpConnectSocket(tcb_idx, ip, port);
-    return result;
+    return net_mod.tcp.tcpConnectSocket(tcb_idx, ip, port);
 }
 
 fn copySockaddrToUser(addr_ptr: u64, addrlen_ptr: u64, sa_buf: []const u8, alen: u32) i64 {
@@ -534,9 +556,10 @@ pub fn getsockname(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
     if (desc.fd_type != .tcp_socket) return -88;
     const info = net_mod.tcp.tcpGetAddrInfo(desc.tcb_idx) orelse return -1;
 
-    var sockaddr: [sa.SOCKADDR_IN_LEN]u8 = undefined;
-    const alen4 = sa.writeInet4(&sockaddr, info.local_port, info.local_ip);
-    return copySockaddrToUser(addr_ptr, addrlen_ptr, &sockaddr, alen4);
+    var sa_buf: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
+    const alen = sa.encodeInetName(info.is_v6, info.local_port, info.local_ip, info.local_ip6, &sa_buf);
+    if (alen == 0) return -1;
+    return copySockaddrToUser(addr_ptr, addrlen_ptr, sa_buf[0..alen], alen);
 }
 
 /// getpeername(fd, addr_ptr, addrlen_ptr) → 0 or -errno
@@ -561,9 +584,10 @@ pub fn getpeername(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
     if (desc.fd_type != .tcp_socket) return -88;
     const info = net_mod.tcp.tcpGetAddrInfo(desc.tcb_idx) orelse return -1;
 
-    var sockaddr: [sa.SOCKADDR_IN_LEN]u8 = undefined;
-    const alen4 = sa.writeInet4(&sockaddr, info.remote_port, info.remote_ip);
-    return copySockaddrToUser(addr_ptr, addrlen_ptr, &sockaddr, alen4);
+    var sa_buf: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
+    const alen = sa.encodeInetName(info.is_v6, info.remote_port, info.remote_ip, info.remote_ip6, &sa_buf);
+    if (alen == 0) return -1;
+    return copySockaddrToUser(addr_ptr, addrlen_ptr, sa_buf[0..alen], alen);
 }
 
 /// shutdown(fd, how) → 0 or -errno

@@ -1261,7 +1261,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:IPv6 TCP 数据面与关闭路径与 IPv4 同构;后续 syscall/`connect` 可直接复用。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-77] tcp ipv6 established path non-x86: OK`。
-- **后续**:TCP `sockaddr_in6` bind/connect/accept 地址回填;或 NS 重传。
+- **后续**:见 3.78（TCP `sockaddr_in6` bind/connect/accept,已完成)。
+
+---
+
+### 3.78 TCP sockaddr_in6 bind/connect/accept（SK-78,2026-07-22）
+
+- **背景**:IPv6 TCP 数据面已通,但 syscall 仍按 IPv4 解析 `connect`/`getsockname`/
+  `getpeername`,且 `accept` 丢弃 peer 地址回填。
+- **方案**:`tcpConnectSocketV6` + `AddrInfo.is_v6`/`remote_ip6`/`local_ip6`;
+  `encodeInetName` 统一 TCP/UDP 名字编码;bind/connect/accept/name 查询走
+  `sockaddr_in6`。`shared/sk78.zig` 锁定 connect→`syn_sent` 与名字 round-trip。
+- **效果**:用户态可用 `AF_INET6` TCP 完成 bind/connect 与 peer/local 地址查询。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-78] tcp sockaddr_in6 connect name non-x86: OK`。
+- **后续**:NS 重传 / NDP 完整解析;或 TCP `accept` backlog 压力与非阻塞路径。
 
 ---
 
