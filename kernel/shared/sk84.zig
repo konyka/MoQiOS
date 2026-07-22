@@ -58,7 +58,7 @@ pub fn announce() void {
 
     // Non-/64 ignored.
     ndp.init();
-    ndp.installSlaac(PREFIX, 48, 3600, MAC);
+    _ = ndp.installSlaac(PREFIX, 48, 3600, MAC);
     if (ndp.probeLocalAddrCount() != 0) {
         fail("non-/64");
         return;
@@ -90,6 +90,9 @@ pub fn announce() void {
         fail("install");
         return;
     }
+    // SK-85: address stays tentative until DAD RetransTimer elapses.
+    var dad_out: [1][16]u8 = undefined;
+    _ = ndp.dadTimerTick(ndp.RETRANS_MS, &dad_out);
     const got = ndp.getGlobalAddress() orelse {
         fail("get global");
         return;

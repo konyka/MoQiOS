@@ -22,6 +22,8 @@ pub const REACHABLE_TIME_MS: u32 = 30_000;
 pub const DELAY_FIRST_PROBE_TIME_MS: u32 = 5_000;
 /// RFC 4861 MAX_UNICAST_SOLICIT.
 pub const MAX_UNICAST_SOLICIT: u8 = 3;
+/// RFC 4862 DupAddrDetectTransmits default.
+pub const DUP_ADDR_DETECT_TRANSMITS: u8 = 1;
 
 pub const NeighborState = enum(u8) {
     incomplete = 0,
@@ -70,12 +72,21 @@ pub const PrefixEntry = struct {
 };
 var prefix_table: [MAX_PREFIXES]PrefixEntry = @splat(.{});
 
-/// SK-84: SLAAC addresses formed from A-flag /64 prefixes.
+/// SK-84/85: SLAAC addresses formed from A-flag /64 prefixes.
 pub const MAX_LOCAL_ADDRS: u32 = 4;
+pub const AddrState = enum(u8) {
+    tentative = 0,
+    preferred = 1,
+};
 const LocalAddr = struct {
     addr: [16]u8 = @splat(0),
     /// Matching PIO prefix length (always 64 for SLAAC today).
     prefix_len: u8 = 0,
+    state: AddrState = .tentative,
+    /// SK-85: ms since last DAD NS.
+    dad_ms: u32 = 0,
+    /// SK-85: DAD NS transmissions completed.
+    dad_sent: u8 = 0,
     valid: bool = false,
 };
 var local_addrs: [MAX_LOCAL_ADDRS]LocalAddr = @splat(.{});
@@ -217,10 +228,11 @@ pub fn formSlaacAddress(prefix: [16]u8, mac: [6]u8) [16]u8 {
     return addr;
 }
 
-/// Install or remove a SLAAC address for an autonomous /64 prefix (SK-84).
+/// Install or remove a SLAAC address for an autonomous /64 prefix (SK-84/85).
 /// `valid_lifetime == 0` removes any address formed from this prefix.
-pub fn installSlaac(prefix: [16]u8, prefix_len: u8, valid_lifetime: u32, mac: [6]u8) void {
-    if (prefix_len != 64) return;
+/// On new install, returns the tentative address so the caller can send DAD NS.
+pub fn installSlaac(prefix: [16]u8, prefix_len: u8, valid_lifetime: u32, mac: [6]u8) ?[16]u8 {
+    if (prefix_len != 64) return null;
     const flags = ndp_lock.acquire();
     defer ndp_lock.release(flags);
 
@@ -232,29 +244,37 @@ pub fn installSlaac(prefix: [16]u8, prefix_len: u8, valid_lifetime: u32, mac: [6
                 e.* = .{};
             }
         }
-        return;
+        return null;
     }
 
     const addr = formSlaacAddress(prefix, mac);
-    // Refresh existing.
+    // Existing preferred/tentative: keep; re-trigger DAD only if new.
     for (0..MAX_LOCAL_ADDRS) |i| {
         const e = &local_addrs[i];
         if (e.valid and ipv6.addrEq(e.addr, addr)) {
             e.prefix_len = 64;
-            return;
+            return null;
         }
     }
-    // Insert.
+    // Insert as tentative; first DAD NS is sent by caller.
     for (0..MAX_LOCAL_ADDRS) |i| {
         const e = &local_addrs[i];
         if (!e.valid) {
-            e.* = .{ .addr = addr, .prefix_len = 64, .valid = true };
-            return;
+            e.* = .{
+                .addr = addr,
+                .prefix_len = 64,
+                .state = .tentative,
+                .dad_ms = 0,
+                .dad_sent = 1,
+                .valid = true,
+            };
+            return addr;
         }
     }
+    return null;
 }
 
-/// True when `addr` is a configured local IPv6 address (SK-84).
+/// True when `addr` is a configured local IPv6 address (tentative or preferred).
 pub fn hasLocalAddress(addr: [16]u8) bool {
     const flags = ndp_lock.acquire();
     defer ndp_lock.release(flags);
@@ -264,18 +284,19 @@ pub fn hasLocalAddress(addr: [16]u8) bool {
     return false;
 }
 
-/// First configured non-link-local address, if any (SK-84).
+/// First *preferred* non-link-local address, if any (SK-85: DAD must pass).
 pub fn getGlobalAddress() ?[16]u8 {
     const flags = ndp_lock.acquire();
     defer ndp_lock.release(flags);
     for (0..MAX_LOCAL_ADDRS) |i| {
-        if (!local_addrs[i].valid) continue;
-        if (!ipv6.isLinkLocal(local_addrs[i].addr)) return local_addrs[i].addr;
+        const e = &local_addrs[i];
+        if (!e.valid or e.state != .preferred) continue;
+        if (!ipv6.isLinkLocal(e.addr)) return e.addr;
     }
     return null;
 }
 
-/// Probe helper (SK-84): number of configured local addresses.
+/// Probe helper (SK-84/85): number of configured local addresses.
 pub fn probeLocalAddrCount() u32 {
     const flags = ndp_lock.acquire();
     defer ndp_lock.release(flags);
@@ -284,6 +305,70 @@ pub fn probeLocalAddrCount() u32 {
         if (local_addrs[i].valid) n += 1;
     }
     return n;
+}
+
+/// Probe helper (SK-85): address DAD/preferred state, or null if missing.
+pub fn probeAddrState(addr: [16]u8) ?AddrState {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    for (0..MAX_LOCAL_ADDRS) |i| {
+        if (local_addrs[i].valid and ipv6.addrEq(local_addrs[i].addr, addr))
+            return local_addrs[i].state;
+    }
+    return null;
+}
+
+/// Advance DAD timers (SK-85). After DupAddrDetectTransmits × RetransTimer
+/// with no conflict, marks the address preferred. May emit extra DAD targets
+/// into `out` when DupAddrDetectTransmits > 1.
+pub fn dadTimerTick(ms_elapsed: u32, out: [][16]u8) u32 {
+    if (ms_elapsed == 0) return 0;
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+
+    var n: u32 = 0;
+    for (0..MAX_LOCAL_ADDRS) |i| {
+        const e = &local_addrs[i];
+        if (!e.valid or e.state != .tentative) continue;
+        e.dad_ms +%= ms_elapsed;
+        if (e.dad_ms < RETRANS_MS) continue;
+        e.dad_ms = 0;
+        if (e.dad_sent >= DUP_ADDR_DETECT_TRANSMITS) {
+            e.state = .preferred;
+            continue;
+        }
+        e.dad_sent +%= 1;
+        if (n < out.len) {
+            out[n] = e.addr;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// DAD conflict: abandon a tentative address matching `target` (SK-85).
+pub fn dadConflict(target: [16]u8) void {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    for (0..MAX_LOCAL_ADDRS) |i| {
+        const e = &local_addrs[i];
+        if (!e.valid or e.state != .tentative) continue;
+        if (ipv6.addrEq(e.addr, target)) {
+            e.* = .{};
+            return;
+        }
+    }
+}
+
+/// True when `target` is one of our tentative addresses (SK-85).
+pub fn isTentative(target: [16]u8) bool {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    for (0..MAX_LOCAL_ADDRS) |i| {
+        const e = &local_addrs[i];
+        if (e.valid and e.state == .tentative and ipv6.addrEq(e.addr, target)) return true;
+    }
+    return false;
 }
 
 /// Lookup the cached MAC for a given IPv6 unicast address.

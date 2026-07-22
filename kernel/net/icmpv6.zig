@@ -152,9 +152,11 @@ fn handleRouterAdvertisement(src_ip: [16]u8, data: [*]const u8, len: u16) void {
     while (i < adv.prefix_count) : (i += 1) {
         const p = adv.prefixes[i];
         ndp.setPrefix(p.prefix, p.prefix_len, p.on_link, p.autonomous, p.valid_lifetime);
-        // SK-84: A-flag /64 → form SLAAC address (or remove when lifetime 0).
+        // SK-84/85: A-flag /64 → tentative SLAAC + DAD NS.
         if (p.autonomous) {
-            ndp.installSlaac(p.prefix, p.prefix_len, p.valid_lifetime, our_mac);
+            if (ndp.installSlaac(p.prefix, p.prefix_len, p.valid_lifetime, our_mac)) |tentative| {
+                sendDadNeighborSolicitation(tentative);
+            }
         }
     }
 }
@@ -206,6 +208,12 @@ fn handleNeighborSolicitation(
     var target: [16]u8 = undefined;
     inline for (0..16) |i| target[i] = data[8 + i];
 
+    // SK-85: NS for our tentative address ⇒ DAD conflict (RFC 4862 §5.4.3).
+    if (ndp.isTentative(target)) {
+        ndp.dadConflict(target);
+        return;
+    }
+
     // Learn sender MAC from Source Link-Layer Address option, if present.
     var off: u16 = 24;
     while (off + 2 <= len) {
@@ -224,10 +232,10 @@ fn handleNeighborSolicitation(
         off += opt_len;
     }
 
-    // Only respond if the target is one of our addresses.
+    // Only respond if the target is one of our addresses (not tentative — handled above).
     const our_mac = netif.getMac();
     const our_ll = ndp.generateLinkLocal(our_mac);
-    if (!ipv6.addrEq(target, our_ll)) return;
+    if (!ipv6.addrEq(target, our_ll) and !ndp.hasLocalAddress(target)) return;
 
     sendNeighborAdvertisement(src_ip, target, true); // v53.37: solicited NA — set S flag (W1 fix, RFC 4861 §7.2.4)
 }
@@ -239,6 +247,12 @@ fn handleNeighborAdvertisement(src_ip: [16]u8, data: [*]const u8, len: u16) void
 
     var target: [16]u8 = undefined;
     inline for (0..16) |i| target[i] = data[8 + i];
+
+    // SK-85: NA claiming our tentative target ⇒ DAD conflict.
+    if (ndp.isTentative(target)) {
+        ndp.dadConflict(target);
+        return;
+    }
 
     var off: u16 = 24;
     while (off + 2 <= len) {
@@ -442,8 +456,40 @@ pub fn sendRouterSolicitation() void {
     _ = nic.sendPacket(&pkt, frame_len);
 }
 
-/// Drive NDP NS retransmits / NUD probes (SK-79/81). Called from the
-/// scheduler maintenance pass alongside `tcp.timerTick`.
+/// Build a DAD Neighbor Solicitation (RFC 4862 §5.4.2): src=::, no SLLA (SK-85).
+pub fn buildDadNeighborSolicitation(out: [*]u8, target: [16]u8, our_mac: [6]u8) u16 {
+    const icmp_len: u16 = 24; // header only — no Source LL option
+    const total_payload: u16 = ipv6.HEADER_LEN + icmp_len;
+    const icmp_off: u16 = 14 + ipv6.HEADER_LEN;
+    const src_ip = [_]u8{0} ** 16;
+    const dst_ip = ipv6.solicitedNodeMulticast(target);
+    const dst_mac = ipv6.multicastMac(dst_ip);
+
+    out[icmp_off + 0] = NEIGHBOR_SOLICITATION;
+    out[icmp_off + 1] = 0;
+    out[icmp_off + 2] = 0;
+    out[icmp_off + 3] = 0;
+    out[icmp_off + 4] = 0;
+    out[icmp_off + 5] = 0;
+    out[icmp_off + 6] = 0;
+    out[icmp_off + 7] = 0;
+    @memcpy(out[icmp_off + 8 .. icmp_off + 24], &target);
+
+    ipv6.buildHeader(out + 14, src_ip, dst_ip, ipv6.PROTO_ICMPV6, icmp_len);
+    const csum = checksum(src_ip, dst_ip, out + icmp_off, icmp_len);
+    bo.writeU16BeAt(out, icmp_off + 2, csum);
+    return eth.buildFrame(out, dst_mac, our_mac, eth.ETHERTYPE_IPV6, total_payload);
+}
+
+/// Transmit a DAD NS for a tentative address (SK-85).
+pub fn sendDadNeighborSolicitation(target: [16]u8) void {
+    const our_mac = netif.getMac();
+    var pkt: [128]u8 = @splat(0);
+    const frame_len = buildDadNeighborSolicitation(&pkt, target, our_mac);
+    _ = nic.sendPacket(&pkt, frame_len);
+}
+
+/// Drive NDP NS retransmits / NUD probes / DAD (SK-79/81/85).
 pub fn neighborTimerTick(ms_elapsed: u32) void {
     var batch: [ndp.MAX_NEIGHBORS]ndp.Solicit = undefined;
     const n = ndp.timerTick(ms_elapsed, &batch);
@@ -454,5 +500,11 @@ pub fn neighborTimerTick(ms_elapsed: u32) void {
         } else {
             sendNeighborSolicitationUnicast(batch[i].target, batch[i].dst_mac);
         }
+    }
+    var dad_batch: [ndp.MAX_LOCAL_ADDRS][16]u8 = undefined;
+    const dn = ndp.dadTimerTick(ms_elapsed, &dad_batch);
+    var di: u32 = 0;
+    while (di < dn) : (di += 1) {
+        sendDadNeighborSolicitation(dad_batch[di]);
     }
 }

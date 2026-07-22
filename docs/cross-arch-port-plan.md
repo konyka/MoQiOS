@@ -1357,7 +1357,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:主机可从 RA 获得全球单播地址(DAD 与源地址选用留待后续)。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-84] ndp slaac address non-x86: OK`。
-- **后续**:启动时自动 RS;或 DAD(重复地址检测)后再标记 preferred。
+- **后续**:见 3.85（DAD → preferred,已完成)。
+
+---
+
+### 3.85 SLAAC DAD 后标记 preferred（SK-85,2026-07-22）
+
+- **背景**:SK-84 安装地址后立即可用,无重复地址检测,违背 RFC 4862。
+- **方案**:地址先 `tentative`;`buildDadNeighborSolicitation`(src=::,无 SLLA);
+  `dadTimerTick` 经 RetransTimer×DupAddrDetectTransmits 后改 `preferred`;
+  收到针对 tentative 的 NS/NA 则 `dadConflict` 丢弃。`getGlobalAddress` 仅返回
+  preferred。`shared/sk85.zig` 锁定帧、晋升与冲突。
+- **效果**:SLAAC 地址在 DAD 通过前不可作源地址选用。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-85] ndp slaac dad preferred non-x86: OK`。
+- **后续**:启动时自动 RS;或源地址选用优先 preferred 全球地址。
 
 ---
 

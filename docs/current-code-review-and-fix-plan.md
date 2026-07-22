@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-22 (SK-84 SLAAC address from A-flag PIO + prior SK-83 reviewed and verified)
+> Last update: 2026-07-22 (SK-85 SLAAC DAD to preferred + prior SK-84 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -416,6 +416,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | No IPv6 default router | RS/RA constants existed but were unused; host had no default router. | SK-82: `buildRouterSolicitation` + RA parse → `ndp.setDefaultRouter`. |
 | RA prefixes ignored | Prefix Information options were skipped; no on-link table. | SK-83: PIO parse + `ndp.setPrefix`/`isOnLink` + `ipv6.prefixMatch`. |
 | No SLAAC addresses | A-flag prefixes were stored but never formed host addresses. | SK-84: `formSlaacAddress`/`installSlaac` on autonomous /64 PIO. |
+| SLAAC skipped DAD | New addresses were usable immediately without duplicate detection. | SK-85: tentative→DAD NS→preferred; conflict abandons the address. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -425,8 +426,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-84] ndp slaac address non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-84] ndp slaac address non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-85] ndp slaac dad preferred non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-85] ndp slaac dad preferred non-x86: OK`. |
 
 ### 5.3 Historical Verification
 
