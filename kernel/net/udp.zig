@@ -5,6 +5,7 @@ const ipv4 = @import("ipv4.zig");
 const ipv6 = @import("ipv6.zig");
 const arp = @import("arp.zig");
 const ndp = @import("ndp.zig");
+const icmpv6 = @import("icmpv6.zig");
 const udp_util = @import("udp_util.zig");
 const bo = @import("../lib/byte_order.zig");
 
@@ -171,6 +172,7 @@ pub fn sendToV6(dst_ip: [16]u8, dst_port: u16, src_port: u16, data: [*]const u8,
 
     const dst_mac = ndp.lookup(dst_ip) orelse {
         ndp.markIncomplete(dst_ip);
+        icmpv6.sendNeighborSolicitation(dst_ip);
         return false;
     };
 

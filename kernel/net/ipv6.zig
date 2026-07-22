@@ -159,3 +159,9 @@ pub inline fn addrEq(a: [16]u8, b: [16]u8) bool {
     for (0..16) |i| if (a[i] != b[i]) return false;
     return true;
 }
+
+/// Map an IPv6 multicast address to its Ethernet MAC (RFC 2464 §7):
+/// `33:33` + the low 32 bits of the IPv6 address.
+pub fn multicastMac(addr: [16]u8) [6]u8 {
+    return .{ 0x33, 0x33, addr[12], addr[13], addr[14], addr[15] };
+}

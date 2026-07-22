@@ -1173,8 +1173,23 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   sendto/recvfrom;IPv4 UDP 路径保持兼容。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-71] sockaddr inet6 util non-x86: OK`。
-- **后续**:TCP over IPv6;或 NDP Neighbor Solicitation TX;或 getsockname/
-  getpeername 的 UDP/IPv6。
+- **后续**:见 3.72（NDP Neighbor Solicitation TX,已完成)。
+
+---
+
+### 3.72 NDP Neighbor Solicitation 发送（SK-72,2026-07-22）
+
+- **背景**:SK-70 `sendToV6` 在 NDP 未命中时只 `markIncomplete`,从不发出 NS,
+  对端无法以 NA 填充邻居缓存,首包到新邻居永远失败。
+- **方案**:`ipv6.multicastMac`;`icmpv6.buildNeighborSolicitation`(纯函数:
+  solicited-node L3/L2、type 135、Source-LL 选项)+`sendNeighborSolicitation`。
+  `udp.sendToV6` 在 miss 路径调用 NS。`shared/sk72.zig` 锁定帧布局与校验和。
+- **效果**:IPv6 UDP 首发可主动解析邻居(对称于 ARP request);NA RX 路径复用
+  既有 `handleNeighborAdvertisement`。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-72] ndp neighbor solicitation non-x86: OK`。
+- **后续**:TCP over IPv6;或 getsockname/getpeername 的 UDP/IPv6;或 NS 重传/
+  可达性状态机细化。
 
 ---
 
