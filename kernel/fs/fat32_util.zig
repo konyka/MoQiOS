@@ -380,3 +380,173 @@ pub fn assembleLfnUtf8(
     if (pending_hi != null) return null;
     return out_len;
 }
+
+// ─── LFN encode / 8.3 alias (SK-67) ────────────────────────────────────────
+
+const LFN_CHAR_OFFSETS = [_]u8{ 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+
+/// Decode UTF-8 into UTF-16 code units (BMP + surrogate pairs). Returns unit
+/// count, or null on invalid UTF-8 / overflow.
+pub fn utf8ToUtf16(src: []const u8, out: []u16) ?u32 {
+    var i: usize = 0;
+    var o: u32 = 0;
+    while (i < src.len) {
+        const c0 = src[i];
+        var cp: u32 = undefined;
+        var adv: usize = undefined;
+        if (c0 < 0x80) {
+            cp = c0;
+            adv = 1;
+        } else if ((c0 & 0xE0) == 0xC0) {
+            if (i + 1 >= src.len) return null;
+            const c1 = src[i + 1];
+            if ((c1 & 0xC0) != 0x80) return null;
+            cp = (@as(u32, c0 & 0x1F) << 6) | (c1 & 0x3F);
+            if (cp < 0x80) return null;
+            adv = 2;
+        } else if ((c0 & 0xF0) == 0xE0) {
+            if (i + 2 >= src.len) return null;
+            const c1 = src[i + 1];
+            const c2 = src[i + 2];
+            if ((c1 & 0xC0) != 0x80 or (c2 & 0xC0) != 0x80) return null;
+            cp = (@as(u32, c0 & 0x0F) << 12) | (@as(u32, c1 & 0x3F) << 6) | (c2 & 0x3F);
+            if (cp < 0x800) return null;
+            adv = 3;
+        } else if ((c0 & 0xF8) == 0xF0) {
+            if (i + 3 >= src.len) return null;
+            const c1 = src[i + 1];
+            const c2 = src[i + 2];
+            const c3 = src[i + 3];
+            if ((c1 & 0xC0) != 0x80 or (c2 & 0xC0) != 0x80 or (c3 & 0xC0) != 0x80) return null;
+            cp = (@as(u32, c0 & 0x07) << 18) | (@as(u32, c1 & 0x3F) << 12) |
+                (@as(u32, c2 & 0x3F) << 6) | (c3 & 0x3F);
+            if (cp < 0x10000 or cp > 0x10FFFF) return null;
+            adv = 4;
+        } else {
+            return null;
+        }
+        i += adv;
+        if (cp < 0x10000) {
+            if (o >= out.len) return null;
+            out[o] = @intCast(cp);
+            o += 1;
+        } else {
+            if (o + 1 >= out.len) return null;
+            const x = cp - 0x10000;
+            out[o] = @intCast(0xD800 + (x >> 10));
+            out[o + 1] = @intCast(0xDC00 + (x & 0x3FF));
+            o += 2;
+        }
+    }
+    return o;
+}
+
+/// True when `name` round-trips through 8.3 encode/decode (case-insensitive).
+pub fn fits83Name(name: []const u8) bool {
+    if (name.len == 0 or name.len > 12) return false;
+    var short: [11]u8 = undefined;
+    encode83Name(name, &short);
+    var decoded: [12]u8 = undefined;
+    const n = decode83Name(&short, decoded[0..]);
+    if (n != name.len) return false;
+    for (0..n) |i| {
+        const a = name[i];
+        const b = decoded[i];
+        const al: u8 = if (a >= 'A' and a <= 'Z') a + 32 else a;
+        const bl: u8 = if (b >= 'A' and b <= 'Z') b + 32 else b;
+        if (al != bl) return false;
+    }
+    return true;
+}
+
+fn dosUpperChar(c: u8) ?u8 {
+    if (c >= 'a' and c <= 'z') return c - 32;
+    if (c >= 'A' and c <= 'Z') return c;
+    if (c >= '0' and c <= '9') return c;
+    // Common 8.3-safe punctuation retained by historical Windows short names.
+    return switch (c) {
+        '$', '%', '\'', '-', '_', '@', '~', '`', '!', '(', ')', '{', '}', '^', '#', '&' => c,
+        else => null,
+    };
+}
+
+/// Build a lossy DOS 8.3 alias `XXXXXX~N.EXT` for a long UTF-8 name.
+pub fn make83Alias(name: []const u8, suffix_n: u8, out: *[11]u8) void {
+    @memset(out, 0x20);
+    var last_dot: usize = name.len;
+    for (0..name.len) |i| {
+        if (name[i] == '.') last_dot = i;
+    }
+    const base = if (last_dot < name.len) name[0..last_dot] else name;
+    const ext = if (last_dot < name.len) name[last_dot + 1 ..] else name[0..0];
+
+    var bi: usize = 0;
+    for (base) |c| {
+        if (bi >= 6) break;
+        if (dosUpperChar(c)) |u| {
+            out[bi] = u;
+            bi += 1;
+        }
+    }
+    if (bi == 0) {
+        out[0] = 'F';
+        bi = 1;
+    }
+    out[bi] = '~';
+    const digit: u8 = if (suffix_n == 0) 1 else suffix_n;
+    out[bi + 1] = '0' + (digit % 10);
+
+    var ei: usize = 0;
+    for (ext) |c| {
+        if (ei >= 3) break;
+        if (dosUpperChar(c)) |u| {
+            out[8 + ei] = u;
+            ei += 1;
+        }
+    }
+}
+
+/// Encode one 32-byte LFN directory entry from up to 13 UTF-16 units.
+pub fn encodeLfnEntry(out: [*]u8, seq: u8, is_last: bool, checksum: u8, chars: []const u16) void {
+    @memset(out[0..32], 0xFF);
+    out[0] = if (is_last) seq | 0x40 else seq;
+    out[11] = ATTR_LFN;
+    out[12] = 0;
+    out[13] = checksum;
+    out[26] = 0;
+    out[27] = 0;
+    var i: usize = 0;
+    while (i < 13) : (i += 1) {
+        const ch: u16 = if (i < chars.len) chars[i] else if (i == chars.len) 0 else 0xFFFF;
+        const off = LFN_CHAR_OFFSETS[i];
+        out[off] = @truncate(ch);
+        out[off + 1] = @truncate(ch >> 8);
+    }
+}
+
+/// Build forward-scan-ordered LFN entries for `utf8_name` keyed to `short_name`.
+/// Returns the number of 32-byte slots written into `out_entries`, or null.
+pub fn buildLfnEntries(
+    utf8_name: []const u8,
+    short_name: *const [11]u8,
+    out_entries: [][32]u8,
+) ?u32 {
+    if (utf8_name.len == 0 or out_entries.len == 0) return null;
+    var units: [260]u16 = undefined;
+    const nunits = utf8ToUtf16(utf8_name, units[0..]) orelse return null;
+    if (nunits == 0) return null;
+    const nslots = (nunits + 12) / 13;
+    if (nslots == 0 or nslots > MAX_LFN_SLOTS or nslots > out_entries.len) return null;
+    const sum = lfnChecksum(short_name);
+
+    var out_i: u32 = 0;
+    var seq: u32 = nslots;
+    while (seq >= 1) : (seq -= 1) {
+        const start = (seq - 1) * 13;
+        const remain = nunits - start;
+        const take = if (remain > 13) @as(u32, 13) else remain;
+        encodeLfnEntry(&out_entries[out_i], @intCast(seq), seq == nslots, sum, units[start .. start + take]);
+        out_i += 1;
+    }
+    return nslots;
+}

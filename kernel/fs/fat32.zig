@@ -528,10 +528,56 @@ fn zeroCluster(cluster: u32) void {
     }
 }
 
+/// True if the 11-byte short name already appears as a non-LFN/non-volume entry.
+fn shortNameTaken(sector: [*]const u8, short_name: *const [11]u8) bool {
+    for (0..16) |i| {
+        const off = i * 32;
+        if (sector[off] == 0x00) break;
+        if (sector[off] == 0xE5) continue;
+        const attr = sector[off + 11];
+        if (fat_util.isLfnAttr(attr) or fat_util.isVolumeLabelAttr(attr)) continue;
+        var same = true;
+        for (0..11) |j| {
+            if (sector[off + j] != short_name[j]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) return true;
+    }
+    return false;
+}
+
+/// Find `need` consecutive free (0x00/0xE5) directory slots in one sector.
+fn findConsecutiveFree(sector: [*]const u8, need: u32) ?u32 {
+    if (need == 0 or need > 16) return null;
+    var run_start: ?u32 = null;
+    var run_len: u32 = 0;
+    for (0..16) |i| {
+        const off = i * 32;
+        const free = sector[off] == 0x00 or sector[off] == 0xE5;
+        if (free) {
+            if (run_start == null) run_start = @intCast(i);
+            run_len += 1;
+            if (run_len >= need) return run_start;
+            // A 0x00 free slot means the rest of the directory is empty —
+            // remaining slots are also free for our purposes.
+            if (sector[off] == 0x00) {
+                const avail = 16 - (run_start orelse @as(u32, @intCast(i)));
+                if (avail >= need) return run_start;
+            }
+        } else {
+            run_start = null;
+            run_len = 0;
+        }
+    }
+    return null;
+}
+
 pub fn createFile(name: []const u8) i64 {
     if (!fat32_active) return -1;
     if (file_count >= MAX_FILES) return -1;
-    if (name.len == 0 or name.len > 12) return -1;
+    if (name.len == 0 or name.len >= MAX_FILENAME) return -1;
 
     for (0..file_count) |i| {
         if (files[i].name_len == name.len) {
@@ -549,24 +595,35 @@ pub fn createFile(name: []const u8) i64 {
     const new_cluster = allocCluster() orelse return -1;
     zeroCluster(new_cluster);
 
-    var short_name: [11]u8 = undefined;
-    fat_util.encode83Name(name, &short_name);
-
     const root_lba = clusterToLBA(fat32_root_cluster);
     const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
     _ = virtio_blk.readSectors(root_lba, 1, buf);
 
-    var free_entry: u32 = 16;
-    for (0..16) |i| {
-        const off: u32 = @intCast(i * 32);
-        if (buf[off] == 0x00 or buf[off] == 0xE5) {
-            free_entry = @intCast(i);
-            break;
+    // SK-67: short 8.3 path, or LFN chain + numeric-tilde alias for long names.
+    var short_name: [11]u8 = undefined;
+    var lfn_slots: [fat_util.MAX_LFN_SLOTS][32]u8 = undefined;
+    var lfn_count: u32 = 0;
+    if (fat_util.fits83Name(name)) {
+        fat_util.encode83Name(name, &short_name);
+    } else {
+        var suffix: u8 = 1;
+        while (suffix <= 9) : (suffix += 1) {
+            fat_util.make83Alias(name, suffix, &short_name);
+            if (!shortNameTaken(buf, &short_name)) break;
+            if (suffix == 9) return -1;
         }
+        lfn_count = fat_util.buildLfnEntries(name, &short_name, lfn_slots[0..]) orelse return -1;
     }
-    if (free_entry >= 16) return -1;
 
-    const eoff = free_entry * 32;
+    const need = lfn_count + 1;
+    const free_entry = findConsecutiveFree(buf, need) orelse return -1;
+
+    // Write LFN slots (forward-scan order) then the short entry.
+    for (0..lfn_count) |i| {
+        const eoff = (free_entry + @as(u32, @intCast(i))) * 32;
+        @memcpy((buf + eoff)[0..32], lfn_slots[i][0..32]);
+    }
+    const eoff = (free_entry + lfn_count) * 32;
     const entry = buf + eoff;
     @memcpy(entry[0..11], short_name[0..11]);
     entry[11] = fat_util.ATTR_ARCHIVE;
@@ -597,7 +654,7 @@ pub fn createFile(name: []const u8) i64 {
         .last_cluster = new_cluster,
         .is_dir = false,
     };
-    for (0..name.len) |j| fi.name[j] = name[j];
+    @memcpy(fi.name[0..name.len], name);
     const idx = file_count;
     files[idx] = fi;
     file_count += 1;

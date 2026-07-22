@@ -1091,7 +1091,24 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   UTF-8,无额外分配(栈上 pending 缓冲)。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-66] fat32 LFN assemble UTF-8 non-x86: OK`。
-- **后续**:LFN 创建/写回,或其它 fs/net 纯层。
+- **后续**:见 3.67（LFN 编码/别名 + createFile 写回,已完成)。
+
+---
+
+### 3.67 FAT32 UTF-8→LFN 编码与 createFile 长名写回（SK-67,2026-07-22）
+
+- **背景**:SK-66 可装配长名,但 `createFile` 仍限制 `name.len<=12` 且只写
+  8.3 短项,无法创建长文件名。
+- **方案**:`fat32_util` 增加 `utf8ToUtf16`/`fits83Name`/`make83Alias`/
+  `encodeLfnEntry`/`buildLfnEntries`。`createFile`：短名走原路径;长名生成
+  `XXXXXX~N.EXT` 别名(避开扇区内冲突)、`buildLfnEntries` 后写入连续目录
+  槽(LFN 链 + 短项)。`shared/sk67.zig` 覆盖 fits/alias、双槽 round-trip、
+  😀 代理对与 `utf8ToUtf16`。
+- **效果**:读写对称的纯 LFN 编解码;创建热路径仅在长名时多写有界槽位,无堆
+  分配。短名行为保持兼容。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-67] fat32 LFN encode/alias non-x86: OK`。
+- **后续**:跨扇区连续目录槽分配,或其它 fs/net 纯层。
 
 ---
 
