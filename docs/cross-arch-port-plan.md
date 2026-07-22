@@ -1247,8 +1247,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:IPv6 TCP 服务端/客户端可完成握手;数据面与 IPv4 状态机完全共享留待后续。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-76] tcp sendSegmentV6 handshake non-x86: OK`。
-- **后续**:IPv6 established 数据/关闭路径与 IPv4 共享;或 `connect`/`sockaddr_in6`
-  TCP syscall;或 NS 重传。
+- **后续**:见 3.77（established 数据/关闭共享,已完成)。
+
+---
+
+### 3.77 TCP IPv6 established 路径共享（SK-77,2026-07-22）
+
+- **背景**:SK-76 仅在 `handlePacketV6` 内手写握手分支,established 数据、FIN/
+  关闭状态机仍只跑在 IPv4 `handlePacket` 里。
+- **方案**:抽出 `driveTcbStateMachine`(RST、握手、established、FIN 各态);
+  IPv4/IPv6 RX 在 demux 后共用。`shared/sk77.zig` 锁定握手 → 收 1 字节 →
+  FIN → `close_wait`。
+- **效果**:IPv6 TCP 数据面与关闭路径与 IPv4 同构;后续 syscall/`connect` 可直接复用。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-77] tcp ipv6 established path non-x86: OK`。
+- **后续**:TCP `sockaddr_in6` bind/connect/accept 地址回填;或 NS 重传。
 
 ---
 

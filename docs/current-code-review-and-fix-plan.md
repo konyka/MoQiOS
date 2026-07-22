@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-22 (SK-76 TCP sendSegmentV6 handshake + prior SK-75 reviewed and verified)
+> Last update: 2026-07-22 (SK-77 TCP IPv6 established path share + prior SK-76 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -408,6 +408,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | IPv6 TCP demux empty | `mod.zig` left `PROTO_TCP` over IPv6 as a TODO. | SK-74: `tcp_util.checksumV6` + checksum-gated `handlePacketV6` (TCB demux deferred). |
 | IPv6 TCP no TCB match | Checksum gate dropped all segments; no `remote_ip6` / listen family split. | SK-75: TCB/`ListenSlot` `is_v6`, `findTcbByTupleV6`, `handleIncomingSynV6`; SYN-ACK TX deferred. |
 | IPv6 TCP no SYN-ACK TX | `sendSegment` returned false for v6 TCBs after listen SYN. | SK-76: `fillTcpSegment` + `sendSegmentV6` (NDP) + handshake completion in `handlePacketV6`. |
+| IPv6 TCP data path split | Established/FIN handling lived only in IPv4 `handlePacket`. | SK-77: shared `driveTcbStateMachine` for both families after demux. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -417,8 +418,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-76] tcp sendSegmentV6 handshake non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-76] tcp sendSegmentV6 handshake non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-77] tcp ipv6 established path non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-77] tcp ipv6 established path non-x86: OK`. |
 
 ### 5.3 Historical Verification
 

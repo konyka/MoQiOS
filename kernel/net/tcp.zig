@@ -609,7 +609,7 @@ fn tcpChecksumV6(src_ip: [16]u8, dst_ip: [16]u8, tcp_hdr: [*]const u8, tcp_len: 
     return tcp_util.checksumV6(src_ip, dst_ip, tcp_hdr, tcp_len);
 }
 
-/// IPv6 TCP receive (SK-74..76): checksum, demux/listen SYN, handshake + TX.
+/// IPv6 TCP receive (SK-74..77): checksum, demux/listen SYN, shared state machine.
 pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32) void {
     if (len < 20) return;
     const tcp_len: u16 = @intCast(@min(len, 0xFFFF));
@@ -617,9 +617,18 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
     if (data_offset < 20 or data_offset > tcp_len) return;
 
     const wire_csum = bo.readU16BeAt(data, 16);
-    if (wire_csum == 0) return; // IPv6 TCP checksum is mandatory
+    if (wire_csum == 0) return;
     const expect = tcpChecksumV6(src_ip, dst_ip, data, tcp_len);
     if (wire_csum != expect) return;
+
+    const epoll = @import("epoll.zig");
+    var pending_events: u32 = 0;
+    var pending_idx: u32 = 0;
+    defer {
+        if (pending_events != 0) {
+            epoll.epollNotify(.tcp_socket, pending_idx, pending_events);
+        }
+    }
 
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
@@ -631,6 +640,7 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
     const flags = data[13];
     const raw_window = bo.readU16BeAt(data, 14);
     const opts = parseTcpOptions(data, data_offset);
+    const payload_len: u32 = if (tcp_len > data_offset) tcp_len - data_offset else 0;
 
     const tcb = findTcbByTupleV6(dst_port, src_port, src_ip) orelse {
         if (flags & SYN != 0) {
@@ -639,52 +649,7 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
         return;
     };
 
-    tcb.idle_ms = 0;
-    if (opts.ts_val) |tv| tcb.ts_recent = tv;
-
-    const window: u32 = if (tcb.ws_enabled)
-        @as(u32, raw_window) << @intCast(tcb.snd_wnd_scale)
-    else
-        raw_window;
-
-    // SK-76: complete three-way handshake on IPv6 (full established data path later).
-    switch (tcb.state) {
-        .syn_sent => {
-            if ((flags & (SYN | ACK)) == (SYN | ACK)) {
-                tcb.irs = seq_num;
-                tcb.rcv_nxt = seq_num +% 1;
-                tcb.snd_una = ack_num;
-                tcb.snd_wnd = window;
-                tcb.state = .established;
-                if (opts.ws_shift) |peer_ws| {
-                    tcb.snd_wnd_scale = peer_ws;
-                    tcb.ws_enabled = true;
-                }
-                if (opts.ts_val) |tv| {
-                    tcb.ts_recent = tv;
-                    tcb.ts_enabled = true;
-                }
-                if (opts.sack_permitted) tcb.sack_permitted = true;
-                tcb.cwnd = TCP_MSS;
-                tcb.dup_ack_count = 0;
-                tcb.in_recovery = false;
-                _ = sendSegment(tcb, ACK, undefined, 0);
-            } else if (flags & SYN != 0) {
-                _ = sendSegment(tcb, RST, undefined, 0);
-                tcb.state = .closed;
-                deactivateTcb(tcb);
-            }
-        },
-        .syn_received => {
-            if (flags & ACK != 0) {
-                tcb.snd_una = ack_num;
-                tcb.snd_wnd = window;
-                tcb.state = .established;
-                tcb.retransmit_timer = 0;
-            }
-        },
-        else => {},
-    }
+    driveTcbStateMachine(tcb, seq_num, ack_num, flags, raw_window, opts, data, data_offset, payload_len, &pending_events, &pending_idx);
 }
 
 // ─── Incoming Packet Handling ─────────────────────────────────────────────
@@ -971,50 +936,25 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
     ls.pending_tail += 1;
 }
 
-pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) void {
-    _ = dst_ip;
-    if (len < 20) return;
-
-    // v53.41: Collect epoll events — notify after releasing tcp_lock to avoid blocking all TCP connections
+/// Shared post-demux TCP state machine for IPv4 and IPv6 (SK-77).
+/// Caller must hold `tcp_lock`. Updates `pending_events`/`pending_idx` for epoll.
+fn driveTcbStateMachine(
+    tcb: *TcpTcb,
+    seq_num: u32,
+    ack_num: u32,
+    flags: u8,
+    raw_window: u16,
+    opts: TcpOptions,
+    data: [*]const u8,
+    payload_offset: u16,
+    payload_len: u32,
+    pending_events: *u32,
+    pending_idx: *u32,
+) void {
     const epoll = @import("epoll.zig");
-    var pending_events: u32 = 0;
-    var pending_idx: u32 = 0;
-    defer {
-        if (pending_events != 0) {
-            epoll.epollNotify(.tcp_socket, pending_idx, pending_events);
-        }
-    }
 
-    // v53.13: Acquire TCP lock for the entire packet processing
-    const lock_flags = tcp_lock.acquire();
-    defer tcp_lock.release(lock_flags);
-
-    // Parse TCP header
-    const src_port = bo.readU16BeAt(data, 0);
-    const dst_port = bo.readU16BeAt(data, 2);
-    const seq_num = bo.readU32BeAt(data, 4);
-    const ack_num = bo.readU32BeAt(data, 8);
-    const data_offset = (@as(u16, data[12]) >> 4) * 4;
-    const flags = data[13];
-    const raw_window = bo.readU16BeAt(data, 14);
-
-    if (data_offset < 20 or data_offset > len) return;
-
-    // Parse TCP options
-    const opts = parseTcpOptions(data, data_offset);
-
-    const payload_offset = data_offset;
-    const payload_len: u32 = if (len > data_offset) len - data_offset else 0;
-
-    // Find matching TCB
-    const tcb = findTcbByTuple(dst_port, src_port, src_ip) orelse {
-        // No matching connection — check if any socket is listening on this port
-        if (flags & SYN != 0) {
-            handleIncomingSyn(src_ip, src_port, dst_port, seq_num, raw_window, opts);
-        }
-        // Otherwise send RST (or just ignore)
-        return;
-    };
+    // Any matched segment counts as activity (keepalive idle reset).
+    tcb.idle_ms = 0;
 
     // Update ts_recent for PAWS
     if (opts.ts_val) |tv| {
@@ -1102,8 +1042,8 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                 tcpLog("[tcp] connection established\n");
 
                 // v53.41: Defer epoll notification outside tcp_lock
-                pending_events |= epoll.EPOLLOUT;
-                pending_idx = tcbIdx(tcb);
+                pending_events.* |= epoll.EPOLLOUT;
+                pending_idx.* = tcbIdx(tcb);
             } else if (flags & SYN != 0) {
                 // v53.5: Simultaneous open not supported — send RST and close
                 _ = sendSegment(tcb, RST, undefined, 0);
@@ -1121,8 +1061,8 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                 tcpLog("[tcp] server: connection established (ACK received)\n");
 
                 // v53.41: Defer epoll notification outside tcp_lock
-                pending_events |= epoll.EPOLLOUT;
-                pending_idx = tcbIdx(tcb);
+                pending_events.* |= epoll.EPOLLOUT;
+                pending_idx.* = tcbIdx(tcb);
             }
         },
         .established => {
@@ -1209,8 +1149,8 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                         }
 
                         // v53.41: Defer epoll notification outside tcp_lock
-                        pending_events |= epoll.EPOLLOUT;
-                        pending_idx = tcbIdx(tcb);
+                        pending_events.* |= epoll.EPOLLOUT;
+                        pending_idx.* = tcbIdx(tcb);
                     }
                 } else {
                     // Duplicate ACK (ack_num == snd_una)
@@ -1254,8 +1194,8 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
             if (payload_len > 0) {
                 processIncomingData(tcb, data + payload_offset, payload_len, seq_num);
                 // v53.41: Defer epoll notification outside tcp_lock
-                pending_events |= epoll.EPOLLIN;
-                pending_idx = tcbIdx(tcb);
+                pending_events.* |= epoll.EPOLLIN;
+                pending_idx.* = tcbIdx(tcb);
             }
 
             // Handle FIN — v53.4: only accept FIN after all data is buffered
@@ -1272,8 +1212,8 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
                     _ = sendSegment(tcb, ACK, undefined, 0);
                     tcpLog("[tcp] remote closed (FIN received)\n");
                     // v53.41: Defer epoll notification outside tcp_lock
-                    pending_events |= epoll.EPOLLIN | epoll.EPOLLHUP;
-                    pending_idx = tcbIdx(tcb);
+                    pending_events.* |= epoll.EPOLLIN | epoll.EPOLLHUP;
+                    pending_idx.* = tcbIdx(tcb);
                 }
                 // else: FIN deferred — peer will retransmit after we ACK the partial data
             }
@@ -1305,8 +1245,8 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
         .fin_wait_2 => {
             if (payload_len > 0) {
                 processIncomingData(tcb, data + payload_offset, payload_len, seq_num);
-                pending_events |= epoll.EPOLLIN;
-                pending_idx = tcbIdx(tcb);
+                pending_events.* |= epoll.EPOLLIN;
+                pending_idx.* = tcbIdx(tcb);
             }
             if (flags & FIN != 0) {
                 tcb.rcv_nxt +%= 1;
@@ -1326,8 +1266,8 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
         .close_wait => {
             if (payload_len > 0) {
                 processIncomingData(tcb, data + payload_offset, payload_len, seq_num);
-                pending_events |= epoll.EPOLLIN;
-                pending_idx = tcbIdx(tcb);
+                pending_events.* |= epoll.EPOLLIN;
+                pending_idx.* = tcbIdx(tcb);
             }
         },
         .closing => {
@@ -1349,7 +1289,57 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
             // Ignore packets in other states
         },
     }
+
 }
+
+pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) void {
+    _ = dst_ip;
+    if (len < 20) return;
+
+    // v53.41: Collect epoll events — notify after releasing tcp_lock to avoid blocking all TCP connections
+    const epoll = @import("epoll.zig");
+    var pending_events: u32 = 0;
+    var pending_idx: u32 = 0;
+    defer {
+        if (pending_events != 0) {
+            epoll.epollNotify(.tcp_socket, pending_idx, pending_events);
+        }
+    }
+
+    // v53.13: Acquire TCP lock for the entire packet processing
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+
+    // Parse TCP header
+    const src_port = bo.readU16BeAt(data, 0);
+    const dst_port = bo.readU16BeAt(data, 2);
+    const seq_num = bo.readU32BeAt(data, 4);
+    const ack_num = bo.readU32BeAt(data, 8);
+    const data_offset = (@as(u16, data[12]) >> 4) * 4;
+    const flags = data[13];
+    const raw_window = bo.readU16BeAt(data, 14);
+
+    if (data_offset < 20 or data_offset > len) return;
+
+    // Parse TCP options
+    const opts = parseTcpOptions(data, data_offset);
+
+    const payload_offset = data_offset;
+    const payload_len: u32 = if (len > data_offset) len - data_offset else 0;
+
+    // Find matching TCB
+    const tcb = findTcbByTuple(dst_port, src_port, src_ip) orelse {
+        // No matching connection — check if any socket is listening on this port
+        if (flags & SYN != 0) {
+            handleIncomingSyn(src_ip, src_port, dst_port, seq_num, raw_window, opts);
+        }
+        // Otherwise send RST (or just ignore)
+        return;
+    };
+
+    driveTcbStateMachine(tcb, seq_num, ack_num, flags, raw_window, opts, data, @intCast(payload_offset), payload_len, &pending_events, &pending_idx);
+}
+
 
 fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) void {
     // Check if this is the expected sequence
@@ -1953,6 +1943,14 @@ pub fn tcpProbeIsEstablishedV6(local_port: u16, remote_port: u16, remote_ip6: [1
     defer tcp_lock.release(lock_flags);
     const tcb = findTcbByTupleV6(local_port, remote_port, remote_ip6) orelse return false;
     return tcb.state == .established;
+}
+
+/// Probe helper: TCB index for an IPv6 tuple, or -1.
+pub fn tcpProbeConnIdxV6(local_port: u16, remote_port: u16, remote_ip6: [16]u8) i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    const tcb = findTcbByTupleV6(local_port, remote_port, remote_ip6) orelse return -1;
+    return @intCast(tcbIdx(tcb));
 }
 
 /// Accept a pending connection on a listening socket.
