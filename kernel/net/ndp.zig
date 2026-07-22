@@ -55,13 +55,15 @@ pub const NeighborEntry = struct {
 
 var neighbor_cache: [MAX_NEIGHBORS]NeighborEntry = @splat(.{});
 
-/// SK-82/89/92: default router list from Router Advertisements.
+/// SK-82/89/92/93: default router list from Router Advertisements.
 pub const MAX_DEFAULT_ROUTERS: u32 = 4;
 const DefaultRouterEntry = struct {
     ip: [16]u8 = @splat(0),
     lifetime_sec: u16 = 0,
     /// SK-89: ms accumulated toward the next whole-second lifetime tick.
     age_ms: u32 = 0,
+    /// SK-93: NUD probe/incomplete exhausted; skip while alternatives exist.
+    nud_failed: bool = false,
     valid: bool = false,
 };
 var default_routers: [MAX_DEFAULT_ROUTERS]DefaultRouterEntry = @splat(.{});
@@ -151,22 +153,71 @@ fn neighborHasMacLocked(ip: [16]u8) bool {
     return false;
 }
 
-/// Pick a default router: sticky if still good; else prefer reachable; else first (SK-92).
+/// SK-93: selecting a stale default router starts DELAY without waiting for TX.
+fn nudgeStaleToDelayLocked(ip: [16]u8) void {
+    for (0..MAX_NEIGHBORS) |i| {
+        const e = &neighbor_cache[i];
+        if (!e.valid or e.state != .stale) continue;
+        if (!ipv6.addrEq(e.ipv6_addr, ip)) continue;
+        e.state = .delay;
+        e.age_ms = 0;
+        return;
+    }
+}
+
+fn markDefaultRouterNudFailedLocked(ip: [16]u8) void {
+    for (0..MAX_DEFAULT_ROUTERS) |i| {
+        const e = &default_routers[i];
+        if (!e.valid or !ipv6.addrEq(e.ip, ip)) continue;
+        e.nud_failed = true;
+        if (default_router_sel == i) default_router_sel = MAX_DEFAULT_ROUTERS;
+        return;
+    }
+}
+
+fn clearDefaultRouterNudFailedLocked(ip: [16]u8) void {
+    for (0..MAX_DEFAULT_ROUTERS) |i| {
+        const e = &default_routers[i];
+        if (e.valid and ipv6.addrEq(e.ip, ip)) {
+            e.nud_failed = false;
+            return;
+        }
+    }
+}
+
+/// Pick a default router (SK-92/93): prefer !nud_failed + MAC; skip failed while alternatives exist.
 fn selectDefaultRouterLocked() ?*DefaultRouterEntry {
     if (default_router_sel < MAX_DEFAULT_ROUTERS) {
         const cur = &default_routers[default_router_sel];
-        if (cur.valid and neighborHasMacLocked(cur.ip)) return cur;
+        if (cur.valid and !cur.nud_failed and neighborHasMacLocked(cur.ip)) {
+            nudgeStaleToDelayLocked(cur.ip);
+            return cur;
+        }
     }
     for (0..MAX_DEFAULT_ROUTERS) |i| {
         const e = &default_routers[i];
-        if (e.valid and neighborHasMacLocked(e.ip)) {
+        if (e.valid and !e.nud_failed and neighborHasMacLocked(e.ip)) {
             default_router_sel = @intCast(i);
+            nudgeStaleToDelayLocked(e.ip);
             return e;
         }
     }
-    if (default_router_sel < MAX_DEFAULT_ROUTERS and default_routers[default_router_sel].valid) {
-        return &default_routers[default_router_sel];
+    if (default_router_sel < MAX_DEFAULT_ROUTERS) {
+        const cur = &default_routers[default_router_sel];
+        if (cur.valid and !cur.nud_failed) {
+            nudgeStaleToDelayLocked(cur.ip);
+            return cur;
+        }
     }
+    for (0..MAX_DEFAULT_ROUTERS) |i| {
+        const e = &default_routers[i];
+        if (e.valid and !e.nud_failed) {
+            default_router_sel = @intCast(i);
+            nudgeStaleToDelayLocked(e.ip);
+            return e;
+        }
+    }
+    // Last resort: retry a nud_failed router (may re-solicit).
     for (0..MAX_DEFAULT_ROUTERS) |i| {
         if (default_routers[i].valid) {
             default_router_sel = @intCast(i);
@@ -198,6 +249,7 @@ pub fn setDefaultRouter(ip: [16]u8, lifetime_sec: u16) void {
         if (e.valid and ipv6.addrEq(e.ip, ip)) {
             e.lifetime_sec = lifetime_sec;
             e.age_ms = 0;
+            e.nud_failed = false;
             return;
         }
     }
@@ -208,6 +260,7 @@ pub fn setDefaultRouter(ip: [16]u8, lifetime_sec: u16) void {
                 .ip = ip,
                 .lifetime_sec = lifetime_sec,
                 .age_ms = 0,
+                .nud_failed = false,
                 .valid = true,
             };
             return;
@@ -226,6 +279,7 @@ pub fn setDefaultRouter(ip: [16]u8, lifetime_sec: u16) void {
         .ip = ip,
         .lifetime_sec = lifetime_sec,
         .age_ms = 0,
+        .nud_failed = false,
         .valid = true,
     };
     if (default_router_sel == victim) default_router_sel = MAX_DEFAULT_ROUTERS;
@@ -252,6 +306,17 @@ pub fn probeDefaultRouterCount() u32 {
     const flags = ndp_lock.acquire();
     defer ndp_lock.release(flags);
     return countDefaultRoutersLocked();
+}
+
+/// Probe helper (SK-93): true when this default router is marked NUD-failed.
+pub fn probeDefaultRouterNudFailed(ip: [16]u8) bool {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    for (0..MAX_DEFAULT_ROUTERS) |i| {
+        const e = &default_routers[i];
+        if (e.valid and ipv6.addrEq(e.ip, ip)) return e.nud_failed;
+    }
+    return false;
 }
 
 /// Age all default-router Router Lifetimes (SK-89/92).
@@ -696,6 +761,7 @@ pub fn update(ipv6_addr: [16]u8, mac_addr: [6]u8) void {
             e.retrans_ms = 0;
             e.solicit_count = 0;
             e.age_ms = 0;
+            clearDefaultRouterNudFailedLocked(ipv6_addr);
             return;
         }
     }
@@ -712,6 +778,7 @@ pub fn update(ipv6_addr: [16]u8, mac_addr: [6]u8) void {
                 .solicit_count = 0,
                 .age_ms = 0,
             };
+            clearDefaultRouterNudFailedLocked(ipv6_addr);
             return;
         }
     }
@@ -725,6 +792,7 @@ pub fn update(ipv6_addr: [16]u8, mac_addr: [6]u8) void {
         .solicit_count = 0,
         .age_ms = 0,
     };
+    clearDefaultRouterNudFailedLocked(ipv6_addr);
 }
 
 /// Mark an entry as `incomplete` placeholder while NS is in flight.
@@ -796,6 +864,8 @@ pub fn timerTick(ms_elapsed: u32, out: []Solicit) u32 {
                 if (e.retrans_ms < RETRANS_MS) continue;
                 e.retrans_ms = 0;
                 if (e.solicit_count >= MAX_UNICAST_SOLICIT) {
+                    // SK-93: failed NUD on a default router → failover.
+                    markDefaultRouterNudFailedLocked(e.ipv6_addr);
                     e.valid = false;
                     continue;
                 }
@@ -807,6 +877,7 @@ pub fn timerTick(ms_elapsed: u32, out: []Solicit) u32 {
                 if (e.retrans_ms < RETRANS_MS) continue;
                 e.retrans_ms = 0;
                 if (e.solicit_count >= MAX_MULTICAST_SOLICIT) {
+                    markDefaultRouterNudFailedLocked(e.ipv6_addr);
                     e.valid = false;
                     continue;
                 }

@@ -1470,7 +1470,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:多路由器环境可保留备选;离链路下一跳可在路由器间故障转移。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-92] ndp multi default router non-x86: OK`。
-- **后续**:默认路由器可达性探测(主动 NUD);或 RA 路由信息选项(RIO)。
+- **后续**:见 3.93（默认路由器 NUD 故障转移,已完成)。
+
+---
+
+### 3.93 默认路由器 NUD 故障转移（SK-93,2026-07-23）
+
+- **背景**:多路由器列表会优先有 MAC 的条目,但 NUD probe 失败后死路由器仍可能被选中。
+- **方案**:邻居 `probe`/`incomplete` 耗尽时 `nud_failed`;选择跳过失败项并切换到备选;
+  `update`/RA 刷新清除标记。选中 `stale` 默认路由器时主动进入 DELAY。
+  `shared/sk93.zig` 锁定主动 NUD、失败标记与故障转移。
+- **效果**:默认路由器不可达时离链路流量可切到仍存活的路由器。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-93] ndp router nud failover non-x86: OK`。
+- **后续**:RA 路由信息选项(RIO);或重定向(Redirect)处理。
 
 ---
 
