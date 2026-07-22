@@ -166,13 +166,13 @@ pub fn sendTo(dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, da
     return ok;
 }
 
-/// Send a UDP datagram over IPv6 (SK-70). Requires a resolved NDP neighbor.
+/// Send a UDP datagram over IPv6 (SK-70/87). On-link via NDP; off-link via default router.
 pub fn sendToV6(dst_ip: [16]u8, dst_port: u16, src_port: u16, data: [*]const u8, data_len: u16) bool {
     if (data_len > MAX_UDP_PAYLOAD_V6) return false;
 
-    const dst_mac = ndp.lookup(dst_ip) orelse {
-        ndp.markIncomplete(dst_ip);
-        icmpv6.sendNeighborSolicitation(dst_ip);
+    const nh = ndp.resolveNextHop(dst_ip);
+    const dst_mac = nh.mac orelse {
+        if (nh.solicit) |t| icmpv6.sendNeighborSolicitation(t);
         return false;
     };
 

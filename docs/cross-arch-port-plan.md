@@ -1385,7 +1385,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:有 SLAAC 地址后,发往全球目的时使用正确全球源地址。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-86] ipv6 source select non-x86: OK`。
-- **后续**:启动时自动 RS;或 off-link 目的走默认路由器转发。
+- **后续**:见 3.87（off-link 经默认路由器,已完成)。
+
+---
+
+### 3.87 IPv6 off-link 下一跳经默认路由器（SK-87,2026-07-23）
+
+- **背景**:源地址已可选全球地址,但 TX 仍对 L3 目的做 NDP;off-link 主机
+  无法解析,报文发不出去。
+- **方案**:`ndp.resolveNextHop` — on-link/LL 解析目的本身;multicast 推导
+  MAC;off-link 解析默认路由器并在未命中时对其发 NS。接入 `sendToV6`/
+  `sendSegmentV6`。`shared/sk87.zig` 锁定四类解析结果。
+- **效果**:有默认路由器后,可向 off-link IPv6 目的发送(L3 目的不变)。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-87] ipv6 nexthop router non-x86: OK`。
+- **后续**:启动时自动 RS;或默认路由器 lifetime 老化/多路由器。
 
 ---
 

@@ -568,14 +568,14 @@ fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
     return true;
 }
 
-/// IPv6 TCP TX (SK-76): NDP resolve + eth/ipv6/tcp frame at offset 54.
+/// IPv6 TCP TX (SK-76/87): on-link NDP or off-link via default router.
 fn sendSegmentV6(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
     // IPv6 min MTU 1280 → leave room for 40 IP + ~40 TCP opts.
     if (data_len > 1200) return false;
 
-    const dst_mac = ndp.lookup(tcb.remote_ip6) orelse {
-        ndp.markIncomplete(tcb.remote_ip6);
-        icmpv6.sendNeighborSolicitation(tcb.remote_ip6);
+    const nh = ndp.resolveNextHop(tcb.remote_ip6);
+    const dst_mac = nh.mac orelse {
+        if (nh.solicit) |t| icmpv6.sendNeighborSolicitation(t);
         tcpLog("[tcp] NDP resolution failed\n");
         return false;
     };

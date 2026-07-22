@@ -318,6 +318,33 @@ pub fn selectSourceAddress(dst: [16]u8, mac: [6]u8) [16]u8 {
     return fallback orelse ll;
 }
 
+/// Next-hop resolution result (SK-87).
+pub const NextHop = struct {
+    /// L2 destination when resolved.
+    mac: ?[6]u8 = null,
+    /// Neighbor to solicit when `mac` is null (dst or default router).
+    solicit: ?[16]u8 = null,
+};
+
+/// Resolve L2 next hop for IPv6 `dst` (SK-87).
+/// On-link / link-local: NDP of `dst`. Multicast: derived multicast MAC.
+/// Off-link: NDP of the default router (L3 dst unchanged at the IP layer).
+pub fn resolveNextHop(dst: [16]u8) NextHop {
+    if (ipv6.isMulticast(dst)) {
+        return .{ .mac = ipv6.multicastMac(dst) };
+    }
+    if (ipv6.isLinkLocal(dst) or isOnLink(dst)) {
+        if (lookup(dst)) |m| return .{ .mac = m };
+        markIncomplete(dst);
+        return .{ .solicit = dst };
+    }
+    // Off-link: forward via default router.
+    const rtr = getDefaultRouter() orelse return .{};
+    if (lookup(rtr)) |m| return .{ .mac = m };
+    markIncomplete(rtr);
+    return .{ .solicit = rtr };
+}
+
 /// Probe helper (SK-84/85): number of configured local addresses.
 pub fn probeLocalAddrCount() u32 {
     const flags = ndp_lock.acquire();
