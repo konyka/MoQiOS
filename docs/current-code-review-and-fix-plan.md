@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-22 (SK-65 ensureBlock via classify + prior SK-64/63 reviewed and verified)
+> Last update: 2026-07-22 (SK-66 FAT32 LFN→UTF-8 assemble + prior SK-65 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -397,6 +397,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | ext2 parse purity | Superblock/geometry/inode-table math lived only inside the I/O driver. | SK-63: `ext2_util.zig` + non-x86 probe; `init`/`readInode`/`writeInode`/mode predicates delegate. |
 | ext2 resolve duplication | `resolveBlock` re-implemented classify bounds and six copy-pasted cache/I/O walks. | SK-64: `switch (classifyLogicalBlock)` + shared `loadIndirectPtr`; `resolveLogicalPure` proves the compose path without I/O. |
 | ext2 ensure duplication | `ensureBlock` still hand-rolled the same bounds and repeated root/child/data ensure ladders. | SK-65: same classifier; `ensureIndirectRoot` / `ensureChildIndirect` / `ensureDataPtr`; `indirectRootSlot` + probe lock the resolve/ensure contract. |
+| FAT32 long names skipped | `listRootDir` ignored LFN slots and only exposed 8.3 names. | SK-66: `assembleLfnUtf8` + driver pending-chain; checksum/surrogate validated on non-x86. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -406,8 +407,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-65] ext2 ensure via classify non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-65] ext2 ensure via classify non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-66] fat32 LFN assemble UTF-8 non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-66] fat32 LFN assemble UTF-8 non-x86: OK`. |
 
 ### 5.3 Historical Verification
 

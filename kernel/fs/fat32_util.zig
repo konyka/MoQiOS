@@ -273,3 +273,110 @@ pub fn lfnSequence(entry_first_byte: u8) u5 {
 pub fn isLastLfnSlot(entry_first_byte: u8) bool {
     return (entry_first_byte & 0x40) != 0;
 }
+
+/// Checksum byte stored in an LFN directory entry (@13).
+pub fn lfnEntryChecksum(entry: [*]const u8) u8 {
+    return entry[13];
+}
+
+/// Max LFN slots per short entry (255 UTF-16 units / 13 ≈ 20).
+pub const MAX_LFN_SLOTS: u32 = 20;
+
+fn utf8EncodeCp(cp: u32, out: []u8) ?u32 {
+    if (cp < 0x80) {
+        if (out.len < 1) return null;
+        out[0] = @truncate(cp);
+        return 1;
+    }
+    if (cp < 0x800) {
+        if (out.len < 2) return null;
+        out[0] = @truncate(0xC0 | (cp >> 6));
+        out[1] = @truncate(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        if (out.len < 3) return null;
+        out[0] = @truncate(0xE0 | (cp >> 12));
+        out[1] = @truncate(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = @truncate(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    if (cp <= 0x10FFFF) {
+        if (out.len < 4) return null;
+        out[0] = @truncate(0xF0 | (cp >> 18));
+        out[1] = @truncate(0x80 | ((cp >> 12) & 0x3F));
+        out[2] = @truncate(0x80 | ((cp >> 6) & 0x3F));
+        out[3] = @truncate(0x80 | (cp & 0x3F));
+        return 4;
+    }
+    return null;
+}
+
+/// Assemble one or more on-disk LFN directory entries into a UTF-8 name.
+///
+/// `lfn_entries` must be in forward-scan order: the first entry carries the
+/// last-slot marker (`0x40 | N`), then N-1 … 1, immediately before the short
+/// entry. All slot checksums must match `lfnChecksum(short_name)`. Returns the
+/// UTF-8 byte length, or null on any structural / checksum error.
+pub fn assembleLfnUtf8(
+    lfn_entries: []const [*]const u8,
+    short_name: *const [11]u8,
+    out: []u8,
+) ?u32 {
+    if (lfn_entries.len == 0 or lfn_entries.len > MAX_LFN_SLOTS) return null;
+    const expect = lfnChecksum(short_name);
+
+    var slot_chars: [MAX_LFN_SLOTS][13]u16 = undefined;
+    var slot_lens: [MAX_LFN_SLOTS]u32 = @splat(0);
+    var slot_present: [MAX_LFN_SLOTS]bool = @splat(false);
+    var max_seq: u32 = 0;
+
+    for (lfn_entries, 0..) |entry, i| {
+        if (!isLfnAttr(entry[11])) return null;
+        const first = entry[0];
+        if (first == 0x00 or first == 0xE5) return null;
+        const seq: u32 = lfnSequence(first);
+        if (seq == 0 or seq > MAX_LFN_SLOTS) return null;
+        if (i == 0) {
+            if (!isLastLfnSlot(first)) return null;
+        } else if (isLastLfnSlot(first)) {
+            return null;
+        }
+        if (lfnEntryChecksum(entry) != expect) return null;
+        if (slot_present[seq - 1]) return null;
+        slot_lens[seq - 1] = decodeLfnEntryChars(entry, &slot_chars[seq - 1]);
+        slot_present[seq - 1] = true;
+        if (seq > max_seq) max_seq = seq;
+    }
+    if (max_seq != lfn_entries.len) return null;
+    for (0..max_seq) |si| {
+        if (!slot_present[si]) return null;
+    }
+
+    var out_len: u32 = 0;
+    var pending_hi: ?u16 = null;
+    for (0..max_seq) |si| {
+        const n = slot_lens[si];
+        for (0..n) |ci| {
+            const unit = slot_chars[si][ci];
+            var cp: u32 = undefined;
+            if (pending_hi) |hi| {
+                // Expect a low surrogate to finish the pair.
+                if (unit < 0xDC00 or unit > 0xDFFF) return null;
+                cp = 0x10000 + (@as(u32, hi - 0xD800) << 10) + (unit - 0xDC00);
+                pending_hi = null;
+            } else if (unit >= 0xD800 and unit <= 0xDBFF) {
+                pending_hi = unit;
+                continue;
+            } else if (unit >= 0xDC00 and unit <= 0xDFFF) {
+                return null; // lone low surrogate
+            } else {
+                cp = unit;
+            }
+            const wrote = utf8EncodeCp(cp, out[out_len..]) orelse return null;
+            out_len += wrote;
+        }
+    }
+    if (pending_hi != null) return null;
+    return out_len;
+}

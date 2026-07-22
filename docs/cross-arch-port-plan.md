@@ -1074,7 +1074,24 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   核。x86 smoke 覆盖 `writeFile`→`ensureBlock` 实路径。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-65] ext2 ensure via classify non-x86: OK`。
-- **后续**:装配 FAT32 多槽 LFN→UTF-8,或转向其它 fs/net 纯层。
+- **后续**:见 3.66（FAT32 多槽 LFN→UTF-8 装配,已完成)。
+
+---
+
+### 3.66 FAT32 多槽 LFN→UTF-8 纯装配（SK-66,2026-07-22）
+
+- **背景**:SK-62 抽出单槽 LFN 字符/校验和后,长文件名仍无法从多槽链还原;
+  `listRootDir` 直接跳过 `0x0F` 项,只暴露 8.3 短名。
+- **方案**:`fat32_util.assembleLfnUtf8`——按正向扫描序(首槽带 `0x40|N`)校验
+  Microsoft checksum、补齐 1..N 槽、拼接 UCS-2/UTF-16(含代理对)并编码
+  UTF-8。`listRootDir` 收集 pending LFN 链,短项到达时优先装配;失败或无链
+  时回退 `decode83Name`。删除项/卷标清空孤儿链。`shared/sk66.zig` 覆盖
+  双槽 `hello-world.txt`、单槽、坏校验和、缺 last 标记、以及 😀 代理对。
+- **效果**:长名解析零 I/O 纯函数可移植验证;x86 列表路径在有 LFN 时直接给
+  UTF-8,无额外分配(栈上 pending 缓冲)。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-66] fat32 LFN assemble UTF-8 non-x86: OK`。
+- **后续**:LFN 创建/写回,或其它 fs/net 纯层。
 
 ---
 

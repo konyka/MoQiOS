@@ -111,20 +111,21 @@ pass_markers() {
         grep -q "\[SK-62\] fat32 8.3/LFN helpers non-x86: OK" "$LOG_FILE" &&
         grep -q "\[SK-63\] ext2 parse/geometry non-x86: OK" "$LOG_FILE" &&
         grep -q "\[SK-64\] ext2 resolve via classify non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-65\] ext2 ensure via classify non-x86: OK" "$LOG_FILE"
+        grep -q "\[SK-65\] ext2 ensure via classify non-x86: OK" "$LOG_FILE" &&
+        grep -q "\[SK-66\] fat32 LFN assemble UTF-8 non-x86: OK" "$LOG_FILE"
 }
 
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if pass_markers; then
-        echo "PASS: MoQiOS riscv64 M7+SK-65 smoke (shared probes + slim footprint/env + virtio + U-mode)."
+        echo "PASS: MoQiOS riscv64 M7+SK-66 smoke (shared probes + slim footprint/env + virtio + U-mode)."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         if pass_markers; then
-            echo "PASS: MoQiOS riscv64 M7+SK-65 smoke (shared probes + slim footprint/env + virtio + U-mode)."
+            echo "PASS: MoQiOS riscv64 M7+SK-66 smoke (shared probes + slim footprint/env + virtio + U-mode)."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -138,7 +139,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for riscv64 smoke markers."
-echo "Expected: SK-2..SK-4 + SK-6..SK-65 shared markers + M7 blk/net + M6 + M5 markers."
+echo "Expected: SK-2..SK-4 + SK-6..SK-66 shared markers + M7 blk/net + M6 + M5 markers."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1
