@@ -58,7 +58,7 @@ pub fn announce() void {
 
     // Non-/64 ignored.
     ndp.init();
-    _ = ndp.installSlaac(PREFIX, 48, 3600, MAC);
+    _ = ndp.installSlaac(PREFIX, 48, 3600, 1800, MAC);
     if (ndp.probeLocalAddrCount() != 0) {
         fail("non-/64");
         return;

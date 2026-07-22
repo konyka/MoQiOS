@@ -37,7 +37,7 @@ pub fn announce() void {
     ndp.init();
 
     ndp.setPrefix(PREFIX, 64, true, true, 2);
-    _ = ndp.installSlaac(PREFIX, 64, 2, MAC);
+    _ = ndp.installSlaac(PREFIX, 64, 2, 2, MAC);
     if (ndp.probePrefixLifetime(PREFIX, 64) != 2 or !ndp.isOnLink(ON_LINK) or
         ndp.probeLocalAddrCount() != 1)
     {

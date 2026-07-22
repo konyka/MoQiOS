@@ -1442,7 +1442,22 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:过期前缀不再误判 on-link;SLAAC 地址随前缀失效。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-90] ndp prefix lifetime aging non-x86: OK`。
-- **后续**:多默认路由器选择;或 Preferred Lifetime / 地址弃用。
+- **后续**:见 3.91（Preferred Lifetime / 地址弃用,已完成)。
+
+---
+
+### 3.91 Preferred Lifetime 老化与地址弃用（SK-91,2026-07-23）
+
+- **背景**:PIO 已解析 `preferred_lifetime`,但 SLAAC 在 DAD 后永远保持
+  `preferred`,`selectSourceAddress` 会一直选用过期地址。
+- **方案**:`installSlaac` 携带 Preferred Lifetime(钳制 ≤ Valid);`preferredLifetimeTimerTick`
+  按秒老化;`0` 时 `preferred→deprecated`(仍 `hasLocalAddress`,但新 TX 跳过);
+  RA 刷新可恢复 `preferred`。`0xffffffff` 不老化。接入 `neighborTimerTick`。
+  `shared/sk91.zig` 锁定老化、弃用、源选跳过与刷新恢复。
+- **效果**:弃用地址不再作新连接源地址;Valid 未到期前仍可收包。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-91] ndp preferred lifetime aging non-x86: OK`。
+- **后续**:多默认路由器选择。
 
 ---
 

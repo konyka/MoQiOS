@@ -66,7 +66,7 @@ pub fn announce() void {
 
     // Install → tentative; getGlobalAddress withheld.
     ndp.init();
-    const t = ndp.installSlaac(PREFIX, 64, 3600, MAC) orelse {
+    const t = ndp.installSlaac(PREFIX, 64, 3600, 1800, MAC) orelse {
         fail("install");
         return;
     };
@@ -106,7 +106,7 @@ pub fn announce() void {
 
     // Conflict path: new tentative + foreign NS for same target.
     ndp.init();
-    _ = ndp.installSlaac(PREFIX, 64, 3600, MAC);
+    _ = ndp.installSlaac(PREFIX, 64, 3600, 1800, MAC);
     var ns: [24]u8 = @splat(0);
     ns[0] = 135;
     @memcpy(ns[8..24], &target);

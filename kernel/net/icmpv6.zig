@@ -156,7 +156,7 @@ fn handleRouterAdvertisement(src_ip: [16]u8, data: [*]const u8, len: u16) void {
         ndp.setPrefix(p.prefix, p.prefix_len, p.on_link, p.autonomous, p.valid_lifetime);
         // SK-84/85: A-flag /64 → tentative SLAAC + DAD NS.
         if (p.autonomous) {
-            if (ndp.installSlaac(p.prefix, p.prefix_len, p.valid_lifetime, our_mac)) |tentative| {
+            if (ndp.installSlaac(p.prefix, p.prefix_len, p.valid_lifetime, p.preferred_lifetime, our_mac)) |tentative| {
                 sendDadNeighborSolicitation(tentative);
             }
         }
@@ -571,4 +571,6 @@ pub fn neighborTimerTick(ms_elapsed: u32) void {
     }
     // SK-90: expire on-link / SLAAC prefixes when Valid Lifetime hits zero.
     ndp.prefixLifetimeTimerTick(ms_elapsed);
+    // SK-91: Preferred Lifetime → deprecate addresses for new TX.
+    ndp.preferredLifetimeTimerTick(ms_elapsed);
 }

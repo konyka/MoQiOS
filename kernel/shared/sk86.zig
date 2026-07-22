@@ -51,7 +51,7 @@ pub fn announce() void {
     }
 
     // Install + complete DAD → preferred global.
-    _ = ndp.installSlaac(PREFIX, 64, 3600, MAC);
+    _ = ndp.installSlaac(PREFIX, 64, 3600, 1800, MAC);
     var dad_out: [1][16]u8 = undefined;
     _ = ndp.dadTimerTick(ndp.RETRANS_MS, &dad_out);
     const global = ndp.formSlaacAddress(PREFIX, MAC);

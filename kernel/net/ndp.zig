@@ -78,17 +78,23 @@ pub const PrefixEntry = struct {
 };
 var prefix_table: [MAX_PREFIXES]PrefixEntry = @splat(.{});
 
-/// SK-84/85: SLAAC addresses formed from A-flag /64 prefixes.
+/// SK-84/85/91: SLAAC addresses formed from A-flag /64 prefixes.
 pub const MAX_LOCAL_ADDRS: u32 = 4;
 pub const AddrState = enum(u8) {
     tentative = 0,
     preferred = 1,
+    /// SK-91: Preferred Lifetime expired; still valid but not for new TX.
+    deprecated = 2,
 };
 const LocalAddr = struct {
     addr: [16]u8 = @splat(0),
     /// Matching PIO prefix length (always 64 for SLAAC today).
     prefix_len: u8 = 0,
     state: AddrState = .tentative,
+    /// SK-91: remaining Preferred Lifetime seconds (infinity = no aging).
+    preferred_lifetime: u32 = 0,
+    /// SK-91: ms accumulated toward the next whole-second preferred tick.
+    preferred_age_ms: u32 = 0,
     /// SK-85: ms since last DAD NS.
     dad_ms: u32 = 0,
     /// SK-85: DAD NS transmissions completed.
@@ -311,10 +317,18 @@ pub fn formSlaacAddress(prefix: [16]u8, mac: [6]u8) [16]u8 {
     return addr;
 }
 
-/// Install or remove a SLAAC address for an autonomous /64 prefix (SK-84/85).
+/// Install or remove a SLAAC address for an autonomous /64 prefix (SK-84/85/91).
 /// `valid_lifetime == 0` removes any address formed from this prefix.
+/// `preferred_lifetime` is clamped to `valid_lifetime`; refresh may restore
+/// a deprecated address to preferred (SK-91).
 /// On new install, returns the tentative address so the caller can send DAD NS.
-pub fn installSlaac(prefix: [16]u8, prefix_len: u8, valid_lifetime: u32, mac: [6]u8) ?[16]u8 {
+pub fn installSlaac(
+    prefix: [16]u8,
+    prefix_len: u8,
+    valid_lifetime: u32,
+    preferred_lifetime: u32,
+    mac: [6]u8,
+) ?[16]u8 {
     if (prefix_len != 64) return null;
     const flags = ndp_lock.acquire();
     defer ndp_lock.release(flags);
@@ -330,12 +344,20 @@ pub fn installSlaac(prefix: [16]u8, prefix_len: u8, valid_lifetime: u32, mac: [6
         return null;
     }
 
+    const pref: u32 = if (preferred_lifetime > valid_lifetime) valid_lifetime else preferred_lifetime;
     const addr = formSlaacAddress(prefix, mac);
-    // Existing preferred/tentative: keep; re-trigger DAD only if new.
+    // Existing: refresh preferred lifetime; do not re-trigger DAD.
     for (0..MAX_LOCAL_ADDRS) |i| {
         const e = &local_addrs[i];
         if (e.valid and ipv6.addrEq(e.addr, addr)) {
             e.prefix_len = 64;
+            e.preferred_lifetime = pref;
+            e.preferred_age_ms = 0;
+            if (pref == 0) {
+                if (e.state == .preferred) e.state = .deprecated;
+            } else if (e.state == .deprecated) {
+                e.state = .preferred;
+            }
             return null;
         }
     }
@@ -347,6 +369,8 @@ pub fn installSlaac(prefix: [16]u8, prefix_len: u8, valid_lifetime: u32, mac: [6
                 .addr = addr,
                 .prefix_len = 64,
                 .state = .tentative,
+                .preferred_lifetime = pref,
+                .preferred_age_ms = 0,
                 .dad_ms = 0,
                 .dad_sent = 1,
                 .valid = true,
@@ -357,7 +381,7 @@ pub fn installSlaac(prefix: [16]u8, prefix_len: u8, valid_lifetime: u32, mac: [6
     return null;
 }
 
-/// True when `addr` is a configured local IPv6 address (tentative or preferred).
+/// True when `addr` is a configured local IPv6 address (any state).
 pub fn hasLocalAddress(addr: [16]u8) bool {
     const flags = ndp_lock.acquire();
     defer ndp_lock.release(flags);
@@ -439,7 +463,7 @@ pub fn probeLocalAddrCount() u32 {
     return n;
 }
 
-/// Probe helper (SK-85): address DAD/preferred state, or null if missing.
+/// Probe helper (SK-85): address DAD/preferred/deprecated state, or null if missing.
 pub fn probeAddrState(addr: [16]u8) ?AddrState {
     const flags = ndp_lock.acquire();
     defer ndp_lock.release(flags);
@@ -450,9 +474,50 @@ pub fn probeAddrState(addr: [16]u8) ?AddrState {
     return null;
 }
 
+/// Probe helper (SK-91): remaining Preferred Lifetime seconds, or 0 if absent.
+pub fn probePreferredLifetime(addr: [16]u8) u32 {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    for (0..MAX_LOCAL_ADDRS) |i| {
+        if (local_addrs[i].valid and ipv6.addrEq(local_addrs[i].addr, addr))
+            return local_addrs[i].preferred_lifetime;
+    }
+    return 0;
+}
+
+/// Age SLAAC Preferred Lifetimes (SK-91). At zero, preferred → deprecated.
+pub fn preferredLifetimeTimerTick(ms_elapsed: u32) void {
+    if (ms_elapsed == 0) return;
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    for (0..MAX_LOCAL_ADDRS) |i| {
+        const e = &local_addrs[i];
+        if (!e.valid) continue;
+        if (e.preferred_lifetime == PREFIX_LIFETIME_INFINITY) continue;
+        if (e.preferred_lifetime == 0) {
+            if (e.state == .preferred) e.state = .deprecated;
+            continue;
+        }
+        // Age while tentative or preferred so the clock starts at install.
+        if (e.state != .tentative and e.state != .preferred) continue;
+
+        e.preferred_age_ms +%= ms_elapsed;
+        while (e.preferred_age_ms >= 1000 and e.preferred_lifetime > 0 and
+            e.preferred_lifetime != PREFIX_LIFETIME_INFINITY)
+        {
+            e.preferred_age_ms -= 1000;
+            e.preferred_lifetime -= 1;
+        }
+        if (e.preferred_lifetime == 0 and e.state == .preferred) {
+            e.state = .deprecated;
+        }
+    }
+}
+
 /// Advance DAD timers (SK-85). After DupAddrDetectTransmits × RetransTimer
-/// with no conflict, marks the address preferred. May emit extra DAD targets
-/// into `out` when DupAddrDetectTransmits > 1.
+/// with no conflict, marks the address preferred (or deprecated if Preferred
+/// Lifetime is already zero). May emit extra DAD targets into `out` when
+/// DupAddrDetectTransmits > 1.
 pub fn dadTimerTick(ms_elapsed: u32, out: [][16]u8) u32 {
     if (ms_elapsed == 0) return 0;
     const flags = ndp_lock.acquire();
@@ -466,7 +531,7 @@ pub fn dadTimerTick(ms_elapsed: u32, out: [][16]u8) u32 {
         if (e.dad_ms < RETRANS_MS) continue;
         e.dad_ms = 0;
         if (e.dad_sent >= DUP_ADDR_DETECT_TRANSMITS) {
-            e.state = .preferred;
+            e.state = if (e.preferred_lifetime == 0) .deprecated else .preferred;
             continue;
         }
         e.dad_sent +%= 1;
