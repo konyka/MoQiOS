@@ -15,6 +15,8 @@ pub const MAX_NEIGHBORS: u32 = 64;
 pub const RETRANS_MS: u32 = 1000;
 /// RFC 4861 MAX_MULTICAST_SOLICIT (initial NS + retransmits).
 pub const MAX_MULTICAST_SOLICIT: u8 = 3;
+/// RFC 4861 BaseReachableTime default (ms). SK-80 uses this as REACHABLE_TIME.
+pub const REACHABLE_TIME_MS: u32 = 30_000;
 
 pub const NeighborState = enum(u8) {
     incomplete = 0,
@@ -33,6 +35,8 @@ pub const NeighborEntry = struct {
     retrans_ms: u32 = 0,
     /// SK-79: NS transmissions so far (1 = initial send by caller).
     solicit_count: u8 = 0,
+    /// SK-80: ms spent in `reachable` (NUD aging toward `stale`).
+    age_ms: u32 = 0,
 };
 
 var neighbor_cache: [MAX_NEIGHBORS]NeighborEntry = @splat(.{});
@@ -76,6 +80,7 @@ pub fn update(ipv6_addr: [16]u8, mac_addr: [6]u8) void {
             e.state = .reachable;
             e.retrans_ms = 0;
             e.solicit_count = 0;
+            e.age_ms = 0;
             return;
         }
     }
@@ -90,6 +95,7 @@ pub fn update(ipv6_addr: [16]u8, mac_addr: [6]u8) void {
                 .valid = true,
                 .retrans_ms = 0,
                 .solicit_count = 0,
+                .age_ms = 0,
             };
             return;
         }
@@ -102,6 +108,7 @@ pub fn update(ipv6_addr: [16]u8, mac_addr: [6]u8) void {
         .valid = true,
         .retrans_ms = 0,
         .solicit_count = 0,
+        .age_ms = 0,
     };
 }
 
@@ -132,19 +139,31 @@ pub fn markIncomplete(ipv6_addr: [16]u8) void {
     }
 }
 
-/// Advance incomplete-entry timers (SK-79).
-/// Writes targets that need another NS into `out` (up to `out.len`).
+/// Advance NDP timers (SK-79 incomplete NS; SK-80 reachable→stale aging).
+/// Writes incomplete targets that need another NS into `out` (up to `out.len`).
 /// Entries that exhaust `MAX_MULTICAST_SOLICIT` are invalidated.
 /// Does not transmit — caller (icmpv6) sends to avoid ndp↔icmpv6 cycles.
 pub fn timerTick(ms_elapsed: u32, out: [][16]u8) u32 {
-    if (ms_elapsed == 0 or out.len == 0) return 0;
+    if (ms_elapsed == 0) return 0;
     const flags = ndp_lock.acquire();
     defer ndp_lock.release(flags);
 
     var n: u32 = 0;
     for (0..MAX_NEIGHBORS) |i| {
         const e = &neighbor_cache[i];
-        if (!e.valid or e.state != .incomplete) continue;
+        if (!e.valid) continue;
+
+        // SK-80: REACHABLE_TIME aging — stale entries remain usable via lookup.
+        if (e.state == .reachable) {
+            e.age_ms +%= ms_elapsed;
+            if (e.age_ms >= REACHABLE_TIME_MS) {
+                e.state = .stale;
+                e.age_ms = 0;
+            }
+            continue;
+        }
+
+        if (e.state != .incomplete) continue;
         e.retrans_ms +%= ms_elapsed;
         if (e.retrans_ms < RETRANS_MS) continue;
         e.retrans_ms = 0;
@@ -182,6 +201,17 @@ pub fn probeSolicitCount(ipv6_addr: [16]u8) u8 {
         if (e.valid and ipv6.addrEq(e.ipv6_addr, ipv6_addr)) return e.solicit_count;
     }
     return 0xFF;
+}
+
+/// Probe helper (SK-80): neighbor state, or null if missing/invalid.
+pub fn probeState(ipv6_addr: [16]u8) ?NeighborState {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    for (0..MAX_NEIGHBORS) |i| {
+        const e = &neighbor_cache[i];
+        if (e.valid and ipv6.addrEq(e.ipv6_addr, ipv6_addr)) return e.state;
+    }
+    return null;
 }
 
 /// Generate an IPv6 link-local address (fe80::/64) from a 48-bit MAC using

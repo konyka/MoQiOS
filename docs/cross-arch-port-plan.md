@@ -1288,7 +1288,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:丢失的 NS 会按 RFC 4861 默认节奏重试,失败后清理 incomplete 槽位。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-79] ndp ns retransmit non-x86: OK`。
-- **后续**:NDP reachable/stale/probe 状态机;或 Router Solicitation/Advertisement。
+- **后续**:见 3.80（reachable→stale 老化,已完成)。
+
+---
+
+### 3.80 NDP reachable→stale 老化（SK-80,2026-07-22）
+
+- **背景**:邻居一经 NA/`update` 即永久 `reachable`,不符合 NUD;长期无确认的
+  映射不会降级。
+- **方案**:`NeighborEntry.age_ms` + `REACHABLE_TIME_MS`(30s);`ndp.timerTick`
+  将超时 `reachable` 降为 `stale`;`lookup` 仍返回 MAC。`shared/sk80.zig` 锁定
+  老化与 refresh 重置。
+- **效果**:NUD 第一步落地;后续可在 stale 使用路径上接 DELAY/PROBE 单播 NS。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-80] ndp reachable stale aging non-x86: OK`。
+- **后续**:stale→delay→probe 单播 NS;或 Router Solicitation/Advertisement。
 
 ---
 
