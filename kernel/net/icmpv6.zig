@@ -15,6 +15,8 @@ const ndp = @import("ndp.zig");
 const bo = @import("../lib/byte_order.zig");
 
 // ── ICMPv6 message types (RFC 4443 + RFC 4861) ─────────────────────────────
+/// RFC 4443 Packet Too Big (SK-97).
+pub const PACKET_TOO_BIG: u8 = 2;
 pub const ECHO_REQUEST: u8 = 128;
 pub const ECHO_REPLY: u8 = 129;
 pub const ROUTER_SOLICITATION: u8 = 133;
@@ -97,8 +99,33 @@ pub fn handlePacket(
         NEIGHBOR_SOLICITATION => handleNeighborSolicitation(src_ip, dst_ip, data, len),
         NEIGHBOR_ADVERTISEMENT => handleNeighborAdvertisement(src_ip, data, len),
         REDIRECT => handleRedirect(src_ip, data, len),
+        PACKET_TOO_BIG => handlePacketTooBig(data, len),
         else => {},
     }
+}
+
+/// Parsed Packet Too Big (RFC 4443 §3.2) (SK-97).
+pub const PacketTooBigMsg = struct {
+    mtu: u32 = 0,
+    /// Destination of the invoking IPv6 packet (PMTU cache key).
+    dst: [16]u8 = @splat(0),
+};
+
+/// Pure PTB parser: needs ICMP header + invoking IPv6 header.
+pub fn parsePacketTooBig(data: [*]const u8, len: u16) ?PacketTooBigMsg {
+    if (len < 8 + ipv6.HEADER_LEN) return null;
+    if (data[0] != PACKET_TOO_BIG or data[1] != 0) return null;
+    const inv = ipv6.parseHeader(data + 8) orelse return null;
+    return .{
+        .mtu = bo.readU32BeAt(data, 4),
+        .dst = inv.dst_ip,
+    };
+}
+
+fn handlePacketTooBig(data: [*]const u8, len: u16) void {
+    const msg = parsePacketTooBig(data, len) orelse return;
+    if (ipv6.isMulticast(msg.dst) or ipv6.isUnspecified(msg.dst)) return;
+    ipv6.updatePathMtu(msg.dst, msg.mtu);
 }
 
 /// Parsed Redirect (RFC 4861 §4.5) (SK-95).
@@ -666,4 +693,6 @@ pub fn neighborTimerTick(ms_elapsed: u32) void {
     ndp.routeLifetimeTimerTick(ms_elapsed);
     // SK-95: expire Destination Cache redirects.
     ndp.destCacheTimerTick(ms_elapsed);
+    // SK-97: expire Path MTU entries.
+    ipv6.pathMtuTimerTick(ms_elapsed);
 }

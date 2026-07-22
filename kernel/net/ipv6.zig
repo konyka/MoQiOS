@@ -5,6 +5,7 @@
 // all of which include an IPv6 pseudo-header in their checksum computation.
 
 const bo = @import("../lib/byte_order.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 pub const PROTO_ICMPV6: u8 = 58;
 pub const PROTO_TCP: u8 = 6;
@@ -12,6 +13,13 @@ pub const PROTO_UDP: u8 = 17;
 
 /// Fixed IPv6 header length in bytes.
 pub const HEADER_LEN: u16 = 40;
+/// IPv6 minimum link MTU (RFC 8200).
+pub const MIN_MTU: u16 = 1280;
+/// Ethernet link MTU used as the default Path MTU.
+pub const LINK_MTU: u16 = 1500;
+/// How long a learned Path MTU stays without refresh (seconds) (SK-97).
+pub const PMTU_LIFETIME_SEC: u32 = 600;
+pub const MAX_PMTU_ENTRIES: u32 = 8;
 
 /// Default Hop Limit for outbound packets (analogous to IPv4 TTL=64).
 pub const DEFAULT_HOP_LIMIT: u8 = 64;
@@ -188,4 +196,105 @@ pub inline fn addrEq(a: [16]u8, b: [16]u8) bool {
 /// `33:33` + the low 32 bits of the IPv6 address.
 pub fn multicastMac(addr: [16]u8) [6]u8 {
     return .{ 0x33, 0x33, addr[12], addr[13], addr[14], addr[15] };
+}
+
+// ── SK-97: Path MTU cache (ICMPv6 Packet Too Big) ─────────────────────────
+const PmtuEntry = struct {
+    dst: [16]u8 = @splat(0),
+    mtu: u16 = LINK_MTU,
+    lifetime_sec: u32 = 0,
+    age_ms: u32 = 0,
+    valid: bool = false,
+};
+var pmtu_table: [MAX_PMTU_ENTRIES]PmtuEntry = @splat(.{});
+var pmtu_lock: IrqSpinlock = .{};
+
+/// Clear the Path MTU cache (called from net.init).
+pub fn initPmtu() void {
+    const flags = pmtu_lock.acquire();
+    defer pmtu_lock.release(flags);
+    for (0..MAX_PMTU_ENTRIES) |i| {
+        pmtu_table[i] = .{};
+    }
+}
+
+fn clampMtu(reported: u32) u16 {
+    if (reported < MIN_MTU) return MIN_MTU;
+    if (reported > LINK_MTU) return LINK_MTU;
+    return @intCast(reported);
+}
+
+/// Lower (or install) Path MTU for `dst` from a Packet Too Big (SK-97).
+pub fn updatePathMtu(dst: [16]u8, reported_mtu: u32) void {
+    const mtu = clampMtu(reported_mtu);
+    const flags = pmtu_lock.acquire();
+    defer pmtu_lock.release(flags);
+    for (0..MAX_PMTU_ENTRIES) |i| {
+        const e = &pmtu_table[i];
+        if (e.valid and addrEq(e.dst, dst)) {
+            if (mtu < e.mtu) e.mtu = mtu;
+            e.lifetime_sec = PMTU_LIFETIME_SEC;
+            e.age_ms = 0;
+            return;
+        }
+    }
+    for (0..MAX_PMTU_ENTRIES) |i| {
+        const e = &pmtu_table[i];
+        if (!e.valid) {
+            e.* = .{
+                .dst = dst,
+                .mtu = mtu,
+                .lifetime_sec = PMTU_LIFETIME_SEC,
+                .age_ms = 0,
+                .valid = true,
+            };
+            return;
+        }
+    }
+    pmtu_table[0] = .{
+        .dst = dst,
+        .mtu = mtu,
+        .lifetime_sec = PMTU_LIFETIME_SEC,
+        .age_ms = 0,
+        .valid = true,
+    };
+}
+
+/// Current Path MTU for `dst`, or `LINK_MTU` when unknown (SK-97).
+pub fn getPathMtu(dst: [16]u8) u16 {
+    const flags = pmtu_lock.acquire();
+    defer pmtu_lock.release(flags);
+    for (0..MAX_PMTU_ENTRIES) |i| {
+        const e = &pmtu_table[i];
+        if (e.valid and addrEq(e.dst, dst)) return e.mtu;
+    }
+    return LINK_MTU;
+}
+
+/// Probe helper (SK-97): number of Path MTU cache entries.
+pub fn probePathMtuCount() u32 {
+    const flags = pmtu_lock.acquire();
+    defer pmtu_lock.release(flags);
+    var n: u32 = 0;
+    for (0..MAX_PMTU_ENTRIES) |i| {
+        if (pmtu_table[i].valid) n += 1;
+    }
+    return n;
+}
+
+/// Age Path MTU entries; expired destinations revert to LINK_MTU (SK-97).
+pub fn pathMtuTimerTick(ms_elapsed: u32) void {
+    if (ms_elapsed == 0) return;
+    const flags = pmtu_lock.acquire();
+    defer pmtu_lock.release(flags);
+    for (0..MAX_PMTU_ENTRIES) |i| {
+        const e = &pmtu_table[i];
+        if (!e.valid) continue;
+        e.age_ms +%= ms_elapsed;
+        while (e.age_ms >= 1000 and e.lifetime_sec > 0) {
+            e.age_ms -= 1000;
+            e.lifetime_sec -= 1;
+        }
+        if (e.lifetime_sec == 0) e.* = .{};
+    }
 }

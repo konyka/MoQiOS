@@ -1522,7 +1522,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:重定向下一跳不可达时自动恢复到可用路径,避免黑洞。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-96] ndp redirect nud invalidate non-x86: OK`。
-- **后续**:Redirected Header 选项;或 Path MTU / Packet Too Big。
+- **后续**:见 3.97（Path MTU / Packet Too Big,已完成)。
+
+---
+
+### 3.97 ICMPv6 Packet Too Big / Path MTU（SK-97,2026-07-23）
+
+- **背景**:IPv6 TX 固定按链路 MTU 发包,忽略路由器 Packet Too Big,易黑洞。
+- **方案**:解析 type=2;`ipv6.updatePathMtu` 按目的缓存 MTU(钳制 1280..1500,只降不升);
+  UDP/TCP IPv6 发送拒绝超过 PMTU 的报文;600s 老化后恢复 LINK_MTU。
+  `shared/sk97.zig` 锁定解析、钳制、TX 拒绝与过期。
+- **效果**:学到更小路径 MTU 后不再发送过大报文。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-97] ipv6 path mtu ptb non-x86: OK`。
+- **后续**:TCP MSS 随 PMTU 收缩;或 Redirected Header 选项。
 
 ---
 

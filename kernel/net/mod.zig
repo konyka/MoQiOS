@@ -16,6 +16,7 @@ pub fn init() void {
     netif.ensureInit();
     arp.init();
     ndp.init();
+    ipv6.initPmtu();
     tcp.initTcbs();
     // SK-88: solicit routers so RA can populate default route / prefixes.
     icmpv6.startRouterSolicit();

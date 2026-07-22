@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-23 (SK-96 redirect NUD invalidate + prior SK-95 reviewed and verified)
+> Last update: 2026-07-23 (SK-97 Path MTU / PTB + prior SK-96 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -428,6 +428,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | RA Route Information ignored | Off-link TX always used the default router. | SK-94: RIO table + longest-match next hop in `resolveNextHop`. |
 | ICMPv6 Redirect ignored | Type 137 was dropped; hosts never updated first hop. | SK-95: Destination Cache + validated Redirect handling. |
 | Stale redirect after NUD fail | Destination Cache kept next hops that failed NUD. | SK-96: clear cache entries when next-hop NUD exhausts. |
+| No IPv6 Path MTU | Packet Too Big ignored; TX always used link MTU. | SK-97: PMTU cache + UDP/TCP refuse oversized sends. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -437,8 +438,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-96] ndp redirect nud invalidate non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-96] ndp redirect nud invalidate non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-97] ipv6 path mtu ptb non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-97] ipv6 path mtu ptb non-x86: OK`. |
 
 ### 5.3 Historical Verification
 
