@@ -55,12 +55,18 @@ pub const NeighborEntry = struct {
 
 var neighbor_cache: [MAX_NEIGHBORS]NeighborEntry = @splat(.{});
 
-/// SK-82/89: single default router learned from Router Advertisement.
-var default_router_ip: [16]u8 = @splat(0);
-var default_router_lifetime_sec: u16 = 0;
-/// SK-89: ms accumulated toward the next whole-second lifetime tick.
-var default_router_age_ms: u32 = 0;
-var default_router_valid: bool = false;
+/// SK-82/89/92: default router list from Router Advertisements.
+pub const MAX_DEFAULT_ROUTERS: u32 = 4;
+const DefaultRouterEntry = struct {
+    ip: [16]u8 = @splat(0),
+    lifetime_sec: u16 = 0,
+    /// SK-89: ms accumulated toward the next whole-second lifetime tick.
+    age_ms: u32 = 0,
+    valid: bool = false,
+};
+var default_routers: [MAX_DEFAULT_ROUTERS]DefaultRouterEntry = @splat(.{});
+/// Sticky selected index; `MAX_DEFAULT_ROUTERS` means none (SK-92).
+var default_router_sel: u32 = MAX_DEFAULT_ROUTERS;
 
 /// SK-83: on-link / PIO prefixes from Router Advertisement.
 pub const MAX_PREFIXES: u32 = 8;
@@ -115,10 +121,10 @@ pub fn init() void {
     for (0..MAX_NEIGHBORS) |i| {
         neighbor_cache[i] = .{};
     }
-    default_router_ip = @splat(0);
-    default_router_lifetime_sec = 0;
-    default_router_age_ms = 0;
-    default_router_valid = false;
+    for (0..MAX_DEFAULT_ROUTERS) |i| {
+        default_routers[i] = .{};
+    }
+    default_router_sel = MAX_DEFAULT_ROUTERS;
     for (0..MAX_PREFIXES) |i| {
         prefix_table[i] = .{};
     }
@@ -127,64 +133,150 @@ pub fn init() void {
     }
 }
 
-fn clearDefaultRouterLocked() void {
-    default_router_valid = false;
-    default_router_lifetime_sec = 0;
-    default_router_age_ms = 0;
-    default_router_ip = @splat(0);
+fn countDefaultRoutersLocked() u32 {
+    var n: u32 = 0;
+    for (0..MAX_DEFAULT_ROUTERS) |i| {
+        if (default_routers[i].valid) n += 1;
+    }
+    return n;
 }
 
-/// Install or clear the default router from an RA (SK-82).
-/// `lifetime_sec == 0` removes this router if it is the current default.
+/// True when a usable (non-incomplete) neighbor MAC is cached (no NUD side effects).
+fn neighborHasMacLocked(ip: [16]u8) bool {
+    for (0..MAX_NEIGHBORS) |i| {
+        const e = &neighbor_cache[i];
+        if (!e.valid or e.state == .incomplete) continue;
+        if (ipv6.addrEq(e.ipv6_addr, ip) and !macIsZero(e.mac_addr)) return true;
+    }
+    return false;
+}
+
+/// Pick a default router: sticky if still good; else prefer reachable; else first (SK-92).
+fn selectDefaultRouterLocked() ?*DefaultRouterEntry {
+    if (default_router_sel < MAX_DEFAULT_ROUTERS) {
+        const cur = &default_routers[default_router_sel];
+        if (cur.valid and neighborHasMacLocked(cur.ip)) return cur;
+    }
+    for (0..MAX_DEFAULT_ROUTERS) |i| {
+        const e = &default_routers[i];
+        if (e.valid and neighborHasMacLocked(e.ip)) {
+            default_router_sel = @intCast(i);
+            return e;
+        }
+    }
+    if (default_router_sel < MAX_DEFAULT_ROUTERS and default_routers[default_router_sel].valid) {
+        return &default_routers[default_router_sel];
+    }
+    for (0..MAX_DEFAULT_ROUTERS) |i| {
+        if (default_routers[i].valid) {
+            default_router_sel = @intCast(i);
+            return &default_routers[i];
+        }
+    }
+    default_router_sel = MAX_DEFAULT_ROUTERS;
+    return null;
+}
+
+/// Install, refresh, or remove a default router from an RA (SK-82/92).
+/// `lifetime_sec == 0` removes this router from the list.
 pub fn setDefaultRouter(ip: [16]u8, lifetime_sec: u16) void {
     const flags = ndp_lock.acquire();
     defer ndp_lock.release(flags);
     if (lifetime_sec == 0) {
-        if (default_router_valid and ipv6.addrEq(default_router_ip, ip)) {
-            clearDefaultRouterLocked();
+        for (0..MAX_DEFAULT_ROUTERS) |i| {
+            const e = &default_routers[i];
+            if (e.valid and ipv6.addrEq(e.ip, ip)) {
+                e.* = .{};
+                if (default_router_sel == i) default_router_sel = MAX_DEFAULT_ROUTERS;
+                return;
+            }
         }
         return;
     }
-    default_router_ip = ip;
-    default_router_lifetime_sec = lifetime_sec;
-    default_router_age_ms = 0;
-    default_router_valid = true;
+    for (0..MAX_DEFAULT_ROUTERS) |i| {
+        const e = &default_routers[i];
+        if (e.valid and ipv6.addrEq(e.ip, ip)) {
+            e.lifetime_sec = lifetime_sec;
+            e.age_ms = 0;
+            return;
+        }
+    }
+    for (0..MAX_DEFAULT_ROUTERS) |i| {
+        const e = &default_routers[i];
+        if (!e.valid) {
+            e.* = .{
+                .ip = ip,
+                .lifetime_sec = lifetime_sec,
+                .age_ms = 0,
+                .valid = true,
+            };
+            return;
+        }
+    }
+    // Full: replace the entry with the shortest remaining lifetime.
+    var victim: u32 = 0;
+    var min_life = default_routers[0].lifetime_sec;
+    for (1..MAX_DEFAULT_ROUTERS) |i| {
+        if (default_routers[i].lifetime_sec < min_life) {
+            min_life = default_routers[i].lifetime_sec;
+            victim = @intCast(i);
+        }
+    }
+    default_routers[victim] = .{
+        .ip = ip,
+        .lifetime_sec = lifetime_sec,
+        .age_ms = 0,
+        .valid = true,
+    };
+    if (default_router_sel == victim) default_router_sel = MAX_DEFAULT_ROUTERS;
 }
 
-/// Current default router IPv6 address, if any (SK-82).
+/// Current default router IPv6 address, if any (SK-82/92).
 pub fn getDefaultRouter() ?[16]u8 {
     const flags = ndp_lock.acquire();
     defer ndp_lock.release(flags);
-    if (!default_router_valid) return null;
-    return default_router_ip;
+    const e = selectDefaultRouterLocked() orelse return null;
+    return e.ip;
 }
 
-/// Probe helper (SK-82/89): remaining Router Lifetime seconds, or 0 if none.
+/// Probe helper (SK-82/89): remaining Router Lifetime of the selected router.
 pub fn probeDefaultRouterLifetime() u16 {
     const flags = ndp_lock.acquire();
     defer ndp_lock.release(flags);
-    if (!default_router_valid) return 0;
-    return default_router_lifetime_sec;
+    const e = selectDefaultRouterLocked() orelse return 0;
+    return e.lifetime_sec;
 }
 
-/// Age the default-router Router Lifetime (SK-89).
-/// Returns true when the router just expired (caller may restart RS).
+/// Probe helper (SK-92): number of default routers in the list.
+pub fn probeDefaultRouterCount() u32 {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    return countDefaultRoutersLocked();
+}
+
+/// Age all default-router Router Lifetimes (SK-89/92).
+/// Returns true when the list becomes empty (caller may restart RS).
 pub fn routerLifetimeTimerTick(ms_elapsed: u32) bool {
     if (ms_elapsed == 0) return false;
     const flags = ndp_lock.acquire();
     defer ndp_lock.release(flags);
-    if (!default_router_valid) return false;
+    const had_any = countDefaultRoutersLocked() != 0;
+    if (!had_any) return false;
 
-    default_router_age_ms +%= ms_elapsed;
-    while (default_router_age_ms >= 1000 and default_router_lifetime_sec > 0) {
-        default_router_age_ms -= 1000;
-        default_router_lifetime_sec -= 1;
+    for (0..MAX_DEFAULT_ROUTERS) |i| {
+        const e = &default_routers[i];
+        if (!e.valid) continue;
+        e.age_ms +%= ms_elapsed;
+        while (e.age_ms >= 1000 and e.lifetime_sec > 0) {
+            e.age_ms -= 1000;
+            e.lifetime_sec -= 1;
+        }
+        if (e.lifetime_sec == 0) {
+            e.* = .{};
+            if (default_router_sel == i) default_router_sel = MAX_DEFAULT_ROUTERS;
+        }
     }
-    if (default_router_lifetime_sec == 0) {
-        clearDefaultRouterLocked();
-        return true;
-    }
-    return false;
+    return countDefaultRoutersLocked() == 0;
 }
 
 /// Install or refresh a Prefix Information entry (SK-83).

@@ -1457,7 +1457,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:弃用地址不再作新连接源地址;Valid 未到期前仍可收包。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-91] ndp preferred lifetime aging non-x86: OK`。
-- **后续**:多默认路由器选择。
+- **后续**:见 3.92（多默认路由器选择,已完成)。
+
+---
+
+### 3.92 多默认路由器列表与选择（SK-92,2026-07-23）
+
+- **背景**:仅保留单一默认路由器,后到的 RA 会覆盖先到的;一路由器过期即空窗。
+- **方案**:`MAX_DEFAULT_ROUTERS` 列表;`setDefaultRouter` 按 IP 增删改;`getDefaultRouter`
+  粘性选择,优先有邻居 MAC 缓存的路由器;部分过期时切到剩余项,列表空时才重启 RS。
+  `shared/sk92.zig` 锁定多条目、可达优先、回退与部分/全部过期。
+- **效果**:多路由器环境可保留备选;离链路下一跳可在路由器间故障转移。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-92] ndp multi default router non-x86: OK`。
+- **后续**:默认路由器可达性探测(主动 NUD);或 RA 路由信息选项(RIO)。
 
 ---
 

@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-23 (SK-91 preferred lifetime / deprecate + prior SK-90 reviewed and verified)
+> Last update: 2026-07-23 (SK-92 multi default router + prior SK-91 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -423,6 +423,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | Default router never expired | Router Lifetime was stored but never aged out. | SK-89: `routerLifetimeTimerTick` clears the router and restarts RS. |
 | RA prefixes never expired | Prefix Valid Lifetime was stored but never aged out. | SK-90: `prefixLifetimeTimerTick` clears prefixes and matching SLAAC. |
 | Preferred Lifetime unused | PIO preferred lifetime ignored; SLAAC stayed preferred forever. | SK-91: age preferred → `deprecated`; source select skips it. |
+| Single default router only | A later RA replaced the only default router. | SK-92: multi-router list; prefer reachable; failover on expiry. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -432,8 +433,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-91] ndp preferred lifetime aging non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-91] ndp preferred lifetime aging non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-92] ndp multi default router non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-92] ndp multi default router non-x86: OK`. |
 
 ### 5.3 Historical Verification
 
