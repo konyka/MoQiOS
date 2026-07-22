@@ -35,6 +35,23 @@ pub fn buildEchoReply(
     return eth.buildFrame(out, reply_dst_mac, reply_src_mac, eth.ETHERTYPE_IPV4, 20 + icmp_total);
 }
 
+/// Parsed ICMP Destination Unreachable / Fragmentation Needed (SK-101).
+pub const FragNeededMsg = struct {
+    next_hop_mtu: u16 = 0,
+    dst: [4]u8 = .{ 0, 0, 0, 0 },
+};
+
+/// Pure parser for type=3/code=4 (RFC 792 + RFC 1191 Next-Hop MTU).
+pub fn parseFragNeeded(data: [*]const u8, len: u32) ?FragNeededMsg {
+    if (len < 8 + 20) return null;
+    if (data[0] != 3 or data[1] != 4) return null;
+    const inv = ipv4.parseHeader(data + 8) orelse return null;
+    return .{
+        .next_hop_mtu = bo.readU16BeAt(data, 6),
+        .dst = inv.dst_ip,
+    };
+}
+
 pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) void {
     if (len < 8) return;
 
@@ -54,5 +71,16 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
         var pkt: [256]u8 = undefined;
         const frame_len = buildEchoReply(&pkt, data, len, dst_ip, src_ip, our_mac, dst_mac);
         _ = nic.sendPacket(&pkt, frame_len);
+    } else if (icmp_type == 3 and icmp_code == 4) {
+        // SK-101: Fragmentation Needed → Path MTU.
+        const msg = parseFragNeeded(data, len) orelse return;
+        var reported: u32 = msg.next_hop_mtu;
+        if (reported == 0) {
+            // Pre-RFC1191: fall back toward the invoking datagram size.
+            const inv = ipv4.parseHeader(data + 8) orelse return;
+            reported = @as(u32, inv.payload_offset) + inv.payload_len;
+            if (reported == 0) reported = ipv4.MIN_MTU;
+        }
+        ipv4.updatePathMtu(msg.dst, reported);
     }
 }

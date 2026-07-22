@@ -11,6 +11,7 @@ const nic = @import("nic.zig");
 const netif = @import("netif.zig");
 const eth = @import("eth.zig");
 const ipv6 = @import("ipv6.zig");
+const ipv4 = @import("ipv4.zig");
 const ndp = @import("ndp.zig");
 const bo = @import("../lib/byte_order.zig");
 
@@ -695,4 +696,6 @@ pub fn neighborTimerTick(ms_elapsed: u32) void {
     ndp.destCacheTimerTick(ms_elapsed);
     // SK-97: expire Path MTU entries.
     ipv6.pathMtuTimerTick(ms_elapsed);
+    // SK-101: expire IPv4 Path MTU entries.
+    ipv4.pathMtuTimerTick(ms_elapsed);
 }

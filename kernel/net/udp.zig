@@ -145,6 +145,8 @@ pub fn sendTo(dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, da
     const our_mac = netif.getMac();
     const our_ip = netif.getOurIp();
     const udp_total: u16 = 8 + data_len;
+    // SK-101: honor Path MTU learned from ICMP Fragmentation Needed.
+    if (ipv4.HEADER_LEN + udp_total > ipv4.getPathMtu(dst_ip)) return false;
 
     // Build UDP header at offset 34 (14 eth + 20 ipv4)
     bo.writeU16BeAt(&send_pkt, 34, src_port);

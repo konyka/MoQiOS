@@ -1571,7 +1571,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:双向协商更小 MSS,避免对端/本端发送过大段。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-100] tcp syn mss option non-x86: OK`。
-- **后续**:IPv4 Path MTU;或 SYN 中 MSS 随接口 MTU 而非仅 PMTU 缓存。
+- **后续**:见 3.101（IPv4 Path MTU,已完成)。
+
+---
+
+### 3.101 IPv4 Path MTU（ICMP Fragmentation Needed）（SK-101,2026-07-23）
+
+- **背景**:IPv4 TX 固定 DF,但忽略 ICMP type=3/code=4,超大包仍按链路 MTU 发出。
+- **方案**:`ipv4` 增加 Path MTU 缓存(钳制 576..1500,只降不升,600s 老化);
+  `icmp.handlePacket` 解析 Frag Needed / Next-Hop MTU 并更新缓存;UDP/TCP IPv4 TX
+  拒绝超过 PMTU 的报文;`localMssForTcb` IPv4 侧取 `PMTU−40`。
+  `shared/sk101.zig` 锁定解析、学习、钳制、SMSS 与老化。
+- **效果**:与 IPv6 PTB 对称的 IPv4 PMTU 发现,避免 DF 黑洞路径上的盲目超大发送。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-101] ipv4 path mtu frag-needed non-x86: OK`。
+- **后续**:SYN MSS 随接口 MTU;或 PMTU 探测抬升(RFC 4821)。
 
 ---
 

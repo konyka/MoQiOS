@@ -48,6 +48,8 @@ inline fn tcpLog(comptime msg: []const u8) void {
 const MAX_CONNECTIONS: u32 = 64;
 const TCP_WINDOW: u32 = 32768;
 const TCP_MSS: u16 = 1460;
+/// IPv4 header + minimum TCP header (no options) for SMSS (SK-101).
+const TCP_IPV4_OVERHEAD: u16 = ipv4.HEADER_LEN + 20;
 /// IPv6 header + minimum TCP header (no options) for SMSS (SK-98).
 const TCP_IPV6_OVERHEAD: u16 = ipv6.HEADER_LEN + 20;
 const SEND_BUF_SIZE: u32 = 65536;
@@ -558,9 +560,13 @@ fn advanceSndNxt(tcb: *TcpTcb, flags: u8, data_len: u16) void {
     if (flags & FIN != 0) tcb.snd_nxt +%= 1;
 }
 
-/// Local SMSS before peer clamp (SK-98/100).
+/// Local SMSS before peer clamp (SK-98/100/101).
 fn localMssForTcb(tcb: *const TcpTcb) u16 {
-    if (!tcb.is_v6) return TCP_MSS;
+    if (!tcb.is_v6) {
+        const pmtu = ipv4.getPathMtu(tcb.remote_ip);
+        if (pmtu <= TCP_IPV4_OVERHEAD) return 1;
+        return @min(TCP_MSS, pmtu - TCP_IPV4_OVERHEAD);
+    }
     const pmtu = ipv6.getPathMtu(tcb.remote_ip6);
     if (pmtu <= TCP_IPV6_OVERHEAD) return 1;
     return @min(TCP_MSS, pmtu - TCP_IPV6_OVERHEAD);
@@ -578,6 +584,13 @@ pub fn probeIpv6Mss(dst: [16]u8) u16 {
     const pmtu = ipv6.getPathMtu(dst);
     if (pmtu <= TCP_IPV6_OVERHEAD) return 1;
     return @min(TCP_MSS, pmtu - TCP_IPV6_OVERHEAD);
+}
+
+/// Probe helper (SK-101): IPv4 SMSS for `dst` from the Path MTU cache.
+pub fn probeIpv4Mss(dst: [4]u8) u16 {
+    const pmtu = ipv4.getPathMtu(dst);
+    if (pmtu <= TCP_IPV4_OVERHEAD) return 1;
+    return @min(TCP_MSS, pmtu - TCP_IPV4_OVERHEAD);
 }
 
 /// Probe helper (SK-100): effective MSS = min(local, peer); peer 0 = local only.
@@ -611,6 +624,9 @@ pub fn probeIpv6RenoMinSsthresh(dst: [16]u8) u32 {
 fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
     if (tcb.is_v6) return sendSegmentV6(tcb, flags, data, data_len);
 
+    // SK-101: segment payload must fit Path MTU − IPv4 − TCP headers.
+    if (data_len > mssForTcb(tcb)) return false;
+
     var send_pkt: [1518]u8 = @splat(0);
     const dst_mac = arp.resolve(tcb.remote_ip) orelse {
         tcpLog("[tcp] ARP resolution failed\n");
@@ -621,6 +637,8 @@ fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
     const our_ip = netif.getOurIp();
     const tcp_off: u16 = 34;
     const tcp_total = fillTcpSegment(tcb, flags, data, data_len, &send_pkt, tcp_off);
+    // SK-101: honor Path MTU learned from ICMP Fragmentation Needed.
+    if (ipv4.HEADER_LEN + tcp_total > ipv4.getPathMtu(tcb.remote_ip)) return false;
     const csum = tcpChecksum(our_ip, tcb.remote_ip, send_pkt[tcp_off..].ptr, tcp_total);
     bo.writeU16BeAt(&send_pkt, tcp_off + 16, csum);
     ipv4.buildHeader(send_pkt[14..].ptr, our_ip, tcb.remote_ip, ipv4.PROTO_TCP, tcp_total);

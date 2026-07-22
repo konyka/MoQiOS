@@ -1,8 +1,19 @@
 const bo = @import("../lib/byte_order.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 pub const PROTO_ICMP: u8 = 1;
 pub const PROTO_TCP: u8 = 6;
 pub const PROTO_UDP: u8 = 17;
+
+/// IPv4 minimum reassembly MTU (RFC 791).
+pub const MIN_MTU: u16 = 576;
+/// Ethernet link MTU used as the default Path MTU.
+pub const LINK_MTU: u16 = 1500;
+/// How long a learned Path MTU stays without refresh (seconds) (SK-101).
+pub const PMTU_LIFETIME_SEC: u32 = 600;
+pub const MAX_PMTU_ENTRIES: u32 = 8;
+/// IPv4 header (no options) for SMSS (SK-101).
+pub const HEADER_LEN: u16 = 20;
 
 pub const Ipv4Info = struct {
     src_ip: [4]u8,
@@ -79,4 +90,109 @@ pub fn parseHeader(data: [*]const u8) ?Ipv4Info {
         .payload_offset = ihl,
         .payload_len = payload_len,
     };
+}
+
+fn addrEq(a: [4]u8, b: [4]u8) bool {
+    return a[0] == b[0] and a[1] == b[1] and a[2] == b[2] and a[3] == b[3];
+}
+
+// ── SK-101: Path MTU cache (ICMP Fragmentation Needed) ────────────────────
+const PmtuEntry = struct {
+    dst: [4]u8 = .{ 0, 0, 0, 0 },
+    mtu: u16 = LINK_MTU,
+    lifetime_sec: u32 = 0,
+    age_ms: u32 = 0,
+    valid: bool = false,
+};
+var pmtu_table: [MAX_PMTU_ENTRIES]PmtuEntry = @splat(.{});
+var pmtu_lock: IrqSpinlock = .{};
+
+/// Clear the IPv4 Path MTU cache (called from net.init).
+pub fn initPmtu() void {
+    const flags = pmtu_lock.acquire();
+    defer pmtu_lock.release(flags);
+    for (0..MAX_PMTU_ENTRIES) |i| {
+        pmtu_table[i] = .{};
+    }
+}
+
+fn clampMtu(reported: u32) u16 {
+    if (reported < MIN_MTU) return MIN_MTU;
+    if (reported > LINK_MTU) return LINK_MTU;
+    return @intCast(reported);
+}
+
+/// Lower (or install) Path MTU for `dst` from Fragmentation Needed (SK-101).
+pub fn updatePathMtu(dst: [4]u8, reported_mtu: u32) void {
+    const mtu = clampMtu(reported_mtu);
+    const flags = pmtu_lock.acquire();
+    defer pmtu_lock.release(flags);
+    for (0..MAX_PMTU_ENTRIES) |i| {
+        const e = &pmtu_table[i];
+        if (e.valid and addrEq(e.dst, dst)) {
+            if (mtu < e.mtu) e.mtu = mtu;
+            e.lifetime_sec = PMTU_LIFETIME_SEC;
+            e.age_ms = 0;
+            return;
+        }
+    }
+    for (0..MAX_PMTU_ENTRIES) |i| {
+        const e = &pmtu_table[i];
+        if (!e.valid) {
+            e.* = .{
+                .dst = dst,
+                .mtu = mtu,
+                .lifetime_sec = PMTU_LIFETIME_SEC,
+                .age_ms = 0,
+                .valid = true,
+            };
+            return;
+        }
+    }
+    pmtu_table[0] = .{
+        .dst = dst,
+        .mtu = mtu,
+        .lifetime_sec = PMTU_LIFETIME_SEC,
+        .age_ms = 0,
+        .valid = true,
+    };
+}
+
+/// Current Path MTU for `dst`, or `LINK_MTU` when unknown (SK-101).
+pub fn getPathMtu(dst: [4]u8) u16 {
+    const flags = pmtu_lock.acquire();
+    defer pmtu_lock.release(flags);
+    for (0..MAX_PMTU_ENTRIES) |i| {
+        const e = &pmtu_table[i];
+        if (e.valid and addrEq(e.dst, dst)) return e.mtu;
+    }
+    return LINK_MTU;
+}
+
+/// Probe helper (SK-101).
+pub fn probePathMtuCount() u32 {
+    const flags = pmtu_lock.acquire();
+    defer pmtu_lock.release(flags);
+    var n: u32 = 0;
+    for (0..MAX_PMTU_ENTRIES) |i| {
+        if (pmtu_table[i].valid) n += 1;
+    }
+    return n;
+}
+
+/// Age IPv4 Path MTU entries (SK-101).
+pub fn pathMtuTimerTick(ms_elapsed: u32) void {
+    if (ms_elapsed == 0) return;
+    const flags = pmtu_lock.acquire();
+    defer pmtu_lock.release(flags);
+    for (0..MAX_PMTU_ENTRIES) |i| {
+        const e = &pmtu_table[i];
+        if (!e.valid) continue;
+        e.age_ms +%= ms_elapsed;
+        while (e.age_ms >= 1000 and e.lifetime_sec > 0) {
+            e.age_ms -= 1000;
+            e.lifetime_sec -= 1;
+        }
+        if (e.lifetime_sec == 0) e.* = .{};
+    }
 }
