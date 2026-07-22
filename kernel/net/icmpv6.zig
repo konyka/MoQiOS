@@ -286,3 +286,14 @@ pub fn sendNeighborSolicitation(target: [16]u8) void {
     const frame_len = buildNeighborSolicitation(&pkt, our_ip, target, our_mac);
     _ = nic.sendPacket(&pkt, frame_len);
 }
+
+/// Drive NDP incomplete NS retransmits (SK-79). Called from the scheduler
+/// maintenance pass alongside `tcp.timerTick`.
+pub fn neighborTimerTick(ms_elapsed: u32) void {
+    var batch: [ndp.MAX_NEIGHBORS][16]u8 = undefined;
+    const n = ndp.timerTick(ms_elapsed, &batch);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        sendNeighborSolicitation(batch[i]);
+    }
+}

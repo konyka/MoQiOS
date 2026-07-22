@@ -1275,7 +1275,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:用户态可用 `AF_INET6` TCP 完成 bind/connect 与 peer/local 地址查询。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-78] tcp sockaddr_in6 connect name non-x86: OK`。
-- **后续**:NS 重传 / NDP 完整解析;或 TCP `accept` backlog 压力与非阻塞路径。
+- **后续**:见 3.79（NDP NS 重传,已完成)。
+
+---
+
+### 3.79 NDP Neighbor Solicitation 重传（SK-79,2026-07-22）
+
+- **背景**:SK-72 在 cache miss 时只发一次 NS;`incomplete` 条目若丢包会永久卡住。
+- **方案**:`NeighborEntry.retrans_ms`/`solicit_count`;`ndp.timerTick` 按
+  RetransTimer=1s、MAX_MULTICAST_SOLICIT=3 产出待重发目标;`icmpv6.neighborTimerTick`
+  发送并挂到调度维护路径。`shared/sk79.zig` 锁定重传计数与耗尽删除。
+- **效果**:丢失的 NS 会按 RFC 4861 默认节奏重试,失败后清理 incomplete 槽位。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-79] ndp ns retransmit non-x86: OK`。
+- **后续**:NDP reachable/stale/probe 状态机;或 Router Solicitation/Advertisement。
 
 ---
 

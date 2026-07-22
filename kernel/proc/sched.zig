@@ -192,6 +192,9 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         // LAPIC fires at ~100Hz (10ms/tick), REAP_INTERVAL=10 ticks → ~100ms per maintenance pass
         const tcp = @import("../net/tcp.zig");
         tcp.timerTick(100);
+        // SK-79: NDP incomplete Neighbor Solicitation retransmit (RetransTimer).
+        const icmpv6 = @import("../net/icmpv6.zig");
+        icmpv6.neighborTimerTick(100);
         // Drive alarm() / setitimer(ITIMER_REAL) expiration checks
         // v53.46: Bitmap scan — only check tasks with active timers (O(active) vs O(64)).
         {
