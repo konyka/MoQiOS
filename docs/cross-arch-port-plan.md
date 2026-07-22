@@ -1413,7 +1413,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:启动后可自动发现路由器/前缀,无需人工注入 RS。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-88] ndp auto router solicit non-x86: OK`。
-- **后续**:默认路由器 Router Lifetime 老化;或多默认路由器选择。
+- **后续**:见 3.89（默认路由器 Router Lifetime 老化,已完成)。
+
+---
+
+### 3.89 默认路由器 Router Lifetime 老化（SK-89,2026-07-23）
+
+- **背景**:RA 写入 `default_router_lifetime_sec` 后从不递减,过期路由仍被
+  `resolveNextHop` 使用。
+- **方案**:`ndp.routerLifetimeTimerTick` 按秒老化剩余 lifetime;归零时清除默认
+  路由器。`icmpv6.neighborTimerTick` 在过期时调用 `startRouterSolicit` 重新发现。
+  RA 刷新会重置 age 累加器。`shared/sk89.zig` 锁定秒级老化、刷新与 RS 重启。
+- **效果**:过期默认路由不再劫持离链路下一跳;可再次发 RS 学习新路由器。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-89] ndp router lifetime aging non-x86: OK`。
+- **后续**:多默认路由器选择;或前缀 Valid Lifetime 老化。
 
 ---
 

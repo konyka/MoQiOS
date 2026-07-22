@@ -565,4 +565,8 @@ pub fn neighborTimerTick(ms_elapsed: u32) void {
         sendDadNeighborSolicitation(dad_batch[di]);
     }
     routerSolicitTimerTick(ms_elapsed);
+    // SK-89: expire default router; rediscover if lifetime hits zero.
+    if (ndp.routerLifetimeTimerTick(ms_elapsed)) {
+        startRouterSolicit();
+    }
 }

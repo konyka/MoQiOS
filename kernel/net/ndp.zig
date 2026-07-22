@@ -55,9 +55,11 @@ pub const NeighborEntry = struct {
 
 var neighbor_cache: [MAX_NEIGHBORS]NeighborEntry = @splat(.{});
 
-/// SK-82: single default router learned from Router Advertisement.
+/// SK-82/89: single default router learned from Router Advertisement.
 var default_router_ip: [16]u8 = @splat(0);
 var default_router_lifetime_sec: u16 = 0;
+/// SK-89: ms accumulated toward the next whole-second lifetime tick.
+var default_router_age_ms: u32 = 0;
 var default_router_valid: bool = false;
 
 /// SK-83: on-link / PIO prefixes from Router Advertisement.
@@ -105,6 +107,7 @@ pub fn init() void {
     }
     default_router_ip = @splat(0);
     default_router_lifetime_sec = 0;
+    default_router_age_ms = 0;
     default_router_valid = false;
     for (0..MAX_PREFIXES) |i| {
         prefix_table[i] = .{};
@@ -114,6 +117,13 @@ pub fn init() void {
     }
 }
 
+fn clearDefaultRouterLocked() void {
+    default_router_valid = false;
+    default_router_lifetime_sec = 0;
+    default_router_age_ms = 0;
+    default_router_ip = @splat(0);
+}
+
 /// Install or clear the default router from an RA (SK-82).
 /// `lifetime_sec == 0` removes this router if it is the current default.
 pub fn setDefaultRouter(ip: [16]u8, lifetime_sec: u16) void {
@@ -121,14 +131,13 @@ pub fn setDefaultRouter(ip: [16]u8, lifetime_sec: u16) void {
     defer ndp_lock.release(flags);
     if (lifetime_sec == 0) {
         if (default_router_valid and ipv6.addrEq(default_router_ip, ip)) {
-            default_router_valid = false;
-            default_router_lifetime_sec = 0;
-            default_router_ip = @splat(0);
+            clearDefaultRouterLocked();
         }
         return;
     }
     default_router_ip = ip;
     default_router_lifetime_sec = lifetime_sec;
+    default_router_age_ms = 0;
     default_router_valid = true;
 }
 
@@ -140,12 +149,32 @@ pub fn getDefaultRouter() ?[16]u8 {
     return default_router_ip;
 }
 
-/// Probe helper (SK-82): Router Lifetime seconds, or 0 if none.
+/// Probe helper (SK-82/89): remaining Router Lifetime seconds, or 0 if none.
 pub fn probeDefaultRouterLifetime() u16 {
     const flags = ndp_lock.acquire();
     defer ndp_lock.release(flags);
     if (!default_router_valid) return 0;
     return default_router_lifetime_sec;
+}
+
+/// Age the default-router Router Lifetime (SK-89).
+/// Returns true when the router just expired (caller may restart RS).
+pub fn routerLifetimeTimerTick(ms_elapsed: u32) bool {
+    if (ms_elapsed == 0) return false;
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    if (!default_router_valid) return false;
+
+    default_router_age_ms +%= ms_elapsed;
+    while (default_router_age_ms >= 1000 and default_router_lifetime_sec > 0) {
+        default_router_age_ms -= 1000;
+        default_router_lifetime_sec -= 1;
+    }
+    if (default_router_lifetime_sec == 0) {
+        clearDefaultRouterLocked();
+        return true;
+    }
+    return false;
 }
 
 /// Install or refresh a Prefix Information entry (SK-83).
