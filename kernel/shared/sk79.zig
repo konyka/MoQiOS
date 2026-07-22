@@ -35,7 +35,7 @@ pub fn announce() void {
     }
 
     // Sub-threshold tick: no retransmit.
-    var batch: [4][16]u8 = undefined;
+    var batch: [4]ndp.Solicit = undefined;
     if (ndp.timerTick(ndp.RETRANS_MS - 1, &batch) != 0) {
         fail("early retransmit");
         return;
@@ -46,7 +46,9 @@ pub fn announce() void {
     }
 
     // Crossing RetransTimer → 2nd NS requested.
-    if (ndp.timerTick(1, &batch) != 1 or !ipv6.addrEq(batch[0], TARGET)) {
+    if (ndp.timerTick(1, &batch) != 1 or !ipv6.addrEq(batch[0].target, TARGET) or
+        !ndp.solicitIsMulticast(batch[0]))
+    {
         fail("retransmit 2");
         return;
     }

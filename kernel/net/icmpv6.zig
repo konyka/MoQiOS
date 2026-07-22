@@ -235,25 +235,7 @@ pub fn sendNeighborAdvertisement(
     _ = nic.sendPacket(&pkt, frame_len);
 }
 
-/// Build a Neighbor Solicitation for `target` into `out`.
-/// Destined to the solicited-node multicast of `target` (L3 + L2).
-/// Pure: no ndp/netif/nic side effects. Returns ethernet frame length.
-pub fn buildNeighborSolicitation(
-    out: [*]u8,
-    our_ip: [16]u8,
-    target: [16]u8,
-    our_mac: [6]u8,
-) u16 {
-    // ICMPv6 NS = 24 bytes header + 8-byte Source LL Addr option = 32 bytes
-    const icmp_len: u16 = 32;
-    const total_payload: u16 = ipv6.HEADER_LEN + icmp_len;
-    const eth_len: u16 = 14;
-    const ip_off: u16 = eth_len;
-    const icmp_off: u16 = eth_len + ipv6.HEADER_LEN;
-
-    const dst_ip = ipv6.solicitedNodeMulticast(target);
-    const dst_mac = ipv6.multicastMac(dst_ip);
-
+fn fillNeighborSolicitationBody(out: [*]u8, icmp_off: u16, target: [16]u8, our_mac: [6]u8) void {
     out[icmp_off + 0] = NEIGHBOR_SOLICITATION;
     out[icmp_off + 1] = 0; // code
     out[icmp_off + 2] = 0; // checksum
@@ -263,18 +245,53 @@ pub fn buildNeighborSolicitation(
     out[icmp_off + 6] = 0;
     out[icmp_off + 7] = 0;
     @memcpy(out[icmp_off + 8 .. icmp_off + 24], &target);
-
     // Source Link-Layer Address option (type=1, len=1 unit=8 bytes)
     out[icmp_off + 24] = OPT_SOURCE_LL_ADDR;
     out[icmp_off + 25] = 1;
     @memcpy(out[icmp_off + 26 .. icmp_off + 32], &our_mac);
+}
 
-    ipv6.buildHeader(out + ip_off, our_ip, dst_ip, ipv6.PROTO_ICMPV6, icmp_len);
-
+fn buildNsFrame(
+    out: [*]u8,
+    our_ip: [16]u8,
+    target: [16]u8,
+    our_mac: [6]u8,
+    dst_ip: [16]u8,
+    dst_mac: [6]u8,
+) u16 {
+    const icmp_len: u16 = 32;
+    const total_payload: u16 = ipv6.HEADER_LEN + icmp_len;
+    const icmp_off: u16 = 14 + ipv6.HEADER_LEN;
+    fillNeighborSolicitationBody(out, icmp_off, target, our_mac);
+    ipv6.buildHeader(out + 14, our_ip, dst_ip, ipv6.PROTO_ICMPV6, icmp_len);
     const csum = checksum(our_ip, dst_ip, out + icmp_off, icmp_len);
     bo.writeU16BeAt(out, icmp_off + 2, csum);
-
     return eth.buildFrame(out, dst_mac, our_mac, eth.ETHERTYPE_IPV6, total_payload);
+}
+
+/// Build a Neighbor Solicitation for `target` into `out`.
+/// Destined to the solicited-node multicast of `target` (L3 + L2).
+/// Pure: no ndp/netif/nic side effects. Returns ethernet frame length.
+pub fn buildNeighborSolicitation(
+    out: [*]u8,
+    our_ip: [16]u8,
+    target: [16]u8,
+    our_mac: [6]u8,
+) u16 {
+    const dst_ip = ipv6.solicitedNodeMulticast(target);
+    return buildNsFrame(out, our_ip, target, our_mac, dst_ip, ipv6.multicastMac(dst_ip));
+}
+
+/// Build a unicast Neighbor Solicitation (SK-81 NUD PROBE).
+/// L3/L2 destined to the cached neighbor address/MAC.
+pub fn buildNeighborSolicitationUnicast(
+    out: [*]u8,
+    our_ip: [16]u8,
+    target: [16]u8,
+    our_mac: [6]u8,
+    dst_mac: [6]u8,
+) u16 {
+    return buildNsFrame(out, our_ip, target, our_mac, target, dst_mac);
 }
 
 /// Transmit an NS for `target` (ARP-request analogue). Caller usually
@@ -287,13 +304,26 @@ pub fn sendNeighborSolicitation(target: [16]u8) void {
     _ = nic.sendPacket(&pkt, frame_len);
 }
 
-/// Drive NDP incomplete NS retransmits (SK-79). Called from the scheduler
-/// maintenance pass alongside `tcp.timerTick`.
+/// Transmit a unicast NS for NUD PROBE (SK-81).
+pub fn sendNeighborSolicitationUnicast(target: [16]u8, dst_mac: [6]u8) void {
+    const our_mac = netif.getMac();
+    const our_ip = ndp.generateLinkLocal(our_mac);
+    var pkt: [128]u8 = @splat(0);
+    const frame_len = buildNeighborSolicitationUnicast(&pkt, our_ip, target, our_mac, dst_mac);
+    _ = nic.sendPacket(&pkt, frame_len);
+}
+
+/// Drive NDP NS retransmits / NUD probes (SK-79/81). Called from the
+/// scheduler maintenance pass alongside `tcp.timerTick`.
 pub fn neighborTimerTick(ms_elapsed: u32) void {
-    var batch: [ndp.MAX_NEIGHBORS][16]u8 = undefined;
+    var batch: [ndp.MAX_NEIGHBORS]ndp.Solicit = undefined;
     const n = ndp.timerTick(ms_elapsed, &batch);
     var i: u32 = 0;
     while (i < n) : (i += 1) {
-        sendNeighborSolicitation(batch[i]);
+        if (ndp.solicitIsMulticast(batch[i])) {
+            sendNeighborSolicitation(batch[i].target);
+        } else {
+            sendNeighborSolicitationUnicast(batch[i].target, batch[i].dst_mac);
+        }
     }
 }

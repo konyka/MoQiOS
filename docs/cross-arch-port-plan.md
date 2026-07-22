@@ -1302,7 +1302,22 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:NUD 第一步落地;后续可在 stale 使用路径上接 DELAY/PROBE 单播 NS。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-80] ndp reachable stale aging non-x86: OK`。
-- **后续**:stale→delay→probe 单播 NS;或 Router Solicitation/Advertisement。
+- **后续**:见 3.81（stale→delay→probe 单播 NS,已完成)。
+
+---
+
+### 3.81 NDP stale→delay→probe 单播 NS（SK-81,2026-07-22）
+
+- **背景**:SK-80 仅老化到 `stale`;首次使用后不会进入 DELAY/PROBE,也无法发
+  单播 NS 做不可达探测。
+- **方案**:`lookup` 将 `stale`→`delay`;`timerTick` 经 DELAY_FIRST_PROBE_TIME
+  进入 `probe` 并产出单播 `Solicit`;`buildNeighborSolicitationUnicast` +
+  `neighborTimerTick` 发送。耗尽 `MAX_UNICAST_SOLICIT` 后删除。`shared/sk81.zig`
+  锁定帧布局与状态迁移。
+- **效果**:NUD 主路径完整(reachable/stale/delay/probe/incomplete)。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-81] ndp delay probe unicast non-x86: OK`。
+- **后续**:Router Solicitation/Advertisement;或默认路由/前缀学习。
 
 ---
 

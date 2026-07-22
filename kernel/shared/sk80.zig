@@ -33,7 +33,7 @@ pub fn announce() void {
         return;
     }
 
-    var batch: [1][16]u8 = undefined;
+    var batch: [1]ndp.Solicit = undefined;
     // Sub-threshold: still reachable, no solicits.
     if (ndp.timerTick(ndp.REACHABLE_TIME_MS - 1, &batch) != 0) {
         fail("unexpected solicit");
@@ -44,7 +44,7 @@ pub fn announce() void {
         return;
     }
 
-    // Cross REACHABLE_TIME → stale; MAC still usable.
+    // Cross REACHABLE_TIME → stale; MAC still usable (lookup may start NUD).
     _ = ndp.timerTick(1, &batch);
     if (ndp.probeState(IP) != .stale) {
         fail("not stale");
