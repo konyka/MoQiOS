@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-23 (SK-87 IPv6 off-link via default router + prior SK-86 reviewed and verified)
+> Last update: 2026-07-23 (SK-88 auto Router Solicitation + prior SK-87 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -419,6 +419,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | SLAAC skipped DAD | New addresses were usable immediately without duplicate detection. | SK-85: tentative→DAD NS→preferred; conflict abandons the address. |
 | IPv6 TX always link-local | UDP/TCP IPv6 sends ignored preferred SLAAC globals. | SK-86: `selectSourceAddress` wired into V6 TX and name queries. |
 | Off-link IPv6 unroutable | TX NDP-resolved the L3 destination, so off-link peers never sent. | SK-87: `resolveNextHop` uses default-router MAC for off-link. |
+| No automatic RS | Hosts waited passively for RA and never solicited routers. | SK-88: `startRouterSolicit` from `net.init` with interval retries. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -428,8 +429,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-87] ipv6 nexthop router non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-87] ipv6 nexthop router non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-88] ndp auto router solicit non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-88] ndp auto router solicit non-x86: OK`. |
 
 ### 5.3 Historical Verification
 

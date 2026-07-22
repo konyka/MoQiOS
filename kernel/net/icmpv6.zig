@@ -147,6 +147,8 @@ fn handleRouterAdvertisement(src_ip: [16]u8, data: [*]const u8, len: u16) void {
         if (!ipv6.isUnspecified(src_ip)) ndp.update(src_ip, mac);
     }
     ndp.setDefaultRouter(src_ip, adv.router_lifetime_sec);
+    // SK-88: a usable RA ends the solicitation burst.
+    if (adv.router_lifetime_sec != 0) stopRouterSolicit();
     const our_mac = netif.getMac();
     var i: u8 = 0;
     while (i < adv.prefix_count) : (i += 1) {
@@ -456,6 +458,61 @@ pub fn sendRouterSolicitation() void {
     _ = nic.sendPacket(&pkt, frame_len);
 }
 
+// ── SK-88: automatic Router Solicitation (RFC 4861 §6.3.7) ───────────────
+/// MAX_RTR_SOLICITATIONS
+pub const MAX_RTR_SOLICITATIONS: u8 = 3;
+/// RTR_SOLICITATION_INTERVAL (ms)
+pub const RTR_SOLICITATION_INTERVAL_MS: u32 = 4_000;
+
+var rs_active: bool = false;
+var rs_sent: u8 = 0;
+var rs_ms: u32 = 0;
+
+/// Begin router discovery: send the first RS immediately (SK-88).
+pub fn startRouterSolicit() void {
+    rs_active = true;
+    rs_sent = 0;
+    rs_ms = 0;
+    sendRouterSolicitation();
+    rs_sent = 1;
+}
+
+/// Stop router discovery early (e.g. after a usable RA) (SK-88).
+pub fn stopRouterSolicit() void {
+    rs_active = false;
+}
+
+/// Probe helper (SK-88).
+pub fn probeRsActive() bool {
+    return rs_active;
+}
+
+/// Probe helper (SK-88): RS transmissions in the current discovery round.
+pub fn probeRsSent() u8 {
+    return rs_sent;
+}
+
+/// Advance RS retransmit timer (SK-88). Stops when a default router appears
+/// or `MAX_RTR_SOLICITATIONS` have been sent.
+pub fn routerSolicitTimerTick(ms_elapsed: u32) void {
+    if (!rs_active) return;
+    if (ndp.getDefaultRouter() != null) {
+        rs_active = false;
+        return;
+    }
+    if (rs_sent >= MAX_RTR_SOLICITATIONS) {
+        rs_active = false;
+        return;
+    }
+    if (ms_elapsed == 0) return;
+    rs_ms +%= ms_elapsed;
+    if (rs_ms < RTR_SOLICITATION_INTERVAL_MS) return;
+    rs_ms = 0;
+    sendRouterSolicitation();
+    rs_sent +%= 1;
+    if (rs_sent >= MAX_RTR_SOLICITATIONS) rs_active = false;
+}
+
 /// Build a DAD Neighbor Solicitation (RFC 4862 §5.4.2): src=::, no SLLA (SK-85).
 pub fn buildDadNeighborSolicitation(out: [*]u8, target: [16]u8, our_mac: [6]u8) u16 {
     const icmp_len: u16 = 24; // header only — no Source LL option
@@ -489,7 +546,7 @@ pub fn sendDadNeighborSolicitation(target: [16]u8) void {
     _ = nic.sendPacket(&pkt, frame_len);
 }
 
-/// Drive NDP NS retransmits / NUD probes / DAD (SK-79/81/85).
+/// Drive NDP NS retransmits / NUD probes / DAD / RS (SK-79/81/85/88).
 pub fn neighborTimerTick(ms_elapsed: u32) void {
     var batch: [ndp.MAX_NEIGHBORS]ndp.Solicit = undefined;
     const n = ndp.timerTick(ms_elapsed, &batch);
@@ -507,4 +564,5 @@ pub fn neighborTimerTick(ms_elapsed: u32) void {
     while (di < dn) : (di += 1) {
         sendDadNeighborSolicitation(dad_batch[di]);
     }
+    routerSolicitTimerTick(ms_elapsed);
 }

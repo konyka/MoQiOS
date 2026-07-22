@@ -17,6 +17,8 @@ pub fn init() void {
     arp.init();
     ndp.init();
     tcp.initTcbs();
+    // SK-88: solicit routers so RA can populate default route / prefixes.
+    icmpv6.startRouterSolicit();
 }
 
 pub fn handleRxPacket(data: [*]const u8, len: u32) void {

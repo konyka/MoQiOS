@@ -1399,7 +1399,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:有默认路由器后,可向 off-link IPv6 目的发送(L3 目的不变)。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-87] ipv6 nexthop router non-x86: OK`。
-- **后续**:启动时自动 RS;或默认路由器 lifetime 老化/多路由器。
+- **后续**:见 3.88（启动时自动 RS,已完成)。
+
+---
+
+### 3.88 启动时自动 Router Solicitation（SK-88,2026-07-23）
+
+- **背景**:RS/RA 与默认路由已齐,但主机从不主动发 RS,只能被动等 RA。
+- **方案**:`startRouterSolicit` 在 `net.init` 立即发首个 RS;`routerSolicitTimerTick`
+  按 RTR_SOLICITATION_INTERVAL 最多重试 `MAX_RTR_SOLICITATIONS` 次;收到
+  lifetime>0 的 RA 或已有默认路由则 `stopRouterSolicit`。`shared/sk88.zig`
+  锁定重试与早停。
+- **效果**:启动后可自动发现路由器/前缀,无需人工注入 RS。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-88] ndp auto router solicit non-x86: OK`。
+- **后续**:默认路由器 Router Lifetime 老化;或多默认路由器选择。
 
 ---
 
