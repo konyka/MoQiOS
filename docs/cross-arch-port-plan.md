@@ -1202,7 +1202,22 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:用户态可对 IPv4/IPv6 UDP 查询 sockname/peername;高编号 TCP fd 不再被误拒。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-73] udp getsockname encode non-x86: OK`。
-- **后续**:TCP over IPv6;或 NS 重传/可达性状态机细化。
+- **后续**:见 3.74（TCP over IPv6 checksum/RX 门控,已完成)。
+
+---
+
+### 3.74 TCP over IPv6 校验和与 RX 门控（SK-74,2026-07-22）
+
+- **背景**:`mod.zig` 对 IPv6 `PROTO_TCP` 仍为空 TODO;TCB 全为 IPv4 四元组,
+  完整 listen/connect 需扩地址字段与 `sendSegmentV6`。
+- **方案**:`tcp_util.checksumV6`(伪首部 + 跳过 checksum@16);`tcp.handlePacketV6`
+  强制校验后暂丢弃(不 demux)。`mod.zig` 接线 RX。`shared/sk74.zig` 锁定
+  校验和与坏包/零校验门控。
+- **效果**:错误的 IPv6 TCP 段不再静默落入空分支;为后续 TCB/v6 TX 铺路。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-74] tcp over ipv6 checksum/rx gate non-x86: OK`。
+- **后续**:TCB `remote_ip6` + `findTcbByTupleV6` / listen SYN;或 `sendSegmentV6`
+  + NDP TX;或 NS 重传状态机。
 
 ---
 

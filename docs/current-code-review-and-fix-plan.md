@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-22 (SK-73 UDP getsockname/getpeername + prior SK-72 reviewed and verified)
+> Last update: 2026-07-22 (SK-74 TCP over IPv6 RX checksum gate + prior SK-73 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -405,6 +405,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | AF_INET6 UDP still IPv4 | `socket(AF_INET6, SOCK_DGRAM)` lacked an IPv6 fd flag; address ops parsed `sockaddr_in` only. | SK-71: `udp_is_v6`/`udp_dst_ip6` + `sockaddr_util` + bind/sendto/recvfrom/connect V6 branches. |
 | NDP miss never solicits | `sendToV6` marked incomplete but never sent NS, so new neighbors could not resolve. | SK-72: `buildNeighborSolicitation`/`sendNeighborSolicitation` + wired from `sendToV6`. |
 | UDP name queries missing | `getsockname`/`getpeername` accepted only TCP and capped `fd >= 16`. | SK-73: UDP v4/v6 via `encodeUdpName`; `ENOTCONN` when unconnected; `MAX_FDS` bound. |
+| IPv6 TCP demux empty | `mod.zig` left `PROTO_TCP` over IPv6 as a TODO. | SK-74: `tcp_util.checksumV6` + checksum-gated `handlePacketV6` (TCB demux deferred). |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -414,8 +415,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-73] udp getsockname encode non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-73] udp getsockname encode non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-74] tcp over ipv6 checksum/rx gate non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-74] tcp over ipv6 checksum/rx gate non-x86: OK`. |
 
 ### 5.3 Historical Verification
 

@@ -563,6 +563,26 @@ fn tcpChecksum(src_ip: [4]u8, dst_ip: [4]u8, tcp_hdr: [*]const u8, tcp_len: u16)
     return tcp_util.checksum(src_ip, dst_ip, tcp_hdr, tcp_len);
 }
 
+fn tcpChecksumV6(src_ip: [16]u8, dst_ip: [16]u8, tcp_hdr: [*]const u8, tcp_len: u16) u16 {
+    return tcp_util.checksumV6(src_ip, dst_ip, tcp_hdr, tcp_len);
+}
+
+/// IPv6 TCP receive gate (SK-74): enforce mandatory checksum, then drop.
+/// Full TCB demux / SYN-ACK / sendSegmentV6 land in later SK steps.
+pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32) void {
+    if (len < 20) return;
+    const tcp_len: u16 = @intCast(@min(len, 0xFFFF));
+    const data_offset = (@as(u16, data[12]) >> 4) * 4;
+    if (data_offset < 20 or data_offset > tcp_len) return;
+
+    const wire_csum = bo.readU16BeAt(data, 16);
+    if (wire_csum == 0) return; // IPv6 TCP checksum is mandatory
+    const expect = tcpChecksumV6(src_ip, dst_ip, data, tcp_len);
+    if (wire_csum != expect) return;
+
+    // Checksum OK — connection matching deferred until TCB grows IPv6 fields.
+}
+
 // ─── Incoming Packet Handling ─────────────────────────────────────────────
 
 /// Parsed TCP options from an incoming segment.
