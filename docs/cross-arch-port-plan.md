@@ -1483,7 +1483,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:默认路由器不可达时离链路流量可切到仍存活的路由器。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-93] ndp router nud failover non-x86: OK`。
-- **后续**:RA 路由信息选项(RIO);或重定向(Redirect)处理。
+- **后续**:见 3.94（RA Route Information / RIO,已完成)。
+
+---
+
+### 3.94 RA Route Information（RIO）更具体路由（SK-94,2026-07-23）
+
+- **背景**:离链路下一跳只走默认路由器,忽略 RFC 4191 RIO,无法按前缀选路。
+- **方案**:解析 RA type=24;`ndp.setRoute` 维护路由表;`resolveNextHop` 对离链路
+  目的地址做最长前缀匹配(同长比 preference),再回退默认路由器;lifetime 按秒老化。
+  `shared/sk94.zig` 锁定解析、选路、偏好与过期回退。
+- **效果**:更具体前缀可走指定路由器,无需把全部流量绑在默认路由上。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-94] ndp route info rio non-x86: OK`。
+- **后续**:ICMPv6 Redirect 处理;或 RIO 与默认路由器 preference 统一。
 
 ---
 

@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-23 (SK-93 router NUD failover + prior SK-92 reviewed and verified)
+> Last update: 2026-07-23 (SK-94 RA Route Information + prior SK-93 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -425,6 +425,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | Preferred Lifetime unused | PIO preferred lifetime ignored; SLAAC stayed preferred forever. | SK-91: age preferred → `deprecated`; source select skips it. |
 | Single default router only | A later RA replaced the only default router. | SK-92: multi-router list; prefer reachable; failover on expiry. |
 | Dead default router still selected | NUD probe failure did not remove a router from selection. | SK-93: `nud_failed` + failover; active DELAY on stale select. |
+| RA Route Information ignored | Off-link TX always used the default router. | SK-94: RIO table + longest-match next hop in `resolveNextHop`. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -434,8 +435,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-93] ndp router nud failover non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-93] ndp router nud failover non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-94] ndp route info rio non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-94] ndp route info rio non-x86: OK`. |
 
 ### 5.3 Historical Verification
 

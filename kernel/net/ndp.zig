@@ -86,6 +86,20 @@ pub const PrefixEntry = struct {
 };
 var prefix_table: [MAX_PREFIXES]PrefixEntry = @splat(.{});
 
+/// SK-94: more-specific routes from RA Route Information (RFC 4191).
+pub const MAX_ROUTES: u32 = 8;
+const RouteEntry = struct {
+    prefix: [16]u8 = @splat(0),
+    prefix_len: u8 = 0,
+    lifetime_sec: u32 = 0,
+    age_ms: u32 = 0,
+    /// -1 low, 0 medium, 1 high.
+    preference: i8 = 0,
+    next_hop: [16]u8 = @splat(0),
+    valid: bool = false,
+};
+var route_table: [MAX_ROUTES]RouteEntry = @splat(.{});
+
 /// SK-84/85/91: SLAAC addresses formed from A-flag /64 prefixes.
 pub const MAX_LOCAL_ADDRS: u32 = 4;
 pub const AddrState = enum(u8) {
@@ -129,6 +143,9 @@ pub fn init() void {
     default_router_sel = MAX_DEFAULT_ROUTERS;
     for (0..MAX_PREFIXES) |i| {
         prefix_table[i] = .{};
+    }
+    for (0..MAX_ROUTES) |i| {
+        route_table[i] = .{};
     }
     for (0..MAX_LOCAL_ADDRS) |i| {
         local_addrs[i] = .{};
@@ -465,6 +482,106 @@ pub fn prefixLifetimeTimerTick(ms_elapsed: u32) void {
     }
 }
 
+/// Install, refresh, or delete a Route Information entry (SK-94).
+/// `lifetime_sec == 0` removes the matching prefix/len/next-hop route.
+pub fn setRoute(
+    prefix: [16]u8,
+    prefix_len: u8,
+    lifetime_sec: u32,
+    preference: i8,
+    next_hop: [16]u8,
+) void {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    if (prefix_len > 128) return;
+
+    for (0..MAX_ROUTES) |i| {
+        const e = &route_table[i];
+        if (!e.valid) continue;
+        if (e.prefix_len == prefix_len and ipv6.addrEq(e.prefix, prefix) and ipv6.addrEq(e.next_hop, next_hop)) {
+            if (lifetime_sec == 0) {
+                e.* = .{};
+            } else {
+                e.lifetime_sec = lifetime_sec;
+                e.age_ms = 0;
+                e.preference = preference;
+            }
+            return;
+        }
+    }
+    if (lifetime_sec == 0) return;
+
+    for (0..MAX_ROUTES) |i| {
+        const e = &route_table[i];
+        if (!e.valid) {
+            e.* = .{
+                .prefix = prefix,
+                .prefix_len = prefix_len,
+                .lifetime_sec = lifetime_sec,
+                .age_ms = 0,
+                .preference = preference,
+                .next_hop = next_hop,
+                .valid = true,
+            };
+            return;
+        }
+    }
+}
+
+fn findBestRouteLocked(dst: [16]u8) ?[16]u8 {
+    var best_len: i16 = -1;
+    var best_pref: i8 = -128;
+    var best_nh: ?[16]u8 = null;
+    for (0..MAX_ROUTES) |i| {
+        const e = &route_table[i];
+        if (!e.valid or e.lifetime_sec == 0) continue;
+        if (!ipv6.prefixMatch(dst, e.prefix, e.prefix_len)) continue;
+        const plen: i16 = e.prefix_len;
+        if (plen > best_len or (plen == best_len and e.preference > best_pref)) {
+            best_len = plen;
+            best_pref = e.preference;
+            best_nh = e.next_hop;
+        }
+    }
+    return best_nh;
+}
+
+/// Probe helper (SK-94): number of Route Information entries.
+pub fn probeRouteCount() u32 {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    var n: u32 = 0;
+    for (0..MAX_ROUTES) |i| {
+        if (route_table[i].valid) n += 1;
+    }
+    return n;
+}
+
+/// Probe helper (SK-94): next hop for best matching route, if any.
+pub fn probeBestRouteNextHop(dst: [16]u8) ?[16]u8 {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    return findBestRouteLocked(dst);
+}
+
+/// Age Route Information lifetimes (SK-94).
+pub fn routeLifetimeTimerTick(ms_elapsed: u32) void {
+    if (ms_elapsed == 0) return;
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    for (0..MAX_ROUTES) |i| {
+        const e = &route_table[i];
+        if (!e.valid) continue;
+        if (e.lifetime_sec == 0 or e.lifetime_sec == PREFIX_LIFETIME_INFINITY) continue;
+        e.age_ms +%= ms_elapsed;
+        while (e.age_ms >= 1000 and e.lifetime_sec > 0 and e.lifetime_sec != PREFIX_LIFETIME_INFINITY) {
+            e.age_ms -= 1000;
+            e.lifetime_sec -= 1;
+        }
+        if (e.lifetime_sec == 0) e.* = .{};
+    }
+}
+
 /// Form a /64 SLAAC address: prefix[0..8] || EUI-64(mac) (SK-84).
 pub fn formSlaacAddress(prefix: [16]u8, mac: [6]u8) [16]u8 {
     var addr: [16]u8 = @splat(0);
@@ -590,9 +707,9 @@ pub const NextHop = struct {
     solicit: ?[16]u8 = null,
 };
 
-/// Resolve L2 next hop for IPv6 `dst` (SK-87).
+/// Resolve L2 next hop for IPv6 `dst` (SK-87/94).
 /// On-link / link-local: NDP of `dst`. Multicast: derived multicast MAC.
-/// Off-link: NDP of the default router (L3 dst unchanged at the IP layer).
+/// Off-link: longest-match RIO next hop, else the default router.
 pub fn resolveNextHop(dst: [16]u8) NextHop {
     if (ipv6.isMulticast(dst)) {
         return .{ .mac = ipv6.multicastMac(dst) };
@@ -602,8 +719,13 @@ pub fn resolveNextHop(dst: [16]u8) NextHop {
         markIncomplete(dst);
         return .{ .solicit = dst };
     }
-    // Off-link: forward via default router.
-    const rtr = getDefaultRouter() orelse return .{};
+    // Off-link: more-specific RIO (SK-94), else default router (SK-87).
+    const rtr = blk: {
+        const flags = ndp_lock.acquire();
+        defer ndp_lock.release(flags);
+        if (findBestRouteLocked(dst)) |nh| break :blk nh;
+        break :blk null;
+    } orelse getDefaultRouter() orelse return .{};
     if (lookup(rtr)) |m| return .{ .mac = m };
     markIncomplete(rtr);
     return .{ .solicit = rtr };

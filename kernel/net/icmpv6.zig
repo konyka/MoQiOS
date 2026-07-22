@@ -26,9 +26,13 @@ pub const NEIGHBOR_ADVERTISEMENT: u8 = 136;
 const OPT_SOURCE_LL_ADDR: u8 = 1;
 const OPT_TARGET_LL_ADDR: u8 = 2;
 const OPT_PREFIX_INFORMATION: u8 = 3;
+/// RFC 4191 Route Information Option (SK-94).
+const OPT_ROUTE_INFORMATION: u8 = 24;
 
 /// Max Prefix Information options retained from one RA (SK-83).
 pub const MAX_RA_PREFIXES: usize = 4;
+/// Max Route Information options retained from one RA (SK-94).
+pub const MAX_RA_ROUTES: usize = 4;
 
 /// RFC 4861 §4.6.2 Prefix Information option fields.
 pub const PrefixInfo = struct {
@@ -38,6 +42,15 @@ pub const PrefixInfo = struct {
     autonomous: bool = false,
     valid_lifetime: u32 = 0,
     preferred_lifetime: u32 = 0,
+};
+
+/// RFC 4191 Route Information option fields (SK-94).
+pub const RouteInfo = struct {
+    prefix: [16]u8 = @splat(0),
+    prefix_len: u8 = 0,
+    /// -1 low, 0 medium, 1 high.
+    preference: i8 = 0,
+    lifetime_sec: u32 = 0,
 };
 
 /// Compute the ICMPv6 checksum over the pseudo-header + ICMPv6 message.
@@ -86,7 +99,7 @@ pub fn handlePacket(
     }
 }
 
-/// Parsed Router Advertisement fields (SK-82/83).
+/// Parsed Router Advertisement fields (SK-82/83/94).
 pub const RouterAdvert = struct {
     hop_limit: u8 = 0,
     router_lifetime_sec: u16 = 0,
@@ -95,6 +108,8 @@ pub const RouterAdvert = struct {
     source_ll: ?[6]u8 = null,
     prefixes: [MAX_RA_PREFIXES]PrefixInfo = @splat(.{}),
     prefix_count: u8 = 0,
+    routes: [MAX_RA_ROUTES]RouteInfo = @splat(.{}),
+    route_count: u8 = 0,
 };
 
 /// Pure RA parser (RFC 4861 §4.2). Requires at least the 16-byte RA header.
@@ -135,6 +150,26 @@ pub fn parseRouterAdvertisement(data: [*]const u8, len: u16) ?RouterAdvert {
                 };
                 adv.prefix_count += 1;
             }
+        } else if (opt_type == OPT_ROUTE_INFORMATION and opt_units >= 1 and opt_units <= 3) {
+            // type(1)+len(1)+prefix_len(1)+flags(1)+lifetime(4)+prefix(0/8/16)
+            const prf_bits: u8 = (data[off + 3] >> 3) & 0x3;
+            if (prf_bits != 0b10 and adv.route_count < MAX_RA_ROUTES) {
+                const preference: i8 = switch (prf_bits) {
+                    0b01 => 1,
+                    0b11 => -1,
+                    else => 0,
+                };
+                var pfx: [16]u8 = @splat(0);
+                if (opt_units >= 2) @memcpy(pfx[0..8], data[off + 8 .. off + 16]);
+                if (opt_units >= 3) @memcpy(pfx[8..16], data[off + 16 .. off + 24]);
+                adv.routes[adv.route_count] = .{
+                    .prefix = pfx,
+                    .prefix_len = data[off + 2],
+                    .preference = preference,
+                    .lifetime_sec = bo.readU32BeAt(data, off + 4),
+                };
+                adv.route_count += 1;
+            }
         }
         off += opt_len;
     }
@@ -160,6 +195,12 @@ fn handleRouterAdvertisement(src_ip: [16]u8, data: [*]const u8, len: u16) void {
                 sendDadNeighborSolicitation(tentative);
             }
         }
+    }
+    // SK-94: Route Information → more-specific off-link next hops.
+    var ri: u8 = 0;
+    while (ri < adv.route_count) : (ri += 1) {
+        const r = adv.routes[ri];
+        ndp.setRoute(r.prefix, r.prefix_len, r.lifetime_sec, r.preference, src_ip);
     }
 }
 
@@ -573,4 +614,6 @@ pub fn neighborTimerTick(ms_elapsed: u32) void {
     ndp.prefixLifetimeTimerTick(ms_elapsed);
     // SK-91: Preferred Lifetime → deprecate addresses for new TX.
     ndp.preferredLifetimeTimerTick(ms_elapsed);
+    // SK-94: expire Route Information entries.
+    ndp.routeLifetimeTimerTick(ms_elapsed);
 }
