@@ -1232,7 +1232,23 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   发送与完整状态机共享为下一步。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-75] tcp ipv6 tcb demux non-x86: OK`。
-- **后续**:`sendSegmentV6` + NDP TX + 与 IPv4 共享 established 处理;或 NS 重传。
+- **后续**:见 3.76（`sendSegmentV6` + 握手完成,已完成)。
+
+---
+
+### 3.76 TCP IPv6 sendSegmentV6 与握手（SK-76,2026-07-22）
+
+- **背景**:SK-75 在 listen SYN 后 `sendSegment` 对 v6 直接返回 false,无法发出
+  SYN-ACK;established 数据路径仍未共享。
+- **方案**:抽出 `fillTcpSegment`/`advanceSndNxt`;`sendSegment` 按 `is_v6` 分发到
+  `sendSegmentV6`(NDP lookup/NS、tcp@54、`checksumV6`、`ETHERTYPE_IPV6`)。
+  `handlePacketV6` 完成 `syn_sent`/`syn_received` 三次握手。`shared/sk76.zig`
+  锁定无 NDP 不推进、有 NDP 则 SYN-ACK + 第三 ACK → established。
+- **效果**:IPv6 TCP 服务端/客户端可完成握手;数据面与 IPv4 状态机完全共享留待后续。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-76] tcp sendSegmentV6 handshake non-x86: OK`。
+- **后续**:IPv6 established 数据/关闭路径与 IPv4 共享;或 `connect`/`sockaddr_in6`
+  TCP syscall;或 NS 重传。
 
 ---
 

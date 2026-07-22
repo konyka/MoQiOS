@@ -21,6 +21,8 @@ const eth = @import("eth.zig");
 const ipv4 = @import("ipv4.zig");
 const ipv6 = @import("ipv6.zig");
 const arp = @import("arp.zig");
+const ndp = @import("ndp.zig");
+const icmpv6 = @import("icmpv6.zig");
 const socket_opt = @import("socket_opt.zig");
 const bo = @import("../lib/byte_order.zig");
 const tcp_util = @import("tcp_util.zig");
@@ -438,74 +440,59 @@ fn ringDataLen(head: u32, tail: u32, size: u32) u32 {
 
 // ─── TCP Header Construction ──────────────────────────────────────────────
 
-/// Build and send a TCP segment.
-/// When `include_options` is true (SYN/SYN-ACK segments), TCP options are
-/// included: Window Scaling option (kind 3) and Timestamps option (kind 8).
-fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
-    // SK-75: IPv6 TCBs demux/listen; TX via sendSegmentV6 lands in SK-76.
-    if (tcb.is_v6) return false;
-    var send_pkt: [1518]u8 = @splat(0);
-    const dst_mac = arp.resolve(tcb.remote_ip) orelse {
-        tcpLog("[tcp] ARP resolution failed\n");
-        return false;
-    };
-
-    const our_mac = netif.getMac();
-    const our_ip = netif.getOurIp();
-
-    // TCP header at offset 34 (14 eth + 20 ipv4)
-    const tcp_off = 34;
+/// Write TCP header + options + payload at `tcp_off` (checksum field left 0).
+/// Shared by IPv4/IPv6 TX (SK-76). Returns the TCP segment length.
+fn fillTcpSegment(
+    tcb: *TcpTcb,
+    flags: u8,
+    data: [*]const u8,
+    data_len: u16,
+    pkt: [*]u8,
+    tcp_off: u16,
+) u16 {
     const seq = tcb.snd_nxt;
     const ack = if (flags & ACK != 0) tcb.rcv_nxt else 0;
 
-    // Build TCP options if this is a SYN segment
-    var opt_buf: [48]u8 = @splat(0); // max options: 48 bytes (SACK blocks need space)
+    var opt_buf: [48]u8 = @splat(0);
     var opt_len: u8 = 0;
     const is_syn = (flags & SYN) != 0;
 
     if (is_syn) {
-        // Window Scaling option: kind=3, len=3, shift_count
-        opt_buf[opt_len] = 3; // kind
-        opt_buf[opt_len + 1] = 3; // length
-        opt_buf[opt_len + 2] = @intCast(tcb.ws_requested); // shift count
+        opt_buf[opt_len] = 3;
+        opt_buf[opt_len + 1] = 3;
+        opt_buf[opt_len + 2] = @intCast(tcb.ws_requested);
         opt_len += 3;
 
-        // Timestamps option: kind=8, len=10, TSVAL, TSECR
         const now_ms = timestampMs();
         tcb.ts_val_last = now_ms;
-        opt_buf[opt_len] = 8; // kind
-        opt_buf[opt_len + 1] = 10; // length
+        opt_buf[opt_len] = 8;
+        opt_buf[opt_len + 1] = 10;
         bo.writeU32BeAt(&opt_buf, opt_len + 2, now_ms);
-        // TSECR = ts_recent
         bo.writeU32BeAt(&opt_buf, opt_len + 6, tcb.ts_recent);
         opt_len += 10;
 
-        // SACK-Permitted: kind=4, len=2
         opt_buf[opt_len] = 4;
         opt_buf[opt_len + 1] = 2;
         opt_len += 2;
 
-        // Pad to 4-byte boundary
         while (opt_len % 4 != 0) : (opt_len += 1) {
-            opt_buf[opt_len] = 1; // NOP
+            opt_buf[opt_len] = 1;
         }
     } else {
-        // Non-SYN: timestamps if enabled
         if (tcb.ts_enabled) {
             const now_ms = timestampMs();
             tcb.ts_val_last = now_ms;
-            opt_buf[opt_len] = 8; // kind
-            opt_buf[opt_len + 1] = 10; // length
+            opt_buf[opt_len] = 8;
+            opt_buf[opt_len + 1] = 10;
             bo.writeU32BeAt(&opt_buf, opt_len + 2, now_ms);
             bo.writeU32BeAt(&opt_buf, opt_len + 6, tcb.ts_recent);
             opt_len += 10;
         }
 
-        // SACK blocks: kind=5, len=2+8*N (only if SACK negotiated and blocks available)
         if (tcb.sack_permitted and tcb.sack_block_count > 0 and (flags & ACK != 0)) {
             const num_blocks = tcb.sack_block_count;
             const sack_len: u8 = 2 + @as(u8, num_blocks) * 8;
-            opt_buf[opt_len] = 5; // kind
+            opt_buf[opt_len] = 5;
             opt_buf[opt_len + 1] = sack_len;
             opt_len += 2;
             var bi: u3 = 0;
@@ -515,80 +502,95 @@ fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
                 bo.writeU32BeAt(&opt_buf, opt_len + 4, blk.right);
                 opt_len += 8;
             }
-            // Clear SACK blocks after sending (they are one-time reports)
             tcb.sack_block_count = 0;
         }
 
-        // Pad to 4-byte boundary
         while (opt_len % 4 != 0) : (opt_len += 1) {
-            opt_buf[opt_len] = 1; // NOP
+            opt_buf[opt_len] = 1;
         }
     }
 
-    const data_offset_val: u8 = @intCast((20 + opt_len) / 4); // in 32-bit words
-
-    // Window: apply receive window scaling
+    const data_offset_val: u8 = @intCast((20 + opt_len) / 4);
     const raw_window: u16 = if (tcb.ws_enabled) blk: {
         const scaled = tcb.rcv_wnd >> @intCast(tcb.rcv_wnd_scale);
         break :blk if (scaled > 0xFFFF) 0xFFFF else @intCast(scaled);
     } else @truncate(tcb.rcv_wnd);
 
-    // Source port
-    bo.writeU16BeAt(&send_pkt, tcp_off + 0, tcb.local_port);
-    // Destination port
-    bo.writeU16BeAt(&send_pkt, tcp_off + 2, tcb.remote_port);
-    // Sequence number
-    bo.writeU32BeAt(&send_pkt, tcp_off + 4, seq);
-    // Acknowledgment number
-    bo.writeU32BeAt(&send_pkt, tcp_off + 8, ack);
-    // Data offset (4 bits) + reserved (4 bits)
-    send_pkt[tcp_off + 12] = data_offset_val << 4;
-    // Flags
-    send_pkt[tcp_off + 13] = flags;
-    // Window
-    bo.writeU16BeAt(&send_pkt, tcp_off + 14, raw_window);
-    // Checksum placeholder + Urgent pointer
-    send_pkt[tcp_off + 16] = 0;
-    send_pkt[tcp_off + 17] = 0;
-    send_pkt[tcp_off + 18] = 0;
-    send_pkt[tcp_off + 19] = 0;
+    bo.writeU16BeAt(pkt, tcp_off + 0, tcb.local_port);
+    bo.writeU16BeAt(pkt, tcp_off + 2, tcb.remote_port);
+    bo.writeU32BeAt(pkt, tcp_off + 4, seq);
+    bo.writeU32BeAt(pkt, tcp_off + 8, ack);
+    pkt[tcp_off + 12] = data_offset_val << 4;
+    pkt[tcp_off + 13] = flags;
+    bo.writeU16BeAt(pkt, tcp_off + 14, raw_window);
+    pkt[tcp_off + 16] = 0;
+    pkt[tcp_off + 17] = 0;
+    pkt[tcp_off + 18] = 0;
+    pkt[tcp_off + 19] = 0;
 
-    // Copy options after fixed header
     if (opt_len > 0) {
-        @memcpy(send_pkt[tcp_off + 20 .. tcp_off + 20 + opt_len], opt_buf[0..opt_len]);
+        @memcpy(pkt[tcp_off + 20 ..][0..opt_len], opt_buf[0..opt_len]);
     }
 
-    // Copy data after header + options
     const hdr_total = 20 + opt_len;
     if (data_len > 0) {
-        @memcpy(send_pkt[tcp_off + hdr_total .. tcp_off + hdr_total + data_len], data[0..data_len]);
+        @memcpy(pkt[tcp_off + hdr_total ..][0..data_len], data[0..data_len]);
     }
+    return @intCast(hdr_total + data_len);
+}
 
-    // Calculate TCP checksum (with pseudo-header)
-    const tcp_total: u16 = @intCast(hdr_total + data_len);
+fn advanceSndNxt(tcb: *TcpTcb, flags: u8, data_len: u16) void {
+    if (data_len > 0) tcb.snd_nxt +%= data_len;
+    if (flags & SYN != 0) tcb.snd_nxt +%= 1;
+    if (flags & FIN != 0) tcb.snd_nxt +%= 1;
+}
+
+/// Build and send a TCP segment (IPv4 or IPv6).
+fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
+    if (tcb.is_v6) return sendSegmentV6(tcb, flags, data, data_len);
+
+    var send_pkt: [1518]u8 = @splat(0);
+    const dst_mac = arp.resolve(tcb.remote_ip) orelse {
+        tcpLog("[tcp] ARP resolution failed\n");
+        return false;
+    };
+
+    const our_mac = netif.getMac();
+    const our_ip = netif.getOurIp();
+    const tcp_off: u16 = 34;
+    const tcp_total = fillTcpSegment(tcb, flags, data, data_len, &send_pkt, tcp_off);
     const csum = tcpChecksum(our_ip, tcb.remote_ip, send_pkt[tcp_off..].ptr, tcp_total);
     bo.writeU16BeAt(&send_pkt, tcp_off + 16, csum);
-
-    // Build IPv4 header
     ipv4.buildHeader(send_pkt[14..].ptr, our_ip, tcb.remote_ip, ipv4.PROTO_TCP, tcp_total);
-
-    // Build ethernet frame
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, 20 + tcp_total);
-
     _ = nic.sendPacket(&send_pkt, frame_len);
+    advanceSndNxt(tcb, flags, data_len);
+    return true;
+}
 
-    // Advance snd_nxt for data payload
-    if (data_len > 0) {
-        tcb.snd_nxt +%= data_len;
-    }
-    // SYN and FIN consume one sequence number each
-    if (flags & SYN != 0) {
-        tcb.snd_nxt +%= 1;
-    }
-    if (flags & FIN != 0) {
-        tcb.snd_nxt +%= 1;
-    }
+/// IPv6 TCP TX (SK-76): NDP resolve + eth/ipv6/tcp frame at offset 54.
+fn sendSegmentV6(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
+    // IPv6 min MTU 1280 → leave room for 40 IP + ~40 TCP opts.
+    if (data_len > 1200) return false;
 
+    const dst_mac = ndp.lookup(tcb.remote_ip6) orelse {
+        ndp.markIncomplete(tcb.remote_ip6);
+        icmpv6.sendNeighborSolicitation(tcb.remote_ip6);
+        tcpLog("[tcp] NDP resolution failed\n");
+        return false;
+    };
+
+    const our_mac = netif.getMac();
+    const our_ip = ndp.generateLinkLocal(our_mac);
+    var send_pkt: [1518]u8 = @splat(0);
+    const tcp_off: u16 = 14 + ipv6.HEADER_LEN;
+    const tcp_total = fillTcpSegment(tcb, flags, data, data_len, &send_pkt, tcp_off);
+    const csum = tcpChecksumV6(our_ip, tcb.remote_ip6, send_pkt[tcp_off..].ptr, tcp_total);
+    bo.writeU16BeAt(&send_pkt, tcp_off + 16, csum);
+    ipv6.buildHeader(send_pkt[14..].ptr, our_ip, tcb.remote_ip6, ipv6.PROTO_TCP, tcp_total);
+    const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + tcp_total);
+    _ = nic.sendPacket(&send_pkt, frame_len);
+    advanceSndNxt(tcb, flags, data_len);
     return true;
 }
 
@@ -607,8 +609,7 @@ fn tcpChecksumV6(src_ip: [16]u8, dst_ip: [16]u8, tcp_hdr: [*]const u8, tcp_len: 
     return tcp_util.checksumV6(src_ip, dst_ip, tcp_hdr, tcp_len);
 }
 
-/// IPv6 TCP receive (SK-74/75): mandatory checksum, then TCB demux / listen SYN.
-/// Established segment processing and SYN-ACK TX (`sendSegmentV6`) are SK-76+.
+/// IPv6 TCP receive (SK-74..76): checksum, demux/listen SYN, handshake + TX.
 pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32) void {
     if (len < 20) return;
     const tcp_len: u16 = @intCast(@min(len, 0xFFFF));
@@ -626,6 +627,7 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
     const src_port = bo.readU16BeAt(data, 0);
     const dst_port = bo.readU16BeAt(data, 2);
     const seq_num = bo.readU32BeAt(data, 4);
+    const ack_num = bo.readU32BeAt(data, 8);
     const flags = data[13];
     const raw_window = bo.readU16BeAt(data, 14);
     const opts = parseTcpOptions(data, data_offset);
@@ -637,9 +639,52 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
         return;
     };
 
-    // Demux hit: mark activity. Full state-machine share with IPv4 is SK-76.
     tcb.idle_ms = 0;
     if (opts.ts_val) |tv| tcb.ts_recent = tv;
+
+    const window: u32 = if (tcb.ws_enabled)
+        @as(u32, raw_window) << @intCast(tcb.snd_wnd_scale)
+    else
+        raw_window;
+
+    // SK-76: complete three-way handshake on IPv6 (full established data path later).
+    switch (tcb.state) {
+        .syn_sent => {
+            if ((flags & (SYN | ACK)) == (SYN | ACK)) {
+                tcb.irs = seq_num;
+                tcb.rcv_nxt = seq_num +% 1;
+                tcb.snd_una = ack_num;
+                tcb.snd_wnd = window;
+                tcb.state = .established;
+                if (opts.ws_shift) |peer_ws| {
+                    tcb.snd_wnd_scale = peer_ws;
+                    tcb.ws_enabled = true;
+                }
+                if (opts.ts_val) |tv| {
+                    tcb.ts_recent = tv;
+                    tcb.ts_enabled = true;
+                }
+                if (opts.sack_permitted) tcb.sack_permitted = true;
+                tcb.cwnd = TCP_MSS;
+                tcb.dup_ack_count = 0;
+                tcb.in_recovery = false;
+                _ = sendSegment(tcb, ACK, undefined, 0);
+            } else if (flags & SYN != 0) {
+                _ = sendSegment(tcb, RST, undefined, 0);
+                tcb.state = .closed;
+                deactivateTcb(tcb);
+            }
+        },
+        .syn_received => {
+            if (flags & ACK != 0) {
+                tcb.snd_una = ack_num;
+                tcb.snd_wnd = window;
+                tcb.state = .established;
+                tcb.retransmit_timer = 0;
+            }
+        },
+        else => {},
+    }
 }
 
 // ─── Incoming Packet Handling ─────────────────────────────────────────────
@@ -841,7 +886,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
     ls.pending_tail += 1;
 }
 
-/// IPv6 listen SYN (SK-75). Creates a SYN_RECEIVED TCB; SYN-ACK TX is SK-76.
+/// IPv6 listen SYN (SK-75/76). Creates SYN_RECEIVED and sends SYN-ACK via NDP.
 fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions) void {
     _ = _w;
     var slot: ?*ListenSlot = null;
@@ -1892,6 +1937,22 @@ pub fn tcpProbeIdleV6(tcb_idx: u32) u32 {
     defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return 0xFFFF_FFFF;
     return tcbs[tcb_idx].idle_ms;
+}
+
+/// Probe helper (SK-76): true when SYN-ACK advanced snd_nxt past iss.
+pub fn tcpProbeSynAckAdvancedV6(local_port: u16, remote_port: u16, remote_ip6: [16]u8) bool {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    const tcb = findTcbByTupleV6(local_port, remote_port, remote_ip6) orelse return false;
+    return tcb.state == .syn_received and tcb.snd_nxt == tcb.iss +% 1;
+}
+
+/// Probe helper (SK-76): IPv6 tuple is in established state.
+pub fn tcpProbeIsEstablishedV6(local_port: u16, remote_port: u16, remote_ip6: [16]u8) bool {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    const tcb = findTcbByTupleV6(local_port, remote_port, remote_ip6) orelse return false;
+    return tcb.state == .established;
 }
 
 /// Accept a pending connection on a listening socket.
