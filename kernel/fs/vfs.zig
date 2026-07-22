@@ -671,7 +671,7 @@ pub const FdTable = struct {
             epoll_mod.epollDestroy(desc.epoll_idx);
         }
         if (desc.fd_type == .eventfd) {
-            // eventfd cleanup: no module yet
+            @import("eventfd.zig").eventfdClose(desc.eventfd_idx);
         }
         if (desc.fd_type == .unix_socket) {
             const unix_mod = @import("../net/unix_socket.zig");
@@ -751,6 +751,7 @@ pub fn retainSharedResources(table: *FdTable) void {
                 .epoll => seen = other.epoll_idx == desc.epoll_idx,
                 .unix_socket => seen = other.unix_sock_idx == desc.unix_sock_idx,
                 .timerfd => seen = other.timerfd_idx == desc.timerfd_idx,
+                .eventfd => seen = other.eventfd_idx == desc.eventfd_idx,
                 else => {},
             }
             if (seen) break;
@@ -765,6 +766,7 @@ pub fn retainSharedResources(table: *FdTable) void {
             .epoll => @import("../net/epoll.zig").epollRetain(desc.epoll_idx),
             .unix_socket => @import("../net/unix_socket.zig").unixRetain(desc.unix_sock_idx),
             .timerfd => @import("../ipc/timerfd.zig").timerfdRetain(desc.timerfd_idx),
+            .eventfd => @import("eventfd.zig").eventfdRetain(desc.eventfd_idx),
             else => {},
         }
     }

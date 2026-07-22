@@ -996,8 +996,28 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   (smoke 全过)。这是 `fs/` 方向可移植化的第一块基石。
 - **验证**:三门禁 + `smoke-smp` + `smoke-smp-stress` 全绿,riscv64/aarch64
   打印 `[SK-61] fat32 parse/geometry non-x86: OK`。
-- **后续**:可继续抽 FAT32 的 8.3/LFN 短长文件名解析为纯函数,或转向 ext2
-  超级块/inode 解析的纯逻辑抽出。
+- **后续**:见 3.62（FAT32 8.3/LFN 目录项纯解析,已完成)。
+
+---
+
+### 3.62 FAT32 8.3/LFN 目录项纯解析抽出并搬上非 x86（SK-62,2026-07-22）
+
+- **背景**:SK-61 抽出几何/簇数学后,`fat32.zig` 仍内联 8.3 编解码、目录项
+  size/cluster 字段读写、LFN/卷标属性判定。这些路径无 I/O，却无法在非 x86
+  单测，也阻碍后续真正装配长文件名。
+- **方案**:在 `fs/fat32_util.zig` 追加纯助手：`decode83Name`/`encode83Name`、
+  `dirEntryFirstCluster`/`dirEntrySize` 及 setter、`isLfnAttr`/
+  `isVolumeLabelAttr`/`isDirectoryAttr`、Microsoft `lfnChecksum`、
+  `decodeLfnEntryChars` + `lfnSequence`/`isLastLfnSlot`。x86 `fat32.zig` 的
+  `listRootDir`/`createFile`/`updateDirEntry`/`deleteFile` 改为 1:1 委托。
+  新增 `shared/sk62.zig`：固定 `readme.txt`/`Makefile` 编解码往返、
+  0x12345678 簇号与 size 字段、属性谓词、手算对照的 LFN checksum、以及合成
+  last-slot LFN（`"hello"` UCS-2）提取。
+- **效果**:目录项命名层与块设备解耦，可移植可单测；为后续完整 LFN 装配铺路，
+  且不增加热路径开销（仍是内联数学，无额外分配）。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-62] fat32 8.3/LFN helpers non-x86: OK`。
+- **后续**:可装配多槽 LFN→UTF-8 名，或转向 ext2 超级块/inode 纯解析抽出。
 
 ---
 

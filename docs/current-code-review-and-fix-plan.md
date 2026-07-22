@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-18 (native-preempt hot path, aarch64 IRQ masking, and probe failure cleanup reviewed and verified)
+> Last update: 2026-07-22 (eventfd fork/close refcount + SK-62 FAT32 8.3/LFN helpers reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -359,8 +359,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | Default timer path | `sk31.onDefaultTimer` read `currentTaskIndex()` twice for each user-mode timer interrupt. | Fixed: capture it once and reuse it for the probe accounting path. |
 | aarch64 IRQ masking | `arch.interrupts.enableIrq` and `disableIrq` were no-ops, unlike riscv64 `sstatus.SIE`, so shared probe setup could not enforce its masked critical section. | Fixed: use `daifclr #2` / `daifset #2` for the DAIF.I bit. aarch64 QEMU smoke passed with real masking. |
 | Probe allocation failures | aarch64 and riscv64 user-IRQ probe setup leaked newly allocated pages when the second allocation or a mapping failed. | Fixed: unmap and free every allocation on every failure path. |
-| User-copy fault recovery | `kernel/mm/copy_from_user.zig` still records the need for an assembly RIP-range fault-recovery guard. | Open P0: needs a separately designed exception-table/recovery implementation and fault-injection coverage. |
-| Fork FD ownership | `kernel/proc/fork.zig` copies socket/epoll/eventfd/timerfd/unix-socket descriptors without the required refcount ownership work. | Open P0: needs per-object ownership semantics and fork/close regression coverage. |
+| User-copy fault recovery | `kernel/mm/copy_from_user.zig` still records the need for an assembly RIP-range fault-recovery guard. | Mitigated P1: page-walk precheck + `userAccessBegin/End` prevent mapped-range faults from taking down the kernel; true exception-table recovery remains a separate design. |
+| Fork FD ownership | `kernel/proc/fork.zig` copies socket/epoll/eventfd/timerfd/unix-socket descriptors without the required refcount ownership work. | ✅ Resolved: v53.44 `retainSharedResources` covers ext2/tcp/epoll/unix/timerfd; 2026-07-22 adds eventfd `ref_count` + `eventfdRetain`/`eventfdClose` wiring (same O(1) retain path as timerfd). |
 | Scale limits | Static task-table bitmap scans, page-cache clock sweeps, and ext2 directory scans remain linear in their respective structures. | Open P1: profile before replacing bounded structures; no speculative data-structure rewrite in this maintenance pass. |
 
 | Gate | Result | Notes |
@@ -387,6 +387,24 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
 | `zig build -Darch=riscv64 smoke-riscv` | Passed | Shared probe ladder through SK-36 + virtio + U-mode. |
 | `zig build -Darch=aarch64 smoke-aarch64` | Passed | Shared probe ladder through SK-36 + default timer + EL0/SVC. |
+
+### 5.2c Review Update: 2026-07-22
+
+| Area | Finding | Resolution / status |
+|---|---|---|
+| eventfd fork/close | `vfs.close` left a stale "no module yet" stub and never called `eventfdClose`; `retainSharedResources` omitted `.eventfd`, so fork + close leaked pool slots or (once wired) would free under the child's feet. | Fixed: `EventfdInstance.ref_count` + `eventfdRetain`/`eventfdClose` (free at 0), wired into `FdTable.close` and `retainSharedResources`. Close no longer resets the held spinlock word. Same O(1) retain path as timerfd — no speculative redesign. |
+| FAT32 name/dir-entry purity | After SK-61, 8.3 encode/decode and dir-entry field math remained inline in the I/O driver. | SK-62: extracted into `fat32_util.zig` + non-x86 probe; x86 driver delegates 1:1. |
+| User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
+| Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build test` | Passed | Host helper tests. |
+| `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
+| `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
+| `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-62] fat32 8.3/LFN helpers non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-62] fat32 8.3/LFN helpers non-x86: OK`. |
 
 ### 5.3 Historical Verification
 

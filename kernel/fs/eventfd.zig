@@ -24,6 +24,8 @@ pub const EventfdInstance = struct {
     spin: IrqSpinlock = .{},
     waiter: ?*WaitNode = null,
     owner_task_idx: u32 = 0,
+    /// Cross-process references (fork/clone) — eventfdClose frees at 0 only.
+    ref_count: u32 = 1,
     valid: bool = false,
 };
 
@@ -46,6 +48,7 @@ pub fn eventfdCreate(init_val: u64) i32 {
             inst.* = .{
                 .counter = init_val,
                 .owner_task_idx = cur_idx,
+                .ref_count = 1,
                 .valid = true,
             };
             return @intCast(i);
@@ -118,6 +121,16 @@ pub fn eventfdWrite(eventfd_idx: u32, buf: [*]const u8, count: usize) i64 {
     return 8;
 }
 
+/// Add a cross-process reference (fork/clone fd-table copy).
+pub fn eventfdRetain(eventfd_idx: u32) void {
+    if (eventfd_idx >= MAX_EVENTFD_INSTANCES) return;
+    const inst = &eventfd_pool[eventfd_idx];
+    const saved = inst.spin.acquire();
+    defer inst.spin.release(saved);
+    if (!inst.valid) return;
+    inst.ref_count += 1;
+}
+
 /// Close an eventfd instance.
 pub fn eventfdClose(eventfd_idx: u32) void {
     if (eventfd_idx >= MAX_EVENTFD_INSTANCES) return;
@@ -125,6 +138,14 @@ pub fn eventfdClose(eventfd_idx: u32) void {
 
     const saved = inst.spin.acquire();
     defer inst.spin.release(saved);
+    if (!inst.valid) return;
+
+    // Shared across fork/clone: drop one reference, free only at zero.
+    if (inst.ref_count > 1) {
+        inst.ref_count -= 1;
+        return;
+    }
+    inst.ref_count = 0;
 
     // Wake any blocked waiter
     if (inst.waiter) |node| {
@@ -138,7 +159,12 @@ pub fn eventfdClose(eventfd_idx: u32) void {
     const epoll_mod = @import("../net/epoll.zig");
     epoll_mod.epollNotify(.eventfd, eventfd_idx, epoll_mod.EPOLLHUP);
 
-    inst.* = .{};
+    // Clear payload without resetting the held spinlock word.
+    inst.counter = 0;
+    inst.waiter = null;
+    inst.owner_task_idx = 0;
+    inst.ref_count = 0;
+    inst.valid = false;
 }
 
 /// Get the current counter value (for epoll computeCurrentEvents).

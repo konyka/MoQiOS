@@ -235,42 +235,23 @@ fn listRootDir() void {
 
             if (first_byte == 0x00) break; // End of directory
             if (first_byte == 0xE5) continue; // Deleted entry
-            if (buf[entry_off + 11] == 0x0F) continue; // LFN entry
-
             const attr = buf[entry_off + 11];
-            if (attr == 0x08) continue; // Volume label
+            if (fat_util.isLfnAttr(attr)) continue;
+            if (fat_util.isVolumeLabelAttr(attr)) continue;
 
-            const is_dir = (attr & 0x10) != 0;
-
-            // Extract 8.3 name
+            const entry = buf + entry_off;
             var fi = FileInfo{
                 .name = @splat(0),
                 .name_len = 0,
-                .size = @bitCast([4]u8{ buf[entry_off + 28], buf[entry_off + 29], buf[entry_off + 30], buf[entry_off + 31] }),
-                .first_cluster = @as(u32, @as(u16, @bitCast([2]u8{ buf[entry_off + 26], buf[entry_off + 27] }))) |
-                    (@as(u32, @as(u16, @bitCast([2]u8{ buf[entry_off + 20], buf[entry_off + 21] }))) << 16),
+                .size = fat_util.dirEntrySize(entry),
+                .first_cluster = fat_util.dirEntryFirstCluster(entry),
                 .last_cluster = 0,
-                .is_dir = is_dir,
+                .is_dir = fat_util.isDirectoryAttr(attr),
             };
 
-            // Convert 8.3 name to readable format
-            var ni: u32 = 0;
-            for (0..8) |j| {
-                const c = buf[entry_off + j];
-                if (c == 0x20) break;
-                fi.name[ni] = if (c >= 'A' and c <= 'Z') c + 32 else c;
-                ni += 1;
-            }
-            if (buf[entry_off + 8] != 0x20) {
-                fi.name[ni] = '.';
-                ni += 1;
-                for (8..11) |j| {
-                    const c = buf[entry_off + j];
-                    if (c == 0x20) break;
-                    fi.name[ni] = if (c >= 'A' and c <= 'Z') c + 32 else c;
-                    ni += 1;
-                }
-            }
+            var short_name: [11]u8 = undefined;
+            @memcpy(short_name[0..11], entry[0..11]);
+            const ni = fat_util.decode83Name(&short_name, fi.name[0..]);
             fi.name_len = ni;
 
             if (ni > 0) {
@@ -279,7 +260,7 @@ fn listRootDir() void {
 
                 serial.writeString("[fs]   ");
                 serial.writeString(fi.name[0..ni]);
-                if (is_dir) serial.writeString("/");
+                if (fi.is_dir) serial.writeString("/");
                 serial.writeString(" size=");
                 fmt.writeDecimal(fi.size);
                 serial.writeString(" cluster=");
@@ -539,28 +520,8 @@ pub fn createFile(name: []const u8) i64 {
     const new_cluster = allocCluster() orelse return -1;
     zeroCluster(new_cluster);
 
-    var basename: [8]u8 = @splat(0x20);
-    var ext: [3]u8 = @splat(0x20);
-    var dot_pos: usize = name.len;
-    for (0..name.len) |j| {
-        if (name[j] == '.') {
-            dot_pos = j;
-            break;
-        }
-    }
-    for (0..if (dot_pos < 8) dot_pos else @as(usize, 8)) |j| {
-        const c = name[j];
-        basename[j] = if (c >= 'a' and c <= 'z') c - 32 else c;
-    }
-    if (dot_pos < name.len) {
-        const ext_start = dot_pos + 1;
-        for (0..3) |j| {
-            if (ext_start + j < name.len) {
-                const c = name[ext_start + j];
-                ext[j] = if (c >= 'a' and c <= 'z') c - 32 else c;
-            }
-        }
-    }
+    var short_name: [11]u8 = undefined;
+    fat_util.encode83Name(name, &short_name);
 
     const root_lba = clusterToLBA(fat32_root_cluster);
     const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
@@ -577,31 +538,25 @@ pub fn createFile(name: []const u8) i64 {
     if (free_entry >= 16) return -1;
 
     const eoff = free_entry * 32;
-    for (0..8) |j| buf[eoff + j] = basename[j];
-    for (0..3) |j| buf[eoff + 8 + j] = ext[j];
-    buf[eoff + 11] = 0x20;
-    buf[eoff + 12] = 0;
-    buf[eoff + 13] = 0;
+    const entry = buf + eoff;
+    @memcpy(entry[0..11], short_name[0..11]);
+    entry[11] = fat_util.ATTR_ARCHIVE;
+    entry[12] = 0;
+    entry[13] = 0;
     const create_time: u16 = 0;
     const create_date: u16 = 0;
-    buf[eoff + 14] = @truncate(create_time);
-    buf[eoff + 15] = @truncate(create_time >> 8);
-    buf[eoff + 16] = @truncate(create_date);
-    buf[eoff + 17] = @truncate(create_date >> 8);
-    buf[eoff + 18] = @truncate(create_date);
-    buf[eoff + 19] = @truncate(create_date >> 8);
-    buf[eoff + 20] = @truncate(new_cluster >> 16);
-    buf[eoff + 21] = @truncate(new_cluster >> 24);
-    buf[eoff + 22] = @truncate(create_time);
-    buf[eoff + 23] = @truncate(create_time >> 8);
-    buf[eoff + 24] = @truncate(create_date);
-    buf[eoff + 25] = @truncate(create_date >> 8);
-    buf[eoff + 26] = @truncate(new_cluster);
-    buf[eoff + 27] = @truncate(new_cluster >> 8);
-    buf[eoff + 28] = 0;
-    buf[eoff + 29] = 0;
-    buf[eoff + 30] = 0;
-    buf[eoff + 31] = 0;
+    entry[14] = @truncate(create_time);
+    entry[15] = @truncate(create_time >> 8);
+    entry[16] = @truncate(create_date);
+    entry[17] = @truncate(create_date >> 8);
+    entry[18] = @truncate(create_date);
+    entry[19] = @truncate(create_date >> 8);
+    entry[22] = @truncate(create_time);
+    entry[23] = @truncate(create_time >> 8);
+    entry[24] = @truncate(create_date);
+    entry[25] = @truncate(create_date >> 8);
+    fat_util.setDirEntryFirstCluster(entry, new_cluster);
+    fat_util.setDirEntrySize(entry, 0);
 
     _ = safeWriteSectors(root_lba, 1, buf);
 
@@ -771,17 +726,12 @@ fn updateDirEntry(file_idx: u32) void {
         const off: u32 = @intCast(i * 32);
         if (buf[off] == 0x00) break;
         if (buf[off] == 0xE5) continue;
-        if (buf[off + 11] == 0x0F) continue;
-        if (buf[off + 11] == 0x08) continue;
+        const attr = buf[off + 11];
+        if (fat_util.isLfnAttr(attr) or fat_util.isVolumeLabelAttr(attr)) continue;
 
-        const entry_cluster = @as(u32, @as(u16, @bitCast([2]u8{ buf[off + 26], buf[off + 27] }))) |
-            (@as(u32, @as(u16, @bitCast([2]u8{ buf[off + 20], buf[off + 21] }))) << 16);
-
-        if (entry_cluster == fi.first_cluster) {
-            buf[off + 28] = @truncate(fi.size);
-            buf[off + 29] = @truncate(fi.size >> 8);
-            buf[off + 30] = @truncate(fi.size >> 16);
-            buf[off + 31] = @truncate(fi.size >> 24);
+        const entry = buf + off;
+        if (fat_util.dirEntryFirstCluster(entry) == fi.first_cluster) {
+            fat_util.setDirEntrySize(entry, fi.size);
             _ = safeWriteSectors(root_lba, 1, buf);
             return;
         }
@@ -801,13 +751,11 @@ pub fn deleteFile(file_idx: u32) bool {
         const off: u32 = @intCast(i * 32);
         if (buf[off] == 0x00) break;
         if (buf[off] == 0xE5) continue;
-        if (buf[off + 11] == 0x0F) continue;
-        if (buf[off + 11] == 0x08) continue;
+        const attr = buf[off + 11];
+        if (fat_util.isLfnAttr(attr) or fat_util.isVolumeLabelAttr(attr)) continue;
 
-        const entry_cluster = @as(u32, @as(u16, @bitCast([2]u8{ buf[off + 26], buf[off + 27] }))) |
-            (@as(u32, @as(u16, @bitCast([2]u8{ buf[off + 20], buf[off + 21] }))) << 16);
-
-        if (entry_cluster == fi.first_cluster) {
+        const entry = buf + off;
+        if (fat_util.dirEntryFirstCluster(entry) == fi.first_cluster) {
             buf[off] = 0xE5;
             _ = safeWriteSectors(root_lba, 1, buf);
             break;

@@ -142,3 +142,134 @@ pub fn isBadCluster(entry: u32) bool {
 pub fn isValidDataCluster(cluster: u32) bool {
     return cluster >= 2 and cluster < 0x0FFFFFF8;
 }
+
+// ─── Directory entry / 8.3 + LFN helpers ───────────────────────────────────
+
+pub const ATTR_READ_ONLY: u8 = 0x01;
+pub const ATTR_HIDDEN: u8 = 0x02;
+pub const ATTR_SYSTEM: u8 = 0x04;
+pub const ATTR_VOLUME_ID: u8 = 0x08;
+pub const ATTR_DIRECTORY: u8 = 0x10;
+pub const ATTR_ARCHIVE: u8 = 0x20;
+/// LFN entries use ATTR_READ_ONLY|HIDDEN|SYSTEM|VOLUME_ID (== 0x0F).
+pub const ATTR_LFN: u8 = 0x0F;
+
+pub fn isLfnAttr(attr: u8) bool {
+    return attr == ATTR_LFN;
+}
+pub fn isVolumeLabelAttr(attr: u8) bool {
+    return attr == ATTR_VOLUME_ID;
+}
+pub fn isDirectoryAttr(attr: u8) bool {
+    return (attr & ATTR_DIRECTORY) != 0;
+}
+
+/// Decode an 11-byte on-disk 8.3 name into a readable lowercase form
+/// (`NAME.EXT`, no trailing spaces). Returns the number of bytes written.
+pub fn decode83Name(short_name: *const [11]u8, out: []u8) u32 {
+    var ni: u32 = 0;
+    for (0..8) |j| {
+        const c = short_name[j];
+        if (c == 0x20) break;
+        if (ni >= out.len) return ni;
+        out[ni] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+        ni += 1;
+    }
+    if (short_name[8] != 0x20 and ni < out.len) {
+        out[ni] = '.';
+        ni += 1;
+        for (8..11) |j| {
+            const c = short_name[j];
+            if (c == 0x20) break;
+            if (ni >= out.len) return ni;
+            out[ni] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+            ni += 1;
+        }
+    }
+    return ni;
+}
+
+/// Encode a readable name into an 11-byte space-padded uppercase 8.3 field.
+/// Behaviour matches the historical FAT32 driver (truncate base/ext; no
+/// illegal-char validation).
+pub fn encode83Name(name: []const u8, out: *[11]u8) void {
+    @memset(out, 0x20);
+    var dot_pos: usize = name.len;
+    for (0..name.len) |j| {
+        if (name[j] == '.') {
+            dot_pos = j;
+            break;
+        }
+    }
+    const base_len = if (dot_pos < 8) dot_pos else @as(usize, 8);
+    for (0..base_len) |j| {
+        const c = name[j];
+        out[j] = if (c >= 'a' and c <= 'z') c - 32 else c;
+    }
+    if (dot_pos < name.len) {
+        const ext_start = dot_pos + 1;
+        for (0..3) |j| {
+            if (ext_start + j < name.len) {
+                const c = name[ext_start + j];
+                out[8 + j] = if (c >= 'a' and c <= 'z') c - 32 else c;
+            }
+        }
+    }
+}
+
+/// First cluster from a 32-byte directory entry (hi@20, lo@26).
+pub fn dirEntryFirstCluster(entry: [*]const u8) u32 {
+    const lo: u16 = @bitCast([2]u8{ entry[26], entry[27] });
+    const hi: u16 = @bitCast([2]u8{ entry[20], entry[21] });
+    return @as(u32, lo) | (@as(u32, hi) << 16);
+}
+
+/// File size from a 32-byte directory entry (@28).
+pub fn dirEntrySize(entry: [*]const u8) u32 {
+    return @bitCast([4]u8{ entry[28], entry[29], entry[30], entry[31] });
+}
+
+pub fn setDirEntryFirstCluster(entry: [*]u8, cluster: u32) void {
+    entry[26] = @truncate(cluster);
+    entry[27] = @truncate(cluster >> 8);
+    entry[20] = @truncate(cluster >> 16);
+    entry[21] = @truncate(cluster >> 24);
+}
+
+pub fn setDirEntrySize(entry: [*]u8, size: u32) void {
+    entry[28] = @truncate(size);
+    entry[29] = @truncate(size >> 8);
+    entry[30] = @truncate(size >> 16);
+    entry[31] = @truncate(size >> 24);
+}
+
+/// Microsoft LFN checksum over the 11-byte short name (used by LFN slots).
+pub fn lfnChecksum(short_name: *const [11]u8) u8 {
+    var sum: u8 = 0;
+    for (short_name.*) |c| {
+        sum = ((sum & 1) << 7) +% (sum >> 1) +% c;
+    }
+    return sum;
+}
+
+/// Extract up to 13 UCS-2 code units from one 32-byte LFN directory entry.
+/// Stops before a 0x0000 terminator; 0xFFFF padding is ignored as end.
+pub fn decodeLfnEntryChars(entry: [*]const u8, out: *[13]u16) u32 {
+    const offsets = [_]u8{ 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+    var n: u32 = 0;
+    for (offsets) |off| {
+        const ch: u16 = @bitCast([2]u8{ entry[off], entry[off + 1] });
+        if (ch == 0x0000 or ch == 0xFFFF) break;
+        out[n] = ch;
+        n += 1;
+    }
+    return n;
+}
+
+/// LFN sequence number in bits 0..4; bit 6 marks the last (highest) slot.
+pub fn lfnSequence(entry_first_byte: u8) u5 {
+    return @truncate(entry_first_byte & 0x1F);
+}
+pub fn isLastLfnSlot(entry_first_byte: u8) bool {
+    return (entry_first_byte & 0x40) != 0;
+}
