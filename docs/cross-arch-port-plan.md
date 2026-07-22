@@ -1056,7 +1056,25 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   (分配副作用更大,留待后续对称改造)。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-64] ext2 resolve via classify non-x86: OK`。
-- **后续**:对称改造 `ensureBlock` 消费 classify,或装配 FAT32 多槽 LFN→UTF-8。
+- **后续**:见 3.65（`ensureBlock` 对称消费 classify,已完成)。
+
+---
+
+### 3.65 ext2 `ensureBlock` 对称消费 `classifyLogicalBlock`（SK-65,2026-07-22）
+
+- **背景**:SK-64 让读路径 `resolveBlock` 走分类器后,写路径 `ensureBlock`
+  仍手写四套边界/索引与重复的「确保 root → 子间接块 → 数据块」样板,双份
+  维护风险高。
+- **方案**:`ensureBlock` 改为 `switch (classifyLogicalBlock)`；抽出
+  `ensureIndirectRoot` / `ensureChildIndirect` / `ensureDataPtr` 三个共享
+  助手(保留 v53.25 间接块强制清零、v53.30 cache 可变引用与
+  revalidate/flush 语义)。util 增加 `indirectRootSlot`(12/13/14)。
+  `shared/sk65.zig` 锁定 classify→root-slot→resolve 索引契约。
+- **效果**:读写寻址同一分类器;分配热路径行为逐字节等价,样板删除后更易审
+  核。x86 smoke 覆盖 `writeFile`→`ensureBlock` 实路径。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-65] ext2 ensure via classify non-x86: OK`。
+- **后续**:装配 FAT32 多槽 LFN→UTF-8,或转向其它 fs/net 纯层。
 
 ---
 

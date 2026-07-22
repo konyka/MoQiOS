@@ -195,6 +195,17 @@ pub const BlockAddr = union(enum) {
     out_of_range,
 };
 
+/// Inode `i_block[]` slot holding the root of an indirect tree for `addr`.
+/// Direct / out-of-range return null (no indirect root).
+pub fn indirectRootSlot(addr: BlockAddr) ?u32 {
+    return switch (addr) {
+        .direct, .out_of_range => null,
+        .single => 12,
+        .double => 13,
+        .triple => 14,
+    };
+}
+
 /// Classify a file-relative logical block into the inode block-map path.
 pub fn classifyLogicalBlock(logical_block: u32, ptrs_per_block: u32) BlockAddr {
     if (logical_block < EXT2_INODE_DIRECT) return .{ .direct = logical_block };

@@ -1534,169 +1534,106 @@ fn revalidateIndirect(ref: *IndirectRef, buf: [*]u8) bool {
     return true;
 }
 
-/// Ensure a logical block is allocated for the given inode.
-/// Returns the physical block number, allocating if necessary.
+/// Ensure `inode.block[root_idx]` holds an indirect root (always zero-filled).
+/// Returns `{block, is_new}` or null on allocation failure.
+fn ensureIndirectRoot(inode: *Ext2Inode, root_idx: u32) ?struct { block: u32, is_new: bool } {
+    if (inode.block[root_idx] != 0) return .{ .block = inode.block[root_idx], .is_new = false };
+    // v53.25: indirect block — always zero on disk
+    const blk = allocBlock(0, false);
+    if (blk == 0) return null;
+    inode.block[root_idx] = blk;
+    inode.blocks += block_size / 512;
+    return .{ .block = blk, .is_new = true };
+}
+
+/// Ensure `parent.ptrs[index]` points at a child indirect block (zero-filled).
+fn ensureChildIndirect(
+    parent: *IndirectRef,
+    parent_buf: [*]u8,
+    index: u32,
+    inode: *Ext2Inode,
+) ?struct { block: u32, is_new: bool } {
+    if (parent.ptrs[index] != 0) return .{ .block = parent.ptrs[index], .is_new = false };
+    const blk = allocBlock(0, false);
+    if (blk == 0) return null;
+    if (!revalidateIndirect(parent, parent_buf)) return null;
+    parent.ptrs[index] = blk;
+    inode.blocks += block_size / 512;
+    flushIndirect(parent.*);
+    return .{ .block = blk, .is_new = true };
+}
+
+/// Ensure `ref.ptrs[index]` holds a data block (`skip_zero` honoured).
+fn ensureDataPtr(
+    ref: *IndirectRef,
+    buf: [*]u8,
+    index: u32,
+    inode: *Ext2Inode,
+    skip_zero: bool,
+) u32 {
+    if (ref.ptrs[index] != 0) return ref.ptrs[index];
+    const blk = allocBlock(0, skip_zero);
+    if (blk == 0) return 0;
+    if (!revalidateIndirect(ref, buf)) return 0;
+    ref.ptrs[index] = blk;
+    inode.blocks += block_size / 512;
+    flushIndirect(ref.*);
+    return blk;
+}
+
+/// SK-65: same allocation semantics as before, but addressing comes from
+/// `classifyLogicalBlock` (shared with `resolveBlock`) and the repeated
+/// ensure-root / ensure-child / ensure-data patterns are factored once.
 fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32, skip_zero: bool) u32 {
-    // Check direct blocks first
-    if (logical_block < EXT2_INODE_DIRECT) {
-        if (inode.block[logical_block] != 0) return inode.block[logical_block];
-        const blk = allocBlock(0, skip_zero); // allocate from group 0 for simplicity
-        if (blk == 0) return 0;
-        inode.block[logical_block] = blk;
-        inode.blocks += block_size / 512;
-        _ = writeInode(inode_num, inode);
-        return blk;
-    }
-
-    // Single indirect
-    const indirect_base = EXT2_INODE_DIRECT;
-    const ptrs_per_block = block_size / 4;
-
-    if (logical_block < indirect_base + ptrs_per_block) {
-        var ind_new = false;
-        if (inode.block[12] == 0) {
-            const ind_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk
-            if (ind_blk == 0) return 0;
-            inode.block[12] = ind_blk;
-            inode.blocks += block_size / 512;
-            ind_new = true;
-        }
-
-        const index = logical_block - indirect_base;
-        const buf: [*]u8 = &ensure_ind_buf[0];
-        var ref = getIndirectMutable(inode.block[12], ind_new, buf) orelse return 0;
-
-        if (ref.ptrs[index] == 0) {
-            const blk = allocBlock(0, skip_zero);
+    const ppb = eu.ptrsPerBlock(block_size);
+    switch (eu.classifyLogicalBlock(logical_block, ppb)) {
+        .direct => |i| {
+            if (inode.block[i] != 0) return inode.block[i];
+            const blk = allocBlock(0, skip_zero); // allocate from group 0 for simplicity
             if (blk == 0) return 0;
-            if (!revalidateIndirect(&ref, buf)) return 0;
-            ref.ptrs[index] = blk;
+            inode.block[i] = blk;
             inode.blocks += block_size / 512;
-            flushIndirect(ref);
-        }
-        const result = ref.ptrs[index];
-        _ = writeInode(inode_num, inode);
-        return result;
+            _ = writeInode(inode_num, inode);
+            return blk;
+        },
+        .single => |i| {
+            const root = ensureIndirectRoot(inode, 12) orelse return 0;
+            const buf: [*]u8 = &ensure_ind_buf[0];
+            var ref = getIndirectMutable(root.block, root.is_new, buf) orelse return 0;
+            const result = ensureDataPtr(&ref, buf, i, inode, skip_zero);
+            if (result == 0) return 0;
+            _ = writeInode(inode_num, inode);
+            return result;
+        },
+        .double => |d| {
+            const root = ensureIndirectRoot(inode, 13) orelse return 0;
+            const buf: [*]u8 = &ensure_ind_buf[0];
+            var dib_ref = getIndirectMutable(root.block, root.is_new, buf) orelse return 0;
+            const child = ensureChildIndirect(&dib_ref, buf, d.idx1, inode) orelse return 0;
+            const si_buf: [*]u8 = &ensure_ind_buf[1];
+            var si_ref = getIndirectMutable(child.block, child.is_new, si_buf) orelse return 0;
+            const result = ensureDataPtr(&si_ref, si_buf, d.idx2, inode, skip_zero);
+            if (result == 0) return 0;
+            _ = writeInode(inode_num, inode);
+            return result;
+        },
+        .triple => |t| {
+            const root = ensureIndirectRoot(inode, 14) orelse return 0;
+            const tib_buf: [*]u8 = &ensure_ind_buf[0];
+            var tib_ref = getIndirectMutable(root.block, root.is_new, tib_buf) orelse return 0;
+            const dib = ensureChildIndirect(&tib_ref, tib_buf, t.idx1, inode) orelse return 0;
+            const dib_buf: [*]u8 = &ensure_ind_buf[1];
+            var dib_ref = getIndirectMutable(dib.block, dib.is_new, dib_buf) orelse return 0;
+            const sib = ensureChildIndirect(&dib_ref, dib_buf, t.idx2, inode) orelse return 0;
+            const sib_buf: [*]u8 = &ensure_ind_buf[2];
+            var sib_ref = getIndirectMutable(sib.block, sib.is_new, sib_buf) orelse return 0;
+            const result = ensureDataPtr(&sib_ref, sib_buf, t.idx3, inode, skip_zero);
+            if (result == 0) return 0;
+            _ = writeInode(inode_num, inode);
+            return result;
+        },
+        .out_of_range => return 0,
     }
-
-    // Double indirect: block[13] -> single indirect blocks -> data blocks
-    const dbl_base = indirect_base + ptrs_per_block;
-    if (logical_block < dbl_base + ptrs_per_block * ptrs_per_block) {
-        var dib_new = false;
-        if (inode.block[13] == 0) {
-            const dbl_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk
-            if (dbl_blk == 0) return 0;
-            inode.block[13] = dbl_blk;
-            inode.blocks += block_size / 512;
-            dib_new = true;
-        }
-
-        const rel = logical_block - dbl_base;
-        const idx1 = rel / ptrs_per_block;
-        const idx2 = rel % ptrs_per_block;
-
-        // v53.30: Zero-copy access to double indirect block
-        const buf: [*]u8 = &ensure_ind_buf[0];
-        var dib_ref = getIndirectMutable(inode.block[13], dib_new, buf) orelse return 0;
-
-        // Ensure single indirect block at idx1
-        var sib_new = false;
-        if (dib_ref.ptrs[idx1] == 0) {
-            const si_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk
-            if (si_blk == 0) return 0;
-            if (!revalidateIndirect(&dib_ref, buf)) return 0;
-            dib_ref.ptrs[idx1] = si_blk;
-            inode.blocks += block_size / 512;
-            flushIndirect(dib_ref);
-            sib_new = true;
-        }
-
-        // v53.30: Zero-copy access to single indirect block
-        const si_buf: [*]u8 = &ensure_ind_buf[1];
-        var si_ref = getIndirectMutable(dib_ref.ptrs[idx1], sib_new, si_buf) orelse return 0;
-
-        if (si_ref.ptrs[idx2] == 0) {
-            const blk = allocBlock(0, skip_zero);
-            if (blk == 0) return 0;
-            if (!revalidateIndirect(&si_ref, si_buf)) return 0;
-            si_ref.ptrs[idx2] = blk;
-            inode.blocks += block_size / 512;
-            flushIndirect(si_ref);
-        }
-        const result = si_ref.ptrs[idx2];
-        _ = writeInode(inode_num, inode);
-        return result;
-    }
-
-    // v53.6: Triple indirect: block[14] -> double indirect -> single indirect -> data blocks
-    const tri_base = dbl_base + ptrs_per_block * ptrs_per_block;
-    if (logical_block < tri_base + ptrs_per_block * ptrs_per_block * ptrs_per_block) {
-        var tib_new = false;
-        if (inode.block[14] == 0) {
-            const tri_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk
-            if (tri_blk == 0) return 0;
-            inode.block[14] = tri_blk;
-            inode.blocks += block_size / 512;
-            tib_new = true;
-        }
-
-        const rel = logical_block - tri_base;
-        const idx1 = rel / (ptrs_per_block * ptrs_per_block);
-        const rem1 = rel % (ptrs_per_block * ptrs_per_block);
-        const idx2 = rem1 / ptrs_per_block;
-        const idx3 = rem1 % ptrs_per_block;
-
-        // v53.30: Zero-copy access to triple indirect block
-        const tib_buf: [*]u8 = &ensure_ind_buf[0];
-        var tib_ref = getIndirectMutable(inode.block[14], tib_new, tib_buf) orelse return 0;
-
-        // Ensure double indirect block at idx1
-        var dib_new = false;
-        if (tib_ref.ptrs[idx1] == 0) {
-            const dbl_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk
-            if (dbl_blk == 0) return 0;
-            if (!revalidateIndirect(&tib_ref, tib_buf)) return 0;
-            tib_ref.ptrs[idx1] = dbl_blk;
-            inode.blocks += block_size / 512;
-            flushIndirect(tib_ref);
-            dib_new = true;
-        }
-
-        // v53.30: Zero-copy access to double indirect block
-        const dib_buf: [*]u8 = &ensure_ind_buf[1];
-        var dib_ref = getIndirectMutable(tib_ref.ptrs[idx1], dib_new, dib_buf) orelse return 0;
-
-        // Ensure single indirect block at idx2
-        var sib_new = false;
-        if (dib_ref.ptrs[idx2] == 0) {
-            const si_blk = allocBlock(0, false); // v53.25: indirect block — always zero on disk
-            if (si_blk == 0) return 0;
-            if (!revalidateIndirect(&dib_ref, dib_buf)) return 0;
-            dib_ref.ptrs[idx2] = si_blk;
-            inode.blocks += block_size / 512;
-            flushIndirect(dib_ref);
-            sib_new = true;
-        }
-
-        // v53.30: Zero-copy access to single indirect block
-        const sib_buf: [*]u8 = &ensure_ind_buf[2];
-        var sib_ref = getIndirectMutable(dib_ref.ptrs[idx2], sib_new, sib_buf) orelse return 0;
-
-        // Ensure data block at idx3
-        if (sib_ref.ptrs[idx3] == 0) {
-            const blk = allocBlock(0, skip_zero);
-            if (blk == 0) return 0;
-            if (!revalidateIndirect(&sib_ref, sib_buf)) return 0;
-            sib_ref.ptrs[idx3] = blk;
-            inode.blocks += block_size / 512;
-            flushIndirect(sib_ref);
-        }
-        const result = sib_ref.ptrs[idx3];
-        _ = writeInode(inode_num, inode);
-        return result;
-    }
-
-    return 0;
 }
 
 /// Write data to an ext2 file at the given offset.
