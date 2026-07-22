@@ -1344,7 +1344,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:可据 RA 前缀做 on-link 判定(SLAAC 地址生成留待后续)。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-83] ndp prefix on-link non-x86: OK`。
-- **后续**:启动时自动 RS;或 SLAAC 从 A-flag 前缀生成全球地址。
+- **后续**:见 3.84（SLAAC 地址生成,已完成)。
+
+---
+
+### 3.84 SLAAC 从 A-flag /64 生成全球地址（SK-84,2026-07-22）
+
+- **背景**:SK-83 有前缀表但未形成主机地址;无法作为全球 IPv6 源地址。
+- **方案**:`formSlaacAddress`(prefix||EUI-64);`installSlaac` 在 A-flag /64
+  且 lifetime>0 时安装,lifetime=0 时删除;RA 处理路径自动调用。
+  `shared/sk84.zig` 锁定形态与安装/清除。
+- **效果**:主机可从 RA 获得全球单播地址(DAD 与源地址选用留待后续)。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-84] ndp slaac address non-x86: OK`。
+- **后续**:启动时自动 RS;或 DAD(重复地址检测)后再标记 preferred。
 
 ---
 

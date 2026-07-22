@@ -147,10 +147,15 @@ fn handleRouterAdvertisement(src_ip: [16]u8, data: [*]const u8, len: u16) void {
         if (!ipv6.isUnspecified(src_ip)) ndp.update(src_ip, mac);
     }
     ndp.setDefaultRouter(src_ip, adv.router_lifetime_sec);
+    const our_mac = netif.getMac();
     var i: u8 = 0;
     while (i < adv.prefix_count) : (i += 1) {
         const p = adv.prefixes[i];
         ndp.setPrefix(p.prefix, p.prefix_len, p.on_link, p.autonomous, p.valid_lifetime);
+        // SK-84: A-flag /64 → form SLAAC address (or remove when lifetime 0).
+        if (p.autonomous) {
+            ndp.installSlaac(p.prefix, p.prefix_len, p.valid_lifetime, our_mac);
+        }
     }
 }
 

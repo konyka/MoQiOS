@@ -70,6 +70,16 @@ pub const PrefixEntry = struct {
 };
 var prefix_table: [MAX_PREFIXES]PrefixEntry = @splat(.{});
 
+/// SK-84: SLAAC addresses formed from A-flag /64 prefixes.
+pub const MAX_LOCAL_ADDRS: u32 = 4;
+const LocalAddr = struct {
+    addr: [16]u8 = @splat(0),
+    /// Matching PIO prefix length (always 64 for SLAAC today).
+    prefix_len: u8 = 0,
+    valid: bool = false,
+};
+var local_addrs: [MAX_LOCAL_ADDRS]LocalAddr = @splat(.{});
+
 // v53.40: Protect neighbor_cache against interrupt vs syscall races
 var ndp_lock: IrqSpinlock = .{};
 
@@ -87,6 +97,9 @@ pub fn init() void {
     default_router_valid = false;
     for (0..MAX_PREFIXES) |i| {
         prefix_table[i] = .{};
+    }
+    for (0..MAX_LOCAL_ADDRS) |i| {
+        local_addrs[i] = .{};
     }
 }
 
@@ -191,6 +204,84 @@ pub fn probePrefixCount() u32 {
     var n: u32 = 0;
     for (0..MAX_PREFIXES) |i| {
         if (prefix_table[i].valid) n += 1;
+    }
+    return n;
+}
+
+/// Form a /64 SLAAC address: prefix[0..8] || EUI-64(mac) (SK-84).
+pub fn formSlaacAddress(prefix: [16]u8, mac: [6]u8) [16]u8 {
+    var addr: [16]u8 = @splat(0);
+    @memcpy(addr[0..8], prefix[0..8]);
+    const iid = generateLinkLocal(mac);
+    @memcpy(addr[8..16], iid[8..16]);
+    return addr;
+}
+
+/// Install or remove a SLAAC address for an autonomous /64 prefix (SK-84).
+/// `valid_lifetime == 0` removes any address formed from this prefix.
+pub fn installSlaac(prefix: [16]u8, prefix_len: u8, valid_lifetime: u32, mac: [6]u8) void {
+    if (prefix_len != 64) return;
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+
+    if (valid_lifetime == 0) {
+        for (0..MAX_LOCAL_ADDRS) |i| {
+            const e = &local_addrs[i];
+            if (!e.valid) continue;
+            if (e.prefix_len == 64 and ipv6.prefixMatch(e.addr, prefix, 64)) {
+                e.* = .{};
+            }
+        }
+        return;
+    }
+
+    const addr = formSlaacAddress(prefix, mac);
+    // Refresh existing.
+    for (0..MAX_LOCAL_ADDRS) |i| {
+        const e = &local_addrs[i];
+        if (e.valid and ipv6.addrEq(e.addr, addr)) {
+            e.prefix_len = 64;
+            return;
+        }
+    }
+    // Insert.
+    for (0..MAX_LOCAL_ADDRS) |i| {
+        const e = &local_addrs[i];
+        if (!e.valid) {
+            e.* = .{ .addr = addr, .prefix_len = 64, .valid = true };
+            return;
+        }
+    }
+}
+
+/// True when `addr` is a configured local IPv6 address (SK-84).
+pub fn hasLocalAddress(addr: [16]u8) bool {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    for (0..MAX_LOCAL_ADDRS) |i| {
+        if (local_addrs[i].valid and ipv6.addrEq(local_addrs[i].addr, addr)) return true;
+    }
+    return false;
+}
+
+/// First configured non-link-local address, if any (SK-84).
+pub fn getGlobalAddress() ?[16]u8 {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    for (0..MAX_LOCAL_ADDRS) |i| {
+        if (!local_addrs[i].valid) continue;
+        if (!ipv6.isLinkLocal(local_addrs[i].addr)) return local_addrs[i].addr;
+    }
+    return null;
+}
+
+/// Probe helper (SK-84): number of configured local addresses.
+pub fn probeLocalAddrCount() u32 {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    var n: u32 = 0;
+    for (0..MAX_LOCAL_ADDRS) |i| {
+        if (local_addrs[i].valid) n += 1;
     }
     return n;
 }
