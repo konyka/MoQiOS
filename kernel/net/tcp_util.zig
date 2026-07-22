@@ -66,6 +66,18 @@ pub fn checksum(src_ip: [4]u8, dst_ip: [4]u8, tcp_hdr: [*]const u8, tcp_len: u16
     return @truncate(~sum);
 }
 
+/// True when an IPv6 TCP 4-tuple matches (SK-75 demux helper).
+pub fn tupleMatchV6(
+    local_port: u16,
+    remote_port: u16,
+    remote_ip: [16]u8,
+    cand_local: u16,
+    cand_remote: u16,
+    cand_ip: [16]u8,
+) bool {
+    return local_port == cand_local and remote_port == cand_remote and ipv6.addrEq(remote_ip, cand_ip);
+}
+
 /// TCP checksum over the IPv6 pseudo-header + segment (RFC 8200 §8.1).
 /// Bytes 16..17 of `data` (on-wire checksum) are treated as zero so this works
 /// for both building and verifying. A computed 0 is transmitted as 0xFFFF.

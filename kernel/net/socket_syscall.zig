@@ -78,12 +78,16 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
         return -1;
     }
 
-    // AF_INET6 — UDP uses the IPv6 stack (SK-70/71); TCP still shares IPv4 TCBs.
+    // AF_INET6 — UDP uses the IPv6 stack (SK-70/71); TCP marks TCB is_v6 (SK-75).
     if (domain == 10) {
         if (sock_type == 1) {
-            // SOCK_STREAM → TCP socket (IPv4 TCB until TCP/IPv6 lands)
+            // SOCK_STREAM → IPv6 TCP socket (TX SYN-ACK still SK-76)
             const tcb_idx6 = net_mod.tcp.tcpSocket(cur_idx);
             if (tcb_idx6 < 0) return -1;
+            if (net_mod.tcp.tcpSetIpv6(@intCast(tcb_idx6)) < 0) {
+                _ = net_mod.tcp.tcpClose(@intCast(tcb_idx6));
+                return -1;
+            }
             const fd6 = allocTcpFd(&t.fd_table, @intCast(tcb_idx6));
             if (fd6 < 0) {
                 _ = net_mod.tcp.tcpClose(@intCast(tcb_idx6));

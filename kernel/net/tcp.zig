@@ -19,6 +19,7 @@ const nic = @import("nic.zig");
 const netif = @import("netif.zig");
 const eth = @import("eth.zig");
 const ipv4 = @import("ipv4.zig");
+const ipv6 = @import("ipv6.zig");
 const arp = @import("arp.zig");
 const socket_opt = @import("socket_opt.zig");
 const bo = @import("../lib/byte_order.zig");
@@ -112,6 +113,9 @@ const TcpTcb = struct {
     local_port: u16,
     remote_port: u16,
     remote_ip: [4]u8,
+    /// SK-75: dual-stack — when true, `remote_ip6` is the peer address.
+    is_v6: bool = false,
+    remote_ip6: [16]u8 = @splat(0),
     state: TcpState,
 
     // Sequence numbers
@@ -210,11 +214,25 @@ inline fn deactivateTcb(tcb: *TcpTcb) void {
 
 pub fn initTcbs() void {
     @atomicStore(u64, &tcb_active_bitmap, 0, .release);
+    listen_active_bitmap = 0;
+    for (0..MAX_CONNECTIONS) |i| {
+        listen_slots[i] = .{
+            .active = false,
+            .local_port = 0,
+            .owner_task = 0,
+            .is_v6 = false,
+            .pending_tpbs = @splat(0),
+            .pending_head = 0,
+            .pending_tail = 0,
+        };
+    }
     for (0..MAX_CONNECTIONS) |i| {
         tcbs[i] = .{
             .local_port = 0,
             .remote_port = 0,
             .remote_ip = .{0} ** 4,
+            .is_v6 = false,
+            .remote_ip6 = @splat(0),
             .state = .closed,
             .snd_una = 0,
             .snd_nxt = 0,
@@ -306,6 +324,9 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].delayed_ack_ms = 0;
     tcbs[i].ref_count = 1;
     tcbs[i].options = .{};
+    tcbs[i].is_v6 = false;
+    tcbs[i].remote_ip6 = @splat(0);
+    tcbs[i].remote_ip = .{ 0, 0, 0, 0 };
     return &tcbs[i];
 }
 
@@ -323,9 +344,26 @@ fn findTcbByTuple(local_port: u16, remote_port: u16, remote_ip: [4]u8) ?*TcpTcb 
     while (bm != 0) {
         const i = @ctz(bm);
         bm &= bm - 1; // clear lowest set bit
-        if (tcbs[i].local_port == local_port and
+        if (!tcbs[i].is_v6 and
+            tcbs[i].local_port == local_port and
             tcbs[i].remote_port == remote_port and
             @as(u32, @bitCast(tcbs[i].remote_ip)) == @as(u32, @bitCast(remote_ip)))
+        {
+            return &tcbs[i];
+        }
+    }
+    return null;
+}
+
+fn findTcbByTupleV6(local_port: u16, remote_port: u16, remote_ip6: [16]u8) ?*TcpTcb {
+    var bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
+    while (bm != 0) {
+        const i = @ctz(bm);
+        bm &= bm - 1;
+        if (tcbs[i].is_v6 and
+            tcbs[i].local_port == local_port and
+            tcbs[i].remote_port == remote_port and
+            ipv6.addrEq(tcbs[i].remote_ip6, remote_ip6))
         {
             return &tcbs[i];
         }
@@ -404,6 +442,8 @@ fn ringDataLen(head: u32, tail: u32, size: u32) u32 {
 /// When `include_options` is true (SYN/SYN-ACK segments), TCP options are
 /// included: Window Scaling option (kind 3) and Timestamps option (kind 8).
 fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
+    // SK-75: IPv6 TCBs demux/listen; TX via sendSegmentV6 lands in SK-76.
+    if (tcb.is_v6) return false;
     var send_pkt: [1518]u8 = @splat(0);
     const dst_mac = arp.resolve(tcb.remote_ip) orelse {
         tcpLog("[tcp] ARP resolution failed\n");
@@ -567,8 +607,8 @@ fn tcpChecksumV6(src_ip: [16]u8, dst_ip: [16]u8, tcp_hdr: [*]const u8, tcp_len: 
     return tcp_util.checksumV6(src_ip, dst_ip, tcp_hdr, tcp_len);
 }
 
-/// IPv6 TCP receive gate (SK-74): enforce mandatory checksum, then drop.
-/// Full TCB demux / SYN-ACK / sendSegmentV6 land in later SK steps.
+/// IPv6 TCP receive (SK-74/75): mandatory checksum, then TCB demux / listen SYN.
+/// Established segment processing and SYN-ACK TX (`sendSegmentV6`) are SK-76+.
 pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32) void {
     if (len < 20) return;
     const tcp_len: u16 = @intCast(@min(len, 0xFFFF));
@@ -580,7 +620,26 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
     const expect = tcpChecksumV6(src_ip, dst_ip, data, tcp_len);
     if (wire_csum != expect) return;
 
-    // Checksum OK — connection matching deferred until TCB grows IPv6 fields.
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+
+    const src_port = bo.readU16BeAt(data, 0);
+    const dst_port = bo.readU16BeAt(data, 2);
+    const seq_num = bo.readU32BeAt(data, 4);
+    const flags = data[13];
+    const raw_window = bo.readU16BeAt(data, 14);
+    const opts = parseTcpOptions(data, data_offset);
+
+    const tcb = findTcbByTupleV6(dst_port, src_port, src_ip) orelse {
+        if (flags & SYN != 0) {
+            handleIncomingSynV6(src_ip, src_port, dst_port, seq_num, raw_window, opts);
+        }
+        return;
+    };
+
+    // Demux hit: mark activity. Full state-machine share with IPv4 is SK-76.
+    tcb.idle_ms = 0;
+    if (opts.ts_val) |tv| tcb.ts_recent = tv;
 }
 
 // ─── Incoming Packet Handling ─────────────────────────────────────────────
@@ -686,7 +745,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
     while (lbm != 0) {
         const i = @ctz(lbm);
         lbm &= lbm - 1;
-        if (listen_slots[i].local_port == dst_port) {
+        if (listen_slots[i].local_port == dst_port and !listen_slots[i].is_v6) {
             slot = &listen_slots[i];
             break;
         }
@@ -699,6 +758,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
         const i = @ctz(tw_bm);
         tw_bm &= tw_bm - 1;
         if (tcbs[i].state == .time_wait and
+            !tcbs[i].is_v6 and
             tcbs[i].local_port == dst_port and
             tcbs[i].remote_port == src_port and
             @as(u32, @bitCast(seq_num -% tcbs[i].irs)) > 0)
@@ -777,6 +837,91 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
     const new_idx = tcbIdx(new_tcb);
 
     // Queue in listen backlog (will be moved to established when ACK arrives)
+    ls.pending_tpbs[ls.pending_tail % LISTEN_BACKLOG] = new_idx;
+    ls.pending_tail += 1;
+}
+
+/// IPv6 listen SYN (SK-75). Creates a SYN_RECEIVED TCB; SYN-ACK TX is SK-76.
+fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions) void {
+    _ = _w;
+    var slot: ?*ListenSlot = null;
+    var lbm = listen_active_bitmap;
+    while (lbm != 0) {
+        const i = @ctz(lbm);
+        lbm &= lbm - 1;
+        if (listen_slots[i].local_port == dst_port and listen_slots[i].is_v6) {
+            slot = &listen_slots[i];
+            break;
+        }
+    }
+    const ls = slot orelse return;
+
+    var tw_bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
+    while (tw_bm != 0) {
+        const i = @ctz(tw_bm);
+        tw_bm &= tw_bm - 1;
+        if (tcbs[i].state == .time_wait and
+            tcbs[i].is_v6 and
+            tcbs[i].local_port == dst_port and
+            tcbs[i].remote_port == src_port and
+            ipv6.addrEq(tcbs[i].remote_ip6, src_ip) and
+            @as(u32, @bitCast(seq_num -% tcbs[i].irs)) > 0)
+        {
+            const reuse_tcb = &tcbs[i];
+            reuse_tcb.iss = generateIss();
+            reuse_tcb.snd_una = reuse_tcb.iss;
+            reuse_tcb.snd_nxt = reuse_tcb.iss;
+            reuse_tcb.irs = seq_num;
+            reuse_tcb.rcv_nxt = seq_num + 1;
+            reuse_tcb.rcv_wnd = TCP_WINDOW;
+            reuse_tcb.state = .syn_received;
+            reuse_tcb.retransmit_timer = 0;
+            reuse_tcb.sack_block_count = 0;
+            reuse_tcb.sack_scoreboard_count = 0;
+            if (opts.ws_shift) |peer_ws| {
+                reuse_tcb.snd_wnd_scale = peer_ws;
+                reuse_tcb.ws_enabled = true;
+            }
+            if (opts.ts_val) |tv| {
+                reuse_tcb.ts_recent = tv;
+                reuse_tcb.ts_enabled = true;
+            }
+            if (opts.sack_permitted) reuse_tcb.sack_permitted = true;
+            _ = sendSegment(reuse_tcb, SYN | ACK, undefined, 0);
+            return;
+        }
+    }
+
+    if (ls.pending_tail -% ls.pending_head >= LISTEN_BACKLOG) return;
+
+    const new_tcb = allocTcb() orelse return;
+    new_tcb.local_port = dst_port;
+    new_tcb.remote_port = src_port;
+    new_tcb.is_v6 = true;
+    new_tcb.remote_ip6 = src_ip;
+    new_tcb.owner_task = ls.owner_task;
+    new_tcb.iss = generateIss();
+    new_tcb.snd_una = new_tcb.iss;
+    new_tcb.snd_nxt = new_tcb.iss;
+    new_tcb.snd_wnd = TCP_WINDOW;
+    new_tcb.irs = seq_num;
+    new_tcb.rcv_nxt = seq_num + 1;
+    new_tcb.rcv_wnd = TCP_WINDOW;
+    new_tcb.state = .syn_received;
+
+    if (opts.ws_shift) |peer_ws| {
+        new_tcb.snd_wnd_scale = peer_ws;
+        new_tcb.ws_enabled = true;
+    }
+    if (opts.ts_val) |tv| {
+        new_tcb.ts_recent = tv;
+        new_tcb.ts_enabled = true;
+    }
+    if (opts.sack_permitted) new_tcb.sack_permitted = true;
+
+    _ = sendSegment(new_tcb, SYN | ACK, undefined, 0);
+
+    const new_idx = tcbIdx(new_tcb);
     ls.pending_tpbs[ls.pending_tail % LISTEN_BACKLOG] = new_idx;
     ls.pending_tail += 1;
 }
@@ -1623,6 +1768,7 @@ const ListenSlot = struct {
     active: bool = false,
     local_port: u16 = 0,
     owner_task: u32 = 0,
+    is_v6: bool = false,
     pending_tpbs: [LISTEN_BACKLOG]u32, // TCB indices of pending connections (SYN_RECEIVED)
     // v53.50: Ring buffer indices — O(1) enqueue/dequeue instead of O(N) array shift
     pending_head: u32 = 0,
@@ -1633,6 +1779,7 @@ var listen_slots: [MAX_CONNECTIONS]ListenSlot = @splat(.{
     .active = false,
     .local_port = 0,
     .owner_task = 0,
+    .is_v6 = false,
     .pending_tpbs = @splat(0),
     .pending_head = 0,
     .pending_tail = 0,
@@ -1651,6 +1798,17 @@ pub fn tcpSocket(owner_task: u32) i64 {
     tcb.state = .closed;
 
     return @intCast(tcbIdx(tcb));
+}
+
+/// Mark a closed TCB as IPv6 (SK-75). Call after `tcpSocket` for AF_INET6.
+pub fn tcpSetIpv6(tcb_idx: u32) i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS) return -1;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active or tcb.state != .closed) return -1;
+    tcb.is_v6 = true;
+    return 0;
 }
 
 /// Bind a TCB to a local port.
@@ -1700,10 +1858,40 @@ pub fn tcpListen(tcb_idx: u32) i64 {
     listen_slots[i].active = true;
     listen_slots[i].local_port = tcb.local_port;
     listen_slots[i].owner_task = tcb.owner_task;
+    listen_slots[i].is_v6 = tcb.is_v6;
     listen_slots[i].pending_head = 0;
     listen_slots[i].pending_tail = 0;
     listen_slots[i].pending_tpbs = @splat(0);
     return 0;
+}
+
+/// Probe helper (SK-75): seed an established IPv6 TCB for demux tests.
+pub fn tcpProbeSeedV6(local_port: u16, remote_port: u16, remote_ip6: [16]u8) i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    const tcb = allocTcb() orelse return -1;
+    tcb.is_v6 = true;
+    tcb.local_port = local_port;
+    tcb.remote_port = remote_port;
+    tcb.remote_ip6 = remote_ip6;
+    tcb.state = .established;
+    tcb.idle_ms = 999;
+    return @intCast(tcbIdx(tcb));
+}
+
+/// Probe helper: true when an IPv6 TCB matches the tuple.
+pub fn tcpProbeHasV6(local_port: u16, remote_port: u16, remote_ip6: [16]u8) bool {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    return findTcbByTupleV6(local_port, remote_port, remote_ip6) != null;
+}
+
+/// Probe helper: idle_ms of a seeded TCB (or maxInt if missing).
+pub fn tcpProbeIdleV6(tcb_idx: u32) u32 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return 0xFFFF_FFFF;
+    return tcbs[tcb_idx].idle_ms;
 }
 
 /// Accept a pending connection on a listening socket.

@@ -1216,8 +1216,23 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:错误的 IPv6 TCP 段不再静默落入空分支;为后续 TCB/v6 TX 铺路。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-74] tcp over ipv6 checksum/rx gate non-x86: OK`。
-- **后续**:TCB `remote_ip6` + `findTcbByTupleV6` / listen SYN;或 `sendSegmentV6`
-  + NDP TX;或 NS 重传状态机。
+- **后续**:见 3.75（TCB IPv6 demux / listen SYN,已完成)。
+
+---
+
+### 3.75 TCP IPv6 TCB demux 与 listen SYN（SK-75,2026-07-22）
+
+- **背景**:SK-74 校验通过后直接丢弃;TCB 无 IPv6 地址字段,listen 不区分族,
+  `AF_INET6` SOCK_STREAM 未标记 IPv6。
+- **方案**:TCB/`ListenSlot` 增加 `is_v6` + `remote_ip6`;`findTcbByTupleV6`;
+  IPv4 demux 跳过 v6 项。`handlePacketV6` 校验后 demux(命中清 `idle_ms`)或
+  `handleIncomingSynV6`。`tcpSetIpv6` + syscall 置位;`sendSegment` 对 v6 暂返回
+  false(TX 留给 SK-76)。`tcp_util.tupleMatchV6` + `shared/sk75.zig`。
+- **效果**:IPv6 TCP 可匹配已有连接并接受 listen SYN 入 SYN_RECEIVED;SYN-ACK
+  发送与完整状态机共享为下一步。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-75] tcp ipv6 tcb demux non-x86: OK`。
+- **后续**:`sendSegmentV6` + NDP TX + 与 IPv4 共享 established 处理;或 NS 重传。
 
 ---
 
