@@ -61,7 +61,7 @@ pub fn handleRxPacket(data: [*]const u8, len: u32) void {
                     // TODO: tcp over ipv6 integration
                 },
                 ipv6.PROTO_UDP => {
-                    // TODO: udp over ipv6 integration
+                    udp.handlePacketV6(info6.src_ip, info6.dst_ip, data + payload_start6, info6.payload_len);
                 },
                 else => {},
             }

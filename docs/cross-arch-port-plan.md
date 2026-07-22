@@ -1142,8 +1142,23 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:单条 LFN+短项可跨越扇区与簇边界落盘;放置规则可在非 x86 纯验证。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-69] fat32 cross-sector dir run non-x86: OK`。
-- **后续**:其它 fs/net 纯层(如 `kernel/net` 上 tcp/udp over IPv6 TODO),或
-  更深目录(非根)的同样跨扇区放置。
+- **后续**:见 3.70（UDP over IPv6 栈层,已完成)。
+
+---
+
+### 3.70 UDP over IPv6 接收/发送（SK-70,2026-07-22）
+
+- **背景**:`mod.zig` 对 IPv6 `PROTO_UDP` 仍为空 TODO;AF_INET6 套接字在
+  syscall 层回落到 IPv4 UDP 机器,栈层无法投递或发出 IPv6 UDP。
+- **方案**:新增 `udp_util`(头解析 + 强制 IPv6 UDP 校验和)。`udp.zig` 队列项
+  扩为 `[16]u8` + `is_v6` 标志;`handlePacketV6`/`recvFromV6`/`sendToV6`
+  (NDP lookup,缺邻则 `markIncomplete`;源地址用 link-local)。`mod.zig` 接线
+  RX。`shared/sk70.zig` 锁定校验和、零校验拒绝、v4/v6 队列隔离与 NDP TX。
+- **效果**:内核可收发 IPv6 UDP(链路本地 + 已解析邻居);IPv4 路径与 SK-53 不回归。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-70] udp over ipv6 non-x86: OK`。
+- **后续**:SK-71 — `sockaddr_in6` 的 bind/sendto/recvfrom/connect;或 TCP over
+  IPv6;或 NDP Neighbor Solicitation TX。
 
 ---
 
