@@ -524,6 +524,62 @@ pub fn encodeLfnEntry(out: [*]u8, seq: u8, is_last: bool, checksum: u8, chars: [
     }
 }
 
+/// True if the 11-byte short name already appears as a non-LFN/non-volume entry
+/// in a 512-byte directory sector.
+pub fn shortNameTaken(sector: [*]const u8, short_name: *const [11]u8) bool {
+    for (0..16) |i| {
+        const off = i * 32;
+        if (sector[off] == 0x00) break;
+        if (sector[off] == 0xE5) continue;
+        const attr = sector[off + 11];
+        if (isLfnAttr(attr) or isVolumeLabelAttr(attr)) continue;
+        var same = true;
+        for (0..11) |j| {
+            if (sector[off + j] != short_name[j]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) return true;
+    }
+    return false;
+}
+
+/// Find `need` consecutive free (0x00/0xE5) directory slots in one sector.
+/// Returns the starting entry index (0..15), or null.
+pub fn findConsecutiveFree(sector: [*]const u8, need: u32) ?u32 {
+    if (need == 0 or need > 16) return null;
+    var run_start: ?u32 = null;
+    var run_len: u32 = 0;
+    for (0..16) |i| {
+        const off = i * 32;
+        const free = sector[off] == 0x00 or sector[off] == 0xE5;
+        if (free) {
+            if (run_start == null) run_start = @intCast(i);
+            run_len += 1;
+            if (run_len >= need) return run_start;
+            // A 0x00 free slot means the rest of the directory is empty —
+            // remaining slots in this sector are also free for our purposes.
+            if (sector[off] == 0x00) {
+                const avail = 16 - (run_start orelse @as(u32, @intCast(i)));
+                if (avail >= need) return run_start;
+            }
+        } else {
+            run_start = null;
+            run_len = 0;
+        }
+    }
+    return null;
+}
+
+/// True if this sector contains an end-of-directory marker (first-byte 0x00).
+pub fn sectorHasDirEnd(sector: [*]const u8) bool {
+    for (0..16) |i| {
+        if (sector[i * 32] == 0x00) return true;
+    }
+    return false;
+}
+
 /// Build forward-scan-ordered LFN entries for `utf8_name` keyed to `short_name`.
 /// Returns the number of 32-byte slots written into `out_entries`, or null.
 pub fn buildLfnEntries(

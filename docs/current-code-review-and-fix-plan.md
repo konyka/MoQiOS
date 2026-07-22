@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-22 (SK-67 FAT32 LFN encode/createFile + prior SK-66 reviewed and verified)
+> Last update: 2026-07-22 (SK-68 FAT32 cross-sector dir slots + prior SK-67 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -399,6 +399,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | ext2 ensure duplication | `ensureBlock` still hand-rolled the same bounds and repeated root/child/data ensure ladders. | SK-65: same classifier; `ensureIndirectRoot` / `ensureChildIndirect` / `ensureDataPtr`; `indirectRootSlot` + probe lock the resolve/ensure contract. |
 | FAT32 long names skipped | `listRootDir` ignored LFN slots and only exposed 8.3 names. | SK-66: `assembleLfnUtf8` + driver pending-chain; checksum/surrogate validated on non-x86. |
 | FAT32 long-name create | `createFile` capped at 12 chars and wrote only 8.3 entries. | SK-67: `buildLfnEntries`/`make83Alias` + consecutive-slot write; round-trip probed on non-x86. |
+| FAT32 root first-sector only | `listRootDir`/`createFile` ignored later sectors/clusters in the root chain. | SK-68: full sector/cluster walk + optional `growRootDir`; placement helpers in `fat32_util`. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -408,8 +409,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-67] fat32 LFN encode/alias non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-67] fat32 LFN encode/alias non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-68] fat32 dir slot placement non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-68] fat32 dir slot placement non-x86: OK`. |
 
 ### 5.3 Historical Verification
 

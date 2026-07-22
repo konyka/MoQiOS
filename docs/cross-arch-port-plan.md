@@ -1108,7 +1108,24 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   分配。短名行为保持兼容。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-67] fat32 LFN encode/alias non-x86: OK`。
-- **后续**:跨扇区连续目录槽分配,或其它 fs/net 纯层。
+- **后续**:见 3.68（跨扇区/簇目录槽分配,已完成)。
+
+---
+
+### 3.68 FAT32 跨扇区/簇连续目录槽分配（SK-68,2026-07-22）
+
+- **背景**:SK-67 的 `createFile`/`listRootDir` 只读根目录首扇区,长名 LFN
+  链与位于后续扇区/簇的文件会被漏列或无法创建;`findConsecutiveFree`/
+  `shortNameTaken` 仍内联在驱动里。
+- **方案**:两函数 + `sectorHasDirEnd` 迁入 `fat32_util`。`listRootDir` 遍历
+  每簇全部扇区;`createFile` 全链扫描别名冲突与连续空槽,满则
+  `growRootDir` 追加清零簇后重试。`shared/sk68.zig` 锁定空扇区/部分占用/
+  间隙 run、短名占用与 LFN 跳过规则。
+- **效果**:根目录列表与创建覆盖完整簇链;槽位搜索纯函数可移植验证;满目录
+  可增长而非静默失败。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-68] fat32 dir slot placement non-x86: OK`。
+- **后续**:跨扇区的单条 LFN 链(槽跨越扇区边界),或其它 fs/net 纯层。
 
 ---
 

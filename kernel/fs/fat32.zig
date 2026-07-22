@@ -222,79 +222,79 @@ fn listRootDir() void {
     var lfn_raw: [fat_util.MAX_LFN_SLOTS][32]u8 = undefined;
     var lfn_count: u32 = 0;
 
-    while (cluster >= 2 and cluster < 0x0FFFFFF8) {
-        const lba = clusterToLBA(cluster);
+    root_scan: while (cluster >= 2 and cluster < 0x0FFFFFF8) {
+        const base_lba = clusterToLBA(cluster);
+        // SK-68: every sector in the cluster (not only the first).
+        var sec: u32 = 0;
+        while (sec < fat32_sectors_per_cluster) : (sec += 1) {
+            const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
+            const n = virtio_blk.readSectors(base_lba + sec, 1, buf);
+            if (n <= 0) break :root_scan;
 
-        // Read cluster sectors into buffer
-        const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
-        const n = virtio_blk.readSectors(lba, 1, buf);
-        if (n <= 0) break;
+            var entry_idx: u32 = 0;
+            while (entry_idx < 16 and file_count < MAX_FILES) : (entry_idx += 1) {
+                const entry_off = entry_idx * 32;
+                const first_byte = buf[entry_off];
 
-        // Parse directory entries (32 bytes each, 16 per sector)
-        var entry_idx: u32 = 0;
-        while (entry_idx < 16 and file_count < MAX_FILES) : (entry_idx += 1) {
-            const entry_off = entry_idx * 32;
-            const first_byte = buf[entry_off];
+                if (first_byte == 0x00) break :root_scan; // End of directory
+                if (first_byte == 0xE5) {
+                    lfn_count = 0; // orphaned LFN chain
+                    continue;
+                }
+                const attr = buf[entry_off + 11];
+                if (fat_util.isLfnAttr(attr)) {
+                    if (lfn_count < fat_util.MAX_LFN_SLOTS) {
+                        @memcpy(lfn_raw[lfn_count][0..32], (buf + entry_off)[0..32]);
+                        lfn_count += 1;
+                    } else {
+                        lfn_count = 0;
+                    }
+                    continue;
+                }
+                if (fat_util.isVolumeLabelAttr(attr)) {
+                    lfn_count = 0;
+                    continue;
+                }
 
-            if (first_byte == 0x00) break; // End of directory
-            if (first_byte == 0xE5) {
-                lfn_count = 0; // orphaned LFN chain
-                continue;
-            }
-            const attr = buf[entry_off + 11];
-            if (fat_util.isLfnAttr(attr)) {
-                if (lfn_count < fat_util.MAX_LFN_SLOTS) {
-                    @memcpy(lfn_raw[lfn_count][0..32], (buf + entry_off)[0..32]);
-                    lfn_count += 1;
-                } else {
+                const entry = buf + entry_off;
+                var fi = FileInfo{
+                    .name = @splat(0),
+                    .name_len = 0,
+                    .size = fat_util.dirEntrySize(entry),
+                    .first_cluster = fat_util.dirEntryFirstCluster(entry),
+                    .last_cluster = 0,
+                    .is_dir = fat_util.isDirectoryAttr(attr),
+                };
+
+                var short_name: [11]u8 = undefined;
+                @memcpy(short_name[0..11], entry[0..11]);
+                var ni: u32 = 0;
+                if (lfn_count > 0) {
+                    var ptrs: [fat_util.MAX_LFN_SLOTS][*]const u8 = undefined;
+                    for (0..lfn_count) |i| ptrs[i] = &lfn_raw[i];
+                    if (fat_util.assembleLfnUtf8(ptrs[0..lfn_count], &short_name, fi.name[0..])) |nlen| {
+                        ni = nlen;
+                    }
                     lfn_count = 0;
                 }
-                continue;
-            }
-            if (fat_util.isVolumeLabelAttr(attr)) {
-                lfn_count = 0;
-                continue;
-            }
-
-            const entry = buf + entry_off;
-            var fi = FileInfo{
-                .name = @splat(0),
-                .name_len = 0,
-                .size = fat_util.dirEntrySize(entry),
-                .first_cluster = fat_util.dirEntryFirstCluster(entry),
-                .last_cluster = 0,
-                .is_dir = fat_util.isDirectoryAttr(attr),
-            };
-
-            var short_name: [11]u8 = undefined;
-            @memcpy(short_name[0..11], entry[0..11]);
-            // Prefer assembled LFN when a valid chain precedes this short entry.
-            var ni: u32 = 0;
-            if (lfn_count > 0) {
-                var ptrs: [fat_util.MAX_LFN_SLOTS][*]const u8 = undefined;
-                for (0..lfn_count) |i| ptrs[i] = &lfn_raw[i];
-                if (fat_util.assembleLfnUtf8(ptrs[0..lfn_count], &short_name, fi.name[0..])) |nlen| {
-                    ni = nlen;
+                if (ni == 0) {
+                    ni = fat_util.decode83Name(&short_name, fi.name[0..]);
                 }
-                lfn_count = 0;
-            }
-            if (ni == 0) {
-                ni = fat_util.decode83Name(&short_name, fi.name[0..]);
-            }
-            fi.name_len = ni;
+                fi.name_len = ni;
 
-            if (ni > 0) {
-                files[file_count] = fi;
-                file_count += 1;
+                if (ni > 0) {
+                    files[file_count] = fi;
+                    file_count += 1;
 
-                serial.writeString("[fs]   ");
-                serial.writeString(fi.name[0..ni]);
-                if (fi.is_dir) serial.writeString("/");
-                serial.writeString(" size=");
-                fmt.writeDecimal(fi.size);
-                serial.writeString(" cluster=");
-                fmt.writeDecimal(fi.first_cluster);
-                serial.writeString("\n");
+                    serial.writeString("[fs]   ");
+                    serial.writeString(fi.name[0..ni]);
+                    if (fi.is_dir) serial.writeString("/");
+                    serial.writeString(" size=");
+                    fmt.writeDecimal(fi.size);
+                    serial.writeString(" cluster=");
+                    fmt.writeDecimal(fi.first_cluster);
+                    serial.writeString("\n");
+                }
             }
         }
 
@@ -528,50 +528,61 @@ fn zeroCluster(cluster: u32) void {
     }
 }
 
-/// True if the 11-byte short name already appears as a non-LFN/non-volume entry.
-fn shortNameTaken(sector: [*]const u8, short_name: *const [11]u8) bool {
-    for (0..16) |i| {
-        const off = i * 32;
-        if (sector[off] == 0x00) break;
-        if (sector[off] == 0xE5) continue;
-        const attr = sector[off + 11];
-        if (fat_util.isLfnAttr(attr) or fat_util.isVolumeLabelAttr(attr)) continue;
-        var same = true;
-        for (0..11) |j| {
-            if (sector[off + j] != short_name[j]) {
-                same = false;
-                break;
-            }
+const DirPlace = struct {
+    lba: u32,
+    entry_index: u32,
+};
+
+/// SK-68: walk every sector of the root cluster chain.
+fn shortNameTakenInRoot(short_name: *const [11]u8) bool {
+    var cluster: u32 = fat32_root_cluster;
+    var safety: u32 = 0;
+    while (cluster >= 2 and cluster < 0x0FFFFFF8 and safety < 65536) : (safety += 1) {
+        const base_lba = clusterToLBA(cluster);
+        var sec: u32 = 0;
+        while (sec < fat32_sectors_per_cluster) : (sec += 1) {
+            const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
+            if (virtio_blk.readSectors(base_lba + sec, 1, buf) <= 0) return true; // fail closed
+            if (fat_util.shortNameTaken(buf, short_name)) return true;
+            if (fat_util.sectorHasDirEnd(buf)) return false;
         }
-        if (same) return true;
+        cluster = getFATEntry(cluster);
     }
     return false;
 }
 
-/// Find `need` consecutive free (0x00/0xE5) directory slots in one sector.
-fn findConsecutiveFree(sector: [*]const u8, need: u32) ?u32 {
-    if (need == 0 or need > 16) return null;
-    var run_start: ?u32 = null;
-    var run_len: u32 = 0;
-    for (0..16) |i| {
-        const off = i * 32;
-        const free = sector[off] == 0x00 or sector[off] == 0xE5;
-        if (free) {
-            if (run_start == null) run_start = @intCast(i);
-            run_len += 1;
-            if (run_len >= need) return run_start;
-            // A 0x00 free slot means the rest of the directory is empty —
-            // remaining slots are also free for our purposes.
-            if (sector[off] == 0x00) {
-                const avail = 16 - (run_start orelse @as(u32, @intCast(i)));
-                if (avail >= need) return run_start;
+/// Find `need` consecutive free slots across all root sectors/clusters.
+fn findFreeRunInRoot(need: u32) ?DirPlace {
+    var cluster: u32 = fat32_root_cluster;
+    var safety: u32 = 0;
+    while (cluster >= 2 and cluster < 0x0FFFFFF8 and safety < 65536) : (safety += 1) {
+        const base_lba = clusterToLBA(cluster);
+        var sec: u32 = 0;
+        while (sec < fat32_sectors_per_cluster) : (sec += 1) {
+            const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
+            if (virtio_blk.readSectors(base_lba + sec, 1, buf) <= 0) return null;
+            if (fat_util.findConsecutiveFree(buf, need)) |idx| {
+                return .{ .lba = base_lba + sec, .entry_index = idx };
             }
-        } else {
-            run_start = null;
-            run_len = 0;
         }
+        cluster = getFATEntry(cluster);
     }
     return null;
+}
+
+/// Append a zeroed cluster to the root directory chain (when no free run exists).
+fn growRootDir() bool {
+    var cluster: u32 = fat32_root_cluster;
+    var last: u32 = cluster;
+    var safety: u32 = 0;
+    while (cluster >= 2 and cluster < 0x0FFFFFF8 and safety < 65536) : (safety += 1) {
+        last = cluster;
+        cluster = getFATEntry(cluster);
+    }
+    const nc = allocCluster() orelse return false;
+    zeroCluster(nc);
+    setFATEntry(last, nc);
+    return true;
 }
 
 pub fn createFile(name: []const u8) i64 {
@@ -595,11 +606,7 @@ pub fn createFile(name: []const u8) i64 {
     const new_cluster = allocCluster() orelse return -1;
     zeroCluster(new_cluster);
 
-    const root_lba = clusterToLBA(fat32_root_cluster);
-    const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
-    _ = virtio_blk.readSectors(root_lba, 1, buf);
-
-    // SK-67: short 8.3 path, or LFN chain + numeric-tilde alias for long names.
+    // SK-67/68: short 8.3 path, or LFN chain + numeric-tilde alias for long names.
     var short_name: [11]u8 = undefined;
     var lfn_slots: [fat_util.MAX_LFN_SLOTS][32]u8 = undefined;
     var lfn_count: u32 = 0;
@@ -609,21 +616,30 @@ pub fn createFile(name: []const u8) i64 {
         var suffix: u8 = 1;
         while (suffix <= 9) : (suffix += 1) {
             fat_util.make83Alias(name, suffix, &short_name);
-            if (!shortNameTaken(buf, &short_name)) break;
+            if (!shortNameTakenInRoot(&short_name)) break;
             if (suffix == 9) return -1;
         }
         lfn_count = fat_util.buildLfnEntries(name, &short_name, lfn_slots[0..]) orelse return -1;
     }
 
     const need = lfn_count + 1;
-    const free_entry = findConsecutiveFree(buf, need) orelse return -1;
+    var place = findFreeRunInRoot(need);
+    if (place == null) {
+        // Root cluster chain full of non-consecutive leftovers — grow once.
+        if (!growRootDir()) return -1;
+        place = findFreeRunInRoot(need);
+    }
+    const dest = place orelse return -1;
+
+    const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
+    if (virtio_blk.readSectors(dest.lba, 1, buf) <= 0) return -1;
 
     // Write LFN slots (forward-scan order) then the short entry.
     for (0..lfn_count) |i| {
-        const eoff = (free_entry + @as(u32, @intCast(i))) * 32;
+        const eoff = (dest.entry_index + @as(u32, @intCast(i))) * 32;
         @memcpy((buf + eoff)[0..32], lfn_slots[i][0..32]);
     }
-    const eoff = (free_entry + lfn_count) * 32;
+    const eoff = (dest.entry_index + lfn_count) * 32;
     const entry = buf + eoff;
     @memcpy(entry[0..11], short_name[0..11]);
     entry[11] = fat_util.ATTR_ARCHIVE;
@@ -644,7 +660,7 @@ pub fn createFile(name: []const u8) i64 {
     fat_util.setDirEntryFirstCluster(entry, new_cluster);
     fat_util.setDirEntrySize(entry, 0);
 
-    _ = safeWriteSectors(root_lba, 1, buf);
+    _ = safeWriteSectors(dest.lba, 1, buf);
 
     var fi = FileInfo{
         .name = @splat(0),
