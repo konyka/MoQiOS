@@ -1496,7 +1496,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:更具体前缀可走指定路由器,无需把全部流量绑在默认路由上。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-94] ndp route info rio non-x86: OK`。
-- **后续**:ICMPv6 Redirect 处理;或 RIO 与默认路由器 preference 统一。
+- **后续**:见 3.95（ICMPv6 Redirect,已完成)。
+
+---
+
+### 3.95 ICMPv6 Redirect 目的缓存（SK-95,2026-07-23）
+
+- **背景**:路由器可 Redirect 到更优第一跳,但主机忽略 type=137,流量仍走默认/RIO。
+- **方案**:解析 Redirect + Target LL;`isCurrentFirstHop` 校验源为当前第一跳后
+  `applyRedirect` 写入 Destination Cache;`resolveNextHop` 优先查缓存;600s 老化。
+  `shared/sk95.zig` 锁定解析、校验、选路切换与过期。
+- **效果**:可按路由器提示切换下一跳,降低次优默认路由上的绕行。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-95] ndp icmpv6 redirect non-x86: OK`。
+- **后续**:Redirected Header 选项;或 Destination Cache 与 NUD 联动失效。
 
 ---
 

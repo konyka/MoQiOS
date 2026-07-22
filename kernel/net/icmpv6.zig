@@ -21,6 +21,7 @@ pub const ROUTER_SOLICITATION: u8 = 133;
 pub const ROUTER_ADVERTISEMENT: u8 = 134;
 pub const NEIGHBOR_SOLICITATION: u8 = 135;
 pub const NEIGHBOR_ADVERTISEMENT: u8 = 136;
+pub const REDIRECT: u8 = 137;
 
 // NDP option types
 const OPT_SOURCE_LL_ADDR: u8 = 1;
@@ -95,7 +96,54 @@ pub fn handlePacket(
         ROUTER_ADVERTISEMENT => handleRouterAdvertisement(src_ip, data, len),
         NEIGHBOR_SOLICITATION => handleNeighborSolicitation(src_ip, dst_ip, data, len),
         NEIGHBOR_ADVERTISEMENT => handleNeighborAdvertisement(src_ip, data, len),
+        REDIRECT => handleRedirect(src_ip, data, len),
         else => {},
+    }
+}
+
+/// Parsed Redirect (RFC 4861 §4.5) (SK-95).
+pub const RedirectMsg = struct {
+    target: [16]u8 = @splat(0),
+    destination: [16]u8 = @splat(0),
+    target_ll: ?[6]u8 = null,
+};
+
+/// Pure Redirect parser. Requires the 40-byte Redirect body.
+pub fn parseRedirect(data: [*]const u8, len: u16) ?RedirectMsg {
+    if (len < 40) return null;
+    if (data[0] != REDIRECT or data[1] != 0) return null;
+    var msg: RedirectMsg = .{};
+    @memcpy(&msg.target, data[8..24]);
+    @memcpy(&msg.destination, data[24..40]);
+    var off: u16 = 40;
+    while (off + 2 <= len) {
+        const opt_type = data[off];
+        const opt_units = data[off + 1];
+        if (opt_units == 0) break;
+        const opt_len: u16 = @as(u16, opt_units) * 8;
+        if (off + opt_len > len) break;
+        if (opt_type == OPT_TARGET_LL_ADDR and opt_len >= 8) {
+            msg.target_ll = .{
+                data[off + 2], data[off + 3], data[off + 4],
+                data[off + 5], data[off + 6], data[off + 7],
+            };
+        }
+        off += opt_len;
+    }
+    return msg;
+}
+
+fn handleRedirect(src_ip: [16]u8, data: [*]const u8, len: u16) void {
+    // RFC 4861 §8.1 host validation (subset).
+    if (!ipv6.isLinkLocal(src_ip)) return;
+    const msg = parseRedirect(data, len) orelse return;
+    if (ipv6.isMulticast(msg.destination)) return;
+    const on_link = ipv6.addrEq(msg.target, msg.destination);
+    if (!on_link and !ipv6.isLinkLocal(msg.target)) return;
+    if (!ndp.isCurrentFirstHop(msg.destination, src_ip)) return;
+    ndp.applyRedirect(msg.destination, msg.target);
+    if (msg.target_ll) |mac| {
+        ndp.update(msg.target, mac);
     }
 }
 
@@ -616,4 +664,6 @@ pub fn neighborTimerTick(ms_elapsed: u32) void {
     ndp.preferredLifetimeTimerTick(ms_elapsed);
     // SK-94: expire Route Information entries.
     ndp.routeLifetimeTimerTick(ms_elapsed);
+    // SK-95: expire Destination Cache redirects.
+    ndp.destCacheTimerTick(ms_elapsed);
 }

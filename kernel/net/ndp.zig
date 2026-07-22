@@ -100,6 +100,20 @@ const RouteEntry = struct {
 };
 var route_table: [MAX_ROUTES]RouteEntry = @splat(.{});
 
+/// SK-95: Destination Cache entries from ICMPv6 Redirect (RFC 4861 §8).
+pub const MAX_DEST_CACHE: u32 = 8;
+/// How long a redirect stays installed without refresh (seconds).
+pub const REDIRECT_LIFETIME_SEC: u32 = 600;
+const DestCacheEntry = struct {
+    destination: [16]u8 = @splat(0),
+    /// Better first hop; equal to `destination` means on-link redirect.
+    next_hop: [16]u8 = @splat(0),
+    lifetime_sec: u32 = 0,
+    age_ms: u32 = 0,
+    valid: bool = false,
+};
+var dest_cache: [MAX_DEST_CACHE]DestCacheEntry = @splat(.{});
+
 /// SK-84/85/91: SLAAC addresses formed from A-flag /64 prefixes.
 pub const MAX_LOCAL_ADDRS: u32 = 4;
 pub const AddrState = enum(u8) {
@@ -146,6 +160,9 @@ pub fn init() void {
     }
     for (0..MAX_ROUTES) |i| {
         route_table[i] = .{};
+    }
+    for (0..MAX_DEST_CACHE) |i| {
+        dest_cache[i] = .{};
     }
     for (0..MAX_LOCAL_ADDRS) |i| {
         local_addrs[i] = .{};
@@ -707,12 +724,118 @@ pub const NextHop = struct {
     solicit: ?[16]u8 = null,
 };
 
-/// Resolve L2 next hop for IPv6 `dst` (SK-87/94).
+fn lookupDestCacheLocked(dst: [16]u8) ?[16]u8 {
+    for (0..MAX_DEST_CACHE) |i| {
+        const e = &dest_cache[i];
+        if (e.valid and ipv6.addrEq(e.destination, dst)) return e.next_hop;
+    }
+    return null;
+}
+
+fn currentFirstHopLocked(dst: [16]u8) ?[16]u8 {
+    // Redirect takes precedence once installed; for validation use RIO/default only.
+    if (findBestRouteLocked(dst)) |nh| return nh;
+    const e = selectDefaultRouterLocked() orelse return null;
+    return e.ip;
+}
+
+/// True when `src` is the current first-hop for `dst` (RIO or default) (SK-95).
+pub fn isCurrentFirstHop(dst: [16]u8, src: [16]u8) bool {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    const hop = currentFirstHopLocked(dst) orelse return false;
+    return ipv6.addrEq(hop, src);
+}
+
+/// Install/refresh a Destination Cache entry from Redirect (SK-95).
+pub fn applyRedirect(destination: [16]u8, next_hop: [16]u8) void {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    for (0..MAX_DEST_CACHE) |i| {
+        const e = &dest_cache[i];
+        if (e.valid and ipv6.addrEq(e.destination, destination)) {
+            e.next_hop = next_hop;
+            e.lifetime_sec = REDIRECT_LIFETIME_SEC;
+            e.age_ms = 0;
+            return;
+        }
+    }
+    for (0..MAX_DEST_CACHE) |i| {
+        const e = &dest_cache[i];
+        if (!e.valid) {
+            e.* = .{
+                .destination = destination,
+                .next_hop = next_hop,
+                .lifetime_sec = REDIRECT_LIFETIME_SEC,
+                .age_ms = 0,
+                .valid = true,
+            };
+            return;
+        }
+    }
+    // Full: overwrite slot 0.
+    dest_cache[0] = .{
+        .destination = destination,
+        .next_hop = next_hop,
+        .lifetime_sec = REDIRECT_LIFETIME_SEC,
+        .age_ms = 0,
+        .valid = true,
+    };
+}
+
+/// Probe helper (SK-95): Destination Cache next hop, if any.
+pub fn probeDestCacheNextHop(destination: [16]u8) ?[16]u8 {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    return lookupDestCacheLocked(destination);
+}
+
+/// Probe helper (SK-95): number of Destination Cache entries.
+pub fn probeDestCacheCount() u32 {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    var n: u32 = 0;
+    for (0..MAX_DEST_CACHE) |i| {
+        if (dest_cache[i].valid) n += 1;
+    }
+    return n;
+}
+
+/// Age Destination Cache redirect lifetimes (SK-95).
+pub fn destCacheTimerTick(ms_elapsed: u32) void {
+    if (ms_elapsed == 0) return;
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    for (0..MAX_DEST_CACHE) |i| {
+        const e = &dest_cache[i];
+        if (!e.valid) continue;
+        e.age_ms +%= ms_elapsed;
+        while (e.age_ms >= 1000 and e.lifetime_sec > 0) {
+            e.age_ms -= 1000;
+            e.lifetime_sec -= 1;
+        }
+        if (e.lifetime_sec == 0) e.* = .{};
+    }
+}
+
+/// Resolve L2 next hop for IPv6 `dst` (SK-87/94/95).
 /// On-link / link-local: NDP of `dst`. Multicast: derived multicast MAC.
-/// Off-link: longest-match RIO next hop, else the default router.
+/// Off-link: Destination Cache redirect, else RIO, else default router.
 pub fn resolveNextHop(dst: [16]u8) NextHop {
     if (ipv6.isMulticast(dst)) {
         return .{ .mac = ipv6.multicastMac(dst) };
+    }
+    // SK-95: on-link redirect (target == destination) before prefix on-link check.
+    const redirected = blk: {
+        const flags = ndp_lock.acquire();
+        defer ndp_lock.release(flags);
+        break :blk lookupDestCacheLocked(dst);
+    };
+    if (redirected) |nh| {
+        const l3 = if (ipv6.addrEq(nh, dst)) dst else nh;
+        if (lookup(l3)) |m| return .{ .mac = m };
+        markIncomplete(l3);
+        return .{ .solicit = l3 };
     }
     if (ipv6.isLinkLocal(dst) or isOnLink(dst)) {
         if (lookup(dst)) |m| return .{ .mac = m };
