@@ -1559,7 +1559,19 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:拥塞窗口增长与路径 MTU 一致,减少过度突发。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-99] tcp reno smss pmtu non-x86: OK`。
-- **后续**:SYN MSS 选项通告;或对端 MSS 取 min(本地 SMSS, 对端 MSS)。
+- **后续**:见 3.100（SYN MSS 选项与对端钳制,已完成)。
+
+---
+
+### 3.100 SYN MSS 选项通告与对端钳制（SK-100,2026-07-23）
+
+- **背景**:SYN/SYN-ACK 未携带 MSS,对端常回退 536;我方也不尊重对端通告。
+- **方案**:SYN 选项列表首部加入 kind=2 MSS=`localMssForTcb`;解析对端 MSS 写入
+  `peer_mss`;`mssForTcb` 取 `min(local, peer)`。`shared/sk100.zig` 锁定解析、通告值与钳制。
+- **效果**:双向协商更小 MSS,避免对端/本端发送过大段。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-100] tcp syn mss option non-x86: OK`。
+- **后续**:IPv4 Path MTU;或 SYN 中 MSS 随接口 MTU 而非仅 PMTU 缓存。
 
 ---
 

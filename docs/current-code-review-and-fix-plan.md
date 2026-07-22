@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-23 (SK-99 TCP Reno SMSS + prior SK-98 reviewed and verified)
+> Last update: 2026-07-23 (SK-100 SYN MSS option + prior SK-99 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -431,6 +431,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | No IPv6 Path MTU | Packet Too Big ignored; TX always used link MTU. | SK-97: PMTU cache + UDP/TCP refuse oversized sends. |
 | TCP IPv6 MSS fixed | TCP segmented at 1460/1200 ignoring learned PMTU. | SK-98: IPv6 SMSS = PMTU−60 in flush/send. |
 | Reno used fixed MSS | cwnd/ssthresh stepped by 1460 after PMTU shrink. | SK-99: congestion control uses `mssForTcb` SMSS. |
+| No TCP MSS option | SYN omitted MSS; peer MSS was ignored. | SK-100: advertise local SMSS; clamp to min(local, peer). |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -440,8 +441,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-99] tcp reno smss pmtu non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-99] tcp reno smss pmtu non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-100] tcp syn mss option non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-100] tcp syn mss option non-x86: OK`. |
 
 ### 5.3 Historical Verification
 

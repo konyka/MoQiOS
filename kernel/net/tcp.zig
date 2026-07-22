@@ -120,6 +120,8 @@ const TcpTcb = struct {
     /// SK-75: dual-stack — when true, `remote_ip6` is the peer address.
     is_v6: bool = false,
     remote_ip6: [16]u8 = @splat(0),
+    /// SK-100: peer MSS from SYN/SYN-ACK (0 = not advertised).
+    peer_mss: u16 = 0,
     state: TcpState,
 
     // Sequence numbers
@@ -237,6 +239,7 @@ pub fn initTcbs() void {
             .remote_ip = .{0} ** 4,
             .is_v6 = false,
             .remote_ip6 = @splat(0),
+            .peer_mss = 0,
             .state = .closed,
             .snd_una = 0,
             .snd_nxt = 0,
@@ -331,6 +334,7 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].is_v6 = false;
     tcbs[i].remote_ip6 = @splat(0);
     tcbs[i].remote_ip = .{ 0, 0, 0, 0 };
+    tcbs[i].peer_mss = 0;
     return &tcbs[i];
 }
 
@@ -460,6 +464,13 @@ fn fillTcpSegment(
     const is_syn = (flags & SYN) != 0;
 
     if (is_syn) {
+        // SK-100: MSS first (RFC 9293 recommends early in the option list).
+        const offer = localMssForTcb(tcb);
+        opt_buf[opt_len] = 2;
+        opt_buf[opt_len + 1] = 4;
+        bo.writeU16BeAt(&opt_buf, opt_len + 2, offer);
+        opt_len += 4;
+
         opt_buf[opt_len] = 3;
         opt_buf[opt_len + 1] = 3;
         opt_buf[opt_len + 2] = @intCast(tcb.ws_requested);
@@ -547,12 +558,19 @@ fn advanceSndNxt(tcb: *TcpTcb, flags: u8, data_len: u16) void {
     if (flags & FIN != 0) tcb.snd_nxt +%= 1;
 }
 
-/// Sender MSS for this TCB (SK-98): IPv6 uses Path MTU − 60; IPv4 uses TCP_MSS.
-fn mssForTcb(tcb: *const TcpTcb) u16 {
+/// Local SMSS before peer clamp (SK-98/100).
+fn localMssForTcb(tcb: *const TcpTcb) u16 {
     if (!tcb.is_v6) return TCP_MSS;
     const pmtu = ipv6.getPathMtu(tcb.remote_ip6);
     if (pmtu <= TCP_IPV6_OVERHEAD) return 1;
     return @min(TCP_MSS, pmtu - TCP_IPV6_OVERHEAD);
+}
+
+/// Sender MSS for this TCB (SK-98/100): min(local SMSS, peer MSS).
+fn mssForTcb(tcb: *const TcpTcb) u16 {
+    const local = localMssForTcb(tcb);
+    if (tcb.peer_mss != 0 and tcb.peer_mss < local) return tcb.peer_mss;
+    return local;
 }
 
 /// Probe helper (SK-98): IPv6 SMSS for `dst` from the Path MTU cache.
@@ -560,6 +578,22 @@ pub fn probeIpv6Mss(dst: [16]u8) u16 {
     const pmtu = ipv6.getPathMtu(dst);
     if (pmtu <= TCP_IPV6_OVERHEAD) return 1;
     return @min(TCP_MSS, pmtu - TCP_IPV6_OVERHEAD);
+}
+
+/// Probe helper (SK-100): effective MSS = min(local, peer); peer 0 = local only.
+pub fn probeMssWithPeer(local_mss: u16, peer_mss: u16) u16 {
+    if (peer_mss != 0 and peer_mss < local_mss) return peer_mss;
+    return local_mss;
+}
+
+/// Probe helper (SK-100): parse MSS option from a TCP header (`data_offset` bytes).
+pub fn probeParseMss(data: [*]const u8, data_offset: u16) ?u16 {
+    return parseTcpOptions(data, data_offset).mss;
+}
+
+/// Probe helper (SK-100): MSS value we advertise on SYN for IPv6 `dst`.
+pub fn probeSynOfferMssV6(dst: [16]u8) u16 {
+    return probeIpv6Mss(dst);
 }
 
 /// Probe helper (SK-99): Reno CA increment for one ACK using SMSS.
@@ -686,6 +720,7 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
 
 /// Parsed TCP options from an incoming segment.
 const TcpOptions = struct {
+    mss: ?u16 = null, // Maximum Segment Size (kind 2) (SK-100)
     ws_shift: ?u4 = null, // window scale shift count (kind 3)
     ts_val: ?u32 = null, // timestamp value (kind 8)
     ts_ecr: ?u32 = null, // timestamp echo reply (kind 8)
@@ -703,6 +738,12 @@ fn parseTcpOptions(data: [*]const u8, data_offset: u16) TcpOptions {
         switch (kind) {
             0 => break, // End of Options List
             1 => pos += 1, // NOP — no length field
+            2 => { // MSS (SK-100)
+                if (pos + 3 < data_offset and data[pos + 1] == 4) {
+                    opts.mss = bo.readU16BeAt(data, pos + 2);
+                }
+                pos += 4;
+            },
             3 => { // Window Scale
                 if (pos + 2 < data_offset and data[pos + 1] == 3) {
                     opts.ws_shift = @intCast(data[pos + 2] & 0x0F);
@@ -773,6 +814,13 @@ fn updateRtt(tcb: *TcpTcb, m: u32) void {
     if (tcb.rto > TCP_RTO_MAX) tcb.rto = TCP_RTO_MAX;
 }
 
+fn applyPeerMss(tcb: *TcpTcb, opts: TcpOptions) void {
+    if (opts.mss) |m| {
+        // Ignore zero/nonsense; keep prior if already set.
+        if (m != 0) tcb.peer_mss = m;
+    }
+}
+
 /// Called from net/mod.zig when an IPv4 packet with protocol=6 is received.
 /// Handle an incoming SYN for a listening socket.
 /// Creates a new TCB in SYN_RECEIVED state, sends SYN-ACK,
@@ -827,6 +875,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
             if (opts.sack_permitted) {
                 reuse_tcb.sack_permitted = true;
             }
+            applyPeerMss(reuse_tcb, opts);
 
             _ = sendSegment(reuse_tcb, SYN | ACK, undefined, 0);
             tcpLog("[tcp] TIME_WAIT reuse → SYN-ACK\n");
@@ -868,6 +917,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
     if (opts.sack_permitted) {
         new_tcb.sack_permitted = true;
     }
+    applyPeerMss(new_tcb, opts);
 
     // Send SYN-ACK
     _ = sendSegment(new_tcb, SYN | ACK, undefined, 0);
@@ -927,6 +977,7 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
                 reuse_tcb.ts_enabled = true;
             }
             if (opts.sack_permitted) reuse_tcb.sack_permitted = true;
+            applyPeerMss(reuse_tcb, opts);
             _ = sendSegment(reuse_tcb, SYN | ACK, undefined, 0);
             return;
         }
@@ -958,6 +1009,7 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
         new_tcb.ts_enabled = true;
     }
     if (opts.sack_permitted) new_tcb.sack_permitted = true;
+    applyPeerMss(new_tcb, opts);
 
     _ = sendSegment(new_tcb, SYN | ACK, undefined, 0);
 
@@ -1050,6 +1102,7 @@ fn driveTcbStateMachine(
                 if (opts.sack_permitted) {
                     tcb.sack_permitted = true;
                 }
+                applyPeerMss(tcb, opts);
 
                 // RTT measurement: if our SYN carried ts_val_last and
                 // the ACK echoes it back, measure initial RTT.

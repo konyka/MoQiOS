@@ -134,20 +134,21 @@ pass_markers() {
         grep -q "\[SK-96\] ndp redirect nud invalidate non-x86: OK" "$LOG_FILE" &&
         grep -q "\[SK-97\] ipv6 path mtu ptb non-x86: OK" "$LOG_FILE" &&
         grep -q "\[SK-98\] tcp ipv6 mss pmtu non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-99\] tcp reno smss pmtu non-x86: OK" "$LOG_FILE"
+        grep -q "\[SK-99\] tcp reno smss pmtu non-x86: OK" "$LOG_FILE" &&
+        grep -q "\[SK-100\] tcp syn mss option non-x86: OK" "$LOG_FILE"
 }
 
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if pass_markers; then
-        echo "PASS: MoQiOS riscv64 M7+SK-99 smoke (shared probes + slim footprint/env + virtio + U-mode)."
+        echo "PASS: MoQiOS riscv64 M7+SK-100 smoke (shared probes + slim footprint/env + virtio + U-mode)."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         if pass_markers; then
-            echo "PASS: MoQiOS riscv64 M7+SK-99 smoke (shared probes + slim footprint/env + virtio + U-mode)."
+            echo "PASS: MoQiOS riscv64 M7+SK-100 smoke (shared probes + slim footprint/env + virtio + U-mode)."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -161,7 +162,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for riscv64 smoke markers."
-echo "Expected: SK-2..SK-4 + SK-6..SK-99 shared markers + M7 blk/net + M6 + M5 markers."
+echo "Expected: SK-2..SK-4 + SK-6..SK-100 shared markers + M7 blk/net + M6 + M5 markers."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1
