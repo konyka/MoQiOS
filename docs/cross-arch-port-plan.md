@@ -1547,7 +1547,19 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:IPv6 TCP 分段跟随路径 MTU,避免反复过大段。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-98] tcp ipv6 mss pmtu non-x86: OK`。
-- **后续**:拥塞窗口增量改用 SMSS;或 SYN MSS 选项通告。
+- **后续**:见 3.99（拥塞控制改用 SMSS,已完成)。
+
+---
+
+### 3.99 TCP Reno 拥塞控制改用 SMSS（SK-99,2026-07-23）
+
+- **背景**:分段已跟 PMTU,但 cwnd/ssthresh 仍按固定 1460 步进,IPv6 小路径上偏激进。
+- **方案**:握手初值、CA 增量(`SMSS²/cwnd`)、快重传/快恢复与 RTO 回退均改用
+  `mssForTcb`。`shared/sk99.zig` 锁定 SMSS、CA 增量与 ssthresh 下限随 PMTU 变化。
+- **效果**:拥塞窗口增长与路径 MTU 一致,减少过度突发。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-99] tcp reno smss pmtu non-x86: OK`。
+- **后续**:SYN MSS 选项通告;或对端 MSS 取 min(本地 SMSS, 对端 MSS)。
 
 ---
 

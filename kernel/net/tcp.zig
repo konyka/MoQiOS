@@ -562,6 +562,17 @@ pub fn probeIpv6Mss(dst: [16]u8) u16 {
     return @min(TCP_MSS, pmtu - TCP_IPV6_OVERHEAD);
 }
 
+/// Probe helper (SK-99): Reno CA increment for one ACK using SMSS.
+pub fn probeIpv6RenoCaInc(dst: [16]u8, cwnd: u32) u32 {
+    const smss: u32 = probeIpv6Mss(dst);
+    return (smss * smss) / @max(cwnd, 1);
+}
+
+/// Probe helper (SK-99): minimum ssthresh = 2×SMSS.
+pub fn probeIpv6RenoMinSsthresh(dst: [16]u8) u32 {
+    return 2 * @as(u32, probeIpv6Mss(dst));
+}
+
 /// Build and send a TCP segment (IPv4 or IPv6).
 fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
     if (tcb.is_v6) return sendSegmentV6(tcb, flags, data, data_len);
@@ -1050,8 +1061,8 @@ fn driveTcbStateMachine(
                     }
                 }
 
-                // Initialize cwnd after handshake
-                tcb.cwnd = TCP_MSS;
+                // Initialize cwnd after handshake (SK-99: SMSS).
+                tcb.cwnd = mssForTcb(tcb);
                 tcb.dup_ack_count = 0;
                 tcb.in_recovery = false;
 
@@ -1137,14 +1148,15 @@ fn driveTcbStateMachine(
                             }
                         }
 
-                        // TCP Reno: congestion control on new ACK
+                        // TCP Reno: congestion control on new ACK (SK-99: SMSS).
+                        const smss: u32 = mssForTcb(tcb);
                         if (tcb.in_recovery) {
                             // Fast recovery: partial ACK
                             // Shrink cwnd by the amount acked (Reno partial)
                             if (tcb.cwnd > acked) {
                                 tcb.cwnd -= @intCast(acked);
                             } else {
-                                tcb.cwnd = TCP_MSS;
+                                tcb.cwnd = smss;
                             }
                             // If this ACK covers recover_seq, exit recovery
                             if (ack_num -% 1 >= tcb.recover_seq) {
@@ -1160,8 +1172,8 @@ fn driveTcbStateMachine(
                                 tcb.cwnd += @intCast(acked);
                             } else {
                                 // Congestion avoidance: additive increase
-                                // cwnd += MSS * MSS / cwnd per full MSS acked
-                                const inc = (@as(u32, TCP_MSS) * @as(u32, TCP_MSS)) / @max(tcb.cwnd, 1);
+                                // cwnd += SMSS * SMSS / cwnd per ACK
+                                const inc = (smss * smss) / @max(tcb.cwnd, 1);
                                 tcb.cwnd += inc;
                             }
                             tcb.dup_ack_count = 0;
@@ -1185,11 +1197,12 @@ fn driveTcbStateMachine(
                         tcb.dup_ack_count += 1;
 
                         if (!tcb.in_recovery and tcb.dup_ack_count >= 3) {
-                            // Fast retransmit + fast recovery
+                            // Fast retransmit + fast recovery (SK-99: SMSS).
+                            const smss_fr: u32 = mssForTcb(tcb);
                             tcb.in_recovery = true;
                             tcb.recover_seq = tcb.snd_nxt;
-                            tcb.ssthresh = @max(tcb.cwnd / 2, 2 * @as(u32, TCP_MSS));
-                            tcb.cwnd = tcb.ssthresh + 3 * @as(u32, TCP_MSS);
+                            tcb.ssthresh = @max(tcb.cwnd / 2, 2 * smss_fr);
+                            tcb.cwnd = tcb.ssthresh + 3 * smss_fr;
 
                             // Retransmit the first non-SACKed segment
                             tcb.snd_nxt = tcb.snd_una;
@@ -1201,8 +1214,8 @@ fn driveTcbStateMachine(
                             }
                             tcpLog("[tcp] fast retransmit\n");
                         } else if (tcb.in_recovery) {
-                            // Fast recovery: inflate cwnd by 1 MSS per dup ACK
-                            tcb.cwnd += @as(u32, TCP_MSS);
+                            // Fast recovery: inflate cwnd by 1 SMSS per dup ACK
+                            tcb.cwnd += @as(u32, mssForTcb(tcb));
                         }
                     }
                 }
@@ -1598,7 +1611,7 @@ pub fn tcpRecv(tcb_idx: u32, buf: [*]u8, len: u32) i64 {
 
     // Flush delayed ACK when app reads data (advertises updated window promptly).
     // Also sends a window update if a significant amount was consumed.
-    if (tcb.delayed_ack_pending or (to_read > TCP_MSS and tcb.state == .established)) {
+    if (tcb.delayed_ack_pending or (to_read > mssForTcb(tcb) and tcb.state == .established)) {
         tcb.delayed_ack_pending = false;
         tcb.delayed_ack_ms = 0;
         _ = sendSegment(tcb, ACK, undefined, 0);
@@ -1769,9 +1782,10 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
                 deactivateTcb(tcb);
                 return;
             }
-            // RTO timeout: Reno behavior — ssthresh = cwnd/2, cwnd = 1 MSS
-            tcb.ssthresh = @max(tcb.cwnd / 2, 2 * @as(u32, TCP_MSS));
-            tcb.cwnd = @as(u32, TCP_MSS); // back to slow start
+            // RTO timeout: Reno behavior — ssthresh = cwnd/2, cwnd = 1 SMSS (SK-99).
+            const smss_rto: u32 = mssForTcb(tcb);
+            tcb.ssthresh = @max(tcb.cwnd / 2, 2 * smss_rto);
+            tcb.cwnd = smss_rto; // back to slow start
             tcb.in_recovery = false;
             tcb.dup_ack_count = 0;
 
