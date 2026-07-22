@@ -1535,7 +1535,19 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:学到更小路径 MTU 后不再发送过大报文。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-97] ipv6 path mtu ptb non-x86: OK`。
-- **后续**:TCP MSS 随 PMTU 收缩;或 Redirected Header 选项。
+- **后续**:见 3.98（TCP MSS 随 PMTU 收缩,已完成)。
+
+---
+
+### 3.98 TCP IPv6 MSS 随 Path MTU 收缩（SK-98,2026-07-23）
+
+- **背景**:PMTU 已学到,但 TCP 仍按固定 1460/1200 分包,小路径上会触发 PTB 循环。
+- **方案**:`mssForTcb` 对 IPv6 使用 `PMTU−60`;`flushSendBuffer`/`sendSegmentV6` 按该 MSS
+  切片。默认链路 1500 → SMSS 1440。`shared/sk98.zig` 锁定默认、PTB 收缩与过期恢复。
+- **效果**:IPv6 TCP 分段跟随路径 MTU,避免反复过大段。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-98] tcp ipv6 mss pmtu non-x86: OK`。
+- **后续**:拥塞窗口增量改用 SMSS;或 SYN MSS 选项通告。
 
 ---
 

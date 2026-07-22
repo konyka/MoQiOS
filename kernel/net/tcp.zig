@@ -48,6 +48,8 @@ inline fn tcpLog(comptime msg: []const u8) void {
 const MAX_CONNECTIONS: u32 = 64;
 const TCP_WINDOW: u32 = 32768;
 const TCP_MSS: u16 = 1460;
+/// IPv6 header + minimum TCP header (no options) for SMSS (SK-98).
+const TCP_IPV6_OVERHEAD: u16 = ipv6.HEADER_LEN + 20;
 const SEND_BUF_SIZE: u32 = 65536;
 const RECV_BUF_SIZE: u32 = 65536;
 const RETRANSMIT_MS: u32 = 2000; // initial RTO (ms), overridden by Jacobson/Karels
@@ -545,6 +547,21 @@ fn advanceSndNxt(tcb: *TcpTcb, flags: u8, data_len: u16) void {
     if (flags & FIN != 0) tcb.snd_nxt +%= 1;
 }
 
+/// Sender MSS for this TCB (SK-98): IPv6 uses Path MTU − 60; IPv4 uses TCP_MSS.
+fn mssForTcb(tcb: *const TcpTcb) u16 {
+    if (!tcb.is_v6) return TCP_MSS;
+    const pmtu = ipv6.getPathMtu(tcb.remote_ip6);
+    if (pmtu <= TCP_IPV6_OVERHEAD) return 1;
+    return @min(TCP_MSS, pmtu - TCP_IPV6_OVERHEAD);
+}
+
+/// Probe helper (SK-98): IPv6 SMSS for `dst` from the Path MTU cache.
+pub fn probeIpv6Mss(dst: [16]u8) u16 {
+    const pmtu = ipv6.getPathMtu(dst);
+    if (pmtu <= TCP_IPV6_OVERHEAD) return 1;
+    return @min(TCP_MSS, pmtu - TCP_IPV6_OVERHEAD);
+}
+
 /// Build and send a TCP segment (IPv4 or IPv6).
 fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
     if (tcb.is_v6) return sendSegmentV6(tcb, flags, data, data_len);
@@ -568,10 +585,10 @@ fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
     return true;
 }
 
-/// IPv6 TCP TX (SK-76/87): on-link NDP or off-link via default router.
+/// IPv6 TCP TX (SK-76/87/98): on-link NDP or off-link via default router.
 fn sendSegmentV6(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
-    // IPv6 min MTU 1280 → leave room for 40 IP + ~40 TCP opts.
-    if (data_len > 1200) return false;
+    // SK-98: segment payload must fit Path MTU − IPv6 − TCP headers.
+    if (data_len > mssForTcb(tcb)) return false;
 
     const nh = ndp.resolveNextHop(tcb.remote_ip6);
     const dst_mac = nh.mac orelse {
@@ -1527,20 +1544,21 @@ pub fn tcpSend(tcb_idx: u32, data: [*]const u8, len: u32) i64 {
 /// When TCP_CORK is set, only full MSS segments are sent (partial segments are held).
 fn flushSendBuffer(tcb: *TcpTcb) void {
     while (true) {
+        const mss = mssForTcb(tcb);
         const pending = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
         const in_flight = tcb.snd_nxt -% tcb.snd_una;
         const effective_wnd = @min(tcb.cwnd, tcb.snd_wnd);
         const window_avail = if (effective_wnd > in_flight) effective_wnd - in_flight else 0;
-        const can_send = @min(pending, window_avail, TCP_MSS);
+        const can_send = @min(pending, window_avail, mss);
 
         if (can_send == 0) break;
 
         // TCP_CORK: only send full MSS segments (coalesce small writes)
-        if (tcb.options.tcp_cork and can_send < TCP_MSS) break;
+        if (tcb.options.tcp_cork and can_send < mss) break;
 
         // Nagle algorithm: if TCP_NODELAY is disabled and there is unacknowledged
         // data in flight, only send a full MSS segment (coalesce small writes).
-        if (!tcb.options.tcp_nodelay and !tcb.options.tcp_cork and in_flight > 0 and can_send < TCP_MSS) {
+        if (!tcb.options.tcp_nodelay and !tcb.options.tcp_cork and in_flight > 0 and can_send < mss) {
             tcb.nagle_pending = true;
             break;
         }
