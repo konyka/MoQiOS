@@ -88,3 +88,9 @@ pub fn writeInet6(buf: []u8, port: u16, addr: [16]u8, scope_id: u32) u32 {
     buf[27] = @truncate(scope_id >> 24);
     return SOCKADDR_IN6_LEN;
 }
+
+/// Encode a UDP local/peer name for either address family (SK-73).
+pub fn encodeUdpName(is_v6: bool, port: u16, ip4: [4]u8, ip6: [16]u8, out: []u8) u32 {
+    if (is_v6) return writeInet6(out, port, ip6, 0);
+    return writeInet4(out, port, ip4);
+}

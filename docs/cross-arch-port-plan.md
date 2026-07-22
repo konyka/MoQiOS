@@ -1188,8 +1188,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   既有 `handleNeighborAdvertisement`。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-72] ndp neighbor solicitation non-x86: OK`。
-- **后续**:TCP over IPv6;或 getsockname/getpeername 的 UDP/IPv6;或 NS 重传/
-  可达性状态机细化。
+- **后续**:见 3.73（UDP getsockname/getpeername,已完成)。
+
+---
+
+### 3.73 UDP getsockname / getpeername（SK-73,2026-07-22）
+
+- **背景**:`getsockname`/`getpeername` 仅接受 TCP,且错误地用 `fd >= 16`
+  截断;`AF_INET6` UDP 套接字无法查询本地/对端地址。
+- **方案**:`sockaddr_util.encodeUdpName`;UDP 分支写出本机 IPv4/`link-local`
+  或已 connect 的对端;`getpeername` 未连接返回 `ENOTCONN`。fd 上界改为
+  `MAX_FDS`。TCP 路径改走 `writeInet4`。`shared/sk73.zig` 锁定编解码长度与字段。
+- **效果**:用户态可对 IPv4/IPv6 UDP 查询 sockname/peername;高编号 TCP fd 不再被误拒。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-73] udp getsockname encode non-x86: OK`。
+- **后续**:TCP over IPv6;或 NS 重传/可达性状态机细化。
 
 ---
 
