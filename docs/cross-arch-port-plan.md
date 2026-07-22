@@ -1509,7 +1509,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:可按路由器提示切换下一跳,降低次优默认路由上的绕行。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-95] ndp icmpv6 redirect non-x86: OK`。
-- **后续**:Redirected Header 选项;或 Destination Cache 与 NUD 联动失效。
+- **后续**:见 3.96（Destination Cache 与 NUD 联动失效,已完成)。
+
+---
+
+### 3.96 Destination Cache 与 NUD 联动失效（SK-96,2026-07-23）
+
+- **背景**:Redirect 写入 Destination Cache 后,若下一跳 NUD 失败,缓存仍指向死邻居。
+- **方案**:`probe`/`incomplete` 耗尽时 `invalidateDestCacheByNextHop`,清除
+  `next_hop` 匹配的条目,使 `resolveNextHop` 回退到 RIO/默认路由器。
+  `shared/sk96.zig` 锁定无关失败保留、下一跳失败清除与 on-link redirect。
+- **效果**:重定向下一跳不可达时自动恢复到可用路径,避免黑洞。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-96] ndp redirect nud invalidate non-x86: OK`。
+- **后续**:Redirected Header 选项;或 Path MTU / Packet Too Big。
 
 ---
 

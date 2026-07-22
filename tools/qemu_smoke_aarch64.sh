@@ -137,20 +137,21 @@ pass_markers() {
         grep -q "\[SK-92\] ndp multi default router non-x86: OK" "$LOG_FILE" &&
         grep -q "\[SK-93\] ndp router nud failover non-x86: OK" "$LOG_FILE" &&
         grep -q "\[SK-94\] ndp route info rio non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-95\] ndp icmpv6 redirect non-x86: OK" "$LOG_FILE"
+        grep -q "\[SK-95\] ndp icmpv6 redirect non-x86: OK" "$LOG_FILE" &&
+        grep -q "\[SK-96\] ndp redirect nud invalidate non-x86: OK" "$LOG_FILE"
 }
 
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if pass_markers; then
-        echo "PASS: MoQiOS aarch64 M9-7+SK-95 smoke (shared probes + slim footprint/env + default timer + EL0/SVC)."
+        echo "PASS: MoQiOS aarch64 M9-7+SK-96 smoke (shared probes + slim footprint/env + default timer + EL0/SVC)."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         if pass_markers; then
-            echo "PASS: MoQiOS aarch64 M9-7+SK-95 smoke (shared probes + slim footprint/env + default timer + EL0/SVC)."
+            echo "PASS: MoQiOS aarch64 M9-7+SK-96 smoke (shared probes + slim footprint/env + default timer + EL0/SVC)."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -164,7 +165,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for aarch64 smoke markers."
-echo "Expected: SK-2..SK-4 + SK-6..SK-95 shared markers + M9-1..M9-7 markers."
+echo "Expected: SK-2..SK-4 + SK-6..SK-96 shared markers + M9-1..M9-7 markers."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

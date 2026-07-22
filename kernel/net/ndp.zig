@@ -209,6 +209,21 @@ fn markDefaultRouterNudFailedLocked(ip: [16]u8) void {
     }
 }
 
+/// SK-96: drop Destination Cache entries whose next hop became unreachable.
+fn invalidateDestCacheByNextHopLocked(next_hop: [16]u8) void {
+    for (0..MAX_DEST_CACHE) |i| {
+        const e = &dest_cache[i];
+        if (e.valid and ipv6.addrEq(e.next_hop, next_hop)) {
+            e.* = .{};
+        }
+    }
+}
+
+fn onNeighborUnreachableLocked(ip: [16]u8) void {
+    markDefaultRouterNudFailedLocked(ip);
+    invalidateDestCacheByNextHopLocked(ip);
+}
+
 fn clearDefaultRouterNudFailedLocked(ip: [16]u8) void {
     for (0..MAX_DEFAULT_ROUTERS) |i| {
         const e = &default_routers[i];
@@ -1109,8 +1124,8 @@ pub fn timerTick(ms_elapsed: u32, out: []Solicit) u32 {
                 if (e.retrans_ms < RETRANS_MS) continue;
                 e.retrans_ms = 0;
                 if (e.solicit_count >= MAX_UNICAST_SOLICIT) {
-                    // SK-93: failed NUD on a default router → failover.
-                    markDefaultRouterNudFailedLocked(e.ipv6_addr);
+                    // SK-93/96: NUD failure → router failover + clear redirects.
+                    onNeighborUnreachableLocked(e.ipv6_addr);
                     e.valid = false;
                     continue;
                 }
@@ -1122,7 +1137,7 @@ pub fn timerTick(ms_elapsed: u32, out: []Solicit) u32 {
                 if (e.retrans_ms < RETRANS_MS) continue;
                 e.retrans_ms = 0;
                 if (e.solicit_count >= MAX_MULTICAST_SOLICIT) {
-                    markDefaultRouterNudFailedLocked(e.ipv6_addr);
+                    onNeighborUnreachableLocked(e.ipv6_addr);
                     e.valid = false;
                     continue;
                 }
