@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-22 (SK-70 UDP over IPv6 stack path + prior SK-69 reviewed and verified)
+> Last update: 2026-07-22 (SK-71 sockaddr_in6 UDP syscalls + prior SK-70 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -402,6 +402,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | FAT32 root first-sector only | `listRootDir`/`createFile` ignored later sectors/clusters in the root chain. | SK-68: full sector/cluster walk + optional `growRootDir`; placement helpers in `fat32_util`. |
 | FAT32 LFN chain sector-bound | Free-run find/write assumed a single-sector window, so long LFN chains near a sector tail could not span. | SK-69: `findConsecutiveFreeMulti` + `findFreeRunInRoot`/`writeRootEntryRun` across sector/cluster boundaries. |
 | IPv6 UDP demux empty | `mod.zig` left `PROTO_UDP` over IPv6 as a TODO; stack could not deliver or emit IPv6 UDP. | SK-70: `udp_util` checksum/parse + `handlePacketV6`/`sendToV6`/`recvFromV6`; syscall `sockaddr_in6` deferred to SK-71. |
+| AF_INET6 UDP still IPv4 | `socket(AF_INET6, SOCK_DGRAM)` lacked an IPv6 fd flag; address ops parsed `sockaddr_in` only. | SK-71: `udp_is_v6`/`udp_dst_ip6` + `sockaddr_util` + bind/sendto/recvfrom/connect V6 branches. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -411,8 +412,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-70] udp over ipv6 non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-70] udp over ipv6 non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-71] sockaddr inet6 util non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-71] sockaddr inet6 util non-x86: OK`. |
 
 ### 5.3 Historical Verification
 

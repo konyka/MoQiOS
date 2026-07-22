@@ -1157,8 +1157,24 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:内核可收发 IPv6 UDP(链路本地 + 已解析邻居);IPv4 路径与 SK-53 不回归。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-70] udp over ipv6 non-x86: OK`。
-- **后续**:SK-71 — `sockaddr_in6` 的 bind/sendto/recvfrom/connect;或 TCP over
-  IPv6;或 NDP Neighbor Solicitation TX。
+- **后续**:见 3.71（`sockaddr_in6` syscall 接线,已完成)。
+
+---
+
+### 3.71 sockaddr_in6 与 AF_INET6 UDP syscall（SK-71,2026-07-22）
+
+- **背景**:SK-70 提供了栈层 `sendToV6`/`recvFromV6`,但 `socket(AF_INET6)`
+  创建的 fd 未标记 IPv6,bind/sendto/recvfrom/connect 仍按 `sockaddr_in` 解析。
+- **方案**:`sockaddr_util` 锁定 Linux `sockaddr_in`/`sockaddr_in6` 布局。
+  `FileDescriptor` 增加 `udp_is_v6` + `udp_dst_ip6`;AF_INET6/SOCK_DGRAM 置位。
+  bind/connect/sendto/recvfrom 按标志分支到 V6 API 与 28 字节地址写出。
+  `shared/sk71.zig` 锁定编解码 round-trip 与族不匹配拒绝。
+- **效果**:用户态可用标准 `sockaddr_in6` 对 IPv6 UDP 套接字 bind/connect/
+  sendto/recvfrom;IPv4 UDP 路径保持兼容。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-71] sockaddr inet6 util non-x86: OK`。
+- **后续**:TCP over IPv6;或 NDP Neighbor Solicitation TX;或 getsockname/
+  getpeername 的 UDP/IPv6。
 
 ---
 

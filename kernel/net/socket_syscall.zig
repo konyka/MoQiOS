@@ -10,6 +10,7 @@ const task_mod = @import("../proc/task.zig");
 const vfs_mod = @import("../fs/vfs.zig");
 const net_mod = @import("mod.zig");
 const udp = @import("udp.zig");
+const sa = @import("sockaddr_util.zig");
 const copy = @import("../mm/copy_from_user.zig");
 const bo = @import("../lib/byte_order.zig");
 
@@ -73,14 +74,10 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
         return -1;
     }
 
-    // AF_INET6 — handled the same way as AF_INET at the syscall layer.
-    // Lower-layer integration (TCP/UDP over IPv6) is incremental; for now we
-    // back AF_INET6 sockets with the existing IPv4 TCB/UDP-port machinery so
-    // that user-space socket() calls succeed and standard TCP/UDP semantics
-    // continue to work over IPv4 transport.
+    // AF_INET6 — UDP uses the IPv6 stack (SK-70/71); TCP still shares IPv4 TCBs.
     if (domain == 10) {
         if (sock_type == 1) {
-            // SOCK_STREAM → TCP socket
+            // SOCK_STREAM → TCP socket (IPv4 TCB until TCP/IPv6 lands)
             const tcb_idx6 = net_mod.tcp.tcpSocket(cur_idx);
             if (tcb_idx6 < 0) return -1;
             const fd6 = allocTcpFd(&t.fd_table, @intCast(tcb_idx6));
@@ -91,16 +88,16 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
             return fd6;
         }
         if (sock_type == 2) {
-            // SOCK_DGRAM → UDP socket (ephemeral port allocation)
+            // SOCK_DGRAM → IPv6 UDP socket
             var port6: u16 = 49152;
             while (port6 < 65535) : (port6 += 1) {
                 const idx6 = udp.ensurePort(port6);
                 if (idx6 != 0xFFFF) {
-                    // v53.49: Use allocFd() O(1) bitmap instead of duplicated linear scan
                     const fd_slot6 = t.fd_table.allocFd() orelse return -24; // EMFILE
                     t.fd_table.fds[fd_slot6] = .{
                         .fd_type = .udp_socket,
                         .udp_port = port6,
+                        .udp_is_v6 = true,
                         .writable = true,
                     };
                     return @intCast(fd_slot6);
@@ -164,8 +161,21 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     // UDP bind
     if (t.fd_table.fds[fd].fd_type == .udp_socket) {
         if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -1;
-        var sock_addr: [8]u8 = undefined;
-        _ = copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), 8);
+        const is_v6 = t.fd_table.fds[fd].udp_is_v6;
+        if (is_v6) {
+            var sa6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
+            const n = copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN);
+            if (n < sa.SOCKADDR_IN6_LEN) return -22; // EINVAL
+            const parsed = sa.parseInet6(&sa6) orelse return -97; // EAFNOSUPPORT
+            const idx = udp.ensurePort(parsed.port);
+            if (idx == 0xFFFF) return -98; // EADDRINUSE
+            t.fd_table.fds[fd].udp_port = parsed.port;
+            return 0;
+        }
+        var sock_addr: [sa.SOCKADDR_IN_LEN]u8 = undefined;
+        const n4 = copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), 8);
+        if (n4 < 8) return -22;
+        // Accept legacy callers that only filled port+addr; family may be unset.
         const new_port = bo.readU16BeAt(&sock_addr, 2);
         const idx = udp.ensurePort(new_port);
         if (idx == 0xFFFF) return -98; // EADDRINUSE
@@ -276,6 +286,34 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         return result;
     } else if (t.fd_table.fds[fd].fd_type == .udp_socket) {
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
+        const is_v6 = t.fd_table.fds[fd].udp_is_v6;
+        const src_port = t.fd_table.fds[fd].udp_port;
+        if (is_v6) {
+            var tmp6: [1232]u8 = undefined;
+            const to_copy6 = @min(len, 1232);
+            const n6 = copy.copyFromUser(&tmp6, @ptrFromInt(buf), to_copy6);
+            if (n6 == 0) return -1;
+            var dst6: [16]u8 = @splat(0);
+            var dst_port6: u16 = 0;
+            if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000) {
+                var sa6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
+                if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) < sa.SOCKADDR_IN6_LEN)
+                    return -22;
+                const parsed = sa.parseInet6(&sa6) orelse return -97; // EAFNOSUPPORT
+                dst6 = parsed.addr;
+                dst_port6 = parsed.port;
+            } else if (t.fd_table.fds[fd].udp_connected) {
+                dst6 = t.fd_table.fds[fd].udp_dst_ip6;
+                dst_port6 = t.fd_table.fds[fd].udp_dst_port;
+            } else {
+                return -89; // EDESTADDRREQ
+            }
+            if (udp.sendToV6(dst6, dst_port6, src_port, &tmp6, @intCast(n6))) {
+                return @intCast(n6);
+            } else {
+                return -1;
+            }
+        }
         var tmp_buf2: [1472]u8 = undefined;
         const to_copy2 = @min(len, 1472);
         const n2 = copy.copyFromUser(&tmp_buf2, @ptrFromInt(buf), to_copy2);
@@ -293,7 +331,6 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
             dst_ip = t.fd_table.fds[fd].udp_dst_ip;
             dst_port = t.fd_table.fds[fd].udp_dst_port;
         }
-        const src_port = t.fd_table.fds[fd].udp_port;
         if (udp.sendTo(dst_ip, dst_port, src_port, &tmp_buf2, @intCast(n2))) {
             return @intCast(n2);
         } else {
@@ -340,9 +377,37 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         return result;
     } else if (t.fd_table.fds[fd].fd_type == .udp_socket) {
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
+        const is_v6 = t.fd_table.fds[fd].udp_is_v6;
+        const src_port = t.fd_table.fds[fd].udp_port;
+        if (is_v6) {
+            var tmp6: [1232]u8 = undefined;
+            const to_read6 = @min(len, 1232);
+            var src6: [16]u8 = @splat(0);
+            var src_port_out6: u16 = 0;
+            const result6 = udp.recvFromV6(src_port, &tmp6, &src6, &src_port_out6);
+            if (result6 > 0) {
+                const to_write6 = @min(@as(u32, @intCast(result6)), to_read6);
+                _ = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp6))[0..to_write6], to_write6);
+                if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000) {
+                    var sa_out6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
+                    const alen = sa.writeInet6(&sa_out6, src_port_out6, src6, 0);
+                    _ = copy.copyToUser(@ptrFromInt(addr_ptr), &sa_out6, alen);
+                    if (addr_len_ptr != 0 and addr_len_ptr < 0x0000_8000_0000_0000) {
+                        var al6: [4]u8 = .{
+                            @truncate(alen),
+                            @truncate(alen >> 8),
+                            @truncate(alen >> 16),
+                            @truncate(alen >> 24),
+                        };
+                        _ = copy.copyToUser(@ptrFromInt(addr_len_ptr), &al6, 4);
+                    }
+                }
+                return @intCast(to_write6);
+            }
+            return 0;
+        }
         var tmp_buf2: [1472]u8 = undefined;
         const to_read2 = @min(len, 1472);
-        const src_port = t.fd_table.fds[fd].udp_port;
         var src_ip: [4]u8 = .{ 0, 0, 0, 0 };
         var src_port_out: u16 = 0;
         const result2 = udp.recvFrom(src_port, &tmp_buf2, &src_ip, &src_port_out);
@@ -350,14 +415,9 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
             const to_write = @min(@as(u32, @intCast(result2)), to_read2);
             _ = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf2))[0..to_write], to_write);
             if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000) {
-                var sa_out: [16]u8 = .{0} ** 16;
-                sa_out[0] = 2; // AF_INET
-                sa_out[1] = 0;
-                bo.writeU16BeAt(&sa_out, 2, src_port_out);
-                sa_out[4] = src_ip[0];
-                sa_out[5] = src_ip[1];
-                sa_out[6] = src_ip[2];
-                sa_out[7] = src_ip[3];
+                var sa_out: [sa.SOCKADDR_IN_LEN]u8 = undefined;
+                _ = sa.writeInet4(&sa_out, src_port_out, src_ip);
+                // Preserve historical 8-byte write for short user buffers.
                 _ = copy.copyToUser(@ptrFromInt(addr_ptr), &sa_out, 8);
                 if (addr_len_ptr != 0 and addr_len_ptr < 0x0000_8000_0000_0000) {
                     var al: [4]u8 = .{ 8, 0, 0, 0 };
@@ -403,6 +463,16 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     // UDP connect: set default destination
     if (t.fd_table.fds[fd].fd_type == .udp_socket) {
         if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -1;
+        if (t.fd_table.fds[fd].udp_is_v6) {
+            var sa6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
+            if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) < sa.SOCKADDR_IN6_LEN)
+                return -22;
+            const parsed = sa.parseInet6(&sa6) orelse return -97;
+            t.fd_table.fds[fd].udp_connected = true;
+            t.fd_table.fds[fd].udp_dst_ip6 = parsed.addr;
+            t.fd_table.fds[fd].udp_dst_port = parsed.port;
+            return 0;
+        }
         var sock_addr: [8]u8 = undefined;
         _ = copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), 8);
         const dst_port = bo.readU16BeAt(&sock_addr, 2);
