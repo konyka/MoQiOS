@@ -1371,7 +1371,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:SLAAC 地址在 DAD 通过前不可作源地址选用。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-85] ndp slaac dad preferred non-x86: OK`。
-- **后续**:启动时自动 RS;或源地址选用优先 preferred 全球地址。
+- **后续**:见 3.86（源地址选用,已完成)。
+
+---
+
+### 3.86 IPv6 源地址选用（SK-86,2026-07-22）
+
+- **背景**:SLAAC preferred 地址已有,但 UDP/TCP IPv6 TX 仍固定用 link-local。
+- **方案**:`ndp.selectSourceAddress` — LL 目的用 LL 源;否则优先同 /64 的
+  preferred 全球地址,再退回任意 preferred,最后 LL。接入 `sendToV6`/
+  `sendSegmentV6`/`tcpGetAddrInfo`/UDP `getsockname`。`shared/sk86.zig` 锁定
+  三类目的选择结果。
+- **效果**:有 SLAAC 地址后,发往全球目的时使用正确全球源地址。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-86] ipv6 source select non-x86: OK`。
+- **后续**:启动时自动 RS;或 off-link 目的走默认路由器转发。
 
 ---
 

@@ -296,6 +296,28 @@ pub fn getGlobalAddress() ?[16]u8 {
     return null;
 }
 
+/// Select IPv6 source address for `dst` (SK-86, RFC 6724 simplified).
+/// Link-local destinations use link-local source; otherwise prefer a
+/// preferred global that shares a /64 with `dst`, else any preferred global,
+/// else fall back to link-local.
+pub fn selectSourceAddress(dst: [16]u8, mac: [6]u8) [16]u8 {
+    const ll = generateLinkLocal(mac);
+    if (ipv6.isLinkLocal(dst)) return ll;
+
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+
+    var fallback: ?[16]u8 = null;
+    for (0..MAX_LOCAL_ADDRS) |i| {
+        const e = &local_addrs[i];
+        if (!e.valid or e.state != .preferred) continue;
+        if (ipv6.isLinkLocal(e.addr)) continue;
+        if (ipv6.prefixMatch(dst, e.addr, e.prefix_len)) return e.addr;
+        if (fallback == null) fallback = e.addr;
+    }
+    return fallback orelse ll;
+}
+
 /// Probe helper (SK-84/85): number of configured local addresses.
 pub fn probeLocalAddrCount() u32 {
     const flags = ndp_lock.acquire();

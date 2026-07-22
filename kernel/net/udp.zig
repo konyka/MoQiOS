@@ -177,7 +177,7 @@ pub fn sendToV6(dst_ip: [16]u8, dst_port: u16, src_port: u16, data: [*]const u8,
     };
 
     const our_mac = netif.getMac();
-    const our_ip = ndp.generateLinkLocal(our_mac);
+    const our_ip = ndp.selectSourceAddress(dst_ip, our_mac);
     const udp_total: u16 = 8 + data_len;
 
     // Offsets: eth 14 + ipv6 40 → UDP at 54.

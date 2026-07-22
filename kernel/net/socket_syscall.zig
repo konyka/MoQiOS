@@ -547,7 +547,8 @@ pub fn getsockname(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
     if (desc.fd_type == .udp_socket) {
         var sa_buf: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
         const our4 = netif.getOurIp();
-        const our6 = ndp.generateLinkLocal(netif.getMac());
+        // SK-86: prefer preferred global when reporting the local UDP name.
+        const our6 = ndp.getGlobalAddress() orelse ndp.generateLinkLocal(netif.getMac());
         const alen = sa.encodeUdpName(desc.udp_is_v6, desc.udp_port, our4, our6, &sa_buf);
         if (alen == 0) return -1;
         return copySockaddrToUser(addr_ptr, addrlen_ptr, sa_buf[0..alen], alen);

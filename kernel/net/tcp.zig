@@ -581,7 +581,7 @@ fn sendSegmentV6(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool
     };
 
     const our_mac = netif.getMac();
-    const our_ip = ndp.generateLinkLocal(our_mac);
+    const our_ip = ndp.selectSourceAddress(tcb.remote_ip6, our_mac);
     var send_pkt: [1518]u8 = @splat(0);
     const tcp_off: u16 = 14 + ipv6.HEADER_LEN;
     const tcp_total = fillTcpSegment(tcb, flags, data, data_len, &send_pkt, tcp_off);
@@ -2090,7 +2090,10 @@ pub fn tcpGetAddrInfo(tcb_idx: u32) ?AddrInfo {
         .local_ip = netif_mod.getOurIp(),
         .is_v6 = tcb.is_v6,
         .remote_ip6 = tcb.remote_ip6,
-        .local_ip6 = ndp_mod.generateLinkLocal(netif_mod.getMac()),
+        .local_ip6 = if (tcb.is_v6)
+            ndp_mod.selectSourceAddress(tcb.remote_ip6, netif_mod.getMac())
+        else
+            ndp_mod.generateLinkLocal(netif_mod.getMac()),
     };
 }
 
