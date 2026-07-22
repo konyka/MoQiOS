@@ -1125,7 +1125,25 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   可增长而非静默失败。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-68] fat32 dir slot placement non-x86: OK`。
-- **后续**:跨扇区的单条 LFN 链(槽跨越扇区边界),或其它 fs/net 纯层。
+- **后续**:见 3.69（跨扇区单条 LFN 链,已完成)。
+
+---
+
+### 3.69 FAT32 跨扇区 LFN 链写入（SK-69,2026-07-22）
+
+- **背景**:SK-68 的连续空槽搜索与写入仍以「扇区内」为隐含单位时,长名
+  LFN 链若从扇区尾部起跨入下一扇区/簇会放不下或写坏;`findConsecutiveFree`
+  只看单扇区窗口。
+- **方案**:`fat32_util` 增加 `splitDirIndex` / `findConsecutiveFreeMulti`(线性
+  下标跨多扇区,`0x00` EOF 延展到窗口末)。驱动侧 `DirPlace` 改为
+  `(cluster, sector_in_cluster, entry_index)`,`findFreeRunInRoot` 跨扇区/簇
+  累计 free run;`writeRootEntryRun` + `advanceRootPos` 流式写入整条链。
+  `shared/sk69.zig` 锁定跨界 start/end 拆分、间隙拒绝与 EOF 延展。
+- **效果**:单条 LFN+短项可跨越扇区与簇边界落盘;放置规则可在非 x86 纯验证。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-69] fat32 cross-sector dir run non-x86: OK`。
+- **后续**:其它 fs/net 纯层(如 `kernel/net` 上 tcp/udp over IPv6 TODO),或
+  更深目录(非根)的同样跨扇区放置。
 
 ---
 

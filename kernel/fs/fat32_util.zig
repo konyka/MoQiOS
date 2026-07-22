@@ -580,6 +580,44 @@ pub fn sectorHasDirEnd(sector: [*]const u8) bool {
     return false;
 }
 
+/// Split a linear directory-entry index into (sector_index, entry_in_sector).
+pub fn splitDirIndex(global_entry: u32) struct { sector: u32, entry: u32 } {
+    return .{ .sector = global_entry / 16, .entry = global_entry % 16 };
+}
+
+/// Find `need` consecutive free slots across a multi-sector directory window
+/// (LFN chains may span sector boundaries). Returns the starting linear entry
+/// index, or null.
+pub fn findConsecutiveFreeMulti(sectors: []const [*]const u8, need: u32) ?u32 {
+    if (need == 0 or sectors.len == 0) return null;
+    const total = @as(u32, @intCast(sectors.len)) * 16;
+    if (need > total) return null;
+
+    var run_start: ?u32 = null;
+    var run_len: u32 = 0;
+    var gi: u32 = 0;
+    while (gi < total) : (gi += 1) {
+        const sec = sectors[gi / 16];
+        const first = sec[(gi % 16) * 32];
+        const free = first == 0x00 or first == 0xE5;
+        if (free) {
+            if (run_start == null) run_start = gi;
+            run_len += 1;
+            if (run_len >= need) return run_start;
+            if (first == 0x00) {
+                // End-of-directory: the remainder of the window is empty.
+                const avail = total - (run_start orelse gi);
+                if (avail >= need) return run_start;
+                return null;
+            }
+        } else {
+            run_start = null;
+            run_len = 0;
+        }
+    }
+    return null;
+}
+
 /// Build forward-scan-ordered LFN entries for `utf8_name` keyed to `short_name`.
 /// Returns the number of 32-byte slots written into `out_entries`, or null.
 pub fn buildLfnEntries(
