@@ -58,6 +58,18 @@ var default_router_ip: [16]u8 = @splat(0);
 var default_router_lifetime_sec: u16 = 0;
 var default_router_valid: bool = false;
 
+/// SK-83: on-link / PIO prefixes from Router Advertisement.
+pub const MAX_PREFIXES: u32 = 8;
+pub const PrefixEntry = struct {
+    prefix: [16]u8 = @splat(0),
+    prefix_len: u8 = 0,
+    on_link: bool = false,
+    autonomous: bool = false,
+    valid_lifetime: u32 = 0,
+    valid: bool = false,
+};
+var prefix_table: [MAX_PREFIXES]PrefixEntry = @splat(.{});
+
 // v53.40: Protect neighbor_cache against interrupt vs syscall races
 var ndp_lock: IrqSpinlock = .{};
 
@@ -73,6 +85,9 @@ pub fn init() void {
     default_router_ip = @splat(0);
     default_router_lifetime_sec = 0;
     default_router_valid = false;
+    for (0..MAX_PREFIXES) |i| {
+        prefix_table[i] = .{};
+    }
 }
 
 /// Install or clear the default router from an RA (SK-82).
@@ -107,6 +122,77 @@ pub fn probeDefaultRouterLifetime() u16 {
     defer ndp_lock.release(flags);
     if (!default_router_valid) return 0;
     return default_router_lifetime_sec;
+}
+
+/// Install or refresh a Prefix Information entry (SK-83).
+/// `valid_lifetime == 0` deletes a matching prefix/len.
+pub fn setPrefix(
+    prefix: [16]u8,
+    prefix_len: u8,
+    on_link: bool,
+    autonomous: bool,
+    valid_lifetime: u32,
+) void {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    if (prefix_len > 128) return;
+
+    // Update or delete existing.
+    for (0..MAX_PREFIXES) |i| {
+        const e = &prefix_table[i];
+        if (!e.valid) continue;
+        if (e.prefix_len == prefix_len and ipv6.addrEq(e.prefix, prefix)) {
+            if (valid_lifetime == 0) {
+                e.* = .{};
+            } else {
+                e.on_link = on_link;
+                e.autonomous = autonomous;
+                e.valid_lifetime = valid_lifetime;
+            }
+            return;
+        }
+    }
+    if (valid_lifetime == 0) return;
+
+    // Insert into first free slot (drop if full).
+    for (0..MAX_PREFIXES) |i| {
+        const e = &prefix_table[i];
+        if (!e.valid) {
+            e.* = .{
+                .prefix = prefix,
+                .prefix_len = prefix_len,
+                .on_link = on_link,
+                .autonomous = autonomous,
+                .valid_lifetime = valid_lifetime,
+                .valid = true,
+            };
+            return;
+        }
+    }
+}
+
+/// True when `addr` is on-link (link-local or matching L-flag prefix) (SK-83).
+pub fn isOnLink(addr: [16]u8) bool {
+    if (ipv6.isLinkLocal(addr)) return true;
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    for (0..MAX_PREFIXES) |i| {
+        const e = &prefix_table[i];
+        if (!e.valid or !e.on_link or e.valid_lifetime == 0) continue;
+        if (ipv6.prefixMatch(addr, e.prefix, e.prefix_len)) return true;
+    }
+    return false;
+}
+
+/// Probe helper (SK-83): number of valid prefix entries.
+pub fn probePrefixCount() u32 {
+    const flags = ndp_lock.acquire();
+    defer ndp_lock.release(flags);
+    var n: u32 = 0;
+    for (0..MAX_PREFIXES) |i| {
+        if (prefix_table[i].valid) n += 1;
+    }
+    return n;
 }
 
 /// Lookup the cached MAC for a given IPv6 unicast address.

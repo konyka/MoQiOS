@@ -25,7 +25,20 @@ pub const NEIGHBOR_ADVERTISEMENT: u8 = 136;
 // NDP option types
 const OPT_SOURCE_LL_ADDR: u8 = 1;
 const OPT_TARGET_LL_ADDR: u8 = 2;
-// OPT_PREFIX_INFORMATION = 3 reserved for later prefix learning.
+const OPT_PREFIX_INFORMATION: u8 = 3;
+
+/// Max Prefix Information options retained from one RA (SK-83).
+pub const MAX_RA_PREFIXES: usize = 4;
+
+/// RFC 4861 §4.6.2 Prefix Information option fields.
+pub const PrefixInfo = struct {
+    prefix: [16]u8 = @splat(0),
+    prefix_len: u8 = 0,
+    on_link: bool = false,
+    autonomous: bool = false,
+    valid_lifetime: u32 = 0,
+    preferred_lifetime: u32 = 0,
+};
 
 /// Compute the ICMPv6 checksum over the pseudo-header + ICMPv6 message.
 /// `data` points at the start of the ICMPv6 header (with checksum field zeroed).
@@ -73,13 +86,15 @@ pub fn handlePacket(
     }
 }
 
-/// Parsed Router Advertisement fields used by SK-82 default-router learning.
+/// Parsed Router Advertisement fields (SK-82/83).
 pub const RouterAdvert = struct {
     hop_limit: u8 = 0,
     router_lifetime_sec: u16 = 0,
     reachable_ms: u32 = 0,
     retrans_ms: u32 = 0,
     source_ll: ?[6]u8 = null,
+    prefixes: [MAX_RA_PREFIXES]PrefixInfo = @splat(.{}),
+    prefix_count: u8 = 0,
 };
 
 /// Pure RA parser (RFC 4861 §4.2). Requires at least the 16-byte RA header.
@@ -104,6 +119,22 @@ pub fn parseRouterAdvertisement(data: [*]const u8, len: u16) ?RouterAdvert {
                 data[off + 2], data[off + 3], data[off + 4],
                 data[off + 5], data[off + 6], data[off + 7],
             };
+        } else if (opt_type == OPT_PREFIX_INFORMATION and opt_len >= 32) {
+            // type(1)+len(1)+prefix_len(1)+flags(1)+valid(4)+pref(4)+reserved(4)+prefix(16)
+            if (adv.prefix_count < MAX_RA_PREFIXES) {
+                const flags = data[off + 3];
+                var pfx: [16]u8 = undefined;
+                @memcpy(&pfx, data[off + 16 .. off + 32]);
+                adv.prefixes[adv.prefix_count] = .{
+                    .prefix = pfx,
+                    .prefix_len = data[off + 2],
+                    .on_link = (flags & 0x80) != 0,
+                    .autonomous = (flags & 0x40) != 0,
+                    .valid_lifetime = bo.readU32BeAt(data, off + 4),
+                    .preferred_lifetime = bo.readU32BeAt(data, off + 8),
+                };
+                adv.prefix_count += 1;
+            }
         }
         off += opt_len;
     }
@@ -116,6 +147,11 @@ fn handleRouterAdvertisement(src_ip: [16]u8, data: [*]const u8, len: u16) void {
         if (!ipv6.isUnspecified(src_ip)) ndp.update(src_ip, mac);
     }
     ndp.setDefaultRouter(src_ip, adv.router_lifetime_sec);
+    var i: u8 = 0;
+    while (i < adv.prefix_count) : (i += 1) {
+        const p = adv.prefixes[i];
+        ndp.setPrefix(p.prefix, p.prefix_len, p.on_link, p.autonomous, p.valid_lifetime);
+    }
 }
 
 /// Echo Reply: copy the request body, swap addresses, recompute checksum.

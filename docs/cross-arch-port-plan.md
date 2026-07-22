@@ -1331,7 +1331,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:可主动探测并缓存默认路由器(前缀学习留待后续)。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-82] ndp router solicit advert non-x86: OK`。
-- **后续**:启动时自动 RS;或 Prefix Information 选项/on-link 前缀表。
+- **后续**:见 3.83（Prefix Information / on-link 表,已完成)。
+
+---
+
+### 3.83 RA Prefix Information 与 on-link 前缀表（SK-83,2026-07-22）
+
+- **背景**:SK-82 只学默认路由器,忽略 PIO;无法判断目的地址是否 on-link。
+- **方案**:解析 type=3 Prefix Information;`ndp.setPrefix`/`isOnLink`;
+  `ipv6.prefixMatch`。link-local 恒为 on-link。`shared/sk83.zig` 锁定
+  `/64` 匹配、RA 安装与 lifetime=0 清除。
+- **效果**:可据 RA 前缀做 on-link 判定(SLAAC 地址生成留待后续)。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-83] ndp prefix on-link non-x86: OK`。
+- **后续**:启动时自动 RS;或 SLAAC 从 A-flag 前缀生成全球地址。
 
 ---
 

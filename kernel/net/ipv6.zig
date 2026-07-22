@@ -163,6 +163,21 @@ pub fn allRoutersLinkLocalMulticast() [16]u8 {
     return out;
 }
 
+/// True when `addr` matches `prefix`/`prefix_len` (SK-83 on-link checks).
+pub fn prefixMatch(addr: [16]u8, prefix: [16]u8, prefix_len: u8) bool {
+    if (prefix_len > 128) return false;
+    if (prefix_len == 0) return true;
+    const full_bytes: usize = prefix_len / 8;
+    const rem_bits: u3 = @intCast(prefix_len % 8);
+    var i: usize = 0;
+    while (i < full_bytes) : (i += 1) {
+        if (addr[i] != prefix[i]) return false;
+    }
+    if (rem_bits == 0) return true;
+    const mask: u8 = @as(u8, 0xFF) << @intCast(8 - @as(u8, rem_bits));
+    return (addr[full_bytes] & mask) == (prefix[full_bytes] & mask);
+}
+
 /// Compare two IPv6 addresses for equality.
 pub inline fn addrEq(a: [16]u8, b: [16]u8) bool {
     for (0..16) |i| if (a[i] != b[i]) return false;
