@@ -57,6 +57,8 @@ const RECV_BUF_SIZE: u32 = 65536;
 const RETRANSMIT_MS: u32 = 2000; // initial RTO (ms), overridden by Jacobson/Karels
 const TCP_RTO_MIN: u32 = 200; // minimum RTO (ms)
 const TCP_RTO_MAX: u32 = 60000; // maximum RTO (ms)
+/// RFC 6675 DupThresh for SACK loss detection (SK-112).
+const DUP_THRESH: u32 = 3;
 const DELAYED_ACK_MS: u32 = 100; // delay ACK by 100ms (reduces ACK count ~50%)
 
 /// Write `count` bytes from `src` into a ring buffer at `write_pos`.
@@ -1290,7 +1292,10 @@ fn driveTcbStateMachine(
 
                         tcb.dup_ack_count += 1;
 
-                        if (!tcb.in_recovery and tcb.dup_ack_count >= 3) {
+                        // SK-112: enter recovery on DupThresh dupacks OR RFC 6675 IsLost(snd_una).
+                        const enter_recovery = !tcb.in_recovery and
+                            (tcb.dup_ack_count >= DUP_THRESH or isLost(tcb, tcb.snd_una));
+                        if (enter_recovery) {
                             // Fast retransmit + fast recovery (SK-99: SMSS).
                             const smss_fr: u32 = mssForTcb(tcb);
                             tcb.in_recovery = true;
@@ -2377,6 +2382,34 @@ fn pipeBytes(tcb: *const TcpTcb) u32 {
     return flight - sacked;
 }
 
+/// SACKed octets with sequence numbers strictly above `seq` (SK-112).
+fn sackedBytesAbove(tcb: *const TcpTcb, seq: u32) u32 {
+    const after = seq +% 1;
+    if (!tcp_util.seqLt(after, tcb.snd_nxt)) return 0;
+    var n: u32 = 0;
+    for (0..tcb.sack_scoreboard_count) |i| {
+        const blk = tcb.sack_scoreboard[i];
+        n += sackRangeOverlap(after, tcb.snd_nxt, blk.left, blk.right);
+    }
+    return n;
+}
+
+/// Number of SACK blocks that begin after `seq` (SK-112).
+fn sackBlocksAbove(tcb: *const TcpTcb, seq: u32) u32 {
+    var n: u32 = 0;
+    for (0..tcb.sack_scoreboard_count) |i| {
+        const blk = tcb.sack_scoreboard[i];
+        if (tcp_util.seqLt(seq, blk.left)) n += 1;
+    }
+    return n;
+}
+
+/// RFC 6675 IsLost(SeqNum) (SK-112).
+fn isLost(tcb: *const TcpTcb, seq: u32) bool {
+    const smss: u32 = mssForTcb(tcb);
+    return probeIsLost(sackedBytesAbove(tcb, seq), sackBlocksAbove(tcb, seq), smss);
+}
+
 /// First sequence ≥ `snd_una` that still needs retransmission (SK-108).
 fn nextRexmitSeq(tcb: *const TcpTcb) u32 {
     var seq = tcb.snd_una;
@@ -2447,6 +2480,13 @@ pub fn probeSackOverlap(una: u32, nxt: u32, left: u32, right: u32) u32 {
 pub fn probePipeBytes(flight: u32, sacked: u32) u32 {
     if (sacked >= flight) return 0;
     return flight - sacked;
+}
+
+/// Probe helper (SK-112): RFC 6675 IsLost predicate.
+pub fn probeIsLost(sacked_above: u32, sack_blocks_above: u32, smss: u32) bool {
+    if (sack_blocks_above >= DUP_THRESH) return true;
+    if (smss > 0 and sacked_above >= (DUP_THRESH - 1) * smss) return true;
+    return false;
 }
 
 /// RFC 1122 keepalive probe SEQ = SND.UNA − 1 (SK-109).

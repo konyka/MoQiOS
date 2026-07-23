@@ -1714,7 +1714,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:SACK 恢复时更快注入新数据,提高丢包路径吞吐。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-111] tcp sack pipe accounting non-x86: OK`。
-- **后续**:RFC 6675 `IsLost` / DupThresh 精化;或 Delivery Rate 估计。
+- **后续**:见 3.112（IsLost 提前快重传,已完成)。
+
+---
+
+### 3.112 RFC 6675 IsLost 提前快重传（SK-112,2026-07-23）
+
+- **背景**:仅靠 3 次 dup ACK 进入快重传;SACK 已证明头部丢失时仍空等。
+- **方案**:实现 `IsLost(seq)`——上方 SACKed 字节 ≥ `(DupThresh-1)*SMSS` 或上方不连续
+  SACK 块数 ≥ DupThresh;与 dup ACK 计数并列触发恢复。
+  `shared/sk112.zig` 锁定字节/块数阈值与 smss=0 边界。
+- **效果**:多段丢失时更快开始修补空洞,缩短恢复时延。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-112] tcp sack islost early rexmit non-x86: OK`。
+- **后续**:Delivery Rate / BBR 类估计;或 `UpdateScoreboard` 增量合并精化。
 
 ---
 
