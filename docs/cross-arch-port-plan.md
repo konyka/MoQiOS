@@ -1650,7 +1650,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:默认 PLPMTUD 试探优先,盲抬升仅作超时回退。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-106] pmtu timer arm before raise non-x86: OK`。
-- **后续**:jumbo / 按 NIC 能力抬高 MAX_MTU;或把探测武装接到更多发送路径统计。
+- **后续**:见 3.107（PTB 冷却后自动再武装,已完成)。
+
+---
+
+### 3.107 PTB 冷却后自动再武装抬升探测（SK-107,2026-07-23）
+
+- **背景**:PTB/Frag Needed 后需等满 PMTU lifetime 才再有抬升机会,恢复过慢。
+- **方案**:`updatePathMtu` 安装/压低时启动 `PMTU_PROBE_COOLDOWN_SEC`(30s);
+  冷却结束自动 `probe_armed`;与 SK-106 的 `probe_window` 配合,避免同一次老化既武装又盲抬升。
+  `shared/sk107.zig` 锁定冷却前后天花板与 PTB 复位。
+- **效果**:路径变宽后数十秒内即可再试探,无需空等 600s。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-107] pmtu rearm after cooldown non-x86: OK`。
+- **后续**:jumbo / 按 NIC 能力抬高 MAX_MTU;或可配置冷却时间。
 
 ---
 

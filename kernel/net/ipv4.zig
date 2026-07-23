@@ -14,6 +14,8 @@ pub const LINK_MTU: u16 = 1500;
 pub const PMTU_LIFETIME_SEC: u32 = 600;
 /// Lifetime between raise-probe steps after expiry (SK-103).
 pub const PMTU_RAISE_LIFETIME_SEC: u32 = 60;
+/// After Frag Needed/lower, wait this long before auto-arming a raise probe (SK-107).
+pub const PMTU_PROBE_COOLDOWN_SEC: u32 = 30;
 pub const MAX_PMTU_ENTRIES: u32 = 8;
 /// IPv4 header (no options) for SMSS (SK-101).
 pub const HEADER_LEN: u16 = 20;
@@ -108,6 +110,10 @@ const PmtuEntry = struct {
     /// SK-105: allow one TX up to `probe_mtu` (> cached mtu).
     probe_armed: bool = false,
     probe_mtu: u16 = 0,
+    /// SK-107: seconds until auto-arm after a lower/install.
+    rearm_sec: u32 = 0,
+    /// True once the current armed probe has entered its raise window (SK-106/107).
+    probe_window: bool = false,
     valid: bool = false,
 };
 var pmtu_table: [MAX_PMTU_ENTRIES]PmtuEntry = @splat(.{});
@@ -142,6 +148,8 @@ pub fn updatePathMtu(dst: [4]u8, reported_mtu: u32) void {
             e.age_ms = 0;
             e.probe_armed = false;
             e.probe_mtu = 0;
+            e.rearm_sec = PMTU_PROBE_COOLDOWN_SEC;
+            e.probe_window = false;
             return;
         }
     }
@@ -153,6 +161,7 @@ pub fn updatePathMtu(dst: [4]u8, reported_mtu: u32) void {
                 .mtu = mtu,
                 .lifetime_sec = PMTU_LIFETIME_SEC,
                 .age_ms = 0,
+                .rearm_sec = PMTU_PROBE_COOLDOWN_SEC,
                 .valid = true,
             };
             return;
@@ -163,6 +172,7 @@ pub fn updatePathMtu(dst: [4]u8, reported_mtu: u32) void {
         .mtu = mtu,
         .lifetime_sec = PMTU_LIFETIME_SEC,
         .age_ms = 0,
+        .rearm_sec = PMTU_PROBE_COOLDOWN_SEC,
         .valid = true,
     };
 }
@@ -204,6 +214,8 @@ pub fn armRaiseProbe(dst: [4]u8) bool {
         if (e.mtu >= if_mtu) return false;
         e.probe_mtu = nextRaiseMtu(e.mtu, if_mtu);
         e.probe_armed = e.probe_mtu > e.mtu;
+        e.probe_window = false;
+        e.rearm_sec = 0;
         return e.probe_armed;
     }
     return false;
@@ -248,9 +260,11 @@ pub fn noteFullSizeSend(dst: [4]u8, ip_total_len: u16) void {
         if (e.mtu < if_mtu) {
             e.probe_mtu = nextRaiseMtu(e.mtu, if_mtu);
             e.probe_armed = e.probe_mtu > e.mtu;
+            e.probe_window = false;
         } else {
             e.probe_armed = false;
             e.probe_mtu = 0;
+            e.probe_window = false;
         }
         return;
     }
@@ -266,9 +280,19 @@ pub fn pathMtuTimerTick(ms_elapsed: u32) void {
         const e = &pmtu_table[i];
         if (!e.valid) continue;
         e.age_ms +%= ms_elapsed;
-        while (e.age_ms >= 1000 and e.lifetime_sec > 0) {
+        while (e.age_ms >= 1000) {
             e.age_ms -= 1000;
-            e.lifetime_sec -= 1;
+            if (e.lifetime_sec > 0) e.lifetime_sec -= 1;
+            // SK-107: after Frag Needed cooldown, auto-arm a raise probe.
+            if (e.rearm_sec > 0) {
+                e.rearm_sec -= 1;
+                if (e.rearm_sec == 0 and !e.probe_armed and e.mtu < if_mtu) {
+                    e.probe_mtu = nextRaiseMtu(e.mtu, if_mtu);
+                    e.probe_armed = e.probe_mtu > e.mtu;
+                    e.probe_window = false;
+                }
+            }
+            if (e.lifetime_sec == 0 and e.rearm_sec == 0) break;
         }
         if (e.lifetime_sec != 0) continue;
         if (e.mtu >= if_mtu) {
@@ -279,9 +303,16 @@ pub fn pathMtuTimerTick(ms_elapsed: u32) void {
         if (!e.probe_armed) {
             e.probe_mtu = nextRaiseMtu(e.mtu, if_mtu);
             e.probe_armed = e.probe_mtu > e.mtu;
+            e.probe_window = true;
             e.lifetime_sec = PMTU_RAISE_LIFETIME_SEC;
             e.age_ms = 0;
             if (e.probe_armed) continue;
+        } else if (!e.probe_window) {
+            // Armed by SK-107 cooldown (or explicit arm): start the probe window.
+            e.probe_window = true;
+            e.lifetime_sec = PMTU_RAISE_LIFETIME_SEC;
+            e.age_ms = 0;
+            continue;
         }
         // Probe window elapsed (or no larger plateau): blind-raise (SK-103).
         e.mtu = nextRaiseMtu(e.mtu, if_mtu);
@@ -290,6 +321,7 @@ pub fn pathMtuTimerTick(ms_elapsed: u32) void {
         // Leave disarmed so the next expiry arms a fresh probe (SK-106).
         e.probe_armed = false;
         e.probe_mtu = 0;
+        e.probe_window = false;
     }
 }
 

@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-23 (SK-106 timer arms PMTU probe first + prior SK-105 reviewed and verified)
+> Last update: 2026-07-23 (SK-107 PMTU rearm after cooldown + prior SK-106 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -438,6 +438,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | Raise waited only on timer | Full-MTU sends did not accelerate recovery. | SK-104: successful full-size TX steps one plateau early. |
 | Could not probe above PMTU | TX hard-capped at cached PMTU. | SK-105: armed oversized probe via `getSendMtu`. |
 | Timer blind-raised PMTU | Expiry raised cache with no TX proof. | SK-106: expiry arms probe first; blind raise is fallback. |
+| Slow PMTU recovery after PTB | Next probe waited for full PMTU lifetime. | SK-107: 30s cooldown auto-arms raise probe. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -447,8 +448,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-106] pmtu timer arm before raise non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-106] pmtu timer arm before raise non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-107] pmtu rearm after cooldown non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-107] pmtu rearm after cooldown non-x86: OK`. |
 
 ### 5.3 Historical Verification
 
