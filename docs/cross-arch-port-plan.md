@@ -1676,7 +1676,19 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:丢包恢复时少传已确认数据,提升快重传效率。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-108] sack selective retransmit non-x86: OK`。
-- **后续**:RFC 6675 管道与 `DupAcks` 精确计数;或 keepalive `SND.UNA-1` 探测。
+- **后续**:见 3.109（keepalive SND.UNA-1,已完成)。
+
+---
+
+### 3.109 TCP keepalive 使用 SND.UNA−1（SK-109,2026-07-23）
+
+- **背景**:keepalive 发 `snd_nxt` 空 ACK,对端常视为重复 ACK 而不响应,空闲探测失效。
+- **方案**:`sendKeepaliveProbe` 经 `sendSegmentSeq` 发送 SEQ=`snd_una-1` 的空 ACK(RFC 1122);
+  不推进 `snd_nxt`。`shared/sk109.zig` 锁定基本值与回绕。
+- **效果**:对端对窗外 SEQ 回 ACK,keepalive 能真正探测死连接。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-109] tcp keepalive snd.una-1 non-x86: OK`。
+- **后续**:零窗口 persist 探针;或 RFC 6675 SACK 管道计数。
 
 ---
 

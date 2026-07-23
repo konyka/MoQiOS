@@ -457,8 +457,10 @@ fn fillTcpSegment(
     data_len: u16,
     pkt: [*]u8,
     tcp_off: u16,
+    seq_override: ?u32,
 ) u16 {
-    const seq = tcb.snd_nxt;
+    // SK-109: keepalive probes use SND.UNA-1; normal TX uses snd_nxt.
+    const seq = seq_override orelse tcb.snd_nxt;
     const ack = if (flags & ACK != 0) tcb.rcv_nxt else 0;
 
     var opt_buf: [48]u8 = @splat(0);
@@ -622,7 +624,12 @@ pub fn probeIpv6RenoMinSsthresh(dst: [16]u8) u32 {
 
 /// Build and send a TCP segment (IPv4 or IPv6).
 fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
-    if (tcb.is_v6) return sendSegmentV6(tcb, flags, data, data_len);
+    return sendSegmentSeq(tcb, flags, data, data_len, null);
+}
+
+/// Like `sendSegment`, but may override the SEQ field (SK-109 keepalive).
+fn sendSegmentSeq(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16, seq_override: ?u32) bool {
+    if (tcb.is_v6) return sendSegmentV6Seq(tcb, flags, data, data_len, seq_override);
 
     // SK-101: segment payload must fit Path MTU − IPv4 − TCP headers.
     if (data_len > mssForTcb(tcb)) return false;
@@ -636,7 +643,7 @@ fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
     const our_mac = netif.getMac();
     const our_ip = netif.getOurIp();
     const tcp_off: u16 = 34;
-    const tcp_total = fillTcpSegment(tcb, flags, data, data_len, &send_pkt, tcp_off);
+    const tcp_total = fillTcpSegment(tcb, flags, data, data_len, &send_pkt, tcp_off, seq_override);
     // SK-101/105: honor Path MTU (or armed oversized raise probe).
     if (ipv4.HEADER_LEN + tcp_total > ipv4.getSendMtu(tcb.remote_ip)) return false;
     const csum = tcpChecksum(our_ip, tcb.remote_ip, send_pkt[tcp_off..].ptr, tcp_total);
@@ -652,6 +659,10 @@ fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
 
 /// IPv6 TCP TX (SK-76/87/98): on-link NDP or off-link via default router.
 fn sendSegmentV6(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
+    return sendSegmentV6Seq(tcb, flags, data, data_len, null);
+}
+
+fn sendSegmentV6Seq(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16, seq_override: ?u32) bool {
     // SK-98: segment payload must fit Path MTU − IPv6 − TCP headers.
     if (data_len > mssForTcb(tcb)) return false;
 
@@ -666,7 +677,7 @@ fn sendSegmentV6(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool
     const our_ip = ndp.selectSourceAddress(tcb.remote_ip6, our_mac);
     var send_pkt: [1518]u8 = @splat(0);
     const tcp_off: u16 = 14 + ipv6.HEADER_LEN;
-    const tcp_total = fillTcpSegment(tcb, flags, data, data_len, &send_pkt, tcp_off);
+    const tcp_total = fillTcpSegment(tcb, flags, data, data_len, &send_pkt, tcp_off, seq_override);
     // SK-97/105: honor Path MTU (or armed oversized raise probe).
     if (ipv6.HEADER_LEN + tcp_total > ipv6.getSendMtu(tcb.remote_ip6)) return false;
     const csum = tcpChecksumV6(our_ip, tcb.remote_ip6, send_pkt[tcp_off..].ptr, tcp_total);
@@ -1908,9 +1919,9 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
         const keep_intvl_ms = tcb.options.keep_intvl * 1000;
 
         if (tcb.idle_ms >= keep_idle_ms and tcb.keepalive_probes == 0) {
-            // First keepalive probe
+            // First keepalive probe (SK-109: SEQ = SND.UNA-1).
             tcb.keepalive_probes = 1;
-            _ = sendSegment(tcb, ACK, undefined, 0); // Send empty ACK as probe
+            _ = sendKeepaliveProbe(tcb);
         } else if (tcb.keepalive_probes > 0 and tcb.idle_ms >= keep_idle_ms + tcb.keepalive_probes * keep_intvl_ms) {
             if (tcb.keepalive_probes >= tcb.options.keep_cnt) {
                 // Max probes reached — connection is dead
@@ -1920,7 +1931,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
                 return;
             }
             tcb.keepalive_probes += 1;
-            _ = sendSegment(tcb, ACK, undefined, 0); // Send probe
+            _ = sendKeepaliveProbe(tcb);
         }
     }
 
@@ -2360,4 +2371,14 @@ pub fn probeNextRexmitSeq(snd_una: u32, snd_nxt: u32, sack_left: u32, sack_right
         seq = sack_right;
     }
     return snd_una;
+}
+
+/// RFC 1122 keepalive probe SEQ = SND.UNA − 1 (SK-109).
+pub fn probeKeepaliveSeq(snd_una: u32) u32 {
+    return snd_una -% 1;
+}
+
+/// Send an empty ACK with SEQ=SND.UNA-1 (SK-109). Does not advance snd_nxt.
+fn sendKeepaliveProbe(tcb: *TcpTcb) bool {
+    return sendSegmentSeq(tcb, ACK, undefined, 0, probeKeepaliveSeq(tcb.snd_una));
 }
