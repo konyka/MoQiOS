@@ -1741,7 +1741,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:跨 ACK 累积 SACK 证据,恢复路径更快更准。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-113] tcp sack scoreboard merge non-x86: OK`。
-- **后续**:Delivery Rate / BBR 类估计;或 PRR/undo 恢复精化。
+- **后续**:见 3.114（PRR 恢复,已完成)。
+
+---
+
+### 3.114 RFC 6937 PRR 快恢复（SK-114,2026-07-23）
+
+- **背景**:Reno 恢复期每 dup ACK 给 cwnd +SMSS、部分 ACK 再粗暴减去 acked,
+  多丢时注入过量或过少,吞吐抖动大。
+- **方案**:进入恢复时记录 RecoverFS;按 PRR 计算 sndcnt——pipe>ssthresh 用比例
+  削减,否则 SSRB 向 ssthresh 追赶;`cwnd = pipe + sndcnt`,发送累计 `prr_out`。
+  `shared/sk114.zig` 锁定 PR/SSRB 与上限。
+- **效果**:丢包恢复发送节奏贴近 ssthresh,减少过冲与欠注。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-114] tcp prr recovery non-x86: OK`。
+- **后续**:Delivery Rate / BBR 类估计;或 DSACK/undo 虚假重传恢复。
 
 ---
 

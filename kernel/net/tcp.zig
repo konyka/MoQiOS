@@ -153,12 +153,18 @@ const TcpTcb = struct {
     retransmit_timer: u32, // ms since last ack
     retransmit_count: u8,
 
-    // Congestion control (TCP Reno)
+    // Congestion control (TCP Reno + PRR in recovery, SK-114)
     cwnd: u32, // congestion window (bytes)
     ssthresh: u32, // slow start threshold (bytes)
     dup_ack_count: u3, // duplicate ACK counter
     in_recovery: bool, // fast recovery active
     recover_seq: u32, // seq number at recovery entry
+    /// Flight size at recovery entry (RFC 6937 RecoverFS).
+    recover_fs: u32,
+    /// Bytes newly delivered (ACKed/SACKed) during recovery.
+    prr_delivered: u32,
+    /// Bytes sent during recovery (PRR).
+    prr_out: u32,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -270,6 +276,9 @@ pub fn initTcbs() void {
             .dup_ack_count = 0,
             .in_recovery = false,
             .recover_seq = 0,
+            .recover_fs = 0,
+            .prr_delivered = 0,
+            .prr_out = 0,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -324,6 +333,9 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].dup_ack_count = 0;
     tcbs[i].in_recovery = false;
     tcbs[i].recover_seq = 0;
+    tcbs[i].recover_fs = 0;
+    tcbs[i].prr_delivered = 0;
+    tcbs[i].prr_out = 0;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -1212,6 +1224,7 @@ fn driveTcbStateMachine(
                     // v53.3: ack_num must be within [snd_una+1, snd_nxt] range
                     const in_flight = tcb.snd_nxt -% tcb.snd_una;
                     if (acked > 0 and acked <= in_flight and acked <= SEND_BUF_SIZE) {
+                        const sacked_before = sackedBytesInFlight(tcb);
                         tcb.snd_una = ack_num;
                         // v53.2: advance send_head to free acknowledged buffer space
                         // Without this, the ring buffer permanently fills → connection deadlock
@@ -1225,6 +1238,12 @@ fn driveTcbStateMachine(
                         } else {
                             updateScoreboard(tcb, &.{});
                         }
+                        const sacked_after = sackedBytesInFlight(tcb);
+                        const newly_sacked: u32 = if (sacked_after > sacked_before)
+                            sacked_after - sacked_before
+                        else
+                            0;
+                        const delivered = acked + newly_sacked;
 
                         // Keepalive: reset idle timer and probe count on new ACK
                         tcb.idle_ms = 0;
@@ -1248,22 +1267,19 @@ fn driveTcbStateMachine(
                             }
                         }
 
-                        // TCP Reno: congestion control on new ACK (SK-99: SMSS).
+                        // Congestion control on new ACK (SK-99 SMSS; SK-114 PRR in recovery).
                         const smss: u32 = mssForTcb(tcb);
                         if (tcb.in_recovery) {
-                            // Fast recovery: partial ACK
-                            // Shrink cwnd by the amount acked (Reno partial)
-                            if (tcb.cwnd > acked) {
-                                tcb.cwnd -= @intCast(acked);
-                            } else {
-                                tcb.cwnd = smss;
-                            }
-                            // If this ACK covers recover_seq, exit recovery
                             if (ack_num -% 1 >= tcb.recover_seq) {
                                 tcb.in_recovery = false;
-                                // Set cwnd to ssthresh (deflate)
                                 tcb.cwnd = tcb.ssthresh;
                                 tcb.dup_ack_count = 0;
+                                tcb.recover_fs = 0;
+                                tcb.prr_delivered = 0;
+                                tcb.prr_out = 0;
+                            } else {
+                                applyPrr(tcb, delivered);
+                                flushSendBuffer(tcb);
                             }
                         } else {
                             // Normal: increase cwnd
@@ -1286,10 +1302,16 @@ fn driveTcbStateMachine(
                 } else {
                     // Duplicate ACK (ack_num == snd_una)
                     if (payload_len == 0) {
+                        const sacked_before = sackedBytesInFlight(tcb);
                         // SK-113: merge incoming SACK blocks into the scoreboard.
                         if (opts.sack_block_count > 0) {
                             updateScoreboard(tcb, opts.sack_blocks[0..opts.sack_block_count]);
                         }
+                        const sacked_after = sackedBytesInFlight(tcb);
+                        const delivered: u32 = if (sacked_after > sacked_before)
+                            sacked_after - sacked_before
+                        else
+                            0;
 
                         tcb.dup_ack_count += 1;
 
@@ -1297,12 +1319,19 @@ fn driveTcbStateMachine(
                         const enter_recovery = !tcb.in_recovery and
                             (tcb.dup_ack_count >= DUP_THRESH or isLost(tcb, tcb.snd_una));
                         if (enter_recovery) {
-                            // Fast retransmit + fast recovery (SK-99: SMSS).
+                            // Fast retransmit + PRR recovery (SK-114).
                             const smss_fr: u32 = mssForTcb(tcb);
+                            const pipe = pipeBytes(tcb);
                             tcb.in_recovery = true;
                             tcb.recover_seq = tcb.snd_nxt;
                             tcb.ssthresh = @max(tcb.cwnd / 2, 2 * smss_fr);
-                            tcb.cwnd = tcb.ssthresh + 3 * smss_fr;
+                            tcb.recover_fs = @max(pipe, 1);
+                            tcb.prr_delivered = 0;
+                            tcb.prr_out = 0;
+                            applyPrr(tcb, delivered);
+                            // Force at least one SMSS for the fast retransmit.
+                            const pipe2 = pipeBytes(tcb);
+                            if (tcb.cwnd < pipe2 + smss_fr) tcb.cwnd = pipe2 + smss_fr;
 
                             // SK-108: retransmit the first non-SACKed hole, not always snd_una.
                             const unacked = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
@@ -1312,9 +1341,7 @@ fn driveTcbStateMachine(
                             }
                             tcpLog("[tcp] fast retransmit\n");
                         } else if (tcb.in_recovery) {
-                            // Fast recovery: inflate cwnd by 1 SMSS per dup ACK
-                            tcb.cwnd += @as(u32, mssForTcb(tcb));
-                            // SK-111: newly SACKed bytes shrink pipe — try to fill cwnd.
+                            applyPrr(tcb, delivered);
                             flushSendBuffer(tcb);
                         }
                     }
@@ -1690,6 +1717,7 @@ fn flushSendBuffer(tcb: *TcpTcb) void {
         ringRead(&tcb.send_buf, SEND_BUF_SIZE, tcb.send_unacked, &seg_buf, can_send);
         tcb.send_unacked = (tcb.send_unacked + can_send) % SEND_BUF_SIZE;
         _ = sendSegment(tcb, ACK | PSH, &seg_buf, @intCast(can_send));
+        if (tcb.in_recovery) tcb.prr_out +%= can_send;
         // ACK piggybacked on data — clear any pending delayed ACK
         tcb.delayed_ack_pending = false;
         tcb.delayed_ack_ms = 0;
@@ -1897,6 +1925,9 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             tcb.cwnd = smss_rto; // back to slow start
             tcb.in_recovery = false;
             tcb.dup_ack_count = 0;
+            tcb.recover_fs = 0;
+            tcb.prr_delivered = 0;
+            tcb.prr_out = 0;
 
             // Exponential backoff for RTO
             tcb.rto = @min(tcb.rto * 2, TCP_RTO_MAX);
@@ -2573,6 +2604,46 @@ pub fn probeIsLost(sacked_above: u32, sack_blocks_above: u32, smss: u32) bool {
     if (sack_blocks_above >= DUP_THRESH) return true;
     if (smss > 0 and sacked_above >= (DUP_THRESH - 1) * smss) return true;
     return false;
+}
+
+/// RFC 6937 PRR sndcnt in bytes (SK-114).
+/// When pipe > ssthresh: CEIL(prr_delivered * ssthresh / RecoverFS) − prr_out.
+/// Else SSRB: MIN(ssthresh − pipe, MAX(prr_delivered − prr_out, DeliveredData)).
+pub fn probePrrSndcnt(
+    pipe: u32,
+    ssthresh: u32,
+    recover_fs: u32,
+    prr_delivered: u32,
+    prr_out: u32,
+    delivered_data: u32,
+) u32 {
+    const fs = if (recover_fs == 0) @as(u32, 1) else recover_fs;
+    if (pipe > ssthresh) {
+        const target64 = (@as(u64, prr_delivered) * @as(u64, ssthresh) + fs - 1) / fs;
+        const target: u32 = @intCast(@min(target64, @as(u64, 0xffff_ffff)));
+        if (target > prr_out) return target - prr_out;
+        return 0;
+    }
+    var sndcnt: u32 = if (prr_delivered > prr_out) prr_delivered - prr_out else 0;
+    if (delivered_data > sndcnt) sndcnt = delivered_data;
+    const limit: u32 = if (ssthresh > pipe) ssthresh - pipe else 0;
+    if (sndcnt > limit) sndcnt = limit;
+    return sndcnt;
+}
+
+/// Apply PRR after DeliveredData bytes arrive during recovery (SK-114).
+fn applyPrr(tcb: *TcpTcb, delivered_data: u32) void {
+    tcb.prr_delivered +%= delivered_data;
+    const pipe = pipeBytes(tcb);
+    const sndcnt = probePrrSndcnt(
+        pipe,
+        tcb.ssthresh,
+        tcb.recover_fs,
+        tcb.prr_delivered,
+        tcb.prr_out,
+        delivered_data,
+    );
+    tcb.cwnd = pipe + sndcnt;
 }
 
 /// RFC 1122 keepalive probe SEQ = SND.UNA − 1 (SK-109).
