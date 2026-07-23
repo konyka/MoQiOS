@@ -1701,7 +1701,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:零窗口死锁可恢复,吞吐在对端重新开窗后继续。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-110] tcp zero-window persist non-x86: OK`。
-- **后续**:RFC 6675 SACK 管道计数;或 persist 与 RTO 计时器交互细化。
+- **后续**:见 3.111（SACK pipe 计数,已完成)。
+
+---
+
+### 3.111 RFC 6675 SACK pipe 计数（SK-111,2026-07-23）
+
+- **背景**:发送窗口用 `snd_nxt−snd_una` 计在途,已 SACK 字节仍占 pipe,快恢复期间无法填窗。
+- **方案**:`pipeBytes = flight − sackedBytesInFlight`;`flushSendBuffer` 用 pipe 判定可发量;
+  快恢复下每收到带 SACK 的 dup ACK 后尝试 `flushSendBuffer`。
+  `shared/sk111.zig` 锁定区间相交与 pipe 公式。
+- **效果**:SACK 恢复时更快注入新数据,提高丢包路径吞吐。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-111] tcp sack pipe accounting non-x86: OK`。
+- **后续**:RFC 6675 `IsLost` / DupThresh 精化;或 Delivery Rate 估计。
 
 ---
 

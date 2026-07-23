@@ -1308,6 +1308,8 @@ fn driveTcbStateMachine(
                         } else if (tcb.in_recovery) {
                             // Fast recovery: inflate cwnd by 1 SMSS per dup ACK
                             tcb.cwnd += @as(u32, mssForTcb(tcb));
+                            // SK-111: newly SACKed bytes shrink pipe — try to fill cwnd.
+                            flushSendBuffer(tcb);
                         }
                     }
                 }
@@ -1659,7 +1661,8 @@ fn flushSendBuffer(tcb: *TcpTcb) void {
         skipSackedSendRange(tcb);
         const mss = mssForTcb(tcb);
         const pending = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
-        const in_flight = tcb.snd_nxt -% tcb.snd_una;
+        // SK-111: RFC 6675 pipe excludes SACKed bytes still above snd_una.
+        const in_flight = pipeBytes(tcb);
         const effective_wnd = @min(tcb.cwnd, tcb.snd_wnd);
         const window_avail = if (effective_wnd > in_flight) effective_wnd - in_flight else 0;
         const can_send = @min(pending, window_avail, mss);
@@ -2345,6 +2348,35 @@ fn isSacked(tcb: *const TcpTcb, seq: u32) bool {
     return false;
 }
 
+/// Bytes of `[left,right)` that overlap `[una,nxt)` (SK-111).
+fn sackRangeOverlap(una: u32, nxt: u32, left: u32, right: u32) u32 {
+    if (!tcp_util.seqLt(left, right)) return 0;
+    if (!tcp_util.seqLt(una, nxt)) return 0;
+    // Intersection start = max(una, left), end = min(nxt, right) in seq space.
+    const start = if (tcp_util.seqLt(left, una)) una else left;
+    const end = if (tcp_util.seqLt(right, nxt)) right else nxt;
+    if (!tcp_util.seqLt(start, end)) return 0;
+    return end -% start;
+}
+
+/// SACKed bytes still between snd_una and snd_nxt (SK-111).
+fn sackedBytesInFlight(tcb: *const TcpTcb) u32 {
+    var n: u32 = 0;
+    for (0..tcb.sack_scoreboard_count) |i| {
+        const blk = tcb.sack_scoreboard[i];
+        n += sackRangeOverlap(tcb.snd_una, tcb.snd_nxt, blk.left, blk.right);
+    }
+    return n;
+}
+
+/// RFC 6675 pipe: outstanding bytes that are not SACKed (SK-111).
+fn pipeBytes(tcb: *const TcpTcb) u32 {
+    const flight = tcb.snd_nxt -% tcb.snd_una;
+    const sacked = sackedBytesInFlight(tcb);
+    if (sacked >= flight) return 0;
+    return flight - sacked;
+}
+
 /// First sequence ≥ `snd_una` that still needs retransmission (SK-108).
 fn nextRexmitSeq(tcb: *const TcpTcb) u32 {
     var seq = tcb.snd_una;
@@ -2404,6 +2436,17 @@ pub fn probeNextRexmitSeq(snd_una: u32, snd_nxt: u32, sack_left: u32, sack_right
         seq = sack_right;
     }
     return snd_una;
+}
+
+/// Probe helper (SK-111): overlap of one SACK block with [una,nxt).
+pub fn probeSackOverlap(una: u32, nxt: u32, left: u32, right: u32) u32 {
+    return sackRangeOverlap(una, nxt, left, right);
+}
+
+/// Probe helper (SK-111): pipe = flight − sacked.
+pub fn probePipeBytes(flight: u32, sacked: u32) u32 {
+    if (sacked >= flight) return 0;
+    return flight - sacked;
 }
 
 /// RFC 1122 keepalive probe SEQ = SND.UNA − 1 (SK-109).
