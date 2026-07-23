@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-23 (SK-118 RACK-lite + prior SK-117 reviewed and verified)
+> Last update: 2026-07-23 (SK-119 delivery rate/BDP + prior SK-118 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -450,6 +450,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | Spurious RTO stuck | Delayed ACK cut cwnd with no F-RTO probe. | SK-116: RFC 5682 F-RTO undoes after two new ACKs. |
 | Tail loss waited for RTO | Lost last segments produced no dupack/SACK. | SK-117: TLP probes at ~2·SRTT without cutting cwnd. |
 | Slow recovery with sparse SACK | DupThresh/IsLost waited despite timed-out head. | SK-118: RACK-lite enters recovery after SRTT+reo_wnd. |
+| Post-recovery cwnd undershoot | Exit always set cwnd=ssthresh below measured BDP. | SK-119: delivery-rate sample floors cwnd at min(BDP,2·ssthresh). |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -459,8 +460,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-118] tcp rack-lite head loss non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-118] tcp rack-lite head loss non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-119] tcp delivery rate bdp non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-119] tcp delivery rate bdp non-x86: OK`. |
 
 ### 5.3 Historical Verification
 

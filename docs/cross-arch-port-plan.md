@@ -1810,7 +1810,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:中等乱序/少量 SACK 场景更快重传头部,缩短恢复时延。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-118] tcp rack-lite head loss non-x86: OK`。
-- **后续**:Delivery Rate / BBR 类估计;或完整 RACK per-segment 时间戳。
+- **后续**:见 3.119（Delivery Rate / BDP,已完成)。
+
+---
+
+### 3.119 Delivery Rate 与 BDP 窗口下限（SK-119,2026-07-23）
+
+- **背景**:退出快恢复时 `cwnd=ssthresh` 常远低于刚测得的可用带宽,爬升慢。
+- **方案**:按 ACK/SACK 交付字节采样 `delivery_rate`(B/s),并跟踪 `min_rtt`;
+  退出恢复时把 cwnd 抬到 `min(BDP, 2·ssthresh)`。为后续 BBR 铺路。
+  `shared/sk119.zig` 锁定 rate/BDP 公式。
+- **效果**:恢复后更快回到测得带宽对应窗口,提高吞吐爬升速度。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-119] tcp delivery rate bdp non-x86: OK`。
+- **后续**:BBR 类 pacing/启动;或完整 RACK per-segment 时间戳。
 
 ---
 

@@ -177,6 +177,12 @@ const TcpTcb = struct {
     tlp_sent: bool,
     /// Last (re)transmit time of SND.UNA head; 0 = unknown (SK-118).
     head_xmit_ms: u32,
+    /// Estimated delivery rate (bytes/sec) (SK-119).
+    delivery_rate: u32,
+    /// Timestamp of last delivery-rate sample (SK-119).
+    rate_sample_ms: u32,
+    /// Minimum observed RTT (ms); 0 = none (SK-119).
+    min_rtt_ms: u32,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -297,6 +303,9 @@ pub fn initTcbs() void {
             .snd_max = 0,
             .tlp_sent = false,
             .head_xmit_ms = 0,
+            .delivery_rate = 0,
+            .rate_sample_ms = 0,
+            .min_rtt_ms = 0,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -360,6 +369,9 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].snd_max = 0;
     tcbs[i].tlp_sent = false;
     tcbs[i].head_xmit_ms = 0;
+    tcbs[i].delivery_rate = 0;
+    tcbs[i].rate_sample_ms = 0;
+    tcbs[i].min_rtt_ms = 0;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -899,9 +911,38 @@ fn updateRtt(tcb: *TcpTcb, m: u32) void {
         tcb.rttvar = (3 * tcb.rttvar + delta) / 4;
         tcb.srtt = (7 * tcb.srtt + m) / 8;
     }
+    // SK-119: track min RTT for BDP.
+    if (m > 0 and (tcb.min_rtt_ms == 0 or m < tcb.min_rtt_ms)) tcb.min_rtt_ms = m;
     tcb.rto = tcb.srtt + @max(200, 4 * tcb.rttvar);
     if (tcb.rto < TCP_RTO_MIN) tcb.rto = TCP_RTO_MIN;
     if (tcb.rto > TCP_RTO_MAX) tcb.rto = TCP_RTO_MAX;
+}
+
+/// Update delivery-rate sample from newly delivered bytes (SK-119).
+fn noteDelivery(tcb: *TcpTcb, delivered: u32) void {
+    if (delivered == 0) return;
+    const now = timestampMs();
+    if (tcb.rate_sample_ms != 0) {
+        const elapsed = now -% tcb.rate_sample_ms;
+        if (elapsed > 0) {
+            const inst = probeDeliveryRateBps(delivered, elapsed);
+            if (inst >= tcb.delivery_rate) {
+                tcb.delivery_rate = inst;
+            } else {
+                tcb.delivery_rate = (tcb.delivery_rate * 7 + inst) / 8;
+            }
+        }
+    }
+    tcb.rate_sample_ms = now;
+}
+
+/// After recovery, floor cwnd at measured BDP (capped at 2·ssthresh) (SK-119).
+fn applyBdpCwndFloor(tcb: *TcpTcb) void {
+    const bdp = probeBdpBytes(tcb.delivery_rate, tcb.min_rtt_ms);
+    if (bdp == 0) return;
+    const cap = if (tcb.ssthresh > 0x7fff_ffff) 0xffff_ffff else tcb.ssthresh *% 2;
+    const floor = if (bdp < cap) bdp else cap;
+    if (floor > tcb.cwnd) tcb.cwnd = floor;
 }
 
 fn applyPeerMss(tcb: *TcpTcb, opts: TcpOptions) void {
@@ -1288,6 +1329,8 @@ fn driveTcbStateMachine(
                         else
                             0;
                         const delivered = acked + newly_sacked;
+                        // SK-119: sample delivery rate from ACKed/SACKed bytes.
+                        noteDelivery(tcb, delivered);
 
                         // Keepalive: reset idle timer and probe count on new ACK
                         tcb.idle_ms = 0;
@@ -1325,6 +1368,8 @@ fn driveTcbStateMachine(
                             if (ack_num -% 1 >= tcb.recover_seq) {
                                 tcb.in_recovery = false;
                                 tcb.cwnd = tcb.ssthresh;
+                                // SK-119: do not undershoot measured BDP after recovery.
+                                applyBdpCwndFloor(tcb);
                                 tcb.dup_ack_count = 0;
                                 tcb.recover_fs = 0;
                                 tcb.prr_delivered = 0;
@@ -1377,6 +1422,7 @@ fn driveTcbStateMachine(
                             sacked_after - sacked_before
                         else
                             0;
+                        noteDelivery(tcb, delivered);
 
                         tcb.dup_ack_count += 1;
 
@@ -2814,6 +2860,20 @@ fn restoreSendHigh(tcb: *TcpTcb) void {
     if (skip > pending) return;
     tcb.snd_nxt = tcb.snd_max;
     tcb.send_unacked = (tcb.send_head + skip) % SEND_BUF_SIZE;
+}
+
+/// Instantaneous delivery rate in bytes/sec (SK-119).
+pub fn probeDeliveryRateBps(delivered: u32, elapsed_ms: u32) u32 {
+    if (elapsed_ms == 0 or delivered == 0) return 0;
+    const v = (@as(u64, delivered) * 1000) / elapsed_ms;
+    return @intCast(@min(v, @as(u64, 0xffff_ffff)));
+}
+
+/// Bandwidth-delay product in bytes: rate_bps · min_rtt_ms / 1000 (SK-119).
+pub fn probeBdpBytes(rate_bps: u32, min_rtt_ms: u32) u32 {
+    if (rate_bps == 0 or min_rtt_ms == 0) return 0;
+    const v = (@as(u64, rate_bps) * min_rtt_ms) / 1000;
+    return @intCast(@min(v, @as(u64, 0xffff_ffff)));
 }
 
 /// RFC 8985-inspired reordering window: max(SRTT/4, 1ms) (SK-118).
