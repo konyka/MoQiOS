@@ -1765,12 +1765,25 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   仍停留在减半后的 cwnd/ssthresh,吞吐长期受损。
 - **方案**:进入恢复前保存 `undo_cwnd`/`undo_ssthresh`;按 RFC 2883 识别首块
   已在累计 ACK 之下或为后续 SACK 子集的 DSACK,则恢复窗口并退出恢复。
-  接收路径对完全重复段把 DSACK 放在首块。RTO 清除 undo。
+  接收路径对完全重复段把 DSACK 放在首块。
   `shared/sk115.zig` 锁定 DSACK 判定。
 - **效果**:虚假重传后尽快回到原拥塞窗口,减少乱序路径的吞吐塌陷。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-115] tcp dsack undo non-x86: OK`。
-- **后续**:Delivery Rate / BBR 类估计;或 F-RTO 虚假超时恢复。
+- **后续**:见 3.116（F-RTO,已完成)。
+
+---
+
+### 3.116 RFC 5682 F-RTO 虚假超时（SK-116,2026-07-23）
+
+- **背景**:ACK 延迟可触发 RTO;发送端立刻减半 cwnd 并重传,即使段并未丢失。
+- **方案**:RTO 后只重传 1 个 SMSS 并进入 F-RTO;首个新 ACK 改为发送新数据,
+  第二个新 ACK 则 undo 窗口;期间若收到 dup ACK 则判定为真丢失并放弃 undo。
+  用 `snd_max` 在 rexmit rewind 后恢复发送高水位。`shared/sk116.zig` 锁定状态机。
+- **效果**:虚假超时时恢复原 cwnd,避免延迟 ACK 路径的吞吐塌陷。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-116] tcp f-rto spurious rto non-x86: OK`。
+- **后续**:Delivery Rate / BBR 类估计;或 RACK/TLP 损失检测。
 
 ---
 

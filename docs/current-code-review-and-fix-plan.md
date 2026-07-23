@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-23 (SK-115 DSACK undo + prior SK-114 reviewed and verified)
+> Last update: 2026-07-23 (SK-116 F-RTO + prior SK-115 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -447,6 +447,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | Scoreboard replaced / wiped | Latest SACK option overwrote prior holes; new ACK cleared all. | SK-113: UpdateScoreboard merges, clips by [una,nxt), keeps ≤4. |
 | Reno recovery overshot pipe | +SMSS/dupack and −acked/partial ignored pipe vs ssthresh. | SK-114: RFC 6937 PRR paces cwnd = pipe + sndcnt. |
 | Spurious fast retransmit stuck | Reordering halved cwnd with no undo path. | SK-115: RFC 2883 DSACK restores prior cwnd/ssthresh. |
+| Spurious RTO stuck | Delayed ACK cut cwnd with no F-RTO probe. | SK-116: RFC 5682 F-RTO undoes after two new ACKs. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -456,8 +457,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-115] tcp dsack undo non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-115] tcp dsack undo non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-116] tcp f-rto spurious rto non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-116] tcp f-rto spurious rto non-x86: OK`. |
 
 ### 5.3 Historical Verification
 

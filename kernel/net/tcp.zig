@@ -165,10 +165,14 @@ const TcpTcb = struct {
     prr_delivered: u32,
     /// Bytes sent during recovery (PRR).
     prr_out: u32,
-    /// Pre-reduction cwnd for DSACK undo (0 = none) (SK-115).
+    /// Pre-reduction cwnd for DSACK/F-RTO undo (0 = none) (SK-115/116).
     undo_cwnd: u32,
-    /// Pre-reduction ssthresh for DSACK undo (SK-115).
+    /// Pre-reduction ssthresh for DSACK/F-RTO undo (SK-115/116).
     undo_ssthresh: u32,
+    /// RFC 5682 F-RTO: 0=off, 1=wait 1st ACK, 2=wait 2nd ACK (SK-116).
+    frto: u2,
+    /// Highest sequence ever sent (survives rexmit rewind) (SK-116).
+    snd_max: u32,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -285,6 +289,8 @@ pub fn initTcbs() void {
             .prr_out = 0,
             .undo_cwnd = 0,
             .undo_ssthresh = 0,
+            .frto = 0,
+            .snd_max = 0,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -344,6 +350,8 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].prr_out = 0;
     tcbs[i].undo_cwnd = 0;
     tcbs[i].undo_ssthresh = 0;
+    tcbs[i].frto = 0;
+    tcbs[i].snd_max = 0;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -590,6 +598,8 @@ fn advanceSndNxt(tcb: *TcpTcb, flags: u8, data_len: u16) void {
     if (data_len > 0) tcb.snd_nxt +%= data_len;
     if (flags & SYN != 0) tcb.snd_nxt +%= 1;
     if (flags & FIN != 0) tcb.snd_nxt +%= 1;
+    // SK-116: track highest sent so F-RTO can restore after rexmit rewind.
+    if (tcp_util.seqLt(tcb.snd_max, tcb.snd_nxt)) tcb.snd_max = tcb.snd_nxt;
 }
 
 /// Local SMSS before peer clamp (SK-98/100/101).
@@ -1281,9 +1291,17 @@ fn driveTcbStateMachine(
                             }
                         }
 
-                        // Congestion control on new ACK (SK-99 SMSS; SK-114 PRR in recovery).
+                        // Congestion control on new ACK (SK-99 SMSS; SK-114 PRR; SK-116 F-RTO).
                         const smss: u32 = mssForTcb(tcb);
-                        if (tcb.in_recovery) {
+                        const frto_act = probeFrtoOnAck(tcb.frto, true);
+                        tcb.frto = frto_act.frto;
+                        if (frto_act.undo) {
+                            tryUndoSpurious(tcb);
+                        } else if (frto_act.send_new) {
+                            // First new ACK after RTO: probe with new data, keep reduced cwnd.
+                            restoreSendHigh(tcb);
+                            flushSendBuffer(tcb);
+                        } else if (tcb.in_recovery) {
                             if (ack_num -% 1 >= tcb.recover_seq) {
                                 tcb.in_recovery = false;
                                 tcb.cwnd = tcb.ssthresh;
@@ -1316,6 +1334,13 @@ fn driveTcbStateMachine(
                 } else {
                     // Duplicate ACK (ack_num == snd_una)
                     if (payload_len == 0) {
+                        // SK-116: dup ACK during F-RTO ⇒ timeout was real loss.
+                        const frto_dup = probeFrtoOnAck(tcb.frto, false);
+                        tcb.frto = frto_dup.frto;
+                        if (frto_dup.clear_undo) {
+                            tcb.undo_cwnd = 0;
+                            tcb.undo_ssthresh = 0;
+                        }
                         // SK-115: detect DSACK before scoreboard clips below-ACK ranges.
                         if (opts.sack_block_count > 0 and
                             probeIsDsack(ack_num, opts.sack_blocks[0..opts.sack_block_count]))
@@ -1949,8 +1974,10 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
                 deactivateTcb(tcb);
                 return;
             }
-            // RTO timeout: Reno behavior — ssthresh = cwnd/2, cwnd = 1 SMSS (SK-99).
+            // RTO timeout: Reno cut + F-RTO probe (SK-99/116).
             const smss_rto: u32 = mssForTcb(tcb);
+            tcb.undo_cwnd = tcb.cwnd;
+            tcb.undo_ssthresh = tcb.ssthresh;
             tcb.ssthresh = @max(tcb.cwnd / 2, 2 * smss_rto);
             tcb.cwnd = smss_rto; // back to slow start
             tcb.in_recovery = false;
@@ -1958,14 +1985,15 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             tcb.recover_fs = 0;
             tcb.prr_delivered = 0;
             tcb.prr_out = 0;
-            // SK-115: RTO is a hard loss signal — do not undo.
-            tcb.undo_cwnd = 0;
-            tcb.undo_ssthresh = 0;
+            // SK-116: enter F-RTO; keep undo until confirmed spurious or lossy.
+            tcb.frto = 1;
+            if (tcp_util.seqLt(tcb.snd_max, tcb.snd_nxt)) tcb.snd_max = tcb.snd_nxt;
 
             // Exponential backoff for RTO
             tcb.rto = @min(tcb.rto * 2, TCP_RTO_MAX);
 
             // SK-108: RTO also starts at the first non-SACKed hole when possible.
+            // cwnd=1 SMSS ⇒ F-RTO step-1 retransmits a single segment.
             const unacked = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
             if (unacked > 0) {
                 prepareRexmitFromHole(tcb);
@@ -2705,7 +2733,7 @@ pub fn probeIsDsack(ack: u32, blocks: []const SackBlock) bool {
     return false;
 }
 
-/// Restore cwnd/ssthresh after a DSACK proves the reduction was spurious (SK-115).
+/// Restore cwnd/ssthresh after a DSACK/F-RTO proves the reduction was spurious (SK-115/116).
 fn tryUndoSpurious(tcb: *TcpTcb) void {
     if (tcb.undo_cwnd == 0) return;
     if (tcb.cwnd < tcb.undo_cwnd) tcb.cwnd = tcb.undo_cwnd;
@@ -2717,6 +2745,39 @@ fn tryUndoSpurious(tcb: *TcpTcb) void {
     tcb.prr_out = 0;
     tcb.undo_cwnd = 0;
     tcb.undo_ssthresh = 0;
+    tcb.frto = 0;
+}
+
+/// RFC 5682 F-RTO ACK response (SK-116).
+pub const FrtoAckAction = struct {
+    frto: u2,
+    /// Second new ACK after RTO ⇒ undo congestion response.
+    undo: bool = false,
+    /// First new ACK after RTO ⇒ send new data instead of more rexmit.
+    send_new: bool = false,
+    /// Dup ACK during F-RTO ⇒ real loss; drop undo.
+    clear_undo: bool = false,
+};
+
+pub fn probeFrtoOnAck(frto: u2, is_new_ack: bool) FrtoAckAction {
+    if (frto == 0) return .{ .frto = 0 };
+    if (is_new_ack) {
+        if (frto == 1) return .{ .frto = 2, .send_new = true };
+        if (frto == 2) return .{ .frto = 0, .undo = true };
+        return .{ .frto = 0 };
+    }
+    return .{ .frto = 0, .clear_undo = true };
+}
+
+/// After F-RTO step-1 rexmit, point the send cursor at snd_max for new data (SK-116).
+fn restoreSendHigh(tcb: *TcpTcb) void {
+    if (!tcp_util.seqLt(tcb.snd_una, tcb.snd_max)) return;
+    if (!tcp_util.seqLt(tcb.snd_nxt, tcb.snd_max)) return;
+    const skip = tcb.snd_max -% tcb.snd_una;
+    const pending = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
+    if (skip > pending) return;
+    tcb.snd_nxt = tcb.snd_max;
+    tcb.send_unacked = (tcb.send_head + skip) % SEND_BUF_SIZE;
 }
 
 /// RFC 1122 keepalive probe SEQ = SND.UNA − 1 (SK-109).
