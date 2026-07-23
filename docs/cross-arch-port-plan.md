@@ -1637,7 +1637,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:真正的 PLPMTUD 试探,避免只靠盲抬升。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-105] pmtu oversized probe non-x86: OK`。
-- **后续**:定时器到期时优先武装探测而非盲抬升;或 jumbo / 按 NIC 能力抬高 MAX_MTU。
+- **后续**:见 3.106（定时器优先武装探测,已完成)。
+
+---
+
+### 3.106 定时器到期优先武装 PMTU 探测（SK-106,2026-07-23）
+
+- **背景**:lifetime 到期仍直接盲抬升缓存 MTU,未先给 TX 试探窗口。
+- **方案**:`pathMtuTimerTick` 到期时若未武装则先 `probe_armed`+`getSendMtu` 抬升天花板;
+  探测窗口再次到期仍无 TX 确认才盲抬升(SK-103 回退);确认路径仍走 `noteFullSizeSend`。
+  `shared/sk106.zig` 锁定武装优先、TX 确认与盲抬升回退。
+- **效果**:默认 PLPMTUD 试探优先,盲抬升仅作超时回退。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-106] pmtu timer arm before raise non-x86: OK`。
+- **后续**:jumbo / 按 NIC 能力抬高 MAX_MTU;或把探测武装接到更多发送路径统计。
 
 ---
 

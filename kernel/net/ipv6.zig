@@ -359,7 +359,7 @@ pub fn noteFullSizeSend(dst: [16]u8, ip_total_len: u16) void {
     }
 }
 
-/// Age Path MTU entries; on expiry raise toward interface MTU then clear (SK-97/103).
+/// Age Path MTU entries; expiry arms a probe first, then blind-raises (SK-103/106).
 pub fn pathMtuTimerTick(ms_elapsed: u32) void {
     if (ms_elapsed == 0) return;
     const if_mtu = netif.getMtu();
@@ -374,14 +374,25 @@ pub fn pathMtuTimerTick(ms_elapsed: u32) void {
             e.lifetime_sec -= 1;
         }
         if (e.lifetime_sec != 0) continue;
-        // SK-103: probe upward instead of jumping straight back to the link MTU.
         if (e.mtu >= if_mtu) {
             e.* = .{};
-        } else {
-            e.mtu = nextRaiseMtu(e.mtu, if_mtu);
+            continue;
+        }
+        // SK-106: prefer an oversized probe window before blind-raising.
+        if (!e.probe_armed) {
+            e.probe_mtu = nextRaiseMtu(e.mtu, if_mtu);
+            e.probe_armed = e.probe_mtu > e.mtu;
             e.lifetime_sec = PMTU_RAISE_LIFETIME_SEC;
             e.age_ms = 0;
+            if (e.probe_armed) continue;
         }
+        // Probe window elapsed (or no larger plateau): blind-raise (SK-103).
+        e.mtu = nextRaiseMtu(e.mtu, if_mtu);
+        e.lifetime_sec = PMTU_RAISE_LIFETIME_SEC;
+        e.age_ms = 0;
+        // Leave disarmed so the next expiry arms a fresh probe (SK-106).
+        e.probe_armed = false;
+        e.probe_mtu = 0;
     }
 }
 

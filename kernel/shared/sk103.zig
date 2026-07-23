@@ -49,16 +49,31 @@ pub fn announce() void {
         return;
     }
 
-    // IPv6: learn 1280, first expiry raises to 1400 (not clear).
+    // IPv6: each plateau is arm-then-raise (SK-106).
     ipv6.updatePathMtu(DST6, 1280);
     ipv6.pathMtuTimerTick(ipv6.PMTU_LIFETIME_SEC * 1000);
-    if (ipv6.probePathMtuCount() != 1 or ipv6.getPathMtu(DST6) != 1400) {
+    if (ipv6.getPathMtu(DST6) != 1280 or ipv6.getSendMtu(DST6) != 1400) {
+        fail("v6 arm1");
+        return;
+    }
+    ipv6.pathMtuTimerTick(ipv6.PMTU_RAISE_LIFETIME_SEC * 1000);
+    if (ipv6.getPathMtu(DST6) != 1400) {
         fail("v6 raise1");
+        return;
+    }
+    ipv6.pathMtuTimerTick(ipv6.PMTU_RAISE_LIFETIME_SEC * 1000);
+    if (ipv6.getPathMtu(DST6) != 1400 or ipv6.getSendMtu(DST6) != 1492) {
+        fail("v6 arm2");
         return;
     }
     ipv6.pathMtuTimerTick(ipv6.PMTU_RAISE_LIFETIME_SEC * 1000);
     if (ipv6.getPathMtu(DST6) != 1492) {
         fail("v6 raise2");
+        return;
+    }
+    ipv6.pathMtuTimerTick(ipv6.PMTU_RAISE_LIFETIME_SEC * 1000);
+    if (ipv6.getPathMtu(DST6) != 1492 or ipv6.getSendMtu(DST6) != 1500) {
+        fail("v6 arm3");
         return;
     }
     ipv6.pathMtuTimerTick(ipv6.PMTU_RAISE_LIFETIME_SEC * 1000);
@@ -73,9 +88,14 @@ pub fn announce() void {
         return;
     }
 
-    // IPv4: learn 576 → 1006 on first expiry.
+    // IPv4: learn 576 — arm then raise to 1006.
     ipv4.updatePathMtu(DST4, 576);
     ipv4.pathMtuTimerTick(ipv4.PMTU_LIFETIME_SEC * 1000);
+    if (ipv4.getPathMtu(DST4) != 576 or ipv4.getSendMtu(DST4) != 1006) {
+        fail("v4 arm");
+        return;
+    }
+    ipv4.pathMtuTimerTick(ipv4.PMTU_RAISE_LIFETIME_SEC * 1000);
     if (ipv4.probePathMtuCount() != 1 or ipv4.getPathMtu(DST4) != 1006) {
         fail("v4 raise1");
         return;
