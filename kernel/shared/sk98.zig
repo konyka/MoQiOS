@@ -54,7 +54,8 @@ pub fn announce() void {
         return;
     }
 
-    ipv6.pathMtuTimerTick(ipv6.PMTU_LIFETIME_SEC * 1000);
+    // SK-103: expiry raises through plateaus before clearing to link MTU.
+    ipv6.probeDrainPathMtu(16);
     if (tcp.probeIpv6Mss(DST) != 1440) {
         fail("expire");
         return;

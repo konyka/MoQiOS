@@ -12,6 +12,8 @@ pub const MIN_MTU: u16 = 576;
 pub const LINK_MTU: u16 = 1500;
 /// How long a learned Path MTU stays without refresh (seconds) (SK-101).
 pub const PMTU_LIFETIME_SEC: u32 = 600;
+/// Lifetime between raise-probe steps after expiry (SK-103).
+pub const PMTU_RAISE_LIFETIME_SEC: u32 = 60;
 pub const MAX_PMTU_ENTRIES: u32 = 8;
 /// IPv4 header (no options) for SMSS (SK-101).
 pub const HEADER_LEN: u16 = 20;
@@ -183,9 +185,20 @@ pub fn probePathMtuCount() u32 {
     return n;
 }
 
-/// Age IPv4 Path MTU entries (SK-101).
+/// Next raise-probe MTU toward `if_mtu` (RFC 1191/4821 plateaus) (SK-103).
+pub fn nextRaiseMtu(current: u16, if_mtu: u16) u16 {
+    if (current >= if_mtu) return if_mtu;
+    const plateaus = [_]u16{ 576, 1006, 1280, 1400, 1492, 1500 };
+    for (plateaus) |p| {
+        if (p > current and p <= if_mtu) return p;
+    }
+    return if_mtu;
+}
+
+/// Age IPv4 Path MTU entries; on expiry raise toward interface MTU then clear (SK-101/103).
 pub fn pathMtuTimerTick(ms_elapsed: u32) void {
     if (ms_elapsed == 0) return;
+    const if_mtu = netif.getMtu();
     const flags = pmtu_lock.acquire();
     defer pmtu_lock.release(flags);
     for (0..MAX_PMTU_ENTRIES) |i| {
@@ -196,6 +209,22 @@ pub fn pathMtuTimerTick(ms_elapsed: u32) void {
             e.age_ms -= 1000;
             e.lifetime_sec -= 1;
         }
-        if (e.lifetime_sec == 0) e.* = .{};
+        if (e.lifetime_sec != 0) continue;
+        // SK-103: probe upward instead of jumping straight back to the link MTU.
+        if (e.mtu >= if_mtu) {
+            e.* = .{};
+        } else {
+            e.mtu = nextRaiseMtu(e.mtu, if_mtu);
+            e.lifetime_sec = PMTU_RAISE_LIFETIME_SEC;
+            e.age_ms = 0;
+        }
+    }
+}
+
+/// Probe helper: expire/raise until cleared or `max_steps` (SK-103).
+pub fn probeDrainPathMtu(max_steps: u32) void {
+    var n: u32 = 0;
+    while (n < max_steps and probePathMtuCount() != 0) : (n += 1) {
+        pathMtuTimerTick(PMTU_LIFETIME_SEC * 1000);
     }
 }

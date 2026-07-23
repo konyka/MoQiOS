@@ -47,8 +47,8 @@ pub fn announce() void {
         return;
     }
 
-    // After PMTU expiry, SMSS (and Reno floors) track LINK_MTU again.
-    ipv6.pathMtuTimerTick(ipv6.PMTU_LIFETIME_SEC * 1000);
+    // After PMTU raise-drain, SMSS (and Reno floors) track LINK_MTU again (SK-103).
+    ipv6.probeDrainPathMtu(16);
     if (tcp.probeIpv6Mss(DST) != 1440 or tcp.probeIpv6RenoMinSsthresh(DST) != 2880) {
         fail("expire");
         return;

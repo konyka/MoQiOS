@@ -1598,7 +1598,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:链路 MTU 收缩时本端立即通告更小 MSS,避免对端按 1500 发送。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-102] if mtu ra syn mss non-x86: OK`。
-- **后续**:PMTU 探测抬升(RFC 4821);或 jumbo / 按 NIC 能力抬高 MAX_MTU。
+- **后续**:见 3.103（PMTU 抬升探测,已完成)。
+
+---
+
+### 3.103 Path MTU 抬升探测（SK-103,2026-07-23）
+
+- **背景**:PMTU 只降不升,lifetime 到期后直接跳回链路 MTU,路径变宽时恢复过猛或过晚。
+- **方案**:到期后沿 RFC 1191/4821 plateau(`576/1006/1280/1400/1492/1500`)逐步抬升,
+  每步使用较短 `PMTU_RAISE_LIFETIME_SEC`;到达接口 MTU 后再清除缓存。
+  PTB/Frag Needed 仍可随时压低。`shared/sk103.zig` 锁定 plateau 与抬升序列。
+- **效果**:路径 MTU 恢复时吞吐逐步回升,同时保留再收缩能力。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-103] pmtu raise probe non-x86: OK`。
+- **后续**:基于 TX 成功的主动探测包;或 jumbo / 按 NIC 能力抬高 MAX_MTU。
 
 ---
 

@@ -95,8 +95,8 @@ pub fn announce() void {
         return;
     }
 
-    // Lifetime expiry restores LINK_MTU.
-    ipv6.pathMtuTimerTick(ipv6.PMTU_LIFETIME_SEC * 1000);
+    // Lifetime expiry raises then clears back to the interface MTU (SK-103).
+    ipv6.probeDrainPathMtu(16);
     if (ipv6.probePathMtuCount() != 0 or ipv6.getPathMtu(DST) != ipv6.LINK_MTU) {
         fail("expire");
         return;
