@@ -165,6 +165,10 @@ const TcpTcb = struct {
     prr_delivered: u32,
     /// Bytes sent during recovery (PRR).
     prr_out: u32,
+    /// Pre-reduction cwnd for DSACK undo (0 = none) (SK-115).
+    undo_cwnd: u32,
+    /// Pre-reduction ssthresh for DSACK undo (SK-115).
+    undo_ssthresh: u32,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -279,6 +283,8 @@ pub fn initTcbs() void {
             .recover_fs = 0,
             .prr_delivered = 0,
             .prr_out = 0,
+            .undo_cwnd = 0,
+            .undo_ssthresh = 0,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -336,6 +342,8 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].recover_fs = 0;
     tcbs[i].prr_delivered = 0;
     tcbs[i].prr_out = 0;
+    tcbs[i].undo_cwnd = 0;
+    tcbs[i].undo_ssthresh = 0;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -1224,6 +1232,12 @@ fn driveTcbStateMachine(
                     // v53.3: ack_num must be within [snd_una+1, snd_nxt] range
                     const in_flight = tcb.snd_nxt -% tcb.snd_una;
                     if (acked > 0 and acked <= in_flight and acked <= SEND_BUF_SIZE) {
+                        // SK-115: detect DSACK before scoreboard clips below-ACK ranges.
+                        if (opts.sack_block_count > 0 and
+                            probeIsDsack(ack_num, opts.sack_blocks[0..opts.sack_block_count]))
+                        {
+                            tryUndoSpurious(tcb);
+                        }
                         const sacked_before = sackedBytesInFlight(tcb);
                         tcb.snd_una = ack_num;
                         // v53.2: advance send_head to free acknowledged buffer space
@@ -1302,6 +1316,12 @@ fn driveTcbStateMachine(
                 } else {
                     // Duplicate ACK (ack_num == snd_una)
                     if (payload_len == 0) {
+                        // SK-115: detect DSACK before scoreboard clips below-ACK ranges.
+                        if (opts.sack_block_count > 0 and
+                            probeIsDsack(ack_num, opts.sack_blocks[0..opts.sack_block_count]))
+                        {
+                            tryUndoSpurious(tcb);
+                        }
                         const sacked_before = sackedBytesInFlight(tcb);
                         // SK-113: merge incoming SACK blocks into the scoreboard.
                         if (opts.sack_block_count > 0) {
@@ -1319,9 +1339,11 @@ fn driveTcbStateMachine(
                         const enter_recovery = !tcb.in_recovery and
                             (tcb.dup_ack_count >= DUP_THRESH or isLost(tcb, tcb.snd_una));
                         if (enter_recovery) {
-                            // Fast retransmit + PRR recovery (SK-114).
+                            // Fast retransmit + PRR recovery (SK-114); save undo (SK-115).
                             const smss_fr: u32 = mssForTcb(tcb);
                             const pipe = pipeBytes(tcb);
+                            tcb.undo_cwnd = tcb.cwnd;
+                            tcb.undo_ssthresh = tcb.ssthresh;
                             tcb.in_recovery = true;
                             tcb.recover_seq = tcb.snd_nxt;
                             tcb.ssthresh = @max(tcb.cwnd / 2, 2 * smss_fr);
@@ -1509,12 +1531,20 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
 fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) void {
     // Check if this is the expected sequence
     if (seq != tcb.rcv_nxt) {
-        // Out-of-order segment — record SACK block if SACK is negotiated
         if (tcb.sack_permitted and len > 0) {
-            // Add/update SACK block for this out-of-order segment
-            addSackBlock(tcb, seq, seq + len);
+            const seg_end = seq +% len;
+            if (tcp_util.seqLeq(seg_end, tcb.rcv_nxt)) {
+                // SK-115: fully duplicate segment → RFC 2883 DSACK as first block.
+                reportDsack(tcb, seq, seg_end);
+            } else if (tcp_util.seqLt(tcb.rcv_nxt, seq)) {
+                // Pure out-of-order ahead of rcv_nxt.
+                addSackBlock(tcb, seq, seg_end);
+            } else {
+                // Straddles rcv_nxt: DSACK the already-received prefix.
+                reportDsack(tcb, seq, tcb.rcv_nxt);
+            }
         }
-        // Send ACK with expected seq (and SACK blocks if available)
+        // Send ACK with expected seq (and SACK/DSACK blocks if available)
         _ = sendSegment(tcb, ACK, undefined, 0);
         return;
     }
@@ -1928,6 +1958,9 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             tcb.recover_fs = 0;
             tcb.prr_delivered = 0;
             tcb.prr_out = 0;
+            // SK-115: RTO is a hard loss signal — do not undo.
+            tcb.undo_cwnd = 0;
+            tcb.undo_ssthresh = 0;
 
             // Exponential backoff for RTO
             tcb.rto = @min(tcb.rto * 2, TCP_RTO_MAX);
@@ -2353,6 +2386,17 @@ pub fn tcpShutdown(tcb_idx: u32, how: u32) i64 {
 
 // ─── SACK Helpers ───────────────────────────────────────────────────────────
 
+/// Place a DSACK range in the first receiver SACK block slot (SK-115).
+fn reportDsack(tcb: *TcpTcb, left: u32, right: u32) void {
+    if (!tcp_util.seqLt(left, right)) return;
+    var i: u3 = @min(tcb.sack_block_count, 3);
+    while (i > 0) : (i -= 1) {
+        tcb.sack_blocks[i] = tcb.sack_blocks[i - 1];
+    }
+    tcb.sack_blocks[0] = .{ .left = left, .right = right };
+    if (tcb.sack_block_count < 4) tcb.sack_block_count += 1;
+}
+
 /// Add or merge a SACK block on the receiver side.
 fn addSackBlock(tcb: *TcpTcb, left: u32, right: u32) void {
     // Try to merge with existing blocks
@@ -2644,6 +2688,35 @@ fn applyPrr(tcb: *TcpTcb, delivered_data: u32) void {
         delivered_data,
     );
     tcb.cwnd = pipe + sndcnt;
+}
+
+/// RFC 2883 DSACK: first block already cum-ACKed, or subset of a later block (SK-115).
+pub fn probeIsDsack(ack: u32, blocks: []const SackBlock) bool {
+    if (blocks.len == 0) return false;
+    const first = blocks[0];
+    if (!tcp_util.seqLt(first.left, first.right)) return false;
+    if (tcp_util.seqLeq(first.right, ack)) return true;
+    for (blocks[1..]) |blk| {
+        if (!tcp_util.seqLt(blk.left, blk.right)) continue;
+        if (tcp_util.seqLeq(blk.left, first.left) and tcp_util.seqLeq(first.right, blk.right)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Restore cwnd/ssthresh after a DSACK proves the reduction was spurious (SK-115).
+fn tryUndoSpurious(tcb: *TcpTcb) void {
+    if (tcb.undo_cwnd == 0) return;
+    if (tcb.cwnd < tcb.undo_cwnd) tcb.cwnd = tcb.undo_cwnd;
+    if (tcb.ssthresh < tcb.undo_ssthresh) tcb.ssthresh = tcb.undo_ssthresh;
+    tcb.in_recovery = false;
+    tcb.dup_ack_count = 0;
+    tcb.recover_fs = 0;
+    tcb.prr_delivered = 0;
+    tcb.prr_out = 0;
+    tcb.undo_cwnd = 0;
+    tcb.undo_ssthresh = 0;
 }
 
 /// RFC 1122 keepalive probe SEQ = SND.UNA − 1 (SK-109).

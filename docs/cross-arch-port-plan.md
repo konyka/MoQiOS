@@ -1755,7 +1755,22 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:丢包恢复发送节奏贴近 ssthresh,减少过冲与欠注。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-114] tcp prr recovery non-x86: OK`。
-- **后续**:Delivery Rate / BBR 类估计;或 DSACK/undo 虚假重传恢复。
+- **后续**:见 3.115（DSACK undo,已完成)。
+
+---
+
+### 3.115 DSACK 虚假重传 undo（SK-115,2026-07-23）
+
+- **背景**:乱序可触发快重传;若重传多余,对端以 DSACK 告知重复投递,但发送端
+  仍停留在减半后的 cwnd/ssthresh,吞吐长期受损。
+- **方案**:进入恢复前保存 `undo_cwnd`/`undo_ssthresh`;按 RFC 2883 识别首块
+  已在累计 ACK 之下或为后续 SACK 子集的 DSACK,则恢复窗口并退出恢复。
+  接收路径对完全重复段把 DSACK 放在首块。RTO 清除 undo。
+  `shared/sk115.zig` 锁定 DSACK 判定。
+- **效果**:虚假重传后尽快回到原拥塞窗口,减少乱序路径的吞吐塌陷。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-115] tcp dsack undo non-x86: OK`。
+- **后续**:Delivery Rate / BBR 类估计;或 F-RTO 虚假超时恢复。
 
 ---
 
