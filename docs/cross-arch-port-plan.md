@@ -1688,7 +1688,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:对端对窗外 SEQ 回 ACK,keepalive 能真正探测死连接。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-109] tcp keepalive snd.una-1 non-x86: OK`。
-- **后续**:零窗口 persist 探针;或 RFC 6675 SACK 管道计数。
+- **后续**:见 3.110（零窗口 persist,已完成)。
+
+---
+
+### 3.110 零窗口 persist 探针（SK-110,2026-07-23）
+
+- **背景**:`snd_wnd=0` 时 `flushSendBuffer` 停发;若窗口更新 ACK 丢失,连接永久卡住。
+- **方案**:有未发送数据且窗口为 0 时启动 persist 定时器,到期发送 1 字节探针(忽略零窗口),
+  间隔指数退避;窗口重新打开时复位定时器并 `flushSendBuffer`。
+  `shared/sk110.zig` 锁定激活条件与到期判定。
+- **效果**:零窗口死锁可恢复,吞吐在对端重新开窗后继续。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-110] tcp zero-window persist non-x86: OK`。
+- **后续**:RFC 6675 SACK 管道计数;或 persist 与 RTO 计时器交互细化。
 
 ---
 

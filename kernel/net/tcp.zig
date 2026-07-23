@@ -177,6 +177,10 @@ const TcpTcb = struct {
     idle_ms: u32, // ms since last data received
     keepalive_probes: u32, // number of keepalive probes sent without response
     nagle_pending: bool, // Nagle: data is pending but held for ACK
+    /// Zero-window persist probe timer (SK-110).
+    persist_timer_ms: u32,
+    /// Current persist probe interval (SK-110); doubles after each probe.
+    persist_rto_ms: u32,
 
     // SACK (Selective Acknowledgment) state
     sack_permitted: bool, // SACK negotiated
@@ -277,6 +281,8 @@ pub fn initTcbs() void {
             .idle_ms = 0,
             .keepalive_probes = 0,
             .nagle_pending = false,
+            .persist_timer_ms = 0,
+            .persist_rto_ms = RETRANSMIT_MS,
             .sack_permitted = false,
             .sack_blocks = @splat(.{ .left = 0, .right = 0 }),
             .sack_block_count = 0,
@@ -329,6 +335,8 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].idle_ms = 0;
     tcbs[i].keepalive_probes = 0;
     tcbs[i].nagle_pending = false;
+    tcbs[i].persist_timer_ms = 0;
+    tcbs[i].persist_rto_ms = RETRANSMIT_MS;
     tcbs[i].delayed_ack_pending = false;
     tcbs[i].delayed_ack_ms = 0;
     tcbs[i].ref_count = 1;
@@ -1304,6 +1312,12 @@ fn driveTcbStateMachine(
                     }
                 }
                 tcb.snd_wnd = window;
+                // SK-110: window reopen cancels persist and drains queued data.
+                if (window > 0) {
+                    tcb.persist_timer_ms = 0;
+                    tcb.persist_rto_ms = RETRANSMIT_MS;
+                    flushSendBuffer(tcb);
+                }
             }
 
             // Process incoming data
@@ -1911,6 +1925,25 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
         }
     }
 
+    // ── Zero-window persist (SK-110) ─────────────────────────────────
+    // When the peer advertises snd_wnd=0 but we still have unsent data,
+    // periodically probe with 1 byte so a lost window update cannot stall forever.
+    if (tcb.state == .established) {
+        const unsent = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
+        if (probePersistActive(tcb.snd_wnd, unsent)) {
+            tcb.persist_timer_ms +%= ms_elapsed;
+            const interval = if (tcb.persist_rto_ms > 0) tcb.persist_rto_ms else RETRANSMIT_MS;
+            if (tcb.persist_timer_ms >= interval) {
+                tcb.persist_timer_ms = 0;
+                tcb.persist_rto_ms = if (interval > TCP_RTO_MAX / 2) TCP_RTO_MAX else interval * 2;
+                _ = sendPersistProbe(tcb);
+            }
+        } else {
+            tcb.persist_timer_ms = 0;
+            tcb.persist_rto_ms = RETRANSMIT_MS;
+        }
+    }
+
     // ── Keepalive logic ──────────────────────────────────────────────
     // Only for established connections with SO_KEEPALIVE enabled
     if (tcb.state == .established and tcb.options.keep_alive) {
@@ -2381,4 +2414,25 @@ pub fn probeKeepaliveSeq(snd_una: u32) u32 {
 /// Send an empty ACK with SEQ=SND.UNA-1 (SK-109). Does not advance snd_nxt.
 fn sendKeepaliveProbe(tcb: *TcpTcb) bool {
     return sendSegmentSeq(tcb, ACK, undefined, 0, probeKeepaliveSeq(tcb.snd_una));
+}
+
+/// True when a zero-window persist timer should run (SK-110).
+pub fn probePersistActive(snd_wnd: u32, unsent: u32) bool {
+    return snd_wnd == 0 and unsent > 0;
+}
+
+/// True when the persist timer has reached its current interval (SK-110).
+pub fn probePersistDue(timer_ms: u32, interval_ms: u32) bool {
+    return interval_ms > 0 and timer_ms >= interval_ms;
+}
+
+/// Send a 1-byte window probe, bypassing the zero send window (SK-110).
+fn sendPersistProbe(tcb: *TcpTcb) bool {
+    const unsent = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
+    if (unsent == 0) return false;
+    var seg_buf: [1]u8 = undefined;
+    ringRead(&tcb.send_buf, SEND_BUF_SIZE, tcb.send_unacked, &seg_buf, 1);
+    if (!sendSegment(tcb, ACK | PSH, &seg_buf, 1)) return false;
+    tcb.send_unacked = (tcb.send_unacked + 1) % SEND_BUF_SIZE;
+    return true;
 }
