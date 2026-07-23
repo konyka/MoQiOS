@@ -145,8 +145,8 @@ pub fn sendTo(dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, da
     const our_mac = netif.getMac();
     const our_ip = netif.getOurIp();
     const udp_total: u16 = 8 + data_len;
-    // SK-101: honor Path MTU learned from ICMP Fragmentation Needed.
-    if (ipv4.HEADER_LEN + udp_total > ipv4.getPathMtu(dst_ip)) return false;
+    // SK-101/105: honor Path MTU (or armed oversized raise probe).
+    if (ipv4.HEADER_LEN + udp_total > ipv4.getSendMtu(dst_ip)) return false;
 
     // Build UDP header at offset 34 (14 eth + 20 ipv4)
     bo.writeU16BeAt(&send_pkt, 34, src_port);
@@ -183,8 +183,8 @@ pub fn sendToV6(dst_ip: [16]u8, dst_port: u16, src_port: u16, data: [*]const u8,
     const our_mac = netif.getMac();
     const our_ip = ndp.selectSourceAddress(dst_ip, our_mac);
     const udp_total: u16 = 8 + data_len;
-    // SK-97: honor Path MTU learned from Packet Too Big.
-    if (ipv6.HEADER_LEN + udp_total > ipv6.getPathMtu(dst_ip)) return false;
+    // SK-97/105: honor Path MTU (or armed oversized raise probe).
+    if (ipv6.HEADER_LEN + udp_total > ipv6.getSendMtu(dst_ip)) return false;
 
     // Offsets: eth 14 + ipv6 40 → UDP at 54.
     const udp_off: u16 = 14 + ipv6.HEADER_LEN;

@@ -637,8 +637,8 @@ fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
     const our_ip = netif.getOurIp();
     const tcp_off: u16 = 34;
     const tcp_total = fillTcpSegment(tcb, flags, data, data_len, &send_pkt, tcp_off);
-    // SK-101: honor Path MTU learned from ICMP Fragmentation Needed.
-    if (ipv4.HEADER_LEN + tcp_total > ipv4.getPathMtu(tcb.remote_ip)) return false;
+    // SK-101/105: honor Path MTU (or armed oversized raise probe).
+    if (ipv4.HEADER_LEN + tcp_total > ipv4.getSendMtu(tcb.remote_ip)) return false;
     const csum = tcpChecksum(our_ip, tcb.remote_ip, send_pkt[tcp_off..].ptr, tcp_total);
     bo.writeU16BeAt(&send_pkt, tcp_off + 16, csum);
     ipv4.buildHeader(send_pkt[14..].ptr, our_ip, tcb.remote_ip, ipv4.PROTO_TCP, tcp_total);
@@ -667,8 +667,8 @@ fn sendSegmentV6(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool
     var send_pkt: [1518]u8 = @splat(0);
     const tcp_off: u16 = 14 + ipv6.HEADER_LEN;
     const tcp_total = fillTcpSegment(tcb, flags, data, data_len, &send_pkt, tcp_off);
-    // SK-97: honor Path MTU learned from Packet Too Big.
-    if (ipv6.HEADER_LEN + tcp_total > ipv6.getPathMtu(tcb.remote_ip6)) return false;
+    // SK-97/105: honor Path MTU (or armed oversized raise probe).
+    if (ipv6.HEADER_LEN + tcp_total > ipv6.getSendMtu(tcb.remote_ip6)) return false;
     const csum = tcpChecksumV6(our_ip, tcb.remote_ip6, send_pkt[tcp_off..].ptr, tcp_total);
     bo.writeU16BeAt(&send_pkt, tcp_off + 16, csum);
     ipv6.buildHeader(send_pkt[14..].ptr, our_ip, tcb.remote_ip6, ipv6.PROTO_TCP, tcp_total);

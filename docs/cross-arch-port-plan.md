@@ -1624,7 +1624,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:PLPMTUD 风格确认加速吞吐恢复,同时保留 PTB/Frag Needed 收缩。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-104] pmtu tx success raise non-x86: OK`。
-- **后续**:允许偶发超当前 PMTU 的探测包;或 jumbo / 按 NIC 能力抬高 MAX_MTU。
+- **后续**:见 3.105（超当前 PMTU 探测包,已完成)。
+
+---
+
+### 3.105 超当前 PMTU 的抬升探测包（SK-105,2026-07-23）
+
+- **背景**:TX 硬限制在缓存 PMTU,下一 plateau 无法在确认前试探。
+- **方案**:`armRaiseProbe` 武装一次性超大发送上限;`getSendMtu` 供 UDP/TCP TX 使用;
+  成功后 `noteFullSizeSend` 确认抬升并自动武装下一跳;PTB/Frag Needed 清除武装。
+  `getPathMtu` 在确认前保持保守。`shared/sk105.zig` 锁定武装/天花板/确认/清除。
+- **效果**:真正的 PLPMTUD 试探,避免只靠盲抬升。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-105] pmtu oversized probe non-x86: OK`。
+- **后续**:定时器到期时优先武装探测而非盲抬升;或 jumbo / 按 NIC 能力抬高 MAX_MTU。
 
 ---
 

@@ -207,6 +207,9 @@ const PmtuEntry = struct {
     mtu: u16 = LINK_MTU,
     lifetime_sec: u32 = 0,
     age_ms: u32 = 0,
+    /// SK-105: allow one TX up to `probe_mtu` (> cached mtu).
+    probe_armed: bool = false,
+    probe_mtu: u16 = 0,
     valid: bool = false,
 };
 var pmtu_table: [MAX_PMTU_ENTRIES]PmtuEntry = @splat(.{});
@@ -239,6 +242,8 @@ pub fn updatePathMtu(dst: [16]u8, reported_mtu: u32) void {
             if (mtu < e.mtu) e.mtu = mtu;
             e.lifetime_sec = PMTU_LIFETIME_SEC;
             e.age_ms = 0;
+            e.probe_armed = false;
+            e.probe_mtu = 0;
             return;
         }
     }
@@ -276,6 +281,36 @@ pub fn getPathMtu(dst: [16]u8) u16 {
     return if_mtu;
 }
 
+/// TX ceiling: Path MTU, or an armed oversized probe target (SK-105).
+pub fn getSendMtu(dst: [16]u8) u16 {
+    const if_mtu = netif.getMtu();
+    const flags = pmtu_lock.acquire();
+    defer pmtu_lock.release(flags);
+    for (0..MAX_PMTU_ENTRIES) |i| {
+        const e = &pmtu_table[i];
+        if (!(e.valid and addrEq(e.dst, dst))) continue;
+        if (e.probe_armed and e.probe_mtu > e.mtu) return @min(e.probe_mtu, if_mtu);
+        return @min(e.mtu, if_mtu);
+    }
+    return if_mtu;
+}
+
+/// Arm one oversized raise probe up to the next plateau (SK-105).
+pub fn armRaiseProbe(dst: [16]u8) bool {
+    const if_mtu = netif.getMtu();
+    const flags = pmtu_lock.acquire();
+    defer pmtu_lock.release(flags);
+    for (0..MAX_PMTU_ENTRIES) |i| {
+        const e = &pmtu_table[i];
+        if (!(e.valid and addrEq(e.dst, dst))) continue;
+        if (e.mtu >= if_mtu) return false;
+        e.probe_mtu = nextRaiseMtu(e.mtu, if_mtu);
+        e.probe_armed = e.probe_mtu > e.mtu;
+        return e.probe_armed;
+    }
+    return false;
+}
+
 /// Probe helper (SK-97): number of Path MTU cache entries.
 pub fn probePathMtuCount() u32 {
     const flags = pmtu_lock.acquire();
@@ -306,12 +341,20 @@ pub fn noteFullSizeSend(dst: [16]u8, ip_total_len: u16) void {
     for (0..MAX_PMTU_ENTRIES) |i| {
         const e = &pmtu_table[i];
         if (!(e.valid and addrEq(e.dst, dst))) continue;
-        // Only full-size sends count as a successful probe at the current PMTU.
+        // Full-size at cached PMTU, or a successful oversized probe (SK-104/105).
         if (ip_total_len < e.mtu) return;
         if (e.mtu >= if_mtu) return;
         e.mtu = nextRaiseMtu(e.mtu, if_mtu);
         e.lifetime_sec = PMTU_RAISE_LIFETIME_SEC;
         e.age_ms = 0;
+        // SK-105: immediately arm the next oversized probe if room remains.
+        if (e.mtu < if_mtu) {
+            e.probe_mtu = nextRaiseMtu(e.mtu, if_mtu);
+            e.probe_armed = e.probe_mtu > e.mtu;
+        } else {
+            e.probe_armed = false;
+            e.probe_mtu = 0;
+        }
         return;
     }
 }
