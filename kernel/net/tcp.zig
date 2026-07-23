@@ -643,7 +643,9 @@ fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
     bo.writeU16BeAt(&send_pkt, tcp_off + 16, csum);
     ipv4.buildHeader(send_pkt[14..].ptr, our_ip, tcb.remote_ip, ipv4.PROTO_TCP, tcp_total);
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, 20 + tcp_total);
-    _ = nic.sendPacket(&send_pkt, frame_len);
+    const ok = nic.sendPacket(&send_pkt, frame_len);
+    // SK-104: full-MTU TX success can raise the Path MTU early.
+    if (ok) ipv4.noteFullSizeSend(tcb.remote_ip, ipv4.HEADER_LEN + tcp_total);
     advanceSndNxt(tcb, flags, data_len);
     return true;
 }
@@ -671,7 +673,9 @@ fn sendSegmentV6(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool
     bo.writeU16BeAt(&send_pkt, tcp_off + 16, csum);
     ipv6.buildHeader(send_pkt[14..].ptr, our_ip, tcb.remote_ip6, ipv6.PROTO_TCP, tcp_total);
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + tcp_total);
-    _ = nic.sendPacket(&send_pkt, frame_len);
+    const ok = nic.sendPacket(&send_pkt, frame_len);
+    // SK-104: full-MTU TX success can raise the Path MTU early.
+    if (ok) ipv6.noteFullSizeSend(tcb.remote_ip6, ipv6.HEADER_LEN + tcp_total);
     advanceSndNxt(tcb, flags, data_len);
     return true;
 }

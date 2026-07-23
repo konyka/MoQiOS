@@ -1611,7 +1611,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:路径 MTU 恢复时吞吐逐步回升,同时保留再收缩能力。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-103] pmtu raise probe non-x86: OK`。
-- **后续**:基于 TX 成功的主动探测包;或 jumbo / 按 NIC 能力抬高 MAX_MTU。
+- **后续**:见 3.104（满 MTU TX 成功提前抬升,已完成)。
+
+---
+
+### 3.104 满 MTU TX 成功提前抬升 Path MTU（SK-104,2026-07-23）
+
+- **背景**:抬升只在 lifetime 到期时发生,满载发送已证明当前 PMTU 可行时仍需空等。
+- **方案**:UDP/TCP 在 `nic.sendPacket` 成功且 IP 总长 ≥ 当前缓存 PMTU 时调用
+  `noteFullSizeSend`,立即迈入下一 plateau 并刷新短 lifetime;小于当前 PMTU 的发送不触发。
+  `shared/sk104.zig` 锁定无条目/undersize/抬升与再压低。
+- **效果**:PLPMTUD 风格确认加速吞吐恢复,同时保留 PTB/Frag Needed 收缩。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-104] pmtu tx success raise non-x86: OK`。
+- **后续**:允许偶发超当前 PMTU 的探测包;或 jumbo / 按 NIC 能力抬高 MAX_MTU。
 
 ---
 

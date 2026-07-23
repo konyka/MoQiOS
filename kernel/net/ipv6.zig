@@ -297,6 +297,25 @@ pub fn nextRaiseMtu(current: u16, if_mtu: u16) u16 {
     return if_mtu;
 }
 
+/// After a successful full-MTU TX, raise one plateau early (SK-104).
+/// `ip_total_len` is the IPv6 packet length (header + payload).
+pub fn noteFullSizeSend(dst: [16]u8, ip_total_len: u16) void {
+    const if_mtu = netif.getMtu();
+    const flags = pmtu_lock.acquire();
+    defer pmtu_lock.release(flags);
+    for (0..MAX_PMTU_ENTRIES) |i| {
+        const e = &pmtu_table[i];
+        if (!(e.valid and addrEq(e.dst, dst))) continue;
+        // Only full-size sends count as a successful probe at the current PMTU.
+        if (ip_total_len < e.mtu) return;
+        if (e.mtu >= if_mtu) return;
+        e.mtu = nextRaiseMtu(e.mtu, if_mtu);
+        e.lifetime_sec = PMTU_RAISE_LIFETIME_SEC;
+        e.age_ms = 0;
+        return;
+    }
+}
+
 /// Age Path MTU entries; on expiry raise toward interface MTU then clear (SK-97/103).
 pub fn pathMtuTimerTick(ms_elapsed: u32) void {
     if (ms_elapsed == 0) return;

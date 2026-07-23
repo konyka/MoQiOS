@@ -165,6 +165,8 @@ pub fn sendTo(dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, da
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, 20 + udp_total);
 
     const ok = nic.sendPacket(&send_pkt, frame_len);
+    // SK-104: full-MTU TX success can raise the Path MTU early.
+    if (ok) ipv4.noteFullSizeSend(dst_ip, ipv4.HEADER_LEN + udp_total);
     return ok;
 }
 
@@ -198,5 +200,8 @@ pub fn sendToV6(dst_ip: [16]u8, dst_port: u16, src_port: u16, data: [*]const u8,
 
     ipv6.buildHeader(send_pkt[14..].ptr, our_ip, dst_ip, ipv6.PROTO_UDP, udp_total);
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + udp_total);
-    return nic.sendPacket(&send_pkt, frame_len);
+    const ok = nic.sendPacket(&send_pkt, frame_len);
+    // SK-104: full-MTU TX success can raise the Path MTU early.
+    if (ok) ipv6.noteFullSizeSend(dst_ip, ipv6.HEADER_LEN + udp_total);
+    return ok;
 }
