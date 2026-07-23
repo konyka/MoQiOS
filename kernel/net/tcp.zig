@@ -175,6 +175,8 @@ const TcpTcb = struct {
     snd_max: u32,
     /// Tail Loss Probe already sent this loss episode (SK-117).
     tlp_sent: bool,
+    /// Last (re)transmit time of SND.UNA head; 0 = unknown (SK-118).
+    head_xmit_ms: u32,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -294,6 +296,7 @@ pub fn initTcbs() void {
             .frto = 0,
             .snd_max = 0,
             .tlp_sent = false,
+            .head_xmit_ms = 0,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -356,6 +359,7 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].frto = 0;
     tcbs[i].snd_max = 0;
     tcbs[i].tlp_sent = false;
+    tcbs[i].head_xmit_ms = 0;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -697,6 +701,7 @@ fn sendSegmentSeq(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16, seq
     const ok = nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.
     if (ok) ipv4.noteFullSizeSend(tcb.remote_ip, ipv4.HEADER_LEN + tcp_total);
+    noteHeadXmit(tcb, seq_override orelse tcb.snd_nxt, data_len);
     advanceSndNxt(tcb, flags, data_len);
     return true;
 }
@@ -731,8 +736,16 @@ fn sendSegmentV6Seq(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16, s
     const ok = nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.
     if (ok) ipv6.noteFullSizeSend(tcb.remote_ip6, ipv6.HEADER_LEN + tcp_total);
+    noteHeadXmit(tcb, seq_override orelse tcb.snd_nxt, data_len);
     advanceSndNxt(tcb, flags, data_len);
     return true;
+}
+
+/// Record transmit time when (re)sending the SND.UNA head (SK-118).
+fn noteHeadXmit(tcb: *TcpTcb, seq: u32, data_len: u16) void {
+    if (data_len > 0 and seq == tcb.snd_una) {
+        tcb.head_xmit_ms = timestampMs();
+    }
 }
 
 /// Get a monotonically increasing millisecond timestamp for TCP timestamps.
@@ -1261,6 +1274,8 @@ fn driveTcbStateMachine(
                         tcb.retransmit_timer = 0;
                         tcb.retransmit_count = 0;
                         tcb.tlp_sent = false;
+                        // SK-118: new head's xmit time unknown until (re)sent.
+                        tcb.head_xmit_ms = 0;
                         // SK-113: trim/merge scoreboard (do not wipe holes still above snd_una).
                         if (opts.sack_block_count > 0) {
                             updateScoreboard(tcb, opts.sack_blocks[0..opts.sack_block_count]);
@@ -1365,9 +1380,11 @@ fn driveTcbStateMachine(
 
                         tcb.dup_ack_count += 1;
 
-                        // SK-112: enter recovery on DupThresh dupacks OR RFC 6675 IsLost(snd_una).
+                        // SK-112/118: DupThresh, IsLost, or RACK-lite timed head loss.
                         const enter_recovery = !tcb.in_recovery and
-                            (tcb.dup_ack_count >= DUP_THRESH or isLost(tcb, tcb.snd_una));
+                            (tcb.dup_ack_count >= DUP_THRESH or
+                                isLost(tcb, tcb.snd_una) or
+                                rackHeadLost(tcb));
                         if (enter_recovery) {
                             // Fast retransmit + PRR recovery (SK-114); save undo (SK-115).
                             const smss_fr: u32 = mssForTcb(tcb);
@@ -2797,6 +2814,28 @@ fn restoreSendHigh(tcb: *TcpTcb) void {
     if (skip > pending) return;
     tcb.snd_nxt = tcb.snd_max;
     tcb.send_unacked = (tcb.send_head + skip) % SEND_BUF_SIZE;
+}
+
+/// RFC 8985-inspired reordering window: max(SRTT/4, 1ms) (SK-118).
+pub fn probeRackReoWnd(srtt: u32) u32 {
+    if (srtt == 0) return 0;
+    const q = srtt / 4;
+    return if (q > 0) q else 1;
+}
+
+/// RACK-lite: head is lost when SACK is above it and elapsed ≥ SRTT+reo_wnd (SK-118).
+pub fn probeRackHeadLost(elapsed_ms: u32, srtt: u32, has_sack_above: bool) bool {
+    if (!has_sack_above or srtt == 0) return false;
+    return elapsed_ms >= srtt +% probeRackReoWnd(srtt);
+}
+
+fn rackHeadLost(tcb: *const TcpTcb) bool {
+    if (tcb.head_xmit_ms == 0) return false;
+    const has_above = sackedBytesAbove(tcb, tcb.snd_una) > 0 or
+        sackBlocksAbove(tcb, tcb.snd_una) > 0;
+    if (!has_above) return false;
+    const elapsed = timestampMs() -% tcb.head_xmit_ms;
+    return probeRackHeadLost(elapsed, tcb.srtt, true);
 }
 
 /// TLP PTO = min(RTO−1, max(2·SRTT, 10ms)) (SK-117).

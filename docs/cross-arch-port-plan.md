@@ -1796,7 +1796,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:尾丢可在 RTO 前修复,缩短短流/尾延迟。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-117] tcp tail loss probe non-x86: OK`。
-- **后续**:Delivery Rate / BBR 类估计;或 RACK 时间序损失检测。
+- **后续**:见 3.118（RACK-lite 头部丢失,已完成)。
+
+---
+
+### 3.118 RACK-lite 时间序头部丢失（SK-118,2026-07-23）
+
+- **背景**:仅靠 DupThresh/IsLost 字节阈值时,少量 SACK 证据下仍可能空等;
+  若头部已发出超过 SRTT+乱序窗且上方已有 SACK,几乎可判定丢失。
+- **方案**:记录 `head_xmit_ms`;当上方存在 SACK 且 `now−head_xmit ≥ SRTT+max(SRTT/4,1)`
+  时提前进入快恢复。累计 ACK 前进后清零直至头部再次发送。
+  `shared/sk118.zig` 锁定 reo_wnd 与判定。
+- **效果**:中等乱序/少量 SACK 场景更快重传头部,缩短恢复时延。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-118] tcp rack-lite head loss non-x86: OK`。
+- **后续**:Delivery Rate / BBR 类估计;或完整 RACK per-segment 时间戳。
 
 ---
 
