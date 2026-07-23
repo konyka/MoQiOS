@@ -1279,12 +1279,10 @@ fn driveTcbStateMachine(
                             tcb.ssthresh = @max(tcb.cwnd / 2, 2 * smss_fr);
                             tcb.cwnd = tcb.ssthresh + 3 * smss_fr;
 
-                            // Retransmit the first non-SACKed segment
-                            tcb.snd_nxt = tcb.snd_una;
-                            // v53.2: use ringDataLen instead of raw subtraction (handles wrap-around)
+                            // SK-108: retransmit the first non-SACKed hole, not always snd_una.
                             const unacked = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
                             if (unacked > 0) {
-                                tcb.send_unacked = tcb.send_head;
+                                prepareRexmitFromHole(tcb);
                                 flushSendBuffer(tcb);
                             }
                             tcpLog("[tcp] fast retransmit\n");
@@ -1632,6 +1630,8 @@ pub fn tcpSend(tcb_idx: u32, data: [*]const u8, len: u32) i64 {
 /// When TCP_CORK is set, only full MSS segments are sent (partial segments are held).
 fn flushSendBuffer(tcb: *TcpTcb) void {
     while (true) {
+        // SK-108: skip SACKed ranges so selective retransmit does not resend them.
+        skipSackedSendRange(tcb);
         const mss = mssForTcb(tcb);
         const pending = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
         const in_flight = tcb.snd_nxt -% tcb.snd_una;
@@ -1867,13 +1867,10 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             // Exponential backoff for RTO
             tcb.rto = @min(tcb.rto * 2, TCP_RTO_MAX);
 
-            // Retransmit: reset snd_nxt back to snd_una and re-flush
-            tcb.snd_nxt = tcb.snd_una;
-            // v53.2: use ringDataLen instead of raw subtraction (handles wrap-around)
+            // SK-108: RTO also starts at the first non-SACKed hole when possible.
             const unacked = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
             if (unacked > 0) {
-                // Re-send from beginning of pending data
-                tcb.send_unacked = tcb.send_head;
+                prepareRexmitFromHole(tcb);
                 flushSendBuffer(tcb);
                 // v53.13: If all pending data has been retransmitted, also retransmit FIN
                 if (tcb.send_unacked == tcb.send_tail) {
@@ -2302,4 +2299,65 @@ fn isSacked(tcb: *const TcpTcb, seq: u32) bool {
         if (tcp_util.seqInWindow(seq, blk.left, blk.right)) return true;
     }
     return false;
+}
+
+/// First sequence ≥ `snd_una` that still needs retransmission (SK-108).
+fn nextRexmitSeq(tcb: *const TcpTcb) u32 {
+    var seq = tcb.snd_una;
+    var guard: u32 = 0;
+    while (guard < 64 and tcp_util.seqLt(seq, tcb.snd_nxt)) : (guard += 1) {
+        if (!isSacked(tcb, seq)) return seq;
+        var jumped = false;
+        for (0..tcb.sack_scoreboard_count) |i| {
+            const blk = tcb.sack_scoreboard[i];
+            if (tcp_util.seqInWindow(seq, blk.left, blk.right)) {
+                seq = blk.right;
+                jumped = true;
+                break;
+            }
+        }
+        if (!jumped) seq +%= 1;
+    }
+    return tcb.snd_una;
+}
+
+/// Point `snd_nxt` / `send_unacked` at the first non-SACKed hole (SK-108).
+fn prepareRexmitFromHole(tcb: *TcpTcb) void {
+    const hole = nextRexmitSeq(tcb);
+    const skip = hole -% tcb.snd_una;
+    tcb.snd_nxt = hole;
+    tcb.send_unacked = (tcb.send_head + skip) % SEND_BUF_SIZE;
+}
+
+/// Advance past SACKed bytes in the send ring (SK-108).
+fn skipSackedSendRange(tcb: *TcpTcb) void {
+    var guard: u32 = 0;
+    while (guard < 64 and isSacked(tcb, tcb.snd_nxt)) : (guard += 1) {
+        var jump: ?u32 = null;
+        for (0..tcb.sack_scoreboard_count) |i| {
+            const blk = tcb.sack_scoreboard[i];
+            if (tcp_util.seqInWindow(tcb.snd_nxt, blk.left, blk.right)) {
+                jump = blk.right;
+                break;
+            }
+        }
+        const j = jump orelse break;
+        const skip = j -% tcb.snd_nxt;
+        if (skip == 0) break;
+        const pending = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
+        if (skip > pending) break;
+        tcb.snd_nxt = j;
+        tcb.send_unacked = (tcb.send_unacked + skip) % SEND_BUF_SIZE;
+    }
+}
+
+/// Probe helper (SK-108): next rexmit seq given one SACK block [left,right).
+pub fn probeNextRexmitSeq(snd_una: u32, snd_nxt: u32, sack_left: u32, sack_right: u32) u32 {
+    var seq = snd_una;
+    var guard: u32 = 0;
+    while (guard < 64 and tcp_util.seqLt(seq, snd_nxt)) : (guard += 1) {
+        if (!tcp_util.seqInWindow(seq, sack_left, sack_right)) return seq;
+        seq = sack_right;
+    }
+    return snd_una;
 }

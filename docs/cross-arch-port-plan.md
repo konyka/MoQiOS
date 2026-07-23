@@ -1663,7 +1663,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:路径变宽后数十秒内即可再试探,无需空等 600s。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-107] pmtu rearm after cooldown non-x86: OK`。
-- **后续**:jumbo / 按 NIC 能力抬高 MAX_MTU;或可配置冷却时间。
+- **后续**:见 3.108（SACK 选择性重传,已完成)。
+
+---
+
+### 3.108 SACK 选择性重传（SK-108,2026-07-23）
+
+- **背景**:快重传/RTO 总是从 `snd_una` 重发,已 SACK 的字节被重复传输;`isSacked` 未接线。
+- **方案**:`nextRexmitSeq` / `prepareRexmitFromHole` 定位第一个未 SACK 空洞;
+  `flushSendBuffer` 经 `skipSackedSendRange` 跳过 scoreboard 覆盖区间。
+  `shared/sk108.zig` 锁定无 SACK、跳过首段、全覆盖回退与回绕。
+- **效果**:丢包恢复时少传已确认数据,提升快重传效率。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-108] sack selective retransmit non-x86: OK`。
+- **后续**:RFC 6675 管道与 `DupAcks` 精确计数;或 keepalive `SND.UNA-1` 探测。
 
 ---
 
