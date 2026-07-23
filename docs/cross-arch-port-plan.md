@@ -1823,7 +1823,19 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:恢复后更快回到测得带宽对应窗口,提高吞吐爬升速度。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-119] tcp delivery rate bdp non-x86: OK`。
-- **后续**:BBR 类 pacing/启动;或完整 RACK per-segment 时间戳。
+- **后续**:见 3.120（按 rate pacing,已完成)。
+
+---
+
+### 3.120 按 Delivery Rate 发送 pacing（SK-120,2026-07-23）
+
+- **背景**:测得带宽后仍可能一次打出整窗突发,引发丢包与 ACK 压缩。
+- **方案**:`flushSendBuffer` 按 `interval=SMSS·1000/rate` 间隔发送;恢复/F-RTO
+  期间不 pacing;定时器到期后继续冲刷。`shared/sk120.zig` 锁定间隔公式。
+- **效果**:平滑注入,降低突发丢包,为 BBR 类控制铺路。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-120] tcp rate pacing non-x86: OK`。
+- **后续**:BBR Startup/Drain;或完整 RACK per-segment 时间戳。
 
 ---
 

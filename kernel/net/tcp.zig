@@ -183,6 +183,8 @@ const TcpTcb = struct {
     rate_sample_ms: u32,
     /// Minimum observed RTT (ms); 0 = none (SK-119).
     min_rtt_ms: u32,
+    /// Last paced data send timestamp (SK-120).
+    last_pace_ms: u32,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -306,6 +308,7 @@ pub fn initTcbs() void {
             .delivery_rate = 0,
             .rate_sample_ms = 0,
             .min_rtt_ms = 0,
+            .last_pace_ms = 0,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -372,6 +375,7 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].delivery_rate = 0;
     tcbs[i].rate_sample_ms = 0;
     tcbs[i].min_rtt_ms = 0;
+    tcbs[i].last_pace_ms = 0;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -1825,6 +1829,15 @@ fn flushSendBuffer(tcb: *TcpTcb) void {
 
         if (can_send == 0) break;
 
+        // SK-120: rate-based pacing (skip during recovery/F-RTO repair).
+        if (!tcb.in_recovery and tcb.frto == 0 and tcb.delivery_rate > 0) {
+            const interval = probePaceIntervalMs(mss, tcb.delivery_rate);
+            if (interval > 0 and tcb.last_pace_ms != 0) {
+                const now = timestampMs();
+                if (now -% tcb.last_pace_ms < interval) break;
+            }
+        }
+
         // TCP_CORK: only send full MSS segments (coalesce small writes)
         if (tcb.options.tcp_cork and can_send < mss) break;
 
@@ -1841,6 +1854,7 @@ fn flushSendBuffer(tcb: *TcpTcb) void {
         tcb.send_unacked = (tcb.send_unacked + can_send) % SEND_BUF_SIZE;
         _ = sendSegment(tcb, ACK | PSH, &seg_buf, @intCast(can_send));
         if (tcb.in_recovery) tcb.prr_out +%= can_send;
+        tcb.last_pace_ms = timestampMs();
         // ACK piggybacked on data — clear any pending delayed ACK
         tcb.delayed_ack_pending = false;
         tcb.delayed_ack_ms = 0;
@@ -2157,6 +2171,21 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
     if (tcb.nagle_pending and tcb.snd_nxt == tcb.snd_una) {
         tcb.nagle_pending = false;
         flushSendBuffer(tcb);
+    }
+
+    // SK-120: resume paced sends after the inter-packet interval elapses.
+    if (tcb.state == .established and !tcb.in_recovery and tcb.frto == 0 and
+        tcb.delivery_rate > 0 and tcb.last_pace_ms != 0)
+    {
+        const mss = mssForTcb(tcb);
+        const interval = probePaceIntervalMs(mss, tcb.delivery_rate);
+        if (interval > 0) {
+            const now = timestampMs();
+            if (now -% tcb.last_pace_ms >= interval) {
+                const pending = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
+                if (pending > 0) flushSendBuffer(tcb);
+            }
+        }
     }
 }
 
@@ -2860,6 +2889,12 @@ fn restoreSendHigh(tcb: *TcpTcb) void {
     if (skip > pending) return;
     tcb.snd_nxt = tcb.snd_max;
     tcb.send_unacked = (tcb.send_head + skip) % SEND_BUF_SIZE;
+}
+
+/// Inter-send pacing interval for one SMSS at `rate_bps` (0 = no delay) (SK-120).
+pub fn probePaceIntervalMs(smss: u32, rate_bps: u32) u32 {
+    if (smss == 0 or rate_bps == 0) return 0;
+    return @intCast((@as(u64, smss) * 1000) / rate_bps);
 }
 
 /// Instantaneous delivery rate in bytes/sec (SK-119).
