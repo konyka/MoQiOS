@@ -1727,7 +1727,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:多段丢失时更快开始修补空洞,缩短恢复时延。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-112] tcp sack islost early rexmit non-x86: OK`。
-- **后续**:Delivery Rate / BBR 类估计;或 `UpdateScoreboard` 增量合并精化。
+- **后续**:见 3.113（UpdateScoreboard 增量合并,已完成)。
+
+---
+
+### 3.113 SACK scoreboard 增量合并（SK-113,2026-07-23）
+
+- **背景**:dup ACK 用最新 SACK option 整表替换 scoreboard;新 ACK 直接清空,
+  仍在 `snd_una` 之上的空洞信息丢失,IsLost/pipe/选重传失真。
+- **方案**:`UpdateScoreboard` 按 `[snd_una,snd_nxt)` 裁剪,合并重叠/相邻区间,
+  最多保留 4 段最高序号块;新 ACK 与 dup ACK 均走合并路径。
+  `shared/sk113.zig` 锁定保留/合并/裁剪/裁边行为。
+- **效果**:跨 ACK 累积 SACK 证据,恢复路径更快更准。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-113] tcp sack scoreboard merge non-x86: OK`。
+- **后续**:Delivery Rate / BBR 类估计;或 PRR/undo 恢复精化。
 
 ---
 

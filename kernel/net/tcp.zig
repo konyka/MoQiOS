@@ -1219,8 +1219,12 @@ fn driveTcbStateMachine(
                         tcb.send_unacked = (tcb.send_unacked + acked) % SEND_BUF_SIZE;
                         tcb.retransmit_timer = 0;
                         tcb.retransmit_count = 0;
-                        // Clear SACK scoreboard — all data up to ack_num is acknowledged
-                        tcb.sack_scoreboard_count = 0;
+                        // SK-113: trim/merge scoreboard (do not wipe holes still above snd_una).
+                        if (opts.sack_block_count > 0) {
+                            updateScoreboard(tcb, opts.sack_blocks[0..opts.sack_block_count]);
+                        } else {
+                            updateScoreboard(tcb, &.{});
+                        }
 
                         // Keepalive: reset idle timer and probe count on new ACK
                         tcb.idle_ms = 0;
@@ -1282,12 +1286,9 @@ fn driveTcbStateMachine(
                 } else {
                     // Duplicate ACK (ack_num == snd_una)
                     if (payload_len == 0) {
-                        // Update SACK scoreboard from received SACK blocks
+                        // SK-113: merge incoming SACK blocks into the scoreboard.
                         if (opts.sack_block_count > 0) {
-                            tcb.sack_scoreboard_count = opts.sack_block_count;
-                            for (0..opts.sack_block_count) |si| {
-                                tcb.sack_scoreboard[si] = opts.sack_blocks[si];
-                            }
+                            updateScoreboard(tcb, opts.sack_blocks[0..opts.sack_block_count]);
                         }
 
                         tcb.dup_ack_count += 1;
@@ -2341,6 +2342,91 @@ fn addSackBlock(tcb: *TcpTcb, left: u32, right: u32) void {
     } else {
         // Replace the oldest (last) block
         tcb.sack_blocks[3] = .{ .left = left, .right = right };
+    }
+}
+
+/// RFC 6675 UpdateScoreboard: clip by [snd_una,snd_nxt), merge overlap/adjacent,
+/// keep at most 4 highest ranges (SK-113).
+pub fn probeMergeScoreboard(
+    una: u32,
+    nxt: u32,
+    old: []const SackBlock,
+    neu: []const SackBlock,
+    out: *[4]SackBlock,
+) u3 {
+    var tmp: [8]SackBlock = undefined;
+    var n: usize = 0;
+
+    const sources = [_][]const SackBlock{ old, neu };
+    for (sources) |src| {
+        for (src) |blk| {
+            if (n >= tmp.len) break;
+            var left = blk.left;
+            var right = blk.right;
+            if (!tcp_util.seqLt(left, right)) continue;
+            // Drop / clip below cumulative ACK.
+            if (tcp_util.seqLeq(right, una)) continue;
+            if (tcp_util.seqLt(left, una)) left = una;
+            // Drop / clip above snd_nxt.
+            if (tcp_util.seqLeq(nxt, left)) continue;
+            if (tcp_util.seqLt(nxt, right)) right = nxt;
+            if (!tcp_util.seqLt(left, right)) continue;
+            tmp[n] = .{ .left = left, .right = right };
+            n += 1;
+        }
+    }
+
+    // Sort by left relative to una (insertion sort; n ≤ 8).
+    var i: usize = 1;
+    while (i < n) : (i += 1) {
+        const key = tmp[i];
+        const key_rel = key.left -% una;
+        var j: usize = i;
+        while (j > 0 and (tmp[j - 1].left -% una) > key_rel) : (j -= 1) {
+            tmp[j] = tmp[j - 1];
+        }
+        tmp[j] = key;
+    }
+
+    // Merge overlapping / adjacent half-open ranges.
+    var w: usize = 0;
+    for (0..n) |k| {
+        if (w == 0) {
+            tmp[w] = tmp[k];
+            w = 1;
+            continue;
+        }
+        const prev = &tmp[w - 1];
+        if (tcp_util.seqLeq(tmp[k].left, prev.right)) {
+            if (tcp_util.seqLt(prev.right, tmp[k].right)) prev.right = tmp[k].right;
+        } else {
+            tmp[w] = tmp[k];
+            w += 1;
+        }
+    }
+
+    // Cap at 4: keep the highest sequence ranges.
+    const start: usize = if (w > 4) w - 4 else 0;
+    const count: u3 = @intCast(w - start);
+    for (0..count) |k| {
+        out[k] = tmp[start + k];
+    }
+    return count;
+}
+
+/// Merge incoming SACK option blocks into the sender scoreboard (SK-113).
+fn updateScoreboard(tcb: *TcpTcb, incoming: []const SackBlock) void {
+    var out: [4]SackBlock = undefined;
+    const n = probeMergeScoreboard(
+        tcb.snd_una,
+        tcb.snd_nxt,
+        tcb.sack_scoreboard[0..tcb.sack_scoreboard_count],
+        incoming,
+        &out,
+    );
+    tcb.sack_scoreboard_count = n;
+    for (0..n) |i| {
+        tcb.sack_scoreboard[i] = out[i];
     }
 }
 

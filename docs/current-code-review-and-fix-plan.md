@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-23 (SK-112 SACK IsLost early rexmit + prior SK-111 reviewed and verified)
+> Last update: 2026-07-23 (SK-113 SACK scoreboard merge + prior SK-112 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -444,6 +444,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | Zero window could stall forever | Lost window-update left unsent data stuck. | SK-110: persist timer sends 1-byte probes. |
 | SACKed bytes blocked the pipe | In-flight used snd_nxt−snd_una during recovery. | SK-111: pipe = flight − sacked (RFC 6675). |
 | Fast retransmit waited on 3 dupacks | SACK already proved head loss. | SK-112: RFC 6675 IsLost also enters recovery. |
+| Scoreboard replaced / wiped | Latest SACK option overwrote prior holes; new ACK cleared all. | SK-113: UpdateScoreboard merges, clips by [una,nxt), keeps ≤4. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -453,8 +454,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-112] tcp sack islost early rexmit non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-112] tcp sack islost early rexmit non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-113] tcp sack scoreboard merge non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-113] tcp sack scoreboard merge non-x86: OK`. |
 
 ### 5.3 Historical Verification
 
