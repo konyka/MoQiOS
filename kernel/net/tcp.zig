@@ -173,6 +173,8 @@ const TcpTcb = struct {
     frto: u2,
     /// Highest sequence ever sent (survives rexmit rewind) (SK-116).
     snd_max: u32,
+    /// Tail Loss Probe already sent this loss episode (SK-117).
+    tlp_sent: bool,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -291,6 +293,7 @@ pub fn initTcbs() void {
             .undo_ssthresh = 0,
             .frto = 0,
             .snd_max = 0,
+            .tlp_sent = false,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -352,6 +355,7 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].undo_ssthresh = 0;
     tcbs[i].frto = 0;
     tcbs[i].snd_max = 0;
+    tcbs[i].tlp_sent = false;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -1256,6 +1260,7 @@ fn driveTcbStateMachine(
                         tcb.send_unacked = (tcb.send_unacked + acked) % SEND_BUF_SIZE;
                         tcb.retransmit_timer = 0;
                         tcb.retransmit_count = 0;
+                        tcb.tlp_sent = false;
                         // SK-113: trim/merge scoreboard (do not wipe holes still above snd_una).
                         if (opts.sack_block_count > 0) {
                             updateScoreboard(tcb, opts.sack_blocks[0..opts.sack_block_count]);
@@ -1959,11 +1964,24 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
         return;
     }
 
-    // Check for unacknowledged data
-    if (tcb.snd_nxt != tcb.snd_una) {
+    // Check for unacknowledged data (use snd_max so rexmit rewind still counts).
+    if (tcp_util.seqLt(tcb.snd_una, tcb.snd_max) or tcb.snd_nxt != tcb.snd_una) {
         tcb.retransmit_timer +%= ms_elapsed;
         // Use per-TCB RTO if available, otherwise fall back to RETRANSMIT_MS
         const current_rto = if (tcb.rto > 0) tcb.rto else RETRANSMIT_MS;
+        // SK-117: Tail Loss Probe before RTO (no cwnd cut).
+        const tlp_to = probeTlpTimeoutMs(tcb.srtt, current_rto);
+        if (probeTlpShouldFire(
+            tcb.retransmit_timer,
+            tlp_to,
+            current_rto,
+            tcb.tlp_sent,
+            tcb.in_recovery,
+            tcb.frto,
+        )) {
+            sendTlpProbe(tcb);
+            tcb.tlp_sent = true;
+        }
         if (tcb.retransmit_timer >= current_rto) {
             tcb.retransmit_timer = 0;
             tcb.retransmit_count += 1;
@@ -1985,6 +2003,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             tcb.recover_fs = 0;
             tcb.prr_delivered = 0;
             tcb.prr_out = 0;
+            tcb.tlp_sent = false;
             // SK-116: enter F-RTO; keep undo until confirmed spurious or lossy.
             tcb.frto = 1;
             if (tcp_util.seqLt(tcb.snd_max, tcb.snd_nxt)) tcb.snd_max = tcb.snd_nxt;
@@ -2778,6 +2797,50 @@ fn restoreSendHigh(tcb: *TcpTcb) void {
     if (skip > pending) return;
     tcb.snd_nxt = tcb.snd_max;
     tcb.send_unacked = (tcb.send_head + skip) % SEND_BUF_SIZE;
+}
+
+/// TLP PTO = min(RTO−1, max(2·SRTT, 10ms)) (SK-117).
+pub fn probeTlpTimeoutMs(srtt: u32, rto: u32) u32 {
+    var pto: u32 = if (srtt > 0) srtt *% 2 else RETRANSMIT_MS / 2;
+    if (pto < 10) pto = 10;
+    const limit: u32 = if (rto > 1) rto - 1 else 1;
+    if (pto > limit) pto = limit;
+    return pto;
+}
+
+/// True when a Tail Loss Probe should fire (SK-117).
+pub fn probeTlpShouldFire(
+    timer_ms: u32,
+    tlp_to: u32,
+    rto: u32,
+    tlp_sent: bool,
+    in_recovery: bool,
+    frto: u2,
+) bool {
+    if (tlp_sent or in_recovery or frto != 0) return false;
+    if (tlp_to == 0 or tlp_to >= rto) return false;
+    return timer_ms >= tlp_to and timer_ms < rto;
+}
+
+/// Send one TLP segment: prefer new data at snd_max, else first hole (SK-117).
+fn sendTlpProbe(tcb: *TcpTcb) void {
+    const smss = mssForTcb(tcb);
+    restoreSendHigh(tcb);
+    var pending = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
+    if (pending == 0) {
+        prepareRexmitFromHole(tcb);
+        pending = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
+    }
+    if (pending == 0) return;
+
+    const saved_cwnd = tcb.cwnd;
+    const saved_nodelay = tcb.options.tcp_nodelay;
+    const pipe = pipeBytes(tcb);
+    tcb.cwnd = pipe + smss;
+    tcb.options.tcp_nodelay = true;
+    flushSendBuffer(tcb);
+    tcb.cwnd = saved_cwnd;
+    tcb.options.tcp_nodelay = saved_nodelay;
 }
 
 /// RFC 1122 keepalive probe SEQ = SND.UNA − 1 (SK-109).

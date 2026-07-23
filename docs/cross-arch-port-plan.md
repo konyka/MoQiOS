@@ -1783,7 +1783,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:虚假超时时恢复原 cwnd,避免延迟 ACK 路径的吞吐塌陷。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-116] tcp f-rto spurious rto non-x86: OK`。
-- **后续**:Delivery Rate / BBR 类估计;或 RACK/TLP 损失检测。
+- **后续**:见 3.117（TLP 尾丢探测,已完成)。
+
+---
+
+### 3.117 Tail Loss Probe（SK-117,2026-07-23）
+
+- **背景**:尾部段丢失时常无 dup ACK/SACK,只能等完整 RTO 才重传,拉长尾延迟。
+- **方案**:在 `PTO=min(RTO−1,max(2·SRTT,10ms))` 到期且尚未恢复/F-RTO 时,
+  不减窗发送 1 段探测(优先新数据,否则首个 hole);每个丢失回合至多一次。
+  `shared/sk117.zig` 锁定 PTO 与触发条件。
+- **效果**:尾丢可在 RTO 前修复,缩短短流/尾延迟。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-117] tcp tail loss probe non-x86: OK`。
+- **后续**:Delivery Rate / BBR 类估计;或 RACK 时间序损失检测。
 
 ---
 
