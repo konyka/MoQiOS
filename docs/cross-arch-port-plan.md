@@ -1585,7 +1585,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:与 IPv6 PTB 对称的 IPv4 PMTU 发现,避免 DF 黑洞路径上的盲目超大发送。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-101] ipv4 path mtu frag-needed non-x86: OK`。
-- **后续**:SYN MSS 随接口 MTU;或 PMTU 探测抬升(RFC 4821)。
+- **后续**:见 3.102（接口 MTU / RA MTU → SYN MSS,已完成)。
+
+---
+
+### 3.102 接口 MTU 与 RA MTU 选项驱动 SYN MSS（SK-102,2026-07-23）
+
+- **背景**:默认 Path MTU / SYN MSS 写死 1500;RA MTU 选项(type=5)被忽略。
+- **方案**:`netif` 维护可配置 `link_mtu`;RA 解析/应用 MTU 选项(≥1280);
+  `ipv4`/`ipv6.getPathMtu` 与钳制上限跟随接口 MTU,从而 SYN MSS / SMSS 同步变化。
+  `shared/sk102.zig` 锁定解析、应用、MSS 跟随与过低 MTU 忽略。
+- **效果**:链路 MTU 收缩时本端立即通告更小 MSS,避免对端按 1500 发送。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-102] if mtu ra syn mss non-x86: OK`。
+- **后续**:PMTU 探测抬升(RFC 4821);或 jumbo / 按 NIC 能力抬高 MAX_MTU。
 
 ---
 

@@ -30,6 +30,8 @@ pub const REDIRECT: u8 = 137;
 const OPT_SOURCE_LL_ADDR: u8 = 1;
 const OPT_TARGET_LL_ADDR: u8 = 2;
 const OPT_PREFIX_INFORMATION: u8 = 3;
+/// RFC 4861 §4.6.4 MTU option (SK-102).
+const OPT_MTU: u8 = 5;
 /// RFC 4191 Route Information Option (SK-94).
 const OPT_ROUTE_INFORMATION: u8 = 24;
 
@@ -182,6 +184,8 @@ pub const RouterAdvert = struct {
     reachable_ms: u32 = 0,
     retrans_ms: u32 = 0,
     source_ll: ?[6]u8 = null,
+    /// RA MTU option value when present (SK-102).
+    mtu: ?u32 = null,
     prefixes: [MAX_RA_PREFIXES]PrefixInfo = @splat(.{}),
     prefix_count: u8 = 0,
     routes: [MAX_RA_ROUTES]RouteInfo = @splat(.{}),
@@ -210,6 +214,9 @@ pub fn parseRouterAdvertisement(data: [*]const u8, len: u16) ?RouterAdvert {
                 data[off + 2], data[off + 3], data[off + 4],
                 data[off + 5], data[off + 6], data[off + 7],
             };
+        } else if (opt_type == OPT_MTU and opt_len >= 8) {
+            // type(1)+len(1)+reserved(2)+mtu(4)
+            adv.mtu = bo.readU32BeAt(data, off + 4);
         } else if (opt_type == OPT_PREFIX_INFORMATION and opt_len >= 32) {
             // type(1)+len(1)+prefix_len(1)+flags(1)+valid(4)+pref(4)+reserved(4)+prefix(16)
             if (adv.prefix_count < MAX_RA_PREFIXES) {
@@ -260,6 +267,10 @@ fn handleRouterAdvertisement(src_ip: [16]u8, data: [*]const u8, len: u16) void {
     ndp.setDefaultRouter(src_ip, adv.router_lifetime_sec);
     // SK-88: a usable RA ends the solicitation burst.
     if (adv.router_lifetime_sec != 0) stopRouterSolicit();
+    // SK-102: RA MTU option lowers/raises the interface MTU (≥ IPv6 minimum).
+    if (adv.mtu) |m| {
+        if (m >= ipv6.MIN_MTU) netif.setMtu(m);
+    }
     const our_mac = netif.getMac();
     var i: u8 = 0;
     while (i < adv.prefix_count) : (i += 1) {

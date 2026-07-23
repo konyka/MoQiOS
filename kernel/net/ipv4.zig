@@ -1,5 +1,6 @@
 const bo = @import("../lib/byte_order.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+const netif = @import("netif.zig");
 
 pub const PROTO_ICMP: u8 = 1;
 pub const PROTO_TCP: u8 = 6;
@@ -117,8 +118,9 @@ pub fn initPmtu() void {
 }
 
 fn clampMtu(reported: u32) u16 {
+    const cap = netif.getMtu();
     if (reported < MIN_MTU) return MIN_MTU;
-    if (reported > LINK_MTU) return LINK_MTU;
+    if (reported > cap) return cap;
     return @intCast(reported);
 }
 
@@ -158,15 +160,16 @@ pub fn updatePathMtu(dst: [4]u8, reported_mtu: u32) void {
     };
 }
 
-/// Current Path MTU for `dst`, or `LINK_MTU` when unknown (SK-101).
+/// Current Path MTU for `dst`, or interface MTU when unknown (SK-101/102).
 pub fn getPathMtu(dst: [4]u8) u16 {
+    const if_mtu = netif.getMtu();
     const flags = pmtu_lock.acquire();
     defer pmtu_lock.release(flags);
     for (0..MAX_PMTU_ENTRIES) |i| {
         const e = &pmtu_table[i];
-        if (e.valid and addrEq(e.dst, dst)) return e.mtu;
+        if (e.valid and addrEq(e.dst, dst)) return @min(e.mtu, if_mtu);
     }
-    return LINK_MTU;
+    return if_mtu;
 }
 
 /// Probe helper (SK-101).
