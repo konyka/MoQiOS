@@ -1982,7 +1982,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:避免 ECN+丢包双次过砍,伪 ECE 可撤销。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-132] tcp ecn undo/loss cut non-x86: OK`。
-- **后续**:AccECN;或 ECN 与 PRR sndcnt 的显式耦合。
+- **后续**:见 3.133（ECN-PRR 耦合,已完成)。
+
+---
+
+### 3.133 ECN 与 PRR sndcnt 耦合（SK-133,2026-07-24）
+
+- **背景**:ECE 砍窗后 inflight 仍可能高于新 cwnd,普通 CA 会在 ACK 上过早爬升;
+  恢复中 ECE 被完全忽略,PRR 目标 ssthresh 过时。
+- **方案**:`pipe>cwnd` 时武装 `ecn_prr` 用 PRR 排空;恢复中 ECE 仅按 CUBIC β 下调
+  ssthresh。`shared/sk133.zig` 锁定 arm/done 与 recovery ssthresh。
+- **效果**:ECN 后发送更平滑,恢复期也能吸收 CE 信号。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-133] tcp ecn prr couple non-x86: OK`。
+- **后续**:AccECN;或 Accurate ECN ACE 计数器。
 
 ---
 

@@ -253,6 +253,8 @@ const TcpTcb = struct {
     ecn_reduced: bool,
     /// undo_* was saved by an ECN cut (SK-132).
     ecn_undo: bool,
+    /// PRR drain after an ECN cut while pipe > cwnd (SK-133).
+    ecn_prr: bool,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -403,6 +405,7 @@ pub fn initTcbs() void {
             .ecn_cwr_pending = false,
             .ecn_reduced = false,
             .ecn_undo = false,
+            .ecn_prr = false,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -496,6 +499,7 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].ecn_cwr_pending = false;
     tcbs[i].ecn_reduced = false;
     tcbs[i].ecn_undo = false;
+    tcbs[i].ecn_prr = false;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -828,6 +832,16 @@ fn noteEcnCwrSent(tcb: *TcpTcb, flags: u8) void {
     }
 }
 
+fn clearEcnPrr(tcb: *TcpTcb) void {
+    if (!tcb.ecn_prr) return;
+    tcb.ecn_prr = false;
+    if (!tcb.in_recovery) {
+        tcb.recover_fs = 0;
+        tcb.prr_delivered = 0;
+        tcb.prr_out = 0;
+    }
+}
+
 /// Build and send a TCP segment (IPv4 or IPv6).
 fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
     return sendSegmentSeq(tcb, flags, data, data_len, null);
@@ -1125,9 +1139,10 @@ fn updateRtt(tcb: *TcpTcb, m: u32) void {
     noteHystartRtt(tcb, m);
 }
 
-/// RFC 3168: cut cwnd on ECE without entering loss recovery (SK-131/132).
+/// RFC 3168: cut cwnd on ECE without entering loss recovery (SK-131/132/133).
 fn applyEcnCongestion(tcb: *TcpTcb) void {
     const smss = mssForTcb(tcb);
+    const pipe = pipeBytes(tcb);
     // SK-132: save prior window so DSACK/F-RTO can undo a spurious ECE cut.
     if (tcb.undo_cwnd == 0) {
         tcb.undo_cwnd = tcb.cwnd;
@@ -1143,16 +1158,34 @@ fn applyEcnCongestion(tcb: *TcpTcb) void {
     tcb.cubic_epoch_ms = 0;
     clearHystartRound(tcb);
     tcb.hystart_css = false;
+    // SK-133: if inflight exceeds the new window, drain with PRR (not loss recovery).
+    if (probeEcnPrrArm(pipe, tcb.cwnd)) {
+        tcb.ecn_prr = true;
+        tcb.recover_fs = @max(pipe, 1);
+        tcb.prr_delivered = 0;
+        tcb.prr_out = 0;
+        tcb.cwnd = pipe; // no burst until DeliveredData arrives
+    }
 }
 
-/// Apply IP-CE / ECE / CWR side effects (SK-131).
+/// ECE during loss recovery: lower PRR's ssthresh only (SK-133).
+fn applyEcnDuringRecovery(tcb: *TcpTcb) void {
+    const smss = mssForTcb(tcb);
+    const new_ss = probeEcnRecoverySsthresh(tcb.cwnd, tcb.ssthresh, smss);
+    if (new_ss < tcb.ssthresh) tcb.ssthresh = new_ss;
+    tcb.ecn_cwr_pending = true;
+    tcb.ecn_reduced = true;
+}
+
+/// Apply IP-CE / ECE / CWR side effects (SK-131/133).
 fn noteEcnRx(tcb: *TcpTcb, flags: u8, ecn_ce: bool) void {
     if (ecn_ce and tcb.ecn_ok) tcb.ecn_ece_pending = true;
     if ((flags & CWR) != 0) tcb.ecn_ece_pending = false;
-    if ((flags & ECE) != 0 and tcb.ecn_ok and
-        probeEcnReact(true, tcb.ecn_reduced, tcb.in_recovery))
-    {
+    if ((flags & ECE) == 0 or !tcb.ecn_ok) return;
+    if (probeEcnReact(true, tcb.ecn_reduced, tcb.in_recovery)) {
         applyEcnCongestion(tcb);
+    } else if (probeEcnReactRecovery(true, tcb.ecn_reduced, tcb.in_recovery)) {
+        applyEcnDuringRecovery(tcb);
     }
 }
 
@@ -1811,10 +1844,20 @@ fn driveTcbStateMachine(
                                 tcb.recover_fs = 0;
                                 tcb.prr_delivered = 0;
                                 tcb.prr_out = 0;
+                                clearEcnPrr(tcb);
                             } else {
                                 applyPrr(tcb, delivered);
                                 flushSendBuffer(tcb);
                             }
+                        } else if (tcb.ecn_prr) {
+                            // SK-133: PRR drain after ECN cut until pipe ≤ ssthresh.
+                            applyPrr(tcb, delivered);
+                            if (probeEcnPrrDone(pipeBytes(tcb), tcb.ssthresh)) {
+                                tcb.cwnd = tcb.ssthresh;
+                                clearEcnPrr(tcb);
+                                tcb.cubic_epoch_ms = 0;
+                            }
+                            flushSendBuffer(tcb);
                         } else {
                             // SK-122: finish ProbeRTT before growing again.
                             maybeExitProbeRtt(tcb);
@@ -1906,6 +1949,7 @@ fn driveTcbStateMachine(
                             tcb.bbr_cycle_ms = 0;
                             tcb.hystart_css = false;
                             clearHystartRound(tcb);
+                            clearEcnPrr(tcb);
                             tcb.in_recovery = true;
                             tcb.recover_seq = tcb.snd_nxt;
                             tcb.recover_fs = @max(pipe, 1);
@@ -2556,6 +2600,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             tcb.cwnd = smss_rto; // back to slow start
             tcb.hystart_css = false;
             clearHystartRound(tcb);
+            clearEcnPrr(tcb);
             tcb.in_recovery = false;
             tcb.dup_ack_count = 0;
             tcb.recover_fs = 0;
@@ -3364,6 +3409,7 @@ fn tryUndoSpurious(tcb: *TcpTcb) void {
         tcb.ecn_cwr_pending = false;
         tcb.ecn_reduced = false;
         tcb.ecn_undo = false;
+        clearEcnPrr(tcb);
     }
     tcb.undo_cwnd = 0;
     tcb.undo_ssthresh = 0;
@@ -3509,6 +3555,26 @@ pub fn probeEcnSkipLossCut(ecn_reduced: bool) bool {
 /// Entering loss recovery after ECN: keep prior undo if ECN saved it (SK-132).
 pub fn probeEcnKeepUndo(ecn_undo: bool, undo_cwnd: u32) bool {
     return ecn_undo and undo_cwnd != 0;
+}
+
+/// ECE during recovery may still lower ssthresh once (SK-133).
+pub fn probeEcnReactRecovery(ece: bool, already_reduced: bool, in_recovery: bool) bool {
+    return ece and !already_reduced and in_recovery;
+}
+
+/// Arm ECN-PRR when inflight exceeds the post-ECE cwnd (SK-133).
+pub fn probeEcnPrrArm(pipe: u32, cwnd: u32) bool {
+    return pipe > cwnd;
+}
+
+/// ECN-PRR finished when pipe is back within ssthresh (SK-133).
+pub fn probeEcnPrrDone(pipe: u32, ssthresh: u32) bool {
+    return pipe <= ssthresh;
+}
+
+/// ssthresh after ECE in recovery = CUBIC β · max(cwnd, ssthresh) (SK-133).
+pub fn probeEcnRecoverySsthresh(cwnd: u32, ssthresh: u32, smss: u32) u32 {
+    return probeCubicSsthresh(@max(cwnd, ssthresh), smss);
 }
 
 /// HyStart round ends when cumulative ACK covers round_end (SK-129).
@@ -3701,6 +3767,7 @@ fn maybeRackTimerRepair(tcb: *TcpTcb, rto: u32) bool {
         tcb.bbr_cycle_ms = 0;
         tcb.hystart_css = false;
         clearHystartRound(tcb);
+        clearEcnPrr(tcb);
         tcb.in_recovery = true;
         tcb.recover_seq = tcb.snd_nxt;
         tcb.recover_fs = @max(pipe, 1);
