@@ -1181,7 +1181,7 @@ fn updateRtt(tcb: *TcpTcb, m: u32) void {
     noteHystartRtt(tcb, m);
 }
 
-/// RFC 3168: cut cwnd on ECE/ACE without entering loss recovery (SK-131/132/133/136).
+/// Cut cwnd on ECE/ACE without entering loss recovery (SK-131/132/133/136/144).
 fn applyEcnCongestion(tcb: *TcpTcb, ace_delta: u3) void {
     const smss = mssForTcb(tcb);
     const pipe = pipeBytes(tcb);
@@ -1191,10 +1191,18 @@ fn applyEcnCongestion(tcb: *TcpTcb, ace_delta: u3) void {
         tcb.undo_ssthresh = tcb.ssthresh;
         tcb.ecn_undo = true;
     }
-    // SK-138: ACE-aware W_max before cut; ECE-only keeps classic pre-cut W_max.
-    noteCubicAceLoss(tcb, smss, ace_delta);
-    // SK-136: ACE delta scales CUBIC β applied times; ECE-only (delta=0) → one cut.
-    tcb.ssthresh = probeAceScaledSsthresh(tcb.cwnd, smss, ace_delta);
+    if (tcb.accecn_ok) {
+        // SK-144: L4S-lite proportional cut keep (8−δ)/8 instead of CUBIC β^δ.
+        tcb.ssthresh = probeL4sSsthresh(tcb.cwnd, smss, ace_delta);
+        tcb.cubic_w_max = tcb.ssthresh;
+        tcb.cubic_epoch_ms = 0;
+        tcb.cubic_k_ms = 0;
+    } else {
+        // SK-138: ACE-aware W_max; ECE-only keeps classic pre-cut W_max.
+        noteCubicAceLoss(tcb, smss, ace_delta);
+        // SK-136: ACE delta scales CUBIC β; ECE-only (delta=0) → one cut.
+        tcb.ssthresh = probeAceScaledSsthresh(tcb.cwnd, smss, ace_delta);
+    }
     if (tcb.cwnd > tcb.ssthresh) tcb.cwnd = tcb.ssthresh;
     tcb.ecn_cwr_pending = true;
     tcb.ecn_reduced = true;
@@ -1212,10 +1220,14 @@ fn applyEcnCongestion(tcb: *TcpTcb, ace_delta: u3) void {
     }
 }
 
-/// ECE/ACE during loss recovery: lower PRR's ssthresh only (SK-133/136).
+/// ECE/ACE during loss recovery: lower PRR's ssthresh only (SK-133/136/144).
 fn applyEcnDuringRecovery(tcb: *TcpTcb, ace_delta: u3) void {
     const smss = mssForTcb(tcb);
-    const new_ss = probeAceScaledRecoverySsthresh(tcb.cwnd, tcb.ssthresh, smss, ace_delta);
+    const basis = @max(tcb.cwnd, tcb.ssthresh);
+    const new_ss = if (tcb.accecn_ok)
+        probeL4sSsthresh(basis, smss, ace_delta)
+    else
+        probeAceScaledRecoverySsthresh(tcb.cwnd, tcb.ssthresh, smss, ace_delta);
     if (new_ss < tcb.ssthresh) tcb.ssthresh = new_ss;
     tcb.ecn_cwr_pending = true;
     tcb.ecn_reduced = true;
@@ -3711,6 +3723,14 @@ pub fn probeEcnRecoverySsthresh(cwnd: u32, ssthresh: u32, smss: u32) u32 {
 /// ACE delta → how many CUBIC β cuts to stack; ECE-only (0) counts as one (SK-136).
 pub fn probeAceCutCount(delta: u3) u3 {
     return if (delta == 0) 1 else delta;
+}
+
+/// L4S-lite ssthresh: keep (8−cuts)/8 of cwnd, floor 2·SMSS (SK-144).
+pub fn probeL4sSsthresh(cwnd: u32, smss: u32, delta: u3) u32 {
+    const cuts: u32 = probeAceCutCount(delta);
+    const keep = 8 - cuts; // cuts 1..7 → keep 7..1
+    const reduced = (@as(u64, cwnd) * keep) / 8;
+    return @max(@as(u32, @intCast(reduced)), smss * 2);
 }
 
 /// Apply CUBIC β `delta` times (or once if delta=0) (SK-136).

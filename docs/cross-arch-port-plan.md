@@ -2126,7 +2126,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:AccECN 流可被 L4S 队列按 ECT(1) 做更密 CE 标记;经典 ECN 不变。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-143] tcp accecn ect(1) non-x86: OK`。
-- **后续**:L4S 风格按 CE 比例微调窗;或 AccECN ACE 与 IP-ECN CE 计数分离统计。
+- **后续**:见 3.144（L4S-lite 比例减窗,已完成)。
+
+---
+
+### 3.144 AccECN L4S-lite 按 ACE 比例减窗（SK-144,2026-07-24）
+
+- **背景**:AccECN+ECT(1) 下 AQM 可能每 RTT 给出多次 CE;若仍叠 CUBIC β^δ,
+  窗口会塌缩,违背 L4S 小步微调。
+- **方案**:`accecn_ok` 时用 `probeL4sSsthresh` 保留 `(8−δ)/8` 的 cwnd(地板 2·SMSS);
+  经典 ECN 仍走 CUBIC β 路径。`shared/sk144.zig` 锁定比例与“轻于 CUBIC”。
+- **效果**:密集 CE 下窗口平滑收缩;与 SK-135 每 RTT 再反应配合形成 L4S-lite。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-144] tcp l4s ace cut non-x86: OK`。
+- **后续**:AccECN ACE 与 IP-ECN CE 计数分离统计;或按交付量归一化 CE 标记率。
 
 ---
 
