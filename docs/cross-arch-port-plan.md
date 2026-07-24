@@ -1897,7 +1897,19 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:慢启动更早转入 CA/CUBIC,减少缓冲区膨胀与不必要丢包。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-125] tcp hystart++ non-x86: OK`。
-- **后续**:完整 RACK per-segment 时间戳;或 ACK-train HyStart 轮次边界。
+- **后续**:见 3.126（RACK per-segment,已完成)。
+
+---
+
+### 3.126 RACK per-segment 发送时间戳（SK-126,2026-07-24）
+
+- **背景**:SK-118 仅记录 SND.UNA 发送时刻并用平滑 SRTT;后发先至的 SACK 无法按真实段 RTT 判定。
+- **方案**:维护 8 槽 `(seq,xmit_ms)`;ACK/SACK 交付时更新 `rack_xmit_ts`/`rack_rtt_ms`;
+  头部在「同刻或更晚发送的段已交付且 elapsed≥RTT+reo」时判丢。`shared/sk126.zig` 锁定判定。
+- **效果**:乱序/稀疏 SACK 下更快进入恢复,减少空等 SRTT。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-126] tcp rack per-segment non-x86: OK`。
+- **后续**:ACK-train HyStart 轮次边界;或 RACK 对非头部空洞的定时重传。
 
 ---
 

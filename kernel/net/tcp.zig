@@ -69,6 +69,8 @@ const CUBIC_BETA_DEN: u32 = 10;
 /// HyStart++ delay thresh clamp (RFC 9406-inspired) (SK-125).
 const HYSTART_MIN_THRESH_MS: u32 = 4;
 const HYSTART_MAX_THRESH_MS: u32 = 16;
+/// RACK per-segment TX timestamp slots (SK-126).
+const RACK_TX_MAX: usize = 8;
 
 /// Write `count` bytes from `src` into a ring buffer at `write_pos`.
 /// Uses @memcpy for contiguous chunks (handles wraparound at buffer boundary).
@@ -186,6 +188,16 @@ const TcpTcb = struct {
     tlp_sent: bool,
     /// Last (re)transmit time of SND.UNA head; 0 = unknown (SK-118).
     head_xmit_ms: u32,
+    /// Recent data TX sequence numbers for RACK (SK-126).
+    rack_tx_seq: [RACK_TX_MAX]u32,
+    /// Matching TX timestamps (0 = empty slot) (SK-126).
+    rack_tx_ms: [RACK_TX_MAX]u32,
+    /// Next RACK TX slot index (SK-126).
+    rack_tx_next: u8,
+    /// Xmit time of most recently delivered segment (SK-126).
+    rack_xmit_ts: u32,
+    /// RTT of that delivered segment (SK-126).
+    rack_rtt_ms: u32,
     /// Estimated delivery rate (bytes/sec) (SK-119).
     delivery_rate: u32,
     /// Timestamp of last delivery-rate sample (SK-119).
@@ -338,6 +350,11 @@ pub fn initTcbs() void {
             .snd_max = 0,
             .tlp_sent = false,
             .head_xmit_ms = 0,
+            .rack_tx_seq = @splat(0),
+            .rack_tx_ms = @splat(0),
+            .rack_tx_next = 0,
+            .rack_xmit_ts = 0,
+            .rack_rtt_ms = 0,
             .delivery_rate = 0,
             .rate_sample_ms = 0,
             .min_rtt_ms = 0,
@@ -417,6 +434,11 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].snd_max = 0;
     tcbs[i].tlp_sent = false;
     tcbs[i].head_xmit_ms = 0;
+    tcbs[i].rack_tx_seq = @splat(0);
+    tcbs[i].rack_tx_ms = @splat(0);
+    tcbs[i].rack_tx_next = 0;
+    tcbs[i].rack_xmit_ts = 0;
+    tcbs[i].rack_rtt_ms = 0;
     tcbs[i].delivery_rate = 0;
     tcbs[i].rate_sample_ms = 0;
     tcbs[i].min_rtt_ms = 0;
@@ -774,7 +796,7 @@ fn sendSegmentSeq(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16, seq
     const ok = nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.
     if (ok) ipv4.noteFullSizeSend(tcb.remote_ip, ipv4.HEADER_LEN + tcp_total);
-    noteHeadXmit(tcb, seq_override orelse tcb.snd_nxt, data_len);
+    noteRackXmit(tcb, seq_override orelse tcb.snd_nxt, data_len);
     advanceSndNxt(tcb, flags, data_len);
     return true;
 }
@@ -809,16 +831,67 @@ fn sendSegmentV6Seq(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16, s
     const ok = nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.
     if (ok) ipv6.noteFullSizeSend(tcb.remote_ip6, ipv6.HEADER_LEN + tcp_total);
-    noteHeadXmit(tcb, seq_override orelse tcb.snd_nxt, data_len);
+    noteRackXmit(tcb, seq_override orelse tcb.snd_nxt, data_len);
     advanceSndNxt(tcb, flags, data_len);
     return true;
 }
 
-/// Record transmit time when (re)sending the SND.UNA head (SK-118).
-fn noteHeadXmit(tcb: *TcpTcb, seq: u32, data_len: u16) void {
-    if (data_len > 0 and seq == tcb.snd_una) {
-        tcb.head_xmit_ms = timestampMs();
+/// Record per-segment TX time for RACK; keep head_xmit for SK-118 (SK-126).
+fn noteRackXmit(tcb: *TcpTcb, seq: u32, data_len: u16) void {
+    if (data_len == 0) return;
+    const now = timestampMs();
+    if (seq == tcb.snd_una) tcb.head_xmit_ms = now;
+    for (0..RACK_TX_MAX) |i| {
+        if (tcb.rack_tx_ms[i] != 0 and tcb.rack_tx_seq[i] == seq) {
+            tcb.rack_tx_ms[i] = now;
+            return;
+        }
     }
+    const idx = tcb.rack_tx_next % RACK_TX_MAX;
+    tcb.rack_tx_seq[idx] = seq;
+    tcb.rack_tx_ms[idx] = now;
+    tcb.rack_tx_next +%= 1;
+}
+
+/// Drop RACK TX slots below SND.UNA (SK-126).
+fn pruneRackTx(tcb: *TcpTcb) void {
+    for (0..RACK_TX_MAX) |i| {
+        if (tcb.rack_tx_ms[i] != 0 and tcp_util.seqLt(tcb.rack_tx_seq[i], tcb.snd_una)) {
+            tcb.rack_tx_ms[i] = 0;
+        }
+    }
+}
+
+/// Update RACK reference from newly ACKed/SACKed segments (SK-126).
+fn noteRackDelivered(tcb: *TcpTcb, ack: u32, blocks: []const SackBlock) void {
+    const now = timestampMs();
+    var best_ms: u32 = 0;
+    for (0..RACK_TX_MAX) |i| {
+        const xmit = tcb.rack_tx_ms[i];
+        if (xmit == 0) continue;
+        const seq = tcb.rack_tx_seq[i];
+        var delivered = tcp_util.seqLt(seq, ack);
+        if (!delivered) {
+            for (blocks) |b| {
+                if (!tcp_util.seqLt(seq, b.left) and tcp_util.seqLt(seq, b.right)) {
+                    delivered = true;
+                    break;
+                }
+            }
+        }
+        if (delivered and xmit >= best_ms) best_ms = xmit;
+    }
+    if (best_ms == 0) return;
+    tcb.rack_xmit_ts = best_ms;
+    const rtt = now -% best_ms;
+    tcb.rack_rtt_ms = if (rtt > 0) rtt else 1;
+}
+
+fn lookupRackXmit(tcb: *const TcpTcb, seq: u32) u32 {
+    for (0..RACK_TX_MAX) |i| {
+        if (tcb.rack_tx_ms[i] != 0 and tcb.rack_tx_seq[i] == seq) return tcb.rack_tx_ms[i];
+    }
+    return 0;
 }
 
 /// Get a monotonically increasing millisecond timestamp for TCP timestamps.
@@ -1525,6 +1598,9 @@ fn driveTcbStateMachine(
                         } else {
                             updateScoreboard(tcb, &.{});
                         }
+                        // SK-126: refresh RACK ref from ACKed/SACKed segments, then prune.
+                        noteRackDelivered(tcb, ack_num, opts.sack_blocks[0..opts.sack_block_count]);
+                        pruneRackTx(tcb);
                         const sacked_after = sackedBytesInFlight(tcb);
                         const newly_sacked: u32 = if (sacked_after > sacked_before)
                             sacked_after - sacked_before
@@ -1638,6 +1714,8 @@ fn driveTcbStateMachine(
                         if (opts.sack_block_count > 0) {
                             updateScoreboard(tcb, opts.sack_blocks[0..opts.sack_block_count]);
                         }
+                        // SK-126: SACK-only delivery still advances the RACK reference.
+                        noteRackDelivered(tcb, ack_num, opts.sack_blocks[0..opts.sack_block_count]);
                         const sacked_after = sackedBytesInFlight(tcb);
                         const delivered: u32 = if (sacked_after > sacked_before)
                             sacked_after - sacked_before
@@ -1647,7 +1725,7 @@ fn driveTcbStateMachine(
 
                         tcb.dup_ack_count += 1;
 
-                        // SK-112/118: DupThresh, IsLost, or RACK-lite timed head loss.
+                        // SK-112/118/126: DupThresh, IsLost, or RACK timed head loss.
                         const enter_recovery = !tcb.in_recovery and
                             (tcb.dup_ack_count >= DUP_THRESH or
                                 isLost(tcb, tcb.snd_una) or
@@ -3298,12 +3376,28 @@ pub fn probeRackHeadLost(elapsed_ms: u32, srtt: u32, has_sack_above: bool) bool 
     return elapsed_ms >= srtt +% probeRackReoWnd(srtt);
 }
 
+/// RACK per-segment: lost if a same/later TX was delivered and elapsed ≥ RTT+reo (SK-126).
+pub fn probeRackSegLost(seg_xmit_ms: u32, ref_xmit_ms: u32, rtt_ms: u32, now_ms: u32) bool {
+    if (seg_xmit_ms == 0 or rtt_ms == 0) return false;
+    if (ref_xmit_ms != 0 and ref_xmit_ms < seg_xmit_ms) return false;
+    const elapsed = now_ms -% seg_xmit_ms;
+    return elapsed >= rtt_ms +% probeRackReoWnd(rtt_ms);
+}
+
 fn rackHeadLost(tcb: *const TcpTcb) bool {
-    if (tcb.head_xmit_ms == 0) return false;
     const has_above = sackedBytesAbove(tcb, tcb.snd_una) > 0 or
         sackBlocksAbove(tcb, tcb.snd_una) > 0;
     if (!has_above) return false;
-    const elapsed = timestampMs() -% tcb.head_xmit_ms;
+    const seg_xmit = blk: {
+        const v = lookupRackXmit(tcb, tcb.snd_una);
+        if (v != 0) break :blk v;
+        break :blk tcb.head_xmit_ms;
+    };
+    if (seg_xmit == 0) return false;
+    const rtt = if (tcb.rack_rtt_ms > 0) tcb.rack_rtt_ms else tcb.srtt;
+    // SK-126: prefer per-segment RACK; fall back to SK-118 elapsed/SRTT.
+    if (probeRackSegLost(seg_xmit, tcb.rack_xmit_ts, rtt, timestampMs())) return true;
+    const elapsed = timestampMs() -% seg_xmit;
     return probeRackHeadLost(elapsed, tcb.srtt, true);
 }
 
