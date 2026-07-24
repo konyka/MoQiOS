@@ -2046,7 +2046,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:CE 后立即排空队列并收紧 pacing/BDP,与 CUBIC β 缩放互补。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-137] tcp ace bbr couple non-x86: OK`。
-- **后续**:完整 AccECN SYN 协商(AE);或 ACE 折扣与 CUBIC W_max 联动。
+- **后续**:见 3.138（ACE↔CUBIC W_max,已完成)。
+
+---
+
+### 3.138 ACE 减窗与 CUBIC W_max 联动（SK-138,2026-07-24）
+
+- **背景**:ACE 叠加 β 砍窗后 `cubic_w_max` 仍记砍前 cwnd,CUBIC 会沿旧峰值快速爬回,
+  多 CE 的严重度在 CA 阶段被抵消。
+- **方案**:`probeAceCubicWmax`——ECE-only(delta=0)保持经典 pre-cut W_max;ACE 前进时
+  W_max=缩放后的 ssthresh。`shared/sk138.zig` 锁定两种路径。
+- **效果**:多 CE 后 CUBIC 以更低目标恢复,与 SK-136 缩放一致;经典 ECE 不变。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-138] tcp ace cubic wmax non-x86: OK`。
+- **后续**:完整 AccECN SYN 协商(AE);或 AccECN 计数与 TCP 选项字段对齐。
 
 ---
 

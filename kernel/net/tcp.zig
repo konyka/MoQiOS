@@ -1165,13 +1165,13 @@ fn applyEcnCongestion(tcb: *TcpTcb, ace_delta: u3) void {
         tcb.undo_ssthresh = tcb.ssthresh;
         tcb.ecn_undo = true;
     }
-    noteCubicLoss(tcb, smss);
+    // SK-138: ACE-aware W_max before cut; ECE-only keeps classic pre-cut W_max.
+    noteCubicAceLoss(tcb, smss, ace_delta);
     // SK-136: ACE delta scales CUBIC β applied times; ECE-only (delta=0) → one cut.
     tcb.ssthresh = probeAceScaledSsthresh(tcb.cwnd, smss, ace_delta);
     if (tcb.cwnd > tcb.ssthresh) tcb.cwnd = tcb.ssthresh;
     tcb.ecn_cwr_pending = true;
     tcb.ecn_reduced = true;
-    tcb.cubic_epoch_ms = 0;
     // SK-137: leave Startup, land ProbeBW on drain, discount delivery_rate.
     noteAceBbrCoupling(tcb, ace_delta);
     clearHystartRound(tcb);
@@ -1391,6 +1391,13 @@ fn bbrPacedRate(tcb: *const TcpTcb) u32 {
 /// Record CUBIC W_max at congestion; epoch restarts on next CA (SK-124).
 fn noteCubicLoss(tcb: *TcpTcb, smss: u32) void {
     tcb.cubic_w_max = @max(tcb.cwnd, smss * 2);
+    tcb.cubic_epoch_ms = 0;
+    tcb.cubic_k_ms = 0;
+}
+
+/// ACE-aware CUBIC W_max: classic on ECE-only, scaled post-cut on ACE (SK-138).
+fn noteCubicAceLoss(tcb: *TcpTcb, smss: u32, ace_delta: u3) void {
+    tcb.cubic_w_max = probeAceCubicWmax(tcb.cwnd, smss, ace_delta);
     tcb.cubic_epoch_ms = 0;
     tcb.cubic_k_ms = 0;
 }
@@ -3668,6 +3675,12 @@ pub fn probeAceRateDiscount(rate: u32, delta: u3) u32 {
     const keep = 10 - cuts; // cuts 1..7 → keep 9..3
     const v = (@as(u64, rate) * keep) / 10;
     return @intCast(@max(v, 1));
+}
+
+/// CUBIC W_max after ECN: pre-cut on ECE-only; ACE uses scaled ssthresh (SK-138).
+pub fn probeAceCubicWmax(pre_cwnd: u32, smss: u32, delta: u3) u32 {
+    if (delta == 0) return @max(pre_cwnd, smss * 2);
+    return probeAceScaledSsthresh(pre_cwnd, smss, delta);
 }
 
 /// ACE wrapping delta (mod 8) between previous and current peer ACE (SK-134).

@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-24 (SK-137 ACE↔BBR couple + prior SK-136 reviewed and verified)
+> Last update: 2026-07-24 (SK-138 ACE↔CUBIC W_max + prior SK-137 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -469,6 +469,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | ACE only cut once | After `ecn_reduced`, further ACE advances ignored until CWR. | SK-135: ACE may re-cut after ≥1 RTT; sticky ECE stays once-per-window. |
 | ACE delta ignored severity | Any ACE advance applied one CUBIC β cut. | SK-136: stack CUBIC β once per ACE CE count (ECE-only → one). |
 | ECN cut left BBR probing | Post-ACE ProbeBW could climb with 5/4 gain on stale rate. | SK-137: jump to drain phase + discount delivery_rate by ACE cuts. |
+| CUBIC raced to pre-ACE peak | After ACE β^n cut, W_max stayed at pre-cut cwnd. | SK-138: ACE sets W_max to scaled ssthresh; ECE-only keeps classic. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -478,8 +479,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-137] tcp ace bbr couple non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-137] tcp ace bbr couple non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-138] tcp ace cubic wmax non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-138] tcp ace cubic wmax non-x86: OK`. |
 
 ### 5.3 Historical Verification
 
