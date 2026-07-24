@@ -166,20 +166,21 @@ pass_markers() {
         grep -q "\[SK-121\] tcp bbr-lite startup non-x86: OK" "$LOG_FILE" &&
         grep -q "\[SK-122\] tcp bbr-lite probebw/rtt non-x86: OK" "$LOG_FILE" &&
         grep -q "\[SK-123\] tcp bbr cycle gains non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-124\] tcp cubic ca non-x86: OK" "$LOG_FILE"
+        grep -q "\[SK-124\] tcp cubic ca non-x86: OK" "$LOG_FILE" &&
+        grep -q "\[SK-125\] tcp hystart++ non-x86: OK" "$LOG_FILE"
 }
 
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if pass_markers; then
-        echo "PASS: MoQiOS aarch64 M9-7+SK-124 smoke (shared probes + slim footprint/env + default timer + EL0/SVC)."
+        echo "PASS: MoQiOS aarch64 M9-7+SK-125 smoke (shared probes + slim footprint/env + default timer + EL0/SVC)."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         if pass_markers; then
-            echo "PASS: MoQiOS aarch64 M9-7+SK-124 smoke (shared probes + slim footprint/env + default timer + EL0/SVC)."
+            echo "PASS: MoQiOS aarch64 M9-7+SK-125 smoke (shared probes + slim footprint/env + default timer + EL0/SVC)."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -193,7 +194,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for aarch64 smoke markers."
-echo "Expected: SK-2..SK-4 + SK-6..SK-124 shared markers + M9-1..M9-7 markers."
+echo "Expected: SK-2..SK-4 + SK-6..SK-125 shared markers + M9-1..M9-7 markers."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

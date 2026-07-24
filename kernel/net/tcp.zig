@@ -66,6 +66,9 @@ const BBR_PROBE_RTT_DURATION_MS: u32 = 200;
 /// CUBIC β = 0.7, C = 0.4 (SK-124).
 const CUBIC_BETA_NUM: u32 = 7;
 const CUBIC_BETA_DEN: u32 = 10;
+/// HyStart++ delay thresh clamp (RFC 9406-inspired) (SK-125).
+const HYSTART_MIN_THRESH_MS: u32 = 4;
+const HYSTART_MAX_THRESH_MS: u32 = 16;
 
 /// Write `count` bytes from `src` into a ring buffer at `write_pos`.
 /// Uses @memcpy for contiguous chunks (handles wraparound at buffer boundary).
@@ -213,6 +216,8 @@ const TcpTcb = struct {
     cubic_epoch_ms: u32,
     /// CUBIC K in milliseconds (SK-124).
     cubic_k_ms: u32,
+    /// HyStart++ Conservative Slow Start active (SK-125).
+    hystart_css: bool,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -348,6 +353,7 @@ pub fn initTcbs() void {
             .cubic_w_max = 0,
             .cubic_epoch_ms = 0,
             .cubic_k_ms = 0,
+            .hystart_css = false,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -426,6 +432,7 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].cubic_w_max = 0;
     tcbs[i].cubic_epoch_ms = 0;
     tcbs[i].cubic_k_ms = 0;
+    tcbs[i].hystart_css = false;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -970,6 +977,26 @@ fn updateRtt(tcb: *TcpTcb, m: u32) void {
     tcb.rto = tcb.srtt + @max(200, 4 * tcb.rttvar);
     if (tcb.rto < TCP_RTO_MIN) tcb.rto = TCP_RTO_MIN;
     if (tcb.rto > TCP_RTO_MAX) tcb.rto = TCP_RTO_MAX;
+    // SK-125: HyStart++ delay detect during slow start.
+    noteHystartRtt(tcb, m);
+}
+
+/// HyStart++: first delay → CSS; second → exit SS (SK-125).
+fn noteHystartRtt(tcb: *TcpTcb, rtt: u32) void {
+    if (tcb.in_recovery or tcb.bbr_probe_rtt) return;
+    // ProbeBW cruise owns the window once rate is known.
+    if (tcb.delivery_rate > 0 and !tcb.bbr_startup) return;
+    if (tcb.cwnd >= tcb.ssthresh) {
+        tcb.hystart_css = false;
+        return;
+    }
+    if (!probeHystartShouldExit(rtt, tcb.min_rtt_ms)) return;
+    if (!tcb.hystart_css) {
+        tcb.hystart_css = true;
+        return;
+    }
+    tcb.ssthresh = probeHystartExitSsthresh(tcb.cwnd, mssForTcb(tcb));
+    tcb.hystart_css = false;
 }
 
 /// Update delivery-rate sample from newly delivered bytes (SK-119).
@@ -1563,7 +1590,9 @@ fn driveTcbStateMachine(
                             } else if (tcb.bbr_startup) {
                                 // Classic SS step, then SK-121 Startup toward 2·BDP.
                                 if (tcb.cwnd < tcb.ssthresh) {
-                                    tcb.cwnd += @intCast(acked);
+                                    // SK-125: CSS grows at half rate after first delay signal.
+                                    const step = if (tcb.hystart_css) probeHystartCssInc(acked) else acked;
+                                    tcb.cwnd += @intCast(step);
                                 } else {
                                     const inc = (smss * smss) / @max(tcb.cwnd, 1);
                                     tcb.cwnd += inc;
@@ -1574,7 +1603,9 @@ fn driveTcbStateMachine(
                                 applyBbrProbeBw(tcb, acked);
                                 maybeEnterProbeRtt(tcb, smss);
                             } else if (tcb.cwnd < tcb.ssthresh) {
-                                tcb.cwnd += @intCast(acked);
+                                // SK-125: CSS grows at half rate after first delay signal.
+                                const step = if (tcb.hystart_css) probeHystartCssInc(acked) else acked;
+                                tcb.cwnd += @intCast(step);
                             } else {
                                 // SK-124: CUBIC CA when BBR rate samples are unavailable.
                                 applyCubic(tcb, acked, smss);
@@ -1632,6 +1663,7 @@ fn driveTcbStateMachine(
                             tcb.bbr_cycle_idx = 0;
                             tcb.bbr_cycle_ms = 0;
                             noteCubicLoss(tcb, smss_fr);
+                            tcb.hystart_css = false;
                             tcb.in_recovery = true;
                             tcb.recover_seq = tcb.snd_nxt;
                             tcb.ssthresh = probeCubicSsthresh(tcb.cwnd, smss_fr);
@@ -2270,6 +2302,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             noteCubicLoss(tcb, smss_rto);
             tcb.ssthresh = probeCubicSsthresh(tcb.cwnd, smss_rto);
             tcb.cwnd = smss_rto; // back to slow start
+            tcb.hystart_css = false;
             tcb.in_recovery = false;
             tcb.dup_ack_count = 0;
             tcb.recover_fs = 0;
@@ -3168,6 +3201,33 @@ pub fn probeICbrt(x: u64) u32 {
         if (cube <= x) lo = mid else hi = mid - 1;
     }
     return @intCast(lo);
+}
+
+/// HyStart++ delay thresh = clamp(min_rtt/8, 4, 16) ms (SK-125).
+pub fn probeHystartDelayThresh(min_rtt_ms: u32) u32 {
+    if (min_rtt_ms == 0) return 0;
+    const eighth = min_rtt_ms / 8;
+    if (eighth < HYSTART_MIN_THRESH_MS) return HYSTART_MIN_THRESH_MS;
+    if (eighth > HYSTART_MAX_THRESH_MS) return HYSTART_MAX_THRESH_MS;
+    return eighth;
+}
+
+/// True when sample RTT exceeds min_rtt by the delay thresh (SK-125).
+pub fn probeHystartShouldExit(rtt_ms: u32, min_rtt_ms: u32) bool {
+    const thresh = probeHystartDelayThresh(min_rtt_ms);
+    if (thresh == 0 or rtt_ms == 0 or min_rtt_ms == 0) return false;
+    return rtt_ms >= min_rtt_ms +% thresh;
+}
+
+/// CSS ACK increase = max(acked/2, 1) (SK-125).
+pub fn probeHystartCssInc(acked: u32) u32 {
+    return @max(acked / 2, 1);
+}
+
+/// Exit SS with ssthresh = max(cwnd, 2·SMSS) (SK-125).
+pub fn probeHystartExitSsthresh(cwnd: u32, smss: u32) u32 {
+    const floor = smss *% 2;
+    return if (cwnd > floor) cwnd else floor;
 }
 
 /// CUBIC ssthresh = max(cwnd·β, 2·SMSS) with β=0.7 (SK-124).

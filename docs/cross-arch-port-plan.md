@@ -1885,7 +1885,19 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:无带宽估计时的长肥管道吞吐爬升更快,减窗更温和。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-124] tcp cubic ca non-x86: OK`。
-- **后续**:完整 RACK per-segment 时间戳;或 HyStart++ 慢启动退出。
+- **后续**:见 3.125（HyStart++,已完成)。
+
+---
+
+### 3.125 HyStart++ 慢启动退出（SK-125,2026-07-24）
+
+- **背景**:经典慢启动在队列开始堆积前仍指数增长,易过冲后丢包;无 BBR rate 时更明显。
+- **方案**:RTT 相对 `min_rtt` 超过 `clamp(min_rtt/8,4,16)` ms 时进入 CSS(半速增长);
+  第二次延迟信号将 `ssthresh=cwnd` 退出 SS。`shared/sk125.zig` 锁定阈值与 CSS 增量。
+- **效果**:慢启动更早转入 CA/CUBIC,减少缓冲区膨胀与不必要丢包。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-125] tcp hystart++ non-x86: OK`。
+- **后续**:完整 RACK per-segment 时间戳;或 ACK-train HyStart 轮次边界。
 
 ---
 
