@@ -265,6 +265,8 @@ const TcpTcb = struct {
     ace_ce_count: u3,
     /// Last ACE value received from peer (SK-134).
     ace_peer: u3,
+    /// Peer ACE baseline established after AccECN handshake (SK-141).
+    ace_peer_valid: bool,
     /// Timestamp of last ACE/ECE window cut (SK-135).
     ace_last_react_ms: u32,
 
@@ -421,6 +423,7 @@ pub fn initTcbs() void {
             .ecn_prr = false,
             .ace_ce_count = 0,
             .ace_peer = 0,
+            .ace_peer_valid = false,
             .ace_last_react_ms = 0,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
@@ -519,6 +522,7 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].ecn_prr = false;
     tcbs[i].ace_ce_count = 0;
     tcbs[i].ace_peer = 0;
+    tcbs[i].ace_peer_valid = false;
     tcbs[i].ace_last_react_ms = 0;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
@@ -1224,7 +1228,7 @@ fn noteAceBbrCoupling(tcb: *TcpTcb, ace_delta: u3) void {
     tcb.delivery_rate = probeAceRateDiscount(tcb.delivery_rate, ace_delta);
 }
 
-/// Apply IP-CE / ECE / CWR / ACE side effects (SK-131/133/134/135/140).
+/// Apply IP-CE / ECE / CWR / ACE side effects (SK-131/133/134/135/140/141).
 fn noteEcnRx(tcb: *TcpTcb, flags: u8, ecn_ce: bool, ace: u3) void {
     if (!tcb.ecn_ok) return;
     if (ecn_ce) {
@@ -1233,6 +1237,13 @@ fn noteEcnRx(tcb: *TcpTcb, flags: u8, ecn_ce: bool, ace: u3) void {
         if (!tcb.accecn_ok) tcb.ecn_ece_pending = true;
     }
     if (!tcb.accecn_ok and (flags & CWR) != 0) tcb.ecn_ece_pending = false;
+
+    // SK-141: first AccECN ACE after handshake is a baseline, not a CE delta.
+    if (tcb.accecn_ok and probeAceBaselineOnly(tcb.ace_peer_valid)) {
+        tcb.ace_peer = ace;
+        tcb.ace_peer_valid = true;
+        return;
+    }
 
     const delta = probeAceDelta(tcb.ace_peer, ace);
     tcb.ace_peer = ace;
@@ -3772,6 +3783,11 @@ pub fn probeAceUnpack(byte12: u8, flags: u8) u3 {
     if ((flags & CWR) != 0) ace |= 2;
     if ((flags & ECE) != 0) ace |= 1;
     return ace;
+}
+
+/// First ACE after AccECN handshake sets baseline only (SK-141).
+pub fn probeAceBaselineOnly(peer_valid: bool) bool {
+    return !peer_valid;
 }
 
 /// Encode data-offset with ACE's AE bit (SK-134/140).

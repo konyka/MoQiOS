@@ -2087,7 +2087,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:AccECN 反馈与对端/规范对齐;经典 ECN 路径不变。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-140] tcp ace ae|cwr|ece non-x86: OK`。
-- **后续**:AccECN 初始 ACE/握手后计数同步;或 CE 计数与 ECT(1)/L4S 路径。
+- **后续**:见 3.141（ACE 基线同步,已完成)。
+
+---
+
+### 3.141 AccECN 握手后 ACE 基线同步（SK-141,2026-07-24）
+
+- **背景**:`ace_peer` 初值为 0,握手后首个非零 ACE(含 SYN-ACK 残留编码)
+  会被当成从 0 起的大 delta 误触发减窗。
+- **方案**:`ace_peer_valid`;AccECN 下首次收到 ACE 只写入基线不反应。
+  `shared/sk141.zig` 锁定 baseline 规则与 SYN-ACK ACE=5 编解码。
+- **效果**:握手后计数对齐,仅后续真正的 ACE 前进才砍窗。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-141] tcp ace baseline sync non-x86: OK`。
+- **后续**:CE 计数与 ECT(1)/L4S 路径;或 AccECN 无效 ACE(0b010) 特殊值处理。
 
 ---
 
