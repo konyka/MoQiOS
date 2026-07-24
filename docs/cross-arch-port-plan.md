@@ -1909,7 +1909,19 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:乱序/稀疏 SACK 下更快进入恢复,减少空等 SRTT。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-126] tcp rack per-segment non-x86: OK`。
-- **后续**:ACK-train HyStart 轮次边界;或 RACK 对非头部空洞的定时重传。
+- **后续**:见 3.127（RACK 非头部空洞,已完成)。
+
+---
+
+### 3.127 RACK 非头部空洞定时重传（SK-127,2026-07-24）
+
+- **背景**:SK-126 只驱动 SND.UNA 判丢;中间空洞仍等 DupThresh/IsLost,恢复中也不优先修 RACK 已判定丢失的段。
+- **方案**:扫描首个 RACK-lost 空洞即可进入恢复;重传优先该空洞(而非总是最早空洞)。
+  `shared/sk127.zig` 锁定 `probeRackHoleLost` / 重传选择。
+- **效果**:多空洞丢失时更快修补后发先至证明已丢的段,缩短恢复尾延迟。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-127] tcp rack hole rexmit non-x86: OK`。
+- **后续**:ACK-train HyStart 轮次边界;或 RACK 重传定时器(无新 ACK 时主动扫描)。
 
 ---
 

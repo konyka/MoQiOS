@@ -1725,11 +1725,12 @@ fn driveTcbStateMachine(
 
                         tcb.dup_ack_count += 1;
 
-                        // SK-112/118/126: DupThresh, IsLost, or RACK timed head loss.
+                        // SK-112/118/126/127: DupThresh, IsLost, or any RACK-lost hole.
+                        const rack_hole = nextRackLostHole(tcb);
                         const enter_recovery = !tcb.in_recovery and
                             (tcb.dup_ack_count >= DUP_THRESH or
                                 isLost(tcb, tcb.snd_una) or
-                                rackHeadLost(tcb));
+                                rack_hole != null);
                         if (enter_recovery) {
                             // Fast retransmit + PRR recovery (SK-114); save undo (SK-115).
                             const smss_fr: u32 = mssForTcb(tcb);
@@ -1753,15 +1754,24 @@ fn driveTcbStateMachine(
                             const pipe2 = pipeBytes(tcb);
                             if (tcb.cwnd < pipe2 + smss_fr) tcb.cwnd = pipe2 + smss_fr;
 
-                            // SK-108: retransmit the first non-SACKed hole, not always snd_una.
+                            // SK-108/127: retransmit RACK-lost hole if any, else first hole.
                             const unacked = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
                             if (unacked > 0) {
-                                prepareRexmitFromHole(tcb);
+                                if (rack_hole) |h| {
+                                    prepareRexmitFromSeq(tcb, h);
+                                } else {
+                                    prepareRexmitFromHole(tcb);
+                                }
                                 flushSendBuffer(tcb);
                             }
                             tcpLog("[tcp] fast retransmit\n");
                         } else if (tcb.in_recovery) {
                             applyPrr(tcb, delivered);
+                            // SK-127: while recovering, repair RACK-lost holes first.
+                            const unacked = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
+                            if (unacked > 0 and nextRackLostHole(tcb) != null) {
+                                prepareRexmitRackOrHole(tcb);
+                            }
                             flushSendBuffer(tcb);
                         }
                     }
@@ -3046,12 +3056,25 @@ fn nextRexmitSeq(tcb: *const TcpTcb) u32 {
     return tcb.snd_una;
 }
 
-/// Point `snd_nxt` / `send_unacked` at the first non-SACKed hole (SK-108).
-fn prepareRexmitFromHole(tcb: *TcpTcb) void {
-    const hole = nextRexmitSeq(tcb);
+/// Point `snd_nxt` / `send_unacked` at `hole` (SK-108/127).
+fn prepareRexmitFromSeq(tcb: *TcpTcb, hole: u32) void {
     const skip = hole -% tcb.snd_una;
     tcb.snd_nxt = hole;
     tcb.send_unacked = (tcb.send_head + skip) % SEND_BUF_SIZE;
+}
+
+/// Point `snd_nxt` / `send_unacked` at the first non-SACKed hole (SK-108).
+fn prepareRexmitFromHole(tcb: *TcpTcb) void {
+    prepareRexmitFromSeq(tcb, nextRexmitSeq(tcb));
+}
+
+/// Prefer a RACK-lost hole for retransmission (SK-127).
+fn prepareRexmitRackOrHole(tcb: *TcpTcb) void {
+    if (nextRackLostHole(tcb)) |hole| {
+        prepareRexmitFromSeq(tcb, hole);
+    } else {
+        prepareRexmitFromHole(tcb);
+    }
 }
 
 /// Advance past SACKed bytes in the send ring (SK-108).
@@ -3384,21 +3407,76 @@ pub fn probeRackSegLost(seg_xmit_ms: u32, ref_xmit_ms: u32, rtt_ms: u32, now_ms:
     return elapsed >= rtt_ms +% probeRackReoWnd(rtt_ms);
 }
 
-fn rackHeadLost(tcb: *const TcpTcb) bool {
-    const has_above = sackedBytesAbove(tcb, tcb.snd_una) > 0 or
-        sackBlocksAbove(tcb, tcb.snd_una) > 0;
+/// Hole is RACK-lost only when SACK is above it (SK-127).
+pub fn probeRackHoleLost(
+    seg_xmit_ms: u32,
+    ref_xmit_ms: u32,
+    rtt_ms: u32,
+    now_ms: u32,
+    has_sack_above: bool,
+) bool {
+    if (!has_sack_above) return false;
+    return probeRackSegLost(seg_xmit_ms, ref_xmit_ms, rtt_ms, now_ms);
+}
+
+/// Prefer a later RACK-lost hole over an earlier not-yet-lost hole (SK-127).
+pub fn probeRackRexmitSeq(first_hole: u32, first_lost: bool, alt_hole: u32, alt_lost: bool) u32 {
+    if (alt_lost and !first_lost) return alt_hole;
+    return first_hole;
+}
+
+fn rackSegLostAt(tcb: *const TcpTcb, seq: u32) bool {
+    if (isSacked(tcb, seq)) return false;
+    const has_above = sackedBytesAbove(tcb, seq) > 0 or sackBlocksAbove(tcb, seq) > 0;
     if (!has_above) return false;
     const seg_xmit = blk: {
-        const v = lookupRackXmit(tcb, tcb.snd_una);
+        const v = lookupRackXmit(tcb, seq);
         if (v != 0) break :blk v;
-        break :blk tcb.head_xmit_ms;
+        if (seq == tcb.snd_una) break :blk tcb.head_xmit_ms;
+        break :blk 0;
     };
     if (seg_xmit == 0) return false;
     const rtt = if (tcb.rack_rtt_ms > 0) tcb.rack_rtt_ms else tcb.srtt;
-    // SK-126: prefer per-segment RACK; fall back to SK-118 elapsed/SRTT.
-    if (probeRackSegLost(seg_xmit, tcb.rack_xmit_ts, rtt, timestampMs())) return true;
-    const elapsed = timestampMs() -% seg_xmit;
-    return probeRackHeadLost(elapsed, tcb.srtt, true);
+    const now = timestampMs();
+    if (probeRackHoleLost(seg_xmit, tcb.rack_xmit_ts, rtt, now, true)) return true;
+    // SK-118 fallback for the head only.
+    if (seq == tcb.snd_una) {
+        return probeRackHeadLost(now -% seg_xmit, tcb.srtt, true);
+    }
+    return false;
+}
+
+/// First unsacked sequence that RACK considers lost (SK-127).
+fn nextRackLostHole(tcb: *const TcpTcb) ?u32 {
+    var seq = tcb.snd_una;
+    var guard: u32 = 0;
+    while (guard < 64 and tcp_util.seqLt(seq, tcb.snd_nxt)) : (guard += 1) {
+        if (!isSacked(tcb, seq)) {
+            if (rackSegLostAt(tcb, seq)) return seq;
+            // Skip to the end of this hole (next SACK left or +SMSS).
+            var hole_end = seq +% @max(mssForTcb(tcb), 1);
+            for (0..tcb.sack_scoreboard_count) |i| {
+                const blk = tcb.sack_scoreboard[i];
+                if (tcp_util.seqLt(seq, blk.left) and tcp_util.seqLt(blk.left, hole_end)) {
+                    hole_end = blk.left;
+                }
+            }
+            if (!tcp_util.seqLt(seq, hole_end)) hole_end = seq +% 1;
+            seq = hole_end;
+            continue;
+        }
+        var jumped = false;
+        for (0..tcb.sack_scoreboard_count) |i| {
+            const blk = tcb.sack_scoreboard[i];
+            if (tcp_util.seqInWindow(seq, blk.left, blk.right)) {
+                seq = blk.right;
+                jumped = true;
+                break;
+            }
+        }
+        if (!jumped) seq +%= 1;
+    }
+    return null;
 }
 
 /// TLP PTO = min(RTO−1, max(2·SRTT, 10ms)) (SK-117).
