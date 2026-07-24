@@ -164,20 +164,21 @@ pass_markers() {
         grep -q "\[SK-126\] tcp rack per-segment non-x86: OK" "$LOG_FILE" &&
         grep -q "\[SK-127\] tcp rack hole rexmit non-x86: OK" "$LOG_FILE" &&
         grep -q "\[SK-128\] tcp rack retransmit timer non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-129\] tcp hystart ack-train rounds non-x86: OK" "$LOG_FILE"
+        grep -q "\[SK-129\] tcp hystart ack-train rounds non-x86: OK" "$LOG_FILE" &&
+        grep -q "\[SK-130\] tcp hystart ack-train gap non-x86: OK" "$LOG_FILE"
 }
 
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if pass_markers; then
-        echo "PASS: MoQiOS riscv64 M7+SK-129 smoke (shared probes + slim footprint/env + virtio + U-mode)."
+        echo "PASS: MoQiOS riscv64 M7+SK-130 smoke (shared probes + slim footprint/env + virtio + U-mode)."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         if pass_markers; then
-            echo "PASS: MoQiOS riscv64 M7+SK-129 smoke (shared probes + slim footprint/env + virtio + U-mode)."
+            echo "PASS: MoQiOS riscv64 M7+SK-130 smoke (shared probes + slim footprint/env + virtio + U-mode)."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -191,7 +192,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for riscv64 smoke markers."
-echo "Expected: SK-2..SK-4 + SK-6..SK-129 shared markers + M7 blk/net + M6 + M5 markers."
+echo "Expected: SK-2..SK-4 + SK-6..SK-130 shared markers + M7 blk/net + M6 + M5 markers."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

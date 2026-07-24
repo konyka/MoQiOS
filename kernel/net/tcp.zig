@@ -69,6 +69,9 @@ const CUBIC_BETA_DEN: u32 = 10;
 /// HyStart++ delay thresh clamp (RFC 9406-inspired) (SK-125).
 const HYSTART_MIN_THRESH_MS: u32 = 4;
 const HYSTART_MAX_THRESH_MS: u32 = 16;
+/// HyStart++ ACK-train gap clamp (SK-130).
+const HYSTART_ACK_GAP_MIN_MS: u32 = 2;
+const HYSTART_ACK_GAP_MAX_MS: u32 = 16;
 /// RACK per-segment TX timestamp slots (SK-126).
 const RACK_TX_MAX: usize = 8;
 
@@ -236,6 +239,8 @@ const TcpTcb = struct {
     hystart_round_end: u32,
     /// Min RTT observed in the current HyStart round (SK-129).
     hystart_round_min: u32,
+    /// Arrival time of previous ACK in the HyStart train; 0 = none (SK-130).
+    hystart_last_ack_ms: u32,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -380,6 +385,7 @@ pub fn initTcbs() void {
             .hystart_css = false,
             .hystart_round_end = 0,
             .hystart_round_min = 0,
+            .hystart_last_ack_ms = 0,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -467,6 +473,7 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].hystart_css = false;
     tcbs[i].hystart_round_end = 0;
     tcbs[i].hystart_round_min = 0;
+    tcbs[i].hystart_last_ack_ms = 0;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -1075,33 +1082,52 @@ fn noteHystartRtt(tcb: *TcpTcb, rtt: u32) void {
     tcb.hystart_round_min = probeHystartRoundMin(tcb.hystart_round_min, rtt);
 }
 
-/// HyStart++ ACK-train: open/close rounds on cumulative ACK (SK-129).
-fn noteHystartAck(tcb: *TcpTcb, ack: u32) void {
-    if (tcb.in_recovery or tcb.bbr_probe_rtt) return;
-    if (tcb.delivery_rate > 0 and !tcb.bbr_startup) return;
-    if (tcb.cwnd >= tcb.ssthresh) {
-        tcb.hystart_css = false;
-        tcb.hystart_round_end = 0;
-        tcb.hystart_round_min = 0;
-        return;
-    }
-    if (tcb.hystart_round_end == 0) {
-        tcb.hystart_round_end = tcb.snd_nxt;
-        tcb.hystart_round_min = 0;
-        return;
-    }
-    if (!probeHystartRoundDone(ack, tcb.hystart_round_end)) return;
-    const sample = tcb.hystart_round_min;
-    tcb.hystart_round_end = tcb.snd_nxt;
-    tcb.hystart_round_min = 0;
-    if (sample == 0) return;
-    if (!probeHystartShouldExit(sample, tcb.min_rtt_ms)) return;
+/// HyStart++ delay/gap signal: first → CSS; second → exit SS (SK-125/130).
+fn applyHystartSignal(tcb: *TcpTcb) void {
     if (!tcb.hystart_css) {
         tcb.hystart_css = true;
         return;
     }
     tcb.ssthresh = probeHystartExitSsthresh(tcb.cwnd, mssForTcb(tcb));
     tcb.hystart_css = false;
+}
+
+fn clearHystartRound(tcb: *TcpTcb) void {
+    tcb.hystart_round_end = 0;
+    tcb.hystart_round_min = 0;
+    tcb.hystart_last_ack_ms = 0;
+}
+
+/// HyStart++ ACK-train: rounds (SK-129) + inter-ACK gap (SK-130).
+fn noteHystartAck(tcb: *TcpTcb, ack: u32) void {
+    if (tcb.in_recovery or tcb.bbr_probe_rtt) return;
+    if (tcb.delivery_rate > 0 and !tcb.bbr_startup) return;
+    if (tcb.cwnd >= tcb.ssthresh) {
+        tcb.hystart_css = false;
+        clearHystartRound(tcb);
+        return;
+    }
+    const now = timestampMs();
+    if (tcb.hystart_round_end == 0) {
+        tcb.hystart_round_end = tcb.snd_nxt;
+        tcb.hystart_round_min = 0;
+        tcb.hystart_last_ack_ms = now;
+        return;
+    }
+    // SK-130: stretched ACK spacing inside a round ⇒ queueing.
+    if (probeHystartAckGap(tcb.hystart_last_ack_ms, now, tcb.min_rtt_ms)) {
+        applyHystartSignal(tcb);
+    }
+    tcb.hystart_last_ack_ms = now;
+
+    if (!probeHystartRoundDone(ack, tcb.hystart_round_end)) return;
+    const sample = tcb.hystart_round_min;
+    tcb.hystart_round_end = tcb.snd_nxt;
+    tcb.hystart_round_min = 0;
+    tcb.hystart_last_ack_ms = 0;
+    if (sample == 0) return;
+    if (!probeHystartShouldExit(sample, tcb.min_rtt_ms)) return;
+    applyHystartSignal(tcb);
 }
 
 /// Update delivery-rate sample from newly delivered bytes (SK-119).
@@ -1779,8 +1805,7 @@ fn driveTcbStateMachine(
                             tcb.bbr_cycle_ms = 0;
                             noteCubicLoss(tcb, smss_fr);
                             tcb.hystart_css = false;
-                            tcb.hystart_round_end = 0;
-                            tcb.hystart_round_min = 0;
+                            clearHystartRound(tcb);
                             tcb.in_recovery = true;
                             tcb.recover_seq = tcb.snd_nxt;
                             tcb.ssthresh = probeCubicSsthresh(tcb.cwnd, smss_fr);
@@ -2431,8 +2456,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             tcb.ssthresh = probeCubicSsthresh(tcb.cwnd, smss_rto);
             tcb.cwnd = smss_rto; // back to slow start
             tcb.hystart_css = false;
-            tcb.hystart_round_end = 0;
-            tcb.hystart_round_min = 0;
+            clearHystartRound(tcb);
             tcb.in_recovery = false;
             tcb.dup_ack_count = 0;
             tcb.recover_fs = 0;
@@ -3360,6 +3384,23 @@ pub fn probeHystartRoundMin(cur_min: u32, sample: u32) u32 {
     return cur_min;
 }
 
+/// ACK-train gap thresh = clamp(min_rtt/8, 2, 16) ms (SK-130).
+pub fn probeHystartAckGapThresh(min_rtt_ms: u32) u32 {
+    if (min_rtt_ms == 0) return 0;
+    const eighth = min_rtt_ms / 8;
+    if (eighth < HYSTART_ACK_GAP_MIN_MS) return HYSTART_ACK_GAP_MIN_MS;
+    if (eighth > HYSTART_ACK_GAP_MAX_MS) return HYSTART_ACK_GAP_MAX_MS;
+    return eighth;
+}
+
+/// True when consecutive ACKs are spaced beyond the train gap thresh (SK-130).
+pub fn probeHystartAckGap(last_ack_ms: u32, now_ms: u32, min_rtt_ms: u32) bool {
+    if (last_ack_ms == 0) return false;
+    const thresh = probeHystartAckGapThresh(min_rtt_ms);
+    if (thresh == 0) return false;
+    return now_ms -% last_ack_ms > thresh;
+}
+
 /// HyStart++ delay thresh = clamp(min_rtt/8, 4, 16) ms (SK-125).
 pub fn probeHystartDelayThresh(min_rtt_ms: u32) u32 {
     if (min_rtt_ms == 0) return 0;
@@ -3514,8 +3555,7 @@ fn maybeRackTimerRepair(tcb: *TcpTcb, rto: u32) bool {
         tcb.bbr_cycle_ms = 0;
         noteCubicLoss(tcb, smss_fr);
         tcb.hystart_css = false;
-        tcb.hystart_round_end = 0;
-        tcb.hystart_round_min = 0;
+        clearHystartRound(tcb);
         tcb.in_recovery = true;
         tcb.recover_seq = tcb.snd_nxt;
         tcb.ssthresh = probeCubicSsthresh(tcb.cwnd, smss_fr);

@@ -1945,7 +1945,19 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:HyStart 决策与飞行轮次对齐,减少误进 CSS / 误退出。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-129] tcp hystart ack-train rounds non-x86: OK`。
-- **后续**:ECN/AccECN 反应路径;或 ACK 间隔间隙检测(ACK-train gap)。
+- **后续**:见 3.130（HyStart ACK-train gap,已完成)。
+
+---
+
+### 3.130 HyStart++ ACK-train 间隙检测（SK-130,2026-07-24）
+
+- **背景**:轮次内排队会拉大 ACK 间距;仅靠轮末 min RTT 可能偏晚。
+- **方案**:记录上一 ACK 到达时刻;间距超过 `clamp(min_rtt/8,2,16)` ms 时触发与
+  延迟相同的 CSS/退出信号。`shared/sk130.zig` 锁定阈值与判定。
+- **效果**:慢启动在 ACK 压缩/拉长时更早收敛,减少缓冲区膨胀。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-130] tcp hystart ack-train gap non-x86: OK`。
+- **后续**:ECN/AccECN 反应路径;或 SYN ECN 协商 + ECE/CWR。
 
 ---
 
