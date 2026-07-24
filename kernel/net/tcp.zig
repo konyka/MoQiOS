@@ -198,6 +198,8 @@ const TcpTcb = struct {
     rack_xmit_ts: u32,
     /// RTT of that delivered segment (SK-126).
     rack_rtt_ms: u32,
+    /// Last RACK-timer repair timestamp; 0 = none (SK-128).
+    rack_timer_ms: u32,
     /// Estimated delivery rate (bytes/sec) (SK-119).
     delivery_rate: u32,
     /// Timestamp of last delivery-rate sample (SK-119).
@@ -355,6 +357,7 @@ pub fn initTcbs() void {
             .rack_tx_next = 0,
             .rack_xmit_ts = 0,
             .rack_rtt_ms = 0,
+            .rack_timer_ms = 0,
             .delivery_rate = 0,
             .rate_sample_ms = 0,
             .min_rtt_ms = 0,
@@ -439,6 +442,7 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].rack_tx_next = 0;
     tcbs[i].rack_xmit_ts = 0;
     tcbs[i].rack_rtt_ms = 0;
+    tcbs[i].rack_timer_ms = 0;
     tcbs[i].delivery_rate = 0;
     tcbs[i].rate_sample_ms = 0;
     tcbs[i].min_rtt_ms = 0;
@@ -1592,6 +1596,8 @@ fn driveTcbStateMachine(
                         tcb.tlp_sent = false;
                         // SK-118: new head's xmit time unknown until (re)sent.
                         tcb.head_xmit_ms = 0;
+                        // SK-128: allow another RACK-timer pass after progress.
+                        tcb.rack_timer_ms = 0;
                         // SK-113: trim/merge scoreboard (do not wipe holes still above snd_una).
                         if (opts.sack_block_count > 0) {
                             updateScoreboard(tcb, opts.sack_blocks[0..opts.sack_block_count]);
@@ -2360,6 +2366,8 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
         tcb.retransmit_timer +%= ms_elapsed;
         // Use per-TCB RTO if available, otherwise fall back to RETRANSMIT_MS
         const current_rto = if (tcb.rto > 0) tcb.rto else RETRANSMIT_MS;
+        // SK-128: RACK timer repair before TLP/RTO (no new ACK required).
+        _ = maybeRackTimerRepair(tcb, current_rto);
         // SK-117: Tail Loss Probe before RTO (no cwnd cut).
         const tlp_to = probeTlpTimeoutMs(tcb.srtt, current_rto);
         if (probeTlpShouldFire(
@@ -2397,6 +2405,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             tcb.prr_delivered = 0;
             tcb.prr_out = 0;
             tcb.tlp_sent = false;
+            tcb.rack_timer_ms = 0;
             tcb.bbr_startup = false;
             tcb.bbr_probe_rtt = false;
             tcb.bbr_cycle_idx = 0;
@@ -3423,6 +3432,55 @@ pub fn probeRackHoleLost(
 pub fn probeRackRexmitSeq(first_hole: u32, first_lost: bool, alt_hole: u32, alt_lost: bool) u32 {
     if (alt_lost and !first_lost) return alt_hole;
     return first_hole;
+}
+
+/// RACK timer may fire before RTO when a hole is already RACK-lost (SK-128).
+pub fn probeRackTimerShouldFire(rack_lost: bool, timer_ms: u32, rto: u32, frto: u2) bool {
+    if (!rack_lost or frto != 0 or rto == 0) return false;
+    return timer_ms < rto;
+}
+
+/// Pace RACK-timer repairs to at most once per RTT (SK-128).
+pub fn probeRackTimerReady(last_ms: u32, now_ms: u32, min_interval_ms: u32) bool {
+    if (last_ms == 0 or min_interval_ms == 0) return true;
+    return now_ms -% last_ms >= min_interval_ms;
+}
+
+/// Without a new ACK, enter recovery / retransmit a RACK-lost hole (SK-128).
+fn maybeRackTimerRepair(tcb: *TcpTcb, rto: u32) bool {
+    const hole = nextRackLostHole(tcb) orelse return false;
+    if (!probeRackTimerShouldFire(true, tcb.retransmit_timer, rto, tcb.frto)) return false;
+    const now = timestampMs();
+    const pace = if (tcb.rack_rtt_ms > 0) tcb.rack_rtt_ms else tcb.srtt;
+    if (!probeRackTimerReady(tcb.rack_timer_ms, now, pace)) return false;
+    const unacked = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
+    if (unacked == 0) return false;
+
+    if (!tcb.in_recovery) {
+        const smss_fr: u32 = mssForTcb(tcb);
+        const pipe = pipeBytes(tcb);
+        tcb.undo_cwnd = tcb.cwnd;
+        tcb.undo_ssthresh = tcb.ssthresh;
+        tcb.bbr_startup = false;
+        tcb.bbr_probe_rtt = false;
+        tcb.bbr_cycle_idx = 0;
+        tcb.bbr_cycle_ms = 0;
+        noteCubicLoss(tcb, smss_fr);
+        tcb.hystart_css = false;
+        tcb.in_recovery = true;
+        tcb.recover_seq = tcb.snd_nxt;
+        tcb.ssthresh = probeCubicSsthresh(tcb.cwnd, smss_fr);
+        tcb.recover_fs = @max(pipe, 1);
+        tcb.prr_delivered = 0;
+        tcb.prr_out = 0;
+        applyPrr(tcb, 0);
+        const pipe2 = pipeBytes(tcb);
+        if (tcb.cwnd < pipe2 + smss_fr) tcb.cwnd = pipe2 + smss_fr;
+    }
+    prepareRexmitFromSeq(tcb, hole);
+    flushSendBuffer(tcb);
+    tcb.rack_timer_ms = now;
+    return true;
 }
 
 fn rackSegLostAt(tcb: *const TcpTcb, seq: u32) bool {

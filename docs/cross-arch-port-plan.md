@@ -1921,7 +1921,19 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:多空洞丢失时更快修补后发先至证明已丢的段,缩短恢复尾延迟。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-127] tcp rack hole rexmit non-x86: OK`。
-- **后续**:ACK-train HyStart 轮次边界;或 RACK 重传定时器(无新 ACK 时主动扫描)。
+- **后续**:见 3.128（RACK 重传定时器,已完成)。
+
+---
+
+### 3.128 RACK 重传定时器（SK-128,2026-07-24）
+
+- **背景**:SK-127 依赖新的 ACK/SACK 才扫描空洞;ACK 静默时已判丢段仍要等到 TLP/RTO。
+- **方案**:`timerTick` 在 RTO 之前调用 `maybeRackTimerRepair`;有 RACK-lost 空洞则进入恢复并重传,
+  且按 RTT 限速。`shared/sk128.zig` 锁定触发条件与 pacing。
+- **效果**:稀疏 ACK 下更快修复已超时空洞,减少空等 RTO。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-128] tcp rack retransmit timer non-x86: OK`。
+- **后续**:ACK-train HyStart 轮次边界;或 ECN/AccECN 反应路径。
 
 ---
 
