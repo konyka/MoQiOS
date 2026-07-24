@@ -1228,15 +1228,22 @@ fn noteAceBbrCoupling(tcb: *TcpTcb, ace_delta: u3) void {
     tcb.delivery_rate = probeAceRateDiscount(tcb.delivery_rate, ace_delta);
 }
 
-/// Apply IP-CE / ECE / CWR / ACE side effects (SK-131/133/134/135/140/141).
+/// Apply IP-CE / ECE / CWR / ACE side effects (SK-131/133/134/135/140/141/142).
 fn noteEcnRx(tcb: *TcpTcb, flags: u8, ecn_ce: bool, ace: u3) void {
     if (!tcb.ecn_ok) return;
     if (ecn_ce) {
-        tcb.ace_ce_count +%= 1;
+        // SK-142: AccECN skips reserved ACE value 0b010 when counting CE.
+        tcb.ace_ce_count = if (tcb.accecn_ok)
+            probeAceNextCount(tcb.ace_ce_count)
+        else
+            tcb.ace_ce_count +% 1;
         // Classic sticky ECE only when AccECN is not in use (SK-140).
         if (!tcb.accecn_ok) tcb.ecn_ece_pending = true;
     }
     if (!tcb.accecn_ok and (flags & CWR) != 0) tcb.ecn_ece_pending = false;
+
+    // SK-142: ignore reserved ACE=0b010 for feedback (do not move peer/baseline).
+    if (tcb.accecn_ok and probeAceInvalid(ace)) return;
 
     // SK-141: first AccECN ACE after handshake is a baseline, not a CE delta.
     if (tcb.accecn_ok and probeAceBaselineOnly(tcb.ace_peer_valid)) {
@@ -3788,6 +3795,18 @@ pub fn probeAceUnpack(byte12: u8, flags: u8) u3 {
 /// First ACE after AccECN handshake sets baseline only (SK-141).
 pub fn probeAceBaselineOnly(peer_valid: bool) bool {
     return !peer_valid;
+}
+
+/// AccECN reserved ACE encoding 0b010 (SK-142).
+pub fn probeAceInvalid(ace: u3) bool {
+    return ace == 0b010;
+}
+
+/// Next CE counter value, skipping reserved 0b010 (SK-142).
+pub fn probeAceNextCount(cur: u3) u3 {
+    var n = cur +% 1;
+    if (n == 0b010) n = 0b011;
+    return n;
 }
 
 /// Encode data-offset with ACE's AE bit (SK-134/140).

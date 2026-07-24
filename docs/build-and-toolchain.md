@@ -242,8 +242,8 @@ qemu-system-x86_64 \
 | `zig build smoke` | 单核 QEMU 限时冒烟测试，串口日志需出现当前 init 自动序列末尾 `hello21 done` 和 `MoQiOS shell` |
 | `zig build smoke-smp` | 双核 QEMU 限时冒烟测试，验证 AP/SMP 启动路径仍能跑完整个 init 测试序列 |
 | `zig build smoke-smp-stress` | 默认连续执行 5 次双核冒烟；用于捕获任务槽复用、共享内核映射和调度时序回归。以 `MOQI_SMOKE_RUNS=N` 覆盖次数 |
-| `zig build -Darch=riscv64 smoke-riscv` | riscv64 M7+SK-141：shared probes + slim BSS + shared user-copy guard + shared idle boot + shared ramdisk parse + virtio + U-mode |
-| `zig build -Darch=aarch64 smoke-aarch64` | aarch64 M9-7+SK-141：shared probes + slim BSS + shared user-copy guard + shared idle boot + shared ramdisk parse + default timer + EL0/SVC |
+| `zig build -Darch=riscv64 smoke-riscv` | riscv64 M7+SK-142：shared probes + slim BSS + shared user-copy guard + shared idle boot + shared ramdisk parse + virtio + U-mode |
+| `zig build -Darch=aarch64 smoke-aarch64` | aarch64 M9-7+SK-142：shared probes + slim BSS + shared user-copy guard + shared idle boot + shared ramdisk parse + default timer + EL0/SVC |
 
 调试连接：
 

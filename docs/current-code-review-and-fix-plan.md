@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-24 (SK-141 ACE baseline sync + prior SK-140 reviewed and verified)
+> Last update: 2026-07-24 (SK-142 ACE invalid 0b010 + prior SK-141 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -473,6 +473,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | ACE without AccECN negotiate | ACE ran whenever classic `ecn_ok` was set. | SK-139: AE on SYN-ACK → `accecn_ok`; ACE gated on AccECN. |
 | ACE in byte12 reserved bits | Non-standard ACE placement conflicted with AccECN flags. | SK-140: ACE packed into AE\|CWR\|ECE; classic sticky ECE unchanged. |
 | First ACE cut from zero | Unsynced `ace_peer=0` treated handshake ACE as a large delta. | SK-141: first AccECN ACE sets baseline only; later deltas cut. |
+| ACE 0b010 as feedback | Reserved AccECN encoding could skew peer delta / baseline. | SK-142: skip 0b010 on CE count; ignore invalid peer ACE. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -482,8 +483,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-141] tcp ace baseline sync non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-141] tcp ace baseline sync non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-142] tcp ace invalid 0b010 non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-142] tcp ace invalid 0b010 non-x86: OK`. |
 
 ### 5.3 Historical Verification
 

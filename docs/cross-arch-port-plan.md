@@ -2100,7 +2100,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:握手后计数对齐,仅后续真正的 ACE 前进才砍窗。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-141] tcp ace baseline sync non-x86: OK`。
-- **后续**:CE 计数与 ECT(1)/L4S 路径;或 AccECN 无效 ACE(0b010) 特殊值处理。
+- **后续**:见 3.142（ACE 0b010 保留值,已完成)。
+
+---
+
+### 3.142 AccECN 保留 ACE 值 0b010（SK-142,2026-07-24）
+
+- **背景**:AccECN 规定非 SYN 上 ACE=0b010 保留,不得用作拥塞反馈;若 CE 计数
+  落到 2 或对端误发 0b010,会污染 delta/基线。
+- **方案**:`probeAceNextCount` 在 CE 递增时跳过 2;`probeAceInvalid` 收包忽略
+  0b010(不更新 `ace_peer`、不减窗)。`shared/sk142.zig` 锁定规则。
+- **效果**:本地不编码保留值,对端脏 ACE 也不触发误砍窗。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-142] tcp ace invalid 0b010 non-x86: OK`。
+- **后续**:CE 计数与 ECT(1)/L4S 路径;或 AccECN ACE 与 IP-ECN CE 计数分离统计。
 
 ---
 
