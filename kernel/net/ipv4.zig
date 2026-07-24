@@ -113,6 +113,14 @@ pub fn setEct0(buf: [*]u8) void {
     bo.writeU16BeAt(buf, 10, checksum(buf, 20));
 }
 
+/// Mark an already-built IPv4 header with ECT(1) for AccECN/L4S (SK-143).
+pub fn setEct1(buf: [*]u8) void {
+    buf[1] = (buf[1] & 0xFC) | ECN_ECT1;
+    buf[10] = 0;
+    buf[11] = 0;
+    bo.writeU16BeAt(buf, 10, checksum(buf, 20));
+}
+
 fn addrEq(a: [4]u8, b: [4]u8) bool {
     return a[0] == b[0] and a[1] == b[1] and a[2] == b[2] and a[3] == b[3];
 }

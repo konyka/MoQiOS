@@ -2113,7 +2113,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:本地不编码保留值,对端脏 ACE 也不触发误砍窗。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-142] tcp ace invalid 0b010 non-x86: OK`。
-- **后续**:CE 计数与 ECT(1)/L4S 路径;或 AccECN ACE 与 IP-ECN CE 计数分离统计。
+- **后续**:见 3.143（AccECN ECT(1)/L4S,已完成)。
+
+---
+
+### 3.143 AccECN 发送路径改用 ECT(1)（SK-143,2026-07-24）
+
+- **背景**:所有 ECN 流均标 ECT(0),L4S/AQM 无法区分可扩展拥塞控制流;
+  AccECN 协商后仍走经典 ECT(0)。
+- **方案**:`accecn_ok` 时 IPv4/IPv6 非 SYN 段标 ECT(1),经典 `ecn_ok` 仍用 ECT(0)。
+  `shared/sk143.zig` 锁定 `probeEcnSendCodepoint`。
+- **效果**:AccECN 流可被 L4S 队列按 ECT(1) 做更密 CE 标记;经典 ECN 不变。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-143] tcp accecn ect(1) non-x86: OK`。
+- **后续**:L4S 风格按 CE 比例微调窗;或 AccECN ACE 与 IP-ECN CE 计数分离统计。
 
 ---
 

@@ -101,6 +101,14 @@ pub fn setEct0(buf: [*]u8) void {
     buf[1] = (buf[1] & 0x0F) | @as(u8, tc << 4);
 }
 
+/// Mark an already-built IPv6 header with ECT(1) for AccECN/L4S (SK-143).
+pub fn setEct1(buf: [*]u8) void {
+    var tc: u8 = ((buf[0] & 0x0f) << 4) | (buf[1] >> 4);
+    tc = (tc & 0xFC) | 0x01;
+    buf[0] = (buf[0] & 0xF0) | (tc >> 4);
+    buf[1] = (buf[1] & 0x0F) | @as(u8, tc << 4);
+}
+
 /// Compute the IPv6 pseudo-header partial checksum (RFC 8200 §8.1).
 ///
 /// The pseudo-header consists of:

@@ -908,8 +908,10 @@ fn sendSegmentSeq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16, 
     const csum = tcpChecksum(our_ip, tcb.remote_ip, send_pkt[tcp_off..].ptr, tcp_total);
     bo.writeU16BeAt(&send_pkt, tcp_off + 16, csum);
     ipv4.buildHeader(send_pkt[14..].ptr, our_ip, tcb.remote_ip, ipv4.PROTO_TCP, tcp_total);
-    // SK-131: ECT(0) on non-SYN when ECN negotiated.
-    if (tcb.ecn_ok and (flags & SYN) == 0) ipv4.setEct0(send_pkt[14..].ptr);
+    // SK-131/143: ECT(1) for AccECN/L4S, else ECT(0) for classic ECN.
+    if (tcb.ecn_ok and (flags & SYN) == 0) {
+        if (tcb.accecn_ok) ipv4.setEct1(send_pkt[14..].ptr) else ipv4.setEct0(send_pkt[14..].ptr);
+    }
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, 20 + tcp_total);
     const ok = nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.
@@ -947,8 +949,10 @@ fn sendSegmentV6Seq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16
     const csum = tcpChecksumV6(our_ip, tcb.remote_ip6, send_pkt[tcp_off..].ptr, tcp_total);
     bo.writeU16BeAt(&send_pkt, tcp_off + 16, csum);
     ipv6.buildHeader(send_pkt[14..].ptr, our_ip, tcb.remote_ip6, ipv6.PROTO_TCP, tcp_total);
-    // SK-131: ECT(0) on non-SYN when ECN negotiated.
-    if (tcb.ecn_ok and (flags & SYN) == 0) ipv6.setEct0(send_pkt[14..].ptr);
+    // SK-131/143: ECT(1) for AccECN/L4S, else ECT(0) for classic ECN.
+    if (tcb.ecn_ok and (flags & SYN) == 0) {
+        if (tcb.accecn_ok) ipv6.setEct1(send_pkt[14..].ptr) else ipv6.setEct0(send_pkt[14..].ptr);
+    }
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + tcp_total);
     const ok = nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.
@@ -3800,6 +3804,13 @@ pub fn probeAceBaselineOnly(peer_valid: bool) bool {
 /// AccECN reserved ACE encoding 0b010 (SK-142).
 pub fn probeAceInvalid(ace: u3) bool {
     return ace == 0b010;
+}
+
+/// IP ECN codepoint to send: Not-ECT / ECT(0) / ECT(1) (SK-131/143).
+pub fn probeEcnSendCodepoint(accecn_ok: bool, ecn_ok: bool) u8 {
+    if (!ecn_ok) return ipv4.ECN_NOT_ECT;
+    if (accecn_ok) return ipv4.ECN_ECT1;
+    return ipv4.ECN_ECT0;
 }
 
 /// Next CE counter value, skipping reserved 0b010 (SK-142).
