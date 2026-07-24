@@ -40,6 +40,13 @@ fn userRangeMapped(addr: u64, len: usize) bool {
     return true;
 }
 
+/// Validate a user buffer before a syscall consumes data from a kernel queue.
+/// Unlike validateUserRange, this also checks the active page table so callers
+/// can reject a bad destination before performing an irreversible dequeue.
+pub fn validateUserBuffer(addr: u64, len: usize) bool {
+    return validateUserRange(addr, len) and userRangeMapped(addr, len);
+}
+
 /// Global recovery state (for future assembly-based recovery).
 var recovery_rip: u64 = 0;
 var in_user_access: bool = false;

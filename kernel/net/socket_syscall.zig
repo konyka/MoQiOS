@@ -382,20 +382,24 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         var tmp_buf: [8192]u8 = undefined;
         const to_read = @min(len, 8192);
+        if (!copy.validateUserBuffer(buf, to_read)) return -14; // EFAULT
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
         const result = net_mod.unix_socket.unixRecv(unix_idx, &tmp_buf, to_read);
         if (result > 0) {
-            _ = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf))[0..@intCast(result)], @intCast(result));
+            const copied = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf))[0..@intCast(result)], @intCast(result));
+            if (copied != @as(usize, @intCast(result))) return -14; // EFAULT
         }
         return result;
     } else if (t.fd_table.fds[fd].fd_type == .tcp_socket) {
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         var tmp_buf: [4096]u8 = undefined;
         const to_read = @min(len, 4096);
+        if (!copy.validateUserBuffer(buf, to_read)) return -14; // EFAULT
         const tcb_idx = t.fd_table.fds[fd].tcb_idx;
         const result = net_mod.tcp.tcpRecv(tcb_idx, &tmp_buf, to_read);
         if (result > 0) {
-            _ = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf))[0..@intCast(result)], @intCast(result));
+            const copied = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf))[0..@intCast(result)], @intCast(result));
+            if (copied != @as(usize, @intCast(result))) return -14; // EFAULT
         }
         return result;
     } else if (t.fd_table.fds[fd].fd_type == .udp_socket) {
@@ -405,16 +409,21 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         if (is_v6) {
             var tmp6: [1232]u8 = undefined;
             const to_read6 = @min(len, 1232);
+            if (!copy.validateUserBuffer(buf, to_read6)) return -14; // EFAULT
+            if (addr_ptr != 0) {
+                if (!copy.validateUserBuffer(addr_ptr, sa.SOCKADDR_IN6_LEN)) return -14;
+                if (addr_len_ptr != 0 and !copy.validateUserBuffer(addr_len_ptr, 4)) return -14;
+            }
             var src6: [16]u8 = @splat(0);
             var src_port_out6: u16 = 0;
             const result6 = udp.recvFromV6(src_port, &tmp6, &src6, &src_port_out6);
             if (result6 > 0) {
                 const to_write6 = @min(@as(u32, @intCast(result6)), to_read6);
-                _ = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp6))[0..to_write6], to_write6);
+                if (copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp6))[0..to_write6], to_write6) != to_write6) return -14;
                 if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000) {
                     var sa_out6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
                     const alen = sa.writeInet6(&sa_out6, src_port_out6, src6, 0);
-                    _ = copy.copyToUser(@ptrFromInt(addr_ptr), &sa_out6, alen);
+                    if (copy.copyToUser(@ptrFromInt(addr_ptr), &sa_out6, alen) != alen) return -14;
                     if (addr_len_ptr != 0 and addr_len_ptr < 0x0000_8000_0000_0000) {
                         var al6: [4]u8 = .{
                             @truncate(alen),
@@ -422,7 +431,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
                             @truncate(alen >> 16),
                             @truncate(alen >> 24),
                         };
-                        _ = copy.copyToUser(@ptrFromInt(addr_len_ptr), &al6, 4);
+                        if (copy.copyToUser(@ptrFromInt(addr_len_ptr), &al6, 4) != 4) return -14;
                     }
                 }
                 return @intCast(to_write6);
@@ -431,20 +440,25 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         }
         var tmp_buf2: [1472]u8 = undefined;
         const to_read2 = @min(len, 1472);
+        if (!copy.validateUserBuffer(buf, to_read2)) return -14; // EFAULT
+        if (addr_ptr != 0) {
+            if (!copy.validateUserBuffer(addr_ptr, 8)) return -14;
+            if (addr_len_ptr != 0 and !copy.validateUserBuffer(addr_len_ptr, 4)) return -14;
+        }
         var src_ip: [4]u8 = .{ 0, 0, 0, 0 };
         var src_port_out: u16 = 0;
         const result2 = udp.recvFrom(src_port, &tmp_buf2, &src_ip, &src_port_out);
         if (result2 > 0) {
             const to_write = @min(@as(u32, @intCast(result2)), to_read2);
-            _ = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf2))[0..to_write], to_write);
+            if (copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf2))[0..to_write], to_write) != to_write) return -14;
             if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000) {
                 var sa_out: [sa.SOCKADDR_IN_LEN]u8 = undefined;
                 _ = sa.writeInet4(&sa_out, src_port_out, src_ip);
                 // Preserve historical 8-byte write for short user buffers.
-                _ = copy.copyToUser(@ptrFromInt(addr_ptr), &sa_out, 8);
+                if (copy.copyToUser(@ptrFromInt(addr_ptr), &sa_out, 8) != 8) return -14;
                 if (addr_len_ptr != 0 and addr_len_ptr < 0x0000_8000_0000_0000) {
                     var al: [4]u8 = .{ 8, 0, 0, 0 };
-                    _ = copy.copyToUser(@ptrFromInt(addr_len_ptr), &al, 4);
+                    if (copy.copyToUser(@ptrFromInt(addr_len_ptr), &al, 4) != 4) return -14;
                 }
             }
             return @intCast(to_write);
@@ -455,9 +469,11 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         // Not a socket — use regular read
         var tmp_buf: [4096]u8 = undefined;
         const to_read = @min(len, 4096);
+        if (!copy.validateUserBuffer(buf, to_read)) return -14; // EFAULT
         const result = vfs_mod.FdTable.read(&t.fd_table, fd, &tmp_buf, to_read);
         if (result > 0) {
-            _ = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf))[0..@intCast(result)], @intCast(result));
+            const copied = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf))[0..@intCast(result)], @intCast(result));
+            if (copied != @as(usize, @intCast(result))) return -14; // EFAULT
         }
         return result;
     }
