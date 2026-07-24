@@ -162,20 +162,21 @@ pass_markers() {
         grep -q "\[SK-117\] tcp tail loss probe non-x86: OK" "$LOG_FILE" &&
         grep -q "\[SK-118\] tcp rack-lite head loss non-x86: OK" "$LOG_FILE" &&
         grep -q "\[SK-119\] tcp delivery rate bdp non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-120\] tcp rate pacing non-x86: OK" "$LOG_FILE"
+        grep -q "\[SK-120\] tcp rate pacing non-x86: OK" "$LOG_FILE" &&
+        grep -q "\[SK-121\] tcp bbr-lite startup non-x86: OK" "$LOG_FILE"
 }
 
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if pass_markers; then
-        echo "PASS: MoQiOS aarch64 M9-7+SK-120 smoke (shared probes + slim footprint/env + default timer + EL0/SVC)."
+        echo "PASS: MoQiOS aarch64 M9-7+SK-121 smoke (shared probes + slim footprint/env + default timer + EL0/SVC)."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         if pass_markers; then
-            echo "PASS: MoQiOS aarch64 M9-7+SK-120 smoke (shared probes + slim footprint/env + default timer + EL0/SVC)."
+            echo "PASS: MoQiOS aarch64 M9-7+SK-121 smoke (shared probes + slim footprint/env + default timer + EL0/SVC)."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -189,7 +190,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for aarch64 smoke markers."
-echo "Expected: SK-2..SK-4 + SK-6..SK-120 shared markers + M9-1..M9-7 markers."
+echo "Expected: SK-2..SK-4 + SK-6..SK-121 shared markers + M9-1..M9-7 markers."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

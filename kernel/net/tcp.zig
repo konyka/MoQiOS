@@ -185,6 +185,8 @@ const TcpTcb = struct {
     min_rtt_ms: u32,
     /// Last paced data send timestamp (SK-120).
     last_pace_ms: u32,
+    /// BBR-lite Startup active until cwnd reaches 2·BDP (SK-121).
+    bbr_startup: bool,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -309,6 +311,7 @@ pub fn initTcbs() void {
             .rate_sample_ms = 0,
             .min_rtt_ms = 0,
             .last_pace_ms = 0,
+            .bbr_startup = true,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -376,6 +379,7 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].rate_sample_ms = 0;
     tcbs[i].min_rtt_ms = 0;
     tcbs[i].last_pace_ms = 0;
+    tcbs[i].bbr_startup = true;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -949,6 +953,25 @@ fn applyBdpCwndFloor(tcb: *TcpTcb) void {
     if (floor > tcb.cwnd) tcb.cwnd = floor;
 }
 
+/// BBR-lite Startup: grow toward 2·BDP; on reach, Drain to 1·BDP (SK-121).
+fn applyBbrStartup(tcb: *TcpTcb, acked: u32, smss: u32) void {
+    const target = probeBbrStartupCwnd(tcb.delivery_rate, tcb.min_rtt_ms);
+    if (target == 0) return;
+    if (tcb.cwnd < target) {
+        const step = @max(acked, smss);
+        const next = tcb.cwnd +% step;
+        tcb.cwnd = if (next < target and next > tcb.cwnd) next else target;
+    }
+    if (probeBbrStartupDone(tcb.cwnd, target)) {
+        tcb.bbr_startup = false;
+        const bdp = probeBdpBytes(tcb.delivery_rate, tcb.min_rtt_ms);
+        if (bdp > 0) {
+            tcb.ssthresh = bdp;
+            if (tcb.cwnd > bdp) tcb.cwnd = bdp;
+        }
+    }
+}
+
 fn applyPeerMss(tcb: *TcpTcb, opts: TcpOptions) void {
     if (opts.mss) |m| {
         // Ignore zero/nonsense; keep prior if already set.
@@ -1393,6 +1416,10 @@ fn driveTcbStateMachine(
                                 const inc = (smss * smss) / @max(tcb.cwnd, 1);
                                 tcb.cwnd += inc;
                             }
+                            // SK-121: BBR-lite Startup toward 2·BDP, then Drain to BDP.
+                            if (tcb.bbr_startup) {
+                                applyBbrStartup(tcb, acked, smss);
+                            }
                             tcb.dup_ack_count = 0;
                         }
 
@@ -1441,6 +1468,7 @@ fn driveTcbStateMachine(
                             const pipe = pipeBytes(tcb);
                             tcb.undo_cwnd = tcb.cwnd;
                             tcb.undo_ssthresh = tcb.ssthresh;
+                            tcb.bbr_startup = false;
                             tcb.in_recovery = true;
                             tcb.recover_seq = tcb.snd_nxt;
                             tcb.ssthresh = @max(tcb.cwnd / 2, 2 * smss_fr);
@@ -2081,6 +2109,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             tcb.prr_delivered = 0;
             tcb.prr_out = 0;
             tcb.tlp_sent = false;
+            tcb.bbr_startup = false;
             // SK-116: enter F-RTO; keep undo until confirmed spurious or lossy.
             tcb.frto = 1;
             if (tcp_util.seqLt(tcb.snd_max, tcb.snd_nxt)) tcb.snd_max = tcb.snd_nxt;
@@ -2909,6 +2938,19 @@ pub fn probeBdpBytes(rate_bps: u32, min_rtt_ms: u32) u32 {
     if (rate_bps == 0 or min_rtt_ms == 0) return 0;
     const v = (@as(u64, rate_bps) * min_rtt_ms) / 1000;
     return @intCast(@min(v, @as(u64, 0xffff_ffff)));
+}
+
+/// BBR Startup cwnd target = 2 × BDP (SK-121).
+pub fn probeBbrStartupCwnd(rate_bps: u32, min_rtt_ms: u32) u32 {
+    const bdp = probeBdpBytes(rate_bps, min_rtt_ms);
+    if (bdp == 0) return 0;
+    if (bdp > 0x7fff_ffff) return 0xffff_ffff;
+    return bdp * 2;
+}
+
+/// True when Startup has filled the 2·BDP target (SK-121).
+pub fn probeBbrStartupDone(cwnd: u32, startup_cwnd: u32) bool {
+    return startup_cwnd > 0 and cwnd >= startup_cwnd;
 }
 
 /// RFC 8985-inspired reordering window: max(SRTT/4, 1ms) (SK-118).

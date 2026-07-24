@@ -1835,7 +1835,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:平滑注入,降低突发丢包,为 BBR 类控制铺路。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-120] tcp rate pacing non-x86: OK`。
-- **后续**:BBR Startup/Drain;或完整 RACK per-segment 时间戳。
+- **后续**:见 3.121（BBR-lite Startup/Drain,已完成)。
+
+---
+
+### 3.121 BBR-lite Startup / Drain（SK-121,2026-07-23）
+
+- **背景**:仅靠 Reno 慢启动在高 BDP 路径上填窗慢;已有 rate/min_rtt 未驱动启动增益。
+- **方案**:Startup 期间将 cwnd 推向 `2·BDP`;达到后退出 Startup,`ssthresh=BDP`
+  并将 cwnd Drain 到 `1·BDP`。丢包/RTO 结束 Startup。
+  `shared/sk121.zig` 锁定目标与完成判定。
+- **效果**:高带宽路径更快探测满管,随后收敛到测得 BDP。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-121] tcp bbr-lite startup non-x86: OK`。
+- **后续**:BBR ProbeBW/ProbeRTT;或完整 RACK per-segment 时间戳。
 
 ---
 

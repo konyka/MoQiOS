@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-23 (SK-120 rate pacing + prior SK-119 reviewed and verified)
+> Last update: 2026-07-24 (SK-121 BBR-lite Startup + prior SK-120 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -452,6 +452,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | Slow recovery with sparse SACK | DupThresh/IsLost waited despite timed-out head. | SK-118: RACK-lite enters recovery after SRTT+reo_wnd. |
 | Post-recovery cwnd undershoot | Exit always set cwnd=ssthresh below measured BDP. | SK-119: delivery-rate sample floors cwnd at min(BDP,2·ssthresh). |
 | cwnd burst without pacing | Full window injected at once after rate known. | SK-120: pace SMSS sends by delivery_rate interval. |
+| Slow start undershoots BDP | Reno SS ignored measured rate×min_rtt. | SK-121: BBR-lite Startup to 2·BDP then Drain to BDP. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -461,8 +462,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-120] tcp rate pacing non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-120] tcp rate pacing non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-121] tcp bbr-lite startup non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-121] tcp bbr-lite startup non-x86: OK`. |
 
 ### 5.3 Historical Verification
 
