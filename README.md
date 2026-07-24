@@ -4,8 +4,9 @@
 
 ## 项目状态
 
-**当前进度**: M11+ 及多项扩展 (TCP、ext2、AHCI/NVMe、tmpfs/procfs、SMP 尝试)。
-系统可正常引导至调度器并跑通 `init` + `hello2`–`hello26` 全部用户态测试 (QEMU 串口验证)。
+**当前进度**: x86_64 主路径已覆盖 M11+ 及多项扩展 (TCP、ext2、AHCI/NVMe、tmpfs/procfs、SMP)。
+系统可正常引导至调度器，并通过 QEMU 串口跑通 `init` + `hello2`–`hello21` 和 Shell；
+`hello22`–`hello28` 保留为手动集成用例。riscv64/aarch64 当前是独立的移植骨架，分别有 QEMU smoke 门禁。
 
 | 里程碑 | 功能 | 状态 |
 |---|---|---|
@@ -26,7 +27,7 @@
 | 扩展 | 范围 TLB Shootdown（IPI + invlpg + 32 页 CR3 阈值回退） | ✅ |
 | 扩展 | IPv6 协议栈（ICMPv6 + NDP 邻居发现） | ✅ |
 | 扩展 | POSIX Capability 安全模型（16 个 capability 位 + 三组掩码） | ✅ |
-| 扩展 | Arch 抽象层（M4 里程碑，x86_64 + riscv64 双实现） | ✅ |
+| 扩展 | Arch 抽象层（x86_64 主路径 + riscv64/aarch64 移植骨架） | 部分完成 |
 | 扩展 | 调度器 Profiling 基础设施（SchedStats + /proc/sched_stats） | ✅ |
 
 > **2026-06-21 SMP 性能三件套完成**：FPU/SSE 按任务保存 (`kernel/arch/x86_64/context_switch.zig`)、
@@ -35,7 +36,7 @@
 > 可**真正**跨核运行用户任务。
 >
 > **2026-06-21 新增功能**：IPv6 协议栈（ICMPv6 + NDP 邻居发现）、POSIX Capability 安全模型、
-> Arch 抽象层（M4 完成，x86_64 + riscv64 双实现）、调度器 Profiling 基础设施。
+> Arch 抽象层（x86_64 主路径；riscv64/aarch64 为独立移植骨架）、调度器 Profiling 基础设施。
 > 详见 [docs/moqios-architecture-current.md](docs/moqios-architecture-current.md) §1.9–1.10 节。
 
 > **2026-06 引导稳定性修复**：修复了 4 个会导致内核无法启动或健壮性不足的缺陷
@@ -51,8 +52,8 @@
 > **2026-06-21 SMP 性能三件套**：FPU/SSE 任务状态保存、Per-CPU 调度队列 + Work-Stealing、
 > 范围 TLB Shootdown 同时完成。三者互为前提，完成后用户任务可跨核迁移，AP 参与负载均衡。
 
-**用户程序**: ~2,300 行 C/ASM | **测试**: `init` 自动跑 `hello2`–`hello21` + Shell；`hello22`–`hello28` 可手动运行
-(注: `zig build test` 当前为占位，实测以 QEMU 运行 `hello*` 为准)
+**用户程序**: ~3,600 行 C/ASM | **测试**: `zig build test` 覆盖主机可运行的共享库逻辑；QEMU
+`smoke`/`smoke-smp` 覆盖 x86_64 启动与集成路径，`hello22`–`hello28` 可手动运行。
 
 ## 功能特性
 
@@ -204,6 +205,18 @@ zig build run
 ```bash
 zig build
 ```
+
+### 验证
+
+```bash
+zig build test
+zig build smoke
+zig build smoke-smp
+zig build -Darch=riscv64 smoke-riscv
+zig build -Darch=aarch64 smoke-aarch64
+```
+
+完整命令、运行时标记和已知限制见 [docs/build-and-toolchain.md](docs/build-and-toolchain.md)。
 
 ### 项目结构
 

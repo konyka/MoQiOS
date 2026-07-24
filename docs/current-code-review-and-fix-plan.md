@@ -479,6 +479,35 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
+### 5.2d Review Update: 2026-07-24
+
+This pass covered the tracked source tree, build graph, shell gates, user-facing status docs, and the
+socket/block-device paths identified by static review. “All problems” is bounded to defects discoverable
+through those checks; it does not claim proof of absence in uncompiled modules or untested hardware.
+
+| Severity | Finding | Resolution / status |
+|---|---|---|
+| P1 | `recvfrom` consumed Unix/TCP/UDP data and ignored `copyToUser` failure, so an invalid mapped-range destination could report success while losing queued data. | Mitigated: validate the complete destination and optional source-address buffers before dequeue, and return `-EFAULT` (`-14`) if a later copy reports a short write. A concurrent unmap between validation and copy remains an open TOCTOU limitation. |
+| P1 | NVMe advertised flush support while the block layer returned success without submitting a flush command. | Fixed safely: NVMe no longer advertises flush until command support exists; unsupported NVMe/virtio-blk flush returns an error instead of a false durability guarantee. |
+| P2 | README status, test claims, and cross-architecture wording had drifted from the current build and smoke gates. | Fixed: synchronized Chinese/English README and recorded the authoritative evidence here. |
+
+The user-buffer page walk adds bounded work proportional to the syscall buffer size, but prevents an
+irreversible queue dequeue before validation. No speculative replacement of bounded task, cache, or
+directory scans was made without profiling evidence. The real exception-table fault-recovery TODO and
+uncompiled-module reachability gap remain explicit follow-up work.
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build test` | Passed | Host helper tests. |
+| `zig build` | Passed | x86_64 kernel and userspace. |
+| `zig build -Darch=riscv64` | Passed | riscv64 build. |
+| `zig build -Darch=aarch64` | Passed | aarch64 build. |
+| `zig build smoke` | Passed | x86_64 single-core reached `hello21 done` and `MoQiOS shell`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | M7+shared probes+SK-144 markers. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | M9-7+shared probes+SK-144 markers. |
+| `zig build smoke-smp` | Passed on retry | The first 120-second run stopped in the existing `hello13` signal path before the shell marker; a second run reached the shell. This remains a timing-sensitive regression gate. |
+| LSP diagnostics | Unavailable | `zls` is not installed; compiler gates were used instead. |
+
 | Gate | Result | Notes |
 |---|---|---|
 | `zig build test` | Passed | Host helper tests. |

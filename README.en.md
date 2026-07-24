@@ -1,12 +1,12 @@
 # MoQiOS
 
-An x86_64 operating system kernel written in Zig, using the Limine boot protocol, with multiprocess support, FAT32 read/write filesystem, network stack, signal handling, and an interactive shell.
+An x86_64-first operating system kernel written in Zig, using the Limine boot protocol, with multiprocess support, FAT32/ext2 filesystems, a network stack, signal handling, and an interactive shell. riscv64 and aarch64 currently provide separately tested porting skeletons.
 
 [中文文档](./README.md)
 
 ## Project Status
 
-**Current Progress**: M11+ (M1–M10 milestones fully complete, plus multiple extension features)
+**Current Progress**: x86_64 M11+ with multiple extension features; riscv64/aarch64 porting skeletons have dedicated QEMU smoke gates.
 
 | Milestone | Feature | Status |
 |---|---|---|
@@ -21,8 +21,10 @@ An x86_64 operating system kernel written in Zig, using the Limine boot protocol
 | M9 | Pipes (pipe) + dup2 + interactive shell | ✅ |
 | M10 | fork + execve + address space cloning | ✅ |
 | M11+ | Signals, environment variables, directory ops, chdir/getcwd, fstat/unlink | ✅ |
+| Extensions | ext2, tmpfs/procfs, TCP sockets, SMP/work-stealing, IPv6, capabilities | ✅ on x86_64 |
+| Porting | riscv64 and aarch64 shared-probe/boot skeletons | In progress |
 
-**Kernel**: ~11,600 lines Zig | **User programs**: ~2,300 lines C/ASM | **Tests**: 18 automated + shell
+**Kernel**: ~63,000 lines Zig | **User programs**: ~3,600 lines C/ASM | **Tests**: host unit tests + QEMU smoke gates
 
 ## Features
 
@@ -121,6 +123,8 @@ An x86_64 operating system kernel written in Zig, using the Limine boot protocol
 | hello16 | Environment variables (setenv/getenv/fork inheritance) |
 | hello17 | execve argv passing verification |
 | hello18 | chdir/getcwd/fstat/uname |
+| hello19–hello21 | TCP setup and init smoke tail |
+| hello22–hello28 | TCP socket, ext2, mkdir/unlink and directory integration tests |
 
 ## Quick Start
 
@@ -141,6 +145,18 @@ zig build run
 ```bash
 zig build
 ```
+
+### Verification
+
+```bash
+zig build test
+zig build smoke
+zig build smoke-smp
+zig build -Darch=riscv64 smoke-riscv
+zig build -Darch=aarch64 smoke-aarch64
+```
+
+See [docs/build-and-toolchain.md](docs/build-and-toolchain.md) for markers, timeouts, and known limits.
 
 ### Project Structure
 
