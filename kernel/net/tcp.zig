@@ -63,6 +63,9 @@ const DELAYED_ACK_MS: u32 = 100; // delay ACK by 100ms (reduces ACK count ~50%)
 /// BBR-lite ProbeRTT interval / dwell (SK-122).
 const BBR_PROBE_RTT_INTERVAL_MS: u32 = 10_000;
 const BBR_PROBE_RTT_DURATION_MS: u32 = 200;
+/// CUBIC β = 0.7, C = 0.4 (SK-124).
+const CUBIC_BETA_NUM: u32 = 7;
+const CUBIC_BETA_DEN: u32 = 10;
 
 /// Write `count` bytes from `src` into a ring buffer at `write_pos`.
 /// Uses @memcpy for contiguous chunks (handles wraparound at buffer boundary).
@@ -204,6 +207,12 @@ const TcpTcb = struct {
     bbr_cycle_idx: u3,
     /// When current ProbeBW phase started (SK-123).
     bbr_cycle_ms: u32,
+    /// CUBIC W_max at last congestion event (SK-124).
+    cubic_w_max: u32,
+    /// CUBIC epoch start timestamp (0 = inactive) (SK-124).
+    cubic_epoch_ms: u32,
+    /// CUBIC K in milliseconds (SK-124).
+    cubic_k_ms: u32,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -336,6 +345,9 @@ pub fn initTcbs() void {
             .bbr_prior_min_rtt_ms = 0,
             .bbr_cycle_idx = 0,
             .bbr_cycle_ms = 0,
+            .cubic_w_max = 0,
+            .cubic_epoch_ms = 0,
+            .cubic_k_ms = 0,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -411,6 +423,9 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].bbr_prior_min_rtt_ms = 0;
     tcbs[i].bbr_cycle_idx = 0;
     tcbs[i].bbr_cycle_ms = 0;
+    tcbs[i].cubic_w_max = 0;
+    tcbs[i].cubic_epoch_ms = 0;
+    tcbs[i].cubic_k_ms = 0;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -1042,6 +1057,37 @@ fn bbrPacedRate(tcb: *const TcpTcb) u32 {
     return @intCast(@min(v, @as(u64, 0xffff_ffff)));
 }
 
+/// Record CUBIC W_max at congestion; epoch restarts on next CA (SK-124).
+fn noteCubicLoss(tcb: *TcpTcb, smss: u32) void {
+    tcb.cubic_w_max = @max(tcb.cwnd, smss * 2);
+    tcb.cubic_epoch_ms = 0;
+    tcb.cubic_k_ms = 0;
+}
+
+/// CUBIC congestion avoidance step (SK-124).
+fn applyCubic(tcb: *TcpTcb, acked: u32, smss: u32) void {
+    const now = timestampMs();
+    if (tcb.cubic_epoch_ms == 0) {
+        if (tcb.cubic_w_max < tcb.cwnd) tcb.cubic_w_max = tcb.cwnd;
+        if (tcb.cubic_w_max == 0) tcb.cubic_w_max = tcb.cwnd;
+        tcb.cubic_epoch_ms = now;
+        tcb.cubic_k_ms = probeCubicK(tcb.cubic_w_max, smss);
+    }
+    const t_ms = now -% tcb.cubic_epoch_ms;
+    const target = probeCubicTarget(tcb.cubic_w_max, smss, t_ms, tcb.cubic_k_ms);
+    if (target > tcb.cwnd) {
+        const diff = target - tcb.cwnd;
+        var incr = (smss *% diff) / @max(tcb.cwnd, 1);
+        if (incr < 1) incr = 1;
+        if (acked > 0 and incr > acked) incr = acked;
+        tcb.cwnd +%= incr;
+    } else {
+        // Below W_max (concave): at least Reno-scale growth.
+        const inc = (smss * smss) / @max(tcb.cwnd, 1);
+        tcb.cwnd +%= @max(inc, 1);
+    }
+}
+
 fn maybeEnterProbeRtt(tcb: *TcpTcb, smss: u32) void {
     if (tcb.bbr_startup or tcb.bbr_probe_rtt or tcb.in_recovery) return;
     if (tcb.delivery_rate == 0 or tcb.min_rtt_ms == 0) return;
@@ -1499,6 +1545,8 @@ fn driveTcbStateMachine(
                                 tcb.cwnd = tcb.ssthresh;
                                 // SK-119: do not undershoot measured BDP after recovery.
                                 applyBdpCwndFloor(tcb);
+                                // SK-124: start a fresh CUBIC epoch after recovery.
+                                tcb.cubic_epoch_ms = 0;
                                 tcb.dup_ack_count = 0;
                                 tcb.recover_fs = 0;
                                 tcb.prr_delivered = 0;
@@ -1528,8 +1576,8 @@ fn driveTcbStateMachine(
                             } else if (tcb.cwnd < tcb.ssthresh) {
                                 tcb.cwnd += @intCast(acked);
                             } else {
-                                const inc = (smss * smss) / @max(tcb.cwnd, 1);
-                                tcb.cwnd += inc;
+                                // SK-124: CUBIC CA when BBR rate samples are unavailable.
+                                applyCubic(tcb, acked, smss);
                             }
                             tcb.dup_ack_count = 0;
                         }
@@ -1583,9 +1631,10 @@ fn driveTcbStateMachine(
                             tcb.bbr_probe_rtt = false;
                             tcb.bbr_cycle_idx = 0;
                             tcb.bbr_cycle_ms = 0;
+                            noteCubicLoss(tcb, smss_fr);
                             tcb.in_recovery = true;
                             tcb.recover_seq = tcb.snd_nxt;
-                            tcb.ssthresh = @max(tcb.cwnd / 2, 2 * smss_fr);
+                            tcb.ssthresh = probeCubicSsthresh(tcb.cwnd, smss_fr);
                             tcb.recover_fs = @max(pipe, 1);
                             tcb.prr_delivered = 0;
                             tcb.prr_out = 0;
@@ -2214,11 +2263,12 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
                 deactivateTcb(tcb);
                 return;
             }
-            // RTO timeout: Reno cut + F-RTO probe (SK-99/116).
+            // RTO timeout: CUBIC cut + F-RTO probe (SK-99/116/124).
             const smss_rto: u32 = mssForTcb(tcb);
             tcb.undo_cwnd = tcb.cwnd;
             tcb.undo_ssthresh = tcb.ssthresh;
-            tcb.ssthresh = @max(tcb.cwnd / 2, 2 * smss_rto);
+            noteCubicLoss(tcb, smss_rto);
+            tcb.ssthresh = probeCubicSsthresh(tcb.cwnd, smss_rto);
             tcb.cwnd = smss_rto; // back to slow start
             tcb.in_recovery = false;
             tcb.dup_ack_count = 0;
@@ -3101,6 +3151,60 @@ pub fn probeBbrCycleCwnd(bdp: u32, gain_num: u32) u32 {
 pub fn probeBbrCycleAdvance(elapsed_ms: u32, min_rtt_ms: u32) bool {
     if (min_rtt_ms == 0) return false;
     return elapsed_ms >= min_rtt_ms;
+}
+
+/// Integer cube root for CUBIC K (SK-124).
+pub fn probeICbrt(x: u64) u32 {
+    if (x == 0) return 0;
+    var lo: u64 = 1;
+    var hi: u64 = @min(x, 2_642_245);
+    while (lo < hi) {
+        const mid = (lo + hi + 1) / 2;
+        if (mid > 2_642_245) {
+            hi = mid - 1;
+            continue;
+        }
+        const cube = mid * mid * mid;
+        if (cube <= x) lo = mid else hi = mid - 1;
+    }
+    return @intCast(lo);
+}
+
+/// CUBIC ssthresh = max(cwnd·β, 2·SMSS) with β=0.7 (SK-124).
+pub fn probeCubicSsthresh(cwnd: u32, smss: u32) u32 {
+    const reduced = (@as(u64, cwnd) * CUBIC_BETA_NUM) / CUBIC_BETA_DEN;
+    const floor = 2 * @as(u64, @max(smss, 1));
+    return @intCast(@max(reduced, floor));
+}
+
+/// CUBIC K in ms ≈ 1000 · ∛(W_max_seg · (1−β) / C) (SK-124).
+pub fn probeCubicK(w_max: u32, smss: u32) u32 {
+    if (w_max == 0 or smss == 0) return 0;
+    const wseg = w_max / smss;
+    // (1-β)/C = 0.3/0.4 = 0.75
+    const inside = (@as(u64, wseg) * 3) / 4;
+    const k_sec = probeICbrt(inside);
+    if (k_sec > 0xffff_ffff / 1000) return 0xffff_ffff;
+    return @intCast(k_sec * 1000);
+}
+
+/// CUBIC W(t) in bytes: C·(t−K)³ + W_max (SK-124).
+pub fn probeCubicTarget(w_max: u32, smss: u32, t_ms: u32, k_ms: u32) u32 {
+    const mss = if (smss == 0) @as(u32, 1) else smss;
+    const wmax_seg: i64 = @intCast(w_max / mss);
+    var offs: i64 = @as(i64, @intCast(t_ms)) - @as(i64, @intCast(k_ms));
+    // Keep cube within i64; beyond ~100s the target is already huge.
+    if (offs > 100_000) offs = 100_000;
+    if (offs < -100_000) offs = -100_000;
+    // C*(ms/1000)^3 = 0.4 * offs^3 / 1e9 = 2*offs^3 / 5e9
+    const a3 = offs * offs * offs;
+    const delta_seg: i64 = @divTrunc(2 * a3, 5_000_000_000);
+    var target_seg = wmax_seg + delta_seg;
+    if (target_seg < 2) target_seg = 2;
+    const tb = target_seg * @as(i64, mss);
+    if (tb <= 0) return mss * 2;
+    if (tb > 0xffff_ffff) return 0xffff_ffff;
+    return @intCast(tb);
 }
 
 /// ProbeRTT cwnd floor = 4·SMSS (SK-122).

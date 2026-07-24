@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-24 (SK-123 BBR cycle gains + prior SK-122 reviewed and verified)
+> Last update: 2026-07-24 (SK-124 CUBIC CA + prior SK-123 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -455,6 +455,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | Slow start undershoots BDP | Reno SS ignored measured rate×min_rtt. | SK-121: BBR-lite Startup to 2·BDP then Drain to BDP. |
 | Post-startup Reno drift | CA ignored BDP; min_rtt never refreshed. | SK-122: ProbeBW cruises near BDP; ProbeRTT every 10s. |
 | ProbeBW lacked drain/probe | Fixed ≤1.25×BDP cruise filled queues. | SK-123: 8-phase gains [5/4,3/4,1×6] on cwnd and pace. |
+| Reno CA on long-fat paths | Fallback AI too slow; ½ cut too harsh. | SK-124: CUBIC CA + β=0.7 when BBR rate absent. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -464,8 +465,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-123] tcp bbr cycle gains non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-123] tcp bbr cycle gains non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-124] tcp cubic ca non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-124] tcp cubic ca non-x86: OK`. |
 
 ### 5.3 Historical Verification
 

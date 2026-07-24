@@ -1873,7 +1873,19 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:周期性探测更高带宽并排空队列,稳态更接近 BBR ProbeBW。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-123] tcp bbr cycle gains non-x86: OK`。
-- **后续**:完整 RACK per-segment 时间戳;或 CUBIC 作为 Reno CA 备选。
+- **后续**:见 3.124（CUBIC CA,已完成)。
+
+---
+
+### 3.124 CUBIC 拥塞避免（SK-124,2026-07-24）
+
+- **背景**:无 BBR rate 样本时回退 Reno AI,高 BDP 路径窗口爬升过慢;丢包仍按 ½ 减窗。
+- **方案**:CA 改 CUBIC(`W(t)=C(t−K)³+W_max`);丢包 `ssthresh=cwnd·0.7`。
+  BBR ProbeBW 路径不变。`shared/sk124.zig` 锁定 ∛、β 与 t=K 行为。
+- **效果**:无带宽估计时的长肥管道吞吐爬升更快,减窗更温和。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-124] tcp cubic ca non-x86: OK`。
+- **后续**:完整 RACK per-segment 时间戳;或 HyStart++ 慢启动退出。
 
 ---
 
