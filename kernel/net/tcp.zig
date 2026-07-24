@@ -251,6 +251,8 @@ const TcpTcb = struct {
     ecn_cwr_pending: bool,
     /// Already cut cwnd for the current ECE episode (SK-131).
     ecn_reduced: bool,
+    /// undo_* was saved by an ECN cut (SK-132).
+    ecn_undo: bool,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -400,6 +402,7 @@ pub fn initTcbs() void {
             .ecn_ece_pending = false,
             .ecn_cwr_pending = false,
             .ecn_reduced = false,
+            .ecn_undo = false,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -492,6 +495,7 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].ecn_ece_pending = false;
     tcbs[i].ecn_cwr_pending = false;
     tcbs[i].ecn_reduced = false;
+    tcbs[i].ecn_undo = false;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -815,6 +819,12 @@ fn noteEcnCwrSent(tcb: *TcpTcb, flags: u8) void {
     if ((flags & CWR) != 0) {
         tcb.ecn_cwr_pending = false;
         tcb.ecn_reduced = false;
+        // SK-132: CWR commits the ECN cut; drop ECN undo.
+        if (tcb.ecn_undo) {
+            tcb.ecn_undo = false;
+            tcb.undo_cwnd = 0;
+            tcb.undo_ssthresh = 0;
+        }
     }
 }
 
@@ -1115,9 +1125,15 @@ fn updateRtt(tcb: *TcpTcb, m: u32) void {
     noteHystartRtt(tcb, m);
 }
 
-/// RFC 3168: cut cwnd on ECE without entering loss recovery (SK-131).
+/// RFC 3168: cut cwnd on ECE without entering loss recovery (SK-131/132).
 fn applyEcnCongestion(tcb: *TcpTcb) void {
     const smss = mssForTcb(tcb);
+    // SK-132: save prior window so DSACK/F-RTO can undo a spurious ECE cut.
+    if (tcb.undo_cwnd == 0) {
+        tcb.undo_cwnd = tcb.cwnd;
+        tcb.undo_ssthresh = tcb.ssthresh;
+        tcb.ecn_undo = true;
+    }
     noteCubicLoss(tcb, smss);
     tcb.ssthresh = probeCubicSsthresh(tcb.cwnd, smss);
     if (tcb.cwnd > tcb.ssthresh) tcb.cwnd = tcb.ssthresh;
@@ -1876,18 +1892,22 @@ fn driveTcbStateMachine(
                             // Fast retransmit + PRR recovery (SK-114); save undo (SK-115).
                             const smss_fr: u32 = mssForTcb(tcb);
                             const pipe = pipeBytes(tcb);
-                            tcb.undo_cwnd = tcb.cwnd;
-                            tcb.undo_ssthresh = tcb.ssthresh;
+                            // SK-132: skip a second CUBIC cut if ECN already reduced this window.
+                            if (!probeEcnSkipLossCut(tcb.ecn_reduced)) {
+                                tcb.undo_cwnd = tcb.cwnd;
+                                tcb.undo_ssthresh = tcb.ssthresh;
+                                tcb.ecn_undo = false;
+                                noteCubicLoss(tcb, smss_fr);
+                                tcb.ssthresh = probeCubicSsthresh(tcb.cwnd, smss_fr);
+                            }
                             tcb.bbr_startup = false;
                             tcb.bbr_probe_rtt = false;
                             tcb.bbr_cycle_idx = 0;
                             tcb.bbr_cycle_ms = 0;
-                            noteCubicLoss(tcb, smss_fr);
                             tcb.hystart_css = false;
                             clearHystartRound(tcb);
                             tcb.in_recovery = true;
                             tcb.recover_seq = tcb.snd_nxt;
-                            tcb.ssthresh = probeCubicSsthresh(tcb.cwnd, smss_fr);
                             tcb.recover_fs = @max(pipe, 1);
                             tcb.prr_delivered = 0;
                             tcb.prr_out = 0;
@@ -3339,6 +3359,12 @@ fn tryUndoSpurious(tcb: *TcpTcb) void {
     tcb.recover_fs = 0;
     tcb.prr_delivered = 0;
     tcb.prr_out = 0;
+    // SK-132: undoing an ECN cut also clears the ECE episode.
+    if (tcb.ecn_undo) {
+        tcb.ecn_cwr_pending = false;
+        tcb.ecn_reduced = false;
+        tcb.ecn_undo = false;
+    }
     tcb.undo_cwnd = 0;
     tcb.undo_ssthresh = 0;
     tcb.frto = 0;
@@ -3473,6 +3499,16 @@ pub fn probeEcnSynAckOk(flags: u8) bool {
 /// React to ECE once per episode outside loss recovery (SK-131).
 pub fn probeEcnReact(ece: bool, already_reduced: bool, in_recovery: bool) bool {
     return ece and !already_reduced and !in_recovery;
+}
+
+/// Skip a second CUBIC cut when ECN already reduced this window (SK-132).
+pub fn probeEcnSkipLossCut(ecn_reduced: bool) bool {
+    return ecn_reduced;
+}
+
+/// Entering loss recovery after ECN: keep prior undo if ECN saved it (SK-132).
+pub fn probeEcnKeepUndo(ecn_undo: bool, undo_cwnd: u32) bool {
+    return ecn_undo and undo_cwnd != 0;
 }
 
 /// HyStart round ends when cumulative ACK covers round_end (SK-129).
@@ -3651,18 +3687,22 @@ fn maybeRackTimerRepair(tcb: *TcpTcb, rto: u32) bool {
     if (!tcb.in_recovery) {
         const smss_fr: u32 = mssForTcb(tcb);
         const pipe = pipeBytes(tcb);
-        tcb.undo_cwnd = tcb.cwnd;
-        tcb.undo_ssthresh = tcb.ssthresh;
+        // SK-132: skip a second CUBIC cut if ECN already reduced this window.
+        if (!probeEcnSkipLossCut(tcb.ecn_reduced)) {
+            tcb.undo_cwnd = tcb.cwnd;
+            tcb.undo_ssthresh = tcb.ssthresh;
+            tcb.ecn_undo = false;
+            noteCubicLoss(tcb, smss_fr);
+            tcb.ssthresh = probeCubicSsthresh(tcb.cwnd, smss_fr);
+        }
         tcb.bbr_startup = false;
         tcb.bbr_probe_rtt = false;
         tcb.bbr_cycle_idx = 0;
         tcb.bbr_cycle_ms = 0;
-        noteCubicLoss(tcb, smss_fr);
         tcb.hystart_css = false;
         clearHystartRound(tcb);
         tcb.in_recovery = true;
         tcb.recover_seq = tcb.snd_nxt;
-        tcb.ssthresh = probeCubicSsthresh(tcb.cwnd, smss_fr);
         tcb.recover_fs = @max(pipe, 1);
         tcb.prr_delivered = 0;
         tcb.prr_out = 0;

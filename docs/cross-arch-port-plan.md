@@ -1969,7 +1969,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:支持 ECN 的路径上可在丢包前收敛,降低重传与尾延迟。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-131] tcp ecn ece/cwr non-x86: OK`。
-- **后续**:AccECN;或 ECN 与 PRR/undo 的更细交互。
+- **后续**:见 3.132（ECN undo/loss cut,已完成)。
+
+---
+
+### 3.132 ECN 与 undo/损失减窗交互（SK-132,2026-07-24）
+
+- **背景**:SK-131 ECE 减窗不保存 undo,且随后进入快重传会再砍一次 CUBIC β。
+- **方案**:ECE 保存 `undo_*`(`ecn_undo`);DSACK/F-RTO 可恢复并清除 ECE 回合;
+  同窗口损失恢复若 `ecn_reduced` 则跳过第二次减窗;CWR 发出后提交并丢弃 ECN undo。
+  `shared/sk132.zig` 锁定 skip-cut / keep-undo。
+- **效果**:避免 ECN+丢包双次过砍,伪 ECE 可撤销。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-132] tcp ecn undo/loss cut non-x86: OK`。
+- **后续**:AccECN;或 ECN 与 PRR sndcnt 的显式耦合。
 
 ---
 
