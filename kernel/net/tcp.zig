@@ -113,6 +113,8 @@ const SYN: u8 = 0x02;
 const RST: u8 = 0x04;
 const PSH: u8 = 0x08;
 const ACK: u8 = 0x10;
+const ECE: u8 = 0x40; // ECN-Echo (SK-131)
+const CWR: u8 = 0x80; // Congestion Window Reduced (SK-131)
 
 // TCP states (RFC 793)
 const TcpState = enum(u8) {
@@ -241,6 +243,14 @@ const TcpTcb = struct {
     hystart_round_min: u32,
     /// Arrival time of previous ACK in the HyStart train; 0 = none (SK-130).
     hystart_last_ack_ms: u32,
+    /// ECN negotiated (RFC 3168) (SK-131).
+    ecn_ok: bool,
+    /// Echo ECE on ACKs until peer sends CWR (SK-131).
+    ecn_ece_pending: bool,
+    /// Send CWR after reacting to ECE (SK-131).
+    ecn_cwr_pending: bool,
+    /// Already cut cwnd for the current ECE episode (SK-131).
+    ecn_reduced: bool,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -386,6 +396,10 @@ pub fn initTcbs() void {
             .hystart_round_end = 0,
             .hystart_round_min = 0,
             .hystart_last_ack_ms = 0,
+            .ecn_ok = false,
+            .ecn_ece_pending = false,
+            .ecn_cwr_pending = false,
+            .ecn_reduced = false,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -474,6 +488,10 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].hystart_round_end = 0;
     tcbs[i].hystart_round_min = 0;
     tcbs[i].hystart_last_ack_ms = 0;
+    tcbs[i].ecn_ok = false;
+    tcbs[i].ecn_ece_pending = false;
+    tcbs[i].ecn_cwr_pending = false;
+    tcbs[i].ecn_reduced = false;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -784,18 +802,35 @@ pub fn probeIpv6RenoMinSsthresh(dst: [16]u8) u32 {
     return 2 * @as(u32, probeIpv6Mss(dst));
 }
 
+/// OR ECE/CWR onto outbound flags when ECN is negotiated (SK-131).
+fn decorateEcnFlags(tcb: *TcpTcb, flags: u8, data_len: u16) u8 {
+    var out = flags;
+    if (!tcb.ecn_ok) return out;
+    if (tcb.ecn_ece_pending and (out & ACK) != 0) out |= ECE;
+    if (tcb.ecn_cwr_pending and data_len > 0) out |= CWR;
+    return out;
+}
+
+fn noteEcnCwrSent(tcb: *TcpTcb, flags: u8) void {
+    if ((flags & CWR) != 0) {
+        tcb.ecn_cwr_pending = false;
+        tcb.ecn_reduced = false;
+    }
+}
+
 /// Build and send a TCP segment (IPv4 or IPv6).
 fn sendSegment(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool {
     return sendSegmentSeq(tcb, flags, data, data_len, null);
 }
 
 /// Like `sendSegment`, but may override the SEQ field (SK-109 keepalive).
-fn sendSegmentSeq(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16, seq_override: ?u32) bool {
-    if (tcb.is_v6) return sendSegmentV6Seq(tcb, flags, data, data_len, seq_override);
+fn sendSegmentSeq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16, seq_override: ?u32) bool {
+    if (tcb.is_v6) return sendSegmentV6Seq(tcb, flags_in, data, data_len, seq_override);
 
     // SK-101: segment payload must fit Path MTU − IPv4 − TCP headers.
     if (data_len > mssForTcb(tcb)) return false;
 
+    const flags = decorateEcnFlags(tcb, flags_in, data_len);
     var send_pkt: [1518]u8 = @splat(0);
     const dst_mac = arp.resolve(tcb.remote_ip) orelse {
         tcpLog("[tcp] ARP resolution failed\n");
@@ -811,10 +846,13 @@ fn sendSegmentSeq(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16, seq
     const csum = tcpChecksum(our_ip, tcb.remote_ip, send_pkt[tcp_off..].ptr, tcp_total);
     bo.writeU16BeAt(&send_pkt, tcp_off + 16, csum);
     ipv4.buildHeader(send_pkt[14..].ptr, our_ip, tcb.remote_ip, ipv4.PROTO_TCP, tcp_total);
+    // SK-131: ECT(0) on non-SYN when ECN negotiated.
+    if (tcb.ecn_ok and (flags & SYN) == 0) ipv4.setEct0(send_pkt[14..].ptr);
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, 20 + tcp_total);
     const ok = nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.
     if (ok) ipv4.noteFullSizeSend(tcb.remote_ip, ipv4.HEADER_LEN + tcp_total);
+    if (ok) noteEcnCwrSent(tcb, flags);
     noteRackXmit(tcb, seq_override orelse tcb.snd_nxt, data_len);
     advanceSndNxt(tcb, flags, data_len);
     return true;
@@ -825,10 +863,11 @@ fn sendSegmentV6(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16) bool
     return sendSegmentV6Seq(tcb, flags, data, data_len, null);
 }
 
-fn sendSegmentV6Seq(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16, seq_override: ?u32) bool {
+fn sendSegmentV6Seq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16, seq_override: ?u32) bool {
     // SK-98: segment payload must fit Path MTU − IPv6 − TCP headers.
     if (data_len > mssForTcb(tcb)) return false;
 
+    const flags = decorateEcnFlags(tcb, flags_in, data_len);
     const nh = ndp.resolveNextHop(tcb.remote_ip6);
     const dst_mac = nh.mac orelse {
         if (nh.solicit) |t| icmpv6.sendNeighborSolicitation(t);
@@ -846,10 +885,13 @@ fn sendSegmentV6Seq(tcb: *TcpTcb, flags: u8, data: [*]const u8, data_len: u16, s
     const csum = tcpChecksumV6(our_ip, tcb.remote_ip6, send_pkt[tcp_off..].ptr, tcp_total);
     bo.writeU16BeAt(&send_pkt, tcp_off + 16, csum);
     ipv6.buildHeader(send_pkt[14..].ptr, our_ip, tcb.remote_ip6, ipv6.PROTO_TCP, tcp_total);
+    // SK-131: ECT(0) on non-SYN when ECN negotiated.
+    if (tcb.ecn_ok and (flags & SYN) == 0) ipv6.setEct0(send_pkt[14..].ptr);
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + tcp_total);
     const ok = nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.
     if (ok) ipv6.noteFullSizeSend(tcb.remote_ip6, ipv6.HEADER_LEN + tcp_total);
+    if (ok) noteEcnCwrSent(tcb, flags);
     noteRackXmit(tcb, seq_override orelse tcb.snd_nxt, data_len);
     advanceSndNxt(tcb, flags, data_len);
     return true;
@@ -929,7 +971,7 @@ fn tcpChecksumV6(src_ip: [16]u8, dst_ip: [16]u8, tcp_hdr: [*]const u8, tcp_len: 
 }
 
 /// IPv6 TCP receive (SK-74..77): checksum, demux/listen SYN, shared state machine.
-pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32) void {
+pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32, ecn_ce: bool) void {
     if (len < 20) return;
     const tcp_len: u16 = @intCast(@min(len, 0xFFFF));
     const data_offset = (@as(u16, data[12]) >> 4) * 4;
@@ -963,12 +1005,12 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
 
     const tcb = findTcbByTupleV6(dst_port, src_port, src_ip) orelse {
         if (flags & SYN != 0) {
-            handleIncomingSynV6(src_ip, src_port, dst_port, seq_num, raw_window, opts);
+            handleIncomingSynV6(src_ip, src_port, dst_port, seq_num, raw_window, opts, flags);
         }
         return;
     };
 
-    driveTcbStateMachine(tcb, seq_num, ack_num, flags, raw_window, opts, data, data_offset, payload_len, &pending_events, &pending_idx);
+    driveTcbStateMachine(tcb, seq_num, ack_num, flags, raw_window, opts, data, data_offset, payload_len, &pending_events, &pending_idx, ecn_ce);
 }
 
 // ─── Incoming Packet Handling ─────────────────────────────────────────────
@@ -1071,6 +1113,31 @@ fn updateRtt(tcb: *TcpTcb, m: u32) void {
     if (tcb.rto > TCP_RTO_MAX) tcb.rto = TCP_RTO_MAX;
     // SK-125: HyStart++ delay detect during slow start.
     noteHystartRtt(tcb, m);
+}
+
+/// RFC 3168: cut cwnd on ECE without entering loss recovery (SK-131).
+fn applyEcnCongestion(tcb: *TcpTcb) void {
+    const smss = mssForTcb(tcb);
+    noteCubicLoss(tcb, smss);
+    tcb.ssthresh = probeCubicSsthresh(tcb.cwnd, smss);
+    if (tcb.cwnd > tcb.ssthresh) tcb.cwnd = tcb.ssthresh;
+    tcb.ecn_cwr_pending = true;
+    tcb.ecn_reduced = true;
+    tcb.bbr_startup = false;
+    tcb.cubic_epoch_ms = 0;
+    clearHystartRound(tcb);
+    tcb.hystart_css = false;
+}
+
+/// Apply IP-CE / ECE / CWR side effects (SK-131).
+fn noteEcnRx(tcb: *TcpTcb, flags: u8, ecn_ce: bool) void {
+    if (ecn_ce and tcb.ecn_ok) tcb.ecn_ece_pending = true;
+    if ((flags & CWR) != 0) tcb.ecn_ece_pending = false;
+    if ((flags & ECE) != 0 and tcb.ecn_ok and
+        probeEcnReact(true, tcb.ecn_reduced, tcb.in_recovery))
+    {
+        applyEcnCongestion(tcb);
+    }
 }
 
 /// HyStart++: accumulate per-round min RTT; decide at round end (SK-125/129).
@@ -1289,8 +1356,9 @@ fn applyPeerMss(tcb: *TcpTcb, opts: TcpOptions) void {
 /// Handle an incoming SYN for a listening socket.
 /// Creates a new TCB in SYN_RECEIVED state, sends SYN-ACK,
 /// and queues it in the listen backlog.
-fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions) void {
+fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions, flags: u8) void {
     _ = _w;
+    const peer_ecn = probeEcnPeerSetup(flags);
     // Find listen slot for this port (bitmap-driven)
     var slot: ?*ListenSlot = null;
     var lbm = listen_active_bitmap;
@@ -1340,8 +1408,9 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
                 reuse_tcb.sack_permitted = true;
             }
             applyPeerMss(reuse_tcb, opts);
+            reuse_tcb.ecn_ok = peer_ecn;
 
-            _ = sendSegment(reuse_tcb, SYN | ACK, undefined, 0);
+            _ = sendSegment(reuse_tcb, probeEcnSynAckFlags(peer_ecn), undefined, 0);
             tcpLog("[tcp] TIME_WAIT reuse → SYN-ACK\n");
             return;
         }
@@ -1382,9 +1451,10 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
         new_tcb.sack_permitted = true;
     }
     applyPeerMss(new_tcb, opts);
+    new_tcb.ecn_ok = peer_ecn;
 
     // Send SYN-ACK
-    _ = sendSegment(new_tcb, SYN | ACK, undefined, 0);
+    _ = sendSegment(new_tcb, probeEcnSynAckFlags(peer_ecn), undefined, 0);
     tcpLog("[tcp] SYN-ACK sent for incoming connection\n");
 
     // Find the index of the new TCB
@@ -1396,8 +1466,9 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
 }
 
 /// IPv6 listen SYN (SK-75/76). Creates SYN_RECEIVED and sends SYN-ACK via NDP.
-fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions) void {
+fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions, flags: u8) void {
     _ = _w;
+    const peer_ecn = probeEcnPeerSetup(flags);
     var slot: ?*ListenSlot = null;
     var lbm = listen_active_bitmap;
     while (lbm != 0) {
@@ -1442,7 +1513,8 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
             }
             if (opts.sack_permitted) reuse_tcb.sack_permitted = true;
             applyPeerMss(reuse_tcb, opts);
-            _ = sendSegment(reuse_tcb, SYN | ACK, undefined, 0);
+            reuse_tcb.ecn_ok = peer_ecn;
+            _ = sendSegment(reuse_tcb, probeEcnSynAckFlags(peer_ecn), undefined, 0);
             return;
         }
     }
@@ -1474,8 +1546,9 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
     }
     if (opts.sack_permitted) new_tcb.sack_permitted = true;
     applyPeerMss(new_tcb, opts);
+    new_tcb.ecn_ok = peer_ecn;
 
-    _ = sendSegment(new_tcb, SYN | ACK, undefined, 0);
+    _ = sendSegment(new_tcb, probeEcnSynAckFlags(peer_ecn), undefined, 0);
 
     const new_idx = tcbIdx(new_tcb);
     ls.pending_tpbs[ls.pending_tail % LISTEN_BACKLOG] = new_idx;
@@ -1496,11 +1569,15 @@ fn driveTcbStateMachine(
     payload_len: u32,
     pending_events: *u32,
     pending_idx: *u32,
+    ecn_ce: bool,
 ) void {
     const epoll = @import("epoll.zig");
 
     // Any matched segment counts as activity (keepalive idle reset).
     tcb.idle_ms = 0;
+
+    // SK-131: CE / ECE / CWR reaction before further state work.
+    noteEcnRx(tcb, flags, ecn_ce);
 
     // Update ts_recent for PAWS
     if (opts.ts_val) |tv| {
@@ -1566,6 +1643,8 @@ fn driveTcbStateMachine(
                 if (opts.sack_permitted) {
                     tcb.sack_permitted = true;
                 }
+                // SK-131: ECN negotiated when SYN-ACK carries ECE (no CWR).
+                tcb.ecn_ok = probeEcnSynAckOk(flags);
                 applyPeerMss(tcb, opts);
 
                 // RTT measurement: if our SYN carried ts_val_last and
@@ -1950,7 +2029,7 @@ fn driveTcbStateMachine(
 
 }
 
-pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) void {
+pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, ecn_ce: bool) void {
     _ = dst_ip;
     if (len < 20) return;
 
@@ -1989,13 +2068,13 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
     const tcb = findTcbByTuple(dst_port, src_port, src_ip) orelse {
         // No matching connection — check if any socket is listening on this port
         if (flags & SYN != 0) {
-            handleIncomingSyn(src_ip, src_port, dst_port, seq_num, raw_window, opts);
+            handleIncomingSyn(src_ip, src_port, dst_port, seq_num, raw_window, opts, flags);
         }
         // Otherwise send RST (or just ignore)
         return;
     };
 
-    driveTcbStateMachine(tcb, seq_num, ack_num, flags, raw_window, opts, data, @intCast(payload_offset), payload_len, &pending_events, &pending_idx);
+    driveTcbStateMachine(tcb, seq_num, ack_num, flags, raw_window, opts, data, @intCast(payload_offset), payload_len, &pending_events, &pending_idx, ecn_ce);
 }
 
 
@@ -2071,7 +2150,7 @@ pub fn tcpConnect(remote_ip: [4]u8, remote_port: u16, owner_task: u32) i64 {
     tcb.state = .syn_sent;
 
     // Send SYN
-    if (!sendSegment(tcb, SYN, undefined, 0)) {
+    if (!sendSegment(tcb, probeEcnSynFlags(true), undefined, 0)) {
         deactivateTcb(tcb);
         return -1;
     }
@@ -2106,7 +2185,7 @@ pub fn tcpConnectSocket(tcb_idx: u32, remote_ip: [4]u8, remote_port: u16) i64 {
     tcb.rcv_wnd = TCP_WINDOW;
     tcb.state = .syn_sent;
 
-    if (!sendSegment(tcb, SYN, undefined, 0)) {
+    if (!sendSegment(tcb, probeEcnSynFlags(true), undefined, 0)) {
         tcb.state = .closed;
         return -1;
     }
@@ -2138,7 +2217,7 @@ pub fn tcpConnectSocketV6(tcb_idx: u32, remote_ip6: [16]u8, remote_port: u16) i6
     tcb.rcv_wnd = TCP_WINDOW;
     tcb.state = .syn_sent;
 
-    if (!sendSegment(tcb, SYN, undefined, 0)) {
+    if (!sendSegment(tcb, probeEcnSynFlags(true), undefined, 0)) {
         tcb.state = .closed;
         return -1;
     }
@@ -2489,7 +2568,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
                 }
             } else if (tcb.state == .syn_sent) {
                 // Retransmit SYN
-                _ = sendSegment(tcb, SYN, undefined, 0);
+                _ = sendSegment(tcb, probeEcnSynFlags(true), undefined, 0);
             } else if (tcb.state == .fin_wait_1 or tcb.state == .last_ack or tcb.state == .closing) {
                 // v53.12: Include .closing — FIN must be retransmitted if ACK is lost
                 _ = sendSegment(tcb, FIN | ACK, undefined, 0);
@@ -3369,6 +3448,31 @@ pub fn probeICbrt(x: u64) u32 {
         if (cube <= x) lo = mid else hi = mid - 1;
     }
     return @intCast(lo);
+}
+
+/// Active open SYN with ECN-setup (ECE+CWR) (SK-131).
+pub fn probeEcnSynFlags(want_ecn: bool) u8 {
+    return if (want_ecn) SYN | ECE | CWR else SYN;
+}
+
+/// SYN-ACK with ECE when peer offered ECN-setup (SK-131).
+pub fn probeEcnSynAckFlags(peer_ecn_setup: bool) u8 {
+    return if (peer_ecn_setup) SYN | ACK | ECE else SYN | ACK;
+}
+
+/// Peer SYN offered ECN when ECE+CWR set and ACK clear (SK-131).
+pub fn probeEcnPeerSetup(flags: u8) bool {
+    return (flags & SYN) != 0 and (flags & ACK) == 0 and (flags & (ECE | CWR)) == (ECE | CWR);
+}
+
+/// SYN-ACK completes ECN when ECE set and CWR clear (SK-131).
+pub fn probeEcnSynAckOk(flags: u8) bool {
+    return (flags & (SYN | ACK | ECE)) == (SYN | ACK | ECE) and (flags & CWR) == 0;
+}
+
+/// React to ECE once per episode outside loss recovery (SK-131).
+pub fn probeEcnReact(ece: bool, already_reduced: bool, in_recovery: bool) bool {
+    return ece and !already_reduced and !in_recovery;
 }
 
 /// HyStart round ends when cumulative ACK covers round_end (SK-129).

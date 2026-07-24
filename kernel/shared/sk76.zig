@@ -65,7 +65,7 @@ pub fn announce() void {
     }
     var syn0: [20]u8 = undefined;
     buildSeg(&syn0, REMOTE, LOCAL, 0x1000, 0x0001, 0, 0, 0x02);
-    tcp.handlePacketV6(PEER6, OURS6, &syn0, 20);
+    tcp.handlePacketV6(PEER6, OURS6, &syn0, 20, false);
     if (!tcp.tcpProbeHasV6(LOCAL, REMOTE, PEER6)) {
         fail("syn without ndp");
         return;
@@ -88,7 +88,7 @@ pub fn announce() void {
     }
     var syn1: [20]u8 = undefined;
     buildSeg(&syn1, REMOTE, LOCAL, 0x2000, 0x0002, 0, 0, 0x02);
-    tcp.handlePacketV6(PEER6, OURS6, &syn1, 20);
+    tcp.handlePacketV6(PEER6, OURS6, &syn1, 20, false);
     if (!tcp.tcpProbeSynAckAdvancedV6(LOCAL, REMOTE, PEER6)) {
         fail("synack advance");
         return;
@@ -98,7 +98,7 @@ pub fn announce() void {
     // use a non-zero ACK flag — server only checks ACK bit for syn_received.
     var ack: [20]u8 = undefined;
     buildSeg(&ack, REMOTE, LOCAL, 0x2000, 0x0003, 0x0001, 0x0000, 0x10);
-    tcp.handlePacketV6(PEER6, OURS6, &ack, 20);
+    tcp.handlePacketV6(PEER6, OURS6, &ack, 20, false);
     if (!tcp.tcpProbeIsEstablishedV6(LOCAL, REMOTE, PEER6)) {
         fail("established");
         return;

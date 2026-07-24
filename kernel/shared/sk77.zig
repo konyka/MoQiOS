@@ -67,7 +67,7 @@ pub fn announce() void {
     // SYN (seq=0x10000001)
     var syn: [20]u8 = undefined;
     buildHdr(&syn, 0x1000_0001, 0, 0x02);
-    tcp.handlePacketV6(PEER6, OURS6, &syn, 20);
+    tcp.handlePacketV6(PEER6, OURS6, &syn, 20, false);
     if (!tcp.tcpProbeSynAckAdvancedV6(LOCAL, REMOTE, PEER6)) {
         fail("synack");
         return;
@@ -76,7 +76,7 @@ pub fn announce() void {
     // Third ACK → established (ack covers server's SYN)
     var ack: [20]u8 = undefined;
     buildHdr(&ack, 0x1000_0002, 0x0001_0000, 0x10);
-    tcp.handlePacketV6(PEER6, OURS6, &ack, 20);
+    tcp.handlePacketV6(PEER6, OURS6, &ack, 20, false);
     if (!tcp.tcpProbeIsEstablishedV6(LOCAL, REMOTE, PEER6)) {
         fail("established");
         return;
@@ -100,7 +100,7 @@ pub fn announce() void {
     bo.writeU16BeAt(&data_seg, 14, 65535);
     data_seg[20] = 'Z';
     csumFill(data_seg[0..]);
-    tcp.handlePacketV6(PEER6, OURS6, &data_seg, 21);
+    tcp.handlePacketV6(PEER6, OURS6, &data_seg, 21, false);
 
     if (tcp.tcpRecvAvailable(@intCast(conn)) != 1) {
         fail("recv avail");
@@ -116,7 +116,7 @@ pub fn announce() void {
     // FIN → close_wait
     var fin: [20]u8 = undefined;
     buildHdr(&fin, 0x1000_0003, 0x0001_0000, 0x11); // FIN|ACK
-    tcp.handlePacketV6(PEER6, OURS6, &fin, 20);
+    tcp.handlePacketV6(PEER6, OURS6, &fin, 20, false);
     // close_wait enum value: check via tcpState — close_wait is after established
     const st = tcp.tcpState(@intCast(conn));
     // TcpState: closed=0 ... established, fin_wait_1, fin_wait_2, closing, time_wait, close_wait, last_ack, listen

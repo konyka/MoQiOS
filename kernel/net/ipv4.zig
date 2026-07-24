@@ -5,6 +5,11 @@ const netif = @import("netif.zig");
 pub const PROTO_ICMP: u8 = 1;
 pub const PROTO_TCP: u8 = 6;
 pub const PROTO_UDP: u8 = 17;
+/// ECN codepoints in TOS low 2 bits (RFC 3168) (SK-131).
+pub const ECN_NOT_ECT: u8 = 0x00;
+pub const ECN_ECT1: u8 = 0x01;
+pub const ECN_ECT0: u8 = 0x02;
+pub const ECN_CE: u8 = 0x03;
 
 /// IPv4 minimum reassembly MTU (RFC 791).
 pub const MIN_MTU: u16 = 576;
@@ -26,6 +31,8 @@ pub const Ipv4Info = struct {
     protocol: u8,
     payload_offset: u16,
     payload_len: u16,
+    /// True when TOS ECN field is Congestion Experienced (SK-131).
+    ecn_ce: bool = false,
 };
 
 pub fn buildHeader(buf: [*]u8, src_ip: [4]u8, dst_ip: [4]u8, protocol: u8, payload_len: u16) void {
@@ -94,7 +101,16 @@ pub fn parseHeader(data: [*]const u8) ?Ipv4Info {
         .protocol = data[9],
         .payload_offset = ihl,
         .payload_len = payload_len,
+        .ecn_ce = (data[1] & 0x03) == ECN_CE,
     };
+}
+
+/// Mark an already-built IPv4 header with ECT(0) and refresh checksum (SK-131).
+pub fn setEct0(buf: [*]u8) void {
+    buf[1] = (buf[1] & 0xFC) | ECN_ECT0;
+    buf[10] = 0;
+    buf[11] = 0;
+    bo.writeU16BeAt(buf, 10, checksum(buf, 20));
 }
 
 fn addrEq(a: [4]u8, b: [4]u8) bool {

@@ -81,7 +81,7 @@ pub fn announce() void {
     // Demux hit clears idle_ms.
     var seg: [20]u8 = undefined;
     buildSeg(&seg, REMOTE, LOCAL, 0x10); // ACK
-    tcp.handlePacketV6(PEER6, OURS6, &seg, 20);
+    tcp.handlePacketV6(PEER6, OURS6, &seg, 20, false);
     if (tcp.tcpProbeIdleV6(@intCast(idx)) != 0) {
         fail("demux idle");
         return;
@@ -103,7 +103,7 @@ pub fn announce() void {
     }
     var syn: [20]u8 = undefined;
     buildSeg(&syn, REMOTE, LOCAL, 0x02); // SYN
-    tcp.handlePacketV6(PEER6, OURS6, &syn, 20);
+    tcp.handlePacketV6(PEER6, OURS6, &syn, 20, false);
     if (!tcp.tcpProbeHasV6(LOCAL, REMOTE, PEER6)) {
         fail("syn demux");
         return;

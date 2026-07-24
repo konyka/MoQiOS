@@ -1957,7 +1957,19 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:慢启动在 ACK 压缩/拉长时更早收敛,减少缓冲区膨胀。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-130] tcp hystart ack-train gap non-x86: OK`。
-- **后续**:ECN/AccECN 反应路径;或 SYN ECN 协商 + ECE/CWR。
+- **后续**:见 3.131（ECN ECE/CWR,已完成)。
+
+---
+
+### 3.131 经典 ECN 协商与 ECE 反应（SK-131,2026-07-24）
+
+- **背景**:队列拥塞只能靠丢包/RTT 信号;RFC 3168 ECN 可在不丢包时提前减窗。
+- **方案**:SYN 带 ECE+CWR,SYN-ACK 带 ECE 完成协商;数据面标 ECT(0);收 CE 则回声 ECE;
+  收到 ECE 时按 CUBIC β 减窗并随后发 CWR。`shared/sk131.zig` 锁定协商/反应谓词。
+- **效果**:支持 ECN 的路径上可在丢包前收敛,降低重传与尾延迟。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-131] tcp ecn ece/cwr non-x86: OK`。
+- **后续**:AccECN;或 ECN 与 PRR/undo 的更细交互。
 
 ---
 

@@ -36,6 +36,8 @@ pub const Ipv6Info = struct {
     hop_limit: u8,
     payload_offset: u16, // always 40 for fixed header
     payload_len: u16,
+    /// True when Traffic Class ECN field is Congestion Experienced (SK-131).
+    ecn_ce: bool = false,
 };
 
 /// Build a fixed 40-byte IPv6 header at `buf`.
@@ -74,6 +76,7 @@ pub fn parseHeader(data: [*]const u8) ?Ipv6Info {
     const version = (data[0] >> 4) & 0xF;
     if (version != 6) return null;
 
+    const tc: u8 = ((data[0] & 0x0f) << 4) | (data[1] >> 4);
     var info: Ipv6Info = .{
         .src_ip = undefined,
         .dst_ip = undefined,
@@ -81,12 +84,21 @@ pub fn parseHeader(data: [*]const u8) ?Ipv6Info {
         .hop_limit = data[7],
         .payload_offset = HEADER_LEN,
         .payload_len = bo.readU16BeAt(data, 4),
+        .ecn_ce = (tc & 0x03) == 0x03,
     };
 
     inline for (0..16) |i| info.src_ip[i] = data[8 + i];
     inline for (0..16) |i| info.dst_ip[i] = data[24 + i];
 
     return info;
+}
+
+/// Mark an already-built IPv6 header with ECT(0) in Traffic Class (SK-131).
+pub fn setEct0(buf: [*]u8) void {
+    var tc: u8 = ((buf[0] & 0x0f) << 4) | (buf[1] >> 4);
+    tc = (tc & 0xFC) | 0x02;
+    buf[0] = (buf[0] & 0xF0) | (tc >> 4);
+    buf[1] = (buf[1] & 0x0F) | @as(u8, tc << 4);
 }
 
 /// Compute the IPv6 pseudo-header partial checksum (RFC 8200 §8.1).

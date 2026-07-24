@@ -43,7 +43,7 @@ pub fn handleRxPacket(data: [*]const u8, len: u32) void {
                     icmp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len);
                 },
                 ipv4.PROTO_TCP => {
-                    tcp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len);
+                    tcp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, info.ecn_ce);
                 },
                 ipv4.PROTO_UDP => {
                     udp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len);
@@ -62,7 +62,7 @@ pub fn handleRxPacket(data: [*]const u8, len: u32) void {
                     icmpv6.handlePacket(info6.src_ip, info6.dst_ip, data + payload_start6, info6.payload_len);
                 },
                 ipv6.PROTO_TCP => {
-                    tcp.handlePacketV6(info6.src_ip, info6.dst_ip, data + payload_start6, info6.payload_len);
+                    tcp.handlePacketV6(info6.src_ip, info6.dst_ip, data + payload_start6, info6.payload_len, info6.ecn_ce);
                 },
                 ipv6.PROTO_UDP => {
                     udp.handlePacketV6(info6.src_ip, info6.dst_ip, data + payload_start6, info6.payload_len);

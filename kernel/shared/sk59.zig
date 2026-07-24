@@ -79,7 +79,7 @@ pub fn announce() void {
 
     // A runt ICMP-sized buffer into the TCP handler must be ignored safely.
     var junk: [4]u8 = .{ 0, 0, 0, 0 };
-    tcp.handlePacket(.{ 10, 0, 2, 2 }, .{ 10, 0, 2, 15 }, &junk, junk.len);
+    tcp.handlePacket(.{ 10, 0, 2, 2 }, .{ 10, 0, 2, 15 }, &junk, junk.len, false);
 
     // timerTick on an idle table must not fault.
     tcp.timerTick(10);
