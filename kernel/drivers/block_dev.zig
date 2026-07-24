@@ -171,10 +171,7 @@ pub fn flush(dev: u8) i32 {
         .ahci => {
             return ahci.flushCache();
         },
-        .nvme, .virtio_blk => {
-            // 当前驱动均未实现 flush，预留接口
-            return 0;
-        },
+        .nvme, .virtio_blk => return -1,
     }
 }
 

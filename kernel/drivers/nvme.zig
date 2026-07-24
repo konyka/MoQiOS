@@ -504,7 +504,9 @@ pub fn init() void {
         .total_sectors = total_lbas,
         .name = nvme_name,
         .name_len = 5,
-        .supports_flush = true,
+        // Flush command submission is not implemented yet; do not advertise
+        // persistence support through the block layer.
+        .supports_flush = false,
         .max_transfer_sectors = 128, // 64KB / 512B
     }, 0);
 
