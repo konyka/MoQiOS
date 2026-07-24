@@ -2033,7 +2033,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:同 RTT 内多次 CE 对应更强减窗,单 CE / 经典 ECE 行为不变。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-136] tcp ace delta scale non-x86: OK`。
-- **后续**:完整 AccECN SYN 协商(AE);或 ACE 反馈与 BBR/CUBIC 增益耦合。
+- **后续**:见 3.137（ACE↔BBR 耦合,已完成)。
+
+---
+
+### 3.137 ACE/ECN 与 BBR drain/rate 耦合（SK-137,2026-07-24）
+
+- **背景**:ACE 砍窗后若仍处 ProbeBW 探测相(5/4),ACK 会把 cwnd/pace 立刻抬回;
+  `delivery_rate` 也不随 CE 严重度下调,BDP 目标偏乐观。
+- **方案**:`noteAceBbrCoupling` 退出 Startup、跳到 ProbeBW drain(idx=1,gain=3/4),
+  并按 `(10−cuts)/10` 折扣 `delivery_rate`。`shared/sk137.zig` 锁定 drain 与折扣。
+- **效果**:CE 后立即排空队列并收紧 pacing/BDP,与 CUBIC β 缩放互补。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-137] tcp ace bbr couple non-x86: OK`。
+- **后续**:完整 AccECN SYN 协商(AE);或 ACE 折扣与 CUBIC W_max 联动。
 
 ---
 

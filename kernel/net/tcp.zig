@@ -1171,8 +1171,9 @@ fn applyEcnCongestion(tcb: *TcpTcb, ace_delta: u3) void {
     if (tcb.cwnd > tcb.ssthresh) tcb.cwnd = tcb.ssthresh;
     tcb.ecn_cwr_pending = true;
     tcb.ecn_reduced = true;
-    tcb.bbr_startup = false;
     tcb.cubic_epoch_ms = 0;
+    // SK-137: leave Startup, land ProbeBW on drain, discount delivery_rate.
+    noteAceBbrCoupling(tcb, ace_delta);
     clearHystartRound(tcb);
     tcb.hystart_css = false;
     // SK-133: if inflight exceeds the new window, drain with PRR (not loss recovery).
@@ -1192,6 +1193,17 @@ fn applyEcnDuringRecovery(tcb: *TcpTcb, ace_delta: u3) void {
     if (new_ss < tcb.ssthresh) tcb.ssthresh = new_ss;
     tcb.ecn_cwr_pending = true;
     tcb.ecn_reduced = true;
+    // SK-137: still drain BBR pacing after recovery-path ACE/ECE.
+    noteAceBbrCoupling(tcb, ace_delta);
+}
+
+/// ACE/ECN → exit BBR Startup, jump to ProbeBW drain, discount rate (SK-137).
+fn noteAceBbrCoupling(tcb: *TcpTcb, ace_delta: u3) void {
+    tcb.bbr_startup = false;
+    if (tcb.delivery_rate == 0) return;
+    tcb.bbr_cycle_idx = probeBbrAceDrainIdx();
+    tcb.bbr_cycle_ms = timestampMs();
+    tcb.delivery_rate = probeAceRateDiscount(tcb.delivery_rate, ace_delta);
 }
 
 /// Apply IP-CE / ECE / CWR / ACE side effects (SK-131/133/134/135).
@@ -3642,6 +3654,20 @@ pub fn probeAceScaledSsthresh(cwnd: u32, smss: u32, delta: u3) u32 {
 /// Recovery ssthresh scaled by ACE delta on max(cwnd, ssthresh) (SK-136).
 pub fn probeAceScaledRecoverySsthresh(cwnd: u32, ssthresh: u32, smss: u32, delta: u3) u32 {
     return probeAceScaledSsthresh(@max(cwnd, ssthresh), smss, delta);
+}
+
+/// ProbeBW phase after ACE/ECN: drain (gain 3/4) (SK-137).
+pub fn probeBbrAceDrainIdx() u3 {
+    return 1;
+}
+
+/// Discount delivery_rate by ACE severity: keep (10−cuts)/10 (SK-137).
+pub fn probeAceRateDiscount(rate: u32, delta: u3) u32 {
+    if (rate == 0) return 0;
+    const cuts: u32 = probeAceCutCount(delta);
+    const keep = 10 - cuts; // cuts 1..7 → keep 9..3
+    const v = (@as(u64, rate) * keep) / 10;
+    return @intCast(@max(v, 1));
 }
 
 /// ACE wrapping delta (mod 8) between previous and current peer ACE (SK-134).
