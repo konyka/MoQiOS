@@ -1933,7 +1933,19 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:稀疏 ACK 下更快修复已超时空洞,减少空等 RTO。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-128] tcp rack retransmit timer non-x86: OK`。
-- **后续**:ACK-train HyStart 轮次边界;或 ECN/AccECN 反应路径。
+- **后续**:见 3.129（HyStart ACK-train 轮次,已完成)。
+
+---
+
+### 3.129 HyStart++ ACK-train 轮次边界（SK-129,2026-07-24）
+
+- **背景**:SK-125 在每个 RTT 样本上判定 CSS/退出,单次噪声易过早离开慢启动。
+- **方案**:以 `snd_nxt` 为轮次终点;RTT 只更新轮内最小值;累计 ACK 覆盖终点时再与
+  `min_rtt` 比较。`shared/sk129.zig` 锁定轮次完成与 round-min 归约。
+- **效果**:HyStart 决策与飞行轮次对齐,减少误进 CSS / 误退出。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-129] tcp hystart ack-train rounds non-x86: OK`。
+- **后续**:ECN/AccECN 反应路径;或 ACK 间隔间隙检测(ACK-train gap)。
 
 ---
 

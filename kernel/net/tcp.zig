@@ -232,6 +232,10 @@ const TcpTcb = struct {
     cubic_k_ms: u32,
     /// HyStart++ Conservative Slow Start active (SK-125).
     hystart_css: bool,
+    /// ACK covering this seq ends the current HyStart round (0 = none) (SK-129).
+    hystart_round_end: u32,
+    /// Min RTT observed in the current HyStart round (SK-129).
+    hystart_round_min: u32,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -374,6 +378,8 @@ pub fn initTcbs() void {
             .cubic_epoch_ms = 0,
             .cubic_k_ms = 0,
             .hystart_css = false,
+            .hystart_round_end = 0,
+            .hystart_round_min = 0,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -459,6 +465,8 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].cubic_epoch_ms = 0;
     tcbs[i].cubic_k_ms = 0;
     tcbs[i].hystart_css = false;
+    tcbs[i].hystart_round_end = 0;
+    tcbs[i].hystart_round_min = 0;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -1058,16 +1066,36 @@ fn updateRtt(tcb: *TcpTcb, m: u32) void {
     noteHystartRtt(tcb, m);
 }
 
-/// HyStart++: first delay → CSS; second → exit SS (SK-125).
+/// HyStart++: accumulate per-round min RTT; decide at round end (SK-125/129).
 fn noteHystartRtt(tcb: *TcpTcb, rtt: u32) void {
     if (tcb.in_recovery or tcb.bbr_probe_rtt) return;
     // ProbeBW cruise owns the window once rate is known.
     if (tcb.delivery_rate > 0 and !tcb.bbr_startup) return;
+    if (tcb.cwnd >= tcb.ssthresh) return;
+    tcb.hystart_round_min = probeHystartRoundMin(tcb.hystart_round_min, rtt);
+}
+
+/// HyStart++ ACK-train: open/close rounds on cumulative ACK (SK-129).
+fn noteHystartAck(tcb: *TcpTcb, ack: u32) void {
+    if (tcb.in_recovery or tcb.bbr_probe_rtt) return;
+    if (tcb.delivery_rate > 0 and !tcb.bbr_startup) return;
     if (tcb.cwnd >= tcb.ssthresh) {
         tcb.hystart_css = false;
+        tcb.hystart_round_end = 0;
+        tcb.hystart_round_min = 0;
         return;
     }
-    if (!probeHystartShouldExit(rtt, tcb.min_rtt_ms)) return;
+    if (tcb.hystart_round_end == 0) {
+        tcb.hystart_round_end = tcb.snd_nxt;
+        tcb.hystart_round_min = 0;
+        return;
+    }
+    if (!probeHystartRoundDone(ack, tcb.hystart_round_end)) return;
+    const sample = tcb.hystart_round_min;
+    tcb.hystart_round_end = tcb.snd_nxt;
+    tcb.hystart_round_min = 0;
+    if (sample == 0) return;
+    if (!probeHystartShouldExit(sample, tcb.min_rtt_ms)) return;
     if (!tcb.hystart_css) {
         tcb.hystart_css = true;
         return;
@@ -1637,6 +1665,8 @@ fn driveTcbStateMachine(
                                 }
                             }
                         }
+                        // SK-129: HyStart round boundary on cumulative ACK.
+                        noteHystartAck(tcb, ack_num);
 
                         // Congestion control on new ACK (SK-99 SMSS; SK-114 PRR; SK-116 F-RTO).
                         const smss: u32 = mssForTcb(tcb);
@@ -1749,6 +1779,8 @@ fn driveTcbStateMachine(
                             tcb.bbr_cycle_ms = 0;
                             noteCubicLoss(tcb, smss_fr);
                             tcb.hystart_css = false;
+                            tcb.hystart_round_end = 0;
+                            tcb.hystart_round_min = 0;
                             tcb.in_recovery = true;
                             tcb.recover_seq = tcb.snd_nxt;
                             tcb.ssthresh = probeCubicSsthresh(tcb.cwnd, smss_fr);
@@ -2399,6 +2431,8 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             tcb.ssthresh = probeCubicSsthresh(tcb.cwnd, smss_rto);
             tcb.cwnd = smss_rto; // back to slow start
             tcb.hystart_css = false;
+            tcb.hystart_round_end = 0;
+            tcb.hystart_round_min = 0;
             tcb.in_recovery = false;
             tcb.dup_ack_count = 0;
             tcb.recover_fs = 0;
@@ -3313,6 +3347,19 @@ pub fn probeICbrt(x: u64) u32 {
     return @intCast(lo);
 }
 
+/// HyStart round ends when cumulative ACK covers round_end (SK-129).
+pub fn probeHystartRoundDone(ack: u32, round_end: u32) bool {
+    if (round_end == 0) return false;
+    return !tcp_util.seqLt(ack, round_end);
+}
+
+/// Track the minimum RTT sample within a HyStart round (SK-129).
+pub fn probeHystartRoundMin(cur_min: u32, sample: u32) u32 {
+    if (sample == 0) return cur_min;
+    if (cur_min == 0 or sample < cur_min) return sample;
+    return cur_min;
+}
+
 /// HyStart++ delay thresh = clamp(min_rtt/8, 4, 16) ms (SK-125).
 pub fn probeHystartDelayThresh(min_rtt_ms: u32) u32 {
     if (min_rtt_ms == 0) return 0;
@@ -3467,6 +3514,8 @@ fn maybeRackTimerRepair(tcb: *TcpTcb, rto: u32) bool {
         tcb.bbr_cycle_ms = 0;
         noteCubicLoss(tcb, smss_fr);
         tcb.hystart_css = false;
+        tcb.hystart_round_end = 0;
+        tcb.hystart_round_min = 0;
         tcb.in_recovery = true;
         tcb.recover_seq = tcb.snd_nxt;
         tcb.ssthresh = probeCubicSsthresh(tcb.cwnd, smss_fr);
