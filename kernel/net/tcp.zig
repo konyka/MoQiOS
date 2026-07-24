@@ -200,6 +200,10 @@ const TcpTcb = struct {
     bbr_prior_cwnd: u32,
     /// min_rtt saved across ProbeRTT refresh (SK-122).
     bbr_prior_min_rtt_ms: u32,
+    /// ProbeBW 8-phase pacing-gain index (SK-123).
+    bbr_cycle_idx: u3,
+    /// When current ProbeBW phase started (SK-123).
+    bbr_cycle_ms: u32,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -330,6 +334,8 @@ pub fn initTcbs() void {
             .bbr_last_probe_rtt_ms = 0,
             .bbr_prior_cwnd = 0,
             .bbr_prior_min_rtt_ms = 0,
+            .bbr_cycle_idx = 0,
+            .bbr_cycle_ms = 0,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -403,6 +409,8 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].bbr_last_probe_rtt_ms = 0;
     tcbs[i].bbr_prior_cwnd = 0;
     tcbs[i].bbr_prior_min_rtt_ms = 0;
+    tcbs[i].bbr_cycle_idx = 0;
+    tcbs[i].bbr_cycle_ms = 0;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -987,6 +995,8 @@ fn applyBbrStartup(tcb: *TcpTcb, acked: u32, smss: u32) void {
     }
     if (probeBbrStartupDone(tcb.cwnd, target)) {
         tcb.bbr_startup = false;
+        tcb.bbr_cycle_idx = 0;
+        tcb.bbr_cycle_ms = 0;
         const bdp = probeBdpBytes(tcb.delivery_rate, tcb.min_rtt_ms);
         if (bdp > 0) {
             tcb.ssthresh = bdp;
@@ -995,17 +1005,41 @@ fn applyBbrStartup(tcb: *TcpTcb, acked: u32, smss: u32) void {
     }
 }
 
-/// BBR-lite ProbeBW: cruise cwnd near BDP (allow up to 1.25×) (SK-122).
+/// BBR-lite ProbeBW: 8-phase pacing-gain cycle around BDP (SK-122/123).
 fn applyBbrProbeBw(tcb: *TcpTcb, acked: u32) void {
     const bdp = probeBdpBytes(tcb.delivery_rate, tcb.min_rtt_ms);
     if (bdp == 0) return;
-    const hi = probeBbrProbeBwHi(bdp);
-    if (tcb.cwnd < bdp) {
+    advanceBbrCycle(tcb);
+    const gain = probeBbrCycleGainNum(tcb.bbr_cycle_idx);
+    const target = probeBbrCycleCwnd(bdp, gain);
+    if (target == 0) return;
+    if (tcb.cwnd < target) {
         const next = tcb.cwnd +% acked;
-        tcb.cwnd = if (next < bdp and next > tcb.cwnd) next else bdp;
-    } else if (tcb.cwnd > hi) {
-        tcb.cwnd = hi;
+        tcb.cwnd = if (next < target and next > tcb.cwnd) next else target;
+    } else if (tcb.cwnd > target) {
+        tcb.cwnd = target;
     }
+}
+
+fn advanceBbrCycle(tcb: *TcpTcb) void {
+    const now = timestampMs();
+    if (tcb.bbr_cycle_ms == 0) {
+        tcb.bbr_cycle_ms = now;
+        return;
+    }
+    const rtt = if (tcb.min_rtt_ms > 0) tcb.min_rtt_ms else tcb.srtt;
+    if (!probeBbrCycleAdvance(now -% tcb.bbr_cycle_ms, rtt)) return;
+    tcb.bbr_cycle_idx +%= 1;
+    tcb.bbr_cycle_ms = now;
+}
+
+fn bbrPacedRate(tcb: *const TcpTcb) u32 {
+    const rate = tcb.delivery_rate;
+    if (rate == 0) return 0;
+    if (tcb.bbr_startup or tcb.bbr_probe_rtt) return rate;
+    const gain = probeBbrCycleGainNum(tcb.bbr_cycle_idx);
+    const v = (@as(u64, rate) * gain) / 4;
+    return @intCast(@min(v, @as(u64, 0xffff_ffff)));
 }
 
 fn maybeEnterProbeRtt(tcb: *TcpTcb, smss: u32) void {
@@ -1035,6 +1069,9 @@ fn maybeExitProbeRtt(tcb: *TcpTcb) void {
     } else if (tcb.bbr_prior_cwnd > 0) {
         tcb.cwnd = tcb.bbr_prior_cwnd;
     }
+    // SK-123: restart ProbeBW cycle after ProbeRTT.
+    tcb.bbr_cycle_idx = 0;
+    tcb.bbr_cycle_ms = now;
 }
 
 fn applyPeerMss(tcb: *TcpTcb, opts: TcpOptions) void {
@@ -1544,6 +1581,8 @@ fn driveTcbStateMachine(
                             tcb.undo_ssthresh = tcb.ssthresh;
                             tcb.bbr_startup = false;
                             tcb.bbr_probe_rtt = false;
+                            tcb.bbr_cycle_idx = 0;
+                            tcb.bbr_cycle_ms = 0;
                             tcb.in_recovery = true;
                             tcb.recover_seq = tcb.snd_nxt;
                             tcb.ssthresh = @max(tcb.cwnd / 2, 2 * smss_fr);
@@ -1932,12 +1971,15 @@ fn flushSendBuffer(tcb: *TcpTcb) void {
 
         if (can_send == 0) break;
 
-        // SK-120: rate-based pacing (skip during recovery/F-RTO repair).
-        if (!tcb.in_recovery and tcb.frto == 0 and tcb.delivery_rate > 0) {
-            const interval = probePaceIntervalMs(mss, tcb.delivery_rate);
-            if (interval > 0 and tcb.last_pace_ms != 0) {
-                const now = timestampMs();
-                if (now -% tcb.last_pace_ms < interval) break;
+        // SK-120/123: rate-based pacing (gain-scaled in ProbeBW; skip recovery/F-RTO).
+        if (!tcb.in_recovery and tcb.frto == 0) {
+            const pace_rate = bbrPacedRate(tcb);
+            if (pace_rate > 0) {
+                const interval = probePaceIntervalMs(mss, pace_rate);
+                if (interval > 0 and tcb.last_pace_ms != 0) {
+                    const now = timestampMs();
+                    if (now -% tcb.last_pace_ms < interval) break;
+                }
             }
         }
 
@@ -2186,6 +2228,8 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             tcb.tlp_sent = false;
             tcb.bbr_startup = false;
             tcb.bbr_probe_rtt = false;
+            tcb.bbr_cycle_idx = 0;
+            tcb.bbr_cycle_ms = 0;
             // SK-116: enter F-RTO; keep undo until confirmed spurious or lossy.
             tcb.frto = 1;
             if (tcp_util.seqLt(tcb.snd_max, tcb.snd_nxt)) tcb.snd_max = tcb.snd_nxt;
@@ -2281,17 +2325,20 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
     // SK-122: ProbeRTT dwell can end on the timer path too.
     if (tcb.state == .established) maybeExitProbeRtt(tcb);
 
-    // SK-120: resume paced sends after the inter-packet interval elapses.
+    // SK-120/123: resume paced sends after the inter-packet interval elapses.
     if (tcb.state == .established and !tcb.in_recovery and tcb.frto == 0 and
-        tcb.delivery_rate > 0 and tcb.last_pace_ms != 0)
+        tcb.last_pace_ms != 0)
     {
-        const mss = mssForTcb(tcb);
-        const interval = probePaceIntervalMs(mss, tcb.delivery_rate);
-        if (interval > 0) {
-            const now = timestampMs();
-            if (now -% tcb.last_pace_ms >= interval) {
-                const pending = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
-                if (pending > 0) flushSendBuffer(tcb);
+        const pace_rate = bbrPacedRate(tcb);
+        if (pace_rate > 0) {
+            const mss = mssForTcb(tcb);
+            const interval = probePaceIntervalMs(mss, pace_rate);
+            if (interval > 0) {
+                const now = timestampMs();
+                if (now -% tcb.last_pace_ms >= interval) {
+                    const pending = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
+                    if (pending > 0) flushSendBuffer(tcb);
+                }
             }
         }
     }
@@ -3032,12 +3079,28 @@ pub fn probeBbrStartupDone(cwnd: u32, startup_cwnd: u32) bool {
     return startup_cwnd > 0 and cwnd >= startup_cwnd;
 }
 
-/// ProbeBW upper cruise bound = BDP + BDP/4 (SK-122).
+/// ProbeBW upper cruise bound = BDP + BDP/4 (SK-122; gain=5/4 phase).
 pub fn probeBbrProbeBwHi(bdp: u32) u32 {
-    if (bdp == 0) return 0;
-    const extra = bdp / 4;
-    const sum = bdp +% extra;
-    return if (sum < bdp) 0xffff_ffff else sum;
+    return probeBbrCycleCwnd(bdp, 5);
+}
+
+/// ProbeBW pacing-gain numerator over 4: [5,3,4,4,4,4,4,4] (SK-123).
+pub fn probeBbrCycleGainNum(idx: u3) u32 {
+    const gains = [_]u32{ 5, 3, 4, 4, 4, 4, 4, 4 };
+    return gains[idx];
+}
+
+/// cwnd = BDP · gain_num / 4 (SK-123).
+pub fn probeBbrCycleCwnd(bdp: u32, gain_num: u32) u32 {
+    if (bdp == 0 or gain_num == 0) return 0;
+    const v = (@as(u64, bdp) * gain_num) / 4;
+    return @intCast(@min(v, @as(u64, 0xffff_ffff)));
+}
+
+/// Advance ProbeBW phase after one min_rtt dwell (SK-123).
+pub fn probeBbrCycleAdvance(elapsed_ms: u32, min_rtt_ms: u32) bool {
+    if (min_rtt_ms == 0) return false;
+    return elapsed_ms >= min_rtt_ms;
 }
 
 /// ProbeRTT cwnd floor = 4·SMSS (SK-122).

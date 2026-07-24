@@ -1861,7 +1861,19 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:稳态吞吐贴合带宽,并周期性校准时延估计。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-122] tcp bbr-lite probebw/rtt non-x86: OK`。
-- **后续**:BBR pacing gain 八相循环;或完整 RACK per-segment 时间戳。
+- **后续**:见 3.123（ProbeBW 八相 gain,已完成)。
+
+---
+
+### 3.123 BBR ProbeBW 八相 pacing gain（SK-123,2026-07-24）
+
+- **背景**:ProbeBW 固定在 ≤1.25·BDP 巡航,缺少抬升探测与排空相,队列易堆积。
+- **方案**:按 min_rtt 推进 8 相 gain `[5/4,3/4,1×6]`;cwnd 与 pacing rate 同步乘
+  gain。ProbeRTT/丢包后重置相位。`shared/sk123.zig` 锁定 gain 表与推进。
+- **效果**:周期性探测更高带宽并排空队列,稳态更接近 BBR ProbeBW。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-123] tcp bbr cycle gains non-x86: OK`。
+- **后续**:完整 RACK per-segment 时间戳;或 CUBIC 作为 Reno CA 备选。
 
 ---
 
