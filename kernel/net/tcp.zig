@@ -60,6 +60,9 @@ const TCP_RTO_MAX: u32 = 60000; // maximum RTO (ms)
 /// RFC 6675 DupThresh for SACK loss detection (SK-112).
 const DUP_THRESH: u32 = 3;
 const DELAYED_ACK_MS: u32 = 100; // delay ACK by 100ms (reduces ACK count ~50%)
+/// BBR-lite ProbeRTT interval / dwell (SK-122).
+const BBR_PROBE_RTT_INTERVAL_MS: u32 = 10_000;
+const BBR_PROBE_RTT_DURATION_MS: u32 = 200;
 
 /// Write `count` bytes from `src` into a ring buffer at `write_pos`.
 /// Uses @memcpy for contiguous chunks (handles wraparound at buffer boundary).
@@ -187,6 +190,16 @@ const TcpTcb = struct {
     last_pace_ms: u32,
     /// BBR-lite Startup active until cwnd reaches 2·BDP (SK-121).
     bbr_startup: bool,
+    /// BBR-lite ProbeRTT active (SK-122).
+    bbr_probe_rtt: bool,
+    /// When current ProbeRTT started (SK-122).
+    bbr_probe_rtt_start_ms: u32,
+    /// When last ProbeRTT ended (SK-122).
+    bbr_last_probe_rtt_ms: u32,
+    /// cwnd saved across ProbeRTT (SK-122).
+    bbr_prior_cwnd: u32,
+    /// min_rtt saved across ProbeRTT refresh (SK-122).
+    bbr_prior_min_rtt_ms: u32,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -312,6 +325,11 @@ pub fn initTcbs() void {
             .min_rtt_ms = 0,
             .last_pace_ms = 0,
             .bbr_startup = true,
+            .bbr_probe_rtt = false,
+            .bbr_probe_rtt_start_ms = 0,
+            .bbr_last_probe_rtt_ms = 0,
+            .bbr_prior_cwnd = 0,
+            .bbr_prior_min_rtt_ms = 0,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -380,6 +398,11 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].min_rtt_ms = 0;
     tcbs[i].last_pace_ms = 0;
     tcbs[i].bbr_startup = true;
+    tcbs[i].bbr_probe_rtt = false;
+    tcbs[i].bbr_probe_rtt_start_ms = 0;
+    tcbs[i].bbr_last_probe_rtt_ms = 0;
+    tcbs[i].bbr_prior_cwnd = 0;
+    tcbs[i].bbr_prior_min_rtt_ms = 0;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -972,6 +995,48 @@ fn applyBbrStartup(tcb: *TcpTcb, acked: u32, smss: u32) void {
     }
 }
 
+/// BBR-lite ProbeBW: cruise cwnd near BDP (allow up to 1.25×) (SK-122).
+fn applyBbrProbeBw(tcb: *TcpTcb, acked: u32) void {
+    const bdp = probeBdpBytes(tcb.delivery_rate, tcb.min_rtt_ms);
+    if (bdp == 0) return;
+    const hi = probeBbrProbeBwHi(bdp);
+    if (tcb.cwnd < bdp) {
+        const next = tcb.cwnd +% acked;
+        tcb.cwnd = if (next < bdp and next > tcb.cwnd) next else bdp;
+    } else if (tcb.cwnd > hi) {
+        tcb.cwnd = hi;
+    }
+}
+
+fn maybeEnterProbeRtt(tcb: *TcpTcb, smss: u32) void {
+    if (tcb.bbr_startup or tcb.bbr_probe_rtt or tcb.in_recovery) return;
+    if (tcb.delivery_rate == 0 or tcb.min_rtt_ms == 0) return;
+    const now = timestampMs();
+    if (!probeBbrProbeRttDue(tcb.bbr_last_probe_rtt_ms, now, BBR_PROBE_RTT_INTERVAL_MS)) return;
+    tcb.bbr_probe_rtt = true;
+    tcb.bbr_probe_rtt_start_ms = now;
+    tcb.bbr_prior_cwnd = tcb.cwnd;
+    tcb.bbr_prior_min_rtt_ms = tcb.min_rtt_ms;
+    tcb.min_rtt_ms = 0;
+    tcb.cwnd = probeBbrProbeRttCwnd(smss);
+}
+
+fn maybeExitProbeRtt(tcb: *TcpTcb) void {
+    if (!tcb.bbr_probe_rtt) return;
+    const now = timestampMs();
+    if (!probeBbrProbeRttDone(tcb.bbr_probe_rtt_start_ms, now, BBR_PROBE_RTT_DURATION_MS)) return;
+    tcb.bbr_probe_rtt = false;
+    tcb.bbr_last_probe_rtt_ms = now;
+    if (tcb.min_rtt_ms == 0) tcb.min_rtt_ms = tcb.bbr_prior_min_rtt_ms;
+    const bdp = probeBdpBytes(tcb.delivery_rate, tcb.min_rtt_ms);
+    if (bdp > 0) {
+        tcb.cwnd = bdp;
+        tcb.ssthresh = bdp;
+    } else if (tcb.bbr_prior_cwnd > 0) {
+        tcb.cwnd = tcb.bbr_prior_cwnd;
+    }
+}
+
 fn applyPeerMss(tcb: *TcpTcb, opts: TcpOptions) void {
     if (opts.mss) |m| {
         // Ignore zero/nonsense; keep prior if already set.
@@ -1406,19 +1471,28 @@ fn driveTcbStateMachine(
                                 flushSendBuffer(tcb);
                             }
                         } else {
-                            // Normal: increase cwnd
-                            if (tcb.cwnd < tcb.ssthresh) {
-                                // Slow start: exponential growth
+                            // SK-122: finish ProbeRTT before growing again.
+                            maybeExitProbeRtt(tcb);
+                            if (tcb.bbr_probe_rtt) {
+                                // Hold the small ProbeRTT window; RTT samples refresh min_rtt.
+                            } else if (tcb.bbr_startup) {
+                                // Classic SS step, then SK-121 Startup toward 2·BDP.
+                                if (tcb.cwnd < tcb.ssthresh) {
+                                    tcb.cwnd += @intCast(acked);
+                                } else {
+                                    const inc = (smss * smss) / @max(tcb.cwnd, 1);
+                                    tcb.cwnd += inc;
+                                }
+                                applyBbrStartup(tcb, acked, smss);
+                            } else if (tcb.delivery_rate > 0 and tcb.min_rtt_ms > 0) {
+                                // SK-122: ProbeBW cruise near BDP.
+                                applyBbrProbeBw(tcb, acked);
+                                maybeEnterProbeRtt(tcb, smss);
+                            } else if (tcb.cwnd < tcb.ssthresh) {
                                 tcb.cwnd += @intCast(acked);
                             } else {
-                                // Congestion avoidance: additive increase
-                                // cwnd += SMSS * SMSS / cwnd per ACK
                                 const inc = (smss * smss) / @max(tcb.cwnd, 1);
                                 tcb.cwnd += inc;
-                            }
-                            // SK-121: BBR-lite Startup toward 2·BDP, then Drain to BDP.
-                            if (tcb.bbr_startup) {
-                                applyBbrStartup(tcb, acked, smss);
                             }
                             tcb.dup_ack_count = 0;
                         }
@@ -1469,6 +1543,7 @@ fn driveTcbStateMachine(
                             tcb.undo_cwnd = tcb.cwnd;
                             tcb.undo_ssthresh = tcb.ssthresh;
                             tcb.bbr_startup = false;
+                            tcb.bbr_probe_rtt = false;
                             tcb.in_recovery = true;
                             tcb.recover_seq = tcb.snd_nxt;
                             tcb.ssthresh = @max(tcb.cwnd / 2, 2 * smss_fr);
@@ -2110,6 +2185,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             tcb.prr_out = 0;
             tcb.tlp_sent = false;
             tcb.bbr_startup = false;
+            tcb.bbr_probe_rtt = false;
             // SK-116: enter F-RTO; keep undo until confirmed spurious or lossy.
             tcb.frto = 1;
             if (tcp_util.seqLt(tcb.snd_max, tcb.snd_nxt)) tcb.snd_max = tcb.snd_nxt;
@@ -2201,6 +2277,9 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
         tcb.nagle_pending = false;
         flushSendBuffer(tcb);
     }
+
+    // SK-122: ProbeRTT dwell can end on the timer path too.
+    if (tcb.state == .established) maybeExitProbeRtt(tcb);
 
     // SK-120: resume paced sends after the inter-packet interval elapses.
     if (tcb.state == .established and !tcb.in_recovery and tcb.frto == 0 and
@@ -2951,6 +3030,32 @@ pub fn probeBbrStartupCwnd(rate_bps: u32, min_rtt_ms: u32) u32 {
 /// True when Startup has filled the 2·BDP target (SK-121).
 pub fn probeBbrStartupDone(cwnd: u32, startup_cwnd: u32) bool {
     return startup_cwnd > 0 and cwnd >= startup_cwnd;
+}
+
+/// ProbeBW upper cruise bound = BDP + BDP/4 (SK-122).
+pub fn probeBbrProbeBwHi(bdp: u32) u32 {
+    if (bdp == 0) return 0;
+    const extra = bdp / 4;
+    const sum = bdp +% extra;
+    return if (sum < bdp) 0xffff_ffff else sum;
+}
+
+/// ProbeRTT cwnd floor = 4·SMSS (SK-122).
+pub fn probeBbrProbeRttCwnd(smss: u32) u32 {
+    if (smss == 0) return 0;
+    if (smss > 0x3fff_ffff) return 0xffff_ffff;
+    return smss * 4;
+}
+
+pub fn probeBbrProbeRttDue(last_end_ms: u32, now_ms: u32, interval_ms: u32) bool {
+    if (interval_ms == 0) return false;
+    if (last_end_ms == 0) return true;
+    return now_ms -% last_end_ms >= interval_ms;
+}
+
+pub fn probeBbrProbeRttDone(start_ms: u32, now_ms: u32, duration_ms: u32) bool {
+    if (duration_ms == 0) return true;
+    return now_ms -% start_ms >= duration_ms;
 }
 
 /// RFC 8985-inspired reordering window: max(SRTT/4, 1ms) (SK-118).

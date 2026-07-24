@@ -1848,7 +1848,20 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:高带宽路径更快探测满管,随后收敛到测得 BDP。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-121] tcp bbr-lite startup non-x86: OK`。
-- **后续**:BBR ProbeBW/ProbeRTT;或完整 RACK per-segment 时间戳。
+- **后续**:见 3.122（ProbeBW/ProbeRTT,已完成)。
+
+---
+
+### 3.122 BBR-lite ProbeBW / ProbeRTT（SK-122,2026-07-24）
+
+- **背景**:Startup 之后仍走 Reno CA,窗口偏离测得 BDP;min_rtt 也可能陈旧。
+- **方案**:ProbeBW 将 cwnd 巡航在 `[BDP, 1.25·BDP]`;每 10s 进入 ProbeRTT
+  ~200ms(`cwnd=4·SMSS`)刷新 min_rtt,结束后回到 BDP。
+  `shared/sk122.zig` 锁定上限/间隔/时长。
+- **效果**:稳态吞吐贴合带宽,并周期性校准时延估计。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-122] tcp bbr-lite probebw/rtt non-x86: OK`。
+- **后续**:BBR pacing gain 八相循环;或完整 RACK per-segment 时间戳。
 
 ---
 
