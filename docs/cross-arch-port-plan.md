@@ -1995,7 +1995,19 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:ECN 后发送更平滑,恢复期也能吸收 CE 信号。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-133] tcp ecn prr couple non-x86: OK`。
-- **后续**:AccECN;或 Accurate ECN ACE 计数器。
+- **后续**:见 3.134（ACE 计数器,已完成)。
+
+---
+
+### 3.134 Accurate ECN ACE 计数器（SK-134,2026-07-24）
+
+- **背景**:经典 ECE 为粘滞位,一轮窗口内多次 CE 被折叠成一次信号。
+- **方案**:收 CE 时递增 3-bit `ace_ce_count` 并写入 TCP 头 byte12 低 3 位;对端 ACE
+  前进(mod 8)时与 ECE 一样触发减窗。`shared/sk134.zig` 锁定编解码与 delta。
+- **效果**:同窗口多次拥塞可被计数反馈,反应更细。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-134] tcp ace counters non-x86: OK`。
+- **后续**:完整 AccECN SYN 协商(AE);或 ACE 与每 RTT 反馈限速。
 
 ---
 

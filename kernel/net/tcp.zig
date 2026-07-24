@@ -255,6 +255,10 @@ const TcpTcb = struct {
     ecn_undo: bool,
     /// PRR drain after an ECN cut while pipe > cwnd (SK-133).
     ecn_prr: bool,
+    /// CE marks seen as receiver; echoed in ACE (SK-134).
+    ace_ce_count: u3,
+    /// Last ACE value received from peer (SK-134).
+    ace_peer: u3,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -406,6 +410,8 @@ pub fn initTcbs() void {
             .ecn_reduced = false,
             .ecn_undo = false,
             .ecn_prr = false,
+            .ace_ce_count = 0,
+            .ace_peer = 0,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -500,6 +506,8 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].ecn_reduced = false;
     tcbs[i].ecn_undo = false;
     tcbs[i].ecn_prr = false;
+    tcbs[i].ace_ce_count = 0;
+    tcbs[i].ace_peer = 0;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -723,7 +731,9 @@ fn fillTcpSegment(
     bo.writeU16BeAt(pkt, tcp_off + 2, tcb.remote_port);
     bo.writeU32BeAt(pkt, tcp_off + 4, seq);
     bo.writeU32BeAt(pkt, tcp_off + 8, ack);
-    pkt[tcp_off + 12] = data_offset_val << 4;
+    // SK-134: low 3 bits of byte 12 carry Accurate ECN ACE when negotiated.
+    const ace_bits: u8 = if (tcb.ecn_ok) @as(u8, tcb.ace_ce_count) else 0;
+    pkt[tcp_off + 12] = (data_offset_val << 4) | (ace_bits & 0x7);
     pkt[tcp_off + 13] = flags;
     bo.writeU16BeAt(pkt, tcp_off + 14, raw_window);
     pkt[tcp_off + 16] = 0;
@@ -1177,11 +1187,20 @@ fn applyEcnDuringRecovery(tcb: *TcpTcb) void {
     tcb.ecn_reduced = true;
 }
 
-/// Apply IP-CE / ECE / CWR side effects (SK-131/133).
-fn noteEcnRx(tcb: *TcpTcb, flags: u8, ecn_ce: bool) void {
-    if (ecn_ce and tcb.ecn_ok) tcb.ecn_ece_pending = true;
+/// Apply IP-CE / ECE / CWR / ACE side effects (SK-131/133/134).
+fn noteEcnRx(tcb: *TcpTcb, flags: u8, ecn_ce: bool, ace: u3) void {
+    if (!tcb.ecn_ok) return;
+    if (ecn_ce) {
+        tcb.ecn_ece_pending = true;
+        tcb.ace_ce_count +%= 1;
+    }
     if ((flags & CWR) != 0) tcb.ecn_ece_pending = false;
-    if ((flags & ECE) == 0 or !tcb.ecn_ok) return;
+
+    const delta = probeAceDelta(tcb.ace_peer, ace);
+    tcb.ace_peer = ace;
+    const ece = (flags & ECE) != 0;
+    const signal = ece or probeAceShouldReact(delta, tcb.ecn_reduced);
+    if (!signal) return;
     if (probeEcnReact(true, tcb.ecn_reduced, tcb.in_recovery)) {
         applyEcnCongestion(tcb);
     } else if (probeEcnReactRecovery(true, tcb.ecn_reduced, tcb.in_recovery)) {
@@ -1625,8 +1644,9 @@ fn driveTcbStateMachine(
     // Any matched segment counts as activity (keepalive idle reset).
     tcb.idle_ms = 0;
 
-    // SK-131: CE / ECE / CWR reaction before further state work.
-    noteEcnRx(tcb, flags, ecn_ce);
+    // SK-131/134: CE / ECE / CWR / ACE reaction before further state work.
+    const ace: u3 = @truncate(data[12] & 0x7);
+    noteEcnRx(tcb, flags, ecn_ce, ace);
 
     // Update ts_recent for PAWS
     if (opts.ts_val) |tv| {
@@ -3575,6 +3595,26 @@ pub fn probeEcnPrrDone(pipe: u32, ssthresh: u32) bool {
 /// ssthresh after ECE in recovery = CUBIC β · max(cwnd, ssthresh) (SK-133).
 pub fn probeEcnRecoverySsthresh(cwnd: u32, ssthresh: u32, smss: u32) u32 {
     return probeCubicSsthresh(@max(cwnd, ssthresh), smss);
+}
+
+/// ACE wrapping delta (mod 8) between previous and current peer ACE (SK-134).
+pub fn probeAceDelta(prev: u3, now: u3) u3 {
+    return now -% prev;
+}
+
+/// React when ACE advanced and this window is not yet reduced (SK-134).
+pub fn probeAceShouldReact(delta: u3, already_reduced: bool) bool {
+    return delta > 0 and !already_reduced;
+}
+
+/// Encode ACE into the low 3 bits beside data-offset (SK-134).
+pub fn probeAceEncode(data_offset_words: u8, ace: u3) u8 {
+    return (data_offset_words << 4) | @as(u8, ace);
+}
+
+/// Decode ACE from TCP header byte 12 (SK-134).
+pub fn probeAceDecode(hdr_byte12: u8) u3 {
+    return @truncate(hdr_byte12 & 0x7);
 }
 
 /// HyStart round ends when cumulative ACK covers round_end (SK-129).
