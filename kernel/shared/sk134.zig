@@ -1,7 +1,7 @@
 //! SK-134 — Accurate ECN ACE counters (non-x86).
 //!
-//! Alongside classic ECE, echo a 3-bit ACE CE counter in TCP header byte 12
-//! and react when the peer's ACE advances (mod 8).
+//! Track a 3-bit ACE CE counter and react when the peer's ACE advances (mod 8).
+//! Wire encoding of ACE is AE|CWR|ECE (SK-140); byte12 carries the AE bit.
 
 const builtin = @import("builtin");
 const arch = @import("../arch/arch.zig");
@@ -34,11 +34,12 @@ pub fn announce() void {
         fail("react");
         return;
     }
-    if (tcp.probeAceEncode(5, 3) != 0x53) {
+    // ace=5 (101b) → AE set in byte12; ace=3 (011b) → AE clear.
+    if (tcp.probeAceEncode(5, 5) != 0x51 or tcp.probeAceEncode(5, 3) != 0x50) {
         fail("encode");
         return;
     }
-    if (tcp.probeAceDecode(0x53) != 3 or tcp.probeAceDecode(0x50) != 0) {
+    if (tcp.probeAceDecode(0x51) != 4 or tcp.probeAceDecode(0x50) != 0) {
         fail("decode");
         return;
     }

@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-24 (SK-139 AccECN AE negotiate + prior SK-138 reviewed and verified)
+> Last update: 2026-07-24 (SK-140 ACE in AE|CWR|ECE + prior SK-139 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -471,6 +471,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | ECN cut left BBR probing | Post-ACE ProbeBW could climb with 5/4 gain on stale rate. | SK-137: jump to drain phase + discount delivery_rate by ACE cuts. |
 | CUBIC raced to pre-ACE peak | After ACE β^n cut, W_max stayed at pre-cut cwnd. | SK-138: ACE sets W_max to scaled ssthresh; ECE-only keeps classic. |
 | ACE without AccECN negotiate | ACE ran whenever classic `ecn_ok` was set. | SK-139: AE on SYN-ACK → `accecn_ok`; ACE gated on AccECN. |
+| ACE in byte12 reserved bits | Non-standard ACE placement conflicted with AccECN flags. | SK-140: ACE packed into AE\|CWR\|ECE; classic sticky ECE unchanged. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -480,8 +481,8 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-139] tcp accecn ae negotiate non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-139] tcp accecn ae negotiate non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-140] tcp ace ae|cwr|ece non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-140] tcp ace ae|cwr|ece non-x86: OK`. |
 
 ### 5.3 Historical Verification
 

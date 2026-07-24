@@ -2073,7 +2073,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:AccECN 与经典 ECN 可区分;ACE 计数仅在双方同意后上线。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-139] tcp accecn ae negotiate non-x86: OK`。
-- **后续**:将 ACE 从 byte12 低 3 位迁到 AE|CWR|ECE 三比特反馈字段。
+- **后续**:见 3.140（ACE→AE|CWR|ECE,已完成)。
+
+---
+
+### 3.140 ACE 迁入 AE|CWR|ECE 反馈字段（SK-140,2026-07-24）
+
+- **背景**:SK-134 把 ACE 放在 byte12 低 3 位,与 AccECN 规范的 AE|CWR|ECE
+  编码不一致,且会与经典粘滞 ECE/CWR 语义冲突。
+- **方案**:`probeAcePackAe`/`PackFlags`/`Unpack` 将 ACE 编入 AE+CWR+ECE;
+  AccECN 路径不再使用粘滞 ECE,也不把 ACE 的 CWR 当作经典 CWR 提交。
+  `shared/sk140.zig` 锁定编解码往返。
+- **效果**:AccECN 反馈与对端/规范对齐;经典 ECN 路径不变。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-140] tcp ace ae|cwr|ece non-x86: OK`。
+- **后续**:AccECN 初始 ACE/握手后计数同步;或 CE 计数与 ECT(1)/L4S 路径。
 
 ---
 

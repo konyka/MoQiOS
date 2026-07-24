@@ -743,12 +743,12 @@ fn fillTcpSegment(
     bo.writeU16BeAt(pkt, tcp_off + 2, tcb.remote_port);
     bo.writeU32BeAt(pkt, tcp_off + 4, seq);
     bo.writeU32BeAt(pkt, tcp_off + 8, ack);
-    // SK-139: SYN/SYN-ACK carry AE; data path carries ACE (SK-134) only if AccECN.
+    // SK-139/140: SYN carries AE; AccECN data path AE is ACE bit2 (with CWR|ECE in flags).
     const byte12_lo: u8 = blk: {
         if ((flags & SYN) != 0) {
             break :blk if (tcb.accecn_ok) AE else 0;
         }
-        break :blk if (tcb.accecn_ok) @as(u8, tcb.ace_ce_count) & 0x7 else 0;
+        break :blk if (tcb.accecn_ok) probeAcePackAe(tcb.ace_ce_count) else 0;
     };
     pkt[tcp_off + 12] = (data_offset_val << 4) | byte12_lo;
     pkt[tcp_off + 13] = flags;
@@ -837,16 +837,23 @@ pub fn probeIpv6RenoMinSsthresh(dst: [16]u8) u32 {
     return 2 * @as(u32, probeIpv6Mss(dst));
 }
 
-/// OR ECE/CWR onto outbound flags when ECN is negotiated (SK-131).
+/// OR ECE/CWR onto outbound flags when ECN is negotiated (SK-131/140).
 fn decorateEcnFlags(tcb: *TcpTcb, flags: u8, data_len: u16) u8 {
     var out = flags;
     if (!tcb.ecn_ok) return out;
+    // SK-140: AccECN encodes ACE in AE|CWR|ECE (not sticky classic ECE/CWR).
+    if (tcb.accecn_ok) {
+        if ((out & SYN) != 0) return out;
+        return probeAcePackFlags(tcb.ace_ce_count, out);
+    }
     if (tcb.ecn_ece_pending and (out & ACK) != 0) out |= ECE;
     if (tcb.ecn_cwr_pending and data_len > 0) out |= CWR;
     return out;
 }
 
 fn noteEcnCwrSent(tcb: *TcpTcb, flags: u8) void {
+    // SK-140: under AccECN, CWR is an ACE bit — not a classic CWR commit.
+    if (tcb.accecn_ok) return;
     if ((flags & CWR) != 0) {
         tcb.ecn_cwr_pending = false;
         tcb.ecn_reduced = false;
@@ -1217,22 +1224,24 @@ fn noteAceBbrCoupling(tcb: *TcpTcb, ace_delta: u3) void {
     tcb.delivery_rate = probeAceRateDiscount(tcb.delivery_rate, ace_delta);
 }
 
-/// Apply IP-CE / ECE / CWR / ACE side effects (SK-131/133/134/135).
+/// Apply IP-CE / ECE / CWR / ACE side effects (SK-131/133/134/135/140).
 fn noteEcnRx(tcb: *TcpTcb, flags: u8, ecn_ce: bool, ace: u3) void {
     if (!tcb.ecn_ok) return;
     if (ecn_ce) {
-        tcb.ecn_ece_pending = true;
         tcb.ace_ce_count +%= 1;
+        // Classic sticky ECE only when AccECN is not in use (SK-140).
+        if (!tcb.accecn_ok) tcb.ecn_ece_pending = true;
     }
-    if ((flags & CWR) != 0) tcb.ecn_ece_pending = false;
+    if (!tcb.accecn_ok and (flags & CWR) != 0) tcb.ecn_ece_pending = false;
 
     const delta = probeAceDelta(tcb.ace_peer, ace);
     tcb.ace_peer = ace;
-    const ece = (flags & ECE) != 0;
+    // Under AccECN, ECE is ACE bit0 — not a classic congestion signal (SK-140).
+    const ece = !tcb.accecn_ok and (flags & ECE) != 0;
     const now = timestampMs();
     const rtt_lim = probeAceRttLimit(tcb.srtt, tcb.min_rtt_ms);
     const rtt_ready = probeAceRttReady(tcb.ace_last_react_ms, now, rtt_lim);
-    const ace_signal = probeAceShouldReact(delta, tcb.ecn_reduced, rtt_ready);
+    const ace_signal = tcb.accecn_ok and probeAceShouldReact(delta, tcb.ecn_reduced, rtt_ready);
 
     // Sticky ECE stays once-per-window; ACE may re-cut after ≥1 RTT (SK-135).
     if (tcb.ecn_reduced) {
@@ -1708,8 +1717,8 @@ fn driveTcbStateMachine(
     // Any matched segment counts as activity (keepalive idle reset).
     tcb.idle_ms = 0;
 
-    // SK-131/134/139: CE / ECE / CWR / ACE (ACE only after AccECN).
-    const ace: u3 = if (tcb.accecn_ok) @truncate(data[12] & 0x7) else 0;
+    // SK-131/139/140: ACE from AE|CWR|ECE after AccECN; else classic ECE only.
+    const ace: u3 = if (tcb.accecn_ok) probeAceUnpack(data[12], flags) else 0;
     noteEcnRx(tcb, flags, ecn_ce, ace);
 
     // Update ts_recent for PAWS
@@ -3743,14 +3752,36 @@ pub fn probeAceRttReady(last_react_ms: u32, now_ms: u32, rtt_ms: u32) bool {
     return now_ms -% last_react_ms >= rtt_ms;
 }
 
-/// Encode ACE into the low 3 bits beside data-offset (SK-134).
-pub fn probeAceEncode(data_offset_words: u8, ace: u3) u8 {
-    return (data_offset_words << 4) | @as(u8, ace);
+/// ACE bit2 → AE in byte12 (SK-140).
+pub fn probeAcePackAe(ace: u3) u8 {
+    return if ((ace & 4) != 0) AE else 0;
 }
 
-/// Decode ACE from TCP header byte 12 (SK-134).
+/// ACE bits1..0 → CWR|ECE in flags (clear those bits first) (SK-140).
+pub fn probeAcePackFlags(ace: u3, base_flags: u8) u8 {
+    var out = base_flags & ~@as(u8, ECE | CWR);
+    if ((ace & 1) != 0) out |= ECE;
+    if ((ace & 2) != 0) out |= CWR;
+    return out;
+}
+
+/// Unpack ACE from AE (byte12 bit0) + CWR + ECE (SK-140).
+pub fn probeAceUnpack(byte12: u8, flags: u8) u3 {
+    var ace: u3 = 0;
+    if ((byte12 & AE) != 0) ace |= 4;
+    if ((flags & CWR) != 0) ace |= 2;
+    if ((flags & ECE) != 0) ace |= 1;
+    return ace;
+}
+
+/// Encode data-offset with ACE's AE bit (SK-134/140).
+pub fn probeAceEncode(data_offset_words: u8, ace: u3) u8 {
+    return (data_offset_words << 4) | probeAcePackAe(ace);
+}
+
+/// AE contribution of ACE from byte12 (0 or 4) (SK-134/140).
 pub fn probeAceDecode(hdr_byte12: u8) u3 {
-    return @truncate(hdr_byte12 & 0x7);
+    return if ((hdr_byte12 & AE) != 0) 4 else 0;
 }
 
 /// HyStart round ends when cumulative ACK covers round_end (SK-129).
