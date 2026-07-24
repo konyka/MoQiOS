@@ -28,8 +28,8 @@ pub fn announce() void {
         fail("wrap");
         return;
     }
-    if (!tcp.probeAceShouldReact(1, false) or tcp.probeAceShouldReact(0, false) or
-        tcp.probeAceShouldReact(2, true))
+    if (!tcp.probeAceShouldReact(1, false, false) or tcp.probeAceShouldReact(0, false, false) or
+        tcp.probeAceShouldReact(2, true, false))
     {
         fail("react");
         return;

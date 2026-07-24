@@ -72,6 +72,8 @@ const HYSTART_MAX_THRESH_MS: u32 = 16;
 /// HyStart++ ACK-train gap clamp (SK-130).
 const HYSTART_ACK_GAP_MIN_MS: u32 = 2;
 const HYSTART_ACK_GAP_MAX_MS: u32 = 16;
+/// Floor for ACE re-cut spacing when SRTT/min_rtt unknown (SK-135).
+const ACE_RTT_FLOOR_MS: u32 = 10;
 /// RACK per-segment TX timestamp slots (SK-126).
 const RACK_TX_MAX: usize = 8;
 
@@ -259,6 +261,8 @@ const TcpTcb = struct {
     ace_ce_count: u3,
     /// Last ACE value received from peer (SK-134).
     ace_peer: u3,
+    /// Timestamp of last ACE/ECE window cut (SK-135).
+    ace_last_react_ms: u32,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -412,6 +416,7 @@ pub fn initTcbs() void {
             .ecn_prr = false,
             .ace_ce_count = 0,
             .ace_peer = 0,
+            .ace_last_react_ms = 0,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -508,6 +513,7 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].ecn_prr = false;
     tcbs[i].ace_ce_count = 0;
     tcbs[i].ace_peer = 0;
+    tcbs[i].ace_last_react_ms = 0;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -1187,7 +1193,7 @@ fn applyEcnDuringRecovery(tcb: *TcpTcb) void {
     tcb.ecn_reduced = true;
 }
 
-/// Apply IP-CE / ECE / CWR / ACE side effects (SK-131/133/134).
+/// Apply IP-CE / ECE / CWR / ACE side effects (SK-131/133/134/135).
 fn noteEcnRx(tcb: *TcpTcb, flags: u8, ecn_ce: bool, ace: u3) void {
     if (!tcb.ecn_ok) return;
     if (ecn_ce) {
@@ -1199,12 +1205,31 @@ fn noteEcnRx(tcb: *TcpTcb, flags: u8, ecn_ce: bool, ace: u3) void {
     const delta = probeAceDelta(tcb.ace_peer, ace);
     tcb.ace_peer = ace;
     const ece = (flags & ECE) != 0;
-    const signal = ece or probeAceShouldReact(delta, tcb.ecn_reduced);
+    const now = timestampMs();
+    const rtt_lim = probeAceRttLimit(tcb.srtt, tcb.min_rtt_ms);
+    const rtt_ready = probeAceRttReady(tcb.ace_last_react_ms, now, rtt_lim);
+    const ace_signal = probeAceShouldReact(delta, tcb.ecn_reduced, rtt_ready);
+
+    // Sticky ECE stays once-per-window; ACE may re-cut after ≥1 RTT (SK-135).
+    if (tcb.ecn_reduced) {
+        if (!ace_signal) return;
+        if (tcb.in_recovery) {
+            applyEcnDuringRecovery(tcb);
+        } else {
+            applyEcnCongestion(tcb);
+        }
+        tcb.ace_last_react_ms = now;
+        return;
+    }
+
+    const signal = ece or ace_signal;
     if (!signal) return;
-    if (probeEcnReact(true, tcb.ecn_reduced, tcb.in_recovery)) {
+    if (probeEcnReact(true, false, tcb.in_recovery)) {
         applyEcnCongestion(tcb);
-    } else if (probeEcnReactRecovery(true, tcb.ecn_reduced, tcb.in_recovery)) {
+        tcb.ace_last_react_ms = now;
+    } else if (probeEcnReactRecovery(true, false, tcb.in_recovery)) {
         applyEcnDuringRecovery(tcb);
+        tcb.ace_last_react_ms = now;
     }
 }
 
@@ -3602,9 +3627,24 @@ pub fn probeAceDelta(prev: u3, now: u3) u3 {
     return now -% prev;
 }
 
-/// React when ACE advanced and this window is not yet reduced (SK-134).
-pub fn probeAceShouldReact(delta: u3, already_reduced: bool) bool {
-    return delta > 0 and !already_reduced;
+/// React when ACE advanced: first cut, or another after ≥1 RTT (SK-134/135).
+pub fn probeAceShouldReact(delta: u3, already_reduced: bool, rtt_ready: bool) bool {
+    if (delta == 0) return false;
+    if (!already_reduced) return true;
+    return rtt_ready;
+}
+
+/// ACE re-cut spacing uses SRTT, else min_rtt, else a tick floor (SK-135).
+pub fn probeAceRttLimit(srtt: u32, min_rtt: u32) u32 {
+    if (srtt > 0) return srtt;
+    if (min_rtt > 0) return min_rtt;
+    return ACE_RTT_FLOOR_MS;
+}
+
+/// True when never cut, or at least `rtt_ms` elapsed since last cut (SK-135).
+pub fn probeAceRttReady(last_react_ms: u32, now_ms: u32, rtt_ms: u32) bool {
+    if (last_react_ms == 0) return true;
+    return now_ms -% last_react_ms >= rtt_ms;
 }
 
 /// Encode ACE into the low 3 bits beside data-offset (SK-134).

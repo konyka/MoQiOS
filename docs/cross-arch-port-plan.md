@@ -2007,7 +2007,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:同窗口多次拥塞可被计数反馈,反应更细。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-134] tcp ace counters non-x86: OK`。
-- **后续**:完整 AccECN SYN 协商(AE);或 ACE 与每 RTT 反馈限速。
+- **后续**:见 3.135（ACE 每 RTT 限速,已完成)。
+
+---
+
+### 3.135 ACE 每 RTT 再减窗限速（SK-135,2026-07-24）
+
+- **背景**:SK-134 在 `ecn_reduced` 置位后忽略后续 ACE,多次 CE 仍只能砍一次;
+  粘滞 ECE 的 once-per-window 应保留,但 AccECN 计数反馈应允许按 RTT 再反应。
+- **方案**:记录 `ace_last_react_ms`;ACE 前进且已减窗时,若距上次砍窗 ≥ SRTT
+  (否则 min_rtt/10ms 地板)则再砍一次。粘滞 ECE 单独不再触发二次砍窗。
+  `shared/sk135.zig` 锁定 RTT limit/ready 与 react 规则。
+- **效果**:持续 CE 下窗口可按 RTT 阶梯收缩,又避免同 RTT 内多次砍窗。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-135] tcp ace rtt rate-limit non-x86: OK`。
+- **后续**:完整 AccECN SYN 协商(AE);或按 ACE delta 幅度缩放减窗。
 
 ---
 
