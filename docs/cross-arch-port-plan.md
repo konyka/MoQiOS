@@ -2021,7 +2021,19 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:持续 CE 下窗口可按 RTT 阶梯收缩,又避免同 RTT 内多次砍窗。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-135] tcp ace rtt rate-limit non-x86: OK`。
-- **后续**:完整 AccECN SYN 协商(AE);或按 ACE delta 幅度缩放减窗。
+- **后续**:见 3.136（ACE delta 缩放减窗,已完成)。
+
+---
+
+### 3.136 按 ACE delta 幅度缩放减窗（SK-136,2026-07-24）
+
+- **背景**:ACE 前进 1 与前进多位时仍只做一次 CUBIC β=0.7 砍窗,多 CE 的严重度被抹平。
+- **方案**:`probeAceScaledSsthresh` 按 delta 叠加 β 次(ECE-only delta=0 视为 1 次);
+  恢复路径对 `max(cwnd,ssthresh)` 同样缩放。`shared/sk136.zig` 锁定 cut count 与缩放。
+- **效果**:同 RTT 内多次 CE 对应更强减窗,单 CE / 经典 ECE 行为不变。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-136] tcp ace delta scale non-x86: OK`。
+- **后续**:完整 AccECN SYN 协商(AE);或 ACE 反馈与 BBR/CUBIC 增益耦合。
 
 ---
 
