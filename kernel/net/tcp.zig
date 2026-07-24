@@ -117,6 +117,8 @@ const PSH: u8 = 0x08;
 const ACK: u8 = 0x10;
 const ECE: u8 = 0x40; // ECN-Echo (SK-131)
 const CWR: u8 = 0x80; // Congestion Window Reduced (SK-131)
+/// AccECN AE flag in TCP header byte12 bit0 (ex-NS) (SK-139).
+const AE: u8 = 0x01;
 
 // TCP states (RFC 793)
 const TcpState = enum(u8) {
@@ -247,6 +249,8 @@ const TcpTcb = struct {
     hystart_last_ack_ms: u32,
     /// ECN negotiated (RFC 3168) (SK-131).
     ecn_ok: bool,
+    /// Accurate ECN negotiated via AE SYN-ACK (SK-139).
+    accecn_ok: bool,
     /// Echo ECE on ACKs until peer sends CWR (SK-131).
     ecn_ece_pending: bool,
     /// Send CWR after reacting to ECE (SK-131).
@@ -409,6 +413,7 @@ pub fn initTcbs() void {
             .hystart_round_min = 0,
             .hystart_last_ack_ms = 0,
             .ecn_ok = false,
+            .accecn_ok = false,
             .ecn_ece_pending = false,
             .ecn_cwr_pending = false,
             .ecn_reduced = false,
@@ -506,6 +511,7 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].hystart_round_min = 0;
     tcbs[i].hystart_last_ack_ms = 0;
     tcbs[i].ecn_ok = false;
+    tcbs[i].accecn_ok = false;
     tcbs[i].ecn_ece_pending = false;
     tcbs[i].ecn_cwr_pending = false;
     tcbs[i].ecn_reduced = false;
@@ -737,9 +743,14 @@ fn fillTcpSegment(
     bo.writeU16BeAt(pkt, tcp_off + 2, tcb.remote_port);
     bo.writeU32BeAt(pkt, tcp_off + 4, seq);
     bo.writeU32BeAt(pkt, tcp_off + 8, ack);
-    // SK-134: low 3 bits of byte 12 carry Accurate ECN ACE when negotiated.
-    const ace_bits: u8 = if (tcb.ecn_ok) @as(u8, tcb.ace_ce_count) else 0;
-    pkt[tcp_off + 12] = (data_offset_val << 4) | (ace_bits & 0x7);
+    // SK-139: SYN/SYN-ACK carry AE; data path carries ACE (SK-134) only if AccECN.
+    const byte12_lo: u8 = blk: {
+        if ((flags & SYN) != 0) {
+            break :blk if (tcb.accecn_ok) AE else 0;
+        }
+        break :blk if (tcb.accecn_ok) @as(u8, tcb.ace_ce_count) & 0x7 else 0;
+    };
+    pkt[tcp_off + 12] = (data_offset_val << 4) | byte12_lo;
     pkt[tcp_off + 13] = flags;
     bo.writeU16BeAt(pkt, tcp_off + 14, raw_window);
     pkt[tcp_off + 16] = 0;
@@ -1521,7 +1532,9 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
                 reuse_tcb.sack_permitted = true;
             }
             applyPeerMss(reuse_tcb, opts);
+            // SK-139: offer AccECN (AE) when peer offered ECN-setup.
             reuse_tcb.ecn_ok = peer_ecn;
+            reuse_tcb.accecn_ok = peer_ecn;
 
             _ = sendSegment(reuse_tcb, probeEcnSynAckFlags(peer_ecn), undefined, 0);
             tcpLog("[tcp] TIME_WAIT reuse → SYN-ACK\n");
@@ -1564,7 +1577,9 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
         new_tcb.sack_permitted = true;
     }
     applyPeerMss(new_tcb, opts);
+    // SK-139: offer AccECN (AE) when peer offered ECN-setup.
     new_tcb.ecn_ok = peer_ecn;
+    new_tcb.accecn_ok = peer_ecn;
 
     // Send SYN-ACK
     _ = sendSegment(new_tcb, probeEcnSynAckFlags(peer_ecn), undefined, 0);
@@ -1626,7 +1641,9 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
             }
             if (opts.sack_permitted) reuse_tcb.sack_permitted = true;
             applyPeerMss(reuse_tcb, opts);
+            // SK-139: offer AccECN (AE) when peer offered ECN-setup.
             reuse_tcb.ecn_ok = peer_ecn;
+            reuse_tcb.accecn_ok = peer_ecn;
             _ = sendSegment(reuse_tcb, probeEcnSynAckFlags(peer_ecn), undefined, 0);
             return;
         }
@@ -1659,7 +1676,9 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
     }
     if (opts.sack_permitted) new_tcb.sack_permitted = true;
     applyPeerMss(new_tcb, opts);
+    // SK-139: offer AccECN (AE) when peer offered ECN-setup.
     new_tcb.ecn_ok = peer_ecn;
+    new_tcb.accecn_ok = peer_ecn;
 
     _ = sendSegment(new_tcb, probeEcnSynAckFlags(peer_ecn), undefined, 0);
 
@@ -1689,8 +1708,8 @@ fn driveTcbStateMachine(
     // Any matched segment counts as activity (keepalive idle reset).
     tcb.idle_ms = 0;
 
-    // SK-131/134: CE / ECE / CWR / ACE reaction before further state work.
-    const ace: u3 = @truncate(data[12] & 0x7);
+    // SK-131/134/139: CE / ECE / CWR / ACE (ACE only after AccECN).
+    const ace: u3 = if (tcb.accecn_ok) @truncate(data[12] & 0x7) else 0;
     noteEcnRx(tcb, flags, ecn_ce, ace);
 
     // Update ts_recent for PAWS
@@ -1757,8 +1776,9 @@ fn driveTcbStateMachine(
                 if (opts.sack_permitted) {
                     tcb.sack_permitted = true;
                 }
-                // SK-131: ECN negotiated when SYN-ACK carries ECE (no CWR).
-                tcb.ecn_ok = probeEcnSynAckOk(flags);
+                // SK-131/139: classic ECN (ECE) or AccECN (AE+ECE) on SYN-ACK.
+                tcb.accecn_ok = probeAccecnSynAckOk(flags, data[12]);
+                tcb.ecn_ok = tcb.accecn_ok or probeEcnSynAckOk(flags);
                 applyPeerMss(tcb, opts);
 
                 // RTT measurement: if our SYN carried ts_val_last and
@@ -3605,6 +3625,21 @@ pub fn probeEcnPeerSetup(flags: u8) bool {
 /// SYN-ACK completes ECN when ECE set and CWR clear (SK-131).
 pub fn probeEcnSynAckOk(flags: u8) bool {
     return (flags & (SYN | ACK | ECE)) == (SYN | ACK | ECE) and (flags & CWR) == 0;
+}
+
+/// AccECN SYN-ACK: classic ECE/CWR pattern plus AE in byte12 bit0 (SK-139).
+pub fn probeAccecnSynAckOk(flags: u8, byte12: u8) bool {
+    return probeEcnSynAckOk(flags) and (byte12 & AE) != 0;
+}
+
+/// AE bit to place in SYN/SYN-ACK byte12 when offering AccECN (SK-139).
+pub fn probeAccecnAeBit(offer_accecn: bool) u8 {
+    return if (offer_accecn) AE else 0;
+}
+
+/// ACE feedback only after AccECN negotiation (SK-139).
+pub fn probeAceFeedbackEnabled(accecn_ok: bool) bool {
+    return accecn_ok;
 }
 
 /// React to ECE once per episode outside loss recovery (SK-131).

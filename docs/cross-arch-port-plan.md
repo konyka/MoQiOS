@@ -2059,7 +2059,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:多 CE 后 CUBIC 以更低目标恢复,与 SK-136 缩放一致;经典 ECE 不变。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-138] tcp ace cubic wmax non-x86: OK`。
-- **后续**:完整 AccECN SYN 协商(AE);或 AccECN 计数与 TCP 选项字段对齐。
+- **后续**:见 3.139（AccECN AE 协商,已完成)。
+
+---
+
+### 3.139 AccECN SYN 协商（AE）（SK-139,2026-07-24）
+
+- **背景**:ACE 反馈在仅有经典 ECN(`ecn_ok`)时即启用,未用 AE 区分 AccECN;
+  与只理解 RFC 3168 的对端可能误用 byte12 低位。
+- **方案**:对端 ECN-setup SYN 时 SYN-ACK 置 AE(byte12 bit0)+ECE;客户端识别
+  `probeAccecnSynAckOk` 置 `accecn_ok`;ACE 编解码仅在 `accecn_ok` 下生效。
+  经典 ECE-only SYN-ACK 仍只开 `ecn_ok`。`shared/sk139.zig` 锁定协商规则。
+- **效果**:AccECN 与经典 ECN 可区分;ACE 计数仅在双方同意后上线。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-139] tcp accecn ae negotiate non-x86: OK`。
+- **后续**:将 ACE 从 byte12 低 3 位迁到 AE|CWR|ECE 三比特反馈字段。
 
 ---
 
