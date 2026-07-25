@@ -542,6 +542,19 @@ pub const FdTable = struct {
         }
     }
 
+    /// Stage a write in the writeback cache and advance the descriptor by the
+    /// bytes actually accepted. Reporting `count` regardless would tell the
+    /// caller that data made it into the cache when the pool had no room for it.
+    fn bufferedWrite(desc: *FileDescriptor, file_idx: u32, buf: [*]const u8, count: usize, fs_type: writeback.FsType) i64 {
+        if (count == 0) return 0;
+        const want: u32 = if (count > 0xFFFF_FFFF) 0xFFFF_FFFF else @intCast(count);
+        const n = writeback.writeBuffered(file_idx, desc.offset, buf, want, fs_type);
+        if (n == 0) return -28; // ENOSPC — no buffer available
+        desc.offset += n;
+        if (desc.offset > desc.file_size) desc.file_size = desc.offset;
+        return @intCast(n);
+    }
+
     /// Write to a file descriptor from a kernel buffer.
     /// Returns number of bytes written, -1 on error.
     pub fn write(self: *FdTable, fd: u32, buf: [*]const u8, count: usize) i64 {
@@ -562,19 +575,13 @@ pub const FdTable = struct {
             .fat32_file => {
                 if (!desc.writable) return -1;
                 // Use writeback for delayed write coalescing
-                writeback.writeBuffered(desc.fat32_file_idx, desc.offset, buf, @intCast(count), .fat32);
-                desc.offset += count;
-                if (desc.offset > desc.file_size) desc.file_size = desc.offset;
-                return @intCast(count);
+                return bufferedWrite(desc, desc.fat32_file_idx, buf, count, .fat32);
             },
             .ramdisk_file => return -1,
             .ext2_file => {
                 if (!desc.writable) return -1;
                 // Use writeback for delayed write coalescing
-                writeback.writeBuffered(desc.ext2_file_idx, desc.offset, buf, @intCast(count), .ext2);
-                desc.offset += count;
-                if (desc.offset > desc.file_size) desc.file_size = desc.offset;
-                return @intCast(count);
+                return bufferedWrite(desc, desc.ext2_file_idx, buf, count, .ext2);
             },
             .tcp_socket => return -1, // TCP sockets use sendto/recvfrom syscalls
             .udp_socket => return -1, // UDP sockets use sendto/recvfrom syscalls

@@ -34,7 +34,10 @@ pub fn announce() void {
     }
 
     // Dirty-buffer round-trip: write into the cache, read it back.
-    writeback.writeBuffered(FILE_IDX, OFFSET, payload.ptr, payload.len, .ext2);
+    if (writeback.writeBuffered(FILE_IDX, OFFSET, payload.ptr, payload.len, .ext2) != payload.len) {
+        arch.serial.writeString("[SK-46] FAILED: writeBuffered accepted len\n");
+        return;
+    }
     var buf: [payload.len]u8 = undefined;
     const n = writeback.readBuffered(FILE_IDX, OFFSET, &buf, payload.len, .ext2);
     if (n != payload.len) {

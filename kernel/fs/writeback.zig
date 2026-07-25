@@ -39,29 +39,41 @@ inline fn bmClr(bm: *[BM_WORDS]u64, idx: u32) void {
     bm[idx >> 6] &= ~(@as(u64, 1) << @intCast(idx & 63));
 }
 
-pub fn writeBuffered(file_idx: u32, byte_offset: u64, data: [*]const u8, len: u32, fs_type: FsType) void {
-    const copy_len = @min(len, @as(u32, 4096));
+/// Buffer `len` bytes for delayed writeback, split across buffer-sized extents.
+///
+/// Returns the number of bytes accepted. A single buffer holds at most
+/// PAGE_SIZE, so longer writes span several of them; callers that write more
+/// than that (`copy_file_range`, `splice` pipe→file) used to have everything
+/// past the first page dropped while still reporting a full write. A short
+/// return means the buffer pool is exhausted and the caller must report a
+/// short write rather than claim the whole length.
+pub fn writeBuffered(file_idx: u32, byte_offset: u64, data: [*]const u8, len: u32, fs_type: FsType) u32 {
+    var done: u32 = 0;
+    while (done < len) {
+        const chunk = @min(len - done, @as(u32, 4096));
+        if (!writeExtentLocked(file_idx, byte_offset + done, data + done, chunk, fs_type)) break;
+        done += chunk;
+    }
+    return done;
+}
+
+/// Stage one buffer-sized extent. Returns false when no buffer can be had.
+fn writeExtentLocked(file_idx: u32, byte_offset: u64, data: [*]const u8, len: u32, fs_type: FsType) bool {
     const flags = wb_lock.acquire();
     defer wb_lock.release(flags);
-    var buf = findBufferLocked(file_idx, byte_offset, fs_type);
-    if (buf) |b| {
-        @memcpy(b.data[0..copy_len], data[0..copy_len]);
-        b.data_len = copy_len;
-        b.dirty = true;
-        b.dirty_time = wb_tick;
-        const idx: u32 = @intCast((@intFromPtr(b) - @intFromPtr(&dirty_buffers)) / @sizeOf(DirtyBuffer));
-        bmSet(&dirty_bm, idx);
-        return;
-    }
-    buf = findOrAllocBufferLocked(file_idx, byte_offset, fs_type, flags);
-    if (buf) |b| {
-        @memcpy(b.data[0..copy_len], data[0..copy_len]);
-        b.data_len = copy_len;
-        b.dirty = true;
-        b.dirty_time = wb_tick;
-        const idx: u32 = @intCast((@intFromPtr(b) - @intFromPtr(&dirty_buffers)) / @sizeOf(DirtyBuffer));
-        bmSet(&dirty_bm, idx);
-    }
+    const b = findBufferLocked(file_idx, byte_offset, fs_type) orelse
+        findOrAllocBufferLocked(file_idx, byte_offset, fs_type, flags) orelse
+        return false;
+    @memcpy(b.data[0..len], data[0..len]);
+    // Only the first `len` bytes are replaced, so an extent that already held
+    // more still owns that tail. Shrinking data_len here would drop it before
+    // it ever reached the disk.
+    if (len > b.data_len) b.data_len = len;
+    b.dirty = true;
+    b.dirty_time = wb_tick;
+    const idx: u32 = @intCast((@intFromPtr(b) - @intFromPtr(&dirty_buffers)) / @sizeOf(DirtyBuffer));
+    bmSet(&dirty_bm, idx);
+    return true;
 }
 fn findBufferLocked(file_idx: u32, byte_offset: u64, fs_type: FsType) ?*DirtyBuffer {
     for (0..BM_WORDS) |w| {
