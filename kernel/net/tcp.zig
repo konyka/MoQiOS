@@ -269,6 +269,10 @@ const TcpTcb = struct {
     ace_peer_valid: bool,
     /// Timestamp of last ACE/ECE window cut (SK-135).
     ace_last_react_ms: u32,
+    /// Cumulative IP-CE marks received (stats; not the ACE wire field) (SK-145).
+    ip_ce_rx: u32,
+    /// Bytes newly delivered since last AccECN cut (SK-145).
+    ace_delivered: u32,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -425,6 +429,8 @@ pub fn initTcbs() void {
             .ace_peer = 0,
             .ace_peer_valid = false,
             .ace_last_react_ms = 0,
+            .ip_ce_rx = 0,
+            .ace_delivered = 0,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -524,6 +530,8 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].ace_peer = 0;
     tcbs[i].ace_peer_valid = false;
     tcbs[i].ace_last_react_ms = 0;
+    tcbs[i].ip_ce_rx = 0;
+    tcbs[i].ace_delivered = 0;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -1192,11 +1200,13 @@ fn applyEcnCongestion(tcb: *TcpTcb, ace_delta: u3) void {
         tcb.ecn_undo = true;
     }
     if (tcb.accecn_ok) {
-        // SK-144: L4S-lite proportional cut keep (8−δ)/8 instead of CUBIC β^δ.
-        tcb.ssthresh = probeL4sSsthresh(tcb.cwnd, smss, ace_delta);
+        // SK-144/145: L4S-lite cut; δ normalized by bytes delivered since last cut.
+        const cuts = probeL4sNormCuts(ace_delta, tcb.ace_delivered, smss);
+        tcb.ssthresh = probeL4sSsthresh(tcb.cwnd, smss, cuts);
         tcb.cubic_w_max = tcb.ssthresh;
         tcb.cubic_epoch_ms = 0;
         tcb.cubic_k_ms = 0;
+        tcb.ace_delivered = 0;
     } else {
         // SK-138: ACE-aware W_max; ECE-only keeps classic pre-cut W_max.
         noteCubicAceLoss(tcb, smss, ace_delta);
@@ -1224,10 +1234,11 @@ fn applyEcnCongestion(tcb: *TcpTcb, ace_delta: u3) void {
 fn applyEcnDuringRecovery(tcb: *TcpTcb, ace_delta: u3) void {
     const smss = mssForTcb(tcb);
     const basis = @max(tcb.cwnd, tcb.ssthresh);
-    const new_ss = if (tcb.accecn_ok)
-        probeL4sSsthresh(basis, smss, ace_delta)
-    else
-        probeAceScaledRecoverySsthresh(tcb.cwnd, tcb.ssthresh, smss, ace_delta);
+    const new_ss = if (tcb.accecn_ok) blk: {
+        const cuts = probeL4sNormCuts(ace_delta, tcb.ace_delivered, smss);
+        tcb.ace_delivered = 0;
+        break :blk probeL4sSsthresh(basis, smss, cuts);
+    } else probeAceScaledRecoverySsthresh(tcb.cwnd, tcb.ssthresh, smss, ace_delta);
     if (new_ss < tcb.ssthresh) tcb.ssthresh = new_ss;
     tcb.ecn_cwr_pending = true;
     tcb.ecn_reduced = true;
@@ -1248,6 +1259,8 @@ fn noteAceBbrCoupling(tcb: *TcpTcb, ace_delta: u3) void {
 fn noteEcnRx(tcb: *TcpTcb, flags: u8, ecn_ce: bool, ace: u3) void {
     if (!tcb.ecn_ok) return;
     if (ecn_ce) {
+        // SK-145: full-width IP-CE stats stay separate from the ACE wire field.
+        tcb.ip_ce_rx +%= 1;
         // SK-142: AccECN skips reserved ACE value 0b010 when counting CE.
         tcb.ace_ce_count = if (tcb.accecn_ok)
             probeAceNextCount(tcb.ace_ce_count)
@@ -1357,9 +1370,11 @@ fn noteHystartAck(tcb: *TcpTcb, ack: u32) void {
     applyHystartSignal(tcb);
 }
 
-/// Update delivery-rate sample from newly delivered bytes (SK-119).
+/// Update delivery-rate sample from newly delivered bytes (SK-119/145).
 fn noteDelivery(tcb: *TcpTcb, delivered: u32) void {
     if (delivered == 0) return;
+    // SK-145: AccECN L4S normalizes ACE cuts by bytes ACKed since last cut.
+    if (tcb.accecn_ok) tcb.ace_delivered +%= delivered;
     const now = timestampMs();
     if (tcb.rate_sample_ms != 0) {
         const elapsed = now -% tcb.rate_sample_ms;
@@ -3731,6 +3746,18 @@ pub fn probeL4sSsthresh(cwnd: u32, smss: u32, delta: u3) u32 {
     const keep = 8 - cuts; // cuts 1..7 → keep 7..1
     const reduced = (@as(u64, cwnd) * keep) / 8;
     return @max(@as(u32, @intCast(reduced)), smss * 2);
+}
+
+/// Normalize ACE δ by SMSS segments delivered since last cut (SK-145).
+/// Sparse CE over a large flight → milder cuts; dense CE → up to 7.
+pub fn probeL4sNormCuts(ace_delta: u3, delivered: u32, smss: u32) u3 {
+    const raw: u32 = probeAceCutCount(ace_delta);
+    if (delivered == 0 or smss == 0) return @intCast(raw);
+    const segs = @max(delivered / smss, 1);
+    var cuts = (raw * 8) / segs;
+    if (cuts < 1) cuts = 1;
+    if (cuts > 7) cuts = 7;
+    return @intCast(cuts);
 }
 
 /// Apply CUBIC β `delta` times (or once if delta=0) (SK-136).

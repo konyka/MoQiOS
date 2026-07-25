@@ -2139,7 +2139,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:密集 CE 下窗口平滑收缩;与 SK-135 每 RTT 再反应配合形成 L4S-lite。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-144] tcp l4s ace cut non-x86: OK`。
-- **后续**:AccECN ACE 与 IP-ECN CE 计数分离统计;或按交付量归一化 CE 标记率。
+- **后续**:见 3.145（CE 分离统计 + 交付归一化,已完成)。
+
+---
+
+### 3.145 IP-CE 与 ACE 分离并按交付归一化（SK-145,2026-07-25）
+
+- **背景**:`ace_ce_count` 同时承担收包 CE 统计与线上海反馈,且 L4S 减窗只看
+  ACE δ,未按本段飞行中已确认交付量归一化,稀疏 CE 仍可能偏重。
+- **方案**:`ip_ce_rx` 累计 IP-CE;`ace_delivered` 累计自上次砍窗以来的 ACK 字节;
+  AccECN 砍窗用 `probeL4sNormCuts(δ,delivered,SMSS)` 再喂给 L4S-lite。
+  `shared/sk145.zig` 锁定稀疏/密集与 raw 回退。
+- **效果**:反馈字段与统计解耦;大飞行中少量 CE 砍得更轻,密 CE 仍可加重。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-145] tcp ace ce rate norm non-x86: OK`。
+- **后续**:按 RTT 滑动窗口估计 CE 标记率;或 AccECN TCP 选项扩展计数。
 
 ---
 

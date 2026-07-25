@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-24 (SK-144 L4S-lite ACE cut + prior SK-143 reviewed and verified)
+> Last update: 2026-07-25 (SK-145 ACE/CE rate norm + prior SK-144 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -476,6 +476,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | ACE 0b010 as feedback | Reserved AccECN encoding could skew peer delta / baseline. | SK-142: skip 0b010 on CE count; ignore invalid peer ACE. |
 | AccECN still sent ECT(0) | L4S AQMs could not distinguish AccECN/scalable flows. | SK-143: AccECN non-SYN uses ECT(1); classic ECN keeps ECT(0). |
 | AccECN CUBIC cuts too harsh | Dense L4S CE marks stacked β^δ and collapsed cwnd. | SK-144: AccECN uses (8−δ)/8 L4S-lite cuts; classic keeps CUBIC. |
+| ACE δ ignored flight size | L4S cut used raw ACE δ without delivery normalization. | SK-145: `ip_ce_rx` stats + normalize cuts by `ace_delivered`/SMSS. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -503,8 +504,8 @@ uncompiled-module reachability gap remain explicit follow-up work.
 | `zig build -Darch=riscv64` | Passed | riscv64 build. |
 | `zig build -Darch=aarch64` | Passed | aarch64 build. |
 | `zig build smoke` | Passed | x86_64 single-core reached `hello21 done` and `MoQiOS shell`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | M7+shared probes+SK-144 markers. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | M9-7+shared probes+SK-144 markers. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | M7+shared probes+SK-145 markers. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | M9-7+shared probes+SK-145 markers. |
 | `zig build smoke-smp` | Passed on retry | The first 120-second run stopped in the existing `hello13` signal path before the shell marker; a second run reached the shell. This remains a timing-sensitive regression gate. |
 | LSP diagnostics | Unavailable | `zls` is not installed; compiler gates were used instead. |
 
@@ -558,6 +559,11 @@ It also rechecked the deferred UDP/driver/page-table risks against current Linux
 | P1 | IPv4 socket `connect`, socket-name output, `socketpair`, `recvmmsg` length output, `epoll_wait`, and `select` ignored short user copies. | Fixed: require complete copies, return `EFAULT`, prevalidate epoll output before consuming ready state, and close newly-created socketpair descriptors when output fails. |
 | P1 | Raw network syscalls passed user pointers directly into NIC/UDP code, bypassing the shared mapped-range checks. | Fixed: bounded kernel staging buffers isolate NIC/UDP operations from user page-table lifetime; UDP receive now accepts caller capacity and validates payload/source outputs before dequeue. |
 | P1 | x86 COW clone has early OOM exits after partial child page-table construction; later failures can also leave parent PTEs COW-marked with unmatched references. | Deferred transactional clone work: preallocate each subtree or add explicit rollback of child tables, parent PTEs, and page references before reporting `ENOMEM`. |
+| P1 | Raw NIC receive could dequeue a packet before proving the complete user destination was mapped. | Fixed: validate the bounded destination before calling the NIC receive path. |
+| P1 | TCP connect/send used generic `-1` for user-copy errors and did not preserve the stream's existing larger-write segmentation path. | Fixed: return `EFAULT` for failed address/data copies and pass bounded multi-segment writes through the existing TCP sender. |
+| P1 | `select` accepted malformed timeval values and allowed millisecond conversion overflow. | Fixed: reject `tv_usec >= 1_000_000` and overflowing seconds. |
+| P0 | `fsync` returned success after writeback even when NVMe/virtio had no device persistence barrier. | Fixed: flush dirty buffers and call the first filesystem backing device's flush barrier; return `EOPNOTSUPP` when it is unavailable. Filesystem-to-device tracking remains a future extension for additional mounts. |
+| P2 | Documentation claimed full `CLONE_FILES` support although clone currently copies the FD table. | Fixed: document the actual copied-table behavior and defer shared-FD semantics. |
 | P1 | UDP receive queues still publish/consume entries without a lock or peek/commit token, and current receive APIs may silently truncate to protocol-local storage limits. | Deferred design work: introduce queue serialization, explicit copied/original lengths, `MSG_TRUNC`/`MSG_PEEK` semantics, and commit only after the syscall copy contract is satisfied. |
 | P1 | virtio-blk/virtio-net and NVMe queues retain shared mutable submission/completion state without a demonstrated per-queue serialization contract. | Deferred design work: start with correctness-first single-flight locks, then measure before adding multi-queue parallelism. |
 | P1 | `MAP_FIXED` replacement lacks transactional rollback; user-copy prewalk still has a concurrent-unmap window; page-table mutation needs a unified ownership/shootdown contract. | Deferred architecture work requiring address-space locks, fault recovery, rollback, and cross-CPU TLB tests. |
@@ -583,8 +589,8 @@ It also rechecked the deferred UDP/driver/page-table risks against current Linux
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-144] tcp l4s ace cut non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-144] tcp l4s ace cut non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-145] tcp ace ce rate norm non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-145] tcp ace ce rate norm non-x86: OK`. |
 
 ### 5.3 Historical Verification
 
