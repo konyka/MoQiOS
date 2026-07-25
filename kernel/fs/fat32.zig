@@ -806,7 +806,7 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
         files[file_idx].last_walk_idx = ci;
     }
 
-    while (bytes_written < count) {
+    write_loop: while (bytes_written < count) {
         if (cluster < 2 or cluster >= 0x0FFFFFF8) break;
 
         const cluster_start_lba = clusterToLBA(cluster);
@@ -819,16 +819,19 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
             const overlap_end = if (offset + count < cluster_end_offset) offset + count - file_offset else cluster_size;
 
             // v53.36: Full cluster write — single multi-sector I/O (P4 fix, 87.5% I/O reduction)
+            // Each arm stops on a failed write rather than counting bytes that
+            // never reached the disk; the writeback cache uses the returned count
+            // to decide whether the buffer can be dropped.
             if (overlap_start == 0 and overlap_end == cluster_size and fat32_sectors_per_cluster <= 8) {
                 @memcpy(wbuf[0..cluster_size], buf[bytes_written .. bytes_written + cluster_size]);
-                _ = safeWriteSectors(cluster_start_lba, fat32_sectors_per_cluster, wbuf);
+                if (safeWriteSectors(cluster_start_lba, fat32_sectors_per_cluster, wbuf) <= 0) break;
                 bytes_written += cluster_size;
             } else if (fat32_sectors_per_cluster <= 8) {
                 // v53.40: Batch partial cluster write — read entire cluster, modify overlap, write back
                 // Reduces N sector I/Os to 2 cluster I/Os (read + write)
-                _ = virtio_blk.readSectors(cluster_start_lba, fat32_sectors_per_cluster, wbuf);
+                if (virtio_blk.readSectors(cluster_start_lba, fat32_sectors_per_cluster, wbuf) <= 0) break;
                 @memcpy(wbuf[overlap_start..overlap_end], buf[bytes_written .. bytes_written + (overlap_end - overlap_start)]);
-                _ = safeWriteSectors(cluster_start_lba, fat32_sectors_per_cluster, wbuf);
+                if (safeWriteSectors(cluster_start_lba, fat32_sectors_per_cluster, wbuf) <= 0) break;
                 bytes_written += overlap_end - overlap_start;
             } else {
                 // Partial cluster write — per-sector read-modify-write (spc > 8)
@@ -851,11 +854,11 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
                         @memcpy(wbuf[0..SECTOR_SIZE], buf[bytes_written .. bytes_written + SECTOR_SIZE]);
                     } else {
                         // Read-modify-write
-                        _ = virtio_blk.readSectors(lba, 1, wbuf);
+                        if (virtio_blk.readSectors(lba, 1, wbuf) <= 0) break :write_loop;
                         @memcpy(wbuf[mod_start..mod_end], buf[bytes_written .. bytes_written + (mod_end - mod_start)]);
                     }
 
-                    _ = safeWriteSectors(lba, 1, wbuf);
+                    if (safeWriteSectors(lba, 1, wbuf) <= 0) break :write_loop;
                     bytes_written += @intCast(mod_end - mod_start);
                 }
             }
@@ -871,8 +874,10 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
         }
     }
 
-    if (offset + count > fi.size) {
-        fi.size = offset + count;
+    // Grow to what was actually written, not to what was requested: a loop that
+    // stopped early would otherwise publish a size covering bytes never written.
+    if (offset + bytes_written > fi.size) {
+        fi.size = offset + bytes_written;
         updateDirEntry(file_idx);
     }
 

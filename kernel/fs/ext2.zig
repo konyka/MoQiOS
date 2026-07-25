@@ -1703,7 +1703,9 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
         if (is_full_block) {
             // v53.29: Direct write from source buffer — eliminates ~100MB intermediate
             // memcpy for 100MB sequential write (buf is kernel buffer in HHDM, DMA-safe).
-            _ = writeBlockUncached(phys_block, buf + written);
+            // Stop at the first failed block: counting it would report bytes that
+            // never reached the disk and let the writeback cache drop them.
+            if (!writeBlockUncached(phys_block, buf + written)) break;
         } else {
             // Partial write - need existing block data for read-modify-write
             var block_data: [4096]u8 = undefined;
@@ -1717,7 +1719,7 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
                 if (!readBlockUncached(phys_block, &block_data)) break;
             }
             @memcpy(block_data[block_offset .. block_offset + chunk], buf[written .. written + chunk]);
-            _ = writeBlockUncached(phys_block, &block_data);
+            if (!writeBlockUncached(phys_block, &block_data)) break;
         }
 
         written += chunk;
@@ -1733,11 +1735,13 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
     // stale entries inserted by concurrent readFile during the loop are removed.
     page_cache.invalidateInode(inode_id);
 
-    // Update file size if we extended the file
+    // Update file size if we extended the file. A failed inode write leaves the
+    // on-disk size stale, which would strand the data we just wrote, so report
+    // it rather than claiming the write completed.
     const new_end = offset + written;
     if (new_end > f.inode.size) {
         f.inode.size = new_end;
-        _ = writeInode(f.inode_num, &f.inode);
+        if (!writeInode(f.inode_num, &f.inode)) return -1;
     }
 
     return @intCast(written);

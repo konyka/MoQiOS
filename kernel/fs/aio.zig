@@ -64,6 +64,7 @@ const errno = @import("../lib/errno.zig");
 const EINVAL = errno.EINVAL;
 const ENOMEM = errno.ENOMEM;
 const EFAULT = errno.EFAULT;
+const EIO = errno.EIO;
 
 /// io_setup(nr_events, ctx_id_ptr) -> 0 or -errno
 /// Creates an AIO context and writes its ID to user space.
@@ -311,25 +312,25 @@ fn executeFsync(iocb: *const IoCb) i64 {
 
     // Determine filesystem type and flush writeback cache
     if (desc.fd_type == .ext2_file) {
-        writeback.invalidateFile(desc.ext2_file_idx, .ext2, ext2WriteFlush);
+        if (!writeback.invalidateFile(desc.ext2_file_idx, .ext2, ext2WriteFlush)) return EIO;
     } else if (desc.fd_type == .fat32_file) {
-        writeback.invalidateFile(desc.fat32_file_idx, .fat32, fat32WriteFlush);
+        if (!writeback.invalidateFile(desc.fat32_file_idx, .fat32, fat32WriteFlush)) return EIO;
     } else {
         _ = vfs_mod;
     }
     return 0;
 }
 
+// Returning true unconditionally would clear the dirty bit on a failed write,
+// so the buffer is only considered flushed once every byte was accepted.
 fn ext2WriteFlush(idx: u32, offset: u64, buf: [*]const u8, len: u32) bool {
     const ext2 = @import("ext2.zig");
-    _ = ext2.writeFile(idx, @intCast(offset), buf, @intCast(len));
-    return true;
+    return ext2.writeFile(idx, @intCast(offset), buf, @intCast(len)) == len;
 }
 
 fn fat32WriteFlush(idx: u32, offset: u64, buf: [*]const u8, len: u32) bool {
     const fat32 = @import("fat32.zig");
-    _ = fat32.writeFile(idx, @intCast(offset), buf, @intCast(len));
-    return true;
+    return fat32.writeFile(idx, @intCast(offset), buf, @intCast(len)) == len;
 }
 
 // ── Internal helpers ──

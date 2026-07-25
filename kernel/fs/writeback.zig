@@ -168,7 +168,10 @@ pub fn readBuffered(file_idx: u32, byte_offset: u64, buf: [*]u8, len: u32, fs_ty
     }
     return 0;
 }
-pub fn flushFile(file_idx: u32, fs_type: FsType, comptime write_fn: fn (u32, u64, [*]const u8, u32) bool) void {
+/// Flush one file's dirty buffers. Returns false if any buffer could not be
+/// written; those stay dirty, so the caller must not report success.
+pub fn flushFile(file_idx: u32, fs_type: FsType, comptime write_fn: fn (u32, u64, [*]const u8, u32) bool) bool {
+    var all_ok = true;
     const flags = wb_lock.acquire();
     defer wb_lock.release(flags);
     for (0..BM_WORDS) |w| {
@@ -194,6 +197,7 @@ pub fn flushFile(file_idx: u32, fs_type: FsType, comptime write_fn: fn (u32, u64
                 if (!write_ok) { // v53.36: restore dirty on flush failure (W2 fix)
                     b.dirty = true;
                     dirty_bm[w] |= (@as(u64, 1) << @intCast(bit));
+                    all_ok = false;
                     continue;
                 }
                 if (!b.dirty) {
@@ -203,11 +207,14 @@ pub fn flushFile(file_idx: u32, fs_type: FsType, comptime write_fn: fn (u32, u64
             }
         }
     }
+    return all_ok;
 }
-pub fn flushAllByType(fs_type: FsType, comptime write_fn: fn (u32, u64, [*]const u8, u32) bool) void {
+/// Flush every dirty buffer of one filesystem. Returns false if any failed.
+pub fn flushAllByType(fs_type: FsType, comptime write_fn: fn (u32, u64, [*]const u8, u32) bool) bool {
     // v53.35: Rename flushAll → flushAllByType + add fs_type filter (C1 fix).
     // Previously dirty_bm[w] = 0 cleared ALL dirty bits (including other fs_type),
     // causing fat32 data loss when syncAll called flushAll(ext2WriteFlush) first.
+    var all_ok = true;
     const flags = wb_lock.acquire();
     for (0..BM_WORDS) |w| {
         var bits = dirty_bm[w];
@@ -232,6 +239,7 @@ pub fn flushAllByType(fs_type: FsType, comptime write_fn: fn (u32, u64, [*]const
             if (!write_ok) { // v53.36: restore dirty on flush failure (W2 fix)
                 b.dirty = true;
                 dirty_bm[w] |= (@as(u64, 1) << @intCast(bit));
+                all_ok = false;
                 continue;
             }
             if (!b.dirty) {
@@ -241,9 +249,13 @@ pub fn flushAllByType(fs_type: FsType, comptime write_fn: fn (u32, u64, [*]const
         }
     }
     wb_lock.release(flags);
+    return all_ok;
 }
-pub fn invalidateFile(file_idx: u32, fs_type: FsType, comptime write_fn: fn (u32, u64, [*]const u8, u32) bool) void {
-    flushFile(file_idx, fs_type, write_fn);
+/// Drop a file's buffers after flushing. Returns false if the flush failed, in
+/// which case the buffers are discarded anyway — the caller is closing the file
+/// and has nowhere left to retry, but it can still report the loss.
+pub fn invalidateFile(file_idx: u32, fs_type: FsType, comptime write_fn: fn (u32, u64, [*]const u8, u32) bool) bool {
+    const flush_ok = flushFile(file_idx, fs_type, write_fn);
     const flags = wb_lock.acquire();
     defer wb_lock.release(flags);
     for (0..BM_WORDS) |w| {
@@ -259,6 +271,7 @@ pub fn invalidateFile(file_idx: u32, fs_type: FsType, comptime write_fn: fn (u32
             }
         }
     }
+    return flush_ok;
 }
 pub fn writebackTimerTick() bool {
     wb_tick += 1;

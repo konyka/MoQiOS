@@ -803,6 +803,43 @@ stack buffer.
 | `bash tools/qemu_smoke_aarch64.sh` | Passed | Same marker. |
 | SK-154 rule attribution | Passed | Host-side run confirming 4 of 5 rules are individually pinned; the fifth is not observable (above). |
 
+### 5.2k Review Update: 2026-07-25 (write-error propagation, fsync)
+
+This pass took up the last item from 5.2h — write paths discarding their return values — and following
+it up the call chain turned up that the chain had no way to carry an error even if it had one.
+
+| Severity | Finding | Resolution / status |
+|---|---|---|
+| P1 | `ext2.writeFile` discarded both `writeBlockUncached` results while still advancing `written` and updating the inode size, and `fat32.writeFile` did the same with three `safeWriteSectors` calls. A failed device write was therefore reported to the caller as bytes successfully written. Because these are the writeback flush callbacks, the cache then cleared the dirty bit and dropped the only copy of the data. | Fixed: both loops stop at the first failed write so the returned count covers only bytes that reached the disk, and a failed inode write reports failure rather than leaving an on-disk size that strands the data. |
+| P1 | `fat32.writeFile` grew the file to `offset + count` rather than `offset + bytes_written`, so a loop that stopped early (out of clusters, or now a failed write) still published a size covering bytes that were never written. | Fixed: the size follows the bytes actually written. |
+| P1 | `flushFile` and `flushAllByType` returned `void`. They already restored the dirty bit when a write failed, so the information existed and was thrown away: `syncFile`, `syncAll`, `fsync`, `sync`, and `msync` all reported success no matter what. | Fixed: both return whether every buffer was written, `syncFile`/`syncAll`/`invalidateFile` propagate it, and `fsync`/`msync` return `EIO`. `close` also reports `EIO` when the final flush failed, while still releasing the descriptor as POSIX requires. |
+| P1 | `aio`'s own flush callbacks ignored the write result and returned `true` unconditionally, so an AIO fsync always claimed success and the cache dropped the buffer even when the write failed. | Fixed: they require the full length to be accepted, and `io_submit`'s fsync arm returns `EIO`. |
+| P1 | The live `fsync(fd)`/`fdatasync(fd)` (syscalls 74/75) ignored the descriptor entirely, called `syncAll()`, and returned 0 unconditionally — no error reporting, no descriptor validation, and every dirty buffer of both filesystems flushed to sync one file. | Fixed: they now go through `syscallFsync`, which validates the descriptor, flushes only that file, and reports `EIO`. |
+| P1 | `syscallFsync` looked the writeback buffers up with `desc.ext2_file_idx` for FAT32 descriptors too. The two filesystems have separate index spaces and the write path stages FAT32 buffers under `fat32_file_idx`, so `fsync` on a FAT32 file flushed a different file's buffers — usually none, since the field is 0 — and returned success. | Fixed: the index is selected by descriptor type. |
+
+`hello29` gained fsync coverage: it writes a file, calls `fsync` on it, and calls `fsync` on an unused
+descriptor, asserting 0 and `EBADF`. That guards the 74/75 rewrite, which previously could not fail.
+`hello29: fsync PASS` is now a required marker in the x86_64 smoke gate.
+
+SK-155 drives `flushFile` with a callback that fails and then one that succeeds, checking the returned
+status, that the callback ran, and that a failed flush leaves the buffer dirty. Unlike SK-154's
+header-bounds rule, there is no redundancy question here: the probe asserts the return value that the
+fix introduced, so dropping the `all_ok = false` assignment makes it report
+`failure reported as success`. SK-46 now also checks `flushFile`'s status on its success path.
+
+Not verified at runtime: the `EIO` paths themselves, which need a failing block device to reach. The
+smoke run confirms the success paths still return 0 and that descriptor validation works.
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build test` | Passed | Host helper tests. |
+| `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
+| `zig build smoke` | Passed | Now also gated on `hello29: fsync PASS`. |
+| `zig build smoke-smp` | Passed | x86_64 dual-core reached shell. |
+| `zig build smoke-smp-stress` | Passed | 5 consecutive dual-core runs. |
+| `bash tools/qemu_smoke_riscv64.sh` | Passed | Includes `[SK-155] writeback flush error propagation non-x86: OK`. |
+| `bash tools/qemu_smoke_aarch64.sh` | Passed | Same marker. |
+
 ### 5.3 Historical Verification
 
 Executed on 2026-06-21:

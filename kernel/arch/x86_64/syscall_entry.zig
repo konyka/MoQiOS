@@ -1106,7 +1106,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallFsync(@truncate(frame.rdi)));
         },
         246 => { // sync()
-            vfs_mod.syncAll();
+            // POSIX sync() has no failure return; the result is still consumed
+            // so a flush failure is not silently discarded at the call site.
+            _ = vfs_mod.syncAll();
             frame.rax = 0;
         },
         // ── v33.2: clock_nanosleep / epoll_pwait / getcpu ────────────
@@ -1578,12 +1580,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(flock_mod.sysFlock(frame.rdi, frame.rsi));
         },
         74 => { // fsync(fd)
-            vfs_mod.syncAll();
-            frame.rax = 0;
+            frame.rax = @bitCast(syscallFsync(@truncate(frame.rdi)));
         },
         75 => { // fdatasync(fd)
-            vfs_mod.syncAll();
-            frame.rax = 0;
+            frame.rax = @bitCast(syscallFsync(@truncate(frame.rdi)));
         },
         76 => { // truncate(path, length) — v53.3: real implementation
             const ext2_mod = @import("../../fs/ext2.zig");
@@ -3370,7 +3370,14 @@ fn syscallFsync(fd: u32) i64 {
         else => .none,
     };
     if (wb_type != .none) {
-        vfs_mod.syncFile(desc.ext2_file_idx, wb_type);
+        // The two filesystems keep separate index spaces; writeback stages FAT32
+        // buffers under `fat32_file_idx`, so looking them up by `ext2_file_idx`
+        // flushed a different file's buffers (usually none) and still said OK.
+        const wb_idx = switch (desc.fd_type) {
+            .fat32_file => desc.fat32_file_idx,
+            else => desc.ext2_file_idx,
+        };
+        if (!vfs_mod.syncFile(wb_idx, wb_type)) return -5; // EIO
         // FAT32/ext2 currently live on block device 0. Only devices that
         // advertise a volatile write cache need a flush barrier; the others are
         // write-through, so writeback completion is already durable.
@@ -4254,7 +4261,7 @@ fn syscallMsync(addr: u64, length: u64, flags: u32) i64 {
     // Flush all dirty buffers to disk (writeback + page_cache).
     // This is the simplest correct implementation: a full sync.
     const vfs = @import("../../fs/vfs.zig");
-    vfs.syncAll();
+    if (!vfs.syncAll()) return -5; // EIO
     return 0;
 }
 

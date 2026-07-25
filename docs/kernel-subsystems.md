@@ -458,6 +458,18 @@ const Pipe = struct {
 - Ext2完整实现：目录项创建/删除/重命名/枚举
 - 系统调用：#82(rename), #84(mkdir), #111(unlink), #123(mkdir旧号), #217(getdents64)
 - 多级路径解析支持
+- 目录读取只对 tmpfs 可达：VFS 目前没有返回 ext2 目录描述符的路径，
+  所以 `getdents64` 的 ext2 分支从用户态触达不到
+
+### 3.6.1 写回错误传播（SK-155 约束）
+
+- `ext2.writeFile` / `fat32.writeFile` 遇到设备写失败即停止，返回值只覆盖真正
+  落盘的字节；文件大小按实际写入量增长，而非按请求量
+- 刷盘回调只有在全长被接受时才算成功，否则脏位保留、数据不被丢弃
+- `flushFile` / `flushAllByType` 返回是否全部写出，经
+  `syncFile` / `syncAll` / `invalidateFile` 上报至 `fsync` / `msync` / `close`（`EIO`）
+- `fsync` 按描述符类型选择 `ext2_file_idx` 或 `fat32_file_idx`：两个文件系统的
+  索引空间独立，用错会刷到别的文件（通常是没有）却报告成功
 
 ### 3.7 Linux AIO ✅ (v18.1)
 

@@ -74,6 +74,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     if [ -f "$LOG_FILE" ] &&
        grep -q "hello21 done" "$LOG_FILE" &&
        grep -q "hello29: PASS" "$LOG_FILE" &&
+       grep -q "hello29: fsync PASS" "$LOG_FILE" &&
        grep -q "MoQiOS shell" "$LOG_FILE"; then
         echo "PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=$SMP_COUNT)."
         echo "Serial log: $LOG_FILE"
@@ -84,7 +85,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for smoke markers."
-echo "Expected serial markers: 'hello21 done', 'hello29: PASS' and 'MoQiOS shell'."
+echo "Expected serial markers: 'hello21 done', 'hello29: PASS', 'hello29: fsync PASS' and 'MoQiOS shell'."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

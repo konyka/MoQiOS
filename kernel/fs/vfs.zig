@@ -662,13 +662,16 @@ pub const FdTable = struct {
         if (desc.fd_type == .pipe_read or desc.fd_type == .pipe_write) {
             pipeClose(desc.pipe_idx);
         }
+        // Buffers are dropped on close whether or not they reached the disk, so
+        // this is the last chance to tell the caller that data was lost.
+        var flush_failed = false;
         if (desc.fd_type == .ext2_file) {
-            writeback.invalidateFile(desc.ext2_file_idx, .ext2, ext2WriteFlush);
+            flush_failed = !writeback.invalidateFile(desc.ext2_file_idx, .ext2, ext2WriteFlush);
             const ext2 = @import("ext2.zig");
             ext2.closeFile(desc.ext2_file_idx);
         }
         if (desc.fd_type == .fat32_file) {
-            writeback.invalidateFile(desc.fat32_file_idx, .fat32, fat32WriteFlush);
+            flush_failed = !writeback.invalidateFile(desc.fat32_file_idx, .fat32, fat32WriteFlush);
             readahead.invalidateCache(&desc.readahead_state);
         }
         if (desc.fd_type == .tcp_socket) {
@@ -697,6 +700,9 @@ pub const FdTable = struct {
         // proc_file needs no special cleanup
         desc.* = .{};
         self.freeFd(fd);
+        // The descriptor is released either way, as POSIX requires; the error
+        // only reports that buffered data did not make it to disk.
+        if (flush_failed) return -5; // EIO
         return 0;
     }
 
@@ -790,16 +796,18 @@ fn fat32ReadBlock(block_num: u64, buf: [*]u8) bool {
 }
 
 /// Write flush callbacks for writeback — flush dirty buffers via FS write.
+// A buffer is only flushed once every byte reached the filesystem. Accepting a
+// short write here would clear the dirty bit and drop the unwritten tail.
 fn ext2WriteFlush(file_idx: u32, byte_offset: u64, data: [*]const u8, len: u32) bool {
     const ext2 = @import("ext2.zig");
     const n = ext2.writeFile(file_idx, @intCast(byte_offset), data, len);
-    return n > 0;
+    return n == len;
 }
 
 fn fat32WriteFlush(file_idx: u32, byte_offset: u64, data: [*]const u8, len: u32) bool {
     const fat32 = @import("fat32.zig");
     const n = fat32.writeFile(file_idx, @intCast(byte_offset), data, len);
-    return n > 0;
+    return n == len;
 }
 
 /// v53.33: Register flush callbacks so writeback can flush dirty buffers
@@ -820,18 +828,23 @@ pub fn writebackTimerTick() bool {
 }
 
 /// Public API: Sync all dirty buffers to disk (fsync/sync).
-pub fn syncAll() void {
-    writeback.flushAllByType(.ext2, ext2WriteFlush);
-    writeback.flushAllByType(.fat32, fat32WriteFlush);
+/// Returns false if any buffer could not be written.
+pub fn syncAll() bool {
+    // Both filesystems are flushed even if the first one fails, so a failure on
+    // one does not strand the other's dirty data.
+    const ext2_ok = writeback.flushAllByType(.ext2, ext2WriteFlush);
+    const fat32_ok = writeback.flushAllByType(.fat32, fat32WriteFlush);
+    return ext2_ok and fat32_ok;
 }
 
 /// Sync a specific file's dirty buffers to disk.
-pub fn syncFile(file_idx: u32, fs_type: writeback.FsType) void {
-    switch (fs_type) {
+/// Returns false if any buffer could not be written.
+pub fn syncFile(file_idx: u32, fs_type: writeback.FsType) bool {
+    return switch (fs_type) {
         .ext2 => writeback.flushFile(file_idx, .ext2, ext2WriteFlush),
         .fat32 => writeback.flushFile(file_idx, .fat32, fat32WriteFlush),
-        .none => {},
-    }
+        .none => true,
+    };
 }
 
 // ── Mount table (Phase 18) ──────────────────────────────────────

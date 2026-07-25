@@ -32,6 +32,7 @@ static inline int64_t syscall3(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_EXIT       2
 #define SYS_OPEN       9
 #define SYS_CLOSE      11
+#define SYS_FSYNC      74
 #define SYS_GETDENTS64 173
 
 #define DIR_PATH "/tmp"
@@ -120,6 +121,30 @@ void _start(void) {
         print("hello29: PASS (short buffer returned every entry)\n");
     } else {
         print("hello29: FAIL (short buffer dropped entries)\n");
+    }
+
+    /// fsync used to ignore its fd entirely, flush every dirty buffer of both
+    /// filesystems, and return 0 unconditionally. It now flushes just this file
+    /// and validates the descriptor, so check both outcomes.
+    int64_t efd = syscall3(SYS_OPEN, (uint64_t)"fsync_probe.txt", 0x41, 0);
+    if (efd < 0) {
+        print("hello29: fsync SKIP (create failed)\n");
+    } else {
+        const char *msg = "durable?";
+        syscall3(SYS_WRITE, (uint64_t)efd, (uint64_t)msg, 8);
+        int64_t fs_ok = syscall1(SYS_FSYNC, (uint64_t)efd);
+        int64_t fs_bad = syscall1(SYS_FSYNC, 99);
+        syscall1(SYS_CLOSE, (uint64_t)efd);
+        print("hello29: fsync(fd)=");
+        print_dec(fs_ok);
+        print(" fsync(99)=");
+        print_dec(fs_bad);
+        print("\n");
+        if (fs_ok == 0 && fs_bad == -9) {
+            print("hello29: fsync PASS\n");
+        } else {
+            print("hello29: fsync FAIL\n");
+        }
     }
 
     print("hello29 done\n");

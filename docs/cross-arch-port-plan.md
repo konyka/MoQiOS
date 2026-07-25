@@ -2319,6 +2319,38 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   `copyToUser` 因此正确拒绝(这正是新 `EFAULT` 返回报告的情形,旧代码会
   当成成功)。因此用户程序无法用整页栈缓冲调 `getdents64`。
 
+### 3.155 写失败沿调用链上报 + fsync 修正（SK-155,2026-07-25）
+
+- **背景**:`ext2.writeFile` 丢掉两处 `writeBlockUncached` 的结果却照样推进
+  `written` 并更新 inode 大小,`fat32.writeFile` 对三处 `safeWriteSectors`
+  同样处理——设备写失败被当成"成功写入了这些字节"。而这两个函数正是写回
+  缓存的刷盘回调,于是缓存清掉脏位、丢弃数据的唯一副本。FAT32 还用
+  `offset + count`（而非实际写入量）更新文件大小。
+  更上层:`flushFile`/`flushAllByType` 返回 `void`——它们**本来就**在写失败时
+  恢复了脏位,信息存在却被丢弃,所以 `syncFile`、`syncAll`、`fsync`、`sync`、
+  `msync` 一律报成功。`aio` 的刷盘回调更直接 `return true`。
+  还有两个 `fsync` 自身的问题:真正生效的 74/75 号完全忽略 fd、调用
+  `syncAll()` 并无条件返回 0（既不报错也不校验 fd,还为同步一个文件刷了两个
+  文件系统的全部脏缓冲）;而带 fd 的 `syscallFsync` 对 FAT32 描述符也用
+  `ext2_file_idx` 去查缓冲——两个文件系统索引空间独立,写入时 FAT32 存在
+  `fat32_file_idx` 下,所以 FAT32 文件的 fsync 实际什么都没刷还返回成功。
+- **方案**:两条写循环遇到失败即停止,返回值只覆盖真正落盘的字节;inode 写
+  失败如实报错。刷盘回调要求全长被接受才算成功。`flushFile`/`flushAllByType`
+  改为返回是否全部写出,`syncFile`/`syncAll`/`invalidateFile` 逐层上报,
+  `fsync`/`msync` 返回 `EIO`,`close` 在最后一次刷盘失败时也返回 `EIO`
+  （描述符仍按 POSIX 释放）。74/75 改走 `syscallFsync`,索引按描述符类型选取。
+- **效果**:设备写失败不再被当成成功,脏数据不再被静默丢弃;fsync 只刷目标
+  文件（而非全部脏缓冲）,对 FAT32 文件也真正生效。
+- **验证**:三架构构建 + `smoke`/`smoke-smp`/`smoke-smp-stress` +
+  riscv64/aarch64 smoke 全绿,打印
+  `[SK-155] writeback flush error propagation non-x86: OK`。
+  SK-155 用一个必然失败的回调驱动 `flushFile`,校验返回状态、回调确实被调用、
+  失败后缓冲仍为脏,再用成功回调确认可正常排空;SK-46 也补上了对返回状态的检查。
+  `hello29` 增加 fsync 用例:写入后 `fsync(fd)` 应为 0、`fsync(99)` 应为 `-9`,
+  `hello29: fsync PASS` 已加入 x86_64 冒烟门禁。
+- **已知边界**:`EIO` 分支本身未做运行时验证——需要一个会失败的块设备才能触达;
+  冒烟只证明成功路径仍返回 0 且 fd 校验生效。
+
 ---
 
 ## 4. M8 进度（x86_64 SMP）

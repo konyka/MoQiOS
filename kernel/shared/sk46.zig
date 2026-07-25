@@ -64,8 +64,12 @@ pub fn announce() void {
         return;
     }
 
-    // Flush through the same comptime-callback path vfs.syncFile uses.
-    writeback.flushFile(FILE_IDX, .ext2, probeFlush);
+    // Flush through the same comptime-callback path vfs.syncFile uses. The
+    // returned status is what lets fsync report EIO, so check it here too.
+    if (!writeback.flushFile(FILE_IDX, .ext2, probeFlush)) {
+        arch.serial.writeString("[SK-46] FAILED: flush reported failure\n");
+        return;
+    }
     if (!flushed_ok) {
         arch.serial.writeString("[SK-46] FAILED: flush callback\n");
         return;
