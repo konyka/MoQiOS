@@ -472,6 +472,18 @@ pub fn decRef(addr: u64) u16 {
     return ref_counts[page];
 }
 
+/// Decrement a reference without returning the page to the free pool.
+/// Used by address-space teardown, which must keep the root page readable
+/// until all child page tables have been released.
+pub fn decRefNoFree(addr: u64) ?u16 {
+    const flags = lock.acquire();
+    defer lock.release(flags);
+    const page = pageFromPhys(addr);
+    if (page >= total_pages or ref_counts[page] == 0) return null;
+    ref_counts[page] -= 1;
+    return ref_counts[page];
+}
+
 /// Get current reference count for a physical page.
 pub fn getRefCount(addr: u64) u16 {
     const flags = lock.acquire();

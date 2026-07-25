@@ -151,10 +151,15 @@ pub fn clone(
     const parent = task_mod.getTask(parent_idx) orelse return -1;
 
     // CLONE_VM: share address space (thread) vs COW copy (process)
-    const child_pml4 = if (flags & CLONE_VM != 0)
+    const shares_vm = flags & CLONE_VM != 0;
+    const child_pml4 = if (shares_vm)
         parent.page_table_phys
     else
         cloneUserPages(parent.page_table_phys) orelse return -12; // ENOMEM
+
+    if (shares_vm) {
+        @import("../../mm/user_space.zig").retainUserSpace(child_pml4);
+    }
 
     const child_idx = task_mod.createUserProcess(
         parent.user_entry,
@@ -163,9 +168,7 @@ pub fn clone(
         parent.tid,
         false, // inherit general affinity
     ) orelse {
-        if (flags & CLONE_VM == 0) {
-            @import("../../mm/user_space.zig").destroyUserSpace(child_pml4);
-        }
+        @import("../../mm/user_space.zig").destroyUserSpace(child_pml4);
         return -12;
     };
     const child = task_mod.getTask(child_idx).?;

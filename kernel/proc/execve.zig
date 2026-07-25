@@ -72,10 +72,7 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64) ?u64 {
         }
     }
 
-    if (cur.page_table_phys != 0) {
-        user_space.destroyUserSpace(cur.page_table_phys);
-    }
-
+    const old_pml4 = cur.page_table_phys;
     cur.page_table_phys = result.pml4;
     cur.user_entry = result.entry;
     cur.user_stack_top = result.stack_top;
@@ -86,6 +83,7 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64) ?u64 {
         :
         : [cr3] "r" (result.pml4),
         : .{ .rax = true, .memory = true });
+    if (old_pml4 != 0) user_space.destroyUserSpace(old_pml4);
     @import("../arch/arch.zig").gdt.setRsp0(getPerCpu().cpu_id, cur.kernel_stack_top);
     getPerCpu().kernel_rsp = cur.kernel_stack_top;
 
@@ -173,10 +171,7 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64) ?u64 {
         }
     }
 
-    if (cur.page_table_phys != 0) {
-        user_space.destroyUserSpace(cur.page_table_phys);
-    }
-
+    const old_pml4 = cur.page_table_phys;
     cur.page_table_phys = result.pml4;
     cur.user_entry = result.entry;
     cur.user_stack_top = result.stack_top;
@@ -186,6 +181,7 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64) ?u64 {
         :
         : [cr3] "r" (result.pml4),
         : .{ .rax = true, .memory = true });
+    if (old_pml4 != 0) user_space.destroyUserSpace(old_pml4);
     @import("../arch/arch.zig").gdt.setRsp0(getPerCpu().cpu_id, cur.kernel_stack_top);
     getPerCpu().kernel_rsp = cur.kernel_stack_top;
 

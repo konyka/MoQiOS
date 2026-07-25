@@ -69,9 +69,17 @@ fn mapUserPageInner(pml4_phys: u64, virt: u64, phys: u64, writable: bool, flush:
         try paging.mapPageNoFlush(pml4_phys, virt, phys, flags);
 }
 
-/// Destroy a user address space — free all user-space page tables and mapped pages.
-/// Does NOT free the kernel pages (those are shared).
+/// Retain a shared user address space for CLONE_VM.
+pub fn retainUserSpace(pml4_phys: u64) void {
+    pmm.addRef(pml4_phys);
+}
+
+/// Release a user address space. Shared CLONE_VM roots are destroyed only when
+/// the last task drops its reference. Kernel mappings are never freed here.
 pub fn destroyUserSpace(pml4_phys: u64) void {
+    const remaining = pmm.decRefNoFree(pml4_phys) orelse return;
+    if (remaining != 0) return;
+
     const pml4_virt = hhdm.physToVirt(pml4_phys);
     const pml4: [*]u64 = @ptrFromInt(pml4_virt);
 
@@ -134,6 +142,9 @@ pub fn destroyUserSpace(pml4_phys: u64) void {
         }
         pmm.freePage(pdpt_phys);
     }
+    // decRefNoFree left the root at refcount zero but allocated while the walk
+    // was in progress. Restore one owned reference for the final free.
+    pmm.addRef(pml4_phys);
     pmm.freePage(pml4_phys);
 }
 
