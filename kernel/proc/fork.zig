@@ -23,7 +23,10 @@ pub fn fork(frame: *SyscallFrame) i64 {
         child_pml4,
         parent.tid,
         true,
-    ) orelse return -1;
+    ) orelse {
+        @import("../mm/user_space.zig").destroyUserSpace(child_pml4);
+        return -1;
+    };
     const child = task_mod.getTask(child_idx).?;
 
     // Inherit parent's CPU pin — fork must not migrate (M8-5b-2).
@@ -161,7 +164,7 @@ pub fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
         if (pml4e & 1 == 0) continue;
 
         const parent_pdpt_phys = pml4e & ADDR_MASK;
-        const child_pdpt_phys = pmm_mod.allocPage() orelse return null;
+        const child_pdpt_phys = pmm_mod.allocPage() orelse return abortCloneRoot(child_pml4_phys);
         const child_pdpt: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(child_pdpt_phys));
         @memset(child_pdpt[0..512], 0);
         child_pml4[pml4_idx] = child_pdpt_phys | 0x07;
@@ -174,7 +177,7 @@ pub fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
             if (pdpte & 1 == 0) continue;
 
             const parent_pd_phys = pdpte & ADDR_MASK;
-            const child_pd_phys = pmm_mod.allocPage() orelse return null;
+            const child_pd_phys = pmm_mod.allocPage() orelse return abortCloneRoot(child_pml4_phys);
             const child_pd: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(child_pd_phys));
             @memset(child_pd[0..512], 0);
             child_pdpt[pdpt_idx] = child_pd_phys | 0x07;
@@ -187,7 +190,7 @@ pub fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
                 if (pde & 1 == 0) continue;
 
                 const parent_pt_phys = pde & ADDR_MASK;
-                const child_pt_phys = pmm_mod.allocPage() orelse return null;
+                const child_pt_phys = pmm_mod.allocPage() orelse return abortCloneRoot(child_pml4_phys);
                 const child_pt: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(child_pt_phys));
                 @memset(child_pt[0..512], 0);
                 child_pd[pd_idx] = child_pt_phys | 0x07;
@@ -200,7 +203,7 @@ pub fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
                     if (pte & 1 == 0) continue;
 
                     const src_phys = pte & ADDR_MASK;
-                    const dst_phys = pmm_mod.allocPage() orelse return null;
+                    const dst_phys = pmm_mod.allocPage() orelse return abortCloneRoot(child_pml4_phys);
 
                     const src: [*]const u8 = @ptrFromInt(hhdm_mod.physToVirt(src_phys));
                     const dst: [*]u8 = @ptrFromInt(hhdm_mod.physToVirt(dst_phys));
@@ -214,6 +217,17 @@ pub fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
     }
 
     return child_pml4_phys;
+}
+
+/// Release a half-built child address space and report the clone as failed.
+///
+/// Running out of memory partway through the walk used to abandon every table
+/// and leaf page allocated so far. `destroyUserSpace` walks from the root and
+/// skips zero entries, so it handles a partial tree, and its batched page frees
+/// also undo the COW `addRefBatch` increments on shared pages.
+fn abortCloneRoot(child_pml4_phys: u64) ?u64 {
+    @import("../mm/user_space.zig").destroyUserSpace(child_pml4_phys);
+    return null;
 }
 
 /// COW (Copy-on-Write) fork: share physical pages between parent and child.
@@ -248,7 +262,7 @@ pub fn cloneUserPagesCow(parent_pml4_phys: u64) ?u64 {
         if (pml4e == 0 or pml4e & 1 == 0) continue;
 
         const parent_pdpt_phys = pml4e & ADDR_MASK;
-        const child_pdpt_phys = pmm_mod.allocPage() orelse return null;
+        const child_pdpt_phys = pmm_mod.allocPage() orelse return abortCloneRoot(child_pml4_phys);
         const child_pdpt: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(child_pdpt_phys));
         @memset(child_pdpt[0..512], 0);
         child_pml4[pml4_idx] = child_pdpt_phys | 0x07; // present+writable+user
@@ -260,7 +274,7 @@ pub fn cloneUserPagesCow(parent_pml4_phys: u64) ?u64 {
             if (pdpte == 0 or pdpte & 1 == 0) continue;
 
             const parent_pd_phys = pdpte & ADDR_MASK;
-            const child_pd_phys = pmm_mod.allocPage() orelse return null;
+            const child_pd_phys = pmm_mod.allocPage() orelse return abortCloneRoot(child_pml4_phys);
             const child_pd: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(child_pd_phys));
             @memset(child_pd[0..512], 0);
             child_pdpt[pdpt_idx] = child_pd_phys | 0x07;
@@ -272,7 +286,7 @@ pub fn cloneUserPagesCow(parent_pml4_phys: u64) ?u64 {
                 if (pde == 0 or pde & 1 == 0) continue;
 
                 const parent_pt_phys = pde & ADDR_MASK;
-                const child_pt_phys = pmm_mod.allocPage() orelse return null;
+                const child_pt_phys = pmm_mod.allocPage() orelse return abortCloneRoot(child_pml4_phys);
                 const child_pt: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(child_pt_phys));
                 @memset(child_pt[0..512], 0);
                 child_pd[pd_idx] = child_pt_phys | 0x07;
