@@ -251,6 +251,8 @@ pub fn epollWait(epfd_idx: u32, events_buf: u64, max_events: u32, timeout_ms: i3
     if (max_events == 0 or max_events > MAX_EPOLL_ITEMS) return EINVAL;
     const inst = getInstance(epfd_idx) orelse return EBADF;
     const max_out: u32 = @min(max_events, MAX_EPOLL_ITEMS);
+    const copy = @import("../mm/copy_from_user.zig");
+    if (!copy.validateUserBuffer(events_buf, @as(usize, max_out) * @sizeOf(EpollEvent))) return -14; // EFAULT
 
     var start_tick: u64 = undefined;
     if (timeout_ms >= 0) start_tick = idt.getTickCount();
@@ -260,8 +262,7 @@ pub fn epollWait(epfd_idx: u32, events_buf: u64, max_events: u32, timeout_ms: i3
         const n = collectEvents(inst, &out_events, max_out);
         if (n > 0) {
             const bytes: usize = @as(usize, n) * @sizeOf(EpollEvent);
-            const copy = @import("../mm/copy_from_user.zig");
-            _ = copy.copyToUser(@ptrFromInt(events_buf), @ptrCast(&out_events), bytes);
+            if (copy.copyToUser(@ptrFromInt(events_buf), @ptrCast(&out_events), bytes) != bytes) return -14; // EFAULT
             return @intCast(n);
         }
         if (timeout_ms == 0) return 0;
