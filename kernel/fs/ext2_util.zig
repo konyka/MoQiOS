@@ -6,6 +6,8 @@
 //! block-driver / allocator dependencies lets it be unit-probed on non-x86 and
 //! shared unchanged by the x86 ext2 driver.
 
+const bo = @import("../lib/byte_order.zig");
+
 pub const EXT2_MAGIC: u16 = 0xEF53;
 pub const EXT2_INODE_DIRECT: u32 = 12;
 pub const S_IFMT: u16 = 0xF000;
@@ -252,6 +254,50 @@ pub fn classifyLogicalBlock(logical_block: u32, ptrs_per_block: u32) BlockAddr {
 /// Directory entry name starts immediately after the 8-byte header.
 pub fn dirEntryNameSlice(entry_bytes: [*]const u8, name_len: u8) []const u8 {
     return entry_bytes[@sizeOf(Ext2DirEntry) .. @sizeOf(Ext2DirEntry) + name_len];
+}
+
+pub const DIR_ENTRY_HEADER_SIZE: u32 = 8;
+
+/// A directory entry header that has been checked against its containing block.
+pub const DirEntryView = struct {
+    inode: u32,
+    rec_len: u16,
+    name_len: u8,
+    file_type: u8,
+    /// Offset of the name within the block; the name is known to fit.
+    name_pos: u32,
+};
+
+/// Read the directory entry at `pos` in a `block_size` block, or null if the
+/// record cannot be trusted.
+///
+/// Directory blocks are on-disk data, so every field here is attacker- or
+/// corruption-controlled. A record is rejected when its 8-byte header would
+/// reach past the end of the block, when `pos` is not 4-aligned (`rec_len` is
+/// always a multiple of 4 on disk, so an unaligned position means a previous
+/// record lied and a struct cast here would be misaligned), when `rec_len` is
+/// too small to hold its own header and name, or when the record extends past
+/// the block. Fields are read as explicit little-endian bytes so this stays
+/// valid at any alignment.
+pub fn readDirEntry(block: [*]const u8, pos: u32, block_size: u32) ?DirEntryView {
+    if (pos % 4 != 0) return null;
+    if (pos > block_size or block_size - pos < DIR_ENTRY_HEADER_SIZE) return null;
+
+    const hdr = block[pos..][0..DIR_ENTRY_HEADER_SIZE];
+    const rec_len = bo.readU16Le(hdr[4..6]);
+    const name_len = hdr[6];
+
+    if (rec_len % 4 != 0) return null;
+    if (rec_len < DIR_ENTRY_HEADER_SIZE + @as(u32, name_len)) return null;
+    if (rec_len > block_size - pos) return null;
+
+    return .{
+        .inode = bo.readU32Le(hdr[0..4]),
+        .rec_len = rec_len,
+        .name_len = name_len,
+        .file_type = hdr[7],
+        .name_pos = pos + DIR_ENTRY_HEADER_SIZE,
+    };
 }
 
 pub fn namesEqual(a: []const u8, b: []const u8) bool {

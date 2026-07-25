@@ -560,6 +560,29 @@ _start:
     movq $13, %rdx
     syscall
 
+    # Spawn hello29 (getdents64 short-buffer test)
+    movq $5, %rax
+    leaq hello29_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn29_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done29_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
     # Spawn hello9 (fork test)
     movq $5, %rax
     leaq hello9_name(%rip), %rdi
@@ -793,6 +816,13 @@ done23_msg:
     .ascii "spawned hello25\n"
     done25_msg:
     .ascii "hello25 done\n"
+    hello29_name:
+    .ascii "hello29"
+    .byte 0
+    spawn29_msg:
+    .ascii "spawned hello29\n"
+    done29_msg:
+    .ascii "hello29 done\n"
     hello26_name:
     .ascii "hello26"
     .byte 0

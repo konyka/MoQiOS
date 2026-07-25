@@ -757,6 +757,52 @@ it did not return when the user buffer fills; and both FAT32 and ext2 write path
 | `bash tools/qemu_smoke_aarch64.sh` | Passed | Same marker. |
 | SK-153 negative control | Passed | Reverting the struct fix turns the marker to `FAILED: stride`. |
 
+### 5.2j Review Update: 2026-07-25 (ext2 directory records, getdents64 resume)
+
+This pass closed the two remaining items from 5.2h: validating on-disk directory records, and the
+`getdents64` resume offset.
+
+| Severity | Finding | Resolution / status |
+|---|---|---|
+| P1 | All five directory walkers cast `buf + pos` to an 8-byte header knowing only `pos < block_size`, so a record near the end of a block read up to 7 bytes past it; copied `name_len` (up to 255) bytes after the header without checking they stayed in the block, which leaks adjacent memory into a returned filename; and advanced by an unchecked `rec_len`, which can leave `pos` unaligned and make the `@alignCast` in the next iteration invalid. | Fixed: `eu.readDirEntry` is the single validated entry point and every read-side walker goes through it. It reads fields as explicit little-endian bytes, so it is correct at any alignment, and rejects a record whose header would leave the block, whose position or `rec_len` is not 4-aligned, whose `rec_len` cannot hold its own name, or which extends past the block. |
+| P1 | `addDirEntry` computed the splittable gap as `last_entry.rec_len - actual_len` on an unvalidated `rec_len`. A `rec_len` smaller than the record's own header plus name made that `u16` subtraction wrap to a huge gap, which passed the `wasted >= aligned_len` test and wrote a new record past the end of the block — an out-of-bounds *write*, not just a read. | Fixed: the gap is computed from a validated record and clamped to 0. The walk also now distinguishes "no valid record in this block" from "first record at offset 0", which previously split on whatever bytes happened to be there. |
+| P1 (latent) | `getdents64`'s ext2 arm set the resume offset from the last entry `readDirEntries` *produced* rather than the last one copied to the user, so every entry that did not fit the buffer was skipped for good and a short-buffer walk silently returned a truncated directory. | Fixed: the offset now comes from the last entry actually emitted. Latent rather than live: the VFS has no path that returns a descriptor for an ext2 directory, so this arm is currently unreachable from user space (hello29 confirms `open` fails for `/`, `.`, and a directory created by `mkdir`). |
+| P2 | Both arms returned 0 when the buffer was too small for even the first entry, which a caller reads as end of directory, and both ignored `copyToUser`'s result, reporting success and advancing the offset after a copy that wrote nothing. | Fixed: a buffer too small for the next entry is `EINVAL`, a failed copy is `EFAULT`, and neither advances the offset. |
+
+`user/hello29.c` is a new init self-test: it creates six files in a tmpfs directory, then walks it once
+with a buffer that takes every entry and once with a buffer that takes one at a time, and fails if the
+two counts differ. `hello29: PASS` is now a required marker in the x86_64 smoke gate.
+
+Two honest limits on this round's verification:
+
+- The ext2 resume fix is reasoned, not runtime-verified, because that code path cannot be reached from
+  user space today. hello29 covers the tmpfs arm, which was already correct on the resume offset; what
+  it does newly cover there is the `EINVAL`/`EFAULT` behaviour.
+- SK-154 pins four of the five rules in `readDirEntry` — a host-side attribution run confirmed each of
+  `pos` alignment, `rec_len` alignment, `rec_len` minimum, and `rec_len` fit is individually the sole
+  reason its fixture case is rejected. The fifth (header fits in the block) cannot be pinned by any
+  return-value test: once `rec_len` must be at least 8 and must fit before the block end, a header near
+  the end is rejected anyway. That check exists to prevent the out-of-bounds read itself, which the
+  probe cannot observe.
+
+While writing hello29 the one-page user stack surfaced as a practical constraint worth recording: a
+`char buf[4096]` local makes the buffer straddle the bottom of the single mapped stack page, so
+`copyToUser` correctly refuses it. That is what the new `EFAULT` return reports; the old code would
+have called it a success with nothing written. A user program therefore cannot pass a full 4 KiB
+stack buffer to `getdents64`, and the internal `@min(buf_size, 4096)` clamp is never reached from a
+stack buffer.
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build test` | Passed | Host helper tests. |
+| `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
+| `zig build smoke` | Passed | Now gated on `hello29: PASS`; also exercises `mkdir`/`unlink`, which use the two rewritten write-side walks. |
+| `zig build smoke-smp` | Passed | x86_64 dual-core reached shell. |
+| `zig build smoke-smp-stress` | Passed | 5 consecutive dual-core runs. |
+| `bash tools/qemu_smoke_riscv64.sh` | Passed | Includes `[SK-154] ext2 dir record validation non-x86: OK`. |
+| `bash tools/qemu_smoke_aarch64.sh` | Passed | Same marker. |
+| SK-154 rule attribution | Passed | Host-side run confirming 4 of 5 rules are individually pinned; the fifth is not observable (above). |
+
 ### 5.3 Historical Verification
 
 Executed on 2026-06-21:

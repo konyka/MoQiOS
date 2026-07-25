@@ -671,11 +671,10 @@ fn findDirEntry(inode: *const Ext2Inode, name: []const u8) ?u32 {
 
         var pos: u32 = 0;
         while (pos < block_size and offset + pos < dir_size) {
-            const entry: *const Ext2DirEntry = @ptrCast(@alignCast(buf + pos));
-            if (entry.rec_len == 0) break;
+            const entry = eu.readDirEntry(buf, pos, block_size) orelse break;
 
             if (entry.inode != 0 and entry.name_len == name.len) {
-                const entry_name = eu.dirEntryNameSlice(buf + pos, entry.name_len);
+                const entry_name = buf[entry.name_pos..][0..entry.name_len];
                 if (eu.namesEqual(entry_name, name)) return entry.inode;
             }
 
@@ -893,12 +892,10 @@ pub fn listDir(path: []const u8, callback: *const fn ([*]const u8, u32) void) vo
 
         var pos: u32 = 0;
         while (pos < block_size) {
-            const entry: *const Ext2DirEntry = @ptrCast(@alignCast(buf + pos));
-            if (entry.rec_len == 0) break;
+            const entry = eu.readDirEntry(buf, pos, block_size) orelse break;
 
             if (entry.inode != 0 and entry.name_len > 0) {
-                const name_ptr = buf + pos + @sizeOf(Ext2DirEntry);
-                callback(name_ptr, entry.name_len);
+                callback(buf + entry.name_pos, entry.name_len);
             }
 
             pos += entry.rec_len;
@@ -941,11 +938,10 @@ fn listDirInode(inode_num: u32, buf: []u8) usize {
 
         var bpos: u32 = 0;
         while (bpos < block_size) {
-            const entry: *const Ext2DirEntry = @ptrCast(@alignCast(blk + bpos));
-            if (entry.rec_len == 0) break;
+            const entry = eu.readDirEntry(blk, bpos, block_size) orelse break;
 
             if (entry.inode != 0 and entry.name_len > 0) {
-                const name = blk + bpos + @sizeOf(Ext2DirEntry);
+                const name = blk + entry.name_pos;
                 const name_len: usize = entry.name_len;
                 if (pos + name_len + 1 <= buf.len) {
                     @memcpy(buf[pos .. pos + name_len], name[0..name_len]);
@@ -1003,13 +999,12 @@ pub fn readDirEntries(file_idx: u32, start_offset: u32, names: [*][256]u8, name_
         var pos: u32 = pos_in_block;
 
         while (pos < block_size and count < max_entries) {
-            const entry: *const Ext2DirEntry = @ptrCast(@alignCast(buf + pos));
-            if (entry.rec_len == 0) break;
+            const entry = eu.readDirEntry(buf, pos, block_size) orelse break;
 
             if (entry.inode != 0 and entry.name_len > 0) {
                 // v53.3: copy name data to caller's output array
                 const nlen: usize = @intCast(entry.name_len);
-                @memcpy(names[count][0..nlen], buf[pos + @sizeOf(Ext2DirEntry) ..][0..nlen]);
+                @memcpy(names[count][0..nlen], buf[entry.name_pos..][0..nlen]);
                 name_lens[count] = entry.name_len;
                 inodes[count] = entry.inode;
                 file_types[count] = entry.file_type;
@@ -1933,24 +1928,27 @@ fn addDirEntry(dir_inode_num: u32, target_inode: u32, entry_name: []const u8, fi
             // Walk to the last entry in this block
             var pos: u32 = 0;
             var last_pos: u32 = 0;
+            var last_view: ?eu.DirEntryView = null;
             while (pos < block_size) {
-                const entry: *const Ext2DirEntry = @ptrCast(@alignCast(buf + pos));
-                if (entry.rec_len == 0) break;
+                const view = eu.readDirEntry(buf, pos, block_size) orelse break;
                 last_pos = pos;
-                const next = pos + entry.rec_len;
+                last_view = view;
+                const next = pos + view.rec_len;
                 if (next >= block_size) break;
                 pos = next;
             }
 
-            // Check if the last entry has wasted space we can split
-            if (last_pos < block_size) {
-                const last_entry: *Ext2DirEntry = @ptrCast(@alignCast(buf + last_pos));
+            // Check if the last entry has wasted space we can split. `rec_len`
+            // is at least the header plus the name (readDirEntry rejects
+            // anything smaller), so the subtraction below cannot wrap.
+            if (last_view) |last_entry| {
                 const actual_len = (@as(u16, @sizeOf(Ext2DirEntry)) + @as(u16, last_entry.name_len) + 3) & ~@as(u16, 3);
-                const wasted = last_entry.rec_len - actual_len;
+                const wasted = if (last_entry.rec_len > actual_len) last_entry.rec_len - actual_len else 0;
 
                 if (wasted >= aligned_len) {
                     // Shrink the last entry
-                    last_entry.rec_len = actual_len;
+                    const last_hdr: *Ext2DirEntry = @ptrCast(@alignCast(buf + last_pos));
+                    last_hdr.rec_len = actual_len;
 
                     // Create new entry in the freed space
                     const new_pos = last_pos + actual_len;
@@ -2234,11 +2232,12 @@ fn removeDirEntry(parent_inode_num: u32, name: []const u8) bool {
         var prev_pos: u32 = 0xFFFF_FFFF; // sentinel: no previous entry
 
         while (pos < block_size and offset + pos < dir_size) {
-            const entry: *Ext2DirEntry = @ptrCast(@alignCast(buf + pos));
-            if (entry.rec_len == 0) break;
+            // Validate before the struct cast: `readDirEntry` establishes both
+            // 4-alignment and that the record lies inside the block.
+            const view = eu.readDirEntry(buf, pos, block_size) orelse break;
 
-            if (entry.inode != 0 and entry.name_len == name.len) {
-                const entry_name = buf[pos + @sizeOf(Ext2DirEntry) .. pos + @sizeOf(Ext2DirEntry) + name.len];
+            if (view.inode != 0 and view.name_len == name.len) {
+                const entry_name = buf[view.name_pos .. view.name_pos + name.len];
                 var match = true;
                 for (name, 0..) |c, j| {
                     if (entry_name[j] != c) {
@@ -2250,9 +2249,10 @@ fn removeDirEntry(parent_inode_num: u32, name: []const u8) bool {
                     // Found — remove by merging with previous or zeroing inode
                     if (prev_pos != 0xFFFF_FFFF) {
                         const prev: *Ext2DirEntry = @ptrCast(@alignCast(buf + prev_pos));
-                        prev.rec_len += entry.rec_len;
+                        prev.rec_len += view.rec_len;
                     } else {
                         // First entry in block — just zero inode
+                        const entry: *Ext2DirEntry = @ptrCast(@alignCast(buf + pos));
                         entry.inode = 0;
                     }
 
@@ -2262,7 +2262,7 @@ fn removeDirEntry(parent_inode_num: u32, name: []const u8) bool {
             }
 
             prev_pos = pos;
-            pos += entry.rec_len;
+            pos += view.rec_len;
         }
         offset += block_size;
     }

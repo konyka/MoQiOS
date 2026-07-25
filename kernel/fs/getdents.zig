@@ -54,6 +54,7 @@ fn getdents64Ext2(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i6
     if (result.count == 0) return 0;
 
     var written: u64 = 0;
+    var emitted: u32 = 0;
     var kbuf: [4096]u8 = undefined;
     for (0..result.count) |i| {
         const name_len = name_lens[i];
@@ -75,24 +76,36 @@ fn getdents64Ext2(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i6
             kbuf[pad] = 0;
         }
         written += padded_reclen;
+        emitted += 1;
     }
-    _ = copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..@as(usize, @intCast(written))], @as(usize, @intCast(written)));
-    desc.offset = next_offs[result.count - 1];
+
+    // A buffer too small for even the first entry is EINVAL, not end of
+    // directory: reporting 0 would tell the caller the directory ended here.
+    if (emitted == 0) return -22;
+
+    const n: usize = @intCast(written);
+    if (copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..n], n) != n) return -14;
+
+    // Resume from the entry after the last one actually handed to the user.
+    // Using the last entry `readDirEntries` produced would skip everything the
+    // buffer had no room for.
+    desc.offset = next_offs[emitted - 1];
     return @intCast(written);
 }
 
 fn getdents64Tmpfs(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i64 {
     var kbuf: [4096]u8 = undefined;
     var written: u64 = 0;
+    var emitted: u32 = 0;
     const entries = tmpfs.tmpfsListDir(@intCast(desc.tmpfs_idx));
-    var idx: u32 = 0;
+    const start: u32 = @intCast(desc.offset);
+    var idx: u32 = start;
     while (idx < entries.count) : (idx += 1) {
         const e = entries.entries[idx];
         const name_len = e.name.len;
         const reclen: u16 = @intCast(19 + name_len + 1);
         const padded_reclen: u16 = (reclen + 7) & ~@as(u16, 7);
         if (written + padded_reclen > @min(buf_size, 4096)) break;
-        if (idx < @as(u32, @intCast(desc.offset))) continue;
         const base = @as(usize, @intCast(written));
         const ino: u64 = 1;
         bo.writeU64Le(kbuf[base .. base + 8], ino);
@@ -103,9 +116,15 @@ fn getdents64Tmpfs(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i
         @memcpy(kbuf[base + 19 .. base + 19 + name_len], e.name.ptr[0..name_len]);
         kbuf[base + 19 + name_len] = 0;
         written += padded_reclen;
+        emitted += 1;
     }
-    if (written == 0) return 0;
-    _ = copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..@as(usize, @intCast(written))], @as(usize, @intCast(written)));
-    desc.offset = idx;
+    if (emitted == 0) {
+        // Nothing emitted is end of directory only if there was nothing left to
+        // emit; otherwise the buffer was too small for the next entry.
+        return if (start >= entries.count) 0 else -22;
+    }
+    const n: usize = @intCast(written);
+    if (copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..n], n) != n) return -14;
+    desc.offset = start + emitted;
     return @intCast(written);
 }
