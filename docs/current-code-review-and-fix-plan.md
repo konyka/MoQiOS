@@ -508,6 +508,42 @@ uncompiled-module reachability gap remain explicit follow-up work.
 | `zig build smoke-smp` | Passed on retry | The first 120-second run stopped in the existing `hello13` signal path before the shell marker; a second run reached the shell. This remains a timing-sensitive regression gate. |
 | LSP diagnostics | Unavailable | `zls` is not installed; compiler gates were used instead. |
 
+### 5.2e Review Update: 2026-07-25
+
+This follow-up review rechecked the pushed socket/flush fixes, all three build targets, the user-copy
+call sites reachable from the x86 syscall dispatcher, UDP payload sizing, driver queue state, and the
+current documentation/toolchain claims. The scope remains evidence-bounded: uncompiled modules,
+unverified physical hardware, and concurrency properties not exercised by the available QEMU gates are
+reported as residual risks rather than claimed solved.
+
+| Severity | Finding | Resolution / status |
+|---|---|---|
+| P1 | The legacy `tcp_recv` and TCP `recvmsg` syscalls consumed the receive ring before ignoring a failed `copyToUser`, unlike the newer `recvfrom` path. | Fixed: prevalidate each destination and report `-EFAULT` (or an earlier iovec's completed byte count) for a short copy after dequeue. Queue peek/commit and fault recovery remain broader follow-up work. |
+| P1 | `timerfd_settime` accepted a failed/short `copyFromUser` for `new_value`, then passed an undefined temporary to the timer implementation; requested old-value output also ignored copy failure. | Fixed: validate and fully copy both user buffers. The old-value snapshot is copied out before the new timer state is committed, so `EFAULT` leaves the timer unchanged; `timerfd_gettime` now rejects missing/invalid output buffers. Concurrent updates to one timerfd still require a future syscall-level transaction API. |
+| P1 | `validateUserRange` formed `addr + len` before checking wraparound. | Fixed: use subtraction against `USER_LIMIT` so wrapping input is rejected without an overflowing expression. |
+| P1 | IPv6 UDP queue storage is 1472 bytes while the IPv6 receive path uses a 1232-byte temporary buffer. | Not reproduced as an overflow in the current enqueue path: `handlePacketV6` clamps payloads to `MAX_UDP_PAYLOAD_V6` before enqueue. Keep the protocol-specific capacity invariant explicit in future queue API work. |
+| P1 | UDP port/queue publication and dequeue use an unprotected `valid` flag; virtio-blk request state and NVMe polling state are also shared mutable paths without a demonstrated SMP lock contract. | Deferred: requires queue reservation/commit and driver serialization design plus stress coverage; no speculative partial lock rewrite was shipped. |
+| P1 | Page-table walks/copies remain vulnerable to a concurrent unmap/protection change between validation and `@memcpy`; `MAP_FIXED` mapping failure has no transactional rollback. | Deferred: requires architecture-specific fault recovery, address-space locking, and TLB shootdown/rollback design. |
+| P2 | Limine base revision 3 is deprecated by current protocol documentation. | Deferred compatibility task: upgrade only after auditing all requested protocol tags against the target Limine revision. |
+
+The immediate fixes add at most one bounded page walk before the legacy TCP/timer operations already
+performed a user copy. No queue, cache, scheduler, or page-table data structure was replaced without
+measurements. The remaining P1 items are recorded as design work because a partial implementation could
+turn a detectable error into packet corruption, device queue corruption, or a cross-CPU page fault.
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build test` | Passed | Host helper tests. |
+| `zig build` | Passed | x86_64 kernel and userspace. |
+| `zig build -Darch=riscv64` | Passed | riscv64 build. |
+| `zig build -Darch=aarch64` | Passed | aarch64 build. |
+| `zig build smoke` | Passed | x86_64 single-core reached shell. |
+| `zig build smoke-smp` | Passed | x86_64 dual-core reached shell. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | M7+shared-probe smoke. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | M9-7+shared-probe smoke. |
+| `bash -n tools/*.sh` | Passed | Shell scripts parse successfully. |
+| LSP diagnostics | Unavailable | `zls` is not installed; compiler gates were used instead. |
+
 | Gate | Result | Notes |
 |---|---|---|
 | `zig build test` | Passed | Host helper tests. |

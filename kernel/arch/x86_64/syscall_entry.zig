@@ -748,29 +748,53 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             // Read Itimerspec from user space
             const copy = @import("../../mm/copy_from_user.zig");
             var new_buf: [@sizeOf(timerfd_mod.Itimerspec)]u8 = undefined;
-            if (new_val_ptr != 0 and new_val_ptr < 0x0000_8000_0000_0000) {
-                _ = copy.copyFromUser(&new_buf, @ptrFromInt(new_val_ptr), @sizeOf(timerfd_mod.Itimerspec));
+            if (!copy.validateUserBuffer(new_val_ptr, @sizeOf(timerfd_mod.Itimerspec))) {
+                frame.rax = @bitCast(@as(i64, -14));
+                return;
+            }
+            if (copy.copyFromUser(&new_buf, @ptrFromInt(new_val_ptr), @sizeOf(timerfd_mod.Itimerspec)) != @sizeOf(timerfd_mod.Itimerspec)) {
+                frame.rax = @bitCast(@as(i64, -14));
+                return;
+            }
+            if (old_val_ptr != 0 and !copy.validateUserBuffer(old_val_ptr, @sizeOf(timerfd_mod.Itimerspec))) {
+                frame.rax = @bitCast(@as(i64, -14));
+                return;
             }
             const new_val: *const timerfd_mod.Itimerspec = @ptrCast(@alignCast(&new_buf));
-            var old_val: timerfd_mod.Itimerspec = undefined;
-            const old_val_opt: ?*timerfd_mod.Itimerspec = if (old_val_ptr != 0 and old_val_ptr < 0x0000_8000_0000_0000) &old_val else null;
-            const result = timerfd_mod.timerfdSettime(tfd_idx, flags, new_val, old_val_opt);
-            // Write old value back if requested
-            if (old_val_opt) |ov| {
-                const ov_bytes: [*]const u8 = @ptrCast(ov);
-                _ = copy.copyToUser(@ptrFromInt(old_val_ptr), ov_bytes[0..@sizeOf(timerfd_mod.Itimerspec)], @sizeOf(timerfd_mod.Itimerspec));
+            if (old_val_ptr != 0) {
+                var old_val: timerfd_mod.Itimerspec = undefined;
+                const get_result = timerfd_mod.timerfdGettime(tfd_idx, &old_val);
+                if (get_result != 0) {
+                    frame.rax = @bitCast(@as(i64, get_result));
+                    return;
+                }
+                const ov_bytes: [*]const u8 = @ptrCast(&old_val);
+                if (copy.copyToUser(@ptrFromInt(old_val_ptr), ov_bytes[0..@sizeOf(timerfd_mod.Itimerspec)], @sizeOf(timerfd_mod.Itimerspec)) != @sizeOf(timerfd_mod.Itimerspec)) {
+                    frame.rax = @bitCast(@as(i64, -14));
+                    return;
+                }
             }
+            const result = timerfd_mod.timerfdSettime(tfd_idx, flags, new_val, null);
             frame.rax = @bitCast(@as(i64, result));
         },
         172 => { // timerfd_gettime(fd, curr_value)
             const tfd_idx: u32 = @truncate(frame.rdi);
             const cur_ptr: u64 = frame.rsi;
+            if (cur_ptr == 0 or cur_ptr >= 0x0000_8000_0000_0000) {
+                frame.rax = @bitCast(@as(i64, -14));
+                return;
+            }
             var cur_val: timerfd_mod.Itimerspec = undefined;
             const result = timerfd_mod.timerfdGettime(tfd_idx, &cur_val);
-            if (result == 0 and cur_ptr != 0 and cur_ptr < 0x0000_8000_0000_0000) {
+            if (result == 0) {
                 const copy = @import("../../mm/copy_from_user.zig");
                 const cv_bytes: [*]const u8 = @ptrCast(&cur_val);
-                _ = copy.copyToUser(@ptrFromInt(cur_ptr), cv_bytes[0..@sizeOf(timerfd_mod.Itimerspec)], @sizeOf(timerfd_mod.Itimerspec));
+                if (!copy.validateUserBuffer(cur_ptr, @sizeOf(timerfd_mod.Itimerspec)) or
+                    copy.copyToUser(@ptrFromInt(cur_ptr), cv_bytes[0..@sizeOf(timerfd_mod.Itimerspec)], @sizeOf(timerfd_mod.Itimerspec)) != @sizeOf(timerfd_mod.Itimerspec))
+                {
+                    frame.rax = @bitCast(@as(i64, -14));
+                    return;
+                }
             }
             frame.rax = @bitCast(@as(i64, result));
         },
