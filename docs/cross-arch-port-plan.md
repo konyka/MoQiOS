@@ -2195,7 +2195,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:L4S 标记升高时更早进入 ProbeBW/Drain,减少 Startup 过冲。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-148] tcp l4s ewma startup non-x86: OK`。
-- **后续**:AccECN TCP 选项扩展计数;或 EWMA 驱动 ProbeRTT 间隔。
+- **后续**:见 3.149（EWMA 驱动 ProbeRTT 间隔,已完成)。
+
+---
+
+### 3.149 CE-rate EWMA 驱动 ProbeRTT 间隔（SK-149,2026-07-25）
+
+- **背景**:ProbeRTT 固定 10s,AccECN/L4S 在持续 CE 标记时 min_rtt/BDP 更新偏慢,
+  与 SK-146–148 的 EWMA 节奏脱节。
+- **方案**:`probeL4sProbeRttInterval` 将间隔缩为 `base·keep/8`,下限
+  `max(base/5,1000ms)`;`maybeEnterProbeRtt` 在 AccECN 路径使用该间隔。
+  `shared/sk149.zig` 锁定冷/轻/重与 due 语义。
+- **效果**:标记升高时更频繁 ProbeRTT,更快刷新 min_rtt 与 BDP 巡航点。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-149] tcp l4s ewma probertt non-x86: OK`。
+- **后续**:AccECN TCP 选项扩展计数;或 EWMA 驱动 ProbeRTT 持续时间。
 
 ---
 

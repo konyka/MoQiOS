@@ -1563,7 +1563,12 @@ fn maybeEnterProbeRtt(tcb: *TcpTcb, smss: u32) void {
     if (tcb.bbr_startup or tcb.bbr_probe_rtt or tcb.in_recovery) return;
     if (tcb.delivery_rate == 0 or tcb.min_rtt_ms == 0) return;
     const now = timestampMs();
-    if (!probeBbrProbeRttDue(tcb.bbr_last_probe_rtt_ms, now, BBR_PROBE_RTT_INTERVAL_MS)) return;
+    // SK-149: AccECN shortens ProbeRTT cadence with CE-rate EWMA.
+    const interval = if (tcb.accecn_ok)
+        probeL4sProbeRttInterval(BBR_PROBE_RTT_INTERVAL_MS, tcb.l4s_ce_ewma)
+    else
+        BBR_PROBE_RTT_INTERVAL_MS;
+    if (!probeBbrProbeRttDue(tcb.bbr_last_probe_rtt_ms, now, interval)) return;
     tcb.bbr_probe_rtt = true;
     tcb.bbr_probe_rtt_start_ms = now;
     tcb.bbr_prior_cwnd = tcb.cwnd;
@@ -3878,6 +3883,18 @@ pub fn probeL4sStartupCwnd(rate_bps: u32, min_rtt_ms: u32, ewma_q8: u32) u32 {
 /// Abort Startup when CE-rate EWMA ≥ 2/8 per segment (Q8 ≥ 64) (SK-148).
 pub fn probeL4sStartupAbort(ewma_q8: u32) bool {
     return ewma_q8 >= 64;
+}
+
+/// AccECN ProbeRTT interval: base · keep/8, floored at max(base/5, 1000ms) (SK-149).
+pub fn probeL4sProbeRttInterval(base_ms: u32, ewma_q8: u32) u32 {
+    if (base_ms == 0 or ewma_q8 == 0) return base_ms;
+    const cuts: u32 = probeL4sEwmaCuts(ewma_q8, 1);
+    const keep = 8 - cuts;
+    var v = (base_ms * keep) / 8;
+    const fifth = base_ms / 5;
+    const floor = if (fifth > 1000) fifth else 1000;
+    if (v < floor) v = floor;
+    return v;
 }
 
 /// Apply CUBIC β `delta` times (or once if delta=0) (SK-136).
