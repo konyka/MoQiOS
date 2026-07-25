@@ -723,6 +723,40 @@ rather than a quick patch.
 | `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-152] writeback multi-page write non-x86: OK`. |
 | `bash -n tools/*.sh` | Passed | Smoke scripts parse. |
 
+### 5.2i Review Update: 2026-07-25 (ext2 on-disk descriptor layout)
+
+This pass took up the ext2 untrusted-on-disk-data group left open by 5.2h. Verifying the block-group
+descriptor table by hand against the shipped image turned up a defect more serious than the one that
+was queued: the descriptor struct did not match the on-disk layout at all.
+
+| Severity | Finding | Resolution / status |
+|---|---|---|
+| P0 | `Ext2GroupDesc` modelled only the 18 meaningful bytes and omitted `bg_pad`/`bg_reserved[3]`, so `@sizeOf` was 20 while the on-disk stride is 32. Every descriptor after the first was read 12 bytes short of where it lives: on the shipped test image `gds[1].bg_inode_table` came out as 0 instead of 0x2044, so every inode in group 1 (inode 65 and up, at 64 inodes per group) resolved its inode table to block 0 and read unrelated disk content. `writeGroupDescs`, which sizes its transfer from the same `@sizeOf`, wrote the table back with the 20-byte stride and so overwrote group 1's real on-disk descriptor. | Fixed: the struct now carries the pad and reserved words and is exactly 32 bytes, which corrects all eight indexing sites, `bgdt_size`, and the write-back length at once. `GROUP_DESC_SIZE` records the on-disk stride, and SK-153 pins both. |
+| P1 | The descriptor table was read into a single `allocPage()`, which holds 128 descriptors, so a volume with more block groups ran off the end of the allocation. The read also issued one transfer whose sector count can exceed the 128-sector limit virtio-blk enforces, which would have failed the mount outright. | Fixed: the table is allocated with `allocContiguous` sized to the real table, and `readSectorRun` splits the transfer into driver-sized chunks. |
+| P1 | `readInode`, `writeInode`, and `freeInode` derived a group index from an inode number with no upper bound, and `freeBlock` did the same for a block number. Both numbers reach these functions from on-disk directory entries and inode block pointers, so a corrupt image could index the descriptor table past its end; inode 0 and a block below `first_data_block` additionally underflowed the `u32` subtraction. | Fixed: `groupForInode` and `groupForBlock` are the single validation entry points, and the four callers now bail out instead of indexing. |
+
+The shipped `disk.img` carries a 2-group ext2 volume (16384 blocks at 8192 per group, 64 inodes per
+group), so the P0 was live rather than latent on any file that landed in group 1.
+
+SK-153 was negative-controlled: with the pad fields removed again it reports
+`[SK-153] FAILED: stride` and fails the riscv64 smoke gate, so the marker constrains the layout
+rather than merely asserting it.
+
+Still open from 5.2h, unchanged by this pass: ext2 directory parsing does not validate
+`rec_len`/`name_len` against the block size; `getdents64` advances the directory offset past entries
+it did not return when the user buffer fills; and both FAT32 and ext2 write paths discard
+`writeBlockUncached`/`safeWriteSectors` return values while still updating metadata.
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
+| `zig build smoke` | Passed | x86_64 single-core reached shell; exercises the 2-group ext2 volume. |
+| `zig build smoke-smp` | Passed | x86_64 dual-core reached shell. |
+| `zig build smoke-smp-stress` | Passed | 5 consecutive dual-core runs reached shell. |
+| `bash tools/qemu_smoke_riscv64.sh` | Passed | Includes `[SK-153] ext2 group desc stride non-x86: OK`. |
+| `bash tools/qemu_smoke_aarch64.sh` | Passed | Same marker. |
+| SK-153 negative control | Passed | Reverting the struct fix turns the marker to `FAILED: stride`. |
+
 ### 5.3 Historical Verification
 
 Executed on 2026-06-21:

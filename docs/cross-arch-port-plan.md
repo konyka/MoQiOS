@@ -2262,6 +2262,29 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   `writeBuffered` 的返回值语义。
 - **后续**:writeback 错误仍到不了 `fsync`（`vfs.syncFile` 返回 void）。
 
+### 3.153 ext2 块组描述符按磁盘 32 字节步长（SK-153,2026-07-25）
+
+- **背景**:`Ext2GroupDesc` 只建模了有意义的 18 字节,漏掉 `bg_pad` 与
+  `bg_reserved[3]`,于是 `@sizeOf` 是 20,而磁盘上的步长是 **32**。
+  第一个之后的每个描述符都被读到比实际位置偏前 12 字节处——在随仓库发布的
+  镜像上 `gds[1].bg_inode_table` 读成 0（真实值 0x2044）,group 1 的所有
+  inode（每组 64 个,即 inode 65 起）都把 inode 表定位到块 0,读回无关数据。
+  `writeGroupDescs` 用同一个 `@sizeOf` 计算回写长度,于是以 20 字节步长
+  覆写磁盘上的表,**直接压坏 group 1 的真实描述符**。
+- **方案**:结构体补上 pad 与 reserved 字段,尺寸精确为 32 字节——8 处
+  `gds[]` 索引、`bgdt_size`、回写长度一次全部修正;`GROUP_DESC_SIZE`
+  记录磁盘步长。描述符表改用 `allocContiguous` 按真实大小分配（单页只放得下
+  128 个描述符）,并由 `readSectorRun` 拆成驱动允许的 128 扇区分段。
+  新增 `groupForInode`/`groupForBlock` 作为统一校验入口,`readInode`、
+  `writeInode`、`freeInode`、`freeBlock` 不再用磁盘上的编号裸算下标。
+- **效果**:多块组卷不再读到错位描述符,也不再在回写时破坏磁盘上的表;
+  损坏镜像里的越界 inode/块号被挡在校验入口,不会越过描述符表末端。
+- **验证**:三架构构建 + `smoke`/`smoke-smp`/`smoke-smp-stress` +
+  riscv64/aarch64 smoke 全绿,打印 `[SK-153] ext2 group desc stride non-x86: OK`。
+  探针做过反向验证:去掉 pad 字段后报 `[SK-153] FAILED: stride` 并使冒烟失败。
+- **后续**:目录项 `rec_len`/`name_len` 仍未按块大小校验;`getdents64` 在用户
+  缓冲写满时会把目录 offset 推过未返回的条目。
+
 ---
 
 ## 4. M8 进度（x86_64 SMP）

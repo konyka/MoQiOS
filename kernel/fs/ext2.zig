@@ -120,11 +120,15 @@ pub fn init() void {
     const bgdt_sectors = bgdt_blocks * (block_size / SECTOR_SIZE);
     const bgdt_sector = bgdt_block * (block_size / SECTOR_SIZE);
 
-    group_descs_phys = pmm.allocPage() orelse return;
+    // One page holds 128 descriptors, so a volume with more block groups than
+    // that needs a larger table; reading it into a single page would run off
+    // the end of the allocation.
+    const bgdt_pages = (bgdt_size + 4095) / 4096;
+    group_descs_phys = pmm.allocContiguous(bgdt_pages) orelse return;
     group_descs_virt = hhdm.physToVirt(group_descs_phys);
 
     const gd_buf: [*]u8 = @ptrFromInt(group_descs_virt);
-    if (!readSectorsToBuf(bgdt_sector, bgdt_sectors, gd_buf)) return;
+    if (!readSectorRun(bgdt_sector, bgdt_sectors, gd_buf)) return;
 
     active = true;
 
@@ -141,6 +145,17 @@ fn readSectors(lba: u64, count: u32) bool {
     const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
     const n = virtio_blk.readSectors(DISK_LBA_OFFSET + lba, count, buf);
     return n > 0;
+}
+
+/// Read `count` sectors, splitting into transfers the driver accepts (128 max).
+fn readSectorRun(lba: u64, count: u32, dest: [*]u8) bool {
+    var done: u32 = 0;
+    while (done < count) {
+        const chunk = @min(count - done, @as(u32, 128));
+        if (!readSectorsToBuf(lba + done, chunk, dest + done * SECTOR_SIZE)) return false;
+        done += chunk;
+    }
+    return true;
 }
 
 fn readSectorsToBuf(lba: u64, count: u32, dest: [*]u8) bool {
@@ -394,9 +409,30 @@ pub fn cacheStats() struct { hits: u64, misses: u64 } {
 
 // ─── Inode operations ─────────────────────────────────────────────────────
 
+/// Block group holding `inode_num`, or null if the number is out of range.
+///
+/// Inode numbers reach us from on-disk directory entries, so a corrupt or
+/// hostile image can name any inode. Indexing the descriptor table with the
+/// derived group would then read past the table, and inode 0 would underflow.
+fn groupForInode(inode_num: u32) ?u32 {
+    if (inode_num == 0 or inodes_per_group == 0) return null;
+    const group = (inode_num - 1) / inodes_per_group;
+    if (group >= groups_count) return null;
+    return group;
+}
+
+/// Block group holding `block_num`, or null if the number is out of range.
+/// Block numbers come from on-disk inode block pointers.
+fn groupForBlock(block_num: u32) ?u32 {
+    if (block_num < first_data_block or sb.blocks_per_group == 0) return null;
+    const group = (block_num - first_data_block) / sb.blocks_per_group;
+    if (group >= groups_count) return null;
+    return group;
+}
+
 fn readInode(inode_num: u32, out: *Ext2Inode) bool {
     const gds: [*]const Ext2GroupDesc = @ptrFromInt(group_descs_virt);
-    const group = (inode_num - 1) / inodes_per_group;
+    const group = groupForInode(inode_num) orelse return false;
     const loc = eu.inodeLocation(inode_num, inodes_per_group, inode_size, block_size, gds[group].bg_inode_table);
     const target_block = loc.target_block;
     const offset_in_block = loc.offset_in_block;
@@ -1314,7 +1350,7 @@ fn writeBlock(block_num: u32, buf: [*]const u8) bool {
 
 fn writeInode(inode_num: u32, inode: *const Ext2Inode) bool {
     const gds: [*]const Ext2GroupDesc = @ptrFromInt(group_descs_virt);
-    const group = (inode_num - 1) / inodes_per_group;
+    const group = groupForInode(inode_num) orelse return false;
     const loc = eu.inodeLocation(inode_num, inodes_per_group, inode_size, block_size, gds[group].bg_inode_table);
     const target_block = loc.target_block;
     const offset_in_block = loc.offset_in_block;
@@ -2065,7 +2101,7 @@ fn freeBlock(block_num: u32) void {
         cacheHashRemove(cidx);
         cache[cidx].valid = false;
     }
-    const group = (block_num - first_data_block) / sb.blocks_per_group;
+    const group = groupForBlock(block_num) orelse return;
     const index = (block_num - first_data_block) % sb.blocks_per_group;
 
     const gds: [*]Ext2GroupDesc = @ptrFromInt(group_descs_virt);
@@ -2119,7 +2155,7 @@ fn freeBlock(block_num: u32) void {
 
 /// Mark an inode as free in the bitmap.
 fn freeInode(inode_num: u32) void {
-    const group = (inode_num - 1) / inodes_per_group;
+    const group = groupForInode(inode_num) orelse return;
     const index = (inode_num - 1) % inodes_per_group;
 
     const gds: [*]Ext2GroupDesc = @ptrFromInt(group_descs_virt);

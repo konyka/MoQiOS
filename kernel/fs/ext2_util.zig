@@ -51,6 +51,10 @@ pub const Ext2Superblock = extern struct {
     volume_name: [16]u8,
 };
 
+/// On-disk block group descriptor. The trailing pad and reserved words are
+/// never read, but they are part of the 32-byte on-disk stride: without them
+/// `@sizeOf` is 20 and every descriptor after the first is indexed at the wrong
+/// offset — and written back over the next one.
 pub const Ext2GroupDesc = extern struct {
     bg_block_bitmap: u32,
     bg_inode_bitmap: u32,
@@ -58,7 +62,12 @@ pub const Ext2GroupDesc = extern struct {
     bg_free_blocks_count: u16,
     bg_free_inodes_count: u16,
     bg_used_dirs_count: u16,
+    bg_pad: u16 = 0,
+    bg_reserved: [3]u32 = @splat(0),
 };
+
+/// On-disk stride between block group descriptors.
+pub const GROUP_DESC_SIZE: u32 = 32;
 
 pub const Ext2Inode = extern struct {
     mode: u16,

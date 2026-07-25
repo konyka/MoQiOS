@@ -410,6 +410,12 @@ const FdTable = struct {
 文件: `ext2.zig`
 
 - Superblock、Block Group Descriptor
+  - `Ext2GroupDesc` 必须保持磁盘上的 **32 字节**步长（含 `bg_pad`/`bg_reserved`），
+    尺寸由 `GROUP_DESC_SIZE` 与 SK-153 约束。描述符表按真实大小用
+    `allocContiguous` 分配（单页只放得下 128 个），读取经 `readSectorRun` 拆成
+    驱动允许的 128 扇区分段。
+  - 来自磁盘的 inode 号与块号一律经 `groupForInode`/`groupForBlock` 校验后
+    才用于索引描述符表。
 - Inode（直接块 + 单级间接块）
 - 块缓存：256 条目 + 64 桶哈希表加速查找，dirty write-back
 - 间接块指针缓存：16 条目，避免重复读取间接块
