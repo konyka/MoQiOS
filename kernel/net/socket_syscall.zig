@@ -696,9 +696,11 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
 
         var tmp: [4096]u8 = undefined;
         const to_read: u32 = @intCast(@min(iov_sz, 4096));
+        if (!copy.validateUserBuffer(iov_base, to_read)) return if (total == 0) -14 else @intCast(total);
         const result = net_mod.tcp.tcpRecv(tcb_idx, &tmp, to_read);
         if (result > 0) {
-            _ = copy.copyToUser(@ptrFromInt(iov_base), &tmp, @intCast(result));
+            const copied = copy.copyToUser(@ptrFromInt(iov_base), &tmp, @intCast(result));
+            if (copied != @as(usize, @intCast(result))) return if (total == 0) -14 else @intCast(total);
             total += @intCast(result);
         }
         if (result <= 0) break;

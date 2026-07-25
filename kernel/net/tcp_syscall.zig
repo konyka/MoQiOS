@@ -36,11 +36,13 @@ pub fn tcpRecv(tcb_idx: u32, buf: u64, len: u32) i64 {
 
     var tmp_buf: [4096]u8 = undefined;
     const to_read = @min(len, 4096);
+    const copy = @import("../mm/copy_from_user.zig");
+    if (!copy.validateUserBuffer(buf, to_read)) return -14; // EFAULT
 
     const result = net_mod.tcp.tcpRecv(tcb_idx, &tmp_buf, to_read);
     if (result > 0) {
-        const copy = @import("../mm/copy_from_user.zig");
-        _ = copy.copyToUser(@ptrFromInt(buf), &tmp_buf, @intCast(result));
+        const copied = copy.copyToUser(@ptrFromInt(buf), &tmp_buf, @intCast(result));
+        if (copied != @as(usize, @intCast(result))) return -14; // EFAULT
     }
     return @bitCast(result);
 }
