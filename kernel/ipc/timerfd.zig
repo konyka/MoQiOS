@@ -10,6 +10,7 @@
 ///   - timerTick() called from scheduler tick to check for expirations
 ///   - Blocking read when no expirations and !TFD_NONBLOCK
 ///   - TSC-based nanosecond resolution for absolute time conversion
+const std = @import("std");
 const sched = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
@@ -73,20 +74,32 @@ var timer_pool: [MAX_TIMERFD_INSTANCES]TimerInstance = @splat(.{});
 /// Global lock protecting the timer pool.
 var timer_lock: IrqSpinlock = .{};
 
+fn timespecToNs(ts: Timespec) ?u64 {
+    if (ts.tv_sec < 0 or ts.tv_nsec < 0 or ts.tv_nsec >= 1_000_000_000) return null;
+    const sec: u64 = @intCast(ts.tv_sec);
+    const nsec: u64 = @intCast(ts.tv_nsec);
+    if (sec > (std.math.maxInt(u64) - nsec) / 1_000_000_000) return null;
+    return sec * 1_000_000_000 + nsec;
+}
+
 /// Convert nanoseconds to scheduler ticks (rounding up to at least 1 tick).
-fn nsToTicks(ns: u64) u64 {
+fn nsToTicks(ns: u64) ?u64 {
     if (ns == 0) return 0;
     // ns * TICKS_PER_SEC / 1_000_000_000, but avoid overflow for large ns
     const sec = ns / 1_000_000_000;
     const rem_ns = ns % 1_000_000_000;
+    if (sec > std.math.maxInt(u64) / TICKS_PER_SEC) return null;
     const ticks_from_sec = sec * TICKS_PER_SEC;
     const ticks_from_rem = (rem_ns * TICKS_PER_SEC + 999_999_999) / 1_000_000_000;
+    if (ticks_from_sec > std.math.maxInt(u64) - ticks_from_rem) return null;
     return ticks_from_sec + ticks_from_rem;
 }
 
 /// Convert scheduler ticks to nanoseconds.
 fn ticksToNs(ticks: u64) u64 {
-    return ticks * (1_000_000_000 / TICKS_PER_SEC);
+    const ns_per_tick = 1_000_000_000 / TICKS_PER_SEC;
+    if (ticks > std.math.maxInt(u64) / ns_per_tick) return std.math.maxInt(u64);
+    return ticks * ns_per_tick;
 }
 
 /// Create a new timerfd instance.
@@ -121,6 +134,10 @@ pub fn timerfdCreate(clock_id: u32, flags: u32) i32 {
 /// Returns 0 on success, negative errno on failure.
 pub fn timerfdSettime(timerfd_idx: u32, flags: u32, new_value: *const Itimerspec, old_value: ?*Itimerspec) i32 {
     if (timerfd_idx >= MAX_TIMERFD_INSTANCES) return -9; // EBADF
+    if (flags & ~@as(u32, TFD_TIMER_ABSTIME) != 0) return -22; // EINVAL
+    const value_ns = timespecToNs(new_value.it_value) orelse return -22;
+    const interval_ns = timespecToNs(new_value.it_interval) orelse return -22;
+    const value_ticks = nsToTicks(value_ns) orelse return -22;
 
     const saved = timer_lock.acquire();
     defer timer_lock.release(saved);
@@ -150,8 +167,6 @@ pub fn timerfdSettime(timerfd_idx: u32, flags: u32, new_value: *const Itimerspec
     }
 
     // Disarm if it_value is zero
-    const value_ns = @as(u64, @bitCast(new_value.it_value.tv_sec)) * 1_000_000_000 +
-        @as(u64, @bitCast(new_value.it_value.tv_nsec));
     if (value_ns == 0) {
         inst.active = false;
         inst.expiry_tick = 0;
@@ -160,8 +175,7 @@ pub fn timerfdSettime(timerfd_idx: u32, flags: u32, new_value: *const Itimerspec
     }
 
     // Set interval
-    inst.interval_ns = @as(u64, @bitCast(new_value.it_interval.tv_sec)) * 1_000_000_000 +
-        @as(u64, @bitCast(new_value.it_interval.tv_nsec));
+    inst.interval_ns = interval_ns;
 
     // Calculate expiry
     if ((flags & TFD_TIMER_ABSTIME) != 0) {
@@ -169,14 +183,19 @@ pub fn timerfdSettime(timerfd_idx: u32, flags: u32, new_value: *const Itimerspec
         const abs_ns = value_ns;
         const current_ns = tsc.nanos();
         if (abs_ns > current_ns) {
-            inst.expiry_tick = idt.getTickCount() + nsToTicks(abs_ns - current_ns);
+            const delta = nsToTicks(abs_ns - current_ns) orelse return -22;
+            const now = idt.getTickCount();
+            if (delta > std.math.maxInt(u64) - now) return -22;
+            inst.expiry_tick = now + delta;
         } else {
             // Already expired
             inst.expiry_tick = idt.getTickCount();
         }
     } else {
         // Relative time
-        inst.expiry_tick = idt.getTickCount() + nsToTicks(value_ns);
+        const now = idt.getTickCount();
+        if (value_ticks > std.math.maxInt(u64) - now) return -22;
+        inst.expiry_tick = now + value_ticks;
     }
 
     inst.active = true;
@@ -321,7 +340,7 @@ pub fn timerfdGetExpirations(timerfd_idx: u32) u64 {
 /// Called from the scheduler timer tick.
 /// Checks all active timers for expiration and wakes waiters.
 pub fn timerTick(current_tick: u64) void {
-    const saved = timer_lock.acquire();
+    var saved = timer_lock.acquire();
 
     for (&timer_pool, 0..) |*inst, i| {
         if (!inst.valid or !inst.active) continue;
@@ -331,7 +350,11 @@ pub fn timerTick(current_tick: u64) void {
 
             if (inst.interval_ns > 0) {
                 // Repeating timer: schedule next expiration
-                inst.expiry_tick = current_tick + nsToTicks(inst.interval_ns);
+                const interval_ticks = nsToTicks(inst.interval_ns) orelse std.math.maxInt(u64);
+                inst.expiry_tick = if (interval_ticks > std.math.maxInt(u64) - current_tick)
+                    std.math.maxInt(u64)
+                else
+                    current_tick + interval_ticks;
             } else {
                 // One-shot timer: stop
                 inst.active = false;
@@ -352,7 +375,7 @@ pub fn timerTick(current_tick: u64) void {
             const epoll_mod = @import("../net/epoll.zig");
             epoll_mod.epollNotify(.timerfd, idx, epoll_mod.EPOLLIN);
             // Re-acquire for next iteration
-            _ = timer_lock.acquire();
+            saved = timer_lock.acquire();
         }
     }
 
