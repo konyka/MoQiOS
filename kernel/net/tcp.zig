@@ -1471,12 +1471,12 @@ fn applyBbrStartup(tcb: *TcpTcb, acked: u32, smss: u32) void {
     }
 }
 
-/// BBR-lite ProbeBW: 8-phase pacing-gain cycle around BDP (SK-122/123).
+/// BBR-lite ProbeBW: 8-phase pacing-gain cycle around BDP (SK-122/123/147).
 fn applyBbrProbeBw(tcb: *TcpTcb, acked: u32) void {
     const bdp = probeBdpBytes(tcb.delivery_rate, tcb.min_rtt_ms);
     if (bdp == 0) return;
     advanceBbrCycle(tcb);
-    const gain = probeBbrCycleGainNum(tcb.bbr_cycle_idx);
+    const gain = bbrCycleGainFor(tcb);
     const target = probeBbrCycleCwnd(bdp, gain);
     if (target == 0) return;
     if (tcb.cwnd < target) {
@@ -1499,11 +1499,18 @@ fn advanceBbrCycle(tcb: *TcpTcb) void {
     tcb.bbr_cycle_ms = now;
 }
 
+fn bbrCycleGainFor(tcb: *const TcpTcb) u32 {
+    const base = probeBbrCycleGainNum(tcb.bbr_cycle_idx);
+    // SK-147: AccECN paths shrink ProbeBW gain with CE-rate EWMA.
+    if (tcb.accecn_ok) return probeL4sEwmaGainNum(base, tcb.l4s_ce_ewma);
+    return base;
+}
+
 fn bbrPacedRate(tcb: *const TcpTcb) u32 {
     const rate = tcb.delivery_rate;
     if (rate == 0) return 0;
     if (tcb.bbr_startup or tcb.bbr_probe_rtt) return rate;
-    const gain = probeBbrCycleGainNum(tcb.bbr_cycle_idx);
+    const gain = bbrCycleGainFor(tcb);
     const v = (@as(u64, rate) * gain) / 4;
     return @intCast(@min(v, @as(u64, 0xffff_ffff)));
 }
@@ -3839,6 +3846,15 @@ pub fn probeL4sEwmaCuts(ewma_q8: u32, ace_delta: u3) u3 {
     if (cuts < 1) cuts = 1;
     if (cuts > 7) cuts = 7;
     return @intCast(cuts);
+}
+
+/// Scale ProbeBW gain numerator by CE-rate EWMA: keep (8−cuts)/8 (SK-147).
+pub fn probeL4sEwmaGainNum(gain_num: u32, ewma_q8: u32) u32 {
+    if (gain_num == 0 or ewma_q8 == 0) return gain_num;
+    const cuts: u32 = probeL4sEwmaCuts(ewma_q8, 1);
+    const keep = 8 - cuts;
+    const v = (gain_num * keep) / 8;
+    return if (v == 0) 1 else v;
 }
 
 /// Apply CUBIC β `delta` times (or once if delta=0) (SK-136).

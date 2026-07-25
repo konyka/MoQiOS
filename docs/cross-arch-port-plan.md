@@ -2167,7 +2167,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:L4S 减窗跟随平滑 CE 标记率,减少单次 ACE δ 噪声。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-146] tcp l4s ce ewma non-x86: OK`。
-- **后续**:AccECN TCP 选项扩展计数;或 EWMA 驱动 pacing gain。
+- **后续**:见 3.147（EWMA 驱动 pacing gain,已完成)。
+
+---
+
+### 3.147 CE-rate EWMA 缩放 ProbeBW pacing gain（SK-147,2026-07-25）
+
+- **背景**:SK-146 已有 RTT CE 标记率 EWMA,但 BBR ProbeBW 的 pacing/cwnd gain
+  仍只在 ACE 砍窗事件上经 SK-137 打折 `delivery_rate`,持续轻度标记时发送节奏偏激进。
+- **方案**:AccECN 路径用 `probeL4sEwmaGainNum` 把周期 gain 缩为 `(8−cuts)/8`;
+  `bbrPacedRate`/`applyBbrProbeBw` 共用 `bbrCycleGainFor`。
+  `shared/sk147.zig` 锁定冷/轻/重缩放与 cwnd 目标。
+- **效果**:L4S 标记率升高时 pacing 与 ProbeBW 目标同步收紧,无需等待下一次 ACE δ。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-147] tcp l4s ewma pace gain non-x86: OK`。
+- **后续**:AccECN TCP 选项扩展计数;或 EWMA 驱动 Startup→ProbeBW 切换阈值。
 
 ---
 
