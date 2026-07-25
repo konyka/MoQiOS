@@ -104,12 +104,32 @@ fn rangesOverlap(a_base: u64, a_pages: u64, b_base: u64, b_pages: u64) bool {
     return a_base < b_end and b_base < a_end;
 }
 
+/// Offset of the first mapped page in the range, or null when every page is
+/// free. Catches everything the mmap_regions table does not know about — the
+/// loaded image, the stack, break pages — so a placement search cannot land on a
+/// live mapping, and lets the search skip straight past a conflict.
+fn firstMappedPage(task: *task_mod.Task, base: u64, num_pages: u64) ?u64 {
+    for (0..num_pages) |p| {
+        if (paging_mod.isPageMapped(task.page_table_phys, base + p * user_space.PAGE_SIZE)) {
+            return p;
+        }
+    }
+    return null;
+}
+
+fn pagesFree(task: *task_mod.Task, base: u64, num_pages: u64) bool {
+    return firstMappedPage(task, base, num_pages) == null;
+}
+
 fn rangeAvailable(task: *task_mod.Task, base: u64, num_pages: u64, ignore_base: ?u64) bool {
-    const stack_base = user_space.USER_STACK_TOP - user_space.PAGE_SIZE;
     if (num_pages == 0) return false;
     if (base % user_space.PAGE_SIZE != 0) return false;
-    if (base >= stack_base) return false;
-    if (num_pages > (stack_base - base) / user_space.PAGE_SIZE) return false;
+    if (base < user_space.PAGE_SIZE) return false;
+    // Bound against the top of the user half rather than the stack: ELF images
+    // load above USER_STACK_TOP, so a stack-relative ceiling declared every
+    // address they use unavailable.
+    if (base >= user_space.USER_ADDR_MAX) return false;
+    if (num_pages > (user_space.USER_ADDR_MAX - base) / user_space.PAGE_SIZE) return false;
 
     for (task.mmap_regions) |r| {
         if (!r.active) continue;
@@ -119,16 +139,28 @@ fn rangeAvailable(task: *task_mod.Task, base: u64, num_pages: u64, ignore_base: 
     return true;
 }
 
-fn findFreeMmapRange(task: *task_mod.Task, num_pages: u64, ignore_base: u64) ?u64 {
+/// Scan the mmap window for `num_pages` free pages, starting at `start`.
+/// `ignore_base` exempts one tracked region (mremap moving a mapping).
+fn findFreeRangeFrom(task: *task_mod.Task, start: u64, num_pages: u64, ignore_base: ?u64) ?u64 {
     const page = user_space.PAGE_SIZE;
-    const stack_base = user_space.USER_STACK_TOP - page;
-    var base = (task.brk_current + page - 1) / page * page;
-    if (base < user_space.USER_CODE_BASE + page) base = user_space.USER_CODE_BASE + page;
+    if (num_pages == 0) return null;
 
-    while (base < stack_base and num_pages <= (stack_base - base) / page) : (base += page) {
+    var base = if (start < user_space.USER_MMAP_BASE) user_space.USER_MMAP_BASE else start;
+    base = (base + page - 1) / page * page;
+
+    while (base < user_space.USER_MMAP_MAX and num_pages <= (user_space.USER_MMAP_MAX - base) / page) {
+        if (firstMappedPage(task, base, num_pages)) |p| {
+            base += (p + 1) * page; // resume past the page in the way
+            continue;
+        }
         if (rangeAvailable(task, base, num_pages, ignore_base)) return base;
+        base += page;
     }
     return null;
+}
+
+fn findFreeMmapRange(task: *task_mod.Task, num_pages: u64, ignore_base: u64) ?u64 {
+    return findFreeRangeFrom(task, user_space.USER_MMAP_BASE, num_pages, ignore_base);
 }
 
 fn allocZeroedPage() ?u64 {
@@ -230,17 +262,32 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     var base: u64 = undefined;
     if (is_fixed and addr_hint != 0) {
         base = addr_hint / user_space.PAGE_SIZE * user_space.PAGE_SIZE;
+        if (base < user_space.PAGE_SIZE) return -22; // EINVAL
+        if (num_pages > (user_space.USER_ADDR_MAX - base) / user_space.PAGE_SIZE) return -12; // ENOMEM
+        // MAP_FIXED replaces whatever is there, so drop the old pages first.
         unmapRange(cur, base, num_pages);
         untrackMmapRange(cur, base, num_pages);
-    } else if (addr_hint != 0 and addr_hint >= user_space.PAGE_SIZE) {
-        base = (addr_hint + user_space.PAGE_SIZE - 1) / user_space.PAGE_SIZE * user_space.PAGE_SIZE;
     } else {
-        base = (cur.brk_current + user_space.PAGE_SIZE - 1) / user_space.PAGE_SIZE * user_space.PAGE_SIZE;
-    }
+        // Without MAP_FIXED the address is advisory. Honour it only when the
+        // range is free: mapPage overwrites a live PTE silently, so taking the
+        // hint unconditionally stranded the old frames and tore down mappings
+        // the caller was still using.
+        const hint = if (addr_hint >= user_space.PAGE_SIZE)
+            (addr_hint + user_space.PAGE_SIZE - 1) / user_space.PAGE_SIZE * user_space.PAGE_SIZE
+        else
+            0;
 
-    // Validate: don't overflow into kernel space or stack
-    const stack_base = user_space.USER_STACK_TOP - user_space.PAGE_SIZE;
-    if (base + num_pages * user_space.PAGE_SIZE >= stack_base) return -12; // ENOMEM
+        if (hint != 0 and hint < user_space.USER_ADDR_MAX and
+            num_pages <= (user_space.USER_ADDR_MAX - hint) / user_space.PAGE_SIZE and
+            rangeAvailable(cur, hint, num_pages, null) and pagesFree(cur, hint, num_pages))
+        {
+            base = hint;
+        } else {
+            base = findFreeRangeFrom(cur, hint, num_pages, null) orelse
+                findFreeRangeFrom(cur, user_space.USER_MMAP_BASE, num_pages, null) orelse
+                return -12; // ENOMEM
+        }
+    }
 
     // Allocate and map pages
     const writable = (prot & 2) != 0;
@@ -289,13 +336,9 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     // Track the mapping region for munmap
     trackMmapRegion(cur, base, num_pages);
 
-    // Advance brk if we allocated above it (non-fixed mappings)
-    if (!is_fixed) {
-        const end = base + num_pages * user_space.PAGE_SIZE;
-        if (end > cur.brk_current) {
-            cur.brk_current = end;
-        }
-    }
+    // The break is deliberately left alone. Dragging it up to cover mmap
+    // placements made brk(2) report a break spanning memory it does not own, and
+    // a later shrink would then hand those mmap pages back to the allocator.
     return @bitCast(base);
 }
 

@@ -99,6 +99,9 @@ pub const Task = struct {
     /// Current program break (end of heap). 0 = not initialized.
     /// brk syscall uses this to manage the heap region.
     brk_current: u64,
+    /// Lowest address the break may return to — the initial break set by the
+    /// loader. Shrinking past it would unmap the loaded image itself.
+    brk_start: u64,
     /// Per-process file descriptor table.
     fd_table: @import("../fs/vfs.zig").FdTable,
 

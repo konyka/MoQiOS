@@ -167,6 +167,30 @@ const AddressSpace = struct {
 - 配套 munmap 解除映射和 msync 同步脏页
 - syscall mmap: 支持匿名映射 + 文件映射 (MAP_PRIVATE)，读取文件内容到物理页
 
+**用户地址空间布局**（两种镜像不同，范围校验必须区分）:
+
+| 区域 | 平坦二进制 | ELF 镜像（全部 C 用户程序） |
+|---|---|---|
+| 代码 | `USER_CODE_BASE` = 4MB | 镜像自带，链接在 16MB |
+| 栈 | 单页在 `USER_STACK_TOP - PAGE` = 0x7FF000，按需向下增长至 64KB | 同左（**在代码之下**） |
+| 堆（brk） | 从代码之上向栈生长，天花板 0x7FF000 | 从镜像之上向上生长，天花板 `USER_HEAP_MAX` = 4GB |
+| 内核选址的 mmap | `USER_MMAP_BASE` = 8GB 起，上限 16GB | 同左 |
+
+两种布局中代码/堆/栈的相对次序相反，因此"堆必须低于 `USER_STACK_TOP`"这类静态窗口
+校验对 ELF 是反的——它曾使 `brk` 增长和匿名 `mmap` 对所有 C 程序无条件失败。正确做法是
+判断目标页是否空闲，再用 `USER_ADDR_MAX`/`USER_HEAP_MAX` 兜底。mmap 选址窗口刻意置于堆
+天花板与栈增长区间之上，使 `mmap` 不会把堆封住；`mmap` 也不再推进 `brk_current`。
+
+- `brk`: 可在 `[Task.brk_start, 天花板]` 内移动。`brk_start` 记录加载器留下的初始
+  break，收缩不能低于它（否则会解除镜像自身的映射）。增长逐页确认未被映射（`mapPage`
+  会无声覆写活跃 PTE 并泄漏旧帧）并清零新页（`pmm.allocPage` 返回的帧带有上一使用者的
+  数据）；收缩释放让出的页。增长/收缩/原地是三条独立分支——早期实现无条件写
+  `for (old_page..new_page)`，收缩时区间反向，直接导致内核整数溢出 panic。
+- 非 `MAP_FIXED` 的 `addr` 按 POSIX 视为建议：仅在区间空闲时采纳，否则内核另选地址。
+  无条件采纳会让进程用 `mmap(&_start, ...)` 覆盖掉正在执行的代码页。
+- 运行时覆盖: `hello30`（brk 增长/清零/收缩 + 匿名 mmap + hint 让位），
+  冒烟门禁标记 `hello30: brk/mmap PASS`。
+
 ### 1.9 Swap 页面置换 (Clock算法 + u64位图分配 + 256MB swap) ✅
 
 文件: `swap.zig`, `arch/x86_64/paging.zig`

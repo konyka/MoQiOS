@@ -36,6 +36,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.last_cpu = parent.last_cpu;
 
     child.brk_current = parent.brk_current;
+    child.brk_start = parent.brk_start;
 
     // v53.50: Copy free_bm bitmap — child inherits parent's fd occupancy state.
     // Without this, child's free_bm stays at default (only bits 0-2 occupied),

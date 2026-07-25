@@ -583,6 +583,29 @@ _start:
     movq $13, %rdx
     syscall
 
+    # Spawn hello30 (brk grow/zero/shrink test)
+    movq $5, %rax
+    leaq hello30_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn30_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done30_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
     # Spawn hello9 (fork test)
     movq $5, %rax
     leaq hello9_name(%rip), %rdi
@@ -823,6 +846,13 @@ done23_msg:
     .ascii "spawned hello29\n"
     done29_msg:
     .ascii "hello29 done\n"
+    hello30_name:
+    .ascii "hello30"
+    .byte 0
+    spawn30_msg:
+    .ascii "spawned hello30\n"
+    done30_msg:
+    .ascii "hello30 done\n"
     hello26_name:
     .ascii "hello26"
     .byte 0

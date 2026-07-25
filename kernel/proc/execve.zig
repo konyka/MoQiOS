@@ -77,6 +77,7 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64) ?u64 {
     cur.user_entry = result.entry;
     cur.user_stack_top = result.stack_top;
     cur.brk_current = result.brk;
+    cur.brk_start = result.brk;
 
     // Switch to new address space
     asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
@@ -176,6 +177,7 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64) ?u64 {
     cur.user_entry = result.entry;
     cur.user_stack_top = result.stack_top;
     cur.brk_current = result.brk;
+    cur.brk_start = result.brk;
 
     asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
         :

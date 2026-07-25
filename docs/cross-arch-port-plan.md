@@ -2351,6 +2351,62 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **已知边界**:`EIO` 分支本身未做运行时验证——需要一个会失败的块设备才能触达;
   冒烟只证明成功路径仍返回 0 且 fd 校验生效。
 
+### 3.156 brk/mmap 地址空间自洽性（2026-07-25）
+
+- **背景**:接手 `mm/proc` 遗留项"`mmap`/brk 覆写已有映射"时发现,这两个调用对
+  C 用户程序**根本就不工作**——从来没有用户程序调用过 `brk` 或 `mmap`,
+  `hello30` 是第一个,于是一次跑完暴露出整簇问题。
+  根因是地址布局与为它写的范围校验脱节了:`USER_CODE_BASE`(4MB)、
+  `USER_STACK_TOP`(8MB) 描述的是平坦二进制布局——堆从代码向上朝栈生长;而 ELF
+  镜像自带加载地址,C 程序链接在 16MB,即**栈之上**,堆向上生长、栈远在下方。
+  于是"堆必须低于 `USER_STACK_TOP`"这类校验对 ELF 不只是保守,而是反的。
+  - **P0** `brk` 拒绝任何 ≥ 0x7FF000 的地址,而 ELF 的初始 break 已经是
+    ~0x1002000,所以**每一次**增长都被拒绝并返回未变的 break——对不做比较的
+    调用方与成功无法区分,程序永远无法扩堆。修复前实测:`brk(0)=0x1002000`、
+    `grow=0x1002000`。
+  - **P0** 增长循环无条件写成 `for (old_page..new_page)`,收缩时区间反向。Zig 以
+    `new_page - old_page` 计算长度,在 Debug 构建下触发整数溢出内核 panic
+    （release 下则是失控循环）。任何收缩 break 的程序都能从用户态触发,而
+    `free` 正是这么做的。ELF 只是被上一条挡住才没暴露,平坦二进制当下即可触达。
+  - **P1** brk 新增页从不清零。`pmm.allocPage` 原样返回物理帧（`mmap` 明确清零
+    并注明原因）,于是扩堆把上一个使用者留在帧里的内容交给了进程。
+  - **P1** brk 增长与非 `MAP_FIXED` 的 `mmap` 都直接 `mapPage` 覆盖既有映射。
+    `mapPageInner` 会无声覆写活跃 PTE,旧物理帧失去最后一个引用而泄漏,调用方
+    正在使用的映射也被静默替换。
+  - **P1** `mmap` 把非 `MAP_FIXED` 的 `addr` 当成强制地址。POSIX 规定它只是建议,
+    无条件采用意味着进程可以摧毁自己的代码段:不带 `MAP_FIXED` 的
+    `mmap(&_start, ...)` 会替换掉正在执行的那一页。
+  - **P1** `mmap` 自己的天花板校验 `base + len >= stack_base` 有同样的反转,而
+    `base` 取自 `brk_current`,所以每一次匿名 `mmap` 都返回 `ENOMEM`;支撑
+    `mremap` 的 `rangeAvailable`/`findFreeMmapRange` 也带着这个假设。
+  - **P2** 非 fixed 的 `mmap` 会把 `brk_current` 拖到其映射之上。配合本轮新增的
+    收缩支持,`brk(0)` 会报出一个跨越堆并不拥有的内存的 break,而收缩会把那些
+    `mmap` 页还给分配器。
+- **方案**:break 可在 `[brk_start, ceiling]` 内移动——平坦二进制保留原来的
+  栈相对天花板（对它们堆确实朝栈生长）,ELF 用 `USER_HEAP_MAX`(4GB)。增长、
+  收缩、原地三条分支分离,收缩释放让出的页,增长前逐页确认未被映射,新页清零。
+  `mmap` 仅在区间空闲时采纳 hint,否则自行寻找空闲区间;边界改为相对
+  `USER_ADDR_MAX`;内核选址改用专属窗口 `USER_MMAP_BASE`(8GB)——它同时高于堆
+  天花板和栈的按需增长区间,两者不再争抢;`mmap` 不再移动 break。
+  新增 `Task.brk_start` 记录加载器留下的 break,使收缩无法向下走进镜像并把它
+  解除映射;两条加载路径、`execve` 两处均设置,`fork` 继承。任务槽分配时清零,
+  因此没有加载器建堆的任务 `brk_start == 0`,`brk` 拒绝移动。
+- **效果**:ELF 程序首次可用 `brk`/`mmap`;收缩不再 panic;堆页不再泄漏上一
+  使用者的数据;两条路径都不再覆写活跃映射并泄漏物理帧。
+- **验证**:三架构构建 + `smoke`/`smoke-smp`/`smoke-smp-stress` +
+  riscv64/aarch64 smoke 全绿。`hello30` 覆盖五项性质:break 增长到请求地址、
+  新堆页读为零且可写、收缩不 panic、匿名 `mmap` 返回可用的清零页且 `munmap`
+  可释放、指向自身代码的 hint 被安置到别处且代码完好。
+  `hello30: brk/mmap PASS` 已加入 x86_64 冒烟门禁。三项负面对照均命中:恢复
+  反向区间产生 `!!! KERNEL PANIC !!! message: integer overflow` 并使冒烟失败;
+  去掉清零使 `hello30` 报 `FAIL (heap page not zeroed/writable)`（证明残留数据
+  真实可观测）;强制采用 hint 使 `hello30` 被 SEGFAULT 杀死。这三项对照在标记
+  加入门禁**之前**都能通过冒烟,说明门禁确实缺这一条。
+- **已知边界**:未加共享探针——`brk`/`mmap` 需要活的用户地址空间,而
+  riscv64/aarch64 端口尚无,探针只能对着固定装置断言,并不会真正走到被修的代码。
+  `mremap` 路径（由 `rangeAvailable`/`findFreeMmapRange` 支撑）的边界一并修正,
+  但没有用户程序调用 `mremap`,因此属于推理而非运行时验证,留待后续补用例。
+
 ---
 
 ## 4. M8 进度（x86_64 SMP）

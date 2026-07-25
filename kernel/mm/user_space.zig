@@ -17,12 +17,34 @@ pub const PAGE_SIZE: u64 = 4096;
 ///   0xFFFF_8000_0000_0000 - ...                    : kernel space (shared via HHDM)
 ///
 /// Specific regions within user space:
-///   0x0000_0000_0040_0000 (4MB)    : code region (load address)
-///   0x0000_0000_7FC0_0000 (~2GB-64MB): stack region (grows down from ~2GB)
+///   0x0000_0000_0040_0000 (4MB) : load address for flat binaries
+///   0x0000_0000_0080_0000 (8MB) : stack top; the stack grows down from here
+///
+/// ELF images carry their own load addresses and the C user programs link at
+/// 16MB, i.e. *above* the stack. So there is no single ordering of code, heap
+/// and stack that holds for both image kinds: for flat binaries the heap grows
+/// from 4MB up toward the stack, while for ELF images it grows from 16MB upward
+/// with the stack far below. Range checks that assume one ordering are wrong for
+/// the other; callers must instead test whether the pages they want are free and
+/// clamp against USER_HEAP_MAX.
 pub const USER_CODE_BASE: u64 = 0x0040_0000; // 4MB — where programs are loaded
 pub const USER_STACK_TOP: u64 = 0x0080_0000; // 8MB — stack grows down from here
 pub const USER_STACK_BOTTOM: u64 = 0x0001_0000; // 64KB — minimum stack address
 pub const USER_STACK_INITIAL: u64 = 64 * PAGE_SIZE; // 256KB — initial stack allocation
+
+/// Top of the user half. Addresses at or above this belong to the kernel.
+pub const USER_ADDR_MAX: u64 = 0x0000_8000_0000_0000; // 128TB
+
+/// Ceiling for break growth. Well below the lower-half limit, so arithmetic on
+/// `addr + length` cannot wrap into kernel space.
+pub const USER_HEAP_MAX: u64 = 0x0000_0001_0000_0000; // 4GB
+
+/// Window mmap draws from when the kernel picks the address. Kept above
+/// USER_HEAP_MAX so that break growth and mmap never compete for pages — a
+/// mapping placed directly above the break would otherwise wall the heap in —
+/// and above USER_STACK_TOP so it stays clear of the stack's demand-grow range.
+pub const USER_MMAP_BASE: u64 = 0x0000_0002_0000_0000; // 8GB
+pub const USER_MMAP_MAX: u64 = 0x0000_0004_0000_0000; // 16GB
 
 /// Create a new user address space (PML4).
 /// Copies kernel-space entries (256-511) from the kernel PML4.

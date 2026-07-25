@@ -840,6 +840,56 @@ smoke run confirms the success paths still return 0 and that descriptor validati
 | `bash tools/qemu_smoke_riscv64.sh` | Passed | Includes `[SK-155] writeback flush error propagation non-x86: OK`. |
 | `bash tools/qemu_smoke_aarch64.sh` | Passed | Same marker. |
 
+### 5.2l Review Update: 2026-07-25 (brk/mmap address-space coherence)
+
+This pass took up the deferred `mm/proc` item — `mmap` and break growth mapping over existing mappings —
+and found the reason nobody had noticed: neither call worked at all for the C user programs. No user
+program had ever called `brk` or `mmap`, so `hello30` is the first caller, and it exposed the whole
+cluster in one run.
+
+The root cause is an address-space layout that drifted apart from the range checks written for it.
+`USER_CODE_BASE` (4MB) and `USER_STACK_TOP` (8MB) describe the flat-binary layout, where the heap grows
+from the code up toward the stack. ELF images carry their own load addresses and the C programs link at
+16MB — *above* the stack — so their heap grows upward with the stack far below. Every check of the form
+"the heap must stay under `USER_STACK_TOP`" is therefore not merely conservative but inverted for ELF.
+
+| Severity | Finding | Resolution / status |
+|---|---|---|
+| P0 | `brk` rejected any address at or above `USER_STACK_TOP - PAGE` (0x7FF000). For ELF images the initial break is already ~0x1002000, so *every* growth request was refused and the syscall returned the unchanged break — indistinguishable from success for a caller that does not compare, and there is no way for a program to grow its heap. Confirmed before the fix: `brk(0)=0x1002000`, `grow=0x1002000`. | Fixed: the break may move anywhere in `[brk_start, ceiling]`. Flat binaries keep the old stack-relative ceiling, since for them the heap really does grow toward the stack; ELF images use `USER_HEAP_MAX` (4GB). |
+| P0 | The growth loop ran `for (old_page..new_page)` unconditionally, so shrinking the break reversed the range. Zig computes the length as `new_page - old_page` on `usize`, which panics the kernel on integer overflow in a Debug build (and would run away in a release build). Reachable from user space by any program that shrinks its break, which is what `free` does. Masked for ELF images only because the check above refused to grow in the first place — flat binaries could reach it today. | Fixed: growth, shrink and no-op are separate branches, and shrinking releases the pages it gives back. Negative control: restoring the reversed range produces `!!! KERNEL PANIC !!! message: integer overflow` and fails the smoke gate. |
+| P1 | The break never zeroed the pages it added. `pmm.allocPage` returns frames as-is — `mmap` zeroes explicitly and says why — so a growing heap handed the process whatever the previous owner left in those frames. | Fixed: pages are cleared before they become reachable. Negative control: removing the `@memset` makes `hello30` report `FAIL (heap page not zeroed/writable)`, i.e. the stale data is real and observable, not theoretical. |
+| P1 | Both `brk` growth and non-`MAP_FIXED` `mmap` called `mapPage` over whatever was already mapped. `mapPageInner` overwrites a live PTE without complaint, so the old frame was stranded with no remaining reference and the caller's mapping was silently replaced. | Fixed: `brk` refuses to grow across a mapped page, and `mmap` checks the range before honouring a hint. |
+| P1 | `mmap` treated a non-`MAP_FIXED` `addr` as binding. POSIX makes it advisory, and honouring it unconditionally let a process destroy its own text: `mmap(&_start, ...)` without `MAP_FIXED` replaced the page it was executing from. | Fixed: the hint is taken only when the range is free, otherwise the kernel picks a free range. Negative control: forcing the hint kills `hello30` with a segfault, exactly as predicted. |
+| P1 | `mmap`'s own ceiling check (`base + len >= stack_base`) had the same inversion, so with `base` taken from `brk_current` every anonymous `mmap` returned `ENOMEM`. `rangeAvailable` and `findFreeMmapRange`, which back `mremap`, carried it too. | Fixed: bounds are relative to `USER_ADDR_MAX`, and kernel-chosen placements come from a dedicated window. |
+| P2 | Non-fixed `mmap` dragged `brk_current` up past its placements. Combined with the shrink support added here, `brk(0)` would report a break spanning memory the heap does not own, and shrinking would hand those `mmap` pages back to the allocator. | Fixed: `mmap` no longer moves the break. Kernel-chosen placements now come from `USER_MMAP_BASE` (8GB), above both the heap ceiling and the stack's demand-grow window, so the two regions cannot compete. |
+
+`brk_start` is a new `Task` field recording where the loader left the break, so a shrink cannot walk down
+into the loaded image and unmap it. It is set on both loader paths and in both `execve` arms, and
+inherited across `fork`. Task slots are zeroed on allocation, so a task with no loader-established heap
+has `brk_start == 0` and `brk` declines to move it.
+
+`hello30` covers all five properties: the break grows to the requested address, fresh heap pages read as
+zero and are writable, the break shrinks without panicking, anonymous `mmap` returns usable zeroed pages
+that `munmap` releases, and a hint aimed at the program's own code is placed elsewhere with the code left
+intact. `hello30: brk/mmap PASS` is now a required marker in the x86_64 smoke gate — the three negative
+controls above all passed the gate before the marker was added, so the gate needed it.
+
+No shared probe: `brk` and `mmap` need a live user address space, which the riscv64/aarch64 ports do not
+have yet, so a probe there could only assert against a fixture and would not exercise the fix.
+
+Not verified: the `mremap` paths that `rangeAvailable`/`findFreeMmapRange` back. Their bounds were
+corrected alongside the rest, but no user program calls `mremap`, so this is reasoned rather than
+runtime-verified. Worth an `mremap` test in a later pass.
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
+| `zig build smoke` | Passed | Now also gated on `hello30: brk/mmap PASS`. |
+| `zig build smoke-smp` | Passed | x86_64 dual-core reached shell. |
+| `zig build smoke-smp-stress` | Passed | 5 consecutive dual-core runs. |
+| `bash tools/qemu_smoke_riscv64.sh` | Passed | Shared probes unaffected. |
+| `bash tools/qemu_smoke_aarch64.sh` | Passed | Same. |
+
 ### 5.3 Historical Verification
 
 Executed on 2026-06-21:
