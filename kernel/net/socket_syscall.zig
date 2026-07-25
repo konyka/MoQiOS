@@ -300,13 +300,8 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
 
     if (t.fd_table.fds[fd].fd_type == .tcp_socket) {
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
-        var tmp_buf: [1460]u8 = undefined;
-        const to_copy = @min(len, 1460);
-        const n = copy.copyFromUser(&tmp_buf, @ptrFromInt(buf), to_copy);
-        if (n == 0) return -1;
         const tcb_idx = t.fd_table.fds[fd].tcb_idx;
-        const result = net_mod.tcp.tcpSend(tcb_idx, &tmp_buf, @intCast(n));
-        return result;
+        return net_mod.tcp.tcpSendFromUser(tcb_idx, buf, len);
     } else if (t.fd_table.fds[fd].fd_type == .udp_socket) {
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         const is_v6 = t.fd_table.fds[fd].udp_is_v6;
@@ -650,11 +645,8 @@ pub fn sendmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
 
         if (iov_base == 0 or iov_base >= 0x0000_8000_0000_0000 or iov_sz == 0) continue;
 
-        var tmp: [1460]u8 = undefined;
-        const to_copy: usize = @intCast(@min(iov_sz, 1460));
-        const n = copy.copyFromUser(&tmp, @ptrFromInt(iov_base), to_copy);
-        if (n == 0) break;
-        const result = net_mod.tcp.tcpSend(tcb_idx, &tmp, @intCast(n));
+        const to_send: u32 = @intCast(@min(iov_sz, @as(u64, 0xffff_ffff)));
+        const result = net_mod.tcp.tcpSendFromUser(tcb_idx, iov_base, to_send);
         if (result <= 0) break;
         total += @intCast(result);
     }

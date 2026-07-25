@@ -1580,7 +1580,12 @@ fn maybeEnterProbeRtt(tcb: *TcpTcb, smss: u32) void {
 fn maybeExitProbeRtt(tcb: *TcpTcb) void {
     if (!tcb.bbr_probe_rtt) return;
     const now = timestampMs();
-    if (!probeBbrProbeRttDone(tcb.bbr_probe_rtt_start_ms, now, BBR_PROBE_RTT_DURATION_MS)) return;
+    // SK-150: AccECN stretches ProbeRTT dwell with CE-rate EWMA.
+    const duration = if (tcb.accecn_ok)
+        probeL4sProbeRttDuration(BBR_PROBE_RTT_DURATION_MS, tcb.l4s_ce_ewma)
+    else
+        BBR_PROBE_RTT_DURATION_MS;
+    if (!probeBbrProbeRttDone(tcb.bbr_probe_rtt_start_ms, now, duration)) return;
     tcb.bbr_probe_rtt = false;
     tcb.bbr_last_probe_rtt_ms = now;
     if (tcb.min_rtt_ms == 0) tcb.min_rtt_ms = tcb.bbr_prior_min_rtt_ms;
@@ -2539,6 +2544,50 @@ pub fn tcpSend(tcb_idx: u32, data: [*]const u8, len: u32) i64 {
     flushSendBuffer(tcb);
 
     return queued;
+}
+
+/// Bytes of `count` that fit before a ring wrap at `write_pos` (SK-151).
+/// The remainder, `count - result`, restarts at offset 0.
+pub fn probeRingHeadLen(buf_size: u32, write_pos: u32, count: u32) u32 {
+    if (write_pos >= buf_size) return 0;
+    return @min(count, buf_size - write_pos);
+}
+
+/// Queue user-space data on an established connection (SK-151).
+///
+/// Copies straight from the user buffer into the send ring, so a full
+/// window-sized write needs neither a bounce buffer on the 128 KiB kernel stack
+/// nor the second bulk copy that staging through one would cost.
+/// Returns bytes queued, -14 (EFAULT) on a bad user range, or -1 on error.
+pub fn tcpSendFromUser(tcb_idx: u32, user_addr: u64, len: u32) i64 {
+    const copy = @import("../mm/copy_from_user.zig");
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS) return -1;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active or tcb.state != .established) return -1;
+
+    const used = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
+    const free_space = SEND_BUF_SIZE - 1 - used;
+    const to_copy = @min(len, free_space);
+    if (to_copy == 0) {
+        flushSendBuffer(tcb);
+        return 0;
+    }
+
+    // send_tail is only advanced once both ring segments are in, so a partial
+    // copy leaves the ring's valid range untouched.
+    const src: [*]const u8 = @ptrFromInt(user_addr);
+    const head_len = probeRingHeadLen(SEND_BUF_SIZE, tcb.send_tail, to_copy);
+    if (copy.copyFromUser(tcb.send_buf[tcb.send_tail..][0..head_len], src, head_len) != head_len) return -14;
+    if (to_copy > head_len) {
+        const wrap_len = to_copy - head_len;
+        if (copy.copyFromUser(tcb.send_buf[0..wrap_len], src + head_len, wrap_len) != wrap_len) return -14;
+    }
+    tcb.send_tail = (tcb.send_tail + to_copy) % SEND_BUF_SIZE;
+
+    flushSendBuffer(tcb);
+    return to_copy;
 }
 
 /// Flush pending send data as TCP segments.
@@ -3895,6 +3944,17 @@ pub fn probeL4sProbeRttInterval(base_ms: u32, ewma_q8: u32) u32 {
     const floor = if (fifth > 1000) fifth else 1000;
     if (v < floor) v = floor;
     return v;
+}
+
+/// AccECN ProbeRTT duration: base · (8+cuts)/8, capped at 2·base (SK-150).
+pub fn probeL4sProbeRttDuration(base_ms: u32, ewma_q8: u32) u32 {
+    if (base_ms == 0 or ewma_q8 == 0) return base_ms;
+    const cuts: u64 = probeL4sEwmaCuts(ewma_q8, 1);
+    // 64-bit intermediates: base·(8+cuts) reaches 15·base before the 2·base cap.
+    const base: u64 = base_ms;
+    const stretched = (base * (8 + cuts)) / 8;
+    const capped = @min(stretched, base * 2);
+    return @intCast(@min(capped, @as(u64, 0xffff_ffff)));
 }
 
 /// Apply CUBIC β `delta` times (or once if delta=0) (SK-136).
