@@ -2209,7 +2209,40 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:标记升高时更频繁 ProbeRTT,更快刷新 min_rtt 与 BDP 巡航点。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-149] tcp l4s ewma probertt non-x86: OK`。
-- **后续**:AccECN TCP 选项扩展计数;或 EWMA 驱动 ProbeRTT 持续时间。
+- **后续**:见 3.150（EWMA 驱动 ProbeRTT 持续时间,已完成)。
+
+---
+
+### 3.150 CE-rate EWMA 驱动 ProbeRTT 持续时间（SK-150,2026-07-25）
+
+- **背景**:SK-149 在高 CE 时更频繁进入 ProbeRTT,但固定 200ms 驻留在重标记下
+  可能排空不足,min_rtt 采样偏乐观。
+- **方案**:`probeL4sProbeRttDuration` 将驻留拉长为 `base·(8+cuts)/8`,上限 `2·base`;
+  `maybeExitProbeRtt` 在 AccECN 路径使用该时长。`shared/sk150.zig` 锁定冷/轻/重与 done。
+- **效果**:标记升高时 ProbeRTT 稍长,队列更易排空,min_rtt/BDP 更可信。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-150] tcp l4s ewma prtt dur non-x86: OK`。
+- **后续**:见 3.151（发送路径去弹跳缓冲,已完成)。
+
+---
+
+### 3.151 TCP 发送用户态直入环形缓冲（SK-151,2026-07-25）
+
+- **背景**:`tcp_syscall.tcpSend` 为支持整窗写入,在内核栈上开了 `[65536]u8`
+  弹跳缓冲。内核栈只有 32 页(128KB),单帧就吃掉一半;同时数据被拷两遍
+  (用户态→栈→环形缓冲)。`sendto`/`sendmsg` 则相反,被 1460 字节栈缓冲卡住吞吐。
+- **方案**:新增 `tcp.tcpSendFromUser(tcb_idx, user_addr, len)`,持锁后按环形缓冲
+  实际可写空间直接从用户态拷入 `send_buf`,跨界时拆成两段;`send_tail` 仅在两段
+  都落地后推进,部分失败不污染有效区间。拆分点提炼为纯函数 `probeRingHeadLen`,
+  由 `shared/sk151.zig` 锁定无回绕/回绕/边界三类语义。
+  `tcp_syscall.tcpSend`、`socket_syscall.sendto`、`sendmsg` 全部改走该路径。
+- **效果**:消除 64KB 栈帧(栈占用从 ~50% 降到常量级),整窗写入的批量拷贝次数
+  由 2 次降为 1 次;`sendto`/`sendmsg` 单次上限由 1460 字节提升到整个发送窗口。
+- **顺带**:`probeL4sProbeRttDuration` 改用 u64 中间量——原实现只防了 `2·base`
+  溢出,却漏了先算的 `base·(8+cuts)`(最高 15·base),防护自相矛盾。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-151] tcp send user->ring non-x86: OK`。
+- **后续**:AccECN TCP 选项扩展计数;或 EWMA 驱动 delivery_rate 采样窗。
 
 ---
 

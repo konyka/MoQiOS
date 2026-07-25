@@ -12,6 +12,7 @@ user_bin/
 asm_test*
 check_tss
 test
+test[0-9]*
 test_asm9
 disk.img filter=lf
 disk.img

@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-25 (SK-149 L4S EWMA ProbeRTT + prior SK-148 reviewed and verified)
+> Last update: 2026-07-25 (SK-151 TCP send user→ring + fsync barrier gate; prior SK-150 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -481,6 +481,9 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | ProbeBW ignored CE EWMA | Pacing/cwnd gain only discounted on ACE cut events. | SK-147: AccECN scales ProbeBW gain by CE-rate EWMA. |
 | Startup ignored CE EWMA | AccECN still aimed at fixed 2·BDP under marking. | SK-148: EWMA shrinks Startup target; abort at Q8≥64. |
 | ProbeRTT fixed under L4S | AccECN kept 10s ProbeRTT despite rising CE EWMA. | SK-149: EWMA shortens ProbeRTT interval (floor base/5). |
+| ProbeRTT dwell fixed | 200ms ProbeRTT under high CE may not drain queue. | SK-150: EWMA stretches ProbeRTT duration up to 2·base. |
+| TCP send bounce buffer | Full-window send staged 64KB on the 128KB kernel stack and copied twice. | SK-151: `tcpSendFromUser` copies user data straight into the send ring. |
+| `fsync` barrier gate | Flush call rejected write-through devices, so every ext2/FAT32 sync returned EOPNOTSUPP. | Fixed: gate the barrier on `block_dev.supportsFlush`; failure maps to EIO. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -508,8 +511,8 @@ uncompiled-module reachability gap remain explicit follow-up work.
 | `zig build -Darch=riscv64` | Passed | riscv64 build. |
 | `zig build -Darch=aarch64` | Passed | aarch64 build. |
 | `zig build smoke` | Passed | x86_64 single-core reached `hello21 done` and `MoQiOS shell`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | M7+shared probes+SK-149 markers. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | M9-7+shared probes+SK-149 markers. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | M7+shared probes+SK-150 markers. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | M9-7+shared probes+SK-150 markers. |
 | `zig build smoke-smp` | Passed on retry | The first 120-second run stopped in the existing `hello13` signal path before the shell marker; a second run reached the shell. This remains a timing-sensitive regression gate. |
 | LSP diagnostics | Unavailable | `zls` is not installed; compiler gates were used instead. |
 
@@ -593,8 +596,44 @@ It also rechecked the deferred UDP/driver/page-table risks against current Linux
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-149] tcp l4s ewma probertt non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-149] tcp l4s ewma probertt non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-150] tcp l4s ewma prtt dur non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-150] tcp l4s ewma prtt dur non-x86: OK`. |
+
+### 5.2f Review Update: 2026-07-25 (uncommitted-worktree audit)
+
+This pass audited the changes that were staged in the worktree but not yet committed, because they had
+never been through a build-and-smoke gate as a set. Scope was the worktree diff plus the call sites it
+touched (`fsync`, TCP send, `select`, raw net) and their downstream implementations; it does not claim
+proof of absence elsewhere.
+
+| Severity | Finding | Resolution / status |
+|---|---|---|
+| P0 | `fsync`/`fdatasync` on any ext2/FAT32 file always failed with `-EOPNOTSUPP`. The new barrier call used `block_dev.flush(0)`, but device 0 is virtio-blk registered with `supports_flush = false`, and `block_dev.flush` rejects both unsupported capability and the virtio/NVMe dispatch arms — so every sync returned an error after a successful writeback. | Fixed: added `block_dev.supportsFlush(dev)` and gated the barrier on it. Devices advertising a volatile write cache must complete the flush (failure now maps to `-EIO`, not `-EOPNOTSUPP`); write-through devices treat writeback completion as durable and return 0. |
+| P0 | `tcp_syscall.tcpSend` staged a `[65536]u8` bounce buffer on the kernel stack. Kernel stacks are 32 pages (128 KiB), so one syscall frame claimed ~50% of the stack, and every full-window write was copied twice (user → stack → ring). | Fixed by SK-151: `tcp.tcpSendFromUser` copies user data straight into `send_buf`, splitting at the ring wrap. Stack use is now constant, bulk copies drop from 2 to 1, and `send_tail` only advances after both segments land so a partial copy cannot corrupt the valid range. |
+| P2 | `probeL4sProbeRttDuration` guarded the `2·base` overflow but computed `base·(8+cuts)` (up to 15·base) in u32 first, so the protection was self-contradictory. | Fixed: 64-bit intermediates, saturating at `u32` max. `shared/sk151.zig` locks a base whose 15× product exceeds u32. |
+| P2 | `sendto`/`sendmsg` capped a single TCP send at 1460 bytes through their own stack buffers, forcing one syscall per segment. | Fixed: both route through `tcpSendFromUser`, lifting the per-call limit to the available send window with no bounce buffer. |
+| P2 | A 10 MB stray ELF (`test2`) sat untracked in the repository root. | Removed and `.gitignore` widened to `test[0-9]*`. |
+
+Reviewed and accepted unchanged from the same worktree diff: the `select` `nfds` bound moved from a
+hard-coded 128 to `vfs.MAX_FDS` (64 on x86_64), which *tightens* the check and keeps the 16-byte
+`fd_set` accesses in range; the `timeval` validation correctly rejects out-of-range `usec` and
+overflowing `sec·1000`; `raw_net.netRecv` now validates the destination before the irreversible NIC
+dequeue; and the `tcp_syscall` error codes moved from `-1` to `-EFAULT`, matching POSIX.
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build` | Passed | x86_64 kernel and userspace. |
+| `zig build -Darch=riscv64` | Passed | riscv64 build. |
+| `zig build -Darch=aarch64` | Passed | aarch64 build. |
+| `zig build smoke` | Passed | x86_64 single-core reached shell (`SMP=1`). |
+| `zig build smoke-smp` | Passed | x86_64 dual-core reached shell (`SMP=2`), first attempt. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-151] tcp send user->ring non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-151] tcp send user->ring non-x86: OK`. |
+| LSP diagnostics | Unavailable | `zls` is not installed; compiler gates were used instead. |
+
+Residual risk: `vfs.syncFile` still returns `void`, so a writeback error cannot reach `fsync`. The
+barrier gate above fixes the false failure but not the inverse false success. Propagating writeback
+errors through the VFS sync path remains open P1 follow-up work.
 
 ### 5.3 Historical Verification
 

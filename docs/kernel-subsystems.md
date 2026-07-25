@@ -301,14 +301,14 @@ const SchedStats = struct {
   2. 注入 trampoline（执行 `sigreturn` 系统调用）
   3. 跳转到用户 handler
 
-### 2.5 clone() 线程 (CLONE_VM/FILES/THREAD + FS_BASE TLS) ✅
+### 2.5 clone() 线程 (CLONE_VM/THREAD + FS_BASE TLS) ✅
 
 文件: `task.zig`, `syscall_entry.zig`
 
-- syscall #56，支持CLONE_VM/CLONE_FILES/CLONE_THREAD/CLONE_SETTLS
+- syscall #56，支持CLONE_VM/CLONE_THREAD/CLONE_SETTLS；CLONE_FILES当前复制FD表，尚未实现共享FD表语义
 - CLONE_VM：共享地址空间创建轻量级线程
 - 独立内核栈，FS_BASE TLS指针配置
-- 兼容Linux clone语义
+- 其余Linux clone标志按当前实现范围处理，完整CLONE_FILES语义仍待实现
 
 ### 2.6 poll() I/O多路复用 (TCP/管道/文件) ✅
 
@@ -536,6 +536,7 @@ e1000 (中断驱动) / virtio-net (Virtqueue)
 - TCP_QUICKACK：禁用延迟ACK，每个收到段立即发送ACK (v29.0)
 - SO_LINGER：linger=0时tcpClose发RST替代FIN（abortive close）(v29.0)
 - @memcpy批量环形缓冲区I/O：tcpSend/flushSendBuffer/processIncomingData/tcpRecv 4处逐字节→ringWrite/ringRead (v29.0)
+- 发送路径零弹跳缓冲：`tcpSendFromUser` 直接把用户数据拷入 send_buf（跨界拆两段），不再在 128KB 内核栈上开整窗中转缓冲，整窗写入的批量拷贝由 2 次降为 1 次；tcpSend 系统调用与 sendto/sendmsg 共用该路径，单次上限即发送窗口 (SK-151)
 - TIME_WAIT 优化：30s→15s，新连接可复用 TIME_WAIT TCB (若序号更大)
 - 窗口更新ACK：应用读取数据后发送窗口更新ACK (超过 1 MSS 时)
 - 延迟ACK：every-other-segment规则 + 100ms超时 + ACK捎带
