@@ -544,6 +544,39 @@ turn a detectable error into packet corruption, device queue corruption, or a cr
 | `bash -n tools/*.sh` | Passed | Shell scripts parse successfully. |
 | LSP diagnostics | Unavailable | `zls` is not installed; compiler gates were used instead. |
 
+### 5.2f Review Update: 2026-07-25
+
+This pass extended the audit from syscall copy semantics into shared address-space lifetime, boot
+protocol discovery, timer validation, multiplexing outputs, and raw network user-buffer boundaries.
+It also rechecked the deferred UDP/driver/page-table risks against current Linux and Limine contracts.
+
+| Severity | Finding | Resolution / status |
+|---|---|---|
+| P0 | `CLONE_VM` tasks shared one `page_table_phys`, but every zombie/exec cleanup unconditionally destroyed that root. One thread exit could free page tables still used by another CPU. | Fixed: retain the PML4 root for each shared task and release it on every cleanup path; only the last reference performs batched deep teardown. Exec installs and switches to the new CR3 before releasing the old root. The O(1) PMM root reference is touched only at clone/exec/reap boundaries. |
+| P1 | Limine requests had no official start/end markers and therefore relied on whole-image request scanning. | Fixed: add bundled-Limine-compatible markers and linker `KEEP` ordering around `.limine_reqs`. ELF inspection confirms `start < requests/base revision < end` in the writable, loadable `.data` segment. |
+| P1 | `timerfd_settime` accepted negative, out-of-range, or overflowing `timespec` fields via signed-to-unsigned bit reinterpretation. | Fixed: reject invalid nanoseconds, negative fields, unknown flags, nanosecond/tick conversion overflow, and expiry addition overflow with `EINVAL`; periodic rearm saturates instead of wrapping. |
+| P1 | IPv4 socket `connect`, socket-name output, `socketpair`, `recvmmsg` length output, `epoll_wait`, and `select` ignored short user copies. | Fixed: require complete copies, return `EFAULT`, prevalidate epoll output before consuming ready state, and close newly-created socketpair descriptors when output fails. |
+| P1 | Raw network syscalls passed user pointers directly into NIC/UDP code, bypassing the shared mapped-range checks. | Fixed: bounded kernel staging buffers isolate NIC/UDP operations from user page-table lifetime; UDP receive now accepts caller capacity and validates payload/source outputs before dequeue. |
+| P1 | x86 COW clone has early OOM exits after partial child page-table construction; later failures can also leave parent PTEs COW-marked with unmatched references. | Deferred transactional clone work: preallocate each subtree or add explicit rollback of child tables, parent PTEs, and page references before reporting `ENOMEM`. |
+| P1 | UDP receive queues still publish/consume entries without a lock or peek/commit token, and current receive APIs may silently truncate to protocol-local storage limits. | Deferred design work: introduce queue serialization, explicit copied/original lengths, `MSG_TRUNC`/`MSG_PEEK` semantics, and commit only after the syscall copy contract is satisfied. |
+| P1 | virtio-blk/virtio-net and NVMe queues retain shared mutable submission/completion state without a demonstrated per-queue serialization contract. | Deferred design work: start with correctness-first single-flight locks, then measure before adding multi-queue parallelism. |
+| P1 | `MAP_FIXED` replacement lacks transactional rollback; user-copy prewalk still has a concurrent-unmap window; page-table mutation needs a unified ownership/shootdown contract. | Deferred architecture work requiring address-space locks, fault recovery, rollback, and cross-CPU TLB tests. |
+| P1 | Filesystem sync APIs can report completion even when the selected NVMe/virtio device cannot issue a persistence barrier. | Deferred ABI work: propagate unsupported flush capability to sync callers rather than silently promising durability. |
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build test` | Passed | Host helper tests. |
+| `zig build` | Passed | x86_64 kernel/userspace and Limine-marked ISO. |
+| `zig build -Darch=riscv64` | Passed | riscv64 build. |
+| `zig build -Darch=aarch64` | Passed | aarch64 build. |
+| `zig build smoke` | Passed | x86_64 single-core reached shell. |
+| `zig build smoke-smp` | Passed | x86_64 dual-core reached shell. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | M7+shared-probe smoke. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | M9-7+shared-probe smoke. |
+| `readelf -SW` / `readelf -sW` | Passed | Markers and requests are ordered in loadable `.data`. |
+| `bash -n tools/*.sh` | Passed | Shell scripts parse successfully. |
+| LSP diagnostics | Unavailable | `zls` is not installed; compiler gates were used instead. |
+
 | Gate | Result | Notes |
 |---|---|---|
 | `zig build test` | Passed | Host helper tests. |
