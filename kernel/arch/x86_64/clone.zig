@@ -12,6 +12,7 @@ const hhdm_mod = @import("../../mm/hhdm.zig");
 const paging_mod = @import("paging.zig");
 const getPerCpu = @import("syscall_entry.zig").getPerCpu;
 const fmt = @import("../../lib/fmt.zig");
+const cow_pte_mod = @import("../../mm/cow_pte.zig");
 
 // ── CLONE flags ──────────────────────────────────────────────────────
 const CLONE_VM: u64 = 0x100;
@@ -43,7 +44,6 @@ pub const ParentRegs = struct {
 
 // ── COW page-table duplication ───────────────────────────────────────
 
-const COW_BIT: u64 = 1 << 9;
 
 /// Check if a 4096-byte page is entirely zero.
 fn isZeroPage(page: [*]const u8) bool {
@@ -122,10 +122,11 @@ pub fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
                     if (isZeroPage(src)) continue;
 
                     pmm_mod.addRef(src_phys);
-                    parent_pt[pt_idx] = (pte & ~@as(u64, paging_mod.WRITABLE)) | COW_BIT;
-
-                    const flags = pte & 0xFFF;
-                    child_pt[pt_idx] = src_phys | (flags & ~@as(u64, paging_mod.WRITABLE)) | COW_BIT;
+                    // Both sides hold the same entry. Rebuilding the child's
+                    // from `phys | (pte & 0xFFF)` dropped NX at bit 63.
+                    const shared = cow_pte_mod.cowPte(pte);
+                    parent_pt[pt_idx] = shared;
+                    child_pt[pt_idx] = shared;
                 }
             }
         }

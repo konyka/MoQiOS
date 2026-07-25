@@ -530,6 +530,7 @@ QEMU / 真机
 - `mapPage(pml4, virt, phys, flags)`: 映射单个虚拟页
 - `unmapPage(pml4, virt)`: 取消映射
 - COW fork: `cloneUserPagesCow` 共享物理页 + 标记 RO + COW bit (bit 9), #PF handler 首次写时分配私有页 (v46.0 实现, v47.0 修复 decRef 内存泄漏)
+- 父子两侧的页表项由 `kernel/mm/cow_pte.zig` 的 `cowPte` 统一推导 (2026-07-25)。此前子侧从 `phys | (pte & 0xFFF)` 重建, 丢掉 bit 63 的 `NX`, 使每个 fork 出的子进程都获得可执行的栈与堆 (实测 `lost=3 kept=0`); 两侧共用同一推导后 W^X 跨 fork 成立
 
 ### 3.3 用户地址空间
 

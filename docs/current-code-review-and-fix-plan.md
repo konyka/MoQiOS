@@ -942,6 +942,8 @@ Found and deferred: `cloneUserPagesCow` (and `cloneUserPages`) copy PTE flags as
 `NX` at bit 63. Every forked child therefore loses `NX` on the pages that had it, including its heap. The
 fix is small but wants a test that asserts an execution fault, which the new "no segfaults" gate rule makes
 awkward to express; both need designing together rather than rushing the flag change in here.
+**Resolved in 5.2n** — the derivation moved to a shared helper and is unit-tested. End-to-end enforcement
+remains untested for the reason recorded there: faults kill instead of raising `SIGSEGV`.
 
 | Gate | Result | Notes |
 |---|---|---|
@@ -952,6 +954,52 @@ awkward to express; both need designing together rather than rushing the flag ch
 | `zig build smoke-smp-stress` | Passed | 5 consecutive dual-core runs. |
 | `bash tools/qemu_smoke_riscv64.sh` | Passed | `setUserTlsBase` is a documented no-op there. |
 | `bash tools/qemu_smoke_aarch64.sh` | Passed | Same. |
+
+### 5.2n Review Update: 2026-07-25 (COW clone dropped NX)
+
+This pass took the item 5.2m deliberately left open: the COW clone derived the child's page-table entry as
+`phys | (pte & 0xFFF)`. `NX` is bit 63, above the address field rather than among the low permission bits,
+so the mask dropped it.
+
+Measured before the fix, by counting entries whose parent had `NX` and whose child did not:
+
+```
+[nx] parent_pte=0x80000000002e4067 child_pte=0x00000000002e4265
+[nx] lost=3 kept=0
+```
+
+Not a single non-executable page survived a `fork`. Every child got a writable *and* executable stack and
+heap — the W^X property the mappings were created with (`mmap`, `brk` and the stack all pass
+`no_execute = true`) held only until the process forked. `EFER.NXE` is enabled (measured: `EFER=0xd01`), so
+this was a real loss of enforcement rather than a cosmetic flag difference.
+
+| Severity | Finding | Resolution / status |
+|---|---|---|
+| P1 | `cloneUserPagesCow` and `cloneUserPages` rebuilt the child's entry from the frame plus the low 12 bits, dropping `NX` at bit 63. Parent and child are supposed to hold the *same* entry, and the parent's side was written as `(pte & ~WRITABLE) \| COW` — preserving the high bits — so the two sides disagreed and only the reconstructed one was wrong. | Fixed: both sides derive the entry from one helper, `cow_pte.cowPte`. Measured after: `[nx] lost=0 kept=3`. |
+
+The asymmetry was the bug's cause, so the fix removes it rather than adding the missing bit to the second
+expression. `kernel/mm/cow_pte.zig` is a small import-free module holding the derivation, which also makes
+it host-testable; `tests/main.zig` covers that `NX` survives, that the frame is shared read-only with the
+COW marker set, that present/user survive, and that re-cloning an already-shared entry is idempotent. One
+test states the regression directly by asserting that the low-12-bit rebuild loses `NX` where `cowPte` does
+not. Negative control: restoring the old derivation inside `cowPte` fails that test.
+
+The two other readers of the COW bit — both arms of `handleCowFault` — were already correct: they mask out
+only the address field and the COW marker, so `NX` survives fault resolution.
+
+Not verified: end-to-end enforcement, i.e. that executing from a data page in a forked child actually
+faults. The blocker is that the kernel kills on a user fault instead of delivering `SIGSEGV`, so a test
+program cannot survive the fault to report what happened, and the smoke gate now (correctly) fails any run
+containing `[SEGFAULT]`. Synchronous fault signal delivery is the missing feature; it would let this and
+similar properties be asserted from user space, and is the natural next item.
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
+| `zig build test` | Passed | Includes the new `cow_pte` tests. |
+| `zig build smoke` / `smoke-smp` | Passed | Single and dual core. |
+| `zig build smoke-smp-stress` | Passed | 5 consecutive dual-core runs. |
+| `bash tools/qemu_smoke_riscv64.sh` / `_aarch64.sh` | Passed | Neither port forks user processes yet. |
 
 ### 5.3 Historical Verification
 

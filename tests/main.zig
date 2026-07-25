@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const byte_order = @import("byte_order");
+const cow_pte = @import("cow_pte");
 const fmt = @import("fmt_core");
 const str = @import("str");
 
@@ -43,6 +44,40 @@ test "format helpers cover decimal, hex, and signed extremes" {
     try std.testing.expectEqualStrings("00000000000000af", fmt.fmtHex16(&buf, 0xaf));
     try std.testing.expectEqualStrings("deadbeef", fmt.fmtHex(&buf, 0xdeadbeef));
     try std.testing.expectEqualStrings("-9223372036854775808", fmt.fmtSignedDec(&buf, std.math.minInt(i64)));
+}
+
+test "COW clone keeps no-execute, which lives above the low flag bits" {
+    // A writable, non-executable user data page — a stack or heap entry.
+    const parent: u64 = cow_pte.NO_EXECUTE | 0x0000_0000_002e_4000 | 0x067;
+
+    const shared = cow_pte.cowPte(parent);
+
+    // The regression: deriving the child's entry from the frame plus the low 12
+    // bits drops NX, because NX is bit 63.
+    const low_flag_rebuild = (parent & 0x000F_FFFF_FFFF_F000) | (parent & 0xFFF);
+    try std.testing.expect(low_flag_rebuild & cow_pte.NO_EXECUTE == 0);
+    try std.testing.expect(shared & cow_pte.NO_EXECUTE != 0);
+}
+
+test "COW clone shares the frame read-only and marks both sides" {
+    const frame: u64 = 0x0000_0000_002e_4000;
+    const parent: u64 = cow_pte.NO_EXECUTE | frame | 0x067; // present|writable|user|accessed|dirty
+
+    const shared = cow_pte.cowPte(parent);
+
+    try std.testing.expectEqual(frame, shared & 0x000F_FFFF_FFFF_F000);
+    try std.testing.expect(shared & cow_pte.WRITABLE == 0);
+    try std.testing.expect(cow_pte.isCow(shared));
+    try std.testing.expect(!cow_pte.isCow(parent));
+    // Present and user survive, or the child could not reach its own memory.
+    try std.testing.expect(shared & 0x005 == 0x005);
+}
+
+test "cloning an already-shared page is a no-op on its entry" {
+    const parent: u64 = cow_pte.NO_EXECUTE | 0x0000_0000_002c_3000 | 0x067;
+
+    const once = cow_pte.cowPte(parent);
+    try std.testing.expectEqual(once, cow_pte.cowPte(once));
 }
 
 test "string helpers compare prefixes and bounded C strings" {

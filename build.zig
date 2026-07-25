@@ -288,6 +288,11 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     }));
+    test_module.addImport("cow_pte", b.createModule(.{
+        .root_source_file = b.path("kernel/mm/cow_pte.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }));
     const lib_test = b.addTest(.{
         .root_module = test_module,
     });

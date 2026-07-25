@@ -245,8 +245,7 @@ pub fn cloneUserPagesCow(parent_pml4_phys: u64) ?u64 {
     const paging_mod = @import("../arch/arch.zig").paging;
 
     const ADDR_MASK: u64 = 0xFFFFFFFFF000;
-    const COW_BIT: u64 = 1 << 9;
-    const WRITABLE: u64 = paging_mod.WRITABLE;
+    const cow_pte_mod = @import("../mm/cow_pte.zig");
 
     const child_pml4_phys = pmm_mod.allocPage() orelse return null;
     const child_pml4: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(child_pml4_phys));
@@ -320,21 +319,22 @@ pub fn cloneUserPagesCow(parent_pml4_phys: u64) ?u64 {
                     const pte = parent_pt[pt_idx];
                     if (pte == 0 or pte & 1 == 0) continue;
 
-                    const phys = pte & ADDR_MASK;
-                    const flags = pte & 0xFFF;
+                    // Both sides hold the same entry, so derive it once. The
+                    // child's used to be rebuilt as `phys | (pte & 0xFFF)`,
+                    // which dropped NX at bit 63 and handed the child an
+                    // executable stack and heap.
+                    const shared = cow_pte_mod.cowPte(pte);
 
                     // Mark parent PTE as read-only + COW (if not already COW)
-                    if (flags & COW_BIT == 0) {
-                        const cow_pte = (pte & ~WRITABLE) | COW_BIT;
-                        parent_pt[pt_idx] = cow_pte;
+                    if (!cow_pte_mod.isCow(pte)) {
+                        parent_pt[pt_idx] = shared;
                         // Invalidate parent TLB for this page
                         const virt = (pml4_idx << 39) | (pdpt_idx << 30) |
                             (pd_idx << 21) | (pt_idx << 12);
                         paging_mod.invlpg(virt);
                     }
 
-                    // Child gets the same physical page with COW + read-only
-                    child_pt[pt_idx] = phys | (flags & ~WRITABLE) | COW_BIT;
+                    child_pt[pt_idx] = shared;
                 }
             }
         }
