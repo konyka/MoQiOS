@@ -118,7 +118,7 @@ fn queryDns(hostname: []const u8, dns_server: [4]u8) [4]u8 {
         var src_ip: [4]u8 = .{ 0, 0, 0, 0 };
         var src_port: u16 = 0;
 
-        const n = udp.recvFrom(12345, &buf, &src_ip, &src_port);
+        const n = udp.recvFrom(12345, &buf, @intCast(buf.len), &src_ip, &src_port);
         if (n > 0 and src_port == DNS_PORT) {
             const resp_id = bo.readU16BeAt(&buf, 0);
             const result = parseResponse(&buf, @intCast(n), resp_id);

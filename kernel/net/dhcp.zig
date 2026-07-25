@@ -188,7 +188,7 @@ fn receiveOffer() bool {
     var src_ip: [4]u8 = .{ 0, 0, 0, 0 };
     var src_port: u16 = 0;
 
-    const n = udp.recvFrom(DHCP_CLIENT_PORT, &buf, &src_ip, &src_port);
+    const n = udp.recvFrom(DHCP_CLIENT_PORT, &buf, @intCast(buf.len), &src_ip, &src_port);
     if (n <= 0) return false;
     if (src_port != DHCP_SERVER_PORT) return false;
 
@@ -223,7 +223,7 @@ fn receiveAck() bool {
     var src_ip: [4]u8 = .{ 0, 0, 0, 0 };
     var src_port: u16 = 0;
 
-    const n = udp.recvFrom(DHCP_CLIENT_PORT, &buf, &src_ip, &src_port);
+    const n = udp.recvFrom(DHCP_CLIENT_PORT, &buf, @intCast(buf.len), &src_ip, &src_port);
     if (n <= 0) return false;
     if (src_port != DHCP_SERVER_PORT) return false;
 

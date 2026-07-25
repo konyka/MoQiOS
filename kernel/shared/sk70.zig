@@ -87,7 +87,7 @@ pub fn announce() void {
     // Good datagram delivered; IPv4 recvFrom must not see it.
     udp.handlePacketV6(SRC6, DST6, &hdr_buf, ulen);
     var v4ip: [4]u8 = undefined;
-    if (udp.recvFrom(BOUND, &out, &v4ip, &out_port) != 0) {
+    if (udp.recvFrom(BOUND, &out, @intCast(out.len), &v4ip, &out_port) != 0) {
         fail("v6 leaked to v4 recv");
         return;
     }

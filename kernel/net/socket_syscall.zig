@@ -447,7 +447,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         }
         var src_ip: [4]u8 = .{ 0, 0, 0, 0 };
         var src_port_out: u16 = 0;
-        const result2 = udp.recvFrom(src_port, &tmp_buf2, &src_ip, &src_port_out);
+        const result2 = udp.recvFrom(src_port, &tmp_buf2, @intCast(tmp_buf2.len), &src_ip, &src_port_out);
         if (result2 > 0) {
             const to_write = @min(@as(u32, @intCast(result2)), to_read2);
             if (copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf2))[0..to_write], to_write) != to_write) return -14;
@@ -513,7 +513,7 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
             return 0;
         }
         var sock_addr: [8]u8 = undefined;
-        _ = copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), 8);
+        if (copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), 8) != 8) return -14;
         const dst_port = bo.readU16BeAt(&sock_addr, 2);
         const dst_ip = [4]u8{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] };
         t.fd_table.fds[fd].udp_connected = true;
@@ -535,7 +535,7 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         return net_mod.tcp.tcpConnectSocketV6(tcb_idx, parsed.addr, parsed.port);
     }
     var sock_addr: [8]u8 = undefined;
-    _ = copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), 8);
+    if (copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), 8) != 8) return -14;
     const port = bo.readU16BeAt(&sock_addr, 2);
     const ip = [4]u8{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] };
     return net_mod.tcp.tcpConnectSocket(tcb_idx, ip, port);
@@ -543,9 +543,9 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
 
 fn copySockaddrToUser(addr_ptr: u64, addrlen_ptr: u64, sa_buf: []const u8, alen: u32) i64 {
     const to_copy = @min(alen, @as(u32, @intCast(sa_buf.len)));
-    _ = copy.copyToUser(@ptrFromInt(addr_ptr), sa_buf[0..to_copy], to_copy);
+    if (copy.copyToUser(@ptrFromInt(addr_ptr), sa_buf[0..to_copy], to_copy) != to_copy) return -14;
     var len_bytes: [4]u8 = @bitCast(alen);
-    _ = copy.copyToUser(@ptrFromInt(addrlen_ptr), &len_bytes, 4);
+    if (copy.copyToUser(@ptrFromInt(addrlen_ptr), &len_bytes, 4) != 4) return -14;
     return 0;
 }
 
@@ -725,7 +725,11 @@ pub fn socketpair(domain: u32, sock_type: u32, protocol: u32, sv_ptr: u64) i64 {
     var fds: [8]u8 = undefined;
     bo.writeU32Le(fds[0..4], read_fd);
     bo.writeU32Le(fds[4..8], write_fd);
-    _ = copy.copyToUser(@ptrFromInt(sv_ptr), &fds, 8);
+    if (copy.copyToUser(@ptrFromInt(sv_ptr), &fds, 8) != 8) {
+        _ = cur.fd_table.close(read_fd);
+        _ = cur.fd_table.close(write_fd);
+        return -14;
+    }
     return 0;
 }
 
@@ -757,7 +761,7 @@ pub fn recvmmsg(sockfd: u32, msgvec_ptr: u64, vlen: u64, flags: u32, timeout: u6
         var len_buf: [4]u8 = undefined;
         const recv_len: u32 = @intCast(result);
         bo.writeU32Le(&len_buf, recv_len);
-        _ = copy.copyToUser(@ptrFromInt(msg_len_offset), &len_buf, 4);
+        if (copy.copyToUser(@ptrFromInt(msg_len_offset), &len_buf, 4) != 4) return -14;
         return 1;
     }
     return result;

@@ -97,13 +97,13 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
     enqueue(port_idx, src_ip, hdr.src_port, hdr.dst_port, data[8..][0..actual_payload], true);
 }
 
-pub fn recvFrom(port: u16, out_buf: [*]u8, out_src_ip: *[4]u8, out_src_port: *u16) i64 {
+pub fn recvFrom(port: u16, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, out_src_port: *u16) i64 {
     const port_idx = findPortIdx(port) orelse return 0;
 
     for (0..QUEUE_DEPTH) |i| {
         const entry = &queues[port_idx][i];
         if (entry.valid and !entry.is_v6) {
-            const n = entry.data_len;
+            const n = @min(entry.data_len, out_len);
             @memcpy(out_buf[0..n], entry.data[0..n]);
             out_src_ip.* = entry.src_ip[0..4].*;
             out_src_port.* = entry.src_port;

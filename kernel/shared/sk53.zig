@@ -62,7 +62,7 @@ pub fn announce() void {
     var out: [64]u8 = undefined;
     var out_ip: [4]u8 = undefined;
     var out_port: u16 = 0;
-    const n = udp.recvFrom(BOUND_PORT, &out, &out_ip, &out_port);
+    const n = udp.recvFrom(BOUND_PORT, &out, @intCast(out.len), &out_ip, &out_port);
     if (n != msg.len) {
         arch.serial.writeString("[SK-53] FAILED: recv len\n");
         return;
@@ -79,7 +79,7 @@ pub fn announce() void {
     }
 
     // Queue is now empty again.
-    if (udp.recvFrom(BOUND_PORT, &out, &out_ip, &out_port) != 0) {
+    if (udp.recvFrom(BOUND_PORT, &out, @intCast(out.len), &out_ip, &out_port) != 0) {
         arch.serial.writeString("[SK-53] FAILED: queue not drained\n");
         return;
     }
@@ -88,7 +88,7 @@ pub fn announce() void {
     const UNBOUND: u16 = 6543;
     buildUdp(&seg, SRC_PORT, UNBOUND, msg);
     udp.handlePacket(SRC_IP, DST_IP, &seg, seg.len);
-    if (udp.recvFrom(UNBOUND, &out, &out_ip, &out_port) != 0) {
+    if (udp.recvFrom(UNBOUND, &out, @intCast(out.len), &out_ip, &out_port) != 0) {
         arch.serial.writeString("[SK-53] FAILED: unbound delivered\n");
         return;
     }
@@ -102,7 +102,7 @@ pub fn announce() void {
         udp.handlePacket(SRC_IP, DST_IP, &one, one.len);
     }
     var drained: usize = 0;
-    while (udp.recvFrom(BOUND_PORT, &out, &out_ip, &out_port) != 0) drained += 1;
+    while (udp.recvFrom(BOUND_PORT, &out, @intCast(out.len), &out_ip, &out_port) != 0) drained += 1;
     if (drained != QUEUE_DEPTH) {
         arch.serial.writeString("[SK-53] FAILED: queue depth wrong\n");
         return;
