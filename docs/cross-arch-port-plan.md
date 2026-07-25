@@ -2242,7 +2242,25 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   溢出,却漏了先算的 `base·(8+cuts)`(最高 15·base),防护自相矛盾。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-151] tcp send user->ring non-x86: OK`。
-- **后续**:AccECN TCP 选项扩展计数;或 EWMA 驱动 delivery_rate 采样窗。
+- **后续**:见 3.152。
+
+---
+
+### 3.152 写回缓存接受跨页写入（SK-152,2026-07-25）
+
+- **背景**:一个脏缓冲最多存一页,而 `writeBuffered` 把 `len` 静默截断到 4096
+  且返回 `void`;VFS 却按完整 `count` 推进 offset、设置文件大小并返回成功。
+  `write()` 系统调用自身已按 4096 分块所以不受影响,但 `copy_file_range(2)`
+  与 `splice(2)` pipe→file 走的是 8KB 分块——**每块后一半数据静默丢失**。
+- **方案**:`writeBuffered` 内部按页拆分并返回实际接受的字节数,
+  VFS 新增 `bufferedWrite` 按该值推进 offset、缓冲池耗尽时返回 ENOSPC。
+  同 offset 覆写更短的区段时改用高水位 `data_len`,不再把之前缓冲的尾部丢掉。
+- **效果**:两条内核内拷贝路径不再丢数据;短写按 POSIX 语义如实上报。
+  8KB 分块保留不变,I/O 批量收益不受影响。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-152] writeback multi-page write non-x86: OK`;`sk46` 同步校验
+  `writeBuffered` 的返回值语义。
+- **后续**:writeback 错误仍到不了 `fsync`（`vfs.syncFile` 返回 void）。
 
 ---
 

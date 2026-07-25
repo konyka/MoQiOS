@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-25 (mm/proc audit: waitpid lost wakeup, sigreturn user-pointer, clone rollback; prior SK-151 reviewed and verified)
+> Last update: 2026-07-25 (SK-152 writeback multi-page write; prior mm/proc audit reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -487,6 +487,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | waitpid lost wakeup | `waiting_for_child` was published after the zombie scan released `task_lock`, so a child exiting in that window woke nobody. | Fixed: rescan after publishing the flag, under the same lock the child uses. |
 | sigreturn user pointer | The signal frame was read straight from `saved_user_rsp`, a user-controlled address. | Fixed: copy through `copyFromUser`, return EFAULT on a bad range. |
 | Clone OOM rollback | Both `cloneUserPages` variants leaked the partial page-table tree on OOM; `fork` leaked a completed root when task creation failed. | Fixed: roll back through `destroyUserSpace` on every failure path. |
+| Writeback truncated writes | `writeBuffered` kept only the first 4KB and reported success, losing half of every 8KB `copy_file_range`/`splice` chunk. | SK-152: split across page-sized extents, return bytes accepted, report ENOSPC. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -683,6 +684,44 @@ decision rather than a local fix:
 | P1 | `vfs.syncFile` returns `void`, so a writeback error cannot reach `fsync` (carried over from 5.2f). | Requires threading errors through the VFS sync path. |
 | P2 | A process's 65th `mmap` region is untracked, so `munmap`/`mprotect` cannot find it. | Should return `ENOMEM`; needs a check on whether callers tolerate that. |
 | P2 | File-backed `mmap` ignores the `read` return value, mapping zeroes instead of reporting failure. | Small, but changes the error contract of `mmap`. |
+
+### 5.2h Review Update: 2026-07-25 (fs/block-device subsystem audit)
+
+This pass audited `kernel/fs/` and `kernel/drivers/` for lifetime, bounds, overflow, and
+silent-error-swallowing defects, with particular attention to indices derived from on-disk data.
+
+| Severity | Finding | Resolution / status |
+|---|---|---|
+| P0 | `writeBuffered` truncated any write to one 4 KiB buffer and returned `void`, while the VFS advanced the descriptor by the full `count`, grew `file_size`, and reported success. The plain `write()` syscall chunks to 4096 before reaching the VFS and is unaffected, but `copy_file_range(2)` and `splice(2)` pipe→file both push 8 KiB chunks, so the second half of every chunk was silently dropped. | Fixed by SK-152: `writeBuffered` splits across page-sized extents and returns bytes accepted; the VFS advances by that value and reports `ENOSPC` when the pool is exhausted. The 8 KiB chunk sizes are kept, so the I/O batching benefit is unchanged. |
+| P1 | Re-writing a shorter run at an offset that already held a longer extent overwrote `data_len` downwards, discarding the still-dirty tail before it reached the disk. | Fixed: `data_len` is now a high-water mark, since only the leading `len` bytes are replaced. |
+
+Reported by the audit but **not confirmed** — recorded here so the next pass does not re-litigate them:
+
+- The claim that any `write()` above 4 KiB loses data overstated the reach of the P0 above.
+  `file_io.zig`, `readv.zig`, `aio.zig`, and the `writev` arm of the syscall dispatcher all chunk to
+  4096 through a kernel bounce buffer and honour short writes, so the plain write path was correct.
+- `io_sched.tryMerge` was reported as producing a DMA range that outruns its buffer. The merge path is
+  only reachable for AHCI-registered devices and needs its own verification before any change; it was
+  not confirmed in this pass.
+
+Still open from the audit and worth a dedicated round, in rough priority order: the ext2 block-group
+descriptor table is read into a single 4 KiB page, so a volume with more than 128 groups overflows it;
+`readInode` derives a group index from an on-disk inode number without an upper bound; ext2 directory
+parsing does not validate `rec_len`/`name_len` against the block size; `getdents64` advances the
+directory offset past entries it did not return when the user buffer fills; and both FAT32 and ext2
+write paths discard `writeBlockUncached`/`safeWriteSectors` return values while still updating
+metadata. These are all on-disk-data or error-propagation issues that need their own verification
+rather than a quick patch.
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build test` | Passed | Host helper tests. |
+| `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
+| `zig build smoke` | Passed | x86_64 single-core reached shell. |
+| `zig build smoke-smp` | Passed | x86_64 dual-core reached shell. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-152] writeback multi-page write non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-152] writeback multi-page write non-x86: OK`. |
+| `bash -n tools/*.sh` | Passed | Smoke scripts parse. |
 
 ### 5.3 Historical Verification
 
