@@ -273,6 +273,14 @@ const TcpTcb = struct {
     ip_ce_rx: u32,
     /// Bytes newly delivered since last AccECN cut (SK-145).
     ace_delivered: u32,
+    /// Peer ACE CE marks accumulated in the current RTT window (SK-146).
+    l4s_rtt_ce: u32,
+    /// Bytes delivered in the current RTT window (SK-146).
+    l4s_rtt_delivered: u32,
+    /// Start of the current L4S RTT sample window (SK-146).
+    l4s_rtt_start_ms: u32,
+    /// EWMA of CE-per-segment × 256 (Q8) over RTT windows (SK-146).
+    l4s_ce_ewma: u32,
 
     // Window Scaling (RFC 1323)
     snd_wnd_scale: u4, // send window scale shift count
@@ -431,6 +439,10 @@ pub fn initTcbs() void {
             .ace_last_react_ms = 0,
             .ip_ce_rx = 0,
             .ace_delivered = 0,
+            .l4s_rtt_ce = 0,
+            .l4s_rtt_delivered = 0,
+            .l4s_rtt_start_ms = 0,
+            .l4s_ce_ewma = 0,
             .snd_wnd_scale = 0,
             .rcv_wnd_scale = 2, // default: shift left by 2 (window 16KB)
             .ws_requested = 2,
@@ -532,6 +544,10 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].ace_last_react_ms = 0;
     tcbs[i].ip_ce_rx = 0;
     tcbs[i].ace_delivered = 0;
+    tcbs[i].l4s_rtt_ce = 0;
+    tcbs[i].l4s_rtt_delivered = 0;
+    tcbs[i].l4s_rtt_start_ms = 0;
+    tcbs[i].l4s_ce_ewma = 0;
     tcbs[i].snd_wnd_scale = 0;
     tcbs[i].rcv_wnd_scale = 2;
     tcbs[i].ws_requested = 2;
@@ -1200,8 +1216,12 @@ fn applyEcnCongestion(tcb: *TcpTcb, ace_delta: u3) void {
         tcb.ecn_undo = true;
     }
     if (tcb.accecn_ok) {
-        // SK-144/145: L4S-lite cut; δ normalized by bytes delivered since last cut.
-        const cuts = probeL4sNormCuts(ace_delta, tcb.ace_delivered, smss);
+        // SK-144/145/146: L4S-lite; prefer RTT EWMA rate, else delivery-normalized δ.
+        closeL4sRttWindow(tcb);
+        const cuts = if (tcb.l4s_ce_ewma != 0)
+            probeL4sEwmaCuts(tcb.l4s_ce_ewma, ace_delta)
+        else
+            probeL4sNormCuts(ace_delta, tcb.ace_delivered, smss);
         tcb.ssthresh = probeL4sSsthresh(tcb.cwnd, smss, cuts);
         tcb.cubic_w_max = tcb.ssthresh;
         tcb.cubic_epoch_ms = 0;
@@ -1235,7 +1255,11 @@ fn applyEcnDuringRecovery(tcb: *TcpTcb, ace_delta: u3) void {
     const smss = mssForTcb(tcb);
     const basis = @max(tcb.cwnd, tcb.ssthresh);
     const new_ss = if (tcb.accecn_ok) blk: {
-        const cuts = probeL4sNormCuts(ace_delta, tcb.ace_delivered, smss);
+        closeL4sRttWindow(tcb);
+        const cuts = if (tcb.l4s_ce_ewma != 0)
+            probeL4sEwmaCuts(tcb.l4s_ce_ewma, ace_delta)
+        else
+            probeL4sNormCuts(ace_delta, tcb.ace_delivered, smss);
         tcb.ace_delivered = 0;
         break :blk probeL4sSsthresh(basis, smss, cuts);
     } else probeAceScaledRecoverySsthresh(tcb.cwnd, tcb.ssthresh, smss, ace_delta);
@@ -1283,6 +1307,11 @@ fn noteEcnRx(tcb: *TcpTcb, flags: u8, ecn_ce: bool, ace: u3) void {
 
     const delta = probeAceDelta(tcb.ace_peer, ace);
     tcb.ace_peer = ace;
+    // SK-146: fold peer ACE advances into the RTT CE-rate window.
+    if (tcb.accecn_ok and delta > 0) {
+        tcb.l4s_rtt_ce +%= delta;
+        closeL4sRttWindow(tcb);
+    }
     // Under AccECN, ECE is ACE bit0 — not a classic congestion signal (SK-140).
     const ece = !tcb.accecn_ok and (flags & ECE) != 0;
     const now = timestampMs();
@@ -1370,11 +1399,15 @@ fn noteHystartAck(tcb: *TcpTcb, ack: u32) void {
     applyHystartSignal(tcb);
 }
 
-/// Update delivery-rate sample from newly delivered bytes (SK-119/145).
+/// Update delivery-rate sample from newly delivered bytes (SK-119/145/146).
 fn noteDelivery(tcb: *TcpTcb, delivered: u32) void {
     if (delivered == 0) return;
-    // SK-145: AccECN L4S normalizes ACE cuts by bytes ACKed since last cut.
-    if (tcb.accecn_ok) tcb.ace_delivered +%= delivered;
+    // SK-145/146: AccECN tracks delivery for cut norm and RTT CE-rate window.
+    if (tcb.accecn_ok) {
+        tcb.ace_delivered +%= delivered;
+        tcb.l4s_rtt_delivered +%= delivered;
+        closeL4sRttWindow(tcb);
+    }
     const now = timestampMs();
     if (tcb.rate_sample_ms != 0) {
         const elapsed = now -% tcb.rate_sample_ms;
@@ -1388,6 +1421,24 @@ fn noteDelivery(tcb: *TcpTcb, delivered: u32) void {
         }
     }
     tcb.rate_sample_ms = now;
+}
+
+/// Close an AccECN RTT sample into the CE-rate EWMA when due (SK-146).
+fn closeL4sRttWindow(tcb: *TcpTcb) void {
+    if (!tcb.accecn_ok) return;
+    const now = timestampMs();
+    const rtt = probeAceRttLimit(tcb.srtt, tcb.min_rtt_ms);
+    if (tcb.l4s_rtt_start_ms == 0) {
+        tcb.l4s_rtt_start_ms = now;
+        return;
+    }
+    if (!probeL4sRttWindowReady(tcb.l4s_rtt_start_ms, now, rtt)) return;
+    const smss = mssForTcb(tcb);
+    const inst = probeL4sCeRateQ8(tcb.l4s_rtt_ce, tcb.l4s_rtt_delivered, smss);
+    tcb.l4s_ce_ewma = probeL4sCeEwma(tcb.l4s_ce_ewma, inst);
+    tcb.l4s_rtt_ce = 0;
+    tcb.l4s_rtt_delivered = 0;
+    tcb.l4s_rtt_start_ms = now;
 }
 
 /// After recovery, floor cwnd at measured BDP (capped at 2·ssthresh) (SK-119).
@@ -3755,6 +3806,36 @@ pub fn probeL4sNormCuts(ace_delta: u3, delivered: u32, smss: u32) u3 {
     if (delivered == 0 or smss == 0) return @intCast(raw);
     const segs = @max(delivered / smss, 1);
     var cuts = (raw * 8) / segs;
+    if (cuts < 1) cuts = 1;
+    if (cuts > 7) cuts = 7;
+    return @intCast(cuts);
+}
+
+/// True when an L4S RTT sampling window should close (SK-146).
+pub fn probeL4sRttWindowReady(start_ms: u32, now_ms: u32, rtt_ms: u32) bool {
+    if (start_ms == 0 or rtt_ms == 0) return false;
+    return now_ms -% start_ms >= rtt_ms;
+}
+
+/// Instantaneous CE-per-segment rate in Q8 (×256) (SK-146).
+pub fn probeL4sCeRateQ8(ce_marks: u32, delivered: u32, smss: u32) u32 {
+    if (ce_marks == 0 or smss == 0) return 0;
+    const segs = @max(if (delivered > 0) delivered / smss else 0, 1);
+    return (ce_marks * 256) / segs;
+}
+
+/// EWMA update for CE rate: (7·old + new) / 8 (SK-146).
+pub fn probeL4sCeEwma(prev: u32, sample: u32) u32 {
+    if (prev == 0) return sample;
+    return (prev * 7 + sample) / 8;
+}
+
+/// Map CE-rate EWMA (Q8) to L4S cut count 1..7 (SK-146).
+pub fn probeL4sEwmaCuts(ewma_q8: u32, ace_delta: u3) u3 {
+    const raw: u32 = probeAceCutCount(ace_delta);
+    if (ewma_q8 == 0) return @intCast(raw);
+    // 32 in Q8 ≈ 1/8 CE per segment → one cut step.
+    var cuts = (ewma_q8 + 31) / 32;
     if (cuts < 1) cuts = 1;
     if (cuts > 7) cuts = 7;
     return @intCast(cuts);

@@ -2153,7 +2153,21 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **效果**:反馈字段与统计解耦;大飞行中少量 CE 砍得更轻,密 CE 仍可加重。
 - **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
   打印 `[SK-145] tcp ace ce rate norm non-x86: OK`。
-- **后续**:按 RTT 滑动窗口估计 CE 标记率;或 AccECN TCP 选项扩展计数。
+- **后续**:见 3.146（RTT CE 标记率 EWMA,已完成)。
+
+---
+
+### 3.146 按 RTT 窗口估计 CE 标记率（SK-146,2026-07-25）
+
+- **背景**:SK-145 仅用“自上次砍窗以来”的交付量归一化,缺少跨 RTT 的标记率记忆,
+  突发/静默交替时减窗幅度抖动大。
+- **方案**:每 RTT 累计 peer ACE CE 与交付字节,折成 Q8 CE/段速率并 EWMA;
+  AccECN 砍窗优先 `probeL4sEwmaCuts`,冷启动仍回退 SK-145 归一化。
+  `shared/sk146.zig` 锁定窗口/速率/EWMA/映射。
+- **效果**:L4S 减窗跟随平滑 CE 标记率,减少单次 ACE δ 噪声。
+- **验证**:三架构构建 + `smoke`/`smoke-smp` + riscv64/aarch64 smoke 全绿，
+  打印 `[SK-146] tcp l4s ce ewma non-x86: OK`。
+- **后续**:AccECN TCP 选项扩展计数;或 EWMA 驱动 pacing gain。
 
 ---
 

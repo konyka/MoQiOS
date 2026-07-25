@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-25 (SK-145 ACE/CE rate norm + prior SK-144 reviewed and verified)
+> Last update: 2026-07-25 (SK-146 L4S CE EWMA + prior SK-145 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -477,6 +477,7 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | AccECN still sent ECT(0) | L4S AQMs could not distinguish AccECN/scalable flows. | SK-143: AccECN non-SYN uses ECT(1); classic ECN keeps ECT(0). |
 | AccECN CUBIC cuts too harsh | Dense L4S CE marks stacked β^δ and collapsed cwnd. | SK-144: AccECN uses (8−δ)/8 L4S-lite cuts; classic keeps CUBIC. |
 | ACE δ ignored flight size | L4S cut used raw ACE δ without delivery normalization. | SK-145: `ip_ce_rx` stats + normalize cuts by `ace_delivered`/SMSS. |
+| L4S cut lacked rate memory | Only since-last-cut delivery; no RTT CE-rate EWMA. | SK-146: per-RTT CE/seg Q8 EWMA drives AccECN L4S cuts. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -504,8 +505,8 @@ uncompiled-module reachability gap remain explicit follow-up work.
 | `zig build -Darch=riscv64` | Passed | riscv64 build. |
 | `zig build -Darch=aarch64` | Passed | aarch64 build. |
 | `zig build smoke` | Passed | x86_64 single-core reached `hello21 done` and `MoQiOS shell`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | M7+shared probes+SK-145 markers. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | M9-7+shared probes+SK-145 markers. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | M7+shared probes+SK-146 markers. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | M9-7+shared probes+SK-146 markers. |
 | `zig build smoke-smp` | Passed on retry | The first 120-second run stopped in the existing `hello13` signal path before the shell marker; a second run reached the shell. This remains a timing-sensitive regression gate. |
 | LSP diagnostics | Unavailable | `zls` is not installed; compiler gates were used instead. |
 
@@ -589,8 +590,8 @@ It also rechecked the deferred UDP/driver/page-table risks against current Linux
 | `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
 | `zig build smoke` | Passed | x86_64 `hello21 done` + `MoQiOS shell`, `MOQI_SMP=1`. |
 | `zig build smoke-smp` | Passed | Same markers with `MOQI_SMP=2`. |
-| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-145] tcp ace ce rate norm non-x86: OK`. |
-| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-145] tcp ace ce rate norm non-x86: OK`. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Includes `[SK-146] tcp l4s ce ewma non-x86: OK`. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Includes `[SK-146] tcp l4s ce ewma non-x86: OK`. |
 
 ### 5.3 Historical Verification
 
