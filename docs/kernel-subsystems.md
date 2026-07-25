@@ -263,6 +263,25 @@ const Task = struct {
 扫描，AP 只能跑被显式绑定到自己的任务；现在 AP 通过 work-stealing **真正参与用户任务并行**，
 忙 CPU 主动卸载、闲 CPU 主动拉取。
 
+**主动让出必须走中断返回路径（x86_64，2026-07-25 修正）**
+
+调度器交接 CPU 的方式是改写 per-CPU 栈锚点（`%gs:16`）并加载下一个任务的 CR3，而**只有中断
+返回路径**会消费这个锚点：中断入口在进入时写锚点，返回时 `movq %gs:16, %rsp` 再 `iretq`。
+
+原先 `forceReschedule()` 在 x86 上直接 `call` 进 `timerTick(getAnchor())`。从系统调用里调用时，
+交接只完成了一半：CR3 已经换成下一个任务的，而系统调用仍在自己的内核栈上通过 `sysretq` 返回，
+于是调用方**带着别人的地址空间回到了自己的用户 RIP**——当下一个任务是内核任务时更是加载了内核
+页表，用户侧一条指令都取不到。
+
+现在 `forceReschedule()` 触发同步让出陷阱（向量 252），让切换发生在真实的中断帧上：当前任务的
+帧被调度器妥善保存，等它再被调度时从该帧 `iretq` 回到 `int` 之后继续，系统调用才正常返回用户态。
+向量 252 的门 DPL=0，用户态执行同样的 `int` 得到 `#GP`；其处理函数刻意不发 LAPIC EOI，因为
+并没有任何中断被投递。
+
+这不是 `sched_yield` 独有的问题：`forceReschedule` 的所有调用方（futex 等待、SysV 信号量、
+`ipc`、阻塞 `flock`、`pause`）都走同一条路径，因此修正落在 `forceReschedule` 自身而非调用点。
+此前无法触及是因为**没有任何用户程序调用过 `sched_yield`**，`hello31` 是第一个。
+
 ### 2.8 调度器 Profiling 基础设施 ✅（2026-06-21 完成）
 
 文件: `proc/per_cpu.zig`, `fs/procfs.zig`
@@ -332,8 +351,36 @@ const SchedStats = struct {
 - syscall #56，支持CLONE_VM/CLONE_THREAD/CLONE_SETTLS；CLONE_FILES当前复制FD表，尚未实现共享FD表语义
 - CLONE_VM：共享地址空间创建轻量级线程
 - 独立内核栈，FS_BASE TLS指针配置
-- 已知缺陷：CLONE_SETTLS 在父进程 syscall 上下文里执行 `wrmsr(FS_BASE)`，写的是父进程的 TLS 而非新线程的；需改为存入 Task 字段、在子线程首次进入用户态时设置
 - 其余Linux clone标志按当前实现范围处理，完整CLONE_FILES语义仍待实现
+
+**TLS 基址是任务私有状态（2026-07-25 修正）**
+
+原先 `CLONE_SETTLS` 直接 `wrmsr(FS_BASE, tls)`，写的是**当前运行父进程的那个 CPU**。由于
+`Task` 没有 TLS 字段、上下文切换从不保存/恢复 `FS_BASE`、内核也没有 `arch_prctl`，这条 `wrmsr`
+是内核里唯一的用户 `FS_BASE` 写入点，于是 TLS 基址实际上成了 **CPU 的属性而非线程的属性**：
+
+- 父进程的 `%fs` 从此指向子线程的 TLS 块，而 `CLONE_SETTLS` 本该服务的子线程反而拿不到自己的基址
+- 这个错误的基址会一直留在该 CPU 上，被之后调度到该 CPU 的**任意**任务继承（包括不同地址空间的
+  任务）。分页仍然隔离各自的内存，所以后果是在攻击者可影响的偏移上发生内存破坏，而非跨进程泄漏
+
+现在 `Task` 增加 `tls_base` 字段：
+
+- `clone`：`CLONE_SETTLS` 时记到**子任务**上，否则沿用父进程的
+- `fork`：直接继承（子进程是地址空间的副本，TLS 块地址相同）
+- `execve`：清零，并同时把 CPU 上的 `FS_BASE` 写 0——`execve` 不经过调度器就返回用户态，
+  否则旧基址会残留进新镜像
+- `setupUserCpuState`：每次切到用户任务时安装 `t.tls_base`，因此没有 TLS 的任务拿到 0
+  而不是继承前一个任务的基址
+
+安装动作是一个 arch 钩子 `syscall.setUserTlsBase`，并按 CPU 缓存已加载值：绝大多数任务没有
+TLS，常见路径只是一次比较，不付 `wrmsr` 的代价。riscv64/aarch64 目前是空实现（尚无用户线程）。
+
+**新增 `arch_prctl(code, addr)`（syscall 472）**：支持 `ARCH_SET_FS`/`ARCH_GET_FS`。此前用户程序
+根本无法建立 TLS。`ARCH_SET_GS`/`ARCH_GET_GS` 返回 `EINVAL`——`GS` 存放本内核的 per-CPU 指针，
+若允许用户设置，下一次 `swapgs` 就会把内核自身的基址交给用户态。
+
+运行期验证：`user/hello31.c`。父子进程各自指向自己的 TLS 块、写入不同值，在对方运行过之后再读回，
+`hello31: TLS PASS` 与 `hello31: child TLS ok` 均为 x86_64 冒烟必需标记。
 
 ### 2.6 poll() I/O多路复用 (TCP/管道/文件) ✅
 

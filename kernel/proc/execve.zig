@@ -78,6 +78,11 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64) ?u64 {
     cur.user_stack_top = result.stack_top;
     cur.brk_current = result.brk;
     cur.brk_start = result.brk;
+    // The old TLS block belonged to the replaced image. Program the CPU too:
+    // execve returns straight to user space without passing through the
+    // scheduler, so the stale base would otherwise survive into the new image.
+    cur.tls_base = 0;
+    syscall_entry.setUserTlsBase(0);
 
     // Switch to new address space
     asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
@@ -178,6 +183,11 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64) ?u64 {
     cur.user_stack_top = result.stack_top;
     cur.brk_current = result.brk;
     cur.brk_start = result.brk;
+    // The old TLS block belonged to the replaced image. Program the CPU too:
+    // execve returns straight to user space without passing through the
+    // scheduler, so the stale base would otherwise survive into the new image.
+    cur.tls_base = 0;
+    syscall_entry.setUserTlsBase(0);
 
     asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
         :

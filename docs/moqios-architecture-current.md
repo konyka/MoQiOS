@@ -1226,7 +1226,7 @@ kernel/main.zig
   │   ├── gdt.zig          — GDT/TSS 设置 (Per-CPU)
   │   ├── idt.zig          — IDT/中断处理 + e1000/virtio-net IRQ分发
   │   ├── paging.zig       — 页表管理 + getPagePhysAddr
-  │   └── syscall_entry.zig — 系统调用入口 + 383 个处理函数 + COW fork
+  │   └── syscall_entry.zig — 系统调用入口 + 384 个处理函数 + COW fork
   │   ├── tsc.zig          — TSC 时钟
   │   └── exception.zig    — 异常处理器
   │

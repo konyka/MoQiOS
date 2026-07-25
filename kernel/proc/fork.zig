@@ -37,6 +37,9 @@ pub fn fork(frame: *SyscallFrame) i64 {
 
     child.brk_current = parent.brk_current;
     child.brk_start = parent.brk_start;
+    // The child is a copy of the address space, so its TLS block sits at the
+    // same address.
+    child.tls_base = parent.tls_base;
 
     // v53.50: Copy free_bm bitmap — child inherits parent's fd occupancy state.
     // Without this, child's free_bm stays at default (only bits 0-2 occupied),

@@ -102,6 +102,10 @@ pub const Task = struct {
     /// Lowest address the break may return to — the initial break set by the
     /// loader. Shrinking past it would unmap the loaded image itself.
     brk_start: u64,
+    /// Thread-local storage base for this task (x86_64 FS_BASE). Installed by
+    /// the scheduler when the task is put on a CPU, so each thread sees its own
+    /// TLS regardless of which CPU it lands on. 0 = no TLS.
+    tls_base: u64,
     /// Per-process file descriptor table.
     fd_table: @import("../fs/vfs.zig").FdTable,
 

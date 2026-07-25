@@ -595,6 +595,13 @@ pub const syscall = struct {
         _ = cpu_id;
     }
 
+    /// TLS base install. riscv64 keeps the thread pointer in `tp`, which the
+    /// trap return path restores from the frame, and this port has no user
+    /// threading yet, so there is nothing to program here.
+    pub fn setUserTlsBase(base: u64) void {
+        _ = base;
+    }
+
     pub fn getPerCpu() *PerCpu {
         return &percpu_array[0];
     }

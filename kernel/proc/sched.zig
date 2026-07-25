@@ -146,6 +146,7 @@ fn setupUserCpuState(t: *task.Task) void {
     pc.current_tid = t.tid;
     syscall_entry.syncUserRspFromTask(t);
     syscall_entry.setPerCpuGsBase(currentCpuId());
+    syscall_entry.setUserTlsBase(t.tls_base);
 }
 
 pub fn currentTaskIndex() ?u32 {
@@ -821,8 +822,17 @@ fn forceRescheduleContinue(cont_rip: u64, caller_sp: u64) void {
         return;
     }
     if (comptime builtin.cpu.arch == .x86_64) {
-        const iframe: *idt.InterruptFrame = @ptrFromInt(getAnchor());
-        timerTick(iframe);
+        // Raise the yield trap instead of driving the scheduler from this stack.
+        // The scheduler hands the CPU over by rewriting the per-CPU stack anchor
+        // and switching CR3, and only an interrupt return consumes that anchor.
+        // Called from a syscall, the switch therefore never happened: the
+        // syscall returned through `sysretq` on its own stack while CR3 already
+        // belonged to the next task, so the caller resumed in another address
+        // space — with no user mappings at all when that task was a kernel one.
+        comptime {
+            if (idt.YIELD_TRAP_VECTOR != 252) @compileError("update the int immediate below");
+        }
+        asm volatile ("int $252" ::: .{ .memory = true });
     } else if (comptime context_switch.uses_software_frame) {
         portableKernelSwitch(cont_rip, caller_sp);
     }

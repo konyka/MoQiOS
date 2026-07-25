@@ -2407,6 +2407,54 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   `mremap` 路径（由 `rangeAvailable`/`findFreeMmapRange` 支撑）的边界一并修正,
   但没有用户程序调用 `mremap`,因此属于推理而非运行时验证,留待后续补用例。
 
+### 3.157 TLS 基址归属任务 + 主动让出走中断返回（2026-07-25）
+
+- **背景**:接手 `mm/proc` 最后一项遗留——`CLONE_SETTLS` 在父进程上下文写 `FS_BASE`。
+  那条 `wrmsr` 本身只是问题的一半:`Task` 没有 TLS 字段、上下文切换从不保存/恢复
+  `FS_BASE`、内核也没有 `arch_prctl`,所以它是内核里**唯一**的用户 `FS_BASE` 写入点,
+  TLS 基址实际成了 CPU 的属性而非线程的属性。
+  - **P1** `clone(CLONE_SETTLS)` 写的是运行**调用方**的那个 CPU。父进程的 `%fs` 从此
+    指向子线程的 TLS 块,而该标志本该服务的子线程反而拿不到自己的基址——两边都拿错,
+    `errno`、线程局部变量以及任何 `%fs` 相对槽位都会静默访问到别的线程的块。
+  - **P1** 因为没有按任务保存/恢复,这个错误基址在 `clone` 之后仍留在该 CPU 上,被之后
+    调度到该 CPU 的**任意**任务继承,包括不同地址空间的任务。分页仍隔离各自内存,所以
+    后果是在攻击者可影响的偏移上发生内存破坏,而非跨进程泄漏。
+  - **P1** x86 上 `sched.forceReschedule()` 直接 `call` 驱动调度器。调度器交接 CPU 的
+    方式是改写 per-CPU 栈锚点并加载下一任务的 CR3,而只有**中断返回路径**会消费锚点。
+    从系统调用里调用时交接只完成一半:CR3 已换成下一任务的,而系统调用仍在自己的内核栈
+    上 `sysretq` 返回,于是调用方**带着别人的地址空间回到自己的用户 RIP**;下一任务是
+    内核任务时更是加载了内核页表,用户侧一条指令都取不到。
+  - **P1** 冒烟门禁会让"标记齐全但有任务被 SEGFAULT 杀死"的运行通过,因为受害者是
+    无关任务,各测试照样打印 PASS。
+- **方案**:新增 `Task.tls_base`。`clone` 记到子任务、`fork` 继承（地址空间是副本,TLS
+  块地址相同）、`execve` 清零并同时把 CPU 上的 `FS_BASE` 写 0（`execve` 不经调度器就
+  返回用户态,否则旧基址残留进新镜像）、`setupUserCpuState` 每次切到用户任务时安装。
+  安装是一个 arch 钩子 `syscall.setUserTlsBase`,按 CPU 缓存已加载值,常见路径（无 TLS）
+  只是一次比较;riscv64/aarch64 为空实现并注明原因（尚无用户线程）。
+  新增 `arch_prctl`(syscall 472) 支持 `ARCH_SET_FS`/`ARCH_GET_FS`——此前用户程序根本
+  无法建立 TLS,修复也没有用户态入口可测;`ARCH_SET_GS`/`ARCH_GET_GS` 返回 `EINVAL`,
+  因为 `GS` 存放本内核的 per-CPU 指针。
+  `forceReschedule()` 改为触发同步让出陷阱（向量 252),让切换发生在真实中断帧上;
+  向量 252 的门 DPL=0,用户态执行同样的 `int` 得到 `#GP`,其处理函数刻意不发 LAPIC EOI。
+  修正落在 `forceReschedule` 自身而非调用点,因为 futex 等待、SysV 信号量、`ipc`、
+  阻塞 `flock`、`pause` 都走同一条路径。
+- **效果**:TLS 基址随线程迁移且不再串到无关任务;`sched_yield` 及所有阻塞路径不再可能
+  带错 CR3 返回用户态;冒烟门禁不再放过含 SEGFAULT/内核 panic 的运行。
+- **验证**:三架构构建 + `zig build test` + `smoke`/`smoke-smp`/`smoke-smp-stress` +
+  riscv64/aarch64 smoke 全绿。`user/hello31.c` 让父子进程各自指向自己的 TLS 块、写入
+  不同值,并在对方运行过之后读回;`hello31: TLS PASS` 与 `hello31: child TLS ok` 均为
+  必需标记。两项负面对照现在都会使冒烟失败:去掉切换路径上的 `setUserTlsBase`,父进程
+  SEGFAULT 于 `0x200001000`——正是**子进程的** TLS 页,在父地址空间里并不存在,故障地址
+  直接指出机制而不只是断言失败;恢复直接 `timerTick(getAnchor())` 则 segfault 重现,
+  报在一个 `page_table_phys == 0` 的内核任务上,而 CR3 是内核 PML4（故障用户地址的
+  `pml4e = 0`）——这项对照同时暴露了旧门禁太弱:它能通过。
+- **已知边界**:`sched_yield` 此前从未被任何用户程序调用过,`hello31` 是第一个,所以这条
+  让出路径的缺陷一直无法触及。另发现但**本轮未修**:`cloneUserPagesCow`（及
+  `cloneUserPages`）以 `pte & 0xFFF` 复制 PTE 标志,丢掉了 bit 63 的 `NX`,于是每个
+  fork 出的子进程都在原本带 `NX` 的页（含其堆）上失去该保护。改动本身很小,但需要一个
+  断言"执行取指失败"的用例,而新加的"不允许 SEGFAULT"门禁规则使这种用例不好表达,
+  两者需一并设计,不在此轮草率合入。
+
 ---
 
 ## 4. M8 进度（x86_64 SMP）

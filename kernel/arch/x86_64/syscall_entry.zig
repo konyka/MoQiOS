@@ -224,6 +224,23 @@ pub fn setPerCpuGsBase(cpu_id: u32) void {
     wrmsr(0xC0000102, addr); // KERNEL_GS_BASE (loaded by swapgs)
 }
 
+const MSR_FS_BASE: u32 = 0xC0000100;
+
+/// FS_BASE currently programmed on each CPU. WRMSR is expensive and nearly
+/// every task runs with no TLS at all, so skip the write when the value is
+/// already loaded. Only setUserTlsBase writes FS_BASE, so this cannot go stale.
+var tls_base_loaded: [MAX_CPUS]u64 = @splat(0);
+
+/// Install a task's TLS base on the current CPU. Called by the scheduler when a
+/// user task is placed on a CPU, so a task's TLS follows it across CPUs and a
+/// task without TLS never inherits the previous task's base.
+pub fn setUserTlsBase(base: u64) void {
+    const cpu_id = getPerCpu().cpu_id;
+    if (tls_base_loaded[cpu_id] == base) return;
+    wrmsr(MSR_FS_BASE, base);
+    tls_base_loaded[cpu_id] = base;
+}
+
 /// The naked syscall entry point — loaded into IA32_LSTAR.
 /// This is called by the SYSCALL instruction from user space.
 ///
@@ -2329,6 +2346,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         471 => { // rseq_slice_yield(cpu_id, flags)
             frame.rax = 0; // accept (rseq yield — no-op)
         },
+        472 => { // arch_prctl(code, addr)
+            frame.rax = @bitCast(syscallArchPrctl(frame.rdi, frame.rsi));
+        },
         else => {
             serial.writeString("[syscall] unknown syscall: 0x");
             fmt.writeHex(syscall_nr);
@@ -3348,6 +3368,44 @@ fn syscallPrctl(option: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) i64 {
             _ = copy.copyToUser(@ptrFromInt(arg2), &buf, 4);
             return 0;
         },
+        else => return -22, // EINVAL
+    }
+}
+
+// ── arch_prctl ──────────────────────────────────────────────────────
+
+const ARCH_SET_GS: u64 = 0x1001;
+const ARCH_SET_FS: u64 = 0x1002;
+const ARCH_GET_FS: u64 = 0x1003;
+const ARCH_GET_GS: u64 = 0x1004;
+
+/// arch_prctl(code, addr) — read or set this thread's TLS base.
+///
+/// Only FS is available: GS holds the kernel's per-CPU pointer, so letting user
+/// space program it would hand it the kernel's own base on the next swapgs.
+fn syscallArchPrctl(code: u64, addr: u64) i64 {
+    const sched = @import("../../proc/sched.zig");
+    const tm = @import("../../proc/task.zig");
+    const us = @import("../../mm/user_space.zig");
+    const copy = @import("../../mm/copy_from_user.zig");
+
+    const cur_idx = sched.currentTaskIndex() orelse return -22; // EINVAL
+    const cur = tm.getTask(cur_idx) orelse return -22;
+
+    switch (code) {
+        ARCH_SET_FS => {
+            if (addr >= us.USER_ADDR_MAX) return -22; // EINVAL — not a user address
+            cur.tls_base = addr;
+            setUserTlsBase(addr);
+            return 0;
+        },
+        ARCH_GET_FS => {
+            const value = cur.tls_base;
+            const bytes: [*]const u8 = @ptrCast(&value);
+            if (copy.copyToUser(@ptrFromInt(addr), bytes[0..8], 8) != 8) return -14; // EFAULT
+            return 0;
+        },
+        ARCH_SET_GS, ARCH_GET_GS => return -22, // EINVAL — GS is the kernel's
         else => return -22, // EINVAL
     }
 }

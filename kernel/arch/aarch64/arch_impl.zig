@@ -531,6 +531,12 @@ pub const syscall = struct {
         _ = cpu_id;
     }
 
+    /// TLS base install. aarch64 uses TPIDR_EL0, and this port has no user
+    /// threading yet, so there is nothing to program here.
+    pub fn setUserTlsBase(base: u64) void {
+        _ = base;
+    }
+
     pub fn getPerCpu() *PerCpu {
         return &percpu_array[0];
     }

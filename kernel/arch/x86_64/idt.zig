@@ -299,6 +299,9 @@ pub fn interruptDispatch(frame: *InterruptFrame) callconv(.c) void {
     } else if (vector == 241) {
         // AHCI interrupt vector
         handleAhci(frame);
+    } else if (vector == YIELD_TRAP_VECTOR) {
+        // Synchronous yield trap — software `int`, never an IPI.
+        handleYieldTrap(frame);
     } else if (vector == 253) {
         // Reschedule IPI (lapic.RESCHEDULE_VECTOR)
         handleReschedule(frame);
@@ -307,6 +310,27 @@ pub fn interruptDispatch(frame: *InterruptFrame) callconv(.c) void {
         handleTlbShootdown(frame);
     }
     // Other vectors: ignored for now
+}
+
+/// Vector for the synchronous yield trap raised by `sched.forceReschedule` on
+/// x86. Its gate has DPL 0, so user space gets #GP rather than a free yield.
+pub const YIELD_TRAP_VECTOR: u8 = 252;
+
+/// Synchronous yield trap (vector 252) — kernel code asked to switch away right
+/// here rather than at the next timer tick.
+///
+/// A `call` into the scheduler cannot do this from a syscall: the scheduler
+/// hands the CPU over by rewriting the per-CPU stack anchor, and only an
+/// interrupt return reads that anchor. The syscall path returns through
+/// `sysretq` on its own stack, so it would resume the *calling* task with the
+/// next task's CR3 already loaded. Taking a real interrupt gives the caller a
+/// frame the scheduler can park and resume, so the handover happens here.
+///
+/// Unlike the reschedule IPI this is not an interrupt the LAPIC delivered, so it
+/// must not send an EOI.
+fn handleYieldTrap(frame: *InterruptFrame) void {
+    const sched = @import("../../proc/sched.zig");
+    sched.forceRescheduleFromIpi(frame);
 }
 
 /// Reschedule IPI (vector 253) — another CPU asked this CPU to re-run its

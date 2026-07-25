@@ -76,7 +76,24 @@ while [ "$SECONDS" -lt "$deadline" ]; do
        grep -q "hello29: PASS" "$LOG_FILE" &&
        grep -q "hello29: fsync PASS" "$LOG_FILE" &&
        grep -q "hello30: brk/mmap PASS" "$LOG_FILE" &&
+       grep -q "hello31: child TLS ok" "$LOG_FILE" &&
+       grep -q "hello31: TLS PASS" "$LOG_FILE" &&
        grep -q "MoQiOS shell" "$LOG_FILE"; then
+        # A healthy run faults nothing and panics nowhere. Checking the markers
+        # alone is not enough: a kernel bug can kill an unrelated task while
+        # every test still prints its PASS line.
+        if grep -q "\[SEGFAULT\]" "$LOG_FILE"; then
+            echo "FAIL: markers present but a process segfaulted (SMP=$SMP_COUNT)."
+            grep -A 2 "\[SEGFAULT\]" "$LOG_FILE" | head -20
+            echo "Serial log: $LOG_FILE"
+            exit 1
+        fi
+        if grep -q "KERNEL PANIC" "$LOG_FILE"; then
+            echo "FAIL: markers present but the kernel panicked (SMP=$SMP_COUNT)."
+            grep -A 4 "KERNEL PANIC" "$LOG_FILE" | head -20
+            echo "Serial log: $LOG_FILE"
+            exit 1
+        fi
         echo "PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=$SMP_COUNT)."
         echo "Serial log: $LOG_FILE"
         exit 0
@@ -86,7 +103,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for smoke markers."
-echo "Expected serial markers: 'hello21 done', 'hello29: PASS', 'hello29: fsync PASS', 'hello30: brk/mmap PASS' and 'MoQiOS shell'."
+echo "Expected serial markers: 'hello21 done', 'hello29: PASS', 'hello29: fsync PASS', 'hello30: brk/mmap PASS', 'hello31: TLS PASS' and 'MoQiOS shell'."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

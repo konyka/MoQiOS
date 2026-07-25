@@ -606,6 +606,29 @@ _start:
     movq $13, %rdx
     syscall
 
+    # Spawn hello31 (per-task TLS base test)
+    movq $5, %rax
+    leaq hello31_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn31_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done31_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
     # Spawn hello9 (fork test)
     movq $5, %rax
     leaq hello9_name(%rip), %rdi
@@ -853,6 +876,13 @@ done23_msg:
     .ascii "spawned hello30\n"
     done30_msg:
     .ascii "hello30 done\n"
+    hello31_name:
+    .ascii "hello31"
+    .byte 0
+    spawn31_msg:
+    .ascii "spawned hello31\n"
+    done31_msg:
+    .ascii "hello31 done\n"
     hello26_name:
     .ascii "hello26"
     .byte 0

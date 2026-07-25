@@ -11,7 +11,6 @@ const pmm_mod = @import("../../mm/pmm.zig");
 const hhdm_mod = @import("../../mm/hhdm.zig");
 const paging_mod = @import("paging.zig");
 const getPerCpu = @import("syscall_entry.zig").getPerCpu;
-const wrmsr = @import("syscall_entry.zig").wrmsr;
 const fmt = @import("../../lib/fmt.zig");
 
 // ── CLONE flags ──────────────────────────────────────────────────────
@@ -252,10 +251,13 @@ pub fn clone(
     child.saved_rsp = child_frame_addr;
     child.started = true;
 
-    // CLONE_SETTLS: set FS_BASE for TLS
-    if (flags & CLONE_SETTLS != 0 and tls != 0) {
-        wrmsr(0xC0000100, tls);
-    }
+    // CLONE_SETTLS names the *child's* TLS. Writing FS_BASE here would program
+    // the CPU currently running the parent: the parent would start reading the
+    // child's TLS block, the child would get whatever base happened to be
+    // loaded, and since nothing saved FS_BASE per task the stray value stayed on
+    // that CPU for every task scheduled after it. Record it on the child and let
+    // the scheduler install it.
+    child.tls_base = if (flags & CLONE_SETTLS != 0) tls else parent.tls_base;
 
     _ = parent_tid_ptr;
     _ = child_tid_ptr;

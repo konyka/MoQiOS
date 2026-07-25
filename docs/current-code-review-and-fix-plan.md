@@ -679,7 +679,7 @@ decision rather than a local fix:
 
 | Severity | Finding | Why deferred |
 |---|---|---|
-| P1 | `clone(CLONE_SETTLS)` calls `wrmsr(FS_BASE)` in the parent's syscall context, so it overwrites the parent's TLS instead of the new thread's. | Needs a `Task` field plus a set on the child's first user entry, touching the context-switch path. |
+| ~~P1~~ | ~~`clone(CLONE_SETTLS)` calls `wrmsr(FS_BASE)` in the parent's syscall context, so it overwrites the parent's TLS instead of the new thread's.~~ | **Resolved in 5.2m** — `Task.tls_base` plus an install on every switch to a user task. The scope was wider than recorded here: nothing saved `FS_BASE` per task, so the stray base also outlived the `clone` on that CPU. |
 | P1 | Non-`MAP_FIXED` `mmap` and `brk` growth map over existing mappings without unmapping, leaking the old frames. `rangeAvailable` already exists but is unused by `mmap`. | Rejecting or unmapping overlaps changes `mmap`/`brk` semantics; needs a decision on which behaviour userland expects. |
 | P1 | `vfs.syncFile` returns `void`, so a writeback error cannot reach `fsync` (carried over from 5.2f). | Requires threading errors through the VFS sync path. |
 | P2 | A process's 65th `mmap` region is untracked, so `munmap`/`mprotect` cannot find it. | Should return `ENOMEM`; needs a check on whether callers tolerate that. |
@@ -888,6 +888,69 @@ runtime-verified. Worth an `mremap` test in a later pass.
 | `zig build smoke-smp` | Passed | x86_64 dual-core reached shell. |
 | `zig build smoke-smp-stress` | Passed | 5 consecutive dual-core runs. |
 | `bash tools/qemu_smoke_riscv64.sh` | Passed | Shared probes unaffected. |
+| `bash tools/qemu_smoke_aarch64.sh` | Passed | Same. |
+
+### 5.2m Review Update: 2026-07-25 (per-task TLS base, and the yield path it uncovered)
+
+This pass took up the last deferred `mm/proc` item — `CLONE_SETTLS` writing `FS_BASE` in the parent's
+context. The write itself was the smaller half of the problem. `Task` had no field for a TLS base, the
+context switch never touched `FS_BASE`, and there was no `arch_prctl`, so that one `wrmsr` in `clone` was
+the only user `FS_BASE` write in the kernel. The base was therefore a property of the *CPU*, not of the
+thread.
+
+| Severity | Finding | Resolution / status |
+|---|---|---|
+| P1 | `clone(CLONE_SETTLS)` programmed `FS_BASE` on the CPU running the *caller*. The parent began reading the child's TLS block through `%fs`, and the child — the thread the flag names — got whatever base happened to be loaded. Both threads end up with the wrong TLS, so `errno`, thread-locals and any `%fs`-relative slot silently address another thread's block. | Fixed: `clone` records the base on the child and the scheduler installs it. |
+| P1 | Because nothing saved or restored `FS_BASE` per task, the stray base outlived the `clone`: it stayed on that CPU for every task scheduled afterwards, including tasks in unrelated address spaces. Paging still confines each task to its own memory, so this is corruption at an attacker-influenced offset rather than a cross-process leak — a task's `%fs` accesses land wherever the last `CLONE_SETTLS` caller pointed. | Fixed: `setupUserCpuState` installs `t.tls_base` on every switch to a user task, so a task with no TLS gets 0 instead of inheriting its predecessor's base. |
+| P1 | On x86, `sched.forceReschedule()` drove the scheduler by `call`, from whatever stack it was on. The scheduler hands a CPU over by rewriting the per-CPU stack anchor and loading the next task's CR3, and only an *interrupt return* consumes that anchor. Called from a syscall the handover half-happened: CR3 became the next task's while the syscall still returned through `sysretq` on its own stack, so the caller resumed **in another task's address space** — and with no user mappings at all when that task was a kernel one. | Fixed: `forceReschedule` raises a synchronous yield trap (vector 252) so the switch happens on a real interrupt frame. |
+| P1 | The smoke gate passed a run in which a task was killed by a segfault, because the gate only looked for each test's PASS marker and the victim was an unrelated task. | Fixed: a run containing `[SEGFAULT]` or `KERNEL PANIC` now fails the gate even when every marker is present. |
+
+`tls_base` is a new `Task` field. `clone` sets it from the `CLONE_SETTLS` argument and otherwise copies the
+parent's; `fork` inherits it, since the child's address space is a copy and its TLS block is at the same
+address; `execve` clears it and also programs 0 on the CPU, because `execve` returns straight to user space
+without passing through the scheduler and the stale base would otherwise survive into the new image. The
+install is one arch hook, `syscall.setUserTlsBase`, and it skips the `wrmsr` when the requested base is
+already loaded on this CPU — almost every task has no TLS, so the common path costs a compare.
+
+`arch_prctl(code, addr)` is new (syscall 472) and supports `ARCH_SET_FS`/`ARCH_GET_FS`. Without it a
+program had no way to establish TLS at all, and the fix had no user-space entry point to test through.
+`ARCH_SET_GS`/`ARCH_GET_GS` return `EINVAL`: `GS` holds this kernel's per-CPU pointer, so letting user
+space program it would hand it the kernel's own base at the next `swapgs`.
+
+The yield bug is the more serious find and was not reachable before this pass: no user program had ever
+called `sched_yield`, and `hello31` needs it to let the other process run. It is not specific to
+`sched_yield` — every `forceReschedule` caller (futex wait, SysV semaphores, `ipc`, blocking `flock`,
+`pause`) went through the same path, so all of them could return to user space with the wrong CR3 loaded.
+The fix is in `forceReschedule` itself rather than at the call sites. Vector 252's gate has DPL 0, so user
+space attempting the same `int` gets `#GP`; the handler deliberately skips the LAPIC EOI, since nothing was
+delivered.
+
+`hello31` establishes a TLS block, checks `%fs` actually reaches it, forks, and has each process stamp a
+distinct value through its own base and read it back after the other has run. Both `hello31: TLS PASS` and
+the child's `hello31: child TLS ok` are required smoke markers.
+
+Negative controls, both of which now fail the gate:
+
+- Dropping the `setUserTlsBase` call from the switch path: the parent segfaults reading `0x200001000` —
+  the *child's* TLS page, which does not exist in the parent's address space. The fault address shows the
+  mechanism directly, not just a failed assertion.
+- Restoring the direct `timerTick(getAnchor())` call in `forceReschedule`: the segfault returns, reported
+  against a kernel task with `page_table_phys == 0` while CR3 held the kernel PML4 (`pml4e = 0` for the
+  faulting user address). This control is also what showed the old gate was too weak — it passed.
+
+Found and deferred: `cloneUserPagesCow` (and `cloneUserPages`) copy PTE flags as `pte & 0xFFF`, which drops
+`NX` at bit 63. Every forked child therefore loses `NX` on the pages that had it, including its heap. The
+fix is small but wants a test that asserts an execution fault, which the new "no segfaults" gate rule makes
+awkward to express; both need designing together rather than rushing the flag change in here.
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
+| `zig build test` | Passed | Unit tests. |
+| `zig build smoke` | Passed | Now also gated on the two `hello31` markers, plus the no-segfault/no-panic rule. |
+| `zig build smoke-smp` | Passed | x86_64 dual-core reached shell. |
+| `zig build smoke-smp-stress` | Passed | 5 consecutive dual-core runs. |
+| `bash tools/qemu_smoke_riscv64.sh` | Passed | `setUserTlsBase` is a documented no-op there. |
 | `bash tools/qemu_smoke_aarch64.sh` | Passed | Same. |
 
 ### 5.3 Historical Verification
