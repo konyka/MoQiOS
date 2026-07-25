@@ -162,6 +162,13 @@ pub fn writeSectors(dev: u8, lba: u64, count: u32, buf: [*]const u8) i32 {
     }
 }
 
+/// 设备是否声明了可下发的 flush 屏障。
+/// 不支持屏障的设备按写透处理：回写完成即为可达的最强持久化保证。
+pub fn supportsFlush(dev: u8) bool {
+    if (dev >= device_count or !devices[dev].active) return false;
+    return devices[dev].info.supports_flush;
+}
+
 /// 分发 flush 命令
 pub fn flush(dev: u8) i32 {
     if (dev >= device_count or !devices[dev].active) return -1;

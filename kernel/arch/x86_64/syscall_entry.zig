@@ -3366,6 +3366,11 @@ fn syscallFsync(fd: u32) i64 {
     };
     if (wb_type != .none) {
         vfs_mod.syncFile(desc.ext2_file_idx, wb_type);
+        // FAT32/ext2 currently live on block device 0. Only devices that
+        // advertise a volatile write cache need a flush barrier; the others are
+        // write-through, so writeback completion is already durable.
+        const block_dev = @import("../../drivers/block_dev.zig");
+        if (block_dev.supportsFlush(0) and block_dev.flush(0) != 0) return -5; // EIO
     }
     return 0;
 }
