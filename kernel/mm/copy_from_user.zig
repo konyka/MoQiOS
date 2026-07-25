@@ -65,10 +65,8 @@ pub fn checkFault() ?u64 {
 pub fn validateUserRange(addr: u64, len: usize) bool {
     if (addr == 0) return false;
     if (addr >= USER_LIMIT) return false;
-    // Check for overflow: addr + len must not wrap or exceed USER_LIMIT
-    const end = addr + @as(u64, len);
-    if (end < addr) return false; // overflow
-    if (end > USER_LIMIT) return false;
+    // Subtraction avoids an overflowing addr + len expression.
+    if (@as(u64, len) > USER_LIMIT - addr) return false;
     return true;
 }
 
