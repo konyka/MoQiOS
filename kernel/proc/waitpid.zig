@@ -28,9 +28,7 @@ pub fn waitpidWithOptions(pid_raw: u64, status_ptr: u64, options: u32) i64 {
 
     var exit_code: i32 = 0;
     if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {
-        if (status_ptr != 0 and status_ptr < 0x0000_8000_0000_0000) {
-            _ = copy.copyToUser(@ptrFromInt(status_ptr), @as([*]const u8, @ptrCast(&exit_code))[0..4], 4);
-        }
+        writeStatus(status_ptr, exit_code);
         return child_tid;
     }
 
@@ -43,6 +41,19 @@ pub fn waitpidWithOptions(pid_raw: u64, status_ptr: u64, options: u32) i64 {
     const parent = task_mod.getTask(cur_idx) orelse return -1;
     parent.waiting_for_child = true;
     parent.wait_cpu = @intCast(se.getPerCpu().cpu_id);
+    asm volatile ("" ::: .{ .memory = true });
+
+    // Rescan now that the flag is visible. `exitTask` sets .zombie and reads the
+    // flag inside one `task_lock` section, and the scan below takes that same
+    // lock, so a child that exits from here on either sees the flag and wakes us
+    // or is already reapable here. Without this rescan a child exiting between
+    // the first scan and the store above wakes nobody and the parent blocks for
+    // good.
+    if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {
+        parent.waiting_for_child = false;
+        writeStatus(status_ptr, exit_code);
+        return child_tid;
+    }
     se.syncUserRspToTask(parent);
 
     task_mod.kickChildCpus(parent.tid, parent.wait_cpu);
@@ -59,11 +70,15 @@ pub fn waitpidWithOptions(pid_raw: u64, status_ptr: u64, options: u32) i64 {
 
     // Woken up — a child has exited. Now reap it.
     if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {
-        if (status_ptr != 0 and status_ptr < 0x0000_8000_0000_0000) {
-            _ = copy.copyToUser(@ptrFromInt(status_ptr), @as([*]const u8, @ptrCast(&exit_code))[0..4], 4);
-        }
+        writeStatus(status_ptr, exit_code);
         return child_tid;
     } else {
         return 0; // Spurious wakeup
     }
+}
+
+fn writeStatus(status_ptr: u64, exit_code: i32) void {
+    if (status_ptr == 0 or status_ptr >= 0x0000_8000_0000_0000) return;
+    const src: [*]const u8 = @ptrCast(&exit_code);
+    _ = copy.copyToUser(@ptrFromInt(status_ptr), src[0..4], 4);
 }
