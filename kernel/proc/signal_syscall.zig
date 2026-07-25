@@ -104,9 +104,13 @@ pub const SigreturnResult = struct {
 /// sigreturn() → SigreturnResult (register restore values)
 /// This is special: it reads the signal frame and returns all register values
 /// that need to be restored. The caller (syscall_entry) applies them.
-pub fn sigreturn() SigreturnResult {
+pub fn sigreturn() ?SigreturnResult {
     const user_rsp = syscall_entry.getPerCpu().saved_user_rsp;
-    const sig_frame: *sig_mod.SignalFrame = @ptrFromInt(user_rsp);
+    // A process can reach sigreturn with an arbitrary RSP, so the frame address
+    // is untrusted input. Reading it directly would fault inside the kernel on an
+    // unmapped stack (fatal — there is no per-syscall recovery) and would feed
+    // kernel memory straight back into user registers when RSP points high.
+    const sig_frame = readSignalFrame(user_rsp) orelse return null;
 
     // M8-5b-1: per-CPU exec redirect for the syscall return path
     const pc = syscall_entry.getPerCpu();
@@ -134,6 +138,18 @@ pub fn sigreturn() SigreturnResult {
         .r14 = sig_frame.r14,
         .r15 = sig_frame.r15,
     };
+}
+
+/// Copy a signal frame out of user memory. Returns null when `addr` is not a
+/// fully mapped user range.
+fn readSignalFrame(addr: u64) ?sig_mod.SignalFrame {
+    const size = @sizeOf(sig_mod.SignalFrame);
+    if (addr == 0 or addr >= 0x0000_8000_0000_0000) return null;
+    var frame: sig_mod.SignalFrame = undefined;
+    const dst: [*]u8 = @ptrCast(&frame);
+    const copy_mod = @import("../mm/copy_from_user.zig");
+    if (copy_mod.copyFromUser(dst[0..size], @ptrFromInt(addr), size) != size) return null;
+    return frame;
 }
 
 /// sigaltstack(ss_ptr, old_ss_ptr) → 0 or -errno

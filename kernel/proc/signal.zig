@@ -200,8 +200,14 @@ pub fn pushSignalFrame(
 /// Restore context from a signal frame on sigreturn.
 /// The user RSP points to the SignalFrame. We read it and return
 /// the saved RIP, RSP, RFLAGS so the syscall return path can use them.
-pub fn popSignalFrame(frame_addr: u64) struct { rip: u64, rsp: u64, rflags: u64, rax: u64 } {
-    const frame: *const SignalFrame = @ptrFromInt(frame_addr);
+/// `frame_addr` is user-controlled, so it is copied in rather than dereferenced;
+/// null means the range is not fully mapped user memory.
+pub fn popSignalFrame(frame_addr: u64) ?struct { rip: u64, rsp: u64, rflags: u64, rax: u64 } {
+    if (frame_addr == 0 or frame_addr >= 0x0000_8000_0000_0000) return null;
+    var frame: SignalFrame = undefined;
+    const dst: [*]u8 = @ptrCast(&frame);
+    const copy = @import("../mm/copy_from_user.zig");
+    if (copy.copyFromUser(dst[0..@sizeOf(SignalFrame)], @ptrFromInt(frame_addr), @sizeOf(SignalFrame)) != @sizeOf(SignalFrame)) return null;
     return .{
         .rip = frame.rip,
         .rsp = frame.rsp,

@@ -2657,7 +2657,12 @@ fn syscallSigprocmask(frame: *SyscallFrame) void {
 }
 
 fn syscallSigreturn(frame: *SyscallFrame) void {
-    const r = signal_syscall_mod.sigreturn();
+    const r = signal_syscall_mod.sigreturn() orelse {
+        // Bad frame address: leave the register state alone rather than
+        // restoring garbage, and report the fault.
+        frame.rax = @bitCast(@as(i64, -14)); // EFAULT
+        return;
+    };
     frame.rax = r.rax;
     frame.rbx = r.rbx;
     frame.rcx = r.rcx;
