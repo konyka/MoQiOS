@@ -1450,16 +1450,22 @@ fn applyBdpCwndFloor(tcb: *TcpTcb) void {
     if (floor > tcb.cwnd) tcb.cwnd = floor;
 }
 
-/// BBR-lite Startup: grow toward 2·BDP; on reach, Drain to 1·BDP (SK-121).
+/// BBR-lite Startup: grow toward 2·BDP; on reach, Drain to 1·BDP (SK-121/148).
 fn applyBbrStartup(tcb: *TcpTcb, acked: u32, smss: u32) void {
-    const target = probeBbrStartupCwnd(tcb.delivery_rate, tcb.min_rtt_ms);
+    const target = if (tcb.accecn_ok)
+        probeL4sStartupCwnd(tcb.delivery_rate, tcb.min_rtt_ms, tcb.l4s_ce_ewma)
+    else
+        probeBbrStartupCwnd(tcb.delivery_rate, tcb.min_rtt_ms);
     if (target == 0) return;
     if (tcb.cwnd < target) {
         const step = @max(acked, smss);
         const next = tcb.cwnd +% step;
         tcb.cwnd = if (next < target and next > tcb.cwnd) next else target;
     }
-    if (probeBbrStartupDone(tcb.cwnd, target)) {
+    // SK-148: AccECN aborts Startup early under sustained CE marking.
+    const done = probeBbrStartupDone(tcb.cwnd, target) or
+        (tcb.accecn_ok and probeL4sStartupAbort(tcb.l4s_ce_ewma));
+    if (done) {
         tcb.bbr_startup = false;
         tcb.bbr_cycle_idx = 0;
         tcb.bbr_cycle_ms = 0;
@@ -3855,6 +3861,23 @@ pub fn probeL4sEwmaGainNum(gain_num: u32, ewma_q8: u32) u32 {
     const keep = 8 - cuts;
     const v = (gain_num * keep) / 8;
     return if (v == 0) 1 else v;
+}
+
+/// AccECN Startup target: 2·BDP · keep/8, floored at 1·BDP (SK-148).
+pub fn probeL4sStartupCwnd(rate_bps: u32, min_rtt_ms: u32, ewma_q8: u32) u32 {
+    const full = probeBbrStartupCwnd(rate_bps, min_rtt_ms);
+    if (full == 0 or ewma_q8 == 0) return full;
+    const cuts: u32 = probeL4sEwmaCuts(ewma_q8, 1);
+    const keep = 8 - cuts;
+    const scaled: u32 = @intCast(@min((@as(u64, full) * keep) / 8, @as(u64, 0xffff_ffff)));
+    const bdp = probeBdpBytes(rate_bps, min_rtt_ms);
+    if (bdp > 0 and scaled < bdp) return bdp;
+    return if (scaled == 0) 1 else scaled;
+}
+
+/// Abort Startup when CE-rate EWMA ≥ 2/8 per segment (Q8 ≥ 64) (SK-148).
+pub fn probeL4sStartupAbort(ewma_q8: u32) bool {
+    return ewma_q8 >= 64;
 }
 
 /// Apply CUBIC β `delta` times (or once if delta=0) (SK-136).
