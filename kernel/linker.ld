@@ -29,7 +29,9 @@ SECTIONS
     .data : {
         *(.data .data.*)
         /* Limine request structs — must be in a writable, loadable segment */
-        *(.limine_reqs)
+        KEEP(*(.limine_requests_start))
+        KEEP(*(.limine_reqs))
+        KEEP(*(.limine_requests_end))
     } :data
 
     . = ALIGN(4K);

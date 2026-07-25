@@ -23,12 +23,14 @@ const subsystem_boot = @import("shared/subsystem_boot.zig");
 
 pub const panic = @import("panic.zig").panic;
 
+pub export var limine_requests_start: limine.RequestsStartMarker linksection(".limine_requests_start") = .{};
 pub export var base_revision: limine.BaseRevision linksection(".limine_reqs") = .{};
 pub export var memmap_request: limine.MemmapRequest linksection(".limine_reqs") = .{};
 pub export var hhdm_request: limine.HhdmRequest linksection(".limine_reqs") = .{};
 pub export var framebuffer_request: limine.FramebufferRequest linksection(".limine_reqs") = .{};
 pub export var rsdp_request: limine.RsdpRequest linksection(".limine_reqs") = .{};
 pub export var module_request: limine.ModuleRequest linksection(".limine_reqs") = .{};
+pub export var limine_requests_end: limine.RequestsEndMarker linksection(".limine_requests_end") = .{};
 
 export fn _start() callconv(.c) noreturn {
     serial.init();
