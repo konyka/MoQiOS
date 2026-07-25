@@ -1,6 +1,7 @@
 /// select — I/O multiplexing via fd_set bitmaps.
 ///
 /// Extracted from syscall_entry.zig (v18.8).
+const std = @import("std");
 const copy = @import("../mm/copy_from_user.zig");
 const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
@@ -10,7 +11,7 @@ const bo = @import("../lib/byte_order.zig");
 
 /// select(nfds, readfds_ptr, writefds_ptr, exceptfds_ptr, timeout_ptr) -> ready count or -errno.
 pub fn select(nfds: u64, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr: u64, timeout_ptr: u64) i64 {
-    if (nfds > 128) return -22; // -EINVAL
+    if (nfds > vfs_mod.MAX_FDS) return -22; // -EINVAL
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
@@ -25,7 +26,9 @@ pub fn select(nfds: u64, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr: u64
         if (copy.copyFromUser(&tv, @ptrFromInt(timeout_ptr), 16) != 16) return -14;
         const sec: u64 = bo.readU64Le(tv[0..8]);
         const usec: u64 = bo.readU64Le(tv[8..16]);
-        timeout_ms = sec * 1000 + usec / 1000;
+        const usec_ms = usec / 1000;
+        if (usec >= 1_000_000 or sec > (std.math.maxInt(u64) - usec_ms) / 1000) return -22;
+        timeout_ms = sec * 1000 + usec_ms;
     }
 
     var read_fds: [16]u8 = @splat(0);

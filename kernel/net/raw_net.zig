@@ -20,6 +20,7 @@ pub fn netRecv(buf: u64, max_len: u64) i64 {
     if (buf == 0 or max_len == 0 or buf >= 0x0000_8000_0000_0000) return -22;
     if (!nic.isActive()) return -1;
     const capacity: u32 = @intCast(@min(max_len, 2048));
+    if (!copy.validateUserBuffer(buf, capacity)) return -14;
     var packet: [2048]u8 = undefined;
     const received = nic.receivePacket(&packet, capacity);
     if (received > 0 and copy.copyToUser(@ptrFromInt(buf), packet[0..received], received) != received) return -14;
