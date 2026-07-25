@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-25 (SK-151 TCP send user→ring + fsync barrier gate; prior SK-150 reviewed and verified)
+> Last update: 2026-07-25 (mm/proc audit: waitpid lost wakeup, sigreturn user-pointer, clone rollback; prior SK-151 reviewed and verified)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -484,6 +484,9 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | ProbeRTT dwell fixed | 200ms ProbeRTT under high CE may not drain queue. | SK-150: EWMA stretches ProbeRTT duration up to 2·base. |
 | TCP send bounce buffer | Full-window send staged 64KB on the 128KB kernel stack and copied twice. | SK-151: `tcpSendFromUser` copies user data straight into the send ring. |
 | `fsync` barrier gate | Flush call rejected write-through devices, so every ext2/FAT32 sync returned EOPNOTSUPP. | Fixed: gate the barrier on `block_dev.supportsFlush`; failure maps to EIO. |
+| waitpid lost wakeup | `waiting_for_child` was published after the zombie scan released `task_lock`, so a child exiting in that window woke nobody. | Fixed: rescan after publishing the flag, under the same lock the child uses. |
+| sigreturn user pointer | The signal frame was read straight from `saved_user_rsp`, a user-controlled address. | Fixed: copy through `copyFromUser`, return EFAULT on a bad range. |
+| Clone OOM rollback | Both `cloneUserPages` variants leaked the partial page-table tree on OOM; `fork` leaked a completed root when task creation failed. | Fixed: roll back through `destroyUserSpace` on every failure path. |
 | User-copy fault recovery | Exception-table TODO still present. | Downgraded to mitigated P1: page-walk precheck already returns EFAULT-style 0 without kernel panic; RIP-range recovery deferred. |
 | Fork FD ownership (broader) | Review still listed socket/epoll/eventfd/timerfd as open P0. | Closed: v53.44 + eventfd completion cover the shared-resource set; pipes keep their separate `Pipe.ref_count`. |
 
@@ -634,6 +637,52 @@ dequeue; and the `tcp_syscall` error codes moved from `-1` to `-EFAULT`, matchin
 Residual risk: `vfs.syncFile` still returns `void`, so a writeback error cannot reach `fsync`. The
 barrier gate above fixes the false failure but not the inverse false success. Propagating writeback
 errors through the VFS sync path remains open P1 follow-up work.
+
+### 5.2g Review Update: 2026-07-25 (mm/proc subsystem audit)
+
+With the worktree clean and pushed, this pass audited the memory-management and process/scheduling
+subsystems (`kernel/mm/`, `kernel/proc/`, `kernel/sync/`) for lifetime, race, and untrusted-input
+defects. Scope is those directories plus the syscall entry points that reach them.
+
+| Severity | Finding | Resolution / status |
+|---|---|---|
+| P0 | Lost wakeup between `waitpid` and `exitTask`. `task.waitpid` scans for zombies under `task_lock` and releases it, but `waiting_for_child` was published outside any lock afterwards. A child exiting in that window read the flag as false, skipped the wake, and the parent then blocked forever with a reapable zombie sitting there. | Fixed: publish the flag, then rescan before blocking. `exitTask` sets `.zombie` and reads the flag in one `task_lock` section and the rescan takes the same lock, so either the child sees the flag or the rescan sees the zombie. |
+| P0 | `sigreturn` dereferenced `saved_user_rsp` directly. Any process can set RSP freely and invoke syscall 15, so an unmapped RSP faulted inside the kernel — fatal, since there is no per-syscall recovery — and an RSP pointing at kernel memory copied that memory into user-visible registers. | Fixed: the frame is copied in through `copyFromUser`; a bad range returns `-EFAULT` and leaves register state untouched. The unused `popSignalFrame` had the same pattern and was converted too, so it is not a trap for the next caller. |
+| P1 | `cloneUserPages` / `cloneUserPagesCow` abandoned every page table and leaf page allocated so far when they hit OOM mid-walk, and `fork` did not release a completed child root when `createUserProcess` then failed (`clone` already did). | Fixed: both clone paths roll back through `destroyUserSpace`, which tolerates a partial tree and whose batched frees also undo the COW `addRefBatch` increments. `fork` now mirrors `clone`. |
+
+Verified as safe and deliberately left alone: `validateUserRange` avoids `addr + len` overflow by
+subtraction; `dequeueSignal` masks bit 31 before indexing `signal_handlers[31]`; `sched.timerTick`
+releases `sched_lock` before taking `task_lock`, matching the documented lock order; and the per-CPU
+work-stealing path takes its two locks in CPU-ID order. No function in these directories declares a
+stack array above 4 KiB — the largest are ~2 KiB.
+
+No SK probe was added for this round. All three defects are x86-specific control-flow and lifetime
+bugs with no pure-function core, so a cross-architecture marker would assert nothing about them.
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build test` | Passed | Host helper tests. |
+| `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
+| `zig build smoke` | Passed | x86_64 single-core reached shell. |
+| `zig build smoke-smp` | Passed | x86_64 dual-core reached shell. |
+| `zig build smoke-smp-stress` | Passed | 5 consecutive dual-core runs reached shell. Closest available gate to the waitpid race. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | SK-151 markers. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | SK-151 markers. |
+
+Residual risk: the smoke gates exercise `fork`/`waitpid` on every shell command, but they cannot
+schedule the exact interleaving the waitpid fix targets, and they never drive the clone paths to OOM.
+Both fixes rest on the lock-ordering argument above rather than on a reproduced failure.
+
+Open follow-ups found in this pass but deliberately not changed yet, since each needs a semantic
+decision rather than a local fix:
+
+| Severity | Finding | Why deferred |
+|---|---|---|
+| P1 | `clone(CLONE_SETTLS)` calls `wrmsr(FS_BASE)` in the parent's syscall context, so it overwrites the parent's TLS instead of the new thread's. | Needs a `Task` field plus a set on the child's first user entry, touching the context-switch path. |
+| P1 | Non-`MAP_FIXED` `mmap` and `brk` growth map over existing mappings without unmapping, leaking the old frames. `rangeAvailable` already exists but is unused by `mmap`. | Rejecting or unmapping overlaps changes `mmap`/`brk` semantics; needs a decision on which behaviour userland expects. |
+| P1 | `vfs.syncFile` returns `void`, so a writeback error cannot reach `fsync` (carried over from 5.2f). | Requires threading errors through the VFS sync path. |
+| P2 | A process's 65th `mmap` region is untracked, so `munmap`/`mprotect` cannot find it. | Should return `ENOMEM`; needs a check on whether callers tolerate that. |
+| P2 | File-backed `mmap` ignores the `read` return value, mapping zeroes instead of reporting failure. | Small, but changes the error contract of `mmap`. |
 
 ### 5.3 Historical Verification
 

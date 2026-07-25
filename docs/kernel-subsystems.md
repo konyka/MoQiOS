@@ -308,6 +308,7 @@ const SchedStats = struct {
 - syscall #56，支持CLONE_VM/CLONE_THREAD/CLONE_SETTLS；CLONE_FILES当前复制FD表，尚未实现共享FD表语义
 - CLONE_VM：共享地址空间创建轻量级线程
 - 独立内核栈，FS_BASE TLS指针配置
+- 已知缺陷：CLONE_SETTLS 在父进程 syscall 上下文里执行 `wrmsr(FS_BASE)`，写的是父进程的 TLS 而非新线程的；需改为存入 Task 字段、在子线程首次进入用户态时设置
 - 其余Linux clone标志按当前实现范围处理，完整CLONE_FILES语义仍待实现
 
 ### 2.6 poll() I/O多路复用 (TCP/管道/文件) ✅
