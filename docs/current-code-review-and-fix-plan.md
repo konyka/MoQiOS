@@ -1001,6 +1001,42 @@ similar properties be asserted from user space, and is the natural next item.
 | `zig build smoke-smp-stress` | Passed | 5 consecutive dual-core runs. |
 | `bash tools/qemu_smoke_riscv64.sh` / `_aarch64.sh` | Passed | Neither port forks user processes yet. |
 
+### 5.2o Review Update: 2026-07-25 (synchronous SIGSEGV delivery — fixing the delivery path itself)
+
+This pass picked up the item 5.2n left open. The working tree already held an unfinished change making a
+user page fault deliver `SIGSEGV` to a registered handler instead of killing outright, together with a test
+(`user/hello32.c`). The test was never wired into `init.S` / `qemu_run.sh`, so it had never run. Wiring it up
+showed the feature did not work at all: the child still took `[SEGFAULT] User process killed`, after which
+the machine stopped producing output entirely.
+
+Both root causes are pre-existing defects that the new feature merely ran into, and both were located from
+measured diagnostic output rather than inferred.
+
+| Severity | Finding | Resolution / status |
+|---|---|---|
+| P0 | `deliverSignalToRunningTask` tested `iframe.cs != 0x1B` to decide "is this frame returning to user mode". The GDT defines *two* user code selectors: `USER_CS = 0x1B` for `iretq` and `USER_CS_SYSRET = 0x2B` for `sysret`. Anything that has made a syscall runs on `0x2B`, so the test was effectively always false and interrupt-path signal delivery was dead code — not just for the new feature. Measured on the faulting frame: `cs=0x2b`. | Fixed: both selectors are accepted, via the named `gdt` constants rather than a literal. |
+| P0 | On a pending signal the timer path released the lock and returned, skipping scheduling. When delivery failed the signal stayed pending, so *every* tick skipped scheduling and the CPU stopped making progress — the hang above. The diagnostic log showed `cs=0x08` repeating without end. | Fixed: the tick path returns only when delivery succeeded, otherwise it re-acquires the lock and reschedules normally. |
+| P1 | The in-flight change made `deliverSignalToRunningTask` return `bool` but left the timer-path call site discarding nothing, so x86_64 did not build. | Fixed with an explicit discard; that path has no fallback, a failed delivery simply leaves the signal pending. |
+| P2 | The ramdisk packer and kernel parser both capped the image at 32 files. hello32 was the 33rd, so `mkramdisk.sh` refused to build the image — the practical reason the test had not been wired up. The cap backs no static array (the index lives in the blob), so it is only a sanity bound. | Raised to 64 on both sides, kept in sync by comment. |
+
+With these fixed, hello32 reports `null fault handler ok`, `NX exec fault handler ok`, and `SIGSEGV PASS`.
+That also closes 5.2n's "not verified" item: the second half of hello32 forks, `mmap`s a writable anonymous
+page and jumps into it, and the resulting instruction-fetch fault arrives as a delivered `SIGSEGV` — W^X
+across `fork` is now asserted from user space rather than only from a unit test.
+
+Left open: `copy_from_user.isUserAccessible` checks only the `user` bit, not writability, so
+`pushSignalFrame` writing a signal frame onto a read-only COW stack page would take a kernel write-protect
+fault. The current test does not hit it because its stack page is already un-shared, but the path needs its
+own handling.
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
+| `zig build test` | Passed | Host helper tests. |
+| `zig build smoke` / `smoke-smp` | Passed | Single and dual core; hello32 passes both parts. |
+| `zig build smoke-smp-stress` | Passed | 5 consecutive dual-core runs. |
+| `bash tools/qemu_smoke_riscv64.sh` / `_aarch64.sh` | Passed | Unaffected; neither port has this fault path. |
+
 ### 5.3 Historical Verification
 
 Executed on 2026-06-21:

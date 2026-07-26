@@ -13,8 +13,10 @@ const klog = @import("../klog.zig");
 const fmt = @import("../lib/fmt.zig");
 const bo = @import("../lib/byte_order.zig");
 
-/// Max files in the ramdisk index.
-pub const MAX_FILES: u32 = 32;
+/// Max files in the ramdisk index. Only a sanity bound on the count read from
+/// the blob — the index itself lives in the blob, so raising this costs nothing
+/// but 80 bytes of image per extra file.
+pub const MAX_FILES: u32 = 64;
 
 /// Max filename length (including null terminator).
 pub const MAX_NAME_LEN: u32 = 64;

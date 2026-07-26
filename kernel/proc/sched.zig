@@ -167,7 +167,7 @@ fn countActiveOnThisCpu() u32 {
 pub fn timerTick(frame: *idt.InterruptFrame) void {
     _ = frame;
 
-    const flags = sched_lock.acquire();
+    var flags = sched_lock.acquire();
 
     // Global periodic maintenance — BSP only (one tick source for the whole system).
     if (currentCpuId() == 0) {
@@ -243,8 +243,12 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
             if (ct.state == .zombie) setSlice(0);
             if (ct.is_user and ct.pending_signals != 0 and ct.pending_signals & ~ct.signal_mask != 0) {
                 sched_lock.release(flags);
-                deliverSignalToRunningTask(ct);
-                return;
+                // Resume through the frame when the handler was entered.
+                // Otherwise fall through to a normal reschedule: returning here
+                // would skip scheduling on every tick for as long as the signal
+                // stays undeliverable, which stalls the CPU outright.
+                if (deliverSignalToRunningTask(ct)) return;
+                flags = sched_lock.acquire();
             }
         }
     }
@@ -537,15 +541,23 @@ fn kickCpuX86(cpu_id: u8) void {
 /// Deliver a pending signal to the currently running user task.
 /// Modifies the InterruptFrame on the kernel stack to redirect execution
 /// to the signal handler with a signal frame pushed onto the user stack.
-pub fn deliverSignalToRunningTask(t: *task.Task) void {
+///
+/// Returns true when the caller should resume through the frame (handler
+/// entered, default ignored, or exitTask was invoked for default terminate).
+/// Returns false when delivery failed and the caller should fall back.
+pub fn deliverSignalToRunningTask(t: *task.Task) bool {
     // Only deliver to tasks returning to user mode.
     // Check this BEFORE dequeuing the signal to avoid losing it.
+    // Both user code selectors have to be accepted: a task resumed with iretq
+    // runs on USER_CS, but one that last returned through sysret runs on
+    // USER_CS_SYSRET, which is most of the time for anything that makes
+    // syscalls. Testing only USER_CS made this path silently give up.
     const iframe: *idt.InterruptFrame = @ptrFromInt(getAnchor());
-    if (iframe.cs != 0x1B) return;
+    if (iframe.cs != gdt.USER_CS and iframe.cs != gdt.USER_CS_SYSRET) return false;
 
     const sig_mod = @import("signal.zig");
 
-    const signum = sig_mod.dequeueSignal(t) orelse return;
+    const signum = sig_mod.dequeueSignal(t) orelse return false;
 
     const handler_addr = t.signal_handlers[signum - 1];
 
@@ -557,10 +569,10 @@ pub fn deliverSignalToRunningTask(t: *task.Task) void {
             task.exitTask(128 + @as(i32, @intCast(signum)));
             // exitTask never returns (ends in sti+hlt loop)
         }
-        return;
+        return true;
     }
 
-    if (handler_addr == 1) return;
+    if (handler_addr == 1) return true;
 
     const user_rsp = iframe.rsp;
     const user_rip = iframe.rip;
@@ -570,12 +582,13 @@ pub fn deliverSignalToRunningTask(t: *task.Task) void {
 
     // v53.45: Drop signal if delivery fails — avoids livelock when user stack
     // is permanently unmapped. Signal was already dequeued by dequeueSignal.
-    if (result.new_rsp == 0) return;
+    if (result.new_rsp == 0) return false;
 
     // Modify the InterruptFrame to jump to the signal handler
     iframe.rip = handler_addr;
     iframe.rsp = result.new_rsp;
     iframe.rdi = signum;
+    return true;
 }
 
 /// Shared kernel idle body — lowest priority, enable IRQs + wait between ticks.

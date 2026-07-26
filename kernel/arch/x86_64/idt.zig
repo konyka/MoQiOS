@@ -499,8 +499,24 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
         // Failed demand page — fall through to segfault
     }
 
-    // Path 4: User-mode segfault — kill the process
+    // Path 4: User-mode segfault — deliver SIGSEGV when a handler is registered,
+    // otherwise terminate (default action).
     if (user_mode) {
+        const task_mod = @import("../../proc/task.zig");
+        const sched_mod = @import("../../proc/sched.zig");
+        const sig_mod = @import("../../proc/signal.zig");
+
+        if (sched_mod.currentTaskIndex()) |idx| {
+            if (task_mod.getTask(idx)) |cur| {
+                if (cur.is_user) {
+                    _ = sig_mod.sendSignal(cur.tid, sig_mod.SIGSEGV);
+                    if (sched_mod.deliverSignalToRunningTask(cur)) {
+                        return;
+                    }
+                }
+            }
+        }
+
         serial.writeString("\n[SEGFAULT] User process killed\n");
         serial.writeString("  fault addr: 0x");
         fmt.writeHex(cr2);
@@ -510,16 +526,6 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
         if (write) serial.writeString("write") else serial.writeString("read");
         if (present) serial.writeString(", protection");
         serial.writeString(")\n");
-
-        const task_mod = @import("../../proc/task.zig");
-        const sched_mod = @import("../../proc/sched.zig");
-        if (sched_mod.currentTaskIndex()) |idx| {
-            if (task_mod.getTask(idx)) |cur| {
-                if (cur.tid == 12) {
-                    serial.writeString("  [SEGFAULT from tid=12]\n");
-                }
-            }
-        }
 
         task_mod.exitTask(139);
         return;

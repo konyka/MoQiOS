@@ -34,8 +34,10 @@ if [ "$FILE_COUNT" -eq 0 ]; then
     exit 1
 fi
 
-if [ "$FILE_COUNT" -gt 32 ]; then
-    echo "Error: too many files ($FILE_COUNT > 32)"
+# Must match ramdisk.MAX_FILES in kernel/fs/ramdisk.zig.
+MAX_FILES=64
+if [ "$FILE_COUNT" -gt "$MAX_FILES" ]; then
+    echo "Error: too many files ($FILE_COUNT > $MAX_FILES)"
     exit 1
 fi
 

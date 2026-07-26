@@ -2484,6 +2484,38 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   下来汇报结果,而冒烟门禁现在（正确地）会因日志出现 `[SEGFAULT]` 而失败。缺的功能是
   同步故障信号投递——补上它才能从用户态断言这类性质,这也是下一项自然的工作。
 
+### 3.159 同步缺页投递 SIGSEGV：修好投递路径本身（2026-07-25）
+
+- **背景**:承接 3.158 留下的那项。工作区里已有一份在制品把用户态缺页从"无条件杀进程"
+  改成"注册了 handler 就投递 `SIGSEGV`",并配了测试 `user/hello32.c`,但该测试**从未接线**
+  进 `init.S`/`qemu_run.sh`,因此从未运行过。把它接上后立刻暴露:功能实际不工作,
+  子进程仍然走 `[SEGFAULT] User process killed`,随后整机停止输出。
+- **根因一(既有缺陷,P0)**:`deliverSignalToRunningTask` 用 `iframe.cs != 0x1B` 判断
+  "是否返回用户态"。但 GDT 有**两个**用户代码段:`USER_CS = 0x1B`(iretq 用)与
+  `USER_CS_SYSRET = 0x2B`(SYSRET 用,见 gdt.zig 注释)。任何做过系统调用的任务都运行在
+  `0x2B` 上,于是该判断恒假——**中断路径的信号投递一直是死代码**,不只是新功能没生效。
+  实测诊断:故障帧 `cs=0x2b`。
+- **根因二(既有缺陷,P0)**:时钟路径在有挂起信号时 `release(flags)` 后直接 `return`,
+  跳过调度。投递一旦失败,信号保持挂起,于是**每一拍都跳过调度**——CPU 就此停止推进。
+  这正是上面"整机停止输出"的原因;诊断日志里可见 `cs=0x08` 无限刷屏。
+- **方案**:判断改为同时接受两个用户段选择子(用 `gdt.USER_CS`/`gdt.USER_CS_SYSRET`
+  具名常量,不再写字面量)。时钟路径改为**只有投递成功才** `return`,失败则重新取锁并
+  照常调度,保证 CPU 始终推进。
+- **顺带**:该在制品把 `deliverSignalToRunningTask` 从 `void` 改成 `bool`,但漏改了时钟
+  路径这个调用点,x86_64 因此无法构建;已补上显式丢弃。另外 ramdisk 打包器与内核解析器
+  的文件数上限是 32,接上 hello32 正好第 33 个,`mkramdisk.sh` 直接报错——这也是原先没接线
+  的现实障碍。该上限不撑任何静态数组(索引就在 blob 里),两侧一并提到 64。
+- **效果**:用户态缺页现在能投递到已注册的 `SIGSEGV` handler。3.158 遗留的"端到端执行
+  语义未验证"随之补上:hello32 第二部分 fork 后 `mmap` 一页可写匿名内存并从中取指,
+  该取指故障作为 `SIGSEGV` 被投递到 handler,从用户态证明了 W^X 跨 fork 成立。
+- **验证**:三架构构建 + `zig build test` + `smoke`/`smoke-smp`/`smoke-smp-stress` +
+  riscv64/aarch64 smoke 全绿。hello32 打印
+  `null fault handler ok` / `NX exec fault handler ok` / `SIGSEGV PASS`。
+  两个根因都是先由诊断输出实测定位(而非推断),再修的。
+- **后续**:`copy_from_user.isUserAccessible` 只检查 `user` 位、不检查可写性,因此
+  `pushSignalFrame` 往只读 COW 栈页写信号帧时会以内核态触发写保护故障;当前用例的栈页
+  已解 COW 所以未触发,但这条路径仍需单独处理。
+
 ---
 
 ## 4. M8 进度（x86_64 SMP）
