@@ -92,6 +92,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
        grep -q "hello34: PASS" "$LOG_FILE" &&
        grep -q "hello35: PASS" "$LOG_FILE" &&
        grep -q "hello36: PASS" "$LOG_FILE" &&
+       grep -q "hello37: PASS" "$LOG_FILE" &&
        grep -q "MoQiOS shell" "$LOG_FILE"; then
         # A healthy run faults nothing and panics nowhere. Checking the markers
         # alone is not enough: a kernel bug can kill an unrelated task while
