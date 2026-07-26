@@ -27,7 +27,7 @@ pub fn readlink(path_ptr: u64, buf_ptr: u64, bufsiz: u64) i64 {
     if (str.eql(path, "/proc/self/exe")) {
         const target = "/bin/sh";
         const tlen = @min(target.len, @as(usize, @intCast(bufsiz)));
-        _ = copy.copyToUser(@ptrFromInt(buf_ptr), target[0..tlen], tlen);
+        if (copy.copyToUser(@ptrFromInt(buf_ptr), target[0..tlen], tlen) != tlen) return -14;
         return @intCast(tlen);
     }
 
@@ -55,7 +55,7 @@ pub fn readlink(path_ptr: u64, buf_ptr: u64, bufsiz: u64) i64 {
                         else => "unknown",
                     };
                     const tlen = @min(type_str.len, @as(usize, @intCast(bufsiz)));
-                    _ = copy.copyToUser(@ptrFromInt(buf_ptr), type_str[0..tlen], tlen);
+                    if (copy.copyToUser(@ptrFromInt(buf_ptr), type_str[0..tlen], tlen) != tlen) return -14;
                     return @intCast(tlen);
                 }
             }
@@ -66,7 +66,7 @@ pub fn readlink(path_ptr: u64, buf_ptr: u64, bufsiz: u64) i64 {
     // v50.0: try ext2 symlink
     if (ext2_mod.readSymlinkByPath(path)) |target| {
         const tlen = @min(target.len, @as(usize, @intCast(bufsiz)));
-        _ = copy.copyToUser(@ptrFromInt(buf_ptr), target[0..tlen], tlen);
+        if (copy.copyToUser(@ptrFromInt(buf_ptr), target[0..tlen], tlen) != tlen) return -14;
         return @intCast(tlen);
     }
 

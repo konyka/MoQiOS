@@ -67,8 +67,7 @@ pub fn statx(pathname_ptr: u64, statxbuf_ptr: u64) i64 {
     }
 
     // Write statx buffer to user space
-    if (statxbuf_ptr != 0 and statxbuf_ptr < 0x0000_8000_0000_0000) {
-        _ = copy.copyToUser(@ptrFromInt(statxbuf_ptr), &stat_buf, 144);
-    }
+    if (statxbuf_ptr == 0 or statxbuf_ptr >= 0x0000_8000_0000_0000) return -14;
+    if (copy.copyToUser(@ptrFromInt(statxbuf_ptr), &stat_buf, stat_buf.len) != stat_buf.len) return -14;
     return 0;
 }

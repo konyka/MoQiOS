@@ -188,16 +188,14 @@ pub fn setLock(fd: u64, cmd: u64, flock_ptr: u64) i64 {
             outbuf[26] = 0;
             outbuf[27] = 0;
             const copy_to = @import("../mm/copy_from_user.zig");
-            _ = copy_to.copyToUser(@ptrFromInt(flock_ptr), outbuf[0..32], 32);
-            return 0;
+            return if (copy_to.copyToUser(@ptrFromInt(flock_ptr), outbuf[0..32], 32) == 32) 0 else -14;
         }
         var outbuf: [32]u8 = undefined;
         @memcpy(outbuf[0..32], kbuf[0..32]);
         outbuf[0] = F_UNLCK;
         outbuf[1] = 0;
         const copy_to = @import("../mm/copy_from_user.zig");
-        _ = copy_to.copyToUser(@ptrFromInt(flock_ptr), outbuf[0..32], 32);
-        return 0;
+        return if (copy_to.copyToUser(@ptrFromInt(flock_ptr), outbuf[0..32], 32) == 32) 0 else -14;
     }
 
     // F_SETLK / F_SETLKW: set or clear a byte-range lock

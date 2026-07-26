@@ -194,13 +194,16 @@ pub fn ioGetevents(ctx_id: u64, min_nr: u64, nr: u64, events_ptr: u64, timeout_p
     var count: u64 = 0;
     const max_out: u64 = if (nr > ctx.event_count) ctx.event_count else nr;
 
-    while (count < max_out) : (count += 1) {
+    while (count < max_out) {
         const ev = &ctx.events[ctx.event_head];
         const dst = events_ptr + count * event_size;
         const ev_bytes: [*]const u8 = @ptrCast(ev);
-        _ = copy.copyToUser(@ptrFromInt(dst), ev_bytes[0..event_size], event_size);
+        if (copy.copyToUser(@ptrFromInt(dst), ev_bytes[0..event_size], event_size) != event_size) {
+            return if (count == 0) EFAULT else @intCast(count);
+        }
         ctx.event_head = (ctx.event_head + 1) % MAX_EVENTS;
         ctx.event_count -= 1;
+        count += 1;
     }
 
     // If min_nr not met and no blocking, still return what we have

@@ -22,7 +22,7 @@ pub fn getcwd(buf_ptr: u64, buf_size: u64) i64 {
     @memcpy(tmp[0..cwd_len], cur.cwd[0..cwd_len]);
     tmp[cwd_len] = 0;
 
-    _ = copy.copyToUser(@ptrFromInt(buf_ptr), tmp[0..total], total);
+    if (copy.copyToUser(@ptrFromInt(buf_ptr), tmp[0..total], total) != total) return -14;
     return @intCast(total);
 }
 
@@ -57,7 +57,7 @@ pub fn fstat(fd: u64, stat_ptr: u64) i64 {
     const size: i64 = @intCast(fdesc.file_size);
     bo.writeI64Le(stat_buf[48..56], size);
 
-    _ = copy.copyToUser(@ptrFromInt(stat_ptr), &stat_buf, 144);
+    if (copy.copyToUser(@ptrFromInt(stat_ptr), &stat_buf, stat_buf.len) != stat_buf.len) return -14;
     return 0;
 }
 
@@ -103,7 +103,7 @@ pub fn listdir(buf_ptr: u64, buf_size: u64) i64 {
     }
 
     if (pos > 0) {
-        _ = copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..pos], pos);
+        if (copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..pos], pos) != pos) return -14;
     }
     return @intCast(pos);
 }

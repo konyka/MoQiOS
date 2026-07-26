@@ -16,14 +16,16 @@ pub fn copyFileRange(fd_in: u32, off_in_ptr: u64, fd_out: u32, off_out_ptr: u64,
     var off_out_val: u64 = 0;
     var use_off_in = false;
     var use_off_out = false;
-    if (off_in_ptr != 0 and off_in_ptr < 0x0000_8000_0000_0000) {
+    if (off_in_ptr != 0) {
+        if (off_in_ptr >= 0x0000_8000_0000_0000 or !copy.validateUserBufferWritable(off_in_ptr, 8)) return -14;
         var buf: [8]u8 = undefined;
         if (copy.copyFromUser(&buf, @ptrFromInt(off_in_ptr), 8) == 8) {
             off_in_val = @as(u64, @bitCast(buf));
             use_off_in = true;
         }
     }
-    if (off_out_ptr != 0 and off_out_ptr < 0x0000_8000_0000_0000) {
+    if (off_out_ptr != 0) {
+        if (off_out_ptr >= 0x0000_8000_0000_0000 or !copy.validateUserBufferWritable(off_out_ptr, 8)) return -14;
         var buf: [8]u8 = undefined;
         if (copy.copyFromUser(&buf, @ptrFromInt(off_out_ptr), 8) == 8) {
             off_out_val = @as(u64, @bitCast(buf));
@@ -55,13 +57,13 @@ pub fn copyFileRange(fd_in: u32, off_in_ptr: u64, fd_out: u32, off_out_ptr: u64,
     if (use_off_in) {
         const new_off = cur.fd_table.fds[fd_in].offset;
         var buf: [8]u8 = @bitCast(new_off);
-        _ = copy.copyToUser(@ptrFromInt(off_in_ptr), &buf, 8);
+        if (copy.copyToUser(@ptrFromInt(off_in_ptr), &buf, 8) != 8) return -14;
         cur.fd_table.fds[fd_in].offset = orig_in;
     }
     if (use_off_out) {
         const new_off = cur.fd_table.fds[fd_out].offset;
         var buf: [8]u8 = @bitCast(new_off);
-        _ = copy.copyToUser(@ptrFromInt(off_out_ptr), &buf, 8);
+        if (copy.copyToUser(@ptrFromInt(off_out_ptr), &buf, 8) != 8) return -14;
         cur.fd_table.fds[fd_out].offset = orig_out;
     }
 

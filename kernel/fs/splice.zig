@@ -206,6 +206,7 @@ pub fn sysSendfile(out_fd: u32, in_fd: u32, offset_ptr: u64, count: u64) i64 {
     if (offset_ptr != 0) {
         // Read the offset value from user space
         if (offset_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+        if (!copy.validateUserBufferWritable(offset_ptr, 8)) return EFAULT;
         var offset_buf: [8]u8 = undefined;
         const copied = copy.copyFromUser(&offset_buf, @ptrFromInt(offset_ptr), 8);
         if (copied < 8) return EFAULT;
@@ -234,7 +235,7 @@ pub fn sysSendfile(out_fd: u32, in_fd: u32, offset_ptr: u64, count: u64) i64 {
     // Write back the new offset to user space if offset_ptr was provided
     if (update_user_offset and result > 0) {
         var offset_buf: [8]u8 = @bitCast(offset);
-        _ = copy.copyToUser(@ptrFromInt(offset_ptr), &offset_buf, 8);
+        if (copy.copyToUser(@ptrFromInt(offset_ptr), &offset_buf, 8) != 8) return EFAULT;
     }
 
     return result;
@@ -325,6 +326,7 @@ fn spliceFileToPipe(fd_table: *vfs.FdTable, file_fd: u32, off_in: u64, pipe_fd: 
     if (off_in != 0) {
         // Read offset from user space
         if (off_in >= 0x0000_8000_0000_0000) return EFAULT;
+        if (!copy.validateUserBufferWritable(off_in, 8)) return EFAULT;
         var offset_buf: [8]u8 = undefined;
         const copied = copy.copyFromUser(&offset_buf, @ptrFromInt(off_in), 8);
         if (copied < 8) return EFAULT;
@@ -367,7 +369,7 @@ fn spliceFileToPipe(fd_table: *vfs.FdTable, file_fd: u32, off_in: u64, pipe_fd: 
     // Write back offset to user space if provided
     if (update_user_offset and total > 0) {
         var offset_buf: [8]u8 = @bitCast(offset);
-        _ = copy.copyToUser(@ptrFromInt(off_in), &offset_buf, 8);
+        if (copy.copyToUser(@ptrFromInt(off_in), &offset_buf, 8) != 8) return EFAULT;
     }
 
     return total;

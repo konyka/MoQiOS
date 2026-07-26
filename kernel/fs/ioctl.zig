@@ -69,7 +69,7 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
         TIOCGWINSZ => {
             if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14; // EFAULT
             const ws_bytes: [*]const u8 = @ptrCast(&default_winsize);
-            _ = copy.copyToUser(@ptrFromInt(arg), ws_bytes[0..@sizeOf(Winsize)], @sizeOf(Winsize));
+            if (copy.copyToUser(@ptrFromInt(arg), ws_bytes[0..@sizeOf(Winsize)], @sizeOf(Winsize)) != @sizeOf(Winsize)) return -14;
             return 0;
         },
         TIOCSWINSZ => {
@@ -84,7 +84,7 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
         TCGETS => {
             if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14;
             const t_bytes: [*]const u8 = @ptrCast(&default_termios);
-            _ = copy.copyToUser(@ptrFromInt(arg), t_bytes[0..@sizeOf(Termios)], @sizeOf(Termios));
+            if (copy.copyToUser(@ptrFromInt(arg), t_bytes[0..@sizeOf(Termios)], @sizeOf(Termios)) != @sizeOf(Termios)) return -14;
             return 0;
         },
         TCSETS => {
@@ -106,7 +106,7 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
                 pgid = cur.pgid;
             }
             const pgid_bytes: [*]const u8 = @ptrCast(&pgid);
-            _ = copy.copyToUser(@ptrFromInt(arg), pgid_bytes[0..2], 2);
+            if (copy.copyToUser(@ptrFromInt(arg), pgid_bytes[0..2], 2) != 2) return -14;
             return 0;
         },
         TIOCSPGRP => {
@@ -134,19 +134,14 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
                 if (desc.fd_type == .none) return -9; // EBADF
 
                 // For pipe_read, calculate available bytes
-                if (desc.fd_type == .pipe_read and desc.pipe_idx < 16) {
-                    const pipe = &vfs.pipes[desc.pipe_idx];
-                    if (pipe.tail >= pipe.head) {
-                        nread = @intCast(pipe.tail - pipe.head);
-                    } else {
-                        nread = @intCast(vfs.PIPE_BUF_SIZE - pipe.head + pipe.tail);
-                    }
+                if (desc.fd_type == .pipe_read) {
+                    if (vfs.pipeState(desc.pipe_idx)) |state| nread = @intCast(state.readable);
                 }
                 // For other fd types, report 0 (no special read buffer)
             }
 
             const nr_bytes: [*]const u8 = @ptrCast(&nread);
-            _ = copy.copyToUser(@ptrFromInt(arg), nr_bytes[0..4], 4);
+            if (copy.copyToUser(@ptrFromInt(arg), nr_bytes[0..4], 4) != 4) return -14;
             return 0;
         },
         FIONBIO => {
