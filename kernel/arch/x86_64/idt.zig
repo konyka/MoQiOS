@@ -466,15 +466,6 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
     // Record in exception ring buffer
     exception.ring.record(14, err, frame.rip, frame.rflags, cr2);
 
-    // Path 1: copy_from_user / copy_to_user recovery
-    const copy_mod = @import("../../mm/copy_from_user.zig");
-    if (copy_mod.checkFault()) |recovery_rip| {
-        // Patch the saved RIP to jump to the recovery label.
-        // RCX still holds the remaining count from rep movsb.
-        frame.rip = recovery_rip;
-        return;
-    }
-
     // Path 2: User-mode COW fault (page present, write attempt, COW bit set)
     if (user_mode and present and write) {
         if (handleCowFault(frame, cr2)) {
@@ -487,6 +478,21 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
     // page. Resolve it here instead of crashing on a supervisor-mode page fault.
     if (!user_mode and present and write and cr2 < 0x0000_8000_0000_0000) {
         if (handleCowFault(frame, cr2)) {
+            return;
+        }
+    }
+
+    // A supervisor fault at the dedicated rep-movsb instruction means the
+    // mapping changed after prevalidation. COW handling stays first so a valid
+    // kernel write to a COW page retries instead of returning a short copy.
+    if (!user_mode) {
+        const user_copy = @import("user_copy.zig");
+        const copy = @import("../../mm/copy_from_user.zig");
+        const faulted_user_operand = cr2 != 0 and cr2 < copy.USER_LIMIT and
+            (cr2 == frame.rsi or cr2 == frame.rdi);
+        if (faulted_user_operand and user_copy.faultFixup(frame.rip) != null) {
+            const recovery_rip = user_copy.faultFixup(frame.rip).?;
+            frame.rip = recovery_rip;
             return;
         }
     }

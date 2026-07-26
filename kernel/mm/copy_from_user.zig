@@ -5,7 +5,9 @@
 /// SK-40: page-walk and root-table reads go through the arch facade
 /// (`paging.currentRoot` / `paging.isUserAccessible`), and copies are
 /// bracketed by `userAccessBegin/End` (riscv64 sstatus.SUM; no-op elsewhere).
-/// For truly safe fault recovery, an instruction-level guard is still TODO.
+/// x86_64 additionally uses a known-RIP copy primitive so a mapping removed
+/// after the page walk returns a short copy instead of crashing the kernel.
+const builtin = @import("builtin");
 const paging = @import("../arch/arch.zig").paging;
 
 /// User-space address limit (canonical hole start).
@@ -24,11 +26,9 @@ inline fn activeRoot() u64 {
 }
 
 /// Verify every page in [addr, addr+len) is present and user-accessible in the
-/// current address space. This is essential: copyFromUser/copyToUser access
-/// user pointers with a plain @memcpy, and there is no per-instruction fault
-/// recovery, so a bad (but in-range) user pointer would otherwise fault inside
-/// the kernel and halt the whole system. Returns false on the first page that
-/// is missing or not user-accessible.
+/// current address space. This rejects bad pointers before entering the copy;
+/// x86_64's instruction fixup remains the backstop for a concurrent unmap after
+/// this walk. Returns false on the first page that is missing or inaccessible.
 fn userRangeMapped(addr: u64, len: usize) bool {
     if (len == 0) return true;
     const root = activeRoot();
@@ -41,9 +41,8 @@ fn userRangeMapped(addr: u64, len: usize) bool {
 }
 
 /// Every page of the range must accept a kernel write. Being mapped to user
-/// space is not enough: a read-only page passes that check and then faults
-/// inside the kernel's own copy, which has no recovery path and takes the
-/// machine down. Any process can arrange one with `mmap(PROT_READ)`.
+/// space is not enough: a read-only page would otherwise reach the copy and
+/// force an avoidable fault. Any process can arrange one with `mmap(PROT_READ)`.
 fn userRangeWritable(addr: u64, len: usize) bool {
     if (len == 0) return true;
     const root = activeRoot();
@@ -72,17 +71,12 @@ pub fn validateUserBufferWritable(addr: u64, len: usize) bool {
     return validateUserRange(addr, len) and userRangeWritable(addr, len);
 }
 
-/// Global recovery state (for future assembly-based recovery).
-var recovery_rip: u64 = 0;
-var in_user_access: bool = false;
-
-/// Called by page fault handler. Currently unused (direct copy approach).
-pub fn checkFault() ?u64 {
-    if (in_user_access and recovery_rip != 0) {
-        in_user_access = false;
-        return recovery_rip;
+fn copyBytes(dst: [*]u8, src: [*]const u8, len: usize) usize {
+    if (comptime builtin.cpu.arch == .x86_64) {
+        return @import("../arch/x86_64/user_copy.zig").copyBytes(dst, src, len);
     }
-    return null;
+    @memcpy(dst[0..len], src[0..len]);
+    return len;
 }
 
 /// Validate that a user-space address range [addr, addr+len) is entirely in user space.
@@ -111,9 +105,9 @@ pub fn copyFromUser(dst: []u8, src_user: [*]const u8, count: usize) usize {
     if (!userRangeMapped(src_addr, copy_len)) return 0;
 
     paging.userAccessBegin();
-    @memcpy(dst[0..copy_len], src_user[0..copy_len]);
+    const copied = copyBytes(dst.ptr, src_user, copy_len);
     paging.userAccessEnd();
-    return copy_len;
+    return copied;
 }
 
 /// Safely copy bytes from kernel buffer to user space.
@@ -132,7 +126,7 @@ pub fn copyToUser(dst_user: [*]u8, src: []const u8, count: usize) usize {
     if (!userRangeWritable(dst_addr, copy_len)) return 0;
 
     paging.userAccessBegin();
-    @memcpy(dst_user[0..copy_len], src[0..copy_len]);
+    const copied = copyBytes(dst_user, src.ptr, copy_len);
     paging.userAccessEnd();
-    return copy_len;
+    return copied;
 }
