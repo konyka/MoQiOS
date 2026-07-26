@@ -1177,6 +1177,43 @@ spent itself on the scheduler bug that surfaced along the way. With `hello35` in
 munmap-versus-copy race is now writable, which is the next step. The eighty `_ = copyToUser(...)` sites remain
 as recorded in 5.2q.
 
+### 5.2s Review Update: 2026-07-26 (x86 user-copy fault recovery)
+
+The `CLONE_VM` support from 5.2r made the remaining user-copy TOCTOU race testable. A page-table walk can
+validate a range and another thread can still unmap it before or during the copy. On x86_64, both
+`copyFromUser` and `copyToUser` now use one dedicated `rep movsb` instruction at a known RIP. A supervisor
+page fault at exactly that instruction rewrites the saved RIP to a fixup which returns `len - RCX`, preserving
+the existing copied-byte return contract without global or per-CPU "copy active" state.
+
+| Severity | Finding | Resolution / status |
+|---|---|---|
+| P0 | The initial SK-156 files were not reachable: production copies still used `@memcpy` and #PF never referenced the new fixup | Fixed. The shared copy layer selects the guarded primitive on x86_64, and the x86 #PF handler matches its exact instruction RIP. |
+| P1 | Handling copy fixup before COW would turn a valid kernel write to a COW user page into a short copy | Fixed. User and supervisor COW resolution runs first; only an unresolved supervisor fault at the guarded RIP uses the copy fixup. |
+| P1 | A process-global "copy in progress" flag would be unsafe under SMP, preemption, nested copies, and unrelated faults | Removed. Recovery is stateless and keyed only by the saved fault RIP, following the x86 exception-table model. |
+| P1 | Matching only RIP could hide a fault on the helper's trusted kernel operand as a short user copy | Fixed. Recovery additionally requires a non-null user-range CR2 equal to the saved current RSI or RDI; unexpected kernel operand faults remain fatal. |
+| P2 | `hello36` was built and launched but its PASS marker was not part of smoke success | Fixed. Both single- and dual-core x86 smokes now require `hello36: PASS`. |
+| P2 | Parallel single-/dual-core smokes shared `user_bin`, `iso_root`, and `moqios.iso`, causing nondeterministic packaging failures | Fixed. Each smoke process now supplies a private packaging directory while interactive runs retain the existing defaults. |
+
+The page-table precheck remains deliberate: it rejects ordinary bad pointers before entering the guarded
+instruction and protects callers that must decide whether to consume queued data. Non-x86 architectures keep
+their existing prevalidated `@memcpy` path; this change does not claim exception recovery for those ports.
+
+`hello36` races 400 writes against unmap/remap in a shared address space and reports full, partial, and refused
+writes separately. It is not deterministic fault injection: the final single-core run reported one full write
+and 399 prevalidation refusals. The final dual-core run reported three partial writes and 397 refusals; because
+the syscall returns a positive short count only from `len - RCX` at the recovery label, those partial writes
+are direct runtime evidence that the mid-copy fixup was exercised. Smoke still gates machine survival and PASS,
+not a mandatory partial count, so scheduling variance cannot make otherwise-correct runs flaky.
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
+| `zig build test` | Passed | Host helper tests. |
+| `zig build smoke` / `smoke-smp` | Passed | Single and dual core; `hello36: PASS` is mandatory, and the final dual-core log observed three recovered partial writes. |
+| `zig build -Darch=riscv64 smoke-riscv` | Passed | Existing non-x86 guarded/prevalidated path unaffected. |
+| `zig build -Darch=aarch64 smoke-aarch64` | Passed | Existing non-x86 guarded/prevalidated path unaffected. |
+| `nm -n zig-out/bin/moqi-kernel.elf` | Passed | Dedicated copy, fault instruction, and fixup symbols emitted at distinct addresses. |
+
 ### 5.3 Historical Verification
 
 Executed on 2026-06-21:
