@@ -1027,7 +1027,45 @@ across `fork` is now asserted from user space rather than only from a unit test.
 Left open: `copy_from_user.isUserAccessible` checks only the `user` bit, not writability, so
 `pushSignalFrame` writing a signal frame onto a read-only COW stack page would take a kernel write-protect
 fault. The current test does not hit it because its stack page is already un-shared, but the path needs its
-own handling.
+own handling. → taken up in 5.2p.
+
+### 5.2p Review Update: 2026-07-26 (read-only user pages — an unprivileged halt, a fork escalation, and W^X)
+
+Taking up what 5.2o left open. The expectation was a one-line writability check on `copyToUser`; what the
+measurements actually turned up was four independent defects, all pre-existing. Two hypotheses formed along
+the way were disproved and discarded — they are recorded below so the same ground is not re-covered.
+
+First the premise had to be established rather than assumed. The kernel never sets `CR0.WP`, and that bit
+decides whether a kernel write to a read-only page faults or silently goes through. Measured at `_start` and
+again at the actual copy site: `CR0=0x8001001b`, **WP=1**. So such a write does fault — and the fault handler
+already carries a supervisor-mode COW path (`!user_mode and present and write` in `idt.zig`), which means the
+COW case 5.2o worried about was in fact already handled.
+
+| Severity | Finding | Resolution / status |
+|---|---|---|
+| P0 | `copyToUser` validated its destination with `userRangeMapped`, which only asks whether the page belongs to user space. A `mmap(PROT_READ)` page passes, and the kernel's own `@memcpy` then takes a supervisor-mode write-protect fault that lands in `handlePageFault`'s "Kernel-mode fault without guard — fatal" branch. The `checkFault()` recovery was never armed (`recovery_rip` is always 0) and cannot catch it. Any unprivileged process halts the machine with `read(fd, mmap(PROT_READ) page, n)`. | Fixed: new `paging.isUserWritable` (writable **or** COW-marked, the latter faulting into the existing COW path); `copyToUser` uses it. riscv64/aarch64 keep prior semantics — single address space, no COW, no read-only user pages. Negative control: restoring `userRangeMapped` reproduces `EXCEPTION #14 ... write, protection violation in kernel mode` and a 123 s smoke timeout. |
+| P0 | `cowPte()` cleared the write bit and set the COW marker on *every* present entry, whether or not it was writable. A read-only page so marked is indistinguishable from a downgraded writable one, and `handleCowFault` keys on that marker alone — granting `WRITABLE` unconditionally. After `fork`, a child's text, rodata and `PROT_READ` pages therefore became writable on first write, quietly lifting the parent's protection. This is why `mmap_ro` (created after the fork, unmarked) was correctly refused while rodata and text were not. | Fixed: `cow_pte.sharedPte` marks only writable pages and returns read-only ones untouched; both clone paths (`fork.zig`, `clone.zig`) use it, and the parent's entry is rewritten (and its TLB shot down) only when it actually changed. |
+| P1 | The ELF loader computed `PF_W` and threw it away (`_ = _writable`), mapping every segment `.writable = true` under a comment claiming it was "initially for loading". Nothing ever tightened it, and the rationale does not hold: segment contents are written through the HHDM alias, never through the user mapping. | Fixed: the mapping honours `PF_W`. |
+| P1 | `file_io.read` / `pread` advanced `pos` by the bytes read *from the file* rather than the bytes `copyToUser` actually delivered, so a refused copy still reported 7 bytes read and swallowed the `EFAULT`. This actively misled the investigation: the first version of the test judged by return value and was fooled by it. | Fixed: `pos` advances by `written`; a first-chunk failure returns `-EFAULT`; the `pos == 0` single-byte fallback checks its copy too. |
+
+Hypotheses disproved along the way: (1) *WP might be 0, letting kernel writes through silently* — measured
+twice, WP=1; (2) *`handleCowFault` might not check the COW bit and so upgrade read-only pages* — line 683
+does check it strictly. The real fault was upstream: read-only pages should never have carried the marker.
+
+Verification: three-architecture builds, `smoke` / `smoke-smp` / `smoke-smp-stress`, and the riscv64 and
+aarch64 smokes all pass. `user/hello33.c` is new, wired in, and its PASS marker is now a condition of the
+x86 smoke. It tests each destination in a **separate forked child** — the first version shared one process,
+and the first successful write landed in its own `.text`, so every result after it rested on a corrupted
+instruction stream and meant nothing. The verdict rests on whether the destination bytes actually changed,
+compared before and after, not on the return value (see the P1 above). A premise check runs first: the child's
+own user-mode store to the page must raise `SIGSEGV` (139), otherwise the later cases prove nothing. Result:
+`user_store=SIGSEGV (page is read-only)` with `mmap_ro`, `rodata` and `text` all `rejected`. SK-156 pins the
+`sharedPte` contract as a pure function on all three architectures; with the read-only guard removed it
+reports `FAILED: read-only page was altered` and the smoke fails.
+
+Left open: `mprotect` is still unimplemented (listed P2 on the plan), so a program cannot tighten or relax
+segment permissions at runtime. Now that text and rodata are genuinely read-only, that becomes a prerequisite
+for any future JIT or self-modifying code.
 
 | Gate | Result | Notes |
 |---|---|---|

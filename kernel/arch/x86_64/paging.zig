@@ -4,6 +4,7 @@ const hhdm = @import("../../mm/hhdm.zig");
 const pmm = @import("../../mm/pmm.zig");
 const serial = @import("serial.zig");
 const fmt = @import("../../lib/fmt.zig");
+const cow_pte = @import("../../mm/cow_pte.zig");
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const PAGE_2MB: u64 = 2 * 1024 * 1024;
@@ -76,6 +77,20 @@ pub fn currentRoot() u64 {
 pub fn isUserAccessible(root_phys: u64, virt: u64) bool {
     const pte = getPageEntry(root_phys, virt) orelse return false;
     return pte.user;
+}
+
+/// Whether the kernel may write to this user page.
+///
+/// A copy-on-write page counts as writable: the store faults, and the fault
+/// handler un-shares the frame and retries. A page that is neither writable nor
+/// COW is genuinely read-only, and writing it takes a supervisor-mode
+/// write-protect fault the kernel has no recovery path for — so callers must be
+/// able to reject the destination instead.
+pub fn isUserWritable(root_phys: u64, virt: u64) bool {
+    const pte = getPageEntry(root_phys, virt) orelse return false;
+    if (!pte.user) return false;
+    if (pte.writable) return true;
+    return cow_pte.isCow(@as(u64, @bitCast(pte.*)));
 }
 
 /// SK-40: bracket kernel touches of user pages. No-ops on x86 (SMAP is not

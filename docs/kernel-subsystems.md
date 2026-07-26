@@ -144,7 +144,10 @@ const AddressSpace = struct {
 
 ### 1.6 CoW Fork (PTE bit9 + ref_count + #PF handler) ✅
 
-- fork 时父子页表共享 PT，PTE 写位清除，PTE bit9 标记 CoW
+- fork 时父子页表共享 PT。**仅可写页**降级：清写位并用 PTE bit9 标记 CoW；只读页原样共享
+  （`cow_pte.sharedPte`）。这条区分是必须的：bit9 是 handler 判断"可以授予写权限"的唯一
+  依据，给只读页打上它等于让 text/rodata/`PROT_READ` 在子进程首次写入后变成可写——3.160
+  之前正是如此
 - 写入触发 #PF → handler 检查引用计数：
   - refcount == 1 → 直接置位 W
   - refcount > 1 → 分配新页 + 复制 + 引用计数递减
@@ -154,6 +157,10 @@ const AddressSpace = struct {
 文件: `copy_from_user.zig`
 
 - 页表预验证方案：访问用户空间前通过walk页表确认地址可访问
+- 写方向额外校验**可写性**（`paging.isUserWritable`）：仅"已可写"或"带 CoW 标记"的页放行，
+  后者会故障并由缺页处理器的内核态 CoW 路径解开。只看 `user` 位是不够的——`mmap(PROT_READ)`
+  的页会通过校验，随后内核自己的 `@memcpy` 在 `CR0.WP=1`（实测）下触发内核态写保护故障，
+  落入无恢复的致命分支，任何非特权进程据此即可停机（3.160）
 - UserAccessError返回而非panic，保证内核鲁棒性
 - 接口：copyFromUserChecked / copyToUserChecked / getUser / putUser / copyStringFromUser
 
@@ -328,6 +335,9 @@ const SchedStats = struct {
 文件: `loader.zig`
 
 - 解析 `Elf64_Ehdr` / `Elf64_Phdr`，按 PT_LOAD 段映射
+- 段权限遵守 `p_flags`：`PF_W` 决定可写位、`PF_X` 决定 NX。段内容通过 HHDM 别名写入物理页，
+  不走用户映射，因此 text/rodata 从一开始就能按只读映射，无需"先可写再收紧"的第二遍
+  （3.160 之前正是丢弃了 `PF_W`、一律按可写映射）
 - 构造 SysV x86_64 ABI 栈帧：`[argc][argv...][NULL][envp...][NULL][auxv...][AT_NULL]`
 - 设置入口寄存器 `rip = e_entry`，`rsp = stack_top`
 

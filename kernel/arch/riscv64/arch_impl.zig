@@ -140,6 +140,12 @@ pub const paging = struct {
         return sv39.isUserMapped(@intCast(virt));
     }
 
+    /// Bring-up maps every user page writable and has no copy-on-write, so
+    /// there is no read-only user page for a kernel write to trip over yet.
+    pub fn isUserWritable(root_phys: u64, virt: u64) bool {
+        return isUserAccessible(root_phys, virt);
+    }
+
     /// SK-40: S-mode loads/stores to U pages trap unless sstatus.SUM is set.
     pub fn userAccessBegin() void {
         asm volatile ("csrs sstatus, %[b]"

@@ -122,8 +122,7 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
 
         if (num_pages == 0 or num_pages > 512) continue; // Skip empty or oversized segments
 
-        const _writable = (seg_flags & PF_W) != 0;
-        _ = _writable;
+        const writable = (seg_flags & PF_W) != 0;
         const executable = (seg_flags & PF_X) != 0;
 
         // Allocate and map pages for this segment
@@ -162,8 +161,11 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
                 }
             }
 
+            // Segment contents go in through the HHDM alias above, not through
+            // this mapping, so a read-only segment can be honoured from the
+            // start — text and rodata never need a writable window.
             const map_flags = paging.MapFlags{
-                .writable = true, // Map writable initially for loading
+                .writable = writable,
                 .user = true,
                 .no_execute = !executable,
                 .global = false,

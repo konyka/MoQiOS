@@ -25,6 +25,19 @@ pub fn cowPte(parent_pte: u64) u64 {
     return (parent_pte & ~WRITABLE) | COW;
 }
 
+/// The entry both sides of a fork should hold for a shared frame.
+///
+/// Only a writable page becomes copy-on-write. A read-only page is shared
+/// unchanged, because the COW marker is what tells the fault handler it may
+/// grant write access: marking a read-only page COW makes it indistinguishable
+/// from a downgraded writable one, and the first write turns it writable for
+/// good. That silently lifted the protection on text, rodata and PROT_READ
+/// mappings in every forked child.
+pub fn sharedPte(parent_pte: u64) u64 {
+    if (parent_pte & WRITABLE == 0) return parent_pte;
+    return cowPte(parent_pte);
+}
+
 /// Whether an entry already describes a COW share, meaning the parent side has
 /// been downgraded by an earlier clone and needs no second TLB invalidation.
 pub fn isCow(pte: u64) bool {

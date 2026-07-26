@@ -323,10 +323,11 @@ pub fn cloneUserPagesCow(parent_pml4_phys: u64) ?u64 {
                     // child's used to be rebuilt as `phys | (pte & 0xFFF)`,
                     // which dropped NX at bit 63 and handed the child an
                     // executable stack and heap.
-                    const shared = cow_pte_mod.cowPte(pte);
+                    const shared = cow_pte_mod.sharedPte(pte);
 
-                    // Mark parent PTE as read-only + COW (if not already COW)
-                    if (!cow_pte_mod.isCow(pte)) {
+                    // Downgrade the parent only when the entry actually changed;
+                    // an already-COW or already-read-only page keeps its entry.
+                    if (shared != pte) {
                         parent_pt[pt_idx] = shared;
                         // Invalidate parent TLB for this page
                         const virt = (pml4_idx << 39) | (pdpt_idx << 30) |

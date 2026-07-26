@@ -6,6 +6,8 @@ const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const copy = @import("../mm/copy_from_user.zig");
 
+const EFAULT: i64 = 14;
+
 /// write(fd, buf, count) → bytes written or -errno
 pub fn write(fd: u64, buf: u64, count: u64) i64 {
     if (buf == 0 or buf >= 0x0000_8000_0000_0000 or count > 0x7FFFFFFF) return -1;
@@ -79,23 +81,32 @@ pub fn read(fd: u32, buf_ptr: u64, count: u64) i64 {
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
     var pos: usize = 0;
+    var faulted = false;
     while (pos < n) {
         const chunk = @min(n - pos, 4096);
         var kbuf: [4096]u8 = undefined;
 
         const result = cur.fd_table.read(fd, &kbuf, chunk);
         if (result <= 0) break;
-        const written = copy.copyToUser(@ptrFromInt(buf_ptr + pos), kbuf[0..@intCast(result)], @intCast(result));
-        pos += @intCast(result);
-        if (result < @as(i64, @intCast(chunk))) break;
-        if (written < @as(usize, @intCast(result))) break;
+        const got: usize = @intCast(result);
+        // Count what reached the user buffer, not what came off the file:
+        // copyToUser refuses an unmapped or read-only destination, and
+        // crediting those bytes would report a read that never landed.
+        const written = copy.copyToUser(@ptrFromInt(buf_ptr + pos), kbuf[0..got], got);
+        pos += written;
+        if (written < got) {
+            faulted = true;
+            break;
+        }
+        if (got < chunk) break;
     }
+    if (faulted and pos == 0) return -EFAULT;
     if (pos == 0 and n > 0) {
         // v53.45: Fix 1-byte read not being copied to user space
         var tmp: [1]u8 = undefined;
         const r = cur.fd_table.read(fd, &tmp, 1);
         if (r > 0) {
-            _ = copy.copyToUser(@ptrFromInt(buf_ptr), &tmp, 1);
+            if (copy.copyToUser(@ptrFromInt(buf_ptr), &tmp, 1) == 0) return -EFAULT;
         }
         return @bitCast(r);
     }
@@ -125,19 +136,25 @@ pub fn pread(fd: u32, buf_ptr: u64, count: u64, offset: u64) i64 {
     cur.fd_table.fds[fd].offset = offset;
 
     var pos: usize = 0;
+    var faulted = false;
     while (pos < n) {
         const chunk = @min(n - pos, 4096);
         var kbuf: [4096]u8 = undefined;
         const result = cur.fd_table.read(fd, &kbuf, chunk);
         if (result <= 0) break;
-        const written = copy.copyToUser(@ptrFromInt(buf_ptr + pos), kbuf[0..@intCast(result)], @intCast(result));
-        pos += @intCast(result);
-        if (result < @as(i64, @intCast(chunk))) break;
-        if (written < @as(usize, @intCast(result))) break;
+        const got: usize = @intCast(result);
+        const written = copy.copyToUser(@ptrFromInt(buf_ptr + pos), kbuf[0..got], got);
+        pos += written;
+        if (written < got) {
+            faulted = true;
+            break;
+        }
+        if (got < chunk) break;
     }
 
     // Restore original offset
     cur.fd_table.fds[fd].offset = saved_offset;
+    if (faulted and pos == 0) return -EFAULT;
     return @intCast(pos);
 }
 

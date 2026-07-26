@@ -40,6 +40,21 @@ fn userRangeMapped(addr: u64, len: usize) bool {
     return true;
 }
 
+/// Every page of the range must accept a kernel write. Being mapped to user
+/// space is not enough: a read-only page passes that check and then faults
+/// inside the kernel's own copy, which has no recovery path and takes the
+/// machine down. Any process can arrange one with `mmap(PROT_READ)`.
+fn userRangeWritable(addr: u64, len: usize) bool {
+    if (len == 0) return true;
+    const root = activeRoot();
+    var page = addr & ~@as(u64, 0xFFF);
+    const end = addr + len;
+    while (page < end) : (page += 0x1000) {
+        if (!paging.isUserWritable(root, page)) return false;
+    }
+    return true;
+}
+
 /// Validate a user buffer before a syscall consumes data from a kernel queue.
 /// Unlike validateUserRange, this also checks the active page table so callers
 /// can reject a bad destination before performing an irreversible dequeue.
@@ -102,9 +117,9 @@ pub fn copyToUser(dst_user: [*]u8, src: []const u8, count: usize) usize {
     // Validate user-space address range
     const dst_addr: u64 = @intFromPtr(dst_user);
     if (!validateUserRange(dst_addr, copy_len)) return 0;
-    // Ensure the destination pages are actually mapped and user-accessible
-    // before writing, so a bad user pointer returns 0 instead of faulting.
-    if (!userRangeMapped(dst_addr, copy_len)) return 0;
+    // Ensure the destination pages are actually mapped and writable before
+    // writing, so a bad or read-only user pointer returns 0 instead of faulting.
+    if (!userRangeWritable(dst_addr, copy_len)) return 0;
 
     paging.userAccessBegin();
     @memcpy(dst_user[0..copy_len], src[0..copy_len]);

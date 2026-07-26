@@ -137,6 +137,12 @@ pub const paging = struct {
         return a64pag.isUserMapped(@intCast(virt));
     }
 
+    /// Bring-up maps every user page writable and has no copy-on-write, so
+    /// there is no read-only user page for a kernel write to trip over yet.
+    pub fn isUserWritable(root_phys: u64, virt: u64) bool {
+        return isUserAccessible(root_phys, virt);
+    }
+
     /// SK-40: PSTATE.PAN is not enabled at EL1 — EL1 can already touch
     /// EL0-accessible pages, so the brackets are no-ops.
     pub fn userAccessBegin() void {}

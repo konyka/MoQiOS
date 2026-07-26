@@ -2514,7 +2514,70 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   两个根因都是先由诊断输出实测定位(而非推断),再修的。
 - **后续**:`copy_from_user.isUserAccessible` 只检查 `user` 位、不检查可写性,因此
   `pushSignalFrame` 往只读 COW 栈页写信号帧时会以内核态触发写保护故障;当前用例的栈页
-  已解 COW 所以未触发,但这条路径仍需单独处理。
+  已解 COW 所以未触发,但这条路径仍需单独处理。→ 见 3.160。
+
+### 3.160 只读用户页:非特权停机、fork 提权与 W^X（SK-156,2026-07-26）
+
+承接 3.159 的"后续"。原以为只需给 `copyToUser` 补一个可写性检查,实测下来牵出三个彼此
+独立的缺陷,其中两个是既有的严重问题。**每一步结论都由实测得出,推断出的假设有两个被
+证伪并已丢弃**(记在"过程中被证伪的假设")。
+
+- **前提实测**:内核未显式设置 `CR0.WP`,而它决定内核写只读页是"故障"还是"静默穿透"。
+  在 `_start` 与实际拷贝点两处打点实测均为 `CR0=0x8001001b`,**WP=1**,故内核写只读用户页
+  必定触发写保护故障。缺页处理器早已有一条内核态 COW 解析路径(`idt.zig` 中
+  `!user_mode and present and write`),所以 COW 页本身不是问题——3.159 里担心的那条其实
+  已有处理。
+
+- **缺陷一(既有,P0,非特权整机停机)**:`copyToUser` 用 `userRangeMapped` 校验目的地,只看
+  `user` 位。`mmap(PROT_READ)` 的页因此通过校验,随后内核自己的 `@memcpy` 在 WP=1 下触发
+  **内核态写保护故障**,落到 `handlePageFault` 的 "Kernel-mode fault without guard — fatal"
+  分支。`checkFault()` 的恢复机制从未启用(`recovery_rip` 恒为 0),接不住。任何普通进程
+  执行 `read(fd, mmap(PROT_READ)页, n)` 即可停机。
+  **方案**:新增 `paging.isUserWritable`(可写 **或** 带 COW 标记则放行,后者会故障并由既有
+  COW 路径解开),`copyToUser` 改用它。riscv64/aarch64 单地址空间、无 COW 与只读用户页,
+  同名接口保持原语义。
+  **反向对照**:改回 `userRangeMapped` 后冒烟必现
+  `EXCEPTION #14 ... write, protection violation in kernel mode` 并超时失败(123 秒);
+  改回后干净拒绝。
+
+- **缺陷二(既有,P0,fork 提权 / W^X 失效)**:`cowPte()` 对**所有**存在的 PTE 清可写位并打
+  COW 标记,不问它原来是否可写。只读页被打上标记后,与"被降级的可写页"再也无法区分,而
+  `handleCowFault` 只认这个标记、并**无条件授予 `WRITABLE`**。于是 fork 之后,子进程的
+  text/rodata/`PROT_READ` 页在第一次写入时被解共享**并变为可写**——父进程持有的只读保护
+  被静默解除。这也解释了为何 `mmap_ro`(fork 之后才创建、无标记)能被正确拒绝,而
+  rodata/text(fork 时被打了标记)却能写穿。
+  **方案**:`cow_pte.zig` 新增 `sharedPte`:只有可写页才降级并打标记,只读页原样共享。
+  `fork.zig` 与 `clone.zig` 两条克隆路径改用它;父侧仅在条目真正变化时才改写并刷 TLB。
+
+- **缺陷三(既有,P1,W^X)**:ELF 加载器把 `p_flags` 的 `PF_W` 算出来后用 `_ = _writable`
+  丢弃,统一按 `.writable = true` 映射,注释称"仅为加载而临时可写"——但从无第二遍收紧。
+  段内容其实是通过 HHDM 别名写入的,根本不走用户映射,该理由不成立。改为遵守 `PF_W`。
+
+- **缺陷四(既有,P1,谎报字节数)**:`file_io.read`/`pread` 按**从文件读出**的字节数推进
+  `pos`,而非 `copyToUser` **实际写入**的字节数。拷贝被拒时仍返回 7,谎报了一次从未送达
+  用户的读取,并吞掉 `EFAULT`。这个 bug 一度把我引偏——测试初版据返回值判定,被它骗过。
+  **方案**:按 `written` 推进;首块即失败时返回 `-EFAULT`;`pos == 0` 的 1 字节兜底路径同样
+  检查拷贝结果。
+
+- **过程中被证伪的假设(记录以免重蹈)**:
+  1. *"WP 可能为 0,内核写会静默穿透"* → 两处实测均为 WP=1,证伪。
+  2. *"`handleCowFault` 可能未校验 COW 位,把只读页升级为可写"* → 读码确认第 683 行
+     `if (pte_val & COW_BIT == 0) return false;` 校验严格,证伪。真正的问题在**上游**:
+     只读页压根不该被打上那个标记(缺陷二)。
+
+- **验证**:三架构构建 + `smoke`/`smoke-smp`/`smoke-smp-stress` + riscv64/aarch64 smoke 全绿。
+  - `user/hello33.c`(新增,已接线并纳入 x86 冒烟通过条件):每个目的地在**独立 fork 子进程**
+    中测试——初版把三种目的地放在同一进程里,结果第一次成功写入直接覆盖了自身
+    `.text`,其后所有结论都建立在被破坏的指令流上,不成立;隔离后才可信。
+    判定依据是**目标内存是否真被改写**(拷贝前后逐字节比对),不看返回值(见缺陷四)。
+    另设前提检查:子进程自己以用户态写该页必须 `SIGSEGV`(139),否则后续用例什么也证明不了。
+    结果:`user_store=SIGSEGV (page is read-only)` + `mmap_ro/rodata/text=rejected` → PASS。
+  - SK-156(纯函数,三架构可验)钉住 `sharedPte` 契约:可写页降级并打标记、只读页原样返回、
+    text 页不受扰动、NX 保留、二次共享幂等。反向对照:去掉只读守卫后
+    `[SK-156] FAILED: read-only page was altered`,冒烟失败。
+
+- **后续**:`mprotect` 尚未实现(计划表中列为 P2),因此程序无法在运行期收紧或放宽段权限;
+  现在 text/rodata 已是只读,若将来引入 JIT 或自修改代码需先补上它。
 
 ---
 

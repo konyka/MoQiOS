@@ -652,6 +652,29 @@ _start:
     movq $13, %rdx
     syscall
 
+    # Spawn hello33 (read-only destination buffer test)
+    movq $5, %rax
+    leaq hello33_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn33_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done33_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
     # Spawn hello9 (fork test)
     movq $5, %rax
     leaq hello9_name(%rip), %rdi
@@ -913,6 +936,13 @@ done23_msg:
     .ascii "spawned hello32\n"
     done32_msg:
     .ascii "hello32 done\n"
+    hello33_name:
+    .ascii "hello33"
+    .byte 0
+    spawn33_msg:
+    .ascii "spawned hello33\n"
+    done33_msg:
+    .ascii "hello33 done\n"
     hello26_name:
     .ascii "hello26"
     .byte 0

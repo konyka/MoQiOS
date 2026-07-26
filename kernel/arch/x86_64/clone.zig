@@ -124,7 +124,7 @@ pub fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
                     pmm_mod.addRef(src_phys);
                     // Both sides hold the same entry. Rebuilding the child's
                     // from `phys | (pte & 0xFFF)` dropped NX at bit 63.
-                    const shared = cow_pte_mod.cowPte(pte);
+                    const shared = cow_pte_mod.sharedPte(pte);
                     parent_pt[pt_idx] = shared;
                     child_pt[pt_idx] = shared;
                 }

@@ -78,6 +78,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
        grep -q "hello30: brk/mmap PASS" "$LOG_FILE" &&
        grep -q "hello31: child TLS ok" "$LOG_FILE" &&
        grep -q "hello31: TLS PASS" "$LOG_FILE" &&
+       grep -q "hello33: PASS" "$LOG_FILE" &&
        grep -q "MoQiOS shell" "$LOG_FILE"; then
         # A healthy run faults nothing and panics nowhere. Checking the markers
         # alone is not enough: a kernel bug can kill an unrelated task while
@@ -103,7 +104,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for smoke markers."
-echo "Expected serial markers: 'hello21 done', 'hello29: PASS', 'hello29: fsync PASS', 'hello30: brk/mmap PASS', 'hello31: TLS PASS' and 'MoQiOS shell'."
+echo "Expected serial markers: 'hello21 done', 'hello29: PASS', 'hello29: fsync PASS', 'hello30: brk/mmap PASS', 'hello31: TLS PASS', 'hello33: PASS' and 'MoQiOS shell'."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1
