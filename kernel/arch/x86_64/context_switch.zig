@@ -196,6 +196,10 @@ pub fn handleDeviceNotAvailable() void {
     };
 
     const cpu_id = syscall_entry.getPerCpu().cpu_id;
+    if (cpu_id >= syscall_entry.MAX_CPUS) {
+        asm volatile ("fninit" ::: .{ .memory = true });
+        return;
+    }
 
     // Drop the previous owner's claim on this CPU's FPU. The previous
     // owner's saved state lives in its Task.fpu_state (eagerly written by

@@ -13,6 +13,8 @@
  *   7050: PerCpu virtual address (u64)
  *   7060: Magic write area (u32, pre-paging)
  *   7070: HHDM offset (u64, M8-5b-0 — reserved for naked apEntry relocation)
+ *   7080: AP startup request token (u64)
+ *   7088: AP startup acknowledgement token (u64)
  */
 
 .code16
@@ -52,10 +54,6 @@ pm_entry:
     mov $0x3F8, %dx
     mov $'B', %al
     outb %al, %dx
-
-    /* Write alive magic to 0x7060 BEFORE enabling paging */
-    movl $0xCAFEBABE, %eax
-    movl %eax, 0x7060
 
     /* Load PML4 into CR3 */
     mov 0x7000, %eax

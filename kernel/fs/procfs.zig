@@ -58,7 +58,7 @@ fn generateMeminfo(buf: [*]u8, max_len: u32) u32 {
 
 fn generateCpuinfo(buf: [*]u8, max_len: u32) u32 {
     const smp = @import("../smp.zig");
-    const cpu_count = smp.cpu_count;
+    const cpu_count = smp.configured_cpu_count;
 
     var pos: u32 = 0;
     var i: u32 = 0;
@@ -252,7 +252,7 @@ fn generateStat(buf: [*]u8, max_len: u32) u32 {
     pos = appendDec(buf, pos, max_len, ticks * 9); // idle
     pos = appendStr(buf, pos, max_len, " 0 0 0 0 0\n");
     // Per-CPU lines
-    const cpu_count: u32 = @intCast(smp.cpu_count);
+    const cpu_count: u32 = smp.configured_cpu_count;
     for (0..cpu_count) |cidx| {
         const c: u32 = @intCast(cidx);
         pos = appendStr(buf, pos, max_len, "cpu");
@@ -278,7 +278,7 @@ fn generateStat(buf: [*]u8, max_len: u32) u32 {
 fn generateSchedStats(buf: [*]u8, max_len: u32) u32 {
     const per_cpu = @import("../proc/per_cpu.zig");
     const smp = @import("../smp.zig");
-    var ncpus: u32 = smp.cpu_count;
+    var ncpus: u32 = smp.configured_cpu_count;
     if (ncpus == 0) ncpus = 1;
     if (ncpus > per_cpu.MAX_CPUS) ncpus = per_cpu.MAX_CPUS;
 

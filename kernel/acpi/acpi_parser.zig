@@ -6,6 +6,7 @@ const tables = @import("acpi_tables.zig");
 const fmt = @import("../lib/fmt.zig");
 const str = @import("../lib/str.zig");
 const bo = @import("../lib/byte_order.zig");
+const cpu_capacity = @import("../arch/cpu_capacity.zig");
 
 /// Map a physical page for ACPI table access. x86_64 uses Limine HHDM helpers
 /// in `main.zig`; other arches no-op (SK-10: avoid pulling Limine `main`).
@@ -18,7 +19,7 @@ pub const AcpiInfo = struct {
     rsdp: ?*const tables.RSDP,
     lapic_address: u64,
     cpu_count: u32,
-    cpu_apic_ids: [256]u32,
+    cpu_apic_ids: [cpu_capacity.MAX_CPUS]u32,
     ioapic_address: u64,
     ioapic_gsi_base: u32,
     mcfg_base: u64,
@@ -31,7 +32,7 @@ pub var info: AcpiInfo = .{
     .rsdp = null,
     .lapic_address = 0,
     .cpu_count = 0,
-    .cpu_apic_ids = .{0} ** 256,
+    .cpu_apic_ids = .{0} ** cpu_capacity.MAX_CPUS,
     .ioapic_address = 0,
     .ioapic_gsi_base = 0,
     .mcfg_base = 0,
@@ -169,12 +170,16 @@ fn parseMadt(madt_phys: u64) void {
     const hdr_len: u32 = @as(u32, bytes[4]) | (@as(u32, bytes[5]) << 8) |
         (@as(u32, bytes[6]) << 16) | (@as(u32, bytes[7]) << 24);
 
+    var warned_x2apic = false;
     var offset: u32 = @sizeOf(tables.Madt);
-    while (offset < hdr_len) {
+    while (offset + 2 <= hdr_len) {
         const entry_type = bytes[offset];
         const entry_len: u32 = bytes[offset + 1];
 
-        if (entry_len == 0) break;
+        if (entry_len < 2 or offset + entry_len > hdr_len) {
+            serial.writeString("[ACPI] WARN: malformed MADT entry; stopping parse\n");
+            break;
+        }
 
         if (entry_type == 0) {
             // MADT LAPIC entry: type(1) + len(1) + acpi_proc_id(1) + apic_id(1) + flags(4)
@@ -182,9 +187,18 @@ fn parseMadt(madt_phys: u64) void {
                 const apic_id: u32 = bytes[offset + 3];
                 const flags: u32 = @as(u32, bytes[offset + 4]) | (@as(u32, bytes[offset + 5]) << 8) |
                     (@as(u32, bytes[offset + 6]) << 16) | (@as(u32, bytes[offset + 7]) << 24);
-                if (flags & 1 != 0 and info.cpu_count < 256) {
-                    info.cpu_apic_ids[info.cpu_count] = apic_id;
-                    info.cpu_count += 1;
+                if (flags & 1 != 0) {
+                    var duplicate = false;
+                    for (info.cpu_apic_ids[0..info.cpu_count]) |known_id| {
+                        if (known_id == apic_id) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!duplicate and info.cpu_count < cpu_capacity.MAX_CPUS) {
+                        info.cpu_apic_ids[info.cpu_count] = apic_id;
+                        info.cpu_count += 1;
+                    }
                 }
             }
         } else if (entry_type == 1) {
@@ -197,6 +211,9 @@ fn parseMadt(madt_phys: u64) void {
                 info.ioapic_address = ioapic_addr;
                 info.ioapic_gsi_base = gsi_base;
             }
+        } else if (entry_type == 9 and !warned_x2apic) {
+            serial.writeString("[ACPI] WARN: skipping unsupported MADT x2APIC entries\n");
+            warned_x2apic = true;
         }
 
         offset += entry_len;

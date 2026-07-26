@@ -36,10 +36,13 @@
 
 const lapic = @import("lapic.zig");
 const smp = @import("../../smp.zig");
+const syscall_entry = @import("syscall_entry.zig");
+const serial = @import("serial.zig");
 
 /// Local-flush fallback threshold. More pages than this on a single
 /// shootdown → just reload CR3 (flushes all non-global TLB entries).
 pub const FLUSH_THRESHOLD: u16 = 32;
+const SHOOTDOWN_WAIT_POLL_LIMIT: u32 = 5_000_000;
 
 /// Global shootdown request slot. Only one shootdown can be in flight at a
 /// time, serialised by `shootdown_lock`. All fields are accessed atomically.
@@ -53,9 +56,19 @@ pub const TlbShootdownReq = extern struct {
     /// decide whether the slot is stale (best-effort; the handler is always
     /// invoked in response to our own IPI so this is mainly for diagnostics).
     active: u32 = 0,
+    generation: u32 = 0,
 };
 
 pub var shootdown_req: TlbShootdownReq = .{};
+var acknowledged_generation: [syscall_entry.MAX_CPUS]u32 = [_]u32{0} ** syscall_entry.MAX_CPUS;
+
+fn failShootdown(reason: []const u8) noreturn {
+    serial.writeString("[TLB] FATAL: shootdown ");
+    serial.writeString(reason);
+    serial.writeString("; halting to preserve mapping safety\n");
+    asm volatile ("cli");
+    while (true) asm volatile ("hlt");
+}
 
 /// Cross-CPU lock used to serialise shootdown initiators. Unlike
 /// `IrqSpinlock` (which disables IRQs for the whole critical section), this
@@ -148,15 +161,25 @@ pub fn handleShootdownIpi() void {
     // EOI first so the LAPIC can deliver further interrupts while we flush.
     eoiInline();
 
-    // Snapshot the request. `active` is informational; we still flush on
-    // any IPI we receive (cheap and idempotent).
+    if (@atomicLoad(u32, &shootdown_req.active, .acquire) == 0) return;
+    const generation = @atomicLoad(u32, &shootdown_req.generation, .acquire);
+    const cpu_id = syscall_entry.getPerCpu().cpu_id;
+    if (cpu_id >= syscall_entry.MAX_CPUS) return;
+    if (@atomicRmw(u32, &acknowledged_generation[cpu_id], .Xchg, generation, .acq_rel) == generation) return;
+
+    // The active acquire load publishes the range before this CPU flushes it.
     const addr = @atomicLoad(u64, &shootdown_req.addr_start, .acquire);
     const cnt = @atomicLoad(u32, &shootdown_req.page_count, .acquire);
 
     flushLocal(addr, cnt);
 
-    // Acknowledge — initiator spins until this counter reaches zero.
-    _ = @atomicRmw(u32, &shootdown_req.completion, .Sub, 1, .release);
+    // Acknowledge only an active, non-zero completion count. This prevents a
+    // duplicate or stale vector from wrapping the counter to UINT_MAX.
+    while (true) {
+        const completion = @atomicLoad(u32, &shootdown_req.completion, .acquire);
+        if (completion == 0) break;
+        if (@cmpxchgWeak(u32, &shootdown_req.completion, completion, completion - 1, .acq_rel, .acquire) == null) break;
+    }
 }
 
 /// Initiator-side: flush `[addr_start, addr_start + page_count * 4K)` on the
@@ -168,12 +191,15 @@ pub fn shootdownRange(addr_start: u64, page_count: u32) void {
     // Local flush first — synchronous, doesn't need the lock.
     flushLocal(addr_start, page_count);
 
-    // Decide how many remote CPUs to wait on. `smp.cpu_count` is the number
-    // of CPUs that have completed bring-up (BSP is always counted as 1).
-    const ncpus = @atomicLoad(u32, &smp.cpu_count, .acquire);
-    if (ncpus <= 1) return; // uniprocessor — nobody else has stale TLB
-
-    const remote: u32 = ncpus - 1;
+    const configured = @atomicLoad(u32, &smp.configured_cpu_count, .acquire);
+    const current_cpu = syscall_entry.getPerCpu().cpu_id;
+    var remote: u32 = 0;
+    var cpu: u32 = 0;
+    while (cpu < configured) : (cpu += 1) {
+        if (cpu == current_cpu) continue;
+        if (smp.isCpuOnline(@intCast(cpu))) remote += 1;
+    }
+    if (remote == 0) return;
 
     // Serialise with other initiators. The IPI handler does NOT take this
     // lock so it can still service shootdowns broadcast by whoever holds it.
@@ -185,17 +211,27 @@ pub fn shootdownRange(addr_start: u64, page_count: u32) void {
     // non-zero via the IPI.
     @atomicStore(u64, &shootdown_req.addr_start, addr_start, .release);
     @atomicStore(u32, &shootdown_req.page_count, page_count, .release);
+    const generation = @atomicLoad(u32, &shootdown_req.generation, .monotonic) +% 1;
+    @atomicStore(u32, &shootdown_req.generation, if (generation == 0) 1 else generation, .release);
     @atomicStore(u32, &shootdown_req.completion, remote, .release);
     @atomicStore(u32, &shootdown_req.active, 1, .release);
 
-    // Broadcast IPI to all CPUs except ourselves.
-    lapic.sendIpiAllButSelf(lapic.TLB_SHOOTDOWN_VECTOR);
+    cpu = 0;
+    while (cpu < configured) : (cpu += 1) {
+        if (cpu == current_cpu) continue;
+        const logical_id: u8 = @intCast(cpu);
+        if (!smp.isCpuOnline(logical_id)) continue;
+        const apic_id: u8 = @intCast(syscall_entry.percpu_array[logical_id].apic_id);
+        if (!lapic.sendIpi(apic_id, lapic.TLB_SHOOTDOWN_VECTOR)) failShootdown("IPI delivery timed out");
+    }
 
     // We must allow IRQs while spinning so other initiators' IPIs can still
     // hit us (they could be parked in `shootdown_lock.acquire` waiting for
     // us, but if anyone else is reachable they may broadcast first).
     asm volatile ("sti");
-    while (@atomicLoad(u32, &shootdown_req.completion, .acquire) != 0) {
+    var polls: u32 = 0;
+    while (@atomicLoad(u32, &shootdown_req.completion, .acquire) != 0) : (polls += 1) {
+        if (polls == SHOOTDOWN_WAIT_POLL_LIMIT) failShootdown("completion timed out");
         asm volatile ("pause");
     }
     // Disable IRQs again before releasing the lock so the saved-rflags

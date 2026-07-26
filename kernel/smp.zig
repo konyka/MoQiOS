@@ -43,6 +43,10 @@ const fmt = @import("lib/fmt.zig");
 const builtin = @import("builtin");
 
 const KERNEL_STACK_PAGES: u64 = 16;
+const AP_MAILBOX_TOKEN_PHYS: u64 = 0x7080;
+const AP_MAILBOX_ACK_PHYS: u64 = 0x7088;
+const AP_STARTUP_TOKEN_INITIAL: u64 = 1;
+const AP_MAILBOX_PERMITTED: u64 = @as(u64, 1) << 63;
 
 /// Master switch for Application Processor (AP) bring-up.
 ///
@@ -58,6 +62,49 @@ pub const enable_ap_startup: bool = true;
 
 /// Number of CPUs currently online (1 = BSP only).
 pub var cpu_count: u32 = 1;
+
+/// CPUs selected for bring-up, including the BSP. Logical IDs are dense in
+/// this range; `cpu_count` counts only CPUs that completed bring-up.
+pub var configured_cpu_count: u32 = 1;
+var online_cpus: [syscall_entry.MAX_CPUS]bool = [_]bool{false} ** syscall_entry.MAX_CPUS;
+var selected_apic_ids: [syscall_entry.MAX_CPUS]u8 = [_]u8{0} ** syscall_entry.MAX_CPUS;
+var next_ap_startup_token: u64 = AP_STARTUP_TOKEN_INITIAL;
+
+fn apMailboxToken() *u64 {
+    return @ptrFromInt(hhdm.physToVirt(AP_MAILBOX_TOKEN_PHYS));
+}
+
+fn apMailboxAck() *u64 {
+    return @ptrFromInt(hhdm.physToVirt(AP_MAILBOX_ACK_PHYS));
+}
+
+fn parkUnrequestedAp() noreturn {
+    while (true) asm volatile ("hlt");
+}
+
+/// Each request is serialized, so token invalidation permanently revokes a
+/// timed-out AP before the next request may be issued.
+fn apRequestPermitted(token: u64) bool {
+    return @atomicLoad(u64, apMailboxToken(), .acquire) == token | AP_MAILBOX_PERMITTED;
+}
+
+fn failCommittedApStartup(cpu_id: u32) noreturn {
+    serial.writeString("[SMP] FATAL: permitted AP ");
+    fmt.writeDecimal(cpu_id);
+    serial.writeString(" did not finish startup; halting to preserve scheduler safety\n");
+    asm volatile ("cli");
+    while (true) asm volatile ("hlt");
+}
+
+pub fn isCpuConfigured(cpu_id: u8) bool {
+    return cpu_id < configured_cpu_count;
+}
+
+pub fn isCpuOnline(cpu_id: u8) bool {
+    if (comptime builtin.cpu.arch != .x86_64) return cpu_id == 0;
+    if (!isCpuConfigured(cpu_id)) return false;
+    return @atomicLoad(bool, &online_cpus[cpu_id], .acquire);
+}
 
 /// BSP's LAPIC ID.
 pub var bsp_apic_id: u32 = 0;
@@ -89,11 +136,27 @@ fn rawPutc(c: u8) void {
 /// Bring-up markers (lock-free, COM1): E=entered, F=GDT, G=IDT, H=per-CPU,
 /// I=LAPIC, J=GS base — then the locked "[SMP] AP N initialized" line.
 pub fn apEntry() callconv(.c) noreturn {
+    const token = @atomicLoad(u64, apMailboxToken(), .acquire);
+    if (token == 0 or token & AP_MAILBOX_PERMITTED != 0) parkUnrequestedAp();
+
     rawPutc('E');
 
     // Read cpu_id from trampoline data area (HHDM alias — AP runs in high-half only).
     const id_ptr: *volatile u32 = @ptrFromInt(hhdm.physToVirt(0x7040));
     const actual_cpu_id: u32 = id_ptr.*;
+    if (actual_cpu_id >= syscall_entry.MAX_CPUS) {
+        serial.writeString("[SMP] WARN: AP logical CPU exceeds kernel capacity\n");
+        while (true) asm volatile ("hlt");
+    }
+
+    // Report that the trampoline has arrived, then wait for the BSP to grant
+    // this exact token. A timeout clears the command and leaves us parked.
+    @atomicStore(u64, apMailboxAck(), token, .release);
+    while (true) {
+        if (apRequestPermitted(token)) break;
+        if (@atomicLoad(u64, apMailboxToken(), .acquire) == 0) parkUnrequestedAp();
+        asm volatile ("pause");
+    }
 
     // Match BSP feature bits needed for ring-3 execution on this AP:
     //   CR4.OSFXSR (bit 9) — SSE in user/C code
@@ -148,7 +211,7 @@ pub fn apEntry() callconv(.c) noreturn {
 
     // Signal BSP that we're alive
     serial.writeString("[SMP] AP ");
-    serial.writeByte('0' + @as(u8, @truncate(actual_cpu_id)));
+    fmt.writeDecimal(actual_cpu_id);
     serial.writeString(" initialized\n");
 
     // M8-5b-2: join scheduler via per-CPU kernel idle, then enable timer.
@@ -157,6 +220,7 @@ pub fn apEntry() callconv(.c) noreturn {
     lapic.initAp();
     // Authoritative LAPIC id for IPI targeting (must not assume id == cpu_id).
     syscall_entry.percpu_array[actual_cpu_id].apic_id = lapic.id();
+    @atomicStore(u64, apMailboxAck(), token | AP_MAILBOX_PERMITTED, .release);
     sched.apBootstrapIdle();
 }
 
@@ -256,36 +320,68 @@ fn initX86() void {
     const trampoline_bin = @embedFile("arch/x86_64/ap_trampoline.bin");
 
     bsp_apic_id = lapic.id();
+    online_cpus[0] = true;
 
     // Initialize BSP per-CPU data
     syscall_entry.percpu_array[0].cpu_id = 0;
     syscall_entry.percpu_array[0].apic_id = bsp_apic_id;
     syscall_entry.percpu_array[0].current_tid = 0;
 
+    selected_apic_ids[0] = @intCast(bsp_apic_id);
+    var discovered_bsp = false;
+    for (acpi.info.cpu_apic_ids[0..acpi.info.cpu_count]) |apic_id| {
+        if (apic_id == bsp_apic_id) {
+            discovered_bsp = true;
+            break;
+        }
+    }
+    if (!discovered_bsp) {
+        serial.writeString("[SMP] WARN: BSP APIC ID missing from MADT; using BSP only\n");
+        configured_cpu_count = 1;
+        return;
+    }
+
+    const task_limit = @min(task.freeSlotCount() + 1, @as(u32, @intCast(syscall_entry.MAX_CPUS)));
+    var selected: u32 = 1;
+    for (acpi.info.cpu_apic_ids[0..acpi.info.cpu_count]) |apic_id| {
+        if (apic_id == bsp_apic_id or selected >= task_limit) continue;
+        selected_apic_ids[selected] = @intCast(apic_id);
+        selected += 1;
+    }
+    configured_cpu_count = selected;
+
+    const ist_count = gdt.initFinalIst(configured_cpu_count);
+    if (ist_count == 0) {
+        serial.writeString("[SMP] WARN: no final IST storage; using BSP only\n");
+        configured_cpu_count = 1;
+        return;
+    }
+    // Reloading the BSP GDT/TSS can refresh the hidden GS descriptor state.
+    // Restore the per-CPU MSR bases before any scheduler/task work continues.
+    syscall_entry.setPerCpuGsBase(0);
+    if (ist_count < configured_cpu_count) configured_cpu_count = @intCast(ist_count);
+
+    serial.writeString("[SMP] ");
+    fmt.writeDecimal(acpi.info.cpu_count);
+    serial.writeString(" CPUs detected\n[SMP] ");
+    fmt.writeDecimal(configured_cpu_count);
+    serial.writeString(" CPUs selected\n");
+
     if (!enable_ap_startup) {
         serial.writeString("[SMP] AP startup disabled (uniprocessor mode); running on BSP only\n");
         return;
     }
 
-    if (acpi.info.cpu_count <= 1) {
+    if (configured_cpu_count <= 1) {
         serial.writeString("[SMP] Single CPU system\n");
+        serial.writeString("[SMP] 1 CPUs online\n");
         return;
     }
 
-    const num_aps = acpi.info.cpu_count - 1;
+    const num_aps = configured_cpu_count - 1;
     serial.writeString("[SMP] Starting ");
-    serial.writeByte('0' + @as(u8, @truncate(num_aps)));
+    fmt.writeDecimal(num_aps);
     serial.writeString(" APs...\n");
-
-    // M8-5b-2: per-CPU idle kernel threads (affinity = cpu_id) so each AP's first
-    // schedule is a kernel idle task — never a direct first-ever user schedule
-    // from cur_idx==null (which lacks a stable prior anchor / context-switch path).
-    for (1..acpi.info.cpu_count) |i| {
-        const cpu_id: u8 = @intCast(i);
-        _ = task.createKernelThreadAffinity(sched.kernelIdleLoop, 255, cpu_id) orelse {
-            serial.writeString("[SMP] WARN: failed to create AP idle thread\n");
-        };
-    }
 
     // Set up trampoline infrastructure
     const trampoline_virt = hhdm.physToVirt(0x8000);
@@ -424,12 +520,22 @@ fn initX86() void {
     const pml4_ptr: *u64 = @ptrFromInt(hhdm.physToVirt(0x7000));
     pml4_ptr.* = pml4_phys;
 
-    // Start each AP (skip BSP)
-    for (0..acpi.info.cpu_count) |i| {
-        const apic_id = acpi.info.cpu_apic_ids[i];
-        if (apic_id == bsp_apic_id) continue;
+    // Start APs serially and stop on the first failure. Reusing a logical ID
+    // after timeout is unsafe because a delayed AP could still reach apEntry.
+    const selected_target = configured_cpu_count;
+    var candidate: u32 = 1;
+    var logical_id: u32 = 1;
+    while (candidate < selected_target) : (candidate += 1) {
+        const apic_id = selected_apic_ids[candidate];
+        const cpu_id = logical_id;
 
-        const cpu_id: u32 = @truncate(i);
+        // Each AP must have a pinned idle task before it enters apBootstrapIdle.
+        const idle_slot = task.createKernelThreadAffinity(sched.kernelIdleLoop, 255, @intCast(cpu_id)) orelse {
+            serial.writeString("[SMP] WARN: idle-task resources stopped bring-up at CPU ");
+            fmt.writeDecimal(cpu_id);
+            serial.writeString("\n");
+            break;
+        };
 
         // Pre-seed APIC id from MADT (apEntry refreshes via lapic.id() after initAp).
         syscall_entry.percpu_array[cpu_id].apic_id = apic_id;
@@ -439,7 +545,11 @@ fn initX86() void {
         // Non-contiguous pages would leave unmapped gaps → #PF when RSP crosses a boundary.
         const stack_phys = pmm.allocContiguous(KERNEL_STACK_PAGES) orelse {
             serial.writeString("[SMP] ERROR: out of contiguous memory for AP stack\n");
-            return;
+            serial.writeString("[SMP] WARN: AP stack resources stopped bring-up at CPU ");
+            fmt.writeDecimal(cpu_id);
+            serial.writeString("\n");
+            task.cancelUnstartedKernelThread(idle_slot);
+            break;
         };
         const stack_top = hhdm.physToVirt(stack_phys + KERNEL_STACK_PAGES * 4096);
 
@@ -490,33 +600,64 @@ fn initX86() void {
         gdt.setupCpuGdtPublic(cpu_id);
 
         serial.writeString("[SMP] Starting AP ");
-        serial.writeByte('0' + @as(u8, @truncate(cpu_id)));
+        fmt.writeDecimal(cpu_id);
         serial.writeString("\n");
 
-        // Send INIT IPI (resets AP to real mode)
-        lapic.sendInitIpi(@truncate(apic_id));
-        microDelay(10000); // Wait 10ms
+        // Publish a fresh request token last, with release ordering. A timeout
+        // revokes it before this logical ID can be degraded.
+        const token = next_ap_startup_token;
+        next_ap_startup_token +%= 1;
+        next_ap_startup_token &= ~AP_MAILBOX_PERMITTED;
+        if (next_ap_startup_token == 0) next_ap_startup_token = AP_STARTUP_TOKEN_INITIAL;
+        @atomicStore(u64, apMailboxAck(), 0, .release);
+        @atomicStore(u64, apMailboxToken(), token, .release);
 
-        // Send SIPI (vector 0x08 = start execution at 0x8000)
-        lapic.sendStartupIpi(@truncate(apic_id), 0x08);
-        microDelay(10000); // Wait 10ms
+        if (!lapic.sendInitIpi(apic_id)) {
+            @atomicStore(u64, apMailboxToken(), 0, .release);
+            task.cancelUnstartedKernelThread(idle_slot);
+            break;
+        }
+        microDelay(10000);
+        if (!lapic.sendStartupIpi(apic_id, 0x08)) {
+            @atomicStore(u64, apMailboxToken(), 0, .release);
+            task.cancelUnstartedKernelThread(idle_slot);
+            break;
+        }
 
-        // Check if AP wrote magic to 0x7060 in 32-bit mode (before paging)
-        const magic_ptr: *u32 = @ptrFromInt(hhdm.physToVirt(0x7060));
-        if (magic_ptr.* == 0xCAFEBABE) {
-            cpu_count += 1;
+        var wait: u32 = 0;
+        while (wait < 500000 and @atomicLoad(u64, apMailboxAck(), .acquire) != token) : (wait += 1) {
+            asm volatile ("pause");
+        }
+        if (@atomicLoad(u64, apMailboxAck(), .acquire) == token) {
+            // The AP may now mutate its private state. Once granted, a later
+            // failure cannot safely be degraded because the AP may be live.
+            @atomicStore(u64, apMailboxToken(), token | AP_MAILBOX_PERMITTED, .release);
+            wait = 0;
+            while (wait < 500000 and @atomicLoad(u64, apMailboxAck(), .acquire) != (token | AP_MAILBOX_PERMITTED)) : (wait += 1) {
+                asm volatile ("pause");
+            }
+            if (@atomicLoad(u64, apMailboxAck(), .acquire) != (token | AP_MAILBOX_PERMITTED)) {
+                failCommittedApStartup(cpu_id);
+            }
+            @atomicStore(bool, &online_cpus[cpu_id], true, .release);
+            _ = @atomicRmw(u32, &cpu_count, .Add, 1, .acq_rel);
+            logical_id += 1;
             serial.writeString("[SMP] AP ");
-            serial.writeByte('0' + @as(u8, @truncate(cpu_id)));
+            fmt.writeDecimal(cpu_id);
             serial.writeString(" alive\n");
         } else {
+            @atomicStore(u64, apMailboxToken(), 0, .release);
             serial.writeString("[SMP] AP ");
-            serial.writeByte('0' + @as(u8, @truncate(cpu_id)));
-            serial.writeString(" no magic (serial confirms alive)\n");
-            cpu_count += 1;
+            fmt.writeDecimal(cpu_id);
+            serial.writeString(" failed to report online\n");
+            task.cancelUnstartedKernelThread(idle_slot);
+            break;
         }
     }
 
+    @atomicStore(u32, &configured_cpu_count, logical_id, .release);
+
     serial.writeString("[SMP] ");
-    serial.writeByte('0' + @as(u8, @truncate(cpu_count)));
+    fmt.writeDecimal(@atomicLoad(u32, &cpu_count, .acquire));
     serial.writeString(" CPUs online\n");
 }

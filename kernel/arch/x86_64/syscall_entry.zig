@@ -19,6 +19,7 @@
 const serial = @import("serial.zig");
 const fmt = @import("../../lib/fmt.zig");
 const errno = @import("../../lib/errno.zig");
+const cpu_capacity = @import("../cpu_capacity.zig");
 
 // MSR constants
 const MSR_EFER = 0xC0000080;
@@ -74,7 +75,7 @@ pub const SyscallFrame = extern struct {
 /// Per-CPU data accessible via GS segment in kernel mode.
 /// In user mode, GSBase points to user-space TLS (unused for now).
 /// In kernel mode (after swapgs), GSBase points to this struct.
-pub const MAX_CPUS: u32 = 4;
+pub const MAX_CPUS: usize = cpu_capacity.MAX_CPUS;
 
 pub const PerCpu = extern struct {
     kernel_rsp: u64, // Kernel RSP0 to switch to on syscall
@@ -97,12 +98,32 @@ pub const PerCpu = extern struct {
 /// Per-CPU data array, indexed by CPU logical ID.
 /// slice_remaining starts at the scheduler timeslice (sched.TIMESLICE_TICKS = 10)
 /// so a freshly-brought-up CPU behaves like the old global default.
-pub var percpu_array: [MAX_CPUS]PerCpu = .{
-    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 0, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF, .exec_pending = 0, .exec_new_entry = 0, .exec_new_stack = 0, .force_reschedule = 0 },
-    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 1, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF, .exec_pending = 0, .exec_new_entry = 0, .exec_new_stack = 0, .force_reschedule = 0 },
-    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 2, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF, .exec_pending = 0, .exec_new_entry = 0, .exec_new_stack = 0, .force_reschedule = 0 },
-    .{ .kernel_rsp = 0, .saved_user_rsp = 0, .saved_stack_anchor = 0, .slice_remaining = 10, .cpu_id = 3, .apic_id = 0, .current_tid = 0, .current_task_idx = 0xFFFFFFFF, .exec_pending = 0, .exec_new_entry = 0, .exec_new_stack = 0, .force_reschedule = 0 },
+pub var percpu_array: [MAX_CPUS]PerCpu = blk: {
+    var array: [MAX_CPUS]PerCpu = undefined;
+    for (&array, 0..) |*percpu, cpu_id| {
+        percpu.* = .{
+            .kernel_rsp = 0,
+            .saved_user_rsp = 0,
+            .saved_stack_anchor = 0,
+            .slice_remaining = 10,
+            .cpu_id = @intCast(cpu_id),
+            .apic_id = 0,
+            .current_tid = 0,
+            .current_task_idx = 0xFFFFFFFF,
+            .exec_pending = 0,
+            .exec_new_entry = 0,
+            .exec_new_stack = 0,
+            .force_reschedule = 0,
+        };
+    }
+    break :blk array;
 };
+
+pub fn configuredPerCpuSlice() []PerCpu {
+    const smp = @import("../../smp.zig");
+    const count = @min(@as(usize, @intCast(smp.configured_cpu_count)), MAX_CPUS);
+    return percpu_array[0..count];
+}
 
 /// Personality type for ABI routing.
 pub const Personality = enum(u8) {
@@ -219,6 +240,7 @@ comptime {
 
 /// Set GS base for the given CPU (used during CPU init).
 pub fn setPerCpuGsBase(cpu_id: u32) void {
+    if (cpu_id >= MAX_CPUS) return;
     const addr = @intFromPtr(&percpu_array[cpu_id]);
     wrmsr(0xC0000101, addr); // GS_BASE (kernel mode)
     wrmsr(0xC0000102, addr); // KERNEL_GS_BASE (loaded by swapgs)
@@ -236,6 +258,7 @@ var tls_base_loaded: [MAX_CPUS]u64 = @splat(0);
 /// task without TLS never inherits the previous task's base.
 pub fn setUserTlsBase(base: u64) void {
     const cpu_id = getPerCpu().cpu_id;
+    if (cpu_id >= MAX_CPUS) return;
     if (tls_base_loaded[cpu_id] == base) return;
     wrmsr(MSR_FS_BASE, base);
     tls_base_loaded[cpu_id] = base;
@@ -3715,13 +3738,13 @@ fn syscallSchedSetaffinity(pid: u32, cpusetsize: u32, mask_ptr: u64) i64 {
 
     const target = task_mod2.getTask(target_idx) orelse return -1;
     const copy = @import("../../mm/copy_from_user.zig");
-    var mask_buf: [16]u8 = .{0} ** 16;
-    const to_copy = @min(cpusetsize, 16);
+    var mask_buf: [32]u8 = .{0} ** 32;
+    const to_copy = @min(cpusetsize, mask_buf.len);
     const copied = copy.copyFromUser(mask_buf[0..to_copy], @ptrFromInt(mask_ptr), to_copy);
     if (copied < to_copy) return -14;
 
-    // Store as cpu_affinity (i8 — CPU index, extract lowest set bit; -1 = unpinned)
-    var affinity: i8 = -1;
+    // Store the lowest selected logical CPU, or -1 for an empty mask.
+    var affinity: i16 = -1;
     if (to_copy > 0) {
         // Find lowest set bit in mask
         var b: u32 = 0;
@@ -3734,6 +3757,7 @@ fn syscallSchedSetaffinity(pid: u32, cpusetsize: u32, mask_ptr: u64) i64 {
             }
         }
     }
+    if (affinity < 0 or @as(u32, @intCast(affinity)) >= @import("../../smp.zig").configured_cpu_count) return -22;
     target.cpu_affinity = affinity;
     return 0;
 }

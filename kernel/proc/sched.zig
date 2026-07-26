@@ -533,9 +533,10 @@ fn kickCpuX86(cpu_id: u8) void {
     const lapic_mod = @import("../arch/arch.zig").timer;
     const se = @import("../arch/arch.zig").syscall;
     if (cpu_id >= se.MAX_CPUS) return;
+    if (!@import("../smp.zig").isCpuOnline(cpu_id)) return;
     const apic_id: u8 = @truncate(se.percpu_array[cpu_id].apic_id);
     asm volatile ("mfence" ::: .{ .memory = true });
-    lapic_mod.sendIpi(apic_id, lapic_mod.RESCHEDULE_VECTOR);
+    _ = lapic_mod.sendIpi(apic_id, lapic_mod.RESCHEDULE_VECTOR);
 }
 
 /// Deliver a pending signal to the currently running user task.
@@ -679,7 +680,7 @@ fn tryStealTask() void {
         bits &= bits - 1;
         const t = task.getTask(i) orelse continue;
         const my_cpu: u8 = @truncate(currentCpuId());
-        const ok = t.cpu_affinity < 0 or t.cpu_affinity == @as(i8, @intCast(my_cpu));
+        const ok = t.cpu_affinity < 0 or t.cpu_affinity == @as(i16, my_cpu);
         if (t.state == .ready and ok) {
             const next_idx: u32 = i;
 
@@ -818,10 +819,12 @@ pub fn forceReschedule() void {
     // Capture caller continuation before any further calls clobber ra/lr (SK-20).
     const cont_rip: u64 = if (comptime builtin.cpu.arch == .riscv64)
         asm volatile ("mv %[r], ra"
-            : [r] "=r" (-> u64))
+            : [r] "=r" (-> u64),
+        )
     else if (comptime builtin.cpu.arch == .aarch64)
         asm volatile ("mov %[r], x30"
-            : [r] "=r" (-> u64))
+            : [r] "=r" (-> u64),
+        )
     else
         @returnAddress();
     const caller_sp: u64 = arch_cpu.readStackPointer();

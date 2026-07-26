@@ -13,7 +13,6 @@
 ///   0x28: user code (64-bit, ring3) — duplicate for SYSRET CS (0x1B+16=0x2B)
 ///   0x30: TSS low (uses two entries)
 ///   0x38: TSS high
-
 pub const KERNEL_CS: u16 = 0x08;
 pub const KERNEL_DS: u16 = 0x10;
 pub const USER_CS: u16 = 0x1B; // GDT entry 3 | RPL 3 (iretq to user)
@@ -79,7 +78,7 @@ const TSS_HW_SIZE: u20 = 104;
 
 /// Total GDT entries: null, kcode, kdata, ucode, udata, ucode_dup, tss_low, tss_high = 8
 const GDT_ENTRIES: usize = 8;
-const MAX_CPUS: usize = 4;
+const MAX_CPUS: usize = @import("../cpu_capacity.zig").MAX_CPUS;
 
 /// Per-CPU GDT and TSS arrays.
 var gdt_entries: [MAX_CPUS][GDT_ENTRIES]GdtEntry = undefined;
@@ -95,10 +94,49 @@ var tss: [MAX_CPUS]Tss = undefined;
 /// valid stack and the handler can run (and dump diagnostics / kill the task)
 /// instead of escalating #SS→#DF→triple-fault.
 ///
-/// These live in .bss (zeroed by the bootloader); only their addresses matter.
 const IST_STACK_SIZE: usize = 16 * 1024;
 const NUM_IST: usize = 3; // IST1=#DF, IST2=#SS/#GP, IST3=NMI/#MC
-var ist_stacks: [MAX_CPUS][NUM_IST][IST_STACK_SIZE]u8 align(16) = undefined;
+const IST_PAGES_PER_CPU: usize = NUM_IST * IST_STACK_SIZE / 4096;
+
+/// BSP-only storage used before PMM is available. Final IST storage is allocated
+/// once, before AP startup, and is never moved after TSS pointers are published.
+var bootstrap_ist: [NUM_IST][IST_STACK_SIZE]u8 align(16) = undefined;
+var final_ist_base: ?[*]u8 = null;
+var final_ist_cpu_count: usize = 0;
+
+fn istStackTop(cpu_id: usize, ist_index: usize) ?u64 {
+    if (cpu_id >= MAX_CPUS or ist_index >= NUM_IST) return null;
+    if (final_ist_base) |base| {
+        if (cpu_id >= final_ist_cpu_count) return null;
+        const offset = (cpu_id * NUM_IST + ist_index + 1) * IST_STACK_SIZE;
+        return @intFromPtr(base + offset);
+    }
+    if (cpu_id != 0) return null;
+    return @intFromPtr(&bootstrap_ist[ist_index]) + IST_STACK_SIZE;
+}
+
+/// Allocate permanent IST backing for the selected CPUs and reload the BSP TSS
+/// onto it. Returns the number of CPUs that have final IST storage.
+pub fn initFinalIst(requested_cpu_count: usize) usize {
+    if (final_ist_base != null) return final_ist_cpu_count;
+    const pmm = @import("../../mm/pmm.zig");
+    const hhdm = @import("../../mm/hhdm.zig");
+
+    var count = @min(requested_cpu_count, MAX_CPUS);
+    while (count > 0) : (count -= 1) {
+        const pages = count * IST_PAGES_PER_CPU;
+        const phys = pmm.allocContiguous(pages) orelse continue;
+        final_ist_base = @ptrFromInt(hhdm.physToVirt(phys));
+        final_ist_cpu_count = count;
+        setupCpuGdt(0);
+        return count;
+    }
+    return 0;
+}
+
+pub fn hasFinalIst(cpu_id: usize) bool {
+    return final_ist_base != null and cpu_id < final_ist_cpu_count;
+}
 
 fn makeEntry(base: u32, limit: u20, access: u8, flags: u4) GdtEntry {
     return .{
@@ -136,6 +174,7 @@ fn makeTssEntry(tss_addr: u64, limit: u20) [2]GdtEntry {
 
 /// Set the RSP0 value in the TSS for a given CPU.
 pub fn setRsp0(cpu_id: usize, rsp0: u64) void {
+    if (cpu_id >= MAX_CPUS) return;
     // DIAGNOSTIC: warn if a non-canonical RSP0 is ever installed — a bad RSP0
     // makes every user→kernel interrupt delivery raise #SS → #DF → triple fault.
     const hi = rsp0 >> 47;
@@ -153,6 +192,7 @@ pub fn setRsp0(cpu_id: usize, rsp0: u64) void {
 
 /// Get the TSS pointer for a given CPU.
 pub fn getTssPtr(cpu_id: usize) *Tss {
+    if (cpu_id >= MAX_CPUS) return &tss[0];
     return &tss[cpu_id];
 }
 
@@ -170,9 +210,9 @@ fn initCpuGdtData(cpu_id: usize) void {
     // Point IST1..IST3 at their dedicated stacks (stacks grow downward, so the
     // pointer is the TOP of each region). The IDT routes #DF→IST1, #SS/#GP→IST2,
     // NMI/#MC→IST3.
-    tss[cpu_id].ist1 = @intFromPtr(&ist_stacks[cpu_id][0]) + IST_STACK_SIZE;
-    tss[cpu_id].ist2 = @intFromPtr(&ist_stacks[cpu_id][1]) + IST_STACK_SIZE;
-    tss[cpu_id].ist3 = @intFromPtr(&ist_stacks[cpu_id][2]) + IST_STACK_SIZE;
+    tss[cpu_id].ist1 = istStackTop(cpu_id, 0) orelse return;
+    tss[cpu_id].ist2 = istStackTop(cpu_id, 1) orelse return;
+    tss[cpu_id].ist3 = istStackTop(cpu_id, 2) orelse return;
 
     // Build GDT entries
     gdt_entries[cpu_id][0] = makeEntry(0, 0, 0, 0); // null
@@ -235,6 +275,7 @@ pub fn init() void {
 
 /// Initialize GDT/TSS for an AP.
 pub fn initAp(cpu_id: usize) void {
+    if (cpu_id >= MAX_CPUS) return;
     setupCpuGdt(cpu_id);
 }
 
@@ -242,10 +283,12 @@ pub fn initAp(cpu_id: usize) void {
 /// Only initializes the GDT entries, TSS, and GDT pointer — does NOT load them.
 /// The AP will load them itself via the trampoline.
 pub fn setupCpuGdtPublic(cpu_id: u32) void {
+    if (cpu_id >= MAX_CPUS) return;
     initCpuGdtData(cpu_id);
 }
 
 /// Get the virtual address of a CPU's GDT entries (for trampoline setup).
 pub fn getGdtEntriesAddr(cpu_id: usize) u64 {
+    if (cpu_id >= MAX_CPUS) return @intFromPtr(&gdt_entries[0]);
     return @intFromPtr(&gdt_entries[cpu_id]);
 }

@@ -38,6 +38,10 @@ const TIMER_MASKED: u32 = 1 << 16;
 /// Calibrated tick count for ~100Hz
 pub var ticks_per_10ms: u32 = 0;
 
+/// A wedged APIC must not leave a caller spinning forever with interrupts
+/// disabled. This is deliberately a polling bound, not a timing guarantee.
+const ICR_DELIVERY_POLL_LIMIT: u32 = 1_000_000;
+
 fn read(offset: u32) u32 {
     const addr: *volatile u32 = @ptrFromInt(lapic_base + offset);
     return addr.*;
@@ -59,24 +63,31 @@ pub fn id() u8 {
 }
 
 /// Send INIT IPI to target AP (resets the AP to real mode).
-pub fn sendInitIpi(apic_id: u8) void {
+fn waitForIcrDelivery() bool {
+    var polls: u32 = 0;
+    while (read(REG_ICR_LOW) & (1 << 12) != 0) : (polls += 1) {
+        if (polls == ICR_DELIVERY_POLL_LIMIT) {
+            serial.writeString("[LAPIC] WARN: ICR delivery timeout\n");
+            return false;
+        }
+        asm volatile ("pause");
+    }
+    return true;
+}
+
+pub fn sendInitIpi(apic_id: u8) bool {
     writeReg(REG_ICR_HIGH, @as(u32, apic_id) << 24);
     // Delivery mode=INIT (0b101), assert level, edge trigger
     writeReg(REG_ICR_LOW, 0x00004500);
-    // Wait for delivery (poll bit 12 = delivery status)
-    while (read(REG_ICR_LOW) & (1 << 12) != 0) {
-        asm volatile ("pause");
-    }
+    return waitForIcrDelivery();
 }
 
 /// Send Startup IPI (SIPI) to target AP at given 4KB-aligned vector page.
-pub fn sendStartupIpi(apic_id: u8, vector_page: u8) void {
+pub fn sendStartupIpi(apic_id: u8, vector_page: u8) bool {
     writeReg(REG_ICR_HIGH, @as(u32, apic_id) << 24);
     // Delivery mode=Startup (0b110), assert level, vector = page frame
     writeReg(REG_ICR_LOW, 0x00004600 | @as(u32, vector_page));
-    while (read(REG_ICR_LOW) & (1 << 12) != 0) {
-        asm volatile ("pause");
-    }
+    return waitForIcrDelivery();
 }
 
 /// Send a fixed-delivery IPI carrying `vector` to the CPU with LAPIC `apic_id`.
@@ -85,23 +96,19 @@ pub fn sendStartupIpi(apic_id: u8, vector_page: u8) void {
 /// trigger = edge. The vector occupies the low 8 bits. Spins on the delivery-
 /// status bit (bit 12) until the LAPIC accepts the request. Safe to target the
 /// caller's own APIC ID (self-IPI) — useful for forcing a local reschedule.
-pub fn sendIpi(apic_id: u8, vector: u8) void {
+pub fn sendIpi(apic_id: u8, vector: u8) bool {
     writeReg(REG_ICR_HIGH, @as(u32, apic_id) << 24);
     writeReg(REG_ICR_LOW, 0x00004000 | @as(u32, vector));
-    while (read(REG_ICR_LOW) & (1 << 12) != 0) {
-        asm volatile ("pause");
-    }
+    return waitForIcrDelivery();
 }
 
 /// Broadcast a fixed-delivery IPI to all CPUs except the sender.
 /// Uses the ICR "all excluding self" shorthand (destination shorthand = 0b11).
-pub fn sendIpiAllButSelf(vector: u8) void {
+pub fn sendIpiAllButSelf(vector: u8) bool {
     writeReg(REG_ICR_HIGH, 0);
     // bits 19:18 = 0b11 (all excluding self) → 0x000C0000, plus assert + vector.
     writeReg(REG_ICR_LOW, 0x000C4000 | @as(u32, vector));
-    while (read(REG_ICR_LOW) & (1 << 12) != 0) {
-        asm volatile ("pause");
-    }
+    return waitForIcrDelivery();
 }
 
 /// Enable this AP's Local APIC (spurious-interrupt vector register) WITHOUT

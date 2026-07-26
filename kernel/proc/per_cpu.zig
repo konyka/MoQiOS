@@ -120,7 +120,7 @@ pub const PerCpuRunQueue = struct {
             target.nr_running -= 1;
             const tt = tt_opt orelse continue;
             // Skip tasks pinned away from us.
-            if (tt.cpu_affinity >= 0 and tt.cpu_affinity != @as(i8, @intCast(self.cpu_id))) {
+            if (tt.cpu_affinity >= 0 and tt.cpu_affinity != @as(i16, self.cpu_id)) {
                 // Re-insert at target's local end (head) so it stays runnable
                 // on its pinned CPU. This walks the loop's tail forward but
                 // never loses the task.
@@ -188,7 +188,7 @@ pub fn init(cpu_id: u8) void {
 /// True if any per-CPU queue has been initialised — gates the new fast path
 /// from running before main.zig has wired up the BSP queue.
 pub fn isAnyReady() bool {
-    for (initialised) |b| if (b) return true;
+    for (initialised[0..configuredCount()]) |b| if (b) return true;
     return false;
 }
 
@@ -197,12 +197,14 @@ pub fn getCurrent() *PerCpuRunQueue {
     const pc = syscall_entry.getPerCpuOrNull() orelse return &run_queues[0];
     const id: u8 = @intCast(pc.cpu_id);
     if (id >= MAX_CPUS) return &run_queues[0];
+    if (!@import("../smp.zig").isCpuConfigured(id)) return &run_queues[0];
     return &run_queues[id];
 }
 
 /// Get the queue for a specific logical CPU id.
 pub fn getQueue(cpu_id: u8) ?*PerCpuRunQueue {
     if (cpu_id >= MAX_CPUS) return null;
+    if (!@import("../smp.zig").isCpuConfigured(cpu_id)) return null;
     return &run_queues[cpu_id];
 }
 
@@ -219,6 +221,7 @@ pub fn targetCpuFor(t: *task_mod.Task) u8 {
 pub fn enqueueTask(t: *task_mod.Task) bool {
     const cpu = targetCpuFor(t);
     if (cpu >= MAX_CPUS) return false;
+    if (!@import("../smp.zig").isCpuOnline(cpu)) return false;
     if (!initialised[cpu]) return false;
     return run_queues[cpu].push(t);
 }
@@ -232,20 +235,20 @@ pub fn tryStealForCurrent() u32 {
     const my = &run_queues[my_id];
 
     const smp = @import("../smp.zig");
-    const ncpus_raw: u32 = smp.cpu_count;
-    const ncpus: u8 = if (ncpus_raw == 0)
+    const ncpus_raw: u32 = smp.configured_cpu_count;
+    const ncpus: usize = if (ncpus_raw == 0)
         1
     else if (ncpus_raw > MAX_CPUS)
-        @intCast(MAX_CPUS)
+        MAX_CPUS
     else
         @intCast(ncpus_raw);
     if (ncpus <= 1) return 0;
 
     // TSC-derived random start to spread steal-target contention.
-    const start: u8 = @as(u8, @truncate(tsc.read())) % ncpus;
-    var i: u8 = 0;
+    const start: usize = @as(usize, @truncate(tsc.read())) % ncpus;
+    var i: usize = 0;
     while (i < ncpus) : (i += 1) {
-        const other: u8 = (start +% i) % ncpus;
+        const other = (start + i) % ncpus;
         if (other == my_id) continue;
         if (!initialised[other]) continue;
         const target = &run_queues[other];
@@ -265,6 +268,7 @@ pub fn tryStealForCurrent() u32 {
 /// pointer aliases the live struct — callers must treat fields as volatile.
 pub fn getStats(cpu_id: u8) ?*const SchedStats {
     if (cpu_id >= MAX_CPUS) return null;
+    if (!@import("../smp.zig").isCpuConfigured(cpu_id)) return null;
     return &run_queues[cpu_id].stats;
 }
 
@@ -273,5 +277,10 @@ pub fn getStats(cpu_id: u8) ?*const SchedStats {
 /// profiling.
 pub fn resetStats(cpu_id: u8) void {
     if (cpu_id >= MAX_CPUS) return;
+    if (!@import("../smp.zig").isCpuConfigured(cpu_id)) return;
     run_queues[cpu_id].stats = .{};
+}
+
+fn configuredCount() usize {
+    return @min(@as(usize, @intCast(@import("../smp.zig").configured_cpu_count)), MAX_CPUS);
 }

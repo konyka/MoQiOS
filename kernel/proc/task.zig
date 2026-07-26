@@ -58,7 +58,7 @@ pub const Task = struct {
     /// CPU affinity. -1 = no pin (eligible for any CPU / work-stealing);
     /// >=0 = hard-pinned to that logical CPU (Task #2: pinned tasks are
     /// never stolen by another CPU's run queue).
-    cpu_affinity: i8 = -1,
+    cpu_affinity: i16 = -1,
     /// Last CPU this task ran on. Used by Task #2 for run-queue placement
     /// preference (warm cache) and as the fallback target when not pinned.
     last_cpu: u8 = 0,
@@ -273,9 +273,13 @@ pub fn getSlotBitmap() u64 {
     return slot_bitmap;
 }
 
+pub fn freeSlotCount() u32 {
+    return MAX_TASKS - @popCount(slot_bitmap);
+}
+
 /// True if `t`'s affinity allows it to run on `cpu` (-1 = no pin).
 fn matchesCpu(t: *Task, cpu: u8) bool {
-    return t.cpu_affinity < 0 or t.cpu_affinity == @as(i8, @intCast(cpu));
+    return t.cpu_affinity < 0 or t.cpu_affinity == @as(i16, cpu);
 }
 
 fn considerReady(idx: u32, cpu: u8, best_idx: *?u32, best_prio: *u8) void {
@@ -465,7 +469,7 @@ var next_assign_cpu: u32 = 0;
 pub fn assignCpuAffinity(elf: bool) u8 {
     const smp = @import("../smp.zig");
     _ = elf;
-    const ncpus = @as(u32, @truncate(smp.cpu_count));
+    const ncpus = smp.configured_cpu_count;
     if (ncpus <= 1) return 0;
     const cpu: u8 = @truncate(next_assign_cpu % ncpus);
     next_assign_cpu += 1;
@@ -504,7 +508,7 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     @import("../fs/vfs.zig").FdTable.initInto(&tasks[slot].fd_table);
     tasks[slot].cwd[0] = '/';
     tasks[slot].cwd_len = 1;
-    tasks[slot].cpu_affinity = @intCast(affinity);
+    tasks[slot].cpu_affinity = affinity;
     tasks[slot].last_cpu = affinity;
 
     // Task #8: POSIX caps default to ALL_CAPS (zeroSlot would leave them at
@@ -517,6 +521,17 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     task_count += 1;
     asm volatile ("" ::: .{ .memory = true });
     return slot;
+}
+
+/// Roll back a kernel thread that has not entered the scheduler yet. Its fixed
+/// stack mapping remains cached for the slot, matching normal task reuse.
+pub fn cancelUnstartedKernelThread(slot: u32) void {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    const t = getTask(slot) orelse return;
+    if (t.is_user or t.started or t.state != .ready) return;
+    slot_bitmap &= ~(@as(u64, 1) << @intCast(slot));
+    task_count -= 1;
 }
 
 /// Create an unpinned kernel thread (cpu_affinity = -1, eligible for stealing).
@@ -640,7 +655,7 @@ pub fn exitTask(exit_code: i32) void {
 fn isCurrentOnAnyCpu(idx: u32) bool {
     if (comptime builtin.cpu.arch != .x86_64) return false;
     const se = @import("../arch/x86_64/syscall_entry.zig");
-    for (&se.percpu_array) |*pc| {
+    for (se.configuredPerCpuSlice()) |*pc| {
         if (@atomicLoad(u32, &pc.current_task_idx, .acquire) == idx) return true;
     }
     return false;
@@ -654,7 +669,7 @@ fn isCurrentOnAnyCpu(idx: u32) bool {
 pub fn isCurrentOnOtherCpu(idx: u32, my_cpu: u32) bool {
     if (comptime builtin.cpu.arch != .x86_64) return false;
     const se = @import("../arch/x86_64/syscall_entry.zig");
-    for (&se.percpu_array, 0..) |*pc, cpu| {
+    for (se.configuredPerCpuSlice(), 0..) |*pc, cpu| {
         if (cpu == my_cpu) continue;
         if (@atomicLoad(u32, &pc.current_task_idx, .acquire) == idx) return true;
     }
@@ -830,9 +845,9 @@ pub fn createUserProcess(
 /// Skips `parent_cpu` — same-CPU children rely on timer preemption of blocked parent.
 pub fn kickChildCpus(parent_tid: u32, parent_cpu: u8) void {
     const sched = @import("sched.zig");
-    const max_cpus: u8 = @intCast(@import("../arch/arch.zig").syscall.MAX_CPUS);
-    var cpus: [4]u8 = undefined;
-    var cpu_count: u8 = 0;
+    const max_cpus = @import("../arch/arch.zig").syscall.MAX_CPUS;
+    var cpus: [max_cpus]u8 = undefined;
+    var cpu_count: usize = 0;
     {
         const flags = task_lock.acquire();
         defer task_lock.release(flags);
@@ -854,7 +869,7 @@ pub fn kickChildCpus(parent_tid: u32, parent_cpu: u8) void {
                     break;
                 }
             }
-            if (!seen and cpu_count < max_cpus) {
+            if (!seen and cpu_count < cpus.len) {
                 cpus[cpu_count] = cpu;
                 cpu_count += 1;
             }
