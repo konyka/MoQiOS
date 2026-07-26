@@ -1,7 +1,7 @@
 # MoQiOS 构建系统与工具链
 
 > **文档定位**: 描述 MoQiOS 的编译、链接、镜像打包与启动流程。
-> **修订日期**: 2026-06-16
+> **修订日期**: 2026-07-26
 > **关联文档**: [moqios-architecture-current.md](./moqios-architecture-current.md)
 
 ---
@@ -224,7 +224,7 @@ qemu-system-x86_64 \
 |---|---|
 | `-M q35` | 现代 Q35 平台（支持 PCIe / ACPI MCFG） |
 | `-m 512M` | 512MB 物理内存 |
-| `-smp 2` | 双核（BSP + AP） |
+| `-smp N` | CPU 核数；由 `MOQI_SMP` 环境变量控制（默认 2），smoke 脚本将其传给 QEMU |
 | `-device virtio-blk-pci` | 虚拟块设备（FAT32/ext2 后端） |
 | `-device e1000` | Intel 82540 千兆网卡 |
 | `-serial stdio` | 串口输出到终端（内核日志） |
@@ -240,8 +240,9 @@ qemu-system-x86_64 \
 | `zig build debug` | 启动 QEMU 并在 1234 端口监听 GDB（`-s -S`） |
 | `zig build test` | 在主机目标运行 `tests/main.zig` 单元测试，覆盖可脱离硬件执行的共享库逻辑 |
 | `zig build smoke` | 单核 QEMU 限时冒烟测试，串口日志需出现当前 init 自动序列末尾 `hello21 done` 和 `MoQiOS shell` |
-| `zig build smoke-smp` | 双核 QEMU 限时冒烟测试，验证 AP/SMP 启动路径仍能跑完整个 init 测试序列 |
-| `zig build smoke-smp-stress` | 默认连续执行 5 次双核冒烟；用于捕获任务槽复用、共享内核映射和调度时序回归。以 `MOQI_SMOKE_RUNS=N` 覆盖次数 |
+| `zig build smoke-smp` | SMP QEMU 限时冒烟测试（默认 `MOQI_SMP=2`），验证 AP 启动路径仍能跑完整个 init 测试序列；`MOQI_SMP=N` 可指定任意正整数核数 |
+| `zig build smoke-smp-matrix` | 按 `MOQI_SMOKE_MATRIX_CPUS`（默认 `"1 2 3 4 6 8"`）依次运行各核数冒烟；16 核在 TCG 下需 `MOQI_SMOKE_TIMEOUT=600` |
+| `zig build smoke-smp-stress` | 连续执行 `MOQI_SMOKE_RUNS`（默认 5）次指定核数（`MOQI_SMP`，默认 2）冒烟；捕获任务槽复用、共享内核映射和调度时序回归 |
 | `zig build -Darch=riscv64 smoke-riscv` | riscv64 M7+SK-156：shared probes + slim BSS + shared user-copy guard + shared idle boot + shared ramdisk parse + virtio + U-mode |
 | `zig build -Darch=aarch64 smoke-aarch64` | aarch64 M9-7+SK-156：shared probes + slim BSS + shared user-copy guard + shared idle boot + shared ramdisk parse + default timer + EL0/SVC |
 
@@ -252,6 +253,16 @@ gdb zig-out/bin/moqi-kernel.elf
 (gdb) target remote :1234
 (gdb) c
 ```
+
+### 9.1 smoke 相关环境变量
+
+| 变量 | 说明 | 默认值 |
+|---|---|---|
+| `MOQI_SMP` | QEMU 传给内核的 CPU 核数（正整数）；smoke/smoke-smp/smoke-smp-stress 均读此变量 | `1`（smoke），`2`（smoke-smp/smoke-smp-stress） |
+| `MOQI_SMOKE_MATRIX_CPUS` | smoke-smp-matrix 要依次测试的核数列表（空格分隔） | `"1 2 3 4 6 8"` |
+| `MOQI_SMOKE_RUNS` | smoke-smp-stress 连续运行次数 | `5` |
+| `MOQI_SMOKE_TIMEOUT` | 单次 smoke 超时秒数；TCG 下跑 16 核建议设为 600 | `120` |
+| `MOQI_SMOKE_STRICT_SMP` | `1`：smoke 检查 "N CPUs online" 与请求核数一致（可因 MADT/资源降级）；`0`：允许部分上线 | `1` |
 
 ---
 

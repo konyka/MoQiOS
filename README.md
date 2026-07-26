@@ -22,13 +22,20 @@
 | M10 | fork + execve + 进程地址空间克隆 | ✅ |
 | M11+ | 信号处理、环境变量、目录操作、chdir/getcwd、fstat/unlink | ✅ |
 | 扩展 | ext2 (读写)、tmpfs、procfs、统一页缓存、TCP socket API | ✅ |
-| 扩展 | SMP / AP 启动 + Per-CPU 调度队列 + Work-Stealing | ✅ |
+| 扩展 | SMP / AP 启动 + Per-CPU 调度队列 + Work-Stealing + CPU 数量自适应（MADT 探测） | ✅ |
 | 扩展 | FPU/SSE 任务状态保存（Lazy FPU，CR0.TS + #NM） | ✅ |
 | 扩展 | 范围 TLB Shootdown（IPI + invlpg + 32 页 CR3 阈值回退） | ✅ |
 | 扩展 | IPv6 协议栈（ICMPv6 + NDP 邻居发现） | ✅ |
 | 扩展 | POSIX Capability 安全模型（16 个 capability 位 + 三组掩码） | ✅ |
 | 扩展 | Arch 抽象层（x86_64 主路径 + riscv64/aarch64 移植骨架） | 部分完成 |
 | 扩展 | 调度器 Profiling 基础设施（SchedStats + /proc/sched_stats） | ✅ |
+
+> **2026-07-26 自适应多核 SMP**：CPU 数量由 ACPI MADT 运行时探测后自动选定，不再固定于双核。
+> 串口输出三段式：`N CPUs detected` → `N CPUs selected` → `N CPUs online`。
+> 逻辑 ID（0…N-1）与 xAPIC 硬件 ID 分离存储；IST 栈背衬按选定 CPU 数量一次性分配（3×16 KiB/核），
+> 不浪费未用核的内存。元数据槽上限 256（xAPIC ID 为 u8），x2APIC/type-9 条目不支持，自动跳过。
+> `smoke-smp-matrix` 已验证 1/2/3/4/6/8/12/16 核（16 核 TCG 需 `MOQI_SMOKE_TIMEOUT=600`）；
+> 8 核 3 次压力测试通过。ReleaseFast 构建通过。
 
 > **2026-06-21 SMP 性能三件套完成**：FPU/SSE 按任务保存 (`kernel/arch/x86_64/context_switch.zig`)、
 > Per-CPU 运行队列 + Work-Stealing (`kernel/proc/per_cpu.zig`, 256 槽 LIFO)、
@@ -46,14 +53,15 @@
 >
 > **2026-06 SMP 进展**：查明并修复了长期存在的 "LAPIC-on-AP 崩溃" 根因——AP trampoline 未启用
 > `EFER.NXE`，导致 AP 冷 TLB walk 到内核 NX 页时触发保留位缺页→三重故障。修复后 AP 可稳定上线
-> (`2 CPUs online`)。v27.0 进一步修复 AP 栈物理连续性、BSP reap 调度间隙、TLB shootdown EOI
-> 顺序、sleepOn 阻塞延迟等 SMP 基础设施问题。
+> （初始双核基线 `[SMP] 2 CPUs online`）。v27.0 进一步修复 AP 栈物理连续性、BSP reap 调度间隙、
+> TLB shootdown EOI 顺序、sleepOn 阻塞延迟等 SMP 基础设施问题。
 >
 > **2026-06-21 SMP 性能三件套**：FPU/SSE 任务状态保存、Per-CPU 调度队列 + Work-Stealing、
 > 范围 TLB Shootdown 同时完成。三者互为前提，完成后用户任务可跨核迁移，AP 参与负载均衡。
 
 **用户程序**: ~3,600 行 C/ASM | **测试**: `zig build test` 覆盖主机可运行的共享库逻辑；QEMU
-`smoke`/`smoke-smp` 覆盖 x86_64 启动与集成路径，`hello22`–`hello28` 可手动运行。
+`smoke`/`smoke-smp`/`smoke-smp-matrix` 覆盖 x86_64 启动与集成路径（矩阵默认测试 1/2/3/4/6/8 核），
+`hello22`–`hello28` 可手动运行。
 
 ## 功能特性
 

@@ -22,9 +22,19 @@ An x86_64-first operating system kernel written in Zig, using the Limine boot pr
 | M10 | fork + execve + address space cloning | ✅ |
 | M11+ | Signals, environment variables, directory ops, chdir/getcwd, fstat/unlink | ✅ |
 | Extensions | ext2, tmpfs/procfs, TCP sockets, SMP/work-stealing, IPv6, capabilities | ✅ on x86_64 |
+| Extensions | CPU-count-adaptive SMP: MADT-detected → resource-bounded selection → IST allocated per selected CPU | ✅ on x86_64 |
 | Porting | riscv64 and aarch64 shared-probe/boot skeletons | In progress |
 
-**Kernel**: ~63,000 lines Zig | **User programs**: ~3,600 lines C/ASM | **Tests**: host unit tests + QEMU smoke gates
+> **2026-07-26 CPU-count-adaptive SMP**: `kernel/smp.zig` now reads the MADT at boot, selects as many
+> APs as task slots and kernel capacity allow (up to `MAX_CPUS = 256`, bounded by xAPIC u8 IDs), and
+> allocates 3×16 KiB IST backing only for selected CPUs. Dense logical IDs (0…N-1) are separated from
+> xAPIC hardware IDs. x2APIC/type-9 entries are unsupported and skipped. AP startup remains serialized.
+> Targeted TLB IPIs wait only for online CPUs. Smoke matrix verified: 1/2/3/4/6/8 cores pass by default;
+> 12/16-core runs pass with `MOQI_SMOKE_TIMEOUT=600` (TCG). 8-core 3-run stress passed. riscv64/aarch64
+> smoke pass. ReleaseFast builds pass. Run: `zig build smoke-smp-matrix` or
+> `MOQI_SMOKE_MATRIX_CPUS="1 2 4 8" zig build smoke-smp-matrix`.
+
+**Kernel**: ~63,000 lines Zig | **User programs**: ~3,600 lines C/ASM | **Tests**: host unit tests + QEMU smoke gates (`smoke`, `smoke-smp`, `smoke-smp-matrix`, `smoke-smp-stress`)
 
 ## Features
 

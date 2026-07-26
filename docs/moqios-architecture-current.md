@@ -108,9 +108,9 @@ ext2 多级目录读写删，QEMU 串口验证，零异常、零三重故障）�
 
 ### 已知限制 / 待办
 
-- ~~**SMP 启用中**~~（**已完成 2026-06-21**）：`smp.enable_ap_startup = true`，
-  AP 稳定上线并参与 timerTick；FPU/SSE 按任务、范围 TLB shootdown、
-  per-CPU 运行队列 + work-stealing **三件套均已完成**，用户任务可跨核迁移。详见 §1.9。
+- ~~**SMP 启用中**~~（**已完成 2026-06-21；CPU 数量自适应 2026-07-26**）：`smp.enable_ap_startup = true`，
+  AP 数量由 MADT 运行时探测后按资源限制筛选，不再限于双核。FPU/SSE 按任务、范围 TLB shootdown、
+  per-CPU 运行队列 + work-stealing **三件套均已完成**，用户任务可跨核迁移。详见 §1.6 自适应模型与 §1.9。
 - **用户指针缺页恢复**：已通过"访问前页表校验"避免内核崩溃，但仍非真正的 per-instruction
   缺页恢复（RIP fixup）。对 COW 只读页的内核态写入依赖缺页处理器支持。
 - ~~**ext2 多级目录写内存破坏**~~（**已修复**）：根因是 ext2 inode 越界与中断 stub 寄存器破坏
@@ -157,13 +157,28 @@ AP 冷 walk 才暴露。
    `setSlice(1)` 防调度间隙；TLB shootdown EOI 先于 CR3 reload；`sleepOn` 调用
    `forceReschedule` 与 futex/file_lock 阻塞模式统一。
 
-修复后实测：AP 稳定走完 `BCDEFGHIJ` 标记 → `[SMP] AP 1 initialized` → `[SMP] 2 CPUs online`，
-不再崩在 LAPIC 访问。
+修复后实测：AP 稳定走完 `BCDEFGHIJ` 标记 → `[SMP] AP 1 initialized` → `[SMP] N CPUs online`（N 由 MADT 探测后按资源限制筛选确定），
+不再崩在 LAPIC 访问。双核验证（`-smp 2`，`[SMP] 2 CPUs online`）是历史最初基线；当前 smoke-smp-matrix 已覆盖 1/2/3/4/6/8/12/16 核。
 
-### SMP 当前状态（2026-07，M8 x86_64 已完成）
+### SMP 当前状态（2026-07，M8 x86_64 已完成；自适应 CPU 数量 + 启动握手硬化，2026-07-27）
 
 历史阻塞点（TSS 错位、中断 stub 寄存器破坏、调度器全局状态）均已修复。**`enable_ap_startup=true`**，
-`-smp 2` 下 AP 稳定上线并参与 timerTick / 用户态调度。门禁：`zig build smoke` / `smoke-smp`。
+AP 数量由 MADT 运行时探测，不再硬编码为固定核数。门禁：`zig build smoke` / `smoke-smp` / `smoke-smp-matrix`。
+
+#### CPU 数量自适应模型（kernel/smp.zig `initX86`）
+
+启动时 `initX86` 按以下流程确定实际使用的 CPU 数量：
+
+1. **检测**：从 ACPI MADT type-0 条目读取 xAPIC ID（u8），得到 `acpi.info.cpu_count`（"N CPUs detected"）。仅处理 type-0/xAPIC 条目；type-9/x2APIC 条目当前不支持，自动跳过。
+2. **筛选**：在 `min(freeSlotCount+1, MAX_CPUS)` 限制内，从 MADT 顺序选取不超过任务槽/内核容量的 AP，得到 `configured_cpu_count`（"N CPUs selected"）。
+3. **IST 分配**：调用 `gdt.initFinalIst(configured_cpu_count)`，按选定 CPU 数量一次性分配 3×16 KiB IST 栈背衬。IST 内存开销随实际使用的核数线性扩展，而非按探测数量浪费。IST 分配失败则安全降为 BSP 独运。
+4. **AP 启动**：BSP 对每个 AP 串行发送 INIT+SIPI，通过双阶段邮箱令牌握手（见下节）逐一确认上线，得到 `cpu_count`（"N CPUs online"）。任务槽耗尽、内存不足或 AP 启动超时均安全缩减已上线 CPU 数。
+
+**逻辑 ID 与 xAPIC ID 分离**：内核内部用密集逻辑 ID（0…configured_cpu_count-1）索引所有 per-CPU 数组；xAPIC 硬件 ID 存储在 `selected_apic_ids[]`，仅用于 LAPIC IPI 寻址。两者不假定相等。
+
+**容量边界（硬件决定）**：元数据槽上限 `MAX_CPUS = 256`，因为 xAPIC ID 字段为 u8。超出此范围的逻辑 CPU ID 在 `apEntry` 入口处被静默 halt，不会破坏内核状态。
+
+**TLB IPI 精准等待**：`tlb.zig` shootdown 仅对 `isCpuOnline(id)` 为真的 CPU 发 IPI 并等待 ACK，不轮询未上线或已 halt 的 CPU。
 
 | 子里程碑 | 状态 | 说明 |
 |---|---|---|
@@ -179,11 +194,61 @@ AP 冷 walk 才暴露。
 | M8-5b-3 | ✅ | FPU/SSE 按任务 lazy save/restore via CR0.TS + #NM（2026-06-21）|
 | M8-6 | ✅ | 范围 TLB shootdown（`tlb.shootdownRange` + invlpg + 32 页 CR3 阈值回退）（2026-06-21）|
 | M8-7 | ✅ | per-CPU 运行队列 + work-stealing（`PerCpuRunQueue` 256 槽 LIFO + steal_half）（2026-06-21）|
+| M8-8 | ✅ | CPU 数量自适应：MADT 运行时探测 → 筛选 → IST 按选定数分配（2026-07-26）|
+| M8-9 | ✅ | 启动握手硬化：AP 邮箱令牌协议 + 延迟停车 + 有界 LAPIC ICR 轮询 + TLB generation dedup（2026-07-27）|
 
 详见 `docs/cross-arch-port-plan.md` M8 节。
 
 > 复现/诊断辅助：`tools/qemu_run.sh` 现支持 `MOQI_SERIAL`（串口目标）、`MOQI_SMP`（核数）、
 > `MOQI_EXTRA_QEMU`（如 `-d int,cpu_reset -D /tmp/qint.log`）三个环境变量覆盖。
+>
+> SMP 矩阵测试：`MOQI_SMOKE_MATRIX_CPUS="1 2 3 4 6 8"` 控制测试核数列表（默认值），
+> 16 核在 TCG 模式下需配合 `MOQI_SMOKE_TIMEOUT=600`。
+
+#### AP 启动握手硬化（2026-07-27，M8-9）
+
+文件：`kernel/smp.zig`
+
+以下描述的 request/grant 令牌协议取代了此前基于魔术值确认的单阶段上线方案，消除了延迟
+AP 与下一个 AP 共用同一逻辑 ID 的竞态，并为授权后失败建立了明确的致命路径。
+
+**邮箱令牌协议（双阶段 request/grant）**
+
+BSP 在 trampoline 数据区物理地址 `0x7080`（token）和 `0x7088`（ack）各写一个 u64，
+通过 release/acquire 原子访问跨 CPU 可见：
+
+1. BSP 向物理 `0x7080` 发布非零 `token`（bit 63 = 0，即不含 `AP_MAILBOX_PERMITTED`），
+   随后发送 INIT+SIPI。
+2. AP 在 `apEntry` 首指令读取 token：若为 0 或已含 `AP_MAILBOX_PERMITTED` 位则
+   调用 `parkUnrequestedAp()`（无限 `hlt`）——这是**授权前可降级停车**，不影响调度安全性。
+3. AP 将读到的 token 写入 ack（release），向 BSP 表明 "trampoline 到达"。
+4. BSP 发现 `ack == token` 后（或超时，见下），决定是否授权：
+   - **超时（授权前）**：写 `token→0` 撤销，取消对应 idle 任务，继续下一个 AP 或终止
+     bring-up。AP 若仍在等待期间读到 token 变 0，自行 `parkUnrequestedAp()`。
+   - **授权**：写 `token | AP_MAILBOX_PERMITTED` 到物理 `0x7080`（release）。此后该 AP
+     的逻辑 ID 已不可安全回收，任何后续超时均触发**致命停机**（见下）。
+5. AP 确认授权后完成全部初始化（GDT/IDT/per-CPU/LAPIC/GS base/idle 引导），最后写
+   `ack = token | AP_MAILBOX_PERMITTED`（release），向 BSP 报告完成。
+6. BSP 读到该最终 ack 后，原子递增 `cpu_count`，标记 `online_cpus[cpu_id] = true`。
+
+**有界 LAPIC ICR 轮询**
+
+两个等待阶段均以 500,000 次 `pause` 为上界，防止悬挂：
+- 阶段一（等 AP 报到）超时 → 授权前撤销，可降级。
+- 阶段二（等 AP 完成初始化）超时 → 调用 `failCommittedApStartup(cpu_id)`，
+  打印致命错误并 `cli`+`hlt` 停机以**保护调度器安全性**。这一区分是关键：
+  已授权的 AP 可能已修改内核状态，不能按授权前逻辑忽略或回收其 ID。
+
+**TLB generation dedup / 有界等待**（`kernel/arch/x86_64/tlb.zig`）
+
+- `completion` 计数器按实际在线 CPU 数精确播种（`@atomicRmw(.Sub, 1)` 递减，保证非零
+  decrement 语义）。
+- BSP 等待循环上界 `SHOOTDOWN_WAIT_POLL_LIMIT = 5_000_000`；若超时则视为缓存一致性
+  无法保证，调用 fatal halt——同类上界设计与授权后 AP 超时一致。
+- shootdown 仅对 `isCpuOnline(id)` 为真的 CPU 发 IPI，已停车或未上线的 CPU 不参与等待。
+
+**验证**：SMP=3/8/16 本地 smoke 通过；专项并发/安全 re-review 通过（见
+`docs/current-code-review-and-fix-plan.md` §5.2g）。
 
 ---
 
