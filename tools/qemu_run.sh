@@ -93,9 +93,9 @@ echo " MoQiOS — Launching QEMU"
 echo " Press Ctrl-A X to exit"
 
 # GDB debug support
-QEMU_DEBUG_FLAGS=""
+QEMU_DEBUG_FLAGS=()
 if [ "${MOQI_DEBUG:-}" = "1" ]; then
-    QEMU_DEBUG_FLAGS="-s -S"
+    QEMU_DEBUG_FLAGS=(-s -S)
     echo " GDB stub active on :1234"
     echo " Connect: gdb zig-out/bin/moqi-kernel.elf -ex 'target remote :1234'"
 fi
@@ -113,7 +113,17 @@ echo "========================================="
 SERIAL_TARGET="${MOQI_SERIAL:-stdio}"
 SMP_COUNT="${MOQI_SMP:-2}"
 DISK_IMAGE="${MOQI_DISK:-disk.img}"
-EXTRA_QEMU="${MOQI_EXTRA_QEMU:-}"
+EXTRA_QEMU_ARGS=()
+if [ -n "${MOQI_EXTRA_QEMU:-}" ]; then
+    # Split an explicitly documented space-delimited option string once; array
+    # expansion preserves each resulting argument and disables glob expansion.
+    read -r -a EXTRA_QEMU_ARGS <<< "$MOQI_EXTRA_QEMU"
+fi
+
+if ! [[ "$SMP_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: MOQI_SMP must be a positive decimal integer (got '$SMP_COUNT')."
+    exit 2
+fi
 
 # exec so callers that background this script get the QEMU PID (not a leftover shell).
 exec qemu-system-x86_64 \
@@ -130,4 +140,4 @@ exec qemu-system-x86_64 \
     -display none \
     -no-reboot \
     -no-shutdown \
-    ${QEMU_DEBUG_FLAGS} ${EXTRA_QEMU}
+    "${QEMU_DEBUG_FLAGS[@]}" "${EXTRA_QEMU_ARGS[@]}"

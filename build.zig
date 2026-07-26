@@ -40,15 +40,14 @@ fn addAsmUserProgram(b: *std.Build, name: []const u8) void {
 /// C user program: `.c` -> static freestanding ELF stored as `.bin`.
 fn addCUserProgram(b: *std.Build, name: []const u8) void {
     const elf = b.addSystemCommand(&.{
-        "zig",               "cc",
-        "-target",           "x86_64-freestanding-none",
-        "-static",           "-nostdlib",
-        "-ffreestanding",    "-O2",
+        "zig",            "cc",
+        "-target",        "x86_64-freestanding-none",
+        "-static",        "-nostdlib",
+        "-ffreestanding", "-O2",
         // C user images enter at _start without a CRT call frame. Realign the
         // stack so compiler-generated SSE locals remain safe at that entry.
-        "-mstackrealign",
-        "-Wl,--gc-sections", "-Wl,-z,norelro",
-        "-o",
+        "-mstackrealign", "-Wl,--gc-sections",
+        "-Wl,-z,norelro", "-o",
     });
     elf.addArg(b.fmt("user/{s}.bin", .{name}));
     elf.addFileArg(b.path(b.fmt("user/{s}.c", .{name})));
@@ -229,8 +228,8 @@ pub fn build(b: *std.Build) void {
         "hello9",  "hello10", "hello11", "hello12", "hello13", "hello14",
         "hello15", "hello16", "hello17", "hello18", "hello19", "hello20",
         "hello21", "hello22", "hello23", "hello24", "hello25", "hello26",
-        "hello27", "hello28", "hello29",
-        "hello30", "hello31", "hello32", "hello33", "hello34", "hello35", "hello36", "hello37",
+        "hello27", "hello28", "hello29", "hello30", "hello31", "hello32",
+        "hello33", "hello34", "hello35", "hello36", "hello37",
     };
     for (c_programs) |name| addCUserProgram(b, name);
 
@@ -252,7 +251,13 @@ pub fn build(b: *std.Build) void {
     smoke_smp_cmd.setEnvironmentVariable("MOQI_SMOKE_SKIP_BUILD", "1");
     smoke_smp_step.dependOn(&smoke_smp_cmd.step);
 
-    const smoke_smp_stress_step = b.step("smoke-smp-stress", "Run repeated dual-core QEMU smoke tests");
+    const smoke_smp_matrix_step = b.step("smoke-smp-matrix", "Run configurable x86 QEMU CPU-count smoke matrix");
+    const smoke_smp_matrix_cmd = b.addSystemCommand(&.{"./tools/qemu_smoke_matrix.sh"});
+    smoke_smp_matrix_cmd.step.dependOn(b.getInstallStep());
+    smoke_smp_matrix_cmd.setEnvironmentVariable("MOQI_SMOKE_SKIP_BUILD", "1");
+    smoke_smp_matrix_step.dependOn(&smoke_smp_matrix_cmd.step);
+
+    const smoke_smp_stress_step = b.step("smoke-smp-stress", "Run repeated configurable multicore QEMU smoke tests");
     const smoke_smp_stress_cmd = b.addSystemCommand(&.{"./tools/qemu_smoke_stress.sh"});
     smoke_smp_stress_cmd.step.dependOn(b.getInstallStep());
     smoke_smp_stress_cmd.setEnvironmentVariable("MOQI_SMOKE_SKIP_BUILD", "1");
