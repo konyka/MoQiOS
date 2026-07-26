@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_DIR"
 
-MATRIX_WORK_DIR="${MOQI_SMOKE_MATRIX_WORK_DIR:-$(mktemp -d "/tmp/moqios-smoke-matrix-XXXXXX")}" 
+MATRIX_WORK_DIR="${MOQI_SMOKE_MATRIX_WORK_DIR:-$(mktemp -d "/tmp/moqios-smoke-matrix-XXXXXX")}"
 MATRIX_COUNTS="${MOQI_SMOKE_MATRIX_CPUS:-1 2 3 4 6 8}"
 
 if [ -z "$MATRIX_COUNTS" ]; then
