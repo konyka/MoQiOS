@@ -2265,7 +2265,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             const bsize: u32 = @truncate(frame.r8);
             const result = ext2_mod.getXattr(inode_num, actual_name, &val_buf, @min(bsize, 4096));
             if (result > 0) {
-                _ = copy.copyToUser(@ptrFromInt(frame.r9), val_buf[0..@intCast(result)], @intCast(result));
+                if (copy.copyToUser(@ptrFromInt(frame.r9), val_buf[0..@intCast(result)], @intCast(result)) != @as(usize, @intCast(result))) {
+                    frame.rax = @bitCast(@as(i64, -14));
+                    return;
+                }
             }
             frame.rax = @bitCast(result);
         },
@@ -2291,7 +2294,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             const bsize: u32 = @truncate(frame.r8);
             const result = ext2_mod.listXattr(inode_num, &list_buf, @min(bsize, 4096));
             if (result > 0) {
-                _ = copy.copyToUser(@ptrFromInt(frame.r10), list_buf[0..@intCast(result)], @intCast(result));
+                if (copy.copyToUser(@ptrFromInt(frame.r10), list_buf[0..@intCast(result)], @intCast(result)) != @as(usize, @intCast(result))) {
+                    frame.rax = @bitCast(@as(i64, -14));
+                    return;
+                }
             }
             frame.rax = @bitCast(result);
         },
@@ -3003,7 +3009,7 @@ fn syscallNanosleep(req_ptr: u64, rem_ptr: u64) i64 {
     // Write zero remaining time (fully slept)
     if (rem_ptr != 0 and rem_ptr < 0x0000_8000_0000_0000) {
         var zero: [16]u8 = @splat(0);
-        _ = copy.copyToUser(@ptrFromInt(rem_ptr), &zero, 16);
+        if (copy.copyToUser(@ptrFromInt(rem_ptr), &zero, 16) != 16) return -14;
     }
     return 0;
 }
@@ -3263,8 +3269,7 @@ fn syscallGetrlimit(resource: u32, rlim_ptr: u64) i64 {
     var buf: [16]u8 = undefined;
     bo.writeU64Le(buf[0..8], rlim.rlim_cur);
     bo.writeU64Le(buf[8..16], rlim.rlim_max);
-    _ = copy.copyToUser(@ptrFromInt(rlim_ptr), &buf, 16);
-    return 0;
+    return if (copy.copyToUser(@ptrFromInt(rlim_ptr), &buf, 16) == 16) 0 else -14;
 }
 
 /// setrlimit(resource, rlim_ptr) — set resource limit.
@@ -3325,8 +3330,7 @@ fn syscallSysinfo(info_ptr: u64) i64 {
     // mem_unit = 1
     bo.writeU32Le(buf[80..84], 1);
 
-    _ = copy.copyToUser(@ptrFromInt(info_ptr), &buf, 128);
-    return 0;
+    return if (copy.copyToUser(@ptrFromInt(info_ptr), &buf, 128) == 128) 0 else -14;
 }
 
 /// prctl(option, arg2, arg3, arg4, arg5) — process control.
@@ -3354,8 +3358,7 @@ fn syscallPrctl(option: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) i64 {
         },
         16 => { // PR_GET_NAME
             if (arg2 == 0 or arg2 >= 0x0000_8000_0000_0000) return -14;
-            _ = copy.copyToUser(@ptrFromInt(arg2), cur.comm[0..16], 16);
-            return 0;
+            return if (copy.copyToUser(@ptrFromInt(arg2), cur.comm[0..16], 16) == 16) 0 else -14;
         },
         1 => { // PR_SET_PDEATHSIG — store signal to send on parent death
             cur.pdeathsig = @truncate(arg2);
@@ -3365,8 +3368,7 @@ fn syscallPrctl(option: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) i64 {
             if (arg2 == 0 or arg2 >= 0x0000_8000_0000_0000) return -14;
             var buf: [4]u8 = undefined;
             @memcpy(buf[0..4], @as(*[4]u8, @ptrCast(&cur.pdeathsig)));
-            _ = copy.copyToUser(@ptrFromInt(arg2), &buf, 4);
-            return 0;
+            return if (copy.copyToUser(@ptrFromInt(arg2), &buf, 4) == 4) 0 else -14;
         },
         else => return -22, // EINVAL
     }
@@ -3483,7 +3485,7 @@ fn syscallClockNanosleep(clockid: u32, flags: u32, req_ptr: u64, rem_ptr: u64) i
     // Write zero remaining time
     if (rem_ptr != 0 and rem_ptr < 0x0000_8000_0000_0000) {
         var zero: [16]u8 = @splat(0);
-        _ = copy.copyToUser(@ptrFromInt(rem_ptr), &zero, 16);
+        if (copy.copyToUser(@ptrFromInt(rem_ptr), &zero, 16) != 16) return -14;
     }
     return 0;
 }
@@ -3500,11 +3502,11 @@ fn syscallGetcpu(cpu_ptr: u64, node_ptr: u64) i64 {
         buf[1] = @truncate(cpu_id >> 8);
         buf[2] = @truncate(cpu_id >> 16);
         buf[3] = @truncate(cpu_id >> 24);
-        _ = copy.copyToUser(@ptrFromInt(cpu_ptr), &buf, 4);
+        if (copy.copyToUser(@ptrFromInt(cpu_ptr), &buf, 4) != 4) return -14;
     }
     if (node_ptr != 0 and node_ptr < 0x0000_8000_0000_0000) {
         var buf: [4]u8 = .{ 0, 0, 0, 0 }; // NUMA node 0
-        _ = copy.copyToUser(@ptrFromInt(node_ptr), &buf, 4);
+        if (copy.copyToUser(@ptrFromInt(node_ptr), &buf, 4) != 4) return -14;
     }
     return 0;
 }
@@ -3514,6 +3516,8 @@ fn syscallGetcpu(cpu_ptr: u64, node_ptr: u64) i64 {
 /// pipe2(pipefd_ptr, flags) — create pipe with O_CLOEXEC/O_NONBLOCK.
 fn syscallPipe2(pipefd_ptr: u64, flags: u32) i64 {
     if (pipefd_ptr == 0 or pipefd_ptr >= 0x0000_8000_0000_0000) return -14;
+    const copy = @import("../../mm/copy_from_user.zig");
+    if (!copy.validateUserBufferWritable(pipefd_ptr, 8)) return -14;
     const sched = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
     const cur_idx = sched.currentTaskIndex() orelse return -3;
@@ -3525,16 +3529,19 @@ fn syscallPipe2(pipefd_ptr: u64, flags: u32) i64 {
 
     const O_CLOEXEC: u32 = 0x80000;
     if (flags & O_CLOEXEC != 0) {
-        if (read_fd < 32) cur.fd_table.fds[read_fd].fd_flags = 1;
-        if (write_fd < 32) cur.fd_table.fds[write_fd].fd_flags = 1;
+        if (read_fd < vfs_mod.MAX_FDS) cur.fd_table.fds[read_fd].fd_flags = 1;
+        if (write_fd < vfs_mod.MAX_FDS) cur.fd_table.fds[write_fd].fd_flags = 1;
     }
 
-    const copy = @import("../../mm/copy_from_user.zig");
     const bo = @import("../../lib/byte_order.zig");
     var fds: [8]u8 = undefined;
     bo.writeU32Le(fds[0..4], read_fd);
     bo.writeU32Le(fds[4..8], write_fd);
-    _ = copy.copyToUser(@ptrFromInt(pipefd_ptr), &fds, 8);
+    if (copy.copyToUser(@ptrFromInt(pipefd_ptr), &fds, 8) != 8) {
+        _ = cur.fd_table.close(read_fd);
+        _ = cur.fd_table.close(write_fd);
+        return -14;
+    }
     return 0;
 }
 
@@ -3548,12 +3555,13 @@ fn syscallMincore(addr: u64, length: u64, vec_ptr: u64) i64 {
 
     const copy = @import("../../mm/copy_from_user.zig");
     const num_pages = (length + 4095) / 4096;
+    if (!copy.validateUserBufferWritable(vec_ptr, @intCast(num_pages))) return -14;
 
     // Write all-ones (all pages resident)
     var i: u64 = 0;
     while (i < num_pages) : (i += 1) {
         const byte: u8 = 1; // page resident
-        _ = copy.copyToUser(@ptrFromInt(vec_ptr + i), @as([*]const u8, @ptrCast(&byte))[0..1], 1);
+        if (copy.copyToUser(@ptrFromInt(vec_ptr + i), @as([*]const u8, @ptrCast(&byte))[0..1], 1) != 1) return -14;
     }
     return 0;
 }
@@ -3575,11 +3583,12 @@ fn initHostname() void {
 
 /// #263 wait4(pid, status, options, rusage) — waitpid with rusage (rusage ignored)
 fn syscallWait4(pid: u64, status_ptr: u64, options: u32, rusage_ptr: u64) i64 {
+    const copy = @import("../../mm/copy_from_user.zig");
+    if (rusage_ptr != 0 and !copy.validateUserBufferWritable(rusage_ptr, 144)) return -14;
     // Zero rusage if provided
-    if (rusage_ptr != 0 and rusage_ptr < 0x0000_8000_0000_0000) {
-        const copy = @import("../../mm/copy_from_user.zig");
+    if (rusage_ptr != 0) {
         var zero_buf: [144]u8 = .{0} ** 144; // struct rusage is ~144 bytes
-        _ = copy.copyToUser(@ptrFromInt(rusage_ptr), &zero_buf, 144);
+        if (copy.copyToUser(@ptrFromInt(rusage_ptr), &zero_buf, 144) != 144) return -14;
     }
 
     return waitpid_mod.waitpidWithOptions(pid, status_ptr, options);
@@ -3605,11 +3614,12 @@ fn syscallGethostname(name_ptr: u64, len: u32) i64 {
     if (kernel_hostname_len == 0) initHostname();
     const copy = @import("../../mm/copy_from_user.zig");
     const to_copy = @min(len, kernel_hostname_len);
-    _ = copy.copyToUser(@ptrFromInt(name_ptr), kernel_hostname[0..to_copy], to_copy);
+    if (!copy.validateUserBufferWritable(name_ptr, if (to_copy < len) to_copy + 1 else to_copy)) return -14;
+    if (copy.copyToUser(@ptrFromInt(name_ptr), kernel_hostname[0..to_copy], to_copy) != to_copy) return -14;
     // NUL-terminate if space
     if (to_copy < len) {
         const zero: u8 = 0;
-        _ = copy.copyToUser(@ptrFromInt(name_ptr + to_copy), @as([*]const u8, @ptrCast(&zero))[0..1], 1);
+        if (copy.copyToUser(@ptrFromInt(name_ptr + to_copy), @as([*]const u8, @ptrCast(&zero))[0..1], 1) != 1) return -14;
     }
     return 0;
 }
@@ -3632,12 +3642,13 @@ fn syscallGetdomainname(name_ptr: u64, len: u32) i64 {
     if (name_ptr == 0 or name_ptr >= 0x0000_8000_0000_0000) return -14;
     const copy = @import("../../mm/copy_from_user.zig");
     const to_copy = @min(len, kernel_domainname_len);
+    if (!copy.validateUserBufferWritable(name_ptr, if (to_copy < len) to_copy + 1 else to_copy)) return -14;
     if (to_copy > 0) {
-        _ = copy.copyToUser(@ptrFromInt(name_ptr), kernel_domainname[0..to_copy], to_copy);
+        if (copy.copyToUser(@ptrFromInt(name_ptr), kernel_domainname[0..to_copy], to_copy) != to_copy) return -14;
     }
     if (to_copy < len) {
         const zero: u8 = 0;
-        _ = copy.copyToUser(@ptrFromInt(name_ptr + to_copy), @as([*]const u8, @ptrCast(&zero))[0..1], 1);
+        if (copy.copyToUser(@ptrFromInt(name_ptr + to_copy), @as([*]const u8, @ptrCast(&zero))[0..1], 1) != 1) return -14;
     }
     return 0;
 }
@@ -3673,8 +3684,7 @@ fn syscallClockGetres(clockid: u32, res_ptr: u64) i64 {
     const nsec: u64 = 1; // 1 nanosecond resolution
     @memcpy(ts[0..8], @as([*]const u8, @ptrCast(&sec))[0..8]);
     @memcpy(ts[8..16], @as([*]const u8, @ptrCast(&nsec))[0..8]);
-    _ = copy.copyToUser(@ptrFromInt(res_ptr), &ts, 16);
-    return 0;
+    return if (copy.copyToUser(@ptrFromInt(res_ptr), &ts, 16) == 16) 0 else -14;
 }
 
 /// #273 sched_setaffinity(pid, cpusetsize, mask) — store CPU affinity mask
@@ -3783,8 +3793,7 @@ fn writeStatfsBuf(buf_ptr: u64) i64 {
     @memcpy(buf[64..72], @as([*]const u8, @ptrCast(&f_namelen))[0..8]);
     @memcpy(buf[72..80], @as([*]const u8, @ptrCast(&f_frsize))[0..8]);
     @memcpy(buf[80..88], @as([*]const u8, @ptrCast(&f_flags))[0..8]);
-    _ = copy.copyToUser(@ptrFromInt(buf_ptr), &buf, 120);
-    return 0;
+    return if (copy.copyToUser(@ptrFromInt(buf_ptr), &buf, 120) == 120) 0 else -14;
 }
 
 /// #278 syslog(type, buf, len) — kernel log control
@@ -3891,7 +3900,7 @@ fn syscallPrlimit64(pid: u32, resource: u32, new_limit_ptr: u64, old_limit_ptr: 
         var buf: [16]u8 = undefined;
         bo.writeU64Le(buf[0..8], rlim.rlim_cur);
         bo.writeU64Le(buf[8..16], rlim.rlim_max);
-        _ = copy.copyToUser(@ptrFromInt(old_limit_ptr), &buf, 16);
+        if (copy.copyToUser(@ptrFromInt(old_limit_ptr), &buf, 16) != 16) return -14;
     }
 
     // Accept new limit (validation only — enforcement is a future enhancement)
@@ -4016,7 +4025,11 @@ fn syscallMemfdCreate(name_ptr: u64, flags: u32) i64 {
     };
     // allocPipe sets ref_count=2 (for read+write ends), but memfd is a single fd.
     // Reduce ref_count to 1 since we only hold one reference.
-    vfs_mod.pipes[pipe_idx].ref_count = 1;
+    if (!vfs_mod.pipeMakeSingleEnded(pipe_idx)) {
+        vfs_mod.pipeClose(pipe_idx);
+        t.fd_table.freeFd(fd_slot);
+        return -5;
+    }
     t.fd_table.fds[fd_slot] = .{
         .fd_type = .pipe_read,
         .pipe_idx = pipe_idx,
@@ -4060,13 +4073,13 @@ fn syscallGetRobustList(pid: u32, head_ptr: u64, len_ptr: u64) i64 {
     // Write head pointer
     var hbuf: [8]u8 = undefined;
     bo.writeU64Le(hbuf[0..8], target.robust_list_head);
-    _ = copy.copyToUser(@ptrFromInt(head_ptr), hbuf[0..], 8);
+    if (copy.copyToUser(@ptrFromInt(head_ptr), hbuf[0..], 8) != 8) return -14;
 
     // Write len (sizeof(struct robust_list_head) = 24 on x86_64)
     var lbuf: [8]u8 = undefined;
     const list_len: u64 = if (target.robust_list_len > 0) @intCast(target.robust_list_len) else 24;
     bo.writeU64Le(lbuf[0..8], list_len);
-    _ = copy.copyToUser(@ptrFromInt(len_ptr), lbuf[0..], 8);
+    if (copy.copyToUser(@ptrFromInt(len_ptr), lbuf[0..], 8) != 8) return -14;
 
     return 0;
 }
@@ -4276,12 +4289,12 @@ fn syscallNameToHandleAt(dirfd: u32, path_ptr: u64, handle_ptr: u64, mount_id_pt
     bo.writeU32Le(hbuf[0..4], 8); // handle_bytes
     bo.writeU32Le(hbuf[4..8], 1); // handle_type (EXT4=1)
     bo.writeU64Le(hbuf[8..16], hash);
-    _ = copy.copyToUser(@ptrFromInt(handle_ptr), hbuf[0..], 16);
+    if (copy.copyToUser(@ptrFromInt(handle_ptr), hbuf[0..], 16) != 16) return -14;
 
     // Write mount_id = 0
     if (mount_id_ptr != 0 and mount_id_ptr < 0x0000_8000_0000_0000) {
         var mid: [4]u8 = .{ 0, 0, 0, 0 };
-        _ = copy.copyToUser(@ptrFromInt(mount_id_ptr), mid[0..], 4);
+        if (copy.copyToUser(@ptrFromInt(mount_id_ptr), mid[0..], 4) != 4) return -14;
     }
     return 0;
 }
@@ -5008,12 +5021,10 @@ fn syscallGetrusage(who: u32, usage_ptr: u64) i64 {
     var buf: [144]u8 = @splat(0);
 
     const cur_idx = sched.currentTaskIndex() orelse {
-        _ = copy.copyToUser(@ptrFromInt(usage_ptr), &buf, 144);
-        return 0;
+        return if (copy.copyToUser(@ptrFromInt(usage_ptr), &buf, 144) == 144) 0 else -14;
     };
     const cur = tm.getTask(cur_idx) orelse {
-        _ = copy.copyToUser(@ptrFromInt(usage_ptr), &buf, 144);
-        return 0;
+        return if (copy.copyToUser(@ptrFromInt(usage_ptr), &buf, 144) == 144) 0 else -14;
     };
 
     // Use TSC nanos for total uptime as user+sys time split
@@ -5042,8 +5053,7 @@ fn syscallGetrusage(who: u32, usage_ptr: u64) i64 {
     const maxrss_kb: u64 = total_pages * 4; // 4KB pages to KB
     @memcpy(buf[32..40], &@as([8]u8, @bitCast(maxrss_kb)));
 
-    _ = copy.copyToUser(@ptrFromInt(usage_ptr), &buf, 144);
-    return 0;
+    return if (copy.copyToUser(@ptrFromInt(usage_ptr), &buf, 144) == 144) 0 else -14;
 }
 
 /// dup(oldfd) — duplicate file descriptor, returns lowest available fd.
@@ -5102,12 +5112,10 @@ fn syscallGetitimer(which: u32, curr_value_ptr: u64) i64 {
 
     var buf: [32]u8 = @splat(0);
     const cur_idx = sched.currentTaskIndex() orelse {
-        _ = copy.copyToUser(@ptrFromInt(curr_value_ptr), &buf, 32);
-        return 0;
+        return if (copy.copyToUser(@ptrFromInt(curr_value_ptr), &buf, 32) == 32) 0 else -14;
     };
     const cur = tm.getTask(cur_idx) orelse {
-        _ = copy.copyToUser(@ptrFromInt(curr_value_ptr), &buf, 32);
-        return 0;
+        return if (copy.copyToUser(@ptrFromInt(curr_value_ptr), &buf, 32) == 32) 0 else -14;
     };
 
     if (which == 0) {
@@ -5130,8 +5138,7 @@ fn syscallGetitimer(which: u32, curr_value_ptr: u64) i64 {
     }
     // ITIMER_VIRTUAL/PROF: return zeros (not tracked per-task)
 
-    _ = copy.copyToUser(@ptrFromInt(curr_value_ptr), &buf, 32);
-    return 0;
+    return if (copy.copyToUser(@ptrFromInt(curr_value_ptr), &buf, 32) == 32) 0 else -14;
 }
 
 /// setitimer(which, new_value, old_value) — set interval timer.
@@ -5206,6 +5213,5 @@ fn syscallCachestat(fd: u32, range_ptr: u64, stat_ptr: u64, flags: u32) i64 {
     bo.writeU64Le(buf[24..32], stats.misses); // nr_evicted (approximate)
     bo.writeU64Le(buf[32..40], 0); // nr_recently_evicted
     _ = range_ptr; // range ignored — return global stats
-    _ = copy.copyToUser(@ptrFromInt(stat_ptr), &buf, 40);
-    return 0;
+    return if (copy.copyToUser(@ptrFromInt(stat_ptr), &buf, 40) == 40) 0 else -14;
 }

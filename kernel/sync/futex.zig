@@ -367,8 +367,7 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
                 // Lock available — set TID
                 var new_buf: [4]u8 = undefined;
                 bo.writeU32Le(&new_buf, tid);
-                _ = copy.copyToUser(@ptrFromInt(addr), &new_buf, 4);
-                return 0;
+                return if (copy.copyToUser(@ptrFromInt(addr), &new_buf, 4) == 4) 0 else -14;
             }
             if (cur_val == tid) return 0; // Already locked by us
 
@@ -390,7 +389,7 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
             if (retry_val == 0) {
                 var new_buf: [4]u8 = undefined;
                 bo.writeU32Le(&new_buf, tid);
-                _ = copy.copyToUser(@ptrFromInt(addr), &new_buf, 4);
+                if (copy.copyToUser(@ptrFromInt(addr), &new_buf, 4) != 4) return -14;
             }
             // v53.44: Clean up node if not granted (prevents UAF)
             if (!node.granted) {
@@ -403,7 +402,7 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
             // Set futex word to 0, wake one waiter
             var new_buf: [4]u8 = undefined;
             bo.writeU32Le(&new_buf, 0);
-            _ = copy.copyToUser(@ptrFromInt(addr), &new_buf, 4);
+            if (copy.copyToUser(@ptrFromInt(addr), &new_buf, 4) != 4) return -14;
             const woken = wakeN(bucket, 1);
             return @intCast(woken);
         },
@@ -418,8 +417,7 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
             if (cur_val == 0 or cur_val == cur_task.tid) {
                 var new_buf: [4]u8 = undefined;
                 bo.writeU32Le(&new_buf, cur_task.tid);
-                _ = copy.copyToUser(@ptrFromInt(addr), &new_buf, 4);
-                return 0;
+                return if (copy.copyToUser(@ptrFromInt(addr), &new_buf, 4) == 4) 0 else -14;
             }
             return -11; // -EAGAIN: lock held
         },

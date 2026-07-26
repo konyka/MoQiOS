@@ -149,6 +149,7 @@ pub fn timerSettime(timerid: u32, flags: u32, new_value_ptr: u64, old_value_ptr:
     }
     const new_val: *const Itimerspec = @ptrCast(@alignCast(&new_buf));
 
+    if (old_value_ptr != 0 and !copy.validateUserBufferWritable(old_value_ptr, @sizeOf(Itimerspec))) return EFAULT;
     const saved = lock.acquire();
 
     const t = &timers[timerid];
@@ -158,7 +159,7 @@ pub fn timerSettime(timerid: u32, flags: u32, new_value_ptr: u64, old_value_ptr:
     }
 
     // Save old value if requested
-    if (old_value_ptr != 0 and old_value_ptr < 0x0000_8000_0000_0000) {
+    if (old_value_ptr != 0) {
         var old_val: Itimerspec = .{
             .it_interval = .{ .tv_sec = 0, .tv_nsec = 0 },
             .it_value = .{ .tv_sec = 0, .tv_nsec = 0 },
@@ -173,7 +174,10 @@ pub fn timerSettime(timerid: u32, flags: u32, new_value_ptr: u64, old_value_ptr:
         }
         var old_buf: [@sizeOf(Itimerspec)]u8 = undefined;
         @memcpy(&old_buf, @as([*]const u8, @ptrCast(&old_val))[0..@sizeOf(Itimerspec)]);
-        _ = copy.copyToUser(@ptrFromInt(old_value_ptr), &old_buf, @sizeOf(Itimerspec));
+        if (copy.copyToUser(@ptrFromInt(old_value_ptr), &old_buf, @sizeOf(Itimerspec)) != @sizeOf(Itimerspec)) {
+            lock.release(saved);
+            return EFAULT;
+        }
     }
 
     // Set interval

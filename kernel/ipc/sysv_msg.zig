@@ -294,11 +294,11 @@ pub fn msgctl(msqid: u32, cmd: i32, buf: u64) i64 {
                 @intCast(q.mode),
                 if (q.marked_removed) @as(u64, 1) else 0,
             };
-            _ = copy.copyToUser(
+            if (copy.copyToUser(
                 @ptrFromInt(buf),
                 @as([*]const u8, @ptrCast(&info))[0..@sizeOf([6]u64)],
                 @sizeOf([6]u64),
-            );
+            ) != @sizeOf([6]u64)) return EFAULT;
             return 0;
         },
         IPC_RMID => {

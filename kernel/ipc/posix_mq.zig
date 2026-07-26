@@ -7,6 +7,7 @@ const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const fmt = @import("../lib/fmt.zig");
 const str = @import("../lib/str.zig");
 const bo = @import("../lib/byte_order.zig");
+const copy = @import("../mm/copy_from_user.zig");
 
 const MAX_QUEUES: u32 = 16;
 const MAX_MSGS: u32 = 8;
@@ -78,7 +79,6 @@ const Timespec = extern struct {
 /// Returns 0 if timeout_ptr is NULL or invalid (caller should treat as no timeout).
 fn readAbsTimeout(timeout_ptr: u64) u64 {
     if (timeout_ptr == 0 or timeout_ptr >= 0x0000_8000_0000_0000) return 0;
-    const copy = @import("../mm/copy_from_user.zig");
     var ts_buf: [@sizeOf(Timespec)]u8 = undefined;
     if (copy.copyFromUser(&ts_buf, @ptrFromInt(timeout_ptr), @sizeOf(Timespec)) != @sizeOf(Timespec)) {
         return 0;
@@ -161,7 +161,6 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
 
     // Read optional attributes
     if (attr_ptr != 0 and attr_ptr < 0x0000_8000_0000_0000) {
-        const copy = @import("../mm/copy_from_user.zig");
         var attr_buf: [8]u8 = undefined;
         if (copy.copyFromUser(&attr_buf, @ptrFromInt(attr_ptr), 8) == 8) {
             const mq_maxmsg: u32 = @as(u32, attr_buf[0]) | (@as(u32, attr_buf[1]) << 8) |
@@ -216,7 +215,6 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
     // Read timeout before acquiring lock
     const abs_timeout_ns = readAbsTimeout(timeout_ptr);
 
-    const copy = @import("../mm/copy_from_user.zig");
 
     // Try to send, with timeout-based retry if queue is full
     while (true) {
@@ -275,10 +273,10 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
 /// mq_timedreceive(mqd, msg_ptr, msg_len, msg_prio, abs_timeout) -> bytes or -errno
 /// rdi=mqd, rsi=msg_ptr, rdx=msg_len, r10=msg_prio, r8=abs_timeout
 pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeout_ptr: u64) i64 {
+    if (prio_ptr != 0 and !copy.validateUserBufferWritable(prio_ptr, 4)) return EFAULT;
     // Read timeout before acquiring lock
     const abs_timeout_ns = readAbsTimeout(timeout_ptr);
 
-    const copy = @import("../mm/copy_from_user.zig");
 
     // Try to receive, with timeout-based retry if queue is empty
     while (true) {
@@ -320,13 +318,16 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
         }
 
         // Write priority if requested
-        if (prio_ptr != 0 and prio_ptr < 0x0000_8000_0000_0000) {
+        if (prio_ptr != 0) {
             var prio_buf: [4]u8 = undefined;
             prio_buf[0] = @intCast(msg.priority & 0xFF);
             prio_buf[1] = @intCast((msg.priority >> 8) & 0xFF);
             prio_buf[2] = @intCast((msg.priority >> 16) & 0xFF);
             prio_buf[3] = @intCast((msg.priority >> 24) & 0xFF);
-            _ = copy.copyToUser(@ptrFromInt(prio_ptr), &prio_buf, 4);
+            if (copy.copyToUser(@ptrFromInt(prio_ptr), &prio_buf, 4) != 4) {
+                mq_lock.release(flags);
+                return EFAULT;
+            }
         }
 
         const result_len: i64 = @intCast(out_len);
@@ -369,26 +370,25 @@ pub fn mqNotify(mqd: u32, notif_ptr: u64) i64 {
 /// mq_getsetattr(mqd, newattr, oldattr) -> 0 or -errno
 /// rdi=mqd, rsi=newattr, rdx=oldattr
 pub fn mqGetSetAttr(mqd: u32, newattr_ptr: u64, oldattr_ptr: u64) i64 {
+    if (oldattr_ptr != 0 and !copy.validateUserBufferWritable(oldattr_ptr, 16)) return EFAULT;
     const flags = mq_lock.acquire();
     defer mq_lock.release(flags);
 
     const q = findByFd(mqd) orelse return EBADF;
 
     // Write old attributes if requested
-    if (oldattr_ptr != 0 and oldattr_ptr < 0x0000_8000_0000_0000) {
-        const copy = @import("../mm/copy_from_user.zig");
+    if (oldattr_ptr != 0) {
         var attr_buf: [16]u8 = @splat(0);
         // mq_flags (4 bytes) + mq_maxmsg (4 bytes) + mq_msgsize (4 bytes) + mq_curmsgs (4 bytes)
         bo.writeU32Le(attr_buf[0..4], q.flags);
         bo.writeU32Le(attr_buf[4..8], q.max_msg);
         bo.writeU32Le(attr_buf[8..12], q.msg_size);
         bo.writeU32Le(attr_buf[12..16], q.count);
-        _ = copy.copyToUser(@ptrFromInt(oldattr_ptr), &attr_buf, 16);
+        if (copy.copyToUser(@ptrFromInt(oldattr_ptr), &attr_buf, 16) != 16) return EFAULT;
     }
 
     // Read new attributes if provided
     if (newattr_ptr != 0 and newattr_ptr < 0x0000_8000_0000_0000) {
-        const copy = @import("../mm/copy_from_user.zig");
         var attr_buf: [16]u8 = undefined;
         if (copy.copyFromUser(&attr_buf, @ptrFromInt(newattr_ptr), 16) == 16) {
             const new_flags = bo.readU32Le(attr_buf[0..4]);
@@ -419,7 +419,6 @@ fn allocFd() i32 {
 
 fn readUserString(user_ptr: u64, buf: []u8) usize {
     if (user_ptr == 0 or user_ptr >= 0x0000_8000_0000_0000) return 0;
-    const copy = @import("../mm/copy_from_user.zig");
     const max_len = buf.len;
     var len: usize = 0;
     while (len < max_len) : (len += 1) {

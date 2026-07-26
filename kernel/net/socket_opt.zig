@@ -302,14 +302,14 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
     // Write value to user space (truncated if user buffer too small)
     const to_copy = @min(val_len, user_optlen);
     if (to_copy > 0) {
-        _ = copy_mod.copyToUser(@ptrFromInt(optval_ptr), val_buf[0..to_copy], to_copy);
+        if (copy_mod.copyToUser(@ptrFromInt(optval_ptr), val_buf[0..to_copy], to_copy) != to_copy) return -14;
     }
 
     // Write actual length back to optlen_ptr
     if (optlen_ptr != 0 and optlen_ptr < 0x0000_8000_0000_0000) {
         var len_out: [4]u8 = undefined;
         bo.writeU32Le(&len_out, val_len);
-        _ = copy_mod.copyToUser(@ptrFromInt(optlen_ptr), &len_out, 4);
+        if (copy_mod.copyToUser(@ptrFromInt(optlen_ptr), &len_out, 4) != 4) return -14;
     }
 
     return 0;

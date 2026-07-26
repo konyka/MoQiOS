@@ -281,7 +281,7 @@ pub fn shmctl(shmid: u32, cmd: i32, buf: u64) i64 {
                 @intCast(seg.shmid),
                 if (seg.marked_removed) @as(u64, 1) else 0,
             };
-            _ = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&info))[0..@sizeOf([6]u64)], @sizeOf([6]u64));
+            if (copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&info))[0..@sizeOf([6]u64)], @sizeOf([6]u64)) != @sizeOf([6]u64)) return -14;
             return 0;
         },
         IPC_RMID => {
