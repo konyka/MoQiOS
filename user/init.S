@@ -721,6 +721,29 @@ _start:
     movq $13, %rdx
     syscall
 
+    # Spawn hello36 (copy-vs-munmap race)
+    movq $5, %rax
+    leaq hello36_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn36_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done36_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
     # Spawn hello9 (fork test)
     movq $5, %rax
     leaq hello9_name(%rip), %rdi
@@ -1003,6 +1026,13 @@ done23_msg:
     .ascii "spawned hello35\n"
     done35_msg:
     .ascii "hello35 done\n"
+    hello36_name:
+    .ascii "hello36"
+    .byte 0
+    spawn36_msg:
+    .ascii "spawned hello36\n"
+    done36_msg:
+    .ascii "hello36 done\n"
     hello26_name:
     .ascii "hello26"
     .byte 0

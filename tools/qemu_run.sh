@@ -7,8 +7,9 @@ cd "$PROJECT_DIR"
 
 KERNEL="zig-out/bin/moqi-kernel.elf"
 LIMINE_DIR="limine"
-ISO_DIR="iso_root"
-ISO_FILE="moqios.iso"
+ISO_DIR="${MOQI_ISO_DIR:-iso_root}"
+ISO_FILE="${MOQI_ISO_FILE:-moqios.iso}"
+USER_BIN_DIR="${MOQI_USER_BIN_DIR:-user_bin}"
 
 # Check kernel exists
 if [ ! -f "$KERNEL" ]; then
@@ -39,7 +40,6 @@ mkdir -p "$ISO_DIR/EFI/BOOT"
 cp "$KERNEL" "$ISO_DIR/boot/moqi-kernel.elf"
 cp limine.conf "$ISO_DIR/boot/limine/"
 
-USER_BIN_DIR="user_bin"
 rm -rf "$USER_BIN_DIR"
 mkdir -p "$USER_BIN_DIR"
 
@@ -48,7 +48,7 @@ USER_PROGRAMS=(
     hello2 hello3 hello4 hello5 hello6 hello7 hello8 sh
     hello9 hello10 hello11 hello12 hello13 hello14 hello15 hello16
     hello17 hello18 hello19 hello20 hello21 hello22 hello23 hello24
-    hello25 hello26 hello27 hello28 hello29 hello30 hello31 hello32 hello33 hello34 hello35
+    hello25 hello26 hello27 hello28 hello29 hello30 hello31 hello32 hello33 hello34 hello35 hello36
 )
 for program in "${USER_PROGRAMS[@]}"; do
     if [ -f "user/${program}.bin" ]; then
@@ -57,7 +57,7 @@ for program in "${USER_PROGRAMS[@]}"; do
         echo "WARNING: user/init.bin not found, building anyway..."
     fi
 done
-if [ -d "$USER_BIN_DIR" ] && [ "$(ls -A $USER_BIN_DIR)" ]; then
+if [ -d "$USER_BIN_DIR" ] && [ "$(ls -A "$USER_BIN_DIR")" ]; then
     ./tools/mkramdisk.sh "$USER_BIN_DIR" "$ISO_DIR/boot/ramdisk.bin"
 else
     echo "WARNING: No user programs to package"
@@ -106,6 +106,9 @@ echo "========================================="
 #   MOQI_SERIAL      serial target (default: stdio; e.g. file:/tmp/serial.log)
 #   MOQI_SMP         number of CPUs (default: 2)
 #   MOQI_DISK        raw disk image path (default: disk.img)
+#   MOQI_ISO_DIR     ISO staging directory (default: iso_root)
+#   MOQI_ISO_FILE    generated ISO path (default: moqios.iso)
+#   MOQI_USER_BIN_DIR ramdisk input directory (default: user_bin)
 #   MOQI_EXTRA_QEMU  extra QEMU args (e.g. "-d int,cpu_reset -D /tmp/qint.log")
 SERIAL_TARGET="${MOQI_SERIAL:-stdio}"
 SMP_COUNT="${MOQI_SMP:-2}"

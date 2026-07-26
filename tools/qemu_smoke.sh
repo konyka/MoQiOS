@@ -18,6 +18,10 @@ TIMEOUT_SECONDS="${MOQI_SMOKE_TIMEOUT:-120}"
 LOG_FILE="${MOQI_SMOKE_LOG:-/tmp/moqios-smoke-smp${SMP_COUNT}.log}"
 RUN_LOG="${MOQI_SMOKE_RUN_LOG:-/tmp/moqios-smoke-smp${SMP_COUNT}.run.log}"
 SMOKE_DISK="${MOQI_SMOKE_DISK:-/tmp/moqios-smoke-smp${SMP_COUNT}.disk.img}"
+PACKAGE_DIR="${MOQI_SMOKE_PACKAGE_DIR:-/tmp/moqios-smoke-smp${SMP_COUNT}-$$}"
+SMOKE_ISO_DIR="$PACKAGE_DIR/iso_root"
+SMOKE_ISO_FILE="$PACKAGE_DIR/moqios.iso"
+SMOKE_USER_BIN_DIR="$PACKAGE_DIR/user_bin"
 
 if ! command -v qemu-system-x86_64 &>/dev/null; then
     echo "ERROR: qemu-system-x86_64 not found."
@@ -38,11 +42,16 @@ if [ ! -f disk.img ]; then
 fi
 
 rm -f "$LOG_FILE" "$RUN_LOG" "$SMOKE_DISK"
+rm -rf "$PACKAGE_DIR"
+mkdir -p "$PACKAGE_DIR"
 cp --reflink=auto disk.img "$SMOKE_DISK"
 
 MOQI_SMP="$SMP_COUNT" \
 MOQI_SERIAL="file:$LOG_FILE" \
 MOQI_DISK="$SMOKE_DISK" \
+MOQI_ISO_DIR="$SMOKE_ISO_DIR" \
+MOQI_ISO_FILE="$SMOKE_ISO_FILE" \
+MOQI_USER_BIN_DIR="$SMOKE_USER_BIN_DIR" \
 ./tools/qemu_run.sh >"$RUN_LOG" 2>&1 &
 QEMU_PID=$!
 
@@ -59,6 +68,7 @@ cleanup() {
         wait "$QEMU_PID" 2>/dev/null || true
     fi
     rm -f "$SMOKE_DISK"
+    rm -rf "$PACKAGE_DIR"
 }
 trap cleanup EXIT
 
@@ -81,6 +91,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
        grep -q "hello33: PASS" "$LOG_FILE" &&
        grep -q "hello34: PASS" "$LOG_FILE" &&
        grep -q "hello35: PASS" "$LOG_FILE" &&
+       grep -q "hello36: PASS" "$LOG_FILE" &&
        grep -q "MoQiOS shell" "$LOG_FILE"; then
         # A healthy run faults nothing and panics nowhere. Checking the markers
         # alone is not enough: a kernel bug can kill an unrelated task while
@@ -106,7 +117,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for smoke markers."
-echo "Expected serial markers: 'hello21 done', 'hello29: PASS', 'hello29: fsync PASS', 'hello30: brk/mmap PASS', 'hello31: TLS PASS', 'hello33: PASS', 'hello34: PASS', 'hello35: PASS' and 'MoQiOS shell'."
+echo "Expected serial markers: 'hello21 done', 'hello29: PASS', 'hello29: fsync PASS', 'hello30: brk/mmap PASS', 'hello31: TLS PASS', 'hello33: PASS', 'hello34: PASS', 'hello35: PASS', 'hello36: PASS' and 'MoQiOS shell'."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1
