@@ -264,6 +264,13 @@ const Task = struct {
   （warm cache hint）。
 - **调度入口 `pickNext` 三段式回退**：① 本地 `pop` → ② `tryStealForCurrent` 跨核
   窃取 → ③ 全局位图回退（`task.pickReadyForCpu`，与亲和性扫描兼容）。
+- **③ 是安全网，不能当作发现新任务的正常途径（2026-07-26）**：每次上下文切换都会把换下来的
+  任务重新入队，因此只要 CPU 上有两个任务来回 ping-pong，①就永远有货，③永远走不到。任务
+  必须**显式发布**才可能被调度：`createUserProcess` 建出的任务处于 `.blocked`，由创建者在
+  构造完毕后调用 `task.publishRunnable(slot)`（`.blocked → .ready` + `sched.enqueue` +
+  跨 CPU kick）。fork、clone、loader 的 ELF/flat 两条路径都走这一步。此前四处都没有入队，
+  新任务只在 CPU 恰好跑空时才被捡起；fork 靠父进程随即阻塞在 waitpid 掩盖了这一点，线程
+  创建者不阻塞，缺陷即刻显形。
 - 时间片 10 个 tick（100ms），LAPIC timer ISR 触发 `schedule()`，调用
   `switchContext(prev, next)`（`arch/x86_64/context.S`）。
 
@@ -395,6 +402,15 @@ TLS，常见路径只是一次比较，不付 `wrmsr` 的代价。riscv64/aarch6
 
 运行期验证：`user/hello31.c`。父子进程各自指向自己的 TLS 块、写入不同值，在对方运行过之后再读回，
 `hello31: TLS PASS` 与 `hello31: child TLS ok` 均为 x86_64 冒烟必需标记。
+
+**用户态线程真正可用（2026-07-26）**
+
+在此之前 `CLONE_VM` 只有内核侧代码，用户态从未创建过线程；第一个线程示例 `user/hello35.c`
+一写出来就暴露了调度器的任务发布缺陷：`clone` 返回子 TID，子线程却永不被调度（详见
+`current-code-review-and-fix-plan.md` 5.2r）。修复后 `hello35` 在 mmap 出的栈上启动线程、
+由线程写共享变量、创建者读到 42，`hello35: PASS` 已是 x86_64 冒烟必需标记。
+
+`clone` 现在还会设置 `child.saved_user_rsp`（取新栈顶），与 fork 对齐。
 
 ### 2.6 poll() I/O多路复用 (TCP/管道/文件) ✅
 

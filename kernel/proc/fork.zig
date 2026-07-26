@@ -132,6 +132,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
 
     child.saved_rsp = child_frame_addr;
     child.started = true;
+    task_mod.publishRunnable(child_idx);
 
     serial.writeString("[fork] parent=");
     fmt.writeDecimal64(parent.tid);

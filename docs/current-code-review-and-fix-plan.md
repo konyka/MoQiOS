@@ -1125,6 +1125,58 @@ user-space `clone` thread support.
 | `zig build smoke-smp-stress` | Passed | 5 consecutive dual-core runs. |
 | `bash tools/qemu_smoke_riscv64.sh` / `_aarch64.sh` | Passed | Unaffected; neither port has this fault path. |
 
+### 5.2r Review Update: 2026-07-26 (a task nobody enqueues is a task that may never run)
+
+5.2q closed by saying the next step was user-space threading, so the TOCTOU window could finally be raced
+deterministically. Writing that example (`user/hello35.c`) went wrong immediately: `clone` returned a child
+TID, the child never executed a single user instruction, and if the creator waited for it with `sched_yield`
+the whole machine went silent. The fault turned out not to be in `clone` at all.
+
+`pickNext()` drains the per-CPU run queue first and only falls back to the bitmap scan (`pickReadyForCpu`)
+when that queue comes up empty. Every context switch re-enqueues the outgoing task, so on a CPU with two
+tasks ping-ponging the queue never empties and the fallback never runs. None of the four task-creation sites
+— fork, clone, and the loader's ELF and flat paths — ever called `sched.enqueue`. A new task was therefore
+discovered only if its CPU happened to run dry.
+
+fork got away with it because a parent normally blocks in `waitpid` right afterwards: it stops being
+re-enqueued, the queue drains, and the bitmap scan picks the child up. A thread creator does not block, by
+definition, so the luck ran out. The same starvation applies to a forked parent that keeps running instead of
+waiting, which makes this a task-creation bug rather than a clone-specific one.
+
+| Severity | Finding | Resolution / status |
+|---|---|---|
+| P0 | A newly created task is never placed on any run queue; on a busy CPU it starves indefinitely | Fixed. `createUserProcess` now leaves the task `.blocked`; new `task.publishRunnable(slot)` does `.blocked → .ready` + `sched.enqueue` + cross-CPU kick, called from all four creation sites once the task is actually complete. |
+| P1 | `createUserProcess` published `.ready` before fork/clone had built the child's interrupt frame | Fixed by the same change. Another CPU's bitmap scan could previously catch the task with `started == false` and enter it through `setupInitialFrame` at the ELF entry, re-running the program from the top instead of resuming at the fork return. The window is gone now that publication happens after construction. |
+| P2 | `clone` never set `child.saved_user_rsp`, unlike fork | Fixed; seeded from the new thread's stack top. |
+
+Worth recording about the diagnosis, because it cost three rounds: `zig build smoke 2>&1 >/dev/null`
+swallowed a compile error (`serial` was not in scope at the point I added a probe to `sched.zig`), and the
+smoke log path carries no run identity, so the greps that followed were reading the *previous* run's log.
+That produced a confident and entirely wrong conclusion that the scheduler never switched to the child. Never
+discard build output, and confirm a log belongs to the run being analysed.
+
+Verification: three-architecture builds, `zig build test`, `smoke` / `smoke-smp` / `smoke-smp-stress`, and the
+riscv64 and aarch64 smokes all pass. hello35 reports `PASS (thread ran and shares memory)` and its marker is
+now a smoke condition. Negative control: removing just the `sched.enqueue` call from `publishRunnable` puts
+the machine straight back into the 123-second hang.
+
+No SK probe was added. This is scheduler state-machine behaviour, not a pure function that can be recomputed
+across architectures; hello35 is its regression test. Inventing a probe that cannot fail would be worse than
+having none, which is the same reasoning that cancelled SK-152.
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds. |
+| `zig build test` | Passed | Host helper tests. |
+| `zig build smoke` / `smoke-smp` | Passed | Single and dual core, with hello35 as a new gating marker. |
+| `zig build smoke-smp-stress` | Passed | Repeated dual-core runs. |
+| `bash tools/qemu_smoke_riscv64.sh` / `_aarch64.sh` | Passed | Shared-probe smokes unaffected. |
+
+Still open. The TOCTOU window from 5.2q is untouched: this round produced the threading primitive it needs but
+spent itself on the scheduler bug that surfaced along the way. With `hello35` in place a two-thread
+munmap-versus-copy race is now writable, which is the next step. The eighty `_ = copyToUser(...)` sites remain
+as recorded in 5.2q.
+
 ### 5.3 Historical Verification
 
 Executed on 2026-06-21:

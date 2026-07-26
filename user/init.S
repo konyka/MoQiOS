@@ -698,6 +698,29 @@ _start:
     movq $13, %rdx
     syscall
 
+    # Spawn hello35 (CLONE_VM thread test)
+    movq $5, %rax
+    leaq hello35_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn35_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done35_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
     # Spawn hello9 (fork test)
     movq $5, %rax
     leaq hello9_name(%rip), %rdi
@@ -973,6 +996,13 @@ done23_msg:
     .ascii "spawned hello34\n"
     done34_msg:
     .ascii "hello34 done\n"
+    hello35_name:
+    .ascii "hello35"
+    .byte 0
+    spawn35_msg:
+    .ascii "spawned hello35\n"
+    done35_msg:
+    .ascii "hello35 done\n"
     hello26_name:
     .ascii "hello26"
     .byte 0

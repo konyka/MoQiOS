@@ -789,7 +789,12 @@ pub fn createUserProcess(
         zeroSlot(slot);
         tasks[slot].self_idx = slot;
         tasks[slot].tid = tid;
-        tasks[slot].state = .ready;
+        // Not runnable yet. fork/clone still have to build the child's
+        // interrupt frame, and the loader still has to set up brk; a picker
+        // that grabbed the task now would run it with `started == false` and
+        // enter it at the ELF entry instead of the fork return. The caller
+        // hands it to the scheduler with publishRunnable() when it is ready.
+        tasks[slot].state = .blocked;
         tasks[slot].priority = 1;
         tasks[slot].kernel_stack = stack_virt;
         tasks[slot].kernel_stack_top = stack_top;
@@ -861,6 +866,30 @@ pub fn kickChildCpus(parent_tid: u32, parent_cpu: u8) void {
 }
 
 /// After a user task is published ready, kick its remote affinity CPU.
+/// Hand a freshly created task to the scheduler.
+///
+/// Marking a task `.ready` is not enough to get it run. `pickNext` drains the
+/// per-CPU run queue first and only falls back to the bitmap scan when that
+/// queue comes up empty — and every context switch re-enqueues the outgoing
+/// task, so on a busy CPU the queue never empties. Nothing enqueued new tasks,
+/// so a task nobody put in a queue was only ever discovered when the CPU
+/// happened to run dry. fork survived on that: the parent normally blocks in
+/// waitpid straight after, which drains the queue. A parent that keeps running
+/// — a thread creator, say — starved its child indefinitely.
+pub fn publishRunnable(slot: u32) void {
+    const t = getTask(slot) orelse return;
+    {
+        const flags = task_lock.acquire();
+        defer task_lock.release(flags);
+        if (t.state != .blocked) return;
+        t.state = .ready;
+    }
+    asm volatile ("" ::: .{ .memory = true });
+    const sched = @import("sched.zig");
+    sched.enqueue(t);
+    kickRemoteForTask(slot);
+}
+
 pub fn kickRemoteForTask(slot: u32) void {
     const t = getTask(slot) orelse return;
     const sched = @import("sched.zig");

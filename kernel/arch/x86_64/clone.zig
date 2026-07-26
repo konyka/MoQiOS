@@ -260,6 +260,11 @@ pub fn clone(
     // the scheduler install it.
     child.tls_base = if (flags & CLONE_SETTLS != 0) tls else parent.tls_base;
 
+    // A thread's creator keeps running by definition, so unlike fork this path
+    // cannot rely on the run queue draining to get the child noticed.
+    child.saved_user_rsp = child_frame.rsp;
+    task_mod.publishRunnable(child_idx);
+
     _ = parent_tid_ptr;
     _ = child_tid_ptr;
 
@@ -270,6 +275,5 @@ pub fn clone(
     if (flags & CLONE_VM != 0) serial.writeString(" VM");
     if (flags & CLONE_THREAD != 0) serial.writeString(" THREAD");
     serial.writeString("\n");
-
     return @intCast(child.tid);
 }

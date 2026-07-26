@@ -2627,6 +2627,44 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   本轮未做,因为该内核的用户态尚无可用的线程示例(`hello31` 用的是 fork),这条竞态无法
   确定性演示——**不提交无法验证的修复**。补齐用户态 `clone` 线程支持后再动。
 
+### 3.162 新建任务从未入队:忙碌 CPU 上的新任务无限饥饿（2026-07-26）
+
+上一轮结尾说"下一步补齐用户态线程,以便确定性演示 TOCTOU"。动手写这个线程示例
+(`user/hello35.c`)时,线程根本跑不起来——`clone` 返回了子 TID,子线程却一行用户代码都没执行,
+而且只要创建者用 `sched_yield` 等它,**整机停止输出**。追下去发现的不是 clone 的问题,是调度
+器的:
+
+- **根因**:`pickNext()` 先从每 CPU 运行队列取任务,只有队列**排空**时才回退到位图扫描
+  (`pickReadyForCpu`)。而每次上下文切换都会把换下来的任务重新入队。于是只要 CPU 上有两个
+  任务来回 ping-pong,队列就永不为空,位图这条回退路径永远走不到。**四个任务创建点
+  (fork、clone、loader 的 ELF 与 flat 两处)没有一个调用 `sched.enqueue`**,新任务因此只有
+  在 CPU 恰好跑空时才会被发现。
+- **为什么 fork 一直没暴露**:fork 后父进程通常立刻阻塞在 `waitpid`,自己不再被重新入队,
+  队列随之排空,子进程靠位图回退被捡起来。**线程创建者按定义不会阻塞**,这条运气就断了。
+  同理,一个 fork 完继续跑而不 wait 的父进程,子进程同样会饿死——这不是 clone 专属缺陷。
+- **定位过程**(记下来是因为中间踩了坑):先打点发现直连调用 `pickReadyForCpu(0,null)` 能
+  返回子任务下标 3,真实调度路径却在 0 和 2 之间循环。有三次构建其实**失败**了
+  (`sched.zig` 里 `serial` 不在作用域),而 `zig build smoke 2>&1 >/dev/null` 把错误吞掉,
+  我读到的是上一次留下的旧日志,据此得出过"从未切换"的错误结论。教训:**构建输出不能丢,
+  日志文件不带运行标识时要先确认它是本次产物**。
+- **方案**:任务"可运行"这件事必须显式发布,而不是靠别人恰好扫到。
+  - `createUserProcess` 建出的任务落在 `.blocked`,**不是** `.ready`;
+  - 新增 `task.publishRunnable(slot)`:`.blocked → .ready` + `sched.enqueue` + 跨 CPU kick;
+  - 四个创建点各自在**任务真正构造完毕之后**调用它——fork/clone 在中断帧建好、
+    `started = true` 之后,loader 在 `brk` 设好之后。
+- **顺带关掉一个 SMP 竞态窗口**:原先 `createUserProcess` 一返回任务就是 `.ready`,而此时
+  fork/clone 还没建中断帧、`started` 仍是 `false`。另一个 CPU 的位图扫描若在这个窗口里选中
+  它,会走 `setupInitialFrame` 把子进程**从 ELF 入口重新执行一遍**,而不是从 fork 返回点继续。
+  改成"构造完再发布"后,这个窗口不复存在。此前它只是因为回退路径极少触发才没被撞上。
+- **另外**:`clone` 没有像 fork 那样设置 `child.saved_user_rsp`(fork 显式赋值),一并补上,
+  取新线程栈顶。
+- **验证**:三架构构建 + `zig build test` + `smoke`/`smoke-smp`/`smoke-smp-stress` +
+  riscv64/aarch64 smoke 全绿。`hello35` 输出 `PASS (thread ran and shares memory)`,其 PASS
+  标记已纳入 x86 冒烟通过条件。反向对照:仅去掉 `publishRunnable` 里的 `sched.enqueue`,
+  hello35 立刻回到整机挂死、123 秒超时。
+- **未做探针**:本次修的是调度器状态机行为,不是可跨架构复算的纯函数,`hello35` 就是它的
+  回归测试。不为凑数造一个恒真的 SK 探针(与此前取消 SK-152 同一原则)。
+
 ---
 
 ## 4. M8 进度（x86_64 SMP）
