@@ -96,6 +96,5 @@ pub fn uname(buf_ptr: u64) i64 {
         offset += 65;
     }
 
-    _ = copy.copyToUser(@ptrFromInt(buf_ptr), &ubuf, 390);
-    return 0;
+    return if (copy.copyToUser(@ptrFromInt(buf_ptr), &ubuf, ubuf.len) == ubuf.len) 0 else -14;
 }

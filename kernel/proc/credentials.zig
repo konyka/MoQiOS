@@ -83,15 +83,10 @@ pub fn setresuid(ruid: u32, euid: u32, suid: u32) i64 {
 /// getresuid(ruid*, euid*, suid*)
 pub fn getresuid118(ruid_ptr: u64, euid_ptr: u64, suid_ptr: u64) i64 {
     const t = getCurrentTask() orelse return -1;
-    if (ruid_ptr != 0 and ruid_ptr < 0x0000_8000_0000_0000) {
-        _ = copy.copyToUser(@ptrFromInt(ruid_ptr), @as([*]const u8, @ptrCast(&t.uid))[0..4], 4);
-    }
-    if (euid_ptr != 0 and euid_ptr < 0x0000_8000_0000_0000) {
-        _ = copy.copyToUser(@ptrFromInt(euid_ptr), @as([*]const u8, @ptrCast(&t.euid))[0..4], 4);
-    }
-    if (suid_ptr != 0 and suid_ptr < 0x0000_8000_0000_0000) {
-        _ = copy.copyToUser(@ptrFromInt(suid_ptr), @as([*]const u8, @ptrCast(&t.suid))[0..4], 4);
-    }
+    if (ruid_ptr == 0 or euid_ptr == 0 or suid_ptr == 0) return -14;
+    if (copy.copyToUser(@ptrFromInt(ruid_ptr), @as([*]const u8, @ptrCast(&t.uid))[0..4], 4) != 4) return -14;
+    if (copy.copyToUser(@ptrFromInt(euid_ptr), @as([*]const u8, @ptrCast(&t.euid))[0..4], 4) != 4) return -14;
+    if (copy.copyToUser(@ptrFromInt(suid_ptr), @as([*]const u8, @ptrCast(&t.suid))[0..4], 4) != 4) return -14;
     return 0;
 }
 
@@ -112,14 +107,9 @@ pub fn setresgid(rgid: u32, egid: u32, sgid: u32) i64 {
 /// getresgid(rgid*, egid*, sgid*)
 pub fn getresgid120(rgid_ptr: u64, egid_ptr: u64, sgid_ptr: u64) i64 {
     const t = getCurrentTask() orelse return -1;
-    if (rgid_ptr != 0 and rgid_ptr < 0x0000_8000_0000_0000) {
-        _ = copy.copyToUser(@ptrFromInt(rgid_ptr), @as([*]const u8, @ptrCast(&t.gid))[0..4], 4);
-    }
-    if (egid_ptr != 0 and egid_ptr < 0x0000_8000_0000_0000) {
-        _ = copy.copyToUser(@ptrFromInt(egid_ptr), @as([*]const u8, @ptrCast(&t.egid))[0..4], 4);
-    }
-    if (sgid_ptr != 0 and sgid_ptr < 0x0000_8000_0000_0000) {
-        _ = copy.copyToUser(@ptrFromInt(sgid_ptr), @as([*]const u8, @ptrCast(&t.sgid))[0..4], 4);
-    }
+    if (rgid_ptr == 0 or egid_ptr == 0 or sgid_ptr == 0) return -14;
+    if (copy.copyToUser(@ptrFromInt(rgid_ptr), @as([*]const u8, @ptrCast(&t.gid))[0..4], 4) != 4) return -14;
+    if (copy.copyToUser(@ptrFromInt(egid_ptr), @as([*]const u8, @ptrCast(&t.egid))[0..4], 4) != 4) return -14;
+    if (copy.copyToUser(@ptrFromInt(sgid_ptr), @as([*]const u8, @ptrCast(&t.sgid))[0..4], 4) != 4) return -14;
     return 0;
 }

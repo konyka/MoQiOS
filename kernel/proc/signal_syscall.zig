@@ -21,23 +21,26 @@ pub fn sigaction(signum: u32, act_ptr: u64, oldact_ptr: u64) i64 {
     const current = sched.currentTask() orelse return -1;
     const old_handler = current.signal_handlers[signum - 1];
 
+    // Validate the optional output before changing the installed action.
+    if (oldact_ptr != 0 and !copy.validateUserBufferWritable(oldact_ptr, 28)) return -14;
+    if (act_ptr != 0 and !copy.validateUserBuffer(act_ptr, 28)) return -14;
+
     // Return old action if requested
-    if (oldact_ptr != 0 and oldact_ptr < 0x0000_8000_0000_0000) {
+    if (oldact_ptr != 0) {
         var old_buf: [28]u8 = undefined;
         @memset(&old_buf, 0);
         const handler_bytes: [*]const u8 = @ptrCast(&old_handler);
         @memcpy(old_buf[0..8], handler_bytes[0..8]);
-        _ = copy.copyToUser(@ptrFromInt(oldact_ptr), &old_buf, 28);
+        if (copy.copyToUser(@ptrFromInt(oldact_ptr), &old_buf, 28) != 28) return -14;
     }
 
     // Set new action if provided
-    if (act_ptr != 0 and act_ptr < 0x0000_8000_0000_0000) {
+    if (act_ptr != 0) {
         var act_buf: [28]u8 = undefined;
         const copied = copy.copyFromUser(&act_buf, @ptrFromInt(act_ptr), 28);
-        if (copied >= 8) {
-            const new_handler: u64 = @bitCast(act_buf[0..8].*);
-            current.signal_handlers[signum - 1] = new_handler;
-        }
+        if (copied != 28) return -14;
+        const new_handler: u64 = @bitCast(act_buf[0..8].*);
+        current.signal_handlers[signum - 1] = new_handler;
     }
 
     return 0;
@@ -48,14 +51,14 @@ pub fn sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64) i64 {
     const current = sched.currentTask() orelse return -1;
     const old_mask = current.signal_mask;
 
-    if (oldset_ptr != 0 and oldset_ptr < 0x0000_8000_0000_0000) {
-        _ = copy.copyToUser(@ptrFromInt(oldset_ptr), @as([*]const u8, @ptrCast(&old_mask))[0..4], 4);
-    }
+    if (oldset_ptr != 0 and !copy.validateUserBufferWritable(oldset_ptr, 4)) return -14;
+    if (set_ptr != 0 and !copy.validateUserBuffer(set_ptr, 4)) return -14;
+    if (oldset_ptr != 0 and copy.copyToUser(@ptrFromInt(oldset_ptr), @as([*]const u8, @ptrCast(&old_mask))[0..4], 4) != 4) return -14;
 
-    if (set_ptr != 0 and set_ptr < 0x0000_8000_0000_0000) {
+    if (set_ptr != 0) {
         var new_set: u32 = 0;
         const new_set_bytes: [*]u8 = @ptrCast(&new_set);
-        _ = copy.copyFromUser(new_set_bytes[0..4], @ptrFromInt(set_ptr), 4);
+        if (copy.copyFromUser(new_set_bytes[0..4], @ptrFromInt(set_ptr), 4) != 4) return -14;
 
         const sigkill_mask = @as(u32, 1) << 8;
         const sigstop_mask = @as(u32, 1) << 18;
@@ -157,8 +160,10 @@ pub fn sigaltstack(ss_ptr: u64, old_ss_ptr: u64) i64 {
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
+    if (old_ss_ptr != 0 and !copy.validateUserBufferWritable(old_ss_ptr, 24)) return -14;
+    if (ss_ptr != 0 and !copy.validateUserBuffer(ss_ptr, 24)) return -14;
     // Return old sigaltstack if requested
-    if (old_ss_ptr != 0 and old_ss_ptr < 0x0000_8000_0000_0000) {
+    if (old_ss_ptr != 0) {
         var old_ss: [24]u8 = undefined;
         @memset(&old_ss, 0);
         const sp: u64 = cur.sigaltstack_base;
@@ -167,12 +172,12 @@ pub fn sigaltstack(ss_ptr: u64, old_ss_ptr: u64) i64 {
         bo.writeU64Le(old_ss[0..8], sp);
         bo.writeU32Le(old_ss[8..12], flags);
         bo.writeU64Le(old_ss[16..24], sz);
-        _ = copy.copyToUser(@ptrFromInt(old_ss_ptr), &old_ss, 24);
+        if (copy.copyToUser(@ptrFromInt(old_ss_ptr), &old_ss, 24) != 24) return -14;
     }
     // Set new sigaltstack if requested
-    if (ss_ptr != 0 and ss_ptr < 0x0000_8000_0000_0000) {
+    if (ss_ptr != 0) {
         var ss_buf: [24]u8 = undefined;
-        _ = copy.copyFromUser(ss_buf[0..], @ptrFromInt(ss_ptr), 24);
+        if (copy.copyFromUser(ss_buf[0..], @ptrFromInt(ss_ptr), 24) != 24) return -14;
         const sp: u64 = bo.readU64Le(ss_buf[0..8]);
         const sz: u64 = bo.readU64Le(ss_buf[16..24]);
         cur.sigaltstack_base = sp;
@@ -187,10 +192,12 @@ pub fn rtSigpending(set_ptr: u64, sigsetsize: u64) i64 {
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    if (set_ptr != 0 and set_ptr < 0x0000_8000_0000_0000) {
+    if (set_ptr != 0) {
         const pending: u64 = @intCast(cur.pending_signals);
         const bytes: [*]const u8 = @ptrCast(&pending);
-        _ = copy.copyToUser(@ptrFromInt(set_ptr), bytes[0..8], 8);
+        if (copy.copyToUser(@ptrFromInt(set_ptr), bytes[0..8], 8) != 8) return -14;
+    } else {
+        return -14;
     }
     return 0;
 }

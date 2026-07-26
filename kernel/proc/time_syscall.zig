@@ -34,7 +34,7 @@ pub fn gettimeofday(tv_ptr: u64) i64 {
     const usec_i64: i64 = @intCast(usec);
     bo.writeI64Le(tv_bytes[8..16], usec_i64);
 
-    _ = copy.copyToUser(@ptrFromInt(tv_ptr), tv_bytes[0..16], 16);
+    if (copy.copyToUser(@ptrFromInt(tv_ptr), tv_bytes[0..16], 16) != 16) return -14;
     return 0;
 }
 
@@ -51,6 +51,6 @@ pub fn clock_gettime(tp_ptr: u64) i64 {
     const nsec_i64: i64 = @intCast(nsec);
     bo.writeI64Le(ts_bytes[8..16], nsec_i64);
 
-    _ = copy.copyToUser(@ptrFromInt(tp_ptr), ts_bytes[0..16], 16);
+    if (copy.copyToUser(@ptrFromInt(tp_ptr), ts_bytes[0..16], 16) != 16) return -14;
     return 0;
 }

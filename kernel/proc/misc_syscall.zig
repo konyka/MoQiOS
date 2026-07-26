@@ -14,8 +14,7 @@ pub fn schedGetaffinity(cpusetsize: u64, mask_ptr: u64) i64 {
     @memset(&mask, 0);
     mask[0] = 1; // CPU 0 set
     const to_copy: usize = @intCast(@min(cpusetsize, 128));
-    _ = copy.copyToUser(@ptrFromInt(mask_ptr), &mask, to_copy);
-    return @intCast(to_copy);
+    return if (copy.copyToUser(@ptrFromInt(mask_ptr), &mask, to_copy) == to_copy) @intCast(to_copy) else -14;
 }
 
 /// getcomm(buf_ptr, size) -> bytes copied or -errno.
@@ -25,8 +24,7 @@ pub fn getcomm(buf_ptr: u64, size: u64) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
     const to_copy: usize = @intCast(@min(size, 16));
-    _ = copy.copyToUser(@ptrFromInt(buf_ptr), cur.comm[0..to_copy], to_copy);
-    return @intCast(to_copy);
+    return if (copy.copyToUser(@ptrFromInt(buf_ptr), cur.comm[0..to_copy], to_copy) == to_copy) @intCast(to_copy) else -14;
 }
 
 /// closefrom(lowfd) -> 0 or -errno.
@@ -47,11 +45,13 @@ pub fn closefrom(lowfd: u32) i64 {
 /// move_pages(pid, count, pages, nodes, status_ptr, flags) -> 0.
 /// Move process pages to NUMA nodes. Stub: writes 0 for all status entries.
 pub fn movePages(count: u64, status_ptr: u64) i64 {
+    const capped = @min(count, 4096);
+    if (capped > 0 and !copy.validateUserBufferWritable(status_ptr, @intCast(capped * 4))) return -14;
     if (status_ptr != 0 and status_ptr < 0x0000_8000_0000_0000 and count > 0) {
         const zero: i32 = 0;
         var i: u64 = 0;
         while (i < count and i < 4096) : (i += 1) {
-            _ = copy.copyToUser(@ptrFromInt(status_ptr + i * 4), @as([*]const u8, @ptrCast(&zero))[0..4], 4);
+            if (copy.copyToUser(@ptrFromInt(status_ptr + i * 4), @as([*]const u8, @ptrCast(&zero))[0..4], 4) != 4) return -14;
         }
     }
     return 0;

@@ -23,12 +23,13 @@ pub fn waitpidWithOptions(pid_raw: u64, status_ptr: u64, options: u32) i64 {
         @intCast(pid_raw);
 
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
+    if (status_ptr != 0 and !copy.validateUserBufferWritable(status_ptr, 4)) return -14;
 
     if (!task_mod.hasChildren(cur_idx)) return -10; // -ECHILD
 
     var exit_code: i32 = 0;
     if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {
-        writeStatus(status_ptr, exit_code);
+        if (!writeStatus(status_ptr, exit_code)) return -14;
         return child_tid;
     }
 
@@ -51,7 +52,7 @@ pub fn waitpidWithOptions(pid_raw: u64, status_ptr: u64, options: u32) i64 {
     // good.
     if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {
         parent.waiting_for_child = false;
-        writeStatus(status_ptr, exit_code);
+        if (!writeStatus(status_ptr, exit_code)) return -14;
         return child_tid;
     }
     se.syncUserRspToTask(parent);
@@ -70,15 +71,16 @@ pub fn waitpidWithOptions(pid_raw: u64, status_ptr: u64, options: u32) i64 {
 
     // Woken up — a child has exited. Now reap it.
     if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {
-        writeStatus(status_ptr, exit_code);
+        if (!writeStatus(status_ptr, exit_code)) return -14;
         return child_tid;
     } else {
         return 0; // Spurious wakeup
     }
 }
 
-fn writeStatus(status_ptr: u64, exit_code: i32) void {
-    if (status_ptr == 0 or status_ptr >= 0x0000_8000_0000_0000) return;
+fn writeStatus(status_ptr: u64, exit_code: i32) bool {
+    if (status_ptr == 0) return true;
+    if (status_ptr >= 0x0000_8000_0000_0000) return false;
     const src: [*]const u8 = @ptrCast(&exit_code);
-    _ = copy.copyToUser(@ptrFromInt(status_ptr), src[0..4], 4);
+    return copy.copyToUser(@ptrFromInt(status_ptr), src[0..4], 4) == 4;
 }

@@ -44,9 +44,10 @@ pub fn getenv(key_ptr: u64, val_ptr: u64, val_max: u64) i64 {
 
             if (val_ptr != 0 and val_ptr < 0x0000_8000_0000_0000 and val_max > 0) {
                 const to_copy = @min(val_len, val_max - 1);
-                _ = copy.copyToUser(@ptrFromInt(val_ptr), entry[val_start .. val_start + to_copy], to_copy);
+                if (!copy.validateUserBufferWritable(val_ptr, to_copy + 1)) return -14;
+                if (copy.copyToUser(@ptrFromInt(val_ptr), entry[val_start .. val_start + to_copy], to_copy) != to_copy) return -14;
                 const zero: u8 = 0;
-                _ = copy.copyToUser(@ptrFromInt(val_ptr + to_copy), @as([*]const u8, @ptrCast(&zero))[0..1], 1);
+                if (copy.copyToUser(@ptrFromInt(val_ptr + to_copy), @as([*]const u8, @ptrCast(&zero))[0..1], 1) != 1) return -14;
             }
             return @intCast(val_len);
         }
@@ -58,6 +59,7 @@ pub fn getenv(key_ptr: u64, val_ptr: u64, val_max: u64) i64 {
 /// pipe(pipefd_ptr) → 0 or -1
 pub fn pipe(pipefd_ptr: u64) i64 {
     if (pipefd_ptr == 0 or pipefd_ptr >= 0x0000_8000_0000_0000) return -1;
+    if (!copy.validateUserBufferWritable(pipefd_ptr, 8)) return -14;
 
     if (sched_mod.currentTaskIndex()) |cur_idx| {
         if (task_mod.getTask(cur_idx)) |cur| {
@@ -70,7 +72,11 @@ pub fn pipe(pipefd_ptr: u64) i64 {
             bo.writeU32Le(pipefd_bytes[0..4], read_fd);
             bo.writeU32Le(pipefd_bytes[4..8], write_fd);
 
-            _ = copy.copyToUser(@ptrFromInt(pipefd_ptr), pipefd_bytes[0..8], 8);
+            if (copy.copyToUser(@ptrFromInt(pipefd_ptr), pipefd_bytes[0..8], 8) != 8) {
+                _ = cur.fd_table.close(read_fd);
+                _ = cur.fd_table.close(write_fd);
+                return -14;
+            }
             return 0;
         }
     }
