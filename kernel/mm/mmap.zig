@@ -34,8 +34,43 @@ pub fn unmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
     tlb_mod.shootdownRange(base, @intCast(num_pages));
 }
 
+/// Whether adding a disjoint range can be represented without dropping metadata.
+fn canTrackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64) bool {
+    for (task.mmap_regions) |r| {
+        if (!r.active) return true;
+        if (r.base + r.num_pages * user_space.PAGE_SIZE == base or
+            base + num_pages * user_space.PAGE_SIZE == r.base) return true;
+    }
+    return false;
+}
+
+/// Check the metadata capacity for MAP_FIXED before destroying old mappings.
+fn canTrackReplacement(task: *task_mod.Task, base: u64, num_pages: u64) bool {
+    const page = user_space.PAGE_SIZE;
+    const end = base + num_pages * page;
+    var pieces: usize = 0;
+    for (task.mmap_regions) |r| {
+        if (!r.active) continue;
+        const r_end = r.base + r.num_pages * page;
+        if (r.base >= end or r_end <= base) {
+            pieces += 1;
+            continue;
+        }
+        if (r.base < base) {
+            pieces += 1;
+        }
+        if (r_end > end) {
+            pieces += 1;
+        }
+    }
+    // This is intentionally conservative: trackMmapRegion may merge an
+    // adjacent piece, but reserving the unmerged upper bound keeps MAP_FIXED
+    // from destroying mappings before discovering an unrepresentable layout.
+    return pieces + 1 <= task.mmap_regions.len;
+}
+
 /// Track an mmap region in the task's mmap_regions table.
-pub fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64) void {
+fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64) void {
     // Try to merge with an adjacent existing region
     for (&task.mmap_regions) |*r| {
         if (r.active and r.base + r.num_pages * 4096 == base) {
@@ -56,7 +91,7 @@ pub fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64) void {
             return;
         }
     }
-    // Table full — region leaked (will be freed on process exit via destroyUserSpace)
+    unreachable; // Capacity is checked before any pages are mapped.
 }
 
 fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
@@ -264,6 +299,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
         base = addr_hint / user_space.PAGE_SIZE * user_space.PAGE_SIZE;
         if (base < user_space.PAGE_SIZE) return -22; // EINVAL
         if (num_pages > (user_space.USER_ADDR_MAX - base) / user_space.PAGE_SIZE) return -12; // ENOMEM
+        if (!canTrackReplacement(cur, base, num_pages)) return -12;
         // MAP_FIXED replaces whatever is there, so drop the old pages first.
         unmapRange(cur, base, num_pages);
         untrackMmapRange(cur, base, num_pages);
@@ -288,6 +324,8 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
                 return -12; // ENOMEM
         }
     }
+
+    if (!is_fixed and !canTrackMmapRegion(cur, base, num_pages)) return -12;
 
     // Allocate and map pages
     const writable = (prot & 2) != 0;
