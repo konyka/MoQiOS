@@ -1214,6 +1214,45 @@ not a mandatory partial count, so scheduling variance cannot make otherwise-corr
 | `zig build -Darch=aarch64 smoke-aarch64` | Passed | Existing non-x86 guarded/prevalidated path unaffected. |
 | `nm -n zig-out/bin/moqi-kernel.elf` | Passed | Dedicated copy, fault instruction, and fixup symbols emitted at distinct addresses. |
 
+### 5.2t Review Update: 2026-07-26 (output contracts, mmap metadata, and SMP pipes)
+
+This pass started as a full-repository audit. Seven internal/external specialist sessions and the Oracle
+synthesis session failed before inspection because their backend returned `Invalid token`; those failures are
+not counted as clean reviews. The filesystem fallback completed on a second model, and every reported issue
+below was then checked against current source rather than accepted from the report. Several older plan items
+were explicitly rejected as stale: non-fixed mmap overlap, brk overlap, `syncFile` error propagation,
+`mprotect`, ext2 directory validation, and x86 user-copy fixup are already implemented at current HEAD.
+
+| Severity | Finding | Resolution / status |
+|---|---|---|
+| P0 | `io_getevents` advanced its completion ring even when the event could not be copied to userspace, permanently losing completion records | Fixed. The head/count advance occurs only after a full `IoEvent` copy; a first-copy failure returns `EFAULT`, while a later failure returns the already delivered count and leaves the failed event queued. |
+| P1 | Output syscalls across fs, proc, IPC, networking, timers, futex helpers, and the legacy x86 dispatcher reported success after a failed or partial `copyToUser` | Fixed. Every previously discarded result now requires the full byte count. Irreversible operations (`io_getevents`, message receive, wait, pipe creation, offset-bearing transfers) validate writable output before consuming state and still check the final copy as a race backstop. |
+| P1 | `copy_file_range` and splice/sendfile offset pointers were copied back best-effort after data movement | Fixed. Optional offset pointers are proven readable and writable before transfer, so `EFAULT` happens before any I/O side effect; copy-back remains length-checked as a race backstop. |
+| P1 | The 65th disjoint mmap was mapped successfully but omitted from the fixed 64-entry region table, making later region operations unable to find it | Fixed. Non-fixed mappings reserve either a free slot or an adjacency merge before allocating pages. MAP_FIXED uses a conservative post-replacement piece count before destroying old mappings and returns `ENOMEM` if the layout cannot be represented. |
+| P1 | Global pipe ring indices, contents, allocation, reset, and refcounts were mutated concurrently without synchronization | Fixed. A shared IRQ-safe lock serializes pipe state; readiness consumers use an immutable snapshot API, retain/single-end transitions are centralized, and epoll notification remains outside the critical section. |
+| P1 | `poll` treated a wrapped pipe as empty and unconditionally added `POLLERR|POLLHUP` to every valid descriptor | Fixed with the same pipe snapshot. Readability uses ring distance, pipe writability/peer-close are explicit, and errors are no longer fabricated for ordinary files and sockets. |
+| P2 | `fcntl` rejected descriptors 32-63 despite x86 `MAX_FDS == 64`, and truncated the argument before validation | Fixed. The original 64-bit fd value is checked against `vfs.MAX_FDS` before conversion; bitmap-based duplication remains O(1). |
+
+The performance choice is deliberately bounded rather than architectural: no heap allocation or dynamic VMA
+tree was introduced. Mmap capacity checks scan 64 entries only at mapping time. Pipe locking retains the
+existing O(bytes) ring copy and holds the lock only across at most 4095 in-kernel bytes; it never spans user
+copy, scheduler calls, or epoll callbacks. Readiness checks take one short snapshot instead of racing several
+loads. A scalable dynamic VMA tree and per-pipe locks remain possible future work only after profiling proves
+the fixed limits or one global pipe lock are material bottlenecks.
+
+`user/hello37.c` is the deterministic regression gate. It verifies `EFAULT` from output syscalls targeting a
+read-only page, `fcntl(F_GETFD)` on descriptor 40, absence of fabricated poll success, and `ENOMEM` on the 65th
+non-adjacent mmap region. It is built, packaged, run by init, and required by x86 single- and dual-core smoke.
+The source scan gate additionally requires no `_ = ...copyToUser(...)` remains in `kernel/`; future output
+syscalls must either propagate full-copy failure or document a deliberately best-effort ABI at the call site.
+
+| Gate | Result | Notes |
+|---|---|---|
+| `zig build` / `-Darch=riscv64` / `-Darch=aarch64` | Passed | All three ISA builds after the implementation changes. |
+| `zig build test` | Passed | Host helper tests. |
+| x86 single-/dual-core smoke | Passed | `hello37: PASS (EFAULT/fd/mmap/poll)` and shell marker required. Existing pipe test still transfers all 16 bytes. |
+| riscv64 / aarch64 smoke | Passed | Shared probe and user-mode bring-up contracts unaffected. |
+
 ### 5.3 Historical Verification
 
 Executed on 2026-06-21:
