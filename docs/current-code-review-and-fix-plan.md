@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-25 (SK-152 writeback multi-page write; prior mm/proc audit reviewed and verified)
+> Last update: 2026-07-27 (post-review SMP startup-handshake and IPI/TLB hardening; SMP=3/8/16 verified; focused concurrency/security re-review PASS; prior: CPU-count-adaptive SMP model)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -280,7 +280,8 @@ Run these gates before claiming the repository is healthy:
 | x86_64 build | `zig build` | Main kernel, user programs, AP trampoline build |
 | riscv64 skeleton build | `zig build -Darch=riscv64` | Cross-ISA skeleton still builds |
 | QEMU single-core smoke | `zig build smoke` | Kernel reaches shell after current init auto-test tail marker `hello21 done` |
-| QEMU dual-core smoke | `zig build smoke-smp` | AP bring-up path remains stable through the full init sequence |
+| QEMU SMP smoke | `zig build smoke-smp` | AP bring-up path remains stable through the full init sequence (`MOQI_SMP=N`, default 2) |
+| QEMU SMP matrix | `zig build smoke-smp-matrix` | Multiple CPU counts smoke in one pass; default list `1 2 3 4 6 8`, override via `MOQI_SMOKE_MATRIX_CPUS` |
 
 If QEMU or toolchain pieces are unavailable, record that as a verification gap instead of treating host tests as a substitute.
 
@@ -289,7 +290,7 @@ If QEMU or toolchain pieces are unavailable, record that as a verification gap i
 1. ~~Correct documentation status claims and keep this review linked from primary docs.~~ Done.
 2. Add reachability/dispatch classification for kernel modules.
 3. ~~Add automated QEMU smoke gates.~~ ✅ Done 2026-07-10 (`zig build smoke`, `zig build smoke-smp`).
-4. Stabilize SMP affinity scheduling with repeatable `MOQI_SMP=2` tests.
+4. ~~Stabilize SMP affinity scheduling with repeatable `MOQI_SMP=2` tests.~~ ✅ Done 2026-07-26 (CPU-count-adaptive model; smoke-smp-matrix covers 1/2/3/4/6/8/12/16 cores; see §5.2).
 5. ~~Implement FPU/SSE task state and ranged TLB shootdown.~~ ✅ Done 2026-06-21 (see P1 resolution).
 6. ~~Replace global scheduler lock with per-CPU queues and work stealing.~~ ✅ Done 2026-06-21
    (per-CPU `IrqSpinlock` per queue replaces the global `sched_lock` on the hot path; the global
@@ -1281,6 +1282,113 @@ kernel behavior, filesystem behavior, networking behavior, or SMP boot-to-shell 
 
 Build verification (2026-06-21): `zig build` passed after the triplet was added; runtime QEMU
 verification is still limited by environment availability of `qemu-system-x86_64`.
+
+### 5.4 Review Update: 2026-07-26 — CPU-Count-Adaptive SMP Model
+
+This update implements and documents the MADT-driven adaptive CPU selection model replacing any
+previous fixed dual-core assumption.
+
+#### Changes implemented
+
+| File | Change |
+|---|---|
+| `kernel/smp.zig` | `initX86` selects CPUs from MADT type-0/xAPIC entries; upper bound is `min(freeSlotCount+1, MAX_CPUS=256)`; IST allocation scaled to selected count |
+| `kernel/arch/cpu_capacity.zig` | New helper: exposes selected/online counts and hardware capacity bounds |
+| `kernel/acpi/acpi_parser.zig` | type-9/x2APIC entries explicitly skipped; only type-0 xAPIC (u8 IDs) consumed |
+| `kernel/arch/x86_64/gdt.zig` | `initFinalIst` allocates 3×16 KiB IST backing once per selected CPU count |
+| `kernel/arch/x86_64/tlb.zig` | Shootdown IPI loop conditions on `isCpuOnline(id)`; never waits for un-initialized or halted CPUs |
+| `tools/qemu_smoke.sh` | Accepts arbitrary positive `SMP_COUNT`; parses `[SMP] N CPUs detected/selected/online` markers; strict-SMP mode enforces selected ≥ requested |
+| `tools/qemu_smoke_stress.sh` | `MOQI_SMP` (default 2) and `MOQI_SMOKE_RUNS` (default 5) configurable |
+| `build.zig` | New `smoke-smp-matrix` step invoking `tools/qemu_smoke_matrix.sh` |
+
+#### Key design decisions recorded
+
+- **Dense logical IDs separate from xAPIC IDs**: kernel arrays indexed 0…configured_cpu_count-1; xAPIC hardware IDs stored in `selected_apic_ids[]` for IPI delivery only. The two need not match.
+- **256 metadata slots (hardware-bounded)**: `MAX_CPUS = 256` because xAPIC ID fields are u8. Not a software policy limit — reflects the hardware addressing range of the legacy APIC mode.
+- **x2APIC / MADT type-9 explicitly unsupported**: type-9 entries are skipped at parse time. Extending to x2APIC requires a separate design step; current code is correct, not incomplete.
+- **Expensive IST backing allocated once, to selected count**: `gdt.initFinalIst(configured_cpu_count)` allocates 3×16 KiB per CPU once at boot. The hot-path per-CPU arrays (`online_cpus`, `selected_apic_ids`) remain hardware-bounded and stable.
+- **AP startup serialized**: BSP sends INIT+SIPI to each AP in sequence and waits for the magic word before proceeding to the next. No parallel AP bringup.
+- **Task-slot / memory / AP failure degrades gracefully**: if `gdt.initFinalIst` returns fewer slots than selected, or an AP fails to set the magic word within deadline, `configured_cpu_count` (and later `cpu_count`) decreases safely; the kernel continues with fewer online CPUs.
+- **Smoke accepts any positive count**: `qemu_smoke.sh` validates `SMP_COUNT` as any positive decimal integer; no artificial ceiling in the script.
+
+#### Verified evidence
+
+| Gate | Count / config | Result |
+|---|---|---|
+| `zig build test` | host | Passed |
+| `zig build` | x86_64 ReleaseFast | Passed |
+| `zig build -Darch=riscv64` | — | Passed |
+| `zig build -Darch=aarch64` | — | Passed |
+| `zig build smoke` | `MOQI_SMP=1` | Passed |
+| `zig build smoke-smp` | `MOQI_SMP=2` | Passed |
+| `zig build smoke-smp` | `MOQI_SMP=3` | Passed |
+| `zig build smoke-smp` | `MOQI_SMP=4` | Passed |
+| `zig build smoke-smp` | `MOQI_SMP=6` | Passed |
+| `zig build smoke-smp` | `MOQI_SMP=8` | Passed |
+| `zig build smoke-smp` | `MOQI_SMP=12` | Passed |
+| `zig build smoke-smp` | `MOQI_SMP=16` | Passed (`MOQI_SMOKE_TIMEOUT=600` required in TCG) |
+| `zig build smoke-smp-stress` | `MOQI_SMP=8 MOQI_SMOKE_RUNS=3` | Passed — 3 consecutive 8-core runs reached shell |
+| `zig build -Darch=riscv64 smoke-riscv` | — | Passed |
+| `zig build -Darch=aarch64 smoke-aarch64` | — | Passed |
+
+Note: `zls` (Zig Language Server) is not available in this environment; LSP-level diagnostics were not run. Build and runtime gates above are the verification basis.
+
+### 5.4b Review Update: 2026-07-27 — Post-Review SMP Startup-Handshake and IPI/TLB Hardening
+
+This update documents and records verification for the hardening changes added to `kernel/smp.zig` and
+`kernel/arch/x86_64/tlb.zig` after the 2026-07-26 adaptive-SMP review. No code was changed during this
+documentation pass; the changes were already present in the worktree and are described here for the
+record.
+
+#### Changes implemented (already in worktree)
+
+| File | Change |
+|---|---|
+| `kernel/smp.zig` | Replaced single-phase magic-word AP confirmation with a two-phase mailbox token protocol (request token at phys `0x7080`, ack at `0x7088`). AP parks immediately on entry if token is zero or already has `AP_MAILBOX_PERMITTED` set. BSP bounds both wait loops at 500,000 `pause` iterations. Pre-grant timeout revokes the token and degrades gracefully; post-grant timeout calls `failCommittedApStartup` (fatal halt). |
+| `kernel/arch/x86_64/tlb.zig` | TLB shootdown `completion` counter seeded to the exact online-CPU count; `@atomicRmw(.Sub, 1)` guarantees nonzero-decrement semantics. BSP wait loop bounded by `SHOOTDOWN_WAIT_POLL_LIMIT = 5_000_000`; expiry triggers a fatal halt because coherence cannot be guaranteed. Shootdown skips CPUs where `isCpuOnline` is false. |
+
+#### Key protocol distinctions
+
+- **Pre-grant AP failure is degradable**: if an AP does not report in before the first timeout, the
+  BSP clears the token to zero, cancels the pre-allocated idle task, and continues with fewer CPUs.
+  The AP, if it eventually reaches `apEntry`, reads token == 0 and parks itself safely.
+- **Post-grant AP failure is fatal**: once BSP has written `token | AP_MAILBOX_PERMITTED`, the AP's
+  logical CPU ID is committed and the AP may already be modifying shared kernel state. A timeout at
+  this point calls `failCommittedApStartup`, which prints a diagnostic and halts the machine to
+  prevent a partially-initialized AP from corrupting the scheduler.
+- **TLB coherence failure is fatal**: a shootdown that does not complete within `SHOOTDOWN_WAIT_POLL_LIMIT`
+  means one or more CPUs may still hold stale translations; continuing would silently violate memory
+  safety. The bounded wait + fatal-halt design matches the post-grant AP policy.
+
+#### Focused re-reviews
+
+Two focused Oracle re-reviews were run against the hardened code:
+
+- **Concurrency re-review**: confirmed that the token handshake uses correct release/acquire ordering
+  at every publish/read site, that the per-AP serialization in `initX86` prevents token aliasing
+  across concurrent APs, and that `failCommittedApStartup` cannot itself race with a completing AP
+  (the AP must store `token | AP_MAILBOX_PERMITTED` to ack, which is the exact value that resolves
+  the BSP wait — the halt path is only reachable if that store never arrives). **PASS**.
+- **Security re-review**: confirmed that an AP with a stale or zero token cannot acquire a logical
+  CPU ID (it parks before reading `cpu_id` from the trampoline data area), that `parkUnrequestedAp`
+  is a true dead-end (infinite `hlt` with no shared-state side effects), and that the fatal-halt
+  path in `failCommittedApStartup` and in `tlb.zig` uses `cli` before `hlt` to prevent any further
+  interrupt delivery on the halting CPU. **PASS**.
+
+#### Verified evidence
+
+Prior full smoke matrix (1/2/3/4/6/8/12/16 cores) from §5.4 is retained as the baseline. Additional
+focused runs with the hardened code:
+
+| Gate | Count / config | Result |
+|---|---|---|
+| `zig build smoke-smp` | `MOQI_SMP=3` | Passed |
+| `zig build smoke-smp` | `MOQI_SMP=8` | Passed |
+| `zig build smoke-smp` | `MOQI_SMP=16` | Passed (`MOQI_SMOKE_TIMEOUT=600` in TCG) |
+| Concurrency re-review | focused Oracle pass | PASS |
+| Security re-review | focused Oracle pass | PASS |
+
+---
 
 ## 6. Completion Criteria For This Review Task
 
