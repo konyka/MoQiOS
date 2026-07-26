@@ -16,6 +16,7 @@ const readahead = @import("readahead.zig");
 const str = @import("../lib/str.zig");
 const writeback = @import("writeback.zig");
 const page_cache = @import("page_cache.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 /// SK-39: non-x86 bring-up exercises no fd-based syscalls, and the per-fd
 /// descriptor array dominates what is left of Task after SK-37/38. Keep a
@@ -56,15 +57,59 @@ pub const PipeBuffer = struct {
     ref_count: u32,
 };
 
-pub var pipes: [16]PipeBuffer = @splat(.{
+var pipes: [16]PipeBuffer = @splat(.{
     .buf = @splat(0),
     .head = 0,
     .tail = 0,
     .ref_count = 0,
 });
 var pipe_count: u32 = 0;
+var pipe_lock: IrqSpinlock = .{};
+
+pub const PipeState = struct {
+    readable: u32,
+    writable: bool,
+    peer_closed: bool,
+};
+
+pub fn pipeState(pipe_idx: u32) ?PipeState {
+    if (pipe_idx >= pipes.len) return null;
+    const flags = pipe_lock.acquire();
+    defer pipe_lock.release(flags);
+    const pipe = &pipes[pipe_idx];
+    if (pipe.ref_count == 0) return null;
+    const readable = if (pipe.tail >= pipe.head)
+        pipe.tail - pipe.head
+    else
+        PIPE_BUF_SIZE - pipe.head + pipe.tail;
+    return .{
+        .readable = readable,
+        .writable = (pipe.tail + 1) % PIPE_BUF_SIZE != pipe.head,
+        .peer_closed = pipe.ref_count <= 1,
+    };
+}
+
+pub fn pipeRetain(pipe_idx: u32) bool {
+    if (pipe_idx >= pipes.len) return false;
+    const flags = pipe_lock.acquire();
+    defer pipe_lock.release(flags);
+    if (pipes[pipe_idx].ref_count == 0) return false;
+    pipes[pipe_idx].ref_count += 1;
+    return true;
+}
+
+pub fn pipeMakeSingleEnded(pipe_idx: u32) bool {
+    if (pipe_idx >= pipes.len) return false;
+    const flags = pipe_lock.acquire();
+    defer pipe_lock.release(flags);
+    if (pipes[pipe_idx].ref_count != 2) return false;
+    pipes[pipe_idx].ref_count = 1;
+    return true;
+}
 
 pub fn allocPipe() ?u32 {
+    const flags = pipe_lock.acquire();
+    defer pipe_lock.release(flags);
     for (0..16) |i| {
         if (pipes[i].ref_count == 0) {
             pipes[i] = .{ .buf = @splat(0), .head = 0, .tail = 0, .ref_count = 2 };
@@ -77,13 +122,19 @@ pub fn allocPipe() ?u32 {
 
 pub fn pipeRead(pipe_idx: u32, buf: [*]u8, count: usize) i64 {
     if (pipe_idx >= 16) return -1;
+    const flags = pipe_lock.acquire();
     const pipe = &pipes[pipe_idx];
+    if (pipe.ref_count == 0) {
+        pipe_lock.release(flags);
+        return -1;
+    }
     var n: usize = 0;
     while (n < count and pipe.head != pipe.tail) {
         buf[n] = pipe.buf[pipe.head];
         pipe.head = (pipe.head + 1) % PIPE_BUF_SIZE;
         n += 1;
     }
+    pipe_lock.release(flags);
     if (n > 0) {
         const epoll_r = @import("../net/epoll.zig");
         epoll_r.epollNotify(.pipe_write, pipe_idx, epoll_r.EPOLLOUT);
@@ -93,7 +144,12 @@ pub fn pipeRead(pipe_idx: u32, buf: [*]u8, count: usize) i64 {
 
 pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize) i64 {
     if (pipe_idx >= 16) return -1;
+    const flags = pipe_lock.acquire();
     const pipe = &pipes[pipe_idx];
+    if (pipe.ref_count == 0) {
+        pipe_lock.release(flags);
+        return -1;
+    }
     var n: usize = 0;
     while (n < count) {
         const next = (pipe.tail + 1) % PIPE_BUF_SIZE;
@@ -102,6 +158,7 @@ pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize) i64 {
         pipe.tail = next;
         n += 1;
     }
+    pipe_lock.release(flags);
     if (n > 0) {
         const epoll_w = @import("../net/epoll.zig");
         epoll_w.epollNotify(.pipe_read, pipe_idx, epoll_w.EPOLLIN);
@@ -111,14 +168,16 @@ pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize) i64 {
 
 pub fn pipeClose(pipe_idx: u32) void {
     if (pipe_idx >= 16) return;
+    const flags = pipe_lock.acquire();
     pipes[pipe_idx].ref_count -|= 1;
-    const epoll_c = @import("../net/epoll.zig");
-    epoll_c.epollNotify(.pipe_read, pipe_idx, epoll_c.EPOLLHUP);
-    epoll_c.epollNotify(.pipe_write, pipe_idx, epoll_c.EPOLLERR);
     if (pipes[pipe_idx].ref_count == 0) {
         pipes[pipe_idx] = .{ .buf = @splat(0), .head = 0, .tail = 0, .ref_count = 0 };
         pipe_count -|= 1;
     }
+    pipe_lock.release(flags);
+    const epoll_c = @import("../net/epoll.zig");
+    epoll_c.epollNotify(.pipe_read, pipe_idx, epoll_c.EPOLLHUP);
+    epoll_c.epollNotify(.pipe_write, pipe_idx, epoll_c.EPOLLERR);
 }
 
 /// Open file descriptor.
@@ -739,7 +798,7 @@ pub const FdTable = struct {
         // Increment pipe ref count if it's a pipe
         if (self.fds[newfd].fd_type == .pipe_read or self.fds[newfd].fd_type == .pipe_write) {
             if (self.fds[newfd].pipe_idx < 16) {
-                pipes[self.fds[newfd].pipe_idx].ref_count += 1;
+                _ = pipeRetain(self.fds[newfd].pipe_idx);
             }
         }
         return newfd;

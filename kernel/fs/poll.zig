@@ -33,7 +33,7 @@ pub fn poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) i64 {
     var pfds: [128]pollfd = @splat(.{ .fd = -1, .events = 0, .revents = 0 });
     const copy_len = @as(usize, @intCast(nfds * @sizeOf(pollfd)));
     const pfds_dst: [*]u8 = @ptrCast(&pfds);
-    if (copy.copyFromUser(pfds_dst[0..copy_len], @ptrFromInt(fds_ptr), copy_len) == 0) {
+    if (copy.copyFromUser(pfds_dst[0..copy_len], @ptrFromInt(fds_ptr), copy_len) != copy_len) {
         return -14; // EFAULT
     }
 
@@ -64,9 +64,9 @@ pub fn poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) i64 {
                         }
                     },
                     .pipe_read => {
-                        if (desc.pipe_idx < 16) {
-                            const pipe = &vfs_mod.pipes[desc.pipe_idx];
-                            if (pipe.tail > pipe.head) pfds[i].revents |= POLLIN;
+                        if (vfs_mod.pipeState(desc.pipe_idx)) |state| {
+                            if (state.readable > 0) pfds[i].revents |= POLLIN;
+                            if (state.readable == 0 and state.peer_closed) pfds[i].revents |= POLLHUP;
                         }
                     },
                     .eventfd => {
@@ -92,14 +92,17 @@ pub fn poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) i64 {
                             if (space > 0) pfds[i].revents |= POLLOUT;
                         }
                     },
+                    .pipe_write => {
+                        if (vfs_mod.pipeState(desc.pipe_idx)) |state| {
+                            if (state.writable) pfds[i].revents |= POLLOUT;
+                            if (state.peer_closed) pfds[i].revents |= POLLERR;
+                        }
+                    },
                     else => {
                         pfds[i].revents |= POLLOUT; // pipes, files always writable
                     },
                 }
             }
-
-            // Always report errors
-            pfds[i].revents |= POLLERR | POLLHUP;
             if (pfds[i].revents & (POLLIN | POLLOUT | POLLERR | POLLHUP | POLLNVAL) != 0) {
                 ready_count += 1;
             }
@@ -108,7 +111,7 @@ pub fn poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) i64 {
         if (ready_count > 0 or timeout_ms == 0) {
             // Copy back to user
             const pfds_src: [*]const u8 = @ptrCast(&pfds);
-            _ = copy.copyToUser(@ptrFromInt(fds_ptr), pfds_src[0..copy_len], copy_len);
+            if (copy.copyToUser(@ptrFromInt(fds_ptr), pfds_src[0..copy_len], copy_len) != copy_len) return -14;
             return @intCast(ready_count);
         }
 
@@ -120,6 +123,6 @@ pub fn poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) i64 {
 
     // Timeout
     const pfds_src: [*]const u8 = @ptrCast(&pfds);
-    _ = copy.copyToUser(@ptrFromInt(fds_ptr), pfds_src[0..copy_len], copy_len);
+    if (copy.copyToUser(@ptrFromInt(fds_ptr), pfds_src[0..copy_len], copy_len) != copy_len) return -14;
     return 0;
 }

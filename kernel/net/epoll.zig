@@ -355,17 +355,14 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32) u32 {
             revents |= EPOLLERR;
         },
         .pipe_read => {
-            if (resource_idx >= 16) return EPOLLERR;
-            const pipe = &vfs.pipes[resource_idx];
-            if (pipe.head != pipe.tail) revents |= EPOLLIN;
-            if (pipe.head == pipe.tail and pipe.ref_count <= 1) revents |= EPOLLHUP;
+            const state = vfs.pipeState(resource_idx) orelse return EPOLLERR;
+            if (state.readable > 0) revents |= EPOLLIN;
+            if (state.readable == 0 and state.peer_closed) revents |= EPOLLHUP;
         },
         .pipe_write => {
-            if (resource_idx >= 16) return EPOLLERR;
-            const pipe = &vfs.pipes[resource_idx];
-            const next = (pipe.tail + 1) % vfs.PIPE_BUF_SIZE;
-            if (next != pipe.head) revents |= EPOLLOUT;
-            if (pipe.ref_count <= 1) revents |= EPOLLERR;
+            const state = vfs.pipeState(resource_idx) orelse return EPOLLERR;
+            if (state.writable) revents |= EPOLLOUT;
+            if (state.peer_closed) revents |= EPOLLERR;
         },
         .special => {
             revents |= EPOLLIN | EPOLLOUT;

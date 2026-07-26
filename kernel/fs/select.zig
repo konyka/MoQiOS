@@ -62,7 +62,7 @@ pub fn select(nfds: u64, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr: u64
                         if (tcp_mod.tcpRecvAvailable(desc.tcb_idx) > 0 or tcp_mod.tcpIsClosing(desc.tcb_idx)) rdy = true;
                     },
                     .pipe_read => {
-                        if (desc.pipe_idx < 16 and vfs_mod.pipes[desc.pipe_idx].tail > vfs_mod.pipes[desc.pipe_idx].head) rdy = true;
+                        if (vfs_mod.pipeState(desc.pipe_idx)) |state| rdy = state.readable > 0;
                     },
                     else => rdy = true,
                 }

@@ -184,7 +184,7 @@ pub fn clone(
         if (child.fd_table.fds[i].fd_type == .pipe_read or child.fd_table.fds[i].fd_type == .pipe_write) {
             const pidx = child.fd_table.fds[i].pipe_idx;
             if (pidx < 16) {
-                vfs_mod.pipes[pidx].ref_count += 1;
+                _ = vfs_mod.pipeRetain(pidx);
             }
         }
     }

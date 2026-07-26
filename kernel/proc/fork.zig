@@ -52,7 +52,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
             .pipe_read, .pipe_write => {
                 const pidx = child.fd_table.fds[i].pipe_idx;
                 if (pidx < 16) {
-                    vfs_mod.pipes[pidx].ref_count += 1;
+                    _ = vfs_mod.pipeRetain(pidx);
                 }
             },
             else => {},

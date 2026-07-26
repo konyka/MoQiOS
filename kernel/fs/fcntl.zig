@@ -40,7 +40,7 @@ fn dupFd(fd_table: *vfs.FdTable, fd: u32, min_fd: u32, new_flags: u32) i64 {
     // Increment pipe ref count if it's a pipe
     if (fd_table.fds[slot].fd_type == .pipe_read or fd_table.fds[slot].fd_type == .pipe_write) {
         if (fd_table.fds[slot].pipe_idx < 16) {
-            vfs.pipes[fd_table.fds[slot].pipe_idx].ref_count += 1;
+            _ = vfs.pipeRetain(fd_table.fds[slot].pipe_idx);
         }
     }
     return @intCast(slot);
@@ -53,9 +53,8 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
     const task_mod = @import("../proc/task.zig");
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
-    const fd: u32 = @truncate(fd_num);
-
-    if (fd >= 32) return -9; // EBADF
+    if (fd_num >= vfs.MAX_FDS) return -9; // EBADF
+    const fd: u32 = @intCast(fd_num);
     if (t.fd_table.fds[fd].fd_type == .none) return -9; // EBADF
 
     switch (cmd) {
