@@ -773,7 +773,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 frame.rax = @bitCast(@as(i64, -14));
                 return;
             }
-            if (old_val_ptr != 0 and !copy.validateUserBuffer(old_val_ptr, @sizeOf(timerfd_mod.Itimerspec))) {
+            if (old_val_ptr != 0 and !copy.validateUserBufferWritable(old_val_ptr, @sizeOf(timerfd_mod.Itimerspec))) {
                 frame.rax = @bitCast(@as(i64, -14));
                 return;
             }
@@ -806,7 +806,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             if (result == 0) {
                 const copy = @import("../../mm/copy_from_user.zig");
                 const cv_bytes: [*]const u8 = @ptrCast(&cur_val);
-                if (!copy.validateUserBuffer(cur_ptr, @sizeOf(timerfd_mod.Itimerspec)) or
+                if (!copy.validateUserBufferWritable(cur_ptr, @sizeOf(timerfd_mod.Itimerspec)) or
                     copy.copyToUser(@ptrFromInt(cur_ptr), cv_bytes[0..@sizeOf(timerfd_mod.Itimerspec)], @sizeOf(timerfd_mod.Itimerspec)) != @sizeOf(timerfd_mod.Itimerspec))
                 {
                     frame.rax = @bitCast(@as(i64, -14));

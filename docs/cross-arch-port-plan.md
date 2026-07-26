@@ -2577,7 +2577,55 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
     `[SK-156] FAILED: read-only page was altered`,冒烟失败。
 
 - **后续**:`mprotect` 尚未实现(计划表中列为 P2),因此程序无法在运行期收紧或放宽段权限;
-  现在 text/rodata 已是只读,若将来引入 JIT 或自修改代码需先补上它。
+  现在 text/rodata 已是只读,若将来引入 JIT 或自修改代码需先补上它。→ 3.161 先收了 3.160
+  自身的尾巴。
+
+### 3.161 拒绝拷贝前先校验:不可逆读取不得吞掉数据（2026-07-26）
+
+3.160 给 `copyToUser` 加了可写性校验,把"内核停机"变成了"干净拒绝"。但拒绝发生在**数据已被
+取走之后**——这是那次改动没有收完的尾巴,本轮补上。
+
+- **背景**:内核里有一套"不可逆出队前的前置校验"`validateUserBuffer`,recvfrom/recvmsg/
+  epoll_wait/raw_net/tcp recv 等都在取数据前调用它。但它内部用的是 `userRangeMapped`,
+  **只查映射不查可写性**。只读目的地因此通过前置校验,数据被取走,随后 `copyToUser` 拒绝,
+  字节就此消失——管道和套接字没有"放回去"的语义。
+- **实测证实(P1,确定性丢数据)**:`user/hello34.c` 向管道写入 `payload` 后关闭写端,先用
+  `mmap(PROT_READ)` 的页读一次、再用正常缓冲区读一次。修复前:`read(ro)=-14 (rejected)`
+  但紧接着 `read(ok)=0`——载荷已被那次失败的读取吃掉。关闭写端是为了让第二次读返回 EOF
+  而不是阻塞,否则冒烟会挂死。
+- **方案**:新增 `validateUserBufferWritable`(= `validateUserRange` + `userRangeWritable`),
+  在**从 fd 取数据之前**校验目的地。`file_io.read`/`pread` 与 `readv`/`preadv` 改为逐块
+  先校验后读取,保留部分读语义(不是一次性校验整个范围)。
+- **按方向逐点替换,不是全局替换**:`validateUserBuffer` 同时被用于输入和输出缓冲区,一刀切
+  会误拒合法的只读输入。改为写方向的有:socket_syscall 全部 10 处(recv 目的地 + 对端地址
+  出参)、tcp_syscall、epoll_wait 的 `events_buf`、raw_net 的接收缓冲与 `src_ip/src_port`
+  出参、`select` 的三个 fd_set(select 会把结果写回,属 in/out)、`timerfd_settime` 的
+  `old_val_ptr` 与 `timerfd_gettime` 的 `cur_ptr`。**保持只读校验**的有:`select` 的
+  `timeout_ptr`、`timerfd_settime` 的 `new_val_ptr`——这两个是纯输入,要求可写会误拒放在
+  rodata 里的常量参数。
+- **顺带**:`readv`/`preadv` 与上一轮 `file_io` 同款的"按读出字节数而非送达字节数推进 `pos`"
+  一并修正。
+- **验证**:三架构构建 + `zig build test` + `smoke`/`smoke-smp`/`smoke-smp-stress` +
+  riscv64/aarch64 smoke 全绿。hello34 输出 `read(ro)=-14 (rejected)` + `read(ok)=7` +
+  `PASS`,其 PASS 标记已纳入 x86 冒烟通过条件。反向对照:去掉 `file_io.read` 的前置校验后
+  `read(ok)=0` 并报 `payload was consumed by the refused read`。
+- **同时排除的两项(有据可查,非遗漏)**:
+  1. *上一轮 `sharedPte` 不再给只读页打 CoW 标记,是否导致共享页被提前释放(UAF)?*
+     不会:`destroyUserSpace` 根本不看 CoW 标记,而是对每个存在的页调 `freePage`,后者递减
+     引用计数、归零才归还;fork 第一遍对**所有**存在的 PTE(含只读页)都递增了计数。
+  2. *是否有系统调用把用户指针直接透传给底层做裸 `@memcpy`,从而绕过可写性校验?*
+     逐一核查了 `fd_table.read` 的全部 8 个调用点,均传内核缓冲区;`readahead` 的 `dst` 是
+     HHDM 别名。读路径一致,无绕过。
+- **已知未收敛**:全内核仍有约 80 处 `_ = copyToUser(...)` 丢弃返回值,拷贝被拒时系统调用
+  仍返回成功、出参未写(如 `uname`/`getrusage`/`sysinfo`)。这类只是"谎报成功",不涉及内存
+  安全,也不像上面那样丢失不可逆数据,故未在本轮批量改动——逐点加错误路径改动面大、回归
+  风险高,留待按需处理。
+- **另一处未做,原因记录在案**:`copy_from_user.zig` 文件头自陈"指令级故障恢复仍是 TODO"
+  (`checkFault()` 恒返回 null,`recovery_rip` 从未设置)。因此"先校验后拷贝"存在 TOCTOU
+  窗口:共享地址空间的另一线程在校验与 `@memcpy` 之间 `munmap` 掉该页,拷贝就会在内核态
+  故障并停机。正确的系统性解法是异常表式的故障恢复(顺带还能省掉每次拷贝的逐页遍历)。
+  本轮未做,因为该内核的用户态尚无可用的线程示例(`hello31` 用的是 fork),这条竞态无法
+  确定性演示——**不提交无法验证的修复**。补齐用户态 `clone` 线程支持后再动。
 
 ---
 

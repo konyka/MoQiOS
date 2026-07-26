@@ -377,7 +377,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         var tmp_buf: [8192]u8 = undefined;
         const to_read = @min(len, 8192);
-        if (!copy.validateUserBuffer(buf, to_read)) return -14; // EFAULT
+        if (!copy.validateUserBufferWritable(buf, to_read)) return -14; // EFAULT
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
         const result = net_mod.unix_socket.unixRecv(unix_idx, &tmp_buf, to_read);
         if (result > 0) {
@@ -389,7 +389,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         var tmp_buf: [4096]u8 = undefined;
         const to_read = @min(len, 4096);
-        if (!copy.validateUserBuffer(buf, to_read)) return -14; // EFAULT
+        if (!copy.validateUserBufferWritable(buf, to_read)) return -14; // EFAULT
         const tcb_idx = t.fd_table.fds[fd].tcb_idx;
         const result = net_mod.tcp.tcpRecv(tcb_idx, &tmp_buf, to_read);
         if (result > 0) {
@@ -404,10 +404,10 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         if (is_v6) {
             var tmp6: [1232]u8 = undefined;
             const to_read6 = @min(len, 1232);
-            if (!copy.validateUserBuffer(buf, to_read6)) return -14; // EFAULT
+            if (!copy.validateUserBufferWritable(buf, to_read6)) return -14; // EFAULT
             if (addr_ptr != 0) {
-                if (!copy.validateUserBuffer(addr_ptr, sa.SOCKADDR_IN6_LEN)) return -14;
-                if (addr_len_ptr != 0 and !copy.validateUserBuffer(addr_len_ptr, 4)) return -14;
+                if (!copy.validateUserBufferWritable(addr_ptr, sa.SOCKADDR_IN6_LEN)) return -14;
+                if (addr_len_ptr != 0 and !copy.validateUserBufferWritable(addr_len_ptr, 4)) return -14;
             }
             var src6: [16]u8 = @splat(0);
             var src_port_out6: u16 = 0;
@@ -435,10 +435,10 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         }
         var tmp_buf2: [1472]u8 = undefined;
         const to_read2 = @min(len, 1472);
-        if (!copy.validateUserBuffer(buf, to_read2)) return -14; // EFAULT
+        if (!copy.validateUserBufferWritable(buf, to_read2)) return -14; // EFAULT
         if (addr_ptr != 0) {
-            if (!copy.validateUserBuffer(addr_ptr, 8)) return -14;
-            if (addr_len_ptr != 0 and !copy.validateUserBuffer(addr_len_ptr, 4)) return -14;
+            if (!copy.validateUserBufferWritable(addr_ptr, 8)) return -14;
+            if (addr_len_ptr != 0 and !copy.validateUserBufferWritable(addr_len_ptr, 4)) return -14;
         }
         var src_ip: [4]u8 = .{ 0, 0, 0, 0 };
         var src_port_out: u16 = 0;
@@ -464,7 +464,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         // Not a socket — use regular read
         var tmp_buf: [4096]u8 = undefined;
         const to_read = @min(len, 4096);
-        if (!copy.validateUserBuffer(buf, to_read)) return -14; // EFAULT
+        if (!copy.validateUserBufferWritable(buf, to_read)) return -14; // EFAULT
         const result = vfs_mod.FdTable.read(&t.fd_table, fd, &tmp_buf, to_read);
         if (result > 0) {
             const copied = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf))[0..@intCast(result)], @intCast(result));
@@ -688,7 +688,7 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
 
         var tmp: [4096]u8 = undefined;
         const to_read: u32 = @intCast(@min(iov_sz, 4096));
-        if (!copy.validateUserBuffer(iov_base, to_read)) return if (total == 0) -14 else @intCast(total);
+        if (!copy.validateUserBufferWritable(iov_base, to_read)) return if (total == 0) -14 else @intCast(total);
         const result = net_mod.tcp.tcpRecv(tcb_idx, &tmp, to_read);
         if (result > 0) {
             const copied = copy.copyToUser(@ptrFromInt(iov_base), &tmp, @intCast(result));

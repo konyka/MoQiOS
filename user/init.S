@@ -675,6 +675,29 @@ _start:
     movq $13, %rdx
     syscall
 
+    # Spawn hello34 (refused copy must not consume data)
+    movq $5, %rax
+    leaq hello34_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn34_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done34_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
     # Spawn hello9 (fork test)
     movq $5, %rax
     leaq hello9_name(%rip), %rdi
@@ -943,6 +966,13 @@ done23_msg:
     .ascii "spawned hello33\n"
     done33_msg:
     .ascii "hello33 done\n"
+    hello34_name:
+    .ascii "hello34"
+    .byte 0
+    spawn34_msg:
+    .ascii "spawned hello34\n"
+    done34_msg:
+    .ascii "hello34 done\n"
     hello26_name:
     .ascii "hello26"
     .byte 0

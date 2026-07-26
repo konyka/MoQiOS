@@ -15,9 +15,9 @@ pub fn select(nfds: u64, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr: u64
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    if (readfds_ptr != 0 and !copy.validateUserBuffer(readfds_ptr, 16)) return -14;
-    if (writefds_ptr != 0 and !copy.validateUserBuffer(writefds_ptr, 16)) return -14;
-    if (exceptfds_ptr != 0 and !copy.validateUserBuffer(exceptfds_ptr, 16)) return -14;
+    if (readfds_ptr != 0 and !copy.validateUserBufferWritable(readfds_ptr, 16)) return -14;
+    if (writefds_ptr != 0 and !copy.validateUserBufferWritable(writefds_ptr, 16)) return -14;
+    if (exceptfds_ptr != 0 and !copy.validateUserBufferWritable(exceptfds_ptr, 16)) return -14;
     if (timeout_ptr != 0 and !copy.validateUserBuffer(timeout_ptr, 16)) return -14;
 
     var timeout_ms: u64 = 0;

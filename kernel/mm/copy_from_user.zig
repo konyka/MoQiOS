@@ -62,6 +62,16 @@ pub fn validateUserBuffer(addr: u64, len: usize) bool {
     return validateUserRange(addr, len) and userRangeMapped(addr, len);
 }
 
+/// Same, but for a buffer the kernel is going to *write*.
+///
+/// Being mapped is not enough for a destination: `copyToUser` refuses a
+/// read-only page, and by then a pipe, socket or timer has already given up its
+/// data with nowhere to put it back. Anything irreversible must be gated on
+/// this, not on `validateUserBuffer`.
+pub fn validateUserBufferWritable(addr: u64, len: usize) bool {
+    return validateUserRange(addr, len) and userRangeWritable(addr, len);
+}
+
 /// Global recovery state (for future assembly-based recovery).
 var recovery_rip: u64 = 0;
 var in_user_access: bool = false;

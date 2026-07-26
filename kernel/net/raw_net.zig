@@ -20,7 +20,7 @@ pub fn netRecv(buf: u64, max_len: u64) i64 {
     if (buf == 0 or max_len == 0 or buf >= 0x0000_8000_0000_0000) return -22;
     if (!nic.isActive()) return -1;
     const capacity: u32 = @intCast(@min(max_len, 2048));
-    if (!copy.validateUserBuffer(buf, capacity)) return -14;
+    if (!copy.validateUserBufferWritable(buf, capacity)) return -14;
     var packet: [2048]u8 = undefined;
     const received = nic.receivePacket(&packet, capacity);
     if (received > 0 and copy.copyToUser(@ptrFromInt(buf), packet[0..received], received) != received) return -14;
@@ -55,9 +55,9 @@ pub fn udpRecv(port: u16, buf: u64, max_len: u64, src_ip_out: u64, src_port_out:
     var out_port: u16 = 0;
 
     const capacity: u16 = @intCast(@min(max_len, 1472));
-    if (!copy.validateUserBuffer(buf, capacity)) return -14;
-    if (src_ip_out != 0 and !copy.validateUserBuffer(src_ip_out, 4)) return -14;
-    if (src_port_out != 0 and !copy.validateUserBuffer(src_port_out, 2)) return -14;
+    if (!copy.validateUserBufferWritable(buf, capacity)) return -14;
+    if (src_ip_out != 0 and !copy.validateUserBufferWritable(src_ip_out, 4)) return -14;
+    if (src_port_out != 0 and !copy.validateUserBufferWritable(src_port_out, 2)) return -14;
     var payload: [1472]u8 = undefined;
     const n = udp_mod.recvFrom(port, &payload, capacity, &out_ip, &out_port);
 

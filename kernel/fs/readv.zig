@@ -6,6 +6,8 @@ const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const bo = @import("../lib/byte_order.zig");
 
+const EFAULT: i64 = 14;
+
 /// readv(fd, iov_ptr, iovcnt) -> bytes read or -errno.
 pub fn readv(fd: u32, iov_ptr: u64, iovcnt: u32) i64 {
     if (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000 or iovcnt == 0 or iovcnt > 1024) return -22;
@@ -29,15 +31,22 @@ pub fn readv(fd: u32, iov_ptr: u64, iovcnt: u32) i64 {
         while (pos < n) {
             const chunk = @min(n - pos, 4096);
             var kbuf: [4096]u8 = undefined;
+            // Refuse before consuming: whatever comes off a pipe or socket
+            // cannot be put back if the destination turns out to be unwritable.
+            if (!copy.validateUserBufferWritable(iov_base + pos, chunk)) {
+                if (total == 0 and pos == 0) return -EFAULT;
+                break;
+            }
             const result = cur.fd_table.read(fd, &kbuf, chunk);
             if (result <= 0) {
                 if (total == 0 and pos == 0) return @bitCast(result);
                 break;
             }
-            const written = copy.copyToUser(@ptrFromInt(iov_base + pos), kbuf[0..@intCast(result)], @intCast(result));
-            pos += @intCast(result);
-            if (result < @as(i64, @intCast(chunk))) break;
-            if (written < @as(usize, @intCast(result))) break;
+            const got: usize = @intCast(result);
+            const written = copy.copyToUser(@ptrFromInt(iov_base + pos), kbuf[0..got], got);
+            pos += written;
+            if (written < got) break;
+            if (got < chunk) break;
         }
         total += pos;
         if (pos < n) break;
@@ -110,6 +119,13 @@ pub fn preadv(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64) i64 {
         while (pos < n) {
             const chunk = @min(n - pos, 4096);
             var kbuf: [4096]u8 = undefined;
+            if (!copy.validateUserBufferWritable(iov_base + pos, chunk)) {
+                if (total == 0 and pos == 0) {
+                    cur.fd_table.fds[fd].offset = orig_offset;
+                    return -EFAULT;
+                }
+                break;
+            }
             const result = cur.fd_table.read(fd, &kbuf, chunk);
             if (result <= 0) {
                 if (total == 0 and pos == 0) {
@@ -118,10 +134,11 @@ pub fn preadv(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64) i64 {
                 }
                 break;
             }
-            const written = copy.copyToUser(@ptrFromInt(iov_base + pos), kbuf[0..@intCast(result)], @intCast(result));
-            pos += @intCast(result);
-            if (result < @as(i64, @intCast(chunk))) break;
-            if (written < @as(usize, @intCast(result))) break;
+            const got: usize = @intCast(result);
+            const written = copy.copyToUser(@ptrFromInt(iov_base + pos), kbuf[0..got], got);
+            pos += written;
+            if (written < got) break;
+            if (got < chunk) break;
         }
         total += pos;
         if (pos < n) break;

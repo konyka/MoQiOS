@@ -1065,7 +1065,57 @@ reports `FAILED: read-only page was altered` and the smoke fails.
 
 Left open: `mprotect` is still unimplemented (listed P2 on the plan), so a program cannot tighten or relax
 segment permissions at runtime. Now that text and rodata are genuinely read-only, that becomes a prerequisite
-for any future JIT or self-modifying code.
+for any future JIT or self-modifying code. 5.2q first finishes what 5.2p started.
+
+### 5.2q Review Update: 2026-07-26 (a refused copy must not consume the data it cannot deliver)
+
+5.2p turned a kernel halt into a clean refusal. But the refusal happens *after* the data has been taken, and
+that loose end is what this pass closes.
+
+The kernel has a guard meant to run before an irreversible read — `validateUserBuffer` — used by recvfrom,
+recvmsg, epoll_wait, raw_net and the TCP receive path. It calls `userRangeMapped`, which asks only whether
+the destination is mapped, never whether it can be written. A read-only destination therefore cleared the
+guard, the data came off the pipe or socket, and only then did `copyToUser` refuse it. Pipes and sockets have
+no way to put it back, so the bytes were gone.
+
+| Severity | Finding | Resolution / status |
+|---|---|---|
+| P1 | A read into a read-only destination consumed the data and delivered nothing. Demonstrated deterministically: `user/hello34.c` writes `payload` to a pipe, closes the write end, reads once into a `mmap(PROT_READ)` page and once into a good buffer. Before the fix, `read(ro)=-14 (rejected)` was followed by `read(ok)=0` — the payload had been eaten. (Closing the write end is what keeps the second read from blocking and hanging the smoke.) | Fixed: new `validateUserBufferWritable` checks the destination *before* anything is taken off the fd. `file_io.read`/`pread` and `readv`/`preadv` validate per chunk, so partial-read semantics survive. |
+| P1 | `readv` / `preadv` carried the same "advance by bytes read rather than bytes delivered" bug fixed in `file_io` last pass. | Fixed alongside. |
+
+The guard was switched per call site by direction, not globally: `validateUserBuffer` is used for input
+buffers too, and requiring writability there would wrongly reject a legitimate read-only argument. Moved to
+the writable check: all ten sites in `socket_syscall` (receive destinations and peer-address out-params),
+`tcp_syscall`, epoll's `events_buf`, raw_net's receive buffer and its `src_ip`/`src_port` out-params,
+`select`'s three fd_sets (in/out — select writes results back), and `timerfd_settime`'s `old_val_ptr` /
+`timerfd_gettime`'s `cur_ptr`. Deliberately left on the mapped-only check: `select`'s `timeout_ptr` and
+`timerfd_settime`'s `new_val_ptr`, which are pure inputs.
+
+Two concerns were checked and ruled out rather than assumed. First, whether last pass's `sharedPte` — which
+no longer marks read-only pages COW — could let a shared frame be freed while another process still maps it:
+it cannot, because `destroyUserSpace` never consults the COW bit and calls `freePage`, which decrements the
+refcount and only releases at zero, while fork's first pass bumps that count for *every* present entry
+including read-only ones. Second, whether any syscall hands a user pointer straight to a lower layer for a
+raw `@memcpy`, bypassing the writability check entirely: all eight call sites of `fd_table.read` pass kernel
+buffers, and `readahead`'s destination is an HHDM alias.
+
+Verification: three-architecture builds, `zig build test`, `smoke` / `smoke-smp` / `smoke-smp-stress`, and
+the riscv64 and aarch64 smokes all pass. hello34 reports `read(ro)=-14 (rejected)`, `read(ok)=7`, `PASS`, and
+its marker is now a smoke condition. Negative control: dropping the pre-check in `file_io.read` brings back
+`read(ok)=0` and `payload was consumed by the refused read`.
+
+Left open, with reasons. Around eighty `_ = copyToUser(...)` sites still discard the result, so a refused
+copy leaves the syscall reporting success with its out-param unwritten (`uname`, `getrusage`, `sysinfo` and
+the like). That is a wrong return value rather than a memory-safety problem or irreversible data loss, and
+adding an error path to eighty call sites is a large, regression-prone change; it is deferred rather than
+rushed. Separately, `copy_from_user.zig` admits in its own header that instruction-level fault recovery is
+still TODO — `checkFault()` always returns null because `recovery_rip` is never set. Validate-then-copy
+therefore has a TOCTOU window: a thread sharing the address space can `munmap` the page between the check and
+the `@memcpy`, faulting inside the kernel with no recovery. An exception-table guard is the systemic answer
+(and would also remove the per-page walk every copy currently pays). It is not attempted here because this
+kernel has no working user-space threading example to race with — `hello31` uses fork — so the window cannot
+be demonstrated deterministically, and an unverifiable fix is not worth committing. It belongs with
+user-space `clone` thread support.
 
 | Gate | Result | Notes |
 |---|---|---|

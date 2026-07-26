@@ -161,6 +161,10 @@ const AddressSpace = struct {
   后者会故障并由缺页处理器的内核态 CoW 路径解开。只看 `user` 位是不够的——`mmap(PROT_READ)`
   的页会通过校验，随后内核自己的 `@memcpy` 在 `CR0.WP=1`（实测）下触发内核态写保护故障，
   落入无恢复的致命分支，任何非特权进程据此即可停机（3.160）
+- **不可逆操作前用 `validateUserBufferWritable`**：从管道/套接字/定时器取数据是单向的，取完
+  才发现目的地只读，字节就丢了（3.161）。按方向选用：输出缓冲区走可写校验，纯输入参数
+  （如 `select` 的 timeout、`timerfd_settime` 的 new_value）仍走 `validateUserBuffer`，否则
+  会误拒放在 rodata 里的常量参数
 - UserAccessError返回而非panic，保证内核鲁棒性
 - 接口：copyFromUserChecked / copyToUserChecked / getUser / putUser / copyStringFromUser
 

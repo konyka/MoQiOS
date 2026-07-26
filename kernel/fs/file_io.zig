@@ -86,6 +86,14 @@ pub fn read(fd: u32, buf_ptr: u64, count: u64) i64 {
         const chunk = @min(n - pos, 4096);
         var kbuf: [4096]u8 = undefined;
 
+        // Refuse before consuming. A pipe or socket hands its data over for
+        // good, so discovering at copy time that the destination is read-only
+        // means the bytes are simply gone.
+        if (!copy.validateUserBufferWritable(buf_ptr + pos, chunk)) {
+            faulted = true;
+            break;
+        }
+
         const result = cur.fd_table.read(fd, &kbuf, chunk);
         if (result <= 0) break;
         const got: usize = @intCast(result);
@@ -140,6 +148,10 @@ pub fn pread(fd: u32, buf_ptr: u64, count: u64, offset: u64) i64 {
     while (pos < n) {
         const chunk = @min(n - pos, 4096);
         var kbuf: [4096]u8 = undefined;
+        if (!copy.validateUserBufferWritable(buf_ptr + pos, chunk)) {
+            faulted = true;
+            break;
+        }
         const result = cur.fd_table.read(fd, &kbuf, chunk);
         if (result <= 0) break;
         const got: usize = @intCast(result);
