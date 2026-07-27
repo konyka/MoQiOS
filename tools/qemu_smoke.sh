@@ -200,11 +200,16 @@ while [ "$SECONDS" -lt "$deadline" ]; do
        grep -q "hello30: brk/mmap PASS" "$LOG_FILE" &&
        grep -q "hello31: child TLS ok" "$LOG_FILE" &&
        grep -q "hello31: TLS PASS" "$LOG_FILE" &&
+       grep -q "hello32: SIGSEGV PASS" "$LOG_FILE" &&
        grep -q "hello33: PASS" "$LOG_FILE" &&
        grep -q "hello34: PASS" "$LOG_FILE" &&
        grep -q "hello35: PASS" "$LOG_FILE" &&
        grep -q "hello36: PASS" "$LOG_FILE" &&
        grep -q "hello37: PASS" "$LOG_FILE" &&
+       grep -q "hello38: PASS (futex EFAULT/waitv validation)" "$LOG_FILE" &&
+       grep -q "hello39: PASS (socket option faults/address lengths)" "$LOG_FILE" &&
+       grep -q "hello40: PASS (IPC_SET and rt_sigsuspend EFAULT)" "$LOG_FILE" &&
+       grep -q "hello41: PASS" "$LOG_FILE" &&
        grep -q "MoQiOS shell" "$LOG_FILE" &&
         { [ "$STRICT_SMP" = "0" ] || has_exact_marker "[SMP] ${SMP_COUNT} CPUs detected"; } &&
         { [ "$STRICT_SMP" = "0" ] || has_exact_marker "[SMP] ${SMP_COUNT} CPUs selected"; } &&
@@ -222,7 +227,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for smoke markers."
-echo "Expected serial markers: init PASS markers, 'MoQiOS shell', '[SMP] ${SMP_COUNT} CPUs detected', '[SMP] ${SMP_COUNT} CPUs selected', and '[SMP] ${SMP_COUNT} CPUs online'."
+echo "Expected serial markers: init PASS markers, 'hello32: SIGSEGV PASS', 'hello38: PASS (futex EFAULT/waitv validation)', 'hello39: PASS (socket option faults/address lengths)', 'hello40: PASS (IPC_SET and rt_sigsuspend EFAULT)', 'hello41: PASS', 'MoQiOS shell', '[SMP] ${SMP_COUNT} CPUs detected', '[SMP] ${SMP_COUNT} CPUs selected', and '[SMP] ${SMP_COUNT} CPUs online'."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

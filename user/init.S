@@ -767,6 +767,98 @@ _start:
     movq $13, %rdx
     syscall
 
+    # Spawn hello38 (futex user-word fault regression)
+    movq $5, %rax
+    leaq hello38_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn38_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done38_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
+    # Spawn hello40 (IPC_SET and rt_sigsuspend failed-copy regression)
+    movq $5, %rax
+    leaq hello40_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn40_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done40_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
+    # Spawn hello39 (socket option and sockaddr validation regressions)
+    movq $5, %rax
+    leaq hello39_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn39_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done39_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
+    # Spawn hello41 (copy_file_range fd and offset rollback regression)
+    movq $5, %rax
+    leaq hello41_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn41_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done41_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
     # Spawn hello9 (fork test)
     movq $5, %rax
     leaq hello9_name(%rip), %rdi
@@ -1063,6 +1155,34 @@ done23_msg:
     .ascii "spawned hello37\n"
     done37_msg:
     .ascii "hello37 done\n"
+    hello38_name:
+    .ascii "hello38"
+    .byte 0
+    spawn38_msg:
+    .ascii "spawned hello38\n"
+    done38_msg:
+    .ascii "hello38 done\n"
+    hello40_name:
+    .ascii "hello40"
+    .byte 0
+    spawn40_msg:
+    .ascii "spawned hello40\n"
+    done40_msg:
+    .ascii "hello40 done\n"
+    hello39_name:
+    .ascii "hello39"
+    .byte 0
+    spawn39_msg:
+    .ascii "spawned hello39\n"
+    done39_msg:
+    .ascii "hello39 done\n"
+    hello41_name:
+    .ascii "hello41"
+    .byte 0
+    spawn41_msg:
+    .ascii "spawned hello41\n"
+    done41_msg:
+    .ascii "hello41 done\n"
     hello26_name:
     .ascii "hello26"
     .byte 0
