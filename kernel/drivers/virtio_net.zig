@@ -32,6 +32,7 @@ const VIRTIO_STATUS_ACK: u8 = 1;
 const VIRTIO_STATUS_DRIVER: u8 = 2;
 const VIRTIO_STATUS_DRIVER_OK: u8 = 4;
 const VIRTIO_STATUS_FEATURES_OK: u8 = 8;
+const VIRTIO_STATUS_FAILED: u8 = 128;
 
 // Virtio-net feature bits
 const VIRTIO_NET_F_MAC: u32 = 0x20; // Device has given MAC address
@@ -85,6 +86,7 @@ const VirtioNetHdr = extern struct {
 const Virtqueue = struct {
     phys: u64,
     virt: u64,
+    ring_phys: [3]u64,
     num: u32,
     free_head: u16,
     free_count: u16,
@@ -112,6 +114,7 @@ var device: VirtioNetDevice = .{
     .rx_queue = .{
         .phys = 0,
         .virt = 0,
+        .ring_phys = .{0} ** 3,
         .num = 0,
         .free_head = 0,
         .free_count = 0,
@@ -121,6 +124,7 @@ var device: VirtioNetDevice = .{
     .tx_queue = .{
         .phys = 0,
         .virt = 0,
+        .ring_phys = .{0} ** 3,
         .num = 0,
         .free_head = 0,
         .free_count = 0,
@@ -175,6 +179,59 @@ fn vqFreeDesc(vq: *Virtqueue, idx: u16) void {
     vq.free_count += 1;
 }
 
+fn queueIsReleased(vq: *const Virtqueue) bool {
+    if (vq.phys != 0 or vq.virt != 0 or vq.num != 0 or vq.free_count != 0) return false;
+    for (vq.ring_phys) |phys| {
+        if (phys != 0) return false;
+    }
+    for (vq.buf_phys) |phys| {
+        if (phys != 0) return false;
+    }
+    return true;
+}
+
+fn resetVirtqueue(vq: *Virtqueue) void {
+    if (vq.phys == 0) return;
+
+    for (vq.buf_phys) |phys| {
+        if (phys != 0) pmm.freePage(phys);
+    }
+    const pml4 = paging.getKernelPml4();
+    _ = paging.unmapPage(pml4, vq.virt + paging.PAGE_SIZE);
+    _ = paging.unmapPage(pml4, vq.virt + 2 * paging.PAGE_SIZE);
+    pmm.freePage(vq.ring_phys[2]);
+    pmm.freePage(vq.ring_phys[1]);
+    pmm.freePage(vq.ring_phys[0]);
+    vq.* = .{
+        .phys = 0,
+        .virt = 0,
+        .ring_phys = .{0} ** 3,
+        .num = 0,
+        .free_head = 0,
+        .free_count = 0,
+        .last_used_idx = 0,
+        .buf_phys = .{0} ** QUEUE_SIZE,
+    };
+    if (!queueIsReleased(vq)) @panic("virtqueue cleanup invariant failed");
+}
+
+fn failDevice() void {
+    if (device.io_base != 0) {
+        io.outb(@intCast(device.io_base + VIRTIO_PCI_STATUS), VIRTIO_STATUS_FAILED);
+    }
+    device.active = false;
+}
+
+fn abortInitialization() void {
+    if (device.io_base != 0) {
+        // A reset returns all queue DMA ownership before releasing buffers.
+        io.outb(@intCast(device.io_base + VIRTIO_PCI_STATUS), 0);
+    }
+    device.active = false;
+    resetVirtqueue(&device.tx_queue);
+    resetVirtqueue(&device.rx_queue);
+}
+
 fn initVirtqueue(vq: *Virtqueue, io_base: u64, queue_idx: u16) !void {
     const base = io_base;
     io.outw(@intCast(base + VIRTIO_PCI_QUEUE_SEL), queue_idx);
@@ -201,8 +258,19 @@ fn initVirtqueue(vq: *Virtqueue, io_base: u64, queue_idx: u16) !void {
         .no_execute = true,
         .global = true,
     };
-    paging.mapPage(pml4, virt + paging.PAGE_SIZE, p2, flags) catch {};
-    paging.mapPage(pml4, virt + 2 * paging.PAGE_SIZE, p3, flags) catch {};
+    paging.mapPage(pml4, virt + paging.PAGE_SIZE, p2, flags) catch |err| {
+        pmm.freePage(p3);
+        pmm.freePage(p2);
+        pmm.freePage(p1);
+        return err;
+    };
+    paging.mapPage(pml4, virt + 2 * paging.PAGE_SIZE, p3, flags) catch |err| {
+        _ = paging.unmapPage(pml4, virt + paging.PAGE_SIZE);
+        pmm.freePage(p3);
+        pmm.freePage(p2);
+        pmm.freePage(p1);
+        return err;
+    };
 
     // Zero 3 pages
     const ptr: [*]u8 = @ptrFromInt(virt);
@@ -210,6 +278,7 @@ fn initVirtqueue(vq: *Virtqueue, io_base: u64, queue_idx: u16) !void {
 
     vq.phys = p1;
     vq.virt = virt;
+    vq.ring_phys = .{ p1, p2, p3 };
     vq.free_head = 0;
     vq.free_count = @intCast(qsize);
     vq.last_used_idx = 0;
@@ -254,6 +323,9 @@ pub fn init() void {
 }
 
 fn initDevice(dev: *const pci.PciDevice) !void {
+    device.active = false;
+    errdefer abortInitialization();
+
     device.pci_bus = dev.bus;
     device.pci_dev = dev.device;
     device.pci_func = dev.function;
@@ -458,23 +530,27 @@ pub fn sendPacket(pkt: [*]const u8, len: u32) bool {
         if (used.idx != vq.last_used_idx) {
             // Process completed TX
             const elem = used.ring[vq.last_used_idx % QUEUE_SIZE];
-            // Free the descriptor chain
-            vqFreeDesc(vq, @intCast(elem.id));
-            // Free the chained data desc (it was hdr_desc.next)
-            const chain_desc = vqGetDesc(vq, elem.id);
+            const head_idx: u16 = @intCast(elem.id);
+            // The device no longer owns completed buffers, so reclaim both slots.
+            const chain_desc = vqGetDesc(vq, head_idx);
             if (chain_desc.flags & VQ_DESC_NEXT != 0) {
                 vqFreeDesc(vq, chain_desc.next);
             }
+            vqFreeDesc(vq, head_idx);
             // Free physical pages
-            pmm.freePage(hdr_phys);
-            pmm.freePage(data_phys);
-            vq.last_used_idx = used.idx;
+            pmm.freePage(vq.buf_phys[head_idx]);
+            pmm.freePage(vq.buf_phys[data_idx]);
+            vq.buf_phys[head_idx] = 0;
+            vq.buf_phys[data_idx] = 0;
+            vq.last_used_idx +%= 1;
             return true;
         }
         asm volatile ("pause");
     }
 
-    // Timeout — leak buffers but continue
+    // The device may still own both pages. Stop the device instead of freeing
+    // them or allowing a later completion to recycle the descriptors.
+    failDevice();
     return false;
 }
 

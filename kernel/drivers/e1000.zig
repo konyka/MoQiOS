@@ -111,6 +111,58 @@ var tx_lock: IrqSpinlock = .{};
 var initialized: bool = false;
 var irq_line: u8 = 0; // PCI IRQ line for this device
 
+fn pagesAreClear(comptime count: u32, pages: *const [count]u64) bool {
+    for (pages.*) |phys| {
+        if (phys != 0) return false;
+    }
+    return true;
+}
+
+fn releaseRXResources() void {
+    for (0..NUM_RX_DESC) |i| {
+        if (rx_buf_phys[i] != 0) {
+            pmm.freePage(rx_buf_phys[i]);
+            rx_buf_phys[i] = 0;
+            rx_buf_virt[i] = 0;
+        }
+    }
+    if (rx_desc_phys != 0) {
+        pmm.freePage(rx_desc_phys);
+        rx_desc_phys = 0;
+        rx_desc_virt = 0;
+    }
+    rx_tail = 0;
+    if (rx_desc_phys != 0 or rx_desc_virt != 0 or !pagesAreClear(NUM_RX_DESC, &rx_buf_phys)) {
+        @panic("e1000 RX cleanup invariant failed");
+    }
+}
+
+fn releaseTXResources() void {
+    for (0..NUM_TX_DESC) |i| {
+        if (tx_buf_phys[i] != 0) {
+            pmm.freePage(tx_buf_phys[i]);
+            tx_buf_phys[i] = 0;
+            tx_buf_virt[i] = 0;
+        }
+    }
+    if (tx_desc_phys != 0) {
+        pmm.freePage(tx_desc_phys);
+        tx_desc_phys = 0;
+        tx_desc_virt = 0;
+    }
+    tx_tail = 0;
+    if (tx_desc_phys != 0 or tx_desc_virt != 0 or !pagesAreClear(NUM_TX_DESC, &tx_buf_phys)) {
+        @panic("e1000 TX cleanup invariant failed");
+    }
+}
+
+fn rollbackInitialization() void {
+    // RX/TX are not enabled until setup succeeds, so no released page is DMA-owned.
+    initialized = false;
+    releaseTXResources();
+    releaseRXResources();
+}
+
 fn readReg(offset: u32) u32 {
     const addr: *volatile u32 = @ptrFromInt(mmio_base + offset);
     return addr.*;
@@ -146,6 +198,9 @@ pub fn init() void {
 }
 
 fn initDevice(dev: *const pci.PciDevice) !void {
+    initialized = false;
+    errdefer rollbackInitialization();
+
     // Enable bus mastering (bit 2) in PCI command register, keep INTx enabled
     const cmd = pci.configRead32(dev.bus, dev.device, dev.function, 0x04);
     pci.configWrite32(dev.bus, dev.device, dev.function, 0x04, (cmd & ~@as(u32, 0x400)) | 0x04);
@@ -172,7 +227,13 @@ fn initDevice(dev: *const pci.PciDevice) !void {
     // Map enough pages for e1000 MMIO (128KB typically)
     var off: u64 = 0;
     while (off < 0x20000) : (off += paging.PAGE_SIZE) {
-        paging.mapPage(pml4, bar_virt + off, bar_phys + off, flags) catch {};
+        paging.mapPage(pml4, bar_virt + off, bar_phys + off, flags) catch |err| {
+            var mapped_off: u64 = 0;
+            while (mapped_off < off) : (mapped_off += paging.PAGE_SIZE) {
+                _ = paging.unmapPage(pml4, bar_virt + mapped_off);
+            }
+            return err;
+        };
     }
 
     mmio_base = bar_virt;
@@ -275,6 +336,8 @@ fn readMAC() void {
 }
 
 fn setupRX() !void {
+    releaseRXResources();
+
     // Allocate RX descriptor ring
     const desc_phys = pmm.allocPage() orelse return error.OutOfMemory;
     const desc_virt = hhdm.physToVirt(desc_phys);
@@ -285,7 +348,10 @@ fn setupRX() !void {
 
     // Allocate packet buffers
     for (0..NUM_RX_DESC) |i| {
-        const buf_phys = pmm.allocPage() orelse return error.OutOfMemory;
+        const buf_phys = pmm.allocPage() orelse {
+            releaseRXResources();
+            return error.OutOfMemory;
+        };
         const buf_virt = hhdm.physToVirt(buf_phys);
         var bptr: [*]u8 = @ptrFromInt(buf_virt);
         @memset(bptr[0..paging.PAGE_SIZE], 0);
@@ -309,6 +375,8 @@ fn setupRX() !void {
 }
 
 fn setupTX() !void {
+    releaseTXResources();
+
     const desc_phys = pmm.allocPage() orelse return error.OutOfMemory;
     const desc_virt = hhdm.physToVirt(desc_phys);
     var dptr: [*]u8 = @ptrFromInt(desc_virt);
@@ -317,7 +385,10 @@ fn setupTX() !void {
     tx_desc_virt = desc_virt;
 
     for (0..NUM_TX_DESC) |i| {
-        const buf_phys = pmm.allocPage() orelse return error.OutOfMemory;
+        const buf_phys = pmm.allocPage() orelse {
+            releaseTXResources();
+            return error.OutOfMemory;
+        };
         const buf_virt = hhdm.physToVirt(buf_phys);
         var bptr: [*]u8 = @ptrFromInt(buf_virt);
         @memset(bptr[0..paging.PAGE_SIZE], 0);
