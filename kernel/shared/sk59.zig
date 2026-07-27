@@ -26,7 +26,7 @@ pub fn announce() void {
         _ = &tcp.tcpRetain;
         _ = &tcp.tcpGetOptions;
         _ = &tcp.tcpSetOptions;
-        _ = &tcp.tcpClearSoError;
+        _ = &tcp.tcpClearSoErrorIfEqual;
         _ = &tcp.handlePacket;
         _ = &tcp.tcpConnect;
         _ = &tcp.tcpConnectSocket;

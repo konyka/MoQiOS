@@ -49,6 +49,17 @@ pub const SocketOptions = struct {
     linger_sec: u32 = 0,
 };
 
+fn timeoutMs(sec: i64, usec: i64) ?u32 {
+    const max_ms: u64 = 0xFFFF_FFFF;
+    if (sec < 0 or usec < 0 or usec >= 1_000_000) return null;
+
+    const seconds: u64 = @intCast(sec);
+    // Bound before scaling so a valid but huge timeval saturates safely.
+    if (seconds > max_ms / 1000) return @intCast(max_ms);
+    const total_ms = seconds * 1000 + @as(u64, @intCast(usec)) / 1000;
+    return @intCast(@min(total_ms, max_ms));
+}
+
 // ─── Resolve fd → SocketOptions pointer ───────────────────────────────────
 
 fn resolveTcpIdx(fd: u64) ?u32 {
@@ -85,53 +96,49 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
             SO_REUSEADDR => {
                 if (optlen < 4) return -22;
                 var buf: [4]u8 = undefined;
-                _ = copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4);
+                if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
                 opts.reuse_addr = bo.readU32Le(&buf) != 0;
             },
             SO_KEEPALIVE => {
                 if (optlen < 4) return -22;
                 var buf: [4]u8 = undefined;
-                _ = copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4);
+                if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
                 opts.keep_alive = bo.readU32Le(&buf) != 0;
             },
             SO_RCVTIMEO => {
                 // struct timeval { tv_sec: i64, tv_usec: i64 } = 16 bytes
                 if (optlen < 16) return -22;
                 var tv: [16]u8 = undefined;
-                _ = copy_mod.copyFromUser(&tv, @ptrFromInt(optval_ptr), 16);
+                if (copy_mod.copyFromUser(&tv, @ptrFromInt(optval_ptr), 16) != 16) return -14;
                 const sec = bo.readI64Le(tv[0..8]);
                 const usec = bo.readI64Le(tv[8..16]);
-                if (sec < 0) return -22;
-                const total_ms = @as(u64, @intCast(sec)) * 1000 + @as(u64, @intCast(@max(usec, 0))) / 1000;
-                opts.rcv_timeout_ms = if (total_ms > 0xFFFFFFFF) 0xFFFFFFFF else @intCast(total_ms);
+                opts.rcv_timeout_ms = timeoutMs(sec, usec) orelse return -22;
             },
             SO_SNDTIMEO => {
                 if (optlen < 16) return -22;
                 var tv: [16]u8 = undefined;
-                _ = copy_mod.copyFromUser(&tv, @ptrFromInt(optval_ptr), 16);
+                if (copy_mod.copyFromUser(&tv, @ptrFromInt(optval_ptr), 16) != 16) return -14;
                 const sec = bo.readI64Le(tv[0..8]);
                 const usec = bo.readI64Le(tv[8..16]);
-                if (sec < 0) return -22;
-                const total_ms = @as(u64, @intCast(sec)) * 1000 + @as(u64, @intCast(@max(usec, 0))) / 1000;
-                opts.snd_timeout_ms = if (total_ms > 0xFFFFFFFF) 0xFFFFFFFF else @intCast(total_ms);
+                opts.snd_timeout_ms = timeoutMs(sec, usec) orelse return -22;
             },
             SO_RCVBUF => {
                 if (optlen < 4) return -22;
                 var buf: [4]u8 = undefined;
-                _ = copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4);
+                if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
                 opts.rcv_buf_size = bo.readU32Le(&buf);
             },
             SO_SNDBUF => {
                 if (optlen < 4) return -22;
                 var buf: [4]u8 = undefined;
-                _ = copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4);
+                if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
                 opts.snd_buf_size = bo.readU32Le(&buf);
             },
             SO_LINGER => {
                 // struct linger { l_onoff: i32, l_linger: i32 } = 8 bytes
                 if (optlen < 8) return -22;
                 var buf: [8]u8 = undefined;
-                _ = copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 8);
+                if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 8) != 8) return -14;
                 opts.linger_on = bo.readU32Le(buf[0..4]) != 0;
                 opts.linger_sec = bo.readU32Le(buf[4..8]);
             },
@@ -142,13 +149,13 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
             TCP_NODELAY => {
                 if (optlen < 4) return -22;
                 var buf: [4]u8 = undefined;
-                _ = copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4);
+                if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
                 opts.tcp_nodelay = bo.readU32Le(&buf) != 0;
             },
             TCP_CORK => {
                 if (optlen < 4) return -22;
                 var buf: [4]u8 = undefined;
-                _ = copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4);
+                if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
                 const new_cork = bo.readU32Le(&buf) != 0;
                 // Uncorking triggers flush of any pending data
                 if (opts.tcp_cork and !new_cork) {
@@ -161,7 +168,7 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
             TCP_QUICKACK => {
                 if (optlen < 4) return -22;
                 var buf: [4]u8 = undefined;
-                _ = copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4);
+                if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
                 opts.tcp_quickack = bo.readU32Le(&buf) != 0;
                 // Setting quickack immediately flushes any pending delayed ACK
                 if (opts.tcp_quickack) {
@@ -171,19 +178,19 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
             TCP_KEEPIDLE => {
                 if (optlen < 4) return -22;
                 var buf: [4]u8 = undefined;
-                _ = copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4);
+                if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
                 opts.keep_idle = bo.readU32Le(&buf);
             },
             TCP_KEEPINTVL => {
                 if (optlen < 4) return -22;
                 var buf: [4]u8 = undefined;
-                _ = copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4);
+                if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
                 opts.keep_intvl = bo.readU32Le(&buf);
             },
             TCP_KEEPCNT => {
                 if (optlen < 4) return -22;
                 var buf: [4]u8 = undefined;
-                _ = copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4);
+                if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
                 opts.keep_cnt = bo.readU32Le(&buf);
             },
             else => return -92, // ENOPROTOOPT
@@ -208,16 +215,19 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
     const opts = tcp_mod.tcpGetOptions(tcb_idx) orelse return -88;
 
     if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT
+    if (optlen_ptr == 0 or optlen_ptr >= 0x0000_8000_0000_0000) return -14;
 
     const copy_mod = @import("../mm/copy_from_user.zig");
 
+    // optlen is both input and output, so verify both access modes before
+    // reading any one-shot socket state.
+    if (!copy_mod.validateUserBuffer(optlen_ptr, 4) or !copy_mod.validateUserBufferWritable(optlen_ptr, 4)) return -14;
+
     // Read current optlen from user space
     var user_optlen: u32 = 0;
-    if (optlen_ptr != 0 and optlen_ptr < 0x0000_8000_0000_0000) {
-        var len_buf: [4]u8 = undefined;
-        _ = copy_mod.copyFromUser(&len_buf, @ptrFromInt(optlen_ptr), 4);
-        user_optlen = bo.readU32Le(&len_buf);
-    }
+    var len_buf: [4]u8 = undefined;
+    if (copy_mod.copyFromUser(&len_buf, @ptrFromInt(optlen_ptr), 4) != 4) return -14;
+    user_optlen = bo.readU32Le(&len_buf);
 
     var val_buf: [16]u8 = undefined;
     var val_len: u32 = 0;
@@ -258,7 +268,6 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
             SO_ERROR => {
                 val_len = 4;
                 bo.writeI32Le(val_buf[0..4], opts.so_error);
-                tcp_mod.tcpClearSoError(tcb_idx); // v53.14: Clear under lock (one-shot)
             },
             SO_LINGER => {
                 val_len = 8;
@@ -306,10 +315,12 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
     }
 
     // Write actual length back to optlen_ptr
-    if (optlen_ptr != 0 and optlen_ptr < 0x0000_8000_0000_0000) {
-        var len_out: [4]u8 = undefined;
-        bo.writeU32Le(&len_out, val_len);
-        if (copy_mod.copyToUser(@ptrFromInt(optlen_ptr), &len_out, 4) != 4) return -14;
+    var len_out: [4]u8 = undefined;
+    bo.writeU32Le(&len_out, val_len);
+    if (copy_mod.copyToUser(@ptrFromInt(optlen_ptr), &len_out, 4) != 4) return -14;
+
+    if (level == SOL_SOCKET and optname == SO_ERROR) {
+        tcp_mod.tcpClearSoErrorIfEqual(tcb_idx, opts.so_error);
     }
 
     return 0;

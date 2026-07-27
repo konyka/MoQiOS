@@ -655,12 +655,14 @@ pub fn tcpSetOptions(tcb_idx: u32, opts: socket_opt.SocketOptions) bool {
     return true;
 }
 
-/// Clear SO_ERROR for a TCB (v53.14: locked — SO_ERROR is one-shot, cleared on read).
-pub fn tcpClearSoError(tcb_idx: u32) void {
+/// Clear SO_ERROR only if it still matches the value delivered to userspace.
+pub fn tcpClearSoErrorIfEqual(tcb_idx: u32, expected: i32) void {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
     if (tcb_idx < MAX_CONNECTIONS and tcbs[tcb_idx].active) {
-        tcbs[tcb_idx].options.so_error = 0;
+        if (tcbs[tcb_idx].options.so_error == expected) {
+            tcbs[tcb_idx].options.so_error = 0;
+        }
     }
 }
 
@@ -2307,7 +2309,6 @@ fn driveTcbStateMachine(
             // Ignore packets in other states
         },
     }
-
 }
 
 pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, ecn_ce: bool) void {
@@ -2357,7 +2358,6 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, e
 
     driveTcbStateMachine(tcb, seq_num, ack_num, flags, raw_window, opts, data, @intCast(payload_offset), payload_len, &pending_events, &pending_idx, ecn_ce);
 }
-
 
 fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) void {
     // Check if this is the expected sequence

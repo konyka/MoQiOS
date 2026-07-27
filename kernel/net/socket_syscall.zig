@@ -17,6 +17,8 @@ const copy = @import("../mm/copy_from_user.zig");
 const bo = @import("../lib/byte_order.zig");
 
 const ENOTCONN: i64 = -107;
+const SOCKADDR_UN_PATH_OFFSET: u32 = 2;
+const SOCKADDR_IN_MIN_LEN: u32 = 8;
 
 // ── FD allocation helpers ──────────────────────────────────────────
 
@@ -144,7 +146,6 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
 
 /// bind(fd, addr_ptr, addr_len) → 0 or -errno
 pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
-    _ = addr_len;
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
 
@@ -154,11 +155,13 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     if (t.fd_table.fds[fd].fd_type == .unix_socket) {
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
         if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -1;
+        if (addr_len <= SOCKADDR_UN_PATH_OFFSET) return -22; // EINVAL: family plus at least one path byte
         var sock_addr_buf: [110]u8 = undefined;
-        const copied = copy.copyFromUser(&sock_addr_buf, @ptrFromInt(addr_ptr), 110);
-        if (copied < 3) return -22; // EINVAL
+        const to_copy = @min(@as(usize, addr_len), sock_addr_buf.len);
+        const copied = copy.copyFromUser(sock_addr_buf[0..to_copy], @ptrFromInt(addr_ptr), to_copy);
+        if (copied <= SOCKADDR_UN_PATH_OFFSET) return -22; // EINVAL
         var path_len: usize = 0;
-        for (2..110) |j| {
+        for (2..copied) |j| {
             if (sock_addr_buf[j] == 0) break;
             path_len += 1;
         }
@@ -171,6 +174,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -1;
         const is_v6 = t.fd_table.fds[fd].udp_is_v6;
         if (is_v6) {
+            if (addr_len < sa.SOCKADDR_IN6_LEN) return -22;
             var sa6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
             const n = copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN);
             if (n < sa.SOCKADDR_IN6_LEN) return -22; // EINVAL
@@ -180,9 +184,10 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
             t.fd_table.fds[fd].udp_port = parsed.port;
             return 0;
         }
+        if (addr_len < SOCKADDR_IN_MIN_LEN) return -22;
         var sock_addr: [sa.SOCKADDR_IN_LEN]u8 = undefined;
-        const n4 = copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), 8);
-        if (n4 < 8) return -22;
+        const n4 = copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), SOCKADDR_IN_MIN_LEN);
+        if (n4 < SOCKADDR_IN_MIN_LEN) return -22;
         // Accept legacy callers that only filled port+addr; family may be unset.
         const new_port = bo.readU16BeAt(&sock_addr, 2);
         const idx = udp.ensurePort(new_port);
@@ -197,14 +202,16 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -1;
     const info = net_mod.tcp.tcpGetAddrInfo(tcb_idx) orelse return -1;
     if (info.is_v6) {
+        if (addr_len < sa.SOCKADDR_IN6_LEN) return -22;
         var sa6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
         if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) < sa.SOCKADDR_IN6_LEN)
             return -22;
         const parsed = sa.parseInet6(&sa6) orelse return -97; // EAFNOSUPPORT
         return net_mod.tcp.tcpBind(tcb_idx, parsed.port);
     }
+    if (addr_len < SOCKADDR_IN_MIN_LEN) return -22;
     var sock_addr: [8]u8 = undefined;
-    _ = copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), 8);
+    if (copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), SOCKADDR_IN_MIN_LEN) != SOCKADDR_IN_MIN_LEN) return -14;
     const port = bo.readU16BeAt(&sock_addr, 2);
     return net_mod.tcp.tcpBind(tcb_idx, port);
 }
@@ -292,7 +299,6 @@ pub fn accept4(fd: u32, addr_ptr: u64, addr_len_ptr: u64, flags: u32) i64 {
 /// sendto(fd, buf, len, flags, addr_ptr, addr_len) → bytes sent or -errno
 pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: u32) i64 {
     _ = flags;
-    _ = addr_len;
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
 
@@ -314,6 +320,7 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
             var dst6: [16]u8 = @splat(0);
             var dst_port6: u16 = 0;
             if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000) {
+                if (addr_len < sa.SOCKADDR_IN6_LEN) return -22;
                 var sa6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
                 if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) < sa.SOCKADDR_IN6_LEN)
                     return -22;
@@ -339,11 +346,11 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         var dst_ip: [4]u8 = .{ 0, 0, 0, 0 };
         var dst_port: u16 = 0;
         if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000) {
+            if (addr_len < SOCKADDR_IN_MIN_LEN) return -22;
             var sa_buf: [16]u8 = undefined;
-            if (copy.copyFromUser(&sa_buf, @ptrFromInt(addr_ptr), 16) >= 8) {
-                dst_port = bo.readU16BeAt(&sa_buf, 2);
-                dst_ip = .{ sa_buf[4], sa_buf[5], sa_buf[6], sa_buf[7] };
-            }
+            if (copy.copyFromUser(sa_buf[0..SOCKADDR_IN_MIN_LEN], @ptrFromInt(addr_ptr), SOCKADDR_IN_MIN_LEN) != SOCKADDR_IN_MIN_LEN) return -14;
+            dst_port = bo.readU16BeAt(&sa_buf, 2);
+            dst_ip = .{ sa_buf[4], sa_buf[5], sa_buf[6], sa_buf[7] };
         } else if (t.fd_table.fds[fd].udp_connected) {
             // Use connected destination when no address provided (send() on connected UDP)
             dst_ip = t.fd_table.fds[fd].udp_dst_ip;
