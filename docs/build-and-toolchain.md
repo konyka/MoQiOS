@@ -1,7 +1,7 @@
 # MoQiOS 构建系统与工具链
 
 > **文档定位**: 描述 MoQiOS 的编译、链接、镜像打包与启动流程。
-> **修订日期**: 2026-07-26
+> **修订日期**: 2026-07-28
 > **关联文档**: [moqios-architecture-current.md](./moqios-architecture-current.md)
 
 ---
@@ -94,7 +94,7 @@ SECTIONS {
 > 分别对 `c_programs` / `asm_programs` 列表循环调用。新增用户程序时只需把程序名追加到对应
 > 列表即可，无需复制整段构建步骤（2026-06 重构：从 ~900 行样板收敛至 ~160 行）。
 
-### 4.1 C 程序（hello4–hello28, sh）
+### 4.1 C 程序（hello4–hello41, sh）
 
 `addCUserProgram(b, name)`：用 `zig cc` 交叉编译为静态 freestanding ELF，并直接输出到
 `user/<name>.bin`。这些 `.bin` 文件实际仍是 ELF，内核 loader 会自动识别 ELF/flat binary。
@@ -239,7 +239,7 @@ qemu-system-x86_64 \
 | `zig build run` | 编译并启动 QEMU 仿真 |
 | `zig build debug` | 启动 QEMU 并在 1234 端口监听 GDB（`-s -S`） |
 | `zig build test` | 在主机目标运行 `tests/main.zig` 单元测试，覆盖可脱离硬件执行的共享库逻辑 |
-| `zig build smoke` | 单核 QEMU 限时冒烟测试，串口日志需出现当前 init 自动序列末尾 `hello21 done` 和 `MoQiOS shell` |
+| `zig build smoke` | 单核 QEMU 限时冒烟测试，串口日志需出现当前 init 自动序列末尾 `hello41: PASS`（及 `hello38`–`hello41` 全部 PASS 标记）和 `MoQiOS shell` |
 | `zig build smoke-smp` | SMP QEMU 限时冒烟测试（默认 `MOQI_SMP=2`），验证 AP 启动路径仍能跑完整个 init 测试序列；`MOQI_SMP=N` 可指定任意正整数核数 |
 | `zig build smoke-smp-matrix` | 按 `MOQI_SMOKE_MATRIX_CPUS`（默认 `"1 2 3 4 6 8"`）依次运行各核数冒烟；16 核在 TCG 下需 `MOQI_SMOKE_TIMEOUT=600` |
 | `zig build smoke-smp-stress` | 连续执行 `MOQI_SMOKE_RUNS`（默认 5）次指定核数（`MOQI_SMP`，默认 2）冒烟；捕获任务槽复用、共享内核映射和调度时序回归 |

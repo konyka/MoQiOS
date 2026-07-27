@@ -5,8 +5,8 @@
 ## 项目状态
 
 **当前进度**: x86_64 主路径已覆盖 M11+ 及多项扩展 (TCP、ext2、AHCI/NVMe、tmpfs/procfs、SMP)。
-系统可正常引导至调度器，并通过 QEMU 串口跑通 `init` + `hello2`–`hello21` 和 Shell；
-`hello22`–`hello28` 保留为手动集成用例。riscv64/aarch64 当前是独立的移植骨架，分别有 QEMU smoke 门禁。
+系统可正常引导至调度器，并通过 QEMU 串口跑通 `init` + 各 hello 用例（`hello2`–`hello41` 中 `init` 自动执行的子集）和 Shell；
+`hello6`、`hello21` 等需要交互输入的用例保留为手动集成用例；`hello38`–`hello41` 是 2026-07-28 新增的强制 smoke 门禁测试。riscv64/aarch64 当前是独立的移植骨架，分别有 QEMU smoke 门禁。
 
 | 里程碑 | 功能 | 状态 |
 |---|---|---|
@@ -61,7 +61,7 @@
 
 **用户程序**: ~3,600 行 C/ASM | **测试**: `zig build test` 覆盖主机可运行的共享库逻辑；QEMU
 `smoke`/`smoke-smp`/`smoke-smp-matrix` 覆盖 x86_64 启动与集成路径（矩阵默认测试 1/2/3/4/6/8 核），
-`hello22`–`hello28` 可手动运行。
+`init` 自动执行其中配置好的非交互 hello 用例；`hello38`–`hello41` 是 2026-07-28 新增的强制 smoke 门禁（`copy_file_range`、`setsockopt`/`getsockopt`、`futex_waitv`、`rt_sigsuspend`）。
 
 ## 功能特性
 
@@ -193,6 +193,10 @@
 | hello23–25 | ext2 多级路径 / unlink / mkdir |
 | hello26–27 | TCP echo server / connect() |
 | hello28 | ext2 目录列举 (listdir) |
+| hello38 | futex 用户指针 EFAULT 与 futex_waitv 数量/记录校验 |
+| hello39 | setsockopt/getsockopt 用户复制、SO_ERROR 与 sockaddr 长度校验 |
+| hello40 | SysV IPC_SET 与 rt_sigsuspend 失败复制不改变状态 |
+| hello41 | copy_file_range fd 边界与显式 offset 回滚 |
 
 ## 快速开始
 

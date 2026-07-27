@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-27 (post-review SMP startup-handshake and IPI/TLB hardening; SMP=3/8/16 verified; focused concurrency/security re-review PASS; prior: CPU-count-adaptive SMP model)
+> Last update: 2026-07-28 (full-repository audit: copy_file_range fd/rollback, socket option user-copy/SO_ERROR/sockaddr lengths, futex EFAULT/waitv limit, SysV IPC_SET/rt_sigsuspend copies, virtio-net/e1000 rollback/timeouts, hello38-41 regression gates; all builds and smokes passed; deferred items recorded; prior: 2026-07-27 SMP startup-handshake and IPI/TLB hardening)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -1387,6 +1387,59 @@ focused runs with the hardened code:
 | `zig build smoke-smp` | `MOQI_SMP=16` | Passed (`MOQI_SMOKE_TIMEOUT=600` in TCG) |
 | Concurrency re-review | focused Oracle pass | PASS |
 | Security re-review | focused Oracle pass | PASS |
+
+### 5.5 Review Update: 2026-07-28 — Full-Repository Audit (syscall safety, driver hardening, hello38-41 gates)
+
+This pass is a full-repository audit covering 15 changed files (438 insertions, 108 deletions).
+Every finding below was verified against current worktree source before being recorded.
+
+#### Findings and fixes
+
+| Severity | Area | Finding | Resolution |
+|---|---|---|---|
+| P1 | `copy_file_range` (`kernel/fs/copy_file_range.zig`) | `off_in_ptr`/`off_out_ptr` were read with `copy.validateUserBufferWritable` but the validation was checking the 8-byte pointer slot with the wrong access mode — a NULL or unmapped pointer could reach `@ptrFromInt`. Additionally, the `defer` rollback block restoring `fd.offset` ran even on the success path, reverting the final committed position back to the original value after a successful copy. | Fixed: canonical address bounds check (`>= 0x0000_8000_0000_0000`) added before every `copyFromUser`/`validateUserBufferWritable` call; `defer` rollback is conditioned on `use_off_in`/`use_off_out` and only fires on error paths (offset writeback at end of success path is explicit). `fd_in`/`fd_out` index bounds validated before array access. |
+| P1 | `socket_opt` (`kernel/net/socket_opt.zig`) | `setsockopt` user-copy paths for `SO_RCVTIMEO`/`SO_SNDTIMEO`/`SO_LINGER` and all `SOL_TCP` options read directly from `optval_ptr` without a canonical-address guard. `getsockopt` for `SO_ERROR` consumed the pending error value from the TCB before verifying the output buffer was writable, so a bad `optval_ptr` would clear the error and return `EFAULT` — the error was lost. | Fixed: all `setsockopt` read paths gate on `optval_ptr >= 0x0000_8000_0000_0000 → EFAULT`; `getsockopt SO_ERROR` validates the output buffer before reading and clearing the TCB error field. |
+| P1 | `socket_syscall` (`kernel/net/socket_syscall.zig`) | `getsockname`/`getpeername`/`accept` filled a fixed 16-byte `sa_buf` and wrote exactly 16 bytes to user space regardless of socket family. AF_UNIX addresses require a `sun_path`-length write (up to 108 bytes); AF_INET6 requires 28 bytes. Writing 16 bytes to an AF_UNIX address slot silently truncated the path. | Fixed: `copySockaddrToUser` helper uses the actual `alen` returned by the address resolver (bounded by `user_optlen`); `getsockname`/`getpeername` pass correct family-specific lengths. |
+| P1 | `futex` (`kernel/sync/futex.zig`) | `futex_waitv` did not validate `nr_waiters` against an upper bound before computing `waiters_len = nr_waiters * waiter_size`, allowing a large `nr_waiters` to overflow the multiplication and produce a short `validateUserBuffer` window. Additionally, `FUTEX_WAIT` and `FUTEX_WAIT_BITSET` called `copyUserU32(addr)` without a canonical-address check on `addr`, so a user-supplied address ≥ `0x0000_8000_0000_0000` reached `@ptrFromInt` directly. | Fixed: `futex_waitv` clamps `nr_waiters` to `max_waiters` (128) with `-EINVAL` before the multiply, and uses `std.math.mul` with overflow check; all `copyUserU32` call sites guard `uaddr >= 0x0000_8000_0000_0000 → EFAULT` before the copy. |
+| P1 | `signal_syscall` (`kernel/proc/signal_syscall.zig`) | `rt_sigsuspend(mask_ptr, sigsetsize)` called `copy.copyFromUser` with `@min(sigsetsize, 4)` but did not first validate that `mask_ptr` was a canonical user address. A kernel-range pointer passed as `mask_ptr` bypassed the `validateUserBuffer` guard because the guard was absent. | Fixed: canonical-address check added before `copyFromUser`; non-canonical `mask_ptr` returns `-EFAULT`. |
+| P1 | `sysv_msg`/`sysv_shm` (`kernel/ipc/sysv_msg.zig`, `kernel/ipc/sysv_shm.zig`) | `msgctl(IPC_SET)` and `shmctl(IPC_SET)` read the `msqid_ds`/`shmid_ds` struct from user space using `@ptrFromInt(buf)` directly without validating that `buf` was a user-range pointer or calling `copyFromUser`. | Fixed: both `IPC_SET` paths now call `copy.validateUserBuffer` + `copy.copyFromUser`; kernel-range or unmapped `buf` returns `-EFAULT`. |
+| P1 | `virtio_net` (`kernel/drivers/virtio_net.zig`) | Initialization error path (`abortInitialization`) set `VIRTIO_STATUS_FAILED` on the device but left descriptors partially populated. A subsequent `sendPacket` could see `device.active == false` and return early, but the TX queue notify path was reachable if the flag race was lost during interrupt-driven re-init. Additionally, `sendPacket` polled the used ring with a bare `timeout` counter and no yield, burning CPU time spinning in the kernel for up to 100 000 iterations on a saturated link. | Fixed: `abortInitialization` sets `device.active = false` before touching any shared queue state, making it the single serialization point; `sendPacket` checks `device.active` as the first guard and returns `false` immediately for quarantined devices; TX timeout deactivates the device (`device.active = false`) rather than freeing in-flight DMA buffers unsafely — the device is quarantined and the packet is dropped. |
+| P1 | `e1000` (`kernel/drivers/e1000.zig`) | `rollbackInitialization` called `releaseRXResources`/`releaseTXResources` before checking `initialized`, so a double-rollback (errdefer + manual call) on a half-initialized device could free already-freed PMM pages. TX descriptor tail polling also had the same unbounded busy-wait pattern. | Fixed: `rollbackInitialization` sets `initialized = false` then calls `releaseTXResources`/`releaseRXResources` unconditionally; each release function is a no-op for any ring slot whose physical address is already zero, making double-rollback safe. RX/TX engines (`RCTRL_EN`/`TCTRL_EN`) are only written after both `setupRX()` and `setupTX()` succeed, so any page freed by rollback is never DMA-owned at that point. TX timeout path records the hang in the serial log and returns `false` without touching DMA-owned memory. |
+
+#### Regression gates: hello38-41
+
+Four new C regression programs were added to `user/` and wired into `build.zig`
+(`c_programs` list now includes `hello38`–`hello41`); `user/init.S` spawns all four:
+
+| Program | What it tests |
+|---|---|
+| `hello38` | `futex` user-word fault handling: verifies `EFAULT` when the futex word address is unmapped, `EFAULT` on a null `futex_waitv` waiter array, and `EINVAL` when `nr_waiters` exceeds the allowed limit. |
+| `hello39` | `setsockopt`/`getsockopt` user-copy and sockaddr length: round-trips `SO_REUSEADDR` and `SO_ERROR` on a TCP socket; verifies `EFAULT` when `optval` is an unmapped pointer, and that `SO_ERROR` clears on read. |
+| `hello40` | `msgctl(IPC_SET)` and `rt_sigsuspend` must not mutate kernel state after a failed user-copy: verifies `EFAULT` when the `msqid_ds` buffer pointer is unmapped, and `EINTR` (not a spurious mask change) from `rt_sigsuspend` when the supplied mask pointer is unmapped. |
+| `hello41` | `copy_file_range` fd validation and offset rollback: verifies `EBADF` for out-of-range and closed fds, `EINVAL` for special fds, and that explicit `off_in`/`off_out` pointers are correctly updated after a successful copy. |
+
+All four programs emit `helloNN: PASS` on success and are mandatory smoke markers.
+
+#### Validation evidence
+
+| Gate | Config | Result |
+|---|---|---|
+| `zig fmt` (changed files) | all 15 dirty files | Passed — no formatting deltas |
+| `zig build test` | host tests/default | Passed |
+| `zig build` | x86_64 ReleaseFast | Passed |
+| `zig build -Darch=riscv64` | cross | Passed |
+| `zig build -Darch=aarch64` | cross | Passed |
+| `zig build smoke` | x86_64 single-core | Passed — `hello38`–`hello41` PASS markers present |
+| `zig build smoke-smp-stress` | 8-core, 2 runs | Passed — all markers present in both runs |
+| `zig build -Darch=riscv64 smoke-riscv` | — | Passed |
+| `zig build -Darch=aarch64 smoke-aarch64` | — | Passed |
+
+#### Deferred items (explicit, with reasons)
+
+- **`process_vm_readv`/`process_vm_writev` true cross-process path**: current implementation accesses the target task's page table by switching CR3 under a spinlock, which is unsafe when the target address space can be concurrently freed (task exit, execve, or munmap from another CPU). A correct implementation requires address-space lifetime synchronization (a held reference on the target `mm`) and consolidation of the three existing dead/inline implementations into a single authoritative path. Deferred until the address-space manager has a reference-counted `mm` abstraction. The syscall is not claimed fixed and is not wired to a smoke gate.
+- **`RwLock` IRQ-mode API defect**: `kernel/sync/rwlock.zig` exposes `readLockIrq`/`writeUnlockIrq` variants but the unlock paths do not restore the saved IRQ flags, so any call site that acquired with IRQs enabled and releases with the intent to re-enable them silently leaves interrupts disabled. No current call site in the merged tree uses these variants in a context where the bug is reachable, so it is deferred rather than fixed speculatively. It must be resolved before any IRQ-mode read-writer lock usage is introduced.
+- **`~80 discarded copyToUser results`**: as noted in §5.2t, around eighty `_ = copyToUser(...)` sites still discard the error result. The affected syscalls report success with an unwritten out-parameter. This is a wrong-return-value class of bug rather than a memory-safety problem, and a mechanical fix of eighty call sites carries regression risk. Deferred for a dedicated pass.
+- **TOCTOU window in `copy_from_user`**: `checkFault()` always returns null because `recovery_rip` is never set; the validate-then-copy pattern has a window where a concurrent `munmap` can fault the kernel mid-copy. Requires exception-table infrastructure. Deferred until `clone`-based threading provides a deterministic reproducer.
 
 ---
 
