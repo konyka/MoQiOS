@@ -3,6 +3,7 @@
 /// Provides FUTEX_WAIT/WAKE/REQUEUE/CMP_REQUEUE/WAKE_OP/WAIT_BITSET/WAKE_BITSET.
 /// Uses a 64-bucket hash table keyed on the futex address for O(1) lookup.
 /// Integrates with the scheduler for blocking/waking tasks.
+const std = @import("std");
 const task_mod = @import("../proc/task.zig");
 const sched_mod = @import("../proc/sched.zig");
 const IrqSpinlock = @import("irq_spinlock.zig").IrqSpinlock;
@@ -106,20 +107,23 @@ fn doRequeue(bucket: *FutexBucket, dst_bucket: *FutexBucket, requeue_count: u32)
 }
 
 /// Read a u32 from user space safely.
-pub fn copyUserU32(addr: u64) u32 {
+pub fn copyUserU32(addr: u64) error{Fault}!u32 {
     var buf: [4]u8 = @splat(0);
     const src: [*]const u8 = @ptrFromInt(addr);
-    _ = copy.copyFromUser(buf[0..], src, 4);
+    if (copy.copyFromUser(buf[0..], src, buf.len) != buf.len) return error.Fault;
     return bo.readU32Le(buf[0..]);
 }
 
 /// Read a u64 from user space safely.
-pub fn copyUserU64(addr: u64) u64 {
-    if (addr == 0 or addr >= 0x0000_8000_0000_0000) return 0;
+pub fn copyUserU64Fallible(addr: u64) error{Fault}!u64 {
     var buf: [8]u8 = @splat(0);
-    const n = copy.copyFromUser(&buf, @ptrFromInt(addr), 8);
-    if (n < 8) return 0;
+    if (copy.copyFromUser(buf[0..], @ptrFromInt(addr), buf.len) != buf.len) return error.Fault;
     return bo.readU64At(&buf, 0);
+}
+
+/// Legacy process_vm compatibility wrapper. Futex paths use the fallible helpers.
+pub fn copyUserU64(addr: u64) u64 {
+    return copyUserU64Fallible(addr) catch 0;
 }
 
 /// Wake up to `count` waiters from a futex bucket.
@@ -159,20 +163,35 @@ pub fn wakeN(bucket: *FutexBucket, count: u32) u64 {
 /// futex_waitv(waiters_ptr, nr_waiters, flags, timeout, clockid) -> woken index or -errno.
 /// Vectored futex wait. Simplified: iterate and wait on first matching futex.
 pub fn futexWaitv(waiters_ptr: u64, nr_waiters: u64) i64 {
-    if (waiters_ptr == 0 or waiters_ptr >= 0x0000_8000_0000_0000) return -14; // -EFAULT
     if (nr_waiters == 0) return -22; // -EINVAL
+    const max_waiters = 16;
+    if (nr_waiters > max_waiters) return -22; // -EINVAL
 
     // struct futex_waitv { val: u64, uaddr: u64, flags: u32, __reserved: u32 }
-    const max_waiters: u32 = @intCast(@min(nr_waiters, 16));
-    var i: u32 = 0;
-    while (i < max_waiters) : (i += 1) {
-        const off = @as(u64, i) * 24;
-        const expected_val = copyUserU64(waiters_ptr + off);
-        const uaddr = copyUserU64(waiters_ptr + off + 8);
+    const waiter_size = 24;
+    const waiters_len = std.math.mul(u64, nr_waiters, waiter_size) catch return -14; // -EFAULT
+    if (!copy.validateUserBuffer(waiters_ptr, @intCast(waiters_len))) return -14; // -EFAULT
 
-        if (uaddr == 0 or uaddr >= 0x0000_8000_0000_0000) continue;
+    var waiters: [max_waiters][waiter_size]u8 = undefined;
+    var i: u64 = 0;
+    while (i < nr_waiters) : (i += 1) {
+        const off = i * waiter_size;
+        const waiter_ptr = std.math.add(u64, waiters_ptr, off) catch return -14; // -EFAULT
+        const waiter = &waiters[@intCast(i)];
+        if (copy.copyFromUser(waiter[0..], @ptrFromInt(waiter_ptr), waiter.len) != waiter.len) {
+            return -14; // -EFAULT
+        }
+    }
 
-        const current_val: u64 = @intCast(copyUserU32(uaddr));
+    i = 0;
+    while (i < nr_waiters) : (i += 1) {
+        const waiter = &waiters[@intCast(i)];
+        const expected_val = bo.readU64At(waiter, 0);
+        const uaddr = bo.readU64At(waiter, 8);
+
+        if (uaddr == 0 or uaddr >= 0x0000_8000_0000_0000) return -14; // -EFAULT
+
+        const current_val: u64 = @intCast(copyUserU32(uaddr) catch return -14); // -EFAULT
         if (current_val == expected_val) {
             const bucket_idx = hash(uaddr);
             const bucket = &buckets[bucket_idx];
@@ -199,7 +218,7 @@ pub fn futexWaitv(waiters_ptr: u64, nr_waiters: u64) i64 {
                 removeWaitNode(bucket, &node);
                 return -11;
             }
-            return @bitCast(@as(u64, i));
+            return @bitCast(i);
         }
     }
 
@@ -224,7 +243,7 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
     switch (op) {
         FUTEX_WAIT => {
             // Atomically check *addr == val, then sleep
-            const user_val: u32 = copyUserU32(addr);
+            const user_val = copyUserU32(addr) catch return -14; // -EFAULT
             if (user_val != @as(u32, @truncate(val))) {
                 return -11; // -EAGAIN
             }
@@ -258,7 +277,7 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
         },
         FUTEX_WAIT_BITSET => {
             // Same as FUTEX_WAIT (ignore bitset for now)
-            const user_val: u32 = copyUserU32(addr);
+            const user_val = copyUserU32(addr) catch return -14; // -EFAULT
             if (user_val != @as(u32, @truncate(val))) {
                 return -11;
             }
@@ -315,7 +334,7 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
         FUTEX_CMP_REQUEUE => {
             const cmp_val: u32 = @truncate(val3);
             // v53.44: Check *addr (not *uaddr2) per Linux CMP_REQUEUE semantics
-            const user_val: u32 = copyUserU32(addr);
+            const user_val = copyUserU32(addr) catch return -14; // -EFAULT
             if (user_val != cmp_val) {
                 return -11; // EAGAIN
             }
