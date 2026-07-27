@@ -316,7 +316,7 @@ pub fn msgctl(msqid: u32, cmd: i32, buf: u64) i64 {
             if (buf == 0 or buf >= 0x0000_8000_0000_0000) return EFAULT;
             const copy = @import("../mm/copy_from_user.zig");
             var mode_buf: [1]u64 = .{0};
-            _ = copy.copyFromUser(@ptrCast(&mode_buf), @as([*]const u8, @ptrFromInt(buf)), @sizeOf(u64));
+            if (copy.copyFromUser(@ptrCast(&mode_buf), @as([*]const u8, @ptrFromInt(buf)), @sizeOf(u64)) != @sizeOf(u64)) return EFAULT;
             q.mode = @intCast(mode_buf[0] & 0o777);
             return 0;
         },

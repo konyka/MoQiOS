@@ -208,12 +208,12 @@ pub fn rtSigsuspend(mask_ptr: u64, sigsetsize: u64) i64 {
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    if (mask_ptr != 0 and mask_ptr < 0x0000_8000_0000_0000) {
-        var new_mask: u32 = 0;
-        const mask_bytes: [*]u8 = @ptrCast(&new_mask);
-        _ = copy.copyFromUser(mask_bytes[0..4], @ptrFromInt(mask_ptr), 4);
-        cur.signal_mask = new_mask;
-    }
+    if (mask_ptr == 0 or mask_ptr >= 0x0000_8000_0000_0000) return -14;
+
+    var new_mask: u32 = 0;
+    const mask_bytes: [*]u8 = @ptrCast(&new_mask);
+    if (copy.copyFromUser(mask_bytes[0..4], @ptrFromInt(mask_ptr), 4) != 4) return -14;
+    cur.signal_mask = new_mask;
     return -4; // EINTR
 }
 
