@@ -19,6 +19,7 @@ const paging = @import("../arch/arch.zig").paging;
 const pci = @import("pci.zig");
 const block_dev = @import("block_dev.zig");
 const fmt = @import("../lib/fmt.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 // ─── NVMe Controller Register Offsets (via BAR0 MMIO) ────────────────────
 
@@ -159,6 +160,11 @@ var io_cq_head: [MAX_IO_QUEUES]u16 = @splat(0);
 var io_cq_phase: [MAX_IO_QUEUES]bool = @splat(true); // Phase bit per CQ (v52.3)
 var io_sq_doorbell: [MAX_IO_QUEUES]u64 = @splat(0);
 var io_cq_doorbell: [MAX_IO_QUEUES]u64 = @splat(0);
+// One lock per I/O queue (SMP fix): covers submit+poll+PRP-list rebuild.
+// Two CPUs landing on the same queue would otherwise interleave the
+// io_sq_tail/io_cq_head read-modify-write and rebuild prp_list_phys[q]
+// while the other CPU's DMA reads it.
+var io_locks: [MAX_IO_QUEUES]IrqSpinlock = @splat(.{});
 var num_io_queues: u32 = 0; // Actual number of I/O queues created
 var io_queue_rr: u32 = 0; // Round-robin queue selector
 
@@ -727,6 +733,9 @@ fn deleteCompletionQueue(cq_id: u16) bool {
 
 // ─── I/O Commands ────────────────────────────────────────────────────────
 
+/// Submit a command on an I/O queue and poll for completion.
+/// Caller must hold io_locks[queue_idx] — the lock also covers the
+/// per-queue PRP list rebuild done by readSectors/writeSectors.
 fn submitIoCmd(queue_idx: u32, cmd: *const NvmeCommand) ?NvmeCompletion {
     const q = queue_idx;
     const sq: [*]NvmeCommand = @ptrFromInt(hhdm.physToVirt(io_sq_phys[q]));
@@ -769,7 +778,13 @@ inline fn selectQueue() u32 {
 /// Returns number of sectors read, or negative error.
 pub fn readSectors(lba: u64, count: u32, buf: [*]u8) i32 {
     if (!enabled) return -1;
+    // count==0 would compute NLB as (count - 1) = 0xFFFF (u16 underflow)
+    if (count == 0) return -1;
     const q = selectQueue();
+
+    // Serialize submit+poll+PRP-list rebuild on this queue (SMP fix)
+    const flags = io_locks[q].acquire();
+    defer io_locks[q].release(flags);
 
     // Determine buffer physical address
     const buf_phys = hhdm.virtToPhys(@intFromPtr(buf));
@@ -820,7 +835,13 @@ pub fn readSectors(lba: u64, count: u32, buf: [*]u8) i32 {
 /// Returns number of sectors written, or negative error.
 pub fn writeSectors(lba: u64, count: u32, buf: [*]const u8) i32 {
     if (!enabled) return -1;
+    // count==0 would compute NLB as (count - 1) = 0xFFFF (u16 underflow)
+    if (count == 0) return -1;
     const q = selectQueue();
+
+    // Serialize submit+poll+PRP-list rebuild on this queue (SMP fix)
+    const flags = io_locks[q].acquire();
+    defer io_locks[q].release(flags);
 
     const buf_phys = hhdm.virtToPhys(@intFromPtr(buf));
 

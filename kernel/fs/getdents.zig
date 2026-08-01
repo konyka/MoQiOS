@@ -94,10 +94,19 @@ fn getdents64Ext2(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i6
 }
 
 fn getdents64Tmpfs(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i64 {
+    // v53.51: tmpfsListDir copies entries+names into caller-owned buffers
+    // under tmpfs_lock — one page holds all names (64 entries x 60 bytes).
+    const pmm = @import("../mm/pmm.zig");
+    const hhdm = @import("../mm/hhdm.zig");
+    const names_phys = pmm.allocPage() orelse return -12; // ENOMEM
+    defer pmm.freePage(names_phys);
+    const names_buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(names_phys));
+    var entries_buf: [64]tmpfs.TmpfsDirEntry = undefined;
+
     var kbuf: [4096]u8 = undefined;
     var written: u64 = 0;
     var emitted: u32 = 0;
-    const entries = tmpfs.tmpfsListDir(@intCast(desc.tmpfs_idx));
+    const entries = tmpfs.tmpfsListDir(@intCast(desc.tmpfs_idx), &entries_buf, names_buf, 4096);
     const start: u32 = @intCast(desc.offset);
     var idx: u32 = start;
     while (idx < entries.count) : (idx += 1) {

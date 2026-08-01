@@ -13,6 +13,9 @@ const arch = @import("../arch/arch.zig");
 const writeback = @import("../fs/writeback.zig");
 
 const FILE_IDX: u32 = 23;
+// v53.51: writeback buffers are keyed by inode_id; FILE_IDX is only the
+// flush-target slot passed to the probe callback.
+const INODE_ID: u64 = 0x3000_0000_0000_0000 + @as(u64, FILE_IDX);
 const OFFSET: u64 = 8192;
 const payload = "SK155-flush-fail";
 
@@ -50,7 +53,7 @@ pub fn announce() void {
     }
 
     const before = writeback.getDirtyCount();
-    if (writeback.writeBuffered(FILE_IDX, OFFSET, payload.ptr, payload.len, .ext2) != payload.len) {
+    if (writeback.writeBuffered(INODE_ID, FILE_IDX, OFFSET, payload.ptr, payload.len, .ext2) != payload.len) {
         fail("stage buffer");
         return;
     }
@@ -60,7 +63,7 @@ pub fn announce() void {
     }
 
     // A flush whose write fails must report failure...
-    if (writeback.flushFile(FILE_IDX, .ext2, failingFlush)) {
+    if (writeback.flushFile(INODE_ID, .ext2, failingFlush)) {
         fail("failure reported as success");
         return;
     }
@@ -75,7 +78,7 @@ pub fn announce() void {
     }
 
     // The same buffer flushes cleanly once the write succeeds.
-    if (!writeback.flushFile(FILE_IDX, .ext2, succeedingFlush)) {
+    if (!writeback.flushFile(INODE_ID, .ext2, succeedingFlush)) {
         fail("retry reported failure");
         return;
     }

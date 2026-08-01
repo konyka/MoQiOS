@@ -10,6 +10,9 @@ const arch = @import("../arch/arch.zig");
 const writeback = @import("../fs/writeback.zig");
 
 const FILE_IDX: u32 = 52;
+// v53.51: writeback buffers are keyed by inode_id; FILE_IDX is only the
+// flush-target slot passed to the probe callback.
+const INODE_ID: u64 = 0x3000_0000_0000_0000 + @as(u64, FILE_IDX);
 const BASE: u64 = 65536;
 
 fn fail(msg: []const u8) void {
@@ -28,7 +31,7 @@ pub fn announce() void {
     var src: [8192]u8 = undefined;
     for (&src, 0..) |*b, i| b.* = @truncate(i / 4096 + 1);
 
-    if (writeback.writeBuffered(FILE_IDX, BASE, &src, src.len, .ext2) != src.len) {
+    if (writeback.writeBuffered(INODE_ID, FILE_IDX, BASE, &src, src.len, .ext2) != src.len) {
         fail("accepted len");
         return;
     }
@@ -37,7 +40,7 @@ pub fn announce() void {
     var out: [4096]u8 = undefined;
     for (0..2) |page| {
         const off = BASE + @as(u64, page) * 4096;
-        if (writeback.readBuffered(FILE_IDX, off, &out, out.len, .ext2) != out.len) {
+        if (writeback.readBuffered(INODE_ID, off, &out, out.len, .ext2) != out.len) {
             fail("extent len");
             return;
         }
@@ -50,11 +53,11 @@ pub fn announce() void {
 
     // Rewriting a shorter run at the same offset must not shorten the extent:
     // the untouched tail is still dirty and has not reached the disk yet.
-    if (writeback.writeBuffered(FILE_IDX, BASE, src[0..16], 16, .ext2) != 16) {
+    if (writeback.writeBuffered(INODE_ID, FILE_IDX, BASE, src[0..16], 16, .ext2) != 16) {
         fail("short accept");
         return;
     }
-    if (writeback.readBuffered(FILE_IDX, BASE, &out, out.len, .ext2) != out.len) {
+    if (writeback.readBuffered(INODE_ID, BASE, &out, out.len, .ext2) != out.len) {
         fail("tail dropped");
         return;
     }

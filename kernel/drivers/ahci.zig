@@ -19,6 +19,7 @@ const pmm = @import("../mm/pmm.zig");
 const pci = @import("pci.zig");
 const main_mod = @import("../main.zig");
 const fmt = @import("../lib/fmt.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 // AHCI port register offsets (relative to port base)
 pub const PORT_CLB: u32 = 0x00;
@@ -234,6 +235,13 @@ var ports: [MAX_AHCI_PORTS]AhciPort = @splat(.{
     .irq_line = 0,
 });
 var active_port_count: u32 = 0;
+// Per-port lock (SMP fix): guards NCQ tag allocation (allocTag/freeTag) and
+// serializes non-NCQ slot selection (findFreeSlot) with command issue+wait.
+// The ISR never takes this lock and never releases tags — only the waiter
+// releases its tag, after it has finished reading requests[tag]; otherwise a
+// freed tag could be reallocated by another CPU and its requests[tag]
+// overwritten before the first waiter reads the result.
+var port_locks: [MAX_AHCI_PORTS]IrqSpinlock = @splat(.{});
 // PCI BDF of the AHCI controller (saved for MSI setup)
 var controller_bus: u8 = 0;
 var controller_dev: u8 = 0;
@@ -854,8 +862,8 @@ fn handlePortInterrupt(port_idx: u32) void {
                 if ((tfd & 0x01) != 0) {
                     ports[port_idx].requests[slot].has_error = true;
                 }
-                // Release the tag
-                ports[port_idx].tag_bitmap |= mask;
+                // Do NOT release the tag here — the waiter releases it after
+                // it has read requests[slot] (SMP use-after-realloc fix).
             }
         }
     }
@@ -875,10 +883,8 @@ fn handlePortInterrupt(port_idx: u32) void {
                 if ((tfd & 0x01) != 0) {
                     ports[port_idx].requests[slot].has_error = true;
                 }
-                // Release tag for NCQ
-                if (ports[port_idx].ncq_supported) {
-                    ports[port_idx].tag_bitmap |= mask;
-                }
+                // Do NOT release the tag here — the waiter releases it after
+                // it has read requests[slot] (SMP use-after-realloc fix).
             }
         }
     }
@@ -909,15 +915,10 @@ fn handlePortError(port_idx: u32, is: u32) void {
         }
     }
 
-    // Release all tags
-    if (ports[port_idx].ncq_supported) {
-        var bm: u32 = 0;
-        var s: u32 = 0;
-        while (s < num_cmd_slots) : (s += 1) {
-            bm |= @as(u32, 1) << @intCast(s);
-        }
-        ports[port_idx].tag_bitmap = bm;
-    }
+    // Do NOT release tags here — each waiter sees completed+has_error and
+    // releases its own tag after reading requests[tag]. Releasing all tags
+    // would let another CPU reallocate a tag and overwrite requests[tag]
+    // before its waiter reads the result (SMP use-after-realloc fix).
 
     // Clear SERR
     writePort(port_base, PORT_SERR, readPort(port_base, PORT_SERR));
@@ -938,6 +939,8 @@ fn handlePortError(port_idx: u32, is: u32) void {
 
 /// Allocate a free NCQ tag. Returns tag number (0-31) or null if all busy.
 fn allocTag(port_idx: u32) ?u8 {
+    const flags = port_locks[port_idx].acquire();
+    defer port_locks[port_idx].release(flags);
     var tag: u8 = 0;
     while (tag < num_cmd_slots) : (tag += 1) {
         const mask = @as(u32, 1) << @intCast(tag);
@@ -949,10 +952,13 @@ fn allocTag(port_idx: u32) ?u8 {
     return null;
 }
 
-/// Release an NCQ tag.
+/// Release an NCQ tag. Only called by the waiter (waitCompletion), never by
+/// the ISR — see port_locks comment.
 fn freeTag(port_idx: u32, tag: u8) void {
     if (tag >= MAX_CMD_SLOTS) return;
     const mask = @as(u32, 1) << @intCast(tag);
+    const flags = port_locks[port_idx].acquire();
+    defer port_locks[port_idx].release(flags);
     ports[port_idx].tag_bitmap |= mask;
 }
 
@@ -979,6 +985,11 @@ fn readSectorsFromPort(port_idx: u32, lba: u64, count: u32, buf: [*]u8) i64 {
     if (ports[port_idx].ncq_supported) {
         return readNcq(port_idx, lba, count, buf);
     }
+
+    // Non-NCQ fallback: legacy DMA polling. Hold the port lock across slot
+    // selection + issue + wait so two CPUs cannot pick the same slot (SMP fix).
+    const pflags = port_locks[port_idx].acquire();
+    defer port_locks[port_idx].release(pflags);
 
     // Non-NCQ fallback: legacy DMA polling
     const slot = findFreeSlot(port_base) orelse return -1;
@@ -1152,6 +1163,11 @@ fn writeSectorsToPort(port_idx: u32, lba: u64, count: u32, buf: [*]const u8) i64
         return writeNcq(port_idx, lba, count, @constCast(buf));
     }
 
+    // Non-NCQ fallback: legacy DMA polling. Hold the port lock across slot
+    // selection + issue + wait so two CPUs cannot pick the same slot (SMP fix).
+    const pflags = port_locks[port_idx].acquire();
+    defer port_locks[port_idx].release(pflags);
+
     // Non-NCQ fallback: legacy DMA polling
     const slot = findFreeSlot(port_base) orelse return -1;
 
@@ -1312,7 +1328,7 @@ fn waitCompletion(port_idx: u32, tag: u8) i64 {
                 if ((tfd & 0x01) != 0) {
                     ports[port_idx].requests[tag].has_error = true;
                 }
-                ports[port_idx].tag_bitmap |= mask;
+                // Tag is released below, after requests[tag] has been read.
                 break;
             }
             // Check for pending interrupts and service them
@@ -1367,6 +1383,11 @@ pub fn trim(lba_ranges: []const u64, range_count: u32) i32 {
 fn trimPort(port_idx: u32, lba_ranges: []const u64, range_count: u32) i32 {
     if (port_idx >= MAX_AHCI_PORTS or !ports[port_idx].active) return -1;
     if (range_count == 0) return 0;
+
+    // Hold the port lock across slot selection + issue + wait so two CPUs
+    // cannot pick the same slot (SMP fix).
+    const pflags = port_locks[port_idx].acquire();
+    defer port_locks[port_idx].release(pflags);
 
     const port_base = ports[port_idx].port_base;
 
@@ -1477,6 +1498,11 @@ pub fn flushCache() i32 {
 
 fn flushCachePort(port_idx: u32) i32 {
     if (port_idx >= MAX_AHCI_PORTS or !ports[port_idx].active) return -1;
+
+    // Hold the port lock across slot selection + issue + wait so two CPUs
+    // cannot pick the same slot (SMP fix).
+    const pflags = port_locks[port_idx].acquire();
+    defer port_locks[port_idx].release(pflags);
 
     const port_base = ports[port_idx].port_base;
     const slot = findFreeSlot(port_base) orelse return -1;

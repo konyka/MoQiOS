@@ -104,6 +104,9 @@ pub const EpollInstance = struct {
 var epoll_pool: [MAX_EPOLL_INSTANCES]EpollInstance = @splat(.{});
 /// Bitmap of valid epoll instances (1 = valid).
 var valid_epoll_bm: u32 = 0;
+/// Guards valid_epoll_bm and instance create/destroy. Lock order:
+/// pool_lock -> inst.spin (epollNotify may run from IRQ context).
+var pool_lock: IrqSpinlock = .{};
 
 /// Obtain a pointer to an epoll instance by index.
 pub fn getInstance(idx: u32) ?*EpollInstance {
@@ -119,6 +122,8 @@ pub fn getInstance(idx: u32) ?*EpollInstance {
 /// Returns the pool index or a negative errno on failure.
 pub fn epollCreate() i32 {
     const cur_idx = sched.currentTaskIndex() orelse return @intCast(EMFILE);
+    const psaved = pool_lock.acquire();
+    defer pool_lock.release(psaved);
     const all_mask: u32 = if (MAX_EPOLL_INSTANCES >= 32) 0xFFFFFFFF else (@as(u32, 1) << MAX_EPOLL_INSTANCES) - 1;
     const free_mask = ~valid_epoll_bm & all_mask;
     if (free_mask == 0) return @intCast(EMFILE);
@@ -254,10 +259,12 @@ pub fn epollWait(epfd_idx: u32, events_buf: u64, max_events: u32, timeout_ms: i3
     const copy = @import("../mm/copy_from_user.zig");
     if (!copy.validateUserBufferWritable(events_buf, @as(usize, max_out) * @sizeOf(EpollEvent))) return -14; // EFAULT
 
-    var start_tick: u64 = undefined;
+    var start_tick: u64 = 0;
     if (timeout_ms >= 0) start_tick = idt.getTickCount();
 
     while (true) {
+        // Woken by epollDestroy: the instance is gone, report EBADF.
+        if (!inst.valid) return EBADF;
         var out_events: [MAX_EPOLL_ITEMS]EpollEvent = undefined;
         const n = collectEvents(inst, &out_events, max_out);
         if (n > 0) {
@@ -270,12 +277,16 @@ pub fn epollWait(epfd_idx: u32, events_buf: u64, max_events: u32, timeout_ms: i3
             const elapsed_ms = (idt.getTickCount() - start_tick) * TICK_MS;
             if (elapsed_ms >= @as(u64, @intCast(timeout_ms))) return 0;
         }
-        blockOnEpoll(inst);
+        if (blockOnEpoll(inst, start_tick, timeout_ms)) return 0; // timed out
     }
 }
 
 /// Notification callback — called by TCP, pipe, etc. when state changes.
 pub fn epollNotify(fd_type: vfs.FdType, resource_idx: u32, ready_events: u32) void {
+    // Hold pool_lock for the whole sweep: create/destroy mutate valid_epoll_bm
+    // and instance storage, and may run concurrently on another CPU.
+    const psaved = pool_lock.acquire();
+    defer pool_lock.release(psaved);
     var ebm = valid_epoll_bm;
     while (ebm != 0) {
         const ei = @ctz(ebm);
@@ -498,17 +509,19 @@ fn collectEvents(inst: *EpollInstance, out: []EpollEvent, max_out: u32) u32 {
     return count;
 }
 
-fn blockOnEpoll(inst: *EpollInstance) void {
+/// Block until an event arrives or the tick-based deadline expires.
+/// Returns true on timeout (caller returns 0 to userspace).
+fn blockOnEpoll(inst: *EpollInstance, start_tick: u64, timeout_ms: i32) bool {
     const my_idx = sched.currentTaskIndex() orelse {
         asm volatile ("sti; hlt");
-        return;
+        return false;
     };
 
     const saved = inst.spin.acquire();
 
     if (inst.ready_head != null) {
         inst.spin.release(saved);
-        return;
+        return false;
     }
 
     var node = WaitNode{
@@ -526,7 +539,43 @@ fn blockOnEpoll(inst: *EpollInstance) void {
     inst.spin.release(saved);
 
     while (!@atomicLoad(bool, &node.granted, .acquire)) {
+        if (timeout_ms > 0) {
+            const elapsed_ms = (idt.getTickCount() - start_tick) * TICK_MS;
+            if (elapsed_ms >= @as(u64, @intCast(timeout_ms))) {
+                // Deadline expired: unlink our wait node unless a concurrent
+                // notify already granted it (wakeWaiterLocked holds inst.spin).
+                const s2 = inst.spin.acquire();
+                const granted = node.granted;
+                if (!granted) removeWaiterLocked(inst, &node);
+                inst.spin.release(s2);
+                if (!granted) {
+                    // We set our own state to .blocked above — restore it.
+                    task_mod.unblockTask(my_idx);
+                    return true;
+                }
+            }
+        }
         asm volatile ("sti; hlt");
+    }
+    return false;
+}
+
+/// Unlink a wait node from the instance waiter list. Caller holds inst.spin.
+fn removeWaiterLocked(inst: *EpollInstance, node: *WaitNode) void {
+    var prev: ?*WaitNode = null;
+    var cur = inst.waiter;
+    while (cur) |n| {
+        if (n == node) {
+            if (prev) |p| {
+                p.next = n.next;
+            } else {
+                inst.waiter = n.next;
+            }
+            n.next = null;
+            return;
+        }
+        prev = n;
+        cur = n.next;
     }
 }
 
@@ -542,6 +591,8 @@ fn wakeWaiterLocked(inst: *EpollInstance) void {
 /// Add a cross-process reference (fork/clone fd-table copy).
 pub fn epollRetain(epoll_idx: u32) void {
     if (epoll_idx >= MAX_EPOLL_INSTANCES) return;
+    const psaved = pool_lock.acquire();
+    defer pool_lock.release(psaved);
     const inst = &epoll_pool[epoll_idx];
     if (!inst.valid) return;
     inst.ref_count += 1;
@@ -550,14 +601,25 @@ pub fn epollRetain(epoll_idx: u32) void {
 /// Destroy an epoll instance by pool index (used by VFS close).
 pub fn epollDestroy(epoll_idx: u32) void {
     if (epoll_idx >= MAX_EPOLL_INSTANCES) return;
+    const psaved = pool_lock.acquire();
+    defer pool_lock.release(psaved);
     const inst = &epoll_pool[epoll_idx];
     // Shared across fork/clone: drop one reference, free only at zero.
     if (inst.valid and inst.ref_count > 1) {
         inst.ref_count -= 1;
         return;
     }
-    epoll_pool[epoll_idx] = .{};
+    // Take the instance lock before wiping: an IRQ-side epollNotify may hold
+    // it — wait for that critical section to finish.
+    const isaved = inst.spin.acquire();
+    // Wake any task blocked in blockOnEpoll so it can observe the destroy.
+    wakeWaiterLocked(inst);
     if (epoll_idx < 32) {
         valid_epoll_bm &= ~(@as(u32, 1) << @intCast(epoll_idx));
     }
+    // Wipe the instance but preserve the lock word we are holding.
+    const spin = inst.spin;
+    epoll_pool[epoll_idx] = .{};
+    inst.spin = spin;
+    inst.spin.release(isaved);
 }

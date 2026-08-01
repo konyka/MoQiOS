@@ -3453,14 +3453,9 @@ fn syscallFsync(fd: u32) i64 {
         else => .none,
     };
     if (wb_type != .none) {
-        // The two filesystems keep separate index spaces; writeback stages FAT32
-        // buffers under `fat32_file_idx`, so looking them up by `ext2_file_idx`
-        // flushed a different file's buffers (usually none) and still said OK.
-        const wb_idx = switch (desc.fd_type) {
-            .fat32_file => desc.fat32_file_idx,
-            else => desc.ext2_file_idx,
-        };
-        if (!vfs_mod.syncFile(wb_idx, wb_type)) return -5; // EIO
+        // v53.51: writeback buffers are keyed by inode_id, not by per-FS slot
+        // index, so fsync addresses the file by the descriptor's inode_id.
+        if (!vfs_mod.syncFile(desc.inode_id, wb_type)) return -5; // EIO
         // FAT32/ext2 currently live on block device 0. Only devices that
         // advertise a volatile write cache need a flush barrier; the others are
         // write-through, so writeback completion is already durable.

@@ -201,6 +201,9 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         {
             const tsc = @import("../arch/arch.zig").tsc;
             const now_ns = tsc.nanos();
+            // Drive timed futex waits (FUTEX_WAIT/FUTEX_WAIT_BITSET with val2).
+            const futex_mod = @import("../sync/futex.zig");
+            futex_mod.timerTick(now_ns);
             // v53.47: Atomic load — alarm_bm/itimer_bm are modified from syscall context
             // on other CPUs. Non-atomic read-modify-write could lose newly set bits.
             var bm = @atomicLoad(u64, &alarm_bm, .acquire) |

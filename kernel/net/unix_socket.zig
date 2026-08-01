@@ -253,6 +253,10 @@ pub fn unixAccept(idx: u32) i32 {
     sock.backlog[UNIX_BACKLOG_MAX - 1] = 255;
     sock.backlog_count -= 1;
 
+    // Backlog entries are raw indices — validate before use (the connector
+    // may have been closed and its slot realloc'd while queued).
+    if (conn_idx >= MAX_UNIX_SOCKETS or !unix_sockets[conn_idx].active) return -103; // ECONNABORTED
+
     // Create a new socket for the accepted connection
     var new_idx: u32 = MAX_UNIX_SOCKETS;
     for (&unix_sockets, 0..) |*s, i| {
@@ -298,6 +302,9 @@ pub fn unixSend(idx: u32, data: [*]const u8, len: usize) i64 {
         if (peer_i >= MAX_UNIX_SOCKETS or !unix_sockets[peer_i].active) return -32; // EPIPE
 
         const peer = &unix_sockets[peer_i];
+        // Validate the back-reference: after a slot realloc, peer_idx could
+        // name an unrelated socket — never deliver data to it.
+        if (!peer.connected or peer.peer_idx != @as(u8, @intCast(idx))) return -32; // EPIPE
         const n: usize = @min(len, UNIX_SOCK_BUF_SIZE - peer.buf_count);
         ringWrite(&peer.buffer, peer.buf_write, data, n);
         peer.buf_write = (peer.buf_write + @as(u32, @intCast(n))) % UNIX_SOCK_BUF_SIZE;
@@ -362,7 +369,12 @@ pub fn unixRecv(idx: u32, buf: [*]u8, len: usize) i64 {
 
     const sock = &unix_sockets[idx];
     if (!sock.active) return -9; // EBADF
-    if (sock.buf_count == 0) return -11; // EAGAIN
+    if (sock.buf_count == 0) {
+        // STREAM with no peer (never connected, or peer closed): no data can
+        // ever arrive — report EOF instead of EAGAIN.
+        if (sock.sock_type == SOCK_STREAM and !sock.connected) return 0;
+        return -11; // EAGAIN
+    }
 
     if (sock.sock_type == SOCK_STREAM) {
         const n: usize = @min(len, sock.buf_count);
@@ -372,7 +384,9 @@ pub fn unixRecv(idx: u32, buf: [*]u8, len: usize) i64 {
 
         if (n > 0 and sock.peer_idx < MAX_UNIX_SOCKETS) {
             const peer = &unix_sockets[sock.peer_idx];
-            if (peer.active) {
+            // Validate the back-reference before touching the peer's waiters —
+            // its slot may have been realloc'd to an unrelated socket.
+            if (peer.active and peer.connected and peer.peer_idx == @as(u8, @intCast(idx))) {
                 if (peer.write_waiters != null) {
                     const node = peer.write_waiters.?;
                     peer.write_waiters = node.next;
@@ -480,7 +494,13 @@ pub fn unixClose(idx: u32) void {
     // Notify peer that we closed
     if (sock.connected and sock.peer_idx < MAX_UNIX_SOCKETS) {
         const peer = &unix_sockets[sock.peer_idx];
-        if (peer.active) {
+        // Clear the reciprocal link only if the peer still points back at us —
+        // after a slot realloc it may belong to an unrelated socket.
+        if (peer.active and peer.peer_idx == @as(u8, @intCast(idx))) {
+            // Mark peer disconnected: it sees EOF and can no longer send
+            // into this (soon-to-be-reused) slot.
+            peer.connected = false;
+            peer.peer_idx = 255;
             // Wake peer's read waiters so they can detect EOF
             var cur = peer.read_waiters;
             while (cur) |node| {

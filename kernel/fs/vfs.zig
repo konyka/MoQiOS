@@ -500,7 +500,7 @@ pub const FdTable = struct {
             .fat32_file => {
                 if (desc.offset >= desc.file_size) return 0;
                 // 1. Check writeback cache (read-after-write consistency)
-                const n_cached = writeback.readBuffered(desc.fat32_file_idx, desc.offset, buf, @intCast(count), .fat32);
+                const n_cached = writeback.readBuffered(desc.inode_id, desc.offset, buf, @intCast(count), .fat32);
                 if (n_cached > 0) {
                     desc.offset += @as(u64, n_cached);
                     return @intCast(n_cached);
@@ -530,7 +530,7 @@ pub const FdTable = struct {
             .ext2_file => {
                 if (desc.offset >= desc.file_size) return 0;
                 // 1. Check writeback cache (read-after-write consistency)
-                const n_cached = writeback.readBuffered(desc.ext2_file_idx, desc.offset, buf, @intCast(count), .ext2);
+                const n_cached = writeback.readBuffered(desc.inode_id, desc.offset, buf, @intCast(count), .ext2);
                 if (n_cached > 0) {
                     desc.offset += @as(u64, n_cached);
                     return @intCast(n_cached);
@@ -608,7 +608,7 @@ pub const FdTable = struct {
     fn bufferedWrite(desc: *FileDescriptor, file_idx: u32, buf: [*]const u8, count: usize, fs_type: writeback.FsType) i64 {
         if (count == 0) return 0;
         const want: u32 = if (count > 0xFFFF_FFFF) 0xFFFF_FFFF else @intCast(count);
-        const n = writeback.writeBuffered(file_idx, desc.offset, buf, want, fs_type);
+        const n = writeback.writeBuffered(desc.inode_id, file_idx, desc.offset, buf, want, fs_type);
         if (n == 0) return -28; // ENOSPC — no buffer available
         desc.offset += n;
         if (desc.offset > desc.file_size) desc.file_size = desc.offset;
@@ -621,7 +621,7 @@ pub const FdTable = struct {
     fn bufferedWriteAt(desc: *FileDescriptor, file_idx: u32, buf: [*]const u8, count: usize, offset: u64, fs_type: writeback.FsType) i64 {
         if (count == 0) return 0;
         const want: u32 = if (count > 0xFFFF_FFFF) 0xFFFF_FFFF else @intCast(count);
-        const n = writeback.writeBuffered(file_idx, offset, buf, want, fs_type);
+        const n = writeback.writeBuffered(desc.inode_id, file_idx, offset, buf, want, fs_type);
         if (n == 0) return -28; // ENOSPC — no buffer available
         const end = offset + n;
         if (end > desc.file_size) desc.file_size = end;
@@ -714,7 +714,7 @@ pub const FdTable = struct {
             },
             .fat32_file => {
                 if (offset >= desc.file_size) return 0;
-                const n_cached = writeback.readBuffered(desc.fat32_file_idx, offset, buf, @intCast(count), .fat32);
+                const n_cached = writeback.readBuffered(desc.inode_id, offset, buf, @intCast(count), .fat32);
                 if (n_cached > 0) return @intCast(n_cached);
                 const fat32 = @import("fat32.zig");
                 const n = fat32.readFile(desc.fat32_file_idx, @intCast(offset), buf, @intCast(count));
@@ -722,7 +722,7 @@ pub const FdTable = struct {
             },
             .ext2_file => {
                 if (offset >= desc.file_size) return 0;
-                const n_cached = writeback.readBuffered(desc.ext2_file_idx, offset, buf, @intCast(count), .ext2);
+                const n_cached = writeback.readBuffered(desc.inode_id, offset, buf, @intCast(count), .ext2);
                 if (n_cached > 0) return @intCast(n_cached);
                 const ext2 = @import("ext2.zig");
                 const n = ext2.readFile(desc.ext2_file_idx, @intCast(offset), buf, @intCast(count));
@@ -829,12 +829,12 @@ pub const FdTable = struct {
         // this is the last chance to tell the caller that data was lost.
         var flush_failed = false;
         if (desc.fd_type == .ext2_file) {
-            flush_failed = !writeback.invalidateFile(desc.ext2_file_idx, .ext2, ext2WriteFlush);
+            flush_failed = !writeback.invalidateFile(desc.inode_id, .ext2, ext2WriteFlush);
             const ext2 = @import("ext2.zig");
             ext2.closeFile(desc.ext2_file_idx);
         }
         if (desc.fd_type == .fat32_file) {
-            flush_failed = !writeback.invalidateFile(desc.fat32_file_idx, .fat32, fat32WriteFlush);
+            flush_failed = !writeback.invalidateFile(desc.inode_id, .fat32, fat32WriteFlush);
             readahead.invalidateCache(&desc.readahead_state);
         }
         if (desc.fd_type == .tcp_socket) {
@@ -934,6 +934,7 @@ pub fn retainSharedResources(table: *FdTable) void {
                 .unix_socket => seen = other.unix_sock_idx == desc.unix_sock_idx,
                 .timerfd => seen = other.timerfd_idx == desc.timerfd_idx,
                 .eventfd => seen = other.eventfd_idx == desc.eventfd_idx,
+                .tmpfs_file => seen = other.tmpfs_idx == desc.tmpfs_idx,
                 else => {},
             }
             if (seen) break;
@@ -941,6 +942,7 @@ pub fn retainSharedResources(table: *FdTable) void {
         if (seen) continue;
         switch (desc.fd_type) {
             .ext2_file => @import("ext2.zig").retainFile(desc.ext2_file_idx),
+            .tmpfs_file => @import("tmpfs.zig").tmpfsRetain(@intCast(desc.tmpfs_idx)),
             .tcp_socket => {
                 const tcp = @import("../net/tcp.zig");
                 tcp.tcpRetain(desc.tcb_idx);
@@ -1006,10 +1008,11 @@ pub fn syncAll() bool {
 
 /// Sync a specific file's dirty buffers to disk.
 /// Returns false if any buffer could not be written.
-pub fn syncFile(file_idx: u32, fs_type: writeback.FsType) bool {
+/// v53.51: keyed by inode_id (writeback buffers are inode-keyed, not slot-keyed).
+pub fn syncFile(inode_id: u64, fs_type: writeback.FsType) bool {
     return switch (fs_type) {
-        .ext2 => writeback.flushFile(file_idx, .ext2, ext2WriteFlush),
-        .fat32 => writeback.flushFile(file_idx, .fat32, fat32WriteFlush),
+        .ext2 => writeback.flushFile(inode_id, .ext2, ext2WriteFlush),
+        .fat32 => writeback.flushFile(inode_id, .fat32, fat32WriteFlush),
         .none => true,
     };
 }

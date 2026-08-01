@@ -8,6 +8,12 @@ const DEFAULT_MAX_AGE_TICKS: u64 = 500;
 const TIMER_CHECK_INTERVAL: u64 = 100;
 pub const FsType = enum(u8) { none = 0, ext2 = 1, fat32 = 2 };
 pub const DirtyBuffer = struct {
+    // v53.51: Buffers are keyed by stable inode identity, not by open-file
+    // slot: opening the same file twice yields two FS slots, and slot-keyed
+    // buffers made reads through fd B miss unflushed data written through fd A.
+    inode_id: u64 = 0,
+    // Open-file slot of the writer that staged this extent. Only used as the
+    // flush target (FS write functions take a slot), never as a lookup key.
     file_idx: u32 = 0,
     byte_offset: u64 = 0,
     data: [PAGE_SIZE]u8 = @splat(0),
@@ -47,22 +53,22 @@ inline fn bmClr(bm: *[BM_WORDS]u64, idx: u32) void {
 /// past the first page dropped while still reporting a full write. A short
 /// return means the buffer pool is exhausted and the caller must report a
 /// short write rather than claim the whole length.
-pub fn writeBuffered(file_idx: u32, byte_offset: u64, data: [*]const u8, len: u32, fs_type: FsType) u32 {
+pub fn writeBuffered(inode_id: u64, file_idx: u32, byte_offset: u64, data: [*]const u8, len: u32, fs_type: FsType) u32 {
     var done: u32 = 0;
     while (done < len) {
         const chunk = @min(len - done, @as(u32, 4096));
-        if (!writeExtentLocked(file_idx, byte_offset + done, data + done, chunk, fs_type)) break;
+        if (!writeExtentLocked(inode_id, file_idx, byte_offset + done, data + done, chunk, fs_type)) break;
         done += chunk;
     }
     return done;
 }
 
 /// Stage one buffer-sized extent. Returns false when no buffer can be had.
-fn writeExtentLocked(file_idx: u32, byte_offset: u64, data: [*]const u8, len: u32, fs_type: FsType) bool {
+fn writeExtentLocked(inode_id: u64, file_idx: u32, byte_offset: u64, data: [*]const u8, len: u32, fs_type: FsType) bool {
     const flags = wb_lock.acquire();
     defer wb_lock.release(flags);
-    const b = findBufferLocked(file_idx, byte_offset, fs_type) orelse
-        findOrAllocBufferLocked(file_idx, byte_offset, fs_type, flags) orelse
+    const b = findBufferLocked(inode_id, byte_offset, fs_type) orelse
+        findOrAllocBufferLocked(inode_id, file_idx, byte_offset, fs_type, flags) orelse
         return false;
     @memcpy(b.data[0..len], data[0..len]);
     // Only the first `len` bytes are replaced, so an extent that already held
@@ -75,19 +81,19 @@ fn writeExtentLocked(file_idx: u32, byte_offset: u64, data: [*]const u8, len: u3
     bmSet(&dirty_bm, idx);
     return true;
 }
-fn findBufferLocked(file_idx: u32, byte_offset: u64, fs_type: FsType) ?*DirtyBuffer {
+fn findBufferLocked(inode_id: u64, byte_offset: u64, fs_type: FsType) ?*DirtyBuffer {
     for (0..BM_WORDS) |w| {
         var bits = in_use_bm[w];
         while (bits != 0) {
             const bit = @ctz(bits);
             bits &= bits - 1;
             const i: u32 = @intCast(w * 64 + @as(u32, bit));
-            if (dirty_buffers[i].fs_type == fs_type and dirty_buffers[i].file_idx == file_idx and dirty_buffers[i].byte_offset == byte_offset) return &dirty_buffers[i];
+            if (dirty_buffers[i].fs_type == fs_type and dirty_buffers[i].inode_id == inode_id and dirty_buffers[i].byte_offset == byte_offset) return &dirty_buffers[i];
         }
     }
     return null;
 }
-fn findOrAllocBufferLocked(file_idx: u32, byte_offset: u64, fs_type: FsType, flags: u64) ?*DirtyBuffer {
+fn findOrAllocBufferLocked(inode_id: u64, file_idx: u32, byte_offset: u64, fs_type: FsType, flags: u64) ?*DirtyBuffer {
     // Find free slot via inverted in_use bitmap
     for (0..BM_WORDS) |w| {
         const inv = ~in_use_bm[w];
@@ -95,7 +101,7 @@ fn findOrAllocBufferLocked(file_idx: u32, byte_offset: u64, fs_type: FsType, fla
         const bit = @ctz(inv);
         const i: u32 = @intCast(w * 64 + @as(u32, bit));
         if (i >= BUFFER_COUNT) break;
-        dirty_buffers[i] = .{ .in_use = true, .file_idx = file_idx, .byte_offset = byte_offset, .fs_type = fs_type };
+        dirty_buffers[i] = .{ .in_use = true, .inode_id = inode_id, .file_idx = file_idx, .byte_offset = byte_offset, .fs_type = fs_type };
         bmSet(&in_use_bm, i);
         return &dirty_buffers[i];
     }
@@ -142,11 +148,11 @@ fn findOrAllocBufferLocked(file_idx: u32, byte_offset: u64, fs_type: FsType, fla
         // Buffer was re-dirtied during flush — refuse allocation
         return null;
     }
-    dirty_buffers[oldest_idx] = .{ .in_use = true, .file_idx = file_idx, .byte_offset = byte_offset, .fs_type = fs_type };
+    dirty_buffers[oldest_idx] = .{ .in_use = true, .inode_id = inode_id, .file_idx = file_idx, .byte_offset = byte_offset, .fs_type = fs_type };
     bmSet(&in_use_bm, oldest_idx);
     return &dirty_buffers[oldest_idx];
 }
-pub fn readBuffered(file_idx: u32, byte_offset: u64, buf: [*]u8, len: u32, fs_type: FsType) u32 {
+pub fn readBuffered(inode_id: u64, byte_offset: u64, buf: [*]u8, len: u32, fs_type: FsType) u32 {
     // v53.35: Return actual bytes copied (0 = miss) instead of bool.
     // Fixes W4: VFS was returning min(count,4096) regardless of data_len,
     // causing garbage data when write < 4096 bytes.
@@ -159,7 +165,7 @@ pub fn readBuffered(file_idx: u32, byte_offset: u64, buf: [*]u8, len: u32, fs_ty
             const bit = @ctz(bits);
             bits &= bits - 1;
             const i: u32 = @intCast(w * 64 + @as(u32, bit));
-            if (dirty_buffers[i].fs_type == fs_type and dirty_buffers[i].file_idx == file_idx and dirty_buffers[i].byte_offset == byte_offset) {
+            if (dirty_buffers[i].fs_type == fs_type and dirty_buffers[i].inode_id == inode_id and dirty_buffers[i].byte_offset == byte_offset) {
                 const n = @min(copy_len, dirty_buffers[i].data_len);
                 @memcpy(buf[0..n], dirty_buffers[i].data[0..n]);
                 return n;
@@ -170,7 +176,7 @@ pub fn readBuffered(file_idx: u32, byte_offset: u64, buf: [*]u8, len: u32, fs_ty
 }
 /// Flush one file's dirty buffers. Returns false if any buffer could not be
 /// written; those stay dirty, so the caller must not report success.
-pub fn flushFile(file_idx: u32, fs_type: FsType, comptime write_fn: fn (u32, u64, [*]const u8, u32) bool) bool {
+pub fn flushFile(inode_id: u64, fs_type: FsType, comptime write_fn: fn (u32, u64, [*]const u8, u32) bool) bool {
     var all_ok = true;
     const flags = wb_lock.acquire();
     defer wb_lock.release(flags);
@@ -180,7 +186,7 @@ pub fn flushFile(file_idx: u32, fs_type: FsType, comptime write_fn: fn (u32, u64
             const bit = @ctz(bits);
             bits &= bits - 1;
             const i: u32 = @intCast(w * 64 + @as(u32, bit));
-            if (dirty_buffers[i].fs_type == fs_type and dirty_buffers[i].file_idx == file_idx) {
+            if (dirty_buffers[i].fs_type == fs_type and dirty_buffers[i].inode_id == inode_id) {
                 const b = &dirty_buffers[i];
                 if (!b.dirty) continue; // v53.35: skip already-flushed (stale snapshot)
                 var tmp_data: [PAGE_SIZE]u8 = undefined;
@@ -254,8 +260,8 @@ pub fn flushAllByType(fs_type: FsType, comptime write_fn: fn (u32, u64, [*]const
 /// Drop a file's buffers after flushing. Returns false if the flush failed, in
 /// which case the buffers are discarded anyway — the caller is closing the file
 /// and has nowhere left to retry, but it can still report the loss.
-pub fn invalidateFile(file_idx: u32, fs_type: FsType, comptime write_fn: fn (u32, u64, [*]const u8, u32) bool) bool {
-    const flush_ok = flushFile(file_idx, fs_type, write_fn);
+pub fn invalidateFile(inode_id: u64, fs_type: FsType, comptime write_fn: fn (u32, u64, [*]const u8, u32) bool) bool {
+    const flush_ok = flushFile(inode_id, fs_type, write_fn);
     const flags = wb_lock.acquire();
     defer wb_lock.release(flags);
     for (0..BM_WORDS) |w| {
@@ -264,7 +270,13 @@ pub fn invalidateFile(file_idx: u32, fs_type: FsType, comptime write_fn: fn (u32
             const bit = @ctz(bits);
             bits &= bits - 1;
             const i: u32 = @intCast(w * 64 + @as(u32, bit));
-            if (dirty_buffers[i].fs_type == fs_type and dirty_buffers[i].file_idx == file_idx) {
+            if (dirty_buffers[i].fs_type == fs_type and dirty_buffers[i].inode_id == inode_id) {
+                // v53.51: Buffers are inode-keyed, so another fd of the same
+                // file may have staged NEW dirty data after flushFile's pass;
+                // dropping it here would lose a write the caller was told
+                // succeeded. Keep still-dirty buffers; the next flush/close
+                // or the writeback timer will retire them.
+                if (dirty_buffers[i].dirty) continue;
                 dirty_buffers[i] = .{};
                 in_use_bm[w] &= ~(@as(u64, 1) << @intCast(bit));
                 bmClr(&dirty_bm, i);

@@ -46,6 +46,9 @@ export fn _start() callconv(.c) noreturn {
     if (hhdm_request.response) |resp| {
         hhdm.init(resp.offset);
         klog.logHex(.info, "HHDM offset: ", resp.offset);
+    } else {
+        serial.writeString("  FATAL: Limine HHDM response missing\n");
+        while (true) asm volatile ("hlt");
     }
 
     // SK-35: gdt + tsc + BSP GS_BASE via shared fragment (before IDT/FPU).
@@ -78,6 +81,9 @@ export fn _start() callconv(.c) noreturn {
     // M2: Physical Memory Manager
     if (memmap_request.response) |memmap| {
         pmm.init(memmap);
+    } else {
+        serial.writeString("  FATAL: Limine memmap response missing\n");
+        while (true) asm volatile ("hlt");
     }
 
     // M2: Page table operations

@@ -10,6 +10,7 @@ const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const fmt = @import("../lib/fmt.zig");
 const fat_util = @import("fat32_util.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 pub const SECTOR_SIZE: u32 = 512;
 pub const MAX_PARTITIONS: u32 = 4;
@@ -27,6 +28,9 @@ pub const FileInfo = struct {
     last_walk_cluster: u32 = 0, // v53.38: cached cluster for readFile chain walk (P1 fix)
     last_walk_idx: u32 = 0, // v53.38: cluster index of last_walk_cluster
     is_dir: bool,
+    // v53.51: deleteFile tombstones the slot instead of shifting files[], so
+    // indices held by open fds and writeback buffers stay stable.
+    active: bool = false,
 };
 
 var partitions: [MAX_PARTITIONS]Partition = @splat(.{
@@ -73,6 +77,19 @@ var file_count: u32 = 0;
 // Temp sector buffer (allocated at init)
 var sector_buf_phys: u64 = 0;
 var sector_buf_virt: u64 = 0;
+
+// Coarse FS-wide lock (SMP fix): serializes all public entry points to
+// protect global state (files[], fat_cache_*, sector_buf_virt,
+// write_buf_virt, last_walk_cluster, ...). Two CPUs writing different files
+// would otherwise interleave the shared bounce buffers and corrupt data.
+// Lock ordering: this lock is a leaf — it is only acquired inside fat32
+// public entry points, never held while calling into vfs/writeback. The
+// writeback flush path (vfs → writeback → fat32WriteFlush → writeFile)
+// re-enters through the public API with no fat32 lock held by the caller
+// (writeback releases wb_lock before invoking the flush callback), so
+// callers of writeback flush must NOT hold this lock. Taken before the
+// virtio_blk io_lock; never the other way around.
+var fs_lock: IrqSpinlock = .{};
 
 pub fn init() void {
     serial.writeString("[fs] Initializing filesystem layer...\n");
@@ -200,14 +217,17 @@ fn clusterToLBA(cluster: u32) u32 {
     return fat_util.clusterToLba(fat32_data_start, fat32_sectors_per_cluster, cluster);
 }
 
-fn getFATEntry(cluster: u32) u32 {
+/// Read one FAT entry. Returns null on a disk read failure — the sector is
+/// NOT marked cached in that case, so stale cache contents are never consumed
+/// (previously the failure was ignored and the sector marked valid anyway).
+fn getFATEntry(cluster: u32) ?u32 {
     const loc = fat_util.fatEntryLocation(fat32_fat_start, fat32_bytes_per_sector, cluster);
 
     // v53.36: Single-sector FAT cache (P2 fix — 128x I/O reduction)
     // v53.37: DMA-safe HHDM buffer (Critical fix — BSS globals not DMA-safe)
     const fbuf: [*]u8 = @ptrFromInt(fat_cache_buf_virt);
     if (loc.sector != fat_cache_sector) {
-        _ = virtio_blk.readSectors(loc.sector, 1, fbuf);
+        if (virtio_blk.readSectors(loc.sector, 1, fbuf) <= 0) return null;
         fat_cache_sector = loc.sector;
     }
     return fat_util.fatEntryValue(fbuf, loc.offset);
@@ -264,6 +284,7 @@ fn listRootDir() void {
                     .first_cluster = fat_util.dirEntryFirstCluster(entry),
                     .last_cluster = 0,
                     .is_dir = fat_util.isDirectoryAttr(attr),
+                    .active = true,
                 };
 
                 var short_name: [11]u8 = undefined;
@@ -298,7 +319,7 @@ fn listRootDir() void {
             }
         }
 
-        cluster = getFATEntry(cluster);
+        cluster = getFATEntry(cluster) orelse break :root_scan;
     }
     serial.writeString("[fs] ");
     fmt.writeDecimal(file_count);
@@ -309,8 +330,11 @@ fn listRootDir() void {
 /// Returns index into files array, or -1 on error.
 pub fn openFile(name: []const u8) i64 {
     if (!fat32_active) return -1;
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     for (0..file_count) |i| {
         const fi = files[i];
+        if (!fi.active) continue; // v53.51: skip tombstoned slots
         if (fi.name_len == name.len) {
             var match = true;
             for (0..name.len) |j| {
@@ -328,7 +352,10 @@ pub fn openFile(name: []const u8) i64 {
 /// Read from an open file. Returns bytes read or -1 on error.
 pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
     if (!fat32_active or file_idx >= file_count) return -1;
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     const fi = files[file_idx];
+    if (!fi.active) return -1; // v53.51: tombstoned (deleted) slot
 
     if (offset >= fi.size) return 0;
     const remaining = fi.size - offset;
@@ -351,7 +378,7 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
         ci = fi.last_walk_idx;
     }
     while (ci < start_cluster_idx and cluster >= 2 and cluster < 0x0FFFFFF8) {
-        cluster = getFATEntry(cluster);
+        cluster = getFATEntry(cluster) orelse return -1;
         ci += 1;
     }
     // v53.38: Update walk cache for sequential read optimization
@@ -372,11 +399,14 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
         const cluster_page_idx: u64 = @as(u64, cluster);
         var chunk: u32 = 0;
 
-        // Try page cache for this cluster
-        if (page_cache.readPage(inode_id, cluster_page_idx)) |cached| {
+        // Try page cache for this cluster (copy-out under cache_lock — a raw
+        // page pointer could be freed by a concurrent eviction before memcpy).
+        const cache_want = blk: {
             const avail = cluster_size - current_offset_in_cluster;
-            chunk = if (total_read + avail > to_read) to_read - total_read else avail;
-            @memcpy(buf[total_read .. total_read + chunk], cached[current_offset_in_cluster .. current_offset_in_cluster + chunk]);
+            break :blk if (total_read + avail > to_read) to_read - total_read else avail;
+        };
+        if (page_cache.copyPage(inode_id, cluster_page_idx, current_offset_in_cluster, buf + total_read, cache_want)) {
+            chunk = cache_want;
         } else {
             // Cache miss — read from disk
             if (fat32_sectors_per_cluster <= 8) {
@@ -420,7 +450,7 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
         current_offset_in_cluster += chunk;
         if (current_offset_in_cluster >= cluster_size) {
             current_offset_in_cluster = 0;
-            cluster = getFATEntry(cluster);
+            cluster = getFATEntry(cluster) orelse break;
         }
     }
 
@@ -429,6 +459,8 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
 
 pub fn getFirstCluster(file_idx: u32) u32 {
     if (file_idx >= MAX_FILES) return 0;
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     return files[file_idx].first_cluster;
 }
 
@@ -437,15 +469,21 @@ pub fn isActive() bool {
 }
 
 pub fn getFileSize(idx: u32) u64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (idx >= file_count) return 0;
     return @intCast(files[idx].size);
 }
 
 pub fn getFileCount() u32 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     return file_count;
 }
 
 pub fn getFileName(idx: u32) ?[]const u8 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (idx >= file_count) return null;
     const len = files[idx].name_len;
     if (len == 0) return null;
@@ -453,6 +491,8 @@ pub fn getFileName(idx: u32) ?[]const u8 {
 }
 
 pub fn setFileSize(idx: u32, size: u32) void {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (idx >= file_count) return;
     files[idx].size = size;
 }
@@ -466,6 +506,12 @@ fn safeWriteSectors(lba: u64, count: u32, buf: [*]const u8) i64 {
     const ret = virtio_blk.writeSectors(lba, count, buf);
     asm volatile ("sti" ::: .{ .memory = true });
     return ret;
+}
+
+/// Flush callback for writeback invalidation on deleteFile: route the staged
+/// extent back through writeFile using the slot that staged it.
+fn writebackFlush(file_idx: u32, byte_offset: u64, data: [*]const u8, len: u32) bool {
+    return writeFile(file_idx, @intCast(byte_offset), data, len) == len;
 }
 
 fn setFATEntry(cluster: u32, value: u32) void {
@@ -500,7 +546,7 @@ fn allocCluster() ?u32 {
     var scanned: u32 = 0;
     while (scanned < max_cluster) : (scanned += 1) {
         if (cluster >= max_cluster) cluster = 2;
-        const entry = getFATEntry(cluster);
+        const entry = getFATEntry(cluster) orelse return null; // fail closed on I/O error
         if (entry == 0) {
             setFATEntry(cluster, 0x0FFFFFFF);
             last_free_cluster = cluster + 1;
@@ -548,7 +594,7 @@ fn shortNameTakenInRoot(short_name: *const [11]u8) bool {
             if (fat_util.shortNameTaken(buf, short_name)) return true;
             if (fat_util.sectorHasDirEnd(buf)) return false;
         }
-        cluster = getFATEntry(cluster);
+        cluster = getFATEntry(cluster) orelse return true; // fail closed on I/O error
     }
     return false;
 }
@@ -597,7 +643,7 @@ fn findFreeRunInRoot(need: u32) ?DirPlace {
                 }
             }
         }
-        cluster = getFATEntry(cluster);
+        cluster = getFATEntry(cluster) orelse return null;
     }
     return null;
 }
@@ -609,7 +655,7 @@ fn growRootDir() bool {
     var safety: u32 = 0;
     while (cluster >= 2 and cluster < 0x0FFFFFF8 and safety < 65536) : (safety += 1) {
         last = cluster;
-        cluster = getFATEntry(cluster);
+        cluster = getFATEntry(cluster) orelse return false;
     }
     const nc = allocCluster() orelse return false;
     zeroCluster(nc);
@@ -625,7 +671,7 @@ fn advanceRootPos(cluster: *u32, sec: *u32, ent: *u32) bool {
     sec.* += 1;
     if (sec.* < fat32_sectors_per_cluster) return true;
     sec.* = 0;
-    const next = getFATEntry(cluster.*);
+    const next = getFATEntry(cluster.*) orelse return false;
     if (next < 2 or next >= 0x0FFFFFF8) return false;
     cluster.* = next;
     return true;
@@ -668,10 +714,17 @@ fn writeRootEntryRun(place: DirPlace, slots: []const [32]u8) bool {
 
 pub fn createFile(name: []const u8) i64 {
     if (!fat32_active) return -1;
-    if (file_count >= MAX_FILES) return -1;
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (name.len == 0 or name.len >= MAX_FILENAME) return -1;
 
+    // v53.51: deleteFile tombstones slots — reuse the first inactive one.
+    var free_slot: ?u32 = null;
     for (0..file_count) |i| {
+        if (!files[i].active) {
+            if (free_slot == null) free_slot = @as(u32, @intCast(i));
+            continue;
+        }
         if (files[i].name_len == name.len) {
             var match = true;
             for (0..name.len) |j| {
@@ -683,6 +736,7 @@ pub fn createFile(name: []const u8) i64 {
             if (match) return @intCast(i);
         }
     }
+    if (free_slot == null and file_count >= MAX_FILES) return -1;
 
     const new_cluster = allocCluster() orelse return -1;
     zeroCluster(new_cluster);
@@ -747,17 +801,21 @@ pub fn createFile(name: []const u8) i64 {
         .first_cluster = new_cluster,
         .last_cluster = new_cluster,
         .is_dir = false,
+        .active = true,
     };
     @memcpy(fi.name[0..name.len], name);
-    const idx = file_count;
+    const idx = free_slot orelse file_count;
     files[idx] = fi;
-    file_count += 1;
+    if (idx == file_count) file_count += 1;
     return @intCast(idx);
 }
 
 pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
     if (!fat32_active or file_idx >= file_count) return -1;
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     const fi = &files[file_idx];
+    if (!fi.active) return -1; // v53.51: tombstoned (deleted) slot
 
     const cluster_size = @as(u32, fat32_sectors_per_cluster) * SECTOR_SIZE;
 
@@ -784,7 +842,7 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
             last = c;
             while (c >= 2 and c < 0x0FFFFFF8) {
                 last = c;
-                c = getFATEntry(c);
+                c = getFATEntry(c) orelse return -1;
             }
         }
         const nc = allocCluster() orelse return -1;
@@ -811,7 +869,7 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
     }
     // Fast-forward to the first overlapping cluster
     while (ci < start_cluster_idx and cluster >= 2 and cluster < 0x0FFFFFF8) {
-        cluster = getFATEntry(cluster);
+        cluster = getFATEntry(cluster) orelse return -1;
         ci += 1;
         file_offset += cluster_size;
     }
@@ -880,7 +938,7 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
         }
 
         file_offset = cluster_end_offset;
-        cluster = getFATEntry(cluster);
+        cluster = getFATEntry(cluster) orelse break :write_loop;
         ci += 1;
         // v53.40: Update walk cache
         if (cluster >= 2 and cluster < 0x0FFFFFF8) {
@@ -894,6 +952,16 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
     if (offset + bytes_written > fi.size) {
         fi.size = offset + bytes_written;
         updateDirEntry(file_idx);
+    }
+
+    // v53.51: Invalidate page_cache for this inode after the write loop. The
+    // data reached the disk synchronously, so any cached cluster pages are
+    // stale — readFile consults the cache, and without this a reopen+read
+    // returned the pre-write cluster contents. Same precedent as
+    // ext2.writeFile (one invalidateInode, no per-cluster bookkeeping).
+    if (bytes_written > 0) {
+        const page_cache = @import("page_cache.zig");
+        page_cache.invalidateInode(0x2000_0000_0000_0000 + @as(u64, fi.first_cluster));
     }
 
     return @intCast(bytes_written);
@@ -930,13 +998,18 @@ fn updateDirEntry(file_idx: u32) void {
                 }
             }
         }
-        cluster = getFATEntry(cluster);
+        cluster = getFATEntry(cluster) orelse break :scan;
     }
 }
 
 pub fn deleteFile(file_idx: u32) bool {
     if (!fat32_active or file_idx >= file_count) return false;
+    var flags = fs_lock.acquire();
     const fi = files[file_idx];
+    if (!fi.active) { // v53.51: already tombstoned
+        fs_lock.release(flags);
+        return false;
+    }
 
     // Mark directory entry as deleted (0xE5)
     // Walk the full root cluster chain — createFile places entries anywhere
@@ -966,7 +1039,23 @@ pub fn deleteFile(file_idx: u32) bool {
                 }
             }
         }
-        dir_cluster = getFATEntry(dir_cluster);
+        dir_cluster = getFATEntry(dir_cluster) orelse break :scan;
+    }
+
+    // v53.51: Flush+drop writeback extents staged for this inode BEFORE the
+    // cluster chain is freed — a later flush would write into freed clusters.
+    // The flush callback re-enters writeFile, which acquires fs_lock, so the
+    // lock must be dropped around the writeback call (see fs_lock note).
+    const writeback = @import("writeback.zig");
+    const wb_inode: u64 = 0x2000_0000_0000_0000 + @as(u64, fi.first_cluster);
+    fs_lock.release(flags);
+    _ = writeback.invalidateFile(wb_inode, .fat32, writebackFlush);
+    flags = fs_lock.acquire();
+    // The slot may have been reused while the lock was dropped; bail out if
+    // it no longer refers to the file being deleted.
+    if (!files[file_idx].active or files[file_idx].first_cluster != fi.first_cluster) {
+        fs_lock.release(flags);
+        return false;
     }
 
     // Free the cluster chain in FAT
@@ -974,17 +1063,28 @@ pub fn deleteFile(file_idx: u32) bool {
     var cluster: u32 = fi.first_cluster;
     var safety: u32 = 0;
     while (cluster >= 2 and cluster < 0x0FFFFFF8 and safety < 65536) : (safety += 1) {
-        const next_cluster = getFATEntry(cluster);
+        const next_cluster = getFATEntry(cluster) orelse break;
         setFATEntry(cluster, 0);
         cluster = next_cluster;
     }
     // No cache invalidation needed — setFATEntry keeps cache consistent
 
-    // Remove from in-memory file array
-    for (file_idx..file_count - 1) |i| {
-        files[i] = files[i + 1];
-    }
-    file_count -= 1;
+    // v53.51: Tombstone the slot instead of shifting files[]. Shifting moved
+    // every later entry down one index, so dirty writeback buffers and open
+    // fds keyed by slot index silently pointed at the WRONG file. The slot is
+    // reused by createFile once tombstoned.
+    const page_cache = @import("page_cache.zig");
+    page_cache.invalidateInode(wb_inode);
+    files[file_idx] = .{
+        .name = @splat(0),
+        .name_len = 0,
+        .size = 0,
+        .first_cluster = 0,
+        .last_cluster = 0,
+        .is_dir = false,
+        .active = false,
+    };
 
+    fs_lock.release(flags);
     return true;
 }

@@ -9,6 +9,7 @@ const paging = @import("../arch/arch.zig").paging;
 const pmm = @import("../mm/pmm.zig");
 const pci = @import("pci.zig");
 const fmt = @import("../lib/fmt.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 pub const SECTOR_SIZE: u32 = 512;
 
@@ -142,6 +143,13 @@ var device2: VirtioBlkDevice = .{
     .pci_func = 0,
 };
 
+// Driver-level lock (SMP fix): every request rewrites fixed descriptors 0-2,
+// the single req_header and the status byte, so the whole submit/poll
+// sequence must be serialized — otherwise a writeback timer flush
+// (scheduler-tick context) racing a syscall I/O interleaves descriptor
+// chains and corrupts disk data.
+var io_lock: IrqSpinlock = .{};
+
 fn readReg8(offset: u32) u8 {
     return io.inb(@intCast(device.io_base + offset));
 }
@@ -260,7 +268,10 @@ fn initDevice(dev: *const pci.PciDevice, out: *VirtioBlkDevice) !void {
         serial.writeString("[virtio-blk] Queue 0 has size 0\n");
         return error.BadQueue;
     }
-    out.queue_num = queue_size;
+    // Clamp to our static QUEUE_SIZE — avail.ring is sized QUEUE_SIZE and is
+    // indexed by avail_idx % queue_num, so a device reporting more would
+    // walk off the end of the ring.
+    out.queue_num = @min(@as(u32, queue_size), QUEUE_SIZE);
 
     // Allocate queue memory (3 pages for desc+avail+used)
     const queue_phys = pmm.allocPage() orelse return error.OutOfMemory;
@@ -325,6 +336,9 @@ fn initDevice(dev: *const pci.PciDevice, out: *VirtioBlkDevice) !void {
 pub fn readSectors(lba: u64, count: u32, buf: [*]u8) i64 {
     if (!device.active) return -1;
     if (count == 0 or count > 128) return -1;
+
+    const flags = io_lock.acquire();
+    defer io_lock.release(flags);
 
     const buf_phys = virtToPhys(@intFromPtr(buf));
 
@@ -408,6 +422,9 @@ fn readSectorsFromDev(dev: *VirtioBlkDevice, lba: u64, count: u32, buf: [*]u8) i
     if (!dev.active) return -1;
     if (count == 0 or count > 128) return -1;
 
+    const flags = io_lock.acquire();
+    defer io_lock.release(flags);
+
     const buf_phys = virtToPhys(@intFromPtr(buf));
 
     const req: *volatile BlkReqHeader = @ptrFromInt(dev.req_header_virt);
@@ -468,6 +485,9 @@ fn readSectorsFromDev(dev: *VirtioBlkDevice, lba: u64, count: u32, buf: [*]u8) i
 pub noinline fn writeSectors(lba: u64, count: u32, buf: [*]const u8) i64 {
     if (!device.active) return -1;
     if (count == 0 or count > 128) return -1;
+
+    const flags = io_lock.acquire();
+    defer io_lock.release(flags);
 
     const buf_phys = virtToPhys(@intFromPtr(buf));
 

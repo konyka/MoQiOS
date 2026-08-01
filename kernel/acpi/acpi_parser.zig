@@ -137,6 +137,11 @@ fn parseRsdt(rsdt_phys: u64) void {
 fn parseXsdt(xsdt_phys: u64) void {
     const xsdt: *const tables.SdtHeader = hhdm.physToPtr(tables.SdtHeader, xsdt_phys);
 
+    // Trusting the firmware length field: if length < header size the u32
+    // subtraction below underflows to ~4G and the loop walks entries far
+    // past the mapped table (same guard as parseRsdt).
+    if (xsdt.length < @sizeOf(tables.SdtHeader)) return;
+
     const entry_count = (xsdt.length - @sizeOf(tables.SdtHeader)) / 8;
     const entries: [*]const u64 = @ptrFromInt(@intFromPtr(xsdt) + @sizeOf(tables.SdtHeader));
 
@@ -167,8 +172,14 @@ fn parseMadt(madt_phys: u64) void {
     info.lapic_address = lapic_addr;
 
     // Read header.length for iteration (bytes 4-7)
-    const hdr_len: u32 = @as(u32, bytes[4]) | (@as(u32, bytes[5]) << 8) |
+    const raw_len: u32 = @as(u32, bytes[4]) | (@as(u32, bytes[5]) << 8) |
         (@as(u32, bytes[6]) << 16) | (@as(u32, bytes[7]) << 24);
+
+    // Clamp the firmware length to the mapped window — only one 2MiB huge
+    // page is mapped per table (mapAcpiPage), so a corrupt length must not
+    // walk entries past the mapped region.
+    const window: u32 = 0x200000 - @as(u32, @intCast(madt_phys & 0x1FFFFF));
+    const hdr_len: u32 = @min(raw_len, window);
 
     var warned_x2apic = false;
     var offset: u32 = @sizeOf(tables.Madt);
@@ -233,8 +244,14 @@ fn parseMcfg(mcfg_phys: u64) void {
     const bytes: [*]const u8 = @ptrFromInt(virt);
 
     // Read header.length
-    const hdr_len: u32 = @as(u32, bytes[4]) | (@as(u32, bytes[5]) << 8) |
+    const raw_len: u32 = @as(u32, bytes[4]) | (@as(u32, bytes[5]) << 8) |
         (@as(u32, bytes[6]) << 16) | (@as(u32, bytes[7]) << 24);
+
+    // Clamp the firmware length to the mapped window — only one 2MiB huge
+    // page is mapped per table (mapAcpiPage), so a corrupt length must not
+    // walk entries past the mapped region.
+    const window: u32 = 0x200000 - @as(u32, @intCast(mcfg_phys & 0x1FFFFF));
+    const hdr_len: u32 = @min(raw_len, window);
 
     var offset: u32 = @sizeOf(tables.Mcfg);
     while (offset + @sizeOf(tables.McfgAllocation) <= hdr_len) {

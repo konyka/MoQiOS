@@ -23,6 +23,12 @@ const TmpfsEntry = struct {
     uid: u16,
     gid: u16,
     ctime: u64,
+    // v53.51: open refcount + deferred free. unlink used to free the slot
+    // while other fds still held its index; allocEntry then reused it and the
+    // stale fds read/wrote the NEW file. Unlink now tombstones (deleted=true)
+    // and the slot is only freed once the last open fd closes.
+    open_count: u16,
+    deleted: bool,
 };
 
 var entries: [MAX_FILES]TmpfsEntry = undefined;
@@ -66,6 +72,7 @@ fn findEntry(name: []const u8, parent: u8) ?u8 {
         const bit = @ctz(bm);
         bm &= bm - 1;
         const i: u8 = @intCast(bit);
+        if (entries[i].deleted) continue; // v53.51: unlinked, pending last close
         if (entries[i].parent_idx != parent) continue;
         if (entries[i].name_len != name.len) continue;
         if (nameEql(entries[i].name[0..entries[i].name_len], name)) {
@@ -144,6 +151,8 @@ pub fn init() void {
             .uid = 0,
             .gid = 0,
             .ctime = 0,
+            .open_count = 0,
+            .deleted = false,
         };
     }
     // Root directory (index 0)
@@ -160,6 +169,8 @@ pub fn init() void {
         .uid = 0,
         .gid = 0,
         .ctime = 0,
+        .open_count = 0,
+        .deleted = false,
     };
     entries[0].name[0] = '/';
     active_bm = 1; // bit 0 = root
@@ -178,11 +189,13 @@ pub fn tmpfsOpen(path: []const u8, create: bool, is_dir: bool) i64 {
 
     // root directory open
     if (name_len == 1 and name_buf[0] == '/') {
+        entries[0].open_count +|= 1;
         return 0;
     }
 
     const name = name_buf[0..name_len];
     if (findEntry(name, parent)) |idx| {
+        entries[idx].open_count +|= 1;
         return @intCast(idx);
     }
 
@@ -201,6 +214,8 @@ pub fn tmpfsOpen(path: []const u8, create: bool, is_dir: bool) i64 {
             .uid = 0,
             .gid = 0,
             .ctime = next_ctime,
+            .open_count = 1,
+            .deleted = false,
         };
         next_ctime +%= 1;
         @memcpy(entries[idx].name[0..name_len], name[0..name_len]);
@@ -292,9 +307,29 @@ pub fn tmpfsWrite(idx: u8, offset: u64, data: [*]const u8, count: u32) i64 {
     return @intCast(src);
 }
 
-/// Close a tmpfs file (no-op; file persists until unlink).
+/// Close a tmpfs file: drop one open reference. The file persists until
+/// unlink; an unlinked (deleted) file is freed once its last fd closes.
 pub fn tmpfsClose(idx: u8) void {
-    _ = idx;
+    if (idx >= MAX_FILES) return;
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    const entry = &entries[idx];
+    if (!entry.active or entry.open_count == 0) return;
+    entry.open_count -= 1;
+    if (entry.open_count == 0 and entry.deleted) {
+        freeEntryPages(idx);
+        entry.active = false;
+        entry.deleted = false;
+    }
+}
+
+/// Retain one open reference (fork/clone fd-table copy — see
+/// vfs.retainSharedResources).
+pub fn tmpfsRetain(idx: u8) void {
+    if (idx >= MAX_FILES) return;
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    if (entries[idx].active) entries[idx].open_count +|= 1;
 }
 
 /// Unlink (delete) a file or empty directory.
@@ -319,14 +354,22 @@ pub fn tmpfsUnlink(path: []const u8) i64 {
             const bit = @ctz(bm);
             bm &= bm - 1;
             const ci: u8 = @intCast(bit);
+            if (entries[ci].deleted) continue;
             if (entries[ci].parent_idx == idx) {
                 return -1; // ENOTEMPTY
             }
         }
     }
 
-    freeEntryPages(@intCast(idx));
-    entry.active = false;
+    // v53.51: Tombstone first. While any fd still holds this index the pages
+    // must stay: freeing now would let allocEntry reuse the slot and stale
+    // fds would read/write the NEW file. tmpfsClose frees at the last close.
+    entry.deleted = true;
+    if (entry.open_count == 0) {
+        freeEntryPages(@intCast(idx));
+        entry.active = false;
+        entry.deleted = false;
+    }
     return 0;
 }
 
@@ -357,31 +400,42 @@ pub const TmpfsDirListing = struct {
     count: u32,
 };
 
-var dir_listing_buf: [MAX_FILES]TmpfsDirEntry = undefined;
-
 /// List directory entries for a given tmpfs directory index.
-pub fn tmpfsListDir(idx: u8) TmpfsDirListing {
+///
+/// v53.51: entries and names are copied into CALLER-OWNED buffers while
+/// tmpfs_lock is held. The previous version returned slices into a global
+/// dir_listing_buf and into live entries[i].name after releasing the lock, so
+/// a concurrent getdents/unlink corrupted a listing still in use.
+/// `out_entries` receives the entry records; `names_buf`/`names_cap` receives
+/// the name bytes each entry's name slice points into.
+pub fn tmpfsListDir(idx: u8, out_entries: []TmpfsDirEntry, names_buf: [*]u8, names_cap: u32) TmpfsDirListing {
+    const empty: TmpfsDirListing = .{ .entries = &[_]TmpfsDirEntry{}, .count = 0 };
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
-    if (idx >= MAX_FILES or !entries[idx].active or !entries[idx].is_dir) {
-        return .{ .entries = &[_]TmpfsDirEntry{}, .count = 0 };
+    if (idx >= MAX_FILES or !entries[idx].active or entries[idx].deleted or !entries[idx].is_dir) {
+        return empty;
     }
     var count: u32 = 0;
+    var names_used: u32 = 0;
     var bm = active_bm;
     while (bm != 0) {
         const bit = @ctz(bm);
         bm &= bm - 1;
         const i: u8 = @intCast(bit);
+        if (entries[i].deleted) continue;
         if (entries[i].parent_idx != idx) continue;
-        if (count >= MAX_FILES) break;
-        const nlen: usize = entries[i].name_len;
-        dir_listing_buf[count] = .{
-            .name = entries[i].name[0..nlen],
+        if (count >= out_entries.len) break;
+        const nlen: u32 = entries[i].name_len;
+        if (names_used + nlen > names_cap) break;
+        @memcpy(names_buf[names_used .. names_used + nlen], entries[i].name[0..nlen]);
+        out_entries[count] = .{
+            .name = names_buf[names_used .. names_used + nlen],
             .is_dir = entries[i].is_dir,
         };
+        names_used += nlen;
         count += 1;
     }
-    return .{ .entries = dir_listing_buf[0..count], .count = count };
+    return .{ .entries = out_entries[0..count], .count = count };
 }
 
 /// Compare two name slices for equality.

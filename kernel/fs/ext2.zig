@@ -15,6 +15,7 @@ const virtio_blk = @import("../drivers/virtio_blk.zig");
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const eu = @import("ext2_util.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 const SECTOR_SIZE: u32 = 512;
 const MAX_OPEN_FILES: u32 = 16;
@@ -73,6 +74,22 @@ pub const Ext2File = struct {
 
 var open_files: [MAX_OPEN_FILES]Ext2File = undefined;
 var open_count: u32 = 0;
+
+// Coarse FS-wide lock (SMP fix): serializes all public entry points to
+// protect global state (open_files[], block cache, io_buf_virt,
+// batch_free_depth, sb/group_descs, ...). Two CPUs writing different files
+// would otherwise interleave shared buffers and bitmap/counter updates and
+// corrupt the filesystem.
+// Lock ordering: this lock is a leaf — it is only acquired inside ext2
+// public entry points, never held while calling into vfs/writeback. The
+// writeback flush path (vfs → writeback → ext2WriteFlush → writeFile)
+// re-enters through the public API with no ext2 lock held by the caller
+// (writeback releases wb_lock before invoking the flush callback), so
+// callers of writeback flush must NOT hold this lock. Taken before the
+// virtio_blk io_lock; never the other way around.
+// Functions called from inside other locked entry points have private
+// *Unlocked variants (the lock is not recursive).
+var fs_lock: IrqSpinlock = .{};
 
 // ─── Open file path table (v52.0: for execveat dirfd resolution) ──────────
 var open_file_paths: [MAX_OPEN_FILES][128]u8 = @splat(@splat(0));
@@ -375,6 +392,13 @@ fn writeBlockBatch(block_num: u32, buf: [*]const u8) bool {
 
 /// Flush all dirty cache entries to disk.
 pub fn cacheFlush() void {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    cacheFlushUnlocked();
+}
+
+/// Lock-free cacheFlush for callers that already hold fs_lock.
+fn cacheFlushUnlocked() void {
     for (0..CACHE_ENTRIES) |i| {
         if (cache[i].valid and cache[i].dirty) {
             if (writeBlockUncached(cache[i].block_num, &cache[i].data)) {
@@ -404,6 +428,8 @@ fn cacheLookupPtr(block_num: u32) ?[*]const u8 {
 }
 
 pub fn cacheStats() struct { hits: u64, misses: u64 } {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     return .{ .hits = cache_hits, .misses = cache_misses };
 }
 
@@ -473,6 +499,8 @@ fn readInode(inode_num: u32, out: *Ext2Inode) bool {
 // ─── Directory operations ─────────────────────────────────────────────────
 
 pub fn openFile(name: []const u8) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return -1;
 
     // Start from root inode (2)
@@ -538,7 +566,7 @@ fn walkPathInner(start_inode: u32, path: []const u8, depth: u32) i64 {
                 if (resolved_fd < 0) return resolved_fd;
                 // Get the inode from the opened file, then close it
                 const resolved_inode = open_files[@intCast(resolved_fd)].inode_num;
-                closeFile(@intCast(resolved_fd)); // v52.1 fix: use closeFile to also clear path
+                closeFileUnlocked(@intCast(resolved_fd)); // v52.1 fix: use closeFile to also clear path
                 return walkPathInner(resolved_inode, remaining, depth + 1);
             }
         }
@@ -728,6 +756,8 @@ fn resolveBlock(inode: *const Ext2Inode, logical_block: u32) u32 {
 // ─── File read ─────────────────────────────────────────────────────────────
 
 pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (file_idx >= open_count) return -1;
     const f = &open_files[file_idx];
     if (f.inode_num == 0) return -1;
@@ -749,13 +779,13 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
         const block_offset = current_offset % block_size;
         const chunk = @min(to_read - read_total, block_size - block_offset);
 
-        // Try page cache first (with sequential prefetch)
+        // Try page cache first (with sequential prefetch).
+        // v53.51: copy-out under cache_lock — a raw page pointer could be
+        // freed by a concurrent clock eviction before the memcpy.
         const page_idx = logical_block; // page_offset in pages
-        if (page_cache.readPageAndRecord(inode_id, page_idx)) |result| {
-            @memcpy(buf[read_total .. read_total + chunk], result.data[block_offset .. block_offset + chunk]);
-            // v53.41: Prefetch hint from combined read+record (single lock acquisition)
-            if (result.prefetch > 0) {
-                prefetchPages(&f.inode, inode_id, page_idx + 1, result.prefetch);
+        if (page_cache.copyPageAndRecord(inode_id, page_idx, block_offset, buf + read_total, chunk)) |pf_count| {
+            if (pf_count > 0) {
+                prefetchPages(&f.inode, inode_id, page_idx + 1, pf_count);
             }
         } else {
             // Cache miss — read from disk
@@ -822,16 +852,27 @@ fn prefetchPages(inode: *const Ext2Inode, inode_id: u64, start_page: u64, count:
 }
 
 pub fn getInodeNum(file_idx: u32) u32 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (file_idx >= MAX_OPEN_FILES) return 0;
     return open_files[file_idx].inode_num;
 }
 
 pub fn getFileSize(file_idx: u32) u64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (file_idx >= open_count) return 0;
     return open_files[file_idx].inode.size;
 }
 
 pub fn closeFile(file_idx: u32) void {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    closeFileUnlocked(file_idx);
+}
+
+/// Lock-free closeFile for callers that already hold fs_lock.
+fn closeFileUnlocked(file_idx: u32) void {
     if (file_idx >= open_count) return;
     const f = &open_files[file_idx];
     if (f.inode_num == 0) return;
@@ -848,6 +889,8 @@ pub fn closeFile(file_idx: u32) void {
 
 /// Add a reference to an open file slot (fork/clone fd-table copy).
 pub fn retainFile(file_idx: u32) void {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (file_idx >= open_count) return;
     if (open_files[file_idx].inode_num == 0) return;
     open_files[file_idx].ref_count += 1;
@@ -856,6 +899,8 @@ pub fn retainFile(file_idx: u32) void {
 // ─── Directory listing ─────────────────────────────────────────────────────
 
 pub fn listDir(path: []const u8, callback: *const fn ([*]const u8, u32) void) void {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return;
 
     const inode_num = if (path.len == 0 or (path.len == 1 and path[0] == '/'))
@@ -864,7 +909,7 @@ pub fn listDir(path: []const u8, callback: *const fn ([*]const u8, u32) void) vo
         const r = walkPath(2, path);
         if (r < 0) break :blk @as(u32, 0);
         const inum = open_files[@intCast(r)].inode_num;
-        closeFile(@intCast(r)); // v52.1 fix: close fd to avoid leak
+        closeFileUnlocked(@intCast(r)); // v52.1 fix: close fd to avoid leak
         break :blk inum;
     };
     if (inode_num == 0) return;
@@ -913,6 +958,8 @@ pub fn getFileName(file_idx: u32) ?[]const u8 {
 /// List directory entries of root (inode 2) into a buffer.
 /// Writes filenames separated by '\n'. Returns bytes written.
 pub fn listDirRoot(buf: []u8) usize {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return 0;
     return listDirInode(2, buf);
 }
@@ -964,6 +1011,8 @@ fn listDirInode(inode_num: u32, buf: []u8) usize {
 /// `out_offset` is updated to the next offset for subsequent reads.
 /// Returns the number of entries written to the output arrays.
 pub fn readDirEntries(file_idx: u32, start_offset: u32, names: [*][256]u8, name_lens: [*]u32, inodes: [*]u32, file_types: [*]u8, next_offsets: [*]u32, max_entries: u32) struct { count: u32, new_offset: u32 } {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return .{ .count = 0, .new_offset = start_offset };
     if (file_idx >= open_count) return .{ .count = 0, .new_offset = start_offset };
     const f = &open_files[file_idx];
@@ -1146,8 +1195,29 @@ fn truncateTripleIndirectTree(block_num: u32, keep_blocks: u32, ptrs_per_block: 
     return writeBlockMaybeBatch(block_num, buf);
 }
 
+/// Flush callback for writeback invalidation on truncate/unlink: route the
+/// staged extent back through writeFile using the slot that staged it.
+fn writebackFlush(file_idx: u32, byte_offset: u64, data: [*]const u8, len: u32) bool {
+    return writeFile(file_idx, @intCast(byte_offset), data, len) == len;
+}
+
+/// Flush + drop all writeback extents staged for `inode_num`. Must be called
+/// before truncate/unlink frees blocks: a dirty extent flushed afterwards
+/// would regrow a truncated file or write into a freed inode. fs_lock is
+/// dropped around the call because the flush callback re-enters writeFile,
+/// which acquires fs_lock (not recursive).
+fn invalidateWriteback(inode_num: u32, flags: *u64) void {
+    const writeback = @import("writeback.zig");
+    const wb_inode: u64 = 0x3000_0000_0000_0000 + @as(u64, inode_num);
+    fs_lock.release(flags.*);
+    _ = writeback.invalidateFile(wb_inode, .ext2, writebackFlush);
+    flags.* = fs_lock.acquire();
+}
+
 /// Truncate a file to the given length. Frees blocks beyond the new size.
 pub fn truncateFile(file_idx: u32, new_size: u32) bool {
+    var flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return false;
     if (file_idx >= open_count) return false;
     const f = &open_files[file_idx];
@@ -1160,13 +1230,19 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
         return true;
     }
 
+    // v53.51: flush+drop staged writeback extents before freeing blocks.
+    const inode_num = f.inode_num;
+    invalidateWriteback(inode_num, &flags);
+    // fs_lock was dropped — make sure the slot still refers to the same inode.
+    if (f.inode_num != inode_num) return false;
+
     // Shrinking: free blocks beyond new_size
     // v53.15: Batch mode — defer cacheFlush+writeGroupDescs+writeSuperblock
     batch_free_depth += 1;
     defer {
         batch_free_depth -= 1;
         if (batch_free_depth == 0) {
-            cacheFlush();
+            cacheFlushUnlocked();
             writeGroupDescs();
             writeSuperblock();
         }
@@ -1216,6 +1292,8 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
 /// Truncate a file by inode number (v53.3: for truncate syscall).
 /// Works directly on disk inode without going through open_files table.
 pub fn truncateByInode(inode_num: u32, new_size: u32) bool {
+    var flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return false;
     if (inode_num == 0) return false;
 
@@ -1229,12 +1307,15 @@ pub fn truncateByInode(inode_num: u32, new_size: u32) bool {
         return true;
     }
 
+    // v53.51: flush+drop staged writeback extents before freeing blocks.
+    invalidateWriteback(inode_num, &flags);
+
     // v53.15: Batch mode — defer cacheFlush+writeGroupDescs+writeSuperblock
     batch_free_depth += 1;
     defer {
         batch_free_depth -= 1;
         if (batch_free_depth == 0) {
-            cacheFlush();
+            cacheFlushUnlocked();
             writeGroupDescs();
             writeSuperblock();
         }
@@ -1285,6 +1366,8 @@ pub fn truncateByInode(inode_num: u32, new_size: u32) bool {
 /// Rename a file: remove old entry from source dir, add entry in dest dir.
 /// Supports cross-directory rename (old_path and new_path can be in different dirs).
 pub fn renameFile(old_path: []const u8, new_path: []const u8) bool {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return false;
 
     // Resolve source: parent dir + old filename
@@ -1670,6 +1753,8 @@ fn ensureBlock(inode: *Ext2Inode, inode_num: u32, logical_block: u32, skip_zero:
 /// Write data to an ext2 file at the given offset.
 /// Returns bytes written, or -1 on error.
 pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return -1;
     if (file_idx >= open_count) return -1;
     const f = &open_files[file_idx];
@@ -1682,7 +1767,7 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
     defer {
         batch_free_depth -= 1;
         if (batch_free_depth == 0) {
-            cacheFlush();
+            cacheFlushUnlocked();
             writeGroupDescs();
             writeSuperblock();
         }
@@ -1709,12 +1794,11 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
         } else {
             // Partial write - need existing block data for read-modify-write
             var block_data: [4096]u8 = undefined;
-            const page_cached = page_cache.readPage(inode_id, logical_block);
-            if (page_cached) |cached| {
-                // v53.32: Only copy block_size bytes, not full PAGE_SIZE (4096).
-                // block_size is typically 1024, saves 3072 bytes per partial write.
-                @memcpy(block_data[0..block_size], cached[0..block_size]);
-            } else {
+            // v53.51: copy-out under cache_lock (raw page pointer could be
+            // freed by a concurrent eviction before the memcpy).
+            // v53.32: Only copy block_size bytes, not full PAGE_SIZE (4096).
+            // block_size is typically 1024, saves 3072 bytes per partial write.
+            if (!page_cache.copyPage(inode_id, logical_block, 0, &block_data, block_size)) {
                 // v53.23: Use readBlockUncached to avoid polluting cache with data blocks
                 if (!readBlockUncached(phys_block, &block_data)) break;
             }
@@ -1859,6 +1943,8 @@ fn writeSuperblock() void {
 /// Create a new file in the root directory of the ext2 filesystem.
 /// Returns file index (>= 0) on success, -1 on failure.
 pub fn createFile(name: []const u8) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return -1;
 
     // Check if file already exists — reuse walkPath (known working)
@@ -2009,6 +2095,8 @@ fn addDirEntry(dir_inode_num: u32, target_inode: u32, entry_name: []const u8, fi
 /// Supports multi-level paths (e.g., "testdir/subdir").
 /// Returns file index (>= 0) on success, 0 if already exists, -1 on failure.
 pub fn createDir(name: []const u8) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return -1;
 
     // Check if already exists
@@ -2289,6 +2377,8 @@ fn removeDirEntry(parent_inode_num: u32, name: []const u8) bool {
 /// Unlink (delete) a file from the ext2 filesystem.
 /// Supports multi-level paths, hardlinks, and symlinks (v50.0).
 pub fn unlinkFile(path: []const u8) bool {
+    var flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return false;
 
     // Resolve parent directory and filename
@@ -2313,12 +2403,15 @@ pub fn unlinkFile(path: []const u8) bool {
         _ = writeInode(file_inode_num, &file_inode);
     } else {
         // Last link: free data blocks
+        // v53.51: flush+drop staged writeback extents BEFORE the inode's blocks
+        // are freed — a later flush would write into a freed inode.
+        invalidateWriteback(file_inode_num, &flags);
         // v53.15: Batch mode — defer cacheFlush+writeGroupDescs+writeSuperblock
         batch_free_depth += 1;
         defer {
             batch_free_depth -= 1;
             if (batch_free_depth == 0) {
-                cacheFlush();
+                cacheFlushUnlocked();
                 writeGroupDescs();
                 writeSuperblock();
             }
@@ -2378,10 +2471,12 @@ pub fn unlinkFile(path: []const u8) bool {
 /// Create a hard link: newpath → same inode as oldpath.
 /// Returns 0 on success, -errno on failure.
 pub fn createHardlink(oldpath: []const u8, newpath: []const u8) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return -5; // EIO
 
     // 1. Resolve oldpath to its inode number (v52.1: use symlink-resolving version)
-    const old_inode = walkPathToInodePublic(oldpath) orelse return -2; // ENOENT
+    const old_inode = walkPathToInodeUnlocked(oldpath) orelse return -2; // ENOENT
 
     // Read the old inode to check it's not a directory
     var old_inode_data: Ext2Inode = undefined;
@@ -2415,6 +2510,8 @@ pub fn createHardlink(oldpath: []const u8, newpath: []const u8) i64 {
 /// Create a symbolic link: linkpath → target.
 /// Returns 0 on success, -errno on failure.
 pub fn createSymlink(target: []const u8, linkpath: []const u8) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return -5;
 
     // 1. Resolve linkpath's parent directory + filename
@@ -2471,12 +2568,26 @@ pub fn createSymlink(target: []const u8, linkpath: []const u8) i64 {
 /// Resolve a path to its inode number (public for xattr/chown/chmod dispatch).
 /// Resolves symlinks in intermediate path components (v52.2 fix: no fd allocation).
 pub fn walkPathToInodePublic(path: []const u8) ?u32 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    return walkPathToInodeUnlocked(path);
+}
+
+/// Lock-free walkPathToInodePublic for callers that already hold fs_lock.
+fn walkPathToInodeUnlocked(path: []const u8) ?u32 {
     return walkPathToInodeResolve(2, path, 0);
 }
 
 /// Resolve a path to its inode number WITHOUT following the final component symlink.
 /// Used by lchown, lstat, etc. Intermediate symlinks ARE resolved.
 pub fn walkPathToInodeNoFollow(path: []const u8) ?u32 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    return walkPathToInodeNoFollowUnlocked(path);
+}
+
+/// Lock-free walkPathToInodeNoFollow for callers that already hold fs_lock.
+fn walkPathToInodeNoFollowUnlocked(path: []const u8) ?u32 {
     return walkPathToInodeResolveNoFollow(2, path, 0);
 }
 
@@ -2563,6 +2674,8 @@ fn walkPathToInodeResolve(start_inode: u32, path: []const u8, depth: u32) ?u32 {
 /// Read symlink target by path. Returns target slice or null.
 /// Uses static symlink_buf for long symlinks (caller must copy before next call).
 pub fn readSymlinkByPath(path: []const u8) ?[]const u8 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return null;
 
     // Resolve parent and find the entry
@@ -2584,9 +2697,11 @@ pub fn readSymlinkByPath(path: []const u8) ?[]const u8 {
 /// Set owner (uid/gid) for a path. Returns 0 on success, -errno on failure.
 /// Pass -1 (0xFFFF) to leave uid or gid unchanged.
 pub fn setOwner(path: []const u8, uid: u16, gid: u16) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return -5; // EIO
 
-    const inode_num = walkPathToInodePublic(path) orelse return -2; // ENOENT
+    const inode_num = walkPathToInodeUnlocked(path) orelse return -2; // ENOENT
     var inode: Ext2Inode = undefined;
     if (!readInode(inode_num, &inode)) return -5;
 
@@ -2598,9 +2713,11 @@ pub fn setOwner(path: []const u8, uid: u16, gid: u16) i64 {
 
 /// Set owner without following final symlink (for lchown).
 pub fn setOwnerNoFollow(path: []const u8, uid: u16, gid: u16) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return -5;
 
-    const inode_num = walkPathToInodeNoFollow(path) orelse return -2;
+    const inode_num = walkPathToInodeNoFollowUnlocked(path) orelse return -2;
     var inode: Ext2Inode = undefined;
     if (!readInode(inode_num, &inode)) return -5;
 
@@ -2612,6 +2729,8 @@ pub fn setOwnerNoFollow(path: []const u8, uid: u16, gid: u16) i64 {
 
 /// Set owner (uid/gid) for an inode by number. Used by fchown via fd→inode mapping.
 pub fn setOwnerByInode(inode_num: u32, uid: u16, gid: u16) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return -5;
     var inode: Ext2Inode = undefined;
     if (!readInode(inode_num, &inode)) return -5;
@@ -2625,9 +2744,11 @@ pub fn setOwnerByInode(inode_num: u32, uid: u16, gid: u16) i64 {
 /// Set permission mode for a path. Returns 0 on success, -errno on failure.
 /// mode is the lower 12 bits (file type preserved).
 pub fn setMode(path: []const u8, new_mode: u16) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return -5;
 
-    const inode_num = walkPathToInodePublic(path) orelse return -2;
+    const inode_num = walkPathToInodeUnlocked(path) orelse return -2;
     var inode: Ext2Inode = undefined;
     if (!readInode(inode_num, &inode)) return -5;
 
@@ -2639,6 +2760,8 @@ pub fn setMode(path: []const u8, new_mode: u16) i64 {
 
 /// Set permission mode for an inode by number. Used by fchmod via fd→inode mapping.
 pub fn setModeByInode(inode_num: u32, new_mode: u16) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return -5;
     var inode: Ext2Inode = undefined;
     if (!readInode(inode_num, &inode)) return -5;
@@ -2650,6 +2773,8 @@ pub fn setModeByInode(inode_num: u32, new_mode: u16) i64 {
 
 /// Get inode number from an open ext2 file index.
 pub fn getInodeNumFromOpen(file_idx: u32) u32 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (file_idx >= MAX_OPEN_FILES) return 0;
     return open_files[file_idx].inode_num;
 }
@@ -2682,6 +2807,8 @@ const Ext2XattrEntry = extern struct {
 /// Uses standard ext2 xattr layout: entries grow forward from header,
 /// values grow backward from end of block (v52.3 fix).
 pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return -5;
     if (name.len == 0 or name.len > 255 or value.len > block_size) return -22;
 
@@ -2918,6 +3045,8 @@ pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
 /// Get extended attribute value from an inode.
 /// Returns bytes written to value_buf, or -errno.
 pub fn getXattr(inode_num: u32, name: []const u8, value_buf: [*]u8, buf_size: u32) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return -5;
     if (name.len == 0) return -22;
 
@@ -2968,6 +3097,8 @@ pub fn getXattr(inode_num: u32, name: []const u8, value_buf: [*]u8, buf_size: u3
 /// List extended attribute names for an inode.
 /// Returns bytes written to list_buf, or -errno.
 pub fn listXattr(inode_num: u32, list_buf: [*]u8, buf_size: u32) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return -5;
 
     var inode: Ext2Inode = undefined;
@@ -3026,6 +3157,8 @@ pub fn listXattr(inode_num: u32, list_buf: [*]u8, buf_size: u32) i64 {
 /// Remove extended attribute from an inode.
 /// Returns 0 on success, -errno on failure.
 pub fn removeXattr(inode_num: u32, name: []const u8) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (!active) return -5;
     if (name.len == 0) return -22;
 
@@ -3117,6 +3250,8 @@ fn eql(a: []const u8, b: []const u8) bool {
 
 /// Get the path used to open file_idx. Returns null if not found.
 pub fn getOpenFilePath(file_idx: u32) ?[]const u8 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
     if (file_idx >= MAX_OPEN_FILES) return null;
     if (open_files[file_idx].inode_num == 0) return null;
     // Find null terminator

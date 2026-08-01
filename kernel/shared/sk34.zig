@@ -36,6 +36,9 @@ pub fn announce() void {
         arch.serial.writeString("[SK-34] FAILED: tmpfsUnlink\n");
         return;
     }
+    // v53.51: tmpfs entries are open-refcounted — drop the open reference so
+    // the unlinked slot is actually freed instead of leaked.
+    tmpfs.tmpfsClose(idx);
 
     var a: [8]u8 = undefined;
     var b: [8]u8 = undefined;

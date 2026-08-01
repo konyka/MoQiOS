@@ -348,6 +348,15 @@ inline fn deactivateTcb(tcb: *TcpTcb) void {
     tcb.active = false;
 }
 
+/// Remote-driven teardown (RST, timeouts, LAST_ACK): mark the TCB closed, but
+/// keep the slot active while open fds still reference it (ref_count > 0) —
+/// freeing the slot here would let a realloc'd TCB be mistaken for this one.
+/// The slot is freed by tcpClose once the last fd reference is dropped.
+inline fn closeTcbRemote(tcb: *TcpTcb) void {
+    tcb.state = .closed;
+    if (tcb.ref_count == 0) deactivateTcb(tcb);
+}
+
 pub fn initTcbs() void {
     @atomicStore(u64, &tcb_active_bitmap, 0, .release);
     listen_active_bitmap = 0;
@@ -940,9 +949,10 @@ fn sendSegmentSeq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16, 
     }
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, 20 + tcp_total);
     const ok = nic.sendPacket(&send_pkt, frame_len);
+    if (!ok) return false; // TX failed: do not advance snd_nxt (segment never sent)
     // SK-104: full-MTU TX success can raise the Path MTU early.
-    if (ok) ipv4.noteFullSizeSend(tcb.remote_ip, ipv4.HEADER_LEN + tcp_total);
-    if (ok) noteEcnCwrSent(tcb, flags);
+    ipv4.noteFullSizeSend(tcb.remote_ip, ipv4.HEADER_LEN + tcp_total);
+    noteEcnCwrSent(tcb, flags);
     noteRackXmit(tcb, seq_override orelse tcb.snd_nxt, data_len);
     advanceSndNxt(tcb, flags, data_len);
     return true;
@@ -981,9 +991,10 @@ fn sendSegmentV6Seq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16
     }
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + tcp_total);
     const ok = nic.sendPacket(&send_pkt, frame_len);
+    if (!ok) return false; // TX failed: do not advance snd_nxt (segment never sent)
     // SK-104: full-MTU TX success can raise the Path MTU early.
-    if (ok) ipv6.noteFullSizeSend(tcb.remote_ip6, ipv6.HEADER_LEN + tcp_total);
-    if (ok) noteEcnCwrSent(tcb, flags);
+    ipv6.noteFullSizeSend(tcb.remote_ip6, ipv6.HEADER_LEN + tcp_total);
+    noteEcnCwrSent(tcb, flags);
     noteRackXmit(tcb, seq_override orelse tcb.snd_nxt, data_len);
     advanceSndNxt(tcb, flags, data_len);
     return true;
@@ -1866,8 +1877,7 @@ fn driveTcbStateMachine(
         if (tcb.state == .syn_sent) {
             // RFC 793 §3.4: RST in SYN_SENT is valid if ack_num == iss+1
             if (ack_num == tcb.iss +% 1) {
-                tcb.state = .closed;
-                deactivateTcb(tcb);
+                closeTcbRemote(tcb);
                 tcpLog("[tcp] RST in SYN_SENT, connection reset\n");
                 return;
             }
@@ -1875,8 +1885,7 @@ fn driveTcbStateMachine(
             // RFC 793: RST is valid if seq_num is within the receive window
             const in_window = seq_num -% tcb.rcv_nxt < tcb.rcv_wnd;
             if (in_window) {
-                tcb.state = .closed;
-                deactivateTcb(tcb);
+                closeTcbRemote(tcb);
                 tcpLog("[tcp] RST received, connection reset\n");
                 return;
             }
@@ -1941,8 +1950,7 @@ fn driveTcbStateMachine(
             } else if (flags & SYN != 0) {
                 // v53.5: Simultaneous open not supported — send RST and close
                 _ = sendSegment(tcb, RST, undefined, 0);
-                tcb.state = .closed;
-                deactivateTcb(tcb);
+                closeTcbRemote(tcb);
             }
         },
         .syn_received => {
@@ -1965,8 +1973,7 @@ fn driveTcbStateMachine(
                 // RST is valid if seq_num is within window
                 const in_window = seq_num -% tcb.rcv_nxt < tcb.rcv_wnd;
                 if (in_window) {
-                    tcb.state = .closed;
-                    deactivateTcb(tcb);
+                    closeTcbRemote(tcb);
                     tcpLog("[tcp] RST received, connection reset\n");
                     return;
                 }
@@ -2278,8 +2285,7 @@ fn driveTcbStateMachine(
         },
         .last_ack => {
             if (flags & ACK != 0) {
-                tcb.state = .closed;
-                deactivateTcb(tcb);
+                closeTcbRemote(tcb);
                 tcpLog("[tcp] LAST_ACK → CLOSED\n");
             }
         },
@@ -2651,7 +2657,7 @@ fn flushSendBuffer(tcb: *TcpTcb) void {
 }
 
 /// Receive data from an established connection.
-/// Returns number of bytes read, 0 if none available, -1 on error/closed.
+/// Returns number of bytes read, 0 if none available or at EOF, -1 on error/closed.
 pub fn tcpRecv(tcb_idx: u32, buf: [*]u8, len: u32) i64 {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
@@ -2662,7 +2668,7 @@ pub fn tcpRecv(tcb_idx: u32, buf: [*]u8, len: u32) i64 {
 
     const available = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
     if (available == 0) {
-        if (tcb.state == .close_wait) return -1; // connection closed by remote
+        // 0 is also EOF in .close_wait (remote sent FIN, buffer drained).
         return 0;
     }
 
@@ -2744,6 +2750,28 @@ pub fn tcpClose(tcb_idx: u32) i64 {
             _ = sendSegment(tcb, FIN | ACK, undefined, 0);
             tcpLog("[tcp] FIN sent → LAST_ACK\n");
         },
+        .listen => {
+            // Clear the listen slot so the port stops answering SYNs, and
+            // free pending backlog TCBs nobody can accept anymore.
+            var lbm = listen_active_bitmap;
+            while (lbm != 0) {
+                const i = @ctz(lbm);
+                lbm &= lbm - 1;
+                const ls = &listen_slots[i];
+                if (ls.local_port == tcb.local_port and ls.is_v6 == tcb.is_v6) {
+                    while (ls.pending_head != ls.pending_tail) {
+                        const pidx = ls.pending_tpbs[ls.pending_head % LISTEN_BACKLOG];
+                        ls.pending_head += 1;
+                        if (pidx < MAX_CONNECTIONS and tcbs[pidx].active) deactivateTcb(&tcbs[pidx]);
+                    }
+                    listen_active_bitmap &= ~(@as(u64, 1) << @intCast(i));
+                    ls.active = false;
+                    break;
+                }
+            }
+            tcb.state = .closed;
+            deactivateTcb(tcb);
+        },
         else => {
             tcb.state = .closed;
             deactivateTcb(tcb);
@@ -2802,8 +2830,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
     if (tcb.state == .fin_wait_2) {
         tcb.retransmit_timer +%= ms_elapsed;
         if (tcb.retransmit_timer >= 60_000) { // 60s timeout (Linux tcp_fin_timeout default)
-            tcb.state = .closed;
-            deactivateTcb(tcb);
+            closeTcbRemote(tcb);
             tcpLog("[tcp] FIN_WAIT_2 timeout → CLOSED\n");
             return;
         }
@@ -2823,8 +2850,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
     if (tcb.state == .time_wait) {
         tcb.retransmit_timer +%= ms_elapsed;
         if (tcb.retransmit_timer >= 15000) {
-            tcb.state = .closed;
-            deactivateTcb(tcb);
+            closeTcbRemote(tcb);
             tcpLog("[tcp] TIME_WAIT → CLOSED (timeout)\n");
         }
         return;
@@ -2856,8 +2882,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             if (tcb.retransmit_count > 5) {
                 // Give up
                 tcpLog("[tcp] retransmit timeout, closing\n");
-                tcb.state = .closed;
-                deactivateTcb(tcb);
+                closeTcbRemote(tcb);
                 return;
             }
             // RTO timeout: CUBIC cut + F-RTO probe (SK-99/116/124).
@@ -2959,8 +2984,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             if (tcb.keepalive_probes >= tcb.options.keep_cnt) {
                 // Max probes reached — connection is dead
                 tcpLog("[tcp] keepalive timeout, closing\n");
-                tcb.state = .closed;
-                deactivateTcb(tcb);
+                closeTcbRemote(tcb);
                 return;
             }
             tcb.keepalive_probes += 1;
@@ -3172,7 +3196,7 @@ pub fn tcpAccept(tcb_idx: u32, owner_task: u32) i64 {
     while (lbm != 0) {
         const i = @ctz(lbm);
         lbm &= lbm - 1;
-        if (listen_slots[i].local_port == tcb.local_port) {
+        if (listen_slots[i].local_port == tcb.local_port and listen_slots[i].is_v6 == tcb.is_v6) {
             slot = &listen_slots[i];
             break;
         }

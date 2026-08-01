@@ -315,9 +315,9 @@ fn executeFsync(iocb: *const IoCb) i64 {
 
     // Determine filesystem type and flush writeback cache
     if (desc.fd_type == .ext2_file) {
-        if (!writeback.invalidateFile(desc.ext2_file_idx, .ext2, ext2WriteFlush)) return EIO;
+        if (!writeback.invalidateFile(desc.inode_id, .ext2, ext2WriteFlush)) return EIO;
     } else if (desc.fd_type == .fat32_file) {
-        if (!writeback.invalidateFile(desc.fat32_file_idx, .fat32, fat32WriteFlush)) return EIO;
+        if (!writeback.invalidateFile(desc.inode_id, .fat32, fat32WriteFlush)) return EIO;
     } else {
         _ = vfs_mod;
     }

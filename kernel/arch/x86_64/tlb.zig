@@ -8,10 +8,12 @@
 //! Algorithm (initiator):
 //!   1. Flush the affected pages on the local CPU.
 //!   2. If SMP is not online (cpu_count <= 1) return — nobody else cares.
-//!   3. Acquire `shootdown_lock` (a custom lock that keeps IRQs ENABLED while
-//!      spinning — see `TlbLock`).  This is critical to avoid the classic
-//!      cross-IPI deadlock where two CPUs each hold IRQs disabled waiting for
-//!      the other's IPI to be accepted.
+//!   3. Acquire `shootdown_lock` (a custom lock that spins with IRQs OFF but
+//!      manually services any in-flight broadcast — see `TlbLock` and
+//!      `servicePendingShootdown`). This is critical both to avoid the
+//!      classic cross-IPI deadlock and to stay safe in interrupt-disabled
+//!      contexts (page-fault handler COW/swap paths), where an `sti` window
+//!      would corrupt the interrupted frame.
 //!   4. Publish (addr_start, page_count) in the global slot and seed the
 //!      `completion` counter with the number of remote CPUs to acknowledge.
 //!   5. Broadcast `TLB_SHOOTDOWN_VECTOR` IPI to all-but-self via the LAPIC.
@@ -71,10 +73,11 @@ fn failShootdown(reason: []const u8) noreturn {
 }
 
 /// Cross-CPU lock used to serialise shootdown initiators. Unlike
-/// `IrqSpinlock` (which disables IRQs for the whole critical section), this
-/// lock RE-ENABLES IRQs while spinning so that another initiator parked here
-/// can still service inbound shootdown IPIs from the current owner. Without
-/// this, two CPUs racing to shootdown deadlock on each other's IPI.
+/// `IrqSpinlock`, this lock services pending shootdown broadcasts manually
+/// while spinning (see `servicePendingShootdown`) instead of re-enabling
+/// IRQs. This keeps the lock usable from interrupt-disabled contexts such as
+/// the page-fault handler (COW/swap paths), where an `sti` window would let a
+/// timer tick nest inside the fault frame and corrupt the iretq state.
 pub const TlbLock = struct {
     locked: u32 = 0,
 
@@ -94,10 +97,11 @@ pub const TlbLock = struct {
             if (@atomicRmw(u32, &self.locked, .Xchg, 1, .acquire) == 0) {
                 return rflags;
             }
-            // Failed: drop IRQs so we remain responsive to other CPUs' IPIs
-            // while the current owner is still broadcasting/waiting.
-            asm volatile ("sti");
+            // Failed: spin with IRQs OFF (fault-handler safe), servicing any
+            // in-flight broadcast ourselves so the current owner can complete
+            // without needing our IF=1.
             while (@atomicLoad(u32, &self.locked, .monotonic) != 0) {
+                servicePendingShootdown();
                 asm volatile ("pause");
             }
         }
@@ -155,12 +159,12 @@ inline fn eoiInline() void {
     reg.* = 0;
 }
 
-/// IPI handler for `TLB_SHOOTDOWN_VECTOR`. Runs on every remote CPU after
-/// the initiator broadcasts. Must not acquire locks — only atomics.
-pub fn handleShootdownIpi() void {
-    // EOI first so the LAPIC can deliver further interrupts while we flush.
-    eoiInline();
-
+/// Service an in-flight shootdown broadcast for this CPU without taking an
+/// actual IPI. Used by the IPI handler and by CPUs spinning on
+/// `shootdown_lock` with IRQs disabled, so the initiator never has to wait
+/// for a waiter to re-enable interrupts. Idempotent per generation via
+/// `acknowledged_generation`.
+fn servicePendingShootdown() void {
     if (@atomicLoad(u32, &shootdown_req.active, .acquire) == 0) return;
     const generation = @atomicLoad(u32, &shootdown_req.generation, .acquire);
     const cpu_id = syscall_entry.getPerCpu().cpu_id;
@@ -180,6 +184,14 @@ pub fn handleShootdownIpi() void {
         if (completion == 0) break;
         if (@cmpxchgWeak(u32, &shootdown_req.completion, completion, completion - 1, .acq_rel, .acquire) == null) break;
     }
+}
+
+/// IPI handler for `TLB_SHOOTDOWN_VECTOR`. Runs on every remote CPU after
+/// the initiator broadcasts. Must not acquire locks — only atomics.
+pub fn handleShootdownIpi() void {
+    // EOI first so the LAPIC can deliver further interrupts while we flush.
+    eoiInline();
+    servicePendingShootdown();
 }
 
 /// Initiator-side: flush `[addr_start, addr_start + page_count * 4K)` on the
@@ -225,18 +237,17 @@ pub fn shootdownRange(addr_start: u64, page_count: u32) void {
         if (!lapic.sendIpi(apic_id, lapic.TLB_SHOOTDOWN_VECTOR)) failShootdown("IPI delivery timed out");
     }
 
-    // We must allow IRQs while spinning so other initiators' IPIs can still
-    // hit us (they could be parked in `shootdown_lock.acquire` waiting for
-    // us, but if anyone else is reachable they may broadcast first).
-    asm volatile ("sti");
+    // Wait with the caller's IF state untouched. Do NOT `sti` here: callers
+    // include the page-fault handler (COW/swap), where an interrupt window
+    // would let a timer tick nest inside the fault frame and corrupt iretq
+    // state. Waiters parked in `TlbLock.acquire` service this broadcast
+    // manually via `servicePendingShootdown`, so IRQ-off waiting cannot
+    // deadlock the protocol.
     var polls: u32 = 0;
     while (@atomicLoad(u32, &shootdown_req.completion, .acquire) != 0) : (polls += 1) {
         if (polls == SHOOTDOWN_WAIT_POLL_LIMIT) failShootdown("completion timed out");
         asm volatile ("pause");
     }
-    // Disable IRQs again before releasing the lock so the saved-rflags
-    // restore on `release` is the authoritative IF state.
-    asm volatile ("cli");
 
     @atomicStore(u32, &shootdown_req.active, 0, .release);
 }

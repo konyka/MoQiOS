@@ -177,6 +177,62 @@ pub fn readPage(inode_id: u64, page_offset: u64) ?*[PAGE_SIZE]u8 {
     return null;
 }
 
+/// Copy `len` bytes from a cached page into `dst` while still holding
+/// cache_lock. A raw pointer from readPage() outlives the lock, so a
+/// concurrent clock eviction could free the frame before the caller memcpys;
+/// copying under the lock removes that race. Returns false on a miss.
+pub fn copyPage(inode_id: u64, page_offset: u64, page_off: u32, dst: [*]u8, len: u32) bool {
+    const flags = cache_lock.acquire();
+    defer cache_lock.release(flags);
+
+    const key = CacheKey{ .inode_id = inode_id, .page_offset = page_offset };
+    const bucket = hashKey(key);
+
+    var slot = hash_buckets[bucket];
+    while (slot) |s| {
+        if (pages[s].valid and
+            pages[s].key.inode_id == inode_id and
+            pages[s].key.page_offset == page_offset)
+        {
+            cache_hits += 1;
+            pages[s].referenced = true;
+            @memcpy(dst[0..len], pages[s].data[page_off .. page_off + len]);
+            return true;
+        }
+        slot = pages[s].hash_next;
+    }
+
+    cache_misses += 1;
+    return false;
+}
+
+/// Copy-out variant of readPageAndRecord: returns the prefetch hint on a hit,
+/// null on a miss. The data is copied under the lock (see copyPage).
+pub fn copyPageAndRecord(inode_id: u64, page_offset: u64, page_off: u32, dst: [*]u8, len: u32) ?u32 {
+    const flags = cache_lock.acquire();
+    defer cache_lock.release(flags);
+
+    const key = CacheKey{ .inode_id = inode_id, .page_offset = page_offset };
+    const bucket = hashKey(key);
+
+    var slot = hash_buckets[bucket];
+    while (slot) |s| {
+        if (pages[s].valid and
+            pages[s].key.inode_id == inode_id and
+            pages[s].key.page_offset == page_offset)
+        {
+            cache_hits += 1;
+            pages[s].referenced = true;
+            @memcpy(dst[0..len], pages[s].data[page_off .. page_off + len]);
+            return recordAccessLocked(inode_id, page_offset);
+        }
+        slot = pages[s].hash_next;
+    }
+
+    cache_misses += 1;
+    return null;
+}
+
 /// Write a page to the cache (marks dirty for writeback).
 /// Returns the cache slot where the data was stored.
 pub fn writePage(inode_id: u64, page_offset: u64, src_data: *const [PAGE_SIZE]u8) ?*[PAGE_SIZE]u8 {
@@ -322,46 +378,113 @@ pub fn insertPageOwned(inode_id: u64, page_offset: u64, phys: u64, data_len: u32
 /// Flush all dirty pages for a given inode.
 /// Calls the provided writeback function for each dirty page.
 /// Uses per-inode linked list for O(pages_of_inode) instead of O(MAX_PAGES).
+///
+/// Disk I/O never runs under cache_lock (writeback.zig v53.35 pattern): each
+/// dirty page is snapshotted to the stack and marked clean, the lock is
+/// dropped for the writeback call, then re-acquired. A failed flush restores
+/// the dirty bit (when the slot still holds the same page) and stops the
+/// scan, so the data is not lost and a persistent I/O error cannot spin the
+/// retry loop. A page re-dirtied by a concurrent writePage during the flush
+/// keeps its dirty bit, so the newer data is flushed on a later pass.
 pub fn flushInode(inode_id: u64, writeback_fn: *const fn (u64, u64, *[PAGE_SIZE]u8) bool) u32 {
-    const flags = cache_lock.acquire();
-    defer cache_lock.release(flags);
-
     var flushed: u32 = 0;
-    var slot = inode_list_heads[inodeListSlot(inode_id)];
-    while (slot) |s| {
-        const next = pages[s].inode_next;
-        if (pages[s].valid and pages[s].dirty and pages[s].key.inode_id == inode_id) {
-            if (writeback_fn(inode_id, pages[s].key.page_offset, pages[s].data)) {
+    while (true) {
+        var tmp: [PAGE_SIZE]u8 = undefined;
+        var page_offset: u64 = 0;
+        var flushed_slot: u16 = 0;
+
+        var flags = cache_lock.acquire();
+        var found = false;
+        var slot = inode_list_heads[inodeListSlot(inode_id)];
+        while (slot) |s| {
+            if (pages[s].valid and pages[s].dirty and pages[s].key.inode_id == inode_id) {
+                @memcpy(&tmp, pages[s].data);
+                page_offset = pages[s].key.page_offset;
                 pages[s].dirty = false;
                 dirtyClr(s);
-                flushed += 1;
+                // Second chance against clock eviction while the lock is dropped.
+                pages[s].referenced = true;
+                flushed_slot = s;
+                found = true;
+                break;
             }
+            slot = pages[s].inode_next;
         }
-        slot = next;
+        cache_lock.release(flags);
+        if (!found) break;
+
+        const ok = writeback_fn(inode_id, page_offset, &tmp);
+
+        flags = cache_lock.acquire();
+        if (!ok) {
+            // Restore dirty only if the slot still holds the same page; if it
+            // was invalidated/evicted during the flush there is nothing to
+            // restore (the caller dropped the page on purpose).
+            if (pages[flushed_slot].valid and
+                pages[flushed_slot].key.inode_id == inode_id and
+                pages[flushed_slot].key.page_offset == page_offset)
+            {
+                pages[flushed_slot].dirty = true;
+                dirtySet(flushed_slot);
+            }
+            cache_lock.release(flags);
+            break;
+        }
+        cache_lock.release(flags);
+        flushed += 1;
     }
     return flushed;
 }
 
-/// Flush ALL dirty pages.
+/// Flush ALL dirty pages. Same drop-the-lock-for-I/O pattern as flushInode.
 pub fn flushAll(writeback_fn: *const fn (u64, u64, *[PAGE_SIZE]u8) bool) u32 {
-    const flags = cache_lock.acquire();
-    defer cache_lock.release(flags);
-
     var flushed: u32 = 0;
-    // Iterate dirty bitmap: skip entire u64 groups with no dirty pages
-    for (0..dirty_bm.len) |grp| {
-        var bm = dirty_bm[grp];
-        while (bm != 0) {
-            const bit = @ctz(bm);
-            bm &= bm - 1;
-            const i: u16 = @intCast(grp * 64 + bit);
-            if (!pages[i].valid or !pages[i].dirty) continue;
-            if (writeback_fn(pages[i].key.inode_id, pages[i].key.page_offset, pages[i].data)) {
+    while (true) {
+        var tmp: [PAGE_SIZE]u8 = undefined;
+        var key: CacheKey = .{ .inode_id = 0, .page_offset = 0 };
+        var flushed_slot: u16 = 0;
+
+        var flags = cache_lock.acquire();
+        var found = false;
+        // Iterate dirty bitmap: skip entire u64 groups with no dirty pages
+        for (0..dirty_bm.len) |grp| {
+            var bm = dirty_bm[grp];
+            while (bm != 0) {
+                const bit = @ctz(bm);
+                bm &= bm - 1;
+                const i: u16 = @intCast(grp * 64 + bit);
+                if (!pages[i].valid or !pages[i].dirty) continue;
+                @memcpy(&tmp, pages[i].data);
+                key = pages[i].key;
                 pages[i].dirty = false;
                 dirtyClr(i);
-                flushed += 1;
+                // Second chance against clock eviction while the lock is dropped.
+                pages[i].referenced = true;
+                flushed_slot = i;
+                found = true;
+                break;
             }
+            if (found) break;
         }
+        cache_lock.release(flags);
+        if (!found) break;
+
+        const ok = writeback_fn(key.inode_id, key.page_offset, &tmp);
+
+        flags = cache_lock.acquire();
+        if (!ok) {
+            if (pages[flushed_slot].valid and
+                pages[flushed_slot].key.inode_id == key.inode_id and
+                pages[flushed_slot].key.page_offset == key.page_offset)
+            {
+                pages[flushed_slot].dirty = true;
+                dirtySet(flushed_slot);
+            }
+            cache_lock.release(flags);
+            break;
+        }
+        cache_lock.release(flags);
+        flushed += 1;
     }
     return flushed;
 }

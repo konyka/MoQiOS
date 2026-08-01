@@ -13,6 +13,9 @@ const arch = @import("../arch/arch.zig");
 const writeback = @import("../fs/writeback.zig");
 
 const FILE_IDX: u32 = 7;
+// v53.51: writeback buffers are keyed by inode_id; FILE_IDX is only the
+// flush-target slot passed to the probe callback.
+const INODE_ID: u64 = 0x3000_0000_0000_0000 + @as(u64, FILE_IDX);
 const OFFSET: u64 = 4096;
 const payload = "SK46-writeback!!";
 
@@ -34,12 +37,12 @@ pub fn announce() void {
     }
 
     // Dirty-buffer round-trip: write into the cache, read it back.
-    if (writeback.writeBuffered(FILE_IDX, OFFSET, payload.ptr, payload.len, .ext2) != payload.len) {
+    if (writeback.writeBuffered(INODE_ID, FILE_IDX, OFFSET, payload.ptr, payload.len, .ext2) != payload.len) {
         arch.serial.writeString("[SK-46] FAILED: writeBuffered accepted len\n");
         return;
     }
     var buf: [payload.len]u8 = undefined;
-    const n = writeback.readBuffered(FILE_IDX, OFFSET, &buf, payload.len, .ext2);
+    const n = writeback.readBuffered(INODE_ID, OFFSET, &buf, payload.len, .ext2);
     if (n != payload.len) {
         arch.serial.writeString("[SK-46] FAILED: readBuffered len\n");
         return;
@@ -51,11 +54,11 @@ pub fn announce() void {
         }
     }
     // Wrong fs_type / offset must miss the cache.
-    if (writeback.readBuffered(FILE_IDX, OFFSET, &buf, payload.len, .fat32) != 0) {
+    if (writeback.readBuffered(INODE_ID, OFFSET, &buf, payload.len, .fat32) != 0) {
         arch.serial.writeString("[SK-46] FAILED: fs_type not keyed\n");
         return;
     }
-    if (writeback.readBuffered(FILE_IDX, OFFSET + 4096, &buf, payload.len, .ext2) != 0) {
+    if (writeback.readBuffered(INODE_ID, OFFSET + 4096, &buf, payload.len, .ext2) != 0) {
         arch.serial.writeString("[SK-46] FAILED: offset not keyed\n");
         return;
     }
@@ -66,7 +69,7 @@ pub fn announce() void {
 
     // Flush through the same comptime-callback path vfs.syncFile uses. The
     // returned status is what lets fsync report EIO, so check it here too.
-    if (!writeback.flushFile(FILE_IDX, .ext2, probeFlush)) {
+    if (!writeback.flushFile(INODE_ID, .ext2, probeFlush)) {
         arch.serial.writeString("[SK-46] FAILED: flush reported failure\n");
         return;
     }

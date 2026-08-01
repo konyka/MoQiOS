@@ -100,6 +100,10 @@ var rx_desc_virt: u64 = 0;
 var rx_buf_phys: [NUM_RX_DESC]u64 = @splat(0);
 var rx_buf_virt: [NUM_RX_DESC]u64 = @splat(0);
 var rx_tail: u32 = 0;
+// receivePacket runs from both the IRQ handler and raw-socket syscall reads;
+// the lock keeps an IRQ mid-receive from consuming/re-arming the same
+// descriptor twice (mirrors tx_lock on the send path).
+var rx_lock: IrqSpinlock = .{};
 
 var tx_desc_phys: u64 = 0;
 var tx_desc_virt: u64 = 0;
@@ -412,6 +416,9 @@ fn setupTX() !void {
 /// Receive a packet. Returns packet length or 0 if no packet available.
 pub fn receivePacket(buf: [*]u8, max_len: u32) u32 {
     if (!initialized) return 0;
+
+    const flags = rx_lock.acquire();
+    defer rx_lock.release(flags);
 
     const next = (rx_tail + 1) % NUM_RX_DESC;
     const desc: *volatile RxDesc = @ptrFromInt(rx_desc_virt + next * @sizeOf(RxDesc));
