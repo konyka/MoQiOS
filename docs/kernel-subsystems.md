@@ -1,7 +1,7 @@
 # MoQiOS 内核子系统详细设计
 
 > **文档定位**: 描述 MoQiOS 内核各子系统的核心数据结构、API、实现状态与依赖关系。
-> **修订日期**: 2026-06-21
+> **修订日期**: 2026-08-01
 > **关联文档**: [moqios-architecture-current.md](./moqios-architecture-current.md)
 >
 > **2026-06-21 更新**: SMP 性能三件套（FPU/SSE 按任务 lazy save、Per-CPU 运行队列 +
@@ -46,7 +46,7 @@
 const Pmm = struct {
     bitmap_l1: []u64,     // L1: 1 bit / 4KB 页
     bitmap_l2: []u64,     // L2: 每 64 页一个汇总位（加速空闲扫描）
-    refcount: []u8,       // 每页引用计数（CoW 支持）
+    refcount: []u16,      // 每页引用计数（CoW 支持）
     total_pages: usize,
     free_pages: usize,
     base_phys: usize,     // 跳过前 2MB
@@ -60,8 +60,8 @@ const Pmm = struct {
 |---|---|
 | `allocPage() ?usize` | 分配单个 4KB 物理页（两级位图加速） |
 | `freePage(phys)` | 释放，并递减引用计数；同步更新 L2 汇总位 |
-| `incRef(phys)` / `decRef(phys)` | 引用计数（CoW 使用） |
-| `allocContig(n) ?usize` | 分配 n 个连续页（DMA 用） |
+| `addRef(phys)` / `decRef(phys) u16` | 引用计数（CoW 使用）；`decRef` 返回递减后的新计数值 |
+| `allocContiguous(n) ?u64` | 分配 n 个连续页（DMA 用），返回基址物理地址 |
 | `totalPages() u64` | ✅ 返回总物理页数 (sysinfo 使用) |
 | `freePages() u64` | ✅ 返回空闲物理页数 (sysinfo 使用) |
 | `allocHugePages(n) ?usize` | 分配 n 个连续 2MB 大页对齐物理页 |
@@ -229,9 +229,9 @@ const Task = struct {
     priority: u8,
     time_slice: u32,
     regs: SavedRegs,            // r15..rax, rip, rsp, rflags, cr3
-    kstack: []u8,               // 16KB 内核栈
+    kstack: []u8,               // 128KB 内核栈（KERNEL_STACK_PAGES=32 × 4KB，task.zig:23）
     mm: *AddressSpace,
-    fdtable: FdTable,           // 16 个 FD
+    fdtable: FdTable,           // 64 个 FD（MAX_FDS=64，vfs.zig:24）
     sigmask: u64, sigpending: u64,
     sigactions: [32]SigAction,
     cwd: [256]u8,
@@ -495,18 +495,21 @@ const FdTable = struct {
 
 只读，由内核启动时一次性加载到内存，存放所有用户测试程序。
 
-### 3.3 FAT32 ✅ 256 扇区 FAT 表 LRU 缓存，write-back
+### 3.3 FAT32 ✅ 单扇区 FAT 缓存 + DMA 安全写缓冲
 
 文件: `fat32.zig`
 
 - MBR 分区表解析
 - Boot Sector (BPB)、FSInfo
-- FAT 表读写：256 扇区 LRU 缓存（128KB），write-back 策略
-- 空闲簇提示指针（next-free hint）加速分配
+- FAT 表读写：单扇区 FAT 缓存（`fat_cache_sector`，v53.36，顺序读 I/O 减少约 128 倍）
+- 空闲簇扫描游标（`last_free_cluster`，v53.38，O(N) 分配扫描）
 - 8.3 短文件名 + LFN（长文件名）支持
 - 操作: 读/写/创建/删除/目录列表
+- 全局 `fs_lock`（IrqSpinlock）串行化文件系统操作；文件数据写回经 `fs/writeback.zig`
+  按稳定 inode 标识（而非打开文件句柄）缓冲，多毫秒级延迟刷盘由专用 writeback 内核线程
+  （`vfs.zig` `writebackThreadMain`，调度 tick 唤醒等待队列）执行
 
-### 3.4 Ext2 ✅ 256 条目块缓存 + 哈希加速 + 间接块缓存
+### 3.4 Ext2 ✅ 64 条目块缓存 + 哈希加速 + 间接块缓存
 
 文件: `ext2.zig`
 
@@ -522,7 +525,7 @@ const FdTable = struct {
   记录越过块尾的记录。新增目录项时的可拆间隙也从校验后的记录计算，避免 u16 下溢
   导致越界写。
 - Inode（直接块 + 单级间接块）
-- 块缓存：256 条目 + 64 桶哈希表加速查找，dirty write-back
+- 块缓存：64 条目（`CACHE_ENTRIES=64`）+ 哈希桶加速查找，dirty write-back
 - 间接块指针缓存：16 条目，避免重复读取间接块
 - 截断释放：`truncateFile` / `truncateByInode` 共用单/双/三级间接块 tail-trim helper，缩小时释放尾部数据块和空的间接树并失效 inode 页缓存
 - 目录条目读写
@@ -821,11 +824,12 @@ const CapTable = [32]Capability; // 每任务
 
 ### 5.6 POSIX 消息队列 ✅ (v18.0)
 
-文件: `posix_mq.zig` (373 行)
+文件: `posix_mq.zig` (519 行)
 
 - 16 个队列上限，8 消息/队列，512 字节/消息
 - mq_open: 创建/打开队列，O_CREAT/O_EXCL/O_NONBLOCK
-- mq_timedsend/timedreceive: 发送/接收消息 (带优先级, v18.2 支持超时等待)
+- mq_timedsend/timedreceive: 发送/接收消息 (带优先级；阻塞在 `task.WaitNode` 等待队列上，
+  支持超时唤醒)
 - mq_unlink: 删除队列 (延迟释放)
 - mq_notify: 注册/注销通知
 - mq_getsetattr: 获取/设置队列属性
@@ -1091,7 +1095,7 @@ const TicketSpinlock = struct {
 | 范围 TLB shootdown（IPI + invlpg loop + 阈值 CR3 回退） | ✅ M8-6（2026-06-21）|
 | per-CPU 运行队列 + work-stealing | ✅ M8-7（2026-06-21）|
 
-验证：`MOQI_SMP=1` 与 `MOQI_SMP=2` 均完整跑通 `init` 自动序列（至 `hello21 done`）+ `MoQiOS shell`。
+验证：`MOQI_SMP=1` 与 `MOQI_SMP=2` 均完整跑通 `init` 自动序列（至 `hello42 done`）+ `MoQiOS shell`。
 
 ### 9.2 集中配置 ✅
 
@@ -1129,31 +1133,42 @@ const TicketSpinlock = struct {
 **核心 API**
 
 ```zig
-pub fn shootdownRange(addr_start: u64, page_count: u32) void
+pub fn shootdownRange(addr_start: u64, page_count: u32, target_cr3: u64) void
 ```
+
+`target_cr3` 是目标（受害者）地址空间的 `page_table_phys`；传 0 表示「未知 / 内核半区」，
+向所有在线 CPU 发送。逐 CPU 读取 `PerCpu.current_cr3`
+（`syscall_entry.percpu_array[cpu].current_cr3`），凡已记录且与 `target_cr3` 不同的 CPU
+整体跳过——不发 IPI、不 flush、不占 `completion` 名额。被跳过的 CPU 之后切入该 CR3 也安全：
+上下文切换时的 CR3 加载会失效全部非 global TLB 项（用户页从不 global）。
 
 **结构**
 
 - 单一全局请求槽 `shootdown_req: TlbShootdownReq`（`addr_start` / `page_count` /
-  `completion` 原子计数器 / `active` 标志）。
-- 多发起方串行化通过自定义 **`TlbLock`**（不是 `IrqSpinlock`）：等待时**主动
-  开中断**，避免两个 CPU 互相等对方接收 IPI 导致的跨核死锁。
+  `target_cr3` / `target_mask` / `generation` / `completion` 原子计数器 / `active` 标志）。
+- 多发起方串行化通过自定义 **`TlbLock`**（不是 `IrqSpinlock`）：等待时**保持关中断**（页故障
+  处理路径可安全使用），并循环调用 `servicePendingShootdown` 手动服务在途广播，避免两个 CPU
+  互相等对方接收 IPI 导致的跨核死锁。
 - 向量号沿用既有 `TLB_SHOOTDOWN_VECTOR = 0xFE`。
 
 **算法（发起方）**
 
 1. 本地 `flushLocal(addr, n)`（≤32 页 → invlpg 循环；>32 页 → CR3 reload）。
-2. SMP 未上线（`smp.cpu_count <= 1`）直接返回。
-3. 持 `shootdown_lock`，发布请求到全局槽，把 `completion` 设为远端 CPU 数。
-4. `lapic.sendIpiAllButSelf(0xFE)` 广播。
-5. `sti` 后 `pause` 自旋等 `completion == 0`；`cli` 后释放锁。
+2. 按 CR3 过滤构建 `target_mask`（见上）；无目标远端 CPU 时直接返回。
+3. 持 `shootdown_lock`，发布请求到全局槽（含 `target_cr3` / `target_mask` / 递增的
+   `generation`），把 `completion` 设为目标远端 CPU 数。
+4. 按 `target_mask` 逐 CPU `lapic.sendIpi(apic_id, 0xFE)` 定向发送（不再全广播）。
+5. 保持调用方 IF 状态不变，`pause` 自旋等 `completion == 0`（**不** `sti`：调用方含页故障
+   处理路径，中断窗口会破坏 iretq 状态；在 `TlbLock` 中等待的 CPU 会经
+   `servicePendingShootdown` 手动服务本次广播，故关中断等待不会死锁），随后释放锁。
 
 **算法（IPI 接收方）**
 
 1. 内联 EOI（直接写 LAPIC EOI 寄存器，避免在 IPI 快路径上拉入 lapic helpers）。
-2. acquire 加载 `addr_start` / `page_count`，调用 `flushLocal`。
-3. `@atomicRmw(.Sub, 1)` 递减 `completion`。
-4. **不获取任何锁**，仅原子，对中断重入安全。
+2. 不在 `target_mask` 内的 CPU 直接返回（不 flush 也不 ack）；按 `generation` 幂等去重。
+3. acquire 加载 `addr_start` / `page_count`，调用 `flushLocal`。
+4. `cmpxchg` 递减 `completion`（仅在非零时，防止重复/过期向量把计数绕回 UINT_MAX）。
+5. **不获取任何锁**，仅原子，对中断重入安全。
 
 **阈值策略**：`FLUSH_THRESHOLD = 32`。超过 32 页改用 CR3 reload（用户页面非 global，
 语义等价但比长串 invlpg 快）。

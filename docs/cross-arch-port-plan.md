@@ -87,8 +87,9 @@
 - ✅ M0：本路线图 + 选型 riscv64。
 - ✅ M1：
   - `build.zig` 增加 `-Darch=x86_64|riscv64`（默认 x86_64，行为与之前完全一致）。
-  - `kernel/arch/riscv64/start.zig`：S-mode `_start` → 设栈 → `kmain`，经控制台打印后停机
-    （M1 用 SBI；**M2 起改 UART16550 直驱**）。
+  - `kernel/riscv64_root.zig`：`-Darch=riscv64` 的构建根（`build.zig:72`），`comptime` 引入
+    `kernel/arch/riscv64/start.zig`（真正的 S-mode `_start` → 设栈 → `kmain`，经控制台打印后停机；
+    M1 用 SBI，**M2 起改 UART16550 直驱**）。
   - `kernel/arch/riscv64/linker.ld`：链接到 `0x80200000`（OpenSBI 之上）。
   - `tools/qemu_run_riscv64.sh`：`qemu-system-riscv64 -machine virt -bios default -kernel ...`。
   - 验证：`zig build -Darch=riscv64` 产出合法 riscv64 ELF（readelf）；`zig build`（x86_64）仍启动到
@@ -120,7 +121,8 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
   - `stvec` 向量配置 + 基本 trap 帧
   - 分页/定时器/上下文切换 stub（待后续里程碑实现）
 - **首步迁移**：`main.zig` 中的串口通过 `arch.zig` 引入，作为渐进迁移的第一步。
-- **`riscv64/start.zig`**：强制 `comptime import arch_impl`，确保架构实现被编译引入。
+- **`riscv64_root.zig`**：构建根，`comptime` 引入 `arch/riscv64/start.zig`，后者再强制
+  `comptime import arch_impl`，确保架构实现被编译引入。
 
 ### 验证结果
 
@@ -2811,8 +2813,8 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 > - **M8-6**：范围 TLB shootdown（`tlb.shootdownRange` + invlpg + 32 页阈值 CR3 回退）。
 > - **M8-7**：per-CPU 运行队列 + work-stealing（`PerCpuRunQueue` 256 槽 LIFO + steal_half）。
 > - 三者互为前提，同时交付后 AP 首次可真正跨核运行用户任务。
-> - 验证：`MOQI_SMP=1` 与 `MOQI_SMP=2` 均完整跑通 `init` 自动序列（至 `hello21 done`）+ `MoQiOS shell`
->   （`init.S` 当前在 hello21 后进入 shell；hello22–28 为手动/后续用例，非自动序列）。
+> - 验证：`MOQI_SMP=1` 与 `MOQI_SMP=2` 均完整跑通 `init` 自动序列（至 `hello42 done`）+ `MoQiOS shell`
+>   （`init.S` 当前在 hello42 后进入 shell；`hello11`/`hello28` 不在自动序列内）。
 
 ---
 

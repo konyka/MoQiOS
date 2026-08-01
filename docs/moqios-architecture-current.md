@@ -2,10 +2,10 @@
 
 > **版本**: v0.51.0（v53.50 free_bm同步修复+fat32嵌套锁消除+TCP accept环形队列+ext2零拷贝）
 > **日期**: 2026-05-29
-> **代码统计**: 内核 41,008 行 Zig / 133 源文件（新增 `kernel/net/ipv6.zig`、
->   `kernel/net/icmpv6.zig`、`kernel/net/ndp.zig`、`kernel/proc/cap_check.zig`、
->   `kernel/arch/arch.zig`、`kernel/arch/x86_64/arch_impl.zig`、`kernel/arch/riscv64/arch_impl.zig`），
->   用户空间 2,244 行 C/ASM
+> **代码统计**: 内核 67,635 行 Zig / 325 源文件（`kernel/**/*.zig`，2026-08 实测；
+>   含 `kernel/net/ipv6.zig`、`kernel/net/icmpv6.zig`、`kernel/net/ndp.zig`、
+>   `kernel/proc/cap_check.zig`、`kernel/arch/arch.zig`、`kernel/arch/x86_64/arch_impl.zig`、
+>   `kernel/arch/riscv64/arch_impl.zig` 等），用户空间 C/ASM
 >
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
@@ -74,10 +74,10 @@ MoQiOS 是一个运行在 x86_64 架构上的**单体内核** (Monolithic Kernel
 | 内核栈大小 | 32 页 = 128KB (KERNEL_STACK_PAGES) |
 | 用户代码段基址 | 0x00400000 (4MB) |
 | 用户栈顶 | 0x00800000 (8MB) |
-| 系统调用数量 | 383 dispatch 条目 (max #471, #0-#330 连续 + Linux #424-#471 完全连续) |
+| 系统调用数量 | 382 dispatch 条目 (max #471, #0-#330 连续 + Linux #424-#471 完全连续) |
 | 文件系统 | FAT32 + ext2 (完整 symlink/hardlink/chown/chmod) + tmpfs + procfs + ramdisk + 统一页缓存 (命中/未中统计) |
 | 网络设备 | e1000 (中断驱动) + virtio-net (Virtqueue) |
-| 内核代码量 | ~40,396 行 Zig / 133 文件 |
+| 内核代码量 | 67,635 行 Zig / 325 文件 |
 | 用户代码量 | 2,244 行 C/ASM |
 
 ---
@@ -88,9 +88,10 @@ MoQiOS 是一个运行在 x86_64 架构上的**单体内核** (Monolithic Kernel
 连续查明并修复了三个相互掩盖的深层根因：**TSS 布局错位**（用户态硬件中断投递从未工作，详见
 **1.7 节**）、**ext2 inode 越界**（256B 磁盘 inode 写入 128B 结构体）、**中断 stub 寄存器破坏**
 （被中断代码 RAX/RCX 遭污染，详见 **1.8 节**）。三者全部修复后，系统首次**完整启动至交互式
-`MoQiOS shell`**，依次跑通 `init` 自动序列（至 `hello21 done`）及后续用户态测试（含用户态被定时器抢占、
-ext2 多级目录读写删，QEMU 串口验证，零异常、零三重故障）。当前 `init.S` 在 hello21 后进入 shell；
-`hello22`–`hello28` 为树内可手动运行的用例，不在自动序列中。
+`MoQiOS shell`**，依次跑通 `init` 自动序列及后续用户态测试（含用户态被定时器抢占、
+ext2 多级目录读写删，QEMU 串口验证，零异常、零三重故障）。当前 `user/init.S`（1,246 行）
+自动 spawn hello2–hello42 全序列（仅 hello11、hello28 不在自动序列中，hello6 因阻塞键盘
+输入被跳过），smoke 门禁以 `hello42 done` + shell 提示符为准（见 `tools/qemu_smoke.sh`）。
 
 ### 已修复缺陷
 
@@ -116,9 +117,9 @@ ext2 多级目录读写删，QEMU 串口验证，零异常、零三重故障）�
 - ~~**ext2 多级目录写内存破坏**~~（**已修复**）：根因是 ext2 inode 越界与中断 stub 寄存器破坏
   两个相互叠加的 bug，已分别修复，`hello21`/`hello24`/`hello25` 全部通过，系统抵达 shell。
   详见 **1.8 节**。
-- **大量未接入源文件**：`kernel/` 下有数十个新增 `.zig`（如 `mm/mprotect.zig`、`proc/clone.zig`、
-  `ipc/sysv_*.zig`、`fs/select.zig` 等）未被任何模块 `@import`，因此不会被编译/检查，属未集成
-  脚手架，详见构建文档。
+- ~~**大量未接入源文件**~~（**已解决**）：`mm/mprotect.zig`、`proc/clone.zig`、
+  `ipc/sysv_*.zig`、`fs/select.zig` 等此前未被 `@import` 的脚手架现均已接入构建并被
+  实际引用。当前已知的孤儿文件仅剩 `kernel/boot_info.zig`（无任何模块导入）。
 - **测试分层**：`zig build test` 已作为主机侧单元测试入口，覆盖可脱离硬件执行的共享库逻辑
   （如字节序、字符串、整数格式化边界）；真正的内核/用户态集成仍以 QEMU 中运行的 `hello*`
   运行时测试为准。
@@ -178,7 +179,7 @@ AP 数量由 MADT 运行时探测，不再硬编码为固定核数。门禁：`z
 
 **容量边界（硬件决定）**：元数据槽上限 `MAX_CPUS = 256`，因为 xAPIC ID 字段为 u8。超出此范围的逻辑 CPU ID 在 `apEntry` 入口处被静默 halt，不会破坏内核状态。
 
-**TLB IPI 精准等待**：`tlb.zig` shootdown 仅对 `isCpuOnline(id)` 为真的 CPU 发 IPI 并等待 ACK，不轮询未上线或已 halt 的 CPU。
+**TLB IPI 精准等待**：`tlb.zig` shootdown 仅对 `isCpuOnline(id)` 为真的 CPU 发 IPI 并等待 ACK，不轮询未上线或已 halt 的 CPU；并按 `PerCpu.current_cr3` 过滤，只打扰运行目标地址空间的核。
 
 | 子里程碑 | 状态 | 说明 |
 |---|---|---|
@@ -452,18 +453,21 @@ M8 路线图的最后三项重要 SMP 性能优化同时落地，**考虑到三�
 
 ### 1.9.3 范围 TLB Shootdown
 
-文件：`kernel/arch/x86_64/tlb.zig`（新增，~206 行）
+文件：`kernel/arch/x86_64/tlb.zig`（298 行）
 
-- **入口**：`shootdownRange(addr_start: u64, page_count: u32)`。
+- **入口**：`shootdownRange(addr_start: u64, page_count: u32, target_cr3: u64)` ——
+  三参数版本按 **CR3 过滤**目标 CPU：仅向 `PerCpu.current_cr3` 与 `target_cr3`
+  匹配（或未记录，值为 0）的在线 CPU 发 IPI，无关核不受影响。
 - **使用现有向量**：`TLB_SHOOTDOWN_VECTOR = 0xFE`（不新增 IDT 向量）。
 - **本地阈值**：`FLUSH_THRESHOLD = 32`；≤ 32 页走 invlpg 循环，> 32 页走 CR3 reload。
 - **全局请求槽**：`shootdown_req: TlbShootdownReq` 包含 `addr_start` / `page_count` /
-  `completion`（原子计数） / `active`。发起方 `sti` 后自旋等 `completion == 0`。
-- **自定义 `TlbLock`**：区别于 `IrqSpinlock`，等待时**开中断**，避免两个发起方
-  互相等对方接收 IPI 导致的跨核死锁。
+  `completion`（原子计数） / `active`。
+- **自定义 `TlbLock`**：**关中断自旋 + 手动广播服务**——等待期间不再开中断
+  （旧版 `sti` 窗口会把调度嵌套进缺页帧，是 SMP #GP 的根因），改为 IRQ-off 自旋，
+  并在自旋中手动检查/服务本核的 shootdown 请求以避免跨核死锁。
 - **IPI 接收方**：内联 EOI 后 `flushLocal(addr, n)` + `@atomicRmw(.Sub, 1)`，不取任何锁。
 - **集成点**：`mm/mprotect.zig`、`mm/mmap.zig` 的 unmap 路径完成 PTE 修改后调用
-  `tlb.shootdownRange`。
+  `tlb.shootdownRange`；释放物理帧之前先 shootdown（swapOut/COW 路径）。
 - **收益**：避免原本 "广播 IPI → 远端 CR3 全刷"对频繁 mprotect/munmap 场景的 TLB 性能损耗。
 
 ### 1.9.4 总体意义
@@ -543,7 +547,8 @@ QEMU / 真机
   │    └─ 跳转至 kernel_main
   │
   ├─ kernel_main() [kernel/main.zig]
-  │    ├─ 解析 Limine 启动信息 (boot_info.zig)
+  │    ├─ 解析 Limine 启动信息 (limine.zig 请求/响应；注意 kernel/boot_info.zig 为
+  │    │    无引用孤儿文件，不参与启动流程)
   │    ├─ 初始化 GDT (gdt.zig) — 代码/数据/TSS 段
   │    ├─ 初始化 IDT (idt.zig) — 异常 + IRQ 中断
   │    ├─ 初始化串口 (serial.zig) — COM1 调试输出
@@ -561,10 +566,9 @@ QEMU / 真机
   └─ init 任务 (内核线程)
        ├─ 延迟初始化网络模块 (net/mod.zig) — 不能在 boot 阶段初始化
        └─ 加载并执行 /init (user/init.S)
-            ├─ 启动 hello3, hello4, hello5, hello7, hello8
-            ├─ 启动 hello12, hello13, hello14, hello15, hello16
-            ├─ 启动 hello9, hello10 (fork 测试)
-            └─ 启动 shell (sh.c)
+            ├─ 自动 spawn hello2–hello42 全序列 (1,246 行；hello6 因阻塞键盘跳过，
+            │    hello11/hello28 不在自动序列中)
+            └─ 序列结束后进入 shell (sh.c)
 ```
 
 ### 关键启动细节
@@ -740,7 +744,7 @@ LAPIC Timer 中断
 
 ## 6. 系统调用
 
-**源文件**: `kernel/arch/x86_64/syscall_entry.zig` (5,052 行)
+**源文件**: `kernel/arch/x86_64/syscall_entry.zig` (5,248 行)
 
 ### 6.1 系统调用机制
 
@@ -749,7 +753,7 @@ LAPIC Timer 中断
 - SyscallFrame 结构保存所有寄存器
 - 返回值通过 rax 传递，错误通过 rax = -errno 表示
 
-### 6.2 系统调用表 (383 dispatch 条目, max #471)
+### 6.2 系统调用表 (382 dispatch 条目, max #471)
 
 > v49.0 ext2 符号链接/硬链接: link()#86/symlink()#88从accept升级为真实ext2实现(createHardlink/createSymlink); walkPathInner递归symlink解析(深度限制8级ELOOP); readSymlinkTarget(短链接i_block内联+长链接静态缓冲区)。
 > v48.0 性能容量全面提升: page_cache 4x扩容 (MAX_PAGES 256→1024, 4MB缓存/CACHE_SLOTS 128→512/INODE_LIST_SLOTS 64→256/MAX_PREFETCH_TRACK 8→32/dirty_bm参数化); writeback BUFFER_COUNT 128→512; TCP MAX_CONNECTIONS 32→64 (u64 bitmap)/收发缓冲 32KB→64KB。
@@ -1103,14 +1107,25 @@ LAPIC Timer 中断
 - **readFile 簇链缓存** (v53.38): last_walk_cluster/last_walk_idx — O(N²)→O(N) 顺序读
 - 缓存: 在内存中维护打开文件数组，避免频繁磁盘 I/O
 - 路径解析: 支持绝对路径和相对路径 (相对于 cwd)
+- **并发模型**: 粗粒度 `fs_lock` (IrqSpinlock) 串行化 FAT32 操作；ext2 同样采用
+  粗粒度 `fs_lock`。两文件系统均无细粒度 inode 级锁。
 
 ### 7.3 Ramdisk
 
 **源文件**: `kernel/fs/ramdisk.zig`
 
 - 启动时由 Limine 模块加载的内存文件系统
-- 存储: init, hello2-hello18, shell 等用户程序
+- 存储: init, hello2-hello42, shell 等用户程序
 - 只读，用于存放可执行文件
+
+### 7.3.1 写回缓存 (writeback)
+
+**源文件**: `kernel/fs/writeback.zig` (356 行)
+
+- 写回缓冲按 **inode_id 键控**（而非旧的 file_idx 全局表），truncate/unlink 时按
+  inode 失效对应脏缓冲，避免句柄复用导致脏数据写错文件。
+- 脏缓冲刷盘由**专用内核线程**执行（`vfs.zig` `startWritebackThread()`），不再在
+  持锁路径上同步落盘。
 
 ### 7.4 块设备驱动
 
@@ -1195,7 +1210,10 @@ LAPIC Timer 中断
 - `sigreturn()`: 从信号处理函数返回，恢复原始上下文
 - `kill()`: 向指定进程发送信号
 - **Ctrl+C**: 键盘中断处理中检测，向前台进程发送 SIGINT
-- **信号投递**: 仅在 `waitpid` 系统调用返回时检查 (`checkSignalsOnSyscallReturn`)
+- **信号投递**: 三处时机 — ① 系统调用返回 (`syscall_entry.zig:469`
+  `checkSignalsOnSyscallReturn`)；② #PF 用户态段错误立即投递 SIGSEGV
+  (`idt.zig:519`)；③ 调度器 timer tick 检查 `pending_signals` 并从当前帧恢复
+  (`sched.zig:269-276`)。
 
 ---
 
@@ -1214,24 +1232,19 @@ LAPIC Timer 中断
 
 ### 11.1 init 进程
 
-**源文件**: `user/init.S` (~540 行)
+**源文件**: `user/init.S` (1,246 行)
 
-启动时第一个用户进程，按顺序 spawn:
-- hello3 (ramdisk 读写) x2
-- hello4 (多进程)
-- hello5 (ELF 加载验证)
-- hello7 (FAT32 写入) x2
-- hello8 (网络 ARP)
-- hello12 (信号处理)
-- hello13 (UDP 网络)
-- hello14 (环境变量)
-- hello15 (fork+信号)
-- hello16 (execve)
-- hello9 (fork) x2
-- hello10 (execve+pipe) x2
-- shell
+启动时第一个用户进程，自动 spawn hello2–hello42 全序列（按 init.S 中的顺序）:
+- hello2 (串口输出), hello3 (ramdisk 读写), hello4 (多进程), hello5 (ELF 加载)
+- hello7 (FAT32 写入), hello8 (网络 ARP), hello12-hello20 (信号/UDP/环境变量/execve/argv/网络/ext2)
+- hello22-hello27 (TCP socket/echo/connect), hello23-hello25 (mkdir/ext2 unlink/多级路径)
+- hello29-hello42 (getdents64/brk/TLS/SIGSEGV/EFAULT/CLONE_VM/审计回归/futex/IPC/copy_file_range/pread64)
+- hello9, hello10 (fork/fork+execve), hello21 (ext2 写入, 最慢排最后)
+- 最后进入 shell
 
-共 18 个输出检查点，全部稳定通过。
+跳过: hello6 (阻塞键盘输入)；hello11、hello28 不在自动序列中（ramdisk 中有，可手动运行）。
+smoke 门禁 (`tools/qemu_smoke.sh`) 以 hello32/38/39/40/41/42 的 PASS 标记 +
+`hello42 done` + shell 提示符为准。
 
 ### 11.2 测试程序
 
@@ -1253,8 +1266,8 @@ LAPIC Timer 中断
 | hello17 | fork+execve 自身 + argv 验证 + uname |
 | hello18 | chdir/getcwd/fstat |
 
-注: hello17 和 hello18 位于 ramdisk 中但不包含在 init.S 自动测试中
-(加入后导致其他测试间歇性挂起，原因疑为调度器时序敏感)。
+注: hello17 和 hello18 现均已包含在 init.S 自动序列中；hello11 与 hello28 位于
+ramdisk 中但不自动运行，可在 shell 中手动执行。
 
 ### 11.3 Shell
 
@@ -1367,7 +1380,9 @@ kernel/main.zig
 
 ## 14. 已知限制
 
-1. **AP 定时器**: AP 无 LAPIC 定时器中断 (QEMU TCG 限制)，需要 KVM 或真机
+1. ~~**AP 定时器**: AP 无 LAPIC 定时器中断 (QEMU TCG 限制)~~ **已解决**：AP 通过
+   `lapic.initAp()` 启用 LAPIC 并开启定时器（见 §1.6），`tools/qemu_smoke_matrix.sh`
+   的 SMP=1/2/3/4/6/8 矩阵（`MOQI_SMOKE_MATRIX_CPUS` 可配置）全部通过。
 2. **调度器时序敏感**: 增加进程数量会导致其他进程间歇性挂起
 3. **无安全模型**: ~~无用户权限、capability 等安全机制~~ **已实现 POSIX Capability 模型**（v0.45.0）16 个 capability 位 + 三组掩码 + syscall 检查点
 4. **e1000/virtio-net 仅 QEMU**: 未测试真实硬件
@@ -1387,7 +1402,7 @@ kernel/main.zig
 
 | 文件 | 行数 | 功能 |
 |---|---|---|
-| kernel/arch/x86_64/syscall_entry.zig | 5,053 | 系统调用入口 + 383 dispatch 条目 (v53.44 futex参数修正+pushSignalFrame检查，v53.45 信号活锁修复，v53.46 alarm/itimer位图) |
+| kernel/arch/x86_64/syscall_entry.zig | 5,248 | 系统调用入口 + 382 dispatch 条目 (v53.44 futex参数修正+pushSignalFrame检查，v53.45 信号活锁修复，v53.46 alarm/itimer位图) |
 | kernel/net/tcp.zig | 1,873 | TCP 协议 (Reno/SACK/WS/TS/CORK/QUICKACK + @memcpy环形缓冲区 + v53.41 epollNotify锁外延迟，v53.46 只读查询无锁化+SACK防DoS) |
 | kernel/fs/vfs.zig | ~720 | 虚拟文件系统 + MAX_FDS=64 + procfs 路由 + inotify + allocFd |
 | kernel/arch/x86_64/idt.zig | 786 | 中断描述符表 + IRQ 分发 + COW #PF 处理 |

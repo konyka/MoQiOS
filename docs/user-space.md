@@ -1,7 +1,7 @@
 # MoQiOS 用户空间
 
 > **文档定位**: 描述 MoQiOS 用户态 ABI、init 进程、Shell、测试程序，以及未来微内核化所需的 `servers/` `drivers/` `lib/` 规划。
-> **修订日期**: 2026-05-28
+> **修订日期**: 2026-08-01
 > **关联文档**: [moqios-architecture-current.md](./moqios-architecture-current.md)、[kernel-subsystems.md](./kernel-subsystems.md)
 
 ---
@@ -46,7 +46,7 @@ static inline long sys_write(int fd, const void *buf, unsigned long n) {
 }
 ```
 
-### 1.3 系统调用清单（约 49 个）
+### 1.3 系统调用清单（分发表共 382 个编号分支，下表为常用子集）
 
 | 类别 | 调用 |
 |---|---|
@@ -59,19 +59,20 @@ static inline long sys_write(int fd, const void *buf, unsigned long n) {
 | 环境变量 | `getenv`, `setenv` |
 | 内存 | `brk` |
 
-详细行为参见对应内核源码 `kernel/proc/syscall.zig` 与 `kernel/arch/x86_64/syscall.zig`。
+详细行为参见 syscall 入口与分发表 `kernel/arch/x86_64/syscall_entry.zig`（`syscallDispatch`
+中的 `switch (syscall_nr)`，编号 1–472）。
 
 ---
 
 ## 2. init 进程
 
-文件：`user/init.S`（汇编，约 857 行），编译为 `user/init.elf`，作为 PID 1。
+文件：`user/init.S`（汇编，约 1246 行），编译为 `user/init.elf`，作为 PID 1。
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前至 `hello21`），并 `waitpid` 收回；随后进入交互 shell。
-   （`hello22`–`hello28` 仍在树中，可手动运行，**不**在 `init.S` 自动序列内。）
-2. 测试全部通过后启动交互式 Shell（`sh.elf`）。
+1. 顺序 `spawn` 自动化测试程序（`hello2`–`hello42`；其中 `hello11` 与 `hello28` **不**在
+   `init.S` 自动序列内），并 `waitpid` 收回；随后进入交互 shell。
+2. 测试全部通过后启动交互式 Shell（`sh`）。
 3. 在 Shell 退出后处于阻塞状态（避免内核因 init 退出而 panic）。
 
 伪流程：
@@ -81,7 +82,7 @@ _start:
     setup_argv_envp
     spawn("hello2");  waitpid;
     ...
-    spawn("hello21"); waitpid;   // last auto-test
+    spawn("hello42"); waitpid;   // last auto-test
     spawn("sh");      waitpid;
     loop_forever
 ```
@@ -135,7 +136,7 @@ _start:
 
 ## 4. 测试程序（hello 系列）
 
-`user/hello2.c` ~ `user/hello28.c` 是渐进式功能测试，每个程序聚焦特定子系统：
+`user/hello2.c` ~ `user/hello42.c` 是渐进式功能测试，每个程序聚焦特定子系统：
 
 | 程序 | 测试焦点 |
 |---|---|
@@ -145,8 +146,9 @@ _start:
 | hello17 / hello18 | 管道 + 网络（部分用例不稳定） |
 | hello19 | UDP 收发 |
 | hello20..hello28 | TCP socket、ext2 写入、mkdir、unlink、connect、ext2 listdir |
+| hello29..hello42 | fsync、brk/mmap、TLS、SIGSEGV 处理、futex、socket 选项、SysV IPC、mqueue 等（各 PASS 标记见 `tools/qemu_smoke.sh`） |
 
-每个测试在结束前打印 `[test name] OK` 字样，由 init 顺序回收，构成自动化回归。
+每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。
 
 ---
 
@@ -220,8 +222,8 @@ SECTIONS {
 ## 7. 用户态调试技巧
 
 - 内核串口输出包含每个用户进程关键事件（spawn / exit / signal / page fault）。
-- `panic` 时内核会打印 `rip` / `rsp` / `cr2` 等寄存器与符号化栈回溯，可对照用户 ELF 反汇编（`zig objdump -d user/hello21.elf`）定位问题。
-- GDB 远程调试：`zig build debug` + `gdb user/sh.elf` + `target remote :1234`，注意 ASLR 关闭，加载地址即链接地址。
+- `panic` 时内核会打印 `rip` / `rsp` / `cr2` 等寄存器与符号化栈回溯，可对照用户 ELF 反汇编（`zig objdump -d user/hello21.bin`，C 程序的 `.bin` 即 ELF）定位问题。
+- GDB 远程调试：`zig build debug` + `gdb user/sh.bin` + `target remote :1234`，注意 ASLR 关闭，加载地址即链接地址。
 
 ---
 

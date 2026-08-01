@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-07-28 (full-repository audit: copy_file_range fd/rollback, socket option user-copy/SO_ERROR/sockaddr lengths, futex EFAULT/waitv limit, SysV IPC_SET/rt_sigsuspend copies, virtio-net/e1000 rollback/timeouts, hello38-41 regression gates; all builds and smokes passed; deferred items recorded; prior: 2026-07-27 SMP startup-handshake and IPI/TLB hardening)
+> Last update: 2026-08 (7-area full-repository audit round recorded in §6: memory-safety / concurrency / performance / userland fixes, SMP #GP root cause in TLB shootdown, all builds and SMP=1/SMP=4 smokes passed; prior: 2026-07-28 full-repository audit — copy_file_range fd/rollback, socket option user-copy/SO_ERROR/sockaddr lengths, futex EFAULT/waitv limit, SysV IPC_SET/rt_sigsuspend copies, virtio-net/e1000 rollback/timeouts, hello38-41 regression gates)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -18,8 +18,9 @@ The authoritative x86_64 boot path starts at `kernel/main.zig` and initializes t
 6. LAPIC, SMP AP startup, IPC/capability system, syscall MSRs and dispatch entry.
 7. Limine ramdisk, kernel idle task, `init` user process, then `sti` and scheduler activation.
 
-The riscv64 path is selected by `zig build -Darch=riscv64` and builds `kernel/arch/riscv64/start.zig`.
-It is a standalone skeleton, not the full kernel behind a shared `arch` abstraction.
+The riscv64 path is selected by `zig build -Darch=riscv64` and builds `kernel/riscv64_root.zig`
+(`build.zig:75`); the aarch64 path similarly builds `kernel/aarch64_root.zig` (`build.zig:120`).
+Both are standalone skeletons, not the full kernel behind a shared `arch` abstraction.
 
 ### Subsystem Map
 
@@ -33,7 +34,7 @@ It is a standalone skeleton, not the full kernel behind a shared `arch` abstract
 | Filesystems | `kernel/fs/*`, `kernel/main.zig` | ramdisk, FAT32, ext2, tmpfs, procfs, page cache/writeback are wired; several fs helper modules remain standalone |
 | Network | `kernel/net/mod.zig`, `kernel/drivers/e1000.zig`, `kernel/drivers/virtio_net.zig` | e1000/virtio-net drivers initialize; ARP/IPv4/ICMP/UDP/TCP path is wired via `net/mod.zig` |
 | IPC | `kernel/ipc/ipc.zig`, `kernel/ipc/capability.zig`, timer/event/posix timer modules | Core IPC/capability path initializes; some POSIX/SysV modules are not consistently documented as integrated |
-| Tests | `tests/main.zig` | Host tests cover only `byte_order`, `fmt_core`, and `str`; QEMU `hello*` tests are runtime/manual gate |
+| Tests | `tests/main.zig` | Host tests cover `byte_order`, `fmt_core`, `str`, and `cow_pte` (`build.zig:286-301`); QEMU `hello*` tests are runtime/manual gate |
 
 ## 2. Review Findings
 
@@ -97,7 +98,7 @@ Evidence:
 
 - `kernel/arch/arch.zig` facade exists (M4); `main.zig` / `klog.zig` route serial/interrupts/paging/timer/context_switch through it.
 - Many drivers/fs/mm/proc/net/IPC files still import `arch/x86_64/*` directly.
-- `build.zig` routes riscv64 to `kernel/arch/riscv64/start.zig` (M2 skeleton), bypassing the full kernel root.
+- `build.zig` routes riscv64 to `kernel/riscv64_root.zig` (skeleton), bypassing the full kernel root.
 - riscv64 M2 verified: soft-float ABI, UART16550, `stvec`+breakpoint trap (`zig build -Darch=riscv64 smoke-riscv`).
 
 Risk: riscv64 cannot share the real kernel subsystems until more call sites migrate and M3–M5 land.
@@ -151,7 +152,7 @@ CPUs through work-stealing. AP cores actively pick up unpinned user tasks instea
 
 Evidence:
 
-- `zig build test` runs host tests for `byte_order`, `fmt_core`, and `str`.
+- `zig build test` runs host tests for `byte_order`, `fmt_core`, `str`, and `cow_pte`.
 - Runtime integration is documented as QEMU `hello*`, but it is not represented as an automated pass/fail command in the Zig test step.
 
 Risk: host tests can pass while kernel boot, syscall, filesystem, networking, and SMP behavior regress.
@@ -164,7 +165,7 @@ Fix plan:
 
 **Resolution (2026-07-10)**: Added `tools/qemu_smoke.sh` plus `zig build smoke` and
 `zig build smoke-smp`. The smoke wrapper builds the x86_64 image, runs QEMU with serial output
-captured to a file, waits for the current init auto-test tail marker `hello21 done` plus
+captured to a file, waits for the current init auto-test tail marker `hello42 done` plus
 `MoQiOS shell`, then terminates QEMU instead
 of leaving the interactive shell running forever. `tools/qemu_run.sh` now packages user programs
 through one `USER_PROGRAMS` loop instead of 29 repeated `if`/`cp` branches, keeping the runtime image
@@ -279,7 +280,7 @@ Run these gates before claiming the repository is healthy:
 | Host unit tests | `zig build test` | Pure library helpers still pass |
 | x86_64 build | `zig build` | Main kernel, user programs, AP trampoline build |
 | riscv64 skeleton build | `zig build -Darch=riscv64` | Cross-ISA skeleton still builds |
-| QEMU single-core smoke | `zig build smoke` | Kernel reaches shell after current init auto-test tail marker `hello21 done` |
+| QEMU single-core smoke | `zig build smoke` | Kernel reaches shell after current init auto-test tail marker `hello42 done` |
 | QEMU SMP smoke | `zig build smoke-smp` | AP bring-up path remains stable through the full init sequence (`MOQI_SMP=N`, default 2) |
 | QEMU SMP matrix | `zig build smoke-smp-matrix` | Multiple CPU counts smoke in one pass; default list `1 2 3 4 6 8`, override via `MOQI_SMOKE_MATRIX_CPUS` |
 
@@ -346,7 +347,8 @@ The new single-core smoke gate exposed a runtime hang at `spawn("hello2")`. The 
 
 The 2026-07-10 rerun passed both single-core and dual-core smoke after the COW/copy_to_user and
 shared-trampoline teardown fixes. **Doc drift fixed 2026-07-11**: primary docs now state that
-`init.S` auto-sequence ends at `hello21` (shell next); `hello22`–`hello28` are manual. riscv64
+`init.S` auto-sequence runs through `hello42` (shell next); only `hello11` and `hello28` are
+manual. riscv64
 console docs updated from SBI putchar to UART16550 (M2).
 
 ### 5.2 Review Update: 2026-07-18
@@ -1438,12 +1440,108 @@ All four programs emit `helloNN: PASS` on success and are mandatory smoke marker
 
 - **`process_vm_readv`/`process_vm_writev` true cross-process path**: current implementation accesses the target task's page table by switching CR3 under a spinlock, which is unsafe when the target address space can be concurrently freed (task exit, execve, or munmap from another CPU). A correct implementation requires address-space lifetime synchronization (a held reference on the target `mm`) and consolidation of the three existing dead/inline implementations into a single authoritative path. Deferred until the address-space manager has a reference-counted `mm` abstraction. The syscall is not claimed fixed and is not wired to a smoke gate.
 - **`RwLock` IRQ-mode API defect**: `kernel/sync/rwlock.zig` exposes `readLockIrq`/`writeUnlockIrq` variants but the unlock paths do not restore the saved IRQ flags, so any call site that acquired with IRQs enabled and releases with the intent to re-enable them silently leaves interrupts disabled. No current call site in the merged tree uses these variants in a context where the bug is reachable, so it is deferred rather than fixed speculatively. It must be resolved before any IRQ-mode read-writer lock usage is introduced.
-- **`~80 discarded copyToUser results`**: as noted in §5.2t, around eighty `_ = copyToUser(...)` sites still discard the error result. The affected syscalls report success with an unwritten out-parameter. This is a wrong-return-value class of bug rather than a memory-safety problem, and a mechanical fix of eighty call sites carries regression risk. Deferred for a dedicated pass.
-- **TOCTOU window in `copy_from_user`**: `checkFault()` always returns null because `recovery_rip` is never set; the validate-then-copy pattern has a window where a concurrent `munmap` can fault the kernel mid-copy. Requires exception-table infrastructure. Deferred until `clone`-based threading provides a deterministic reproducer.
+- ~~**`~80 discarded copyToUser results`**~~ ✅ RESOLVED (2026-08): `grep -rn "_ = .*copyToUser" kernel/`
+  now returns 0 hits. A later fix round required the full byte count at every previously discarded
+  site (see §5.2u), and the source-scan gate rejects any new `_ = ...copyToUser(...)` in `kernel/`.
+- ~~**TOCTOU window in `copy_from_user`**~~ ✅ RESOLVED (2026-08): the described mechanism no longer
+  exists. The current implementation is a single-instruction `rep movsb` copy at a known RIP plus
+  `user_copy.faultFixup`, with the #PF handler in `kernel/arch/x86_64/idt.zig` rewriting the faulting
+  RIP to the fixup path (`recovery_rip`-style zero-fill/short-count semantics). `checkFault()` and the
+  never-armed `recovery_rip` were removed.
 
 ---
 
-## 6. Completion Criteria For This Review Task
+## 6. 2026-08 全仓库审查与修复轮次
+
+### 6.1 范围
+
+七个领域的静态审查：mm/arch、sync/smp/sched、fs/drivers、net/ipc、probes/acpi、user/lib、
+build/tools/docs。审查对象为当前 worktree 代码与验证门禁。
+
+### 6.2 本轮已修复（分组）
+
+**内存安全**
+- mprotect / mmap(MAP_FIXED) 范围检查
+- mprotect 时 COW unshare
+- mremap 尺寸上限 + live-PTE 检查
+- slab 大分配 header 修复
+- ramdisk/splice 偏移下溢
+- preadv/pwritev fd 边界检查
+- fork readahead 共享修复
+- ICMP echo 栈溢出
+- keepalive u32 溢出
+- swapOut/COW 释放物理帧前先做 TLB shootdown
+
+**并发/生命周期**
+- futex 丢失唤醒 + LOCK_PI + 超时
+- wakeN requeue
+- TCB 生命周期 + listen 清理
+- UDP 端口释放 / EADDRINUSE
+- epoll 超时 + pool 锁
+- AF_UNIX peer 链接
+- ARP 锁
+- RX 校验和验证
+- writeback 按 inode_id 键控 + truncate/unlink 失效
+- fat32 tombstone 删除
+- page_cache 拷贝出 + 锁外刷盘
+- tmpfs 引用计数
+- NVMe/AHCI/virtio-blk/e1000 加锁
+- sysv_sem / msgrcv / posix_timer / MINIX IPC 修复
+- ACPI 长度验证
+
+**性能**
+- 调度器 steal 跳过 + 低开销 active 计数
+- writeback 专用内核线程（`vfs.zig` `startWritebackThread`）
+- 按 CR3 过滤的 TLB shootdown（`kernel/arch/x86_64/tlb.zig` 三参 `shootdownRange`）
+- TCP 发送暂存（staging）
+- shm/mq 锁范围收敛 + SHM 退出 detach + mq 等待队列 + mq_attr ABI
+
+**用户态**
+- sh.c 管道 fd ABI / sigaction / O_TRUNC / stdin yield
+- hello13 ppid
+- hello3 open 检查
+
+### 6.3 SMP #GP 根因（验证期间查明）
+
+`shootdownRange` 的 `sti` 窗口会把调度嵌套进缺页帧（page-fault frame），是 SMP 下
+间歇 #GP 的根因。修复：`TlbLock` 改为关中断自旋，并在自旋中手动服务本核的
+shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
+
+### 6.4 验证
+
+| 门禁 | 结果 |
+|---|---|
+| `zig build` (x86_64) | 通过 |
+| `zig build -Darch=riscv64` | 通过 |
+| `zig build -Darch=aarch64` | 通过 |
+| `zig build test` | 通过 |
+| QEMU smoke SMP=1 | 通过 |
+| QEMU smoke SMP=4 | 通过 |
+
+### 6.5 本轮明确未修复（留待下一轮）
+
+- vfs 已解码但不执行 O_APPEND / O_TRUNC
+- socket fd 上限硬编码 16/32，未用 `vfs.MAX_FDS`（`socket_opt.zig:67`，`socket_syscall.zig:617/630/671`）
+- 信号不会唤醒阻塞中的任务（`sendSignal` 不解除阻塞）
+- SIGINT/sigaction ABI 截断（28B vs 152B）
+- AF_UNIX connect/send 未接入系统调用
+- DNS/DHCP 接收路径（未注册端口、广播 ARP）
+- netif 硬编码 10.0.2.15
+- panic 不停 AP + 串口锁递归
+- x86 符号表为死代码（344KB BSS）
+- `mapAcpiRegion` 在 1GiB HHDM 下为空操作
+- `sk5.zig` 无引用
+- RwLock/SeqLock/TicketSpinlock 未使用且有缺陷
+- execve argv[0] 前置行为与 Linux 不一致
+- fat32 `setFATEntry` 忽略读失败
+- NVMe admin queue 引导后无锁
+- `kernel/boot_info.zig` 孤儿文件
+- 空目录 `tools/mkimage`、`tools/qemu_run`、`tools/test_runner`
+- posix_mq 超时精度受限于唤醒事件
+
+---
+
+## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:
 

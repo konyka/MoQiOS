@@ -1,7 +1,7 @@
 # MoQiOS 构建系统与工具链
 
 > **文档定位**: 描述 MoQiOS 的编译、链接、镜像打包与启动流程。
-> **修订日期**: 2026-07-28
+> **修订日期**: 2026-08-01
 > **关联文档**: [moqios-architecture-current.md](./moqios-architecture-current.md)
 
 ---
@@ -26,24 +26,28 @@
 ## 2. 构建总览
 
 ```
-                    zig build
+                    zig build（仅编译）
                         │
-        ┌───────────────┼───────────────┬─────────────────┐
-        ▼               ▼               ▼                 ▼
-   编译内核      编译用户程序     编译 trampoline    打包资产
-   (kernel.elf)  (hello*, sh,    (ap_trampoline.bin) (ramdisk.mrd,
-                  init)                                disk.img)
-        │               │               │                 │
-        └───────────────┴───────────┬───┴─────────────────┘
-                                    ▼
-                              生成 moqios.iso
-                                    │
-                                    ▼
-                              zig build run
-                                    │
-                                    ▼
-                              QEMU 启动
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+   编译内核          编译用户程序     编译 trampoline
+   (moqi-kernel.elf) (hello*, sh,    (ap_trampoline.bin)
+                      init)
+                        │
+                        ▼
+        zig build run → tools/qemu_run.sh（打包 + 启动）
+                        │
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+   mkramdisk.sh      xorriso 生成     limine bios-install
+   打包 ramdisk.bin   moqios.iso
+                        │
+                        ▼
+                   QEMU 启动
 ```
+
+注意：`zig build` 本身**不**打包 ramdisk/ISO，也不生成 `disk.img`；ramdisk 与 ISO 打包发生在
+`tools/qemu_run.sh`（由 `zig build run` / smoke 脚本调用）中，`disk.img` 是手动维护的构建外资产。
 
 ---
 
@@ -62,10 +66,10 @@ code_model = .kernel
 
 ### 3.2 关键编译选项
 
-- 禁用 SSE/AVX：`-mno-sse -mno-mmx -mno-sse2 -mno-avx`
-- 禁用红区：`-mno-red-zone`
-- 启用 LTO（可选）
-- `code_model = kernel`，对应高 2GB 内核镜像
+- 禁用 SSE/SSE2/MMX 并强制 soft-float：target query `cpu_features = "baseline-sse-sse2-mmx+soft_float"`（`build.zig:164-167`），而非 `-mno-*` 命令行标志
+- 禁用红区：`red_zone = false`
+- `code_model = .kernel`，对应高 2GB 内核镜像
+- `pic = true`（高半区内核按位置无关编译）
 
 ### 3.3 链接
 
@@ -84,7 +88,7 @@ SECTIONS {
 }
 ```
 
-输出：`zig-out/bin/kernel.elf`
+输出：`zig-out/bin/moqi-kernel.elf`
 
 ---
 
@@ -94,18 +98,19 @@ SECTIONS {
 > 分别对 `c_programs` / `asm_programs` 列表循环调用。新增用户程序时只需把程序名追加到对应
 > 列表即可，无需复制整段构建步骤（2026-06 重构：从 ~900 行样板收敛至 ~160 行）。
 
-### 4.1 C 程序（hello4–hello41, sh）
+### 4.1 C 程序（hello4–hello42, sh）
 
-`addCUserProgram(b, name)`：用 `zig cc` 交叉编译为静态 freestanding ELF，并直接输出到
-`user/<name>.bin`。这些 `.bin` 文件实际仍是 ELF，内核 loader 会自动识别 ELF/flat binary。
+`addCUserProgram(b, name)`：用 `zig cc` 交叉编译为静态 freestanding ELF，保存为 `<name>.bin`
+装载镜像（输出目录由 `build.zig` 决定，当前为 `user/`）。这些 `.bin` 文件实际仍是 ELF，
+内核 loader 会自动识别 ELF/flat binary。
 Windows 兼容构建路径不再依赖外部 `strip`；后续可在 CI 中按工具可用性重新启用体积优化。
 
 ```
 zig cc \
     -target x86_64-freestanding-none \
     -static -nostdlib -ffreestanding -O2 \
-    -Wl,--gc-sections -Wl,-z,norelro \
-    -o user/<name>.bin user/<name>.c
+    -mstackrealign -Wl,--gc-sections -Wl,-z,norelro \
+    -o <name>.bin user/<name>.c
 ```
 
 注意：C 程序**不使用** `user/user.ld`，由 `zig cc` 默认链接（内置自定义 `_start`）。内核目标仍禁用
@@ -146,7 +151,7 @@ zig objcopy -O binary user/<name>.elf user/<name>.bin
 
 ## 6. Ramdisk 打包（MRD 格式）
 
-工具：`tools/mkramdisk.sh` 或 `tools/mkimage/`
+工具：`tools/mkramdisk.sh`（由 `tools/qemu_run.sh` 在打包阶段调用）
 
 ```
 +----------------+
@@ -162,11 +167,11 @@ zig objcopy -O binary user/<name>.elf user/<name>.bin
 
 打包过程：
 
-1. 收集 `user/*.elf` 与必要资产
+1. `qemu_run.sh` 把用户程序装载镜像收集到 `user_bin/`
 2. 写入 Header
 3. 顺序追加 Entry（计算偏移）
 4. 顺序追加 Data
-5. 输出到 ramdisk 模块文件，通过 Limine `MODULE` 加载
+5. 输出为 `iso_root/boot/ramdisk.bin`，随 ISO 由 Limine 作为 module 加载（`limine.conf` 的 `module_path`）
 
 ---
 
@@ -208,26 +213,31 @@ iso_root/
 qemu-system-x86_64 \
     -M q35 \
     -m 512M \
-    -smp 2 \
-    -cpu max \
-    -enable-kvm \
     -cdrom moqios.iso \
-    -drive id=disk0,file=disk.img,if=none,format=raw \
+    -boot order=d \
+    -drive file=disk.img,format=raw,if=none,id=disk0 \
     -device virtio-blk-pci,drive=disk0 \
-    -netdev user,id=n0,hostfwd=tcp::2222-:22 \
-    -device e1000,netdev=n0 \
+    -netdev user,id=net0 \
+    -device e1000,netdev=net0 \
+    -smp "$MOQI_SMP" \
     -serial stdio \
+    -display none \
     -no-reboot -no-shutdown
 ```
+
+脚本不使用 `-cpu` / KVM / hostfwd；额外诊断参数可经 `MOQI_EXTRA_QEMU` 追加（例如
+`MOQI_EXTRA_QEMU="-d int,cpu_reset -D /tmp/qint.log"`）。
 
 | 选项 | 说明 |
 |---|---|
 | `-M q35` | 现代 Q35 平台（支持 PCIe / ACPI MCFG） |
 | `-m 512M` | 512MB 物理内存 |
+| `-boot order=d` | 从 CD-ROM（moqios.iso）启动 |
 | `-smp N` | CPU 核数；由 `MOQI_SMP` 环境变量控制（默认 2），smoke 脚本将其传给 QEMU |
 | `-device virtio-blk-pci` | 虚拟块设备（FAT32/ext2 后端） |
 | `-device e1000` | Intel 82540 千兆网卡 |
-| `-serial stdio` | 串口输出到终端（内核日志） |
+| `-serial stdio` | 串口输出到终端（内核日志）；由 `MOQI_SERIAL` 控制 |
+| `-display none` | 无图形窗口，纯串口交互 |
 
 ---
 
@@ -235,11 +245,11 @@ qemu-system-x86_64 \
 
 | 命令 | 说明 |
 |---|---|
-| `zig build` | 仅编译：生成内核镜像、用户程序、ramdisk、ISO |
+| `zig build` | 仅编译：生成内核镜像与用户程序；ramdisk/ISO 打包由 `tools/qemu_run.sh` 在 run/smoke 时完成 |
 | `zig build run` | 编译并启动 QEMU 仿真 |
 | `zig build debug` | 启动 QEMU 并在 1234 端口监听 GDB（`-s -S`） |
 | `zig build test` | 在主机目标运行 `tests/main.zig` 单元测试，覆盖可脱离硬件执行的共享库逻辑 |
-| `zig build smoke` | 单核 QEMU 限时冒烟测试，串口日志需出现当前 init 自动序列末尾 `hello41: PASS`（及 `hello38`–`hello41` 全部 PASS 标记）和 `MoQiOS shell` |
+| `zig build smoke` | 单核 QEMU 限时冒烟测试，串口日志需出现 init 自动序列各 PASS 标记（`hello21 done`、`hello29: PASS` … `hello41: PASS`）、序列终点 `hello42: PASS` + `hello42 done`，以及 `MoQiOS shell`；完整判定见 `tools/qemu_smoke.sh` |
 | `zig build smoke-smp` | SMP QEMU 限时冒烟测试（默认 `MOQI_SMP=2`），验证 AP 启动路径仍能跑完整个 init 测试序列；`MOQI_SMP=N` 可指定任意正整数核数 |
 | `zig build smoke-smp-matrix` | 按 `MOQI_SMOKE_MATRIX_CPUS`（默认 `"1 2 3 4 6 8"`）依次运行各核数冒烟；16 核在 TCG 下需 `MOQI_SMOKE_TIMEOUT=600` |
 | `zig build smoke-smp-stress` | 连续执行 `MOQI_SMOKE_RUNS`（默认 5）次指定核数（`MOQI_SMP`，默认 2）冒烟；捕获任务槽复用、共享内核映射和调度时序回归 |
@@ -285,8 +295,8 @@ gdb zig-out/bin/moqi-kernel.elf
 
 ## 11. 已知构建相关问题
 
-- `zig build run` 在无 KVM 环境下，AP LAPIC 定时器可能不工作（多核调度无法测试，应使用 `-enable-kvm` 或真机）。
-- `disk.img` 与 `disk.img.bak` 需手动维护（参见 `tools/mkimage/`）。
+- `zig build run` 默认 TCG（脚本不传 `-enable-kvm`）；TCG 下 AP LAPIC 定时器可能不工作（多核调度无法充分测试，可用 `MOQI_EXTRA_QEMU="-enable-kvm -cpu host"` 或真机验证）。
+- `disk.img` 与 `disk.img.bak` 需手动维护。
 - 用户程序起始地址为 `0x0`，与某些链接器默认行为冲突，汇编程序必须显式 `-T user/user.ld`。
 - `zig build test` 使用主机目标，适合验证无硬件副作用的共享库函数；真正的内核/用户态集成仍以
   `zig build run` 下的 QEMU `hello*` 运行时测试为准。
@@ -295,35 +305,33 @@ gdb zig-out/bin/moqi-kernel.elf
 
 ## 12. 未集成源文件清单（孤立模块）
 
-从 `kernel/main.zig` 出发沿 `@import` 做可达性分析（2026-06），121 个 `.zig` 文件中 **88 个可达
-（参与编译）**，**33 个孤立**——它们未被任何模块 `@import`，因此**不会被编译/类型检查**，也不
-会进入内核镜像。这些多为已写好但尚未接线到 syscall 分发表/模块图的**完整功能实现**（非空壳）。
+从三个构建根（`kernel/main.zig`、`kernel/riscv64_root.zig`、`kernel/aarch64_root.zig`）出发沿
+`@import` 做可达性分析（2026-08-01 重新统计）：`kernel/**/*.zig` 共 **325 个**文件，
+**317 个可达（参与编译）**，**8 个孤立**——它们未被任何构建根 `@import`，因此**不会被编译/
+类型检查**，也不会进入内核镜像。仅按 x86_64 根（`main.zig`）统计则为 164 可达 / 161 未达，
+差值主要是 `kernel/shared/sk*.zig` 共享阶梯模块与非 x86 的 `arch/` 骨架（由 riscv64/aarch64
+构建根引入）。
 
-> 经 `zig ast-check` 校验：33 个文件中 32 个语法/AST 完好；唯一例外
-> `kernel/net/dns.zig` 误用了不存在的内建 `@memcmp`，已修正为手动字节比较（现 33/33 通过）。
->
-> ⚠️ 注意：`ast-check` 仅验证语法与基本语义，**未**针对当前内核 API 做完整类型检查。真正接线
-> 前仍需逐个 `@import` 并 `zig build` 验证其对 `task`/`vfs`/`paging` 等模块的调用是否匹配现状。
+> 上轮（2026-06）清单中的 futex、posix_mq、sysv_msg/sem/shm、mprotect、getdents/poll/select/
+> ioctl、dhcp/dns 等文件此后已陆续接线进 syscall 分发表或模块图，不再孤立。
 
 ### 分类清单
 
 | 类别 | 文件 | 说明 |
 |---|---|---|
-| 同步原语 | `sync/futex.zig` `sync/rwlock.zig` `sync/seqlock.zig` `sync/ticket_spinlock.zig` | futex（FUTEX_WAIT/WAKE 等，307 行）与多种锁实现 |
-| 文件系统 | `fs/getdents.zig` `fs/poll.zig` `fs/select.zig` `fs/ioctl.zig` `fs/fcntl.zig` `fs/statx.zig` `fs/readlink.zig` `fs/readv.zig` `fs/splice.zig` `fs/copy_file_range.zig` `fs/file_lock.zig` `fs/aio.zig` `fs/inotify.zig` `fs/io_sched.zig` | getdents64/poll/select/ioctl 等 VFS 扩展 syscall |
-| IPC | `ipc/posix_mq.zig` `ipc/sysv_msg.zig` `ipc/sysv_sem.zig` `ipc/sysv_shm.zig` | POSIX 消息队列 + System V msg/sem/shm |
-| 内存 | `mm/mprotect.zig` `mm/process_vm.zig` | mprotect 与 process_vm_readv/writev |
-| 进程 | `proc/credentials.zig` `proc/pgrp.zig` `proc/misc_syscall.zig` `arch/x86_64/clone.zig` | setuid 族 / 进程组 / clone |
-| 网络 | `net/dhcp.zig` `net/dns.zig` | DHCP 客户端 / DNS 解析器 |
+| 同步原语 | `sync/rwlock.zig` `sync/seqlock.zig` `sync/ticket_spinlock.zig` | 多种锁实现（25–71 行） |
+| 内存 | `mm/process_vm.zig` | process_vm_readv/writev（116 行） |
+| 共享阶梯 | `shared/sk5.zig` | 早期非 x86 PMM/slab arena 引导，疑似已被后续 sk 阶梯取代 |
 | 其他 | `arch/x86_64/user_mode.zig` `arch/x86_64/vga.zig` `boot_info.zig` | 疑似被现有实现取代的早期模块 |
 
 ### 处理建议
 
-1. **不要直接删除**：这些是作者的在制功能（WIP），删除会丢失大量已完成工作。
-2. **按需逐个集成**：需要某个 syscall 时，将对应文件 `@import` 进相关模块、在 syscall 分发表登记
-   编号，再 `zig build` 修正类型不匹配，最后补一个 `hello*` 运行时测试。
-3. **`boot_info.zig` / `vga.zig` / `user_mode.zig`** 需先确认是否已被现有实现取代，若确认废弃可单独清理。
-4. 在集成前，这些文件**不应**被视为"已支持的功能"——README/架构文档以"可达即编译"的 88 个文件为准。
+1. **不要直接删除**：这些是作者的在制功能（WIP），删除会丢失已完成工作。
+2. **按需逐个集成**：需要某个能力时，将对应文件 `@import` 进相关模块，`zig build` 修正类型
+   不匹配，最后补一个 `hello*` 运行时测试。
+3. **`boot_info.zig` / `vga.zig` / `user_mode.zig` / `sk5.zig`** 需先确认是否已被现有实现
+   取代，若确认废弃可单独清理。
+4. 在集成前，这些文件**不应**被视为"已支持的功能"——以"可达即编译"的 317 个文件为准。
 
 ---
 
