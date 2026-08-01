@@ -139,11 +139,8 @@ pub fn pread(fd: u32, buf_ptr: u64, count: u64, offset: u64) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    // Save and override offset
-    const saved_offset = cur.fd_table.fds[fd].offset;
-    cur.fd_table.fds[fd].offset = offset;
-
     var pos: usize = 0;
+    var current_offset = offset;
     var faulted = false;
     while (pos < n) {
         const chunk = @min(n - pos, 4096);
@@ -152,11 +149,16 @@ pub fn pread(fd: u32, buf_ptr: u64, count: u64, offset: u64) i64 {
             faulted = true;
             break;
         }
-        const result = cur.fd_table.read(fd, &kbuf, chunk);
-        if (result <= 0) break;
+        const result = cur.fd_table.readAtOffset(fd, &kbuf, chunk, current_offset);
+        if (result < 0) {
+            if (pos == 0) return result;
+            break;
+        }
+        if (result == 0) break;
         const got: usize = @intCast(result);
         const written = copy.copyToUser(@ptrFromInt(buf_ptr + pos), kbuf[0..got], got);
         pos += written;
+        current_offset += written;
         if (written < got) {
             faulted = true;
             break;
@@ -164,8 +166,6 @@ pub fn pread(fd: u32, buf_ptr: u64, count: u64, offset: u64) i64 {
         if (got < chunk) break;
     }
 
-    // Restore original offset
-    cur.fd_table.fds[fd].offset = saved_offset;
     if (faulted and pos == 0) return -EFAULT;
     return @intCast(pos);
 }
@@ -180,23 +180,23 @@ pub fn pwrite(fd: u32, buf_ptr: u64, count: u64, offset: u64) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    // Save and override offset
-    const saved_offset = cur.fd_table.fds[fd].offset;
-    cur.fd_table.fds[fd].offset = offset;
-
     var pos: usize = 0;
+    var current_offset = offset;
     while (pos < n) {
         const chunk = @min(n - pos, 4096);
         var kbuf: [4096]u8 = undefined;
         const copied = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(buf_ptr + pos), chunk);
         if (copied == 0) break;
-        const result = cur.fd_table.write(fd, &kbuf, copied);
-        if (result <= 0) break;
+        const result = cur.fd_table.writeAtOffset(fd, &kbuf, copied, current_offset);
+        if (result < 0) {
+            if (pos == 0) return result;
+            break;
+        }
+        if (result == 0) break;
         pos += @intCast(result);
+        current_offset += @intCast(result);
         if (result < @as(i64, @intCast(copied))) break;
     }
 
-    // Restore original offset
-    cur.fd_table.fds[fd].offset = saved_offset;
     return @intCast(pos);
 }

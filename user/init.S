@@ -859,6 +859,29 @@ _start:
     movq $13, %rdx
     syscall
 
+    # Spawn hello42 (pread64/pwrite64 fd and offset regression)
+    movq $5, %rax
+    leaq hello42_name(%rip), %rdi
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq spawn42_msg(%rip), %rsi
+    movq $16, %rdx
+    syscall
+
+    movq $6, %rax
+    movq $-1, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    syscall
+
+    movq $1, %rax
+    movq $1, %rdi
+    leaq done42_msg(%rip), %rsi
+    movq $13, %rdx
+    syscall
+
     # Spawn hello9 (fork test)
     movq $5, %rax
     leaq hello9_name(%rip), %rdi
@@ -1183,6 +1206,13 @@ done23_msg:
     .ascii "spawned hello41\n"
     done41_msg:
     .ascii "hello41 done\n"
+    hello42_name:
+    .ascii "hello42"
+    .byte 0
+    spawn42_msg:
+    .ascii "spawned hello42\n"
+    done42_msg:
+    .ascii "hello42 done\n"
     hello26_name:
     .ascii "hello26"
     .byte 0

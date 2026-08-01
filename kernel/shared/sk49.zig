@@ -69,7 +69,7 @@ pub fn announce() void {
     }
 
     // And parseHeader must read the L3 layer back through the composed frame.
-    const info = ipv4.parseHeader(frame[14..].ptr) orelse {
+    const info = ipv4.parseHeader(frame[14..].ptr, null) orelse {
         arch.serial.writeString("[SK-49] FAILED: composed ipv4 parse null\n");
         return;
     };

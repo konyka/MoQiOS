@@ -8,6 +8,7 @@ const ndp = @import("ndp.zig");
 const icmpv6 = @import("icmpv6.zig");
 const udp_util = @import("udp_util.zig");
 const bo = @import("../lib/byte_order.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 const MAX_PORTS = 16;
 const QUEUE_DEPTH = 8;
@@ -37,8 +38,11 @@ var queues: [MAX_PORTS][QUEUE_DEPTH]UdpEntry = @splat(@splat(.{
     .is_v6 = false,
 }));
 var num_ports: u16 = 0;
+var udp_lock: IrqSpinlock = .{};
 
 fn findPortIdx(port: u16) ?u16 {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
     for (0..num_ports) |i| {
         if (ports[i] == port) return @intCast(i);
     }
@@ -46,7 +50,14 @@ fn findPortIdx(port: u16) ?u16 {
 }
 
 pub fn ensurePort(port: u16) u16 {
-    if (findPortIdx(port)) |idx| return idx;
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+
+    // Check for existing registration
+    for (0..num_ports) |i| {
+        if (ports[i] == port) return @intCast(i);
+    }
+
     if (num_ports >= MAX_PORTS) return 0xFFFF;
     const idx = num_ports;
     ports[idx] = port;
@@ -55,6 +66,9 @@ pub fn ensurePort(port: u16) u16 {
 }
 
 fn enqueue(port_idx: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, payload: []const u8, is_v6: bool) void {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+
     const actual = @min(payload.len, MAX_UDP_PAYLOAD);
     for (0..QUEUE_DEPTH) |i| {
         if (!queues[port_idx][i].valid) {
@@ -68,6 +82,7 @@ fn enqueue(port_idx: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, payload:
             return;
         }
     }
+    // Queue full - packet dropped (no accounting yet)
 }
 
 pub fn handlePacket(src_ip: [4]u8, _: [4]u8, data: [*]const u8, len: u32) void {
@@ -100,6 +115,9 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
 pub fn recvFrom(port: u16, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, out_src_port: *u16) i64 {
     const port_idx = findPortIdx(port) orelse return 0;
 
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+
     for (0..QUEUE_DEPTH) |i| {
         const entry = &queues[port_idx][i];
         if (entry.valid and !entry.is_v6) {
@@ -117,6 +135,9 @@ pub fn recvFrom(port: u16, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, out
 /// Drain one IPv6 datagram for `port` (SK-70).
 pub fn recvFromV6(port: u16, out_buf: [*]u8, out_src_ip: *[16]u8, out_src_port: *u16) i64 {
     const port_idx = findPortIdx(port) orelse return 0;
+
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
 
     for (0..QUEUE_DEPTH) |i| {
         const entry = &queues[port_idx][i];

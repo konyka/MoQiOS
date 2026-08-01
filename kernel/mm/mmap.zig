@@ -20,18 +20,70 @@ const MREMAP_MAYMOVE: u32 = 0x1;
 const MREMAP_FIXED: u32 = 0x2;
 
 /// Unmap pages in a range and free physical memory.
+/// TLB safety: collects physical frames during unmapping, performs the
+/// synchronous shootdown, then frees frames — ensures no remote CPU can
+/// reference a freed frame via stale TLB entries.
 pub fn unmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
     if (num_pages == 0) return;
+
+    // Bounded collection using 128-element stack buffer. Flush when either the
+    // buffer is full OR the virtual span would exceed MAX_BATCH_SPAN pages.
+    // This prevents both stack overflow and inefficient sparse-range shootdowns.
+    const MAX_BATCH_SPAN: u32 = 32; // Stay below TLB flush threshold for efficiency
+    var free_buf: [128]u64 = undefined;
+    var free_count: u32 = 0;
+    var batch_first_virt: u64 = 0;
+    var batch_last_virt: u64 = 0;
+
+    // Internal flush helper: shoots down the collected range, then frees.
+    const flushBatch = struct {
+        fn call(
+            first_virt: u64,
+            last_virt: u64,
+            buf: []const u64,
+        ) void {
+            const span_pages = @as(u32, @intCast((last_virt - first_virt) / 4096 + 1));
+            tlb_mod.shootdownRange(first_virt, span_pages);
+            pmm_mod.freePageBatch(buf);
+        }
+    }.call;
+
     for (0..num_pages) |p| {
         const virt = base + p * 4096;
         if (paging_mod.unmapPage(task.page_table_phys, virt)) |phys| {
-            pmm_mod.freePage(phys);
+            // Start new batch if this is the first frame.
+            if (free_count == 0) {
+                batch_first_virt = virt;
+                batch_last_virt = virt;
+            } else {
+                // Check if adding this frame would exceed the span limit.
+                const span_pages = (virt - batch_first_virt) / 4096 + 1;
+                if (span_pages > MAX_BATCH_SPAN) {
+                    // Flush current batch before starting a new one.
+                    flushBatch(batch_first_virt, batch_last_virt, free_buf[0..free_count]);
+                    free_count = 0;
+                    batch_first_virt = virt;
+                    batch_last_virt = virt;
+                } else {
+                    batch_last_virt = virt;
+                }
+            }
+
+            free_buf[free_count] = phys;
+            free_count += 1;
+
+            // Flush when buffer is full.
+            if (free_count == 128) {
+                flushBatch(batch_first_virt, batch_last_virt, free_buf[0..128]);
+                free_count = 0;
+            }
         }
     }
-    // M8-6: broadcast a single ranged shootdown for the whole unmap. The
-    // per-page `unmapPage` already invalidated the local TLB; this call also
-    // hits remote CPUs that may share the same page table (CLONE_VM threads).
-    tlb_mod.shootdownRange(base, @intCast(num_pages));
+
+    // Final batch: shootdown the remaining pages, then free.
+    if (free_count > 0) {
+        flushBatch(batch_first_virt, batch_last_virt, free_buf[0..free_count]);
+    }
 }
 
 /// Whether adding a disjoint range can be represented without dropping metadata.

@@ -677,6 +677,98 @@ pub const FdTable = struct {
         }
     }
 
+    /// Read from a file descriptor at a specific offset without mutating the shared offset.
+    /// Returns number of bytes read, 0 on EOF, or negative errno.
+    /// Used by pread64/preadv to avoid temporary offset mutation.
+    pub fn readAtOffset(self: *FdTable, fd: u32, buf: [*]u8, count: usize, offset: u64) i64 {
+        if (fd >= MAX_FDS) return -9; // EBADF
+        const desc = &self.fds[fd];
+
+        switch (desc.fd_type) {
+            .none => return -9, // EBADF
+            .special => return -29, // ESPIPE - can't seek on stdin/stdout/stderr
+            .pipe_read, .pipe_write => return -29, // ESPIPE - pipes don't support offset
+            .tcp_socket, .udp_socket, .unix_socket, .raw_socket => return -29, // ESPIPE
+            .epoll, .eventfd, .timerfd, .inotify => return -29, // ESPIPE
+            .ramdisk_file => {
+                if (offset >= desc.file_size) return 0;
+                const remaining = desc.file_size - offset;
+                const to_read = if (@as(u64, count) > remaining) @as(usize, @intCast(remaining)) else count;
+                const src: [*]const u8 = @ptrFromInt(desc.file_data + offset);
+                @memcpy(buf[0..to_read], src[0..to_read]);
+                return @intCast(to_read);
+            },
+            .fat32_file => {
+                if (offset >= desc.file_size) return 0;
+                const n_cached = writeback.readBuffered(desc.fat32_file_idx, offset, buf, @intCast(count), .fat32);
+                if (n_cached > 0) return @intCast(n_cached);
+                const fat32 = @import("fat32.zig");
+                const n = fat32.readFile(desc.fat32_file_idx, @intCast(offset), buf, @intCast(count));
+                return n;
+            },
+            .ext2_file => {
+                if (offset >= desc.file_size) return 0;
+                const n_cached = writeback.readBuffered(desc.ext2_file_idx, offset, buf, @intCast(count), .ext2);
+                if (n_cached > 0) return @intCast(n_cached);
+                const ext2 = @import("ext2.zig");
+                const n = ext2.readFile(desc.ext2_file_idx, @intCast(offset), buf, @intCast(count));
+                return n;
+            },
+            .tmpfs_file => {
+                const tmpfs = @import("tmpfs.zig");
+                return tmpfs.tmpfsRead(@intCast(desc.tmpfs_idx), offset, buf, @intCast(count));
+            },
+            .proc_file => {
+                const procfs = @import("procfs.zig");
+                var scratch: [4096]u8 = undefined;
+                const generated = procfs.procRead(desc.proc_file_type, desc.proc_pid, &scratch, 4096);
+                if (offset >= generated) return 0;
+                const avail = generated - @as(u32, @intCast(offset));
+                const to_copy = @min(@as(u32, @intCast(count)), avail);
+                @memcpy(buf[0..to_copy], scratch[@as(u32, @intCast(offset)) .. @as(u32, @intCast(offset)) + to_copy]);
+                return @intCast(to_copy);
+            },
+            .random => return -29, // ESPIPE - /dev/urandom doesn't support offset
+        }
+    }
+
+    /// Write to a file descriptor at a specific offset without mutating the shared offset.
+    /// Returns number of bytes written or negative errno.
+    /// Used by pwrite64/pwritev to avoid temporary offset mutation.
+    pub fn writeAtOffset(self: *FdTable, fd: u32, buf: [*]const u8, count: usize, offset: u64) i64 {
+        if (fd >= MAX_FDS) return -9; // EBADF
+        const desc = &self.fds[fd];
+
+        switch (desc.fd_type) {
+            .none => return -9, // EBADF
+            .special => return -29, // ESPIPE
+            .pipe_read, .pipe_write => return -29, // ESPIPE
+            .tcp_socket, .udp_socket, .unix_socket, .raw_socket => return -29, // ESPIPE
+            .epoll, .eventfd, .timerfd, .inotify => return -29, // ESPIPE
+            .ramdisk_file => return -1, // ramdisk is read-only
+            .random => return -29, // ESPIPE
+            .proc_file => return -1, // proc files are read-only
+            .fat32_file => {
+                if (!desc.writable) return -9; // EBADF
+                // For offset-based writes, use direct FS write to avoid offset confusion in writeback cache
+                const fat32 = @import("fat32.zig");
+                const n = fat32.writeFile(desc.fat32_file_idx, @intCast(offset), buf, @intCast(count));
+                return n;
+            },
+            .ext2_file => {
+                if (!desc.writable) return -9; // EBADF
+                const ext2 = @import("ext2.zig");
+                const n = ext2.writeFile(desc.ext2_file_idx, @intCast(offset), buf, @intCast(count));
+                return n;
+            },
+            .tmpfs_file => {
+                if (!desc.writable) return -9; // EBADF
+                const tmpfs = @import("tmpfs.zig");
+                return tmpfs.tmpfsWrite(@intCast(desc.tmpfs_idx), offset, buf, @intCast(count));
+            },
+        }
+    }
+
     /// v53.47: Check if another fd in this table shares the same underlying
     /// resource (via dup2). Used by close() to avoid freeing resources still
     /// referenced by a dup'd fd — prevents use-after-free.

@@ -71,7 +71,7 @@ pub fn announce() void {
         arch.serial.writeString("[SK-55] FAILED: ipv4 checksum\n");
         return;
     }
-    const info = ipv4.parseHeader(frame[14..].ptr) orelse {
+    const info = ipv4.parseHeader(frame[14..].ptr, null) orelse {
         arch.serial.writeString("[SK-55] FAILED: ipv4 parse\n");
         return;
     };

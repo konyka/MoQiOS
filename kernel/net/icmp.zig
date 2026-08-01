@@ -45,7 +45,7 @@ pub const FragNeededMsg = struct {
 pub fn parseFragNeeded(data: [*]const u8, len: u32) ?FragNeededMsg {
     if (len < 8 + 20) return null;
     if (data[0] != 3 or data[1] != 4) return null;
-    const inv = ipv4.parseHeader(data + 8) orelse return null;
+    const inv = ipv4.parseHeader(data + 8, null) orelse return null;
     return .{
         .next_hop_mtu = bo.readU16BeAt(data, 6),
         .dst = inv.dst_ip,
@@ -77,7 +77,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
         var reported: u32 = msg.next_hop_mtu;
         if (reported == 0) {
             // Pre-RFC1191: fall back toward the invoking datagram size.
-            const inv = ipv4.parseHeader(data + 8) orelse return;
+            const inv = ipv4.parseHeader(data + 8, null) orelse return;
             reported = @as(u32, inv.payload_offset) + inv.payload_len;
             if (reported == 0) reported = ipv4.MIN_MTU;
         }

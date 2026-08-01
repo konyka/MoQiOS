@@ -230,7 +230,7 @@ pub fn build(b: *std.Build) void {
         "hello21", "hello22", "hello23", "hello24", "hello25", "hello26",
         "hello27", "hello28", "hello29", "hello30", "hello31", "hello32",
         "hello33", "hello34", "hello35", "hello36", "hello37", "hello38",
-        "hello39", "hello40", "hello41",
+        "hello39", "hello40", "hello41", "hello42",
     };
     for (c_programs) |name| addCUserProgram(b, name);
 

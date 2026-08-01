@@ -200,6 +200,58 @@ inline fn writeDoorbell(doorbell_offset: u64, value: u32) void {
     mmioWrite32(doorbell_offset, value);
 }
 
+// ─── Resource Management ─────────────────────────────────────────────────
+
+/// Release all allocated I/O queue resources (idempotent).
+fn releaseIOQueueResources() void {
+    for (0..MAX_IO_QUEUES) |q| {
+        if (io_sq_phys[q] != 0) {
+            pmm.freePage(io_sq_phys[q]);
+            io_sq_phys[q] = 0;
+        }
+        if (io_cq_phys[q] != 0) {
+            pmm.freePage(io_cq_phys[q]);
+            io_cq_phys[q] = 0;
+        }
+        if (prp_list_phys[q] != 0) {
+            pmm.freePage(prp_list_phys[q]);
+            prp_list_phys[q] = 0;
+        }
+        io_sq_tail[q] = 0;
+        io_cq_head[q] = 0;
+        io_cq_phase[q] = true;
+        io_sq_doorbell[q] = 0;
+        io_cq_doorbell[q] = 0;
+    }
+    num_io_queues = 0;
+    io_queue_rr = 0;
+}
+
+/// Release admin queue resources (idempotent).
+fn releaseAdminQueueResources() void {
+    if (admin_sq_phys != 0) {
+        pmm.freePage(admin_sq_phys);
+        admin_sq_phys = 0;
+    }
+    if (admin_cq_phys != 0) {
+        pmm.freePage(admin_cq_phys);
+        admin_cq_phys = 0;
+    }
+    admin_sq_tail = 0;
+    admin_cq_head = 0;
+    admin_cq_phase = true;
+    admin_sq_doorbell = 0;
+    admin_cq_doorbell = 0;
+}
+
+/// Rollback initialization on failure. Only safe before controller enable
+/// or after controller disable; never free device-owned pages while DMA active.
+fn rollbackInitialization() void {
+    enabled = false;
+    releaseIOQueueResources();
+    releaseAdminQueueResources();
+}
+
 // ─── Initialization ──────────────────────────────────────────────────────
 
 pub fn init() void {
@@ -291,7 +343,10 @@ pub fn init() void {
 
     // Allocate admin queue memory (physically contiguous)
     admin_sq_phys = pmm.allocPage() orelse return; // 4KB = 64 entries × 64 bytes
-    admin_cq_phys = pmm.allocPage() orelse return; // 4KB = 64 entries × 16 bytes × 4 (padded)
+    admin_cq_phys = pmm.allocPage() orelse {
+        rollbackInitialization();
+        return;
+    };
 
     // v52.0: Allocate multiple I/O queue pairs for parallel throughput
     for (0..MAX_IO_QUEUES) |q| {
@@ -317,6 +372,7 @@ pub fn init() void {
     }
     if (num_io_queues == 0) {
         serial.writeString("[NVMe] Failed to allocate I/O queues\n");
+        rollbackInitialization();
         return;
     }
 
@@ -355,6 +411,15 @@ pub fn init() void {
     }
     if (timeout == 0) {
         serial.writeString("[NVMe] Controller failed to enable\n");
+        // Controller did not become ready; disable and release resources
+        mmioWrite32(NVME_CC, 0);
+        timeout = 500000;
+        while (timeout > 0) : (timeout -= 1) {
+            const csts = mmioRead32(NVME_CSTS);
+            if ((csts & 0x1) == 0) break;
+            asm volatile ("pause");
+        }
+        rollbackInitialization();
         return;
     }
 
@@ -363,6 +428,15 @@ pub fn init() void {
     // Identify Controller
     const id_ctrl = identifyController() orelse {
         serial.writeString("[NVMe] Identify Controller failed\n");
+        // Disable controller before freeing queue memory
+        mmioWrite32(NVME_CC, 0);
+        timeout = 500000;
+        while (timeout > 0) : (timeout -= 1) {
+            const csts = mmioRead32(NVME_CSTS);
+            if ((csts & 0x1) == 0) break;
+            asm volatile ("pause");
+        }
+        rollbackInitialization();
         return;
     };
 
@@ -478,6 +552,15 @@ pub fn init() void {
 
     if (num_io_queues == 0) {
         serial.writeString("[NVMe] Failed to create any I/O queues\n");
+        // Disable controller before freeing resources
+        mmioWrite32(NVME_CC, 0);
+        timeout = 500000;
+        while (timeout > 0) : (timeout -= 1) {
+            const csts = mmioRead32(NVME_CSTS);
+            if ((csts & 0x1) == 0) break;
+            asm volatile ("pause");
+        }
+        rollbackInitialization();
         return;
     }
 
@@ -488,6 +571,15 @@ pub fn init() void {
     // Identify Namespace 1
     if (!identifyNamespace(1)) {
         serial.writeString("[NVMe] Identify Namespace 1 failed\n");
+        // Disable controller before freeing resources
+        mmioWrite32(NVME_CC, 0);
+        timeout = 500000;
+        while (timeout > 0) : (timeout -= 1) {
+            const csts = mmioRead32(NVME_CSTS);
+            if ((csts & 0x1) == 0) break;
+            asm volatile ("pause");
+        }
+        rollbackInitialization();
         return;
     }
 

@@ -42,7 +42,7 @@ pub fn announce() void {
         return;
     }
 
-    const info = ipv4.parseHeader(&hdr) orelse {
+    const info = ipv4.parseHeader(&hdr, null) orelse {
         arch.serial.writeString("[SK-47] FAILED: parseHeader returned null\n");
         return;
     };

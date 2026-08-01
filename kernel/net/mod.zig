@@ -34,7 +34,7 @@ pub fn handleRxPacket(data: [*]const u8, len: u32) void {
         },
         eth.ETHERTYPE_IPV4 => {
             if (len < 34) return;
-            const info = ipv4.parseHeader(data + 14) orelse return;
+            const info = ipv4.parseHeader(data + 14, len - 14) orelse return;
             const payload_start: u32 = 14 + @as(u32, info.payload_offset);
             if (payload_start + @as(u32, info.payload_len) > len) return;
 

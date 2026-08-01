@@ -85,7 +85,7 @@ pub fn checksum(buf: [*]const u8, len: u16) u16 {
     return @truncate(~sum);
 }
 
-pub fn parseHeader(data: [*]const u8) ?Ipv4Info {
+pub fn parseHeader(data: [*]const u8, frame_len: ?u32) ?Ipv4Info {
     const version = (data[0] >> 4) & 0xF;
     if (version != 4) return null;
 
@@ -93,6 +93,14 @@ pub fn parseHeader(data: [*]const u8) ?Ipv4Info {
     if (ihl < 20) return null;
 
     const total_len = bo.readU16BeAt(data, 2);
+    // Reject malformed length fields
+    if (total_len < ihl) return null;
+
+    // Validate against actual received frame length if available
+    if (frame_len) |flen| {
+        if (total_len > flen) return null;
+    }
+
     const payload_len = total_len - ihl;
 
     return .{
