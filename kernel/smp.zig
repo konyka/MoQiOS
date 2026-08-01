@@ -316,7 +316,8 @@ pub fn init() void {
 }
 
 fn initX86() void {
-    // AP trampoline binary (precompiled flat binary, embedded at compile time).
+    // AP trampoline binary (precompiled flat binary, embedded at compile time;
+    // build.zig regenerates it into this path from a cache-tracked pipeline).
     const trampoline_bin = @embedFile("arch/x86_64/ap_trampoline.bin");
 
     bsp_apic_id = lapic.id();

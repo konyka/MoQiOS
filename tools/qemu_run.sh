@@ -10,6 +10,7 @@ LIMINE_DIR="limine"
 ISO_DIR="${MOQI_ISO_DIR:-iso_root}"
 ISO_FILE="${MOQI_ISO_FILE:-moqios.iso}"
 USER_BIN_DIR="${MOQI_USER_BIN_DIR:-user_bin}"
+USER_SRC_DIR="${MOQI_USER_SRC_DIR:-zig-out/user}"
 
 # Check kernel exists
 if [ ! -f "$KERNEL" ]; then
@@ -51,11 +52,13 @@ USER_PROGRAMS=(
     hello25 hello26 hello27 hello28 hello29 hello30 hello31 hello32 hello33 hello34 hello35 hello36 hello37 hello38 hello39 hello40 hello41 hello42
 )
 for program in "${USER_PROGRAMS[@]}"; do
-    if [ -f "user/${program}.bin" ]; then
-        cp "user/${program}.bin" "$USER_BIN_DIR/$program"
-    elif [ "$program" = "init" ]; then
-        echo "WARNING: user/init.bin not found, building anyway..."
+    src="$USER_SRC_DIR/${program}.bin"
+    if [ ! -f "$src" ]; then
+        echo "ERROR: user program '$program' missing: $src not found."
+        echo "Run 'zig build' first (user programs are installed to zig-out/user/)."
+        exit 1
     fi
+    cp "$src" "$USER_BIN_DIR/$program"
 done
 if [ -d "$USER_BIN_DIR" ] && [ "$(ls -A "$USER_BIN_DIR")" ]; then
     ./tools/mkramdisk.sh "$USER_BIN_DIR" "$ISO_DIR/boot/ramdisk.bin"
@@ -109,6 +112,7 @@ echo "========================================="
 #   MOQI_ISO_DIR     ISO staging directory (default: iso_root)
 #   MOQI_ISO_FILE    generated ISO path (default: moqios.iso)
 #   MOQI_USER_BIN_DIR ramdisk input directory (default: user_bin)
+#   MOQI_USER_SRC_DIR built user-program directory (default: zig-out/user)
 #   MOQI_EXTRA_QEMU  extra QEMU args (e.g. "-d int,cpu_reset -D /tmp/qint.log")
 SERIAL_TARGET="${MOQI_SERIAL:-stdio}"
 SMP_COUNT="${MOQI_SMP:-2}"
@@ -123,6 +127,11 @@ fi
 if ! [[ "$SMP_COUNT" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: MOQI_SMP must be a positive decimal integer (got '$SMP_COUNT')."
     exit 2
+fi
+
+if [ ! -f "$DISK_IMAGE" ]; then
+    echo "ERROR: disk image missing at $DISK_IMAGE (required by virtio-blk)."
+    exit 1
 fi
 
 # exec so callers that background this script get the QEMU PID (not a leftover shell).

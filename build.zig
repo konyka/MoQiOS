@@ -3,24 +3,27 @@ const std = @import("std");
 /// Assembly user program: `.S` -> object -> linked ELF -> raw flat binary.
 /// Used for hand-written entry stubs that rely on `user/user.ld`.
 fn addAsmUserProgram(b: *std.Build, name: []const u8) void {
+    // All artifacts are declared outputs (zig-cache) and installed to
+    // zig-out/user/<name>.bin, so the cache tracks them and the source tree
+    // stays free of generated files. tools/qemu_run.sh packages the ramdisk
+    // from zig-out/user/.
     const obj = b.addSystemCommand(&.{
         "zig",     "cc",
         "-target", "x86_64-freestanding-none",
         "-c",      "-o",
     });
-    obj.addArg(b.fmt("user/{s}.o", .{name}));
+    const obj_out = obj.addOutputFileArg(b.fmt("{s}.o", .{name}));
     obj.addFileArg(b.path(b.fmt("user/{s}.S", .{name})));
     obj.setName(b.fmt("assemble {s}.S", .{name}));
 
     const elf = b.addSystemCommand(&.{
-        "ld.lld",
+        "zig", "ld.lld",
         "-T",
         "user/user.ld",
         "-o",
     });
-    elf.addArg(b.fmt("user/{s}.elf", .{name}));
-    elf.addArg(b.fmt("user/{s}.o", .{name}));
-    elf.step.dependOn(&obj.step);
+    const elf_out = elf.addOutputFileArg(b.fmt("{s}.elf", .{name}));
+    elf.addFileArg(obj_out);
     elf.setName(b.fmt("link {s}.elf", .{name}));
 
     const bin = b.addSystemCommand(&.{
@@ -29,15 +32,15 @@ fn addAsmUserProgram(b: *std.Build, name: []const u8) void {
         "-O",
         "binary",
     });
-    bin.addArg(b.fmt("user/{s}.elf", .{name}));
-    bin.addArg(b.fmt("user/{s}.bin", .{name}));
-    bin.step.dependOn(&elf.step);
+    bin.addFileArg(elf_out);
+    const bin_out = bin.addOutputFileArg(b.fmt("{s}.bin", .{name}));
     bin.setName(b.fmt("objcopy {s} -> raw binary", .{name}));
 
-    b.getInstallStep().dependOn(&bin.step);
+    b.getInstallStep().dependOn(&b.addInstallFile(bin_out, b.fmt("user/{s}.bin", .{name})).step);
 }
 
 /// C user program: `.c` -> static freestanding ELF stored as `.bin`.
+/// Output is a declared cache artifact installed to zig-out/user/<name>.bin.
 fn addCUserProgram(b: *std.Build, name: []const u8) void {
     const elf = b.addSystemCommand(&.{
         "zig",            "cc",
@@ -49,11 +52,11 @@ fn addCUserProgram(b: *std.Build, name: []const u8) void {
         "-mstackrealign", "-Wl,--gc-sections",
         "-Wl,-z,norelro", "-o",
     });
-    elf.addArg(b.fmt("user/{s}.bin", .{name}));
+    const elf_out = elf.addOutputFileArg(b.fmt("{s}.bin", .{name}));
     elf.addFileArg(b.path(b.fmt("user/{s}.c", .{name})));
     elf.setName(b.fmt("compile {s}.c -> ELF bin", .{name}));
 
-    b.getInstallStep().dependOn(&elf.step);
+    b.getInstallStep().dependOn(&b.addInstallFile(elf_out, b.fmt("user/{s}.bin", .{name})).step);
 }
 
 /// Build the RISC-V 64 kernel skeleton (cross-ISA port, Milestone 2).
@@ -185,35 +188,43 @@ pub fn build(b: *std.Build) void {
 
     kernel.setLinkerScript(b.path("kernel/linker.ld"));
 
-    // AP trampoline: precompiled flat binary, embedded via @embedFile in smp.zig
-    // Build step to assemble the trampoline source into a raw binary
+    // AP trampoline: precompiled flat binary, embedded via @embedFile in smp.zig.
+    // All intermediates are declared cache outputs; the final binary reaches the
+    // kernel through the module embed path, so a deleted/stale trampoline can
+    // never survive a green build.
     const trampoline_obj = b.addSystemCommand(&.{
         "zig",     "cc",
         "-target", "x86-freestanding-none",
         "-c",      "-o",
     });
-    trampoline_obj.addArg(".zig-cache/ap_trampoline.o");
+    const trampoline_obj_out = trampoline_obj.addOutputFileArg("ap_trampoline.o");
     trampoline_obj.addFileArg(b.path("kernel/arch/x86_64/ap_trampoline_src.S"));
     trampoline_obj.setName("assemble ap_trampoline.S");
 
     const trampoline_elf = b.addSystemCommand(&.{
-        "ld.lld", "-m", "elf_i386", "--image-base=0", "-Ttext", "0x8000", "-o",
+        "zig", "ld.lld", "-m", "elf_i386", "--image-base=0", "-Ttext", "0x8000", "-o",
     });
-    trampoline_elf.addArg(".zig-cache/ap_trampoline.elf");
-    trampoline_elf.addArg(".zig-cache/ap_trampoline.o");
-    trampoline_elf.step.dependOn(&trampoline_obj.step);
+    const trampoline_elf_out = trampoline_elf.addOutputFileArg("ap_trampoline.elf");
+    trampoline_elf.addFileArg(trampoline_obj_out);
     trampoline_elf.setName("link ap_trampoline.elf");
 
     const trampoline_bin = b.addSystemCommand(&.{
         "zig", "objcopy", "-O", "binary",
     });
-    trampoline_bin.addArg(".zig-cache/ap_trampoline.elf");
-    trampoline_bin.addArg("kernel/arch/x86_64/ap_trampoline.bin");
-    trampoline_bin.step.dependOn(&trampoline_elf.step);
+    trampoline_bin.addFileArg(trampoline_elf_out);
+    const trampoline_bin_out = trampoline_bin.addOutputFileArg("ap_trampoline.bin");
     trampoline_bin.setName("objcopy ap_trampoline -> raw binary");
 
-    // Make kernel depend on trampoline binary being up-to-date
-    kernel.step.dependOn(&trampoline_bin.step);
+    // smp.zig embeds the trampoline via @embedFile("arch/x86_64/ap_trampoline.bin"),
+    // which resolves relative to kernel/smp.zig, so copy the cache-tracked binary
+    // into the source tree. This step declares no outputs, so it re-runs on every
+    // build and restores a deleted or stale ap_trampoline.bin.
+    const trampoline_copy = b.addSystemCommand(&.{"cp"});
+    trampoline_copy.addFileArg(trampoline_bin_out);
+    trampoline_copy.addArg("kernel/arch/x86_64/ap_trampoline.bin");
+    trampoline_copy.setName("install ap_trampoline.bin (embed source)");
+
+    kernel.step.dependOn(&trampoline_copy.step);
 
     b.installArtifact(kernel);
 

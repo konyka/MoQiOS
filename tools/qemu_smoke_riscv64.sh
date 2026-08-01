@@ -191,20 +191,40 @@ pass_markers() {
         grep -q "\[SK-153\] ext2 group desc stride non-x86: OK" "$LOG_FILE" &&
         grep -q "\[SK-154\] ext2 dir record validation non-x86: OK" "$LOG_FILE" &&
         grep -q "\[SK-155\] writeback flush error propagation non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-156\] fork keeps read-only pages read-only non-x86: OK" "$LOG_FILE"
+        grep -q "\[SK-156\] fork keeps read-only pages read-only non-x86: OK" "$LOG_FILE" &&
+        grep -q "\[SK-157\] UDP race fixes + IPv4 underflow: OK" "$LOG_FILE"
+}
+
+# Any explicit failure or panic in the serial log fails the run immediately,
+# even if some pass markers have already appeared.
+check_fatal_output() {
+    if [ -f "$LOG_FILE" ] && grep -aq "FAILED" "$LOG_FILE"; then
+        echo "FAIL: serial log contains a FAILED marker."
+        grep -a "FAILED" "$LOG_FILE" | head -10
+        echo "Serial log: $LOG_FILE"
+        exit 1
+    fi
+    if [ -f "$LOG_FILE" ] && grep -aq "KERNEL PANIC" "$LOG_FILE"; then
+        echo "FAIL: the kernel panicked during smoke."
+        grep -a -A 4 "KERNEL PANIC" "$LOG_FILE" | head -20
+        echo "Serial log: $LOG_FILE"
+        exit 1
+    fi
 }
 
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
+    check_fatal_output
+
     if pass_markers; then
-        echo "PASS: MoQiOS riscv64 M7+SK-156 smoke (shared probes + slim footprint/env + virtio + U-mode)."
+        echo "PASS: MoQiOS riscv64 M7+SK-157 smoke (shared probes + slim footprint/env + virtio + U-mode)."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         if pass_markers; then
-            echo "PASS: MoQiOS riscv64 M7+SK-156 smoke (shared probes + slim footprint/env + virtio + U-mode)."
+            echo "PASS: MoQiOS riscv64 M7+SK-157 smoke (shared probes + slim footprint/env + virtio + U-mode)."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -218,7 +238,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for riscv64 smoke markers."
-echo "Expected: SK-2..SK-4 + SK-6..SK-156 shared markers + M7 blk/net + M6 + M5 markers."
+echo "Expected: SK-2..SK-4 + SK-6..SK-157 shared markers + M7 blk/net + M6 + M5 markers."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1
