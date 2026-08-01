@@ -96,7 +96,7 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     // per-page invlpg on the local CPU and crucial for cross-CPU correctness
     // when the same address space is mapped on another core (CLONE_VM thread).
     const num_pages: u32 = @intCast((end - addr) / paging.PAGE_SIZE);
-    tlb.shootdownRange(addr, num_pages);
+    tlb.shootdownRange(addr, num_pages, cur.page_table_phys);
 
     return 0;
 }

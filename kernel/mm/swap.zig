@@ -123,7 +123,6 @@ pub fn decodeSwapEntry(pte: u64) u64 {
 /// Returns true on success.
 pub fn swapOut(pml4_phys: u64, virt_addr: u64, pte_ptr: *u64) bool {
     if (!swap_enabled) return false;
-    _ = pml4_phys;
 
     const pte = pte_ptr.*;
     if ((pte & 1) == 0) return false; // Not present
@@ -161,7 +160,7 @@ pub fn swapOut(pml4_phys: u64, virt_addr: u64, pte_ptr: *u64) bool {
     // table (CLONE_VM) on remote CPUs would otherwise keep stale TLB entries
     // into freed memory. Mirrors the collect→shootdown→free ordering in
     // unmapRange.
-    tlb.shootdownRange(virt_addr, 1);
+    tlb.shootdownRange(virt_addr, 1, pml4_phys);
 
     // Free the physical page
     pmm.freePage(phys_addr);

@@ -629,9 +629,10 @@ pub const irq = struct {
 
 /// TLB shootdown surface — local only on uniprocessor aarch64 bring-up (SK-8).
 pub const tlb = struct {
-    pub fn shootdownRange(addr_start: u64, page_count: u32) void {
+    pub fn shootdownRange(addr_start: u64, page_count: u32, target_cr3: u64) void {
         _ = addr_start;
         _ = page_count;
+        _ = target_cr3; // uniprocessor bring-up — no IPI filtering needed
         asm volatile ("dsb ish" ::: .{ .memory = true });
         asm volatile ("tlbi vmalle1" ::: .{ .memory = true });
         asm volatile ("dsb ish" ::: .{ .memory = true });

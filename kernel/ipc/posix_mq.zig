@@ -8,6 +8,8 @@ const fmt = @import("../lib/fmt.zig");
 const str = @import("../lib/str.zig");
 const bo = @import("../lib/byte_order.zig");
 const copy = @import("../mm/copy_from_user.zig");
+const task = @import("../proc/task.zig");
+const sched = @import("../proc/sched.zig");
 
 const MAX_QUEUES: u32 = 16;
 const MAX_MSGS: u32 = 8;
@@ -43,6 +45,10 @@ pub const MqQueue = struct {
     marked_removed: bool = false,
     /// Notification registered (pid of notifier, 0 = none)
     notify_pid: u32 = 0,
+    /// Senders blocked on a full queue (mq_timedsend without O_NONBLOCK)
+    send_waiters: ?*task.WaitNode = null,
+    /// Receivers blocked on an empty queue (mq_timedreceive without O_NONBLOCK)
+    recv_waiters: ?*task.WaitNode = null,
 };
 
 var queues: [MAX_QUEUES]MqQueue = @splat(.{});
@@ -97,26 +103,59 @@ fn isTimedOut(abs_timeout_ns: u64) bool {
     return tsc.nanos() >= abs_timeout_ns;
 }
 
-/// Sleep approximately 1ms using TSC busy-wait to yield CPU to other tasks.
-fn sleepBrief() void {
-    const tsc = @import("../arch/arch.zig").tsc;
-    const start = tsc.nanos();
-    while (tsc.nanos() - start < 1_000_000) {
-        asm volatile ("pause");
+/// Remove `node` from `wait_queue` if still linked. Caller holds mq_lock.
+/// wakeOne already pops woken nodes; this only matters if a wake path ever
+/// bypasses the queue (defensive — mirrors futex.removeWaitNode).
+fn unlinkNode(wait_queue: *?*task.WaitNode, node: *task.WaitNode) void {
+    var prev: ?*task.WaitNode = null;
+    var cur = wait_queue.*;
+    while (cur) |n| {
+        if (n == node) {
+            if (prev) |p| {
+                p.next = n.next;
+            } else {
+                wait_queue.* = n.next;
+            }
+            return;
+        }
+        prev = n;
+        cur = n.next;
     }
+}
+
+/// Free a queue slot, waking any blocked senders/receivers first so they
+/// re-check and see the queue gone (EBADF) instead of sleeping forever.
+/// Caller holds mq_lock.
+fn freeQueue(q: *MqQueue) void {
+    sched.wakeAll(&q.send_waiters);
+    sched.wakeAll(&q.recv_waiters);
+    q.* = .{};
 }
 
 /// mq_open(name, oflag, mode, attr) -> fd or -errno
 /// rdi=name, rsi=oflag, rdx=mode, r10=attr
 pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
     _ = mode;
-    const flags = mq_lock.acquire();
-    defer mq_lock.release(flags);
 
-    // Read name from user space
+    // Read name and attributes BEFORE taking mq_lock: user copies walk page
+    // tables and must not run with IRQs off. Linux struct mq_attr is four
+    // 8-byte longs: mq_flags@0, mq_maxmsg@8, mq_msgsize@16, mq_curmsgs@24.
     var name_buf: [MAX_NAME_LEN]u8 = @splat(0);
     const name_len: u32 = @intCast(readUserString(name_ptr, &name_buf));
     if (name_len == 0) return EINVAL;
+
+    var maxmsg: i64 = 0;
+    var msgsize: i64 = 0;
+    if (attr_ptr != 0 and attr_ptr < 0x0000_8000_0000_0000) {
+        var attr_buf: [32]u8 = undefined;
+        if (copy.copyFromUser(&attr_buf, @ptrFromInt(attr_ptr), 32) == 32) {
+            maxmsg = bo.readI64Le(attr_buf[8..16]);
+            msgsize = bo.readI64Le(attr_buf[16..24]);
+        }
+    }
+
+    const flags = mq_lock.acquire();
+    defer mq_lock.release(flags);
 
     // Search for existing queue with this name
     for (&queues) |*q| {
@@ -159,18 +198,9 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
     q.marked_removed = false;
     q.notify_pid = 0;
 
-    // Read optional attributes
-    if (attr_ptr != 0 and attr_ptr < 0x0000_8000_0000_0000) {
-        var attr_buf: [8]u8 = undefined;
-        if (copy.copyFromUser(&attr_buf, @ptrFromInt(attr_ptr), 8) == 8) {
-            const mq_maxmsg: u32 = @as(u32, attr_buf[0]) | (@as(u32, attr_buf[1]) << 8) |
-                (@as(u32, attr_buf[2]) << 16) | (@as(u32, attr_buf[3]) << 24);
-            const mq_msgsize: u32 = @as(u32, attr_buf[4]) | (@as(u32, attr_buf[5]) << 8) |
-                (@as(u32, attr_buf[6]) << 16) | (@as(u32, attr_buf[7]) << 24);
-            if (mq_maxmsg > 0 and mq_maxmsg <= MAX_MSGS) q.max_msg = mq_maxmsg;
-            if (mq_msgsize > 0 and mq_msgsize <= MAX_MSG_SIZE) q.msg_size = mq_msgsize;
-        }
-    }
+    // Apply optional attributes (only honored at creation)
+    if (maxmsg > 0 and maxmsg <= MAX_MSGS) q.max_msg = @intCast(maxmsg);
+    if (msgsize > 0 and msgsize <= MAX_MSG_SIZE) q.msg_size = @intCast(msgsize);
 
     q.fd = allocFd();
 
@@ -186,12 +216,13 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
 /// mq_unlink(name) -> 0 or -errno
 /// rdi=name
 pub fn mqUnlink(name_ptr: u64) i64 {
-    const flags = mq_lock.acquire();
-    defer mq_lock.release(flags);
-
+    // Read name before taking mq_lock (see mqOpen).
     var name_buf: [MAX_NAME_LEN]u8 = @splat(0);
     const name_len: u32 = @intCast(readUserString(name_ptr, &name_buf));
     if (name_len == 0) return EINVAL;
+
+    const flags = mq_lock.acquire();
+    defer mq_lock.release(flags);
 
     for (&queues) |*q| {
         if (q.active and str.eql(q.name[0..q.name_len], name_buf[0..name_len])) {
@@ -201,7 +232,7 @@ pub fn mqUnlink(name_ptr: u64) i64 {
             q.marked_removed = true;
             // If no messages and no references, free immediately
             if (q.count == 0) {
-                q.* = .{};
+                freeQueue(q);
             }
             return 0;
         }
@@ -216,7 +247,7 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
     const abs_timeout_ns = readAbsTimeout(timeout_ptr);
 
 
-    // Try to send, with timeout-based retry if queue is full
+    // Try to send, blocking on the send wait queue if the queue is full
     while (true) {
         const flags = mq_lock.acquire();
 
@@ -244,9 +275,31 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
                 mq_lock.release(flags);
                 return ETIMEDOUT;
             }
-            // Release lock, sleep briefly, retry
+            // Block until a receiver frees a slot (or mq_unlink wakes us).
+            // Enqueue while holding mq_lock so a concurrent mq_timedreceive
+            // can't wakeOne before we join the queue (lost wakeup) — the
+            // sysv_sem.semop pattern.
+            var node: task.WaitNode = .{ .task_idx = 0 };
+            const cur_idx = sched.currentTaskIndex() orelse {
+                mq_lock.release(flags);
+                return EAGAIN; // kernel thread: cannot block
+            };
+            node.task_idx = cur_idx;
+            node.next = q.send_waiters;
+            q.send_waiters = &node;
+            const cur_task = task.getTask(cur_idx) orelse {
+                mq_lock.release(flags);
+                return EAGAIN;
+            };
+            cur_task.state = .blocked;
             mq_lock.release(flags);
-            sleepBrief();
+            sched.forceReschedule();
+            // Woken: wakeOne already popped our node; unlink defensively in
+            // case a future wake path bypasses the queue, then re-check the
+            // condition and the deadline from the top.
+            const flags2 = mq_lock.acquire();
+            unlinkNode(&q.send_waiters, &node);
+            mq_lock.release(flags2);
             continue;
         }
 
@@ -265,6 +318,9 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
         q.tail = (q.tail + 1) % MAX_MSGS;
         q.count += 1;
 
+        // Wake a receiver blocked on the empty queue
+        _ = sched.wakeOne(&q.recv_waiters);
+
         mq_lock.release(flags);
         return 0;
     }
@@ -278,7 +334,7 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
     const abs_timeout_ns = readAbsTimeout(timeout_ptr);
 
 
-    // Try to receive, with timeout-based retry if queue is empty
+    // Try to receive, blocking on the receive wait queue if the queue is empty
     while (true) {
         const flags = mq_lock.acquire();
 
@@ -301,9 +357,27 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
                 mq_lock.release(flags);
                 return ETIMEDOUT;
             }
-            // Release lock, sleep briefly, retry
+            // Block until a sender posts a message (or mq_unlink wakes us).
+            // Enqueue under mq_lock to avoid a lost wakeup (sysv_sem pattern).
+            var node: task.WaitNode = .{ .task_idx = 0 };
+            const cur_idx = sched.currentTaskIndex() orelse {
+                mq_lock.release(flags);
+                return EAGAIN; // kernel thread: cannot block
+            };
+            node.task_idx = cur_idx;
+            node.next = q.recv_waiters;
+            q.recv_waiters = &node;
+            const cur_task = task.getTask(cur_idx) orelse {
+                mq_lock.release(flags);
+                return EAGAIN;
+            };
+            cur_task.state = .blocked;
             mq_lock.release(flags);
-            sleepBrief();
+            sched.forceReschedule();
+            // Woken: re-check condition and deadline from the top.
+            const flags2 = mq_lock.acquire();
+            unlinkNode(&q.recv_waiters, &node);
+            mq_lock.release(flags2);
             continue;
         }
 
@@ -338,9 +412,12 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
         q.head = (q.head + 1) % MAX_MSGS;
         q.count -= 1;
 
+        // Wake a sender blocked on the full queue
+        _ = sched.wakeOne(&q.send_waiters);
+
         // If queue was marked for removal and now empty, free it
         if (q.marked_removed and q.count == 0) {
-            q.* = .{};
+            freeQueue(q);
         }
 
         mq_lock.release(flags);
@@ -369,8 +446,10 @@ pub fn mqNotify(mqd: u32, notif_ptr: u64) i64 {
 
 /// mq_getsetattr(mqd, newattr, oldattr) -> 0 or -errno
 /// rdi=mqd, rsi=newattr, rdx=oldattr
+/// Linux struct mq_attr is four 8-byte longs (32 bytes):
+/// mq_flags@0, mq_maxmsg@8, mq_msgsize@16, mq_curmsgs@24.
 pub fn mqGetSetAttr(mqd: u32, newattr_ptr: u64, oldattr_ptr: u64) i64 {
-    if (oldattr_ptr != 0 and !copy.validateUserBufferWritable(oldattr_ptr, 16)) return EFAULT;
+    if (oldattr_ptr != 0 and !copy.validateUserBufferWritable(oldattr_ptr, 32)) return EFAULT;
     const flags = mq_lock.acquire();
     defer mq_lock.release(flags);
 
@@ -378,20 +457,19 @@ pub fn mqGetSetAttr(mqd: u32, newattr_ptr: u64, oldattr_ptr: u64) i64 {
 
     // Write old attributes if requested
     if (oldattr_ptr != 0) {
-        var attr_buf: [16]u8 = @splat(0);
-        // mq_flags (4 bytes) + mq_maxmsg (4 bytes) + mq_msgsize (4 bytes) + mq_curmsgs (4 bytes)
-        bo.writeU32Le(attr_buf[0..4], q.flags);
-        bo.writeU32Le(attr_buf[4..8], q.max_msg);
-        bo.writeU32Le(attr_buf[8..12], q.msg_size);
-        bo.writeU32Le(attr_buf[12..16], q.count);
-        if (copy.copyToUser(@ptrFromInt(oldattr_ptr), &attr_buf, 16) != 16) return EFAULT;
+        var attr_buf: [32]u8 = @splat(0);
+        bo.writeI64Le(attr_buf[0..8], q.flags);
+        bo.writeI64Le(attr_buf[8..16], q.max_msg);
+        bo.writeI64Le(attr_buf[16..24], q.msg_size);
+        bo.writeI64Le(attr_buf[24..32], q.count);
+        if (copy.copyToUser(@ptrFromInt(oldattr_ptr), &attr_buf, 32) != 32) return EFAULT;
     }
 
     // Read new attributes if provided
     if (newattr_ptr != 0 and newattr_ptr < 0x0000_8000_0000_0000) {
-        var attr_buf: [16]u8 = undefined;
-        if (copy.copyFromUser(&attr_buf, @ptrFromInt(newattr_ptr), 16) == 16) {
-            const new_flags = bo.readU32Le(attr_buf[0..4]);
+        var attr_buf: [32]u8 = undefined;
+        if (copy.copyFromUser(&attr_buf, @ptrFromInt(newattr_ptr), 32) == 32) {
+            const new_flags: u32 = @truncate(@as(u64, @bitCast(bo.readI64Le(attr_buf[0..8]))));
             // Only O_NONBLOCK can be changed
             q.flags = (q.flags & ~@as(u32, O_NONBLOCK)) | (new_flags & O_NONBLOCK);
         }
@@ -420,6 +498,16 @@ fn allocFd() i32 {
 fn readUserString(user_ptr: u64, buf: []u8) usize {
     if (user_ptr == 0 or user_ptr >= 0x0000_8000_0000_0000) return 0;
     const max_len = buf.len;
+    // Fast path: one bulk copy — a single page-table walk for the whole
+    // range instead of one per byte.
+    if (copy.copyFromUser(buf, @ptrFromInt(user_ptr), max_len) == max_len) {
+        for (buf, 0..) |c, i| {
+            if (c == 0) return i;
+        }
+        return max_len;
+    }
+    // The 64-byte range may run past the string into an unmapped page;
+    // fall back to per-byte copies.
     var len: usize = 0;
     while (len < max_len) : (len += 1) {
         var byte: [1]u8 = .{0};

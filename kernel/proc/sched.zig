@@ -160,6 +160,16 @@ pub fn currentTask() ?*task.Task {
 
 /// Count non-zombie/non-blocked tasks pinned to this CPU (for single-task fast-path).
 fn countActiveOnThisCpu() u32 {
+    // Cheap pre-check: any task sitting in this CPU's run queue means more than
+    // the current task is active here, so the caller's `== 1` test already has
+    // its answer — skip the task_lock + full slot-bitmap scan. The returned 2
+    // is a lower-bound sentinel, not an exact count (the only caller compares
+    // against 1). Stale queue entries can only make this over-report, which
+    // costs one harmless extra schedule pass, never a wrong skip.
+    if (per_cpu.isAnyReady()) {
+        const q = per_cpu.getCurrent();
+        if (@atomicLoad(u32, &q.nr_running, .monotonic) != 0) return 2;
+    }
     return task.countActiveOnCpu(@intCast(currentCpuId()));
 }
 
@@ -167,6 +177,16 @@ fn countActiveOnThisCpu() u32 {
 pub fn timerTick(frame: *idt.InterruptFrame) void {
     _ = frame;
 
+    // sched_lock still serialises the whole pick/steal/switch path below.
+    // Splitting it (lock-free per-CPU pick, sched_lock only around the anchor
+    // switch) is deliberately NOT done: between a lock-free popRunnable /
+    // pickReadyForCpu and the locked `state = .running` transition another CPU
+    // could claim the same ready task — the isCurrentOnOtherCpu check is only
+    // a snapshot — putting one task (and one kernel stack) on two CPUs at
+    // once. Closing that TOCTOU needs an atomic claim protocol on Task.state,
+    // which is too invasive for the win here. Cheaper subsets live in
+    // countActiveOnThisCpu (queue-depth pre-check) and pickNext (steal skip).
+    // Lock order unchanged: sched_lock → task_lock → queue lock (no ABBA).
     var flags = sched_lock.acquire();
 
     // Global periodic maintenance — BSP only (one tick source for the whole system).
@@ -180,7 +200,9 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         // Lock order: sched_lock → task_lock → pmm.lock (always this order).
         sched_lock.release(flags);
         _ = task.reapZombies();
-        // Drive writeback timer (flush expired dirty buffers ~every 1 s)
+        // Drive writeback expiry check (~every 1 s). Only the cheap scan runs
+        // here (IRQ-off); the flush itself is deferred to the writeback kernel
+        // thread — see vfs.writebackTimerTick.
         const vfs = @import("../fs/vfs.zig");
         _ = vfs.writebackTimerTick();
         // Drive timerfd expiration checks
@@ -318,6 +340,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
                 :
                 : [cr3] "r" (t.page_table_phys),
                 : .{ .rax = true, .memory = true });
+            syscall_entry.noteCr3Switch(t.page_table_phys);
             setupUserCpuState(t);
             return;
         }
@@ -387,6 +410,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
                 :
                 : [cr3] "r" (pt),
                 : .{ .rax = true, .memory = true });
+            syscall_entry.noteCr3Switch(pt);
             setupUserCpuState(new_task);
             return;
         }
@@ -400,6 +424,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
                 :
                 : [cr3] "r" (kernel_pml4),
                 : .{ .rax = true, .memory = true });
+            syscall_entry.noteCr3Switch(kernel_pml4);
             return;
         }
         sched_lock.release(flags);
@@ -475,10 +500,18 @@ fn pickNext() ?u32 {
     // skip enqueueTask).
     if (per_cpu.isAnyReady()) {
         const q = per_cpu.getCurrent();
-        if (popRunnable(q)) |i| return i;
-        const stolen = per_cpu.tryStealForCurrent();
-        if (stolen > 0) {
-            if (popRunnable(q)) |i| return i;
+        var deferred_local = false;
+        if (popRunnable(q, &deferred_local)) |i| return i;
+        // Steal skip: when the pop set `deferred_local`, a .ready task pinned
+        // here already exists (it is only unpickable until its owner CPU
+        // switches away). The bitmap fallback below rediscovers it —
+        // pickReadyForCpu re-checks isCurrentOnOtherCpu — so don't take two
+        // remote queue locks in tryStealForCurrent for work we don't need.
+        if (!deferred_local) {
+            const stolen = per_cpu.tryStealForCurrent();
+            if (stolen > 0) {
+                if (popRunnable(q, &deferred_local)) |i| return i;
+            }
         }
     }
     return task.pickReadyForCpu(@intCast(currentCpuId()), getCurrentIdx());
@@ -492,12 +525,18 @@ fn pickNext() ?u32 {
 /// second CPU's syscall entry). Skipped entries are NOT requeued: the task is
 /// still `.ready`, so the bitmap fallback rediscovers it once its owner CPU
 /// has moved on; stale non-ready entries are dropped the same way.
-fn popRunnable(q: *per_cpu.PerCpuRunQueue) ?u32 {
+/// `deferred_local` is set when at least one entry was skipped solely because
+/// it is still current on another CPU — i.e. real local work exists and the
+/// caller should not bother stealing from remote queues.
+fn popRunnable(q: *per_cpu.PerCpuRunQueue, deferred_local: *bool) ?u32 {
     const my_cpu = currentCpuId();
     while (q.pop()) |t| {
         const i = taskIndexOf(t) orelse continue;
         if (t.state != .ready) continue;
-        if (task.isCurrentOnOtherCpu(i, my_cpu)) continue;
+        if (task.isCurrentOnOtherCpu(i, my_cpu)) {
+            deferred_local.* = true;
+            continue;
+        }
         return i;
     }
     return null;
@@ -703,6 +742,7 @@ fn tryStealTask() void {
                     :
                     : [cr3] "r" (t.page_table_phys),
                     : .{ .rax = true, .memory = true });
+                syscall_entry.noteCr3Switch(t.page_table_phys);
                 gdt.setRsp0(currentCpuId(), t.kernel_stack_top);
                 syscall_entry.getPerCpu().kernel_rsp = t.kernel_stack_top;
                 return;

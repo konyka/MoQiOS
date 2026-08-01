@@ -254,6 +254,11 @@ export fn _start() callconv(.c) noreturn {
     };
     klog.log(.info, "Idle thread created");
 
+    // Deferred writeback: dedicated kernel thread performs the dirty-buffer
+    // flush outside the timer ISR (see vfs.writebackTimerTick). Created here —
+    // after the BSP run queue and task subsystem are ready, before IRQs on.
+    @import("fs/vfs.zig").startWritebackThread();
+
     // M5.5: Load init program from ramdisk as the first user process (pid 1)
     if (loader.loadProgram("init", 0)) |task_idx| {
         serial.writeString("[kernel] init launched as task ");

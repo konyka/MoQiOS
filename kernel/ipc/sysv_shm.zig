@@ -8,6 +8,8 @@ const paging = @import("../arch/arch.zig").paging;
 const serial = @import("../arch/arch.zig").serial;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const fmt = @import("../lib/fmt.zig");
+const sched = @import("../proc/sched.zig");
+const task_mod = @import("../proc/task.zig");
 
 const PAGE_SIZE: u64 = 4096;
 const MAX_SEGMENTS: u32 = 32;
@@ -50,6 +52,46 @@ var next_shmid: u32 = 1;
 var shm_lock: IrqSpinlock = .{};
 var next_free_hint: u64 = 0x7000_0000; // Track next candidate address for findFreeRegion
 
+/// Attached-segment bookkeeping, keyed by TID, so process exit can detach
+/// segments whose owner never called shmdt (attach_count would otherwise
+/// leak and IPC_RMID segments would never be freed).
+const MAX_ATTACH_RECS: u32 = 128;
+const AttachRec = struct {
+    active: bool = false,
+    tid: u32 = 0,
+    shmid: u32 = 0,
+    base: u64 = 0,
+};
+var attach_recs: [MAX_ATTACH_RECS]AttachRec = @splat(.{});
+
+/// True if an attach-record slot is free. Caller holds shm_lock.
+fn hasFreeAttachRec() bool {
+    for (&attach_recs) |*rec| {
+        if (!rec.active) return true;
+    }
+    return false;
+}
+
+/// Record an attachment. Caller holds shm_lock and checked hasFreeAttachRec.
+fn addAttachRec(tid: u32, shmid: u32, base: u64) void {
+    for (&attach_recs) |*rec| {
+        if (!rec.active) {
+            rec.* = .{ .active = true, .tid = tid, .shmid = shmid, .base = base };
+            return;
+        }
+    }
+}
+
+/// Drop the record for (tid, base), if any. Caller holds shm_lock.
+fn removeAttachRec(tid: u32, base: u64) void {
+    for (&attach_recs) |*rec| {
+        if (rec.active and rec.tid == tid and rec.base == base) {
+            rec.active = false;
+            return;
+        }
+    }
+}
+
 /// IPC flags
 const IPC_CREAT: i32 = 0o1000;
 const IPC_EXCL: i32 = 0o2000;
@@ -60,94 +102,124 @@ const IPC_PRIVATE: i32 = 0;
 
 /// shmget(key, size, shmflg) -> shmid or -errno
 pub fn shmget(key: i32, size: u64, shmflg: i32) i64 {
-    const flags = shm_lock.acquire();
-    defer shm_lock.release(flags);
+    // Phase 1 (locked): lookup existing segment and validate the request.
+    {
+        const flags = shm_lock.acquire();
+        defer shm_lock.release(flags);
 
-    // Search for existing segment with this key
-    if (key != IPC_PRIVATE) {
-        for (&segments) |*seg| {
-            if (seg.active and seg.perm.key == key) {
-                // Found existing segment
-                if (shmflg & IPC_CREAT != 0 and shmflg & IPC_EXCL != 0) {
-                    return -17; // -EEXIST
+        // Search for existing segment with this key
+        if (key != IPC_PRIVATE) {
+            for (&segments) |*seg| {
+                if (seg.active and seg.perm.key == key) {
+                    // Found existing segment
+                    if (shmflg & IPC_CREAT != 0 and shmflg & IPC_EXCL != 0) {
+                        return -17; // -EEXIST
+                    }
+                    return @intCast(seg.shmid);
                 }
-                return @intCast(seg.shmid);
             }
         }
-    }
 
-    // Need to create a new segment
-    if (shmflg & IPC_CREAT == 0 and key != IPC_PRIVATE) {
-        return -2; // -ENOENT
-    }
+        // Need to create a new segment
+        if (shmflg & IPC_CREAT == 0 and key != IPC_PRIVATE) {
+            return -2; // -ENOENT
+        }
 
-    if (size == 0 or size > MAX_PAGES_PER_SEG * PAGE_SIZE) {
-        return -22; // -EINVAL
-    }
-
-    // Find a free slot
-    var slot: ?u32 = null;
-    for (0..MAX_SEGMENTS) |i| {
-        if (!segments[i].active) {
-            slot = @intCast(i);
-            break;
+        if (size == 0 or size > MAX_PAGES_PER_SEG * PAGE_SIZE) {
+            return -22; // -EINVAL
         }
     }
-    if (slot == null) return -28; // -ENOSPC
 
-    const idx = slot.?;
     const num_pages: u32 = @intCast((size + PAGE_SIZE - 1) / PAGE_SIZE);
 
-    // Allocate physical pages
-    var seg = &segments[idx];
-    seg.num_pages = num_pages;
+    // Allocate and zero physical pages WITHOUT shm_lock: zeroing up to 1 MiB
+    // with IRQs off stalls interrupt handling for milliseconds.
+    var phys_pages: [MAX_PAGES_PER_SEG]u64 = @splat(0);
+    var allocated: u32 = 0;
     for (0..num_pages) |p| {
         const phys = pmm.allocPage() orelse {
-            // Rollback: free already allocated pages
-            for (0..p) |q| {
-                pmm.freePage(seg.phys_pages[q]);
-                seg.phys_pages[q] = 0;
-            }
-            seg.num_pages = 0;
+            freePages(&phys_pages, allocated);
             return -12; // -ENOMEM
         };
-        seg.phys_pages[p] = phys;
+        phys_pages[p] = phys;
+        allocated += 1;
         // Zero the page
         const virt_addr = hhdm.physToVirt(phys);
         const ptr: [*]u8 = @ptrFromInt(virt_addr);
         @memset(ptr[0..PAGE_SIZE], 0);
     }
 
-    const shmid = next_shmid;
-    next_shmid += 1;
+    // Phase 2 (locked): re-validate (another CPU may have created the segment
+    // or taken the last slot while we allocated without the lock), then publish.
+    var result: i64 = -1;
+    var published = false;
+    {
+        const flags = shm_lock.acquire();
+        defer shm_lock.release(flags);
 
-    seg.* = .{
-        .active = true,
-        .perm = .{
-            .key = key,
-            .uid = 0,
-            .gid = 0,
-            .cuid = 0,
-            .cgid = 0,
-            .mode = @intCast(shmflg & 0o777),
-        },
-        .shmid = shmid,
-        .size = size,
-        .num_pages = num_pages,
-        .phys_pages = seg.phys_pages, // preserve allocated pages
-        .attach_count = 0,
-        .owner_tid = 0,
-    };
+        if (key != IPC_PRIVATE) {
+            for (&segments) |*seg| {
+                if (seg.active and seg.perm.key == key) {
+                    // Lost the race — drop our pages and report the winner.
+                    result = if (shmflg & IPC_CREAT != 0 and shmflg & IPC_EXCL != 0)
+                        -17 // -EEXIST
+                    else
+                        @as(i64, @intCast(seg.shmid));
+                    break;
+                }
+            }
+        }
 
-    serial.writeString("[sysv_shm] created shmid=");
-    fmt.writeDecimal(seg.shmid);
-    serial.writeString(" key=");
-    fmt.writeDecimal64(@intCast(seg.perm.key));
-    serial.writeString(" pages=");
-    fmt.writeDecimal(seg.num_pages);
-    serial.writeString("\n");
+        if (result == -1) {
+            // Find a free slot
+            var slot: ?u32 = null;
+            for (0..MAX_SEGMENTS) |i| {
+                if (!segments[i].active) {
+                    slot = @intCast(i);
+                    break;
+                }
+            }
+            if (slot == null) {
+                result = -28; // -ENOSPC
+            } else {
+                const idx = slot.?;
+                const shmid = next_shmid;
+                next_shmid += 1;
 
-    return @intCast(shmid);
+                const seg = &segments[idx];
+                seg.* = .{
+                    .active = true,
+                    .perm = .{
+                        .key = key,
+                        .uid = 0,
+                        .gid = 0,
+                        .cuid = 0,
+                        .cgid = 0,
+                        .mode = @intCast(shmflg & 0o777),
+                    },
+                    .shmid = shmid,
+                    .size = size,
+                    .num_pages = num_pages,
+                    .phys_pages = phys_pages,
+                    .attach_count = 0,
+                    .owner_tid = 0,
+                };
+                published = true;
+                result = @intCast(shmid);
+
+                serial.writeString("[sysv_shm] created shmid=");
+                fmt.writeDecimal(seg.shmid);
+                serial.writeString(" key=");
+                fmt.writeDecimal64(@intCast(seg.perm.key));
+                serial.writeString(" pages=");
+                fmt.writeDecimal(seg.num_pages);
+                serial.writeString("\n");
+            }
+        }
+    }
+
+    if (!published) freePages(&phys_pages, allocated);
+    return result;
 }
 
 /// shmat(shmid, shmaddr, shmflg) -> virtual address or -errno
@@ -162,15 +234,16 @@ pub fn shmat(shmid: u32, shmaddr: u64, shmflg: u64) i64 {
     if (seg.marked_removed) return -22; // -EINVAL
 
     // Get current process page table
-    const sched = @import("../proc/sched.zig");
-    const task_mod = @import("../proc/task.zig");
     const cur_idx = sched.currentTaskIndex() orelse return -1; // -EPERM
     const task = task_mod.getTask(cur_idx) orelse return -1;
     const pml4 = task.page_table_phys;
     if (pml4 == 0) return -1; // kernel thread can't attach
 
+    // Need an attach-record slot so process exit can undo this attachment.
+    if (!hasFreeAttachRec()) return -28; // -ENOSPC
+
     // Determine mapping address
-    const map_addr: u64 = if (shmaddr != 0) shmaddr else findFreeRegion(seg.num_pages, pml4);
+    const map_addr: u64 = if (shmaddr != 0) shmaddr else findFreeRegion(task, seg.num_pages);
     if (map_addr == 0) return -12; // -ENOMEM
     if (map_addr & (PAGE_SIZE - 1) != 0) return -22; // -EINVAL (not aligned)
     if (map_addr >= 0x0000_8000_0000_0000) return -22; // user space only
@@ -202,6 +275,7 @@ pub fn shmat(shmid: u32, shmaddr: u64, shmflg: u64) i64 {
     }
 
     seg.attach_count += 1;
+    addAttachRec(task.tid, shmid, map_addr);
 
     serial.writeString("[sysv_shm] shmat shmid=");
     fmt.writeDecimal(shmid);
@@ -220,8 +294,6 @@ pub fn shmdt(shmaddr: u64) i64 {
 
     if (shmaddr == 0 or shmaddr & (PAGE_SIZE - 1) != 0) return -22; // -EINVAL
 
-    const sched = @import("../proc/sched.zig");
-    const task_mod = @import("../proc/task.zig");
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const task = task_mod.getTask(cur_idx) orelse return -1;
     const pml4 = task.page_table_phys;
@@ -242,6 +314,7 @@ pub fn shmdt(shmaddr: u64) i64 {
                 paging.invlpg(virt);
             }
             if (seg.attach_count > 0) seg.attach_count -= 1;
+            removeAttachRec(task.tid, shmaddr);
 
             serial.writeString("[sysv_shm] shmdt addr=0x");
             fmt.writeHex(shmaddr);
@@ -258,6 +331,41 @@ pub fn shmdt(shmaddr: u64) i64 {
     }
 
     return -22; // -EINVAL (not attached)
+}
+
+/// Detach every segment still attached by `tid`. Called from task.exitTask
+/// so a process that exits without shmdt doesn't leak attachments (and
+/// IPC_RMID segments waiting on attach_count get freed).
+pub fn detachAllForTask(tid: u32, pml4: u64) void {
+    const flags = shm_lock.acquire();
+    defer shm_lock.release(flags);
+
+    for (&attach_recs) |*rec| {
+        if (!rec.active or rec.tid != tid) continue;
+        rec.active = false;
+        const seg = findSegment(rec.shmid) orelse continue;
+
+        // Unmap all pages
+        for (0..seg.num_pages) |p| {
+            _ = paging.unmapPage(pml4, rec.base + @as(u64, @intCast(p)) * PAGE_SIZE);
+        }
+        // Flush TLB
+        for (0..seg.num_pages) |p| {
+            paging.invlpg(rec.base + @as(u64, @intCast(p)) * PAGE_SIZE);
+        }
+        if (seg.attach_count > 0) seg.attach_count -= 1;
+
+        serial.writeString("[sysv_shm] exit-detach shmid=");
+        fmt.writeDecimal(seg.shmid);
+        serial.writeString(" addr=0x");
+        fmt.writeHex(rec.base);
+        serial.writeString("\n");
+
+        // If marked for removal and no more attachments, free it
+        if (seg.marked_removed and seg.attach_count == 0) {
+            freeSegment(seg);
+        }
+    }
 }
 
 /// shmctl(shmid, cmd, buf) -> 0 or -errno
@@ -317,6 +425,16 @@ fn findSegment(shmid: u32) ?*ShmSegment {
     return null;
 }
 
+/// Free `count` pages from a freshly allocated (not yet published) page list.
+fn freePages(phys_pages: *[MAX_PAGES_PER_SEG]u64, count: u32) void {
+    for (0..count) |p| {
+        if (phys_pages[p] != 0) {
+            pmm.freePage(phys_pages[p]);
+            phys_pages[p] = 0;
+        }
+    }
+}
+
 fn freeSegment(seg: *ShmSegment) void {
     for (0..seg.num_pages) |p| {
         if (seg.phys_pages[p] != 0) {
@@ -363,30 +481,48 @@ fn isMappedAt(pml4: u64, virt: u64, first_phys: u64) bool {
 }
 
 /// Find a free virtual region in user space for mapping.
-/// Uses next_free_hint to avoid rescanning previously allocated regions (O(n) vs O(n²)).
-fn findFreeRegion(num_pages: u32, pml4: u64) u64 {
+/// Uses next_free_hint to avoid rescanning previously allocated regions.
+/// Conflicts are checked against the process's tracked mmap/vma list (cheap
+/// memory compares) instead of probing the page tables for every candidate
+/// page — the old O(region × pages) walk held shm_lock (IRQs off) for
+/// milliseconds. Page-table probing only happens for pages the region list
+/// does not know about (loaded image, earlier shmat after a hint wrap).
+fn findFreeRegion(task: *task_mod.Task, num_pages: u32) u64 {
+    const SHM_BASE: u64 = 0x7000_0000;
     const SHM_END: u64 = 0x7800_0000; // 128MB region
     const region_size: u64 = @as(u64, num_pages) * PAGE_SIZE;
 
     var addr: u64 = next_free_hint;
-    while (addr + region_size <= SHM_END) : (addr += PAGE_SIZE) {
-        var all_free = true;
-        for (0..num_pages) |p| {
-            const test_addr = addr + @as(u64, @intCast(p)) * PAGE_SIZE;
-            if (isPageMapped(pml4, test_addr)) {
-                all_free = false;
-                break;
+    while (addr + region_size <= SHM_END) {
+        // Skip past any tracked region overlapping this candidate.
+        var conflict_end: u64 = 0;
+        for (task.mmap_regions) |r| {
+            if (!r.active) continue;
+            const r_end = r.base + r.num_pages * PAGE_SIZE;
+            if (addr < r_end and r.base < addr + region_size) {
+                conflict_end = @max(conflict_end, r_end);
             }
         }
-        if (all_free) {
+        if (conflict_end != 0) {
+            addr = conflict_end;
+            continue;
+        }
+        // Probe untracked pages once; skip straight past the first one in the
+        // way instead of rescanning page by page.
+        var p: u32 = 0;
+        while (p < num_pages) : (p += 1) {
+            if (isPageMapped(task.page_table_phys, addr + @as(u64, @intCast(p)) * PAGE_SIZE)) break;
+        }
+        if (p == num_pages) {
             next_free_hint = addr + region_size; // advance hint past this region
             return addr;
         }
+        addr += @as(u64, p + 1) * PAGE_SIZE;
     }
     // Wrap around: retry from SHM_BASE if we started past it
-    if (next_free_hint > 0x7000_0000) {
-        next_free_hint = 0x7000_0000;
-        return findFreeRegion(num_pages, pml4);
+    if (next_free_hint > SHM_BASE) {
+        next_free_hint = SHM_BASE;
+        return findFreeRegion(task, num_pages);
     }
     return 0; // no free region
 }

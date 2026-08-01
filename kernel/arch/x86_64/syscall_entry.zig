@@ -93,6 +93,10 @@ pub const PerCpu = extern struct {
     exec_new_stack: u64,
     /// Non-zero while handling a reschedule IPI — bypass single-task fast-path.
     force_reschedule: u8,
+    /// CR3 this CPU is currently running (0 = not recorded yet). Updated on
+    /// every CR3 write so TLB shootdown initiators can skip CPUs that do not
+    /// run the target address space. Read lock-free by remote CPUs.
+    current_cr3: u64 = 0,
 };
 
 /// Per-CPU data array, indexed by CPU logical ID.
@@ -165,6 +169,13 @@ pub fn getPerCpuOrNull() ?*PerCpu {
     const gs_base = rdmsr(0xC0000101); // MSR_GS_BASE
     if (gs_base == 0) return null;
     return @ptrFromInt(gs_base);
+}
+
+/// Record the CR3 this CPU is now running. Must be called after every CR3
+/// write (context switch, execve, syscall re-sync) so TLB shootdown
+/// initiators can filter IPIs by address space via `percpu_array[].current_cr3`.
+pub inline fn noteCr3Switch(cr3: u64) void {
+    getPerCpu().current_cr3 = cr3;
 }
 
 // v53.48: Comptime assertions — verify PerCpu field offsets for %gs: direct access.
@@ -425,6 +436,7 @@ fn prepareSyscallCpu() void {
         :
         : [cr3] "r" (t.page_table_phys),
         : .{ .rax = true, .memory = true });
+    pc.current_cr3 = t.page_table_phys;
     syncUserRspToTask(t);
 }
 

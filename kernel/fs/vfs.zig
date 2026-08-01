@@ -986,12 +986,68 @@ pub fn initWritebackCallbacks() void {
     writeback.setFlushCallback(.fat32, fat32WriteFlush);
 }
 
+// ---------------------------------------------------------------------------
+// Deferred writeback flush (dedicated kernel thread)
+// ---------------------------------------------------------------------------
+
+/// Wait queue the writeback thread sleeps on; woken from the scheduler tick
+/// when expired dirty buffers exist.
+var wb_wait_queue: ?*@import("../proc/task.zig").WaitNode = null;
+/// 1 once the writeback kernel thread exists (atomic — written from boot
+/// context, read from the timer ISR).
+var wb_thread_created: u8 = 0;
+
+/// Flush all expired dirty buffers. Runs in thread context with IRQs ENABLED.
+/// The block-device write path below ext2/fat32 polls (NVMe completion loops
+/// of up to ~2M pause iterations), so it must never run inside the timer ISR.
+fn flushExpired() void {
+    writeback.flushExpiredByFs(.ext2, ext2WriteFlush);
+    writeback.flushExpiredByFs(.fat32, fat32WriteFlush);
+}
+
+/// Writeback daemon: sleep until the tick wakes us, then flush expired buffers.
+/// A lost wake (tick fired while we were flushing or between flush and
+/// re-block) only delays the flush until the next expiry pass (~1 s): expired
+/// buffers stay visible to writeback.writebackTimerTick, which re-wakes us, so
+/// no dirty data is stranded. A spurious wake is equally harmless — the flush
+/// scan finds nothing expired and we go back to sleep.
+fn writebackThreadMain() callconv(.c) void {
+    const sched = @import("../proc/sched.zig");
+    const task_mod = @import("../proc/task.zig");
+    while (true) {
+        var node: task_mod.WaitNode = .{ .task_idx = 0 };
+        _ = sched.sleepOn(&wb_wait_queue, &node);
+        flushExpired();
+    }
+}
+
+/// Create the writeback kernel thread. Call once from boot context after the
+/// task subsystem and the BSP run queue are up. On failure the tick keeps the
+/// old synchronous-flush fallback in writebackTimerTick.
+/// Priority 10: above the user default (20) so CPU-bound user tasks cannot
+/// starve the flush indefinitely, below critical kernel work (0).
+pub fn startWritebackThread() void {
+    const task_mod = @import("../proc/task.zig");
+    _ = task_mod.createKernelThread(writebackThreadMain, 10) orelse return;
+    @atomicStore(u8, &wb_thread_created, 1, .release);
+}
+
 /// Public API: Drive writeback timer from scheduler tick.
+/// Called from the BSP maintenance tick with IRQs OFF — only the cheap expiry
+/// scan runs here. The expensive flush (synchronous polling block I/O,
+/// multi-millisecond) is deferred to the writeback kernel thread, woken via
+/// the scheduler's wait-queue path. The thread itself runs flushExpired in
+/// normal task context with IRQs enabled.
 pub fn writebackTimerTick() bool {
     const expired = writeback.writebackTimerTick();
     if (expired) {
-        writeback.flushExpiredByFs(.ext2, ext2WriteFlush);
-        writeback.flushExpiredByFs(.fat32, fat32WriteFlush);
+        if (@atomicLoad(u8, &wb_thread_created, .acquire) != 0) {
+            const sched = @import("../proc/sched.zig");
+            _ = sched.wakeOne(&wb_wait_queue);
+        } else {
+            // Early boot / thread creation failed: keep the old behaviour.
+            flushExpired();
+        }
     }
     return expired;
 }

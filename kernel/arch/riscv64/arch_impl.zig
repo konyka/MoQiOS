@@ -692,9 +692,10 @@ pub const irq = struct {
 
 /// TLB shootdown surface — no-op on uniprocessor riscv64 bring-up (SK-8).
 pub const tlb = struct {
-    pub fn shootdownRange(addr_start: u64, page_count: u32) void {
+    pub fn shootdownRange(addr_start: u64, page_count: u32, target_cr3: u64) void {
         _ = addr_start;
         _ = page_count;
+        _ = target_cr3; // uniprocessor bring-up — no IPI filtering needed
         asm volatile ("sfence.vma" ::: .{ .memory = true });
     }
 };

@@ -41,9 +41,10 @@ pub fn unmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
             first_virt: u64,
             last_virt: u64,
             buf: []const u64,
+            target_cr3: u64,
         ) void {
             const span_pages = @as(u32, @intCast((last_virt - first_virt) / 4096 + 1));
-            tlb_mod.shootdownRange(first_virt, span_pages);
+            tlb_mod.shootdownRange(first_virt, span_pages, target_cr3);
             pmm_mod.freePageBatch(buf);
         }
     }.call;
@@ -60,7 +61,7 @@ pub fn unmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
                 const span_pages = (virt - batch_first_virt) / 4096 + 1;
                 if (span_pages > MAX_BATCH_SPAN) {
                     // Flush current batch before starting a new one.
-                    flushBatch(batch_first_virt, batch_last_virt, free_buf[0..free_count]);
+                    flushBatch(batch_first_virt, batch_last_virt, free_buf[0..free_count], task.page_table_phys);
                     free_count = 0;
                     batch_first_virt = virt;
                     batch_last_virt = virt;
@@ -74,7 +75,7 @@ pub fn unmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
 
             // Flush when buffer is full.
             if (free_count == 128) {
-                flushBatch(batch_first_virt, batch_last_virt, free_buf[0..128]);
+                flushBatch(batch_first_virt, batch_last_virt, free_buf[0..128], task.page_table_phys);
                 free_count = 0;
             }
         }
@@ -82,7 +83,7 @@ pub fn unmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
 
     // Final batch: shootdown the remaining pages, then free.
     if (free_count > 0) {
-        flushBatch(batch_first_virt, batch_last_virt, free_buf[0..free_count]);
+        flushBatch(batch_first_virt, batch_last_virt, free_buf[0..free_count], task.page_table_phys);
     }
 }
 

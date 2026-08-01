@@ -716,7 +716,7 @@ fn handleCowFault(frame: *InterruptFrame, fault_addr: u64) bool {
     // entries into the old frame. Mirrors the shootdown→free ordering in
     // unmapRange.
     const tlb_mod = @import("tlb.zig");
-    tlb_mod.shootdownRange(page_addr, 1);
+    tlb_mod.shootdownRange(page_addr, 1, current.page_table_phys);
 
     // Release our reference to the old shared page (other owner still holds it).
     _ = pmm_mod.decRef(old_phys);

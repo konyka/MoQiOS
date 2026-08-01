@@ -89,6 +89,7 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64) ?u64 {
         :
         : [cr3] "r" (result.pml4),
         : .{ .rax = true, .memory = true });
+    syscall_entry.noteCr3Switch(result.pml4);
     if (old_pml4 != 0) user_space.destroyUserSpace(old_pml4);
     @import("../arch/arch.zig").gdt.setRsp0(getPerCpu().cpu_id, cur.kernel_stack_top);
     getPerCpu().kernel_rsp = cur.kernel_stack_top;
@@ -193,6 +194,7 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64) ?u64 {
         :
         : [cr3] "r" (result.pml4),
         : .{ .rax = true, .memory = true });
+    syscall_entry.noteCr3Switch(result.pml4);
     if (old_pml4 != 0) user_space.destroyUserSpace(old_pml4);
     @import("../arch/arch.zig").gdt.setRsp0(getPerCpu().cpu_id, cur.kernel_stack_top);
     getPerCpu().kernel_rsp = cur.kernel_stack_top;

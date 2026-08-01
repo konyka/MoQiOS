@@ -14,15 +14,19 @@
 //!      classic cross-IPI deadlock and to stay safe in interrupt-disabled
 //!      contexts (page-fault handler COW/swap paths), where an `sti` window
 //!      would corrupt the interrupted frame.
-//!   4. Publish (addr_start, page_count) in the global slot and seed the
-//!      `completion` counter with the number of remote CPUs to acknowledge.
-//!   5. Broadcast `TLB_SHOOTDOWN_VECTOR` IPI to all-but-self via the LAPIC.
+//!   4. Publish (addr_start, page_count, target_cr3, target_mask) in the
+//!      global slot and seed the `completion` counter with the number of
+//!      targeted remote CPUs. `target_mask` covers only online CPUs whose
+//!      recorded current CR3 matches `target_cr3` (or is unrecorded); a
+//!      `target_cr3` of 0 means "unknown / kernel-half" and targets everyone.
+//!   5. Send `TLB_SHOOTDOWN_VECTOR` IPI to the masked CPUs via the LAPIC.
 //!   6. Spin (with `pause`) on `completion` until it reaches zero.
 //!   7. Clear the `active` flag and release the lock.
 //!
 //! Algorithm (IPI handler on remote CPU):
 //!   1. EOI the LAPIC.
-//!   2. Read (addr_start, page_count) from the global slot.
+//!   2. Read (addr_start, page_count) from the global slot — unless this CPU
+//!      is outside `target_mask`, in which case skip flush AND ack.
 //!   3. Flush locally (range invlpg, or CR3 reload if oversized).
 //!   4. Atomically decrement `completion`.
 //!
@@ -59,7 +63,20 @@ pub const TlbShootdownReq = extern struct {
     /// invoked in response to our own IPI so this is mainly for diagnostics).
     active: u32 = 0,
     generation: u32 = 0,
+    /// Address space being shot down (target CR3 / page_table_phys). 0 means
+    /// "unknown / kernel-half" → broadcast to every online CPU. Remote CPUs
+    /// whose current CR3 differs are excluded from `target_mask` at send time.
+    target_cr3: u64 = 0,
+    /// Bitmask of remote CPUs that must flush+ack (bit N = logical CPU N).
+    /// CPUs outside the mask skip the request entirely — no flush, no ack —
+    /// so `completion` only ever counts masked CPUs.
+    target_mask: [4]u64 = .{ 0, 0, 0, 0 },
 };
+
+comptime {
+    if (syscall_entry.MAX_CPUS > 256)
+        @compileError("TlbShootdownReq.target_mask is [4]u64 — MAX_CPUS must be <= 256");
+}
 
 pub var shootdown_req: TlbShootdownReq = .{};
 var acknowledged_generation: [syscall_entry.MAX_CPUS]u32 = [_]u32{0} ** syscall_entry.MAX_CPUS;
@@ -169,6 +186,13 @@ fn servicePendingShootdown() void {
     const generation = @atomicLoad(u32, &shootdown_req.generation, .acquire);
     const cpu_id = syscall_entry.getPerCpu().cpu_id;
     if (cpu_id >= syscall_entry.MAX_CPUS) return;
+
+    // Address-space filtering: CPUs outside the target mask never run the
+    // target CR3, so they skip the flush AND the ack — `completion` was
+    // seeded with exactly the masked CPU count.
+    const mask_word = @atomicLoad(u64, &shootdown_req.target_mask[cpu_id >> 6], .acquire);
+    if ((mask_word >> @intCast(cpu_id & 63)) & 1 == 0) return;
+
     if (@atomicRmw(u32, &acknowledged_generation[cpu_id], .Xchg, generation, .acq_rel) == generation) return;
 
     // The active acquire load publishes the range before this CPU flushes it.
@@ -195,9 +219,13 @@ pub fn handleShootdownIpi() void {
 }
 
 /// Initiator-side: flush `[addr_start, addr_start + page_count * 4K)` on the
-/// local CPU and every other online CPU. Safe to call on uniprocessor (skips
-/// the IPI step). `page_count == 0` is a no-op.
-pub fn shootdownRange(addr_start: u64, page_count: u32) void {
+/// local CPU and every other online CPU that runs the target address space.
+/// `target_cr3` is the victim address space's page_table_phys; pass 0 for
+/// "unknown / kernel-half" to broadcast to all online CPUs. CPUs whose
+/// recorded current CR3 provably differs from `target_cr3` are skipped
+/// entirely — no IPI, no flush, no ack slot in `completion`. Safe to call on
+/// uniprocessor (skips the IPI step). `page_count == 0` is a no-op.
+pub fn shootdownRange(addr_start: u64, page_count: u32, target_cr3: u64) void {
     if (page_count == 0) return;
 
     // Local flush first — synchronous, doesn't need the lock.
@@ -205,11 +233,25 @@ pub fn shootdownRange(addr_start: u64, page_count: u32) void {
 
     const configured = @atomicLoad(u32, &smp.configured_cpu_count, .acquire);
     const current_cpu = syscall_entry.getPerCpu().cpu_id;
+
+    // Address-space filtering: a CPU only needs the shootdown if it is (or
+    // may be) running the target CR3. `current_cr3 == 0` means "not recorded
+    // yet" — keep such CPUs, we cannot prove exclusion. Excluding a CPU that
+    // later switches INTO the target CR3 is still correct: the CR3 load on
+    // context switch invalidates all non-global TLB entries (user pages are
+    // never global), so it cannot observe stale translations.
+    var mask: [4]u64 = .{ 0, 0, 0, 0 };
     var remote: u32 = 0;
     var cpu: u32 = 0;
     while (cpu < configured) : (cpu += 1) {
         if (cpu == current_cpu) continue;
-        if (smp.isCpuOnline(@intCast(cpu))) remote += 1;
+        if (!smp.isCpuOnline(@intCast(cpu))) continue;
+        if (target_cr3 != 0) {
+            const cpu_cr3 = @atomicLoad(u64, &syscall_entry.percpu_array[cpu].current_cr3, .acquire);
+            if (cpu_cr3 != 0 and cpu_cr3 != target_cr3) continue;
+        }
+        mask[cpu >> 6] |= @as(u64, 1) << @intCast(cpu & 63);
+        remote += 1;
     }
     if (remote == 0) return;
 
@@ -223,6 +265,9 @@ pub fn shootdownRange(addr_start: u64, page_count: u32) void {
     // non-zero via the IPI.
     @atomicStore(u64, &shootdown_req.addr_start, addr_start, .release);
     @atomicStore(u32, &shootdown_req.page_count, page_count, .release);
+    @atomicStore(u64, &shootdown_req.target_cr3, target_cr3, .release);
+    for (&shootdown_req.target_mask, 0..) |*word, i|
+        @atomicStore(u64, word, mask[i], .release);
     const generation = @atomicLoad(u32, &shootdown_req.generation, .monotonic) +% 1;
     @atomicStore(u32, &shootdown_req.generation, if (generation == 0) 1 else generation, .release);
     @atomicStore(u32, &shootdown_req.completion, remote, .release);
@@ -231,8 +276,8 @@ pub fn shootdownRange(addr_start: u64, page_count: u32) void {
     cpu = 0;
     while (cpu < configured) : (cpu += 1) {
         if (cpu == current_cpu) continue;
+        if ((mask[cpu >> 6] >> @intCast(cpu & 63)) & 1 == 0) continue;
         const logical_id: u8 = @intCast(cpu);
-        if (!smp.isCpuOnline(logical_id)) continue;
         const apic_id: u8 = @intCast(syscall_entry.percpu_array[logical_id].apic_id);
         if (!lapic.sendIpi(apic_id, lapic.TLB_SHOOTDOWN_VECTOR)) failShootdown("IPI delivery timed out");
     }

@@ -928,7 +928,11 @@ fn sendSegmentSeq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16, 
     if (data_len > mssForTcb(tcb)) return false;
 
     const flags = decorateEcnFlags(tcb, flags_in, data_len);
-    var send_pkt: [1518]u8 = @splat(0);
+    // Only the header region needs zeroing — fillTcpSegment/buildHeader/
+    // buildFrame overwrite it, and the payload is memcpy'd over the rest.
+    var send_pkt: [1518]u8 = undefined;
+    const tcp_off: u16 = 34;
+    @memset(send_pkt[0 .. tcp_off + 20], 0);
     const dst_mac = arp.resolve(tcb.remote_ip) orelse {
         tcpLog("[tcp] ARP resolution failed\n");
         return false;
@@ -936,7 +940,6 @@ fn sendSegmentSeq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16, 
 
     const our_mac = netif.getMac();
     const our_ip = netif.getOurIp();
-    const tcp_off: u16 = 34;
     const tcp_total = fillTcpSegment(tcb, flags, data, data_len, &send_pkt, tcp_off, seq_override);
     // SK-101/105: honor Path MTU (or armed oversized raise probe).
     if (ipv4.HEADER_LEN + tcp_total > ipv4.getSendMtu(tcb.remote_ip)) return false;
@@ -977,8 +980,10 @@ fn sendSegmentV6Seq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16
 
     const our_mac = netif.getMac();
     const our_ip = ndp.selectSourceAddress(tcb.remote_ip6, our_mac);
-    var send_pkt: [1518]u8 = @splat(0);
+    // Only the header region needs zeroing (see sendSegmentSeq).
+    var send_pkt: [1518]u8 = undefined;
     const tcp_off: u16 = 14 + ipv6.HEADER_LEN;
+    @memset(send_pkt[0 .. tcp_off + 20], 0);
     const tcp_total = fillTcpSegment(tcb, flags, data, data_len, &send_pkt, tcp_off, seq_override);
     // SK-97/105: honor Path MTU (or armed oversized raise probe).
     if (ipv6.HEADER_LEN + tcp_total > ipv6.getSendMtu(tcb.remote_ip6)) return false;
@@ -2567,41 +2572,55 @@ pub fn probeRingHeadLen(buf_size: u32, write_pos: u32, count: u32) u32 {
     return @min(count, buf_size - write_pos);
 }
 
+/// Bytes staged from user space per iteration — one page-table walk per
+/// chunk, small enough for the 128 KiB kernel stack.
+const SEND_STAGE_SIZE: u32 = 4096;
+
 /// Queue user-space data on an established connection (SK-151).
 ///
-/// Copies straight from the user buffer into the send ring, so a full
-/// window-sized write needs neither a bounce buffer on the 128 KiB kernel stack
-/// nor the second bulk copy that staging through one would cost.
+/// The user copy runs BEFORE tcp_lock is taken: copyFromUser walks page
+/// tables and a window-sized write is up to 64 KiB — far too long to hold
+/// the IRQ-off lock. Data is staged in SEND_STAGE_SIZE chunks on the kernel
+/// stack, then copied into the send ring under the lock.
 /// Returns bytes queued, -14 (EFAULT) on a bad user range, or -1 on error.
 pub fn tcpSendFromUser(tcb_idx: u32, user_addr: u64, len: u32) i64 {
     const copy = @import("../mm/copy_from_user.zig");
-    const lock_flags = tcp_lock.acquire();
-    defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
-    const tcb = &tcbs[tcb_idx];
-    if (!tcb.active or tcb.state != .established) return -1;
 
-    const used = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
-    const free_space = SEND_BUF_SIZE - 1 - used;
-    const to_copy = @min(len, free_space);
-    if (to_copy == 0) {
-        flushSendBuffer(tcb);
-        return 0;
+    var total: u32 = 0;
+    while (total < len) {
+        var stage: [SEND_STAGE_SIZE]u8 = undefined;
+        const chunk: u32 = @min(len - total, SEND_STAGE_SIZE);
+        const src: [*]const u8 = @ptrFromInt(user_addr + total);
+        if (copy.copyFromUser(&stage, src, chunk) != chunk) {
+            // Fault after a partial queue: report what made it into the ring.
+            return if (total > 0) @intCast(total) else -14;
+        }
+
+        const lock_flags = tcp_lock.acquire();
+        const tcb = &tcbs[tcb_idx];
+        if (!tcb.active or tcb.state != .established) {
+            tcp_lock.release(lock_flags);
+            return if (total > 0) @intCast(total) else -1;
+        }
+        const used = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
+        const free_space = SEND_BUF_SIZE - 1 - used;
+        const to_copy = @min(chunk, free_space);
+        ringWrite(&tcb.send_buf, SEND_BUF_SIZE, tcb.send_tail, &stage, to_copy);
+        tcb.send_tail = (tcb.send_tail + to_copy) % SEND_BUF_SIZE;
+        tcp_lock.release(lock_flags);
+
+        total += to_copy;
+        if (to_copy < chunk) break; // ring full
     }
 
-    // send_tail is only advanced once both ring segments are in, so a partial
-    // copy leaves the ring's valid range untouched.
-    const src: [*]const u8 = @ptrFromInt(user_addr);
-    const head_len = probeRingHeadLen(SEND_BUF_SIZE, tcb.send_tail, to_copy);
-    if (copy.copyFromUser(tcb.send_buf[tcb.send_tail..][0..head_len], src, head_len) != head_len) return -14;
-    if (to_copy > head_len) {
-        const wrap_len = to_copy - head_len;
-        if (copy.copyFromUser(tcb.send_buf[0..wrap_len], src + head_len, wrap_len) != wrap_len) return -14;
+    if (len > 0) {
+        const lock_flags = tcp_lock.acquire();
+        defer tcp_lock.release(lock_flags);
+        const tcb = &tcbs[tcb_idx];
+        if (tcb.active and tcb.state == .established) flushSendBuffer(tcb);
     }
-    tcb.send_tail = (tcb.send_tail + to_copy) % SEND_BUF_SIZE;
-
-    flushSendBuffer(tcb);
-    return to_copy;
+    return total;
 }
 
 /// Flush pending send data as TCP segments.

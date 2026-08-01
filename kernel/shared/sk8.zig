@@ -8,7 +8,7 @@ const fmt_core = @import("../lib/fmt_core.zig");
 pub fn announce() void {
     const page_size = arch.paging.PAGE_SIZE;
     const tick = arch.tsc.read();
-    arch.tlb.shootdownRange(0, 0);
+    arch.tlb.shootdownRange(0, 0, 0);
 
     arch.serial.writeString("[SK-8] paging.PAGE_SIZE=");
     var buf: [20]u8 = undefined;

@@ -604,6 +604,12 @@ pub fn exitTask(exit_code: i32) void {
         }
     }
 
+    // Detach any SysV SHM segments still attached (shmat without shmdt) —
+    // otherwise attach_count leaks and IPC_RMID segments are never freed.
+    if (t.page_table_phys != 0) {
+        @import("../ipc/sysv_shm.zig").detachAllForTask(t.tid, t.page_table_phys);
+    }
+
     const flags = task_lock.acquire();
     t.exit_code = exit_code;
     t.state = .zombie;
