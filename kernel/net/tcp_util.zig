@@ -99,7 +99,7 @@ pub fn checksumV6(
     }
 
     var sum: u32 = @truncate(acc);
-    sum +|= @as(u32, @truncate(acc >> 32));
+    sum +%= @as(u32, @truncate(acc >> 32));
     sum = (sum & 0xFFFF) + (sum >> 16);
     sum = (sum & 0xFFFF) + (sum >> 16);
     const folded: u16 = @truncate(~sum);

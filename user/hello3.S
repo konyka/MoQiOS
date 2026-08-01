@@ -21,6 +21,19 @@ _start:
     # Save fd
     mov %rax, %r12
 
+    # ---- Bail out on open failure (negative fd) ----
+    test %rax, %rax
+    jns .Lopen_ok
+    mov $1, %rdi
+    leaq msg_fail(%rip), %rsi
+    mov $20, %rdx
+    mov $1, %rax
+    syscall
+    mov $1, %rdi            # exit(1)
+    mov $2, %rax
+    syscall
+.Lopen_ok:
+
     # ---- Print "hello3: got fd=X\n" ----
     mov $1, %rdi
     leaq msg_fd(%rip), %rsi
@@ -62,12 +75,15 @@ _start:
     mov $1, %rax
     syscall
 
-    # ---- Print the content read from file ----
+    # ---- Print the content read from file (skip if read failed) ----
+    test %r13, %r13
+    js .Lskip_dump
     mov $1, %rdi
     leaq buf(%rip), %rsi
     mov %r13, %rdx
     mov $1, %rax
     syscall
+.Lskip_dump:
 
     # ---- close(fd) ----
     mov %r12, %rdi
@@ -97,6 +113,7 @@ fd_str:     .byte '0'
 fd_char     = fd_str
 nl:         .ascii "\n"
 msg_read:   .ascii "hello3: read bytes:\n"
+msg_fail:   .ascii "hello3: open failed\n"
 msg_done:   .ascii "hello3: done!\n"
 filename:   .asciz "hello2"
 

@@ -68,6 +68,7 @@ fn readFileAt(fd_table: *vfs.FdTable, fd: u32, offset: *u64, buf: [*]u8, count: 
 
     switch (desc.fd_type) {
         .ramdisk_file => {
+            if (offset.* >= desc.file_size) return 0;
             const remaining = desc.file_size - offset.*;
             if (remaining == 0) return 0;
             const to_read: usize = if (@as(u64, count) > remaining) @intCast(remaining) else count;
@@ -335,6 +336,9 @@ fn spliceFileToPipe(fd_table: *vfs.FdTable, file_fd: u32, off_in: u64, pipe_fd: 
     } else {
         offset = fd_table.fds[file_fd].offset;
     }
+
+    // If offset is past EOF, nothing to do
+    if (offset >= fd_table.fds[file_fd].file_size) return 0;
 
     var remaining: u64 = len;
     var total: i64 = 0;

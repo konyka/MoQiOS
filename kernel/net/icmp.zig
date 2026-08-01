@@ -19,7 +19,8 @@ pub fn buildEchoReply(
     reply_dst_mac: [6]u8,
 ) u16 {
     // ICMP message: copy the request (type, code, checksum, id, seq, data).
-    const icmp_total: u16 = @intCast(@min(req_len, @as(u32, 236)));
+    // Cap at 222 so the reply fits the caller's 256-byte frame (34 = eth+ipv4).
+    const icmp_total: u16 = @intCast(@min(req_len, @as(u32, 222)));
     @memcpy(out[34..][0..icmp_total], req[0..icmp_total]);
 
     // Type=0 (echo reply), code=0, clear + recompute checksum.

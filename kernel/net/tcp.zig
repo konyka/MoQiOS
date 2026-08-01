@@ -2315,6 +2315,14 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, e
     _ = dst_ip;
     if (len < 20) return;
 
+    // Verify the TCP checksum (mandatory, RFC 793) before touching any state —
+    // a forged RST with a bad checksum must not tear down a connection.
+    // tcpChecksum folds pseudo-header + segment including the checksum field,
+    // so a valid segment yields 0 (same convention as icmpv6.handlePacket).
+    const tcp_len: u16 = @intCast(@min(len, 0xFFFF));
+    if (bo.readU16BeAt(data, 16) == 0) return;
+    if (tcpChecksum(src_ip, netif.getOurIp(), data, tcp_len) != 0) return;
+
     // v53.41: Collect epoll events — notify after releasing tcp_lock to avoid blocking all TCP connections
     const epoll = @import("epoll.zig");
     var pending_events: u32 = 0;
@@ -2944,7 +2952,10 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             // First keepalive probe (SK-109: SEQ = SND.UNA-1).
             tcb.keepalive_probes = 1;
             _ = sendKeepaliveProbe(tcb);
-        } else if (tcb.keepalive_probes > 0 and tcb.idle_ms >= keep_idle_ms + tcb.keepalive_probes * keep_intvl_ms) {
+        } else if (tcb.keepalive_probes > 0 and
+            // u64: probes*keep_intvl_ms can exceed u32 even with clamped options.
+            @as(u64, tcb.idle_ms) >= @as(u64, keep_idle_ms) + @as(u64, tcb.keepalive_probes) * keep_intvl_ms)
+        {
             if (tcb.keepalive_probes >= tcb.options.keep_cnt) {
                 // Max probes reached — connection is dead
                 tcpLog("[tcp] keepalive timeout, closing\n");
@@ -3146,7 +3157,8 @@ pub fn tcpProbeConnIdxV6(local_port: u16, remote_port: u16, remote_ip6: [16]u8) 
 }
 
 /// Accept a pending connection on a listening socket.
-/// Returns new TCB index (>= 0) for the accepted connection, -1 if none pending.
+/// Returns new TCB index (>= 0, including 0) for the accepted connection,
+/// -11 (EAGAIN) when the backlog is empty, -1 on error.
 pub fn tcpAccept(tcb_idx: u32, owner_task: u32) i64 {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
@@ -3167,7 +3179,7 @@ pub fn tcpAccept(tcb_idx: u32, owner_task: u32) i64 {
     }
     const ls = slot orelse return -1;
 
-    if (ls.pending_head == ls.pending_tail) return 0; // No pending connections
+    if (ls.pending_head == ls.pending_tail) return -11; // EAGAIN: no pending connections
 
     // v53.50: O(1) ring buffer dequeue — no array shift needed
     const pending_idx = ls.pending_tpbs[ls.pending_head % LISTEN_BACKLOG];

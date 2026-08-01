@@ -55,6 +55,12 @@ pub fn fork(frame: *SyscallFrame) i64 {
                     _ = vfs_mod.pipeRetain(pidx);
                 }
             },
+            // The shallow copy duplicates readahead page pointers that stay
+            // owned by the parent — drop the child's copy (UAF/double-free).
+            .fat32_file => {
+                const readahead = @import("../fs/readahead.zig");
+                readahead.resetStateForFork(&child.fd_table.fds[i].readahead_state);
+            },
             else => {},
         }
     }

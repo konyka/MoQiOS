@@ -47,6 +47,13 @@ pub fn invalidateCache(state: *ReadaheadState) void {
     state.cache_count = 0;
     state.initialized = false;
 }
+/// fork()/clone() copy the fd table by value, which would duplicate the
+/// cached page pointers: the pages stay owned by the parent's descriptor, so
+/// the child must drop them (without freeing) and start with an empty window.
+/// Freeing them here would double-free on the parent's invalidateCache.
+pub fn resetStateForFork(state: *ReadaheadState) void {
+    initState(state);
+}
 fn isSequential(state: *const ReadaheadState, offset: u64) bool {
     if (!state.initialized) return false;
     if (state.sequential_count == 0) return true;

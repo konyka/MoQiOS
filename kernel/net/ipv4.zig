@@ -77,9 +77,9 @@ pub fn checksum(buf: [*]const u8, len: u16) u16 {
         acc += @as(u64, buf[i]) << 8;
     }
 
-    // Fold 64→32→16
+    // Fold 64→32→16 (end-around carry, then two 32→16 folds).
     var sum: u32 = @truncate(acc);
-    sum +|= @as(u32, @truncate(acc >> 32));
+    sum +%= @as(u32, @truncate(acc >> 32));
     sum = (sum & 0xFFFF) + (sum >> 16);
     sum = (sum & 0xFFFF) + (sum >> 16);
     return @truncate(~sum);
@@ -91,6 +91,14 @@ pub fn parseHeader(data: [*]const u8, frame_len: ?u32) ?Ipv4Info {
 
     const ihl = @as(u16, data[0] & 0xF) * 4;
     if (ihl < 20) return null;
+
+    // Validate against actual received frame length if available
+    if (frame_len) |flen| {
+        if (ihl > flen) return null;
+    }
+
+    // Verify the header checksum (RFC 791) before trusting any field.
+    if (checksum(data, ihl) != 0) return null;
 
     const total_len = bo.readU16BeAt(data, 2);
     // Reject malformed length fields

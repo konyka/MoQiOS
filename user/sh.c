@@ -19,10 +19,20 @@
 #define SYS_listdir 107
 #define SYS_chdir   108
 #define SYS_getcwd  109
+#define SYS_yield   24
 
 #define SIGINT  2
 #define SIG_IGN ((long)1)
 #define CTRL_C  0x03
+
+/* Matches the kernel's expected sigaction layout (kernel reads 28 bytes):
+   the handler pointer is the first 8 bytes of the struct. */
+struct ksigaction {
+    void (*handler)(int);
+    unsigned long mask;
+    unsigned long flags;
+    void *restorer;
+};
 
 static long syscall0(long n) {
     long ret;
@@ -86,7 +96,11 @@ static int read_line(char *buf, int max) {
     int pos = 0;
     while (pos < max - 1) {
         long n = syscall3(SYS_read, 0, (long)(buf + pos), 1);
-        if (n <= 0) continue;
+        if (n <= 0) {
+            /* EOF/error: yield instead of busy-spinning at 100% CPU */
+            syscall0(SYS_yield);
+            continue;
+        }
         char c = buf[pos];
         if (c == '\n') {
             buf[pos] = '\0';
@@ -186,7 +200,7 @@ static void run_command(const char *cmd, int pipe_in, int pipe_out, const char *
 
     /* Handle output redirection */
     if (redir_out && redir_out[0]) {
-        long fd = syscall3(SYS_open, (long)redir_out, 0x41 /* O_WRONLY|O_CREAT */, 0644);
+        long fd = syscall3(SYS_open, (long)redir_out, 0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
         if (fd < 0) {
             print("sh: cannot open ");
             print(redir_out);
@@ -375,8 +389,8 @@ static int execute_pipeline(const char *line) {
 
         /* Create pipe for all but the last command */
         if (!is_last) {
-            /* pipe syscall: returns [read_fd, write_fd] via two longs on stack */
-            long pfd[2];
+            /* pipe syscall writes two 32-bit fds (8 bytes total) */
+            int pfd[2];
             pfd[0] = -1;
             pfd[1] = -1;
             long ret = syscall3(SYS_pipe, (long)pfd, 0, 0);
@@ -384,8 +398,8 @@ static int execute_pipeline(const char *line) {
                 print("sh: pipe failed\n");
                 return -1;
             }
-            pipefd[0] = (int)pfd[0];
-            pipefd[1] = (int)pfd[1];
+            pipefd[0] = pfd[0];
+            pipefd[1] = pfd[1];
         }
 
         long pid = syscall0(SYS_fork);
@@ -430,7 +444,8 @@ static int execute_pipeline(const char *line) {
 }
 
 void _start(void) {
-    syscall3(SYS_sigaction, SIGINT, SIG_IGN, 0);
+    struct ksigaction ign = { (void (*)(int))SIG_IGN, 0, 0, 0 };
+    syscall3(SYS_sigaction, SIGINT, (long)&ign, 0);
 
     print("MoQiOS shell\n");
 

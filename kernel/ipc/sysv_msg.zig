@@ -2,6 +2,7 @@
 ///
 /// Completes the SysV IPC trilogy alongside sysv_shm.zig and sysv_sem.zig.
 /// Used by legacy applications and some message-passing architectures.
+const std = @import("std");
 const serial = @import("../arch/arch.zig").serial;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const fmt = @import("../lib/fmt.zig");
@@ -186,15 +187,27 @@ pub fn msgrcv(msqid: u32, msgp: u64, msgsz: u64, msgtyp: i64, msgflg: i32) i64 {
     // Find matching message by type
     // msgtyp == 0: first message
     // msgtyp > 0: first message with that type
-    // msgtyp < 0: first message with lowest type <= |msgtyp|
+    // msgtyp < 0: message with the LOWEST type <= |msgtyp|
+    // Typed receives free middle slots, leaving holes in the ring — scan all
+    // MAX_MSGS_PER_Q slots and skip !used ones in every path (q.count only
+    // tracks how many slots are used, not where they are).
     var found_idx: ?u32 = null;
 
     if (msgtyp == 0) {
-        // First available message
-        found_idx = q.head;
-    } else {
+        // First used message starting from head
         var i: u32 = 0;
-        while (i < q.count) : (i += 1) {
+        while (i < MAX_MSGS_PER_Q) : (i += 1) {
+            const idx = (q.head + i) % MAX_MSGS_PER_Q;
+            if (q.msgs[idx].used) {
+                found_idx = idx;
+                break;
+            }
+        }
+    } else {
+        // |msgtyp| — minInt(i64) has no positive counterpart; clamp to maxInt
+        const abs_type: i64 = if (msgtyp == std.math.minInt(i64)) std.math.maxInt(i64) else -msgtyp;
+        var i: u32 = 0;
+        while (i < MAX_MSGS_PER_Q) : (i += 1) {
             const idx = (q.head + i) % MAX_MSGS_PER_Q;
             const msg = &q.msgs[idx];
             if (!msg.used) continue;
@@ -202,9 +215,11 @@ pub fn msgrcv(msqid: u32, msgp: u64, msgsz: u64, msgtyp: i64, msgflg: i32) i64 {
                 found_idx = idx;
                 break;
             }
-            if (msgtyp < 0 and msg.mtype <= @as(i64, @intCast(@as(u64, @bitCast(-msgtyp))))) {
-                found_idx = idx;
-                break;
+            if (msgtyp < 0 and msg.mtype <= abs_type) {
+                // Keep scanning: must pick the lowest type, not the first match
+                if (found_idx == null or msg.mtype < q.msgs[found_idx.?].mtype) {
+                    found_idx = idx;
+                }
             }
         }
     }

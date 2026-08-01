@@ -222,14 +222,13 @@ pub fn destroyEndpoint(ep: EndpointId) void {
     const flags = ipc_lock.acquire();
     defer ipc_lock.release(flags);
 
-    // Unblock any tasks waiting on this endpoint
+    // Unblock any tasks waiting on this endpoint (unblockTask also
+    // re-enqueues them — a bare state = .ready starves the task)
     if (endpoints[ep].waiting_sender) |sender_idx| {
-        const t = task.getTask(sender_idx) orelse return;
-        t.state = .ready;
+        task.unblockTask(sender_idx);
     }
     if (endpoints[ep].waiting_receiver) |recv_idx| {
-        const t = task.getTask(recv_idx) orelse return;
-        t.state = .ready;
+        task.unblockTask(recv_idx);
     }
     endpoints[ep].active = false;
     endpoints[ep].owner_task_idx = null;
@@ -257,18 +256,29 @@ pub fn send(target_ep: EndpointId, msg: *const Message) IpcError {
 
     // v53.44: SMP-safe endpoint access
     const flags = ipc_lock.acquire();
-    defer ipc_lock.release(flags);
 
-    if (!endpoints[target_ep].active) return .invalid_endpoint;
-    const sender_ep = findEndpointForTask(sender_idx) orelse return .not_ready;
+    if (!endpoints[target_ep].active) {
+        ipc_lock.release(flags);
+        return .invalid_endpoint;
+    }
+    const sender_ep = findEndpointForTask(sender_idx) orelse {
+        ipc_lock.release(flags);
+        return .not_ready;
+    };
 
     // Check for self-send deadlock
     if (endpoints[target_ep].owner_task_idx) |owner| {
-        if (owner == sender_idx) return .would_deadlock;
+        if (owner == sender_idx) {
+            ipc_lock.release(flags);
+            return .would_deadlock;
+        }
     }
 
     // Check for circular wait deadlock
-    if (checkCircularWait(sender_idx, target_ep)) return .would_deadlock;
+    if (checkCircularWait(sender_idx, target_ep)) {
+        ipc_lock.release(flags);
+        return .would_deadlock;
+    }
 
     // Copy message with sender info
     var out_msg: Message = msg.*;
@@ -276,23 +286,37 @@ pub fn send(target_ep: EndpointId, msg: *const Message) IpcError {
 
     if (endpoints[target_ep].waiting_receiver) |recv_idx| {
         // Receiver is already waiting — deliver immediately
-        const recv_task = task.getTask(recv_idx) orelse return .not_ready;
+        _ = task.getTask(recv_idx) orelse {
+            ipc_lock.release(flags);
+            return .not_ready;
+        };
 
         endpoints[target_ep].pending_msg = out_msg;
 
-        // Wake up receiver
-        recv_task.state = .ready;
+        // Wake up receiver — unblockTask re-enqueues it; a bare
+        // state = .ready leaves it out of every run queue (starvation).
+        task.unblockTask(recv_idx);
         endpoints[target_ep].waiting_receiver = null;
         task_ipc_state[recv_idx].blocked_on = 0;
-    } else {
-        // No receiver waiting — block the sender
-        const sender_task = task.getTask(sender_idx) orelse return .not_ready;
-        endpoints[target_ep].waiting_sender = sender_idx;
-        endpoints[target_ep].pending_msg = out_msg;
-        sender_task.state = .blocked;
-        task_ipc_state[sender_idx].blocked_on = target_ep;
+        ipc_lock.release(flags);
+        return .success;
     }
 
+    // No receiver waiting — block the sender
+    const sender_task = task.getTask(sender_idx) orelse {
+        ipc_lock.release(flags);
+        return .not_ready;
+    };
+    endpoints[target_ep].waiting_sender = sender_idx;
+    endpoints[target_ep].pending_msg = out_msg;
+    sender_task.state = .blocked;
+    task_ipc_state[sender_idx].blocked_on = target_ep;
+    ipc_lock.release(flags);
+
+    // Actually yield the CPU — marking the task .blocked without rescheduling
+    // leaves a running task flagged blocked. Lock must be released first
+    // (same pattern as receive()).
+    sched.forceReschedule();
     return .success;
 }
 
@@ -321,12 +345,12 @@ pub fn receive(ep: EndpointId, buf: *Message) IpcError {
             endpoints[ep].pending_msg = null;
         }
 
-        // Wake up sender
-        const sender_task = task.getTask(sender_idx) orelse {
+        // Wake up sender — unblockTask re-enqueues it (bare .ready starves)
+        _ = task.getTask(sender_idx) orelse {
             ipc_lock.release(flags);
             return .not_ready;
         };
-        sender_task.state = .ready;
+        task.unblockTask(sender_idx);
         endpoints[ep].waiting_sender = null;
         ipc_lock.release(flags);
         return .success;
@@ -344,7 +368,7 @@ pub fn receive(ep: EndpointId, buf: *Message) IpcError {
     // Force context switch — must release lock first to avoid deadlock
     sched.forceReschedule();
 
-    // Resumed after send() delivered message and set state = .ready
+    // Resumed after send() delivered the message and unblocked us
     const flags2 = ipc_lock.acquire();
     if (endpoints[ep].pending_msg) |msg| {
         buf.* = msg;
@@ -390,6 +414,10 @@ pub fn call(target_ep: EndpointId, msg: *Message) IpcError {
     caller_task.state = .blocked;
     task_ipc_state[caller_idx].blocked_on = target_ep;
 
+    // Actually yield the CPU — marking the task .blocked without rescheduling
+    // leaves a running task flagged blocked. No lock is held here.
+    sched.forceReschedule();
+
     return .success;
 }
 
@@ -406,8 +434,9 @@ pub fn reply(caller_ep: EndpointId, reply_msg: *const Message) IpcError {
 
     // Unblock the caller
     if (endpoints[caller_ep].owner_task_idx) |owner_idx| {
-        const owner_task = task.getTask(owner_idx) orelse return .not_ready;
-        owner_task.state = .ready;
+        _ = task.getTask(owner_idx) orelse return .not_ready;
+        // unblockTask re-enqueues the caller (bare .ready starves)
+        task.unblockTask(owner_idx);
 
         // Decrement call depth
         if (task_ipc_state[owner_idx].call_depth > 0) {
@@ -436,8 +465,9 @@ pub fn notify(target_ep: EndpointId, bits: NotifyBitmap) IpcError {
 
     // If receiver is blocked on this endpoint, wake it
     if (endpoints[target_ep].waiting_receiver) |recv_idx| {
-        const recv_task = task.getTask(recv_idx) orelse return .not_ready;
-        recv_task.state = .ready;
+        _ = task.getTask(recv_idx) orelse return .not_ready;
+        // unblockTask re-enqueues the receiver (bare .ready starves)
+        task.unblockTask(recv_idx);
         endpoints[target_ep].waiting_receiver = null;
     }
 

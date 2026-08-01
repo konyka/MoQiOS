@@ -17,6 +17,7 @@
 ///   Bits 52-62: reserved
 ///   Bit 63:    NX (no-execute, preserved)
 const serial = @import("../arch/arch.zig").serial;
+const tlb = @import("../arch/arch.zig").tlb;
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const idt = @import("../arch/arch.zig").interrupts;
@@ -156,14 +157,14 @@ pub fn swapOut(pml4_phys: u64, virt_addr: u64, pte_ptr: *u64) bool {
     const cow_bit = if ((pte & (1 << 9)) != 0) @as(u64, 1 << 3) else @as(u64, 0);
     pte_ptr.* = swap_pte | nx_bit | writable_bit | cow_bit;
 
+    // Cross-CPU shootdown BEFORE releasing the frame: tasks sharing this page
+    // table (CLONE_VM) on remote CPUs would otherwise keep stale TLB entries
+    // into freed memory. Mirrors the collect→shootdown→free ordering in
+    // unmapRange.
+    tlb.shootdownRange(virt_addr, 1);
+
     // Free the physical page
     pmm.freePage(phys_addr);
-
-    // Flush TLB for this address
-    asm volatile ("invlpg (%[addr])"
-        :
-        : [addr] "r" (virt_addr),
-    );
 
     return true;
 }

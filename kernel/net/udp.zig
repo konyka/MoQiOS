@@ -65,6 +65,43 @@ pub fn ensurePort(port: u16) u16 {
     return @intCast(idx);
 }
 
+/// Register `port` only when no socket owns it yet. Returns the new slot
+/// index, 0xFFFE when the port is already registered, 0xFFFF when full.
+pub fn ensurePortExclusive(port: u16) u16 {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+
+    for (0..num_ports) |i| {
+        if (ports[i] == port) return 0xFFFE;
+    }
+
+    if (num_ports >= MAX_PORTS) return 0xFFFF;
+    const idx = num_ports;
+    ports[idx] = port;
+    num_ports += 1;
+    return @intCast(idx);
+}
+
+/// Deregister `port`, freeing its slot and dropping any queued datagrams.
+/// Swap-remove keeps slots dense; each queue travels with its port.
+pub fn releasePort(port: u16) void {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+
+    for (0..num_ports) |i| {
+        if (ports[i] == port) {
+            num_ports -= 1;
+            ports[i] = ports[num_ports];
+            queues[i] = queues[num_ports];
+            ports[num_ports] = 0;
+            // Invalidate the vacated tail so a future registration on that
+            // slot never delivers stale datagrams to a new owner.
+            for (0..QUEUE_DEPTH) |j| queues[num_ports][j].valid = false;
+            return;
+        }
+    }
+}
+
 fn enqueue(port_idx: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, payload: []const u8, is_v6: bool) void {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
@@ -85,8 +122,17 @@ fn enqueue(port_idx: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, payload:
     // Queue full - packet dropped (no accounting yet)
 }
 
-pub fn handlePacket(src_ip: [4]u8, _: [4]u8, data: [*]const u8, len: u32) void {
+pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) void {
     const hdr = udp_util.parseHeader(data, len) orelse return;
+
+    // RFC 768: checksum 0 means "no checksum" for IPv4 UDP; verify when present.
+    const wire_csum = bo.readU16BeAt(data, 6);
+    if (wire_csum != 0) {
+        if (hdr.udp_len < udp_util.HEADER_LEN or hdr.udp_len > len) return;
+        const expect = udp_util.checksumV4(src_ip, dst_ip, data, hdr.udp_len);
+        if (wire_csum != expect) return;
+    }
+
     const port_idx = findPortIdx(hdr.dst_port) orelse return;
     const actual_payload = @min(hdr.payload_len, @as(u16, MAX_UDP_PAYLOAD));
     if (8 + actual_payload > len) return;
@@ -153,8 +199,6 @@ pub fn recvFromV6(port: u16, out_buf: [*]u8, out_src_ip: *[16]u8, out_src_port: 
     return 0;
 }
 
-var send_pkt: [1518]u8 = @splat(0);
-
 pub fn sendTo(dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, data_len: u16) bool {
     if (data_len > MAX_UDP_PAYLOAD) return false;
 
@@ -168,6 +212,9 @@ pub fn sendTo(dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, da
     const udp_total: u16 = 8 + data_len;
     // SK-101/105: honor Path MTU (or armed oversized raise probe).
     if (ipv4.HEADER_LEN + udp_total > ipv4.getSendMtu(dst_ip)) return false;
+
+    // Stack-local frame buffer: concurrent sends on other CPUs must not tear it.
+    var send_pkt: [1518]u8 = @splat(0);
 
     // Build UDP header at offset 34 (14 eth + 20 ipv4)
     bo.writeU16BeAt(&send_pkt, 34, src_port);
@@ -206,6 +253,9 @@ pub fn sendToV6(dst_ip: [16]u8, dst_port: u16, src_port: u16, data: [*]const u8,
     const udp_total: u16 = 8 + data_len;
     // SK-97/105: honor Path MTU (or armed oversized raise probe).
     if (ipv6.HEADER_LEN + udp_total > ipv6.getSendMtu(dst_ip)) return false;
+
+    // Stack-local frame buffer: concurrent sends on other CPUs must not tear it.
+    var send_pkt: [1518]u8 = @splat(0);
 
     // Offsets: eth 14 + ipv6 40 → UDP at 54.
     const udp_off: u16 = 14 + ipv6.HEADER_LEN;

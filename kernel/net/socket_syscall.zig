@@ -68,7 +68,10 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
             const idx = udp.ensurePort(port);
             if (idx != 0xFFFF) {
                 // v53.49: Use allocFd() O(1) bitmap instead of duplicated linear scan
-                const fd_slot = t.fd_table.allocFd() orelse return -24; // EMFILE
+                const fd_slot = t.fd_table.allocFd() orelse {
+                    udp.releasePort(port); // roll back the port registration
+                    return -24; // EMFILE
+                };
                 t.fd_table.fds[fd_slot] = .{
                     .fd_type = .udp_socket,
                     .udp_port = port,
@@ -103,7 +106,10 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
             while (port6 < 65535) : (port6 += 1) {
                 const idx6 = udp.ensurePort(port6);
                 if (idx6 != 0xFFFF) {
-                    const fd_slot6 = t.fd_table.allocFd() orelse return -24; // EMFILE
+                    const fd_slot6 = t.fd_table.allocFd() orelse {
+                        udp.releasePort(port6); // roll back the port registration
+                        return -24; // EMFILE
+                    };
                     t.fd_table.fds[fd_slot6] = .{
                         .fd_type = .udp_socket,
                         .udp_port = port6,
@@ -179,9 +185,14 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
             const n = copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN);
             if (n < sa.SOCKADDR_IN6_LEN) return -22; // EINVAL
             const parsed = sa.parseInet6(&sa6) orelse return -97; // EAFNOSUPPORT
-            const idx = udp.ensurePort(parsed.port);
-            if (idx == 0xFFFF) return -98; // EADDRINUSE
-            t.fd_table.fds[fd].udp_port = parsed.port;
+            const cur_port = t.fd_table.fds[fd].udp_port;
+            if (parsed.port != cur_port) {
+                // EADDRINUSE when another socket owns the port (0xFFFE) or the
+                // port table is full (0xFFFF).
+                if (udp.ensurePortExclusive(parsed.port) >= 0xFFFE) return -98;
+                udp.releasePort(cur_port); // drop the ephemeral port from socket()
+                t.fd_table.fds[fd].udp_port = parsed.port;
+            }
             return 0;
         }
         if (addr_len < SOCKADDR_IN_MIN_LEN) return -22;
@@ -190,9 +201,14 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         if (n4 < SOCKADDR_IN_MIN_LEN) return -22;
         // Accept legacy callers that only filled port+addr; family may be unset.
         const new_port = bo.readU16BeAt(&sock_addr, 2);
-        const idx = udp.ensurePort(new_port);
-        if (idx == 0xFFFF) return -98; // EADDRINUSE
-        t.fd_table.fds[fd].udp_port = new_port;
+        const cur_port = t.fd_table.fds[fd].udp_port;
+        if (new_port != cur_port) {
+            // EADDRINUSE when another socket owns the port (0xFFFE) or the
+            // port table is full (0xFFFF).
+            if (udp.ensurePortExclusive(new_port) >= 0xFFFE) return -98;
+            udp.releasePort(cur_port); // drop the ephemeral port from socket()
+            t.fd_table.fds[fd].udp_port = new_port;
+        }
         return 0;
     }
 
@@ -258,7 +274,8 @@ pub fn accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) i64 {
     if (t.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
     const listen_tcb_idx = t.fd_table.fds[fd].tcb_idx;
     const new_tcb_idx = net_mod.tcp.tcpAccept(listen_tcb_idx, cur_idx);
-    if (new_tcb_idx <= 0) return new_tcb_idx;
+    // Negative only on error/empty backlog (-11 EAGAIN); TCB index 0 is valid.
+    if (new_tcb_idx < 0) return new_tcb_idx;
     const new_fd = allocTcpFd(&t.fd_table, @intCast(new_tcb_idx));
     if (new_fd < 0) {
         _ = net_mod.tcp.tcpClose(@intCast(new_tcb_idx));

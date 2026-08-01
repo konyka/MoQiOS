@@ -6,6 +6,8 @@
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const idt = @import("../arch/arch.zig").interrupts;
 const copy = @import("../mm/copy_from_user.zig");
+const sched_mod = @import("../proc/sched.zig");
+const task_mod = @import("../proc/task.zig");
 
 const MAX_TIMERS: u32 = 16;
 const TICKS_PER_SEC: u64 = 100;
@@ -54,6 +56,9 @@ const PosixTimer = struct {
     overrun: u64 = 0,
     sigev_signo: i32 = 0,
     sigev_notify: i32 = SIGEV_NONE,
+    /// Task that created the timer — signals go here, not to the task
+    /// that happens to be running when the tick fires.
+    owner_task_idx: ?u32 = null,
 };
 
 // Global pool
@@ -122,13 +127,17 @@ pub fn timerCreate(clockid: u32, sigev_ptr: u64, timerid_ptr: u64) i64 {
                 .overrun = 0,
                 .sigev_signo = sigev_signo,
                 .sigev_notify = sigev_notify,
+                .owner_task_idx = sched_mod.currentTaskIndex(),
             };
             // Write timer ID to user space
             const id: i32 = @intCast(i);
             const id_bytes: [4]u8 = @bitCast(id);
             if (timerid_ptr != 0 and timerid_ptr < 0x0000_8000_0000_0000) {
                 const written = copy.copyToUser(@ptrFromInt(timerid_ptr), &id_bytes, 4);
-                if (written != 4) return EFAULT;
+                if (written != 4) {
+                    t.* = .{}; // roll back the slot on failure
+                    return EFAULT;
+                }
             }
             return 0;
         }
@@ -299,12 +308,12 @@ pub fn timerTick(current_tick: u64) void {
             }
 
             // Simplified signal delivery: if SIGEV_SIGNAL, queue the signal
+            // to the timer's owner (recorded at timer_create) — not to
+            // whatever task happens to be running when the tick fires.
             if (t.sigev_notify == SIGEV_SIGNAL and t.sigev_signo > 0 and t.sigev_signo < 32) {
-                const sched_mod = @import("../proc/sched.zig");
-                const task_mod = @import("../proc/task.zig");
-                if (sched_mod.currentTaskIndex()) |ci| {
-                    if (task_mod.getTask(ci)) |cur| {
-                        cur.pending_signals |= @as(u32, 1) << @as(u5, @intCast(t.sigev_signo));
+                if (t.owner_task_idx) |owner_idx| {
+                    if (task_mod.getTask(owner_idx)) |owner| {
+                        owner.pending_signals |= @as(u32, 1) << @as(u5, @intCast(t.sigev_signo));
                     }
                 }
             }

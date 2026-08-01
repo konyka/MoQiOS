@@ -6,6 +6,7 @@ const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const bo = @import("../lib/byte_order.zig");
 
+const EBADF: i64 = -9;
 const EFAULT: i64 = 14;
 
 /// readv(fd, iov_ptr, iovcnt) -> bytes read or -errno.
@@ -99,9 +100,10 @@ pub fn preadv(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    const orig_offset = cur.fd_table.fds[fd].offset;
-    cur.fd_table.fds[fd].offset = pos_l;
+    // Validate untrusted fd number before indexing the descriptor array.
+    if (fd >= cur.fd_table.fds.len or cur.fd_table.fds[fd].fd_type == .none) return EBADF;
 
+    var current_offset = pos_l;
     var total: usize = 0;
     for (0..iovcnt) |i| {
         var iov_buf: [16]u8 = undefined;
@@ -120,23 +122,18 @@ pub fn preadv(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64) i64 {
             const chunk = @min(n - pos, 4096);
             var kbuf: [4096]u8 = undefined;
             if (!copy.validateUserBufferWritable(iov_base + pos, chunk)) {
-                if (total == 0 and pos == 0) {
-                    cur.fd_table.fds[fd].offset = orig_offset;
-                    return -EFAULT;
-                }
+                if (total == 0 and pos == 0) return -EFAULT;
                 break;
             }
-            const result = cur.fd_table.read(fd, &kbuf, chunk);
+            const result = cur.fd_table.readAtOffset(fd, &kbuf, chunk, current_offset);
             if (result <= 0) {
-                if (total == 0 and pos == 0) {
-                    cur.fd_table.fds[fd].offset = orig_offset;
-                    return @bitCast(result);
-                }
+                if (total == 0 and pos == 0) return @bitCast(result);
                 break;
             }
             const got: usize = @intCast(result);
             const written = copy.copyToUser(@ptrFromInt(iov_base + pos), kbuf[0..got], got);
             pos += written;
+            current_offset += written;
             if (written < got) break;
             if (got < chunk) break;
         }
@@ -144,7 +141,6 @@ pub fn preadv(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64) i64 {
         if (pos < n) break;
     }
 
-    cur.fd_table.fds[fd].offset = orig_offset;
     return @intCast(total);
 }
 
@@ -154,9 +150,10 @@ pub fn pwritev(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    const orig_offset = cur.fd_table.fds[fd].offset;
-    cur.fd_table.fds[fd].offset = pos_l;
+    // Validate untrusted fd number before indexing the descriptor array.
+    if (fd >= cur.fd_table.fds.len or cur.fd_table.fds[fd].fd_type == .none) return EBADF;
 
+    var current_offset = pos_l;
     var total: usize = 0;
     for (0..iovcnt) |i| {
         var iov_buf: [16]u8 = undefined;
@@ -176,15 +173,15 @@ pub fn pwritev(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64) i64 {
             var kbuf: [4096]u8 = undefined;
             const ucopy = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(iov_base + pos), chunk);
             if (ucopy == 0) break;
-            const result = cur.fd_table.write(fd, &kbuf, ucopy);
+            const result = cur.fd_table.writeAtOffset(fd, &kbuf, ucopy, current_offset);
             if (result <= 0) break;
             pos += @intCast(result);
+            current_offset += @intCast(result);
             if (result < @as(i64, @intCast(ucopy))) break;
         }
         total += pos;
         if (pos < n) break;
     }
 
-    cur.fd_table.fds[fd].offset = orig_offset;
     return @intCast(total);
 }

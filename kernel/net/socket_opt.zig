@@ -179,19 +179,23 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
                 if (optlen < 4) return -22;
                 var buf: [4]u8 = undefined;
                 if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
-                opts.keep_idle = bo.readU32Le(&buf);
+                // Clamp like Linux (MAX_TCP_KEEPIDLE = 32767) so the keepalive
+                // millisecond arithmetic in tcp.zig cannot overflow u32.
+                opts.keep_idle = @min(bo.readU32Le(&buf), 32767);
             },
             TCP_KEEPINTVL => {
                 if (optlen < 4) return -22;
                 var buf: [4]u8 = undefined;
                 if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
-                opts.keep_intvl = bo.readU32Le(&buf);
+                // Clamp like Linux (MAX_TCP_KEEPINTVL = 32767).
+                opts.keep_intvl = @min(bo.readU32Le(&buf), 32767);
             },
             TCP_KEEPCNT => {
                 if (optlen < 4) return -22;
                 var buf: [4]u8 = undefined;
                 if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
-                opts.keep_cnt = bo.readU32Le(&buf);
+                // Clamp like Linux (MAX_TCP_KEEPCNT = 32767).
+                opts.keep_cnt = @min(bo.readU32Le(&buf), 32767);
             },
             else => return -92, // ENOPROTOOPT
         }

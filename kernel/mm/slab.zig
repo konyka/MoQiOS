@@ -195,7 +195,16 @@ pub fn krealloc(ptr: ?*anyopaque, old_size: usize, new_size: usize) ?*anyopaque 
 }
 
 fn allocLarge(size: usize) ?*anyopaque {
-    const pages_needed = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    // The 8-byte header lives inside the returned run of pages, so count it —
+    // otherwise kmalloc(4089..4096) got one page and 8 fewer usable bytes
+    // than requested.
+    const pages_needed = (size + HEADER_ALIGNED + PAGE_SIZE - 1) / PAGE_SIZE;
+    // kfree reads the page count from the u16 _pad field; an allocation
+    // needing more than 65535 pages would leak the rest on free. Refuse it.
+    if (pages_needed > 65535) {
+        serial.writeString("[slab] allocation too large, refusing\n");
+        return null;
+    }
     if (pages_needed == 1) {
         const phys = pmm.allocPage() orelse return null;
         const base: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
@@ -216,7 +225,7 @@ fn allocLarge(size: usize) ?*anyopaque {
     const header: *SlabHeader = @ptrCast(@alignCast(base));
     header.pool_idx = LARGE_ALLOC_MARKER;
     // Store page count in _pad field for freeing
-    header._pad = @intCast(@min(pages_needed, 65535));
+    header._pad = @intCast(pages_needed);
     return @ptrFromInt(@intFromPtr(base) + HEADER_ALIGNED);
 }
 

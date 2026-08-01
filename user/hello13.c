@@ -60,12 +60,12 @@ void _start(void) {
     }
 
     print("hello13: step 2 - fork\n");
+    long parent_pid = syscall1(SYS_getpid, 0);
     long pid = syscall1(SYS_fork, 0);
 
     if (pid == 0) {
-        long ppid = syscall1(SYS_getpid, 0) - 1;
         print("hello13: child sending SIGUSR1 to parent\n");
-        syscall2(SYS_kill, ppid, 10);
+        syscall2(SYS_kill, parent_pid, 10);
         print("hello13: child exiting\n");
         syscall3(SYS_exit, 0, 0, 0);
     } else {

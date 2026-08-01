@@ -710,7 +710,13 @@ fn handleCowFault(frame: *InterruptFrame, fault_addr: u64) bool {
     // Update PTE: point to new page, make writable, clear COW bit
     const updated_pte = (pte_val & ~paging_mod.ADDR_MASK & ~@as(u64, COW_BIT)) | new_phys | paging_mod.WRITABLE;
     paging_mod.setPageEntryRaw(current.page_table_phys, page_addr, updated_pte);
-    paging_mod.invlpg(page_addr);
+
+    // Cross-CPU shootdown BEFORE dropping our reference: CLONE_VM threads on
+    // other CPUs share this page table and would otherwise keep stale TLB
+    // entries into the old frame. Mirrors the shootdown→free ordering in
+    // unmapRange.
+    const tlb_mod = @import("tlb.zig");
+    tlb_mod.shootdownRange(page_addr, 1);
 
     // Release our reference to the old shared page (other owner still holds it).
     _ = pmm_mod.decRef(old_phys);

@@ -698,18 +698,30 @@ pub fn createFile(name: []const u8) i64 {
         while (suffix <= 9) : (suffix += 1) {
             fat_util.make83Alias(name, suffix, &short_name);
             if (!shortNameTakenInRoot(&short_name)) break;
-            if (suffix == 9) return -1;
+            if (suffix == 9) {
+                setFATEntry(new_cluster, 0);
+                return -1;
+            }
         }
-        lfn_count = fat_util.buildLfnEntries(name, &short_name, lfn_slots[0..]) orelse return -1;
+        lfn_count = fat_util.buildLfnEntries(name, &short_name, lfn_slots[0..]) orelse {
+            setFATEntry(new_cluster, 0);
+            return -1;
+        };
     }
 
     const need = lfn_count + 1;
     var place = findFreeRunInRoot(need);
     if (place == null) {
-        if (!growRootDir()) return -1;
+        if (!growRootDir()) {
+            setFATEntry(new_cluster, 0);
+            return -1;
+        }
         place = findFreeRunInRoot(need);
     }
-    const dest = place orelse return -1;
+    const dest = place orelse {
+        setFATEntry(new_cluster, 0);
+        return -1;
+    };
 
     // Pack LFN slots + short entry into one contiguous write run.
     var write_slots: [fat_util.MAX_LFN_SLOTS + 1][32]u8 = undefined;
@@ -723,7 +735,10 @@ pub fn createFile(name: []const u8) i64 {
     fat_util.setDirEntrySize(&short_ent, 0);
     write_slots[lfn_count] = short_ent;
 
-    if (!writeRootEntryRun(dest, write_slots[0 .. need])) return -1;
+    if (!writeRootEntryRun(dest, write_slots[0 .. need])) {
+        setFATEntry(new_cluster, 0);
+        return -1;
+    }
 
     var fi = FileInfo{
         .name = @splat(0),
@@ -888,23 +903,34 @@ fn updateDirEntry(file_idx: u32) void {
     if (file_idx >= file_count) return;
     const fi = files[file_idx];
 
-    const root_lba = clusterToLBA(fat32_root_cluster);
+    // Walk the full root cluster chain — createFile places entries anywhere
+    // in the chain via findFreeRunInRoot, not only in the first sector.
     const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
-    _ = virtio_blk.readSectors(root_lba, 1, buf);
+    var cluster: u32 = fat32_root_cluster;
+    var safety: u32 = 0;
+    scan: while (cluster >= 2 and cluster < 0x0FFFFFF8 and safety < 65536) : (safety += 1) {
+        const base_lba = clusterToLBA(cluster);
+        var sec: u32 = 0;
+        while (sec < fat32_sectors_per_cluster) : (sec += 1) {
+            const lba = base_lba + sec;
+            if (virtio_blk.readSectors(lba, 1, buf) <= 0) break :scan;
 
-    for (0..16) |i| {
-        const off: u32 = @intCast(i * 32);
-        if (buf[off] == 0x00) break;
-        if (buf[off] == 0xE5) continue;
-        const attr = buf[off + 11];
-        if (fat_util.isLfnAttr(attr) or fat_util.isVolumeLabelAttr(attr)) continue;
+            for (0..16) |i| {
+                const off: u32 = @intCast(i * 32);
+                if (buf[off] == 0x00) break :scan;
+                if (buf[off] == 0xE5) continue;
+                const attr = buf[off + 11];
+                if (fat_util.isLfnAttr(attr) or fat_util.isVolumeLabelAttr(attr)) continue;
 
-        const entry = buf + off;
-        if (fat_util.dirEntryFirstCluster(entry) == fi.first_cluster) {
-            fat_util.setDirEntrySize(entry, fi.size);
-            _ = safeWriteSectors(root_lba, 1, buf);
-            return;
+                const entry = buf + off;
+                if (fat_util.dirEntryFirstCluster(entry) == fi.first_cluster) {
+                    fat_util.setDirEntrySize(entry, fi.size);
+                    _ = safeWriteSectors(lba, 1, buf);
+                    return;
+                }
+            }
         }
+        cluster = getFATEntry(cluster);
     }
 }
 
@@ -913,23 +939,34 @@ pub fn deleteFile(file_idx: u32) bool {
     const fi = files[file_idx];
 
     // Mark directory entry as deleted (0xE5)
-    const root_lba = clusterToLBA(fat32_root_cluster);
+    // Walk the full root cluster chain — createFile places entries anywhere
+    // in the chain via findFreeRunInRoot, not only in the first sector.
     const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
-    _ = virtio_blk.readSectors(root_lba, 1, buf);
+    var dir_cluster: u32 = fat32_root_cluster;
+    var dir_safety: u32 = 0;
+    scan: while (dir_cluster >= 2 and dir_cluster < 0x0FFFFFF8 and dir_safety < 65536) : (dir_safety += 1) {
+        const base_lba = clusterToLBA(dir_cluster);
+        var sec: u32 = 0;
+        while (sec < fat32_sectors_per_cluster) : (sec += 1) {
+            const lba = base_lba + sec;
+            if (virtio_blk.readSectors(lba, 1, buf) <= 0) break :scan;
 
-    for (0..16) |i| {
-        const off: u32 = @intCast(i * 32);
-        if (buf[off] == 0x00) break;
-        if (buf[off] == 0xE5) continue;
-        const attr = buf[off + 11];
-        if (fat_util.isLfnAttr(attr) or fat_util.isVolumeLabelAttr(attr)) continue;
+            for (0..16) |i| {
+                const off: u32 = @intCast(i * 32);
+                if (buf[off] == 0x00) break :scan;
+                if (buf[off] == 0xE5) continue;
+                const attr = buf[off + 11];
+                if (fat_util.isLfnAttr(attr) or fat_util.isVolumeLabelAttr(attr)) continue;
 
-        const entry = buf + off;
-        if (fat_util.dirEntryFirstCluster(entry) == fi.first_cluster) {
-            buf[off] = 0xE5;
-            _ = safeWriteSectors(root_lba, 1, buf);
-            break;
+                const entry = buf + off;
+                if (fat_util.dirEntryFirstCluster(entry) == fi.first_cluster) {
+                    buf[off] = 0xE5;
+                    _ = safeWriteSectors(lba, 1, buf);
+                    break :scan;
+                }
+            }
         }
+        dir_cluster = getFATEntry(dir_cluster);
     }
 
     // Free the cluster chain in FAT

@@ -41,6 +41,7 @@ pub const RamdiskEntry = extern struct {
 /// Parsed ramdisk state.
 const RamdiskState = struct {
     base: [*]const u8 = undefined,
+    blob_size: u64 = 0,
     file_count: u32 = 0,
     entries_off: u64 = 0,
     data_offset: u64 = 0,
@@ -78,8 +79,23 @@ pub fn init(base: [*]const u8, size: u64) bool {
         return false;
     }
 
+    // Validate every entry against the blob up front: a truncated/corrupt
+    // image must not hand findFile() an out-of-bounds data pointer later.
+    // Overflow-safe: both sides stay within the blob's data region.
+    const data_len = size - data_off;
+    for (0..file_count) |i| {
+        const entry_base = base + entries_off + @as(u64, i) * entry_size;
+        const file_off = bo.readU64Ptr(entry_base + 64);
+        const file_size = bo.readU64Ptr(entry_base + 72);
+        if (file_off > data_len or file_size > data_len - file_off) {
+            klog.log(.info, "Ramdisk entry exceeds blob size");
+            return false;
+        }
+    }
+
     state = .{
         .base = base,
+        .blob_size = size,
         .file_count = file_count,
         .entries_off = entries_off,
         .data_offset = data_off,

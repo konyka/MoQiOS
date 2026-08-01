@@ -488,6 +488,7 @@ pub const FdTable = struct {
                 return -1;
             },
             .ramdisk_file => {
+                if (desc.offset >= desc.file_size) return 0;
                 const remaining = desc.file_size - desc.offset;
                 if (remaining == 0) return 0;
                 const to_read = if (@as(u64, count) > remaining) @as(usize, @intCast(remaining)) else count;
@@ -611,6 +612,19 @@ pub const FdTable = struct {
         if (n == 0) return -28; // ENOSPC — no buffer available
         desc.offset += n;
         if (desc.offset > desc.file_size) desc.file_size = desc.offset;
+        return @intCast(n);
+    }
+
+    /// Offset-based variant of bufferedWrite: stages at `offset` without
+    /// touching the shared descriptor position, and grows file_size to cover
+    /// the write so the new data stays readable through the fd.
+    fn bufferedWriteAt(desc: *FileDescriptor, file_idx: u32, buf: [*]const u8, count: usize, offset: u64, fs_type: writeback.FsType) i64 {
+        if (count == 0) return 0;
+        const want: u32 = if (count > 0xFFFF_FFFF) 0xFFFF_FFFF else @intCast(count);
+        const n = writeback.writeBuffered(file_idx, offset, buf, want, fs_type);
+        if (n == 0) return -28; // ENOSPC — no buffer available
+        const end = offset + n;
+        if (end > desc.file_size) desc.file_size = end;
         return @intCast(n);
     }
 
@@ -750,16 +764,13 @@ pub const FdTable = struct {
             .proc_file => return -1, // proc files are read-only
             .fat32_file => {
                 if (!desc.writable) return -9; // EBADF
-                // For offset-based writes, use direct FS write to avoid offset confusion in writeback cache
-                const fat32 = @import("fat32.zig");
-                const n = fat32.writeFile(desc.fat32_file_idx, @intCast(offset), buf, @intCast(count));
-                return n;
+                // Stage through the writeback cache like write() does so that
+                // write()-then-pwrite() ordering survives a later flush.
+                return bufferedWriteAt(desc, desc.fat32_file_idx, buf, count, offset, .fat32);
             },
             .ext2_file => {
                 if (!desc.writable) return -9; // EBADF
-                const ext2 = @import("ext2.zig");
-                const n = ext2.writeFile(desc.ext2_file_idx, @intCast(offset), buf, @intCast(count));
-                return n;
+                return bufferedWriteAt(desc, desc.ext2_file_idx, buf, count, offset, .ext2);
             },
             .tmpfs_file => {
                 if (!desc.writable) return -9; // EBADF
@@ -783,6 +794,7 @@ pub const FdTable = struct {
                 .ext2_file => if (other.ext2_file_idx == desc.ext2_file_idx) return true,
                 .fat32_file => if (other.fat32_file_idx == desc.fat32_file_idx) return true,
                 .tcp_socket => if (other.tcb_idx == desc.tcb_idx) return true,
+                .udp_socket => if (other.udp_port == desc.udp_port) return true,
                 .epoll => if (other.epoll_idx == desc.epoll_idx) return true,
                 .unix_socket => if (other.unix_sock_idx == desc.unix_sock_idx) return true,
                 .timerfd => if (other.timerfd_idx == desc.timerfd_idx) return true,
@@ -828,6 +840,10 @@ pub const FdTable = struct {
         if (desc.fd_type == .tcp_socket) {
             const tcp = @import("../net/tcp.zig");
             _ = tcp.tcpClose(desc.tcb_idx);
+        }
+        if (desc.fd_type == .udp_socket) {
+            const udp = @import("../net/udp.zig");
+            udp.releasePort(desc.udp_port);
         }
         if (desc.fd_type == .epoll) {
             const epoll_mod = @import("../net/epoll.zig");

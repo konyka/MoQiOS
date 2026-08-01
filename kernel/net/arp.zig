@@ -2,6 +2,7 @@ const nic = @import("nic.zig");
 const netif = @import("netif.zig");
 const eth = @import("eth.zig");
 const bo = @import("../lib/byte_order.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 const MAX_ARP_ENTRIES: usize = 16;
 
@@ -12,8 +13,12 @@ const ArpEntry = struct {
 };
 
 var cache: [MAX_ARP_ENTRIES]ArpEntry = @splat(.{ .ip = @splat(0), .mac = @splat(0), .valid = false });
+// addToCache runs in IRQ context while resolve runs from syscall context.
+var arp_lock: IrqSpinlock = .{};
 
 pub fn init() void {
+    const saved = arp_lock.acquire();
+    defer arp_lock.release(saved);
     for (0..MAX_ARP_ENTRIES) |i| {
         cache[i].valid = false;
     }
@@ -45,6 +50,8 @@ pub fn handlePacket(data: [*]const u8, len: u32) void {
 }
 
 pub fn resolve(ip: [4]u8) ?[6]u8 {
+    const saved = arp_lock.acquire();
+    defer arp_lock.release(saved);
     for (0..MAX_ARP_ENTRIES) |i| {
         if (cache[i].valid and @as(u32, @bitCast(cache[i].ip)) == @as(u32, @bitCast(ip))) {
             return cache[i].mac;
@@ -82,6 +89,8 @@ pub fn sendArpRequest(target_ip: [4]u8) void {
 }
 
 fn addToCache(ip: [4]u8, mac: [6]u8) void {
+    const saved = arp_lock.acquire();
+    defer arp_lock.release(saved);
     // Update existing entry
     for (0..MAX_ARP_ENTRIES) |i| {
         if (cache[i].valid and @as(u32, @bitCast(cache[i].ip)) == @as(u32, @bitCast(ip))) {

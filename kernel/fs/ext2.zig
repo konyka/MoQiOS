@@ -1885,10 +1885,14 @@ pub fn createFile(name: []const u8) i64 {
     new_inode.size = 0;
     new_inode.block = @splat(0);
 
-    if (!writeInode(new_inode_num, &new_inode)) return -1;
+    if (!writeInode(new_inode_num, &new_inode)) {
+        freeInode(new_inode_num);
+        return -1;
+    }
 
     // Add directory entry to parent directory
     if (!addDirEntry(parent_inode_num, new_inode_num, filename, 1)) { // file_type=1 (regular file)
+        freeInode(new_inode_num);
         return -1;
     }
 
@@ -1975,7 +1979,10 @@ fn addDirEntry(dir_inode_num: u32, target_inode: u32, entry_name: []const u8, fi
 
     // Add block to directory inode
     const next_logical = dir_size / block_size;
-    if (next_logical >= EXT2_INODE_DIRECT) return false; // only direct blocks for dirs
+    if (next_logical >= EXT2_INODE_DIRECT) { // only direct blocks for dirs
+        freeBlock(new_block);
+        return false;
+    }
     dir_inode.block[next_logical] = new_block;
     dir_inode.blocks += block_size / 512;
     dir_inode.size += block_size;
@@ -1989,7 +1996,10 @@ fn addDirEntry(dir_inode_num: u32, target_inode: u32, entry_name: []const u8, fi
     new_entry.file_type = file_type;
     @memcpy(buf[@sizeOf(Ext2DirEntry) .. @sizeOf(Ext2DirEntry) + entry_name.len], entry_name);
 
-    if (!writeBlock(new_block, buf)) return false;
+    if (!writeBlock(new_block, buf)) {
+        freeBlock(new_block);
+        return false;
+    }
     return writeInode(dir_inode_num, &dir_inode);
 }
 

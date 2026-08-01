@@ -209,9 +209,14 @@ pub fn unmapPage(pml4_phys: u64, virt: u64) ?u64 {
 
     const pdpt: *PageTable = hhdm.physToPtr(PageTable, pml4.entries[pml4_idx].getPhysAddr());
     if (!pdpt.entries[pdpt_idx].present) return null;
+    // A huge-page entry is a data frame, NOT a next-level page table —
+    // descending would treat RAM data as a page table and free arbitrary
+    // physical memory. Refuse, like isPageMapped/getPageEntry do.
+    if (pdpt.entries[pdpt_idx].huge_page) return null; // 1GB page
 
     const pd: *PageTable = hhdm.physToPtr(PageTable, pdpt.entries[pdpt_idx].getPhysAddr());
     if (!pd.entries[pd_idx].present) return null;
+    if (pd.entries[pd_idx].huge_page) return null; // 2MB page
 
     const pt: *PageTable = hhdm.physToPtr(PageTable, pd.entries[pd_idx].getPhysAddr());
     if (!pt.entries[pt_idx].present) return null;
@@ -344,6 +349,7 @@ pub fn enumerateVMAs(pml4_phys: u64, out: []VMAEntry) u32 {
     const pml4: *PageTable = hhdm_mod.physToPtr(PageTable, pml4_phys);
     var count: u32 = 0;
     var cur_start: u64 = 0;
+    var cur_end: u64 = 0; // exclusive end of the open range
     var cur_flags: u8 = 0;
     var in_range = false;
 
@@ -386,14 +392,15 @@ pub fn enumerateVMAs(pml4_phys: u64, out: []VMAEntry) u32 {
                     var f: u8 = 1; // readable
                     if (pd.entries[pd_i].writable) f |= 2;
                     if (!pd.entries[pd_i].no_execute) f |= 4;
-                    if (in_range and f == cur_flags) {
-                        // extend range
+                    if (in_range and f == cur_flags and addr == cur_end) {
+                        cur_end = addr + 0x20_0000; // extend range by the 2MB page
                     } else {
                         if (in_range and count < out.len) {
                             out[count] = .{ .start = cur_start, .end = addr, .flags = cur_flags };
                             count += 1;
                         }
                         cur_start = addr;
+                        cur_end = addr + 0x20_0000;
                         cur_flags = f;
                         in_range = true;
                     }
@@ -414,15 +421,15 @@ pub fn enumerateVMAs(pml4_phys: u64, out: []VMAEntry) u32 {
                     var f: u8 = 1; // readable
                     if (pt.entries[pt_i].writable) f |= 2;
                     if (!pt.entries[pt_i].no_execute) f |= 4;
-                    if (in_range and f == cur_flags and addr == cur_start + (count * 0)) {
-                        // continue range (approximate: just check adjacency by addr)
-                        // For simplicity, merge adjacent pages with same flags
+                    if (in_range and f == cur_flags and addr == cur_end) {
+                        cur_end = addr + 0x1000; // merge adjacent pages with same flags
                     } else {
                         if (in_range and count < out.len) {
                             out[count] = .{ .start = cur_start, .end = addr, .flags = cur_flags };
                             count += 1;
                         }
                         cur_start = addr;
+                        cur_end = addr + 0x1000;
                         cur_flags = f;
                         in_range = true;
                     }
@@ -432,7 +439,7 @@ pub fn enumerateVMAs(pml4_phys: u64, out: []VMAEntry) u32 {
     }
     // Close final range
     if (in_range and count < out.len) {
-        out[count] = .{ .start = cur_start, .end = cur_start + 0x1000, .flags = cur_flags };
+        out[count] = .{ .start = cur_start, .end = cur_end, .flags = cur_flags };
         count += 1;
     }
     return count;

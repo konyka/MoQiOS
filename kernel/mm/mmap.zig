@@ -319,12 +319,20 @@ fn moveMapping(task: *task_mod.Task, region: *task_mod.MmapRegion, new_base: u64
 
 fn moveOrNoMem(task: *task_mod.Task, region: *task_mod.MmapRegion, old_pages: u64, new_pages: u64, mflags: u32, new_addr_hint: u64) i64 {
     if ((mflags & MREMAP_MAYMOVE) == 0) return -12; // ENOMEM
+    // Moving a sub-range would strand the region tail: the bookkeeping tracks
+    // a single base/num_pages pair, so refuse old_sizes that do not cover the
+    // whole tracked region.
+    if (old_pages != region.num_pages) return -22; // EINVAL
     const new_base = if ((mflags & MREMAP_FIXED) != 0)
         new_addr_hint
     else
         (findFreeMmapRange(task, new_pages, region.base) orelse return -12);
     if (rangesOverlap(region.base, old_pages, new_base, new_pages)) return -22; // EINVAL
     if (!rangeAvailable(task, new_base, new_pages, region.base)) return -12;
+    // rangeAvailable only consults the tracked region list; MREMAP_FIXED may
+    // target untracked live pages (image, stack, brk) and mapPage overwrites a
+    // live PTE silently, so gate on the actual page tables too.
+    if (!pagesFree(task, new_base, new_pages)) return -12; // ENOMEM
     return moveMapping(task, region, new_base, old_pages, new_pages);
 }
 
@@ -350,6 +358,9 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     if (is_fixed and addr_hint != 0) {
         base = addr_hint / user_space.PAGE_SIZE * user_space.PAGE_SIZE;
         if (base < user_space.PAGE_SIZE) return -22; // EINVAL
+        // A kernel-half base would underflow USER_ADDR_MAX - base below
+        // (panic in safe builds) or unmap kernel pages in ReleaseFast.
+        if (base >= user_space.USER_ADDR_MAX) return -22; // EINVAL
         if (num_pages > (user_space.USER_ADDR_MAX - base) / user_space.PAGE_SIZE) return -12; // ENOMEM
         if (!canTrackReplacement(cur, base, num_pages)) return -12;
         // MAP_FIXED replaces whatever is there, so drop the old pages first.
@@ -466,6 +477,10 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
     if ((mflags & MREMAP_FIXED) != 0 and (mflags & MREMAP_MAYMOVE) == 0) return -22; // EINVAL
     if ((mflags & MREMAP_FIXED) != 0 and new_addr_hint % PAGE != 0) return -22; // EINVAL
 
+    // Same cap as mmap(): larger sizes wrap the page-count computation,
+    // which would process a grow as a shrink.
+    if (old_size > 0xFFFFFFFF_FFFFF000 or new_size > 0xFFFFFFFF_FFFFF000) return -12; // ENOMEM
+
     const old_pages = (old_size + PAGE - 1) / PAGE;
     const new_pages = (new_size + PAGE - 1) / PAGE;
     if (new_pages == 0) return -22; // EINVAL
@@ -477,11 +492,13 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
     for (&cur.mmap_regions) |*r| {
         if (r.active and r.base == old_addr and r.num_pages >= old_pages) {
             if (new_pages <= old_pages) {
-                // Shrink: unmap pages beyond new_size
-                if (new_pages < r.num_pages) {
-                    unmapRange(cur, old_addr + new_pages * PAGE, r.num_pages - new_pages);
+                // Shrink: unmap only the validated old range, not the whole
+                // tracked region — a tail beyond old_size stays mapped.
+                // untrackMmapRange splits the region bookkeeping to match.
+                if (new_pages < old_pages) {
+                    unmapRange(cur, old_addr + new_pages * PAGE, old_pages - new_pages);
+                    untrackMmapRange(cur, old_addr + new_pages * PAGE, old_pages - new_pages);
                 }
-                r.num_pages = new_pages;
                 return @bitCast(old_addr);
             }
             if ((mflags & MREMAP_FIXED) != 0) return moveOrNoMem(cur, r, old_pages, new_pages, mflags, new_addr_hint);
@@ -501,6 +518,11 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
                 }
             }
             if (!can_grow) return moveOrNoMem(cur, r, old_pages, new_pages, mflags, new_addr_hint);
+            // The region list does not know about untracked live pages
+            // (loaded image, stack, brk) — gate on the actual page tables so
+            // mapPage never silently overwrites a live PTE.
+            if (!pagesFree(cur, grow_base, grow_pages))
+                return moveOrNoMem(cur, r, old_pages, new_pages, mflags, new_addr_hint);
 
             // Map new pages
             for (0..grow_pages) |p| {

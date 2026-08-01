@@ -142,7 +142,28 @@ pub fn semop(semid: u32, sem_num: u32, op: i16) i64 {
             cur_task.state = .blocked;
             sem_lock.release(flags);
             sched.forceReschedule();
-            if (!node.granted) return -43; // interrupted (EIDRM / signal)
+            if (!node.granted) {
+                // Interrupted (EIDRM / signal) before being granted — unlink
+                // our stack WaitNode from the queue first, otherwise a later
+                // V-op wakeOne would dereference freed stack memory.
+                const flags2 = sem_lock.acquire();
+                var prev: ?*task.WaitNode = null;
+                var cur_node = s.wait_queue;
+                while (cur_node) |n| {
+                    if (n == &node) {
+                        if (prev) |p| {
+                            p.next = n.next;
+                        } else {
+                            s.wait_queue = n.next;
+                        }
+                        break;
+                    }
+                    prev = n;
+                    cur_node = n.next;
+                }
+                sem_lock.release(flags2);
+                return -43; // interrupted (EIDRM / signal)
+            }
             continue; // re-acquire lock and re-check condition
         }
 
@@ -174,8 +195,15 @@ pub fn semctl(semid: u32, semnum: i32, cmd: i32, arg: i32) i64 {
             serial.writeString("[sysv_sem] removed semid=");
             fmt.writeDecimal(semid);
             serial.writeString("\n");
-            // Wake all blocked waiters so they get EIDRM
-            sched.wakeAll(&s.wait_queue);
+            // Wake all blocked waiters WITHOUT setting granted, so semop
+            // takes its interrupted path and returns -EIDRM. wakeAll() would
+            // set granted=true and the waiters would report -EINVAL instead.
+            var node = s.wait_queue;
+            while (node) |n| {
+                task.unblockTask(n.task_idx);
+                node = n.next;
+            }
+            s.wait_queue = null;
             s.* = .{};
             return 0;
         },

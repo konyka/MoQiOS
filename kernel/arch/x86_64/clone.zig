@@ -187,6 +187,12 @@ pub fn clone(
                 _ = vfs_mod.pipeRetain(pidx);
             }
         }
+        // The shallow copy duplicates readahead page pointers that stay
+        // owned by the parent — drop the child's copy (UAF/double-free).
+        if (child.fd_table.fds[i].fd_type == .fat32_file) {
+            const readahead = @import("../../fs/readahead.zig");
+            readahead.resetStateForFork(&child.fd_table.fds[i].readahead_state);
+        }
     }
     // v53.44 fix: ext2/tcp/epoll/unix/timerfd resources are now refcounted —
     // one reference per process per distinct index (see vfs.retainSharedResources).
