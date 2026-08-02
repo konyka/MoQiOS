@@ -20,6 +20,7 @@ pub const fmt = @import("lib/fmt.zig");
 pub const fmt_core = @import("lib/fmt_core.zig");
 pub const str = @import("lib/str.zig");
 pub const cow_pte = @import("mm/cow_pte.zig");
+pub const pci_msix = @import("drivers/pci_msix.zig");
 pub const eth = @import("net/eth.zig");
 pub const ipv4 = @import("net/ipv4.zig");
 pub const ipv6 = @import("net/ipv6.zig");

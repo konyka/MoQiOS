@@ -1132,6 +1132,13 @@ LAPIC Timer 中断
 |---|---|---|---|
 | virtio-blk | kernel/drivers/virtio_blk.zig | 545 | 主存储设备 |
 | AHCI | kernel/drivers/ahci.zig | 638 | SATA 控制器 (已实现，未为主要文件系统) |
+| NVMe | kernel/drivers/nvme.zig | ~1400 | MSI-X 中断驱动 I/O (向量 242..245)，轮询回退 |
+
+NVMe 启动日志：MSI-X 成功时输出 `[NVMe] MSI-X interrupts enabled (N vectors)`
+（冒烟测试的必需标记），随后启动自检做一次性中断驱动扇区读取并输出
+`[NVMe] interrupt-driven read verified (pattern match)`（镜像首扇区含
+qemu_run.sh 写入的 "MoQiNVMe" 模式串时）；MSI-X 不可用时输出
+`[NVMe] MSI-X not available, using polling fallback` 并保持原有轮询行为。
 
 ---
 
@@ -1339,11 +1346,12 @@ kernel/main.zig
   │   └── page_cache.zig   — 统一页缓存
   │
   ├── drivers/
-  │   ├── pci.zig          — PCI 配置空间枚举
+  │   ├── pci.zig          — PCI 配置空间枚举 + MSI-X 辅助
+  │   ├── pci_msix.zig     — MSI-X 纯解析 (可主机测试)
   │   ├── virtio_blk.zig   — virtio 块设备
   │   ├── virtio_net.zig   — virtio-net 网卡 (548行)
   │   ├── ahci.zig         — AHCI/SATA
-  │   ├── nvme.zig         — NVMe SSD (多队列, 最多4 I/O SQ/CQ对)
+  │   ├── nvme.zig         — NVMe SSD (多队列, 最多4 I/O SQ/CQ对, MSI-X 中断驱动)
   │   ├── e1000.zig        — e1000 网卡 (中断驱动)
   │   └── keyboard.zig     — PS/2 键盘
   │
@@ -1416,7 +1424,7 @@ kernel/main.zig
 | kernel/proc/scheduler.zig | ~500 | O(1) 位图调度器 |
 | kernel/proc/task.zig | 800 | Task 结构体 + 进程管理 (v53.45 self_idx字段O(1)反查) |
 | kernel/drivers/virtio_blk.zig | 545 | virtio-blk 块设备驱动 (多设备+DMA安全) |
-| kernel/drivers/nvme.zig | ~690 | NVMe SSD 驱动 (多队列, 最多4 I/O SQ/CQ对) |
+| kernel/drivers/nvme.zig | ~1400 | NVMe SSD 驱动 (多队列, 最多4 I/O SQ/CQ对, MSI-X 中断驱动完成) |
 | kernel/mm/pmm.zig | 373 | 物理内存管理 (两级位图 + refcount + COW API，v53.39 修复双重释放锁，v53.45 freePage锁释放后serial I/O) |
 | kernel/mm/slab.zig | 232 | Slab 分配器 (v53.39 _pad u16修复大分配页数截断，v53.44 IrqSpinlock保护free_list) |
 | kernel/mm/swap.zig | ~267 | Swap 页面置换 (Clock算法 + u64位图@ctz分配) |

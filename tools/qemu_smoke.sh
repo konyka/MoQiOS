@@ -38,6 +38,7 @@ fi
 LOG_FILE="${MOQI_SMOKE_LOG:-$SMOKE_WORK_DIR/serial.log}"
 RUN_LOG="${MOQI_SMOKE_RUN_LOG:-$SMOKE_WORK_DIR/qemu.run.log}"
 SMOKE_DISK="${MOQI_SMOKE_DISK:-$SMOKE_WORK_DIR/disk.img}"
+SMOKE_NVME="${MOQI_SMOKE_NVME_IMG:-$SMOKE_WORK_DIR/nvme.img}"
 PACKAGE_DIR="${MOQI_SMOKE_PACKAGE_DIR:-$SMOKE_WORK_DIR/package}"
 SMOKE_ISO_DIR="$PACKAGE_DIR/iso_root"
 SMOKE_ISO_FILE="$PACKAGE_DIR/moqios.iso"
@@ -71,6 +72,9 @@ fi
 if [ -z "${MOQI_SMOKE_DISK:-}" ]; then
     rm -f "$SMOKE_DISK"
 fi
+if [ -z "${MOQI_SMOKE_NVME_IMG:-}" ]; then
+    rm -f "$SMOKE_NVME"
+fi
 if [ -z "${MOQI_SMOKE_PACKAGE_DIR:-}" ]; then
     rm -rf "$PACKAGE_DIR"
 fi
@@ -80,6 +84,7 @@ cp --reflink=auto disk.img "$SMOKE_DISK"
 MOQI_SMP="$SMP_COUNT" \
 MOQI_SERIAL="file:$LOG_FILE" \
 MOQI_DISK="$SMOKE_DISK" \
+MOQI_NVME_IMG="$SMOKE_NVME" \
 MOQI_ISO_DIR="$SMOKE_ISO_DIR" \
 MOQI_ISO_FILE="$SMOKE_ISO_FILE" \
 MOQI_USER_BIN_DIR="$SMOKE_USER_BIN_DIR" \
@@ -100,6 +105,9 @@ cleanup() {
     fi
     if [ -z "${MOQI_SMOKE_DISK:-}" ]; then
         rm -f "$SMOKE_DISK"
+    fi
+    if [ -z "${MOQI_SMOKE_NVME_IMG:-}" ]; then
+        rm -f "$SMOKE_NVME"
     fi
     if [ -z "${MOQI_SMOKE_PACKAGE_DIR:-}" ]; then
         rm -rf "$PACKAGE_DIR"
@@ -131,6 +139,18 @@ check_fatal_output() {
     if [ -f "$LOG_FILE" ] && grep -aq "\[SEGFAULT\]" "$LOG_FILE"; then
         echo "FAIL: a process segfaulted during smoke (SMP=$SMP_COUNT)."
         grep -a -A 2 "\[SEGFAULT\]" "$LOG_FILE" | head -20
+        echo "Serial log: $LOG_FILE"
+        exit 1
+    fi
+    if [ -f "$LOG_FILE" ] && grep -aq "\[NVMe\] interrupt-driven read FAILED" "$LOG_FILE"; then
+        echo "FAIL: NVMe interrupt-driven boot read failed during smoke (SMP=$SMP_COUNT)."
+        grep -a "\[NVMe\]" "$LOG_FILE" | head -20
+        echo "Serial log: $LOG_FILE"
+        exit 1
+    fi
+    if [ -f "$LOG_FILE" ] && grep -aq "\[NVMe\] IRQ wait timeout" "$LOG_FILE"; then
+        echo "FAIL: an NVMe MSI-X completion wait timed out during smoke (SMP=$SMP_COUNT)."
+        grep -a "\[NVMe\]" "$LOG_FILE" | head -20
         echo "Serial log: $LOG_FILE"
         exit 1
     fi
@@ -194,6 +214,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     fi
 
     if [ -f "$LOG_FILE" ] &&
+       grep -q "\[NVMe\] MSI-X interrupts enabled" "$LOG_FILE" &&
        grep -q "hello21 done" "$LOG_FILE" &&
        grep -q "hello29: PASS" "$LOG_FILE" &&
        grep -q "hello29: fsync PASS" "$LOG_FILE" &&
@@ -229,7 +250,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for smoke markers."
-echo "Expected serial markers: init PASS markers, 'hello32: SIGSEGV PASS', 'hello38: PASS (futex EFAULT/waitv validation)', 'hello39: PASS (socket option faults/address lengths)', 'hello40: PASS (IPC_SET and rt_sigsuspend EFAULT)', 'hello41: PASS', 'hello42: PASS', 'hello42 done', 'MoQiOS shell', '[SMP] ${SMP_COUNT} CPUs detected', '[SMP] ${SMP_COUNT} CPUs selected', and '[SMP] ${SMP_COUNT} CPUs online'."
+echo "Expected serial markers: '[NVMe] MSI-X interrupts enabled', init PASS markers, 'hello32: SIGSEGV PASS', 'hello38: PASS (futex EFAULT/waitv validation)', 'hello39: PASS (socket option faults/address lengths)', 'hello40: PASS (IPC_SET and rt_sigsuspend EFAULT)', 'hello41: PASS', 'hello42: PASS', 'hello42 done', 'MoQiOS shell', '[SMP] ${SMP_COUNT} CPUs detected', '[SMP] ${SMP_COUNT} CPUs selected', and '[SMP] ${SMP_COUNT} CPUs online'."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

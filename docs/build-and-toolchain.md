@@ -217,6 +217,8 @@ qemu-system-x86_64 \
     -boot order=d \
     -drive file=disk.img,format=raw,if=none,id=disk0 \
     -device virtio-blk-pci,drive=disk0 \
+    -drive file=nvme.img,format=raw,if=none,id=nvm0 \
+    -device nvme,serial=moqi,drive=nvm0 \
     -netdev user,id=net0 \
     -device e1000,netdev=net0 \
     -smp "$MOQI_SMP" \
@@ -226,7 +228,9 @@ qemu-system-x86_64 \
 ```
 
 脚本不使用 `-cpu` / KVM / hostfwd；额外诊断参数可经 `MOQI_EXTRA_QEMU` 追加（例如
-`MOQI_EXTRA_QEMU="-d int,cpu_reset -D /tmp/qint.log"`）。
+`MOQI_EXTRA_QEMU="-d int,cpu_reset -D /tmp/qint.log"`）。NVMe 设备默认挂载
+（`MOQI_NVME=0` 可关闭，镜像路径 `MOQI_NVME_IMG`，默认 `nvme.img`；不存在时由
+脚本 `truncate -s 8M` 创建，并在首扇区写入 "MoQiNVMe" 模式串供内核启动自检校验）。
 
 | 选项 | 说明 |
 |---|---|
@@ -234,7 +238,8 @@ qemu-system-x86_64 \
 | `-m 512M` | 512MB 物理内存 |
 | `-boot order=d` | 从 CD-ROM（moqios.iso）启动 |
 | `-smp N` | CPU 核数；由 `MOQI_SMP` 环境变量控制（默认 2），smoke 脚本将其传给 QEMU |
-| `-device virtio-blk-pci` | 虚拟块设备（FAT32/ext2 后端） |
+| `-device virtio-blk-pci` | 虚拟块设备（FAT32/ext2 后端，根盘） |
+| `-device nvme` | NVMe 控制器（scratch 镜像，用于 MSI-X 中断驱动 I/O 路径；`MOQI_NVME=0` 关闭） |
 | `-device e1000` | Intel 82540 千兆网卡 |
 | `-serial stdio` | 串口输出到终端（内核日志）；由 `MOQI_SERIAL` 控制 |
 | `-display none` | 无图形窗口，纯串口交互 |
@@ -288,6 +293,7 @@ gdb zig-out/bin/moqi-kernel.elf
 | `iso_root/boot/ramdisk.bin` | 打包好的 ramdisk |
 | `moqios.iso` | 最终 ISO |
 | `disk.img` | virtio-blk 后端磁盘镜像 |
+| `nvme.img` | NVMe scratch 镜像（qemu_run.sh 自动创建/写模式串） |
 | `ext2.img` | ext2 测试镜像 |
 | `.zig-cache/` | Zig 编译缓存 |
 

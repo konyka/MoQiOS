@@ -15,6 +15,7 @@ const io = @import("../arch/arch.zig").io;
 const hhdm = @import("../mm/hhdm.zig");
 const acpi = @import("../acpi/acpi_parser.zig");
 const fmt = @import("../lib/fmt.zig");
+const pci_msix = @import("pci_msix.zig");
 
 pub const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
 pub const PCI_CONFIG_DATA: u16 = 0xCFC;
@@ -366,6 +367,104 @@ pub fn findByClass(class: u8, subclass: u8) ?*const PciDevice {
         }
     }
     return null;
+}
+
+// ─── MSI-X Support ───────────────────────────────────────────────────────
+
+/// Walk a device's PCI capability list and return the offset of capability
+/// `cap_id`, or null if absent. Thin config-space wrapper over the pure
+/// parsing helpers in pci_msix.zig (host-tested there).
+pub fn findCapability(bus: u8, dev: u8, func: u8, cap_id: u8) ?u8 {
+    // Status register (upper half of the dword at 0x04), bit 4: caps list.
+    const status_cmd = configRead32(bus, dev, func, 0x04);
+    if ((status_cmd & (1 << 20)) == 0) return null;
+
+    var off: u8 = @truncate(configRead32(bus, dev, func, 0x34) & 0xFC);
+    var steps: u32 = 0;
+    while (off != 0 and steps < 48) : (steps += 1) {
+        const reg = configRead32(bus, dev, func, off);
+        if (@as(u8, @truncate(reg)) == cap_id) return off;
+        off = @truncate((reg >> 8) & 0xFC);
+    }
+    return null;
+}
+
+/// A located MSI-X capability with its table mapped into kernel space.
+pub const MsixTable = struct {
+    info: pci_msix.MsixInfo,
+    cap_offset: u8,
+    /// HHDM virtual address of the first table entry.
+    table_virt: u64,
+};
+
+/// Locate the device's MSI-X capability and map the table BAR through the
+/// HHDM (same mapping approach as other MMIO in the tree). Returns null when
+/// the device has no MSI-X capability or the table BAR is unassigned.
+pub fn msixLocate(dev: *const PciDevice) ?MsixTable {
+    const cap_offset = findCapability(dev.bus, dev.device, dev.function, pci_msix.CAP_ID_MSIX) orelse
+        return null;
+
+    const msg_control: u16 = @truncate(configRead32(dev.bus, dev.device, dev.function, cap_offset) >> 16);
+    const table_reg = configRead32(dev.bus, dev.device, dev.function, cap_offset + 4);
+    const pba_reg = configRead32(dev.bus, dev.device, dev.function, cap_offset + 8);
+    const info = pci_msix.parseMsixRegs(msg_control, table_reg, pba_reg);
+    if (info.table_size == 0 or info.table_bir > 5) return null;
+
+    const bar_phys = dev.bars[info.table_bir];
+    if (bar_phys == 0) return null;
+    const table_phys = bar_phys + info.table_offset;
+
+    // Map the table page(s) into the kernel address space via HHDM.
+    // mapPage fails harmlessly when the page is already HHDM-mapped.
+    const paging = @import("../arch/arch.zig").paging;
+    const kernel_pml4 = paging.getKernelPml4();
+    const map_flags = paging.MapFlags{
+        .writable = true,
+        .user = false,
+        .no_execute = true,
+        .global = true,
+    };
+    const table_bytes = @as(u64, info.table_size) * 16;
+    const map_pages = @max((table_bytes + (table_phys & 0xFFF) + 4095) / 4096, 1);
+    const base_phys = table_phys & ~@as(u64, 0xFFF);
+    for (0..map_pages) |i| {
+        paging.mapPage(kernel_pml4, hhdm.physToVirt(base_phys + i * 4096), base_phys + i * 4096, map_flags) catch {};
+    }
+
+    return .{
+        .info = info,
+        .cap_offset = cap_offset,
+        .table_virt = hhdm.physToVirt(table_phys),
+    };
+}
+
+/// Program one MSI-X table entry with a message address/data pair and
+/// unmask it (vector control bit 0 = 0).
+pub fn msixProgramVector(table: *const MsixTable, index: u16, msg_addr: u64, msg_data: u32) void {
+    if (index >= table.info.table_size) return;
+    const entry = table.table_virt + @as(u64, index) * 16;
+    const lo: *volatile u32 = @ptrFromInt(entry);
+    const hi: *volatile u32 = @ptrFromInt(entry + 4);
+    const data: *volatile u32 = @ptrFromInt(entry + 8);
+    const ctrl: *volatile u32 = @ptrFromInt(entry + 12);
+    lo.* = @truncate(msg_addr);
+    hi.* = @truncate(msg_addr >> 32);
+    data.* = msg_data;
+    ctrl.* = 0; // unmask
+}
+
+/// Enable MSI-X delivery: set the enable bit and clear the function mask in
+/// the capability message control, then disable legacy INTx (command bit 10)
+/// so the device cannot raise both interrupt flavours at once.
+pub fn msixEnable(dev: *const PciDevice, table: *const MsixTable) void {
+    const reg = configRead32(dev.bus, dev.device, dev.function, table.cap_offset);
+    var ctrl = reg & 0xFFFF_0000;
+    ctrl |= 0x8000_0000; // MSI-X Enable (bit 15 of message control)
+    ctrl &= ~@as(u32, 0x4000_0000); // Function Mask = 0
+    configWrite32(dev.bus, dev.device, dev.function, table.cap_offset, ctrl);
+
+    const cmd = configRead32(dev.bus, dev.device, dev.function, 0x04);
+    configWrite32(dev.bus, dev.device, dev.function, 0x04, cmd | (1 << 10)); // INTx disable
 }
 
 /// Print device information.

@@ -961,25 +961,41 @@ const SysCap = packed struct {
 - Scancode set 1 → ASCII
 - 修饰键（Shift/Ctrl/Alt）状态
 
-### 6.6 NVMe SSD (Admin/IO Queue + PRP) ✅
+### 6.6 NVMe SSD (Admin/IO Queue + PRP + MSI-X) ✅
 
-文件: `nvme.zig`
+文件: `nvme.zig`, `pci_msix.zig`, `pci.zig` (MSI-X 部分)
 
 - PCI枚举发现NVMe设备
-- Admin Queue + IO Queue初始化
+- Admin Queue + IO Queue初始化（Admin 保持轮询，仅初始化期使用）
 - Doorbell机制通知控制器
 - PRP（Physical Region Page）分散/聚集
 - readSectors / writeSectors / flush 接口
-- 轮询完成模式
+- MSI-X 中断驱动完成（I/O 队列）：每队列一个向量（242..245），向量不足时
+  多队列共享；MSI-X 不可用时回退到原有的轮询模式（行为完全不变）
+- 提交路径：获取队列通道（channel，保证每队列最多一个命令在飞，PRP 页在
+  DMA 期间不被重建）→ 提交 + 敲 Doorbell → 释放锁后在 WaitNode 上睡眠，
+  ISR 收割 CQ 并唤醒提交者；等待有界（NVME_WAIT_TIMEOUT_MS=500ms），每次
+  唤醒直接收割 CQ 作为丢中断回退，不会挂死
+- 锁序：`io_locks[q]` → `task_lock`（经 unblockTask）。`io_locks[q]` 保护
+  SQ/CQ 指针、PRP 重建、通道所有权与等待链表；睡眠前必释放，ISR 只取
+  `io_locks[q]`，IRQ-off 临界区短，不会与被阻塞的提交者死锁
+- 丢失唤醒防护：WaitNode 在持有 `io_locks[q]` 时挂链（ISR 在同一锁下收割
+  并唤醒），模式同 sysv_sem
+- 启动自检：MSI-X 启用后做一次中断驱动的扇区 0 读取，并校验 qemu_run.sh
+  写入镜像首扇区的 "MoQiNVMe" 模式串
 
 ### 6.7 PCI MSI/MSI-X (Capability List + 向量分配) ✅
 
-文件: `pci.zig`, `msi.zig`
+文件: `pci.zig`, `pci_msix.zig` (纯解析，可主机测试)
 
-- Capability List遍历发现MSI/MSI-X能力
-- MSI 32bit/64bit配置
-- MSI-X表映射和向量配置
-- 向量分配器（从0x40起分配中断向量）
+- Capability List遍历发现MSI/MSI-X能力（`pci.findCapability`）
+- MSI 32bit/64bit配置（AHCI 使用，向量 241）
+- MSI-X：能力解析（表 BIR/偏移、PBA）、表 BAR 经 HHDM 映射、按向量编程
+  表项（地址=LAPIC base 0xFEE00000 固定投递，数据=IDT 向量）、去掩码、
+  使能 MSI-X 并禁用 INTx（`pci.msixLocate/msixProgramVector/msixEnable`）
+- `pci_msix.zig` 为无 MMIO 依赖的纯解析模块（capability 遍历、N-1 表大小
+  解码、消息地址/数据组合），由 `tests/main.zig` 经 `kernel/host_test.zig`
+  做主机单元测试
 
 ### 6.8 virtio-net 网卡 ✅ Virtqueue RX/TX + 中断驱动
 

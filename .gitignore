@@ -17,5 +17,6 @@ test_asm9
 disk.img filter=lf
 disk.img
 disk.img.bak
+nvme.img
 serial_*.log
 .qoder/

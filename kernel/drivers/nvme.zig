@@ -11,14 +11,21 @@
 /// Limitations:
 ///   - Up to 4 I/O queue pairs (configurable via MAX_IO_QUEUES)
 ///   - PRP only (no SGL)
-///   - Polling mode (no MSI-X interrupt for completion yet)
+///   - Admin queue is polled (init-time only); I/O queues complete via MSI-X
+///     interrupts when the capability is present, with a bounded-wait +
+///     direct-harvest fallback and a full polling fallback when MSI-X setup
+///     fails (behavior then identical to the pre-MSI-X driver).
+const builtin = @import("builtin");
 const serial = @import("../arch/arch.zig").serial;
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const paging = @import("../arch/arch.zig").paging;
 const pci = @import("pci.zig");
+const pci_msix = @import("pci_msix.zig");
 const block_dev = @import("block_dev.zig");
 const fmt = @import("../lib/fmt.zig");
+const task = @import("../proc/task.zig");
+const sched = @import("../proc/sched.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 // ─── NVMe Controller Register Offsets (via BAR0 MMIO) ────────────────────
@@ -49,7 +56,12 @@ const NVME_CMD_READ = 0x02;
 const QUEUE_DEPTH = 64;
 
 /// Maximum I/O queue pairs for parallel throughput (v52.0 multi-queue).
-const MAX_IO_QUEUES = 4;
+pub const MAX_IO_QUEUES = 4;
+
+/// First IDT vector allocated to NVMe MSI-X (242..242+MAX_IO_QUEUES-1).
+/// Sits above the LAPIC timer (240) and AHCI (241) vectors and below the
+/// yield trap (252) / reschedule / TLB-shootdown IPIs (253/254).
+pub const NVME_IRQ_VECTOR_BASE: u8 = 242;
 
 // ─── NVMe Command Structure (64 bytes) ───────────────────────────────────
 
@@ -167,6 +179,35 @@ var io_cq_doorbell: [MAX_IO_QUEUES]u64 = @splat(0);
 var io_locks: [MAX_IO_QUEUES]IrqSpinlock = @splat(.{});
 var num_io_queues: u32 = 0; // Actual number of I/O queues created
 var io_queue_rr: u32 = 0; // Round-robin queue selector
+
+// ─── Interrupt-driven completion (MSI-X) ─────────────────────────────────
+//
+// Lock ordering: io_locks[q] → task.zig's task_lock (via unblockTask).
+// io_locks[q] protects SQ/CQ pointers, the PRP list rebuild, in-flight
+// channel ownership and the wait lists. It is never held while sleeping:
+// waiters link their WaitNode under it, release it, then park. The ISR
+// takes only io_locks[q], so IRQ-off sections stay short and cannot
+// deadlock with a blocked submitter (which holds no locks while parked).
+
+/// Located MSI-X table (null when the controller has no MSI-X capability).
+var msix_table: ?pci.MsixTable = null;
+/// Number of MSI-X vectors programmed (0 = polling fallback).
+var msix_vectors: u32 = 0;
+/// MSI-X table index each I/O queue's CQ raises: the queue index when
+/// per-queue vectors were granted, shared indexes when fewer vectors were
+/// available than queues.
+var iv_of_queue: [MAX_IO_QUEUES]u16 = @splat(0);
+
+/// Channel ownership: exactly one command in flight per I/O queue, so the
+/// per-queue PRP list page is never rebuilt while a DMA still references it.
+/// (Replaces the old whole-operation io_locks[q] hold, which would have
+/// prevented the ISR from taking the lock while a submitter sleeps.)
+var io_in_flight: [MAX_IO_QUEUES]bool = @splat(false);
+/// Completion handoff ISR → submitter (all protected by io_locks[q]).
+var io_done: [MAX_IO_QUEUES]bool = @splat(false);
+var io_result: [MAX_IO_QUEUES]NvmeCompletion = @splat(undefined);
+var io_cpl_wait: [MAX_IO_QUEUES]?*task.WaitNode = @splat(null);
+var io_chan_wait: [MAX_IO_QUEUES]?*task.WaitNode = @splat(null);
 
 // Serializes admin queue submission. Admin commands only run during
 // single-threaded init today, but the queue registers (admin_sq_tail,
@@ -413,7 +454,10 @@ pub fn init() void {
 
     // Enable controller: CC.EN=1, CC.MPS=0 (4KB page), CC.CSS=0 (NVM I/O Command Set)
     // AMS=0 (Round Robin), MPS=0 (2^(12+0)=4KB), CSS=0 (NVM)
-    mmioWrite32(NVME_CC, (1 << 0)); // CC.EN = 1
+    // IOSQES=6 (64-byte SQ entries, bits 19:16), IOCQES=4 (16-byte CQ
+    // entries, bits 23:20) — QEMU 10+ rejects Create CQ/SQ with
+    // "Invalid Queue Size" (0x102) when these are left at 0.
+    mmioWrite32(NVME_CC, (1 << 0) | (6 << 16) | (4 << 20));
 
     // Wait for CSTS.RDY = 1
     timeout = 500000;
@@ -437,6 +481,12 @@ pub fn init() void {
     }
 
     serial.writeString("[NVMe] Controller enabled\n");
+
+    // Interrupt-driven completion: try MSI-X (one vector per I/O queue,
+    // shared-vector fallback, polling fallback when unavailable). Must run
+    // before Create I/O Completion Queue so the CQ can be bound to its
+    // interrupt vector (IEN + IV).
+    msix_vectors = setupMsix(nvme_pci, MAX_IO_QUEUES);
 
     // Identify Controller
     const id_ctrl = identifyController() orelse {
@@ -519,11 +569,20 @@ pub fn init() void {
         }
     }
 
+    // Bind each queue's CQ to an MSI-X table index: one vector per queue
+    // when enough were granted, otherwise queues share vectors evenly.
+    if (msix_vectors > 0) {
+        for (0..MAX_IO_QUEUES) |q| {
+            iv_of_queue[q] = @intCast(q % msix_vectors);
+        }
+    }
+
     var created_queues: u32 = 0;
     for (0..num_io_queues) |q| {
         const qid: u16 = @intCast(q + 1); // Queue IDs are 1-based
         // Create I/O Completion Queue
-        if (!createCompletionQueue(qid, io_cq_phys[q], QUEUE_DEPTH)) {
+        const iv: ?u16 = if (msix_vectors > 0) iv_of_queue[q] else null;
+        if (!createCompletionQueue(qid, io_cq_phys[q], QUEUE_DEPTH, iv)) {
             serial.writeString("[NVMe] Failed to create I/O CQ ");
             fmt.writeDecimal(qid);
             serial.writeString("\n");
@@ -581,6 +640,16 @@ pub fn init() void {
     fmt.writeDecimal(num_io_queues);
     serial.writeString(" I/O queue pair(s)\n");
 
+    if (msix_vectors > 0) {
+        // Unmask all interrupt vectors at the controller (INTMC: 0 = unmasked).
+        mmioWrite32(NVME_INTMC, 0xFFFFFFFF);
+        serial.writeString("[NVMe] MSI-X interrupts enabled (");
+        fmt.writeDecimal(@min(msix_vectors, num_io_queues));
+        serial.writeString(" vectors)\n");
+    } else {
+        serial.writeString("[NVMe] MSI-X not available, using polling fallback\n");
+    }
+
     // Identify Namespace 1
     if (!identifyNamespace(1)) {
         serial.writeString("[NVMe] Identify Namespace 1 failed\n");
@@ -621,6 +690,14 @@ pub fn init() void {
     serial.writeString(" sectors × ");
     fmt.writeDecimal(lba_size);
     serial.writeString(" bytes\n");
+
+    // Prove the interrupt-driven path end to end at boot: one sector read
+    // whose completion is delivered by the ISR (no scheduler needed — the
+    // pre-task wait path parks with hlt). qemu_run.sh stamps the first
+    // sector of its scratch image with a known pattern.
+    if (msix_vectors > 0) {
+        bootIoSelfTest();
+    }
 }
 
 pub fn isEnabled() bool {
@@ -710,15 +787,83 @@ fn identifyNamespace(ns: u32) bool {
     return true;
 }
 
-fn createCompletionQueue(cq_id: u16, phys: u64, depth: u16) bool {
+fn createCompletionQueue(cq_id: u16, phys: u64, depth: u16, iv: ?u16) bool {
     var cmd = zeroCommand();
     cmd.opcode = NVME_CMD_CREATE_CQ;
     cmd.prp1 = phys;
     cmd.cdw10 = (@as(u32, depth - 1) << 16) | @as(u32, cq_id); // NCQR + CQID
-    cmd.cdw11 = 1; // PC=1 (Physically Contiguous), IEN=1
+    cmd.cdw11 = 1; // PC=1 (Physically Contiguous)
+    if (iv) |v| {
+        cmd.cdw11 |= (1 << 1) | (@as(u32, v) << 16); // IEN=1, Interrupt Vector
+    }
 
     const cpl = submitAdminCmd(&cmd) orelse return false;
-    return (cpl.status >> 1) & 0x7FF == 0;
+    const status = (cpl.status >> 1) & 0x7FF;
+    if (status != 0) {
+        serial.writeString("[NVMe] Create CQ status=0x");
+        fmt.writeHex32(status);
+        serial.writeString(" cdw11=0x");
+        fmt.writeHex32(cmd.cdw11);
+        serial.writeString("\n");
+        return false;
+    }
+    return true;
+}
+
+// ─── MSI-X Setup ─────────────────────────────────────────────────────────
+
+/// Locate the controller's MSI-X capability, program up to `max_vecs` table
+/// entries (fixed delivery to the BSP LAPIC, vectors NVME_IRQ_VECTOR_BASE+i)
+/// and enable MSI-X. Returns the number of vectors programmed; 0 means the
+/// driver stays in polling mode (behavior identical to pre-MSI-X).
+fn setupMsix(nvme_pci: *const pci.PciDevice, max_vecs: u32) u32 {
+    // MSI-X delivery targets the LAPIC/IDT — x86_64 only. Other
+    // architectures keep the polling path (they find no PCI device anyway).
+    if (comptime builtin.cpu.arch != .x86_64) return 0;
+
+    const table = pci.msixLocate(nvme_pci) orelse return 0;
+    const n = @min(@as(u32, table.info.table_size), max_vecs);
+    if (n == 0) return 0;
+
+    // Fixed delivery to the BSP local APIC (APIC ID 0), one IDT vector per
+    // table entry.
+    const lapic_base: u64 = 0xFEE0_0000;
+    for (0..n) |i| {
+        const vector: u8 = NVME_IRQ_VECTOR_BASE + @as(u8, @intCast(i));
+        pci.msixProgramVector(&table, @intCast(i), pci_msix.composeMessageAddress(lapic_base, 0), pci_msix.composeMessageData(vector));
+    }
+    pci.msixEnable(nvme_pci, &table);
+    msix_table = table;
+    return n;
+}
+
+// ─── Boot-time interrupt path self-test ──────────────────────────────────
+
+/// Pattern qemu_run.sh stamps into the first sector of its scratch image.
+const BOOT_PATTERN = "MoQiNVMe";
+
+/// One interrupt-driven sector read at boot, validating the data against the
+/// known image pattern when present. A failure here means the ISR completion
+/// path is broken even though MSI-X setup reported success.
+fn bootIoSelfTest() void {
+    const buf_phys = pmm.allocPage() orelse return;
+    defer pmm.freePage(buf_phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+    @memset(buf[0..512], 0);
+
+    if (readSectors(0, 1, buf) != 1) {
+        serial.writeString("[NVMe] interrupt-driven read FAILED\n");
+        return;
+    }
+    var matches = true;
+    for (BOOT_PATTERN, 0..) |ch, i| {
+        if (buf[i] != ch) matches = false;
+    }
+    if (matches) {
+        serial.writeString("[NVMe] interrupt-driven read verified (pattern match)\n");
+    } else {
+        serial.writeString("[NVMe] interrupt-driven read OK (no pattern)\n");
+    }
 }
 
 fn createSubmissionQueue(sq_id: u16, phys: u64, depth: u16, cq_id: u16) bool {
@@ -743,37 +888,249 @@ fn deleteCompletionQueue(cq_id: u16) bool {
 
 // ─── I/O Commands ────────────────────────────────────────────────────────
 
-/// Submit a command on an I/O queue and poll for completion.
-/// Caller must hold io_locks[queue_idx] — the lock also covers the
-/// per-queue PRP list rebuild done by readSectors/writeSectors.
+/// LAPIC timer period in milliseconds (~100 Hz tick; epoll.zig uses the same).
+const TICK_MS: u64 = 10;
+/// Bounded wait for one I/O completion. Only hit when an interrupt is lost
+/// or the controller wedges; the wait loop harvests the CQ directly on every
+/// wake, so a lost interrupt degrades to tick-granularity polling, never a
+/// hang. Matches the spirit of the old 5M-pause polling timeout.
+const NVME_WAIT_TIMEOUT_MS: u64 = 500;
+
+/// Harvest one completion from CQ `q` if the phase bit shows one pending.
+/// Caller holds io_locks[q].
+fn harvestCqLocked(q: u32) ?NvmeCompletion {
+    const cq: [*]NvmeCompletion = @ptrFromInt(hhdm.physToVirt(io_cq_phys[q]));
+    const cpl = cq[io_cq_head[q]];
+    const phase = (cpl.status & 0x1) != 0;
+    if (phase != io_cq_phase[q]) return null;
+    io_cq_head[q] = (io_cq_head[q] + 1) % QUEUE_DEPTH;
+    // Phase toggles when CQ wraps around
+    if (io_cq_head[q] == 0) {
+        io_cq_phase[q] = !io_cq_phase[q];
+    }
+    writeDoorbell(io_cq_doorbell[q], io_cq_head[q]);
+    return cpl;
+}
+
+/// Unlink a wait node from a queue-local wait list. Caller holds io_locks[q].
+fn unlinkWaitLocked(queue: *?*task.WaitNode, node: *task.WaitNode) void {
+    var prev: ?*task.WaitNode = null;
+    var cur = queue.*;
+    while (cur) |n| {
+        if (n == node) {
+            if (prev) |p| {
+                p.next = n.next;
+            } else {
+                queue.* = n.next;
+            }
+            n.next = null;
+            return;
+        }
+        prev = n;
+        cur = n.next;
+    }
+}
+
+/// Pop the head waiter from a queue-local wait list and wake its task.
+/// Caller holds io_locks[q].
+fn wakeOneLocked(queue: *?*task.WaitNode) void {
+    const node = queue.* orelse return;
+    queue.* = node.next;
+    node.next = null;
+    @atomicStore(bool, &node.granted, true, .release);
+    task.unblockTask(node.task_idx);
+}
+
+inline fn tickNow() u64 {
+    if (comptime builtin.cpu.arch == .x86_64) {
+        return @import("../arch/x86_64/idt.zig").getTickCount();
+    }
+    // Unreachable: the interrupt-driven wait is only entered when MSI-X was
+    // enabled, which setupMsix restricts to x86_64.
+    return 0;
+}
+
+inline fn parkUntilInterrupt() void {
+    if (comptime builtin.cpu.arch == .x86_64) {
+        asm volatile ("sti; hlt");
+    } else if (comptime builtin.cpu.arch == .riscv64) {
+        asm volatile ("wfi");
+    } else if (comptime builtin.cpu.arch == .aarch64) {
+        asm volatile ("wfi");
+    } else {
+        unreachable;
+    }
+}
+
+/// Acquire exclusive ownership of queue `q`'s command channel (one command
+/// in flight per queue). Parks on io_chan_wait[q] while another submitter
+/// owns the channel; spins when called before the scheduler exists.
+fn acquireChannel(q: u32) void {
+    const my_idx = sched.currentTaskIndex();
+    var node: task.WaitNode = .{ .task_idx = 0 };
+    var linked = false;
+    while (true) {
+        const flags = io_locks[q].acquire();
+        if (!io_in_flight[q]) {
+            io_in_flight[q] = true;
+            // Our node may still be linked from a previous park iteration
+            // (we won the channel before the waker popped us) — unlink it so
+            // no later wake writes through a stale stack pointer.
+            if (linked) unlinkWaitLocked(&io_chan_wait[q], &node);
+            io_locks[q].release(flags);
+            // Restore the .blocked state we set while parked (no-op if the
+            // waker already did).
+            if (linked) task.unblockTask(my_idx.?);
+            return;
+        }
+        if (my_idx == null) {
+            // Pre-scheduler boot path: single-threaded, so the channel is
+            // always free; spin defensively.
+            io_locks[q].release(flags);
+            asm volatile ("pause");
+            continue;
+        }
+        // Link (once) while holding the lock — lost-wake safe against
+        // releaseChannel, which pops waiters under the same lock.
+        if (!linked) {
+            node.task_idx = my_idx.?;
+            node.next = io_chan_wait[q];
+            io_chan_wait[q] = &node;
+            linked = true;
+        }
+        if (task.getTask(my_idx.?)) |t| t.state = .blocked;
+        io_locks[q].release(flags);
+        parkUntilInterrupt();
+    }
+}
+
+/// Release queue `q`'s command channel and wake the next parked submitter.
+fn releaseChannel(q: u32) void {
+    const flags = io_locks[q].acquire();
+    io_in_flight[q] = false;
+    wakeOneLocked(&io_chan_wait[q]);
+    io_locks[q].release(flags);
+}
+
+/// Submit a command on an I/O queue and wait for completion.
+/// The caller owns the queue channel (acquireChannel).
+///
+/// MSI-X mode: park until the ISR harvests the CQ and wakes us. The wait is
+/// bounded (NVME_WAIT_TIMEOUT_MS) and every wake re-harvests the CQ
+/// directly, so a lost interrupt falls back to tick-granularity polling
+/// instead of hanging.
+///
+/// Polling mode (MSI-X unavailable): the pre-MSI-X spin loop, unchanged.
 fn submitIoCmd(queue_idx: u32, cmd: *const NvmeCommand) ?NvmeCompletion {
     const q = queue_idx;
-    const sq: [*]NvmeCommand = @ptrFromInt(hhdm.physToVirt(io_sq_phys[q]));
-    const tail = io_sq_tail[q];
-    sq[tail] = cmd.*;
 
-    io_sq_tail[q] = (io_sq_tail[q] + 1) % QUEUE_DEPTH;
-    writeDoorbell(io_sq_doorbell[q], io_sq_tail[q]);
+    {
+        const flags = io_locks[q].acquire();
+        const sq: [*]NvmeCommand = @ptrFromInt(hhdm.physToVirt(io_sq_phys[q]));
+        const tail = io_sq_tail[q];
+        sq[tail] = cmd.*;
+        io_sq_tail[q] = (io_sq_tail[q] + 1) % QUEUE_DEPTH;
+        writeDoorbell(io_sq_doorbell[q], io_sq_tail[q]);
+        io_locks[q].release(flags);
+    }
 
-    // Poll for completion using phase bit (v52.3 fix)
+    if (msix_vectors == 0) {
+        return pollCompletion(q);
+    }
+    return waitCompletionIrq(q);
+}
+
+/// Legacy spin-poll completion (pre-MSI-X behavior, polling fallback).
+fn pollCompletion(q: u32) ?NvmeCompletion {
     var timeout: u32 = 5000000;
-    const expected_phase = io_cq_phase[q];
     while (timeout > 0) : (timeout -= 1) {
-        const cq: [*]NvmeCompletion = @ptrFromInt(hhdm.physToVirt(io_cq_phys[q]));
-        const cpl = cq[io_cq_head[q]];
-        const phase = (cpl.status & 0x1) != 0;
-        if (phase == expected_phase) {
-            io_cq_head[q] = (io_cq_head[q] + 1) % QUEUE_DEPTH;
-            // Phase toggles when CQ wraps around
-            if (io_cq_head[q] == 0) {
-                io_cq_phase[q] = !io_cq_phase[q];
-            }
-            writeDoorbell(io_cq_doorbell[q], io_cq_head[q]);
-            return cpl;
-        }
+        const flags = io_locks[q].acquire();
+        const cpl = harvestCqLocked(q);
+        io_locks[q].release(flags);
+        if (cpl) |c| return c;
         asm volatile ("pause");
     }
     return null;
+}
+
+/// Interrupt-driven completion wait: park until the ISR hands over a
+/// completion, harvesting the CQ directly on every wake as the
+/// missed-interrupt fallback. Returns null on timeout (I/O error).
+fn waitCompletionIrq(q: u32) ?NvmeCompletion {
+    const my_idx = sched.currentTaskIndex();
+    var node: task.WaitNode = .{ .task_idx = 0 };
+
+    // Fast path + waiter link under the queue lock (lost-wake safe: the ISR
+    // harvests and wakes under the same lock).
+    var flags = io_locks[q].acquire();
+    if (harvestCqLocked(q)) |cpl| {
+        io_locks[q].release(flags);
+        return cpl;
+    }
+    io_done[q] = false;
+    if (my_idx) |idx| {
+        node.task_idx = idx;
+        node.next = io_cpl_wait[q];
+        io_cpl_wait[q] = &node;
+        if (task.getTask(idx)) |t| t.state = .blocked;
+    }
+    io_locks[q].release(flags);
+
+    const start = tickNow();
+    var result: ?NvmeCompletion = null;
+    while (true) {
+        flags = io_locks[q].acquire();
+        if (io_done[q]) {
+            result = io_result[q];
+            io_locks[q].release(flags);
+            break;
+        }
+        // Missed/delayed interrupt fallback: harvest the CQ ourselves.
+        if (harvestCqLocked(q)) |cpl| {
+            unlinkWaitLocked(&io_cpl_wait[q], &node);
+            io_locks[q].release(flags);
+            result = cpl;
+            break;
+        }
+        if ((tickNow() - start) * TICK_MS >= NVME_WAIT_TIMEOUT_MS) {
+            unlinkWaitLocked(&io_cpl_wait[q], &node);
+            io_locks[q].release(flags);
+            serial.writeString("[NVMe] IRQ wait timeout on queue ");
+            fmt.writeDecimal(q);
+            serial.writeString("\n");
+            break; // null — caller reports an I/O error
+        }
+        io_locks[q].release(flags);
+        parkUntilInterrupt();
+    }
+
+    // If we left the loop without the ISR waking us (self-harvest or
+    // timeout), restore the .blocked state we set above. No-op otherwise.
+    if (my_idx) |idx| task.unblockTask(idx);
+    return result;
+}
+
+/// MSI-X interrupt handler — called from IDT dispatch (vectors
+/// NVME_IRQ_VECTOR_BASE .. NVME_IRQ_VECTOR_BASE+MAX_IO_QUEUES-1) with the
+/// table index that fired. The caller has already sent the LAPIC EOI, so the
+/// next interrupt can be delivered while this runs. Takes only io_locks[q];
+/// never allocates, never sleeps.
+pub fn handleInterrupt(table_index: u32) void {
+    if (msix_vectors == 0) return;
+    for (0..num_io_queues) |q| {
+        if (iv_of_queue[q] != table_index) continue;
+        const flags = io_locks[q].acquire();
+        var completed = false;
+        while (harvestCqLocked(@intCast(q))) |cpl| {
+            io_result[q] = cpl;
+            completed = true;
+        }
+        if (completed) {
+            io_done[q] = true;
+            wakeOneLocked(&io_cpl_wait[q]);
+        }
+        io_locks[q].release(flags);
+    }
 }
 
 /// Select next I/O queue via round-robin (v52.0).
@@ -792,9 +1149,11 @@ pub fn readSectors(lba: u64, count: u32, buf: [*]u8) i32 {
     if (count == 0) return -1;
     const q = selectQueue();
 
-    // Serialize submit+poll+PRP-list rebuild on this queue (SMP fix)
-    const flags = io_locks[q].acquire();
-    defer io_locks[q].release(flags);
+    // Channel ownership serializes submit+wait+PRP-list rebuild on this
+    // queue (one command in flight; the PRP page stays stable during DMA).
+    // Parks instead of spinning when another submitter owns the channel.
+    acquireChannel(q);
+    defer releaseChannel(q);
 
     // Determine buffer physical address
     const buf_phys = hhdm.virtToPhys(@intFromPtr(buf));
@@ -819,6 +1178,7 @@ pub fn readSectors(lba: u64, count: u32, buf: [*]u8) i32 {
     // For larger transfers (crossing >2 pages), use PRP list
     // v52.5 fix: use page_offset+bytes instead of bytes alone for non-page-aligned buffers
     if (page_offset + bytes > 8192) {
+        const flags = io_locks[q].acquire();
         const prp_list: [*]u64 = @ptrFromInt(hhdm.physToVirt(prp_list_phys[q]));
         @memset(@as([*]u8, @ptrCast(prp_list))[0..4096], 0);
         var prp_count: u32 = 0;
@@ -828,6 +1188,7 @@ pub fn readSectors(lba: u64, count: u32, buf: [*]u8) i32 {
             cur_phys += 4096;
         }
         cmd.prp2 = prp_list_phys[q];
+        io_locks[q].release(flags);
     }
 
     const cpl = submitIoCmd(q, &cmd) orelse return -1;
@@ -849,9 +1210,10 @@ pub fn writeSectors(lba: u64, count: u32, buf: [*]const u8) i32 {
     if (count == 0) return -1;
     const q = selectQueue();
 
-    // Serialize submit+poll+PRP-list rebuild on this queue (SMP fix)
-    const flags = io_locks[q].acquire();
-    defer io_locks[q].release(flags);
+    // Channel ownership serializes submit+wait+PRP-list rebuild on this
+    // queue (one command in flight; the PRP page stays stable during DMA).
+    acquireChannel(q);
+    defer releaseChannel(q);
 
     const buf_phys = hhdm.virtToPhys(@intFromPtr(buf));
 
@@ -871,6 +1233,7 @@ pub fn writeSectors(lba: u64, count: u32, buf: [*]const u8) i32 {
     }
     // v52.5 fix: use page_offset+bytes for non-page-aligned buffers
     if (page_offset + bytes > 8192) {
+        const flags = io_locks[q].acquire();
         const prp_list: [*]u64 = @ptrFromInt(hhdm.physToVirt(prp_list_phys[q]));
         @memset(@as([*]u8, @ptrCast(prp_list))[0..4096], 0);
         var prp_count: u32 = 0;
@@ -880,6 +1243,7 @@ pub fn writeSectors(lba: u64, count: u32, buf: [*]const u8) i32 {
             cur_phys += 4096;
         }
         cmd.prp2 = prp_list_phys[q];
+        io_locks[q].release(flags);
     }
 
     const cpl = submitIoCmd(q, &cmd) orelse return -1;

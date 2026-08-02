@@ -299,6 +299,10 @@ pub fn interruptDispatch(frame: *InterruptFrame) callconv(.c) void {
     } else if (vector == 241) {
         // AHCI interrupt vector
         handleAhci(frame);
+    } else if (vector >= 242 and vector < 242 + 4) {
+        // NVMe MSI-X vectors (one per I/O queue, shared when fewer granted;
+        // nvme.NVME_IRQ_VECTOR_BASE .. +nvme.MAX_IO_QUEUES-1)
+        handleNvme(vector - 242);
     } else if (vector == YIELD_TRAP_VECTOR) {
         // Synchronous yield trap — software `int`, never an IPI.
         handleYieldTrap(frame);
@@ -733,6 +737,16 @@ fn handleAhci(frame: *InterruptFrame) void {
     // Send EOI to LAPIC (MSI interrupts still require LAPIC EOI)
     const lapic = @import("lapic.zig");
     lapic.eoi();
+}
+
+/// Handle NVMe MSI-X interrupt (vectors 242..245, one per I/O queue).
+/// EOI first so the LAPIC can deliver the next NVMe interrupt while the CQ
+/// harvest runs in the driver handler.
+fn handleNvme(table_index: u8) void {
+    const lapic = @import("lapic.zig");
+    lapic.eoi();
+    const nvme = @import("../../drivers/nvme.zig");
+    nvme.handleInterrupt(table_index);
 }
 
 /// Handle LAPIC timer interrupt (vector 240).

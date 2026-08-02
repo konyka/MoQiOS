@@ -13,6 +13,7 @@ const ipv6 = kt.ipv6;
 const str = kt.str;
 const tcp_util = kt.tcp_util;
 const udp_util = kt.udp_util;
+const pci_msix = kt.pci_msix;
 
 test {
     std.testing.refAllDecls(@This());
@@ -361,4 +362,88 @@ test "udp checksums match independently computed vectors" {
     dst6[3] = 0xb8;
     dst6[15] = 0x02;
     try std.testing.expectEqual(@as(u16, 0xebc3), udp_util.checksumV6(src6, dst6, &seg, seg.len));
+}
+
+/// Build a minimal fake PCI config-space image with a capabilities list.
+/// caps: list of .{ offset, cap_id, next_offset } entries; status bit 4 set.
+fn fakeConfigWithCaps(caps: []const struct { off: u8, id: u8, next: u8 }) [256]u8 {
+    var cfg: [256]u8 = @splat(0);
+    // Status register (offset 0x06), bit 4: capabilities list present.
+    cfg[0x06] = 0x10;
+    cfg[0x34] = if (caps.len > 0) caps[0].off else 0;
+    for (caps) |c| {
+        cfg[c.off] = c.id;
+        cfg[c.off + 1] = c.next;
+    }
+    return cfg;
+}
+
+test "pci capability walk finds MSI-X by ID 0x11" {
+    const cfg = fakeConfigWithCaps(&.{
+        .{ .off = 0x40, .id = 0x01, .next = 0x50 }, // Power Management
+        .{ .off = 0x50, .id = 0x05, .next = 0x60 }, // MSI
+        .{ .off = 0x60, .id = 0x11, .next = 0x00 }, // MSI-X (last)
+    });
+
+    try std.testing.expectEqual(@as(?u8, 0x60), pci_msix.findCapability(&cfg, 0x11));
+    try std.testing.expectEqual(@as(?u8, 0x50), pci_msix.findCapability(&cfg, 0x05));
+    // Capability not in the list terminates the walk with null.
+    try std.testing.expectEqual(@as(?u8, null), pci_msix.findCapability(&cfg, 0x10));
+
+    // No capabilities list (status bit 4 clear) -> null even if bytes match.
+    var no_caps = cfg;
+    no_caps[0x06] = 0;
+    try std.testing.expectEqual(@as(?u8, null), pci_msix.findCapability(&no_caps, 0x11));
+
+    // Empty list pointer -> null.
+    var empty = cfg;
+    empty[0x34] = 0;
+    try std.testing.expectEqual(@as(?u8, null), pci_msix.findCapability(&empty, 0x11));
+
+    // Truncated image cannot host a walk.
+    try std.testing.expectEqual(@as(?u8, null), pci_msix.findCapability(cfg[0..0x20], 0x11));
+}
+
+test "MSI-X capability parse decodes table size, BIR and offsets" {
+    var cfg = fakeConfigWithCaps(&.{
+        .{ .off = 0x40, .id = 0x11, .next = 0x00 },
+    });
+    // Message Control (cap+2): table size N-1 = 3 -> 4 entries.
+    cfg[0x42] = 0x03;
+    cfg[0x43] = 0x00;
+    // Table BIR/offset (cap+4): BIR=4, offset 0x0000_2000 (8-byte aligned).
+    byte_order.writeU32Le(cfg[0x44..0x48], 0x0000_2004);
+    // PBA BIR/offset (cap+8): BIR=4, offset 0x0000_3000.
+    byte_order.writeU32Le(cfg[0x48..0x4C], 0x0000_3004);
+
+    const info = pci_msix.parseMsixCapability(&cfg, 0x40).?;
+    try std.testing.expectEqual(@as(u16, 4), info.table_size);
+    try std.testing.expectEqual(@as(u8, 4), info.table_bir);
+    try std.testing.expectEqual(@as(u32, 0x2000), info.table_offset);
+    try std.testing.expectEqual(@as(u8, 4), info.pba_bir);
+    try std.testing.expectEqual(@as(u32, 0x3000), info.pba_offset);
+
+    // Wrong capability ID at the offset is rejected.
+    try std.testing.expectEqual(@as(?pci_msix.MsixInfo, null), pci_msix.parseMsixCapability(&cfg, 0x44));
+}
+
+test "MSI-X table size decode is N-1 based" {
+    try std.testing.expectEqual(@as(u16, 1), pci_msix.msixTableSize(0x0000));
+    try std.testing.expectEqual(@as(u16, 4), pci_msix.msixTableSize(0x0003));
+    try std.testing.expectEqual(@as(u16, 2048), pci_msix.msixTableSize(0x07FF));
+    // Enable/function-mask bits (14/15) do not leak into the size.
+    try std.testing.expectEqual(@as(u16, 5), pci_msix.msixTableSize(0xC004));
+}
+
+test "MSI-X message address/data compose fixed LAPIC delivery" {
+    // BSP (APIC ID 0): plain LAPIC base, vector in the low data byte.
+    try std.testing.expectEqual(@as(u64, 0xFEE0_0000), pci_msix.composeMessageAddress(0xFEE0_0000, 0));
+    try std.testing.expectEqual(@as(u32, 242), pci_msix.composeMessageData(242));
+
+    // Non-zero destination APIC ID lands in address bits 19:12.
+    try std.testing.expectEqual(@as(u64, 0xFEE0_3000), pci_msix.composeMessageAddress(0xFEE0_0000, 3));
+
+    // Data word: fixed delivery mode (000) keeps everything above the vector clear.
+    try std.testing.expectEqual(@as(u32, 0), pci_msix.composeMessageData(0));
+    try std.testing.expectEqual(@as(u32, 0xFF), pci_msix.composeMessageData(0xFF));
 }

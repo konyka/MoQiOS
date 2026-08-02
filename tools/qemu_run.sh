@@ -109,6 +109,9 @@ echo "========================================="
 #   MOQI_SERIAL      serial target (default: stdio; e.g. file:/tmp/serial.log)
 #   MOQI_SMP         number of CPUs (default: 2)
 #   MOQI_DISK        raw disk image path (default: disk.img)
+#   MOQI_NVME        attach an NVMe controller when != 0 (default: 1)
+#   MOQI_NVME_IMG    NVMe scratch image path (default: nvme.img); created and
+#                    pattern-stamped automatically when NVMe is enabled
 #   MOQI_ISO_DIR     ISO staging directory (default: iso_root)
 #   MOQI_ISO_FILE    generated ISO path (default: moqios.iso)
 #   MOQI_USER_BIN_DIR ramdisk input directory (default: user_bin)
@@ -117,6 +120,7 @@ echo "========================================="
 SERIAL_TARGET="${MOQI_SERIAL:-stdio}"
 SMP_COUNT="${MOQI_SMP:-2}"
 DISK_IMAGE="${MOQI_DISK:-disk.img}"
+NVME_IMAGE="${MOQI_NVME_IMG:-nvme.img}"
 EXTRA_QEMU_ARGS=()
 if [ -n "${MOQI_EXTRA_QEMU:-}" ]; then
     # Split an explicitly documented space-delimited option string once; array
@@ -134,6 +138,19 @@ if [ ! -f "$DISK_IMAGE" ]; then
     exit 1
 fi
 
+# Optional NVMe controller (scratch image; the virtio-blk disk above stays
+# the boot/root disk). The kernel stamps a boot-time interrupt-driven read
+# against this known first-sector pattern.
+NVME_ARGS=()
+if [ "${MOQI_NVME:-1}" != "0" ]; then
+    if [ ! -f "$NVME_IMAGE" ]; then
+        truncate -s 8M "$NVME_IMAGE"
+    fi
+    printf 'MoQiNVMe' | dd of="$NVME_IMAGE" bs=1 conv=notrunc status=none
+    NVME_ARGS=(-drive file="$NVME_IMAGE",format=raw,if=none,id=nvm0
+        -device nvme,serial=moqi,drive=nvm0)
+fi
+
 # exec so callers that background this script get the QEMU PID (not a leftover shell).
 exec qemu-system-x86_64 \
     -M q35 \
@@ -142,6 +159,7 @@ exec qemu-system-x86_64 \
     -boot order=d \
     -drive file="$DISK_IMAGE",format=raw,if=none,id=disk0 \
     -device virtio-blk-pci,drive=disk0 \
+    "${NVME_ARGS[@]}" \
     -netdev user,id=net0 \
     -device e1000,netdev=net0 \
     -smp "$SMP_COUNT" \
