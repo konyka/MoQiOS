@@ -311,12 +311,14 @@ pub fn unixSend(idx: u32, data: [*]const u8, len: usize) i64 {
         peer.buf_count += @as(u32, @intCast(n));
 
         // Wake any read waiter on peer
-        if (n > 0 and peer.read_waiters) |node| {
-            peer.read_waiters = node.next;
-            node.next = null;
-            @atomicStore(bool, &node.granted, true, .release);
-            const task_mod = @import("../proc/task.zig");
-            task_mod.unblockTask(node.task_idx);
+        if (n > 0) {
+            if (peer.read_waiters) |node| {
+                peer.read_waiters = node.next;
+                node.next = null;
+                @atomicStore(bool, &node.granted, true, .release);
+                const task_mod = @import("../proc/task.zig");
+                task_mod.unblockTask(node.task_idx);
+            }
         }
 
         if (n == 0 and len > 0) return -11; // EAGAIN

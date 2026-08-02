@@ -865,6 +865,23 @@ pub fn getFileSize(file_idx: u32) u64 {
     return open_files[file_idx].inode.size;
 }
 
+/// Re-read the on-disk inode and refresh the slot's cached size. Each open
+/// slot keeps its own inode copy, so a write through one slot never reaches
+/// the others' inode.size — concurrent fds would see a stale EOF without
+/// this. Returns the refreshed size (cached value on read failure).
+pub fn refreshSize(file_idx: u32) u64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (file_idx >= open_count) return 0;
+    const f = &open_files[file_idx];
+    if (f.inode_num == 0) return 0;
+    var disk_inode: Ext2Inode = undefined;
+    if (readInode(f.inode_num, &disk_inode)) {
+        f.inode.size = disk_inode.size;
+    }
+    return f.inode.size;
+}
+
 pub fn closeFile(file_idx: u32) void {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);

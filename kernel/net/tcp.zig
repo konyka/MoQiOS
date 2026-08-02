@@ -3365,6 +3365,29 @@ pub fn tcpShutdown(tcb_idx: u32, how: u32) i64 {
                     _ = sendSegment(tcb, FIN | ACK, undefined, 0);
                     tcpLog("[tcp] shutdown RDWR FIN → LAST_ACK\n");
                 },
+                .listen => {
+                    // Same teardown as tcpClose's .listen arm: clear the
+                    // listen slot so the port stops answering SYNs, and free
+                    // the pending backlog TCBs nobody can accept anymore.
+                    var lbm = listen_active_bitmap;
+                    while (lbm != 0) {
+                        const i = @ctz(lbm);
+                        lbm &= lbm - 1;
+                        const ls = &listen_slots[i];
+                        if (ls.local_port == tcb.local_port and ls.is_v6 == tcb.is_v6) {
+                            while (ls.pending_head != ls.pending_tail) {
+                                const pidx = ls.pending_tpbs[ls.pending_head % LISTEN_BACKLOG];
+                                ls.pending_head += 1;
+                                if (pidx < MAX_CONNECTIONS and tcbs[pidx].active) deactivateTcb(&tcbs[pidx]);
+                            }
+                            listen_active_bitmap &= ~(@as(u64, 1) << @intCast(i));
+                            ls.active = false;
+                            break;
+                        }
+                    }
+                    tcb.state = .closed;
+                    deactivateTcb(tcb);
+                },
                 else => {
                     tcb.state = .closed;
                     deactivateTcb(tcb);

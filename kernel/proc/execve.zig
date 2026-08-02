@@ -21,14 +21,16 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64) ?u64 {
     serial.writeString(name);
     serial.writeString("'\n");
 
-    // Build argv array from user-space argv pointer
+    // Build argv array from user-space argv pointer.
+    // Linux semantics: the caller's argv is authoritative — their argv[0] is
+    // the program's argv[0]. Only fall back to the resolved path when the
+    // caller supplied an empty/absent argv.
     var argv_buffers: [16][128]u8 = undefined;
     var argv_slices: [16][]const u8 = undefined;
-    var argc: usize = 1;
-    argv_slices[0] = name;
+    var argc: usize = 0;
 
     if (argv_ptr != 0 and argv_ptr < 0x0000_8000_0000_0000) {
-        for (1..16) |i| {
+        for (0..16) |i| {
             var ptr_bytes: [8]u8 = undefined;
             const pc = copy.copyFromUser(ptr_bytes[0..], @ptrFromInt(argv_ptr + i * 8), 8);
             if (pc < 8) break;
@@ -42,6 +44,10 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64) ?u64 {
             argv_slices[i] = argv_buffers[i][0..al];
             argc = i + 1;
         }
+    }
+    if (argc == 0) {
+        argv_slices[0] = name;
+        argc = 1;
     }
 
     // Load the new program — if this fails, old address space is intact, caller can return error
@@ -129,14 +135,16 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64) ?u64 {
     serial.writeString(name);
     serial.writeString("'\n");
 
-    // Build argv array from user-space argv pointer
+    // Build argv array from user-space argv pointer.
+    // Linux semantics: the caller's argv is authoritative — their argv[0] is
+    // the program's argv[0]. Only fall back to the resolved path when the
+    // caller supplied an empty/absent argv.
     var argv_buffers: [16][128]u8 = undefined;
     var argv_slices: [16][]const u8 = undefined;
-    var argc: usize = 1;
-    argv_slices[0] = name;
+    var argc: usize = 0;
 
     if (argv_ptr != 0 and argv_ptr < 0x0000_8000_0000_0000) {
-        for (1..16) |i| {
+        for (0..16) |i| {
             var ptr_bytes: [8]u8 = undefined;
             const pc = copy.copyFromUser(ptr_bytes[0..], @ptrFromInt(argv_ptr + i * 8), 8);
             if (pc < 8) break;
@@ -150,6 +158,10 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64) ?u64 {
             argv_slices[i] = argv_buffers[i][0..al];
             argc = i + 1;
         }
+    }
+    if (argc == 0) {
+        argv_slices[0] = name;
+        argc = 1;
     }
 
     const loader = @import("loader.zig");

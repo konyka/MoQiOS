@@ -115,7 +115,9 @@ pub const Task = struct {
 
     /// Signal mask — blocked signals (bit N = signal N+1 is blocked).
     /// SIGKILL (9) and SIGSTOP (19) cannot be blocked.
-    signal_mask: u32,
+    /// 64-bit to match the rt_* sigset_t ABI; only bits 0-30 are meaningful
+    /// (pending_signals stays u32 — signals 1-31 are supported).
+    signal_mask: u64,
 
     /// Signal handler addresses. 0 = default (terminate for now).
     /// Index 0 = signal 1 (SIGHUP), ..., index 30 = signal 31 (SIGUSR2).

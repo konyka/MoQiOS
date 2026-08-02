@@ -277,7 +277,11 @@ pub fn epollWait(epfd_idx: u32, events_buf: u64, max_events: u32, timeout_ms: i3
             const elapsed_ms = (idt.getTickCount() - start_tick) * TICK_MS;
             if (elapsed_ms >= @as(u64, @intCast(timeout_ms))) return 0;
         }
-        if (blockOnEpoll(inst, start_tick, timeout_ms)) return 0; // timed out
+        switch (blockOnEpoll(inst, start_tick, timeout_ms)) {
+            .event => {},
+            .timeout => return 0,
+            .interrupted => return -4, // EINTR — a signal kicked us out of the wait
+        }
     }
 }
 
@@ -339,6 +343,7 @@ fn copyEventFromUser(event_ptr: u64) ?EpollEvent {
 fn resourceIdxFromDesc(desc: *const vfs.FileDescriptor) u32 {
     return switch (desc.fd_type) {
         .tcp_socket => desc.tcb_idx,
+        .udp_socket => desc.udp_port,
         .pipe_read => desc.pipe_idx,
         .pipe_write => desc.pipe_idx,
         .epoll => desc.epoll_idx,
@@ -368,12 +373,12 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32) u32 {
         .pipe_read => {
             const state = vfs.pipeState(resource_idx) orelse return EPOLLERR;
             if (state.readable > 0) revents |= EPOLLIN;
-            if (state.readable == 0 and state.peer_closed) revents |= EPOLLHUP;
+            if (state.readable == 0 and !state.write_open) revents |= EPOLLHUP;
         },
         .pipe_write => {
             const state = vfs.pipeState(resource_idx) orelse return EPOLLERR;
             if (state.writable) revents |= EPOLLOUT;
-            if (state.peer_closed) revents |= EPOLLERR;
+            if (!state.read_open) revents |= EPOLLERR;
         },
         .special => {
             revents |= EPOLLIN | EPOLLOUT;
@@ -387,7 +392,10 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32) u32 {
             revents |= EPOLLOUT;
         },
         .eventfd => {
-            revents |= EPOLLIN | EPOLLOUT;
+            // Level-triggered: readable only while the counter is non-zero.
+            const eventfd_mod = @import("../fs/eventfd.zig");
+            if (eventfd_mod.eventfdGetCounter(resource_idx) > 0) revents |= EPOLLIN;
+            revents |= EPOLLOUT;
         },
         .timerfd => {
             const timerfd_mod = @import("../ipc/timerfd.zig");
@@ -403,13 +411,18 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32) u32 {
             revents |= EPOLLIN | EPOLLOUT;
         },
         .udp_socket => {
-            revents |= EPOLLIN | EPOLLOUT;
+            // Level-triggered: readable only while a datagram is queued —
+            // reporting EPOLLIN unconditionally made LT epoll busy-spin.
+            // resource_idx carries the UDP port (see resourceIdxFromDesc).
+            const udp_mod = @import("udp.zig");
+            if (udp_mod.hasQueuedDatagram(@intCast(resource_idx))) revents |= EPOLLIN;
+            revents |= EPOLLOUT; // datagram sockets are always writable
         },
         .inotify => {
             revents |= EPOLLIN | EPOLLOUT;
         },
         .raw_socket => {
-            revents |= EPOLLIN | EPOLLOUT;
+            revents |= EPOLLOUT; // no per-socket RX queue to test
         },
     }
     return revents;
@@ -509,19 +522,29 @@ fn collectEvents(inst: *EpollInstance, out: []EpollEvent, max_out: u32) u32 {
     return count;
 }
 
-/// Block until an event arrives or the tick-based deadline expires.
-/// Returns true on timeout (caller returns 0 to userspace).
-fn blockOnEpoll(inst: *EpollInstance, start_tick: u64, timeout_ms: i32) bool {
+/// Result of blockOnEpoll.
+const BlockOutcome = enum {
+    /// Woken by a readiness notification (or events were already pending).
+    event,
+    /// The tick-based deadline expired (caller returns 0 to userspace).
+    timeout,
+    /// A pending signal kicked the task out of the wait (caller returns -EINTR).
+    interrupted,
+};
+
+/// Block until an event arrives, the tick-based deadline expires, or a
+/// pending signal interrupts the wait.
+fn blockOnEpoll(inst: *EpollInstance, start_tick: u64, timeout_ms: i32) BlockOutcome {
     const my_idx = sched.currentTaskIndex() orelse {
         asm volatile ("sti; hlt");
-        return false;
+        return .event;
     };
 
     const saved = inst.spin.acquire();
 
     if (inst.ready_head != null) {
         inst.spin.release(saved);
-        return false;
+        return .event;
     }
 
     var node = WaitNode{
@@ -551,13 +574,30 @@ fn blockOnEpoll(inst: *EpollInstance, start_tick: u64, timeout_ms: i32) bool {
                 if (!granted) {
                     // We set our own state to .blocked above — restore it.
                     task_mod.unblockTask(my_idx);
-                    return true;
+                    return .timeout;
+                }
+            }
+        }
+        // Signal kick: sendSignal unblocks the task without granting the
+        // wait node. Bail out with EINTR (handled signal) or die via the
+        // same exit-by-signal path the timer tick uses (fatal default).
+        if (task_mod.getTask(my_idx)) |ct| {
+            const sig_mod = @import("../proc/signal.zig");
+            if (sig_mod.pendingAny(ct)) {
+                const s2 = inst.spin.acquire();
+                const granted = node.granted;
+                if (!granted) removeWaiterLocked(inst, &node);
+                inst.spin.release(s2);
+                if (!granted) {
+                    task_mod.unblockTask(my_idx);
+                    if (sig_mod.pendingFatal(ct)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+                    return .interrupted;
                 }
             }
         }
         asm volatile ("sti; hlt");
     }
-    return false;
+    return .event;
 }
 
 /// Unlink a wait node from the instance waiter list. Caller holds inst.spin.

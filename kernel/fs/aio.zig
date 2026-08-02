@@ -236,6 +236,8 @@ fn executePread(iocb: *const IoCb) i64 {
     if (fd >= cur.fd_table.fds.len) return EINVAL;
     if (iocb.aio_buf == 0 or iocb.aio_buf >= 0x0000_8000_0000_0000) return EFAULT;
     if (iocb.aio_nbytes == 0) return 0;
+    // A negative offset would trap the @intCast below; reject it up front.
+    if (iocb.aio_offset < 0) return EINVAL;
 
     // Save offset, set to requested position, read via VFS, restore
     const saved_offset = cur.fd_table.fds[fd].offset;
@@ -250,10 +252,13 @@ fn executePread(iocb: *const IoCb) i64 {
         var kbuf: [4096]u8 = undefined;
         const n = cur.fd_table.read(fd, &kbuf, chunk);
         if (n <= 0) break;
+        // Credit what copyToUser delivered, not what the file produced —
+        // bytes that never reached the user buffer were never read as far
+        // as the caller is concerned (same rule as file_io.zig read).
         const written = copy_mod.copyToUser(@ptrFromInt(dst), kbuf[0..@intCast(n)], @intCast(n));
-        total += @intCast(n);
-        dst += @as(u64, @intCast(n));
-        remaining -= @intCast(n);
+        total += written;
+        dst += @as(u64, @intCast(written));
+        remaining -= written;
         if (n < @as(i64, @intCast(chunk)) or written < @as(usize, @intCast(n))) break;
     }
 
@@ -273,6 +278,8 @@ fn executePwrite(iocb: *const IoCb) i64 {
     if (fd >= cur.fd_table.fds.len) return EINVAL;
     if (iocb.aio_buf == 0 or iocb.aio_buf >= 0x0000_8000_0000_0000) return EFAULT;
     if (iocb.aio_nbytes == 0) return 0;
+    // A negative offset would trap the @intCast below; reject it up front.
+    if (iocb.aio_offset < 0) return EINVAL;
 
     // Save offset, set to requested position, write via VFS, restore
     const saved_offset = cur.fd_table.fds[fd].offset;

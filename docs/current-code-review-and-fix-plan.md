@@ -1520,24 +1520,30 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 ### 6.5 本轮明确未修复（留待下一轮）
 
-- vfs 已解码但不执行 O_APPEND / O_TRUNC
-- socket fd 上限硬编码 16/32，未用 `vfs.MAX_FDS`（`socket_opt.zig:67`，`socket_syscall.zig:617/630/671`）
-- 信号不会唤醒阻塞中的任务（`sendSignal` 不解除阻塞）
-- SIGINT/sigaction ABI 截断（28B vs 152B）
-- AF_UNIX connect/send 未接入系统调用
-- DNS/DHCP 接收路径（未注册端口、广播 ARP）
-- netif 硬编码 10.0.2.15
-- panic 不停 AP + 串口锁递归
-- x86 符号表为死代码（344KB BSS）
-- `mapAcpiRegion` 在 1GiB HHDM 下为空操作
-- `sk5.zig` 无引用
-- RwLock/SeqLock/TicketSpinlock 未使用且有缺陷
-- execve argv[0] 前置行为与 Linux 不一致
-- fat32 `setFATEntry` 忽略读失败
-- NVMe admin queue 引导后无锁
-- `kernel/boot_info.zig` 孤儿文件
-- 空目录 `tools/mkimage`、`tools/qemu_run`、`tools/test_runner`
-- posix_mq 超时精度受限于唤醒事件
+以下 18 项已全部于 2026-08-01 补完（提交 `fix: implement deferred review items`）：
+
+- ~~vfs 已解码但不执行 O_APPEND / O_TRUNC~~ → open 存入 status_flags（F_GETFL/F_SETFL 生效），write 路径执行 O_APPEND，tmpfs/fat32/ext2 实现 O_TRUNC（新增 `tmpfsTruncate`、`fat32.truncateFile`）
+- ~~socket fd 上限硬编码 16/32~~ → 统一改用 `vfs.MAX_FDS`
+- ~~信号不会唤醒阻塞中的任务~~ → `sendSignal` 增加 `kickIfBlocked`（unblockTask + 跨核 kick）；semop/timerfd/epoll/futex/posix_mq 等待循环在唤醒后检查 pending 信号，致命信号走 exitTask，其余返回 -EINTR
+- ~~SIGINT/sigaction ABI 截断（28B vs 152B）~~ → signal_mask 扩为 u64；sigaction 在缓冲区足够时读取 offset 24 的 8 字节 sa_mask（28 字节旧调用方兼容）；sigprocmask 支持 sigsetsize=8
+- ~~AF_UNIX connect/send 未接入系统调用~~ → connect/sendto/read/write 已接线（STREAM/已 connect 的 DGRAM）
+- ~~DNS/DHCP 接收路径~~ → 查询前注册端口、等待循环内泵 RX、255.255.255.255 广播直接用广播 MAC；parseIpV4 改 u32 累加防 panic
+- ~~netif 硬编码 10.0.2.15~~ → DHCP 已配置时返回 `dhcp.getIp()`
+- ~~panic 不停 AP + 串口锁递归~~ → `panicking` 原子标志：AP 在定时器 tick 检查并停驻；panic 重入回退到无锁 0x3F8 直写
+- ~~x86 符号表为死代码（344KB BSS）~~ → x86 不再初始化，MAX_SYMBOLS 缩至 64
+- ~~`mapAcpiRegion` 在 1GiB HHDM 下为空操作~~ → 改为带覆盖校验的 no-op 并在失败时告警
+- ~~`sk5.zig` 无引用~~ → 已删除
+- ~~RwLock/SeqLock/TicketSpinlock 未使用且有缺陷~~ → RwLock 全程关中断 + writer_wait 全程有效；SeqLock 更名 readNeedsRetry 并加获取屏障；TicketSpinlock 增加中断屏蔽
+- ~~execve argv[0] 前置行为与 Linux 不一致~~ → 按 Linux 语义使用用户 argv，sh.c 相应补 argv[0]
+- ~~fat32 `setFATEntry` 忽略读失败~~ → 返回 bool 并全量传播
+- ~~NVMe admin queue 引导后无锁~~ → 增加 admin_lock
+- ~~`kernel/boot_info.zig` 孤儿文件~~ → 已删除
+- ~~空目录 `tools/mkimage`、`tools/qemu_run`、`tools/test_runner`~~ → 已删除
+- ~~posix_mq 超时精度受限于唤醒事件~~ → 增加 futex 风格 deadline 位图 + sched 维护 tick 驱动的 `posix_mq.timerTick`
+
+本轮顺带修复：AIO 负 offset panic 与字节计数、file_io 首块错误返回、非 ext2 truncate 假成功、shutdown 监听槽泄漏、UDP 端口 fork 引用计数、pipe 读端关闭后 EPIPE/SIGPIPE、timerfd 虚假 -1 与周期过期累计、sysv_sem SETVAL 唤醒、mq_close/mqNotify、tcp sendto EDESTADDRREQ、recvmmsg 预校验、epoll 事件忙等、readahead 双插入、wb_tick 无锁、ext2 跨 fd 过期 inode.size。
+
+仍遗留（下一轮）：EINTR 未覆盖 ipc.zig receive/file_lock F_SETLKW/waitpid 阻塞；panic 停 AP 为 tick 检查（~10ms 延迟）而非 NMI；servers/、lib/、drivers/ 空占位目录保留作意向文档。
 
 ---
 

@@ -236,21 +236,54 @@ pub fn timerfdGettime(timerfd_idx: u32, curr_value: *Itimerspec) i32 {
     return 0;
 }
 
+/// Unlink a wait node from the instance waiter list. Caller holds timer_lock.
+/// tick/close pop the node they wake; this covers wakes that bypass the queue
+/// (signal kick) so the stack-allocated node never dangles.
+fn unlinkWaiter(inst: *TimerInstance, node: *WaitNode) void {
+    var prev: ?*WaitNode = null;
+    var cur = inst.waiter;
+    while (cur) |n| {
+        if (n == node) {
+            if (prev) |p| {
+                p.next = n.next;
+            } else {
+                inst.waiter = n.next;
+            }
+            n.next = null;
+            return;
+        }
+        prev = n;
+        cur = n.next;
+    }
+}
+
 /// Read from a timerfd instance.
-/// Returns 8 on success (u64 expiration count), -1 on error, 0 if would block.
+/// Returns 8 on success (u64 expiration count), -EBADF if the instance was
+/// destroyed while waiting, -EINTR on signal, -EAGAIN if non-blocking.
 pub fn timerfdRead(timerfd_idx: u32, buf: [*]u8, count: usize) i64 {
     if (timerfd_idx >= MAX_TIMERFD_INSTANCES) return -1;
-    const inst = &timer_pool[timerfd_idx];
-    if (!inst.valid) return -1;
     if (count < 8) return -1;
 
-    const saved = timer_lock.acquire();
-
-    if (inst.expirations == 0) {
+    while (true) {
+        const saved = timer_lock.acquire();
+        const inst = &timer_pool[timerfd_idx];
+        if (!inst.valid) {
+            timer_lock.release(saved);
+            return -9; // EBADF — destroyed (timerfdClose) while we waited
+        }
+        if (inst.expirations > 0) {
+            const val = inst.expirations;
+            inst.expirations = 0;
+            timer_lock.release(saved);
+            // Write little-endian u64
+            bo.writeU64At(buf, 0, val);
+            return 8;
+        }
         if ((inst.flags & TFD_NONBLOCK) != 0) {
             timer_lock.release(saved);
             return -11; // EAGAIN
         }
+
         // Block the current task
         const cur_idx = sched.currentTaskIndex() orelse {
             timer_lock.release(saved);
@@ -267,25 +300,22 @@ pub fn timerfdRead(timerfd_idx: u32, buf: [*]u8, count: usize) i64 {
         // Yield — reschedule will pick another task
         asm volatile ("int $240");
 
-        // Woken up — check again
+        // Woken up — unlink defensively (tick/close already pop their wake;
+        // a signal kick leaves the node linked), then decide: re-block unless
+        // the instance was destroyed (EBADF, checked at the top of the loop)
+        // or a signal arrived (EINTR / fatal exit). Previously an early wake
+        // (e.g. timerfdClose granting the node) surfaced as a spurious -1.
         const saved2 = timer_lock.acquire();
-        defer timer_lock.release(saved2);
+        unlinkWaiter(inst, &node);
+        timer_lock.release(saved2);
 
-        if (inst.expirations == 0) return -1;
-    } else {
-        timer_lock.release(saved);
+        if (task_mod.getTask(cur_idx)) |ct| {
+            const sig_mod = @import("../proc/signal.zig");
+            if (sig_mod.pendingFatal(ct)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+            if (sig_mod.pendingAny(ct)) return -4; // EINTR
+        }
+        // loop and re-check / re-block
     }
-
-    // Re-acquire to read expirations
-    const saved3 = timer_lock.acquire();
-    const val = inst.expirations;
-    inst.expirations = 0;
-    timer_lock.release(saved3);
-
-    // Write little-endian u64
-    bo.writeU64At(buf, 0, val);
-
-    return 8;
 }
 
 /// Add a cross-process reference (fork/clone fd-table copy).
@@ -346,17 +376,24 @@ pub fn timerTick(current_tick: u64) void {
         if (!inst.valid or !inst.active) continue;
 
         if (current_tick >= inst.expiry_tick) {
-            inst.expirations += 1;
-
             if (inst.interval_ns > 0) {
-                // Repeating timer: schedule next expiration
+                // Repeating timer: accumulate ALL missed expirations, not
+                // just one — a task waking late must read the full count.
                 const interval_ticks = nsToTicks(inst.interval_ns) orelse std.math.maxInt(u64);
+                if (interval_ticks > 0 and interval_ticks != std.math.maxInt(u64)) {
+                    const missed: u64 = 1 + (current_tick - inst.expiry_tick) / interval_ticks;
+                    inst.expirations +|= missed;
+                } else {
+                    inst.expirations +|= 1;
+                }
+                // Schedule next expiration
                 inst.expiry_tick = if (interval_ticks > std.math.maxInt(u64) - current_tick)
                     std.math.maxInt(u64)
                 else
                     current_tick + interval_ticks;
             } else {
                 // One-shot timer: stop
+                inst.expirations +|= 1;
                 inst.active = false;
             }
 

@@ -119,7 +119,7 @@ ext2 多级目录读写删，QEMU 串口验证，零异常、零三重故障）�
   详见 **1.8 节**。
 - ~~**大量未接入源文件**~~（**已解决**）：`mm/mprotect.zig`、`proc/clone.zig`、
   `ipc/sysv_*.zig`、`fs/select.zig` 等此前未被 `@import` 的脚手架现均已接入构建并被
-  实际引用。当前已知的孤儿文件仅剩 `kernel/boot_info.zig`（无任何模块导入）。
+  实际引用。此前的孤儿文件 `kernel/boot_info.zig`、`shared/sk5.zig` 经确认无引用后已删除。
 - **测试分层**：`zig build test` 已作为主机侧单元测试入口，覆盖可脱离硬件执行的共享库逻辑
   （如字节序、字符串、整数格式化边界）；真正的内核/用户态集成仍以 QEMU 中运行的 `hello*`
   运行时测试为准。
@@ -547,8 +547,7 @@ QEMU / 真机
   │    └─ 跳转至 kernel_main
   │
   ├─ kernel_main() [kernel/main.zig]
-  │    ├─ 解析 Limine 启动信息 (limine.zig 请求/响应；注意 kernel/boot_info.zig 为
-  │    │    无引用孤儿文件，不参与启动流程)
+  │    ├─ 解析 Limine 启动信息 (limine.zig 请求/响应)
   │    ├─ 初始化 GDT (gdt.zig) — 代码/数据/TSS 段
   │    ├─ 初始化 IDT (idt.zig) — 异常 + IRQ 中断
   │    ├─ 初始化串口 (serial.zig) — COM1 调试输出

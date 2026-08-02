@@ -9,9 +9,10 @@ pub const Symbol = struct {
     name_len: u8 = 0,
 };
 
-/// SK-37: non-x86 bring-up has no ELF .symtab loader; a small table keeps
-/// the panic-backtrace API alive without 320KB of dead BSS.
-const MAX_SYMBOLS: u32 = if (@import("builtin").cpu.arch == .x86_64) 4096 else 64;
+/// SK-37: there is no ELF .symtab loader on any target; only the non-x86
+/// SK-35 probe ever calls addSymbol. A small table keeps the panic-backtrace
+/// API alive without ~344KB (4096 entries) of dead BSS on x86.
+const MAX_SYMBOLS: u32 = 64;
 
 pub const SymbolTable = struct {
     symbols: [MAX_SYMBOLS]Symbol,

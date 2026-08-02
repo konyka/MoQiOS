@@ -90,15 +90,17 @@ void _start(void) {
     if (syscall3(SYS_MSGCTL, msgid, IPC_STAT, (uint64_t)msg_info) != 0) fail("msgctl stat");
     if (msg_info[4] != mode) fail("msgctl mode changed");
 
-    uint32_t expected_mask = (uint32_t)1 << 1;
-    uint32_t observed_mask = 0;
-    if (syscall3(SYS_SIGPROCMASK, 2, (uint64_t)&expected_mask, 0) != 0) fail("sigprocmask set");
+    /* sigprocmask now takes the rt_* ABI: 8-byte masks with sigsetsize=8 in
+       the 4th argument (r10). */
+    uint64_t expected_mask = (uint64_t)1 << 1;
+    uint64_t observed_mask = 0;
+    if (syscall6(SYS_SIGPROCMASK, 2, (uint64_t)&expected_mask, 0, 8, 0, 0) != 0) fail("sigprocmask set");
     if (syscall2(SYS_RT_SIGSUSPEND, 0, 4) != -EFAULT) fail("rt_sigsuspend EFAULT");
-    if (syscall3(SYS_SIGPROCMASK, 2, 0, (uint64_t)&observed_mask) != 0) fail("sigprocmask get");
+    if (syscall6(SYS_SIGPROCMASK, 2, 0, (uint64_t)&observed_mask, 8, 0, 0) != 0) fail("sigprocmask get");
     if (observed_mask != expected_mask) fail("signal mask changed");
 
     if (syscall2(SYS_RT_SIGSUSPEND, (uint64_t)copy_page, 4) != -EFAULT) fail("rt_sigsuspend EFAULT");
-    if (syscall3(SYS_SIGPROCMASK, 2, 0, (uint64_t)&expected_mask) != 0) fail("sigprocmask get after failure");
+    if (syscall6(SYS_SIGPROCMASK, 2, 0, (uint64_t)&expected_mask, 8, 0, 0) != 0) fail("sigprocmask get after failure");
     if (expected_mask != observed_mask) fail("rt_sigsuspend failed mask");
 
     uint64_t new_mode = 0600;
@@ -107,9 +109,9 @@ void _start(void) {
     if (syscall3(SYS_MSGCTL, msgid, IPC_STAT, (uint64_t)msg_info) != 0) fail("msgctl stat after set");
     if (msg_info[4] != new_mode) fail("msgctl mode after set");
 
-    observed_mask = (uint32_t)1 << 2;
+    observed_mask = (uint64_t)1 << 2;
     if (syscall2(SYS_RT_SIGSUSPEND, (uint64_t)&observed_mask, 4) != -EINTR) fail("rt_sigsuspend success");
-    if (syscall3(SYS_SIGPROCMASK, 2, 0, (uint64_t)&expected_mask) != 0) fail("sigprocmask get after success");
+    if (syscall6(SYS_SIGPROCMASK, 2, 0, (uint64_t)&expected_mask, 8, 0, 0) != 0) fail("sigprocmask get after success");
     if (expected_mask != observed_mask) fail("rt_sigsuspend mask");
 
     syscall3(SYS_MSGCTL, msgid, IPC_RMID, 0);

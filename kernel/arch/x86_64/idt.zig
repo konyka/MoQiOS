@@ -747,6 +747,14 @@ fn handleLapicTimer(frame: *InterruptFrame) void {
     const lapic = @import("lapic.zig");
     lapic.eoi();
 
+    // Panic park: another CPU is inside panic() — stop scheduling and halt
+    // instead of interleaving serial output with the panic dump. The panicking
+    // CPU itself never gets here (it masked IRQs on entry).
+    if (@import("../../panic.zig").isPanicking()) {
+        const cpu = @import("arch_impl.zig").cpu;
+        cpu.halt();
+    }
+
     const sc = @import("syscall_entry.zig");
     if (sc.getPerCpu().cpu_id == 0) {
         incrementTick();

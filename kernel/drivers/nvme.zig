@@ -168,6 +168,13 @@ var io_locks: [MAX_IO_QUEUES]IrqSpinlock = @splat(.{});
 var num_io_queues: u32 = 0; // Actual number of I/O queues created
 var io_queue_rr: u32 = 0; // Round-robin queue selector
 
+// Serializes admin queue submission. Admin commands only run during
+// single-threaded init today, but the queue registers (admin_sq_tail,
+// admin_cq_head, admin_cq_phase) are global: any future post-boot admin
+// command (namespace mgmt, sanitize, log pages) would corrupt an in-flight
+// submission without this lock.
+var admin_lock: IrqSpinlock = .{};
+
 var nsid: u32 = 1; // Active namespace ID
 var lba_size: u32 = 512; // Logical Block Size
 var total_lbas: u64 = 0; // Total LBAs in namespace
@@ -623,6 +630,9 @@ pub fn isEnabled() bool {
 // ─── Admin Queue Commands ────────────────────────────────────────────────
 
 fn submitAdminCmd(cmd: *const NvmeCommand) ?NvmeCompletion {
+    const lock_flags = admin_lock.acquire();
+    defer admin_lock.release(lock_flags);
+
     const sq: [*]NvmeCommand = @ptrFromInt(hhdm.physToVirt(admin_sq_phys));
     const tail = admin_sq_tail;
     sq[tail] = cmd.*;

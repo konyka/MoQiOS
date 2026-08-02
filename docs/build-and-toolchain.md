@@ -319,18 +319,18 @@ gdb zig-out/bin/moqi-kernel.elf
 
 | 类别 | 文件 | 说明 |
 |---|---|---|
-| 同步原语 | `sync/rwlock.zig` `sync/seqlock.zig` `sync/ticket_spinlock.zig` | 多种锁实现（25–71 行） |
+| 同步原语 | `sync/rwlock.zig` `sync/seqlock.zig` `sync/ticket_spinlock.zig` | 多种锁实现（尚无树内使用者，2026-08 已修复其缺陷） |
 | 内存 | `mm/process_vm.zig` | process_vm_readv/writev（116 行） |
-| 共享阶梯 | `shared/sk5.zig` | 早期非 x86 PMM/slab arena 引导，疑似已被后续 sk 阶梯取代 |
-| 其他 | `arch/x86_64/user_mode.zig` `arch/x86_64/vga.zig` `boot_info.zig` | 疑似被现有实现取代的早期模块 |
+| 其他 | `arch/x86_64/user_mode.zig` `arch/x86_64/vga.zig` | 疑似被现有实现取代的早期模块 |
+
+（`shared/sk5.zig` 与 `kernel/boot_info.zig` 经确认无引用，已于 2026-08 删除。）
 
 ### 处理建议
 
 1. **不要直接删除**：这些是作者的在制功能（WIP），删除会丢失已完成工作。
 2. **按需逐个集成**：需要某个能力时，将对应文件 `@import` 进相关模块，`zig build` 修正类型
    不匹配，最后补一个 `hello*` 运行时测试。
-3. **`boot_info.zig` / `vga.zig` / `user_mode.zig` / `sk5.zig`** 需先确认是否已被现有实现
-   取代，若确认废弃可单独清理。
+3. **`vga.zig` / `user_mode.zig`** 需先确认是否已被现有实现取代，若确认废弃可单独清理。
 4. 在集成前，这些文件**不应**被视为"已支持的功能"——以"可达即编译"的 317 个文件为准。
 
 ---

@@ -226,6 +226,10 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
             // Drive timed futex waits (FUTEX_WAIT/FUTEX_WAIT_BITSET with val2).
             const futex_mod = @import("../sync/futex.zig");
             futex_mod.timerTick(now_ns);
+            // Drive timed POSIX mq waits (mq_timedsend/mq_timedreceive with
+            // abs_timeout) — same deadline-bitmap pattern as the futex scan.
+            const posix_mq_mod = @import("../ipc/posix_mq.zig");
+            posix_mq_mod.timerTick(now_ns);
             // v53.47: Atomic load — alarm_bm/itimer_bm are modified from syscall context
             // on other CPUs. Non-atomic read-modify-write could lose newly set bits.
             var bm = @atomicLoad(u64, &alarm_bm, .acquire) |
@@ -266,7 +270,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         if (task.getTask(ci)) |ct| {
             // Exited tasks stay cur_idx until we switch away — don't burn timeslice.
             if (ct.state == .zombie) setSlice(0);
-            if (ct.is_user and ct.pending_signals != 0 and ct.pending_signals & ~ct.signal_mask != 0) {
+            if (ct.is_user and ct.pending_signals != 0 and ct.pending_signals & ~@as(u32, @truncate(ct.signal_mask)) != 0) {
                 sched_lock.release(flags);
                 // Resume through the frame when the handler was entered.
                 // Otherwise fall through to a normal reschedule: returning here

@@ -64,7 +64,8 @@ fn timeoutMs(sec: i64, usec: i64) ?u32 {
 
 fn resolveTcpIdx(fd: u64) ?u32 {
     const fd_u32: u32 = @truncate(fd);
-    if (fd_u32 >= 32) return null;
+    const vfs_mod = @import("../fs/vfs.zig");
+    if (fd_u32 >= vfs_mod.MAX_FDS) return null;
     const sched_mod = @import("../proc/sched.zig");
     const cur_idx = sched_mod.currentTaskIndex() orelse return null;
     const task_mod = @import("../proc/task.zig");

@@ -15,6 +15,16 @@ const bo = @import("../lib/byte_order.zig");
 const syscall_entry = @import("../arch/arch.zig").syscall;
 
 /// sigaction(signum, act_ptr, oldact_ptr) → 0 or -errno
+///
+/// ABI note: Linux x86_64 struct sigaction is 152 bytes — handler@0, flags@8,
+/// restorer@16, mask@24 (128-byte sigset). The legacy MoQiOS users (sh.c,
+/// hello13, hello32) pass a 28/32-byte struct { handler, mask, flags,
+/// restorer } of which only the handler was ever read. We keep validating
+/// and reading the first 28 bytes exactly as before (handler from offset 0),
+/// and additionally apply the u64 sa_mask at offset 24 with SIG_SETMASK
+/// semantics only when the buffer validates for the full 152-byte Linux
+/// struct. For the legacy users restorer@24 is 0, so even when the wider
+/// probe succeeds the applied mask is 0 — their behavior is unchanged.
 pub fn sigaction(signum: u32, act_ptr: u64, oldact_ptr: u64) i64 {
     if (signum == 0 or signum > 31) return -22;
 
@@ -25,7 +35,9 @@ pub fn sigaction(signum: u32, act_ptr: u64, oldact_ptr: u64) i64 {
     if (oldact_ptr != 0 and !copy.validateUserBufferWritable(oldact_ptr, 28)) return -14;
     if (act_ptr != 0 and !copy.validateUserBuffer(act_ptr, 28)) return -14;
 
-    // Return old action if requested
+    // Return old action if requested. Always written in the legacy 28-byte
+    // form (handler + zeros): we cannot tell a 152-byte oldact buffer from
+    // a 32-byte legacy one, and writing 152 bytes could overrun the latter.
     if (oldact_ptr != 0) {
         var old_buf: [28]u8 = undefined;
         @memset(&old_buf, 0);
@@ -41,27 +53,44 @@ pub fn sigaction(signum: u32, act_ptr: u64, oldact_ptr: u64) i64 {
         if (copied != 28) return -14;
         const new_handler: u64 = @bitCast(act_buf[0..8].*);
         current.signal_handlers[signum - 1] = new_handler;
+
+        // Full Linux struct present → apply the u64 sa_mask from offset 24.
+        if (copy.validateUserBuffer(act_ptr, 152)) {
+            var mask_buf: [8]u8 = undefined;
+            if (copy.copyFromUser(&mask_buf, @ptrFromInt(act_ptr + 24), 8) == 8) {
+                const new_mask: u64 = @bitCast(mask_buf);
+                const unblockable = (@as(u64, 1) << 8) | (@as(u64, 1) << 18);
+                current.signal_mask = new_mask & ~unblockable;
+            }
+        }
     }
 
     return 0;
 }
 
-/// sigprocmask(how, set_ptr, oldset_ptr) → 0 or -errno
-pub fn sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64) i64 {
+/// sigprocmask(how, set_ptr, oldset_ptr, sigsetsize) → 0 or -errno
+///
+/// The rt_* ABI advertises a 64-signal sigset_t (8 bytes); legacy callers
+/// used a 4-byte mask. The width is chosen by sigsetsize (r10, as in Linux
+/// rt_sigprocmask): >= 8 selects the 8-byte form, anything else keeps the
+/// legacy 4-byte form so existing 4-byte users are not broken.
+pub fn sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64, sigsetsize: u64) i64 {
     const current = sched.currentTask() orelse return -1;
     const old_mask = current.signal_mask;
 
-    if (oldset_ptr != 0 and !copy.validateUserBufferWritable(oldset_ptr, 4)) return -14;
-    if (set_ptr != 0 and !copy.validateUserBuffer(set_ptr, 4)) return -14;
-    if (oldset_ptr != 0 and copy.copyToUser(@ptrFromInt(oldset_ptr), @as([*]const u8, @ptrCast(&old_mask))[0..4], 4) != 4) return -14;
+    const width: usize = if (sigsetsize >= 8) 8 else 4;
+
+    if (oldset_ptr != 0 and !copy.validateUserBufferWritable(oldset_ptr, width)) return -14;
+    if (set_ptr != 0 and !copy.validateUserBuffer(set_ptr, width)) return -14;
+    if (oldset_ptr != 0 and copy.copyToUser(@ptrFromInt(oldset_ptr), @as([*]const u8, @ptrCast(&old_mask))[0..width], width) != width) return -14;
 
     if (set_ptr != 0) {
-        var new_set: u32 = 0;
+        var new_set: u64 = 0;
         const new_set_bytes: [*]u8 = @ptrCast(&new_set);
-        if (copy.copyFromUser(new_set_bytes[0..4], @ptrFromInt(set_ptr), 4) != 4) return -14;
+        if (copy.copyFromUser(new_set_bytes[0..width], @ptrFromInt(set_ptr), width) != width) return -14;
 
-        const sigkill_mask = @as(u32, 1) << 8;
-        const sigstop_mask = @as(u32, 1) << 18;
+        const sigkill_mask = @as(u64, 1) << 8;
+        const sigstop_mask = @as(u64, 1) << 18;
         const unblockable = sigkill_mask | sigstop_mask;
 
         switch (how) {
@@ -204,15 +233,17 @@ pub fn rtSigpending(set_ptr: u64, sigsetsize: u64) i64 {
 
 /// rt_sigsuspend(mask_ptr, sigsetsize) → -errno (always EINTR in simplified impl)
 pub fn rtSigsuspend(mask_ptr: u64, sigsetsize: u64) i64 {
-    _ = sigsetsize;
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
     if (mask_ptr == 0 or mask_ptr >= 0x0000_8000_0000_0000) return -14;
 
-    var new_mask: u32 = 0;
+    // Accept the 8-byte rt_* sigset_t when advertised; legacy callers pass
+    // sigsetsize == 4. The task mask is u64 — unread bytes default to 0.
+    const width: usize = @intCast(@min(sigsetsize, @as(u64, 8)));
+    var new_mask: u64 = 0;
     const mask_bytes: [*]u8 = @ptrCast(&new_mask);
-    if (copy.copyFromUser(mask_bytes[0..4], @ptrFromInt(mask_ptr), 4) != 4) return -14;
+    if (copy.copyFromUser(mask_bytes[0..width], @ptrFromInt(mask_ptr), width) != width) return -14;
     cur.signal_mask = new_mask;
     return -4; // EINTR
 }
@@ -224,19 +255,23 @@ pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_s
 
     if (sigset_size == 0 or sigset_ptr == 0 or sigset_ptr >= 0x0000_8000_0000_0000) return -22;
 
-    var mask_buf: [8]u8 = undefined;
-    const copied = copy.copyFromUser(mask_buf[0..], @ptrFromInt(sigset_ptr), @min(sigset_size, @as(u64, 4)));
+    var mask_buf: [8]u8 = @splat(0);
+    const width: usize = @intCast(@min(sigset_size, @as(u64, 8)));
+    const copied = copy.copyFromUser(mask_buf[0..width], @ptrFromInt(sigset_ptr), width);
     if (copied == 0) return -14;
-    const mask: u32 = @as(u32, @bitCast(mask_buf[0..4].*));
+    // Only signals 1-31 exist — the upper word of an 8-byte sigset is inert.
+    const mask: u32 = @truncate(@as(u64, @bitCast(mask_buf)));
 
     const cur_idx = sched.currentTaskIndex() orelse return -3;
     const cur = task_mod.getTask(cur_idx) orelse return -3;
 
-    const pending = cur.pending_signals & mask;
+    // Atomic load + Rmw like dequeueSignal: a plain read-modify-write races
+    // with sendSignal's atomic Rmw on another CPU and can lose a signal bit.
+    const pending = @atomicLoad(u32, &cur.pending_signals, .seq_cst) & mask;
     if (pending != 0) {
-        const sig = @ctz(pending) + 1;
-        cur.pending_signals &= ~(@as(u32, 1) << @intCast(sig - 1));
-        return @intCast(sig);
+        const bit: u5 = @intCast(@ctz(pending));
+        _ = @atomicRmw(u32, &cur.pending_signals, .And, ~(@as(u32, 1) << bit), .seq_cst);
+        return @as(i64, bit) + 1;
     }
     return -11; // EAGAIN
 }

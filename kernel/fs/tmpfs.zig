@@ -307,6 +307,39 @@ pub fn tmpfsWrite(idx: u8, offset: u64, data: [*]const u8, count: u32) i64 {
     return @intCast(src);
 }
 
+/// Truncate a tmpfs file to `new_size`, freeing pages beyond the new size.
+/// Growing only updates the size — pages are allocated lazily on write and
+/// unallocated pages read back as zeros.
+pub fn tmpfsTruncate(idx: u8, new_size: u32) bool {
+    if (idx >= MAX_FILES) return false;
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+
+    const entry = &entries[idx];
+    if (!entry.active or entry.is_dir) return false;
+    if (new_size > MAX_FILE_SIZE) return false;
+
+    const keep_pages: u32 = if (new_size == 0) 0 else (new_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    var p: u32 = keep_pages;
+    while (p < PAGES_PER_FILE) : (p += 1) {
+        if (entry.pages[p]) |phys| {
+            pmm.freePage(phys);
+            entry.pages[p] = null;
+            entry.page_count -= 1;
+        }
+    }
+    // Zero the tail of the last kept page so stale bytes past the new EOF
+    // don't resurface if the file later regrows into the same page.
+    if (keep_pages > 0 and new_size % PAGE_SIZE != 0) {
+        if (entry.pages[keep_pages - 1]) |phys| {
+            const ptr: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+            @memset(ptr[new_size % PAGE_SIZE .. PAGE_SIZE], 0);
+        }
+    }
+    entry.size = new_size;
+    return true;
+}
+
 /// Close a tmpfs file: drop one open reference. The file persists until
 /// unlink; an unlinked (deleted) file is freed once its last fd closes.
 pub fn tmpfsClose(idx: u8) void {

@@ -310,10 +310,13 @@ pub fn timerTick(current_tick: u64) void {
             // Simplified signal delivery: if SIGEV_SIGNAL, queue the signal
             // to the timer's owner (recorded at timer_create) — not to
             // whatever task happens to be running when the tick fires.
+            // kickIfBlocked wakes an owner blocked in a wait primitive so it
+            // can die/handle on resume (same mechanism as sendSignal).
             if (t.sigev_notify == SIGEV_SIGNAL and t.sigev_signo > 0 and t.sigev_signo < 32) {
                 if (t.owner_task_idx) |owner_idx| {
                     if (task_mod.getTask(owner_idx)) |owner| {
-                        owner.pending_signals |= @as(u32, 1) << @as(u5, @intCast(t.sigev_signo));
+                        _ = @atomicRmw(u32, &owner.pending_signals, .Or, @as(u32, 1) << @as(u5, @intCast(t.sigev_signo - 1)), .seq_cst);
+                        @import("../proc/signal.zig").kickIfBlocked(owner_idx);
                     }
                 }
             }

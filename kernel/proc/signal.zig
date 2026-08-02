@@ -11,6 +11,7 @@
 const task = @import("task.zig");
 
 pub const SIGKILL: u32 = 9;
+pub const SIGPIPE: u32 = 13;
 pub const SIGTERM: u32 = 15;
 pub const SIGUSR1: u32 = 10;
 pub const SIGUSR2: u32 = 31;
@@ -63,6 +64,11 @@ var sigreturn_trampoline_phys: u64 = 0;
 
 /// Send a signal to a process. Returns true on success.
 /// v53.44: Uses atomic OR for SMP-safe signal bit setting.
+/// If the target is blocked in a wait primitive, wake and kick it so it can
+/// observe the signal on resume: the wait loops re-check pending_signals after
+/// a non-grant wake and either return -EINTR (handled signal) or terminate
+/// (fatal default action). Previously a task blocked in e.g. semop or
+/// epoll_wait never noticed SIGKILL — unkillable tasks.
 pub fn sendSignal(target_tid: u32, signum: u32) bool {
     if (signum == 0 or signum > 31) return false;
 
@@ -70,10 +76,54 @@ pub fn sendSignal(target_tid: u32, signum: u32) bool {
         const t = task.getTask(@intCast(i)) orelse continue;
         if (t.tid == target_tid and t.state != .zombie) {
             _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << @intCast(signum - 1), .seq_cst);
+            kickIfBlocked(@intCast(i));
             return true;
         }
     }
     return false;
+}
+
+/// Wake a blocked task so it can observe a newly pending signal on resume.
+/// unblockTask re-enqueues it, kickRemoteForTask IPIs the CPU it last ran on.
+pub fn kickIfBlocked(idx: u32) void {
+    const t = task.getTask(idx) orelse return;
+    if (t.state == .blocked) {
+        task.unblockTask(idx);
+        task.kickRemoteForTask(idx);
+    }
+}
+
+/// Raise a signal on the current task itself (e.g. SIGPIPE from pipeWrite).
+/// Delivery happens on the usual syscall-return / timer-tick paths.
+pub fn raiseSelf(signum: u32) void {
+    if (signum == 0 or signum > 31) return;
+    const sched = @import("sched.zig");
+    const t = sched.currentTask() orelse return;
+    _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << @intCast(signum - 1), .seq_cst);
+}
+
+/// Lowest pending, unblocked signal that has no user handler installed and
+/// whose default action terminates the process, or null. Blocking wait
+/// primitives check this after a non-grant wake: on a hit the caller routes
+/// through task.exitTask(128 + signum), the same exit-by-signal path the
+/// scheduler tick uses (sched.deliverSignalToRunningTask).
+pub fn pendingFatal(t: *task.Task) ?u32 {
+    const pending = (@atomicLoad(u32, &t.pending_signals, .seq_cst) & ~@as(u32, @truncate(t.signal_mask))) & 0x7FFFFFFF;
+    var bits = pending;
+    while (bits != 0) {
+        const bit: u5 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const signum = @as(u32, bit) + 1;
+        if (t.signal_handlers[bit] == 0 and !defaultSignalAction(signum)) return signum;
+    }
+    return null;
+}
+
+/// True if the task has any pending, unblocked signal (handled or not).
+/// Wait primitives return -EINTR on a hit so the syscall-return/tick path
+/// can run the handler.
+pub fn pendingAny(t: *task.Task) bool {
+    return (@atomicLoad(u32, &t.pending_signals, .seq_cst) & ~@as(u32, @truncate(t.signal_mask)) & 0x7FFFFFFF) != 0;
 }
 
 /// Check if a task has any pending, non-blocked signals.
@@ -82,7 +132,7 @@ pub fn sendSignal(target_tid: u32, signum: u32) bool {
 pub fn dequeueSignal(t: *task.Task) ?u32 {
     // v53.45: Mask bit 31 — signals 1-31 only, @ctz returning 31 would
     // index signal_handlers[31] which is out of bounds (array has 31 slots, 0-30).
-    const pending = (@atomicLoad(u32, &t.pending_signals, .seq_cst) & ~t.signal_mask) & 0x7FFFFFFF;
+    const pending = (@atomicLoad(u32, &t.pending_signals, .seq_cst) & ~@as(u32, @truncate(t.signal_mask))) & 0x7FFFFFFF;
     if (pending == 0) return null;
 
     const bit: u5 = @intCast(@ctz(pending));

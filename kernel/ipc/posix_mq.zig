@@ -43,8 +43,15 @@ pub const MqQueue = struct {
     flags: u32 = 0,
     /// Marked for removal (mq_unlink)
     marked_removed: bool = false,
+    /// Open references (mq_open). The slot is freed only when an unlinked,
+    /// drained queue's last reference is dropped via mq_close.
+    open_count: u32 = 0,
     /// Notification registered (pid of notifier, 0 = none)
     notify_pid: u32 = 0,
+    /// Task that registered mq_notify, and the requested signal number
+    /// (delivered once when a message arrives on an empty queue).
+    notify_task_idx: ?u32 = null,
+    notify_signo: i32 = 0,
     /// Senders blocked on a full queue (mq_timedsend without O_NONBLOCK)
     send_waiters: ?*task.WaitNode = null,
     /// Receivers blocked on an empty queue (mq_timedreceive without O_NONBLOCK)
@@ -73,6 +80,7 @@ const EAGAIN = errno.EAGAIN;
 const EMFILE = errno.EMFILE;
 const EBADF = errno.EBADF;
 const EFAULT = errno.EFAULT;
+const EINTR = errno.EINTR;
 const ETIMEDOUT = errno.ETIMEDOUT;
 
 /// Linux timespec for timeout reading.
@@ -101,6 +109,46 @@ fn isTimedOut(abs_timeout_ns: u64) bool {
     if (abs_timeout_ns == 0) return false;
     const tsc = @import("../arch/arch.zig").tsc;
     return tsc.nanos() >= abs_timeout_ns;
+}
+
+// ── Timed waits (abs_timeout) ──
+// A timed mq wait on an idle queue has no wake source, so the deadline was
+// previously only observed on an unrelated wake — the task could sleep past
+// it. Same fix as futex.zig: per-task deadline + bitmap, scanned by
+// timerTick from the BSP maintenance tick (sched.zig).
+var wait_deadlines: [task.MAX_TASKS]u64 = @splat(0);
+pub var mq_wait_bm: u64 = 0;
+
+/// Arm a timed-wait deadline. Called while enqueuing under mq_lock; the tick
+/// only wakes (the waiter unlinks its own node on resume), so this is
+/// race-free with the wait queues.
+fn armWaitDeadline(task_idx: u32, deadline_ns: u64) void {
+    wait_deadlines[task_idx] = deadline_ns;
+    _ = @atomicRmw(u64, &mq_wait_bm, .Or, @as(u64, 1) << @intCast(task_idx), .seq_cst);
+}
+
+/// Disarm a timed-wait deadline (woken, timed out, or wait abandoned).
+fn disarmWaitDeadline(task_idx: u32) void {
+    wait_deadlines[task_idx] = 0;
+    _ = @atomicRmw(u64, &mq_wait_bm, .And, ~(@as(u64, 1) << @intCast(task_idx)), .seq_cst);
+}
+
+/// Drive timed mq waits. Called from the BSP maintenance tick (sched.zig,
+/// alongside futex.timerTick). Wakes expired waiters; the woken waiter
+/// re-checks isTimedOut from the top of its loop and returns ETIMEDOUT.
+pub fn timerTick(now_ns: u64) void {
+    var bm = @atomicLoad(u64, &mq_wait_bm, .acquire);
+    while (bm != 0) {
+        const i: u6 = @truncate(@ctz(bm));
+        bm &= bm - 1;
+        const idx: u32 = i;
+        const deadline = wait_deadlines[idx];
+        if (deadline == 0 or now_ns < deadline) continue;
+        disarmWaitDeadline(idx);
+        // Republish like futex wakeN: a bare .ready starves on busy CPUs.
+        task.unblockTask(idx);
+        task.kickRemoteForTask(idx);
+    }
 }
 
 /// Remove `node` from `wait_queue` if still linked. Caller holds mq_lock.
@@ -165,6 +213,7 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
             }
             // Return existing fd (or assign one)
             if (q.fd < 0) q.fd = allocFd();
+            q.open_count += 1;
             return @intCast(q.fd);
         }
     }
@@ -196,7 +245,10 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
     q.tail = 0;
     q.count = 0;
     q.marked_removed = false;
+    q.open_count = 1;
     q.notify_pid = 0;
+    q.notify_task_idx = null;
+    q.notify_signo = 0;
 
     // Apply optional attributes (only honored at creation)
     if (maxmsg > 0 and maxmsg <= MAX_MSGS) q.max_msg = @intCast(maxmsg);
@@ -230,8 +282,9 @@ pub fn mqUnlink(name_ptr: u64) i64 {
             serial.writeString(q.name[0..q.name_len]);
             serial.writeString("\n");
             q.marked_removed = true;
-            // If no messages and no references, free immediately
-            if (q.count == 0) {
+            // Free only once the queue is drained AND the last open reference
+            // is gone (mq_close) — an unlinked-but-open queue stays usable.
+            if (q.count == 0 and q.open_count == 0) {
                 freeQueue(q);
             }
             return 0;
@@ -291,15 +344,22 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
                 mq_lock.release(flags);
                 return EAGAIN;
             };
+            if (abs_timeout_ns != 0) armWaitDeadline(cur_idx, abs_timeout_ns);
             cur_task.state = .blocked;
             mq_lock.release(flags);
             sched.forceReschedule();
+            if (abs_timeout_ns != 0) disarmWaitDeadline(cur_idx);
             // Woken: wakeOne already popped our node; unlink defensively in
             // case a future wake path bypasses the queue, then re-check the
             // condition and the deadline from the top.
             const flags2 = mq_lock.acquire();
             unlinkNode(&q.send_waiters, &node);
             mq_lock.release(flags2);
+            // Signal kick (sendSignal unblocks without granting): die on a
+            // fatal signal, or EINTR so the handler can run on return.
+            const sig_mod = @import("../proc/signal.zig");
+            if (sig_mod.pendingFatal(cur_task)) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
+            if (sig_mod.pendingAny(cur_task)) return EINTR;
             continue;
         }
 
@@ -317,6 +377,23 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
         msg.used = true;
         q.tail = (q.tail + 1) % MAX_MSGS;
         q.count += 1;
+
+        // mq_notify: a message arriving on an empty queue (with no blocked
+        // receiver about to consume it) delivers the registered signal once;
+        // Linux requires re-arming via another mq_notify.
+        if (q.count == 1 and q.recv_waiters == null and q.notify_task_idx != null) {
+            const notify_idx = q.notify_task_idx.?;
+            const notify_signo = q.notify_signo;
+            q.notify_pid = 0;
+            q.notify_task_idx = null;
+            q.notify_signo = 0;
+            if (notify_signo > 0 and notify_signo < 32) {
+                if (task.getTask(notify_idx)) |nt| {
+                    _ = @atomicRmw(u32, &nt.pending_signals, .Or, @as(u32, 1) << @as(u5, @intCast(notify_signo - 1)), .seq_cst);
+                    @import("../proc/signal.zig").kickIfBlocked(notify_idx);
+                }
+            }
+        }
 
         // Wake a receiver blocked on the empty queue
         _ = sched.wakeOne(&q.recv_waiters);
@@ -371,13 +448,19 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
                 mq_lock.release(flags);
                 return EAGAIN;
             };
+            if (abs_timeout_ns != 0) armWaitDeadline(cur_idx, abs_timeout_ns);
             cur_task.state = .blocked;
             mq_lock.release(flags);
             sched.forceReschedule();
+            if (abs_timeout_ns != 0) disarmWaitDeadline(cur_idx);
             // Woken: re-check condition and deadline from the top.
             const flags2 = mq_lock.acquire();
             unlinkNode(&q.recv_waiters, &node);
             mq_lock.release(flags2);
+            // Signal kick: die on a fatal signal, or EINTR (see mqTimedSend).
+            const sig_mod = @import("../proc/signal.zig");
+            if (sig_mod.pendingFatal(cur_task)) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
+            if (sig_mod.pendingAny(cur_task)) return EINTR;
             continue;
         }
 
@@ -415,8 +498,9 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
         // Wake a sender blocked on the full queue
         _ = sched.wakeOne(&q.send_waiters);
 
-        // If queue was marked for removal and now empty, free it
-        if (q.marked_removed and q.count == 0) {
+        // If queue was marked for removal and now empty and fully closed,
+        // free it
+        if (q.marked_removed and q.count == 0 and q.open_count == 0) {
             freeQueue(q);
         }
 
@@ -427,7 +511,21 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
 
 /// mq_notify(mqd, notification) -> 0 or -errno
 /// rdi=mqd, rsi=notification (sigevent struct pointer, or NULL to unregister)
+/// Registers the calling task; the requested signal (sigev_signo @ offset 8)
+/// is delivered once when a message arrives on an empty queue.
 pub fn mqNotify(mqd: u32, notif_ptr: u64) i64 {
+    // Read sigev_signo/sigev_notify before taking mq_lock (user copies walk
+    // page tables). Layout matches posix_timer.Sigevent: value@0, signo@8,
+    // notify@12.
+    var signo: i32 = 0;
+    if (notif_ptr != 0) {
+        if (notif_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+        var buf: [16]u8 = undefined;
+        if (copy.copyFromUser(&buf, @ptrFromInt(notif_ptr), 16) != 16) return EFAULT;
+        signo = @bitCast(bo.readU32Le(buf[8..12]));
+        if (signo <= 0 or signo > 31) return EINVAL;
+    }
+
     const flags = mq_lock.acquire();
     defer mq_lock.release(flags);
 
@@ -436,11 +534,31 @@ pub fn mqNotify(mqd: u32, notif_ptr: u64) i64 {
     if (notif_ptr == 0) {
         // Unregister notification
         q.notify_pid = 0;
+        q.notify_task_idx = null;
+        q.notify_signo = 0;
         return 0;
     }
 
-    // Register: simplified — just store a marker
-    q.notify_pid = 1; // would be PID in real impl
+    // Register: one-shot, re-armed by another mq_notify after delivery.
+    q.notify_pid = 1;
+    q.notify_task_idx = sched.currentTaskIndex();
+    q.notify_signo = signo;
+    return 0;
+}
+
+/// mq_close(mqd) -> 0 or -errno.
+/// mq descriptors live outside the per-task fd table (300+), so FdTable.close
+/// routes fds >= MAX_FDS here. Drops the queue's open refcount; a
+/// fully-closed, unlinked, drained queue frees its slot.
+pub fn mqClose(mqd: u32) i64 {
+    const flags = mq_lock.acquire();
+    defer mq_lock.release(flags);
+
+    const q = findByFd(mqd) orelse return EBADF;
+    q.open_count -|= 1;
+    if (q.marked_removed and q.count == 0 and q.open_count == 0) {
+        freeQueue(q);
+    }
     return 0;
 }
 

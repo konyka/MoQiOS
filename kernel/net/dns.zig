@@ -86,6 +86,14 @@ fn queryDns(hostname: []const u8, dns_server: [4]u8) [4]u8 {
     var pkt: [512]u8 = @splat(0);
     var offset: usize = 0;
 
+    // Register the reply port first — without it the UDP demux drops the
+    // response before recvFrom can ever see it.
+    if (udp.ensurePort(12345) == 0xFFFF) {
+        serial.writeString("[DNS] Failed to register reply port\n");
+        return .{ 0, 0, 0, 0 };
+    }
+    defer udp.releasePort(12345);
+
     // DNS Header (big-endian / network byte order)
     bo.writeU16BeAt(&pkt, 0, query_id); // id
     query_id +%= 1;
@@ -114,6 +122,7 @@ fn queryDns(hostname: []const u8, dns_server: [4]u8) [4]u8 {
     // Wait for response
     const start = idt.getTickCount();
     while (idt.getTickCount() - start < DNS_QUERY_TIMEOUT) {
+        pumpRx(); // replies only reach the UDP queue when the NIC is polled
         var buf: [512]u8 = @splat(0);
         var src_ip: [4]u8 = .{ 0, 0, 0, 0 };
         var src_port: u16 = 0;
@@ -135,6 +144,22 @@ fn queryDns(hostname: []const u8, dns_server: [4]u8) [4]u8 {
     serial.writeString(hostname);
     serial.writeString("\n");
     return .{ 0, 0, 0, 0 };
+}
+
+/// Drain pending NIC RX frames into the network stack so replies reach the
+/// UDP queue (mirrors the netPoll loop in socket_syscall.zig).
+fn pumpRx() void {
+    const nic = @import("nic.zig");
+    if (!nic.isActive()) return;
+    const net_mod = @import("mod.zig");
+    var rx_tmp: [2048]u8 = undefined;
+    var poll_limit: u32 = 0;
+    while (poll_limit < 16) {
+        const n = nic.receivePacket(&rx_tmp, 2048);
+        if (n == 0) break;
+        net_mod.handleRxPacket(&rx_tmp, n);
+        poll_limit += 1;
+    }
 }
 
 /// Parse DNS response, extract first A record answer.
@@ -247,21 +272,28 @@ fn isIpV4(s: []const u8) bool {
 }
 
 /// Parse a dotted decimal IPv4 address string.
+/// Returns .{0,0,0,0} for malformed input (octet > 255 or too many octets).
 fn parseIpV4(s: []const u8) [4]u8 {
     var ip: [4]u8 = .{ 0, 0, 0, 0 };
     var idx: u8 = 0;
-    var val: u8 = 0;
+    var val: u32 = 0; // u32 accumulator: u8 would overflow-panic on "999..."
 
     for (s) |c| {
         if (c == '.') {
-            if (idx < 4) ip[idx] = val;
+            if (val > 255 or idx >= 4) return .{ 0, 0, 0, 0 };
+            ip[idx] = @intCast(val);
             idx += 1;
             val = 0;
         } else if (c >= '0' and c <= '9') {
             val = val * 10 + (c - '0');
+            // Reject early so a long digit run cannot overflow the u32.
+            if (val > 255) return .{ 0, 0, 0, 0 };
+        } else {
+            return .{ 0, 0, 0, 0 };
         }
     }
-    if (idx < 4) ip[idx] = val;
+    if (val > 255 or idx >= 4) return .{ 0, 0, 0, 0 };
+    ip[idx] = @intCast(val);
 
     return ip;
 }

@@ -130,7 +130,16 @@ pub fn checkAndPrefetch(state: *ReadaheadState, current_offset: u64, block_size:
         const ok = fs_read_fn(block_num, tmp);
         if (!ok) { pmm.freePage(tmp_phys); break; }
         const lock2 = ra_lock.acquire();
-        const inserted = insertCachedBlock(state, block_num, tmp, block_size);
+        // The lock was dropped for the disk read: another prefetcher may have
+        // inserted this same block meanwhile — re-check before inserting.
+        var dup = false;
+        for (0..MAX_WINDOW) |i| {
+            if (state.cache[i].valid and state.cache[i].block_num == block_num) {
+                dup = true;
+                break;
+            }
+        }
+        const inserted = if (dup) true else insertCachedBlock(state, block_num, tmp, block_size);
         ra_lock.release(lock2);
         pmm.freePage(tmp_phys);
         if (!inserted) break;

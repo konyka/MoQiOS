@@ -286,13 +286,17 @@ pub fn invalidateFile(inode_id: u64, fs_type: FsType, comptime write_fn: fn (u32
     return flush_ok;
 }
 pub fn writebackTimerTick() bool {
+    // wb_tick/next_check were bumped unlocked while dirty_time is stamped
+    // under wb_lock; move the tick under the same lock so the expiry
+    // comparison in hasExpiredBuffers sees a coherent clock.
+    const flags = wb_lock.acquire();
     wb_tick += 1;
     next_check -|= 1;
-    if (next_check == 0) {
-        next_check = TIMER_CHECK_INTERVAL;
-        return hasExpiredBuffers(DEFAULT_MAX_AGE_TICKS);
-    }
-    return false;
+    const due = next_check == 0;
+    if (due) next_check = TIMER_CHECK_INTERVAL;
+    wb_lock.release(flags);
+    if (!due) return false;
+    return hasExpiredBuffers(DEFAULT_MAX_AGE_TICKS);
 }
 fn hasExpiredBuffers(max_age_ticks: u64) bool {
     const flags = wb_lock.acquire();

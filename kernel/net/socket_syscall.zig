@@ -288,7 +288,11 @@ pub fn accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) i64 {
         if (net_mod.tcp.tcpGetAddrInfo(@intCast(new_tcb_idx))) |ainfo| {
             var sa_buf: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
             const alen = sa.encodeInetName(ainfo.is_v6, ainfo.remote_port, ainfo.remote_ip, ainfo.remote_ip6, &sa_buf);
-            if (alen != 0) _ = copySockaddrToUser(addr_ptr, addr_len_ptr, sa_buf[0..alen], alen);
+            // Copy-out failure must not leak the accepted fd/TCB.
+            if (alen != 0 and copySockaddrToUser(addr_ptr, addr_len_ptr, sa_buf[0..alen], alen) != 0) {
+                _ = t.fd_table.close(@intCast(new_fd));
+                return -14; // EFAULT
+            }
         }
     }
     return new_fd;
@@ -372,12 +376,25 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
             // Use connected destination when no address provided (send() on connected UDP)
             dst_ip = t.fd_table.fds[fd].udp_dst_ip;
             dst_port = t.fd_table.fds[fd].udp_dst_port;
+        } else {
+            return -89; // EDESTADDRREQ — unconnected UDP socket, no destination given
         }
         if (udp.sendTo(dst_ip, dst_port, src_port, &tmp_buf2, @intCast(n2))) {
             return @intCast(n2);
         } else {
             return -1;
         }
+    } else if (t.fd_table.fds[fd].fd_type == .unix_socket) {
+        // AF_UNIX: connected sockets only (STREAM pair, or DGRAM after
+        // connect() set a default peer). An explicit destination address is
+        // not supported — unixSend routes through the established peer_idx.
+        if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
+        var tmp_unix: [8192]u8 = undefined;
+        const to_copy_unix = @min(len, 8192);
+        const n_unix = copy.copyFromUser(&tmp_unix, @ptrFromInt(buf), to_copy_unix);
+        if (n_unix == 0) return -1;
+        const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
+        return net_mod.unix_socket.unixSend(unix_idx, &tmp_unix, n_unix);
     } else {
         // Not a socket — use regular write
         var tmp_buf: [4096]u8 = undefined;
@@ -512,11 +529,28 @@ pub fn getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen_ptr: u6
 
 /// connect(fd, addr_ptr, addr_len) → 0 or -errno
 pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
-    _ = addr_len;
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
 
     if (fd >= vfs_mod.MAX_FDS) return -88;
+
+    // AF_UNIX connect: sockaddr_un (family + path), routed to unixConnect.
+    if (t.fd_table.fds[fd].fd_type == .unix_socket) {
+        const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
+        if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -1;
+        if (addr_len <= SOCKADDR_UN_PATH_OFFSET) return -22; // EINVAL
+        var sock_addr_buf: [110]u8 = undefined;
+        const to_copy = @min(@as(usize, addr_len), sock_addr_buf.len);
+        const copied = copy.copyFromUser(sock_addr_buf[0..to_copy], @ptrFromInt(addr_ptr), to_copy);
+        if (copied <= SOCKADDR_UN_PATH_OFFSET) return -22; // EINVAL
+        var path_len: usize = 0;
+        for (2..copied) |j| {
+            if (sock_addr_buf[j] == 0) break;
+            path_len += 1;
+        }
+        const result = net_mod.unix_socket.unixConnect(unix_idx, @ptrCast(sock_addr_buf[2 .. 2 + path_len].ptr), path_len);
+        return @as(i64, result);
+    }
 
     // UDP connect: set default destination
     if (t.fd_table.fds[fd].fd_type == .udp_socket) {
@@ -631,7 +665,7 @@ pub fn shutdown(fd: u32, how: u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    if (fd >= 16 or cur.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
+    if (fd >= vfs_mod.MAX_FDS or cur.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
     const result = net_mod.tcp.tcpShutdown(cur.fd_table.fds[fd].tcb_idx, how);
     return result;
 }
@@ -644,7 +678,7 @@ pub fn sendmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    if (fd >= 16 or cur.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
+    if (fd >= vfs_mod.MAX_FDS or cur.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
 
     var msghdr_buf: [56]u8 = undefined;
     const hdr_copied = copy.copyFromUser(&msghdr_buf, @ptrFromInt(msg_ptr), 56);
@@ -685,7 +719,7 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    if (fd >= 16 or cur.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
+    if (fd >= vfs_mod.MAX_FDS or cur.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
 
     var msghdr_buf: [56]u8 = undefined;
     const hdr_copied = copy.copyFromUser(&msghdr_buf, @ptrFromInt(msg_ptr), 56);
@@ -771,6 +805,12 @@ pub fn netPoll() i64 {
 pub fn recvmmsg(sockfd: u32, msgvec_ptr: u64, vlen: u64, flags: u32, timeout: u64) i64 {
     _ = timeout;
     if (vlen == 0) return 0;
+    // Validate before consuming: recvmsg reads the 56-byte msghdr from
+    // msgvec and we write msg_len at +56 afterwards — check the whole range
+    // up front, mirroring recvfrom's validate-before-consume pattern.
+    if (msgvec_ptr == 0 or msgvec_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT
+    if (!copy.validateUserBuffer(msgvec_ptr, 56)) return -14;
+    if (!copy.validateUserBufferWritable(msgvec_ptr + 56, 4)) return -14;
     const result = recvmsg(sockfd, msgvec_ptr, flags);
     if (result >= 0) {
         const msg_len_offset = msgvec_ptr + 56;

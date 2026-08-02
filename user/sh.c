@@ -233,9 +233,11 @@ static void run_command(const char *cmd, int pipe_in, int pipe_out, const char *
         nargs++;
     }
 
-    char *argv[9];
-    for (int i = 0; i < nargs; i++) argv[i] = args[i];
-    argv[nargs] = (void*)0;
+    /* execve follows Linux semantics: argv[0] is the program name. */
+    char *argv[10];
+    argv[0] = name;
+    for (int i = 0; i < nargs; i++) argv[i + 1] = args[i];
+    argv[nargs + 1] = (void*)0;
 
     long ret = syscall3(SYS_execve, (long)name, (long)argv, 0);
     /* If execve returns, it failed */

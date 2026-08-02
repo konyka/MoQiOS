@@ -82,9 +82,33 @@ pub fn getDnsServer() [4]u8 {
     return dhcp_dns;
 }
 
+/// Drain pending NIC RX frames into the network stack so OFFER/ACK replies
+/// reach the UDP queue (mirrors the netPoll loop in socket_syscall.zig).
+fn pumpRx() void {
+    const nic = @import("nic.zig");
+    if (!nic.isActive()) return;
+    const net_mod = @import("mod.zig");
+    var rx_tmp: [2048]u8 = undefined;
+    var poll_limit: u32 = 0;
+    while (poll_limit < 16) {
+        const n = nic.receivePacket(&rx_tmp, 2048);
+        if (n == 0) break;
+        net_mod.handleRxPacket(&rx_tmp, n);
+        poll_limit += 1;
+    }
+}
+
 /// Perform DHCP discover — sends DHCPDISCOVER and waits for DHCPOFFER.
 pub fn discover() bool {
     serial.writeString("[DHCP] Starting DHCP discover...\n");
+
+    // Register the client port first — without it the UDP demux drops
+    // OFFER/ACK replies before recvFrom can ever see them.
+    if (udp.ensurePort(DHCP_CLIENT_PORT) == 0xFFFF) {
+        serial.writeString("[DHCP] Failed to register client port\n");
+        return false;
+    }
+    defer udp.releasePort(DHCP_CLIENT_PORT);
 
     // Generate a transaction ID
     our_xid = @truncate(idt.getTickCount());
@@ -98,6 +122,7 @@ pub fn discover() bool {
     // Wait for DHCPOFFER (poll for up to 5 seconds)
     const start = idt.getTickCount();
     while (idt.getTickCount() - start < 500) {
+        pumpRx();
         if (receiveOffer()) {
             serial.writeString("[DHCP] Received OFFER\n");
             // Send DHCPREQUEST
@@ -108,6 +133,7 @@ pub fn discover() bool {
             // Wait for DHCPACK
             const req_start = idt.getTickCount();
             while (idt.getTickCount() - req_start < 500) {
+                pumpRx();
                 if (receiveAck()) {
                     applyConfig();
                     return true;

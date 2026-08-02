@@ -43,14 +43,17 @@ pub const SeqLock = struct {
 
     /// End a read section. Returns the current sequence number.
     /// If this differs from readBegin()'s result, the data was modified.
+    /// The acq_rel RMW doubles as the acquire fence ordering the data reads
+    /// before this sequence load (weak-memory targets; no-op cost on x86).
     pub fn readEnd(self: *SeqLock) u64 {
-        return @atomicLoad(u64, &self.sequence, .acquire);
+        return @atomicRmw(u64, &self.sequence, .Add, 0, .acq_rel);
     }
 
     /// Check if a read needs to be retried.
-    /// Returns true if the read is valid (no concurrent write occurred).
-    pub fn readRetry(self: *SeqLock, start_seq: u64) bool {
-        const end_seq = @atomicLoad(u64, &self.sequence, .acquire);
+    /// Returns true if a retry is NEEDED (a concurrent write occurred or was
+    /// in progress); false means the read is valid. Same fence as readEnd.
+    pub fn readNeedsRetry(self: *SeqLock, start_seq: u64) bool {
+        const end_seq = @atomicRmw(u64, &self.sequence, .Add, 0, .acq_rel);
         return end_seq != start_seq or start_seq & 1 != 0;
     }
 

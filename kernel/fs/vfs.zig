@@ -54,7 +54,13 @@ pub const PipeBuffer = struct {
     buf: [PIPE_BUF_SIZE]u8,
     head: u32,
     tail: u32,
+    /// Total references (slot occupied when > 0). Kept as the sum of the
+    /// per-end refcounts below.
     ref_count: u32,
+    /// Open read-end references — pipeWrite fails with EPIPE when 0.
+    read_refs: u32 = 0,
+    /// Open write-end references — pipeRead sees EOF when 0.
+    write_refs: u32 = 0,
 };
 
 var pipes: [16]PipeBuffer = @splat(.{
@@ -69,7 +75,8 @@ var pipe_lock: IrqSpinlock = .{};
 pub const PipeState = struct {
     readable: u32,
     writable: bool,
-    peer_closed: bool,
+    read_open: bool,
+    write_open: bool,
 };
 
 pub fn pipeState(pipe_idx: u32) ?PipeState {
@@ -85,25 +92,35 @@ pub fn pipeState(pipe_idx: u32) ?PipeState {
     return .{
         .readable = readable,
         .writable = (pipe.tail + 1) % PIPE_BUF_SIZE != pipe.head,
-        .peer_closed = pipe.ref_count <= 1,
+        .read_open = pipe.read_refs > 0,
+        .write_open = pipe.write_refs > 0,
     };
 }
 
-pub fn pipeRetain(pipe_idx: u32) bool {
+/// Add a reference to one end of a pipe (dup/fork/clone fd-table copies).
+pub fn pipeRetain(pipe_idx: u32, write_end: bool) bool {
     if (pipe_idx >= pipes.len) return false;
     const flags = pipe_lock.acquire();
     defer pipe_lock.release(flags);
     if (pipes[pipe_idx].ref_count == 0) return false;
     pipes[pipe_idx].ref_count += 1;
+    if (write_end) {
+        pipes[pipe_idx].write_refs += 1;
+    } else {
+        pipes[pipe_idx].read_refs += 1;
+    }
     return true;
 }
 
+/// memfd: collapse a fresh two-ended pipe to a single read-end reference.
 pub fn pipeMakeSingleEnded(pipe_idx: u32) bool {
     if (pipe_idx >= pipes.len) return false;
     const flags = pipe_lock.acquire();
     defer pipe_lock.release(flags);
     if (pipes[pipe_idx].ref_count != 2) return false;
     pipes[pipe_idx].ref_count = 1;
+    pipes[pipe_idx].read_refs = 1;
+    pipes[pipe_idx].write_refs = 0;
     return true;
 }
 
@@ -112,7 +129,7 @@ pub fn allocPipe() ?u32 {
     defer pipe_lock.release(flags);
     for (0..16) |i| {
         if (pipes[i].ref_count == 0) {
-            pipes[i] = .{ .buf = @splat(0), .head = 0, .tail = 0, .ref_count = 2 };
+            pipes[i] = .{ .buf = @splat(0), .head = 0, .tail = 0, .ref_count = 2, .read_refs = 1, .write_refs = 1 };
             pipe_count += 1;
             return @intCast(i);
         }
@@ -150,6 +167,14 @@ pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize) i64 {
         pipe_lock.release(flags);
         return -1;
     }
+    if (pipe.read_refs == 0) {
+        pipe_lock.release(flags);
+        // Read end is gone — Linux semantics: SIGPIPE to the writer, -EPIPE.
+        // Previously the data silently accumulated in the buffer.
+        const sig_mod = @import("../proc/signal.zig");
+        sig_mod.raiseSelf(sig_mod.SIGPIPE);
+        return -32; // EPIPE
+    }
     var n: usize = 0;
     while (n < count) {
         const next = (pipe.tail + 1) % PIPE_BUF_SIZE;
@@ -166,13 +191,23 @@ pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize) i64 {
     return if (n == 0) -1 else @intCast(n);
 }
 
-pub fn pipeClose(pipe_idx: u32) void {
+/// Drop one reference to one end of a pipe; frees the slot when both ends
+/// are fully closed.
+pub fn pipeClose(pipe_idx: u32, write_end: bool) void {
     if (pipe_idx >= 16) return;
     const flags = pipe_lock.acquire();
-    pipes[pipe_idx].ref_count -|= 1;
-    if (pipes[pipe_idx].ref_count == 0) {
-        pipes[pipe_idx] = .{ .buf = @splat(0), .head = 0, .tail = 0, .ref_count = 0 };
-        pipe_count -|= 1;
+    const pipe = &pipes[pipe_idx];
+    if (pipe.ref_count > 0) {
+        pipe.ref_count -= 1;
+        if (write_end) {
+            pipe.write_refs -|= 1;
+        } else {
+            pipe.read_refs -|= 1;
+        }
+        if (pipe.ref_count == 0) {
+            pipe.* = .{ .buf = @splat(0), .head = 0, .tail = 0, .ref_count = 0 };
+            pipe_count -|= 1;
+        }
     }
     pipe_lock.release(flags);
     const epoll_c = @import("../net/epoll.zig");
@@ -271,6 +306,9 @@ pub const FdTable = struct {
 
         const is_writable = (flags & 0x03) != 0;
         const o_creat = (flags & 0x40) != 0;
+        const o_trunc = (flags & 0x200) != 0; // O_TRUNC
+        // Status flags visible via F_GETFL: access mode + O_APPEND + O_NONBLOCK.
+        const status = flags & (0x03 | 0x400 | 0x800);
 
         // /dev/urandom and /dev/random
         if (name.len >= 12 and name[0] == '/' and name[1] == 'd' and name[2] == 'e' and name[3] == 'v' and name[4] == '/') {
@@ -281,6 +319,7 @@ pub const FdTable = struct {
                 self.fds[slot] = .{
                     .fd_type = .random,
                     .writable = false,
+                    .status_flags = status,
                 };
                 return @intCast(slot);
             }
@@ -293,12 +332,14 @@ pub const FdTable = struct {
             const result = tmpfs.tmpfsOpen(name, o_creat, is_dir);
             if (result >= 0) {
                 const idx: u32 = @intCast(result);
+                if (o_trunc and is_writable) _ = tmpfs.tmpfsTruncate(@intCast(idx), 0);
                 self.fds[slot] = .{
                     .fd_type = .tmpfs_file,
                     .offset = 0,
                     .file_size = tmpfs.tmpfsGetSize(@intCast(idx)),
                     .tmpfs_idx = idx,
                     .writable = is_writable,
+                    .status_flags = status,
                 };
                 return @intCast(slot);
             }
@@ -367,6 +408,7 @@ pub const FdTable = struct {
                 .inode_id = 0x4000_0000_0000_0000 + (@as(u64, pid) << 8) + @intFromEnum(pfile),
                 .proc_file_type = pfile,
                 .proc_pid = pid,
+                .status_flags = status,
             };
             return @intCast(slot);
         }
@@ -380,6 +422,7 @@ pub const FdTable = struct {
                 .file_data = data_ptr,
                 .writable = is_writable,
                 .inode_id = data_ptr,
+                .status_flags = status,
             };
             return @intCast(slot);
         }
@@ -389,6 +432,7 @@ pub const FdTable = struct {
             var fi = fat32.openFile(name);
             if (fi >= 0) {
                 const idx: u32 = @intCast(fi);
+                if (o_trunc and is_writable) _ = fat32.truncateFile(idx, 0);
                 self.fds[slot] = .{
                     .fd_type = .fat32_file,
                     .offset = 0,
@@ -396,6 +440,7 @@ pub const FdTable = struct {
                     .fat32_file_idx = idx,
                     .writable = is_writable,
                     .inode_id = 0x2000_0000_0000_0000 + @as(u64, fat32.getFirstCluster(idx)),
+                    .status_flags = status,
                 };
                 readahead.initState(&self.fds[slot].readahead_state);
                 return @intCast(slot);
@@ -412,6 +457,7 @@ pub const FdTable = struct {
                         .fat32_file_idx = idx,
                         .writable = true,
                         .inode_id = 0x2000_0000_0000_0000 + @as(u64, fat32.getFirstCluster(idx)),
+                        .status_flags = status,
                     };
                     readahead.initState(&self.fds[slot].readahead_state);
                     return @intCast(slot);
@@ -424,6 +470,7 @@ pub const FdTable = struct {
             const fi = ext2.openFile(name);
             if (fi >= 0) {
                 const idx: u32 = @intCast(fi);
+                if (o_trunc and is_writable) _ = ext2.truncateFile(idx, 0);
                 self.fds[slot] = .{
                     .fd_type = .ext2_file,
                     .offset = 0,
@@ -431,6 +478,7 @@ pub const FdTable = struct {
                     .ext2_file_idx = idx,
                     .writable = is_writable,
                     .inode_id = 0x3000_0000_0000_0000 + @as(u64, ext2.getInodeNum(idx)),
+                    .status_flags = status,
                 };
                 readahead.initState(&self.fds[slot].readahead_state);
                 return @intCast(slot);
@@ -448,6 +496,7 @@ pub const FdTable = struct {
                         .ext2_file_idx = idx,
                         .writable = true,
                         .inode_id = 0x3000_0000_0000_0000 + @as(u64, ext2.getInodeNum(idx)),
+                        .status_flags = status,
                     };
                     readahead.initState(&self.fds[slot].readahead_state);
                     return @intCast(slot);
@@ -528,6 +577,11 @@ pub const FdTable = struct {
                 return n;
             },
             .ext2_file => {
+                const ext2 = @import("ext2.zig");
+                // Refresh the cached size: another fd may have grown the file
+                // through a different ext2 open slot (each slot keeps its own
+                // inode copy), so this descriptor's file_size can be stale.
+                desc.file_size = ext2.refreshSize(desc.ext2_file_idx);
                 if (desc.offset >= desc.file_size) return 0;
                 // 1. Check writeback cache (read-after-write consistency)
                 const n_cached = writeback.readBuffered(desc.inode_id, desc.offset, buf, @intCast(count), .ext2);
@@ -542,7 +596,6 @@ pub const FdTable = struct {
                 // correctly uses resolveBlock + readBlockUncached with LBA offset.
                 // Also removed VFS-level recordAccess which used 4KB page numbers
                 // conflicting with ext2's 1KB block numbers in the same tracker.
-                const ext2 = @import("ext2.zig");
                 const n = ext2.readFile(desc.ext2_file_idx, @intCast(desc.offset), buf, @intCast(count));
                 if (n > 0) {
                     desc.offset += @intCast(n);
@@ -557,7 +610,11 @@ pub const FdTable = struct {
             .udp_socket => return -1, // UDP sockets use sendto/recvfrom syscalls
             .epoll => return -1,
             .eventfd => return -1,
-            .unix_socket => return -1,
+            .unix_socket => {
+                // read() on an AF_UNIX socket drains the socket's ring buffer.
+                const unix_mod = @import("../net/unix_socket.zig");
+                return unix_mod.unixRecv(desc.unix_sock_idx, buf, count);
+            },
             .timerfd => {
                 const timerfd_mod = @import("../ipc/timerfd.zig");
                 return timerfd_mod.timerfdRead(desc.timerfd_idx, buf, count);
@@ -647,12 +704,15 @@ pub const FdTable = struct {
             .pipe_read => return -1,
             .fat32_file => {
                 if (!desc.writable) return -1;
+                // O_APPEND: every sequential write goes to the current end.
+                if ((desc.status_flags & 0x400) != 0) desc.offset = desc.file_size;
                 // Use writeback for delayed write coalescing
                 return bufferedWrite(desc, desc.fat32_file_idx, buf, count, .fat32);
             },
             .ramdisk_file => return -1,
             .ext2_file => {
                 if (!desc.writable) return -1;
+                if ((desc.status_flags & 0x400) != 0) desc.offset = desc.file_size;
                 // Use writeback for delayed write coalescing
                 return bufferedWrite(desc, desc.ext2_file_idx, buf, count, .ext2);
             },
@@ -660,11 +720,16 @@ pub const FdTable = struct {
             .udp_socket => return -1, // UDP sockets use sendto/recvfrom syscalls
             .epoll => return -1,
             .eventfd => return -1,
-            .unix_socket => return -1,
+            .unix_socket => {
+                // write() on an AF_UNIX socket sends to the connected peer.
+                const unix_mod = @import("../net/unix_socket.zig");
+                return unix_mod.unixSend(desc.unix_sock_idx, buf, count);
+            },
             .timerfd => return -1, // timerfd is read-only
             .random => return -1, // random is read-only
             .tmpfs_file => {
                 if (!desc.writable) return -1;
+                if ((desc.status_flags & 0x400) != 0) desc.offset = desc.file_size;
                 const tmpfs = @import("tmpfs.zig");
                 const n = tmpfs.tmpfsWrite(@intCast(desc.tmpfs_idx), desc.offset, buf, @intCast(count));
                 if (n > 0) {
@@ -721,10 +786,13 @@ pub const FdTable = struct {
                 return n;
             },
             .ext2_file => {
+                const ext2 = @import("ext2.zig");
+                // Same stale-size refresh as read(): another open slot may
+                // have grown the file since this descriptor cached file_size.
+                desc.file_size = ext2.refreshSize(desc.ext2_file_idx);
                 if (offset >= desc.file_size) return 0;
                 const n_cached = writeback.readBuffered(desc.inode_id, offset, buf, @intCast(count), .ext2);
                 if (n_cached > 0) return @intCast(n_cached);
-                const ext2 = @import("ext2.zig");
                 const n = ext2.readFile(desc.ext2_file_idx, @intCast(offset), buf, @intCast(count));
                 return n;
             },
@@ -809,7 +877,10 @@ pub const FdTable = struct {
 
     /// Close a file descriptor.
     pub fn close(self: *FdTable, fd: u32) i64 {
-        if (fd >= MAX_FDS) return -1;
+        if (fd >= MAX_FDS) {
+            // POSIX mq descriptors live outside the per-task table (300+).
+            return @import("../ipc/posix_mq.zig").mqClose(fd);
+        }
         if (fd <= FD_STDERR) return 0;
         const desc = &self.fds[fd];
         if (desc.fd_type == .none) return -1;
@@ -823,7 +894,7 @@ pub const FdTable = struct {
             }
         }
         if (desc.fd_type == .pipe_read or desc.fd_type == .pipe_write) {
-            pipeClose(desc.pipe_idx);
+            pipeClose(desc.pipe_idx, desc.fd_type == .pipe_write);
         }
         // Buffers are dropped on close whether or not they reached the disk, so
         // this is the last chance to tell the caller that data was lost.
@@ -878,12 +949,14 @@ pub const FdTable = struct {
         const pipe_idx = allocPipe() orelse return -1;
 
         const read_fd = self.allocFd() orelse {
-            pipeClose(pipe_idx);
+            pipeClose(pipe_idx, false);
+            pipeClose(pipe_idx, true);
             return -1;
         };
         const write_fd = self.allocFd() orelse {
             self.freeFd(read_fd);
-            pipeClose(pipe_idx);
+            pipeClose(pipe_idx, false);
+            pipeClose(pipe_idx, true);
             return -1;
         };
 
@@ -906,7 +979,7 @@ pub const FdTable = struct {
         // Increment pipe ref count if it's a pipe
         if (self.fds[newfd].fd_type == .pipe_read or self.fds[newfd].fd_type == .pipe_write) {
             if (self.fds[newfd].pipe_idx < 16) {
-                _ = pipeRetain(self.fds[newfd].pipe_idx);
+                _ = pipeRetain(self.fds[newfd].pipe_idx, self.fds[newfd].fd_type == .pipe_write);
             }
         }
         return newfd;
@@ -930,6 +1003,7 @@ pub fn retainSharedResources(table: *FdTable) void {
             switch (desc.fd_type) {
                 .ext2_file => seen = other.ext2_file_idx == desc.ext2_file_idx,
                 .tcp_socket => seen = other.tcb_idx == desc.tcb_idx,
+                .udp_socket => seen = other.udp_port == desc.udp_port,
                 .epoll => seen = other.epoll_idx == desc.epoll_idx,
                 .unix_socket => seen = other.unix_sock_idx == desc.unix_sock_idx,
                 .timerfd => seen = other.timerfd_idx == desc.timerfd_idx,
@@ -947,6 +1021,7 @@ pub fn retainSharedResources(table: *FdTable) void {
                 const tcp = @import("../net/tcp.zig");
                 tcp.tcpRetain(desc.tcb_idx);
             },
+            .udp_socket => @import("../net/udp.zig").retainPort(desc.udp_port),
             .epoll => @import("../net/epoll.zig").epollRetain(desc.epoll_idx),
             .unix_socket => @import("../net/unix_socket.zig").unixRetain(desc.unix_sock_idx),
             .timerfd => @import("../ipc/timerfd.zig").timerfdRetain(desc.timerfd_idx),

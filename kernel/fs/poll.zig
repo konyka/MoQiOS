@@ -66,7 +66,7 @@ pub fn poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) i64 {
                     .pipe_read => {
                         if (vfs_mod.pipeState(desc.pipe_idx)) |state| {
                             if (state.readable > 0) pfds[i].revents |= POLLIN;
-                            if (state.readable == 0 and state.peer_closed) pfds[i].revents |= POLLHUP;
+                            if (state.readable == 0 and !state.write_open) pfds[i].revents |= POLLHUP;
                         }
                     },
                     .eventfd => {
@@ -95,7 +95,7 @@ pub fn poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) i64 {
                     .pipe_write => {
                         if (vfs_mod.pipeState(desc.pipe_idx)) |state| {
                             if (state.writable) pfds[i].revents |= POLLOUT;
-                            if (state.peer_closed) pfds[i].revents |= POLLERR;
+                            if (!state.read_open) pfds[i].revents |= POLLERR;
                         }
                     },
                     else => {

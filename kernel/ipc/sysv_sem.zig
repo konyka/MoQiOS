@@ -162,6 +162,12 @@ pub fn semop(semid: u32, sem_num: u32, op: i16) i64 {
                     cur_node = n.next;
                 }
                 sem_lock.release(flags2);
+                // Signal kick (sendSignal unblocks without granting): die on
+                // a fatal signal via the same exit-by-signal path the timer
+                // tick uses, or report EINTR so the handler can run on return.
+                const sig_mod = @import("../proc/signal.zig");
+                if (sig_mod.pendingFatal(cur_task)) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
+                if (sig_mod.pendingAny(cur_task)) return -4; // -EINTR
                 return -43; // interrupted (EIDRM / signal)
             }
             continue; // re-acquire lock and re-check condition
@@ -218,6 +224,9 @@ pub fn semctl(semid: u32, semnum: i32, cmd: i32, arg: i32) i64 {
         SETVAL => {
             if (semnum < 0 or @as(u32, @intCast(semnum)) >= s.nsems) return -22;
             s.values[@intCast(semnum)] = arg;
+            // Mirror the V-op wake: raising the value may let a blocked
+            // P-waiter's operation succeed — wake one so it re-checks.
+            if (arg > 0) _ = sched.wakeOne(&s.wait_queue);
             return 0;
         },
         GETVAL => {

@@ -184,7 +184,7 @@ pub fn clone(
         if (child.fd_table.fds[i].fd_type == .pipe_read or child.fd_table.fds[i].fd_type == .pipe_write) {
             const pidx = child.fd_table.fds[i].pipe_idx;
             if (pidx < 16) {
-                _ = vfs_mod.pipeRetain(pidx);
+                _ = vfs_mod.pipeRetain(pidx, child.fd_table.fds[i].fd_type == .pipe_write);
             }
         }
         // The shallow copy duplicates readahead page pointers that stay

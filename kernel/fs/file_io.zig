@@ -41,7 +41,14 @@ pub fn write(fd: u64, buf: u64, count: u64) i64 {
                 const copied = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(buf + pos), chunk);
                 if (copied == 0) break;
                 const result = cur.fd_table.write(@intCast(fd), &kbuf, copied);
-                if (result <= 0) break;
+                // Propagate a first-chunk error (e.g. -28 ENOSPC from the
+                // writeback cache) instead of reporting a 0-byte write that
+                // callers would retry forever — mirrors pwrite below.
+                if (result < 0) {
+                    if (pos == 0) return result;
+                    break;
+                }
+                if (result == 0) break;
                 pos += @intCast(result);
                 if (result < @as(i64, @intCast(copied))) break;
             }
@@ -82,6 +89,7 @@ pub fn read(fd: u32, buf_ptr: u64, count: u64) i64 {
 
     var pos: usize = 0;
     var faulted = false;
+    var first_err: i64 = 0;
     while (pos < n) {
         const chunk = @min(n - pos, 4096);
         var kbuf: [4096]u8 = undefined;
@@ -95,7 +103,11 @@ pub fn read(fd: u32, buf_ptr: u64, count: u64) i64 {
         }
 
         const result = cur.fd_table.read(fd, &kbuf, chunk);
-        if (result <= 0) break;
+        if (result < 0) {
+            if (pos == 0) first_err = result;
+            break;
+        }
+        if (result == 0) break;
         const got: usize = @intCast(result);
         // Count what reached the user buffer, not what came off the file:
         // copyToUser refuses an unmapped or read-only destination, and
@@ -109,6 +121,10 @@ pub fn read(fd: u32, buf_ptr: u64, count: u64) i64 {
         if (got < chunk) break;
     }
     if (faulted and pos == 0) return -EFAULT;
+    // A genuine error is returned, never re-issued: re-reading after an error
+    // would consume more from a pipe and could turn the error into a bogus
+    // 1-byte success. The fallback below is only for the EOF-ish 0 return.
+    if (pos == 0 and first_err < 0) return first_err;
     if (pos == 0 and n > 0) {
         // v53.45: Fix 1-byte read not being copied to user space
         var tmp: [1]u8 = undefined;

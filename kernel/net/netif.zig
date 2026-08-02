@@ -21,6 +21,10 @@ pub fn ensureInit() void {
 }
 
 pub fn getOurIp() [4]u8 {
+    // Prefer the DHCP-acquired address once the lease handshake completed;
+    // fall back to the QEMU user-net default otherwise.
+    const dhcp = @import("dhcp.zig");
+    if (dhcp.isConfigured()) return dhcp.getIp();
     return .{ 10, 0, 2, 15 };
 }
 

@@ -28,6 +28,9 @@ const UdpEntry = struct {
 };
 
 var ports: [MAX_PORTS]u16 = @splat(0);
+/// Cross-process references per registered port (fork/clone fd-table copy) —
+/// releasePort frees the slot only when the count reaches 0.
+var port_refs: [MAX_PORTS]u16 = @splat(0);
 var queues: [MAX_PORTS][QUEUE_DEPTH]UdpEntry = @splat(@splat(.{
     .src_ip = @splat(0),
     .src_port = 0,
@@ -61,6 +64,7 @@ pub fn ensurePort(port: u16) u16 {
     if (num_ports >= MAX_PORTS) return 0xFFFF;
     const idx = num_ports;
     ports[idx] = port;
+    port_refs[idx] = 1;
     num_ports += 1;
     return @intCast(idx);
 }
@@ -78,28 +82,59 @@ pub fn ensurePortExclusive(port: u16) u16 {
     if (num_ports >= MAX_PORTS) return 0xFFFF;
     const idx = num_ports;
     ports[idx] = port;
+    port_refs[idx] = 1;
     num_ports += 1;
     return @intCast(idx);
 }
 
+/// Add a cross-process reference to a registered port (fork/clone).
+pub fn retainPort(port: u16) void {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    for (0..num_ports) |i| {
+        if (ports[i] == port) {
+            port_refs[i] += 1;
+            return;
+        }
+    }
+}
+
 /// Deregister `port`, freeing its slot and dropping any queued datagrams.
 /// Swap-remove keeps slots dense; each queue travels with its port.
+/// A port shared across fork/clone survives until the last reference drops.
 pub fn releasePort(port: u16) void {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
 
     for (0..num_ports) |i| {
         if (ports[i] == port) {
+            if (port_refs[i] > 1) {
+                port_refs[i] -= 1;
+                return;
+            }
             num_ports -= 1;
             ports[i] = ports[num_ports];
+            port_refs[i] = port_refs[num_ports];
             queues[i] = queues[num_ports];
             ports[num_ports] = 0;
+            port_refs[num_ports] = 0;
             // Invalidate the vacated tail so a future registration on that
             // slot never delivers stale datagrams to a new owner.
             for (0..QUEUE_DEPTH) |j| queues[num_ports][j].valid = false;
             return;
         }
     }
+}
+
+/// True when a datagram is queued for `port` (epoll readiness).
+pub fn hasQueuedDatagram(port: u16) bool {
+    const port_idx = findPortIdx(port) orelse return false;
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    for (0..QUEUE_DEPTH) |i| {
+        if (queues[port_idx][i].valid) return true;
+    }
+    return false;
 }
 
 fn enqueue(port_idx: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, payload: []const u8, is_v6: bool) void {
@@ -202,10 +237,16 @@ pub fn recvFromV6(port: u16, out_buf: [*]u8, out_src_ip: *[16]u8, out_src_port: 
 pub fn sendTo(dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, data_len: u16) bool {
     if (data_len > MAX_UDP_PAYLOAD) return false;
 
-    const dst_mac = arp.resolve(dst_ip) orelse {
-        arp.sendArpRequest(dst_ip);
-        return false;
-    };
+    // Limited broadcast has no ARP entry (arp.resolve would fail and nothing
+    // would ever be transmitted) — use the broadcast MAC directly. DHCP
+    // DISCOVER/REQUEST depend on this.
+    const dst_mac = if (dst_ip[0] == 255 and dst_ip[1] == 255 and dst_ip[2] == 255 and dst_ip[3] == 255)
+        [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }
+    else
+        arp.resolve(dst_ip) orelse {
+            arp.sendArpRequest(dst_ip);
+            return false;
+        };
 
     const our_mac = netif.getMac();
     const our_ip = netif.getOurIp();

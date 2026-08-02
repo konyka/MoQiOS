@@ -74,9 +74,8 @@ export fn _start() callconv(.c) noreturn {
     // skip for now, rely on serial output instead
     klog.log(.info, "VGA skipped (serial-only mode)");
 
-    // M1: symbol table (shared boot fragment — SK-35)
-    subsystem_boot.initSymbolTable();
-    klog.log(.info, "Symbol table initialized");
+    // M1: symbol table — non-x86 SK-35 probe only; x86 has no ELF .symtab
+    // loader and panic never looks symbols up, so no init here.
 
     // M2: Physical Memory Manager
     if (memmap_request.response) |memmap| {
@@ -276,27 +275,27 @@ export fn _start() callconv(.c) noreturn {
     sched_boot.bootIdleLoop();
 }
 
-/// Map the low memory region (0-1MB) via HHDM so ACPI tables and BIOS data
-/// are accessible.
+/// Verify the low memory region (0-1MB) is accessible via the HHDM so ACPI
+/// tables and BIOS data can be read. Limine maps the HHDM with 1GiB huge
+/// pages, so these pages are always covered — mapping them again with
+/// mapPage fails with error.HugePagePresent. Checked no-op: warn if coverage
+/// is ever missing (non-Limine boot, changed HHDM layout).
 fn mapAcpiRegion() void {
     const pml4 = paging.getKernelPml4();
-    const flags = paging.MapFlags{
-        .writable = false,
-        .user = false,
-        .no_execute = true,
-        .global = true,
-    };
     var phys: u64 = 0;
     while (phys < 0x100000) : (phys += paging.PAGE_SIZE) {
-        const virt = hhdm.physToVirt(phys);
-        paging.mapPage(pml4, virt, phys, flags) catch {};
+        if (!paging.isPageMapped(pml4, hhdm.physToVirt(phys))) {
+            klog.logHex(.warn, "ACPI low region not HHDM-mapped at phys ", phys);
+            return;
+        }
     }
+    klog.log(.info, "ACPI low region covered by HHDM");
 }
 
-/// Map a single physical page containing an ACPI table at the given physical address.
-/// Skips mapping if the page is already mapped (to avoid splitting huge pages).
 /// Map a single physical page for ACPI/MMIO access.
-/// Uses 2MB huge page mapping to avoid splitting existing huge pages.
+/// No-op when the page is already mapped (the common case: Limine's HHDM
+/// covers everything with huge pages). Falls back to a 2MB huge-page mapping
+/// to avoid splitting existing 1GiB pages.
 pub fn mapAcpiPage(phys_addr: u64) void {
     const page = phys_addr & ~@as(u64, paging.PAGE_SIZE - 1);
     const virt = hhdm.physToVirt(page);
@@ -312,7 +311,9 @@ pub fn mapAcpiPage(phys_addr: u64) void {
         .write_through = true,
         .cache_disable = true,
     };
-    paging.mapHugePage(pml4, hhdm.physToVirt(huge_page_base), huge_page_base, flags) catch {};
+    paging.mapHugePage(pml4, hhdm.physToVirt(huge_page_base), huge_page_base, flags) catch {
+        klog.logHex(.warn, "mapAcpiPage: mapHugePage failed for phys ", huge_page_base);
+    };
 }
 
 fn strnLen(s: [*:0]u8, max: usize) usize {

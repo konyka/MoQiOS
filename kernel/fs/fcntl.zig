@@ -40,7 +40,7 @@ fn dupFd(fd_table: *vfs.FdTable, fd: u32, min_fd: u32, new_flags: u32) i64 {
     // Increment pipe ref count if it's a pipe
     if (fd_table.fds[slot].fd_type == .pipe_read or fd_table.fds[slot].fd_type == .pipe_write) {
         if (fd_table.fds[slot].pipe_idx < 16) {
-            _ = vfs.pipeRetain(fd_table.fds[slot].pipe_idx);
+            _ = vfs.pipeRetain(fd_table.fds[slot].pipe_idx, fd_table.fds[slot].fd_type == .pipe_write);
         }
     }
     return @intCast(slot);

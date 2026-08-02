@@ -2714,7 +2714,7 @@ fn syscallSigaction(frame: *SyscallFrame) void {
 }
 
 fn syscallSigprocmask(frame: *SyscallFrame) void {
-    frame.rax = @bitCast(signal_syscall_mod.sigprocmask(@truncate(frame.rdi), frame.rsi, frame.rdx));
+    frame.rax = @bitCast(signal_syscall_mod.sigprocmask(@truncate(frame.rdi), frame.rsi, frame.rdx, frame.r10));
 }
 
 fn syscallSigreturn(frame: *SyscallFrame) void {
@@ -2780,7 +2780,7 @@ pub fn checkSignalsOnSyscallReturn(frame: *SyscallFrame) void {
     const current = sched.currentTask() orelse return;
     if (!current.is_user) return;
     if (current.pending_signals == 0) return;
-    if (current.pending_signals & ~current.signal_mask == 0) return;
+    if (current.pending_signals & ~@as(u32, @truncate(current.signal_mask)) == 0) return;
 
     const signum = sig_mod.dequeueSignal(current) orelse return;
 
@@ -3137,20 +3137,13 @@ fn syscallTruncate(path_ptr: u64, length: u64) i64 {
 
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = tm.getTask(cur_idx) orelse return -1;
-    const fd_result = cur.fd_table.open(name, 0);
+    // O_WRONLY (0x01): truncate requires write access to the file.
+    const fd_result = cur.fd_table.open(name, 1);
     if (fd_result < 0) return -2; // ENOENT
     const fd: u32 = @intCast(fd_result);
-    const desc = &cur.fd_table.fds[fd];
-    const ext2 = @import("../../fs/ext2.zig");
-    if (desc.fd_type == .ext2_file) {
-        const ok = ext2.truncateFile(desc.ext2_file_idx, @truncate(length));
-        _ = cur.fd_table.close(fd);
-        return if (ok) @as(i64, 0) else @as(i64, -5); // EIO
-    }
-    // For other file types, just update the in-memory size
-    desc.file_size = @truncate(length);
+    const result = truncateDesc(&cur.fd_table.fds[fd], length);
     _ = cur.fd_table.close(fd);
-    return 0;
+    return result;
 }
 
 /// ftruncate(fd, length) — truncate a file by fd.
@@ -3162,12 +3155,31 @@ fn syscallFtruncate(fd: u32, length: u64) i64 {
     if (fd >= vfs_mod.MAX_FDS) return -9;
     const desc = &cur.fd_table.fds[fd];
     if (desc.fd_type == .none) return -9;
-    const ext2 = @import("../../fs/ext2.zig");
-    if (desc.fd_type == .ext2_file) {
-        const ok = ext2.truncateFile(desc.ext2_file_idx, @truncate(length));
-        return if (ok) @as(i64, 0) else @as(i64, -5);
+    if (!desc.writable) return -22; // EINVAL — fd not open for writing
+    return truncateDesc(desc, length);
+}
+
+/// Shared truncate implementation. Only filesystems with real truncation
+/// support are accepted; ramdisk/proc files are read-only and rejected.
+fn truncateDesc(desc: *vfs_mod.FileDescriptor, length: u64) i64 {
+    const new_size: u32 = @truncate(length);
+    switch (desc.fd_type) {
+        .ext2_file => {
+            const ext2 = @import("../../fs/ext2.zig");
+            if (!ext2.truncateFile(desc.ext2_file_idx, new_size)) return -5; // EIO
+        },
+        .fat32_file => {
+            const fat32 = @import("../../fs/fat32.zig");
+            if (!fat32.truncateFile(desc.fat32_file_idx, new_size)) return -5; // EIO
+        },
+        .tmpfs_file => {
+            const tmpfs = @import("../../fs/tmpfs.zig");
+            if (!tmpfs.tmpfsTruncate(@intCast(desc.tmpfs_idx), new_size)) return -22; // EINVAL
+        },
+        else => return -22, // EINVAL — ramdisk/proc and special fds are not truncatable
     }
-    desc.file_size = @truncate(length);
+    desc.file_size = new_size;
+    if (desc.offset > new_size) desc.offset = new_size;
     return 0;
 }
 
@@ -4057,7 +4069,8 @@ fn syscallMemfdCreate(name_ptr: u64, flags: u32) i64 {
     // allocPipe sets ref_count=2 (for read+write ends), but memfd is a single fd.
     // Reduce ref_count to 1 since we only hold one reference.
     if (!vfs_mod.pipeMakeSingleEnded(pipe_idx)) {
-        vfs_mod.pipeClose(pipe_idx);
+        vfs_mod.pipeClose(pipe_idx, false);
+        vfs_mod.pipeClose(pipe_idx, true);
         t.fd_table.freeFd(fd_slot);
         return -5;
     }
