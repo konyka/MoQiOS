@@ -75,7 +75,9 @@ const moqi_libc_sources = [_][]const u8{
 /// C user program built against moqi_libc: same flags as addCUserProgram,
 /// plus the libc include dir and sources. The program's entry point is
 /// `int main(void)`; crt0 provides `_start` and `exit(main())`.
-fn addLibcUserProgram(b: *std.Build, name: []const u8) void {
+/// `src` is the program's C source path (user/ for most programs; init
+/// lives in servers/init/).
+fn addLibcUserProgram(b: *std.Build, name: []const u8, src: []const u8) void {
     const elf = b.addSystemCommand(&.{
         "zig",            "cc",
         "-target",        "x86_64-freestanding-none",
@@ -87,8 +89,8 @@ fn addLibcUserProgram(b: *std.Build, name: []const u8) void {
         "-o",
     });
     const elf_out = elf.addOutputFileArg(b.fmt("{s}.bin", .{name}));
-    elf.addFileArg(b.path(b.fmt("user/{s}.c", .{name})));
-    for (moqi_libc_sources) |src| elf.addFileArg(b.path(src));
+    elf.addFileArg(b.path(src));
+    for (moqi_libc_sources) |libc_src| elf.addFileArg(b.path(libc_src));
     elf.setName(b.fmt("compile {s}.c + moqi_libc -> ELF bin", .{name}));
 
     b.getInstallStep().dependOn(&b.addInstallFile(elf_out, b.fmt("user/{s}.bin", .{name})).step);
@@ -264,8 +266,11 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(kernel);
 
     // --- User programs ---
-    // Assembly entry stubs (.S -> flat binary via user.ld)
-    const asm_programs = [_][]const u8{ "init", "hello2", "hello3" };
+    // Assembly entry stubs (.S -> flat binary via user.ld).
+    // NOTE: user/init.S is retained in the tree as the assembly fallback but
+    // is no longer built; init is the C program in servers/init/ below, and
+    // only one rule may install zig-out/user/init.bin.
+    const asm_programs = [_][]const u8{ "hello2", "hello3" };
     for (asm_programs) |name| addAsmUserProgram(b, name);
 
     // C programs (.c -> static freestanding ELF stored as .bin)
@@ -283,8 +288,11 @@ pub fn build(b: *std.Build) void {
 
     // C programs built against moqi_libc (lib/moqi_libc/): entry point is
     // `int main(void)`, libc provides _start and the syscall wrappers.
+    // init (PID 1) is the C replacement for user/init.S; its source lives in
+    // servers/init/, everything else in user/.
     const libc_programs = [_][]const u8{ "sh", "hello10" };
-    for (libc_programs) |name| addLibcUserProgram(b, name);
+    for (libc_programs) |name| addLibcUserProgram(b, name, b.fmt("user/{s}.c", .{name}));
+    addLibcUserProgram(b, "init", "servers/init/main.c");
 
     // Build and run in QEMU with Limine
     const run_step = b.step("run", "Build and run in QEMU");

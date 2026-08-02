@@ -359,7 +359,7 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
             // fatal signal, or EINTR so the handler can run on return.
             const sig_mod = @import("../proc/signal.zig");
             if (sig_mod.pendingFatal(cur_task)) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
-            if (sig_mod.pendingAny(cur_task)) return EINTR;
+            if (sig_mod.pendingActionable(cur_task)) return EINTR;
             continue;
         }
 
@@ -460,7 +460,7 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
             // Signal kick: die on a fatal signal, or EINTR (see mqTimedSend).
             const sig_mod = @import("../proc/signal.zig");
             if (sig_mod.pendingFatal(cur_task)) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
-            if (sig_mod.pendingAny(cur_task)) return EINTR;
+            if (sig_mod.pendingActionable(cur_task)) return EINTR;
             continue;
         }
 

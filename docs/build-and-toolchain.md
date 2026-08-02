@@ -13,7 +13,7 @@
 | Zig | 0.16+ | 内核编译、`zig cc` 交叉编译用户 C 程序、构建驱动（`build.zig`） |
 | `zig cc` | 内置 | 编译用户态 C 程序（封装 clang） |
 | LLD | 内置 (`ld.lld`) | 链接内核与用户程序 |
-| `zig cc` (assembler mode) | 内置 | 汇编 `init.S`、`hello*.S`、`ap_trampoline_src.S` |
+| `zig cc` (assembler mode) | 内置 | 汇编 `hello*.S`、`ap_trampoline_src.S`（`init.S` 保留为回退，不再参与构建） |
 | `zig objcopy` | 内置 | 提取二进制段（用户汇编程序、trampoline 等） |
 | `xorriso` | 系统包 | 生成 ISO 镜像 |
 | `limine` | 仓库 `limine/` 子目录 | 安装 BIOS/UEFI 引导器 |
@@ -118,12 +118,17 @@ zig cc \
 SSE；用户态 C 程序不再传 `-mno-sse/-mno-sse2`，因为 Zig 0.15.2 的 compiler-rt 在该组合下会触发
 half-float SSE 返回错误。启用跨核用户任务迁移前仍需补齐 FPU/SSE 上下文保存验证。
 
-### 4.1.1 moqi_libc 程序（sh, hello10）
+### 4.1.1 moqi_libc 程序（init, sh, hello10）
 
-`addLibcUserProgram(b, name)`：标志与 `addCUserProgram` 完全相同，额外加
+`addLibcUserProgram(b, name, src)`：标志与 `addCUserProgram` 完全相同，额外加
 `-Ilib/moqi_libc/include` 并把 `lib/moqi_libc/src/*.c` 一起编译链接。入口约定为
 `int main(void)`（crt0 提供 `_start` 与 `exit(main())`），程序内直接使用
 libc 的 `print/printf/fork/execve/malloc` 等，不再手写 syscall 内联汇编。
+`src` 为源文件路径：大多数程序在 `user/<name>.c`；**init**（PID 1，2026-08 起为
+C 实现）源文件位于 `servers/init/main.c`，同样安装为 `zig-out/user/init.bin`，
+由 `tools/qemu_run.sh` 打包进 ramdisk 后按文件名 `init` 被内核加载。汇编版
+`user/init.S` 保留在源码树中作为回退，但已从 `asm_programs` 移除，不再产生
+`init.bin`（避免与 C 版安装冲突）。
 库结构与设计见 [user-space.md](./user-space.md) 第 5 节。
 
 ```
@@ -140,7 +145,7 @@ zig cc \
 `lib/moqi_libc/host_tests/run_tests.sh` 运行，使用私有 zig 缓存目录，可与
 `zig build` 并行执行。
 
-### 4.2 汇编程序（init.S, hello2.S, hello3.S）
+### 4.2 汇编程序（hello2.S, hello3.S）
 
 `addAsmUserProgram(b, name)`：`zig cc -c` 汇编为 `.o`，再用 `user/user.ld` 链接，最后
 `objcopy -O binary` 生成纯二进制。

@@ -1547,6 +1547,30 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 ---
 
+### 6.6 基础设施补完轮次（2026-08-02）
+
+性能优先、安全可靠、全程 TDD（先 host 单测红→实现绿→QEMU 运行时标记→文档→独立提交）。
+
+| 阶段 | 内容 | 验证 |
+|---|---|---|
+| F0 | host 单测基础设施：`zig build test` 从 4 模块扩到 11（新增 eth/ipv4/ipv6/tcp_util/udp_util/errno/fmt 行为测试；`kernel/host_test.zig` 再导出根 + `docs/build-and-toolchain.md` §13 约定） | 22 测试通过 |
+| F1 | NVMe MSI-X 中断驱动（性能核心）：`pci_msix.zig` 纯解析模块（host 单测）、每 I/O 队列一向量（242-245）、ISR 收割 CQ 唤醒提交者、通道所有权取代全程持锁、500ms 有界等待回退轮询、QEMU 挂载 NVMe 设备 + 引导自测（"interrupt-driven read verified"）；顺带修复 QEMU 10 拒绝的 CC 队列项尺寸字段 | smoke SMP=1/4，MSI-X 标记 |
+| F2 | loopback 接口：`lo.zig` 回环设备（host 单测），udp/tcp 发送路径对 127/8 绕过 ARP 直投 lo，netPoll/e1000 ISR 排干回送队列；`hello43` 验证 127.0.0.1 上 TCP+UDP 回环 | hello43 PASS |
+| F3 | SCHED_FIFO/RR 实时调度类：`sched_policy.zig` 纯策略模块（host 单测），RT rankKey 压制 OTHER、FIFO 无量子、RR 10-tick 轮转、nice 正交；新增 syscall #473-476（Linux 号在本分发表被占用）；`hello44` 运行时验证 | hello44 PASS |
+| F4 | moqi_libc 最小 freestanding C 运行时（crt0/unistd/string/stdio-lite/malloc），TDD 宿主测试 91 checks；`sh` 与 `hello10` 迁移示范；`lib/zig_crt/start.zig` | smoke 标记不变 |
+| F5 | `servers/init/main.c` C 版 init 取代 1246 行汇编 init.S（静态 parity 校验 119/119 输出事件一致；init.S 保留作回退） | smoke 全标记 |
+| F6 | EINTR 补覆盖：ipc.zig receive、file_lock F_SETLKW/flock、waitpid 阻塞路径接入 pendingFatal/pendingAny 协议 | ast-check + smoke |
+
+**调试中发现的两个深层问题（均已修复）**：
+
+1. `sched_setaffinity` 整数收窄 panic：`@min(u32, comptime 32)` 被收窄为 u6，`to_copy * 8` 在 cpusetsize≥8 时整数溢出——该 syscall 此前从未被真实调用过。显式标注 u32 修复。
+2. hello44 "fifo child preempted"（SMP=4 偶发）根因链：重调度 IPI 可为任意唤醒抢占运行中的 RT 任务（已加 `peekBestRankKey` 防护）；更根本的是 **setaffinity 不迁移运行中的任务**——hello44 钉 CPU 0 时实际在别的核上运行，父子进程并行执行，"同核压制"前提不成立。诊断方法学：hello44 打印 c0/c1 差值 → 内核 RTDIAG（无 RT 抢占）→ AFFDIAG（无亲和违规）→ 定位到 first-schedule 不经诊断路径 → 确认缺迁移。
+3. SMP 压测又暴露三个既有缺陷：`pendingAny` 把默认忽略的 SIGCHLD 也算作 EINTR 条件，导致 waitpid 第二个子进程等待被前一个子进程的 SIGCHLD 虚假打断（新增 `pendingActionable` 谓词——仅"装了 handler 或默认终止"的信号才产生 EINTR，12 处等待点全部切换）；`exitTask` 唤醒 waitpid 父进程时只置 `.ready` 不入队，忙核上队列优先的 pickNext 会让父进程无限饥饿（hello33 偶发挂死），改为置位后经 `per_cpu.enqueueTask` 重新入队；阻塞 waitpid 被**非目标**子进程的退出唤醒后返回 0（虚假成功，hello44 RR 测试 SMP=1 确定性失败），改为重扫描后重新阻塞（无子进程可等时返回 -ECHILD）。hello14/19/27 的 ARP/connect 偶发失败确认为 QEMU slirp 既有抖动（历史日志约 10% 出现率），不在本轮范围。
+
+**仍遗留**：panic 停 AP 为 tick 检查而非 NMI；RT 任务唤醒抢占为尽力而为（同 rank 不抢）；servers/ 服务化与 drivers/ 用户态驱动属长期微内核目标未启动。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:

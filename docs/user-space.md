@@ -75,28 +75,34 @@ static inline long sys_write(int fd, const void *buf, unsigned long n) {
 
 ## 2. init 进程
 
-文件：`user/init.S`（汇编，约 1306 行），编译为 `user/init.elf`，作为 PID 1。
+文件：`servers/init/main.c`（C，基于 moqi_libc，见第 5 节），编译安装为
+`zig-out/user/init.bin`，作为 PID 1。2026-08 起取代汇编实现；`user/init.S`
+（汇编，约 1306 行）保留在源码树中作为回退参考，但不再参与构建。
+C 版保持字节级行为一致：相同 spawn 顺序、相同打印行、相同 waitpid 语义。
 
 职责：
 
 1. 顺序 `spawn` 自动化测试程序（`hello2`–`hello44`；其中 `hello11` 与 `hello28` **不**在
-   `init.S` 自动序列内），并 `waitpid` 收回；随后进入交互 shell。
+   init 自动序列内），并 `waitpid` 收回；随后进入交互 shell。
 2. 测试全部通过后启动交互式 Shell（`sh`）。
 3. 在 Shell 退出后处于阻塞状态（避免内核因 init 退出而 panic）。
 
 伪流程：
 
 ```
-_start:
-    setup_argv_envp
+main():
+    printf("init (pid %ld) started\n", getpid());
     spawn("hello2");  waitpid;
     ...
     spawn("hello44"); waitpid;   // SCHED_FIFO/RR realtime classes (after hello42)
-    spawn("sh");      waitpid;
-    loop_forever
+    spawn("hello9/10/21"); waitpid;   // fork/ext2 写测试排在最后
+    spawn("sh");
+    exit(0);
 ```
 
-为什么用汇编：避免依赖 libc，便于直接控制系统调用号与栈布局。
+历史说明：init 最初用汇编编写（`user/init.S`），以避免依赖 libc、直接控制系统调用号
+与栈布局；moqi_libc 成熟后已迁移为 C（`servers/init/main.c`），行为逐字节保持一致，
+汇编版保留作为回退。
 
 ---
 
@@ -211,8 +217,9 @@ _start:
    [build-and-toolchain.md](./build-and-toolchain.md) 第 4 节）。
 3. 输出仍是 `zig-out/user/<name>.bin`（静态 freestanding ELF），与裸 C 程序一致。
 
-现有示范：`user/sh.c`（最大消费者）与 `user/hello10.c` 已迁移到 moqi_libc，
-PASS 标记与原始版本逐字节一致。
+现有示范：`user/sh.c`（最大消费者）、`user/hello10.c` 与 `servers/init/main.c`
+（PID 1，2026-08 迁移）已迁移到 moqi_libc，PASS 标记与原始版本逐字节一致。
+init 的源文件不在 `user/` 下，构建时以显式路径调用 `addLibcUserProgram`。
 
 ### 5.4 有意缺失
 
@@ -252,7 +259,7 @@ SECTIONS {
 
 | 子目录 | 规划职责 |
 |---|---|
-| `servers/init/` | 用户态 init（替代当前 `user/init.S`） |
+| `servers/init/` | 用户态 init（**已实现**：`main.c` 基于 moqi_libc，取代 `user/init.S`；汇编版保留为回退） |
 | `servers/pm/` | 进程管理服务（fork/exec/wait） |
 | `servers/vfs/ext4/` | 文件系统服务（ext4 实现，从内核迁出） |
 | `servers/devmgr/` | 设备管理 / 命名空间 |

@@ -98,6 +98,13 @@ pub fn sysFlock(fd: u64, operation: u64) i64 {
         if (has_conflict) {
             fl_lock.release(flags);
             if (is_nb) return -11; // EAGAIN for non-blocking
+            // Signal kick (sendSignal unblocks/yields us): die on a fatal
+            // signal via the same exit-by-signal path the timer tick uses,
+            // or report EINTR so the handler can run on return. This retry
+            // loop links no wait node, so there is nothing to unlink.
+            const sig_mod = @import("../proc/signal.zig");
+            if (sig_mod.pendingFatal(t)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+            if (sig_mod.pendingActionable(t)) return -4; // -EINTR
             // Blocking: yield and retry
             sched_mod.forceReschedule();
             continue;
@@ -246,6 +253,13 @@ pub fn setLock(fd: u64, cmd: u64, flock_ptr: u64) i64 {
         if (has_conflict) {
             fl_lock.release(flags);
             if (is_nb) return -11; // EAGAIN for non-blocking
+            // Signal kick (sendSignal unblocks/yields us): die on a fatal
+            // signal via the same exit-by-signal path the timer tick uses,
+            // or report EINTR so the handler can run on return. This retry
+            // loop links no wait node, so there is nothing to unlink.
+            const sig_mod = @import("../proc/signal.zig");
+            if (sig_mod.pendingFatal(t)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+            if (sig_mod.pendingActionable(t)) return -4; // -EINTR
             sched_mod.forceReschedule();
             continue;
         }

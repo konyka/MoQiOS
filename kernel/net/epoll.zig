@@ -583,7 +583,7 @@ fn blockOnEpoll(inst: *EpollInstance, start_tick: u64, timeout_ms: i32) BlockOut
         // same exit-by-signal path the timer tick uses (fatal default).
         if (task_mod.getTask(my_idx)) |ct| {
             const sig_mod = @import("../proc/signal.zig");
-            if (sig_mod.pendingAny(ct)) {
+            if (sig_mod.pendingActionable(ct)) {
                 const s2 = inst.spin.acquire();
                 const granted = node.granted;
                 if (!granted) removeWaiterLocked(inst, &node);

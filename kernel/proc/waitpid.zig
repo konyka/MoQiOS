@@ -40,41 +40,60 @@ pub fn waitpidWithOptions(pid_raw: u64, status_ptr: u64, options: u32) i64 {
     // previous waitpid path hlt-spun in the syscall until a child exited, which
     // deadlocked on a single CPU because the newly spawned child never ran.
     const parent = task_mod.getTask(cur_idx) orelse return -1;
-    parent.waiting_for_child = true;
-    parent.wait_cpu = @intCast(se.getPerCpu().cpu_id);
-    asm volatile ("" ::: .{ .memory = true });
+    const sig_mod = @import("signal.zig");
 
-    // Rescan now that the flag is visible. `exitTask` sets .zombie and reads the
-    // flag inside one `task_lock` section, and the scan below takes that same
-    // lock, so a child that exits from here on either sees the flag and wakes us
-    // or is already reapable here. Without this rescan a child exiting between
-    // the first scan and the store above wakes nobody and the parent blocks for
-    // good.
-    if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {
+    // Retry loop: any child's exit clears `waiting_for_child` (exitTask does
+    // not filter by target pid), so a non-target child's exit must NOT end the
+    // wait — reap our target if available, otherwise re-block. Returning 0
+    // here made waitpid(specific_pid) spuriously succeed (hello44 RR test).
+    while (true) {
+        parent.waiting_for_child = true;
+        parent.wait_cpu = @intCast(se.getPerCpu().cpu_id);
+        asm volatile ("" ::: .{ .memory = true });
+
+        // Rescan now that the flag is visible. `exitTask` sets .zombie and
+        // reads the flag inside one `task_lock` section, and the scan below
+        // takes that same lock, so a child that exits from here on either sees
+        // the flag and wakes us or is already reapable here. Without this
+        // rescan a child exiting between the first scan and the store above
+        // wakes nobody and the parent blocks for good.
+        if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {
+            parent.waiting_for_child = false;
+            if (!writeStatus(status_ptr, exit_code)) return -14;
+            return child_tid;
+        }
+        // No matching child will ever exit — don't re-block forever.
+        if (!task_mod.hasChildren(cur_idx)) {
+            parent.waiting_for_child = false;
+            return -10; // -ECHILD
+        }
+        se.syncUserRspToTask(parent);
+
+        task_mod.kickChildCpus(parent.tid, parent.wait_cpu);
+        parent.state = .blocked;
+        sched_mod.requestReschedule();
+        while (@as(*volatile bool, @ptrCast(&parent.waiting_for_child)).* and !sig_mod.pendingActionable(parent)) {
+            asm volatile ("sti");
+            asm volatile ("hlt" ::: .{ .memory = true });
+        }
         parent.waiting_for_child = false;
-        if (!writeStatus(status_ptr, exit_code)) return -14;
-        return child_tid;
-    }
-    se.syncUserRspToTask(parent);
+        se.syncUserRspFromTask(parent);
+        se.getPerCpu().kernel_rsp = parent.kernel_stack_top;
+        @import("../arch/arch.zig").gdt.setRsp0(se.getPerCpu().cpu_id, parent.kernel_stack_top);
 
-    task_mod.kickChildCpus(parent.tid, parent.wait_cpu);
-    parent.state = .blocked;
-    sched_mod.requestReschedule();
-    while (@as(*volatile bool, @ptrCast(&parent.waiting_for_child)).*) {
-        asm volatile ("sti");
-        asm volatile ("hlt" ::: .{ .memory = true });
-    }
-    parent.waiting_for_child = false;
-    se.syncUserRspFromTask(parent);
-    se.getPerCpu().kernel_rsp = parent.kernel_stack_top;
-    @import("../arch/arch.zig").gdt.setRsp0(se.getPerCpu().cpu_id, parent.kernel_stack_top);
-
-    // Woken up — a child has exited. Now reap it.
-    if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {
-        if (!writeStatus(status_ptr, exit_code)) return -14;
-        return child_tid;
-    } else {
-        return 0; // Spurious wakeup
+        // Woken up — a child may have exited. Reap first: a pending signal
+        // only aborts the wait when no child status is available, so an
+        // EINTR'd (or killed) waitpid never consumes the child's exit status.
+        if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {
+            if (!writeStatus(status_ptr, exit_code)) return -14;
+            return child_tid;
+        }
+        // Signal kick (sendSignal unblocks without a child exit): die on a
+        // fatal signal via the same exit-by-signal path the timer tick uses,
+        // or report EINTR so the handler can run on return.
+        if (sig_mod.pendingFatal(parent)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+        if (sig_mod.pendingActionable(parent)) return -4; // -EINTR
+        // Non-target child exit (or spurious wake): loop and re-block.
     }
 }
 

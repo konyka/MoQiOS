@@ -326,7 +326,7 @@ pub fn futexWaitv(waiters_ptr: u64, nr_waiters: u64) i64 {
             // Signal kick: fatal signal exits, handled signal EINTRs.
             const sig_mod = @import("../proc/signal.zig");
             if (sig_mod.pendingFatal(cur)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
-            if (sig_mod.pendingAny(cur)) return -4; // -EINTR
+            if (sig_mod.pendingActionable(cur)) return -4; // -EINTR
             return -11;
         }
         return @bitCast(i);
@@ -397,7 +397,7 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
                 // a fatal signal via the tick's exit-by-signal path, or EINTR.
                 const sig_mod = @import("../proc/signal.zig");
                 if (sig_mod.pendingFatal(cur)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
-                if (sig_mod.pendingAny(cur)) return -4; // -EINTR
+                if (sig_mod.pendingActionable(cur)) return -4; // -EINTR
                 return -11;
             }
             return 0;
@@ -449,7 +449,7 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
                 // Signal kick: fatal signal exits, handled signal EINTRs.
                 const sig_mod = @import("../proc/signal.zig");
                 if (sig_mod.pendingFatal(cur)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
-                if (sig_mod.pendingAny(cur)) return -4; // -EINTR
+                if (sig_mod.pendingActionable(cur)) return -4; // -EINTR
                 return -11;
             }
             return 0;
@@ -569,7 +569,7 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
                     // Signal kick: fatal signal exits, handled signal EINTRs.
                     const sig_mod = @import("../proc/signal.zig");
                     if (sig_mod.pendingFatal(cur_task)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
-                    if (sig_mod.pendingAny(cur_task)) return -4; // -EINTR
+                    if (sig_mod.pendingActionable(cur_task)) return -4; // -EINTR
                     return -11;
                 }
                 // v53.51: Woken — loop back and re-contend instead of

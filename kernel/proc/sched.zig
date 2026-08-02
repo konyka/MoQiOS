@@ -346,6 +346,26 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         }
     }
 
+    // F3: a reschedule IPI (force_pick) must not preempt a running RT task
+    // for lower-ranked work — every remote wake would otherwise cut into
+    // FIFO/RR execution. Preempt only when a strictly better-ranked runnable
+    // exists on this CPU.
+    if (force_pick) {
+        if (getCurrentIdx()) |ci| {
+            if (task.getTask(ci)) |ct| {
+                if (ct.state == .running and sched_policy.isRtClass(ct.sched_policy)) {
+                    const cur_key = sched_policy.rankKey(ct.sched_policy, ct.priority);
+                    const best = peekBestRankKey();
+                    if (best == null or best.? >= cur_key) {
+                        setSlice(TIMESLICE_TICKS);
+                        sched_lock.release(flags);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     setSlice(TIMESLICE_TICKS);
 
     const next_idx = pickNext() orelse {
@@ -548,6 +568,34 @@ fn pickNext() ?u32 {
         }
     }
     return task.pickReadyForCpu(@intCast(currentCpuId()), getCurrentIdx());
+}
+
+/// Best (lowest) rankKey among runnable tasks eligible for this CPU, without
+/// dequeuing anything. Used to decide whether a reschedule IPI may preempt a
+/// running RT task: the IPI must not cut into FIFO/RR execution for
+/// lower-ranked work (observed as hello44 fifo-preemption flakiness on SMP).
+fn peekBestRankKey() ?u16 {
+    var best: ?u16 = null;
+    // Per-CPU run queue (read-only scan).
+    const q = per_cpu.getCurrent();
+    const qflags = q.lock.acquire();
+    var i: u32 = 0;
+    while (i < q.nr_running) : (i += 1) {
+        const slot = (q.tail + i) % per_cpu.QUEUE_SIZE;
+        const t = q.tasks[slot] orelse continue;
+        if (t.state != .ready) continue;
+        const key = sched_policy.rankKey(t.sched_policy, t.priority);
+        if (best == null or key < best.?) best = key;
+    }
+    q.lock.release(qflags);
+    // Bitmap fallback (non-mutating pick).
+    if (task.pickReadyForCpu(@intCast(currentCpuId()), null)) |idx| {
+        if (task.getTask(idx)) |t| {
+            const key = sched_policy.rankKey(t.sched_policy, t.priority);
+            if (best == null or key < best.?) best = key;
+        }
+    }
+    return best;
 }
 
 /// Pop queue entries until one is actually runnable *here*. Wake paths

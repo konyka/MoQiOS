@@ -167,7 +167,7 @@ pub fn semop(semid: u32, sem_num: u32, op: i16) i64 {
                 // tick uses, or report EINTR so the handler can run on return.
                 const sig_mod = @import("../proc/signal.zig");
                 if (sig_mod.pendingFatal(cur_task)) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
-                if (sig_mod.pendingAny(cur_task)) return -4; // -EINTR
+                if (sig_mod.pendingActionable(cur_task)) return -4; // -EINTR
                 return -43; // interrupted (EIDRM / signal)
             }
             continue; // re-acquire lock and re-check condition

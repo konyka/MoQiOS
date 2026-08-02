@@ -122,8 +122,29 @@ pub fn pendingFatal(t: *task.Task) ?u32 {
 /// True if the task has any pending, unblocked signal (handled or not).
 /// Wait primitives return -EINTR on a hit so the syscall-return/tick path
 /// can run the handler.
+///
+/// NOTE: raw pending check — includes default-ignored signals (SIGCHLD).
+/// For EINTR decisions use `pendingActionable` instead: Linux only
+/// interrupts a blocking syscall when a signal is actually delivered
+/// (handler installed) or terminates the process.
 pub fn pendingAny(t: *task.Task) bool {
     return (@atomicLoad(u32, &t.pending_signals, .seq_cst) & ~@as(u32, @truncate(t.signal_mask)) & 0x7FFFFFFF) != 0;
+}
+
+/// True if a pending, unblocked signal would actually be acted on: a handler
+/// is installed for it, or its default action terminates the process.
+/// Default-ignored signals (SIGCHLD) do NOT interrupt blocking syscalls —
+/// observed as waitpid returning spurious -EINTR after an earlier child's
+/// SIGCHLD landed while waiting for a second child.
+pub fn pendingActionable(t: *task.Task) bool {
+    const pending = (@atomicLoad(u32, &t.pending_signals, .seq_cst) & ~@as(u32, @truncate(t.signal_mask))) & 0x7FFFFFFF;
+    var bits = pending;
+    while (bits != 0) {
+        const bit: u5 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        if (t.signal_handlers[bit] != 0 or !defaultSignalAction(@as(u32, bit) + 1)) return true;
+    }
+    return false;
 }
 
 /// Check if a task has any pending, non-blocked signals.

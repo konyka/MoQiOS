@@ -312,7 +312,7 @@ pub fn timerfdRead(timerfd_idx: u32, buf: [*]u8, count: usize) i64 {
         if (task_mod.getTask(cur_idx)) |ct| {
             const sig_mod = @import("../proc/signal.zig");
             if (sig_mod.pendingFatal(ct)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
-            if (sig_mod.pendingAny(ct)) return -4; // EINTR
+            if (sig_mod.pendingActionable(ct)) return -4; // EINTR
         }
         // loop and re-check / re-block
     }

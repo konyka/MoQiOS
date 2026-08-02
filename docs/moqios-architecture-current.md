@@ -89,9 +89,10 @@ MoQiOS 是一个运行在 x86_64 架构上的**单体内核** (Monolithic Kernel
 **1.7 节**）、**ext2 inode 越界**（256B 磁盘 inode 写入 128B 结构体）、**中断 stub 寄存器破坏**
 （被中断代码 RAX/RCX 遭污染，详见 **1.8 节**）。三者全部修复后，系统首次**完整启动至交互式
 `MoQiOS shell`**，依次跑通 `init` 自动序列及后续用户态测试（含用户态被定时器抢占、
-ext2 多级目录读写删，QEMU 串口验证，零异常、零三重故障）。当前 `user/init.S`（1,306 行）
-自动 spawn hello2–hello44 全序列（仅 hello11、hello28 不在自动序列中，hello6 因阻塞键盘
-输入被跳过），smoke 门禁以 `hello44 done` + shell 提示符为准（见 `tools/qemu_smoke.sh`）。
+ext2 多级目录读写删，QEMU 串口验证，零异常、零三重故障）。当前 init（`servers/init/main.c`，
+基于 moqi_libc；汇编版 `user/init.S` 保留为回退，不再构建）自动 spawn hello2–hello44
+全序列（仅 hello11、hello28 不在自动序列中，hello6 因阻塞键盘输入被跳过），smoke 门禁以
+`hello44 done` + shell 提示符为准（见 `tools/qemu_smoke.sh`）。
 
 ### 已修复缺陷
 
@@ -564,8 +565,8 @@ QEMU / 真机
   │
   └─ init 任务 (内核线程)
        ├─ 延迟初始化网络模块 (net/mod.zig) — 不能在 boot 阶段初始化
-       └─ 加载并执行 /init (user/init.S)
-            ├─ 自动 spawn hello2–hello44 全序列 (1,306 行；hello6 因阻塞键盘跳过，
+       └─ 加载并执行 /init (servers/init/main.c，基于 moqi_libc；汇编回退 user/init.S 保留不构建)
+            ├─ 自动 spawn hello2–hello44 全序列 (hello6 因阻塞键盘跳过，
             │    hello11/hello28 不在自动序列中)
             └─ 序列结束后进入 shell (sh.c)
 ```
@@ -574,7 +575,7 @@ QEMU / 真机
 
 - **HHDM**: Limine 在启动时将全部物理内存映射到高地址区域，内核通过 HHDM 偏移访问物理页
 - **网络延迟初始化**: `net_mod.init()` 不能在 boot 阶段调用（会导致未解释的死锁），而是在第一个 init 内核线程中执行
-- **init.S**: 用户空间第一个进程，通过 `spawn` 系统调用启动所有测试程序和 shell
+- **init**: 用户空间第一个进程（`servers/init/main.c`，基于 moqi_libc；`user/init.S` 保留为汇编回退），通过 `spawn` 系统调用启动所有测试程序和 shell
 
 ---
 
@@ -1246,7 +1247,12 @@ qemu_run.sh 写入的 "MoQiNVMe" 模式串时）；MSI-X 不可用时输出
 
 ### 11.1 init 进程
 
-**源文件**: `user/init.S` (1,306 行)
+**源文件**: `servers/init/main.c`（C，基于 moqi_libc；2026-08 起取代汇编版本。
+汇编实现 `user/init.S`（1,306 行）保留在源码树中作为回退参考，但不再参与构建——
+`build.zig` 中 `init` 已移入 `libc_programs`，安装产物为 `zig-out/user/init.bin`）。
+C 版与汇编版字节级行为一致：相同的 spawn 顺序、相同的打印行
+（`spawned helloN` / `helloN done` / hello2 的 `child exited`）、相同的
+waitpid 语义，smoke 门禁标记不受影响。
 
 启动时第一个用户进程，自动 spawn hello2–hello44 全序列（按 init.S 中的顺序）:
 - hello2 (串口输出), hello3 (ramdisk 读写), hello4 (多进程), hello5 (ELF 加载)

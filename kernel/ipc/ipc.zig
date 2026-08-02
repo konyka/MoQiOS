@@ -376,7 +376,19 @@ pub fn receive(ep: EndpointId, buf: *Message) IpcError {
         ipc_lock.release(flags2);
         return .success;
     }
+    // Woken without a message (signal kick or endpoint teardown): drop our
+    // receiver registration so a later send() does not deliver to a task
+    // that is no longer waiting.
+    if (endpoints[ep].waiting_receiver == caller_idx) {
+        endpoints[ep].waiting_receiver = null;
+    }
     ipc_lock.release(flags2);
+    // Signal kick (sendSignal unblocks without delivering): die on a fatal
+    // signal via the same exit-by-signal path the timer tick uses, or report
+    // EINTR so the handler can run on return. (.timeout is -4 == -EINTR.)
+    const sig_mod = @import("../proc/signal.zig");
+    if (sig_mod.pendingFatal(recv_task)) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
+    if (sig_mod.pendingActionable(recv_task)) return .timeout;
     return .not_ready;
 }
 

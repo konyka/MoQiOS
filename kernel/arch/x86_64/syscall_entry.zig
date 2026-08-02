@@ -3795,6 +3795,22 @@ fn syscallSchedSetaffinity(pid: u32, cpusetsize: u32, mask_ptr: u64) i64 {
     }
     if (affinity < 0 or @as(u32, @intCast(affinity)) >= @import("../../smp.zig").configured_cpu_count) return -22;
     target.cpu_affinity = affinity;
+
+    // Migrate a live task whose current CPU falls outside the new pin —
+    // otherwise a running task keeps its old CPU forever (observed: hello44
+    // pinned itself to CPU 0 while running elsewhere, then its "same-CPU"
+    // FIFO test ran concurrently with the child). The switch-out path
+    // re-enqueues onto the pinned CPU's queue (enqueueTask honors affinity).
+    if (target.state == .running and
+        target.last_cpu != @as(u32, @intCast(target.cpu_affinity)))
+    {
+        sched.kickCpu(@intCast(target.cpu_affinity));
+        if (target_idx == cur_idx) {
+            sched.forceReschedule();
+        } else {
+            sched.kickCpu(@intCast(target.last_cpu));
+        }
+    }
     return 0;
 }
 

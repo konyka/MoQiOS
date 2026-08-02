@@ -115,7 +115,26 @@ static void fifo_child(void) {
 
     /* A preempted FIFO child would let the parent advance thousands of
        iterations; an un preempted one sees at most a boundary wobble. */
-    if (c1 - c0 > 2) syscall1(SYS_EXIT, 15);
+    if (c1 - c0 > 2) {
+        /* DIAG: report the observed delta before failing. */
+        char buf[64];
+        int n = 0;
+        const char *pfx = "hello44: diag c0=";
+        while (pfx[n]) { buf[n] = pfx[n]; n++; }
+        uint32_t v = c0; char tmp[16]; int t = 0;
+        if (!v) tmp[t++] = '0';
+        while (v) { tmp[t++] = '0' + (v % 10); v /= 10; }
+        while (t) buf[n++] = tmp[--t];
+        const char *mid = " c1=";
+        for (int k = 0; mid[k]; k++) buf[n++] = mid[k];
+        v = c1; t = 0;
+        if (!v) tmp[t++] = '0';
+        while (v) { tmp[t++] = '0' + (v % 10); v /= 10; }
+        while (t) buf[n++] = tmp[--t];
+        buf[n++] = '\n';
+        syscall3(SYS_WRITE, 1, (uint64_t)buf, (uint64_t)n);
+        syscall1(SYS_EXIT, 15);
+    }
     print("hello44: fifo child held cpu\n");
     syscall1(SYS_EXIT, 0);
     for (;;) {}

@@ -319,9 +319,16 @@ const Task = struct {
   SCHED_RR 任务轮转而非反复弹出刚重新入队的任务。③ 位图回退 `task.pickReadyForCpu` 同上
   改用 rankKey 比较。
 - **量子**：SCHED_FIFO 无量子——`timerTick` 与 `hardwareTimerTick` 在时间片耗尽时若当前
-  任务为运行态 FIFO 则直接补充时间片返回，FIFO 只在阻塞 / yield / 退出时让出 CPU（重调度
-  IPI 的 `force_pick` 仍可抢占，为尽力而为的唤醒抢占）。SCHED_RR 量子为 10 tick（≈100ms，
-  与 OTHER 时间片同值），到期重新入队后由同级 RR 对端轮转。
+  任务为运行态 FIFO 则直接补充时间片返回，FIFO 只在阻塞 / yield / 退出时让出 CPU。
+  SCHED_RR 量子为 10 tick（≈100ms，与 OTHER 时间片同值），到期重新入队后由同级 RR 对端轮转。
+- **IPI 抢占防护（2026-08-02 修订）**：重调度 IPI（`force_pick`）**不再**能单纯为唤醒事件
+  抢占运行中的 RT 任务——`timerTick` 先用 `peekBestRankKey()` 只读扫描本核队列与位图回退，
+  仅当存在**严格更优** rankKey 的可运行任务时才让 RT 任务让出。此前每个远程唤醒 IPI 都会
+  切入 FIFO/RR 的执行（SMP 下 hello44 偶发 "fifo child preempted" 的部分原因）。
+- **sched_setaffinity 迁移（2026-08-02 修复）**：对当前正在其它 CPU 上运行的任务设置
+  affinity 现在会触发迁移（kick 目标 CPU + 当前 CPU 重调度；切换出时 `enqueueTask` 按
+  affinity 入队目标 CPU 的队列）。此前运行中的任务永远停留在原 CPU——hello44 钉 CPU 0
+  时实际运行在别的核上，导致"同核 FIFO 压制"测试在 SMP=4 下偶发失败（根因，非调度器缺陷）。
 - **nice 正交**：`setNice`/`getNice` 对 FIFO/RR 任务为 no-op / 返回 0（Linux：nice 只影响
   OTHER 类）。
 - **系统调用**（MoQiOS 编号，Linux 号 156/157/146/147 在本分发表已被 msgget/msgsnd/

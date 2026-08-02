@@ -649,6 +649,10 @@ pub fn exitTask(exit_code: i32) void {
             if (parent.waiting_for_child) {
                 parent.waiting_for_child = false;
                 parent.state = .ready;
+                // Ready is not enough — re-enqueue so a busy CPU's queue-first
+                // pickNext can't starve the parent indefinitely (bitmap-only
+                // tasks lose to a never-empty per-CPU queue).
+                _ = @import("per_cpu.zig").enqueueTask(parent);
                 asm volatile ("" ::: .{ .memory = true });
                 sched.kickCpu(parent.wait_cpu);
             }
