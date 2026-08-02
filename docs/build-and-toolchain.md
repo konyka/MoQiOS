@@ -323,7 +323,9 @@ gdb zig-out/bin/moqi-kernel.elf
 | 内存 | `mm/process_vm.zig` | process_vm_readv/writev（116 行） |
 | 其他 | `arch/x86_64/user_mode.zig` `arch/x86_64/vga.zig` | 疑似被现有实现取代的早期模块 |
 
-（`shared/sk5.zig` 与 `kernel/boot_info.zig` 经确认无引用，已于 2026-08 删除。）
+（`shared/sk5.zig` 与 `kernel/boot_info.zig` 经确认无引用，已于 2026-08 删除。另：
+`kernel/host_test.zig` 是 `zig build test` 的专用模块根，只被测试构建引用、刻意不进内核
+构建根，统计孤立文件时应排除——见第 13 节。）
 
 ### 处理建议
 
@@ -332,6 +334,38 @@ gdb zig-out/bin/moqi-kernel.elf
    不匹配，最后补一个 `hello*` 运行时测试。
 3. **`vga.zig` / `user_mode.zig`** 需先确认是否已被现有实现取代，若确认废弃可单独清理。
 4. 在集成前，这些文件**不应**被视为"已支持的功能"——以"可达即编译"的 317 个文件为准。
+
+---
+
+## 13. 主机端单元测试（`zig build test`）
+
+`zig build test` 以主机目标编译 `tests/main.zig`，直接运行内核源码的单元测试（freestanding
+目标无法承载 Zig 的标准 test runner）。当前覆盖 **11 个内核模块**：
+`lib/{byte_order,errno,fmt,fmt_core,str}.zig`、`mm/cow_pte.zig`、
+`net/{eth,ipv4,ipv6,tcp_util,udp_util}.zig`。
+
+### 工作原理
+
+- **懒 decl 分析**：Zig 只分析被引用到的声明。被测模块顶层可以 `@import` 架构相关文件
+  （如 `arch/arch.zig`、serial、pmm、端口 I/O），只要**被测的 decl 本身不触及**这些代码即可。
+  因此测试只针对纯函数（checksum、头部 build/parse、序列号比较、格式化等），并且**不要**对
+  被测模块调用 `refAllDecls`。
+- **一个文件只能属于一个模块**：模块的文件归属沿 `@import` 路径**传递**计算（包括函数体内的
+  import）。net 辅助模块共享 `lib/byte_order.zig`，`ipv4.zig` 与 `lib/fmt.zig` 又都经 arch
+  闭包触及 `sync/irq_spinlock.zig`、`mm/cow_pte.zig`，所以这些文件无法各自挂为独立测试模块。
+  它们统一由 **`kernel/host_test.zig`**（仅测试用，不参与内核构建）作为单一模块根 re-export。
+  该文件必须直接位于 `kernel/` 下，否则路径 import 会超出模块根目录。
+
+### 如何新增一个模块的主机测试
+
+1. 在 `kernel/host_test.zig` 加一行 `pub const xxx = @import("...");`（若新文件的路径 import
+   闭包与现有模块完全不相交，也可以在 `build.zig` 的 `host_test_modules` 列表中另起一项）。
+2. 在 `tests/main.zig` 顶部加 `const xxx = kt.xxx;`，然后编写行为测试（已知向量、
+   round-trip、边界条件），校验和等期望值请用独立实现（如 Python 版 RFC 1071）离线计算。
+3. 运行 `zig build test`；再跑 `zig build` 确认内核构建不受影响。
+
+如果被测 decl 因一小处内核改动即可变为纯函数（如把纯 helper 下沉到叶子模块），可以做
+**行为保持**的最小改动；否则放弃该模块，另选纯模块。
 
 ---
 

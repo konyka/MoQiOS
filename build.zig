@@ -290,26 +290,27 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     });
-    test_module.addImport("byte_order", b.createModule(.{
-        .root_source_file = b.path("kernel/lib/byte_order.zig"),
-        .target = b.graph.host,
-        .optimize = optimize,
-    }));
-    test_module.addImport("fmt_core", b.createModule(.{
-        .root_source_file = b.path("kernel/lib/fmt_core.zig"),
-        .target = b.graph.host,
-        .optimize = optimize,
-    }));
-    test_module.addImport("str", b.createModule(.{
-        .root_source_file = b.path("kernel/lib/str.zig"),
-        .target = b.graph.host,
-        .optimize = optimize,
-    }));
-    test_module.addImport("cow_pte", b.createModule(.{
-        .root_source_file = b.path("kernel/mm/cow_pte.zig"),
-        .target = b.graph.host,
-        .optimize = optimize,
-    }));
+    // Host-compilable kernel modules under test. Zig analyzes declarations
+    // lazily, so a file may be tested on the host as long as the *tested*
+    // decls do not reach arch-specific code (arch/, serial, pmm, port I/O).
+    //
+    // A Zig file may belong to only one module, and module file-membership
+    // follows path imports transitively — even from function bodies — so all
+    // tested kernel files share one module rooted at kernel/host_test.zig,
+    // which re-exports them. Extending coverage is one `pub const` line in
+    // kernel/host_test.zig plus the import alias and tests in
+    // tests/main.zig. A second entry here is only possible for a kernel
+    // subtree whose path-import closure is fully disjoint from the first.
+    const host_test_modules = [_]struct { name: []const u8, path: []const u8 }{
+        .{ .name = "kernel_shared", .path = "kernel/host_test.zig" },
+    };
+    for (host_test_modules) |m| {
+        test_module.addImport(m.name, b.createModule(.{
+            .root_source_file = b.path(m.path),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }));
+    }
     const lib_test = b.addTest(.{
         .root_module = test_module,
     });
