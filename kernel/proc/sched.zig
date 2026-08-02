@@ -15,6 +15,7 @@
 /// Priority: lower number = higher priority (0 = highest).
 /// Among tasks of equal priority, round-robin is used.
 const task = @import("task.zig");
+const sched_policy = @import("sched_policy.zig");
 const per_cpu = @import("per_cpu.zig");
 const idt = @import("../arch/arch.zig").interrupts;
 const gdt = @import("../arch/arch.zig").gdt;
@@ -121,10 +122,21 @@ pub fn timerTickPortable() void {
 /// SK-23: account one hardware timer IRQ against the timeslice.
 /// Returns true when the slice has expired (caller / task should preempt).
 /// Safe to call from arch IRQ handlers — does not switch.
+/// F3: a running SCHED_FIFO task never expires — the slice is refilled and
+/// false is returned (FIFO yields the CPU only by blocking or exiting).
 pub fn hardwareTimerTick() bool {
     const new_slice = getSlice() -| 1;
     setSlice(new_slice);
-    return new_slice == 0;
+    if (new_slice != 0) return false;
+    if (getCurrentIdx()) |ci| {
+        if (task.getTask(ci)) |ct| {
+            if (ct.state == .running and !sched_policy.hasQuantumExpiry(ct.sched_policy)) {
+                setSlice(TIMESLICE_TICKS);
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 /// SK-23: true when the current timeslice is exhausted.
@@ -317,6 +329,23 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         sched_lock.release(flags);
         return;
     }
+
+    // F3: SCHED_FIFO has no quantum — a running FIFO task is never preempted
+    // by a plain timer tick; it leaves the CPU only by blocking, yielding or
+    // exiting. A reschedule IPI (force_pick) still preempts, and a blocked /
+    // zombie current task is switched out regardless.
+    if (!force_pick) {
+        if (getCurrentIdx()) |ci| {
+            if (task.getTask(ci)) |ct| {
+                if (ct.state == .running and !sched_policy.hasQuantumExpiry(ct.sched_policy)) {
+                    setSlice(TIMESLICE_TICKS);
+                    sched_lock.release(flags);
+                    return;
+                }
+            }
+        }
+    }
+
     setSlice(TIMESLICE_TICKS);
 
     const next_idx = pickNext() orelse {
@@ -532,9 +561,11 @@ fn pickNext() ?u32 {
 /// `deferred_local` is set when at least one entry was skipped solely because
 /// it is still current on another CPU — i.e. real local work exists and the
 /// caller should not bother stealing from remote queues.
+/// F3: pops go through `popRtAware` so a queued SCHED_FIFO/RR task outranks
+/// OTHER entries; with no RT task queued the pop is byte-identical LIFO.
 fn popRunnable(q: *per_cpu.PerCpuRunQueue, deferred_local: *bool) ?u32 {
     const my_cpu = currentCpuId();
-    while (q.pop()) |t| {
+    while (q.popRtAware()) |t| {
         const i = taskIndexOf(t) orelse continue;
         if (t.state != .ready) continue;
         if (task.isCurrentOnOtherCpu(i, my_cpu)) {
@@ -1011,14 +1042,20 @@ pub fn nativeUserTimerPreempt(frame_ptr: u64) ?u64 {
 ///
 /// Lower priority number = higher scheduling priority.
 /// Set the nice value of a task, updating its internal priority.
+/// F3: no-op for SCHED_FIFO/RR tasks — nice is orthogonal to the realtime
+/// classes (Linux: nice only affects SCHED_OTHER/BATCH/IDLE).
 pub fn setNice(t: *task.Task, nice: i32) void {
+    if (sched_policy.isRtClass(t.sched_policy)) return;
     const clamped: i32 = @max(-20, @min(19, nice));
     const new_prio: u8 = @intCast(clamped + 20);
     t.priority = new_prio;
 }
 
 /// Get the nice value of a task from its internal priority.
+/// F3: RT tasks report nice 0 (their `priority` field holds the RT band
+/// 0..98, which is meaningless as a nice value).
 pub fn getNice(t: *task.Task) i32 {
+    if (sched_policy.isRtClass(t.sched_policy)) return 0;
     return @as(i32, @intCast(t.priority)) - 20;
 }
 

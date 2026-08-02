@@ -233,6 +233,10 @@ while [ "$SECONDS" -lt "$deadline" ]; do
         grep -q "hello41: PASS" "$LOG_FILE" &&
         grep -q "hello42: PASS" "$LOG_FILE" &&
         grep -q "hello42 done" "$LOG_FILE" &&
+        grep -q "hello43: PASS" "$LOG_FILE" &&
+        grep -q "hello43 done" "$LOG_FILE" &&
+        grep -q "hello44: PASS" "$LOG_FILE" &&
+        grep -q "hello44 done" "$LOG_FILE" &&
        grep -q "MoQiOS shell" "$LOG_FILE" &&
         { [ "$STRICT_SMP" = "0" ] || has_exact_marker "[SMP] ${SMP_COUNT} CPUs detected"; } &&
         { [ "$STRICT_SMP" = "0" ] || has_exact_marker "[SMP] ${SMP_COUNT} CPUs selected"; } &&
@@ -250,7 +254,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for smoke markers."
-echo "Expected serial markers: '[NVMe] MSI-X interrupts enabled', init PASS markers, 'hello32: SIGSEGV PASS', 'hello38: PASS (futex EFAULT/waitv validation)', 'hello39: PASS (socket option faults/address lengths)', 'hello40: PASS (IPC_SET and rt_sigsuspend EFAULT)', 'hello41: PASS', 'hello42: PASS', 'hello42 done', 'MoQiOS shell', '[SMP] ${SMP_COUNT} CPUs detected', '[SMP] ${SMP_COUNT} CPUs selected', and '[SMP] ${SMP_COUNT} CPUs online'."
+echo "Expected serial markers: '[NVMe] MSI-X interrupts enabled', init PASS markers, 'hello32: SIGSEGV PASS', 'hello38: PASS (futex EFAULT/waitv validation)', 'hello39: PASS (socket option faults/address lengths)', 'hello40: PASS (IPC_SET and rt_sigsuspend EFAULT)', 'hello41: PASS', 'hello42: PASS', 'hello42 done', 'hello43: PASS', 'hello43 done', 'hello44: PASS', 'hello44 done', 'MoQiOS shell', '[SMP] ${SMP_COUNT} CPUs detected', '[SMP] ${SMP_COUNT} CPUs selected', and '[SMP] ${SMP_COUNT} CPUs online'."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

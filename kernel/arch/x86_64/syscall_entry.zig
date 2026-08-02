@@ -2390,6 +2390,21 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         472 => { // arch_prctl(code, addr)
             frame.rax = @bitCast(syscallArchPrctl(frame.rdi, frame.rsi));
         },
+        // ── F3: realtime scheduling classes (SCHED_FIFO / SCHED_RR) ──────────
+        // Linux numbers are taken in this table (156/157=msgget/msgsnd,
+        // 146/147=epoll_create1/epoll_ctl) → MoQiOS-specific numbers.
+        473 => { // sched_setscheduler(pid, policy, param_ptr{sched_priority})
+            frame.rax = @bitCast(syscallSchedSetscheduler(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx));
+        },
+        474 => { // sched_getscheduler(pid)
+            frame.rax = @bitCast(syscallSchedGetscheduler(@truncate(frame.rdi)));
+        },
+        475 => { // sched_get_priority_max(policy)
+            frame.rax = @bitCast(syscallSchedGetPriorityMax(@truncate(frame.rdi)));
+        },
+        476 => { // sched_get_priority_min(policy)
+            frame.rax = @bitCast(syscallSchedGetPriorityMin(@truncate(frame.rdi)));
+        },
         else => {
             serial.writeString("[syscall] unknown syscall: 0x");
             fmt.writeHex(syscall_nr);
@@ -3758,7 +3773,9 @@ fn syscallSchedSetaffinity(pid: u32, cpusetsize: u32, mask_ptr: u64) i64 {
     const target = task_mod2.getTask(target_idx) orelse return -1;
     const copy = @import("../../mm/copy_from_user.zig");
     var mask_buf: [32]u8 = .{0} ** 32;
-    const to_copy = @min(cpusetsize, mask_buf.len);
+    // NOTE: explicit u32 — @min(u32, comptime 32) would narrow to u6, and
+    // `to_copy * 8` below then overflows (panic) for any cpusetsize >= 8.
+    const to_copy: u32 = @min(cpusetsize, mask_buf.len);
     const copied = copy.copyFromUser(mask_buf[0..to_copy], @ptrFromInt(mask_ptr), to_copy);
     if (copied < to_copy) return -14;
 
@@ -4788,6 +4805,74 @@ fn syscallSchedGetattr(pid: u32, attr_ptr: u64, size: u32, flags: u32) i64 {
     if (written == 0) return -14;
     _ = bo;
     return 0;
+}
+
+// ── F3: sched_setscheduler / sched_getscheduler / sched_get_priority_max/min ──
+//
+// Linux ABI numbering conflict: the MoQiOS dispatch table does not follow
+// Linux syscall numbers — Linux #156/#157 (sched_setscheduler/getscheduler)
+// are taken by msgget/msgsnd and #146/#147 (sched_get_priority_max/min) by
+// epoll_create1/epoll_ctl. These four are therefore dispatched as MoQiOS
+// #473-#476 (next free after arch_prctl #472).
+//
+// Permission model: MoQiOS has no uid-based privilege split (every task runs
+// as uid 0 / root with full capabilities), so any task may set any policy on
+// any pid — same model as the existing sched_setattr. If a uid system lands,
+// gate FIFO/RR behind CAP_SYS_NICE here.
+
+/// sched_setscheduler(pid, policy, param_ptr) — param = struct { i32 sched_priority }.
+/// pid=0 means current task. OTHER requires priority 0; FIFO/RR require 1..99.
+fn syscallSchedSetscheduler(pid: u32, policy: u32, param_ptr: u64) i64 {
+    const copy = @import("../../mm/copy_from_user.zig");
+    const sp = @import("../../proc/sched_policy.zig");
+
+    if (param_ptr == 0) return -14; // EFAULT
+    const pol: u8 = @truncate(policy);
+    if (policy != pol or !sp.isValidClass(pol)) return -22; // EINVAL
+
+    var param: i32 = 0;
+    if (copy.copyFromUser(@as([*]u8, @ptrCast(&param))[0..4], @ptrFromInt(param_ptr), 4) != 4) return -14;
+
+    if (!sp.validatePriority(pol, param)) return -22; // EINVAL
+
+    const target = findTaskByPid(pid) orelse return -3; // ESRCH
+    target.sched_policy = pol;
+    if (sp.isRtClass(pol)) {
+        target.priority = sp.rtToKernelPriority(@intCast(param));
+    } else {
+        // RT→OTHER (or OTHER→OTHER): reset to the default nice-0 kernel
+        // priority used at task creation (setNice band, not the sched_setattr
+        // 100..139 band — see docs/kernel-subsystems.md).
+        target.priority = 20;
+    }
+    return 0;
+}
+
+/// sched_getscheduler(pid) — return the task's policy (0/1/2), -ESRCH if none.
+fn syscallSchedGetscheduler(pid: u32) i64 {
+    const target = findTaskByPid(pid) orelse return -3; // ESRCH
+    return target.sched_policy;
+}
+
+/// sched_get_priority_max(policy) — FIFO/RR: 99, OTHER-like: 0.
+fn syscallSchedGetPriorityMax(policy: u32) i64 {
+    const sp = @import("../../proc/sched_policy.zig");
+    const pol: u8 = @truncate(policy);
+    if (policy != pol) return -22;
+    if (sp.isRtClass(pol)) return sp.RT_PRIO_MAX;
+    // OTHER plus the not-implemented fair/idle classes report 0 (Linux ABI).
+    if (pol == sp.SCHED_OTHER or pol == 3 or pol == 5 or pol == 6) return 0;
+    return -22; // EINVAL
+}
+
+/// sched_get_priority_min(policy) — FIFO/RR: 1, OTHER-like: 0.
+fn syscallSchedGetPriorityMin(policy: u32) i64 {
+    const sp = @import("../../proc/sched_policy.zig");
+    const pol: u8 = @truncate(policy);
+    if (policy != pol) return -22;
+    if (sp.isRtClass(pol)) return sp.RT_PRIO_MIN;
+    if (pol == sp.SCHED_OTHER or pol == 3 or pol == 5 or pol == 6) return 0;
+    return -22; // EINVAL
 }
 
 /// membarrier(cmd, flags) — issue memory barriers across CPUs.

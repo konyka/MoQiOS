@@ -80,17 +80,21 @@ pub fn udpRecv(port: u16, buf: u64, max_len: u64, src_ip_out: u64, src_port_out:
 
 /// Network poll — drain the active NIC's RX ring into the network stack
 pub fn netPoll() i64 {
-    if (!nic.isActive()) return 0;
-
-    var rx_tmp: [2048]u8 = undefined;
+    const lo = @import("lo.zig");
     var count: u64 = 0;
-    var poll_limit: u32 = 0;
-    while (poll_limit < 16) {
-        const n = nic.receivePacket(&rx_tmp, 2048);
-        if (n == 0) break;
-        net_mod.handleRxPacket(&rx_tmp, n);
-        count += 1;
-        poll_limit += 1;
+    if (nic.isActive()) {
+        var rx_tmp: [2048]u8 = undefined;
+        var poll_limit: u32 = 0;
+        while (poll_limit < 16) {
+            const n = nic.receivePacket(&rx_tmp, 2048);
+            if (n == 0) break;
+            net_mod.handleRxPacket(&rx_tmp, n);
+            count += 1;
+            poll_limit += 1;
+        }
     }
+    // F2: deliver frames queued on the loopback device (runs even when no
+    // hardware NIC is active — lo traffic must not depend on one).
+    count += lo.drain();
     return @intCast(count);
 }

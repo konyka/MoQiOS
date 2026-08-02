@@ -500,4 +500,7 @@ pub fn handleInterrupt() void {
         if (n == 0) break;
         net.handleRxPacket(&rx_tmp, n);
     }
+
+    // F2: flush loopback frames queued since the last pump.
+    _ = @import("../net/lo.zig").drain();
 }

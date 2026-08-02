@@ -17,6 +17,7 @@
 /// - SMP send safety: per-call packet buffer, e1000 serializes TX ring submit
 const nic = @import("nic.zig");
 const netif = @import("netif.zig");
+const lo_dev = @import("lo.zig");
 const eth = @import("eth.zig");
 const ipv4 = @import("ipv4.zig");
 const ipv6 = @import("ipv6.zig");
@@ -933,13 +934,17 @@ fn sendSegmentSeq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16, 
     var send_pkt: [1518]u8 = undefined;
     const tcp_off: u16 = 34;
     @memset(send_pkt[0 .. tcp_off + 20], 0);
-    const dst_mac = arp.resolve(tcb.remote_ip) orelse {
+    // F2: 127.0.0.0/8 goes to the loopback device — no ARP, no hardware NIC.
+    const loopback = netif.isLoopback(tcb.remote_ip);
+    const our_mac = netif.getMac();
+    const dst_mac = if (loopback) our_mac else (arp.resolve(tcb.remote_ip) orelse {
         tcpLog("[tcp] ARP resolution failed\n");
         return false;
-    };
+    });
 
-    const our_mac = netif.getMac();
-    const our_ip = netif.getOurIp();
+    // Loopback segments also carry the 127/8 destination as source, so the
+    // peer's replies stay on lo and both pseudo-headers agree.
+    const our_ip = if (loopback) tcb.remote_ip else netif.getOurIp();
     const tcp_total = fillTcpSegment(tcb, flags, data, data_len, &send_pkt, tcp_off, seq_override);
     // SK-101/105: honor Path MTU (or armed oversized raise probe).
     if (ipv4.HEADER_LEN + tcp_total > ipv4.getSendMtu(tcb.remote_ip)) return false;
@@ -951,7 +956,7 @@ fn sendSegmentSeq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16, 
         if (tcb.accecn_ok) ipv4.setEct1(send_pkt[14..].ptr) else ipv4.setEct0(send_pkt[14..].ptr);
     }
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, 20 + tcp_total);
-    const ok = nic.sendPacket(&send_pkt, frame_len);
+    const ok = if (loopback) lo_dev.sendPacket(&send_pkt, frame_len) else nic.sendPacket(&send_pkt, frame_len);
     if (!ok) return false; // TX failed: do not advance snd_nxt (segment never sent)
     // SK-104: full-MTU TX success can raise the Path MTU early.
     ipv4.noteFullSizeSend(tcb.remote_ip, ipv4.HEADER_LEN + tcp_total);
@@ -2323,7 +2328,6 @@ fn driveTcbStateMachine(
 }
 
 pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, ecn_ce: bool) void {
-    _ = dst_ip;
     if (len < 20) return;
 
     // Verify the TCP checksum (mandatory, RFC 793) before touching any state —
@@ -2332,7 +2336,10 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, e
     // so a valid segment yields 0 (same convention as icmpv6.handlePacket).
     const tcp_len: u16 = @intCast(@min(len, 0xFFFF));
     if (bo.readU16BeAt(data, 16) == 0) return;
-    if (tcpChecksum(src_ip, netif.getOurIp(), data, tcp_len) != 0) return;
+    // F2: a loopback segment was checksummed against its 127/8 wire
+    // destination, not the primary interface address.
+    const csum_dst = if (netif.isLoopback(dst_ip)) dst_ip else netif.getOurIp();
+    if (tcpChecksum(src_ip, csum_dst, data, tcp_len) != 0) return;
 
     // v53.41: Collect epoll events — notify after releasing tcp_lock to avoid blocking all TCP connections
     const epoll = @import("epoll.zig");

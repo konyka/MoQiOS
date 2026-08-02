@@ -1,104 +1,21 @@
-#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
 
-/* Syscall numbers */
-#define SYS_write   1
-#define SYS_exit    2
-#define SYS_getpid  4
-#define SYS_waitpid 6
-#define SYS_open    9
-#define SYS_read   10
-#define SYS_close  11
-#define SYS_sigaction 13
-#define SYS_pipe   22
-#define SYS_dup2   33
-#define SYS_fork   57
-#define SYS_execve 59
-#define SYS_kill   62
-#define SYS_getenv 105
-#define SYS_setenv 106
-#define SYS_listdir 107
-#define SYS_chdir   108
-#define SYS_getcwd  109
-#define SYS_yield   24
-
-#define SIGINT  2
-#define SIG_IGN ((long)1)
 #define CTRL_C  0x03
 
-/* Matches the kernel's expected sigaction layout (kernel reads 28 bytes):
-   the handler pointer is the first 8 bytes of the struct. */
-struct ksigaction {
-    void (*handler)(int);
-    unsigned long mask;
-    unsigned long flags;
-    void *restorer;
-};
-
-static long syscall0(long n) {
-    long ret;
-    __asm__ volatile ("syscall" : "=a"(ret) : "a"(n) : "rcx", "r11", "memory");
-    return ret;
-}
-
-static long syscall1(long n, long a1) {
-    long ret;
-    __asm__ volatile ("syscall" : "=a"(ret) : "a"(n), "D"(a1) : "rcx", "r11", "memory");
-    return ret;
-}
-
-static long syscall3(long n, long a1, long a2, long a3) {
-    long ret;
-    __asm__ volatile ("syscall" : "=a"(ret) : "a"(n), "D"(a1), "S"(a2), "d"(a3) : "rcx", "r11", "memory");
-    return ret;
-}
-
-static long syscall2(long n, long a1, long a2) {
-    long ret;
-    __asm__ volatile ("syscall" : "=a"(ret) : "a"(n), "D"(a1), "S"(a2) : "rcx", "r11", "memory");
-    return ret;
-}
-
 /* Utility functions */
-static void print(const char *s) {
-    int len = 0;
-    while (s[len]) len++;
-    syscall3(SYS_write, 1, (long)s, len);
-}
-
-static void print_num(long n) {
-    if (n < 0) { print("-"); n = -n; }
-    if (n == 0) { print("0"); return; }
-    char buf[20];
-    int i = 0;
-    while (n > 0) { buf[i++] = '0' + (n % 10); n /= 10; }
-    char out[20];
-    for (int j = 0; j < i; j++) out[j] = buf[i - 1 - j];
-    out[i] = '\0';
-    print(out);
-}
-
-static int streq(const char *a, const char *b) {
-    while (*a && *b) {
-        if (*a != *b) return 0;
-        a++; b++;
-    }
-    return *a == *b;
-}
-
-static int strlen_s(const char *s) {
-    int len = 0;
-    while (s[len]) len++;
-    return len;
-}
 
 /* Read a line from stdin with basic line editing */
 static int read_line(char *buf, int max) {
     int pos = 0;
     while (pos < max - 1) {
-        long n = syscall3(SYS_read, 0, (long)(buf + pos), 1);
+        long n = read(STDIN_FILENO, buf + pos, 1);
         if (n <= 0) {
             /* EOF/error: yield instead of busy-spinning at 100% CPU */
-            syscall0(SYS_yield);
+            yield();
             continue;
         }
         char c = buf[pos];
@@ -145,14 +62,6 @@ static const char *copy_token(char *dst, int max, const char *src) {
     return src;
 }
 
-static void do_setenv(const char *kvp) {
-    syscall2(SYS_setenv, (long)kvp, 0);
-}
-
-static int do_getenv(const char *key, char *val, int max) {
-    return (int)syscall3(SYS_getenv, (long)key, (long)val, (long)max);
-}
-
 static int expand_vars(const char *src, char *dst, int max) {
     int si = 0, di = 0;
     while (src[si] && di < max - 1) {
@@ -169,7 +78,7 @@ static int expand_vars(const char *src, char *dst, int max) {
             key[ki] = '\0';
             if (ki > 0) {
                 char val[128];
-                long vlen = do_getenv(key, val, sizeof(val));
+                long vlen = moqi_getenv(key, val, sizeof(val));
                 if (vlen >= 0) {
                     for (int v = 0; v < vlen && di < max - 1; v++) {
                         dst[di++] = val[v];
@@ -195,32 +104,32 @@ static void run_command(const char *cmd, int pipe_in, int pipe_out, const char *
     const char *p = copy_token(name, sizeof(name), cmd);
 
     if (name[0] == '\0') {
-        syscall1(SYS_exit, 1);
+        _exit(1);
     }
 
     /* Handle output redirection */
     if (redir_out && redir_out[0]) {
-        long fd = syscall3(SYS_open, (long)redir_out, 0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
+        long fd = open(redir_out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) {
             print("sh: cannot open ");
             print(redir_out);
             print("\n");
-            syscall1(SYS_exit, 1);
+            _exit(1);
         }
-        syscall3(SYS_dup2, fd, 1, 0);
-        syscall1(SYS_close, fd);
+        dup2((int)fd, STDOUT_FILENO);
+        close((int)fd);
     }
 
     /* Handle pipe input */
     if (pipe_in >= 0) {
-        syscall3(SYS_dup2, pipe_in, 0, 0);
-        syscall1(SYS_close, pipe_in);
+        dup2(pipe_in, STDIN_FILENO);
+        close(pipe_in);
     }
 
     /* Handle pipe output */
     if (pipe_out >= 0) {
-        syscall3(SYS_dup2, pipe_out, 1, 0);
-        syscall1(SYS_close, pipe_out);
+        dup2(pipe_out, STDOUT_FILENO);
+        close(pipe_out);
     }
 
     char args[8][64];
@@ -239,12 +148,12 @@ static void run_command(const char *cmd, int pipe_in, int pipe_out, const char *
     for (int i = 0; i < nargs; i++) argv[i + 1] = args[i];
     argv[nargs + 1] = (void*)0;
 
-    long ret = syscall3(SYS_execve, (long)name, (long)argv, 0);
+    execve(name, argv, (void *)0);
     /* If execve returns, it failed */
     print("sh: ");
     print(name);
     print(": exec failed\n");
-    syscall1(SYS_exit, 127);
+    _exit(127);
 }
 
 /* Parse and execute a pipeline: cmd1 | cmd2 | cmd3 ...
@@ -293,20 +202,19 @@ static int execute_pipeline(const char *line) {
         copy_token(cmd, sizeof(cmd), cmds[0]);
 
         /* Built-in commands */
-        if (streq(cmd, "exit")) {
+        if (strcmp(cmd, "exit") == 0) {
             print("bye\n");
-            syscall1(SYS_exit, 0);
+            _exit(0);
         }
-        if (streq(cmd, "pid")) {
-            print_num(syscall0(SYS_getpid));
-            print("\n");
+        if (strcmp(cmd, "pid") == 0) {
+            printf("%ld\n", getpid());
             return 0;
         }
-        if (streq(cmd, "help")) {
+        if (strcmp(cmd, "help") == 0) {
             print("Commands: exit, pid, echo, ls, cd, pwd, export, env, help, <program>\n");
             return 0;
         }
-        if (streq(cmd, "echo")) {
+        if (strcmp(cmd, "echo") == 0) {
             const char *rest = cmds[0];
             int idx = 0;
             while (rest[idx] && rest[idx] != ' ') idx++;
@@ -315,46 +223,46 @@ static int execute_pipeline(const char *line) {
             print("\n");
             return 0;
         }
-        if (streq(cmd, "export")) {
+        if (strcmp(cmd, "export") == 0) {
             const char *rest = cmds[0];
             int idx = 0;
             while (rest[idx] && rest[idx] != ' ') idx++;
             while (rest[idx] == ' ') idx++;
             if (rest[idx]) {
-                do_setenv(rest + idx);
+                moqi_setenv(rest + idx);
             }
             return 0;
         }
-        if (streq(cmd, "env")) {
+        if (strcmp(cmd, "env") == 0) {
             print("(use export VAR=value to set)\n");
             return 0;
         }
-        if (streq(cmd, "ls")) {
+        if (strcmp(cmd, "ls") == 0) {
             char lsbuf[4096];
-            long n = syscall2(SYS_listdir, (long)lsbuf, sizeof(lsbuf));
+            long n = moqi_listdir(lsbuf, sizeof(lsbuf));
             if (n > 0) {
-                syscall3(SYS_write, 1, (long)lsbuf, (int)n);
+                write(STDOUT_FILENO, lsbuf, (size_t)n);
             }
             return 0;
         }
-        if (streq(cmd, "cd")) {
+        if (strcmp(cmd, "cd") == 0) {
             const char *rest = cmds[0];
             int idx = 0;
             while (rest[idx] && rest[idx] != ' ') idx++;
             while (rest[idx] == ' ') idx++;
             if (!rest[idx]) {
-                long ret = syscall1(SYS_chdir, (long)"/");
+                long ret = chdir("/");
                 if (ret < 0) print("cd: failed\n");
             } else {
-                long ret = syscall1(SYS_chdir, (long)(rest + idx));
+                long ret = chdir(rest + idx);
                 if (ret < 0) print("cd: failed\n");
             }
             return 0;
         }
-        if (streq(cmd, "pwd")) {
+        if (strcmp(cmd, "pwd") == 0) {
             char buf[256];
-            for (int i = 0; i < 256; i++) buf[i] = 0;
-            long n = syscall2(SYS_getcwd, (long)buf, sizeof(buf));
+            memset(buf, 0, sizeof(buf));
+            long n = getcwd(buf, sizeof(buf));
             if (n > 0) {
                 print(buf);
                 print("\n");
@@ -365,7 +273,7 @@ static int execute_pipeline(const char *line) {
         }
 
         /* Fork and exec */
-        long pid = syscall0(SYS_fork);
+        long pid = fork();
         if (pid < 0) {
             print("sh: fork failed\n");
             return -1;
@@ -377,7 +285,7 @@ static int execute_pipeline(const char *line) {
         }
         /* Parent: wait for child */
         int status;
-        long waited = syscall3(SYS_waitpid, -1, (long)&status, 0);
+        waitpid(-1, &status, 0);
         return (int)status;
     }
 
@@ -395,7 +303,7 @@ static int execute_pipeline(const char *line) {
             int pfd[2];
             pfd[0] = -1;
             pfd[1] = -1;
-            long ret = syscall3(SYS_pipe, (long)pfd, 0, 0);
+            long ret = pipe(pfd);
             if (ret < 0) {
                 print("sh: pipe failed\n");
                 return -1;
@@ -404,7 +312,7 @@ static int execute_pipeline(const char *line) {
             pipefd[1] = pfd[1];
         }
 
-        long pid = syscall0(SYS_fork);
+        long pid = fork();
         if (pid < 0) {
             print("sh: fork failed\n");
             return -1;
@@ -417,7 +325,7 @@ static int execute_pipeline(const char *line) {
                 /* stdin will be replaced by run_command, no need to close here */
             }
             if (!is_last) {
-                syscall1(SYS_close, pipefd[0]); /* Close read end in child */
+                close(pipefd[0]); /* Close read end in child */
             }
 
             const char *redir = is_last ? redir_out : (void *)0;
@@ -426,11 +334,11 @@ static int execute_pipeline(const char *line) {
 
         /* Parent */
         if (prev_pipe >= 0) {
-            syscall1(SYS_close, prev_pipe);
+            close(prev_pipe);
         }
         if (!is_last) {
-            syscall1(SYS_close, pipefd[1]); /* Close write end in parent */
-            prev_pipe = pipefd[0];          /* Next command reads from this pipe */
+            close(pipefd[1]);       /* Close write end in parent */
+            prev_pipe = pipefd[0];  /* Next command reads from this pipe */
         }
 
         last_pid = pid;
@@ -439,15 +347,15 @@ static int execute_pipeline(const char *line) {
     /* Wait for all children */
     int status = 0;
     for (int i = 0; i < ncmds; i++) {
-        syscall3(SYS_waitpid, -1, (long)&status, 0);
+        waitpid(-1, &status, 0);
     }
 
     return status;
 }
 
-void _start(void) {
-    struct ksigaction ign = { (void (*)(int))SIG_IGN, 0, 0, 0 };
-    syscall3(SYS_sigaction, SIGINT, (long)&ign, 0);
+int main(void) {
+    struct ksigaction ign = { SIG_IGN, 0, 0, 0 };
+    sigaction(SIGINT, &ign, (void *)0);
 
     print("MoQiOS shell\n");
 

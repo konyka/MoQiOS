@@ -89,9 +89,9 @@ MoQiOS 是一个运行在 x86_64 架构上的**单体内核** (Monolithic Kernel
 **1.7 节**）、**ext2 inode 越界**（256B 磁盘 inode 写入 128B 结构体）、**中断 stub 寄存器破坏**
 （被中断代码 RAX/RCX 遭污染，详见 **1.8 节**）。三者全部修复后，系统首次**完整启动至交互式
 `MoQiOS shell`**，依次跑通 `init` 自动序列及后续用户态测试（含用户态被定时器抢占、
-ext2 多级目录读写删，QEMU 串口验证，零异常、零三重故障）。当前 `user/init.S`（1,246 行）
-自动 spawn hello2–hello42 全序列（仅 hello11、hello28 不在自动序列中，hello6 因阻塞键盘
-输入被跳过），smoke 门禁以 `hello42 done` + shell 提示符为准（见 `tools/qemu_smoke.sh`）。
+ext2 多级目录读写删，QEMU 串口验证，零异常、零三重故障）。当前 `user/init.S`（1,306 行）
+自动 spawn hello2–hello44 全序列（仅 hello11、hello28 不在自动序列中，hello6 因阻塞键盘
+输入被跳过），smoke 门禁以 `hello44 done` + shell 提示符为准（见 `tools/qemu_smoke.sh`）。
 
 ### 已修复缺陷
 
@@ -565,7 +565,7 @@ QEMU / 真机
   └─ init 任务 (内核线程)
        ├─ 延迟初始化网络模块 (net/mod.zig) — 不能在 boot 阶段初始化
        └─ 加载并执行 /init (user/init.S)
-            ├─ 自动 spawn hello2–hello42 全序列 (1,246 行；hello6 因阻塞键盘跳过，
+            ├─ 自动 spawn hello2–hello44 全序列 (1,306 行；hello6 因阻塞键盘跳过，
             │    hello11/hello28 不在自动序列中)
             └─ 序列结束后进入 shell (sh.c)
 ```
@@ -1114,7 +1114,7 @@ LAPIC Timer 中断
 **源文件**: `kernel/fs/ramdisk.zig`
 
 - 启动时由 Limine 模块加载的内存文件系统
-- 存储: init, hello2-hello42, shell 等用户程序
+- 存储: init, hello2-hello44, shell 等用户程序
 - 只读，用于存放可执行文件
 
 ### 7.3.1 写回缓存 (writeback)
@@ -1171,7 +1171,8 @@ qemu_run.sh 写入的 "MoQiNVMe" 模式串时）；MSI-X 不可用时输出
   ├─ ARP 层 (arp.zig) — 地址解析缓存
   ├─ Ethernet 层 (eth.zig) — 帧封装 (IPv4/ARP/IPv6)
   │
-  ├─ 网络接口层 (netif.zig) — 接口管理
+  ├─ 网络接口层 (netif.zig) — 接口管理 + 127/8 loopback 路由判定
+  ├─ Loopback 设备 (lo.zig) — 127.0.0.0/8 本机回环：TX 入队、drain 回注 RX（F2）
   ├─ e1000 驱动 (drivers/e1000.zig, 453 行)
   │   ├─ 中断驱动模式 (INTx + IMASK/ICR + IRQ handler)
   │   ├─ TX/RX 描述符环
@@ -1203,6 +1204,13 @@ qemu_run.sh 写入的 "MoQiNVMe" 模式串时）；MSI-X 不可用时输出
 - **Window Scaling**: shift=7，最大窗口 4MB，突破 64KB 限制
 - **Timestamps + PAWS**: 精确 RTT 测量，防止序列号环绕误判
 - **TIME_WAIT 优化**: 30s→15s，新连接可复用 TIME_WAIT TCB (若序号更大)
+
+### 8.5 Loopback (lo) 设备（F2）
+
+- `lo.zig`：127.0.0.0/8 目的地帧不出硬件网卡、不做 ARP —— `udp.sendTo` / `tcp sendSegmentSeq` 命中 loopback 时跳过 `arp.resolve`，源地址也替换为 127/8 目的地址（双向对称），成品 L2 帧排入 16 槽 × 2048 字节环形队列
+- drain 泵点：`raw_net.netPoll`、`socket_syscall.netPoll`（无 NIC 也运行）、`e1000.handleInterrupt` 末尾；出队持锁、协议处理不持锁（锁顺序 tcp_lock → lo_lock）
+- TCP RX 校验和的伪首部 dst 在 loopback 段使用线上的 127/8 地址（而非 `netif.getOurIp()`）
+- 运行时验证：`hello43`（单进程 TCP client+server over 127.0.0.1 + UDP 自收发）；队列纯逻辑有 host 单测（`tests/main.zig` 的 loopback 块）
 
 ---
 
@@ -1238,19 +1246,21 @@ qemu_run.sh 写入的 "MoQiNVMe" 模式串时）；MSI-X 不可用时输出
 
 ### 11.1 init 进程
 
-**源文件**: `user/init.S` (1,246 行)
+**源文件**: `user/init.S` (1,306 行)
 
-启动时第一个用户进程，自动 spawn hello2–hello42 全序列（按 init.S 中的顺序）:
+启动时第一个用户进程，自动 spawn hello2–hello44 全序列（按 init.S 中的顺序）:
 - hello2 (串口输出), hello3 (ramdisk 读写), hello4 (多进程), hello5 (ELF 加载)
 - hello7 (FAT32 写入), hello8 (网络 ARP), hello12-hello20 (信号/UDP/环境变量/execve/argv/网络/ext2)
 - hello22-hello27 (TCP socket/echo/connect), hello23-hello25 (mkdir/ext2 unlink/多级路径)
 - hello29-hello42 (getdents64/brk/TLS/SIGSEGV/EFAULT/CLONE_VM/审计回归/futex/IPC/copy_file_range/pread64)
+- hello43 (loopback lo 设备：单进程 TCP client+server over 127.0.0.1 + UDP 自收发)
+- hello44 (SCHED_FIFO/RR 实时调度类：优先级上下限/FIFO 抢占/RR 轮转/EINVAL 校验)
 - hello9, hello10 (fork/fork+execve), hello21 (ext2 写入, 最慢排最后)
 - 最后进入 shell
 
 跳过: hello6 (阻塞键盘输入)；hello11、hello28 不在自动序列中（ramdisk 中有，可手动运行）。
-smoke 门禁 (`tools/qemu_smoke.sh`) 以 hello32/38/39/40/41/42 的 PASS 标记 +
-`hello42 done` + shell 提示符为准。
+smoke 门禁 (`tools/qemu_smoke.sh`) 以 hello32/38/39/40/41/42/43/44 的 PASS 标记 +
+`hello44 done` + shell 提示符为准。
 
 ### 11.2 测试程序
 

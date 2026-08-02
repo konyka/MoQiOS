@@ -447,3 +447,191 @@ test "MSI-X message address/data compose fixed LAPIC delivery" {
     try std.testing.expectEqual(@as(u32, 0), pci_msix.composeMessageData(0));
     try std.testing.expectEqual(@as(u32, 0xFF), pci_msix.composeMessageData(0xFF));
 }
+
+// ─── loopback (F2) ───
+const lo = kt.lo;
+
+test "lo queue enqueue/dequeue preserves FIFO order" {
+    var q = lo.LoopbackQueue.init();
+    try std.testing.expectEqual(@as(u32, 0), q.pending());
+
+    const a = [_]u8{ 0xaa, 0xbb, 0xcc };
+    const b = [_]u8{ 0x11, 0x22 };
+    try std.testing.expect(q.enqueue(&a));
+    try std.testing.expect(q.enqueue(&b));
+    try std.testing.expectEqual(@as(u32, 2), q.pending());
+
+    var out: [lo.MAX_FRAME]u8 = undefined;
+    try std.testing.expectEqual(@as(u32, 3), q.dequeue(&out));
+    try std.testing.expectEqualSlices(u8, &a, out[0..3]);
+    try std.testing.expectEqual(@as(u32, 2), q.dequeue(&out));
+    try std.testing.expectEqualSlices(u8, &b, out[0..2]);
+    try std.testing.expectEqual(@as(u32, 0), q.dequeue(&out));
+    try std.testing.expectEqual(@as(u32, 0), q.pending());
+}
+
+test "lo queue head/tail wrap around the ring" {
+    var q = lo.LoopbackQueue.init();
+    var out: [lo.MAX_FRAME]u8 = undefined;
+
+    // Cycle more frames than QUEUE_DEPTH so head/tail wrap past slot 0.
+    var i: u32 = 0;
+    while (i < lo.QUEUE_DEPTH * 3) : (i += 1) {
+        const frame = [_]u8{ @truncate(i), 0x5a };
+        try std.testing.expect(q.enqueue(&frame));
+        try std.testing.expectEqual(@as(u32, 2), q.dequeue(&out));
+        try std.testing.expectEqual(@as(u8, @truncate(i)), out[0]);
+        try std.testing.expectEqual(@as(u8, 0x5a), out[1]);
+    }
+    try std.testing.expectEqual(@as(u32, 0), q.pending());
+    try std.testing.expectEqual(@as(u64, 0), q.dropped);
+}
+
+test "lo queue full drops new frames and counts them" {
+    var q = lo.LoopbackQueue.init();
+    const frame = [_]u8{0x42} ** 64;
+
+    var i: u32 = 0;
+    while (i < lo.QUEUE_DEPTH) : (i += 1) try std.testing.expect(q.enqueue(&frame));
+    try std.testing.expectEqual(lo.QUEUE_DEPTH, q.pending());
+
+    try std.testing.expect(!q.enqueue(&frame));
+    try std.testing.expect(!q.enqueue(&frame));
+    try std.testing.expectEqual(@as(u64, 2), q.dropped);
+
+    // One dequeue frees a slot, then exactly one more frame fits.
+    var out: [lo.MAX_FRAME]u8 = undefined;
+    try std.testing.expectEqual(@as(u32, 64), q.dequeue(&out));
+    try std.testing.expect(q.enqueue(&frame));
+    try std.testing.expectEqual(lo.QUEUE_DEPTH, q.pending());
+}
+
+test "lo queue rejects empty and oversized frames" {
+    var q = lo.LoopbackQueue.init();
+    try std.testing.expect(!q.enqueue(&[_]u8{}));
+    const big = [_]u8{0xff} ** (lo.MAX_FRAME + 1);
+    try std.testing.expect(!q.enqueue(&big));
+    try std.testing.expectEqual(@as(u32, 0), q.pending());
+
+    // Exactly MAX_FRAME bytes still fits.
+    const max_frame = [_]u8{0x7e} ** lo.MAX_FRAME;
+    try std.testing.expect(q.enqueue(&max_frame));
+    var out: [lo.MAX_FRAME]u8 = undefined;
+    try std.testing.expectEqual(lo.MAX_FRAME, q.dequeue(&out));
+    try std.testing.expectEqualSlices(u8, &max_frame, &out);
+}
+
+test "lo isLoopback classifies the whole 127.0.0.0/8 block" {
+    try std.testing.expect(lo.isLoopback(.{ 127, 0, 0, 1 }));
+    try std.testing.expect(lo.isLoopback(.{ 127, 0, 0, 0 }));
+    try std.testing.expect(lo.isLoopback(.{ 127, 255, 255, 254 }));
+    try std.testing.expect(!lo.isLoopback(.{ 126, 255, 255, 255 }));
+    try std.testing.expect(!lo.isLoopback(.{ 128, 0, 0, 1 }));
+    try std.testing.expect(!lo.isLoopback(.{ 10, 0, 2, 15 }));
+    try std.testing.expect(!lo.isLoopback(.{ 0, 0, 0, 0 }));
+}
+
+
+// ─── RT scheduling (F3) ───
+// Pure policy-logic tests for kernel/proc/sched_policy.zig (SCHED_FIFO/RR).
+
+test "F3: RT classes beat every OTHER task regardless of priority band" {
+    const sp = kt.sched_policy;
+
+    // Lowest-prio RT task (rt 1 → kernel 98) still beats the highest-prio
+    // OTHER task (nice -20 → kernel 0).
+    try std.testing.expect(sp.beats(sp.SCHED_FIFO, 98, sp.SCHED_OTHER, 0));
+    try std.testing.expect(sp.beats(sp.SCHED_RR, 98, sp.SCHED_OTHER, 0));
+    // ... and beats the default OTHER task (kernel 20) and idle (255).
+    try std.testing.expect(sp.beats(sp.SCHED_FIFO, 98, sp.SCHED_OTHER, 20));
+    try std.testing.expect(sp.beats(sp.SCHED_RR, 0, sp.SCHED_OTHER, 255));
+    // OTHER never beats RT.
+    try std.testing.expect(!sp.beats(sp.SCHED_OTHER, 0, sp.SCHED_FIFO, 98));
+    try std.testing.expect(!sp.beats(sp.SCHED_OTHER, 0, sp.SCHED_RR, 98));
+}
+
+test "F3: within-class ordering preserves kernel priority order" {
+    const sp = kt.sched_policy;
+
+    // RT: higher sched_priority (lower kernel prio) wins; FIFO vs RR at the
+    // same RT priority rank equally (neither strictly beats the other).
+    try std.testing.expect(sp.beats(sp.SCHED_FIFO, sp.rtToKernelPriority(99), sp.SCHED_RR, sp.rtToKernelPriority(1)));
+    try std.testing.expect(!sp.beats(sp.SCHED_FIFO, 10, sp.SCHED_RR, 10));
+    try std.testing.expect(!sp.beats(sp.SCHED_RR, 10, sp.SCHED_FIFO, 10));
+    // OTHER: identical to the pre-F3 raw comparison (lower number wins).
+    try std.testing.expect(sp.beats(sp.SCHED_OTHER, 0, sp.SCHED_OTHER, 20));
+    try std.testing.expect(sp.beats(sp.SCHED_OTHER, 20, sp.SCHED_OTHER, 39));
+    try std.testing.expect(!sp.beats(sp.SCHED_OTHER, 20, sp.SCHED_OTHER, 20));
+}
+
+test "F3: quantum expiry per class" {
+    const sp = kt.sched_policy;
+
+    // FIFO runs until it blocks/yields — no quantum expiry.
+    try std.testing.expect(!sp.hasQuantumExpiry(sp.SCHED_FIFO));
+    // RR and OTHER expire (RR rotates among equal-priority peers).
+    try std.testing.expect(sp.hasQuantumExpiry(sp.SCHED_RR));
+    try std.testing.expect(sp.hasQuantumExpiry(sp.SCHED_OTHER));
+    try std.testing.expectEqual(@as(u64, 10), sp.RR_QUANTUM_TICKS);
+}
+
+test "F3: RT priority clamping and kernel-band mapping" {
+    const sp = kt.sched_policy;
+
+    try std.testing.expectEqual(@as(u8, 1), sp.clampRtPriority(-5));
+    try std.testing.expectEqual(@as(u8, 1), sp.clampRtPriority(0));
+    try std.testing.expectEqual(@as(u8, 50), sp.clampRtPriority(50));
+    try std.testing.expectEqual(@as(u8, 99), sp.clampRtPriority(100));
+    try std.testing.expectEqual(@as(u8, 99), sp.clampRtPriority(1000));
+
+    // Band mapping: rt 99 → kernel 0 (best), rt 1 → kernel 98, round-trips.
+    try std.testing.expectEqual(@as(u8, 0), sp.rtToKernelPriority(99));
+    try std.testing.expectEqual(@as(u8, 98), sp.rtToKernelPriority(1));
+    try std.testing.expectEqual(@as(u8, 99), sp.kernelToRtPriority(0));
+    try std.testing.expectEqual(@as(u8, 1), sp.kernelToRtPriority(98));
+    var rt: u8 = 1;
+    while (rt <= 99) : (rt += 1) {
+        try std.testing.expectEqual(rt, sp.kernelToRtPriority(sp.rtToKernelPriority(rt)));
+    }
+}
+
+test "F3: priority validation per policy (sched_setscheduler rules)" {
+    const sp = kt.sched_policy;
+
+    // OTHER requires priority 0.
+    try std.testing.expect(sp.validatePriority(sp.SCHED_OTHER, 0));
+    try std.testing.expect(!sp.validatePriority(sp.SCHED_OTHER, 1));
+    try std.testing.expect(!sp.validatePriority(sp.SCHED_OTHER, -1));
+    // FIFO/RR require 1..99.
+    try std.testing.expect(!sp.validatePriority(sp.SCHED_FIFO, 0));
+    try std.testing.expect(sp.validatePriority(sp.SCHED_FIFO, 1));
+    try std.testing.expect(sp.validatePriority(sp.SCHED_FIFO, 99));
+    try std.testing.expect(!sp.validatePriority(sp.SCHED_FIFO, 100));
+    try std.testing.expect(!sp.validatePriority(sp.SCHED_RR, 0));
+    try std.testing.expect(sp.validatePriority(sp.SCHED_RR, 50));
+    try std.testing.expect(!sp.validatePriority(sp.SCHED_RR, 100));
+    // Unknown policies rejected outright.
+    try std.testing.expect(!sp.validatePriority(3, 0)); // BATCH — not implemented
+    try std.testing.expect(!sp.validatePriority(6, 0)); // DEADLINE — not implemented
+    try std.testing.expect(!sp.isValidClass(3));
+    try std.testing.expect(sp.isValidClass(sp.SCHED_OTHER));
+    try std.testing.expect(sp.isValidClass(sp.SCHED_FIFO));
+    try std.testing.expect(sp.isValidClass(sp.SCHED_RR));
+}
+
+test "F3: rankKey bands — RT below OTHER below idle, OTHER order intact" {
+    const sp = kt.sched_policy;
+
+    // Every RT key < every OTHER key.
+    try std.testing.expect(sp.rankKey(sp.SCHED_FIFO, 98) < sp.rankKey(sp.SCHED_OTHER, 0));
+    try std.testing.expect(sp.rankKey(sp.SCHED_RR, 0) < sp.rankKey(sp.SCHED_OTHER, 255));
+    // OTHER keys are monotonic in kernel priority (pre-F3 ordering preserved).
+    try std.testing.expect(sp.rankKey(sp.SCHED_OTHER, 0) < sp.rankKey(sp.SCHED_OTHER, 20));
+    try std.testing.expect(sp.rankKey(sp.SCHED_OTHER, 20) < sp.rankKey(sp.SCHED_OTHER, 255));
+    // Idle (OTHER, 255) stays unpickable by the bitmap fallback, matching the
+    // old `best_prio = 255` initialiser: its key is not below MAX_PICK_KEY.
+    try std.testing.expect(!(sp.rankKey(sp.SCHED_OTHER, 255) < sp.MAX_PICK_KEY));
+    try std.testing.expect(sp.rankKey(sp.SCHED_OTHER, 254) < sp.MAX_PICK_KEY);
+    try std.testing.expect(sp.rankKey(sp.SCHED_FIFO, 98) < sp.MAX_PICK_KEY);
+}
+// ─── end RT scheduling (F3) ───

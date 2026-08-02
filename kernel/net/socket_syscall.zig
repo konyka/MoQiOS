@@ -786,18 +786,22 @@ pub fn socketpair(domain: u32, sock_type: u32, protocol: u32, sv_ptr: u64) i64 {
 /// net_poll() → count of packets processed
 pub fn netPoll() i64 {
     const nic = @import("nic.zig");
-    if (!nic.isActive()) return 0;
-
-    var rx_tmp: [2048]u8 = undefined;
+    const lo = @import("lo.zig");
     var count: u64 = 0;
-    var poll_limit: u32 = 0;
-    while (poll_limit < 16) {
-        const n = nic.receivePacket(&rx_tmp, 2048);
-        if (n == 0) break;
-        net_mod.handleRxPacket(&rx_tmp, n);
-        count += 1;
-        poll_limit += 1;
+    if (nic.isActive()) {
+        var rx_tmp: [2048]u8 = undefined;
+        var poll_limit: u32 = 0;
+        while (poll_limit < 16) {
+            const n = nic.receivePacket(&rx_tmp, 2048);
+            if (n == 0) break;
+            net_mod.handleRxPacket(&rx_tmp, n);
+            count += 1;
+            poll_limit += 1;
+        }
     }
+    // F2: deliver frames queued on the loopback device (runs even when no
+    // hardware NIC is active — lo traffic must not depend on one).
+    count += lo.drain();
     return @intCast(count);
 }
 

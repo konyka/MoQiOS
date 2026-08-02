@@ -300,6 +300,47 @@ const Task = struct {
 `ipc`、阻塞 `flock`、`pause`）都走同一条路径，因此修正落在 `forceReschedule` 自身而非调用点。
 此前无法触及是因为**没有任何用户程序调用过 `sched_yield`**，`hello31` 是第一个。
 
+**实时调度类 SCHED_FIFO / SCHED_RR（F3，2026-08-02 完成 ✅）**
+
+文件: `proc/sched_policy.zig`（纯策略模块，无 arch 依赖，host 单测覆盖）、`proc/sched.zig`、
+`proc/per_cpu.zig`、`proc/task.zig`
+
+- **策略存储**：复用 v37.0 引入的 `Task.sched_policy`（0=OTHER / 1=FIFO / 2=RR，与 Linux
+  编号一致），fork 时继承。RT 任务的 `Task.priority` 沿用 sched_setattr 的**保留优先级带**
+  约定：sched_priority 1..99 → 内核优先级 98..0（带 0..98，数值越小越优先）；OTHER 任务保持
+  nice 带（nice -20..19 → 0..39，默认 20）；idle 仍为 255。
+- **类优先比较**：由于 OTHER nice 带与 RT 带数值重叠，选择路径**不跨类比较裸优先级**，而是
+  比较 `sched_policy.rankKey(policy, priority)`——RT 键 0..98 恒小于任意 OTHER 键
+  （100+priority）。OTHER 内部键序与旧裸优先级比较完全等价，故无 RT 任务时选取结果
+  **逐字节不变**（位图回退的 `best_key` 初值 `MAX_PICK_KEY=355` 保持 idle（255）不可选，
+  与旧 `best_prio=255` 初值语义一致）。
+- **两条选择路径都已 RT 化**：① per-CPU 队列 `popRtAware`——队列无 RT 任务时退化为原 LIFO
+  `pop`（逐字节一致）；有 RT 任务时扫描选最优 RT 键，**同优先级取最老入队者**，使同级
+  SCHED_RR 任务轮转而非反复弹出刚重新入队的任务。③ 位图回退 `task.pickReadyForCpu` 同上
+  改用 rankKey 比较。
+- **量子**：SCHED_FIFO 无量子——`timerTick` 与 `hardwareTimerTick` 在时间片耗尽时若当前
+  任务为运行态 FIFO 则直接补充时间片返回，FIFO 只在阻塞 / yield / 退出时让出 CPU（重调度
+  IPI 的 `force_pick` 仍可抢占，为尽力而为的唤醒抢占）。SCHED_RR 量子为 10 tick（≈100ms，
+  与 OTHER 时间片同值），到期重新入队后由同级 RR 对端轮转。
+- **nice 正交**：`setNice`/`getNice` 对 FIFO/RR 任务为 no-op / 返回 0（Linux：nice 只影响
+  OTHER 类）。
+- **系统调用**（MoQiOS 编号，Linux 号 156/157/146/147 在本分发表已被 msgget/msgsnd/
+  epoll_create1/epoll_ctl 占用）：#473 `sched_setscheduler(pid, policy, param{sched_priority})`、
+  #474 `sched_getscheduler(pid)`、#475 `sched_get_priority_max(policy)`（FIFO/RR→99，OTHER→0）、
+  #476 `sched_get_priority_min`（FIFO/RR→1，OTHER→0）。校验：OTHER 要求 priority==0，
+  FIFO/RR 要求 1..99，非法返回 `-EINVAL`，pid 不存在 `-ESRCH`。RT→OTHER 迁移时优先级复位为
+  默认 nice-0 带值 20。**权限模型**：MoQiOS 无 uid 特权分级（所有任务 uid 0、全 capability），
+  任何任务可对任意 pid 设置 RT 策略——与既有 sched_setattr 一致；将来引入 uid 体系时应在
+  此处加 CAP_SYS_NICE 门。
+- **饥饿警告（starvation caveat）**：可运行的 FIFO/RR 任务会**无条件**压制同 CPU 上所有
+  OTHER 任务（包括 shell 与 init）；一个永不阻塞的 FIFO 死循环会永久饿死其 CPU 上的
+  OTHER 工作。idle 线程仍保持可调度（其就绪路径不经被压制的比较）。无 RT 任务时调度行为
+  与 F3 之前完全一致。
+- **验证**：host 单测 `tests/main.zig` “RT scheduling (F3)” 块（类比较 / 量子 / 钳制 /
+  校验）；运行时回归 `user/hello44.c`（优先级上下限、FIFO 子任务压制 OTHER 忙循环期间
+  父进度计数冻结、两个 RR 子任务互相观察到对方推进、非法参数 EINVAL），经
+  `sched_setaffinity` 钉在 CPU 0 使 SMP>1 下亦确定。
+
 ### 2.8 调度器 Profiling 基础设施 ✅（2026-06-21 完成）
 
 文件: `proc/per_cpu.zig`, `fs/procfs.zig`
@@ -712,6 +753,20 @@ e1000 (中断驱动) / virtio-net (Virtqueue)
 - `AF_INET6 = 10` 地址族支持
 - SOCK_STREAM（TCP over IPv6）与 SOCK_DGRAM（UDP over IPv6）创建
 - 与现有 socket API（bind/connect/send/recv）集成
+
+### 4.14 Loopback (lo) 设备 ✅（F2）
+
+文件: `kernel/net/lo.zig`；集成点: `netif.zig` / `udp.zig` / `tcp.zig` / `raw_net.zig` / `socket_syscall.zig` / `e1000.zig` / `mod.zig`
+
+127.0.0.0/8 的流量不出硬件网卡、不做 ARP：TX 路径把组好的 L2 帧排入 lo 环形队列，下一次 drain 将其送回 `net.handleRxPacket`，完成本机协议栈全回路。
+
+- **路由判定**：`netif.isLoopback(ip)`（`ip[0] == 127`，RFC 1122 §3.2.1.3 整个 127/8 块）；纯逻辑版本 `lo.isLoopback` 供 host 单测
+- **TX 注入点**：`udp.sendTo` 与 `tcp sendSegmentSeq`（仅 IPv4；IPv6 走 `::1` 尚未实现）。命中 loopback 时跳过 `arp.resolve`（不产生 ARP 请求），dst MAC 填本机 MAC，源地址也填 127/8 目的地址——双向对称，回复自然回到 lo
+- **RX 环形队列**：`LoopbackQueue` 为纯数据结构（16 槽 × 2048 字节，enqueue/dequeue/wrap/dropped 计数），无任何 arch 依赖，host 单测覆盖（`tests/main.zig` 的 `// ─── loopback (F2) ───` 块）；内核全局实例外加 `IrqSpinlock`
+- **drain 泵点**：`raw_net.netPoll`、`socket_syscall.netPoll`（无硬件 NIC 时也运行）与 `e1000.handleInterrupt` 末尾。出队持锁、协议处理不持锁（TCP 处理会重入 `lo.sendPacket`，锁顺序恒为 tcp_lock → lo_lock）；单次 drain 上限 4×QUEUE_DEPTH
+- **TCP 校验和**：RX 验证的伪首部 dst 在 loopback 段必须使用线上的 127/8 地址而非 `netif.getOurIp()`（`tcp.handlePacket`）
+- **getOurIp 语义不变**：DHCP/10.0.2.15 不受影响；loopback 源地址由 TX 路径就地替换
+- 运行时验证：`hello43`（单进程 TCP client+server over 127.0.0.1 + UDP 自收发）
 
 ### 4.8 Socket API ✅ 完整 BSD-like Socket 接口
 

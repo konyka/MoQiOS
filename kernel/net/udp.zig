@@ -1,5 +1,6 @@
 const nic = @import("nic.zig");
 const netif = @import("netif.zig");
+const lo = @import("lo.zig");
 const eth = @import("eth.zig");
 const ipv4 = @import("ipv4.zig");
 const ipv6 = @import("ipv6.zig");
@@ -237,10 +238,15 @@ pub fn recvFromV6(port: u16, out_buf: [*]u8, out_src_ip: *[16]u8, out_src_port: 
 pub fn sendTo(dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, data_len: u16) bool {
     if (data_len > MAX_UDP_PAYLOAD) return false;
 
+    const our_mac = netif.getMac();
+    // F2: 127.0.0.0/8 goes to the loopback device — no ARP, no hardware NIC.
+    const loopback = netif.isLoopback(dst_ip);
     // Limited broadcast has no ARP entry (arp.resolve would fail and nothing
     // would ever be transmitted) — use the broadcast MAC directly. DHCP
     // DISCOVER/REQUEST depend on this.
-    const dst_mac = if (dst_ip[0] == 255 and dst_ip[1] == 255 and dst_ip[2] == 255 and dst_ip[3] == 255)
+    const dst_mac = if (loopback)
+        our_mac
+    else if (dst_ip[0] == 255 and dst_ip[1] == 255 and dst_ip[2] == 255 and dst_ip[3] == 255)
         [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }
     else
         arp.resolve(dst_ip) orelse {
@@ -248,8 +254,9 @@ pub fn sendTo(dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, da
             return false;
         };
 
-    const our_mac = netif.getMac();
-    const our_ip = netif.getOurIp();
+    // Loopback datagrams also carry the 127/8 destination as source, so the
+    // peer's replies stay on lo and both directions are symmetric.
+    const our_ip = if (loopback) dst_ip else netif.getOurIp();
     const udp_total: u16 = 8 + data_len;
     // SK-101/105: honor Path MTU (or armed oversized raise probe).
     if (ipv4.HEADER_LEN + udp_total > ipv4.getSendMtu(dst_ip)) return false;
@@ -273,7 +280,7 @@ pub fn sendTo(dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, da
     // Build ethernet frame
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, 20 + udp_total);
 
-    const ok = nic.sendPacket(&send_pkt, frame_len);
+    const ok = if (loopback) lo.sendPacket(&send_pkt, frame_len) else nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.
     if (ok) ipv4.noteFullSizeSend(dst_ip, ipv4.HEADER_LEN + udp_total);
     return ok;

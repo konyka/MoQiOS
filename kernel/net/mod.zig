@@ -1,4 +1,5 @@
 const netif = @import("netif.zig");
+const lo = @import("lo.zig");
 const eth = @import("eth.zig");
 const arp = @import("arp.zig");
 const ipv4 = @import("ipv4.zig");
@@ -14,6 +15,7 @@ pub const socket_opt = @import("socket_opt.zig");
 
 pub fn init() void {
     netif.ensureInit();
+    lo.init();
     arp.init();
     ndp.init();
     ipv6.initPmtu();

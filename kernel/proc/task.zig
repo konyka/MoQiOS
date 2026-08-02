@@ -17,6 +17,7 @@ const paging = @import("../arch/arch.zig").paging;
 const arch_cpu = @import("../arch/arch.zig").cpu;
 const arch_irq = @import("../arch/arch.zig").interrupts;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+const sched_policy = @import("sched_policy.zig");
 const builtin = @import("builtin");
 
 const PAGE_SIZE: u64 = 4096;
@@ -191,6 +192,10 @@ pub const Task = struct {
     robust_list_len: u32 = 0,
 
     /// Scheduling policy: 0=OTHER, 1=FIFO, 2=RR, 3=BATCH, 6=DEADLINE.
+    /// F3: OTHER/FIFO/RR are honoured by the scheduler. For FIFO/RR the
+    /// `priority` field holds the RT kernel band 0..98 (rtToKernelPriority,
+    /// lower = better; sched_priority 1..99 maps to 98..0); for OTHER it
+    /// stays in the nice band (see sched.setNice). See proc/sched_policy.zig.
     sched_policy: u8 = 0,
 
     /// alarm() deadline in TSC nanoseconds (0 = no alarm set).
@@ -284,13 +289,19 @@ fn matchesCpu(t: *Task, cpu: u8) bool {
     return t.cpu_affinity < 0 or t.cpu_affinity == @as(i16, cpu);
 }
 
-fn considerReady(idx: u32, cpu: u8, best_idx: *?u32, best_prio: *u8) void {
+fn considerReady(idx: u32, cpu: u8, best_idx: *?u32, best_key: *u16) void {
     const t = getTask(idx) orelse return;
-    if (t.state == .ready and matchesCpu(t, cpu) and t.priority < best_prio.*) {
+    if (t.state == .ready and matchesCpu(t, cpu)) {
+        // F3: class-aware rank — any runnable FIFO/RR task outranks every
+        // OTHER task. Within the OTHER class keys are monotonic in kernel
+        // priority, so OTHER-only picks are identical to the pre-F3 raw
+        // `t.priority < best_prio` comparison (strict < keeps scan order).
+        const key = sched_policy.rankKey(t.sched_policy, t.priority);
+        if (key >= best_key.*) return;
         // Never pick a task that another CPU is still running (see
         // isCurrentOnOtherCpu) — its kstack/context are live over there.
         if (isCurrentOnOtherCpu(idx, cpu)) return;
-        best_prio.* = t.priority;
+        best_key.* = key;
         best_idx.* = idx;
     }
 }
@@ -302,7 +313,9 @@ pub fn pickReadyForCpu(cpu: u8, after_idx: ?u32) ?u32 {
 
     const start = if (after_idx) |a| (a + 1) % MAX_TASKS else 0;
     var best_idx: ?u32 = null;
-    var best_prio: u8 = 255;
+    // F3: MAX_PICK_KEY keeps idle-priority (255) OTHER tasks unpickable here,
+    // exactly like the old `best_prio = 255` initialiser.
+    var best_key: u16 = sched_policy.MAX_PICK_KEY;
 
     var pos: u32 = start;
     var remaining: u32 = MAX_TASKS;
@@ -314,8 +327,8 @@ pub fn pickReadyForCpu(cpu: u8, after_idx: ?u32) ?u32 {
         const idx: u32 = @intCast(next_slot.?);
         remaining -= (idx - pos) + 1;
         pos = idx + 1;
-        considerReady(idx, cpu, &best_idx, &best_prio);
-        if (best_prio == 0) break;
+        considerReady(idx, cpu, &best_idx, &best_key);
+        if (best_key == 0) break; // RT sched_priority 99 — nothing can outrank it
     }
 
     if (best_idx == null and start > 0) {
@@ -324,8 +337,8 @@ pub fn pickReadyForCpu(cpu: u8, after_idx: ?u32) ?u32 {
         while (bits != 0) {
             const idx: u32 = @intCast(@ctz(bits));
             bits &= bits - 1;
-            considerReady(idx, cpu, &best_idx, &best_prio);
-            if (best_prio == 0) break;
+            considerReady(idx, cpu, &best_idx, &best_key);
+            if (best_key == 0) break;
         }
     }
 

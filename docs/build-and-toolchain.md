@@ -94,11 +94,12 @@ SECTIONS {
 
 ## 4. 用户程序编译
 
-> 实现位置：`build.zig` 中的两个辅助函数 `addCUserProgram` / `addAsmUserProgram`，
-> 分别对 `c_programs` / `asm_programs` 列表循环调用。新增用户程序时只需把程序名追加到对应
+> 实现位置：`build.zig` 中的辅助函数 `addCUserProgram` / `addAsmUserProgram` /
+> `addLibcUserProgram`，分别对 `c_programs` / `asm_programs` / `libc_programs`
+> 列表循环调用。新增用户程序时只需把程序名追加到对应
 > 列表即可，无需复制整段构建步骤（2026-06 重构：从 ~900 行样板收敛至 ~160 行）。
 
-### 4.1 C 程序（hello4–hello42, sh）
+### 4.1 C 程序（hello4–hello44, 裸 C）
 
 `addCUserProgram(b, name)`：用 `zig cc` 交叉编译为静态 freestanding ELF，保存为 `<name>.bin`
 装载镜像（输出目录由 `build.zig` 决定，当前为 `user/`）。这些 `.bin` 文件实际仍是 ELF，
@@ -116,6 +117,28 @@ zig cc \
 注意：C 程序**不使用** `user/user.ld`，由 `zig cc` 默认链接（内置自定义 `_start`）。内核目标仍禁用
 SSE；用户态 C 程序不再传 `-mno-sse/-mno-sse2`，因为 Zig 0.15.2 的 compiler-rt 在该组合下会触发
 half-float SSE 返回错误。启用跨核用户任务迁移前仍需补齐 FPU/SSE 上下文保存验证。
+
+### 4.1.1 moqi_libc 程序（sh, hello10）
+
+`addLibcUserProgram(b, name)`：标志与 `addCUserProgram` 完全相同，额外加
+`-Ilib/moqi_libc/include` 并把 `lib/moqi_libc/src/*.c` 一起编译链接。入口约定为
+`int main(void)`（crt0 提供 `_start` 与 `exit(main())`），程序内直接使用
+libc 的 `print/printf/fork/execve/malloc` 等，不再手写 syscall 内联汇编。
+库结构与设计见 [user-space.md](./user-space.md) 第 5 节。
+
+```
+zig cc \
+    -target x86_64-freestanding-none \
+    -static -nostdlib -ffreestanding -O2 \
+    -mstackrealign -Wl,--gc-sections -Wl,-z,norelro \
+    -Ilib/moqi_libc/include \
+    -o <name>.bin user/<name>.c lib/moqi_libc/src/*.c
+```
+
+输出同样安装到 `zig-out/user/<name>.bin`，与裸 C 程序在 ramdisk 打包与加载路径上
+完全一致。moqi_libc 的宿主机单元测试（string/printf 格式化/malloc 空闲链表）经
+`lib/moqi_libc/host_tests/run_tests.sh` 运行，使用私有 zig 缓存目录，可与
+`zig build` 并行执行。
 
 ### 4.2 汇编程序（init.S, hello2.S, hello3.S）
 

@@ -59,6 +59,41 @@ fn addCUserProgram(b: *std.Build, name: []const u8) void {
     b.getInstallStep().dependOn(&b.addInstallFile(elf_out, b.fmt("user/{s}.bin", .{name})).step);
 }
 
+/// moqi_libc sources linked into every libc-based user program.
+const moqi_libc_sources = [_][]const u8{
+    "lib/moqi_libc/src/crt0.c",
+    "lib/moqi_libc/src/unistd.c",
+    "lib/moqi_libc/src/string.c",
+    "lib/moqi_libc/src/format.c",
+    "lib/moqi_libc/src/stdio.c",
+    "lib/moqi_libc/src/malloc.c",
+    "lib/moqi_libc/src/sbrk.c",
+    "lib/moqi_libc/src/stdlib.c",
+    "lib/moqi_libc/src/signal.c",
+};
+
+/// C user program built against moqi_libc: same flags as addCUserProgram,
+/// plus the libc include dir and sources. The program's entry point is
+/// `int main(void)`; crt0 provides `_start` and `exit(main())`.
+fn addLibcUserProgram(b: *std.Build, name: []const u8) void {
+    const elf = b.addSystemCommand(&.{
+        "zig",            "cc",
+        "-target",        "x86_64-freestanding-none",
+        "-static",        "-nostdlib",
+        "-ffreestanding", "-O2",
+        // Same entry/stack rationale as addCUserProgram.
+        "-mstackrealign", "-Wl,--gc-sections",
+        "-Wl,-z,norelro", "-Ilib/moqi_libc/include",
+        "-o",
+    });
+    const elf_out = elf.addOutputFileArg(b.fmt("{s}.bin", .{name}));
+    elf.addFileArg(b.path(b.fmt("user/{s}.c", .{name})));
+    for (moqi_libc_sources) |src| elf.addFileArg(b.path(src));
+    elf.setName(b.fmt("compile {s}.c + moqi_libc -> ELF bin", .{name}));
+
+    b.getInstallStep().dependOn(&b.addInstallFile(elf_out, b.fmt("user/{s}.bin", .{name})).step);
+}
+
 /// Build the RISC-V 64 kernel skeleton (cross-ISA port, Milestone 2).
 /// Soft-float ABI (lp64): baseline_rv64 with F/D removed so the kernel never
 /// touches FP registers. Separate from the x86_64 path until the shared arch
@@ -235,15 +270,21 @@ pub fn build(b: *std.Build) void {
 
     // C programs (.c -> static freestanding ELF stored as .bin)
     const c_programs = [_][]const u8{
-        "hello4",  "hello5",  "hello6",  "hello7",  "hello8",  "sh",
-        "hello9",  "hello10", "hello11", "hello12", "hello13", "hello14",
+        "hello4",  "hello5",  "hello6",  "hello7",  "hello8",
+        "hello9",             "hello11", "hello12", "hello13", "hello14",
         "hello15", "hello16", "hello17", "hello18", "hello19", "hello20",
         "hello21", "hello22", "hello23", "hello24", "hello25", "hello26",
         "hello27", "hello28", "hello29", "hello30", "hello31", "hello32",
         "hello33", "hello34", "hello35", "hello36", "hello37", "hello38",
-        "hello39", "hello40", "hello41", "hello42",
+        "hello39", "hello40", "hello41", "hello42", "hello43",
+        "hello44",
     };
     for (c_programs) |name| addCUserProgram(b, name);
+
+    // C programs built against moqi_libc (lib/moqi_libc/): entry point is
+    // `int main(void)`, libc provides _start and the syscall wrappers.
+    const libc_programs = [_][]const u8{ "sh", "hello10" };
+    for (libc_programs) |name| addLibcUserProgram(b, name);
 
     // Build and run in QEMU with Limine
     const run_step = b.step("run", "Build and run in QEMU");

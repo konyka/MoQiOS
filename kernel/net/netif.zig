@@ -1,4 +1,5 @@
 const nic = @import("nic.zig");
+const lo = @import("lo.zig");
 const serial = @import("../arch/arch.zig").serial;
 
 var our_mac: [6]u8 = @splat(0);
@@ -30,6 +31,12 @@ pub fn getOurIp() [4]u8 {
 
 pub fn getGateway() [4]u8 {
     return .{ 10, 0, 2, 2 };
+}
+
+/// Route decision for the TX paths: the whole 127.0.0.0/8 block is loopback
+/// (F2) and goes to the lo device instead of the hardware NIC.
+pub fn isLoopback(ip: [4]u8) bool {
+    return lo.isLoopback(ip);
 }
 
 pub fn getNetmask() [4]u8 {
