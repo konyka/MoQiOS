@@ -14,6 +14,15 @@ const filemap = @import("filemap.zig");
 const vfs = @import("../fs/vfs.zig");
 const ext2 = @import("../fs/ext2.zig");
 const tmpfs = @import("../fs/tmpfs.zig");
+const huge_user = @import("huge_user.zig");
+const huge_impl = @import("huge_user_impl.zig");
+
+/// I1: compile-time gate for user 2MiB huge pages on anonymous mappings.
+/// Set to false to disable the feature entirely (the demote paths stay —
+/// they are no-ops when no huge page was ever created). Effective only on
+/// x86_64 (huge_impl.enable); other backends never create huge pages.
+pub const huge_user_enable: bool = true;
+const huge_on = huge_user_enable and huge_impl.enable;
 
 const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_PRIVATE: u64 = 0x2;
@@ -29,6 +38,11 @@ const MREMAP_FIXED: u32 = 0x2;
 /// reference a freed frame via stale TLB entries.
 pub fn unmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
     if (num_pages == 0) return;
+
+    // I1: free huge blocks fully inside the range directly, and demote
+    // partially-overlapped ones first — the 4K pass below cannot touch huge
+    // entries (unmapPage refuses them).
+    huge_impl.prescanHuge(task.page_table_phys, base, num_pages);
 
     // Bounded collection using 128-element stack buffer. Flush when either the
     // buffer is full OR the virtual span would exceed MAX_BATCH_SPAN pages.
@@ -146,12 +160,15 @@ pub const RegionFileMeta = struct {
 /// Track an mmap region in the task's mmap_regions table.
 /// `meta` is null for anonymous regions. File regions never merge with
 /// neighbours — a merge would silently drop one side's backing metadata.
-fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, meta: ?RegionFileMeta) void {
+/// I1: regions with huge blocks never merge either way — a merge would
+/// break the invariant that a region's huge blocks are its FIRST
+/// huge_pages*512 pages.
+fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, meta: ?RegionFileMeta, huge_pages: u32) void {
     const new_kind: u8 = if (meta) |m| @intFromEnum(m.kind) else 0;
     // Try to merge with an adjacent existing region (anonymous only)
-    if (meta == null) {
+    if (meta == null and huge_pages == 0) {
         for (&task.mmap_regions) |*r| {
-            if (!r.active or !filemap.canMergeAnon(r.file_kind, new_kind)) continue;
+            if (!r.active or r.huge_pages != 0 or !filemap.canMergeAnon(r.file_kind, new_kind)) continue;
             if (r.base + r.num_pages * 4096 == base) {
                 r.num_pages += num_pages;
                 return;
@@ -166,7 +183,7 @@ fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, meta: ?Regio
     // Find a free slot
     for (&task.mmap_regions) |*r| {
         if (!r.active) {
-            r.* = .{ .base = base, .num_pages = num_pages, .active = true };
+            r.* = .{ .base = base, .num_pages = num_pages, .active = true, .huge_pages = huge_pages };
             if (meta) |m| {
                 r.file_kind = @intFromEnum(m.kind);
                 r.shared = m.shared;
@@ -232,16 +249,40 @@ fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
             const removed = (end - r.base) / page;
             r.base = end;
             r.num_pages -= removed;
+            // I1: huge blocks fully below the new base were freed by
+            // unmapRange; a straddling block was demoted first. The
+            // huge-first invariant only survives a block-aligned cut —
+            // otherwise drop the count (page-table-driven paths still
+            // handle any huge block that remains mapped).
+            if (r.huge_pages != 0) {
+                if (removed % huge_user.HUGE_PAGES == 0) {
+                    r.huge_pages -|= @intCast(@min(r.huge_pages, removed / huge_user.HUGE_PAGES));
+                } else {
+                    r.huge_pages = 0;
+                }
+            }
             // G2: the base moved up, so the file offset tracked at the base
             // advances with it (the piece keeps its backing reference).
             r.file_offset = filemap.advanceFileOffset(r.file_offset, removed);
         } else if (base > r.base and end >= r_end) {
             r.num_pages = (base - r.base) / page;
+            // I1: keep only the huge blocks fully below the cut.
+            r.huge_pages = @intCast(@min(r.huge_pages, r.num_pages / huge_user.HUGE_PAGES));
         } else {
             const tail_base = end;
             const tail_pages = (r_end - end) / page;
             const tail_offset = filemap.advanceFileOffset(r.file_offset, (end - r.base) / page);
+            // I1: the head keeps the huge blocks fully below `base`; the
+            // tail keeps the ones fully past `end`, but only a block-aligned
+            // cut preserves the tail's huge-first invariant.
+            const head_huge: u32 = @intCast(@min(r.huge_pages, ((base - r.base) / page) / huge_user.HUGE_PAGES));
+            const end_off_pages = (end - r.base) / page;
+            const tail_huge: u32 = if (end_off_pages % huge_user.HUGE_PAGES == 0)
+                r.huge_pages -| @as(u32, @intCast(@min(r.huge_pages, end_off_pages / huge_user.HUGE_PAGES)))
+            else
+                0;
             r.num_pages = (base - r.base) / page;
+            r.huge_pages = head_huge;
             for (&task.mmap_regions) |*r2| {
                 if (!r2.active) {
                     r2.* = .{
@@ -249,6 +290,7 @@ fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
                         .num_pages = tail_pages,
                         .active = true,
                         .locked = r.locked,
+                        .huge_pages = tail_huge,
                         // G2: the tail piece keeps the same backing; it needs
                         // its own reference so either piece can be unmapped
                         // independently.
@@ -351,6 +393,28 @@ fn findFreeMmapRange(task: *task_mod.Task, num_pages: u64, ignore_base: u64) ?u6
     return findFreeRangeFrom(task, user_space.USER_MMAP_BASE, num_pages, ignore_base);
 }
 
+/// I1: 2MiB-aligned variant of findFreeRangeFrom — huge-block mappings need
+/// an aligned base. Returns null when no aligned slot fits; the caller then
+/// falls back to the generic (4K-granular) search and a 4K-only mapping.
+fn findFreeRangeAligned2M(task: *task_mod.Task, start: u64, num_pages: u64) ?u64 {
+    const page = user_space.PAGE_SIZE;
+    const huge = huge_user.HUGE_BYTES;
+    if (num_pages == 0) return null;
+
+    var base = if (start < user_space.USER_MMAP_BASE) user_space.USER_MMAP_BASE else start;
+    base = (base + huge - 1) / huge * huge;
+
+    while (base < user_space.USER_MMAP_MAX and num_pages <= (user_space.USER_MMAP_MAX - base) / page) {
+        if (firstMappedPage(task, base, num_pages)) |p| {
+            base = (base + (p + 1) * page + huge - 1) / huge * huge; // next aligned slot past the conflict
+            continue;
+        }
+        if (rangeAvailable(task, base, num_pages, null)) return base;
+        base += huge;
+    }
+    return null;
+}
+
 fn allocZeroedPage() ?u64 {
     const phys = pmm_mod.allocPage() orelse return null;
     const page_ptr: [*]u8 = @ptrFromInt(hhdm_mod.physToVirt(phys));
@@ -373,6 +437,12 @@ fn moveMapping(task: *task_mod.Task, region: *task_mod.MmapRegion, new_base: u64
     const old_base = region.base;
     if (rangesOverlap(old_base, old_pages, new_base, new_pages)) return -22;
     var mapped: u64 = 0;
+
+    // I1: the 4K copy loop below cannot read huge PDEs (getPageEntry
+    // refuses them and would substitute zero pages, silently losing the
+    // block's contents) — demote every huge block in the source range.
+    huge_impl.demoteRange(task.page_table_phys, old_base, old_pages) catch return -12;
+    region.huge_pages = 0;
 
     while (mapped < new_pages) : (mapped += 1) {
         const dst_virt = new_base + mapped * page;
@@ -557,14 +627,32 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
         {
             base = hint;
         } else {
-            base = findFreeRangeFrom(cur, hint, num_pages, null) orelse
-                findFreeRangeFrom(cur, user_space.USER_MMAP_BASE, num_pages, null) orelse
-                return -12; // ENOMEM
+            // I1: a huge-eligible anonymous mapping tries a 2MiB-aligned
+            // slot first — the generic search steps by 4K and would almost
+            // never pick one. Falls back to a 4K-only mapping when no
+            // aligned slot fits.
+            base = if (meta == null and huge_on and num_pages >= huge_user.HUGE_PAGES)
+                (findFreeRangeAligned2M(cur, hint, num_pages) orelse
+                    findFreeRangeFrom(cur, hint, num_pages, null) orelse
+                    findFreeRangeFrom(cur, user_space.USER_MMAP_BASE, num_pages, null) orelse
+                    return -12) // ENOMEM
+            else
+                (findFreeRangeFrom(cur, hint, num_pages, null) orelse
+                    findFreeRangeFrom(cur, user_space.USER_MMAP_BASE, num_pages, null) orelse
+                    return -12); // ENOMEM
         }
     }
 
-    if (!is_fixed and !canTrackMmapRegion(cur, base, num_pages, meta == null)) return -12;
+    // I1: huge blocks are only attempted for anonymous mappings whose final
+    // base is 2MiB-aligned with at least one full block. A huge region never
+    // merges with neighbours (the huge-first invariant), so the capacity
+    // check must not count a merge as available space.
+    const huge_attempt = meta == null and huge_on and
+        huge_user.eligible(base, num_pages);
 
+    if (!is_fixed and !canTrackMmapRegion(cur, base, num_pages, meta == null and !huge_attempt)) return -12;
+
+    var huge_count: u32 = 0;
     if (meta == null) {
         // Anonymous: allocate and map zeroed pages eagerly (unchanged).
         const writable = (prot & 2) != 0;
@@ -573,11 +661,24 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
             .writable = writable,
             .user = true,
             .no_execute = !executable,
-            .global = false,
+            .global = false, // user mappings must never be global (PCID)
         };
 
         var mapped: u64 = 0;
-        while (mapped < num_pages) : (mapped += 1) {
+        var huge_ok = huge_attempt;
+        while (mapped < num_pages) {
+            // I1: map the region's leading full 2MiB blocks as huge pages.
+            // Once a block falls back to 4K the rest of the region stays 4K,
+            // so a region's huge blocks are always its first pages.
+            if (huge_ok and num_pages - mapped >= huge_user.HUGE_PAGES) {
+                const virt = base + mapped * user_space.PAGE_SIZE;
+                if (huge_impl.mapHugeBlock(cur.page_table_phys, virt, map_flags)) {
+                    huge_count += 1;
+                    mapped += huge_user.HUGE_PAGES;
+                    continue;
+                }
+                huge_ok = false;
+            }
             const virt = base + mapped * user_space.PAGE_SIZE;
             const phys = pmm_mod.allocPage() orelse {
                 unmapRange(cur, base, mapped);
@@ -592,6 +693,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
                 unmapRange(cur, base, mapped);
                 return -12;
             };
+            mapped += 1;
         }
     } else if (meta.?.kind == .ext2) {
         // The mapping is known to succeed: retain the ext2 open slot so the
@@ -601,7 +703,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     }
 
     // Track the mapping region for munmap (records backing metadata for G2).
-    trackMmapRegion(cur, base, num_pages, meta);
+    trackMmapRegion(cur, base, num_pages, meta, huge_count);
 
     // The break is deliberately left alone. Dragging it up to cover mmap
     // placements made brk(2) report a break spanning memory it does not own, and

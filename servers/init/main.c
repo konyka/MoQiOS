@@ -105,6 +105,11 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello46");  /* file-backed mmap (MAP_PRIVATE demand paging) */
     run_test("hello47");  /* /dev/kmsg ring buffer reader */
     run_test("hello48");  /* MAP_SHARED file mappings (tmpfs/ext2/ramdisk) */
+    run_test("hello49");  /* user 2MiB huge-page anonymous mmap */
+
+    /* First resident system service: drains /dev/kmsg into /tmp/kern.log.
+     * Never exits — do not waitpid it. */
+    spawn("syslogd");
 
     run_test("hello9");   /* fork test */
     run_test("hello10");  /* fork+execve test */

@@ -138,7 +138,10 @@ pub fn destroyUserSpace(pml4_phys: u64) void {
                 if (pd[pd_idx] & paging.PRESENT == 0) continue;
                 // Check for 2MB huge page in PD
                 if (pd[pd_idx] & (1 << 7) != 0) {
-                    pmm.freePage(pd[pd_idx] & paging.ADDR_MASK);
+                    // I1: a huge block owns 512 frames (allocContiguous sets
+                    // one refcount each) — a single freePage would leak the
+                    // other 511.
+                    pmm.freeContiguous(pd[pd_idx] & paging.ADDR_MASK, 512);
                     continue;
                 }
 

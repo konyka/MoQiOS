@@ -5,6 +5,7 @@ const pmm = @import("../../mm/pmm.zig");
 const serial = @import("serial.zig");
 const fmt = @import("../../lib/fmt.zig");
 const cow_pte = @import("../../mm/cow_pte.zig");
+const huge_user = @import("../../mm/huge_user.zig");
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const PAGE_2MB: u64 = 2 * 1024 * 1024;
@@ -75,8 +76,10 @@ pub fn currentRoot() u64 {
 /// SK-40: true when `virt` is mapped user-accessible under `root_phys`.
 /// Same check copy_from_user did inline: walk present, U/S bit set.
 pub fn isUserAccessible(root_phys: u64, virt: u64) bool {
-    const pte = getPageEntry(root_phys, virt) orelse return false;
-    return pte.user;
+    if (getPageEntry(root_phys, virt)) |pte| return pte.user;
+    // I1: getPageEntry refuses huge entries; a present user 2MB PDE counts.
+    const pde = getPdEntry(root_phys, virt) orelse return false;
+    return pde.present and pde.huge_page and pde.user;
 }
 
 /// Whether the kernel may write to this user page.
@@ -87,10 +90,15 @@ pub fn isUserAccessible(root_phys: u64, virt: u64) bool {
 /// write-protect fault the kernel has no recovery path for — so callers must be
 /// able to reject the destination instead.
 pub fn isUserWritable(root_phys: u64, virt: u64) bool {
-    const pte = getPageEntry(root_phys, virt) orelse return false;
-    if (!pte.user) return false;
-    if (pte.writable) return true;
-    return cow_pte.isCow(@as(u64, @bitCast(pte.*)));
+    if (getPageEntry(root_phys, virt)) |pte| {
+        if (!pte.user) return false;
+        if (pte.writable) return true;
+        return cow_pte.isCow(@as(u64, @bitCast(pte.*)));
+    }
+    // I1: huge PDE — never COW-shared (fork demotes both sides), so the
+    // writable bit alone decides.
+    const pde = getPdEntry(root_phys, virt) orelse return false;
+    return pde.present and pde.huge_page and pde.user and pde.writable;
 }
 
 /// SK-40: bracket kernel touches of user pages. No-ops on x86 (SMAP is not
@@ -212,6 +220,70 @@ pub fn mapHugePage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void 
     invlpg(virt);
 }
 
+/// Get a mutable pointer to the PD entry covering `virt`.
+/// Returns null if the PML4/PDPT levels are missing or a 1GB huge page
+/// stands where the PD would be.
+pub fn getPdEntry(pml4_phys: u64, virt: u64) ?*PTE {
+    const pml4_idx = (virt >> 39) & 0x1FF;
+    const pdpt_idx = (virt >> 30) & 0x1FF;
+    const pd_idx = (virt >> 21) & 0x1FF;
+
+    const pml4: *PageTable = hhdm.physToPtr(PageTable, pml4_phys);
+    if (!pml4.entries[pml4_idx].present) return null;
+
+    const pdpt: *PageTable = hhdm.physToPtr(PageTable, pml4.entries[pml4_idx].getPhysAddr());
+    if (!pdpt.entries[pdpt_idx].present) return null;
+    if (pdpt.entries[pdpt_idx].huge_page) return null; // 1GB page — no PD below
+
+    const pd: *PageTable = hhdm.physToPtr(PageTable, pdpt.entries[pdpt_idx].getPhysAddr());
+    return &pd.entries[pd_idx];
+}
+
+/// Unmap the 2MB huge page covering `virt`. Returns its physical base, or
+/// null when the entry is not a huge page or owns no frame.
+///
+/// A PROT_NONE'd huge page (present cleared, frame preserved) still owns its
+/// frames and is unmapped here too. No TLB flush: callers batch a ranged
+/// shootdown before freeing the frames (unmapRange does).
+pub fn unmapHugePage(pml4_phys: u64, virt: u64) ?u64 {
+    const pde = getPdEntry(pml4_phys, virt) orelse return null;
+    if (!pde.huge_page) return null;
+    const phys = pde.getPhysAddr();
+    if (phys == 0) return null;
+    pde.* = .{}; // Zero = not present
+    return phys;
+}
+
+/// Split the 2MB huge page covering `virt` into 512 4K PTEs — the
+/// demote-first primitive for partial mutations (munmap/mprotect/mremap/
+/// fork all demote before touching part of a huge block).
+///
+/// No-op when the entry is not a present huge page. Returns
+/// error.OutOfMemory (mapping left untouched) when the PT page cannot be
+/// allocated. The 4K PTEs mirror the huge entry's physical base and flags
+/// exactly, so a stale 2MB TLB entry on another CPU still names the same
+/// frames with the same permissions — the local invlpg sweep below is
+/// belt-and-braces, and later permission changes do their own ranged
+/// shootdown.
+pub fn demoteHugePage(pml4_phys: u64, virt: u64) !void {
+    const pde = getPdEntry(pml4_phys, virt) orelse return;
+    if (!pde.present or !pde.huge_page) return;
+
+    const pde_raw: u64 = @bitCast(pde.*);
+    const pt_phys = pmm.allocPage() orelse return error.OutOfMemory;
+    const pt: *PageTable = hhdm.physToPtr(PageTable, pt_phys);
+    const out: *[512]u64 = @ptrCast(pt);
+    const new_pde = huge_user.demotePtes(pde_raw, out, pt_phys);
+    pde.* = @bitCast(new_pde);
+
+    // Local shootdown of the whole 2MB range.
+    const huge_base = virt & ~(PAGE_2MB - 1);
+    var i: u64 = 0;
+    while (i < huge_user.HUGE_PAGES) : (i += 1) {
+        invlpg(huge_base + i * PAGE_SIZE);
+    }
+}
+
 /// Unmap a virtual page. Returns the physical address of the unmapped page, or null.
 pub fn unmapPage(pml4_phys: u64, virt: u64) ?u64 {
     const pml4_idx = (virt >> 39) & 0x1FF;
@@ -321,9 +393,14 @@ pub fn getPageEntryRaw(pml4_phys: u64, virt: u64) ?u64 {
 
     const pdpt: *PageTable = hhdm.physToPtr(PageTable, pml4.entries[pml4_idx].getPhysAddr());
     if (!pdpt.entries[pdpt_idx].present) return null;
+    if (pdpt.entries[pdpt_idx].huge_page) return null; // 1GB page — data, not a table
 
     const pd: *PageTable = hhdm.physToPtr(PageTable, pdpt.entries[pdpt_idx].getPhysAddr());
     if (!pd.entries[pd_idx].present) return null;
+    // I1: refuse 2MB pages like getPageEntry/unmapPage do — descending would
+    // read the data frame as a PT and let callers (swap-entry probe,
+    // process_vm) interpret user data as page-table entries.
+    if (pd.entries[pd_idx].huge_page) return null;
 
     const pt: *PageTable = hhdm.physToPtr(PageTable, pd.entries[pd_idx].getPhysAddr());
     // Return the raw value even if not present
@@ -342,9 +419,11 @@ pub fn setPageEntryRaw(pml4_phys: u64, virt: u64, value: u64) void {
 
     const pdpt: *PageTable = hhdm.physToPtr(PageTable, pml4.entries[pml4_idx].getPhysAddr());
     if (!pdpt.entries[pdpt_idx].present) return;
+    if (pdpt.entries[pdpt_idx].huge_page) return; // 1GB page — data, not a table
 
     const pd: *PageTable = hhdm.physToPtr(PageTable, pdpt.entries[pdpt_idx].getPhysAddr());
     if (!pd.entries[pd_idx].present) return;
+    if (pd.entries[pd_idx].huge_page) return; // 2MB page — refuse (see getPageEntryRaw)
 
     const pt: *PageTable = hhdm.physToPtr(PageTable, pd.entries[pd_idx].getPhysAddr());
     pt.entries[pt_idx] = @bitCast(value);

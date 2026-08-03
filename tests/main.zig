@@ -1255,3 +1255,98 @@ test "P1: registry refuses more than MAX_SPACES live spaces" {
     try std.testing.expect(c.registerSpace(0xDEAD000) == null);
 }
 // ─── end PCID (P1) ───
+
+// ─── NVMe per-CPU (I3) ───
+const nvme_queue = kt.nvme_queue;
+
+test "I3: pickQueue prefers the submitting CPU's own queue" {
+    const pick = nvme_queue.pickQueue;
+    // Preferred channel free → cpu_id % num_queues, rr_hint irrelevant.
+    try std.testing.expectEqual(@as(u32, 2), pick(2, 4, 0b1001, 9));
+    try std.testing.expectEqual(@as(u32, 0), pick(0, 4, 0b1110, 3));
+    // cpu_id wraps modulo the queue count.
+    try std.testing.expectEqual(@as(u32, 2), pick(6, 4, 0, 0));
+    try std.testing.expectEqual(@as(u32, 3), pick(7, 4, 0, 12));
+}
+
+test "I3: pickQueue falls back to round-robin when the preferred channel is busy" {
+    const pick = nvme_queue.pickQueue;
+    // Bit 2 set (queue 2 busy) → rr_hint % num_queues.
+    try std.testing.expectEqual(@as(u32, 1), pick(2, 4, 0b0100, 9));
+    // Writeback/boot submitter (cpu 0) with queue 0 busy → fallback too.
+    try std.testing.expectEqual(@as(u32, 3), pick(0, 4, 0b0001, 3));
+    // Every channel busy → still the round-robin answer (submitter parks
+    // there instead of serializing behind its preferred queue).
+    try std.testing.expectEqual(@as(u32, 2), pick(3, 4, 0b1111, 6));
+    // Busy bits above num_queues are ignored.
+    try std.testing.expectEqual(@as(u32, 1), pick(1, 2, 0b1000, 5));
+}
+
+test "I3: pickQueue degenerate queue counts" {
+    const pick = nvme_queue.pickQueue;
+    // Single queue: always 0, whatever the CPU and busy state.
+    try std.testing.expectEqual(@as(u32, 0), pick(5, 1, 0b1, 7));
+    try std.testing.expectEqual(@as(u32, 0), pick(5, 1, 0, 7));
+    // No queues yet (pre-init): 0, no division by zero.
+    try std.testing.expectEqual(@as(u32, 0), pick(5, 0, 0, 7));
+}
+// ─── end NVMe per-CPU (I3) ───
+
+// ─── user huge pages (I1) ───
+// Pure 2MiB huge-page helpers: eligibility and the demote decomposition
+// (2MiB PDE → 512 4K PTEs mirroring phys+flags). Runtime wiring (map on
+// mmap, demote-first on partial mutations) is verified by user/hello49.
+const huge_user = kt.huge_user;
+
+test "I1: eligibility requires 2MiB-aligned base and at least 512 pages" {
+    try std.testing.expect(!huge_user.eligible(0x400000, 511)); // too small
+    try std.testing.expect(huge_user.eligible(0x400000, 512)); // exactly one block
+    try std.testing.expect(huge_user.eligible(0x400000, 1024));
+    try std.testing.expect(!huge_user.eligible(0x401000, 1024)); // 4K-aligned only
+    try std.testing.expect(!huge_user.eligible(0x500000, 4096)); // 1MiB-misaligned
+    try std.testing.expect(huge_user.eligible(0x600000, 4096)); // 2MiB-aligned
+}
+
+test "I1: hugeBlocksFor counts only full 2MiB blocks" {
+    try std.testing.expectEqual(@as(u64, 0), huge_user.hugeBlocksFor(0));
+    try std.testing.expectEqual(@as(u64, 0), huge_user.hugeBlocksFor(511));
+    try std.testing.expectEqual(@as(u64, 1), huge_user.hugeBlocksFor(512));
+    try std.testing.expectEqual(@as(u64, 1), huge_user.hugeBlocksFor(1023));
+    try std.testing.expectEqual(@as(u64, 2), huge_user.hugeBlocksFor(1024));
+}
+
+test "I1: demotePtes mirrors phys+flags over 512 PTEs, drops the huge bit" {
+    const NX: u64 = 1 << 63;
+    // Huge PDE: present|writable|user|huge|NX, phys 0x200000 (2MiB-aligned).
+    const pde: u64 = 0x200000 | huge_user.PRESENT | huge_user.WRITABLE |
+        huge_user.USER | huge_user.HUGE_BIT | NX;
+    var out: [512]u64 = undefined;
+    _ = huge_user.demotePtes(pde, &out, 0x100000);
+
+    for (0..512) |i| {
+        const expect_phys = 0x200000 + @as(u64, @intCast(i)) * huge_user.PAGE_SIZE;
+        try std.testing.expectEqual(expect_phys, out[i] & huge_user.ADDR_MASK);
+        try std.testing.expect(out[i] & huge_user.PRESENT != 0);
+        try std.testing.expect(out[i] & huge_user.WRITABLE != 0);
+        try std.testing.expect(out[i] & huge_user.USER != 0);
+        try std.testing.expect(out[i] & NX != 0); // NX preserved
+        try std.testing.expect(out[i] & huge_user.HUGE_BIT == 0); // huge bit gone
+    }
+}
+
+test "I1: demotePtes replacement PDE is a PT pointer inheriting p/w/u" {
+    const pde_ro: u64 = 0x400000 | huge_user.PRESENT | huge_user.USER | huge_user.HUGE_BIT;
+    var out: [512]u64 = undefined;
+    const new_pde = huge_user.demotePtes(pde_ro, &out, 0x300000);
+
+    try std.testing.expectEqual(@as(u64, 0x300000), new_pde & huge_user.ADDR_MASK);
+    try std.testing.expect(new_pde & huge_user.PRESENT != 0);
+    try std.testing.expect(new_pde & huge_user.USER != 0);
+    try std.testing.expect(new_pde & huge_user.WRITABLE == 0); // was read-only
+    try std.testing.expect(new_pde & huge_user.HUGE_BIT == 0); // a table, not data
+
+    // Read-only huge page demotes to read-only 4K PTEs.
+    try std.testing.expect(out[0] & huge_user.WRITABLE == 0);
+    try std.testing.expect(out[511] & huge_user.PRESENT != 0);
+}
+// ─── end user huge pages (I1) ───

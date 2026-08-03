@@ -268,11 +268,42 @@ SECTIONS {
 
 ---
 
-## 7. 微内核化规划目录
+## 7. 系统服务（servers/）
+
+### 7.1 syslogd — 系统日志守护（servers/syslogd/main.c）
+
+第一个用户态系统服务，moqi_libc 程序（入口 `main(argc, argv, envp)`，构建与
+链接方式同 init，见第 5 节），由 init 以 `spawn("syslogd")` 启动。
+
+**kmsg 消费者模式**：
+
+1. `open("/dev/kmsg", O_RDONLY)`：内核日志环的只读视图，每个 fd 有独立游标，
+   打开时从最旧可用字节开始；`read()` 到达最新字节时返回 0，**不会阻塞**。
+2. 主循环：有数据则 drain 并追加到日志文件；`read()` 返回 0（已追上）或出错时
+   `nanosleep(100ms)`（syscall #35）——守护进程绝不忙等。
+
+**日志文件 `/tmp/kern.log`**：vfs 的 open 路径只把 `/tmp` 前缀路由到 tmpfs
+（唯一支持 `O_CREAT` 的可写位置，见 `kernel/fs/vfs.zig` `FdTable.open`）；
+`/var/log/*` 等其它绝对路径会落到只读 ramdisk 查找而失败，因此目前无法用
+`/var/log`。打开标志 `O_WRONLY|O_CREAT|O_APPEND` = 0x441（位值见
+`lib/moqi_libc/include/unistd.h`）；内核在每次写前把 offset 重置为文件末尾，
+实现 O_APPEND 语义。
+
+**轮转**：tmpfs 单文件有 256 KiB 硬上限（`PAGES_PER_FILE * PAGE_SIZE`，触顶的写
+会被拒绝/短写），因此采用**写前轮转**——当下一次写入会使文件超过 256 KiB 时，
+先 close 并以 `O_WRONLY|O_CREAT|O_TRUNC|O_APPEND`（0x641）重开。单代轮转，
+旧内容直接丢弃，无 `.1` 备份。启动标记为 stdout 一行 `[syslogd] started`。
+
+**未来增强**：`/dev/kmsg` 目前不阻塞，syslogd 只能以 10 Hz 轮询；待内核为 kmsg
+提供阻塞读（或 poll/epoll 唤醒）后，应以阻塞读替换 nanosleep 兜底，改为事件驱动。
+
+---
+
+## 8. 微内核化规划目录
 
 下列目录已建立框架，**当前尚未实现**，是迈向微内核架构的预留位置。详见 [moqios-design.md](./moqios-design.md)。
 
-### 7.1 servers/ 用户空间服务
+### 8.1 servers/ 用户空间服务
 
 | 子目录 | 规划职责 |
 |---|---|
@@ -282,13 +313,13 @@ SECTIONS {
 | `servers/devmgr/` | 设备管理 / 命名空间 |
 | `servers/netstack/` | 网络协议栈服务（从内核迁出） |
 | `servers/ttyd/` | 终端 / 控制台守护 |
-| `servers/syslogd/` | 日志服务 |
+| `servers/syslogd/` | 日志服务（**已实现**：`main.c` 基于 moqi_libc，见第 7 节） |
 | `servers/powermgr/` | 电源管理 |
 | `servers/vmm/` | 虚拟机监视器（容器/沙箱） |
 | `servers/linux_pers/` | Linux 个性（兼容 Linux 系统调用） |
 | `servers/win_pers/` | Windows 个性（PE / Win32 兼容） |
 
-### 7.2 drivers/ 用户空间驱动
+### 8.2 drivers/ 用户空间驱动
 
 | 子目录 | 规划职责 |
 |---|---|
@@ -301,7 +332,7 @@ SECTIONS {
 | `drivers/usb/` | USB |
 | `drivers/libdriver/` | 驱动公共库（IPC、寄存器抽象） |
 
-### 7.3 lib/ 用户库
+### 8.3 lib/ 用户库
 
 | 子目录 | 规划职责 |
 |---|---|
@@ -315,7 +346,7 @@ SECTIONS {
 
 ---
 
-## 8. 用户态调试技巧
+## 9. 用户态调试技巧
 
 - 内核串口输出包含每个用户进程关键事件（spawn / exit / signal / page fault）。
 - `panic` 时内核会打印 `rip` / `rsp` / `cr2` 等寄存器与符号化栈回溯，可对照用户 ELF 反汇编（`zig objdump -d user/hello21.bin`，C 程序的 `.bin` 即 ELF）定位问题。

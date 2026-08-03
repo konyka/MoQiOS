@@ -512,7 +512,13 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
         if (handleDemandPage(frame, cr2)) {
             return; // Successfully handled
         }
-        // Failed demand page — fall through to segfault
+        // Failed demand page — log the address before falling through to
+        // SIGSEGV (which terminates silently when no handler is registered).
+        serial.writeString("[#PF] demand fault failed: addr=0x");
+        fmt.writeHex(cr2);
+        serial.writeString(" rip=0x");
+        fmt.writeHex(frame.rip);
+        serial.writeString("\n");
     }
 
     // Path 4: User-mode segfault — deliver SIGSEGV when a handler is registered,

@@ -301,6 +301,49 @@ H1 再加 `shared` 字段记录 MAP_SHARED），不触碰页表；首次访问�
 - 水位线自动触发内存回收
 - #PF缺页时自动swap-in
 
+### 1.10 用户态 2MiB 大页匿名 mmap（I1）✅
+
+文件: `mm/huge_user.zig`（纯函数，host 可测）、`mm/huge_user_impl.zig`（arch 门控运行时）、
+`mm/mmap.zig`、`mm/mprotect.zig`、`arch/x86_64/paging.zig`、`proc/fork.zig`、
+`arch/x86_64/clone.zig`、`mm/user_space.zig`、`mm/swap.zig`、`mm/pmm.zig`
+
+设计要点：
+
+- **分配**：匿名 mmap 且最终选定 base 2MiB 对齐、`num_pages >= 512` 时，
+  对前导完整 2MiB 块逐块尝试 `pmm.allocContiguous(512)`，成功则清零并以
+  2MiB PDE 映射（user=true、writable 随 prot、**绝不置 global** —— PCID 隔离硬要求，
+  `mapHugePage` 内有断言）；失败则该块及区域其余部分回退 4K。
+  非 MAP_FIXED 时放置搜索先试 2MiB 对齐空槽（`findFreeRangeAligned2M`），
+  找不到再退回普通 4K 粒度搜索（此时整段为 4K 映射）。
+- **不变式**：区域的巨大页块永远是其**前** `huge_pages*512` 页
+  （首块回退后不再尝试后续块；含巨大页的区域不与邻居合并）。
+  `MmapRegion.huge_pages` 仅为信息性计数——所有变更路径都由页表驱动。
+- **demote-first 规则**：任何部分变更先把巨大块拆成 512 个 4K PTE
+  （`paging.demoteHugePage`：分配一页 PT、按相同物理基址+标志位生成 PTE、
+  替换 PDE、本地 invlpg 整个 2MiB 范围）。munmap/mremap shrink 经
+  `unmapRange` 预扫描：整块覆盖直接 `unmapHugePage` + 批量 shootdown +
+  `pmm.freeContiguous` 释放 512 帧，部分覆盖先 demote；
+  mprotect 整块覆盖原地改写 PDE 权限位（保持大页），部分覆盖 demote 后走 4K 改写；
+  mremap 移动（`moveMapping`）先 `demoteRange`；fork/clone 的 COW 遍历只认 4K PTE，
+  遇到巨大 PDE 先在父进程 demote（两侧同为 4K，COW 语义不变），
+  因此巨大页永远不会带 COW 标记，#PF 的 COW 路径无需感知大页。
+- **swap/reclaim 排除**：reclaim 扫描跳过巨大 PDE（`pd[idx] & (1<<7)`），
+  巨大页不可换出——内存紧张时 demote 需要分配 PT 页，正是最分配不出的时刻。
+- **拆除**：`destroyUserSpace` 对 2MiB PDE 用 `freeContiguous` 释放全部 512 帧
+  （此前只 freePage 首帧，会泄漏其余 511 帧——巨大页每帧各有独立 refcount）。
+- **读取路径硬化**：`isUserAccessible`/`isUserWritable` 识别巨大 PDE
+  （否则 copy_from_user/copy_to_user 会拒绝巨大页上的用户缓冲区）；
+  `getPageEntryRaw`/`setPageEntryRaw` 与既有 `getPageEntry`/`unmapPage` 一样
+  拒绝下降进巨大页（否则 swap 条目探测、process_vm 会把数据帧当页表解析）。
+- **开关**：`mmap.zig` 的 `pub const huge_user_enable: bool = true` 编译期总开关；
+  非 x86_64 后端由 `huge_user_impl.zig` 的 stub 恒不启用。
+- **Host 单测**：`tests/main.zig` 末尾 `// ─── user huge pages (I1) ───` 块
+  （eligible 对齐/尺寸判定、hugeBlocksFor、demotePtes 的 512 PTE 物理/标志镜像与
+  huge 位清除、替换 PDE 的表指针语义）。
+- **运行时覆盖**：`user/hello49.c`（4MiB 匿名映射写读校验 → mprotect 前 1MiB 只读
+  触发 demote 且数据保持、第二 MiB 可写 → munmap 后 2MiB → fork 子进程读回模式 →
+  munmap 其余），门禁标记 `hello49: PASS` / `hello49 done`。
+
 ---
 
 ## 2. 进程管理
@@ -1156,6 +1199,19 @@ const SysCap = packed struct {
   `io_locks[q]`，IRQ-off 临界区短，不会与被阻塞的提交者死锁
 - 丢失唤醒防护：WaitNode 在持有 `io_locks[q]` 时挂链（ISR 在同一锁下收割
   并唤醒），模式同 sysv_sem
+- I/O 队列选择（I3：per-CPU 绑定）：纯策略函数 `nvme_queue.pickQueue`
+  （`kernel/drivers/nvme_queue.zig`，主机可测）。优先选提交者所在 CPU 的
+  队列 `cpu_id % num_io_queues`——同一任务的连续提交落在同一队列上，
+  避免跨 CPU 的 `io_locks[q]` 竞争，MSI-X 中断也打在提交 CPU 的向量上；
+  首选队列通道被占用（`io_in_flight`，无锁快照 `busyChannelMask`，只是
+  启发式提示，通道所有权仍由 acquireChannel 串行化）时回退到轮询计数器
+  `io_queue_rr`，提交者因此散开而非停在一个队列上其余队列闲置。CPU id
+  经 `arch.syscall.getPerCpuOrNull()` 读取（x86_64 早期启动 GS 未安装时
+  回退 CPU 0 → 队列 0；aarch64/riscv64 端口恒为 CPU 0）。内核线程——主要
+  是 writeback 守护线程（vfs.startWritebackThread，其 flush 经
+  writeback.flushExpiredByFs → FS 写回调 → block_dev → writeSectors 到达
+  本驱动）——显式绑定到队列 0：单线程绑定可避免它随调度落在不同 CPU 上
+  扰乱用户任务的 per-CPU 分布；队列 0 忙时回退逻辑仍允许它使用其他队列
 - 启动自检：MSI-X 启用后做一次中断驱动的扇区 0 读取，并校验 qemu_run.sh
   写入镜像首扇区的 "MoQiNVMe" 模式串
 - TRIM/discard (G5)：Identify Controller 的 ONCS（byte 520）bit 2 检测

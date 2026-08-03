@@ -241,6 +241,15 @@ pub const MmapRegion = struct {
     /// Whether this region is mlock'd (non-swappable).
     locked: bool = false,
 
+    /// I1: count of 2MiB huge blocks in this region; they are always the
+    /// FIRST huge_pages*512 pages of the region (a block that falls back to
+    /// 4K at mmap ends huge allocation for the rest of the region).
+    /// Informational: every huge-page mutation path (munmap/mprotect/
+    /// mremap/fork/teardown) is driven by the page tables themselves, and
+    /// any partial mutation demotes first — this count only records what
+    /// mmap created and is recomputed conservatively on region splits.
+    huge_pages: u32 = 0,
+
     // ─── G2: file-backed (MAP_PRIVATE) metadata ───
     // All zero = anonymous region, so existing initialisers are unaffected.
     /// Backing store kind (filemap.FsKind as u8); 0 = anonymous.

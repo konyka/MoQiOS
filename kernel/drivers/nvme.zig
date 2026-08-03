@@ -8,6 +8,9 @@
 ///   - NVMe Read/Write commands using PRP entries
 ///   - Dataset Management (TRIM/deallocate) when ONCS bit 2 is set
 ///   - Integration with block_dev abstraction layer
+///   - Per-CPU I/O queue selection (I3): submitters prefer
+///     `cpu_id % num_io_queues`, falling back to round-robin when the
+///     preferred channel is busy (policy in nvme_queue.zig, host-tested)
 ///
 /// Limitations:
 ///   - Up to 4 I/O queue pairs (configurable via MAX_IO_QUEUES)
@@ -27,6 +30,8 @@ const block_dev = @import("block_dev.zig");
 const fmt = @import("../lib/fmt.zig");
 const task = @import("../proc/task.zig");
 const sched = @import("../proc/sched.zig");
+const arch_syscall = @import("../arch/arch.zig").syscall;
+const nvme_queue = @import("nvme_queue.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 // ─── NVMe Controller Register Offsets (via BAR0 MMIO) ────────────────────
@@ -193,7 +198,7 @@ var io_cq_doorbell: [MAX_IO_QUEUES]u64 = @splat(0);
 // while the other CPU's DMA reads it.
 var io_locks: [MAX_IO_QUEUES]IrqSpinlock = @splat(.{});
 var num_io_queues: u32 = 0; // Actual number of I/O queues created
-var io_queue_rr: u32 = 0; // Round-robin queue selector
+var io_queue_rr: u32 = 0; // Round-robin fallback counter (busy preferred queue)
 
 // ─── Interrupt-driven completion (MSI-X) ─────────────────────────────────
 //
@@ -1155,12 +1160,56 @@ pub fn handleInterrupt(table_index: u32) void {
     }
 }
 
-/// Select next I/O queue via round-robin (v52.0).
+/// Select the I/O queue for one submission (I3: per-CPU affinity).
+///
+/// Prefers the submitting CPU's own queue (`cpu_id % num_io_queues`) so a
+/// task's consecutive submissions land on the same queue — no cross-CPU
+/// `io_locks[q]` contention, and the MSI-X interrupt fires on the vector of
+/// the CPU that submitted. When the preferred queue's channel is busy
+/// (`io_in_flight`), falls back to the round-robin counter so submitters
+/// spread instead of parking behind one queue while others idle. The pure
+/// policy lives in nvme_queue.pickQueue (host-tested in tests/main.zig).
 inline fn selectQueue() u32 {
     if (num_io_queues <= 1) return 0;
-    // v52.6: atomic increment for SMP safety (.acq_rel for proper ordering)
-    const old = @atomicRmw(u32, &io_queue_rr, .Add, 1, .acq_rel);
-    return old % num_io_queues;
+    const cpu_id = affinityCpuId();
+    const q = nvme_queue.pickQueue(cpu_id, num_io_queues, busyChannelMask(), @atomicLoad(u32, &io_queue_rr, .acquire));
+    if (q != cpu_id % num_io_queues) {
+        // Fallback path taken — advance the counter for the next busy hit.
+        _ = @atomicRmw(u32, &io_queue_rr, .Add, 1, .acq_rel);
+    }
+    return q;
+}
+
+/// CPU id used for queue affinity. Kernel threads — notably the writeback
+/// daemon (vfs.startWritebackThread), whose flushes reach us via
+/// writeback.flushExpiredByFs → FS write callback → block_dev →
+/// writeSectors — are pinned to 0 (→ queue 0): it is a single thread, and
+/// binding it keeps it from disturbing the per-CPU spread of user-task
+/// submissions on whichever CPU the scheduler happened to place it. The
+/// busy fallback above still lets it use other queues when queue 0 is
+/// occupied. Returns 0 as well before the per-CPU block exists (early
+/// boot: x86_64 GS base unset — getPerCpuOrNull() == null).
+inline fn affinityCpuId() u32 {
+    if (sched.currentTaskIndex()) |idx| {
+        if (task.getTask(idx)) |t| {
+            if (!t.is_user) return 0;
+        }
+    }
+    if (arch_syscall.getPerCpuOrNull()) |pc| return pc.cpu_id;
+    return 0;
+}
+
+/// Snapshot of owned queue channels (bit q ⇔ io_in_flight[q]). Lock-free
+/// heuristic for queue selection only: a stale bit steers one submission to
+/// a suboptimal queue but never corrupts state — channel ownership itself
+/// is still serialized by acquireChannel.
+inline fn busyChannelMask() u32 {
+    var mask: u32 = 0;
+    for (0..num_io_queues) |q| {
+        if (@atomicLoad(bool, &io_in_flight[q], .acquire))
+            mask |= @as(u32, 1) << @intCast(q);
+    }
+    return mask;
 }
 
 /// Read sectors from NVMe device.

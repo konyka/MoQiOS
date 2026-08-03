@@ -15,6 +15,7 @@ const pmm = @import("pmm.zig");
 const hhdm = @import("hhdm.zig");
 const cow_pte = @import("cow_pte.zig");
 const filemap = @import("filemap.zig");
+const huge_impl = @import("huge_user_impl.zig");
 
 pub const PROT_NONE: u64 = 0;
 pub const PROT_READ: u64 = 1;
@@ -95,7 +96,14 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     }
     if (slots_needed > free_slots) return ENOMEM;
 
-    // 5. Walk page tables for [addr, addr+len) and modify PTE permissions
+    // 5. Walk page tables for [addr, addr+len) and modify PTE permissions.
+    //
+    // I1: the 4K walk below skips huge PDEs entirely (getPageEntry refuses
+    // them), so handle huge blocks first: a block only PARTIALLY covered is
+    // demoted to 4K pages (the walk then re-flags it); a block FULLY covered
+    // has its PDE rewritten in place and stays huge.
+    huge_impl.protectHugeOverlaps(cur.page_table_phys, addr, addr + len, prot) catch return ENOMEM;
+
     var v = addr;
     const end = addr + len;
 

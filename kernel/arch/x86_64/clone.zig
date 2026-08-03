@@ -99,6 +99,11 @@ pub fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
             const parent_pd: [*]const u64 = @ptrFromInt(hhdm_mod.physToVirt(parent_pd_phys));
 
             for (0..512) |pd_idx| {
+                // I1: a 2MiB user huge PDE is a data frame, not a PT —
+                // demote it in the parent before the 4K COW walk below.
+                const huge_virt = (@as(u64, pml4_idx) << 39) |
+                    (@as(u64, pdpt_idx) << 30) | (@as(u64, pd_idx) << 21);
+                paging_mod.demoteHugePage(parent_pml4_phys, huge_virt) catch return null;
                 const pde = parent_pd[pd_idx];
                 if (pde == 0) continue;
                 if (pde & 1 == 0) continue;
@@ -159,6 +164,10 @@ pub fn clone(
 
     if (shares_vm) {
         @import("../../mm/user_space.zig").retainUserSpace(child_pml4);
+    } else {
+        // I1: the COW clone demoted every huge block in the parent (the
+        // walk is 4K-only) — no huge pages remain, clear the counts.
+        for (&parent.mmap_regions) |*r| r.huge_pages = 0;
     }
 
     const child_idx = task_mod.createUserProcess(

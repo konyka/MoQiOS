@@ -1607,6 +1607,22 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 ---
 
+### 6.9 基础设施补完·第五轮（2026-08-05）
+
+| 阶段 | 内容 | 验证 |
+|---|---|---|
+| I1 | **用户 2MiB 大页匿名映射**：≥2MiB 对齐匿名映射优先按整块大页分配（`pmm.allocContiguous(512)`，失败回退 4K）；新页表操作 `demoteHugePage`（2MiB PDE → 512 个 4K PTE）——所有部分变更路径（部分 munmap/mprotect/mremap 收缩/fork COW/缺页）一律先 demote 再复用 4K 逻辑，仅「整块分配+整块释放」是纯大页路径；swap/reclaim 跳过大页；`huge_user_enable` 编译期门控；顺带修复 `destroyUserSpace` 大页帧泄漏与 `isUserAccessible/isUserWritable` 大页感知 | hello49（内容/mprotect demote 后数据保持/部分 munmap/fork COW） |
+| I2 | **servers/syslogd**——首个用户态系统服务：moqi_libc 编写，消费 `/dev/kmsg` 写入 `/tmp/kern.log`（O_APPEND；tmpfs 单文件 256KiB 上限前的单代轮转）；100ms nanosleep 轮询不忙等；init 在测试序列后 spawn（不 waitpid） | `[syslogd] started` 入 smoke 门槛 |
+| I3 | **NVMe per-CPU 队列绑定**：`pickQueue(cpu_id, n, busy_mask, rr)` 纯函数——优先 `cpu_id % num_io_queues`（同核提交、ISR 同向量），首选忙时回退轮询；内核线程（写回刷盘）固定队列 0 | host 单测 + NVMe 自测标记回归 |
+
+**说明**：sched_lock 完整拆锁继续推迟——需要先扩展 `qemu_smoke_stress.sh` 的 SMP 压力覆盖作为安全验证前提（下一轮前置项）。I1 代理复核发现的既有小漏（4K PROT_NONE 后 munmap 泄漏帧、`destroyUserSpace` 对 1GiB PDE 的释放）已记录待修。
+
+**调试记录**：① hello49 静默死亡根因——`pmm.allocContiguous` 返回**非 2MiB 对齐**的物理帧，大页 PDE 保留位置位导致首次访问即 #PF（用户态 SIGSEGV 无 handler 时静默退出、无 [exit] 输出，使死因一度不可见）；修复为新增 `allocContiguousAligned(count, align)`，并给缺页失败路径加了 `[#PF]` 诊断行（常驻）。② hello49 测试自身三处断言矛盾（整页填充覆盖边界字节、page300 验证未计入刻意写入、pattern 边界索引），修正测试。
+
+**仍遗留**：kmsg 阻塞读（syslogd 暂轮询）；drivers/ 用户态驱动框架；大页不支持文件映射；SMP 压力测试扩展；真实硬件 PCID 验证。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:

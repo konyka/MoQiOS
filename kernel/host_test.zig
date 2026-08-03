@@ -33,3 +33,5 @@ pub const dhcp = @import("net/dhcp.zig");
 pub const kmsg_ring = @import("lib/kmsg_ring.zig");
 pub const trim_ranges = @import("lib/trim_ranges.zig");
 pub const pcid_alloc = @import("mm/pcid_alloc.zig");
+pub const huge_user = @import("mm/huge_user.zig");
+pub const nvme_queue = @import("drivers/nvme_queue.zig");

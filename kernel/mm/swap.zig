@@ -253,6 +253,7 @@ fn reclaimScanPass(pml4_phys: u64, target: u32) u32 {
             if (swapped >= target) break;
             if (pte_scanned >= MAX_PTE_SCAN) break; // v53.13: Scan limit
             if (pdpt[pdpt_idx] & 1 == 0) continue;
+            if (pdpt[pdpt_idx] & (1 << 7) != 0) continue; // 1GB huge page — a data frame, not a PD
 
             const pd_phys = pdpt[pdpt_idx] & 0xFFFF_FFFF_F000;
             const pd: [*]u64 = @ptrFromInt(hhdm.physToVirt(pd_phys));
@@ -261,6 +262,12 @@ fn reclaimScanPass(pml4_phys: u64, target: u32) u32 {
                 if (swapped >= target) break;
                 if (pte_scanned >= MAX_PTE_SCAN) break; // v53.13: Scan limit
                 if (pd[pd_idx] & 1 == 0) continue;
+                // I1: a 2MB huge PDE is a data frame, not a PT — descending
+                // would read the block's contents as PTEs. Huge pages are
+                // deliberately excluded from swap/reclaim (documented in
+                // docs/kernel-subsystems.md): demoting under memory pressure
+                // would need a PT allocation exactly when none is available.
+                if (pd[pd_idx] & (1 << 7) != 0) continue;
 
                 const pt_phys = pd[pd_idx] & 0xFFFF_FFFF_F000;
                 const pt: [*]u64 = @ptrFromInt(hhdm.physToVirt(pt_phys));

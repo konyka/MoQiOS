@@ -80,6 +80,10 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.cwd_len = parent.cwd_len;
 
     // v53.2: inherit mmap regions so munmap/madvise/mlock work in child
+    // I1: cloneUserPagesCow demoted every huge block it met (the COW walk is
+    // 4K-only), so neither side has huge pages anymore — clear the counts
+    // before the child inherits the region table.
+    for (&parent.mmap_regions) |*r| r.huge_pages = 0;
     child.mmap_regions = parent.mmap_regions;
     child.mmap_count = parent.mmap_count;
 
@@ -206,7 +210,12 @@ pub fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
             const parent_pd: [*]const u64 = @ptrFromInt(hhdm_mod.physToVirt(parent_pd_phys));
 
             for (0..512) |pd_idx| {
-                const pde = parent_pd[pd_idx];
+                // I1: demote 2MiB huge PDEs before the 4K walk — a huge PDE
+                // is a data frame, not a PT (see cloneUserPagesCow).
+                const huge_virt = (@as(u64, pml4_idx) << 39) |
+                    (@as(u64, pdpt_idx) << 30) | (@as(u64, pd_idx) << 21);
+                const pde = @import("../mm/huge_user_impl.zig").demoteIfHugePde(parent_pml4_phys, parent_pd, pd_idx, huge_virt) catch
+                    return abortCloneRoot(child_pml4_phys);
                 if (pde == 0) continue;
                 if (pde & 1 == 0) continue;
 
@@ -267,6 +276,7 @@ pub fn cloneUserPagesCow(parent_pml4_phys: u64, shared_regions: ?[]const @import
     const paging_mod = @import("../arch/arch.zig").paging;
     const filemap = @import("../mm/filemap.zig");
     const task_mod = @import("task.zig");
+    const huge_impl = @import("../mm/huge_user_impl.zig");
 
     const ADDR_MASK: u64 = 0xFFFFFFFFF000;
     const cow_pte_mod = @import("../mm/cow_pte.zig");
@@ -309,7 +319,14 @@ pub fn cloneUserPagesCow(parent_pml4_phys: u64, shared_regions: ?[]const @import
             const parent_pd: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(parent_pd_phys));
 
             for (0..512) |pd_idx| {
-                const pde = parent_pd[pd_idx];
+                // I1: a 2MiB user huge PDE is a data frame, not a PT — the
+                // 4K COW walk below would treat the block's contents as
+                // page-table entries. Demote it in the parent first; both
+                // sides end up 4K and COW semantics are preserved.
+                const huge_virt = (@as(u64, pml4_idx) << 39) |
+                    (@as(u64, pdpt_idx) << 30) | (@as(u64, pd_idx) << 21);
+                const pde = huge_impl.demoteIfHugePde(parent_pml4_phys, parent_pd, pd_idx, huge_virt) catch
+                    return abortCloneRoot(child_pml4_phys);
                 if (pde == 0 or pde & 1 == 0) continue;
 
                 const parent_pt_phys = pde & ADDR_MASK;

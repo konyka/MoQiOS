@@ -332,8 +332,17 @@ fn allocPageLocked() ?u64 {
 
 /// Allocate `count` physically contiguous pages. Returns base physical address or null.
 pub fn allocContiguous(count: usize) ?u64 {
+    return allocContiguousAligned(count, 1);
+}
+
+/// Allocate `count` contiguous frames starting at a multiple of
+/// `align_pages` frames. Huge-page mappings require the base frame to be
+/// aligned to the page size (a 2MiB PDE with a misaligned frame sets
+/// reserved bits and faults on first access).
+pub fn allocContiguousAligned(count: usize, align_pages: usize) ?u64 {
     if (count == 0) return null;
     if (count == 1) return allocPage();
+    const alignment = @max(align_pages, 1);
 
     const flags = lock.acquire();
     defer lock.release(flags);
@@ -348,8 +357,9 @@ pub fn allocContiguous(count: usize) ?u64 {
     while (pass < 2) {
         const limit = if (pass == 0) total_pages else first;
         while (start + count <= limit) {
-            const candidate = start;
-            var skip_to = start + 1;
+            const candidate = if (alignment <= 1) start else (start + alignment - 1) / alignment * alignment;
+            if (candidate + count > limit) break;
+            var skip_to = candidate + 1;
             if (tryAllocContiguousAt(candidate, count, &skip_to)) |phys| return phys;
             start = skip_to;
         }
@@ -378,6 +388,32 @@ fn tryAllocContiguousAt(start: u64, count: usize, skip_to: *u64) ?u64 {
     free_pages -= count;
     next_free_hint = start + @as(u64, @intCast(count));
     return physFromPage(start);
+}
+
+/// Free `count` physically contiguous pages starting at `phys` — the
+/// counterpart of allocContiguous. Decrements each frame's refcount once
+/// under a single lock acquisition; frames at refcount zero are skipped
+/// silently (same double-free policy as freePageBatch).
+pub fn freeContiguous(phys: u64, count: usize) void {
+    if (count == 0) return;
+    if (count == 1) {
+        freePage(phys);
+        return;
+    }
+    const flags = lock.acquire();
+    defer lock.release(flags);
+    const first = pageFromPhys(phys);
+    for (0..count) |j| {
+        const page = first + j;
+        if (page >= total_pages) break;
+        if (ref_counts[page] == 0) continue; // Skip double-free silently
+        ref_counts[page] -= 1;
+        if (ref_counts[page] == 0) {
+            setBit(page);
+            free_pages += 1;
+            if (page < next_free_hint) next_free_hint = page;
+        }
+    }
 }
 
 /// Reserve a physical page (mark as used). Used to protect page table pages
