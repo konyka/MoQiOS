@@ -6,6 +6,8 @@
 ///   - Falls back to raw FAT32 if no MBR partition table found
 const serial = @import("../arch/arch.zig").serial;
 const virtio_blk = @import("../drivers/virtio_blk.zig");
+const block_dev = @import("../drivers/block_dev.zig");
+const trim_ranges = @import("../lib/trim_ranges.zig");
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const fmt = @import("../lib/fmt.zig");
@@ -63,6 +65,33 @@ var fat_cache_sector: u32 = 0xFFFFFFFF;
 var fat_cache_phys: u64 = 0;
 var fat_cache_buf_virt: u64 = 0;
 var last_free_cluster: u32 = 2; // v53.38: allocCluster scan cursor (O(N) vs O(N×M))
+
+// G5 TRIM: extents of freed clusters accumulate here and are coalesced into
+// maximal contiguous sector ranges before issuing block_dev.discard. Static
+// buffers (fs_lock serializes); flushed when full or at the end of a free
+// loop. discard() is plain device I/O that never re-enters fat32, so the
+// writeback flush rule (drop fs_lock around writeback calls) does not apply
+// — it runs under fs_lock like the existing FAT/dir sector I/O.
+var discard_in: [64]trim_ranges.Extent = undefined;
+var discard_out: [64]trim_ranges.Extent = undefined;
+var discard_count: usize = 0;
+
+fn noteFreedCluster(cluster: u32) void {
+    if (discard_count == discard_in.len) flushDiscard();
+    discard_in[discard_count] = .{
+        .start = clusterToLBA(cluster),
+        .count = fat32_sectors_per_cluster,
+    };
+    discard_count += 1;
+}
+
+fn flushDiscard() void {
+    const n = trim_ranges.coalesce(discard_in[0..discard_count], &discard_out);
+    discard_count = 0;
+    for (discard_out[0..n]) |r| {
+        _ = block_dev.discard(r.start, r.count);
+    }
+}
 
 var files: [MAX_FILES]FileInfo = @splat(.{
     .name = @splat(0),
@@ -1058,10 +1087,12 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
             last_kept = cluster;
         } else {
             if (!setFATEntry(cluster, 0)) break;
+            noteFreedCluster(cluster); // G5: batch a discard extent
         }
         cluster = next;
         ci += 1;
     }
+    flushDiscard(); // G5: issue coalesced discards for the freed tail
     // Terminate the chain at the last kept cluster.
     if (last_kept >= 2) {
         if (!setFATEntry(last_kept, 0x0FFFFFFF)) {
@@ -1146,8 +1177,10 @@ pub fn deleteFile(file_idx: u32) bool {
     while (cluster >= 2 and cluster < 0x0FFFFFF8 and safety < 65536) : (safety += 1) {
         const next_cluster = getFATEntry(cluster) orelse break;
         if (!setFATEntry(cluster, 0)) break;
+        noteFreedCluster(cluster); // G5: batch a discard extent
         cluster = next_cluster;
     }
+    flushDiscard(); // G5: issue coalesced discards for the freed chain
     // No cache invalidation needed — setFATEntry keeps cache consistent
 
     // v53.51: Tombstone the slot instead of shifting files[]. Shifting moved

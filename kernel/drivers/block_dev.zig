@@ -2,7 +2,7 @@
 ///
 /// Provides a single interface for all block devices (NVMe/AHCI/virtio-blk).
 /// Drivers register themselves after init; the dispatch functions route
-/// read/write/flush calls to the appropriate driver based on device type.
+/// read/write/flush/discard calls to the appropriate driver based on device type.
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const klog = @import("../klog.zig");
 const serial = @import("../arch/arch.zig").serial;
@@ -195,6 +195,50 @@ pub fn trim(dev: u8, lba_ranges: []const u64, range_count: u32) i32 {
         },
         .nvme, .virtio_blk => {
             return -1;
+        },
+    }
+}
+
+/// Discard (deallocate) `count` sectors starting at `lba` on the active
+/// device — the disk the filesystems actually sit on (virtio-blk disk 0 is
+/// the only disk fat32/ext2 address directly today; when no virtio-blk
+/// device is registered, falls back to the first active device so the
+/// NVMe/AHCI paths stay reachable). No-op (returns 0) when the target
+/// driver lacks discard/TRIM support; -1 on I/O error.
+pub fn discard(lba: u64, count: u32) i32 {
+    if (count == 0) return 0;
+
+    var target: ?u8 = null;
+    for (0..device_count) |i| {
+        if (!devices[i].active) continue;
+        if (devices[i].info.dev_type == .virtio_blk and devices[i].dev_idx == 0) {
+            target = @intCast(i);
+            break;
+        }
+        if (target == null) target = @intCast(i);
+    }
+    const dev = target orelse return 0;
+
+    switch (devices[dev].info.dev_type) {
+        .virtio_blk => return virtio_blk.discard(lba, count),
+        .nvme => {
+            if (!nvme.isTrimSupported()) return 0;
+            return nvme.trimSectors(lba, count);
+        },
+        .ahci => {
+            if (!ahci.isTrimSupported()) return 0;
+            // AHCI TRIM range entry: low 2 bytes = sector count (0 = 65536),
+            // high 6 bytes = starting LBA. Split counts above 65535.
+            var cur = lba;
+            var remaining = count;
+            while (remaining > 0) {
+                const chunk: u32 = @min(remaining, 65535);
+                const entry: u64 = (cur << 16) | chunk;
+                if (ahci.trim(&.{entry}, 1) != 0) return -1;
+                cur += chunk;
+                remaining -= chunk;
+            }
+            return 0;
         },
     }
 }

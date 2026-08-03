@@ -66,6 +66,13 @@ const DhcpPacket = extern struct {
 var our_xid: u32 = 0;
 var dhcp_configured: bool = false;
 
+/// Backstop iteration bound for the OFFER/ACK poll loops. getTickCount only
+/// advances once timer IRQs are enabled, which happens late in boot — so a
+/// tick-only deadline never expires when discover() runs early (boot-time
+/// DHCP, see kernel/main.zig). The cap keeps every wait bounded regardless;
+/// with ticks live the 500-tick (~5s) deadline fires first.
+const MAX_POLL_ITERS: u32 = 5_000_000;
+
 // Acquired configuration
 var dhcp_ip: [4]u8 = .{ 0, 0, 0, 0 };
 var dhcp_netmask: [4]u8 = .{ 255, 255, 255, 0 };
@@ -99,13 +106,16 @@ fn pumpRx() void {
 }
 
 /// Perform DHCP discover — sends DHCPDISCOVER and waits for DHCPOFFER.
+/// Bounded: each wait exits on the 500-tick deadline or the MAX_POLL_ITERS
+/// backstop, whichever comes first, so it is safe to call before timer IRQs
+/// are enabled (boot-time DHCP). Returns true once the lease is applied.
 pub fn discover() bool {
-    serial.writeString("[DHCP] Starting DHCP discover...\n");
+    serial.writeString("[dhcp] Starting DHCP discover...\n");
 
     // Register the client port first — without it the UDP demux drops
     // OFFER/ACK replies before recvFrom can ever see them.
     if (udp.ensurePort(DHCP_CLIENT_PORT) == 0xFFFF) {
-        serial.writeString("[DHCP] Failed to register client port\n");
+        serial.writeString("[dhcp] Failed to register client port\n");
         return false;
     }
     defer udp.releasePort(DHCP_CLIENT_PORT);
@@ -115,24 +125,27 @@ pub fn discover() bool {
 
     // Send DHCPDISCOVER
     if (!sendDiscover()) {
-        serial.writeString("[DHCP] Failed to send DISCOVER\n");
+        serial.writeString("[dhcp] Failed to send DISCOVER\n");
         return false;
     }
 
-    // Wait for DHCPOFFER (poll for up to 5 seconds)
+    // Wait for DHCPOFFER (poll for up to 5 seconds, or MAX_POLL_ITERS
+    // iterations as a backstop when the tick counter is not advancing yet)
     const start = idt.getTickCount();
-    while (idt.getTickCount() - start < 500) {
+    var offer_iters: u32 = 0;
+    while (idt.getTickCount() - start < 500 and offer_iters < MAX_POLL_ITERS) : (offer_iters += 1) {
         pumpRx();
         if (receiveOffer()) {
-            serial.writeString("[DHCP] Received OFFER\n");
+            serial.writeString("[dhcp] Received OFFER\n");
             // Send DHCPREQUEST
             if (!sendRequest()) {
-                serial.writeString("[DHCP] Failed to send REQUEST\n");
+                serial.writeString("[dhcp] Failed to send REQUEST\n");
                 return false;
             }
-            // Wait for DHCPACK
+            // Wait for DHCPACK (same bounded scheme as the OFFER wait)
             const req_start = idt.getTickCount();
-            while (idt.getTickCount() - req_start < 500) {
+            var ack_iters: u32 = 0;
+            while (idt.getTickCount() - req_start < 500 and ack_iters < MAX_POLL_ITERS) : (ack_iters += 1) {
                 pumpRx();
                 if (receiveAck()) {
                     applyConfig();
@@ -140,13 +153,13 @@ pub fn discover() bool {
                 }
                 cpu.pause();
             }
-            serial.writeString("[DHCP] No ACK received\n");
+            serial.writeString("[dhcp] No ACK received\n");
             return false;
         }
         cpu.pause();
     }
 
-    serial.writeString("[DHCP] No OFFER received\n");
+    serial.writeString("[dhcp] No OFFER received\n");
     return false;
 }
 
@@ -210,7 +223,7 @@ fn sendRequest() bool {
 }
 
 fn receiveOffer() bool {
-    var buf: [576]u8 = @splat(0);
+    var buf: [576]u8 align(@alignOf(DhcpPacket)) = @splat(0);
     var src_ip: [4]u8 = .{ 0, 0, 0, 0 };
     var src_port: u16 = 0;
 
@@ -235,7 +248,7 @@ fn receiveOffer() bool {
     dhcp_ip = pkt.yiaddr;
     dhcp_server_id = pkt.siaddr;
 
-    serial.writeString("[DHCP] Offered IP: ");
+    serial.writeString("[dhcp] Offered IP: ");
     printIp(dhcp_ip);
     serial.writeString(" from server: ");
     printIp(dhcp_server_id);
@@ -245,7 +258,7 @@ fn receiveOffer() bool {
 }
 
 fn receiveAck() bool {
-    var buf: [576]u8 = @splat(0);
+    var buf: [576]u8 align(@alignOf(DhcpPacket)) = @splat(0);
     var src_ip: [4]u8 = .{ 0, 0, 0, 0 };
     var src_port: u16 = 0;
 
@@ -263,7 +276,7 @@ fn receiveAck() bool {
     parseOptions(pkt, &msg_type);
 
     if (msg_type == DHCPNACK) {
-        serial.writeString("[DHCP] Received NACK\n");
+        serial.writeString("[dhcp] Received NACK\n");
         return false;
     }
     if (msg_type != DHCPACK) return false;
@@ -343,7 +356,7 @@ fn applyConfig() void {
     // Note: We update the static values in netif.zig via functions below
     dhcp_configured = true;
 
-    serial.writeString("[DHCP] Configured: IP=");
+    serial.writeString("[dhcp] Configured: IP=");
     printIp(dhcp_ip);
     serial.writeString(" netmask=");
     printIp(dhcp_netmask);

@@ -10,6 +10,10 @@ const pmm_mod = @import("pmm.zig");
 const hhdm_mod = @import("hhdm.zig");
 const paging_mod = @import("../arch/arch.zig").paging;
 const tlb_mod = @import("../arch/arch.zig").tlb;
+const filemap = @import("filemap.zig");
+const vfs = @import("../fs/vfs.zig");
+const ext2 = @import("../fs/ext2.zig");
+const tmpfs = @import("../fs/tmpfs.zig");
 
 const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_PRIVATE: u64 = 0x2;
@@ -88,11 +92,14 @@ pub fn unmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
 }
 
 /// Whether adding a disjoint range can be represented without dropping metadata.
-fn canTrackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64) bool {
+/// `anonymous` because only anonymous regions merge with neighbours (G2):
+/// a file region always needs a free slot of its own.
+fn canTrackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, anonymous: bool) bool {
     for (task.mmap_regions) |r| {
         if (!r.active) return true;
-        if (r.base + r.num_pages * user_space.PAGE_SIZE == base or
-            base + num_pages * user_space.PAGE_SIZE == r.base) return true;
+        if (anonymous and r.file_kind == 0 and
+            (r.base + r.num_pages * user_space.PAGE_SIZE == base or
+            base + num_pages * user_space.PAGE_SIZE == r.base)) return true;
     }
     return false;
 }
@@ -122,29 +129,65 @@ fn canTrackReplacement(task: *task_mod.Task, base: u64, num_pages: u64) bool {
     return pieces + 1 <= task.mmap_regions.len;
 }
 
+/// File-backing metadata recorded for a file region at track time (G2).
+pub const RegionFileMeta = struct {
+    kind: filemap.FsKind,
+    prot: u8,
+    offset: u64,
+    size: u64,
+    idx: u32,
+    data: u64,
+    inode: u64,
+};
+
 /// Track an mmap region in the task's mmap_regions table.
-fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64) void {
-    // Try to merge with an adjacent existing region
-    for (&task.mmap_regions) |*r| {
-        if (r.active and r.base + r.num_pages * 4096 == base) {
-            r.num_pages += num_pages;
-            return;
-        }
-        if (r.active and base + num_pages * 4096 == r.base) {
-            r.base = base;
-            r.num_pages += num_pages;
-            return;
+/// `meta` is null for anonymous regions. File regions never merge with
+/// neighbours — a merge would silently drop one side's backing metadata.
+fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, meta: ?RegionFileMeta) void {
+    const new_kind: u8 = if (meta) |m| @intFromEnum(m.kind) else 0;
+    // Try to merge with an adjacent existing region (anonymous only)
+    if (meta == null) {
+        for (&task.mmap_regions) |*r| {
+            if (!r.active or !filemap.canMergeAnon(r.file_kind, new_kind)) continue;
+            if (r.base + r.num_pages * 4096 == base) {
+                r.num_pages += num_pages;
+                return;
+            }
+            if (base + num_pages * 4096 == r.base) {
+                r.base = base;
+                r.num_pages += num_pages;
+                return;
+            }
         }
     }
     // Find a free slot
     for (&task.mmap_regions) |*r| {
         if (!r.active) {
             r.* = .{ .base = base, .num_pages = num_pages, .active = true };
+            if (meta) |m| {
+                r.file_kind = @intFromEnum(m.kind);
+                r.prot = m.prot;
+                r.file_offset = m.offset;
+                r.file_size = m.size;
+                r.file_idx = m.idx;
+                r.file_data = m.data;
+                r.inode_id = m.inode;
+            }
             task.mmap_count += 1;
             return;
         }
     }
     unreachable; // Capacity is checked before any pages are mapped.
+}
+
+/// G2: drop the backing-store reference held by a file region piece.
+/// ext2 regions retain their open slot at mmap time so faults survive
+/// close(fd); every deactivation must balance that retain.
+fn releaseRegionBacking(r: *task_mod.MmapRegion) void {
+    if (r.file_kind == @intFromEnum(filemap.FsKind.ext2)) {
+        ext2.closeFile(r.file_idx);
+    }
+    r.file_kind = 0;
 }
 
 fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
@@ -157,17 +200,22 @@ fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
         if (r.base >= end or r_end <= base) continue; // no overlap
 
         if (base <= r.base and end >= r_end) {
+            releaseRegionBacking(r);
             r.active = false;
             if (task.mmap_count > 0) task.mmap_count -= 1;
         } else if (base <= r.base and end < r_end) {
             const removed = (end - r.base) / page;
             r.base = end;
             r.num_pages -= removed;
+            // G2: the base moved up, so the file offset tracked at the base
+            // advances with it (the piece keeps its backing reference).
+            r.file_offset = filemap.advanceFileOffset(r.file_offset, removed);
         } else if (base > r.base and end >= r_end) {
             r.num_pages = (base - r.base) / page;
         } else {
             const tail_base = end;
             const tail_pages = (r_end - end) / page;
+            const tail_offset = filemap.advanceFileOffset(r.file_offset, (end - r.base) / page);
             r.num_pages = (base - r.base) / page;
             for (&task.mmap_regions) |*r2| {
                 if (!r2.active) {
@@ -176,13 +224,39 @@ fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
                         .num_pages = tail_pages,
                         .active = true,
                         .locked = r.locked,
+                        // G2: the tail piece keeps the same backing; it needs
+                        // its own reference so either piece can be unmapped
+                        // independently.
+                        .file_kind = r.file_kind,
+                        .prot = r.prot,
+                        .file_offset = tail_offset,
+                        .file_size = r.file_size,
+                        .file_idx = r.file_idx,
+                        .file_data = r.file_data,
+                        .inode_id = r.inode_id,
                     };
+                    if (r.file_kind == @intFromEnum(filemap.FsKind.ext2)) {
+                        ext2.retainFile(r.file_idx);
+                    }
                     task.mmap_count += 1;
                     break;
                 }
             }
         }
     }
+}
+
+/// G2: release every file-region backing reference held by a task and clear
+/// its region table. Called by the task teardown paths (reap/exec) right
+/// before destroyUserSpace, which only walks page tables and never consults
+/// the region metadata.
+pub fn releaseFileRefs(task: *task_mod.Task) void {
+    for (&task.mmap_regions) |*r| {
+        if (!r.active) continue;
+        releaseRegionBacking(r);
+        r.active = false;
+    }
+    task.mmap_count = 0;
 }
 
 fn rangesOverlap(a_base: u64, a_pages: u64, b_base: u64, b_pages: u64) bool {
@@ -350,6 +424,71 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
+    // ─── G2: file-backed validation and backing metadata ───
+    // File mappings are demand-paged: nothing is mapped here, the region
+    // metadata below drives the page-fault path (handleFileFault in idt.zig).
+    var meta: ?RegionFileMeta = null;
+    if (!is_anonymous) {
+        // MAP_SHARED writeback is deferred to a later round (G2 scope).
+        if (flags & MAP_SHARED != 0) return -95; // EOPNOTSUPP
+        // Linux: the offset must be page-aligned.
+        if (!filemap.offsetValid(offset)) return -22; // EINVAL
+        if (fd < 0 or fd >= vfs.MAX_FDS) return -9; // EBADF
+        const desc = &cur.fd_table.fds[@intCast(fd)];
+        const kind: filemap.FsKind = switch (desc.fd_type) {
+            .ramdisk_file => .ramdisk,
+            .tmpfs_file => .tmpfs,
+            .ext2_file => .ext2,
+            .fat32_file => .fat32,
+            // Pipes, sockets and special files are not mappable.
+            else => return -19, // ENODEV
+        };
+        // The fd must be readable (status_flags & 3 == 1 is O_WRONLY).
+        if ((desc.status_flags & 0x03) == 1) return -9; // EBADF
+
+        var m = RegionFileMeta{
+            .kind = kind,
+            .prot = @intCast(prot & 7),
+            .offset = offset,
+            .size = desc.file_size,
+            .idx = 0,
+            .data = 0,
+            .inode = 0,
+        };
+        switch (kind) {
+            .ramdisk => {
+                // Kernel-virtual pointer to the immutable blob contents.
+                m.data = desc.file_data;
+            },
+            .tmpfs => {
+                m.idx = desc.tmpfs_idx;
+                // ctime doubles as a generation tag: after unlink+close the
+                // entry is freed and a recycled slot gets a fresh ctime, so a
+                // stale region can never be served the wrong file's pages.
+                m.data = tmpfs.tmpfsGetCtime(@intCast(desc.tmpfs_idx));
+            },
+            .ext2 => {
+                m.idx = desc.ext2_file_idx;
+                m.inode = desc.inode_id;
+                // Refresh the size like the read path does — another fd may
+                // have grown the file through a different ext2 open slot.
+                m.size = ext2.refreshSize(desc.ext2_file_idx);
+                // NOTE: the open slot is retained only once the mapping is
+                // known to succeed (see below), so early ENOMEM returns do
+                // not leak the reference.
+            },
+            .fat32 => {
+                // fat32 open slots are never freed on close (vfs.close only
+                // invalidates readahead), so the index stays valid for the
+                // life of the mapping without a retain.
+                m.idx = desc.fat32_file_idx;
+                m.inode = desc.inode_id;
+            },
+            .none => unreachable,
+        }
+        meta = m;
+    }
+
     // v53.2: reject overflow-inducing length values
     if (length > 0xFFFFFFFF_FFFFF000) return -12; // ENOMEM
     const num_pages = (length + user_space.PAGE_SIZE - 1) / user_space.PAGE_SIZE;
@@ -389,54 +528,45 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
         }
     }
 
-    if (!is_fixed and !canTrackMmapRegion(cur, base, num_pages)) return -12;
+    if (!is_fixed and !canTrackMmapRegion(cur, base, num_pages, meta == null)) return -12;
 
-    // Allocate and map pages
-    const writable = (prot & 2) != 0;
-    const executable = (prot & 4) != 0;
-    const map_flags = paging_mod.MapFlags{
-        .writable = writable,
-        .user = true,
-        .no_execute = !executable,
-        .global = false,
-    };
-
-    var mapped: u64 = 0;
-    while (mapped < num_pages) : (mapped += 1) {
-        const virt = base + mapped * user_space.PAGE_SIZE;
-        const phys = pmm_mod.allocPage() orelse {
-            unmapRange(cur, base, mapped);
-            return -12;
+    if (meta == null) {
+        // Anonymous: allocate and map zeroed pages eagerly (unchanged).
+        const writable = (prot & 2) != 0;
+        const executable = (prot & 4) != 0;
+        const map_flags = paging_mod.MapFlags{
+            .writable = writable,
+            .user = true,
+            .no_execute = !executable,
+            .global = false,
         };
-        // Zero the page (security: don't leak kernel data)
-        const page_ptr: [*]u8 = @ptrFromInt(hhdm_mod.physToVirt(phys));
-        @memset(page_ptr[0..user_space.PAGE_SIZE], 0);
 
-        // For file-backed mappings, read file content into the page
-        if (!is_anonymous) {
-            const file_offset = offset + mapped * user_space.PAGE_SIZE;
-            const remaining: u64 = if (offset + length > file_offset) (offset + length - file_offset) else 0;
-            if (remaining > 0) {
-                const to_read: usize = @intCast(@min(remaining, user_space.PAGE_SIZE));
-                const fd_u32: u32 = @intCast(fd);
-                if (fd_u32 < cur.fd_table.fds.len) {
-                    const saved_off = cur.fd_table.fds[fd_u32].offset;
-                    cur.fd_table.fds[fd_u32].offset = file_offset;
-                    _ = cur.fd_table.read(fd_u32, page_ptr, to_read);
-                    cur.fd_table.fds[fd_u32].offset = saved_off;
-                }
-            }
+        var mapped: u64 = 0;
+        while (mapped < num_pages) : (mapped += 1) {
+            const virt = base + mapped * user_space.PAGE_SIZE;
+            const phys = pmm_mod.allocPage() orelse {
+                unmapRange(cur, base, mapped);
+                return -12;
+            };
+            // Zero the page (security: don't leak kernel data)
+            const page_ptr: [*]u8 = @ptrFromInt(hhdm_mod.physToVirt(phys));
+            @memset(page_ptr[0..user_space.PAGE_SIZE], 0);
+
+            paging_mod.mapPage(cur.page_table_phys, virt, phys, map_flags) catch {
+                pmm_mod.freePage(phys);
+                unmapRange(cur, base, mapped);
+                return -12;
+            };
         }
-
-        paging_mod.mapPage(cur.page_table_phys, virt, phys, map_flags) catch {
-            pmm_mod.freePage(phys);
-            unmapRange(cur, base, mapped);
-            return -12;
-        };
+    } else if (meta.?.kind == .ext2) {
+        // The mapping is known to succeed: retain the ext2 open slot so the
+        // fault path can read after close(fd). Balanced by
+        // releaseRegionBacking on untrack and releaseFileRefs on exit/exec.
+        ext2.retainFile(meta.?.idx);
     }
 
-    // Track the mapping region for munmap
-    trackMmapRegion(cur, base, num_pages);
+    // Track the mapping region for munmap (records backing metadata for G2).
+    trackMmapRegion(cur, base, num_pages, meta);
 
     // The break is deliberately left alone. Dragging it up to cover mmap
     // placements made brk(2) report a break spanning memory it does not own, and
@@ -502,6 +632,10 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
                 }
                 return @bitCast(old_addr);
             }
+            // G2: growing or moving a file-backed region is unsupported —
+            // moveMapping would substitute zero pages for never-faulted file
+            // pages, and a grown tail has no backing file content.
+            if (r.file_kind != 0) return -12; // ENOMEM
             if ((mflags & MREMAP_FIXED) != 0) return moveOrNoMem(cur, r, old_pages, new_pages, mflags, new_addr_hint);
 
             // Grow: map new pages in the virtual range [old_addr + old_pages*PAGE, ...)
@@ -556,6 +690,8 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
 
     for (&cur.mmap_regions) |*r| {
         if (!r.active or r.base != old_addr) continue;
+        // G2: see the grow/move guard in the main loop above.
+        if (r.file_kind != 0) return -12; // ENOMEM
         return moveOrNoMem(cur, r, old_pages, new_pages, mflags, new_addr_hint);
     }
     return -22; // EINVAL: old_addr not found

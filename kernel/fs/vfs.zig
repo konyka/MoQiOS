@@ -46,6 +46,7 @@ pub const FdType = enum(u8) {
     udp_socket = 15,
     inotify = 16,
     raw_socket = 17,
+    kmsg = 18,
 };
 
 pub const PIPE_BUF_SIZE: u32 = 4096;
@@ -323,6 +324,20 @@ pub const FdTable = struct {
                 };
                 return @intCast(slot);
             }
+        }
+
+        // /dev/kmsg — read-only view of the kernel log ring (G4)
+        if (name.len == 9 and name[0] == '/' and name[1] == 'd' and name[2] == 'e' and name[3] == 'v' and name[4] == '/' and
+            name[5] == 'k' and name[6] == 'm' and name[7] == 's' and name[8] == 'g')
+        {
+            self.fds[slot] = .{
+                .fd_type = .kmsg,
+                // offset is the absolute ring cursor; 0 = oldest available.
+                .offset = 0,
+                .writable = false,
+                .status_flags = status,
+            };
+            return @intCast(slot);
         }
 
         // tmpfs: paths starting with /tmp/
@@ -647,6 +662,12 @@ pub const FdTable = struct {
                 desc.offset += to_copy;
                 return @intCast(to_copy);
             },
+            .kmsg => {
+                const klog = @import("../klog.zig");
+                const res = klog.kmsgRead(desc.offset, buf[0..count]);
+                desc.offset = res.new_pos;
+                return @intCast(res.n);
+            },
             .inotify => return -1, // inotify uses read via special syscall path
             .raw_socket => {
                 // Raw socket: receive raw ethernet frame
@@ -727,6 +748,7 @@ pub const FdTable = struct {
             },
             .timerfd => return -1, // timerfd is read-only
             .random => return -1, // random is read-only
+            .kmsg => return -1, // kmsg is read-only
             .tmpfs_file => {
                 if (!desc.writable) return -1;
                 if ((desc.status_flags & 0x400) != 0) desc.offset = desc.file_size;
@@ -811,6 +833,13 @@ pub const FdTable = struct {
                 return @intCast(to_copy);
             },
             .random => return -29, // ESPIPE - /dev/urandom doesn't support offset
+            .kmsg => {
+                // pread on /dev/kmsg: offset is an absolute ring cursor
+                // (0 = oldest available); the fd's own offset is untouched.
+                const klog = @import("../klog.zig");
+                const res = klog.kmsgRead(offset, buf[0..count]);
+                return @intCast(res.n);
+            },
         }
     }
 
@@ -829,6 +858,7 @@ pub const FdTable = struct {
             .epoll, .eventfd, .timerfd, .inotify => return -29, // ESPIPE
             .ramdisk_file => return -1, // ramdisk is read-only
             .random => return -29, // ESPIPE
+            .kmsg => return -1, // kmsg is read-only
             .proc_file => return -1, // proc files are read-only
             .fat32_file => {
                 if (!desc.writable) return -9; // EBADF

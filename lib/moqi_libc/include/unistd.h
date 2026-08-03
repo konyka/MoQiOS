@@ -24,6 +24,11 @@
 #define SEEK_CUR 1
 #define SEEK_END 2
 
+/* Process environment, initialised by crt0 from the kernel's initial
+ * stack (System V layout: envp array follows the NULL-terminated argv
+ * array). NULL/empty when the kernel passed no environment. */
+extern char **environ;
+
 struct timespec {
     long tv_sec;
     long tv_nsec;

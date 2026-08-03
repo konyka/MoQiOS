@@ -1,7 +1,8 @@
 #include <stdio.h>
 #include <unistd.h>
 
-int main(void) {
+int main(int argc, char **argv, char **envp) {
+    (void)argc; (void)argv; (void)envp;
     print("hello10: fork+execve test\n");
 
     long pid = fork();

@@ -16,4 +16,9 @@ void exit(int code) __attribute__((noreturn));
 
 int atoi(const char *s);
 
+/* getenv walks the process environment (environ, set by crt0 from the
+ * initial stack) without any syscall. Returns a pointer into the
+ * environ entry (do not free), or NULL if name is not present. */
+char *getenv(const char *name);
+
 #endif /* MOQI_STDLIB_H */

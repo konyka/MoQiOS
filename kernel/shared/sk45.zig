@@ -29,7 +29,7 @@ pub fn announce() void {
     const argv = [_][]const u8{ "init", "-v" };
     const entry: u64 = 0x40_1000;
 
-    const sp = user_stack.buildUserStack(phys, stack_top, argv[0..], .{
+    const sp = user_stack.buildUserStack(phys, stack_top, argv[0..], &.{}, .{
         .phdr_addr = 0x40_0040,
         .phnum = 2,
         .entry = entry,

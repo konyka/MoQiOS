@@ -283,6 +283,14 @@ fn reclaimScanPass(pml4_phys: u64, target: u32) u32 {
                     }
 
                     // Candidate for swap-out
+                    // G2: skip shared frames — COW clones and file-backed
+                    // (page-cache/tmpfs) mappings hold references beyond the
+                    // page table's own. Swapping one would write file content
+                    // to swap and strand the other owners' references; a
+                    // clean file page can simply be re-faulted from its
+                    // backing store instead.
+                    if (pmm.getRefCount(pte & 0xFFFF_FFFF_F000) > 1) continue;
+
                     const virt_addr = (@as(u64, pml4_idx) << 39) |
                         (@as(u64, pdpt_idx) << 30) |
                         (@as(u64, pd_idx) << 21) |

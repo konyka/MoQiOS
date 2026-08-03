@@ -317,6 +317,13 @@ pub fn send(target_ep: EndpointId, msg: *const Message) IpcError {
     // leaves a running task flagged blocked. Lock must be released first
     // (same pattern as receive()).
     sched.forceReschedule();
+
+    // The message is already queued, so delivery is guaranteed regardless —
+    // but a fatal signal must still kill the sender, and an actionable one
+    // reports EINTR. (.timeout is -4 == -EINTR.)
+    const sig_mod = @import("../proc/signal.zig");
+    if (sig_mod.pendingFatal(sender_task)) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
+    if (sig_mod.pendingActionable(sender_task)) return .timeout;
     return .success;
 }
 
@@ -429,6 +436,13 @@ pub fn call(target_ep: EndpointId, msg: *Message) IpcError {
     // Actually yield the CPU — marking the task .blocked without rescheduling
     // leaves a running task flagged blocked. No lock is held here.
     sched.forceReschedule();
+
+    // Woken by reply() or by a signal kick. Reply delivery is tracked by
+    // reply_to/call_depth rather than a payload, so a signal-kicked caller
+    // simply dies on a fatal signal or reports EINTR. (.timeout is -4.)
+    const sig_mod = @import("../proc/signal.zig");
+    if (sig_mod.pendingFatal(caller_task)) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
+    if (sig_mod.pendingActionable(caller_task)) return .timeout;
 
     return .success;
 }

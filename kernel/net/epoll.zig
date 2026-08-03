@@ -407,6 +407,9 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32) u32 {
         .random => {
             revents |= EPOLLIN;
         },
+        .kmsg => {
+            revents |= EPOLLIN;
+        },
         .tmpfs_file => {
             revents |= EPOLLIN | EPOLLOUT;
         },

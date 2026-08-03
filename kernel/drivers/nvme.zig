@@ -6,6 +6,7 @@
 ///   - Admin Queue + I/O Submission/Completion Queue pairs (depth 64)
 ///   - Identify Controller / Identify Namespace
 ///   - NVMe Read/Write commands using PRP entries
+///   - Dataset Management (TRIM/deallocate) when ONCS bit 2 is set
 ///   - Integration with block_dev abstraction layer
 ///
 /// Limitations:
@@ -50,6 +51,7 @@ const NVME_CMD_CREATE_CQ = 0x05;
 const NVME_CMD_IDENTIFY = 0x06;
 const NVME_CMD_WRITE = 0x01;
 const NVME_CMD_READ = 0x02;
+const NVME_CMD_DSM = 0x09; // Dataset Management (NVM I/O command)
 
 // ─── NVMe Queue Constants ────────────────────────────────────────────────
 
@@ -119,8 +121,21 @@ const IdentifyController = extern struct {
     cqes: u8, // CQ Entry Size (bits 7:4 = max, 3:0 = min)
     rsvd3: [2]u8,
     nn: u32, // Number of Namespaces
-    rsvd4: [156]u8,
+    oncs: u16, // Optional NVM Command Support (byte 520; bit 2 = Dataset Mgmt)
+    rsvd4: [154]u8,
 };
+
+// ─── NVMe Dataset Management Range (16 bytes, NVM spec fig. "Dataset ──────
+// Management — Range Definition") ─────────────────────────────────────────
+
+const DsmRange = extern struct {
+    cattr: u32, // Context Attributes (0 = no attribute)
+    len: u32, // Length in logical blocks
+    slba: u64, // Starting LBA
+};
+
+const DSM_ATTR_DEALLOCATE: u32 = 1 << 2; // CDW11 bit 2 (AD)
+const ONCS_DSM: u16 = 1 << 2; // ONCS bit 2: Dataset Management command
 
 // ─── NVMe Identify Namespace Data (partial) ──────────────────────────────
 
@@ -219,6 +234,7 @@ var admin_lock: IrqSpinlock = .{};
 var nsid: u32 = 1; // Active namespace ID
 var lba_size: u32 = 512; // Logical Block Size
 var total_lbas: u64 = 0; // Total LBAs in namespace
+var trim_supported: bool = false; // ONCS bit 2: Dataset Management (TRIM)
 var doorbell_stride: u32 = 0; // Doorbell stride (in bytes)
 var sq_entry_size: u32 = 64; // SQES
 var cq_entry_size: u32 = 16; // CQES
@@ -516,6 +532,12 @@ pub fn init() void {
     serial.writeString("[NVMe] Namespaces: ");
     fmt.writeDecimal(id_ctrl.nn);
     serial.writeString("\n");
+
+    // Dataset Management (TRIM/deallocate) support: ONCS bit 2 (G5).
+    trim_supported = (id_ctrl.oncs & ONCS_DSM) != 0;
+    if (trim_supported) {
+        serial.writeString("[NVMe] TRIM supported\n");
+    }
 
     // Create I/O queue pairs (v52.4: negotiate via Set Features first)
     // NVMe spec requires Set Features (Feature ID 0x07) to request queue count
@@ -1252,4 +1274,51 @@ pub fn writeSectors(lba: u64, count: u32, buf: [*]const u8) i32 {
         return -1;
     }
     return @intCast(count);
+}
+
+// ─── TRIM (Dataset Management, G5) ───────────────────────────────────────
+
+pub fn isTrimSupported() bool {
+    return trim_supported;
+}
+
+/// Deallocate (TRIM) `count` LBAs starting at `lba` via a Dataset Management
+/// command (opcode 0x09) on a regular I/O queue — same channel-ownership path
+/// as read/write (one command in flight per queue keeps the range-list page
+/// stable while the controller DMAs it). Returns 0 on success, -1 on error
+/// or when the controller lacks DSM support.
+pub fn trimSectors(lba: u64, count: u32) i32 {
+    if (!enabled or !trim_supported) return -1;
+    if (count == 0) return 0;
+    const q = selectQueue();
+
+    acquireChannel(q);
+    defer releaseChannel(q);
+
+    // One DSM range (16 bytes) in a PMM page (DMA-safe, physically contiguous).
+    const page_phys = pmm.allocPage() orelse return -1;
+    defer pmm.freePage(page_phys);
+    const page: [*]u8 = @ptrFromInt(hhdm.physToVirt(page_phys));
+    @memset(page[0..4096], 0);
+    const ranges: *volatile DsmRange = @ptrCast(@alignCast(page));
+    ranges.cattr = 0;
+    ranges.len = count;
+    ranges.slba = lba;
+
+    var cmd = zeroCommand();
+    cmd.opcode = NVME_CMD_DSM;
+    cmd.nsid = nsid;
+    cmd.prp1 = page_phys;
+    cmd.cdw10 = 0; // NR — number of ranges, 0-based (1 range)
+    cmd.cdw11 = DSM_ATTR_DEALLOCATE; // AD — deallocate
+
+    const cpl = submitIoCmd(q, &cmd) orelse return -1;
+    const status = (cpl.status >> 1) & 0x7FF;
+    if (status != 0) {
+        serial.writeString("[NVMe] TRIM error: status=0x");
+        fmt.writeHex32(status);
+        serial.writeString("\n");
+        return -1;
+    }
+    return 0;
 }

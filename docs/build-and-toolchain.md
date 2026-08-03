@@ -282,7 +282,7 @@ qemu-system-x86_64 \
 | `zig build run` | 编译并启动 QEMU 仿真 |
 | `zig build debug` | 启动 QEMU 并在 1234 端口监听 GDB（`-s -S`） |
 | `zig build test` | 在主机目标运行 `tests/main.zig` 单元测试，覆盖可脱离硬件执行的共享库逻辑 |
-| `zig build smoke` | 单核 QEMU 限时冒烟测试，串口日志需出现 init 自动序列各 PASS 标记（`hello21 done`、`hello29: PASS` … `hello41: PASS`）、序列终点 `hello42: PASS` + `hello42 done`，以及 `MoQiOS shell`；完整判定见 `tools/qemu_smoke.sh` |
+| `zig build smoke` | 单核 QEMU 限时冒烟测试，串口日志需出现 init 自动序列各 PASS 标记（`hello21 done`、`hello29: PASS` … `hello41: PASS`）、序列终点 `hello42: PASS` + `hello42 done`，以及 `MoQiOS shell`；完整判定见 `tools/qemu_smoke.sh`。此外启动早期（定时器 IRQ 使能前）会尝试一次有界 DHCP（G3），日志恰有一行大写结果标记：成功 `[DHCP] lease: a.b.c.d`，失败/无 NIC `[DHCP] no lease, static 10.0.2.15`；内部进度日志为小写 `[dhcp] ` |
 | `zig build smoke-smp` | SMP QEMU 限时冒烟测试（默认 `MOQI_SMP=2`），验证 AP 启动路径仍能跑完整个 init 测试序列；`MOQI_SMP=N` 可指定任意正整数核数 |
 | `zig build smoke-smp-matrix` | 按 `MOQI_SMOKE_MATRIX_CPUS`（默认 `"1 2 3 4 6 8"`）依次运行各核数冒烟；16 核在 TCG 下需 `MOQI_SMOKE_TIMEOUT=600` |
 | `zig build smoke-smp-stress` | 连续执行 `MOQI_SMOKE_RUNS`（默认 5）次指定核数（`MOQI_SMP`，默认 2）冒烟；捕获任务槽复用、共享内核映射和调度时序回归 |

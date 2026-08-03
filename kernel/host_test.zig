@@ -28,3 +28,7 @@ pub const ipv4 = @import("net/ipv4.zig");
 pub const ipv6 = @import("net/ipv6.zig");
 pub const tcp_util = @import("net/tcp_util.zig");
 pub const udp_util = @import("net/udp_util.zig");
+pub const filemap = @import("mm/filemap.zig");
+pub const dhcp = @import("net/dhcp.zig");
+pub const kmsg_ring = @import("lib/kmsg_ring.zig");
+pub const trim_ranges = @import("lib/trim_ranges.zig");

@@ -5,7 +5,7 @@ const idt = @import("../arch/arch.zig").interrupts;
 
 /// Prepare execve: load program, destroy old address space, set up new context.
 /// Returns the frame address for iretq tail, or null if loading fails (before destroying old AS).
-pub fn prepareExec(name_ptr: u64, argv_ptr: u64) ?u64 {
+pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
     if (name_ptr == 0 or name_ptr >= 0x0000_8000_0000_0000) return null;
 
     var name_buf: [64]u8 = undefined;
@@ -50,9 +50,32 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64) ?u64 {
         argc = 1;
     }
 
+    // Build envp array from user-space envp pointer (same rules as argv:
+    // caller's envp is authoritative; absent envp means an empty environment).
+    var envp_buffers: [16][128]u8 = undefined;
+    var envp_slices: [16][]const u8 = undefined;
+    var envc: usize = 0;
+
+    if (envp_ptr != 0 and envp_ptr < 0x0000_8000_0000_0000) {
+        for (0..16) |i| {
+            var ptr_bytes: [8]u8 = undefined;
+            const pc = copy.copyFromUser(ptr_bytes[0..], @ptrFromInt(envp_ptr + i * 8), 8);
+            if (pc < 8) break;
+            const env_ptr: u64 = @bitCast(ptr_bytes);
+            if (env_ptr == 0 or env_ptr >= 0x0000_8000_0000_0000) break;
+            const ec = copy.copyFromUser(envp_buffers[i][0..], @ptrFromInt(env_ptr), 127);
+            if (ec == 0) break;
+            envp_buffers[i][if (ec < 127) ec else 127] = 0;
+            var el: usize = 0;
+            while (el < ec and envp_buffers[i][el] != 0) : (el += 1) {}
+            envp_slices[i] = envp_buffers[i][0..el];
+            envc = i + 1;
+        }
+    }
+
     // Load the new program — if this fails, old address space is intact, caller can return error
     const loader = @import("loader.zig");
-    const result = loader.loadProgramForExec(name, argv_slices[0..argc]) orelse {
+    const result = loader.loadProgramForExec(name, argv_slices[0..argc], envp_slices[0..envc]) orelse {
         serial.writeString("[execve] failed\n");
         return null;
     };
@@ -96,6 +119,10 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64) ?u64 {
         : [cr3] "r" (result.pml4),
         : .{ .rax = true, .memory = true });
     syscall_entry.noteCr3Switch(result.pml4);
+    // G2: the old image's file mappings die with it — release their backing
+    // refs (ext2 open slots) and clear the stale region table before the old
+    // address space is destroyed.
+    @import("../mm/mmap.zig").releaseFileRefs(cur);
     if (old_pml4 != 0) user_space.destroyUserSpace(old_pml4);
     @import("../arch/arch.zig").gdt.setRsp0(getPerCpu().cpu_id, cur.kernel_stack_top);
     getPerCpu().kernel_rsp = cur.kernel_stack_top;
@@ -128,7 +155,7 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64) ?u64 {
 /// v52.0: Variant of prepareExec that takes a kernel-space path directly.
 /// Used by execveat with non-AT_FDCWD dirfd where the combined path is
 /// already resolved in kernel memory.
-pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64) ?u64 {
+pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64) ?u64 {
     const copy = @import("../mm/copy_from_user.zig");
 
     serial.writeString("[execveat] loading '");
@@ -164,8 +191,31 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64) ?u64 {
         argc = 1;
     }
 
+    // Build envp array from user-space envp pointer (same rules as argv:
+    // caller's envp is authoritative; absent envp means an empty environment).
+    var envp_buffers: [16][128]u8 = undefined;
+    var envp_slices: [16][]const u8 = undefined;
+    var envc: usize = 0;
+
+    if (envp_ptr != 0 and envp_ptr < 0x0000_8000_0000_0000) {
+        for (0..16) |i| {
+            var ptr_bytes: [8]u8 = undefined;
+            const pc = copy.copyFromUser(ptr_bytes[0..], @ptrFromInt(envp_ptr + i * 8), 8);
+            if (pc < 8) break;
+            const env_ptr: u64 = @bitCast(ptr_bytes);
+            if (env_ptr == 0 or env_ptr >= 0x0000_8000_0000_0000) break;
+            const ec = copy.copyFromUser(envp_buffers[i][0..], @ptrFromInt(env_ptr), 127);
+            if (ec == 0) break;
+            envp_buffers[i][if (ec < 127) ec else 127] = 0;
+            var el: usize = 0;
+            while (el < ec and envp_buffers[i][el] != 0) : (el += 1) {}
+            envp_slices[i] = envp_buffers[i][0..el];
+            envc = i + 1;
+        }
+    }
+
     const loader = @import("loader.zig");
-    const result = loader.loadProgramForExec(name, argv_slices[0..argc]) orelse {
+    const result = loader.loadProgramForExec(name, argv_slices[0..argc], envp_slices[0..envc]) orelse {
         serial.writeString("[execveat] failed\n");
         return null;
     };
@@ -207,6 +257,10 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64) ?u64 {
         : [cr3] "r" (result.pml4),
         : .{ .rax = true, .memory = true });
     syscall_entry.noteCr3Switch(result.pml4);
+    // G2: the old image's file mappings die with it — release their backing
+    // refs (ext2 open slots) and clear the stale region table before the old
+    // address space is destroyed.
+    @import("../mm/mmap.zig").releaseFileRefs(cur);
     if (old_pml4 != 0) user_space.destroyUserSpace(old_pml4);
     @import("../arch/arch.zig").gdt.setRsp0(getPerCpu().cpu_id, cur.kernel_stack_top);
     getPerCpu().kernel_rsp = cur.kernel_stack_top;

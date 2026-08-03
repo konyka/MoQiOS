@@ -83,6 +83,16 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.mmap_regions = parent.mmap_regions;
     child.mmap_count = parent.mmap_count;
 
+    // G2: the child inherits file-backed regions. Each ext2 region piece
+    // holds an open-slot reference (taken at mmap time); the child needs its
+    // own so the fault path survives the parent's close/exit. tmpfs/fat32/
+    // ramdisk need no retain (see mmap.zig's RegionFileMeta comments).
+    for (&child.mmap_regions) |*r| {
+        if (r.active and r.file_kind == @intFromEnum(@import("../mm/filemap.zig").FsKind.ext2)) {
+            @import("../fs/ext2.zig").retainFile(r.file_idx);
+        }
+    }
+
     // v53.6: inherit POSIX-required process attributes (credentials, umask, process group)
     child.uid = parent.uid;
     child.gid = parent.gid;

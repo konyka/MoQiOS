@@ -193,6 +193,31 @@ export fn _start() callconv(.c) noreturn {
     const net_mod = @import("net/mod.zig");
     net_mod.init();
 
+    // G3: Boot-time DHCP. Runs before timer IRQs are enabled, so discover()
+    // relies on polled RX plus its iteration backstop — bounded, boot can
+    // never hang here. On failure netif.getOurIp() keeps the QEMU user-net
+    // static fallback (10.0.2.15). Exactly one "[DHCP] " outcome line is
+    // printed (internal progress logs use lowercase "[dhcp] ") so the smoke
+    // gate can match it deterministically.
+    {
+        const nic = @import("net/nic.zig");
+        const dhcp = @import("net/dhcp.zig");
+        if (nic.isActive() and dhcp.discover()) {
+            const ip = dhcp.getIp();
+            serial.writeString("[DHCP] lease: ");
+            fmt.writeDecimal(ip[0]);
+            serial.writeString(".");
+            fmt.writeDecimal(ip[1]);
+            serial.writeString(".");
+            fmt.writeDecimal(ip[2]);
+            serial.writeString(".");
+            fmt.writeDecimal(ip[3]);
+            serial.writeString("\n");
+        } else {
+            serial.writeString("[DHCP] no lease, static 10.0.2.15\n");
+        }
+    }
+
     // ext2 filesystem (on first virtio-blk disk at LBA offset 32768)
     const ext2 = @import("fs/ext2.zig");
     ext2.init();

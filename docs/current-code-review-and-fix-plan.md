@@ -1571,6 +1571,27 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 ---
 
+### 6.7 基础设施补完·第三轮（2026-08-03）
+
+性能优先、安全可靠、全程 TDD（host 单测红→绿 → hello45-47 运行时测试 → smoke 门槛 → 文档 → 独立提交）。
+
+| 阶段 | 内容 | 验证 |
+|---|---|---|
+| G1 | libc argc/argv/envp：内核 `buildUserStack` 修复 envp 字符串缺失与对齐 pad 位置（argv/envp 恒连续），execve 透传 envp；crt0 解析 SysV 初始栈调 `main(argc,argv,envp)` + `environ` + libc `getenv`；hello45 端到端验证 | hello45 PASS |
+| G2 | **文件映射 mmap MAP_PRIVATE（本轮性能核心）**：mmap 只记录后备元数据，缺页按需供给——tmpfs/page_cache 帧零拷贝共享（只读 + COW 位），写入走既有 handleCowFault 私有复制；越 EOF 整页 SIGSEGV、部分页尾部清零；page_cache 驱逐跳过 refcount>1 帧（防复用活帧）；ext2 槽位 retain/release 对称；fork/exec 元数据随行。ramdisk 因非 PMM 内存改为私有副本（文档注明）。纯逻辑抽 `kernel/mm/filemap.zig` 入 host 单测 | hello46 PASS |
+| G3 | 引导时 DHCP：`main.zig` 在 NIC 初始化后 `dhcp.discover()`，修复引导期（中断未开）tick 不走导致的死等（5M 迭代兜底）；`[DHCP] lease: x.x.x.x` / `[DHCP] no lease, static` 唯一标记行（内部日志降小写） | smoke 门槛含 `[DHCP] ` |
+| G4 | klog 64KiB 环形缓冲（IrqSpinlock，ISR 安全，整行淘汰）+ `/dev/kmsg` 只读 fd（每 fd 独立游标）；纯逻辑 `kernel/lib/kmsg_ring.zig` host 单测 9 项；为将来 syslogd 奠基 | hello47 PASS |
+| G5 | TRIM/discard：NVMe Dataset Management（ONCS 探测，I/O 队列通道所有权路径）、virtio-blk DISCARD（特性位探测，无则 no-op）、AHCI 复用既有 trim；`block_dev.discard` 统一路由；fat32/ext2 释放簇/块时批量合并后下发（`kernel/lib/trim_ranges.zig` host 单测 7 项） | fs 写删测试无回归 |
+| G6 | `ipc.zig` send/call 阻塞路径补 EINTR（pendingFatal/pendingActionable） | smoke |
+
+**调试记录**：① DHCP 引导即 panic "incorrect alignment"——`receiveOffer/receiveAck` 把 `align(1)` 栈数组 @ptrCast 为 extern struct 指针（该路径此前从未在 x86 引导运行过），缓冲区按 `@alignOf(DhcpPacket)` 对齐修复；② hello46 初版测试在 EOF 前 1 字节处 pread 4 字节并期望返回 4——内核短读语义正确，修正测试期望为 1。
+
+**验证**：`zig build`（x86_64/riscv64/aarch64）+ `zig build test`（新增 filemap/kmsg_ring/trim_ranges/dhcp 单测）+ QEMU smoke SMP=1/SMP=4 全绿（hello45/46/47、`[DHCP]` 已入门槛）。
+
+**仍遗留**：MAP_SHARED 写回（mmap 当前拒绝 EOPNOTSUPP）；mremap 文件区域仅支持收缩；内核态 copy_to_user 不触发文件缺页；PCID/2MB 大页/servers 服务化/drivers 用户态驱动为后续候选；slirp ARP 抖动为环境问题。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:

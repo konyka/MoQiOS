@@ -240,6 +240,24 @@ pub const MmapRegion = struct {
     active: bool = false,
     /// Whether this region is mlock'd (non-swappable).
     locked: bool = false,
+
+    // ─── G2: file-backed (MAP_PRIVATE) metadata ───
+    // All zero = anonymous region, so existing initialisers are unaffected.
+    /// Backing store kind (filemap.FsKind as u8); 0 = anonymous.
+    file_kind: u8 = 0,
+    /// PROT_READ/WRITE/EXEC bits captured at mmap; demand faults synthesise
+    /// page permissions from this.
+    prot: u8 = 0,
+    /// Byte offset in the file that corresponds to `base`.
+    file_offset: u64 = 0,
+    /// File size snapshot taken at mmap time — drives the EOF/SIGSEGV rule.
+    file_size: u64 = 0,
+    /// FS open slot: ext2_file_idx / fat32_file_idx / tmpfs entry index.
+    file_idx: u32 = 0,
+    /// ramdisk: kernel-virtual data pointer. tmpfs: ctime generation tag.
+    file_data: u64 = 0,
+    /// Page-cache key (ext2/fat32).
+    inode_id: u64 = 0,
 };
 
 pub const MAX_TASKS: u32 = 64;
@@ -728,6 +746,9 @@ pub fn reapZombies() u32 {
         }
 
         if (t.page_table_phys != 0) {
+            // G2: release file-region backing refs before the address space
+            // (destroyUserSpace walks page tables, not region metadata).
+            @import("../mm/mmap.zig").releaseFileRefs(t);
             @import("../mm/user_space.zig").destroyUserSpace(t.page_table_phys);
         }
         freeKernelStack(t.kernel_stack);
@@ -980,6 +1001,8 @@ pub fn waitpid(parent_idx: u32, pid: i32, status: *i32) ?u32 {
             status.* = t.exit_code;
             const child_tid = t.tid;
             if (t.page_table_phys != 0) {
+                // G2: release file-region backing refs before the address space.
+                @import("../mm/mmap.zig").releaseFileRefs(t);
                 @import("../mm/user_space.zig").destroyUserSpace(t.page_table_phys);
             }
             freeKernelStack(t.kernel_stack);

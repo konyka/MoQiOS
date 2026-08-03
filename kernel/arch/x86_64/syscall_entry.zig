@@ -1493,6 +1493,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 // Equivalent to execve(pathname, argv, envp) — delegate
                 frame.rdi = frame.rsi; // pathname
                 frame.rsi = frame.rdx; // argv
+                frame.rdx = frame.r10; // envp
                 syscallExecve(frame);
                 return;
             }
@@ -2581,9 +2582,9 @@ fn syscallFork(frame: *SyscallFrame) void {
     frame.rax = @bitCast(fork_mod.fork(frame));
 }
 
-/// Syscall #59: execve(filename) — replace current process with new program
+/// Syscall #59: execve(filename, argv, envp) — replace current process with new program
 fn syscallExecve(frame: *SyscallFrame) void {
-    const frame_addr = execve_mod.prepareExec(frame.rdi, frame.rsi) orelse {
+    const frame_addr = execve_mod.prepareExec(frame.rdi, frame.rsi, frame.rdx) orelse {
         frame.rax = @bitCast(errno.EPERM);
         return;
     };
@@ -2658,7 +2659,7 @@ fn execveatWithDirfd(frame: *SyscallFrame, dirfd: i32) void {
 
     // v52.4: absolute pathname — dirfd is ignored per POSIX/Linux semantics
     if (rlen > 0 and rel_buf[0] == '/') {
-        const frame_addr = execve_mod.prepareExecWithKernelPath(rel_buf[0..rlen], frame.rdx) orelse {
+        const frame_addr = execve_mod.prepareExecWithKernelPath(rel_buf[0..rlen], frame.rdx, frame.r10) orelse {
             frame.rax = @bitCast(@as(i64, -13));
             return;
         };
@@ -2693,7 +2694,7 @@ fn execveatWithDirfd(frame: *SyscallFrame, dirfd: i32) void {
         return;
     };
 
-    const frame_addr = execve_mod.prepareExecWithKernelPath(path, frame.rdx) orelse {
+    const frame_addr = execve_mod.prepareExecWithKernelPath(path, frame.rdx, frame.r10) orelse {
         frame.rax = @bitCast(@as(i64, -13));
         return;
     };

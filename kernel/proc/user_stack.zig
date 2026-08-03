@@ -45,18 +45,24 @@ pub const StackInfo = struct {
 ///
 /// Stack layout (high address to low, SP points at argc):
 ///   [string area: argv strings, env strings]  ← bottom of stack page
-///   ... padding to 16-byte alignment ...
 ///   AT_NULL entry (16 bytes)
 ///   auxv entries (16 bytes each)
+///   ... alignment pad (0 or 1 slot, keeps SP 16-byte aligned) ...
 ///   NULL (envp terminator, 8 bytes)
-///   envp pointers (8 bytes each, currently none)
+///   envp pointers (8 bytes each)
 ///   NULL (argv terminator, 8 bytes)
 ///   argv[0..argc-1] pointers (8 bytes each)
 ///   argc (8 bytes)                             ← SP
+///
+/// argv and envp are contiguous from SP: envp == &argv[argc + 1]. The
+/// alignment pad (when needed) sits between the envp terminator and the
+/// auxv, never between argv and envp, so user-space crt0 can parse both
+/// arrays unconditionally.
 pub fn buildUserStack(
     stack_phys: u64,
     stack_top: u64,
     argv: []const []const u8,
+    envp: []const []const u8,
     info: StackInfo,
 ) u64 {
     // Access the stack page via HHDM
@@ -66,6 +72,7 @@ pub fn buildUserStack(
     // Phase 1: Write string data at the bottom of the stack page.
     var str_offset: u64 = 0;
     var argv_offsets: [16]u64 = @splat(0);
+    var envp_offsets: [16]u64 = @splat(0);
 
     for (argv, 0..) |arg, i| {
         if (i >= 16) break;
@@ -76,6 +83,16 @@ pub fn buildUserStack(
         str_offset += 1;
     }
     const argc = @min(argv.len, @as(usize, 16));
+
+    for (envp, 0..) |env, i| {
+        if (i >= 16) break;
+        envp_offsets[i] = str_offset;
+        @memcpy(page_base[str_offset .. str_offset + env.len], env);
+        str_offset += env.len;
+        page_base[str_offset] = 0;
+        str_offset += 1;
+    }
+    const nenv = @min(envp.len, @as(usize, 16));
 
     // Phase 2: Build the structure from the top of the page downward.
     // We'll compute offsets relative to the start of the page, then
@@ -139,16 +156,26 @@ pub fn buildUserStack(
         push64(&pos, page_base, AT_PHDR);
     }
 
-    // envp terminator (no env vars yet)
-    push64(&pos, page_base, 0);
-
-    // Pad to ensure 16-byte alignment of final SP.
+    // Pad to ensure 16-byte alignment of final SP. The pad sits between
+    // the envp terminator and the auxv so argc/argv/envp stay contiguous
+    // from SP upwards.
     {
-        const remaining_pushes: u64 = argc + 2;
+        const remaining_pushes: u64 = argc + 2 + nenv + 1;
         const final_pos = pos - remaining_pushes * 8;
         if (final_pos % 16 != 0) {
             push64(&pos, page_base, 0);
         }
+    }
+
+    // envp terminator
+    push64(&pos, page_base, 0);
+
+    // envp pointers (in reverse order)
+    var ei: usize = nenv;
+    while (ei > 0) {
+        ei -= 1;
+        const env_user_addr: u64 = stack_top - page_size + envp_offsets[ei];
+        push64(&pos, page_base, env_user_addr);
     }
 
     // argv terminator

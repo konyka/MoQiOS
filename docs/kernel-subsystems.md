@@ -27,6 +27,7 @@
 9. [SMP 多核](#9-smp-多核)
 10. [子系统依赖关系](#10-子系统依赖关系)
 11. [Arch 抽象层](#11-arch-抽象层)
+12. [调试与日志](#12-调试与日志)
 
 实现状态图例: ✅ 完整 / ⚠️ 部分 / 🧩 框架
 
@@ -176,7 +177,8 @@ const AddressSpace = struct {
 - 支持 MAP_FIXED 强制指定地址
 - 64条VMA表管理用户态映射区
 - 配套 munmap 解除映射和 msync 同步脏页
-- syscall mmap: 支持匿名映射 + 文件映射 (MAP_PRIVATE)，读取文件内容到物理页
+- syscall mmap: 支持匿名映射 + 文件映射 (MAP_PRIVATE)；G2 起文件映射改为
+  页缓存支撑的按需分页 + 零拷贝 COW，详见 1.8.1
 
 **用户地址空间布局**（两种镜像不同，范围校验必须区分）:
 
@@ -201,6 +203,52 @@ const AddressSpace = struct {
   无条件采纳会让进程用 `mmap(&_start, ...)` 覆盖掉正在执行的代码页。
 - 运行时覆盖: `hello30`（brk 增长/清零/收缩 + 匿名 mmap + hint 让位），
   冒烟门禁标记 `hello30: brk/mmap PASS`。
+
+### 1.8.1 文件映射按需分页（G2，MAP_PRIVATE 零拷贝 + COW）✅
+
+文件: `mm/filemap.zig`（纯逻辑，host 可测）, `mm/mmap.zig`, `arch/x86_64/idt.zig`（`handleFileFault`）,
+`fs/page_cache.zig`（`getPageFrame` + 驱逐保护）, `fs/tmpfs.zig`（`tmpfsGetMapPage`/`tmpfsGetCtime`）
+
+G2 之前的文件 mmap 在建映射时把文件内容**即时读入**新分配的物理页；G2 改为真正的按需分页：
+`mmap()` 只做校验并把后备元数据记入 `Task.mmap_regions`（`MmapRegion` 新增
+`file_kind/prot/file_offset/file_size/file_idx/file_data/inode_id` 字段，全零 = 匿名，老初始化器不受影响），
+不触碰页表；首次访问触发 #PF，由 `handleFileFault` 按 `filemap.planFault` 决定行为。
+
+- **校验**：offset 必须页对齐（否则 EINVAL）；fd 必须是常规文件
+  （ramdisk/tmpfs/ext2/fat32，管道/socket/特殊文件 ENODEV）；O_WRONLY 打开返回 EBADF；
+  文件映射的 MAP_SHARED 本轮拒绝（EOPNOTSUPP，写回留待下轮）。
+- **EOF 语义**：整页越过 EOF 的访问 → SIGSEGV（Linux 是 SIGBUS，本内核统一 SEGV，状态码 139）；
+  最后一个部分页正常供给，尾部清零。`file_size` 取 mmap 时的快照。
+- **零拷贝共享帧**：tmpfs 直接映射其数据页；ext2/fat32 经 page_cache
+  （命中 `getPageFrame` 直接拿物理帧；未命中先 `readFile` 填充缓存再取）。
+  共享帧一律先 `pmm.addRef` 再以"只读 + COW 位(bit9)"映射——即使 PROT_WRITE，
+  首次写入落入既有 `handleCowFault` 复制路径，文件内容永远不被 MAP_PRIVATE 写污染。
+- **引用计数规则（最容易错的记账点）**：帧的所有者（page_cache 槽位 / tmpfs 条目）
+  持有一个 ref，每个映射它的地址空间各加一个 ref。`unmapRange`/`destroyUserSpace`
+  的 freePage 本质是 decRef，因此**永远不会**把缓存/文件系统仍持有的帧放回空闲池；
+  反过来，缓存驱逐（`removePage` 的 freePage）也只是 decRef，映射侧的帧不会被抽走。
+  page_cache 的 clock 驱逐**跳过 refcount > 1 的槽位**——否则 `removePageKeepPhys`
+  会把仍被用户映射的活帧重复利用给新文件页。
+- **ramdisk 例外**：Limine 模块内存不属于 PMM，无法引用计数，直接共享会让 unmap
+  把它喂给空闲池，因此 ramdisk 页在缺页时复制为私有页（仍是按需加载，只是非零拷贝）。
+- **ext2 打开槽位寿命**：故障路径用 `readFile(file_idx)` 读盘，因此 mmap 成功时
+  `ext2.retainFile` 持有一份引用，`untrackMmapRange`（区域撤销/拆分）与
+  `mmap.releaseFileRefs`（task 回收、execve 换镜像前）对称释放；fork 为子进程的
+  ext2 区域补一次 retain。fat32 槽位 close 后不释放，无需 retain；tmpfs 用
+  `ctime` 当代数标签（`tmpfsGetMapPage` 校验），条目被 unlink+回收后旧映射只会
+  拿到零页而**不会**拿到复用槽位里别的文件的数据。
+- **swap 交互**：`reclaimScanPass` 跳过 refcount > 1 的帧（COW 共享页与文件后备页），
+  干净文件页本就可从后备存储重新缺页，无需占用交换槽。
+- **已知限制**：mremap 对文件区域仅支持收缩（增长/移动返回 ENOMEM——移动会把
+  未缺页的文件页换成零页）；mprotect 只改已映射 PTE，不更新区域 prot 元数据；
+  内核态 `copy_to_user` 对未缺页的文件映射返回 EFAULT（无内核态按需分页）；
+  同一地址空间多线程并发缺同一文件页时后写 PTE 者胜出（与既有匿名按需分页同级竞态）。
+- **运行时覆盖**：`user/hello46.c`（tmpfs 文件写模式串 → MAP_PRIVATE 映射 →
+  close(fd) 后验证内容 → 尾部清零 → 写穿透后 pread 验证文件不变（COW）→
+  fork 子进程缺页继承区域 + 越过 EOF 整页 SIGSEGV(139)），
+  门禁标记 `hello46: PASS` / `hello46 done`。
+- **Host 单测**：`tests/main.zig` 末尾 `// ─── file mmap (G2) ───` 块
+  （区域查找、EOF 钳制、权限/PTE 合成、offset 校验、head-trim 偏移推进、合并规则）。
 
 ### 1.9 Swap 页面置换 (Clock算法 + u64位图分配 + 256MB swap) ✅
 
@@ -556,6 +604,9 @@ const FdTable = struct {
 - 全局 `fs_lock`（IrqSpinlock）串行化文件系统操作；文件数据写回经 `fs/writeback.zig`
   按稳定 inode 标识（而非打开文件句柄）缓冲，多毫秒级延迟刷盘由专用 writeback 内核线程
   （`vfs.zig` `writebackThreadMain`，调度 tick 唤醒等待队列）执行
+- TRIM (G5)：`deleteFile` / `truncateFile` 的簇链释放循环把每个释放的簇记入
+  discard 积攒缓冲，循环结束后经 `trim_ranges.coalesce` 合并为最大连续范围
+  批量调用 `block_dev.discard`
 
 ### 3.4 Ext2 ✅ 64 条目块缓存 + 哈希加速 + 间接块缓存
 
@@ -579,6 +630,10 @@ const FdTable = struct {
 - 目录条目读写
 - 多级路径解析（`resolveParent`）
 - 操作: `readFile` / `writeFile` / `createFile` / `createDir` / `unlinkFile` / `listDirInode` / `truncate`
+- TRIM (G5)：`freeBlock` 把释放的数据块记入 discard 积攒缓冲（非批量时立即
+  下发；`batch_free_depth` 批量释放时在 defer 收尾统一经 `trim_ranges.coalesce`
+  合并后批量 `block_dev.discard`），覆盖 `unlinkFile` / `truncateFile` /
+  `truncateByInode` 的全部直接块与间接树释放路径
 
 ### 3.5 管道 ✅ 阻塞读写 + SIGPIPE + O_NONBLOCK + poll集成
 
@@ -774,6 +829,17 @@ e1000 (中断驱动) / virtio-net (Virtqueue)
 - **TCP 校验和**：RX 验证的伪首部 dst 在 loopback 段必须使用线上的 127/8 地址而非 `netif.getOurIp()`（`tcp.handlePacket`）
 - **getOurIp 语义不变**：DHCP/10.0.2.15 不受影响；loopback 源地址由 TX 路径就地替换
 - 运行时验证：`hello43`（单进程 TCP client+server over 127.0.0.1 + UDP 自收发）
+
+### 4.15 DHCP 客户端与启动时租约 ✅（G3）
+
+文件: `kernel/net/dhcp.zig`；集成点: `kernel/main.zig`（启动接线）、`netif.zig`（地址来源选择）
+
+- **四次握手**：DISCOVER → OFFER → REQUEST → ACK，UDP 67/68 端口；先 `udp.ensurePort(68)` 注册客户端端口，否则 UDP 分用会把 OFFER/ACK 丢掉
+- **启动时获取**：`kernel/main.zig` 在 `net_mod.init()` 之后（NIC 驱动就绪、定时器 IRQ 尚未使能）尝试一次 `dhcp.discover()`，前提 `nic.isActive()`
+- **有界性**：等待循环以 500 tick（~5s）为截止，另有 `MAX_POLL_ITERS` 迭代兜底——启动早期 tick 计数不递增（IRQ 未开），纯 tick 截止永远不会触发，迭代上限保证 boot 不会挂在 DHCP 上；RX 由 `pumpRx()` 轮询驱动，不依赖中断
+- **结果标记**：恰好一行大写 `[DHCP] ` 结果日志——成功 `[DHCP] lease: a.b.c.d`，失败 `[DHCP] no lease, static 10.0.2.15`（无 NIC 也走失败分支）；内部进度日志一律小写 `[dhcp] `，供 smoke 门确定性匹配
+- **回退语义**：`netif.getOurIp()` 仅在 `dhcp.isConfigured()` 为真时返回 DHCP 地址，否则保持 QEMU user-net 静态地址 10.0.2.15——DHCP 失败不影响 hello14/15/22/27 等静态路径
+- **host 单测**：租约状态默认值（未配置 / IP 0.0.0.0 / netmask 255.255.255.0）在 `tests/main.zig` 的 `// ─── DHCP boot (G3) ───` 块覆盖（纯全局量，无 arch 依赖）
 
 ### 4.8 Socket API ✅ 完整 BSD-like Socket 接口
 
@@ -1005,7 +1071,13 @@ const SysCap = packed struct {
 - 队列：avail/used/desc 三环
 - 中断驱动：ISR 寄存器自动清除，原子完成标志（`AtomicBool`），唤醒等待方
 - 超时 fallback：中断丢失时回退到轮询
-- 操作：READ / WRITE / FLUSH
+- 操作：READ / WRITE / FLUSH / DISCARD
+- TRIM/discard (G5)：特性协商时检查 `VIRTIO_BLK_F_DISCARD`（bit 13），
+  设备提供则在 driver features 中回写并接受；`discard(lba, count)` 经同一
+  `io_lock` 提交路径下发 `VIRTIO_BLK_T_DISCARD`(8) 请求（desc0=头部，
+  desc1=16 字节 `virtio_blk_discard_write_zeroes` 段，desc2=状态字节）。
+  设备不提供该特性时 `discard()` 为 no-op（返回 0）。QEMU 需给
+  virtio-blk 设备加 `discard=on` 才会提供该特性，默认不开启。
 
 ### 6.4 AHCI/SATA 🧩
 
@@ -1045,6 +1117,12 @@ const SysCap = packed struct {
   并唤醒），模式同 sysv_sem
 - 启动自检：MSI-X 启用后做一次中断驱动的扇区 0 读取，并校验 qemu_run.sh
   写入镜像首扇区的 "MoQiNVMe" 模式串
+- TRIM/discard (G5)：Identify Controller 的 ONCS（byte 520）bit 2 检测
+  Dataset Management 支持，支持时启动打印 `[NVMe] TRIM supported`；
+  `trimSectors(lba, count)` 在普通 I/O 队列上下发 DSM 命令（opcode 0x09，
+  CDW10=NR(0-based)、CDW11 bit2=AD/deallocate），单个 16 字节 range
+  （cattr/len/slba）放在 PMM 页内经 PRP1 传给控制器，走与读写完全相同的
+  通道所有权（acquireChannel/submitIoCmd）路径
 
 ### 6.7 PCI MSI/MSI-X (Capability List + 向量分配) ✅
 
@@ -1072,6 +1150,24 @@ const SysCap = packed struct {
 - PCI 配置: Bus Master + INTx 启用
 
 **API**: `init()` / `isActive()` / `getIrqLine()` / `handleInterrupt()` / `sendPacket()` / `receivePacket()`
+
+### 6.9 块设备抽象层 (block_dev) + TRIM 路由 ✅ (G5)
+
+文件: `block_dev.zig`, `lib/trim_ranges.zig`
+
+- `discard(lba, count)`：路由到文件系统实际所在的活动设备（virtio-blk
+  disk 0，fat32/ext2 唯一直接寻址的磁盘；无 virtio-blk 注册时回退到第一个
+  活动设备，NVMe/AHCI 路径保持可达）。目标驱动不支持 TRIM 时 no-op
+  （返回 0），I/O 错误返回 -1
+- AHCI 分支把单个范围编码为现有 `trim()` 的 8 字节打包格式（低 2 字节
+  扇区数、高 6 字节起始 LBA），超过 65535 扇区自动拆分
+- `lib/trim_ranges.zig`：纯逻辑模块（无依赖，主机可测），把文件系统
+  释放路径产出的零散 extent 排序合并成最大连续 discard 范围
+  （相邻/重叠合并、零长度丢弃），fat32/ext2 各用 64 槽静态缓冲积攒后
+  批量下发
+- 锁序：discard 与现有 FAT/位图 I/O 一样在 `fs_lock` 下执行（
+  `fs_lock` → 驱动 `io_lock`，单向）；writeback flush 规则（writeback
+  调用前释放 `fs_lock`）不适用，因为 discard 不会重入文件系统
 
 ---
 
@@ -1353,6 +1449,44 @@ pub fn shootdownRange(addr_start: u64, page_count: u32, target_cr3: u64) void
 - **x86_64 不回归**：每步保持可构建、x86_64 启动到 shell
 - **薄接口**：仅抽象「硬件相关、其余内核必须调用」的能力
 - **下一步**：逐步迁移 gdt/idt/paging 等深度模块到 arch 接口后面
+
+---
+
+## 12. 调试与日志
+
+### 12.1 klog 与 kmsg 环形缓冲区 ✅（G4）
+
+`kernel/klog.zig` 提供带级别前缀的日志接口（`log()` / `logHex()`，`setLevel()` 过滤）。
+G4 之前仅输出到串口；现在每条通过级别过滤的日志行在写串口的同时，
+追加到一个 **64 KiB 静态环形缓冲区**（`KMSG_CAP`），作为 `/dev/kmsg` 的数据源。
+
+**环形设计**（`kernel/lib/kmsg_ring.zig`，纯逻辑、无 arch 依赖、可宿主测试）：
+
+- 字节环 + 绝对流游标：`total` 记录历史追加总字节数，读游标是该流上的绝对位置；
+  过期游标（`< total - len`）自动前移到最旧可用字节。
+- 覆盖策略保留整行语义：追加放不下的行时，逐条丢弃最旧的完整行（含其 `'\n'`）
+  直到放得下；单行超过整个缓冲区时只保留尾部（必然从行中间开始）。
+- 物理回绕处 `read()` 返回短读，调用方按 `new_pos` 循环续读。
+
+**ISR 安全性**：与 `serial.zig` 同一模式 —— 环形缓冲区由 `IrqSpinlock` 保护
+（acquire 时屏蔽中断），中断上下文调用 `log()` 不会撕裂环状态；全程无分配。
+
+### 12.2 /dev/kmsg ✅（G4）
+
+VFS 新增 `FdType.kmsg`（只读特殊文件，镜像 `/dev/urandom` 的接法）：
+
+- `open("/dev/kmsg", O_RDONLY)`：fd 的 `offset` 即绝对环游标，0 = 从最旧可用字节开始。
+- `read()`：从 fd 游标拷贝并推进（per-fd 独立游标）；到最新字节返回 0（EOF）。
+- `pread()`：按给定游标读，不动 fd 自身 offset；`write()`/`pwrite()` 拒绝（只读）。
+- 运行时验证：`user/hello47.c`（读取全量并校验 `[INF] ` 前缀与
+  `=== MoQiOS scheduler active ===` 启动行、二次打开游标独立、写入被拒）。
+
+### 12.3 后续：syslogd 挂钩
+
+`servers/syslogd`（目前为空目录）将作为消费者：打开 `/dev/kmsg` 循环读取，
+按级别分流、写持久日志文件或转发 IPC 客户端。数据源已就绪 —— syslogd
+只需普通文件读取语义，无需内核侧再改动；如需不阻塞跟随（`tail -f` 式），
+可在环满/追加时通过 poll/epoll 的 `EPOLLIN` 通知扩展（当前 `.kmsg` 恒报 `EPOLLIN`）。
 
 ---
 

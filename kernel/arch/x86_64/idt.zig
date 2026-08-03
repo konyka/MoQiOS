@@ -611,7 +611,10 @@ fn handleDemandPage(frame: *InterruptFrame, fault_addr: u64) bool {
     // Code:  [USER_CODE_BASE, USER_CODE_BASE + MAX_CODE_PAGES * PAGE_SIZE)
     const in_code_range = page_addr >= user_space.USER_CODE_BASE and page_addr < user_space.USER_CODE_BASE + 16 * paging_mod.PAGE_SIZE;
 
-    if (!in_stack_range and !in_code_range) return false;
+    if (!in_stack_range and !in_code_range) {
+        // G2: demand paging for file-backed (MAP_PRIVATE) mmap regions.
+        return handleFileFault(current, page_addr);
+    }
 
     // Check if this is a swap-in (page was swapped out)
     const swap = @import("../../mm/swap.zig");
@@ -665,6 +668,152 @@ fn handleDemandPage(frame: *InterruptFrame, fault_addr: u64) bool {
 
     _ = frame;
     return true;
+}
+
+/// G2: install an exact PTE value at a not-present user address.
+///
+/// mapPage allocates any missing intermediate tables; the entry it writes is
+/// then replaced by the precise raw value (which may carry the COW marker in
+/// bit 9, not expressible through MapFlags). On failure the caller's
+/// reference on `phys` is dropped — for an addRef'd shared frame that is a
+/// plain decRef, for a freshly allocated private page it frees the page.
+fn mapRawUserPte(current: anytype, page_addr: u64, raw_pte: u64, phys: u64) bool {
+    const pmm = @import("../../mm/pmm.zig");
+    const paging_mod = @import("paging.zig");
+
+    paging_mod.mapPage(current.page_table_phys, page_addr, phys, .{
+        .writable = false,
+        .user = true,
+        .no_execute = true,
+    }) catch {
+        pmm.freePage(phys);
+        return false;
+    };
+    paging_mod.setPageEntryRaw(current.page_table_phys, page_addr, raw_pte);
+    return true;
+}
+
+/// G2: map a fresh zero-filled private page honouring the region's prot.
+/// Used for tmpfs sparse holes and stale mappings whose backing is gone.
+fn mapZeroPrivatePage(current: anytype, page_addr: u64, prot: u8) bool {
+    const pmm = @import("../../mm/pmm.zig");
+    const hhdm = @import("../../mm/hhdm.zig");
+    const filemap = @import("../../mm/filemap.zig");
+    const paging_mod = @import("paging.zig");
+
+    const phys = pmm.allocPage() orelse return false;
+    const page: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+    @memset(page[0..paging_mod.PAGE_SIZE], 0);
+    return mapRawUserPte(current, page_addr, filemap.privatePte(phys, prot), phys);
+}
+
+/// G2: demand paging for file-backed (MAP_PRIVATE) mmap regions.
+///
+/// The region metadata recorded by mmap() (task.MmapRegion) says what backs
+/// each page. Shared backing frames (page-cache, tmpfs) are mapped read-only
+/// with the COW marker after pmm.addRef — a write faults into handleCowFault
+/// which copies, so the file never sees MAP_PRIVATE writes. Pages wholly
+/// past EOF return false, which the caller turns into SIGSEGV.
+fn handleFileFault(current: anytype, page_addr: u64) bool {
+    const pmm = @import("../../mm/pmm.zig");
+    const hhdm = @import("../../mm/hhdm.zig");
+    const filemap = @import("../../mm/filemap.zig");
+    const paging_mod = @import("paging.zig");
+    const task_mod = @import("../../proc/task.zig");
+
+    const ri = filemap.findFileRegion(task_mod.MmapRegion, &current.mmap_regions, page_addr) orelse return false;
+    const region = &current.mmap_regions[ri];
+
+    // A swapped-out page takes precedence: after a COW copy the private page
+    // may have been swapped, and the swap entry still sits in the PTE.
+    const swap = @import("../../mm/swap.zig");
+    if (swap.isEnabled()) {
+        if (paging_mod.getPageEntryRaw(current.page_table_phys, page_addr)) |pte_val| {
+            if (swap.isSwapEntry(pte_val)) {
+                const new_pte = swap.swapIn(pte_val) orelse return false;
+                paging_mod.setPageEntryRaw(current.page_table_phys, page_addr, new_pte);
+                asm volatile ("invlpg (%[addr])"
+                    :
+                    : [addr] "r" (page_addr),
+                );
+                return true;
+            }
+        }
+    }
+
+    const plan = filemap.planFault(task_mod.MmapRegion, region, page_addr);
+    if (plan.action == .segv) return false; // whole page past EOF
+
+    const kind: filemap.FsKind = @enumFromInt(region.file_kind);
+    switch (kind) {
+        .none => return false,
+        .ramdisk => {
+            // Ramdisk frames are Limine module memory — not PMM-owned, so
+            // they cannot be refcounted and must never be mapped shared
+            // (unmap would feed them to the free pool). Serve a private copy.
+            const phys = pmm.allocPage() orelse return false;
+            const dst: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+            const src: [*]const u8 = @ptrFromInt(region.file_data + plan.file_off);
+            @memcpy(dst[0..plan.valid_bytes], src[0..plan.valid_bytes]);
+            if (plan.valid_bytes < 4096) {
+                @memset(dst[plan.valid_bytes..4096], 0);
+            }
+            return mapRawUserPte(current, page_addr, filemap.privatePte(phys, region.prot), phys);
+        },
+        .tmpfs => {
+            const tmpfs = @import("../../fs/tmpfs.zig");
+            const page_idx: u32 = @intCast(plan.file_off / paging_mod.PAGE_SIZE);
+            // region.file_data holds the ctime generation tag from mmap time.
+            if (tmpfs.tmpfsGetMapPage(@intCast(region.file_idx), region.file_data, page_idx)) |phys| {
+                // Zero-copy: share tmpfs's frame read-only (+COW when the
+                // mapping is writable). addRef makes our unmap a decRef, so
+                // tmpfs's own freePage can never pull the frame from under us.
+                pmm.addRef(phys);
+                return mapRawUserPte(current, page_addr, filemap.filePte(phys, plan.cow, plan.executable), phys);
+            }
+            // Sparse hole (or the file was unlinked and its slot recycled —
+            // the generation tag no longer matches): zeros, privately owned.
+            return mapZeroPrivatePage(current, page_addr, region.prot);
+        },
+        .ext2, .fat32 => {
+            const page_cache = @import("../../fs/page_cache.zig");
+            const page_off = plan.file_off / paging_mod.PAGE_SIZE;
+
+            // Cache hit: map the cached frame read-only shared (zero-copy).
+            if (page_cache.getPageFrame(region.inode_id, page_off)) |phys| {
+                pmm.addRef(phys);
+                return mapRawUserPte(current, page_addr, filemap.filePte(phys, plan.cow, plan.executable), phys);
+            }
+
+            // Cache miss: read the page from disk into a scratch frame. The
+            // read populates the page cache as a side effect, so re-check
+            // before falling back to a private copy.
+            const scratch = pmm.allocPage() orelse return false;
+            const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(scratch));
+            var n: i64 = switch (kind) {
+                .ext2 => @import("../../fs/ext2.zig").readFile(region.file_idx, @intCast(plan.file_off), buf, 4096),
+                else => @import("../../fs/fat32.zig").readFile(region.file_idx, @intCast(plan.file_off), buf, 4096),
+            };
+            if (n < 0) n = 0;
+            const got: u32 = @intCast(n);
+            if (got < 4096) @memset(buf[got..4096], 0);
+
+            // Staged writeback data (written, not yet flushed) wins over the
+            // disk image; an overlaid page must stay a private copy because
+            // the cache holds the pre-write contents.
+            const writeback = @import("../../fs/writeback.zig");
+            const wb_fs: writeback.FsType = if (kind == .ext2) .ext2 else .fat32;
+            const overlaid = writeback.readBuffered(region.inode_id, plan.file_off, buf, 4096, wb_fs);
+            if (overlaid == 0) {
+                if (page_cache.getPageFrame(region.inode_id, page_off)) |phys| {
+                    pmm.freePage(scratch);
+                    pmm.addRef(phys);
+                    return mapRawUserPte(current, page_addr, filemap.filePte(phys, plan.cow, plan.executable), phys);
+                }
+            }
+            return mapRawUserPte(current, page_addr, filemap.privatePte(scratch, region.prot), scratch);
+        },
+    }
 }
 
 /// Copy-on-Write fault handler.

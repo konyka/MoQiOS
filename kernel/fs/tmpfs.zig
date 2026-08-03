@@ -423,6 +423,33 @@ pub fn tmpfsGetSize(idx: u8) u32 {
     return entries[idx].size;
 }
 
+/// G2: ctime doubles as a generation tag for file-backed mmap regions —
+/// captured at mmap time, revalidated on every fault by tmpfsGetMapPage so a
+/// recycled slot can never serve a stale mapping the wrong file's pages.
+pub fn tmpfsGetCtime(idx: u8) u64 {
+    if (idx >= MAX_FILES) return 0;
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    if (!entries[idx].active) return 0;
+    return entries[idx].ctime;
+}
+
+/// G2: physical frame backing file page `page_idx`, for zero-copy MAP_PRIVATE
+/// mappings. Returns null for sparse holes and for stale mappings (entry gone
+/// or ctime tag mismatch). The caller must pmm.addRef() the frame before
+/// mapping it; freeEntryPages' freePage then only drops tmpfs's own
+/// reference and the frame outlives the entry while the mapping holds it.
+pub fn tmpfsGetMapPage(idx: u8, ctime: u64, page_idx: u32) ?u64 {
+    if (idx >= MAX_FILES) return null;
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    const entry = &entries[idx];
+    if (!entry.active or entry.is_dir) return null;
+    if (entry.ctime != ctime) return null;
+    if (page_idx >= PAGES_PER_FILE) return null;
+    return entry.pages[page_idx];
+}
+
 pub const TmpfsDirEntry = struct {
     name: []const u8,
     is_dir: bool,

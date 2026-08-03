@@ -213,8 +213,8 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
         phdr_addr = phoff; // file offset = virtual address for non-PIE executables
     }
 
-    // Build initial user stack with argc/argv/auxv
-    const user_rsp = buildUserStack(stack_phys, user_space.USER_STACK_TOP, &.{name}, .{
+    // Build initial user stack with argc/argv/auxv (first process: no env)
+    const user_rsp = buildUserStack(stack_phys, user_space.USER_STACK_TOP, &.{name}, &.{}, .{
         .phdr_addr = phdr_addr,
         .phnum = ehdr.e_phnum,
         .entry = ehdr.e_entry,
@@ -319,8 +319,8 @@ fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32) 
         return null;
     };
 
-    // Build initial user stack with argc/argv/auxv
-    const user_rsp = buildUserStack(stack_phys, user_space.USER_STACK_TOP, &.{name}, .{
+    // Build initial user stack with argc/argv/auxv (first process: no env)
+    const user_rsp = buildUserStack(stack_phys, user_space.USER_STACK_TOP, &.{name}, &.{}, .{
         .entry = user_space.USER_CODE_BASE,
     });
 
@@ -367,7 +367,7 @@ fn freePages(pages: *[256]?u64, count: u64) void {
     }
 }
 
-pub fn loadProgramForExec(name: []const u8, argv: []const []const u8) ?ExecResult {
+pub fn loadProgramForExec(name: []const u8, argv: []const []const u8, envp: []const []const u8) ?ExecResult {
     const file = ramdisk.findFile(name) orelse return null;
     const binary_size = file.size;
     if (binary_size == 0 or binary_size > 4 * 1024 * 1024) return null;
@@ -456,7 +456,7 @@ pub fn loadProgramForExec(name: []const u8, argv: []const []const u8) ?ExecResul
         return null;
     };
 
-    const user_rsp = buildUserStack(stack_phys, user_space.USER_STACK_TOP, argv, .{});
+    const user_rsp = buildUserStack(stack_phys, user_space.USER_STACK_TOP, argv, envp, .{});
 
     {
         serial.writeString("[loader-exec] entry=0x");

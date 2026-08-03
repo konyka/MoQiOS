@@ -48,7 +48,8 @@ static void run_test_quiet(const char *name) {
     waitpid(-1, (void *)0, 0);
 }
 
-int main(void) {
+int main(int argc, char **argv, char **envp) {
+    (void)argc; (void)argv; (void)envp;
     printf("init (pid %ld) started\n", getpid());
     print("Hello from init!\n");
 
@@ -100,6 +101,9 @@ int main(void) {
     run_test("hello42");  /* pread64/pwrite64 fd and offset regression */
     run_test("hello43");  /* TCP/UDP loopback test */
     run_test("hello44");  /* SCHED_FIFO/RR realtime scheduling classes */
+    run_test("hello45");  /* argc/argv/envp through moqi_libc crt0 */
+    run_test("hello46");  /* file-backed mmap (MAP_PRIVATE demand paging) */
+    run_test("hello47");  /* /dev/kmsg ring buffer reader */
 
     run_test("hello9");   /* fork test */
     run_test("hello10");  /* fork+execve test */

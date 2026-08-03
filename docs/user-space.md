@@ -181,18 +181,19 @@ main():
 | 路径 | 内容 |
 |---|---|
 | `include/moqi_syscalls.h` | syscall 编号常量 + `syscall0`..`syscall6` 内联封装 |
-| `include/unistd.h` | read/write/open/close/lseek/fork/execve/waitpid/_exit/pipe/dup2/yield/nanosleep/brk/sbrk 等 |
+| `include/crt0.h` | 初始栈解析（`moqi_parse_initial_stack`，头文件内联，可宿主机测试） |
+| `include/unistd.h` | read/write/open/close/lseek/fork/execve/waitpid/_exit/pipe/dup2/yield/nanosleep/brk/sbrk 等 + `extern char **environ` |
 | `include/string.h` | memcpy/memmove/memset/memcmp/strlen/strcmp/strncmp/strcpy/strncpy/strcat/strchr/strrchr |
 | `include/stdio.h` | print/puts/putchar/printf（%d %i %u %x %X %s %c %p %%，支持 l/ll；无浮点）+ snprintf/vsnprintf |
-| `include/stdlib.h` | malloc/free/calloc（brk 上的首次适配空闲链表）、exit、atoi |
+| `include/stdlib.h` | malloc/free/calloc（brk 上的首次适配空闲链表）、exit、atoi、getenv |
 | `include/ctype.h` | isdigit/isalpha/isspace/toupper 等（纯头文件） |
 | `include/signal.h` | `struct ksigaction`（匹配内核读取的 28 字节布局）、sigaction、SIGINT/SIG_IGN 等 |
-| `src/crt0.c` | `_start`：对齐栈 → 调 `main()` → `_exit(main())` |
+| `src/crt0.c` | `_start`（naked）：捕获入口 rsp → `_start_c` 解析 argc/argv/envp → 设置 `environ` → `main(argc, argv, envp)` → `_exit(main(...))` |
 | `src/format.c` | printf 格式化核心（无 syscall，可在宿主机测试） |
 | `src/malloc.c` | 分配器核心（无 syscall；经弱符号 `__moqi_heap_grow` 扩容） |
 | `src/sbrk.c` | 强符号 `__moqi_heap_grow`，基于 brk 实现 |
-| `src/unistd.c` `src/stdio.c` `src/signal.c` `src/stdlib.c` | 薄 syscall 封装与 fd 1 输出（仅 freestanding） |
-| `host_tests/` | 宿主机单元测试（test_string / test_format / test_malloc + run_tests.sh） |
+| `src/unistd.c` `src/stdio.c` `src/signal.c` `src/stdlib.c` | 薄 syscall 封装、fd 1 输出与 getenv（仅 freestanding） |
+| `host_tests/` | 宿主机单元测试（test_string / test_format / test_malloc / test_args + run_tests.sh） |
 
 ### 5.2 设计要点
 
@@ -207,10 +208,25 @@ main():
   4KiB 粒度走 brk（syscall #7）。无 realloc，无线程安全（用户程序单线程）。
 - **printf**：格式化进 512 字节栈缓冲后一次 write 到 fd 1，超长截断；
   无浮点、无宽度/精度修饰。
+- **argc/argv/envp 与初始栈契约**：内核（`kernel/proc/user_stack.zig`
+  `buildUserStack`）按 System V 布局构建进程入口栈：RSP 指向 argc（8 字节），
+  其后依次是 NULL 结尾的 argv 指针数组、NULL 结尾的 envp 指针数组
+  （`envp == &argv[argc+1]`，两者恒连续，16 字节对齐 pad 在 envp-NULL 与
+  auxv 之间），最后是 auxv 对。execve（syscall #59）把调用者的 argv/envp
+  完整传入新程序（各最多 16 项、每项截断到 127 字节）；首个进程
+  （`loader.loadProgram`）envp 为空。crt0 的 naked `_start` 捕获入口 rsp，
+  `_start_c` 用 `include/crt0.h` 的 `moqi_parse_initial_stack` 解析，
+  设置全局 `environ` 后以 `main(argc, argv, envp)` 进入程序。
+- **environ / getenv**：`environ`（unistd.h 声明，crt0.c 定义）指向初始栈上的
+  envp 数组；`getenv(name)`（stdlib）纯遍历 environ，不发 syscall，返回指向
+  environ 条目内部的指针。libc 不提供 setenv——修改内核侧环境请用
+  `moqi_setenv`（注意：内核环境表与栈上 envp 是两套机制，execve 只传
+  调用者给的 envp，不继承 `moqi_setenv` 设置的变量）。
 
 ### 5.3 编写新的 libc 用户程序
 
-1. `user/foo.c` 以 `int main(void)` 为入口（crt0 提供 `_start`），按需
+1. `user/foo.c` 以 `int main(int argc, char **argv, char **envp)` 为入口
+   （crt0 提供 `_start`；不需要参数时可 `(void)` 丢弃三者），按需
    `#include <stdio.h> <unistd.h> <string.h> <stdlib.h> <ctype.h> <signal.h>`。
 2. 把程序名加入 `build.zig` 的 `libc_programs` 列表（`addLibcUserProgram` 会
    连同 `lib/moqi_libc/src/*.c` 一起编译链接；手工编译命令见
@@ -224,7 +240,8 @@ init 的源文件不在 `user/` 下，构建时以显式路径调用 `addLibcUse
 ### 5.4 有意缺失
 
 浮点 printf、stdio 缓冲/FILE、errno 全局量、realloc、线程与 TLS、locale、
-setjmp/longjmp、完整 POSIX 信号语义。需要时请按最小需求追加，不要预先泛化。
+setjmp/longjmp、完整 POSIX 信号语义、libc 侧 setenv（environ 只读；
+改环境用 `moqi_setenv`，见 5.2）。需要时请按最小需求追加，不要预先泛化。
 
 `lib/zig_crt/` 另含 `start.zig`：Zig 用户程序的最小 `_start`（对齐栈 →
 `main()` → exit syscall），供 Zig 编写的 freestanding 用户程序链接，非 libc。

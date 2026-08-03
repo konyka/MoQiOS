@@ -206,6 +206,38 @@ pub fn copyPage(inode_id: u64, page_offset: u64, page_off: u32, dst: [*]u8, len:
     return false;
 }
 
+/// G2: return the physical frame backing a cached page, for zero-copy
+/// MAP_PRIVATE file mappings. Returns null on a miss.
+///
+/// Lifetime contract: the caller must pmm.addRef() the returned frame before
+/// mapping it. The cache entry may be evicted at any time after this call —
+/// eviction only drops the cache's own reference (freePage is a decRef), and
+/// the clock scan skips frames with refcount > 1, so an addRef'd frame can
+/// neither be freed nor reused while a mapping holds it.
+pub fn getPageFrame(inode_id: u64, page_offset: u64) ?u64 {
+    const flags = cache_lock.acquire();
+    defer cache_lock.release(flags);
+
+    const key = CacheKey{ .inode_id = inode_id, .page_offset = page_offset };
+    const bucket = hashKey(key);
+
+    var slot = hash_buckets[bucket];
+    while (slot) |s| {
+        if (pages[s].valid and
+            pages[s].key.inode_id == inode_id and
+            pages[s].key.page_offset == page_offset)
+        {
+            cache_hits += 1;
+            pages[s].referenced = true;
+            return pages[s].phys;
+        }
+        slot = pages[s].hash_next;
+    }
+
+    cache_misses += 1;
+    return null;
+}
+
 /// Copy-out variant of readPageAndRecord: returns the prefetch hint on a hit,
 /// null on a miss. The data is copied under the lock (see copyPage).
 pub fn copyPageAndRecord(inode_id: u64, page_offset: u64, page_off: u32, dst: [*]u8, len: u32) ?u32 {
@@ -545,6 +577,11 @@ fn allocSlot() ?u16 {
         // v53.39: Don't evict dirty pages — data would be lost (Critical fix)
         if (dirtyTest(@intCast(i))) continue;
 
+        // G2: don't evict frames mapped into a user address space
+        // (refcount > 1 = someone besides the cache holds a reference) —
+        // removePageKeepPhys would hand the live frame to a new file page.
+        if (pmm.getRefCount(pages[i].phys) > 1) continue;
+
         // v53.41: Evict but keep physical page — avoids free+alloc pair (2 PMM lock ops)
         removePageKeepPhys(@intCast(i));
         return @intCast(i);
@@ -580,6 +617,10 @@ fn allocSlotOwned(phys: u64) ?u16 {
         }
 
         if (dirtyTest(@intCast(i))) continue;
+
+        // G2: don't evict frames mapped into a user address space
+        // (refcount > 1 = someone besides the cache holds a reference).
+        if (pmm.getRefCount(pages[i].phys) > 1) continue;
 
         // v53.42: Evict, free old physical page, then use caller's page
         removePageKeepPhys(@intCast(i));

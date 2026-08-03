@@ -353,7 +353,8 @@ static int execute_pipeline(const char *line) {
     return status;
 }
 
-int main(void) {
+int main(int argc, char **argv, char **envp) {
+    (void)argc; (void)argv; (void)envp;
     struct ksigaction ign = { SIG_IGN, 0, 0, 0 };
     sigaction(SIGINT, &ign, (void *)0);
 

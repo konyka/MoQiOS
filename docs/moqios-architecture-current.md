@@ -10,6 +10,8 @@
 > **注意**: 本文档描述 MoQiOS 的**当前实际实现状态**，不是设计目标。
 > 长期设计目标请参见 [moqios-design.md](./moqios-design.md)。
 >
+> **2026-08-02 更新 (G5)**：块设备 TRIM/discard — NVMe 驱动新增 Dataset Management 命令 (opcode 0x09，I/O 队列经通道所有权路径下发，单 range 16 字节经 PRP1 传入，ONCS byte 520 bit 2 检测，支持时打印 `[NVMe] TRIM supported`)；virtio-blk 特性协商接受 `VIRTIO_BLK_F_DISCARD` (bit 13) 并实现 `discard()` (`VIRTIO_BLK_T_DISCARD`=8，经同一 io_lock 提交路径，设备不提供特性时 no-op)；block_dev 新增 `discard(lba, count)` 路由到 FS 所在活动设备 (不支持时 no-op)；fat32 `deleteFile`/`truncateFile` 簇链释放与 ext2 `freeBlock` (含 unlink/truncate 批量 defer 收尾) 经纯逻辑模块 `kernel/lib/trim_ranges.zig` 合并为最大连续范围后批量下发 (主机单测见 tests/main.zig "TRIM (G5)" 块)。
+>
 > **2026-05-29 更新 (v53.50)**：free_bm同步修复+fat32嵌套锁消除+TCP accept环形队列+ext2零拷贝目录遍历 — v53.49引入的free_bm位图在fork/clone/fcntl/memfd_create 4处绕过allocFd的路径未同步修复 (fork.zig和clone.zig复制free_bm到子进程、fcntl.zig dupFd改用free_bm位图O(1)查找、syscall_entry.zig syscallMemfdCreate改用allocFd()，allocPipe失败时freeFd回滚)、fat32 readFile缓存插入路径从insertPage改为insertPageOwned (消除cache_lock→pmm.lock嵌套锁，数据直接读入PMM页面后零拷贝转移所有权，OOM时fallback到全局缓冲区不缓存)、TCP accept队列从O(N)数组移位改为O(1)环形缓冲区 (pending_head/pending_tail+取模索引，LISTEN_BACKLOG=32)、ext2 readDirEntries从函数级allocPage/freePage改为per-block cacheLookupPtr零拷贝模式 (cache命中时直接使用缓存指针，cache未命中时临时页读取后释放，与findDirEntry一致)。
 >
 > **2026-05-29 更新 (v53.49)**：信号杀死路径exitTask+UDP安全修复+TCP批量锁+FdTable位图优化 — 信号杀死路径路由到exitTask修复fd泄漏和waitpid死锁 (deliverSignalToRunningTask在handler_addr==0且defaultSignalAction返回false时，从直接设置zombie改为调用task.exitTask()，确保fd关闭/父进程唤醒/kickCpu全部执行)、UDP handlePacket安全修复 (从ensurePort改为findPortIdx，不再为未绑定端口创建表目，丢弃未绑定端口包防安全漏洞)、TCP timerTick单次锁优化 (从逐TCB获取/释放tcp_lock改为单次锁覆盖全扫描，消除63次冗余锁操作，bm==0提前返回)、FdTable free_bm位图优化 (新增u64位图字段+freeFd方法，allocFd从O(N)线性扫描改为O(1) @ctz位操作，close/dup2/createPipe/open全路径正确维护位图一致性，socket_syscall.zig 3处重复内联扫描统一替换为allocFd()调用)。
@@ -708,8 +710,8 @@ Task 结构体约 6000 字节，包含：
                         ← RSP (16 字节对齐)
 ```
 
-关键：padding 位于 envp-NULL 和 argv-NULL 之间，
-确保 RSP 在 argc 之前为 16 字节对齐。
+关键：argv 与 envp 从 RSP 起连续（envp == &argv[argc+1]）；padding 位于
+envp-NULL 与 auxv 之间，确保 RSP 在 argc 之前为 16 字节对齐。
 
 ---
 
@@ -1048,7 +1050,10 @@ LAPIC Timer 中断
 - **fork**: COW 克隆地址空间，设置所有页为 Read-Only，缺页时才复制
 - **execve**: 完全替换地址空间，释放旧页表，加载 ELF，构建新栈
 - **waitpid**: 阻塞式等待，使用 WaitNode 睡眠唤醒机制
-- **mmap**: 支持匿名映射 (MAP_ANONYMOUS) 和文件映射 (MAP_PRIVATE)
+- **mmap**: 支持匿名映射 (MAP_ANONYMOUS) 和文件映射 (MAP_PRIVATE)；G2 起文件映射为
+  按需分页——mmap 只记录区域元数据，#PF 时经 page_cache/tmpfs 零拷贝映射共享帧
+  （只读+COW位，写入走既有 COW 复制），ramdisk 复制为私有页；整页越过 EOF 触发
+  SIGSEGV；MAP_SHARED 写回暂不支持（EOPNOTSUPP）
 - **mremap**: 优先原地缩放映射；原地扩展被占用且设置 `MREMAP_MAYMOVE` 时，分配新的用户虚拟区、
   复制旧页内容并释放旧映射；`MREMAP_FIXED` 要求同时设置 `MREMAP_MAYMOVE` 且目标页对齐。
 - **readv/writev**: scatter-gather I/O，复用 VFS read/write 路径
@@ -1131,15 +1136,18 @@ LAPIC Timer 中断
 
 | 驱动 | 文件 | 行数 | 说明 |
 |---|---|---|---|
-| virtio-blk | kernel/drivers/virtio_blk.zig | 545 | 主存储设备 |
-| AHCI | kernel/drivers/ahci.zig | 638 | SATA 控制器 (已实现，未为主要文件系统) |
-| NVMe | kernel/drivers/nvme.zig | ~1400 | MSI-X 中断驱动 I/O (向量 242..245)，轮询回退 |
+| virtio-blk | kernel/drivers/virtio_blk.zig | 545 | 主存储设备，支持 DISCARD (特性协商，设备不提供则 no-op) |
+| AHCI | kernel/drivers/ahci.zig | 638 | SATA 控制器 (已实现，未为主要文件系统)，含 TRIM (DATA SET MANAGEMENT) |
+| NVMe | kernel/drivers/nvme.zig | ~1400 | MSI-X 中断驱动 I/O (向量 242..245)，轮询回退；Dataset Management (TRIM) |
 
 NVMe 启动日志：MSI-X 成功时输出 `[NVMe] MSI-X interrupts enabled (N vectors)`
 （冒烟测试的必需标记），随后启动自检做一次性中断驱动扇区读取并输出
 `[NVMe] interrupt-driven read verified (pattern match)`（镜像首扇区含
 qemu_run.sh 写入的 "MoQiNVMe" 模式串时）；MSI-X 不可用时输出
 `[NVMe] MSI-X not available, using polling fallback` 并保持原有轮询行为。
+控制器 ONCS bit 2 声明 Dataset Management 支持时输出 `[NVMe] TRIM supported`
+(G5)。fat32/ext2 释放路径经 `block_dev.discard()` 下发 TRIM，目标设备不支持
+时为 no-op，不影响既有 fs 读写/删除语义。
 
 ---
 

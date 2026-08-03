@@ -33,6 +33,10 @@ const VIRTIO_STATUS_FAILED: u8 = 0x80;
 // Block request types
 const VIRTIO_BLK_T_IN: u32 = 0;
 const VIRTIO_BLK_T_OUT: u32 = 1;
+const VIRTIO_BLK_T_DISCARD: u32 = 8;
+
+// Feature bits
+const VIRTIO_BLK_F_DISCARD: u32 = 1 << 13;
 
 // Block request status
 const VIRTIO_BLK_S_OK: u8 = 0;
@@ -46,6 +50,15 @@ const BlkReqHeader = extern struct {
     type: u32,
     reserved: u32,
     sector: u64,
+};
+
+/// Discard payload segment (struct virtio_blk_discard_write_zeroes):
+/// one per descriptor, placed right after the request header in the same
+/// page. `flags` is 0 for DISCARD (bit 0 = UNMAP only for WRITE_ZEROES).
+const DiscardSegment = extern struct {
+    sector: u64,
+    num_sectors: u32,
+    flags: u32,
 };
 
 /// Virtqueue descriptor.
@@ -105,6 +118,7 @@ const VirtioBlkDevice = struct {
     pci_bus: u8,
     pci_dev: u8,
     pci_func: u8,
+    discard_supported: bool,
 };
 
 var device: VirtioBlkDevice = .{
@@ -123,6 +137,7 @@ var device: VirtioBlkDevice = .{
     .pci_bus = 0,
     .pci_dev = 0,
     .pci_func = 0,
+    .discard_supported = false,
 };
 
 var device2: VirtioBlkDevice = .{
@@ -141,6 +156,7 @@ var device2: VirtioBlkDevice = .{
     .pci_bus = 0,
     .pci_dev = 0,
     .pci_func = 0,
+    .discard_supported = false,
 };
 
 // Driver-level lock (SMP fix): every request rewrites fixed descriptors 0-2,
@@ -239,9 +255,15 @@ fn initDevice(dev: *const pci.PciDevice, out: *VirtioBlkDevice) !void {
     io.outb(@intCast(base + VIRTIO_PCI_STATUS), VIRTIO_STATUS_ACK);
     io.outb(@intCast(base + VIRTIO_PCI_STATUS), VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER);
 
-    // Negotiate features — accept none
-    _ = io.inl(@intCast(base + VIRTIO_PCI_DEVICE_FEATURES));
-    io.outl(@intCast(base + VIRTIO_PCI_DRIVER_FEATURES), 0);
+    // Negotiate features — accept DISCARD (G5) when the device offers it,
+    // nothing else. Legacy virtio exposes bits 0-31 in this register.
+    const dev_features = io.inl(@intCast(base + VIRTIO_PCI_DEVICE_FEATURES));
+    var driver_features: u32 = 0;
+    out.discard_supported = (dev_features & VIRTIO_BLK_F_DISCARD) != 0;
+    if (out.discard_supported) {
+        driver_features |= VIRTIO_BLK_F_DISCARD;
+    }
+    io.outl(@intCast(base + VIRTIO_PCI_DRIVER_FEATURES), driver_features);
 
     io.outb(@intCast(base + VIRTIO_PCI_STATUS), VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
     const status = io.inb(@intCast(base + VIRTIO_PCI_STATUS));
@@ -329,6 +351,9 @@ fn initDevice(dev: *const pci.PciDevice, out: *VirtioBlkDevice) !void {
     serial.writeString("[virtio-blk] Initialized, queue size=");
     fmt.writeDecimal(queue_size);
     serial.writeString("\n");
+    if (out.discard_supported) {
+        serial.writeString("[virtio-blk] DISCARD supported\n");
+    }
 }
 
 /// Read sectors from the virtio-blk device.
@@ -550,6 +575,84 @@ pub noinline fn writeSectors(lba: u64, count: u32, buf: [*]const u8) i64 {
     }
 
     return @intCast(count * SECTOR_SIZE);
+}
+
+/// Discard (deallocate) `count` sectors starting at `lba` on disk 0 via a
+/// VIRTIO_BLK_T_DISCARD request through the same io_lock submit path as
+/// read/write. No-op (returns 0) when the device did not offer
+/// VIRTIO_BLK_F_DISCARD during feature negotiation. Returns -1 on I/O error.
+pub fn discard(lba: u64, count: u32) i32 {
+    if (!device.active or !device.discard_supported) return 0;
+    if (count == 0) return 0;
+
+    const flags = io_lock.acquire();
+    defer io_lock.release(flags);
+
+    const req: *volatile BlkReqHeader = @ptrFromInt(device.req_header_virt);
+    req.type = VIRTIO_BLK_T_DISCARD;
+    req.reserved = 0;
+    req.sector = 0; // unused for DISCARD; the sector lives in the payload
+
+    // Payload segment sits right after the header in the same page.
+    const seg: *volatile DiscardSegment = @ptrFromInt(device.req_header_virt + @sizeOf(BlkReqHeader));
+    seg.sector = lba;
+    seg.num_sectors = count;
+    seg.flags = 0;
+
+    const status_byte: *volatile u8 = @ptrFromInt(device.status_virt);
+    status_byte.* = 0xFF;
+
+    const vq_virt = device.queue_virt;
+
+    // Desc 0: request header (device-readable)
+    const d0 = getDesc(vq_virt, 0);
+    d0.addr = device.req_header_phys;
+    d0.len = @sizeOf(BlkReqHeader);
+    d0.flags = 1 << 0; // NEXT
+    d0.next = 1;
+
+    // Desc 1: discard payload segment (device-readable)
+    const d1 = getDesc(vq_virt, 1);
+    d1.addr = device.req_header_phys + @sizeOf(BlkReqHeader);
+    d1.len = @sizeOf(DiscardSegment);
+    d1.flags = 1 << 0; // NEXT (no WRITE flag = device reads)
+    d1.next = 2;
+
+    // Desc 2: status byte (device-writable)
+    const d2 = getDesc(vq_virt, 2);
+    d2.addr = device.status_phys;
+    d2.len = 1;
+    d2.flags = 1 << 1; // WRITE
+    d2.next = 0;
+
+    const avail = getAvail(vq_virt);
+    const avail_idx = avail.idx;
+    avail.ring[avail_idx % device.queue_num] = 0;
+    asm volatile ("" ::: .{ .memory = true });
+    avail.idx = avail_idx + 1;
+
+    writeReg16(VIRTIO_PCI_QUEUE_NOTIFY, 0);
+
+    const used = getUsed(device.queue_virt);
+    var timeout: u32 = 10_000_000;
+    while (timeout > 0) : (timeout -= 1) {
+        if (used.idx != device.last_used_idx) {
+            device.last_used_idx = used.idx;
+            break;
+        }
+        asm volatile ("pause");
+    }
+
+    if (timeout == 0) {
+        serial.writeString("[virtio-blk] discard timeout\n");
+        return -1;
+    }
+    if (status_byte.* != VIRTIO_BLK_S_OK) {
+        serial.writeString("[virtio-blk] discard error\n");
+        return -1;
+    }
+
+    return 0;
 }
 
 pub fn hasActiveDisk() bool {

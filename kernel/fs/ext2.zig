@@ -12,6 +12,8 @@
 /// Designed for ext2 with 1024-byte blocks (revision 0 / "good old ext2").
 const serial = @import("../arch/arch.zig").serial;
 const virtio_blk = @import("../drivers/virtio_blk.zig");
+const block_dev = @import("../drivers/block_dev.zig");
+const trim_ranges = @import("../lib/trim_ranges.zig");
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const eu = @import("ext2_util.zig");
@@ -47,6 +49,36 @@ var first_data_block: u32 = 0;
 // before batch block-freeing, then defer-flush cacheFlush+writeGroupDescs+writeSuperblock.
 // Depth counter (not bool) supports nested batch contexts and is SMP-tolerant.
 var batch_free_depth: u32 = 0;
+
+// G5 TRIM: extents of freed data blocks accumulate here and are coalesced
+// into maximal contiguous sector ranges before issuing block_dev.discard.
+// Static buffers (fs_lock serializes). noteFreedBlock flushes when the
+// buffer fills or outside a batch; batch callers flush in their defer.
+// discard() is plain device I/O that never re-enters ext2, so the writeback
+// flush rule (drop fs_lock around writeback calls) does not apply — it runs
+// under fs_lock like the rest of the FS's sector I/O.
+var discard_in: [64]trim_ranges.Extent = undefined;
+var discard_out: [64]trim_ranges.Extent = undefined;
+var discard_count: usize = 0;
+
+fn noteFreedBlock(block_num: u32) void {
+    const spb: u32 = block_size / SECTOR_SIZE; // sectors per block
+    if (discard_count == discard_in.len) flushDiscard();
+    discard_in[discard_count] = .{
+        .start = DISK_LBA_OFFSET + @as(u64, block_num) * spb,
+        .count = spb,
+    };
+    discard_count += 1;
+    if (batch_free_depth == 0) flushDiscard();
+}
+
+fn flushDiscard() void {
+    const n = trim_ranges.coalesce(discard_in[0..discard_count], &discard_out);
+    discard_count = 0;
+    for (discard_out[0..n]) |r| {
+        _ = block_dev.discard(r.start, r.count);
+    }
+}
 
 const DISK_LBA_OFFSET: u64 = 32768;
 
@@ -1262,6 +1294,7 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
             cacheFlushUnlocked();
             writeGroupDescs();
             writeSuperblock();
+            flushDiscard(); // G5: issue coalesced discards for batched frees
         }
     }
     const new_blocks_needed = if (new_size == 0) 0 else (new_size + block_size - 1) / block_size;
@@ -1335,6 +1368,7 @@ pub fn truncateByInode(inode_num: u32, new_size: u32) bool {
             cacheFlushUnlocked();
             writeGroupDescs();
             writeSuperblock();
+            flushDiscard(); // G5: issue coalesced discards for batched frees
         }
     }
     // v53.4: invalidate page cache for this inode before freeing blocks
@@ -1787,6 +1821,7 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
             cacheFlushUnlocked();
             writeGroupDescs();
             writeSuperblock();
+            flushDiscard(); // G5: issue coalesced discards for batched frees
         }
     }
     const page_cache = @import("page_cache.zig");
@@ -2263,6 +2298,8 @@ fn freeBlock(block_num: u32) void {
     gd.bg_free_blocks_count += 1;
     sb.free_blocks_count += 1;
 
+    noteFreedBlock(block_num); // G5: batch a discard extent for the freed block
+
     // v53.15: Skip expensive disk flushes during batch operations (caller flushes at end)
     if (batch_free_depth == 0) {
         writeGroupDescs();
@@ -2431,6 +2468,7 @@ pub fn unlinkFile(path: []const u8) bool {
                 cacheFlushUnlocked();
                 writeGroupDescs();
                 writeSuperblock();
+                flushDiscard(); // G5: issue coalesced discards for batched frees
             }
         }
         // v53.5: invalidate page cache before freeing blocks

@@ -282,15 +282,16 @@ pub fn build(b: *std.Build) void {
         "hello27", "hello28", "hello29", "hello30", "hello31", "hello32",
         "hello33", "hello34", "hello35", "hello36", "hello37", "hello38",
         "hello39", "hello40", "hello41", "hello42", "hello43",
-        "hello44",
+        "hello44", "hello46", "hello47",
     };
     for (c_programs) |name| addCUserProgram(b, name);
 
     // C programs built against moqi_libc (lib/moqi_libc/): entry point is
-    // `int main(void)`, libc provides _start and the syscall wrappers.
+    // `int main(int argc, char **argv, char **envp)`, libc provides _start
+    // (parsing the kernel's SysV initial stack) and the syscall wrappers.
     // init (PID 1) is the C replacement for user/init.S; its source lives in
     // servers/init/, everything else in user/.
-    const libc_programs = [_][]const u8{ "sh", "hello10" };
+    const libc_programs = [_][]const u8{ "sh", "hello10", "hello45" };
     for (libc_programs) |name| addLibcUserProgram(b, name, b.fmt("user/{s}.c", .{name}));
     addLibcUserProgram(b, "init", "servers/init/main.c");
 

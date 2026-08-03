@@ -635,3 +635,364 @@ test "F3: rankKey bands — RT below OTHER below idle, OTHER order intact" {
     try std.testing.expect(sp.rankKey(sp.SCHED_FIFO, 98) < sp.MAX_PICK_KEY);
 }
 // ─── end RT scheduling (F3) ───
+
+// ─── kmsg ring (G4) ───
+const kmsg_ring = kt.kmsg_ring;
+
+/// Drain the ring from `cursor` into `out`, following short reads at the
+/// physical wrap. Returns bytes copied and the final cursor.
+fn kmsgDrain(ring: anytype, cursor: u64, out: []u8) struct { n: usize, pos: u64 } {
+    var pos = cursor;
+    var copied: usize = 0;
+    while (copied < out.len) {
+        const r = ring.read(pos, out[copied..]);
+        pos = r.new_pos;
+        copied += r.n;
+        if (r.n == 0) break;
+    }
+    return .{ .n = copied, .pos = pos };
+}
+
+test "G4: empty ring reads as EOF" {
+    var ring: kmsg_ring.KmsgRing(64) = .{};
+    var buf: [16]u8 = undefined;
+    const r = ring.read(0, &buf);
+    try std.testing.expectEqual(@as(usize, 0), r.n);
+    try std.testing.expectEqual(@as(u64, 0), r.new_pos);
+}
+
+test "G4: append lines and read them back from cursor 0" {
+    var ring: kmsg_ring.KmsgRing(64) = .{};
+    ring.appendLine("[INF] one\n");
+    ring.appendLine("[DBG] two\n");
+
+    var buf: [64]u8 = undefined;
+    const d = kmsgDrain(&ring, 0, &buf);
+    try std.testing.expectEqualStrings("[INF] one\n[DBG] two\n", buf[0..d.n]);
+    try std.testing.expectEqual(@as(u64, 20), d.pos);
+
+    // Reading at the newest cursor is EOF.
+    const r = ring.read(d.pos, &buf);
+    try std.testing.expectEqual(@as(usize, 0), r.n);
+}
+
+test "G4: piecewise append (prefix + body + newline) reads as one line" {
+    var ring: kmsg_ring.KmsgRing(64) = .{};
+    ring.appendLine("[INF] ");
+    ring.appendLine("0x");
+    ring.appendLine("deadbeef");
+    ring.appendLine("\n");
+
+    var buf: [64]u8 = undefined;
+    const d = kmsgDrain(&ring, 0, &buf);
+    try std.testing.expectEqualStrings("[INF] 0xdeadbeef\n", buf[0..d.n]);
+}
+
+test "G4: wrap drops oldest whole lines, keeps newest intact" {
+    var ring: kmsg_ring.KmsgRing(16) = .{};
+    ring.appendLine("AAAA\n"); // 5
+    ring.appendLine("BBBB\n"); // 10
+    ring.appendLine("CCCC\n"); // 15 — 1 byte free
+    ring.appendLine("DDDD\n"); // needs 5: drops AAAA only (BBBB..DDDD = 15 <= 16)
+
+    var buf: [32]u8 = undefined;
+    const d = kmsgDrain(&ring, 0, &buf);
+    try std.testing.expectEqualStrings("BBBB\nCCCC\nDDDD\n", buf[0..d.n]);
+
+    // Absolute cursors survive the wrap: 20 bytes appended total.
+    try std.testing.expectEqual(@as(u64, 20), d.pos);
+    try std.testing.expectEqual(@as(u64, 5), ring.oldestPos());
+}
+
+test "G4: stale cursor clamps forward to the oldest available byte" {
+    var ring: kmsg_ring.KmsgRing(16) = .{};
+    ring.appendLine("AAAA\n");
+    ring.appendLine("BBBB\n");
+    ring.appendLine("CCCC\n");
+    ring.appendLine("DDDD\n"); // oldest is now absolute 5 ("BBBB\n...")
+
+    var buf: [16]u8 = undefined;
+    // Cursor 3 points into long-gone "AAAA\n" — clamp to 5.
+    const r = ring.read(3, &buf);
+    try std.testing.expect(r.n > 0);
+    try std.testing.expectEqual(@as(u8, 'B'), buf[0]);
+    try std.testing.expectEqual(@as(u64, 5 + r.n), r.new_pos);
+}
+
+test "G4: short read at the physical wrap, continuation gets the rest" {
+    var ring: kmsg_ring.KmsgRing(8) = .{};
+    ring.appendLine("ab\n"); // bytes 0..3
+    ring.appendLine("cd\n"); // bytes 3..6 — write head now near the end
+    ring.appendLine("ef\n"); // drops "ab\n", wraps mid-line: bytes 6..9
+
+    // First read must stop at the physical end of the buffer...
+    var buf: [8]u8 = undefined;
+    const r1 = ring.read(ring.oldestPos(), &buf);
+    try std.testing.expect(r1.n > 0);
+    // ...and draining must still reconstruct "cd\nef\n" (6 bytes).
+    const d = kmsgDrain(&ring, ring.oldestPos(), &buf);
+    try std.testing.expectEqualStrings("cd\nef\n", buf[0..d.n]);
+    try std.testing.expectEqual(@as(u64, 9), d.pos);
+}
+
+test "G4: line longer than the whole ring keeps only its tail" {
+    var ring: kmsg_ring.KmsgRing(8) = .{};
+    const long = "0123456789\n"; // 11 bytes > 8
+    ring.appendLine(long);
+
+    var buf: [16]u8 = undefined;
+    const d = kmsgDrain(&ring, 0, &buf);
+    try std.testing.expectEqualStrings(long[long.len - 8 ..], buf[0..d.n]);
+}
+
+test "G4: ring survives many small lines (overwrite-oldest stress)" {
+    var ring: kmsg_ring.KmsgRing(32) = .{};
+    // 20 lines of "Lnn\n" (4 bytes each) = 80 bytes through a 32-byte ring.
+    var linebuf: [4]u8 = undefined;
+    var i: u32 = 0;
+    while (i < 20) : (i += 1) {
+        linebuf[0] = 'L';
+        linebuf[1] = '0' + @as(u8, @intCast(i / 10));
+        linebuf[2] = '0' + @as(u8, @intCast(i % 10));
+        linebuf[3] = '\n';
+        ring.appendLine(&linebuf);
+    }
+    // Only the last 8 lines fit.
+    var buf: [64]u8 = undefined;
+    const d = kmsgDrain(&ring, 0, &buf);
+    try std.testing.expectEqual(@as(usize, 32), d.n);
+    try std.testing.expectEqualStrings("L12\nL13\nL14\nL15\nL16\nL17\nL18\nL19\n", buf[0..d.n]);
+    try std.testing.expectEqual(@as(u64, 80), d.pos);
+}
+// ─── end kmsg ring (G4) ───
+
+// ─── DHCP boot (G3) ───
+// The lease-state globals are pure (no arch deps): only the packet TX/RX
+// paths reach serial/udp/nic, and Zig's lazy decl analysis leaves those
+// unanalyzed here. Pinning the defaults matters because netif.getOurIp()
+// falls back to static 10.0.2.15 exactly when isConfigured() is false.
+test "G3: DHCP lease state defaults to unconfigured (static fallback active)" {
+    const dhcp = kt.dhcp;
+
+    try std.testing.expect(!dhcp.isConfigured());
+    try std.testing.expectEqual(@as([4]u8, .{ 0, 0, 0, 0 }), dhcp.getIp());
+    try std.testing.expectEqual(@as([4]u8, .{ 0, 0, 0, 0 }), dhcp.getGateway());
+    try std.testing.expectEqual(@as([4]u8, .{ 255, 255, 255, 0 }), dhcp.getNetmask());
+    try std.testing.expectEqual(@as([4]u8, .{ 0, 0, 0, 0 }), dhcp.getDnsServer());
+}
+// ─── end DHCP boot (G3) ───
+
+// ─── TRIM (G5) ───
+const trim_ranges = kt.trim_ranges;
+const TrimExtent = trim_ranges.Extent;
+
+test "G5: empty extent list coalesces to zero ranges" {
+    var out: [4]TrimExtent = undefined;
+    try std.testing.expectEqual(@as(usize, 0), trim_ranges.coalesce(&.{}, &out));
+}
+
+test "G5: single extent passes through unchanged" {
+    var out: [4]TrimExtent = undefined;
+    const in = [_]TrimExtent{.{ .start = 100, .count = 8 }};
+    const n = trim_ranges.coalesce(&in, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u64, 100), out[0].start);
+    try std.testing.expectEqual(@as(u32, 8), out[0].count);
+}
+
+test "G5: adjacent extents merge into one contiguous range" {
+    var out: [4]TrimExtent = undefined;
+    const in = [_]TrimExtent{
+        .{ .start = 100, .count = 8 },
+        .{ .start = 108, .count = 8 },
+        .{ .start = 116, .count = 4 },
+    };
+    const n = trim_ranges.coalesce(&in, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u64, 100), out[0].start);
+    try std.testing.expectEqual(@as(u32, 20), out[0].count);
+}
+
+test "G5: overlapping extents merge without double counting" {
+    var out: [4]TrimExtent = undefined;
+    const in = [_]TrimExtent{
+        .{ .start = 100, .count = 16 },
+        .{ .start = 108, .count = 16 }, // overlaps 108..115
+    };
+    const n = trim_ranges.coalesce(&in, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u64, 100), out[0].start);
+    try std.testing.expectEqual(@as(u32, 24), out[0].count);
+}
+
+test "G5: disjoint extents stay separate and come out sorted" {
+    var out: [4]TrimExtent = undefined;
+    // Deliberately unsorted input (ext2 indirect-tree frees arrive out of order).
+    const in = [_]TrimExtent{
+        .{ .start = 500, .count = 4 },
+        .{ .start = 100, .count = 8 },
+        .{ .start = 108, .count = 2 },
+    };
+    const n = trim_ranges.coalesce(&in, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(u64, 100), out[0].start);
+    try std.testing.expectEqual(@as(u32, 10), out[0].count);
+    try std.testing.expectEqual(@as(u64, 500), out[1].start);
+    try std.testing.expectEqual(@as(u32, 4), out[1].count);
+}
+
+test "G5: zero-count extents are dropped" {
+    var out: [4]TrimExtent = undefined;
+    const in = [_]TrimExtent{
+        .{ .start = 100, .count = 0 },
+        .{ .start = 200, .count = 4 },
+    };
+    const n = trim_ranges.coalesce(&in, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u64, 200), out[0].start);
+}
+
+test "G5: contained extent does not grow the range" {
+    var out: [4]TrimExtent = undefined;
+    const in = [_]TrimExtent{
+        .{ .start = 100, .count = 64 },
+        .{ .start = 120, .count = 8 }, // fully inside the first
+    };
+    const n = trim_ranges.coalesce(&in, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u64, 100), out[0].start);
+    try std.testing.expectEqual(@as(u32, 64), out[0].count);
+}
+// ─── end TRIM (G5) ───
+
+// ─── file mmap (G2) ───
+const filemap = kt.filemap;
+
+const G2Region = struct {
+    base: u64 = 0,
+    num_pages: u64 = 0,
+    active: bool = false,
+    file_kind: u8 = 0,
+    prot: u8 = 0,
+    file_offset: u64 = 0,
+    file_size: u64 = 0,
+};
+
+test "G2: mmap offset must be page-aligned" {
+    try std.testing.expect(filemap.offsetValid(0));
+    try std.testing.expect(filemap.offsetValid(4096));
+    try std.testing.expect(filemap.offsetValid(8192));
+    try std.testing.expect(!filemap.offsetValid(1));
+    try std.testing.expect(!filemap.offsetValid(4095));
+    try std.testing.expect(!filemap.offsetValid(4097));
+}
+
+test "G2: findFileRegion matches only active file-backed regions" {
+    const regions = [_]G2Region{
+        .{ .base = 0x1000, .num_pages = 2, .active = true, .file_kind = 2 },
+        .{ .base = 0x4000, .num_pages = 1, .active = true, .file_kind = 0 }, // anonymous
+        .{ .base = 0x8000, .num_pages = 4, .active = false, .file_kind = 3 }, // inactive
+        .{ .base = 0x10000, .num_pages = 2, .active = true, .file_kind = 3 },
+    };
+    try std.testing.expectEqual(@as(?usize, 0), filemap.findFileRegion(G2Region, &regions, 0x1000));
+    try std.testing.expectEqual(@as(?usize, 0), filemap.findFileRegion(G2Region, &regions, 0x2fff));
+    // Just past the end of region 0.
+    try std.testing.expectEqual(@as(?usize, null), filemap.findFileRegion(G2Region, &regions, 0x3000));
+    // Anonymous and inactive regions are invisible to the file fault path.
+    try std.testing.expectEqual(@as(?usize, null), filemap.findFileRegion(G2Region, &regions, 0x4000));
+    try std.testing.expectEqual(@as(?usize, null), filemap.findFileRegion(G2Region, &regions, 0x8000));
+    try std.testing.expectEqual(@as(?usize, 3), filemap.findFileRegion(G2Region, &regions, 0x11000));
+    try std.testing.expectEqual(@as(?usize, null), filemap.findFileRegion(G2Region, &regions, 0x0));
+}
+
+test "G2: planFault computes file offset, EOF clamp and COW permissions" {
+    const PAGE = filemap.PAGE_SIZE;
+    const r = G2Region{
+        .base = 0x400000,
+        .num_pages = 4,
+        .active = true,
+        .file_kind = 2,
+        .prot = filemap.PROT_READ | filemap.PROT_WRITE,
+        .file_offset = 0,
+        .file_size = 10000,
+    };
+    // Page 0: full page from the file, COW-shared (PROT_WRITE, MAP_PRIVATE).
+    var p = filemap.planFault(G2Region, &r, 0x400000);
+    try std.testing.expect(p.action == .file_page);
+    try std.testing.expectEqual(@as(u64, 0), p.file_off);
+    try std.testing.expectEqual(@as(u32, 4096), p.valid_bytes);
+    try std.testing.expect(p.cow);
+    try std.testing.expect(!p.executable);
+    // Page 2: partial last page — 10000 - 8192 = 1808 valid bytes, tail zeroed.
+    p = filemap.planFault(G2Region, &r, 0x400000 + 2 * PAGE);
+    try std.testing.expect(p.action == .file_page);
+    try std.testing.expectEqual(@as(u64, 8192), p.file_off);
+    try std.testing.expectEqual(@as(u32, 1808), p.valid_bytes);
+    // Page 3: wholly past EOF → SIGSEGV (Linux SIGBUS semantics).
+    p = filemap.planFault(G2Region, &r, 0x400000 + 3 * PAGE);
+    try std.testing.expect(p.action == .segv);
+
+    // PROT_READ mapping: shared read-only, no COW marker.
+    const r_ro = G2Region{ .base = 0x400000, .num_pages = 1, .active = true, .file_kind = 2, .prot = filemap.PROT_READ, .file_offset = 0, .file_size = 4096 };
+    p = filemap.planFault(G2Region, &r_ro, 0x400000);
+    try std.testing.expect(p.action == .file_page);
+    try std.testing.expect(!p.cow);
+
+    // Non-zero mmap offset shifts the mapped window into the file.
+    const r_off = G2Region{ .base = 0x400000, .num_pages = 2, .active = true, .file_kind = 3, .prot = filemap.PROT_READ, .file_offset = 8192, .file_size = 16384 };
+    p = filemap.planFault(G2Region, &r_off, 0x400000 + PAGE);
+    try std.testing.expect(p.action == .file_page);
+    try std.testing.expectEqual(@as(u64, 12288), p.file_off);
+    try std.testing.expectEqual(@as(u32, 4096), p.valid_bytes);
+
+    // PROT_EXEC keeps NX clear; read+exec is not COW.
+    const r_x = G2Region{ .base = 0x400000, .num_pages = 1, .active = true, .file_kind = 3, .prot = filemap.PROT_READ | filemap.PROT_EXEC, .file_offset = 0, .file_size = 4096 };
+    p = filemap.planFault(G2Region, &r_x, 0x400000);
+    try std.testing.expect(p.executable);
+    try std.testing.expect(!p.cow);
+}
+
+test "G2: munmap head-trim advances the file offset" {
+    try std.testing.expectEqual(@as(u64, 8192), filemap.advanceFileOffset(0, 2));
+    try std.testing.expectEqual(@as(u64, 12288), filemap.advanceFileOffset(4096, 2));
+    try std.testing.expectEqual(@as(u64, 0), filemap.advanceFileOffset(0, 0));
+}
+
+test "G2: region merging is only valid between anonymous regions" {
+    try std.testing.expect(filemap.canMergeAnon(0, 0));
+    try std.testing.expect(!filemap.canMergeAnon(0, 2));
+    try std.testing.expect(!filemap.canMergeAnon(3, 0));
+    try std.testing.expect(!filemap.canMergeAnon(3, 3));
+}
+
+test "G2: PTE synthesis for shared file frames and private copies" {
+    const phys: u64 = 0x12345000;
+
+    // Writable MAP_PRIVATE: present+user, read-only, COW marker, NX.
+    var pte = filemap.filePte(phys, true, false);
+    try std.testing.expectEqual(phys, pte & filemap.PTE_ADDR_MASK);
+    try std.testing.expect(pte & filemap.PTE_PRESENT != 0);
+    try std.testing.expect(pte & filemap.PTE_USER != 0);
+    try std.testing.expect(pte & filemap.PTE_WRITABLE == 0);
+    try std.testing.expect(pte & filemap.PTE_COW != 0);
+    try std.testing.expect(pte & filemap.PTE_NX != 0);
+
+    // Read-only shared frame: no COW, no writable.
+    pte = filemap.filePte(phys, false, false);
+    try std.testing.expect(pte & filemap.PTE_COW == 0);
+    try std.testing.expect(pte & filemap.PTE_WRITABLE == 0);
+
+    // Executable mapping keeps NX clear.
+    pte = filemap.filePte(phys, false, true);
+    try std.testing.expect(pte & filemap.PTE_NX == 0);
+
+    // Private copy honours prot, never carries the COW marker.
+    pte = filemap.privatePte(phys, filemap.PROT_READ | filemap.PROT_WRITE);
+    try std.testing.expectEqual(phys, pte & filemap.PTE_ADDR_MASK);
+    try std.testing.expect(pte & filemap.PTE_WRITABLE != 0);
+    try std.testing.expect(pte & filemap.PTE_COW == 0);
+    try std.testing.expect(pte & filemap.PTE_NX != 0);
+    pte = filemap.privatePte(phys, filemap.PROT_READ);
+    try std.testing.expect(pte & filemap.PTE_WRITABLE == 0);
+}
+// ─── end file mmap (G2) ───
