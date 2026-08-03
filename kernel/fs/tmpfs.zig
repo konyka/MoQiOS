@@ -450,6 +450,29 @@ pub fn tmpfsGetMapPage(idx: u8, ctime: u64, page_idx: u32) ?u64 {
     return entry.pages[page_idx];
 }
 
+/// H1: tmpfsGetMapPage variant for writable MAP_SHARED faults — allocates a
+/// zeroed backing page for a sparse hole so the write lands on tmpfs-owned
+/// memory every sharer can see (a private zero page would silently unshare).
+/// Same generation-tag validation and lifetime contract as tmpfsGetMapPage.
+/// Does not grow entry.size: the fault path only ensures pages inside the
+/// mmap-time size snapshot.
+pub fn tmpfsEnsureMapPage(idx: u8, ctime: u64, page_idx: u32) ?u64 {
+    if (idx >= MAX_FILES) return null;
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    const entry = &entries[idx];
+    if (!entry.active or entry.is_dir) return null;
+    if (entry.ctime != ctime) return null;
+    if (page_idx >= PAGES_PER_FILE) return null;
+    if (entry.pages[page_idx]) |phys| return phys;
+    const phys = pmm.allocPage() orelse return null;
+    const page_ptr: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+    @memset(page_ptr[0..PAGE_SIZE], 0);
+    entry.pages[page_idx] = phys;
+    entry.page_count += 1;
+    return phys;
+}
+
 pub const TmpfsDirEntry = struct {
     name: []const u8,
     is_dir: bool,

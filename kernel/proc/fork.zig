@@ -15,7 +15,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
     const parent_idx = sched.currentTaskIndex() orelse return -1;
     const parent = task_mod.getTask(parent_idx) orelse return -1;
 
-    const child_pml4 = cloneUserPagesCow(parent.page_table_phys) orelse return -1;
+    const child_pml4 = cloneUserPagesCow(parent.page_table_phys, &parent.mmap_regions) orelse return -1;
 
     const child_idx = task_mod.createUserProcess(
         parent.user_entry,
@@ -256,10 +256,17 @@ fn abortCloneRoot(child_pml4_phys: u64) ?u64 {
 /// physical page marked read-only with COW bit. The #PF handler (handleCowFault
 /// in idt.zig) allocates a private copy on first write.
 /// This makes fork() O(page-table-entries) instead of O(total-pages * 4KB).
-pub fn cloneUserPagesCow(parent_pml4_phys: u64) ?u64 {
+///
+/// H1: pages inside MAP_SHARED file regions (`shared_regions`) are exempt —
+/// COW-downgrading them would silently unshare the file mapping, so both
+/// sides keep the (possibly writable) entry unchanged. Pass 1's addRef still
+/// runs for them, keeping the refcount balanced across both address spaces.
+pub fn cloneUserPagesCow(parent_pml4_phys: u64, shared_regions: ?[]const @import("task.zig").MmapRegion) ?u64 {
     const pmm_mod = @import("../mm/pmm.zig");
     const hhdm_mod = @import("../mm/hhdm.zig");
     const paging_mod = @import("../arch/arch.zig").paging;
+    const filemap = @import("../mm/filemap.zig");
+    const task_mod = @import("task.zig");
 
     const ADDR_MASK: u64 = 0xFFFFFFFFF000;
     const cow_pte_mod = @import("../mm/cow_pte.zig");
@@ -336,19 +343,26 @@ pub fn cloneUserPagesCow(parent_pml4_phys: u64) ?u64 {
                     const pte = parent_pt[pt_idx];
                     if (pte == 0 or pte & 1 == 0) continue;
 
+                    const virt = (pml4_idx << 39) | (pdpt_idx << 30) |
+                        (pd_idx << 21) | (pt_idx << 12);
+
+                    // H1: MAP_SHARED file pages stay shared across fork.
+                    const keep_shared = if (shared_regions) |regs|
+                        filemap.inSharedFileRegion(task_mod.MmapRegion, regs, virt)
+                    else
+                        false;
+
                     // Both sides hold the same entry, so derive it once. The
                     // child's used to be rebuilt as `phys | (pte & 0xFFF)`,
                     // which dropped NX at bit 63 and handed the child an
                     // executable stack and heap.
-                    const shared = cow_pte_mod.sharedPte(pte);
+                    const shared = if (keep_shared) pte else cow_pte_mod.sharedPte(pte);
 
                     // Downgrade the parent only when the entry actually changed;
                     // an already-COW or already-read-only page keeps its entry.
                     if (shared != pte) {
                         parent_pt[pt_idx] = shared;
                         // Invalidate parent TLB for this page
-                        const virt = (pml4_idx << 39) | (pdpt_idx << 30) |
-                            (pd_idx << 21) | (pt_idx << 12);
                         paging_mod.invlpg(virt);
                     }
 

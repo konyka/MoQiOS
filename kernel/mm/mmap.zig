@@ -132,6 +132,9 @@ fn canTrackReplacement(task: *task_mod.Task, base: u64, num_pages: u64) bool {
 /// File-backing metadata recorded for a file region at track time (G2).
 pub const RegionFileMeta = struct {
     kind: filemap.FsKind,
+    /// H1: MAP_SHARED — faults map the backing frame writable (no COW) and
+    /// ext2/fat32 regions flush dirty cache pages on release.
+    shared: bool,
     prot: u8,
     offset: u64,
     size: u64,
@@ -166,6 +169,7 @@ fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, meta: ?Regio
             r.* = .{ .base = base, .num_pages = num_pages, .active = true };
             if (meta) |m| {
                 r.file_kind = @intFromEnum(m.kind);
+                r.shared = m.shared;
                 r.prot = m.prot;
                 r.file_offset = m.offset;
                 r.file_size = m.size;
@@ -183,11 +187,21 @@ fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, meta: ?Regio
 /// G2: drop the backing-store reference held by a file region piece.
 /// ext2 regions retain their open slot at mmap time so faults survive
 /// close(fd); every deactivation must balance that retain.
+/// H1: a MAP_SHARED ext2/fat32 region flushes its dirty mmap-owned cache
+/// pages first — after release nothing references the mapping, and the dirty
+/// pages would sit in the cache (unevictable) until an unrelated syncAll.
 fn releaseRegionBacking(r: *task_mod.MmapRegion) void {
+    if (r.shared and
+        (r.file_kind == @intFromEnum(filemap.FsKind.ext2) or
+            r.file_kind == @intFromEnum(filemap.FsKind.fat32)))
+    {
+        vfs.flushMappedInode(r.inode_id);
+    }
     if (r.file_kind == @intFromEnum(filemap.FsKind.ext2)) {
         ext2.closeFile(r.file_idx);
     }
     r.file_kind = 0;
+    r.shared = false;
 }
 
 fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
@@ -198,6 +212,17 @@ fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
         if (!r.active) continue;
         const r_end = r.base + r.num_pages * page;
         if (r.base >= end or r_end <= base) continue; // no overlap
+
+        // H1: unmapping any part of a MAP_SHARED ext2/fat32 region flushes
+        // the inode's dirty mmap-owned cache pages first (cheap no-op when
+        // clean) — the unmapped part's writes must not outlive the mapping
+        // only in an unevictable dirty cache page.
+        if (r.shared and
+            (r.file_kind == @intFromEnum(filemap.FsKind.ext2) or
+                r.file_kind == @intFromEnum(filemap.FsKind.fat32)))
+        {
+            vfs.flushMappedInode(r.inode_id);
+        }
 
         if (base <= r.base and end >= r_end) {
             releaseRegionBacking(r);
@@ -228,6 +253,7 @@ fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
                         // its own reference so either piece can be unmapped
                         // independently.
                         .file_kind = r.file_kind,
+                        .shared = r.shared,
                         .prot = r.prot,
                         .file_offset = tail_offset,
                         .file_size = r.file_size,
@@ -429,8 +455,6 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     // metadata below drives the page-fault path (handleFileFault in idt.zig).
     var meta: ?RegionFileMeta = null;
     if (!is_anonymous) {
-        // MAP_SHARED writeback is deferred to a later round (G2 scope).
-        if (flags & MAP_SHARED != 0) return -95; // EOPNOTSUPP
         // Linux: the offset must be page-aligned.
         if (!filemap.offsetValid(offset)) return -22; // EINVAL
         if (fd < 0 or fd >= vfs.MAX_FDS) return -9; // EBADF
@@ -445,9 +469,20 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
         };
         // The fd must be readable (status_flags & 3 == 1 is O_WRONLY).
         if ((desc.status_flags & 0x03) == 1) return -9; // EBADF
+        const shared = (flags & MAP_SHARED) != 0;
+        if (shared and (prot & 2) != 0) {
+            // The ramdisk is immutable Limine module memory — writable shared
+            // mappings have nowhere to write back to. Checked first: ramdisk
+            // files cannot be opened writable, so the EACCES branch below
+            // would make EROFS unreachable.
+            if (kind == .ramdisk) return -30; // EROFS
+            // Linux: MAP_SHARED|PROT_WRITE on a read-only fd → EACCES.
+            if ((desc.status_flags & 0x03) == 0) return -13; // EACCES
+        }
 
         var m = RegionFileMeta{
             .kind = kind,
+            .shared = shared,
             .prot = @intCast(prot & 7),
             .offset = offset,
             .size = desc.file_size,
@@ -632,10 +667,34 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
                 }
                 return @bitCast(old_addr);
             }
-            // G2: growing or moving a file-backed region is unsupported —
-            // moveMapping would substitute zero pages for never-faulted file
-            // pages, and a grown tail has no backing file content.
-            if (r.file_kind != 0) return -12; // ENOMEM
+            // H1: in-place growth of a file-backed region is allowed. The
+            // grown tail is deliberately left unmapped — it demand-faults
+            // through planFault like the rest of the region: pages inside
+            // the recorded file size are served from the backing store,
+            // pages wholly past it SIGSEGV (Linux allows growing a file
+            // mapping past EOF and faults on access). Moving a file region
+            // stays unsupported: moveMapping would substitute freshly
+            // allocated private pages for never-faulted shared/zero-copy
+            // frames, silently unsharing a MAP_SHARED mapping.
+            if (r.file_kind != 0) {
+                const g = filemap.fileGrowRange(old_addr, old_pages, new_pages);
+                var file_can_grow = true;
+                for (&cur.mmap_regions) |r2| {
+                    if (r2.active and r2.base != old_addr) {
+                        const r2_end = r2.base + r2.num_pages * PAGE;
+                        if (r2.base < g.start + g.pages * PAGE and r2_end > g.start) {
+                            file_can_grow = false;
+                            break;
+                        }
+                    }
+                }
+                if (!file_can_grow) return -12; // ENOMEM
+                // The region list does not know about untracked live pages
+                // (image, stack, brk) — gate on the actual page tables too.
+                if (!pagesFree(cur, g.start, g.pages)) return -12; // ENOMEM
+                r.num_pages = new_pages;
+                return @bitCast(old_addr);
+            }
             if ((mflags & MREMAP_FIXED) != 0) return moveOrNoMem(cur, r, old_pages, new_pages, mflags, new_addr_hint);
 
             // Grow: map new pages in the virtual range [old_addr + old_pages*PAGE, ...)

@@ -14,6 +14,7 @@ pub const gdt = @import("gdt.zig");
 pub const tsc = @import("tsc.zig");
 pub const syscall = @import("syscall_entry.zig");
 pub const tlb = @import("tlb.zig");
+pub const pcid = @import("pcid.zig");
 pub const io = @import("io.zig");
 
 pub const cpu = struct {

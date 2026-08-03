@@ -104,6 +104,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello45");  /* argc/argv/envp through moqi_libc crt0 */
     run_test("hello46");  /* file-backed mmap (MAP_PRIVATE demand paging) */
     run_test("hello47");  /* /dev/kmsg ring buffer reader */
+    run_test("hello48");  /* MAP_SHARED file mappings (tmpfs/ext2/ramdisk) */
 
     run_test("hello9");   /* fork test */
     run_test("hello10");  /* fork+execve test */

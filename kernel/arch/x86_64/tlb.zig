@@ -44,6 +44,7 @@ const lapic = @import("lapic.zig");
 const smp = @import("../../smp.zig");
 const syscall_entry = @import("syscall_entry.zig");
 const serial = @import("serial.zig");
+const pcid = @import("pcid.zig");
 
 /// Local-flush fallback threshold. More pages than this on a single
 /// shootdown → just reload CR3 (flushes all non-global TLB entries).
@@ -227,6 +228,14 @@ pub fn handleShootdownIpi() void {
 /// uniprocessor (skips the IPI step). `page_count == 0` is a no-op.
 pub fn shootdownRange(addr_start: u64, page_count: u32, target_cr3: u64) void {
     if (page_count == 0) return;
+
+    // PCID: bump the target space's invalidation generation BEFORE the mask
+    // is computed below. CPUs excluded from the mask (they run another CR3)
+    // may still hold stale entries for the target PCID; the generation bump
+    // forces a flushing CR3 write the next time they switch into this space.
+    // Ordered before the current_cr3 reads so a concurrent switchCr3 either
+    // lands in our mask or sees the bump in its post-publish re-check.
+    if (target_cr3 != 0) pcid.noteShootdown(target_cr3);
 
     // Local flush first — synchronous, doesn't need the lock.
     flushLocal(addr_start, page_count);

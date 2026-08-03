@@ -836,3 +836,56 @@ pub fn isCached(inode_id: u64, page_offset: u64) bool {
     }
     return false;
 }
+
+/// H1: mark a cached page dirty — a MAP_SHARED writable mapping points
+/// straight at the cache frame, so writes bypass writePage/updateIfCached
+/// and the dirty bit must be set explicitly when the frame is mapped
+/// writable (the fault handler cannot observe the hardware dirty bit later).
+/// No-op on a miss: only frames actually in the cache can be written through.
+pub fn markDirty(inode_id: u64, page_offset: u64) void {
+    const flags = cache_lock.acquire();
+    defer cache_lock.release(flags);
+
+    const key = CacheKey{ .inode_id = inode_id, .page_offset = page_offset };
+    const bucket = hashKey(key);
+
+    var slot = hash_buckets[bucket];
+    while (slot) |s| {
+        if (pages[s].valid and
+            pages[s].key.inode_id == inode_id and
+            pages[s].key.page_offset == page_offset)
+        {
+            pages[s].dirty = true;
+            dirtySet(s);
+            return;
+        }
+        slot = pages[s].hash_next;
+    }
+}
+
+/// H1: drop ONE clean cache entry. Used by the mmap writeback path
+/// (ext2/fat32 writePageByInode) to retire read-path entries covering file
+/// bytes it just rewrote on disk — the read paths key the cache per FS block
+/// (unflagged namespace) and would otherwise keep serving the stale
+/// pre-writeback data. Dirty entries are never touched: they hold unwritten
+/// data (in practice only flagged mmap-namespace pages are ever dirty, and
+/// the flush loop owns those).
+pub fn invalidatePage(inode_id: u64, page_offset: u64) void {
+    const flags = cache_lock.acquire();
+    defer cache_lock.release(flags);
+
+    const key = CacheKey{ .inode_id = inode_id, .page_offset = page_offset };
+    const bucket = hashKey(key);
+
+    var slot = hash_buckets[bucket];
+    while (slot) |s| {
+        if (pages[s].valid and
+            pages[s].key.inode_id == inode_id and
+            pages[s].key.page_offset == page_offset)
+        {
+            if (!pages[s].dirty) removePage(s);
+            return;
+        }
+        slot = pages[s].hash_next;
+    }
+}

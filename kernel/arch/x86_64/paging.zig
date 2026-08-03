@@ -110,8 +110,22 @@ pub fn mapPageNoFlush(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !vo
     try mapPageInner(pml4_phys, virt, phys, flags, false);
 }
 
+/// PCID safety gate: user mappings must NEVER carry the global bit. Global
+/// entries survive CR3 writes (legacy and PCID no-flush alike) and are
+/// visible in every process context — a global user page would leak one
+/// process's translation into every other address space. All in-tree user
+/// mapping sites pass .global = false; halt loudly if that ever regresses.
+fn assertNotGlobalUser(flags: MapFlags) void {
+    if (flags.user and flags.global) {
+        serial.writeString("[paging] FATAL: user page mapped with global bit (breaks PCID isolation)\n");
+        asm volatile ("cli");
+        while (true) asm volatile ("hlt");
+    }
+}
+
 /// Internal map implementation. `flush_tlb` controls whether invlpg is called.
 fn mapPageInner(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags, flush_tlb: bool) !void {
+    assertNotGlobalUser(flags);
     const pml4_idx = (virt >> 39) & 0x1FF;
     const pdpt_idx = (virt >> 30) & 0x1FF;
     const pd_idx = (virt >> 21) & 0x1FF;
@@ -170,6 +184,7 @@ pub fn isPageMapped(pml4_phys: u64, virt: u64) bool {
 
 /// Map a 2MB huge page via PD entry (no PT needed).
 pub fn mapHugePage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void {
+    assertNotGlobalUser(flags);
     const pml4_idx = (virt >> 39) & 0x1FF;
     const pdpt_idx = (virt >> 30) & 0x1FF;
     const pd_idx = (virt >> 21) & 0x1FF;

@@ -7,6 +7,7 @@
 /// The kernel PML4 entries are shared (not copied), so kernel mappings
 /// are automatically visible in every user address space.
 const paging = @import("../arch/arch.zig").paging;
+const pcid = @import("../arch/arch.zig").pcid;
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 
@@ -65,6 +66,11 @@ pub fn createUserSpace() ?u64 {
         pml4[i] = kernel_pml4[i];
     }
 
+    // PCID: assign a process-context identifier to the new address space
+    // (no-op when PCID is unsupported/disabled or the table is full — the
+    // space then runs with legacy flush-on-switch semantics).
+    pcid.registerSpace(pml4_phys);
+
     return pml4_phys;
 }
 
@@ -101,6 +107,10 @@ pub fn retainUserSpace(pml4_phys: u64) void {
 pub fn destroyUserSpace(pml4_phys: u64) void {
     const remaining = pmm.decRefNoFree(pml4_phys) orelse return;
     if (remaining != 0) return;
+
+    // PCID: free the space's identifier and poison its cached translations
+    // (generation bump + local INVPCID) before the root page can be reused.
+    pcid.unregisterSpace(pml4_phys);
 
     const pml4_virt = hhdm.physToVirt(pml4_phys);
     const pml4: [*]u64 = @ptrFromInt(pml4_virt);

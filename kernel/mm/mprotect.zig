@@ -14,6 +14,7 @@ const user_space = @import("user_space.zig");
 const pmm = @import("pmm.zig");
 const hhdm = @import("hhdm.zig");
 const cow_pte = @import("cow_pte.zig");
+const filemap = @import("filemap.zig");
 
 pub const PROT_NONE: u64 = 0;
 pub const PROT_READ: u64 = 1;
@@ -24,6 +25,37 @@ const errno = @import("../lib/errno.zig");
 const EINVAL = errno.EINVAL;
 const ENOMEM = errno.ENOMEM;
 const EACCES = errno.EACCES;
+
+/// H1: insert a file-region piece cloned from `proto` with a different
+/// prot/file_offset, for mprotect splits. Mirrors the split piece in
+/// mmap.zig's untrackMmapRange, including the ext2 open-slot retain (each
+/// piece's releaseRegionBacking balances one reference).
+fn insertRegionPiece(cur: *task.Task, base: u64, num_pages: u64, proto: *const task.MmapRegion, prot: u8, file_offset: u64) void {
+    for (&cur.mmap_regions) |*slot| {
+        if (!slot.active) {
+            slot.* = .{
+                .base = base,
+                .num_pages = num_pages,
+                .active = true,
+                .locked = proto.locked,
+                .file_kind = proto.file_kind,
+                .shared = proto.shared,
+                .prot = prot,
+                .file_offset = file_offset,
+                .file_size = proto.file_size,
+                .file_idx = proto.file_idx,
+                .file_data = proto.file_data,
+                .inode_id = proto.inode_id,
+            };
+            if (proto.file_kind == @intFromEnum(filemap.FsKind.ext2)) {
+                @import("../fs/ext2.zig").retainFile(proto.file_idx);
+            }
+            cur.mmap_count += 1;
+            return;
+        }
+    }
+    unreachable; // slot capacity is checked before any PTE is touched
+}
 
 /// sysMprotect(addr, len, prot) → 0 on success, negative errno on failure.
 pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
@@ -44,6 +76,24 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task.getTask(cur_idx) orelse return -1;
     if (cur.page_table_phys == 0) return EINVAL; // kernel thread — not allowed
+
+    // H1: file-backed regions carry the prot metadata the demand-fault path
+    // synthesises page permissions from. Partial overlaps split regions, so
+    // count the extra slots BEFORE touching page tables — failing after the
+    // PTE rewrite would leave metadata and page tables describing different
+    // permissions.
+    const len_pages = (len + paging.PAGE_SIZE - 1) / paging.PAGE_SIZE;
+    var slots_needed: u32 = 0;
+    var free_slots: u32 = 0;
+    for (&cur.mmap_regions) |*r| {
+        if (!r.active) {
+            free_slots += 1;
+            continue;
+        }
+        if (r.file_kind == 0) continue; // anonymous faults never read prot
+        slots_needed += filemap.planProtUpdate(r.base, r.num_pages, addr, len_pages).slots_needed;
+    }
+    if (slots_needed > free_slots) return ENOMEM;
 
     // 5. Walk page tables for [addr, addr+len) and modify PTE permissions
     var v = addr;
@@ -97,6 +147,57 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     // when the same address space is mapped on another core (CLONE_VM thread).
     const num_pages: u32 = @intCast((end - addr) / paging.PAGE_SIZE);
     tlb.shootdownRange(addr, num_pages, cur.page_table_phys);
+
+    // H1: update the file regions' prot metadata (splitting on partial
+    // overlaps) so later demand faults grant the new permissions.
+    const new_prot: u8 = @intCast(prot & 7);
+    for (&cur.mmap_regions) |*r| {
+        if (!r.active or r.file_kind == 0) continue;
+        const plan = filemap.planProtUpdate(r.base, r.num_pages, addr, len_pages);
+        if (plan.overlap == .none) continue;
+        const old_prot = r.prot;
+        const old_offset = r.file_offset;
+
+        // Granting WRITE on a MAP_SHARED ext2/fat32 region: pages already
+        // faulted read-only now become writable without another fault, so
+        // their cache frames must be marked dirty now — the fault-time
+        // markDirty never runs for them. Misses are no-ops (not yet cached).
+        if ((new_prot & 2) != 0 and r.shared and
+            (r.file_kind == @intFromEnum(filemap.FsKind.ext2) or
+                r.file_kind == @intFromEnum(filemap.FsKind.fat32)))
+        {
+            const page_cache = @import("../fs/page_cache.zig");
+            const mid_first_file_page = (old_offset + plan.head_pages * paging.PAGE_SIZE) / paging.PAGE_SIZE;
+            for (0..plan.mid_pages) |p| {
+                page_cache.markDirty(r.inode_id, filemap.mmapCacheKey(mid_first_file_page + p));
+            }
+        }
+
+        switch (plan.overlap) {
+            .none => unreachable,
+            .cover => r.prot = new_prot,
+            .head => {
+                // Protected head: r becomes the new-prot head piece; insert
+                // the tail piece keeping the old prot.
+                insertRegionPiece(cur, r.base + plan.mid_pages * paging.PAGE_SIZE, plan.tail_pages, r, old_prot, filemap.advanceFileOffset(old_offset, plan.mid_pages));
+                r.num_pages = plan.mid_pages;
+                r.prot = new_prot;
+            },
+            .tail => {
+                // r keeps the old-prot head; insert the protected tail piece.
+                insertRegionPiece(cur, r.base + plan.head_pages * paging.PAGE_SIZE, plan.mid_pages, r, new_prot, filemap.advanceFileOffset(old_offset, plan.head_pages));
+                r.num_pages = plan.head_pages;
+            },
+            .middle => {
+                // r keeps the old-prot head; insert the protected middle and
+                // the old-prot tail (tail first: insertRegionPiece cannot
+                // fail, so order is only about slot fill).
+                insertRegionPiece(cur, addr + plan.mid_pages * paging.PAGE_SIZE, plan.tail_pages, r, old_prot, filemap.advanceFileOffset(old_offset, plan.head_pages + plan.mid_pages));
+                insertRegionPiece(cur, addr, plan.mid_pages, r, new_prot, filemap.advanceFileOffset(old_offset, plan.head_pages));
+                r.num_pages = plan.head_pages;
+            },
+        }
+    }
 
     return 0;
 }

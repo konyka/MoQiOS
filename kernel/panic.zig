@@ -29,6 +29,18 @@ pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) nor
         arch.cpu.halt();
     }
 
+    // Park the other CPUs immediately via NMI so they stop scheduling and
+    // interleaving serial output with the panic dump. LAPIC may be unmapped
+    // this early (guarded inside sendNmiAllButSelf), and the timer-tick
+    // isPanicking() check remains as the fallback for unreachable CPUs.
+    if (comptime builtin.cpu.arch == .x86_64) {
+        const smp = @import("smp.zig");
+        if (smp.isCpuOnline(1)) {
+            const lapic = @import("arch/x86_64/lapic.zig");
+            _ = lapic.sendNmiAllButSelf();
+        }
+    }
+
     serial.writeString("\n!!! KERNEL PANIC !!!\n");
     serial.writeString("  message: ");
     serial.writeString(msg);

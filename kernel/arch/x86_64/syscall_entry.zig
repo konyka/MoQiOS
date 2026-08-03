@@ -432,11 +432,7 @@ fn prepareSyscallCpu() void {
     }
     pc.current_tid = t.tid;
 
-    asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
-        :
-        : [cr3] "r" (t.page_table_phys),
-        : .{ .rax = true, .memory = true });
-    pc.current_cr3 = t.page_table_phys;
+    @import("pcid.zig").switchCr3(t.page_table_phys);
     syncUserRspToTask(t);
 }
 
@@ -3800,12 +3796,17 @@ fn syscallSchedSetaffinity(pid: u32, cpusetsize: u32, mask_ptr: u64) i64 {
     // Migrate a live task whose current CPU falls outside the new pin —
     // otherwise a running task keeps its old CPU forever (observed: hello44
     // pinned itself to CPU 0 while running elsewhere, then its "same-CPU"
-    // FIFO test ran concurrently with the child). The switch-out path
-    // re-enqueues onto the pinned CPU's queue (enqueueTask honors affinity).
+    // FIFO test ran concurrently with the child). Enqueue onto the pin CPU's
+    // queue FIRST so a runnable copy always waits there, then make the
+    // current CPU switch away (to idle if nothing else is runnable) — a bare
+    // reschedule is not enough: with no other runnable work the scheduler
+    // just keeps the task on the wrong CPU (flaky migration).
     if (target.state == .running and
         target.last_cpu != @as(u32, @intCast(target.cpu_affinity)))
     {
-        sched.kickCpu(@intCast(target.cpu_affinity));
+        const pin_cpu: u8 = @intCast(target.cpu_affinity);
+        _ = @import("../../proc/per_cpu.zig").enqueueTask(target);
+        sched.kickCpu(pin_cpu);
         if (target_idx == cur_idx) {
             sched.forceReschedule();
         } else {

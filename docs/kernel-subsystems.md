@@ -177,7 +177,7 @@ const AddressSpace = struct {
 - 支持 MAP_FIXED 强制指定地址
 - 64条VMA表管理用户态映射区
 - 配套 munmap 解除映射和 msync 同步脏页
-- syscall mmap: 支持匿名映射 + 文件映射 (MAP_PRIVATE)；G2 起文件映射改为
+- syscall mmap: 支持匿名映射 + 文件映射 (MAP_PRIVATE/MAP_SHARED)；G2 起文件映射改为
   页缓存支撑的按需分页 + 零拷贝 COW，详见 1.8.1
 
 **用户地址空间布局**（两种镜像不同，范围校验必须区分）:
@@ -204,19 +204,25 @@ const AddressSpace = struct {
 - 运行时覆盖: `hello30`（brk 增长/清零/收缩 + 匿名 mmap + hint 让位），
   冒烟门禁标记 `hello30: brk/mmap PASS`。
 
-### 1.8.1 文件映射按需分页（G2，MAP_PRIVATE 零拷贝 + COW）✅
+### 1.8.1 文件映射按需分页（G2 零拷贝 + COW，H1 起 MAP_SHARED 写透）✅
 
 文件: `mm/filemap.zig`（纯逻辑，host 可测）, `mm/mmap.zig`, `arch/x86_64/idt.zig`（`handleFileFault`）,
-`fs/page_cache.zig`（`getPageFrame` + 驱逐保护）, `fs/tmpfs.zig`（`tmpfsGetMapPage`/`tmpfsGetCtime`）
+`fs/page_cache.zig`（`getPageFrame`/`markDirty`/`flushInode` + 驱逐保护）, `fs/tmpfs.zig`
+（`tmpfsGetMapPage`/`tmpfsGetCtime`/`tmpfsEnsureMapPage`）, `fs/vfs.zig`（`flushMappedInode`/`syncAll`/`syncFile`）
 
 G2 之前的文件 mmap 在建映射时把文件内容**即时读入**新分配的物理页；G2 改为真正的按需分页：
 `mmap()` 只做校验并把后备元数据记入 `Task.mmap_regions`（`MmapRegion` 新增
-`file_kind/prot/file_offset/file_size/file_idx/file_data/inode_id` 字段，全零 = 匿名，老初始化器不受影响），
-不触碰页表；首次访问触发 #PF，由 `handleFileFault` 按 `filemap.planFault` 决定行为。
+`file_kind/prot/file_offset/file_size/file_idx/file_data/inode_id` 字段，全零 = 匿名，老初始化器不受影响；
+H1 再加 `shared` 字段记录 MAP_SHARED），不触碰页表；首次访问触发 #PF，由 `handleFileFault`
+按 `filemap.planFault` 决定行为。
 
 - **校验**：offset 必须页对齐（否则 EINVAL）；fd 必须是常规文件
-  （ramdisk/tmpfs/ext2/fat32，管道/socket/特殊文件 ENODEV）；O_WRONLY 打开返回 EBADF；
-  文件映射的 MAP_SHARED 本轮拒绝（EOPNOTSUPP，写回留待下轮）。
+  （ramdisk/tmpfs/ext2/fat32，管道/socket/特殊文件 ENODEV）；O_WRONLY 打开返回 EBADF。
+  H1 起接受 MAP_SHARED：`MAP_SHARED|PROT_WRITE` 要求 fd 可写（status_flags 低位为只读 →
+  EACCES，与 Linux 一致）；ramdisk 不可写，`MAP_SHARED|PROT_WRITE` → EROFS（先于 EACCES
+  判定——ramdisk fd 永远不可写，否则 EROFS 不可达）；ramdisk 只读 MAP_SHARED 允许，
+  缺页时与 MAP_PRIVATE 一样复制为私有页（安全选择：ramdisk 帧是 Limine 模块内存、不属于
+  PMM，直接映射会让 unmap 把它喂给空闲池；只读共享与私有副本字节相同，无观测差异）。
 - **EOF 语义**：整页越过 EOF 的访问 → SIGSEGV（Linux 是 SIGBUS，本内核统一 SEGV，状态码 139）；
   最后一个部分页正常供给，尾部清零。`file_size` 取 mmap 时的快照。
 - **零拷贝共享帧**：tmpfs 直接映射其数据页；ext2/fat32 经 page_cache
@@ -239,16 +245,51 @@ G2 之前的文件 mmap 在建映射时把文件内容**即时读入**新分配�
   拿到零页而**不会**拿到复用槽位里别的文件的数据。
 - **swap 交互**：`reclaimScanPass` 跳过 refcount > 1 的帧（COW 共享页与文件后备页），
   干净文件页本就可从后备存储重新缺页，无需占用交换槽。
-- **已知限制**：mremap 对文件区域仅支持收缩（增长/移动返回 ENOMEM——移动会把
-  未缺页的文件页换成零页）；mprotect 只改已映射 PTE，不更新区域 prot 元数据；
+- **MAP_SHARED 写透（H1）**：共享映射缺页时直接以后备帧的可写 PTE 映射（
+  `filemap.sharedPte`，无 COW 位），写入直达 tmpfs 数据页或页缓存帧，所有共享者
+  立即可见。tmpfs 稀疏空洞用 `tmpfsEnsureMapPage` 分配真实后备页（私有零页会悄悄
+  "去共享"）；tmpfs 是内存文件系统，无需脏页跟踪。ext2/fat32 在映射可写时立即
+  `page_cache.markDirty`（映射后硬件脏位无法廉价观测，宁可多写回不可漏写）；
+  写回点：`untrackMmapRange`/`releaseRegionBacking`（munmap/exit/exec，经
+  `vfs.flushMappedInode` → `page_cache.flushInode`）与 msync → `vfs.syncAll`
+  （新增 `page_cache.flushAll` 一路，回写回调按 inode 高位标签分发到
+  `ext2/fat32.writePageByInode`——按 inode 写盘、不动 i_size、不像 writeFile 那样
+  顺手 invalidate 缓存）。写回 staged-writeback 叠加的选择：MAP_SHARED 缺页未命中时
+  先 `vfs.syncFile` 把该 inode 的 writeback 暂存区刷到磁盘再读盘填缓存——若只做
+  readBuffered 叠加，暂存区仍在，日后写回会用旧数据盖掉映射侧的新写入。
+- **页缓存键名空间（H1）**：ext2 按 1KiB 逻辑块、fat32 按簇做缓存键，与 4K 映射页
+  不同粒度；mmap 侧一律用 `filemap.mmapCacheKey`（bit63 置位）存取整 4K 页，避免
+  撞上读路径只含一个文件系统块有效字节的条目（这一错位在 G2 的 ext2/fat32
+  MAP_PRIVATE 路径上同样存在，本轮一并改走带标志的键修复）。
+- **fork 与 MAP_SHARED（H1）**：`cloneUserPagesCow` 接收父进程区域表，落在
+  MAP_SHARED 文件区域内的页跳过一次 COW 降级（否则子进程首写会被复制成私有页，
+  父进程永远看不到），addRef 记账不变；munmap/exit 时各地址空间 decRef 平衡。
+- **mremap/mprotect 补齐（H1）**：文件区域允许**原地增长**（新页不预映射，按需缺页；
+  越过记录文件大小的页访问即 SIGSEGV，与 Linux 允许增长过 EOF 但访问即 SIGBUS 的
+  语义对应；移动文件区域仍拒绝——moveMapping 会把未缺页的共享帧换成私有零页）。
+  mprotect 在改 PTE 之外同步更新文件区域的 prot 元数据（`filemap.planProtUpdate`
+  分类 cover/head/tail/middle，部分覆盖时拆区域、ext2 片各补一次 retain，拆前先做
+  槽位容量检查）；对获得 PROT_WRITE 的 MAP_SHARED ext2/fat32 区域，顺手把已缓存页
+  markDirty——这些页此前以只读缺入，此后可写但不再经过缺页路径。
+- **已知限制**：mremap 文件区域仅支持原地增长/收缩（移动返回 ENOMEM）；
+  MAP_SHARED 可写页与随后对同一 inode 的 `write()` 系统调用之间不做一致性保证
+  （writeFile 会 invalidate 该 inode 的缓存页，未刷出的映射写入可能丢失——请先
+  msync）；MAP_SHARED 映射可写时页缓存 insert 失败（缓存满）会先刷本 inode 脏页
+  重试一次，仍失败则缺页失败（SIGSEGV）——绝不退化为会丢写的私有副本；
   内核态 `copy_to_user` 对未缺页的文件映射返回 EFAULT（无内核态按需分页）；
   同一地址空间多线程并发缺同一文件页时后写 PTE 者胜出（与既有匿名按需分页同级竞态）。
 - **运行时覆盖**：`user/hello46.c`（tmpfs 文件写模式串 → MAP_PRIVATE 映射 →
   close(fd) 后验证内容 → 尾部清零 → 写穿透后 pread 验证文件不变（COW）→
   fork 子进程缺页继承区域 + 越过 EOF 整页 SIGSEGV(139)），
-  门禁标记 `hello46: PASS` / `hello46 done`。
+  门禁标记 `hello46: PASS` / `hello46 done`；
+  `user/hello48.c`（tmpfs MAP_SHARED fork 后子写父读零系统调用可见 →
+  ext2 MAP_SHARED 写透 + msync 后另一 fd pread 验证落盘 →
+  ramdisk MAP_SHARED|PROT_WRITE 返回 EROFS、只读共享可用），
+  门禁标记 `hello48: PASS` / `hello48 done`。
 - **Host 单测**：`tests/main.zig` 末尾 `// ─── file mmap (G2) ───` 块
-  （区域查找、EOF 钳制、权限/PTE 合成、offset 校验、head-trim 偏移推进、合并规则）。
+  （区域查找、EOF 钳制、权限/PTE 合成、offset 校验、head-trim 偏移推进、合并规则）与
+  `// ─── MAP_SHARED (H1) ───` 块（sharedPte 合成、共享 planFault 抑制 COW、
+  4K 缓存键标志、mprotect 拆分分类、mremap 增长窗口）。
 
 ### 1.9 Swap 页面置换 (Clock算法 + u64位图分配 + 256MB swap) ✅
 

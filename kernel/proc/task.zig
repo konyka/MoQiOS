@@ -246,8 +246,12 @@ pub const MmapRegion = struct {
     /// Backing store kind (filemap.FsKind as u8); 0 = anonymous.
     file_kind: u8 = 0,
     /// PROT_READ/WRITE/EXEC bits captured at mmap; demand faults synthesise
-    /// page permissions from this.
+    /// page permissions from this. mprotect updates it (splitting regions).
     prot: u8 = 0,
+    /// H1: MAP_SHARED region — faults map the backing frame writable with no
+    /// COW marker, fork keeps the frame shared, and ext2/fat32 regions flush
+    /// their dirty page-cache pages when the region is released.
+    shared: bool = false,
     /// Byte offset in the file that corresponds to `base`.
     file_offset: u64 = 0,
     /// File size snapshot taken at mmap time — drives the EOF/SIGSEGV rule.

@@ -49,7 +49,7 @@ USER_PROGRAMS=(
     hello2 hello3 hello4 hello5 hello6 hello7 hello8 sh
     hello9 hello10 hello11 hello12 hello13 hello14 hello15 hello16
     hello17 hello18 hello19 hello20 hello21 hello22 hello23 hello24
-    hello25 hello26 hello27 hello28 hello29 hello30 hello31 hello32 hello33 hello34 hello35 hello36 hello37 hello38 hello39 hello40 hello41 hello42 hello43 hello44 hello45 hello46 hello47
+    hello25 hello26 hello27 hello28 hello29 hello30 hello31 hello32 hello33 hello34 hello35 hello36 hello37 hello38 hello39 hello40 hello41 hello42 hello43 hello44 hello45 hello46 hello47 hello48
 )
 for program in "${USER_PROGRAMS[@]}"; do
     src="$USER_SRC_DIR/${program}.bin"

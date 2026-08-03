@@ -43,17 +43,22 @@ pub var ticks_per_10ms: u32 = 0;
 const ICR_DELIVERY_POLL_LIMIT: u32 = 1_000_000;
 
 fn read(offset: u32) u32 {
+    if (lapic_base == 0) return 0; // LAPIC not yet mapped (early boot / KVM)
     const addr: *volatile u32 = @ptrFromInt(lapic_base + offset);
     return addr.*;
 }
 
 fn writeReg(offset: u32, value: u32) void {
+    if (lapic_base == 0) return; // LAPIC not yet mapped (early boot / KVM)
     const addr: *volatile u32 = @ptrFromInt(lapic_base + offset);
     addr.* = value;
 }
 
 /// Send End-of-Interrupt.
 pub fn eoi() void {
+    // IRQs can arrive before lapic.init maps the MMIO window (observed on
+    // KVM: timer IRQ during early init → EOI to address 0xB0 → page fault).
+    if (lapic_base == 0) return;
     writeReg(REG_EOI, 0);
 }
 
@@ -99,6 +104,16 @@ pub fn sendStartupIpi(apic_id: u8, vector_page: u8) bool {
 pub fn sendIpi(apic_id: u8, vector: u8) bool {
     writeReg(REG_ICR_HIGH, @as(u32, apic_id) << 24);
     writeReg(REG_ICR_LOW, 0x00004000 | @as(u32, vector));
+    return waitForIcrDelivery();
+}
+
+/// Broadcast an NMI to all CPUs except the sender (ICR "all excluding self"
+/// shorthand, delivery mode = NMI). Used by the panic path to park APs
+/// immediately instead of waiting for their next timer tick.
+pub fn sendNmiAllButSelf() bool {
+    writeReg(REG_ICR_HIGH, 0);
+    // bits 19:18 = 0b11 (all excluding self), delivery mode 0b100 (NMI).
+    writeReg(REG_ICR_LOW, 0x000C4400);
     return waitForIcrDelivery();
 }
 

@@ -276,6 +276,12 @@ pub fn interruptDispatch(frame: *InterruptFrame) callconv(.c) void {
     const vector: u8 = @truncate(frame.vector);
 
     if (vector < 32) {
+        // NMI (vector 2): a panic on another CPU broadcasts NMIs to park this
+        // CPU immediately. A "real" NMI is still fatal.
+        if (vector == 2 and @import("../../panic.zig").isPanicking()) {
+            const cpu = @import("arch_impl.zig").cpu;
+            cpu.halt();
+        }
         // Vector 7 (#NM, Device Not Available) drives the lazy FPU/SSE
         // restore path — NOT a fatal exception. Handle it here and let the
         // offending instruction re-execute via iretq.
@@ -707,13 +713,18 @@ fn mapZeroPrivatePage(current: anytype, page_addr: u64, prot: u8) bool {
     return mapRawUserPte(current, page_addr, filemap.privatePte(phys, prot), phys);
 }
 
-/// G2: demand paging for file-backed (MAP_PRIVATE) mmap regions.
+/// G2/H1: demand paging for file-backed mmap regions.
 ///
 /// The region metadata recorded by mmap() (task.MmapRegion) says what backs
-/// each page. Shared backing frames (page-cache, tmpfs) are mapped read-only
-/// with the COW marker after pmm.addRef — a write faults into handleCowFault
-/// which copies, so the file never sees MAP_PRIVATE writes. Pages wholly
-/// past EOF return false, which the caller turns into SIGSEGV.
+/// each page. MAP_PRIVATE: shared backing frames (page-cache, tmpfs) are
+/// mapped read-only with the COW marker after pmm.addRef — a write faults
+/// into handleCowFault which copies, so the file never sees MAP_PRIVATE
+/// writes. MAP_SHARED (H1): the backing frame is mapped honouring prot —
+/// writable and WITHOUT the COW marker when the mapping has PROT_WRITE — so
+/// writes land on tmpfs's page or the page-cache frame directly; for
+/// ext2/fat32 the cache page is marked dirty and flushed at munmap/exit/
+/// exec (mmap.zig releaseRegionBacking) and by msync→vfs.syncAll. Pages
+/// wholly past EOF return false, which the caller turns into SIGSEGV.
 fn handleFileFault(current: anytype, page_addr: u64) bool {
     const pmm = @import("../../mm/pmm.zig");
     const hhdm = @import("../../mm/hhdm.zig");
@@ -751,6 +762,9 @@ fn handleFileFault(current: anytype, page_addr: u64) bool {
             // Ramdisk frames are Limine module memory — not PMM-owned, so
             // they cannot be refcounted and must never be mapped shared
             // (unmap would feed them to the free pool). Serve a private copy.
+            // This covers MAP_SHARED read-only too (writable shared ramdisk
+            // is rejected with EROFS at mmap time): identical bytes, and no
+            // sharer can ever observe a write through a read-only mapping.
             const phys = pmm.allocPage() orelse return false;
             const dst: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
             const src: [*]const u8 = @ptrFromInt(region.file_data + plan.file_off);
@@ -764,10 +778,31 @@ fn handleFileFault(current: anytype, page_addr: u64) bool {
             const tmpfs = @import("../../fs/tmpfs.zig");
             const page_idx: u32 = @intCast(plan.file_off / paging_mod.PAGE_SIZE);
             // region.file_data holds the ctime generation tag from mmap time.
+            if (region.shared) {
+                if (plan.shared_write) {
+                    // Writable shared: the write must land on tmpfs-owned
+                    // memory, so sparse holes get a real backing page — a
+                    // private zero page would silently unshare the mapping.
+                    if (tmpfs.tmpfsEnsureMapPage(@intCast(region.file_idx), region.file_data, page_idx)) |phys| {
+                        pmm.addRef(phys);
+                        return mapRawUserPte(current, page_addr, filemap.sharedPte(phys, region.prot), phys);
+                    }
+                    // Stale mapping (slot recycled): private zero page.
+                    return mapZeroPrivatePage(current, page_addr, region.prot);
+                }
+                // Read-only shared: zero-copy read-only frame. A hole reads
+                // as zeros from a private page — never written, so sharing
+                // is irrelevant. Memory fs: no dirty tracking or flush.
+                if (tmpfs.tmpfsGetMapPage(@intCast(region.file_idx), region.file_data, page_idx)) |phys| {
+                    pmm.addRef(phys);
+                    return mapRawUserPte(current, page_addr, filemap.sharedPte(phys, region.prot), phys);
+                }
+                return mapZeroPrivatePage(current, page_addr, region.prot);
+            }
+            // MAP_PRIVATE: zero-copy shared read-only (+COW when writable).
+            // addRef makes our unmap a decRef, so tmpfs's own freePage can
+            // never pull the frame from under us.
             if (tmpfs.tmpfsGetMapPage(@intCast(region.file_idx), region.file_data, page_idx)) |phys| {
-                // Zero-copy: share tmpfs's frame read-only (+COW when the
-                // mapping is writable). addRef makes our unmap a decRef, so
-                // tmpfs's own freePage can never pull the frame from under us.
                 pmm.addRef(phys);
                 return mapRawUserPte(current, page_addr, filemap.filePte(phys, plan.cow, plan.executable), phys);
             }
@@ -777,17 +812,38 @@ fn handleFileFault(current: anytype, page_addr: u64) bool {
         },
         .ext2, .fat32 => {
             const page_cache = @import("../../fs/page_cache.zig");
-            const page_off = plan.file_off / paging_mod.PAGE_SIZE;
+            const writeback = @import("../../fs/writeback.zig");
+            const vfs = @import("../../fs/vfs.zig");
+            const wb_fs: writeback.FsType = if (kind == .ext2) .ext2 else .fat32;
+            // mmap pages live in a flagged 4K cache namespace: the FS read
+            // paths key the cache per FS block (1KiB ext2 blocks, per-cluster
+            // fat32), so an unflagged lookup could hit an entry holding only
+            // one FS block of valid data (zero tail) for a 4K file page.
+            const key = filemap.mmapCacheKey(plan.file_off / paging_mod.PAGE_SIZE);
 
-            // Cache hit: map the cached frame read-only shared (zero-copy).
-            if (page_cache.getPageFrame(region.inode_id, page_off)) |phys| {
+            // Cache hit: map the cached frame zero-copy.
+            if (page_cache.getPageFrame(region.inode_id, key)) |phys| {
                 pmm.addRef(phys);
+                if (region.shared) {
+                    // Mapped writable without COW — writes go straight to the
+                    // cache frame, so the dirty bit cannot be observed later;
+                    // set it now. Flush points: munmap/exit/exec + msync.
+                    if (plan.shared_write) page_cache.markDirty(region.inode_id, key);
+                    return mapRawUserPte(current, page_addr, filemap.sharedPte(phys, region.prot), phys);
+                }
                 return mapRawUserPte(current, page_addr, filemap.filePte(phys, plan.cow, plan.executable), phys);
             }
 
-            // Cache miss: read the page from disk into a scratch frame. The
-            // read populates the page cache as a side effect, so re-check
-            // before falling back to a private copy.
+            // MAP_SHARED cache miss: flush the inode's staged writeback
+            // extents to disk FIRST. The cache frame mapped below becomes the
+            // authoritative copy for the mapping's writes; a still-staged
+            // extent flushed later would overwrite those newer writes with
+            // stale data. syncFile retires the extents, removing the hazard.
+            if (region.shared) {
+                _ = vfs.syncFile(region.inode_id, wb_fs);
+            }
+
+            // Cache miss: read the page from disk into a scratch frame.
             const scratch = pmm.allocPage() orelse return false;
             const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(scratch));
             var n: i64 = switch (kind) {
@@ -798,20 +854,41 @@ fn handleFileFault(current: anytype, page_addr: u64) bool {
             const got: u32 = @intCast(n);
             if (got < 4096) @memset(buf[got..4096], 0);
 
-            // Staged writeback data (written, not yet flushed) wins over the
-            // disk image; an overlaid page must stay a private copy because
-            // the cache holds the pre-write contents.
-            const writeback = @import("../../fs/writeback.zig");
-            const wb_fs: writeback.FsType = if (kind == .ext2) .ext2 else .fat32;
-            const overlaid = writeback.readBuffered(region.inode_id, plan.file_off, buf, 4096, wb_fs);
-            if (overlaid == 0) {
-                if (page_cache.getPageFrame(region.inode_id, page_off)) |phys| {
-                    pmm.freePage(scratch);
-                    pmm.addRef(phys);
-                    return mapRawUserPte(current, page_addr, filemap.filePte(phys, plan.cow, plan.executable), phys);
+            if (!region.shared) {
+                // Staged writeback data (written, not yet flushed) wins over
+                // the disk image; an overlaid page must stay a private copy
+                // because the cache holds the pre-write contents.
+                const overlaid = writeback.readBuffered(region.inode_id, plan.file_off, buf, 4096, wb_fs);
+                if (overlaid != 0) {
+                    return mapRawUserPte(current, page_addr, filemap.privatePte(scratch, region.prot), scratch);
                 }
             }
-            return mapRawUserPte(current, page_addr, filemap.privatePte(scratch, region.prot), scratch);
+
+            // Transfer the scratch frame to the page cache (mmap namespace)
+            // so every mapping of this file page shares it zero-copy.
+            if (page_cache.insertPageOwned(region.inode_id, key, scratch, 4096) == null) {
+                if (region.shared) {
+                    // Cache full: flush this inode's dirty mmap pages (making
+                    // slots evictable) and retry once. Failing that, refuse
+                    // the fault — a private copy would silently lose shared
+                    // writes, which is worse than a SIGSEGV.
+                    vfs.flushMappedInode(region.inode_id);
+                    if (page_cache.insertPageOwned(region.inode_id, key, scratch, 4096) == null) {
+                        pmm.freePage(scratch);
+                        return false;
+                    }
+                } else {
+                    // Cache full — fall back to an exclusively owned copy.
+                    return mapRawUserPte(current, page_addr, filemap.privatePte(scratch, region.prot), scratch);
+                }
+            }
+
+            pmm.addRef(scratch);
+            if (region.shared) {
+                if (plan.shared_write) page_cache.markDirty(region.inode_id, key);
+                return mapRawUserPte(current, page_addr, filemap.sharedPte(scratch, region.prot), scratch);
+            }
+            return mapRawUserPte(current, page_addr, filemap.filePte(scratch, plan.cow, plan.executable), scratch);
         },
     }
 }

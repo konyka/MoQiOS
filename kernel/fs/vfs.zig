@@ -1091,6 +1091,35 @@ pub fn initWritebackCallbacks() void {
     writeback.setFlushCallback(.fat32, fat32WriteFlush);
 }
 
+/// H1: writeback callback for mmap-owned dirty page-cache pages (MAP_SHARED).
+/// The page cache key carries filemap's 4K-namespace flag, stripped here; the
+/// FS is identified by the inode_id high nibble (0x3… = ext2, 0x2… = fat32).
+/// Dispatches to writePageByInode, which — unlike writeFile — never
+/// invalidates the cache mid-flush and never grows the file.
+fn mappedPageWriteback(inode_id: u64, page_offset: u64, data: *[4096]u8) bool {
+    const filemap = @import("../mm/filemap.zig");
+    const page_idx = filemap.mmapCachePage(page_offset);
+    const EXT2_TAG: u64 = 0x3000_0000_0000_0000;
+    const FAT32_TAG: u64 = 0x2000_0000_0000_0000;
+    const tag = inode_id & 0xF000_0000_0000_0000;
+    if (tag == EXT2_TAG) {
+        const ext2 = @import("ext2.zig");
+        return ext2.writePageByInode(@intCast(inode_id - EXT2_TAG), page_idx, data);
+    }
+    if (tag == FAT32_TAG) {
+        const fat32 = @import("fat32.zig");
+        return fat32.writePageByInode(@intCast(inode_id - FAT32_TAG), page_idx, data);
+    }
+    return false;
+}
+
+/// H1: flush an inode's dirty mmap-owned cache pages to disk. Called when a
+/// MAP_SHARED ext2/fat32 region is released (munmap/exit/exec) and from the
+/// MAP_SHARED fault path's cache-full recovery.
+pub fn flushMappedInode(inode_id: u64) void {
+    _ = page_cache.flushInode(inode_id, mappedPageWriteback);
+}
+
 // ---------------------------------------------------------------------------
 // Deferred writeback flush (dedicated kernel thread)
 // ---------------------------------------------------------------------------
@@ -1164,6 +1193,12 @@ pub fn syncAll() bool {
     // one does not strand the other's dirty data.
     const ext2_ok = writeback.flushAllByType(.ext2, ext2WriteFlush);
     const fat32_ok = writeback.flushAllByType(.fat32, fat32WriteFlush);
+    // H1: dirty mmap-owned (MAP_SHARED) cache pages too — msync routes here.
+    // Only mmap pages are ever marked dirty in the page cache, so this scans
+    // exactly the shared-mapping writeback set. Pages that fail to write stay
+    // dirty for a later pass; they do not flip the return value (matching the
+    // pre-H1 contract, which had no page-cache component at all).
+    _ = page_cache.flushAll(mappedPageWriteback);
     return ext2_ok and fat32_ok;
 }
 
@@ -1171,6 +1206,9 @@ pub fn syncAll() bool {
 /// Returns false if any buffer could not be written.
 /// v53.51: keyed by inode_id (writeback buffers are inode-keyed, not slot-keyed).
 pub fn syncFile(inode_id: u64, fs_type: writeback.FsType) bool {
+    // H1: also flush this inode's dirty mmap-owned cache pages, so fsync on a
+    // file with a dirty MAP_SHARED mapping persists the mapping's writes.
+    _ = page_cache.flushInode(inode_id, mappedPageWriteback);
     return switch (fs_type) {
         .ext2 => writeback.flushFile(inode_id, .ext2, ext2WriteFlush),
         .fat32 => writeback.flushFile(inode_id, .fat32, fat32WriteFlush),

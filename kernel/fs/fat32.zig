@@ -1000,6 +1000,75 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
     return @intCast(bytes_written);
 }
 
+/// H1: write one mmap-owned 4KiB cache page back for a MAP_SHARED mapping,
+/// keyed by first cluster (the page-cache flush callback has no open slot).
+///
+/// Walks the existing cluster chain only — a mapping can never extend a file
+/// (the fault path clamps at the mmap-time size), so clusters are never
+/// allocated and bytes past the chain end are dropped. Never invalidates the
+/// page cache (the flush loop owns those entries) and never touches the
+/// directory entry/i_size.
+pub fn writePageByInode(first_cluster: u32, page_idx: u64, data: *const [4096]u8) bool {
+    if (!fat32_active) return false;
+    const page_cache = @import("page_cache.zig");
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+
+    const cluster_size: u64 = @as(u64, fat32_sectors_per_cluster) * SECTOR_SIZE;
+    const base: u64 = page_idx * 4096;
+    const end: u64 = base + 4096;
+    const src: [*]const u8 = data;
+    const wbuf: [*]u8 = @ptrFromInt(write_buf_virt);
+
+    var cluster: u32 = first_cluster;
+    var file_offset: u64 = 0;
+    while (cluster >= 2 and cluster < 0x0FFFFFF8) {
+        const cluster_end = file_offset + cluster_size;
+        if (file_offset >= end) break;
+
+        if (cluster_end > base and file_offset < end) {
+            const overlap_start: u64 = if (base > file_offset) base - file_offset else 0;
+            const overlap_end: u64 = @min(end - file_offset, cluster_size);
+            const src_off: u64 = file_offset + overlap_start - base;
+
+            if (overlap_start == 0 and overlap_end == cluster_size and fat32_sectors_per_cluster <= 8) {
+                @memcpy(wbuf[0..cluster_size], src[src_off .. src_off + cluster_size]);
+                if (safeWriteSectors(clusterToLBA(cluster), fat32_sectors_per_cluster, wbuf) <= 0) return false;
+            } else if (fat32_sectors_per_cluster <= 8) {
+                if (virtio_blk.readSectors(clusterToLBA(cluster), fat32_sectors_per_cluster, wbuf) <= 0) return false;
+                @memcpy(wbuf[overlap_start..overlap_end], src[src_off .. src_off + (overlap_end - overlap_start)]);
+                if (safeWriteSectors(clusterToLBA(cluster), fat32_sectors_per_cluster, wbuf) <= 0) return false;
+            } else {
+                // Partial cluster, large-spc: per-sector read-modify-write.
+                var sec: u32 = 0;
+                while (sec < fat32_sectors_per_cluster) : (sec += 1) {
+                    const sec_start: u64 = @as(u64, sec) * SECTOR_SIZE;
+                    const sec_end: u64 = sec_start + SECTOR_SIZE;
+                    if (sec_end <= overlap_start or sec_start >= overlap_end) continue;
+                    const mod_start = @max(overlap_start, sec_start);
+                    const mod_end = @min(overlap_end, sec_end);
+                    const lba = clusterToLBA(cluster) + sec;
+                    if (mod_start == sec_start and mod_end == sec_end) {
+                        @memcpy(wbuf[0..SECTOR_SIZE], src[src_off + sec_start - overlap_start ..][0..SECTOR_SIZE]);
+                    } else {
+                        if (virtio_blk.readSectors(lba, 1, wbuf) <= 0) return false;
+                        @memcpy(wbuf[mod_start - sec_start .. mod_end - sec_start], src[src_off + mod_start - overlap_start .. src_off + mod_end - overlap_start]);
+                    }
+                    if (safeWriteSectors(lba, 1, wbuf) <= 0) return false;
+                }
+            }
+            // Retire the read-path cache entry for this cluster (readFile
+            // keys the cache by cluster number) — it now holds stale
+            // pre-writeback bytes.
+            page_cache.invalidatePage(0x2000_0000_0000_0000 + @as(u64, first_cluster), cluster);
+        }
+
+        file_offset = cluster_end;
+        cluster = getFATEntry(cluster) orelse break;
+    }
+    return true;
+}
+
 fn updateDirEntry(file_idx: u32) void {
     if (file_idx >= file_count) return;
     const fi = files[file_idx];

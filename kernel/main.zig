@@ -88,6 +88,11 @@ export fn _start() callconv(.c) noreturn {
     // M2: Page table operations
     paging.init();
 
+    // PCID: probe CPUID.(7,0):EBX.17 and set CR4.PCIDE when available.
+    // Must run before the first user address space is created and before
+    // SMP bring-up (APs pick the state up via pcid.initThisCpu).
+    @import("arch/arch.zig").pcid.init();
+
     // M2: Address space + DMA (shared portable mm boot — SK-25)
     subsystem_boot.initPortableMm();
 

@@ -639,3 +639,22 @@ pub const tlb = struct {
         asm volatile ("isb");
     }
 };
+
+/// PCID is x86_64-only; aarch64 keeps the facade namespace as no-ops so
+/// shared mm code (user_space) compiles unchanged.
+pub const pcid = struct {
+    pub fn init() void {}
+    pub fn initThisCpu() void {}
+    pub fn registerSpace(pml4_phys: u64) void {
+        _ = pml4_phys;
+    }
+    pub fn unregisterSpace(pml4_phys: u64) void {
+        _ = pml4_phys;
+    }
+    pub fn noteShootdown(target_cr3: u64) void {
+        _ = target_cr3;
+    }
+    pub fn switchCr3(pml4_phys: u64) void {
+        _ = pml4_phys;
+    }
+};

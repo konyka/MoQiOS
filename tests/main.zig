@@ -876,6 +876,7 @@ const G2Region = struct {
     prot: u8 = 0,
     file_offset: u64 = 0,
     file_size: u64 = 0,
+    shared: bool = false,
 };
 
 test "G2: mmap offset must be page-aligned" {
@@ -996,3 +997,261 @@ test "G2: PTE synthesis for shared file frames and private copies" {
     try std.testing.expect(pte & filemap.PTE_WRITABLE == 0);
 }
 // ─── end file mmap (G2) ───
+
+// ─── MAP_SHARED (H1) ───
+
+test "H1: sharedPte maps the backing frame writable per prot, never COW" {
+    const phys: u64 = 0x45670000;
+
+    // Writable shared mapping: present+user+writable, no COW, NX.
+    var pte = filemap.sharedPte(phys, filemap.PROT_READ | filemap.PROT_WRITE);
+    try std.testing.expectEqual(phys, pte & filemap.PTE_ADDR_MASK);
+    try std.testing.expect(pte & filemap.PTE_PRESENT != 0);
+    try std.testing.expect(pte & filemap.PTE_USER != 0);
+    try std.testing.expect(pte & filemap.PTE_WRITABLE != 0);
+    try std.testing.expect(pte & filemap.PTE_COW == 0);
+    try std.testing.expect(pte & filemap.PTE_NX != 0);
+
+    // Read-only shared mapping: not writable, still no COW.
+    pte = filemap.sharedPte(phys, filemap.PROT_READ);
+    try std.testing.expect(pte & filemap.PTE_WRITABLE == 0);
+    try std.testing.expect(pte & filemap.PTE_COW == 0);
+
+    // Executable shared mapping keeps NX clear.
+    pte = filemap.sharedPte(phys, filemap.PROT_READ | filemap.PROT_EXEC);
+    try std.testing.expect(pte & filemap.PTE_NX == 0);
+}
+
+test "H1: planFault suppresses COW and requests writable shared frames" {
+    const PAGE = filemap.PAGE_SIZE;
+    const r = G2Region{
+        .base = 0x400000,
+        .num_pages = 2,
+        .active = true,
+        .file_kind = 2,
+        .prot = filemap.PROT_READ | filemap.PROT_WRITE,
+        .file_offset = 0,
+        .file_size = 8192,
+        .shared = true,
+    };
+    // Writable MAP_SHARED: no COW marker, direct writable shared frame.
+    var p = filemap.planFault(G2Region, &r, 0x400000);
+    try std.testing.expect(p.action == .file_page);
+    try std.testing.expect(!p.cow);
+    try std.testing.expect(p.shared_write);
+
+    // Read-only MAP_SHARED: shared frame, but not writable.
+    const r_ro = G2Region{ .base = 0x400000, .num_pages = 1, .active = true, .file_kind = 2, .prot = filemap.PROT_READ, .file_offset = 0, .file_size = 4096, .shared = true };
+    p = filemap.planFault(G2Region, &r_ro, 0x400000);
+    try std.testing.expect(!p.cow);
+    try std.testing.expect(!p.shared_write);
+
+    // EOF rule is unchanged for shared mappings.
+    const r_eof = G2Region{ .base = 0x400000, .num_pages = 3, .active = true, .file_kind = 3, .prot = filemap.PROT_READ | filemap.PROT_WRITE, .file_offset = 0, .file_size = 2 * PAGE, .shared = true };
+    p = filemap.planFault(G2Region, &r_eof, 0x400000 + 2 * PAGE);
+    try std.testing.expect(p.action == .segv);
+}
+
+test "H1: mmap page-cache keys live in a flagged 4K namespace" {
+    // The FS read paths key the page cache per FS block (e.g. 1KiB ext2
+    // blocks); mmap pages must not collide with those entries.
+    const key = filemap.mmapCacheKey(7);
+    try std.testing.expect(key & filemap.MMAP_CACHE_FLAG != 0);
+    try std.testing.expectEqual(@as(u64, 7), filemap.mmapCachePage(key));
+    try std.testing.expectEqual(@as(u64, 0), filemap.mmapCachePage(filemap.mmapCacheKey(0)));
+    // Stripping is idempotent for unflagged keys (flush callback contract).
+    try std.testing.expectEqual(@as(u64, 42), filemap.mmapCachePage(42));
+}
+
+test "H1: planProtUpdate classifies mprotect overlap shapes" {
+    const PAGE = filemap.PAGE_SIZE;
+    const R = 0x800000; // region base, 4 pages
+
+    // No overlap.
+    var plan = filemap.planProtUpdate(R, 4, 0x900000, 2);
+    try std.testing.expect(plan.overlap == .none);
+    try std.testing.expectEqual(@as(u8, 0), plan.slots_needed);
+
+    // Full cover: no split, one extra slot never needed.
+    plan = filemap.planProtUpdate(R, 4, R, 4);
+    try std.testing.expect(plan.overlap == .cover);
+    try std.testing.expectEqual(@as(u64, 4), plan.mid_pages);
+    try std.testing.expectEqual(@as(u8, 0), plan.slots_needed);
+    plan = filemap.planProtUpdate(R, 4, R - PAGE, 6); // range larger than region
+    try std.testing.expect(plan.overlap == .cover);
+
+    // Head overlap: [R, R+2P) protected, tail keeps old prot.
+    plan = filemap.planProtUpdate(R, 4, R, 2);
+    try std.testing.expect(plan.overlap == .head);
+    try std.testing.expectEqual(@as(u64, 2), plan.mid_pages);
+    try std.testing.expectEqual(@as(u64, 2), plan.tail_pages);
+    try std.testing.expectEqual(@as(u8, 1), plan.slots_needed);
+
+    // Tail overlap: head keeps old prot, [R+2P, R+4P) protected.
+    plan = filemap.planProtUpdate(R, 4, R + 2 * PAGE, 2);
+    try std.testing.expect(plan.overlap == .tail);
+    try std.testing.expectEqual(@as(u64, 2), plan.head_pages);
+    try std.testing.expectEqual(@as(u64, 2), plan.mid_pages);
+    try std.testing.expectEqual(@as(u8, 1), plan.slots_needed);
+
+    // Middle: three pieces, two extra slots.
+    plan = filemap.planProtUpdate(R, 4, R + PAGE, 2);
+    try std.testing.expect(plan.overlap == .middle);
+    try std.testing.expectEqual(@as(u64, 1), plan.head_pages);
+    try std.testing.expectEqual(@as(u64, 2), plan.mid_pages);
+    try std.testing.expectEqual(@as(u64, 1), plan.tail_pages);
+    try std.testing.expectEqual(@as(u8, 2), plan.slots_needed);
+}
+
+test "H1: inSharedFileRegion matches only shared file regions" {
+    const regions = [_]G2Region{
+        .{ .base = 0x1000, .num_pages = 2, .active = true, .file_kind = 2, .shared = true },
+        .{ .base = 0x4000, .num_pages = 2, .active = true, .file_kind = 2, .shared = false }, // private
+        .{ .base = 0x8000, .num_pages = 2, .active = true, .file_kind = 0, .shared = true }, // anonymous
+        .{ .base = 0xc000, .num_pages = 2, .active = false, .file_kind = 3, .shared = true }, // inactive
+    };
+    try std.testing.expect(filemap.inSharedFileRegion(G2Region, &regions, 0x1000));
+    try std.testing.expect(filemap.inSharedFileRegion(G2Region, &regions, 0x2fff));
+    try std.testing.expect(!filemap.inSharedFileRegion(G2Region, &regions, 0x3000));
+    try std.testing.expect(!filemap.inSharedFileRegion(G2Region, &regions, 0x4000));
+    try std.testing.expect(!filemap.inSharedFileRegion(G2Region, &regions, 0x8000));
+    try std.testing.expect(!filemap.inSharedFileRegion(G2Region, &regions, 0xc000));
+}
+
+test "H1: mremap file grow extends the demand-fault window" {
+    const PAGE = filemap.PAGE_SIZE;
+    const g = filemap.fileGrowRange(0x400000, 2, 5);
+    try std.testing.expectEqual(@as(u64, 0x400000 + 2 * PAGE), g.start);
+    try std.testing.expectEqual(@as(u64, 3), g.pages);
+
+    // A grown region keeps faulting through planFault: new pages inside the
+    // recorded file size are served from the file, pages wholly past EOF
+    // SIGSEGV (growth past EOF is allowed but faults on access, like Linux).
+    const grown = G2Region{
+        .base = 0x400000,
+        .num_pages = 5, // after fileGrowRange
+        .active = true,
+        .file_kind = 3,
+        .prot = filemap.PROT_READ,
+        .file_offset = 0,
+        .file_size = 3 * PAGE, // file only covers 3 pages
+        .shared = true,
+    };
+    var p = filemap.planFault(G2Region, &grown, 0x400000 + 2 * PAGE);
+    try std.testing.expect(p.action == .file_page); // newly covered, in file
+    p = filemap.planFault(G2Region, &grown, 0x400000 + 3 * PAGE);
+    try std.testing.expect(p.action == .segv); // growth past EOF
+}
+// ─── end MAP_SHARED (H1) ───
+
+// ─── PCID (P1) ───
+// Pure PCID bookkeeping: 12-bit allocator, pml4→PCID registry with
+// invalidation generations, CR3 composition and the context-switch decision.
+const pcid_alloc = kt.pcid_alloc;
+const SwitchAction = pcid_alloc.SwitchAction;
+
+test "P1: composeCr3 packs phys, pcid and the no-flush bit" {
+    const phys: u64 = 0x0000_0000_1234_5000;
+    // Legacy flush write: PCID in the low 12 bits, no bit 63.
+    try std.testing.expectEqual(phys | 7, pcid_alloc.composeCr3(phys, 7, false));
+    // No-flush write sets CR3 bit 63.
+    try std.testing.expectEqual(phys | 7 | (@as(u64, 1) << 63), pcid_alloc.composeCr3(phys, 7, true));
+    // PCID is masked to 12 bits; phys is masked to the address bits.
+    try std.testing.expectEqual(phys | 0x0FFF, pcid_alloc.composeCr3(phys, 0x1FFF, false));
+    try std.testing.expectEqual(@as(u64, 0x000F_FFFF_FFFF_FFFF), pcid_alloc.composeCr3(0xFFFF_FFFF_FFFF_FFFF, 0x0FFF, false));
+    // Kernel PCID 0 with flush is the plain legacy value.
+    try std.testing.expectEqual(phys, pcid_alloc.composeCr3(phys, 0, false));
+}
+
+test "P1: allocator hands out 1..4095, never 0, and recycles freed IDs" {
+    var a: pcid_alloc.PcidAllocator = .{};
+    const first = a.alloc().?;
+    try std.testing.expect(first >= 1);
+    const second = a.alloc().?;
+    try std.testing.expect(first != second);
+
+    a.free(first);
+    // The freed ID is reusable; it must surface again within a full cycle.
+    var seen_reuse = false;
+    var i: u32 = 0;
+    while (i < 4096) : (i += 1) {
+        const p = a.alloc() orelse break;
+        if (p == first) seen_reuse = true;
+    }
+    try std.testing.expect(seen_reuse);
+}
+
+test "P1: allocator exhausts at 4095 live IDs and frees reopen exactly one slot" {
+    var a: pcid_alloc.PcidAllocator = .{};
+    var count: u32 = 0;
+    while (a.alloc()) |_| count += 1;
+    try std.testing.expectEqual(@as(u32, 4095), count);
+    try std.testing.expect(a.alloc() == null);
+
+    a.free(1234);
+    try std.testing.expectEqual(@as(?u16, 1234), a.alloc());
+    try std.testing.expect(a.alloc() == null);
+}
+
+test "P1: registry maps pml4 to pcid; unregister frees the ID and bumps its generation" {
+    var c: pcid_alloc.PcidCore = .{};
+    const p1 = c.registerSpace(0x100000).?;
+    try std.testing.expect(p1 >= 1);
+    try std.testing.expectEqual(p1, c.pcidFor(0x100000).?);
+    try std.testing.expect(c.pcidFor(0x200000) == null);
+
+    const g_before = c.generation(p1);
+    const freed = c.unregisterSpace(0x100000).?;
+    try std.testing.expectEqual(p1, freed);
+    // Reuse-invalidation: the freed PCID's generation moved on, so any CPU
+    // still holding stale entries observes the change and flushes.
+    try std.testing.expect(c.generation(p1) > g_before);
+    try std.testing.expect(c.pcidFor(0x100000) == null);
+    try std.testing.expect(c.unregisterSpace(0x100000) == null);
+
+    // The recycled PCID is handed out again, with the bumped generation kept.
+    const p2 = c.registerSpace(0x200000).?;
+    try std.testing.expectEqual(p1, p2);
+    try std.testing.expect(c.generation(p2) > g_before);
+}
+
+test "P1: noteShootdown bumps only the owning PCID's generation" {
+    var c: pcid_alloc.PcidCore = .{};
+    const p = c.registerSpace(0x400000).?;
+    const q = c.registerSpace(0x500000).?;
+    const g0 = c.generation(p);
+    c.noteShootdown(0x400000);
+    try std.testing.expectEqual(g0 + 1, c.generation(p));
+    try std.testing.expectEqual(@as(u64, 0), c.generation(q));
+    // Unknown space: no-op, no crash.
+    c.noteShootdown(0x999000);
+    try std.testing.expectEqual(g0 + 1, c.generation(p));
+}
+
+test "P1: decideSwitch — skip / no-flush / flush matrix" {
+    const d = pcid_alloc.decideSwitch;
+    const A: u64 = 0xAAAA000;
+    const B: u64 = 0xBBBB000;
+    // Same space already loaded on this CPU: no CR3 write at all.
+    try std.testing.expectEqual(SwitchAction.skip, d(5, A, 0, 0, A, 5, 9));
+    // Kernel/unregistered target (PCID 0): legacy flush write.
+    try std.testing.expectEqual(SwitchAction.flush, d(5, A, 0, 0, 0x100000, 0, 0));
+    // A→B→A with unchanged generation: no-flush fast path.
+    try std.testing.expectEqual(SwitchAction.no_flush, d(7, B, 5, 9, A, 5, 9));
+    // Generation moved (shootdown or PCID reuse): must flush.
+    try std.testing.expectEqual(SwitchAction.flush, d(7, B, 5, 9, A, 5, 10));
+    // Different space, no previous record: flush.
+    try std.testing.expectEqual(SwitchAction.flush, d(7, B, 0, 0, A, 5, 9));
+    // PCID matches but CR3 does not (stale record): must not skip.
+    try std.testing.expect(d(5, B, 0, 0, A, 5, 9) != SwitchAction.skip);
+}
+
+test "P1: registry refuses more than MAX_SPACES live spaces" {
+    var c: pcid_alloc.PcidCore = .{};
+    var i: usize = 0;
+    while (i < pcid_alloc.MAX_SPACES) : (i += 1) {
+        try std.testing.expect(c.registerSpace(0x1000 * @as(u64, i + 1)) != null);
+    }
+    try std.testing.expect(c.registerSpace(0xDEAD000) == null);
+}
+// ─── end PCID (P1) ───

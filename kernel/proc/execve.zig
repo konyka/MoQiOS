@@ -114,11 +114,7 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
     syscall_entry.setUserTlsBase(0);
 
     // Switch to new address space
-    asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
-        :
-        : [cr3] "r" (result.pml4),
-        : .{ .rax = true, .memory = true });
-    syscall_entry.noteCr3Switch(result.pml4);
+    @import("../arch/arch.zig").pcid.switchCr3(result.pml4);
     // G2: the old image's file mappings die with it — release their backing
     // refs (ext2 open slots) and clear the stale region table before the old
     // address space is destroyed.
@@ -252,11 +248,7 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64)
     cur.tls_base = 0;
     syscall_entry.setUserTlsBase(0);
 
-    asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
-        :
-        : [cr3] "r" (result.pml4),
-        : .{ .rax = true, .memory = true });
-    syscall_entry.noteCr3Switch(result.pml4);
+    @import("../arch/arch.zig").pcid.switchCr3(result.pml4);
     // G2: the old image's file mappings die with it — release their backing
     // refs (ext2 open slots) and clear the stale region table before the old
     // address space is destroyed.

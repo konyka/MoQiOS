@@ -1883,6 +1883,74 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
     return @intCast(written);
 }
 
+/// H1: write one mmap-owned 4KiB cache page back for a MAP_SHARED mapping,
+/// keyed by inode number (the page-cache flush callback has no open slot).
+///
+/// Unlike writeFile this never invalidates the page cache — the flush loop
+/// owns those entries and invalidating mid-flush would drop the inode's other
+/// dirty mmap pages — and never grows i_size: bytes past EOF in the last
+/// partial page are discarded (Linux semantics). Pages wholly past EOF are a
+/// no-op success (they cannot be reached via the fault path's EOF clamp, but
+/// be safe).
+pub fn writePageByInode(inode_num: u32, page_idx: u64, data: *const [4096]u8) bool {
+    const page_cache = @import("page_cache.zig");
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active) return false;
+
+    var inode: Ext2Inode = undefined;
+    if (!readInode(inode_num, &inode)) return false;
+
+    const base: u64 = page_idx * 4096;
+    if (base >= inode.size) return true;
+    var end: u64 = base + 4096;
+    if (end > inode.size) end = inode.size;
+
+    // Same batching discipline as writeFile: bitmap/group-desc/superblock
+    // writes (from ensureBlock allocations in sparse holes) are deferred to
+    // the outermost exit.
+    batch_free_depth += 1;
+    defer {
+        batch_free_depth -= 1;
+        if (batch_free_depth == 0) {
+            cacheFlushUnlocked();
+            writeGroupDescs();
+            writeSuperblock();
+            flushDiscard();
+        }
+    }
+
+    var off = base;
+    while (off < end) {
+        const logical_block: u32 = @intCast(off / block_size);
+        const block_offset: u32 = @intCast(off % block_size);
+        const chunk: u32 = @intCast(@min(end - off, block_size - block_offset));
+
+        // Sparse hole inside the file: allocate (zeroed) so the write lands.
+        const phys_block = ensureBlock(&inode, inode_num, logical_block, false);
+        if (phys_block == 0) return false;
+
+        const src: [*]const u8 = @ptrCast(data);
+        if (chunk == block_size) {
+            if (!writeBlockUncached(phys_block, src + (off - base))) return false;
+        } else {
+            // Partial block (straddles i_size): read-modify-write, persisting
+            // only the bytes below EOF.
+            var block_data: [4096]u8 = undefined;
+            if (!readBlockUncached(phys_block, &block_data)) return false;
+            @memcpy(block_data[block_offset .. block_offset + chunk], src[off - base .. off - base + chunk]);
+            if (!writeBlockUncached(phys_block, &block_data)) return false;
+        }
+        // Retire the read-path cache entry for this block: readFile keys the
+        // page cache per logical block (unflagged namespace), and a stale
+        // entry populated before this writeback would keep serving the old
+        // bytes to read()/pread() even though the disk now has the new ones.
+        page_cache.invalidatePage(0x3000_0000_0000_0000 + @as(u64, inode_num), logical_block);
+        off += chunk;
+    }
+    return true;
+}
+
 // ─── Inode allocation ──────────────────────────────────────────────────────
 
 /// Allocate an inode from the bitmap of the given group.

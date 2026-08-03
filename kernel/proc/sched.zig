@@ -21,6 +21,7 @@ const idt = @import("../arch/arch.zig").interrupts;
 const gdt = @import("../arch/arch.zig").gdt;
 const paging = @import("../arch/arch.zig").paging;
 const syscall_entry = @import("../arch/arch.zig").syscall;
+const pcid = @import("../arch/arch.zig").pcid;
 const context_switch = @import("../arch/arch.zig").context_switch;
 const arch_cpu = @import("../arch/arch.zig").cpu;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
@@ -373,6 +374,24 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         return;
     };
 
+    // DIAG: pinned task scheduled on a foreign CPU (catches both first
+    // schedule and switches).
+    if (task.getTask(next_idx)) |nt| {
+        if (nt.cpu_affinity >= 0 and nt.cpu_affinity != @as(i16, @intCast(currentCpuId()))) {
+            var b1: [24]u8 = undefined;
+            var b2: [24]u8 = undefined;
+            var b3: [24]u8 = undefined;
+            const serial = @import("../arch/arch.zig").serial;
+            serial.writeString("[AFFDIAG] tid=");
+            serial.writeString(fmt.fmtDec(&b1, nt.tid));
+            serial.writeString(" pin=");
+            serial.writeString(fmt.fmtDec(&b2, @as(u64, @intCast(nt.cpu_affinity))));
+            serial.writeString(" cpu=");
+            serial.writeString(fmt.fmtDec(&b3, currentCpuId()));
+            serial.writeString("\n");
+        }
+    }
+
     // First ever schedule
     if (getCurrentIdx() == null) {
         const t = task.getTask(next_idx) orelse {
@@ -389,11 +408,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         // Set up CPU state for the first scheduled task (mirror context-switch path).
         if (t.page_table_phys != 0) {
             sched_lock.release(flags);
-            asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
-                :
-                : [cr3] "r" (t.page_table_phys),
-                : .{ .rax = true, .memory = true });
-            syscall_entry.noteCr3Switch(t.page_table_phys);
+            pcid.switchCr3(t.page_table_phys);
             setupUserCpuState(t);
             return;
         }
@@ -459,11 +474,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         if (old_task.page_table_phys != new_task.page_table_phys) {
             const pt = new_task.page_table_phys;
             sched_lock.release(flags);
-            asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
-                :
-                : [cr3] "r" (pt),
-                : .{ .rax = true, .memory = true });
-            syscall_entry.noteCr3Switch(pt);
+            pcid.switchCr3(pt);
             setupUserCpuState(new_task);
             return;
         }
@@ -473,11 +484,7 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
         if (old_task.page_table_phys != 0) {
             const kernel_pml4 = paging.getKernelPml4();
             sched_lock.release(flags);
-            asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
-                :
-                : [cr3] "r" (kernel_pml4),
-                : .{ .rax = true, .memory = true });
-            syscall_entry.noteCr3Switch(kernel_pml4);
+            pcid.switchCr3(kernel_pml4);
             return;
         }
         sched_lock.release(flags);
@@ -821,11 +828,7 @@ fn tryStealTask() void {
             // Set up CPU state for the task
             if (t.page_table_phys != 0) {
                 sched_lock.release(flags);
-                asm volatile ("movq %[cr3], %%rax\n\tmovq %%rax, %%cr3"
-                    :
-                    : [cr3] "r" (t.page_table_phys),
-                    : .{ .rax = true, .memory = true });
-                syscall_entry.noteCr3Switch(t.page_table_phys);
+                pcid.switchCr3(t.page_table_phys);
                 gdt.setRsp0(currentCpuId(), t.kernel_stack_top);
                 syscall_entry.getPerCpu().kernel_rsp = t.kernel_stack_top;
                 return;

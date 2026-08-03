@@ -785,7 +785,7 @@ LAPIC Timer 中断
 | 5 | spawn | 创建新进程执行程序 |
 | 6 | waitpid | 等待子进程退出 (阻塞式) |
 | 7 | brk | 调整程序断点 |
-| 8 | mmap | 映射内存 (匿名+文件 MAP_PRIVATE) |
+| 8 | mmap | 映射内存 (匿名+文件 MAP_PRIVATE/MAP_SHARED) |
 | 9 | open | 打开文件 |
 | 10 | mprotect | 修改内存保护属性 |
 | 11 | close | 关闭文件描述符 |
@@ -1050,10 +1050,11 @@ LAPIC Timer 中断
 - **fork**: COW 克隆地址空间，设置所有页为 Read-Only，缺页时才复制
 - **execve**: 完全替换地址空间，释放旧页表，加载 ELF，构建新栈
 - **waitpid**: 阻塞式等待，使用 WaitNode 睡眠唤醒机制
-- **mmap**: 支持匿名映射 (MAP_ANONYMOUS) 和文件映射 (MAP_PRIVATE)；G2 起文件映射为
+- **mmap**: 支持匿名映射 (MAP_ANONYMOUS) 和文件映射 (MAP_PRIVATE / MAP_SHARED)；G2 起文件映射为
   按需分页——mmap 只记录区域元数据，#PF 时经 page_cache/tmpfs 零拷贝映射共享帧
-  （只读+COW位，写入走既有 COW 复制），ramdisk 复制为私有页；整页越过 EOF 触发
-  SIGSEGV；MAP_SHARED 写回暂不支持（EOPNOTSUPP）
+  （MAP_PRIVATE 只读+COW位，写入走既有 COW 复制；H1 起 MAP_SHARED 直接映射可写共享帧，
+  ext2/fat32 标记页缓存脏页并在 munmap/exit/msync 时写回），ramdisk 复制为私有页
+  （MAP_SHARED|PROT_WRITE 拒绝 EROFS）；整页越过 EOF 触发 SIGSEGV
 - **mremap**: 优先原地缩放映射；原地扩展被占用且设置 `MREMAP_MAYMOVE` 时，分配新的用户虚拟区、
   复制旧页内容并释放旧映射；`MREMAP_FIXED` 要求同时设置 `MREMAP_MAYMOVE` 且目标页对齐。
 - **readv/writev**: scatter-gather I/O，复用 VFS read/write 路径

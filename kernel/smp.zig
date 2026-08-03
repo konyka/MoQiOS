@@ -176,6 +176,9 @@ pub fn apEntry() callconv(.c) noreturn {
     // sets CR0.MP and arms CR0.TS. Re-setting OSFXSR is idempotent.
     context_switch.initCpu();
 
+    // Match the BSP's CR4.PCIDE state (no-op when PCID is unsupported).
+    @import("arch/arch.zig").pcid.initThisCpu();
+
     // STAR/LSTAR/SFMASK are per-logical-processor; AP must not rely on BSP values.
     syscall_entry.initSyscallMsrsOnThisCpu();
 

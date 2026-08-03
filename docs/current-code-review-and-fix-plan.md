@@ -1592,6 +1592,21 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 ---
 
+### 6.8 基础设施补完·第四轮（2026-08-04）
+
+| 阶段 | 内容 | 验证 |
+|---|---|---|
+| H1 | **MAP_SHARED 文件映射 + 回写**：共享可写帧（无 COW）——tmpfs 直写页面天然一致；ext2/fat32 缺页经 page_cache 帧可写映射 + 标脏，msync/munmap/exit 经 `flushMappedInode` → `writePageByInode` 回写（mmap 页使用 bit-63 标记的独立 4K 缓存命名空间，避免与 ext2 1KiB 块/fat32 簇键冲突）；ramdisk 可写共享拒绝 EROFS；回写后使读命名空间陈旧页失效（`invalidatePage`）；fork 共享区域跳过 COW 降级 | hello48（tmpfs 跨进程共享/ext2 回写/ramdisk EROFS） |
+| H2 | G2 遗留：mremap 文件区域允许原地增长（新页按需缺页，越 EOF 访问 SIGSEGV）；mprotect 更新区域 prot 元数据（部分覆盖时拆分，ext2 引用对称） | host 单测 + hello46/48 |
+| H3 | **PCID**：CPUID 检测（TCG 不支持→legacy 路径不变；`pcid_enable` 编译期开关）；`pcid_alloc.zig` 纯逻辑分配器 + 逐 PCID 失效代际计数（复用安全）；`switchCr3` 统一 CR3 写路径（同空间命中代际→no_flush 位，否则 flush）；用户映射 global 位断言门（审计全部 user 映射 global=false）；shootdown 代际核对防漏过滤 | 72/72 host 测试；smoke 双 PASS |
+| H4 | panic 立即停驻 AP（NMI 广播 `sendNmiAllButSelf`，tick 检查兜底）；修复 KVM 引导期 LAPIC 未映射时 EOI 写 0xB0 崩溃（early-IRQ 防护） | 编译+smoke |
+
+**调试记录**：① hello48 ext2 回写失败根因不是写回路径而是**读侧陈旧缓存**——缺页时 readFile 顺带填充的未标记命名空间条目在 pread 时被优先命中，writePageByInode 后按块失效修复；② hello44 fifo flaky 第三次复发，根因链最终定位：**setaffinity 迁移在原 CPU 无其它可运行任务时沉默失败**（调度器"无可选则保持当前"），修复为先入队目标 CPU 队列再重调度；`AFFDIAG`（钉核任务被调度到错误 CPU 时告警）作为常驻金丝雀保留；③ PCID 在 TCG 不可用，KVM 下暴露 LAPIC 早期 EOI 崩溃（与 PCID 无关的既有 bug，已修）。
+
+**仍遗留**：真实硬件 PCID no-flush 路径未经硅验证（TCG 不支持，KVM 现可引导待测）；MAP_SHARED 与 write() 交错且未 msync 时语义弱于 Linux（§1.8.1 已注明）；mremap 文件区域不支持移动增长；2MB 大页/servers 服务化/drivers 用户态驱动为后续候选。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:
