@@ -1,6 +1,7 @@
 /// DNS Resolver — Domain Name System query/resolution.
 ///
 /// Implements:
+///   - Static built-in host table (net/static_hosts.zig, consulted first)
 ///   - DNS A record queries (IPv4)
 ///   - Response parsing with header, question, answer sections
 ///   - Simple 16-entry LRU cache with TTL expiry
@@ -40,9 +41,18 @@ var query_id: u16 = 0x1234;
 
 /// Resolve a hostname to an IPv4 address.
 /// Returns [4]u8 on success, or .{0,0,0,0} on failure.
-/// Checks cache first, then sends DNS query.
+/// Order: static host table → dotted-decimal parse → cache → network
+/// query. The static table (net/static_hosts.zig) answers names the
+/// kernel knows authoritatively (localhost, the slirp gateway) without
+/// depending on a reachable DNS server.
 pub fn resolve(hostname: []const u8) [4]u8 {
     if (hostname.len == 0 or hostname.len > 63) return .{ 0, 0, 0, 0 };
+
+    // Static built-in names first: no NIC, server, or ~2s query timeout.
+    const static_hosts = @import("static_hosts.zig");
+    if (static_hosts.lookup(hostname)) |ip| {
+        return ip;
+    }
 
     // Check if it's already an IP address (dotted decimal)
     if (isIpV4(hostname)) {

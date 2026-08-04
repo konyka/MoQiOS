@@ -243,6 +243,11 @@ pub const FileDescriptor = struct {
     devfs_idx: u32 = 0,
     /// devfs proxy node slot (fs/devfs_proxy.zig) for .devfs_ctrl fds.
     devfs_ctrl_idx: u32 = 0,
+    /// devfs slot generation captured at open (fs/devfs.zig
+    /// generationAt); for .devfs_ctrl fds, the proxy slot generation.
+    /// Seeded into IoCtx so proxy ops can reject stale fds of recycled
+    /// slots with -EIO.
+    devfs_generation: u32 = 0,
     udp_port: u16 = 0,
     udp_connected: bool = false,
     udp_is_v6: bool = false,
@@ -352,6 +357,7 @@ pub const FdTable = struct {
                 self.fds[slot] = .{
                     .fd_type = .devfs,
                     .devfs_idx = node_idx,
+                    .devfs_generation = devfs.generationAt(node_idx) orelse 0,
                     .writable = is_writable,
                     .status_flags = status,
                     .inode_id = 0x2000_0000_0000_0000 + @as(u64, node_idx),
@@ -663,14 +669,14 @@ pub const FdTable = struct {
                 const read_op = ops.read orelse return -1;
                 // The op may advance ctx.offset (kmsg cursor, pci snapshot
                 // position); commit it to the descriptor on success.
-                var ctx: devfs.IoCtx = .{ .offset = desc.offset, .status_flags = desc.status_flags };
+                var ctx: devfs.IoCtx = .{ .offset = desc.offset, .status_flags = desc.status_flags, .generation = desc.devfs_generation };
                 const n = read_op(&ctx, buf, count);
                 if (n >= 0) desc.offset = ctx.offset;
                 return n;
             },
             .devfs_ctrl => {
                 // Owner end of a userspace node: dequeue the next request.
-                return @import("devfs_proxy.zig").ctrlRead(desc.devfs_ctrl_idx, buf, count);
+                return @import("devfs_proxy.zig").ctrlRead(desc.devfs_ctrl_idx, desc.devfs_generation, buf, count);
             },
             .tmpfs_file => {
                 const tmpfs = @import("tmpfs.zig");
@@ -777,7 +783,7 @@ pub const FdTable = struct {
                 if (!desc.writable) return -1;
                 const ops = devfs.opsAt(desc.devfs_idx) orelse return -1;
                 const write_op = ops.write orelse return -1;
-                var ctx: devfs.IoCtx = .{ .offset = desc.offset, .status_flags = desc.status_flags };
+                var ctx: devfs.IoCtx = .{ .offset = desc.offset, .status_flags = desc.status_flags, .generation = desc.devfs_generation };
                 const n = write_op(&ctx, buf, count);
                 if (n >= 0) desc.offset = ctx.offset;
                 return n;
@@ -785,7 +791,7 @@ pub const FdTable = struct {
             .devfs_ctrl => {
                 // Owner end of a userspace node: complete a request.
                 if (!desc.writable) return -1;
-                return @import("devfs_proxy.zig").ctrlWrite(desc.devfs_ctrl_idx, buf, count);
+                return @import("devfs_proxy.zig").ctrlWrite(desc.devfs_ctrl_idx, desc.devfs_generation, buf, count);
             },
             .tmpfs_file => {
                 if (!desc.writable) return -1;
@@ -879,7 +885,7 @@ pub const FdTable = struct {
                 const read_op = ops.read orelse return -1;
                 // pread: explicit offset, the fd's own cursor is untouched.
                 // O_NONBLOCK is forced so a kmsg pread can never sleep.
-                var ctx: devfs.IoCtx = .{ .offset = offset, .status_flags = desc.status_flags | 0x800 };
+                var ctx: devfs.IoCtx = .{ .offset = offset, .status_flags = desc.status_flags | 0x800, .generation = desc.devfs_generation };
                 return read_op(&ctx, buf, count);
             },
         }

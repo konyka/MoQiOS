@@ -77,6 +77,15 @@ pub fn poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) i64 {
                         const timerfd_mod = @import("../ipc/timerfd.zig");
                         if (timerfd_mod.timerfdGetExpirations(desc.timerfd_idx) > 0) pfds[i].revents |= POLLIN;
                     },
+                    .devfs_ctrl => {
+                        // Owner end of a userspace devfs node: readable
+                        // only while a request is queued (mirrors epoll's
+                        // .devfs_ctrl arm); always writable via the
+                        // default POLLOUT arm below (responses are
+                        // matched by seq and never block).
+                        const dpx = @import("devfs_proxy.zig");
+                        if (dpx.ctrlHasQueued(desc.devfs_ctrl_idx)) pfds[i].revents |= POLLIN;
+                    },
                     else => {
                         pfds[i].revents |= POLLIN; // files, ramdisk always readable
                     },

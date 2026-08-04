@@ -889,15 +889,20 @@ const Pipe = struct {
 文件: `devfs.zig`（纯核心，host 可测）、`devfs_nodes.zig`（内建节点实现）；
 接入点: `vfs.zig`（open/read/write/pread/pwrite）、`getdents.zig`、`epoll.zig`
 
-- **注册表**：定长 32 槽（`MAX_NODES`），名字 ≤ 24 字节。槽位稠密且永久
-  稳定（append-only），fd 直接缓存槽位索引，getdents 用索引作目录游标。
+- **注册表**：定长 32 槽（`MAX_NODES`），名字 ≤ 24 字节。槽位稠密
+  （0..nodeCount()-1），fd 直接缓存槽位索引，getdents 用索引作目录游标。
   `unregister(idx)` 打墓碑（tombstone）：lookup/nameAt/getdents 跳过，
-  名字可重新注册为**新槽位**（槽位永不复用，已缓存旧槽位的 fd 不会误
-  中新节点）；`opsAt` 对墓碑槽位仍返回 ops，让存量 fd 在 op 内拿到干净
-  的 `-EIO`。每次注册/注销递增单调 `changeCounter()`（seq-cst 原子），
-  并触发 `change_hook`（由 devfs_nodes 安装，唤醒 /dev/devfs-watch 读者）。
+  名字可重新注册；`opsAt` 对墓碑槽位仍返回 ops，让存量 fd 在 op 内拿到干净
+  的 `-EIO`。**v1.1 起墓碑槽位可复用**：register 优先取最老墓碑（最小索引），
+  无墓碑才追加，反复注册/注销不再耗尽表。复用由**每槽 generation** 兜底：
+  每次注册递增 `entries[idx].generation`，vfs 在 open 时把它缓存进
+  `FileDescriptor.devfs_generation` 并随 `IoCtx.generation` 传给 op，
+  proxy op 对不匹配的 fd 返回 `-EIO`——旧 fd 缓存的槽位索引即使指向新节点
+  也只会稳定失败，绝不误中新节点。每次注册/注销递增单调
+  `changeCounter()`（seq-cst 原子），并触发 `change_hook`（由 devfs_nodes
+  安装，唤醒 /dev/devfs-watch 读者）。
   运行时注册（devfs_register 系统调用）由 devfs_proxy 的 alloc_lock 串行化，
-  表本身保持无锁：register 先发布条目再递增 count。
+  表本身保持无锁：register 先发布条目再（仅追加时）递增 count。
 - **ops 结构**（`NodeOps`）：
   ```zig
   open:  ?*const fn () i64,                                  // 0 成功 / 负 errno（如 /dev/pci 的 CAP_SYS_RAWIO 门）
@@ -906,9 +911,11 @@ const Pipe = struct {
   poll:  ?*const fn (ctx: *const IoCtx) u32,                 // POLL_IN|POLL_OUT（与 EPOLLIN/EPOLLOUT 同值）
   flags: packed struct { no_pread: bool = false },
   ```
-  `IoCtx { offset, status_flags }` 镜像 fd 的游标与 O_NONBLOCK 位：vfs 调用前
-  从描述符播种、成功后写回（pread 则用显式 offset 播种并丢弃，且强制
-  O_NONBLOCK 使 kmsg pread 永不睡眠）。read 返回负 errno / 0 EOF / 字节数。
+  `IoCtx { offset, status_flags, generation }` 镜像 fd 的游标、O_NONBLOCK 位
+  与 devfs 槽位 generation：vfs 调用前从描述符播种、成功后写回 offset（pread
+  则用显式 offset 播种并丢弃，且强制 O_NONBLOCK 使 kmsg pread 永不睡眠）；
+  generation 供 proxy op 识别复用槽位的陈旧 fd。read 返回负 errno / 0 EOF /
+  字节数。
 - **锁与上下文契约**：表仅在内核 init（`devfs_nodes.init()`，main.zig 在
   任何用户任务打开 /dev 之前）单线程注册，之后只读、无需锁。ops 在调用者
   的系统调用上下文执行，不持有 devfs 内部锁（也没有）；可以阻塞（kmsg
@@ -941,14 +948,15 @@ const Pipe = struct {
 文件: `fs/devfs_proxy.zig`（纯核心 + 内核胶水）、`fs/devfs.zig`（墓碑与
 变更计数器）、`fs/devfs_nodes.zig`（/dev/devfs-watch）；接入点:
 `vfs.zig`（FdType.devfs_ctrl、read/write/close）、`getdents.zig`（跳过
-墓碑槽）、`epoll.zig`、syscall #484、task reap 双站点 cleanup。
+墓碑槽）、`epoll.zig` / `poll.zig` / `select.zig`（就绪分支）、
+syscall #484、task reap 双站点 cleanup。
 
 - **devfs_register(name_ptr, flags) → ctrl_fd（syscall 484，x86_64）**：
   需要 CAP_SYS_RAWIO；名字 ≤ 24 字节；flags 必须为 0（保留）。内核以
   comptime 展开的每槽 ops 创建 devfs 节点（每槽一个 `nodes[i]` 闭包，
   NodeOps 无 userdata），并返回新 fd 类型 `.devfs_ctrl` 的控制 fd。
-  同一时刻及累计最多 `MAX_USER_NODES = 8` 个用户态节点（槽位永不复用，
-  见下）；重名 `-EEXIST`，表满 `-ENFILE`。
+  同一时刻最多 `MAX_USER_NODES = 8` 个用户态节点；owner 已死的槽位可
+  复用（见下），重名 `-EEXIST`，8 槽全存活时 `-ENFILE`。
 - **协议字节布局**（全部小端）：
   - 请求（owner 从 ctrl_fd `read`，一次性返回完整一条）：
     `u32 seq @0 | u32 op @4（1=read, 2=write）| u64 offset @8 | u32 len @16 |
@@ -959,10 +967,14 @@ const Pipe = struct {
     ≤ 4096）；写响应与错误响应恰为 8 字节，ret 为已消费字节数或负 errno。
     未知/状态不符的 seq、畸形响应一律 `-EINVAL`。
 - **请求生命周期**：客户端 read/write 入队 `{seq, op, offset, len[, payload]}`
-  （seq 单调不复用；并发上限 `MAX_PENDING = 4`，满则 `-EAGAIN`），随后在
+  （seq 单调不复用；并发上限 `MAX_PENDING = 4`），随后在
   **节点私有等待队列**上阻塞；owner `read(ctrl_fd)` 出队最老 queued 请求
   （转 inflight，空则阻塞，EINTR 协议）；owner `write(ctrl_fd, response)`
-  按 seq 完成并唤醒客户端。客户端阻塞遵循 pendingFatal/pendingActionable
+  按 seq 完成并唤醒客户端。队列满时：阻塞式客户端睡在专门的 `space_wq`
+  上直到某槽释放（collect/cancel/drain 时唤醒）；`O_NONBLOCK` 客户端立即
+  `-EAGAIN`——**O_NONBLOCK 只门控入队接受**，入队后的往返等待两种 fd 都
+  阻塞（与本内核 pipe 语义一致：pipeRead/pipeWrite 同样从不中途阻塞，
+  见 vfs.zig）。客户端阻塞遵循 pendingFatal/pendingActionable
   协议（致命信号走 exitTask，可处理信号 `-EINTR` 并取消请求：queued 直接
   释放，inflight 标记 cancelled、迟到的响应被接受但丢弃）。阻塞期间**不持
   有任何 vfs/devfs 锁**——锁序：`alloc_lock → node.lock（IrqSpinlock）→
@@ -974,18 +986,31 @@ const Pipe = struct {
   close；另有 reap 双站点的 `devfs_proxy.cleanupTask` 兜底，与
   `userdrv.cleanupTask` 并列）：所有未完成请求以 `-EIO` 完成并唤醒全部
   等待者；devfs 节点打墓碑（`devfs.unregister`）——此后按名 open 得
-  `-ENOENT`，已打开客户端 fd 的读写得 `-EIO`。proxy 槽与 devfs 槽都
-  **永不复用**：旧 fd 缓存的槽位索引只会指向已死节点（稳定 `-EIO`），
-  绝不误中同名的新节点；代价是累计 8 次注册后 `-ENFILE`（v1 限制）。
+  `-ENOENT`，已打开客户端 fd 的读写得 `-EIO`。**v1.1 起槽位可复用**：
+  devfs 侧 register 优先回收最老墓碑槽（最小索引），proxy 侧优先回收
+  最小索引的已死槽（`used && !owner_alive`）；复用前在 node.lock 下做
+  全量重置（core 请求队列、三条等待队列、owner、generation），陈旧请求
+  与等待者不会漏进新节点。防误中靠**generation**：devfs 每次注册递增槽
+  位 generation，proxy 注册时快照进 `node.generation`；客户端 fd 经
+  `IoCtx.generation`、ctrl fd 经 `FileDescriptor.devfs_generation` 携带
+  open 时的值，op 内不匹配即 `-EIO`——墓碑未复用时稳定 `-EIO`（owner_alive
+  检查），复用后也不会把旧 fd 静默重定向到新节点。客户端往返等待循环
+  另在每次醒来时复查 generation，复用发生即 `-EIO` 退出。
 - **性能权衡**：每次客户端 I/O 都是一次完整的用户态往返（客户端阻塞
   → 调度 owner → owner 读写 ctrl_fd → 唤醒客户端），至少两次上下文
   切换加两次拷贝，吞吐与延迟远逊于内核内节点。热路径设备（kmsg、
   tty、random、磁盘后端）必须留在内核；devfs proxy 面向低频、原型
   验证与策略在用户态的伪设备。payload ≤ 4 KiB/请求，大 I/O 被截为
   4 KiB 短读/短写。
-- **poll v1 限制**：proxy 节点的 poll op 恒报 `EPOLLIN|EPOLLOUT`，
-  不反映 owner 真实就绪状态（O_NONBLOCK 也被忽略，客户端总是阻塞；
-  pread/pwrite 经 `no_pread` 拒绝 `-ESPIPE`）。
+- **poll v1.1 语义**：proxy 读写是同步往返，不存在经典意义的"有数据可读/
+  有缓冲可写"，因此就绪定义为**新请求能否不阻塞地被接受**（`Core.pollMask`
+  纯谓词）：owner 存活且有空闲请求槽 → `EPOLLIN|EPOLLOUT`；队列饱和
+  （MAX_PENDING 占满，注意 queued→inflight 不释放槽位，只有 collect/cancel
+  释放）→ 双向都不报就绪；owner 已死 → 恒报 `EPOLLIN|EPOLLOUT`（op 立即
+  `-EIO`，若报不就绪 poller 会在死节点上永远睡下去）。ctrl fd 侧在
+  epoll/poll/select 三个多路复用器里语义一致：有排队请求 →
+  `EPOLLIN/POLLIN/read-ready`，写恒就绪（响应按 seq 匹配、从不阻塞）。
+  pread/pwrite 仍经 `no_pread` 拒绝 `-ESPIPE`。
 - **devfs 变更事件**：`devfs.register/unregister` 递增 seq-cst 原子
   `change_counter` 并触发 `change_hook`（devfs_nodes 安装）。只读节点
   `/dev/devfs-watch` 的 read 返回当前计数器 u64 LE（8 字节）；计数器未
@@ -997,7 +1022,9 @@ const Pipe = struct {
 - **测试**：纯核心 host 测试（`tests/main.zig` "devfs proxy (P1)" 块）：
   入队形状校验与 seq 单调、请求/响应线格式逐字节、complete 匹配与拒绝、
   cancel 语义、owner 死亡 drain（-EIO）、devfs 墓碑与计数器/钩子；
-  端到端见 `user/hello54.c`。
+  "v1.1 finishing" 块：墓碑槽最老优先复用、change_counter 单调、
+  generation 识别注册代次（陈旧 fd 可判定）、pollMask/canAccept 就绪
+  谓词（饱和/死亡/释放槽位）；端到端见 `user/hello54.c`。
 
 ---
 
@@ -1149,6 +1176,24 @@ e1000 (中断驱动) / virtio-net (Virtqueue)
 - **结果标记**：恰好一行大写 `[DHCP] ` 结果日志——成功 `[DHCP] lease: a.b.c.d`，失败 `[DHCP] no lease, static 10.0.2.15`（无 NIC 也走失败分支）；内部进度日志一律小写 `[dhcp] `，供 smoke 门确定性匹配
 - **回退语义**：`netif.getOurIp()` 仅在 `dhcp.isConfigured()` 为真时返回 DHCP 地址，否则保持 QEMU user-net 静态地址 10.0.2.15——DHCP 失败不影响 hello14/15/22/27 等静态路径
 - **host 单测**：租约状态默认值（未配置 / IP 0.0.0.0 / netmask 255.255.255.0）在 `tests/main.zig` 的 `// ─── DHCP boot (G3) ───` 块覆盖（纯全局量，无 arch 依赖）
+
+### 4.16 DNS 解析器与静态主机表 ✅
+
+文件: `kernel/net/dns.zig`（解析器）、`kernel/net/static_hosts.zig`（纯静态表，host 可测）
+
+- **解析顺序**（`dns.resolve()`）：静态主机表 → 点分十进制直解 → 16 槽
+  LRU 缓存（TTL 过期）→ 真实 DNS 查询（DHCP 提供的 DNS，缺省回退 8.8.8.8，
+  UDP 53，~2s tick 超时，等待期间 `pumpRx()` 轮询驱动 RX）。
+- **静态主机表**：内核可权威回答、不应依赖网络可达性的名字——
+  `localhost` → 127.0.0.1，`gateway` → 10.0.2.2（QEMU slirp 默认网关/宿主机
+  地址）。匹配为全名、ASCII 大小写不敏感（DNS 名字本就不区分大小写）。
+- **环境限制**：真实 DNS 路径要求 NIC 活跃、slirp/上游 DNS 可达且 ARP/UDP
+  出栈正常；无 NIC 或无租约时非静态名字一律解析失败（返回 0.0.0.0）——
+  静态表保证 localhost/gateway 在任何网络环境下可解。公网域名的真实
+  查询在 QEMU user-net 下走 slirp 内建 DNS 代理（10.0.2.3），DHCP 租约
+  通常即返回该地址。
+- **host 单测**：静态表查询（含大小写不敏感、未知名/空前缀不命中）在
+  `tests/main.zig` "v1.1 finishing" 块覆盖（`static_hosts.zig` 无内核依赖）。
 
 ### 4.8 Socket API ✅ 完整 BSD-like Socket 接口
 

@@ -28,12 +28,19 @@
 /// (devfs.unregister) so new opens of the name get ENOENT, and client ops
 /// on already-open fds get -EIO.
 ///
-/// v1 limitations (documented in docs/kernel-subsystems.md §3.8):
-///   - poll on proxy nodes always reports EPOLLIN|EPOLLOUT.
-///   - Client ops ignore O_NONBLOCK (they always block) and pread/pwrite
-///     are rejected via no_pread.
-///   - Proxy slots and devfs slots are never reused: at most
-///     MAX_USER_NODES registrations per boot.
+/// v1.1 semantics (documented in docs/kernel-subsystems.md §3.9):
+///   - poll on proxy nodes reports EPOLLIN|EPOLLOUT only while a new
+///     request can be enqueued without blocking (owner alive + a free
+///     slot); a dead owner always reports both (ops fail fast with -EIO).
+///   - O_NONBLOCK gates enqueue acceptance only: a saturated queue fails
+///     with -EAGAIN instead of blocking the client. The round-trip wait
+///     itself stays blocking either way (this kernel's pipes likewise
+///     never block mid-operation — see vfs.pipeRead/pipeWrite).
+///   - Tombstoned devfs slots and drained proxy slots are reused
+///     (oldest-first). Reuse fully resets the slot (request queue, wait
+///     queues, owner) and is guarded by the devfs slot generation, so
+///     stale fds keep failing with -EIO instead of retargeting the new
+///     node. pread/pwrite stay rejected via no_pread.
 ///
 /// Pure core (Core, wire codec, limits) has no kernel imports and is
 /// host-tested via tests/main.zig ("devfs proxy (P1)" block); the glue
@@ -56,8 +63,8 @@ const task_mod = @import("../proc/task.zig");
 
 pub const SYS_DEVFS_REGISTER: u64 = 484;
 
-/// Userspace-owned node limit (cumulative per boot — slots are never
-/// reused, see the file header).
+/// Userspace-owned node limit (simultaneous — drained slots are reused,
+/// see the file header).
 pub const MAX_USER_NODES: u32 = 8;
 /// Concurrently outstanding client requests per node.
 pub const MAX_PENDING: u32 = 4;
@@ -242,6 +249,34 @@ pub const Core = struct {
         }
     }
 
+    /// True while a new client request can be enqueued without waiting:
+    /// the owner is alive and at least one request slot is free. Slots
+    /// are freed by collect/cancel only — handing a request to the owner
+    /// (queued → inflight) does not free one.
+    pub fn canAccept(self: *const Core) bool {
+        if (!self.owner_alive) return false;
+        for (&self.reqs) |*r| {
+            if (r.state == .free) return true;
+        }
+        return false;
+    }
+
+    /// Poll readiness mask (devfs.POLL_IN/POLL_OUT values). Proxy reads
+    /// and writes are synchronous round-trips, so classic "data ready /
+    /// buffer space" readiness does not exist; the honest v1.1 semantics
+    /// (documented in docs/kernel-subsystems.md §3.9):
+    ///   - owner dead → POLL_IN|POLL_OUT always. Client ops fail fast
+    ///     with -EIO, so the fd must never be reported not-ready (a
+    ///     poller would sleep forever on a dead node).
+    ///   - owner alive → POLL_IN|POLL_OUT only while canAccept(): a new
+    ///     request would be enqueued without blocking. A saturated queue
+    ///     reports not-ready in both directions.
+    pub fn pollMask(self: *const Core) u32 {
+        if (!self.owner_alive) return devfs.POLL_IN | devfs.POLL_OUT;
+        if (self.canAccept()) return devfs.POLL_IN | devfs.POLL_OUT;
+        return 0;
+    }
+
     /// Owner death: fail every outstanding request with -EIO and seal the
     /// queue (enqueue starts failing). Returns the number completed so
     /// the glue knows whether anyone needs waking. Idempotent.
@@ -309,18 +344,27 @@ fn readU32Le(in: []const u8) u32 {
 // ---------------------------------------------------------------------------
 
 const ProxyNode = struct {
-    /// Ever allocated. Slots are never reused: the tombstoned devfs slot
-    /// keeps this node's comptime ops, and they must keep reporting -EIO
-    /// for stale client fds instead of retargeting a newer node.
+    /// Ever allocated. A used slot whose owner died (core.owner_alive ==
+    /// false) is recyclable: reuse fully resets the slot so no stale
+    /// request or waiter can cross into the new node.
     used: bool = false,
     devfs_idx: u32 = 0,
     owner_task_idx: u32 = 0,
+    /// devfs slot generation of the current registration (captured from
+    /// devfs.generationAt at register time). Client fds carry it in
+    /// IoCtx.generation (seeded by the vfs at open), ctrl fds in
+    /// FileDescriptor.devfs_generation; both op paths reject a mismatch
+    /// with -EIO so stale fds of a recycled slot fail cleanly.
+    generation: u32 = 0,
     lock: IrqSpinlock = .{},
     core: Core = .{},
     /// Blocked client tasks (one per outstanding request at most).
     client_wq: ?*task_mod.WaitNode = null,
     /// Blocked owner ctrl_fd readers.
     owner_wq: ?*task_mod.WaitNode = null,
+    /// Blocking clients waiting for a free request slot (O_NONBLOCK
+    /// clients get -EAGAIN instead, matching pipe semantics).
+    space_wq: ?*task_mod.WaitNode = null,
 };
 
 var nodes: [MAX_USER_NODES]ProxyNode = @splat(.{});
@@ -339,8 +383,16 @@ fn ProxyOps(comptime i: usize) type {
         }
         fn pollOp(ctx: *const devfs.IoCtx) u32 {
             _ = ctx;
-            // v1 limitation: proxy nodes always report ready (documented).
-            return devfs.POLL_IN | devfs.POLL_OUT;
+            // Real v1.1 readiness (Core.pollMask): ready while a new
+            // request can be enqueued without blocking; always ready once
+            // the owner is dead (ops fail fast with -EIO). Deliberately
+            // no generation check: a stale fd on a recycled slot sees the
+            // new node's saturation state, and its ops still fail on the
+            // generation mismatch in clientRoundTrip.
+            const node = &nodes[i];
+            const flags = node.lock.acquire();
+            defer node.lock.release(flags);
+            return node.core.pollMask();
         }
     };
 }
@@ -411,6 +463,13 @@ fn checkSignals() ?i64 {
 /// arrives → -EINTR and the request is cancelled). Runs in the client's
 /// syscall context holding NO vfs/devfs lock — only node.lock in short
 /// critical sections.
+///
+/// O_NONBLOCK gates ENQUEUE ACCEPTANCE ONLY (pipe-style, see vfs
+/// pipeRead/pipeWrite which never block either): a saturated request
+/// queue fails a nonblocking client with -EAGAIN, while a blocking
+/// client sleeps on space_wq until a slot frees. Once enqueued, the
+/// round-trip wait blocks either way — a half-delivered request must not
+/// be abandoned silently.
 fn clientRoundTrip(comptime i: usize, comptime op: u32, ctx: *devfs.IoCtx, buf: [*]u8, count: usize) i64 {
     const sched = @import("../proc/sched.zig");
     if (count == 0) return 0;
@@ -418,13 +477,40 @@ fn clientRoundTrip(comptime i: usize, comptime op: u32, ctx: *devfs.IoCtx, buf: 
     const len: u32 = @intCast(@min(count, MAX_PAYLOAD));
 
     var seq: u32 = undefined;
-    {
-        const flags = node.lock.acquire();
-        defer node.lock.release(flags);
-        if (!node.core.owner_alive) return errno.EIO;
-        seq = node.core.enqueue(op, ctx.offset, len, if (op == OP_WRITE) buf[0..len] else &.{}) orelse
-            return errno.EAGAIN; // MAX_PENDING clients already waiting
-        _ = sched.wakeOne(&node.owner_wq);
+    var gen: u32 = undefined;
+    while (true) {
+        var wn: task_mod.WaitNode = .{ .task_idx = 0 };
+        {
+            const flags = node.lock.acquire();
+            // Stale fd on a recycled slot: never retarget the new node.
+            if (ctx.generation != node.generation or !node.core.owner_alive) {
+                node.lock.release(flags);
+                return errno.EIO;
+            }
+            if (node.core.enqueue(op, ctx.offset, len, if (op == OP_WRITE) buf[0..len] else &.{})) |s| {
+                seq = s;
+                gen = node.generation;
+                _ = sched.wakeOne(&node.owner_wq);
+                node.lock.release(flags);
+                break;
+            }
+            // Queue saturated: nonblocking clients fail immediately...
+            if (ctx.nonBlocking()) {
+                node.lock.release(flags);
+                return errno.EAGAIN; // -11
+            }
+            // ...blocking clients wait for a slot to free (collect /
+            // cancel / drain wake space_wq). Check + block in the same
+            // critical section so no wakeup is lost.
+            if (!sched.blockOn(&node.space_wq, &wn)) {
+                node.lock.release(flags);
+                return errno.EIO; // no current task (should not happen)
+            }
+            node.lock.release(flags);
+        }
+        sched.forceReschedule();
+        unlinkWaiter(&node.space_wq, &wn, &node.lock);
+        if (checkSignals()) |rc| return rc; // nothing enqueued yet
     }
 
     while (true) {
@@ -433,10 +519,18 @@ fn clientRoundTrip(comptime i: usize, comptime op: u32, ctx: *devfs.IoCtx, buf: 
             const flags = node.lock.acquire();
             // Check + block in one critical section: complete() wakes
             // under the same lock, so no response can be lost.
+            if (node.generation != gen) {
+                // Slot recycled while we waited (owner died, node
+                // re-registered): the request is gone — fail cleanly.
+                node.lock.release(flags);
+                return errno.EIO;
+            }
             if (node.core.pollDone(seq)) |res| {
                 const out: i64 = res.ret;
                 if (res.ret > 0 and op == OP_READ) @memcpy(buf[0..@intCast(res.ret)], res.data);
                 node.core.collect(seq);
+                // A freed slot may unblock a client waiting for space.
+                _ = sched.wakeOne(&node.space_wq);
                 node.lock.release(flags);
                 return out;
             }
@@ -451,6 +545,8 @@ fn clientRoundTrip(comptime i: usize, comptime op: u32, ctx: *devfs.IoCtx, buf: 
         if (checkSignals()) |rc| {
             const flags = node.lock.acquire();
             node.core.cancel(seq);
+            // Cancelling a queued request frees its slot immediately.
+            _ = sched.wakeOne(&node.space_wq);
             node.lock.release(flags);
             return rc;
         }
@@ -460,7 +556,9 @@ fn clientRoundTrip(comptime i: usize, comptime op: u32, ctx: *devfs.IoCtx, buf: 
 /// vfs read on a ctrl fd: dequeue the next request as wire bytes. Blocks
 /// while the queue is empty (EINTR protocol); -EIO once the owner is
 /// dead; -EINVAL when the buffer cannot hold the oldest request.
-pub fn ctrlRead(idx: u32, buf: [*]u8, count: usize) i64 {
+/// `generation` is the fd's cached slot generation: after a slot recycle
+/// a stale ctrl fd fails with -EIO instead of serving the new node.
+pub fn ctrlRead(idx: u32, generation: u32, buf: [*]u8, count: usize) i64 {
     const sched = @import("../proc/sched.zig");
     if (idx >= MAX_USER_NODES) return errno.EBADF;
     const node = &nodes[idx];
@@ -469,7 +567,7 @@ pub fn ctrlRead(idx: u32, buf: [*]u8, count: usize) i64 {
         var wn: task_mod.WaitNode = .{ .task_idx = 0 };
         {
             const flags = node.lock.acquire();
-            if (!node.core.owner_alive) {
+            if (generation != node.generation or !node.core.owner_alive) {
                 node.lock.release(flags);
                 return errno.EIO;
             }
@@ -505,8 +603,8 @@ pub fn ctrlHasQueued(idx: u32) bool {
 
 /// vfs write on a ctrl fd: complete the request matching the response's
 /// seq and wake the blocked client. Unknown seq / malformed response is
-/// -EINVAL.
-pub fn ctrlWrite(idx: u32, buf: [*]const u8, count: usize) i64 {
+/// -EINVAL; a stale fd (generation mismatch after a slot recycle) is -EIO.
+pub fn ctrlWrite(idx: u32, generation: u32, buf: [*]const u8, count: usize) i64 {
     const sched = @import("../proc/sched.zig");
     if (idx >= MAX_USER_NODES) return errno.EBADF;
     const node = &nodes[idx];
@@ -514,8 +612,11 @@ pub fn ctrlWrite(idx: u32, buf: [*]const u8, count: usize) i64 {
 
     const flags = node.lock.acquire();
     defer node.lock.release(flags);
+    if (generation != node.generation) return errno.EIO;
     if (!node.core.complete(rsp.seq, rsp.ret, rsp.data)) return errno.EINVAL;
     _ = sched.wakeOne(&node.client_wq);
+    // Completing a cancelled in-flight request frees its slot.
+    _ = sched.wakeOne(&node.space_wq);
     return @intCast(count);
 }
 
@@ -534,6 +635,7 @@ pub fn ctrlClose(idx: u32) void {
         _ = node.core.drain();
         sched.wakeAll(&node.client_wq);
         sched.wakeAll(&node.owner_wq);
+        sched.wakeAll(&node.space_wq);
         devfs_idx = node.devfs_idx;
     }
     // Outside node.lock: tombstone the node (lookup/getdents stop
@@ -588,28 +690,61 @@ pub fn syscallDevfsRegister(name_ptr: u64, flags: u64) i64 {
 
     if (devfs.lookup(name) != null) return errno.EEXIST;
 
+    // Slot selection: never-used slots first; when all 8 have been used,
+    // recycle the lowest-index slot whose owner died (drained by
+    // ctrlClose). Mirrors devfs.register's oldest-tombstone-first reuse.
     var slot: ?usize = null;
+    var dead_slot: ?usize = null;
     for (&nodes, 0..) |*n, i| {
         if (!n.used) {
             slot = i;
             break;
         }
+        if (dead_slot == null and !n.core.owner_alive) dead_slot = i;
     }
-    const i = slot orelse return errno.ENFILE;
+    const i = slot orelse (dead_slot orelse return errno.ENFILE);
 
     const devfs_idx = devfs.register(name, opsFor(i)) orelse return errno.ENFILE;
+    const generation = devfs.generationAt(devfs_idx) orelse {
+        _ = devfs.unregister(devfs_idx);
+        return errno.EIO;
+    };
 
     const fd = cur.fd_table.allocFd() orelse {
         _ = devfs.unregister(devfs_idx);
         return errno.EMFILE;
     };
-    nodes[i].used = true;
-    nodes[i].devfs_idx = devfs_idx;
-    nodes[i].owner_task_idx = cur.self_idx;
-    nodes[i].core = .{};
+
+    // Publish the new registration under node.lock: a full reset on
+    // recycle so no stale request, waiter, or owner crosses into the new
+    // node (stale fds fail on the generation check instead).
+    {
+        const node = &nodes[i];
+        const node_flags = node.lock.acquire();
+        defer node.lock.release(node_flags);
+        if (node.used and node.core.owner_alive) {
+            // Lost a death race (owner died without ctrlClose yet —
+            // cleanupTask fires at reap). Refuse rather than resetting a
+            // live node; the caller can retry after the reap.
+            cur.fd_table.freeFd(fd);
+            _ = devfs.unregister(devfs_idx);
+            return errno.ENFILE;
+        }
+        // Reset field by field — node.lock itself must NOT be touched
+        // (we are holding it).
+        node.used = true;
+        node.devfs_idx = devfs_idx;
+        node.owner_task_idx = cur.self_idx;
+        node.generation = generation;
+        node.core = .{};
+        node.client_wq = null;
+        node.owner_wq = null;
+        node.space_wq = null;
+    }
     cur.fd_table.fds[fd] = .{
         .fd_type = .devfs_ctrl,
         .devfs_ctrl_idx = @intCast(i),
+        .devfs_generation = generation,
         .writable = true,
     };
     return @intCast(fd);

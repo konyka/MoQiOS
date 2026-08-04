@@ -64,6 +64,12 @@ pub fn select(nfds: u64, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr: u64
                     .pipe_read => {
                         if (vfs_mod.pipeState(desc.pipe_idx)) |state| rdy = state.readable > 0;
                     },
+                    .devfs_ctrl => {
+                        // Owner end of a userspace devfs node: readable
+                        // only while a request is queued (mirrors epoll).
+                        const dpx = @import("devfs_proxy.zig");
+                        rdy = dpx.ctrlHasQueued(desc.devfs_ctrl_idx);
+                    },
                     else => rdy = true,
                 }
                 if (rdy) {

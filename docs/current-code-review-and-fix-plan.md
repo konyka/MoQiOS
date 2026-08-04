@@ -1703,6 +1703,19 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 ---
 
+### 6.16 基础设施补完·第十二轮（2026-08-12）
+
+| 阶段 | 内容 | 验证 |
+|---|---|---|
+| Q1 | **devfs proxy 语义 v1.1**：真实 poll（`Core.pollMask`——"可入队不阻塞"：owner 存活且队列未满则就绪，owner 死亡恒就绪防 epoll 永久阻塞）；ctrl fd 的 poll/select 接通（排队请求→POLLIN，与 epoll 一致）；客户端 O_NONBLOCK 门控入队接受（满则立即 -EAGAIN，中途等待保持阻塞——与本内核管道语义一致）；代际（generation）防槽位复用后陈旧 fd 误用 | host 单测 + hello54 回归 |
+| Q2 | **devfs 槽位复用**：tombstone 槽位最老优先回收，复用时全量重置 proxy 状态（队列/inflight/owner），Entry.generation 守卫陈旧 fd；变更计数保持单调 | host 单测（复用顺序/状态隔离/陈旧契约） |
+| Q3 | **静态 hosts 表**：`dns.resolve` 先查内置表（localhost→127.0.0.1、gateway→10.0.2.2，大小写不敏感），静态名永远可解析；真实 DNS 仍依赖宿主机可达性（环境限制，文档注明，不做门槛断言） | host 单测 |
+| Q4 | 门禁：三架构编译 + 139/139 host 测试 + smoke SMP=1/4 + stress 10 连 | 全绿 |
+
+**仍遗留**（环境或后续）：GSI≥16 真实设备验证、真实硬件 PCID、真实 DNS 端到端（依赖宿主机 DNS）、驱动迁出内核评估（v2）。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:

@@ -43,4 +43,5 @@ pub const ioapic_core = @import("arch/x86_64/ioapic_core.zig");
 pub const ioperm_core = @import("proc/ioperm_core.zig");
 pub const devfs = @import("fs/devfs.zig");
 pub const devfs_proxy = @import("fs/devfs_proxy.zig");
+pub const static_hosts = @import("net/static_hosts.zig");
 pub const madt_iso = @import("acpi/madt_iso.zig");

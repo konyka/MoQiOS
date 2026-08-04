@@ -15,14 +15,23 @@
 ///     a node appearing mid-scan.
 ///   - unregister() tombstones a slot (owner death of a userspace node):
 ///     lookup/nameAt skip it, getdents skips it, new opens of the name get
-///     ENOENT, and the name can be registered again (as a NEW slot). The
-///     ops stay callable through opsAt so fds that already cached the slot
-///     index fail cleanly inside the op (-EIO from the proxy) instead of
-///     dereferencing a stale entry. Slots are never reused — a cached
-///     devfs_idx can never silently retarget a different node.
-///   - Slot indices are dense (0..nodeCount()-1) and stable forever, so a
+///     ENOENT, and the name can be registered again. The ops stay callable
+///     through opsAt so fds that already cached the slot index fail cleanly
+///     inside the op (-EIO from the proxy) instead of dereferencing a stale
+///     entry.
+///   - Tombstoned slots ARE reusable (v1.1): register() prefers the oldest
+///     tombstone (lowest index) over appending, so the table cannot be
+///     exhausted by repeated register/unregister cycles. A cached
+///     devfs_idx can therefore retarget a newer node — this is guarded by
+///     the per-slot generation: every registration bumps
+///     entries[idx].generation, the vfs caches it in the FileDescriptor at
+///     open, and the proxy op rejects a mismatched generation with -EIO.
+///     While a slot is tombstoned its generation is unchanged, so the
+///     original "stale fd fails cleanly" contract still holds until reuse.
+///   - Slot indices stay dense (0..nodeCount()-1) across reuse, so a
 ///     FileDescriptor can cache the index and getdents can use it directly
-///     as the directory cursor.
+///     as the directory cursor; the generation (not the index) identifies
+///     which registration an fd belongs to.
 ///   - changeCounter() counts register+unregister events (monotonic u64)
 ///     and backs /dev/devfs-watch; change_hook (installed by devfs_nodes)
 ///     fires after each bump to wake watchers.
@@ -65,6 +74,11 @@ pub const IoCtx = struct {
     offset: u64 = 0,
     /// Open-time status flags (0x800 = O_NONBLOCK) copied from the fd.
     status_flags: u32 = 0,
+    /// devfs slot generation captured at open (devfs.generationAt). Proxy
+    /// ops reject a mismatch with -EIO: after a tombstone+reuse cycle the
+    /// fd's slot may point at a newer node, and the generation is what
+    /// keeps stale fds failing cleanly instead of retargeting it.
+    generation: u32 = 0,
 
     pub fn nonBlocking(self: *const IoCtx) bool {
         return (self.status_flags & 0x800) != 0;
@@ -90,6 +104,11 @@ const Entry = struct {
     name_len: u8 = 0,
     name: [MAX_NAME_LEN]u8 = @splat(0),
     ops: NodeOps = .{},
+    /// Bumped on every registration of this slot (1 for the first). The
+    /// vfs caches it in FileDescriptor.devfs_generation at open; after a
+    /// tombstone+reuse cycle a stale fd's generation no longer matches and
+    /// the (proxy) op fails with -EIO instead of retargeting the new node.
+    generation: u32 = 0,
 };
 
 var entries: [MAX_NODES]Entry = @splat(.{});
@@ -123,23 +142,39 @@ fn nameValid(name: []const u8) bool {
 
 /// Register a device node. Returns the stable slot index, or null when
 /// the name is invalid, already registered, or the table is full.
+/// Tombstoned slots are recycled oldest-first (lowest index) before the
+/// table grows; every registration bumps the slot's generation.
 /// Init-time only for built-ins; devfs_proxy serializes runtime
 /// registrations under its own alloc lock.
 pub fn register(name: []const u8, ops: NodeOps) ?u32 {
     if (!nameValid(name)) return null;
     if (lookup(name) != null) return null;
-    if (count >= MAX_NODES) return null;
-    const idx = count;
+    // Prefer the oldest tombstone (lowest dead index); append only when
+    // no slot has been recycled yet.
+    var idx: u32 = MAX_NODES;
+    for (0..count) |i| {
+        if (!entries[i].used) {
+            idx = @intCast(i);
+            break;
+        }
+    }
+    if (idx == MAX_NODES) {
+        if (count >= MAX_NODES) return null;
+        idx = count;
+        count += 1;
+    }
+    const generation = entries[idx].generation +% 1;
     entries[idx] = .{
         .used = true,
         .name_len = @intCast(name.len),
         .ops = ops,
+        .generation = generation,
     };
     @memcpy(entries[idx].name[0..name.len], name);
     // Publish the entry before the count bump makes it visible to
-    // lock-free readers (getdents / lookup / open).
+    // lock-free readers (getdents / lookup / open). A reused slot was
+    // already covered by count, so only appends bump it.
     asm volatile ("" ::: .{ .memory = true });
-    count += 1;
     bumpChange();
     return idx;
 }
@@ -191,6 +226,15 @@ pub fn nameAt(idx: u32) ?[]const u8 {
 pub fn opsAt(idx: u32) ?*const NodeOps {
     if (idx >= count) return null;
     return &entries[idx].ops;
+}
+
+/// Current generation of slot `idx` (see Entry.generation). Returned for
+/// live and tombstoned slots alike — the vfs snapshots it at open and the
+/// proxy compares it per-op, so a stale fd fails with -EIO both while the
+/// slot is dead and after it has been recycled for a newer node.
+pub fn generationAt(idx: u32) ?u32 {
+    if (idx >= count) return null;
+    return entries[idx].generation;
 }
 
 /// Test-only reset — host tests re-register from a clean table. Never

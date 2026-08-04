@@ -2247,7 +2247,7 @@ test "devfs: unregister tombstones a slot; lookup/getdents skip it, ops survive"
     // ...but the ops stay callable so in-flight fds get a clean -EIO from
     // the (proxy) op instead of a stale-pointer crash.
     try std.testing.expect(devfs.opsAt(a) != null);
-    // Slots are dense and never reused; the counter bumped on unregister.
+    // Slots stay dense while tombstoned; the counter bumped on unregister.
     try std.testing.expectEqual(@as(u32, 2), devfs.nodeCount());
     try std.testing.expectEqual(@as(u64, 3), devfs.changeCounter());
 
@@ -2255,11 +2255,12 @@ test "devfs: unregister tombstones a slot; lookup/getdents skip it, ops survive"
     try std.testing.expect(!devfs.unregister(a));
     try std.testing.expect(!devfs.unregister(999));
 
-    // The name is free again — re-registering appends a NEW slot.
+    // The name is free again — re-registering REUSES the tombstoned slot
+    // (v1.1: slots are recyclable, guarded by the per-slot generation).
     const a2 = devfs.register("alpha", devfs.null_node_ops) orelse return error.TestFailed;
-    try std.testing.expectEqual(@as(u32, 2), a2);
+    try std.testing.expectEqual(a, a2);
     try std.testing.expectEqual(a2, devfs.lookup("alpha").?);
-    try std.testing.expectEqual(@as(u32, 3), devfs.nodeCount());
+    try std.testing.expectEqual(@as(u32, 2), devfs.nodeCount());
     try std.testing.expectEqual(@as(u64, 4), devfs.changeCounter());
 }
 
@@ -2483,3 +2484,124 @@ test "devfs proxy: write response survives the wire (parse+complete, hello54 dea
     try std.testing.expect(core.complete(rd, 3, "xyz"));
 }
 // ─── end devfs proxy (P1) ───
+
+// ─── v1.1 finishing: devfs slot reuse + proxy poll + static hosts ───
+// devfs tombstone-slot reuse with per-slot generations (fs/devfs.zig),
+// devfs proxy readiness predicates (fs/devfs_proxy.zig Core), and the
+// static host table consulted before real DNS (net/static_hosts.zig).
+
+const static_hosts = kt.static_hosts;
+
+test "devfs: tombstone slots are reused oldest-first; change counter stays monotonic" {
+    devfs.resetForTest();
+
+    const a = devfs.register("alpha", devfs.null_node_ops) orelse return error.TestFailed;
+    const b = devfs.register("beta", devfs.zero_node_ops) orelse return error.TestFailed;
+    const c = devfs.register("gamma", devfs.full_node_ops) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(u32, 0), a);
+    try std.testing.expectEqual(@as(u32, 1), b);
+    try std.testing.expectEqual(@as(u32, 2), c);
+    try std.testing.expectEqual(@as(u64, 3), devfs.changeCounter());
+
+    // Tombstone the middle slot: reuse prefers it over appending.
+    try std.testing.expect(devfs.unregister(b));
+    const d = devfs.register("delta", devfs.null_node_ops) orelse return error.TestFailed;
+    try std.testing.expectEqual(b, d); // reused slot 1, not appended at 3
+    try std.testing.expectEqual(@as(u32, 3), devfs.nodeCount());
+    try std.testing.expectEqualStrings("delta", devfs.nameAt(d).?);
+    try std.testing.expectEqual(d, devfs.lookup("delta").?);
+    try std.testing.expect(devfs.lookup("beta") == null);
+
+    // Oldest tombstone first: with slots 0 and 2 dead, slot 0 wins.
+    try std.testing.expect(devfs.unregister(a));
+    try std.testing.expect(devfs.unregister(c));
+    const e = devfs.register("epsilon", devfs.zero_node_ops) orelse return error.TestFailed;
+    try std.testing.expectEqual(a, e);
+    const f = devfs.register("zeta", devfs.zero_node_ops) orelse return error.TestFailed;
+    try std.testing.expectEqual(c, f);
+
+    // No tombstones left: registration appends again.
+    const g = devfs.register("eta", devfs.zero_node_ops) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(u32, 3), g);
+    try std.testing.expectEqual(@as(u32, 4), devfs.nodeCount());
+
+    // Counter never goes backwards: 3 registers + 3 unregisters + 4 more
+    // registers = 10 events, each bump exactly +1.
+    try std.testing.expectEqual(@as(u64, 10), devfs.changeCounter());
+}
+
+test "devfs: per-slot generation identifies a registration; stale fds are detectable" {
+    devfs.resetForTest();
+
+    const x = devfs.register("xray", devfs.null_node_ops) orelse return error.TestFailed;
+    const gen_open = devfs.generationAt(x) orelse return error.TestFailed;
+
+    // Tombstone: the generation is unchanged while the slot is dead — a
+    // stale fd still matches it, but the proxy op fails on owner_alive
+    // (opsAt keeps returning the ops, per the tombstone contract).
+    try std.testing.expect(devfs.unregister(x));
+    try std.testing.expectEqual(gen_open, devfs.generationAt(x).?);
+    try std.testing.expect(devfs.opsAt(x) != null);
+
+    // Reuse bumps the generation: an fd that cached (idx, gen_open) can no
+    // longer match the new registration on the same slot.
+    const y = devfs.register("yank", devfs.zero_node_ops) orelse return error.TestFailed;
+    try std.testing.expectEqual(x, y);
+    const gen_new = devfs.generationAt(y) orelse return error.TestFailed;
+    try std.testing.expect(gen_new != gen_open);
+
+    // Out-of-range slots report no generation.
+    try std.testing.expect(devfs.generationAt(devfs.MAX_NODES) == null);
+}
+
+test "devfs proxy: poll readiness reflects owner state and queue saturation" {
+    var core: devfs_proxy.Core = .{};
+    var buf: [devfs_proxy.REQ_WIRE_LEN + devfs_proxy.MAX_PAYLOAD]u8 = undefined;
+
+    // Fresh node: owner alive, queue empty → a new request is accepted
+    // without blocking, so both directions report ready.
+    try std.testing.expect(core.canAccept());
+    try std.testing.expectEqual(devfs.POLL_IN | devfs.POLL_OUT, core.pollMask());
+
+    // Saturate the request queue (MAX_PENDING outstanding): nothing ready.
+    var seqs: [devfs_proxy.MAX_PENDING]u32 = undefined;
+    for (&seqs) |*s| {
+        s.* = core.enqueue(devfs_proxy.OP_READ, 0, 64, "") orelse return error.TestFailed;
+    }
+    try std.testing.expect(!core.canAccept());
+    try std.testing.expectEqual(@as(u32, 0), core.pollMask());
+
+    // Handing requests to the owner does NOT free slots (inflight still
+    // occupies one) — readiness only returns when a slot actually frees.
+    _ = core.takeRequest(&buf);
+    try std.testing.expect(!core.canAccept());
+    try std.testing.expectEqual(@as(u32, 0), core.pollMask());
+
+    // A cancelled queued request frees its slot → acceptable again.
+    core.cancel(seqs[devfs_proxy.MAX_PENDING - 1]);
+    try std.testing.expect(core.canAccept());
+    try std.testing.expectEqual(devfs.POLL_IN | devfs.POLL_OUT, core.pollMask());
+
+    // Owner death: ops fail fast with -EIO, so the node must ALWAYS report
+    // ready (a not-ready report would sleep pollers forever on a dead node).
+    _ = core.drain();
+    try std.testing.expect(!core.owner_alive);
+    try std.testing.expect(!core.canAccept());
+    try std.testing.expectEqual(devfs.POLL_IN | devfs.POLL_OUT, core.pollMask());
+}
+
+test "static hosts: built-in table resolves localhost/gateway before any DNS query" {
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, static_hosts.lookup("localhost").?);
+    try std.testing.expectEqual([4]u8{ 10, 0, 2, 2 }, static_hosts.lookup("gateway").?);
+
+    // DNS names are case-insensitive.
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, static_hosts.lookup("LOCALHOST").?);
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, static_hosts.lookup("LocalHost").?);
+
+    // Unknown names miss (the caller falls through to the real resolver).
+    try std.testing.expect(static_hosts.lookup("example.com") == null);
+    try std.testing.expect(static_hosts.lookup("") == null);
+    try std.testing.expect(static_hosts.lookup("localhost.localdomain") == null);
+    try std.testing.expect(static_hosts.lookup("localhos") == null);
+}
+// ─── end v1.1 finishing ───
