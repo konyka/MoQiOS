@@ -189,7 +189,7 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
             inst.item_count += 1;
             inst.in_use_bm[s >> 6] |= @as(u64, 1) << @intCast(s & 63);
 
-            const current = computeCurrentEvents(desc.fd_type, resourceIdxFromDesc(desc));
+            const current = computeCurrentEvents(desc.fd_type, resourceIdxFromDesc(desc), desc.offset);
             if (current & (ev.events & ~EPOLLET & ~EPOLLONESHOT) != 0) {
                 addToReadyList(inst, @intCast(s));
             }
@@ -213,7 +213,7 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
                         item.last_reported = 0;
                         found = true;
                         if (!item.on_ready) {
-                            const current = computeCurrentEvents(item.fd_type, item.resource_idx);
+                            const current = computeCurrentEvents(item.fd_type, item.resource_idx, desc.offset);
                             if (current & (ev.events & ~EPOLLET & ~EPOLLONESHOT) != 0) {
                                 addToReadyList(inst, i);
                             }
@@ -353,7 +353,23 @@ fn resourceIdxFromDesc(desc: *const vfs.FileDescriptor) u32 {
     };
 }
 
-fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32) u32 {
+/// kmsg read cursor for a registered item (J3): the per-fd ring position
+/// lives in the FileDescriptor (vfs.read advances desc.offset), so recover
+/// it through the epoll instance owner's fd table. A closed or reused fd
+/// reports the newest position (nothing unread) — the registration is
+/// stale by then anyway.
+fn kmsgCursorForItem(inst: *const EpollInstance, fd: i32) u64 {
+    const klog = @import("../klog.zig");
+    if (fd >= 0 and fd < @as(i32, @intCast(vfs.MAX_FDS))) {
+        if (task_mod.getTask(inst.owner_task_idx)) |owner| {
+            const desc = &owner.fd_table.fds[@as(u32, @intCast(fd))];
+            if (desc.fd_type == .kmsg) return desc.offset;
+        }
+    }
+    return klog.kmsgNewestPos();
+}
+
+fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32, kmsg_cursor: u64) u32 {
     var revents: u32 = 0;
     switch (fd_type) {
         .tcp_socket => {
@@ -408,7 +424,11 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32) u32 {
             revents |= EPOLLIN;
         },
         .kmsg => {
-            revents |= EPOLLIN;
+            // Level-triggered: readable only while this fd's cursor has
+            // unread ring bytes (J3). Reporting EPOLLIN unconditionally
+            // (G4) made LT epoll busy-spin once the reader caught up.
+            const klog = @import("../klog.zig");
+            if (klog.kmsgHasUnread(kmsg_cursor)) revents |= EPOLLIN;
         },
         .tmpfs_file => {
             revents |= EPOLLIN | EPOLLOUT;
@@ -497,7 +517,7 @@ fn collectEvents(inst: *EpollInstance, out: []EpollEvent, max_out: u32) u32 {
             continue;
         }
 
-        const current = computeCurrentEvents(item.fd_type, item.resource_idx);
+        const current = computeCurrentEvents(item.fd_type, item.resource_idx, kmsgCursorForItem(inst, item.fd));
         const interest = item.events & ~EPOLLET & ~EPOLLONESHOT;
         const matched = current & interest;
         const always_report = current & (EPOLLERR | EPOLLHUP);

@@ -1568,22 +1568,46 @@ G4 之前仅输出到串口；现在每条通过级别过滤的日志行在写�
 **ISR 安全性**：与 `serial.zig` 同一模式 —— 环形缓冲区由 `IrqSpinlock` 保护
 （acquire 时屏蔽中断），中断上下文调用 `log()` 不会撕裂环状态；全程无分配。
 
-### 12.2 /dev/kmsg ✅（G4）
+**阻塞唤醒（J3）**：klog 持有一个 kmsg 等待队列（`kmsg_waiters`，`task.WaitNode`
+单链表头，由 `ring_lock` 保护）。每次追加（`ringAppend`）在写入环之后、同一临界区内
+`sched.wakeOne()` 唤醒一个阻塞读者。该唤醒是 ISR 安全的：`wakeOne`/`unblockTask`
+只做标记 + 入队 per-CPU 运行队列（无分配），与回写线程 tick 在定时器 ISR 中唤醒
+（`fs/vfs.zig` `writebackTimerTick`）是同一条已验证路径；锁序为
+`ring_lock → task_lock/运行队列锁`，`proc/` 不回调 klog，无循环。
+追加在释放 `ring_lock` 之后再调 `epoll.epollNotify(.kmsg, 0, EPOLLIN)`：
+epoll 的 `collectEvents` 会在持有 `inst.spin` 时经 `kmsgHasUnread` 取 `ring_lock`，
+若反向嵌套会构成锁序环。
+
+### 12.2 /dev/kmsg ✅（G4；J3 阻塞读）
 
 VFS 新增 `FdType.kmsg`（只读特殊文件，镜像 `/dev/urandom` 的接法）：
 
 - `open("/dev/kmsg", O_RDONLY)`：fd 的 `offset` 即绝对环游标，0 = 从最旧可用字节开始。
-- `read()`：从 fd 游标拷贝并推进（per-fd 独立游标）；到最新字节返回 0（EOF）。
-- `pread()`：按给定游标读，不动 fd 自身 offset；`write()`/`pwrite()` 拒绝（只读）。
+- `read()`：从 fd 游标拷贝并推进（per-fd 独立游标）。**J3 起为阻塞语义**：
+  追到最新字节（0 字节可读）且 fd 未设 `O_NONBLOCK`（`status_flags & 0x800`）时，
+  读线程经 `klog.kmsgReadOrBlock()` 睡在 kmsg 等待队列上 —— 空检查与入队在
+  `ring_lock` 同一临界区内完成，追加不会丢失唤醒（sysv_sem/posix_mq 同款模式）。
+  被信号打断时按 waitpid 协议处理：`pendingFatal` 走 exit-by-signal
+  （`exitTask(128 + sig)`），`pendingActionable` 返回 `-4`（-EINTR）让处理函数先跑；
+  信号唤醒后必须用 `kmsgUnlinkWaiter()` 摘除仍在队列上的栈节点。
+  `O_NONBLOCK` 保持旧行为：追到最新字节返回 0。
+- `pread()`：按给定游标读，不动 fd 自身 offset，永不阻塞；`write()`/`pwrite()` 拒绝（只读）。
+- epoll（J3）：`.kmsg` 的 `EPOLLIN` 不再恒报，而是按**该 fd 的游标**判定 ——
+  `klog.kmsgHasUnread(cursor)`（底层是纯函数 `kmsg_ring.bytesAvailable(total, cursor)`，
+  宿主可测）。游标从属 fd 的 `desc.offset`；`collectEvents` 经 epoll 实例属主的
+  fd 表恢复游标，fd 已关闭/复用时按「无未读数据」处理。配合追加时的
+  `epollNotify`，LT epoll 在追平后不再空转，新数据到达即醒。
 - 运行时验证：`user/hello47.c`（读取全量并校验 `[INF] ` 前缀与
   `=== MoQiOS scheduler active ===` 启动行、二次打开游标独立、写入被拒）。
+  注意：hello47 以「读到 0 为止」的方式 drain，阻塞语义下它需要在 open 时
+  带 `O_NONBLOCK` 才能在追平后拿到 0。
 
-### 12.3 后续：syslogd 挂钩
+### 12.3 syslogd ✅（J3 起事件驱动）
 
-`servers/syslogd`（目前为空目录）将作为消费者：打开 `/dev/kmsg` 循环读取，
-按级别分流、写持久日志文件或转发 IPC 客户端。数据源已就绪 —— syslogd
-只需普通文件读取语义，无需内核侧再改动；如需不阻塞跟随（`tail -f` 式），
-可在环满/追加时通过 poll/epoll 的 `EPOLLIN` 通知扩展（当前 `.kmsg` 恒报 `EPOLLIN`）。
+`servers/syslogd` 是 kmsg 消费者：打开 `/dev/kmsg` 循环**阻塞读**，追加写入
+`/tmp/kern.log`（tmpfs，256 KiB 硬顶前单代轮换）。J3 之前内核不会阻塞，
+daemon 以 `nanosleep(100ms)` 轮询；现在读本身在最新字节处睡眠，日志行追加即醒，
+投递完全事件驱动，无轮询、无空转。
 
 ---
 

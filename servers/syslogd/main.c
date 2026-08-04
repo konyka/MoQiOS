@@ -4,11 +4,13 @@
  * Design (kmsg consumer pattern):
  *  - Opens /dev/kmsg read-only. The kernel gives each fd an independent
  *    cursor into the kernel log ring; offset 0 means the oldest available
- *    byte, and read() returns 0 once the cursor reaches the newest byte
- *    (it never blocks).
- *  - Main loop: drain whatever is available and append it to the log file;
- *    when read() returns 0 (caught up) or a negative error, sleep 100 ms
- *    via nanosleep — the daemon never busy-spins.
+ *    byte. Since J3 the read() blocks at the newest byte until a log line
+ *    is appended (or a signal interrupts it), so the daemon is fully
+ *    event-driven — no poll loop, no nanosleep.
+ *  - Main loop: blocking-read whatever is available and append it to the
+ *    log file. read() returning 0 means a non-blocking/edge case (nothing
+ *    to do); a negative return other than -EINTR is unexpected but must
+ *    never wedge the daemon, so it just retries.
  *  - Rotation: the log file is opened O_WRONLY|O_CREAT|O_APPEND (= 0x441 in
  *    this kernel's flag encoding, see lib/moqi_libc/include/unistd.h).
  *    tmpfs (kernel/fs/tmpfs.zig) imposes a hard per-file cap of exactly
@@ -23,11 +25,6 @@
  * support (kernel/fs/vfs.zig FdTable.open); any other absolute path such
  * as /var/log/kern.log falls through to the read-only ramdisk lookup and
  * cannot be created. Hence tmpfs is the only writable location today.
- *
- * Future enhancement: /dev/kmsg currently never blocks, so the daemon
- * polls at 10 Hz. Once the kernel grows a blocking-read (or poll/epoll
- * wakeup) for kmsg, the nanosleep fallback should be replaced by a
- * blocking read to make delivery event-driven.
  */
 
 #include <stdio.h>
@@ -42,7 +39,6 @@
 #define LOG_MAX_BYTES (256L * 1024L)
 
 #define DRAIN_BUF_SIZE 4096
-#define SLEEP_NS (100L * 1000L * 1000L) /* 100 ms */
 
 /* open() flag values from lib/moqi_libc/include/unistd.h:
  * O_WRONLY=0x001, O_CREAT=0x040, O_TRUNC=0x200, O_APPEND=0x400. */
@@ -91,8 +87,9 @@ int main(int argc, char **argv, char **envp) {
 
     printf("[syslogd] started\n");
 
-    const struct timespec interval = { 0, SLEEP_NS };
     for (;;) {
+        /* Blocking read (J3): sleeps in the kernel at the newest byte
+         * until a log line is appended; no poll loop needed. */
         const long n = read(kmsg, drain_buf, sizeof(drain_buf));
         if (n > 0) {
             /* Rotate before a write that would cross the 256 KiB tmpfs
@@ -108,10 +105,11 @@ int main(int argc, char **argv, char **envp) {
             if (w > 0) log_size += w;
             /* A short/failed write just drops the tail of this chunk;
              * logging is best-effort and must never wedge the daemon. */
-            continue; /* keep draining; sleep only when caught up */
+            continue; /* keep draining while data is available */
         }
-        /* n == 0: cursor at the newest byte (EOF). n < 0: unexpected
-         * error. Either way, sleep instead of spinning. */
-        nanosleep(&interval, (void *)0);
+        /* n == 0: nothing readable (edge case). n < 0: -EINTR (-4, a
+         * signal interrupted the blocking read) or an unexpected error.
+         * All are handled the same way: loop back into the blocking
+         * read. */
     }
 }

@@ -623,6 +623,11 @@ fn popRunnable(q: *per_cpu.PerCpuRunQueue, deferred_local: *bool) ?u32 {
     while (q.popRtAware()) |t| {
         const i = taskIndexOf(t) orelse continue;
         if (t.state != .ready) continue;
+        // J1: never run a task pinned to another CPU. Entries can predate the
+        // pin (the task was queued while still unpinned, e.g. right after
+        // fork before sched_setaffinity); the bitmap fallback on the pinned
+        // CPU rediscovers the task via pickReadyForCpu's matchesCpu check.
+        if (t.cpu_affinity >= 0 and t.cpu_affinity != @as(i16, @intCast(my_cpu))) continue;
         if (task.isCurrentOnOtherCpu(i, my_cpu)) {
             deferred_local.* = true;
             continue;

@@ -21,6 +21,17 @@ pub const ReadResult = struct {
     new_pos: u64,
 };
 
+/// Bytes a reader at absolute cursor `cursor` can still get from a stream
+/// whose newest position is `total` (J3). Zero when the reader is caught up
+/// (or ahead). A stale cursor — older than the oldest surviving byte —
+/// reports the full absolute backlog `total - cursor`: `read()` clamps such
+/// cursors forward, and the blocking-read / epoll readiness decisions this
+/// feeds only need "zero vs non-zero".
+pub fn bytesAvailable(total: u64, cursor: u64) u64 {
+    if (cursor >= total) return 0;
+    return total - cursor;
+}
+
 pub fn KmsgRing(comptime capacity: usize) type {
     return struct {
         const Self = @This();

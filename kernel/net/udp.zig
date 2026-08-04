@@ -44,9 +44,11 @@ var queues: [MAX_PORTS][QUEUE_DEPTH]UdpEntry = @splat(@splat(.{
 var num_ports: u16 = 0;
 var udp_lock: IrqSpinlock = .{};
 
-fn findPortIdx(port: u16) ?u16 {
-    const saved = udp_lock.acquire();
-    defer udp_lock.release(saved);
+/// Lookup with the lock already held. Callers that use the returned index to
+/// touch `queues` MUST stay in the same critical section: releasePort's
+/// swap-remove reshuffles slots, so an index computed under a previous lock
+/// hold can name a different port's queue by the time it is used (J1).
+fn findPortIdxLocked(port: u16) ?u16 {
     for (0..num_ports) |i| {
         if (ports[i] == port) return @intCast(i);
     }
@@ -129,19 +131,25 @@ pub fn releasePort(port: u16) void {
 
 /// True when a datagram is queued for `port` (epoll readiness).
 pub fn hasQueuedDatagram(port: u16) bool {
-    const port_idx = findPortIdx(port) orelse return false;
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
+    const port_idx = findPortIdxLocked(port) orelse return false;
     for (0..QUEUE_DEPTH) |i| {
         if (queues[port_idx][i].valid) return true;
     }
     return false;
 }
 
-fn enqueue(port_idx: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, payload: []const u8, is_v6: bool) void {
+/// J1: the port lookup and the queue insert share one critical section.
+/// Previously the caller looked the index up under its own lock hold and
+/// passed it here; a concurrent releasePort swap-remove in between could
+/// point the index at a different port's queue, delivering the datagram to
+/// the wrong socket (or effectively dropping it for the real owner).
+fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, payload: []const u8, is_v6: bool) void {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
 
+    const port_idx = findPortIdxLocked(port) orelse return;
     const actual = @min(payload.len, MAX_UDP_PAYLOAD);
     for (0..QUEUE_DEPTH) |i| {
         if (!queues[port_idx][i].valid) {
@@ -169,12 +177,11 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
         if (wire_csum != expect) return;
     }
 
-    const port_idx = findPortIdx(hdr.dst_port) orelse return;
     const actual_payload = @min(hdr.payload_len, @as(u16, MAX_UDP_PAYLOAD));
     if (8 + actual_payload > len) return;
     var ip16: [16]u8 = @splat(0);
     @memcpy(ip16[0..4], &src_ip);
-    enqueue(port_idx, ip16, hdr.src_port, hdr.dst_port, data[8..][0..actual_payload], false);
+    enqueue(hdr.dst_port, ip16, hdr.src_port, hdr.dst_port, data[8..][0..actual_payload], false);
 }
 
 /// IPv6 UDP receive (SK-70). Bound-port-only; checksum verified when non-zero.
@@ -188,18 +195,17 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
     const expect = udp_util.checksumV6(src_ip, dst_ip, data, hdr.udp_len);
     if (wire_csum != expect) return;
 
-    const port_idx = findPortIdx(hdr.dst_port) orelse return;
     const actual_payload = @min(hdr.payload_len, @as(u16, MAX_UDP_PAYLOAD_V6));
     if (8 + actual_payload > len) return;
-    enqueue(port_idx, src_ip, hdr.src_port, hdr.dst_port, data[8..][0..actual_payload], true);
+    enqueue(hdr.dst_port, src_ip, hdr.src_port, hdr.dst_port, data[8..][0..actual_payload], true);
 }
 
 pub fn recvFrom(port: u16, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, out_src_port: *u16) i64 {
-    const port_idx = findPortIdx(port) orelse return 0;
-
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
 
+    // J1: lookup and dequeue in one critical section (see enqueue).
+    const port_idx = findPortIdxLocked(port) orelse return 0;
     for (0..QUEUE_DEPTH) |i| {
         const entry = &queues[port_idx][i];
         if (entry.valid and !entry.is_v6) {
@@ -216,11 +222,10 @@ pub fn recvFrom(port: u16, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, out
 
 /// Drain one IPv6 datagram for `port` (SK-70).
 pub fn recvFromV6(port: u16, out_buf: [*]u8, out_src_ip: *[16]u8, out_src_port: *u16) i64 {
-    const port_idx = findPortIdx(port) orelse return 0;
-
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
 
+    const port_idx = findPortIdxLocked(port) orelse return 0;
     for (0..QUEUE_DEPTH) |i| {
         const entry = &queues[port_idx][i];
         if (entry.valid and entry.is_v6) {

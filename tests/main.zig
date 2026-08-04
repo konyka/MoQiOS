@@ -1350,3 +1350,42 @@ test "I1: demotePtes replacement PDE is a PT pointer inheriting p/w/u" {
     try std.testing.expect(out[511] & huge_user.PRESENT != 0);
 }
 // ─── end user huge pages (I1) ───
+
+// ─── kmsg blocking (J3) ───
+// Pure availability helper behind blocking /dev/kmsg reads and the
+// cursor-accurate epoll EPOLLIN: bytesAvailable(total, cursor) tells a
+// reader at absolute `cursor` how many bytes a stream ending at `total`
+// still has for it. Stale cursors (older than the oldest surviving byte)
+// report the full absolute backlog — the read path clamps them forward,
+// and for block/epoll decisions only "zero vs non-zero" matters.
+
+test "J3: bytesAvailable is zero when caught up or ahead" {
+    try std.testing.expectEqual(@as(u64, 0), kmsg_ring.bytesAvailable(0, 0)); // empty stream
+    try std.testing.expectEqual(@as(u64, 0), kmsg_ring.bytesAvailable(20, 20)); // at newest byte
+    try std.testing.expectEqual(@as(u64, 0), kmsg_ring.bytesAvailable(20, 25)); // cursor in the future
+}
+
+test "J3: bytesAvailable counts the unread backlog" {
+    try std.testing.expectEqual(@as(u64, 15), kmsg_ring.bytesAvailable(20, 5));
+    try std.testing.expectEqual(@as(u64, 20), kmsg_ring.bytesAvailable(20, 0));
+    // Stale cursor (bytes already overwritten): reports the full absolute
+    // backlog — read() clamps forward, availability is what epoll needs.
+    try std.testing.expectEqual(@as(u64, 90), kmsg_ring.bytesAvailable(100, 10));
+}
+
+test "J3: bytesAvailable tracks a live ring's newest position" {
+    var ring: kmsg_ring.KmsgRing(64) = .{};
+    ring.appendLine("[INF] one\n");
+    ring.appendLine("[DBG] two\n");
+    const total = ring.newestPos();
+    try std.testing.expectEqual(@as(u64, 20), total);
+    // Fresh reader at cursor 0 sees everything; a caught-up reader sees 0.
+    try std.testing.expectEqual(@as(u64, 20), kmsg_ring.bytesAvailable(total, 0));
+    try std.testing.expectEqual(@as(u64, 0), kmsg_ring.bytesAvailable(total, total));
+    // Mid-stream cursor: exactly the second line remains.
+    try std.testing.expectEqual(@as(u64, 10), kmsg_ring.bytesAvailable(total, 10));
+    // After another append the same cursor has the new line too.
+    ring.appendLine("[ERR] x\n");
+    try std.testing.expectEqual(@as(u64, 18), kmsg_ring.bytesAvailable(ring.newestPos(), 10));
+}
+// ─── end kmsg blocking (J3) ───

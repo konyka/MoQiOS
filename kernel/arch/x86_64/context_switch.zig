@@ -137,6 +137,13 @@ inline fn clearTs() void {
 /// Sets:
 ///   CR4.OSFXSR | CR4.OSXMMEXCPT
 ///   CR0.MP, CR0.TS, clears CR0.EM
+///   CR0.WP — WITHOUT THIS (J1): nothing in the AP bring-up set WP (the
+///   trampoline only ORs PE/PG into CR0), so APs ran with WP=0 and supervisor
+///   writes bypassed page write-protection entirely. Every kernel
+///   copy_to_user into a not-yet-broken COW page then wrote the SHARED frame
+///   directly instead of faulting into handleCowFault — forked siblings
+///   executing on APs polluted each other's pages (hello50 tmpfs/pipe verify
+///   failures on SMP>1). Set it on every CPU here (idempotent on the BSP).
 ///
 /// After this, the very first FPU/SSE instruction on this CPU will fault
 /// into the #NM handler, which performs the initial fninit + arms tracking.
@@ -151,6 +158,7 @@ pub fn initCpu() void {
         \\btr $2, %%rax        // clear CR0.EM (no x87 emulation)
         \\bts $1, %%rax        // set CR0.MP   (monitor coprocessor)
         \\bts $3, %%rax        // set CR0.TS   (lazy switch armed)
+        \\bts $16, %%rax       // set CR0.WP   (supervisor honours write-protect)
         \\movq %%rax, %%cr0
         ::: .{ .rax = true, .memory = true });
 }
@@ -162,17 +170,21 @@ pub fn initCpu() void {
 pub fn onContextSwitch(old: ?*task.Task) void {
     if (builtin.cpu.arch != .x86_64) return;
     if (old) |o| {
-        if (o.fpu_owned) {
+        // Save only when THIS CPU holds the task's live FPU state. After a
+        // migration the live state belongs to a different CPU, whose own
+        // switch-out path performs the save (J1).
+        const my_cpu = syscall_entry.getPerCpu().cpu_id;
+        if (o.fpu_owned and o.fpu_home_cpu == my_cpu + 1) {
             asm volatile ("fxsave (%[buf])"
                 :
                 : [buf] "r" (@as([*]u8, @ptrCast(&o.fpu_state))),
                 : .{ .memory = true });
+            o.fpu_owned = false;
+            o.fpu_home_cpu = 0;
         }
     }
-    // Arm lazy-restore for the incoming task. The old task keeps its
-    // fpu_owned flag set — the #NM handler clears it when a different task
-    // first touches FPU on this CPU (so a re-scheduled `old` can short-
-    // circuit straight back to its saved state without an extra fxsave).
+    // Arm lazy-restore for the incoming task: the next FPU/SSE use takes a
+    // #NM, which fxrstors the task's saved state.
     setTs();
 }
 
@@ -201,12 +213,17 @@ pub fn handleDeviceNotAvailable() void {
         return;
     }
 
-    // Drop the previous owner's claim on this CPU's FPU. The previous
-    // owner's saved state lives in its Task.fpu_state (eagerly written by
-    // onContextSwitch), so clearing the flag is sufficient.
+    // Drop the previous owner's claim on this CPU's FPU — but ONLY when its
+    // live state is anchored to THIS CPU (fpu_home_cpu). J1: clearing the
+    // flag of a task that is FPU-live on ANOTHER CPU made that CPU's next
+    // context switch skip the fxsave, and the task later resumed with a
+    // stale fxrstor (hello50 worker pattern corruption after migration).
+    // When the anchor matches, the state was already saved by the switch
+    // that took prev off this CPU, so dropping the claim is enough.
     if (fpu_owners[cpu_id]) |prev| {
-        if (prev != cur) {
+        if (prev != cur and prev.fpu_home_cpu == cpu_id + 1) {
             prev.fpu_owned = false;
+            prev.fpu_home_cpu = 0;
         }
     }
 
@@ -220,5 +237,6 @@ pub fn handleDeviceNotAvailable() void {
         cur.fpu_initialized = true;
     }
     cur.fpu_owned = true;
+    cur.fpu_home_cpu = @intCast(cpu_id + 1);
     fpu_owners[cpu_id] = cur;
 }

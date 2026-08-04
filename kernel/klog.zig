@@ -4,6 +4,9 @@ const serial = @import("arch/arch.zig").serial;
 const fmt = @import("lib/fmt.zig");
 const kmsg_ring = @import("lib/kmsg_ring.zig");
 const IrqSpinlock = @import("sync/irq_spinlock.zig").IrqSpinlock;
+const task = @import("proc/task.zig");
+const sched = @import("proc/sched.zig");
+const epoll = @import("net/epoll.zig");
 
 pub const Level = enum(u8) {
     err = 0,
@@ -21,6 +24,13 @@ var ring: kmsg_ring.KmsgRing(KMSG_CAP) = .{};
 /// ring is mutated, so log() from interrupt context cannot tear state.
 /// No allocation anywhere on this path.
 var ring_lock: IrqSpinlock = .{};
+
+/// Wait queue for blocking /dev/kmsg readers (J3). Guarded by `ring_lock`:
+/// readers link their node and mark themselves blocked inside the same
+/// critical section as the empty-check (kmsgReadOrBlock), and ringAppend
+/// wakes one waiter under the same lock, so an append can never slip
+/// between a reader's empty-check and its enqueue (no lost wakeup).
+var kmsg_waiters: ?*task.WaitNode = null;
 
 var min_level: Level = .debug;
 
@@ -53,10 +63,93 @@ pub fn kmsgOldestPos() u64 {
     return ring.oldestPos();
 }
 
-fn ringAppend(parts: []const []const u8) void {
+/// Absolute cursor one past the newest byte in the ring.
+pub fn kmsgNewestPos() u64 {
     const flags = ring_lock.acquire();
     defer ring_lock.release(flags);
-    for (parts) |p| ring.appendLine(p);
+    return ring.newestPos();
+}
+
+/// True when a reader at absolute `cursor` still has unread ring bytes
+/// (J3) — feeds the blocking-read empty check and epoll's EPOLLIN.
+pub fn kmsgHasUnread(cursor: u64) bool {
+    const flags = ring_lock.acquire();
+    defer ring_lock.release(flags);
+    return kmsg_ring.bytesAvailable(ring.newestPos(), cursor) > 0;
+}
+
+/// Outcome of kmsgReadOrBlock.
+pub const KmsgReadOrBlock = union(enum) {
+    /// Data was copied (or there is no current task to block — early boot
+    /// / kernel-thread callers get the old non-blocking EOF behaviour).
+    ready: kmsg_ring.ReadResult,
+    /// No data: `node` is linked on the kmsg wait queue and the current
+    /// task is marked .blocked. The caller must forceReschedule(), then
+    /// kmsgUnlinkWaiter() and re-check signals before retrying.
+    blocked,
+};
+
+/// Attempt a read at absolute cursor `read_pos`; if no data is available,
+/// atomically (under `ring_lock`) join the kmsg wait queue and mark the
+/// current task blocked. Holding the lock across check + enqueue is what
+/// closes the lost-wakeup race against ringAppend, which appends and wakes
+/// under the same lock (the sysv_sem / posix_mq pattern).
+pub fn kmsgReadOrBlock(read_pos: u64, buf: []u8, node: *task.WaitNode) KmsgReadOrBlock {
+    const flags = ring_lock.acquire();
+    defer ring_lock.release(flags);
+    const res = ring.read(read_pos, buf);
+    if (res.n > 0) return .{ .ready = res };
+    if (!sched.blockOn(&kmsg_waiters, node)) return .{ .ready = res };
+    return .blocked;
+}
+
+/// Remove `node` from the kmsg wait queue if it is still linked. A granted
+/// wakeOne already popped it (this is then a no-op); a signal kick
+/// (sendSignal → kickIfBlocked) unblocks the task without touching the
+/// queue, so an interrupted wait MUST unlink here before its stack frame
+/// goes away (mirrors posix_mq's unlinkNode).
+pub fn kmsgUnlinkWaiter(node: *task.WaitNode) void {
+    const flags = ring_lock.acquire();
+    defer ring_lock.release(flags);
+    var prev: ?*task.WaitNode = null;
+    var cur = kmsg_waiters;
+    while (cur) |n| {
+        if (n == node) {
+            if (prev) |p| {
+                p.next = n.next;
+            } else {
+                kmsg_waiters = n.next;
+            }
+            n.next = null;
+            return;
+        }
+        prev = n;
+        cur = n.next;
+    }
+}
+
+fn ringAppend(parts: []const []const u8) void {
+    {
+        const flags = ring_lock.acquire();
+        defer ring_lock.release(flags);
+        for (parts) |p| ring.appendLine(p);
+        // J3: wake one blocked /dev/kmsg reader after the data is stored.
+        // ISR-safe: log() runs from interrupt context, and wakeOne only
+        // flips WaitNode/task state words and pushes onto a per-CPU
+        // runqueue (IrqSpinlock, no allocation) — the same wake the
+        // writeback thread tick already performs from the timer ISR
+        // (fs/vfs.zig writebackTimerTick). Lock order is
+        // ring_lock → task_lock/runqueue lock; nothing in proc/ ever calls
+        // back into klog, so no cycle.
+        _ = sched.wakeOne(&kmsg_waiters);
+    }
+    // J3: notify epoll AFTER releasing ring_lock. epollNotify walks
+    // instances under pool_lock/inst.spin, and epoll's collectEvents
+    // acquires ring_lock while holding inst.spin (kmsg cursor check) —
+    // nesting ring_lock outside inst.spin here would close a lock-order
+    // cycle. ISR-safety of epollNotify from interrupt context is already
+    // established by timerfd, which notifies from the timer tick.
+    epoll.epollNotify(.kmsg, 0, epoll.EPOLLIN);
 }
 
 pub fn log(comptime level: Level, comptime msg: []const u8) void {

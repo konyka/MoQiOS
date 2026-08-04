@@ -664,9 +664,46 @@ pub const FdTable = struct {
             },
             .kmsg => {
                 const klog = @import("../klog.zig");
-                const res = klog.kmsgRead(desc.offset, buf[0..count]);
-                desc.offset = res.new_pos;
-                return @intCast(res.n);
+                // J3: O_NONBLOCK (and pread-like zero-count) keeps the old
+                // "0 at the newest byte" behaviour.
+                if (count == 0 or (desc.status_flags & 0x800) != 0) {
+                    const res = klog.kmsgRead(desc.offset, buf[0..count]);
+                    desc.offset = res.new_pos;
+                    return @intCast(res.n);
+                }
+                // Blocking read: sleep on the kmsg wait queue until a log
+                // append wakes us or a signal interrupts. The empty-check
+                // and the wait-queue enqueue are atomic under klog's ring
+                // lock (kmsgReadOrBlock), so no append is missed.
+                const sched = @import("../proc/sched.zig");
+                const task_mod = @import("../proc/task.zig");
+                const sig_mod = @import("../proc/signal.zig");
+                while (true) {
+                    var node: task_mod.WaitNode = .{ .task_idx = 0 };
+                    switch (klog.kmsgReadOrBlock(desc.offset, buf[0..count], &node)) {
+                        .ready => |res| {
+                            // Data copied — or no current task to block
+                            // (early boot): report what the ring gave us.
+                            desc.offset = res.new_pos;
+                            return @intCast(res.n);
+                        },
+                        .blocked => {
+                            sched.forceReschedule();
+                            // Woken: wakeOne already popped our node on a
+                            // data wake; a signal kick leaves it linked, so
+                            // unlink defensively before the frame dies.
+                            klog.kmsgUnlinkWaiter(&node);
+                            // Signal protocol (mirrors proc/waitpid.zig):
+                            // die on a fatal signal via the exit-by-signal
+                            // path, or EINTR so a handler runs on return.
+                            const cur_idx = sched.currentTaskIndex() orelse return 0;
+                            const cur = task_mod.getTask(cur_idx) orelse return 0;
+                            if (sig_mod.pendingFatal(cur)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+                            if (sig_mod.pendingActionable(cur)) return -4; // -EINTR
+                            // Data wake (or spurious): loop and re-read.
+                        },
+                    }
+                }
             },
             .inotify => return -1, // inotify uses read via special syscall path
             .raw_socket => {

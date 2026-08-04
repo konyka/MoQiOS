@@ -222,6 +222,14 @@ pub const Task = struct {
     /// #NM lazy-restore; cleared by the #NM handler of a different task that
     /// claims the FPU on the same CPU.
     fpu_owned: bool = false,
+    /// J1: which CPU's FPU holds this task's live state, encoded as cpu_id+1
+    /// (0 = none). The lazy protocol is per-CPU, so ownership must name the
+    /// CPU: the #NM handler clears `fpu_owned` when another task claims the
+    /// FPU, and without this field a CPU would clear the flag of a task that
+    /// is FPU-live on a DIFFERENT CPU (post-migration) — that task's next
+    /// switch-out then skipped the fxsave and it resumed with a stale
+    /// fxrstor (observed as hello50 worker-0 pattern corruption).
+    fpu_home_cpu: u8 = 0,
 
     // --- POSIX system capabilities (Task #8) ---
     /// Effective capabilities — currently active permissions.

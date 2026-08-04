@@ -31,6 +31,7 @@ static inline int64_t syscall3(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_CLOSE 11
 
 #define O_RDONLY 0
+#define O_NONBLOCK 0x800
 #define O_WRONLY 1
 
 static void print(const char *s) {
@@ -63,7 +64,7 @@ static char log_buf[80 * 1024];
 
 void _start(void) {
     /* (a) open + drain the ring from the oldest available byte. */
-    int64_t fd = syscall3(SYS_OPEN, (uint64_t)"/dev/kmsg", O_RDONLY, 0);
+    int64_t fd = syscall3(SYS_OPEN, (uint64_t)"/dev/kmsg", O_RDONLY | O_NONBLOCK, 0);
     if (fd < 0) fail("open /dev/kmsg");
 
     uint64_t total = 0;
@@ -84,7 +85,7 @@ void _start(void) {
 
     /* (c) second open: independent cursor starting at the oldest byte. */
     {
-        int64_t fd2 = syscall3(SYS_OPEN, (uint64_t)"/dev/kmsg", O_RDONLY, 0);
+        int64_t fd2 = syscall3(SYS_OPEN, (uint64_t)"/dev/kmsg", O_RDONLY | O_NONBLOCK, 0);
         if (fd2 < 0) fail("reopen /dev/kmsg");
         char first2[64];
         int64_t n2 = syscall3(SYS_READ, (uint64_t)fd2, (uint64_t)first2, sizeof(first2));

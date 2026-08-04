@@ -18,6 +18,12 @@ pub fn unlink(path_ptr: u64) i64 {
     while (name_len < copied and name_buf[name_len] != 0) : (name_len += 1) {}
     const name = name_buf[0..name_len];
 
+    // tmpfs: /tmp paths route there, mirroring the open path in vfs.zig.
+    if (name.len >= 4 and name[0] == '/' and name[1] == 't' and name[2] == 'm' and name[3] == 'p') {
+        const tmpfs = @import("../fs/tmpfs.zig");
+        return tmpfs.tmpfsUnlink(name);
+    }
+
     // Try ext2 first
     if (ext2.isActive()) {
         if (ext2.unlinkFile(name)) return 0;
