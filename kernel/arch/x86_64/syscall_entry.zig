@@ -2429,6 +2429,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         483 => { // ioperm_set(port, count, enable) — per-task TSS IOPB
             frame.rax = @bitCast(@import("../../proc/ioperm.zig").syscallIopermSet(frame.rdi, frame.rsi, frame.rdx));
         },
+        484 => { // devfs_register(name_ptr, flags) -> ctrl fd (fs/devfs_proxy.zig)
+            frame.rax = @bitCast(@import("../../fs/devfs_proxy.zig").syscallDevfsRegister(frame.rdi, frame.rsi));
+        },
         else => {
             serial.writeString("[syscall] unknown syscall: 0x");
             fmt.writeHex(syscall_nr);

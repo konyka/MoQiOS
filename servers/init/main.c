@@ -110,6 +110,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello51");  /* userspace driver framework (pci/mmio/irq/dma) */
     run_test("hello52");  /* ioperm: user port I/O via TSS I/O bitmap */
     run_test("hello53");  /* devfs device nodes (/dev registry + getdents) */
+    run_test("hello54");  /* userspace-owned /dev node (devfs proxy) */
 
     /* First resident system service: drains /dev/kmsg into /tmp/kern.log.
      * Never exits — do not waitpid it. */

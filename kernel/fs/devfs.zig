@@ -7,13 +7,25 @@
 /// devfs_nodes.zig and register themselves at kernel init.
 ///
 /// Contract:
-///   - The table is append-only. Nodes are registered once during kernel
-///     init, BEFORE any user task can open /dev; after that the table is
-///     read-only and needs no lock. `register` itself is single-threaded
-///     init-time API — callers must not register concurrently with opens.
+///   - The table is append-only. Built-in nodes are registered once during
+///     kernel init, BEFORE any user task can open /dev; userspace-owned
+///     nodes (devfs_proxy) register later from syscall context under the
+///     proxy's own alloc lock. The table itself stays lock-free: register
+///     publishes the entry before bumping the count, and readers tolerate
+///     a node appearing mid-scan.
+///   - unregister() tombstones a slot (owner death of a userspace node):
+///     lookup/nameAt skip it, getdents skips it, new opens of the name get
+///     ENOENT, and the name can be registered again (as a NEW slot). The
+///     ops stay callable through opsAt so fds that already cached the slot
+///     index fail cleanly inside the op (-EIO from the proxy) instead of
+///     dereferencing a stale entry. Slots are never reused — a cached
+///     devfs_idx can never silently retarget a different node.
 ///   - Slot indices are dense (0..nodeCount()-1) and stable forever, so a
 ///     FileDescriptor can cache the index and getdents can use it directly
 ///     as the directory cursor.
+///   - changeCounter() counts register+unregister events (monotonic u64)
+///     and backs /dev/devfs-watch; change_hook (installed by devfs_nodes)
+///     fires after each bump to wake watchers.
 ///   - Ops run in the caller's syscall context (the opening/reading task),
 ///     with no devfs-internal lock held. They may block (kmsg's read does)
 ///     and may use interrupt-safe subsystem locks, but must never assume
@@ -83,6 +95,24 @@ const Entry = struct {
 var entries: [MAX_NODES]Entry = @splat(.{});
 var count: u32 = 0;
 
+/// Monotonic register/unregister event counter backing /dev/devfs-watch.
+var change_counter: u64 = 0;
+/// Installed by devfs_nodes.init(); fired after every counter bump to wake
+/// blocked /dev/devfs-watch readers. Null in host tests unless a test sets
+/// it. Runs in the registrant's context with no devfs lock held.
+pub var change_hook: ?*const fn () void = null;
+
+fn bumpChange() void {
+    _ = @atomicRmw(u64, &change_counter, .Add, 1, .seq_cst);
+    if (change_hook) |h| h();
+}
+
+/// Number of register+unregister events so far (the devfs-watch cursor
+/// space). Seq-cst so a watcher that sees the bump also sees the entry.
+pub fn changeCounter() u64 {
+    return @atomicLoad(u64, &change_counter, .seq_cst);
+}
+
 fn nameValid(name: []const u8) bool {
     if (name.len == 0 or name.len > MAX_NAME_LEN) return false;
     for (name) |c| {
@@ -93,7 +123,8 @@ fn nameValid(name: []const u8) bool {
 
 /// Register a device node. Returns the stable slot index, or null when
 /// the name is invalid, already registered, or the table is full.
-/// Init-time only (see the contract in the file header).
+/// Init-time only for built-ins; devfs_proxy serializes runtime
+/// registrations under its own alloc lock.
 pub fn register(name: []const u8, ops: NodeOps) ?u32 {
     if (!nameValid(name)) return null;
     if (lookup(name) != null) return null;
@@ -105,8 +136,24 @@ pub fn register(name: []const u8, ops: NodeOps) ?u32 {
         .ops = ops,
     };
     @memcpy(entries[idx].name[0..name.len], name);
+    // Publish the entry before the count bump makes it visible to
+    // lock-free readers (getdents / lookup / open).
+    asm volatile ("" ::: .{ .memory = true });
     count += 1;
+    bumpChange();
     return idx;
+}
+
+/// Tombstone slot `idx` (userspace-node owner death). lookup/nameAt stop
+/// resolving it; opsAt keeps returning the ops so cached fds fail cleanly
+/// inside the op. Returns false for out-of-range or already-dead slots.
+pub fn unregister(idx: u32) bool {
+    if (idx >= count) return false;
+    if (!entries[idx].used) return false;
+    asm volatile ("" ::: .{ .memory = true });
+    entries[idx].used = false;
+    bumpChange();
+    return true;
 }
 
 /// Look up a node by bare device name (no "/dev/" prefix).
@@ -114,6 +161,7 @@ pub fn lookup(name: []const u8) ?u32 {
     if (!nameValid(name)) return null;
     for (0..count) |i| {
         const e = &entries[i];
+        if (!e.used) continue;
         if (e.name_len == name.len and
             stdEql(e.name[0..e.name_len], name))
         {
@@ -129,12 +177,17 @@ pub fn nodeCount() u32 {
 }
 
 /// Name of the node at slot `idx` (idx < nodeCount()), for getdents.
+/// Tombstoned slots report null so enumeration skips them.
 pub fn nameAt(idx: u32) ?[]const u8 {
     if (idx >= count) return null;
+    if (!entries[idx].used) return null;
     return entries[idx].name[0..entries[idx].name_len];
 }
 
-/// Ops of the node at slot `idx`.
+/// Ops of the node at slot `idx`. Deliberately returned even for
+/// tombstoned slots: a FileDescriptor caches the slot index at open, so a
+/// client op racing an unregister must still reach the (proxy) op, which
+/// then reports -EIO.
 pub fn opsAt(idx: u32) ?*const NodeOps {
     if (idx >= count) return null;
     return &entries[idx].ops;
@@ -145,6 +198,8 @@ pub fn opsAt(idx: u32) ?*const NodeOps {
 pub fn resetForTest() void {
     entries = @splat(.{});
     count = 0;
+    change_counter = 0;
+    change_hook = null;
 }
 
 // Tiny local eql so this file stays import-free (host-testable).

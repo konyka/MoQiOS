@@ -784,6 +784,9 @@ pub fn reapZombies() u32 {
             // L1: release user-driver resources (IRQ registrations, DMA
             // buffers, MMIO mappings) before the address space walk.
             @import("../drivers/userdrv.zig").cleanupTask(t, t.page_table_phys);
+            // P1: tombstone any userspace-owned devfs nodes (drains their
+            // pending requests with -EIO).
+            @import("../fs/devfs_proxy.zig").cleanupTask(t);
             // ioperm: return the TSS IOPB pages (allocated by ioperm_set).
             @import("ioperm.zig").freeBitmap(t);
             // G2: release file-region backing refs before the address space
@@ -1044,6 +1047,9 @@ pub fn waitpid(parent_idx: u32, pid: i32, status: *i32) ?u32 {
                 // L1: release user-driver resources (IRQ registrations, DMA
                 // buffers, MMIO mappings) before the address space walk.
                 @import("../drivers/userdrv.zig").cleanupTask(t, t.page_table_phys);
+                // P1: tombstone any userspace-owned devfs nodes (drains
+                // their pending requests with -EIO).
+                @import("../fs/devfs_proxy.zig").cleanupTask(t);
                 // ioperm: return the TSS IOPB pages (allocated by ioperm_set).
                 @import("ioperm.zig").freeBitmap(t);
                 // G2: release file-region backing refs before the address space.

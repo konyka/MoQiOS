@@ -350,6 +350,7 @@ fn resourceIdxFromDesc(desc: *const vfs.FileDescriptor) u32 {
         .eventfd => desc.eventfd_idx,
         .timerfd => desc.timerfd_idx,
         .devfs => desc.devfs_idx,
+        .devfs_ctrl => desc.devfs_ctrl_idx,
         else => 0,
     };
 }
@@ -453,6 +454,13 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32, kmsg_cursor: u64
         },
         .raw_socket => {
             revents |= EPOLLOUT; // no per-socket RX queue to test
+        },
+        .devfs_ctrl => {
+            // Owner end of a userspace node: readable when a request is
+            // queued, always writable (responses are matched by seq).
+            const dpx = @import("../fs/devfs_proxy.zig");
+            if (dpx.ctrlHasQueued(resource_idx)) revents |= EPOLLIN;
+            revents |= EPOLLOUT;
         },
     }
     return revents;

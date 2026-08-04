@@ -311,7 +311,7 @@ SECTIONS {
 | `servers/init/` | 用户态 init（**已实现**：`main.c` 基于 moqi_libc，取代 `user/init.S`；汇编版保留为回退） |
 | `servers/pm/` | 进程管理服务（fork/exec/wait） |
 | `servers/vfs/ext4/` | 文件系统服务（ext4 实现，从内核迁出） |
-| `servers/devmgr/` | 设备管理 / 命名空间 |
+| `servers/devmgr/` | 设备管理 / 命名空间（**已实现**：`main.c` 基于 moqi_libc，事件驱动——阻塞读 `/dev/devfs-watch`（devfs 变更计数器），节点注册/注销（含 devfs_register 的用户态节点）时重新快照 `getdents("/dev")` 并打印 `[devmgr] devices: ...`；无 watch 节点时回退 1 Hz 轮询。启动标记 `[devmgr] started` 入 smoke） |
 | `servers/netstack/` | 网络协议栈服务（从内核迁出） |
 | `servers/ttyd/` | 终端 / 控制台守护 |
 | `servers/syslogd/` | 日志服务（**已实现**：`main.c` 基于 moqi_libc，见第 7 节） |

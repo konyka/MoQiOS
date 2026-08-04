@@ -49,6 +49,11 @@ pub const FdType = enum(u8) {
     /// Replaces the old per-node random/kmsg/pci fd types, which are now
     /// registered devfs nodes like everything else under /dev.
     devfs = 20,
+    /// devfs proxy control fd (fs/devfs_proxy.zig) — the owner end of a
+    /// userspace-owned /dev node from devfs_register (syscall 484).
+    /// devfs_ctrl_idx selects the proxy node. Read dequeues requests,
+    /// write completes them; close kills the node.
+    devfs_ctrl = 21,
 };
 
 pub const PIPE_BUF_SIZE: u32 = 4096;
@@ -236,6 +241,8 @@ pub const FileDescriptor = struct {
     tmpfs_idx: u32 = 0,
     /// devfs node slot (fs/devfs.zig); devfs.DIR_IDX = the /dev directory.
     devfs_idx: u32 = 0,
+    /// devfs proxy node slot (fs/devfs_proxy.zig) for .devfs_ctrl fds.
+    devfs_ctrl_idx: u32 = 0,
     udp_port: u16 = 0,
     udp_connected: bool = false,
     udp_is_v6: bool = false,
@@ -315,9 +322,11 @@ pub const FdTable = struct {
         // Status flags visible via F_GETFL: access mode + O_APPEND + O_NONBLOCK.
         const status = flags & (0x03 | 0x400 | 0x800);
 
-        // /dev — devfs device nodes (fs/devfs.zig). All nodes (null, zero,
-        // full, random, urandom, kmsg, pci, tty) are registered in the
-        // devfs table at kernel init; unregistered names are ENOENT.
+        // /dev — devfs device nodes (fs/devfs.zig). Built-in nodes (null,
+        // zero, full, random, urandom, kmsg, pci, tty, devfs-watch) are
+        // registered at kernel init; userspace-owned nodes (devfs_proxy,
+        // syscall 484) register at runtime and tombstone on owner death.
+        // Unregistered (or tombstoned) names are ENOENT.
         // "/dev" itself opens the devfs directory for getdents.
         if (str.eql(name, "/dev") or str.eql(name, "/dev/")) {
             self.fds[slot] = .{
@@ -659,6 +668,10 @@ pub const FdTable = struct {
                 if (n >= 0) desc.offset = ctx.offset;
                 return n;
             },
+            .devfs_ctrl => {
+                // Owner end of a userspace node: dequeue the next request.
+                return @import("devfs_proxy.zig").ctrlRead(desc.devfs_ctrl_idx, buf, count);
+            },
             .tmpfs_file => {
                 const tmpfs = @import("tmpfs.zig");
                 if (desc.offset >= desc.file_size) return 0;
@@ -769,6 +782,11 @@ pub const FdTable = struct {
                 if (n >= 0) desc.offset = ctx.offset;
                 return n;
             },
+            .devfs_ctrl => {
+                // Owner end of a userspace node: complete a request.
+                if (!desc.writable) return -1;
+                return @import("devfs_proxy.zig").ctrlWrite(desc.devfs_ctrl_idx, buf, count);
+            },
             .tmpfs_file => {
                 if (!desc.writable) return -1;
                 if ((desc.status_flags & 0x400) != 0) desc.offset = desc.file_size;
@@ -811,6 +829,7 @@ pub const FdTable = struct {
             .pipe_read, .pipe_write => return -29, // ESPIPE - pipes don't support offset
             .tcp_socket, .udp_socket, .unix_socket, .raw_socket => return -29, // ESPIPE
             .epoll, .eventfd, .timerfd, .inotify => return -29, // ESPIPE
+            .devfs_ctrl => return -29, // ESPIPE — ctrl fds are sequential streams
             .ramdisk_file => {
                 if (offset >= desc.file_size) return 0;
                 const remaining = desc.file_size - offset;
@@ -879,6 +898,7 @@ pub const FdTable = struct {
             .pipe_read, .pipe_write => return -29, // ESPIPE
             .tcp_socket, .udp_socket, .unix_socket, .raw_socket => return -29, // ESPIPE
             .epoll, .eventfd, .timerfd, .inotify => return -29, // ESPIPE
+            .devfs_ctrl => return -29, // ESPIPE
             .ramdisk_file => return -1, // ramdisk is read-only
             .devfs => {
                 // Char devices are streams: explicit-offset writes are
@@ -927,6 +947,7 @@ pub const FdTable = struct {
                 .unix_socket => if (other.unix_sock_idx == desc.unix_sock_idx) return true,
                 .timerfd => if (other.timerfd_idx == desc.timerfd_idx) return true,
                 .tmpfs_file => if (other.tmpfs_idx == desc.tmpfs_idx) return true,
+                .devfs_ctrl => if (other.devfs_ctrl_idx == desc.devfs_ctrl_idx) return true,
                 .eventfd => if (other.eventfd_idx == desc.eventfd_idx) return true,
                 .ramdisk_file => if (other.file_data == desc.file_data) return true,
                 else => {},
@@ -994,6 +1015,11 @@ pub const FdTable = struct {
         if (desc.fd_type == .tmpfs_file) {
             const tmpfs = @import("tmpfs.zig");
             tmpfs.tmpfsClose(@intCast(desc.tmpfs_idx));
+        }
+        if (desc.fd_type == .devfs_ctrl) {
+            // Owner death: pending requests complete with -EIO and the
+            // devfs node is tombstoned (devfs_proxy.ctrlClose).
+            @import("devfs_proxy.zig").ctrlClose(desc.devfs_ctrl_idx);
         }
         // proc_file needs no special cleanup
         desc.* = .{};

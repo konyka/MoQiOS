@@ -891,6 +891,13 @@ const Pipe = struct {
 
 - **注册表**：定长 32 槽（`MAX_NODES`），名字 ≤ 24 字节。槽位稠密且永久
   稳定（append-only），fd 直接缓存槽位索引，getdents 用索引作目录游标。
+  `unregister(idx)` 打墓碑（tombstone）：lookup/nameAt/getdents 跳过，
+  名字可重新注册为**新槽位**（槽位永不复用，已缓存旧槽位的 fd 不会误
+  中新节点）；`opsAt` 对墓碑槽位仍返回 ops，让存量 fd 在 op 内拿到干净
+  的 `-EIO`。每次注册/注销递增单调 `changeCounter()`（seq-cst 原子），
+  并触发 `change_hook`（由 devfs_nodes 安装，唤醒 /dev/devfs-watch 读者）。
+  运行时注册（devfs_register 系统调用）由 devfs_proxy 的 alloc_lock 串行化，
+  表本身保持无锁：register 先发布条目再递增 count。
 - **ops 结构**（`NodeOps`）：
   ```zig
   open:  ?*const fn () i64,                                  // 0 成功 / 负 errno（如 /dev/pci 的 CAP_SYS_RAWIO 门）
@@ -917,6 +924,7 @@ const Pipe = struct {
   | kmsg | 日志环，阻塞读（J3 语义不变，游标在 fd offset） | 无 | epoll 电平触发 EPOLLIN |
   | pci | PCI 枚举快照 | 无 | open 需 CAP_SYS_RAWIO（L1） |
   | tty | x86_64: PS/2 键盘输入环；其他架构 -ENOTTY（无串口 RX 路径） | 串口输出 | no_pread |
+  | devfs-watch | devfs 变更计数器（u64 LE），计数器未越过本 fd 上次读到的游标时阻塞 | 无 | no_pread；devmgr 的事件源 |
 - **打开语义**：`vfs.open` 的 `/dev/` 分支先查 devfs 表；未注册的名字一律
   `-ENOENT`（不再有硬编码节点）。`/dev` 本身可打开为目录 fd
   （`devfs_idx == DIR_IDX`），`getdents64` 对其枚举全部注册节点
@@ -927,6 +935,69 @@ const Pipe = struct {
 - **测试**：纯核心 host 测试（`tests/main.zig` "devfs" 块）：注册/查找/枚举、
   非法名/重名/满表拒绝、null/zero/full 语义、IoCtx O_NONBLOCK 解码；
   端到端见 `user/hello53.c`。
+
+### 3.9 devfs proxy：用户态设备节点 + devfs 变更事件（P1）✅
+
+文件: `fs/devfs_proxy.zig`（纯核心 + 内核胶水）、`fs/devfs.zig`（墓碑与
+变更计数器）、`fs/devfs_nodes.zig`（/dev/devfs-watch）；接入点:
+`vfs.zig`（FdType.devfs_ctrl、read/write/close）、`getdents.zig`（跳过
+墓碑槽）、`epoll.zig`、syscall #484、task reap 双站点 cleanup。
+
+- **devfs_register(name_ptr, flags) → ctrl_fd（syscall 484，x86_64）**：
+  需要 CAP_SYS_RAWIO；名字 ≤ 24 字节；flags 必须为 0（保留）。内核以
+  comptime 展开的每槽 ops 创建 devfs 节点（每槽一个 `nodes[i]` 闭包，
+  NodeOps 无 userdata），并返回新 fd 类型 `.devfs_ctrl` 的控制 fd。
+  同一时刻及累计最多 `MAX_USER_NODES = 8` 个用户态节点（槽位永不复用，
+  见下）；重名 `-EEXIST`，表满 `-ENFILE`。
+- **协议字节布局**（全部小端）：
+  - 请求（owner 从 ctrl_fd `read`，一次性返回完整一条）：
+    `u32 seq @0 | u32 op @4（1=read, 2=write）| u64 offset @8 | u32 len @16 |
+    u8 payload[len] @20`（仅写请求携带；读请求止于偏移 20，头部共 20 字节）。
+    缓冲区放不下最老请求时 `-EINVAL`，请求不出队。
+  - 响应（owner 向 ctrl_fd `write`）：`u32 seq @0 | i32 ret @4 |
+    u8 data[ret] @8`。读响应 ret>0 时恰为 `8+ret` 字节（ret ≤ 请求的 len，
+    ≤ 4096）；写响应与错误响应恰为 8 字节，ret 为已消费字节数或负 errno。
+    未知/状态不符的 seq、畸形响应一律 `-EINVAL`。
+- **请求生命周期**：客户端 read/write 入队 `{seq, op, offset, len[, payload]}`
+  （seq 单调不复用；并发上限 `MAX_PENDING = 4`，满则 `-EAGAIN`），随后在
+  **节点私有等待队列**上阻塞；owner `read(ctrl_fd)` 出队最老 queued 请求
+  （转 inflight，空则阻塞，EINTR 协议）；owner `write(ctrl_fd, response)`
+  按 seq 完成并唤醒客户端。客户端阻塞遵循 pendingFatal/pendingActionable
+  协议（致命信号走 exitTask，可处理信号 `-EINTR` 并取消请求：queued 直接
+  释放，inflight 标记 cancelled、迟到的响应被接受但丢弃）。阻塞期间**不持
+  有任何 vfs/devfs 锁**——锁序：`alloc_lock → node.lock（IrqSpinlock）→
+  task/runqueue 锁`（wakeOne/wakeAll 在 node.lock 内调用，同 klog 的
+  ring_lock 嵌套）；检查+入队、检查+阻塞各在同一段 node.lock 临界区内，
+  完成方也在同一把锁下唤醒，无丢失唤醒。node.lock 绝不跨
+  forceReschedule 持有。
+- **owner 死亡语义**（ctrl_fd close，或任务退出——exitTask 关 fd 触发
+  close；另有 reap 双站点的 `devfs_proxy.cleanupTask` 兜底，与
+  `userdrv.cleanupTask` 并列）：所有未完成请求以 `-EIO` 完成并唤醒全部
+  等待者；devfs 节点打墓碑（`devfs.unregister`）——此后按名 open 得
+  `-ENOENT`，已打开客户端 fd 的读写得 `-EIO`。proxy 槽与 devfs 槽都
+  **永不复用**：旧 fd 缓存的槽位索引只会指向已死节点（稳定 `-EIO`），
+  绝不误中同名的新节点；代价是累计 8 次注册后 `-ENFILE`（v1 限制）。
+- **性能权衡**：每次客户端 I/O 都是一次完整的用户态往返（客户端阻塞
+  → 调度 owner → owner 读写 ctrl_fd → 唤醒客户端），至少两次上下文
+  切换加两次拷贝，吞吐与延迟远逊于内核内节点。热路径设备（kmsg、
+  tty、random、磁盘后端）必须留在内核；devfs proxy 面向低频、原型
+  验证与策略在用户态的伪设备。payload ≤ 4 KiB/请求，大 I/O 被截为
+  4 KiB 短读/短写。
+- **poll v1 限制**：proxy 节点的 poll op 恒报 `EPOLLIN|EPOLLOUT`，
+  不反映 owner 真实就绪状态（O_NONBLOCK 也被忽略，客户端总是阻塞；
+  pread/pwrite 经 `no_pread` 拒绝 `-ESPIPE`）。
+- **devfs 变更事件**：`devfs.register/unregister` 递增 seq-cst 原子
+  `change_counter` 并触发 `change_hook`（devfs_nodes 安装）。只读节点
+  `/dev/devfs-watch` 的 read 返回当前计数器 u64 LE（8 字节）；计数器未
+  越过本 fd 上次读到的游标（`IoCtx.offset`）时阻塞直到变化（O_NONBLOCK
+  则 `-EAGAIN`）。新 fd 游标为 0，init 期注册已把计数器推过 0，首次读
+  立即返回。等待/唤醒走 watch_lock 保护的等待队列（kmsg J3 同款：
+  读者持锁做 检查+入队，hook 持锁 wakeAll，无丢失唤醒）；poll 按
+  `counter != cursor` 报 EPOLLIN。
+- **测试**：纯核心 host 测试（`tests/main.zig` "devfs proxy (P1)" 块）：
+  入队形状校验与 seq 单调、请求/响应线格式逐字节、complete 匹配与拒绝、
+  cancel 语义、owner 死亡 drain（-EIO）、devfs 墓碑与计数器/钩子；
+  端到端见 `user/hello54.c`。
 
 ---
 

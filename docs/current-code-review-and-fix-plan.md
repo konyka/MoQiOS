@@ -1689,6 +1689,20 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 ---
 
+### 6.15 基础设施补完·第十一轮（2026-08-11）
+
+| 阶段 | 内容 | 验证 |
+|---|---|---|
+| P1 | **devfs 用户态节点（微内核设备模型小型化）**：syscall #484 `devfs_register` → 节点 + ctrl_fd；客户端 read/write 经请求队列转发 `{seq,op,offset,len}`（≤4KiB），所有者 `read(ctrl_fd)` 取请求、`write(ctrl_fd, {seq,ret,data})` 应答；seq 单调防串扰、客户端阻塞带完整信号协议、**owner 死亡全量 -EIO 唤醒 + 节点墓碑化**（exitTask 钩子）；锁序 `alloc_lock → node.lock → 调度锁`，阻塞不持锁 | host 单测 8 项 + hello54 |
+| P2 | **devfs 变更事件**：原子 change_counter + `/dev/devfs-watch` 阻塞读节点；devmgr 从 1s 轮询改为事件驱动（watch 阻塞读，缺失时回退轮询） | smoke |
+| P3 | **hello54 端到端**：子进程注册并服务 /dev/echo54，父进程写读回环 + 第二客户端 + kill 服务进程后 EIO/ENOENT 语义。首次实跑发现死锁：`parseResponse` 对 write 响应误用 read-only 长度规则（8 字节无数据响应被 -EINVAL 拒绝），修复为 op 无关解析 + `Core.complete` 按请求类型校验（补回归单测） | hello54 PASS 入门槛 |
+
+**性能取舍**（已写入 kernel-subsystems §3.9）：用户态节点每 I/O 一次往返，仅用于配置/控制类非热路径设备；块/网热路径设备留内核。
+
+**仍遗留**：proxy 节点 poll 恒 EPOLLIN|EPOLLOUT（v1）；proxy ctrl 的 poll/select 未接（epoll 已接）；用户态节点槽位不复用（≤8 累计）；GSI≥16 无真实设备验证；真实硬件 PCID 验证。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:

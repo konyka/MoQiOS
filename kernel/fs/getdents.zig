@@ -44,7 +44,8 @@ pub fn getdents64(fd: u32, buf_ptr: u64, buf_size: u64) i64 {
 
 /// Enumerate registered devfs nodes. The descriptor offset is simply the
 /// next node slot index — the table is append-only after init, so slots
-/// are dense and stable.
+/// are dense and stable. Tombstoned slots (userspace node owner death,
+/// devfs.unregister) are skipped; the cursor still advances past them.
 fn getdents64Devfs(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i64 {
     const devfs = @import("devfs.zig");
     var kbuf: [4096]u8 = undefined;
@@ -52,8 +53,12 @@ fn getdents64Devfs(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i
     var emitted: u32 = 0;
     const start: u32 = @intCast(@min(desc.offset, 0xFFFFFFFF));
     var idx: u32 = start;
+    var cursor: u32 = start;
     while (idx < devfs.nodeCount()) : (idx += 1) {
-        const name = devfs.nameAt(idx) orelse break;
+        const name = devfs.nameAt(idx) orelse {
+            cursor = idx + 1; // tombstone: skip, but advance the cursor
+            continue;
+        };
         const reclen: u16 = @intCast(19 + name.len + 1);
         const padded_reclen: u16 = (reclen + 7) & ~@as(u16, 7);
         if (written + padded_reclen > @min(buf_size, 4096)) break;
@@ -68,15 +73,17 @@ fn getdents64Devfs(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i
         kbuf[base + 19 + name.len] = 0;
         written += padded_reclen;
         emitted += 1;
+        cursor = idx + 1;
     }
     if (emitted == 0) {
-        // Nothing emitted is end of directory only if there was nothing
-        // left to emit; otherwise the buffer was too small.
-        return if (start >= devfs.nodeCount()) 0 else -22;
+        // Nothing emitted is end of directory only when the scan reached
+        // the end of the table (tombstones included); otherwise the
+        // buffer was too small for the next live entry.
+        return if (cursor >= devfs.nodeCount()) 0 else -22;
     }
     const n: usize = @intCast(written);
     if (copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..n], n) != n) return -14;
-    desc.offset = start + emitted;
+    desc.offset = cursor;
     return @intCast(written);
 }
 

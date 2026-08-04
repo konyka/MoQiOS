@@ -2222,3 +2222,264 @@ test "madt_iso: flags decode to trigger/polarity with bus-conformant defaults" {
     try std.testing.expectEqual(madt_iso.Trigger.edge, madt_iso.triggerOf(2 << 2));
 }
 // ─── end MADT ISO ───
+
+// ─── devfs proxy (P1) ───
+// Userspace-owned /dev nodes (fs/devfs_proxy.zig pure core) + devfs
+// tombstone/change-counter support (fs/devfs.zig). The glue (blocking
+// protocol, ctrl fd, syscall 484) is exercised end-to-end by user/hello54.c.
+
+const devfs_proxy = kt.devfs_proxy;
+
+test "devfs: unregister tombstones a slot; lookup/getdents skip it, ops survive" {
+    devfs.resetForTest();
+    try std.testing.expectEqual(@as(u64, 0), devfs.changeCounter());
+
+    const a = devfs.register("alpha", devfs.null_node_ops) orelse return error.TestFailed;
+    const b = devfs.register("beta", devfs.zero_node_ops) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(u64, 2), devfs.changeCounter());
+
+    try std.testing.expect(devfs.unregister(a));
+    // Tombstone: name no longer resolves, enumeration skips the slot.
+    try std.testing.expect(devfs.lookup("alpha") == null);
+    try std.testing.expectEqual(b, devfs.lookup("beta").?);
+    try std.testing.expect(devfs.nameAt(a) == null);
+    try std.testing.expectEqualStrings("beta", devfs.nameAt(b).?);
+    // ...but the ops stay callable so in-flight fds get a clean -EIO from
+    // the (proxy) op instead of a stale-pointer crash.
+    try std.testing.expect(devfs.opsAt(a) != null);
+    // Slots are dense and never reused; the counter bumped on unregister.
+    try std.testing.expectEqual(@as(u32, 2), devfs.nodeCount());
+    try std.testing.expectEqual(@as(u64, 3), devfs.changeCounter());
+
+    // Double unregister / out-of-range unregister are rejected.
+    try std.testing.expect(!devfs.unregister(a));
+    try std.testing.expect(!devfs.unregister(999));
+
+    // The name is free again — re-registering appends a NEW slot.
+    const a2 = devfs.register("alpha", devfs.null_node_ops) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(u32, 2), a2);
+    try std.testing.expectEqual(a2, devfs.lookup("alpha").?);
+    try std.testing.expectEqual(@as(u32, 3), devfs.nodeCount());
+    try std.testing.expectEqual(@as(u64, 4), devfs.changeCounter());
+}
+
+test "devfs: change hook fires on register and unregister" {
+    devfs.resetForTest();
+    const S = struct {
+        var bumps: u32 = 0;
+        fn hook() void {
+            bumps += 1;
+        }
+    };
+    devfs.change_hook = S.hook;
+    defer devfs.change_hook = null;
+
+    const idx = devfs.register("hooked", devfs.null_node_ops) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(u32, 1), S.bumps);
+    try std.testing.expectEqual(@as(u32, 1), devfs.changeCounter());
+    try std.testing.expect(devfs.unregister(idx));
+    try std.testing.expectEqual(@as(u32, 2), S.bumps);
+    try std.testing.expectEqual(@as(u64, 2), devfs.changeCounter());
+}
+
+test "devfs proxy: enqueue validates shape and assigns monotonic seqs" {
+    var core: devfs_proxy.Core = .{};
+    try std.testing.expect(core.owner_alive);
+
+    // Shape validation: bad op, write payload/len mismatch, oversize.
+    try std.testing.expect(core.enqueue(3, 0, 1, "") == null);
+    try std.testing.expect(core.enqueue(devfs_proxy.OP_WRITE, 0, 3, "ab") == null);
+    try std.testing.expect(core.enqueue(devfs_proxy.OP_READ, 0, 1, "x") == null);
+    try std.testing.expect(core.enqueue(devfs_proxy.OP_READ, 0, devfs_proxy.MAX_PAYLOAD + 1, "") == null);
+
+    const s1 = core.enqueue(devfs_proxy.OP_READ, 0, 64, "") orelse return error.TestFailed;
+    const s2 = core.enqueue(devfs_proxy.OP_WRITE, 0, 2, "ab") orelse return error.TestFailed;
+    const s3 = core.enqueue(devfs_proxy.OP_READ, 4096, 64, "") orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(u32, 1), s1);
+    try std.testing.expectEqual(@as(u32, 2), s2);
+    try std.testing.expectEqual(@as(u32, 3), s3);
+
+    // Freeing a slot lets a new request in; seqs never recycle.
+    core.cancel(s1);
+    var last: u32 = s3;
+    for (0..devfs_proxy.MAX_PENDING - 2) |_| {
+        last = core.enqueue(devfs_proxy.OP_READ, 0, 64, "") orelse return error.TestFailed;
+    }
+    try std.testing.expectEqual(@as(u32, devfs_proxy.MAX_PENDING + 1), last);
+    // Full: MAX_PENDING requests outstanding.
+    try std.testing.expect(core.enqueue(devfs_proxy.OP_READ, 0, 64, "") == null);
+}
+
+test "devfs proxy: request wire layout is exact (seq/op/offset/len + payload)" {
+    var core: devfs_proxy.Core = .{};
+    const payload = "hello";
+    _ = core.enqueue(devfs_proxy.OP_WRITE, 0x1122_3344_5566_7788, payload.len, payload) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(usize, devfs_proxy.REQ_WIRE_LEN + payload.len), core.queuedWireLen().?);
+
+    var buf: [devfs_proxy.REQ_WIRE_LEN + devfs_proxy.MAX_PAYLOAD]u8 = @splat(0);
+    const n = core.takeRequest(&buf) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(usize, devfs_proxy.REQ_WIRE_LEN + payload.len), n);
+    try std.testing.expectEqual(@as(usize, 20), devfs_proxy.REQ_WIRE_LEN);
+    // u32 seq LE @0, u32 op LE @4, u64 offset LE @8, u32 len LE @16, payload @20.
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0 }, buf[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 0, 0, 0 }, buf[4..8]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11 }, buf[8..16]);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 0, 0, 0 }, buf[16..20]);
+    try std.testing.expectEqualStrings("hello", buf[20..25]);
+
+    // The handed-out request is in-flight: not handed out twice.
+    try std.testing.expect(core.queuedWireLen() == null);
+    try std.testing.expect(core.takeRequest(&buf) == null);
+
+    // A read request carries no payload but keeps the wanted byte count.
+    _ = core.enqueue(devfs_proxy.OP_READ, 7, 64, "") orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(usize, devfs_proxy.REQ_WIRE_LEN), core.queuedWireLen().?);
+    const n2 = core.takeRequest(&buf) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(usize, devfs_proxy.REQ_WIRE_LEN), n2);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 0, 0, 0 }, buf[0..4]); // seq 2
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0 }, buf[4..8]); // OP_READ
+    try std.testing.expectEqualSlices(u8, &.{ 7, 0, 0, 0, 0, 0, 0, 0 }, buf[8..16]);
+    try std.testing.expectEqualSlices(u8, &.{ 64, 0, 0, 0 }, buf[16..20]);
+}
+
+test "devfs proxy: complete matches seq, stages read data, rejects bad responses" {
+    var core: devfs_proxy.Core = .{};
+    const rd = core.enqueue(devfs_proxy.OP_READ, 0, 64, "") orelse return error.TestFailed;
+    const wr = core.enqueue(devfs_proxy.OP_WRITE, 0, 6, "abcdef") orelse return error.TestFailed;
+    var buf: [devfs_proxy.REQ_WIRE_LEN + devfs_proxy.MAX_PAYLOAD]u8 = undefined;
+    _ = core.takeRequest(&buf);
+    _ = core.takeRequest(&buf);
+
+    // Unknown seq is rejected.
+    try std.testing.expect(!core.complete(999, 0, ""));
+    // A queued (not handed-out) request cannot be completed either.
+    const queued = core.enqueue(devfs_proxy.OP_READ, 0, 64, "") orelse return error.TestFailed;
+    try std.testing.expect(!core.complete(queued, 0, ""));
+
+    // Read response: data staged, ret = byte count.
+    try std.testing.expect(core.complete(rd, 3, "xyz"));
+    const done = core.pollDone(rd) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(i32, 3), done.ret);
+    try std.testing.expectEqualStrings("xyz", done.data);
+    core.collect(rd);
+    try std.testing.expect(core.pollDone(rd) == null); // slot freed
+
+    // Write responses carry a byte count in ret and no data; ret may not
+    // exceed the requested length on either op.
+    try std.testing.expect(!core.complete(wr, 0, "x"));
+    try std.testing.expect(!core.complete(wr, 7, "")); // wr.len == 6
+    try std.testing.expect(core.complete(wr, 6, ""));
+    const wdone = core.pollDone(wr) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(i32, 6), wdone.ret);
+    try std.testing.expectEqual(@as(usize, 0), wdone.data.len);
+    core.collect(wr);
+
+    // Error completion propagates a negative errno.
+    const e = core.enqueue(devfs_proxy.OP_READ, 0, 64, "") orelse return error.TestFailed;
+    _ = core.takeRequest(&buf); // `queued` (seq 3) is the oldest
+    _ = core.takeRequest(&buf); // then `e` goes in-flight
+    try std.testing.expect(core.complete(e, -28, ""));
+    try std.testing.expectEqual(@as(i32, -28), core.pollDone(e).?.ret);
+}
+
+test "devfs proxy: cancel drops queued requests, defers inflight ones" {
+    var core: devfs_proxy.Core = .{};
+    var buf: [devfs_proxy.REQ_WIRE_LEN + devfs_proxy.MAX_PAYLOAD]u8 = undefined;
+
+    const q = core.enqueue(devfs_proxy.OP_WRITE, 0, 2, "zz") orelse return error.TestFailed;
+    core.cancel(q); // queued → freed immediately, owner never sees it
+    try std.testing.expect(core.takeRequest(&buf) == null);
+
+    const f = core.enqueue(devfs_proxy.OP_READ, 0, 64, "") orelse return error.TestFailed;
+    _ = core.takeRequest(&buf); // inflight
+    core.cancel(f); // owner already has it: late response is accepted then dropped
+    try std.testing.expect(core.complete(f, 1, "k"));
+    try std.testing.expect(core.pollDone(f) == null); // cancelled → freed, not done
+}
+
+test "devfs proxy: owner-death drain completes everything with -EIO" {
+    var core: devfs_proxy.Core = .{};
+    var buf: [devfs_proxy.REQ_WIRE_LEN + devfs_proxy.MAX_PAYLOAD]u8 = undefined;
+
+    const inflight = core.enqueue(devfs_proxy.OP_READ, 0, 64, "") orelse return error.TestFailed;
+    _ = core.takeRequest(&buf);
+    const queued = core.enqueue(devfs_proxy.OP_WRITE, 0, 1, "q") orelse return error.TestFailed;
+
+    try std.testing.expectEqual(@as(u32, 2), core.drain());
+    try std.testing.expect(!core.owner_alive);
+    try std.testing.expectEqual(@as(i32, -5), core.pollDone(inflight).?.ret); // -EIO
+    try std.testing.expectEqual(@as(i32, -5), core.pollDone(queued).?.ret);
+    core.collect(inflight);
+    core.collect(queued);
+
+    // New client ops fail fast; the owner is gone.
+    try std.testing.expect(core.enqueue(devfs_proxy.OP_READ, 0, 64, "") == null);
+    // Drain is idempotent.
+    try std.testing.expectEqual(@as(u32, 0), core.drain());
+}
+
+test "devfs proxy: response wire parse (seq/ret/data)" {
+    // read response: seq=4, ret=2, data "hi"
+    const wire = [_]u8{ 4, 0, 0, 0, 2, 0, 0, 0, 'h', 'i' };
+    const rsp = devfs_proxy.parseResponse(&wire) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(u32, 4), rsp.seq);
+    try std.testing.expectEqual(@as(i32, 2), rsp.ret);
+    try std.testing.expectEqualStrings("hi", rsp.data);
+
+    // write response / error response: exactly 8 bytes, no data
+    const wwire = [_]u8{ 9, 0, 0, 0, 0xFB, 0xFF, 0xFF, 0xFF }; // ret = -5
+    const wrsp = devfs_proxy.parseResponse(&wwire) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(u32, 9), wrsp.seq);
+    try std.testing.expectEqual(@as(i32, -5), wrsp.ret);
+    try std.testing.expectEqual(@as(usize, 0), wrsp.data.len);
+
+    try std.testing.expect(devfs_proxy.parseResponse(wire[0..7]) == null); // short header
+    // ret>0 with fewer data bytes than ret still parses — write responses
+    // carry a byte count in ret and NO data, and the parser is
+    // op-agnostic; the per-op data-length rule is Core.complete's job.
+    const partial = devfs_proxy.parseResponse(wire[0..9]) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(i32, 2), partial.ret);
+    try std.testing.expectEqual(@as(usize, 1), partial.data.len);
+    const extra = [_]u8{ 4, 0, 0, 0, 0, 0, 0, 0, 'x' }; // ret<=0 must be exactly 8
+    try std.testing.expect(devfs_proxy.parseResponse(&extra) == null);
+    const oversize = [_]u8{ 4, 0, 0, 0, 1, 0x10, 0, 0 }; // ret = 4097 > MAX_PAYLOAD
+    try std.testing.expect(devfs_proxy.parseResponse(&oversize) == null);
+}
+
+test "devfs proxy: write response survives the wire (parse+complete, hello54 deadlock regression)" {
+    // Regression: parseResponse used to demand 8+ret bytes for ANY
+    // ret > 0, so a legitimate write response ({seq, ret=len}, 8 bytes,
+    // no data) was rejected with -EINVAL and the client never woke.
+    var core: devfs_proxy.Core = .{};
+    const payload = "userspace echo via devfs proxy";
+    const wr = core.enqueue(devfs_proxy.OP_WRITE, 0, payload.len, payload) orelse return error.TestFailed;
+    var buf: [devfs_proxy.REQ_WIRE_LEN + devfs_proxy.MAX_PAYLOAD]u8 = undefined;
+    _ = core.takeRequest(&buf);
+
+    // The owner answers exactly 8 bytes: seq, ret = bytes consumed.
+    var wwire: [8]u8 = undefined;
+    wwire[0] = @intCast(wr);
+    wwire[1] = 0;
+    wwire[2] = 0;
+    wwire[3] = 0;
+    wwire[4] = payload.len;
+    wwire[5] = 0;
+    wwire[6] = 0;
+    wwire[7] = 0;
+    const rsp = devfs_proxy.parseResponse(&wwire) orelse return error.TestFailed;
+    try std.testing.expectEqual(wr, rsp.seq);
+    try std.testing.expectEqual(@as(i32, payload.len), rsp.ret);
+    try std.testing.expectEqual(@as(usize, 0), rsp.data.len);
+    try std.testing.expect(core.complete(rsp.seq, rsp.ret, rsp.data));
+    const done = core.pollDone(wr) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(i32, payload.len), done.ret);
+    try std.testing.expectEqual(@as(usize, 0), done.data.len);
+
+    // A read response whose data length disagrees with ret is rejected
+    // at complete() (parser can't know the op).
+    const rd = core.enqueue(devfs_proxy.OP_READ, 0, 64, "") orelse return error.TestFailed;
+    _ = core.takeRequest(&buf);
+    try std.testing.expect(!core.complete(rd, 3, "xy")); // data.len != ret
+    try std.testing.expect(core.complete(rd, 3, "xyz"));
+}
+// ─── end devfs proxy (P1) ───

@@ -1,12 +1,12 @@
-/* servers/devmgr/main.c — MoQiOS device manager (minimal first step),
- * built against moqi_libc like servers/syslogd/main.c.
+/* servers/devmgr/main.c — MoQiOS device manager, built against moqi_libc
+ * like servers/syslogd/main.c.
  *
- * Current scope: poll getdents("/dev") every second and log the registered
- * device-node set whenever it changes. The devfs registration table is
- * kernel-init-time only today, so the set is static — but this daemon is
- * the hook point for future hotplug: once devfs grows an event/notify
- * mechanism, devmgr switches from polling to event-driven without changing
- * its external role (documented in docs/kernel-subsystems.md §3.8).
+ * Event-driven: blocks on /dev/devfs-watch, whose read returns the devfs
+ * change counter (u64 LE) once it moves past the fd's last-read cursor —
+ * i.e. after any device-node register/unregister (userspace-owned nodes
+ * from devfs_register, syscall 484, included). On each change devmgr
+ * re-snapshots getdents("/dev") and logs the node set. If the watch node
+ * is unavailable it falls back to the original 1s poll loop.
  *
  * Markers: "[devmgr] started" at boot (smoke gate), "[devmgr] devices: ..."
  * on change.
@@ -17,7 +17,8 @@
 #include <unistd.h>
 #include <moqi_syscalls.h>
 
-#define DEV_PATH   "/dev"
+#define DEV_PATH       "/dev"
+#define WATCH_PATH     "/dev/devfs-watch"
 #define SYS_getdents64 78
 #define POLL_NS    (1000L * 1000L * 1000L) /* 1s */
 
@@ -58,6 +59,13 @@ static int snapshot(char *out, int cap) {
     return n;
 }
 
+static void report_change(char *cur, char *prev, int cap) {
+    if (snapshot(cur, cap) >= 0 && strcmp(cur, prev) != 0) {
+        printf("[devmgr] devices: %s\n", cur);
+        memcpy(prev, cur, (size_t)cap);
+    }
+}
+
 int main(int argc, char **argv, char **envp) {
     (void)argc; (void)argv; (void)envp;
     static char cur[1024], prev[1024];
@@ -65,11 +73,26 @@ int main(int argc, char **argv, char **envp) {
     printf("[devmgr] started\n");
     prev[0] = '\0';
 
-    for (;;) {
-        if (snapshot(cur, (int)sizeof(cur)) >= 0 && strcmp(cur, prev) != 0) {
-            printf("[devmgr] devices: %s\n", cur);
-            memcpy(prev, cur, sizeof(prev));
+    int wfd = open(WATCH_PATH, 0, 0);
+    if (wfd >= 0) {
+        /* Event-driven: the first read returns the current counter
+         * immediately (fresh cursor), later reads block until the next
+         * register/unregister. */
+        for (;;) {
+            unsigned long long counter = 0;
+            long n = read(wfd, &counter, sizeof(counter));
+            if (n < 0) {
+                /* Node gone or interrupted — re-report, then keep going. */
+                report_change(cur, prev, (int)sizeof(cur));
+                continue;
+            }
+            report_change(cur, prev, (int)sizeof(cur));
         }
+    }
+
+    /* Fallback: no /dev/devfs-watch on this kernel — poll once a second. */
+    for (;;) {
+        report_change(cur, prev, (int)sizeof(cur));
         struct timespec ts = { .tv_sec = 0, .tv_nsec = POLL_NS };
         nanosleep(&ts, (void *)0);
     }

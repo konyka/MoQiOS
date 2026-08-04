@@ -13,6 +13,9 @@
 ///             open requires CAP_SYS_RAWIO (L1 user driver framework)
 ///   tty     — console: write → serial out; read → PS/2 keyboard input
 ///             queue on x86_64, -ENOTTY elsewhere (no serial RX path)
+///   devfs-watch — read-only devfs change counter (u64 LE); read blocks
+///             until the counter moves past the fd's last-read cursor
+///             (devfs register/unregister, e.g. devfs_proxy nodes)
 const builtin = @import("builtin");
 const devfs = @import("devfs.zig");
 
@@ -20,10 +23,17 @@ var registered: bool = false;
 /// Slot index of the kmsg node (epollNotify matching + epoll cursor
 /// recovery). DIR_IDX = not registered yet.
 var kmsg_idx: u32 = devfs.DIR_IDX;
+/// Slot index of the devfs-watch node (epollNotify on change events).
+var watch_idx: u32 = devfs.DIR_IDX;
 
 pub fn init() void {
     if (registered) return;
     registered = true;
+
+    // Install the change hook before any registration that could matter
+    // (init-time bumps have no waiters yet, but the counter must be live
+    // before userspace can open the watch node).
+    devfs.change_hook = onDevfsChanged;
 
     _ = devfs.register("null", devfs.null_node_ops);
     _ = devfs.register("zero", devfs.zero_node_ops);
@@ -33,6 +43,7 @@ pub fn init() void {
     kmsg_idx = devfs.register("kmsg", kmsg_node_ops) orelse devfs.DIR_IDX;
     _ = devfs.register("pci", pci_node_ops);
     _ = devfs.register("tty", tty_node_ops);
+    watch_idx = devfs.register("devfs-watch", watch_node_ops) orelse devfs.DIR_IDX;
 }
 
 /// devfs slot of /dev/kmsg — klog's ring append notifies epoll with this
@@ -175,5 +186,106 @@ const tty_node_ops: devfs.NodeOps = .{
     .read = ttyRead,
     .write = ttyWrite,
     .poll = ttyPoll,
+    .flags = .{ .no_pread = true },
+};
+
+// ---- devfs-watch ----
+// Change-event stream for devfs itself. devfs.zig bumps a monotonic
+// counter on every register/unregister (seq-cst atomic) and fires
+// change_hook; the hook wakes blocked readers under watch_lock. A reader
+// holds watch_lock across its counter check + wait-queue link, and the
+// hook takes watch_lock before waking, so a change can never slip between
+// the check and the block (the kmsg J3 pattern). Lock order: watch_lock →
+// task/runqueue locks; nothing in proc/ calls back into devfs_nodes.
+
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+const WatchNode = @import("../proc/task.zig").WaitNode;
+
+var watch_lock: IrqSpinlock = .{};
+var watch_waiters: ?*WatchNode = null;
+
+fn onDevfsChanged() void {
+    const sched = @import("../proc/sched.zig");
+    {
+        const flags = watch_lock.acquire();
+        defer watch_lock.release(flags);
+        sched.wakeAll(&watch_waiters);
+    }
+    // Notify epoll outside watch_lock (same ordering rule as klog's
+    // ringAppend): epoll's collectEvents may take watch_lock via the poll
+    // op while holding its instance lock.
+    if (watch_idx != devfs.DIR_IDX) {
+        const epoll = @import("../net/epoll.zig");
+        epoll.epollNotify(.devfs, watch_idx, epoll.EPOLLIN);
+    }
+}
+
+/// Remove `node` from the watch wait queue if still linked (a signal kick
+/// unblocks the task without touching the queue — kmsgUnlinkWaiter twin).
+fn watchUnlinkWaiter(node: *WatchNode) void {
+    const flags = watch_lock.acquire();
+    defer watch_lock.release(flags);
+    var prev: ?*WatchNode = null;
+    var cur = watch_waiters;
+    while (cur) |n| {
+        if (n == node) {
+            if (prev) |p| {
+                p.next = n.next;
+            } else {
+                watch_waiters = n.next;
+            }
+            n.next = null;
+            return;
+        }
+        prev = n;
+        cur = n.next;
+    }
+}
+
+fn watchRead(ctx: *devfs.IoCtx, buf: [*]u8, count: usize) i64 {
+    if (count < 8) return -22; // EINVAL — a cursor is exactly one u64
+    const sched = @import("../proc/sched.zig");
+    const sig_mod = @import("../proc/signal.zig");
+    const task_mod = @import("../proc/task.zig");
+    const bo = @import("../lib/byte_order.zig");
+    while (true) {
+        var node: WatchNode = .{ .task_idx = 0 };
+        {
+            const flags = watch_lock.acquire();
+            const cur = devfs.changeCounter();
+            if (cur != ctx.offset) {
+                // A fresh fd (offset 0) sees the current counter at once —
+                // init-time registrations already bumped it past 0.
+                bo.writeU64Le(buf[0..8], cur);
+                ctx.offset = cur;
+                watch_lock.release(flags);
+                return 8;
+            }
+            if (ctx.nonBlocking()) {
+                watch_lock.release(flags);
+                return -11; // EAGAIN
+            }
+            if (!sched.blockOn(&watch_waiters, &node)) {
+                watch_lock.release(flags);
+                return -5; // EIO — no current task to block
+            }
+            watch_lock.release(flags);
+        }
+        sched.forceReschedule();
+        watchUnlinkWaiter(&node);
+        const cur_idx = sched.currentTaskIndex() orelse return 0;
+        const cur_task = task_mod.getTask(cur_idx) orelse return 0;
+        if (sig_mod.pendingFatal(cur_task)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+        if (sig_mod.pendingActionable(cur_task)) return -4; // -EINTR
+    }
+}
+
+fn watchPoll(ctx: *const devfs.IoCtx) u32 {
+    return if (devfs.changeCounter() != ctx.offset) devfs.POLL_IN else 0;
+}
+
+const watch_node_ops: devfs.NodeOps = .{
+    .read = watchRead,
+    .poll = watchPoll,
     .flags = .{ .no_pread = true },
 };
