@@ -1676,6 +1676,19 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 ---
 
+### 6.14 基础设施补完·第十轮（2026-08-10）
+
+| 阶段 | 内容 | 验证 |
+|---|---|---|
+| N1 | **devfs 设备节点注册框架**：`devfs.zig` 注册表（32 槽，`NodeOps{open/read/write/poll,flags}` + `IoCtx` 游标/标志透传），vfs.open 的 /dev 分支改为纯查表（未注册名 ENOENT）；既有 urandom/kmsg/pci 全部迁移为注册节点（kmsg 阻塞协议原样迁入 devfs_nodes），新增 null/zero/full/tty；`getdents("/dev")` 枚举注册表；epoll 经节点 poll 回调（kmsg 游标准确上报）；tryStealTask 死代码删除（无调用者且绕过 onContextSwitch 的 FPU 隐患路径） | host 单测 + hello47/51/52 回归 |
+| N2 | **servers/devmgr 极简起步**：轮询 `getdents("/dev")` 跟踪节点集变化，`[devmgr] started` 入 smoke；文档注明 devfs 事件钩子就位后转事件驱动 | smoke |
+| N3 | **MADT ISO 覆盖**：type-2 条目解析进 `info.isos`，ioapic.routeGsi 按覆盖应用电平/极性（无覆盖则 edge/active-high 不变） | host 单测 |
+| N4 | hello53 端到端：getdents /dev 全节点、null/zero/full/tty 语义 | hello53 PASS 入门槛 |
+
+**仍遗留**：devfs 仅内核注册（无用户态注册/热插拔通知）；GSI≥16 无真实设备验证；真实硬件 PCID 验证；驱动迁出内核（v2 评估）。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:

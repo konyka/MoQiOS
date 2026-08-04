@@ -2069,3 +2069,156 @@ test "M2: inherit copies the bitmap into independent storage" {
     try std.testing.expect(ioperm_core.isAllowed(&child, 0x70));
     try std.testing.expect(!ioperm_core.isAllowed(&parent, 0x3F8));
 }
+
+// ─── devfs: /dev device-node registration table (fs/devfs.zig) ───
+
+const devfs = kt.devfs;
+
+test "devfs: register/lookup/enumerate round-trip" {
+    devfs.resetForTest();
+    try std.testing.expectEqual(@as(u32, 0), devfs.nodeCount());
+    try std.testing.expect(devfs.lookup("null") == null);
+
+    const null_idx = devfs.register("null", devfs.null_node_ops) orelse return error.TestFailed;
+    const zero_idx = devfs.register("zero", devfs.zero_node_ops) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(u32, 0), null_idx);
+    try std.testing.expectEqual(@as(u32, 1), zero_idx);
+    try std.testing.expectEqual(@as(u32, 2), devfs.nodeCount());
+
+    // Lookup finds both, misses unregistered names.
+    try std.testing.expectEqual(null_idx, devfs.lookup("null").?);
+    try std.testing.expectEqual(zero_idx, devfs.lookup("zero").?);
+    try std.testing.expect(devfs.lookup("kmsg") == null);
+
+    // Enumeration order is registration order, with stable slot indices.
+    try std.testing.expectEqualStrings("null", devfs.nameAt(0).?);
+    try std.testing.expectEqualStrings("zero", devfs.nameAt(1).?);
+    try std.testing.expect(devfs.nameAt(2) == null);
+    try std.testing.expect(devfs.opsAt(0) != null);
+    try std.testing.expect(devfs.opsAt(2) == null);
+}
+
+test "devfs: registration rejects invalid, duplicate, and overflowing names" {
+    devfs.resetForTest();
+
+    // Invalid names: empty, too long, containing '/' or NUL.
+    try std.testing.expect(devfs.register("", .{}) == null);
+    try std.testing.expect(devfs.register("this-name-is-way-too-long-for-devfs", .{}) == null);
+    try std.testing.expect(devfs.register("a/b", .{}) == null);
+    try std.testing.expect(devfs.lookup("a/b") == null);
+    try std.testing.expectEqual(@as(u32, 0), devfs.nodeCount());
+
+    // A 24-byte name is exactly at the limit and works.
+    const max_name = "abcdefghijklmnopqrstuvwx";
+    try std.testing.expectEqual(@as(usize, devfs.MAX_NAME_LEN), max_name.len);
+    try std.testing.expect(devfs.register(max_name, .{}) != null);
+    try std.testing.expect(devfs.lookup(max_name) != null);
+
+    // Duplicates are rejected; the original slot/ops stay authoritative.
+    const first = devfs.register("dup", devfs.null_node_ops) orelse return error.TestFailed;
+    try std.testing.expect(devfs.register("dup", devfs.zero_node_ops) == null);
+    try std.testing.expectEqual(first, devfs.lookup("dup").?);
+
+    // The table fills at MAX_NODES and then refuses new names.
+    devfs.resetForTest();
+    var name_buf: [8]u8 = undefined;
+    for (0..devfs.MAX_NODES) |i| {
+        name_buf[0] = 'n';
+        name_buf[1] = @intCast('0' + (i / 10));
+        name_buf[2] = @intCast('0' + (i % 10));
+        try std.testing.expect(devfs.register(name_buf[0..3], .{}) != null);
+    }
+    try std.testing.expectEqual(devfs.MAX_NODES, devfs.nodeCount());
+    try std.testing.expect(devfs.register("overflow", .{}) == null);
+}
+
+test "devfs: null/zero/full node ops semantics" {
+    var ctx: devfs.IoCtx = .{};
+
+    // /dev/null: read is instant EOF, write discards and reports count.
+    const nread = devfs.null_node_ops.read.?(&ctx, @ptrCast(&ctx), 16);
+    try std.testing.expectEqual(@as(i64, 0), nread);
+    const payload = "discard me";
+    try std.testing.expectEqual(@as(i64, payload.len), devfs.null_node_ops.write.?(&ctx, payload.ptr, payload.len));
+    try std.testing.expectEqual(@as(i64, 0), devfs.null_node_ops.write.?(&ctx, payload.ptr, 0));
+
+    // /dev/zero: read zero-fills the whole buffer; write behaves like null.
+    var buf = [_]u8{0xAA} ** 64;
+    try std.testing.expectEqual(@as(i64, 64), devfs.zero_node_ops.read.?(&ctx, &buf, buf.len));
+    for (buf) |b| try std.testing.expectEqual(@as(u8, 0), b);
+
+    // /dev/full: write fails with -ENOSPC (except a zero-length write),
+    // read is EOF.
+    try std.testing.expectEqual(@as(i64, -28), devfs.full_node_ops.write.?(&ctx, payload.ptr, payload.len));
+    try std.testing.expectEqual(@as(i64, 0), devfs.full_node_ops.write.?(&ctx, payload.ptr, 0));
+    try std.testing.expectEqual(@as(i64, 0), devfs.full_node_ops.read.?(&ctx, &buf, buf.len));
+
+    // Poll masks use the EPOLLIN/EPOLLOUT bit values.
+    try std.testing.expectEqual(devfs.POLL_IN | devfs.POLL_OUT, devfs.null_node_ops.poll.?(&ctx));
+    try std.testing.expectEqual(@as(u32, 0x001), devfs.POLL_IN);
+    try std.testing.expectEqual(@as(u32, 0x004), devfs.POLL_OUT);
+}
+
+test "devfs: IoCtx O_NONBLOCK decoding" {
+    var ctx: devfs.IoCtx = .{};
+    try std.testing.expect(!ctx.nonBlocking());
+    ctx.status_flags = 0x800;
+    try std.testing.expect(ctx.nonBlocking());
+    ctx.offset = 42;
+    try std.testing.expectEqual(@as(u64, 42), ctx.offset);
+}
+// ─── end devfs ───
+
+// ─── MADT ISO (type 2): parse-table + flag decode (acpi/madt_iso.zig) ───
+
+const madt_iso = kt.madt_iso;
+
+test "madt_iso: table add/lookup, same-GSI override, capacity bound" {
+    var table: madt_iso.IsoTable = .{};
+    try std.testing.expect(table.lookup(1) == null);
+
+    try std.testing.expect(table.add(.{ .bus = 0, .irq = 1, .gsi = 1, .flags = 0xD }));
+    try std.testing.expect(table.add(.{ .bus = 0, .irq = 12, .gsi = 12, .flags = 0 }));
+    try std.testing.expectEqual(@as(u32, 2), table.count);
+
+    const iso1 = table.lookup(1).?;
+    try std.testing.expectEqual(@as(u8, 1), iso1.irq);
+    try std.testing.expectEqual(@as(u16, 0xD), iso1.flags);
+    try std.testing.expect(table.lookup(2) == null);
+
+    // Re-adding the same GSI replaces the entry instead of growing.
+    try std.testing.expect(table.add(.{ .bus = 0, .irq = 1, .gsi = 1, .flags = 0x5 }));
+    try std.testing.expectEqual(@as(u32, 2), table.count);
+    try std.testing.expectEqual(@as(u16, 0x5), table.lookup(1).?.flags);
+
+    // The table fills at MAX_ISO and then refuses new GSIs.
+    var full: madt_iso.IsoTable = .{};
+    for (0..madt_iso.MAX_ISO) |i| {
+        try std.testing.expect(full.add(.{ .gsi = @intCast(i) }));
+    }
+    try std.testing.expect(!full.add(.{ .gsi = 999 }));
+    // ... but overriding an existing GSI still succeeds.
+    try std.testing.expect(full.add(.{ .gsi = 3, .flags = 0xF }));
+}
+
+test "madt_iso: flags decode to trigger/polarity with bus-conformant defaults" {
+    // 0 = conforms to bus spec → the pre-ISO defaults: edge, active-high.
+    try std.testing.expectEqual(madt_iso.Trigger.edge, madt_iso.triggerOf(0));
+    try std.testing.expectEqual(madt_iso.Polarity.active_high, madt_iso.polarityOf(0));
+
+    // Explicit active-high / edge encodings.
+    try std.testing.expectEqual(madt_iso.Polarity.active_high, madt_iso.polarityOf(1));
+    try std.testing.expectEqual(madt_iso.Trigger.edge, madt_iso.triggerOf(1 << 2));
+
+    // Active-low (0b11) and level (0b11 << 2); the two fields are independent.
+    try std.testing.expectEqual(madt_iso.Polarity.active_low, madt_iso.polarityOf(3));
+    try std.testing.expectEqual(madt_iso.Trigger.level, madt_iso.triggerOf(3 << 2));
+    const both: u16 = 3 | (3 << 2); // 0xF: level + active-low
+    try std.testing.expectEqual(madt_iso.Trigger.level, madt_iso.triggerOf(both));
+    try std.testing.expectEqual(madt_iso.Polarity.active_low, madt_iso.polarityOf(both));
+
+    // Reserved encodings (0b10) fall back to the defaults.
+    try std.testing.expectEqual(madt_iso.Polarity.active_high, madt_iso.polarityOf(2));
+    try std.testing.expectEqual(madt_iso.Trigger.edge, madt_iso.triggerOf(2 << 2));
+}
+// ─── end MADT ISO ───

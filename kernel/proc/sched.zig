@@ -67,7 +67,7 @@ var sched_lock: IrqSpinlock = .{};
 ///    byte-identically, holding `sched_lock` across the whole pick/switch
 ///    path.
 /// What `sched_lock` still protects when the gate is on: only the legacy
-/// body itself and the (currently unused) `tryStealTask` helper. The BSP
+/// body itself. The BSP
 /// maintenance pass (reapZombies/writeback/tcp/...) needs no scheduler lock —
 /// every callee has its own. `reap_counter` is BSP-only state.
 /// New lock order (fine-grain mode): task_lock → per-CPU queue lock
@@ -1226,51 +1226,11 @@ pub fn apParkLoop() noreturn {
     }
 }
 
-/// Try to steal a task from the global run queue.
-/// Simple implementation: check for ready tasks and run them on this CPU.
-fn tryStealTask() void {
-    const count = task.getTaskCount();
-    if (count == 0) return;
-
-    const flags = sched_lock.acquire();
-
-    // Find a ready task using bitmap fast-path
-    var bits = task.getSlotBitmap();
-    while (bits != 0) {
-        const i: u32 = @intCast(@ctz(bits));
-        bits &= bits - 1;
-        const t = task.getTask(i) orelse continue;
-        const my_cpu: u8 = @truncate(currentCpuId());
-        const ok = t.cpu_affinity < 0 or t.cpu_affinity == @as(i16, my_cpu);
-        if (t.state == .ready and ok) {
-            const next_idx: u32 = i;
-
-            if (!t.started) {
-                setupInitialFrame(t);
-            }
-
-            setAnchor(t.saved_rsp);
-            t.state = .running;
-            setCurrentIdx(next_idx);
-            setSlice(TIMESLICE_TICKS);
-
-            // Set up CPU state for the task
-            if (t.page_table_phys != 0) {
-                sched_lock.release(flags);
-                pcid.switchCr3(t.page_table_phys);
-                gdt.setRsp0(currentCpuId(), t.kernel_stack_top);
-                // ioperm: pair every per-switch RSP0 update with the IOPB load.
-                @import("ioperm.zig").loadForTask(currentCpuId(), t);
-                syscall_entry.getPerCpu().kernel_rsp = t.kernel_stack_top;
-                return;
-            }
-            sched_lock.release(flags);
-            return;
-        }
-    }
-
-    sched_lock.release(flags);
-}
+// tryStealTask was removed: it had no callers, and its switch path
+// (setAnchor/setCurrentIdx + CR3 swap) skipped onContextSwitch, so wiring
+// it up would have resumed a task without the FPU save/restore — a latent
+// FPU-corruption hazard. Work stealing lives in the fine-grained
+// timerTickFg path instead.
 
 // ---------------------------------------------------------------------------
 // Blocking wait / wake primitives

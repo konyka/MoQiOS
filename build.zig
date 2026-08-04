@@ -282,7 +282,7 @@ pub fn build(b: *std.Build) void {
         "hello27", "hello28", "hello29", "hello30", "hello31", "hello32",
         "hello33", "hello34", "hello35", "hello36", "hello37", "hello38",
         "hello39", "hello40", "hello41", "hello42", "hello43",
-        "hello44", "hello46", "hello47", "hello48", "hello49", "hello50", "hello51", "hello52",
+        "hello44", "hello46", "hello47", "hello48", "hello49", "hello50", "hello51", "hello52", "hello53",
     };
     for (c_programs) |name| addCUserProgram(b, name);
 
@@ -295,6 +295,7 @@ pub fn build(b: *std.Build) void {
     for (libc_programs) |name| addLibcUserProgram(b, name, b.fmt("user/{s}.c", .{name}));
     addLibcUserProgram(b, "init", "servers/init/main.c");
     addLibcUserProgram(b, "syslogd", "servers/syslogd/main.c");
+    addLibcUserProgram(b, "devmgr", "servers/devmgr/main.c");
 
     // Build and run in QEMU with Limine
     const run_step = b.step("run", "Build and run in QEMU");

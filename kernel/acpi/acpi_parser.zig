@@ -7,6 +7,7 @@ const fmt = @import("../lib/fmt.zig");
 const str = @import("../lib/str.zig");
 const bo = @import("../lib/byte_order.zig");
 const cpu_capacity = @import("../arch/cpu_capacity.zig");
+const madt_iso = @import("madt_iso.zig");
 
 /// Map a physical page for ACPI table access. x86_64 uses Limine HHDM helpers
 /// in `main.zig`; other arches no-op (SK-10: avoid pulling Limine `main`).
@@ -22,6 +23,9 @@ pub const AcpiInfo = struct {
     cpu_apic_ids: [cpu_capacity.MAX_CPUS]u32,
     ioapic_address: u64,
     ioapic_gsi_base: u32,
+    /// MADT Interrupt Source Override (type 2) entries — consulted by
+    /// ioapic.routeGsi for firmware-declared trigger/polarity.
+    isos: madt_iso.IsoTable,
     mcfg_base: u64,
     mcfg_segment: u16,
     mcfg_start_bus: u8,
@@ -35,6 +39,7 @@ pub var info: AcpiInfo = .{
     .cpu_apic_ids = .{0} ** cpu_capacity.MAX_CPUS,
     .ioapic_address = 0,
     .ioapic_gsi_base = 0,
+    .isos = .{},
     .mcfg_base = 0,
     .mcfg_segment = 0,
     .mcfg_start_bus = 0,
@@ -221,6 +226,21 @@ fn parseMadt(madt_phys: u64) void {
                     (@as(u32, bytes[offset + 10]) << 16) | (@as(u32, bytes[offset + 11]) << 24);
                 info.ioapic_address = ioapic_addr;
                 info.ioapic_gsi_base = gsi_base;
+            }
+        } else if (entry_type == 2) {
+            // MADT ISO entry: type(1) + len(1) + bus(1) + source_irq(1) + gsi(4) + flags(2)
+            if (offset + 10 <= hdr_len) {
+                const gsi: u32 = @as(u32, bytes[offset + 4]) | (@as(u32, bytes[offset + 5]) << 8) |
+                    (@as(u32, bytes[offset + 6]) << 16) | (@as(u32, bytes[offset + 7]) << 24);
+                const flags: u16 = @as(u16, bytes[offset + 8]) | (@as(u16, bytes[offset + 9]) << 8);
+                if (!info.isos.add(.{
+                    .bus = bytes[offset + 2],
+                    .irq = bytes[offset + 3],
+                    .gsi = gsi,
+                    .flags = flags,
+                })) {
+                    serial.writeString("[ACPI] WARN: ISO table full; dropping MADT type-2 entry\n");
+                }
             }
         } else if (entry_type == 9 and !warned_x2apic) {
             serial.writeString("[ACPI] WARN: skipping unsupported MADT x2APIC entries\n");

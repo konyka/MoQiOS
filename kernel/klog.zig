@@ -149,7 +149,8 @@ fn ringAppend(parts: []const []const u8) void {
     // nesting ring_lock outside inst.spin here would close a lock-order
     // cycle. ISR-safety of epollNotify from interrupt context is already
     // established by timerfd, which notifies from the timer tick.
-    epoll.epollNotify(.kmsg, 0, epoll.EPOLLIN);
+    // /dev/kmsg is a devfs node: match on fd_type .devfs + its slot index.
+    epoll.epollNotify(.devfs, @import("fs/devfs_nodes.zig").kmsgNodeIdx(), epoll.EPOLLIN);
 }
 
 pub fn log(comptime level: Level, comptime msg: []const u8) void {

@@ -349,6 +349,7 @@ fn resourceIdxFromDesc(desc: *const vfs.FileDescriptor) u32 {
         .epoll => desc.epoll_idx,
         .eventfd => desc.eventfd_idx,
         .timerfd => desc.timerfd_idx,
+        .devfs => desc.devfs_idx,
         else => 0,
     };
 }
@@ -363,7 +364,11 @@ fn kmsgCursorForItem(inst: *const EpollInstance, fd: i32) u64 {
     if (fd >= 0 and fd < @as(i32, @intCast(vfs.MAX_FDS))) {
         if (task_mod.getTask(inst.owner_task_idx)) |owner| {
             const desc = &owner.fd_table.fds[@as(u32, @intCast(fd))];
-            if (desc.fd_type == .kmsg) return desc.offset;
+            if (desc.fd_type == .devfs and
+                desc.devfs_idx == @import("../fs/devfs_nodes.zig").kmsgNodeIdx())
+            {
+                return desc.offset;
+            }
         }
     }
     return klog.kmsgNewestPos();
@@ -402,9 +407,17 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32, kmsg_cursor: u64
         .ramdisk_file, .fat32_file, .ext2_file, .proc_file => {
             revents |= EPOLLIN | EPOLLOUT;
         },
-        .pci => {
-            // Read-only snapshot: always readable, never writable.
-            revents |= EPOLLIN;
+        .devfs => {
+            // Device node readiness comes from the node's poll op
+            // (fs/devfs.zig). kmsg_cursor carries this fd's ring position
+            // for /dev/kmsg; other nodes ignore it.
+            const devfs = @import("../fs/devfs.zig");
+            if (devfs.opsAt(resource_idx)) |ops| {
+                if (ops.poll) |poll_op| {
+                    const ctx: devfs.IoCtx = .{ .offset = kmsg_cursor };
+                    revents |= poll_op(&ctx);
+                }
+            }
         },
         .epoll => {
             const inst = getInstance(resource_idx) orelse return EPOLLERR;
@@ -424,16 +437,6 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32, kmsg_cursor: u64
         },
         .unix_socket => {},
         .none => {},
-        .random => {
-            revents |= EPOLLIN;
-        },
-        .kmsg => {
-            // Level-triggered: readable only while this fd's cursor has
-            // unread ring bytes (J3). Reporting EPOLLIN unconditionally
-            // (G4) made LT epoll busy-spin once the reader caught up.
-            const klog = @import("../klog.zig");
-            if (klog.kmsgHasUnread(kmsg_cursor)) revents |= EPOLLIN;
-        },
         .tmpfs_file => {
             revents |= EPOLLIN | EPOLLOUT;
         },

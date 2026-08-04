@@ -40,15 +40,15 @@ pub const FdType = enum(u8) {
     eventfd = 9,
     unix_socket = 10,
     timerfd = 11,
-    random = 12,
     tmpfs_file = 13,
     proc_file = 14,
     udp_socket = 15,
     inotify = 16,
     raw_socket = 17,
-    kmsg = 18,
-    /// L1: read-only PCI enumeration snapshot (user driver framework).
-    pci = 19,
+    /// devfs device node (fs/devfs.zig) — devfs_idx selects the node.
+    /// Replaces the old per-node random/kmsg/pci fd types, which are now
+    /// registered devfs nodes like everything else under /dev.
+    devfs = 20,
 };
 
 pub const PIPE_BUF_SIZE: u32 = 4096;
@@ -234,6 +234,8 @@ pub const FileDescriptor = struct {
     timerfd_idx: u32 = 0,
     inotify_idx: u32 = 0,
     tmpfs_idx: u32 = 0,
+    /// devfs node slot (fs/devfs.zig); devfs.DIR_IDX = the /dev directory.
+    devfs_idx: u32 = 0,
     udp_port: u16 = 0,
     udp_connected: bool = false,
     udp_is_v6: bool = false,
@@ -313,55 +315,42 @@ pub const FdTable = struct {
         // Status flags visible via F_GETFL: access mode + O_APPEND + O_NONBLOCK.
         const status = flags & (0x03 | 0x400 | 0x800);
 
-        // /dev/urandom and /dev/random
-        if (name.len >= 12 and name[0] == '/' and name[1] == 'd' and name[2] == 'e' and name[3] == 'v' and name[4] == '/') {
+        // /dev — devfs device nodes (fs/devfs.zig). All nodes (null, zero,
+        // full, random, urandom, kmsg, pci, tty) are registered in the
+        // devfs table at kernel init; unregistered names are ENOENT.
+        // "/dev" itself opens the devfs directory for getdents.
+        if (str.eql(name, "/dev") or str.eql(name, "/dev/")) {
+            self.fds[slot] = .{
+                .fd_type = .devfs,
+                .devfs_idx = @import("devfs.zig").DIR_IDX,
+                .status_flags = status,
+            };
+            return @intCast(slot);
+        }
+        if (name.len > 5 and name[0] == '/' and name[1] == 'd' and name[2] == 'e' and name[3] == 'v' and name[4] == '/') {
+            const devfs = @import("devfs.zig");
             const dev_name = name[5..];
-            if ((dev_name.len == 7 and dev_name[0] == 'u' and dev_name[1] == 'r' and dev_name[2] == 'a' and dev_name[3] == 'n' and dev_name[4] == 'd' and dev_name[5] == 'o' and dev_name[6] == 'm') or
-                (dev_name.len == 6 and dev_name[0] == 'r' and dev_name[1] == 'a' and dev_name[2] == 'n' and dev_name[3] == 'd' and dev_name[4] == 'o' and dev_name[5] == 'm'))
-            {
+            if (devfs.lookup(dev_name)) |node_idx| {
+                const ops = devfs.opsAt(node_idx).?;
+                // Per-node open hook (e.g. /dev/pci's CAP_SYS_RAWIO gate).
+                if (ops.open) |open_op| {
+                    const rc = open_op();
+                    if (rc < 0) {
+                        self.freeFd(slot);
+                        return rc;
+                    }
+                }
                 self.fds[slot] = .{
-                    .fd_type = .random,
-                    .writable = false,
+                    .fd_type = .devfs,
+                    .devfs_idx = node_idx,
+                    .writable = is_writable,
                     .status_flags = status,
+                    .inode_id = 0x2000_0000_0000_0000 + @as(u64, node_idx),
                 };
                 return @intCast(slot);
             }
-        }
-
-        // /dev/kmsg — read-only view of the kernel log ring (G4)
-        if (name.len == 9 and name[0] == '/' and name[1] == 'd' and name[2] == 'e' and name[3] == 'v' and name[4] == '/' and
-            name[5] == 'k' and name[6] == 'm' and name[7] == 's' and name[8] == 'g')
-        {
-            self.fds[slot] = .{
-                .fd_type = .kmsg,
-                // offset is the absolute ring cursor; 0 = oldest available.
-                .offset = 0,
-                .writable = false,
-                .status_flags = status,
-            };
-            return @intCast(slot);
-        }
-
-        // /dev/pci — read-only PCI enumeration snapshot (L1 user driver
-        // framework). Raw device topology is gated behind CAP_SYS_RAWIO.
-        if (name.len == 8 and name[0] == '/' and name[1] == 'd' and name[2] == 'e' and name[3] == 'v' and name[4] == '/' and
-            name[5] == 'p' and name[6] == 'c' and name[7] == 'i')
-        {
-            {
-                const sched = @import("../proc/sched.zig");
-                const task_mod = @import("../proc/task.zig");
-                const cap_check = @import("../proc/cap_check.zig");
-                const cur_idx = sched.currentTaskIndex() orelse return -1;
-                const cur = task_mod.getTask(cur_idx) orelse return -1;
-                if (!cap_check.capable(cur, "cap_sys_rawio")) return -1; // EPERM
-            }
-            self.fds[slot] = .{
-                .fd_type = .pci,
-                .offset = 0,
-                .writable = false,
-                .status_flags = status,
-            };
-            return @intCast(slot);
+            self.freeFd(slot);
+            return -2; // ENOENT — no such device node
         }
 
         // tmpfs: paths starting with /tmp/
@@ -658,26 +647,17 @@ pub const FdTable = struct {
                 const timerfd_mod = @import("../ipc/timerfd.zig");
                 return timerfd_mod.timerfdRead(desc.timerfd_idx, buf, count);
             },
-            .random => {
-                const random_mod = @import("../drivers/random.zig");
-                const to_read: u32 = @intCast(@min(count, 256));
-                var kbuf: [256]u8 = undefined;
-                random_mod.getRandomBytes(&kbuf, to_read);
-                @memcpy(buf[0..to_read], kbuf[0..to_read]);
-                return @intCast(to_read);
-            },
-            .pci => {
-                // L1: regenerate the enumeration snapshot on every read,
-                // procfs-style — the table is small and reads are rare.
-                const userdrv = @import("../drivers/userdrv.zig");
-                var scratch: [8192]u8 = undefined;
-                const generated = userdrv.pciGenerate(&scratch);
-                if (desc.offset >= generated) return 0;
-                const avail = generated - @as(u32, @intCast(desc.offset));
-                const to_copy = @min(@as(u32, @intCast(count)), avail);
-                @memcpy(buf[0..to_copy], scratch[@as(u32, @intCast(desc.offset))..@as(u32, @intCast(desc.offset)) + to_copy]);
-                desc.offset += to_copy;
-                return @intCast(to_copy);
+            .devfs => {
+                const devfs = @import("devfs.zig");
+                if (desc.devfs_idx == devfs.DIR_IDX) return -21; // EISDIR
+                const ops = devfs.opsAt(desc.devfs_idx) orelse return -1;
+                const read_op = ops.read orelse return -1;
+                // The op may advance ctx.offset (kmsg cursor, pci snapshot
+                // position); commit it to the descriptor on success.
+                var ctx: devfs.IoCtx = .{ .offset = desc.offset, .status_flags = desc.status_flags };
+                const n = read_op(&ctx, buf, count);
+                if (n >= 0) desc.offset = ctx.offset;
+                return n;
             },
             .tmpfs_file => {
                 const tmpfs = @import("tmpfs.zig");
@@ -698,49 +678,6 @@ pub const FdTable = struct {
                 @memcpy(buf[0..to_copy], scratch[@as(u32, @intCast(desc.offset)) .. @as(u32, @intCast(desc.offset)) + to_copy]);
                 desc.offset += to_copy;
                 return @intCast(to_copy);
-            },
-            .kmsg => {
-                const klog = @import("../klog.zig");
-                // J3: O_NONBLOCK (and pread-like zero-count) keeps the old
-                // "0 at the newest byte" behaviour.
-                if (count == 0 or (desc.status_flags & 0x800) != 0) {
-                    const res = klog.kmsgRead(desc.offset, buf[0..count]);
-                    desc.offset = res.new_pos;
-                    return @intCast(res.n);
-                }
-                // Blocking read: sleep on the kmsg wait queue until a log
-                // append wakes us or a signal interrupts. The empty-check
-                // and the wait-queue enqueue are atomic under klog's ring
-                // lock (kmsgReadOrBlock), so no append is missed.
-                const sched = @import("../proc/sched.zig");
-                const task_mod = @import("../proc/task.zig");
-                const sig_mod = @import("../proc/signal.zig");
-                while (true) {
-                    var node: task_mod.WaitNode = .{ .task_idx = 0 };
-                    switch (klog.kmsgReadOrBlock(desc.offset, buf[0..count], &node)) {
-                        .ready => |res| {
-                            // Data copied — or no current task to block
-                            // (early boot): report what the ring gave us.
-                            desc.offset = res.new_pos;
-                            return @intCast(res.n);
-                        },
-                        .blocked => {
-                            sched.forceReschedule();
-                            // Woken: wakeOne already popped our node on a
-                            // data wake; a signal kick leaves it linked, so
-                            // unlink defensively before the frame dies.
-                            klog.kmsgUnlinkWaiter(&node);
-                            // Signal protocol (mirrors proc/waitpid.zig):
-                            // die on a fatal signal via the exit-by-signal
-                            // path, or EINTR so a handler runs on return.
-                            const cur_idx = sched.currentTaskIndex() orelse return 0;
-                            const cur = task_mod.getTask(cur_idx) orelse return 0;
-                            if (sig_mod.pendingFatal(cur)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
-                            if (sig_mod.pendingActionable(cur)) return -4; // -EINTR
-                            // Data wake (or spurious): loop and re-read.
-                        },
-                    }
-                }
             },
             .inotify => return -1, // inotify uses read via special syscall path
             .raw_socket => {
@@ -821,9 +758,17 @@ pub const FdTable = struct {
                 return unix_mod.unixSend(desc.unix_sock_idx, buf, count);
             },
             .timerfd => return -1, // timerfd is read-only
-            .random => return -1, // random is read-only
-            .kmsg => return -1, // kmsg is read-only
-            .pci => return -1, // /dev/pci is read-only
+            .devfs => {
+                const devfs = @import("devfs.zig");
+                if (desc.devfs_idx == devfs.DIR_IDX) return -21; // EISDIR
+                if (!desc.writable) return -1;
+                const ops = devfs.opsAt(desc.devfs_idx) orelse return -1;
+                const write_op = ops.write orelse return -1;
+                var ctx: devfs.IoCtx = .{ .offset = desc.offset, .status_flags = desc.status_flags };
+                const n = write_op(&ctx, buf, count);
+                if (n >= 0) desc.offset = ctx.offset;
+                return n;
+            },
             .tmpfs_file => {
                 if (!desc.writable) return -1;
                 if ((desc.status_flags & 0x400) != 0) desc.offset = desc.file_size;
@@ -907,24 +852,16 @@ pub const FdTable = struct {
                 @memcpy(buf[0..to_copy], scratch[@as(u32, @intCast(offset)) .. @as(u32, @intCast(offset)) + to_copy]);
                 return @intCast(to_copy);
             },
-            .random => return -29, // ESPIPE - /dev/urandom doesn't support offset
-            .pci => {
-                // pread on /dev/pci: same regenerated snapshot, explicit offset.
-                const userdrv = @import("../drivers/userdrv.zig");
-                var scratch: [8192]u8 = undefined;
-                const generated = userdrv.pciGenerate(&scratch);
-                if (offset >= generated) return 0;
-                const avail = generated - @as(u32, @intCast(offset));
-                const to_copy = @min(@as(u32, @intCast(count)), avail);
-                @memcpy(buf[0..to_copy], scratch[@as(u32, @intCast(offset))..@as(u32, @intCast(offset)) + to_copy]);
-                return @intCast(to_copy);
-            },
-            .kmsg => {
-                // pread on /dev/kmsg: offset is an absolute ring cursor
-                // (0 = oldest available); the fd's own offset is untouched.
-                const klog = @import("../klog.zig");
-                const res = klog.kmsgRead(offset, buf[0..count]);
-                return @intCast(res.n);
+            .devfs => {
+                const devfs = @import("devfs.zig");
+                if (desc.devfs_idx == devfs.DIR_IDX) return -21; // EISDIR
+                const ops = devfs.opsAt(desc.devfs_idx) orelse return -9;
+                if (ops.flags.no_pread) return -29; // ESPIPE — pure stream
+                const read_op = ops.read orelse return -1;
+                // pread: explicit offset, the fd's own cursor is untouched.
+                // O_NONBLOCK is forced so a kmsg pread can never sleep.
+                var ctx: devfs.IoCtx = .{ .offset = offset, .status_flags = desc.status_flags | 0x800 };
+                return read_op(&ctx, buf, count);
             },
         }
     }
@@ -943,9 +880,15 @@ pub const FdTable = struct {
             .tcp_socket, .udp_socket, .unix_socket, .raw_socket => return -29, // ESPIPE
             .epoll, .eventfd, .timerfd, .inotify => return -29, // ESPIPE
             .ramdisk_file => return -1, // ramdisk is read-only
-            .random => return -29, // ESPIPE
-            .kmsg => return -1, // kmsg is read-only
-            .pci => return -1, // /dev/pci is read-only
+            .devfs => {
+                // Char devices are streams: explicit-offset writes are
+                // meaningless. Nodes without a write op are read-only.
+                const devfs = @import("devfs.zig");
+                if (desc.devfs_idx == devfs.DIR_IDX) return -21; // EISDIR
+                const ops = devfs.opsAt(desc.devfs_idx) orelse return -9;
+                if (ops.write == null) return -1;
+                return -29; // ESPIPE
+            },
             .proc_file => return -1, // proc files are read-only
             .fat32_file => {
                 if (!desc.writable) return -9; // EBADF

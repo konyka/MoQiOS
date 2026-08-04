@@ -740,6 +740,9 @@ const FdTable = struct {
 
 **挂载管理** (v18.0): `mountFs` / `umountFs`，16 挂载点表，支持 tmpfs/ext2/vfat/proc/ramfs 类型。系统调用 #165 (mount), #166 (umount2)。
 
+**/dev 设备节点**：全部由 devfs 注册表提供（见 3.8），`open` 的 `/dev/` 分支
+查表分发到节点 ops；未注册名字返回 `-ENOENT`。
+
 ### 3.2 Ramdisk ✅
 
 文件: `ramdisk.zig`，格式: MRD（自定义）
@@ -880,6 +883,50 @@ const Pipe = struct {
 - io_getevents: 获取完成事件 (环形缓冲)
 - io_cancel: 取消请求 (stub: 返回 EINVAL)
 - 系统调用: #206 (io_setup), #207 (io_destroy), #208 (io_getevents), #209 (io_submit), #210 (io_cancel)
+
+### 3.8 devfs 设备节点注册框架 ✅
+
+文件: `devfs.zig`（纯核心，host 可测）、`devfs_nodes.zig`（内建节点实现）；
+接入点: `vfs.zig`（open/read/write/pread/pwrite）、`getdents.zig`、`epoll.zig`
+
+- **注册表**：定长 32 槽（`MAX_NODES`），名字 ≤ 24 字节。槽位稠密且永久
+  稳定（append-only），fd 直接缓存槽位索引，getdents 用索引作目录游标。
+- **ops 结构**（`NodeOps`）：
+  ```zig
+  open:  ?*const fn () i64,                                  // 0 成功 / 负 errno（如 /dev/pci 的 CAP_SYS_RAWIO 门）
+  read:  ?*const fn (ctx: *IoCtx, buf: [*]u8, count: usize) i64,
+  write: ?*const fn (ctx: *IoCtx, buf: [*]const u8, count: usize) i64,
+  poll:  ?*const fn (ctx: *const IoCtx) u32,                 // POLL_IN|POLL_OUT（与 EPOLLIN/EPOLLOUT 同值）
+  flags: packed struct { no_pread: bool = false },
+  ```
+  `IoCtx { offset, status_flags }` 镜像 fd 的游标与 O_NONBLOCK 位：vfs 调用前
+  从描述符播种、成功后写回（pread 则用显式 offset 播种并丢弃，且强制
+  O_NONBLOCK 使 kmsg pread 永不睡眠）。read 返回负 errno / 0 EOF / 字节数。
+- **锁与上下文契约**：表仅在内核 init（`devfs_nodes.init()`，main.zig 在
+  任何用户任务打开 /dev 之前）单线程注册，之后只读、无需锁。ops 在调用者
+  的系统调用上下文执行，不持有 devfs 内部锁（也没有）；可以阻塞（kmsg
+  read 走 J3 等待队列）并可以使用各子系统自己的 IRQ 安全锁，但不得假定
+  中断上下文；`open`/`poll` 不得阻塞。
+- **节点清单**（注册顺序 = getdents 枚举顺序）：
+  | 节点 | read | write | 备注 |
+  |---|---|---|---|
+  | null | 立即 EOF | 丢弃，返回 count | 纯核心（host 测试） |
+  | zero | 全零填充 | 同 null | 纯核心 |
+  | full | 立即 EOF | -ENOSPC | 纯核心 |
+  | random / urandom | ≤256 字节 PRNG | 无（-1） | no_pread |
+  | kmsg | 日志环，阻塞读（J3 语义不变，游标在 fd offset） | 无 | epoll 电平触发 EPOLLIN |
+  | pci | PCI 枚举快照 | 无 | open 需 CAP_SYS_RAWIO（L1） |
+  | tty | x86_64: PS/2 键盘输入环；其他架构 -ENOTTY（无串口 RX 路径） | 串口输出 | no_pread |
+- **打开语义**：`vfs.open` 的 `/dev/` 分支先查 devfs 表；未注册的名字一律
+  `-ENOENT`（不再有硬编码节点）。`/dev` 本身可打开为目录 fd
+  （`devfs_idx == DIR_IDX`），`getdents64` 对其枚举全部注册节点
+  （DT_CHR）；对目录 fd 的 read/write 返回 `-EISDIR`。
+- **epoll 集成**：fd 类型统一为 `.devfs`（旧的 `.random/.kmsg/.pci` 已删除），
+  `resource_idx = devfs 槽位`；就绪事件由节点 poll op 计算。klog 追加日志后
+  用 `epollNotify(.devfs, kmsgNodeIdx(), EPOLLIN)` 唤醒等待者。
+- **测试**：纯核心 host 测试（`tests/main.zig` "devfs" 块）：注册/查找/枚举、
+  非法名/重名/满表拒绝、null/zero/full 语义、IoCtx O_NONBLOCK 解码；
+  端到端见 `user/hello53.c`。
 
 ---
 

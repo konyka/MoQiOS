@@ -51,7 +51,7 @@ pub fn readlink(path_ptr: u64, buf_ptr: u64, bufsiz: u64) i64 {
                         .timerfd => "anon_inode:[timerfd]",
                         .proc_file => "file",
                         .special => "file",
-                        .random => "char",
+                        .devfs => "char",
                         else => "unknown",
                     };
                     const tlen = @min(type_str.len, @as(usize, @intCast(bufsiz)));

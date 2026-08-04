@@ -235,6 +235,11 @@ export fn _start() callconv(.c) noreturn {
     subsystem_boot.initTmpfs();
     subsystem_boot.initRandom();
 
+    // devfs: register the /dev device-node table (null/zero/full/random/
+    // urandom/kmsg/pci/tty) before any user task can open /dev — vfs.open
+    // resolves every /dev/* name against this table now.
+    @import("fs/devfs_nodes.zig").init();
+
     // M3: LAPIC timer — use LAPIC address from ACPI MADT, fallback to 0xFEE00000
     const lapic_addr = if (acpi.info.lapic_address != 0) acpi.info.lapic_address else 0xFEE00000;
     lapic.init(lapic_addr);

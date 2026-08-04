@@ -109,10 +109,14 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello50");  /* SMP concurrent-workload stress (4 workers) */
     run_test("hello51");  /* userspace driver framework (pci/mmio/irq/dma) */
     run_test("hello52");  /* ioperm: user port I/O via TSS I/O bitmap */
+    run_test("hello53");  /* devfs device nodes (/dev registry + getdents) */
 
     /* First resident system service: drains /dev/kmsg into /tmp/kern.log.
      * Never exits — do not waitpid it. */
     spawn("syslogd");
+    /* Device manager: watches the /dev node set (polling today, event
+     * hooks when devfs grows them). Also resident — do not waitpid. */
+    spawn("devmgr");
 
     run_test("hello9");   /* fork test */
     run_test("hello10");  /* fork+execve test */

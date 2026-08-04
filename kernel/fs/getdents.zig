@@ -32,7 +32,52 @@ pub fn getdents64(fd: u32, buf_ptr: u64, buf_size: u64) i64 {
         return getdents64Tmpfs(desc, buf_ptr, buf_size);
     }
 
+    // devfs directory (/dev)
+    if (desc.fd_type == .devfs) {
+        const devfs = @import("devfs.zig");
+        if (desc.devfs_idx == devfs.DIR_IDX) return getdents64Devfs(desc, buf_ptr, buf_size);
+        return -20; // ENOTDIR — a device node is not a directory
+    }
+
     return -20; // ENOTDIR
+}
+
+/// Enumerate registered devfs nodes. The descriptor offset is simply the
+/// next node slot index — the table is append-only after init, so slots
+/// are dense and stable.
+fn getdents64Devfs(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i64 {
+    const devfs = @import("devfs.zig");
+    var kbuf: [4096]u8 = undefined;
+    var written: u64 = 0;
+    var emitted: u32 = 0;
+    const start: u32 = @intCast(@min(desc.offset, 0xFFFFFFFF));
+    var idx: u32 = start;
+    while (idx < devfs.nodeCount()) : (idx += 1) {
+        const name = devfs.nameAt(idx) orelse break;
+        const reclen: u16 = @intCast(19 + name.len + 1);
+        const padded_reclen: u16 = (reclen + 7) & ~@as(u16, 7);
+        if (written + padded_reclen > @min(buf_size, 4096)) break;
+        const base = @as(usize, @intCast(written));
+        const ino: u64 = idx + 1;
+        bo.writeU64Le(kbuf[base .. base + 8], ino);
+        const doff: u64 = idx + 1;
+        bo.writeU64Le(kbuf[base + 8 .. base + 16], doff);
+        bo.writeU16Le(kbuf[base + 16 .. base + 18], padded_reclen);
+        kbuf[base + 18] = 2; // DT_CHR — all devfs nodes are char devices
+        @memcpy(kbuf[base + 19 .. base + 19 + name.len], name);
+        kbuf[base + 19 + name.len] = 0;
+        written += padded_reclen;
+        emitted += 1;
+    }
+    if (emitted == 0) {
+        // Nothing emitted is end of directory only if there was nothing
+        // left to emit; otherwise the buffer was too small.
+        return if (start >= devfs.nodeCount()) 0 else -22;
+    }
+    const n: usize = @intCast(written);
+    if (copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..n], n) != n) return -14;
+    desc.offset = start + emitted;
+    return @intCast(written);
 }
 
 fn getdents64Ext2(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i64 {

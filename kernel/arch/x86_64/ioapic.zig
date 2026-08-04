@@ -11,12 +11,12 @@
 /// Scope notes:
 ///   - Only the FIRST IOAPIC from the MADT is used (acpi_parser records one
 ///     ioapic_address/gsi_base pair); enough for QEMU's single 82489DX.
-///   - MADT Interrupt Source Override (type 2) entries are NOT parsed by
-///     acpi_parser, so every line is programmed edge-triggered / active-high.
-///     The legacy PIC lines (GSI 0-15) keep flowing through the 8259A path
-///     unchanged, so this only affects userdrv-claimed GSIs >= 16 (PCI
-///     defaults there are level/low, but no in-tree consumer depends on ISO
-///     polarity yet — revisit if a device misbehaves).
+///   - MADT Interrupt Source Override (type 2) entries are parsed by
+///     acpi_parser into acpi.info.isos; routeGsi applies the ISO's
+///     trigger/polarity when one covers the GSI, and falls back to
+///     edge-triggered / active-high otherwise. The legacy PIC lines
+///     (GSI 0-15) keep flowing through the 8259A path unchanged, so this
+///     only affects userdrv-claimed GSIs >= 16.
 const hhdm = @import("../../mm/hhdm.zig");
 const serial = @import("serial.zig");
 const fmt = @import("../../lib/fmt.zig");
@@ -117,15 +117,32 @@ fn entryIndex(gsi: u32) ?u32 {
     return idx;
 }
 
-/// Route `gsi` to `vector` on the LAPIC `dest_apic_id`, unmasked,
-/// edge-triggered, active-high (see the ISO note in the file header).
+/// Route `gsi` to `vector` on the LAPIC `dest_apic_id`, unmasked. Trigger
+/// and polarity come from the MADT ISO table when an entry covers the GSI,
+/// else the defaults (edge-triggered, active-high) apply.
 /// Returns false when the GSI is not handled by this IOAPIC.
 pub fn routeGsi(gsi: u32, vector: u8, dest_apic_id: u8) bool {
     const idx = entryIndex(gsi) orelse return false;
+    var trigger: core.Trigger = .edge;
+    var polarity: core.Polarity = .active_high;
+    const acpi = @import("../../acpi/acpi_parser.zig");
+    const madt_iso = @import("../../acpi/madt_iso.zig");
+    if (acpi.info.isos.lookup(gsi)) |iso| {
+        trigger = switch (madt_iso.triggerOf(iso.flags)) {
+            .edge => .edge,
+            .level => .level,
+        };
+        polarity = switch (madt_iso.polarityOf(iso.flags)) {
+            .active_high => .active_high,
+            .active_low => .active_low,
+        };
+    }
     writeRedEntry(idx, core.encodeRedEntry(.{
         .vector = vector,
         .dest_apic_id = dest_apic_id,
         .masked = false,
+        .trigger = trigger,
+        .polarity = polarity,
     }));
     return true;
 }
