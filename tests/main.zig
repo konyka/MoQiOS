@@ -1389,3 +1389,118 @@ test "J3: bytesAvailable tracks a live ring's newest position" {
     try std.testing.expectEqual(@as(u64, 18), kmsg_ring.bytesAvailable(ring.newestPos(), 10));
 }
 // ─── end kmsg blocking (J3) ───
+
+// ─── sched claim (J2) ───
+// Atomic task-claim protocol behind the fine-grained scheduler: a CPU may run
+// a task only after winning the .ready → .running cmpxchg on its state word.
+// These tests pin the contention matrix: exactly-one-winner, claim against
+// blocked/zombie/running states, and release refusal when the task blocked or
+// exited underneath an in-flight switch.
+const sched_claim = kt.sched_claim;
+const ClaimState = sched_claim.TaskState;
+
+test "J2: tryClaim wins exactly once from ready" {
+    var s: ClaimState = .ready;
+    try std.testing.expect(sched_claim.tryClaim(&s));
+    try std.testing.expectEqual(ClaimState.running, sched_claim.load(&s));
+    // A second CPU claiming the same task must lose, leaving state untouched.
+    try std.testing.expect(!sched_claim.tryClaim(&s));
+    try std.testing.expectEqual(ClaimState.running, sched_claim.load(&s));
+}
+
+test "J2: tryClaim refuses blocked and zombie tasks without disturbing them" {
+    var s: ClaimState = .blocked;
+    try std.testing.expect(!sched_claim.tryClaim(&s));
+    try std.testing.expectEqual(ClaimState.blocked, sched_claim.load(&s));
+
+    sched_claim.store(&s, .zombie);
+    try std.testing.expect(!sched_claim.tryClaim(&s));
+    try std.testing.expectEqual(ClaimState.zombie, sched_claim.load(&s));
+}
+
+test "J2: releaseToReady round-trips a claim" {
+    var s: ClaimState = .ready;
+    try std.testing.expect(sched_claim.tryClaim(&s));
+    try std.testing.expect(sched_claim.releaseToReady(&s));
+    try std.testing.expectEqual(ClaimState.ready, sched_claim.load(&s));
+    // The task is claimable again afterwards (re-pick after preemption).
+    try std.testing.expect(sched_claim.tryClaim(&s));
+    try std.testing.expectEqual(ClaimState.running, sched_claim.load(&s));
+}
+
+test "J2: releaseToReady refuses a task that blocked underneath the switch" {
+    var s: ClaimState = .ready;
+    try std.testing.expect(sched_claim.tryClaim(&s));
+    // The running task blocks itself (futex/waitpid) while the switch is in
+    // flight: the release must fail and must NOT resurrect it to .ready.
+    sched_claim.store(&s, .blocked);
+    try std.testing.expect(!sched_claim.releaseToReady(&s));
+    try std.testing.expectEqual(ClaimState.blocked, sched_claim.load(&s));
+    // A blocked task stays unclaimable until a wake publishes it.
+    try std.testing.expect(!sched_claim.tryClaim(&s));
+    sched_claim.store(&s, .ready); // wake path: blocked → ready
+    try std.testing.expect(sched_claim.tryClaim(&s));
+}
+
+test "J2: releaseToReady refuses a zombie (exited during the switch window)" {
+    var s: ClaimState = .ready;
+    try std.testing.expect(sched_claim.tryClaim(&s));
+    sched_claim.store(&s, .zombie);
+    try std.testing.expect(!sched_claim.releaseToReady(&s));
+    try std.testing.expectEqual(ClaimState.zombie, sched_claim.load(&s));
+    try std.testing.expect(!sched_claim.tryClaim(&s));
+}
+
+test "J2: releaseToReady refuses an unclaimed (ready) task" {
+    // Releasing a task nobody owns would be a protocol bug: ready stays ready.
+    var s: ClaimState = .ready;
+    try std.testing.expect(!sched_claim.releaseToReady(&s));
+    try std.testing.expectEqual(ClaimState.ready, sched_claim.load(&s));
+}
+
+test "J2: contended cmpxchg claims grant exclusive ownership" {
+    // N hammering threads × M rounds: a won claim must imply sole ownership
+    // (nobody else inside the claimed section), and every claim is released.
+    const THREADS = 4;
+    const ROUNDS = 5000;
+    const Shared = struct {
+        state: ClaimState = .ready,
+        in_section: u32 = 0,
+        overlap: u32 = 0,
+        claimed: u32 = 0,
+        released: u32 = 0,
+    };
+    var shared: Shared = .{};
+    const Worker = struct {
+        fn run(sh: *Shared) void {
+            var i: u32 = 0;
+            while (i < ROUNDS) : (i += 1) {
+                if (!sched_claim.tryClaim(&sh.state)) continue;
+                // Claim won: we must be the sole owner.
+                if (@atomicRmw(u32, &sh.in_section, .Xchg, 1, .seq_cst) != 0) {
+                    @atomicStore(u32, &sh.overlap, 1, .seq_cst);
+                }
+                _ = @atomicRmw(u32, &sh.claimed, .Add, 1, .seq_cst);
+                // Leave the exclusive section BEFORE releasing: the state is
+                // still .running (ours), so no new claim can sneak in.
+                @atomicStore(u32, &sh.in_section, 0, .seq_cst);
+                // The owner always releases successfully (nothing else can
+                // move a claimed task out of .running).
+                if (!sched_claim.releaseToReady(&sh.state)) {
+                    @atomicStore(u32, &sh.overlap, 1, .seq_cst);
+                }
+                _ = @atomicRmw(u32, &sh.released, .Add, 1, .seq_cst);
+            }
+        }
+    };
+    var threads: [THREADS]std.Thread = undefined;
+    for (&threads) |*th| th.* = try std.Thread.spawn(.{}, Worker.run, .{&shared});
+    for (&threads) |*th| th.join();
+
+    try std.testing.expectEqual(@as(u32, 0), shared.overlap);
+    try std.testing.expectEqual(shared.claimed, shared.released);
+    try std.testing.expect(shared.claimed > 0);
+    // All claims released: the task ends up .ready, never stuck .running.
+    try std.testing.expectEqual(ClaimState.ready, sched_claim.load(&shared.state));
+}
+// ─── end sched claim (J2) ───

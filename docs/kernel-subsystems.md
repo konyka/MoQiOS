@@ -413,6 +413,56 @@ const Task = struct {
 扫描，AP 只能跑被显式绑定到自己的任务；现在 AP 通过 work-stealing **真正参与用户任务并行**，
 忙 CPU 主动卸载、闲 CPU 主动拉取。
 
+**细粒度调度选取：原子任务认领协议（J2，2026-08-04 完成 ✅）**
+
+文件: `proc/sched_claim.zig`（纯模块，无 arch 依赖，host 单测覆盖）、`proc/sched.zig`、
+`proc/task.zig`
+
+- **回滚门**：`sched.sched_fine_grain_enable`（默认 `true`）。为 `false` 时
+  `timerTick` 走 `timerTickLegacy`——旧的全局锁路径**逐字节保留**；为 `true` 时走
+  `timerTickFg`。门切换两种构型都通过 `zig build` 验证。
+- **认领协议**：一个 CPU 只有在 `Task.state` 上赢得 cmpxchg（`.ready → .running`，
+  `sched_claim.tryClaim`）之后才允许运行该任务。这取代了旧不变量"持有 `sched_lock`
+  就不会被别的 CPU 选中同一任务"。状态机的跨 CPU 转移全部收口在 `sched_claim`：
+  `.ready → .running` 只能由 `tryClaim` 完成（唯一出口，故两 CPU 永不重复认领）；
+  `.running` 的出口只有运行者自己（阻塞/退出）或属主 CPU 换出时的
+  `releaseToReady`（cmpxchg `.running → .ready`）。唤醒路径只在 `.blocked` 任务上
+  做 `store(.ready)`，而 `.blocked` 任务按定义不可被认领，因此普通唤醒写永远不会
+  与一次**成功**的认领竞争。
+- **选取路径改造**：`pickNextFg` 保持三段式回退（本地队列 → 窃取 → 位图），但只在
+  认领成功后才返回：① `popRunnableClaim` = 队列锁内 `popRtAware`（RT 语义不变）+
+  state/affinity/isCurrentOnOtherCpu 过滤 + cmpxchg 认领，认领失败丢弃该条目继续；
+  ③ 位图回退先 `pickReadyForCpu`（task_lock 快照）再 cmpxchg 认领，失败重选——
+  `.ready` 的唯一出口是成功认领，故重选不会返回同一任务，循环有界（≤ MAX_TASKS）。
+  ② 窃取逻辑不改动（队列锁本来就按 CPU-id 升序成对获取）。
+- **换出任务最后发布**：`timerTickFg` 的切换路径把旧任务的 `.running → .ready` +
+  重新入队推迟到锚点/current/CR3 全部切换完之后（`releaseOldTask`）。在此之前旧任务
+  保持 `.running` 不可认领，任何远程 CPU 都无法在本 CPU 仍运行于其内核栈上时开始执行
+  它——旧代码在 `sched_lock` 释放前就重新发布旧任务，整个中断尾声都是双栈窗口；现在
+  该窗口收窄到 [release → iretq]。cmpxchg 同时兼任旧的 `state == .running` 检查：
+  切换窗口内自行阻塞/退出的任务（waitpid 父进程、exitTask、信号杀死）发布失败，
+  不会被重新入队。
+- **`sched_lock` 还剩什么**：细粒度模式下热路径不再使用它，仅保留给 legacy 回滚体
+  与（当前无调用方的）`tryStealTask`。BSP 维护段（reapZombies/writeback/TCP/timerfd/
+  futex 等）本来就不需要调度锁——每个被调方自带锁；`reap_counter` 是 BSP 私有。
+  快速路径（`countActiveOnThisCpu`、FIFO 无量子守卫、force_pick RT 守卫
+  `peekBestRankKey`）全部经原子读，无全局锁。
+- **IRQ 屏蔽**：legacy 路径靠 `sched_lock.acquire` 顺带 cli；细粒度路径没有锁，因此
+  `timerTickFg` 入口显式 `saveAndDisable`、出口恢复——否则从系统调用上下文（IF=1）
+  触发的让出陷阱（int 252）可能在切换中途嵌套第二个定时器 IRQ，在同一内核栈上重入
+  调度器。
+- **新锁序**：`task_lock → 每 CPU 队列锁`（唤醒路径）；窃取时两把队列锁按 CPU-id
+  升序成对获取；选取路径从不同时持有 {队列锁， task_lock} 中的两把。legacy 模式仍为
+  `sched_lock → task_lock → 队列锁`。
+- **RR/FIFO/force_pick/RT 守卫语义**：全部保留——FIFO 无量子补充、force_pick 只在存在
+  严格更优 rankKey 时抢占 RT、`popRtAware` 同级取最老入队者、位图回退
+  `MAX_PICK_KEY` 排除 idle（255），逐条与 legacy 同构。
+- **验证**：host 单测 `tests/main.zig` "sched claim (J2)" 块（7 个用例：唯一赢家、
+  对 blocked/zombie/running 拒绝认领、release 拒绝非 running、释放后可再认领、
+  4 线程 × 5000 轮 cmpxchg 竞争独占性不变量）；运行时回归 `qemu_smoke.sh`（SMP=1/4）
+  与 `qemu_smoke_stress.sh`（SMP=4 × 10 轮，含 hello50 四 worker 并发
+  fs/pipe/udp/mmap 压力），零 AFFDIAG。
+
 **主动让出必须走中断返回路径（x86_64，2026-07-25 修正）**
 
 调度器交接 CPU 的方式是改写 per-CPU 栈锚点（`%gs:16`）并加载下一个任务的 CR3，而**只有中断

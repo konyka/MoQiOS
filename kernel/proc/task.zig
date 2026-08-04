@@ -32,12 +32,11 @@ const KERNEL_STACK_STRIDE: u64 = 256 * 1024;
 pub const ENV_MAX_VARS: u32 = if (builtin.cpu.arch == .x86_64) 32 else 4;
 pub const ENV_VAR_BYTES: u32 = if (builtin.cpu.arch == .x86_64) 128 else 64;
 
-pub const TaskState = enum(u8) {
-    ready = 0,
-    running = 1,
-    blocked = 2,
-    zombie = 3,
-};
+/// Canonical task-state enum lives in the pure claim module (J2) so the
+/// atomic claim protocol and every scheduler reader/writer share one
+/// definition. Values are unchanged: ready=0, running=1, blocked=2, zombie=3.
+const sched_claim = @import("sched_claim.zig");
+pub const TaskState = sched_claim.TaskState;
 
 pub const TaskFunc = *const fn () callconv(.c) void;
 
@@ -330,7 +329,7 @@ fn matchesCpu(t: *Task, cpu: u8) bool {
 
 fn considerReady(idx: u32, cpu: u8, best_idx: *?u32, best_key: *u16) void {
     const t = getTask(idx) orelse return;
-    if (t.state == .ready and matchesCpu(t, cpu)) {
+    if (sched_claim.load(&t.state) == .ready and matchesCpu(t, cpu)) {
         // F3: class-aware rank — any runnable FIFO/RR task outranks every
         // OTHER task. Within the OTHER class keys are monotonic in kernel
         // priority, so OTHER-only picks are identical to the pre-F3 raw
@@ -393,7 +392,7 @@ pub fn pickKernelBootstrapForCpu(cpu: u8) ?u32 {
         const i: u32 = @intCast(@ctz(bits));
         bits &= bits - 1;
         const t = getTask(i) orelse continue;
-        if (t.state == .ready and !t.is_user and matchesCpu(t, cpu)) {
+        if (sched_claim.load(&t.state) == .ready and !t.is_user and matchesCpu(t, cpu)) {
             // Same double-current guard as considerReady/popRunnable: an
             // unpinned kernel thread just woken may still be another CPU's
             // current until that CPU switches away.
@@ -414,7 +413,8 @@ pub fn countActiveOnCpu(cpu: u8) u32 {
         const i: u32 = @intCast(@ctz(bits));
         bits &= bits - 1;
         const t = getTask(i) orelse continue;
-        if (matchesCpu(t, cpu) and t.state != .zombie and t.state != .blocked) {
+        const st = sched_claim.load(&t.state);
+        if (matchesCpu(t, cpu) and st != .zombie and st != .blocked) {
             n += 1;
         }
     }
@@ -430,7 +430,7 @@ pub fn hasReadyOnCpu(cpu: u8) bool {
         const i: u32 = @intCast(@ctz(bits));
         bits &= bits - 1;
         const t = getTask(i) orelse continue;
-        if (t.state == .ready and matchesCpu(t, cpu)) return true;
+        if (sched_claim.load(&t.state) == .ready and matchesCpu(t, cpu)) return true;
     }
     return false;
 }
@@ -666,7 +666,7 @@ pub fn exitTask(exit_code: i32) void {
 
     const flags = task_lock.acquire();
     t.exit_code = exit_code;
-    t.state = .zombie;
+    sched_claim.store(&t.state, .zombie);
     asm volatile ("" ::: .{ .memory = true });
 
     // Wake parent if sleeping on our exit_waiters queue
@@ -687,7 +687,7 @@ pub fn exitTask(exit_code: i32) void {
             };
             if (parent.waiting_for_child) {
                 parent.waiting_for_child = false;
-                parent.state = .ready;
+                sched_claim.store(&parent.state, .ready);
                 // Ready is not enough — re-enqueue so a busy CPU's queue-first
                 // pickNext can't starve the parent indefinitely (bitmap-only
                 // tasks lose to a never-empty per-CPU queue).
@@ -807,8 +807,8 @@ pub fn blockTask(idx: u32) void {
     const flags = task_lock.acquire();
     defer task_lock.release(flags);
     const t = getTask(idx) orelse return;
-    if (t.state == .running) {
-        t.state = .blocked;
+    if (sched_claim.load(&t.state) == .running) {
+        sched_claim.store(&t.state, .blocked);
     }
 }
 
@@ -817,8 +817,8 @@ pub fn unblockTask(idx: u32) void {
     const flags = task_lock.acquire();
     defer task_lock.release(flags);
     const t = getTask(idx) orelse return;
-    if (t.state == .blocked) {
-        t.state = .ready;
+    if (sched_claim.load(&t.state) == .blocked) {
+        sched_claim.store(&t.state, .ready);
         // Task #2: republish to per-CPU queue (best-effort, full → bitmap fallback).
         const per_cpu = @import("per_cpu.zig");
         if (per_cpu.isAnyReady()) _ = per_cpu.enqueueTask(t);
@@ -963,8 +963,8 @@ pub fn publishRunnable(slot: u32) void {
     {
         const flags = task_lock.acquire();
         defer task_lock.release(flags);
-        if (t.state != .blocked) return;
-        t.state = .ready;
+        if (sched_claim.load(&t.state) != .blocked) return;
+        sched_claim.store(&t.state, .ready);
     }
     asm volatile ("" ::: .{ .memory = true });
     const sched = @import("sched.zig");

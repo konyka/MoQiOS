@@ -16,6 +16,7 @@
 /// Among tasks of equal priority, round-robin is used.
 const task = @import("task.zig");
 const sched_policy = @import("sched_policy.zig");
+const sched_claim = @import("sched_claim.zig");
 const per_cpu = @import("per_cpu.zig");
 const idt = @import("../arch/arch.zig").interrupts;
 const gdt = @import("../arch/arch.zig").gdt;
@@ -56,6 +57,23 @@ pub const TIMESLICE_TICKS_PUB: u64 = TIMESLICE_TICKS;
 var reap_counter: u64 = 0;
 const REAP_INTERVAL: u64 = TIMESLICE_TICKS;
 var sched_lock: IrqSpinlock = .{};
+
+/// J2: fine-grained scheduler picking gate.
+///  * true  — `timerTick` dispatches to `timerTickFg`: pick/steal/bitmap run
+///    WITHOUT `sched_lock`; single-CPU ownership of a task is guaranteed by
+///    the atomic claim protocol in `sched_claim.zig` (cmpxchg .ready →
+///    .running) instead of the global lock.
+///  * false — rollback: the legacy `timerTickLegacy` body runs
+///    byte-identically, holding `sched_lock` across the whole pick/switch
+///    path.
+/// What `sched_lock` still protects when the gate is on: only the legacy
+/// body itself and the (currently unused) `tryStealTask` helper. The BSP
+/// maintenance pass (reapZombies/writeback/tcp/...) needs no scheduler lock —
+/// every callee has its own. `reap_counter` is BSP-only state.
+/// New lock order (fine-grain mode): task_lock → per-CPU queue lock
+/// (wake paths), queue locks pairwise in ascending CPU-id order (steals).
+/// The pick path never holds two of {queue lock, task_lock} at once.
+pub const sched_fine_grain_enable: bool = true;
 
 // v53.46: Active timer bitmaps — timerTick only scans tasks with active timers
 // instead of all 64 task slots. Set by alarm/setitimer syscalls, cleared on fire/cancel.
@@ -188,18 +206,25 @@ fn countActiveOnThisCpu() u32 {
 
 /// Called from timer IRQ handler on every tick (all online CPUs — M8-5b-2).
 pub fn timerTick(frame: *idt.InterruptFrame) void {
+    if (comptime sched_fine_grain_enable) {
+        timerTickFg(frame);
+    } else {
+        timerTickLegacy(frame);
+    }
+}
+
+/// Legacy global-lock tick — kept byte-identical for rollback
+/// (`sched_fine_grain_enable = false`). sched_lock serialises the whole
+/// pick/steal/switch path: between a lock-free popRunnable / pickReadyForCpu
+/// and the locked `state = .running` transition another CPU could otherwise
+/// claim the same ready task — the isCurrentOnOtherCpu check is only a
+/// snapshot — putting one task (and one kernel stack) on two CPUs at once.
+/// The fine-grain path (`timerTickFg`) closes that TOCTOU with the atomic
+/// claim protocol in sched_claim.zig instead.
+/// Lock order: sched_lock → task_lock → queue lock (no ABBA).
+fn timerTickLegacy(frame: *idt.InterruptFrame) void {
     _ = frame;
 
-    // sched_lock still serialises the whole pick/steal/switch path below.
-    // Splitting it (lock-free per-CPU pick, sched_lock only around the anchor
-    // switch) is deliberately NOT done: between a lock-free popRunnable /
-    // pickReadyForCpu and the locked `state = .running` transition another CPU
-    // could claim the same ready task — the isCurrentOnOtherCpu check is only
-    // a snapshot — putting one task (and one kernel stack) on two CPUs at
-    // once. Closing that TOCTOU needs an atomic claim protocol on Task.state,
-    // which is too invasive for the win here. Cheaper subsets live in
-    // countActiveOnThisCpu (queue-depth pre-check) and pickNext (steal skip).
-    // Lock order unchanged: sched_lock → task_lock → queue lock (no ABBA).
     var flags = sched_lock.acquire();
 
     // Global periodic maintenance — BSP only (one tick source for the whole system).
@@ -491,6 +516,385 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
     }
 }
 
+/// J2 fine-grained tick: identical decision structure to `timerTickLegacy`,
+/// but the pick/switch path runs WITHOUT `sched_lock`. Exclusion against two
+/// CPUs running the same task is provided by the atomic claim protocol
+/// (`sched_claim.zig`): `pickNextFg` only returns a task after winning the
+/// .ready → .running cmpxchg, so the anchor/CR3 switch below touches a task
+/// this CPU provably owns.
+///
+/// IRQs are masked for the whole pass: the legacy path got that from
+/// sched_lock's acquire, and the yield trap (int 252) enters with IF=1 from
+/// syscall context, so without an explicit cli a nested timer IRQ could run a
+/// second scheduler pass mid-switch on the same kernel stack.
+fn timerTickFg(frame: *idt.InterruptFrame) void {
+    _ = frame;
+    const arch_irq = @import("../arch/arch.zig").irq;
+    const irq_flags = arch_irq.saveAndDisable();
+    defer arch_irq.restore(irq_flags);
+
+    // Global periodic maintenance — BSP only (one tick source for the whole
+    // system). Every callee carries its own locking (task_lock, vfs, net),
+    // so no scheduler lock is needed here.
+    if (currentCpuId() == 0) {
+        reap_counter +|= 1;
+    }
+    if (currentCpuId() == 0 and reap_counter >= REAP_INTERVAL) {
+        reap_counter = 0;
+        // Lock order: task_lock → pmm.lock (inside reapZombies/freeKernelStack).
+        _ = task.reapZombies();
+        // Drive writeback expiry check (~every 1 s). Only the cheap scan runs
+        // here (IRQ-off); the flush itself is deferred to the writeback kernel
+        // thread — see vfs.writebackTimerTick.
+        const vfs = @import("../fs/vfs.zig");
+        _ = vfs.writebackTimerTick();
+        // Drive timerfd expiration checks
+        const timerfd = @import("../ipc/timerfd.zig");
+        timerfd.timerTick(idt.getTickCount());
+        // Drive POSIX timer expiration checks
+        const posix_timer = @import("../ipc/posix_timer.zig");
+        posix_timer.timerTick(idt.getTickCount());
+        // v53.12: Drive TCP timer (retransmission, TIME_WAIT/FIN_WAIT_2 timeout, delayed ACK)
+        // LAPIC fires at ~100Hz (10ms/tick), REAP_INTERVAL=10 ticks → ~100ms per maintenance pass
+        const tcp = @import("../net/tcp.zig");
+        tcp.timerTick(100);
+        // SK-79: NDP incomplete Neighbor Solicitation retransmit (RetransTimer).
+        const icmpv6 = @import("../net/icmpv6.zig");
+        icmpv6.neighborTimerTick(100);
+        // Drive alarm() / setitimer(ITIMER_REAL) expiration checks
+        // v53.46: Bitmap scan — only check tasks with active timers (O(active) vs O(64)).
+        {
+            const tsc = @import("../arch/arch.zig").tsc;
+            const now_ns = tsc.nanos();
+            // Drive timed futex waits (FUTEX_WAIT/FUTEX_WAIT_BITSET with val2).
+            const futex_mod = @import("../sync/futex.zig");
+            futex_mod.timerTick(now_ns);
+            // Drive timed POSIX mq waits (mq_timedsend/mq_timedreceive with
+            // abs_timeout) — same deadline-bitmap pattern as the futex scan.
+            const posix_mq_mod = @import("../ipc/posix_mq.zig");
+            posix_mq_mod.timerTick(now_ns);
+            // v53.47: Atomic load — alarm_bm/itimer_bm are modified from syscall context
+            // on other CPUs. Non-atomic read-modify-write could lose newly set bits.
+            var bm = @atomicLoad(u64, &alarm_bm, .acquire) |
+                @atomicLoad(u64, &itimer_bm, .acquire);
+            while (bm != 0) {
+                const i: u6 = @truncate(@ctz(bm));
+                bm &= bm - 1;
+                const t = task.getTask(@intCast(i)) orelse continue;
+                if (sched_claim.load(&t.state) == .zombie) continue;
+                // Check alarm() deadline
+                if (t.alarm_deadline != 0 and now_ns >= t.alarm_deadline) {
+                    t.alarm_deadline = 0; // One-shot: clear after firing
+                    _ = @atomicRmw(u64, &alarm_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
+                    _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
+                }
+                // Check ITIMER_REAL deadline
+                if (t.itimer_real_value != 0 and now_ns >= t.itimer_real_value) {
+                    _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
+                    if (t.itimer_real_interval != 0) {
+                        // Recurring: reschedule next expiration
+                        t.itimer_real_value = now_ns + t.itimer_real_interval;
+                    } else {
+                        // One-shot: clear after firing
+                        t.itimer_real_value = 0;
+                        _ = @atomicRmw(u64, &itimer_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
+                    }
+                }
+            }
+        }
+        // Force scheduling on the very next tick so the BSP doesn't idle a full
+        // timeslice after this maintenance pass (which skipped scheduling).
+        setSlice(1);
+        return;
+    }
+
+    // Check for pending signals on current task
+    if (getCurrentIdx()) |ci| {
+        if (task.getTask(ci)) |ct| {
+            // Exited tasks stay cur_idx until we switch away — don't burn timeslice.
+            if (sched_claim.load(&ct.state) == .zombie) setSlice(0);
+            if (ct.is_user and ct.pending_signals != 0 and ct.pending_signals & ~@as(u32, @truncate(ct.signal_mask)) != 0) {
+                // Resume through the frame when the handler was entered.
+                // Otherwise fall through to a normal reschedule: returning here
+                // would skip scheduling on every tick for as long as the signal
+                // stays undeliverable, which stalls the CPU outright.
+                if (deliverSignalToRunningTask(ct)) return;
+            }
+        }
+    }
+
+    const pc_force = thisCpu();
+    const force_pick = pc_force != null and pc_force.?.force_reschedule != 0;
+
+    if (task.getTaskCount() == 0) {
+        return;
+    }
+
+    if (getCurrentIdx()) |ci| {
+        if (task.getTask(ci)) |ct| {
+            const cpu: u8 = @intCast(currentCpuId());
+            const ct_state = sched_claim.load(&ct.state);
+            if (!force_pick and countActiveOnThisCpu() == 1 and ct_state != .zombie and ct_state != .blocked) {
+                return;
+            }
+            // Blocked parent in waitpid still holds cur_idx — run peers on this CPU.
+            if (!force_pick and ct_state == .blocked) {
+                if (task.hasReadyOnCpu(cpu)) {
+                    setSlice(0);
+                } else {
+                    return;
+                }
+            }
+        } else {
+            setCurrentIdx(null);
+        }
+    }
+
+    const new_slice = getSlice() -| 1;
+    setSlice(new_slice);
+    if (new_slice > 0) {
+        return;
+    }
+
+    // F3: SCHED_FIFO has no quantum — a running FIFO task is never preempted
+    // by a plain timer tick; it leaves the CPU only by blocking, yielding or
+    // exiting. A reschedule IPI (force_pick) still preempts, and a blocked /
+    // zombie current task is switched out regardless.
+    if (!force_pick) {
+        if (getCurrentIdx()) |ci| {
+            if (task.getTask(ci)) |ct| {
+                if (sched_claim.load(&ct.state) == .running and !sched_policy.hasQuantumExpiry(ct.sched_policy)) {
+                    setSlice(TIMESLICE_TICKS);
+                    return;
+                }
+            }
+        }
+    }
+
+    // F3: a reschedule IPI (force_pick) must not preempt a running RT task
+    // for lower-ranked work — every remote wake would otherwise cut into
+    // FIFO/RR execution. Preempt only when a strictly better-ranked runnable
+    // exists on this CPU.
+    if (force_pick) {
+        if (getCurrentIdx()) |ci| {
+            if (task.getTask(ci)) |ct| {
+                if (sched_claim.load(&ct.state) == .running and sched_policy.isRtClass(ct.sched_policy)) {
+                    const cur_key = sched_policy.rankKey(ct.sched_policy, ct.priority);
+                    const best = peekBestRankKey();
+                    if (best == null or best.? >= cur_key) {
+                        setSlice(TIMESLICE_TICKS);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    setSlice(TIMESLICE_TICKS);
+
+    // Returns a task this CPU already CLAIMED (state is .running, owned here).
+    const next_idx = pickNextFg() orelse {
+        return;
+    };
+
+    // DIAG: pinned task scheduled on a foreign CPU (catches both first
+    // schedule and switches).
+    if (task.getTask(next_idx)) |nt| {
+        if (nt.cpu_affinity >= 0 and nt.cpu_affinity != @as(i16, @intCast(currentCpuId()))) {
+            var b1: [24]u8 = undefined;
+            var b2: [24]u8 = undefined;
+            var b3: [24]u8 = undefined;
+            const serial = @import("../arch/arch.zig").serial;
+            serial.writeString("[AFFDIAG] tid=");
+            serial.writeString(fmt.fmtDec(&b1, nt.tid));
+            serial.writeString(" pin=");
+            serial.writeString(fmt.fmtDec(&b2, @as(u64, @intCast(nt.cpu_affinity))));
+            serial.writeString(" cpu=");
+            serial.writeString(fmt.fmtDec(&b3, currentCpuId()));
+            serial.writeString("\n");
+        }
+    }
+
+    // First ever schedule on this CPU (no current task). The claim in
+    // pickNextFg already made the task .running — no state write needed.
+    if (getCurrentIdx() == null) {
+        const t = task.getTask(next_idx) orelse {
+            return;
+        };
+        if (!t.started) {
+            setupInitialFrame(t);
+        }
+        setAnchor(t.saved_rsp);
+        setCurrentIdx(next_idx);
+
+        // Set up CPU state for the first scheduled task (mirror context-switch path).
+        if (t.page_table_phys != 0) {
+            pcid.switchCr3(t.page_table_phys);
+            setupUserCpuState(t);
+            return;
+        }
+        return;
+    }
+
+    const cur_idx = getCurrentIdx().?;
+    if (next_idx == cur_idx) {
+        // We claimed our own (woken-while-current) task: .ready → .running
+        // is exactly the right transition — keep running it.
+        return;
+    }
+
+    // A claimed (.running) task is never reaped, so this lookup cannot fail.
+    const new_task = task.getTask(next_idx) orelse {
+        return;
+    };
+    const old_task = task.getTask(cur_idx) orelse {
+        // Defensive: drop the claim so the task stays schedulable.
+        _ = sched_claim.releaseToReady(&new_task.state);
+        return;
+    };
+
+    old_task.saved_rsp = getAnchor();
+    if (old_task.is_user) syscall_entry.syncUserRspToTask(old_task);
+
+    // Task #1: eager fxsave on context switch (only if old_task currently
+    // owns the FPU on this CPU) + arm CR0.TS so the new task takes a lazy
+    // #NM the first time it touches FPU/SSE state.
+    context_switch.onContextSwitch(old_task);
+
+    // CPU time accounting: accumulate time spent in this task
+    const tsc_mod = @import("../arch/arch.zig").tsc;
+    const now_tsc = tsc_mod.read();
+    if (old_task.sched_in_tsc != 0 and tsc_mod.tsc_freq_mhz != 0) {
+        const elapsed_tsc = now_tsc - old_task.sched_in_tsc;
+        const elapsed_us = elapsed_tsc / tsc_mod.tsc_freq_mhz;
+        if (old_task.is_user) {
+            old_task.utime_us += elapsed_us;
+        } else {
+            old_task.stime_us += elapsed_us;
+        }
+        old_task.nivcsw += 1;
+    }
+    new_task.sched_in_tsc = now_tsc;
+
+    if (!new_task.started) {
+        setupInitialFrame(new_task);
+    }
+
+    setAnchor(new_task.saved_rsp);
+    setCurrentIdx(next_idx);
+
+    // J2: publish the outgoing task LAST, after the anchor/current/CR3 moves.
+    // Until releaseOldTask's cmpxchg lands the task stays .running and
+    // unclaimable — no remote CPU can start executing on the kernel stack
+    // this very function is still running on. (The legacy path re-published
+    // it before releasing sched_lock, leaving the whole epilogue as a
+    // double-stack window; this narrows that window to [release → iretq].)
+    if (new_task.page_table_phys != 0) {
+        if (old_task.page_table_phys != new_task.page_table_phys) {
+            const pt = new_task.page_table_phys;
+            pcid.switchCr3(pt);
+            setupUserCpuState(new_task);
+            releaseOldTask(old_task);
+            return;
+        }
+        setupUserCpuState(new_task);
+        releaseOldTask(old_task);
+    } else {
+        if (old_task.page_table_phys != 0) {
+            const kernel_pml4 = paging.getKernelPml4();
+            pcid.switchCr3(kernel_pml4);
+            releaseOldTask(old_task);
+            return;
+        }
+        releaseOldTask(old_task);
+    }
+}
+
+/// Publish the outgoing task as runnable again — the last step of a
+/// fine-grained context switch. The cmpxchg doubles as the legacy
+/// `if (old_task.state == .running)` check: a task that blocked or exited
+/// underneath us (waitpid parent, exitTask, signal kill) is left untouched
+/// and must NOT be re-enqueued.
+fn releaseOldTask(old_task: *task.Task) void {
+    if (sched_claim.releaseToReady(&old_task.state)) {
+        // Task #2: re-publish to its target per-CPU queue so the next
+        // pickNextFg picks it up from the local fast-path. Best-effort —
+        // a full queue just falls back to the bitmap scan.
+        if (per_cpu.isAnyReady()) _ = per_cpu.enqueueTask(old_task);
+    }
+}
+
+/// J2 fine-grained pick — same three-stage fallback as `pickNext` (local
+/// queue → steal → bitmap) but every returned task is already CLAIMED
+/// (cmpxchg .ready → .running won by this CPU). Callers must treat the
+/// result as owned: either switch to it or release the claim.
+fn pickNextFg() ?u32 {
+    // Task #6: profiling — every scheduler pass on this CPU bumps schedule_calls
+    // and contributes a queue-depth sample. Safe without locking: only this CPU
+    // writes its own stats fields.
+    if (per_cpu.isAnyReady()) {
+        const pq = per_cpu.getCurrent();
+        pq.stats.schedule_calls += 1;
+        pq.stats.queue_depth_sum += @atomicLoad(u32, &pq.nr_running, .monotonic);
+        pq.stats.sample_count += 1;
+    }
+    if (getCurrentIdx() == null) {
+        if (pickBootstrapKernel()) |k| {
+            // The bootstrap pick is a task_lock snapshot; another CPU may
+            // have claimed the task since. Claim before committing.
+            const bt = task.getTask(k) orelse return null;
+            if (sched_claim.tryClaim(&bt.state)) return k;
+        }
+    }
+    if (per_cpu.isAnyReady()) {
+        const q = per_cpu.getCurrent();
+        var deferred_local = false;
+        if (popRunnableClaim(q, &deferred_local)) |i| return i;
+        // Steal skip: same rationale as `pickNext` — a deferred local entry
+        // is rediscovered by the bitmap fallback once its owner CPU moves on.
+        if (!deferred_local) {
+            const stolen = per_cpu.tryStealForCurrent();
+            if (stolen > 0) {
+                if (popRunnableClaim(q, &deferred_local)) |i| return i;
+            }
+        }
+    }
+    // Bitmap fallback: pickReadyForCpu is a task_lock snapshot of the best
+    // candidate; the claim afterwards closes the race against another CPU
+    // picking the same snapshot. A lost claim means the task left .ready
+    // (the only transition out of .ready is a successful claim), so the
+    // re-pick below cannot return the same index and the loop terminates.
+    var attempts: u32 = 0;
+    while (attempts < task.MAX_TASKS) : (attempts += 1) {
+        const idx = task.pickReadyForCpu(@intCast(currentCpuId()), getCurrentIdx()) orelse return null;
+        const t = task.getTask(idx) orelse return null;
+        if (sched_claim.tryClaim(&t.state)) return idx;
+    }
+    return null;
+}
+
+/// Claim-based variant of `popRunnable` for the fine-grain path. Same
+/// filters (state, J1 affinity, isCurrentOnOtherCpu → deferred_local), same
+/// RT-aware pop order; the difference is the final cmpxchg claim: a lost
+/// race (another CPU claimed the task between our load and the cmpxchg)
+/// drops the entry — the winner owns the task now — and the loop continues.
+fn popRunnableClaim(q: *per_cpu.PerCpuRunQueue, deferred_local: *bool) ?u32 {
+    const my_cpu = currentCpuId();
+    while (q.popRtAware()) |t| {
+        const i = taskIndexOf(t) orelse continue;
+        if (sched_claim.load(&t.state) != .ready) continue;
+        // J1: never run a task pinned to another CPU (see popRunnable).
+        if (t.cpu_affinity >= 0 and t.cpu_affinity != @as(i16, @intCast(my_cpu))) continue;
+        if (task.isCurrentOnOtherCpu(i, my_cpu)) {
+            deferred_local.* = true;
+            continue;
+        }
+        if (!sched_claim.tryClaim(&t.state)) continue;
+        return i;
+    }
+    return null;
+}
+
 /// Build a fake InterruptFrame at the top of a new task's kernel stack.
 /// When the arch restore path loads this frame, it jumps to the task entry.
 fn setupInitialFrame(t: *task.Task) void {
@@ -590,7 +994,7 @@ fn peekBestRankKey() ?u16 {
     while (i < q.nr_running) : (i += 1) {
         const slot = (q.tail + i) % per_cpu.QUEUE_SIZE;
         const t = q.tasks[slot] orelse continue;
-        if (t.state != .ready) continue;
+        if (sched_claim.load(&t.state) != .ready) continue;
         const key = sched_policy.rankKey(t.sched_policy, t.priority);
         if (best == null or key < best.?) best = key;
     }
@@ -877,7 +1281,7 @@ pub fn blockOn(queue: *?*task.WaitNode, node: *task.WaitNode) bool {
     node.next = queue.*;
     queue.* = node;
 
-    cur.state = .blocked;
+    sched_claim.store(&cur.state, .blocked);
     cur.wait_queue = queue;
     return true;
 }
@@ -908,8 +1312,8 @@ pub fn wakeOne(queue: *?*task.WaitNode) ?u32 {
             node.granted = true;
             const idx = node.task_idx;
             const t = task.getTask(idx) orelse return null;
-            if (t.state == .blocked) {
-                t.state = .ready;
+            if (sched_claim.load(&t.state) == .blocked) {
+                sched_claim.store(&t.state, .ready);
                 t.wait_queue = null;
                 if (per_cpu.isAnyReady()) _ = per_cpu.enqueueTask(t);
             }
@@ -937,8 +1341,8 @@ pub fn wakeAll(queue: *?*task.WaitNode) void {
             current = node.next;
             continue;
         };
-        if (t.state == .blocked) {
-            t.state = .ready;
+        if (sched_claim.load(&t.state) == .blocked) {
+            sched_claim.store(&t.state, .ready);
             t.wait_queue = null;
             if (per_cpu.isAnyReady()) _ = per_cpu.enqueueTask(t);
         }

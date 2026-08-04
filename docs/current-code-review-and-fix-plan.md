@@ -1623,6 +1623,20 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 ---
 
+### 6.10 基础设施补完·第六轮（2026-08-06）
+
+| 阶段 | 内容 | 验证 |
+|---|---|---|
+| J1 | **SMP 并发压测 hello50**：4 worker 跨核并行（tmpfs 写读删/pipe/loopback UDP/mmap 循环，迭代相关模式字校验），纳入 init 序列与 smoke 门槛 | SMP=1/2/4 |
+| J1 战果 | hello50 揪出三个深藏内核 bug：① **AP 启动从未设置 CR0.WP**——AP 上内核写绕过页写保护，copyToUser 直写共享 COW 帧（"tmpfs verify" 损坏真相，SMP=1 从不触发因 BSP 有 WP）；② UDP 端口索引 TOCTOU（查用分离两个临界区，releasePort swap-remove 重排后投错队列）；③ FPU lazy-switch 不防迁移（`fpu_owned` 单布尔跨核误判 → fxsave 丢失、fxrstor 陈旧重放）+ popRunnable 缺亲和检查（AFFDIAG 实锤 tid=69 pin=0 cpu=2） | 修复后 8/8 SMP=4 全绿、AFFDIAG=0 |
+| J2 | **sched_lock 细化（性能核心）**：Task.state 原子认领协议（`sched_claim.zig` 纯模块，cmpxchg ready→running 独占任务），pick/pop 走队列锁+认领，anchor/CR3 切换仅在认领成功后；老任务最后发布以收窄双栈窗口；`sched_fine_grain_enable` 编译期回退门控（旧全局锁路径 `timerTickLegacy` 逐字节保留）；stats/计数路径原子化 | 89/89 host 测试；smoke SMP=1/4；**stress SMP=4 十连全绿** |
+| J3 | kmsg 阻塞读：`kmsgReadOrBlock`（锁内读+阻塞注册防丢唤醒），append 时 ISR 安全 wakeOne + epollNotify；epoll 按游标真实上报 EPOLLIN（修掉恒 EPOLLIN 忙等）；syslogd 去轮询改事件驱动；hello47 改 O_NONBLOCK（G4 行为变更适配） | hello47/50 PASS |
+| 顺带 | unlink #111 路由 tmpfs（hello50 暴露）；waitpid 等信号协议在新增阻塞点保持一致 | smoke |
+
+**仍遗留**：timerTick 切换路径的旧任务内核栈窗口已收窄但未完全消除（sched.zig:469-491 注释）；tryStealTask 死代码（若启用需补 onContextSwitch）；fork COW 降级仅本地 invlpg（PCID no-flush 重入下理论窗口，未触发）；drivers/ 用户态驱动框架；真实硬件 PCID 验证。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:
