@@ -1832,3 +1832,126 @@ test "K2: batching parameters are consistent" {
     try std.testing.expect(slab_mag.FLUSH_BATCH < slab_mag.MAG_SIZE); // post-flush push always fits
 }
 // ─── end slab magazine (K2) ───
+
+
+// ─── user driver framework (L1) ───
+const userdrv_core = kt.userdrv_core;
+
+test "L1: dev_map_mmio request validation" {
+    // Well-formed MMIO request (e1000 BAR0-shaped): aligned, 128 KiB.
+    try std.testing.expectEqual(@as(i64, 0), userdrv_core.validateMmioRequest(0xFEBC0000, 0x20000));
+    // Exactly the 16 MiB cap is accepted; one byte past it is not.
+    try std.testing.expectEqual(@as(i64, 0), userdrv_core.validateMmioRequest(0x100000, userdrv_core.MMIO_MAX_SIZE));
+    try std.testing.expectEqual(errno.EINVAL, userdrv_core.validateMmioRequest(0x100000, userdrv_core.MMIO_MAX_SIZE + 1));
+    // Zero size and non-page-aligned phys are rejected.
+    try std.testing.expectEqual(errno.EINVAL, userdrv_core.validateMmioRequest(0xFEBC0000, 0));
+    try std.testing.expectEqual(errno.EINVAL, userdrv_core.validateMmioRequest(0xFEBC0123, 0x1000));
+    // phys + size must not wrap the 64-bit address space.
+    try std.testing.expectEqual(errno.EINVAL, userdrv_core.validateMmioRequest(0xFFFFFFFFFFFFF000, 0x2000));
+    try std.testing.expectEqual(errno.EINVAL, userdrv_core.validateMmioRequest(0xFFFFFFFFFFFFF000, 0x1000));
+}
+
+test "L1: MMIO-vs-RAM overlap detection" {
+    // Fake machine: RAM is [0, 128 MiB), everything above is fair game.
+    const ram = [_]userdrv_core.PhysRange{.{ .base = 0, .len = 0x8000000 }};
+    // e1000 BAR0 / IOAPIC / LAPIC windows are not RAM.
+    try std.testing.expect(!userdrv_core.overlapsRamRanges(&ram, 0xFEBC0000, 0x20000));
+    try std.testing.expect(!userdrv_core.overlapsRamRanges(&ram, 0xFEC00000, 0x1000));
+    try std.testing.expect(!userdrv_core.overlapsRamRanges(&ram, 0xFEE00000, 0x1000));
+    // Plain RAM is rejected, including a range that only straddles the top.
+    try std.testing.expect(userdrv_core.overlapsRamRanges(&ram, 0x100000, 0x1000));
+    try std.testing.expect(userdrv_core.overlapsRamRanges(&ram, 0x7FFF000, 0x2000));
+    try std.testing.expect(userdrv_core.overlapsRamRanges(&ram, 0, 0x1000));
+    // Touching-but-not-overlapping (base == RAM top) is allowed.
+    try std.testing.expect(!userdrv_core.overlapsRamRanges(&ram, 0x8000000, 0x1000));
+    // Disjoint ranges in the list are each consulted.
+    const ram2 = [_]userdrv_core.PhysRange{
+        .{ .base = 0, .len = 0x9FC00 },
+        .{ .base = 0x100000, .len = 0x7F00000 },
+    };
+    // The EBDA hole between the two RAM pieces is not RAM.
+    try std.testing.expect(!userdrv_core.overlapsRamRanges(&ram2, 0x9FC00, 0x1000));
+    try std.testing.expect(userdrv_core.overlapsRamRanges(&ram2, 0x200000, 0x1000));
+}
+
+test "L1: IRQ table register/unregister/edge accounting" {
+    var table: userdrv_core.IrqTable = .{};
+
+    // A free GSI registers fine; the keyboard line is kernel-owned.
+    const slot = try table.registerIrq(10, 7, false);
+    try std.testing.expect(slot < userdrv_core.MAX_IRQ_SLOTS);
+    try std.testing.expectError(error.KernelOwned, table.registerIrq(1, 7, true));
+    // PIC-only routing: GSI >= 16 cannot be routed without an IOAPIC.
+    try std.testing.expectError(error.Invalid, table.registerIrq(16, 7, false));
+    // Same GSI twice (any owner) is busy.
+    try std.testing.expectError(error.Busy, table.registerIrq(10, 8, false));
+
+    // Edge counting is per-GSI and saturates instead of wrapping.
+    try std.testing.expect(table.recordEdge(10));
+    try std.testing.expect(table.recordEdge(10));
+    try std.testing.expect(!table.recordEdge(9)); // not registered
+    try std.testing.expectEqual(@as(u64, 2), table.find(10).?.edge_count);
+    table.find(10).?.edge_count = std.math.maxInt(u64);
+    try std.testing.expect(table.recordEdge(10));
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), table.find(10).?.edge_count);
+
+    // Only the owning task may unregister.
+    try std.testing.expect(!table.unregisterIrq(10, 8));
+    try std.testing.expect(table.unregisterIrq(10, 7));
+    try std.testing.expect(!table.unregisterIrq(10, 7)); // already gone
+    try std.testing.expect(table.find(10) == null);
+
+    // The table holds exactly MAX_IRQ_SLOTS registrations.
+    for (0..userdrv_core.MAX_IRQ_SLOTS) |i| {
+        _ = try table.registerIrq(@intCast(3 + i), 7, false);
+    }
+    try std.testing.expectError(error.Full, table.registerIrq(15, 7, false));
+
+    // Bulk release on task exit frees exactly that task's slots.
+    try std.testing.expect(table.unregisterIrq(3, 7)); // make room
+    _ = try table.registerIrq(0, 9, false); // owner 9 keeps its slot
+    var released: [userdrv_core.MAX_IRQ_SLOTS]u8 = @splat(0xFF);
+    const n = table.releaseAllForTask(7, &released);
+    try std.testing.expectEqual(@as(u32, userdrv_core.MAX_IRQ_SLOTS - 1), n);
+    try std.testing.expect(table.find(4) == null);
+    try std.testing.expect(table.find(0) != null); // other owner untouched
+    for (released[0..n]) |gsi| try std.testing.expect(gsi != 0xFF and gsi != 0);
+}
+
+test "L1: dev_dma_alloc size validation" {
+    try std.testing.expectEqual(@as(i64, 0), userdrv_core.validateDmaSize(4096));
+    try std.testing.expectEqual(@as(i64, 0), userdrv_core.validateDmaSize(1));
+    try std.testing.expectEqual(@as(i64, 0), userdrv_core.validateDmaSize(userdrv_core.DMA_MAX_SIZE));
+    try std.testing.expectEqual(errno.EINVAL, userdrv_core.validateDmaSize(0));
+    try std.testing.expectEqual(errno.EINVAL, userdrv_core.validateDmaSize(userdrv_core.DMA_MAX_SIZE + 1));
+}
+
+test "L1: /dev/pci listing format" {
+    const devs = [_]userdrv_core.PciInfo{
+        .{
+            .bus = 0, .device = 0, .function = 0,
+            .vendor_id = 0x8086, .device_id = 0x1237,
+            .class_code = 0x06, .subclass = 0x00, .irq_line = 0,
+            .bars = .{ 0, 0, 0, 0, 0, 0 }, .bar_sizes = .{ 0, 0, 0, 0, 0, 0 },
+        },
+        .{
+            .bus = 0, .device = 3, .function = 0,
+            .vendor_id = 0x8086, .device_id = 0x100e,
+            .class_code = 0x02, .subclass = 0x00, .irq_line = 11,
+            .bars = .{ 0xFEBC0000, 0xC040, 0, 0, 0, 0 },
+            .bar_sizes = .{ 0x20000, 0x40, 0, 0, 0, 0 },
+        },
+    };
+    var buf: [512]u8 = undefined;
+    const n = userdrv_core.genPciListing(&devs, &buf);
+    try std.testing.expectEqualStrings(
+        "00:00.0 8086:1237 class=06:00 irq=0\n" ++
+            "00:03.0 8086:100e class=02:00 irq=11 bar0=febc0000+00020000 bar1=0000c040+00000040\n",
+        buf[0..n],
+    );
+    // A tiny output buffer truncates cleanly (never overruns).
+    var tiny: [8]u8 = undefined;
+    const tn = userdrv_core.genPciListing(&devs, &tiny);
+    try std.testing.expect(tn <= tiny.len);
+}
+// ─── end user driver framework (L1) ───

@@ -38,3 +38,4 @@ pub const huge_user = @import("mm/huge_user.zig");
 pub const nvme_queue = @import("drivers/nvme_queue.zig");
 pub const slab_mag = @import("mm/slab_mag.zig");
 pub const dcache = @import("fs/dcache.zig");
+pub const userdrv_core = @import("drivers/userdrv_core.zig");

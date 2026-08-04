@@ -402,6 +402,10 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32, kmsg_cursor: u64
         .ramdisk_file, .fat32_file, .ext2_file, .proc_file => {
             revents |= EPOLLIN | EPOLLOUT;
         },
+        .pci => {
+            // Read-only snapshot: always readable, never writable.
+            revents |= EPOLLIN;
+        },
         .epoll => {
             const inst = getInstance(resource_idx) orelse return EPOLLERR;
             if (inst.ready_head != null) revents |= EPOLLIN;

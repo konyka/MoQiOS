@@ -31,6 +31,50 @@ var min_alloc_page: u64 = 512;
 var arena_mode: bool = false;
 var arena_base: u64 = 0;
 
+// ─── L1: recorded RAM ranges (user driver framework MMIO validation) ───
+/// Half-open physical ranges the boot memmap reported as RAM-like (usable,
+/// kernel/modules, reclaimable). Used by `isRamPhys` to decide whether a
+/// physical range may be handed to userspace as device MMIO.
+pub const RamRange = struct { base: u64, len: u64 };
+pub const MAX_RAM_RANGES: u32 = 48;
+var ram_ranges: [MAX_RAM_RANGES]RamRange = undefined;
+var ram_range_count: u32 = 0;
+
+fn recordRamRange(base: u64, len: u64) void {
+    if (len == 0 or ram_range_count >= MAX_RAM_RANGES) return;
+    ram_ranges[ram_range_count] = .{ .base = base, .len = len };
+    ram_range_count += 1;
+}
+
+/// The recorded boot-time RAM ranges (for the host-tested overlap logic in
+/// drivers/userdrv_core.zig).
+pub fn ramRanges() []const RamRange {
+    return ram_ranges[0..ram_range_count];
+}
+
+/// L1: heuristic "is this physical address RAM" predicate.
+///
+/// True when the address lies in a recorded boot RAM range (covers free RAM,
+/// allocated RAM, the kernel image and reclaimable regions) or names a
+/// managed frame that is currently free/allocated in the bitmap. MMIO apertures
+/// (PCI BARs, LAPIC/IOAPIC windows) are reserved memmap holes: never recorded
+/// and never bitmap-managed, so they read as non-RAM.
+///
+/// Lock-free by design (called from teardown loops and syscall validation):
+/// the answer is stable for MMIO holes, and a racing free/alloc of a RAM frame
+/// can only ever flip the answer towards "RAM", which is the safe direction
+/// for the map-MMIO rejection path. Limits: RAM the memmap did not report as
+/// RAM-like (e.g. a framebuffer inside a "usable" entry) is treated as RAM —
+/// such regions cannot be mapped with dev_map_mmio.
+pub fn isRamPhys(phys: u64) bool {
+    for (ram_ranges[0..ram_range_count]) |r| {
+        if (phys >= r.base and phys - r.base < r.len) return true;
+    }
+    const page = pageFromPhys(phys);
+    if (page < total_pages and (isBitSet(page) or ref_counts[page] > 0)) return true;
+    return false;
+}
+
 fn physFromPage(page: u64) u64 {
     if (arena_mode) return arena_base + page * PAGE_SIZE;
     return page * PAGE_SIZE;
@@ -68,12 +112,16 @@ pub fn init(memmap: *const limine.MemmapResponse) void {
 
     // Pass 1: find highest usable physical address
     highest_phys = 0;
+    ram_range_count = 0;
     for (0..entry_count) |i| {
         const entry = entries[i];
         const top = entry.base + entry.length;
         switch (entry.kind) {
             .usable, .bootloader_reclaimable, .kernel_and_modules, .acpi_reclaimable => {
                 if (top > highest_phys) highest_phys = top;
+                // L1: remember every RAM-like range so dev_map_mmio can reject
+                // user mappings of real memory (kernel image included).
+                recordRamRange(entry.base, entry.length);
             },
             else => {},
         }
@@ -187,6 +235,8 @@ pub fn initArena(phys_base: u64, length: u64) void {
     arena_base = phys_base;
     min_alloc_page = 0;
     highest_phys = phys_base + length;
+    ram_range_count = 0;
+    recordRamRange(phys_base, length);
 
     total_pages = length / PAGE_SIZE;
     if (total_pages == 0) {

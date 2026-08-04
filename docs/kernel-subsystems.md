@@ -1373,6 +1373,63 @@ const SysCap = packed struct {
   `fs_lock` → 驱动 `io_lock`，单向）；writeback flush 规则（writeback
   调用前释放 `fs_lock`）不适用，因为 discard 不会重入文件系统
 
+### 6.10 用户态驱动框架 v1（L1）✅
+
+文件: `kernel/drivers/userdrv.zig`（内核胶水）、`kernel/drivers/userdrv_core.zig`
+（纯逻辑，主机单测）、`user/hello51.c`（端到端运行时验证）
+
+持有 `CAP_SYS_RAWIO`（`SysCap` bit 16，`ALL_CAPS` 默认包含）的任务可以把
+PCI 设备完全搬到用户态驱动。系统调用号 #477–#482（MoQiOS 自定义，接在
+F3 的 #473–#476 之后）：
+
+| 号 | 调用 | 语义 |
+|----|------|------|
+| 477 | `dev_map_mmio(phys, size)` | 映射设备 MMIO 窗口到调用者地址空间，返回用户 VA |
+| 478 | `dev_irq_register(gsi)` | 认领一条 legacy IRQ 线（GSI 0–15） |
+| 479 | `dev_irq_wait(gsi, timeout_ms)` | 阻塞等待中断沿；返回沿计数增量，超时 `-ETIMEDOUT`，信号 `-EINTR` |
+| 480 | `dev_irq_unregister(gsi)` | 释放并重新屏蔽该 IRQ 线 |
+| 481 | `dev_dma_alloc(size, out_ptr)` | 分配物理连续 DMA 缓冲并映射到用户态，向用户结构体写 `{user_va, phys}` |
+| 482 | `dev_dma_free(user_va)` | 释放 DMA 缓冲（解除映射 + `dma.freeCoherent`） |
+
+`/dev/pci`（新 `FdType.pci=19`）提供只读 PCI 枚举快照，procfs 风格每次
+read 重新生成：`00:03.0 8086:100e class=02:00 irq=11 bar0=febc0000+00020000`
+（BAR 为 `<物理地址>+<大小>` 十六进制，0 值 BAR 省略）。open 处检查
+`CAP_SYS_RAWIO`。
+
+**MMIO-vs-RAM 校验设计**：`pmm.isRamPhys(phys)` 是无锁启发式谓词——命中
+启动 memmap 记录的 RAM 类范围（usable / kernel_and_modules /
+bootloader_reclaimable / acpi_reclaimable，`pmm.init` 时录入最多 48 条）
+或位图内空闲/已分配帧即判为 RAM。MMIO 空洞（PCI BAR、LAPIC/IOAPIC 窗口）
+在 memmap 中是保留区、从不进入位图管理，因此判为非 RAM 放行。
+`dev_map_mmio` 先过 `validateMmioRequest`（size ∈ (0, 16MiB]、phys 页对齐、
+phys+size 不回绕），再逐页 `isRamPhys` 拒绝（`-EACCES`）。已知限制：
+framebuffer 若被 Limine 报为 usable 则同样被拒绝（v1 不接受）；
+谓词对「memmap 未如实报告」的 RAM 无能为力。
+
+**no_free 记账（最危险的账目点）**：MMIO 帧不是 PMM 帧，绝不能进空闲池。
+`MmapRegion` 新增 `no_free` 标志，`dev_map_mmio`/`dev_dma_alloc` 经
+`mmap.trackNoFreeRegion` 登记（同时 `locked=true` 防换出）；
+`unmapRange` 对 no_free 区域的页只解映射不 `freePageBatch`；
+`trackMmapRegion` 的匿名合并跳过 no_free 邻居；`untrackMmapRange`
+分裂时向两侧传播该标志。fork 的 COW 克隆对 `!isRamPhys` 帧跳过
+addRef 与 COW 降级（原样复制 PTE，父子共享设备映射）。退出/exec 时
+`userdrv.cleanupTask(t, pml4)`（挂在两个 reap 点与 execve 换址前）
+解映射全部 no_free 页、释放 IRQ 注册与 DMA 缓冲，因此
+`destroyUserSpace` 的页表遍历永远看不到设备帧；即便漏网，
+`freePageBatch` 对 refcount==0 的帧静默跳过兜底。
+
+**IRQ 路径**：无 IOAPIC 驱动，v1 仅支持 PIC 路由的 GSI 0–15（向量
+32+gsi）；内核占用线（键盘 1、级联 2、活动 e1000/virtio-net 的 IRQ）
+拒绝注册（`-EBUSY`）。`idt.handleIrq` 先查 userdrv 表：命中则计边沿 +
+EOI + 跳过内核驱动处理程序。等待用 TSC 纳秒截止 + `sti; hlt` 轮询
+（沿用 waitpid 模式），信号走 `pendingFatal`/`pendingActionable` 协议。
+
+运行时证明 `hello51`：读 `/dev/pci` 找到 e1000 → 映射 BAR0 → 读
+STATUS(0x0008) 非零、RAL/RAH(0x5400/0x5404) 回读 MAC ==
+52:54:00:12:34:56（内核启动时打印的值）→ 内核占用 GSI 注册返回
+`-EBUSY`、空闲 GSI 10 注册/50ms 超时（`-ETIMEDOUT`）/注销语义 →
+DMA 分配/校验/释放 → munmap MMIO。标记：`hello51: PASS` / `hello51 done`。
+
 ---
 
 ## 7. 同步原语

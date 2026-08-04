@@ -47,6 +47,8 @@ pub const FdType = enum(u8) {
     inotify = 16,
     raw_socket = 17,
     kmsg = 18,
+    /// L1: read-only PCI enumeration snapshot (user driver framework).
+    pci = 19,
 };
 
 pub const PIPE_BUF_SIZE: u32 = 4096;
@@ -333,6 +335,28 @@ pub const FdTable = struct {
             self.fds[slot] = .{
                 .fd_type = .kmsg,
                 // offset is the absolute ring cursor; 0 = oldest available.
+                .offset = 0,
+                .writable = false,
+                .status_flags = status,
+            };
+            return @intCast(slot);
+        }
+
+        // /dev/pci — read-only PCI enumeration snapshot (L1 user driver
+        // framework). Raw device topology is gated behind CAP_SYS_RAWIO.
+        if (name.len == 8 and name[0] == '/' and name[1] == 'd' and name[2] == 'e' and name[3] == 'v' and name[4] == '/' and
+            name[5] == 'p' and name[6] == 'c' and name[7] == 'i')
+        {
+            {
+                const sched = @import("../proc/sched.zig");
+                const task_mod = @import("../proc/task.zig");
+                const cap_check = @import("../proc/cap_check.zig");
+                const cur_idx = sched.currentTaskIndex() orelse return -1;
+                const cur = task_mod.getTask(cur_idx) orelse return -1;
+                if (!cap_check.capable(cur, "cap_sys_rawio")) return -1; // EPERM
+            }
+            self.fds[slot] = .{
+                .fd_type = .pci,
                 .offset = 0,
                 .writable = false,
                 .status_flags = status,
@@ -642,6 +666,19 @@ pub const FdTable = struct {
                 @memcpy(buf[0..to_read], kbuf[0..to_read]);
                 return @intCast(to_read);
             },
+            .pci => {
+                // L1: regenerate the enumeration snapshot on every read,
+                // procfs-style — the table is small and reads are rare.
+                const userdrv = @import("../drivers/userdrv.zig");
+                var scratch: [8192]u8 = undefined;
+                const generated = userdrv.pciGenerate(&scratch);
+                if (desc.offset >= generated) return 0;
+                const avail = generated - @as(u32, @intCast(desc.offset));
+                const to_copy = @min(@as(u32, @intCast(count)), avail);
+                @memcpy(buf[0..to_copy], scratch[@as(u32, @intCast(desc.offset))..@as(u32, @intCast(desc.offset)) + to_copy]);
+                desc.offset += to_copy;
+                return @intCast(to_copy);
+            },
             .tmpfs_file => {
                 const tmpfs = @import("tmpfs.zig");
                 if (desc.offset >= desc.file_size) return 0;
@@ -786,6 +823,7 @@ pub const FdTable = struct {
             .timerfd => return -1, // timerfd is read-only
             .random => return -1, // random is read-only
             .kmsg => return -1, // kmsg is read-only
+            .pci => return -1, // /dev/pci is read-only
             .tmpfs_file => {
                 if (!desc.writable) return -1;
                 if ((desc.status_flags & 0x400) != 0) desc.offset = desc.file_size;
@@ -870,6 +908,17 @@ pub const FdTable = struct {
                 return @intCast(to_copy);
             },
             .random => return -29, // ESPIPE - /dev/urandom doesn't support offset
+            .pci => {
+                // pread on /dev/pci: same regenerated snapshot, explicit offset.
+                const userdrv = @import("../drivers/userdrv.zig");
+                var scratch: [8192]u8 = undefined;
+                const generated = userdrv.pciGenerate(&scratch);
+                if (offset >= generated) return 0;
+                const avail = generated - @as(u32, @intCast(offset));
+                const to_copy = @min(@as(u32, @intCast(count)), avail);
+                @memcpy(buf[0..to_copy], scratch[@as(u32, @intCast(offset))..@as(u32, @intCast(offset)) + to_copy]);
+                return @intCast(to_copy);
+            },
             .kmsg => {
                 // pread on /dev/kmsg: offset is an absolute ring cursor
                 // (0 = oldest available); the fd's own offset is untouched.
@@ -896,6 +945,7 @@ pub const FdTable = struct {
             .ramdisk_file => return -1, // ramdisk is read-only
             .random => return -29, // ESPIPE
             .kmsg => return -1, // kmsg is read-only
+            .pci => return -1, // /dev/pci is read-only
             .proc_file => return -1, // proc files are read-only
             .fat32_file => {
                 if (!desc.writable) return -9; // EBADF

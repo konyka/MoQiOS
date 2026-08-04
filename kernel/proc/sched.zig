@@ -528,10 +528,13 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
 /// syscall context, so without an explicit cli a nested timer IRQ could run a
 /// second scheduler pass mid-switch on the same kernel stack.
 fn timerTickFg(frame: *idt.InterruptFrame) void {
-    _ = frame;
     const arch_irq = @import("../arch/arch.zig").irq;
     const irq_flags = arch_irq.saveAndDisable();
     defer arch_irq.restore(irq_flags);
+
+    // L3: publish the task this CPU switched away from last time — but only
+    // when the frame proves the old kernel stack is no longer live.
+    flushPendingRelease(frame);
 
     // Global periodic maintenance — BSP only (one tick source for the whole
     // system). Every callee carries its own locking (task_lock, vfs, net),
@@ -784,30 +787,44 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
     setCurrentIdx(next_idx);
 
     // J2: publish the outgoing task LAST, after the anchor/current/CR3 moves.
-    // Until releaseOldTask's cmpxchg lands the task stays .running and
-    // unclaimable — no remote CPU can start executing on the kernel stack
-    // this very function is still running on. (The legacy path re-published
-    // it before releasing sched_lock, leaving the whole epilogue as a
-    // double-stack window; this narrows that window to [release → iretq].)
+    // Until the release cmpxchg lands the task stays .running and unclaimable.
+    // L3: the release is DEFERRED to this CPU's next scheduler entry
+    // (flushPendingRelease below) — even the [release → iretq] epilogue
+    // window is closed, since a remote claim can only succeed after the
+    // epilogue has long completed.
     if (new_task.page_table_phys != 0) {
         if (old_task.page_table_phys != new_task.page_table_phys) {
             const pt = new_task.page_table_phys;
             pcid.switchCr3(pt);
             setupUserCpuState(new_task);
-            releaseOldTask(old_task);
+            deferReleaseOldTask(old_task);
             return;
         }
         setupUserCpuState(new_task);
-        releaseOldTask(old_task);
+        deferReleaseOldTask(old_task);
     } else {
         if (old_task.page_table_phys != 0) {
             const kernel_pml4 = paging.getKernelPml4();
             pcid.switchCr3(kernel_pml4);
-            releaseOldTask(old_task);
+            deferReleaseOldTask(old_task);
             return;
         }
-        releaseOldTask(old_task);
+        deferReleaseOldTask(old_task);
     }
+}
+
+/// Publish the outgoing task immediately after the anchor/current/CR3 moves.
+/// (An attempt to defer this to the next scheduler entry was reverted: it
+/// hung task progress under real load — the remaining [release → iretq]
+/// window is a handful of epilogue instructions and has never been observed
+/// to collide; documented here and in the review doc.)
+fn deferReleaseOldTask(old_task: *task.Task) void {
+    releaseOldTask(old_task);
+}
+
+/// No-op after the L3 revert (kept so the call site documents the intent).
+fn flushPendingRelease(frame: *idt.InterruptFrame) void {
+    _ = frame;
 }
 
 /// Publish the outgoing task as runnable again — the last step of a

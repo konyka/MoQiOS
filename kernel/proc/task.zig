@@ -278,6 +278,13 @@ pub const MmapRegion = struct {
     file_data: u64 = 0,
     /// Page-cache key (ext2/fat32).
     inode_id: u64 = 0,
+
+    /// L1: the frames backing this region are NOT PMM-owned RAM (user-MMIO
+    /// from dev_map_mmio, or DMA frames owned by the user driver framework).
+    /// unmapRange must unmap such pages without returning their frames to
+    /// the PMM; the owner (userdrv) releases DMA frames itself, and MMIO
+    /// frames are never freed at all.
+    no_free: bool = false,
 };
 
 pub const MAX_TASKS: u32 = 64;
@@ -767,6 +774,9 @@ pub fn reapZombies() u32 {
         }
 
         if (t.page_table_phys != 0) {
+            // L1: release user-driver resources (IRQ registrations, DMA
+            // buffers, MMIO mappings) before the address space walk.
+            @import("../drivers/userdrv.zig").cleanupTask(t, t.page_table_phys);
             // G2: release file-region backing refs before the address space
             // (destroyUserSpace walks page tables, not region metadata).
             @import("../mm/mmap.zig").releaseFileRefs(t);
@@ -1022,6 +1032,9 @@ pub fn waitpid(parent_idx: u32, pid: i32, status: *i32) ?u32 {
             status.* = t.exit_code;
             const child_tid = t.tid;
             if (t.page_table_phys != 0) {
+                // L1: release user-driver resources (IRQ registrations, DMA
+                // buffers, MMIO mappings) before the address space walk.
+                @import("../drivers/userdrv.zig").cleanupTask(t, t.page_table_phys);
                 // G2: release file-region backing refs before the address space.
                 @import("../mm/mmap.zig").releaseFileRefs(t);
                 @import("../mm/user_space.zig").destroyUserSpace(t.page_table_phys);

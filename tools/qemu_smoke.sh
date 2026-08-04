@@ -249,6 +249,8 @@ while [ "$SECONDS" -lt "$deadline" ]; do
         grep -q "hello49 done" "$LOG_FILE" &&
         grep -q "hello50: PASS" "$LOG_FILE" &&
         grep -q "hello50 done" "$LOG_FILE" &&
+        grep -q "hello51: PASS" "$LOG_FILE" &&
+        grep -q "hello51 done" "$LOG_FILE" &&
         grep -q "\[syslogd\] started" "$LOG_FILE" &&
         grep -q "\[DHCP\] " "$LOG_FILE" &&
        grep -q "MoQiOS shell" "$LOG_FILE" &&
@@ -268,7 +270,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for smoke markers."
-echo "Expected serial markers: '[NVMe] MSI-X interrupts enabled', init PASS markers, 'hello32: SIGSEGV PASS', 'hello38: PASS (futex EFAULT/waitv validation)', 'hello39: PASS (socket option faults/address lengths)', 'hello40: PASS (IPC_SET and rt_sigsuspend EFAULT)', 'hello41: PASS', 'hello42: PASS', 'hello42 done', 'hello43: PASS', 'hello43 done', 'hello44: PASS', 'hello44 done', 'hello45: PASS', 'hello45 done', 'hello46: PASS', 'hello46 done', 'hello47: PASS', 'hello47 done', 'hello48: PASS', 'hello48 done', 'hello49: PASS', 'hello49 done', 'hello50: PASS', 'hello50 done', '[syslogd] started', '[DHCP] ', 'MoQiOS shell', '[SMP] ${SMP_COUNT} CPUs detected', '[SMP] ${SMP_COUNT} CPUs selected', and '[SMP] ${SMP_COUNT} CPUs online'."
+echo "Expected serial markers: '[NVMe] MSI-X interrupts enabled', init PASS markers, 'hello32: SIGSEGV PASS', 'hello38: PASS (futex EFAULT/waitv validation)', 'hello39: PASS (socket option faults/address lengths)', 'hello40: PASS (IPC_SET and rt_sigsuspend EFAULT)', 'hello41: PASS', 'hello42: PASS', 'hello42 done', 'hello43: PASS', 'hello43 done', 'hello44: PASS', 'hello44 done', 'hello45: PASS', 'hello45 done', 'hello46: PASS', 'hello46 done', 'hello47: PASS', 'hello47 done', 'hello48: PASS', 'hello48 done', 'hello49: PASS', 'hello49 done', 'hello50: PASS', 'hello50 done', 'hello51: PASS', 'hello51 done', '[syslogd] started', '[DHCP] ', 'MoQiOS shell', '[SMP] ${SMP_COUNT} CPUs detected', '[SMP] ${SMP_COUNT} CPUs selected', and '[SMP] ${SMP_COUNT} CPUs online'."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

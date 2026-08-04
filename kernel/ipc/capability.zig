@@ -131,7 +131,10 @@ pub const SysCap = packed struct(u32) {
     cap_sys_resource: bool = false,
     cap_net_admin: bool = false,
     cap_ipc_lock: bool = false,
-    _pad: u16 = 0,
+    /// Raw device access: dev_map_mmio / dev_irq_* / dev_dma_* and /dev/pci
+    /// (L1 user driver framework).
+    cap_sys_rawio: bool = false,
+    _pad: u15 = 0,
 };
 
 /// All capabilities enabled (for init/root processes).
@@ -152,6 +155,7 @@ pub const ALL_CAPS: SysCap = .{
     .cap_sys_resource = true,
     .cap_net_admin = true,
     .cap_ipc_lock = true,
+    .cap_sys_rawio = true,
 };
 
 /// No capabilities (for unprivileged processes).

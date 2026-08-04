@@ -2402,6 +2402,27 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         476 => { // sched_get_priority_min(policy)
             frame.rax = @bitCast(syscallSchedGetPriorityMin(@truncate(frame.rdi)));
         },
+        // ── L1: userspace driver framework (kernel/drivers/userdrv.zig) ────
+        // MoQiOS-specific numbers, next free after the F3 block (#473-#476).
+        // All six require CAP_SYS_RAWIO (checked inside userdrv).
+        477 => { // dev_map_mmio(phys, size) -> user VA
+            frame.rax = @bitCast(@import("../../drivers/userdrv.zig").syscallDevMapMmio(frame.rdi, frame.rsi));
+        },
+        478 => { // dev_irq_register(gsi)
+            frame.rax = @bitCast(@import("../../drivers/userdrv.zig").syscallDevIrqRegister(frame.rdi));
+        },
+        479 => { // dev_irq_wait(gsi, timeout_ms)
+            frame.rax = @bitCast(@import("../../drivers/userdrv.zig").syscallDevIrqWait(frame.rdi, frame.rsi));
+        },
+        480 => { // dev_irq_unregister(gsi)
+            frame.rax = @bitCast(@import("../../drivers/userdrv.zig").syscallDevIrqUnregister(frame.rdi));
+        },
+        481 => { // dev_dma_alloc(size, out_ptr{user_va, phys})
+            frame.rax = @bitCast(@import("../../drivers/userdrv.zig").syscallDevDmaAlloc(frame.rdi, frame.rsi));
+        },
+        482 => { // dev_dma_free(user_va)
+            frame.rax = @bitCast(@import("../../drivers/userdrv.zig").syscallDevDmaFree(frame.rdi));
+        },
         else => {
             serial.writeString("[syscall] unknown syscall: 0x");
             fmt.writeHex(syscall_nr);

@@ -1013,6 +1013,17 @@ fn handleLapicTimer(frame: *InterruptFrame) void {
 /// Handle legacy PIC IRQ (IRQ 0-15).
 fn handleIrq(frame: *InterruptFrame, irq: u8) void {
     _ = frame;
+    // L1: a user-owned line (dev_irq_register) gets its edge counted and an
+    // EOI — the kernel driver handlers below must NOT run for it.
+    {
+        const userdrv = @import("../../drivers/userdrv.zig");
+        if (userdrv.handleUserIrq(irq)) {
+            const io = @import("io.zig");
+            io.outb(0x20, 0x20); // EOI to master PIC
+            if (irq >= 8) io.outb(0xA0, 0x20); // EOI to slave PIC
+            return;
+        }
+    }
     if (irq == 1) {
         const keyboard = @import("../../drivers/keyboard.zig");
         keyboard.handleInterrupt();

@@ -115,6 +115,10 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
 
     // Switch to new address space
     @import("../arch/arch.zig").pcid.switchCr3(result.pml4);
+    // L1: the old image's user-driver resources (IRQ registrations, DMA
+    // buffers, MMIO mappings) die with it, before the address-space walk.
+    // cur.page_table_phys already points at the NEW space — pass the old one.
+    @import("../drivers/userdrv.zig").cleanupTask(cur, old_pml4);
     // G2: the old image's file mappings die with it — release their backing
     // refs (ext2 open slots) and clear the stale region table before the old
     // address space is destroyed.
@@ -249,6 +253,10 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64)
     syscall_entry.setUserTlsBase(0);
 
     @import("../arch/arch.zig").pcid.switchCr3(result.pml4);
+    // L1: the old image's user-driver resources (IRQ registrations, DMA
+    // buffers, MMIO mappings) die with it — cur.page_table_phys already
+    // points at the NEW space, so pass the old one explicitly.
+    @import("../drivers/userdrv.zig").cleanupTask(cur, old_pml4);
     // G2: the old image's file mappings die with it — release their backing
     // refs (ext2 open slots) and clear the stale region table before the old
     // address space is destroyed.

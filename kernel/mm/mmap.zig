@@ -70,6 +70,11 @@ pub fn unmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
     for (0..num_pages) |p| {
         const virt = base + p * 4096;
         if (paging_mod.unmapPage(task.page_table_phys, virt)) |phys| {
+            // L1: pages of a no_free region (user-MMIO / framework DMA) are
+            // unmapped but their frames are NEVER returned to the PMM — MMIO
+            // frames are device registers, DMA frames are released by
+            // userdrv's own accounting (dev_dma_free / cleanupTask).
+            if (isNoFreePage(task, virt)) continue;
             // Start new batch if this is the first frame.
             if (free_count == 0) {
                 batch_first_virt = virt;
@@ -103,6 +108,16 @@ pub fn unmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
     if (free_count > 0) {
         flushBatch(batch_first_virt, batch_last_virt, free_buf[0..free_count], task.page_table_phys);
     }
+}
+
+/// L1: true when `virt` belongs to an active no_free region (user-MMIO or
+/// framework DMA). Scans the region table — bounded by 64 entries.
+fn isNoFreePage(task: *task_mod.Task, virt: u64) bool {
+    for (task.mmap_regions) |r| {
+        if (!r.active or !r.no_free) continue;
+        if (virt >= r.base and virt - r.base < r.num_pages * user_space.PAGE_SIZE) return true;
+    }
+    return false;
 }
 
 /// Whether adding a disjoint range can be represented without dropping metadata.
@@ -168,7 +183,10 @@ fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, meta: ?Regio
     // Try to merge with an adjacent existing region (anonymous only)
     if (meta == null and huge_pages == 0) {
         for (&task.mmap_regions) |*r| {
-            if (!r.active or r.huge_pages != 0 or !filemap.canMergeAnon(r.file_kind, new_kind)) continue;
+            // L1: never merge into a no_free region — a merge would make the
+            // anonymous neighbour's frames inherit the no-free accounting
+            // (or vice versa) and corrupt PMM ownership.
+            if (!r.active or r.huge_pages != 0 or r.no_free or !filemap.canMergeAnon(r.file_kind, new_kind)) continue;
             if (r.base + r.num_pages * 4096 == base) {
                 r.num_pages += num_pages;
                 return;
@@ -291,6 +309,8 @@ fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
                         .active = true,
                         .locked = r.locked,
                         .huge_pages = tail_huge,
+                        // L1: a split no_free piece stays no_free on both sides.
+                        .no_free = r.no_free,
                         // G2: the tail piece keeps the same backing; it needs
                         // its own reference so either piece can be unmapped
                         // independently.
@@ -325,6 +345,49 @@ pub fn releaseFileRefs(task: *task_mod.Task) void {
         r.active = false;
     }
     task.mmap_count = 0;
+}
+
+// ─── L1: user driver framework helpers ──────────────────────────────────────
+// dev_map_mmio / dev_dma_alloc place eager, non-demand-paged mappings that
+// must still participate in munmap and placement bookkeeping. These wrappers
+// expose just enough of the region machinery without widening the invariants
+// (no merging, no demand faults) to the caller.
+
+/// Find `num_pages` of unmapped VA in the mmap window, or null.
+pub fn findFreeRangePub(task: *task_mod.Task, num_pages: u64) ?u64 {
+    return findFreeRangeFrom(task, user_space.USER_MMAP_BASE, num_pages, null);
+}
+
+/// True when a non-mergeable region of `num_pages` still fits the table.
+pub fn canTrackRegionPub(task: *task_mod.Task, base: u64, num_pages: u64) bool {
+    return canTrackMmapRegion(task, base, num_pages, false);
+}
+
+/// Track an already-mapped range as a no_free region (see MmapRegion.no_free).
+/// `locked` keeps swap/mlock accounting away from device memory. Capacity
+/// must have been checked with canTrackRegionPub first; returns false instead
+/// of overflowing the table.
+pub fn trackNoFreeRegion(task: *task_mod.Task, base: u64, num_pages: u64) bool {
+    for (&task.mmap_regions) |*r| {
+        if (!r.active) {
+            r.* = .{
+                .base = base,
+                .num_pages = num_pages,
+                .active = true,
+                .locked = true,
+                .no_free = true,
+            };
+            task.mmap_count += 1;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Drop the region bookkeeping for [base, base + num_pages*4096) without
+/// touching page tables (userdrv unmaps/frees the pages itself).
+pub fn untrackRangePub(task: *task_mod.Task, base: u64, num_pages: u64) void {
+    untrackMmapRange(task, base, num_pages);
 }
 
 fn rangesOverlap(a_base: u64, a_pages: u64, b_base: u64, b_pages: u64) bool {

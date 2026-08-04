@@ -107,6 +107,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello48");  /* MAP_SHARED file mappings (tmpfs/ext2/ramdisk) */
     run_test("hello49");  /* user 2MiB huge-page anonymous mmap */
     run_test("hello50");  /* SMP concurrent-workload stress (4 workers) */
+    run_test("hello51");  /* userspace driver framework (pci/mmio/irq/dma) */
 
     /* First resident system service: drains /dev/kmsg into /tmp/kern.log.
      * Never exits — do not waitpid it. */

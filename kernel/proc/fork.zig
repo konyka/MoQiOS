@@ -346,6 +346,11 @@ pub fn cloneUserPagesCow(parent_pml4_phys: u64, shared_regions: ?[]const @import
                 for (0..512) |pt_idx| {
                     const pte = parent_pt[pt_idx];
                     if (pte == 0 or pte & 1 == 0) continue;
+                    // L1: frames the PMM does not own (user-MMIO from
+                    // dev_map_mmio) are never ref-counted — an addRef would
+                    // later let a teardown freePage return a device-register
+                    // frame to the free pool.
+                    if (!pmm_mod.isRamPhys(pte & ADDR_MASK)) continue;
                     cow_phys[cow_count] = pte & ADDR_MASK;
                     cow_count += 1;
                     if (cow_count == 128) {
@@ -374,11 +379,16 @@ pub fn cloneUserPagesCow(parent_pml4_phys: u64, shared_regions: ?[]const @import
                     else
                         false;
 
+                    // L1: non-PMM frames (user-MMIO) are copied unchanged —
+                    // a COW downgrade would make device-register writes fault
+                    // into a private RAM copy in both parent and child.
+                    const raw_device = !pmm_mod.isRamPhys(pte & ADDR_MASK);
+
                     // Both sides hold the same entry, so derive it once. The
                     // child's used to be rebuilt as `phys | (pte & 0xFFF)`,
                     // which dropped NX at bit 63 and handed the child an
                     // executable stack and heap.
-                    const shared = if (keep_shared) pte else cow_pte_mod.sharedPte(pte);
+                    const shared = if (keep_shared or raw_device) pte else cow_pte_mod.sharedPte(pte);
 
                     // Downgrade the parent only when the entry actually changed;
                     // an already-COW or already-read-only page keeps its entry.

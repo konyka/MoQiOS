@@ -1650,6 +1650,20 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 ---
 
+### 6.12 基础设施补完·第八轮（2026-08-08）
+
+| 阶段 | 内容 | 验证 |
+|---|---|---|
+| L1 | **用户态驱动框架 v1**：新增 syscall #477-482——`dev_map_mmio`（MMIO 白名单校验：`pmm.isRamPhys` 拒绝 RAM 帧，防映射普通内存；`no_free` 区域标志保证 unmap 不误释放非 PMM 帧；fork COW 跳过非 RAM 帧）、`dev_irq_register/wait/unregister`（PIC GSI 0-15，内核占用互斥 EBUSY，edge 计数防丢，EINTR/超时协议）、`dev_dma_alloc/free`（coherent 分配 + 用户映射，exit 自动清理）；`/dev/pci` 枚举快照；全部入口 `CAP_SYS_RAWIO` 门控（在 ALL_CAPS 内，现状不变） | host 单测 + hello51 端到端 |
+| L2 | **hello51 端到端证明**：用户态程序经 /dev/pci 找到 e1000 → 映射 BAR0 → 读出 STATUS 与 MAC（52:54:00:12:34:56 与内核引导一致）；IRQ 注册/超时/注销语义；DMA 分配读写释放 | hello51 PASS 入 smoke 门槛 |
+| L3 | **timerTick 旧栈窗口**：评估并尝试延迟发布（pending_release + 入口 flush），实测导致任务活性回归（SMP=1 挂起），**已回退**为 J2 的即时发布——剩余 [release → iretq] 窗口为几条尾声指令、从未观测到碰撞，作为已接受窗口记录在代码注释与本文档 | 回退后全量验证 |
+
+**调试记录**：hello51 的 FREE_GSI=10 写死与本机 e1000 IRQ（10）冲突——改为扫描 /dev/pci 全部 irq= 行动态选空闲 GSI。
+
+**仍遗留**：tryStealTask 死代码；IOAPIC 缺失（GSI≥16 不可路由）；framebuffer 类 Limine-usable 内存被 MMIO 白名单拒绝（保守方向）；devmgr（设备节点管理）未做；真实硬件 PCID 验证；MAP_SHARED 弱语义注记。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:
