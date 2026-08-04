@@ -296,13 +296,17 @@ pub fn sendToV6(dst_ip: [16]u8, dst_port: u16, src_port: u16, data: [*]const u8,
     if (data_len > MAX_UDP_PAYLOAD_V6) return false;
 
     const nh = ndp.resolveNextHop(dst_ip);
-    const dst_mac = nh.mac orelse {
+    // K3: ::1 short-circuits NDP and the wire — loop back via lo.
+    const is_loop = netif.isLoopbackV6(dst_ip);
+    const dst_mac = if (is_loop) netif.getMac() else nh.mac orelse {
         if (nh.solicit) |t| icmpv6.sendNeighborSolicitation(t);
         return false;
     };
 
     const our_mac = netif.getMac();
-    const our_ip = ndp.selectSourceAddress(dst_ip, our_mac);
+    // Loopback: src = dst = ::1 (mirrors the IPv4 lo choice), keeping TX/RX
+    // pseudo-headers consistent on both sides.
+    const our_ip = if (is_loop) dst_ip else ndp.selectSourceAddress(dst_ip, our_mac);
     const udp_total: u16 = 8 + data_len;
     // SK-97/105: honor Path MTU (or armed oversized raise probe).
     if (ipv6.HEADER_LEN + udp_total > ipv6.getSendMtu(dst_ip)) return false;
@@ -324,7 +328,7 @@ pub fn sendToV6(dst_ip: [16]u8, dst_port: u16, src_port: u16, data: [*]const u8,
 
     ipv6.buildHeader(send_pkt[14..].ptr, our_ip, dst_ip, ipv6.PROTO_UDP, udp_total);
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + udp_total);
-    const ok = nic.sendPacket(&send_pkt, frame_len);
+    const ok = if (is_loop) lo.sendPacket(&send_pkt, frame_len) else nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.
     if (ok) ipv6.noteFullSizeSend(dst_ip, ipv6.HEADER_LEN + udp_total);
     return ok;

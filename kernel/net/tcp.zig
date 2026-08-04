@@ -976,15 +976,18 @@ fn sendSegmentV6Seq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16
     if (data_len > mssForTcb(tcb)) return false;
 
     const flags = decorateEcnFlags(tcb, flags_in, data_len);
+    // K3: ::1 short-circuits NDP and the wire — loop back via lo.
+    const is_loop = netif.isLoopbackV6(tcb.remote_ip6);
     const nh = ndp.resolveNextHop(tcb.remote_ip6);
-    const dst_mac = nh.mac orelse {
+    const dst_mac = if (is_loop) netif.getMac() else nh.mac orelse {
         if (nh.solicit) |t| icmpv6.sendNeighborSolicitation(t);
         tcpLog("[tcp] NDP resolution failed\n");
         return false;
     };
 
     const our_mac = netif.getMac();
-    const our_ip = ndp.selectSourceAddress(tcb.remote_ip6, our_mac);
+    // Loopback: src = dst = ::1 (mirrors the IPv4 lo choice).
+    const our_ip = if (is_loop) tcb.remote_ip6 else ndp.selectSourceAddress(tcb.remote_ip6, our_mac);
     // Only the header region needs zeroing (see sendSegmentSeq).
     var send_pkt: [1518]u8 = undefined;
     const tcp_off: u16 = 14 + ipv6.HEADER_LEN;
@@ -1000,7 +1003,7 @@ fn sendSegmentV6Seq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16
         if (tcb.accecn_ok) ipv6.setEct1(send_pkt[14..].ptr) else ipv6.setEct0(send_pkt[14..].ptr);
     }
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + tcp_total);
-    const ok = nic.sendPacket(&send_pkt, frame_len);
+    const ok = if (is_loop) lo_dev.sendPacket(&send_pkt, frame_len) else nic.sendPacket(&send_pkt, frame_len);
     if (!ok) return false; // TX failed: do not advance snd_nxt (segment never sent)
     // SK-104: full-MTU TX success can raise the Path MTU early.
     ipv6.noteFullSizeSend(tcb.remote_ip6, ipv6.HEADER_LEN + tcp_total);

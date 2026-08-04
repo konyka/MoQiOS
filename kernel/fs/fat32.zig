@@ -12,6 +12,7 @@ const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const fmt = @import("../lib/fmt.zig");
 const fat_util = @import("fat32_util.zig");
+const dcache = @import("dcache.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 pub const SECTOR_SIZE: u32 = 512;
@@ -355,24 +356,39 @@ fn listRootDir() void {
     serial.writeString(" files in root directory\n");
 }
 
+/// K1 dcache helper: full name compare against a files[] slot.
+fn nameMatches(fi: *const FileInfo, name: []const u8) bool {
+    if (fi.name_len != name.len) return false;
+    for (name, 0..) |c, j| {
+        if (fi.name[j] != c) return false;
+    }
+    return true;
+}
+
 /// Open a file by name from the FAT32 filesystem.
 /// Returns index into files array, or -1 on error.
 pub fn openFile(name: []const u8) i64 {
     if (!fat32_active) return -1;
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
+
+    // K1 dcache: (fat32, root_cluster, name) → files[] slot. A hit skips the
+    // linear files[] scan; the slot is defensively revalidated so a stale or
+    // conflicted entry degrades to the slow path instead of a wrong open.
+    if (dcache.lookup(.fat32, fat32_root_cluster, name)) |idx| {
+        if (idx < file_count and files[idx].active and !files[idx].is_dir and
+            nameMatches(&files[idx], name))
+        {
+            return @intCast(idx);
+        }
+    }
+
     for (0..file_count) |i| {
         const fi = files[i];
         if (!fi.active) continue; // v53.51: skip tombstoned slots
-        if (fi.name_len == name.len) {
-            var match = true;
-            for (0..name.len) |j| {
-                if (fi.name[j] != name[j]) {
-                    match = false;
-                    break;
-                }
-            }
-            if (match and !fi.is_dir) return @intCast(i);
+        if (nameMatches(&fi, name) and !fi.is_dir) {
+            dcache.fill(.fat32, fat32_root_cluster, name, @intCast(i));
+            return @intCast(i);
         }
     }
     return -1;
@@ -749,6 +765,11 @@ pub fn createFile(name: []const u8) i64 {
     if (!fat32_active) return -1;
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
+    // K1 dcache: createFile may reuse a tombstoned files[] slot under a
+    // different name, so per-slot tracking is untrustworthy — flush all fat32
+    // entries (they only ever cover the root directory). Unconditional, even
+    // when this call creates nothing: a spurious drop costs only a re-scan.
+    defer dcache.invalidateFs(.fat32);
     if (name.len == 0 or name.len >= MAX_FILENAME) return -1;
 
     // v53.51: deleteFile tombstones slots — reuse the first inactive one.
@@ -1186,6 +1207,10 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
 pub fn deleteFile(file_idx: u32) bool {
     if (!fat32_active or file_idx >= file_count) return false;
     var flags = fs_lock.acquire();
+    // K1 dcache: deleting tombstones a slot that createFile may later reuse
+    // for a different name — flush all fat32 entries (root-only anyway) on
+    // every path, including the bail-outs after the 0xE5 write below.
+    defer dcache.invalidateFs(.fat32);
     const fi = files[file_idx];
     if (!fi.active) { // v53.51: already tombstoned
         fs_lock.release(flags);

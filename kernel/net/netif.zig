@@ -39,6 +39,14 @@ pub fn isLoopback(ip: [4]u8) bool {
     return lo.isLoopback(ip);
 }
 
+/// K3: IPv6 loopback classifier — ::1 only (all-zero except the last byte).
+pub fn isLoopbackV6(ip: [16]u8) bool {
+    for (ip[0..15]) |b| {
+        if (b != 0) return false;
+    }
+    return ip[15] == 1;
+}
+
 pub fn getNetmask() [4]u8 {
     return .{ 255, 255, 255, 0 };
 }

@@ -93,6 +93,26 @@ const SlabClass = struct {
 
 **大分配 (v26.2)**: >1024 字节走 allocLarge 路径，单页用 pmm.allocPage，多页用 pmm.allocContiguous，header._pad 存页数供 kfree 释放。
 
+**Per-CPU magazine 层 (K2)**
+
+文件: `mm/slab_mag.zig`（纯逻辑，可主机测试）+ `mm/slab.zig` 中的接线。
+
+设计：每个 (CPU, 大小类) 一个 magazine——固定容量 8（`MAG_SIZE=8`）的对象指针 LIFO 栈，位于带锁的 SlabPool 空闲链表之前，使小类分配/释放热路径不再每次抢 pool 锁：
+
+- **kmalloc 快路径**：`arch.irq.saveAndDisable()` 关中断 → 从本 CPU 的 magazine pop；为空则在 pool 锁内批量 refill 4 个对象（`REFILL_BATCH=4`）后再 pop；pool 也空（含 refillPoolLocked 缺页）则返回 null。
+- **kfree 快路径**：关中断 → push 到本 CPU 的 magazine；满了则在 pool 锁内批量 flush 一半（`FLUSH_BATCH=4`）回 pool，之后再 push 必然放得下（`FLUSH_BATCH < MAG_SIZE`，有 comptime 断言保证）。
+- **allocLarge / 大类 kfree 路径不经过 magazine，保持不变。**
+
+**迁移安全论证**：所有 magazine 操作都在关中断窗口内完成。本 CPU 的上下文切换只能由中断（时钟 tick → `forceReschedule`，或重调度 IPI）或显式阻塞/调度调用触发，而 kmalloc/kfree 不含此类调用——因此关中断期间运行 CPU 不会变，窗口开始时读到的 `getPerCpuOrNull().cpu_id` 在整个操作期间有效。两个 CPU 永不共享同一 magazine；magazine 本身无需锁，pool 锁仍串行化所有 refill/flush。magazine 是纯 CPU 本地状态，与地址空间无关，PCID/CR3 切换无需任何处理。早期启动（GS base 未设置）时 `getPerCpuOrNull()` 返回 null，退化为 CPU 0 的 magazine。
+
+**所有权不变式**：任一时刻每个对象恰好处于三处之一——(a) pool 空闲链表、(b) 恰好一个 CPU 的 magazine、(c) 用户手中。refill 只接收 pool 已从空闲链表摘除的对象；flush 先把对象移出 magazine 再挂回 pool 空闲链表。因此 magazine 持有的对象对 pool 而言视为**已分配**，pool 不会二次发放，对象既不重复也不丢失。
+
+**stats 语义**：`getStats().total_allocs` 在 magazine 开启时统计"已从 pool 空闲链表签出"的对象数 = 活跃用户分配 + 各 CPU magazine 库存（每类每 CPU 至多 `MAG_SIZE`），是活跃分配数的上界；gate 关闭时仍为精确活跃数。`total_pages` 不受影响。
+
+**Gate**：`slab.zig` 中 `pub const slab_magazine_enable: bool = true`；置 false 则 kmalloc/kfree 恢复 K2 之前的逐次 pool 锁行为（旧代码路径原样保留）。
+
+**主机测试**：`tests/main.zig` 末尾 `// ─── slab magazine (K2) ───` 块，以 mock backing store 覆盖 push/pop LIFO、空/满边界、批量 refill/flush、部分 refill，以及模拟 kmalloc/kfree 协议下 20000 步随机混合操作的对象守恒（不重复、不丢失）校验。
+
 ### 1.3 分页 ✅ mapPages()/unmapPages() 批量接口，flushTlbAll()
 
 文件: `arch/x86_64/paging.zig`
@@ -327,6 +347,11 @@ H1 再加 `shared` 字段记录 MAP_SHARED），不触碰页表；首次访问�
   mremap 移动（`moveMapping`）先 `demoteRange`；fork/clone 的 COW 遍历只认 4K PTE，
   遇到巨大 PDE 先在父进程 demote（两侧同为 4K，COW 语义不变），
   因此巨大页永远不会带 COW 标记，#PF 的 COW 路径无需感知大页。
+- **fork COW 降级的 TLB 失效（K4，2026-08-07）**：fork 的降级按页表批量化——
+  每张 PT 一次 `shootdownRange`（CR3 过滤，仅命中运行该地址空间的 CPU）；
+  clone 末尾的本地 `reloadCR3` 改为对全用户空间的过滤广播 shootdown。
+  此前仅本地 invlpg/reload：CLONE_VM 对端 CPU 或 PCID no-flush 重入下的
+  迁移父进程会残留可写陈旧项（理论窗口，未触发，属 CR0.WP 同类先修）。
 - **swap/reclaim 排除**：reclaim 扫描跳过巨大 PDE（`pd[idx] & (1<<7)`），
   巨大页不可换出——内存紧张时 demote 需要分配 PT 页，正是最分配不出的时刻。
 - **拆除**：`destroyUserSpace` 对 2MiB PDE 用 `freeContiguous` 释放全部 512 帧
@@ -769,6 +794,38 @@ const FdTable = struct {
   合并后批量 `block_dev.discard`），覆盖 `unlinkFile` / `truncateFile` /
   `truncateByInode` 的全部直接块与间接树释放路径
 
+### 3.4.1 目录项缓存 dcache (K1) ✅
+
+文件: `dcache.zig`（纯核心 + 内核胶水）；接入点: `ext2.zig`、`fat32.zig`
+
+- **键结构**：`(fs_kind, parent_id, name)` → `child_id` 的正向缓存（只缓存
+  查找成功的项）。ext2: parent_id = 父目录 inode 号，child_id = 子 inode；
+  fat32: parent_id = 所属目录簇（只有固定根簇被缓存——`fat32.openFile` 只解析
+  根目录项），child_id = `files[]` 槽位索引，命中跳过线性扫描。
+- **结构**：512 条目（`CAPACITY`），按哈希直接映射、冲突直接替换（首版
+  无链无 LRU）。条目存完整名字节做全名比较，哈希冲突不会误命中。
+- **命中路径**：ext2 `findDirEntryCached`（`walkPathInner` / `resolveParent` /
+  `walkPathToInodeResolve*` 等所有按名查目录项的调用点）先查缓存，命中即跳过
+  目录块读取；未命中走原慢路径，成功后回填。fat32 `openFile` 同理，且命中后
+  防御性复核槽位（active + 非目录 + 全名比较），失效条目退化为慢路径而不是
+  打开错误文件。
+- **失效策略（保守——错误命中即数据损坏）**：
+  - ext2 `addDirEntry` / `removeDirEntry`（覆盖 create/unlink/rename/
+    hardlink/symlink 全部目录内容变更）：defer 无条件失效该父目录 inode 的
+    全部条目，并失效子 inode 作为 parent 的条目（子项可能是被抛弃的目录，
+    且其 inode 号之后可能被复用）。失败路径同样失效——多失效只损失一次
+    重扫。
+  - fat32 `createFile` / `deleteFile`：`createFile` 可能把 tombstone 槽位
+    复用于不同名字，按条目跟踪槽位不可靠，故**整体失效全部 fat32 条目**
+    （fat32 本就只缓存根目录，代价极小）。
+- **锁序**：整张表一把 `IrqSpinlock`（叶子锁），只在 `lookup` / `fill` /
+  `invalidate*` 胶水函数内短暂持有，绝不跨 I/O 或 FS 调用。锁序
+  `fs_lock → dcache.lock`（dcache 只在 fs_lock 临界区内被短暂获取，反向
+  不成立）。
+- **测试**：纯核心 host 测试（`tests/main.zig` "K1" 块，经
+  `kernel/host_test.zig` 导出）：命中/未命中/回填/按 parent 失效/按 fs 整体
+  失效/冲突替换/容量上限/超长名不缓存/统计计数。
+
 ### 3.5 管道 ✅ 阻塞读写 + SIGPIPE + O_NONBLOCK + poll集成
 
 文件: `pipe.zig`
@@ -957,7 +1014,7 @@ e1000 (中断驱动) / virtio-net (Virtqueue)
 127.0.0.0/8 的流量不出硬件网卡、不做 ARP：TX 路径把组好的 L2 帧排入 lo 环形队列，下一次 drain 将其送回 `net.handleRxPacket`，完成本机协议栈全回路。
 
 - **路由判定**：`netif.isLoopback(ip)`（`ip[0] == 127`，RFC 1122 §3.2.1.3 整个 127/8 块）；纯逻辑版本 `lo.isLoopback` 供 host 单测
-- **TX 注入点**：`udp.sendTo` 与 `tcp sendSegmentSeq`（仅 IPv4；IPv6 走 `::1` 尚未实现）。命中 loopback 时跳过 `arp.resolve`（不产生 ARP 请求），dst MAC 填本机 MAC，源地址也填 127/8 目的地址——双向对称，回复自然回到 lo
+- **TX 注入点**：`udp.sendTo` 与 `tcp sendSegmentSeq`（IPv4 127/8）；IPv6 由 K3 补全——`sendToV6`/`sendSegmentV6Seq` 对 `::1`（`netif.isLoopbackV6`：仅末字节为 1）同样绕过 NDP 直投 lo，源地址取 ::1（双向对称）。命中 loopback 时跳过 `arp.resolve`/NDP（不产生地址解析请求），dst MAC 填本机 MAC，v4 源地址填 127/8 目的地址——回复自然回到 lo
 - **RX 环形队列**：`LoopbackQueue` 为纯数据结构（16 槽 × 2048 字节，enqueue/dequeue/wrap/dropped 计数），无任何 arch 依赖，host 单测覆盖（`tests/main.zig` 的 `// ─── loopback (F2) ───` 块）；内核全局实例外加 `IrqSpinlock`
 - **drain 泵点**：`raw_net.netPoll`、`socket_syscall.netPoll`（无硬件 NIC 时也运行）与 `e1000.handleInterrupt` 末尾。出队持锁、协议处理不持锁（TCP 处理会重入 `lo.sendPacket`，锁顺序恒为 tcp_lock → lo_lock）；单次 drain 上限 4×QUEUE_DEPTH
 - **TCP 校验和**：RX 验证的伪首部 dst 在 loopback 段必须使用线上的 127/8 地址而非 `netif.getOurIp()`（`tcp.handlePacket`）

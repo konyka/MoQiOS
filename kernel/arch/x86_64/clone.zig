@@ -137,7 +137,12 @@ pub fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
         }
     }
 
-    paging_mod.reloadCR3();
+    // K4: reloadCR3 only flushes THIS CPU; CPUs sharing the parent's address
+    // space (CLONE_VM) or the parent's previous CPU under PCID no-flush would
+    // keep stale writable entries for the just-downgraded pages. A ranged
+    // shootdown over the user space flushes local + all matching remote CPUs.
+    const tlb = @import("tlb.zig");
+    tlb.shootdownRange(0, 1 << 31, parent_pml4_phys);
     return child_pml4_phys;
 }
 

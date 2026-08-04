@@ -2,11 +2,17 @@
 /// Uses intrusive free lists within pages allocated from PMM.
 /// Each allocation stores a SlabHeader before the returned pointer so that
 /// kfree(ptr) can determine the size class without the caller passing it.
+///
+/// K2: an optional per-CPU magazine layer (slab_mag.zig) sits in front of
+/// the size-class pools; see slab_magazine_enable below.
 const pmm = @import("pmm.zig");
 const hhdm = @import("hhdm.zig");
 const serial = @import("../arch/arch.zig").serial;
+const arch_irq = @import("../arch/arch.zig").irq;
+const syscall_entry = @import("../arch/arch.zig").syscall;
 const klog = @import("../klog.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+const slab_mag = @import("slab_mag.zig");
 
 const PAGE_SIZE: u64 = 4096;
 
@@ -47,6 +53,68 @@ const SlabPool = struct {
 /// Global slab pools.
 var pools: [NUM_CLASSES]SlabPool = undefined;
 var initialized: bool = false;
+
+/// K2: per-CPU magazine layer gate. When false, kmalloc/kfree take the pool
+/// lock on every small-class operation — byte-identical to the pre-K2
+/// behaviour. When true, small-class allocs/frees go through per-CPU
+/// magazines and only touch the pool lock on batch refill/flush.
+pub const slab_magazine_enable: bool = true;
+
+/// Magazine array dimension — one magazine per (CPU, size class).
+const MAG_CPUS: usize = syscall_entry.MAX_CPUS;
+
+/// K2: per-CPU, per-class magazines. Static, zero-initialised (all empty).
+/// A magazine is only ever touched by its owning CPU inside an IRQ-off
+/// window, so no lock is needed on the magazines themselves; the pool lock
+/// still serialises every refill/flush against other CPUs.
+var magazines: [MAG_CPUS][NUM_CLASSES]slab_mag.Magazine =
+    [_][NUM_CLASSES]slab_mag.Magazine{[_]slab_mag.Magazine{.{}} ** NUM_CLASSES} ** MAG_CPUS;
+
+/// K2: magazine index for the currently executing CPU. Must be called inside
+/// an IRQ-off window (or before per-CPU bring-up, where it returns 0).
+///
+/// Migration safety: all magazine operations run with IRQs disabled
+/// (arch.irq.saveAndDisable). Context switches on this CPU are initiated
+/// either by an interrupt (timer tick -> forceReschedule, or a reschedule
+/// IPI) or by an explicit blocking/scheduling call — kmalloc/kfree make no
+/// such call — so with IRQs off the running CPU cannot change between reading
+/// cpu_id and finishing the magazine operation. Magazines are CPU-local
+/// state with no address-space ties, so PCID/CR3 switches need no handling.
+fn currentMagCpu() usize {
+    const pc = syscall_entry.getPerCpuOrNull() orelse return 0; // early boot
+    if (pc.cpu_id >= MAG_CPUS) return 0;
+    return pc.cpu_id;
+}
+
+/// K2: backing-store adapter handed to Magazine.refill/flush. The caller
+/// holds the pool lock for the whole batch, so these are plain free-list
+/// ops. Magazine-held objects count as pool-allocated: popFree bumps
+/// allocated_count, pushFree decrements it — getStats() therefore reports
+/// live user allocations plus magazine stock (see getStats doc).
+const PoolAdapter = struct {
+    pool_idx: usize,
+
+    pub fn popFree(self: *PoolAdapter) ?*anyopaque {
+        const pool = &pools[self.pool_idx];
+        if (pool.free_list == null) {
+            if (!refillPoolLocked(self.pool_idx)) return null;
+        }
+        const node = pool.free_list.?;
+        pool.free_list = node.next;
+        pool.allocated_count += 1;
+        return @ptrCast(node);
+    }
+
+    pub fn pushFree(self: *PoolAdapter, obj: *anyopaque) void {
+        const pool = &pools[self.pool_idx];
+        const node: *FreeNode = @ptrCast(@alignCast(obj));
+        node.next = pool.free_list;
+        pool.free_list = node;
+        if (pool.allocated_count > 0) {
+            pool.allocated_count -= 1;
+        }
+    }
+};
 
 pub fn init() void {
     // Idempotent: SK-6 / subsystem_boot / main may all call this.
@@ -104,6 +172,10 @@ pub fn kmalloc(size: usize) ?*anyopaque {
         return allocLarge(size);
     };
 
+    if (comptime slab_magazine_enable) {
+        return kmallocMag(pool_idx);
+    }
+
     // v53.44: SMP-safe free list access
     const flags = pools[pool_idx].lock.acquire();
     defer pools[pool_idx].lock.release(flags);
@@ -118,6 +190,40 @@ pub fn kmalloc(size: usize) ?*anyopaque {
 
     // Write SlabHeader at the start of the slot
     const slot_ptr: [*]u8 = @ptrCast(node);
+    const header: *SlabHeader = @ptrCast(@alignCast(slot_ptr));
+    header.pool_idx = @intCast(pool_idx);
+
+    // Zero the payload area (after header)
+    const payload: [*]u8 = slot_ptr + HEADER_ALIGNED;
+    const payload_len = pools[pool_idx].object_size - HEADER_ALIGNED;
+    @memset(payload[0..payload_len], 0);
+
+    // Return pointer to payload (after header)
+    return @ptrFromInt(@intFromPtr(slot_ptr) + HEADER_ALIGNED);
+}
+
+/// K2: magazine fast path for small classes. Local pops are lock-free inside
+/// an IRQ-off window; the pool lock is taken only to batch-refill an empty
+/// magazine. The pool treats magazine-held objects as allocated, so an
+/// object is never handed out twice.
+fn kmallocMag(pool_idx: usize) ?*anyopaque {
+    const flags = arch_irq.saveAndDisable();
+    defer arch_irq.restore(flags);
+
+    const mag = &magazines[currentMagCpu()][pool_idx];
+    var slot_opt = mag.pop();
+    if (slot_opt == null) {
+        // Empty magazine: batch-refill from the pool under the pool lock.
+        const pflags = pools[pool_idx].lock.acquire();
+        var adapter = PoolAdapter{ .pool_idx = pool_idx };
+        _ = mag.refill(&adapter);
+        pools[pool_idx].lock.release(pflags);
+        slot_opt = mag.pop();
+        if (slot_opt == null) return null; // pool OOM
+    }
+    const slot_ptr: [*]u8 = @ptrCast(slot_opt.?);
+
+    // Write SlabHeader at the start of the slot
     const header: *SlabHeader = @ptrCast(@alignCast(slot_ptr));
     header.pool_idx = @intCast(pool_idx);
 
@@ -164,6 +270,11 @@ pub fn kfree(ptr: *anyopaque) void {
         return;
     }
 
+    if (comptime slab_magazine_enable) {
+        kfreeMag(pool_idx, user_addr);
+        return;
+    }
+
     // v53.44: SMP-safe free list access
     const flags = pools[pool_idx].lock.acquire();
     defer pools[pool_idx].lock.release(flags);
@@ -175,6 +286,25 @@ pub fn kfree(ptr: *anyopaque) void {
     pools[pool_idx].free_list = node;
     if (pools[pool_idx].allocated_count > 0) {
         pools[pool_idx].allocated_count -= 1;
+    }
+}
+
+/// K2: magazine fast path for small-class frees. The freed slot (including
+/// its header) is pushed onto this CPU's magazine; on a full magazine half
+/// of the stock is flushed back to the pool under the pool lock, after which
+/// the push always fits (FLUSH_BATCH < MAG_SIZE).
+fn kfreeMag(pool_idx: usize, user_addr: usize) void {
+    const slot_ptr: [*]u8 = @ptrFromInt(user_addr - HEADER_ALIGNED);
+    const flags = arch_irq.saveAndDisable();
+    defer arch_irq.restore(flags);
+
+    const mag = &magazines[currentMagCpu()][pool_idx];
+    if (!mag.push(@ptrCast(slot_ptr))) {
+        const pflags = pools[pool_idx].lock.acquire();
+        var adapter = PoolAdapter{ .pool_idx = pool_idx };
+        _ = mag.flush(&adapter);
+        pools[pool_idx].lock.release(pflags);
+        _ = mag.push(@ptrCast(slot_ptr));
     }
 }
 
@@ -229,6 +359,11 @@ fn allocLarge(size: usize) ?*anyopaque {
     return @ptrFromInt(@intFromPtr(base) + HEADER_ALIGNED);
 }
 
+/// K2 stats semantics: with slab_magazine_enable, `total_allocs` counts all
+/// objects checked out of the pool free lists — live user allocations PLUS
+/// per-CPU magazine stock (at most MAG_SIZE per online CPU per class). It is
+/// therefore an upper bound on live allocations; with the gate off it is the
+/// exact live count, as before. `total_pages` is unaffected by magazines.
 pub fn getStats() struct { total_allocs: u32, total_pages: u32 } {
     var allocs: u32 = 0;
     var pages: u32 = 0;

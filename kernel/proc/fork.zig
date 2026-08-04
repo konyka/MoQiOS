@@ -356,6 +356,11 @@ pub fn cloneUserPagesCow(parent_pml4_phys: u64, shared_regions: ?[]const @import
                 if (cow_count > 0) pmm_mod.addRefBatch(cow_phys[0..cow_count]);
 
                 // Pass 2: Set PTEs (mark COW, invalidate parent TLB, copy to child)
+                // K4: batch the parent-side TLB invalidation per page table —
+                // a per-page local invlpg leaves stale WRITABLE entries in
+                // remote CPUs' TLBs (CLONE_VM / migrated-parent case, and it
+                // is a hard correctness window with PCID no-flush switches).
+                var downgraded = false;
                 for (0..512) |pt_idx| {
                     const pte = parent_pt[pt_idx];
                     if (pte == 0 or pte & 1 == 0) continue;
@@ -379,11 +384,17 @@ pub fn cloneUserPagesCow(parent_pml4_phys: u64, shared_regions: ?[]const @import
                     // an already-COW or already-read-only page keeps its entry.
                     if (shared != pte) {
                         parent_pt[pt_idx] = shared;
-                        // Invalidate parent TLB for this page
-                        paging_mod.invlpg(virt);
+                        downgraded = true;
                     }
 
                     child_pt[pt_idx] = shared;
+                }
+                if (downgraded) {
+                    // One ranged shootdown per page table (2MiB span). The
+                    // CR3 filter skips CPUs not running this address space.
+                    const pt_base = (pml4_idx << 39) | (pdpt_idx << 30) | (pd_idx << 21);
+                    const tlb = @import("../arch/arch.zig").tlb;
+                    tlb.shootdownRange(pt_base, 512, parent_pml4_phys);
                 }
             }
         }

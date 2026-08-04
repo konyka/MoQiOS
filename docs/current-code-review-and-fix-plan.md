@@ -1637,6 +1637,19 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 ---
 
+### 6.11 基础设施补完·第七轮（2026-08-07）
+
+| 阶段 | 内容 | 验证 |
+|---|---|---|
+| K1 | **目录项缓存 dcache**（VFS 性能）：`(fs, parent, name)` → 子项 id，512 项直接映射（FNV-1a + 冲突替换）；ext2 全部命名查找路径（walkPath/resolveParent/rename/unlink/hardlink/symlink）命中即跳过目录块读取；fat32 缓存根目录 files[] 槽位（带防御性重校验，陈旧即回退慢路径）。失效策略保守：ext2 按父 inode + 子 inode 精确失效（addDirEntry/removeDirEntry 的 defer 覆盖失败路径）；fat32 因墓碑槽复用按全表失效。锁序 `fs_lock → dcache.lock`（叶子，绝不持锁做 I/O） | host 单测 10 项 + fs 全套回归 + hello50 |
+| K2 | **slab per-CPU magazine**（分配器性能）：每核每 size-class 8 槽 LIFO 杂志——kmalloc/kfree 快路径关中断弹压本地杂志（无需跨核锁；本调度器下关中断窗口内 CPU 不会变，迁移安全论证见文档），空则批量 refill 4 个、满则批量归还 4 个（池锁仍串行池访问）；大对象路径不变；`slab_magazine_enable` 门控，关闭即旧路径逐字节还原；所有权不变量（对象必恰好存在于 池自由表/某核杂志/用户手中 之一）经 20000 步确定性压力单测验证 | host 单测 8 项 + hello50 + stress |
+| K3 | **IPv6 loopback ::1**：tcp/udp v6 发送路径对 ::1 绕过 NDP 直投 lo（src=dst=::1，镜像 v4 的 F2 设计），`netif.isLoopbackV6` | smoke 回归 |
+| K4 | **fork COW 降级 shootdown 补漏**（正确性）：fork 按页表批量化降级后的失效（每 PT 一次 `shootdownRange`，CR3 过滤），clone 末尾本地 reloadCR3 改为按地址空间过滤的广播——闭合 PCID no-flush 重入下迁移父进程残留可写陈旧项的理论窗口 | fork 密集测试回归 |
+
+**仍遗留**：timerTick 旧栈窗口残余；tryStealTask 死代码；drivers/ 用户态驱动框架与 devmgr（下一轮评估）；真实硬件 PCID 验证；MAP_SHARED 与 write() 交错的弱语义。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:

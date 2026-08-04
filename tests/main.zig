@@ -1504,3 +1504,331 @@ test "J2: contended cmpxchg claims grant exclusive ownership" {
     try std.testing.expectEqual(ClaimState.ready, sched_claim.load(&shared.state));
 }
 // ─── end sched claim (J2) ───
+// ─── dcache (K1) ───
+const dcache = kt.dcache;
+
+// Find a parent id whose (fs, parent, name) key lands on the same direct-mapped
+// slot as `ref_parent` for the same name — deterministic conflict generator.
+fn dcacheConflictingParent(fs: dcache.FsKind, name: []const u8, ref_parent: u32) u32 {
+    const h = dcache.hashName(name);
+    const want = dcache.slotFor(fs, ref_parent, h);
+    var p: u32 = ref_parent + 1;
+    while (p != ref_parent) : (p +%= 1) {
+        if (dcache.slotFor(fs, p, h) == want) return p;
+    }
+    unreachable; // 512 slots, u32 parents — a collision always exists
+}
+
+test "K1: lookup on empty cache misses" {
+    dcache.resetPure();
+    try std.testing.expect(dcache.lookupPure(.ext2, 2, "hello") == null);
+    try std.testing.expect(dcache.lookupPure(.fat32, 2, "hello") == null);
+}
+
+test "K1: fill then lookup hits and returns the child" {
+    dcache.resetPure();
+    dcache.fillPure(.ext2, 2, "foo", 1234);
+    try std.testing.expectEqual(@as(?u32, 1234), dcache.lookupPure(.ext2, 2, "foo"));
+    // Wrong parent / wrong fs / wrong name all miss (full key compare).
+    try std.testing.expect(dcache.lookupPure(.ext2, 3, "foo") == null);
+    try std.testing.expect(dcache.lookupPure(.fat32, 2, "foo") == null);
+    try std.testing.expect(dcache.lookupPure(.ext2, 2, "fop") == null);
+    try std.testing.expect(dcache.lookupPure(.ext2, 2, "fo") == null);
+    try std.testing.expect(dcache.lookupPure(.ext2, 2, "fooo") == null);
+}
+
+test "K1: same name under different parents and filesystems stays distinct" {
+    dcache.resetPure();
+    dcache.fillPure(.ext2, 10, "name", 100);
+    dcache.fillPure(.ext2, 20, "name", 200);
+    dcache.fillPure(.fat32, 10, "name", 7);
+    try std.testing.expectEqual(@as(?u32, 100), dcache.lookupPure(.ext2, 10, "name"));
+    try std.testing.expectEqual(@as(?u32, 200), dcache.lookupPure(.ext2, 20, "name"));
+    try std.testing.expectEqual(@as(?u32, 7), dcache.lookupPure(.fat32, 10, "name"));
+}
+
+test "K1: conflict on the same slot replaces the old entry" {
+    dcache.resetPure();
+    dcache.fillPure(.ext2, 1000, "conflict", 111);
+    const p2 = dcacheConflictingParent(.ext2, "conflict", 1000);
+    dcache.fillPure(.ext2, p2, "conflict", 222);
+    // Direct-mapped replace-on-conflict: the older entry is gone.
+    try std.testing.expect(dcache.lookupPure(.ext2, 1000, "conflict") == null);
+    try std.testing.expectEqual(@as(?u32, 222), dcache.lookupPure(.ext2, p2, "conflict"));
+}
+
+test "K1: same-slot different-name lookup misses (full name compare)" {
+    dcache.resetPure();
+    dcache.fillPure(.ext2, 500, "alpha", 42);
+    const p2 = dcacheConflictingParent(.ext2, "beta", 500);
+    // (p2, "beta") hashes to alpha's slot but neither parent nor name match.
+    try std.testing.expect(dcache.lookupPure(.ext2, p2, "beta") == null);
+    // And the original entry is untouched by the failed lookup.
+    try std.testing.expectEqual(@as(?u32, 42), dcache.lookupPure(.ext2, 500, "alpha"));
+}
+
+test "K1: invalidateParent drops only entries under that parent" {
+    dcache.resetPure();
+    dcache.fillPure(.ext2, 11, "a", 1);
+    dcache.fillPure(.ext2, 11, "b", 2);
+    dcache.fillPure(.ext2, 12, "a", 3);
+    dcache.fillPure(.fat32, 11, "a", 4);
+    const dropped = dcache.invalidateParentPure(.ext2, 11);
+    try std.testing.expectEqual(@as(u32, 2), dropped);
+    try std.testing.expect(dcache.lookupPure(.ext2, 11, "a") == null);
+    try std.testing.expect(dcache.lookupPure(.ext2, 11, "b") == null);
+    try std.testing.expectEqual(@as(?u32, 3), dcache.lookupPure(.ext2, 12, "a"));
+    try std.testing.expectEqual(@as(?u32, 4), dcache.lookupPure(.fat32, 11, "a"));
+}
+
+test "K1: invalidateFs drops every entry of one filesystem only" {
+    dcache.resetPure();
+    dcache.fillPure(.fat32, 2, "x", 9);
+    dcache.fillPure(.fat32, 7, "y", 8);
+    dcache.fillPure(.ext2, 2, "x", 5);
+    _ = dcache.invalidateFsPure(.fat32);
+    try std.testing.expect(dcache.lookupPure(.fat32, 2, "x") == null);
+    try std.testing.expect(dcache.lookupPure(.fat32, 7, "y") == null);
+    try std.testing.expectEqual(@as(?u32, 5), dcache.lookupPure(.ext2, 2, "x"));
+}
+
+test "K1: capacity is bounded at 512 with replace-on-conflict" {
+    dcache.resetPure();
+    var i: u32 = 0;
+    while (i < dcache.CAPACITY * 3) : (i += 1) {
+        var name_buf: [16]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "f{d}", .{i}) catch unreachable;
+        dcache.fillPure(.ext2, 2, name, i);
+    }
+    try std.testing.expect(dcache.countValidPure() <= dcache.CAPACITY);
+    const st = dcache.statsPure();
+    try std.testing.expectEqual(@as(u64, dcache.CAPACITY * 3), st.fills);
+}
+
+test "K1: overlong names are never cached" {
+    dcache.resetPure();
+    const long_name = "x" ** 300;
+    dcache.fillPure(.ext2, 2, long_name, 77);
+    try std.testing.expect(dcache.lookupPure(.ext2, 2, long_name) == null);
+    try std.testing.expectEqual(@as(u32, 0), dcache.countValidPure());
+    dcache.fillPure(.ext2, 2, "", 1);
+    try std.testing.expect(dcache.lookupPure(.ext2, 2, "") == null);
+}
+
+test "K1: stats count hits and misses" {
+    dcache.resetPure();
+    dcache.fillPure(.ext2, 2, "stat", 55);
+    _ = dcache.lookupPure(.ext2, 2, "stat"); // hit
+    _ = dcache.lookupPure(.ext2, 2, "nope"); // miss
+    const st = dcache.statsPure();
+    try std.testing.expectEqual(@as(u64, 1), st.hits);
+    try std.testing.expectEqual(@as(u64, 1), st.misses);
+    try std.testing.expectEqual(@as(u64, 1), st.fills);
+}
+// ─── end dcache (K1) ───
+
+// ─── slab magazine (K2) ───
+// Pure per-CPU magazine bookkeeping from kernel/mm/slab_mag.zig: push/pop
+// LIFO, batch refill/flush against a mock backing store, boundary behaviour,
+// and the no-duplication/no-loss ownership invariant under a simulated
+// kmalloc/kfree protocol. The kernel wiring (IRQ-off windows, pool locking)
+// lives in kernel/mm/slab.zig; here only the lock-free core is exercised.
+const slab_mag = kt.slab_mag;
+
+const K2_NUM_OBJS = 64;
+
+const K2MockPool = struct {
+    storage: [K2_NUM_OBJS]u64 = undefined,
+    free: [K2_NUM_OBJS]?*anyopaque = undefined,
+    count: usize = 0,
+    pops: u32 = 0,
+    pushes: u32 = 0,
+
+    fn init() K2MockPool {
+        var p = K2MockPool{};
+        for (0..K2_NUM_OBJS) |i| {
+            p.storage[i] = i;
+            p.free[i] = &p.storage[i];
+        }
+        p.count = K2_NUM_OBJS;
+        return p;
+    }
+
+    pub fn popFree(self: *K2MockPool) ?*anyopaque {
+        if (self.count == 0) return null;
+        self.count -= 1;
+        const obj = self.free[self.count];
+        self.free[self.count] = null;
+        self.pops += 1;
+        return obj;
+    }
+
+    pub fn pushFree(self: *K2MockPool, obj: *anyopaque) void {
+        self.free[self.count] = obj;
+        self.count += 1;
+        self.pushes += 1;
+    }
+};
+
+/// Assert every mock object exists exactly once across pool, magazine and
+/// `hands` (user-held) — the no-duplication / no-loss invariant.
+fn k2ExpectConservation(pool: *K2MockPool, m: *slab_mag.Magazine, hands: []?*anyopaque) !void {
+    var seen = [_]bool{false} ** K2_NUM_OBJS;
+    for (pool.free[0..pool.count]) |o| {
+        const idx = @as(*u64, @ptrCast(@alignCast(o.?))).*;
+        try std.testing.expect(!seen[@intCast(idx)]);
+        seen[@intCast(idx)] = true;
+    }
+    for (m.slots[0..m.count]) |o| {
+        const idx = @as(*u64, @ptrCast(@alignCast(o.?))).*;
+        try std.testing.expect(!seen[@intCast(idx)]);
+        seen[@intCast(idx)] = true;
+    }
+    for (hands) |o| {
+        if (o) |obj| {
+            const idx = @as(*u64, @ptrCast(@alignCast(obj))).*;
+            try std.testing.expect(!seen[@intCast(idx)]);
+            seen[@intCast(idx)] = true;
+        }
+    }
+    for (seen) |s| try std.testing.expect(s);
+}
+
+test "K2: magazine push/pop is LIFO and tracks count" {
+    var m: slab_mag.Magazine = .{};
+    try std.testing.expect(m.isEmpty());
+    try std.testing.expectEqual(@as(?*anyopaque, null), m.pop());
+
+    var a: u64 = 1;
+    var b: u64 = 2;
+    try std.testing.expect(m.push(&a));
+    try std.testing.expect(m.push(&b));
+    try std.testing.expectEqual(@as(u8, 2), m.len());
+    try std.testing.expectEqual(@as(?*anyopaque, &b), m.pop());
+    try std.testing.expectEqual(@as(?*anyopaque, &a), m.pop());
+    try std.testing.expect(m.isEmpty());
+}
+
+test "K2: magazine boundary — full push fails, empty pop returns null" {
+    var m: slab_mag.Magazine = .{};
+    var objs: [slab_mag.MAG_SIZE]u64 = undefined;
+    for (0..slab_mag.MAG_SIZE) |i| try std.testing.expect(m.push(&objs[i]));
+    try std.testing.expect(m.isFull());
+    try std.testing.expectEqual(@as(u8, slab_mag.MAG_SIZE), m.len());
+
+    var extra: u64 = 0;
+    try std.testing.expect(!m.push(&extra)); // full: refused, not overwritten
+    try std.testing.expectEqual(@as(u8, slab_mag.MAG_SIZE), m.len());
+
+    for (0..slab_mag.MAG_SIZE) |_| try std.testing.expect(m.pop() != null);
+    try std.testing.expectEqual(@as(?*anyopaque, null), m.pop());
+}
+
+test "K2: refill moves a full batch from the pool" {
+    var pool = K2MockPool.init();
+    var m: slab_mag.Magazine = .{};
+    const n = m.refill(&pool);
+    try std.testing.expectEqual(@as(u8, slab_mag.REFILL_BATCH), n);
+    try std.testing.expectEqual(@as(u8, slab_mag.REFILL_BATCH), m.len());
+    try std.testing.expectEqual(K2_NUM_OBJS - slab_mag.REFILL_BATCH, pool.count);
+    try std.testing.expectEqual(@as(u32, slab_mag.REFILL_BATCH), pool.pops);
+
+    var hands = [_]?*anyopaque{null} ** K2_NUM_OBJS;
+    try k2ExpectConservation(&pool, &m, &hands);
+}
+
+test "K2: refill is partial when the pool has fewer than a batch" {
+    var pool = K2MockPool.init();
+    // Drain the pool to REFILL_BATCH - 1 objects.
+    for (0..K2_NUM_OBJS - (slab_mag.REFILL_BATCH - 1)) |_| _ = pool.popFree();
+    var m: slab_mag.Magazine = .{};
+    const n = m.refill(&pool);
+    try std.testing.expectEqual(@as(u8, slab_mag.REFILL_BATCH - 1), n);
+    try std.testing.expectEqual(@as(usize, 0), pool.count);
+    // A second refill on an empty pool is a no-op.
+    try std.testing.expectEqual(@as(u8, 0), m.refill(&pool));
+    try std.testing.expectEqual(@as(u8, slab_mag.REFILL_BATCH - 1), m.len());
+}
+
+test "K2: flush moves half the magazine back to the pool" {
+    var pool = K2MockPool.init();
+    var m: slab_mag.Magazine = .{};
+    _ = m.refill(&pool); // 4 in mag
+    _ = m.refill(&pool); // 8 in mag (full)
+    try std.testing.expect(m.isFull());
+
+    const n = m.flush(&pool);
+    try std.testing.expectEqual(@as(u8, slab_mag.FLUSH_BATCH), n);
+    try std.testing.expectEqual(@as(u8, slab_mag.MAG_SIZE - slab_mag.FLUSH_BATCH), m.len());
+    try std.testing.expectEqual(@as(u32, slab_mag.FLUSH_BATCH), pool.pushes);
+
+    var hands = [_]?*anyopaque{null} ** K2_NUM_OBJS;
+    try k2ExpectConservation(&pool, &m, &hands);
+}
+
+test "K2: flush on a non-full magazine flushes at most a batch" {
+    var pool = K2MockPool.init();
+    // Make room: the mock's backing array is exactly K2_NUM_OBJS deep.
+    _ = pool.popFree();
+    _ = pool.popFree();
+    var m: slab_mag.Magazine = .{};
+    var a: u64 = 0;
+    var b: u64 = 0;
+    _ = m.push(&a);
+    _ = m.push(&b);
+    const n = m.flush(&pool); // count < FLUSH_BATCH: flushes count
+    try std.testing.expectEqual(@as(u8, 2), n);
+    try std.testing.expect(m.isEmpty());
+    try std.testing.expectEqual(@as(usize, K2_NUM_OBJS), pool.count); // 62 + 2 flushed
+}
+
+test "K2: simulated kmalloc/kfree protocol conserves objects under stress" {
+    // Mirror the slab.zig fast path: alloc = pop, refill-on-empty then pop;
+    // free = push, flush-half-on-full then push.
+    var pool = K2MockPool.init();
+    var m: slab_mag.Magazine = .{};
+    var hands = [_]?*anyopaque{null} ** K2_NUM_OBJS;
+
+    var seed: u64 = 0x12345678;
+    var live: usize = 0;
+    var step: u32 = 0;
+    while (step < 20000) : (step += 1) {
+        // xorshift PRNG for a deterministic op mix.
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        const do_alloc = (seed & 1) == 0 or live == 0;
+
+        if (do_alloc) {
+            if (live == K2_NUM_OBJS) continue;
+            var obj = m.pop();
+            if (obj == null) {
+                _ = m.refill(&pool);
+                obj = m.pop();
+            }
+            if (obj) |o| { // pool OOM is possible: alloc returns null
+                hands[live] = o;
+                live += 1;
+            }
+        } else {
+            live -= 1;
+            const o = hands[live].?;
+            hands[live] = null;
+            if (!m.push(o)) {
+                _ = m.flush(&pool);
+                try std.testing.expect(m.push(o)); // post-flush push must fit
+            }
+        }
+        if (step % 997 == 0) try k2ExpectConservation(&pool, &m, &hands);
+    }
+    try k2ExpectConservation(&pool, &m, &hands);
+}
+
+test "K2: batching parameters are consistent" {
+    try std.testing.expectEqual(@as(usize, 8), slab_mag.MAG_SIZE);
+    try std.testing.expectEqual(@as(usize, 4), slab_mag.REFILL_BATCH);
+    try std.testing.expectEqual(@as(usize, 4), slab_mag.FLUSH_BATCH);
+    try std.testing.expect(slab_mag.REFILL_BATCH <= slab_mag.MAG_SIZE);
+    try std.testing.expect(slab_mag.FLUSH_BATCH < slab_mag.MAG_SIZE); // post-flush push always fits
+}
+// ─── end slab magazine (K2) ───

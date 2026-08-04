@@ -17,6 +17,7 @@ const trim_ranges = @import("../lib/trim_ranges.zig");
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const eu = @import("ext2_util.zig");
+const dcache = @import("dcache.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 const SECTOR_SIZE: u32 = 512;
@@ -576,8 +577,8 @@ fn walkPathInner(start_inode: u32, path: []const u8, depth: u32) i64 {
         // Must be a directory
         if (!eu.isDirectory(inode.mode)) return -1;
 
-        // Search directory entries for component
-        const found = findDirEntry(&inode, component) orelse return -1;
+        // Search directory entries for component (K1: dcache hit skips the scan)
+        const found = findDirEntryCached(current_inode, &inode, component) orelse return -1;
 
         // Check if the found entry is a symlink
         var found_inode: Ext2Inode = undefined;
@@ -685,7 +686,7 @@ fn resolveParent(path: []const u8) ?struct { parent: u32, name: []const u8 } {
             if (!eu.isDirectory(inode.mode)) return null;
 
             const dir_inode = parent_inode; // directory containing this component
-            parent_inode = findDirEntry(&inode, component) orelse return null;
+            parent_inode = findDirEntryCached(dir_inode, &inode, component) orelse return null;
 
             // v52.2: resolve symlinks in intermediate components (no fd allocation)
             var found_inode: Ext2Inode = undefined;
@@ -704,6 +705,17 @@ fn resolveParent(path: []const u8) ?struct { parent: u32, name: []const u8 } {
     }
 
     return .{ .parent = parent_inode, .name = filename };
+}
+
+/// K1 dcache: probe (parent_inode_num, name) first; a hit skips the directory
+/// block reads entirely. On a miss, run the slow scan and fill the cache on
+/// success (positive entries only). Caller holds fs_lock; the dcache lock is
+/// a leaf taken briefly inside lookup/fill and never held across I/O.
+fn findDirEntryCached(dir_inode_num: u32, inode: *const Ext2Inode, name: []const u8) ?u32 {
+    if (dcache.lookup(.ext2, dir_inode_num, name)) |ino| return ino;
+    const found = findDirEntry(inode, name) orelse return null;
+    dcache.fill(.ext2, dir_inode_num, name, found);
+    return found;
 }
 
 fn findDirEntry(inode: *const Ext2Inode, name: []const u8) ?u32 {
@@ -1434,7 +1446,7 @@ pub fn renameFile(old_path: []const u8, new_path: []const u8) bool {
     // Find the file's inode
     var old_parent_ino_data: Ext2Inode = undefined;
     if (!readInode(old_parent_inode, &old_parent_ino_data)) return false;
-    const file_inode_num = findDirEntry(&old_parent_ino_data, old_filename) orelse return false;
+    const file_inode_num = findDirEntryCached(old_parent_inode, &old_parent_ino_data, old_filename) orelse return false;
 
     // Read file inode to get file_type
     var file_inode: Ext2Inode = undefined;
@@ -1444,7 +1456,7 @@ pub fn renameFile(old_path: []const u8, new_path: []const u8) bool {
     // If destination exists, remove it first (overwrite semantics)
     var new_parent_inode_data: Ext2Inode = undefined;
     if (readInode(new_parent_inode, &new_parent_inode_data)) {
-        if (findDirEntry(&new_parent_inode_data, new_filename)) |_| {
+        if (findDirEntryCached(new_parent_inode, &new_parent_inode_data, new_filename)) |_| {
             _ = removeDirEntry(new_parent_inode, new_filename);
         }
     }
@@ -2124,6 +2136,17 @@ pub fn createFile(name: []const u8) i64 {
 /// Add a directory entry to a directory inode.
 /// Simple approach: try to split last entry in last block, else allocate new block.
 fn addDirEntry(dir_inode_num: u32, target_inode: u32, entry_name: []const u8, file_type: u8) bool {
+    // K1 dcache: the directory's contents change here — drop every cached
+    // lookup keyed by this directory, and every entry keyed by the child
+    // inode as a parent (it may be a directory whose contents are being
+    // abandoned, and its inode number can be reused after a later free).
+    // Unconditional (even on failure paths): wrong hits are corruption,
+    // spurious drops are just a re-scan. Covers createFile/createDir/
+    // renameFile/createHardlink/createSymlink, which all add via this.
+    defer {
+        dcache.invalidateParent(.ext2, dir_inode_num);
+        dcache.invalidateParent(.ext2, target_inode);
+    }
     var dir_inode: Ext2Inode = undefined;
     if (!readInode(dir_inode_num, &dir_inode)) return false;
 
@@ -2432,6 +2455,15 @@ fn freeInode(inode_num: u32) void {
 /// Remove a named entry from a parent directory.
 /// Merges the deleted entry's rec_len into the previous entry if possible.
 fn removeDirEntry(parent_inode_num: u32, name: []const u8) bool {
+    // K1 dcache: unconditional invalidation of the parent directory's cached
+    // lookups (conservative — also on failure paths), plus the removed child's
+    // inode as a parent once known (it may be a directory being abandoned).
+    // Covers unlinkFile and renameFile, which both remove via this.
+    var removed_inode: u32 = 0;
+    defer {
+        dcache.invalidateParent(.ext2, parent_inode_num);
+        if (removed_inode != 0) dcache.invalidateParent(.ext2, removed_inode);
+    }
     var parent_inode: Ext2Inode = undefined;
     if (!readInode(parent_inode_num, &parent_inode)) return false;
 
@@ -2470,6 +2502,7 @@ fn removeDirEntry(parent_inode_num: u32, name: []const u8) bool {
                     }
                 }
                 if (match) {
+                    removed_inode = view.inode; // K1: invalidate child-as-parent too
                     // Found — remove by merging with previous or zeroing inode
                     if (prev_pos != 0xFFFF_FFFF) {
                         const prev: *Ext2DirEntry = @ptrCast(@alignCast(buf + prev_pos));
@@ -2511,7 +2544,7 @@ pub fn unlinkFile(path: []const u8) bool {
     // Find the file's inode number via findDirEntry on parent
     var parent_inode: Ext2Inode = undefined;
     if (!readInode(parent_inode_num, &parent_inode)) return false;
-    const file_inode_num = findDirEntry(&parent_inode, filename) orelse return false;
+    const file_inode_num = findDirEntryCached(parent_inode_num, &parent_inode, filename) orelse return false;
 
     // Read file inode
     var file_inode: Ext2Inode = undefined;
@@ -2614,7 +2647,7 @@ pub fn createHardlink(oldpath: []const u8, newpath: []const u8) i64 {
     // Check that newpath doesn't already exist
     var parent_check: Ext2Inode = undefined;
     if (readInode(resolved.parent, &parent_check)) {
-        if (findDirEntry(&parent_check, resolved.name) != null) return -17; // EEXIST
+        if (findDirEntryCached(resolved.parent, &parent_check, resolved.name) != null) return -17; // EEXIST
     }
 
     // 3. Add directory entry pointing to old_inode with same file_type
@@ -2644,7 +2677,7 @@ pub fn createSymlink(target: []const u8, linkpath: []const u8) i64 {
     // Check that linkpath doesn't already exist
     var parent_check: Ext2Inode = undefined;
     if (readInode(resolved.parent, &parent_check)) {
-        if (findDirEntry(&parent_check, resolved.name) != null) return -17; // EEXIST
+        if (findDirEntryCached(resolved.parent, &parent_check, resolved.name) != null) return -17; // EEXIST
     }
 
     // 2. Allocate a new inode for the symlink
@@ -2734,7 +2767,7 @@ fn walkPathToInodeResolveNoFollow(start_inode: u32, path: []const u8, depth: u32
         if (!readInode(current_inode, &inode)) return null;
         if (!eu.isDirectory(inode.mode)) return null;
 
-        const found = findDirEntry(&inode, component) orelse return null;
+        const found = findDirEntryCached(current_inode, &inode, component) orelse return null;
 
         // Check if symlink — resolve for intermediate, but NOT for final component
         var found_inode: Ext2Inode = undefined;
@@ -2775,7 +2808,7 @@ fn walkPathToInodeResolve(start_inode: u32, path: []const u8, depth: u32) ?u32 {
         if (!readInode(current_inode, &inode)) return null;
         if (!eu.isDirectory(inode.mode)) return null; // not a directory
 
-        const found = findDirEntry(&inode, component) orelse return null;
+        const found = findDirEntryCached(current_inode, &inode, component) orelse return null;
 
         // Check if symlink
         var found_inode: Ext2Inode = undefined;
@@ -2805,7 +2838,7 @@ pub fn readSymlinkByPath(path: []const u8) ?[]const u8 {
     const resolved = resolveParent(path) orelse return null;
     var parent_inode: Ext2Inode = undefined;
     if (!readInode(resolved.parent, &parent_inode)) return null;
-    const entry_inode_num = findDirEntry(&parent_inode, resolved.name) orelse return null;
+    const entry_inode_num = findDirEntryCached(resolved.parent, &parent_inode, resolved.name) orelse return null;
 
     // Read the entry's inode and check it's a symlink
     var entry_inode: Ext2Inode = undefined;
