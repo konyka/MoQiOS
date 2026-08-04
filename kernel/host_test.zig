@@ -39,3 +39,5 @@ pub const nvme_queue = @import("drivers/nvme_queue.zig");
 pub const slab_mag = @import("mm/slab_mag.zig");
 pub const dcache = @import("fs/dcache.zig");
 pub const userdrv_core = @import("drivers/userdrv_core.zig");
+pub const ioapic_core = @import("arch/x86_64/ioapic_core.zig");
+pub const ioperm_core = @import("proc/ioperm_core.zig");

@@ -80,6 +80,8 @@ pub fn waitpidWithOptions(pid_raw: u64, status_ptr: u64, options: u32) i64 {
         se.syncUserRspFromTask(parent);
         se.getPerCpu().kernel_rsp = parent.kernel_stack_top;
         @import("../arch/arch.zig").gdt.setRsp0(se.getPerCpu().cpu_id, parent.kernel_stack_top);
+        // ioperm: pair every per-switch RSP0 update with the IOPB load.
+        @import("ioperm.zig").loadForTask(se.getPerCpu().cpu_id, parent);
 
         // Woken up — a child may have exited. Reap first: a pending signal
         // only aborts the wait when no child status is available, so an

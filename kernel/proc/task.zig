@@ -182,6 +182,13 @@ pub const Task = struct {
     mmap_regions: [64]MmapRegion = [_]MmapRegion{.{}} ** 64,
     mmap_count: u32 = 0,
 
+    /// Per-task I/O permission bitmap (TSS IOPB, 8192 bytes / 2 PMM pages,
+    /// HHDM virtual pointer). Lazily allocated on the first ioperm_set call;
+    /// null = deny-all. Copied into the per-CPU TSS block on every context
+    /// switch (proc/ioperm.zig loadForTask), deep-copied on fork, freed at
+    /// task teardown. x86_64 only.
+    io_bitmap: ?[*]u8 = null,
+
     /// Process name (for prctl PR_SET_NAME / /proc/<pid>/comm).
     comm: [16]u8 = [_]u8{0} ** 16,
 
@@ -777,6 +784,8 @@ pub fn reapZombies() u32 {
             // L1: release user-driver resources (IRQ registrations, DMA
             // buffers, MMIO mappings) before the address space walk.
             @import("../drivers/userdrv.zig").cleanupTask(t, t.page_table_phys);
+            // ioperm: return the TSS IOPB pages (allocated by ioperm_set).
+            @import("ioperm.zig").freeBitmap(t);
             // G2: release file-region backing refs before the address space
             // (destroyUserSpace walks page tables, not region metadata).
             @import("../mm/mmap.zig").releaseFileRefs(t);
@@ -1035,6 +1044,8 @@ pub fn waitpid(parent_idx: u32, pid: i32, status: *i32) ?u32 {
                 // L1: release user-driver resources (IRQ registrations, DMA
                 // buffers, MMIO mappings) before the address space walk.
                 @import("../drivers/userdrv.zig").cleanupTask(t, t.page_table_phys);
+                // ioperm: return the TSS IOPB pages (allocated by ioperm_set).
+                @import("ioperm.zig").freeBitmap(t);
                 // G2: release file-region backing refs before the address space.
                 @import("../mm/mmap.zig").releaseFileRefs(t);
                 @import("../mm/user_space.zig").destroyUserSpace(t.page_table_phys);

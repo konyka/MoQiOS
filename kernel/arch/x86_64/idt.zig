@@ -299,6 +299,11 @@ pub fn interruptDispatch(frame: *InterruptFrame) callconv(.c) void {
     if (vector >= 32 and vector < 48) {
         // Legacy PIC IRQ (32-47)
         handleIrq(frame, vector - 32);
+    } else if (vector >= 100 and vector < 128) {
+        // User-owned IOAPIC line (dev_irq_register, GSI >= 16 routed by
+        // userdrv into the 100-127 window). Not a PIC interrupt: EOI goes to
+        // the LAPIC, never to the 8259A ports.
+        handleUserIoapicIrq(vector);
     } else if (vector == 240) {
         // LAPIC timer vector
         handleLapicTimer(frame);
@@ -1048,6 +1053,20 @@ fn handleIrq(frame: *InterruptFrame, irq: u8) void {
     if (irq >= 8) {
         io.outb(0xA0, 0x20); // EOI to slave PIC
     }
+}
+
+/// Handle a user-owned IOAPIC interrupt (vectors 100-127).
+///
+/// The GSI is recovered from the vector with the inverse of userdrv's
+/// routing map (vector = 100 + (gsi - 16)). The edge is counted for the
+/// waiting user task and the LAPIC gets the EOI — an IOAPIC line is never
+/// acknowledged through the PIC ports.
+fn handleUserIoapicIrq(vector: u8) void {
+    const userdrv = @import("../../drivers/userdrv.zig");
+    const gsi: u8 = 16 + (vector - userdrv.USER_IRQ_VECTOR_BASE);
+    _ = userdrv.handleUserIrq(gsi);
+    const lapic = @import("lapic.zig");
+    lapic.eoi();
 }
 
 /// Load the (shared) IDT register on the calling CPU.

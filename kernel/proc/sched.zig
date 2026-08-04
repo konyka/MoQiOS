@@ -173,6 +173,9 @@ fn currentCpuId() u32 {
 fn setupUserCpuState(t: *task.Task) void {
     const pc = syscall_entry.getPerCpu();
     gdt.setRsp0(currentCpuId(), t.kernel_stack_top);
+    // ioperm: refresh this CPU's TSS IOPB with the incoming task's bitmap —
+    // mandatory at every RSP0 update point or port permissions leak.
+    @import("ioperm.zig").loadForTask(currentCpuId(), t);
     pc.kernel_rsp = t.kernel_stack_top;
     pc.current_tid = t.tid;
     syscall_entry.syncUserRspFromTask(t);
@@ -1256,6 +1259,8 @@ fn tryStealTask() void {
                 sched_lock.release(flags);
                 pcid.switchCr3(t.page_table_phys);
                 gdt.setRsp0(currentCpuId(), t.kernel_stack_top);
+                // ioperm: pair every per-switch RSP0 update with the IOPB load.
+                @import("ioperm.zig").loadForTask(currentCpuId(), t);
                 syscall_entry.getPerCpu().kernel_rsp = t.kernel_stack_top;
                 return;
             }

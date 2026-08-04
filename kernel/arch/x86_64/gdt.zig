@@ -76,6 +76,42 @@ const Tss = packed struct {
 /// for the descriptor limit and IOPB base.
 const TSS_HW_SIZE: u20 = 104;
 
+/// I/O permission bitmap (IOPB) size: 1 bit per port × 65536 ports.
+pub const IO_BITMAP_BYTES: usize = 8192;
+/// IOPB storage appended to the TSS block, including the trailing 0xFF
+/// sentinel byte the architecture requires past the bitmap end.
+const IOPB_BYTES: usize = IO_BITMAP_BYTES + 1;
+/// Bytes per per-CPU TSS block: 104-byte hardware TSS + IOPB, padded up so
+/// every block start keeps the array's 16-byte alignment.
+const TSS_BLOCK_BYTES: usize = (TSS_HW_SIZE + IOPB_BYTES + 15) & ~@as(usize, 15);
+
+/// Per-CPU TSS + appended IOPB storage, carved manually out of a byte array.
+///
+/// The hardware iomap_base is a 16-bit OFFSET FROM THE TSS BASE — it can only
+/// address the 64 KiB following the TSS, so a per-task bitmap allocated from
+/// the PMM (HHDM) can never be referenced by pointer. Instead the IOPB lives
+/// at a fixed offset (TSS_HW_SIZE) inside this block and the scheduler COPIES
+/// the incoming task's bitmap into it on every context switch (loadIoBitmap),
+/// mirroring Linux's tss_copy_io_bitmap. Default content is all-ones (every
+/// port denied), so a task without an allocated bitmap — or any missed switch
+/// hook — gets #GP on port I/O, never the previous task's permissions.
+///
+/// Why raw bytes: Zig packed structs cap at 65535 total bits (a TSS+8193B
+/// block exceeds that), byte arrays are not allowed as packed fields, and a
+/// packed Tss is not extern-compatible — no struct type can express this
+/// layout, so the block is addressed by explicit offsets instead.
+
+/// Pointer to a CPU's hardware TSS (first TSS_HW_SIZE bytes of its block).
+/// The aligned stride (TSS_BLOCK_BYTES) keeps every block 16-byte aligned.
+fn tssPtr(cpu_id: usize) *Tss {
+    return @alignCast(@ptrCast(&tss_blocks[cpu_id]));
+}
+
+/// Byte pointer to a CPU's IOPB storage (offset TSS_HW_SIZE from TSS base).
+fn iopbPtr(cpu_id: usize) [*]u8 {
+    return @ptrCast(&tss_blocks[cpu_id][TSS_HW_SIZE]);
+}
+
 /// Total GDT entries: null, kcode, kdata, ucode, udata, ucode_dup, tss_low, tss_high = 8
 const GDT_ENTRIES: usize = 8;
 const MAX_CPUS: usize = @import("../cpu_capacity.zig").MAX_CPUS;
@@ -83,7 +119,7 @@ const MAX_CPUS: usize = @import("../cpu_capacity.zig").MAX_CPUS;
 /// Per-CPU GDT and TSS arrays.
 var gdt_entries: [MAX_CPUS][GDT_ENTRIES]GdtEntry = undefined;
 var gdt_ptr: [MAX_CPUS]GdtPtr = undefined;
-var tss: [MAX_CPUS]Tss = undefined;
+var tss_blocks: [MAX_CPUS][TSS_BLOCK_BYTES]u8 align(16) = undefined;
 
 /// Dedicated Interrupt Stack Table (IST) stacks.
 ///
@@ -187,13 +223,29 @@ pub fn setRsp0(cpu_id: usize, rsp0: u64) void {
         fmt.writeHex(rsp0);
         serial.writeString("\n");
     }
-    tss[cpu_id].rsp0 = rsp0;
+    tssPtr(cpu_id).rsp0 = rsp0;
 }
 
 /// Get the TSS pointer for a given CPU.
 pub fn getTssPtr(cpu_id: usize) *Tss {
-    if (cpu_id >= MAX_CPUS) return &tss[0];
-    return &tss[cpu_id];
+    if (cpu_id >= MAX_CPUS) return tssPtr(0);
+    return tssPtr(cpu_id);
+}
+
+/// Copy a task's I/O permission bitmap into this CPU's TSS block
+/// (`src == null` restores the deny-all default). The copy is mandatory on
+/// every user-task context switch: iomap_base can only address memory within
+/// 64 KiB of the TSS base, so the IOPB must physically live in the TSS block
+/// and be refreshed per task. Every call site of setRsp0 that installs a
+/// user task must be paired with this (proc/ioperm.zig loadForTask does
+/// both), otherwise the previous task's port permissions would leak.
+pub fn loadIoBitmap(cpu_id: usize, src: ?*const [IO_BITMAP_BYTES]u8) void {
+    if (cpu_id >= MAX_CPUS) return;
+    if (src) |s| {
+        @memcpy(iopbPtr(cpu_id)[0..IO_BITMAP_BYTES], s);
+    } else {
+        @memset(iopbPtr(cpu_id)[0..IO_BITMAP_BYTES], 0xFF);
+    }
 }
 
 /// Legacy compat: set RSP0 for CPU 0 (BSP).
@@ -203,16 +255,19 @@ pub fn setRsp0Bsp(rsp0: u64) void {
 
 /// Initialize GDT/TSS data for a specific CPU (without loading).
 fn initCpuGdtData(cpu_id: usize) void {
-    // Initialize TSS
-    @memset(@as([*]u8, @ptrCast(&tss[cpu_id]))[0..@sizeOf(Tss)], 0);
-    tss[cpu_id].iomap_base = TSS_HW_SIZE;
+    // Initialize TSS + appended IOPB: every port denied until a task with an
+    // allocated bitmap is switched in (loadIoBitmap). iomap_base points at
+    // the IOPB right past the 104-byte hardware TSS.
+    @memset(&tss_blocks[cpu_id], 0);
+    tssPtr(cpu_id).iomap_base = TSS_HW_SIZE;
+    @memset(iopbPtr(cpu_id)[0..IOPB_BYTES], 0xFF);
 
     // Point IST1..IST3 at their dedicated stacks (stacks grow downward, so the
     // pointer is the TOP of each region). The IDT routes #DF→IST1, #SS/#GP→IST2,
     // NMI/#MC→IST3.
-    tss[cpu_id].ist1 = istStackTop(cpu_id, 0) orelse return;
-    tss[cpu_id].ist2 = istStackTop(cpu_id, 1) orelse return;
-    tss[cpu_id].ist3 = istStackTop(cpu_id, 2) orelse return;
+    tssPtr(cpu_id).ist1 = istStackTop(cpu_id, 0) orelse return;
+    tssPtr(cpu_id).ist2 = istStackTop(cpu_id, 1) orelse return;
+    tssPtr(cpu_id).ist3 = istStackTop(cpu_id, 2) orelse return;
 
     // Build GDT entries
     gdt_entries[cpu_id][0] = makeEntry(0, 0, 0, 0); // null
@@ -223,8 +278,10 @@ fn initCpuGdtData(cpu_id: usize) void {
     gdt_entries[cpu_id][5] = makeEntry(0, 0xFFFFF, 0xFA, 0xA); // user code dup (SYSRET)
 
     // TSS descriptor (two entries). Limit MUST be the hardware TSS size, not
-    // @sizeOf(Tss) (which may be padded for the packed backing integer).
-    const tss_entries = makeTssEntry(@intFromPtr(&tss[cpu_id]), TSS_HW_SIZE - 1);
+    // @sizeOf(Tss) (which may be padded for the packed backing integer). The
+    // limit spans the appended IOPB so port I/O is checked against the bitmap
+    // instead of faulting on the descriptor limit.
+    const tss_entries = makeTssEntry(@intFromPtr(tssPtr(cpu_id)), TSS_HW_SIZE + IOPB_BYTES - 1);
     gdt_entries[cpu_id][6] = tss_entries[0];
     gdt_entries[cpu_id][7] = tss_entries[1];
 

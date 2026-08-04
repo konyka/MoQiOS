@@ -1664,6 +1664,18 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 ---
 
+### 6.13 基础设施补完·第九轮（2026-08-09）
+
+| 阶段 | 内容 | 验证 |
+|---|---|---|
+| M1 | **IOAPIC 驱动**（`ioapic.zig` + 纯逻辑 `ioapic_core.zig`）：MADT 地址映射、VER 读取重定向项数（QEMU 24 项）、REDTBL 编程（先高双字）；PIC 路径（GSI 0-15）逐字节不变；userdrv `dev_irq_register` 扩展至 GSI≥16（路由到用户向量段 100-127，BSP 投递）；引导标记 `[IOAPIC] initialized (N entries)` | host 单测 + hello51 回归 |
+| M2 | **ioperm（TSS I/O 位图）**：每任务 8KiB 位图懒分配（syscall #483 `ioperm_set`，CAP_SYS_RAWIO 门控），**每次上下文切换与 RSP0 同点装载**（防上一任务权限泄漏——安全关键点）；fork 继承独立副本、exit 释放；`ioperm_enable` 门控；hello52 端到端：用户态直接 inb/outb 读 RTC，撤销权限后访问收 #GP（退出码 141=128+13） | 120/120 host 测试 + hello52 |
+| M3 | 接线与门禁：hello52 入 init/smoke；三架构编译 | smoke SMP=1/4 |
+
+**仍遗留**：IOAPIC 未消费 MADT ISO 覆盖（电平/极性）；GSI≥16 无真实设备验证（QEMU 默认无高 GSI 设备）；devmgr 未做；真实硬件 PCID 验证。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:

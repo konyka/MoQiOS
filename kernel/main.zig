@@ -239,6 +239,11 @@ export fn _start() callconv(.c) noreturn {
     const lapic_addr = if (acpi.info.lapic_address != 0) acpi.info.lapic_address else 0xFEE00000;
     lapic.init(lapic_addr);
 
+    // IOAPIC: route GSIs >= 16 for the userspace driver framework. Must run
+    // after ACPI parsing (MADT address source) and before smp.init so AP
+    // bring-up sees a fully programmed interrupt controller.
+    @import("arch/x86_64/ioapic.zig").init(acpi.info.ioapic_address, acpi.info.ioapic_gsi_base);
+
     // Task #2: initialise the BSP's per-CPU run queue BEFORE smp.init creates
     // any kernel threads (createKernelThread/createKernelThreadAffinity may
     // observe the queue via subsequent enqueue paths). AP queues are

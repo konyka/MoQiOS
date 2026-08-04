@@ -77,9 +77,11 @@ pub const IrqTable = struct {
 
     /// Register `gsi` for `owner`. `kernel_owned` is precomputed by the
     /// caller (keyboard line, active NIC lines, ...) — a kernel-owned GSI is
-    /// always refused. PIC routing limits v1 to GSI 0-15.
-    pub fn registerIrq(self: *IrqTable, gsi: u8, owner: u32, kernel_owned: bool) RegisterError!usize {
-        if (gsi >= 16) return error.Invalid;
+    /// always refused. `max_gsi` is the exclusive routable ceiling the caller
+    /// computed from the available interrupt hardware: 16 for the legacy PIC,
+    /// higher when an IOAPIC is present (see userdrv.maxRoutableGsi).
+    pub fn registerIrq(self: *IrqTable, gsi: u8, owner: u32, kernel_owned: bool, max_gsi: u8) RegisterError!usize {
+        if (gsi >= max_gsi) return error.Invalid;
         if (kernel_owned) return error.KernelOwned;
         for (self.slots) |s| {
             if (s.active and s.gsi == gsi) return error.Busy;

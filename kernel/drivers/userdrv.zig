@@ -2,7 +2,7 @@
 ///
 /// Lets a CAP_SYS_RAWIO task drive a PCI device entirely from userspace:
 ///   - dev_map_mmio(phys, size)          map a device MMIO window (BAR)
-///   - dev_irq_register(gsi)             claim a legacy IRQ line
+///   - dev_irq_register(gsi)             claim an IRQ line (PIC 0-15, IOAPIC 16+)
 ///   - dev_irq_wait(gsi, timeout_ms)     block until an interrupt edge
 ///   - dev_irq_unregister(gsi)           release + mask the line
 ///   - dev_dma_alloc(size, out_ptr)      coherent DMA buffer mapped to user
@@ -91,8 +91,8 @@ fn isKernelOwnedGsi(gsi: u8) bool {
     return false;
 }
 
-/// Mask or unmask a legacy PIC line (GSI 0-15, vectors 32-47). No IOAPIC
-/// driver exists in this kernel, so GSI >= 16 cannot be routed (v1 limit).
+/// Mask or unmask a legacy PIC line (GSI 0-15, vectors 32-47). GSIs >= 16 go
+/// through the IOAPIC instead — see setGsiMask.
 fn picSetMask(gsi: u8, masked: bool) void {
     if (comptime !is_x86) return;
     if (gsi >= 16) return;
@@ -101,6 +101,62 @@ fn picSetMask(gsi: u8, masked: bool) void {
     const bit: u8 = @as(u8, 1) << @intCast(gsi & 7);
     const cur = io.inb(port);
     io.outb(port, if (masked) cur | bit else cur & ~bit);
+}
+
+// ─── IOAPIC routing (GSI >= 16) ─────────────────────────────────────────────
+
+/// First IDT vector handed to user-owned IOAPIC lines. The IDT dispatch
+/// (idt.zig) routes vectors 100..127 to userdrv.handleUserIrq; the LAPIC
+/// vectors (240+), NVMe MSI-X (242-245) and the yield trap (252) stay clear.
+pub const USER_IRQ_VECTOR_BASE: u8 = 100;
+pub const USER_IRQ_VECTOR_COUNT: u8 = 28; // vectors 100..127 → GSIs 16..43
+
+/// Exclusive ceiling of routable GSIs: 16 when no IOAPIC was found (legacy
+/// PIC behavior, byte-identical to v1), otherwise the smaller of the IOAPIC's
+/// redirection-entry span and the user vector window.
+fn maxRoutableGsi() u8 {
+    if (comptime !is_x86) return 16;
+    const ioapic = @import("../arch/x86_64/ioapic.zig");
+    if (!ioapic.isAvailable()) return 16;
+    const hw_ceiling: u32 = ioapic.gsiBase() + ioapic.maxRedirectionEntries();
+    const vec_ceiling: u32 = 16 + USER_IRQ_VECTOR_COUNT;
+    return @intCast(@min(hw_ceiling, vec_ceiling));
+}
+
+/// IDT vector a user-owned GSI >= 16 is routed to (inverse of the idt.zig
+/// dispatch decode).
+pub fn userIrqVector(gsi: u8) u8 {
+    return USER_IRQ_VECTOR_BASE + (gsi - 16);
+}
+
+/// Program the hardware route for a freshly registered GSI. GSI < 16 keeps
+/// the PIC path (byte-identical); >= 16 is programmed into the IOAPIC aimed
+/// at the BSP LAPIC.
+fn routeRegisteredGsi(gsi: u8) void {
+    if (comptime !is_x86) return;
+    if (gsi < 16) {
+        picSetMask(gsi, false);
+        return;
+    }
+    const ioapic = @import("../arch/x86_64/ioapic.zig");
+    const acpi = @import("../acpi/acpi_parser.zig");
+    const lapic = @import("../arch/x86_64/lapic.zig");
+    const dest: u8 = if (acpi.info.cpu_count > 0)
+        @truncate(acpi.info.cpu_apic_ids[0])
+    else
+        lapic.id();
+    _ = ioapic.routeGsi(gsi, userIrqVector(gsi), dest);
+}
+
+/// Mask or unmask a released GSI at its interrupt controller.
+fn setGsiMask(gsi: u8, masked: bool) void {
+    if (comptime !is_x86) return;
+    if (gsi < 16) {
+        picSetMask(gsi, masked);
+    } else {
+        const ioapic = @import("../arch/x86_64/ioapic.zig");
+        if (masked) ioapic.maskGsi(gsi) else ioapic.unmaskGsi(gsi);
+    }
 }
 
 /// Unmap `pages` pages starting at `base` WITHOUT freeing their frames.
@@ -170,17 +226,17 @@ pub fn syscallDevIrqRegister(gsi_u: u64) i64 {
     const gsi: u8 = @intCast(gsi_u);
 
     const flags = irq_lock.acquire();
-    const result = irq_table.registerIrq(gsi, cur.self_idx, isKernelOwnedGsi(gsi));
+    const result = irq_table.registerIrq(gsi, cur.self_idx, isKernelOwnedGsi(gsi), maxRoutableGsi());
     irq_lock.release(flags);
 
     _ = result catch |err| return switch (err) {
-        error.Invalid => errno.ENODEV, // no IOAPIC: only GSI 0-15 routable
+        error.Invalid => errno.ENODEV, // beyond PIC range and no IOAPIC route
         error.KernelOwned => errno.EBUSY,
         error.Busy => errno.EBUSY,
         error.Full => errno.EAGAIN,
     };
 
-    picSetMask(gsi, false);
+    routeRegisteredGsi(gsi);
     serial.writeString("[userdrv] irq gsi=");
     fmt.writeDecimal(gsi);
     serial.writeString(" registered\n");
@@ -251,7 +307,7 @@ pub fn syscallDevIrqUnregister(gsi_u: u64) i64 {
     irq_lock.release(flags);
     if (!ok) return errno.EINVAL;
 
-    picSetMask(gsi, true);
+    setGsiMask(gsi, true);
     serial.writeString("[userdrv] irq gsi=");
     fmt.writeDecimal(gsi);
     serial.writeString(" unregistered\n");
@@ -441,7 +497,7 @@ pub fn cleanupTask(t: *task_mod.Task, space_pml4: u64) void {
     const flags = irq_lock.acquire();
     const n = irq_table.releaseAllForTask(t.self_idx, &released);
     irq_lock.release(flags);
-    for (released[0..n]) |gsi| picSetMask(gsi, true);
+    for (released[0..n]) |gsi| setGsiMask(gsi, true);
 
     // DMA buffers (unmap first if the address space is still there).
     const dflags = dma_lock.acquire();

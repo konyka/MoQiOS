@@ -125,6 +125,8 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
     @import("../mm/mmap.zig").releaseFileRefs(cur);
     if (old_pml4 != 0) user_space.destroyUserSpace(old_pml4);
     @import("../arch/arch.zig").gdt.setRsp0(getPerCpu().cpu_id, cur.kernel_stack_top);
+    // ioperm: pair every per-switch RSP0 update with the IOPB load.
+    @import("ioperm.zig").loadForTask(getPerCpu().cpu_id, cur);
     getPerCpu().kernel_rsp = cur.kernel_stack_top;
 
     // Build interrupt frame for new program
@@ -263,6 +265,8 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64)
     @import("../mm/mmap.zig").releaseFileRefs(cur);
     if (old_pml4 != 0) user_space.destroyUserSpace(old_pml4);
     @import("../arch/arch.zig").gdt.setRsp0(getPerCpu().cpu_id, cur.kernel_stack_top);
+    // ioperm: pair every per-switch RSP0 update with the IOPB load.
+    @import("ioperm.zig").loadForTask(getPerCpu().cpu_id, cur);
     getPerCpu().kernel_rsp = cur.kernel_stack_top;
 
     const stack_top = cur.kernel_stack_top;

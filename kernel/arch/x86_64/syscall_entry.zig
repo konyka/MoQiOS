@@ -429,6 +429,9 @@ fn prepareSyscallCpu() void {
     if (pc.kernel_rsp != t.kernel_stack_top) {
         pc.kernel_rsp = t.kernel_stack_top;
         gdt_mod.setRsp0(pc.cpu_id, t.kernel_stack_top);
+        // ioperm: pair every per-switch RSP0 update with the IOPB load. The
+        // mismatch branch fires exactly when this CPU changed current task.
+        @import("../../proc/ioperm.zig").loadForTask(pc.cpu_id, t);
     }
     pc.current_tid = t.tid;
 
@@ -2422,6 +2425,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         482 => { // dev_dma_free(user_va)
             frame.rax = @bitCast(@import("../../drivers/userdrv.zig").syscallDevDmaFree(frame.rdi));
+        },
+        483 => { // ioperm_set(port, count, enable) — per-task TSS IOPB
+            frame.rax = @bitCast(@import("../../proc/ioperm.zig").syscallIopermSet(frame.rdi, frame.rsi, frame.rdx));
         },
         else => {
             serial.writeString("[syscall] unknown syscall: 0x");

@@ -1418,17 +1418,89 @@ addRef 与 COW 降级（原样复制 PTE，父子共享设备映射）。退出/
 `destroyUserSpace` 的页表遍历永远看不到设备帧；即便漏网，
 `freePageBatch` 对 refcount==0 的帧静默跳过兜底。
 
-**IRQ 路径**：无 IOAPIC 驱动，v1 仅支持 PIC 路由的 GSI 0–15（向量
-32+gsi）；内核占用线（键盘 1、级联 2、活动 e1000/virtio-net 的 IRQ）
-拒绝注册（`-EBUSY`）。`idt.handleIrq` 先查 userdrv 表：命中则计边沿 +
-EOI + 跳过内核驱动处理程序。等待用 TSC 纳秒截止 + `sti; hlt` 轮询
-（沿用 waitpid 模式），信号走 `pendingFatal`/`pendingActionable` 协议。
+**IRQ 路径**：GSI 0–15 走 PIC 路由（向量 32+gsi），行为与 v1 完全一致；
+GSI ≥ 16 经 IOAPIC 路由到用户向量窗口 100–127（见 6.11）。内核占用线
+（键盘 1、级联 2、活动 e1000/virtio-net 的 IRQ）拒绝注册（`-EBUSY`）。
+`idt.handleIrq`（PIC）与 100–127 分发分支（IOAPIC）都先查 userdrv 表：
+命中则计边沿 + EOI + 跳过内核驱动处理程序。等待用 TSC 纳秒截止 +
+`sti; hlt` 轮询（沿用 waitpid 模式），信号走
+`pendingFatal`/`pendingActionable` 协议。
 
 运行时证明 `hello51`：读 `/dev/pci` 找到 e1000 → 映射 BAR0 → 读
 STATUS(0x0008) 非零、RAL/RAH(0x5400/0x5404) 回读 MAC ==
 52:54:00:12:34:56（内核启动时打印的值）→ 内核占用 GSI 注册返回
 `-EBUSY`、空闲 GSI 10 注册/50ms 超时（`-ETIMEDOUT`）/注销语义 →
 DMA 分配/校验/释放 → munmap MMIO。标记：`hello51: PASS` / `hello51 done`。
+
+### 6.11 IOAPIC ✅
+
+文件: `kernel/arch/x86_64/ioapic.zig`（MMIO 胶水）、
+`kernel/arch/x86_64/ioapic_core.zig`（REDTBL 项编码/解码纯逻辑，主机单测）
+
+初始化在 `main.zig` 中 ACPI 解析之后、`smp.init` 之前：用 MADT 记录的
+`ioapic_address`/`ioapic_gsi_base`（`acpi_parser.zig`）经 HHDM 映射 MMIO
+窗口，读 ID/VER 取得重定向项数（VER[23:16]+1），全部项初始屏蔽，启动
+日志 `[IOAPIC] initialized (N entries)`。`ioapic_address == 0` 时记
+`[IOAPIC] not present (PIC-only)` 并保持不可用，所有调用方回退 PIC
+行为。
+
+- 寄存器接口：IOREGSEL(0x00)/IOWIN(0x10) 间接寻址；REDTBL 项 i 在
+  0x10+2i（低 32 位）/0x11+2i（高 32 位）。
+- `routeGsi(gsi, vector, dest_apic_id)` / `maskGsi` / `unmaskGsi`：
+  固定投递、物理目标、边沿触发、高电平有效。**MADT ISO（type 2 中断源
+  覆盖）未解析**——`acpi_parser` 只存 IOAPIC 地址与 GSI 基址，不存覆盖
+  表，因此所有线按边沿/高电平编程；GSI 0–15 仍走 8259A PIC 路径不受
+  影响。
+- userdrv 扩展：`dev_irq_register` 的可路由上限从 16 提升到
+  `min(gsi_base + 重定向项数, 44)`（`maxRoutableGsi`）；GSI ≥ 16 映射到
+  向量 `100 + (gsi - 16)`（窗口 100–127，与 LAPIC 定时器 240、AHCI
+  241、NVMe MSI-X 242–245、yield 252、IPI 253/254 均不冲突），目标为
+  BSP LAPIC。IDT 对向量 100–127 的分发调用
+  `userdrv.handleUserIrq(gsi)` 计边沿后向 LAPIC 发 EOI（绝不写 PIC
+  端口）。注销/任务退出时在 IOAPIC 侧重新屏蔽。
+
+### 6.12 ioperm（TSS I/O 位图）✅
+
+文件: `kernel/proc/ioperm.zig`（系统调用胶水）、
+`kernel/proc/ioperm_core.zig`（位图纯逻辑，主机单测）、
+`kernel/arch/x86_64/gdt.zig`（每 CPU TSS 块内 IOPB 存储与切换时拷贝）、
+`user/hello52.c`（端到端运行时验证）
+
+系统调用 **#483 `ioperm_set(port, count, enable)`**：校验
+`port+count ≤ 65536` 且 `count ≥ 1`（`-EINVAL`），`CAP_SYS_RAWIO` 门控
+（`-EPERM`），置位/清除调用者 I/O 位图中的对应位（位=1 表示拒绝，
+硬件语义）。编译期开关 `ioperm_enable: bool = true`（置 false 时系统
+调用返回 ENOSYS，所有 TSS IOPB 保持全 1 默认，行为与引入本特性前完全
+一致）。
+
+**安全模型**：
+
+- 默认拒绝：无位图的任务对任何端口 I/O 触发 #GP（每 CPU TSS 块内 IOPB
+  初始化为全 1，含末尾 0xFF 哨兵字节；用户 rflags=0x202，IOPL=0，位图
+  是唯一授权机制）。
+- 位图惰性分配：首次 `ioperm_set` 时分配 2 个 PMM 页（8192 字节），
+  存于 `Task.io_bitmap`。
+- **切换时加载点**：硬件 iomap_base 是 TSS 基址的 u16 偏移，无法指向
+  PMM/HHDM 分配的任务位图，因此 IOPB 固定在每 CPU TSS 块内
+  （`gdt.zig` 的 `tss_blocks`，iomap_base=104），每次上下文切换把
+  传入任务的位图**拷贝**进去（`ioperm.loadForTask` →
+  `gdt.loadIoBitmap`，仿 Linux `tss_copy_io_bitmap`）。加载与 TSS
+  RSP0 更新严格同点：`sched.setupUserCpuState`、`sched.tryStealTask`、
+  `execve`（两处）、`waitpid` 唤醒恢复、
+  `syscall_entry.prepareSyscallCpu`（惰性再同步）。漏掉任何一处都会把
+  前一个任务的端口权限泄漏给下一个任务。`ioperm_set` 本身在改完位图后
+  立即刷新当前 CPU 的活副本。
+- fork 语义：子进程继承位图的**独立副本**（`inheritForFork`，分配失败
+  时子进程回退全拒绝并告警，不阻塞 fork）。
+- 退出语义：任务收割（reapZombies）与 waitpid 回收两处拆解点释放位图
+  页（`freeBitmap`，与 `userdrv.cleanupTask` 并列）；execve 保留位图
+  （同 Linux ioperm 语义）。
+
+运行时证明 `hello52`：授予 0x70/0x71 → 读 RTC 秒寄存器并验证合法 BCD
+（≤0x59、低半字节 ≤9）→ fork 子进程继承权限读成功（退出码 0）→ 撤销
+后 fork 的子进程访问 0x71 被 #GP 杀死，waitpid 状态 == 141（本内核
+`exitTask(128+向量号)`，#GP 为向量 13）。标记：`hello52: PASS` /
+`hello52 done`。
 
 ---
 

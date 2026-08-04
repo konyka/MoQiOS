@@ -118,6 +118,10 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.permitted_caps = parent.permitted_caps;
     child.inheritable_caps = parent.inheritable_caps;
 
+    // ioperm: the child receives an independent COPY of the parent's I/O
+    // port bitmap (allocated iff the parent ever called ioperm_set).
+    @import("ioperm.zig").inheritForFork(parent, child);
+
     const child_stack_top = child.kernel_stack_top;
     const child_frame_addr = child_stack_top - @sizeOf(idt.InterruptFrame);
     const child_frame: *idt.InterruptFrame = @ptrFromInt(child_frame_addr);

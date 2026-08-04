@@ -1877,14 +1877,15 @@ test "L1: MMIO-vs-RAM overlap detection" {
 test "L1: IRQ table register/unregister/edge accounting" {
     var table: userdrv_core.IrqTable = .{};
 
+    // PIC-only ceiling: GSI >= 16 cannot be routed without an IOAPIC.
+    const PIC_MAX_GSI: u8 = 16;
     // A free GSI registers fine; the keyboard line is kernel-owned.
-    const slot = try table.registerIrq(10, 7, false);
+    const slot = try table.registerIrq(10, 7, false, PIC_MAX_GSI);
     try std.testing.expect(slot < userdrv_core.MAX_IRQ_SLOTS);
-    try std.testing.expectError(error.KernelOwned, table.registerIrq(1, 7, true));
-    // PIC-only routing: GSI >= 16 cannot be routed without an IOAPIC.
-    try std.testing.expectError(error.Invalid, table.registerIrq(16, 7, false));
+    try std.testing.expectError(error.KernelOwned, table.registerIrq(1, 7, true, PIC_MAX_GSI));
+    try std.testing.expectError(error.Invalid, table.registerIrq(16, 7, false, PIC_MAX_GSI));
     // Same GSI twice (any owner) is busy.
-    try std.testing.expectError(error.Busy, table.registerIrq(10, 8, false));
+    try std.testing.expectError(error.Busy, table.registerIrq(10, 8, false, PIC_MAX_GSI));
 
     // Edge counting is per-GSI and saturates instead of wrapping.
     try std.testing.expect(table.recordEdge(10));
@@ -1903,19 +1904,33 @@ test "L1: IRQ table register/unregister/edge accounting" {
 
     // The table holds exactly MAX_IRQ_SLOTS registrations.
     for (0..userdrv_core.MAX_IRQ_SLOTS) |i| {
-        _ = try table.registerIrq(@intCast(3 + i), 7, false);
+        _ = try table.registerIrq(@intCast(3 + i), 7, false, PIC_MAX_GSI);
     }
-    try std.testing.expectError(error.Full, table.registerIrq(15, 7, false));
+    try std.testing.expectError(error.Full, table.registerIrq(15, 7, false, PIC_MAX_GSI));
 
     // Bulk release on task exit frees exactly that task's slots.
     try std.testing.expect(table.unregisterIrq(3, 7)); // make room
-    _ = try table.registerIrq(0, 9, false); // owner 9 keeps its slot
+    _ = try table.registerIrq(0, 9, false, PIC_MAX_GSI); // owner 9 keeps its slot
     var released: [userdrv_core.MAX_IRQ_SLOTS]u8 = @splat(0xFF);
     const n = table.releaseAllForTask(7, &released);
     try std.testing.expectEqual(@as(u32, userdrv_core.MAX_IRQ_SLOTS - 1), n);
     try std.testing.expect(table.find(4) == null);
     try std.testing.expect(table.find(0) != null); // other owner untouched
     for (released[0..n]) |gsi| try std.testing.expect(gsi != 0xFF and gsi != 0);
+}
+
+test "M1: IRQ table routes GSI >= 16 once the IOAPIC ceiling is raised" {
+    var table: userdrv_core.IrqTable = .{};
+    // With an IOAPIC present the kernel passes the routable ceiling (e.g. 44
+    // for the 100-127 user vector window); GSIs 16..43 then register fine and
+    // the ceiling itself is still exclusive.
+    const IOAPIC_MAX_GSI: u8 = 44;
+    _ = try table.registerIrq(16, 7, false, IOAPIC_MAX_GSI);
+    _ = try table.registerIrq(43, 7, false, IOAPIC_MAX_GSI);
+    try std.testing.expectError(error.Invalid, table.registerIrq(44, 7, false, IOAPIC_MAX_GSI));
+    try std.testing.expectError(error.KernelOwned, table.registerIrq(1, 7, true, IOAPIC_MAX_GSI));
+    try std.testing.expect(table.recordEdge(16));
+    try std.testing.expectEqual(@as(u64, 1), table.find(16).?.edge_count);
 }
 
 test "L1: dev_dma_alloc size validation" {
@@ -1955,3 +1970,102 @@ test "L1: /dev/pci listing format" {
     try std.testing.expect(tn <= tiny.len);
 }
 // ─── end user driver framework (L1) ───
+
+// ─── M1: IOAPIC redirection-table encode/decode (ioapic_core) ───
+
+const ioapic_core = kt.ioapic_core;
+
+test "M1: REDTBL encode matches the hardware bit layout" {
+    // vector 0x64, dest APIC 1, masked: dest at bits 56-63, mask at bit 16.
+    const raw = ioapic_core.encodeRedEntry(.{ .vector = 0x64, .dest_apic_id = 1, .masked = true });
+    try std.testing.expectEqual(@as(u64, (1 << 56) | (1 << 16) | 0x64), raw);
+
+    // Defaults are fixed-delivery, physical dest, edge, active-high: all zero.
+    const unmasked = ioapic_core.encodeRedEntry(.{ .vector = 32, .dest_apic_id = 0, .masked = false });
+    try std.testing.expectEqual(@as(u64, 32), unmasked);
+}
+
+test "M1: REDTBL encode/decode round-trips routing fields" {
+    const raw = ioapic_core.encodeRedEntry(.{
+        .vector = 117,
+        .dest_apic_id = 3,
+        .masked = false,
+        .trigger = .level,
+        .polarity = .active_low,
+    });
+    const d = ioapic_core.decodeRedEntry(raw);
+    try std.testing.expectEqual(@as(u8, 117), d.vector);
+    try std.testing.expectEqual(@as(u8, 3), d.dest_apic_id);
+    try std.testing.expect(!d.masked);
+    try std.testing.expectEqual(ioapic_core.Trigger.level, d.trigger);
+    try std.testing.expectEqual(ioapic_core.Polarity.active_low, d.polarity);
+}
+
+test "M1: REDTBL mask toggle preserves vector and destination" {
+    const routed = ioapic_core.encodeRedEntry(.{ .vector = 104, .dest_apic_id = 2, .masked = false });
+    const masked = ioapic_core.setRedEntryMask(routed, true);
+    try std.testing.expectEqual(@as(u8, 104), ioapic_core.redEntryVector(masked));
+    const d = ioapic_core.decodeRedEntry(masked);
+    try std.testing.expect(d.masked);
+    try std.testing.expectEqual(@as(u8, 2), d.dest_apic_id);
+    // Unmasking returns to the exact original entry.
+    try std.testing.expectEqual(routed, ioapic_core.setRedEntryMask(masked, false));
+}
+
+// ─── M2: ioperm bitmap logic (ioperm_core) ───
+
+const ioperm_core = kt.ioperm_core;
+
+test "M2: ioperm range validation" {
+    try std.testing.expectEqual(@as(i64, 0), ioperm_core.validateRange(0, 1));
+    try std.testing.expectEqual(@as(i64, 0), ioperm_core.validateRange(0x70, 2));
+    try std.testing.expectEqual(@as(i64, 0), ioperm_core.validateRange(0, 65536));
+    try std.testing.expectEqual(@as(i64, 0), ioperm_core.validateRange(65535, 1));
+    try std.testing.expectEqual(errno.EINVAL, ioperm_core.validateRange(0, 0));
+    try std.testing.expectEqual(errno.EINVAL, ioperm_core.validateRange(65536, 1));
+    try std.testing.expectEqual(errno.EINVAL, ioperm_core.validateRange(65535, 2));
+    try std.testing.expectEqual(errno.EINVAL, ioperm_core.validateRange(0, 65537));
+}
+
+test "M2: fresh bitmap denies every port; enable/disable toggles bits" {
+    var bitmap: ioperm_core.Bitmap = ioperm_core.denyAll();
+    try std.testing.expect(!ioperm_core.isAllowed(&bitmap, 0));
+    try std.testing.expect(!ioperm_core.isAllowed(&bitmap, 0x70));
+    try std.testing.expect(!ioperm_core.isAllowed(&bitmap, 65535));
+
+    ioperm_core.setRange(&bitmap, 0x70, 2, true);
+    try std.testing.expect(ioperm_core.isAllowed(&bitmap, 0x70));
+    try std.testing.expect(ioperm_core.isAllowed(&bitmap, 0x71));
+    try std.testing.expect(!ioperm_core.isAllowed(&bitmap, 0x6F));
+    try std.testing.expect(!ioperm_core.isAllowed(&bitmap, 0x72));
+
+    ioperm_core.setRange(&bitmap, 0x70, 2, false);
+    try std.testing.expect(!ioperm_core.isAllowed(&bitmap, 0x70));
+    try std.testing.expect(!ioperm_core.isAllowed(&bitmap, 0x71));
+}
+
+test "M2: range enable crosses byte boundaries" {
+    var bitmap: ioperm_core.Bitmap = ioperm_core.denyAll();
+    ioperm_core.setRange(&bitmap, 6, 5, true); // ports 6..10 — spans bytes 0 and 1
+    for (0..16) |p| {
+        const expect_allowed = p >= 6 and p <= 10;
+        try std.testing.expectEqual(expect_allowed, ioperm_core.isAllowed(&bitmap, @intCast(p)));
+    }
+}
+
+test "M2: inherit copies the bitmap into independent storage" {
+    var parent: ioperm_core.Bitmap = ioperm_core.denyAll();
+    ioperm_core.setRange(&parent, 0x70, 2, true);
+
+    var child: ioperm_core.Bitmap = ioperm_core.denyAll();
+    ioperm_core.inherit(&child, &parent);
+    try std.testing.expect(ioperm_core.isAllowed(&child, 0x70));
+    try std.testing.expect(ioperm_core.isAllowed(&child, 0x71));
+    try std.testing.expect(!ioperm_core.isAllowed(&child, 0x72));
+
+    // Later parent changes must not leak into the child's copy (and back).
+    ioperm_core.setRange(&parent, 0x70, 2, false);
+    ioperm_core.setRange(&child, 0x3F8, 1, true);
+    try std.testing.expect(ioperm_core.isAllowed(&child, 0x70));
+    try std.testing.expect(!ioperm_core.isAllowed(&parent, 0x3F8));
+}
