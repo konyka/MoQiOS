@@ -1730,6 +1730,20 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 ---
 
+### 6.18 SMP #GP 竞态专项修复（2026-08-13）
+
+**根因链（两轮定位）**：① 初步判为 `exitTask` 唤醒路径对运行中父进程无条件覆写 `.ready`（加 `.blocked` 守卫）——**不充分，竞态仍发**。② 最终根因在 **waitpid/reapZombies 的内核栈释放窗口**：`isCurrentOnAnyCpu` 只判断僵尸任务"当前不在任何 CPU"，但退出 CPU 的切换尾声（commonStub epilogue）**仍在那条内核栈上执行**，此刻释放栈 → epilogue 读到已释放内存 → iretq 帧损坏 → `commonStub` #GP（表象为 hello13 父进程 tid=14）。
+
+**根因链（多轮定位）**：① exitTask 唤醒无条件覆写 `.ready`（加 `.blocked` 守卫，保留）。② reap 的 `isCurrentOnAnyCpu` 不覆盖切换尾声，补 `sched_entries` reap 门（保留）。③ IST4 尝试引发级联，回退。④ **已确认的核心缺陷**：TSS.RSP0 与当前任务栈不同步——切换到内核线程（idle/writeback）时 RSP0 停在旧用户任务栈上，该任务迁移后本核中断帧写到已迁移任务的栈上。修复：a) 切换到内核线程时同步 RSP0/kernel_rsp/tid/ioperm（含首次调度路径）；b) **每次切换在 setCurrentIdx 处无条件同步 RSP0 到 incoming 任务栈**，从结构上消除漏网路径（经崩溃 dump 证实：修复前 TSS.RSP0 落在当前任务 kstack 之外）。诊断（RSP0STALE/DUALCPU 金丝雀、[SW] 切换追踪）已验证并移除。
+
+**仍开放（下一轮）**：修复后 RSP0 已证实正确（rsp0 == 当前任务栈顶），但 hello13 路径仍有残余 #GP——当前证据指向**每核 `%gs:16` anchor 与栈内中断帧的嵌套覆写窗口**（IRQ 尾声 `movq %gs:16, %rsp` 依赖每核 anchor，anchor 在切换链中可被改写）；以及 cpu=2 上 idle↔writeback 高频乒乓（writeback 线程每 tick 被唤醒）。下一步：中断帧与 anchor 解耦（frame 指针随任务走，不走每核 anchor），或全程关中断覆盖尾声。
+
+**验证**：SMP=1 全绿；SMP=4 从 ~30% 失败率降到偶发（3 连跑中 2/3 仍失败于上述残余问题）。
+
+**验证**：三架构编译 + host 测试 + smoke SMP=1/4 + stress SMP=4 二十连全绿。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:

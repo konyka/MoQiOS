@@ -219,6 +219,14 @@ pub const PerCpuRunQueue = struct {
 };
 
 /// One run queue per logical CPU. Initialised lazily by `init(cpu_id)`.
+/// Per-CPU count of scheduler passes (timerTickFg entries). Incremented at
+/// every scheduler entry — timer ticks, yield traps and reschedule IPIs
+/// alike, so it advances at least every timer period on every online CPU.
+/// Used to gate zombie kernel-stack reaping (task.zig): a stack freed at
+/// >= exit_epoch + 2 entries is provably no longer live, because at most one
+/// nesting level of scheduler pass can execute inside a switch epilogue.
+pub var sched_entries: [MAX_CPUS]u64 = [_]u64{0} ** MAX_CPUS;
+
 pub var run_queues: [MAX_CPUS]PerCpuRunQueue = blk: {
     var arr: [MAX_CPUS]PerCpuRunQueue = undefined;
     var i: usize = 0;

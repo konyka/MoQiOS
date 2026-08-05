@@ -103,7 +103,7 @@ const TSS_BLOCK_BYTES: usize = (TSS_HW_SIZE + IOPB_BYTES + 15) & ~@as(usize, 15)
 
 /// Pointer to a CPU's hardware TSS (first TSS_HW_SIZE bytes of its block).
 /// The aligned stride (TSS_BLOCK_BYTES) keeps every block 16-byte aligned.
-fn tssPtr(cpu_id: usize) *Tss {
+pub fn tssPtr(cpu_id: usize) *Tss {
     return @alignCast(@ptrCast(&tss_blocks[cpu_id]));
 }
 

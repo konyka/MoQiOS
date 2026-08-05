@@ -62,6 +62,12 @@ pub const Task = struct {
     /// Last CPU this task ran on. Used by Task #2 for run-queue placement
     /// preference (warm cache) and as the fallback target when not pinned.
     last_cpu: u8 = 0,
+    /// CPU the task exited on, and the sched_entries value observed there at
+    /// that moment. waitpid must not free this task's kernel stack until
+    /// sched_entries[exit_cpu] advances past exit_epoch — proof that the
+    /// exit-time switch epilogue (which runs on this very stack) completed.
+    exit_cpu: u8 = 255,
+    exit_epoch: u64 = 0, // gate: reap when sched_entries[exit_cpu] >= exit_epoch + 3
     /// Kernel stack base (lowest address, page-aligned).
     kernel_stack: u64,
     /// Kernel stack top (highest address — this is where RSP starts).
@@ -659,6 +665,18 @@ pub fn exitTask(exit_code: i32) void {
     const idx = sched.currentTaskIndex() orelse return;
     const t = getTask(idx) orelse return;
 
+    // Stamp the exit epoch: the reap gate in waitpid compares this against
+    // sched_entries on the exit CPU to prove the exit-time switch epilogue
+    // (running on this task's kernel stack) has completed before freeing it.
+    {
+        const se = @import("../arch/arch.zig").syscall;
+        const pc = se.getPerCpuOrNull();
+        if (pc) |p| {
+            t.exit_cpu = @intCast(p.cpu_id);
+            t.exit_epoch = @atomicLoad(u64, &@import("per_cpu.zig").sched_entries[t.exit_cpu], .monotonic);
+        }
+    }
+
     // Diagnostic: deaths not going through the exit() syscall (signal kills,
     // fault terminations) are otherwise invisible in the serial log.
     if (exit_code >= 128) {
@@ -714,13 +732,23 @@ pub fn exitTask(exit_code: i32) void {
             };
             if (parent.waiting_for_child) {
                 parent.waiting_for_child = false;
-                sched_claim.store(&parent.state, .ready);
-                // Ready is not enough — re-enqueue so a busy CPU's queue-first
-                // pickNext can't starve the parent indefinitely (bitmap-only
-                // tasks lose to a never-empty per-CPU queue).
-                _ = @import("per_cpu.zig").enqueueTask(parent);
-                asm volatile ("" ::: .{ .memory = true });
-                sched.kickCpu(parent.wait_cpu);
+                // Only a BLOCKED parent may be unblocked: storing .ready on a
+                // parent that is currently .running on another CPU makes it
+                // claimable there while its original CPU is still executing
+                // it — two CPUs, one task, one kernel stack (the recurring
+                // hello13 fork+SIGUSR1 SMP #GP). A still-running parent
+                // notices waiting_for_child == false in its wait loop and
+                // takes the reap path instead, so nothing is lost either way.
+                if (parent.state == .blocked) {
+                    sched_claim.store(&parent.state, .ready);
+                    // Ready is not enough — re-enqueue so a busy CPU's
+                    // queue-first pickNext can't starve the parent
+                    // indefinitely (bitmap-only tasks lose to a never-empty
+                    // per-CPU queue).
+                    _ = @import("per_cpu.zig").enqueueTask(parent);
+                    asm volatile ("" ::: .{ .memory = true });
+                    sched.kickCpu(parent.wait_cpu);
+                }
             }
         }
     }
@@ -783,6 +811,14 @@ pub fn reapZombies() u32 {
         // Still current on some CPU (owner hasn't switched away yet) —
         // defer to the next reap interval instead of yanking a live kstack.
         if (isCurrentOnAnyCpu(i)) continue;
+        // Same epilogue-safety gate as waitpid: only free the stack once a
+        // quiescing tick has passed on the exit CPU.
+        {
+            const pc = @import("per_cpu.zig");
+            if (t.exit_cpu != 255 and
+                @atomicLoad(u64, &pc.sched_entries[t.exit_cpu], .monotonic) < t.exit_epoch + 3)
+                continue;
+        }
 
         // Check if parent is still alive
         if (t.parent_tid != 0) {
@@ -1053,6 +1089,23 @@ pub fn waitpid(parent_idx: u32, pid: i32, status: *i32) ?u32 {
                 continue;
             }
 
+            // The zombie is no longer current anywhere, but its exit-time
+            // switch epilogue may STILL be executing on its kernel stack on
+            // the exit CPU right now (the [switch-out → iretq] window).
+            // Reaping here freed that stack and produced the recurring
+            // commonStub #GP. Only reap once a quiescing tick (user-mode or
+            // idle frame) has passed on the exit CPU — proof the epilogue
+            // finished and the stack is no longer live.
+            {
+                const pc = @import("per_cpu.zig");
+                if (t.exit_cpu != 255 and
+                    @atomicLoad(u64, &pc.sched_entries[t.exit_cpu], .monotonic) < t.exit_epoch + 3)
+                {
+                    busy_child = true;
+                    continue;
+                }
+            }
+
             // Found a quiesced zombie child — collect its exit code and reap it
             status.* = t.exit_code;
             const child_tid = t.tid;
@@ -1077,6 +1130,10 @@ pub fn waitpid(parent_idx: u32, pid: i32, status: *i32) ?u32 {
         }
         task_lock.release(flags);
         if (!busy_child) return null;
+        // Spin with IRQs on: the reap gate needs a scheduler pass (timer
+        // tick) to advance sched_entries, and syscalls run with IF=0, so an
+        // unmodified pause() would spin forever (observed as a waitpid hang).
+        asm volatile ("sti");
         @import("../arch/arch.zig").cpu.pause();
     }
 }

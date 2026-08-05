@@ -440,7 +440,14 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
             setupUserCpuState(t);
             return;
         }
+        // First-ever schedule to a kernel thread (bootstrap idle): RSP0 must
+        // move to the kernel thread's stack, same as the context-switch path.
         sched_lock.release(flags);
+        gdt.setRsp0(currentCpuId(), t.kernel_stack_top);
+        const pc = syscall_entry.getPerCpu();
+        pc.kernel_rsp = t.kernel_stack_top;
+        pc.current_tid = t.tid;
+        @import("ioperm.zig").loadForTask(currentCpuId(), t);
         return;
     }
 
@@ -534,6 +541,15 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
     const arch_irq = @import("../arch/arch.zig").irq;
     const irq_flags = arch_irq.saveAndDisable();
     defer arch_irq.restore(irq_flags);
+
+    // Count this scheduler pass: the reap gate in task.zig uses it to prove a
+    // zombie's kernel stack is no longer executing (>= exit_epoch + 2 entries).
+    {
+        const pc = @import("../arch/arch.zig").syscall.getPerCpuOrNull();
+        if (pc) |p| {
+            _ = @atomicRmw(u64, &per_cpu.sched_entries[@intCast(p.cpu_id)], .Add, 1, .monotonic);
+        }
+    }
 
     // L3: publish the task this CPU switched away from last time — but only
     // when the frame proves the old kernel stack is no longer live.
@@ -787,14 +803,15 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
     }
 
     setAnchor(new_task.saved_rsp);
+    // RSP0 tracks the incoming task's stack at EVERY switch, unconditionally:
+    // any path that skips it leaves an IRQ window where the interrupt frame
+    // lands on a stack that no longer belongs to the current task (proven by
+    // crash dumps showing TSS.RSP0 outside the current task's kstack).
+    gdt.setRsp0(currentCpuId(), new_task.kernel_stack_top);
     setCurrentIdx(next_idx);
 
     // J2: publish the outgoing task LAST, after the anchor/current/CR3 moves.
     // Until the release cmpxchg lands the task stays .running and unclaimable.
-    // L3: the release is DEFERRED to this CPU's next scheduler entry
-    // (flushPendingRelease below) — even the [release → iretq] epilogue
-    // window is closed, since a remote claim can only succeed after the
-    // epilogue has long completed.
     if (new_task.page_table_phys != 0) {
         if (old_task.page_table_phys != new_task.page_table_phys) {
             const pt = new_task.page_table_phys;
@@ -806,6 +823,17 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
         setupUserCpuState(new_task);
         deferReleaseOldTask(old_task);
     } else {
+        // Switching to a kernel thread (idle/writeback/…). RSP0 MUST move to
+        // the kernel thread's own stack: leaving it on the previous USER
+        // task's stack means an interrupt here pushes its frame onto that
+        // user stack — and once that user task migrates to another CPU, the
+        // two CPUs share one kernel stack (the recurring commonStub #GP in
+        // fork/signal-heavy SMP runs).
+        gdt.setRsp0(currentCpuId(), new_task.kernel_stack_top);
+        const pc = syscall_entry.getPerCpu();
+        pc.kernel_rsp = new_task.kernel_stack_top;
+        pc.current_tid = new_task.tid;
+        @import("ioperm.zig").loadForTask(currentCpuId(), new_task);
         if (old_task.page_table_phys != 0) {
             const kernel_pml4 = paging.getKernelPml4();
             pcid.switchCr3(kernel_pml4);
