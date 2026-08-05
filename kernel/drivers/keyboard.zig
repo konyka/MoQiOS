@@ -55,7 +55,15 @@ pub fn init() void {
     ring_head = 0;
     ring_tail = 0;
 
-    // Enable PS/2 keyboard device
+    // Enable PS/2 keyboard device. The controller ports are shared with the
+    // aux (mouse) channel — serialize the command sequence on the ps2 lock
+    // so mouse.init's sequence can never interleave with ours (and vice
+    // versa). Held across the whole sequence: IRQs stay masked on this CPU,
+    // so handleInterrupt cannot steal an ACK byte mid-sequence either.
+    const ps2 = @import("ps2.zig");
+    const flags = ps2.lock.acquire();
+    defer ps2.lock.release(flags);
+
     // Clear any pending output from the keyboard controller
     while ((io.inb(PS2_STATUS) & 0x01) != 0) {
         _ = io.inb(PS2_DATA);

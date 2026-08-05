@@ -70,6 +70,16 @@ export fn _start() callconv(.c) noreturn {
     const keyboard = @import("drivers/keyboard.zig");
     keyboard.init();
 
+    // PS/2 mouse driver (aux channel, IRQ12) — shares the 0x60/0x64
+    // controller ports with the keyboard via drivers/ps2.zig's lock.
+    const mouse = @import("drivers/mouse.zig");
+    mouse.init();
+
+    // RTC wall clock: seed the epoch base so gettimeofday reports real time
+    // (TSC interpolation from here on; needs tsc.init from initCpuSurfaces).
+    const rtc = @import("drivers/rtc.zig");
+    rtc.init();
+
     // VGA text mode uses MMIO at 0xB8000 which may not be HHDM-mapped;
     // skip for now, rely on serial output instead
     klog.log(.info, "VGA skipped (serial-only mode)");
@@ -115,6 +125,11 @@ export fn _start() callconv(.c) noreturn {
     // Framebuffer graphics driver
     const framebuffer = @import("drivers/framebuffer.zig");
     framebuffer.init();
+
+    // Framebuffer text console: mirrors serial/klog output onto the
+    // framebuffer (pure addition — serial stays the primary console).
+    const fbcon = @import("drivers/fbcon.zig");
+    fbcon.init();
 
     // M6.0: PCI enumeration
     const pci = @import("drivers/pci.zig");

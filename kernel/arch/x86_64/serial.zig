@@ -29,6 +29,8 @@ pub fn writeByte(byte: u8) void {
     defer lock.release(flags);
     while ((ports.inb(COM1 + 5) & 0x20) == 0) {}
     ports.outb(COM1, byte);
+    // fbcon mirror: pure addition, no-op until fbcon.init() arms it.
+    @import("../../drivers/fbcon.zig").writeString(&[1]u8{byte});
 }
 
 pub fn writeString(s: []const u8) void {
@@ -42,4 +44,9 @@ pub fn writeString(s: []const u8) void {
         while ((ports.inb(COM1 + 5) & 0x20) == 0) {}
         ports.outb(COM1, byte);
     }
+    // fbcon mirror: serial stays the primary console; the framebuffer text
+    // console (drivers/fbcon.zig, gated by fbcon_enable) renders the same
+    // bytes. No-op when there is no framebuffer. Lock order serial → fbcon;
+    // fbcon never calls back into serial.
+    @import("../../drivers/fbcon.zig").writeString(s);
 }

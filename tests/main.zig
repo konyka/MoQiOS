@@ -2605,3 +2605,164 @@ test "static hosts: built-in table resolves localhost/gateway before any DNS que
     try std.testing.expect(static_hosts.lookup("localhos") == null);
 }
 // ─── end v1.1 finishing ───
+
+// ─── fbcon core: cell grid / cursor / scroll (drivers/fbcon_core.zig) ───
+
+const fbcon_core = kt.fbcon_core;
+const fbcon_font = kt.fbcon_font;
+
+test "fbcon core: init clamps geometry and blanks the grid" {
+    const core = fbcon_core.Core.init(1000, 1000);
+    try std.testing.expectEqual(fbcon_core.MAX_COLS, core.cols);
+    try std.testing.expectEqual(fbcon_core.MAX_ROWS, core.rows);
+    try std.testing.expectEqual(@as(u16, 0), core.cx);
+    try std.testing.expectEqual(@as(u16, 0), core.cy);
+    try std.testing.expectEqual(@as(u8, ' '), core.cellAt(0, 0));
+    try std.testing.expectEqual(@as(u8, ' '), core.cellAt(core.cols - 1, core.rows - 1));
+}
+
+test "fbcon core: printable chars advance and wrap to the next line" {
+    var core = fbcon_core.Core.init(4, 3);
+    try std.testing.expectEqual(fbcon_core.Effect{ .cell = .{ .x = 0, .y = 0, .ch = 'a' } }, core.putChar('a'));
+    try std.testing.expectEqual(@as(u16, 1), core.cx);
+    _ = core.putChar('b');
+    _ = core.putChar('c');
+    // Last column: the cell is drawn, the cursor wraps to the next row.
+    try std.testing.expectEqual(fbcon_core.Effect{ .cell = .{ .x = 3, .y = 0, .ch = 'd' } }, core.putChar('d'));
+    try std.testing.expectEqual(@as(u16, 0), core.cx);
+    try std.testing.expectEqual(@as(u16, 1), core.cy);
+    try std.testing.expectEqual(@as(u8, 'a'), core.cellAt(0, 0));
+    try std.testing.expectEqual(@as(u8, 'd'), core.cellAt(3, 0));
+}
+
+test "fbcon core: newline is CR+LF, backspace retreats, tab aligns to 8" {
+    var core = fbcon_core.Core.init(16, 4);
+    _ = core.putChar('x');
+    _ = core.putChar('\n');
+    try std.testing.expectEqual(@as(u16, 0), core.cx);
+    try std.testing.expectEqual(@as(u16, 1), core.cy);
+    _ = core.putChar('y');
+    _ = core.putChar('\r');
+    try std.testing.expectEqual(@as(u16, 0), core.cx);
+    try std.testing.expectEqual(@as(u16, 1), core.cy);
+    _ = core.putChar(0x08);
+    try std.testing.expectEqual(@as(u16, 0), core.cx); // clamped at column 0
+    _ = core.putChar('z');
+    _ = core.putChar('\t');
+    try std.testing.expectEqual(@as(u16, 8), core.cx);
+    // Control bytes without console meaning are ignored.
+    try std.testing.expectEqual(fbcon_core.Effect.none, core.putChar(0x07));
+    try std.testing.expectEqual(@as(u16, 8), core.cx);
+}
+
+test "fbcon core: full screen scrolls, keeps upper lines, clears the bottom" {
+    var core = fbcon_core.Core.init(2, 2);
+    _ = core.putChar('a');
+    _ = core.putChar('b'); // wraps to row 1
+    _ = core.putChar('c');
+    // 'd' fills the last cell of the last row: drawn, then the grid scrolls.
+    try std.testing.expectEqual(fbcon_core.Effect.scroll, core.putChar('d'));
+    // After the scroll: old row 1 ("cd") is now row 0, row 1 is blank.
+    try std.testing.expectEqual(@as(u8, 'c'), core.cellAt(0, 0));
+    try std.testing.expectEqual(@as(u8, 'd'), core.cellAt(1, 0));
+    try std.testing.expectEqual(@as(u8, ' '), core.cellAt(0, 1));
+    try std.testing.expectEqual(@as(u8, ' '), core.cellAt(1, 1));
+    try std.testing.expectEqual(@as(u16, 0), core.cx);
+    try std.testing.expectEqual(@as(u16, 1), core.cy);
+
+    // A character in the very last cell also reports the scroll (the drawn
+    // cell scrolled up with the grid).
+    _ = core.putChar('e');
+    try std.testing.expectEqual(fbcon_core.Effect.scroll, core.putChar('f'));
+    try std.testing.expectEqual(@as(u8, 'e'), core.cellAt(0, 0));
+    try std.testing.expectEqual(@as(u8, 'f'), core.cellAt(1, 0));
+}
+
+test "fbcon font: printable ASCII glyphs are present and shaped" {
+    // Space is blank, '!' has ink, glyphs are 8x16.
+    for (fbcon_font.data[0]) |row| try std.testing.expectEqual(@as(u8, 0), row);
+    var ink: u32 = 0;
+    for (fbcon_font.data['!' - 32]) |row| ink += @popCount(row);
+    try std.testing.expect(ink > 10);
+    try std.testing.expectEqual(@as(usize, 96), fbcon_font.data.len);
+    try std.testing.expectEqual(@as(usize, 16), fbcon_font.data[0].len);
+}
+// ─── end fbcon core ───
+
+// ─── PS/2 mouse packet assembly (drivers/mouse.zig pure decls) ───
+
+const mouse = kt.mouse;
+
+test "mouse packet assembler: frames 3-byte packets and resyncs" {
+    var asm_: mouse.PacketAssembler = .{};
+    try std.testing.expect(asm_.feed(0x08) == null); // bit3 set: packet start
+    try std.testing.expect(asm_.feed(0x05) == null);
+    const p = asm_.feed(0x07).?;
+    try std.testing.expectEqual([3]u8{ 0x08, 0x05, 0x07 }, p);
+
+    // A byte with bit 3 clear is not a valid packet start: dropped.
+    try std.testing.expect(asm_.feed(0x00) == null);
+    try std.testing.expectEqual(@as(u8, 0), asm_.count);
+    // Middle bytes may legitimately carry bit 3, so assembly is purely
+    // positional: three bytes after a start complete a packet.
+    _ = asm_.feed(0x09);
+    _ = asm_.feed(0x11);
+    const p2 = asm_.feed(0x0B).?;
+    try std.testing.expectEqual([3]u8{ 0x09, 0x11, 0x0B }, p2);
+    try std.testing.expectEqual(@as(u8, 0), asm_.count);
+}
+
+test "mouse decodePacket: buttons, sign extension, Y inversion, clamping" {
+    // Right button, dx=+5, wire dy=+5 (down) → reported dy=-5.
+    const e1 = mouse.decodePacket(.{ 0x0A, 5, 5 });
+    try std.testing.expectEqual(@as(u8, 2), e1.buttons);
+    try std.testing.expectEqual(@as(i8, 5), e1.dx);
+    try std.testing.expectEqual(@as(i8, -5), e1.dy);
+
+    // Negative deltas via the sign bits (bit4=X sign, bit5=Y sign):
+    // wire dx=0xFE (-2), wire dy=0xFE (-2 = up 2) → reported dy=+2.
+    const e2 = mouse.decodePacket(.{ 0x39, 0xFE, 0xFE });
+    try std.testing.expectEqual(@as(u8, 1), e2.buttons);
+    try std.testing.expectEqual(@as(i8, -2), e2.dx);
+    try std.testing.expectEqual(@as(i8, 2), e2.dy);
+
+    // Large wire deltas clamp into the i8 event range instead of wrapping.
+    const e3 = mouse.decodePacket(.{ 0x08, 0xFF, 0xFF });
+    try std.testing.expectEqual(@as(i8, 127), e3.dx);
+    try std.testing.expectEqual(@as(i8, -128), e3.dy);
+}
+// ─── end PS/2 mouse ───
+
+// ─── RTC wall-clock conversion (drivers/rtc.zig pure decls) ───
+
+const rtc = kt.rtc;
+
+test "rtc: BCD decode and century rule" {
+    try std.testing.expectEqual(@as(u8, 0), rtc.bcdToBin(0x00));
+    try std.testing.expectEqual(@as(u8, 59), rtc.bcdToBin(0x59));
+    try std.testing.expectEqual(@as(u8, 99), rtc.bcdToBin(0x99));
+    // Century pivot: 00-69 → 2000s, 70-99 → 1900s.
+    try std.testing.expectEqual(@as(u16, 2000), rtc.expandYear(0));
+    try std.testing.expectEqual(@as(u16, 2026), rtc.expandYear(26));
+    try std.testing.expectEqual(@as(u16, 2069), rtc.expandYear(69));
+    try std.testing.expectEqual(@as(u16, 1970), rtc.expandYear(70));
+    try std.testing.expectEqual(@as(u16, 1999), rtc.expandYear(99));
+}
+
+test "rtc: Gregorian date to Unix epoch seconds" {
+    // The epoch itself.
+    try std.testing.expectEqual(@as(u64, 0), rtc.dateTimeToEpoch(1970, 1, 1, 0, 0, 0));
+    // Known anchors (verifiable against any Unix date tool).
+    try std.testing.expectEqual(@as(u64, 946684800), rtc.dateTimeToEpoch(2000, 1, 1, 0, 0, 0));
+    try std.testing.expectEqual(@as(u64, 1704067200), rtc.dateTimeToEpoch(2024, 1, 1, 0, 0, 0));
+    try std.testing.expectEqual(@as(u64, 951782400), rtc.dateTimeToEpoch(2000, 2, 29, 0, 0, 0)); // leap day
+    try std.testing.expectEqual(@as(u64, 1754438400), rtc.dateTimeToEpoch(2025, 8, 6, 0, 0, 0));
+    // Time-of-day folds in.
+    try std.testing.expectEqual(@as(u64, 3661), rtc.dateTimeToEpoch(1970, 1, 1, 1, 1, 1));
+    // Leap-year math across the century boundary (2000 was a leap year).
+    try std.testing.expect(rtc.isLeapYear(2000));
+    try std.testing.expect(!rtc.isLeapYear(1900));
+    try std.testing.expect(rtc.isLeapYear(2024));
+    try std.testing.expect(!rtc.isLeapYear(2026));
+}
+// ─── end RTC ───

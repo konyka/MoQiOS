@@ -16,6 +16,13 @@
 ///   devfs-watch — read-only devfs change counter (u64 LE); read blocks
 ///             until the counter moves past the fd's last-read cursor
 ///             (devfs register/unregister, e.g. devfs_proxy nodes)
+///   fb0     — Limine framebuffer: byte read/write at offset, always-ready
+///             poll, mmap via drivers/fbdev.zig (no_free region, NOT
+///             dev_map_mmio); -ENODEV everywhere without a framebuffer
+///   fbinfo  — read-only geometry line "WxH pitch bpp\n" for /dev/fb0
+///   mouse   — PS/2 mouse event stream (4-byte [buttons, dx, dy, 0]
+///             records); empty queue: 0 with O_NONBLOCK else a short
+///             bounded block; -ENODEV without a detected mouse
 const builtin = @import("builtin");
 const devfs = @import("devfs.zig");
 
@@ -25,6 +32,9 @@ var registered: bool = false;
 var kmsg_idx: u32 = devfs.DIR_IDX;
 /// Slot index of the devfs-watch node (epollNotify on change events).
 var watch_idx: u32 = devfs.DIR_IDX;
+/// Slot index of the /dev/fb0 node — mmap() matches an mmap'd devfs fd
+/// against this to take the framebuffer mapping path (drivers/fbdev.zig).
+var fb0_idx: u32 = devfs.DIR_IDX;
 
 pub fn init() void {
     if (registered) return;
@@ -44,6 +54,17 @@ pub fn init() void {
     _ = devfs.register("pci", pci_node_ops);
     _ = devfs.register("tty", tty_node_ops);
     watch_idx = devfs.register("devfs-watch", watch_node_ops) orelse devfs.DIR_IDX;
+    fb0_idx = devfs.register("fb0", fb0_node_ops) orelse devfs.DIR_IDX;
+    _ = devfs.register("fbinfo", fbinfo_node_ops);
+    _ = devfs.register("mouse", mouse_node_ops);
+}
+
+/// devfs slot of /dev/fb0 — mmap() (mm/mmap.zig) compares a mapped devfs
+/// fd against this to route it into drivers/fbdev.zig's framebuffer
+/// mapping path instead of rejecting it with ENODEV. DIR_IDX = not
+/// registered (never equals a real node fd's slot).
+pub fn fb0NodeIdx() u32 {
+    return fb0_idx;
 }
 
 /// devfs slot of /dev/kmsg — klog's ring append notifies epoll with this
@@ -287,5 +308,155 @@ fn watchPoll(ctx: *const devfs.IoCtx) u32 {
 const watch_node_ops: devfs.NodeOps = .{
     .read = watchRead,
     .poll = watchPoll,
+    .flags = .{ .no_pread = true },
+};
+
+// ---- fb0 ----
+// Linear framebuffer device (drivers/framebuffer.zig, Limine fb). read:
+// framebuffer bytes at the fd offset (bounded by pitch*height); write:
+// pixel bytes at the offset; poll: always ready. mmap on an fb0 fd takes
+// the drivers/fbdev.zig path (matched via fb0NodeIdx in mm/mmap.zig). With
+// no Limine framebuffer every op reports -ENODEV.
+
+fn fb0Open() i64 {
+    if (comptime builtin.cpu.arch != .x86_64) return -19; // ENODEV
+    const fb = @import("../drivers/framebuffer.zig");
+    if (!fb.isInitialized()) return -19; // ENODEV
+    return 0;
+}
+
+fn fb0Read(ctx: *devfs.IoCtx, buf: [*]u8, count: usize) i64 {
+    if (comptime builtin.cpu.arch != .x86_64) return -19;
+    const fb = @import("../drivers/framebuffer.zig");
+    const addr = fb.getFramebufferAddr() orelse return -19; // ENODEV
+    const size = fb.getSize();
+    if (ctx.offset >= size) return 0;
+    const avail = size - ctx.offset;
+    const to_copy: usize = @intCast(@min(@as(u64, count), avail));
+    @memcpy(buf[0..to_copy], addr[@as(usize, @intCast(ctx.offset))..@as(usize, @intCast(ctx.offset)) + to_copy]);
+    ctx.offset += to_copy;
+    return @intCast(to_copy);
+}
+
+fn fb0Write(ctx: *devfs.IoCtx, buf: [*]const u8, count: usize) i64 {
+    if (comptime builtin.cpu.arch != .x86_64) return -19;
+    const fb = @import("../drivers/framebuffer.zig");
+    const addr = fb.getFramebufferAddr() orelse return -19; // ENODEV
+    const size = fb.getSize();
+    if (ctx.offset >= size) return 0;
+    const avail = size - ctx.offset;
+    const to_copy: usize = @intCast(@min(@as(u64, count), avail));
+    @memcpy(addr[@as(usize, @intCast(ctx.offset))..@as(usize, @intCast(ctx.offset)) + to_copy], buf[0..to_copy]);
+    ctx.offset += to_copy;
+    return @intCast(to_copy);
+}
+
+fn fb0Poll(ctx: *const devfs.IoCtx) u32 {
+    _ = ctx;
+    if (comptime builtin.cpu.arch != .x86_64) return 0;
+    const fb = @import("../drivers/framebuffer.zig");
+    if (!fb.isInitialized()) return 0;
+    return devfs.POLL_IN | devfs.POLL_OUT;
+}
+
+const fb0_node_ops: devfs.NodeOps = .{
+    .open = fb0Open,
+    .read = fb0Read,
+    .write = fb0Write,
+    .poll = fb0Poll,
+};
+
+// ---- fbinfo ----
+// Geometry query for /dev/fb0 (chosen over an ioctl-style op: devfs has no
+// ioctl channel, and a tiny read-only node is the simplest thing that
+// works). read returns one ASCII line "WxH pitch bpp\n", e.g.
+// "1024x768 4096 32\n", served at the fd offset like /dev/pci's snapshot.
+
+fn fbinfoGenerate(scratch: []u8) u32 {
+    const fb = @import("../drivers/framebuffer.zig");
+    var n: usize = 0;
+    const nums = [4]u64{ fb.getWidth(), fb.getHeight(), fb.getPitch(), fb.getBpp() };
+    for (nums, 0..) |v, i| {
+        var tmp: [20]u8 = undefined;
+        var len: usize = 0;
+        var x = v;
+        if (x == 0) {
+            tmp[0] = '0';
+            len = 1;
+        } else {
+            while (x != 0) : (x /= 10) {
+                tmp[len] = @intCast('0' + x % 10);
+                len += 1;
+            }
+        }
+        // append reversed
+        var k: usize = 0;
+        while (k < len) : (k += 1) {
+            scratch[n] = tmp[len - 1 - k];
+            n += 1;
+        }
+        scratch[n] = switch (i) {
+            0 => 'x',
+            3 => '\n',
+            else => ' ',
+        };
+        n += 1;
+    }
+    return @intCast(n);
+}
+
+fn fbinfoRead(ctx: *devfs.IoCtx, buf: [*]u8, count: usize) i64 {
+    if (comptime builtin.cpu.arch != .x86_64) return -19; // ENODEV
+    const fb = @import("../drivers/framebuffer.zig");
+    if (!fb.isInitialized()) return -19; // ENODEV
+    var scratch: [64]u8 = undefined;
+    const generated = fbinfoGenerate(&scratch);
+    if (ctx.offset >= generated) return 0;
+    const avail = generated - @as(u32, @intCast(ctx.offset));
+    const to_copy = @min(@as(u32, @intCast(count)), avail);
+    @memcpy(buf[0..to_copy], scratch[@as(u32, @intCast(ctx.offset))..@as(u32, @intCast(ctx.offset)) + to_copy]);
+    ctx.offset += to_copy;
+    return @intCast(to_copy);
+}
+
+const fbinfo_node_ops: devfs.NodeOps = .{
+    .read = fbinfoRead,
+    .poll = pollReadable,
+};
+
+// ---- mouse ----
+// PS/2 mouse event stream (drivers/mouse.zig). read dequeues 4-byte event
+// records [buttons, dx, dy, 0] (dx/dy signed, dy up-positive). Empty queue:
+// 0 with O_NONBLOCK, otherwise a short bounded block (yield loop) — no wait
+// queue, mirroring the simplest blocking behaviour that still lets a reader
+// catch the next event without spinning in userspace. -ENODEV when no
+// mouse was detected at boot.
+
+fn mouseRead(ctx: *devfs.IoCtx, buf: [*]u8, count: usize) i64 {
+    if (comptime builtin.cpu.arch != .x86_64) return -19; // ENODEV
+    const mouse = @import("../drivers/mouse.zig");
+    if (!mouse.isPresent()) return -19; // ENODEV
+    var n = mouse.read(buf[0..count]);
+    if (n > 0 or ctx.nonBlocking()) return @intCast(n);
+    const sched = @import("../proc/sched.zig");
+    var tries: u32 = 0;
+    while (tries < 100) : (tries += 1) {
+        sched.forceReschedule();
+        n = mouse.read(buf[0..count]);
+        if (n > 0) break;
+    }
+    return @intCast(n);
+}
+
+fn mousePoll(ctx: *const devfs.IoCtx) u32 {
+    _ = ctx;
+    if (comptime builtin.cpu.arch != .x86_64) return 0;
+    const mouse = @import("../drivers/mouse.zig");
+    return if (mouse.hasData()) devfs.POLL_IN else 0;
+}
+
+const mouse_node_ops: devfs.NodeOps = .{
+    .read = mouseRead,
+    .poll = mousePoll,
     .flags = .{ .no_pread = true },
 };

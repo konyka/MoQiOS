@@ -256,6 +256,31 @@ pub fn isInitialized() bool {
     return initialized;
 }
 
+/// Total framebuffer size in bytes (pitch * height).
+pub fn getSize() u64 {
+    return fb_size;
+}
+
+/// Physical base address of the framebuffer (Limine reports a HHDM virtual
+/// address). Used by the /dev/fb0 mmap path (drivers/fbdev.zig) — NOT by
+/// dev_map_mmio, which rejects RAM frames.
+pub fn getPhysBase() u64 {
+    return hhdm.virtToPhys(@intFromPtr(fb_addr));
+}
+
+/// The buffer fbcon renders into: the back buffer when double-buffered
+/// (present() swaps it to the front), the front buffer otherwise.
+pub fn rawBuffer() ?[*]u8 {
+    if (!initialized) return null;
+    if (back_buffer) |bb| return bb;
+    return fb_addr;
+}
+
+/// Push the back buffer to the screen (no-op when single-buffered).
+pub fn present() void {
+    swap();
+}
+
 pub fn getWidth() u32 {
     return fb_width;
 }

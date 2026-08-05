@@ -533,6 +533,16 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
         const sched_mod = @import("../../proc/sched.zig");
         const sig_mod = @import("../../proc/signal.zig");
 
+        // Diagnostic: log the fault before delivery — no-handler SIGSEGV
+        // terminates silently inside deliverSignalToRunningTask.
+        serial.writeString("[#PF] user fault: addr=0x");
+        fmt.writeHex(cr2);
+        serial.writeString(" rip=0x");
+        fmt.writeHex(frame.rip);
+        serial.writeString(" err=0x");
+        fmt.writeHex(frame.error_code);
+        serial.writeString("\n");
+
         if (sched_mod.currentTaskIndex()) |idx| {
             if (task_mod.getTask(idx)) |cur| {
                 if (cur.is_user) {
@@ -1032,6 +1042,10 @@ fn handleIrq(frame: *InterruptFrame, irq: u8) void {
     if (irq == 1) {
         const keyboard = @import("../../drivers/keyboard.zig");
         keyboard.handleInterrupt();
+    }
+    if (irq == 12) {
+        const mouse = @import("../../drivers/mouse.zig");
+        mouse.handleInterrupt();
     }
     // e1000 NIC interrupt (typically IRQ 11 in QEMU)
     {

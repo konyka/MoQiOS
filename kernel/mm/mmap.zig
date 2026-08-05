@@ -583,6 +583,21 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
+    // ─── /dev/fb0: framebuffer mapping ───
+    // A devfs fd is not a file mapping; the generic path below rejects it
+    // with ENODEV. An fb0 fd takes the framebuffer's own mapping path
+    // (drivers/fbdev.zig): eager shared mapping of the fb's RAM frames,
+    // addRef-pinned, tracked as a no_free region. dev_map_mmio cannot be
+    // used — the Limine fb lives in usable RAM and isRamPhys rejects it.
+    if (!is_anonymous and fd >= 0 and fd < vfs.MAX_FDS) {
+        const desc = &cur.fd_table.fds[@intCast(fd)];
+        if (desc.fd_type == .devfs and
+            desc.devfs_idx == @import("../fs/devfs_nodes.zig").fb0NodeIdx())
+        {
+            return @import("../drivers/fbdev.zig").mmapFb(cur, length, prot, flags, offset);
+        }
+    }
+
     // ─── G2: file-backed validation and backing metadata ───
     // File mappings are demand-paged: nothing is mapped here, the region
     // metadata below drives the page-fault path (handleFileFault in idt.zig).

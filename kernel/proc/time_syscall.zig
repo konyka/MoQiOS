@@ -5,9 +5,13 @@ const copy = @import("../mm/copy_from_user.zig");
 const tsc = @import("../arch/arch.zig").tsc;
 const bo = @import("../lib/byte_order.zig");
 
-/// Wall-clock offset from boot time (set by clock_settime).
+/// Wall-clock offset from boot time (set by clock_settime, or seeded from
+/// the RTC at boot by drivers/rtc.zig).
 /// wall_time_ns = tsc.nanos() + wall_clock_offset
 var wall_clock_offset: i64 = 0;
+
+pub const CLOCK_REALTIME: u64 = 0;
+pub const CLOCK_MONOTONIC: u64 = 1;
 
 /// Set wall-clock offset so that clock_gettime returns the desired time.
 pub fn setWallClockOffset(offset_ns: i64) void {
@@ -38,11 +42,14 @@ pub fn gettimeofday(tv_ptr: u64) i64 {
     return 0;
 }
 
-/// clock_gettime(tp_ptr) → 0 or -1
-pub fn clock_gettime(tp_ptr: u64) i64 {
+/// clock_gettime(clockid, tp_ptr) → 0 or -1
+/// CLOCK_REALTIME: wall clock (RTC epoch base + TSC-since-boot). Every other
+/// clock id (CLOCK_MONOTONIC included) reports the raw TSC-since-boot time,
+/// exactly as before the RTC base existed.
+pub fn clock_gettime(clockid: u64, tp_ptr: u64) i64 {
     if (tp_ptr == 0 or tp_ptr >= 0x0000_8000_0000_0000) return -1;
 
-    const ns = wallClockNanos();
+    const ns = if (clockid == CLOCK_REALTIME) wallClockNanos() else tsc.nanos();
     const sec = ns / 1_000_000_000;
     const nsec = ns % 1_000_000_000;
 

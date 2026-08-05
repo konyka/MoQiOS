@@ -1665,6 +1665,104 @@ DMA 分配/校验/释放 → munmap MMIO。标记：`hello51: PASS` / `hello51 d
 `exitTask(128+向量号)`，#GP 为向量 13）。标记：`hello52: PASS` /
 `hello52 done`。
 
+### 6.13 /dev/fb0 + /dev/fbinfo（帧缓冲设备节点 + mmap）✅
+
+文件: `kernel/fs/devfs_nodes.zig`（节点注册与 ops）、
+`kernel/drivers/fbdev.zig`（mmap 路径）、
+`kernel/drivers/framebuffer.zig`（getPhysBase/getSize/rawBuffer/present
+访问器）、`kernel/mm/mmap.zig`（fb0 fd 分支）、
+`user/hello56.c`（端到端运行时验证）
+
+- `/dev/fb0`：read = 按 fd 偏移读帧缓冲字节（上界 pitch×height）；
+  write = 按偏移写像素；poll 恒就绪（POLL_IN|POLL_OUT）。无 Limine
+  帧缓冲时 open/read/write/poll 全部返回 `-ENODEV`。
+- `/dev/fbinfo`：几何查询。devfs 没有 ioctl 通道，故选用一个只读小
+  节点而非 ioctl 式 op（更简单的方案）：read 返回一行 ASCII
+  `"WxH pitch bpp\n"`（如 `1024x768 4096 32\n`），按偏移服务，同
+  /dev/pci 快照模式。
+- **mmap 集成点**：`mmap()` 在校验 fd 类型时识别 devfs fd 且
+  `devfs_idx == devfs_nodes.fb0NodeIdx()`，转 `fbdev.mmapFb`。
+  **不走 dev_map_mmio**——Limine 帧缓冲位于可用 RAM，`pmm.isRamPhys`
+  会拒绝。fbdev 路径：要求 MAP_SHARED（私有映射无意义）、偏移页对齐、
+  长度不越界；把 fb 物理帧**急切**共享可写映射进调用者（write-through），
+  每帧 `pmm.addRef` 钉住（分配器跳过 ref>0 的帧），区域以
+  `trackNoFreeRegion` 登记——munmap/退出时 unmapRange 跳过 no_free 页，
+  帧永不归还 PMM；addRef 是刻意的永久设备内存钉（unmap 既不 free 也不
+  decRef，PMM 记账保持平衡）。
+
+### 6.14 fbcon（帧缓冲文本控制台）✅
+
+文件: `kernel/drivers/fbcon.zig`（渲染胶水）、
+`kernel/drivers/fbcon_core.zig`（纯单元格/光标/滚屏逻辑，主机单测）、
+`kernel/drivers/fbcon_font.zig`（内嵌 VGA 8x16 字体，ASCII 32-127，
+数据源自 XFree86 vga.bdf，经 ReactOS FreeLoader，GPL-2.0-or-later）、
+`kernel/arch/x86_64/serial.zig`（挂接点）
+
+- **挂接点**：x86_64 `serial.writeString`/`writeByte` 在 UART 输出之后
+  调 `fbcon.writeString`——纯增量，串口仍是主控制台；锁序
+  serial → fbcon，fbcon 绝不回调串口。`fbcon_enable` 运行期开关。
+- 渲染路径零分配（IrqSpinlock，IRQ 安全：klog 可在中断上下文经串口
+  路径到达）；无帧缓冲或非 32bpp → init 置 no-op。
+- 双缓冲可用时渲染进 back_buffer，每次 writeString 末尾 `present()`
+  交换；滚屏 = 像素行 memmove + 重绘底部两行文本（倒数第二行可能含
+  触发滚屏的那个字形）。光标为两条扫描线的下划线。
+- 语义：`\n` 含回车（串口输出从不发 `\r`）、`\t` 对齐 8 列、
+  `0x08` 退格不擦除、行尾自动折行、末行滚屏。
+
+### 6.15 PS/2 鼠标（IRQ12 + /dev/mouse）✅
+
+文件: `kernel/drivers/mouse.zig`（纯 PacketAssembler/decodePacket 主机
+单测 + 驱动胶水）、`kernel/drivers/ps2.zig`（0x60/0x64 端口共享锁）、
+`kernel/drivers/keyboard.zig`（init 改用 ps2 锁）、
+`kernel/arch/x86_64/idt.zig`（IRQ12 分发）、
+`kernel/fs/devfs_nodes.zig`（/dev/mouse 节点）
+
+- **端口协调**：i8042 的 0x60/0x64 由键盘与鼠标（aux）通道共享。
+  `ps2.zig` 提供 IrqSpinlock + 有界 waitWrite/waitRead + 控制器命令/
+  aux 命令（0xD4 前缀 + ACK）助手；keyboard.init 与 mouse.init 的命令
+  序列都在锁内完成——持锁期间本 CPU 屏蔽 IRQ，键盘 IRQ 处理器不可能
+  在序列中途抢走鼠标的 ACK 字节。
+- init 序列：使能 aux 口（0xA8）→ 读配置字节（0x20），置 bit1
+  （IRQ12 使能）、清 bit5（aux 时钟运行），写回（0x60）→ aux 设默认
+  （0xF6）→ 采样率 100（0xF3）→ 使能数据上报（0xF4）；全部有界等待，
+  无设备时记录日志并退出（IRQ12 保持屏蔽）。成功后解除 PIC 屏蔽：
+  主片 bit2（级联）+ 从片 bit4（IRQ12）。
+- IRQ12 字节经 PacketAssembler 组 3 字节包（首字节 bit3 必置位，
+  否则丢弃重同步——协议唯一的带内帧界），decodePacket 解出
+  {buttons, dx, dy}（bit4/5 符号扩展为 9 位后钳入 i8；Y 轴取反，
+  向上为正），入 64 项定长环（满则丢）。
+- `/dev/mouse`：read 出队 4 字节事件记录 `[buttons, dx, dy, 0]`；
+  空队列时 O_NONBLOCK 返回 0，否则短暂有界阻塞（≤100 次
+  forceReschedule 让出循环，无等待队列——最简阻塞镜像）；poll 报
+  POLL_IN；未探测到鼠标返回 `-ENODEV`。
+
+### 6.16 RTC 墙上时钟（gettimeofday/CLOCK_REALTIME 真时间）✅
+
+文件: `kernel/drivers/rtc.zig`（BCD→epoch 纯逻辑主机单测 + CMOS 读取）、
+`kernel/proc/time_syscall.zig`（wall_clock_offset 播种、clock_gettime
+按 clockid 分流）、`kernel/arch/x86_64/syscall_entry.zig`（228 号调用
+传入 clockid）
+
+- 启动时经 0x70/0x71 读 RTC 寄存器（有界等待 update-in-progress 清除；
+  卡死则保持启动相对时钟）。寄存器 B bit2 区分 BCD/二进制，bit1 区分
+  24/12 小时制（12 小时制按 PM 位换算）。
+- **世纪规则**：RTC 年份为两位 BCD；00-69 → 2000-2069，70-99 →
+  1970-1999（Unix 经典支点）。不信任 CMOS 世纪寄存器 0x32（QEMU 与
+  多数固件不设置）。
+- epoch 基准 = `dateTimeToEpoch`（Howard Hinnant days_from_civil），
+  随后 `wall_clock_offset = epoch_ns - tsc.nanos()`——与 clock_settime
+  同一形状，此后 gettimeofday / clock_gettime(CLOCK_REALTIME) =
+  epoch 基准 + TSC 单调内插，不再触碰 RTC。
+- `clock_gettime` 现在按 clockid 分流：CLOCK_REALTIME(0) 走墙上时钟；
+  其余 id（含 CLOCK_MONOTONIC）保持原始 TSC 启动相对时间，行为与
+  引入 RTC 基准前一致。
+
+运行时证明 `hello56`（6.13-6.16 联合）：fbinfo 解析几何 → fb0 mmap
+写 40×40 可识别像素块并经 pread 逐字节校验 → /dev/mouse 空读
+O_NONBLOCK 返回 0 → gettimeofday tv_sec > 1577836800（2020-01-01）且
+gettimeofday 与 CLOCK_MONOTONIC 各 10000 次循环单调不减。标记：
+`hello56: PASS` / `hello56 done`。
+
 ---
 
 ## 7. 同步原语

@@ -45,3 +45,7 @@ pub const devfs = @import("fs/devfs.zig");
 pub const devfs_proxy = @import("fs/devfs_proxy.zig");
 pub const static_hosts = @import("net/static_hosts.zig");
 pub const madt_iso = @import("acpi/madt_iso.zig");
+pub const fbcon_core = @import("drivers/fbcon_core.zig");
+pub const fbcon_font = @import("drivers/fbcon_font.zig");
+pub const mouse = @import("drivers/mouse.zig");
+pub const rtc = @import("drivers/rtc.zig");

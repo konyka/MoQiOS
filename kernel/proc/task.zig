@@ -659,6 +659,19 @@ pub fn exitTask(exit_code: i32) void {
     const idx = sched.currentTaskIndex() orelse return;
     const t = getTask(idx) orelse return;
 
+    // Diagnostic: deaths not going through the exit() syscall (signal kills,
+    // fault terminations) are otherwise invisible in the serial log.
+    if (exit_code >= 128) {
+        const fmt = @import("../lib/fmt.zig");
+        var b1: [24]u8 = undefined;
+        var b2: [24]u8 = undefined;
+        serial.writeString("[kill] tid=");
+        serial.writeString(fmt.fmtDec(&b1, t.tid));
+        serial.writeString(" code=");
+        serial.writeString(fmt.fmtDec(&b2, @as(u64, @intCast(exit_code))));
+        serial.writeString("\n");
+    }
+
     // v53.48: Close all open file descriptors before becoming a zombie.
     // Without this, TCP connections, pipes, ext2/fat32 files, and epoll
     // instances permanently leak their underlying resources.

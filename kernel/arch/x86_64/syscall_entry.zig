@@ -2589,7 +2589,7 @@ fn syscallGettimeofday(frame: *SyscallFrame) void {
 /// Syscall #228: clock_gettime(clockid, tp)
 /// RDI = clockid, RSI = pointer to struct timespec in user space
 fn syscallClock_gettime(frame: *SyscallFrame) void {
-    frame.rax = @bitCast(time_mod.clock_gettime(frame.rsi));
+    frame.rax = @bitCast(time_mod.clock_gettime(frame.rdi, frame.rsi));
 }
 
 /// Syscall #22: pipe(pipefd) — create a pipe

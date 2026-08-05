@@ -1716,6 +1716,20 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 ---
 
+### 6.17 基础设施补完·第十三轮（2026-08-13）
+
+| 阶段 | 内容 | 验证 |
+|---|---|---|
+| R1 | **/dev/fb0 + fbinfo 节点**：fb 帧经独立映射路径共享可写映射给用户态（fb 在 Limine usable RAM，dev_map_mmio 白名单拒绝——`fbdev.mmapFb`：MAP_SHARED 强制、逐帧 addRef 永久钉住、no_free 区域记账）；mmap fb0 时**自动停用 fbcon 镜像**（否则 present() 周期性覆盖用户像素） | hello56（像素块写读回环） |
+| R2 | **fbcon 文本控制台**：VGA 8x16 字体（提取自 ReactOS FreeLoader，GPL 兼容注明），串口输出镜像渲染到 fb（行缓冲/滚屏/光标，双缓冲 present），零分配，`fbcon_enable` 门控 | 引导 160x50 控制台 |
+| R3 | **PS/2 鼠标**：i8042 辅助通道初始化（ps2.zig 共享锁与 keyboard 命令协调）、IRQ12、3 字节包解析（位 3 重同步）、/dev/mouse 事件节点 | 初始化标记 + hello56 |
+| R4 | **RTC 墙钟**：引导读 CMOS RTC 得 epoch 基准（世纪规则 00-69→2000s；BCD/12h 处理），gettimeofday/CLOCK_REALTIME = epoch + TSC 插值，CLOCK_MONOTONIC 不变 | hello56（>2020 下限 + 单调性） |
+| R5 | 调试链：hello56 静默 SIGSEGV 根因为其 **syscall6/syscall4 包装器漏传 rdx（第 3 参数）**——prot/count 为垃圾值导致 RO 映射/pread 空读；新增常驻诊断 `[kill] tid=N code=M`（exitTask 信号死亡）与 `[#PF] user fault addr/rip/err`（Path 4 保护性缺页） | 全量验证 |
+
+**仍遗留**：hello13 fork+SIGUSR1 路径存在低频 SMP #GP（iretq 帧损坏，~5-10% 复现率，与本轮特性无关，stress 多次全绿后偶发）——已定位为下一步专项目标；fbcon 被 fb0 映射单向停用（无恢复路径）；鼠标事件无压力测试。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:
