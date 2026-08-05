@@ -1754,7 +1754,7 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 **验证中排除的假说**（均有实验证据）：双核同跑（claimed_cpu DUAL 检测三跑全零）、中断门嵌套（全 IDT 均为 0x8E 中断门，IF 入口即清）、栈槽双分配（每槽位固定虚拟窗口 + task_lock 保护）、丢唤醒（唤醒侧计数器证明唤醒先于旗标且合法空转）。
 
-**已知残余**：SMP=4 下仍有低频非 hello13 路径的挂死形态（一次观测到 hello41 子任务 running 但不进展），与本次修复的 #GP/waitpid/信号帧问题无关，留待下一轮专项。串行多核打印交错会偶发涂抹单个标记行导致 smoke 脚本误报超时（逐 run 日志核验：无 FRAMEGUARD/PANIC/挂死且到达 shell 即为通过）。
+**已知残余**：SMP=4 下 hello13 仍有较高比例（10 连跑中 6 例）的 waitpid 挂死：父进程收到的 pid 是用户栈地址（0x7FFEC0），即信号投递时读到的帧内容异常（r8=14 为 fork 前的 parent_pid 值、rip=0x100144e 落在指令中间——非硬件可产生）。已排除：锚点误读（epilogue 与投递路径均已解耦）、信号帧被 handler 覆写、GPR 未保存、丢唤醒、创建窗口。当前最强嫌疑：投递发生前入口帧已被另一写入者损坏（跨核栈使用窗口或一字节级覆写），留待下一轮专项。串行多核打印交错会偶发涂抹单个标记行导致 smoke 脚本误报超时（逐 run 日志核验：无 FRAMEGUARD/PANIC 且到达 shell 即为通过）。
 
 **验证**：三架构编译 + host 测试 + smoke SMP=1/4 + SMP=4 连跑（诊断代码 DUAL/FRAMEMOD/[wp]/WPSTALL/claimed_cpu 已全部移除）。
 
