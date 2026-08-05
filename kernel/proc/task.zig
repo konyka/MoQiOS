@@ -13,6 +13,7 @@
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const serial = @import("../arch/arch.zig").serial;
+const fmt = @import("../lib/fmt.zig");
 const paging = @import("../arch/arch.zig").paging;
 const arch_cpu = @import("../arch/arch.zig").cpu;
 const arch_irq = @import("../arch/arch.zig").interrupts;
@@ -680,7 +681,6 @@ pub fn exitTask(exit_code: i32) void {
     // Diagnostic: deaths not going through the exit() syscall (signal kills,
     // fault terminations) are otherwise invisible in the serial log.
     if (exit_code >= 128) {
-        const fmt = @import("../lib/fmt.zig");
         var b1: [24]u8 = undefined;
         var b2: [24]u8 = undefined;
         serial.writeString("[kill] tid=");
@@ -920,6 +920,12 @@ pub fn createUserProcess(
             serial.writeString("[task] no free task slots\n");
             return null;
         };
+        // The stack alloc below runs WITHOUT the lock; while the bit is set
+        // but the fields are still stale, a locked bitmap reader (picker /
+        // waitpid scan) could otherwise see a phantom .ready/.zombie task —
+        // picking it panics in setupInitialFrame (kernel_stack_top == 0).
+        // Mark the slot .blocked for the whole creation window.
+        sched_claim.store(&tasks[slot].state, .blocked);
         break :blk slot;
     };
 
@@ -1055,7 +1061,91 @@ pub fn kickRemoteForTask(slot: u32) void {
     sched.kickCpu(target_cpu);
 }
 
-/// Wait for a child process to exit. Returns the child's TID, or 0 if no
+/// Result of a single waitpid zombie scan (task_lock held by caller).
+pub const WaitScan = union(enum) {
+    /// No matching zombie child.
+    none,
+    /// A matching zombie exists but is not reapable yet (still current on its
+    /// exit CPU, or the epilogue-quiesce gate has not passed).
+    busy,
+    /// Reaped this child tid; its exit code is in *status.
+    reaped: u32,
+};
+
+/// Expose task_lock for waitpid's atomic block protocol: the waiter must hold
+/// it across [flag store → zombie scan → .blocked store] so exitTask's wake
+/// (same lock) can never slip between them.
+pub fn lockTask() u64 {
+    return task_lock.acquire();
+}
+
+pub fn unlockTask(flags: u64) void {
+    task_lock.release(flags);
+}
+
+/// Single zombie-child scan. Caller MUST hold task_lock (via lockTask).
+/// Lockless body of `waitpid` — see it for the reaping rules.
+pub fn waitpidScanLocked(parent_idx: u32, pid: i32, status: *i32) WaitScan {
+    const parent = getTask(parent_idx) orelse return .none;
+    const parent_tid_val = parent.tid;
+
+    var busy_child = false;
+    var bits = slot_bitmap;
+    while (bits != 0) {
+        const i: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const t = &tasks[i];
+        if (t.parent_tid != parent_tid_val) continue;
+        if (t.state != .zombie) continue;
+        if (pid > 0 and t.tid != @as(u32, @intCast(pid))) continue;
+
+        if (isCurrentOnAnyCpu(i)) {
+            busy_child = true;
+            continue;
+        }
+
+        // The zombie is no longer current anywhere, but its exit-time
+        // switch epilogue may STILL be executing on its kernel stack on
+        // the exit CPU right now (the [switch-out → iretq] window).
+        // Reaping here freed that stack and produced the recurring
+        // commonStub #GP. Only reap once a quiescing tick (user-mode or
+        // idle frame) has passed on the exit CPU — proof the epilogue
+        // finished and the stack is no longer live.
+        {
+            const pc = @import("per_cpu.zig");
+            if (t.exit_cpu != 255 and
+                @atomicLoad(u64, &pc.sched_entries[t.exit_cpu], .monotonic) < t.exit_epoch + 3)
+            {
+                busy_child = true;
+                continue;
+            }
+        }
+
+        // Found a quiesced zombie child — collect its exit code and reap it
+        status.* = t.exit_code;
+        const child_tid = t.tid;
+        if (t.page_table_phys != 0) {
+            // L1: release user-driver resources (IRQ registrations, DMA
+            // buffers, MMIO mappings) before the address space walk.
+            @import("../drivers/userdrv.zig").cleanupTask(t, t.page_table_phys);
+            // P1: tombstone any userspace-owned devfs nodes (drains
+            // their pending requests with -EIO).
+            @import("../fs/devfs_proxy.zig").cleanupTask(t);
+            // ioperm: return the TSS IOPB pages (allocated by ioperm_set).
+            @import("ioperm.zig").freeBitmap(t);
+            // G2: release file-region backing refs before the address space.
+            @import("../mm/mmap.zig").releaseFileRefs(t);
+            @import("../mm/user_space.zig").destroyUserSpace(t.page_table_phys);
+        }
+        freeKernelStack(t.kernel_stack);
+        slot_bitmap &= ~(@as(u64, 1) << @intCast(i));
+        task_count -= 1;
+        return .{ .reaped = child_tid };
+    }
+    return if (busy_child) .busy else .none;
+}
+
+/// Wait for a child process to exit. Returns the child's TID, or null if no
 /// child has exited yet (WNOHANG behavior). Writes the exit code to *status.
 /// pid == -1 means wait for any child; pid > 0 means wait for specific child.
 pub fn waitpid(parent_idx: u32, pid: i32, status: *i32) ?u32 {
@@ -1066,76 +1156,35 @@ pub fn waitpid(parent_idx: u32, pid: i32, status: *i32) ?u32 {
     // the one running — so this never spins on itself.
     while (true) {
         const flags = task_lock.acquire();
-
-        const parent = getTask(parent_idx) orelse {
-            task_lock.release(flags);
-            return null;
-        };
-        const parent_tid_val = parent.tid;
-
-        // Search for a matching zombie child using bitmap
-        var busy_child = false;
-        var bits = slot_bitmap;
-        while (bits != 0) {
-            const i: u32 = @intCast(@ctz(bits));
-            bits &= bits - 1;
-            const t = &tasks[i];
-            if (t.parent_tid != parent_tid_val) continue;
-            if (t.state != .zombie) continue;
-            if (pid > 0 and t.tid != @as(u32, @intCast(pid))) continue;
-
-            if (isCurrentOnAnyCpu(i)) {
-                busy_child = true;
-                continue;
-            }
-
-            // The zombie is no longer current anywhere, but its exit-time
-            // switch epilogue may STILL be executing on its kernel stack on
-            // the exit CPU right now (the [switch-out → iretq] window).
-            // Reaping here freed that stack and produced the recurring
-            // commonStub #GP. Only reap once a quiescing tick (user-mode or
-            // idle frame) has passed on the exit CPU — proof the epilogue
-            // finished and the stack is no longer live.
-            {
-                const pc = @import("per_cpu.zig");
-                if (t.exit_cpu != 255 and
-                    @atomicLoad(u64, &pc.sched_entries[t.exit_cpu], .monotonic) < t.exit_epoch + 3)
-                {
-                    busy_child = true;
-                    continue;
-                }
-            }
-
-            // Found a quiesced zombie child — collect its exit code and reap it
-            status.* = t.exit_code;
-            const child_tid = t.tid;
-            if (t.page_table_phys != 0) {
-                // L1: release user-driver resources (IRQ registrations, DMA
-                // buffers, MMIO mappings) before the address space walk.
-                @import("../drivers/userdrv.zig").cleanupTask(t, t.page_table_phys);
-                // P1: tombstone any userspace-owned devfs nodes (drains
-                // their pending requests with -EIO).
-                @import("../fs/devfs_proxy.zig").cleanupTask(t);
-                // ioperm: return the TSS IOPB pages (allocated by ioperm_set).
-                @import("ioperm.zig").freeBitmap(t);
-                // G2: release file-region backing refs before the address space.
-                @import("../mm/mmap.zig").releaseFileRefs(t);
-                @import("../mm/user_space.zig").destroyUserSpace(t.page_table_phys);
-            }
-            freeKernelStack(t.kernel_stack);
-            slot_bitmap &= ~(@as(u64, 1) << @intCast(i));
-            task_count -= 1;
-            task_lock.release(flags);
-            return child_tid;
-        }
+        const r = waitpidScanLocked(parent_idx, pid, status);
         task_lock.release(flags);
-        if (!busy_child) return null;
-        // Spin with IRQs on: the reap gate needs a scheduler pass (timer
-        // tick) to advance sched_entries, and syscalls run with IF=0, so an
-        // unmodified pause() would spin forever (observed as a waitpid hang).
-        asm volatile ("sti");
-        @import("../arch/arch.zig").cpu.pause();
+        switch (r) {
+            .reaped => |child_tid| return child_tid,
+            .none => return null,
+            .busy => {
+                // Spin with IRQs on: the reap gate needs a scheduler pass
+                // (timer tick) to advance sched_entries, and syscalls run
+                // with IF=0, so an unmodified pause() would spin forever
+                // (observed as a waitpid hang).
+                asm volatile ("sti");
+                @import("../arch/arch.zig").cpu.pause();
+            },
+        }
     }
+}
+
+/// Lockless body of `hasChildren` — caller MUST hold task_lock.
+pub fn hasChildrenLocked(parent_idx: u32) bool {
+    const parent = getTask(parent_idx) orelse return false;
+    const parent_tid_val = parent.tid;
+    var bits = slot_bitmap;
+    while (bits != 0) {
+        const i: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const t = &tasks[i];
+        if (t.parent_tid == parent_tid_val) return true;
+    }
+    return false;
 }
 
 /// Check if the given task has any children (for waitpid validation).

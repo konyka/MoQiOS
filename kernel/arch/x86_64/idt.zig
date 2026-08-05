@@ -207,7 +207,7 @@ pub const InterruptFrame = extern struct {
 /// `"r"` input instead would make the compiler materialize it into a register
 /// (RAX in practice) *before* the first `pushq`, silently corrupting the
 /// interrupted task's RAX (it would be saved/restored as the handler address).
-export var interrupt_handler_ptr: *const fn (*InterruptFrame) callconv(.c) void = &interruptDispatch;
+export var interrupt_handler_ptr: *const fn (*InterruptFrame) callconv(.c) u64 = &interruptDispatch;
 
 export fn commonStub() callconv(.naked) void {
     // CRITICAL: the very first instruction must save an interrupted register.
@@ -245,9 +245,44 @@ export fn commonStub() callconv(.naked) void {
         \\
         \\call *interrupt_handler_ptr(%%rip)
         \\
-        \\// Restore stack from the per-CPU anchor (scheduler may have switched
-        \\// stacks by rewriting %%gs:16 to a new task's frame).
-        \\movq %%gs:16, %%rsp
+        \\// Restore stack: interruptDispatch returns the frame pointer to resume
+        \\// through — the entry frame normally, or the incoming task's frame
+        \\// when the scheduler switched (anchor_switched flag). Never read the
+        \\// anchor here directly: a nested commonStub entry (e.g. a #PF inside
+        \\// the handler) clobbers %%gs:16, and the outer epilogue must still
+        \\// resume through its own entry frame.
+        \\movq %%rax, %%rsp
+        \\
+        \\// FRAME GUARD (SMP #GP hunt): validate the frame about to be popped.
+        \\// A bad rip/cs here would fault inside iretq with the stack already
+        \\// half-consumed; catch it while the frame is still fully intact.
+        \\movq 136(%%rsp), %%rax
+        \\movq %%rax, %%rcx
+        \\sarq $47, %%rcx
+        \\jz 1f
+        \\incq %%rcx
+        \\jz 1f
+        \\jmp 9f
+        \\1:
+        \\movq 144(%%rsp), %%rax
+        \\cmpq $0x08, %%rax
+        \\je 2f
+        \\cmpq $0x1B, %%rax
+        \\je 2f
+        \\cmpq $0x2B, %%rax
+        \\je 2f
+        \\jmp 9f
+        \\2:
+        \\// Kernel frame (cs=0x08): same-CPL iretq ignores ss/rsp — skip.
+        \\// User frame: iretq loads ss:rsp, so both must be sane.
+        \\cmpq $0x08, %%rax
+        \\je 3f
+        \\cmpq $0x23, 168(%%rsp)
+        \\jne 9f
+        \\movq 160(%%rsp), %%rcx
+        \\sarq $47, %%rcx
+        \\jnz 9f
+        \\3:
         \\
         \\popq %%r15
         \\popq %%r14
@@ -267,12 +302,95 @@ export fn commonStub() callconv(.naked) void {
         \\
         \\addq $16, %%rsp
         \\iretq
+        \\9:
+        \\// Frame guard tripped: dump with the frame still intact.
+        \\movq %%rsp, %%rdi
+        \\andq $-16, %%rsp
+        \\call frameGuardPanic
+        \\ud2
         ::: .{ .memory = true });
 }
 
+/// Frame-guard failure dump — called from commonStub with the suspect frame
+/// still fully intact at `frame`. Never returns.
+export fn frameGuardPanic(frame: *InterruptFrame) callconv(.c) noreturn {
+    const se = @import("syscall_entry.zig");
+    serial.writeString("\n!!! FRAMEGUARD: corrupt interrupt frame about to be popped !!!\n");
+    serial.writeString("  cpu=");
+    fmt.writeDecimal(se.getPerCpu().cpu_id);
+    serial.writeString("  frame=0x");
+    fmt.writeHex(@intFromPtr(frame));
+    serial.writeString("\n  rip=0x");
+    fmt.writeHex(frame.rip);
+    serial.writeString("  cs=0x");
+    fmt.writeHex(frame.cs);
+    serial.writeString("  rflags=0x");
+    fmt.writeHex(frame.rflags);
+    serial.writeString("  rsp=0x");
+    fmt.writeHex(frame.rsp);
+    serial.writeString("  ss=0x");
+    fmt.writeHex(frame.ss);
+    serial.writeString("  vec=0x");
+    fmt.writeHex(frame.vector);
+    serial.writeString("  err=0x");
+    fmt.writeHex(frame.error_code);
+    serial.writeString("\n  rax=0x");
+    fmt.writeHex(frame.rax);
+    serial.writeString("  rbx=0x");
+    fmt.writeHex(frame.rbx);
+    serial.writeString("  rcx=0x");
+    fmt.writeHex(frame.rcx);
+    serial.writeString("  rdx=0x");
+    fmt.writeHex(frame.rdx);
+    const sched = @import("../../proc/sched.zig");
+    const task = @import("../../proc/task.zig");
+    if (sched.currentTaskIndex()) |ci| {
+        serial.writeString("\n  cur task idx: ");
+        fmt.writeDecimal64(ci);
+        if (task.getTask(ci)) |ct| {
+            serial.writeString(" tid: ");
+            fmt.writeDecimal64(ct.tid);
+            serial.writeString(" kstack: 0x");
+            fmt.writeHex(ct.kernel_stack);
+            serial.writeString("..0x");
+            fmt.writeHex(ct.kernel_stack_top);
+            serial.writeString(" saved_rsp: 0x");
+            fmt.writeHex(ct.saved_rsp);
+        }
+    }
+    serial.writeString("\n  system halted\n");
+    while (true) {
+        asm volatile ("cli");
+        asm volatile ("hlt");
+    }
+}
+
 /// Central interrupt dispatch — called from commonStub with pointer to InterruptFrame.
-/// Decides whether to handle as exception (halt) or IRQ (return).
-pub fn interruptDispatch(frame: *InterruptFrame) callconv(.c) void {
+/// Returns the frame pointer commonStub must resume through: normally the entry
+/// frame itself; when the scheduler switched tasks mid-pass (it then sets the
+/// per-CPU anchor_switched flag via sched.switchAnchor), the incoming task's
+/// frame from the anchor. The indirection exists because a nested commonStub
+/// entry (e.g. a #PF inside this handler — the fork+SIGUSR1 COW fault path)
+/// clobbers the %gs:16 anchor, so the epilogue cannot trust it blindly.
+pub fn interruptDispatch(frame: *InterruptFrame) callconv(.c) u64 {
+    const se = @import("syscall_entry.zig");
+    const sched = @import("../../proc/sched.zig");
+    const pc = se.getPerCpu();
+    // Nesting-safe: save/restore the flag so a nested entry (which clears it
+    // for its own pass) does not erase an outer pass's already-done switch.
+    const prev_switched = pc.anchor_switched;
+    pc.anchor_switched = 0;
+    interruptDispatchInner(frame);
+    if (pc.anchor_switched != 0) {
+        pc.anchor_switched = prev_switched;
+        return sched.getAnchor();
+    }
+    pc.anchor_switched = prev_switched;
+    return @intFromPtr(frame);
+}
+
+/// Dispatch body — decides whether to handle as exception (halt) or IRQ.
+fn interruptDispatchInner(frame: *InterruptFrame) void {
     const vector: u8 = @truncate(frame.vector);
 
     if (vector < 32) {
@@ -420,8 +538,12 @@ fn handleException(frame: *InterruptFrame) void {
     // non-canonical RSP0 explains #SS-on-interrupt-delivery cascades.
     if (vector == 8 or vector == 12 or vector == 13) {
         const gdt = @import("gdt.zig");
+        const se = @import("syscall_entry.zig");
+        const crash_cpu = se.getPerCpu().cpu_id;
+        serial.writeString("\n  cpu: ");
+        fmt.writeDecimal(crash_cpu);
         serial.writeString("\n  TSS.RSP0: 0x");
-        fmt.writeHex(gdt.getTssPtr(0).rsp0);
+        fmt.writeHex(gdt.getTssPtr(crash_cpu).rsp0);
         const sched = @import("../../proc/sched.zig");
         const task = @import("../../proc/task.zig");
         if (sched.currentTaskIndex()) |ci| {
@@ -547,7 +669,7 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
             if (task_mod.getTask(idx)) |cur| {
                 if (cur.is_user) {
                     _ = sig_mod.sendSignal(cur.tid, sig_mod.SIGSEGV);
-                    if (sched_mod.deliverSignalToRunningTask(cur)) {
+                    if (sched_mod.deliverSignalToRunningTask(cur, frame)) {
                         return;
                     }
                 }

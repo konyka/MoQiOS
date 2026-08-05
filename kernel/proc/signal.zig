@@ -46,13 +46,15 @@ pub const SignalFrame = extern struct {
 };
 
 /// Sigreturn trampoline code — copied to user memory at a fixed address.
-/// After the signal handler returns via RET, RSP points 8 bytes past the
-/// return address slot. We adjust RSP back to the SignalFrame, then syscall.
-///   leaq -160(%rsp), %rsp    ; RSP -> SignalFrame (152 + 8 = 160)
+/// The SignalFrame sits ABOVE the handler's entry RSP (the handler only ever
+/// writes BELOW its RSP), so after the handler's RET the RSP points exactly
+/// at the SignalFrame — no adjustment needed. (The old layout placed the
+/// frame below the entry RSP, where the handler's own stack frames clobbered
+/// it — sigreturn then restored a corrupted rsp/rip, observed as hello13's
+/// waitpid receiving a stack address as pid.)
 ///   movq $15, %rax            ; sigreturn syscall number
 ///   syscall
-pub const SIGRETURN_TRAMPOLINE: [17]u8 = .{
-    0x48, 0x8d, 0xa4, 0x24, 0x60, 0xff, 0xff, 0xff, // leaq -160(%rsp), %rsp
+pub const SIGRETURN_TRAMPOLINE: [9]u8 = .{
     0x48, 0xc7, 0xc0, 0x0f, 0x00, 0x00, 0x00, // movq $15, %rax
     0x0f, 0x05, // syscall
 };
@@ -196,10 +198,35 @@ pub fn defaultSignalAction(signum: u32) bool {
     }
 }
 
+/// General-purpose register snapshot saved into the signal frame so sigreturn
+/// can restore the FULL interrupted context (POSIX: sigreturn must leave all
+/// callee-saved registers intact). Without this the handler's sigreturn
+/// zeroed rbx/rbp/r12-r15/etc. — intermittent user-state corruption whenever
+/// the compiler kept anything live in those registers across the interruption
+/// (observed as hello13's waitpid receiving a stack address as pid on SMP).
+pub const GpRegs = extern struct {
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rbp: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+};
+
 /// Deliver a signal to a user-space task by pushing a signal frame.
 /// `user_rsp` is the current user RSP (where we'll push the frame).
 /// `user_rip` is the current user RIP (where execution would return).
 /// `user_rflags` is the current RFLAGS.
+/// `gprs` holds the interrupted GPR set to be restored by sigreturn.
 /// Returns the new user RSP (handler entry RSP) and the handler address.
 ///
 /// User stack layout after delivery:
@@ -217,35 +244,54 @@ pub fn pushSignalFrame(
     user_rsp: u64,
     user_rip: u64,
     user_rflags: u64,
+    gprs: *const GpRegs,
 ) struct { new_rsp: u64, handler: u64 } {
     const handler_addr = t.signal_handlers[signum - 1];
 
-    // Layout (stack grows down, lower addresses are newer):
-    //   [SignalFrame]           at frame_addr
-    //   [return address]        at frame_addr + sizeof(SignalFrame)
-    //   <- handler RSP          = frame_addr + sizeof(SignalFrame)
+    // Layout (stack grows down; the handler only writes BELOW its entry RSP):
+    //   [SignalFrame]           at handler_rsp + 8 (above the handler's stack)
+    //   [return address]        at handler_rsp
+    //   <- handler RSP          = handler_rsp
     //
-    // The handler's RSP must satisfy ABI: RSP+8 is 16-aligned at entry.
-    // We compute the handler RSP first, then derive the frame address.
+    // The frame MUST sit above the handler's RSP: placing it below (the old
+    // layout) put it in the handler's stack-growth path, so any non-trivial
+    // handler clobbered the saved rsp/rip slots and sigreturn resumed with a
+    // corrupted stack (observed as hello13's waitpid getting a stack address
+    // as pid). The handler's RSP must satisfy the ABI: RSP+8 is 16-aligned
+    // at entry, and the frame (handler_rsp+8 .. +8+sizeof) must not overrun
+    // the pre-signal user RSP.
 
-    // Reserve space for SignalFrame + return address (8 bytes)
     const total_size: u64 = @sizeOf(SignalFrame) + 8;
 
-    var handler_rsp = user_rsp - total_size;
-    handler_rsp = handler_rsp & ~@as(u64, 15);
+    var handler_rsp = (user_rsp - total_size) & ~@as(u64, 15);
     handler_rsp += 8;
     if (handler_rsp + total_size > user_rsp) {
         handler_rsp -= 16;
     }
 
-    const frame_addr = handler_rsp - @sizeOf(SignalFrame);
+    const frame_addr = handler_rsp + 8;
 
     // v53.44: Build frame on kernel stack, then copyToUser for safe write.
     // Prevents kernel page fault if user stack is near limit or unmapped.
     var frame: SignalFrame = undefined;
     const fb: [*]u8 = @ptrCast(&frame);
     @memset(fb[0..@sizeOf(SignalFrame)], 0);
-    frame.rax = 0;
+    // Full interrupted GPR set — sigreturn restores these verbatim.
+    frame.rax = gprs.rax;
+    frame.rbx = gprs.rbx;
+    frame.rcx = gprs.rcx;
+    frame.rdx = gprs.rdx;
+    frame.rsi = gprs.rsi;
+    frame.rdi = gprs.rdi;
+    frame.rbp = gprs.rbp;
+    frame.r8 = gprs.r8;
+    frame.r9 = gprs.r9;
+    frame.r10 = gprs.r10;
+    frame.r11 = gprs.r11;
+    frame.r12 = gprs.r12;
+    frame.r13 = gprs.r13;
+    frame.r14 = gprs.r14;
+    frame.r15 = gprs.r15;
     frame.rip = user_rip;
     frame.rflags = user_rflags;
     frame.rsp = user_rsp;

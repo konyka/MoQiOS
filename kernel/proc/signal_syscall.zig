@@ -143,7 +143,6 @@ pub fn sigreturn() ?SigreturnResult {
     // unmapped stack (fatal — there is no per-syscall recovery) and would feed
     // kernel memory straight back into user registers when RSP points high.
     const sig_frame = readSignalFrame(user_rsp) orelse return null;
-
     // M8-5b-1: per-CPU exec redirect for the syscall return path
     const pc = syscall_entry.getPerCpu();
     pc.exec_pending = 2;

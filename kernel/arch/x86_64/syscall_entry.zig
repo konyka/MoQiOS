@@ -97,6 +97,13 @@ pub const PerCpu = extern struct {
     /// every CR3 write so TLB shootdown initiators can skip CPUs that do not
     /// run the target address space. Read lock-free by remote CPUs.
     current_cr3: u64 = 0,
+    /// Set by sched.switchAnchor when a scheduler pass redirected this CPU's
+    /// interrupt return to another task's frame. commonStub's epilogue trusts
+    /// this flag — not an anchor/frame pointer comparison — because a nested
+    /// commonStub entry (e.g. a #PF inside the handler, such as the COW fault
+    /// from a signal-frame push after fork) clobbers %%gs:16, and the outer
+    /// epilogue must still resume through its OWN entry frame.
+    anchor_switched: u8 = 0,
 };
 
 /// Per-CPU data array, indexed by CPU logical ID.
@@ -2842,7 +2849,28 @@ pub fn checkSignalsOnSyscallReturn(frame: *SyscallFrame) void {
     const user_rip = frame.rcx;
     const user_rflags = frame.r11;
 
-    const result = sig_mod.pushSignalFrame(current, signum, user_rsp, user_rip, user_rflags);
+    // Full GPR set for sigreturn. rcx/r11 hold the user rip/rflags here (the
+    // syscall instruction clobbered the user's originals with exactly those
+    // values), so passing the frame fields is faithful for every register.
+    const gprs: sig_mod.GpRegs = .{
+        .rax = frame.rax,
+        .rbx = frame.rbx,
+        .rcx = frame.rcx,
+        .rdx = frame.rdx,
+        .rsi = frame.rsi,
+        .rdi = frame.rdi,
+        .rbp = frame.rbp,
+        .r8 = frame.r8,
+        .r9 = frame.r9,
+        .r10 = frame.r10,
+        .r11 = frame.r11,
+        .r12 = frame.r12,
+        .r13 = frame.r13,
+        .r14 = frame.r14,
+        .r15 = frame.r15,
+    };
+
+    const result = sig_mod.pushSignalFrame(current, signum, user_rsp, user_rip, user_rflags, &gprs);
 
     // v53.45: Drop signal if delivery fails — avoids livelock when user stack
     // is permanently unmapped. Signal was already dequeued by dequeueSignal.

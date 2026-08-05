@@ -1736,11 +1736,27 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 **根因链（多轮定位）**：① exitTask 唤醒无条件覆写 `.ready`（加 `.blocked` 守卫，保留）。② reap 的 `isCurrentOnAnyCpu` 不覆盖切换尾声，补 `sched_entries` reap 门（保留）。③ IST4 尝试引发级联，回退。④ **已确认的核心缺陷**：TSS.RSP0 与当前任务栈不同步——切换到内核线程（idle/writeback）时 RSP0 停在旧用户任务栈上，该任务迁移后本核中断帧写到已迁移任务的栈上。修复：a) 切换到内核线程时同步 RSP0/kernel_rsp/tid/ioperm（含首次调度路径）；b) **每次切换在 setCurrentIdx 处无条件同步 RSP0 到 incoming 任务栈**，从结构上消除漏网路径（经崩溃 dump 证实：修复前 TSS.RSP0 落在当前任务 kstack 之外）。诊断（RSP0STALE/DUALCPU 金丝雀、[SW] 切换追踪）已验证并移除。
 
-**仍开放（下一轮）**：修复后 RSP0 已证实正确（rsp0 == 当前任务栈顶），但 hello13 路径仍有残余 #GP——当前证据指向**每核 `%gs:16` anchor 与栈内中断帧的嵌套覆写窗口**（IRQ 尾声 `movq %gs:16, %rsp` 依赖每核 anchor，anchor 在切换链中可被改写）；以及 cpu=2 上 idle↔writeback 高频乒乓（writeback 线程每 tick 被唤醒）。下一步：中断帧与 anchor 解耦（frame 指针随任务走，不走每核 anchor），或全程关中断覆盖尾声。
+**残余 #GP 的最终根因（第三轮，帧守卫实锤）**：在 commonStub 尾声（`movq %gs:16,%rsp` 之后、`iretq` 之前）加了**帧守卫**（校验待弹帧 rip 规范化 / cs 白名单 / 用户帧 ss+rsp），当场抓获：弹帧地址 `0x9019f3b0` ≠ 当前任务 `saved_rsp=0x9019ff50`，且帧内容是典型的**活动调用栈数据**（内核文本地址、HHDM 指针）。机理：**commonStub 入口无条件用当前帧地址覆写每核锚点 `%gs:16`，但尾声无条件信任该锚点**——处理程序执行期间任何嵌套的 commonStub 入口（如 fork 后 SIGUSR1 投递压信号帧时触发 COW 缺页 → 嵌套 #PF）都会把锚点顶成嵌套帧；嵌套返回后锚点停留在**已弹出的嵌套帧位置**，外层尾声于是把锚点处（此时是外层自己的活栈帧）当中断帧弹 → iretq #GP。这解释了全部既有证据：fork+SIGUSR1 强相关（COW #PF 是嵌套入口）、帧地址正确但内容损坏、SMP 下更高频（核间时序放大了缺页与信号投递的交叠）。
 
-**验证**：SMP=1 全绿；SMP=4 从 ~30% 失败率降到偶发（3 连跑中 2/3 仍失败于上述残余问题）。
+**修复（frame 指针随返回值走，不走每核锚点）**：
+- `interruptDispatch` 改为返回 `u64`：未切换时返回**入口帧指针本身**（嵌套覆写锚点也无关——根本不读锚点）；切换路径经 `sched.switchAnchor` 置 per-CPU `anchor_switched` 标志，有切换才返回锚点值。标志保存/恢复是嵌套安全的（入口存旧值、出口还原）。
+- commonStub 尾声 `movq %gs:16,%rsp` → `movq %rax,%rsp`。每中断返回成本仅数条指令。
+- 锚点保留原有职责：commonStub 入口写入供切换路径 `old_task.saved_rsp = getAnchor()` 使用。
+- **帧守卫转为常驻安全网**（frameGuardPanic：全帧 dump + 崩溃核 TSS.RSP0/cpu_id），异常 dump 同步改为打印崩溃核而非 CPU0。
 
-**验证**：三架构编译 + host 测试 + smoke SMP=1/4 + stress SMP=4 二十连全绿。
+**连环挖出的另外六处缺陷（同轮实锤修复）**：
+1. **waitpid 唤醒竞态后状态未复位**：子在父 `waiting_for_child=true` 之后、`state=.blocked` 之前退出时，exitTask 清旗但跳过 `.ready` 写入，父以 `.blocked` 状态继续运行，下次切出即永久丢失。修复：hlt 环退出后若 `state != .running` 则复位（此时本任务必是本核 current，幂等）。
+2. **僵尸滞留 current**：当前任务为 zombie/blocked 且队列无可运行时 `pickNextFg` 返回 null，CPU 永远停在僵尸上下文 → `isCurrentOnAnyCpu` 永远为真 → reap 永远被门挡。修复：当前任务不可运行且常规挑选为空时，回退挑选本核 idle/自举内核线程（带正规 claim）。
+3. **waitpid 阻塞协议跨锁分裂**：旗标写入在锁外、扫描在锁内，唤醒可从两者之间滑过。修复：旗标 + 僵尸扫描 + `.blocked` 写入全部置于 `task_lock` 临界区内（`lockTask`/`waitpidScanLocked`/`hasChildrenLocked` 重构），与 exitTask 的唤醒段同锁互斥。
+4. **信号帧被 handler 自身栈覆写**：`pushSignalFrame` 把 SignalFrame 放在 handler 入口 RSP **下方**——handler 的任何栈写入都会踩掉已保存的 rsp/rip 槽位，sigreturn 以损坏的 rsp 恢复 → 用户态局部变量错位。修复：SignalFrame 移到 handler 入口 RSP **上方**（trampoline 相应去掉 -160 调整）。同路径附带缺陷：`pushSignalFrame` 只保存 rip/rsp/rflags，sigreturn 把全部 callee-saved 寄存器清零——现随帧保存完整 `GpRegs`（tick 与 syscall 两条投递路径都改）。
+5. **信号投递读取过期锚点（hello13 挂死的最终根因）**：`deliverSignalToRunningTask` 经 `getAnchor()` 取"当前帧"——若本次 tick 的处理程序此前发生过嵌套 commonStub 入口（如维护 pass 内的缺页），锚点指向**已弹出的嵌套帧位置**，读到的是活栈数据（探针实锤：保存到的 r8=14 而非 15、rip=0x100144e 落在指令中间——硬件不可能产生）。沿垃圾 rip/rsp 改写并压信号帧 → 用户态上下文被毁（hello13 的 waitpid 收到栈地址 0x7FFEC0 作为 pid → 过滤永不匹配 → 永久阻塞）。修复：三个调用点全部改为**直接传入入口帧指针**（`timerTickFg`/`timerTickLegacy`/`handlePageFault` 本持就有 `frame`），信号投递路径从此不读锚点。
+6. **createUserProcess 创建窗口**：槽位预订（bitmap 置位）与字段初始化分属两个锁临界区，窗口内锁内读者可见陈旧/全零字段（`kernel_stack_top=0` 的"就绪内核线程"被挑中 → `setupInitialFrame` 减法溢出 panic）。修复：预订槽位时当即置 `.blocked`。
+
+**验证中排除的假说**（均有实验证据）：双核同跑（claimed_cpu DUAL 检测三跑全零）、中断门嵌套（全 IDT 均为 0x8E 中断门，IF 入口即清）、栈槽双分配（每槽位固定虚拟窗口 + task_lock 保护）、丢唤醒（唤醒侧计数器证明唤醒先于旗标且合法空转）。
+
+**已知残余**：SMP=4 下仍有低频非 hello13 路径的挂死形态（一次观测到 hello41 子任务 running 但不进展），与本次修复的 #GP/waitpid/信号帧问题无关，留待下一轮专项。串行多核打印交错会偶发涂抹单个标记行导致 smoke 脚本误报超时（逐 run 日志核验：无 FRAMEGUARD/PANIC/挂死且到达 shell 即为通过）。
+
+**验证**：三架构编译 + host 测试 + smoke SMP=1/4 + SMP=4 连跑（诊断代码 DUAL/FRAMEMOD/[wp]/WPSTALL/claimed_cpu 已全部移除）。
 
 ---
 

@@ -52,6 +52,21 @@ pub fn setAnchor(v: u64) void {
     pc.saved_stack_anchor = v;
 }
 
+/// Redirect this CPU's interrupt return to another task's frame (context
+/// switch). Sets the anchor AND the per-CPU `anchor_switched` flag that
+/// commonStub's epilogue consults via interruptDispatch's return value. The
+/// flag — not an anchor/frame pointer comparison — is what survives a nested
+/// commonStub entry (e.g. a #PF inside the handler, such as the COW fault
+/// from a signal-frame push after fork): such an entry clobbers %%gs:16, so
+/// the outer epilogue must resume through its OWN entry frame unless a switch
+/// genuinely happened.
+pub fn switchAnchor(v: u64) void {
+    setAnchor(v);
+    if (comptime builtin.cpu.arch == .x86_64) {
+        if (thisCpu()) |pc| pc.anchor_switched = 1;
+    }
+}
+
 pub const TIMESLICE_TICKS_PUB: u64 = TIMESLICE_TICKS;
 
 var reap_counter: u64 = 0;
@@ -226,8 +241,6 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
 /// claim protocol in sched_claim.zig instead.
 /// Lock order: sched_lock → task_lock → queue lock (no ABBA).
 fn timerTickLegacy(frame: *idt.InterruptFrame) void {
-    _ = frame;
-
     var flags = sched_lock.acquire();
 
     // Global periodic maintenance — BSP only (one tick source for the whole system).
@@ -317,7 +330,7 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
                 // Otherwise fall through to a normal reschedule: returning here
                 // would skip scheduling on every tick for as long as the signal
                 // stays undeliverable, which stalls the CPU outright.
-                if (deliverSignalToRunningTask(ct)) return;
+                if (deliverSignalToRunningTask(ct, frame)) return;
                 flags = sched_lock.acquire();
             }
         }
@@ -429,7 +442,7 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
         if (!t.started) {
             setupInitialFrame(t);
         }
-        setAnchor(t.saved_rsp);
+        switchAnchor(t.saved_rsp);
         t.state = .running;
         setCurrentIdx(next_idx);
 
@@ -501,7 +514,7 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
         setupInitialFrame(new_task);
     }
 
-    setAnchor(new_task.saved_rsp);
+    switchAnchor(new_task.saved_rsp);
     new_task.state = .running;
     setCurrentIdx(next_idx);
 
@@ -640,7 +653,7 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
                 // Otherwise fall through to a normal reschedule: returning here
                 // would skip scheduling on every tick for as long as the signal
                 // stays undeliverable, which stalls the CPU outright.
-                if (deliverSignalToRunningTask(ct)) return;
+                if (deliverSignalToRunningTask(ct, frame)) return;
             }
         }
     }
@@ -715,8 +728,23 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
     setSlice(TIMESLICE_TICKS);
 
     // Returns a task this CPU already CLAIMED (state is .running, owned here).
-    const next_idx = pickNextFg() orelse {
-        return;
+    const next_idx = pickNextFg() orelse blk: {
+        // A zombie/blocked current MUST vacate the CPU: parking on a zombie
+        // keeps it "current" here forever, and isCurrentOnAnyCpu then blocks
+        // its reap indefinitely (observed as an SMP waitpid hang). The normal
+        // pick can legitimately return null here because idle-priority (255)
+        // threads are queue-only and the BSP idle is unpinned — fall back to
+        // this CPU's idle/bootstrap kernel thread with a proper claim.
+        const cur_unrunnable = if (getCurrentIdx()) |ci0| blk2: {
+            const ct0 = task.getTask(ci0) orelse break :blk2 false;
+            const s0 = sched_claim.load(&ct0.state);
+            break :blk2 s0 == .zombie or s0 == .blocked;
+        } else false;
+        if (!cur_unrunnable) return;
+        const k = pickBootstrapKernel() orelse return;
+        const kt = task.getTask(k) orelse return;
+        if (!sched_claim.tryClaim(&kt.state)) return;
+        break :blk k;
     };
 
     // DIAG: pinned task scheduled on a foreign CPU (catches both first
@@ -746,7 +774,7 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
         if (!t.started) {
             setupInitialFrame(t);
         }
-        setAnchor(t.saved_rsp);
+        switchAnchor(t.saved_rsp);
         setCurrentIdx(next_idx);
 
         // Set up CPU state for the first scheduled task (mirror context-switch path).
@@ -802,7 +830,7 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
         setupInitialFrame(new_task);
     }
 
-    setAnchor(new_task.saved_rsp);
+    switchAnchor(new_task.saved_rsp);
     // RSP0 tracks the incoming task's stack at EVERY switch, unconditionally:
     // any path that skips it leaves an IRQ window where the interrupt frame
     // lands on a stack that no longer belongs to the current task (proven by
@@ -891,7 +919,9 @@ fn pickNextFg() ?u32 {
             // The bootstrap pick is a task_lock snapshot; another CPU may
             // have claimed the task since. Claim before committing.
             const bt = task.getTask(k) orelse return null;
-            if (sched_claim.tryClaim(&bt.state)) return k;
+            if (sched_claim.tryClaim(&bt.state)) {
+                return k;
+            }
         }
     }
     if (per_cpu.isAnyReady()) {
@@ -916,7 +946,9 @@ fn pickNextFg() ?u32 {
     while (attempts < task.MAX_TASKS) : (attempts += 1) {
         const idx = task.pickReadyForCpu(@intCast(currentCpuId()), getCurrentIdx()) orelse return null;
         const t = task.getTask(idx) orelse return null;
-        if (sched_claim.tryClaim(&t.state)) return idx;
+        if (sched_claim.tryClaim(&t.state)) {
+            return idx;
+        }
     }
     return null;
 }
@@ -1132,17 +1164,24 @@ fn kickCpuX86(cpu_id: u8) void {
 /// Modifies the InterruptFrame on the kernel stack to redirect execution
 /// to the signal handler with a signal frame pushed onto the user stack.
 ///
+/// `iframe` must be the caller's OWN entry frame — never re-read the per-CPU
+/// anchor here: a nested commonStub entry (e.g. a #PF inside this tick's
+/// maintenance pass) clobbers %%gs:16, so getAnchor() can point at an
+/// already-popped nested frame whose stack slots now hold live call-chain
+/// data. Delivering through that rewrote live stack words and pushed the
+/// user signal frame from garbage rip/rsp (observed as hello13's r8/pid
+/// corruption after SIGUSR1).
+///
 /// Returns true when the caller should resume through the frame (handler
 /// entered, default ignored, or exitTask was invoked for default terminate).
 /// Returns false when delivery failed and the caller should fall back.
-pub fn deliverSignalToRunningTask(t: *task.Task) bool {
+pub fn deliverSignalToRunningTask(t: *task.Task, iframe: *idt.InterruptFrame) bool {
     // Only deliver to tasks returning to user mode.
     // Check this BEFORE dequeuing the signal to avoid losing it.
     // Both user code selectors have to be accepted: a task resumed with iretq
     // runs on USER_CS, but one that last returned through sysret runs on
     // USER_CS_SYSRET, which is most of the time for anything that makes
     // syscalls. Testing only USER_CS made this path silently give up.
-    const iframe: *idt.InterruptFrame = @ptrFromInt(getAnchor());
     if (iframe.cs != gdt.USER_CS and iframe.cs != gdt.USER_CS_SYSRET) return false;
 
     const sig_mod = @import("signal.zig");
@@ -1168,7 +1207,27 @@ pub fn deliverSignalToRunningTask(t: *task.Task) bool {
     const user_rip = iframe.rip;
     const user_rflags = iframe.rflags;
 
-    const result = sig_mod.pushSignalFrame(t, signum, user_rsp, user_rip, user_rflags);
+    // Save the full interrupted GPR set for sigreturn — taken BEFORE the
+    // rdi=signum redirect below overwrites the frame.
+    const gprs: sig_mod.GpRegs = .{
+        .rax = iframe.rax,
+        .rbx = iframe.rbx,
+        .rcx = iframe.rcx,
+        .rdx = iframe.rdx,
+        .rsi = iframe.rsi,
+        .rdi = iframe.rdi,
+        .rbp = iframe.rbp,
+        .r8 = iframe.r8,
+        .r9 = iframe.r9,
+        .r10 = iframe.r10,
+        .r11 = iframe.r11,
+        .r12 = iframe.r12,
+        .r13 = iframe.r13,
+        .r14 = iframe.r14,
+        .r15 = iframe.r15,
+    };
+
+    const result = sig_mod.pushSignalFrame(t, signum, user_rsp, user_rip, user_rflags, &gprs);
 
     // v53.45: Drop signal if delivery fails — avoids livelock when user stack
     // is permanently unmapped. Signal was already dequeued by dequeueSignal.
