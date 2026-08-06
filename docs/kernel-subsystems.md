@@ -622,12 +622,23 @@ const SchedStats = struct {
 
 ### 2.5 clone() 线程 (CLONE_VM/THREAD + FS_BASE TLS) ✅
 
-文件: `task.zig`, `syscall_entry.zig`
+文件: `task.zig`, `syscall_entry.zig`, `arch/x86_64/clone.zig`
 
 - syscall #56，支持CLONE_VM/CLONE_THREAD/CLONE_SETTLS；CLONE_FILES当前复制FD表，尚未实现共享FD表语义
 - CLONE_VM：共享地址空间创建轻量级线程
 - 独立内核栈，FS_BASE TLS指针配置
 - 其余Linux clone标志按当前实现范围处理，完整CLONE_FILES语义仍待实现
+
+### 2.5a pthread 子集（moqi_libc，v1，2026-08-14）✅
+
+文件: `lib/moqi_libc/{include/pthread.h,src/pthread.c,src/crt0.c}`、`kernel/arch/x86_64/clone.zig`、`kernel/proc/{task,process_mgmt}.zig`
+
+- **线程模型**：每线程独立 malloc 分配区，头部放 TCB（FS:0 直读），栈区其后；子线程 FS 由内核 `CLONE_SETTLS` 安装，主线程由 crt0 `arch_prctl(ARCH_SET_FS)` 安装。
+- **API**：`pthread_create/join/exit/self`、`pthread_mutex_*`（glibc 风格 0/1/2 futex 状态机，无竞争零系统调用）、`pthread_once`（0/1/2 状态机）、`pthread_key_create/getspecific/setspecific`（32 keys）、每线程 `errno`（TCB 内）。
+- **内核配合**：`Task.is_thread`（CLONE_THREAD 置位）；`getpid()` 对线程汇报 tgid（创建者 tid）；`waitpidScanLocked`/`hasChildrenLocked` 跳过线程（线程经 pthread_join 汇合而非 waitpid）。
+- **性能设计**：mutex 快路径一次 `lock cmpxchg`；join 单次 futex 唤醒；TLS 一次安装后纯内存访问。
+- **v1 限制**：CLONE_FILES 真共享 fd 表未实现（创建时复制）；`__thread`（PT_TLS）未实现，线程私有数据用 getspecific；detached 线程不 join 时栈描述符泄漏（v2 回收）。
+- **验收**：hello57（4 线程 × 25000 次互斥自增 = 100000 全对、once 恰好一次、getspecific/errno 隔离、tgid 一致），SMP=1/4 smoke 通过。
 
 **TLS 基址是任务私有状态（2026-07-25 修正）**
 

@@ -225,6 +225,8 @@ pub fn clone(
     child.cwd_len = parent.cwd_len;
     child.pgid = parent.pgid;
     child.sid = parent.sid;
+    // CLONE_THREAD: 标记为线程——getpid 汇报 tgid，waitpid 不 reap。
+    child.is_thread = (flags & CLONE_THREAD) != 0;
     // Inherit credentials
     child.uid = parent.uid;
     child.gid = parent.gid;

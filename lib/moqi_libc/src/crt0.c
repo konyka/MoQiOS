@@ -11,6 +11,7 @@
 #include "../include/unistd.h"
 
 extern int main(int argc, char **argv, char **envp);
+extern void __pthread_init_main(void);
 
 /* Process environment, set by _start_c from the initial stack. */
 char **environ;
@@ -19,6 +20,8 @@ __attribute__((used)) void _start_c(unsigned long *sp) {
     long argc;
     char **argv;
     char **envp;
+    /* 先装主线程 FS/TCB（errno/getspecific 依赖），再进 main。 */
+    __pthread_init_main();
     moqi_parse_initial_stack(sp, &argc, &argv, &envp);
     environ = envp;
     int code = main((int)argc, argv, envp);

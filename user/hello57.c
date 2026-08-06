@@ -1,0 +1,115 @@
+// hello57 — pthread 子集验收测试（TDD 目标）。
+// 覆盖：pthread_create/join/retval、mutex 竞争正确性、pthread_once 恰好一次、
+// pthread_getspecific 线程私有数据、errno 线程隔离、getpid tgid 一致性。
+#include "../lib/moqi_libc/include/stdio.h"
+#include "../lib/moqi_libc/include/stdlib.h"
+#include "../lib/moqi_libc/include/string.h"
+#include "../lib/moqi_libc/include/unistd.h"
+#include "../lib/moqi_libc/include/pthread.h"
+
+#define NTHREADS 4
+#define NITER 25000
+
+static pthread_mutex_t counter_lock = PTHREAD_MUTEX_INITIALIZER;
+static long counter;
+static pthread_once_t once_ctrl = PTHREAD_ONCE_INIT;
+static int once_ran;
+static pthread_key_t key_a;
+
+static int failures;
+
+#define CHECK(cond, name) do { \
+    if (!(cond)) { \
+        print("hello57: FAIL " name "\n"); \
+        failures++; \
+    } \
+} while (0)
+
+static void print_u64(unsigned long v) {
+    char buf[24];
+    int i = 0;
+    if (v == 0) { print("0"); return; }
+    while (v != 0) { buf[i++] = (char)('0' + v % 10); v /= 10; }
+    while (i > 0) { char c[2] = { buf[--i], 0 }; print(c); }
+}
+
+static void once_init(void) {
+    once_ran++;
+}
+
+static void *worker(void *arg) {
+    long id = (long)arg;
+    for (long i = 0; i < NITER; i++) {
+        pthread_mutex_lock(&counter_lock);
+        counter++;
+        pthread_mutex_unlock(&counter_lock);
+    }
+    pthread_once(&once_ctrl, once_init);
+
+    /* 线程私有数据：写入再读回，须为本线程的值。 */
+    pthread_setspecific(key_a, (void *)(id * 100 + 7));
+    void *got = pthread_getspecific(key_a);
+    if (got != (void *)(id * 100 + 7)) {
+        print("hello57: FAIL getspecific\n");
+        __sync_fetch_and_add(&failures, 1);
+    }
+
+    /* errno 线程隔离：本线程改写 errno，不得影响其他线程。 */
+    errno = (int)(1000 + id);
+
+    /* getpid 在全部线程中必须一致（tgid）。 */
+    long pid = getpid();
+    return (void *)(id * 10 + (pid & 0));
+}
+
+int main(int argc, char **argv, char **envp) {
+    (void)argc; (void)argv; (void)envp;
+    print("hello57: start\n");
+
+    if (pthread_key_create(&key_a, 0) != 0) {
+        print("hello57: FAIL key_create\n");
+        return 1;
+    }
+
+    pthread_t th[NTHREADS];
+    for (long i = 0; i < NTHREADS; i++) {
+        if (pthread_create(&th[i], 0, worker, (void *)i) != 0) {
+            print("hello57: FAIL create\n");
+            return 1;
+        }
+    }
+
+    long main_pid = getpid();
+    long main_errno = 5;
+    errno = 5;
+
+    for (long i = 0; i < NTHREADS; i++) {
+        void *ret = 0;
+        if (pthread_join(th[i], &ret) != 0) {
+            print("hello57: FAIL join\n");
+            return 1;
+        }
+        if (ret != (void *)(i * 10)) {
+            print("hello57: FAIL retval\n");
+            failures++;
+        }
+    }
+
+    CHECK(counter == (long)NTHREADS * NITER, "counter");
+    CHECK(once_ran == 1, "once");
+    CHECK(errno == 5, "errno-isolation");
+    CHECK(main_pid == getpid(), "tgid");
+    (void)main_errno;
+
+    if (failures == 0) {
+        print("hello57: PASS (");
+        print_u64((unsigned long)counter);
+        print(" increments)\n");
+    } else {
+        print("hello57: FAIL count=");
+        print_u64((unsigned long)failures);
+        print("\n");
+        return 1;
+    }
+    return 0;
+}

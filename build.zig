@@ -70,6 +70,7 @@ const moqi_libc_sources = [_][]const u8{
     "lib/moqi_libc/src/sbrk.c",
     "lib/moqi_libc/src/stdlib.c",
     "lib/moqi_libc/src/signal.c",
+    "lib/moqi_libc/src/pthread.c",
 };
 
 /// C user program built against moqi_libc: same flags as addCUserProgram,
@@ -291,7 +292,7 @@ pub fn build(b: *std.Build) void {
     // (parsing the kernel's SysV initial stack) and the syscall wrappers.
     // init (PID 1) is the C replacement for user/init.S; its source lives in
     // servers/init/, everything else in user/.
-    const libc_programs = [_][]const u8{ "sh", "hello10", "hello45" };
+    const libc_programs = [_][]const u8{ "sh", "hello10", "hello45", "hello57" };
     for (libc_programs) |name| addLibcUserProgram(b, name, b.fmt("user/{s}.c", .{name}));
     addLibcUserProgram(b, "init", "servers/init/main.c");
     addLibcUserProgram(b, "syslogd", "servers/syslogd/main.c");

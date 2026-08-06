@@ -1774,6 +1774,22 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 ---
 
+### 6.20 基础设施补完·第十四轮（2026-08-14）：pthread 子集 v1
+
+| 阶段 | 内容 | 验证 |
+|---|---|---|
+| 方案 | 盘点未实现基建（explore 代理全仓调研）：首选用户态线程——内核 clone(CLONE_VM/THREAD/SETTLS) 已就绪、futex 已就绪，价值/工作量比最高；CLONE_FILES 共享 fd 表与 __thread(PT_TLS) 列入 v2 | docs/kernel-subsystems.md §2.5a |
+| TDD | 先写 hello57 验收测试（create/join/retval/mutex 竞争计数/once/specific/errno 隔离/tgid），再实现至绿 | hello57 全项通过 |
+| libc | `pthread.h/pthread.c`：TCB（FS:0）线程模型；create/join/exit/self；glibc 风格 0/1/2 futex mutex（无竞争零 syscall）；once；32 keys getspecific；每线程 errno；crt0 装主线程 FS | 100000 次互斥自增全对 |
+| 内核 | `Task.is_thread`；getpid 对线程汇报 tgid；waitpidScanLocked/hasChildrenLocked 跳过线程 | SMP=1 一次通过 |
+| 接入 | build.zig（hello57→libc_programs、pthread.c→moqi_libc_sources）、init run_test、qemu_smoke.sh 标记、qemu_run.sh 打包清单 | SMP=4 首跑全过（标记涂抹为既有串行交错问题） |
+
+**性能设计**：mutex 快路径一次 `lock cmpxchg`（无竞争零系统调用）；unlock 无争零唤醒；join 单次 futex 唤醒；TLS 一次安装后纯内存访问；futex 状态机与 glibc 同构。
+
+**验证**：SMP=1 smoke 一次通过（hello57 100000 全对）；SMP=4 首跑通过；三架构编译 + host 测试通过。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:

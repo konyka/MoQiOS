@@ -89,6 +89,10 @@ pub const Task = struct {
     personality: @import("../arch/arch.zig").syscall.Personality,
     /// Whether this task runs in user mode.
     is_user: bool,
+    /// Whether this task is a thread (clone with CLONE_THREAD, shares the
+    /// creator's address space). Threads report the creator's tid as getpid()
+    /// and are joined via pthread_join, not reaped by waitpid.
+    is_thread: bool = false,
     /// User-space entry point (RIP).
     user_entry: u64,
     /// User-space stack top (RSP for ring3).
@@ -1096,6 +1100,7 @@ pub fn waitpidScanLocked(parent_idx: u32, pid: i32, status: *i32) WaitScan {
         bits &= bits - 1;
         const t = &tasks[i];
         if (t.parent_tid != parent_tid_val) continue;
+        if (t.is_thread) continue; // 线程由 pthread_join 汇合，不经 waitpid
         if (t.state != .zombie) continue;
         if (pid > 0 and t.tid != @as(u32, @intCast(pid))) continue;
 
@@ -1182,7 +1187,7 @@ pub fn hasChildrenLocked(parent_idx: u32) bool {
         const i: u32 = @intCast(@ctz(bits));
         bits &= bits - 1;
         const t = &tasks[i];
-        if (t.parent_tid == parent_tid_val) return true;
+        if (t.parent_tid == parent_tid_val and !t.is_thread) return true;
     }
     return false;
 }
