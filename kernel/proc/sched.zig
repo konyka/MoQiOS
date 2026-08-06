@@ -482,10 +482,10 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
     old_task.saved_rsp = getAnchor();
     if (old_task.is_user) syscall_entry.syncUserRspToTask(old_task);
 
-    // Task #1: eager fxsave on context switch (only if old_task currently
-    // owns the FPU on this CPU) + arm CR0.TS so the new task takes a lazy
-    // #NM the first time it touches FPU/SSE state.
+    // Task #1: eager FPU — fxsave the outgoing task if it owns this CPU's
+    // FPU, then fxrstor the incoming task's state. No lazy #NM arming.
     context_switch.onContextSwitch(old_task);
+    context_switch.onSwitchIn(new_task);
 
     // CPU time accounting: accumulate time spent in this task
     const tsc_mod = @import("../arch/arch.zig").tsc;
@@ -806,10 +806,10 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
     old_task.saved_rsp = getAnchor();
     if (old_task.is_user) syscall_entry.syncUserRspToTask(old_task);
 
-    // Task #1: eager fxsave on context switch (only if old_task currently
-    // owns the FPU on this CPU) + arm CR0.TS so the new task takes a lazy
-    // #NM the first time it touches FPU/SSE state.
+    // Task #1: eager FPU — fxsave the outgoing task if it owns this CPU's
+    // FPU, then fxrstor the incoming task's state. No lazy #NM arming.
     context_switch.onContextSwitch(old_task);
+    context_switch.onSwitchIn(new_task);
 
     // CPU time accounting: accumulate time spent in this task
     const tsc_mod = @import("../arch/arch.zig").tsc;

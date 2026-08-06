@@ -1760,6 +1760,20 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 ---
 
+### 6.19 残余 hello13 挂死专项——结案（2026-08-14）
+
+**结论：上一轮"已知残余"挂死由三个独立成因叠加，已全部闭合。**
+
+1. **AP 从 x86 复位态继承 CR0.CD=1/NW=1（真 bug）**：实测挂死现场某核 `cr0=0xE001001B`（复位态 0x60000010 | PE/MP/TS/NE/PG）——AP bring-up 只 OR 了 PE/PG，`context_switch.initCpu()` 又只清 EM，CD/NW 从未清除，该 AP 整个启动周期以 cache-disabled 运行（慢 50-100 倍，且部分微架构下停 snoop 致内核结构脏读）。修复：`initCpu` 增加 `btr $29/$30`。
+2. **懒 FPU #NM 活锁（真 bug）**：记录到同一 movups 上 94~178 次 #NM、每 timeslice（10 tick）循环一次——懒恢复模型（切出 fxsave + arm TS、首用 #NM 触发 fxrstor）在 SMP 抢占节奏下构成"arm→fault→clear→preempt→arm"闭环，指令永不完成。修复：改 **eager FPU**——`onContextSwitch` 仅 fxsave（不再 arm TS），新增 `onSwitchIn` 在切入时直接 fxrstor/fninit。改后 #NM 归零。
+3. **"父进程冻结于入口指令、零执行"形态是取证探针自身造成的假象（重要教训）**：fentry/ripbytes 等探针在 tick 处理程序中逐 tick 串口打印（115200 波特每行数毫秒），制造"恢复即被下一 tick 抢占"的自持续饥饿风暴，表象与真 bug 无异。决定性对照：同一批次内，含探针的 4 轮全部"冻结"，探针移除后重建的 4 轮全部通过。**教训：中断/调度热路径禁止串口打印，探针只能放系统调用等冷路径或落环形缓冲。**
+
+**最终验证**：移除全部 tick 路径探针后 SMP=4 八连跑全过（stormlines=0，#NM=0）；三架构编译 + host 测试通过。
+
+**遗留说明**：上一轮记录的信号投递帧 rip=0x100144e（指令中间）未再复现——其与懒 FPU 活锁/CD 缺陷共因的可能性大；投递完整性探针（dispatch 入口快照 vs 交付值逐字节比对）曾证明帧与快照一致，即若再现亦非 handler 内改写。此处留存为观察项，不设专项。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:

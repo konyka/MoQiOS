@@ -159,14 +159,18 @@ pub fn initCpu() void {
         \\bts $1, %%rax        // set CR0.MP   (monitor coprocessor)
         \\bts $3, %%rax        // set CR0.TS   (lazy switch armed)
         \\bts $16, %%rax       // set CR0.WP   (supervisor honours write-protect)
-        \\movq %%rax, %%cr0
-        ::: .{ .rax = true, .memory = true });
+        \\btr $29, %%rax       // clear CR0.NW  — APs start from the x86 reset
+        \\btr $30, %%rax       // clear CR0.CD    state (CD=1/NW=1): without this
+        \\movq %%rax, %%cr0    // an AP runs cache-disabled (and potentially
+        ::: .{ .rax = true, .memory = true }); // incoherent) for the whole boot.
 }
 
 /// Called from the scheduler immediately before it reroutes the per-CPU
 /// stack anchor from `old` to a new task. If `old` owns the FPU on this
-/// CPU we fxsave its state, then arm CR0.TS so the incoming task takes a
-/// lazy #NM the first time it touches FPU/SSE.
+/// CPU we fxsave its state. EAGER restore model: the incoming task's state
+/// is fxrstor'd right here in `onSwitchIn` — no CR0.TS arming. (The lazy
+/// model's #NM-on-first-use livelocked on SMP under signal/fork load: the
+/// same SSE instruction faulted dozens of times without completing.)
 pub fn onContextSwitch(old: ?*task.Task) void {
     if (builtin.cpu.arch != .x86_64) return;
     if (old) |o| {
@@ -183,9 +187,38 @@ pub fn onContextSwitch(old: ?*task.Task) void {
             o.fpu_home_cpu = 0;
         }
     }
-    // Arm lazy-restore for the incoming task: the next FPU/SSE use takes a
-    // #NM, which fxrstors the task's saved state.
-    setTs();
+}
+
+/// Eagerly restore the incoming task's FPU state on this CPU.
+/// Called from the scheduler right after `onContextSwitch`.
+pub fn onSwitchIn(cur: ?*task.Task) void {
+    if (builtin.cpu.arch != .x86_64) return;
+    const t = cur orelse return;
+    const cpu_id = syscall_entry.getPerCpu().cpu_id;
+    if (cpu_id >= syscall_entry.MAX_CPUS) return;
+    // Drop the previous owner's claim on this CPU's FPU — but ONLY when its
+    // live state is anchored to THIS CPU (fpu_home_cpu). J1: clearing the
+    // flag of a task that is FPU-live on ANOTHER CPU made that CPU's next
+    // context switch skip the fxsave, and the task later resumed with a
+    // stale fxrstor (hello50 worker pattern corruption after migration).
+    if (fpu_owners[cpu_id]) |prev| {
+        if (prev != t and prev.fpu_home_cpu == cpu_id + 1) {
+            prev.fpu_owned = false;
+            prev.fpu_home_cpu = 0;
+        }
+    }
+    if (t.fpu_initialized) {
+        asm volatile ("fxrstor (%[buf])"
+            :
+            : [buf] "r" (@as([*]u8, @ptrCast(&t.fpu_state))),
+            : .{ .memory = true });
+    } else {
+        asm volatile ("fninit" ::: .{ .memory = true });
+        t.fpu_initialized = true;
+    }
+    t.fpu_owned = true;
+    t.fpu_home_cpu = @intCast(cpu_id + 1);
+    fpu_owners[cpu_id] = t;
 }
 
 /// #NM (vector 7 — Device Not Available) handler. Runs with interrupts
