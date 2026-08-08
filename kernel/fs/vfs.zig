@@ -572,6 +572,10 @@ pub const FdTable = struct {
             .special => {
                 // stdin (fd 0): read from keyboard buffer
                 if (fd == FD_STDIN) {
+                    // 作业控制：后台进程组读控制台 → SIGTTIN/EIO（v1 单一终端模型）
+                    const jc = @import("../proc/jobctl.zig");
+                    const jc_rc = jc.stdinJobCheck();
+                    if (jc_rc != 0) return jc_rc;
                     const keyboard = @import("../drivers/keyboard.zig");
                     const n = keyboard.read(buf[0..count]);
                     return @intCast(n);

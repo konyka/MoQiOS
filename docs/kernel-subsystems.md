@@ -410,8 +410,12 @@ const Task = struct {
 - **Per-CPU 运行队列**：`proc/per_cpu.zig` 定义 `PerCpuRunQueue` 结构，每 CPU 一份；
   256 槽环形缓冲区（`QUEUE_SIZE=256`），由 `IrqSpinlock` 保护。本地操作只持有本队列锁；
   跨队列窃取同时按 CPU ID 升序持有 thief/victim 两把锁，避免并发搬运损坏队列或 ABBA 死锁。
-- **本地 LIFO 操作**：`push` / `pop` 在 `head` 端 O(1) 操作（最近压入的任务先出，
-  最大化 L1/L2 缓存复用）。
+- **本地 FIFO 操作（2026-08-15 由 LIFO 改为 FIFO）**：`push` 在 `head` 端入队、`pop` 在
+  `tail` 端取出最老任务，O(1) 轮转公平。原 LIFO（最近压入先出）在一个睡眠/唤醒循环者
+  （每次 unblock 都重新压栈顶）加上每次切换都被重新入队的 idle 的组合下，会把第三个就绪
+  任务永久压在栈底——两个 nanosleep 循环者即可让另一个就绪任务饿死数千 tick（在阻塞式
+  nanosleep 落地后实测复现：hello54 的子进程永远拿不到 CPU）。`popRtAware` 的非 RT 路径
+  同步改为 FIFO；RT 任务仍按 rank 选优、平级取最老。SK-17 探针断言同步更新为 FIFO 序。
 - **Work-Stealing**：仅当本地队列为空（idle）时触发，`tryStealForCurrent` 以
   TSC 派生的随机 CPU 为起点扫描其他 CPU 的队列，调用 `steal_half` 从对端 `tail`
   端窃取约一半任务（>1 才偷，留 1 给被偷者避免乒乓）。
@@ -521,8 +525,8 @@ const Task = struct {
   （100+priority）。OTHER 内部键序与旧裸优先级比较完全等价，故无 RT 任务时选取结果
   **逐字节不变**（位图回退的 `best_key` 初值 `MAX_PICK_KEY=355` 保持 idle（255）不可选，
   与旧 `best_prio=255` 初值语义一致）。
-- **两条选择路径都已 RT 化**：① per-CPU 队列 `popRtAware`——队列无 RT 任务时退化为原 LIFO
-  `pop`（逐字节一致）；有 RT 任务时扫描选最优 RT 键，**同优先级取最老入队者**，使同级
+- **两条选择路径都已 RT 化**：① per-CPU 队列 `popRtAware`——队列无 RT 任务时退化为 FIFO
+  `pop`（2026-08-15 起，见 §2.2）；有 RT 任务时扫描选最优 RT 键，**同优先级取最老入队者**，使同级
   SCHED_RR 任务轮转而非反复弹出刚重新入队的任务。③ 位图回退 `task.pickReadyForCpu` 同上
   改用 rankKey 比较。
 - **量子**：SCHED_FIFO 无量子——`timerTick` 与 `hardwareTimerTick` 在时间片耗尽时若当前
@@ -619,6 +623,63 @@ const SchedStats = struct {
   1. 在用户栈构造 `siginfo` + saved context
   2. 注入 trampoline（执行 `sigreturn` 系统调用）
   3. 跳转到用户 handler
+- **默认动作分类（2026-08-15）**：`signal.defaultAction()` 把每个信号归为
+  terminate / ignore / stop / cont 四类；`SIGSTOP/SIGTTIN/SIGTTOU` 默认停（不可捕获、
+  不可忽略——SIGSTOP 连 handler 位都被强制忽略）、`SIGCONT` 默认继续。tick 投递路径
+  （`sched.deliverSignalToRunningTask`）与 syscall 返回路径
+  （`checkSignalsOnSyscallReturn`，已接入 waitpid/read/nanosleep）共用同一分类。
+- **投递语义**：阻塞中的任务收到信号会被 `kickIfBlocked` 唤醒，等待循环按惯例复查
+  `pendingFatal`（经 `exitTask` 终止）与 `pendingActionable`（返回 -EINTR）。
+- **sigreturn 修纲（2026-08-15）**：syscall 出口的 exec 重定向（fork/exec/信号/sigreturn
+  共用）此前丢弃已保存的 rax 并把新栈指针留在 rax 里返回用户态——sigreturn 因此把"用户
+  栈地址"而非 sigframe 保存的 rax 交还（hello58 实测：read 的 -EINTR 返回值被吞）。现在
+  重定向前先弹出原返回值，三种重定向（execve 不在乎 rax、handler 入口参数在 rdi、
+  sigreturn 必须还原）全部正确。
+
+### 2.4a 作业控制（job control v1，2026-08-15）✅
+
+文件: `proc/jobctl.zig`, `proc/pgrp.zig`, `proc/signal.zig`, `fs/ioctl.zig`, `fs/vfs.zig`
+
+- **单一终端模型**：一个全局控制终端（ctty），`ctty_owner_sid` 由首个 TIOCSPGRP 调用者
+  认领，`foreground_pgid` 记录前台进程组；fd0 的 read 前经 `jobctl.stdinJobCheck` 做前后台
+  判定。v1 无 `/dev/tty` 文件节点、无 TOSTOP（后台写不拦）。
+- **后台读 SIGTTIN**：后台组读 fd0 → 给全组发 SIGTTIN：已装 handler 的成员走 pending
+  投递 + read 返回 -EINTR；默认动作的成员 `stopTask` 置 `Task.stopped` 并内核内等待，
+  直到 TIOCSPGRP 把它所在组切为前台 + SIGCONT 解除停止，再进入真正的键盘读。
+  SIGTTIN 被阻塞/忽略时按 POSIX 返回 -EIO。
+- **停止/继续语义**：`Task.stopped` 是独立于调度 state 的标志；普通 wait-queue 唤醒
+  （`unblockTask`/`wakeOne`/`wakeAll`）对 stopped 任务一律抑制，只有 SIGCONT
+  （`continueTask`，POSIX：即使被阻塞/忽略也生效）能复活；致命信号先清 stopped 再唤醒
+  以保证可杀。
+- **进程组/会话权限收紧（2026-08-15）**：syscall 层的 setpgid/setsid/getpgid/getsid 全部
+  委托 `proc/pgrp.zig`（此前 syscall 入口内联了一个无任何校验的"简陋版"，任意进程可改写
+  任意任务的 pgid）。严格语义：只能改自己或子进程、目标组必须已存在于同会话、会话长不
+  可改 pgid、新建组时禁止会话长建组。`syscallWaitpid` 现在透传 options（WNOHANG 此前被
+  静默丢弃，是 waitpid(-1,…,WNOHANG) 永久阻塞的根因）。
+- **kill(-pgid) 广播**：`lifecycle.kill(pid<0)` → `signal.sendSignalToPgrp`——stop/cont 类
+  按默认处置立即生效，其余走 pending + 唤醒；返回发送计数（0 → ESRCH）。
+- **孤儿组 SIGHUP（近似规则）**：会话长退出时 `exitTask → jobctl.onSessionLeaderExit`，
+  同会话成员收 SIGHUP，停止中的成员同时被 SIGCONT 唤醒（v1 简化：未实现完整的"孤儿组
+  停止成员才收 SIGHUP+SIGCONT"区分）。
+- **验收**：`user/hello58.c`——setsid/getpgid/getsid、后台读两类处置（handler→EINTR、
+  默认→停→前台化→SIGCONT 恢复）、kill(-pgid) 全组终止、孤儿组 SIGHUP，SMP=1/4 全绿。
+
+### 2.4b nanosleep 阻塞化（2026-08-15）✅
+
+文件: `arch/x86_64/syscall_entry.zig`, `proc/sched.zig`, `proc/task.zig`
+
+- **旧实现是 TSC 忙等**：syscall 入口全程 IF=0（SFMASK 清 IF），忙等期间 LAPIC 定时器
+  无法触发，任何其他就绪任务都拿不到 CPU——fork 出的子进程在父/兄进程用 nanosleep
+  轮询时会被饿死数秒（hello58 测试 4 实测）。
+- **新实现**：`Task.sleep_deadline_ns` + 全局 `sched.sleep_bm` 位图；syscall 里发布
+  deadline → 置位 → `blockTask` → `forceReschedule` 让出 CPU；每个 tick（每 CPU，
+  位图门控近零开销）由 `sched.sleepTimerTick` 扫描到期者 `unblockTask` 唤醒，唤醒粒度
+  一个 tick（10ms）。先发 deadline 再阻塞，丢失唤醒最多 +1 tick 重试，不会永久失醒。
+- **信号协议与既有等待原语一致**：致命 pending → `exitTask`；可处理 pending → -EINTR
+  并回填 `rem`。
+- **槽位复用防护**：`reserveSlotLocked` 在槽位可见前清理旧的 sleep_bm 位 / deadline /
+  stopped 标志，杜绝上一租户残留把半建任务误唤醒进就绪队列。
+- aarch64/riscv64 的 nanosleep 仍为忙等实现（各自的 syscall 入口），列入后续轮次。
 
 ### 2.5 clone() 线程 (CLONE_VM/THREAD + FS_BASE TLS) ✅
 

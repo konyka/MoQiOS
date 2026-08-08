@@ -18,6 +18,25 @@ pub const SIGUSR2: u32 = 31;
 pub const SIGCHLD: u32 = 17;
 pub const SIGINT: u32 = 2;
 pub const SIGSEGV: u32 = 11;
+pub const SIGHUP: u32 = 1;
+pub const SIGCONT: u32 = 18;
+pub const SIGSTOP: u32 = 19;
+pub const SIGTTIN: u32 = 21;
+pub const SIGTTOU: u32 = 22;
+
+/// Default disposition of a signal when no handler is installed.
+pub const SigDefault = enum { terminate, ignore, stop, cont };
+
+/// POSIX default actions. SIGCHLD is ignored, SIGSTOP/SIGTTIN/SIGTTOU stop
+/// the process, SIGCONT continues it, everything else terminates.
+pub fn defaultAction(signum: u32) SigDefault {
+    return switch (signum) {
+        SIGCHLD => .ignore,
+        SIGCONT => .cont,
+        SIGSTOP, SIGTTIN, SIGTTOU => .stop,
+        else => .terminate,
+    };
+}
 
 /// Signal frame pushed onto user stack before calling signal handler.
 /// The handler receives (signum) as the only argument (in RDI).
@@ -77,6 +96,10 @@ pub fn sendSignal(target_tid: u32, signum: u32) bool {
     for (0..task.MAX_TASKS) |i| {
         const t = task.getTask(@intCast(i)) orelse continue;
         if (t.tid == target_tid and t.state != .zombie) {
+            // POSIX: SIGCONT 立即继续（阻塞/忽略亦生效），pending 位照置以便
+            // handler 在恢复后投递；致命信号必须先解除停止态否则杀不死。
+            if (signum == SIGCONT) continueTask(t);
+            if (defaultAction(signum) == .terminate and t.stopped) t.stopped = false;
             _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << @intCast(signum - 1), .seq_cst);
             kickIfBlocked(@intCast(i));
             return true;
@@ -93,6 +116,64 @@ pub fn kickIfBlocked(idx: u32) void {
         task.unblockTask(idx);
         task.kickRemoteForTask(idx);
     }
+}
+
+/// Job control: stop a task (SIGSTOP/SIGTTIN/SIGTTOU default). Running/ready
+/// tasks transition to .blocked and stay there until SIGCONT — wait-queue
+/// wakes are suppressed while `stopped` holds (see continueTask).
+pub fn stopTask(t: *task.Task) void {
+    if (t.stopped) return;
+    t.stopped = true;
+    const sc = @import("sched_claim.zig");
+    const s = sc.load(&t.state);
+    if (s == .running or s == .ready) sc.store(&t.state, .blocked);
+}
+
+/// Job control: continue a stopped task (SIGCONT — effective even when the
+/// signal is blocked or ignored, per POSIX).
+pub fn continueTask(t: *task.Task) void {
+    if (!t.stopped) return;
+    t.stopped = false;
+    const idx = t.self_idx;
+    task.unblockTask(idx);
+    task.kickRemoteForTask(idx);
+}
+
+/// Broadcast a signal to every task in a process group (kill(-pgid) and the
+/// job-control stops). Stop/continue signals act immediately per default
+/// disposition; everything else goes through the normal pending-signal path.
+/// Returns the number of tasks signalled.
+pub fn sendSignalToPgrp(pgid: u16, signum: u32) u32 {
+    if (signum == 0 or signum > 31) return 0;
+    const action = defaultAction(signum);
+    var sent: u32 = 0;
+    for (0..task.MAX_TASKS) |i| {
+        const t = task.getTask(@intCast(i)) orelse continue;
+        if (t.pgid != pgid or t.state == .zombie) continue;
+        sent += 1;
+        switch (action) {
+            .stop => {
+                const h = t.signal_handlers[signum - 1];
+                if (signum != SIGSTOP and h == 1) {
+                    // SIG_IGN：忽略该成员。
+                } else if (signum != SIGSTOP and h != 0) {
+                    // 已装 handler：走普通 pending 投递（handler 运行，读得 EINTR）。
+                    _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << @intCast(signum - 1), .seq_cst);
+                    kickIfBlocked(@intCast(i));
+                } else {
+                    stopTask(t);
+                }
+            },
+            .cont => continueTask(t),
+            else => {
+                _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << @intCast(signum - 1), .seq_cst);
+                // 致命信号必须能终止已停止的任务：先解除停止态再唤醒。
+                if (defaultAction(signum) == .terminate and t.stopped) t.stopped = false;
+                kickIfBlocked(@intCast(i));
+            },
+        }
+    }
+    return sent;
 }
 
 /// Raise a signal on the current task itself (e.g. SIGPIPE from pipeWrite).
@@ -192,10 +273,7 @@ pub fn setupSigreturnTrampoline(user_pml4: u64) void {
 /// (i.e., the process should continue). Returns false if the process
 /// should be terminated.
 pub fn defaultSignalAction(signum: u32) bool {
-    switch (signum) {
-        SIGCHLD => return true,
-        else => return false,
-    }
+    return defaultAction(signum) != .terminate;
 }
 
 /// General-purpose register snapshot saved into the signal frame so sigreturn

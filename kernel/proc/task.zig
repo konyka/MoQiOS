@@ -93,6 +93,10 @@ pub const Task = struct {
     /// creator's address space). Threads report the creator's tid as getpid()
     /// and are joined via pthread_join, not reaped by waitpid.
     is_thread: bool = false,
+    /// Job control: the task is stopped (SIGSTOP/SIGTTIN/SIGTTOU default).
+    /// Stopped tasks are held in .blocked and resume only via SIGCONT —
+    /// plain wait-queue wakes must not revive them.
+    stopped: bool = false,
     /// User-space entry point (RIP).
     user_entry: u64,
     /// User-space stack top (RSP for ring3).
@@ -217,6 +221,10 @@ pub const Task = struct {
 
     /// alarm() deadline in TSC nanoseconds (0 = no alarm set).
     alarm_deadline: u64 = 0,
+
+    /// nanosleep() wake deadline in TSC nanoseconds (0 = not sleeping).
+    /// Scanned every timer tick against sched.sleep_bm — see sched.sleepTimerTick.
+    sleep_deadline_ns: u64 = 0,
 
     /// ITIMER_REAL: next expiration deadline (ns) and recurring interval (ns).
     itimer_real_value: u64 = 0,
@@ -471,6 +479,14 @@ fn allocSlot() ?u32 {
 
 fn reserveSlotLocked() ?u32 {
     const slot = allocSlot() orelse return null;
+    // Clear any stale nanosleep publication BEFORE the slot becomes visible:
+    // a previous tenant that died mid-sleep leaves its sleep_bm bit and a
+    // stale deadline behind, and the per-tick scan would otherwise unblock a
+    // half-created task (state .blocked during the creation window) straight
+    // into the ready queue.
+    _ = @atomicRmw(u64, &@import("sched.zig").sleep_bm, .And, ~(@as(u64, 1) << @intCast(slot)), .seq_cst);
+    tasks[slot].sleep_deadline_ns = 0;
+    tasks[slot].stopped = false;
     slot_bitmap |= @as(u64, 1) << @intCast(slot);
     return slot;
 }
@@ -718,6 +734,11 @@ pub fn exitTask(exit_code: i32) void {
     sched_claim.store(&t.state, .zombie);
     asm volatile ("" ::: .{ .memory = true });
 
+    // 作业控制：会话长退出 → 同会话成员收 SIGHUP（孤儿进程组，近似规则）。
+    if (t.is_user and t.sid == @as(u16, @intCast(t.tid))) {
+        @import("jobctl.zig").onSessionLeaderExit(t);
+    }
+
     // Wake parent if sleeping on our exit_waiters queue
     if (t.exit_waiters != null) {
         // wakeAll modifies the list, safe to call under task_lock
@@ -892,7 +913,9 @@ pub fn unblockTask(idx: u32) void {
     const flags = task_lock.acquire();
     defer task_lock.release(flags);
     const t = getTask(idx) orelse return;
-    if (sched_claim.load(&t.state) == .blocked) {
+    // Job control: a stopped task must not be revived by ordinary wait-queue
+    // wakes — only SIGCONT (continueTask clears `stopped` first).
+    if (sched_claim.load(&t.state) == .blocked and !t.stopped) {
         sched_claim.store(&t.state, .ready);
         // Task #2: republish to per-CPU queue (best-effort, full → bitmap fallback).
         const per_cpu = @import("per_cpu.zig");
@@ -1196,14 +1219,5 @@ pub fn hasChildrenLocked(parent_idx: u32) bool {
 pub fn hasChildren(parent_idx: u32) bool {
     const flags = task_lock.acquire();
     defer task_lock.release(flags);
-    const parent = getTask(parent_idx) orelse return false;
-    const parent_tid_val = parent.tid;
-    var bits = slot_bitmap;
-    while (bits != 0) {
-        const i: u32 = @intCast(@ctz(bits));
-        bits &= bits - 1;
-        const t = &tasks[i];
-        if (t.parent_tid == parent_tid_val) return true;
-    }
-    return false;
+    return hasChildrenLocked(parent_idx);
 }

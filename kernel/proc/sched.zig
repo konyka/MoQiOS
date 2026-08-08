@@ -95,6 +95,35 @@ pub const sched_fine_grain_enable: bool = true;
 pub var alarm_bm: u64 = 0;
 pub var itimer_bm: u64 = 0;
 
+/// nanosleep sleepers bitmap — set/cleared by the nanosleep syscall, scanned
+/// every timer tick by sleepTimerTick. The bit stays set until the sleeper
+/// itself exits the wait loop (or dies), so a wake racing the sleeper's
+/// block-transition is retried on the next tick instead of being lost.
+pub var sleep_bm: u64 = 0;
+
+/// Wake every nanosleep sleeper whose deadline passed. Runs on every CPU's
+/// timer tick: cheap bitmap gate, O(active sleepers) scan. Waking is
+/// best-effort — unblockTask only revives a .blocked, non-stopped task, and
+/// bits of exited/stopped tasks are cleaned up here.
+pub fn sleepTimerTick(now_ns: u64) void {
+    var bm = @atomicLoad(u64, &sleep_bm, .acquire);
+    while (bm != 0) {
+        const i: u6 = @truncate(@ctz(bm));
+        bm &= bm - 1;
+        const t = task.getTask(@intCast(i)) orelse {
+            _ = @atomicRmw(u64, &sleep_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
+            continue;
+        };
+        const deadline = @atomicLoad(u64, &t.sleep_deadline_ns, .acquire);
+        const st = sched_claim.load(&t.state);
+        if (deadline == 0 or st == .zombie) {
+            _ = @atomicRmw(u64, &sleep_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
+            continue;
+        }
+        if (now_ns >= deadline) task.unblockTask(@intCast(i));
+    }
+}
+
 // M8-2: the running task index and remaining timeslice are now PER-CPU state,
 // stored in syscall_entry.PerCpu (current_task_idx / slice_remaining) and reached
 // via GS_BASE. In uniprocessor mode GS_BASE always points at percpu_array[0], so
@@ -563,6 +592,9 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
             _ = @atomicRmw(u64, &per_cpu.sched_entries[@intCast(p.cpu_id)], .Add, 1, .monotonic);
         }
     }
+
+    // nanosleep wakeups — every tick, every CPU (bitmap-gated, ~free when idle).
+    sleepTimerTick(@import("../arch/arch.zig").tsc.nanos());
 
     // L3: publish the task this CPU switched away from last time — but only
     // when the frame proves the old kernel stack is no longer live.
@@ -1188,17 +1220,31 @@ pub fn deliverSignalToRunningTask(t: *task.Task, iframe: *idt.InterruptFrame) bo
 
     const signum = sig_mod.dequeueSignal(t) orelse return false;
 
-    const handler_addr = t.signal_handlers[signum - 1];
+    // SIGSTOP 不可捕获/阻塞：handler 与 handler==1(SIG_IGN) 均被 POSIX 忽略。
+    const handler_addr = if (signum == sig_mod.SIGSTOP) 0 else t.signal_handlers[signum - 1];
 
     if (handler_addr == 0) {
-        if (!sig_mod.defaultSignalAction(signum)) {
-            // v53.49: Route through exitTask for proper fd cleanup and parent
-            // wakeup. Previously this directly set zombie state, leaking all
-            // open fds and deadlocking any parent blocked in waitpid().
-            task.exitTask(128 + @as(i32, @intCast(signum)));
-            // exitTask never returns (ends in sti+hlt loop)
+        switch (sig_mod.defaultAction(signum)) {
+            .terminate => {
+                // v53.49: Route through exitTask for proper fd cleanup and parent
+                // wakeup. Previously this directly set zombie state, leaking all
+                // open fds and deadlocking any parent blocked in waitpid().
+                task.exitTask(128 + @as(i32, @intCast(signum)));
+                // exitTask never returns (ends in sti+hlt loop)
+            },
+            .ignore => return true,
+            .stop => {
+                // 默认停：标记 stopped 并转入 .blocked——下一调度点自然切出，
+                // 只有 SIGCONT 能复活（见 signal.continueTask / Task.stopped）。
+                sig_mod.stopTask(t);
+                return true;
+            },
+            .cont => {
+                // SIGCONT：即使被阻塞/忽略也继续（POSIX）。
+                sig_mod.continueTask(t);
+                return true;
+            },
         }
-        return true;
     }
 
     if (handler_addr == 1) return true;
@@ -1381,7 +1427,7 @@ pub fn wakeOne(queue: *?*task.WaitNode) ?u32 {
             node.granted = true;
             const idx = node.task_idx;
             const t = task.getTask(idx) orelse return null;
-            if (sched_claim.load(&t.state) == .blocked) {
+            if (sched_claim.load(&t.state) == .blocked and !t.stopped) {
                 sched_claim.store(&t.state, .ready);
                 t.wait_queue = null;
                 if (per_cpu.isAnyReady()) _ = per_cpu.enqueueTask(t);
@@ -1410,7 +1456,7 @@ pub fn wakeAll(queue: *?*task.WaitNode) void {
             current = node.next;
             continue;
         };
-        if (sched_claim.load(&t.state) == .blocked) {
+        if (sched_claim.load(&t.state) == .blocked and !t.stopped) {
             sched_claim.store(&t.state, .ready);
             t.wait_queue = null;
             if (per_cpu.isAnyReady()) _ = per_cpu.enqueueTask(t);

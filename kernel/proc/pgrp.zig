@@ -54,7 +54,6 @@ pub fn sysSetpgid(pid_arg: u64, pgid_arg: u64) i64 {
     }
 
     const target = task_mod.getTask(target_idx orelse return ESRCH) orelse return ESRCH;
-
     // Only allow setting pgid for self or child processes
     if (target_idx.? != cur_idx) {
         if (target.parent_tid != cur.tid) {
@@ -82,6 +81,11 @@ pub fn sysSetpgid(pid_arg: u64, pgid_arg: u64) i64 {
             }
         }
         if (!found_group) return EPERM;
+    } else {
+        // Session leader check only applies when creating a NEW group
+        if (target.sid == @as(u16, @intCast(target.tid))) {
+            return EPERM;
+        }
     }
 
     // Cannot change pgid of a session leader

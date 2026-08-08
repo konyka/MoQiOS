@@ -62,9 +62,15 @@ pub fn spawn(name_ptr: u64) i64 {
 }
 
 /// Syscall #62: kill(pid, signum)
-pub fn kill(target_tid: u32, signum: u32) i64 {
+/// pid > 0: 单进程；pid < -1: 广播到进程组 -pid（kill(-pgid)）；pid == -1: 暂不支持。
+pub fn kill(target_pid: i64, signum: u32) i64 {
     const sig_mod = @import("signal.zig");
-    if (sig_mod.sendSignal(target_tid, signum)) {
+    if (target_pid == -1) return -22; // EINVAL — kill(-1) 不在 v1 范围
+    if (target_pid < -1) {
+        const pgid: u16 = @intCast(-target_pid);
+        return if (sig_mod.sendSignalToPgrp(pgid, signum) > 0) 0 else -1;
+    }
+    if (sig_mod.sendSignal(@intCast(target_pid), signum)) {
         return 0;
     }
     return -1;

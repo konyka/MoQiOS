@@ -381,11 +381,13 @@ pub fn syscallEntry() callconv(.naked) void {
         \\movq %%gs:48, %%rax
         \\testq %%rax, %%rax
         \\jz 2f
-        \\addq $8, %%rsp
+        \\// Restore the syscall's return value BEFORE switching stacks: the
+        \\// sigreturn redirect (pending=2) must deliver the sigframe's rax to
+        \\// the user; exec (1) and handler entry (3) do not care about rax.
+        \\popq %%rax
         \\movq %%gs:56, %%rcx
-        \\movq %%gs:64, %%rax
+        \\movq %%gs:64, %%rsp
         \\movq $0x202, %%r11
-        \\movq %%rax, %%rsp
         \\movq $0, %%gs:48
         \\jmp 3f
         \\2:
@@ -485,6 +487,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         10 => {
             syscallRead(frame);
+            checkSignalsOnSyscallReturn(frame);
         },
         11 => {
             syscallClose(frame);
@@ -948,6 +951,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         199 => { // nanosleep(req, rem)
             frame.rax = @bitCast(syscallNanosleep(frame.rdi, frame.rsi));
+            checkSignalsOnSyscallReturn(frame);
         },
         200 => { // sched_yield()
             const sched = @import("../../proc/sched.zig");
@@ -2472,7 +2476,7 @@ fn syscallSpawn(frame: *SyscallFrame) void {
 /// RDX = options (bit 0 = WNOHANG)
 /// Returns child TID on success, 0 if WNOHANG and no child exited, -1 on error.
 fn syscallWaitpid(frame: *SyscallFrame) void {
-    frame.rax = @bitCast(waitpid_mod.waitpid(frame.rdi, frame.rsi));
+    frame.rax = @bitCast(waitpid_mod.waitpidWithOptions(frame.rdi, frame.rsi, @truncate(frame.rdx)));
 }
 
 /// Syscall #7: brk(addr)
@@ -2792,14 +2796,20 @@ fn syscallSigreturn(frame: *SyscallFrame) void {
 
 fn syscallKill(frame: *SyscallFrame) void {
     // Task #8: cap_kill required when targeting a different process.
+    const pid_signed: i64 = @bitCast(frame.rdi);
     const target_pid: u32 = @truncate(frame.rdi);
     if (currentTaskCaps()) |info| {
-        if (info.tid != target_pid and !@field(info.t.effective_caps, "cap_kill")) {
+        // 进程组广播（pid<0）与跨进程单发同样需要 cap_kill；-1 时按目标校验。
+        if (pid_signed > 0 and info.tid != target_pid and !@field(info.t.effective_caps, "cap_kill")) {
+            frame.rax = @bitCast(@as(i64, -1)); // EPERM
+            return;
+        }
+        if (pid_signed < 0 and !@field(info.t.effective_caps, "cap_kill")) {
             frame.rax = @bitCast(@as(i64, -1)); // EPERM
             return;
         }
     }
-    frame.rax = @bitCast(lifecycle_mod.kill(@truncate(frame.rdi), @truncate(frame.rsi)));
+    frame.rax = @bitCast(lifecycle_mod.kill(pid_signed, @truncate(frame.rsi)));
 }
 
 fn syscallNetSend(frame: *SyscallFrame) void {
@@ -2833,12 +2843,18 @@ pub fn checkSignalsOnSyscallReturn(frame: *SyscallFrame) void {
 
     const signum = sig_mod.dequeueSignal(current) orelse return;
 
-    const handler_addr = current.signal_handlers[signum - 1];
+    // SIGSTOP 不可捕获/阻塞（与 sched.deliverSignalToRunningTask 一致）。
+    const handler_addr = if (signum == sig_mod.SIGSTOP) 0 else current.signal_handlers[signum - 1];
 
     if (handler_addr == 0) {
-        if (!sig_mod.defaultSignalAction(signum)) {
-            current.state = .zombie;
-            current.exit_code = 128 + @as(i32, @intCast(signum));
+        switch (sig_mod.defaultAction(signum)) {
+            .terminate => {
+                current.state = .zombie;
+                current.exit_code = 128 + @as(i32, @intCast(signum));
+            },
+            .ignore => return,
+            .stop => sig_mod.stopTask(current),
+            .cont => sig_mod.continueTask(current),
         }
         return;
     }
@@ -3094,10 +3110,24 @@ fn syscallAccess(pathname_ptr: u64, mode: u32) i64 {
 }
 
 /// nanosleep(req_timespec, rem_timespec) — high-resolution sleep.
+///
+/// Blocking sleep: the caller parks on the scheduler's sleep bitmap
+/// (sched.sleep_bm) and is woken by the per-tick sleepTimerTick scan at its
+/// deadline. The previous TSC busy-spin burned the CPU inside an IF=0 syscall
+/// — the LAPIC timer could not fire, so no other runnable task was ever
+/// scheduled until the spinner blocked on something else (observed as a forked
+/// child starving for seconds while parent/sibling polled with nanosleep).
+///
+/// Signal protocol matches the other wait primitives (devfs_proxy pattern):
+/// a fatal pending signal terminates via exitTask; an actionable one returns
+/// -EINTR with the remaining time written back to `rem`.
 fn syscallNanosleep(req_ptr: u64, rem_ptr: u64) i64 {
     if (req_ptr == 0 or req_ptr >= 0x0000_8000_0000_0000) return -14;
     const copy = @import("../../mm/copy_from_user.zig");
     const tsc = @import("../../arch/x86_64/tsc.zig");
+    const sched = @import("../../proc/sched.zig");
+    const tm = @import("../../proc/task.zig");
+    const sig_mod = @import("../../proc/signal.zig");
     var ts_buf: [16]u8 = undefined;
     if (copy.copyFromUser(&ts_buf, @ptrFromInt(req_ptr), 16) != 16) return -14;
     const bo = @import("../../lib/byte_order.zig");
@@ -3106,10 +3136,44 @@ fn syscallNanosleep(req_ptr: u64, rem_ptr: u64) i64 {
     const target_ns = sec * 1_000_000_000 + nsec;
     if (target_ns == 0) return 0;
 
-    const start = tsc.nanos();
-    while (tsc.nanos() - start < target_ns) {
-        asm volatile ("pause");
+    const cur_idx = sched.currentTaskIndex() orelse return -14;
+    const cur = tm.getTask(cur_idx) orelse return -14;
+    const bit = @as(u64, 1) << @intCast(cur_idx);
+    const deadline = tsc.nanos() + target_ns;
+
+    while (true) {
+        // Fatal signal: die through exitTask (fd cleanup + parent wakeup).
+        if (sig_mod.pendingFatal(cur)) |s| {
+            cur.sleep_deadline_ns = 0;
+            _ = @atomicRmw(u64, &sched.sleep_bm, .And, ~bit, .seq_cst);
+            tm.exitTask(128 + @as(i32, @intCast(s)));
+        }
+        // Actionable (handled) signal: report remaining time, return -EINTR.
+        if (sig_mod.pendingActionable(cur)) {
+            cur.sleep_deadline_ns = 0;
+            _ = @atomicRmw(u64, &sched.sleep_bm, .And, ~bit, .seq_cst);
+            const now = tsc.nanos();
+            if (rem_ptr != 0 and rem_ptr < 0x0000_8000_0000_0000) {
+                const left = deadline -| now;
+                var rem_buf: [16]u8 = undefined;
+                bo.writeU64Le(rem_buf[0..8], left / 1_000_000_000);
+                bo.writeU64Le(rem_buf[8..16], left % 1_000_000_000);
+                if (copy.copyToUser(@ptrFromInt(rem_ptr), &rem_buf, 16) != 16) return -14;
+            }
+            return -4; // EINTR
+        }
+        if (tsc.nanos() >= deadline) break;
+        // Publish the deadline BEFORE blocking: if the tick scan fires in the
+        // gap it cannot unblock a .running task, but the bit stays set, so the
+        // next tick retries the wake — no lost wakeup, worst case +1 tick.
+        @atomicStore(u64, &cur.sleep_deadline_ns, deadline, .release);
+        _ = @atomicRmw(u64, &sched.sleep_bm, .Or, bit, .seq_cst);
+        tm.blockTask(cur_idx);
+        sched.forceReschedule();
     }
+
+    cur.sleep_deadline_ns = 0;
+    _ = @atomicRmw(u64, &sched.sleep_bm, .And, ~bit, .seq_cst);
 
     // Write zero remaining time (fully slept)
     if (rem_ptr != 0 and rem_ptr < 0x0000_8000_0000_0000) {
@@ -3123,70 +3187,22 @@ fn syscallNanosleep(req_ptr: u64, rem_ptr: u64) i64 {
 
 /// setsid() — create a new session.
 fn syscallSetsid() i64 {
-    const sched = @import("../../proc/sched.zig");
-    const tm = @import("../../proc/task.zig");
-    const cur_idx = sched.currentTaskIndex() orelse return -1;
-    const cur = tm.getTask(cur_idx) orelse return -1;
-    // If already a session leader, fail
-    if (cur.pgid == @as(u16, @truncate(cur.tid))) return -1; // EPERM
-    cur.sid = @truncate(cur.tid);
-    cur.pgid = @truncate(cur.tid);
-    return @intCast(cur.tid);
+    return pgrp_mod.sysSetsid();
 }
 
 /// setpgid(pid, pgid) — set process group ID.
 fn syscallSetpgid(pid: u32, pgid: u32) i64 {
-    const sched = @import("../../proc/sched.zig");
-    const tm = @import("../../proc/task.zig");
-    const cur_idx = sched.currentTaskIndex() orelse return -1;
-    const cur = tm.getTask(cur_idx) orelse return -1;
-    const target_pid: u32 = if (pid == 0) cur.tid else pid;
-    const new_pgid: u16 = if (pgid == 0) @truncate(target_pid) else @truncate(pgid);
-
-    // Find target task
-    for (0..tm.MAX_TASKS) |i| {
-        if (tm.getTask(@intCast(i))) |t| {
-            if (t.tid == target_pid) {
-                t.pgid = new_pgid;
-                return 0;
-            }
-        }
-    }
-    return -3; // ESRCH
+    return pgrp_mod.sysSetpgid(pid, pgid);
 }
 
 /// getpgid(pid) — get process group ID.
 fn syscallGetpgid(pid: u32) i64 {
-    const sched = @import("../../proc/sched.zig");
-    const tm = @import("../../proc/task.zig");
-    if (pid == 0) {
-        const cur_idx = sched.currentTaskIndex() orelse return -1;
-        const cur = tm.getTask(cur_idx) orelse return -1;
-        return @intCast(cur.pgid);
-    }
-    for (0..tm.MAX_TASKS) |i| {
-        if (tm.getTask(@intCast(i))) |t| {
-            if (t.tid == pid) return @intCast(t.pgid);
-        }
-    }
-    return -3; // ESRCH
+    return pgrp_mod.sysGetpgid(pid);
 }
 
 /// getsid(pid) — get session ID.
 fn syscallGetsid(pid: u32) i64 {
-    const sched = @import("../../proc/sched.zig");
-    const tm = @import("../../proc/task.zig");
-    if (pid == 0) {
-        const cur_idx = sched.currentTaskIndex() orelse return -1;
-        const cur = tm.getTask(cur_idx) orelse return -1;
-        return @intCast(cur.sid);
-    }
-    for (0..tm.MAX_TASKS) |i| {
-        if (tm.getTask(@intCast(i))) |t| {
-            if (t.tid == pid) return @intCast(t.sid);
-        }
-    }
-    return -3; // ESRCH
+    return pgrp_mod.sysGetsid(pid);
 }
 
 // ── v31.7: truncate/ftruncate/rename ─────────────────────────────

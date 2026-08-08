@@ -1788,6 +1788,25 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 **验证**：SMP=1 smoke 一次通过（hello57 100000 全对）；SMP=4 首跑通过；三架构编译 + host 测试通过。
 
+### 6.21 基础设施补完·第十五轮（2026-08-15）：作业控制 v1 + 调度/睡眠修复三连
+
+| 阶段 | 内容 | 验证 |
+|---|---|---|
+| 方案 | 盘点未实现基建：作业控制（ctty/前后台/SIGTTIN/kill(-pgid)/孤儿组）价值最高且内核已有 pgrp/session 骨架 | docs/kernel-subsystems.md §2.4a |
+| TDD | 先写 hello58 五项验收（setsid 系列、后台读两类处置、TIOCSPGRP+SIGCONT 恢复、kill(-pgid) 广播、孤儿组 SIGHUP），再实现至绿 | hello58 全项通过（SMP=1/4） |
+| 作业控制 | 新增 `proc/jobctl.zig`（单一终端模型：ctty_owner_sid/foreground_pgid、stdinJobCheck、tcSetForegroundPgrp、onSessionLeaderExit）；`Task.stopped` 独立标志；信号默认动作四分（terminate/ignore/stop/cont），SIGSTOP 不可捕获 | §2.4/§2.4a |
+| 权限收紧 | syscall 层 setpgid/setsid/getpgid/getsid 全部委托 pgrp.zig（入口内联版无任何校验，任意进程可改任意任务 pgid）；syscallWaitpid 透传 options（WNOHANG 被丢弃曾是 waitpid 永久阻塞根因）；kill(-pgid) 广播 | 严格版 setpgid 生效 |
+| 修复① | **nanosleep 忙等饿死**：syscall 全程 IF=0，忙等 nanosleep 期间 LAPIC 不触发，就绪任务饿死数秒 → 睡眠位图（sleep_bm + sleep_deadline_ns）+ 每 tick 唤醒，EINTR/fatal 协议与既有等待原语一致，槽位复用清残留 | §2.4b |
+| 修复② | **运行队列 LIFO 饿死**：睡眠循环者反复压栈顶 + idle 每次切换重入队，把第三个就绪任务永久压栈底（hello54 子进程永远拿不到 CPU）→ 改 FIFO 轮转，popRtAware 非 RT 路径同步，SK-17 探针改断言 | §2.2 |
+| 修复③ | **sigreturn 丢 rax**：syscall 出口 exec 重定向丢弃保存的 rax 并把新栈指针留在 rax——sigreturn 后用户拿到栈地址而非 syscall 返回值 → 重定向前先弹出原返回值 | hello58 测试 2（r==-4 且 handler 触发） |
+
+**调试教训**：
+- tick 路径（IF=0）内放串口打印会让"每次 iretq 后立即有 tick 到期"，被调试的子进程连一条指令都执行不到——观测本身制造挂死；tickalive/switch 类探针必须极低频或零打印。
+- 测试自身的竞态（fork 后立即 setpgid 依赖调度顺序）要用 pgid 轮询或 pipe 同步消除，不能靠 nanosleep 时长赌。
+- 本内核 pipeRead 非阻塞（空管道返回 0 而非等写者），测试要按此语义轮询。
+
+**验证**：三架构编译 + host 测试通过；SMP=1 smoke 全绿（hello58 PASS）；SMP=4 smoke 全绿。
+
 ---
 
 ## 7. Completion Criteria For This Review Task

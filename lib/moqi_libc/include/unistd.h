@@ -49,6 +49,11 @@ long getpid(void);
 long kill(long pid, long sig);
 void _exit(int code) __attribute__((noreturn));
 
+long setsid(void);
+long setpgid(long pid, long pgid);
+long getpgid(long pid);
+long getsid(long pid);
+
 long pipe(int fds[2]);
 long dup2(int oldfd, int newfd);
 

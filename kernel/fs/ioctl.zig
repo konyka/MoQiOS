@@ -58,7 +58,7 @@ var default_termios: Termios = .{
 };
 
 /// Foreground process group ID for the controlling terminal.
-var foreground_pgid: u16 = 0;
+/// （作业控制 v1 起，真值统一由 kernel/proc/jobctl.zig 的 foreground_pgid 持有。）
 
 /// sysIoctl(fd, cmd, arg) → 0 on success, negative errno on failure
 pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
@@ -98,7 +98,8 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
         },
         TIOCGPGRP => {
             if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14;
-            var pgid: u16 = foreground_pgid;
+            const jc = @import("../proc/jobctl.zig");
+            var pgid: u16 = jc.foreground_pgid;
             if (pgid == 0) {
                 // If no fg group set, use current process's pgid
                 const cur_idx = sched.currentTaskIndex() orelse return -3;
@@ -115,11 +116,11 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
             const pgid_bytes: [*]u8 = @ptrCast(&pgid);
             const copied = copy.copyFromUser(pgid_bytes[0..2], @ptrFromInt(arg), 2);
             if (copied < 2) return -14;
-            // Validate that pgid belongs to a process in the caller's session
-            const cur_idx = sched.currentTaskIndex() orelse return -3;
-            const cur = task_mod.getTask(cur_idx) orelse return -3;
-            _ = cur;
-            foreground_pgid = pgid;
+            // 作业控制：只有控制终端的 owner 会话能设置前台组，且目标组必须
+            // 属于该会话（kernel/proc/jobctl.zig 单一终端模型）。
+            const jc = @import("../proc/jobctl.zig");
+            const rc = jc.tcSetForegroundPgrp(pgid);
+            if (rc != 0) return rc;
             return 0;
         },
         FIONREAD => {

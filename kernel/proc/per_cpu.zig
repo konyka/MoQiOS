@@ -45,9 +45,12 @@ pub const SchedStats = struct {
 pub const PerCpuRunQueue = struct {
     /// Ring buffer of ready tasks (capacity = QUEUE_SIZE).
     tasks: [QUEUE_SIZE]?*task_mod.Task = [_]?*task_mod.Task{null} ** QUEUE_SIZE,
-    /// Local-CPU enqueue/dequeue end (LIFO for cache locality).
+    /// Local-CPU enqueue end (newest entry).
     head: u32 = 0,
-    /// Steal end (other CPUs consume from here).
+    /// Dequeue/steal end (oldest entry) — FIFO pop gives round-robin fairness:
+    /// a plain LIFO pop starves any task buried under a sleep/wake cycler plus
+    /// the re-enqueued idle (observed: two nanosleep loopers pinned the pick to
+    /// {cycler, idle} forever and a third ready task never ran again).
     tail: u32 = 0,
     /// Serialises head/tail updates. Acquired by both local and remote ops.
     lock: IrqSpinlock = .{},
@@ -77,27 +80,26 @@ pub const PerCpuRunQueue = struct {
         return true;
     }
 
-    /// Pop a task from the local end (most recently pushed).
+    /// Pop the OLDEST task in the queue (FIFO — see `tail`).
     pub fn pop(self: *PerCpuRunQueue) ?*task_mod.Task {
         const flags = self.lock.acquire();
         defer self.lock.release(flags);
         if (self.nr_running == 0) return null;
-        self.head -%= 1;
-        const slot = self.head % QUEUE_SIZE;
+        const slot = self.tail % QUEUE_SIZE;
         const t = self.tasks[slot];
         self.tasks[slot] = null;
+        self.tail +%= 1;
         self.nr_running -= 1;
         self.stats.local_dequeues += 1;
         return t;
     }
 
     /// F3: RT-aware pop. When no SCHED_FIFO/RR task is queued this behaves
-    /// exactly like `pop()` (LIFO, byte-identical). When at least one RT
-    /// task is queued, the best-ranked RT task wins instead; ties (equal RT
-    /// priority) resolve to the OLDEST queued entry (nearest the steal tail)
-    /// so equal-priority SCHED_RR peers rotate instead of replaying the most
-    /// recently re-enqueued task. The chosen entry is swapped into the local
-    /// pop slot to keep the ring compact.
+    /// exactly like `pop()` (FIFO from `tail`). When at least one RT task is
+    /// queued, the best-ranked RT task wins instead; ties (equal RT priority)
+    /// resolve to the OLDEST queued entry (nearest the steal tail) so
+    /// equal-priority SCHED_RR peers rotate. The chosen entry is swapped into
+    /// the FIFO pop slot to keep the ring compact.
     pub fn popRtAware(self: *PerCpuRunQueue) ?*task_mod.Task {
         const sp = @import("sched_policy.zig");
         const flags = self.lock.acquire();
@@ -120,25 +122,25 @@ pub const PerCpuRunQueue = struct {
             }
         }
 
+        // FIFO pop slot is the oldest entry (tail); an RT winner sitting
+        // elsewhere is swapped into it so the ring stays compact.
+        const pop_slot = self.tail % QUEUE_SIZE;
         if (!any_rt) {
-            // Pure-OTHER queue: identical to pop().
-            self.head -%= 1;
-            const slot = self.head % QUEUE_SIZE;
-            const t = self.tasks[slot];
-            self.tasks[slot] = null;
+            const t = self.tasks[pop_slot];
+            self.tasks[pop_slot] = null;
+            self.tail +%= 1;
             self.nr_running -= 1;
             self.stats.local_dequeues += 1;
             return t;
         }
 
         const chosen = self.tasks[best_slot];
-        self.head -%= 1;
-        const pop_slot = self.head % QUEUE_SIZE;
         if (best_slot != pop_slot) {
             // Keep the displaced entry by moving it into the chosen slot.
             self.tasks[best_slot] = self.tasks[pop_slot];
         }
         self.tasks[pop_slot] = null;
+        self.tail +%= 1;
         self.nr_running -= 1;
         self.stats.local_dequeues += 1;
         return chosen;

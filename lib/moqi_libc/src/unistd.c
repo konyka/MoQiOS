@@ -52,6 +52,22 @@ long kill(long pid, long sig) {
     return syscall2(SYS_kill, pid, sig);
 }
 
+long setsid(void) {
+    return syscall0(206);
+}
+
+long setpgid(long pid, long pgid) {
+    return syscall2(207, pid, pgid);
+}
+
+long getpgid(long pid) {
+    return syscall1(208, pid);
+}
+
+long getsid(long pid) {
+    return syscall1(209, pid);
+}
+
 void _exit(int code) {
     syscall1(SYS_exit, code);
     for (;;) {}

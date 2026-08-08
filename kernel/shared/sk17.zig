@@ -41,21 +41,21 @@ pub fn announce() void {
         return;
     }
 
-    // Local queue is LIFO — last enqueued (lo) pops first.
-    const popped_lo = q.pop() orelse {
+    // Local queue is FIFO — first enqueued (hi) pops first.
+    const popped_hi = q.pop() orelse {
         arch.serial.writeString("[SK-17] FAILED: pop empty\n");
         return;
     };
-    if (popped_lo.self_idx != idx_lo) {
-        arch.serial.writeString("[SK-17] FAILED: LIFO order\n");
+    if (popped_hi.self_idx != idx_hi) {
+        arch.serial.writeString("[SK-17] FAILED: FIFO order\n");
         return;
     }
-    const popped_hi = q.pop() orelse {
+    const popped_lo = q.pop() orelse {
         arch.serial.writeString("[SK-17] FAILED: second pop\n");
         return;
     };
-    if (popped_hi.self_idx != idx_hi) {
-        arch.serial.writeString("[SK-17] FAILED: LIFO second\n");
+    if (popped_lo.self_idx != idx_lo) {
+        arch.serial.writeString("[SK-17] FAILED: FIFO second\n");
         return;
     }
 
