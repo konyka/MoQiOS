@@ -70,7 +70,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
     }
     // v53.44 fix: ext2/tcp/epoll/unix/timerfd resources are now refcounted —
     // one reference per process per distinct index (see vfs.retainSharedResources).
-    vfs_mod.retainSharedResources(&child.fd_table);
+    vfs_mod.retainSharedResources(child.fd_table);
 
     for (0..31) |i| {
         child.signal_handlers[i] = parent.signal_handlers[i];

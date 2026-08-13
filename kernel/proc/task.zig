@@ -122,8 +122,10 @@ pub const Task = struct {
     /// the scheduler when the task is put on a CPU, so each thread sees its own
     /// TLS regardless of which CPU it lands on. 0 = no TLS.
     tls_base: u64,
-    /// Per-process file descriptor table.
-    fd_table: @import("../fs/vfs.zig").FdTable,
+    /// File descriptor table — pointer into the vfs FdTable pool so
+    /// CLONE_FILES threads can share one table (pthread v2). Never null for
+    /// a live task; set at creation from vfs.allocFdTable().
+    fd_table: *@import("../fs/vfs.zig").FdTable,
     /// Per-task RLIMIT_NOFILE; defaults preserve the historical MAX_FDS cap.
     nofile_cur: u64 = @import("../fs/vfs.zig").MAX_FDS,
     nofile_max: u64 = @import("../fs/vfs.zig").MAX_FDS,
@@ -321,13 +323,13 @@ pub const MmapRegion = struct {
 
 pub const MAX_TASKS: u32 = 64;
 
-/// Task table. Slots are NOT optionals: a `Task` is ~62KB (dominated by the
-/// per-fd readahead caches plus env/cwd buffers), and storing it in a `?Task`
-/// forced the compiler to materialise a full-size temporary on the kernel
-/// stack on every create/assign, which overflowed the boot stack. Occupancy is
-/// tracked exclusively by `slot_bitmap`; an entry is only valid when its bit is
-/// set. Tasks are built in place via `zeroSlot` + field writes — no large value
-/// is ever copied through the stack.
+/// Task table. Slots are NOT optionals: a `Task` used to be ~62KB (dominated
+/// by the embedded fd table, now pooled in vfs.zig) and storing it in a
+/// `?Task` forced the compiler to materialise a full-size temporary on the
+/// kernel stack on every create/assign, which overflowed the boot stack.
+/// Occupancy is tracked exclusively by `slot_bitmap`; an entry is only valid
+/// when its bit is set. Tasks are built in place via `zeroSlot` + field
+/// writes — no large value is ever copied through the stack.
 var tasks: [MAX_TASKS]Task = undefined;
 var next_tid: u32 = 1;
 var task_count: u32 = 0;
@@ -598,6 +600,11 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     next_tid += 1;
 
     zeroSlot(slot);
+    const fd_table = @import("../fs/vfs.zig").allocFdTable() orelse {
+        serial.writeString("[task] OOM allocating fd table\n");
+        slot_bitmap &= ~(@as(u64, 1) << @intCast(slot));
+        return null;
+    };
     tasks[slot].umask_val = creation_metadata.initialTaskUmask();
     tasks[slot].self_idx = slot;
     tasks[slot].tid = tid;
@@ -607,7 +614,7 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     tasks[slot].kernel_stack_top = stack_top;
     tasks[slot].entry = entry;
     tasks[slot].personality = .native;
-    @import("../fs/vfs.zig").FdTable.initInto(&tasks[slot].fd_table);
+    tasks[slot].fd_table = fd_table;
     tasks[slot].nofile_cur = @import("../fs/vfs.zig").MAX_FDS;
     tasks[slot].nofile_max = @import("../fs/vfs.zig").MAX_FDS;
     tasks[slot].fd_table.alloc_limit = tasks[slot].nofile_cur;
@@ -628,6 +635,10 @@ pub fn cancelUnstartedKernelThread(slot: u32) void {
     defer task_lock.release(flags);
     const t = getTask(slot) orelse return;
     if (t.is_user or t.started or t.state != .ready) return;
+    // Return the pooled fd table: a fresh table only wires stdin/stdout/stderr
+    // (close() is a no-op for those), so release + free without a close loop.
+    const vfs = @import("../fs/vfs.zig");
+    if (vfs.releaseFdTable(t.fd_table)) vfs.freeFdTable(t.fd_table);
     slot_bitmap &= ~(@as(u64, 1) << @intCast(slot));
     task_count -= 1;
 }
@@ -651,6 +662,11 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     const tid = next_tid;
     next_tid += 1;
     zeroSlot(slot);
+    const fd_table = @import("../fs/vfs.zig").allocFdTable() orelse {
+        serial.writeString("[task] OOM allocating fd table\n");
+        slot_bitmap &= ~(@as(u64, 1) << @intCast(slot));
+        return null;
+    };
     tasks[slot].umask_val = creation_metadata.initialTaskUmask();
     tasks[slot].self_idx = slot;
     tasks[slot].tid = tid;
@@ -660,7 +676,7 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     tasks[slot].kernel_stack_top = stack_top;
     tasks[slot].entry = entry;
     tasks[slot].personality = .native;
-    @import("../fs/vfs.zig").FdTable.initInto(&tasks[slot].fd_table);
+    tasks[slot].fd_table = fd_table;
     tasks[slot].nofile_cur = @import("../fs/vfs.zig").MAX_FDS;
     tasks[slot].nofile_max = @import("../fs/vfs.zig").MAX_FDS;
     tasks[slot].fd_table.alloc_limit = tasks[slot].nofile_cur;
@@ -715,13 +731,19 @@ pub fn exitTask(exit_code: i32) void {
     // v53.48: Close all open file descriptors before becoming a zombie.
     // Without this, TCP connections, pipes, ext2/fat32 files, and epoll
     // instances permanently leak their underlying resources.
+    // pthread v2: the table may be shared with CLONE_FILES threads — only the
+    // LAST reference runs the close loop and returns the table to the pool;
+    // a shared table (refs > 1) is left untouched for the surviving threads.
     {
         const vfs = @import("../fs/vfs.zig");
-        var fd: u32 = 3;
-        while (fd < vfs.MAX_FDS) : (fd += 1) {
-            if (t.fd_table.fds[fd].fd_type != .none) {
-                _ = t.fd_table.close(fd);
+        if (vfs.releaseFdTable(t.fd_table)) {
+            var fd: u32 = 3;
+            while (fd < vfs.MAX_FDS) : (fd += 1) {
+                if (t.fd_table.fds[fd].fd_type != .none) {
+                    _ = t.fd_table.close(fd);
+                }
             }
+            vfs.freeFdTable(t.fd_table);
         }
     }
 
@@ -985,6 +1007,11 @@ pub fn createUserProcess(
 
         // Build the large Task in place to avoid overflowing the kernel stack.
         zeroSlot(slot);
+        const fd_table = @import("../fs/vfs.zig").allocFdTable() orelse {
+            serial.writeString("[task] OOM allocating fd table\n");
+            slot_bitmap &= ~(@as(u64, 1) << @intCast(slot));
+            return null;
+        };
         tasks[slot].umask_val = creation_metadata.initialTaskUmask();
         tasks[slot].self_idx = slot;
         tasks[slot].tid = tid;
@@ -1011,7 +1038,7 @@ pub fn createUserProcess(
         tasks[slot].user_stack_top = user_stack_top;
         tasks[slot].stack_limit = user_stack_top - 64 * 4096;
         tasks[slot].parent_tid = parent_tid_val;
-        @import("../fs/vfs.zig").FdTable.initInto(&tasks[slot].fd_table);
+        tasks[slot].fd_table = fd_table;
         tasks[slot].nofile_cur = @import("../fs/vfs.zig").MAX_FDS;
         tasks[slot].nofile_max = @import("../fs/vfs.zig").MAX_FDS;
         tasks[slot].fd_table.alloc_limit = tasks[slot].nofile_cur;

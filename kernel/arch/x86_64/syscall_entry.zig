@@ -4763,9 +4763,11 @@ fn syscallKcmp(pid1: u32, pid2: u32, kcmp_type: u32, idx1: u64, idx2: u64) i64 {
         0 => { // KCMP_FILE — compare fd tables
             _ = idx1;
             _ = idx2;
-            // Both point to same FdTable if same task, otherwise compare by address
-            if (&t1.fd_table == &t2.fd_table) return 0;
-            if (@intFromPtr(&t1.fd_table) < @intFromPtr(&t2.fd_table)) return 1;
+            // With CLONE_FILES, two tasks can share one pooled FdTable —
+            // identical pointers mean equal (and a shared KCMP_FILE table
+            // never aliases a different one).
+            if (t1.fd_table == t2.fd_table) return 0;
+            if (@intFromPtr(t1.fd_table) < @intFromPtr(t2.fd_table)) return 1;
             return 2;
         },
         1 => { // KCMP_VM — compare page tables
@@ -4774,8 +4776,8 @@ fn syscallKcmp(pid1: u32, pid2: u32, kcmp_type: u32, idx1: u64, idx2: u64) i64 {
             return 2;
         },
         2 => { // KCMP_FILES — compare file descriptor tables
-            if (&t1.fd_table == &t2.fd_table) return 0;
-            if (@intFromPtr(&t1.fd_table) < @intFromPtr(&t2.fd_table)) return 1;
+            if (t1.fd_table == t2.fd_table) return 0;
+            if (@intFromPtr(t1.fd_table) < @intFromPtr(t2.fd_table)) return 1;
             return 2;
         },
         3 => { // KCMP_FS — compare filesystem info (cwd)

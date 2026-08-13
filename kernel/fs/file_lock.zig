@@ -49,7 +49,7 @@ pub fn sysFlock(fd: u64, operation: u64) i64 {
     const fd_u: u32 = @truncate(fd);
     const op: u8 = @truncate(operation);
 
-    const inode = getInodeForFd(&t.fd_table, fd_u) orelse return -9; // EBADF
+    const inode = getInodeForFd(t.fd_table, fd_u) orelse return -9; // EBADF
     const is_nb = (op & LOCK_NB) != 0;
     const lock_type = op & (LOCK_SH | LOCK_EX | LOCK_UN);
 
@@ -157,7 +157,7 @@ pub fn setLock(fd: u64, cmd: u64, flock_ptr: u64) i64 {
     const t = task_mod.getTask(cur_idx) orelse return -1;
     const fd_u: u32 = @truncate(fd);
 
-    const inode = getInodeForFd(&t.fd_table, fd_u) orelse return -9; // EBADF
+    const inode = getInodeForFd(t.fd_table, fd_u) orelse return -9; // EBADF
 
     // Read struct flock from user space (x86_64 layout, 32 bytes)
     if (flock_ptr == 0 or flock_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT

@@ -54,7 +54,7 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
         // AF_UNIX
         const sock_idx = net_mod.unix_socket.unixSocket(sock_type);
         if (sock_idx < 0) return @as(i64, sock_idx);
-        const fd = allocUnixFd(&t.fd_table, @intCast(sock_idx));
+        const fd = allocUnixFd(t.fd_table, @intCast(sock_idx));
         if (fd < 0) {
             net_mod.unix_socket.unixClose(@intCast(sock_idx));
             return fd;
@@ -94,7 +94,7 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
                 _ = net_mod.tcp.tcpClose(@intCast(tcb_idx6));
                 return -1;
             }
-            const fd6 = allocTcpFd(&t.fd_table, @intCast(tcb_idx6));
+            const fd6 = allocTcpFd(t.fd_table, @intCast(tcb_idx6));
             if (fd6 < 0) {
                 _ = net_mod.tcp.tcpClose(@intCast(tcb_idx6));
                 return fd6;
@@ -144,7 +144,7 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
     // AF_INET + TCP
     const tcb_idx = net_mod.tcp.tcpSocket(cur_idx);
     if (tcb_idx < 0) return -1;
-    const fd = allocTcpFd(&t.fd_table, @intCast(tcb_idx));
+    const fd = allocTcpFd(t.fd_table, @intCast(tcb_idx));
     if (fd < 0) {
         _ = net_mod.tcp.tcpClose(@intCast(tcb_idx));
         return fd;
@@ -265,7 +265,7 @@ pub fn accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) i64 {
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
         const new_sock_idx = net_mod.unix_socket.unixAccept(unix_idx);
         if (new_sock_idx < 0) return @as(i64, new_sock_idx);
-        const new_fd = allocUnixFd(&t.fd_table, @intCast(new_sock_idx));
+        const new_fd = allocUnixFd(t.fd_table, @intCast(new_sock_idx));
         if (new_fd < 0) {
             net_mod.unix_socket.unixClose(@intCast(new_sock_idx));
             return new_fd;
@@ -278,7 +278,7 @@ pub fn accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) i64 {
     const new_tcb_idx = net_mod.tcp.tcpAccept(listen_tcb_idx, cur_idx);
     // Negative only on error/empty backlog (-11 EAGAIN); TCB index 0 is valid.
     if (new_tcb_idx < 0) return new_tcb_idx;
-    const new_fd = allocTcpFd(&t.fd_table, @intCast(new_tcb_idx));
+    const new_fd = allocTcpFd(t.fd_table, @intCast(new_tcb_idx));
     if (new_fd < 0) {
         _ = net_mod.tcp.tcpClose(@intCast(new_tcb_idx));
         return new_fd;
@@ -403,7 +403,7 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         const to_copy = @min(len, 4096);
         const n = copy.copyFromUser(&tmp_buf, @ptrFromInt(buf), to_copy);
         if (n == 0) return -1;
-        const result = vfs_mod.FdTable.write(&t.fd_table, fd, &tmp_buf, n);
+        const result = vfs_mod.FdTable.write(t.fd_table, fd, &tmp_buf, n);
         return result;
     }
 }
@@ -514,7 +514,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         var tmp_buf: [4096]u8 = undefined;
         const to_read = @min(len, 4096);
         if (!copy.validateUserBufferWritable(buf, to_read)) return -14; // EFAULT
-        const result = vfs_mod.FdTable.read(&t.fd_table, fd, &tmp_buf, to_read);
+        const result = vfs_mod.FdTable.read(t.fd_table, fd, &tmp_buf, to_read);
         if (result > 0) {
             const copied = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf))[0..@intCast(result)], @intCast(result));
             if (copied != @as(usize, @intCast(result))) return -14; // EFAULT

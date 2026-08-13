@@ -52,7 +52,7 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
 
     switch (cmd) {
         F_DUPFD => {
-            return dupFd(&t.fd_table, fd, arg, 0);
+            return dupFd(t.fd_table, fd, arg, 0);
         },
         F_GETFD => {
             return @intCast(t.fd_table.fds[fd].fd_flags);
@@ -73,7 +73,7 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
             return 0;
         },
         F_DUPFD_CLOEXEC => {
-            return dupFd(&t.fd_table, fd, arg, FD_CLOEXEC);
+            return dupFd(t.fd_table, fd, arg, FD_CLOEXEC);
         },
         F_GETLK, F_SETLK, F_SETLKW => {
             const file_lock = @import("file_lock.zig");

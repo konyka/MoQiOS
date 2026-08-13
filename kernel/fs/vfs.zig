@@ -277,6 +277,9 @@ pub const FdTable = struct {
     free_bm: u64 = FREE_BM_ALL, // bits 0-2 clear (stdin/stdout/stderr occupied)
     /// Mirrored from the owning Task so every allocator path shares the limit.
     alloc_limit: u64 = MAX_FDS,
+    /// pthread v2 (CLONE_FILES): reference count of tasks sharing this table.
+    /// Only touched via @atomicRmw; managed by allocFdTable/releaseFdTable.
+    refs: u32 = 0,
 
     const FREE_BM_ALL: u64 = blk: {
         const in_range: u64 = if (MAX_FDS >= 64) ~@as(u64, 0) else (@as(u64, 1) << MAX_FDS) - 1;
@@ -313,9 +316,17 @@ pub const FdTable = struct {
     }
 
     pub fn allocFdAtLeast(self: *FdTable, min_fd: u32) ?u32 {
-        const slot = RlimitPolicy.allocationCandidate(self.free_bm, min_fd, self.alloc_limit, MAX_FDS) orelse return null;
-        self.free_bm &= ~(@as(u64, 1) << @intCast(slot));
-        return slot;
+        // Lock-free slot claim (pthread v2): CLONE_FILES threads share this
+        // table, so pick-and-clear must be atomic. The candidate is derived
+        // from the latest bitmap each iteration; the And's return value tells
+        // us whether WE cleared the bit — a lost race just retries.
+        while (true) {
+            const bm = @atomicLoad(u64, &self.free_bm, .acquire);
+            const slot = RlimitPolicy.allocationCandidate(bm, min_fd, self.alloc_limit, MAX_FDS) orelse return null;
+            const bit = @as(u64, 1) << @intCast(slot);
+            const prev = @atomicRmw(u64, &self.free_bm, .And, ~bit, .acq_rel);
+            if (prev & bit != 0) return slot; // we cleared it — slot is ours
+        }
     }
 
     pub fn openFdCount(self: *const FdTable) u64 {
@@ -328,21 +339,23 @@ pub const FdTable = struct {
         if (!RlimitPolicy.fdAllowed(self.alloc_limit, fd, MAX_FDS)) return false;
         const bit = @as(u64, 1) << @intCast(fd);
         const already_open = self.fds[fd].fd_type != .none;
-        const already_reserved = self.free_bm & bit == 0;
+        const already_reserved = @atomicLoad(u64, &self.free_bm, .acquire) & bit == 0;
         if (already_open) {
             _ = self.close(fd);
-            self.free_bm &= ~bit;
+            // Atomic claim: shared tables may race a concurrent freeFd here.
+            _ = @atomicRmw(u64, &self.free_bm, .And, ~bit, .acq_rel);
             return true;
         }
         if (already_reserved) return true;
-        self.free_bm &= ~bit;
+        _ = @atomicRmw(u64, &self.free_bm, .And, ~bit, .acq_rel);
         return true;
     }
 
     /// Release an fd slot back to the free pool. Called by close() and
     /// on failure paths in open()/createPipe() that allocated but didn't use a slot.
+    /// Atomic Or: pairs with allocFdAtLeast's claim on shared (CLONE_FILES) tables.
     pub fn freeFd(self: *FdTable, fd: u32) void {
-        self.free_bm |= @as(u64, 1) << @intCast(fd);
+        _ = @atomicRmw(u64, &self.free_bm, .Or, @as(u64, 1) << @intCast(fd), .acq_rel);
     }
 
     /// Open a file by name. Returns fd index or -1 on failure.
@@ -1006,6 +1019,13 @@ pub const FdTable = struct {
     }
 
     /// Close a file descriptor.
+    ///
+    /// Weak-semantics note (pthread v2 / CLONE_FILES): slot allocation and
+    /// release are race-free (atomic free_bm), but a close racing another
+    /// thread's in-progress read/write on the SAME fd of a shared table is
+    /// accepted as-is — the descriptor may be torn down mid-use, matching
+    /// the documented close-vs-use weakness. Callers must not rely on
+    /// close blocking a concurrent user of the descriptor.
     pub fn close(self: *FdTable, fd: u32) i64 {
         if (fd >= MAX_FDS) {
             // POSIX mq descriptors live outside the per-task table (300+).
@@ -1120,6 +1140,59 @@ pub const FdTable = struct {
         return newfd;
     }
 };
+
+// ── FdTable pool (pthread v2 / CLONE_FILES) ─────────────────────────────
+//
+// FdTable used to be embedded in Task (~57KB each). It now lives in this
+// static pool so several tasks can share ONE table (CLONE_FILES threads).
+// One slot per task (task.MAX_TASKS == 64) bounds the pool; usage is
+// tracked in a u64 bitmap (bit set = in use). No table-level lock: pool
+// membership and refs move via atomics only.
+
+/// Must equal task.MAX_TASKS — every live task holds exactly one reference.
+pub const MAX_FD_TABLES: u32 = 64;
+
+var fd_table_pool: [MAX_FD_TABLES]FdTable = undefined;
+var fd_table_used: u64 = 0;
+
+/// Allocate an initialized FdTable from the pool with refs == 1.
+/// Returns null when the pool is exhausted (OOM — treat like a task-slot
+/// failure at the call site).
+pub fn allocFdTable() ?*FdTable {
+    while (true) {
+        const bm = @atomicLoad(u64, &fd_table_used, .acquire);
+        if (bm == ~@as(u64, 0)) return null;
+        const slot: u6 = @intCast(@ctz(~bm));
+        const bit = @as(u64, 1) << slot;
+        const prev = @atomicRmw(u64, &fd_table_used, .Or, bit, .acq_rel);
+        if (prev & bit != 0) continue; // lost the race — retry
+        const table = &fd_table_pool[slot];
+        FdTable.initInto(table);
+        table.refs = 1;
+        return table;
+    }
+}
+
+/// Add one reference (CLONE_FILES share at clone time).
+pub fn retainFdTable(table: *FdTable) void {
+    _ = @atomicRmw(u32, &table.refs, .Add, 1, .acq_rel);
+}
+
+/// Drop one reference. Returns true when this WAS the last reference: the
+/// caller must then run the per-fd close loop and call freeFdTable. The
+/// table is deliberately NOT returned to the pool here — doing so before the
+/// close loop would let a concurrent allocFdTable reinit it under the closer.
+pub fn releaseFdTable(table: *FdTable) bool {
+    const prev = @atomicRmw(u32, &table.refs, .Sub, 1, .acq_rel);
+    return prev == 1;
+}
+
+/// Return a table to the pool. Call only after releaseFdTable reported the
+/// last reference and all fds have been closed.
+pub fn freeFdTable(table: *FdTable) void {
+    const slot = (@intFromPtr(table) - @intFromPtr(&fd_table_pool)) / @sizeOf(FdTable);
+    _ = @atomicRmw(u64, &fd_table_used, .And, ~(@as(u64, 1) << @intCast(slot)), .acq_rel);
+}
 
 /// v53.44 fix: fork/clone used to copy fd tables without refcounting shared
 /// resources, so close() in one process dangled the other's indices. Each

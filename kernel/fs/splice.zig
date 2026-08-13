@@ -35,7 +35,7 @@ const DstType = enum { tcp_socket, pipe_write };
 fn getCurrentFdTable() ?*vfs.FdTable {
     const cur_idx = sched.currentTaskIndex() orelse return null;
     const t = task_mod.getTask(cur_idx) orelse return null;
-    return &t.fd_table;
+    return t.fd_table;
 }
 
 /// Validate that `fd` is open and return its type.
