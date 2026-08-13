@@ -580,7 +580,10 @@ fn setFATEntry(cluster: u32, value: u32) bool {
     fbuf[offset + 1] = @truncate(value >> 8);
     fbuf[offset + 2] = @truncate(value >> 16);
     fbuf[offset + 3] = (fbuf[offset + 3] & 0xF0) | @as(u8, @truncate(value >> 24));
-    _ = safeWriteSectors(sector, 1, fbuf);
+    // v53.52: propagate the write result — a failed FAT update must not be
+    // reported as success (the cache now diverges from disk either way, but
+    // the caller decides whether to continue or roll back).
+    if (safeWriteSectors(sector, 1, fbuf) <= 0) return false;
     // Cache stays valid — no invalidation needed
     return true;
 }
@@ -606,21 +609,25 @@ fn allocCluster() ?u32 {
     return null;
 }
 
-fn zeroCluster(cluster: u32) void {
+/// Zero a freshly allocated cluster. v53.52: returns false when any backing
+/// sector write fails — publishing a cluster whose stale contents were never
+/// cleared would leak previous file data into the new owner.
+fn zeroCluster(cluster: u32) bool {
     const lba = clusterToLBA(cluster);
     const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
     // v53.37: Multi-sector write for spc<=8 (P2 perf fix, same pattern as P4 writeFile)
     if (fat32_sectors_per_cluster <= 8) {
         const cluster_size = @as(u32, fat32_sectors_per_cluster) * SECTOR_SIZE;
         @memset(buf[0..cluster_size], 0);
-        _ = safeWriteSectors(lba, fat32_sectors_per_cluster, buf);
+        if (safeWriteSectors(lba, fat32_sectors_per_cluster, buf) <= 0) return false;
     } else {
         @memset(buf[0..SECTOR_SIZE], 0);
         var s: u32 = 0;
         while (s < fat32_sectors_per_cluster) : (s += 1) {
-            _ = safeWriteSectors(lba + s, 1, buf);
+            if (safeWriteSectors(lba + s, 1, buf) <= 0) return false;
         }
     }
+    return true;
 }
 
 /// SK-69: start of a free directory-entry run (may span sectors/clusters).
@@ -707,7 +714,10 @@ fn growRootDir() bool {
         cluster = getFATEntry(cluster) orelse return false;
     }
     const nc = allocCluster() orelse return false;
-    zeroCluster(nc);
+    if (!zeroCluster(nc)) {
+        _ = setFATEntry(nc, 0); // best-effort release; on failure the cluster leaks until fsck
+        return false;
+    }
     if (!setFATEntry(last, nc)) return false;
     return true;
 }
@@ -793,7 +803,10 @@ pub fn createFile(name: []const u8) i64 {
     if (free_slot == null and file_count >= MAX_FILES) return -1;
 
     const new_cluster = allocCluster() orelse return -1;
-    zeroCluster(new_cluster);
+    if (!zeroCluster(new_cluster)) {
+        _ = setFATEntry(new_cluster, 0); // best-effort release, same convention as the failure paths below
+        return -1;
+    }
 
     // SK-67/68/69: short 8.3, or LFN chain (+ cross-sector placement).
     var short_name: [11]u8 = undefined;
@@ -807,6 +820,10 @@ pub fn createFile(name: []const u8) i64 {
             fat_util.make83Alias(name, suffix, &short_name);
             if (!shortNameTakenInRoot(&short_name)) break;
             if (suffix == 9) {
+                // Best-effort release: the create already failed, and a
+                // failed free only leaks one cluster until fsck — there is
+                // no useful error left to propagate. Same for every
+                // `_ = setFATEntry(new_cluster, 0)` rollback below.
                 _ = setFATEntry(new_cluster, 0);
                 return -1;
             }
@@ -885,7 +902,10 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
         var c: u32 = fi.first_cluster;
         if (c < 2 or c >= 0x0FFFFFF8) {
             const nc = allocCluster() orelse return -1;
-            zeroCluster(nc);
+            if (!zeroCluster(nc)) {
+                _ = setFATEntry(nc, 0); // best-effort release; on failure the cluster leaks until fsck
+                return -1;
+            }
             fi.first_cluster = nc;
             fi.last_cluster = nc;
             continue;
@@ -900,7 +920,10 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
             }
         }
         const nc = allocCluster() orelse return -1;
-        zeroCluster(nc);
+        if (!zeroCluster(nc)) {
+            _ = setFATEntry(nc, 0); // best-effort release; on failure the cluster leaks until fsck
+            return -1;
+        }
         if (!setFATEntry(last, nc)) return -1;
         fi.last_cluster = nc;
     }
@@ -1005,7 +1028,10 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
     // stopped early would otherwise publish a size covering bytes never written.
     if (offset + bytes_written > fi.size) {
         fi.size = offset + bytes_written;
-        updateDirEntry(file_idx);
+        // v53.52: the data is on disk but the on-disk size is stale — report
+        // failure so writeback keeps the buffer and retries (the retry
+        // rewrites the same range and republishes the size).
+        if (!updateDirEntry(file_idx)) return -1;
     }
 
     // v53.51: Invalidate page_cache for this inode after the write loop. The
@@ -1090,8 +1116,11 @@ pub fn writePageByInode(first_cluster: u32, page_idx: u64, data: *const [4096]u8
     return true;
 }
 
-fn updateDirEntry(file_idx: u32) void {
-    if (file_idx >= file_count) return;
+/// v53.52: returns false when the on-disk entry could not be updated (scan
+/// I/O error, entry not found, or the sector write failed) — the in-memory
+/// size then diverges from disk and the caller must not claim success.
+fn updateDirEntry(file_idx: u32) bool {
+    if (file_idx >= file_count) return false;
     const fi = files[file_idx];
 
     // Walk the full root cluster chain — createFile places entries anywhere
@@ -1116,13 +1145,13 @@ fn updateDirEntry(file_idx: u32) void {
                 const entry = buf + off;
                 if (fat_util.dirEntryFirstCluster(entry) == fi.first_cluster) {
                     fat_util.setDirEntrySize(entry, fi.size);
-                    _ = safeWriteSectors(lba, 1, buf);
-                    return;
+                    return safeWriteSectors(lba, 1, buf) > 0;
                 }
             }
         }
         cluster = getFATEntry(cluster) orelse break :scan;
     }
+    return false;
 }
 
 /// Truncate a file to the given length. Frees the clusters beyond the new
@@ -1142,7 +1171,10 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
         // Growing: just update the size (clusters are allocated on write).
         if (new_size > fi.size) {
             files[file_idx].size = new_size;
-            updateDirEntry(file_idx);
+            if (!updateDirEntry(file_idx)) {
+                fs_lock.release(flags);
+                return false;
+            }
         }
         fs_lock.release(flags);
         return true;
@@ -1196,12 +1228,14 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
     // The cached chain-walk position may point past the freed tail.
     files[file_idx].last_walk_cluster = 0;
     files[file_idx].last_walk_idx = 0;
-    updateDirEntry(file_idx);
+    // v53.52: clusters beyond the new size are already freed; if the on-disk
+    // size update fails, report it instead of claiming a clean truncate.
+    const dir_ok = updateDirEntry(file_idx);
 
     const page_cache = @import("page_cache.zig");
     page_cache.invalidateInode(wb_inode);
     fs_lock.release(flags);
-    return true;
+    return dir_ok;
 }
 
 pub fn deleteFile(file_idx: u32) bool {
@@ -1240,7 +1274,14 @@ pub fn deleteFile(file_idx: u32) bool {
                 const entry = buf + off;
                 if (fat_util.dirEntryFirstCluster(entry) == fi.first_cluster) {
                     buf[off] = 0xE5;
-                    _ = safeWriteSectors(lba, 1, buf);
+                    // v53.52: abort if the tombstone never reached the disk —
+                    // freeing the cluster chain below while the live entry
+                    // still references it would hand those clusters to the
+                    // next allocation and corrupt the file.
+                    if (safeWriteSectors(lba, 1, buf) <= 0) {
+                        fs_lock.release(flags);
+                        return false;
+                    }
                     break :scan;
                 }
             }

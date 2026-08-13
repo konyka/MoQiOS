@@ -1601,7 +1601,12 @@ fn allocBlock(group: u32, skip_zero: bool) u32 {
             // v53.24: Skip zeroing when caller will overwrite entire block (full-block writes)
             const block_num = first_block + i;
             if (!skip_zero) {
-                _ = writeBlockUncached(block_num, zero_block_buf[0..block_size].ptr);
+                // v53.52: if the zeroing write fails, the block still holds
+                // stale data — refuse to hand it out. The bitmap bit/counters
+                // stay set (rolling back would need another write that may
+                // fail too), so the block leaks until fsck; that is strictly
+                // safer than publishing dirty data.
+                if (!writeBlockUncached(block_num, zero_block_buf[0..block_size].ptr)) return 0;
             }
             last_alloc_word = w;
             return block_num;
@@ -1655,7 +1660,10 @@ fn allocBlock(group: u32, skip_zero: bool) u32 {
         // v53.24: Skip zeroing when caller will overwrite entire block (full-block writes)
         const block_num = first_block + i;
         if (!skip_zero) {
-            _ = writeBlockUncached(block_num, zero_block_buf[0..block_size].ptr);
+            // v53.52: same policy as the zero-copy path above — on a failed
+            // zeroing write, leak the block (bitmap stays set) rather than
+            // hand out stale data.
+            if (!writeBlockUncached(block_num, zero_block_buf[0..block_size].ptr)) return 0;
         }
 
         last_alloc_word = w;
@@ -1685,17 +1693,24 @@ fn getIndirectMutable(block_num: u32, is_new: bool, buf: [*]u8) ?IndirectRef {
     return .{ .ptrs = @ptrCast(@alignCast(buf)), .cache_idx = null, .block_num = block_num };
 }
 
-fn flushIndirect(ref: IndirectRef) void {
+/// v53.52: returns false when the indirect block could not be persisted.
+/// On a cache-path write failure the entry stays dirty so a later cacheFlush
+/// can retry; callers treat false as allocation/persistence failure.
+fn flushIndirect(ref: IndirectRef) bool {
     if (ref.cache_idx) |idx| {
         if (batch_free_depth > 0) {
             cache[idx].dirty = true;
         } else {
-            _ = writeBlockUncached(ref.block_num, &cache[idx].data);
+            if (!writeBlockUncached(ref.block_num, &cache[idx].data)) {
+                cache[idx].dirty = true; // keep dirty for a later cacheFlush retry
+                return false;
+            }
             cache[idx].dirty = false;
         }
     } else {
-        _ = writeBlockMaybeBatch(ref.block_num, @ptrCast(ref.ptrs));
+        if (!writeBlockMaybeBatch(ref.block_num, @ptrCast(ref.ptrs))) return false;
     }
+    return true;
 }
 
 /// v53.30: Re-validate cache reference after a potentially cache-evicting operation
@@ -1736,7 +1751,10 @@ fn ensureChildIndirect(
     if (!revalidateIndirect(parent, parent_buf)) return null;
     parent.ptrs[index] = blk;
     inode.blocks += block_size / 512;
-    flushIndirect(parent.*);
+    // v53.52: on flush failure the new child pointer may never reach the
+    // disk — report failure; the freshly allocated child block leaks until
+    // fsck (same policy as allocBlock zeroing failures).
+    if (!flushIndirect(parent.*)) return null;
     return .{ .block = blk, .is_new = true };
 }
 
@@ -1754,7 +1772,10 @@ fn ensureDataPtr(
     if (!revalidateIndirect(ref, buf)) return 0;
     ref.ptrs[index] = blk;
     inode.blocks += block_size / 512;
-    flushIndirect(ref.*);
+    // v53.52: on flush failure the new data pointer may never reach the disk
+    // — report failure; the allocated block leaks until fsck (same policy as
+    // allocBlock zeroing failures).
+    if (!flushIndirect(ref.*)) return 0;
     return blk;
 }
 
