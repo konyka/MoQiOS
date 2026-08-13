@@ -37,6 +37,37 @@ static void once_init(void) {
     once_ran++;
 }
 
+/* ── v2 CLONE_FILES 验收：线程共享 fd 表 ────────────────────────────── */
+/* 读线程：直接读主线程打开的 fd，共享表下必须成功且内容一致。 */
+static void *fdshare_reader(void *arg) {
+    long fd = (long)arg;
+    char buf[8];
+    long n = read((int)fd, buf, 5);
+    if (n != 5 || buf[0] != 's' || buf[1] != 'h' || buf[4] != '7') {
+        print("hello57: FAIL fdshare-read\n");
+        __sync_fetch_and_add(&failures, 1);
+    }
+    return (void *)0;
+}
+
+/* EBADF 线程：主线程 close 后再读同一 fd 号，必须失败。
+   注意：本内核 read 闭合 fd 的历史 ABI 返回 -1（vfs.read 的 .none 分支），
+   非 -9；接受两者，核心是"必须报错"。 */
+static void *fdshare_ebadf(void *arg) {
+    long fd = (long)arg;
+    char buf[8];
+    long n = read((int)fd, buf, 5);
+    if (n != -1 && n != -9) { /* EBADF-class */
+        print("hello57: FAIL fdshare-ebadf n=");
+        char d[2] = { (char)('0' + (n < 0 ? -n : n) % 10), 0 };
+        print(n < 0 ? "-" : "+");
+        print(d);
+        print("\n");
+        __sync_fetch_and_add(&failures, 1);
+    }
+    return (void *)0;
+}
+
 /* detached 验收：线程仅原子自增后即退出，栈块由后续 create 惰性回收。 */
 static volatile long detached_done;
 
@@ -141,6 +172,29 @@ int main(int argc, char **argv, char **envp) {
         long spins = 0;
         while (detached_done != NDETACHED + 2 && spins < 100000000L) spins++;
         CHECK(detached_done == NDETACHED + 2, "detached-done");
+    }
+
+    /* ── v2 CLONE_FILES：pthread 线程共享 fd 表 ─────────────────────── */
+    /* 用 pthread_join 排序：先证明线程可见主线程的 fd，再证明主线程
+       close 后（共享表同一份）其他线程读同一 fd 号得到 EBADF。 */
+    {
+        long fd = open("/tmp/h57shr.dat", O_RDWR | O_CREAT | O_TRUNC, 0644);
+        CHECK(fd >= 3, "shr-open");
+        CHECK(write((int)fd, "shr57", 5) == 5, "shr-write");
+        CHECK(lseek((int)fd, 0, SEEK_SET) == 0, "shr-lseek");
+        pthread_t t;
+        if (pthread_create(&t, 0, fdshare_reader, (void *)fd) != 0 ||
+            pthread_join(t, 0) != 0) {
+            print("hello57: FAIL shr-join1\n");
+            failures++;
+        }
+        CHECK(close((int)fd) == 0, "shr-close");
+        if (pthread_create(&t, 0, fdshare_ebadf, (void *)fd) != 0 ||
+            pthread_join(t, 0) != 0) {
+            print("hello57: FAIL shr-join2\n");
+            failures++;
+        }
+        unlink("/tmp/h57shr.dat");
     }
 
     if (failures == 0) {

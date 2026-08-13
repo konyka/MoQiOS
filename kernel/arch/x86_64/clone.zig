@@ -188,32 +188,47 @@ pub fn clone(
     const child = task_mod.getTask(child_idx).?;
     child.nofile_cur = parent.nofile_cur;
     child.nofile_max = parent.nofile_max;
-    child.fd_table.alloc_limit = child.nofile_cur;
 
     child.brk_current = parent.brk_current;
     child.stack_limit = parent.stack_limit;
 
-    // CLONE_FILES: share fd table (currently always copies)
-    // v53.50: Copy free_bm bitmap — child inherits parent's fd occupancy state.
-    child.fd_table.free_bm = parent.fd_table.free_bm;
-    for (0..vfs_mod.MAX_FDS) |i| {
-        child.fd_table.fds[i] = parent.fd_table.fds[i];
-        if (child.fd_table.fds[i].fd_type == .pipe_read or child.fd_table.fds[i].fd_type == .pipe_write) {
-            const pidx = child.fd_table.fds[i].pipe_idx;
-            if (pidx < 16) {
-                _ = vfs_mod.pipeRetain(pidx, child.fd_table.fds[i].fd_type == .pipe_write);
+    if (flags & CLONE_FILES != 0) {
+        // Share the fd table with the parent (pthread v2): one atomic
+        // reference added, NO descriptor copy and NO retainSharedResources —
+        // the table holds exactly one reference per underlying resource for
+        // the whole thread group, and exitTask only closes it when the last
+        // reference drops. The fresh table createUserProcess allocated goes
+        // straight back to the pool (it only wires stdin/stdout/stderr, whose
+        // close is a no-op). alloc_limit is inherited with the shared table —
+        // the thread group shares NOFILE, matching Linux.
+        vfs_mod.retainFdTable(parent.fd_table);
+        const fresh = child.fd_table;
+        child.fd_table = parent.fd_table;
+        if (vfs_mod.releaseFdTable(fresh)) vfs_mod.freeFdTable(fresh);
+    } else {
+        child.fd_table.alloc_limit = child.nofile_cur;
+
+        // v53.50: Copy free_bm bitmap — child inherits parent's fd occupancy state.
+        child.fd_table.free_bm = parent.fd_table.free_bm;
+        for (0..vfs_mod.MAX_FDS) |i| {
+            child.fd_table.fds[i] = parent.fd_table.fds[i];
+            if (child.fd_table.fds[i].fd_type == .pipe_read or child.fd_table.fds[i].fd_type == .pipe_write) {
+                const pidx = child.fd_table.fds[i].pipe_idx;
+                if (pidx < 16) {
+                    _ = vfs_mod.pipeRetain(pidx, child.fd_table.fds[i].fd_type == .pipe_write);
+                }
+            }
+            // The shallow copy duplicates readahead page pointers that stay
+            // owned by the parent — drop the child's copy (UAF/double-free).
+            if (child.fd_table.fds[i].fd_type == .fat32_file) {
+                const readahead = @import("../../fs/readahead.zig");
+                readahead.resetStateForFork(&child.fd_table.fds[i].readahead_state);
             }
         }
-        // The shallow copy duplicates readahead page pointers that stay
-        // owned by the parent — drop the child's copy (UAF/double-free).
-        if (child.fd_table.fds[i].fd_type == .fat32_file) {
-            const readahead = @import("../../fs/readahead.zig");
-            readahead.resetStateForFork(&child.fd_table.fds[i].readahead_state);
-        }
+        // v53.44 fix: ext2/tcp/epoll/unix/timerfd resources are now refcounted —
+        // one reference per process per distinct index (see vfs.retainSharedResources).
+        vfs_mod.retainSharedResources(child.fd_table);
     }
-    // v53.44 fix: ext2/tcp/epoll/unix/timerfd resources are now refcounted —
-    // one reference per process per distinct index (see vfs.retainSharedResources).
-    vfs_mod.retainSharedResources(&child.fd_table);
 
     // Signal handlers, mask, environment, cwd, pgid, sid
     for (0..31) |i| {
