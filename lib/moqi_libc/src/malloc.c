@@ -28,6 +28,21 @@ struct block {
 
 static struct block *heap_head;
 
+/* v2: free-list mutations run under a test-and-set spinlock so concurrent
+ * pthread_create/join from multiple threads cannot corrupt the heap. The
+ * critical sections are short (no syscalls except grow's brk), so spinning
+ * beats futex overhead here. The lock is a no-op cost-wise for the
+ * single-threaded programs the host tests exercise. */
+static volatile int heap_lock;
+
+static void heap_acquire(void) {
+    while (__sync_lock_test_and_set(&heap_lock, 1)) {}
+}
+
+static void heap_release(void) {
+    __sync_lock_release(&heap_lock);
+}
+
 static size_t align_up(size_t n) {
     return (n + ALIGN - 1) & ~(ALIGN - 1);
 }
@@ -67,18 +82,24 @@ static void split(struct block *b, size_t size) {
 void *malloc(size_t size) {
     size_t want = align_up(size == 0 ? 1 : size);
 
+    heap_acquire();
     for (struct block *b = heap_head; b; b = b->next) {
         if (b->free && b->size >= want) {
             split(b, want);
             b->free = 0;
+            heap_release();
             return (void *)(b + 1);
         }
     }
 
     struct block *b = grow(want);
-    if (b == (struct block *)0) return (void *)0;
+    if (b == (struct block *)0) {
+        heap_release();
+        return (void *)0;
+    }
     split(b, want);
     b->free = 0;
+    heap_release();
     return (void *)(b + 1);
 }
 
@@ -96,9 +117,11 @@ static void coalesce(void) {
 
 void free(void *ptr) {
     if (ptr == (void *)0) return;
+    heap_acquire();
     struct block *b = (struct block *)ptr - 1;
     b->free = 1;
     coalesce();
+    heap_release();
 }
 
 void *calloc(size_t nmemb, size_t size) {

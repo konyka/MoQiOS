@@ -35,7 +35,34 @@ typedef struct TCB {
     void *arg;
     void *specific[PTHREAD_KEYS_MAX];
     void *alloc_base;               /* join 时 free */
+    volatile int detached;          /* pthread_detach 置位；join 返回 EINVAL */
+    struct TCB *dead_next;          /* 死栈链链接（仅退出后使用） */
 } TCB;
+
+/* ── detached 栈惰性回收（v2） ────────────────────────────────────────
+ * 退出的 detached 线程无法安全 free 自己仍在运行的栈，因此把 TCB 块压入
+ * 无锁死栈链，由下一次 pthread_create 排空并 free。压链是退出线程的
+ * 最后内存写：其后以纯寄存器 asm 直接 syscall exit，不再触碰本栈；
+ * 残余窗口是压链与 exit 之间的信号投递（帧会写到可能已回收的栈顶），
+ * 指令级宽度，按既有惯例记录为已接受残余。 */
+static TCB *volatile dead_head;
+
+static void dead_push(TCB *t) {
+    TCB *head;
+    do {
+        head = dead_head;
+        t->dead_next = head;
+    } while (!__sync_bool_compare_and_swap(&dead_head, head, t));
+}
+
+static void dead_drain(void) {
+    TCB *list = __sync_lock_test_and_set(&dead_head, (TCB *)0);
+    while (list != 0) {
+        TCB *next = list->dead_next;
+        free(list->alloc_base);
+        list = next;
+    }
+}
 
 static TCB main_tcb = { .self = &main_tcb };
 
@@ -75,6 +102,8 @@ static inline long futex_call(volatile int *uaddr, long op, long val, long val2)
 int pthread_create(pthread_t *thread, const void *attr,
                    void *(*start_routine)(void *), void *arg) {
     (void)attr;
+    /* v2：先回收已退出 detached 线程的栈块（见 dead_drain 注释）。 */
+    dead_drain();
     void *base = malloc(sizeof(TCB) + THREAD_STACK_SIZE);
     if (base == 0) return -12; /* ENOMEM */
     TCB *t = (TCB *)base;
@@ -85,6 +114,8 @@ int pthread_create(pthread_t *thread, const void *attr,
     t->fn = start_routine;
     t->arg = arg;
     t->alloc_base = base;
+    t->detached = 0;
+    t->dead_next = 0;
     for (int i = 0; i < PTHREAD_KEYS_MAX; i++) t->specific[i] = 0;
 
     long sp = (long)base + sizeof(TCB) + THREAD_STACK_SIZE;
@@ -111,15 +142,38 @@ void pthread_exit(void *retval) {
     me->retval = retval;
     __atomic_store_n(&me->state, 1, __ATOMIC_SEQ_CST);
     futex_call((volatile int *)&me->state, FUTEX_WAKE, 1, 0);
+    if (me->detached) {
+        /* 压入死栈链后不再触碰本栈：直接以寄存器内联 exit syscall，
+           连 _exit 的调用帧都不建。栈块由下一次 pthread_create 回收。 */
+        dead_push(me);
+        __asm__ volatile("syscall"
+            :: "a"((long)2 /* SYS_exit */), "D"(0L)
+            : "rcx", "r11", "memory");
+        __builtin_unreachable();
+    }
     _exit(0);
     __builtin_unreachable();
 }
 
+int pthread_detach(pthread_t thread) {
+    TCB *t = (TCB *)thread;
+    if (__sync_lock_test_and_set(&t->detached, 1) != 0) return -22; /* EINVAL */
+    /* 已退出的线程不会再被 join：直接送入死栈链。 */
+    if (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == 1) dead_push(t);
+    return 0;
+}
+
 int pthread_join(pthread_t thread, void **retval) {
     TCB *t = (TCB *)thread;
+    if (__atomic_load_n(&t->detached, __ATOMIC_ACQUIRE) != 0) return -22; /* EINVAL */
     while (__atomic_load_n(&t->state, __ATOMIC_SEQ_CST) == 0) {
         futex_call((volatile int *)&t->state, FUTEX_WAIT, 0, 0);
     }
+    /* 与并发 detach 的竞速（POSIX 属 UB，但必须不产生 double-free）：
+       退出线程只在看到 detached==1 时压死栈链；压链发生在 state=1 之后，
+       因此此处复见 detached==1 时该块可能已在死栈链上，所有权归
+       dead_drain，join 不得再读 retval 或 free。 */
+    if (__atomic_load_n(&t->detached, __ATOMIC_ACQUIRE) != 0) return -22; /* EINVAL */
     if (retval) *retval = t->retval;
     free(t->alloc_base);
     return 0;

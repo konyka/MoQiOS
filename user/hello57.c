@@ -37,6 +37,15 @@ static void once_init(void) {
     once_ran++;
 }
 
+/* detached 验收：线程仅原子自增后即退出，栈块由后续 create 惰性回收。 */
+static volatile long detached_done;
+
+static void *detached_worker(void *arg) {
+    (void)arg;
+    __sync_fetch_and_add(&detached_done, 1);
+    return (void *)0;
+}
+
 static void *worker(void *arg) {
     long id = (long)arg;
     for (long i = 0; i < NITER; i++) {
@@ -100,6 +109,39 @@ int main(int argc, char **argv, char **envp) {
     CHECK(errno == 5, "errno-isolation");
     CHECK(main_pid == getpid(), "tgid");
     (void)main_errno;
+
+    /* ── v2 detached：不 join 的线程栈块由后续 create 惰性回收 ──────── */
+    {
+#define NDETACHED 8
+        pthread_t dth[NDETACHED];
+        for (long i = 0; i < NDETACHED; i++) {
+            if (pthread_create(&dth[i], 0, detached_worker, (void *)0) != 0) {
+                print("hello57: FAIL detach-create\n");
+                failures++;
+                break;
+            }
+            if (pthread_detach(dth[i]) != 0) {
+                print("hello57: FAIL detach\n");
+                failures++;
+            }
+        }
+        /* 重复 detach 与 join-detached 都必须报 EINVAL。 */
+        CHECK(pthread_detach(dth[0]) == -22, "double-detach-EINVAL");
+        CHECK(pthread_join(dth[0], 0) == -22, "join-detached-EINVAL");
+        /* 后续 create 触发死栈链排空；这两个线程自身走 join 回收。 */
+        for (long i = 0; i < 2; i++) {
+            pthread_t t;
+            if (pthread_create(&t, 0, detached_worker, (void *)0) != 0 ||
+                pthread_join(t, 0) != 0) {
+                print("hello57: FAIL drain-create\n");
+                failures++;
+            }
+        }
+        /* 8 个 detached + 2 个 drain 线程共 10 次自增；有界等待。 */
+        long spins = 0;
+        while (detached_done != NDETACHED + 2 && spins < 100000000L) spins++;
+        CHECK(detached_done == NDETACHED + 2, "detached-done");
+    }
 
     if (failures == 0) {
         print("hello57: PASS (");
