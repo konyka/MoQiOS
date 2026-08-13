@@ -1902,6 +1902,44 @@ reap 静默门保证槽位有效）。验证：修复前近 4 个 SMP=4 样本 3
 
 ---
 
+### 6.26 SMP=4 残余停滞专项——结案（2026-08-13）：三个独立根因全部闭合
+
+**取证工具**：新增 `tools/gdb_stall_probe.sh`——QEMU 挂 GDB stub 启动，停滞检测（串口日志
+90 秒无增长且未到 shell）后批量转储：各 vCPU 寄存器/回溯、任务表全量状态、阻塞任务的
+saved_rsp 帧。另用临时复现 init（连跑 60 次 hello58，未提交）把单轮停滞概率从 ~1/6 压到
+接近 1/1，并用 `blocked_by`/`sleep_bm_clear_by` 调用点插桩（验证后已撤除）锁定肇事路径。
+
+**根因①（checkSignalsOnSyscallReturn 幻影僵尸）**：syscall 返回路径对默认动作 terminate
+的信号直接写 `state = .zombie`，不走 exitTask——无 fd 清理、无 [kill] 打印、**不唤醒
+waitpid 中的父进程**；tick 随后把幻影僵尸切走，再无任何人补 exitTask。这正是 §6.21 注释里
+v53.49 在 tick 投递路径修过的同一个 bug 的孪生漏网路径。修复：改调
+`exitTask(128 + signum)`。
+
+**根因②（sleepTimerTick 误清睡眠位）**：tick 扫描的 bm 是循环开始前一次性加载的，任务在
+两次 nanosleep 之间（旧睡眠已清 deadline、新睡眠未发布）被读到 `deadline==0` 时会被误清位
+——读-判-清非原子，裁掉新睡眠刚武装的位，任务永久失醒（.blocked 且 sleep_bm=0）。修复：
+tick 只在 zombie 时清位，deadline==0 瞬态位由任务自己清除。
+
+**根因③（yield trap 恢复 .blocked 任务继续运行——系列停滞的主根因）**：阻塞原语
+`blockTask + forceReschedule`（int 252 yield trap）的 tick 在**本 CPU 无可运行同伴**时直接
+`return`，iretq 恢复的是这个已被标记 .blocked 的任务——它带着 .blocked 状态继续执行，
+逃出阻塞循环回到用户态后，下一次抢占的 switch-out 走 `releaseToReady`（只认 .running）→
+既不重新入队也无任何唤醒源，任务永久丢失（四核全部 idle-hlt，串口完全静默）。waitpid 的
+park 路径早有同款"状态修复"，nanosleep/futex/sleepOn 等路径没有。修复：新增
+`sched.repairCurrentAfterBlock()`（返回时本任务必为当前任务，状态非 .running 即修复），
+接入全部 12 个 block+forceReschedule 点位（nanosleep、sleepOn、futex×4、timerfd、ipc×3、
+posix_mq×2、sysv_sem、file_lock×2）。
+
+**证据链**：GDB 转储显示父任务 .blocked、无 stopped、无 sleep_bm 位、无 wait 标志，四核
+全 idle；saved_rsp 帧为 write() 包装器内的用户态抢占帧；`blocked_by` 插桩指向 nanosleep 的
+blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（240 次 hello58）全过。
+
+**验证**：host 测试 + smoke SMP=1 + 复现器 4 轮 + SMP=4 连跑（见提交记录）。
+
+---
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:

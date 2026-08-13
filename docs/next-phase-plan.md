@@ -55,6 +55,20 @@
 ## P2：中期项（需要 1–2 个专项迭代）
 
 - pthread v2 三件套：~~detached 线程栈回收~~（✅ 6.25 完成，死栈链惰性回收 + malloc 自旋锁）；CLONE_FILES 真共享 fd 表、`__thread`（PT_TLS）仍待做（kernel-subsystems §2.5a）。
+
+  **CLONE_FILES 设计要点（2026-08-13 勘察定稿）**：
+  1. `FdTable` 从 `Task` 内嵌（约 57KB/任务）移到静态池（`fd_table_pool[MAX_TASKS]` +
+     使用位图），`Task.fd_table` 改为 `*FdTable`（Zig 指针字段访问自动解引用，
+     约 30 处 `&x.fd_table` 需改为 `x.fd_table`，无整表赋值点）；
+  2. 表内新增 `refs`（原子引用计数）与表级 IrqSpinlock；fork/clone 默认复制到新表
+     （保留现有 pipeRetain/retainSharedResources 逐资源引用语义），CLONE_FILES 共享
+     指针且 refs++，不取任何逐资源引用；
+  3. exitTask 的 fd 关闭只在 refs 降 0 时执行（最后一个引用者负责关闭全部 fd）；
+     exec 的 CLOEXEC 关闭作用于共享表（POSIX 语义）；
+  4. 并发契约 v1：alloc/close/dup 类变更持表锁；read/write 路径不加锁（fd 槽位
+     内容竞态为记录的弱语义，fget/fput 级完整引用计数留待后续）；
+  5. pthread_create 加传 CLONE_FILES（真正获得线程 fd 共享语义）；
+  6. 验收：hello57 扩展——A 线程 open 的文件 B 线程可读；A close 后 B 看到 EBADF。
 - AHCI/SATA 实际 I/O 路径与 `io_sched.tryMerge` 验证（kernel-subsystems §6.4）——
   真机存储的前提。
 - tmpfs 单文件 256 KiB 上限扩容（user-space §7.1）。
