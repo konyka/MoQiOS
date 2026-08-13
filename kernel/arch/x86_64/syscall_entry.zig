@@ -3057,7 +3057,8 @@ fn syscallAccept(frame: *SyscallFrame) void {
 /// RDX = data length
 /// Returns bytes sent, -1 on error.
 fn syscallSendto(frame: *SyscallFrame) void {
-    frame.rax = @bitCast(socket_mod.sendto(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx), @truncate(frame.rcx), frame.r8, @truncate(frame.r9)));
+    // 4th arg arrives in r10 per the syscall ABI (rcx holds the user RIP).
+    frame.rax = @bitCast(socket_mod.sendto(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx), @truncate(frame.r10), frame.r8, @truncate(frame.r9)));
 }
 
 /// Syscall #122: recvfrom(fd, buf, len, flags, addr_ptr, addr_len_ptr)
@@ -3067,7 +3068,9 @@ fn syscallSendto(frame: *SyscallFrame) void {
 /// RDX = buffer length
 /// Returns bytes received (0 = none), -1 on error/closed.
 fn syscallRecvfrom(frame: *SyscallFrame) void {
-    frame.rax = @bitCast(socket_mod.recvfrom(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx), @truncate(frame.rcx), frame.r8, frame.r9));
+    // 4th arg arrives in r10 per the syscall ABI (rcx holds the user RIP);
+    // reading rcx made flags garbage — invisible while flags were ignored.
+    frame.rax = @bitCast(socket_mod.recvfrom(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx), @truncate(frame.r10), frame.r8, frame.r9));
 }
 
 /// Syscall #123: mkdir(path, mode)

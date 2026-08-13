@@ -201,6 +201,16 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
 }
 
 pub fn recvFrom(port: u16, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, out_src_port: *u16) i64 {
+    var full_len: u16 = 0;
+    return recvFromEx(port, out_buf, out_len, out_src_ip, out_src_port, &full_len, false);
+}
+
+/// recvFrom variant reporting the datagram's full queued length and
+/// optionally leaving the entry queued (MSG_PEEK). Returns the copied byte
+/// count (min of full length and out_len), 0 when no datagram is queued.
+/// `out_full_len` always receives the untruncated datagram length so the
+/// caller can implement MSG_TRUNC.
+pub fn recvFromEx(port: u16, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, out_src_port: *u16, out_full_len: *u16, peek: bool) i64 {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
 
@@ -213,7 +223,8 @@ pub fn recvFrom(port: u16, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, out
             @memcpy(out_buf[0..n], entry.data[0..n]);
             out_src_ip.* = entry.src_ip[0..4].*;
             out_src_port.* = entry.src_port;
-            entry.valid = false;
+            out_full_len.* = entry.data_len;
+            if (!peek) entry.valid = false;
             return n;
         }
     }
@@ -222,6 +233,13 @@ pub fn recvFrom(port: u16, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, out
 
 /// Drain one IPv6 datagram for `port` (SK-70).
 pub fn recvFromV6(port: u16, out_buf: [*]u8, out_src_ip: *[16]u8, out_src_port: *u16) i64 {
+    var full_len: u16 = 0;
+    return recvFromV6Ex(port, out_buf, MAX_UDP_PAYLOAD_V6, out_src_ip, out_src_port, &full_len, false);
+}
+
+/// recvFromV6 variant with an explicit output cap, full-length reporting
+/// and optional peek — same contract as recvFromEx.
+pub fn recvFromV6Ex(port: u16, out_buf: [*]u8, out_len: u16, out_src_ip: *[16]u8, out_src_port: *u16, out_full_len: *u16, peek: bool) i64 {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
 
@@ -229,11 +247,12 @@ pub fn recvFromV6(port: u16, out_buf: [*]u8, out_src_ip: *[16]u8, out_src_port: 
     for (0..QUEUE_DEPTH) |i| {
         const entry = &queues[port_idx][i];
         if (entry.valid and entry.is_v6) {
-            const n = entry.data_len;
+            const n = @min(entry.data_len, out_len);
             @memcpy(out_buf[0..n], entry.data[0..n]);
             out_src_ip.* = entry.src_ip;
             out_src_port.* = entry.src_port;
-            entry.valid = false;
+            out_full_len.* = entry.data_len;
+            if (!peek) entry.valid = false;
             return n;
         }
     }

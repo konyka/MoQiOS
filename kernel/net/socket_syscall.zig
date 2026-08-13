@@ -410,7 +410,11 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
 
 /// recvfrom(fd, buf, len, flags, addr_ptr, addr_len_ptr) → bytes received or -errno
 pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len_ptr: u64) i64 {
-    _ = flags;
+    // UDP honors MSG_PEEK (leave the datagram queued) and MSG_TRUNC (report
+    // the full datagram length even when the buffer is smaller). Other flag
+    // bits keep the historical ignore behavior.
+    const msg_peek = (flags & 0x02) != 0;
+    const msg_trunc = (flags & 0x20) != 0;
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
 
@@ -454,7 +458,8 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
             }
             var src6: [16]u8 = @splat(0);
             var src_port_out6: u16 = 0;
-            const result6 = udp.recvFromV6(src_port, &tmp6, &src6, &src_port_out6);
+            var full_len6: u16 = 0;
+            const result6 = udp.recvFromV6Ex(src_port, &tmp6, @intCast(tmp6.len), &src6, &src_port_out6, &full_len6, msg_peek);
             if (result6 > 0) {
                 const to_write6 = @min(@as(u32, @intCast(result6)), to_read6);
                 if (copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp6))[0..to_write6], to_write6) != to_write6) return -14;
@@ -472,7 +477,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
                         if (copy.copyToUser(@ptrFromInt(addr_len_ptr), &al6, 4) != 4) return -14;
                     }
                 }
-                return @intCast(to_write6);
+                return if (msg_trunc) @as(i64, full_len6) else @intCast(to_write6);
             }
             return 0;
         }
@@ -485,7 +490,8 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         }
         var src_ip: [4]u8 = .{ 0, 0, 0, 0 };
         var src_port_out: u16 = 0;
-        const result2 = udp.recvFrom(src_port, &tmp_buf2, @intCast(tmp_buf2.len), &src_ip, &src_port_out);
+        var full_len: u16 = 0;
+        const result2 = udp.recvFromEx(src_port, &tmp_buf2, @intCast(tmp_buf2.len), &src_ip, &src_port_out, &full_len, msg_peek);
         if (result2 > 0) {
             const to_write = @min(@as(u32, @intCast(result2)), to_read2);
             if (copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf2))[0..to_write], to_write) != to_write) return -14;
@@ -499,7 +505,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
                     if (copy.copyToUser(@ptrFromInt(addr_len_ptr), &al, 4) != 4) return -14;
                 }
             }
-            return @intCast(to_write);
+            return if (msg_trunc) @as(i64, full_len) else @intCast(to_write);
         } else {
             return 0;
         }

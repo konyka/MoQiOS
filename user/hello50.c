@@ -74,6 +74,8 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define MAP_ANONYMOUS       0x20
 #define AF_INET             2
 #define SOCK_DGRAM          2
+#define MSG_PEEK            0x02
+#define MSG_TRUNC           0x20
 
 #define NWORKERS  4
 #define ITERS     300
@@ -124,11 +126,20 @@ static void mk_addr(uint8_t *a, uint16_t port) {
     a[4] = 127; a[5] = 0; a[6] = 0; a[7] = 1;
 }
 
+static int64_t recv_pumped_flags(int64_t fd, uint8_t *buf, uint64_t len, uint64_t flags,
+                                 uint8_t *src, uint64_t *srclen);
+
 /* Bounded non-blocking recv: pump the lo queue between attempts. */
 static int64_t recv_pumped(int64_t fd, uint8_t *buf, uint64_t len, uint8_t *src, uint64_t *srclen) {
+    return recv_pumped_flags(fd, buf, len, 0, src, srclen);
+}
+
+/* Same bounded pump with explicit recvfrom flags (MSG_PEEK/MSG_TRUNC). */
+static int64_t recv_pumped_flags(int64_t fd, uint8_t *buf, uint64_t len, uint64_t flags,
+                                 uint8_t *src, uint64_t *srclen) {
     for (int attempt = 0; attempt < 1000; attempt++) {
         syscall1(SYS_NETPOLL, 0);
-        int64_t n = syscall6(SYS_RECVFROM, (uint64_t)fd, (uint64_t)buf, len, 0,
+        int64_t n = syscall6(SYS_RECVFROM, (uint64_t)fd, (uint64_t)buf, len, flags,
                              (uint64_t)src, (uint64_t)srclen);
         if (n != 0) return n;
     }
@@ -219,6 +230,37 @@ static void worker(int w) {
         if (!verify_pat(urcv, UDP_LEN / 8, w, iter)) worker_fail(w, "udp verify");
         if (src[4] != 127 || src[5] != 0 || src[6] != 0 || src[7] != 1)
             worker_fail(w, "udp src addr");
+
+        /* MSG_PEEK/MSG_TRUNC semantics (once per worker): send a second
+           datagram, peek it twice (not consumed), then receive it with a
+           half-size buffer + MSG_TRUNC expecting the full length back.
+           Uses stack-local buffers: the file-scope upay/urcv are shared
+           between concurrent workers and would race under preemption. */
+        if (iter == 0) {
+            uint64_t pay2[UDP_LEN / 8], rcv2[UDP_LEN / 8];
+            fill_pat(pay2, UDP_LEN / 8, w, 77);
+            if (syscall6(SYS_SENDTO, (uint64_t)u, (uint64_t)pay2, UDP_LEN, 0,
+                         (uint64_t)addr, 16) != UDP_LEN)
+                worker_fail(w, "udp sendto flags");
+            for (int i = 0; i < UDP_LEN / 8; i++) rcv2[i] = 0;
+            if (recv_pumped_flags(u, (uint8_t *)rcv2, UDP_LEN, MSG_PEEK, src, &srclen) != UDP_LEN)
+                worker_fail(w, "udp peek");
+            if (!verify_pat(rcv2, UDP_LEN / 8, w, 77)) worker_fail(w, "udp peek verify");
+            /* Second peek must see the same datagram: it was not consumed. */
+            for (int i = 0; i < UDP_LEN / 8; i++) rcv2[i] = 0;
+            if (recv_pumped_flags(u, (uint8_t *)rcv2, UDP_LEN, MSG_PEEK, src, &srclen) != UDP_LEN)
+                worker_fail(w, "udp peek again");
+            if (!verify_pat(rcv2, UDP_LEN / 8, w, 77)) worker_fail(w, "udp peek again verify");
+            /* MSG_TRUNC: half-size buffer, full length reported, datagram consumed. */
+            for (int i = 0; i < UDP_LEN / 8; i++) rcv2[i] = 0;
+            if (recv_pumped_flags(u, (uint8_t *)rcv2, UDP_LEN / 2, MSG_TRUNC, src, &srclen) != UDP_LEN)
+                worker_fail(w, "udp trunc len");
+            if (!verify_pat(rcv2, UDP_LEN / 16, w, 77)) worker_fail(w, "udp trunc verify");
+            /* Queue drained: an immediate recv finds nothing. */
+            if (syscall6(SYS_RECVFROM, (uint64_t)u, (uint64_t)rcv2, UDP_LEN, 0,
+                         (uint64_t)src, (uint64_t)&srclen) != 0)
+                worker_fail(w, "udp trunc consumed");
+        }
         if (syscall1(SYS_CLOSE, (uint64_t)u) != 0) worker_fail(w, "udp close");
 
         /* ── anonymous mmap ────────────────────────────────────────── */
