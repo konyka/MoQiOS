@@ -2881,8 +2881,13 @@ pub fn checkSignalsOnSyscallReturn(frame: *SyscallFrame) void {
     if (handler_addr == 0) {
         switch (sig_mod.defaultAction(signum)) {
             .terminate => {
-                current.state = .zombie;
-                current.exit_code = 128 + @as(i32, @intCast(signum));
+                // 必须走完整 exitTask：直接标 .zombie 会跳过 fd 清理、
+                // [kill] 诊断和父进程唤醒——若父进程正阻塞在 waitpid
+                // （waiting_for_child 已置位），它将永远等不到唤醒，且 tick
+                // 随后把该僵尸切走，再无任何人调用 exitTask（SMP=4 hello58
+                // 停滞的根因：子进程被 SIGKILL 在此静默标记，父进程永久停放）。
+                // exitTask 不返回（与本函数的其他终止路径一致）。
+                @import("../../proc/task.zig").exitTask(128 + @as(i32, @intCast(signum)));
             },
             .ignore => return,
             .stop => sig_mod.stopTask(current),
@@ -3205,6 +3210,10 @@ fn syscallNanosleep(req_ptr: u64, rem_ptr: u64) i64 {
         _ = @atomicRmw(u64, &sched.sleep_bm, .Or, bit, .seq_cst);
         tm.blockTask(cur_idx);
         sched.forceReschedule();
+        // yield trap 可能未切换（本 CPU 无可运行同伴时 tick 直接返回），
+        // 本任务仍以 .blocked 继续执行——必须修复状态，否则逃出循环后
+        // 一旦被抢占就永远不会再被调度。
+        sched.repairCurrentAfterBlock();
     }
 
     cur.sleep_deadline_ns = 0;

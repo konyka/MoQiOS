@@ -348,6 +348,7 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
             cur_task.state = .blocked;
             mq_lock.release(flags);
             sched.forceReschedule();
+            sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
             if (abs_timeout_ns != 0) disarmWaitDeadline(cur_idx);
             // Woken: wakeOne already popped our node; unlink defensively in
             // case a future wake path bypasses the queue, then re-check the
@@ -452,6 +453,7 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
             cur_task.state = .blocked;
             mq_lock.release(flags);
             sched.forceReschedule();
+            sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
             if (abs_timeout_ns != 0) disarmWaitDeadline(cur_idx);
             // Woken: re-check condition and deadline from the top.
             const flags2 = mq_lock.acquire();

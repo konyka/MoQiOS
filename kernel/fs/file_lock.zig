@@ -107,6 +107,7 @@ pub fn sysFlock(fd: u64, operation: u64) i64 {
             if (sig_mod.pendingActionable(t)) return -4; // -EINTR
             // Blocking: yield and retry
             sched_mod.forceReschedule();
+            sched_mod.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
             continue;
         }
 
@@ -261,6 +262,7 @@ pub fn setLock(fd: u64, cmd: u64, flock_ptr: u64) i64 {
             if (sig_mod.pendingFatal(t)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
             if (sig_mod.pendingActionable(t)) return -4; // -EINTR
             sched_mod.forceReschedule();
+            sched_mod.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
             continue;
         }
 

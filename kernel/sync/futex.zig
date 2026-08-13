@@ -319,6 +319,7 @@ pub fn futexWaitv(waiters_ptr: u64, nr_waiters: u64) i64 {
         bucket.lock.release(irq_flags);
 
         sched_mod.forceReschedule();
+        sched_mod.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
 
         // v53.44: Clean up node if not granted (prevents UAF)
         if (!node.granted) {
@@ -385,6 +386,7 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
             bucket.lock.release(irq_flags);
 
             sched_mod.forceReschedule();
+            sched_mod.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
 
             if (deadline != 0) disarmWaitDeadline(cur_idx);
             // v53.44: Clean up node if not granted (prevents UAF)
@@ -439,6 +441,7 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
             cur.state = .blocked;
             bucket.lock.release(irq_flags);
             sched_mod.forceReschedule();
+            sched_mod.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
             if (deadline != 0) disarmWaitDeadline(cur_idx);
             // v53.44: Clean up node if not granted (prevents UAF)
             if (!node.granted) {
@@ -562,6 +565,7 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
                 bucket.lock.release(irq_flags);
 
                 sched_mod.forceReschedule();
+                sched_mod.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
 
                 // v53.44: Clean up node if not granted (prevents UAF)
                 if (!node.granted) {

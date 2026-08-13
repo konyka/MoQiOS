@@ -116,10 +116,16 @@ pub fn sleepTimerTick(now_ns: u64) void {
         };
         const deadline = @atomicLoad(u64, &t.sleep_deadline_ns, .acquire);
         const st = sched_claim.load(&t.state);
-        if (deadline == 0 or st == .zombie) {
+        if (st == .zombie) {
             _ = @atomicRmw(u64, &sleep_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
             continue;
         }
+        // deadline == 0 不再清位：本扫描的 bm 是循环开始前一次性加载的，
+        // 任务可能在两次 nanosleep 之间（旧睡眠清 deadline、新睡眠尚未
+        // 发布）被读到 deadline==0，若据此清位会裁掉新睡眠刚武装的位，
+        // 造成永久失醒（任务 .blocked 而 sleep_bm 为 0）。deadline==0 的
+        // 瞬态位无害：unblockTask 对非 .blocked 任务是 no-op，位由任务
+        // 自己在退出睡眠循环时清除。
         if (now_ns >= deadline) task.unblockTask(@intCast(i));
     }
 }
@@ -1381,7 +1387,26 @@ pub fn sleepOn(queue: *?*task.WaitNode, node: *task.WaitNode) bool {
     // When we are woken, we return here. Check if granted.
     // The waker sets node.granted = true before making the task ready.
     @call(.never_inline, forceReschedule, .{});
+    repairCurrentAfterBlock();
     return node.granted;
+}
+
+/// State repair for block+forceReschedule pairs. If the yield trap's tick
+/// found no runnable peer on this CPU it RESUMES the blocked current task
+/// without switching; the task then keeps executing (possibly back to user
+/// space) with state == .blocked, and a later preemption drops it from the
+/// runnable set for good — releaseOldTask only re-publishes .running tasks
+/// (observed as SMP=4 smoke stalls: task frozen with no wait flags set).
+/// Same contract as the waitpid park repair: on return we are by
+/// construction this CPU's current task, so the state must be .running —
+/// either it already is (claimed after a real wake) or we fix the
+/// resumed-without-switch case here.
+pub fn repairCurrentAfterBlock() void {
+    const cur_idx = currentTaskIndex() orelse return;
+    const cur = task.getTask(cur_idx) orelse return;
+    if (sched_claim.load(&cur.state) != .running) {
+        sched_claim.store(&cur.state, .running);
+    }
 }
 
 /// Portable half of `sleepOn`: link WaitNode + mark current task blocked.

@@ -299,6 +299,8 @@ pub fn timerfdRead(timerfd_idx: u32, buf: [*]u8, count: usize) i64 {
 
         // Yield — reschedule will pick another task
         asm volatile ("int $240");
+        // 阻塞后状态修复：yield 未切换时本任务仍以 .blocked 继续运行
+        @import("../proc/sched.zig").repairCurrentAfterBlock();
 
         // Woken up — unlink defensively (tick/close already pop their wake;
         // a signal kick leaves the node linked), then decide: re-block unless

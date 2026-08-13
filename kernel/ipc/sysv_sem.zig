@@ -142,6 +142,7 @@ pub fn semop(semid: u32, sem_num: u32, op: i16) i64 {
             cur_task.state = .blocked;
             sem_lock.release(flags);
             sched.forceReschedule();
+            sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
             if (!node.granted) {
                 // Interrupted (EIDRM / signal) before being granted — unlink
                 // our stack WaitNode from the queue first, otherwise a later

@@ -317,6 +317,7 @@ pub fn send(target_ep: EndpointId, msg: *const Message) IpcError {
     // leaves a running task flagged blocked. Lock must be released first
     // (same pattern as receive()).
     sched.forceReschedule();
+    sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
 
     // The message is already queued, so delivery is guaranteed regardless —
     // but a fatal signal must still kill the sender, and an actionable one
@@ -374,6 +375,7 @@ pub fn receive(ep: EndpointId, buf: *Message) IpcError {
 
     // Force context switch — must release lock first to avoid deadlock
     sched.forceReschedule();
+    sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
 
     // Resumed after send() delivered the message and unblocked us
     const flags2 = ipc_lock.acquire();
@@ -436,6 +438,7 @@ pub fn call(target_ep: EndpointId, msg: *Message) IpcError {
     // Actually yield the CPU — marking the task .blocked without rescheduling
     // leaves a running task flagged blocked. No lock is held here.
     sched.forceReschedule();
+    sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
 
     // Woken by reply() or by a signal kick. Reply delivery is tracked by
     // reply_to/call_depth rather than a payload, so a signal-kicked caller
