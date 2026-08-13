@@ -1938,6 +1938,19 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 
 ---
 
+### 6.27 P2 批次第二轮（2026-08-13）：CLONE_FILES 真共享 fd 表（pthread v2 之二）
+
+| 阶段 | 内容 | 验证 |
+|---|---|---|
+| FdTable 池化 | 从 Task 内嵌（约 57KB/任务）移入静态池（64 槽 + 原子位图，`vfs.allocFdTable/releaseFdTable/freeFdTable`）；`Task.fd_table` 改指针，13 处取地址点修正；release 只判末引用、close 循环后才归还池（避免重分配竞态） | 行为不变：host + SMP=1 smoke |
+| CLONE_FILES | clone 共享路径：refs 原子 +1、跳过复制与 retainSharedResources、预分配新表即还池；exitTask 仅末引用执行 fd 关闭循环；fd 位图操作原子化（allocFdAtLeast 抢位重试、freeFd 原子 Or、reserveFdForDup2 原子读改），无表级锁；close-vs-use 弱语义记录在 close 注释 | hello57 新增跨线程共享读 + close 后 EBADF 断言 |
+| pthread 接入 | pthread_create 加传 CLONE_FILES（0x400），线程组共享 fd 表与 NOFILE | SMP=1/4 smoke |
+
+**观察项（未复现）**：本轮复核中 hello57 的 fdshare-ebadf 断言曾单次失败（随后 1×SMP=1 +
+3×SMP=4 均未复现）；失败分支已加打印，复发时可直接读出返回值定位。
+
+**v2 剩余**：`__thread`（PT_TLS）——loader 解析 PT_TLS + crt0/pthread 的 TLS 布局调整。
+
 ---
 
 ## 7. Completion Criteria For This Review Task
