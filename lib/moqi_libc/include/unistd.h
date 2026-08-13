@@ -40,7 +40,7 @@ long open(const char *path, long flags, long mode);
 long close(int fd);
 long lseek(int fd, long offset, int whence);
 long unlink(const char *path);
-long mkdir(const char *path);
+long mkdir(const char *path, long mode);
 
 long fork(void);
 long execve(const char *path, char *const argv[], char *const envp[]);

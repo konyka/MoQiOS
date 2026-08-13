@@ -56,6 +56,11 @@
 #define SYS_chdir       108
 #define SYS_getcwd      109
 
+/* Resource limits */
+#define SYS_getrlimit   236
+#define SYS_setrlimit   237
+#define SYS_prlimit64   238
+
 static inline long syscall0(long n) {
     long ret;
     __asm__ volatile ("syscall" : "=a"(ret) : "a"(n) : "rcx", "r11", "memory");

@@ -28,8 +28,8 @@ long unlink(const char *path) {
     return syscall1(SYS_unlink, (long)path);
 }
 
-long mkdir(const char *path) {
-    return syscall1(SYS_mkdir, (long)path);
+long mkdir(const char *path, long mode) {
+    return syscall2(SYS_mkdir, (long)path, mode);
 }
 
 long fork(void) {

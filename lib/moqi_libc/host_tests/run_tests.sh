@@ -22,6 +22,16 @@ for t in test_string test_format test_malloc test_args; do
     "$OUT/$t" || fail=1
 done
 
+echo "== test_mkdir_abi =="
+$CC $CFLAGS -c ../src/unistd.c -o "$OUT/unistd.o"
+$CC $CFLAGS -o "$OUT/test_mkdir_abi" test_mkdir_abi.c "$OUT/unistd.o"
+"$OUT/test_mkdir_abi" || fail=1
+
+echo "== test_rlimit_abi =="
+$CC $CFLAGS -c ../src/rlimit.c -o "$OUT/rlimit.o"
+$CC $CFLAGS -o "$OUT/test_rlimit_abi" test_rlimit_abi.c "$OUT/rlimit.o"
+"$OUT/test_rlimit_abi" || fail=1
+
 if [ "$fail" -eq 0 ]; then
     echo "ALL HOST TESTS PASS"
 else

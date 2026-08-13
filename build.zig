@@ -18,8 +18,7 @@ fn addAsmUserProgram(b: *std.Build, name: []const u8) void {
 
     const elf = b.addSystemCommand(&.{
         "zig", "ld.lld",
-        "-T",
-        "user/user.ld",
+        "-T",  "user/user.ld",
         "-o",
     });
     const elf_out = elf.addOutputFileArg(b.fmt("{s}.elf", .{name}));
@@ -71,6 +70,7 @@ const moqi_libc_sources = [_][]const u8{
     "lib/moqi_libc/src/stdlib.c",
     "lib/moqi_libc/src/signal.c",
     "lib/moqi_libc/src/pthread.c",
+    "lib/moqi_libc/src/rlimit.c",
 };
 
 /// C user program built against moqi_libc: same flags as addCUserProgram,
@@ -277,13 +277,15 @@ pub fn build(b: *std.Build) void {
     // C programs (.c -> static freestanding ELF stored as .bin)
     const c_programs = [_][]const u8{
         "hello4",  "hello5",  "hello6",  "hello7",  "hello8",
-        "hello9",             "hello11", "hello12", "hello13", "hello14",
-        "hello15", "hello16", "hello17", "hello18", "hello19", "hello20",
-        "hello21", "hello22", "hello23", "hello24", "hello25", "hello26",
-        "hello27", "hello28", "hello29", "hello30", "hello31", "hello32",
-        "hello33", "hello34", "hello35", "hello36", "hello37", "hello38",
-        "hello39", "hello40", "hello41", "hello42", "hello43",
-        "hello44", "hello46", "hello47", "hello48", "hello49", "hello50", "hello51", "hello52", "hello53", "hello54", "hello56",
+        "hello9",  "hello11", "hello12", "hello13", "hello14",
+        "hello15", "hello16", "hello17", "hello18", "hello19",
+        "hello20", "hello21", "hello22", "hello23", "hello24",
+        "hello25", "hello26", "hello27", "hello28", "hello29",
+        "hello30", "hello31", "hello32", "hello33", "hello34",
+        "hello35", "hello36", "hello37", "hello38", "hello39",
+        "hello40", "hello41", "hello42", "hello43", "hello44",
+        "hello46", "hello47", "hello48", "hello49", "hello50",
+        "hello51", "hello52", "hello53", "hello54", "hello56",
     };
     for (c_programs) |name| addCUserProgram(b, name);
 
@@ -370,4 +372,8 @@ pub fn build(b: *std.Build) void {
     const run_lib_tests = b.addRunArtifact(lib_test);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_lib_tests.step);
+    const run_libc_host_tests = b.addSystemCommand(&.{"./lib/moqi_libc/host_tests/run_tests.sh"});
+    test_step.dependOn(&run_libc_host_tests.step);
+    const run_init_supervisor_tests = b.addSystemCommand(&.{"./tools/tests/test_init_supervisor.sh"});
+    test_step.dependOn(&run_init_supervisor_tests.step);
 }
