@@ -42,15 +42,15 @@
 
 | # | 条目 | 来源 | 状态（2026-08-13 对账） |
 |---|------|------|------|
-| 1 | FAT32/ext2 写路径检查 `writeBlockUncached`/`safeWriteSectors` 返回值 | review §5.2h–j | **本轮执行**：写回缓存路径已完成（syncFile→bool→fsync EIO），残余为 direct-write 丢弃点（setFATEntry/zeroCluster/目录项更新/allocBlock 清零/flushIndirect） |
+| 1 | FAT32/ext2 写路径检查 `writeBlockUncached`/`safeWriteSectors` 返回值 | review §5.2h–j | ✅ 完成（6.23）：direct-write 丢弃点全部传播或注释约定 |
 | 2 | `vfs.syncFile` 错误传播 + 设备 flush barrier 能力上报 | review §5.2g/§5.6 | 代码已完成：`vfs.zig:1313` syncFile 返回 bool，fsync syscall 传播 `-5 EIO` |
-| 3 | UDP 接收队列串行化 + MSG_TRUNC/MSG_PEEK 语义 | review §5.6 | 队列锁已完成（J1，`udp_lock` 全路径）；**本轮补** MSG_PEEK/MSG_TRUNC（recvFromEx/recvFromV6Ex + recvfrom flags，hello50 验收） |
-| 4 | virtio-blk/virtio-net/NVMe 队列 single-flight 锁契约 | review §5.5/§5.6 | 仍待做（大，需逐驱动设计评审，是多队列并行的前提） |
+| 3 | UDP 接收队列串行化 + MSG_TRUNC/MSG_PEEK 语义 | review §5.6 | ✅ 完成（6.23）：队列锁（J1）+ recvFromEx/recvFromV6Ex + recvfrom flags，hello50 验收；顺带修复 sendto/recvfrom flags 错读 rcx 的 ABI bug |
+| 4 | virtio-blk/virtio-net/NVMe 队列 single-flight 锁契约 | review §5.5/§5.6 | 仍待做（大，需逐驱动设计评审，是多队列并行的前提）——**P1 唯一剩余项** |
 | 5 | `/dev/kmsg` 阻塞读/poll 唤醒，syslogd 改事件驱动 | user-space §7.1 | 代码已完成（J3：kmsg 读在最新字节处阻塞，syslogd 无轮询循环） |
 | 6 | panic 停 AP 改 NMI（替代 ~10ms tick 轮询） | review §6.5/6.6 | 代码已完成：`panic.zig` sendNmiAllButSelf + idt NMI 处理 park，tick 轮询降为兜底 |
 | 7 | IOAPIC 消费 MADT ISO 覆盖（电平/极性） | review §6.12–14 | 代码已完成：`ioapic.zig` routeGsi 应用 ISO trigger/polarity |
 | 8 | `tryStealTask` 死代码：启用需补 `onContextSwitch`，否则删除 | review §6.10 | 代码已完成：已删除（sched.zig:1362 注记） |
-| 9 | fbcon 被 fb0 映射停用后的恢复路径 | review §6.17 | 仍待做，重估为**中**：需跟踪每任务 fb 映射（mmapFb 登记 + munmap/exit 注销 + 引用计数归零后重启 mirror），部分解除映射与区域分裂使边界复杂；控制台镜面恢复价值有限，排在本批最后 |
+| 9 | fbcon 被 fb0 映射停用后的恢复路径 | review §6.17 | ✅ 完成（6.24）：fbdev 映射登记（8 槽 + IrqSpinlock），munmap/mremap 裁剪、exit/exec 注销，归零即恢复 mirror；smoke 门禁新增 disabled/restored 双标记 |
 
 ## P2：中期项（需要 1–2 个专项迭代）
 

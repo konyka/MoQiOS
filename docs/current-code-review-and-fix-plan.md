@@ -1842,6 +1842,26 @@ tryStealTask 删除，共五项**代码早已完成**，文档记录滞后；已
 
 ---
 
+### 6.24 P1 批次第二轮（2026-08-13）：fbcon 镜面恢复路径（P1-9 关闭）
+
+**问题**：用户态 mmap /dev/fb0 时 fbcon 文本镜面被单向停用（防止 present() 覆写用户像素），
+但映射消失后无恢复路径，控制台输出永久不再上屏。
+
+**方案**：fbdev.zig 新增固定 8 槽映射登记（owner task + base/pages，IrqSpinlock 保护）：
+- `mmapFb` 成功建立映射后（而非进入函数时）登记并停用镜面——映射失败不再误关镜面。
+- `noteUnmap` 挂入 `mmap.zig` 的 munmap 与 mremap 收缩路径：按区间裁剪登记项，
+  中间切断时在有空槽时分裂为两项，无空槽时保留较大半（降级为旧单向行为）。
+- `cleanupTask` 挂入两个 reap 路径（task.zig，紧邻 devfs_proxy.cleanupTask）与两个
+  exec 路径（execve.zig）：任务退出/换镜像即回收其全部 fb 映射登记。
+- 登记计数归零且 framebuffer 仍在（fbcon.isActive）即重新启用镜面并打印
+  `[fbcon] mirror restored`。
+- smoke 门禁新增 `[fbcon] mirror disabled`/`[fbcon] mirror restored` 双标记
+  （hello56 映射 fb0 → 停用，hello56 退出回收 → 恢复），恢复路径从此有持续回归覆盖。
+
+**验证**：host 测试 + smoke SMP=1/4 全绿（含新门禁标记）。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:
