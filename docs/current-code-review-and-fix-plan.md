@@ -1823,6 +1823,25 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 ---
 
+### 6.23 P1 批次第一轮（2026-08-13）：UDP MSG_PEEK/TRUNC + 写盘错误传播收口 + P1 对账
+
+**P1 对账（文档滞后修正）**：next-phase-plan.md 的 P1 九项逐项核对当前代码——
+syncFile 错误传播（vfs.zig syncFile→bool→fsync EIO）、kmsg 阻塞读 + syslogd 事件驱动（J3）、
+panic NMI 停 AP（sendNmiAllButSelf + tick 兜底）、IOAPIC MADT ISO 应用（routeGsi）、
+tryStealTask 删除，共五项**代码早已完成**，文档记录滞后；已对账标注证据位置。
+
+| 阶段 | 内容 | 验证 |
+|---|---|---|
+| UDP MSG_PEEK/MSG_TRUNC | recvfrom 此前完全忽略 flags。新增 `udp.recvFromEx`/`recvFromV6Ex`（报告数据报完整长度 + 可选不消费），recvfrom 的 UDP v4/v6 分支实现 MSG_PEEK（不消费）与 MSG_TRUNC（半缓冲也返回完整长度）；队列锁（J1 udp_lock）此前已就绪 | hello50 每 worker 四项新验收（peek 两次不消费、trunc 全长上报、消费后队列空），SMP=1/4 smoke |
+| **sendto/recvfrom ABI 修复** | 两个 wrapper 的第 4 参数（flags）错读 `frame.rcx`——syscall 惯例 rcx 保存用户 RIP，第 4 参数在 r10。flags 长期被忽略所以从未暴露；本次随 MSG_PEEK 落地修正为 frame.r10 | hello50 flags 验收依赖正确传递，SMP=1/4 通过 |
+| FAT32 写错误传播 | `setFATEntry` 吞掉 FAT 元数据写失败（已返回 false，调用点本已闭环）；`zeroCluster`/`updateDirEntry`/`deleteFile` 改返回 bool 并向上传播；deleteFile 在 tombstone 写失败时停止释放簇链（避免活动目录项引用被释放簇）。createFile 回滚路径的 `_ = setFATEntry(nc, 0)` 属 best-effort 释放（create 已失败，泄漏一簇等 fsck），保留丢弃并注释约定 | hello9/10/21 ext2、hello24/25/29 删除/fsync、FAT32 路径 smoke 全绿 |
+| ext2 写错误传播 | `allocBlock` 两分支新块清零写失败返回 0（接受位图位泄漏等 fsck，优于交付脏块）；`flushIndirect` 改返回 bool，缓存路径失败保持 dirty 待 cacheFlush 重试，经 `ensureChildIndirect`/`ensureDataPtr` 闭环到 `getBlockForWrite` 既有 null/0 失败约定 | 同上 |
+| fbcon 恢复路径（P1-9） | 重估为中工作量：需 mmapFb 登记 + munmap/exit 注销 + 引用计数归零重启 mirror，部分解除映射与区域分裂使边界复杂；记录设计要点后排至 P1 批次末尾 | — |
+
+**验证**：host 测试 + smoke SMP=1（FAT32/ext2 改动后单独一轮）+ SMP=1/4（全量）全绿。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:
