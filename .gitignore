@@ -20,3 +20,4 @@ disk.img.bak
 nvme.img
 serial_*.log
 .qoder/
+__pycache__/

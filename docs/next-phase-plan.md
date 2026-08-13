@@ -1,0 +1,88 @@
+# MoQiOS 下一阶段统一方案
+
+> **版本**: v1.0
+> **日期**: 2026-08-13
+> **说明**: 本文档汇总各文档中记录的未完成工作项，给出统一的优先级排序与执行方案。
+> 权威问题清单仍以 [current-code-review-and-fix-plan.md](./current-code-review-and-fix-plan.md) 为准；
+> 本文是它的执行排序视图。
+
+## 排序原则（性能最优的交付路径）
+
+1. **正确性先于性能**：会造成静默数据丢失或持久性假承诺的条目排在所有优化之前。
+2. **小步可验证**：每一项必须能独立通过 `zig build test`（主机门禁）和
+   `zig build smoke` / `smoke-smp`（QEMU 门禁）后才提交，避免多特性纠缠。
+3. **锁粒度与并行性优先于算法微调**：SMP 下已验证的瓶颈在共享队列串行化
+   （驱动队列、UDP 接收队列），先做契约再做多队列扩展。
+4. **环境受限项不阻塞流水线**：真机/KVM 验证单独成轨，不占主线。
+
+## P0：本批次已完成（2026-08-13）
+
+- Limine 固定版本由 `v8.0.14-binary` 更正为 `v8.7.0-binary`
+  （`aad3edd370955449717a334f0289dee10e2c5f01`）：v8.0.14 不支持内核要求的
+  base revision 3，QEMU 直接报 `Limine protocol not supported`；v8.7.0 是 smoke
+  矩阵实际验证过的版本。同步更新 `tools/limine_bootstrap.sh`、合约测试、README
+  与构建文档。
+- moqi_libc 补齐 rlimit 包装器（`include/resource.h` + `src/rlimit.c`，原生
+  236/237/238），关闭 [rlimit.md](./rlimit.md) 的 "libc wrappers are future
+  integration work"；ABI 由宿主机测试 `test_rlimit_abi` 锁定。
+- 用户态 stdout/stderr 写路径由逐字节 `writeByte` 改为按块（≤4096 字节）单次
+  `writeString`：串口锁从每字节一次降为每块一次，既消除 SMP 下跨核字符级交错
+  导致的 smoke 标记行涂抹（review §6.18 已知残余），又减少锁获取次数。
+- 测试程序适配新创建元数据语义：`O_CREAT` 打开显式传入 `0666`（原先依赖内核
+  忽略 mode）；hello53 的 `/dev/full` 读检查改用 `O_RDWR`（O_WRONLY 描述符读
+  现在按 POSIX 返回 EBADF）。
+- 本批未提交里程碑（RLIMIT_NOFILE、tmpfs DAC 第一阶段、capability profile、
+  creation metadata/umask、init 监督器、spawn 报告、mkdir ABI、磁盘 fixture
+  manifest、CI 时长观察）随本次统一验证后提交。
+
+## P1：下一批执行项（小/中工作量，按序执行）
+
+| # | 条目 | 来源 | 动机 |
+|---|------|------|------|
+| 1 | FAT32/ext2 写路径检查 `writeBlockUncached`/`safeWriteSectors` 返回值 | review §5.2h–j | 磁盘满/IO 错误下静默损坏，正确性 P1 |
+| 2 | `vfs.syncFile` 错误传播 + 设备 flush barrier 能力上报 | review §5.2g/§5.6 | fsync 假成功，持久性承诺 |
+| 3 | UDP 接收队列串行化 + MSG_TRUNC/MSG_PEEK 语义 | review §5.6 | SMP 下静默截断 |
+| 4 | virtio-blk/virtio-net/NVMe 队列 single-flight 锁契约 | review §5.5/§5.6 | SMP 正确性设计债，多队列并行的前提 |
+| 5 | `/dev/kmsg` 阻塞读/poll 唤醒，syslogd 改事件驱动 | user-space §7.1 | 消除 10 Hz 轮询，直接降延迟与唤醒开销 |
+| 6 | panic 停 AP 改 NMI（替代 ~10ms tick 轮询） | review §6.5/6.6 | 缩短 panic 收敛窗口 |
+| 7 | IOAPIC 消费 MADT ISO 覆盖（电平/极性） | review §6.12–14 | GSI≥16 路由正确性 |
+| 8 | `tryStealTask` 死代码：启用需补 `onContextSwitch`，否则删除 | review §6.10 | 消除误导性代码 |
+| 9 | fbcon 被 fb0 映射停用后的恢复路径 | review §6.17 | 控制台可用性 |
+
+## P2：中期项（需要 1–2 个专项迭代）
+
+- pthread v2 三件套：CLONE_FILES 真共享 fd 表、`__thread`（PT_TLS）、detached
+  线程栈回收（kernel-subsystems §2.5a）。
+- AHCI/SATA 实际 I/O 路径与 `io_sched.tryMerge` 验证（kernel-subsystems §6.4）——
+  真机存储的前提。
+- tmpfs 单文件 256 KiB 上限扩容（user-space §7.1）。
+- `mmap_regions` 固定 64 条目 → 动态 VMA 树（先做 profiling 证明需要，
+  review §5.2g/§5.2t）。
+- 2MB 大页（尤其文件映射）与 fork COW OOM 半途回滚（review §5.6/§6.8）。
+- smoke 门禁 CI 化（当前 CI 只跑主机测试；QEMU 门禁依赖本地环境，review §1）。
+- rlimit 扩展到 NOFILE 之外的资源（先定执行语义再实现，避免 stub 蔓延）。
+
+## P3：大项（需独立设计评审，不与其他工作混批）
+
+- ~80 处 `_ = copyToUser(...)` 返回值治理（review §5.2q，大且易回归，需分批 + 全程门禁）。
+- 地址空间并发：统一锁/TLB shootdown 契约、MAP_FIXED 事务回滚、
+  `process_vm_readv/writev` 的引用计数 mm 抽象（review §5.5/§5.6）。
+- riscv64/aarch64 跑通用户进程 + `main.zig` 初始化收敛到共享 arch 抽象
+  （cross-arch-port-plan）。
+- 微内核服务化第一批迁移（netstack 或 vfs 迁出内核，依托已验证的 devfs
+  用户态节点机制，moqios-design §5）。
+- Windows PE 兼容 personality（moqios-design §4/§10 Phase 3）。
+
+## 独立轨道（环境受限）
+
+- 真机/KVM 验证包：AP LAPIC 定时器、PCID no-flush 硅验证、GSI≥16 真实设备。
+- QEMU slirp ARP/connect 偶发抖动为上游既有行为，不修；真实 DNS 端到端依赖
+  宿主机网络。
+
+## 验证门禁
+
+- 每个 P1 条目：主机测试（`zig build test`）+ 单核 smoke；涉及调度/SMP 的条目
+  追加 `smoke-smp`（至少 2/4 核）。
+- 性能相关条目合并前在 PR 描述中给出前后对照（如 syslogd 轮询 → 事件驱动的
+  唤醒次数、kmsg 读取延迟）。
+- CI（`.github`）对推送与 PR 运行 `zig build test` 并记录时长观察（非门禁）。

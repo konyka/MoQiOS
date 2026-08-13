@@ -1809,6 +1809,20 @@ shootdown 广播请求（`kernel/arch/x86_64/tlb.zig`）。
 
 ---
 
+### 6.22 基础设施补完·第十六轮（2026-08-13）：统一验证收口 + 串口写原子化 + rlimit libc 包装器
+
+| 阶段 | 内容 | 验证 |
+|---|---|---|
+| Limine 固定版本更正 | 上一轮引入的 `v8.0.14-binary` 固定不支持内核要求的 base revision 3（QEMU 直接 `Limine protocol not supported`）；更正为实际通过 smoke 矩阵验证的 `v8.7.0-binary`（`aad3edd`），同步 bootstrap 脚本、合约测试、README 与构建文档 | SMP=1/2/4 smoke |
+| 串口写原子化（§6.18 已知残余关闭） | 用户态 stdout/stderr 写路径在 `file_io.zig` 中逐字节 `writeByte`，每字节释放一次串口锁，跨核写者字符级交错涂抹 smoke 标记行（SMP=4 两轮实测误报超时，日志人工核验实为全过）。改为按块（≤4096 字节）单次 `writeString`：每块一次锁获取，交错消除且锁开销下降 | 修复后 SMP=4 smoke 直接通过 |
+| 测试程序适配创建元数据语义 | hello36/41/42/44/46/48/50 的 `O_CREAT` 打开原先传 mode 0（旧内核忽略 mode）；新语义下创建出 mode-0 文件导致重开被 DAC 拒绝（hello41/42/44/46/50 FAIL）。统一显式传 `0666`；hello53 `/dev/full` 读检查改 `O_RDWR`（O_WRONLY 描述符读现按 POSIX 返回 EBADF） | SMP=1 smoke 全绿 |
+| rlimit libc 包装器 | 关闭 rlimit.md 的 "libc wrappers are future integration work"：新增 `include/resource.h`（16 字节 `struct rlimit` ABI、RLIMIT_* 常量）与 `src/rlimit.c`（原生 236/237/238），宿主机 ABI 测试 `test_rlimit_abi` 锁定 | host 测试 |
+| 统一方案 | 新增 [next-phase-plan.md](./next-phase-plan.md)：剩余工作项按"正确性先于性能、小步可验证、锁粒度优先"排序为 P1/P2/P3 + 环境受限轨道 | — |
+
+**验证**：host 测试（Zig 单元 + moqi_libc C + init supervisor 合约）+ smoke SMP=1/2/4 全绿 + ReleaseFast 构建通过。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:
