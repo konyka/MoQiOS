@@ -119,6 +119,9 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
     // buffers, MMIO mappings) die with it, before the address-space walk.
     // cur.page_table_phys already points at the NEW space — pass the old one.
     @import("../drivers/userdrv.zig").cleanupTask(cur, old_pml4);
+    // fb0: the old image's framebuffer mappings die with it — drop their
+    // registry entries (restores the console mirror when none remain).
+    @import("../drivers/fbdev.zig").cleanupTask(cur);
     // G2: the old image's file mappings die with it — release their backing
     // refs (ext2 open slots) and clear the stale region table before the old
     // address space is destroyed.
@@ -259,6 +262,9 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64)
     // buffers, MMIO mappings) die with it — cur.page_table_phys already
     // points at the NEW space, so pass the old one explicitly.
     @import("../drivers/userdrv.zig").cleanupTask(cur, old_pml4);
+    // fb0: the old image's framebuffer mappings die with it — drop their
+    // registry entries (restores the console mirror when none remain).
+    @import("../drivers/fbdev.zig").cleanupTask(cur);
     // G2: the old image's file mappings die with it — release their backing
     // refs (ext2 open slots) and clear the stale region table before the old
     // address space is destroyed.

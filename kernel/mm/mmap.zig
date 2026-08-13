@@ -810,6 +810,9 @@ pub fn munmap(addr: u64, length: u64) i64 {
     // Unmap pages and free physical memory
     unmapRange(cur, base, num_pages);
     untrackMmapRange(cur, base, num_pages);
+    // fb0: clip any framebuffer mapping registry entries covered by this
+    // range — the console mirror is restored once the last one goes away.
+    @import("../drivers/fbdev.zig").noteUnmap(cur, base, num_pages);
 
     return 0;
 }
@@ -844,6 +847,7 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
                 if (new_pages < old_pages) {
                     unmapRange(cur, old_addr + new_pages * PAGE, old_pages - new_pages);
                     untrackMmapRange(cur, old_addr + new_pages * PAGE, old_pages - new_pages);
+                    @import("../drivers/fbdev.zig").noteUnmap(cur, old_addr + new_pages * PAGE, old_pages - new_pages);
                 }
                 return @bitCast(old_addr);
             }

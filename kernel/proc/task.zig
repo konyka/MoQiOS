@@ -863,6 +863,9 @@ pub fn reapZombies() u32 {
             // P1: tombstone any userspace-owned devfs nodes (drains their
             // pending requests with -EIO).
             @import("../fs/devfs_proxy.zig").cleanupTask(t);
+            // fb0: drop framebuffer mapping registry entries (restores the
+            // console mirror when the last one goes away).
+            @import("../drivers/fbdev.zig").cleanupTask(t);
             // ioperm: return the TSS IOPB pages (allocated by ioperm_set).
             @import("ioperm.zig").freeBitmap(t);
             // G2: release file-region backing refs before the address space
@@ -1172,6 +1175,9 @@ pub fn waitpidScanLocked(parent_idx: u32, pid: i32, status: *i32) WaitScan {
             // P1: tombstone any userspace-owned devfs nodes (drains
             // their pending requests with -EIO).
             @import("../fs/devfs_proxy.zig").cleanupTask(t);
+            // fb0: drop framebuffer mapping registry entries (restores the
+            // console mirror when the last one goes away).
+            @import("../drivers/fbdev.zig").cleanupTask(t);
             // ioperm: return the TSS IOPB pages (allocated by ioperm_set).
             @import("ioperm.zig").freeBitmap(t);
             // G2: release file-region backing refs before the address space.
