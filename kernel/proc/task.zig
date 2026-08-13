@@ -736,11 +736,6 @@ pub fn exitTask(exit_code: i32) void {
     sched_claim.store(&t.state, .zombie);
     asm volatile ("" ::: .{ .memory = true });
 
-    // 作业控制：会话长退出 → 同会话成员收 SIGHUP（孤儿进程组，近似规则）。
-    if (t.is_user and t.sid == @as(u16, @intCast(t.tid))) {
-        @import("jobctl.zig").onSessionLeaderExit(t);
-    }
-
     // Wake parent if sleeping on our exit_waiters queue
     if (t.exit_waiters != null) {
         // wakeAll modifies the list, safe to call under task_lock
@@ -780,6 +775,17 @@ pub fn exitTask(exit_code: i32) void {
         }
     }
     task_lock.release(flags);
+
+    // 作业控制：会话长退出 → 同会话成员收 SIGHUP（孤儿进程组，近似规则）。
+    // 必须在 task_lock 之外调用：广播路径的 kickIfBlocked/continueTask 会经
+    // unblockTask 重取 task_lock（非递归 IrqSpinlock），锁内调用且目标成员
+    // 处于 .blocked 时构成同 CPU 自死锁（SMP=4 hello58 测试 5 全系统冻结的
+    // 根因：SMP=1 下 D 总在 C 首次阻塞前退完所以不触发）。此刻本任务已标
+    // .zombie 且仍是某 CPU 的当前任务，reap 静默门保证槽位不会被提前回收，
+    // 指针 t 在广播期间保持有效。
+    if (t.is_user and t.sid == @as(u16, @intCast(t.tid))) {
+        @import("jobctl.zig").onSessionLeaderExit(t);
+    }
 
     // Prompt the next timer interrupt to switch away from this zombie. Avoid
     // calling timerTick recursively from inside syscall/fault exit paths: that
