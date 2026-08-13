@@ -36,6 +36,20 @@ An x86_64-first operating system kernel written in Zig, using the Limine boot pr
 
 **Kernel**: ~63,000 lines Zig | **User programs**: ~3,600 lines C/ASM | **Tests**: host unit tests + QEMU smoke gates (`smoke`, `smoke-smp`, `smoke-smp-matrix`, `smoke-smp-stress`)
 
+## Canonical Disk Fixture
+
+The tracked `disk.img` is a canonical x86 test fixture. Its checked-in `disk.img.manifest`
+records the tracked HEAD blob provenance (format, filename, byte count, and raw-byte
+SHA-256). `tools/qemu_run.sh` validates it before Limine/ISO/NVMe side effects, and
+`tools/qemu_smoke.sh` validates it before making its private copy. This detects fixture
+integrity drift; it does not claim reproducible disk-image generation.
+
+With `MOQI_DISK` unset or empty, canonical validation is required. A non-empty
+`MOQI_DISK` remains a caller-owned override: it only needs to be a regular file and is not
+compared with the canonical manifest. Validate the checked-in fixture and run its offline
+contracts with `tools/disk_fixture.sh disk.img.manifest disk.img` and
+`bash tools/tests/test_disk_fixture.sh`.
+
 ## Features
 
 ### Process Management
@@ -141,8 +155,21 @@ An x86_64-first operating system kernel written in Zig, using the Limine boot pr
 ### Prerequisites
 
 - Zig 0.16.0+
+- git (needed with network for the first Limine bootstrap; an existing `limine/` must be a clean checkout)
+- make (needed to build the `limine` utility in a fresh checkout)
 - QEMU (qemu-system-x86_64)
 - xorriso (for ISO creation)
+
+`tools/qemu_run.sh` pins Limine to the `v8.7.0-binary` tag and requires commit
+`aad3edd370955449717a334f0289dee10e2c5f01`. A fresh download is cloned into a temporary sibling
+and verified before it becomes `limine/`; an existing directory must be a clean Git checkout and
+must not be a symlink. This historical binary tag has no official release checksum or signature;
+the pinned commit is not cryptographic identity authentication. The local bootstrap contract test
+does not use QEMU or the network:
+
+```bash
+bash tools/tests/test_limine_bootstrap.sh
+```
 
 ### Build & Run
 
@@ -165,6 +192,14 @@ zig build smoke-smp
 zig build -Darch=riscv64 smoke-riscv
 zig build -Darch=aarch64 smoke-aarch64
 ```
+
+`zig build test` is the canonical host test gate: it runs both the Zig unit tests in
+`tests/main.zig` and the moqi_libc C host tests in `lib/moqi_libc/host_tests/run_tests.sh`.
+Register new host-runnable tests in one of those suites. GitHub CI runs the same command through
+`tools/observe_test_duration.py` for pushes and pull requests, printing one non-gating JSONL
+duration observation in the log; it does not run QEMU or Limine. Durations are observational only,
+not comparable baseline or regression data; see the build documentation for the schema, local
+commands, and QEMU status limitation.
 
 See [docs/build-and-toolchain.md](docs/build-and-toolchain.md) for markers, timeouts, and known limits.
 

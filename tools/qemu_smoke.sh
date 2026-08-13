@@ -57,10 +57,7 @@ if [ "${MOQI_SMOKE_SKIP_BUILD:-0}" != "1" ]; then
     zig build
 fi
 
-if [ ! -f disk.img ]; then
-    echo "ERROR: disk.img missing (required by virtio-blk smoke path)."
-    exit 1
-fi
+"$SCRIPT_DIR/disk_fixture.sh" disk.img.manifest disk.img
 
 mkdir -p "$SMOKE_WORK_DIR" "$(dirname "$LOG_FILE")" "$(dirname "$RUN_LOG")" "$(dirname "$SMOKE_DISK")"
 if [ -z "${MOQI_SMOKE_LOG:-}" ]; then

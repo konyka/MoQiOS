@@ -1,0 +1,20 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      # v2.0.0
+      - uses: mlugg/setup-zig@0270eb3bdaaf2a98f1e5c7f84c15c71ad4ca6ceb
+        with:
+          version: 0.16.0
+      - run: python3 tools/observe_test_duration.py -- zig build test --summary all

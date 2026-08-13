@@ -37,6 +37,17 @@
 > `smoke-smp-matrix` 已验证 1/2/3/4/6/8/12/16 核（16 核 TCG 需 `MOQI_SMOKE_TIMEOUT=600`）；
 > 8 核 3 次压力测试通过。ReleaseFast 构建通过。
 
+## Canonical disk fixture
+
+跟踪的 `disk.img` 是 x86 测试的规范 fixture；提交的 `disk.img.manifest` 记录其 HEAD blob 来源
+（格式、文件名、字节数和原始字节 SHA-256）。`tools/qemu_run.sh` 会在 Limine、ISO、NVMe 副作用
+之前验证它，`tools/qemu_smoke.sh` 会在创建私有副本之前验证它。该检查用于发现 fixture 完整性漂移，
+并不表示磁盘镜像生成可复现。
+
+未设置或设为空的 `MOQI_DISK` 必须使用并验证规范 fixture。非空 `MOQI_DISK` 仍是调用方拥有的覆盖：
+它只需是普通文件，不会与规范 manifest 的 hash 比较。可本地离线运行
+`tools/disk_fixture.sh disk.img.manifest disk.img` 和 `bash tools/tests/test_disk_fixture.sh`。
+
 > **2026-06-21 SMP 性能三件套完成**：FPU/SSE 按任务保存 (`kernel/arch/x86_64/context_switch.zig`)、
 > Per-CPU 运行队列 + Work-Stealing (`kernel/proc/per_cpu.zig`, 256 槽 LIFO)、
 > 范围 TLB Shootdown (`kernel/arch/x86_64/tlb.zig`) 同时交付。三者互为前提，AP 首次
@@ -203,8 +214,19 @@
 ### 前置条件
 
 - Zig 0.16.0+
+- git（首次 bootstrap Limine 时需要网络；`limine/` 必须是固定 commit 的干净 Git checkout）
+- make（首次 checkout 构建 `limine` utility）
 - QEMU (qemu-system-x86_64)
 - xorriso (用于创建 ISO)
+
+`tools/qemu_run.sh` 使用固定的 Limine `v8.7.0-binary` tag，要求 commit
+`aad3edd370955449717a334f0289dee10e2c5f01`。首次下载会先在 `limine/` 旁创建临时目录并
+验证后再切换；已有目录必须干净且不是符号链接。此历史 binary tag 没有官方 release
+checksum/签名；固定 commit 不是加密身份认证。无需 QEMU 或网络即可运行本地 bootstrap 合约测试：
+
+```bash
+bash tools/tests/test_limine_bootstrap.sh
+```
 
 ### 构建 & 运行
 
@@ -227,6 +249,12 @@ zig build smoke-smp
 zig build -Darch=riscv64 smoke-riscv
 zig build -Darch=aarch64 smoke-aarch64
 ```
+
+`zig build test` 是规范的主机测试门禁：它同时运行 `tests/main.zig` 的 Zig 单元测试和
+`lib/moqi_libc/host_tests/run_tests.sh` 的 moqi_libc C 宿主机测试；新增可在主机运行的
+测试应注册到这两个套件之一。GitHub CI 对推送和拉取请求经由 `tools/observe_test_duration.py`
+运行相同命令，并在日志打印一条非门禁 JSONL 时长观察；不运行 QEMU 或 Limine。时长只是观察结果，
+不构成可比较的基线或回归数据；完整 schema、当地命令和 QEMU 状态限制见构建文档。
 
 完整命令、运行时标记和已知限制见 [docs/build-and-toolchain.md](docs/build-and-toolchain.md)。
 

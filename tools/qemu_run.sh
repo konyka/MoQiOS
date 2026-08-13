@@ -12,6 +12,17 @@ ISO_FILE="${MOQI_ISO_FILE:-moqios.iso}"
 USER_BIN_DIR="${MOQI_USER_BIN_DIR:-user_bin}"
 USER_SRC_DIR="${MOQI_USER_SRC_DIR:-zig-out/user}"
 
+# Keep the Limine bootstrap independently testable from the QEMU launch path.
+source "$SCRIPT_DIR/limine_bootstrap.sh"
+
+DISK_IMAGE="${MOQI_DISK:-disk.img}"
+if [ -z "${MOQI_DISK:-}" ]; then
+    "$SCRIPT_DIR/disk_fixture.sh" disk.img.manifest "$DISK_IMAGE"
+elif [ ! -f "$DISK_IMAGE" ]; then
+    echo "ERROR: disk image missing at $DISK_IMAGE (required by virtio-blk)."
+    exit 1
+fi
+
 # Check kernel exists
 if [ ! -f "$KERNEL" ]; then
     echo "ERROR: Kernel not found at $KERNEL"
@@ -19,18 +30,7 @@ if [ ! -f "$KERNEL" ]; then
     exit 1
 fi
 
-# Download Limine if needed
-if [ ! -d "$LIMINE_DIR" ]; then
-    echo "[limine] Downloading Limine v8.x..."
-    git clone https://github.com/limine-bootloader/limine.git \
-        --branch=v8.x-binary --depth=1 "$LIMINE_DIR" 2>/dev/null
-fi
-
-# Build limine utility if needed
-if [ ! -f "$LIMINE_DIR/limine" ]; then
-    echo "[limine] Building utility..."
-    make -C "$LIMINE_DIR" 2>/dev/null
-fi
+limine_prepare "$LIMINE_DIR"
 
 # Create ISO structure
 rm -rf "$ISO_DIR"
@@ -66,11 +66,11 @@ else
     echo "WARNING: No user programs to package"
 fi
 
-# Copy Limine binaries
-cp "$LIMINE_DIR/limine-bios.sys" "$ISO_DIR/boot/limine/" 2>/dev/null || true
-cp "$LIMINE_DIR/limine-bios-cd.bin" "$ISO_DIR/boot/limine/" 2>/dev/null || true
-cp "$LIMINE_DIR/limine-uefi-cd.bin" "$ISO_DIR/boot/limine/" 2>/dev/null || true
-cp "$LIMINE_DIR/BOOTX64.EFI" "$ISO_DIR/EFI/BOOT/" 2>/dev/null || true
+# Copy Limine binaries verified by limine_prepare.
+cp -- "$LIMINE_DIR/limine-bios.sys" "$ISO_DIR/boot/limine/"
+cp -- "$LIMINE_DIR/limine-bios-cd.bin" "$ISO_DIR/boot/limine/"
+cp -- "$LIMINE_DIR/limine-uefi-cd.bin" "$ISO_DIR/boot/limine/"
+cp -- "$LIMINE_DIR/BOOTX64.EFI" "$ISO_DIR/EFI/BOOT/"
 
 # Create ISO
 if ! command -v xorriso &>/dev/null; then
@@ -88,7 +88,7 @@ xorriso -as mkisofs \
     "$ISO_DIR" -o "$ISO_FILE" 2>/dev/null
 
 # Install Limine BIOS stages
-"$LIMINE_DIR/limine" bios-install "$ISO_FILE" 2>/dev/null || true
+limine_bios_install "$LIMINE_DIR" "$ISO_FILE"
 
 # Launch QEMU
 echo "========================================="
@@ -119,7 +119,6 @@ echo "========================================="
 #   MOQI_EXTRA_QEMU  extra QEMU args (e.g. "-d int,cpu_reset -D /tmp/qint.log")
 SERIAL_TARGET="${MOQI_SERIAL:-stdio}"
 SMP_COUNT="${MOQI_SMP:-2}"
-DISK_IMAGE="${MOQI_DISK:-disk.img}"
 NVME_IMAGE="${MOQI_NVME_IMG:-nvme.img}"
 EXTRA_QEMU_ARGS=()
 if [ -n "${MOQI_EXTRA_QEMU:-}" ]; then
@@ -131,11 +130,6 @@ fi
 if ! [[ "$SMP_COUNT" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: MOQI_SMP must be a positive decimal integer (got '$SMP_COUNT')."
     exit 2
-fi
-
-if [ ! -f "$DISK_IMAGE" ]; then
-    echo "ERROR: disk image missing at $DISK_IMAGE (required by virtio-blk)."
-    exit 1
 fi
 
 # Optional NVMe controller (scratch image; the virtio-blk disk above stays

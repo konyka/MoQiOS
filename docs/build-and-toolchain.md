@@ -16,10 +16,28 @@
 | `zig cc` (assembler mode) | 内置 | 汇编 `hello*.S`、`ap_trampoline_src.S`（`init.S` 保留为回退，不再参与构建） |
 | `zig objcopy` | 内置 | 提取二进制段（用户汇编程序、trampoline 等） |
 | `xorriso` | 系统包 | 生成 ISO 镜像 |
-| `limine` | 仓库 `limine/` 子目录 | 安装 BIOS/UEFI 引导器 |
+| `limine` | `limine/` 子目录，固定为 `v8.7.0-binary` / `aad3edd370955449717a334f0289dee10e2c5f01` | 安装 BIOS/UEFI 引导器 |
 | QEMU (x86_64) | 系统包 | 仿真运行 |
 
 `zig build` 是项目的**唯一**构建入口，统一管理上述步骤；不依赖额外的 `make`。
+
+### Limine 引导器固定版本与本地验证
+
+`tools/qemu_run.sh` 首次运行时从 Limine 仓库的 `v8.7.0-binary` tag 克隆，并要求
+`HEAD` 精确为 `aad3edd370955449717a334f0289dee10e2c5f01`。因此首次 bootstrap 需要
+可用的 `git` 和网络；如果 `limine/` 已存在，它必须是该 commit 的干净 Git work tree
+（包括没有未跟踪文件），不要求特定分支，也不接受符号链接。每次 x86 打包运行都会在验证通过的
+checkout 中重新构建 `limine` utility，不复用已有可执行文件；utility 路径为目录或符号链接时会失败，
+且 clone、make 和 `bios-install` 的失败都会终止流程。
+
+可以不安装 QEMU、也不访问网络地运行 bootstrap 合约测试：
+
+```bash
+bash tools/tests/test_limine_bootstrap.sh
+```
+
+这个历史 `v8.7.0-binary` tag 没有官方 release checksum 或签名；上述固定 commit
+只是构建输入选择，不应被称为加密身份认证。
 
 ---
 
@@ -47,7 +65,29 @@
 ```
 
 注意：`zig build` 本身**不**打包 ramdisk/ISO，也不生成 `disk.img`；ramdisk 与 ISO 打包发生在
-`tools/qemu_run.sh`（由 `zig build run` / smoke 脚本调用）中，`disk.img` 是手动维护的构建外资产。
+`tools/qemu_run.sh`（由 `zig build run` / smoke 脚本调用）中。`disk.img` 是受跟踪的 canonical
+测试 fixture，由 `disk.img.manifest` 校验；它不是 `zig build` 的生成输出。
+
+### Canonical disk fixture integrity
+
+The tracked `disk.img` is a canonical test fixture, identified by the tracked HEAD blob's
+`disk.img.manifest`. Before the x86 `qemu_run.sh` path performs Limine preparation, ISO
+staging, or NVMe work, and before `qemu_smoke.sh` copies its private disk, the default
+fixture is checked for the manifest format, non-symlink regular-file status, byte count,
+and raw-byte SHA-256. This detects fixture integrity drift; it does not make disk image
+generation reproducible.
+
+`MOQI_DISK` is an escape hatch for a caller-owned image. When it is unset or empty, the
+canonical fixture check is mandatory. A non-empty `MOQI_DISK` bypasses manifest matching
+and retains the existing regular-file requirement, so custom images are not rejected for
+having a different hash. The RISC-V, AArch64, and NVMe paths are unchanged.
+
+The checker and its fully offline contracts can be run locally:
+
+```bash
+tools/disk_fixture.sh disk.img.manifest disk.img
+bash tools/tests/test_disk_fixture.sh
+```
 
 ---
 
@@ -141,9 +181,9 @@ zig cc \
 ```
 
 输出同样安装到 `zig-out/user/<name>.bin`，与裸 C 程序在 ramdisk 打包与加载路径上
-完全一致。moqi_libc 的宿主机单元测试（string/printf 格式化/malloc 空闲链表）经
-`lib/moqi_libc/host_tests/run_tests.sh` 运行，使用私有 zig 缓存目录，可与
-`zig build` 并行执行。
+完全一致。moqi_libc 的宿主机单元测试（string/printf 格式化/malloc 空闲链表）由
+`zig build test` 调用 `lib/moqi_libc/host_tests/run_tests.sh` 运行；该脚本使用私有 zig
+缓存目录，可与其他 `zig build` 工作并行执行。
 
 ### 4.2 汇编程序（hello2.S, hello3.S）
 
@@ -281,7 +321,7 @@ qemu-system-x86_64 \
 | `zig build` | 仅编译：生成内核镜像与用户程序；ramdisk/ISO 打包由 `tools/qemu_run.sh` 在 run/smoke 时完成 |
 | `zig build run` | 编译并启动 QEMU 仿真 |
 | `zig build debug` | 启动 QEMU 并在 1234 端口监听 GDB（`-s -S`） |
-| `zig build test` | 在主机目标运行 `tests/main.zig` 单元测试，覆盖可脱离硬件执行的共享库逻辑 |
+| `zig build test` | 规范的主机测试门禁：在主机目标运行 `tests/main.zig` 的 Zig 单元测试和 `lib/moqi_libc/host_tests/run_tests.sh` 的 moqi_libc C 测试；任一失败都会使命令失败 |
 | `zig build smoke` | 单核 QEMU 限时冒烟测试，串口日志需出现 init 自动序列各 PASS 标记（`hello21 done`、`hello29: PASS` … `hello41: PASS`）、序列终点 `hello42: PASS` + `hello42 done`，以及 `MoQiOS shell`；完整判定见 `tools/qemu_smoke.sh`。此外启动早期（定时器 IRQ 使能前）会尝试一次有界 DHCP（G3），日志恰有一行大写结果标记：成功 `[DHCP] lease: a.b.c.d`，失败/无 NIC `[DHCP] no lease, static 10.0.2.15`；内部进度日志为小写 `[dhcp] ` |
 | `zig build smoke-smp` | SMP QEMU 限时冒烟测试（默认 `MOQI_SMP=2`），验证 AP 启动路径仍能跑完整个 init 测试序列；`MOQI_SMP=N` 可指定任意正整数核数 |
 | `zig build smoke-smp-matrix` | 按 `MOQI_SMOKE_MATRIX_CPUS`（默认 `"1 2 3 4 6 8"`）依次运行各核数冒烟；16 核在 TCG 下需 `MOQI_SMOKE_TIMEOUT=600` |
@@ -306,6 +346,43 @@ gdb zig-out/bin/moqi-kernel.elf
 | `MOQI_SMOKE_RUNS` | smoke-smp-stress 连续运行次数 | `5` |
 | `MOQI_SMOKE_TIMEOUT` | 单次 smoke 超时秒数；TCG 下跑 16 核建议设为 600 | `120` |
 | `MOQI_SMOKE_STRICT_SMP` | `1`：smoke 检查 "N CPUs online" 与请求核数一致（可因 MADT/资源降级）；`0`：允许部分上线 | `1` |
+
+### 9.2 Host test duration observation
+
+`tools/observe_test_duration.py` is a Python standard-library wrapper for observing the canonical
+host test command. GitHub CI runs the unchanged child command
+`zig build test --summary all` through the wrapper and prints its JSONL record in the job log. The
+child's stdout/stderr and exact exit status pass through; an observer timer, JSON, stdout, or local
+recording failure only reports a diagnostic and never changes that status.
+
+Run it locally with:
+
+```bash
+python3 tools/observe_test_duration.py -- zig build test --summary all
+python3 tools/observe_test_duration.py --output host-test-observations.jsonl -- zig build test --summary all
+python3 -m unittest tools/tests/test_observe_test_duration.py
+```
+
+Each completed JSONL object has this stable schema:
+
+```json
+{"schema_version":1,"scenario":"host-tests","source":"host","status":"completed","sample_count":1,"gating":false,"duration_ms":12.345}
+```
+
+`schema_version`, `scenario`, `source`, `status`, `sample_count`, and `gating` are always present.
+Only completed records include `duration_ms`. These observations have no threshold, baseline,
+regression comparison, or gate: host durations are observational and are not comparable
+baseline/regression data.
+
+The current QEMU state can be recorded without probing QEMU or Limine:
+
+```bash
+python3 tools/observe_test_duration.py --qemu-unavailable
+```
+
+P1 emits an unavailable record without probing QEMU or Limine: it contains `status: "unavailable"`,
+`sample_count: 0`, `gating: false`, and `unavailable_reason: "qemu_dependency_unavailable"`, with
+no `duration_ms`. This P1 mode does not provide QEMU runtime samples.
 
 ---
 
@@ -333,7 +410,8 @@ gdb zig-out/bin/moqi-kernel.elf
 - `disk.img` 与 `disk.img.bak` 需手动维护。
 - 用户程序起始地址为 `0x0`，与某些链接器默认行为冲突，汇编程序必须显式 `-T user/user.ld`。
 - `zig build test` 使用主机目标，适合验证无硬件副作用的共享库函数；真正的内核/用户态集成仍以
-  `zig build run` 下的 QEMU `hello*` 运行时测试为准。
+  `zig build run` 下的 QEMU `hello*` 运行时测试为准。GitHub CI 在每次推送和拉取请求运行
+  `zig build test --summary all`，不包含 QEMU 或 Limine 作业。
 
 ---
 
@@ -373,10 +451,11 @@ gdb zig-out/bin/moqi-kernel.elf
 
 ## 13. 主机端单元测试（`zig build test`）
 
-`zig build test` 以主机目标编译 `tests/main.zig`，直接运行内核源码的单元测试（freestanding
-目标无法承载 Zig 的标准 test runner）。当前覆盖 **11 个内核模块**：
-`lib/{byte_order,errno,fmt,fmt_core,str}.zig`、`mm/cow_pte.zig`、
-`net/{eth,ipv4,ipv6,tcp_util,udp_util}.zig`。
+`zig build test` 是唯一的主机测试入口。它以主机目标编译并运行 `tests/main.zig` 的 Zig 单元
+测试（freestanding 目标无法承载 Zig 的标准 test runner），再运行
+`lib/moqi_libc/host_tests/run_tests.sh` 的 C 测试；任一套件失败都会使构建步骤失败。可由
+`kernel/host_test.zig` 复用的内核模块清单是主机端测试的权威来源，实际覆盖范围由
+`tests/main.zig` 中的断言决定。
 
 ### 工作原理
 
@@ -397,6 +476,12 @@ gdb zig-out/bin/moqi-kernel.elf
 2. 在 `tests/main.zig` 顶部加 `const xxx = kt.xxx;`，然后编写行为测试（已知向量、
    round-trip、边界条件），校验和等期望值请用独立实现（如 Python 版 RFC 1071）离线计算。
 3. 运行 `zig build test`；再跑 `zig build` 确认内核构建不受影响。
+
+### 如何新增 moqi_libc 宿主机测试
+
+在 `lib/moqi_libc/host_tests/` 添加测试源文件，并将其名称加入
+`run_tests.sh` 中的测试列表。该脚本已注册到 `zig build test`，不需要额外修改 CI 或创建独立
+入口；失败退出码会传播到本地命令和 GitHub CI。
 
 如果被测 decl 因一小处内核改动即可变为纯函数（如把纯 helper 下沉到叶子模块），可以做
 **行为保持**的最小改动；否则放弃该模块，另选纯模块。
