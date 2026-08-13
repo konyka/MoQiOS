@@ -1862,6 +1862,46 @@ tryStealTask 删除，共五项**代码早已完成**，文档记录滞后；已
 
 ---
 
+### 6.25 P2 批次第一轮（2026-08-13）：pthread v2 之一——detached 栈回收 + malloc 线程安全
+
+**问题（v1 限制，kernel-subsystems §2.5a）**：detached 线程不 join 时 TCB+栈块（malloc 分配）
+永久泄漏；且 moqi_libc 的 free-list malloc 完全无锁，多线程并发 create/join 会竞争堆链表。
+
+**方案（性能最优取向：零额外系统调用）**：
+- 退出线程无法安全 free 自己仍在运行的栈，故采用**惰性回收**：`pthread_exit` 的 detached
+  路径把 TCB 块以单次 CAS 压入无锁死栈链（无分配、无锁、无系统调用），随后以纯寄存器内联
+  exit syscall 收尾（连 _exit 调用帧都不建）；下一次 `pthread_create` 以一次 XCHG 取走整条链
+  逐个 free。回收延迟有界于创建活动，快路径零成本。
+- 竞态闭合：detach 与 exit 的"看到对方标志"由存储/加载顺序保证至少一方看见（不会双压也
+  不会漏收）；join 与并发 detach（POSIX UB）竞速时 join 复见 detached==1 即放弃读 retval 与
+  free，所有权归死栈链——杜绝 double-free。已接受残余：压链与 exit 之间的信号投递帧可能写到
+  已回收栈顶（指令级窗口，与 §6.18 已接受残余同类）。
+- malloc/free 增加 test-and-set 自旋锁（临界区短、除 grow 的 brk 外无系统调用，自旋优于
+  futex），并发 create/join 不再竞争堆空闲链；单线程程序无感。
+
+**验收**：hello57 新增 8 detached 线程（detach 后立即退出）+ double-detach/join-detached
+EINVAL + 后续 create 触发排空的断言组；host 测试 + smoke SMP=1/4 全绿。
+
+**v2 剩余**：CLONE_FILES 真共享 fd 表（内核 fd 表引用计数化，单独一轮）；`__thread`（PT_TLS，
+loader + crt0/pthread 布局调整，单独一轮）。
+
+**同轮挖出并关闭的固有内核缺陷（exitTask 自死锁）**：SMP=4 门禁三连卡在 hello58 测试 5
+（孤儿 SIGHUP），二分（基线 / 仅回退 hello57 / 基线三连）证明与本轮 libc 改动无关——**基线
+在同一位置复现**，为既有缺陷。根因：`exitTask` 在 `task_lock` 临界区内调用
+`jobctl.onSessionLeaderExit`，其广播路径 `kickIfBlocked/continueTask → unblockTask` 会重取
+`task_lock`（非递归 IrqSpinlock）；目标成员处于 `.blocked`（nanosleep 中）即同 CPU 自死锁，
+IF=0 自旋迅速传染全系统 → 串口完全静默。SMP=1 下 D 总在 C 首次阻塞前退完，所以从不触发。
+修复：SIGHUP 广播移到 `task_lock.release` 之后（此刻本任务已标 .zombie 且仍是当前任务，
+reap 静默门保证槽位有效）。验证：修复前近 4 个 SMP=4 样本 3 次冻结于 D 退出点；修复后
+6 个样本 5 次全绿（含 3 连跑），hello58 测试 5 稳定通过。
+
+**残余观察项**：修复后仍有 1/6 样本停滞在 hello58 主线程打印 PASS 之后、`[exit]` 打印之前
+——主线程在 write 返回与 exit 系统调用之间不再被调度，init 卡在 waitpid，无任何内核输出。
+与 §6.18/6.19 的 SMP 时序竞态同族（调度/信号投递窗口），触发率低；留待 GDB stub 现场取证
+（MOQI_DEBUG=1 起 QEMU，停滞后 attach 查看各 CPU RIP 与任务态）的专项。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:
