@@ -8,10 +8,11 @@
  * smoke test (tools/qemu_smoke.sh) greps the serial log for these markers,
  * so every line here is load-bearing.
  *
- * Behavior contract (mirrors user/init.S):
- *  - "spawned helloN" is printed after every spawn() attempt, whether or
- *    not the spawn succeeded; the spawn return value is never checked.
- *  - Each child is reaped with waitpid(-1, NULL, 0) before the next spawn.
+ * Behavior contract:
+ *  - A SYS_spawn return of exactly -1 reports "spawn failed <program>";
+ *    init skips that program's marker and wait, then continues the sequence.
+ *  - Each successfully created test child is reaped with waitpid(-1, NULL,
+ *    0) before the next spawn.
  *  - hello2 additionally passes a status pointer and prints "child exited"
  *    instead of "hello2 done".
  *  - hello13..hello16 print no "done" line after their wait.
@@ -19,13 +20,23 @@
  *    hello28 are built and packed but never part of the auto sequence.
  *  - hello40 runs before hello39; hello9, hello10 and hello21 (slow ext2
  *    write test) run at the very end, after hello44.
- *  - Finally the interactive shell "sh" is spawned and init exits.
+ *  - Finally the interactive shell "sh" is spawned and init remains alive
+ *    to reap children and supervise only the opt-in persistent services.
  */
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
 #include <moqi_syscalls.h>
+
+#include "spawn_report.h"
+#include "supervisor.h"
+
+static const char *const persistent_services[] = {
+    "syslogd",
+    "devmgr",
+};
+
+static struct init_supervisor supervisor;
 
 /* spawn() has no libc wrapper yet (only sh/hello10 used the libc before
  * init), so call the syscall directly through the shared ABI header. */
@@ -33,19 +44,71 @@ static long spawn(const char *name) {
     return syscall1(SYS_spawn, (long)name);
 }
 
+static void report_spawn_failure(const char *name) {
+    printf("spawn failed %s\n", name);
+}
+
+static int spawn_created(const char *name) {
+    return init_spawn_created(spawn(name), name, report_spawn_failure);
+}
+
+static void report_service_disabled(const char *name) {
+    printf("service disabled %s\n", name);
+}
+
+static const struct init_supervisor_ops supervisor_ops = {
+    spawn,
+    report_spawn_failure,
+    report_service_disabled,
+};
+
+static long spawn_child(const char *name) {
+    long tid = spawn(name);
+
+    if (!init_spawn_created(tid, name, report_spawn_failure)) return -1;
+    return tid;
+}
+
+static long reap_child(int *status) {
+    for (;;) {
+        int child_status = 0;
+        long tid = waitpid(-1, &child_status, 0);
+
+        if (tid < 0) return tid;
+        if (init_supervisor_child_exit(&supervisor, tid, child_status,
+                                       &supervisor_ops) ==
+            INIT_SUPERVISOR_IGNORED) {
+            if (status != (int *)0) *status = child_status;
+            return tid;
+        }
+    }
+}
+
 /* Common case: spawn, announce, reap, announce done. */
 static void run_test(const char *name) {
-    spawn(name);
+    if (spawn_child(name) == -1) return;
     printf("spawned %s\n", name);
-    waitpid(-1, (void *)0, 0);
+    (void)reap_child((int *)0);
     printf("%s done\n", name);
 }
 
 /* hello13..hello16: no "done" line in the original sequence. */
 static void run_test_quiet(const char *name) {
-    spawn(name);
+    if (spawn_child(name) == -1) return;
     printf("spawned %s\n", name);
-    waitpid(-1, (void *)0, 0);
+    (void)reap_child((int *)0);
+}
+
+static void start_persistent_services(void) {
+    unsigned long i;
+
+    init_supervisor_init(&supervisor);
+    for (i = 0; i < sizeof(persistent_services) / sizeof(persistent_services[0]);
+         i++) {
+        int slot = init_supervisor_register(&supervisor,
+                                            persistent_services[i]);
+        if (slot >= 0) init_supervisor_start(&supervisor, slot, &supervisor_ops);
+    }
 }
 
 int main(int argc, char **argv, char **envp) {
@@ -56,10 +119,11 @@ int main(int argc, char **argv, char **envp) {
     /* hello2: the only child reaped with a status pointer, and the only
      * one that prints "child exited" instead of "hello2 done". */
     int status;
-    spawn("hello2");
-    print("spawned hello2\n");
-    waitpid(-1, &status, 0);
-    print("child exited\n");
+    if (spawn_child("hello2") != -1) {
+        print("spawned hello2\n");
+        (void)reap_child(&status);
+        print("child exited\n");
+    }
 
     run_test("hello3");
     run_test("hello4");
@@ -115,20 +179,18 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello57");  /* pthread 子集: create/join/mutex/once/specific/errno */
     run_test("hello58");  /* 作业控制: ctty/前后台/SIGTTIN/kill(-pgid)/孤儿组 */
 
-    /* First resident system service: drains /dev/kmsg into /tmp/kern.log.
-     * Never exits — do not waitpid it. */
-    spawn("syslogd");
-    /* Device manager: watches the /dev node set (polling today, event
-     * hooks when devfs grows them). Also resident — do not waitpid. */
-    spawn("devmgr");
+    start_persistent_services();
 
     run_test("hello9");   /* fork test */
     run_test("hello10");  /* fork+execve test */
     run_test("hello21");  /* ext2 write test — last, slow disk I/O */
 
-    /* Spawn the interactive shell (runs forever), then exit. If the exit
-     * syscall ever returned, park the CPU like the assembly fallback did. */
-    spawn("sh");
-    exit(0);
-    for (;;) __asm__ volatile ("pause");
+    /* The shell remains one-shot. PID 1 stays alive to reap it and supervise
+     * only persistent_services after the fixed startup sequence completes. */
+    spawn_created("sh");
+    for (;;) {
+        if (reap_child((int *)0) < 0) {
+            for (;;) __asm__ volatile ("pause");
+        }
+    }
 }
