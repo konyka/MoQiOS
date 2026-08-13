@@ -55,13 +55,13 @@ void _start(void) {
     if (syscall6(SYS_COPY_FILE_RANGE, 64, 0, 1, 0, 1, 0) != -9) fail("out-of-range fd EBADF");
     if (syscall6(SYS_COPY_FILE_RANGE, 1, 0, 1, 0, 1, 0) != -22) fail("special fd EINVAL");
 
-    int64_t src = syscall3(SYS_OPEN, (uint64_t)"/tmp/cfr-src", O_WRONLY_CREAT, 0);
+    int64_t src = syscall3(SYS_OPEN, (uint64_t)"/tmp/cfr-src", O_WRONLY_CREAT, 0666);
     if (src < 0 || syscall3(SYS_WRITE, (uint64_t)src, (uint64_t)"abcdef", 6) != 6) fail("create source");
     if (syscall1(SYS_CLOSE, (uint64_t)src) != 0) fail("close source writer");
     if (syscall6(SYS_COPY_FILE_RANGE, (uint64_t)src, 0, 1, 0, 1, 0) != -9) fail("closed fd EBADF");
 
     src = syscall3(SYS_OPEN, (uint64_t)"/tmp/cfr-src", 0, 0);
-    int64_t dst = syscall3(SYS_OPEN, (uint64_t)"/tmp/cfr-dst", O_WRONLY_CREAT, 0);
+    int64_t dst = syscall3(SYS_OPEN, (uint64_t)"/tmp/cfr-dst", O_WRONLY_CREAT, 0666);
     if (src < 0 || dst < 0) fail("open files");
 
     uint64_t in_offset = 1;

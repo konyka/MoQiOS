@@ -3,6 +3,9 @@
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
+const capability = @import("../proc/capability_profile.zig");
+const creation_metadata = @import("../proc/creation_metadata.zig");
+const dac = @import("dac.zig");
 
 const MAX_FILES = 64;
 const MAX_NAME_LEN = 60;
@@ -20,8 +23,8 @@ const TmpfsEntry = struct {
     pages: [PAGES_PER_FILE]?u64, // physical page addresses
     page_count: u8,
     mode: u32,
-    uid: u16,
-    gid: u16,
+    uid: u32,
+    gid: u32,
     ctime: u64,
     // v53.51: open refcount + deferred free. unlink used to free the slot
     // while other fds still held its index; allocEntry then reused it and the
@@ -29,6 +32,13 @@ const TmpfsEntry = struct {
     // and the slot is only freed once the last open fd closes.
     open_count: u16,
     deleted: bool,
+};
+
+pub const Metadata = struct {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    is_dir: bool,
 };
 
 var entries: [MAX_FILES]TmpfsEntry = undefined;
@@ -180,6 +190,36 @@ pub fn init() void {
 /// Open a file under /tmp/. Creates if it does not exist.
 /// Returns entry index on success, -1 on error.
 pub fn tmpfsOpen(path: []const u8, create: bool, is_dir: bool) i64 {
+    return tmpfsOpenAuthorized(path, create, is_dir, 0, 0, .{}, 0, null, creation_metadata.DEFAULT_UMASK);
+}
+
+fn createEntryLocked(name: []const u8, name_len: u8, parent: u8, is_dir: bool, requested_mode: ?u32, umask_val: u32, euid: u32, egid: u32) ?u8 {
+    const idx = allocEntry() orelse return null;
+    const metadata = creation_metadata.decide(null, if (is_dir) .directory else .regular_file, requested_mode, umask_val, euid, egid).metadata;
+    entries[idx] = .{
+        .active = true,
+        .name = @splat(0),
+        .name_len = name_len,
+        .is_dir = is_dir,
+        .parent_idx = parent,
+        .size = 0,
+        .pages = [_]?u64{null} ** PAGES_PER_FILE,
+        .page_count = 0,
+        .mode = metadata.mode,
+        .uid = metadata.uid,
+        .gid = metadata.gid,
+        .ctime = next_ctime,
+        .open_count = 1,
+        .deleted = false,
+    };
+    next_ctime +%= 1;
+    @memcpy(entries[idx].name[0..name_len], name[0..name_len]);
+    return idx;
+}
+
+/// Open a tmpfs entry for VFS. DAC applies only to an existing regular file;
+/// creation and directory-open behavior remain identical to tmpfsOpen.
+pub fn tmpfsOpenAuthorized(path: []const u8, create: bool, is_dir: bool, euid: u32, egid: u32, effective_caps: capability.SysCap, flags: u32, requested_mode: ?u32, umask_val: u32) i64 {
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
 
@@ -187,38 +227,31 @@ pub fn tmpfsOpen(path: []const u8, create: bool, is_dir: bool) i64 {
     var name_len: u8 = 0;
     const parent = resolvePath(path, &name_buf, &name_len) orelse return -1;
 
-    // root directory open
     if (name_len == 1 and name_buf[0] == '/') {
+        if (creation_metadata.exclusiveCreateRejectsExisting(create, flags)) return -17;
         entries[0].open_count +|= 1;
         return 0;
     }
 
     const name = name_buf[0..name_len];
     if (findEntry(name, parent)) |idx| {
-        entries[idx].open_count +|= 1;
+        if (creation_metadata.exclusiveCreateRejectsExisting(create, flags)) return -17;
+        const entry = &entries[idx];
+        if (!entry.is_dir) {
+            const decision = dac.decideExistingOpen(
+                .{ .mode = entry.mode, .uid = entry.uid, .gid = entry.gid },
+                .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override },
+                flags,
+            );
+            if (!decision.allowed) return -13;
+            if (decision.truncate) truncateLocked(entry, 0);
+        }
+        entry.open_count +|= 1;
         return @intCast(idx);
     }
 
     if (create) {
-        const idx = allocEntry() orelse return -1;
-        entries[idx] = .{
-            .active = true,
-            .name = @splat(0),
-            .name_len = name_len,
-            .is_dir = is_dir,
-            .parent_idx = parent,
-            .size = 0,
-            .pages = [_]?u64{null} ** PAGES_PER_FILE,
-            .page_count = 0,
-            .mode = if (is_dir) 0o755 else 0o644,
-            .uid = 0,
-            .gid = 0,
-            .ctime = next_ctime,
-            .open_count = 1,
-            .deleted = false,
-        };
-        next_ctime +%= 1;
-        @memcpy(entries[idx].name[0..name_len], name[0..name_len]);
+        const idx = createEntryLocked(name, name_len, parent, is_dir, requested_mode, umask_val, euid, egid) orelse return -1;
         return @intCast(idx);
     }
 
@@ -316,9 +349,12 @@ pub fn tmpfsTruncate(idx: u8, new_size: u32) bool {
     defer tmpfs_lock.release(state_held);
 
     const entry = &entries[idx];
-    if (!entry.active or entry.is_dir) return false;
-    if (new_size > MAX_FILE_SIZE) return false;
+    if (!entry.active or entry.is_dir or new_size > MAX_FILE_SIZE) return false;
+    truncateLocked(entry, new_size);
+    return true;
+}
 
+fn truncateLocked(entry: *TmpfsEntry, new_size: u32) void {
     const keep_pages: u32 = if (new_size == 0) 0 else (new_size + PAGE_SIZE - 1) / PAGE_SIZE;
     var p: u32 = keep_pages;
     while (p < PAGES_PER_FILE) : (p += 1) {
@@ -337,7 +373,6 @@ pub fn tmpfsTruncate(idx: u8, new_size: u32) bool {
         }
     }
     entry.size = new_size;
-    return true;
 }
 
 /// Close a tmpfs file: drop one open reference. The file persists until
@@ -408,7 +443,11 @@ pub fn tmpfsUnlink(path: []const u8) i64 {
 
 /// Create a directory.
 pub fn tmpfsMkdir(path: []const u8) i64 {
-    const result = tmpfsOpen(path, true, true);
+    return tmpfsMkdirAuthorized(path, 0o777, creation_metadata.DEFAULT_UMASK, 0, 0, .{});
+}
+
+pub fn tmpfsMkdirAuthorized(path: []const u8, requested_mode: u32, umask_val: u32, euid: u32, egid: u32, effective_caps: capability.SysCap) i64 {
+    const result = tmpfsOpenAuthorized(path, true, true, euid, egid, effective_caps, 0, requested_mode, umask_val);
     if (result < 0) return result;
     // tmpfsOpen already created as dir; just return success
     return 0;
@@ -421,6 +460,20 @@ pub fn tmpfsGetSize(idx: u8) u32 {
     defer tmpfs_lock.release(state_held);
     if (!entries[idx].active) return 0;
     return entries[idx].size;
+}
+
+pub fn tmpfsGetMetadata(idx: u8) ?Metadata {
+    if (idx >= MAX_FILES) return null;
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    const entry = &entries[idx];
+    if (!entry.active) return null;
+    return .{
+        .mode = entry.mode,
+        .uid = entry.uid,
+        .gid = entry.gid,
+        .is_dir = entry.is_dir,
+    };
 }
 
 /// G2: ctime doubles as a generation tag for file-backed mmap regions —
@@ -482,6 +535,18 @@ pub const TmpfsDirListing = struct {
     entries: []const TmpfsDirEntry,
     count: u32,
 };
+
+pub fn tmpfsCanListDir(idx: u8, euid: u32, egid: u32, effective_caps: capability.SysCap) bool {
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    if (idx >= MAX_FILES) return false;
+    const entry = &entries[idx];
+    if (!entry.active or entry.deleted or !entry.is_dir) return false;
+    return dac.canListDirectory(
+        .{ .mode = entry.mode, .uid = entry.uid, .gid = entry.gid },
+        .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override },
+    );
+}
 
 /// List directory entries for a given tmpfs directory index.
 ///

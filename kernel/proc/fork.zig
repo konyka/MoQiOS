@@ -23,6 +23,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
         child_pml4,
         parent.tid,
         true,
+        @import("capability_profile.zig").default_user_profile,
     ) orelse {
         @import("../mm/user_space.zig").destroyUserSpace(child_pml4);
         return -1;
@@ -45,6 +46,9 @@ pub fn fork(frame: *SyscallFrame) i64 {
     // Without this, child's free_bm stays at default (only bits 0-2 occupied),
     // causing allocFd() to return already-occupied slots and corrupt fds.
     child.fd_table.free_bm = parent.fd_table.free_bm;
+    child.nofile_cur = parent.nofile_cur;
+    child.nofile_max = parent.nofile_max;
+    child.fd_table.alloc_limit = child.nofile_cur;
 
     for (0..vfs_mod.MAX_FDS) |i| {
         child.fd_table.fds[i] = parent.fd_table.fds[i];
@@ -104,7 +108,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.egid = parent.egid;
     child.suid = parent.suid;
     child.sgid = parent.sgid;
-    child.umask_val = parent.umask_val;
+    child.umask_val = @import("creation_metadata.zig").inheritedTaskUmask(parent.umask_val);
     child.pgid = parent.pgid;
     child.sid = parent.sid;
     child.personality = parent.personality;
@@ -117,6 +121,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.effective_caps = parent.effective_caps;
     child.permitted_caps = parent.permitted_caps;
     child.inheritable_caps = parent.inheritable_caps;
+    child.initial_init = false;
 
     // ioperm: the child receives an independent COPY of the parent's I/O
     // port bitmap (allocated iff the parent ever called ioperm_set).

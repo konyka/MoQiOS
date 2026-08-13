@@ -55,7 +55,7 @@ void _start(void) {
     if (syscall4(SYS_PWRITE, 64, (uint64_t)buf, 1, 0) != -9) fail("pwrite OOB fd");
 
     // Test 2: pread/pwrite return EBADF for closed fd
-    int64_t fd = syscall3(SYS_OPEN, (uint64_t)"/tmp/ptest", O_WRONLY_CREAT, 0);
+    int64_t fd = syscall3(SYS_OPEN, (uint64_t)"/tmp/ptest", O_WRONLY_CREAT, 0666);
     if (fd < 0) fail("open file");
     if (syscall1(SYS_CLOSE, (uint64_t)fd) != 0) fail("close file");
     int64_t ret = syscall4(SYS_PREAD, (uint64_t)fd, (uint64_t)buf, 1, 0);
@@ -70,7 +70,7 @@ void _start(void) {
     if (syscall4(SYS_PWRITE, 1, (uint64_t)"x", 1, 0) != -29) fail("pwrite stdout ESPIPE");
 
     // Test 4: pread/pwrite don't mutate shared offset
-    fd = syscall3(SYS_OPEN, (uint64_t)"/tmp/ptest", O_WRONLY_CREAT, 0);
+    fd = syscall3(SYS_OPEN, (uint64_t)"/tmp/ptest", O_WRONLY_CREAT, 0666);
     if (fd < 0) fail("reopen file");
     if (syscall3(SYS_WRITE, (uint64_t)fd, (uint64_t)"0123456789", 10) != 10) fail("write data");
     if (syscall1(SYS_CLOSE, (uint64_t)fd) != 0) fail("close writer");
@@ -96,7 +96,7 @@ void _start(void) {
     if (syscall1(SYS_CLOSE, (uint64_t)fd) != 0) fail("close reader");
 
     // Test 5: pwrite doesn't mutate shared offset on writable fd
-    fd = syscall3(SYS_OPEN, (uint64_t)"/tmp/ptest2", O_WRONLY_CREAT, 0);
+    fd = syscall3(SYS_OPEN, (uint64_t)"/tmp/ptest2", O_WRONLY_CREAT, 0666);
     if (fd < 0) fail("open ptest2");
     if (syscall3(SYS_WRITE, (uint64_t)fd, (uint64_t)"abcd", 4) != 4) fail("write ptest2");
 

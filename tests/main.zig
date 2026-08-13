@@ -14,6 +14,392 @@ const str = kt.str;
 const tcp_util = kt.tcp_util;
 const udp_util = kt.udp_util;
 const pci_msix = kt.pci_msix;
+const capability_profile = kt.capability_profile;
+const capability = kt.capability;
+const dac = kt.dac;
+const rlimit = kt.rlimit;
+const creation_metadata = kt.creation_metadata;
+
+test "creation metadata masks requested permissions to nine mode bits" {
+    const metadata = creation_metadata.decide(null, .regular_file, 0o1764, 0o027, 41, 52).metadata;
+    try std.testing.expectEqual(@as(u32, 0o740), metadata.mode);
+}
+
+test "creation metadata defaults omitted file and directory modes separately" {
+    const file = creation_metadata.decide(null, .regular_file, null, 0o022, 1, 2).metadata;
+    const directory = creation_metadata.decide(null, .directory, null, 0o022, 1, 2).metadata;
+    try std.testing.expectEqual(@as(u32, 0o644), file.mode);
+    try std.testing.expectEqual(@as(u32, 0o755), directory.mode);
+}
+
+test "creation metadata distinguishes explicit zero mode from omitted mode" {
+    const explicit = creation_metadata.decide(null, .regular_file, 0, 0, 1, 2).metadata;
+    const omitted = creation_metadata.decide(null, .regular_file, null, 0, 1, 2).metadata;
+    try std.testing.expectEqual(@as(u32, 0), explicit.mode);
+    try std.testing.expectEqual(@as(u32, 0o666), omitted.mode);
+}
+
+test "creation metadata assigns effective owner and group" {
+    const metadata = creation_metadata.decide(null, .regular_file, 0o600, 0, 1001, 1002).metadata;
+    try std.testing.expectEqual(@as(u32, 1001), metadata.uid);
+    try std.testing.expectEqual(@as(u32, 1002), metadata.gid);
+}
+
+test "creation metadata never mutates an existing object" {
+    const existing: creation_metadata.Metadata = .{ .mode = 0o711, .uid = 7, .gid = 8 };
+    const decision = creation_metadata.decide(existing, .directory, 0, 0o777, 1001, 1002);
+    try std.testing.expect(!decision.created);
+    try std.testing.expectEqual(existing, decision.metadata);
+}
+
+test "exclusive create rejects an existing object without ordinary create rejection" {
+    try std.testing.expect(creation_metadata.exclusiveCreateRejectsExisting(true, 0x40 | 0x80));
+    try std.testing.expect(!creation_metadata.exclusiveCreateRejectsExisting(true, 0x40));
+    try std.testing.expect(!creation_metadata.exclusiveCreateRejectsExisting(false, 0x80));
+}
+
+test "task umask defaults inherits and returns the previous masked value" {
+    var parent = creation_metadata.initialTaskUmask();
+    try std.testing.expectEqual(@as(u32, 0o022), parent);
+    try std.testing.expectEqual(parent, creation_metadata.inheritedTaskUmask(parent));
+    try std.testing.expectEqual(@as(u32, 0o022), creation_metadata.replaceTaskUmask(&parent, 0o1754));
+    try std.testing.expectEqual(@as(u32, 0o754), parent);
+}
+
+test "task umask replacement is isolated to the selected task state" {
+    var first = creation_metadata.initialTaskUmask();
+    const second = creation_metadata.initialTaskUmask();
+    _ = creation_metadata.replaceTaskUmask(&first, 0o077);
+    try std.testing.expectEqual(@as(u32, 0o077), first);
+    try std.testing.expectEqual(@as(u32, 0o022), second);
+}
+
+test "NOFILE defaults to MAX_FDS and reserves standard descriptors" {
+    const limit = rlimit.Policy.default(64);
+    try std.testing.expectEqual(@as(u64, 64), limit.cur);
+    try std.testing.expectEqual(@as(u64, 64), limit.max);
+    try std.testing.expectEqual(@as(?u32, 3), rlimit.Policy.allocationCandidate(~@as(u64, 0b111), 0, limit.cur, 64));
+}
+
+test "NOFILE allocation routes through bounded fd APIs" {
+    const free = (@as(u64, 1) << 3) | (@as(u64, 1) << 4) | (@as(u64, 1) << 7);
+    try std.testing.expectEqual(@as(?u32, 3), rlimit.Policy.allocationCandidate(free, 0, 4, 64));
+    try std.testing.expectEqual(@as(?u32, null), rlimit.Policy.allocationCandidate(free, 4, 4, 64));
+    try std.testing.expectEqual(@as(?u32, null), rlimit.Policy.allocationCandidate(free, 0, 0, 64));
+    try std.testing.expectEqual(@as(?u32, null), rlimit.Policy.allocationCandidate(free, 8, 64, 8));
+}
+
+test "NOFILE allocation treats the soft limit as an FD-number upper bound" {
+    const free = (@as(u64, 1) << 3) | (@as(u64, 1) << 4);
+    try std.testing.expectEqual(@as(?u32, 3), rlimit.Policy.allocationCandidate(free, 0, 4, 64));
+    try std.testing.expectEqual(@as(?u32, null), rlimit.Policy.allocationCandidate(free, 4, 4, 64));
+    try std.testing.expectEqual(@as(?u32, null), rlimit.Policy.allocationCandidate(free, 0, 3, 64));
+}
+
+test "NOFILE explicit occupancy distinguishes replacement from allocation" {
+    try std.testing.expectEqual(rlimit.Policy.DupExplicit.no_op, rlimit.Policy.dupExplicit(true, 7, 7, 4, 64));
+    try std.testing.expectEqual(rlimit.Policy.DupExplicit.bad_target, rlimit.Policy.dupExplicit(true, 3, 4, 4, 64));
+    try std.testing.expectEqual(rlimit.Policy.DupExplicit.no_op, rlimit.Policy.dupExplicit(true, 3, 3, 4, 64));
+    try std.testing.expectEqual(rlimit.Policy.DupExplicit.bad_old, rlimit.Policy.dupExplicit(false, 7, 7, 4, 64));
+}
+
+test "new task creation restores NOFILE defaults after zeroSlot" {
+    const limit = rlimit.Policy.default(8);
+    try std.testing.expectEqual(@as(u64, 8), limit.cur);
+    try std.testing.expectEqual(@as(u64, 8), limit.max);
+}
+
+test "NOFILE blocks future allocations but keeps existing descriptors" {
+    const limit = rlimit.Policy.default(64);
+    const lowered = try rlimit.Policy.apply(limit, .{ .cur = 4, .max = 64 }, 64, false);
+    try std.testing.expect(rlimit.Policy.fdAllowed(lowered.cur, 3, 64));
+    try std.testing.expect(!rlimit.Policy.fdAllowed(lowered.cur, 4, 64));
+    try std.testing.expect(!rlimit.Policy.fdAllowed(lowered.cur, 10, 64));
+}
+
+test "F_DUPFD minimum must be below the active soft limit" {
+    try std.testing.expect(rlimit.Policy.dupMinimumValid(4, 3, 64));
+    try std.testing.expect(!rlimit.Policy.dupMinimumValid(4, 4, 64));
+    try std.testing.expect(!rlimit.Policy.dupMinimumValid(64, std.math.maxInt(u64), 64));
+}
+
+test "dup2 rejects out-of-range targets but permits a valid no-op" {
+    try std.testing.expectEqual(rlimit.Policy.DupExplicit.bad_target, rlimit.Policy.dupExplicit(true, 3, 4, 4, 64));
+    try std.testing.expectEqual(rlimit.Policy.DupExplicit.no_op, rlimit.Policy.dupExplicit(true, 4, 4, 4, 64));
+    try std.testing.expectEqual(rlimit.Policy.DupExplicit.bad_old, rlimit.Policy.dupExplicit(false, 4, 4, 4, 64));
+}
+
+test "dup3 rejects same-fd before routing through dup2" {
+    const source = kt.syscall_entry_source;
+    const dispatch = std.mem.indexOf(u8, source, "161 => { // dup3(oldfd, newfd, flags)") orelse return error.TestUnexpectedResult;
+    const guard = std.mem.indexOfPos(u8, source, dispatch, "if (frame.rdi == frame.rsi)") orelse return error.TestUnexpectedResult;
+    const invalid = std.mem.indexOfPos(u8, source, guard, "frame.rax = @bitCast(errno.EINVAL)") orelse return error.TestUnexpectedResult;
+    const flags = std.mem.indexOfPos(u8, source, dispatch, "const O_CLOEXEC: u64 = 0x80000;") orelse return error.TestUnexpectedResult;
+    const invalid_flags = std.mem.indexOfPos(u8, source, flags, "if (frame.rdx & ~O_CLOEXEC != 0)") orelse return error.TestUnexpectedResult;
+    const dup2_route = std.mem.indexOfPos(u8, source, dispatch, "proc_mgmt_mod.dup2(") orelse return error.TestUnexpectedResult;
+    const cloexec = std.mem.indexOfPos(u8, source, dup2_route, "if (dup_result >= 0 and (frame.rdx & O_CLOEXEC) != 0)") orelse return error.TestUnexpectedResult;
+    const max_fds_guard = std.mem.indexOfPos(u8, source, cloexec, "if (newfd2 < vfs_mod.MAX_FDS)") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(guard < dup2_route);
+    try std.testing.expect(invalid < dup2_route);
+    try std.testing.expect(flags < invalid_flags);
+    try std.testing.expect(invalid_flags < dup2_route);
+    try std.testing.expect(dup2_route < cloexec);
+    try std.testing.expect(cloexec < max_fds_guard);
+}
+
+fn expectSourceRoute(source: []const u8, start_marker: []const u8, end_marker: []const u8, route: []const u8) !void {
+    const start = std.mem.indexOf(u8, source, start_marker) orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, source, start, end_marker) orelse return error.TestUnexpectedResult;
+    const route_pos = std.mem.indexOfPos(u8, source, start, route) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(route_pos < end);
+}
+
+test "creation syscall dispatch forwards mode registers" {
+    const source = kt.syscall_entry_source;
+    try expectSourceRoute(
+        source,
+        "255 => { // openat(dirfd, pathname, flags, mode)",
+        "256 => { // unlinkat",
+        "file_io_mod.openWithMode(frame.rsi, @truncate(frame.rdx), @truncate(frame.r10))",
+    );
+    try expectSourceRoute(
+        source,
+        "257 => { // mkdirat(dirfd, pathname, mode)",
+        "258 => { // faccessat",
+        "dir_ops_mod.mkdirWithMode(frame.rsi, @truncate(frame.rdx))",
+    );
+    try expectSourceRoute(
+        source,
+        "83 => { // mkdir(pathname, mode)",
+        "84 => { // rmdir",
+        "dir_ops_mod.mkdirWithMode(frame.rdi, @truncate(frame.rsi))",
+    );
+    try expectSourceRoute(
+        source,
+        "fn syscallOpen(frame: *SyscallFrame) void",
+        "fn syscallRead(frame: *SyscallFrame) void",
+        "file_io_mod.openWithMode(frame.rdi, @truncate(frame.rsi), @truncate(frame.rdx))",
+    );
+    try expectSourceRoute(
+        source,
+        "fn syscallMkdir(frame: *SyscallFrame) void",
+        "fn syscallConnect(frame: *SyscallFrame) void",
+        "dir_ops_mod.mkdirWithMode(frame.rdi, @truncate(frame.rsi))",
+    );
+}
+
+test "tmpfs exclusive create rejects before existing-entry mutation" {
+    const source = kt.tmpfs_source;
+    const existing = std.mem.indexOf(u8, source, "if (findEntry(name, parent)) |idx|") orelse return error.TestUnexpectedResult;
+    const reject = std.mem.indexOfPos(u8, source, existing, "if (creation_metadata.exclusiveCreateRejectsExisting(create, flags)) return -17;") orelse return error.TestUnexpectedResult;
+    const dac_route = std.mem.indexOfPos(u8, source, existing, "dac.decideExistingOpen(") orelse return error.TestUnexpectedResult;
+    const truncate = std.mem.indexOfPos(u8, source, existing, "truncateLocked(entry, 0)") orelse return error.TestUnexpectedResult;
+    const retain = std.mem.indexOfPos(u8, source, existing, "entry.open_count +|= 1") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(reject < dac_route);
+    try std.testing.expect(reject < truncate);
+    try std.testing.expect(reject < retain);
+}
+
+test "statx routes tmpfs fields through locked metadata accessor" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.tmpfs_source, "pub fn tmpfsGetMetadata(idx: u8) ?Metadata") != null);
+    try expectSourceRoute(
+        kt.statx_source,
+        "if (fd_entry.fd_type == .tmpfs_file)",
+        "bo.writeU16Le(stat_buf[off..], mode)",
+        "tmpfs.tmpfsGetMetadata(@intCast(fd_entry.tmpfs_idx))",
+    );
+    try std.testing.expect(std.mem.indexOf(u8, kt.statx_source, "if (metadata.is_dir) @as(u16, 0o040000) else @as(u16, 0o100000)") != null);
+}
+
+test "creat dispatch creates truncates and opens writable with caller mode" {
+    const source = kt.syscall_entry_source;
+    try expectSourceRoute(source, "85 => { // creat(pathname, mode)", "87 => { // unlink", "const O_WRONLY: u32 = 0x1;");
+    try expectSourceRoute(source, "85 => { // creat(pathname, mode)", "87 => { // unlink", "const O_CREAT: u32 = 0x40;");
+    try expectSourceRoute(source, "85 => { // creat(pathname, mode)", "87 => { // unlink", "const O_TRUNC: u32 = 0x200;");
+    try expectSourceRoute(
+        source,
+        "85 => { // creat(pathname, mode)",
+        "87 => { // unlink",
+        "file_io_mod.openWithMode(frame.rdi, O_WRONLY | O_CREAT | O_TRUNC, @truncate(frame.rsi))",
+    );
+}
+
+test "Linux RLIMIT aliases preserve native syscall numbers" {
+    try std.testing.expectEqual(rlimit.Policy.LinuxAlias.setrlimit, rlimit.Policy.linuxAlias(true, 160).?);
+    try std.testing.expectEqual(rlimit.Policy.LinuxAlias.prlimit64, rlimit.Policy.linuxAlias(true, 302).?);
+    try std.testing.expectEqual(@as(?rlimit.Policy.LinuxAlias, null), rlimit.Policy.linuxAlias(false, 160));
+    try std.testing.expectEqual(@as(?rlimit.Policy.LinuxAlias, null), rlimit.Policy.linuxAlias(false, 302));
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "dispatchLinuxRlimitAlias(frame, syscall_nr)") != null);
+}
+
+test "signalfd closes backing eventfd on later failures" {
+    const create = std.mem.indexOf(u8, kt.signal_syscall_source, "eventfdCreate(0)") orelse return error.TestUnexpectedResult;
+    const cleanup = std.mem.indexOfPos(u8, kt.signal_syscall_source, create, "eventfdClose(eventfd_idx)") orelse return error.TestUnexpectedResult;
+    const alloc = std.mem.indexOfPos(u8, kt.signal_syscall_source, cleanup, "fd_table.allocFd()") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cleanup < alloc);
+    try std.testing.expect(std.mem.indexOf(u8, kt.signal_syscall_source, "defer if (!installed) eventfd_mod.eventfdClose(eventfd_idx)") != null);
+}
+
+test "prlimit re-resolves target after user copies" {
+    const snapshot = std.mem.indexOf(u8, kt.syscall_entry_source, "target_tid = if (pid == 0) caller.tid else pid") orelse return error.TestUnexpectedResult;
+    const copy_from = std.mem.indexOfPos(u8, kt.syscall_entry_source, snapshot, "copy.copyFromUser(nbuf[0..]") orelse return error.TestUnexpectedResult;
+    const relock = std.mem.indexOfPos(u8, kt.syscall_entry_source, copy_from, "const lock_flags = tm.lockTask()") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOfPos(u8, kt.syscall_entry_source, relock, "tm.findTaskByTidLocked(target_tid) orelse return -3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "target.fd_table.alloc_limit = applied.cur") != null);
+}
+
+test "NOFILE validates cur <= max <= MAX_FDS" {
+    try std.testing.expectError(error.InvalidLimit, rlimit.Policy.validate(.{ .cur = 65, .max = 64 }, 64));
+    try std.testing.expectError(error.InvalidLimit, rlimit.Policy.validate(.{ .cur = 64, .max = 65 }, 64));
+}
+
+test "NOFILE raising hard limit requires privilege" {
+    const current = rlimit.Policy.default(32);
+    try std.testing.expectError(error.WouldLowerHardLimit, rlimit.Policy.apply(current, .{ .cur = 33, .max = 64 }, 64, false));
+    try std.testing.expectEqual(@as(u64, 64), (try rlimit.Policy.apply(current, .{ .cur = 64, .max = 64 }, 64, true)).max);
+}
+
+test "NOFILE policy returns the applied limit for prlimit get/set" {
+    const current = rlimit.Policy.default(64);
+    const updated = try rlimit.Policy.apply(current, .{ .cur = 8, .max = 16 }, 64, false);
+    try std.testing.expectEqual(@as(u64, 8), updated.cur);
+    try std.testing.expectEqual(@as(u64, 16), updated.max);
+}
+
+test "DAC decodes open access modes and adds write for truncate" {
+    try std.testing.expectEqual(dac.Access.read, dac.accessForOpen(0));
+    try std.testing.expectEqual(dac.Access.write, dac.accessForOpen(1));
+    try std.testing.expectEqual(dac.Access.read_write, dac.accessForOpen(2));
+    try std.testing.expectEqual(dac.Access.read_write, dac.accessForOpen(0x200));
+}
+
+test "DAC uses owner group and other mode classes with strict precedence" {
+    const meta: dac.Metadata = .{ .mode = 0o042, .uid = 10, .gid = 20 };
+
+    try std.testing.expect(!dac.allows(meta, .{ .euid = 10, .egid = 20 }, .read));
+    try std.testing.expect(dac.allows(meta, .{ .euid = 11, .egid = 20 }, .read));
+    try std.testing.expect(!dac.allows(meta, .{ .euid = 11, .egid = 20 }, .write));
+    try std.testing.expect(dac.allows(meta, .{ .euid = 11, .egid = 21 }, .write));
+    try std.testing.expect(!dac.allows(meta, .{ .euid = 11, .egid = 21 }, .read));
+}
+
+test "DAC root and CAP_DAC_OVERRIDE bypass mode denial" {
+    const meta: dac.Metadata = .{ .mode = 0, .uid = 10, .gid = 20 };
+
+    try std.testing.expect(dac.allows(meta, .{ .euid = 0, .egid = 30 }, .read_write));
+    try std.testing.expect(dac.allows(meta, .{ .euid = 30, .egid = 30, .cap_dac_override = true }, .read_write));
+    try std.testing.expect(!dac.allows(meta, .{ .euid = 30, .egid = 30 }, .read));
+}
+
+test "DAC requires directory read permission for listing" {
+    const meta: dac.Metadata = .{ .mode = 0o700, .uid = 10, .gid = 20 };
+
+    try std.testing.expect(dac.canListDirectory(meta, .{ .euid = 10, .egid = 30 }));
+    try std.testing.expect(!dac.canListDirectory(meta, .{ .euid = 11, .egid = 20 }));
+}
+
+test "DAC denied truncate decision leaves synthetic size unchanged" {
+    const meta: dac.Metadata = .{ .mode = 0o444, .uid = 10, .gid = 20 };
+    const decision = dac.decideExistingOpen(meta, .{ .euid = 11, .egid = 21 }, 0x200);
+    var size: u32 = 37;
+
+    if (decision.allowed and decision.truncate) size = 0;
+    try std.testing.expect(!decision.allowed);
+    try std.testing.expect(decision.truncate);
+    try std.testing.expectEqual(@as(u32, 37), size);
+}
+
+test "descriptor read direction rejects O_WRONLY only" {
+    try std.testing.expect(dac.descriptorCanRead(0));
+    try std.testing.expect(!dac.descriptorCanRead(1));
+    try std.testing.expect(dac.descriptorCanRead(2));
+    try std.testing.expect(!dac.descriptorCanRead(1 | 0x400 | 0x800));
+}
+
+test "positioned reads enforce descriptor direction through shared routing" {
+    const positioned_gate = "const desc = &self.fds[fd];\n        if (!@import(\"dac.zig\").descriptorCanRead(desc.status_flags)) return -9; // EBADF\n\n        switch (desc.fd_type)";
+    const positioned_call = "cur.fd_table.readAtOffset(fd, &kbuf, chunk, current_offset)";
+    const read_at_start = std.mem.indexOf(u8, kt.vfs_source, "pub fn readAtOffset") orelse return error.TestUnexpectedResult;
+    const read_at_source = kt.vfs_source[read_at_start..];
+
+    try std.testing.expect(std.mem.indexOf(u8, read_at_source, positioned_gate) != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.file_io_source, positioned_call) != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.readv_source, positioned_call) != null);
+}
+
+test "UID 1000 create ownership remains outside DAC phase one" {
+    try std.testing.expect(!dac.enforcesOwnershipOnCreate);
+}
+
+test "user metadata probes forward effective DAC credentials" {
+    const forwarding = "openWithCredentials(name, 0, cur.euid, cur.egid, cur.effective_caps)";
+
+    try std.testing.expect(std.mem.indexOf(u8, kt.statx_source, forwarding) != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, forwarding) != null);
+}
+
+test "capability launch profiles enforce the init trust boundary" {
+    const init = capability_profile.profileForLaunch("init", false, true);
+    try std.testing.expectEqual(@as(u32, 0), init.uid);
+    try std.testing.expectEqual(@as(u32, 0), init.gid);
+    try std.testing.expectEqual(@as(u32, @bitCast(@import("kernel_shared").capability.ALL_CAPS)), @as(u32, @bitCast(init.caps)));
+    try std.testing.expect(init.initial_init);
+
+    const wrong_name = capability_profile.profileForLaunch("hello14", false, true);
+    try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(wrong_name.caps)));
+    try std.testing.expect(!wrong_name.initial_init);
+
+    const unknown = capability_profile.profileForLaunch("syslogd", true, false);
+    try std.testing.expectEqual(capability_profile.DEFAULT_UID, unknown.uid);
+    try std.testing.expectEqual(capability_profile.DEFAULT_GID, unknown.gid);
+    try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(unknown.caps)));
+    try std.testing.expect(!unknown.initial_init);
+}
+
+test "capability launch profiles grant only exact trusted compatibility names" {
+    const hello14 = capability_profile.profileForLaunch("hello14", true, false).caps;
+    try std.testing.expect(hello14.cap_net_raw);
+    try std.testing.expectEqual(@as(u32, 1), @popCount(@as(u32, @bitCast(hello14))));
+
+    const hello51 = capability_profile.profileForLaunch("hello51", true, false).caps;
+    const hello52 = capability_profile.profileForLaunch("hello52", true, false).caps;
+    try std.testing.expect(hello51.cap_sys_rawio);
+    try std.testing.expectEqual(@as(u32, 1), @popCount(@as(u32, @bitCast(hello51))));
+    try std.testing.expectEqual(@as(u32, @bitCast(hello51)), @as(u32, @bitCast(hello52)));
+
+    const hello54 = capability_profile.profileForLaunch("hello54", true, false).caps;
+    try std.testing.expect(hello54.cap_sys_rawio);
+    try std.testing.expect(hello54.cap_kill);
+    try std.testing.expectEqual(@as(u32, 2), @popCount(@as(u32, @bitCast(hello54))));
+
+    const hello13 = capability_profile.profileForLaunch("hello13", true, false).caps;
+    const hello58 = capability_profile.profileForLaunch("hello58", true, false).caps;
+    try std.testing.expect(hello13.cap_kill);
+    try std.testing.expectEqual(@as(u32, 1), @popCount(@as(u32, @bitCast(hello13))));
+    try std.testing.expectEqual(@as(u32, @bitCast(hello13)), @as(u32, @bitCast(hello58)));
+}
+
+test "untrusted callers cannot receive named profiles" {
+    inline for ([_][]const u8{ "hello14", "hello51", "hello52", "hello54", "hello13", "hello58" }) |name| {
+        const profile = capability_profile.profileForLaunch(name, false, false);
+        try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(profile.caps)));
+        try std.testing.expect(!profile.initial_init);
+    }
+}
+
+test "named child profiles never carry the initial init marker" {
+    const profile = capability_profile.profileForLaunch("hello54", true, false);
+    try std.testing.expect(!profile.initial_init);
+    try std.testing.expectEqual(capability_profile.DEFAULT_UID, profile.uid);
+    try std.testing.expectEqual(capability_profile.DEFAULT_GID, profile.gid);
+}
+
+test "raw network gate permits only CAP_NET_RAW" {
+    try std.testing.expect(capability_profile.permitsRawNetwork(.{ .cap_net_raw = true }));
+    try std.testing.expect(!capability_profile.permitsRawNetwork(.{}));
+    try std.testing.expect(!capability_profile.permitsRawNetwork(.{ .cap_kill = true }));
+    try std.testing.expect(!capability_profile.permitsRawNetwork(.{ .cap_sys_rawio = true }));
+}
 
 test {
     std.testing.refAllDecls(@This());
@@ -530,7 +916,6 @@ test "lo isLoopback classifies the whole 127.0.0.0/8 block" {
     try std.testing.expect(!lo.isLoopback(.{ 10, 0, 2, 15 }));
     try std.testing.expect(!lo.isLoopback(.{ 0, 0, 0, 0 }));
 }
-
 
 // ─── RT scheduling (F3) ───
 // Pure policy-logic tests for kernel/proc/sched_policy.zig (SCHED_FIFO/RR).
@@ -1833,7 +2218,6 @@ test "K2: batching parameters are consistent" {
 }
 // ─── end slab magazine (K2) ───
 
-
 // ─── user driver framework (L1) ───
 const userdrv_core = kt.userdrv_core;
 
@@ -1944,15 +2328,26 @@ test "L1: dev_dma_alloc size validation" {
 test "L1: /dev/pci listing format" {
     const devs = [_]userdrv_core.PciInfo{
         .{
-            .bus = 0, .device = 0, .function = 0,
-            .vendor_id = 0x8086, .device_id = 0x1237,
-            .class_code = 0x06, .subclass = 0x00, .irq_line = 0,
-            .bars = .{ 0, 0, 0, 0, 0, 0 }, .bar_sizes = .{ 0, 0, 0, 0, 0, 0 },
+            .bus = 0,
+            .device = 0,
+            .function = 0,
+            .vendor_id = 0x8086,
+            .device_id = 0x1237,
+            .class_code = 0x06,
+            .subclass = 0x00,
+            .irq_line = 0,
+            .bars = .{ 0, 0, 0, 0, 0, 0 },
+            .bar_sizes = .{ 0, 0, 0, 0, 0, 0 },
         },
         .{
-            .bus = 0, .device = 3, .function = 0,
-            .vendor_id = 0x8086, .device_id = 0x100e,
-            .class_code = 0x02, .subclass = 0x00, .irq_line = 11,
+            .bus = 0,
+            .device = 3,
+            .function = 0,
+            .vendor_id = 0x8086,
+            .device_id = 0x100e,
+            .class_code = 0x02,
+            .subclass = 0x00,
+            .irq_line = 11,
             .bars = .{ 0xFEBC0000, 0xC040, 0, 0, 0, 0 },
             .bar_sizes = .{ 0x20000, 0x40, 0, 0, 0, 0 },
         },

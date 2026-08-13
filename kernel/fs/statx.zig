@@ -23,7 +23,7 @@ pub fn statx(pathname_ptr: u64, statxbuf_ptr: u64) i64 {
     // Try to open and fstat
     var stat_buf: [144]u8 = undefined;
     @memset(&stat_buf, 0);
-    const fd_result = cur.fd_table.open(name, 0); // O_RDONLY
+    const fd_result = cur.fd_table.openWithCredentials(name, 0, cur.euid, cur.egid, cur.effective_caps); // O_RDONLY
     if (fd_result >= 0) {
         const fd: u32 = @intCast(fd_result);
         const fd_entry = &cur.fd_table.fds[fd];
@@ -44,13 +44,24 @@ pub fn statx(pathname_ptr: u64, statxbuf_ptr: u64) i64 {
         const nlink: u32 = 1;
         bo.writeU32Le(stat_buf[off..], nlink);
         off += 4;
-        const uid: u32 = 0;
-        const gid: u32 = 0;
+        var uid: u32 = 0;
+        var gid: u32 = 0;
+        var mode: u16 = if (fd_entry.fd_type == .tcp_socket) @as(u16, 0o140777) else @as(u16, 0o100644);
+        if (fd_entry.fd_type == .tmpfs_file) {
+            const tmpfs = @import("tmpfs.zig");
+            const metadata = tmpfs.tmpfsGetMetadata(@intCast(fd_entry.tmpfs_idx)) orelse {
+                _ = cur.fd_table.close(fd);
+                return -2;
+            };
+            uid = metadata.uid;
+            gid = metadata.gid;
+            const file_type = if (metadata.is_dir) @as(u16, 0o040000) else @as(u16, 0o100000);
+            mode = file_type | @as(u16, @intCast(metadata.mode & 0o777));
+        }
         bo.writeU32Le(stat_buf[off..], uid);
         off += 4;
         bo.writeU32Le(stat_buf[off..], gid);
         off += 4;
-        const mode: u16 = if (fd_entry.fd_type == .tcp_socket) @as(u16, 0o140777) else @as(u16, 0o100644);
         bo.writeU16Le(stat_buf[off..], mode);
         off += 2;
         off += 2; // padding

@@ -88,7 +88,7 @@ static uint8_t pattern(uint64_t i) {
 
 static void make_file(void) {
     static uint8_t buf[PAGE];
-    const int64_t fd = syscall3(SYS_OPEN, (uint64_t)"/tmp/h46.dat", O_RDWR_CREAT_TRUNC, 0);
+    const int64_t fd = syscall3(SYS_OPEN, (uint64_t)"/tmp/h46.dat", O_RDWR_CREAT_TRUNC, 0666);
     if (fd < 0) fail("open for write");
     uint64_t done = 0;
     while (done < FILE_LEN) {

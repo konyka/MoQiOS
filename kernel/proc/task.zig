@@ -19,6 +19,7 @@ const arch_cpu = @import("../arch/arch.zig").cpu;
 const arch_irq = @import("../arch/arch.zig").interrupts;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const sched_policy = @import("sched_policy.zig");
+const creation_metadata = @import("creation_metadata.zig");
 const builtin = @import("builtin");
 
 const PAGE_SIZE: u64 = 4096;
@@ -123,6 +124,9 @@ pub const Task = struct {
     tls_base: u64,
     /// Per-process file descriptor table.
     fd_table: @import("../fs/vfs.zig").FdTable,
+    /// Per-task RLIMIT_NOFILE; defaults preserve the historical MAX_FDS cap.
+    nofile_cur: u64 = @import("../fs/vfs.zig").MAX_FDS,
+    nofile_max: u64 = @import("../fs/vfs.zig").MAX_FDS,
 
     /// Bitmask of pending signals (bit N = signal N+1 is pending).
     /// Signals 1-31 supported. Bit 0 = SIGHUP (1), bit 30 = SIGUSR2 (31).
@@ -258,11 +262,13 @@ pub const Task = struct {
 
     // --- POSIX system capabilities (Task #8) ---
     /// Effective capabilities — currently active permissions.
-    effective_caps: @import("../ipc/capability.zig").SysCap = @import("../ipc/capability.zig").ALL_CAPS,
+    effective_caps: @import("../ipc/capability.zig").SysCap = @import("../ipc/capability.zig").NO_CAPS,
     /// Permitted capabilities — upper bound of what can be effective.
-    permitted_caps: @import("../ipc/capability.zig").SysCap = @import("../ipc/capability.zig").ALL_CAPS,
+    permitted_caps: @import("../ipc/capability.zig").SysCap = @import("../ipc/capability.zig").NO_CAPS,
     /// Inheritable capabilities — passed across fork/exec.
-    inheritable_caps: @import("../ipc/capability.zig").SysCap = @import("../ipc/capability.zig").ALL_CAPS,
+    inheritable_caps: @import("../ipc/capability.zig").SysCap = @import("../ipc/capability.zig").NO_CAPS,
+    /// Internal trust marker: only the boot-created init may delegate profiles.
+    initial_init: bool = false,
 };
 
 /// Tracked mmap region for munmap support.
@@ -334,8 +340,8 @@ var task_count: u32 = 0;
 var kernel_stack_mapped: [MAX_TASKS]bool = [_]bool{false} ** MAX_TASKS;
 
 /// Zero a task slot in place (never via a stack temporary). All Task fields
-/// have a valid all-zero representation, so callers only need to set the
-/// handful of non-default fields afterwards.
+/// have a valid all-zero representation, so callers set the required non-zero
+/// fields and restore initialized substructures afterwards.
 fn zeroSlot(slot: u32) void {
     const bytes: [*]u8 = @ptrCast(&tasks[slot]);
     @memset(bytes[0..@sizeOf(Task)], 0);
@@ -592,6 +598,7 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     next_tid += 1;
 
     zeroSlot(slot);
+    tasks[slot].umask_val = creation_metadata.initialTaskUmask();
     tasks[slot].self_idx = slot;
     tasks[slot].tid = tid;
     tasks[slot].state = .ready;
@@ -601,17 +608,13 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     tasks[slot].entry = entry;
     tasks[slot].personality = .native;
     @import("../fs/vfs.zig").FdTable.initInto(&tasks[slot].fd_table);
+    tasks[slot].nofile_cur = @import("../fs/vfs.zig").MAX_FDS;
+    tasks[slot].nofile_max = @import("../fs/vfs.zig").MAX_FDS;
+    tasks[slot].fd_table.alloc_limit = tasks[slot].nofile_cur;
     tasks[slot].cwd[0] = '/';
     tasks[slot].cwd_len = 1;
     tasks[slot].cpu_affinity = affinity;
     tasks[slot].last_cpu = affinity;
-
-    // Task #8: POSIX caps default to ALL_CAPS (zeroSlot would leave them at
-    // NO_CAPS, which would break every existing capability-checked syscall).
-    const _cap_init_kt_aff = @import("../ipc/capability.zig");
-    tasks[slot].effective_caps = _cap_init_kt_aff.ALL_CAPS;
-    tasks[slot].permitted_caps = _cap_init_kt_aff.ALL_CAPS;
-    tasks[slot].inheritable_caps = _cap_init_kt_aff.ALL_CAPS;
 
     task_count += 1;
     asm volatile ("" ::: .{ .memory = true });
@@ -648,6 +651,7 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     const tid = next_tid;
     next_tid += 1;
     zeroSlot(slot);
+    tasks[slot].umask_val = creation_metadata.initialTaskUmask();
     tasks[slot].self_idx = slot;
     tasks[slot].tid = tid;
     tasks[slot].state = .ready;
@@ -657,15 +661,13 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     tasks[slot].entry = entry;
     tasks[slot].personality = .native;
     @import("../fs/vfs.zig").FdTable.initInto(&tasks[slot].fd_table);
+    tasks[slot].nofile_cur = @import("../fs/vfs.zig").MAX_FDS;
+    tasks[slot].nofile_max = @import("../fs/vfs.zig").MAX_FDS;
+    tasks[slot].fd_table.alloc_limit = tasks[slot].nofile_cur;
     tasks[slot].cwd[0] = '/';
     tasks[slot].cwd_len = 1;
     tasks[slot].cpu_affinity = -1;
     tasks[slot].last_cpu = 0;
-    // Task #8: POSIX caps default to ALL_CAPS (see createKernelThreadAffinity).
-    const _cap_init_kt = @import("../ipc/capability.zig");
-    tasks[slot].effective_caps = _cap_init_kt.ALL_CAPS;
-    tasks[slot].permitted_caps = _cap_init_kt.ALL_CAPS;
-    tasks[slot].inheritable_caps = _cap_init_kt.ALL_CAPS;
     task_count += 1;
     asm volatile ("" ::: .{ .memory = true });
     return slot;
@@ -879,7 +881,7 @@ pub fn reapZombies() u32 {
 /// Find a task by its TID. Returns the task slot index or null.
 /// Internal version — caller must hold task_lock.
 /// Uses slot_bitmap to skip empty slots via @ctz.
-fn findTaskByTidLocked(tid: u32) ?u32 {
+pub fn findTaskByTidLocked(tid: u32) ?u32 {
     var bits = slot_bitmap;
     while (bits != 0) {
         const i: u32 = @intCast(@ctz(bits));
@@ -938,6 +940,7 @@ pub fn createUserProcess(
     page_table_phys: u64,
     parent_tid_val: u32,
     elf: bool,
+    profile: @import("capability_profile.zig").LaunchProfile,
 ) ?u32 {
     const slot = blk: {
         const flags = task_lock.acquire();
@@ -973,6 +976,7 @@ pub fn createUserProcess(
 
         // Build the large Task in place to avoid overflowing the kernel stack.
         zeroSlot(slot);
+        tasks[slot].umask_val = creation_metadata.initialTaskUmask();
         tasks[slot].self_idx = slot;
         tasks[slot].tid = tid;
         // Not runnable yet. fork/clone still have to build the child's
@@ -988,21 +992,30 @@ pub fn createUserProcess(
         tasks[slot].page_table_phys = page_table_phys;
         tasks[slot].personality = .native;
         tasks[slot].is_user = true;
+        tasks[slot].uid = profile.uid;
+        tasks[slot].gid = profile.gid;
+        tasks[slot].euid = profile.uid;
+        tasks[slot].egid = profile.gid;
+        tasks[slot].suid = profile.uid;
+        tasks[slot].sgid = profile.gid;
         tasks[slot].user_entry = user_entry;
         tasks[slot].user_stack_top = user_stack_top;
         tasks[slot].stack_limit = user_stack_top - 64 * 4096;
         tasks[slot].parent_tid = parent_tid_val;
         @import("../fs/vfs.zig").FdTable.initInto(&tasks[slot].fd_table);
+        tasks[slot].nofile_cur = @import("../fs/vfs.zig").MAX_FDS;
+        tasks[slot].nofile_max = @import("../fs/vfs.zig").MAX_FDS;
+        tasks[slot].fd_table.alloc_limit = tasks[slot].nofile_cur;
         tasks[slot].cwd[0] = '/';
         tasks[slot].cwd_len = 1;
         // User processes are not pinned by default; last_cpu seeds placement.
         tasks[slot].cpu_affinity = -1;
         tasks[slot].last_cpu = assignCpuAffinity(elf);
 
-        const _cap_init_up = @import("../ipc/capability.zig");
-        tasks[slot].effective_caps = _cap_init_up.ALL_CAPS;
-        tasks[slot].permitted_caps = _cap_init_up.ALL_CAPS;
-        tasks[slot].inheritable_caps = _cap_init_up.ALL_CAPS;
+        tasks[slot].effective_caps = profile.caps;
+        tasks[slot].permitted_caps = profile.caps;
+        tasks[slot].inheritable_caps = profile.caps;
+        tasks[slot].initial_init = profile.initial_init;
 
         task_count += 1;
         asm volatile ("mfence" ::: .{ .memory = true });

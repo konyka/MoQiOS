@@ -58,7 +58,7 @@ static inline long sys_write(int fd, const void *buf, unsigned long n) {
 | 文件 I/O | `write`, `open`, `read`, `close`, `dup2` |
 | 信号 | `sigaction`, `sigprocmask`, `sigreturn` |
 | 管道 | `pipe` |
-| 文件系统 | `listdir`, `chdir`, `getcwd`, `mkdir`, `unlink`, `truncate` |
+| 文件系统 | `listdir`, `chdir`, `getcwd`, `mkdir(path, mode)`, `unlink`, `truncate` |
 | 网络 | `net_send`, `net_recv`, `net_poll`, `tcp_connect`, `tcp_send`, `tcp_recv`, `tcp_close`, `tcp_listen`, `socket`, `bind`, `accept`, `sendto`, `recvfrom`, `connect` |
 | 环境变量 | `getenv`, `setenv` |
 | 内存 | `brk` |
@@ -78,14 +78,36 @@ static inline long sys_write(int fd, const void *buf, unsigned long n) {
 文件：`servers/init/main.c`（C，基于 moqi_libc，见第 5 节），编译安装为
 `zig-out/user/init.bin`，作为 PID 1。2026-08 起取代汇编实现；`user/init.S`
 （汇编，约 1306 行）保留在源码树中作为回退参考，但不再参与构建。
-C 版保持字节级行为一致：相同 spawn 顺序、相同打印行、相同 waitpid 语义。
+C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同打印行、相同 waitpid 语义。
+`SYS_spawn` 返回恰好 `-1` 时，init 打印 `spawn failed <program>`，跳过该程序的成功标记和
+`waitpid`，并继续后续配置的 spawn。
 
 职责：
 
 1. 顺序 `spawn` 自动化测试程序（`hello2`–`hello44`；其中 `hello11` 与 `hello28` **不**在
    init 自动序列内），并 `waitpid` 收回；随后进入交互 shell。
-2. 测试全部通过后启动交互式 Shell（`sh`）。
-3. 在 Shell 退出后处于阻塞状态（避免内核因 init 退出而 panic）。
+2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
+   `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
+3. 测试全部通过后启动一次交互式 Shell（`sh`）；PID 1 保持运行并继续回收子进程。
+
+### 2.1 有界服务监督策略
+
+监督器是 `servers/init/supervisor.h` 中的固定大小状态机：最多 4 个服务，不使用动态内存。
+按服务槽保存名称、当前 TID、状态和已使用的重启次数；子进程退出时最多线性扫描 4 个槽，
+因此查找成本具有明确的小常数上界。
+
+- 初次 spawn 成功：记录 TID，服务进入运行状态，不消耗重启预算。
+- 初次 spawn 返回恰好 `-1`：打印 `spawn failed <name>`，随后立即尝试重启；spawn 失败与
+  异常退出共享同一预算。
+- 退出码为 `0`：视为干净退出，回收后停止，不重启。
+- 退出码非 `0`（包括内核编码为 `128 + signal` 的致命信号退出）：立即重启。
+- 每个服务最多执行 3 次重启 spawn；成功的重启同样消耗一次。预算耗尽后打印
+  `service disabled <name>`，禁用该服务直至下次启动系统。
+- 未登记或 TID 不匹配的子进程只正常回收，不影响任何服务状态。
+
+这是第一阶段的最小 PID 1 监督，不提供退避或定时窗口、服务依赖图、就绪协议、看门狗、
+系统范围进程重启或持久化监督日志；也不改变现有日志服务的持久化策略。重启预算仅保存在
+本次 init 进程的内存中。
 
 伪流程：
 
@@ -97,7 +119,7 @@ main():
     spawn("hello44"); waitpid;   // SCHED_FIFO/RR realtime classes (after hello42)
     spawn("hello9/10/21"); waitpid;   // fork/ext2 写测试排在最后
     spawn("sh");
-    exit(0);
+    forever: waitpid; dispatch registered service exits
 ```
 
 历史说明：init 最初用汇编编写（`user/init.S`），以避免依赖 libc、直接控制系统调用号
@@ -355,7 +377,47 @@ SECTIONS {
 
 ---
 
-## 参考
+## 10. Launch Credentials And Raw Networking
+
+ELF programs loaded for a new user task start with UID/GID `1000` and no
+capabilities. The kernel's initial `init` task is the sole initial exception:
+it starts as UID/GID `0` with `ALL_CAPS`. A later launch receives a capability
+profile only when the caller is the trusted initial `init` task and the ramdisk
+name matches exactly: `hello14` gets `CAP_NET_RAW`, `hello51`/`hello52` get
+`CAP_SYS_RAWIO`, `hello54` gets `CAP_SYS_RAWIO` plus `CAP_KILL`, and
+`hello13`/`hello58` get `CAP_KILL`. All other names remain unprivileged.
+
+AF_INET `SOCK_RAW` creation and the custom raw network send/receive syscalls
+return `EPERM` unless the current task has `CAP_NET_RAW`; TCP and UDP sockets
+are unaffected. Fork, clone, and ordinary exec preserve the task credentials
+and capability sets.
+
+### 10.1 First-phase tmpfs DAC boundary
+
+The first DAC phase applies only when opening an existing regular file under
+`/tmp` and when listing an existing tmpfs directory. Regular-file open access
+uses the effective UID/GID and the owner, group, or other mode bits; `O_RDONLY`
+is access mode zero, and `O_TRUNC` adds a write requirement. Authorization is
+performed while the tmpfs lock is held and before the open reference or file
+contents are changed. A denial returns `-13` (`EACCES`) and leaves the file
+size and directory-listing state unchanged.
+
+UID `0` and effective `CAP_DAC_OVERRIDE` bypass these checks. Fresh tmpfs
+objects created by `O_CREAT` or `mkdir` receive the caller's effective
+UID/GID, and their permissions are `(requested_mode & 0777) & ~(umask & 0777)`
+before the object becomes visible. Existing objects keep their metadata;
+`O_CREAT|O_EXCL` returns `-17` (`EEXIST`) without modifying them. This phase
+does not enforce unlink, rmdir, rename, chmod, or chown; it does not revalidate
+already-open descriptors and does not alter ext2, ramdisk, devfs, or FAT32
+behavior. Group management, ACLs, and setuid behavior are outside this boundary.
+
+Independent of DAC, descriptor access modes are enforced at read time
+regardless of filesystem: reading a descriptor opened `O_WRONLY` fails with
+`-9` (`EBADF`). Callers that need both directions must open `O_RDWR`.
+
+---
+
+## Reference
 
 - [moqios-architecture-current.md](./moqios-architecture-current.md)
 - [kernel-subsystems.md](./kernel-subsystems.md)

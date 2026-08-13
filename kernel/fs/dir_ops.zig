@@ -110,6 +110,11 @@ pub fn listdir(buf_ptr: u64, buf_size: u64) i64 {
 
 /// mkdir(name_ptr) → 0 or -1
 pub fn mkdir(name_ptr: u64) i64 {
+    return mkdirWithMode(name_ptr, null);
+}
+
+/// mkdir with an optional mode; null preserves the legacy 0777 default.
+pub fn mkdirWithMode(name_ptr: u64, requested_mode: ?u32) i64 {
     if (name_ptr >= 0x0000_8000_0000_0000 or name_ptr == 0) return -1;
 
     var name_buf: [256]u8 = undefined;
@@ -120,6 +125,13 @@ pub fn mkdir(name_ptr: u64) i64 {
     var len: usize = 0;
     while (len < copied and name_buf[len] != 0) : (len += 1) {}
     const name = name_buf[0..len];
+
+    if (name.len >= 4 and name[0] == '/' and name[1] == 't' and name[2] == 'm' and name[3] == 'p') {
+        const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
+        const cur = task_mod.getTask(cur_idx) orelse return -1;
+        const mode = requested_mode orelse @import("../proc/creation_metadata.zig").DEFAULT_DIRECTORY_MODE;
+        return @import("tmpfs.zig").tmpfsMkdirAuthorized(name, mode, cur.umask_val, cur.euid, cur.egid, cur.effective_caps);
+    }
 
     const ext2 = @import("ext2.zig");
     if (ext2.isActive()) {

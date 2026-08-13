@@ -22,9 +22,12 @@ pub fn write(fd: u64, buf: u64, count: u64) i64 {
             var kbuf: [4096]u8 = undefined;
             const copied = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(buf + pos), chunk);
             if (copied == 0) break;
-            for (0..copied) |i| {
-                serial.writeByte(kbuf[i]);
-            }
+            // One locked writeString per chunk: per-byte writeByte calls would
+            // drop the serial lock between bytes and let concurrent writers on
+            // other CPUs interleave character-by-character (SMP smoke marker
+            // smearing). Chunk granularity also costs one lock acquisition
+            // instead of `copied`.
+            serial.writeString(kbuf[0..copied]);
             pos += copied;
             if (copied < chunk) break;
         }
@@ -60,6 +63,11 @@ pub fn write(fd: u64, buf: u64, count: u64) i64 {
 
 /// open(name_ptr, flags) → fd or -1
 pub fn open(name_ptr: u64, flags: u32) i64 {
+    return openWithMode(name_ptr, flags, null);
+}
+
+/// Open with an optional creation mode; null preserves the legacy 0666 default.
+pub fn openWithMode(name_ptr: u64, flags: u32, requested_mode: ?u32) i64 {
     if (name_ptr >= 0x0000_8000_0000_0000 or name_ptr == 0) return -1;
 
     var name_buf: [256]u8 = undefined;
@@ -74,7 +82,7 @@ pub fn open(name_ptr: u64, flags: u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    const result = cur.fd_table.open(name, flags);
+    const result = cur.fd_table.openWithCreationCredentials(name, flags, requested_mode, cur.umask_val, cur.euid, cur.egid, cur.effective_caps);
     return @bitCast(result);
 }
 

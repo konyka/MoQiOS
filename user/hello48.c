@@ -97,7 +97,7 @@ static uint8_t disk_pattern(uint64_t i) {
 /* (a) tmpfs shared visibility across fork. */
 static void test_tmpfs_shared(void) {
     static uint8_t buf[PAGE];
-    const int64_t fd = syscall3(SYS_OPEN, (uint64_t)"/tmp/h48.dat", O_RDWR_CREAT_TRUNC, 0);
+    const int64_t fd = syscall3(SYS_OPEN, (uint64_t)"/tmp/h48.dat", O_RDWR_CREAT_TRUNC, 0666);
     if (fd < 0) fail("tmpfs open");
     for (uint64_t i = 0; i < PAGE; i++) buf[i] = seed_pattern(i);
     if (syscall3(SYS_WRITE, (uint64_t)fd, (uint64_t)buf, PAGE) != PAGE)
@@ -140,7 +140,7 @@ static void test_tmpfs_shared(void) {
 /* (b) ext2 shared write-through to disk. */
 static void test_ext2_shared(void) {
     static uint8_t buf[PAGE];
-    const int64_t fd = syscall3(SYS_OPEN, (uint64_t)"/h48_shared.dat", O_RDWR_CREAT_TRUNC, 0);
+    const int64_t fd = syscall3(SYS_OPEN, (uint64_t)"/h48_shared.dat", O_RDWR_CREAT_TRUNC, 0666);
     if (fd < 0) fail("ext2 open");
     for (uint64_t i = 0; i < PAGE; i++) buf[i] = seed_pattern(i);
     if (syscall3(SYS_WRITE, (uint64_t)fd, (uint64_t)buf, PAGE) != PAGE)

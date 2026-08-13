@@ -39,7 +39,12 @@ pub fn spawn(name_ptr: u64) i64 {
         }
     }
 
-    if (loader.loadProgram(name, caller_tid)) |task_idx| {
+    var initial_init_caller = false;
+    if (sched.currentTaskIndex()) |idx| {
+        if (task_mod.getTask(idx)) |cur| initial_init_caller = cur.initial_init;
+    }
+
+    if (loader.loadProgram(name, caller_tid, initial_init_caller, false)) |task_idx| {
         const t = @import("task.zig");
         if (t.getTask(task_idx)) |new_task| {
             const se = @import("../arch/arch.zig").syscall;

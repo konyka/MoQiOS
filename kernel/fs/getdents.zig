@@ -29,7 +29,7 @@ pub fn getdents64(fd: u32, buf_ptr: u64, buf_size: u64) i64 {
 
     // tmpfs directory
     if (desc.fd_type == .tmpfs_file) {
-        return getdents64Tmpfs(desc, buf_ptr, buf_size);
+        return getdents64Tmpfs(desc, buf_ptr, buf_size, cur.euid, cur.egid, cur.effective_caps);
     }
 
     // devfs directory (/dev)
@@ -145,7 +145,9 @@ fn getdents64Ext2(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i6
     return @intCast(written);
 }
 
-fn getdents64Tmpfs(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i64 {
+fn getdents64Tmpfs(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64, euid: u32, egid: u32, effective_caps: @import("../proc/capability_profile.zig").SysCap) i64 {
+    if (!tmpfs.tmpfsCanListDir(@intCast(desc.tmpfs_idx), euid, egid, effective_caps)) return -13;
+
     // v53.51: tmpfsListDir copies entries+names into caller-owned buffers
     // under tmpfs_lock — one page holds all names (64 entries x 60 bytes).
     const pmm = @import("../mm/pmm.zig");

@@ -130,7 +130,9 @@ void _start(void) {
 
     /* ── 4. /dev/full: write fails with -ENOSPC ────────────────────── */
     {
-        int64_t fd = syscall3(SYS_OPEN, (uint64_t)"/dev/full", O_WRONLY, 0);
+        /* O_RDWR: reads on a write-only descriptor are now EBADF (POSIX),
+           so the EOF check needs a readable descriptor. */
+        int64_t fd = syscall3(SYS_OPEN, (uint64_t)"/dev/full", O_RDWR, 0);
         if (fd < 0) fail("open /dev/full");
         if (syscall3(SYS_WRITE, (uint64_t)fd, (uint64_t)"x", 1) != -ENOSPC)
             fail("write /dev/full not ENOSPC");

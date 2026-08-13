@@ -7,6 +7,7 @@
 
 const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
+const cap_mod = @import("../ipc/capability.zig");
 const vfs_mod = @import("../fs/vfs.zig");
 const net_mod = @import("mod.zig");
 const udp = @import("udp.zig");
@@ -23,7 +24,7 @@ const SOCKADDR_IN_MIN_LEN: u32 = 8;
 // ── FD allocation helpers ──────────────────────────────────────────
 
 pub fn allocTcpFd(fd_table: *vfs_mod.FdTable, tcb_idx: u32) i64 {
-    const slot = fd_table.allocFd() orelse return -1;
+    const slot = fd_table.allocFd() orelse return -24; // EMFILE
     fd_table.fds[slot] = .{
         .fd_type = .tcp_socket,
         .tcb_idx = tcb_idx,
@@ -33,7 +34,7 @@ pub fn allocTcpFd(fd_table: *vfs_mod.FdTable, tcb_idx: u32) i64 {
 }
 
 pub fn allocUnixFd(fd_table: *vfs_mod.FdTable, unix_sock_idx: u32) i32 {
-    const slot = fd_table.allocFd() orelse return -1;
+    const slot = fd_table.allocFd() orelse return -24; // EMFILE
     fd_table.fds[slot] = .{
         .fd_type = .unix_socket,
         .unix_sock_idx = unix_sock_idx,
@@ -56,7 +57,7 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
         const fd = allocUnixFd(&t.fd_table, @intCast(sock_idx));
         if (fd < 0) {
             net_mod.unix_socket.unixClose(@intCast(sock_idx));
-            return -1;
+            return fd;
         }
         return @as(i64, fd);
     }
@@ -96,7 +97,7 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
             const fd6 = allocTcpFd(&t.fd_table, @intCast(tcb_idx6));
             if (fd6 < 0) {
                 _ = net_mod.tcp.tcpClose(@intCast(tcb_idx6));
-                return -1;
+                return fd6;
             }
             return fd6;
         }
@@ -127,6 +128,7 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
     if (domain != 2 or sock_type != 1) {
         // AF_INET + SOCK_RAW (type=3): raw packet socket
         if (domain == 2 and sock_type == 3) {
+            if (!cap_mod.hasSysCap(cur_idx, "cap_net_raw")) return -1; // EPERM
             // Allocate raw socket fd
             // v53.49: Use allocFd() O(1) bitmap instead of duplicated linear scan
             const fd_slot = t.fd_table.allocFd() orelse return -24; // EMFILE
@@ -145,7 +147,7 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
     const fd = allocTcpFd(&t.fd_table, @intCast(tcb_idx));
     if (fd < 0) {
         _ = net_mod.tcp.tcpClose(@intCast(tcb_idx));
-        return -1;
+        return fd;
     }
     return fd;
 }
@@ -266,7 +268,7 @@ pub fn accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) i64 {
         const new_fd = allocUnixFd(&t.fd_table, @intCast(new_sock_idx));
         if (new_fd < 0) {
             net_mod.unix_socket.unixClose(@intCast(new_sock_idx));
-            return -1;
+            return new_fd;
         }
         return @as(i64, @as(i64, new_fd));
     }
@@ -279,7 +281,7 @@ pub fn accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) i64 {
     const new_fd = allocTcpFd(&t.fd_table, @intCast(new_tcb_idx));
     if (new_fd < 0) {
         _ = net_mod.tcp.tcpClose(@intCast(new_tcb_idx));
-        return -1;
+        return new_fd;
     }
     // SK-78: optionally fill peer sockaddr (IPv4 or IPv6).
     if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000 and

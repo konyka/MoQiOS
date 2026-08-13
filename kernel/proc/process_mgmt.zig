@@ -68,7 +68,7 @@ pub fn pipe(pipefd_ptr: u64) i64 {
     if (sched_mod.currentTaskIndex()) |cur_idx| {
         if (task_mod.getTask(cur_idx)) |cur| {
             const result = cur.fd_table.createPipe();
-            if (result < 0) return -1;
+            if (result < 0) return result;
             const read_fd: u32 = @intCast(result & 0xFFFF);
             const write_fd: u32 = @intCast(@as(u64, @intCast(result)) >> 16);
 

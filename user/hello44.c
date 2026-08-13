@@ -147,7 +147,7 @@ static void rr_child(int64_t my_off, int64_t peer_off) {
     if (syscall1(SYS_SCHED_GETSCHEDULER, 0) != SCHED_RR) syscall1(SYS_EXIT, 21);
 
     int64_t fdr = syscall3(SYS_OPEN, (uint64_t)"/tmp/rt44rr", 0, 0);
-    int64_t fdw = syscall3(SYS_OPEN, (uint64_t)"/tmp/rt44rr", O_WRONLY_CREAT, 0);
+    int64_t fdw = syscall3(SYS_OPEN, (uint64_t)"/tmp/rt44rr", O_WRONLY_CREAT, 0666);
     if (fdr < 0 || fdw < 0) syscall1(SYS_EXIT, 22);
 
     uint32_t peer_seen = 0;
@@ -212,7 +212,7 @@ void _start(void) {
 
     /* ── (b) FIFO child preempts OTHER busy loop ────────────────────── */
     {
-        int64_t fdw = syscall3(SYS_OPEN, (uint64_t)"/tmp/rt44fifo", O_WRONLY_CREAT, 0);
+        int64_t fdw = syscall3(SYS_OPEN, (uint64_t)"/tmp/rt44fifo", O_WRONLY_CREAT, 0666);
         if (fdw < 0) fail("open rt44fifo");
         uint32_t zero = 0;
         if (syscall4(SYS_PWRITE, (uint64_t)fdw, (uint64_t)&zero, 4, 0) != 4)
@@ -238,7 +238,7 @@ void _start(void) {
 
     /* ── (c) two RR children share the CPU ──────────────────────────── */
     {
-        int64_t fdw = syscall3(SYS_OPEN, (uint64_t)"/tmp/rt44rr", O_WRONLY_CREAT, 0);
+        int64_t fdw = syscall3(SYS_OPEN, (uint64_t)"/tmp/rt44rr", O_WRONLY_CREAT, 0666);
         if (fdw < 0) fail("open rt44rr");
         uint32_t zeros[2] = { 0, 0 };
         if (syscall4(SYS_PWRITE, (uint64_t)fdw, (uint64_t)zeros, 8, 0) != 8)

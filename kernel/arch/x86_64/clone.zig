@@ -44,7 +44,6 @@ pub const ParentRegs = struct {
 
 // ── COW page-table duplication ───────────────────────────────────────
 
-
 /// Check if a 4096-byte page is entirely zero.
 fn isZeroPage(page: [*]const u8) bool {
     const words: [*]const u64 = @ptrCast(@alignCast(page));
@@ -181,11 +180,15 @@ pub fn clone(
         child_pml4,
         parent.tid,
         false, // inherit general affinity
+        @import("../../proc/capability_profile.zig").default_user_profile,
     ) orelse {
         @import("../../mm/user_space.zig").destroyUserSpace(child_pml4);
         return -12;
     };
     const child = task_mod.getTask(child_idx).?;
+    child.nofile_cur = parent.nofile_cur;
+    child.nofile_max = parent.nofile_max;
+    child.fd_table.alloc_limit = child.nofile_cur;
 
     child.brk_current = parent.brk_current;
     child.stack_limit = parent.stack_limit;
@@ -234,6 +237,11 @@ pub fn clone(
     child.egid = parent.egid;
     child.suid = parent.suid;
     child.sgid = parent.sgid;
+    child.umask_val = @import("../../proc/creation_metadata.zig").inheritedTaskUmask(parent.umask_val);
+    child.effective_caps = parent.effective_caps;
+    child.permitted_caps = parent.permitted_caps;
+    child.inheritable_caps = parent.inheritable_caps;
+    child.initial_init = false;
 
     // Set up child's execution context
     const child_stack_top = child.kernel_stack_top;

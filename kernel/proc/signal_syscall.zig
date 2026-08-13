@@ -327,12 +327,16 @@ pub fn signalfd4(old_fd: u64, mask: u64, sizemask: u64, flags: u64) i64 {
     const eventfd_mod = @import("../fs/eventfd.zig");
     const efd_idx = eventfd_mod.eventfdCreate(0);
     if (efd_idx < 0) return @as(i64, efd_idx);
+    const eventfd_idx: u32 = @intCast(efd_idx);
+    var installed = false;
+    defer if (!installed) eventfd_mod.eventfdClose(eventfd_idx);
 
     const cur_idx = sched.currentTaskIndex() orelse return -3;
     const cur = task_mod.getTask(cur_idx) orelse return -3;
 
     const slot = cur.fd_table.allocFd() orelse return -24;
-    cur.fd_table.fds[slot] = .{ .fd_type = .eventfd, .eventfd_idx = @intCast(efd_idx) };
+    cur.fd_table.fds[slot] = .{ .fd_type = .eventfd, .eventfd_idx = eventfd_idx };
+    installed = true;
     return @bitCast(@as(u64, slot));
 }
 

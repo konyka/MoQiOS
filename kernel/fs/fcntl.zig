@@ -24,17 +24,10 @@ pub const O_APPEND: u32 = 0x400;
 
 /// Duplicate fd to lowest available slot >= min_fd, with given fd_flags.
 /// Returns new fd or negative errno.
-fn dupFd(fd_table: *vfs.FdTable, fd: u32, min_fd: u32, new_flags: u32) i64 {
-    if (min_fd >= vfs.MAX_FDS) return -22; // EINVAL
-    // v53.50: Use free_bm bitmap — find first free slot >= min_fd (O(1)).
-    // Previously used linear scan (fds[slot].fd_type == .none) which bypassed
-    // the bitmap, causing allocFd() to later return the same slot.
-    const min_shift: u6 = @intCast(min_fd);
-    const mask: u64 = ~((@as(u64, 1) << min_shift) - 1);
-    const avail = fd_table.free_bm & mask;
-    if (avail == 0) return -24; // EMFILE
-    const slot: u6 = @truncate(@ctz(avail));
-    fd_table.free_bm &= ~(@as(u64, 1) << slot);
+fn dupFd(fd_table: *vfs.FdTable, fd: u32, min_fd: u64, new_flags: u32) i64 {
+    if (!@import("../proc/rlimit.zig").Policy.dupMinimumValid(fd_table.alloc_limit, min_fd, vfs.MAX_FDS)) return -22; // EINVAL
+    const min_fd_u32: u32 = @intCast(min_fd);
+    const slot = fd_table.allocFdAtLeast(min_fd_u32) orelse return -24; // EMFILE
     fd_table.fds[slot] = fd_table.fds[fd];
     fd_table.fds[slot].fd_flags = new_flags;
     // Increment pipe ref count if it's a pipe
@@ -59,8 +52,7 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
 
     switch (cmd) {
         F_DUPFD => {
-            const min_fd: u32 = @truncate(arg);
-            return dupFd(&t.fd_table, fd, min_fd, 0);
+            return dupFd(&t.fd_table, fd, arg, 0);
         },
         F_GETFD => {
             return @intCast(t.fd_table.fds[fd].fd_flags);
@@ -81,8 +73,7 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
             return 0;
         },
         F_DUPFD_CLOEXEC => {
-            const min_fd: u32 = @truncate(arg);
-            return dupFd(&t.fd_table, fd, min_fd, FD_CLOEXEC);
+            return dupFd(&t.fd_table, fd, arg, FD_CLOEXEC);
         },
         F_GETLK, F_SETLK, F_SETLKW => {
             const file_lock = @import("file_lock.zig");

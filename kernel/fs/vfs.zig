@@ -17,6 +17,8 @@ const str = @import("../lib/str.zig");
 const writeback = @import("writeback.zig");
 const page_cache = @import("page_cache.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+const SysCap = @import("../proc/capability_profile.zig").SysCap;
+const RlimitPolicy = @import("../proc/rlimit.zig").Policy;
 
 /// SK-39: non-x86 bring-up exercises no fd-based syscalls, and the per-fd
 /// descriptor array dominates what is left of Task after SK-37/38. Keep a
@@ -273,6 +275,8 @@ pub const FdTable = struct {
     /// SK-39: bits >= MAX_FDS stay clear so allocFd never returns an
     /// out-of-range slot when the table is arch-slimmed.
     free_bm: u64 = FREE_BM_ALL, // bits 0-2 clear (stdin/stdout/stderr occupied)
+    /// Mirrored from the owning Task so every allocator path shares the limit.
+    alloc_limit: u64 = MAX_FDS,
 
     const FREE_BM_ALL: u64 = blk: {
         const in_range: u64 = if (MAX_FDS >= 64) ~@as(u64, 0) else (@as(u64, 1) << MAX_FDS) - 1;
@@ -302,13 +306,37 @@ pub const FdTable = struct {
         @memcpy(out[0..@sizeOf(FdTable)], src[0..@sizeOf(FdTable)]);
     }
 
-    /// Allocate a free fd slot — O(1) via @ctz on the free bitmap.
-    /// Returns the slot index or null if none available.
+    /// Allocate the lowest free fd slot at or above min_fd. The table's
+    /// alloc_limit is the owning task's soft NOFILE limit.
     pub fn allocFd(self: *FdTable) ?u32 {
-        if (self.free_bm == 0) return null;
-        const slot: u6 = @truncate(@ctz(self.free_bm));
-        self.free_bm &= ~(@as(u64, 1) << slot);
-        return @intCast(slot);
+        return self.allocFdAtLeast(0);
+    }
+
+    pub fn allocFdAtLeast(self: *FdTable, min_fd: u32) ?u32 {
+        const slot = RlimitPolicy.allocationCandidate(self.free_bm, min_fd, self.alloc_limit, MAX_FDS) orelse return null;
+        self.free_bm &= ~(@as(u64, 1) << @intCast(slot));
+        return slot;
+    }
+
+    pub fn openFdCount(self: *const FdTable) u64 {
+        return @popCount(~self.free_bm & if (MAX_FDS >= 64) ~@as(u64, 0) else (@as(u64, 1) << MAX_FDS) - 1);
+    }
+
+    /// Reserve a dup2-style explicit target below the owning task's NOFILE
+    /// bound. A target reserved by allocFdAtLeast is accepted as-is.
+    pub fn reserveFdForDup2(self: *FdTable, fd: u32) bool {
+        if (!RlimitPolicy.fdAllowed(self.alloc_limit, fd, MAX_FDS)) return false;
+        const bit = @as(u64, 1) << @intCast(fd);
+        const already_open = self.fds[fd].fd_type != .none;
+        const already_reserved = self.free_bm & bit == 0;
+        if (already_open) {
+            _ = self.close(fd);
+            self.free_bm &= ~bit;
+            return true;
+        }
+        if (already_reserved) return true;
+        self.free_bm &= ~bit;
+        return true;
     }
 
     /// Release an fd slot back to the free pool. Called by close() and
@@ -319,7 +347,17 @@ pub const FdTable = struct {
 
     /// Open a file by name. Returns fd index or -1 on failure.
     pub fn open(self: *FdTable, name: []const u8, flags: u32) i64 {
-        const slot = self.allocFd() orelse return -1;
+        return self.openWithCredentials(name, flags, 0, 0, .{});
+    }
+
+    /// Credential-aware open used by user open/truncate. Credentials affect
+    /// only existing tmpfs regular files; all other routing is unchanged.
+    pub fn openWithCredentials(self: *FdTable, name: []const u8, flags: u32, euid: u32, egid: u32, effective_caps: SysCap) i64 {
+        return self.openWithCreationCredentials(name, flags, null, @import("../proc/creation_metadata.zig").DEFAULT_UMASK, euid, egid, effective_caps);
+    }
+
+    pub fn openWithCreationCredentials(self: *FdTable, name: []const u8, flags: u32, requested_mode: ?u32, umask_val: u32, euid: u32, egid: u32, effective_caps: SysCap) i64 {
+        const slot = self.allocFd() orelse return -24; // EMFILE
 
         const is_writable = (flags & 0x03) != 0;
         const o_creat = (flags & 0x40) != 0;
@@ -372,10 +410,9 @@ pub const FdTable = struct {
         if (name.len >= 4 and name[0] == '/' and name[1] == 't' and name[2] == 'm' and name[3] == 'p') {
             const tmpfs = @import("tmpfs.zig");
             const is_dir = o_creat and (flags & 0o100000) != 0; // O_DIRECTORY
-            const result = tmpfs.tmpfsOpen(name, o_creat, is_dir);
+            const result = tmpfs.tmpfsOpenAuthorized(name, o_creat, is_dir, euid, egid, effective_caps, flags, requested_mode, umask_val);
             if (result >= 0) {
                 const idx: u32 = @intCast(result);
-                if (o_trunc and is_writable) _ = tmpfs.tmpfsTruncate(@intCast(idx), 0);
                 self.fds[slot] = .{
                     .fd_type = .tmpfs_file,
                     .offset = 0,
@@ -387,7 +424,7 @@ pub const FdTable = struct {
                 return @intCast(slot);
             }
             self.freeFd(slot);
-            return -1;
+            return result;
         }
 
         // ---- procfs paths ----
@@ -566,6 +603,7 @@ pub const FdTable = struct {
     pub fn read(self: *FdTable, fd: u32, buf: [*]u8, count: usize) i64 {
         if (fd >= MAX_FDS) return -1;
         const desc = &self.fds[fd];
+        if (!@import("dac.zig").descriptorCanRead(desc.status_flags)) return -9; // EBADF
 
         switch (desc.fd_type) {
             .none => return -1, // EBADF
@@ -832,6 +870,7 @@ pub const FdTable = struct {
     pub fn readAtOffset(self: *FdTable, fd: u32, buf: [*]u8, count: usize, offset: u64) i64 {
         if (fd >= MAX_FDS) return -9; // EBADF
         const desc = &self.fds[fd];
+        if (!@import("dac.zig").descriptorCanRead(desc.status_flags)) return -9; // EBADF
 
         switch (desc.fd_type) {
             .none => return -9, // EBADF
@@ -1040,20 +1079,20 @@ pub const FdTable = struct {
         return 0;
     }
 
-    /// Create a pipe. Returns read_fd in low 16 bits, write_fd in high 16 bits, or -1 on error.
+    /// Create a pipe. Returns read_fd in low 16 bits, write_fd in high 16 bits, or -errno.
     pub fn createPipe(self: *FdTable) i64 {
         const pipe_idx = allocPipe() orelse return -1;
 
         const read_fd = self.allocFd() orelse {
             pipeClose(pipe_idx, false);
             pipeClose(pipe_idx, true);
-            return -1;
+            return -24; // EMFILE
         };
         const write_fd = self.allocFd() orelse {
             self.freeFd(read_fd);
             pipeClose(pipe_idx, false);
             pipeClose(pipe_idx, true);
-            return -1;
+            return -24; // EMFILE
         };
 
         self.fds[read_fd] = .{ .fd_type = .pipe_read, .pipe_idx = pipe_idx };
@@ -1061,17 +1100,17 @@ pub const FdTable = struct {
         return @as(i64, read_fd) | (@as(i64, write_fd) << 16);
     }
 
-    /// Duplicate fd: dup2(oldfd, newfd). Returns newfd on success, -1 on error.
+    /// Duplicate fd: dup2(oldfd, newfd). Returns newfd on success or -errno.
     pub fn dup2(self: *FdTable, oldfd: u32, newfd: u32) i64 {
-        if (oldfd >= MAX_FDS or newfd >= MAX_FDS) return -1;
-        if (self.fds[oldfd].fd_type == .none) return -1;
-        if (newfd == oldfd) return newfd;
-        // Close newfd if open
-        if (self.fds[newfd].fd_type != .none) {
-            _ = self.close(newfd);
+        const old_valid = oldfd < MAX_FDS and self.fds[oldfd].fd_type != .none;
+        switch (RlimitPolicy.dupExplicit(old_valid, oldfd, newfd, self.alloc_limit, MAX_FDS)) {
+            .bad_old => return -1,
+            .no_op => return newfd,
+            .bad_target => return -9, // EBADF
+            .replace => {},
         }
+        if (!self.reserveFdForDup2(newfd)) return -9; // EBADF
         self.fds[newfd] = self.fds[oldfd];
-        self.free_bm &= ~(@as(u64, 1) << @intCast(newfd)); // v53.49: mark newfd occupied
         // Increment pipe ref count if it's a pipe
         if (self.fds[newfd].fd_type == .pipe_read or self.fds[newfd].fd_type == .pipe_write) {
             if (self.fds[newfd].pipe_idx < 16) {

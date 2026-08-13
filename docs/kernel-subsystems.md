@@ -11,6 +11,13 @@
 >
 > **2026-06-21 新增功能**: 调度器 Profiling 基础设施（§2.8）、IPv6 协议栈（§4.10–4.12）、
 > POSIX Capability 安全模型（§5.9）、Arch 抽象层（§11）。
+>
+> **2026-08-12 tmpfs 创建元数据**: `O_CREAT` 和 `mkdir` 新建的 tmpfs 普通文件或目录在
+> `tmpfs_lock` 内、发布前设置为调用任务的 `euid:egid`，权限为
+> `(requested_mode & 0777) & ~(umask & 0777)`。`umask` 为每任务状态，新任务默认 `022`，
+> fork/clone 继承；普通 `O_CREAT` 打开已有对象不修改元数据，`O_CREAT|O_EXCL` 打开已有
+> 对象返回 `-EEXIST` 且不执行 DAC、截断或引用计数变更。tmpfs 根目录、默认目录以及非
+> tmpfs 文件系统的创建元数据行为不变。
 
 ---
 

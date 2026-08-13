@@ -125,7 +125,7 @@ void _start(void) {
     }
     buf_addr = (uint64_t)region;
 
-    const int64_t fd = syscall3(SYS_OPEN, (uint64_t)"/tmp/race", O_WRONLY_CREAT, 0);
+    const int64_t fd = syscall3(SYS_OPEN, (uint64_t)"/tmp/race", O_WRONLY_CREAT, 0666);
     if (fd < 0) {
         print("hello36: FAIL (no file)\n");
         print("hello36 done\n");

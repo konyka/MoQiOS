@@ -9,7 +9,6 @@
 ///
 /// For M4, capabilities are simple tokens. Full capability
 /// derivation (mint, restrict) comes in M5+.
-
 const task = @import("../proc/task.zig");
 
 /// Capability rights (bitmask).
@@ -113,53 +112,9 @@ pub fn init() void {
 // the Linux capability(7) model.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// POSIX-style system capabilities (Linux-compatible bitmask).
-pub const SysCap = packed struct(u32) {
-    cap_net_raw: bool = false,
-    cap_net_bind: bool = false,
-    cap_sys_admin: bool = false,
-    cap_sys_ptrace: bool = false,
-    cap_kill: bool = false,
-    cap_setuid: bool = false,
-    cap_setgid: bool = false,
-    cap_chown: bool = false,
-    cap_dac_override: bool = false,
-    cap_fowner: bool = false,
-    cap_mknod: bool = false,
-    cap_sys_mount: bool = false,
-    cap_sys_reboot: bool = false,
-    cap_sys_resource: bool = false,
-    cap_net_admin: bool = false,
-    cap_ipc_lock: bool = false,
-    /// Raw device access: dev_map_mmio / dev_irq_* / dev_dma_* and /dev/pci
-    /// (L1 user driver framework).
-    cap_sys_rawio: bool = false,
-    _pad: u15 = 0,
-};
-
-/// All capabilities enabled (for init/root processes).
-pub const ALL_CAPS: SysCap = .{
-    .cap_net_raw = true,
-    .cap_net_bind = true,
-    .cap_sys_admin = true,
-    .cap_sys_ptrace = true,
-    .cap_kill = true,
-    .cap_setuid = true,
-    .cap_setgid = true,
-    .cap_chown = true,
-    .cap_dac_override = true,
-    .cap_fowner = true,
-    .cap_mknod = true,
-    .cap_sys_mount = true,
-    .cap_sys_reboot = true,
-    .cap_sys_resource = true,
-    .cap_net_admin = true,
-    .cap_ipc_lock = true,
-    .cap_sys_rawio = true,
-};
-
-/// No capabilities (for unprivileged processes).
-pub const NO_CAPS: SysCap = .{};
+pub const SysCap = @import("../proc/capability_profile.zig").SysCap;
+pub const ALL_CAPS = @import("../proc/capability_profile.zig").ALL_CAPS;
+pub const NO_CAPS = @import("../proc/capability_profile.zig").NO_CAPS;
 
 /// Check if a task has a specific system capability (queries the effective set).
 /// `field` is the field name on `SysCap`, e.g. "cap_kill".

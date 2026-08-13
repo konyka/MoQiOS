@@ -454,6 +454,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
     prepareSyscallCpu();
     const syscall_nr = frame.rax;
 
+    if (dispatchLinuxRlimitAlias(frame, syscall_nr)) return;
+
     switch (syscall_nr) {
         1 => {
             syscallWrite(frame);
@@ -750,8 +752,17 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallDup(@truncate(frame.rdi)));
         },
         161 => { // dup3(oldfd, newfd, flags)
+            const O_CLOEXEC: u64 = 0x80000;
+            if (frame.rdi == frame.rsi) {
+                frame.rax = @bitCast(errno.EINVAL);
+                return;
+            }
+            if (frame.rdx & ~O_CLOEXEC != 0) {
+                frame.rax = @bitCast(errno.EINVAL);
+                return;
+            }
             const dup_result = proc_mgmt_mod.dup2(@intCast(frame.rdi), @intCast(frame.rsi));
-            if (dup_result >= 0 and (frame.rdx & 0x80000) != 0) { // O_CLOEXEC
+            if (dup_result >= 0 and (frame.rdx & O_CLOEXEC) != 0) {
                 const sched_mod = @import("../../proc/sched.zig");
                 const task_mod3 = @import("../../proc/task.zig");
                 const cur_idx2 = sched_mod.currentTaskIndex() orelse {
@@ -763,7 +774,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                     return;
                 };
                 const newfd2: u32 = @intCast(dup_result);
-                if (newfd2 < 32) {
+                if (newfd2 < vfs_mod.MAX_FDS) {
                     cur2.fd_table.fds[newfd2].fd_flags = 1;
                 }
             }
@@ -1209,7 +1220,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         // ── v33.5: *at() variants ────────────────────────────────────
         255 => { // openat(dirfd, pathname, flags, mode)
             _ = frame.rdi; // dirfd: simplified, ignore dirfd, use cwd
-            frame.rax = @bitCast(file_io_mod.open(frame.rsi, @truncate(frame.rdx)));
+            frame.rax = @bitCast(file_io_mod.openWithMode(frame.rsi, @truncate(frame.rdx), @truncate(frame.r10)));
         },
         256 => { // unlinkat(dirfd, pathname, flags)
             _ = frame.rdi;
@@ -1217,8 +1228,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         257 => { // mkdirat(dirfd, pathname, mode)
             _ = frame.rdi;
-            _ = frame.rdx;
-            frame.rax = @bitCast(dir_ops_mod.mkdir(frame.rsi));
+            frame.rax = @bitCast(dir_ops_mod.mkdirWithMode(frame.rsi, @truncate(frame.rdx)));
         },
         // ── v33.6: more *at() variants ───────────────────────────────
         258 => { // faccessat(dirfd, pathname, mode, flags)
@@ -1690,15 +1700,16 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallRename(frame.rdi, frame.rsi));
         },
         83 => { // mkdir(pathname, mode)
-            _ = frame.rsi; // mode ignored
-            frame.rax = @bitCast(dir_ops_mod.mkdir(frame.rdi));
+            frame.rax = @bitCast(dir_ops_mod.mkdirWithMode(frame.rdi, @truncate(frame.rsi)));
         },
         84 => { // rmdir(pathname) — delegate to unlink for dirs
             frame.rax = @bitCast(unlink_mod.unlink(frame.rdi));
         },
         85 => { // creat(pathname, mode)
-            _ = frame.rsi; // mode
-            frame.rax = @bitCast(file_io_mod.open(frame.rdi, 0));
+            const O_WRONLY: u32 = 0x1;
+            const O_CREAT: u32 = 0x40;
+            const O_TRUNC: u32 = 0x200;
+            frame.rax = @bitCast(file_io_mod.openWithMode(frame.rdi, O_WRONLY | O_CREAT | O_TRUNC, @truncate(frame.rsi)));
         },
         87 => { // unlink(pathname)
             frame.rax = @bitCast(unlink_mod.unlink(frame.rdi));
@@ -2452,6 +2463,19 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
     }
 }
 
+fn dispatchLinuxRlimitAlias(frame: *SyscallFrame, syscall_nr: u64) bool {
+    const sched = @import("../../proc/sched.zig");
+    const current = sched.currentTask() orelse return false;
+    const policy = @import("../../proc/rlimit.zig").Policy;
+    const alias = policy.linuxAlias(current.personality == .linux, syscall_nr) orelse return false;
+
+    frame.rax = @bitCast(switch (alias) {
+        .setrlimit => syscallSetrlimit(@truncate(frame.rdi), frame.rsi),
+        .prlimit64 => syscallPrlimit64(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, frame.r10),
+    });
+    return true;
+}
+
 /// Syscall #1: write(fd, buf, count)
 /// Routes through VFS: stdout/stderr → serial, other fds → VFS write.
 fn syscallWrite(frame: *SyscallFrame) void {
@@ -2499,7 +2523,7 @@ fn syscallMmap(frame: *SyscallFrame) void {
 /// RDI = filename pointer in user space, RSI = flags, RDX = mode
 /// Returns fd on success, -1 on failure.
 fn syscallOpen(frame: *SyscallFrame) void {
-    frame.rax = @bitCast(file_io_mod.open(frame.rdi, @truncate(frame.rsi)));
+    frame.rax = @bitCast(file_io_mod.openWithMode(frame.rdi, @truncate(frame.rsi), @truncate(frame.rdx)));
 }
 
 /// Syscall #10: read(fd, buf, count)
@@ -2813,10 +2837,18 @@ fn syscallKill(frame: *SyscallFrame) void {
 }
 
 fn syscallNetSend(frame: *SyscallFrame) void {
+    if (!checkCapForCurrent("cap_net_raw")) {
+        frame.rax = @bitCast(@as(i64, -1)); // EPERM
+        return;
+    }
     frame.rax = @bitCast(raw_net_mod.netSend(frame.rdi, frame.rsi));
 }
 
 fn syscallNetRecv(frame: *SyscallFrame) void {
+    if (!checkCapForCurrent("cap_net_raw")) {
+        frame.rax = @bitCast(@as(i64, -1)); // EPERM
+        return;
+    }
     frame.rax = @bitCast(raw_net_mod.netRecv(frame.rdi, frame.rsi));
 }
 
@@ -3040,10 +3072,10 @@ fn syscallRecvfrom(frame: *SyscallFrame) void {
 
 /// Syscall #123: mkdir(path, mode)
 /// RDI = path pointer (user space)
-/// RSI = mode (ignored, always 0777 for dirs)
+/// RSI = requested mode
 /// Returns 0 on success, -1 on failure.
 fn syscallMkdir(frame: *SyscallFrame) void {
-    frame.rax = @bitCast(dir_ops_mod.mkdir(frame.rdi));
+    frame.rax = @bitCast(dir_ops_mod.mkdirWithMode(frame.rdi, @truncate(frame.rsi)));
 }
 
 /// Syscall #124: connect(fd, addr_ptr, addr_len)
@@ -3100,7 +3132,7 @@ fn syscallAccess(pathname_ptr: u64, mode: u32) i64 {
     // F_OK: just check existence
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = tm.getTask(cur_idx) orelse return -1;
-    const fd_result = cur.fd_table.open(name, 0);
+    const fd_result = cur.fd_table.openWithCredentials(name, 0, cur.euid, cur.egid, cur.effective_caps);
     if (fd_result >= 0) {
         const fd: u32 = @intCast(fd_result);
         _ = cur.fd_table.close(fd);
@@ -3224,8 +3256,8 @@ fn syscallTruncate(path_ptr: u64, length: u64) i64 {
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = tm.getTask(cur_idx) orelse return -1;
     // O_WRONLY (0x01): truncate requires write access to the file.
-    const fd_result = cur.fd_table.open(name, 1);
-    if (fd_result < 0) return -2; // ENOENT
+    const fd_result = cur.fd_table.openWithCredentials(name, 1, cur.euid, cur.egid, cur.effective_caps);
+    if (fd_result < 0) return fd_result;
     const fd: u32 = @intCast(fd_result);
     const result = truncateDesc(&cur.fd_table.fds[fd], length);
     _ = cur.fd_table.close(fd);
@@ -3378,8 +3410,12 @@ fn syscallGetrlimit(resource: u32, rlim_ptr: u64) i64 {
     var rlim: Rlimit = .{};
     switch (resource) {
         RLIMIT_NOFILE => {
-            rlim.rlim_cur = vfs_mod.MAX_FDS;
-            rlim.rlim_max = vfs_mod.MAX_FDS;
+            const sched = @import("../../proc/sched.zig");
+            const tm = @import("../../proc/task.zig");
+            const idx = sched.currentTaskIndex() orelse return -3;
+            const task = tm.getTask(idx) orelse return -3;
+            rlim.rlim_cur = task.nofile_cur;
+            rlim.rlim_max = task.nofile_max;
         },
         RLIMIT_STACK => {
             rlim.rlim_cur = 8 * 1024 * 1024; // 8MB
@@ -3408,22 +3444,43 @@ fn syscallGetrlimit(resource: u32, rlim_ptr: u64) i64 {
 /// setrlimit(resource, rlim_ptr) — set resource limit.
 /// Simplified: accept but don't enforce (return 0).
 fn syscallSetrlimit(resource: u32, rlim_ptr: u64) i64 {
-    _ = resource;
     if (rlim_ptr == 0 or rlim_ptr >= 0x0000_8000_0000_0000) return -14;
-    // Accept the limit — enforcement is a future enhancement
+    const copy = @import("../../mm/copy_from_user.zig");
+    const bo = @import("../../lib/byte_order.zig");
+    var buf: [16]u8 = undefined;
+    if (copy.copyFromUser(&buf, @ptrFromInt(rlim_ptr), 16) != 16) return -14;
+    if (resource != RLIMIT_NOFILE) return 0;
+    const next = @import("../../proc/rlimit.zig").Limit{ .cur = bo.readU64At(&buf, 0), .max = bo.readU64At(&buf, 8) };
+    const sched = @import("../../proc/sched.zig");
+    const tm = @import("../../proc/task.zig");
+    const idx = sched.currentTaskIndex() orelse return -3;
+    const policy = @import("../../proc/rlimit.zig").Policy;
+    const lock_flags = tm.lockTask();
+    defer tm.unlockTask(lock_flags);
+    const task = tm.getTask(idx) orelse return -3;
+    const privileged = @field(task.effective_caps, "cap_sys_resource");
+    const applied = policy.apply(.{ .cur = task.nofile_cur, .max = task.nofile_max }, next, vfs_mod.MAX_FDS, privileged) catch |err| return switch (err) {
+        error.InvalidLimit => -22,
+        error.WouldLowerHardLimit => -1,
+    };
+    task.nofile_cur = applied.cur;
+    task.nofile_max = applied.max;
+    task.fd_table.alloc_limit = applied.cur;
     return 0;
 }
 
 // ── v32.5: umask / sysinfo / prctl ──────────────────────────────────
 
-/// Global umask (per-kernel, not per-process for simplicity).
-var global_umask: u32 = 0o022;
-
 /// umask(mask) — set file creation mask. Returns previous mask.
 fn syscallUmask(mask: u32) i64 {
-    const old = global_umask;
-    global_umask = mask & 0o777;
-    return @intCast(old);
+    const sched_mod = @import("../../proc/sched.zig");
+    const task_mod = @import("../../proc/task.zig");
+    const policy = @import("../../proc/creation_metadata.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse return -3;
+    const lock_flags = task_mod.lockTask();
+    defer task_mod.unlockTask(lock_flags);
+    const cur = task_mod.getTask(cur_idx) orelse return -3;
+    return @intCast(policy.replaceTaskUmask(&cur.umask_val, mask));
 }
 
 /// sysinfo(info_ptr) — system information.
@@ -4012,56 +4069,65 @@ fn syscallChroot(path_ptr: u64) i64 {
 fn syscallPrlimit64(pid: u32, resource: u32, new_limit_ptr: u64, old_limit_ptr: u64) i64 {
     const copy = @import("../../mm/copy_from_user.zig");
     const bo = @import("../../lib/byte_order.zig");
-
-    // Resolve target task (pid=0 → current) — validates pid exists
     const tm = @import("../../proc/task.zig");
     const sched_mod = @import("../../proc/sched.zig");
-    if (pid != 0) {
-        var found = false;
-        var i: u32 = 0;
-        while (i < tm.MAX_TASKS) : (i += 1) {
-            if (tm.getTask(i)) |t| {
-                if (t.tid == pid and t.state != .zombie) {
-                    found = true;
-                    break;
-                }
-            }
-        }
-        if (!found) return -3; // ESRCH
-    } else {
-        if (sched_mod.currentTaskIndex() == null) return -3;
-    }
+    const caller_idx = sched_mod.currentTaskIndex() orelse return -3;
+    var target_tid: u32 = 0;
+    var old_limit: Rlimit = .{};
+    var privileged = false;
+    {
+        const lock_flags = tm.lockTask();
+        defer tm.unlockTask(lock_flags);
+        const caller = tm.getTask(caller_idx) orelse return -3;
+        target_tid = if (pid == 0) caller.tid else pid;
+        const target_idx = tm.findTaskByTidLocked(target_tid) orelse return -3;
+        const target = tm.getTask(target_idx) orelse return -3;
+        if (target_tid != caller.tid and !@field(caller.effective_caps, "cap_sys_resource")) return -1;
+        privileged = @field(caller.effective_caps, "cap_sys_resource");
 
-    // Read old limit before writing new one
-    if (old_limit_ptr != 0 and old_limit_ptr < 0x0000_8000_0000_0000) {
-        var rlim: Rlimit = .{};
         switch (resource) {
             RLIMIT_NOFILE => {
-                rlim.rlim_cur = vfs_mod.MAX_FDS;
-                rlim.rlim_max = vfs_mod.MAX_FDS;
+                old_limit.rlim_cur = target.nofile_cur;
+                old_limit.rlim_max = target.nofile_max;
             },
             RLIMIT_STACK => {
-                rlim.rlim_cur = 8 * 1024 * 1024;
-                rlim.rlim_max = 8 * 1024 * 1024;
+                old_limit.rlim_cur = 8 * 1024 * 1024;
+                old_limit.rlim_max = 8 * 1024 * 1024;
             },
             else => {
-                rlim.rlim_cur = RLIM_INFINITY;
-                rlim.rlim_max = RLIM_INFINITY;
+                old_limit.rlim_cur = RLIM_INFINITY;
+                old_limit.rlim_max = RLIM_INFINITY;
             },
         }
+    }
+
+    if (old_limit_ptr != 0) {
+        if (old_limit_ptr >= 0x0000_8000_0000_0000) return -14;
         var buf: [16]u8 = undefined;
-        bo.writeU64Le(buf[0..8], rlim.rlim_cur);
-        bo.writeU64Le(buf[8..16], rlim.rlim_max);
+        bo.writeU64Le(buf[0..8], old_limit.rlim_cur);
+        bo.writeU64Le(buf[8..16], old_limit.rlim_max);
         if (copy.copyToUser(@ptrFromInt(old_limit_ptr), &buf, 16) != 16) return -14;
     }
 
-    // Accept new limit (validation only — enforcement is a future enhancement)
-    if (new_limit_ptr != 0 and new_limit_ptr < 0x0000_8000_0000_0000) {
+    if (new_limit_ptr != 0) {
+        if (new_limit_ptr >= 0x0000_8000_0000_0000) return -14;
         var nbuf: [16]u8 = undefined;
-        _ = copy.copyFromUser(nbuf[0..], @ptrFromInt(new_limit_ptr), 16);
-        // Read and validate the new limits (accept all for now)
-        _ = bo.readU64At(&nbuf, 0); // rlim_cur
-        _ = bo.readU64At(&nbuf, 8); // rlim_max
+        if (copy.copyFromUser(nbuf[0..], @ptrFromInt(new_limit_ptr), 16) != 16) return -14;
+        if (resource == RLIMIT_NOFILE) {
+            const next = @import("../../proc/rlimit.zig").Limit{ .cur = bo.readU64At(&nbuf, 0), .max = bo.readU64At(&nbuf, 8) };
+            const policy = @import("../../proc/rlimit.zig").Policy;
+            const lock_flags = tm.lockTask();
+            defer tm.unlockTask(lock_flags);
+            const target_idx = tm.findTaskByTidLocked(target_tid) orelse return -3;
+            const target = tm.getTask(target_idx) orelse return -3;
+            const applied = policy.apply(.{ .cur = target.nofile_cur, .max = target.nofile_max }, next, vfs_mod.MAX_FDS, privileged) catch |err| return switch (err) {
+                error.InvalidLimit => -22,
+                error.WouldLowerHardLimit => -1,
+            };
+            target.nofile_cur = applied.cur;
+            target.nofile_max = applied.max;
+            target.fd_table.alloc_limit = applied.cur;
+        }
     }
     return 0;
 }
@@ -5287,7 +5353,7 @@ fn syscallDup(oldfd: u32) i64 {
     if (oldfd >= vfs_mod.MAX_FDS) return -9; // EBADF
     if (cur.fd_table.fds[oldfd].fd_type == .none) return -9; // EBADF
 
-    const newfd = cur.fd_table.allocFd() orelse return -24; // EMFILE
+    const newfd = cur.fd_table.allocFdAtLeast(0) orelse return -24; // EMFILE
     return cur.fd_table.dup2(oldfd, newfd);
 }
 

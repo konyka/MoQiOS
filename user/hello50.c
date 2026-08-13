@@ -165,7 +165,7 @@ static void worker(int w) {
     for (uint32_t iter = 0; iter < ITERS; iter++) {
         /* ── tmpfs ─────────────────────────────────────────────────── */
         fill_pat(fbuf, FILE_LEN / 8, w, iter);
-        int64_t fd = syscall3(SYS_OPEN, (uint64_t)path, O_RDWR_CREAT_TRUNC, 0);
+        int64_t fd = syscall3(SYS_OPEN, (uint64_t)path, O_RDWR_CREAT_TRUNC, 0666);
         if (fd < 0) worker_fail(w, "tmpfs open-w");
         if (syscall3(SYS_WRITE, (uint64_t)fd, (uint64_t)fbuf, FILE_LEN) != FILE_LEN)
             worker_fail(w, "tmpfs write");
