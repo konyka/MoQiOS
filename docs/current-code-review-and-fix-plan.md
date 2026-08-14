@@ -1953,6 +1953,23 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 
 ---
 
+### 6.28 P2 批次第三轮（2026-08-14）：PT_TLS `__thread` 支持（pthread v2 收官）
+
+- **设计**：x86-64 TLS variant II——FS（tp）指向 TCB（TCB[0]=self），程序 PT_TLS 模板的
+  每线程副本位于 tp 正下方 `align_up(memsz, align)` 字节；编译器 LE 模型（R_X86_64_TPOFF32）
+  以 tp 负偏移直接访问，无需 `__tls_get_addr` 运行时。
+- **内核零改动**：loader 早就在初始栈 auxv 写 AT_PHDR/AT_PHENT/AT_PHNUM；crt0 新增
+  `__moqi_tls_setup(sp)` 自行扫描 PT_TLS。
+- **libc 布局**：有 PT_TLS 时主线程从静态 main_tcb 改为动态 [TLS][TCB] 块（静态 TCB 无法
+  满足 tp 相对位置）；pthread_create 按 [TLS 块（align 对齐）][TCB][栈] 分配并逐线程复制
+  模板（filesz 拷贝 + memsz 清零）。无 PT_TLS 的程序保持原布局，行为不变。
+- **验收**：hello57 新增 __thread 块——.tdata（初值）与 .tbss（零值）各一变量，3 个线程
+  写不同值、忙等放大交错窗口后读回验证隔离，主线程原值不变；SMP=1/4 smoke 全绿。
+
+至此 pthread v2 三件套全部完成（detached 回收 6.25、CLONE_FILES 6.27、PT_TLS 6.28）。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:

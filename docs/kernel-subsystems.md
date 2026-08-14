@@ -705,9 +705,10 @@ const SchedStats = struct {
 - **API**：`pthread_create/join/exit/self`、`pthread_mutex_*`（glibc 风格 0/1/2 futex 状态机，无竞争零系统调用）、`pthread_once`（0/1/2 状态机）、`pthread_key_create/getspecific/setspecific`（32 keys）、每线程 `errno`（TCB 内）。
 - **内核配合**：`Task.is_thread`（CLONE_THREAD 置位）；`getpid()` 对线程汇报 tgid（创建者 tid）；`waitpidScanLocked`/`hasChildrenLocked` 跳过线程（线程经 pthread_join 汇合而非 waitpid）。
 - **性能设计**：mutex 快路径一次 `lock cmpxchg`；join 单次 futex 唤醒；TLS 一次安装后纯内存访问。
-- **v1 限制**：~~CLONE_FILES 真共享 fd 表未实现（创建时复制）~~（6.27 已实现）；`__thread`（PT_TLS）未实现，线程私有数据用 getspecific；~~detached 线程不 join 时栈描述符泄漏~~（v2 已回收，见下）。
+- **v1 限制**：~~CLONE_FILES 真共享 fd 表未实现（创建时复制）~~（6.27 已实现）；~~`__thread`（PT_TLS）未实现~~（6.28 已实现）；线程私有数据仍可用 getspecific；~~detached 线程不 join 时栈描述符泄漏~~（v2 已回收，见下）。
 - **v2（2026-08-13）**：`pthread_detach` + detached 栈惰性回收——退出线程把 TCB+栈块压入无锁死栈链（CAS push），下一次 `pthread_create` 排空 free（退出线程无法安全释放自己仍在运行的栈；压链后以纯寄存器内联 exit syscall，不再触碰本栈）。join-detached 与重复 detach 返回 EINVAL；join 与并发 detach 竞速时复见 detached 即放弃 free（所有权归死栈链，杜绝 double-free）。malloc/free 增加 test-and-set 自旋锁，多线程并发 create/join 不再竞争堆空闲链。验收：hello57 增加 8 detached + double-detach/join-detached EINVAL + 排空触发的断言组。
 - **v2 续（2026-08-13，CLONE_FILES）**：FdTable 从 Task 内嵌（约 57KB/任务）移入静态池（64 槽 + 原子位图），`Task.fd_table` 改为指针；表带原子引用计数，`clone(CLONE_FILES)` 共享指针（跳过复制与 retainSharedResources），`exitTask` 仅在末引用时关闭全部 fd 并归还池。fd 位图操作原子化（allocFdAtLeast 抢位循环 / freeFd 原子 Or），无表级锁；close 与并发使用的描述符内容竞态为记录的弱语义。pthread_create 加传 CLONE_FILES，线程组获得真共享 fd 表与共享 NOFILE 上限。验收：hello57 新增跨线程 fd 共享读 + close 后 EBADF 断言。
+- **v2 续（2026-08-14，PT_TLS/`__thread`）**：x86-64 TLS variant II——FS（tp）指向 TCB，程序 PT_TLS 模板的每线程副本位于 tp 正下方（编译器 LE 模型负偏移访问）。crt0 经 auxv（AT_PHDR/AT_PHENT/AT_PHNUM）发现 PT_TLS（`__moqi_tls_setup`），主线程改用动态 [TLS][TCB] 布局；pthread_create 按 [TLS 块][TCB][栈] 分配并逐线程复制模板。无 PT_TLS 的程序保持原布局。验收：hello57 的 .tdata/.tbss 隔离断言（3 线程写不同值读回 + 主线程原值不变）。
 - **验收**：hello57（4 线程 × 25000 次互斥自增 = 100000 全对、once 恰好一次、getspecific/errno 隔离、tgid 一致），SMP=1/4 smoke 通过。
 
 **TLS 基址是任务私有状态（2026-07-25 修正）**

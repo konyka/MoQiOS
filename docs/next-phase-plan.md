@@ -54,7 +54,7 @@
 
 ## P2：中期项（需要 1–2 个专项迭代）
 
-- pthread v2 三件套：~~detached 线程栈回收~~（✅ 6.25）、~~CLONE_FILES 真共享 fd 表~~（✅ 6.27，FdTable 池化 + 引用计数 + 原子位图）均完成；`__thread`（PT_TLS）仍待做（kernel-subsystems §2.5a，loader + crt0/pthread 布局调整）。
+- pthread v2 三件套：~~detached 线程栈回收~~（✅ 6.25）、~~CLONE_FILES 真共享 fd 表~~（✅ 6.27）、~~`__thread`（PT_TLS）~~（✅ 6.28，crt0 auxv 发现 + variant II 布局，内核零改动）——**全部完成**。
 - AHCI/SATA 实际 I/O 路径与 `io_sched.tryMerge` 验证（kernel-subsystems §6.4）——
   真机存储的前提。
 - tmpfs 单文件 256 KiB 上限扩容（user-space §7.1）。
