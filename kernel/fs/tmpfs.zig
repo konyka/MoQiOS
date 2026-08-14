@@ -11,7 +11,10 @@ const MAX_FILES = 64;
 const MAX_NAME_LEN = 60;
 const PAGES_PER_FILE = 64;
 const PAGE_SIZE = 4096;
-const MAX_FILE_SIZE = PAGES_PER_FILE * PAGE_SIZE; // 256KB
+/// 一级间接页：一页 4KB 存放 512 个 u64 物理地址（0 = 空洞），
+/// 单文件上限从 64 页（256 KiB）提升到 64+512 页（2.25 MiB）。
+const INDIRECT_PAGES = 512;
+const MAX_FILE_SIZE = (PAGES_PER_FILE + INDIRECT_PAGES) * PAGE_SIZE;
 
 const TmpfsEntry = struct {
     active: bool,
@@ -21,7 +24,9 @@ const TmpfsEntry = struct {
     parent_idx: u8, // 255 = root
     size: u32,
     pages: [PAGES_PER_FILE]?u64, // physical page addresses
-    page_count: u8,
+    page_count: u16, // 数据页数（不含间接页）；最大 576
+    /// 一级间接页物理地址（0 = 未分配）；覆盖页号 [64, 576)。
+    indirect: u64 = 0,
     mode: u32,
     uid: u32,
     gid: u32,
@@ -71,9 +76,55 @@ fn freeEntryPages(idx: u8) void {
             entry.pages[p] = null;
         }
     }
+    if (entry.indirect != 0) {
+        const table: [*]u64 = @ptrFromInt(hhdm.physToVirt(entry.indirect));
+        for (0..INDIRECT_PAGES) |s| {
+            if (table[s] != 0) pmm.freePage(table[s]);
+        }
+        pmm.freePage(entry.indirect);
+        entry.indirect = 0;
+    }
     entry.page_count = 0;
     entry.size = 0;
     bmClr(@intCast(idx));
+}
+
+/// 读取文件页 page_idx 的物理地址（0 = 空洞）。页号 >= 64 走一级间接页。
+fn pageAt(entry: *const TmpfsEntry, page_idx: u32) u64 {
+    if (page_idx < PAGES_PER_FILE) return entry.pages[page_idx] orelse 0;
+    const slot = page_idx - PAGES_PER_FILE;
+    if (slot >= INDIRECT_PAGES or entry.indirect == 0) return 0;
+    const table: [*]const u64 = @ptrFromInt(hhdm.physToVirt(entry.indirect));
+    return table[slot];
+}
+
+/// 读取或按需分配文件页（0 = OOM）。间接页本身同样按需分配。
+fn pageAtAlloc(entry: *TmpfsEntry, page_idx: u32) u64 {
+    if (page_idx < PAGES_PER_FILE) {
+        if (entry.pages[page_idx]) |phys| return phys;
+        const phys = pmm.allocPage() orelse return 0;
+        const page_ptr: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+        @memset(page_ptr[0..PAGE_SIZE], 0);
+        entry.pages[page_idx] = phys;
+        entry.page_count += 1;
+        return phys;
+    }
+    const slot = page_idx - PAGES_PER_FILE;
+    if (slot >= INDIRECT_PAGES) return 0;
+    if (entry.indirect == 0) {
+        const ind = pmm.allocPage() orelse return 0;
+        const ind_ptr: [*]u8 = @ptrFromInt(hhdm.physToVirt(ind));
+        @memset(ind_ptr[0..PAGE_SIZE], 0);
+        entry.indirect = ind;
+    }
+    const table: [*]u64 = @ptrFromInt(hhdm.physToVirt(entry.indirect));
+    if (table[slot] != 0) return table[slot];
+    const phys = pmm.allocPage() orelse return 0;
+    const page_ptr: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+    @memset(page_ptr[0..PAGE_SIZE], 0);
+    table[slot] = phys;
+    entry.page_count += 1;
+    return phys;
 }
 
 fn findEntry(name: []const u8, parent: u8) ?u8 {
@@ -277,8 +328,9 @@ pub fn tmpfsRead(idx: u8, offset: u64, buf: [*]u8, count: u32) i64 {
         const page_idx = pos / PAGE_SIZE;
         const page_off = pos % PAGE_SIZE;
         const chunk = @min(remaining, PAGE_SIZE - page_off);
-        if (page_idx >= PAGES_PER_FILE) break;
-        if (entry.pages[page_idx]) |phys| {
+        if (page_idx >= PAGES_PER_FILE + INDIRECT_PAGES) break;
+        const phys = pageAt(entry, page_idx);
+        if (phys != 0) {
             const src: [*]const u8 = @ptrFromInt(hhdm.physToVirt(phys) + page_off);
             @memcpy(buf[dst .. dst + chunk], src[0..chunk]);
         } else {
@@ -313,18 +365,10 @@ pub fn tmpfsWrite(idx: u8, offset: u64, data: [*]const u8, count: u32) i64 {
         const page_idx = pos / PAGE_SIZE;
         const page_off = pos % PAGE_SIZE;
         const chunk = @min(remaining, PAGE_SIZE - page_off);
-        if (page_idx >= PAGES_PER_FILE) break;
 
-        if (entry.pages[page_idx] == null) {
-            const phys = pmm.allocPage() orelse break;
-            entry.pages[page_idx] = phys;
-            entry.page_count += 1;
-            // Zero the page
-            const page_ptr: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
-            @memset(page_ptr[0..PAGE_SIZE], 0);
-        }
+        const phys = pageAtAlloc(entry, page_idx);
+        if (phys == 0) break; // OOM 或超出单文件上限
 
-        const phys = entry.pages[page_idx].?;
         const dst: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys) + page_off);
         @memcpy(dst[0..chunk], data[src .. src + chunk]);
 
@@ -364,10 +408,28 @@ fn truncateLocked(entry: *TmpfsEntry, new_size: u32) void {
             entry.page_count -= 1;
         }
     }
+    // 间接区：释放 keep 之后的数据页；keep 全部落在直辖区时间接页本身也释放。
+    if (entry.indirect != 0) {
+        const table: [*]u64 = @ptrFromInt(hhdm.physToVirt(entry.indirect));
+        const start: u32 = if (keep_pages > PAGES_PER_FILE) keep_pages - PAGES_PER_FILE else 0;
+        var s: u32 = start;
+        while (s < INDIRECT_PAGES) : (s += 1) {
+            if (table[s] != 0) {
+                pmm.freePage(table[s]);
+                table[s] = 0;
+                entry.page_count -= 1;
+            }
+        }
+        if (keep_pages <= PAGES_PER_FILE) {
+            pmm.freePage(entry.indirect);
+            entry.indirect = 0;
+        }
+    }
     // Zero the tail of the last kept page so stale bytes past the new EOF
     // don't resurface if the file later regrows into the same page.
     if (keep_pages > 0 and new_size % PAGE_SIZE != 0) {
-        if (entry.pages[keep_pages - 1]) |phys| {
+        const phys = pageAt(entry, keep_pages - 1);
+        if (phys != 0) {
             const ptr: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
             @memset(ptr[new_size % PAGE_SIZE .. PAGE_SIZE], 0);
         }
@@ -499,8 +561,9 @@ pub fn tmpfsGetMapPage(idx: u8, ctime: u64, page_idx: u32) ?u64 {
     const entry = &entries[idx];
     if (!entry.active or entry.is_dir) return null;
     if (entry.ctime != ctime) return null;
-    if (page_idx >= PAGES_PER_FILE) return null;
-    return entry.pages[page_idx];
+    if (page_idx >= PAGES_PER_FILE + INDIRECT_PAGES) return null;
+    const phys = pageAt(entry, page_idx);
+    return if (phys != 0) phys else null;
 }
 
 /// H1: tmpfsGetMapPage variant for writable MAP_SHARED faults — allocates a
@@ -516,14 +579,9 @@ pub fn tmpfsEnsureMapPage(idx: u8, ctime: u64, page_idx: u32) ?u64 {
     const entry = &entries[idx];
     if (!entry.active or entry.is_dir) return null;
     if (entry.ctime != ctime) return null;
-    if (page_idx >= PAGES_PER_FILE) return null;
-    if (entry.pages[page_idx]) |phys| return phys;
-    const phys = pmm.allocPage() orelse return null;
-    const page_ptr: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
-    @memset(page_ptr[0..PAGE_SIZE], 0);
-    entry.pages[page_idx] = phys;
-    entry.page_count += 1;
-    return phys;
+    if (page_idx >= PAGES_PER_FILE + INDIRECT_PAGES) return null;
+    const phys = pageAtAlloc(entry, page_idx);
+    return if (phys != 0) phys else null;
 }
 
 pub const TmpfsDirEntry = struct {

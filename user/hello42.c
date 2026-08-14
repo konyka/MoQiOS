@@ -8,6 +8,12 @@ static inline int64_t syscall1(uint64_t nr, uint64_t a1) {
     return ret;
 }
 
+static inline int64_t syscall2(uint64_t nr, uint64_t a1, uint64_t a2) {
+    int64_t ret;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2) : "rcx", "r11", "memory");
+    return ret;
+}
+
 static inline int64_t syscall3(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3) {
     int64_t ret;
     register uint64_t rdx __asm__("rdx") = a3;
@@ -30,8 +36,12 @@ static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_CLOSE  11
 #define SYS_PREAD  17
 #define SYS_PWRITE 18
+#define SYS_TRUNCATE 76
+#define SYS_FTRUNCATE 77
+#define SYS_UNLINK 111
 
 #define O_WRONLY_CREAT 0x41
+#define O_RDWR_CREAT_TRUNC 0x242
 
 static void print(const char *s) {
     uint64_t n = 0;
@@ -115,6 +125,37 @@ void _start(void) {
     if (buf[0] != 'a' || buf[1] != 'X' || buf[2] != 'Y' || buf[3] != 'd' || buf[4] != 'e' || buf[5] != 'f')
         fail("ptest2 final content");
     if (syscall1(SYS_CLOSE, (uint64_t)fd) != 0) fail("close verify");
+
+    // Test 6: tmpfs 一级间接页——超过旧 256 KiB 上限的大文件（600 KiB，
+    // 页 64..149 走间接页），跨边界抽查 + 截断后扩展区读零。
+    {
+        static uint8_t big[4096];
+        const uint32_t BIG = 600 * 1024;
+        fd = syscall3(SYS_OPEN, (uint64_t)"/tmp/pbig", O_RDWR_CREAT_TRUNC, 0666);
+        if (fd < 0) fail("open pbig");
+        for (uint32_t off = 0; off < BIG; off += 4096) {
+            uint32_t pg = off / 4096;
+            for (uint32_t i = 0; i < 4096; i++) big[i] = (uint8_t)(pg + i);
+            if (syscall4(SYS_PWRITE, (uint64_t)fd, (uint64_t)big, 4096, off) != 4096)
+                fail("pwrite pbig");
+        }
+        // 抽查：首页 / 直辖末页 / 间接首页 / 末页
+        const uint32_t pages[4] = { 0, 63, 64, 149 };
+        for (uint32_t k = 0; k < 4; k++) {
+            uint32_t pg = pages[k];
+            if (syscall4(SYS_PREAD, (uint64_t)fd, (uint64_t)big, 4096, (uint64_t)pg * 4096) != 4096)
+                fail("pread pbig");
+            for (uint32_t i = 0; i < 4096; i += 257)
+                if (big[i] != (uint8_t)(pg + i)) fail("pbig content");
+        }
+        // 截断到 32 KiB（释放全部间接页），再读旧 100 页位置应为 EOF
+        if (syscall2(SYS_FTRUNCATE, (uint64_t)fd, 32 * 1024) != 0)
+            fail("ftruncate pbig");
+        if (syscall4(SYS_PREAD, (uint64_t)fd, (uint64_t)big, 16, 100 * 4096) != 0)
+            fail("pread past truncated EOF");
+        if (syscall1(SYS_CLOSE, (uint64_t)fd) != 0) fail("close pbig");
+        syscall1(SYS_UNLINK, (uint64_t)"/tmp/pbig");
+    }
 
     print("hello42: PASS\nhello42 done\n");
     syscall1(SYS_EXIT, 0);
