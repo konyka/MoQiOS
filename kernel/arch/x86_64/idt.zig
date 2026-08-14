@@ -884,6 +884,43 @@ fn mapZeroPrivatePage(current: anytype, page_addr: u64, prot: u8) bool {
 /// exec (mmap.zig releaseRegionBacking) and by msync→vfs.syncAll. Pages
 /// wholly past EOF return false, which the caller turns into SIGSEGV.
 fn handleFileFault(current: anytype, page_addr: u64) bool {
+    const filemap = @import("../../mm/filemap.zig");
+    const paging_mod = @import("paging.zig");
+    const task_mod = @import("../../proc/task.zig");
+
+    // Serve the faulting page first — a failure here is the real SIGSEGV.
+    if (!serveFilePage(current, page_addr)) return false;
+
+    // Fault-around: prefault the forward window of the same region. Every
+    // served page costs a full #PF round-trip, so a sequential scan pays
+    // ~1 fault per 64 KiB instead of per 4 KiB. Prefault failures are
+    // non-fatal — the page simply faults again on demand.
+    const ri = filemap.findFileRegion(task_mod.MmapRegion, &current.mmap_regions, page_addr) orelse return true;
+    const region = &current.mmap_regions[ri];
+    const plan0 = filemap.planFault(task_mod.MmapRegion, region, page_addr);
+    // Writable shared mappings mark pages dirty at serve time; prefaulting
+    // them would pay writeback for data nobody wrote (see filemap.zig).
+    if (!filemap.prefaultSafe(plan0.shared_write)) return true;
+
+    const ahead = filemap.faultAroundAhead(region.base, region.num_pages, page_addr);
+    var i: u64 = 1;
+    while (i <= ahead) : (i += 1) {
+        const pa = page_addr + i * paging_mod.PAGE_SIZE;
+        // Already present (or a swap entry): nothing to do for this page.
+        if (paging_mod.getPageEntryRaw(current.page_table_phys, pa) != null) continue;
+        // Past-EOF page: stop — the rest of the window is past EOF too.
+        const plan = filemap.planFault(task_mod.MmapRegion, region, pa);
+        if (plan.action == .segv) break;
+        if (!serveFilePage(current, pa)) break;
+    }
+    return true;
+}
+
+/// Serve one not-present file-backed page (swap-in first, then per-kind
+/// backing). Returns false for a page wholly past EOF or an exhausted
+/// allocator — the caller turns the faulting page's false into SIGSEGV and
+/// treats a prefault page's false as "stop the window".
+fn serveFilePage(current: anytype, page_addr: u64) bool {
     const pmm = @import("../../mm/pmm.zig");
     const hhdm = @import("../../mm/hhdm.zig");
     const filemap = @import("../../mm/filemap.zig");

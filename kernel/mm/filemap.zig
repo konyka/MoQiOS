@@ -125,6 +125,34 @@ pub fn advanceFileOffset(file_offset: u64, delta_pages: u64) u64 {
     return file_offset + delta_pages * PAGE_SIZE;
 }
 
+// ─── Fault-around (prefault) policy ─────────────────────────────────────
+
+/// Forward pages prefaulted after a file fault (64 KiB window incl. the
+/// faulting page) — each served page costs a full #PF round-trip, so
+/// sequential scans amortise 16 faults into 1. True 2MiB PDEs are
+/// deliberately NOT used for file mappings: the zero-copy design maps the
+/// backing store's own frames (tmpfs pages, page-cache frames), which are
+/// individually allocated and never contiguous; a huge PDE would require
+/// copying 512 pages into one frame, breaking MAP_SHARED write-through.
+pub const FAULT_AROUND_AHEAD: u64 = 15;
+
+/// How many pages after `page_addr` a fault-around pass may try, capped by
+/// the region end. The caller established `page_addr` is inside the region.
+pub fn faultAroundAhead(region_base: u64, region_pages: u64, page_addr: u64) u64 {
+    const region_end = region_base + region_pages * PAGE_SIZE;
+    if (page_addr + PAGE_SIZE >= region_end) return 0;
+    const ahead = (region_end - page_addr - PAGE_SIZE) / PAGE_SIZE;
+    return @min(ahead, FAULT_AROUND_AHEAD);
+}
+
+/// A prefault candidate is only safe when the plan is not shared_write:
+/// prefaulting a writable shared page would have to mark it dirty before any
+/// write happened (the dirty bit cannot be observed later), paying writeback
+/// for untouched data. The faulting page itself is always served.
+pub fn prefaultSafe(shared_write: bool) bool {
+    return !shared_write;
+}
+
 /// Region merging (trackMmapRegion) is only valid between two anonymous
 /// regions — file regions carry per-region backing metadata that a merge
 /// would silently drop.
