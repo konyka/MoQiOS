@@ -39,6 +39,7 @@ LOG_FILE="${MOQI_SMOKE_LOG:-$SMOKE_WORK_DIR/serial.log}"
 RUN_LOG="${MOQI_SMOKE_RUN_LOG:-$SMOKE_WORK_DIR/qemu.run.log}"
 SMOKE_DISK="${MOQI_SMOKE_DISK:-$SMOKE_WORK_DIR/disk.img}"
 SMOKE_NVME="${MOQI_SMOKE_NVME_IMG:-$SMOKE_WORK_DIR/nvme.img}"
+SMOKE_AHCI="${MOQI_SMOKE_AHCI_IMG:-$SMOKE_WORK_DIR/ahci.img}"
 PACKAGE_DIR="${MOQI_SMOKE_PACKAGE_DIR:-$SMOKE_WORK_DIR/package}"
 SMOKE_ISO_DIR="$PACKAGE_DIR/iso_root"
 SMOKE_ISO_FILE="$PACKAGE_DIR/moqios.iso"
@@ -72,6 +73,9 @@ fi
 if [ -z "${MOQI_SMOKE_NVME_IMG:-}" ]; then
     rm -f "$SMOKE_NVME"
 fi
+if [ -z "${MOQI_SMOKE_AHCI_IMG:-}" ]; then
+    rm -f "$SMOKE_AHCI"
+fi
 if [ -z "${MOQI_SMOKE_PACKAGE_DIR:-}" ]; then
     rm -rf "$PACKAGE_DIR"
 fi
@@ -82,6 +86,7 @@ MOQI_SMP="$SMP_COUNT" \
 MOQI_SERIAL="file:$LOG_FILE" \
 MOQI_DISK="$SMOKE_DISK" \
 MOQI_NVME_IMG="$SMOKE_NVME" \
+MOQI_AHCI_IMG="$SMOKE_AHCI" \
 MOQI_ISO_DIR="$SMOKE_ISO_DIR" \
 MOQI_ISO_FILE="$SMOKE_ISO_FILE" \
 MOQI_USER_BIN_DIR="$SMOKE_USER_BIN_DIR" \
@@ -151,6 +156,12 @@ check_fatal_output() {
         echo "Serial log: $LOG_FILE"
         exit 1
     fi
+    if [ -f "$LOG_FILE" ] && grep -aqE "\[ahci\] boot (read|write|flush|readback) (FAILED|MISMATCH)" "$LOG_FILE"; then
+        echo "FAIL: AHCI boot I/O self-test failed during smoke (SMP=$SMP_COUNT)."
+        grep -a "\[ahci\]" "$LOG_FILE" | head -20
+        echo "Serial log: $LOG_FILE"
+        exit 1
+    fi
     if { [ -f "$LOG_FILE" ] && grep -aq "KERNEL PANIC" "$LOG_FILE"; } ||
        { [ -f "$RUN_LOG" ] && grep -aq "KERNEL PANIC" "$RUN_LOG"; }; then
         echo "FAIL: the kernel panicked during smoke (SMP=$SMP_COUNT)."
@@ -212,6 +223,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 
     if [ -f "$LOG_FILE" ] &&
        grep -q "\[NVMe\] MSI-X interrupts enabled" "$LOG_FILE" &&
+       grep -q "\[ahci\] boot write+readback verified" "$LOG_FILE" &&
        grep -q "hello21 done" "$LOG_FILE" &&
        grep -q "hello29: PASS" "$LOG_FILE" &&
        grep -q "hello29: fsync PASS" "$LOG_FILE" &&
@@ -284,7 +296,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for smoke markers."
-echo "Expected serial markers: '[NVMe] MSI-X interrupts enabled', init PASS markers, 'hello32: SIGSEGV PASS', 'hello38: PASS (futex EFAULT/waitv validation)', 'hello39: PASS (socket option faults/address lengths)', 'hello40: PASS (IPC_SET and rt_sigsuspend EFAULT)', 'hello41: PASS', 'hello42: PASS', 'hello42 done', 'hello43: PASS', 'hello43 done', 'hello44: PASS', 'hello44 done', 'hello45: PASS', 'hello45 done', 'hello46: PASS', 'hello46 done', 'hello47: PASS', 'hello47 done', 'hello48: PASS', 'hello48 done', 'hello49: PASS', 'hello49 done', 'hello50: PASS', 'hello50 done', 'hello51: PASS', 'hello51 done', 'hello52: PASS', 'hello52 done', 'hello53: PASS', 'hello53 done', 'hello54: PASS', 'hello54 done', 'hello56: PASS', 'hello56 done', 'hello57: PASS', 'hello57 done', 'hello58: PASS', 'hello58 done', 'hello59: PASS', 'hello59 done', '[fbcon] mirror disabled/restored', '[syslogd] started', '[devmgr] started', '[DHCP] ', 'MoQiOS shell', '[SMP] ${SMP_COUNT} CPUs detected', '[SMP] ${SMP_COUNT} CPUs selected', and '[SMP] ${SMP_COUNT} CPUs online'."
+echo "Expected serial markers: '[NVMe] MSI-X interrupts enabled', '[ahci] boot write+readback verified', init PASS markers, 'hello32: SIGSEGV PASS', 'hello38: PASS (futex EFAULT/waitv validation)', 'hello39: PASS (socket option faults/address lengths)', 'hello40: PASS (IPC_SET and rt_sigsuspend EFAULT)', 'hello41: PASS', 'hello42: PASS', 'hello42 done', 'hello43: PASS', 'hello43 done', 'hello44: PASS', 'hello44 done', 'hello45: PASS', 'hello45 done', 'hello46: PASS', 'hello46 done', 'hello47: PASS', 'hello47 done', 'hello48: PASS', 'hello48 done', 'hello49: PASS', 'hello49 done', 'hello50: PASS', 'hello50 done', 'hello51: PASS', 'hello51 done', 'hello52: PASS', 'hello52 done', 'hello53: PASS', 'hello53 done', 'hello54: PASS', 'hello54 done', 'hello56: PASS', 'hello56 done', 'hello57: PASS', 'hello57 done', 'hello58: PASS', 'hello58 done', 'hello59: PASS', 'hello59 done', '[fbcon] mirror disabled/restored', '[syslogd] started', '[devmgr] started', '[DHCP] ', 'MoQiOS shell', '[SMP] ${SMP_COUNT} CPUs detected', '[SMP] ${SMP_COUNT} CPUs selected', and '[SMP] ${SMP_COUNT} CPUs online'."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

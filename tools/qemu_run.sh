@@ -112,6 +112,10 @@ echo "========================================="
 #   MOQI_NVME        attach an NVMe controller when != 0 (default: 1)
 #   MOQI_NVME_IMG    NVMe scratch image path (default: nvme.img); created and
 #                    pattern-stamped automatically when NVMe is enabled
+#   MOQI_AHCI        attach an AHCI/SATA controller + scratch disk when != 0
+#                    (default: 1)
+#   MOQI_AHCI_IMG    SATA scratch image path (default: ahci.img); created and
+#                    pattern-stamped automatically when AHCI is enabled
 #   MOQI_ISO_DIR     ISO staging directory (default: iso_root)
 #   MOQI_ISO_FILE    generated ISO path (default: moqios.iso)
 #   MOQI_USER_BIN_DIR ramdisk input directory (default: user_bin)
@@ -120,6 +124,7 @@ echo "========================================="
 SERIAL_TARGET="${MOQI_SERIAL:-stdio}"
 SMP_COUNT="${MOQI_SMP:-2}"
 NVME_IMAGE="${MOQI_NVME_IMG:-nvme.img}"
+AHCI_IMAGE="${MOQI_AHCI_IMG:-ahci.img}"
 EXTRA_QEMU_ARGS=()
 if [ -n "${MOQI_EXTRA_QEMU:-}" ]; then
     # Split an explicitly documented space-delimited option string once; array
@@ -145,6 +150,21 @@ if [ "${MOQI_NVME:-1}" != "0" ]; then
         -device nvme,serial=moqi,drive=nvm0)
 fi
 
+# Optional AHCI/SATA controller with a scratch disk (the virtio-blk disk above
+# stays the boot/root disk). The kernel runs a boot-time I/O self-test against
+# this known first-sector pattern; the write path is only exercised when the
+# pattern matches, so a real disk is never written.
+AHCI_ARGS=()
+if [ "${MOQI_AHCI:-1}" != "0" ]; then
+    if [ ! -f "$AHCI_IMAGE" ]; then
+        truncate -s 8M "$AHCI_IMAGE"
+    fi
+    printf 'MoQiAHCI' | dd of="$AHCI_IMAGE" bs=1 conv=notrunc status=none
+    AHCI_ARGS=(-device ich9-ahci,id=ahci0
+        -drive file="$AHCI_IMAGE",format=raw,if=none,id=sata0
+        -device ide-hd,drive=sata0,bus=ahci0.0)
+fi
+
 # exec so callers that background this script get the QEMU PID (not a leftover shell).
 exec qemu-system-x86_64 \
     -M q35 \
@@ -154,6 +174,7 @@ exec qemu-system-x86_64 \
     -drive file="$DISK_IMAGE",format=raw,if=none,id=disk0 \
     -device virtio-blk-pci,drive=disk0 \
     "${NVME_ARGS[@]}" \
+    "${AHCI_ARGS[@]}" \
     -netdev user,id=net0 \
     -device e1000,netdev=net0 \
     -smp "$SMP_COUNT" \
