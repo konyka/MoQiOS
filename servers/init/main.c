@@ -179,6 +179,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello57");  /* pthread 子集: create/join/mutex/once/specific/errno */
     run_test("hello58");  /* 作业控制: ctty/前后台/SIGTTIN/kill(-pgid)/孤儿组 */
     run_test("hello59");  /* RLIMIT_STACK 执行语义: 默认值/EINVAL/继承/SIGSEGV */
+    run_test("hello60");  /* RLIMIT_AS 执行语义: mmap/brk 计费/超限/继承/SIGSEGV */
 
     start_persistent_services();
 

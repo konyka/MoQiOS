@@ -283,18 +283,34 @@ test "STACK floor clamps to the architecture region" {
 test "STACK setrlimit validation mirrors NOFILE privilege rules" {
     const current: rlimit.Limit = .{ .cur = 8 * 1024 * 1024, .max = 8 * 1024 * 1024 };
     // cur > max is structurally invalid.
-    try std.testing.expectError(error.InvalidLimit, rlimit.Policy.applyStack(current, .{ .cur = 2, .max = 1 }, false));
+    try std.testing.expectError(error.InvalidLimit, rlimit.Policy.applyBytes(current, .{ .cur = 2, .max = 1 }, false));
     // No table-size ceiling: RLIM_INFINITY is a valid value.
-    const inf = try rlimit.Policy.applyStack(current, .{ .cur = 8 * 1024 * 1024, .max = rlimit.RLIM_INFINITY }, true);
+    const inf = try rlimit.Policy.applyBytes(current, .{ .cur = 8 * 1024 * 1024, .max = rlimit.RLIM_INFINITY }, true);
     try std.testing.expectEqual(rlimit.RLIM_INFINITY, inf.max);
     // Raising soft above the current hard limit necessarily raises the hard
     // limit too (cur <= max), and needs privilege either way.
-    try std.testing.expectError(error.WouldLowerHardLimit, rlimit.Policy.applyStack(current, .{ .cur = 16 * 1024 * 1024, .max = 16 * 1024 * 1024 }, false));
-    try std.testing.expectError(error.WouldLowerHardLimit, rlimit.Policy.applyStack(current, .{ .cur = 1024, .max = rlimit.RLIM_INFINITY }, false));
+    try std.testing.expectError(error.WouldLowerHardLimit, rlimit.Policy.applyBytes(current, .{ .cur = 16 * 1024 * 1024, .max = 16 * 1024 * 1024 }, false));
+    try std.testing.expectError(error.WouldLowerHardLimit, rlimit.Policy.applyBytes(current, .{ .cur = 1024, .max = rlimit.RLIM_INFINITY }, false));
     // Lowering both is always allowed; soft may rise up to the hard limit.
-    const lowered = try rlimit.Policy.applyStack(current, .{ .cur = 64 * 1024, .max = 128 * 1024 }, false);
+    const lowered = try rlimit.Policy.applyBytes(current, .{ .cur = 64 * 1024, .max = 128 * 1024 }, false);
     try std.testing.expectEqual(@as(u64, 64 * 1024), lowered.cur);
-    _ = try rlimit.Policy.applyStack(current, .{ .cur = 8 * 1024 * 1024, .max = 8 * 1024 * 1024 }, false);
+    _ = try rlimit.Policy.applyBytes(current, .{ .cur = 8 * 1024 * 1024, .max = 8 * 1024 * 1024 }, false);
+}
+
+test "AS charge check blocks past the soft limit without underflow" {
+    const inf = rlimit.RLIM_INFINITY;
+    // Unlimited always passes.
+    try std.testing.expect(rlimit.Policy.asChargeOk(std.math.maxInt(u64), 4096, inf));
+    // Fits exactly / would exceed.
+    try std.testing.expect(rlimit.Policy.asChargeOk(0, 4096, 4096));
+    try std.testing.expect(!rlimit.Policy.asChargeOk(0, 4097, 4096));
+    try std.testing.expect(rlimit.Policy.asChargeOk(1024, 3072, 4096));
+    try std.testing.expect(!rlimit.Policy.asChargeOk(1024, 3073, 4096));
+    // Usage already above the (lowered) limit: blocked, no underflow.
+    try std.testing.expect(!rlimit.Policy.asChargeOk(8192, 1, 4096));
+    try std.testing.expect(!rlimit.Policy.asChargeOk(8192, 0, 4096));
+    // Zero charge at the boundary is allowed.
+    try std.testing.expect(rlimit.Policy.asChargeOk(4096, 0, 4096));
 }
 
 test "DAC decodes open access modes and adds write for truncate" {

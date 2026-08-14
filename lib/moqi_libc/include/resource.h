@@ -2,8 +2,8 @@
  *
  * ABI matches the kernel (kernel/arch/x86_64/syscall_entry.zig): struct
  * rlimit is two little-endian u64 fields, RLIM_INFINITY is ~0ULL.
- * RLIMIT_NOFILE and RLIMIT_STACK are enforced by the kernel; the other
- * resources report fixed/stub values and setrlimit on them is a no-op.
+ * RLIMIT_NOFILE, RLIMIT_STACK and RLIMIT_AS are enforced by the kernel; the
+ * other resources report fixed/stub values and setrlimit on them is a no-op.
  */
 #ifndef MOQI_RESOURCE_H
 #define MOQI_RESOURCE_H
