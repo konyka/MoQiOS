@@ -190,8 +190,6 @@ const AhciPort = struct {
     pci_func: u8,
     irq_pin: u8,
     irq_line: u8,
-    // I/O scheduler registration (v36.0)
-    io_sched_idx: u8 = 0xFF, // 0xFF = not registered
 };
 
 var hba_base: u64 = 0;
@@ -294,6 +292,70 @@ pub fn init() void {
     if (!found) {
         serial.writeString("[ahci] No AHCI controller found\n");
     }
+
+    // Prove the I/O path end to end at boot (polling waits are safe in the
+    // pre-scheduler context). qemu_run.sh stamps a known pattern into the
+    // first sector of its scratch SATA image; only when that pattern matches
+    // do we also exercise the write path — never write to a foreign disk.
+    if (found) {
+        bootIoSelfTest();
+    }
+}
+
+// ─── Boot-time I/O path self-test ─────────────────────────────────────
+
+/// Pattern qemu_run.sh stamps into sector 0 of its scratch SATA image.
+const BOOT_PATTERN = "MoQiAHCI";
+/// Payload written to sector 1 and read back when the scratch pattern matches.
+const SELFTEST_PAYLOAD = "MoQiAhciWrite";
+
+fn bootIoSelfTest() void {
+    if (!hasActiveDisk()) return;
+    const buf_phys = pmm.allocPage() orelse return;
+    defer pmm.freePage(buf_phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+    @memset(buf[0..512], 0);
+
+    if (readSectors(0, 1, buf) != SECTOR_SIZE) {
+        serial.writeString("[ahci] boot read FAILED\n");
+        return;
+    }
+    var matches = true;
+    for (BOOT_PATTERN, 0..) |ch, i| {
+        if (buf[i] != ch) matches = false;
+    }
+    if (!matches) {
+        // Foreign/real disk: the read path is proven; stop before any write.
+        serial.writeString("[ahci] boot read OK (no scratch pattern)\n");
+        return;
+    }
+    serial.writeString("[ahci] boot read verified (pattern match)\n");
+
+    // Scratch disk confirmed — exercise write + flush + readback on sector 1.
+    @memset(buf[0..512], 0);
+    for (SELFTEST_PAYLOAD, 0..) |ch, i| {
+        buf[i] = ch;
+    }
+    if (writeSectors(1, 1, buf) != SECTOR_SIZE) {
+        serial.writeString("[ahci] boot write FAILED\n");
+        return;
+    }
+    if (flushCache() != 0) {
+        serial.writeString("[ahci] boot flush FAILED\n");
+        return;
+    }
+    @memset(buf[0..512], 0);
+    if (readSectors(1, 1, buf) != SECTOR_SIZE) {
+        serial.writeString("[ahci] boot readback FAILED\n");
+        return;
+    }
+    for (SELFTEST_PAYLOAD, 0..) |ch, i| {
+        if (buf[i] != ch) {
+            serial.writeString("[ahci] boot readback MISMATCH\n");
+            return;
+        }
+    }
+    serial.writeString("[ahci] boot write+readback verified\n");
 }
 
 fn initController(dev: *const pci.PciDevice) !void {
@@ -534,14 +596,9 @@ fn initPort(idx: u32, port_base: u64) !void {
         ports[idx].tag_bitmap = 0; // Not used in non-NCQ mode
     }
 
-    // Register with I/O scheduler for request ordering (v36.0)
-    const io_sched = @import("../fs/io_sched.zig");
-    if (io_sched.registerDevice(@intCast(idx))) |sched_idx| {
-        ports[idx].io_sched_idx = @intCast(sched_idx);
-        serial.writeString("[ahci] port ");
-        fmt.writeHex8(@intCast(idx));
-        serial.writeString(" registered with io_sched\n");
-    }
+    // Note: no software I/O scheduler registration — the io_sched layer was
+    // removed (round 6.32): it was never wired to submit/dispatch, and NCQ
+    // hardware queueing supersedes a software elevator on SATA.
 }
 
 fn stopCmd(port_base: u64) void {
@@ -1096,12 +1153,16 @@ fn readNcq(port_idx: u32, lba: u64, count: u32, buf: [*]u8) i64 {
     ct.cfis[9] = @truncate(lba >> 32); // LBA[39:32]
     ct.cfis[10] = @truncate(lba >> 40); // LBA[47:40]
 
-    // Sector count in features field (for NCQ)
-    ct.cfis[12] = @truncate(count); // Count[7:0]
-    ct.cfis[13] = @truncate(count >> 8); // Count[15:8]
-
-    // NCQ tag in features upper byte
-    ct.cfis[3] = tag << 3; // Tag field in features[5:3]
+    // NCQ register mapping (ATA/ACS: READ/WRITE FPDMA QUEUED):
+    //   Features(7:0)  = Sector Count(7:0)   -> cfis[3]
+    //   Features(15:8) = Sector Count(15:8)  -> cfis[11]
+    //   Count(7:0)     = TAG << 3            -> cfis[12]
+    // (Putting the count in the Count field makes the device read it as 0,
+    // i.e. 65536 sectors — QEMU rejects that against the PRDT length.)
+    ct.cfis[3] = @truncate(count); // Features(7:0) = Sector Count(7:0)
+    ct.cfis[11] = @truncate(count >> 8); // Features(15:8) = Sector Count(15:8)
+    ct.cfis[12] = tag << 3; // Count(7:0) = TAG in bits 7:3
+    ct.cfis[13] = 0;
 
     // PRDT
     const buf_phys = virtToPhys(@intFromPtr(buf));
@@ -1253,12 +1314,13 @@ fn writeNcq(port_idx: u32, lba: u64, count: u32, buf: [*]const u8) i64 {
     ct.cfis[9] = @truncate(lba >> 32);
     ct.cfis[10] = @truncate(lba >> 40);
 
-    // Sector count in features
-    ct.cfis[12] = @truncate(count);
-    ct.cfis[13] = @truncate(count >> 8);
-
-    // NCQ tag
-    ct.cfis[3] = tag << 3;
+    // NCQ register mapping — sector count in Features, tag in Count (see
+    // readNcq for the full note; the swapped layout reads as count 0 =
+    // 65536 sectors and is rejected against the PRDT length).
+    ct.cfis[3] = @truncate(count); // Features(7:0) = Sector Count(7:0)
+    ct.cfis[11] = @truncate(count >> 8); // Features(15:8) = Sector Count(15:8)
+    ct.cfis[12] = tag << 3; // Count(7:0) = TAG in bits 7:3
+    ct.cfis[13] = 0;
 
     // PRDT
     const buf_phys = virtToPhys(@intFromPtr(buf));
@@ -1307,36 +1369,36 @@ fn waitCompletion(port_idx: u32, tag: u8) i64 {
     const port_base = ports[port_idx].port_base;
     const mask = @as(u32, 1) << @intCast(tag);
 
-    // First, try interrupt-driven wait (poll the completed flag set by ISR)
+    // Interrupt-accelerated, polling-guaranteed: the completed flag set by
+    // the ISR is the fast path, but CI/SACT is always polled too — a lost
+    // interrupt (or the pre-scheduler boot context, where the MSI may not
+    // be deliverable yet) degrades to polling, never a hang. Mirrors the
+    // NVMe wait design.
     var timeout: u32 = 10_000_000;
     while (timeout > 0) : (timeout -= 1) {
         // Check if the interrupt handler marked it complete
         if (ports[port_idx].requests[tag].completed) break;
 
-        // Also check hardware directly as a fast path / fallback
-        if (ports[port_idx].msi_enabled) {
-            // Give interrupts a chance to fire
-            asm volatile ("pause");
-        } else {
-            // Polling fallback: check CI and SACT
-            const ci = readPort(port_base, PORT_CI);
-            const sact = readPort(port_base, PORT_SACT);
-            if ((ci & mask) == 0 and (sact & mask) == 0) {
-                // Command completed via polling
-                const tfd = readPort(port_base, PORT_TFD);
-                ports[port_idx].requests[tag].completed = true;
-                if ((tfd & 0x01) != 0) {
-                    ports[port_idx].requests[tag].has_error = true;
-                }
-                // Tag is released below, after requests[tag] has been read.
-                break;
+        // Hardware fast path / fallback: check CI and SACT directly
+        const ci = readPort(port_base, PORT_CI);
+        const sact = readPort(port_base, PORT_SACT);
+        if ((ci & mask) == 0 and (sact & mask) == 0) {
+            // Command completed via polling
+            const tfd = readPort(port_base, PORT_TFD);
+            ports[port_idx].requests[tag].completed = true;
+            if ((tfd & 0x01) != 0) {
+                ports[port_idx].requests[tag].has_error = true;
             }
-            // Check for pending interrupts and service them
-            const is = readPort(port_base, PORT_IS);
-            if (is != 0) {
-                handlePortInterrupt(port_idx);
-            }
+            // Tag is released below, after requests[tag] has been read.
+            break;
         }
+        // Service any pending port interrupt inline (same handling the ISR
+        // would do; idempotent if the ISR races us on another CPU)
+        const is = readPort(port_base, PORT_IS);
+        if (is != 0) {
+            handlePortInterrupt(port_idx);
+        }
+        asm volatile ("pause");
     }
 
     if (timeout == 0) {
