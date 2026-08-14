@@ -1515,13 +1515,23 @@ const SysCap = packed struct {
   设备不提供该特性时 `discard()` 为 no-op（返回 0）。QEMU 需给
   virtio-blk 设备加 `discard=on` 才会提供该特性，默认不开启。
 
-### 6.4 AHCI/SATA 🧩
+### 6.4 AHCI/SATA ✅
 
 文件: `ahci.zig`
 
-- HBA 寄存器 / 端口寄存器框架
-- 命令列表 / FIS 框架就位
-- **未完成**: 实际 I/O 路径
+- HBA 寄存器 / 端口寄存器框架、命令列表 / FIS 框架
+- 实际 I/O 路径已验证（6.32）：NCQ 读写（READ/WRITE FPDMA QUEUED）+
+  legacy DMA 轮询回退、TRIM、FLUSH CACHE；MSI 中断（向量 241）加速 +
+  寄存器轮询兜底（丢中断/启动早期退化为轮询，不会挂死，同 NVMe 哲学）
+- boot 自测：qemu_run.sh 挂 ich9-ahci + scratch SATA 盘并盖戳
+  `MoQiAHCI`；内核读 sector 0 验模式，匹配才继续写 sector 1 + flush +
+  读回（真机外来盘永不写）。smoke 门禁标记
+  `[ahci] boot write+readback verified`
+- 6.32 修复：NCQ FIS 寄存器映射错误（扇区数应在 Features cfis[3]/[11]、
+  tag 在 Count cfis[12]，原代码写反导致设备按 65536 扇区解释被 QEMU
+  拒绝）；`io_sched` 软件电梯层删除（submit/dispatch 从未接线属死代码，
+  tryMerge 合并后 DMA 范围超出缓冲区的缺陷随层移除；NCQ 硬件队列已
+  取代软件排序）
 
 ### 6.5 PS/2 键盘 ✅
 

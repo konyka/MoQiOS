@@ -1145,7 +1145,6 @@ moqios/
 │   │   ├── devpts.zig           # [新增] /dev/pts 伪终端
 │   │   ├── bio.zig              # [新增] 块设备 I/O 层
 │   │   ├── buffer_cache.zig     # [新增] 块级缓冲缓存
-│   │   └── io_sched.zig         # [新增] I/O 调度器 (电梯合并)
 │   ├── vmm/                     # 虚拟内存管理器
 │   │   ├── main.zig
 │   │   ├── lru.zig              # [新增] 双链表 LRU 页面置换

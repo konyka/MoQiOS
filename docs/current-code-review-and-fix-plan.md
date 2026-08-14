@@ -703,9 +703,12 @@ Reported by the audit but **not confirmed** — recorded here so the next pass d
 - The claim that any `write()` above 4 KiB loses data overstated the reach of the P0 above.
   `file_io.zig`, `readv.zig`, `aio.zig`, and the `writev` arm of the syscall dispatcher all chunk to
   4096 through a kernel bounce buffer and honour short writes, so the plain write path was correct.
-- `io_sched.tryMerge` was reported as producing a DMA range that outruns its buffer. The merge path is
-  only reachable for AHCI-registered devices and needs its own verification before any change; it was
-  not confirmed in this pass.
+- `io_sched.tryMerge` was reported as producing a DMA range that outruns its buffer.
+  **Resolved in round 6.32**: verified by inspection — the merge extends the LBA range but
+  keeps the original buffer pointer, so the combined DMA range indeed outruns the buffer.
+  The layer was unreachable in practice (`submitRequest`/`dispatchNext` had no callers);
+  NCQ hardware queueing supersedes a software elevator on SATA, so `io_sched.zig` was
+  removed outright along with the AHCI registration.
 
 Still open from the audit and worth a dedicated round, in rough priority order: the ext2 block-group
 descriptor table is read into a single 4 KiB page, so a volume with more than 128 groups overflows it;
@@ -2026,6 +2029,34 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   smoke 门禁标记新增 `hello59: PASS`/`hello59 done`。
 - 其余 RLIMIT_*（AS/NPROC/DATA/…）仍为上报 stub，待各自语义定稿后逐个执行，
   避免 stub 蔓延。
+
+---
+
+### 6.32 P2 批次第六轮（2026-08-14）：AHCI/SATA 实际 I/O 路径端到端验证 + io_sched 结案
+
+- **QEMU 接线**：qemu_run.sh 新增可选 ich9-ahci + scratch SATA 盘
+  （`MOQI_AHCI`/`MOQI_AHCI_IMG`，默认开，模式同 NVMe）；8 MiB 镜像首扇区盖戳
+  `MoQiAHCI`。smoke 用自己的工作目录镜像，不碰 disk.img。
+- **boot I/O 自测**（ahci.zig，仿 NVMe 模式但更进一步）：读 sector 0 验模式；
+  **仅当模式匹配**（确认是我们的 scratch 盘）才继续写 sector 1 + flushCache +
+  读回比对——真机外来盘永远只读。smoke 门禁新增标记
+  `[ahci] boot write+readback verified` 与失败快速通道。
+- **抓到并修复两个真 bug**（此前该路径从未跑过）：
+  1. NCQ FIS 寄存器映射反转：扇区数应在 Features（cfis[3]/[11]）、NCQ tag 在
+     Count（cfis[12] bits 7:3），原代码写反，设备把 count 读成 0（=65536 扇区，
+     32 MiB），QEMU 以 "PRDT length smaller than requested size" 拒绝，命令挂死。
+  2. `waitCompletion` 在 msi_enabled 时纯靠 ISR 标志位自旋，启动早期（或丢中断）
+     必超时；统一为"ISR 加速 + CI/SACT 轮询兜底"（同 NVMe 哲学），内联服务
+     pending IS，与 ISR 幂等兼容。
+- **io_sched 结案**：按 §706 悬案核查——tryMerge 缺陷属实（合并扩范围但保留原
+  buffer 指针，合并 DMA 范围确实越出缓冲区），但 submitRequest/dispatchNext 全库
+  无调用方，是不可达死代码；NCQ 硬件排队已取代软件电梯。整层删除
+  （kernel/fs/io_sched.zig + ahci 注册点 + Port.io_sched_idx 字段），比修复更优：
+  零行为变化、消除 494 行错误倾向代码。§706 悬案关闭。
+- **门禁**：`zig build`、`zig build test`（191 全绿）、smoke SMP=1（AHCI 标记齐）、
+  SMP=4 stress 2/2 全绿。串日志实证：`NCQ=yes TRIM=yes sectors=16384` →
+  `boot read verified (pattern match)` → `boot write+readback verified`。
+- kernel-subsystems §6.4 升 ✅；docs/moqios-design.md 文件树移除 io_sched.zig。
 
 ---
 
