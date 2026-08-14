@@ -196,10 +196,12 @@ zig build -Darch=aarch64 smoke-aarch64
 `zig build test` is the canonical host test gate: it runs both the Zig unit tests in
 `tests/main.zig` and the moqi_libc C host tests in `lib/moqi_libc/host_tests/run_tests.sh`.
 Register new host-runnable tests in one of those suites. GitHub CI runs the same command through
-`tools/observe_test_duration.py` for pushes and pull requests, printing one non-gating JSONL
-duration observation in the log; it does not run QEMU or Limine. Durations are observational only,
-not comparable baseline or regression data; see the build documentation for the schema, local
-commands, and QEMU status limitation.
+`tools/observe_test_duration.py` for pushes and pull requests (host-tests job), printing one
+non-gating JSONL duration observation in the log. Durations are observational only,
+not comparable baseline or regression data. Since 2026-08-14 a `smoke-qemu` CI job runs the
+QEMU boot-to-shell gate under TCG (`zig build smoke` single-core and `zig build smoke-smp`
+dual-core), cloning Limine at its pinned commit and verifying disk.img against the manifest;
+see the build documentation for the schema, local commands, and QEMU status limitation.
 
 See [docs/build-and-toolchain.md](docs/build-and-toolchain.md) for markers, timeouts, and known limits.
 

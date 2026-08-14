@@ -253,8 +253,11 @@ zig build -Darch=aarch64 smoke-aarch64
 `zig build test` 是规范的主机测试门禁：它同时运行 `tests/main.zig` 的 Zig 单元测试和
 `lib/moqi_libc/host_tests/run_tests.sh` 的 moqi_libc C 宿主机测试；新增可在主机运行的
 测试应注册到这两个套件之一。GitHub CI 对推送和拉取请求经由 `tools/observe_test_duration.py`
-运行相同命令，并在日志打印一条非门禁 JSONL 时长观察；不运行 QEMU 或 Limine。时长只是观察结果，
-不构成可比较的基线或回归数据；完整 schema、当地命令和 QEMU 状态限制见构建文档。
+运行相同命令（host-tests 作业），并在日志打印一条非门禁 JSONL 时长观察；时长只是观察结果，
+不构成可比较的基线或回归数据。自 2026-08-14 起 CI 增加 `smoke-qemu` 作业：
+TCG 下运行 `zig build smoke`（单核）与 `zig build smoke-smp`（双核）boot-to-shell 门禁，
+Limine 按固定 commit 现场克隆，`disk.img` 经 manifest 校验。完整 schema、当地命令和
+QEMU 状态限制见构建文档。
 
 完整命令、运行时标记和已知限制见 [docs/build-and-toolchain.md](docs/build-and-toolchain.md)。
 

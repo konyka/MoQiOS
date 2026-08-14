@@ -1985,6 +1985,16 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 
 ---
 
+### 6.30 工程化（2026-08-14）：smoke 门禁 CI 化
+
+- CI 新增 `smoke-qemu` 作业（`.github/workflows/test.yml`）：apt 安装 qemu-system-x86 与
+  xorriso 后运行 `zig build smoke`（单核）+ `zig build smoke-smp`（双核），TCG 软模拟
+  不依赖 /dev/kvm；Limine 由 limine_bootstrap.sh 按固定 commit 现场克隆构建，disk.img 走
+  manifest 校验。自此每次推送/PR 都过完整 boot-to-shell 门禁，此前 CI 只跑主机测试。
+- 本地可验证的部分已全部验证（YAML schema、作业步骤）；GitHub 侧运行结果以 gh 观察为准。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:

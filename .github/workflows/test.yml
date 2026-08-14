@@ -18,3 +18,27 @@ jobs:
         with:
           version: 0.16.0
       - run: python3 tools/observe_test_duration.py -- zig build test --summary all
+
+  # QEMU 冒烟门禁：单核 + 双核 boot-to-shell（全部 init 自动测试 + 标记断言）。
+  # TCG 软模拟即可（不依赖 /dev/kvm）；Limine 由 limine_bootstrap.sh 按固定
+  # commit 克隆构建；disk.img 是跟踪在库的规范 fixture（manifest 校验）。
+  smoke-qemu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      # v2.0.0
+      - uses: mlugg/setup-zig@0270eb3bdaaf2a98f1e5c7f84c15c71ad4ca6ceb
+        with:
+          version: 0.16.0
+      - name: Install QEMU and xorriso
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 xorriso
+      - name: Smoke SMP=1
+        run: zig build smoke
+        env:
+          MOQI_SMOKE_TIMEOUT: 600
+      - name: Smoke SMP=2
+        run: zig build smoke-smp
+        env:
+          MOQI_SMOKE_TIMEOUT: 600

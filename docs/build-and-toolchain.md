@@ -411,7 +411,9 @@ no `duration_ms`. This P1 mode does not provide QEMU runtime samples.
 - 用户程序起始地址为 `0x0`，与某些链接器默认行为冲突，汇编程序必须显式 `-T user/user.ld`。
 - `zig build test` 使用主机目标，适合验证无硬件副作用的共享库函数；真正的内核/用户态集成仍以
   `zig build run` 下的 QEMU `hello*` 运行时测试为准。GitHub CI 在每次推送和拉取请求运行
-  `zig build test --summary all`，不包含 QEMU 或 Limine 作业。
+  `zig build test --summary all`（host-tests 作业），并自 2026-08-14 起以 `smoke-qemu` 作业
+  运行 QEMU 冒烟门禁（`zig build smoke` 单核 + `zig build smoke-smp` 双核，TCG 软模拟，
+  不依赖 /dev/kvm；Limine 按固定 commit 现场克隆构建，disk.img 走 manifest 校验）。
 
 ---
 
