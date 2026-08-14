@@ -266,6 +266,37 @@ test "NOFILE policy returns the applied limit for prlimit get/set" {
     try std.testing.expectEqual(@as(u64, 16), updated.max);
 }
 
+test "STACK floor clamps to the architecture region" {
+    const top: u64 = 0x0080_0000;
+    const bottom: u64 = 0x0001_0000;
+    // 8 MiB soft limit covers the whole region → floor is the region bottom.
+    try std.testing.expectEqual(bottom, rlimit.Policy.stackFloor(top, bottom, 8 * 1024 * 1024));
+    // RLIM_INFINITY behaves the same — enforcement never leaves the region.
+    try std.testing.expectEqual(bottom, rlimit.Policy.stackFloor(top, bottom, rlimit.RLIM_INFINITY));
+    // 64 KiB soft limit → floor is 64 KiB below the top.
+    try std.testing.expectEqual(top - 64 * 1024, rlimit.Policy.stackFloor(top, bottom, 64 * 1024));
+    // Initial watermark: historical 256 KiB head start, clamped by the floor.
+    try std.testing.expectEqual(top - 64 * 4096, rlimit.Policy.initialStackLimit(top, bottom, 8 * 1024 * 1024));
+    try std.testing.expectEqual(top - 64 * 1024, rlimit.Policy.initialStackLimit(top, bottom, 64 * 1024));
+}
+
+test "STACK setrlimit validation mirrors NOFILE privilege rules" {
+    const current: rlimit.Limit = .{ .cur = 8 * 1024 * 1024, .max = 8 * 1024 * 1024 };
+    // cur > max is structurally invalid.
+    try std.testing.expectError(error.InvalidLimit, rlimit.Policy.applyStack(current, .{ .cur = 2, .max = 1 }, false));
+    // No table-size ceiling: RLIM_INFINITY is a valid value.
+    const inf = try rlimit.Policy.applyStack(current, .{ .cur = 8 * 1024 * 1024, .max = rlimit.RLIM_INFINITY }, true);
+    try std.testing.expectEqual(rlimit.RLIM_INFINITY, inf.max);
+    // Raising soft above the current hard limit necessarily raises the hard
+    // limit too (cur <= max), and needs privilege either way.
+    try std.testing.expectError(error.WouldLowerHardLimit, rlimit.Policy.applyStack(current, .{ .cur = 16 * 1024 * 1024, .max = 16 * 1024 * 1024 }, false));
+    try std.testing.expectError(error.WouldLowerHardLimit, rlimit.Policy.applyStack(current, .{ .cur = 1024, .max = rlimit.RLIM_INFINITY }, false));
+    // Lowering both is always allowed; soft may rise up to the hard limit.
+    const lowered = try rlimit.Policy.applyStack(current, .{ .cur = 64 * 1024, .max = 128 * 1024 }, false);
+    try std.testing.expectEqual(@as(u64, 64 * 1024), lowered.cur);
+    _ = try rlimit.Policy.applyStack(current, .{ .cur = 8 * 1024 * 1024, .max = 8 * 1024 * 1024 }, false);
+}
+
 test "DAC decodes open access modes and adds write for truncate" {
     try std.testing.expectEqual(dac.Access.read, dac.accessForOpen(0));
     try std.testing.expectEqual(dac.Access.write, dac.accessForOpen(1));
