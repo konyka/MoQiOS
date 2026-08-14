@@ -49,6 +49,8 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.nofile_cur = parent.nofile_cur;
     child.nofile_max = parent.nofile_max;
     child.fd_table.alloc_limit = child.nofile_cur;
+    child.stack_cur = parent.stack_cur;
+    child.stack_max = parent.stack_max;
 
     for (0..vfs_mod.MAX_FDS) |i| {
         child.fd_table.fds[i] = parent.fd_table.fds[i];

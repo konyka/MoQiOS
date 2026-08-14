@@ -3421,17 +3421,18 @@ fn syscallGetrlimit(resource: u32, rlim_ptr: u64) i64 {
 
     var rlim: Rlimit = .{};
     switch (resource) {
-        RLIMIT_NOFILE => {
+        RLIMIT_NOFILE, RLIMIT_STACK => {
             const sched = @import("../../proc/sched.zig");
             const tm = @import("../../proc/task.zig");
             const idx = sched.currentTaskIndex() orelse return -3;
             const task = tm.getTask(idx) orelse return -3;
-            rlim.rlim_cur = task.nofile_cur;
-            rlim.rlim_max = task.nofile_max;
-        },
-        RLIMIT_STACK => {
-            rlim.rlim_cur = 8 * 1024 * 1024; // 8MB
-            rlim.rlim_max = 8 * 1024 * 1024;
+            if (resource == RLIMIT_NOFILE) {
+                rlim.rlim_cur = task.nofile_cur;
+                rlim.rlim_max = task.nofile_max;
+            } else {
+                rlim.rlim_cur = task.stack_cur;
+                rlim.rlim_max = task.stack_max;
+            }
         },
         RLIMIT_AS => {
             rlim.rlim_cur = RLIM_INFINITY;
@@ -3454,14 +3455,15 @@ fn syscallGetrlimit(resource: u32, rlim_ptr: u64) i64 {
 }
 
 /// setrlimit(resource, rlim_ptr) — set resource limit.
-/// Simplified: accept but don't enforce (return 0).
+/// Real per-task operation for RLIMIT_NOFILE and RLIMIT_STACK; other
+/// resources are accepted but not enforced (return 0).
 fn syscallSetrlimit(resource: u32, rlim_ptr: u64) i64 {
     if (rlim_ptr == 0 or rlim_ptr >= 0x0000_8000_0000_0000) return -14;
     const copy = @import("../../mm/copy_from_user.zig");
     const bo = @import("../../lib/byte_order.zig");
     var buf: [16]u8 = undefined;
     if (copy.copyFromUser(&buf, @ptrFromInt(rlim_ptr), 16) != 16) return -14;
-    if (resource != RLIMIT_NOFILE) return 0;
+    if (resource != RLIMIT_NOFILE and resource != RLIMIT_STACK) return 0;
     const next = @import("../../proc/rlimit.zig").Limit{ .cur = bo.readU64At(&buf, 0), .max = bo.readU64At(&buf, 8) };
     const sched = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
@@ -3471,6 +3473,22 @@ fn syscallSetrlimit(resource: u32, rlim_ptr: u64) i64 {
     defer tm.unlockTask(lock_flags);
     const task = tm.getTask(idx) orelse return -3;
     const privileged = @field(task.effective_caps, "cap_sys_resource");
+    if (resource == RLIMIT_STACK) {
+        const applied = policy.applyStack(.{ .cur = task.stack_cur, .max = task.stack_max }, next, privileged) catch |err| return switch (err) {
+            error.InvalidLimit => -22,
+            error.WouldLowerHardLimit => -1,
+        };
+        task.stack_cur = applied.cur;
+        task.stack_max = applied.max;
+        // Raising the soft limit widens the floor naturally on the next
+        // growth fault; lowering it must lift the watermark immediately so
+        // direct-map faults cannot slip in between the old watermark and the
+        // new floor.
+        const user_space = @import("../../mm/user_space.zig");
+        const floor = policy.stackFloor(user_space.USER_STACK_TOP, user_space.USER_STACK_BOTTOM, applied.cur);
+        if (task.stack_limit < floor) task.stack_limit = floor;
+        return 0;
+    }
     const applied = policy.apply(.{ .cur = task.nofile_cur, .max = task.nofile_max }, next, vfs_mod.MAX_FDS, privileged) catch |err| return switch (err) {
         error.InvalidLimit => -22,
         error.WouldLowerHardLimit => -1,
@@ -4103,8 +4121,8 @@ fn syscallPrlimit64(pid: u32, resource: u32, new_limit_ptr: u64, old_limit_ptr: 
                 old_limit.rlim_max = target.nofile_max;
             },
             RLIMIT_STACK => {
-                old_limit.rlim_cur = 8 * 1024 * 1024;
-                old_limit.rlim_max = 8 * 1024 * 1024;
+                old_limit.rlim_cur = target.stack_cur;
+                old_limit.rlim_max = target.stack_max;
             },
             else => {
                 old_limit.rlim_cur = RLIM_INFINITY;
@@ -4125,20 +4143,32 @@ fn syscallPrlimit64(pid: u32, resource: u32, new_limit_ptr: u64, old_limit_ptr: 
         if (new_limit_ptr >= 0x0000_8000_0000_0000) return -14;
         var nbuf: [16]u8 = undefined;
         if (copy.copyFromUser(nbuf[0..], @ptrFromInt(new_limit_ptr), 16) != 16) return -14;
-        if (resource == RLIMIT_NOFILE) {
+        if (resource == RLIMIT_NOFILE or resource == RLIMIT_STACK) {
             const next = @import("../../proc/rlimit.zig").Limit{ .cur = bo.readU64At(&nbuf, 0), .max = bo.readU64At(&nbuf, 8) };
             const policy = @import("../../proc/rlimit.zig").Policy;
             const lock_flags = tm.lockTask();
             defer tm.unlockTask(lock_flags);
             const target_idx = tm.findTaskByTidLocked(target_tid) orelse return -3;
             const target = tm.getTask(target_idx) orelse return -3;
-            const applied = policy.apply(.{ .cur = target.nofile_cur, .max = target.nofile_max }, next, vfs_mod.MAX_FDS, privileged) catch |err| return switch (err) {
-                error.InvalidLimit => -22,
-                error.WouldLowerHardLimit => -1,
-            };
-            target.nofile_cur = applied.cur;
-            target.nofile_max = applied.max;
-            target.fd_table.alloc_limit = applied.cur;
+            if (resource == RLIMIT_STACK) {
+                const applied = policy.applyStack(.{ .cur = target.stack_cur, .max = target.stack_max }, next, privileged) catch |err| return switch (err) {
+                    error.InvalidLimit => -22,
+                    error.WouldLowerHardLimit => -1,
+                };
+                target.stack_cur = applied.cur;
+                target.stack_max = applied.max;
+                const user_space = @import("../../mm/user_space.zig");
+                const floor = policy.stackFloor(user_space.USER_STACK_TOP, user_space.USER_STACK_BOTTOM, applied.cur);
+                if (target.stack_limit < floor) target.stack_limit = floor;
+            } else {
+                const applied = policy.apply(.{ .cur = target.nofile_cur, .max = target.nofile_max }, next, vfs_mod.MAX_FDS, privileged) catch |err| return switch (err) {
+                    error.InvalidLimit => -22,
+                    error.WouldLowerHardLimit => -1,
+                };
+                target.nofile_cur = applied.cur;
+                target.nofile_max = applied.max;
+                target.fd_table.alloc_limit = applied.cur;
+            }
         }
     }
     return 0;

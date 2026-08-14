@@ -188,6 +188,8 @@ pub fn clone(
     const child = task_mod.getTask(child_idx).?;
     child.nofile_cur = parent.nofile_cur;
     child.nofile_max = parent.nofile_max;
+    child.stack_cur = parent.stack_cur;
+    child.stack_max = parent.stack_max;
 
     child.brk_current = parent.brk_current;
     child.stack_limit = parent.stack_limit;

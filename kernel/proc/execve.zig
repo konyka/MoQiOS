@@ -105,6 +105,14 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
     cur.page_table_phys = result.pml4;
     cur.user_entry = result.entry;
     cur.user_stack_top = result.stack_top;
+    // RLIMIT_STACK is preserved across exec (like NOFILE), but the growth
+    // watermark belongs to the old image — reset it so a deep inherited
+    // watermark cannot bypass the limit's floor in the fresh image.
+    cur.stack_limit = @import("rlimit.zig").Policy.initialStackLimit(
+        result.stack_top,
+        @import("../mm/user_space.zig").USER_STACK_BOTTOM,
+        cur.stack_cur,
+    );
     cur.brk_current = result.brk;
     cur.brk_start = result.brk;
     // The old TLS block belonged to the replaced image. Program the CPU too:
@@ -249,6 +257,12 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64)
     cur.page_table_phys = result.pml4;
     cur.user_entry = result.entry;
     cur.user_stack_top = result.stack_top;
+    // RLIMIT_STACK preserved across exec; watermark resets for the new image.
+    cur.stack_limit = @import("rlimit.zig").Policy.initialStackLimit(
+        result.stack_top,
+        @import("../mm/user_space.zig").USER_STACK_BOTTOM,
+        cur.stack_cur,
+    );
     cur.brk_current = result.brk;
     cur.brk_start = result.brk;
     // The old TLS block belonged to the replaced image. Program the CPU too:

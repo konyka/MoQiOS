@@ -129,6 +129,11 @@ pub const Task = struct {
     /// Per-task RLIMIT_NOFILE; defaults preserve the historical MAX_FDS cap.
     nofile_cur: u64 = @import("../fs/vfs.zig").MAX_FDS,
     nofile_max: u64 = @import("../fs/vfs.zig").MAX_FDS,
+    /// Per-task RLIMIT_STACK in bytes; enforced as the main-stack growth
+    /// floor in the demand-paging fault path. Defaults match the values the
+    /// former stub reported.
+    stack_cur: u64 = 8 * 1024 * 1024,
+    stack_max: u64 = 8 * 1024 * 1024,
 
     /// Bitmask of pending signals (bit N = signal N+1 is pending).
     /// Signals 1-31 supported. Bit 0 = SIGHUP (1), bit 30 = SIGUSR2 (31).
@@ -1036,7 +1041,13 @@ pub fn createUserProcess(
         tasks[slot].sgid = profile.gid;
         tasks[slot].user_entry = user_entry;
         tasks[slot].user_stack_top = user_stack_top;
-        tasks[slot].stack_limit = user_stack_top - 64 * 4096;
+        tasks[slot].stack_cur = 8 * 1024 * 1024;
+        tasks[slot].stack_max = 8 * 1024 * 1024;
+        tasks[slot].stack_limit = @import("rlimit.zig").Policy.initialStackLimit(
+            user_stack_top,
+            @import("../mm/user_space.zig").USER_STACK_BOTTOM,
+            tasks[slot].stack_cur,
+        );
         tasks[slot].parent_tid = parent_tid_val;
         tasks[slot].fd_table = fd_table;
         tasks[slot].nofile_cur = @import("../fs/vfs.zig").MAX_FDS;

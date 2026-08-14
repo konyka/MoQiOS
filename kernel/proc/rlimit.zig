@@ -1,9 +1,12 @@
-//! Pure RLIMIT_NOFILE policy. Other resource limits remain syscall stubs.
+//! Pure rlimit policy: RLIMIT_NOFILE descriptor bounds and RLIMIT_STACK
+//! growth-floor semantics. Other resource limits remain syscall stubs.
 
 pub const Limit = struct {
     cur: u64,
     max: u64,
 };
+
+pub const RLIM_INFINITY: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 
 pub const Policy = struct {
     pub const Error = error{ InvalidLimit, WouldLowerHardLimit };
@@ -71,6 +74,36 @@ pub const Policy = struct {
     pub fn apply(current: Limit, next: Limit, max_fds: u32, privileged: bool) Error!Limit {
         try validate(next, max_fds);
         if (next.max > current.max and !privileged) return error.WouldLowerHardLimit;
+        if ((next.cur > current.max or next.max > current.max) and !privileged) {
+            return error.WouldLowerHardLimit;
+        }
+        return next;
+    }
+
+    // ── RLIMIT_STACK ─────────────────────────────────────────────────
+
+    /// Stack growth floor: the lowest address the main stack may claim.
+    /// `cur == RLIM_INFINITY` (or any value past the region) clamps to
+    /// `stack_bottom`, so enforcement never exceeds the architecture region.
+    pub fn stackFloor(stack_top: u64, stack_bottom: u64, cur: u64) u64 {
+        const region = stack_top - stack_bottom;
+        return stack_top - @min(cur, region);
+    }
+
+    /// Initial/reset growth watermark for a fresh image: the historical
+    /// 256 KiB head start, clamped so a tighter limit is honoured from the
+    /// very first fault.
+    pub fn initialStackLimit(stack_top: u64, stack_bottom: u64, cur: u64) u64 {
+        const floor = stackFloor(stack_top, stack_bottom, cur);
+        const head_start = stack_top - 64 * 4096;
+        return @max(head_start, floor);
+    }
+
+    /// setrlimit/prlimit64 validation for RLIMIT_STACK. Same privilege rules
+    /// as NOFILE but no table-size ceiling: any value up to RLIM_INFINITY is
+    /// structurally valid, only `cur > max` is rejected.
+    pub fn applyStack(current: Limit, next: Limit, privileged: bool) Error!Limit {
+        if (next.cur > next.max) return error.InvalidLimit;
         if ((next.cur > current.max or next.max > current.max) and !privileged) {
             return error.WouldLowerHardLimit;
         }

@@ -791,9 +791,17 @@ fn handleDemandPage(frame: *InterruptFrame, fault_addr: u64) bool {
         if (page_addr < user_space.USER_STACK_BOTTOM) return false;
         // Check we don't grow into the heap region (brk)
         if (page_addr < current.brk_current + 4096) return false;
+        // RLIMIT_STACK: refuse growth below the soft-limit floor → SIGSEGV.
+        const rlimit = @import("../../proc/rlimit.zig");
+        const floor = rlimit.Policy.stackFloor(
+            user_space.USER_STACK_TOP,
+            user_space.USER_STACK_BOTTOM,
+            current.stack_cur,
+        );
+        if (page_addr < floor) return false;
         // Extend stack_limit — grow in chunks of 32 pages (128KB) for efficiency
         const new_limit = page_addr & ~@as(u64, 32 * paging_mod.PAGE_SIZE - 1);
-        current.stack_limit = @max(new_limit, user_space.USER_STACK_BOTTOM);
+        current.stack_limit = @max(new_limit, floor);
     }
 
     // Allocate a physical page
