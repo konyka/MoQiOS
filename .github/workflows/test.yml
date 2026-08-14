@@ -13,10 +13,12 @@ jobs:
     steps:
       # v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      # v2.0.0
-      - uses: mlugg/setup-zig@0270eb3bdaaf2a98f1e5c7f84c15c71ad4ca6ceb
-        with:
-          version: 0.16.0
+      - name: Install Zig 0.16.0
+        # 直装官方 tarball：第三方 setup action 的固定 commit 曾被上游改写导致
+        # CI 无法解析，自包含下载更稳。
+        run: |
+          curl -sSfL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | sudo tar -xJ -C /opt
+          echo "/opt/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
       - run: python3 tools/observe_test_duration.py -- zig build test --summary all
 
   # QEMU 冒烟门禁：单核 + 双核 boot-to-shell（全部 init 自动测试 + 标记断言）。
@@ -28,10 +30,10 @@ jobs:
     steps:
       # v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      # v2.0.0
-      - uses: mlugg/setup-zig@0270eb3bdaaf2a98f1e5c7f84c15c71ad4ca6ceb
-        with:
-          version: 0.16.0
+      - name: Install Zig 0.16.0
+        run: |
+          curl -sSfL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | sudo tar -xJ -C /opt
+          echo "/opt/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
       - name: Install QEMU and xorriso
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 xorriso
       - name: Smoke SMP=1
