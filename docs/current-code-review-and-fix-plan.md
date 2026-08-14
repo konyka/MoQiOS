@@ -1970,6 +1970,21 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 
 ---
 
+### 6.29 P2 批次第四轮（2026-08-14）：tmpfs 单文件上限扩容（一级间接页）
+
+- **问题**：tmpfs 每文件固定 64 页数组（256 KiB 硬顶），syslogd 日志等写路径只能在
+  触顶前单代轮转规避。
+- **方案（性能最优取向：直辖区零开销）**：ext2 式一级间接页——页号 0..63 仍走
+  `entry.pages[]` 直读；页号 64..575 经一页间接表（4KB = 512 个 u64 物理地址，0 为空洞），
+  间接页按需分配。单文件上限 64+512=576 页 = 2.25 MiB。`pageAt`/`pageAtAlloc` 两个 helper
+  收口全部访问点（read/write/truncate/mmap 读与写缺页/entry 释放）；`page_count` 升 u16。
+- **验收**：hello42 新增 600 KiB 大文件块——pwrite 全量 + 首/直辖末/间接首/末页 pread
+  抽查 + ftruncate 到 32 KiB 后旧位置读 EOF；SMP=1/4 smoke 全绿。
+- **顺路文档修正**：user-space §7.1 与 moqios-architecture-current 的 syslogd 轮询描述
+  滞后于 J3（kmsg 阻塞读、事件驱动），一并更正。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:

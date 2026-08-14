@@ -2184,7 +2184,8 @@ VFS 新增 `FdType.kmsg`（只读特殊文件，镜像 `/dev/urandom` 的接法�
 ### 12.3 syslogd ✅（J3 起事件驱动）
 
 `servers/syslogd` 是 kmsg 消费者：打开 `/dev/kmsg` 循环**阻塞读**，追加写入
-`/tmp/kern.log`（tmpfs，256 KiB 硬顶前单代轮换）。J3 之前内核不会阻塞，
+`/tmp/kern.log`（tmpfs，2.25 MiB 上限前单代轮换；2026-08-14 起旧 256 KiB 硬顶随一级
+间接页扩容移除）。J3 之前内核不会阻塞，
 daemon 以 `nanosleep(100ms)` 轮询；现在读本身在最新字节处睡眠，日志行追加即醒，
 投递完全事件驱动，无轮询、无空转。
 

@@ -312,13 +312,14 @@ SECTIONS {
 `lib/moqi_libc/include/unistd.h`）；内核在每次写前把 offset 重置为文件末尾，
 实现 O_APPEND 语义。
 
-**轮转**：tmpfs 单文件有 256 KiB 硬上限（`PAGES_PER_FILE * PAGE_SIZE`，触顶的写
-会被拒绝/短写），因此采用**写前轮转**——当下一次写入会使文件超过 256 KiB 时，
-先 close 并以 `O_WRONLY|O_CREAT|O_TRUNC|O_APPEND`（0x641）重开。单代轮转，
-旧内容直接丢弃，无 `.1` 备份。启动标记为 stdout 一行 `[syslogd] started`。
+**轮转**：tmpfs 单文件上限为 2.25 MiB（64 直辖页 + 512 间接页，2026-08-14 前的
+256 KiB 硬顶已随一级间接页扩容移除；触顶的写会被拒绝/短写），因此采用**写前轮转**——
+当下一次写入会使文件超过上限时，先 close 并以 `O_WRONLY|O_CREAT|O_TRUNC|O_APPEND`
+（0x641）重开。单代轮转，旧内容直接丢弃，无 `.1` 备份。启动标记为 stdout 一行
+`[syslogd] started`。
 
-**未来增强**：`/dev/kmsg` 目前不阻塞，syslogd 只能以 10 Hz 轮询；待内核为 kmsg
-提供阻塞读（或 poll/epoll 唤醒）后，应以阻塞读替换 nanosleep 兜底，改为事件驱动。
+**事件驱动**：自 J3 起 `/dev/kmsg` 支持阻塞读（读在最新字节处睡眠直到新日志到达），
+syslogd 主循环为阻塞读，无轮询。
 
 ---
 

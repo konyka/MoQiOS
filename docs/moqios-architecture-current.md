@@ -1322,9 +1322,10 @@ ramdisk 中但不自动运行，可在 shell 中手动执行。
 第一个用户态系统服务：以只读方式打开 `/dev/kmsg`（内核日志环，每 fd 独立游标，
 读到最新字节返回 0、不阻塞），循环 drain 并追加写入 `/tmp/kern.log`
 （`O_WRONLY|O_CREAT|O_APPEND` = 0x441；vfs open 仅将 `/tmp` 前缀路由到 tmpfs，
-`/var/log` 等路径会落到只读 ramdisk，故日志位于 tmpfs）。文件将超过 256 KiB
-（tmpfs 单文件硬上限）时先 close 再以 O_TRUNC 重开做写前轮转；空闲时
-`nanosleep(100ms)`，绝不忙等。启动标记 `[syslogd] started`。
+`/var/log` 等路径会落到只读 ramdisk，故日志位于 tmpfs）。文件将超过 2.25 MiB
+（tmpfs 单文件上限，2026-08-14 起为一级间接页扩容后的值）时先 close 再以
+O_TRUNC 重开做写前轮转；自 J3 起读在最新字节处阻塞，事件驱动、无轮询。
+启动标记 `[syslogd] started`。
 详见 [user-space.md](./user-space.md) 第 7 节。
 
 ---

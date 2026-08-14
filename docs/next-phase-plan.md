@@ -57,7 +57,7 @@
 - pthread v2 三件套：~~detached 线程栈回收~~（✅ 6.25）、~~CLONE_FILES 真共享 fd 表~~（✅ 6.27）、~~`__thread`（PT_TLS）~~（✅ 6.28，crt0 auxv 发现 + variant II 布局，内核零改动）——**全部完成**。
 - AHCI/SATA 实际 I/O 路径与 `io_sched.tryMerge` 验证（kernel-subsystems §6.4）——
   真机存储的前提。
-- tmpfs 单文件 256 KiB 上限扩容（user-space §7.1）。
+- ~~tmpfs 单文件 256 KiB 上限扩容~~（✅ 6.29 完成：一级间接页，64 直辖 + 512 间接 = 576 页 / 2.25 MiB，hello42 大文件验收；user-space §7.1）。
 - `mmap_regions` 固定 64 条目 → 动态 VMA 树（先做 profiling 证明需要，
   review §5.2g/§5.2t）。
 - 2MB 大页（尤其文件映射）与 fork COW OOM 半途回滚（review §5.6/§6.8）。
