@@ -56,12 +56,66 @@ fn isZeroPage(page: [*]const u8) bool {
 
 /// Clone the user-space page tables with Copy-on-Write semantics.
 /// Returns the physical address of the new PML4, or null on OOM.
+///
+/// Transactional three-phase structure (same as proc/fork.zig's
+/// cloneUserPagesCow): phase 0 demotes parent huge PDEs (neutral) and counts
+/// table pages; phase 1 preallocates them into a pool (failure frees only
+/// fresh, unlinked pages — parent untouched); phase 2 downgrades and fills
+/// with zero allocations, so OOM can neither abandon a half-built child tree
+/// nor leave the parent COW-marked for a child that does not exist.
 pub fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
     const ADDR_MASK: u64 = 0xFFFFFFFFF000;
 
-    const child_pml4_phys = pmm_mod.allocPage() orelse return null;
+    const parent_pml4: [*]const u64 = @ptrFromInt(hhdm_mod.physToVirt(parent_pml4_phys));
+
+    // ── Phase 0: demote + count ──────────────────────────────────────
+    var needed: u32 = 1; // the child PML4 itself
+    for (0..256) |pml4_idx| {
+        const pml4e = parent_pml4[pml4_idx];
+        if (pml4e == 0 or pml4e & 1 == 0) continue;
+        needed += 1;
+
+        const count_pdpt: [*]const u64 = @ptrFromInt(hhdm_mod.physToVirt(pml4e & ADDR_MASK));
+        for (0..512) |pdpt_idx| {
+            const pdpte = count_pdpt[pdpt_idx];
+            if (pdpte == 0 or pdpte & 1 == 0) continue;
+            needed += 1;
+
+            const count_pd: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(pdpte & ADDR_MASK));
+            for (0..512) |pd_idx| {
+                // I1: a 2MiB user huge PDE is a data frame, not a PT —
+                // demote it in the parent before the 4K COW walk below.
+                const huge_virt = (@as(u64, pml4_idx) << 39) |
+                    (@as(u64, pdpt_idx) << 30) | (@as(u64, pd_idx) << 21);
+                paging_mod.demoteHugePage(parent_pml4_phys, huge_virt) catch return null;
+                const pde = count_pd[pd_idx];
+                if (pde == 0 or pde & 1 == 0) continue;
+                needed += 1;
+            }
+        }
+    }
+    // 512 pool entries cover 1 GiB of 4K PTEs — more than the machine's RAM.
+    if (needed > 512) return null;
+
+    // ── Phase 1: preallocate pool + tables ───────────────────────────
+    const pool_phys = pmm_mod.allocPage() orelse return null;
+    const pool: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(pool_phys));
+    var got: u32 = 0;
+    while (got < needed) : (got += 1) {
+        pool[got] = pmm_mod.allocPage() orelse {
+            for (0..got) |j| pmm_mod.freePage(pool[j]);
+            pmm_mod.freePage(pool_phys);
+            return null;
+        };
+        const t: [*]u8 = @ptrFromInt(hhdm_mod.physToVirt(pool[got]));
+        @memset(t[0..4096], 0);
+    }
+    defer pmm_mod.freePage(pool_phys);
+
+    // ── Phase 2: build + downgrade (allocation-free, cannot fail) ────
+    var next: u32 = 1;
+    const child_pml4_phys = pool[0];
     const child_pml4: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(child_pml4_phys));
-    @memset(child_pml4[0..512], 0);
 
     const kernel_pml4_phys = paging_mod.getKernelPml4();
     const kernel_pml4: [*]const u64 = @ptrFromInt(hhdm_mod.physToVirt(kernel_pml4_phys));
@@ -69,17 +123,18 @@ pub fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
         child_pml4[i] = kernel_pml4[i];
     }
 
-    const parent_pml4: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(parent_pml4_phys));
-
     for (0..256) |pml4_idx| {
         const pml4e = parent_pml4[pml4_idx];
         if (pml4e == 0) continue;
         if (pml4e & 1 == 0) continue;
 
         const parent_pdpt_phys = pml4e & ADDR_MASK;
-        const child_pdpt_phys = pmm_mod.allocPage() orelse return null;
+        // A table that appeared after phase 0 would overflow the pool —
+        // abort rather than index past it (concurrent CLONE_VM mutation).
+        if (next >= needed) return abortClone(child_pml4_phys);
+        const child_pdpt_phys = pool[next];
+        next += 1;
         const child_pdpt: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(child_pdpt_phys));
-        @memset(child_pdpt[0..512], 0);
         child_pml4[pml4_idx] = child_pdpt_phys | 0x07;
 
         const parent_pdpt: [*]const u64 = @ptrFromInt(hhdm_mod.physToVirt(parent_pdpt_phys));
@@ -90,27 +145,29 @@ pub fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
             if (pdpte & 1 == 0) continue;
 
             const parent_pd_phys = pdpte & ADDR_MASK;
-            const child_pd_phys = pmm_mod.allocPage() orelse return null;
+            if (next >= needed) return abortClone(child_pml4_phys);
+            const child_pd_phys = pool[next];
+            next += 1;
             const child_pd: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(child_pd_phys));
-            @memset(child_pd[0..512], 0);
             child_pdpt[pdpt_idx] = child_pd_phys | 0x07;
 
-            const parent_pd: [*]const u64 = @ptrFromInt(hhdm_mod.physToVirt(parent_pd_phys));
+            const parent_pd: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(parent_pd_phys));
 
             for (0..512) |pd_idx| {
-                // I1: a 2MiB user huge PDE is a data frame, not a PT —
-                // demote it in the parent before the 4K COW walk below.
+                // Phase 0 already demoted every huge PDE; this is a no-op
+                // safeguard against one appearing between the phases.
                 const huge_virt = (@as(u64, pml4_idx) << 39) |
                     (@as(u64, pdpt_idx) << 30) | (@as(u64, pd_idx) << 21);
-                paging_mod.demoteHugePage(parent_pml4_phys, huge_virt) catch return null;
+                paging_mod.demoteHugePage(parent_pml4_phys, huge_virt) catch return abortClone(child_pml4_phys);
                 const pde = parent_pd[pd_idx];
                 if (pde == 0) continue;
                 if (pde & 1 == 0) continue;
 
                 const parent_pt_phys = pde & ADDR_MASK;
-                const child_pt_phys = pmm_mod.allocPage() orelse return null;
+                if (next >= needed) return abortClone(child_pml4_phys);
+                const child_pt_phys = pool[next];
+                next += 1;
                 const child_pt: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(child_pt_phys));
-                @memset(child_pt[0..512], 0);
                 child_pd[pd_idx] = child_pt_phys | 0x07;
 
                 const parent_pt: [*]u64 = @ptrFromInt(hhdm_mod.physToVirt(parent_pt_phys));
@@ -143,6 +200,13 @@ pub fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
     const tlb = @import("tlb.zig");
     tlb.shootdownRange(0, 1 << 31, parent_pml4_phys);
     return child_pml4_phys;
+}
+
+/// Roll back a half-built child tree (destroyUserSpace tolerates a partial
+/// tree and its batched frees undo the addRef increments on shared pages).
+fn abortClone(child_pml4_phys: u64) ?u64 {
+    @import("../../mm/user_space.zig").destroyUserSpace(child_pml4_phys);
+    return null;
 }
 
 // ── clone() syscall ──────────────────────────────────────────────────
