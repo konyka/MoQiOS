@@ -19,8 +19,9 @@ before attempting duplication. Successful `dup3(..., O_CLOEXEC)` calls mark the
 new descriptor `FD_CLOEXEC` throughout the VFS descriptor table.
 
 `getrlimit`, `setrlimit`, and `prlimit64` provide real per-task operations for
-`RLIMIT_NOFILE` and `RLIMIT_STACK`. All other `RLIMIT_*` resource types retain
-their existing reported/stub behavior and are not enforced.
+`RLIMIT_NOFILE`, `RLIMIT_STACK`, and `RLIMIT_AS`. All other `RLIMIT_*`
+resource types retain their existing reported/stub behavior and are not
+enforced.
 
 ## RLIMIT_STACK execution semantics
 
@@ -45,6 +46,29 @@ inherited from the previous image cannot bypass the floor.
 limit — without `cap_sys_resource` is `EPERM`. Limits are inherited across
 fork/clone. `CLONE_VM` thread stacks are mmap-backed and outside the
 auto-grow region, so the limit constrains only the main stack, as on Linux.
+
+## RLIMIT_AS execution semantics
+
+`RLIMIT_AS` carries per-task soft/hard byte limits over the total charged
+address space (default `RLIM_INFINITY` / `RLIM_INFINITY`, matching the former
+stub report, so an untouched task sees no behaviour change). The kernel keeps
+a per-task `as_used` byte counter; a charge that would push it past the soft
+limit is refused per interface: `mmap`/anonymous `mremap` growth fail with
+`ENOMEM`, `brk` reports the unchanged break, and stack demand-growth is
+refused exactly like crossing the stack floor — `SIGSEGV`.
+
+Charged: `brk` heap pages, every mmap-tracked region (anonymous, file-backed,
+and eager device regions such as fb0/MMIO), and each demand-faulted main-stack
+page. Not charged: the exec'd image's code/data demand pages, kernel
+structures, and page tables. `munmap`/`mremap` shrink/`brk` shrink refund;
+`MAP_FIXED` replacement refunds the old range before charging the new one, so
+a same-size replace never trips the limit. Fork copies the limits and the
+current usage (the child's space mirrors the parent's); exec preserves the
+limits and resets usage to zero — the fresh image starts uncharged like a
+newly created task. Validation is the same byte-denominated rule set as
+`RLIMIT_STACK` (`applyBytes`: `cur > max` → `EINVAL`, raising hard/soft above
+the current hard without `cap_sys_resource` → `EPERM`); lowering below the
+current usage is legal and only blocks further charges, matching Linux.
 
 Linux-personality x86_64 tasks may call `setrlimit` at syscall 160 and
 `prlimit64` at syscall 302. Native syscall 160 remains `dup`, and native

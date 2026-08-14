@@ -1069,7 +1069,7 @@ LAPIC Timer 中断
 - **lseek**: SEEK_SET/SEEK_CUR/SEEK_END 三种定位模式
 - **stat/lstat**: 路径查询文件状态，填充 stat 缓冲区 (ino/mode/size)
 - **openat/newfstatat/unlinkat**: *at() 系列 glibc 必备 syscall
-- **getrlimit/prlimit64**: RLIMIT_NOFILE/STACK 真实执行（per-task 软/硬限），AS 等其余资源为查询 stub
+- **getrlimit/prlimit64**: RLIMIT_NOFILE/STACK/AS 真实执行（per-task 软/硬限），其余资源为查询 stub
 - **arch_prctl**: ARCH_SET_FS 设置 TLS 基址 (wrmsr MSR_FS_BASE)
 - **sysinfo**: 内存总量/空闲量查询 (PMM totalPages/freePages)
 - **epoll_pwait**: 委托 epoll_wait，忽略信号掩码

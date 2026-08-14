@@ -2060,6 +2060,34 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 
 ---
 
+### 6.33 P2 批次第七轮（2026-08-14）：RLIMIT_AS 真实执行（rlimit 扩展第二步）
+
+- **语义先行**：`docs/rlimit.md` 新增 "RLIMIT_AS execution semantics"——per-task
+  软/硬字节限（默认 RLIM_INFINITY，行为不变），内核维护 `as_used` 计费计数：
+  brk 堆页、所有 mmap 追踪区域（匿名/文件/设备 eagerly 映射）与按需增长的
+  主栈页计入；exec 镜像代码页、内核结构、页表不计。超限按接口区分：
+  mmap/mremap 增长 → ENOMEM，brk → 报原 break（POSIX），栈增长 → SIGSEGV。
+  munmap/shrink 退款；MAP_FIXED 先退旧再计新（同尺寸替换不触发）；fork 复制
+  限值与用量；exec 保留限值、用量清零。
+- **纯策略**：`applyStack` 更名 `applyBytes`（STACK/AS 共享的字节限校验）+
+  新增 `asChargeOk`（用量超限后只阻断不欠账）。
+- **记账挂钩**（最小侵入）：`trackMmapRegion`/`trackNoFreeRegion` 计费、
+  `untrackMmapRange` 按实际裁切退款（区域互不重叠，重叠求和精确）；
+  mremap 三个增长点（文件原地/匿名原地/moveMapping delta）各自计费；
+  brk 增/缩计退；idt 栈缺页逐页计费（swap-in 提前返回不重复计）。
+- **syscall 接线**：getrlimit/setrlimit/prlimit64 的 RLIMIT_AS 从 INFINITY stub
+  改为真实 per-task 读写；下调低于当前用量合法（只阻断后续计费，同 Linux）。
+- **验收**：hello60 覆盖默认 INFINITY、cur>max → EINVAL、1 MiB 软限下子进程
+  递归栈计费耗尽被 SIGSEGV 杀（串日志实证第 257 页 0x7bf000 被拒 = 恰好
+  1 MiB）、16 MiB 软限下 1 MiB mmap 成功 / 64 MiB mmap ENOMEM、munmap 退款后
+  再 mmap 成功、brk 32 MiB 被拒 / 64 KiB 成功、fork 继承。smoke 门禁新增
+  `hello60: PASS`/`hello60 done` 双标记。
+- **门禁**：`zig build`、`zig build test`（192 全绿，含 asChargeOk 边界组）、
+  smoke SMP=1（hello60 PASS）、SMP=4 stress 2/2 全绿。
+- 其余 RLIMIT_*（NPROC/DATA/FSIZE/CORE/RSS）仍为上报 stub，待各自语义定稿。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:
