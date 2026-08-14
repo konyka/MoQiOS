@@ -1992,6 +1992,10 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   不依赖 /dev/kvm；Limine 由 limine_bootstrap.sh 按固定 commit 现场克隆构建，disk.img 走
   manifest 校验。自此每次推送/PR 都过完整 boot-to-shell 门禁，此前 CI 只跑主机测试。
 - 本地可验证的部分已全部验证（YAML schema、作业步骤）；GitHub 侧运行结果以 gh 观察为准。
+- **顺路修复既有 CI 失效**：`mlugg/setup-zig` 的固定 commit 已被上游改写而不可解析，
+  两个作业在 setup 阶段即失败（与本次 smoke 作业无关，推送前已存在）。改为直接下载
+  ziglang.org 官方 0.16.0 tarball 到 /opt 并写入 GITHUB_PATH——自包含，不受第三方
+  action 仓库漂移影响。
 
 ---
 
