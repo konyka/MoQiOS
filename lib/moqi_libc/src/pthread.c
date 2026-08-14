@@ -1,13 +1,15 @@
-/* pthread.c — MoQiOS pthread 子集实现（v1）。
+/* pthread.c — MoQiOS pthread 子集实现（v2）。
  *
- * 布局：每个线程的 TCB 位于其独立分配区头部，栈区紧随其后；
- * FS base 指向 TCB（variant I：TCB[0]=self）。子线程 FS 由内核经
- * CLONE_SETTLS 安装，主线程由 crt0 经 arch_prctl 安装。
+ * 布局：x86-64 TLS variant II —— FS base（tp）指向 TCB（TCB[0]=self），
+ * 程序 PT_TLS 模板的每线程副本位于 tp 下方（编译器 LE 模型以负偏移访问
+ * __thread 变量）。无 PT_TLS 的程序保持 v1 布局（TCB 在分配区头部）。
+ * 子线程 FS 由内核经 CLONE_SETTLS 安装，主线程由 crt0 经 arch_prctl 安装。
  *
  * 无竞争路径零系统调用：mutex/once 是 glibc 风格 futex 状态机。
  */
 #include "../include/pthread.h"
 #include "../include/stdlib.h"
+#include "../include/string.h"
 #include "../include/unistd.h"
 #include "../include/moqi_syscalls.h"
 
@@ -25,6 +27,67 @@
 #define FUTEX_WAKE      1
 
 #define THREAD_STACK_SIZE (64 * 1024)
+
+/* ── PT_TLS 模板（__thread 支持） ─────────────────────────────────────
+ * crt0 在 main 前调用 __moqi_tls_setup(sp)：从初始栈 auxv 取 AT_PHDR/
+ * AT_PHNUM/AT_PHENT，扫描出 PT_TLS 段，记录模板位置与尺寸。
+ * tls_block_size = align_up(memsz, align)：每个线程的 TLS 副本占用
+ * tp 正下方的这么多字节；0 表示程序没有 PT_TLS。 */
+#define AT_PHDR  3
+#define AT_PHENT 4
+#define AT_PHNUM 5
+#define PT_TLS   7
+
+static const char *tls_image;
+static unsigned long tls_filesz;
+static unsigned long tls_memsz;
+static unsigned long tls_align = 8;
+static unsigned long tls_block_size;
+
+static unsigned long tls_align_up(unsigned long n, unsigned long a) {
+    return (n + a - 1) & ~(a - 1);
+}
+
+/* 由 crt0 的 _start_c 在 main 前调用；sp 为内核构建的初始栈。 */
+void __moqi_tls_setup(unsigned long *sp) {
+    long argc = (long)sp[0];
+    char **argv = (char **)(sp + 1);
+    char **envp = argv + argc + 1;
+    while (*envp) envp++;           /* 跳过 NULL 结尾的 envp 指针数组 */
+    unsigned long *auxv = (unsigned long *)(envp + 1);
+
+    unsigned long phdr = 0, phent = 56, phnum = 0;
+    for (unsigned long *a = auxv; a[0] != 0; a += 2) {
+        if (a[0] == AT_PHDR) phdr = a[1];
+        else if (a[0] == AT_PHENT) phent = a[1];
+        else if (a[0] == AT_PHNUM) phnum = a[1];
+    }
+    if (phdr == 0 || phnum == 0) return;
+
+    for (unsigned long i = 0; i < phnum; i++) {
+        const unsigned char *ph = (const unsigned char *)phdr + i * phent;
+        unsigned int p_type;
+        __builtin_memcpy(&p_type, ph, 4);
+        if (p_type != PT_TLS) continue;
+        unsigned long vaddr, filesz, memsz, align;
+        __builtin_memcpy(&vaddr, ph + 16, 8);
+        __builtin_memcpy(&filesz, ph + 32, 8);
+        __builtin_memcpy(&memsz, ph + 40, 8);
+        __builtin_memcpy(&align, ph + 48, 8);
+        tls_image = (const char *)vaddr;
+        tls_filesz = filesz;
+        tls_memsz = memsz;
+        if (align != 0) tls_align = align;
+        tls_block_size = tls_align_up(memsz, tls_align);
+        return;
+    }
+}
+
+/* 在 base 处复制 TLS 模板（filesz 拷贝 + memsz-filesz 清零）。 */
+static void tls_init_block(char *base) {
+    __builtin_memcpy(base, tls_image, tls_filesz);
+    __builtin_memset(base + tls_filesz, 0, tls_memsz - tls_filesz);
+}
 
 /* ── TCB ──────────────────────────────────────────────────────────── */
 typedef struct TCB {
@@ -67,9 +130,26 @@ static void dead_drain(void) {
 
 static TCB main_tcb = { .self = &main_tcb };
 
-/* crt0 在 main 前调用：为主线程安装 FS。 */
+/* crt0 在 main 前调用：为主线程安装 FS。有 PT_TLS 时主线程也需要动态
+ * 布局（TLS 块在 tp 正下方），静态 main_tcb 无法满足相对位置。 */
 void __pthread_init_main(void) {
-    syscall2(SYS_arch_prctl, ARCH_SET_FS, (long)&main_tcb);
+    if (tls_block_size == 0) {
+        syscall2(SYS_arch_prctl, ARCH_SET_FS, (long)&main_tcb);
+        return;
+    }
+    char *base = malloc(tls_block_size + tls_align + sizeof(TCB));
+    char *tls_start = (char *)tls_align_up((unsigned long)base, tls_align);
+    TCB *t = (TCB *)(tls_start + tls_block_size);
+    tls_init_block(tls_start);
+    t->self = t;
+    t->errno_val = 0;
+    t->state = 0;
+    t->retval = 0;
+    t->alloc_base = 0;              /* 主线程 TCB 永不回收 */
+    t->detached = 0;
+    t->dead_next = 0;
+    for (int i = 0; i < PTHREAD_KEYS_MAX; i++) t->specific[i] = 0;
+    syscall2(SYS_arch_prctl, ARCH_SET_FS, (long)t);
 }
 
 static inline TCB *tcb_self(void) {
@@ -105,9 +185,13 @@ int pthread_create(pthread_t *thread, const void *attr,
     (void)attr;
     /* v2：先回收已退出 detached 线程的栈块（见 dead_drain 注释）。 */
     dead_drain();
-    void *base = malloc(sizeof(TCB) + THREAD_STACK_SIZE);
+    /* PT_TLS 布局：[TLS 块（align 对齐）][TCB 于 tp][栈]；无模板时退化为
+     * v1 布局（TCB 在分配区头部）。多分配 align 字节以容纳对齐余量。 */
+    void *base = malloc(tls_block_size + tls_align + sizeof(TCB) + THREAD_STACK_SIZE);
     if (base == 0) return -12; /* ENOMEM */
-    TCB *t = (TCB *)base;
+    char *tls_start = (char *)tls_align_up((unsigned long)base, tls_align);
+    TCB *t = (TCB *)(tls_start + tls_block_size);
+    if (tls_block_size != 0) tls_init_block(tls_start);
     t->self = t;
     t->errno_val = 0;
     t->state = 0;
@@ -119,7 +203,7 @@ int pthread_create(pthread_t *thread, const void *attr,
     t->dead_next = 0;
     for (int i = 0; i < PTHREAD_KEYS_MAX; i++) t->specific[i] = 0;
 
-    long sp = (long)base + sizeof(TCB) + THREAD_STACK_SIZE;
+    long sp = (long)t + sizeof(TCB) + THREAD_STACK_SIZE;
     sp &= ~15L;
     long ret = clone_call(CLONE_VM | CLONE_FILES | CLONE_THREAD | CLONE_SETTLS,
                           sp, 0, 0, (long)t);

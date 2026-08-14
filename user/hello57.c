@@ -71,6 +71,24 @@ static void *fdshare_ebadf(void *arg) {
 /* detached 验收：线程仅原子自增后即退出，栈块由后续 create 惰性回收。 */
 static volatile long detached_done;
 
+/* __thread（PT_TLS）验收：.tdata 与 .tbss 各一，每线程写不同值并读回，
+ * 主线程的初始值不被子线程修改（隔离性）。 */
+static __thread long tls_data = 1234;
+static __thread long tls_zero;
+
+static void *tls_worker(void *arg) {
+    long id = (long)arg;
+    tls_data = id * 10 + 1;
+    tls_zero = id * 10 + 2;
+    /* 忙等一小段放大交错窗口，再读回验证未被其他线程串改。 */
+    for (volatile int i = 0; i < 200000; i++) {}
+    if (tls_data != id * 10 + 1 || tls_zero != id * 10 + 2) {
+        print("hello57: FAIL tls-isolation\n");
+        __sync_fetch_and_add(&failures, 1);
+    }
+    return (void *)0;
+}
+
 static void *detached_worker(void *arg) {
     (void)arg;
     __sync_fetch_and_add(&detached_done, 1);
@@ -195,6 +213,20 @@ int main(int argc, char **argv, char **envp) {
             failures++;
         }
         unlink("/tmp/h57shr.dat");
+    }
+
+    /* ── __thread（PT_TLS）：每线程副本互不串扰，主线程原值不变 ─────── */
+    {
+        pthread_t th[3];
+        for (long i = 0; i < 3; i++) {
+            if (pthread_create(&th[i], 0, tls_worker, (void *)i) != 0) {
+                print("hello57: FAIL tls-create\n");
+                failures++;
+            }
+        }
+        for (long i = 0; i < 3; i++) pthread_join(th[i], 0);
+        CHECK(tls_data == 1234, "tls-main-tdata");
+        CHECK(tls_zero == 0, "tls-main-tbss");
     }
 
     if (failures == 0) {

@@ -12,6 +12,7 @@
 
 extern int main(int argc, char **argv, char **envp);
 extern void __pthread_init_main(void);
+extern void __moqi_tls_setup(unsigned long *sp);
 
 /* Process environment, set by _start_c from the initial stack. */
 char **environ;
@@ -20,7 +21,8 @@ __attribute__((used)) void _start_c(unsigned long *sp) {
     long argc;
     char **argv;
     char **envp;
-    /* 先装主线程 FS/TCB（errno/getspecific 依赖），再进 main。 */
+    /* 先发现 PT_TLS 模板（auxv），再装主线程 FS/TCB（TLS 块布局依赖模板）。 */
+    __moqi_tls_setup(sp);
     __pthread_init_main();
     moqi_parse_initial_stack(sp, &argc, &argv, &envp);
     environ = envp;
