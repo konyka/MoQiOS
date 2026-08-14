@@ -62,7 +62,9 @@
   review §5.2g/§5.2t）。
 - 2MB 大页（尤其文件映射）与 fork COW OOM 半途回滚（review §5.6/§6.8）。
 - smoke 门禁 CI 化（当前 CI 只跑主机测试；QEMU 门禁依赖本地环境，review §1）。
-- rlimit 扩展到 NOFILE 之外的资源（先定执行语义再实现，避免 stub 蔓延）。
+- rlimit 扩展到 NOFILE 之外的资源（先定执行语义再实现，避免 stub 蔓延）——
+  ~~RLIMIT_STACK~~（✅ 6.31：缺页增长地板执行 + 真实 set/get/prlimit64，hello59 验收）；
+  AS/NPROC 等其余资源仍待各自语义定稿。
 
 ## P3：大项（需独立设计评审，不与其他工作混批）
 

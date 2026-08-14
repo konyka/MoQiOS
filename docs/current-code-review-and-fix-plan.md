@@ -1999,6 +1999,36 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 
 ---
 
+### 6.31 P2 批次第五轮（2026-08-14）：RLIMIT_STACK 真实执行（rlimit 扩展第一步）
+
+- **语义先行**（计划约束"先定执行语义再实现"）：`docs/rlimit.md` 新增
+  "RLIMIT_STACK execution semantics"——per-task 软/硬字节限（默认 8 MiB/8 MiB，
+  与原 stub 上报一致），在执行点定义 enforcement：缺页 demand-growth 的地板
+  `floor = USER_STACK_TOP - min(rlim_cur, region)`，越地板的栈 fault 拒绝对页并走
+  既有 SIGSEGV 投递（默认动作终止）；RLIM_INFINITY 软限仅受架构区域约束；下调
+  不解除已映射页，只抬升增长水位线；exec 保留限值但重置水位线，防止旧镜像的深
+  水位线绕过地板；fork/clone 继承；CLONE_VM 线程栈为 mmap 区域不受约束（与
+  Linux 一致）。
+- **纯策略**：`rlimit.zig` 新增 `Policy.stackFloor`/`initialStackLimit`/`applyStack`
+  （校验镜像 NOFILE 规则但无表容量上限：仅 `cur > max` 为 EINVAL，提硬限/软限超
+  现硬限需 cap_sys_resource 否则 EPERM）。
+- **内核接线**：`task.zig` 新增 `stack_cur/stack_max` 字段（槽位复用显式重置）；
+  fork/clone 拷贝；execve 两条路径重置水位线；`idt.zig` handleDemandPage 增长
+  分支执行地板（不变式 `stack_limit >= floor` 由初值、增长钳位与 setrlimit 抬升
+  三处共同维持）；getrlimit/setrlimit/prlimit64 三个入口的 RLIMIT_STACK 从固定
+  stub 改为真实 per-task 读写（setrlimit 下调时立即抬升目标水位线）。
+- **验收**：hello59（libc 程序）覆盖默认值 8MiB/8MiB、cur>max → EINVAL(-22)、
+  软限下调读回、prlimit64 读取、fork 继承、以及真实执行——子进程压到 64 KiB
+  后无限递归被 SIGSEGV 杀死（waitpid 状态 139）。串日志实证 fault 地址
+  `0x7efff8` = USER_STACK_TOP − 64 KiB，恰为地板，一次不多。
+- **门禁**：`zig build`、`zig build test`（191 全绿，含新增 STACK floor/applyStack
+  两组宿主机测试）、smoke SMP=1（hello59 PASS）、SMP=4 stress 2/2 全绿。
+  smoke 门禁标记新增 `hello59: PASS`/`hello59 done`。
+- 其余 RLIMIT_*（AS/NPROC/DATA/…）仍为上报 stub，待各自语义定稿后逐个执行，
+  避免 stub 蔓延。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:

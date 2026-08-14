@@ -19,8 +19,32 @@ before attempting duplication. Successful `dup3(..., O_CLOEXEC)` calls mark the
 new descriptor `FD_CLOEXEC` throughout the VFS descriptor table.
 
 `getrlimit`, `setrlimit`, and `prlimit64` provide real per-task operations for
-`RLIMIT_NOFILE`. All other `RLIMIT_*` resource types retain their existing
-reported/stub behavior and are not enforced in this milestone.
+`RLIMIT_NOFILE` and `RLIMIT_STACK`. All other `RLIMIT_*` resource types retain
+their existing reported/stub behavior and are not enforced.
+
+## RLIMIT_STACK execution semantics
+
+`RLIMIT_STACK` carries per-task soft/hard byte limits (default 8 MiB / 8 MiB,
+matching the values the stub previously reported). The soft limit is enforced
+at the demand-growth page-fault path: the growth floor is
+
+    floor = USER_STACK_TOP - min(rlim_cur, USER_STACK_TOP - USER_STACK_BOTTOM)
+
+so a fault whose growth would reach below `floor` is refused and delivered as
+`SIGSEGV`, exactly like any other unhandled stack fault. `RLIM_INFINITY` as
+the soft limit caps growth only at the architecture region bottom.
+Already-mapped stack pages are never unmapped by lowering the limit; lowering
+only raises the growth watermark (`stack_limit`) so no further page below the
+new floor can be claimed. `exec` preserves both limit values (like
+`RLIMIT_NOFILE`) but resets the watermark to
+`max(stack_top - 256 KiB, floor)` for the fresh image, so a deep watermark
+inherited from the previous image cannot bypass the floor.
+
+`setrlimit`/`prlimit64` validation mirrors the NOFILE policy: `cur > max` is
+`EINVAL`; raising the hard limit — or the soft limit above the current hard
+limit — without `cap_sys_resource` is `EPERM`. Limits are inherited across
+fork/clone. `CLONE_VM` thread stacks are mmap-backed and outside the
+auto-grow region, so the limit constrains only the main stack, as on Linux.
 
 Linux-personality x86_64 tasks may call `setrlimit` at syscall 160 and
 `prlimit64` at syscall 302. Native syscall 160 remains `dup`, and native
