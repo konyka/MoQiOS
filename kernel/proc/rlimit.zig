@@ -99,14 +99,25 @@ pub const Policy = struct {
         return @max(head_start, floor);
     }
 
-    /// setrlimit/prlimit64 validation for RLIMIT_STACK. Same privilege rules
-    /// as NOFILE but no table-size ceiling: any value up to RLIM_INFINITY is
-    /// structurally valid, only `cur > max` is rejected.
-    pub fn applyStack(current: Limit, next: Limit, privileged: bool) Error!Limit {
+    /// setrlimit/prlimit64 validation for byte-denominated limits
+    /// (RLIMIT_STACK, RLIMIT_AS). Same privilege rules as NOFILE but no
+    /// table-size ceiling: any value up to RLIM_INFINITY is structurally
+    /// valid, only `cur > max` is rejected.
+    pub fn applyBytes(current: Limit, next: Limit, privileged: bool) Error!Limit {
         if (next.cur > next.max) return error.InvalidLimit;
         if ((next.cur > current.max or next.max > current.max) and !privileged) {
             return error.WouldLowerHardLimit;
         }
         return next;
+    }
+
+    // ── RLIMIT_AS ────────────────────────────────────────────────────
+
+    /// RLIMIT_AS charge check: true when `add` more bytes fit under the soft
+    /// limit. `used` may already exceed `cur` after a limit lowering — that
+    /// only blocks further charges, never underflows.
+    pub fn asChargeOk(used: u64, add: u64, cur: u64) bool {
+        if (cur == RLIM_INFINITY) return true;
+        return used <= cur and add <= cur - used;
     }
 };

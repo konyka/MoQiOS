@@ -805,6 +805,12 @@ fn handleDemandPage(frame: *InterruptFrame, fault_addr: u64) bool {
     }
 
     // Allocate a physical page
+    if (in_stack_range) {
+        // RLIMIT_AS: each demand-faulted stack page charges; a charge past
+        // the soft limit refuses the fault exactly like crossing the stack
+        // floor — the caller turns false into SIGSEGV.
+        if (!@import("../../proc/rlimit.zig").Policy.asChargeOk(current.as_used, paging_mod.PAGE_SIZE, current.as_cur)) return false;
+    }
     const phys = pmm.allocPage() orelse return false;
     const virt = hhdm.physToVirt(phys);
     const page: [*]u8 = @ptrFromInt(virt);
@@ -822,6 +828,7 @@ fn handleDemandPage(frame: *InterruptFrame, fault_addr: u64) bool {
         pmm.freePage(phys);
         return false;
     };
+    if (in_stack_range) current.as_used += paging_mod.PAGE_SIZE;
 
     _ = frame;
     return true;

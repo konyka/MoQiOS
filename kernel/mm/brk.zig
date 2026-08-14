@@ -55,6 +55,13 @@ pub fn brk(addr: u64) i64 {
     const new_page = pageCeil(addr);
 
     if (new_page > old_page) {
+        // RLIMIT_AS: heap growth past the soft limit reports the unchanged
+        // break (POSIX brk failure), same as an allocation failure below.
+        const delta_bytes = (new_page - old_page) * PAGE;
+        if (!@import("../proc/rlimit.zig").Policy.asChargeOk(cur.as_used, delta_bytes, cur.as_cur)) {
+            return @bitCast(cur.brk_current);
+        }
+
         // Refuse to grow across pages that are already mapped. mapPage
         // overwrites a live PTE without complaint, which would strand the old
         // frame and hand the heap a region the process is still using
@@ -91,11 +98,13 @@ pub fn brk(addr: u64) i64 {
                 return @bitCast(cur.brk_current);
             };
         }
+        cur.as_used += delta_bytes; // RLIMIT_AS charge (checked above)
     } else if (new_page < old_page) {
         // Give the released pages back. The growth loop used to run
         // `old_page..new_page` unconditionally, so a shrinking break reversed
         // the range and panicked the kernel computing its length.
         releasePages(cur, new_page, old_page);
+        cur.as_used -|= (old_page - new_page) * PAGE; // RLIMIT_AS refund
     }
 
     cur.brk_current = addr;

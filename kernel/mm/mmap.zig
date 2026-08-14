@@ -179,6 +179,8 @@ pub const RegionFileMeta = struct {
 /// break the invariant that a region's huge blocks are its FIRST
 /// huge_pages*512 pages.
 fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, meta: ?RegionFileMeta, huge_pages: u32) void {
+    // RLIMIT_AS: every tracked region charges its full length (merged or new).
+    task.as_used += num_pages * user_space.PAGE_SIZE;
     const new_kind: u8 = if (meta) |m| @intFromEnum(m.kind) else 0;
     // Try to merge with an adjacent existing region (anonymous only)
     if (meta == null and huge_pages == 0) {
@@ -242,11 +244,16 @@ fn releaseRegionBacking(r: *task_mod.MmapRegion) void {
 fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
     const page = user_space.PAGE_SIZE;
     const end = base + num_pages * page;
+    // RLIMIT_AS refund: regions never overlap each other, so the sum of
+    // per-region overlap is exactly the number of pages being cut.
+    var refunded: u64 = 0;
+    defer task.as_used -|= refunded * page;
 
     for (&task.mmap_regions) |*r| {
         if (!r.active) continue;
         const r_end = r.base + r.num_pages * page;
         if (r.base >= end or r_end <= base) continue; // no overlap
+        refunded += (@min(end, r_end) - @max(base, r.base)) / page;
 
         // H1: unmapping any part of a MAP_SHARED ext2/fat32 region flushes
         // the inode's dirty mmap-owned cache pages first (cheap no-op when
@@ -370,6 +377,8 @@ pub fn canTrackRegionPub(task: *task_mod.Task, base: u64, num_pages: u64) bool {
 pub fn trackNoFreeRegion(task: *task_mod.Task, base: u64, num_pages: u64) bool {
     for (&task.mmap_regions) |*r| {
         if (!r.active) {
+            // RLIMIT_AS: eager device regions charge like any mapping.
+            task.as_used += num_pages * user_space.PAGE_SIZE;
             r.* = .{
                 .base = base,
                 .num_pages = num_pages,
@@ -499,6 +508,9 @@ fn moveMapping(task: *task_mod.Task, region: *task_mod.MmapRegion, new_base: u64
     const default_flags = paging_mod.MapFlags{ .writable = true, .user = true, .no_execute = true };
     const old_base = region.base;
     if (rangesOverlap(old_base, old_pages, new_base, new_pages)) return -22;
+    // RLIMIT_AS: a growing move charges the delta before any page is copied.
+    if (new_pages > old_pages and
+        !@import("../proc/rlimit.zig").Policy.asChargeOk(task.as_used, (new_pages - old_pages) * page, task.as_cur)) return -12; // ENOMEM
     var mapped: u64 = 0;
 
     // I1: the 4K copy loop below cannot read huge PDEs (getPageEntry
@@ -546,6 +558,13 @@ fn moveMapping(task: *task_mod.Task, region: *task_mod.MmapRegion, new_base: u64
     }
 
     unmapRange(task, old_base, old_pages);
+    // RLIMIT_AS: settle the delta (the region itself was neither tracked nor
+    // untracked by the move).
+    if (new_pages > old_pages) {
+        task.as_used += (new_pages - old_pages) * page;
+    } else if (old_pages > new_pages) {
+        task.as_used -|= (old_pages - new_pages) * page;
+    }
     region.base = new_base;
     region.num_pages = new_pages;
     return @bitCast(new_base);
@@ -721,6 +740,12 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
         }
     }
 
+    // RLIMIT_AS: refuse the mapping when its length would push the charged
+    // usage past the soft limit. Checked after base selection so a MAP_FIXED
+    // replacement has already refunded the range it unmapped above.
+    const rlimit = @import("../proc/rlimit.zig");
+    if (!rlimit.Policy.asChargeOk(cur.as_used, num_pages * user_space.PAGE_SIZE, cur.as_cur)) return -12; // ENOMEM
+
     // I1: huge blocks are only attempted for anonymous mappings whose final
     // base is 2MiB-aligned with at least one full block. A huge region never
     // merges with neighbours (the huge-first invariant), so the capacity
@@ -876,6 +901,9 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
                 // The region list does not know about untracked live pages
                 // (image, stack, brk) — gate on the actual page tables too.
                 if (!pagesFree(cur, g.start, g.pages)) return -12; // ENOMEM
+                // RLIMIT_AS: the grown tail charges like a fresh mapping.
+                if (!@import("../proc/rlimit.zig").Policy.asChargeOk(cur.as_used, (new_pages - old_pages) * PAGE, cur.as_cur)) return -12; // ENOMEM
+                cur.as_used += (new_pages - old_pages) * PAGE;
                 r.num_pages = new_pages;
                 return @bitCast(old_addr);
             }
@@ -885,6 +913,9 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
             // Check that the virtual range is available (no other region overlaps)
             const grow_base = old_addr + old_pages * PAGE;
             const grow_pages = new_pages - old_pages;
+            // RLIMIT_AS: refuse growth past the soft limit outright (moving
+            // would hit the same charge, checked again in moveMapping).
+            if (!@import("../proc/rlimit.zig").Policy.asChargeOk(cur.as_used, grow_pages * PAGE, cur.as_cur)) return -12; // ENOMEM
             var can_grow = true;
             for (&cur.mmap_regions) |r2| {
                 if (r2.active and r2.base != old_addr) {
@@ -924,6 +955,7 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
                 const dst: [*]u8 = @ptrFromInt(hhdm_mod.physToVirt(phys));
                 @memset(dst[0..PAGE], 0);
             }
+            cur.as_used += grow_pages * PAGE; // RLIMIT_AS charge
             r.num_pages = new_pages;
             return @bitCast(old_addr);
         } else if (r.active and r.base == old_addr and r.num_pages < old_pages) {

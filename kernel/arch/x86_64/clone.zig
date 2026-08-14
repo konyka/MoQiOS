@@ -190,6 +190,11 @@ pub fn clone(
     child.nofile_max = parent.nofile_max;
     child.stack_cur = parent.stack_cur;
     child.stack_max = parent.stack_max;
+    child.as_cur = parent.as_cur;
+    child.as_max = parent.as_max;
+    // The clone's address space mirrors (or with CLONE_VM shares) the
+    // parent's, so it starts with the same charged usage.
+    child.as_used = parent.as_used;
 
     child.brk_current = parent.brk_current;
     child.stack_limit = parent.stack_limit;

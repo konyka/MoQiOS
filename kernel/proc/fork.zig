@@ -51,6 +51,11 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.fd_table.alloc_limit = child.nofile_cur;
     child.stack_cur = parent.stack_cur;
     child.stack_max = parent.stack_max;
+    child.as_cur = parent.as_cur;
+    child.as_max = parent.as_max;
+    // The child's address space mirrors the parent's (COW), so it starts with
+    // the same charged usage.
+    child.as_used = parent.as_used;
 
     for (0..vfs_mod.MAX_FDS) |i| {
         child.fd_table.fds[i] = parent.fd_table.fds[i];

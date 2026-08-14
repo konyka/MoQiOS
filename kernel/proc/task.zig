@@ -134,6 +134,12 @@ pub const Task = struct {
     /// former stub reported.
     stack_cur: u64 = 8 * 1024 * 1024,
     stack_max: u64 = 8 * 1024 * 1024,
+    /// Per-task RLIMIT_AS in bytes over the charged address space; defaults
+    /// preserve the former stub report (unlimited). `as_used` charges brk
+    /// heap pages, mmap-tracked regions, and demand-faulted stack pages.
+    as_cur: u64 = @import("rlimit.zig").RLIM_INFINITY,
+    as_max: u64 = @import("rlimit.zig").RLIM_INFINITY,
+    as_used: u64 = 0,
 
     /// Bitmask of pending signals (bit N = signal N+1 is pending).
     /// Signals 1-31 supported. Bit 0 = SIGHUP (1), bit 30 = SIGUSR2 (31).
@@ -1043,6 +1049,9 @@ pub fn createUserProcess(
         tasks[slot].user_stack_top = user_stack_top;
         tasks[slot].stack_cur = 8 * 1024 * 1024;
         tasks[slot].stack_max = 8 * 1024 * 1024;
+        tasks[slot].as_cur = @import("rlimit.zig").RLIM_INFINITY;
+        tasks[slot].as_max = @import("rlimit.zig").RLIM_INFINITY;
+        tasks[slot].as_used = 0;
         tasks[slot].stack_limit = @import("rlimit.zig").Policy.initialStackLimit(
             user_stack_top,
             @import("../mm/user_space.zig").USER_STACK_BOTTOM,
