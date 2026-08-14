@@ -2112,6 +2112,31 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 
 ---
 
+### 6.35 P2 批次第九轮（2026-08-14）：文件映射 fault-around 预缺页（2MB 大页文件映射项收口）
+
+- **方案定论**（性能最优原则的诚实结论）：真 2MiB PDE 大页与文件映射的零拷贝
+  共享设计**物理不兼容**——MAP_SHARED 写透要求映射后备方自己的帧（tmpfs 页、
+  page_cache 帧），这些帧逐 4K 分配、物理不连续；硬件大页要求 2MiB 连续帧，
+  意味着每次缺页复制 512 页进连续帧，恰好摧毁写透语义并双倍内存流量。文件
+  映射的性能瓶颈是每页一次 #PF 往返，不是 TLB 覆盖——故采用 Linux 同级的
+  fault-around：缺页服务成功后向前预供给同区域最多 15 页（64 KiB 窗口）。
+- **实现**：`filemap.zig` 新增纯策略 `FAULT_AROUND_AHEAD`/`faultAroundAhead`
+  （区域末端截断）/`prefaultSafe`（排除 MAP_SHARED 可写——供给即标脏，预供给
+  会为无人写入的数据白付回写）；`idt.zig` 把原 handleFileFault 拆为
+  `serveFilePage`（单页供给，逻辑不变）+ `handleFileFault`（先服务缺页页，
+  再预供给窗口：已有 PTE 含 swap 项跳过、EOF 截断、失败非致命中断窗口）。
+  RLIMIT_AS 计费不变（区域在建映射时已全额计费）。
+- **验收**：hello62 在 tmpfs 造 256 KiB 已知模式文件，MAP_PRIVATE 与
+  MAP_SHARED 只读各做一次逐字节顺序扫描（跨 4 个 64 KiB 窗口，页偏移错乱
+  必现）；hello46（COW/EOF SIGSEGV）与 hello48（MAP_SHARED 写透/EROFS）作为
+  回归全绿。host 测试锁定窗口截断与 prefaultSafe 排除规则。
+- **门禁**：`zig build`、`zig build test`（193 全绿）、smoke SMP=1、SMP=4
+  stress 2/2 全绿。smoke 门禁新增 `hello62: PASS`/`hello62 done` 双标记。
+- kernel-subsystems §1.8.1 记录 fault-around 与 2MiB PDE 不兼容的分析定论；
+  next-phase-plan 的 2MB 大页文件映射半项关闭。
+
+---
+
 ## 7. Completion Criteria For This Review Task
 
 The review/documentation part is complete when:

@@ -256,6 +256,14 @@ H1 再加 `shared` 字段记录 MAP_SHARED），不触碰页表；首次访问�
   （命中 `getPageFrame` 直接拿物理帧；未命中先 `readFile` 填充缓存再取）。
   共享帧一律先 `pmm.addRef` 再以"只读 + COW 位(bit9)"映射——即使 PROT_WRITE，
   首次写入落入既有 `handleCowFault` 复制路径，文件内容永远不被 MAP_PRIVATE 写污染。
+- **fault-around 预缺页（6.35）**：文件缺页服务成功后，向前预供给同区域最多
+  15 页（64 KiB 窗口，Linux fault-around 同量级）——每页一次 #PF 往返的开销
+  对顺序扫描摊薄 16 倍。窗口受区域末端与 EOF 截断；已有 PTE（含 swap 项）跳过；
+  预供给失败非致命（页留待按需再缺）。MAP_SHARED 可写映射**不参与**预供给：
+  供给即标脏，预供给会为无人写入的数据白付回写。真 2MiB PDE 大页**有意不用于**
+  文件映射：零拷贝设计映射的是后备方自己的帧（tmpfs 页、page_cache 帧），它们
+  逐 4K 分配、物理不连续，硬件大页要求 2MiB 连续帧——上大页必须复制 512 页进
+  连续帧，恰好摧毁 MAP_SHARED 写透语义。
 - **引用计数规则（最容易错的记账点）**：帧的所有者（page_cache 槽位 / tmpfs 条目）
   持有一个 ref，每个映射它的地址空间各加一个 ref。`unmapRange`/`destroyUserSpace`
   的 freePage 本质是 decRef，因此**永远不会**把缓存/文件系统仍持有的帧放回空闲池；
