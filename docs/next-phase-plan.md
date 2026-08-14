@@ -62,7 +62,9 @@
 - ~~tmpfs 单文件 256 KiB 上限扩容~~（✅ 6.29 完成：一级间接页，64 直辖 + 512 间接 = 576 页 / 2.25 MiB，hello42 大文件验收；user-space §7.1）。
 - `mmap_regions` 固定 64 条目 → 动态 VMA 树（先做 profiling 证明需要，
   review §5.2g/§5.2t）。
-- 2MB 大页（尤其文件映射）与 fork COW OOM 半途回滚（review §5.6/§6.8）。
+- ~~2MB 大页（尤其文件映射）与 fork COW OOM 半途回滚~~（review §5.6/§6.8）——
+  fork COW 部分 ✅ 6.34（三阶段事务化克隆，两条路径）；2MB 大页文件映射
+  仍待做。
 - smoke 门禁 CI 化（当前 CI 只跑主机测试；QEMU 门禁依赖本地环境，review §1）。
 - rlimit 扩展到 NOFILE 之外的资源（先定执行语义再实现，避免 stub 蔓延）——
   ~~RLIMIT_STACK~~（✅ 6.31：缺页增长地板执行 + 真实 set/get/prlimit64，hello59 验收）、

@@ -572,7 +572,7 @@ It also rechecked the deferred UDP/driver/page-table risks against current Linux
 | P1 | `timerfd_settime` accepted negative, out-of-range, or overflowing `timespec` fields via signed-to-unsigned bit reinterpretation. | Fixed: reject invalid nanoseconds, negative fields, unknown flags, nanosecond/tick conversion overflow, and expiry addition overflow with `EINVAL`; periodic rearm saturates instead of wrapping. |
 | P1 | IPv4 socket `connect`, socket-name output, `socketpair`, `recvmmsg` length output, `epoll_wait`, and `select` ignored short user copies. | Fixed: require complete copies, return `EFAULT`, prevalidate epoll output before consuming ready state, and close newly-created socketpair descriptors when output fails. |
 | P1 | Raw network syscalls passed user pointers directly into NIC/UDP code, bypassing the shared mapped-range checks. | Fixed: bounded kernel staging buffers isolate NIC/UDP operations from user page-table lifetime; UDP receive now accepts caller capacity and validates payload/source outputs before dequeue. |
-| P1 | x86 COW clone has early OOM exits after partial child page-table construction; later failures can also leave parent PTEs COW-marked with unmatched references. | Deferred transactional clone work: preallocate each subtree or add explicit rollback of child tables, parent PTEs, and page references before reporting `ENOMEM`. |
+| P1 | x86 COW clone has early OOM exits after partial child page-table construction; later failures can also leave parent PTEs COW-marked with unmatched references. | Fixed (round 6.34): both clone walks (`fork.zig cloneUserPagesCow`, `clone.zig cloneUserPages`) are now transactional — phase 0 demotes parent huge PDEs (neutral) and counts table pages, phase 1 preallocates them into a pool (failure frees only fresh, unlinked pages), phase 2 downgrades/fills with zero allocations and cannot fail partway. The parent is never left COW-marked for a child that does not exist; `clone.zig` additionally gained the `destroyUserSpace` rollback it lacked. |
 | P1 | Raw NIC receive could dequeue a packet before proving the complete user destination was mapped. | Fixed: validate the bounded destination before calling the NIC receive path. |
 | P1 | TCP connect/send used generic `-1` for user-copy errors and did not preserve the stream's existing larger-write segmentation path. | Fixed: return `EFAULT` for failed address/data copies and pass bounded multi-segment writes through the existing TCP sender. |
 | P1 | `select` accepted malformed timeval values and allowed millisecond conversion overflow. | Fixed: reject `tv_usec >= 1_000_000` and overflowing seconds. |
@@ -2085,6 +2085,30 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 - **门禁**：`zig build`、`zig build test`（192 全绿，含 asChargeOk 边界组）、
   smoke SMP=1（hello60 PASS）、SMP=4 stress 2/2 全绿。
 - 其余 RLIMIT_*（NPROC/DATA/FSIZE/CORE/RSS）仍为上报 stub，待各自语义定稿。
+
+---
+
+### 6.34 P2 批次第八轮（2026-08-14）：fork COW OOM 事务化克隆（review §5.2t 悬案收口）
+
+- **差距确认**：子树/引用泄漏早已修（6.x 经 destroyUserSpace 回滚）；剩余是
+  原 P1 条目的后半——OOM 中途失败会把**父进程 PTE 留在 COW 降级态**（ benign
+  但违背事务性），且 `clone.zig cloneUserPages` 的 OOM 出口连子树回滚都没有
+  （`orelse return null` 直接遗弃半成品页表）。
+- **方案**（采用 review 建议的 preallocate 路线）：两条克隆走查统一为三阶段
+  事务结构——阶段 0 在父侧降级大页 PDE（语义中性：同内容同权限，仅 4K 粒度化）
+  并统计所需子表页数；阶段 1 预分配池页 + 全部表页（失败只释放未链接的新页，
+  父进程除中性降级外零改动）；阶段 2 零分配地完成全部父 PTE 降级与子树填充，
+  **不存在中途失败点**。池索引一页 512 项可覆盖 1 GiB 用户页表，超过物理内存
+  上限，实际不可达；阶段 2 对阶段 0 之后并发出现的表项做 `next >= needed`
+  防御性截断（CLONE_VM 并发 mutate 属 P3 地址空间并发项）。
+- **验收**：hello61（96 MiB 匿名映射 ≈ 48 张 PT 页规模）fork 后子进程读验证
+  共享内容、写触发 COW 私有副本、父进程页面不受污染、munmap 回收。smoke 门禁
+  新增 `hello61: PASS`/`hello61 done` 双标记。OOM 路径正确性由结构保证
+  （阶段 1 失败只释放池；阶段 2 无分配），无确定性 OOM 注入手段，已在文档注明。
+- **门禁**：`zig build`、`zig build test`（192 全绿）、smoke SMP=1、SMP=4
+  stress 2/2 全绿（fork/clone 被全部 run_test 派生 + hello50 SMP 压力反复覆盖）。
+- review §6.9 表内该 P1 条目标记 Fixed；next-phase-plan 的 fork COW 半项关闭，
+  2MB 大页文件映射仍留。
 
 ---
 
