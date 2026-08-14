@@ -1320,6 +1320,22 @@ test "G2: mmap offset must be page-aligned" {
     try std.testing.expect(!filemap.offsetValid(4097));
 }
 
+test "fault-around window caps at 15 pages and the region end" {
+    const base: u64 = 0x4000_0000;
+    // Large region: full 15-page forward window from the first page.
+    try std.testing.expectEqual(@as(u64, 15), filemap.faultAroundAhead(base, 1000, base));
+    // Window shrinks toward the region end.
+    try std.testing.expectEqual(@as(u64, 3), filemap.faultAroundAhead(base, 100, base + 96 * 4096));
+    // Last page of the region: nothing ahead.
+    try std.testing.expectEqual(@as(u64, 0), filemap.faultAroundAhead(base, 100, base + 99 * 4096));
+    // Single-page region: zero.
+    try std.testing.expectEqual(@as(u64, 0), filemap.faultAroundAhead(base, 1, base));
+    // Prefault safety: writable shared mappings are excluded (dirty-bit
+    // would be paid for unwritten data); everything else prefaults.
+    try std.testing.expect(!filemap.prefaultSafe(true));
+    try std.testing.expect(filemap.prefaultSafe(false));
+}
+
 test "G2: findFileRegion matches only active file-backed regions" {
     const regions = [_]G2Region{
         .{ .base = 0x1000, .num_pages = 2, .active = true, .file_kind = 2 },
