@@ -78,7 +78,10 @@
 ## P3：大项（需独立设计评审，不与其他工作混批）
 
 - ~80 处 `_ = copyToUser(...)` 返回值治理（review §5.2q，大且易回归，需分批 + 全程门禁）。
-- 地址空间并发：统一锁/TLB shootdown 契约、MAP_FIXED 事务回滚、
+- 地址空间并发：统一锁/TLB shootdown 契约，以及超出当前有界策略的 MAP_FIXED 事务回滚；
+  当前策略只接受精确覆盖、完整跟踪的匿名私有 RW 4K PMM-owned 区域，长度最多 128 页。
+  资源检查或形状不支持时返回 `ENOMEM` 且不改变原映射，成功替换后的页面为零填充。
+  该策略不是全局并发安全保证。
   `process_vm_readv/writev` 的引用计数 mm 抽象（review §5.5/§5.6）。
 - riscv64/aarch64 跑通用户进程 + `main.zig` 初始化收敛到共享 arch 抽象
   （cross-arch-port-plan）。

@@ -202,6 +202,7 @@ const AddressSpace = struct {
 
 - 支持 MAP_PRIVATE / MAP_SHARED 文件映射
 - 支持 MAP_FIXED 强制指定地址
+- MAP_FIXED 的事务化替换目前只支持精确覆盖、完整跟踪的匿名私有 RW 4K 区域，且长度不超过 128 页；这些区域必须由 PMM 所有。替换前的资源检查失败返回 `ENOMEM`，原映射保持不变；成功替换后新页为零填充。其他已占用形状也返回 `ENOMEM` 且保持不变。这是有界资源事务，不是全局地址空间并发安全保证；统一锁、TLB shootdown 和更一般的回滚设计仍属于后续工作。
 - 64条VMA表管理用户态映射区
 - 配套 munmap 解除映射和 msync 同步脏页
 - syscall mmap: 支持匿名映射 + 文件映射 (MAP_PRIVATE/MAP_SHARED)；G2 起文件映射改为
@@ -230,6 +231,9 @@ const AddressSpace = struct {
   无条件采纳会让进程用 `mmap(&_start, ...)` 覆盖掉正在执行的代码页。
 - 运行时覆盖: `hello30`（brk 增长/清零/收缩 + 匿名 mmap + hint 让位），
   冒烟门禁标记 `hello30: brk/mmap PASS`。
+
+用户态验收: `hello65` 映射一页匿名私有 RW 区域，写入哨兵后降低 `RLIMIT_AS`，确认等长
+MAP_FIXED 替换以 `ENOMEM` 失败且哨兵仍在；恢复无限制后替换成功并确认新页清零。
 
 ### 1.8.1 文件映射按需分页（G2 零拷贝 + COW，H1 起 MAP_SHARED 写透）✅
 
