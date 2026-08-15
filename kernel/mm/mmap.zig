@@ -16,6 +16,7 @@ const ext2 = @import("../fs/ext2.zig");
 const tmpfs = @import("../fs/tmpfs.zig");
 const huge_user = @import("huge_user.zig");
 const huge_impl = @import("huge_user_impl.zig");
+const fixed_replacement = @import("map_fixed.zig");
 
 /// I1: compile-time gate for user 2MiB huge pages on anonymous mappings.
 /// Set to false to disable the feature entirely (the demote paths stay —
@@ -436,6 +437,13 @@ fn pagesFree(task: *task_mod.Task, base: u64, num_pages: u64) bool {
     return firstMappedPage(task, base, num_pages) == null;
 }
 
+fn hasMmapOverlap(task: *task_mod.Task, base: u64, num_pages: u64) bool {
+    for (task.mmap_regions) |r| {
+        if (r.active and rangesOverlap(base, num_pages, r.base, r.num_pages)) return true;
+    }
+    return false;
+}
+
 fn rangeAvailable(task: *task_mod.Task, base: u64, num_pages: u64, ignore_base: ?u64) bool {
     if (num_pages == 0) return false;
     if (base % user_space.PAGE_SIZE != 0) return false;
@@ -514,6 +522,84 @@ fn mapZeroedPage(task: *task_mod.Task, virt: u64, flags: paging_mod.MapFlags) bo
         return false;
     };
     return true;
+}
+
+/// Replace one exact, tracked anonymous 4K region without a destructive gap.
+/// Every failure-prone operation is completed before a PTE changes; commit only
+/// writes validated PTE slots, shoots down the old translations, then releases
+/// their frames. Unsupported occupied MAP_FIXED ranges are rejected by the
+/// caller rather than falling back to unmap-before-allocation.
+fn replaceFixedAnonymous(
+    task: *task_mod.Task,
+    base: u64,
+    num_pages: u64,
+    prot: u64,
+    flags: u64,
+) i64 {
+    const page = user_space.PAGE_SIZE;
+    if (!fixed_replacement.pageCountSupported(num_pages)) return -12;
+
+    var region: ?*task_mod.MmapRegion = null;
+    for (&task.mmap_regions) |*candidate| {
+        if (candidate.active and rangesOverlap(base, num_pages, candidate.base, candidate.num_pages) and
+            (candidate.base != base or candidate.num_pages != num_pages)) return -12;
+        if (!candidate.active or candidate.base != base or candidate.num_pages != num_pages) continue;
+        if (candidate.file_kind != 0 or candidate.shared or candidate.no_free or candidate.locked or
+            candidate.huge_pages != 0 or (candidate.prot & 3) != 3) return -12;
+        region = candidate;
+        break;
+    }
+    const old_region = region orelse return -12;
+
+    const shared = (flags & MAP_SHARED) != 0;
+    if (shared or (prot & 3) != 3) return -12;
+    const writable_private = (prot & 2) != 0 and !shared;
+    const old_writable_private = (old_region.prot & 2) != 0 and !old_region.shared;
+    const old_charge = if (old_writable_private) num_pages * page else 0;
+    const new_charge = if (writable_private) num_pages * page else 0;
+    const next_as = fixed_replacement.chargeAfterReplacement(task.as_used, num_pages * page, num_pages * page, task.as_cur) orelse return -12;
+    const next_data = fixed_replacement.chargeAfterReplacement(task.data_used, old_charge, new_charge, task.data_cur) orelse return -12;
+
+    var old_phys: [fixed_replacement.MAX_ANON_REPLACEMENT_PAGES]u64 = undefined;
+    var new_phys: [fixed_replacement.MAX_ANON_REPLACEMENT_PAGES]u64 = undefined;
+    var prepared: u64 = 0;
+
+    // No page table walk or allocation occurs during commit. getPageEntryRaw
+    // rejects huge PDEs, while the checks below reject swapped/non-present PTEs.
+    for (0..num_pages) |index| {
+        const virt = base + index * page;
+        const raw = paging_mod.getPageEntryRaw(task.page_table_phys, virt) orelse return -12;
+        const phys = raw & paging_mod.ADDR_MASK;
+        if ((raw & (paging_mod.PRESENT | paging_mod.USER)) != (paging_mod.PRESENT | paging_mod.USER) or phys % page != 0 or
+            !pmm_mod.isRamPhys(phys) or pmm_mod.getRefCount(phys) == 0) return -12;
+        old_phys[index] = phys;
+    }
+
+    for (0..num_pages) |index| {
+        const phys = pmm_mod.allocPageNoReclaim() orelse {
+            for (new_phys[0..prepared]) |fresh| pmm_mod.freePage(fresh);
+            return -12;
+        };
+        const page_ptr: [*]u8 = @ptrFromInt(hhdm_mod.physToVirt(phys));
+        @memset(page_ptr[0..page], 0);
+        new_phys[index] = phys;
+        prepared += 1;
+    }
+
+    var new_pte_flags: u64 = paging_mod.PRESENT | paging_mod.USER;
+    if ((prot & 2) != 0) new_pte_flags |= paging_mod.WRITABLE;
+    if ((prot & 4) == 0) new_pte_flags |= @as(u64, 1) << 63;
+    for (0..num_pages) |index| {
+        paging_mod.setPageEntryRaw(task.page_table_phys, base + index * page, new_phys[index] | new_pte_flags);
+    }
+    tlb_mod.shootdownRange(base, @intCast(num_pages), task.page_table_phys);
+    pmm_mod.freePageBatch(old_phys[0..num_pages]);
+
+    task.as_used = next_as;
+    task.data_used = next_data;
+    old_region.prot = @intCast(prot & 7);
+    old_region.shared = shared;
+    return @bitCast(base);
 }
 
 fn moveMapping(task: *task_mod.Task, region: *task_mod.MmapRegion, new_base: u64, old_pages: u64, new_pages: u64) i64 {
@@ -728,17 +814,20 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
 
     // Determine base address
     var base: u64 = undefined;
-    if (is_fixed and addr_hint != 0) {
-        base = addr_hint / user_space.PAGE_SIZE * user_space.PAGE_SIZE;
+    if (is_fixed) {
+        if (addr_hint == 0 or addr_hint % user_space.PAGE_SIZE != 0) return -22; // EINVAL
+        base = addr_hint;
         if (base < user_space.PAGE_SIZE) return -22; // EINVAL
         // A kernel-half base would underflow USER_ADDR_MAX - base below
         // (panic in safe builds) or unmap kernel pages in ReleaseFast.
         if (base >= user_space.USER_ADDR_MAX) return -22; // EINVAL
         if (num_pages > (user_space.USER_ADDR_MAX - base) / user_space.PAGE_SIZE) return -12; // ENOMEM
+        if (hasMmapOverlap(cur, base, num_pages)) {
+            if (meta != null) return -12;
+            return replaceFixedAnonymous(cur, base, num_pages, prot, flags);
+        }
+        if (!pagesFree(cur, base, num_pages)) return -12;
         if (!canTrackReplacement(cur, base, num_pages)) return -12;
-        // MAP_FIXED replaces whatever is there, so drop the old pages first.
-        unmapRange(cur, base, num_pages);
-        untrackMmapRange(cur, base, num_pages);
     } else {
         // Without MAP_FIXED the address is advisory. Honour it only when the
         // range is free: mapPage overwrites a live PTE silently, so taking the
