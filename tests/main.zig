@@ -35,6 +35,15 @@ test "rlimit NPROC policy rejects creation at the soft limit" {
     try std.testing.expect(policy.nprocAllowed(64, kt.rlimit.RLIM_INFINITY));
 }
 
+test "rlimit DATA charge policy preserves byte-limit boundaries" {
+    const policy = kt.rlimit.Policy;
+    try std.testing.expect(policy.dataChargeOk(0, 4096, 4096));
+    try std.testing.expect(policy.dataChargeOk(4096, 0, 4096));
+    try std.testing.expect(!policy.dataChargeOk(4096, 1, 4096));
+    try std.testing.expect(!policy.dataChargeOk(8192, 0, 4096));
+    try std.testing.expect(policy.dataChargeOk(8192, 1, kt.rlimit.RLIM_INFINITY));
+}
+
 test "creation metadata defaults omitted file and directory modes separately" {
     const file = creation_metadata.decide(null, .regular_file, null, 0o022, 1, 2).metadata;
     const directory = creation_metadata.decide(null, .directory, null, 0o022, 1, 2).metadata;
