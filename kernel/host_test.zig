@@ -20,6 +20,7 @@ pub const fmt = @import("lib/fmt.zig");
 pub const fmt_core = @import("lib/fmt_core.zig");
 pub const str = @import("lib/str.zig");
 pub const cow_pte = @import("mm/cow_pte.zig");
+pub const map_fixed = @import("mm/map_fixed.zig");
 pub const pci_msix = @import("drivers/pci_msix.zig");
 pub const lo = @import("net/lo.zig");
 pub const sched_policy = @import("proc/sched_policy.zig");

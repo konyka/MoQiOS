@@ -4,6 +4,7 @@ const kt = @import("kernel_shared");
 
 const byte_order = kt.byte_order;
 const cow_pte = kt.cow_pte;
+const map_fixed = kt.map_fixed;
 const errno = kt.errno;
 const eth = kt.eth;
 const fmt = kt.fmt_core;
@@ -42,6 +43,23 @@ test "rlimit DATA charge policy preserves byte-limit boundaries" {
     try std.testing.expect(!policy.dataChargeOk(4096, 1, 4096));
     try std.testing.expect(!policy.dataChargeOk(8192, 0, 4096));
     try std.testing.expect(policy.dataChargeOk(8192, 1, kt.rlimit.RLIM_INFINITY));
+}
+
+test "MAP_FIXED replacement policy bounds stack-resident transactions" {
+    try std.testing.expect(!map_fixed.pageCountSupported(0));
+    try std.testing.expect(map_fixed.pageCountSupported(1));
+    try std.testing.expect(map_fixed.pageCountSupported(map_fixed.MAX_ANON_REPLACEMENT_PAGES));
+    try std.testing.expect(!map_fixed.pageCountSupported(map_fixed.MAX_ANON_REPLACEMENT_PAGES + 1));
+}
+
+test "MAP_FIXED replacement policy settles net charges before commit" {
+    const infinity = std.math.maxInt(u64);
+    try std.testing.expectEqual(@as(?u64, 8192), map_fixed.chargeAfterReplacement(8192, 4096, 4096, infinity));
+    try std.testing.expectEqual(@as(?u64, 4096), map_fixed.chargeAfterReplacement(8192, 4096, 0, infinity));
+    try std.testing.expectEqual(@as(?u64, 12288), map_fixed.chargeAfterReplacement(8192, 0, 4096, 12288));
+    try std.testing.expectEqual(@as(?u64, null), map_fixed.chargeAfterReplacement(8192, 0, 4096, 8192));
+    try std.testing.expectEqual(@as(?u64, null), map_fixed.chargeAfterReplacement(4096, 8192, 0, infinity));
+    try std.testing.expectEqual(@as(?u64, null), map_fixed.chargeAfterReplacement(infinity, 0, 1, infinity));
 }
 
 test "creation metadata defaults omitted file and directory modes separately" {
