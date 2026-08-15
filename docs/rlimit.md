@@ -19,9 +19,37 @@ before attempting duplication. Successful `dup3(..., O_CLOEXEC)` calls mark the
 new descriptor `FD_CLOEXEC` throughout the VFS descriptor table.
 
 `getrlimit`, `setrlimit`, and `prlimit64` provide real per-task operations for
-`RLIMIT_NOFILE`, `RLIMIT_STACK`, and `RLIMIT_AS`. All other `RLIMIT_*`
-resource types retain their existing reported/stub behavior and are not
-enforced.
+`RLIMIT_NOFILE`, `RLIMIT_STACK`, `RLIMIT_AS`, and `RLIMIT_NPROC`. All other
+`RLIMIT_*` resource types retain their existing reported/stub behavior and are
+not enforced.
+
+## RLIMIT_NPROC execution semantics
+
+`RLIMIT_NPROC` carries per-task soft/hard process-count limits over the number
+of live tasks sharing the caller's real UID (default
+`RLIM_INFINITY` / `RLIM_INFINITY`, matching the former stub report, so an
+untouched task sees no behaviour change). The kernel keeps a per-UID live-task
+counter (`uid_task_count`) next to the global `task_count`; both are maintained
+under `task_lock`, incremented at every task-creation site and decremented at
+every reap site (`cancelUnstartedKernelThread`, `reapZombies`, and the waitpid
+scan). A zombie still counts until it is reaped, matching Linux semantics —
+the limit gates *task creation*, so a reaped slot frees one unit immediately.
+
+The gate lives at every task-creation chokepoint *before* expensive page-table
+work: `fork()` checks before `cloneUserPagesCow`, `clone()` before COW cloning
+or address-space retention, and `spawn()` before the loader touches any user
+memory. When the live count for the real UID reaches the soft limit, creation
+is refused with `EAGAIN` (matching Linux). The count applies to every task the
+real UID creates, so threads (CLONE_VM) count too, exactly like Linux
+`RLIMIT_NPROC`. Lowering the limit below the current live count is legal and
+only blocks further creation — no task is killed. Limits are inherited across
+fork/clone and preserved by exec; validation and privilege rules are the same
+byte-denominated `applyBytes` set as `RLIMIT_STACK`/`RLIMIT_AS`.
+
+The per-UID counter is a bounded table keyed by UID (the kernel issues a small
+UID set today). A UID that exhausts the table fails closed: finite limits
+refuse creation for it rather than silently granting unlimited budget.
+`RLIM_INFINITY` bypasses the count entirely.
 
 ## RLIMIT_STACK execution semantics
 

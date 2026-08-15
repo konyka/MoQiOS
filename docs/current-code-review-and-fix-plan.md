@@ -2170,6 +2170,33 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   blocked state` 为既有环境失败——在 stash 掉本批全部改动后的干净 main 上
   复现，与本次改动无关（riscv 使用独立 `arch/riscv64/virtio_net.zig`）。
 
+### 6.37 P2 rlimit 第一步（2026-08-15）：RLIMIT_NPROC 真实执行
+
+- **现状核对**：此前 `RLIMIT_NPROC` 的 getrlimit 返回固定 infinity，
+  setrlimit/prlimit64 接受后 no-op；`Task` 只有 NOFILE/STACK/AS 字段，
+  任务表只有全局 `task_count`，fork/clone/spawn 没有资源闸点。
+- **实现**：`Task` 新增 `nproc_cur`/`nproc_max`（默认 infinity）；task 模块
+  新增 under-`task_lock` 的固定 UID 计数表。三个任务创建站点和三个回收站点
+  对 UID 计数做对称增减，zombie 在 waitpid/reap 前继续计数；未知 UID 在有限
+  NPROC 下 fail-closed。fork 在 COW 前、clone 在 COW/retain 前、spawn 在
+  loader 前做 `uid_count < rlim_cur` 闸点，拒绝返回 `EAGAIN`；fork/clone
+  继承限制，exec 保持限制。syscall get/set/prlimit64 现在均是真实 per-task
+  NPROC 操作，沿用 `applyBytes` 的 `cur<=max` 与 `cap_sys_resource` 规则。
+- **TDD/验收**：host 策略测试锁定 infinity/边界，libc ABI 锁定
+  `RLIMIT_DATA=2`、`RLIMIT_NPROC=6`；新增 `hello64` 验收默认值、EINVAL、
+  `nproc_cur=1` 时确定性 `fork -> EAGAIN`、恢复软限、继承和 reap 后计数释放。
+  hello64 已接入 build、ramdisk、PID 1 自动测试和 QEMU smoke 标记。
+- **配套容量修复**：hello64 使 ramdisk 用户程序数从 64 增至 65；同步将
+  `kernel/fs/ramdisk.zig` 与 `tools/mkramdisk.sh` 的 sanity 上限从 64 提至
+  128。该上限只约束 blob 文件计数，索引位于 blob 中，每新增文件仅增加
+  80 字节镜像空间；FAT32/tmpfs 的独立 64 槽限制不受影响。
+- **门禁**：`zig build test`（194/194）、`zig build`、x86_64 smoke SMP=1/2、
+  CPU matrix 2/4/8、SMP=4 stress 3/3、riscv64/aarch64 构建均通过。
+
+**后续 P2**：RLIMIT_DATA 仍单独待实现。它复用 AS 的 charge/refund 事务，
+  但需要第三个 `data_used` 账本，并精确覆盖 brk 与可写私有 mmap 的
+  `munmap`/`mremap`/`MAP_FIXED` 增长和回滚路径，不能与 NPROC 混批。
+
 ---
 
 ## 7. Completion Criteria For This Review Task

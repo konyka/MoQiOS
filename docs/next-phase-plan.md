@@ -69,8 +69,9 @@
 - smoke 门禁 CI 化（当前 CI 只跑主机测试；QEMU 门禁依赖本地环境，review §1）。
 - rlimit 扩展到 NOFILE 之外的资源（先定执行语义再实现，避免 stub 蔓延）——
   ~~RLIMIT_STACK~~（✅ 6.31：缺页增长地板执行 + 真实 set/get/prlimit64，hello59 验收）、
-  ~~RLIMIT_AS~~（✅ 6.33：as_used 计费 + mmap/brk/mremap/栈增长执行点，hello60 验收）；
-  NPROC/DATA 等其余资源仍待各自语义定稿。
+  ~~RLIMIT_AS~~（✅ 6.33：as_used 计费 + mmap/brk/mremap/栈增长执行点，hello60 验收）、
+  ~~RLIMIT_NPROC~~（✅ 6.37：per-UID 活任务计数 + fork/clone/spawn 前置 EAGAIN 闸点，
+  hello64 验收）；DATA 待语义定稿后单独成批。
 
 ## P3：大项（需独立设计评审，不与其他工作混批）
 
