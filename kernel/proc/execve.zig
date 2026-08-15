@@ -116,6 +116,7 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
     // RLIMIT_AS limits are preserved, but every charged byte belonged to the
     // replaced image — the fresh image starts uncharged (see docs/rlimit.md).
     cur.as_used = 0;
+    cur.data_used = 0;
     cur.brk_current = result.brk;
     cur.brk_start = result.brk;
     // The old TLS block belonged to the replaced image. Program the CPU too:
@@ -269,6 +270,7 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64)
     // RLIMIT_AS limits are preserved, but every charged byte belonged to the
     // replaced image — the fresh image starts uncharged (see docs/rlimit.md).
     cur.as_used = 0;
+    cur.data_used = 0;
     cur.brk_current = result.brk;
     cur.brk_start = result.brk;
     // The old TLS block belonged to the replaced image. Program the CPU too:

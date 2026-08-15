@@ -140,6 +140,11 @@ pub const Task = struct {
     as_cur: u64 = @import("rlimit.zig").RLIM_INFINITY,
     as_max: u64 = @import("rlimit.zig").RLIM_INFINITY,
     as_used: u64 = 0,
+    /// Per-task RLIMIT_DATA in bytes. `data_used` tracks brk heap pages and
+    /// writable private mmap regions independently from RLIMIT_AS.
+    data_cur: u64 = @import("rlimit.zig").RLIM_INFINITY,
+    data_max: u64 = @import("rlimit.zig").RLIM_INFINITY,
+    data_used: u64 = 0,
     /// Per-task RLIMIT_NPROC soft/hard limits in task count for the real
     /// UID; defaults preserve the former stub report (unlimited). The gate
     /// lives at every task-creation chokepoint (fork/clone/spawn) before
@@ -1121,6 +1126,9 @@ pub fn createUserProcess(
         tasks[slot].as_cur = @import("rlimit.zig").RLIM_INFINITY;
         tasks[slot].as_max = @import("rlimit.zig").RLIM_INFINITY;
         tasks[slot].as_used = 0;
+        tasks[slot].data_cur = @import("rlimit.zig").RLIM_INFINITY;
+        tasks[slot].data_max = @import("rlimit.zig").RLIM_INFINITY;
+        tasks[slot].data_used = 0;
         tasks[slot].nproc_cur = @import("rlimit.zig").RLIM_INFINITY;
         tasks[slot].nproc_max = @import("rlimit.zig").RLIM_INFINITY;
         tasks[slot].stack_limit = @import("rlimit.zig").Policy.initialStackLimit(

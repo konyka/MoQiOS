@@ -61,6 +61,10 @@ pub fn brk(addr: u64) i64 {
         if (!@import("../proc/rlimit.zig").Policy.asChargeOk(cur.as_used, delta_bytes, cur.as_cur)) {
             return @bitCast(cur.brk_current);
         }
+        // RLIMIT_DATA: brk heap growth charges the independent data ledger.
+        if (!@import("../proc/rlimit.zig").Policy.dataChargeOk(cur.data_used, delta_bytes, cur.data_cur)) {
+            return @bitCast(cur.brk_current);
+        }
 
         // Refuse to grow across pages that are already mapped. mapPage
         // overwrites a live PTE without complaint, which would strand the old
@@ -99,12 +103,14 @@ pub fn brk(addr: u64) i64 {
             };
         }
         cur.as_used += delta_bytes; // RLIMIT_AS charge (checked above)
+        cur.data_used += delta_bytes; // RLIMIT_DATA charge (checked above)
     } else if (new_page < old_page) {
         // Give the released pages back. The growth loop used to run
         // `old_page..new_page` unconditionally, so a shrinking break reversed
         // the range and panicked the kernel computing its length.
         releasePages(cur, new_page, old_page);
         cur.as_used -|= (old_page - new_page) * PAGE; // RLIMIT_AS refund
+        cur.data_used -|= (old_page - new_page) * PAGE; // RLIMIT_DATA refund
     }
 
     cur.brk_current = addr;

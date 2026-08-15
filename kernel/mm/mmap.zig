@@ -178,9 +178,13 @@ pub const RegionFileMeta = struct {
 /// I1: regions with huge blocks never merge either way — a merge would
 /// break the invariant that a region's huge blocks are its FIRST
 /// huge_pages*512 pages.
-fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, meta: ?RegionFileMeta, huge_pages: u32) void {
+fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, meta: ?RegionFileMeta, prot: u8, shared: bool, huge_pages: u32) void {
     // RLIMIT_AS: every tracked region charges its full length (merged or new).
     task.as_used += num_pages * user_space.PAGE_SIZE;
+    // RLIMIT_DATA: only writable private regions (anonymous or file-private)
+    // charge the data ledger, independent of RLIMIT_AS.
+    const writable_private = (prot & 2) != 0 and !shared;
+    if (writable_private) task.data_used += num_pages * user_space.PAGE_SIZE;
     const new_kind: u8 = if (meta) |m| @intFromEnum(m.kind) else 0;
     // Try to merge with an adjacent existing region (anonymous only)
     if (meta == null and huge_pages == 0) {
@@ -189,6 +193,10 @@ fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, meta: ?Regio
             // anonymous neighbour's frames inherit the no-free accounting
             // (or vice versa) and corrupt PMM ownership.
             if (!r.active or r.huge_pages != 0 or r.no_free or !filemap.canMergeAnon(r.file_kind, new_kind)) continue;
+            // Only merge when the protection and sharing match: a merge with
+            // a different prot would make the RLIMIT_DATA refund imprecise
+            // (the region records one prot for the whole range).
+            if (r.prot != prot or r.shared != shared) continue;
             if (r.base + r.num_pages * 4096 == base) {
                 r.num_pages += num_pages;
                 return;
@@ -204,10 +212,10 @@ fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, meta: ?Regio
     for (&task.mmap_regions) |*r| {
         if (!r.active) {
             r.* = .{ .base = base, .num_pages = num_pages, .active = true, .huge_pages = huge_pages };
+            r.prot = prot;
+            r.shared = shared;
             if (meta) |m| {
                 r.file_kind = @intFromEnum(m.kind);
-                r.shared = m.shared;
-                r.prot = m.prot;
                 r.file_offset = m.offset;
                 r.file_size = m.size;
                 r.file_idx = m.idx;
@@ -248,12 +256,17 @@ fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
     // per-region overlap is exactly the number of pages being cut.
     var refunded: u64 = 0;
     defer task.as_used -|= refunded * page;
+    // RLIMIT_DATA refund: only writable private regions charged data_used.
+    var data_refunded: u64 = 0;
+    defer task.data_used -|= data_refunded * page;
 
     for (&task.mmap_regions) |*r| {
         if (!r.active) continue;
         const r_end = r.base + r.num_pages * page;
         if (r.base >= end or r_end <= base) continue; // no overlap
-        refunded += (@min(end, r_end) - @max(base, r.base)) / page;
+        const overlap_pages = (@min(end, r_end) - @max(base, r.base)) / page;
+        refunded += overlap_pages;
+        if ((r.prot & 2) != 0 and !r.shared) data_refunded += overlap_pages;
 
         // H1: unmapping any part of a MAP_SHARED ext2/fat32 region flushes
         // the inode's dirty mmap-owned cache pages first (cheap no-op when
@@ -511,6 +524,15 @@ fn moveMapping(task: *task_mod.Task, region: *task_mod.MmapRegion, new_base: u64
     // RLIMIT_AS: a growing move charges the delta before any page is copied.
     if (new_pages > old_pages and
         !@import("../proc/rlimit.zig").Policy.asChargeOk(task.as_used, (new_pages - old_pages) * page, task.as_cur)) return -12; // ENOMEM
+    // RLIMIT_DATA: apply the same preflight before demotion or page copying;
+    // a writable-private move must never partially mutate the address space
+    // before discovering that its growth exceeds the data soft limit.
+    if (new_pages > old_pages and (region.prot & 2) != 0 and !region.shared and
+        !@import("../proc/rlimit.zig").Policy.dataChargeOk(
+            task.data_used,
+            (new_pages - old_pages) * page,
+            task.data_cur,
+        )) return -12; // ENOMEM
     var mapped: u64 = 0;
 
     // I1: the 4K copy loop below cannot read huge PDEs (getPageEntry
@@ -564,6 +586,15 @@ fn moveMapping(task: *task_mod.Task, region: *task_mod.MmapRegion, new_base: u64
         task.as_used += (new_pages - old_pages) * page;
     } else if (old_pages > new_pages) {
         task.as_used -|= (old_pages - new_pages) * page;
+    }
+    // RLIMIT_DATA: a writable private region carries its delta on the
+    // independent data ledger as well.
+    if ((region.prot & 2) != 0 and !region.shared) {
+        if (new_pages > old_pages) {
+            task.data_used += (new_pages - old_pages) * page;
+        } else if (old_pages > new_pages) {
+            task.data_used -|= (old_pages - new_pages) * page;
+        }
     }
     region.base = new_base;
     region.num_pages = new_pages;
@@ -744,7 +775,14 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     // usage past the soft limit. Checked after base selection so a MAP_FIXED
     // replacement has already refunded the range it unmapped above.
     const rlimit = @import("../proc/rlimit.zig");
-    if (!rlimit.Policy.asChargeOk(cur.as_used, num_pages * user_space.PAGE_SIZE, cur.as_cur)) return -12; // ENOMEM
+    const map_bytes = num_pages * user_space.PAGE_SIZE;
+    if (!rlimit.Policy.asChargeOk(cur.as_used, map_bytes, cur.as_cur)) return -12; // ENOMEM
+    // RLIMIT_DATA: writable private mappings (anonymous or file-private)
+    // charge an independent data ledger on top of RLIMIT_AS.
+    const shared = (flags & MAP_SHARED) != 0;
+    const writable_private = (prot & 2) != 0 and !shared;
+    if (writable_private and
+        !rlimit.Policy.dataChargeOk(cur.data_used, map_bytes, cur.data_cur)) return -12; // ENOMEM
 
     // I1: huge blocks are only attempted for anonymous mappings whose final
     // base is 2MiB-aligned with at least one full block. A huge region never
@@ -806,7 +844,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     }
 
     // Track the mapping region for munmap (records backing metadata for G2).
-    trackMmapRegion(cur, base, num_pages, meta, huge_count);
+    trackMmapRegion(cur, base, num_pages, meta, @intCast(prot & 7), shared, huge_count);
 
     // The break is deliberately left alone. Dragging it up to cover mmap
     // placements made brk(2) report a break spanning memory it does not own, and
@@ -904,6 +942,13 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
                 // RLIMIT_AS: the grown tail charges like a fresh mapping.
                 if (!@import("../proc/rlimit.zig").Policy.asChargeOk(cur.as_used, (new_pages - old_pages) * PAGE, cur.as_cur)) return -12; // ENOMEM
                 cur.as_used += (new_pages - old_pages) * PAGE;
+                // RLIMIT_DATA: a writable private file region charges its
+                // grown tail on the independent data ledger as well.
+                if ((r.prot & 2) != 0 and !r.shared) {
+                    const grow_bytes = (new_pages - old_pages) * PAGE;
+                    if (!@import("../proc/rlimit.zig").Policy.dataChargeOk(cur.data_used, grow_bytes, cur.data_cur)) return -12; // ENOMEM
+                    cur.data_used += grow_bytes;
+                }
                 r.num_pages = new_pages;
                 return @bitCast(old_addr);
             }
@@ -916,6 +961,8 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
             // RLIMIT_AS: refuse growth past the soft limit outright (moving
             // would hit the same charge, checked again in moveMapping).
             if (!@import("../proc/rlimit.zig").Policy.asChargeOk(cur.as_used, grow_pages * PAGE, cur.as_cur)) return -12; // ENOMEM
+            if ((r.prot & 2) != 0 and !r.shared and
+                !@import("../proc/rlimit.zig").Policy.dataChargeOk(cur.data_used, grow_pages * PAGE, cur.data_cur)) return -12; // ENOMEM
             var can_grow = true;
             for (&cur.mmap_regions) |r2| {
                 if (r2.active and r2.base != old_addr) {
@@ -956,6 +1003,7 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
                 @memset(dst[0..PAGE], 0);
             }
             cur.as_used += grow_pages * PAGE; // RLIMIT_AS charge
+            if ((r.prot & 2) != 0 and !r.shared) cur.data_used += grow_pages * PAGE; // RLIMIT_DATA charge
             r.num_pages = new_pages;
             return @bitCast(old_addr);
         } else if (r.active and r.base == old_addr and r.num_pages < old_pages) {

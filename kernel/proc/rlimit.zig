@@ -121,6 +121,12 @@ pub const Policy = struct {
         return used <= cur and add <= cur - used;
     }
 
+    /// RLIMIT_DATA charge check — same byte-denominated rule as RLIMIT_AS,
+    /// over the independent `data_used` ledger (brk + writable-private mmap).
+    pub fn dataChargeOk(used: u64, add: u64, cur: u64) bool {
+        return asChargeOk(used, add, cur);
+    }
+
     // ── RLIMIT_NPROC ────────────────────────────────────────────────
 
     /// RLIMIT_NPROC gate: true when a new task for `uid` may be created.

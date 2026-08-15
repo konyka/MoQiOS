@@ -3421,7 +3421,7 @@ fn syscallGetrlimit(resource: u32, rlim_ptr: u64) i64 {
 
     var rlim: Rlimit = .{};
     switch (resource) {
-        RLIMIT_NOFILE, RLIMIT_STACK, RLIMIT_AS, RLIMIT_NPROC => {
+        RLIMIT_NOFILE, RLIMIT_STACK, RLIMIT_AS, RLIMIT_DATA, RLIMIT_NPROC => {
             const sched = @import("../../proc/sched.zig");
             const tm = @import("../../proc/task.zig");
             const idx = sched.currentTaskIndex() orelse return -3;
@@ -3435,12 +3435,15 @@ fn syscallGetrlimit(resource: u32, rlim_ptr: u64) i64 {
             } else if (resource == RLIMIT_AS) {
                 rlim.rlim_cur = task.as_cur;
                 rlim.rlim_max = task.as_max;
+            } else if (resource == RLIMIT_DATA) {
+                rlim.rlim_cur = task.data_cur;
+                rlim.rlim_max = task.data_max;
             } else {
                 rlim.rlim_cur = task.nproc_cur;
                 rlim.rlim_max = task.nproc_max;
             }
         },
-        RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_CORE, RLIMIT_RSS => {
+        RLIMIT_FSIZE, RLIMIT_CORE, RLIMIT_RSS => {
             rlim.rlim_cur = RLIM_INFINITY;
             rlim.rlim_max = RLIM_INFINITY;
         },
@@ -3465,7 +3468,7 @@ fn syscallSetrlimit(resource: u32, rlim_ptr: u64) i64 {
     const bo = @import("../../lib/byte_order.zig");
     var buf: [16]u8 = undefined;
     if (copy.copyFromUser(&buf, @ptrFromInt(rlim_ptr), 16) != 16) return -14;
-    if (resource != RLIMIT_NOFILE and resource != RLIMIT_STACK and resource != RLIMIT_AS and resource != RLIMIT_NPROC) return 0;
+    if (resource != RLIMIT_NOFILE and resource != RLIMIT_STACK and resource != RLIMIT_AS and resource != RLIMIT_DATA and resource != RLIMIT_NPROC) return 0;
     const next = @import("../../proc/rlimit.zig").Limit{ .cur = bo.readU64At(&buf, 0), .max = bo.readU64At(&buf, 8) };
     const sched = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
@@ -3500,6 +3503,17 @@ fn syscallSetrlimit(resource: u32, rlim_ptr: u64) i64 {
         // further charges, nothing is unmapped.
         task.as_cur = applied.cur;
         task.as_max = applied.max;
+        return 0;
+    }
+    if (resource == RLIMIT_DATA) {
+        const applied = policy.applyBytes(.{ .cur = task.data_cur, .max = task.data_max }, next, privileged) catch |err| return switch (err) {
+            error.InvalidLimit => -22,
+            error.WouldLowerHardLimit => -1,
+        };
+        // Lowering below the current usage is legal (Linux): it only blocks
+        // further charges, nothing is unmapped.
+        task.data_cur = applied.cur;
+        task.data_max = applied.max;
         return 0;
     }
     if (resource == RLIMIT_NPROC) {
@@ -4152,6 +4166,10 @@ fn syscallPrlimit64(pid: u32, resource: u32, new_limit_ptr: u64, old_limit_ptr: 
                 old_limit.rlim_cur = target.as_cur;
                 old_limit.rlim_max = target.as_max;
             },
+            RLIMIT_DATA => {
+                old_limit.rlim_cur = target.data_cur;
+                old_limit.rlim_max = target.data_max;
+            },
             RLIMIT_NPROC => {
                 old_limit.rlim_cur = target.nproc_cur;
                 old_limit.rlim_max = target.nproc_max;
@@ -4175,7 +4193,7 @@ fn syscallPrlimit64(pid: u32, resource: u32, new_limit_ptr: u64, old_limit_ptr: 
         if (new_limit_ptr >= 0x0000_8000_0000_0000) return -14;
         var nbuf: [16]u8 = undefined;
         if (copy.copyFromUser(nbuf[0..], @ptrFromInt(new_limit_ptr), 16) != 16) return -14;
-        if (resource == RLIMIT_NOFILE or resource == RLIMIT_STACK or resource == RLIMIT_AS or resource == RLIMIT_NPROC) {
+        if (resource == RLIMIT_NOFILE or resource == RLIMIT_STACK or resource == RLIMIT_AS or resource == RLIMIT_DATA or resource == RLIMIT_NPROC) {
             const next = @import("../../proc/rlimit.zig").Limit{ .cur = bo.readU64At(&nbuf, 0), .max = bo.readU64At(&nbuf, 8) };
             const policy = @import("../../proc/rlimit.zig").Policy;
             const lock_flags = tm.lockTask();
@@ -4199,6 +4217,13 @@ fn syscallPrlimit64(pid: u32, resource: u32, new_limit_ptr: u64, old_limit_ptr: 
                 };
                 target.as_cur = applied.cur;
                 target.as_max = applied.max;
+            } else if (resource == RLIMIT_DATA) {
+                const applied = policy.applyBytes(.{ .cur = target.data_cur, .max = target.data_max }, next, privileged) catch |err| return switch (err) {
+                    error.InvalidLimit => -22,
+                    error.WouldLowerHardLimit => -1,
+                };
+                target.data_cur = applied.cur;
+                target.data_max = applied.max;
             } else if (resource == RLIMIT_NPROC) {
                 const applied = policy.applyBytes(.{ .cur = target.nproc_cur, .max = target.nproc_max }, next, privileged) catch |err| return switch (err) {
                     error.InvalidLimit => -22,
