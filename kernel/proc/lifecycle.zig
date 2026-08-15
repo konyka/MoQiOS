@@ -44,6 +44,15 @@ pub fn spawn(name_ptr: u64) i64 {
         if (task_mod.getTask(idx)) |cur| initial_init_caller = cur.initial_init;
     }
 
+    // RLIMIT_NPROC preflight: the spawned program counts against the
+    // caller's real UID. Gate before any loader/address-space work so a
+    // denied spawn costs nothing and leaks nothing. EAGAIN matches Linux.
+    if (sched.currentTaskIndex()) |idx| {
+        if (task_mod.getTask(idx)) |cur| {
+            if (!task_mod.nprocPreflight(cur.uid, cur.nproc_cur)) return -11;
+        }
+    }
+
     if (loader.loadProgram(name, caller_tid, initial_init_caller, false)) |task_idx| {
         const t = @import("task.zig");
         if (t.getTask(task_idx)) |new_task| {

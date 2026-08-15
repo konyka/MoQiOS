@@ -223,6 +223,12 @@ pub fn clone(
     const parent_idx = sched.currentTaskIndex() orelse return -1;
     const parent = task_mod.getTask(parent_idx) orelse return -1;
 
+    // RLIMIT_NPROC preflight: a thread or process created via clone counts
+    // against the parent's real UID (Linux counts every task). Gate before
+    // COW cloning or address-space retention so a denied clone leaks
+    // nothing. EAGAIN matches Linux.
+    if (!task_mod.nprocPreflight(parent.uid, parent.nproc_cur)) return -11;
+
     // CLONE_VM: share address space (thread) vs COW copy (process)
     const shares_vm = flags & CLONE_VM != 0;
     const child_pml4 = if (shares_vm)
@@ -256,6 +262,8 @@ pub fn clone(
     child.stack_max = parent.stack_max;
     child.as_cur = parent.as_cur;
     child.as_max = parent.as_max;
+    child.nproc_cur = parent.nproc_cur;
+    child.nproc_max = parent.nproc_max;
     // The clone's address space mirrors (or with CLONE_VM shares) the
     // parent's, so it starts with the same charged usage.
     child.as_used = parent.as_used;

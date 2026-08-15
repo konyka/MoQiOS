@@ -140,6 +140,13 @@ pub const Task = struct {
     as_cur: u64 = @import("rlimit.zig").RLIM_INFINITY,
     as_max: u64 = @import("rlimit.zig").RLIM_INFINITY,
     as_used: u64 = 0,
+    /// Per-task RLIMIT_NPROC soft/hard limits in task count for the real
+    /// UID; defaults preserve the former stub report (unlimited). The gate
+    /// lives at every task-creation chokepoint (fork/clone/spawn) before
+    /// expensive page-table work; the per-UID count is maintained in
+    /// `uid_task_count` alongside `task_count`.
+    nproc_cur: u64 = @import("rlimit.zig").RLIM_INFINITY,
+    nproc_max: u64 = @import("rlimit.zig").RLIM_INFINITY,
 
     /// Bitmask of pending signals (bit N = signal N+1 is pending).
     /// Signals 1-31 supported. Bit 0 = SIGHUP (1), bit 30 = SIGUSR2 (31).
@@ -344,6 +351,64 @@ pub const MAX_TASKS: u32 = 64;
 var tasks: [MAX_TASKS]Task = undefined;
 var next_tid: u32 = 1;
 var task_count: u32 = 0;
+
+// A fixed table keeps the task-lock hot path O(1) without introducing
+// allocator failure into task creation/reap. Entries are keyed by UID rather
+// than using UID as an array index because the default user profile is UID
+// 1000 while MAX_TASKS is only 64.
+const UID_COUNT_SLOTS: usize = MAX_TASKS;
+const UidTaskCount = struct { uid: u32 = 0, count: u32 = 0, used: bool = false };
+var uid_task_count: [UID_COUNT_SLOTS]UidTaskCount = [_]UidTaskCount{.{}} ** UID_COUNT_SLOTS;
+
+fn uidCountSlot(uid: u32) ?usize {
+    for (uid_task_count, 0..) |entry, i| {
+        if (entry.used and entry.uid == uid) return i;
+    }
+    return null;
+}
+
+/// Caller must hold task_lock. Returns the live-task count for a real UID.
+pub fn uidTaskCountLocked(uid: u32) u32 {
+    // An unknown UID means the bounded table is exhausted. Returning the
+    // maximum task count makes finite RLIMIT_NPROC fail closed rather than
+    // silently granting an untracked UID an unlimited creation budget.
+    return if (uidCountSlot(uid)) |slot| uid_task_count[slot].count else MAX_TASKS;
+}
+
+/// Caller must hold task_lock. Add or remove one live task for a real UID.
+fn uidTaskCountAddLocked(uid: u32) void {
+    if (uidCountSlot(uid)) |slot| {
+        uid_task_count[slot].count += 1;
+        return;
+    }
+    for (&uid_task_count) |*entry| {
+        if (!entry.used) {
+            entry.* = .{ .uid = uid, .count = 1, .used = true };
+            return;
+        }
+    }
+}
+
+fn uidTaskCountRemoveLocked(uid: u32) void {
+    if (uidCountSlot(uid)) |slot| {
+        if (uid_task_count[slot].count > 0) uid_task_count[slot].count -= 1;
+        if (uid_task_count[slot].count == 0) uid_task_count[slot] = .{};
+    }
+}
+
+/// Caller must hold task_lock. Return whether one more task for `uid` fits.
+pub fn nprocAllowedLocked(uid: u32, soft_limit: u64) bool {
+    return @import("rlimit.zig").Policy.nprocAllowed(uidTaskCountLocked(uid), soft_limit);
+}
+
+/// Caller must hold task_lock. This is the preflight used before page-table
+/// cloning or loader work. A caller with an unlimited limit bypasses the
+/// count; finite limits are enforced against the real UID being created.
+pub fn nprocPreflight(uid: u32, soft_limit: u64) bool {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    return nprocAllowedLocked(uid, soft_limit);
+}
 
 // Kernel stacks live in the shared upper half of every user address space.
 // Reusing a slot must therefore reuse its mapping as well: tearing a stack
@@ -635,6 +700,7 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     tasks[slot].last_cpu = affinity;
 
     task_count += 1;
+    uidTaskCountAddLocked(tasks[slot].uid);
     asm volatile ("" ::: .{ .memory = true });
     return slot;
 }
@@ -652,6 +718,7 @@ pub fn cancelUnstartedKernelThread(slot: u32) void {
     if (vfs.releaseFdTable(t.fd_table)) vfs.freeFdTable(t.fd_table);
     slot_bitmap &= ~(@as(u64, 1) << @intCast(slot));
     task_count -= 1;
+    uidTaskCountRemoveLocked(t.uid);
 }
 
 /// Create an unpinned kernel thread (cpu_affinity = -1, eligible for stealing).
@@ -696,6 +763,7 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     tasks[slot].cpu_affinity = -1;
     tasks[slot].last_cpu = 0;
     task_count += 1;
+    uidTaskCountAddLocked(tasks[slot].uid);
     asm volatile ("" ::: .{ .memory = true });
     return slot;
 }
@@ -915,6 +983,7 @@ pub fn reapZombies() u32 {
         freeKernelStack(t.kernel_stack);
         slot_bitmap &= ~(@as(u64, 1) << @intCast(i));
         task_count -= 1;
+        uidTaskCountRemoveLocked(t.uid);
         reaped += 1;
     }
     return reaped;
@@ -1052,6 +1121,8 @@ pub fn createUserProcess(
         tasks[slot].as_cur = @import("rlimit.zig").RLIM_INFINITY;
         tasks[slot].as_max = @import("rlimit.zig").RLIM_INFINITY;
         tasks[slot].as_used = 0;
+        tasks[slot].nproc_cur = @import("rlimit.zig").RLIM_INFINITY;
+        tasks[slot].nproc_max = @import("rlimit.zig").RLIM_INFINITY;
         tasks[slot].stack_limit = @import("rlimit.zig").Policy.initialStackLimit(
             user_stack_top,
             @import("../mm/user_space.zig").USER_STACK_BOTTOM,
@@ -1074,6 +1145,11 @@ pub fn createUserProcess(
         tasks[slot].initial_init = profile.initial_init;
 
         task_count += 1;
+        // RLIMIT_NPROC: count this user process against its real UID. uid
+        // was set above from the launch profile; the count balances with the
+        // three reap sites (cancelUnstartedKernelThread / reapZombies /
+        // waitpidScanLocked) which remove by the task's stored uid.
+        uidTaskCountAddLocked(tasks[slot].uid);
         asm volatile ("mfence" ::: .{ .memory = true });
     }
 
@@ -1240,6 +1316,7 @@ pub fn waitpidScanLocked(parent_idx: u32, pid: i32, status: *i32) WaitScan {
         freeKernelStack(t.kernel_stack);
         slot_bitmap &= ~(@as(u64, 1) << @intCast(i));
         task_count -= 1;
+        uidTaskCountRemoveLocked(t.uid);
         return .{ .reaped = child_tid };
     }
     return if (busy_child) .busy else .none;

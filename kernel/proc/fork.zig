@@ -15,6 +15,11 @@ pub fn fork(frame: *SyscallFrame) i64 {
     const parent_idx = sched.currentTaskIndex() orelse return -1;
     const parent = task_mod.getTask(parent_idx) orelse return -1;
 
+    // RLIMIT_NPROC preflight: the child counts against the parent's real
+    // UID. Check before any page-table cloning so a denied fork costs
+    // nothing and leaks nothing. EAGAIN matches Linux.
+    if (!task_mod.nprocPreflight(parent.uid, parent.nproc_cur)) return -11;
+
     const child_pml4 = cloneUserPagesCow(parent.page_table_phys, &parent.mmap_regions) orelse return -1;
 
     const child_idx = task_mod.createUserProcess(
@@ -53,6 +58,8 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.stack_max = parent.stack_max;
     child.as_cur = parent.as_cur;
     child.as_max = parent.as_max;
+    child.nproc_cur = parent.nproc_cur;
+    child.nproc_max = parent.nproc_max;
     // The child's address space mirrors the parent's (COW), so it starts with
     // the same charged usage.
     child.as_used = parent.as_used;

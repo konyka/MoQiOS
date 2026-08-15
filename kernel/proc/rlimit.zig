@@ -120,4 +120,17 @@ pub const Policy = struct {
         if (cur == RLIM_INFINITY) return true;
         return used <= cur and add <= cur - used;
     }
+
+    // ── RLIMIT_NPROC ────────────────────────────────────────────────
+
+    /// RLIMIT_NPROC gate: true when a new task for `uid` may be created.
+    /// `uid_count` is the current number of live (including zombie) tasks
+    /// for that real UID; `cur` is the caller's soft limit. Linux semantics:
+    /// the check counts processes by real UID and refuses creation with
+    /// EAGAIN once the count reaches the soft limit. `RLIM_INFINITY` never
+    /// refuses. A UID with no live tasks always passes (uid_count == 0).
+    pub fn nprocAllowed(uid_count: u32, cur: u64) bool {
+        if (cur == RLIM_INFINITY) return true;
+        return @as(u64, uid_count) < cur;
+    }
 };
