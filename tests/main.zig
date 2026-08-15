@@ -26,6 +26,15 @@ test "creation metadata masks requested permissions to nine mode bits" {
     try std.testing.expectEqual(@as(u32, 0o740), metadata.mode);
 }
 
+test "rlimit NPROC policy rejects creation at the soft limit" {
+    const policy = kt.rlimit.Policy;
+    try std.testing.expect(policy.nprocAllowed(0, 1));
+    try std.testing.expect(policy.nprocAllowed(7, 8));
+    try std.testing.expect(!policy.nprocAllowed(8, 8));
+    try std.testing.expect(!policy.nprocAllowed(9, 1));
+    try std.testing.expect(policy.nprocAllowed(64, kt.rlimit.RLIM_INFINITY));
+}
+
 test "creation metadata defaults omitted file and directory modes separately" {
     const file = creation_metadata.decide(null, .regular_file, null, 0o022, 1, 2).metadata;
     const directory = creation_metadata.decide(null, .directory, null, 0o022, 1, 2).metadata;

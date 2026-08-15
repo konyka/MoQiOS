@@ -26,6 +26,8 @@ int main(void) {
     assert(offsetof(struct rlimit, rlim_max) == 8);
 
     assert(RLIMIT_NOFILE == 7);
+    assert(RLIMIT_DATA == 2);
+    assert(RLIMIT_NPROC == 6);
     assert(RLIMIT_STACK == 3);
     assert(RLIM_INFINITY == (rlim_t)~0ULL);
     return 0;

@@ -182,6 +182,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello60");  /* RLIMIT_AS 执行语义: mmap/brk 计费/超限/继承/SIGSEGV */
     run_test("hello61");  /* fork COW 事务化克隆回归: 96MiB 大页表规模 */
     run_test("hello62");  /* 文件映射 fault-around: 256KiB 顺序扫描校验 */
+    run_test("hello64");  /* RLIMIT_NPROC 执行语义: 默认/EINVAL/EAGAIN/继承/释放 */
 
     start_persistent_services();
 
