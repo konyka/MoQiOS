@@ -2135,6 +2135,41 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 - kernel-subsystems §1.8.1 记录 fault-around 与 2MiB PDE 不兼容的分析定论；
   next-phase-plan 的 2MB 大页文件映射半项关闭。
 
+### 6.36 P1 收口（2026-08-15）：virtio-net TX single-flight 锁契约 + RX 所有权审计
+
+- **对账结论**：`docs/next-phase-plan.md` 的 P1 唯一剩余项原描述为
+  "virtio-blk/virtio-net/NVMe 队列 single-flight 锁契约"。逐驱动核对代码后，
+  virtio-blk 用 `io_lock: IrqSpinlock`（virtio_blk.zig:167）串行化整笔请求
+  （所有请求共享固定描述符 0-2），NVMe 用 `io_locks: [MAX_IO_QUEUES]IrqSpinlock`
+  每队列一把锁并写明锁序（nvme.zig:195-210）——二者早已满足 single-flight
+  契约。唯一真实缺口是 virtio-net TX：`sendPacket` 从任意 CPU 进入（用户任务
+  TX vs. 写回/定时器 TX），同时改写共享 TX virtqueue 的 free list
+  （`free_head`/`free_count`，经描述符内存）、描述符链、avail 环与完成索引，
+  无任何串行化——并发发送会重复分配/回收同一描述符、丢失 avail 更新、改写
+  DMA 所有权并泄漏页。
+- **实现**：`virtio_net.zig` 新增 `tx_lock: IrqSpinlock`，`sendPacket` 在首个
+  队列可变操作前 acquire、整笔事务（alloc→publish→notify→同步 reclaim）持锁、
+  `defer` 释放；失败路径（第二描述符/页分配失败）在持锁下回滚队列状态。RX
+  路径（`processRxQueue`）保持无锁——见下方所有权审计。
+- **TDD**：新增纯模块 `kernel/drivers/virtio_net_queue.zig`（不依赖内核/硬件
+  符号，host 可测），承载队列记账（`init`/`allocDescriptor`/`freeDescriptor`/
+  `publishAvail`/`recordCompletion`/`recycleRx`）与 single-flight 不变量；
+  8 个 host 测试（alloc-until-full 唯一性、free 恢复容量、重复/越界 free 无操作、
+  零大小安全、publish 单槽单步进、completion 单步进、分配失败回滚、RX 单次消费+
+  重发）先红后绿，经
+  `kernel/host_test.zig` 与 `tests/main.zig` 接入 `zig build test`。
+- **RX 所有权审计（本批结论）**：`processRxQueue` 仅由 `handleInterrupt` 调用，
+  IDT 中断上下文单所有者（`idt.zig` handleIrq 的 virtio-net 分支）；QEMU smoke
+  用 e1000（qemu_run.sh `-device e1000`）而不用 virtio-net，且 PIC 初始化仅
+  unmask IRQ1（idt.zig:1317），virtio-net 的 INTx 在当前门禁下不可达。RX 与
+  TX 操作不同 virtqueue，故加锁只会引入假依赖并让整笔 TX poll 关中断，无
+  正确性收益——**维持无锁，另记 follow-up**：若未来引入 virtio-net 多队列或
+  非 ISR RX 拉取，需先为此路径补 per-queue 锁/所有权契约。
+- **门禁**：`zig build`、`zig build test`（193 全绿）、smoke SMP=1、smoke
+  SMP=2 全绿；riscv64/aarch64 构建通过。riscv64 smoke `[SK-19] FAILED:
+  blocked state` 为既有环境失败——在 stash 掉本批全部改动后的干净 main 上
+  复现，与本次改动无关（riscv 使用独立 `arch/riscv64/virtio_net.zig`）。
+
 ---
 
 ## 7. Completion Criteria For This Review Task

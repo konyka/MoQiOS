@@ -1523,6 +1523,26 @@ const SysCap = packed struct {
   设备不提供该特性时 `discard()` 为 no-op（返回 0）。QEMU 需给
   virtio-blk 设备加 `discard=on` 才会提供该特性，默认不开启。
 
+### 6.2b Virtio-net ✅ TX single-flight 锁契约（2026-08-15）
+
+文件: `virtio_net.zig`, `virtio_net_queue.zig`
+
+- Legacy virtio PCI（I/O port 基），RX/TX 两条独立 virtqueue（队列 0/1），
+  中断驱动 RX + 同步 TX（submit + poll 完成）
+- **TX single-flight（6.36）**：`sendPacket` 从任意 CPU 进入（用户任务 TX vs.
+  写回/定时器 TX），同时改写共享 TX free list/描述符链/avail 环/完成索引。
+  现以 `tx_lock: IrqSpinlock` 覆盖整笔事务（alloc → publish → notify →
+  同步 reclaim），`defer` 释放；失败路径在持锁下回滚队列状态。同
+  virtio-blk 的 `io_lock`（全请求串行）与 NVMe 的每队列 `io_locks`。
+- **RX 无锁（审计结论）**：`processRxQueue` 仅由 ISR 单所有者调用，且操作
+  独立 rx_queue；与 TX 加锁只引入假依赖并让整笔 TX poll 关中断。若未来引入
+  多队列或非 ISR RX 拉取，需先补 per-queue 锁/所有权契约（review §6.36）。
+- **队列记账纯模块**：`virtio_net_queue.zig` 承载
+  `init`/`allocDescriptor`/`freeDescriptor`/`publishAvail`/
+  `recordCompletion`/`recycleRx` 与 single-flight 不变量，host 可测
+  （8 个测试锁定唯一性/边界/单步进/回滚），经 `host_test.zig`/`tests/main.zig`
+  接入 `zig build test`
+
 ### 6.4 AHCI/SATA ✅
 
 文件: `ahci.zig`

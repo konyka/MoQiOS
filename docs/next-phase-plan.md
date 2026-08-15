@@ -45,7 +45,7 @@
 | 1 | FAT32/ext2 写路径检查 `writeBlockUncached`/`safeWriteSectors` 返回值 | review §5.2h–j | ✅ 完成（6.23）：direct-write 丢弃点全部传播或注释约定 |
 | 2 | `vfs.syncFile` 错误传播 + 设备 flush barrier 能力上报 | review §5.2g/§5.6 | 代码已完成：`vfs.zig:1313` syncFile 返回 bool，fsync syscall 传播 `-5 EIO` |
 | 3 | UDP 接收队列串行化 + MSG_TRUNC/MSG_PEEK 语义 | review §5.6 | ✅ 完成（6.23）：队列锁（J1）+ recvFromEx/recvFromV6Ex + recvfrom flags，hello50 验收；顺带修复 sendto/recvfrom flags 错读 rcx 的 ABI bug |
-| 4 | virtio-blk/virtio-net/NVMe 队列 single-flight 锁契约 | review §5.5/§5.6 | 仍待做（大，需逐驱动设计评审，是多队列并行的前提）——**P1 唯一剩余项** |
+| 4 | virtio-blk/virtio-net/NVMe 队列 single-flight 锁契约 | review §5.5/§5.6 | ✅ 完成（6.36）：2026-08-15 逐驱动核对后确认 virtio-blk（`io_lock`，virtio_blk.zig:167 全请求串行）与 NVMe（每队列 `io_locks` + 显式锁序注释，nvme.zig:195-210）**早已加锁**；唯一真实缺口是 virtio-net TX——`sendPacket` 无锁并发改写共享 TX free list/描述符链/avail 环/完成索引。已加 `tx_lock`（IrqSpinlock）覆盖整笔事务（alloc→publish→notify→reclaim），并新增纯队列记账模块 `virtio_net_queue.zig` + host 测试锁定 single-flight 不变量；RX 保持无锁（仅 ISR 单所有者、独立 rx_queue，见 review §6.36 审计）。P1 至此全部关闭。 |
 | 5 | `/dev/kmsg` 阻塞读/poll 唤醒，syslogd 改事件驱动 | user-space §7.1 | 代码已完成（J3：kmsg 读在最新字节处阻塞，syslogd 无轮询循环） |
 | 6 | panic 停 AP 改 NMI（替代 ~10ms tick 轮询） | review §6.5/6.6 | 代码已完成：`panic.zig` sendNmiAllButSelf + idt NMI 处理 park，tick 轮询降为兜底 |
 | 7 | IOAPIC 消费 MADT ISO 覆盖（电平/极性） | review §6.12–14 | 代码已完成：`ioapic.zig` routeGsi 应用 ISO trigger/polarity |
