@@ -15,6 +15,8 @@ const paging = @import("../arch/arch.zig").paging;
 const pmm = @import("../mm/pmm.zig");
 const pci = @import("pci.zig");
 const fmt = @import("../lib/fmt.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+const virtio_queue = @import("virtio_net_queue.zig");
 
 // Virtio PCI registers (legacy)
 const VIRTIO_PCI_QUEUE_SEL: u32 = 0x0E;
@@ -48,7 +50,7 @@ const VqDesc = extern struct {
     next: u16,
 };
 
-const VQ_DESC_NEXT: u16 = 1;
+const VQ_DESC_NEXT: u16 = virtio_queue.VQ_DESC_NEXT;
 const VQ_DESC_WRITE: u16 = 2; // device-writable
 
 const VqAvailable = extern struct {
@@ -94,6 +96,18 @@ const Virtqueue = struct {
     // Buffer tracking: physical address of each descriptor's buffer
     buf_phys: [QUEUE_SIZE]u64,
 };
+
+// Driver-level lock: TX is a synchronous, full-transaction submit/poll path
+// reachable from any CPU (user task TX, writeback/timer TX) and mutates the
+// shared TX virtqueue (free list, descriptor chain, avail ring, completion
+// index). The TX lock guards the whole `sendPacket` transaction (alloc →
+// publish → notify → reclaim), matching the documented single-flight
+// contract. The RX path is deliberately lock-free: it runs only from the
+// device ISR and mutates a *different* virtqueue (rx_queue), so serializing
+// it behind the TX lock would add a false dependency and disable IRQs for
+// the whole synchronous TX poll. See the RX ownership audit in
+// current-code-review-and-fix-plan.md §6.36.
+var tx_lock: IrqSpinlock = .{};
 
 const VirtioNetDevice = struct {
     io_base: u64,
@@ -466,6 +480,16 @@ fn populateRxQueue() !void {
 /// `pkt` should be a complete Ethernet frame (including ETH header).
 pub fn sendPacket(pkt: [*]const u8, len: u32) bool {
     if (!device.active or len == 0 or len > 1514) return false;
+
+    // Single-flight TX contract: the whole transaction below mutates the
+    // shared TX free list, descriptor chain, available ring and completion
+    // index, so concurrent senders on SMP (user-task TX vs. writeback/timer
+    // TX) must be serialized or they allocate/reclaim the same descriptors
+    // and corrupt the queue. Acquire the TX lock up front; every failure
+    // path below unwinds the queue state while still holding it, and the
+    // release happens after the transaction fully completes or times out.
+    const flags = tx_lock.acquire();
+    defer tx_lock.release(flags);
 
     const vq = &device.tx_queue;
 

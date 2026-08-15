@@ -19,6 +19,7 @@ const capability = kt.capability;
 const dac = kt.dac;
 const rlimit = kt.rlimit;
 const creation_metadata = kt.creation_metadata;
+const virtio_net_queue = kt.virtio_net_queue;
 
 test "creation metadata masks requested permissions to nine mode bits" {
     const metadata = creation_metadata.decide(null, .regular_file, 0o1764, 0o027, 41, 52).metadata;
