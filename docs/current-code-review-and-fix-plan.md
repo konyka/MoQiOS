@@ -2197,6 +2197,30 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   但需要第三个 `data_used` 账本，并精确覆盖 brk 与可写私有 mmap 的
   `munmap`/`mremap`/`MAP_FIXED` 增长和回滚路径，不能与 NPROC 混批。
 
+### 6.38 P2 rlimit 第二步（2026-08-15）：RLIMIT_DATA 真实执行
+
+- **现状核对**：`RLIMIT_DATA` 此前与 NPROC 一样是 stub——getrlimit 返回固定
+  infinity、set/prlimit 接受后 no-op；brk 和 mmap 只走 RLIMIT_AS 的
+  `as_used` 账本，无独立的 data 账本。
+- **实现**：`Task` 新增 `data_cur`/`data_max`/`data_used`（独立于 `as_used`
+  的第三账本）。计费对象是 brk 堆增长 + 可写私有 mmap（匿名私有 + 可写文件
+  `MAP_PRIVATE`）；只读私有、`MAP_SHARED`、exec 镜像 code/rodata 不计费。
+  `trackMmapRegion` 现在为匿名区域记录 `prot`/`shared`，并仅在 `prot`/`shared`
+  一致时才 merge（否则合并后单一 prot 无法精确退款）；`untrackMmapRange` 按
+  区域 `prot`/`shared` 并行退款 `data_used`。每个增长路径（mmap、匿名与文件
+  `mremap` grow、`moveMapping`）都在任何页表变更前做 `dataChargeOk` 预检查，
+  超限返回 ENOMEM 且不产生部分变更——绝不在超限后才发现需要回滚。
+  fork/clone 继承限制与用量，exec 重置用量而保留限制。
+- **TDD/验收**：host 测试锁定 `dataChargeOk` 边界（精确上限/超限/无限），
+  libc ABI 常量此前已在 NPROC 批锁定 `RLIMIT_DATA=2`；新增 `hello63` 验收
+  默认值、EINVAL、16MiB 软限下可写私有 mmap 超限 ENOMEM、只读/共享 64MiB
+  映射不受限、munmap 退款、brk 增长超限拒绝 + 收缩退款、fork 继承。
+- **门禁**：`zig build test`（195/195）、`zig build`、x86_64 smoke SMP=1/2、
+  CPU matrix 2/4/8、SMP=4 stress 3/3、riscv64/aarch64 构建均通过。
+
+**后续 rlimit**：剩余资源（RLIMIT_FSIZE/CORE/RSS）语义差异较大，各自定稿后
+单独成批；当前 P2 的 rlimit 执行语义目标已全部完成。
+
 ---
 
 ## 7. Completion Criteria For This Review Task

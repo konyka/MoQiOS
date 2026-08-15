@@ -19,9 +19,9 @@ before attempting duplication. Successful `dup3(..., O_CLOEXEC)` calls mark the
 new descriptor `FD_CLOEXEC` throughout the VFS descriptor table.
 
 `getrlimit`, `setrlimit`, and `prlimit64` provide real per-task operations for
-`RLIMIT_NOFILE`, `RLIMIT_STACK`, `RLIMIT_AS`, and `RLIMIT_NPROC`. All other
-`RLIMIT_*` resource types retain their existing reported/stub behavior and are
-not enforced.
+`RLIMIT_NOFILE`, `RLIMIT_STACK`, `RLIMIT_AS`, `RLIMIT_NPROC`, and
+`RLIMIT_DATA`. All other `RLIMIT_*` resource types retain their existing
+reported/stub behavior and are not enforced.
 
 ## RLIMIT_NPROC execution semantics
 
@@ -50,6 +50,39 @@ The per-UID counter is a bounded table keyed by UID (the kernel issues a small
 UID set today). A UID that exhausts the table fails closed: finite limits
 refuse creation for it rather than silently granting unlimited budget.
 `RLIM_INFINITY` bypasses the count entirely.
+
+## RLIMIT_DATA execution semantics
+
+`RLIMIT_DATA` carries per-task soft/hard byte limits over the charged data
+segment (default `RLIM_INFINITY` / `RLIM_INFINITY`, matching the former stub
+report, so an untouched task sees no behaviour change). The kernel keeps an
+independent per-task `data_used` byte counter alongside `as_used`; the two
+ledgers never interact, so a writable private mapping may consume both limits.
+
+Charged: `brk` heap growth and every writable private mapping (anonymous
+private, or a writable `MAP_PRIVATE` file mapping). Not charged: read-only
+private mappings, `MAP_SHARED` mappings, and the exec'd image's code/rodata
+segments — matching Linux, which accounts private-writable VMAs plus the data
+segment in `mm->data_vm`.
+
+Charges happen at mapping/creation time (a snapshot of the region's protection
+at mmap), and are refunded on `munmap`, `mremap` shrink, `MAP_FIXED`
+replacement, `brk` shrink, and exec (which resets `data_used` for the fresh
+image while preserving `data_cur`/`data_max`). Every growth path checks the
+data soft limit *before* any page-table mutation: mmap, the anonymous and
+file-backed `mremap` grow paths, and `moveMapping` all preflight `dataChargeOk`
+and refuse with `ENOMEM` on overflow. A mapping/charge never partially applies
+— a refused grow leaves both `as_used` and `data_used` untouched and no page is
+demoted or copied. Because `data_used` is snapshotted at mmap time, `mprotect`
+changing writability does not rebalance the ledger — the same snapshot model
+RLIMIT_AS already uses, and the reason merge only combines regions with
+matching `prot`/`shared`.
+
+Validation and privilege rules are the same byte-denominated `applyBytes` set
+as `RLIMIT_STACK`/`RLIMIT_AS`; lowering below the current usage is legal and
+only blocks further charges. Limits and usage are inherited across fork/clone
+and preserved by exec (usage reset). moqi_libc wrappers and the ABI constants
+are covered by the `test_rlimit_abi` host test.
 
 ## RLIMIT_STACK execution semantics
 

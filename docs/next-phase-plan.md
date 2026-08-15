@@ -71,7 +71,9 @@
   ~~RLIMIT_STACK~~（✅ 6.31：缺页增长地板执行 + 真实 set/get/prlimit64，hello59 验收）、
   ~~RLIMIT_AS~~（✅ 6.33：as_used 计费 + mmap/brk/mremap/栈增长执行点，hello60 验收）、
   ~~RLIMIT_NPROC~~（✅ 6.37：per-UID 活任务计数 + fork/clone/spawn 前置 EAGAIN 闸点，
-  hello64 验收）；DATA 待语义定稿后单独成批。
+  hello64 验收）、~~RLIMIT_DATA~~（✅ 6.38：独立 `data_used` 账本——brk 增长 +
+  可写私有 mmap 计费，munmap/mremap/brk shrink/MAP_FIXED/exec 退款，hello63 验收；
+  与 RLIMIT_AS 独立）。剩余资源（FSIZE/CORE/RSS）仍待各自语义定稿。
 
 ## P3：大项（需独立设计评审，不与其他工作混批）
 
