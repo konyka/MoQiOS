@@ -326,6 +326,15 @@ pub fn allocPage() ?u64 {
     return null;
 }
 
+/// Allocate only from currently free PMM frames. Transactional VM paths use
+/// this variant when reclaim could invalidate a previously validated PTE.
+pub fn allocPageNoReclaim() ?u64 {
+    const flags = lock.acquire();
+    const result = allocPageLocked();
+    lock.release(flags);
+    return result;
+}
+
 /// Inner allocation — caller must hold lock.
 /// Word-at-a-time bitmap scanning: reads 64 bits at once, skips empty
 /// 64-page blocks in a single iteration. Uses @ctz for fast bit scan.
