@@ -184,6 +184,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello62");  /* 文件映射 fault-around: 256KiB 顺序扫描校验 */
     run_test("hello63");  /* RLIMIT_DATA 执行语义: mmap/brk 计费/退款/继承 */
     run_test("hello64");  /* RLIMIT_NPROC 执行语义: 默认/EINVAL/EAGAIN/继承/释放 */
+    run_test("hello65");  /* bounded transactional MAP_FIXED anonymous replacement */
 
     start_persistent_services();
 
