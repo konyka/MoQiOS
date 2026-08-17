@@ -231,6 +231,10 @@ const AddressSpace = struct {
   无条件采纳会让进程用 `mmap(&_start, ...)` 覆盖掉正在执行的代码页。
 - 运行时覆盖: `hello30`（brk 增长/清零/收缩 + 匿名 mmap + hint 让位），
   冒烟门禁标记 `hello30: brk/mmap PASS`。
+- VMA 扫描基线：`/proc/vma_stats` 输出 instrumented mmap 元数据事件的固定 64 槽
+  模型次数、模型槽位总数及平均模型槽位；`hello67` 用 40 页碎片化映射验证该测量契约。计数器是
+  无锁诊断原子，不读取时钟、不改变映射决策；完整的动态 VMA 树替换决策见
+  `vma-profiling.md`。
 
 用户态验收: `hello65` 映射一页匿名私有 RW 区域，写入哨兵后降低 `RLIMIT_AS`，确认等长
 MAP_FIXED 替换以 `ENOMEM` 失败且哨兵仍在；恢复无限制后替换成功并确认新页清零。
