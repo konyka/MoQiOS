@@ -2084,7 +2084,8 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   `hello60: PASS`/`hello60 done` 双标记。
 - **门禁**：`zig build`、`zig build test`（192 全绿，含 asChargeOk 边界组）、
   smoke SMP=1（hello60 PASS）、SMP=4 stress 2/2 全绿。
-- 其余 RLIMIT_*（NPROC/DATA/FSIZE/CORE/RSS）仍为上报 stub，待各自语义定稿。
+- 其余 RLIMIT_*（CORE/RSS）仍为上报 stub，待各自语义定稿；NPROC/DATA/FSIZE
+  已分别由 hello64/hello63/hello66 收口。
 
 ---
 
@@ -2218,7 +2219,7 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 - **门禁**：`zig build test`（195/195）、`zig build`、x86_64 smoke SMP=1/2、
   CPU matrix 2/4/8、SMP=4 stress 3/3、riscv64/aarch64 构建均通过。
 
-**后续 rlimit**：剩余资源（RLIMIT_FSIZE/CORE/RSS）语义差异较大，各自定稿后
+**后续 rlimit**：剩余资源（RLIMIT_CORE/RSS）语义差异较大，各自定稿后
 单独成批；当前 P2 的 rlimit 执行语义目标已全部完成。
 
 ---

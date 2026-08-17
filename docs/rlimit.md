@@ -1,7 +1,7 @@
 # Resource limits
 
-This milestone implements per-task `RLIMIT_NOFILE` soft and hard limits. The
-soft limit is enforced by the common file-descriptor allocation and explicit
+This milestone implements per-task resource-limit execution semantics. `RLIMIT_NOFILE`
+soft and hard limits are enforced by the common file-descriptor allocation and explicit
 target reservation APIs as an exclusive upper bound on the descriptor number:
 an FD is allowed only when `fd < rlim_cur`. This applies to `dup`, `dup2`,
 `dup3`, `F_DUPFD`, and `F_DUPFD_CLOEXEC`; it is not an open-descriptor count.
@@ -19,9 +19,29 @@ before attempting duplication. Successful `dup3(..., O_CLOEXEC)` calls mark the
 new descriptor `FD_CLOEXEC` throughout the VFS descriptor table.
 
 `getrlimit`, `setrlimit`, and `prlimit64` provide real per-task operations for
-`RLIMIT_NOFILE`, `RLIMIT_STACK`, `RLIMIT_AS`, `RLIMIT_NPROC`, and
-`RLIMIT_DATA`. All other `RLIMIT_*` resource types retain their existing
-reported/stub behavior and are not enforced.
+`RLIMIT_NOFILE`, `RLIMIT_STACK`, `RLIMIT_AS`, `RLIMIT_NPROC`, `RLIMIT_DATA`, and
+`RLIMIT_FSIZE`. `RLIMIT_CORE` and `RLIMIT_RSS` retain reported-only behavior.
+
+## RLIMIT_FSIZE execution semantics
+
+`RLIMIT_FSIZE` carries per-task soft/hard byte limits (default
+`RLIM_INFINITY` / `RLIM_INFINITY`). The limit applies only to regular-file
+writes through `write`, `writev`, `pwrite64`, and `pwritev`; streams, pipes,
+sockets, devices, and read-only descriptors are not file-size limited.
+
+Before each buffered regular-file write, the VFS computes the permitted prefix
+from the current or explicit offset. A write ending exactly at the soft limit
+succeeds; a write crossing it is truncated to `min(count, limit - offset)` and
+raises `SIGXFSZ`. When the offset is already at or above the limit, the write
+returns `EFBIG` and raises `SIGXFSZ`. The check is performed before writeback-cache
+mutation, so refused bytes cannot enlarge the file or consume cache capacity.
+`truncate`, `ftruncate`, and default `fallocate` also reject file growth past
+the limit with `EFBIG`.
+
+The limit is inherited by fork/clone and is controlled by the same
+`cur > max`/`cap_sys_resource` rules as `RLIMIT_AS`. `hello66` validates the
+default and set/get values, exact-boundary and partial writes, `pwrite` offset
+semantics, `SIGXFSZ`, fork inheritance, and pipe exclusion.
 
 ## RLIMIT_NPROC execution semantics
 
