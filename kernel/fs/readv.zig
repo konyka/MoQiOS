@@ -174,9 +174,12 @@ pub fn pwritev(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64) i64 {
             const ucopy = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(iov_base + pos), chunk);
             if (ucopy == 0) break;
             const result = cur.fd_table.writeAtOffset(fd, &kbuf, ucopy, current_offset);
-            if (result <= 0) break;
+            if (result < 0) return if (total == 0 and pos == 0) result else @intCast(total + pos);
+            if (result == 0) break;
             pos += @intCast(result);
-            current_offset += @intCast(result);
+            const advanced, const overflow = @addWithOverflow(current_offset, @as(u64, @intCast(result)));
+            if (overflow != 0) return if (total == 0 and pos == 0) -22 else @intCast(total + pos);
+            current_offset = advanced;
             if (result < @as(i64, @intCast(ucopy))) break;
         }
         total += pos;

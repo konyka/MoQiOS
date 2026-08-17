@@ -909,6 +909,17 @@ pub fn getFileSize(file_idx: u32) u64 {
     return open_files[file_idx].inode.size;
 }
 
+/// Read the authoritative on-disk size for an inode without requiring an
+/// open-file slot. Used by truncate-style limits before mutating the inode.
+pub fn getInodeSize(inode_num: u32) ?u64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active or inode_num == 0) return null;
+    var inode: Ext2Inode = undefined;
+    if (!readInode(inode_num, &inode)) return null;
+    return inode.size;
+}
+
 /// Re-read the on-disk inode and refresh the slot's cached size. Each open
 /// slot keeps its own inode copy, so a write through one slot never reaches
 /// the others' inode.size — concurrent fds would see a stale EOF without

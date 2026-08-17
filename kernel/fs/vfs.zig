@@ -765,6 +765,27 @@ pub const FdTable = struct {
         }
     }
 
+    /// RLIMIT_FSIZE preflight for a regular-file write at byte position `pos`.
+    /// Returns the number of bytes the write may actually perform. When the
+    /// requested write would cross `fSize_cur`, it is truncated to the allowed
+    /// prefix (`soft_limit - pos`) and SIGXFSZ is raised. A write that starts
+    /// at/past the limit returns EFBIG after raising SIGXFSZ. The filesystem
+    /// backends use u32 offsets, so unrepresentable ranges return EINVAL.
+    /// Regular files only — the caller gates non-file branches.
+    fn fsizeGate(pos: u64, count: usize) i64 {
+        const sched = @import("../proc/sched.zig");
+        const t = sched.currentTask() orelse return @intCast(count);
+        if (count == 0) return 0;
+        if (pos > 0xFFFF_FFFF or count > 0xFFFF_FFFF or @as(u64, @intCast(count)) > 0xFFFF_FFFF - pos) return -22; // EINVAL
+        const limit = t.fSize_cur;
+        const allowed = RlimitPolicy.fsizeWriteBytes(pos, @intCast(count), limit);
+        if (allowed == count) return @intCast(count);
+        const sig_mod = @import("../proc/signal.zig");
+        sig_mod.raiseSelf(sig_mod.SIGXFSZ);
+        if (allowed == 0) return -27; // EFBIG
+        return @intCast(allowed);
+    }
+
     /// Stage a write in the writeback cache and advance the descriptor by the
     /// bytes actually accepted. Reporting `count` regardless would tell the
     /// caller that data made it into the cache when the pool had no room for it.
@@ -783,6 +804,7 @@ pub const FdTable = struct {
     /// the write so the new data stays readable through the fd.
     fn bufferedWriteAt(desc: *FileDescriptor, file_idx: u32, buf: [*]const u8, count: usize, offset: u64, fs_type: writeback.FsType) i64 {
         if (count == 0) return 0;
+        if (offset > 0xFFFF_FFFF or count > 0xFFFF_FFFF or @as(u64, @intCast(count)) > 0xFFFF_FFFF - offset) return -22; // EINVAL
         const want: u32 = if (count > 0xFFFF_FFFF) 0xFFFF_FFFF else @intCast(count);
         const n = writeback.writeBuffered(desc.inode_id, file_idx, offset, buf, want, fs_type);
         if (n == 0) return -28; // ENOSPC — no buffer available
@@ -812,15 +834,19 @@ pub const FdTable = struct {
                 if (!desc.writable) return -1;
                 // O_APPEND: every sequential write goes to the current end.
                 if ((desc.status_flags & 0x400) != 0) desc.offset = desc.file_size;
+                const gate = fsizeGate(desc.offset, count);
+                if (gate < 0) return gate;
                 // Use writeback for delayed write coalescing
-                return bufferedWrite(desc, desc.fat32_file_idx, buf, count, .fat32);
+                return bufferedWrite(desc, desc.fat32_file_idx, buf, @intCast(gate), .fat32);
             },
             .ramdisk_file => return -1,
             .ext2_file => {
                 if (!desc.writable) return -1;
                 if ((desc.status_flags & 0x400) != 0) desc.offset = desc.file_size;
+                const gate = fsizeGate(desc.offset, count);
+                if (gate < 0) return gate;
                 // Use writeback for delayed write coalescing
-                return bufferedWrite(desc, desc.ext2_file_idx, buf, count, .ext2);
+                return bufferedWrite(desc, desc.ext2_file_idx, buf, @intCast(gate), .ext2);
             },
             .tcp_socket => return -1, // TCP sockets use sendto/recvfrom syscalls
             .udp_socket => return -1, // UDP sockets use sendto/recvfrom syscalls
@@ -851,8 +877,10 @@ pub const FdTable = struct {
             .tmpfs_file => {
                 if (!desc.writable) return -1;
                 if ((desc.status_flags & 0x400) != 0) desc.offset = desc.file_size;
+                const gate = fsizeGate(desc.offset, count);
+                if (gate < 0) return gate;
                 const tmpfs = @import("tmpfs.zig");
-                const n = tmpfs.tmpfsWrite(@intCast(desc.tmpfs_idx), desc.offset, buf, @intCast(count));
+                const n = tmpfs.tmpfsWrite(@intCast(desc.tmpfs_idx), desc.offset, buf, @intCast(gate));
                 if (n > 0) {
                     desc.offset += @intCast(n);
                     if (desc.offset > desc.file_size) {
@@ -974,18 +1002,24 @@ pub const FdTable = struct {
             .proc_file => return -1, // proc files are read-only
             .fat32_file => {
                 if (!desc.writable) return -9; // EBADF
+                const gate = fsizeGate(offset, count);
+                if (gate < 0) return gate;
                 // Stage through the writeback cache like write() does so that
                 // write()-then-pwrite() ordering survives a later flush.
-                return bufferedWriteAt(desc, desc.fat32_file_idx, buf, count, offset, .fat32);
+                return bufferedWriteAt(desc, desc.fat32_file_idx, buf, @intCast(gate), offset, .fat32);
             },
             .ext2_file => {
                 if (!desc.writable) return -9; // EBADF
-                return bufferedWriteAt(desc, desc.ext2_file_idx, buf, count, offset, .ext2);
+                const gate = fsizeGate(offset, count);
+                if (gate < 0) return gate;
+                return bufferedWriteAt(desc, desc.ext2_file_idx, buf, @intCast(gate), offset, .ext2);
             },
             .tmpfs_file => {
                 if (!desc.writable) return -9; // EBADF
+                const gate = fsizeGate(offset, count);
+                if (gate < 0) return gate;
                 const tmpfs = @import("tmpfs.zig");
-                return tmpfs.tmpfsWrite(@intCast(desc.tmpfs_idx), offset, buf, @intCast(count));
+                return tmpfs.tmpfsWrite(@intCast(desc.tmpfs_idx), offset, buf, @intCast(gate));
             },
         }
     }
