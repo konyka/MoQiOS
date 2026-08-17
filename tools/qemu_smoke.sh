@@ -222,6 +222,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     fi
 
     if [ -f "$LOG_FILE" ] &&
+       ! grep -q "hello67: FAIL" "$LOG_FILE" &&
        grep -q "\[NVMe\] MSI-X interrupts enabled" "$LOG_FILE" &&
        grep -q "\[ahci\] boot write+readback verified" "$LOG_FILE" &&
        grep -q "hello21 done" "$LOG_FILE" &&
@@ -288,6 +289,8 @@ while [ "$SECONDS" -lt "$deadline" ]; do
         grep -q "hello65 done" "$LOG_FILE" &&
         grep -q "hello66: PASS" "$LOG_FILE" &&
         grep -q "hello66 done" "$LOG_FILE" &&
+        grep -q "hello67: PASS" "$LOG_FILE" &&
+        grep -q "hello67 done" "$LOG_FILE" &&
         grep -q "\[fbcon\] mirror disabled" "$LOG_FILE" &&
         grep -q "\[fbcon\] mirror restored" "$LOG_FILE" &&
         grep -q "\[syslogd\] started" "$LOG_FILE" &&

@@ -186,6 +186,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello64");  /* RLIMIT_NPROC 执行语义: 默认/EINVAL/EAGAIN/继承/释放 */
     run_test("hello65");  /* bounded transactional MAP_FIXED anonymous replacement */
     run_test("hello66");  /* RLIMIT_FSIZE writes, pwrite, SIGXFSZ, inheritance */
+    run_test("hello67");  /* fixed-table VMA fragmentation baseline */
 
     start_persistent_services();
 
