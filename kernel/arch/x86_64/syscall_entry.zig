@@ -459,6 +459,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
     switch (syscall_nr) {
         1 => {
             syscallWrite(frame);
+            checkSignalsOnSyscallReturn(frame);
         },
         2 => {
             syscallExit(frame);
@@ -644,18 +645,21 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         137 => { // pwrite64(fd, buf, count, offset)
             frame.rax = @bitCast(file_io_mod.pwrite(@intCast(frame.rdi), frame.rsi, frame.rdx, frame.r10));
+            checkSignalsOnSyscallReturn(frame);
         },
         138 => { // readv(fd, iov, iovcnt)
             frame.rax = @bitCast(readv_mod.readv(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));
         },
         139 => { // writev(fd, iov, iovcnt)
             frame.rax = @bitCast(readv_mod.writev(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));
+            checkSignalsOnSyscallReturn(frame);
         },
         140 => { // preadv(fd, iov, iovcnt, pos_l)
             frame.rax = @bitCast(readv_mod.preadv(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx), frame.r10));
         },
         141 => { // pwritev(fd, iov, iovcnt, pos_l)
             frame.rax = @bitCast(readv_mod.pwritev(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx), frame.r10));
+            checkSignalsOnSyscallReturn(frame);
         },
         142 => { // fcntl(fd, cmd, arg)
             frame.rax = @bitCast(fcntl_mod.sysFcntl(frame.rdi, frame.rsi, frame.rdx));
@@ -666,9 +670,11 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         144 => { // sendfile(out_fd, in_fd, offset_ptr, count)
             frame.rax = @bitCast(splice_mod.sysSendfile(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, frame.r10));
+            checkSignalsOnSyscallReturn(frame);
         },
         145 => { // splice(fd_in, off_in, fd_out, off_out, len, flags)
             frame.rax = @bitCast(splice_mod.sysSplice(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx), frame.r10, frame.r8, @truncate(frame.r9)));
+            checkSignalsOnSyscallReturn(frame);
         },
         146 => { // epoll_create1(flags)
             _ = frame.rdi; // flags accepted but epollCreate ignores them
@@ -915,6 +921,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         184 => { // copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)
             _ = frame.r9;
             frame.rax = @bitCast(cfr_mod.copyFileRange(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx), frame.r10, frame.r8));
+            checkSignalsOnSyscallReturn(frame);
         },
         185 => { // flock(fd, operation)
             frame.rax = @bitCast(flock_mod.sysFlock(frame.rdi, frame.rsi));
@@ -1051,9 +1058,11 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         // ── v31.7: truncate/ftruncate/rename ───────────────────────
         210 => { // truncate(path, length)
             frame.rax = @bitCast(syscallTruncate(frame.rdi, frame.rsi));
+            checkSignalsOnSyscallReturn(frame);
         },
         211 => { // ftruncate(fd, length)
             frame.rax = @bitCast(syscallFtruncate(@truncate(frame.rdi), frame.rsi));
+            checkSignalsOnSyscallReturn(frame);
         },
         212 => { // rename(oldpath, newpath)
             frame.rax = @bitCast(syscallRename(frame.rdi, frame.rsi));
@@ -1067,6 +1076,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         215 => { // io_submit(ctx_id, nr, iocbpp)
             frame.rax = @bitCast(aio_mod.ioSubmit(frame.rdi, frame.rsi, frame.rdx));
+            checkSignalsOnSyscallReturn(frame);
         },
         216 => { // io_getevents(ctx_id, min_nr, nr, events, timeout)
             frame.rax = @bitCast(aio_mod.ioGetevents(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8));
@@ -1317,32 +1327,43 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             const offset = frame.rdx;
             const len = frame.r10;
             if (mode == 0) {
-                // Default: allocate space by extending file to offset+len
-                const sched = @import("../../proc/sched.zig");
-                const tm = @import("../../proc/task.zig");
-                if (sched.currentTaskIndex()) |cur_idx| {
-                    if (tm.getTask(cur_idx)) |t| {
+                if (offset > 0xFFFF_FFFF or len > 0xFFFF_FFFF or len > 0xFFFF_FFFF - offset) {
+                    frame.rax = @bitCast(@as(i64, -22));
+                } else {
+                    // Default: allocate space by extending file to offset+len
+                    const sched = @import("../../proc/sched.zig");
+                    const tm = @import("../../proc/task.zig");
+                    if (sched.currentTaskIndex()) |cur_idx| {
+                        if (tm.getTask(cur_idx)) |t| {
                         if (fd >= t.fd_table.fds.len or t.fd_table.fds[fd].fd_type == .none) {
                             frame.rax = @bitCast(@as(i64, -9)); // EBADF
                         } else {
                             const ext2 = @import("../../fs/ext2.zig");
                             const ext2_idx = t.fd_table.fds[fd].ext2_file_idx;
-                            const new_size: u32 = @truncate(offset + len);
-                            if (ext2.truncateFile(ext2_idx, new_size)) {
-                                frame.rax = 0;
+                            if (offset + len > t.fSize_cur) {
+                                const sig = @import("../../proc/signal.zig");
+                                sig.raiseSelf(sig.SIGXFSZ);
+                                frame.rax = @bitCast(@as(i64, -27));
                             } else {
-                                frame.rax = @bitCast(@as(i64, -28)); // ENOSPC
+                                const new_size: u32 = @truncate(offset + len);
+                                if (ext2.truncateFile(ext2_idx, new_size)) {
+                                    frame.rax = 0;
+                                } else {
+                                    frame.rax = @bitCast(@as(i64, -28)); // ENOSPC
                             }
                         }
+                        }
+                        } else {
+                            frame.rax = @bitCast(@as(i64, -9));
+                        }
                     } else {
-                        frame.rax = @bitCast(@as(i64, -9));
+                        frame.rax = @bitCast(@as(i64, -1));
                     }
-                } else {
-                    frame.rax = @bitCast(@as(i64, -1));
                 }
             } else {
                 frame.rax = 0; // Non-default modes: accept
             }
+            checkSignalsOnSyscallReturn(frame);
         },
         275 => { // posix_fadvise(fd, offset, len, advice) — readahead hints
             frame.rax = @bitCast(syscallPosixFadvise(@truncate(frame.rdi), frame.rsi, frame.rdx, @truncate(frame.r10)));
@@ -1531,12 +1552,14 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         18 => { // pwrite64(fd, buf, count, offset)
             frame.rax = @bitCast(file_io_mod.pwrite(@intCast(frame.rdi), frame.rsi, frame.rdx, frame.r10));
+            checkSignalsOnSyscallReturn(frame);
         },
         19 => { // readv(fd, iov, iovcnt)
             frame.rax = @bitCast(readv_mod.readv(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));
         },
         20 => { // writev(fd, iov, iovcnt)
             frame.rax = @bitCast(readv_mod.writev(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));
+            checkSignalsOnSyscallReturn(frame);
         },
         21 => { // access(pathname, mode)
             frame.rax = @bitCast(syscallAccess(frame.rdi, @truncate(frame.rsi)));
@@ -1575,6 +1598,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         40 => { // sendfile(out_fd, in_fd, offset_ptr, count)
             frame.rax = @bitCast(splice_mod.sysSendfile(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, frame.r10));
+            checkSignalsOnSyscallReturn(frame);
         },
         41 => { // socket(domain, type, protocol)
             frame.rax = @bitCast(socket_mod.socket(@truncate(frame.rdi), @truncate(frame.rsi), @truncate(frame.rdx)));
@@ -1676,16 +1700,28 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 frame.rax = @bitCast(@as(i64, -2));
                 return; // ENOENT
             }; // v53.3: truncate by inode directly, no open_files needed
+            if (@import("../../proc/sched.zig").currentTask()) |t| {
+                const old_size = ext2_mod.getInodeSize(inode_num) orelse return;
+                if (length > old_size and length > t.fSize_cur) {
+                    const sig = @import("../../proc/signal.zig");
+                    sig.raiseSelf(sig.SIGXFSZ);
+                    frame.rax = @bitCast(@as(i64, -27));
+                    checkSignalsOnSyscallReturn(frame);
+                    return;
+                }
+            }
             if (!ext2_mod.truncateByInode(inode_num, @truncate(length))) {
                 frame.rax = @bitCast(@as(i64, -5)); // EIO
                 return;
             }
             frame.rax = 0;
+            checkSignalsOnSyscallReturn(frame);
         },
         77 => { // ftruncate(fd, length) — v53.3: call real implementation
             const fd: u32 = @truncate(frame.rdi);
             const result = syscallFtruncate(fd, frame.rsi);
             frame.rax = @bitCast(result);
+            checkSignalsOnSyscallReturn(frame);
         },
         79 => { // getcwd(buf, size)
             syscallGetcwd(frame);
@@ -3292,6 +3328,15 @@ fn syscallFtruncate(fd: u32, length: u64) i64 {
 /// Shared truncate implementation. Only filesystems with real truncation
 /// support are accepted; ramdisk/proc files are read-only and rejected.
 fn truncateDesc(desc: *vfs_mod.FileDescriptor, length: u64) i64 {
+    const sched = @import("../../proc/sched.zig");
+    if (sched.currentTask()) |t| {
+        if (length > desc.file_size and length > t.fSize_cur) {
+            const sig = @import("../../proc/signal.zig");
+            sig.raiseSelf(sig.SIGXFSZ);
+            return -27; // EFBIG
+        }
+    }
+    if (length > 0xFFFF_FFFF) return -22; // EINVAL: backends use u32 sizes
     const new_size: u32 = @truncate(length);
     switch (desc.fd_type) {
         .ext2_file => {
@@ -3421,7 +3466,7 @@ fn syscallGetrlimit(resource: u32, rlim_ptr: u64) i64 {
 
     var rlim: Rlimit = .{};
     switch (resource) {
-        RLIMIT_NOFILE, RLIMIT_STACK, RLIMIT_AS, RLIMIT_DATA, RLIMIT_NPROC => {
+        RLIMIT_NOFILE, RLIMIT_STACK, RLIMIT_AS, RLIMIT_DATA, RLIMIT_NPROC, RLIMIT_FSIZE => {
             const sched = @import("../../proc/sched.zig");
             const tm = @import("../../proc/task.zig");
             const idx = sched.currentTaskIndex() orelse return -3;
@@ -3438,12 +3483,15 @@ fn syscallGetrlimit(resource: u32, rlim_ptr: u64) i64 {
             } else if (resource == RLIMIT_DATA) {
                 rlim.rlim_cur = task.data_cur;
                 rlim.rlim_max = task.data_max;
-            } else {
+            } else if (resource == RLIMIT_NPROC) {
                 rlim.rlim_cur = task.nproc_cur;
                 rlim.rlim_max = task.nproc_max;
+            } else {
+                rlim.rlim_cur = task.fSize_cur;
+                rlim.rlim_max = task.fSize_max;
             }
         },
-        RLIMIT_FSIZE, RLIMIT_CORE, RLIMIT_RSS => {
+        RLIMIT_CORE, RLIMIT_RSS => {
             rlim.rlim_cur = RLIM_INFINITY;
             rlim.rlim_max = RLIM_INFINITY;
         },
@@ -3468,7 +3516,7 @@ fn syscallSetrlimit(resource: u32, rlim_ptr: u64) i64 {
     const bo = @import("../../lib/byte_order.zig");
     var buf: [16]u8 = undefined;
     if (copy.copyFromUser(&buf, @ptrFromInt(rlim_ptr), 16) != 16) return -14;
-    if (resource != RLIMIT_NOFILE and resource != RLIMIT_STACK and resource != RLIMIT_AS and resource != RLIMIT_DATA and resource != RLIMIT_NPROC) return 0;
+    if (resource != RLIMIT_NOFILE and resource != RLIMIT_STACK and resource != RLIMIT_AS and resource != RLIMIT_DATA and resource != RLIMIT_NPROC and resource != RLIMIT_FSIZE) return 0;
     const next = @import("../../proc/rlimit.zig").Limit{ .cur = bo.readU64At(&buf, 0), .max = bo.readU64At(&buf, 8) };
     const sched = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
@@ -3525,6 +3573,17 @@ fn syscallSetrlimit(resource: u32, rlim_ptr: u64) i64 {
         // blocks further creations, no task is killed.
         task.nproc_cur = applied.cur;
         task.nproc_max = applied.max;
+        return 0;
+    }
+    if (resource == RLIMIT_FSIZE) {
+        const applied = policy.applyBytes(.{ .cur = task.fSize_cur, .max = task.fSize_max }, next, privileged) catch |err| return switch (err) {
+            error.InvalidLimit => -22,
+            error.WouldLowerHardLimit => -1,
+        };
+        // Lowering below the current file size is legal (Linux): it only
+        // blocks further growth, existing file contents are untouched.
+        task.fSize_cur = applied.cur;
+        task.fSize_max = applied.max;
         return 0;
     }
     const applied = policy.apply(.{ .cur = task.nofile_cur, .max = task.nofile_max }, next, vfs_mod.MAX_FDS, privileged) catch |err| return switch (err) {
@@ -4174,6 +4233,10 @@ fn syscallPrlimit64(pid: u32, resource: u32, new_limit_ptr: u64, old_limit_ptr: 
                 old_limit.rlim_cur = target.nproc_cur;
                 old_limit.rlim_max = target.nproc_max;
             },
+            RLIMIT_FSIZE => {
+                old_limit.rlim_cur = target.fSize_cur;
+                old_limit.rlim_max = target.fSize_max;
+            },
             else => {
                 old_limit.rlim_cur = RLIM_INFINITY;
                 old_limit.rlim_max = RLIM_INFINITY;
@@ -4193,7 +4256,7 @@ fn syscallPrlimit64(pid: u32, resource: u32, new_limit_ptr: u64, old_limit_ptr: 
         if (new_limit_ptr >= 0x0000_8000_0000_0000) return -14;
         var nbuf: [16]u8 = undefined;
         if (copy.copyFromUser(nbuf[0..], @ptrFromInt(new_limit_ptr), 16) != 16) return -14;
-        if (resource == RLIMIT_NOFILE or resource == RLIMIT_STACK or resource == RLIMIT_AS or resource == RLIMIT_DATA or resource == RLIMIT_NPROC) {
+        if (resource == RLIMIT_NOFILE or resource == RLIMIT_STACK or resource == RLIMIT_AS or resource == RLIMIT_DATA or resource == RLIMIT_NPROC or resource == RLIMIT_FSIZE) {
             const next = @import("../../proc/rlimit.zig").Limit{ .cur = bo.readU64At(&nbuf, 0), .max = bo.readU64At(&nbuf, 8) };
             const policy = @import("../../proc/rlimit.zig").Policy;
             const lock_flags = tm.lockTask();
@@ -4231,6 +4294,13 @@ fn syscallPrlimit64(pid: u32, resource: u32, new_limit_ptr: u64, old_limit_ptr: 
                 };
                 target.nproc_cur = applied.cur;
                 target.nproc_max = applied.max;
+            } else if (resource == RLIMIT_FSIZE) {
+                const applied = policy.applyBytes(.{ .cur = target.fSize_cur, .max = target.fSize_max }, next, privileged) catch |err| return switch (err) {
+                    error.InvalidLimit => -22,
+                    error.WouldLowerHardLimit => -1,
+                };
+                target.fSize_cur = applied.cur;
+                target.fSize_max = applied.max;
             } else {
                 const applied = policy.apply(.{ .cur = target.nofile_cur, .max = target.nofile_max }, next, vfs_mod.MAX_FDS, privileged) catch |err| return switch (err) {
                     error.InvalidLimit => -22,

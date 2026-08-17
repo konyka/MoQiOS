@@ -127,6 +127,27 @@ pub const Policy = struct {
         return asChargeOk(used, add, cur);
     }
 
+    /// RLIMIT_FSIZE: number of bytes permitted from a write beginning at
+    /// `pos`. A finite limit truncates the request to the remaining prefix;
+    /// infinity leaves it unchanged. Overflowing positions are refused.
+    pub fn fsizeWriteBytes(pos: u64, count: u64, soft_limit: u64) u64 {
+        if (pos == 0xFFFF_FFFF_FFFF_FFFF and count != 0) return 0;
+        if (count > 0xFFFF_FFFF_FFFF_FFFF - pos) return 0;
+        if (soft_limit == RLIM_INFINITY) return count;
+        if (pos >= soft_limit) return 0;
+        const remaining = soft_limit - pos;
+        return @min(count, remaining);
+    }
+
+    /// Whether writing `add` bytes starting at file offset `pos` stays within
+    /// the soft byte limit. A write ending exactly at the limit is allowed.
+    pub fn fsizeAllowed(pos: u64, add: u64, soft_limit: u64) bool {
+        if (soft_limit == RLIM_INFINITY) return true;
+        const end, const overflow = @addWithOverflow(pos, add);
+        if (overflow != 0) return false;
+        return end <= soft_limit;
+    }
+
     // ── RLIMIT_NPROC ────────────────────────────────────────────────
 
     /// RLIMIT_NPROC gate: true when a new task for `uid` may be created.

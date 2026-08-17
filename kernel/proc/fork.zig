@@ -29,6 +29,8 @@ pub fn fork(frame: *SyscallFrame) i64 {
         parent.tid,
         true,
         @import("capability_profile.zig").default_user_profile,
+        parent.fSize_cur,
+        parent.fSize_max,
     ) orelse {
         @import("../mm/user_space.zig").destroyUserSpace(child_pml4);
         return -1;
@@ -62,6 +64,8 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.data_max = parent.data_max;
     child.nproc_cur = parent.nproc_cur;
     child.nproc_max = parent.nproc_max;
+    child.fSize_cur = parent.fSize_cur;
+    child.fSize_max = parent.fSize_max;
     // The child's address space mirrors the parent's (COW), so it starts with
     // the same charged usage.
     child.as_used = parent.as_used;

@@ -6,6 +6,7 @@
 #define SIGKILL 9
 #define SIGSEGV 11
 #define SIGTERM 15
+#define SIGXFSZ 25
 
 #define SIG_DFL ((void (*)(int))0)
 #define SIG_IGN ((void (*)(int))1)

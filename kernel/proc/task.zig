@@ -152,6 +152,11 @@ pub const Task = struct {
     /// `uid_task_count` alongside `task_count`.
     nproc_cur: u64 = @import("rlimit.zig").RLIM_INFINITY,
     nproc_max: u64 = @import("rlimit.zig").RLIM_INFINITY,
+    /// Per-task RLIMIT_FSIZE soft/hard limits in bytes; defaults preserve the
+    /// former stub report (unlimited). Enforced as a byte-boundary gate on
+    /// file writes in the write path.
+    fSize_cur: u64 = @import("rlimit.zig").RLIM_INFINITY,
+    fSize_max: u64 = @import("rlimit.zig").RLIM_INFINITY,
 
     /// Bitmask of pending signals (bit N = signal N+1 is pending).
     /// Signals 1-31 supported. Bit 0 = SIGHUP (1), bit 30 = SIGUSR2 (31).
@@ -699,6 +704,8 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     tasks[slot].nofile_cur = @import("../fs/vfs.zig").MAX_FDS;
     tasks[slot].nofile_max = @import("../fs/vfs.zig").MAX_FDS;
     tasks[slot].fd_table.alloc_limit = tasks[slot].nofile_cur;
+    tasks[slot].fSize_cur = @import("rlimit.zig").RLIM_INFINITY;
+    tasks[slot].fSize_max = @import("rlimit.zig").RLIM_INFINITY;
     tasks[slot].cwd[0] = '/';
     tasks[slot].cwd_len = 1;
     tasks[slot].cpu_affinity = affinity;
@@ -763,6 +770,8 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     tasks[slot].nofile_cur = @import("../fs/vfs.zig").MAX_FDS;
     tasks[slot].nofile_max = @import("../fs/vfs.zig").MAX_FDS;
     tasks[slot].fd_table.alloc_limit = tasks[slot].nofile_cur;
+    tasks[slot].fSize_cur = @import("rlimit.zig").RLIM_INFINITY;
+    tasks[slot].fSize_max = @import("rlimit.zig").RLIM_INFINITY;
     tasks[slot].cwd[0] = '/';
     tasks[slot].cwd_len = 1;
     tasks[slot].cpu_affinity = -1;
@@ -1057,6 +1066,8 @@ pub fn createUserProcess(
     parent_tid_val: u32,
     elf: bool,
     profile: @import("capability_profile.zig").LaunchProfile,
+    fsize_cur: u64,
+    fsize_max: u64,
 ) ?u32 {
     const slot = blk: {
         const flags = task_lock.acquire();
@@ -1131,6 +1142,8 @@ pub fn createUserProcess(
         tasks[slot].data_used = 0;
         tasks[slot].nproc_cur = @import("rlimit.zig").RLIM_INFINITY;
         tasks[slot].nproc_max = @import("rlimit.zig").RLIM_INFINITY;
+    tasks[slot].fSize_cur = fsize_cur;
+    tasks[slot].fSize_max = fsize_max;
         tasks[slot].stack_limit = @import("rlimit.zig").Policy.initialStackLimit(
             user_stack_top,
             @import("../mm/user_space.zig").USER_STACK_BOTTOM,

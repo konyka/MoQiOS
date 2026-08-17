@@ -39,7 +39,14 @@ const StackInfo = user_stack.StackInfo;
 pub const buildUserStack = user_stack.buildUserStack;
 
 /// Load a program from ramdisk. Detects ELF vs flat binary automatically.
-pub fn loadProgram(name: []const u8, parent_tid: u32, initial_init_caller: bool, initial_init_launch: bool) ?u32 {
+pub fn loadProgram(
+    name: []const u8,
+    parent_tid: u32,
+    initial_init_caller: bool,
+    initial_init_launch: bool,
+    fsize_cur: u64,
+    fsize_max: u64,
+) ?u32 {
     const file = ramdisk.findFile(name) orelse {
         serial.writeString("[loader] File not found: ");
         serial.writeString(name);
@@ -60,15 +67,15 @@ pub fn loadProgram(name: []const u8, parent_tid: u32, initial_init_caller: bool,
             serial.writeString("[loader] Invalid ELF header\n");
             return null;
         };
-        return loadElf(file, &ehdr, name, parent_tid, initial_init_caller, initial_init_launch);
+        return loadElf(file, &ehdr, name, parent_tid, initial_init_caller, initial_init_launch, fsize_cur, fsize_max);
     }
 
     // Flat binary fallback
-    return loadFlatBinary(file, name, parent_tid, initial_init_caller, initial_init_launch);
+    return loadFlatBinary(file, name, parent_tid, initial_init_caller, initial_init_launch, fsize_cur, fsize_max);
 }
 
 /// Load an ELF64 executable (header already validated by elf.parseHeader).
-fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8, parent_tid: u32, initial_init_caller: bool, initial_init_launch: bool) ?u32 {
+fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8, parent_tid: u32, initial_init_caller: bool, initial_init_launch: bool, fsize_cur: u64, fsize_max: u64) ?u32 {
     const user_pml4 = user_space.createUserSpace() orelse {
         serial.writeString("[loader] OOM for user PML4\n");
         return null;
@@ -228,6 +235,8 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
         parent_tid,
         true,
         @import("capability_profile.zig").profileForLaunch(name, initial_init_caller, initial_init_launch),
+        fsize_cur,
+        fsize_max,
     ) orelse {
         serial.writeString("[loader] Failed to create task\n");
         user_space.destroyUserSpace(user_pml4);
@@ -256,7 +265,7 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
 }
 
 /// Load a flat binary (no ELF headers) at USER_CODE_BASE.
-fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32, initial_init_caller: bool, initial_init_launch: bool) ?u32 {
+fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32, initial_init_caller: bool, initial_init_launch: bool, fsize_cur: u64, fsize_max: u64) ?u32 {
     const binary_size = file.size;
     const pages_needed = (binary_size + paging.PAGE_SIZE - 1) / paging.PAGE_SIZE;
 
@@ -332,6 +341,8 @@ fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32, 
         parent_tid,
         false,
         @import("capability_profile.zig").profileForLaunch(name, initial_init_caller, initial_init_launch),
+        fsize_cur,
+        fsize_max,
     ) orelse {
         serial.writeString("[loader] Failed to create task\n");
         user_space.destroyUserSpace(user_pml4);

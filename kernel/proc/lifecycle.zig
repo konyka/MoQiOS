@@ -33,9 +33,13 @@ pub fn spawn(name_ptr: u64) i64 {
     const task_mod = @import("task.zig");
 
     var caller_tid: u32 = 0;
+    var caller_fsize_cur: u64 = @import("rlimit.zig").RLIM_INFINITY;
+    var caller_fsize_max: u64 = @import("rlimit.zig").RLIM_INFINITY;
     if (sched.currentTaskIndex()) |idx| {
         if (task_mod.getTask(idx)) |cur| {
             caller_tid = cur.tid;
+            caller_fsize_cur = cur.fSize_cur;
+            caller_fsize_max = cur.fSize_max;
         }
     }
 
@@ -53,7 +57,7 @@ pub fn spawn(name_ptr: u64) i64 {
         }
     }
 
-    if (loader.loadProgram(name, caller_tid, initial_init_caller, false)) |task_idx| {
+    if (loader.loadProgram(name, caller_tid, initial_init_caller, false, caller_fsize_cur, caller_fsize_max)) |task_idx| {
         const t = @import("task.zig");
         if (t.getTask(task_idx)) |new_task| {
             const se = @import("../arch/arch.zig").syscall;

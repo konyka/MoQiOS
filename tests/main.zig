@@ -45,6 +45,22 @@ test "rlimit DATA charge policy preserves byte-limit boundaries" {
     try std.testing.expect(policy.dataChargeOk(8192, 1, kt.rlimit.RLIM_INFINITY));
 }
 
+test "rlimit FSIZE policy enforces byte-position boundaries" {
+    const policy = kt.rlimit.Policy;
+    const inf = kt.rlimit.RLIM_INFINITY;
+    try std.testing.expectEqual(@as(u64, 4096), policy.fsizeWriteBytes(0, 4096, 4096));
+    try std.testing.expectEqual(@as(u64, 0), policy.fsizeWriteBytes(4096, 1, 4096));
+    try std.testing.expectEqual(@as(u64, 4), policy.fsizeWriteBytes(4, 8, 8));
+    try std.testing.expectEqual(@as(u64, 8), policy.fsizeWriteBytes(4, 8, inf));
+    try std.testing.expect(policy.fsizeAllowed(0, 4096, 4096));
+    try std.testing.expect(policy.fsizeAllowed(4096, 0, 4096));
+    try std.testing.expect(!policy.fsizeAllowed(4096, 1, 4096));
+    try std.testing.expect(!policy.fsizeAllowed(8192, 0, 4096));
+    try std.testing.expect(policy.fsizeAllowed(8192, 1, inf));
+    try std.testing.expect(policy.fsizeAllowed(0, 1, inf));
+    try std.testing.expect(!policy.fsizeAllowed(0x7FFF_FFFF_FFFF_FFFE, 2, 0x7FFF_FFFF_FFFF_FFFF));
+}
+
 test "MAP_FIXED replacement policy bounds stack-resident transactions" {
     try std.testing.expect(!map_fixed.pageCountSupported(0));
     try std.testing.expect(map_fixed.pageCountSupported(1));
