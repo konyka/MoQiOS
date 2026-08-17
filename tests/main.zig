@@ -5,6 +5,7 @@ const kt = @import("kernel_shared");
 const byte_order = kt.byte_order;
 const cow_pte = kt.cow_pte;
 const map_fixed = kt.map_fixed;
+const vma_stats = kt.vma_stats;
 const errno = kt.errno;
 const eth = kt.eth;
 const fmt = kt.fmt_core;
@@ -66,6 +67,30 @@ test "MAP_FIXED replacement policy bounds stack-resident transactions" {
     try std.testing.expect(map_fixed.pageCountSupported(1));
     try std.testing.expect(map_fixed.pageCountSupported(map_fixed.MAX_ANON_REPLACEMENT_PAGES));
     try std.testing.expect(!map_fixed.pageCountSupported(map_fixed.MAX_ANON_REPLACEMENT_PAGES + 1));
+}
+
+test "fixed VMA table statistics report deterministic scan cost" {
+    try std.testing.expectEqual(@as(u64, 64), vma_stats.MAX_REGIONS);
+
+    const empty = vma_stats.scanCost(0);
+    try std.testing.expectEqual(@as(u64, 64), empty.slots_scanned);
+    try std.testing.expectEqual(@as(u64, 0), empty.active_seen);
+
+    const partial = vma_stats.scanCost(10);
+    try std.testing.expectEqual(@as(u64, 64), partial.slots_scanned);
+    try std.testing.expectEqual(@as(u64, 10), partial.active_seen);
+
+    const full = vma_stats.scanCost(64);
+    try std.testing.expectEqual(@as(u64, 64), full.slots_scanned);
+    try std.testing.expectEqual(@as(u64, 64), full.active_seen);
+
+    const over_capacity = vma_stats.scanCost(65);
+    try std.testing.expectEqual(@as(u64, 64), over_capacity.slots_scanned);
+    try std.testing.expectEqual(@as(u64, 64), over_capacity.active_seen);
+
+    try std.testing.expectEqual(@as(u64, 64), vma_stats.avgCost(2, 128));
+    try std.testing.expectEqual(@as(u64, 0), vma_stats.avgCost(0, 0));
+    try std.testing.expectEqual(@as(u64, 0), vma_stats.avgCost(0, 100));
 }
 
 test "MAP_FIXED replacement policy settles net charges before commit" {

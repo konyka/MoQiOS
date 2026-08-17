@@ -17,6 +17,7 @@ const tmpfs = @import("../fs/tmpfs.zig");
 const huge_user = @import("huge_user.zig");
 const huge_impl = @import("huge_user_impl.zig");
 const fixed_replacement = @import("map_fixed.zig");
+const vma_runtime_stats = @import("vma_runtime_stats.zig");
 
 /// I1: compile-time gate for user 2MiB huge pages on anonymous mappings.
 /// Set to false to disable the feature entirely (the demote paths stay —
@@ -136,6 +137,7 @@ fn canTrackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, anonymous
 
 /// Check the metadata capacity for MAP_FIXED before destroying old mappings.
 fn canTrackReplacement(task: *task_mod.Task, base: u64, num_pages: u64) bool {
+    vma_runtime_stats.recordScan(task.mmap_count);
     const page = user_space.PAGE_SIZE;
     const end = base + num_pages * page;
     var pieces: usize = 0;
@@ -180,6 +182,7 @@ pub const RegionFileMeta = struct {
 /// break the invariant that a region's huge blocks are its FIRST
 /// huge_pages*512 pages.
 fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, meta: ?RegionFileMeta, prot: u8, shared: bool, huge_pages: u32) void {
+    vma_runtime_stats.recordScan(task.mmap_count);
     // RLIMIT_AS: every tracked region charges its full length (merged or new).
     task.as_used += num_pages * user_space.PAGE_SIZE;
     // RLIMIT_DATA: only writable private regions (anonymous or file-private)
@@ -251,6 +254,7 @@ fn releaseRegionBacking(r: *task_mod.MmapRegion) void {
 }
 
 fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
+    vma_runtime_stats.recordScan(task.mmap_count);
     const page = user_space.PAGE_SIZE;
     const end = base + num_pages * page;
     // RLIMIT_AS refund: regions never overlap each other, so the sum of
@@ -438,6 +442,7 @@ fn pagesFree(task: *task_mod.Task, base: u64, num_pages: u64) bool {
 }
 
 fn hasMmapOverlap(task: *task_mod.Task, base: u64, num_pages: u64) bool {
+    vma_runtime_stats.recordScan(task.mmap_count);
     for (task.mmap_regions) |r| {
         if (r.active and rangesOverlap(base, num_pages, r.base, r.num_pages)) return true;
     }

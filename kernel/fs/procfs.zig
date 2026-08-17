@@ -14,6 +14,7 @@ pub const ProcFile = enum(u8) {
     filesystems,
     stat,
     sched_stats,
+    vma_stats,
 };
 
 /// Generate proc file content into the provided buffer.
@@ -34,6 +35,7 @@ pub fn procRead(file: ProcFile, pid: u16, buf: [*]u8, max_len: u32) u32 {
         .filesystems => generateFilesystems(buf, max_len),
         .stat => generateStat(buf, max_len),
         .sched_stats => generateSchedStats(buf, max_len),
+        .vma_stats => generateVmaStats(buf, max_len),
     };
 }
 
@@ -311,6 +313,18 @@ fn generateSchedStats(buf: [*]u8, max_len: u32) u32 {
         pos = appendChar(buf, pos, max_len, '\n');
     }
     return pos;
+}
+
+fn generateVmaStats(buf: [*]u8, max_len: u32) u32 {
+    const stats = @import("../mm/vma_runtime_stats.zig").snapshot();
+    var pos: u32 = 0;
+    pos = appendStr(buf, pos, max_len, "events=");
+    pos = appendDec(buf, pos, max_len, stats.scans);
+    pos = appendStr(buf, pos, max_len, " modeled_slots=");
+    pos = appendDec(buf, pos, max_len, stats.slots);
+    pos = appendStr(buf, pos, max_len, " avg_modeled_slots=");
+    pos = appendDec(buf, pos, max_len, @import("../mm/vma_stats.zig").avgCost(stats.scans, stats.slots));
+    return appendChar(buf, pos, max_len, '\n');
 }
 
 // ---------- helpers ----------
