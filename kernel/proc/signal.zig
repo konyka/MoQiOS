@@ -23,6 +23,7 @@ pub const SIGCONT: u32 = 18;
 pub const SIGSTOP: u32 = 19;
 pub const SIGTTIN: u32 = 21;
 pub const SIGTTOU: u32 = 22;
+pub const SIGXFSZ: u32 = 25;
 
 /// Default disposition of a signal when no handler is installed.
 pub const SigDefault = enum { terminate, ignore, stop, cont };
