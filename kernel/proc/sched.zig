@@ -1387,7 +1387,11 @@ pub fn sleepOn(queue: *?*task.WaitNode, node: *task.WaitNode) bool {
     // When we are woken, we return here. Check if granted.
     // The waker sets node.granted = true before making the task ready.
     @call(.never_inline, forceReschedule, .{});
-    repairCurrentAfterBlock();
+    // Non-x86 bring-up probes install a deliberately non-switching hook. In
+    // that mode the waiter must stay blocked until wakeOne exercises the
+    // blocked-to-ready transition; real scheduler paths still repair a task
+    // that resumed without a switch.
+    if (portable_reschedule == null) repairCurrentAfterBlock();
     return node.granted;
 }
 
