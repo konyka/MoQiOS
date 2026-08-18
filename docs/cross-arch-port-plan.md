@@ -30,10 +30,15 @@
   完整 `main.zig` / Limine 驱动仍未在非 x86 链接。
 - **SMP（x86_64）**：`enable_ap_startup=true`；M8-1…M8-7 已完成（per-CPU 调度、FPU、
   TLB shootdown、work-stealing）。门禁：`zig build smoke` / `smoke-smp`。
-- **riscv64**：M0–M7 完成（…PMM/Sv39、timer/sched、U-mode/`ecall`、virtio-mmio blk + net MAC）。
-  门禁：`zig build -Darch=riscv64 smoke-riscv`。后续：共享内核复用 / TX-RX 网栈。
-- **aarch64**：M9-1…M9-7 完成（…EL0/`SVC` + 抢占调度）。
-  门禁：`zig build -Darch=aarch64 smoke-aarch64`。后续：共享内核复用。
+- **riscv64**：当前可重复 smoke 门禁收口到 SK-2–SK-19（共享内核子集、Sv39/PMM、
+  portable scheduler、sleep/wake probe）；`zig build -Darch=riscv64 smoke-riscv`
+  不再宣称尚未跑通的 SK-20+、完整 M6/M7 用户/网络路径。SK-20+ 与完整共享内核
+  复用、TX-RX 网栈仍待逐项修复和独立门禁。SK-19 的非切换 portable reschedule
+  hook 保留 waiter 为 `.blocked`，让 probe 真正验证 `wakeOne` 的 blocked→ready
+  转换；真实切换路径仍执行 `repairCurrentAfterBlock`。
+- **aarch64**：M9-1…M9-7 代码路径存在，但当前 QEMU smoke 在 SK-2 后发生同步异常
+  （`ESR=0x96000021`）；因此暂不把 `smoke-aarch64` 作为已通过门禁。需先修复
+  EL1 早期同步异常，再恢复 M9 smoke 门禁。
 - **引导**：x86_64 经 Limine；riscv64 经 OpenSBI `-kernel`（链接地址 `0x80200000`）；
   aarch64 经 QEMU `-kernel`（链接地址 `0x40000000`，EL1；DTB 经 loader @ `0x4a000000`）。
 
