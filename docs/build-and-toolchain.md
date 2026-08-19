@@ -327,7 +327,7 @@ qemu-system-x86_64 \
 | `zig build smoke-smp-matrix` | 按 `MOQI_SMOKE_MATRIX_CPUS`（默认 `"1 2 3 4 6 8"`）依次运行各核数冒烟；16 核在 TCG 下需 `MOQI_SMOKE_TIMEOUT=600` |
 | `zig build smoke-smp-stress` | 连续执行 `MOQI_SMOKE_RUNS`（默认 5）次指定核数（`MOQI_SMP`，默认 2）冒烟；捕获任务槽复用、共享内核映射和调度时序回归 |
 | `zig build -Darch=riscv64 smoke-riscv` | riscv64 当前稳定门禁：SK-2..SK-15 与 SK-17..SK-19 shared scheduler bring-up 基线；SK-20+、完整 M5/M6/M7 路径尚未纳入当前 smoke 合约 |
-| `zig build -Darch=aarch64 smoke-aarch64` | aarch64 当前稳定门禁：M9-1..M9-7（FDT、异常、MMU、timer/GIC、EL0/SVC、抢占）及 SK-2..SK-19；SK-20+ 未纳入当前 smoke 合约 |
+| `zig build -Darch=aarch64 smoke-aarch64` | aarch64 当前稳定门禁：M9-1..M9-7（FDT、异常、MMU、timer/GIC、EL0/SVC、抢占）及 SK-2..4、SK-6..15、SK-17..19；SK-5、SK-16、SK-20+ 未纳入当前 smoke 合约 |
 
 调试连接：
 
@@ -484,6 +484,12 @@ no `duration_ms`. This P1 mode does not provide QEMU runtime samples.
 在 `lib/moqi_libc/host_tests/` 添加测试源文件，并将其名称加入
 `run_tests.sh` 中的测试列表。该脚本已注册到 `zig build test`，不需要额外修改 CI 或创建独立
 入口；失败退出码会传播到本地命令和 GitHub CI。
+
+GitHub CI 还分三个层次运行 QEMU：`smoke-qemu` 保持 x86_64 的单核/双核
+boot-to-shell 测试（安装 `qemu-system-x86` 与 `xorriso`）；`smoke-cross-arch`
+安装 `qemu-system-misc` 并串行运行当前稳定的 `smoke-riscv` 与
+`smoke-aarch64` 合约。跨架构 job 的标记范围以各自 smoke 脚本及本章命令表为准，
+不将 SK-20+ 等未验证里程碑纳入 CI 声称。
 
 如果被测 decl 因一小处内核改动即可变为纯函数（如把纯 helper 下沉到叶子模块），可以做
 **行为保持**的最小改动；否则放弃该模块，另选纯模块。

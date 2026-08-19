@@ -44,3 +44,28 @@ jobs:
         run: zig build smoke-smp
         env:
           MOQI_SMOKE_TIMEOUT: 600
+
+  # Cross-ISA skeleton smoke gates. These are intentionally separate from the
+  # x86 ISO smoke: they boot raw ELF images under OpenSBI/QEMU virt and do not
+  # need Limine, xorriso, or KVM. Current marker contracts are scoped in the
+  # corresponding smoke scripts and must not claim unverified SK-20+ probes.
+  smoke-cross-arch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install Zig 0.16.0
+        run: |
+          curl -sSfL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | sudo tar -xJ -C /opt
+          echo "/opt/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+      - name: Install cross-architecture QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc
+      - name: Smoke RISC-V 64
+        run: zig build -Darch=riscv64 smoke-riscv
+        env:
+          MOQI_SMOKE_TIMEOUT: 120
+      - name: Smoke AArch64
+        run: zig build -Darch=aarch64 smoke-aarch64
+        env:
+          MOQI_SMOKE_TIMEOUT: 120
