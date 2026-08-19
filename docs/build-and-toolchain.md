@@ -326,8 +326,8 @@ qemu-system-x86_64 \
 | `zig build smoke-smp` | SMP QEMU 限时冒烟测试（默认 `MOQI_SMP=2`），验证 AP 启动路径仍能跑完整个 init 测试序列；`MOQI_SMP=N` 可指定任意正整数核数 |
 | `zig build smoke-smp-matrix` | 按 `MOQI_SMOKE_MATRIX_CPUS`（默认 `"1 2 3 4 6 8"`）依次运行各核数冒烟；16 核在 TCG 下需 `MOQI_SMOKE_TIMEOUT=600` |
 | `zig build smoke-smp-stress` | 连续执行 `MOQI_SMOKE_RUNS`（默认 5）次指定核数（`MOQI_SMP`，默认 2）冒烟；捕获任务槽复用、共享内核映射和调度时序回归 |
-| `zig build -Darch=riscv64 smoke-riscv` | riscv64 M7+SK-156：shared probes + slim BSS + shared user-copy guard + shared idle boot + shared ramdisk parse + virtio + U-mode |
-| `zig build -Darch=aarch64 smoke-aarch64` | aarch64 M9-7+SK-156：shared probes + slim BSS + shared user-copy guard + shared idle boot + shared ramdisk parse + default timer + EL0/SVC |
+| `zig build -Darch=riscv64 smoke-riscv` | riscv64 当前稳定门禁：SK-2..SK-15 与 SK-17..SK-19 shared scheduler bring-up 基线；SK-20+、完整 M5/M6/M7 路径尚未纳入当前 smoke 合约 |
+| `zig build -Darch=aarch64 smoke-aarch64` | aarch64 当前稳定门禁：M9-1..M9-7（FDT、异常、MMU、timer/GIC、EL0/SVC、抢占）及 SK-2..SK-19；SK-20+ 未纳入当前 smoke 合约 |
 
 调试连接：
 

@@ -36,15 +36,18 @@
   复用、TX-RX 网栈仍待逐项修复和独立门禁。SK-19 的非切换 portable reschedule
   hook 保留 waiter 为 `.blocked`，让 probe 真正验证 `wakeOne` 的 blocked→ready
   转换；真实切换路径仍执行 `repairCurrentAfterBlock`。
-- **aarch64**：M9-1…M9-7 代码路径存在，但当前 QEMU smoke 在 SK-2 后发生同步异常
-  （`ESR=0x96000021`）；因此暂不把 `smoke-aarch64` 作为已通过门禁。需先修复
-  EL1 早期同步异常，再恢复 M9 smoke 门禁。
+- **aarch64**：`zig build -Darch=aarch64 smoke-aarch64` 已验证 M9-1…M9-7
+  （FDT、异常、MMU、timer/GIC、EL0/SVC、抢占）和 SK-2–SK-19。早期 klog ring
+  曾对未对齐 rodata 走 compiler-rt word memcpy 并触发 `ESR=0x96000021`；ring 改用
+  byte copy 后已收口。SK-20+ 仍因 cooperative software-frame probe 不返回而保持
+  独立未验证状态。
 - **引导**：x86_64 经 Limine；riscv64 经 OpenSBI `-kernel`（链接地址 `0x80200000`）；
   aarch64 经 QEMU `-kernel`（链接地址 `0x40000000`，EL1；DTB 经 loader @ `0x4a000000`）。
 
 ### 环境约束（影响验证手段）
 
-- 本开发机现已具备 `qemu-system-x86_64` 与 `qemu-system-riscv64`。
+- 本开发机现已具备 `qemu-system-x86_64`、`qemu-system-riscv64` 与
+  `qemu-system-aarch64`。
 - riscv64 可用 `tools/qemu_run_riscv64.sh` 做运行时验证；x86_64 用 `zig build smoke` /
   `zig build smoke-smp` 做 boot-to-shell 门禁。
 
@@ -249,6 +252,9 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 
 ### 3.17 SK-20 完成记录（2026-07-14）
 
+> 当前状态：实现记录保留供 x86 路径参考；SK-20 的 cooperative software-frame
+> probe 在非 x86 skeleton 上不返回，因此当前 RISC-V/AArch64 smoke 有意止于 SK-19。
+
 - **`switchToSoftwareFrame`**：按 `InterruptFrame.rsp` 恢复栈后 sret/eret（不覆盖 SK-14 resume）。
 - **`portableKernelSwitch`**：非 x86 `forceReschedule` 默认路径；`.blocked` 保留调用方
   安装的 resume 帧，`.running` 保存续体后入队。
@@ -353,8 +359,11 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 
 ### 3.29 SK-32 完成记录（2026-07-17）
 
-- **`sk_probes.zig`**：`runEarly`（sk2–4）+ `runPostMm`（sk6…sk32）；riscv/aarch64
-  `start.zig` 共用，避免阶梯分叉。
+> 当前状态：本节记录共享阶梯的历史实现范围；非 x86 `runPostMm` 当前在 SK-19
+> 返回，避免 SK-20 阻断架构本地 M3/M9 路径，故 SK-20+ 不属于当前 smoke 合约。
+
+- **`sk_probes.zig`**：`runEarly`（sk2–4）+ `runPostMm`（历史为 sk6…sk32）；riscv/aarch64
+  `start.zig` 共用，当前非 x86 运行时在 SK-19 返回，避免阶梯分叉。
 - **`subsystem_boot.initSlab`**：与 `main.zig` M2 slab 调用对齐；`slab.init` 幂等。
 - **探针**：`initSlab` + kmalloc/kfree；`[SK-32] shared sk probes+slab boot: OK`。
 - **后续**：SK-33 — 继续把非 x86 引导向 `main.zig` 可复用片段收敛（勿整文件搬迁）。

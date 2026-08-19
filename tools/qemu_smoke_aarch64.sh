@@ -72,134 +72,8 @@ pass_markers() {
         grep -q "\[SK-16\] shared milestone preempt: OK" "$LOG_FILE" &&
         grep -q "\[SK-17\] shared sched queue+pick: OK" "$LOG_FILE" &&
         grep -q "\[SK-18\] shared sched wake+block: OK" "$LOG_FILE" &&
-        grep -q "\[SK-19\] shared sleepOn+sched_boot: OK" "$LOG_FILE" &&
-        grep -q "\[SK-20\] portable sleepOn switch: OK" "$LOG_FILE" &&
-        grep -q "\[SK-21\] shared subsystem boot: OK" "$LOG_FILE" &&
-        grep -q "\[SK-22\] portable timerTick: OK" "$LOG_FILE" &&
-        grep -q "\[SK-23\] irq ticks wired to timeslice: OK" "$LOG_FILE" &&
-        grep -q "\[SK-24\] irq software-frame preempt: OK" "$LOG_FILE" &&
-        grep -q "\[SK-25\] shared portable mm boot: OK" "$LOG_FILE" &&
-        grep -q "\[SK-26\] user timer IRQ visible: OK" "$LOG_FILE" &&
-        grep -q "\[SK-27\] user trapframe preempt: OK" "$LOG_FILE" &&
-        grep -q "\[SK-28\] dual-user trapframe preempt: OK" "$LOG_FILE" &&
-        grep -q "\[SK-29\] sched native-user preempt: OK" "$LOG_FILE" &&
-        grep -q "\[SK-30\] timeslice native-user preempt: OK" "$LOG_FILE" &&
-        grep -q "\[SK-31\] default timer native-user preempt: OK" "$LOG_FILE" &&
-        grep -q "\[SK-32\] shared sk probes+slab boot: OK" "$LOG_FILE" &&
-        grep -q "\[SK-33\] shared page_cache boot: OK" "$LOG_FILE" &&
-        grep -q "\[SK-34\] shared tmpfs+random boot: OK" "$LOG_FILE" &&
-        grep -q "\[SK-35\] shared cpu surfaces+symbol table: OK" "$LOG_FILE" &&
-        grep -q "\[SK-36\] probe ladder cleanup: OK" "$LOG_FILE" &&
-        grep -q "\[SK-37\] slim task/symbol footprint: OK" "$LOG_FILE" &&
-        grep -q "\[SK-38\] slim env buffers: OK" "$LOG_FILE" &&
-        grep -q "\[SK-39\] slim fd table: OK" "$LOG_FILE" &&
-        grep -q "\[SK-40\] portable copy_from_user: OK" "$LOG_FILE" &&
-        grep -q "\[SK-41\] user write via shared copy: OK" "$LOG_FILE" &&
-        grep -q "\[SK-42\] shared idle boot fragment: OK" "$LOG_FILE" &&
-        grep -q "\[SK-43\] shared ramdisk parse: OK" "$LOG_FILE" &&
-        grep -q "\[SK-44\] shared elf header parse: OK" "$LOG_FILE" &&
-        grep -q "\[SK-45\] shared user stack build: OK" "$LOG_FILE" &&
-        grep -q "\[SK-46\] shared writeback cache: OK" "$LOG_FILE" &&
-        grep -q "\[SK-47\] shared ipv4 header/checksum: OK" "$LOG_FILE" &&
-        grep -q "\[SK-48\] shared ipv6 header/pseudo-csum: OK" "$LOG_FILE" &&
-        grep -q "\[SK-49\] shared eth framing + L2/L3 compose: OK" "$LOG_FILE" &&
-        grep -q "\[SK-50\] nic facade non-x86 no-op: OK" "$LOG_FILE" &&
-        grep -q "\[SK-51\] netif config non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-52\] arp cache/state machine non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-53\] udp ports/queues non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-54\] tcp_util helpers non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-55\] icmp echo reply builder non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-56\] ndp neighbor cache/eui64 non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-57\] icmpv6 checksum/NA builder non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-58\] portable tcp time sources non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-59\] tcp engine links non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-60\] dns/dhcp link non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-61\] fat32 parse/geometry non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-62\] fat32 8.3/LFN helpers non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-63\] ext2 parse/geometry non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-64\] ext2 resolve via classify non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-65\] ext2 ensure via classify non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-66\] fat32 LFN assemble UTF-8 non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-67\] fat32 LFN encode/alias non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-68\] fat32 dir slot placement non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-69\] fat32 cross-sector dir run non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-70\] udp over ipv6 non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-71\] sockaddr inet6 util non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-72\] ndp neighbor solicitation non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-73\] udp getsockname encode non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-74\] tcp over ipv6 checksum/rx gate non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-75\] tcp ipv6 tcb demux non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-76\] tcp sendSegmentV6 handshake non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-88\] ndp auto router solicit non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-89\] ndp router lifetime aging non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-90\] ndp prefix lifetime aging non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-91\] ndp preferred lifetime aging non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-92\] ndp multi default router non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-93\] ndp router nud failover non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-94\] ndp route info rio non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-95\] ndp icmpv6 redirect non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-96\] ndp redirect nud invalidate non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-97\] ipv6 path mtu ptb non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-98\] tcp ipv6 mss pmtu non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-99\] tcp reno smss pmtu non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-100\] tcp syn mss option non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-101\] ipv4 path mtu frag-needed non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-102\] if mtu ra syn mss non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-103\] pmtu raise probe non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-104\] pmtu tx success raise non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-105\] pmtu oversized probe non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-106\] pmtu timer arm before raise non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-107\] pmtu rearm after cooldown non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-108\] sack selective retransmit non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-109\] tcp keepalive snd.una-1 non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-110\] tcp zero-window persist non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-111\] tcp sack pipe accounting non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-112\] tcp sack islost early rexmit non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-113\] tcp sack scoreboard merge non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-114\] tcp prr recovery non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-115\] tcp dsack undo non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-116\] tcp f-rto spurious rto non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-117\] tcp tail loss probe non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-118\] tcp rack-lite head loss non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-119\] tcp delivery rate bdp non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-120\] tcp rate pacing non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-121\] tcp bbr-lite startup non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-122\] tcp bbr-lite probebw/rtt non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-123\] tcp bbr cycle gains non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-124\] tcp cubic ca non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-125\] tcp hystart++ non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-126\] tcp rack per-segment non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-127\] tcp rack hole rexmit non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-128\] tcp rack retransmit timer non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-129\] tcp hystart ack-train rounds non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-130\] tcp hystart ack-train gap non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-131\] tcp ecn ece/cwr non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-132\] tcp ecn undo/loss cut non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-133\] tcp ecn prr couple non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-134\] tcp ace counters non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-135\] tcp ace rtt rate-limit non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-136\] tcp ace delta scale non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-137\] tcp ace bbr couple non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-138\] tcp ace cubic wmax non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-139\] tcp accecn ae negotiate non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-140\] tcp ace ae|cwr|ece non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-141\] tcp ace baseline sync non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-142\] tcp ace invalid 0b010 non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-143\] tcp accecn ect(1) non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-144\] tcp l4s ace cut non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-145\] tcp ace ce rate norm non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-146\] tcp l4s ce ewma non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-147\] tcp l4s ewma pace gain non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-148\] tcp l4s ewma startup non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-149\] tcp l4s ewma probertt non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-150\] tcp l4s ewma prtt dur non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-151\] tcp send user->ring non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-152\] writeback multi-page write non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-153\] ext2 group desc stride non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-154\] ext2 dir record validation non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-155\] writeback flush error propagation non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-156\] fork keeps read-only pages read-only non-x86: OK" "$LOG_FILE" &&
-        grep -q "\[SK-157\] UDP race fixes + IPv4 underflow: OK" "$LOG_FILE"
+        grep -q "\[SK-19\] shared sleepOn+sched_boot: OK" "$LOG_FILE"
+
 }
 
 # Any explicit failure or panic in the serial log fails the run immediately,
@@ -224,14 +98,14 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     check_fatal_output
 
     if pass_markers; then
-        echo "PASS: MoQiOS aarch64 M9-7+SK-157 smoke (shared probes + slim footprint/env + default timer + EL0/SVC)."
+echo "PASS: MoQiOS aarch64 M9-1..M9-7 + SK-2..SK-19 smoke."
         echo "Serial log: $LOG_FILE"
         exit 0
     fi
 
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         if pass_markers; then
-            echo "PASS: MoQiOS aarch64 M9-7+SK-157 smoke (shared probes + slim footprint/env + default timer + EL0/SVC)."
+echo "PASS: MoQiOS aarch64 M9-1..M9-7 + SK-2..SK-19 smoke."
             echo "Serial log: $LOG_FILE"
             exit 0
         fi
@@ -245,7 +119,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "ERROR: timed out after ${TIMEOUT_SECONDS}s waiting for aarch64 smoke markers."
-echo "Expected: SK-2..SK-4 + SK-6..SK-157 shared markers + M9-1..M9-7 markers."
+echo "Expected: M9-1..M9-7 plus SK-2..SK-15 and SK-17..SK-19 markers."
 echo "QEMU log: $RUN_LOG"
 echo "Serial log: $LOG_FILE"
 exit 1

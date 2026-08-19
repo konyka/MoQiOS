@@ -303,6 +303,9 @@ If QEMU or toolchain pieces are unavailable, record that as a verification gap i
 
 ### 5.0 Review Update: 2026-07-14
 
+> 历史门禁记录（2026-07-19）：下表反映当时的 probe ladder；当前跨架构 smoke
+> 覆盖范围以 `docs/cross-arch-port-plan.md` 和 `docs/build-and-toolchain.md` 为准。
+
 | Gate | Result | Notes |
 |---|---|---|
 | `zig build test` | Passed | Host unit tests passed before the work-stealing correction. |
@@ -319,6 +322,9 @@ dual-core runtime-verified. The default Zig cache issue is environmental; use th
 variables above for repeatable local verification until its filesystem cause is corrected.
 
 Executed on 2026-07-10:
+
+> 历史门禁记录（2026-07-25）：下表保留当时的验证证据；当前跨架构 smoke
+> 覆盖范围以 `docs/cross-arch-port-plan.md` 和 `docs/build-and-toolchain.md` 为准。
 
 | Gate | Result | Notes |
 |---|---|---|
@@ -366,6 +372,9 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | Fork FD ownership | `kernel/proc/fork.zig` copies socket/epoll/eventfd/timerfd/unix-socket descriptors without the required refcount ownership work. | ✅ Resolved: v53.44 `retainSharedResources` covers ext2/tcp/epoll/unix/timerfd; 2026-07-22 adds eventfd `ref_count` + `eventfdRetain`/`eventfdClose` wiring (same O(1) retain path as timerfd). |
 | Scale limits | Static task-table bitmap scans, page-cache clock sweeps, and ext2 directory scans remain linear in their respective structures. | Open P1: profile before replacing bounded structures; no speculative data-structure rewrite in this maintenance pass. |
 
+> 历史门禁记录（2026-07-25）：下表的 SK-150 声明是当时记录，不代表当前
+> RISC-V/AArch64 smoke 合约；当前范围以 `docs/cross-arch-port-plan.md` 为准。
+
 | Gate | Result | Notes |
 |---|---|---|
 | `zig build test` | Passed | Host helper tests. |
@@ -379,6 +388,11 @@ aarch64/riscv64 probe setup, task/FD lifetime handling, and memory-copy fault re
 | `zig build -Darch=aarch64 smoke-aarch64` | Passed | Shared probe ladder, default timer, EL0/SVC smoke. |
 
 ### 5.2b Review Update: 2026-07-19
+
+> 本节及其后的 5.2b–5.2t 门禁表均为历史审查记录，保留当时的验证证据，
+> 不定义当前跨架构 smoke 覆盖范围。当前命令契约以
+> `docs/build-and-toolchain.md` 与 `docs/cross-arch-port-plan.md` 为准；当前
+> RISC-V 为 SK-2..SK-15、SK-17..SK-19，AArch64 为 M9-1..M9-7 与 SK-2..SK-19。
 
 | Area | Finding | Resolution / status |
 |---|---|---|
