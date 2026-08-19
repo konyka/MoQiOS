@@ -187,6 +187,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello65");  /* bounded transactional MAP_FIXED anonymous replacement */
     run_test("hello66");  /* RLIMIT_FSIZE writes, pwrite, SIGXFSZ, inheritance */
     run_test("hello67");  /* fixed-table VMA fragmentation baseline */
+    run_test("hello68");  /* observation-only present-user-page RSS telemetry */
 
     start_persistent_services();
 
