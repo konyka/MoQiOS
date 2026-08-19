@@ -22,6 +22,29 @@ new descriptor `FD_CLOEXEC` throughout the VFS descriptor table.
 `RLIMIT_NOFILE`, `RLIMIT_STACK`, `RLIMIT_AS`, `RLIMIT_NPROC`, `RLIMIT_DATA`, and
 `RLIMIT_FSIZE`. `RLIMIT_CORE` and `RLIMIT_RSS` retain reported-only behavior.
 
+## RSS Observation Telemetry
+
+`RLIMIT_RSS` is not enforced. A correct resident admission limit would need an
+address-space-owned ledger shared by `CLONE_VM` tasks and every PTE lifecycle
+transition (fault, COW, swap, huge pages, unmap, exec, and teardown). MoQiOS
+does not claim that incomplete model as an enforced limit.
+
+On x86_64, `/proc/<pid>/rss` provides observation-only `VmRSS` telemetry. It
+walks the target task's page tables and reports present user mappings: each 4
+KiB user leaf PTE counts once and each present 2 MiB user leaf PDE contributes
+512 pages. One-GiB leaves and non-present/swap entries are excluded. The value
+is per task page table, so COW/shared frames count once for each task mapping
+that is presently resident. Proc task IDs are parsed as u32 without wrapping;
+the observer temporarily retains the target address-space root while walking,
+and exec publishes a replacement root under the same task lock, so reap or
+exec cannot free page tables during the read. Non-x86 skeletons report
+`VmRSS: 0 kB` followed by an availability note until their paging backends
+expose an equivalent walker.
+
+`hello68` validates the observable contract: an anonymous resident page grows
+`VmRSS` by at least 4 KiB and `munmap` reduces it again. This telemetry does not
+change `getrlimit`, `setrlimit`, `prlimit64`, allocation admission, or eviction.
+
 ## RLIMIT_FSIZE execution semantics
 
 `RLIMIT_FSIZE` carries per-task soft/hard byte limits (default

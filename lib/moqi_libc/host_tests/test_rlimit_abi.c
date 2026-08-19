@@ -30,6 +30,7 @@ int main(void) {
     assert(RLIMIT_NPROC == 6);
     assert(RLIMIT_STACK == 3);
     assert(RLIMIT_FSIZE == 1);
+    assert(RLIMIT_RSS == 5);
     assert(RLIM_INFINITY == (rlim_t)~0ULL);
     return 0;
 }

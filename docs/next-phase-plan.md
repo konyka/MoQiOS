@@ -76,7 +76,10 @@
   hello64 验收）、~~RLIMIT_DATA~~（✅ 6.38：独立 `data_used` 账本——brk 增长 +
   可写私有 mmap 计费，munmap/mremap/brk shrink/MAP_FIXED/exec 退款，hello63 验收；
   与 RLIMIT_AS 独立）、~~RLIMIT_FSIZE~~（✅：常规文件写入边界、SIGXFSZ、pwrite/
-  writev 统一预检，hello66 验收）。剩余资源（CORE/RSS）仍待各自语义定稿。
+  writev 统一预检，hello66 验收）。`RLIMIT_RSS` 当前仅有 x86 present-user-PTE
+  观测 telemetry（`/proc/<pid>/rss`、hello68），仍保持 reported-only；安全 enforcement
+  需独立的 shared-address-space resident ledger。剩余资源（CORE 与 RSS enforcement）
+  仍待各自语义定稿。
 
 ## P3：大项（需独立设计评审，不与其他工作混批）
 

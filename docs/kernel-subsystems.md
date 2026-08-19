@@ -235,6 +235,9 @@ const AddressSpace = struct {
   模型次数、模型槽位总数及平均模型槽位；`hello67` 用 40 页碎片化映射验证该测量契约。计数器是
   无锁诊断原子，不读取时钟、不改变映射决策；完整的动态 VMA 树替换决策见
   `vma-profiling.md`。
+- x86 RSS 观测：`/proc/<pid>/rss` 只读统计 target task page table 内 present+user
+  的 4 KiB leaf PTE（以及 2 MiB user PDE 的 512 页等价）；它不是 RLIMIT_RSS
+  admission limit，也不按物理帧去重。hello68 锁定匿名页映射/解除映射的可观察变化。
 
 用户态验收: `hello65` 映射一页匿名私有 RW 区域，写入哨兵后降低 `RLIMIT_AS`，确认等长
 MAP_FIXED 替换以 `ENOMEM` 失败且哨兵仍在；恢复无限制后替换成功并确认新页清零。
