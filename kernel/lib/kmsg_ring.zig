@@ -71,7 +71,9 @@ pub fn KmsgRing(comptime capacity: usize) type {
             while (rest.len > 0) {
                 const write_idx = (self.start + self.len) % capacity;
                 const chunk = @min(rest.len, capacity - write_idx);
-                @memcpy(self.buf[write_idx..][0..chunk], rest[0..chunk]);
+                // AArch64 traps on compiler-rt's unaligned word-copy path
+                // when klog appends an unaligned rodata string during boot.
+                for (0..chunk) |i| self.buf[write_idx + i] = rest[i];
                 self.len += chunk;
                 self.total += chunk;
                 rest = rest[chunk..];
@@ -105,7 +107,7 @@ pub fn KmsgRing(comptime capacity: usize) type {
             const off: usize = @intCast(pos - oldest);
             const idx = (self.start + off) % capacity;
             const n = @min(@min(out.len, self.len - off), capacity - idx);
-            @memcpy(out[0..n], self.buf[idx..][0..n]);
+            for (0..n) |i| out[i] = self.buf[idx + i];
             return .{ .n = n, .new_pos = pos + n };
         }
     };
