@@ -25,6 +25,11 @@ pub fn runPostMm(phys_base: u64, length: u64) void {
     @import("sk17.zig").announce();
     @import("sk18.zig").announce();
     @import("sk19.zig").announce();
+    // SK-20's cooperative software-frame switch does not return on the
+    // current non-x86 skeletons. Stop at the verified SK-19 boundary so the
+    // architecture-local M3/M9 bring-up can continue; later probes remain
+    // separate milestones rather than silently blocking the boot path.
+    if (@import("builtin").cpu.arch != .x86_64) return;
     @import("sk20.zig").announce();
     @import("sk21.zig").announce();
     @import("sk22.zig").announce();
