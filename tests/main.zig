@@ -6,6 +6,7 @@ const byte_order = kt.byte_order;
 const cow_pte = kt.cow_pte;
 const map_fixed = kt.map_fixed;
 const vma_stats = kt.vma_stats;
+const rss_stats = kt.rss_stats;
 const errno = kt.errno;
 const eth = kt.eth;
 const fmt = kt.fmt_core;
@@ -91,6 +92,15 @@ test "fixed VMA table statistics report deterministic scan cost" {
     try std.testing.expectEqual(@as(u64, 64), vma_stats.avgCost(2, 128));
     try std.testing.expectEqual(@as(u64, 0), vma_stats.avgCost(0, 0));
     try std.testing.expectEqual(@as(u64, 0), vma_stats.avgCost(0, 100));
+}
+
+test "resident RSS telemetry page model counts only present user leaves" {
+    try std.testing.expectEqual(@as(u64, 0), rss_stats.addLeafPages(0, false, false));
+    try std.testing.expectEqual(@as(u64, 1), rss_stats.addLeafPages(0, true, false));
+    try std.testing.expectEqual(@as(u64, 512), rss_stats.addLeafPages(0, true, true));
+    try std.testing.expectEqual(@as(u64, 513), rss_stats.addLeafPages(1, true, true));
+    try std.testing.expectEqual(@as(u64, 4096), rss_stats.bytesForPages(1));
+    try std.testing.expectEqual(@as(u64, 2048), rss_stats.kibForPages(512));
 }
 
 test "MAP_FIXED replacement policy settles net charges before commit" {

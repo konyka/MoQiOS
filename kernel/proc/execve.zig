@@ -101,8 +101,10 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
         }
     }
 
+    const lock_flags = task_mod.lockTask();
     const old_pml4 = cur.page_table_phys;
     cur.page_table_phys = result.pml4;
+    task_mod.unlockTask(lock_flags);
     cur.user_entry = result.entry;
     cur.user_stack_top = result.stack_top;
     // RLIMIT_STACK is preserved across exec (like NOFILE), but the growth
@@ -257,8 +259,10 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64)
         }
     }
 
+    const lock_flags = task_mod.lockTask();
     const old_pml4 = cur.page_table_phys;
     cur.page_table_phys = result.pml4;
+    task_mod.unlockTask(lock_flags);
     cur.user_entry = result.entry;
     cur.user_stack_top = result.stack_top;
     // RLIMIT_STACK preserved across exec; watermark resets for the new image.

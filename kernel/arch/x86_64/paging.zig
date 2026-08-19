@@ -436,6 +436,39 @@ pub const VMAEntry = struct {
     flags: u8, // bit0=r, bit1=w, bit2=x
 };
 
+/// Count resident user pages in one x86 address space for procfs telemetry.
+/// This is observation-only: present user 4KiB PTEs count one page and present
+/// user 2MiB PDEs count 512 pages. One-GiB leaves are deliberately excluded
+/// until a workload creates and validates them.
+pub fn residentUserPages(pml4_phys: u64) u64 {
+    const pml4: *PageTable = hhdm.physToPtr(PageTable, pml4_phys);
+    var pages: u64 = 0;
+
+    for (0..256) |pml4_i| {
+        const pml4e = pml4.entries[pml4_i];
+        if (!pml4e.present or !pml4e.user) continue;
+        const pdpt: *PageTable = hhdm.physToPtr(PageTable, pml4e.getPhysAddr());
+        for (0..512) |pdpt_i| {
+            const pdpte = pdpt.entries[pdpt_i];
+            if (!pdpte.present or !pdpte.user or pdpte.huge_page) continue;
+            const pd: *PageTable = hhdm.physToPtr(PageTable, pdpte.getPhysAddr());
+            for (0..512) |pd_i| {
+                const pde = pd.entries[pd_i];
+                if (!pde.present or !pde.user) continue;
+                if (pde.huge_page) {
+                    pages += 512;
+                    continue;
+                }
+                const pt: *PageTable = hhdm.physToPtr(PageTable, pde.getPhysAddr());
+                for (pt.entries) |pte| {
+                    if (pte.present and pte.user) pages += 1;
+                }
+            }
+        }
+    }
+    return pages;
+}
+
 /// Walk the user-space page table and collect VMA ranges (up to max_vmas).
 /// Returns number of VMAs found.
 pub fn enumerateVMAs(pml4_phys: u64, out: []VMAEntry) u32 {

@@ -9,6 +9,7 @@ pub const ProcFile = enum(u8) {
     pid_maps,
     pid_stat,
     pid_cmdline,
+    pid_rss,
     version,
     loadavg,
     filesystems,
@@ -21,7 +22,7 @@ pub const ProcFile = enum(u8) {
 /// Returns the number of bytes written (may exceed max_len, caller must handle offset).
 /// For integration with VFS, the caller should generate into a scratch buffer
 /// and copy from the current offset.
-pub fn procRead(file: ProcFile, pid: u16, buf: [*]u8, max_len: u32) u32 {
+pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
     return switch (file) {
         .meminfo => generateMeminfo(buf, max_len),
         .cpuinfo => generateCpuinfo(buf, max_len),
@@ -30,6 +31,7 @@ pub fn procRead(file: ProcFile, pid: u16, buf: [*]u8, max_len: u32) u32 {
         .pid_maps => generatePidMaps(pid, buf, max_len),
         .pid_stat => generatePidStat(pid, buf, max_len),
         .pid_cmdline => generatePidCmdline(pid, buf, max_len),
+        .pid_rss => generatePidRss(pid, buf, max_len),
         .version => generateVersion(buf, max_len),
         .loadavg => generateLoadavg(buf, max_len),
         .filesystems => generateFilesystems(buf, max_len),
@@ -95,7 +97,7 @@ fn generateUptime(buf: [*]u8, max_len: u32) u32 {
     return pos;
 }
 
-fn generatePidStatus(pid: u16, buf: [*]u8, max_len: u32) u32 {
+fn generatePidStatus(pid: u32, buf: [*]u8, max_len: u32) u32 {
     const t = findTaskByPid(pid) orelse {
         return appendStr(buf, 0, max_len, "Pid: 0\nState: X (dead)\n");
     };
@@ -112,7 +114,7 @@ fn generatePidStatus(pid: u16, buf: [*]u8, max_len: u32) u32 {
     return pos;
 }
 
-fn generatePidMaps(pid: u16, buf: [*]u8, max_len: u32) u32 {
+fn generatePidMaps(pid: u32, buf: [*]u8, max_len: u32) u32 {
     _ = @import("../proc/task.zig"); // referenced by findTaskByPid
     const paging_mod = @import("../arch/arch.zig").paging;
     const t = findTaskByPid(pid) orelse {
@@ -139,6 +141,30 @@ fn generatePidMaps(pid: u16, buf: [*]u8, max_len: u32) u32 {
     return pos;
 }
 
+fn generatePidRss(pid: u32, buf: [*]u8, max_len: u32) u32 {
+    const task_mod = @import("../proc/task.zig");
+    const user_space = @import("../mm/user_space.zig");
+    const flags = task_mod.lockTask();
+    const idx = task_mod.findTaskByTidLocked(pid) orelse {
+        task_mod.unlockTask(flags);
+        return appendStr(buf, 0, max_len, "VmRSS:\t0 kB\n");
+    };
+    const task = task_mod.getTask(idx) orelse unreachable;
+    const root = task.page_table_phys;
+    if (root != 0) user_space.retainUserSpace(root);
+    task_mod.unlockTask(flags);
+    defer if (root != 0) user_space.destroyUserSpace(root);
+    if (root == 0) return appendStr(buf, 0, max_len, "VmRSS:\t0 kB\n");
+    if (comptime @import("builtin").cpu.arch != .x86_64) {
+        return appendStr(buf, 0, max_len, "VmRSS:\t0 kB\n# observation unavailable\n");
+    }
+    const pages = @import("../arch/x86_64/paging.zig").residentUserPages(root);
+    var pos: u32 = 0;
+    pos = appendStr(buf, pos, max_len, "VmRSS:\t");
+    pos = appendDec(buf, pos, max_len, pages * 4);
+    return appendStr(buf, pos, max_len, " kB\n");
+}
+
 fn appendHex(buf: [*]u8, pos: u32, max_len: u32, val: u64) u32 {
     const hex = "0123456789abcdef";
     var p = pos;
@@ -160,7 +186,7 @@ fn appendHex(buf: [*]u8, pos: u32, max_len: u32, val: u64) u32 {
 }
 
 /// Generate /proc/PID/stat — Linux-compatible single-line format.
-fn generatePidStat(pid: u16, buf: [*]u8, max_len: u32) u32 {
+fn generatePidStat(pid: u32, buf: [*]u8, max_len: u32) u32 {
     const t = findTaskByPid(pid) orelse {
         return appendStr(buf, 0, max_len, "0 (none) Z 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n");
     };
@@ -185,7 +211,7 @@ fn stateChar(state: @import("../proc/task.zig").TaskState) u8 {
 }
 
 /// Generate /proc/PID/cmdline
-fn generatePidCmdline(pid: u16, buf: [*]u8, max_len: u32) u32 {
+fn generatePidCmdline(pid: u32, buf: [*]u8, max_len: u32) u32 {
     _ = pid;
     // Simplified: return "process\0" (null-terminated)
     if (max_len >= 8) {
@@ -329,7 +355,7 @@ fn generateVmaStats(buf: [*]u8, max_len: u32) u32 {
 
 // ---------- helpers ----------
 
-fn findTaskByPid(pid: u16) ?*const @import("../proc/task.zig").Task {
+fn findTaskByPid(pid: u32) ?*const @import("../proc/task.zig").Task {
     const task_mod = @import("../proc/task.zig");
     const MAX_TASKS = task_mod.MAX_TASKS;
     var i: u32 = 0;

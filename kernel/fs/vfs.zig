@@ -264,7 +264,7 @@ pub const FileDescriptor = struct {
     inode_id: u64 = 0,
     // procfs fields
     proc_file_type: @import("procfs.zig").ProcFile = .meminfo,
-    proc_pid: u16 = 0,
+    proc_pid: u32 = 0,
 };
 
 /// Per-process FD table.
@@ -447,7 +447,7 @@ pub const FdTable = struct {
             const rest = name[6..];
             const procfs = @import("procfs.zig");
             var pfile: procfs.ProcFile = undefined;
-            var pid: u16 = 0;
+            var pid: u32 = 0;
 
             if (rest.len == 7 and str.eql(rest, "meminfo")) {
                 pfile = .meminfo;
@@ -474,7 +474,10 @@ pub const FdTable = struct {
                     digit_end += 1;
                 }
                 if (digit_end > 0 and digit_end < rest.len and rest[digit_end] == '/') {
-                    pid = parseU16(rest[0..digit_end]);
+                    pid = parseU32(rest[0..digit_end]) orelse {
+                        self.freeFd(slot);
+                        return -1;
+                    };
                     const file_part = rest[digit_end + 1 ..];
                     if (str.eql(file_part, "status")) {
                         pfile = .pid_status;
@@ -484,6 +487,8 @@ pub const FdTable = struct {
                         pfile = .pid_stat;
                     } else if (str.eql(file_part, "cmdline")) {
                         pfile = .pid_cmdline;
+                    } else if (str.eql(file_part, "rss")) {
+                        pfile = .pid_rss;
                     } else {
                         self.freeFd(slot);
                         return -1;
@@ -603,12 +608,16 @@ pub const FdTable = struct {
         return -1;
     }
 
-    // Parse a small decimal string into u16
-    fn parseU16(s: []const u8) u16 {
-        var v: u16 = 0;
+    // Parse a proc task ID without wrapping it onto another task.
+    fn parseU32(s: []const u8) ?u32 {
+        var v: u32 = 0;
         for (s) |c| {
-            if (c < '0' or c > '9') break;
-            v = v * 10 + (c - '0');
+            if (c < '0' or c > '9') return null;
+            const product = @mulWithOverflow(v, @as(u32, 10));
+            if (product[1] != 0) return null;
+            const sum = @addWithOverflow(product[0], @as(u32, c - '0'));
+            if (sum[1] != 0) return null;
+            v = sum[0];
         }
         return v;
     }
