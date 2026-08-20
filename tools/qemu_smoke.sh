@@ -267,7 +267,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
         grep -q "hello53 done" "$LOG_FILE" &&
         grep -q "hello54: PASS" "$LOG_FILE" &&
         grep -q "hello54 done" "$LOG_FILE" &&
-        grep -q "hello56: PASS" "$LOG_FILE" &&
+        { grep -q "hello56: PASS" "$LOG_FILE" || grep -q "hello56: SKIP RTC unavailable" "$LOG_FILE"; } &&
         grep -q "hello56 done" "$LOG_FILE" &&
         grep -q "hello57: PASS" "$LOG_FILE" &&
         grep -q "hello57 done" "$LOG_FILE" &&

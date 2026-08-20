@@ -19,8 +19,43 @@ pub fn bcdToBin(bcd: u8) u8 {
     return (bcd >> 4) *% 10 +% (bcd & 0x0F);
 }
 
+pub fn validBcd(bcd: u8) bool {
+    return (bcd >> 4) <= 9 and (bcd & 0x0F) <= 9;
+}
+
 pub fn isLeapYear(y: u16) bool {
     return (y % 4 == 0 and y % 100 != 0) or y % 400 == 0;
+}
+
+pub fn validDate(year: u16, month: u8, day: u8) bool {
+    if (month == 0 or month > 12 or day == 0) return false;
+    const days: u8 = switch (month) {
+        2 => if (isLeapYear(year)) 29 else 28,
+        4, 6, 9, 11 => 30,
+        else => 31,
+    };
+    return day <= days;
+}
+
+pub fn validClockTime(hour: u8, minute: u8, second: u8, hour24: bool) bool {
+    if (minute > 59 or second > 59) return false;
+    if (hour24) return hour <= 23;
+    return hour >= 1 and hour <= 12;
+}
+
+pub fn normalizeRtcHour(hour: u8, pm: bool, hour24: bool) ?u8 {
+    if (hour24) return if (hour <= 23) hour else null;
+    if (hour == 0 or hour > 12) return null;
+    if (pm and hour < 12) return hour + 12;
+    if (!pm and hour == 12) return 0;
+    return hour;
+}
+
+pub fn decodeRtcHour(raw: u8, binary_mode: bool, hour24: bool) ?u8 {
+    const pm = (raw & 0x80) != 0;
+    if (hour24 and pm) return null;
+    const hour = if (binary_mode) raw & 0x7F else bcdToBin(raw & 0x7F);
+    return normalizeRtcHour(hour, pm, hour24);
 }
 
 /// 2-digit RTC year → full year (see the century rule above).
@@ -62,59 +97,79 @@ pub fn init() void {
     const time_mod = @import("../proc/time_syscall.zig");
     const fmt = @import("../lib/fmt.zig");
 
-    // Wait (bounded) for any RTC update cycle to finish: register A bit 7.
-    var tries: u32 = 0;
-    while (tries < 1_000_000) : (tries += 1) {
-        io.outb(0x70, 0x0A);
-        if (io.inb(0x71) & 0x80 == 0) break;
-    } else {
-        serial.writeString("[rtc] update-in-progress stuck, wall clock stays boot-relative\n");
-        return;
-    }
+    // CMOS can expose a torn snapshot around an update boundary. Retry a
+    // bounded number of complete snapshots before falling back to boot time.
+    var budget: u64 = 10_000_000;
+    snapshot: while (budget > 0) {
+        var tries: u32 = 0;
+        var uip_clear = false;
+        while (tries < 100_000 and budget > 0) : (tries += 1) {
+            const reg_a = readRegBudgeted(io, 0x0A, &budget) orelse break;
+            if (reg_a & 0x80 == 0) {
+                uip_clear = true;
+                break;
+            }
+        }
+        if (budget == 0 or !uip_clear) continue :snapshot;
 
-    const regB = readReg(io, 0x0B);
+    const regB = readRegBudgeted(io, 0x0B, &budget) orelse break;
     const binary_mode = (regB & 0x04) != 0;
     const hour24 = (regB & 0x02) != 0;
 
-    var second = readReg(io, 0x00);
-    var minute = readReg(io, 0x02);
-    var hour = readReg(io, 0x04);
-    const day = readReg(io, 0x07);
-    const month = readReg(io, 0x08);
-    const year = readReg(io, 0x09);
+    const second_raw = readRegBudgeted(io, 0x00, &budget) orelse break;
+    var minute = readRegBudgeted(io, 0x02, &budget) orelse break;
+    const hour = readRegBudgeted(io, 0x04, &budget) orelse break;
+    const day = readRegBudgeted(io, 0x07, &budget) orelse break;
+    const month = readRegBudgeted(io, 0x08, &budget) orelse break;
+    const year = readRegBudgeted(io, 0x09, &budget) orelse break;
+    const reg_a_after = readRegBudgeted(io, 0x0A, &budget) orelse break;
+    if (reg_a_after & 0x80 != 0) continue :snapshot;
+    const second_confirm = readRegBudgeted(io, 0x00, &budget) orelse break;
+    if (second_confirm != second_raw) continue :snapshot;
+    var second = second_raw;
 
     if (!binary_mode) {
         // BCD mode: the PM bit (0x80) of the hour register is a plain bit,
         // not a BCD nibble — strip it before conversion.
-        const pm = (hour & 0x80) != 0;
+        if (!validBcd(second) or !validBcd(minute) or !validBcd(hour & 0x7F) or
+            !validBcd(day) or !validBcd(month) or !validBcd(year)) continue :snapshot;
+        const calendar_year = expandYear(bcdToBin(year));
+        const calendar_month = bcdToBin(month);
+        const calendar_day = bcdToBin(day);
         second = bcdToBin(second);
         minute = bcdToBin(minute);
-        hour = bcdToBin(hour & 0x7F);
-        if (!hour24 and pm and hour < 12) hour += 12;
-        if (!hour24 and !pm and hour == 12) hour = 0;
-        if (month > 12 or day > 31 or month == 0 or day == 0) {
-            serial.writeString("[rtc] implausible BCD date, wall clock stays boot-relative\n");
-            return;
+        const normalized_hour = decodeRtcHour(hour, false, hour24) orelse continue :snapshot;
+        if (!validDate(calendar_year, calendar_month, calendar_day) or
+            !validClockTime(normalized_hour, minute, second, true)) {
+            continue :snapshot;
         }
-        const epoch = dateTimeToEpoch(expandYear(bcdToBin(year)), bcdToBin(month), bcdToBin(day), hour, minute, second);
+        const epoch = dateTimeToEpoch(calendar_year, calendar_month, calendar_day, normalized_hour, minute, second);
         arm(epoch, serial, tsc, time_mod, fmt);
+        return;
     } else {
-        const pm = (hour & 0x80) != 0;
-        hour &= 0x7F;
-        if (!hour24 and pm and hour < 12) hour += 12;
-        if (!hour24 and !pm and hour == 12) hour = 0;
-        if (month > 12 or day > 31 or month == 0 or day == 0) {
-            serial.writeString("[rtc] implausible date, wall clock stays boot-relative\n");
-            return;
+        if (year > 99) continue :snapshot;
+        const normalized_hour = decodeRtcHour(hour, true, hour24) orelse continue :snapshot;
+        if (!validDate(expandYear(year), month, day) or
+            !validClockTime(normalized_hour, minute, second, true)) {
+            continue :snapshot;
         }
-        const epoch = dateTimeToEpoch(expandYear(year), month, day, hour, minute, second);
+        const epoch = dateTimeToEpoch(expandYear(year), month, day, normalized_hour, minute, second);
         arm(epoch, serial, tsc, time_mod, fmt);
+        return;
     }
+    }
+    serial.writeString("[rtc] no stable CMOS snapshot, wall clock stays boot-relative\n");
 }
 
 fn readReg(io: anytype, reg: u8) u8 {
     io.outb(0x70, reg);
     return io.inb(0x71);
+}
+
+fn readRegBudgeted(io: anytype, reg: u8, budget: *u64) ?u8 {
+    if (budget.* == 0) return null;
+    budget.* -= 1;
+    return readReg(io, reg);
 }
 
 fn arm(epoch_sec: u64, serial: anytype, tsc: anytype, time_mod: anytype, fmt: anytype) void {

@@ -3347,4 +3347,31 @@ test "rtc: Gregorian date to Unix epoch seconds" {
     try std.testing.expect(rtc.isLeapYear(2024));
     try std.testing.expect(!rtc.isLeapYear(2026));
 }
+
+test "rtc: calendar validation rejects impossible days" {
+    try std.testing.expect(rtc.validDate(2024, 2, 29));
+    try std.testing.expect(!rtc.validDate(2023, 2, 29));
+    try std.testing.expect(!rtc.validDate(2024, 4, 31));
+    try std.testing.expect(rtc.validDate(2024, 10, 20));
+    try std.testing.expect(rtc.validClockTime(23, 59, 59, true));
+    try std.testing.expect(!rtc.validClockTime(24, 0, 0, true));
+    try std.testing.expect(rtc.validClockTime(12, 0, 0, false));
+    try std.testing.expect(rtc.validClockTime(1, 0, 0, false));
+    try std.testing.expect(!rtc.validClockTime(0, 0, 0, false));
+    try std.testing.expect(!rtc.validClockTime(13, 0, 0, false));
+    try std.testing.expect(!rtc.validClockTime(12, 60, 0, false));
+    try std.testing.expectEqual(@as(?u8, 13), rtc.normalizeRtcHour(1, true, false));
+    try std.testing.expectEqual(@as(?u8, 0), rtc.normalizeRtcHour(12, false, false));
+    try std.testing.expectEqual(@as(?u8, null), rtc.normalizeRtcHour(0, false, false));
+    try std.testing.expectEqual(@as(?u8, null), rtc.normalizeRtcHour(13, false, false));
+    try std.testing.expectEqual(@as(?u8, null), rtc.normalizeRtcHour(0x80, false, true));
+    try std.testing.expectEqual(@as(?u8, 0), rtc.normalizeRtcHour(12, false, false));
+    try std.testing.expectEqual(@as(?u8, 12), rtc.normalizeRtcHour(12, true, false));
+    try std.testing.expectEqual(@as(?u8, 23), rtc.normalizeRtcHour(11, true, false));
+    try std.testing.expectEqual(@as(?u8, null), rtc.normalizeRtcHour(0x92, false, true));
+    try std.testing.expectEqual(@as(?u8, 23), rtc.normalizeRtcHour(23, false, true));
+    try std.testing.expectEqual(@as(?u8, 13), rtc.decodeRtcHour(0x81, false, false));
+    try std.testing.expectEqual(@as(?u8, 0), rtc.decodeRtcHour(0x12, false, false));
+    try std.testing.expectEqual(@as(?u8, null), rtc.decodeRtcHour(0x92, false, true));
+}
 // ─── end RTC ───

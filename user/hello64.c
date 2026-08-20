@@ -48,26 +48,27 @@ int main(int argc, char **argv, char **envp) {
     struct rlimit inf = { RLIM_INFINITY, RLIM_INFINITY };
     CHECK(setrlimit(RLIMIT_NPROC, &inf) == 0, "restore infinity");
     long child = fork();
-    CHECK(child > 0, "fork ok after restore");
     if (child == 0) {
         struct rlimit crl;
         if (getrlimit(RLIMIT_NPROC, &crl) != 0 || crl.rlim_cur != RLIM_INFINITY)
             _exit(3); /* 未继承 */
         _exit(0);
     }
+    CHECK(child > 0, "fork ok after restore");
     int st = 0;
     CHECK(waitpid(child, &st, 0) == child, "waitpid child");
     CHECK(st == 0, "child exits cleanly");
 
     /* 6. 子进程退出（被 reap）后计数释放：父进程再次 fork 成功。 */
     long again = fork();
+    if (again == 0) {
+        _exit(0);
+    }
     CHECK(again > 0, "fork ok after child reaped");
     if (again > 0) {
         int st2 = 0;
         CHECK(waitpid(again, &st2, 0) == again, "waitpid second child");
         CHECK(st2 == 0, "second child clean");
-    } else if (again == 0) {
-        _exit(0);
     }
 
     if (failures == 0) {

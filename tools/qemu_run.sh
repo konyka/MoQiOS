@@ -169,6 +169,7 @@ fi
 exec qemu-system-x86_64 \
     -M q35 \
     -m 512M \
+    -rtc base=utc,clock=vm \
     -cdrom "$ISO_FILE" \
     -boot order=d \
     -drive file="$DISK_IMAGE",format=raw,if=none,id=disk0 \
