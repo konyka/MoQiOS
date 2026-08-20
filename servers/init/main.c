@@ -188,6 +188,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello66");  /* RLIMIT_FSIZE writes, pwrite, SIGXFSZ, inheritance */
     run_test("hello67");  /* fixed-table VMA fragmentation baseline */
     run_test("hello68");  /* observation-only present-user-page RSS telemetry */
+    run_test("hello69");  /* private futex isolation and pthread contention */
 
     start_persistent_services();
 

@@ -25,6 +25,7 @@
 
 #define FUTEX_WAIT      0
 #define FUTEX_WAKE      1
+#define FUTEX_PRIVATE_FLAG 128
 
 #define THREAD_STACK_SIZE (64 * 1024)
 
@@ -226,7 +227,7 @@ void pthread_exit(void *retval) {
     TCB *me = tcb_self();
     me->retval = retval;
     __atomic_store_n(&me->state, 1, __ATOMIC_SEQ_CST);
-    futex_call((volatile int *)&me->state, FUTEX_WAKE, 1, 0);
+    futex_call((volatile int *)&me->state, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0);
     if (me->detached) {
         /* 压入死栈链后不再触碰本栈：直接以寄存器内联 exit syscall，
            连 _exit 的调用帧都不建。栈块由下一次 pthread_create 回收。 */
@@ -252,7 +253,7 @@ int pthread_join(pthread_t thread, void **retval) {
     TCB *t = (TCB *)thread;
     if (__atomic_load_n(&t->detached, __ATOMIC_ACQUIRE) != 0) return -22; /* EINVAL */
     while (__atomic_load_n(&t->state, __ATOMIC_SEQ_CST) == 0) {
-        futex_call((volatile int *)&t->state, FUTEX_WAIT, 0, 0);
+        futex_call((volatile int *)&t->state, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0, 0);
     }
     /* 与并发 detach 的竞速（POSIX 属 UB，但必须不产生 double-free）：
        退出线程只在看到 detached==1 时压死栈链；压链发生在 state=1 之后，
@@ -284,7 +285,7 @@ int pthread_mutex_lock(pthread_mutex_t *m) {
     if (c == 0) return 0; /* 无竞争快路径：一次 lock cmpxchg */
     if (c != 2) c = __sync_lock_test_and_set(&m->f, 2);
     while (c != 0) {
-        futex_call(&m->f, FUTEX_WAIT, 2, 0);
+        futex_call(&m->f, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 2, 0);
         c = __sync_lock_test_and_set(&m->f, 2);
     }
     return 0;
@@ -292,7 +293,7 @@ int pthread_mutex_lock(pthread_mutex_t *m) {
 
 int pthread_mutex_unlock(pthread_mutex_t *m) {
     if (__sync_lock_test_and_set(&m->f, 0) == 2) {
-        futex_call(&m->f, FUTEX_WAKE, 1, 0);
+        futex_call(&m->f, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0);
     }
     return 0;
 }
@@ -313,11 +314,11 @@ int pthread_once(pthread_once_t *o, void (*init_routine)(void)) {
     if (c == 0) {
         init_routine();
         __atomic_store_n(&o->s, 2, __ATOMIC_RELEASE);
-        futex_call(&o->s, FUTEX_WAKE, 0x7fffffff, 0);
+        futex_call(&o->s, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 0x7fffffff, 0);
         return 0;
     }
     while (__atomic_load_n(&o->s, __ATOMIC_ACQUIRE) != 2) {
-        futex_call(&o->s, FUTEX_WAIT, 1, 0);
+        futex_call(&o->s, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 1, 0);
     }
     return 0;
 }
