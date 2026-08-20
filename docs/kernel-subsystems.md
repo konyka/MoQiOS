@@ -989,8 +989,10 @@ const Pipe = struct {
 - io_destroy: 销毁上下文
 - io_submit: 提交 I/O 请求 (简化: 同步执行 PREAD/PWRITE，立即标记完成)
 - io_getevents: 获取完成事件 (环形缓冲)
-- io_cancel: 取消请求 (stub: 返回 EINVAL)
-- 系统调用: #206 (io_setup), #207 (io_destroy), #208 (io_getevents), #209 (io_submit), #210 (io_cancel)
+- io_cancel: 当前 `io_submit` 在返回前同步完成请求，因此没有 pending request 可取消；
+  io_cancel 返回 `ENOSYS` 且不读取 IOCB/不写 result。真实异步取消需独立 pending-request
+  生命周期与取消所有权模型后再实现；hello70 锁定该无副作用 contract。
+- 系统调用: #213 (io_setup), #214 (io_destroy), #215 (io_submit), #216 (io_getevents), #217 (io_cancel)
 
 ### 3.8 devfs 设备节点注册框架 ✅
 
