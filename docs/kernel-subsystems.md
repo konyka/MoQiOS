@@ -724,6 +724,13 @@ const SchedStats = struct {
 - **API**：`pthread_create/join/exit/self`、`pthread_mutex_*`（glibc 风格 0/1/2 futex 状态机，无竞争零系统调用）、`pthread_once`（0/1/2 状态机）、`pthread_key_create/getspecific/setspecific`（32 keys）、每线程 `errno`（TCB 内）。
 - **内核配合**：`Task.is_thread`（CLONE_THREAD 置位）；`getpid()` 对线程汇报 tgid（创建者 tid）；`waitpidScanLocked`/`hasChildrenLocked` 跳过线程（线程经 pthread_join 汇合而非 waitpid）。
 - **性能设计**：mutex 快路径一次 `lock cmpxchg`；join 单次 futex 唤醒；TLS 一次安装后纯内存访问。
+- **private futex 边界（2026-08）**：内核只支持带 `FUTEX_PRIVATE_FLAG` 的基本
+  `FUTEX_WAIT`/`FUTEX_WAKE`。wait queue key 是 `(page_table_phys, uaddr)`，所以
+  同页不同 word、不同进程相同虚拟地址都不会互相唤醒；pthread 的慢路径均使用
+  private flag。PI 锁、PI requeue、bitset、普通 requeue 和 WAKE_OP 当前返回
+  `ENOSYS`，不再成功 no-op 或修改用户 word；完整共享 futex/PI donation 需独立状态
+  模型后再实现。`futex_waitv` 同样返回 `ENOSYS`，直到每个 vector entry 都可携带
+  address-space-qualified private key；不再将第一个匹配项错误地入队到 bucket。
 - **v1 限制**：~~CLONE_FILES 真共享 fd 表未实现（创建时复制）~~（6.27 已实现）；~~`__thread`（PT_TLS）未实现~~（6.28 已实现）；线程私有数据仍可用 getspecific；~~detached 线程不 join 时栈描述符泄漏~~（v2 已回收，见下）。
 - **v2（2026-08-13）**：`pthread_detach` + detached 栈惰性回收——退出线程把 TCB+栈块压入无锁死栈链（CAS push），下一次 `pthread_create` 排空 free（退出线程无法安全释放自己仍在运行的栈；压链后以纯寄存器内联 exit syscall，不再触碰本栈）。join-detached 与重复 detach 返回 EINVAL；join 与并发 detach 竞速时复见 detached 即放弃 free（所有权归死栈链，杜绝 double-free）。malloc/free 增加 test-and-set 自旋锁，多线程并发 create/join 不再竞争堆空闲链。验收：hello57 增加 8 detached + double-detach/join-detached EINVAL + 排空触发的断言组。
 - **v2 续（2026-08-13，CLONE_FILES）**：FdTable 从 Task 内嵌（约 57KB/任务）移入静态池（64 槽 + 原子位图），`Task.fd_table` 改为指针；表带原子引用计数，`clone(CLONE_FILES)` 共享指针（跳过复制与 retainSharedResources），`exitTask` 仅在末引用时关闭全部 fd 并归还池。fd 位图操作原子化（allocFdAtLeast 抢位循环 / freeFd 原子 Or），无表级锁；close 与并发使用的描述符内容竞态为记录的弱语义。pthread_create 加传 CLONE_FILES，线程组获得真共享 fd 表与共享 NOFILE 上限。验收：hello57 新增跨线程 fd 共享读 + close 后 EBADF 断言。
