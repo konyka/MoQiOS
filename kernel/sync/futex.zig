@@ -12,6 +12,7 @@ const IrqSpinlock = @import("irq_spinlock.zig").IrqSpinlock;
 const copy = @import("../mm/copy_from_user.zig");
 const bo = @import("../lib/byte_order.zig");
 const tsc = @import("../arch/arch.zig").tsc;
+const futex_key = @import("futex_key.zig");
 
 // ── Futex operation constants (Linux ABI) ──
 
@@ -171,7 +172,10 @@ fn doRequeue(bucket: *FutexBucket, dst_bucket: *FutexBucket, requeue_count: u32)
             current = next;
             continue;
         };
-        if (t.state == .blocked) {
+        // A scheduler resume/requeue transition may transiently expose a
+        // still-linked waiter as blocked, running, or ready. The exact key and
+        // live node are the ownership proof; only zombies are ineligible.
+        if (t.state != .zombie) {
             if (bucket != dst_bucket) {
                 // Remove from source bucket
                 if (prev) |p| {
@@ -215,8 +219,8 @@ pub fn copyUserU64(addr: u64) u64 {
     return copyUserU64Fallible(addr) catch 0;
 }
 
-/// Wake up to `count` waiters from a futex bucket.
-pub fn wakeN(bucket: *FutexBucket, count: u32) u64 {
+/// Wake up to `count` waiters for one address-space-qualified futex key.
+pub fn wakeN(bucket: *FutexBucket, key: futex_key.Key, count: u32) u64 {
     var woken: usize = 0;
     var woken_idx: [task_mod.MAX_TASKS]u32 = undefined;
     const irq_flags = bucket.lock.acquire();
@@ -225,12 +229,17 @@ pub fn wakeN(bucket: *FutexBucket, count: u32) u64 {
     while (current) |node| {
         if (woken >= count) break;
         const next = node.next;
+        if (!futex_key.equal(.{ .root = node.futex_root, .addr = node.futex_addr }, key)) {
+            prev = node;
+            current = next;
+            continue;
+        }
         const t = task_mod.getTask(node.task_idx) orelse {
             prev = node;
             current = next;
             continue;
         };
-        if (t.state == .blocked) {
+        if (t.state != .zombie) {
             node.granted = true;
             woken_idx[woken] = node.task_idx;
             woken += 1;
@@ -259,81 +268,11 @@ pub fn wakeN(bucket: *FutexBucket, count: u32) u64 {
 // ── Vectored futex wait ──
 
 /// futex_waitv(waiters_ptr, nr_waiters, flags, timeout, clockid) -> woken index or -errno.
-/// Vectored futex wait. Simplified: iterate and wait on first matching futex.
+/// Unsupported until vector entries carry address-space-qualified private keys.
 pub fn futexWaitv(waiters_ptr: u64, nr_waiters: u64) i64 {
-    if (nr_waiters == 0) return -22; // -EINVAL
-    const max_waiters = 16;
-    if (nr_waiters > max_waiters) return -22; // -EINVAL
-
-    // struct futex_waitv { val: u64, uaddr: u64, flags: u32, __reserved: u32 }
-    const waiter_size = 24;
-    const waiters_len = std.math.mul(u64, nr_waiters, waiter_size) catch return -14; // -EFAULT
-    if (!copy.validateUserBuffer(waiters_ptr, @intCast(waiters_len))) return -14; // -EFAULT
-
-    var waiters: [max_waiters][waiter_size]u8 = undefined;
-    var i: u64 = 0;
-    while (i < nr_waiters) : (i += 1) {
-        const off = i * waiter_size;
-        const waiter_ptr = std.math.add(u64, waiters_ptr, off) catch return -14; // -EFAULT
-        const waiter = &waiters[@intCast(i)];
-        if (copy.copyFromUser(waiter[0..], @ptrFromInt(waiter_ptr), waiter.len) != waiter.len) {
-            return -14; // -EFAULT
-        }
-    }
-
-    i = 0;
-    while (i < nr_waiters) : (i += 1) {
-        const waiter = &waiters[@intCast(i)];
-        const expected_val = bo.readU64At(waiter, 0);
-        const uaddr = bo.readU64At(waiter, 8);
-
-        if (uaddr == 0 or uaddr >= 0x0000_8000_0000_0000) return -14; // -EFAULT
-
-        const bucket_idx = hash(uaddr);
-        const bucket = &buckets[bucket_idx];
-
-        var node: task_mod.WaitNode = .{ .task_idx = 0 };
-        const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
-        const irq_flags = bucket.lock.acquire();
-        // v53.51: Check-and-enqueue under bucket.lock — validating *uaddr
-        // before taking the lock left a window where FUTEX_WAKE could fire
-        // between the check and the enqueue (lost wakeup).
-        const cur_u32 = copyUserU32(uaddr) catch {
-            bucket.lock.release(irq_flags);
-            return -14; // -EFAULT
-        };
-        if (@as(u64, cur_u32) != expected_val) {
-            bucket.lock.release(irq_flags);
-            continue; // Value mismatch — try the next waiter
-        }
-        node.task_idx = cur_idx;
-        node.granted = false;
-        node.next = bucket.head;
-        bucket.head = &node;
-
-        const cur = task_mod.getTask(cur_idx) orelse {
-            bucket.lock.release(irq_flags);
-            return -1;
-        };
-        cur.state = .blocked;
-        bucket.lock.release(irq_flags);
-
-        sched_mod.forceReschedule();
-        sched_mod.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
-
-        // v53.44: Clean up node if not granted (prevents UAF)
-        if (!node.granted) {
-            removeWaitNode(bucket, &node);
-            // Signal kick: fatal signal exits, handled signal EINTRs.
-            const sig_mod = @import("../proc/signal.zig");
-            if (sig_mod.pendingFatal(cur)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
-            if (sig_mod.pendingActionable(cur)) return -4; // -EINTR
-            return -11;
-        }
-        return @bitCast(i);
-    }
-
-    return -11; // -EAGAIN
+    _ = waiters_ptr;
+    _ = nr_waiters;
+    return -38; // -ENOSYS
 }
 
 // ── Core futex syscall ──
@@ -342,11 +281,25 @@ pub fn futexWaitv(waiters_ptr: u64, nr_waiters: u64) i64 {
 /// Core logic for syscall #202.
 /// v53.44: added val2 param for Linux ABI correctness (r10 = val2/timeout).
 pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64) i64 {
-    const op: i64 = raw_op & ~FUTEX_PRIVATE; // strip private flag
+    _ = uaddr2;
+    _ = val3;
+    const decoded = futex_key.privateOp(raw_op) orelse return -22; // -EINVAL
+    const op = decoded.base;
 
     if (addr == 0 or addr >= 0x0000_8000_0000_0000) {
         return -14; // -EFAULT
     }
+    if (!futex_key.aligned(addr)) return -22; // -EINVAL
+    if (futex_key.piUnsupported(op)) return -38; // -ENOSYS
+    if (!decoded.private) return -38; // -ENOSYS: shared futex keys are unavailable
+    switch (op) {
+        FUTEX_WAIT, FUTEX_WAKE => {},
+        else => return -38, // -ENOSYS: only private basic waits/wakes are implemented
+    }
+
+    const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
+    const cur_task = task_mod.getTask(cur_idx) orelse return -1;
+    const key = futex_key.Key{ .root = cur_task.page_table_phys, .addr = addr };
 
     const bucket_idx = hash(addr);
     const bucket = &buckets[bucket_idx];
@@ -359,7 +312,6 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
                 error.Invalid => return -22, // -EINVAL
             };
             var node: task_mod.WaitNode = .{ .task_idx = 0 };
-            const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
             const irq_flags = bucket.lock.acquire();
             // v53.51: Check-and-enqueue atomically w.r.t. FUTEX_WAKE — the
             // canonical futex protocol. Reading *addr before taking the lock
@@ -374,247 +326,62 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
             }
             node.task_idx = cur_idx;
             node.granted = false;
+            node.futex_root = key.root;
+            node.futex_addr = key.addr;
             node.next = bucket.head;
             bucket.head = &node;
             if (deadline != 0) armWaitDeadline(cur_idx, bucket, deadline);
 
-            const cur = task_mod.getTask(cur_idx) orelse {
-                bucket.lock.release(irq_flags);
-                return -1;
-            };
-            cur.state = .blocked;
+            cur_task.state = .blocked;
             bucket.lock.release(irq_flags);
 
-            sched_mod.forceReschedule();
-            sched_mod.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
-
-            if (deadline != 0) disarmWaitDeadline(cur_idx);
-            // v53.44: Clean up node if not granted (prevents UAF)
-            if (!node.granted) {
-                removeWaitNode(bucket, &node);
-                if (deadline != 0 and tsc.nanos() >= deadline) {
-                    return -110; // -ETIMEDOUT
-                }
-                // Signal kick (sendSignal unblocks without granting): die on
-                // a fatal signal via the tick's exit-by-signal path, or EINTR.
+            while (true) {
+                sched_mod.forceReschedule();
                 const sig_mod = @import("../proc/signal.zig");
-                if (sig_mod.pendingFatal(cur)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
-                if (sig_mod.pendingActionable(cur)) return -4; // -EINTR
+                const flags2 = bucket.lock.acquire();
+                if (node.granted) {
+                    bucket.lock.release(flags2);
+                    if (deadline != 0) disarmWaitDeadline(cur_idx);
+                    return 0;
+                }
+                const expired = deadline != 0 and tsc.nanos() >= deadline;
+                const fatal = sig_mod.pendingFatal(cur_task);
+                const actionable = sig_mod.pendingActionable(cur_task);
+                if (!expired and fatal == null and !actionable) {
+                    // A yield can resume the current task without a switch.
+                    // A linked, ungranted futex node must remain blocked so an
+                    // exact-key wake sees it as eligible rather than losing it.
+                    cur_task.state = .blocked;
+                    bucket.lock.release(flags2);
+                    continue;
+                }
+
+                // Cancellation owns the node while holding bucket.lock, so a
+                // concurrent wake cannot grant a node that is being unlinked.
+                var prev: ?*task_mod.WaitNode = null;
+                var current = bucket.head;
+                while (current) |candidate| {
+                    if (candidate == &node) {
+                        if (prev) |p| p.next = candidate.next else bucket.head = candidate.next;
+                        break;
+                    }
+                    prev = candidate;
+                    current = candidate.next;
+                }
+                bucket.lock.release(flags2);
+                if (deadline != 0) disarmWaitDeadline(cur_idx);
+                if (expired) return -110; // -ETIMEDOUT
+                if (fatal) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+                if (actionable) return -4; // -EINTR
                 return -11;
             }
-            return 0;
         },
         FUTEX_WAKE => {
             const count: u32 = @truncate(val);
-            return @intCast(wakeN(bucket, count));
+            return @intCast(wakeN(bucket, key, count));
         },
-        FUTEX_WAIT_BITSET => {
-            // Same as FUTEX_WAIT (ignore bitset for now), but val2 is an
-            // absolute timespec* per the Linux ABI.
-            const deadline = parseTimeout(val2, true) catch |err| switch (err) {
-                error.Fault => return -14, // -EFAULT
-                error.Invalid => return -22, // -EINVAL
-            };
-            var node: task_mod.WaitNode = .{ .task_idx = 0 };
-            const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
-            const irq_flags = bucket.lock.acquire();
-            // v53.51: Check-and-enqueue under bucket.lock (lost-wakeup fix,
-            // see FUTEX_WAIT).
-            const user_val = copyUserU32(addr) catch {
-                bucket.lock.release(irq_flags);
-                return -14; // -EFAULT
-            };
-            if (user_val != @as(u32, @truncate(val))) {
-                bucket.lock.release(irq_flags);
-                return -11;
-            }
-            node.task_idx = cur_idx;
-            node.granted = false;
-            node.next = bucket.head;
-            bucket.head = &node;
-            if (deadline != 0) armWaitDeadline(cur_idx, bucket, deadline);
-
-            const cur = task_mod.getTask(cur_idx) orelse {
-                bucket.lock.release(irq_flags);
-                return -1;
-            };
-            cur.state = .blocked;
-            bucket.lock.release(irq_flags);
-            sched_mod.forceReschedule();
-            sched_mod.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
-            if (deadline != 0) disarmWaitDeadline(cur_idx);
-            // v53.44: Clean up node if not granted (prevents UAF)
-            if (!node.granted) {
-                removeWaitNode(bucket, &node);
-                if (deadline != 0 and tsc.nanos() >= deadline) {
-                    return -110; // -ETIMEDOUT
-                }
-                // Signal kick: fatal signal exits, handled signal EINTRs.
-                const sig_mod = @import("../proc/signal.zig");
-                if (sig_mod.pendingFatal(cur)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
-                if (sig_mod.pendingActionable(cur)) return -4; // -EINTR
-                return -11;
-            }
-            return 0;
-        },
-        FUTEX_WAKE_BITSET => {
-            const count: u32 = @truncate(val);
-            return @intCast(wakeN(bucket, count));
-        },
-        FUTEX_REQUEUE => {
-            const wake_count: u32 = @truncate(val);
-            const requeue_count: u32 = @truncate(val2); // v53.44: val2 not val3
-            const woken = wakeN(bucket, wake_count);
-            var requeued: u64 = 0;
-            if (requeue_count > 0 and uaddr2 != 0 and uaddr2 < 0x0000_8000_0000_0000) {
-                const dst_bucket = &buckets[hash(uaddr2)];
-                // v53.44: Same-bucket check prevents double-acquire deadlock
-                if (bucket == dst_bucket) {
-                    const f1 = bucket.lock.acquire();
-                    requeued = doRequeue(bucket, dst_bucket, requeue_count);
-                    bucket.lock.release(f1);
-                } else {
-                    const src_first = @intFromPtr(bucket) <= @intFromPtr(dst_bucket);
-                    const b1 = if (src_first) bucket else dst_bucket;
-                    const b2 = if (src_first) dst_bucket else bucket;
-                    const f1 = b1.lock.acquire();
-                    const f2 = b2.lock.acquire();
-                    requeued = doRequeue(bucket, dst_bucket, requeue_count);
-                    b2.lock.release(f2);
-                    b1.lock.release(f1);
-                }
-            }
-            return @intCast(woken + requeued);
-        },
-        FUTEX_CMP_REQUEUE => {
-            const cmp_val: u32 = @truncate(val3);
-            // v53.44: Check *addr (not *uaddr2) per Linux CMP_REQUEUE semantics
-            const user_val = copyUserU32(addr) catch return -14; // -EFAULT
-            if (user_val != cmp_val) {
-                return -11; // EAGAIN
-            }
-            const wake_count: u32 = @truncate(val);
-            const requeue_count: u32 = @truncate(val2); // v53.44: val2 not val3>>32
-            const woken = wakeN(bucket, wake_count);
-            var requeued: u64 = 0;
-            if (requeue_count > 0 and uaddr2 != 0 and uaddr2 < 0x0000_8000_0000_0000) {
-                const dst_bucket = &buckets[hash(uaddr2)];
-                // v53.44: Same-bucket check prevents double-acquire deadlock
-                if (bucket == dst_bucket) {
-                    const f1 = bucket.lock.acquire();
-                    requeued = doRequeue(bucket, dst_bucket, requeue_count);
-                    bucket.lock.release(f1);
-                } else {
-                    const src_first = @intFromPtr(bucket) <= @intFromPtr(dst_bucket);
-                    const b1 = if (src_first) bucket else dst_bucket;
-                    const b2 = if (src_first) dst_bucket else bucket;
-                    const f1 = b1.lock.acquire();
-                    const f2 = b2.lock.acquire();
-                    requeued = doRequeue(bucket, dst_bucket, requeue_count);
-                    b2.lock.release(f2);
-                    b1.lock.release(f1);
-                }
-            }
-            return @intCast(woken + requeued);
-        },
-        FUTEX_WAKE_OP => {
-            const wake_count1: u32 = @truncate(val);
-            const wake_count2: u32 = @truncate(val2); // v53.44: val2 not val3>>32
-            const woken1 = wakeN(bucket, wake_count1);
-            var woken2: u64 = 0;
-            if (uaddr2 != 0 and uaddr2 < 0x0000_8000_0000_0000 and wake_count2 > 0) {
-                const bucket2 = &buckets[hash(uaddr2)];
-                woken2 = wakeN(bucket2, wake_count2);
-            }
-            return @intCast(woken1 + woken2);
-        },
-        FUTEX_LOCK_PI => {
-            // Simplified PI lock: claim (*addr: 0 → tid), block on contention.
-            const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
-            const cur_task = task_mod.getTask(cur_idx) orelse return -1;
-            const tid: u32 = cur_task.tid;
-
-            while (true) {
-                var node: task_mod.WaitNode = .{ .task_idx = 0 };
-                // v53.51: Serialize check-and-set under bucket.lock — the old
-                // copyFromUser-check-copyToUser "CAS" let two threads on two
-                // CPUs both read 0 and both return success (two owners).
-                const irq_flags = bucket.lock.acquire();
-                var word_buf: [4]u8 = undefined;
-                if (copy.copyFromUser(&word_buf, @ptrFromInt(addr), 4) != 4) {
-                    bucket.lock.release(irq_flags);
-                    return -14;
-                }
-                const cur_val: u32 = bo.readU32Le(&word_buf);
-                if (cur_val == 0 or cur_val == tid) {
-                    // Lock available (or already ours) — claim it under the lock.
-                    var new_buf: [4]u8 = undefined;
-                    bo.writeU32Le(&new_buf, tid);
-                    const ok = copy.copyToUser(@ptrFromInt(addr), &new_buf, 4) == 4;
-                    bucket.lock.release(irq_flags);
-                    return if (ok) 0 else -14;
-                }
-
-                // Lock held — block on futex wait queue (still under the lock,
-                // so FUTEX_UNLOCK_PI's wake cannot be lost).
-                node.task_idx = cur_idx;
-                node.granted = false;
-                node.next = bucket.head;
-                bucket.head = &node;
-                cur_task.state = .blocked;
-                bucket.lock.release(irq_flags);
-
-                sched_mod.forceReschedule();
-                sched_mod.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
-
-                // v53.44: Clean up node if not granted (prevents UAF)
-                if (!node.granted) {
-                    removeWaitNode(bucket, &node);
-                    // Signal kick: fatal signal exits, handled signal EINTRs.
-                    const sig_mod = @import("../proc/signal.zig");
-                    if (sig_mod.pendingFatal(cur_task)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
-                    if (sig_mod.pendingActionable(cur_task)) return -4; // -EINTR
-                    return -11;
-                }
-                // v53.51: Woken — loop back and re-contend instead of
-                // returning success unconditionally: another thread may have
-                // grabbed the word first, in which case we re-block.
-            }
-        },
-        FUTEX_UNLOCK_PI => {
-            // Set futex word to 0, wake one waiter
-            var new_buf: [4]u8 = undefined;
-            bo.writeU32Le(&new_buf, 0);
-            if (copy.copyToUser(@ptrFromInt(addr), &new_buf, 4) != 4) return -14;
-            const woken = wakeN(bucket, 1);
-            return @intCast(woken);
-        },
-        FUTEX_TRYLOCK_PI => {
-            // Non-blocking: try claim (*addr: 0 → tid), serialized like LOCK_PI.
-            const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
-            const cur_task = task_mod.getTask(cur_idx) orelse return -1;
-
-            const irq_flags = bucket.lock.acquire();
-            var word_buf: [4]u8 = undefined;
-            if (copy.copyFromUser(&word_buf, @ptrFromInt(addr), 4) != 4) {
-                bucket.lock.release(irq_flags);
-                return -14;
-            }
-            const cur_val: u32 = bo.readU32Le(&word_buf);
-            if (cur_val == 0 or cur_val == cur_task.tid) {
-                var new_buf: [4]u8 = undefined;
-                bo.writeU32Le(&new_buf, cur_task.tid);
-                const ok = copy.copyToUser(@ptrFromInt(addr), &new_buf, 4) == 4;
-                bucket.lock.release(irq_flags);
-                return if (ok) 0 else -14;
-            }
-            bucket.lock.release(irq_flags);
-            return -11; // -EAGAIN: lock held
-        },
-        FUTEX_WAIT_REQUEUE_PI, FUTEX_CMP_REQUEUE_PI => {
-            // Complex PI requeue — not commonly used, return success as no-op
-            return 0;
-        },
+        FUTEX_LOCK_PI, FUTEX_UNLOCK_PI, FUTEX_TRYLOCK_PI,
+        FUTEX_WAIT_REQUEUE_PI, FUTEX_CMP_REQUEUE_PI => return -38, // ENOSYS: PI semantics unavailable
         else => {
             return -38; // -ENOSYS
         },

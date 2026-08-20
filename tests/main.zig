@@ -3,6 +3,7 @@ const std = @import("std");
 const kt = @import("kernel_shared");
 
 const byte_order = kt.byte_order;
+const futex_key = kt.futex_key;
 const cow_pte = kt.cow_pte;
 const map_fixed = kt.map_fixed;
 const vma_stats = kt.vma_stats;
@@ -61,6 +62,36 @@ test "rlimit FSIZE policy enforces byte-position boundaries" {
     try std.testing.expect(policy.fsizeAllowed(8192, 1, inf));
     try std.testing.expect(policy.fsizeAllowed(0, 1, inf));
     try std.testing.expect(!policy.fsizeAllowed(0x7FFF_FFFF_FFFF_FFFE, 2, 0x7FFF_FFFF_FFFF_FFFF));
+}
+
+test "private futex keys distinguish roots and exact addresses" {
+    const key_a = futex_key.Key{ .root = 0x1000, .addr = 0x4000 };
+    const same = futex_key.Key{ .root = 0x1000, .addr = 0x4000 };
+    const same_page_other_word = futex_key.Key{ .root = 0x1000, .addr = 0x4004 };
+    const same_addr_other_root = futex_key.Key{ .root = 0x2000, .addr = 0x4000 };
+
+    try std.testing.expect(futex_key.aligned(key_a.addr));
+    try std.testing.expect(!futex_key.aligned(0x4002));
+    try std.testing.expect(futex_key.equal(key_a, same));
+    try std.testing.expect(!futex_key.equal(key_a, same_page_other_word));
+    try std.testing.expect(!futex_key.equal(key_a, same_addr_other_root));
+}
+
+test "private futex operation decoder rejects unsupported flags and PI" {
+    const private_wait = futex_key.privateOp(128) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 0), private_wait.base);
+    try std.testing.expect(private_wait.private);
+
+    const private_wake = futex_key.privateOp(129) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 1), private_wake.base);
+    try std.testing.expect(private_wake.private);
+    try std.testing.expect(futex_key.privateOp(256) == null);
+    try std.testing.expect(futex_key.privateOp(-1) == null);
+
+    for ([_]i64{ 6, 7, 8, 11, 12 }) |op| {
+        try std.testing.expect(futex_key.piUnsupported(op));
+    }
+    try std.testing.expect(!futex_key.piUnsupported(0));
 }
 
 test "MAP_FIXED replacement policy bounds stack-resident transactions" {

@@ -49,6 +49,10 @@ pub const WaitNode = struct {
     task_idx: u32,
     granted: bool = false,
     next: ?*WaitNode = null,
+    /// Futex waiters use this address-space-qualified key; other queues leave
+    /// both fields at zero.
+    futex_root: u64 = 0,
+    futex_addr: u64 = 0,
 };
 
 pub const Task = struct {
