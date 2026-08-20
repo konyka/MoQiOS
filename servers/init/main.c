@@ -189,6 +189,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello67");  /* fixed-table VMA fragmentation baseline */
     run_test("hello68");  /* observation-only present-user-page RSS telemetry */
     run_test("hello69");  /* private futex isolation and pthread contention */
+    run_test("hello70");  /* native AIO io_cancel unsupported contract */
 
     start_persistent_services();
 
