@@ -3,6 +3,7 @@ const std = @import("std");
 const kt = @import("kernel_shared");
 
 const byte_order = kt.byte_order;
+const aio_policy = kt.aio_policy;
 const futex_key = kt.futex_key;
 const cow_pte = kt.cow_pte;
 const map_fixed = kt.map_fixed;
@@ -75,6 +76,10 @@ test "private futex keys distinguish roots and exact addresses" {
     try std.testing.expect(futex_key.equal(key_a, same));
     try std.testing.expect(!futex_key.equal(key_a, same_page_other_word));
     try std.testing.expect(!futex_key.equal(key_a, same_addr_other_root));
+}
+
+test "AIO cancellation is unsupported when submissions complete synchronously" {
+    try std.testing.expect(aio_policy.cancelUnsupported());
 }
 
 test "private futex operation decoder rejects unsupported flags and PI" {

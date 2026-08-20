@@ -10,6 +10,7 @@ const serial = @import("../arch/arch.zig").serial;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const bo = @import("../lib/byte_order.zig");
 const fmt = @import("../lib/fmt.zig");
+const aio_policy = @import("aio_policy.zig");
 
 const MAX_CONTEXTS: u32 = 8;
 const MAX_EVENTS: u32 = 32;
@@ -214,12 +215,8 @@ pub fn ioGetevents(ctx_id: u64, min_nr: u64, nr: u64, events_ptr: u64, timeout_p
 pub fn ioCancel(ctx_id: u64, iocb: u64, result: u64) i64 {
     _ = iocb;
     _ = result;
-    const flags = aio_lock.acquire();
-    defer aio_lock.release(flags);
-
-    _ = findByCtxId(ctx_id) orelse return EINVAL;
-    // Cannot cancel already-completed synchronous operations
-    return EINVAL;
+    _ = ctx_id;
+    return if (aio_policy.cancelUnsupported()) -38 else unreachable; // ENOSYS: no pending requests
 }
 
 // ── I/O execution helpers ──
