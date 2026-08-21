@@ -191,6 +191,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello69");  /* private futex isolation and pthread contention */
     run_test("hello70");  /* native AIO io_cancel unsupported contract */
     run_test("hello71");  /* mlock ABI rejection and MAP_FIXED independence */
+    run_test("hello72");  /* ioprio process ABI and unsupported scopes */
 
     start_persistent_services();
 
