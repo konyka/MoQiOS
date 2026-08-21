@@ -130,6 +130,8 @@ pub const Task = struct {
     /// CLONE_FILES threads can share one table (pthread v2). Never null for
     /// a live task; set at creation from vfs.allocFdTable().
     fd_table: *@import("../fs/vfs.zig").FdTable,
+    /// Per-task Linux ioprio value; independent of scheduler priority/policy.
+    ioprio: u32 = @import("ioprio_policy.zig").DEFAULT,
     /// Per-task RLIMIT_NOFILE; defaults preserve the historical MAX_FDS cap.
     nofile_cur: u64 = @import("../fs/vfs.zig").MAX_FDS,
     nofile_max: u64 = @import("../fs/vfs.zig").MAX_FDS,
@@ -690,6 +692,7 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     next_tid += 1;
 
     zeroSlot(slot);
+    tasks[slot].ioprio = @import("ioprio_policy.zig").DEFAULT;
     const fd_table = @import("../fs/vfs.zig").allocFdTable() orelse {
         serial.writeString("[task] OOM allocating fd table\n");
         slot_bitmap &= ~(@as(u64, 1) << @intCast(slot));
@@ -756,6 +759,7 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     const tid = next_tid;
     next_tid += 1;
     zeroSlot(slot);
+    tasks[slot].ioprio = @import("ioprio_policy.zig").DEFAULT;
     const fd_table = @import("../fs/vfs.zig").allocFdTable() orelse {
         serial.writeString("[task] OOM allocating fd table\n");
         slot_bitmap &= ~(@as(u64, 1) << @intCast(slot));
@@ -1122,6 +1126,11 @@ pub fn createUserProcess(
         // hands it to the scheduler with publishRunnable() when it is ready.
         tasks[slot].state = .blocked;
         tasks[slot].priority = 1;
+        // zeroSlot clears field defaults; root user tasks need the ABI default.
+        tasks[slot].ioprio = @import("ioprio_policy.zig").DEFAULT;
+        if (findTaskByTidLocked(parent_tid_val)) |parent_idx| {
+            tasks[slot].ioprio = tasks[parent_idx].ioprio;
+        }
         tasks[slot].kernel_stack = stack_virt;
         tasks[slot].kernel_stack_top = stack_top;
         tasks[slot].entry = null;

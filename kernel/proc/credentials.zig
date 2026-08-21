@@ -22,6 +22,8 @@ fn getCurrentTask() ?*const task_mod.Task {
 
 /// setuid(uid) — set real and effective user ID.
 pub fn setuid(uid: u32) i64 {
+    const lock_flags = task_mod.lockTask();
+    defer task_mod.unlockTask(lock_flags);
     const t = getCurrentTaskMut() orelse return -1;
     if (t.euid != 0 and uid != t.uid and uid != t.suid) return -1; // EPERM
     t.uid = uid;
@@ -32,6 +34,8 @@ pub fn setuid(uid: u32) i64 {
 
 /// setgid(gid) — set real and effective group ID.
 pub fn setgid(gid: u32) i64 {
+    const lock_flags = task_mod.lockTask();
+    defer task_mod.unlockTask(lock_flags);
     const t = getCurrentTaskMut() orelse return -1;
     if (t.egid != 0 and gid != t.gid and gid != t.sgid) return -1;
     t.gid = gid;
@@ -42,6 +46,8 @@ pub fn setgid(gid: u32) i64 {
 
 /// setreuid(ruid, euid)
 pub fn setreuid(ruid: u32, euid: u32) i64 {
+    const lock_flags = task_mod.lockTask();
+    defer task_mod.unlockTask(lock_flags);
     const t = getCurrentTaskMut() orelse return -1;
     if (ruid != 0xFFFFFFFF and t.euid != 0 and ruid != t.uid and ruid != t.suid) return -1;
     if (euid != 0xFFFFFFFF and t.euid != 0 and euid != t.uid and euid != t.euid and euid != t.suid) return -1;
@@ -55,6 +61,8 @@ pub fn setreuid(ruid: u32, euid: u32) i64 {
 
 /// setregid(rgid, egid)
 pub fn setregid(rgid: u32, egid: u32) i64 {
+    const lock_flags = task_mod.lockTask();
+    defer task_mod.unlockTask(lock_flags);
     const t = getCurrentTaskMut() orelse return -1;
     if (rgid != 0xFFFFFFFF and t.egid != 0 and rgid != t.gid and rgid != t.sgid) return -1;
     if (egid != 0xFFFFFFFF and t.egid != 0 and egid != t.gid and egid != t.egid and egid != t.sgid) return -1;
@@ -68,6 +76,8 @@ pub fn setregid(rgid: u32, egid: u32) i64 {
 
 /// setresuid(ruid, euid, suid)
 pub fn setresuid(ruid: u32, euid: u32, suid: u32) i64 {
+    const lock_flags = task_mod.lockTask();
+    defer task_mod.unlockTask(lock_flags);
     const t = getCurrentTaskMut() orelse return -1;
     if (t.euid != 0) {
         for ([_]u32{ ruid, euid, suid }) |val| {
@@ -92,6 +102,8 @@ pub fn getresuid118(ruid_ptr: u64, euid_ptr: u64, suid_ptr: u64) i64 {
 
 /// setresgid(rgid, egid, sgid)
 pub fn setresgid(rgid: u32, egid: u32, sgid: u32) i64 {
+    const lock_flags = task_mod.lockTask();
+    defer task_mod.unlockTask(lock_flags);
     const t = getCurrentTaskMut() orelse return -1;
     if (t.egid != 0) {
         for ([_]u32{ rgid, egid, sgid }) |val| {

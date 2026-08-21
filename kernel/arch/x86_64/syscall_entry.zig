@@ -4573,54 +4573,47 @@ fn syscallReadahead(fd: u32, offset: u64, count: u32) i64 {
     return 0;
 }
 
-/// ioprio_set(which, who, ioprio) — set I/O scheduling priority.
-/// which: 1=process, 2=pgrp, 3=user. ioprio encodes class(2bits)+data(13bits).
+/// ioprio_set(which, who, ioprio) — set per-task I/O priority.
 fn syscallIoprioSet(which: u32, who: u32, ioprio: u32) i64 {
     const tm = @import("../../proc/task.zig");
     const sched_mod = @import("../../proc/sched.zig");
-
-    if (which == 1) {
-        // Process-level
-        const target_pid: u32 = if (who == 0) blk: {
-            const cur_idx = sched_mod.currentTaskIndex() orelse return -3;
-            const ct = tm.getTask(cur_idx) orelse return -3;
-            break :blk ct.tid;
-        } else who;
-
-        var i: u32 = 0;
-        while (i < tm.MAX_TASKS) : (i += 1) {
-            if (tm.getTask(i)) |t| {
-                if (t.tid == target_pid and t.state != .zombie) {
-                    // Map io_class to task priority (0-255 scale)
-                    const io_class = ioprio >> 13; // 1=realtime, 2=best-effort, 3=idle
-                    const io_prio_data = ioprio & 0x1FFF;
-                    // Best-effort: map data 0-7 to priority 100-170
-                    // Realtime: map data 0-7 to priority 0-70
-                    // Idle: fixed priority 200
-                    switch (io_class) {
-                        1 => t.priority = @intCast(@min(io_prio_data * 10, 70)), // realtime
-                        2 => t.priority = @intCast(100 + @min(io_prio_data * 10, 70)), // best-effort
-                        3 => t.priority = 200, // idle
-                        else => {},
-                    }
-                    return 0;
-                }
-            }
-        }
-        return -3; // ESRCH
-    }
-    // pgrp/user: accept silently
+    const policy = @import("../../proc/ioprio_policy.zig");
+    if (policy.unsupportedWhich(which)) return -38;
+    if (!policy.validWhich(which)) return -22;
+    if (!policy.validValue(ioprio)) return -22;
+    const lock_flags = tm.lockTask();
+    defer tm.unlockTask(lock_flags);
+    const current_idx = sched_mod.currentTaskIndex() orelse return -3;
+    const current = tm.getTask(current_idx) orelse return -3;
+    const target_tid: u32 = if (who == 0) blk: {
+        break :blk current.tid;
+    } else who;
+    const target_idx = tm.findTaskByTidLocked(target_tid) orelse return -3;
+    const target = tm.getTask(target_idx) orelse return -3;
+    if (target.state == .zombie) return -3;
+    if (target.tid != current.tid and target.uid != current.uid) return -1;
+    target.ioprio = ioprio;
     return 0;
 }
 
-/// ioprio_get(which, who) — get I/O scheduling priority.
-/// Returns ioprio value: class(2bits)<<13 | data(13bits). Default: best-effort prio 4.
+/// ioprio_get(which, who) — get a task's stored I/O priority.
 fn syscallIoprioGet(which: u32, who: u32) i64 {
-    _ = who;
-    if (which != 1 and which != 2 and which != 3) return -22;
-    // Default: class=2 (best-effort), data=4 (middle priority)
-    const default_ioprio: i64 = (2 << 13) | 4;
-    return default_ioprio;
+    const tm = @import("../../proc/task.zig");
+    const sched_mod = @import("../../proc/sched.zig");
+    const policy = @import("../../proc/ioprio_policy.zig");
+    if (policy.unsupportedWhich(which)) return -38;
+    if (!policy.validWhich(which)) return -22;
+    const lock_flags = tm.lockTask();
+    defer tm.unlockTask(lock_flags);
+    const current_idx = sched_mod.currentTaskIndex() orelse return -3;
+    const current = tm.getTask(current_idx) orelse return -3;
+    const target_tid: u32 = if (who == 0) blk: {
+        break :blk current.tid;
+    } else who;
+    const target_idx = tm.findTaskByTidLocked(target_tid) orelse return -3;
+    const target = tm.getTask(target_idx) orelse return -3;
+    if (target.state == .zombie) return -3;
+    return target.ioprio;
 }
 
 // ── v36.0: vmsplice / name_to_handle_at / open_by_handle_at ──────────────────

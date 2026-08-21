@@ -49,6 +49,7 @@ pub const userdrv_core = @import("drivers/userdrv_core.zig");
 pub const ioapic_core = @import("arch/x86_64/ioapic_core.zig");
 pub const ioperm_core = @import("proc/ioperm_core.zig");
 pub const rlimit = @import("proc/rlimit.zig");
+pub const ioprio_policy = @import("proc/ioprio_policy.zig");
 pub const creation_metadata = @import("proc/creation_metadata.zig");
 pub const devfs = @import("fs/devfs.zig");
 pub const devfs_proxy = @import("fs/devfs_proxy.zig");
