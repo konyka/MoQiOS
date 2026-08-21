@@ -24,6 +24,7 @@ const capability_profile = kt.capability_profile;
 const capability = kt.capability;
 const dac = kt.dac;
 const rlimit = kt.rlimit;
+const ioprio_policy = kt.ioprio_policy;
 const creation_metadata = kt.creation_metadata;
 const virtio_net_queue = kt.virtio_net_queue;
 
@@ -85,6 +86,21 @@ test "AIO cancellation is unsupported when submissions complete synchronously" {
 
 test "user memory locking is explicitly unsupported" {
     try std.testing.expect(mlock_policy.userMlockUnsupported());
+}
+
+test "ioprio policy validates process scope and encoded classes" {
+    try std.testing.expect(ioprio_policy.validWhich(ioprio_policy.WHO_PROCESS));
+    try std.testing.expect(!ioprio_policy.validWhich(2));
+    try std.testing.expect(ioprio_policy.unsupportedWhich(2));
+    try std.testing.expect(ioprio_policy.unsupportedWhich(3));
+    try std.testing.expect(!ioprio_policy.unsupportedWhich(4));
+    try std.testing.expect(ioprio_policy.validValue(ioprio_policy.DEFAULT));
+    try std.testing.expect(ioprio_policy.validValue((ioprio_policy.CLASS_RT << 13) | 7));
+    try std.testing.expect(ioprio_policy.validValue(ioprio_policy.CLASS_IDLE << 13));
+    try std.testing.expect(!ioprio_policy.validValue((ioprio_policy.CLASS_BE << 13) | 8));
+    try std.testing.expect(!ioprio_policy.validValue((ioprio_policy.CLASS_IDLE << 13) | 1));
+    try std.testing.expect(!ioprio_policy.validValue(0));
+    try std.testing.expect(!ioprio_policy.validValue(1 << 15));
 }
 
 test "private futex operation decoder rejects unsupported flags and PI" {
