@@ -767,7 +767,7 @@ LAPIC Timer 中断
 > v42.0 新增 15 个 Linux 标准编号 dispatch (#331-#451): 别名接线 statx/io_pgetevents/pidfd_send_signal/pidfd_getfd/faccessat2/pidfd_open/close_range/openat2; 新实现 clone3(clone_args解析)/epoll_pwait2(timespec→ms)/futex_waitv(接线futexWaitv)/cachestat(page_cache统计)/rseq(注册接受)。
 > v41.0 替换 5 个 no-op/stub 为真实实现: madvise WILLNEED/SEQUENTIAL→page_cache.recordAccess 预热缓存+DONTNEED→解锁 MmapRegion; posix_fadvise DONTNEED→page_cache.invalidateInode 真实驱逐; execveat(AT_FDCWD)→委托 syscallExecve; fallocate(mode=0)→ext2.truncateFile 预分配; prctl PR_SET_PDEATHSIG→存储到 Task+新增 PR_GET_PDEATHSIG。Task 新增 pdeathsig 字段。
 > v40.0 新增 25 个 dispatch 条目，**全面消除所有缺口**。补齐 SysV IPC Linux 标准编号别名 (shmget/shmat/shmctl/semget/semop/semctl/shmdt/msgget/msgsnd/msgrcv/msgctl)、文件操作 (fcntl/getdents/link/symlink/chown/fchown/lchown)、新实现 getitimer/setitimer (ITIMER_REAL TSC deadline+interval)、pause (forceReschedule+EINTR)。fchdir 从 no-op 升级为真实实现。
-> v37.0 新增 14 个 dispatch 条目 (#297-#310)，接线 MoQiOS 原生 IPC (moqipc_create_ep/destroy_ep/send/recv/call/reply/notify/get_notify) + kcmp/capget/capset/sched_setattr/sched_getattr/membarrier。替换 3 个 no-op 为真实实现：msync→vfs.syncAll / mlock+munlock→MmapRegion.locked / posix_fadvise→page_cache.recordAccess。Task 新增 sched_policy，MmapRegion 新增 locked。
+> v37.0 历史记录：新增 14 个 dispatch 条目 (#297-#310)，接线 MoQiOS 原生 IPC (moqipc_create_ep/destroy_ep/send/recv/call/reply/notify/get_notify) + kcmp/capget/capset/sched_setattr/sched_getattr/membarrier。当时 mlock/munlock 曾仅切换 `MmapRegion.locked`；当前用户 memory-lock ABI 已改为 ENOSYS，内部 locked 仅保留给 device/no-free 映射。
 > v36.0 新增 16 个 dispatch 条目 (#238, #282-#296)，覆盖 prlimit64/unshare/process_vm_readv/process_vm_writev/memfd_create/get_robust_list/set_robust_list/mount/umount2/sync_file_range/readahead/ioprio_set/ioprio_get/vmsplice/name_to_handle_at/open_by_handle_at。性能优化：page_cache.recordAccess 接入 ext2/fat32 读路径，AHCI 注册 io_sched 设备。
 > v34.0 新增 20 个 dispatch 条目 (#262-#281)，覆盖 vfork/wait4/sethostname/gethostname/setdomainname/getdomainname/personality/clock_getres/clock_settime/mlockall/munlockall/sched_setaffinity/fallocate/posix_fadvise/statfs/fstatfs/syslog/reboot/chroot/acct。
 > v33.0 新增 20 个 dispatch 条目 (#242-#261)，覆盖 getrandom/clone/fsync/fdatasync/sync/clock_nanosleep/epoll_pwait/getcpu/pipe2/mincore/mlock/munlock/msync/openat/unlinkat/mkdirat/faccessat/readlinkat/fchmodat/renameat2。
@@ -974,8 +974,8 @@ LAPIC Timer 中断
 | 249 | getcpu | 获取当前CPU/NUMA节点 |
 | 250 | pipe2 | 创建管道 (O_CLOEXEC) |
 | 251 | mincore | 检查页面驻留 |
-| 252 | mlock | 锁定页面 |
-| 253 | munlock | 解锁页面 |
+| 252 | mlock | 当前返回 ENOSYS（用户 pinning 未实现） |
+| 253 | munlock | 当前返回 ENOSYS（用户 pinning 未实现） |
 | 254 | msync | 同步内存映射 |
 | 255 | openat | 打开文件 (相对dirfd) |
 | 256 | unlinkat | 删除文件 (相对dirfd) |
@@ -993,8 +993,8 @@ LAPIC Timer 中断
 | 268 | personality | 获取/设置进程personality |
 | 269 | clock_getres | 获取时钟精度 |
 | 270 | clock_settime | 设置时钟 (stub) |
-| 271 | mlockall | 锁定全部内存 (no-op) |
-| 272 | munlockall | 解锁全部内存 (no-op) |
+| 271 | mlockall | 当前返回 ENOSYS（用户 pinning 未实现） |
+| 272 | munlockall | 当前返回 ENOSYS（用户 pinning 未实现） |
 | 273 | sched_setaffinity | 设置CPU亲和性 |
 | 274 | fallocate | 预分配文件空间 (no-op) |
 | 275 | posix_fadvise | 文件访问建议 (no-op) |

@@ -731,6 +731,10 @@ const SchedStats = struct {
   `ENOSYS`，不再成功 no-op 或修改用户 word；完整共享 futex/PI donation 需独立状态
   模型后再实现。`futex_waitv` 同样返回 `ENOSYS`，直到每个 vector entry 都可携带
   address-space-qualified private key；不再将第一个匹配项错误地入队到 bucket。
+- **memory-lock ABI（2026-08）**：用户 `mlock`、`munlock`、`mlockall` 和
+  `munlockall` 当前统一返回 `ENOSYS`，不检查映射也不修改 `MmapRegion.locked`。
+  内核的 `.locked` 仍仅表示 device/no-free 映射内部不参与 swap/reclaim；真实用户页
+  pinning 需要 prefault、swap exclusion、MCL_FUTURE 和 RLIMIT_MEMLOCK 模型后再实现。
 - **v1 限制**：~~CLONE_FILES 真共享 fd 表未实现（创建时复制）~~（6.27 已实现）；~~`__thread`（PT_TLS）未实现~~（6.28 已实现）；线程私有数据仍可用 getspecific；~~detached 线程不 join 时栈描述符泄漏~~（v2 已回收，见下）。
 - **v2（2026-08-13）**：`pthread_detach` + detached 栈惰性回收——退出线程把 TCB+栈块压入无锁死栈链（CAS push），下一次 `pthread_create` 排空 free（退出线程无法安全释放自己仍在运行的栈；压链后以纯寄存器内联 exit syscall，不再触碰本栈）。join-detached 与重复 detach 返回 EINVAL；join 与并发 detach 竞速时复见 detached 即放弃 free（所有权归死栈链，杜绝 double-free）。malloc/free 增加 test-and-set 自旋锁，多线程并发 create/join 不再竞争堆空闲链。验收：hello57 增加 8 detached + double-detach/join-detached EINVAL + 排空触发的断言组。
 - **v2 续（2026-08-13，CLONE_FILES）**：FdTable 从 Task 内嵌（约 57KB/任务）移入静态池（64 槽 + 原子位图），`Task.fd_table` 改为指针；表带原子引用计数，`clone(CLONE_FILES)` 共享指针（跳过复制与 retainSharedResources），`exitTask` 仅在末引用时关闭全部 fd 并归还池。fd 位图操作原子化（allocFdAtLeast 抢位循环 / freeFd 原子 Or），无表级锁；close 与并发使用的描述符内容竞态为记录的弱语义。pthread_create 加传 CLONE_FILES，线程组获得真共享 fd 表与共享 NOFILE 上限。验收：hello57 新增跨线程 fd 共享读 + close 后 EBADF 断言。
