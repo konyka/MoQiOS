@@ -1210,17 +1210,17 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         249 => { // getcpu(cpu*, node*, unused)
             frame.rax = @bitCast(syscallGetcpu(frame.rdi, frame.rsi));
         },
-        // ── v33.3: pipe2 / mincore / mlock / munlock ─────────────────
+        // ── v33.3: pipe2 / mincore / unsupported user mlock ABI ─────────
         250 => { // pipe2(pipefd, flags)
             frame.rax = @bitCast(syscallPipe2(frame.rdi, @truncate(frame.rsi)));
         },
         251 => { // mincore(addr, length, vec)
             frame.rax = @bitCast(syscallMincore(frame.rdi, frame.rsi, frame.rdx));
         },
-        252 => { // mlock(addr, len) — lock pages, prevent swap
+        252 => { // mlock(addr, len) — unsupported user page pinning
             frame.rax = @bitCast(syscallMlock(frame.rdi, frame.rsi));
         },
-        253 => { // munlock(addr, len) — unlock pages
+        253 => { // munlock(addr, len) — unsupported user page pinning
             frame.rax = @bitCast(syscallMunlock(frame.rdi, frame.rsi));
         },
         // ── v33.4: msync ─────────────────────────────────────────────
@@ -1312,10 +1312,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         270 => { // clock_settime(clockid, tp) — set wall clock
             frame.rax = @bitCast(syscallClockSettime(@truncate(frame.rdi), frame.rsi));
         },
-        271 => { // mlockall(flags) — lock all pages
+        271 => { // mlockall(flags) — unsupported user page pinning
             frame.rax = @bitCast(syscallMlockall(@truncate(frame.rdi)));
         },
-        272 => { // munlockall() — unlock all pages
+        272 => { // munlockall() — unsupported user page pinning
             frame.rax = @bitCast(syscallMunlockall());
         },
         273 => { // sched_setaffinity(pid, cpusetsize, mask)
@@ -4719,7 +4719,7 @@ fn strLen(buf: []const u8) usize {
     return i;
 }
 
-// ── v37.0: msync / mlock / posix_fadvise ──────────────────────────────────
+// ── v37.0: msync / unsupported mlock / posix_fadvise ─────────────────────
 
 /// msync(addr, length, flags) — flush dirty pages to backing store.
 /// MS_ASYNC=1: schedule flush, return immediately.
@@ -4738,43 +4738,18 @@ fn syscallMsync(addr: u64, length: u64, flags: u32) i64 {
     return 0;
 }
 
-/// mlock(addr, len) — lock pages in memory, prevent swapping.
-/// Marks overlapping mmap regions as locked.
+/// mlock(addr, len) — user page pinning is not implemented.
 fn syscallMlock(addr: u64, len: u64) i64 {
-    const sched = @import("../../proc/sched.zig");
-    const tm = @import("../../proc/task.zig");
-    const cur_idx = sched.currentTaskIndex() orelse return -1;
-    const cur = tm.getTask(cur_idx) orelse return -1;
-
-    const base = addr & ~@as(u64, 0xFFF);
-    const end = (addr + len + 0xFFF) & ~@as(u64, 0xFFF);
-
-    for (&cur.mmap_regions) |*r| {
-        if (!r.active) continue;
-        const r_end = r.base + r.num_pages * 4096;
-        if (r_end <= base or r.base >= end) continue;
-        r.locked = true;
-    }
-    return 0;
+    _ = addr;
+    _ = len;
+    return if (@import("../../mm/mlock_policy.zig").userMlockUnsupported()) -38 else unreachable;
 }
 
-/// munlock(addr, len) — unlock pages, allow swapping again.
+/// munlock(addr, len) — user page pinning is not implemented.
 fn syscallMunlock(addr: u64, len: u64) i64 {
-    const sched = @import("../../proc/sched.zig");
-    const tm = @import("../../proc/task.zig");
-    const cur_idx = sched.currentTaskIndex() orelse return -1;
-    const cur = tm.getTask(cur_idx) orelse return -1;
-
-    const base = addr & ~@as(u64, 0xFFF);
-    const end = (addr + len + 0xFFF) & ~@as(u64, 0xFFF);
-
-    for (&cur.mmap_regions) |*r| {
-        if (!r.active) continue;
-        const r_end = r.base + r.num_pages * 4096;
-        if (r_end <= base or r.base >= end) continue;
-        r.locked = false;
-    }
-    return 0;
+    _ = addr;
+    _ = len;
+    return if (@import("../../mm/mlock_policy.zig").userMlockUnsupported()) -38 else unreachable;
 }
 
 /// posix_fadvise(fd, offset, len, advice) — provide readahead hints.
@@ -5281,36 +5256,15 @@ fn syscallClockSettime(clockid: u32, tp_ptr: u64) i64 {
     return 0;
 }
 
-/// mlockall(flags) — lock all current and future mmap regions.
-/// MCL_CURRENT=1: lock all current mappings.
-/// MCL_FUTURE=2: lock all future mappings (stored but not enforced per-mmap).
+/// mlockall(flags) — user page pinning is not implemented.
 fn syscallMlockall(flags: u32) i64 {
-    const sched = @import("../../proc/sched.zig");
-    const tm = @import("../../proc/task.zig");
-    const cur_idx = sched.currentTaskIndex() orelse return -1;
-    const cur = tm.getTask(cur_idx) orelse return -1;
-
-    if (flags & 1 != 0) { // MCL_CURRENT: lock all existing regions
-        for (&cur.mmap_regions) |*r| {
-            if (r.active) r.locked = true;
-        }
-    }
-    // MCL_FUTURE is a hint; new mmaps will check this flag.
-    // For now we accept it but don't enforce per-mmap.
-    return 0;
+    _ = flags;
+    return if (@import("../../mm/mlock_policy.zig").userMlockUnsupported()) -38 else unreachable;
 }
 
-/// munlockall() — unlock all mmap regions for current process.
+/// munlockall() — user page pinning is not implemented.
 fn syscallMunlockall() i64 {
-    const sched = @import("../../proc/sched.zig");
-    const tm = @import("../../proc/task.zig");
-    const cur_idx = sched.currentTaskIndex() orelse return -1;
-    const cur = tm.getTask(cur_idx) orelse return -1;
-
-    for (&cur.mmap_regions) |*r| {
-        if (r.active) r.locked = false;
-    }
-    return 0;
+    return if (@import("../../mm/mlock_policy.zig").userMlockUnsupported()) -38 else unreachable;
 }
 
 // ── v38.0: MoQiOS capability syscalls ────────────────────────────────────

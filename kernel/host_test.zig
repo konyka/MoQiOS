@@ -21,6 +21,7 @@ pub const fmt_core = @import("lib/fmt_core.zig");
 pub const str = @import("lib/str.zig");
 pub const aio_policy = @import("fs/aio_policy.zig");
 pub const futex_key = @import("sync/futex_key.zig");
+pub const mlock_policy = @import("mm/mlock_policy.zig");
 pub const cow_pte = @import("mm/cow_pte.zig");
 pub const map_fixed = @import("mm/map_fixed.zig");
 pub const vma_stats = @import("mm/vma_stats.zig");

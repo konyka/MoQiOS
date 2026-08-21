@@ -5,6 +5,7 @@ const kt = @import("kernel_shared");
 const byte_order = kt.byte_order;
 const aio_policy = kt.aio_policy;
 const futex_key = kt.futex_key;
+const mlock_policy = kt.mlock_policy;
 const cow_pte = kt.cow_pte;
 const map_fixed = kt.map_fixed;
 const vma_stats = kt.vma_stats;
@@ -80,6 +81,10 @@ test "private futex keys distinguish roots and exact addresses" {
 
 test "AIO cancellation is unsupported when submissions complete synchronously" {
     try std.testing.expect(aio_policy.cancelUnsupported());
+}
+
+test "user memory locking is explicitly unsupported" {
+    try std.testing.expect(mlock_policy.userMlockUnsupported());
 }
 
 test "private futex operation decoder rejects unsupported flags and PI" {
