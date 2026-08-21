@@ -758,6 +758,7 @@ LAPIC Timer 中断
 ### 6.2 系统调用表 (382 dispatch 条目, max #471)
 
 > v49.0 ext2 符号链接/硬链接: link()#86/symlink()#88从accept升级为真实ext2实现(createHardlink/createSymlink); walkPathInner递归symlink解析(深度限制8级ELOOP); readSymlinkTarget(短链接i_block内联+长链接静态缓冲区)。
+> v50.0 ioprio 进程 ABI: MoQiOS 原生 #292/#293 支持 `IOPRIO_WHO_PROCESS`；每个 Task 保存独立 I/O 优先级（默认 BE/4，fork/clone/spawn 继承），不影响 CPU 调度优先级。RT/BE 接受 data 0..7，IDLE 仅接受 data 0；PGRP/USER 返回 ENOSYS，无效 selector/value 返回 EINVAL，不存在 TID 返回 ESRCH；跨 UID 设置返回 EPERM。当前该状态尚未接入块设备调度。
 > v48.0 性能容量全面提升: page_cache 4x扩容 (MAX_PAGES 256→1024, 4MB缓存/CACHE_SLOTS 128→512/INODE_LIST_SLOTS 64→256/MAX_PREFETCH_TRACK 8→32/dirty_bm参数化); writeback BUFFER_COUNT 128→512; TCP MAX_CONNECTIONS 32→64 (u64 bitmap)/收发缓冲 32KB→64KB。
 > v47.0 COW 正确性修复: handleCowFault 在分配新页后正确 decRef 旧共享页 (修复内存泄漏); 新增 #463-#466 (xattr-at ENOSYS)/#467-#469 (file attr accept)/#470 listns/#471 rseq_slice_yield。**424-471 完全连续无缺口**。
 > v46.0 COW fork 性能优化: fork() 从深拷贝改为 Copy-on-Write (cloneUserPagesCow 共享物理页 + 标记 RO+COW bit, 首次写时由 #PF handler 分配私有页); 新增 #457-#462 (statmount/listmount/lsm_*/mseal)。

@@ -337,8 +337,8 @@
 | 287 | timerfd_gettime | 获取定时器 | Phase1 |
 | 288 | accept4 | 接受连接 (带标志) | Phase2 |
 | 290 | eventfd2 | 创建eventfd | Phase2 |
-| 292 | dup3 | 复制fd (带O_CLOEXEC) | Phase2 |
-| 293 | pipe2 | 创建管道 (带标志) | Phase2 |
+| 292 | ioprio_set | 设置进程 I/O 优先级（MoQiOS 原生 process scope） | Phase2 |
+| 293 | ioprio_get | 获取进程 I/O 优先级（MoQiOS 原生 process scope） | Phase2 |
 | 300 | tcp_connect | TCP socket连接 | Phase 6 |
 | 318 | getrandom | 获取随机数 | Phase1 |
 | 158 | arch_prctl | 架构相关 (ARCH_SET_FS TLS) | Phase3 |
@@ -727,7 +727,7 @@
 - ~~T2: waitid(247) + pidfd_open(434)~~ → waitid委托wait4, pidfd_open验证pid并分配proc_file fd
 - ~~T3: openat2(437)~~ → 增强型open (从open_how struct提取flags委托syscallOpenat)
 - ~~T4: sched_getscheduler(144) + sched_getparam(143)~~ → 返回SCHED_OTHER(0), priority=0
-- ~~T5: ioprio_set(251) + ioprio_get(252)~~ → I/O优先级 no-op/get返回4
+- ~~T5: ioprio_set/get~~ → 已由 v50.0 MoQiOS 原生 #292/#293 进程级 ABI 替代：Task 独立 I/O 优先级，默认 BE/4；PGRP/USER 明确 ENOSYS，尚未接入块设备调度
 - 新增子系统: inotify文件变更通知, pidfd进程文件描述符
 - 编译验证: ✅ 全部通过
 
