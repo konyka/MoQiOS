@@ -324,6 +324,11 @@ H1 再加 `shared` 字段记录 MAP_SHARED），不触碰页表；首次访问�
   `PROT_NONE` 清除 present 访问但保留帧，部分大页覆盖降级为 4 KiB 且保留数据。
   `user/hello74.c` 验收普通 4 KiB 页的相邻写入、恢复、PROT_NONE 子进程故障后恢复、
   无效参数回滚和 fork/COW 隔离。
+- **openat2 严格边界（#320/#437）**：当前 native 与标准别名入口只接受
+  `dirfd=AT_FDCWD`、`pathname` 指向有效已有路径、`open_how{flags=0,mode=0,resolve=0}`
+  且 `size >= 24`；`size < 24`、无效 `dirfd`、非零 `resolve`、未知 `flags` 和无效
+  `how` 指针分别拒绝并返回 `EINVAL`、`EBADF`、`EINVAL`、`EINVAL`、`EFAULT`。成功返回
+  的 fd 必须由调用者关闭。`user/hello75.c` 以 raw syscall 同时验收 #320/#437。
 - **已知限制**：mremap 文件区域仅支持原地增长/收缩（移动返回 ENOMEM）；
   MAP_SHARED 可写页与随后对同一 inode 的 `write()` 系统调用之间不做一致性保证
   （writeFile 会 invalidate 该 inode 的缓存页，未刷出的映射写入可能丢失——请先

@@ -1092,6 +1092,12 @@ the target mapping unchanged. `user/hello74.c` provides raw-ABI coverage for
 ordinary-page protection changes, invalid-argument rollback, PROT_NONE recovery,
 and fork/COW isolation.
 
+The openat2 acceptance boundary is explicit for both native #320 and standard #437:
+only `AT_FDCWD` with an existing path and `open_how{flags=0, mode=0, resolve=0}` at
+`size >= 24` is supported. `size < 24`, an invalid dirfd, nonzero resolve, unknown flags,
+and an invalid how pointer must return `EINVAL`, `EBADF`, `EINVAL`, `EINVAL`, and `EFAULT`;
+`user/hello75.c` exercises each case through raw syscalls and closes every successful fd.
+
 ### 5.2q Review Update: 2026-07-26 (a refused copy must not consume the data it cannot deliver)
 
 5.2p turned a kernel halt into a clean refusal. But the refusal happens *after* the data has been taken, and

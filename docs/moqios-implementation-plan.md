@@ -725,7 +725,9 @@
 
 - ~~T1: inotify(253/254/255)~~ → 文件变更通知子系统 (InotifyInstance/InotifyWatch, add_watch/rm_watch, FdType.inotify)
 - ~~T2: waitid(247) + pidfd_open(434)~~ → waitid委托wait4, pidfd_open验证pid并分配proc_file fd
-- ~~T3: openat2(437)~~ → 增强型open (从open_how struct提取flags委托syscallOpenat)
+- ~~T3: openat2(437)~~ → 严格支持边界：#320/#437 仅接受 `AT_FDCWD`、已有路径、
+  `open_how{flags=0,mode=0,resolve=0}` 和 `size >= 24`；错误参数返回 `EINVAL`/`EBADF`/
+  `EFAULT`，raw syscall 验收见 `user/hello75.c`
 - ~~T4: sched_getscheduler(144) + sched_getparam(143)~~ → 返回SCHED_OTHER(0), priority=0
 - ~~T5: ioprio_set/get~~ → 已由 v50.0 MoQiOS 原生 #292/#293 进程级 ABI 替代：Task 独立 I/O 优先级，默认 BE/4；PGRP/USER 明确 ENOSYS，尚未接入块设备调度
 - 新增子系统: inotify文件变更通知, pidfd进程文件描述符
