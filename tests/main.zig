@@ -6,6 +6,7 @@ const byte_order = kt.byte_order;
 const aio_policy = kt.aio_policy;
 const futex_key = kt.futex_key;
 const mlock_policy = kt.mlock_policy;
+const mprotect_policy = kt.mprotect_policy;
 const cow_pte = kt.cow_pte;
 const map_fixed = kt.map_fixed;
 const vma_stats = kt.vma_stats;
@@ -32,6 +33,22 @@ const virtio_net_queue = kt.virtio_net_queue;
 test "creation metadata masks requested permissions to nine mode bits" {
     const metadata = creation_metadata.decide(null, .regular_file, 0o1764, 0o027, 41, 52).metadata;
     try std.testing.expectEqual(@as(u32, 0o740), metadata.mode);
+}
+
+test "mprotect transaction policy enforces fixed resource caps" {
+    try std.testing.expect(mprotect_policy.supported(0, 0));
+    try std.testing.expect(mprotect_policy.supported(
+        mprotect_policy.MAX_PARTIAL_HUGE_DEMOTIONS,
+        mprotect_policy.MAX_COW_COPIES,
+    ));
+    try std.testing.expect(!mprotect_policy.supported(
+        mprotect_policy.MAX_PARTIAL_HUGE_DEMOTIONS + 1,
+        0,
+    ));
+    try std.testing.expect(!mprotect_policy.supported(
+        0,
+        mprotect_policy.MAX_COW_COPIES + 1,
+    ));
 }
 
 test "rlimit NPROC policy rejects creation at the soft limit" {

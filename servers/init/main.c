@@ -193,6 +193,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello71");  /* mlock ABI rejection and MAP_FIXED independence */
     run_test("hello72");  /* ioprio process ABI and unsupported scopes */
     run_test("hello73");  /* expanded VMA telemetry acceptance */
+    run_test("hello74");  /* raw ABI mprotect transactions and ordinary-page COW */
 
     start_persistent_services();
 

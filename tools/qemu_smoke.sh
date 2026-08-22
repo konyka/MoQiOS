@@ -309,6 +309,9 @@ while [ "$SECONDS" -lt "$deadline" ]; do
          ! grep -q "hello73: FAIL" "$LOG_FILE" &&
          grep -q "hello73: PASS" "$LOG_FILE" &&
          grep -q "hello73 done" "$LOG_FILE" &&
+         ! grep -q "hello74: FAIL" "$LOG_FILE" &&
+         grep -q "hello74: PASS" "$LOG_FILE" &&
+         grep -q "hello74 done" "$LOG_FILE" &&
         grep -q "\[fbcon\] mirror disabled" "$LOG_FILE" &&
         grep -q "\[fbcon\] mirror restored" "$LOG_FILE" &&
         grep -q "\[syslogd\] started" "$LOG_FILE" &&
