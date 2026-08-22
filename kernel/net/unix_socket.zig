@@ -104,6 +104,45 @@ pub fn unixSocket(sock_type: u32) i32 {
     return -24; // EMFILE
 }
 
+pub const UnixSocketPair = struct {
+    first: u32,
+    second: u32,
+};
+
+/// Allocate and connect both endpoints while holding the pool lock.
+pub fn unixSocketPair() i32 {
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+
+    var first: ?u32 = null;
+    var second: ?u32 = null;
+    for (&unix_sockets, 0..) |*sock, i| {
+        if (!sock.active) {
+            if (first == null) {
+                first = @intCast(i);
+            } else {
+                second = @intCast(i);
+                break;
+            }
+        }
+    }
+    const first_idx = first orelse return -24;
+    const second_idx = second orelse return -24;
+    unix_sockets[first_idx] = .{
+        .active = true,
+        .sock_type = SOCK_STREAM,
+        .connected = true,
+        .peer_idx = @intCast(second_idx),
+    };
+    unix_sockets[second_idx] = .{
+        .active = true,
+        .sock_type = SOCK_STREAM,
+        .connected = true,
+        .peer_idx = @intCast(first_idx),
+    };
+    return @as(i32, @intCast(first_idx)) | (@as(i32, @intCast(second_idx)) << 8);
+}
+
 /// Add a cross-process reference (fork/clone fd-table copy).
 pub fn unixRetain(idx: u32) void {
     if (idx >= MAX_UNIX_SOCKETS) return;

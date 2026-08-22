@@ -16,6 +16,7 @@ const netif = @import("netif.zig");
 const ndp = @import("ndp.zig");
 const copy = @import("../mm/copy_from_user.zig");
 const bo = @import("../lib/byte_order.zig");
+const socketpair_policy = @import("socketpair_policy.zig");
 
 const ENOTCONN: i64 = -107;
 const SOCKADDR_UN_PATH_OFFSET: u32 = 2;
@@ -768,24 +769,45 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
 
 /// socketpair(domain, type, protocol, sv_ptr) → 0 or -errno
 pub fn socketpair(domain: u32, sock_type: u32, protocol: u32, sv_ptr: u64) i64 {
-    _ = domain;
-    _ = sock_type;
-    _ = protocol;
-    if (sv_ptr == 0 or sv_ptr >= 0x0000_8000_0000_0000) return -14;
+    const policy_result = socketpair_policy.validate(domain, sock_type, protocol);
+    if (policy_result != 0) return policy_result;
+    if (!copy.validateUserBufferWritable(sv_ptr, 8)) return -14;
 
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    const result = cur.fd_table.createPipe();
-    if (result < 0) return -12;
-    const read_fd: u32 = @intCast(result & 0xFFFF);
-    const write_fd: u32 = @intCast(@as(u64, @intCast(result)) >> 16);
+    const pair_result = net_mod.unix_socket.unixSocketPair();
+    if (pair_result < 0) return if (pair_result == -24) -24 else -12;
+    const first_idx: u32 = @intCast(pair_result & 0xff);
+    const second_idx: u32 = @intCast((@as(u32, @intCast(pair_result)) >> 8) & 0xff);
+    const first_fd = cur.fd_table.allocFd() orelse {
+        net_mod.unix_socket.unixClose(first_idx);
+        net_mod.unix_socket.unixClose(second_idx);
+        return -24;
+    };
+    cur.fd_table.fds[first_fd] = .{
+        .fd_type = .unix_socket,
+        .unix_sock_idx = first_idx,
+        .fd_flags = if ((sock_type & socketpair_policy.SOCK_CLOEXEC) != 0) 1 else 0,
+        .status_flags = sock_type & socketpair_policy.SOCK_NONBLOCK,
+    };
+    const second_fd = cur.fd_table.allocFd() orelse {
+        _ = cur.fd_table.close(first_fd);
+        net_mod.unix_socket.unixClose(second_idx);
+        return -24;
+    };
+    cur.fd_table.fds[second_fd] = .{
+        .fd_type = .unix_socket,
+        .unix_sock_idx = second_idx,
+        .fd_flags = if ((sock_type & socketpair_policy.SOCK_CLOEXEC) != 0) 1 else 0,
+        .status_flags = sock_type & socketpair_policy.SOCK_NONBLOCK,
+    };
     var fds: [8]u8 = undefined;
-    bo.writeU32Le(fds[0..4], read_fd);
-    bo.writeU32Le(fds[4..8], write_fd);
+    bo.writeU32Le(fds[0..4], first_fd);
+    bo.writeU32Le(fds[4..8], second_fd);
     if (copy.copyToUser(@ptrFromInt(sv_ptr), &fds, 8) != 8) {
-        _ = cur.fd_table.close(read_fd);
-        _ = cur.fd_table.close(write_fd);
+        _ = cur.fd_table.close(first_fd);
+        _ = cur.fd_table.close(second_fd);
         return -14;
     }
     return 0;
