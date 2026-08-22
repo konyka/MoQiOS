@@ -195,6 +195,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello73");  /* expanded VMA telemetry acceptance */
     run_test("hello74");  /* raw ABI mprotect transactions and ordinary-page COW */
     run_test("hello75");  /* strict raw openat2 validation for #320 and #437 */
+    run_test("hello76");  /* bounded raw sync_file_range validation for #290 */
 
     start_persistent_services();
 

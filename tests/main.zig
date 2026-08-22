@@ -4,6 +4,7 @@ const kt = @import("kernel_shared");
 
 const byte_order = kt.byte_order;
 const aio_policy = kt.aio_policy;
+const sync_file_range_policy = kt.sync_file_range_policy;
 const openat2_policy = kt.openat2_policy;
 const futex_key = kt.futex_key;
 const mlock_policy = kt.mlock_policy;
@@ -34,6 +35,19 @@ const virtio_net_queue = kt.virtio_net_queue;
 test "creation metadata masks requested permissions to nine mode bits" {
     const metadata = creation_metadata.decide(null, .regular_file, 0o1764, 0o027, 41, 52).metadata;
     try std.testing.expectEqual(@as(u32, 0o740), metadata.mode);
+}
+
+test "sync_file_range policy validates flags and bounded page ranges" {
+    const r = try sync_file_range_policy.validate(4095, 2, sync_file_range_policy.WRITE);
+    try std.testing.expectEqual(@as(u64, 0), r.first_page);
+    try std.testing.expectEqual(@as(u64, 2), r.page_count);
+
+    const empty = try sync_file_range_policy.validate(123, 0, 0);
+    try std.testing.expectEqual(@as(u64, 0), empty.page_count);
+    try std.testing.expectError(error.InvalidFlags, sync_file_range_policy.validate(0, 1, 8));
+    try std.testing.expectError(error.InvalidOffset, sync_file_range_policy.validate(std.math.maxInt(i64) + 1, 0, 0));
+    try std.testing.expectError(error.InvalidOffset, sync_file_range_policy.validate(std.math.maxInt(u64), 2, 0));
+    try std.testing.expectError(error.RangeOverflow, sync_file_range_policy.validate(std.math.maxInt(i64), std.math.maxInt(u64), 0));
 }
 
 test "mprotect transaction policy enforces fixed resource caps" {
