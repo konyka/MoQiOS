@@ -4,6 +4,7 @@ const kt = @import("kernel_shared");
 
 const byte_order = kt.byte_order;
 const aio_policy = kt.aio_policy;
+const readahead_policy = kt.readahead_policy;
 const sync_file_range_policy = kt.sync_file_range_policy;
 const openat2_policy = kt.openat2_policy;
 const futex_key = kt.futex_key;
@@ -48,6 +49,19 @@ test "sync_file_range policy validates flags and bounded page ranges" {
     try std.testing.expectError(error.InvalidOffset, sync_file_range_policy.validate(std.math.maxInt(i64) + 1, 0, 0));
     try std.testing.expectError(error.InvalidOffset, sync_file_range_policy.validate(std.math.maxInt(u64), 2, 0));
     try std.testing.expectError(error.RangeOverflow, sync_file_range_policy.validate(std.math.maxInt(i64), std.math.maxInt(u64), 0));
+}
+
+test "readahead policy plans bounded aligned page ranges" {
+    const range = try readahead_policy.validate(4095, 2);
+    try std.testing.expectEqual(@as(u64, 0), range.first_page);
+    try std.testing.expectEqual(@as(u32, 2), range.page_count);
+
+    const zero = try readahead_policy.validate(123, 0);
+    try std.testing.expectEqual(@as(u32, 0), zero.page_count);
+    try std.testing.expectError(error.InvalidOffset, readahead_policy.validate(std.math.maxInt(u64), 0));
+    try std.testing.expectError(error.InvalidOffset, readahead_policy.validate(std.math.maxInt(u64), 1));
+    try std.testing.expectError(error.TooManyPages, readahead_policy.validate(0, std.math.maxInt(u64)));
+    try std.testing.expectError(error.TooManyPages, readahead_policy.validate(0, readahead_policy.MAX_PAGES * 4096 + 1));
 }
 
 test "mprotect transaction policy enforces fixed resource caps" {
