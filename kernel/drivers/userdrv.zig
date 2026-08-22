@@ -26,9 +26,9 @@ const builtin = @import("builtin");
 const core = @import("userdrv_core.zig");
 const errno = @import("../lib/errno.zig");
 const task_mod = @import("../proc/task.zig");
+const mmap_mod = @import("../mm/mmap.zig");
 const cap_check = @import("../proc/cap_check.zig");
 const pmm = @import("../mm/pmm.zig");
-const mmap_mod = @import("../mm/mmap.zig");
 const dma = @import("../mm/dma.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const serial = @import("../arch/arch.zig").serial;
@@ -514,7 +514,7 @@ pub fn cleanupTask(t: *task_mod.Task, space_pml4: u64) void {
         for (&t.mmap_regions) |*r| {
             if (!r.active or !r.no_free) continue;
             unmapNoFree(space_pml4, r.base, r.num_pages);
-            r.active = false;
+            mmap_mod.untrackRangePub(t, r.base, r.num_pages);
         }
     }
 }
