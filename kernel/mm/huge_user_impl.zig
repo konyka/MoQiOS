@@ -81,7 +81,7 @@ const x86 = struct {
         var blk = addr & ~(huge.HUGE_BYTES - 1);
         while (blk < end) : (blk += huge.HUGE_BYTES) {
             const pde = paging.getPdEntry(cr3, blk) orelse continue;
-            if (!pde.huge_page or !pde.present) continue;
+            if (!pde.huge_page) continue;
             if (blk >= addr and blk + huge.HUGE_BYTES <= end) {
                 if (prot == 0) { // PROT_NONE
                     pde.present = false; // frame preserved, mirrors the 4K path
@@ -95,6 +95,29 @@ const x86 = struct {
                 try paging.demoteHugePage(cr3, blk);
             }
         }
+    }
+
+    fn protectHugeOverlapsReserved(cr3: u64, addr: u64, end: u64, prot: u64, reserved: []const u64) u32 {
+        var used: u32 = 0;
+        var blk = addr & ~(huge.HUGE_BYTES - 1);
+        while (blk < end) : (blk += huge.HUGE_BYTES) {
+            const pde = paging.getPdEntry(cr3, blk) orelse continue;
+            if (!pde.huge_page) continue;
+            if (blk >= addr and blk + huge.HUGE_BYTES <= end) {
+                if (prot == 0) {
+                    pde.present = false;
+                } else {
+                    pde.present = true;
+                    pde.no_execute = (prot & 4) == 0;
+                    pde.user = true;
+                    pde.writable = (prot & 2) != 0;
+                }
+            } else {
+                if (used >= reserved.len) unreachable;
+                if (paging.demoteHugePageReserved(cr3, blk, reserved[used])) used += 1;
+            }
+        }
+        return used;
     }
 
     /// fork/clone COW walks are 4K-only. If `pd[pd_idx]` is a huge PDE,
@@ -137,6 +160,15 @@ const stub = struct {
         _ = virt;
         return pd[pd_idx];
     }
+
+    fn protectHugeOverlapsReserved(cr3: u64, addr: u64, end: u64, prot: u64, reserved: []const u64) u32 {
+        _ = cr3;
+        _ = addr;
+        _ = end;
+        _ = prot;
+        _ = reserved;
+        return 0;
+    }
 };
 
 const impl = switch (builtin.cpu.arch) {
@@ -148,4 +180,5 @@ pub const prescanHuge = impl.prescanHuge;
 pub const mapHugeBlock = impl.mapHugeBlock;
 pub const demoteRange = impl.demoteRange;
 pub const protectHugeOverlaps = impl.protectHugeOverlaps;
+pub const protectHugeOverlapsReserved = impl.protectHugeOverlapsReserved;
 pub const demoteIfHugePde = impl.demoteIfHugePde;

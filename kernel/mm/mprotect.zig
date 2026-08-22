@@ -16,6 +16,7 @@ const hhdm = @import("hhdm.zig");
 const cow_pte = @import("cow_pte.zig");
 const filemap = @import("filemap.zig");
 const huge_impl = @import("huge_user_impl.zig");
+const policy = @import("mprotect_policy.zig");
 
 pub const PROT_NONE: u64 = 0;
 pub const PROT_READ: u64 = 1;
@@ -76,6 +77,9 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     // Mirrors the munmap check in mmap.zig.
     if (addr >= user_space.USER_ADDR_MAX) return EINVAL;
     if (len > user_space.USER_ADDR_MAX - addr) return EINVAL;
+    // The TLB shootdown API takes a u32 page count; reject larger requests
+    // before any preflight work rather than allowing a truncating cast.
+    if (len / paging.PAGE_SIZE > 0xFFFF_FFFF) return ENOMEM;
 
     // 4. Get current task
     const cur_idx = sched.currentTaskIndex() orelse return -1;
@@ -100,19 +104,64 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     }
     if (slots_needed > free_slots) return ENOMEM;
 
-    // 5. Walk page tables for [addr, addr+len) and modify PTE permissions.
-    //
-    // I1: the 4K walk below skips huge PDEs entirely (getPageEntry refuses
-    // them), so handle huge blocks first: a block only PARTIALLY covered is
-    // demoted to 4K pages (the walk then re-flags it); a block FULLY covered
-    // has its PDE rewritten in place and stays huge.
-    huge_impl.protectHugeOverlaps(cur.page_table_phys, addr, addr + len, prot) catch return ENOMEM;
+    // 5. Preflight every resource which commit can consume. Partial huge
+    // demotions need one PT page each; writable COW entries need one data page
+    // each. The fixed arrays and caps make ENOMEM happen before mutation.
+    const end = addr + len;
+    var huge_demotions: u32 = 0;
+    var block = addr & ~(paging.PAGE_2MB - 1);
+    while (block < end) : (block += paging.PAGE_2MB) {
+        const pde = paging.getPdEntry(cur.page_table_phys, block) orelse continue;
+        if (!pde.huge_page) continue;
+        if (!(block >= addr and block + paging.PAGE_2MB <= end)) huge_demotions += 1;
+    }
+
+    var cow_copies: u32 = 0;
+    if ((prot & PROT_WRITE) != 0) {
+        var scan = addr;
+        while (scan < end) : (scan += paging.PAGE_SIZE) {
+            const pte = paging.getProtectionPageEntry(cur.page_table_phys, scan) orelse continue;
+            const raw: u64 = @bitCast(pte.*);
+            if (cow_pte.isCow(raw) and pmm.getRefCount(raw & paging.ADDR_MASK) > 1) cow_copies += 1;
+        }
+    }
+    if (!policy.supported(huge_demotions, cow_copies)) return ENOMEM;
+
+    var reserved_pt: [policy.MAX_PARTIAL_HUGE_DEMOTIONS]u64 = undefined;
+    var reserved_data: [policy.MAX_COW_COPIES]u64 = undefined;
+    var got_pt: u32 = 0;
+    var got_data: u32 = 0;
+    while (got_pt < huge_demotions) : (got_pt += 1) {
+        reserved_pt[got_pt] = pmm.allocPageNoReclaim() orelse {
+            pmm.freePageBatch(reserved_pt[0..got_pt]);
+            return ENOMEM;
+        };
+        const bytes: [*]u8 = @ptrFromInt(hhdm.physToVirt(reserved_pt[got_pt]));
+        @memset(bytes[0..paging.PAGE_SIZE], 0);
+    }
+    while (got_data < cow_copies) : (got_data += 1) {
+        reserved_data[got_data] = pmm.allocPageNoReclaim() orelse {
+            pmm.freePageBatch(reserved_pt[0..got_pt]);
+            pmm.freePageBatch(reserved_data[0..got_data]);
+            return ENOMEM;
+        };
+    }
+
+    // 6. Commit page-table and PTE changes. No operation below allocates or
+    // returns an error after the reservations have succeeded.
+    _ = huge_impl.protectHugeOverlapsReserved(
+        cur.page_table_phys,
+        addr,
+        end,
+        prot,
+        reserved_pt[0..huge_demotions],
+    );
 
     var v = addr;
-    const end = addr + len;
+    var data_used: u32 = 0;
 
     while (v < end) : (v += paging.PAGE_SIZE) {
-        const pte_opt = paging.getPageEntry(cur.page_table_phys, v);
+        const pte_opt = paging.getProtectionPageEntry(cur.page_table_phys, v);
         const pte = pte_opt orelse continue; // skip unmapped pages
 
         if (prot == PROT_NONE) {
@@ -136,7 +185,8 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
                 if (cow_pte.isCow(pte_val)) {
                     const frame = pte_val & paging.ADDR_MASK;
                     if (pmm.getRefCount(frame) > 1) {
-                        const new_phys = pmm.allocPage() orelse return ENOMEM;
+                        const new_phys = reserved_data[data_used];
+                        data_used += 1;
                         const src: [*]const u8 = @ptrFromInt(hhdm.physToVirt(frame));
                         const dst: [*]u8 = @ptrFromInt(hhdm.physToVirt(new_phys));
                         @memcpy(dst[0..paging.PAGE_SIZE], src[0..paging.PAGE_SIZE]);
@@ -159,6 +209,8 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     // when the same address space is mapped on another core (CLONE_VM thread).
     const num_pages: u32 = @intCast((end - addr) / paging.PAGE_SIZE);
     tlb.shootdownRange(addr, num_pages, cur.page_table_phys);
+
+    pmm.freePageBatch(reserved_data[data_used..got_data]);
 
     // H1: update the file regions' prot metadata (splitting on partial
     // overlaps) so later demand faults grant the new permissions.

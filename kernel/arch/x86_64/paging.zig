@@ -284,6 +284,20 @@ pub fn demoteHugePage(pml4_phys: u64, virt: u64) !void {
     }
 }
 
+/// Demote using a page reserved by the caller's transaction. The reserved
+/// page is consumed only when a present huge PDE is actually split.
+pub fn demoteHugePageReserved(pml4_phys: u64, virt: u64, pt_phys: u64) bool {
+    const pde = getPdEntry(pml4_phys, virt) orelse return false;
+    if (!pde.huge_page or pde.getPhysAddr() == 0) return false;
+
+    const pde_raw: u64 = @bitCast(pde.*);
+    const pt: *PageTable = hhdm.physToPtr(PageTable, pt_phys);
+    const out: *[512]u64 = @ptrCast(pt);
+    const new_pde = huge_user.demotePtes(pde_raw, out, pt_phys);
+    pde.* = @bitCast(new_pde);
+    return true;
+}
+
 /// Unmap a virtual page. Returns the physical address of the unmapped page, or null.
 pub fn unmapPage(pml4_phys: u64, virt: u64) ?u64 {
     const pml4_idx = (virt >> 39) & 0x1FF;
@@ -377,6 +391,25 @@ pub fn getPageEntry(pml4_phys: u64, virt: u64) ?*PTE {
     const pt: *PageTable = hhdm.physToPtr(PageTable, pd.entries[pd_idx].getPhysAddr());
     if (!pt.entries[pt_idx].present) return null;
 
+    return &pt.entries[pt_idx];
+}
+
+/// Return a leaf PTE when the page-table structure exists, even if the leaf
+/// is non-present. mprotect uses this to restore PROT_NONE entries that retain
+/// their physical frame and protection metadata.
+pub fn getProtectionPageEntry(pml4_phys: u64, virt: u64) ?*PTE {
+    const pml4_idx = (virt >> 39) & 0x1FF;
+    const pdpt_idx = (virt >> 30) & 0x1FF;
+    const pd_idx = (virt >> 21) & 0x1FF;
+    const pt_idx = (virt >> 12) & 0x1FF;
+
+    const pml4: *PageTable = hhdm.physToPtr(PageTable, pml4_phys);
+    if (!pml4.entries[pml4_idx].present) return null;
+    const pdpt: *PageTable = hhdm.physToPtr(PageTable, pml4.entries[pml4_idx].getPhysAddr());
+    if (!pdpt.entries[pdpt_idx].present or pdpt.entries[pdpt_idx].huge_page) return null;
+    const pd: *PageTable = hhdm.physToPtr(PageTable, pdpt.entries[pdpt_idx].getPhysAddr());
+    if (!pd.entries[pd_idx].present or pd.entries[pd_idx].huge_page) return null;
+    const pt: *PageTable = hhdm.physToPtr(PageTable, pd.entries[pd_idx].getPhysAddr());
     return &pt.entries[pt_idx];
 }
 
