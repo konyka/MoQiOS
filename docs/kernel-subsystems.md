@@ -862,6 +862,13 @@ const FdTable = struct {
 
 **统一 API**: `open` / `read` / `write` / `close` / `lseek` / `listdir` / `mkdir` / `unlink` / `truncate` / `syncAll` / `syncFile`。
 
+**`sync_file_range`（有界范围同步）**：按调用者提供的 `[offset, offset + nbytes)` 范围
+处理回写；`nbytes == 0` 是有界空操作，不隐式扩展为直到文件末尾。范围先做溢出和标志位
+校验，未知 flags 或 `offset + nbytes` 溢出返回 `EINVAL`；无效描述符返回 `EBADF`，不支持
+范围同步的管道/设备描述符返回 `EINVAL`。当前成功路径复用 `syncFile`/writeback 机制，
+`hello76` 覆盖 regular-file/range、零长度、边界错误、错误传播和 fd close；验收只声明这些
+语义，不作 wall-clock 或持久化性能结论。
+
 **挂载管理** (v18.0): `mountFs` / `umountFs`，16 挂载点表，支持 tmpfs/ext2/vfat/proc/ramfs 类型。系统调用 #165 (mount), #166 (umount2)。
 
 **/dev 设备节点**：全部由 devfs 注册表提供（见 3.8），`open` 的 `/dev/` 分支

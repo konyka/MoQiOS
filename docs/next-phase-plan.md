@@ -70,6 +70,11 @@
   映射，成功后才提交 PTE 与保护元数据。`PROT_NONE` 保留帧以支持恢复，部分大页
   覆盖降级为 4 KiB 且保留数据；hello74 覆盖普通页、故障恢复、无效参数回滚和
   fork/COW。后续证据限于可复现的语义/一致性检查，不作 QEMU 墙钟速度声明。
+- `sync_file_range`（hello76）验收以 syscall #290 的有界范围契约为准：只处理
+  `[offset, offset + nbytes)`，`nbytes == 0` 为有界空操作；支持 flags 之外的标志位及
+  `offset + nbytes` 溢出返回 `EINVAL`，无效 fd 返回 `EBADF`，管道/设备等不支持的描述符
+  返回 `EINVAL`。使用既有 ext2 文件和 raw syscall 检查 regular-file/range、错误传播与
+  close；不以 wall-clock、吞吐或持久化性能作结论。
 - ~~2MB 大页（尤其文件映射）与 fork COW OOM 半途回滚~~（review §5.6/§6.8）——
   fork COW 部分 ✅ 6.34（三阶段事务化克隆，两条路径）；文件映射部分 ✅ 6.35
   以 fault-around 预缺页收口：真 2MiB PDE 与零拷贝 MAP_SHARED 设计物理上

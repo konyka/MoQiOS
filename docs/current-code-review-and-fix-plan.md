@@ -1284,6 +1284,21 @@ syscalls must either propagate full-copy failure or document a deliberately best
 | x86 single-/dual-core smoke | Passed | `hello37: PASS (EFAULT/fd/mmap/poll)` and shell marker required. Existing pipe test still transfers all 16 bytes. |
 | riscv64 / aarch64 smoke | Passed | Shared probe and user-mode bring-up contracts unaffected. |
 
+### 5.2u Review Update: 2026-08-22 (hello76 sync_file_range acceptance)
+
+`hello76` adds the raw syscall #290 acceptance gate without changing kernel core code. The contract is
+bounded and semantic: a request covers exactly `[offset, offset + nbytes)`; `nbytes == 0` is a bounded
+no-op; unknown flags and offset-plus-length overflow return `EINVAL`; invalid descriptors return
+`EBADF`; pipe/device descriptors return the implementation's unsupported `EINVAL`. The regular-file
+case uses the existing ext2 fixture, and every opened descriptor is closed. The test deliberately makes
+no wall-clock, throughput, or persistence-performance claim.
+
+| Acceptance item | Evidence |
+|---|---|
+| Valid regular-file range with supported flags | `hello76: PASS` checks syscall #290 over a finite ext2 file range. |
+| Zero length | `hello76` checks `nbytes == 0` returns success without widening the request. |
+| Error propagation and cleanup | `EBADF`, unknown flags, overflow, pipe/device unsupported cases, and all fd closes are checked. |
+
 ### 5.3 Historical Verification
 
 Executed on 2026-06-21:
