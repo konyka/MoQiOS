@@ -1350,8 +1350,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                                     frame.rax = 0;
                                 } else {
                                     frame.rax = @bitCast(@as(i64, -28)); // ENOSPC
+                                }
                             }
-                        }
                         }
                         } else {
                             frame.rax = @bitCast(@as(i64, -9));
@@ -1517,10 +1517,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallSwapoff(frame.rdi));
         },
         320 => { // openat2(dirfd, pathname, how, size) — enhanced open
-            _ = frame.rdi;
-            _ = frame.rdx;
-            _ = frame.r10;
-            frame.rax = @bitCast(file_io_mod.open(frame.rsi, 0));
+            frame.rax = @bitCast(syscallOpenat2(frame.rdi, frame.rsi, frame.rdx, frame.r10));
         },
         321 => { // faccessat2(dirfd, pathname, mode, flags) — enhanced access
             _ = frame.rdi;
@@ -2119,10 +2116,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallCloseRange(@truncate(frame.rdi), @truncate(frame.rsi), @truncate(frame.rdx)));
         },
         437 => { // openat2(dirfd, pathname, how, size) — alias of #320
-            _ = frame.rdi;
-            _ = frame.rdx;
-            _ = frame.r10;
-            frame.rax = @bitCast(file_io_mod.open(frame.rsi, 0));
+            frame.rax = @bitCast(syscallOpenat2(frame.rdi, frame.rsi, frame.rdx, frame.r10));
         },
         438 => { // pidfd_getfd(pidfd, targetfd, flags) — alias of #317 (dup)
             frame.rax = @bitCast(syscallPidfdGetfd(@truncate(frame.rdi), @truncate(frame.rsi), @truncate(frame.rdx)));
@@ -2560,6 +2554,31 @@ fn syscallMmap(frame: *SyscallFrame) void {
 /// Returns fd on success, -1 on failure.
 fn syscallOpen(frame: *SyscallFrame) void {
     frame.rax = @bitCast(file_io_mod.openWithMode(frame.rdi, @truncate(frame.rsi), @truncate(frame.rdx)));
+}
+
+/// openat2(dirfd, pathname, how, size) — validate the fixed open_how prefix
+/// before handing flags and mode to the credential-aware open implementation.
+fn syscallOpenat2(dirfd_raw: u64, pathname: u64, how_ptr: u64, size: u64) i64 {
+    const dirfd: i64 = @as(i64, @as(i32, @bitCast(@as(u32, @truncate(dirfd_raw)))));
+    const policy = @import("../../fs/openat2_policy.zig");
+    if (size != policy.SIZE) return errno.EINVAL;
+
+    const copy = @import("../../mm/copy_from_user.zig");
+    const bo = @import("../../lib/byte_order.zig");
+    var how_buf: [24]u8 = undefined;
+    if (copy.copyFromUser(&how_buf, @ptrFromInt(how_ptr), how_buf.len) != how_buf.len) {
+        return errno.EFAULT;
+    }
+
+    const how: policy.OpenHow = .{
+        .flags = bo.readU64Le(how_buf[0..8]),
+        .mode = bo.readU64Le(how_buf[8..16]),
+        .resolve = bo.readU64Le(how_buf[16..24]),
+    };
+    const validation = policy.validate(dirfd, how, size);
+    if (validation != 0) return validation;
+
+    return file_io_mod.openWithMode(pathname, @truncate(how.flags), @truncate(how.mode));
 }
 
 /// Syscall #10: read(fd, buf, count)
