@@ -67,7 +67,9 @@ static int parse_vma_stats(const char *line, unsigned long *events,
     if (!parse_u64_after(&line, "events", events) || *line++ != ' ') return 0;
     if (!parse_u64_after(&line, "modeled_slots", modeled_slots) || *line++ != ' ') return 0;
     if (!parse_u64_after(&line, "avg_modeled_slots", avg_modeled_slots)) return 0;
-    return *line == '\n' || *line == '\0';
+    /* Newer kernels append visited-slot fields; the legacy contract only
+     * requires the three baseline fields and accepts that extension. */
+    return *line == '\n' || *line == '\0' || *line == ' ';
 }
 
 /* All entries between lo and hi (inclusive) must be page-aligned and
