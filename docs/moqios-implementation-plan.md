@@ -17,6 +17,7 @@
 - **系统调用**: 384 个 dispatch 条目 (max #472, #0-#330 连续 + #424-#471 Linux标准编号完全连续 + #472 arch_prctl), 58 个函数已提取到独立模块
 - **模块提取**: 26 个独立模块文件 (fs/mm/proc/net/sync/arch)
 - **自动化测试**: 29 个 (hello2-hello27, init.S) + 交互式 Shell
+- **新增验收门禁**: `hello78` raw syscall #53 Unix `socketpair`（严格支持边界与双向 I/O）
 - **测试稳定性**: 29/29 通过 (KVM -smp 1)
 - **最大进程数**: 64
 - **每进程文件描述符**: 64
@@ -777,6 +778,17 @@
 - 注释修复: 298→perf_event_open, 227→readahead
 - 标准 Linux x86_64 syscall 表 (0-449) 实现率: 361/361 = 100%
 - 编译验证: ✅ 全部通过
+
+### Unix socketpair 验收门禁 ✅（2026-08-22）
+
+- `hello78` 以 raw syscall #53 验证严格边界：仅支持
+  `AF_UNIX` + `SOCK_STREAM` + protocol `0`，成功返回一对 pipe-backed fd，并通过
+  `write`/`read` 检查双向传输。
+- 非法 domain/type/protocol 必须返回 `EINVAL`；坏 `sv` 指针必须返回 `EFAULT`；失败路径
+  不得分配 fd，成功返回的两个 fd 均显式 close。
+- 接线位置：`build.zig`、PID 1 的 `servers/init/main.c`、`tools/qemu_run.sh` 和
+  `tools/qemu_smoke.sh`。该门禁不修改 kernel core，也不作完整 Unix socket 兼容性或
+  wall-clock/吞吐/持久化性能声明。
 
 ### 编号修正补丁 v17.1 ✅
 

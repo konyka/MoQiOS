@@ -1355,6 +1355,12 @@ e1000 (中断驱动) / virtio-net (Virtqueue)
 - @memcpy 批量环形缓冲区 I/O：ringWrite/ringRead 处理环形缓冲区边界，逐字节循环替换为 2 段 @memcpy（STREAM/DGRAM 读写各 2 处）
 - 阻塞 I/O：read_waiters/write_waiters 等待队列
 - 系统调用: socket(AF_UNIX) / socketpair
+- **`socketpair` 验收边界（hello78）**：raw syscall #53 只声明支持
+  `AF_UNIX` + `SOCK_STREAM` + protocol `0`，返回一对 pipe-backed descriptors，且两端可用
+  `write`/`read` 双向传输。其他 domain/type/protocol 返回 `EINVAL`；空或无效 `sv` 指针返回
+  `EFAULT`，失败路径不得留下 fd；成功返回的两个 fd 都必须由调用者 `close`。这份验收只证明
+  syscall 参数、数据方向和资源清理语义，不宣称完整 Unix-domain socket 兼容性、wall-clock
+  性能、吞吐或持久化行为。
 
 ---
 

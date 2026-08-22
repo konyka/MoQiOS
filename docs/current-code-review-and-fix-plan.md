@@ -1304,6 +1304,21 @@ no wall-clock, throughput, or persistence-performance claim.
 | Zero length | `hello76` checks `nbytes == 0` returns success without widening the request. |
 | Error propagation and cleanup | `EBADF`, unknown flags, overflow, pipe/device unsupported cases, and all fd closes are checked. |
 
+### 5.2v Review Update: 2026-08-22 (hello78 socketpair acceptance)
+
+`hello78` adds the raw syscall #53 acceptance gate without changing kernel core code. The supported
+boundary is deliberately narrow: `AF_UNIX` + `SOCK_STREAM` + protocol `0`, with a returned pair that
+supports bidirectional `write`/`read`. Invalid domain, type, or protocol must return `EINVAL`; a bad
+`sv` pointer must return `EFAULT`; rejected calls must not leak descriptors; and both successful fds
+must be closed. This is semantic syscall evidence only and makes no wall-clock, throughput,
+compatibility-breadth, or persistence-performance claim.
+
+| Acceptance item | Evidence |
+|---|---|
+| Supported pair | `hello78: PASS` checks raw #53 and both directions of byte-stream transfer. |
+| Validation | Invalid domain/type/protocol return `EINVAL`; bad `sv` returns `EFAULT`. |
+| Cleanup | Rejected calls are checked for no fd allocation, and both returned descriptors are closed. |
+
 ### 5.3 Historical Verification
 
 Executed on 2026-06-21:

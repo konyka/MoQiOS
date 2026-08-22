@@ -79,6 +79,11 @@
   regular-file 只预取 `[offset, offset + count * 4096)`，`count == 0` 返回 0 且不改变 fd
   offset；无效 fd 返回 `EBADF`，管道/设备返回 `EINVAL`，范围溢出或超过 32 页返回 `EINVAL`。
   后续 read 必须保持正确；不作 wall-clock、吞吐或命中率声明。
+- `socketpair`（hello78）验收以 raw syscall #53 的严格支持边界为准：只支持
+  `AF_UNIX`/`SOCK_STREAM`/protocol `0`，成功返回一对可双向 `write`/`read` 的 pipe-backed fd；
+  非法 domain/type/protocol 返回 `EINVAL`，坏 `sv` 指针返回 `EFAULT`，失败不得泄漏 fd，成功
+  的两个 fd 都关闭。证据限于 syscall 参数校验、双向数据语义和资源清理，不作完整 Unix
+  socket 兼容性、wall-clock、吞吐或持久化性能声明。
 - ~~2MB 大页（尤其文件映射）与 fork COW OOM 半途回滚~~（review §5.6/§6.8）——
   fork COW 部分 ✅ 6.34（三阶段事务化克隆，两条路径）；文件映射部分 ✅ 6.35
   以 fault-around 预缺页收口：真 2MiB PDE 与零拷贝 MAP_SHARED 设计物理上
