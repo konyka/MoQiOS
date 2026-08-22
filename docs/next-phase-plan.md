@@ -65,6 +65,11 @@
   一致性（见 `vma-profiling.md`）；继续先以扫描压力和可重复 QEMU 前后数据证明
   需要，再决定是否替换，不能仅因 64 槽容量或 telemetry 单独提前重构，也不宣称
   wall-clock speedup（review §5.2g/§5.2t）。
+- `mprotect` 验收以原子事务语义为准：先检查对齐、长度、保护位、用户范围和完整
+  映射覆盖，并预留 VMA 分裂及页表资源；预检失败返回 `EINVAL`/`ENOMEM` 且不改变
+  映射，成功后才提交 PTE 与保护元数据。`PROT_NONE` 保留帧以支持恢复，部分大页
+  覆盖降级为 4 KiB 且保留数据；hello74 覆盖普通页、故障恢复、无效参数回滚和
+  fork/COW。后续证据限于可复现的语义/一致性检查，不作 QEMU 墙钟速度声明。
 - ~~2MB 大页（尤其文件映射）与 fork COW OOM 半途回滚~~（review §5.6/§6.8）——
   fork COW 部分 ✅ 6.34（三阶段事务化克隆，两条路径）；文件映射部分 ✅ 6.35
   以 fault-around 预缺页收口：真 2MiB PDE 与零拷贝 MAP_SHARED 设计物理上

@@ -1086,9 +1086,11 @@ own user-mode store to the page must raise `SIGSEGV` (139), otherwise the later 
 `sharedPte` contract as a pure function on all three architectures; with the read-only guard removed it
 reports `FAILED: read-only page was altered` and the smoke fails.
 
-Left open: `mprotect` is still unimplemented (listed P2 on the plan), so a program cannot tighten or relax
-segment permissions at runtime. Now that text and rodata are genuinely read-only, that becomes a prerequisite
-for any future JIT or self-modifying code. 5.2q first finishes what 5.2p started.
+`mprotect` is implemented at the current HEAD. Its validation, resource preflight,
+and page-table/VMA mutation form an atomic transaction: rejected requests leave
+the target mapping unchanged. `user/hello74.c` provides raw-ABI coverage for
+ordinary-page protection changes, invalid-argument rollback, PROT_NONE recovery,
+and fork/COW isolation.
 
 ### 5.2q Review Update: 2026-07-26 (a refused copy must not consume the data it cannot deliver)
 

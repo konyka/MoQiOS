@@ -317,7 +317,13 @@ H1 再加 `shared` 字段记录 MAP_SHARED），不触碰页表；首次访问�
   mprotect 在改 PTE 之外同步更新文件区域的 prot 元数据（`filemap.planProtUpdate`
   分类 cover/head/tail/middle，部分覆盖时拆区域、ext2 片各补一次 retain，拆前先做
   槽位容量检查）；对获得 PROT_WRITE 的 MAP_SHARED ext2/fat32 区域，顺手把已缓存页
-  markDirty——这些页此前以只读缺入，此后可写但不再经过缺页路径。
+   markDirty——这些页此前以只读缺入，此后可写但不再经过缺页路径。
+- **mprotect 原子事务契约**：先验证地址对齐、长度、保护位、用户边界和完整范围
+  覆盖，再预留 VMA 分裂槽位及页表/数据页资源；预检失败返回 `-EINVAL` 或
+  `-ENOMEM`，且不改变目标映射。预检成功后才提交 PTE 与保护元数据更新；
+  `PROT_NONE` 清除 present 访问但保留帧，部分大页覆盖降级为 4 KiB 且保留数据。
+  `user/hello74.c` 验收普通 4 KiB 页的相邻写入、恢复、PROT_NONE 子进程故障后恢复、
+  无效参数回滚和 fork/COW 隔离。
 - **已知限制**：mremap 文件区域仅支持原地增长/收缩（移动返回 ENOMEM）；
   MAP_SHARED 可写页与随后对同一 inode 的 `write()` 系统调用之间不做一致性保证
   （writeFile 会 invalidate 该 inode 的缓存页，未刷出的映射写入可能丢失——请先
