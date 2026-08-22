@@ -337,6 +337,7 @@
 | 287 | timerfd_gettime | 获取定时器 | Phase1 |
 | 288 | accept4 | 接受连接 (带标志) | Phase2 |
 | 290 | eventfd2 | 创建eventfd | Phase2 |
+| 291 | readahead | ext2/FAT32 regular-file bounded best-effort page prefetch | Phase2 |
 | 292 | ioprio_set | 设置进程 I/O 优先级（MoQiOS 原生 process scope） | Phase2 |
 | 293 | ioprio_get | 获取进程 I/O 优先级（MoQiOS 原生 process scope） | Phase2 |
 | 300 | tcp_connect | TCP socket连接 | Phase 6 |

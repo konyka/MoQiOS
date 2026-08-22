@@ -869,6 +869,12 @@ const FdTable = struct {
 `hello76` 覆盖 regular-file/range、零长度、边界错误、错误传播和 fd close；验收只声明这些
 语义，不作 wall-clock 或持久化性能结论。
 
+**`readahead`（有界 ext2/FAT32 预取）**：syscall #291 只接受 ext2 或 FAT32 regular-file 描述符，按
+`[offset, offset + count * 4096)` 做有界、best-effort page-cache 预取；`count == 0` 返回
+成功且不改变 fd offset。offset/字节范围溢出、超过 32 页、无效 fd 返回 `EINVAL`/`EBADF`，
+管道和设备等不支持的描述符返回 `EINVAL`。该契约只保证验证与后续 read 的语义正确性，
+不作 wall-clock、吞吐或预取命中率结论。
+
 **挂载管理** (v18.0): `mountFs` / `umountFs`，16 挂载点表，支持 tmpfs/ext2/vfat/proc/ramfs 类型。系统调用 #165 (mount), #166 (umount2)。
 
 **/dev 设备节点**：全部由 devfs 注册表提供（见 3.8），`open` 的 `/dev/` 分支

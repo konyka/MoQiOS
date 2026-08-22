@@ -338,6 +338,11 @@ Executed on 2026-07-10:
 The new smoke gates are now executable, but they prove the repository is not yet runtime-clean.
 Do not treat the passing host builds as proof of boot-to-shell health until `zig build smoke` passes.
 
+ The `hello77` gate records syscall #291 as an ext2/FAT32, bounded, best-effort readahead contract:
+ only regular ext2 or FAT32 files are eligible, `count` is limited to 32 pages, overflow and unsupported
+descriptor types return `EINVAL`, invalid descriptors return `EBADF`, and the call does not move
+the fd offset. Acceptance checks subsequent read correctness; it makes no wall-clock claim.
+
 ### 5.1 Runtime Fixes From 2026-07-10 Smoke Testing
 
 The new single-core smoke gate exposed a runtime hang at `spawn("hello2")`. The fix set is:

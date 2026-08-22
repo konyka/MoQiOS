@@ -73,8 +73,12 @@
 - `sync_file_range`（hello76）验收以 syscall #290 的有界范围契约为准：只处理
   `[offset, offset + nbytes)`，`nbytes == 0` 为有界空操作；支持 flags 之外的标志位及
   `offset + nbytes` 溢出返回 `EINVAL`，无效 fd 返回 `EBADF`，管道/设备等不支持的描述符
-  返回 `EINVAL`。使用既有 ext2 文件和 raw syscall 检查 regular-file/range、错误传播与
-  close；不以 wall-clock、吞吐或持久化性能作结论。
+ 返回 `EINVAL`。使用既有 ext2 文件和 raw syscall 检查 regular-file/range、错误传播与
+ close；不以 wall-clock、吞吐或持久化性能作结论。
+- `readahead`（hello77）验收以 syscall #291 的 ext2/FAT32 bounded best-effort 契约为准：
+  regular-file 只预取 `[offset, offset + count * 4096)`，`count == 0` 返回 0 且不改变 fd
+  offset；无效 fd 返回 `EBADF`，管道/设备返回 `EINVAL`，范围溢出或超过 32 页返回 `EINVAL`。
+  后续 read 必须保持正确；不作 wall-clock、吞吐或命中率声明。
 - ~~2MB 大页（尤其文件映射）与 fork COW OOM 半途回滚~~（review §5.6/§6.8）——
   fork COW 部分 ✅ 6.34（三阶段事务化克隆，两条路径）；文件映射部分 ✅ 6.35
   以 fault-around 预缺页收口：真 2MiB PDE 与零拷贝 MAP_SHARED 设计物理上
