@@ -61,9 +61,10 @@
   且 tryMerge 确有缓冲区越界缺陷，整层删除）——真机存储前提已具备。
 - ~~tmpfs 单文件 256 KiB 上限扩容~~（✅ 6.29 完成：一级间接页，64 直辖 + 512 间接 = 576 页 / 2.25 MiB，hello42 大文件验收；user-space §7.1）。
 - `mmap_regions` 固定 64 条目 → 动态 VMA 树：已新增 `/proc/vma_stats`、纯模型
-  host 测试与 hello67 碎片化基线（见 `vma-profiling.md`）；继续先以扫描压力和
-  可重复 QEMU 前后数据证明需要，再决定是否替换，不能仅因 64 槽容量提前重构
-  （review §5.2g/§5.2t）。
+  host 测试与 hello67 碎片化基线，并由 hello73 验收 modeled/visited telemetry
+  一致性（见 `vma-profiling.md`）；继续先以扫描压力和可重复 QEMU 前后数据证明
+  需要，再决定是否替换，不能仅因 64 槽容量或 telemetry 单独提前重构，也不宣称
+  wall-clock speedup（review §5.2g/§5.2t）。
 - ~~2MB 大页（尤其文件映射）与 fork COW OOM 半途回滚~~（review §5.6/§6.8）——
   fork COW 部分 ✅ 6.34（三阶段事务化克隆，两条路径）；文件映射部分 ✅ 6.35
   以 fault-around 预缺页收口：真 2MiB PDE 与零拷贝 MAP_SHARED 设计物理上

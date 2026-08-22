@@ -24,12 +24,14 @@ the statistics do not participate in allocation, placement, or correctness.
 `/proc/vma_stats` exposes a single line:
 
 ```
-events=<n> modeled_slots=<n> avg_modeled_slots=<n>
+events=<n> modeled_slots=<n> avg_modeled_slots=<n> visited_slots=<n> avg_visited_slots=<n>
 ```
 
 The values are global boot-session diagnostics. They include all processes and
 all prior activity, so acceptance asserts invariants rather than fragile exact
-counter deltas. `avg_slots` must remain `64` for the current representation.
+counter deltas. `avg_modeled_slots` must remain `64` for the current
+representation. `visited_slots` must be positive and no greater than
+`modeled_slots`; `avg_visited_slots` must be no greater than `64`.
 
 ## Runtime Baseline
 
@@ -54,6 +56,12 @@ fixed scan cost under fragmentation without using unstable QEMU wall-clock
 numbers. For wall-clock comparisons, use `tools/observe_test_duration.py` with
 the same QEMU scenario before and after a proposed implementation change.
 
+`hello73` repeats the hello67 fragmentation workload and accepts the expanded
+telemetry contract. It requires `events > 0`, `modeled_slots >= events * 64`,
+`avg_modeled_slots == 64`, `visited_slots > 0`, `visited_slots <= modeled_slots`,
+and `avg_visited_slots <= 64`, then reports all five counters. These are
+conservative consistency checks, not evidence of a wall-clock speedup.
+
 ## Decision Rule
 
 Do not replace the table solely because it has 64 entries. A dynamic VMA tree
@@ -62,7 +70,8 @@ is justified only when repeatable fragmented workloads show both:
 1. sustained high scan pressure in `/proc/vma_stats` (the fixed 64-slot cost
    dominates the relevant mmap/mprotect/mremap workload); and
 2. a measured before/after QEMU scenario improvement that exceeds instrumentation
-   noise while preserving the host and SMP smoke gates.
+   noise while preserving the host and SMP smoke gates; telemetry alone is not
+   sufficient, and hello67/hello73 make no wall-clock speedup claim.
 
 Until then, the fixed table has predictable memory use, cache locality, and a
 small, bounded worst-case scan. Any future tree design must retain the current

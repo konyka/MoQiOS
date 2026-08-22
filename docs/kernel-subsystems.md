@@ -232,7 +232,8 @@ const AddressSpace = struct {
 - 运行时覆盖: `hello30`（brk 增长/清零/收缩 + 匿名 mmap + hint 让位），
   冒烟门禁标记 `hello30: brk/mmap PASS`。
 - VMA 扫描基线：`/proc/vma_stats` 输出 instrumented mmap 元数据事件的固定 64 槽
-  模型次数、模型槽位总数及平均模型槽位；`hello67` 用 40 页碎片化映射验证该测量契约。计数器是
+  模型次数、模型槽位总数、平均模型槽位、实际访问槽位总数及平均访问槽位；`hello67` 用 40 页碎片化映射验证历史
+  模型契约，`hello73` 验收扩展 telemetry 的保守不变量。计数器是
   无锁诊断原子，不读取时钟、不改变映射决策；完整的动态 VMA 树替换决策见
   `vma-profiling.md`。
 - x86 RSS 观测：`/proc/<pid>/rss` 只读统计 target task page table 内 present+user
