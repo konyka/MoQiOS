@@ -9,6 +9,7 @@ const mlock_policy = kt.mlock_policy;
 const cow_pte = kt.cow_pte;
 const map_fixed = kt.map_fixed;
 const vma_stats = kt.vma_stats;
+const vma_runtime_stats = kt.vma_runtime_stats;
 const rss_stats = kt.rss_stats;
 const errno = kt.errno;
 const eth = kt.eth;
@@ -149,6 +150,18 @@ test "fixed VMA table statistics report deterministic scan cost" {
     try std.testing.expectEqual(@as(u64, 64), vma_stats.avgCost(2, 128));
     try std.testing.expectEqual(@as(u64, 0), vma_stats.avgCost(0, 0));
     try std.testing.expectEqual(@as(u64, 0), vma_stats.avgCost(0, 100));
+}
+
+test "VMA occupancy scan visits only active bitmap slots" {
+    try std.testing.expectEqual(@as(u64, 0), vma_stats.visitedSlots(0));
+    try std.testing.expectEqual(@as(u64, 64), vma_stats.visitedSlots(~@as(u64, 0)));
+    try std.testing.expectEqual(@as(u64, 2), vma_stats.visitedSlots((@as(u64, 1) << 3) | (@as(u64, 1) << 61)));
+    try std.testing.expect(vma_stats.visitedSlots(0xA5A5) <= vma_stats.MAX_REGIONS);
+    const before = vma_runtime_stats.snapshot();
+    vma_runtime_stats.recordScan(0x3);
+    const after = vma_runtime_stats.snapshot();
+    try std.testing.expectEqual(before.scans + 1, after.scans);
+    try std.testing.expectEqual(before.visited_slots + 2, after.visited_slots);
 }
 
 test "resident RSS telemetry page model counts only present user leaves" {

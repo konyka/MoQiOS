@@ -350,6 +350,10 @@ fn generateVmaStats(buf: [*]u8, max_len: u32) u32 {
     pos = appendDec(buf, pos, max_len, stats.slots);
     pos = appendStr(buf, pos, max_len, " avg_modeled_slots=");
     pos = appendDec(buf, pos, max_len, @import("../mm/vma_stats.zig").avgCost(stats.scans, stats.slots));
+    pos = appendStr(buf, pos, max_len, " visited_slots=");
+    pos = appendDec(buf, pos, max_len, stats.visited_slots);
+    pos = appendStr(buf, pos, max_len, " avg_visited_slots=");
+    pos = appendDec(buf, pos, max_len, @import("../mm/vma_stats.zig").avgCost(stats.scans, stats.visited_slots));
     return appendChar(buf, pos, max_len, '\n');
 }
 
