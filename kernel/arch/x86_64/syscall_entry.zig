@@ -1428,7 +1428,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallSyncFileRange(@truncate(frame.rdi), frame.rsi, frame.rdx, @truncate(frame.r10)));
         },
         291 => { // readahead(fd, offset, count) — page cache prefetch
-            frame.rax = @bitCast(syscallReadahead(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));
+            frame.rax = @bitCast(syscallReadahead(@truncate(frame.rdi), frame.rsi, frame.rdx));
         },
         292 => { // ioprio_set(which, who, ioprio) — set I/O scheduling priority
             frame.rax = @bitCast(syscallIoprioSet(@truncate(frame.rdi), @truncate(frame.rsi), @truncate(frame.rdx)));
@@ -4590,18 +4590,36 @@ fn syscallSyncFileRange(fd: u32, offset: u64, nbytes: u64, flags: u32) i64 {
 }
 
 /// readahead(fd, offset, count) — prefetch file pages into page cache.
-/// Simplified: validate fd and accept. Full prefetch requires ext2 block-level readahead.
-fn syscallReadahead(fd: u32, offset: u64, count: u32) i64 {
-    _ = offset;
-    _ = count;
-
+/// Valid requests are advisory; filesystem prefetch failures are intentionally silent.
+fn syscallReadahead(fd: u32, offset: u64, count: u64) i64 {
     const sched_mod = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
+    const policy = @import("../../fs/readahead_policy.zig");
+    const ext2_mod = @import("../../fs/ext2.zig");
+    const fat32_mod = @import("../../fs/fat32.zig");
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = tm.getTask(cur_idx) orelse return -1;
-    if (fd >= vfs_mod.MAX_FDS or t.fd_table.fds[fd].fd_type == .none) return -9;
-
-    // Accept — page cache readahead will happen naturally on next read()
+    if (fd >= vfs_mod.MAX_FDS) return -9;
+    const desc = &t.fd_table.fds[fd];
+    if (desc.fd_type == .none) return -9;
+    if (desc.fd_type != .ext2_file and desc.fd_type != .fat32_file) return -22;
+    const range = policy.validate(offset, count) catch return -22;
+    if (range.page_count == 0) return 0;
+    const file_size = switch (desc.fd_type) {
+        .ext2_file => ext2_mod.getFileSize(desc.ext2_file_idx),
+        .fat32_file => fat32_mod.getFileSize(desc.fat32_file_idx),
+        else => unreachable,
+    };
+    if (offset >= file_size) return 0;
+    const end = @min(offset + @as(u64, count), file_size);
+    const clipped = policy.validate(offset, end - offset) catch return -22;
+    if (clipped.page_count != 0) {
+        switch (desc.fd_type) {
+            .ext2_file => ext2_mod.prefetchFilePages(desc.ext2_file_idx, clipped.first_page, clipped.page_count),
+            .fat32_file => fat32_mod.prefetchFilePages(desc.fat32_file_idx, clipped.first_page, clipped.page_count, &desc.readahead_state),
+            else => unreachable,
+        }
+    }
     return 0;
 }
 

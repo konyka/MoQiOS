@@ -895,6 +895,17 @@ fn prefetchPages(inode: *const Ext2Inode, inode_id: u64, start_page: u64, count:
     }
 }
 
+/// Best-effort page prefetch for an already-open ext2 regular file.
+/// The descriptor offset is not involved or modified.
+pub fn prefetchFilePages(file_idx: u32, start_page: u64, count: u32) void {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (file_idx >= open_count) return;
+    const f = &open_files[file_idx];
+    if (f.inode_num == 0) return;
+    prefetchPages(&f.inode, 0x3000_0000_0000_0000 + @as(u64, f.inode_num), start_page, count);
+}
+
 pub fn getInodeNum(file_idx: u32) u32 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);

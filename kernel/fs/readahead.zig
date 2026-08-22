@@ -86,16 +86,27 @@ fn insertCachedBlock(state: *ReadaheadState, block_num: u64, data: [*]const u8, 
             return true;
         }
     }
-    if (state.cache[0].valid and state.cache[0].data != 0) pmm.freePage(state.cache[0].data);
+    const replacement = pmm.allocPage() orelse return false;
     var i: usize = 0;
     while (i < MAX_WINDOW - 1) : (i += 1) state.cache[i] = state.cache[i + 1];
-    const page = pmm.allocPage() orelse return false;
-    const virt: u64 = hhdm.physToVirt(page);
+    if (state.cache[MAX_WINDOW - 1].valid and state.cache[MAX_WINDOW - 1].data != 0) pmm.freePage(state.cache[MAX_WINDOW - 1].data);
+    const virt: u64 = hhdm.physToVirt(replacement);
     const dst: [*]u8 = @ptrFromInt(virt);
     const copy_len = @min(block_size, @as(u32, 4096));
     @memcpy(dst[0..copy_len], data[0..copy_len]);
-    state.cache[MAX_WINDOW - 1] = .{ .block_num = block_num, .data = page, .valid = true };
+    state.cache[MAX_WINDOW - 1] = .{ .block_num = block_num, .data = replacement, .valid = true };
     return true;
+}
+/// Add one already-read block to the bounded per-descriptor cache.
+/// The caller owns the source buffer; this function copies it into a cache page.
+pub fn cacheBlock(state: *ReadaheadState, block_num: u64, data: [*]const u8, block_size: u32) bool {
+    const flags = ra_lock.acquire();
+    defer ra_lock.release(flags);
+    if (!state.initialized) return false;
+    for (0..MAX_WINDOW) |i| {
+        if (state.cache[i].valid and state.cache[i].block_num == block_num) return true;
+    }
+    return insertCachedBlock(state, block_num, data, block_size);
 }
 pub const FsReadBlockFn = *const fn (u64, [*]u8) bool;
 pub fn checkAndPrefetch(state: *ReadaheadState, current_offset: u64, block_size: u32, fs_read_fn: FsReadBlockFn) void {

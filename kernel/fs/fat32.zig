@@ -520,6 +520,27 @@ pub fn getFileSize(idx: u32) u64 {
     return @intCast(files[idx].size);
 }
 
+/// Best-effort prefetch of aligned 4 KiB pages into a descriptor's readahead
+/// cache. This uses FAT32 file mapping rather than treating pages as raw LBAs.
+pub fn prefetchFilePages(file_idx: u32, start_page: u64, count: u32, state: *@import("readahead.zig").ReadaheadState) void {
+    if (count == 0 or file_idx >= file_count) return;
+    const file_size = getFileSize(file_idx);
+    var page = start_page;
+    var remaining = count;
+    while (remaining > 0) : ({
+        page += 1;
+        remaining -= 1;
+    }) {
+        const offset = page * 4096;
+        if (offset >= file_size or offset > 0xFFFF_FFFF) break;
+        var data: [4096]u8 = undefined;
+        const want: u32 = @intCast(@min(@as(u64, 4096), file_size - offset));
+        const n = readFile(file_idx, @intCast(offset), &data, want);
+        if (n <= 0) break;
+        if (!@import("readahead.zig").cacheBlock(state, page, &data, @intCast(n))) break;
+    }
+}
+
 pub fn getFileCount() u32 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
