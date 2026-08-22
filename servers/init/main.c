@@ -194,6 +194,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello72");  /* ioprio process ABI and unsupported scopes */
     run_test("hello73");  /* expanded VMA telemetry acceptance */
     run_test("hello74");  /* raw ABI mprotect transactions and ordinary-page COW */
+    run_test("hello75");  /* strict raw openat2 validation for #320 and #437 */
 
     start_persistent_services();
 

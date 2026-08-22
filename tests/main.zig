@@ -4,6 +4,7 @@ const kt = @import("kernel_shared");
 
 const byte_order = kt.byte_order;
 const aio_policy = kt.aio_policy;
+const openat2_policy = kt.openat2_policy;
 const futex_key = kt.futex_key;
 const mlock_policy = kt.mlock_policy;
 const mprotect_policy = kt.mprotect_policy;
@@ -48,6 +49,49 @@ test "mprotect transaction policy enforces fixed resource caps" {
     try std.testing.expect(!mprotect_policy.supported(
         0,
         mprotect_policy.MAX_COW_COPIES + 1,
+    ));
+}
+
+test "openat2 policy validates size, dirfd, flags, mode, and resolve" {
+    try std.testing.expectEqual(@as(i64, 0), openat2_policy.validate(
+        openat2_policy.AT_FDCWD,
+        .{ .flags = openat2_policy.O_CREAT, .mode = 0o644, .resolve = 0 },
+        openat2_policy.SIZE,
+    ));
+    try std.testing.expectEqual(kt.errno.EINVAL, openat2_policy.validate(
+        0,
+        .{ .flags = 0, .mode = 0, .resolve = 0 },
+        openat2_policy.SIZE + 8,
+    ));
+    try std.testing.expectEqual(kt.errno.EINVAL, openat2_policy.validate(
+        openat2_policy.AT_FDCWD,
+        .{ .flags = 0, .mode = 0, .resolve = 0 },
+        openat2_policy.SIZE - 1,
+    ));
+    try std.testing.expectEqual(kt.errno.EBADF, openat2_policy.validate(
+        3,
+        .{ .flags = 0, .mode = 0, .resolve = 0 },
+        openat2_policy.SIZE,
+    ));
+    try std.testing.expectEqual(kt.errno.EINVAL, openat2_policy.validate(
+        0,
+        .{ .flags = openat2_policy.SUPPORTED_FLAGS | (1 << 40), .mode = 0, .resolve = 0 },
+        openat2_policy.SIZE,
+    ));
+    try std.testing.expectEqual(kt.errno.EINVAL, openat2_policy.validate(
+        0,
+        .{ .flags = 0, .mode = 0o1000, .resolve = 0 },
+        openat2_policy.SIZE,
+    ));
+    try std.testing.expectEqual(kt.errno.EINVAL, openat2_policy.validate(
+        0,
+        .{ .flags = 0, .mode = 0o644, .resolve = 0 },
+        openat2_policy.SIZE,
+    ));
+    try std.testing.expectEqual(kt.errno.EINVAL, openat2_policy.validate(
+        0,
+        .{ .flags = 0, .mode = 0, .resolve = 1 },
+        openat2_policy.SIZE,
     ));
 }
 
@@ -361,6 +405,23 @@ test "creation syscall dispatch forwards mode registers" {
         "fn syscallConnect(frame: *SyscallFrame) void",
         "dir_ops_mod.mkdirWithMode(frame.rdi, @truncate(frame.rsi))",
     );
+}
+
+test "openat2 dispatch routes both syscall numbers through strict validation" {
+    const source = kt.syscall_entry_source;
+    try expectSourceRoute(
+        source,
+        "320 => { // openat2(dirfd, pathname, how, size) — enhanced open",
+        "321 => { // faccessat2",
+        "syscallOpenat2(frame.rdi, frame.rsi, frame.rdx, frame.r10)",
+    );
+    try expectSourceRoute(
+        source,
+        "437 => { // openat2(dirfd, pathname, how, size) — alias of #320",
+        "438 => { // pidfd_getfd",
+        "syscallOpenat2(frame.rdi, frame.rsi, frame.rdx, frame.r10)",
+    );
+    try std.testing.expect(std.mem.indexOf(u8, source, "_ = frame.rdi;\n             _ = frame.rdx;\n             _ = frame.r10;\n             frame.rax = @bitCast(file_io_mod.open(frame.rsi, 0));") == null);
 }
 
 test "tmpfs exclusive create rejects before existing-entry mutation" {
