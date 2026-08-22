@@ -3397,8 +3397,11 @@ fn syscallMadvise(addr: u64, length: u64, advice: u32) i64 {
         1 => {}, // MADV_RANDOM — no special action
         2 => { // MADV_SEQUENTIAL — boost readahead for this range
             // Walk mmap regions to find files and warm page cache
-            for (cur.mmap_regions) |r| {
-                if (!r.active) continue;
+            var bits = cur.mmap_active_bm;
+            while (bits != 0) {
+                const i: usize = @intCast(@ctz(bits));
+                bits &= bits - 1;
+                const r = cur.mmap_regions[i];
                 if (addr >= r.base and addr < r.base + r.num_pages * 0x1000) {
                     // Record sequential access pattern for page cache
                     const start_page = (addr - r.base) / 0x1000;
@@ -3412,8 +3415,11 @@ fn syscallMadvise(addr: u64, length: u64, advice: u32) i64 {
             }
         },
         3 => { // MADV_WILLNEED — pre-touch pages to warm TLB/cache
-            for (cur.mmap_regions) |r| {
-                if (!r.active) continue;
+            var bits = cur.mmap_active_bm;
+            while (bits != 0) {
+                const i: usize = @intCast(@ctz(bits));
+                bits &= bits - 1;
+                const r = cur.mmap_regions[i];
                 if (addr >= r.base and addr < r.base + r.num_pages * 0x1000) {
                     const start_page = (addr - r.base) / 0x1000;
                     const end_page = @min(start_page + (length + 0xFFF) / 0x1000, r.num_pages);
@@ -3427,8 +3433,11 @@ fn syscallMadvise(addr: u64, length: u64, advice: u32) i64 {
         },
         4 => { // MADV_DONTNEED — hint that pages can be reclaimed
             // Mark as not-locked so swap/page-cache can reclaim
-            for (&cur.mmap_regions) |*r| {
-                if (!r.active) continue;
+            var bits = cur.mmap_active_bm;
+            while (bits != 0) {
+                const i: usize = @intCast(@ctz(bits));
+                bits &= bits - 1;
+                const r = &cur.mmap_regions[i];
                 if (addr >= r.base and addr < r.base + r.num_pages * 0x1000) {
                     r.locked = false;
                     break;
@@ -5466,8 +5475,11 @@ fn syscallGetrusage(who: u32, usage_ptr: u64) i64 {
 
     // ru_maxrss at offset 32 (long): estimate from mmap regions
     var total_pages: u64 = 0;
-    for (cur.mmap_regions) |r| {
-        if (r.active) total_pages += r.num_pages;
+    var bits = cur.mmap_active_bm;
+    while (bits != 0) {
+        const i: usize = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        total_pages += cur.mmap_regions[i].num_pages;
     }
     const maxrss_kb: u64 = total_pages * 4; // 4KB pages to KB
     @memcpy(buf[32..40], &@as([8]u8, @bitCast(maxrss_kb)));

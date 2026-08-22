@@ -274,6 +274,9 @@ pub fn clone(
     // parent's, so it starts with the same charged usage.
     child.as_used = parent.as_used;
     child.data_used = parent.data_used;
+    child.mmap_regions = parent.mmap_regions;
+    child.mmap_count = parent.mmap_count;
+    child.mmap_active_bm = parent.mmap_active_bm;
 
     child.brk_current = parent.brk_current;
     child.stack_limit = parent.stack_limit;

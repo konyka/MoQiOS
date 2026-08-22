@@ -7,6 +7,14 @@ pub const ScanCost = struct {
     active_seen: u64,
 };
 
+pub fn visitedSlots(active_mask: u64) u64 {
+    return @popCount(active_mask);
+}
+
+pub fn occupancyScanCost(active_mask: u64) ScanCost {
+    return .{ .slots_scanned = visitedSlots(active_mask), .active_seen = visitedSlots(active_mask) };
+}
+
 /// A table scan always visits every fixed slot, while active entries are
 /// bounded by the table capacity.
 pub fn scanCost(active_count: u64) ScanCost {

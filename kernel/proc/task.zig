@@ -236,6 +236,7 @@ pub const Task = struct {
     /// Each entry stores (base_addr, num_pages). Max 64 regions per process.
     mmap_regions: [64]MmapRegion = [_]MmapRegion{.{}} ** 64,
     mmap_count: u32 = 0,
+    mmap_active_bm: u64 = 0,
 
     /// Per-task I/O permission bitmap (TSS IOPB, 8192 bytes / 2 PMM pages,
     /// HHDM virtual pointer). Lazily allocated on the first ioperm_set call;

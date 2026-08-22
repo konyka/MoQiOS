@@ -54,6 +54,8 @@ fn insertRegionPiece(cur: *task.Task, base: u64, num_pages: u64, proto: *const t
                 @import("../fs/ext2.zig").retainFile(proto.file_idx);
             }
             cur.mmap_count += 1;
+            const idx = (@intFromPtr(slot) - @intFromPtr(&cur.mmap_regions[0])) / @sizeOf(task.MmapRegion);
+            cur.mmap_active_bm |= @as(u64, 1) << @intCast(idx);
             return;
         }
     }
@@ -87,12 +89,12 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     // permissions.
     const len_pages = (len + paging.PAGE_SIZE - 1) / paging.PAGE_SIZE;
     var slots_needed: u32 = 0;
-    var free_slots: u32 = 0;
-    for (&cur.mmap_regions) |*r| {
-        if (!r.active) {
-            free_slots += 1;
-            continue;
-        }
+    const free_slots: u32 = @intCast(cur.mmap_regions.len - @popCount(cur.mmap_active_bm));
+    var bits = cur.mmap_active_bm;
+    while (bits != 0) {
+        const i: usize = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const r = &cur.mmap_regions[i];
         if (r.file_kind == 0) continue; // anonymous faults never read prot
         slots_needed += filemap.planProtUpdate(r.base, r.num_pages, addr, len_pages).slots_needed;
     }

@@ -111,6 +111,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
     for (&parent.mmap_regions) |*r| r.huge_pages = 0;
     child.mmap_regions = parent.mmap_regions;
     child.mmap_count = parent.mmap_count;
+    child.mmap_active_bm = parent.mmap_active_bm;
 
     // G2: the child inherits file-backed regions. Each ext2 region piece
     // holds an open-slot reference (taken at mmap time); the child needs its
