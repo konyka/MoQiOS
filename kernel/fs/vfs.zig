@@ -1439,6 +1439,24 @@ pub fn syncFile(inode_id: u64, fs_type: writeback.FsType) bool {
     };
 }
 
+/// Flush ordinary writeback buffers and dirty mmap pages in [first_byte,
+/// end_byte). Zero-length ranges are successful no-ops.
+pub fn syncFileRange(inode_id: u64, fs_type: writeback.FsType, first_byte: u64, end_byte: u64) bool {
+    if (first_byte >= end_byte) return true;
+    if (fs_type == .none) return false;
+
+    const writeback_ok = switch (fs_type) {
+        .ext2 => writeback.flushFileRange(inode_id, .ext2, first_byte, end_byte, ext2WriteFlush),
+        .fat32 => writeback.flushFileRange(inode_id, .fat32, first_byte, end_byte, fat32WriteFlush),
+        .none => unreachable,
+    };
+    const first_page = first_byte / 4096;
+    const last_page = (end_byte - 1) / 4096;
+    const page_count = last_page - first_page + 1;
+    const page_result = page_cache.flushInodeRange(inode_id, first_page, page_count, mappedPageWriteback);
+    return writeback_ok and !page_result.failed;
+}
+
 // ── Mount table (Phase 18) ──────────────────────────────────────
 
 pub const MAX_MOUNTS: u32 = 16;

@@ -215,6 +215,60 @@ pub fn flushFile(inode_id: u64, fs_type: FsType, comptime write_fn: fn (u32, u64
     }
     return all_ok;
 }
+/// Flush dirty buffers of one inode whose byte ranges intersect [first_byte,
+/// end_byte). The lock is dropped while write_fn performs I/O, and a failed
+/// write restores the buffer's dirty state for a later retry.
+pub fn flushFileRange(
+    inode_id: u64,
+    fs_type: FsType,
+    first_byte: u64,
+    end_byte: u64,
+    comptime write_fn: fn (u32, u64, [*]const u8, u32) bool,
+) bool {
+    if (first_byte >= end_byte) return true;
+
+    var all_ok = true;
+    const flags = wb_lock.acquire();
+    defer wb_lock.release(flags);
+    for (0..BM_WORDS) |w| {
+        var bits = dirty_bm[w];
+        while (bits != 0) {
+            const bit = @ctz(bits);
+            bits &= bits - 1;
+            const i: u32 = @intCast(w * 64 + @as(u32, bit));
+            const b = &dirty_buffers[i];
+            if (b.fs_type != fs_type or b.inode_id != inode_id or !b.dirty) continue;
+            const buffer_end = if (b.data_len > ~@as(u64, 0) - b.byte_offset)
+                ~@as(u64, 0)
+            else
+                b.byte_offset + b.data_len;
+            if (b.byte_offset >= end_byte or first_byte >= buffer_end) continue;
+
+            var tmp_data: [PAGE_SIZE]u8 = undefined;
+            @memcpy(tmp_data[0..b.data_len], b.data[0..b.data_len]);
+            const tmp_len = b.data_len;
+            const tmp_offset = b.byte_offset;
+            const tmp_file_idx = b.file_idx;
+            b.dirty = false;
+            bmClr(&dirty_bm, i);
+            wb_lock.release(flags);
+            const write_ok = write_fn(tmp_file_idx, tmp_offset, &tmp_data, tmp_len);
+            _ = wb_lock.acquire();
+            if (!write_ok) {
+                b.dirty = true;
+                bmSet(&dirty_bm, i);
+                all_ok = false;
+                continue;
+            }
+            if (!b.dirty) {
+                b.in_use = false;
+                bmClr(&in_use_bm, i);
+            }
+        }
+    }
+    return all_ok;
+}
+
 /// Flush every dirty buffer of one filesystem. Returns false if any failed.
 pub fn flushAllByType(fs_type: FsType, comptime write_fn: fn (u32, u64, [*]const u8, u32) bool) bool {
     // v53.35: Rename flushAll → flushAllByType + add fs_type filter (C1 fix).

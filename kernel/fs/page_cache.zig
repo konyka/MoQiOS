@@ -18,6 +18,7 @@ const hhdm = @import("../mm/hhdm.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 const PAGE_SIZE: u64 = 4096;
+const MMAP_CACHE_FLAG: u64 = 1 << 63;
 const CACHE_SLOTS: u32 = 512;
 const MAX_PAGES: u32 = 1024; // Max cached pages (4MB cached data)
 const DIRTY_BM_WORDS: u32 = (MAX_PAGES + 63) / 64;
@@ -466,6 +467,70 @@ pub fn flushInode(inode_id: u64, writeback_fn: *const fn (u64, u64, *[PAGE_SIZE]
         flushed += 1;
     }
     return flushed;
+}
+
+pub const FlushResult = struct {
+    flushed: u32 = 0,
+    failed: bool = false,
+};
+
+/// Flush dirty pages of one inode whose page offsets are in the bounded range.
+/// The cache lock is dropped around I/O, and a failed page remains dirty.
+pub fn flushInodeRange(
+    inode_id: u64,
+    first_page: u64,
+    range_page_count: u64,
+    writeback_fn: *const fn (u64, u64, *[PAGE_SIZE]u8) bool,
+) FlushResult {
+    var result: FlushResult = .{};
+    if (range_page_count == 0) return result;
+    const last_page = first_page + range_page_count - 1;
+
+    while (true) {
+        var tmp: [PAGE_SIZE]u8 = undefined;
+        var page_offset: u64 = 0;
+        var flushed_slot: u16 = 0;
+        var flags = cache_lock.acquire();
+        var found = false;
+        var slot = inode_list_heads[inodeListSlot(inode_id)];
+        while (slot) |s| {
+            const page = &pages[s];
+            const logical_page = page.key.page_offset & ~MMAP_CACHE_FLAG;
+            if (page.valid and page.dirty and page.key.inode_id == inode_id and
+                logical_page >= first_page and logical_page <= last_page)
+            {
+                @memcpy(&tmp, page.data);
+                page_offset = page.key.page_offset;
+                page.dirty = false;
+                dirtyClr(s);
+                page.referenced = true;
+                flushed_slot = s;
+                found = true;
+                break;
+            }
+            slot = page.inode_next;
+        }
+        cache_lock.release(flags);
+        if (!found) break;
+
+        const ok = writeback_fn(inode_id, page_offset, &tmp);
+        flags = cache_lock.acquire();
+        if (!ok) {
+            if (pages[flushed_slot].valid and
+                pages[flushed_slot].key.inode_id == inode_id and
+                pages[flushed_slot].key.page_offset == page_offset)
+            {
+                pages[flushed_slot].dirty = true;
+                dirtySet(flushed_slot);
+            }
+            cache_lock.release(flags);
+            result.failed = true;
+            break;
+        }
+        cache_lock.release(flags);
+        result.flushed += 1;
+    }
+    return result;
 }
 
 /// Flush ALL dirty pages. Same drop-the-lock-for-I/O pattern as flushInode.

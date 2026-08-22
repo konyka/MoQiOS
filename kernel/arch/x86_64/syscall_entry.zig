@@ -4567,21 +4567,25 @@ fn syscallUmount2(target_ptr: u64, flags: u32) i64 {
 
 /// sync_file_range(fd, offset, nbytes, flags) — flush dirty pages for a file range.
 /// flags: SYNC_FILE_RANGE_WAIT_BEFORE=1, SYNC_FILE_RANGE_WRITE=2, SYNC_FILE_RANGE_WAIT_AFTER=4.
-/// Simplified: validate fd and accept — full writeback requires per-fs page flush.
 fn syscallSyncFileRange(fd: u32, offset: u64, nbytes: u64, flags: u32) i64 {
-    _ = offset;
-    _ = nbytes;
-    _ = flags;
-
     const sched_mod = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
+    const policy = @import("../../fs/sync_file_range_policy.zig");
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = tm.getTask(cur_idx) orelse return -1;
-    if (fd >= vfs_mod.MAX_FDS or t.fd_table.fds[fd].fd_type == .none) return -9;
-
-    // Accept the request — dirty pages will be flushed by the writeback daemon
-    // or on file close. Full per-range writeback requires filesystem-level
-    // page tracking which is not yet wired.
+    if (fd >= vfs_mod.MAX_FDS) return -9;
+    const desc = &t.fd_table.fds[fd];
+    if (desc.fd_type == .none) return -9;
+    const fs_type: @import("../../fs/writeback.zig").FsType = switch (desc.fd_type) {
+        .ext2_file => .ext2,
+        .fat32_file => .fat32,
+        else => return -22,
+    };
+    const range = policy.validate(offset, nbytes, flags) catch |err| return switch (err) {
+        error.InvalidFlags, error.InvalidOffset, error.RangeOverflow => -22,
+    };
+    if (range.page_count == 0) return 0;
+    if (!vfs_mod.syncFileRange(desc.inode_id, fs_type, offset, offset + nbytes)) return -5;
     return 0;
 }
 
