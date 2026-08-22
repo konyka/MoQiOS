@@ -32,6 +32,16 @@ const rlimit = kt.rlimit;
 const ioprio_policy = kt.ioprio_policy;
 const creation_metadata = kt.creation_metadata;
 const virtio_net_queue = kt.virtio_net_queue;
+const socketpair_policy = kt.socketpair_policy;
+
+test "socketpair policy rejects unsupported combinations before allocation" {
+    try std.testing.expectEqual(@as(i64, 0), socketpair_policy.validate(1, 1, 0));
+    try std.testing.expectEqual(@as(i64, 0), socketpair_policy.validate(1, 1 | socketpair_policy.TYPE_FLAGS, 0));
+    try std.testing.expectEqual(kt.errno.EINVAL, socketpair_policy.validate(2, 1, 0));
+    try std.testing.expectEqual(kt.errno.EINVAL, socketpair_policy.validate(1, 1, 6));
+    try std.testing.expectEqual(kt.errno.EINVAL, socketpair_policy.validate(1, 2, 0));
+    try std.testing.expectEqual(kt.errno.EINVAL, socketpair_policy.validate(1, 1 | 0x400, 0));
+}
 
 test "creation metadata masks requested permissions to nine mode bits" {
     const metadata = creation_metadata.decide(null, .regular_file, 0o1764, 0o027, 41, 52).metadata;
