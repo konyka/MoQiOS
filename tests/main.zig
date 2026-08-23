@@ -33,6 +33,14 @@ const ioprio_policy = kt.ioprio_policy;
 const creation_metadata = kt.creation_metadata;
 const virtio_net_queue = kt.virtio_net_queue;
 const socketpair_policy = kt.socketpair_policy;
+const fallocate_policy = kt.fallocate_policy;
+
+test "fallocate policy rejects unsupported modes before mutation" {
+    try std.testing.expectEqual(@as(i64, 0), fallocate_policy.validate(0));
+    try std.testing.expectEqual(fallocate_policy.EOPNOTSUPP, fallocate_policy.validate(1));
+    try std.testing.expectEqual(fallocate_policy.EOPNOTSUPP, fallocate_policy.validate(0x400));
+    try std.testing.expectEqual(fallocate_policy.EOPNOTSUPP, fallocate_policy.validate(0xFFFF_FFFF));
+}
 
 test "socketpair policy rejects unsupported combinations before allocation" {
     try std.testing.expectEqual(@as(i64, 0), socketpair_policy.validate(1, 1, 0));

@@ -23,6 +23,7 @@ pub const aio_policy = @import("fs/aio_policy.zig");
 pub const readahead_policy = @import("fs/readahead_policy.zig");
 pub const sync_file_range_policy = @import("fs/sync_file_range_policy.zig");
 pub const openat2_policy = @import("fs/openat2_policy.zig");
+pub const fallocate_policy = @import("fs/fallocate_policy.zig");
 pub const futex_key = @import("sync/futex_key.zig");
 pub const mlock_policy = @import("mm/mlock_policy.zig");
 pub const mprotect_policy = @import("mm/mprotect_policy.zig");

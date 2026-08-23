@@ -198,6 +198,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello76");  /* bounded raw sync_file_range validation for #290 */
     run_test("hello77");  /* bounded raw ext2 readahead validation for #291 */
     run_test("hello78");  /* raw Unix socketpair #53 boundary and bidirectional I/O */
+    run_test("hello79");  /* raw fallocate #274 mode boundary and size preservation */
 
     start_persistent_services();
 
