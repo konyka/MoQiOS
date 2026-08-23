@@ -19,6 +19,7 @@
 const serial = @import("serial.zig");
 const fmt = @import("../../lib/fmt.zig");
 const errno = @import("../../lib/errno.zig");
+const unsupported_policy = @import("../../proc/unsupported_policy.zig");
 const cpu_capacity = @import("../cpu_capacity.zig");
 
 // MSR constants
@@ -1396,16 +1397,14 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallChroot(frame.rdi));
         },
         281 => { // acct(filename) — no-op (process accounting not supported)
-            _ = frame.rdi;
-            frame.rax = 0;
+            frame.rax = @bitCast(unsupported_policy.acct());
         },
         // ── v36.0: 性能最优先功能补全 ─────────────────────────────────────
         238 => { // prlimit64(pid, resource, new_limit, old_limit)
             frame.rax = @bitCast(syscallPrlimit64(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, frame.r10));
         },
         282 => { // unshare(flags) — namespace unshare (simplified no-op)
-            _ = frame.rdi;
-            frame.rax = 0;
+            frame.rax = @bitCast(unsupported_policy.unshare());
         },
         283 => { // process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)
             frame.rax = @bitCast(syscallProcessVmReadv(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx), frame.r10, @truncate(frame.r8)));
@@ -2134,7 +2133,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallAccess(frame.rsi, @truncate(frame.rdx)));
         },
         440 => { // process_madvise(pidfd, iov, nr_iov, advice, flags) — Linux #440
-            frame.rax = 0; // accept (advisory only, no cross-process effect)
+            frame.rax = @bitCast(unsupported_policy.processMadvise());
         },
         441 => { // epoll_pwait2(epfd, events, maxevents, timeout_ts, sigmask, sigsetsize)
             const epoll_mod2 = @import("../../net/epoll.zig");
@@ -2167,13 +2166,13 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = 0; // accept (no quota enforcement)
         },
         444 => { // landlock_create_ruleset(attr, size, flags) — Linux #444
-            frame.rax = 0; // accept (no Landlock enforcement)
+            frame.rax = @bitCast(unsupported_policy.landlock());
         },
         445 => { // landlock_add_rule(ruleset_fd, rule_type, rule_attr, size) — Linux #445
-            frame.rax = 0; // accept (no Landlock enforcement)
+            frame.rax = @bitCast(unsupported_policy.landlock());
         },
         446 => { // landlock_restrict_self(ruleset_fd, flags) — Linux #446
-            frame.rax = 0; // accept (no Landlock enforcement)
+            frame.rax = @bitCast(unsupported_policy.landlock());
         },
         447 => { // memfd_secret(flags) — create secret memfd — Linux #447
             frame.rax = @bitCast(@as(i64, -38)); // ENOSYS (requires special page isolation)
@@ -2247,13 +2246,13 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(@as(i64, -38)); // ENOSYS
         },
         459 => { // lsm_get_self_attr(attr, ptr, size, flags) — Linux #459
-            frame.rax = 0; // accept (no LSM enforcement)
+            frame.rax = @bitCast(unsupported_policy.lsm());
         },
         460 => { // lsm_set_self_attr(attr, ptr, size, flags) — Linux #460
-            frame.rax = 0; // accept (no LSM enforcement)
+            frame.rax = @bitCast(unsupported_policy.lsm());
         },
         461 => { // lsm_list_modules(ids, size, flags) — Linux #461
-            frame.rax = 0; // accept (no LSM modules)
+            frame.rax = @bitCast(unsupported_policy.lsm());
         },
         462 => { // mseal(addr, len, flags) — seal memory mapping — Linux #462
             // Mark mmap region as sealed (prevent mprotect/munmap/mremap)
