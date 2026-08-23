@@ -34,6 +34,28 @@ const creation_metadata = kt.creation_metadata;
 const virtio_net_queue = kt.virtio_net_queue;
 const socketpair_policy = kt.socketpair_policy;
 const fallocate_policy = kt.fallocate_policy;
+const unsupported_policy = kt.unsupported_policy;
+
+test "unsupported syscall policy returns ENOSYS without inspecting arguments" {
+    try std.testing.expectEqual(kt.errno.ENOSYS, unsupported_policy.acct());
+    try std.testing.expectEqual(kt.errno.ENOSYS, unsupported_policy.unshare());
+    try std.testing.expectEqual(kt.errno.ENOSYS, unsupported_policy.processMadvise());
+    try std.testing.expectEqual(kt.errno.ENOSYS, unsupported_policy.landlock());
+    try std.testing.expectEqual(kt.errno.ENOSYS, unsupported_policy.lsm());
+}
+
+test "unsupported syscall dispatches route to the pure ENOSYS policy" {
+    const source = kt.syscall_entry_source;
+    try expectSourceRoute(source, "281 => { // acct(filename)", "282 => {", "unsupported_policy.acct()");
+    try expectSourceRoute(source, "282 => { // unshare(flags)", "283 => {", "unsupported_policy.unshare()");
+    try expectSourceRoute(source, "440 => { // process_madvise", "441 => {", "unsupported_policy.processMadvise()");
+    try expectSourceRoute(source, "444 => { // landlock_create_ruleset", "445 => {", "unsupported_policy.landlock()");
+    try expectSourceRoute(source, "445 => { // landlock_add_rule", "446 => {", "unsupported_policy.landlock()");
+    try expectSourceRoute(source, "446 => { // landlock_restrict_self", "447 => {", "unsupported_policy.landlock()");
+    try expectSourceRoute(source, "459 => { // lsm_get_self_attr", "460 => {", "unsupported_policy.lsm()");
+    try expectSourceRoute(source, "460 => { // lsm_set_self_attr", "461 => {", "unsupported_policy.lsm()");
+    try expectSourceRoute(source, "461 => { // lsm_list_modules", "462 => {", "unsupported_policy.lsm()");
+}
 
 test "fallocate policy rejects unsupported modes before mutation" {
     try std.testing.expectEqual(@as(i64, 0), fallocate_policy.validate(0));
