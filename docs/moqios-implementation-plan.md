@@ -800,6 +800,16 @@
   `tools/qemu_smoke.sh`。该门禁不修改 kernel core，也不作 wall-clock、吞吐、分配速度或
   持久化性能声明。
 
+### 显式不支持 syscall 验收门禁（hello80）
+
+- `hello80` 以当前 native dispatcher 编号 raw #281（acct）、#282（unshare）、#440
+  （process_madvise）和 #444-#446（Landlock）锁定显式 unsupported contract：每个调用必须返回
+  `ENOSYS`，且 acct/process_madvise/Landlock 传入的 sentinel user buffer 不得改变。
+- 该门禁只证明 ABI rejection 和 no-mutation 边界，不实现 process accounting、namespace、跨进程
+  madvise 或 Landlock；当前 dispatcher 的 no-op 成功路径会使 hello80 失败，不能由测试接受成功掩盖。
+- 接线位置：`build.zig`、PID 1 的 `servers/init/main.c`、`tools/qemu_run.sh` 和
+  `tools/qemu_smoke.sh`；不修改 kernel core。
+
 ### 编号修正补丁 v17.1 ✅
 
 - ~~修复 Phase 16 错误别名 (7个)~~ → 220(semtimedop→ENOSYS), 221(fadvise64→ENOSYS), 226(timer_delete→ENOSYS), 231(exit_group→ENOSYS), 246(kexec_load→ENOSYS), 305(clock_adjtime→ENOSYS), 307(sendmmsg→ENOSYS)

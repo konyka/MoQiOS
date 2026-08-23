@@ -881,6 +881,12 @@ const FdTable = struct {
 无效 fd 返回 `EBADF`，只读 ext2 描述符返回 `EACCES`。`hello79` 验证模式校验、非 ext2/只读
 错误传播和大小不变性；该验收不作 wall-clock、吞吐、分配速度或持久化性能结论。
 
+**显式不支持 syscall 边界（hello80）**：acct（#281）、unshare（#282）、process_madvise
+（#440）及 Landlock（#444-#446）若没有对应的 accounting、namespace、跨进程内存或 LSM
+实现，必须在任何目标查找、状态变更或用户缓冲区访问前返回 `ENOSYS`。hello80 用 raw syscall
+和 sentinel buffer 验证错误码及 no-mutation 保证；它是 ABI acceptance gate，不是这些子系统的
+实现，也不接受 no-op 成功作为替代证据。
+
 **挂载管理** (v18.0): `mountFs` / `umountFs`，16 挂载点表，支持 tmpfs/ext2/vfat/proc/ramfs 类型。系统调用 #165 (mount), #166 (umount2)。
 
 **/dev 设备节点**：全部由 devfs 注册表提供（见 3.8），`open` 的 `/dev/` 分支

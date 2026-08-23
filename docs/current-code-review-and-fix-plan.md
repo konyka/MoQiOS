@@ -1334,6 +1334,22 @@ wall-clock, throughput, allocation-speed, or persistence-performance claim.
 | Unsupported boundary | Nonzero mode returns `EOPNOTSUPP` and preserves the regular-file size. |
 | Descriptor/target errors | Invalid fd returns `EBADF`; pipe/device cases accept only `EINVAL` or `EOPNOTSUPP`; all fds close. |
 
+### 5.2x Review Update: 2026-08-23 (hello80 unsupported syscall acceptance)
+
+`hello80` defines an explicit unsupported boundary for the native dispatcher entries acct (#281),
+unshare (#282), process_madvise (#440), and Landlock (#444-#446). Each raw call must return `ENOSYS`
+before target lookup, namespace/LSM state handling, or user-buffer access; sentinel buffers must remain
+unchanged. This is acceptance evidence for an ABI contract, not an implementation of process accounting,
+namespaces, cross-process memory advice, or Landlock. The current dispatcher still contains no-op success
+arms for these numbers, so the new gate correctly fails until a separately authorized kernel-core change
+aligns behavior; the test must not weaken the contract to accept success.
+
+| Acceptance item | Evidence |
+|---|---|
+| Unsupported calls | `hello80` checks raw #281, #282, #440, and #444-#446 for `-ENOSYS`. |
+| No mutation | Sentinel buffers passed to acct, process_madvise, and Landlock remain byte-for-byte unchanged. |
+| Scope | Build/init/ramdisk/smoke wiring only; no kernel-core implementation or compatibility claim. |
+
 ### 5.3 Historical Verification
 
 Executed on 2026-06-21:

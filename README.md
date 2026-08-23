@@ -5,7 +5,7 @@
 ## 项目状态
 
 **当前进度**: x86_64 主路径已覆盖 M11+ 及多项扩展 (TCP、ext2、AHCI/NVMe、tmpfs/procfs、SMP)。
-系统可正常引导至调度器，并通过 QEMU 串口跑通 `init` + 各 hello 用例（`hello2`–`hello41` 中 `init` 自动执行的子集）和 Shell；
+系统可正常引导至调度器，并通过 QEMU 串口跑通 `init` + 各 hello 用例（包括后续 raw syscall acceptance gates）和 Shell；
 `hello6`、`hello21` 等需要交互输入的用例保留为手动集成用例；`hello38`–`hello41` 是 2026-07-28 新增的强制 smoke 门禁测试。riscv64/aarch64 当前是独立的移植骨架，分别有 QEMU smoke 门禁。
 
 | 里程碑 | 功能 | 状态 |
