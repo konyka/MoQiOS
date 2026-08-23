@@ -1321,13 +1321,17 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         273 => { // sched_setaffinity(pid, cpusetsize, mask)
             frame.rax = @bitCast(syscallSchedSetaffinity(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx));
         },
-        274 => { // fallocate(fd, mode, offset, len) — pre-allocate space
-            const fd: u32 = @truncate(frame.rdi);
-            const mode: u32 = @truncate(frame.rsi);
-            const offset = frame.rdx;
-            const len = frame.r10;
-            if (mode == 0) {
-                if (offset > 0xFFFF_FFFF or len > 0xFFFF_FFFF or len > 0xFFFF_FFFF - offset) {
+         274 => { // fallocate(fd, mode, offset, len) — pre-allocate space
+             const fd: u32 = @truncate(frame.rdi);
+             const mode: u32 = @truncate(frame.rsi);
+             const offset = frame.rdx;
+             const len = frame.r10;
+             const fallocate_policy = @import("../../fs/fallocate_policy.zig");
+             const mode_result = fallocate_policy.validate(mode);
+             if (mode_result != 0) {
+                 frame.rax = @bitCast(mode_result);
+             } else {
+                 if (offset > 0xFFFF_FFFF or len > 0xFFFF_FFFF or len > 0xFFFF_FFFF - offset) {
                     frame.rax = @bitCast(@as(i64, -22));
                 } else {
                     // Default: allocate space by extending file to offset+len
@@ -1337,6 +1341,12 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                         if (tm.getTask(cur_idx)) |t| {
                         if (fd >= t.fd_table.fds.len or t.fd_table.fds[fd].fd_type == .none) {
                             frame.rax = @bitCast(@as(i64, -9)); // EBADF
+                        } else if (t.fd_table.fds[fd].fd_type != .ext2_file) {
+                            // mode=0 is implemented only by the ext2 extent
+                            // path; never reinterpret pipes/devices as files.
+                            frame.rax = @bitCast(@as(i64, -95)); // EOPNOTSUPP
+                        } else if (!t.fd_table.fds[fd].writable) {
+                            frame.rax = @bitCast(@as(i64, -13)); // EACCES
                         } else {
                             const ext2 = @import("../../fs/ext2.zig");
                             const ext2_idx = t.fd_table.fds[fd].ext2_file_idx;
@@ -1360,9 +1370,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                         frame.rax = @bitCast(@as(i64, -1));
                     }
                 }
-            } else {
-                frame.rax = 0; // Non-default modes: accept
-            }
+             }
             checkSignalsOnSyscallReturn(frame);
         },
         275 => { // posix_fadvise(fd, offset, len, advice) — readahead hints
