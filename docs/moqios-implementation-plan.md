@@ -790,6 +790,16 @@
   `tools/qemu_smoke.sh`。该门禁不修改 kernel core，也不作完整 Unix socket 兼容性或
   wall-clock/吞吐/持久化性能声明。
 
+### fallocate 验收门禁 ✅（2026-08-23）
+
+- `hello79` 以 raw syscall #274 验证严格模式边界：regular file 仅接受 `mode == 0` 有界范围，验证
+  有效调用后的文件大小；任意非零 mode 必须返回 `EOPNOTSUPP`，并在目标查找/修改前保持文件大小不变。
+- 无效 fd 必须返回 `EBADF`；pipe/device 等不支持目标只接受 `EINVAL` 或 `EOPNOTSUPP`，并显式关闭
+  成功打开的描述符。
+- 接线位置：`build.zig`、PID 1 的 `servers/init/main.c`、`tools/qemu_run.sh` 和
+  `tools/qemu_smoke.sh`。该门禁不修改 kernel core，也不作 wall-clock、吞吐、分配速度或
+  持久化性能声明。
+
 ### 编号修正补丁 v17.1 ✅
 
 - ~~修复 Phase 16 错误别名 (7个)~~ → 220(semtimedop→ENOSYS), 221(fadvise64→ENOSYS), 226(timer_delete→ENOSYS), 231(exit_group→ENOSYS), 246(kexec_load→ENOSYS), 305(clock_adjtime→ENOSYS), 307(sendmmsg→ENOSYS)

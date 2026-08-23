@@ -1319,6 +1319,21 @@ compatibility-breadth, or persistence-performance claim.
 | Validation | Invalid domain/type/protocol return `EINVAL`; bad `sv` returns `EFAULT`. |
 | Cleanup | Rejected calls are checked for no fd allocation, and both returned descriptors are closed. |
 
+### 5.2w Review Update: 2026-08-23 (hello79 fallocate acceptance)
+
+`hello79` adds the raw syscall #274 acceptance gate without changing kernel core code. The supported
+boundary is strict: only `mode == 0` may operate on a regular file. Every nonzero mode must return
+`EOPNOTSUPP` before target lookup or mutation; unsupported pipe/device targets may return the documented
+`EINVAL` or `EOPNOTSUPP`. The test checks invalid fd `EBADF`, verifies mode-zero extension and verifies
+that rejected nonzero modes do not change file size. This is semantic syscall evidence only and makes no
+wall-clock, throughput, allocation-speed, or persistence-performance claim.
+
+| Acceptance item | Evidence |
+|---|---|
+| Supported mode | `hello79: PASS` checks raw #274 mode `0` over an in-file regular-file range. |
+| Unsupported boundary | Nonzero mode returns `EOPNOTSUPP` and preserves the regular-file size. |
+| Descriptor/target errors | Invalid fd returns `EBADF`; pipe/device cases accept only `EINVAL` or `EOPNOTSUPP`; all fds close. |
+
 ### 5.3 Historical Verification
 
 Executed on 2026-06-21:

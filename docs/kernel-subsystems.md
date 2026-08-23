@@ -875,6 +875,12 @@ const FdTable = struct {
 管道和设备等不支持的描述符返回 `EINVAL`。该契约只保证验证与后续 read 的语义正确性，
 不作 wall-clock、吞吐或预取命中率结论。
 
+**`fallocate`（严格模式边界）**：syscall #274 只在可写 ext2 regular-file 描述符上保留现有
+`mode == 0` 路径；FAT32、ramdisk、管道、设备和其它非 ext2 描述符在目标修改前返回
+`EOPNOTSUPP`。所有非零 mode 必须在目标查找和修改前返回 `EOPNOTSUPP`，并且不得改变文件大小；
+无效 fd 返回 `EBADF`，只读 ext2 描述符返回 `EACCES`。`hello79` 验证模式校验、非 ext2/只读
+错误传播和大小不变性；该验收不作 wall-clock、吞吐、分配速度或持久化性能结论。
+
 **挂载管理** (v18.0): `mountFs` / `umountFs`，16 挂载点表，支持 tmpfs/ext2/vfat/proc/ramfs 类型。系统调用 #165 (mount), #166 (umount2)。
 
 **/dev 设备节点**：全部由 devfs 注册表提供（见 3.8），`open` 的 `/dev/` 分支

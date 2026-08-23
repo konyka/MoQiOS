@@ -84,6 +84,11 @@
   非法 domain/type/protocol 返回 `EINVAL`，坏 `sv` 指针返回 `EFAULT`，失败不得泄漏 fd，成功
   的两个 fd 都关闭。证据限于 syscall 参数校验、双向数据语义和资源清理，不作完整 Unix
   socket 兼容性、wall-clock、吞吐或持久化性能声明。
+- `fallocate`（hello79）验收以 raw syscall #274 的严格模式边界为准：只支持 regular file
+  上的 `mode == 0` 有界范围；所有非零 mode 必须在目标查找和修改之前返回 `EOPNOTSUPP`，且不得改变
+  文件大小。无效 fd 返回 `EBADF`；pipe/device 等不支持目标只接受文档规定的 `EINVAL` 或
+  `EOPNOTSUPP`。验收只证明 syscall 语义、错误传播和大小不变性，不作 wall-clock、吞吐、
+  分配速度或持久化性能声明。
 - ~~2MB 大页（尤其文件映射）与 fork COW OOM 半途回滚~~（review §5.6/§6.8）——
   fork COW 部分 ✅ 6.34（三阶段事务化克隆，两条路径）；文件映射部分 ✅ 6.35
   以 fault-around 预缺页收口：真 2MiB PDE 与零拷贝 MAP_SHARED 设计物理上
