@@ -1115,8 +1115,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         // ── v32.2: Misc syscalls ─────────────────────────────────────
         227 => { // sched_getaffinity(pid, cpusetsize, mask)
-            _ = frame.rdi; // pid ignored (current process)
-            frame.rax = @bitCast(misc_mod.schedGetaffinity(frame.rsi, frame.rdx));
+            frame.rax = @bitCast(misc_mod.schedGetaffinity(@truncate(frame.rdi), frame.rsi, frame.rdx));
         },
         229 => { // getcomm(buf, size)
             frame.rax = @bitCast(misc_mod.getcomm(frame.rdi, frame.rsi));

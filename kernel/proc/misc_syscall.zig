@@ -4,10 +4,14 @@
 const copy = @import("../mm/copy_from_user.zig");
 const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
+const sched_getaffinity_policy = @import("../proc/sched_getaffinity_policy.zig");
 const vfs_mod = @import("../fs/vfs.zig");
 
 /// sched_getaffinity(pid, cpusetsize, mask_ptr) -> bytes copied or -errno.
-pub fn schedGetaffinity(cpusetsize: u64, mask_ptr: u64) i64 {
+pub fn schedGetaffinity(pid: u32, cpusetsize: u64, mask_ptr: u64) i64 {
+    const cur = sched_mod.currentTask() orelse return -3; // -ESRCH
+    const target = if (pid == 0) cur.tid else task_mod.findTaskByTid(pid);
+    if (sched_getaffinity_policy.validatePid(pid, cur.tid, target != null) != 0) return -3; // -ESRCH
     if (mask_ptr == 0 or mask_ptr >= 0x0000_8000_0000_0000) return -14; // -EFAULT
     // Return CPU 0 only (single CPU affinity)
     var mask: [128]u8 = undefined;
