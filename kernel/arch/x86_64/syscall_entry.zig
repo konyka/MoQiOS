@@ -678,9 +678,14 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             checkSignalsOnSyscallReturn(frame);
         },
         146 => { // epoll_create1(flags)
-            _ = frame.rdi; // flags accepted but epollCreate ignores them
-            const epoll_mod = @import("../../net/epoll.zig");
-            frame.rax = @bitCast(@as(i64, epoll_mod.epollCreate()));
+            const epoll_policy = @import("../../net/epoll_policy.zig");
+            const policy_result = epoll_policy.validate(@truncate(frame.rdi));
+            if (policy_result != 0) {
+                frame.rax = @bitCast(policy_result);
+            } else {
+                const epoll_mod = @import("../../net/epoll.zig");
+                frame.rax = @bitCast(@as(i64, epoll_mod.epollCreate()));
+            }
         },
         147 => { // epoll_ctl(epfd, op, fd, event)
             const epoll_mod = @import("../../net/epoll.zig");
