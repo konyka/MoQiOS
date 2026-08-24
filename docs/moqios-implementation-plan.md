@@ -980,3 +980,4 @@
 | v0.3 | 2026-05-22 | 添加 M11+ 进度，更新系统调用表 |
 | v0.2 | 2026-05-20 | 更新 M1-M10 完成状态 |
 | v0.1 | 2026-05-15 | 初始版本 |
+- `sendmmsg/recvmmsg`：TCP-only bounded batch，最多 16 条；invalid batch returns `EINVAL` before transport I/O。

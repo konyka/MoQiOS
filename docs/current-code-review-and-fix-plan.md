@@ -2323,3 +2323,6 @@ The review/documentation part is complete when:
 - The repo builds/tests that can run in the current environment are executed and their result is recorded.
 - Any unavailable verification is explicitly listed as a gap.
 - A push to `origin/main` is attempted after local verification, or a network/credential blocker is reported with the exact command.
+### Bounded TCP message batching
+
+`sendmmsg` and `recvmmsg` now process up to 16 TCP messages with explicit partial-count semantics. Unix/UDP batching remains outside this bounded contract.

@@ -138,3 +138,4 @@
 - 性能相关条目合并前在 PR 描述中给出前后对照（如 syslogd 轮询 → 事件驱动的
   唤醒次数、kmsg 读取延迟）。
 - CI（`.github`）对推送与 PR 运行 `zig build test` 并记录时长观察（非门禁）。
+- `sendmmsg/recvmmsg` 当前已完成 TCP-only bounded batch contract；完整 Unix/UDP message batching 仍需独立 transport 语义设计。

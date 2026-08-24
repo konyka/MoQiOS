@@ -2302,3 +2302,4 @@ daemon 以 `nanosleep(100ms)` 轮询；现在读本身在最新字节处睡眠�
 - [build-and-toolchain.md](./build-and-toolchain.md)
 - [user-space.md](./user-space.md)
 - [moqios-design.md](./moqios-design.md)
+**`sendmmsg/recvmmsg` bounded TCP contract**：当前仅支持既有 TCP `sendmsg/recvmsg` 路径，`vlen=0` 返回 0，单批最多 16 条；超限或非零 flags/timeout 返回 `EINVAL`，首条失败返回 errno，已有成功条目返回 partial count。Unix/UDP 不宣称由该批处理支持；`hello81` 锁定验证边界。
