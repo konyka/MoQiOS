@@ -1350,6 +1350,23 @@ aligns behavior; the test must not weaken the contract to accept success.
 | No mutation | Sentinel buffers passed to acct, process_madvise, and Landlock remain byte-for-byte unchanged. |
 | Scope | Build/init/ramdisk/smoke wiring only; no kernel-core implementation or compatibility claim. |
 
+### 5.2y Review Update: 2026-08-24 (hello82 sched_getaffinity acceptance)
+
+`hello82` records the existing raw syscall #227 boundary without changing kernel core. The accepted
+contract is current-pid-only: `pid == 0` and the current TID succeed, while invalid or non-current pids
+return `ESRCH` before touching the user buffer. A bad pointer returns `EFAULT`. The current single-CPU
+mask contains only CPU 0 (bit 0), and the syscall copies/returns `min(cpusetsize, 128)` bytes; size zero
+is a successful no-write boundary and a 129-byte request remains capped at 128. The acceptance test
+therefore covers ABI return lengths, mask contents, error ordering, and sentinel preservation, not SMP
+affinity support or scheduling performance.
+
+| Acceptance item | Evidence |
+|---|---|
+| Current PID contract | `hello82` checks `pid == 0` and the current PID, including the CPU-0 mask. |
+| Error ordering | Invalid/non-current PID returns `ESRCH` without sentinel mutation; null mask returns `EFAULT`. |
+| Size boundary | `hello82` checks sizes 0, 1, 127, 128, and 129 against the 128-byte cap. |
+| Scope | User acceptance plus build/init/ramdisk/smoke wiring; no kernel-core edits. |
+
 ### 5.3 Historical Verification
 
 Executed on 2026-06-21:

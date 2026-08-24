@@ -2303,3 +2303,9 @@ daemon 以 `nanosleep(100ms)` 轮询；现在读本身在最新字节处睡眠�
 - [user-space.md](./user-space.md)
 - [moqios-design.md](./moqios-design.md)
 **`sendmmsg/recvmmsg` bounded TCP contract**：当前仅支持既有 TCP `sendmsg/recvmsg` 路径，`vlen=0` 返回 0，单批最多 16 条；超限或非零 flags/timeout 返回 `EINVAL`，首条失败返回 errno，已有成功条目返回 partial count。Unix/UDP 不宣称由该批处理支持；`hello81` 锁定验证边界。
+
+**`sched_getaffinity` current-pid-only contract**：raw syscall #227 仅接受 `pid == 0` 或当前 TID；
+其他/不存在的 pid 必须在用户缓冲区访问前返回 `ESRCH`，因此失败不得改写 sentinel。空指针返回
+`EFAULT`。当前系统为单 CPU 边界：成功调用复制 `min(cpusetsize, 128)` 字节并返回复制长度，
+CPU 0 仅置 bit 0（第一个字节为 `1`，其余为 `0`）；`cpusetsize == 0` 成功但不写入，129 字节
+请求仍只复制/返回 128。hello82 锁定这些 ABI/边界语义，不修改 kernel core 或宣称 SMP affinity 支持。

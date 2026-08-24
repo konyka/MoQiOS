@@ -623,7 +623,7 @@
 - ~~T1: truncate(409)~~ → 文件截断支持
 - ~~T2: rename(411)~~ → ext2 rename 未支持，返回 -EXDEV
 - ~~T3: select(404)~~ → 返回 0，应用回退 poll
-- ~~T4: sigaltstack(131)/sched_getaffinity(204)~~ → 信号栈+ CPU 亲和力查询
+ - ~~T4: sigaltstack(131)/sched_getaffinity(227)~~ → 信号栈+ CPU 亲和力查询
 - ~~T5: msync(26)~~ → mmap 同步 (MAP_PRIVATE 直接返回成功)
 - ~~T6: chmod(90)/fchmod(91)/chown(92)/fchown(93)~~ → 权限/所有权简化实现
 - ~~T7: statfs(137)/fstatfs(138)~~ → 文件系统统计 (f_type/f_blocks/f_bfree)
@@ -809,6 +809,17 @@
   madvise 或 Landlock；当前 dispatcher 的 no-op 成功路径会使 hello80 失败，不能由测试接受成功掩盖。
 - 接线位置：`build.zig`、PID 1 的 `servers/init/main.c`、`tools/qemu_run.sh` 和
   `tools/qemu_smoke.sh`；不修改 kernel core。
+
+### sched_getaffinity 验收门禁（hello82）
+
+- `hello82` 以 raw syscall #227 锁定 current-pid-only 合约：`pid == 0` 或当前 TID 成功，
+  非 current/不存在 pid 返回 `ESRCH`，且必须在用户缓冲区访问前失败，sentinel buffer 不得改变；
+  bad pointer 返回 `EFAULT`。
+- 当前为单 CPU mask 边界：成功调用返回并复制 `min(cpusetsize, 128)` 字节，仅设置 CPU 0 的 bit 0；
+  size 0 成功且不写，size 127/128 按请求复制，size 129 仍只复制/返回 128。该门禁不扩大为
+  SMP affinity 语义，也不修改 kernel core。
+- 接线位置：`build.zig`、PID 1 的 `servers/init/main.c`、`tools/qemu_run.sh` 和
+  `tools/qemu_smoke.sh`，均紧随 `hello81`。
 
 ### 编号修正补丁 v17.1 ✅
 

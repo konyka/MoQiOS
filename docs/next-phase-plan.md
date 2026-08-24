@@ -89,11 +89,16 @@
   文件大小。无效 fd 返回 `EBADF`；pipe/device 等不支持目标只接受文档规定的 `EINVAL` 或
   `EOPNOTSUPP`。验收只证明 syscall 语义、错误传播和大小不变性，不作 wall-clock、吞吐、
   分配速度或持久化性能声明。
-- `acct`/`unshare`/`process_madvise`/Landlock（hello80）验收以当前 native dispatcher 的显式
-  `ENOSYS` unsupported boundary 为准：raw syscall #281/#282/#440/#444-#446 必须在目标查找、
-  namespace/LSM 状态处理或用户缓冲区读写之前返回 `ENOSYS`，并保持所有 sentinel buffer 不变。
-  该门禁只锁定“不支持”的 ABI 合约，不代表实现 process accounting、namespace、跨进程 madvise
-  或 Landlock；若 dispatcher 仍返回 no-op 成功，验收必须失败，不能由测试放宽为成功。
+ - `acct`/`unshare`/`process_madvise`/Landlock（hello80）验收以当前 native dispatcher 的显式
+   `ENOSYS` unsupported boundary 为准：raw syscall #281/#282/#440/#444-#446 必须在目标查找、
+   namespace/LSM 状态处理或用户缓冲区读写之前返回 `ENOSYS`，并保持所有 sentinel buffer 不变。
+   该门禁只锁定“不支持”的 ABI 合约，不代表实现 process accounting、namespace、跨进程 madvise
+   或 Landlock；若 dispatcher 仍返回 no-op 成功，验收必须失败，不能由测试放宽为成功。
+- `sched_getaffinity`（hello82）验收以 raw syscall #227 的 current-pid-only 契约为准：`pid == 0`
+  和当前 TID 成功，其他/不存在的 pid 在任何用户缓冲区访问前返回 `ESRCH` 并保持 sentinel 不变；
+  空指针返回 `EFAULT`。有效调用复制 `min(cpusetsize, 128)` 字节，`cpusetsize == 0` 是不写入的
+  成功边界，掩码仅设置 CPU 0（byte 0 为 `1`，其余位为 `0`），129 字节请求仍只写/返回 128。
+  证据限于 raw ABI、错误优先级、用户缓冲区保护和单 CPU mask 边界，不宣称 CPU 集合扩展或调度性能。
 - ~~2MB 大页（尤其文件映射）与 fork COW OOM 半途回滚~~（review §5.6/§6.8）——
   fork COW 部分 ✅ 6.34（三阶段事务化克隆，两条路径）；文件映射部分 ✅ 6.35
   以 fault-around 预缺页收口：真 2MiB PDE 与零拷贝 MAP_SHARED 设计物理上
