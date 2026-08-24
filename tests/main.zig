@@ -36,6 +36,14 @@ const socketpair_policy = kt.socketpair_policy;
 const message_batch_policy = kt.message_batch_policy;
 const fallocate_policy = kt.fallocate_policy;
 const unsupported_policy = kt.unsupported_policy;
+const sched_getaffinity_policy = kt.sched_getaffinity_policy;
+
+test "sched_getaffinity validates pid before user copy" {
+    try std.testing.expectEqual(@as(i64, 0), sched_getaffinity_policy.validatePid(0, 17, true));
+    try std.testing.expectEqual(@as(i64, 0), sched_getaffinity_policy.validatePid(17, 17, true));
+    try std.testing.expectEqual(errno.ESRCH, sched_getaffinity_policy.validatePid(18, 17, true));
+    try std.testing.expectEqual(errno.ESRCH, sched_getaffinity_policy.validatePid(17, 17, false));
+}
 
 test "unsupported syscall policy returns ENOSYS without inspecting arguments" {
     try std.testing.expectEqual(kt.errno.ENOSYS, unsupported_policy.acct());
