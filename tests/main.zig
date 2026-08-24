@@ -37,6 +37,13 @@ const message_batch_policy = kt.message_batch_policy;
 const fallocate_policy = kt.fallocate_policy;
 const unsupported_policy = kt.unsupported_policy;
 const sched_getaffinity_policy = kt.sched_getaffinity_policy;
+const epoll_policy = kt.epoll_policy;
+
+test "epoll_create1 rejects unsupported flags before fd allocation" {
+    try std.testing.expectEqual(@as(i64, 0), epoll_policy.validate(0));
+    try std.testing.expectEqual(kt.errno.EINVAL, epoll_policy.validate(1));
+    try std.testing.expectEqual(kt.errno.EINVAL, epoll_policy.validate(0x80000));
+}
 
 test "sched_getaffinity validates pid before user copy" {
     try std.testing.expectEqual(@as(i64, 0), sched_getaffinity_policy.validatePid(0, 17, true));

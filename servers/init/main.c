@@ -201,7 +201,8 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello79");  /* raw fallocate #274 mode boundary and size preservation */
     run_test("hello80");  /* raw unsupported syscall ENOSYS and user-buffer preservation */
      run_test("hello81");  /* bounded TCP sendmmsg/recvmmsg validation */
-     run_test("hello82");  /* raw sched_getaffinity current-pid and CPU-0 mask boundary */
+    run_test("hello82");  /* raw sched_getaffinity current-pid and CPU-0 mask boundary */
+    run_test("hello83");  /* raw epoll_create1 flag boundary */
 
     start_persistent_services();
 

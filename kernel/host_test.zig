@@ -38,6 +38,7 @@ pub const sched_policy = @import("proc/sched_policy.zig");
 pub const sched_claim = @import("proc/sched_claim.zig");
 pub const unsupported_policy = @import("proc/unsupported_policy.zig");
 pub const sched_getaffinity_policy = @import("proc/sched_getaffinity_policy.zig");
+pub const epoll_policy = @import("net/epoll_policy.zig");
 pub const eth = @import("net/eth.zig");
 pub const ipv4 = @import("net/ipv4.zig");
 pub const ipv6 = @import("net/ipv6.zig");
