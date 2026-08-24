@@ -2309,3 +2309,6 @@ daemon 以 `nanosleep(100ms)` 轮询；现在读本身在最新字节处睡眠�
 `EFAULT`。当前系统为单 CPU 边界：成功调用复制 `min(cpusetsize, 128)` 字节并返回复制长度，
 CPU 0 仅置 bit 0（第一个字节为 `1`，其余为 `0`）；`cpusetsize == 0` 成功但不写入，129 字节
 请求仍只复制/返回 128。hello82 锁定这些 ABI/边界语义，不修改 kernel core 或宣称 SMP affinity 支持。
+**`epoll_create1` flags boundary**：raw syscall #146 当前只接受 `flags == 0`；`EPOLL_CLOEXEC`
+及其它非零 flags 尚未接入 fd close-on-exec 语义，因此在 fd 分配前返回 `EINVAL`，不创建 epoll fd。
+`hello83` 覆盖零 flags 成功和非零 flags 拒绝，不作性能结论。

@@ -992,3 +992,4 @@
 | v0.2 | 2026-05-20 | 更新 M1-M10 完成状态 |
 | v0.1 | 2026-05-15 | 初始版本 |
 - `sendmmsg/recvmmsg`：TCP-only bounded batch，最多 16 条；invalid batch returns `EINVAL` before transport I/O。
+- `epoll_create1` flags：只接受零 flags；CLOEXEC 生命周期语义尚未实现，非零 flags 返回 `EINVAL`。

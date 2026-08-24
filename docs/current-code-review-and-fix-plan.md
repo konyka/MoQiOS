@@ -2343,3 +2343,6 @@ The review/documentation part is complete when:
 ### Bounded TCP message batching
 
 `sendmmsg` and `recvmmsg` now process up to 16 TCP messages with explicit partial-count semantics. Unix/UDP batching remains outside this bounded contract.
+### epoll_create1 flag boundary
+
+The current epoll implementation accepts only `flags == 0`; unsupported flags fail before fd allocation. `hello83` provides the raw acceptance gate.
