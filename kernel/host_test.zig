@@ -51,6 +51,7 @@ pub const huge_user = @import("mm/huge_user.zig");
 pub const nvme_queue = @import("drivers/nvme_queue.zig");
 pub const virtio_net_queue = @import("drivers/virtio_net_queue.zig");
 pub const socketpair_policy = @import("net/socketpair_policy.zig");
+pub const message_batch_policy = @import("net/message_batch_policy.zig");
 pub const slab_mag = @import("mm/slab_mag.zig");
 pub const dcache = @import("fs/dcache.zig");
 pub const userdrv_core = @import("drivers/userdrv_core.zig");

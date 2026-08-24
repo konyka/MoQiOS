@@ -33,6 +33,7 @@ const ioprio_policy = kt.ioprio_policy;
 const creation_metadata = kt.creation_metadata;
 const virtio_net_queue = kt.virtio_net_queue;
 const socketpair_policy = kt.socketpair_policy;
+const message_batch_policy = kt.message_batch_policy;
 const fallocate_policy = kt.fallocate_policy;
 const unsupported_policy = kt.unsupported_policy;
 
@@ -71,6 +72,14 @@ test "socketpair policy rejects unsupported combinations before allocation" {
     try std.testing.expectEqual(kt.errno.EINVAL, socketpair_policy.validate(1, 1, 6));
     try std.testing.expectEqual(kt.errno.EINVAL, socketpair_policy.validate(1, 2, 0));
     try std.testing.expectEqual(kt.errno.EINVAL, socketpair_policy.validate(1, 1 | 0x400, 0));
+}
+
+test "message batch policy bounds TCP batches without reading timeout" {
+    try std.testing.expectEqual(@as(i64, 0), message_batch_policy.validate(0, 0, 0));
+    try std.testing.expectEqual(@as(i64, 0), message_batch_policy.validate(message_batch_policy.MAX_MESSAGES, 0, 0));
+    try std.testing.expectEqual(kt.errno.EINVAL, message_batch_policy.validate(message_batch_policy.MAX_MESSAGES + 1, 0, 0));
+    try std.testing.expectEqual(kt.errno.EINVAL, message_batch_policy.validate(1, 1, 0));
+    try std.testing.expectEqual(kt.errno.EINVAL, message_batch_policy.validate(1, 0, 0x0000_7fff_ffff_fff0));
 }
 
 test "creation metadata masks requested permissions to nine mode bits" {
