@@ -18,6 +18,7 @@ const copy = @import("../mm/copy_from_user.zig");
 const bo = @import("../lib/byte_order.zig");
 const socketpair_policy = @import("socketpair_policy.zig");
 const message_batch_policy = @import("message_batch_policy.zig");
+const accept4_policy = @import("accept4_policy.zig");
 
 const ENOTCONN: i64 = -107;
 const SOCKADDR_UN_PATH_OFFSET: u32 = 2;
@@ -304,6 +305,8 @@ pub fn accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) i64 {
 
 /// accept4(fd, addr, addrlen, flags) → new fd or -errno
 pub fn accept4(fd: u32, addr_ptr: u64, addr_len_ptr: u64, flags: u32) i64 {
+    const policy_result = accept4_policy.validate(flags);
+    if (policy_result != 0) return policy_result;
     const result = accept(fd, addr_ptr, addr_len_ptr);
     if (result >= 0 and flags != 0) {
         const cur_idx = sched_mod.currentTaskIndex() orelse return result;

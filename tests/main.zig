@@ -38,11 +38,19 @@ const fallocate_policy = kt.fallocate_policy;
 const unsupported_policy = kt.unsupported_policy;
 const sched_getaffinity_policy = kt.sched_getaffinity_policy;
 const epoll_policy = kt.epoll_policy;
+const accept4_policy = kt.accept4_policy;
 
 test "epoll_create1 accepts only zero or EPOLL_CLOEXEC" {
     try std.testing.expectEqual(@as(i64, 0), epoll_policy.validate(0));
     try std.testing.expectEqual(kt.errno.EINVAL, epoll_policy.validate(1));
     try std.testing.expectEqual(@as(i64, 0), epoll_policy.validate(0x80000));
+
+    try std.testing.expectEqual(@as(i64, 0), accept4_policy.validate(0));
+    try std.testing.expectEqual(@as(i64, 0), accept4_policy.validate(accept4_policy.SOCK_NONBLOCK));
+    try std.testing.expectEqual(@as(i64, 0), accept4_policy.validate(accept4_policy.SOCK_CLOEXEC));
+    try std.testing.expectEqual(@as(i64, 0), accept4_policy.validate(accept4_policy.SUPPORTED_FLAGS));
+    try std.testing.expectEqual(kt.errno.EINVAL, accept4_policy.validate(1));
+    try std.testing.expectEqual(kt.errno.EINVAL, accept4_policy.validate(accept4_policy.SUPPORTED_FLAGS | 1));
 }
 
 test "sched_getaffinity validates pid before user copy" {
