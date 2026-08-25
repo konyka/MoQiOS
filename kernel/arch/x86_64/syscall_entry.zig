@@ -684,22 +684,44 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 frame.rax = @bitCast(policy_result);
             } else {
                 const epoll_mod = @import("../../net/epoll.zig");
-                frame.rax = @bitCast(@as(i64, epoll_mod.epollCreate()));
+                const epoll_idx = epoll_mod.epollCreate();
+                if (epoll_idx < 0) {
+                    frame.rax = @bitCast(@as(i64, epoll_idx));
+                } else if (@import("../../proc/sched.zig").currentTaskIndex()) |cur_idx| {
+                    const task_mod = @import("../../proc/task.zig");
+                    if (task_mod.getTask(cur_idx)) |task| {
+                        if (task.fd_table.allocFd()) |epfd| {
+                            task.fd_table.fds[epfd] = .{
+                                .fd_type = .epoll,
+                                .epoll_idx = @intCast(epoll_idx),
+                                .fd_flags = if ((@as(u32, @truncate(frame.rdi)) & epoll_policy.EPOLL_CLOEXEC) != 0) 1 else 0,
+                            };
+                            frame.rax = @bitCast(@as(i64, epfd));
+                        } else {
+                            epoll_mod.epollDestroy(@intCast(epoll_idx));
+                            frame.rax = @bitCast(@as(i64, -24));
+                        }
+                    } else {
+                        epoll_mod.epollDestroy(@intCast(epoll_idx));
+                        frame.rax = @bitCast(@as(i64, -24));
+                    }
+                } else {
+                    epoll_mod.epollDestroy(@intCast(epoll_idx));
+                    frame.rax = @bitCast(@as(i64, -24));
+                }
             }
         },
         147 => { // epoll_ctl(epfd, op, fd, event)
-            const epoll_mod = @import("../../net/epoll.zig");
             const epfd_idx: u32 = @truncate(frame.rdi);
             const op: i32 = @bitCast(@as(u32, @truncate(frame.rsi)));
             const fd_arg: i32 = @bitCast(@as(u32, @truncate(frame.rdx)));
-            frame.rax = @bitCast(@as(i64, epoll_mod.epollCtl(epfd_idx, op, fd_arg, frame.r10)));
+            frame.rax = @bitCast(epollCtlFd(epfd_idx, op, fd_arg, frame.r10));
         },
         148 => { // epoll_wait(epfd, events, maxevents, timeout)
-            const epoll_mod = @import("../../net/epoll.zig");
             const epfd_idx: u32 = @truncate(frame.rdi);
             const max_ev: u32 = @truncate(frame.rdx);
             const timeout: i32 = @bitCast(@as(u32, @truncate(frame.r10)));
-            frame.rax = @bitCast(@as(i64, epoll_mod.epollWait(epfd_idx, frame.rsi, max_ev, timeout)));
+            frame.rax = @bitCast(epollWaitFd(epfd_idx, frame.rsi, max_ev, timeout));
         },
         149 => { // shmget(key, size, shmflg)
             const shm_mod = @import("../../ipc/sysv_shm.zig");
@@ -1206,11 +1228,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         248 => { // epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)
             _ = frame.r8; // sigsetsize
             _ = frame.r9; // sigmask (simplified: same as epoll_wait)
-            const epoll_mod = @import("../../net/epoll.zig");
             const epfd_idx: u32 = @truncate(frame.rdi);
             const max_ev: u32 = @truncate(frame.rdx);
             const timeout: i32 = @bitCast(@as(u32, @truncate(frame.r10)));
-            frame.rax = @bitCast(@as(i64, epoll_mod.epollWait(epfd_idx, frame.rsi, max_ev, timeout)));
+            frame.rax = @bitCast(epollWaitFd(epfd_idx, frame.rsi, max_ev, timeout));
         },
         249 => { // getcpu(cpu*, node*, unused)
             frame.rax = @bitCast(syscallGetcpu(frame.rdi, frame.rsi));
@@ -2140,7 +2161,6 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(unsupported_policy.processMadvise());
         },
         441 => { // epoll_pwait2(epfd, events, maxevents, timeout_ts, sigmask, sigsetsize)
-            const epoll_mod2 = @import("../../net/epoll.zig");
             const epfd_idx: u32 = @truncate(frame.rdi);
             const max_ev: u32 = @truncate(frame.rdx);
             const timeout_ts_ptr = frame.r10;
@@ -2159,7 +2179,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             }
             _ = frame.r8; // sigmask ignored
             _ = frame.r9; // sigsetsize ignored
-            frame.rax = @bitCast(@as(i64, epoll_mod2.epollWait(epfd_idx, frame.rsi, max_ev, timeout_ms)));
+            frame.rax = @bitCast(epollWaitFd(epfd_idx, frame.rsi, max_ev, timeout_ms));
         },
         // ── v45.0: Linux standard 424+ corrected numbering ──────────────────
         // (v44.0 #335-#343 were wrong MoQiOS custom numbers; deleted in v45.0)
@@ -2607,6 +2627,25 @@ fn syscallClose(frame: *SyscallFrame) void {
 }
 
 const paging = @import("../../arch/x86_64/paging.zig");
+
+fn epollFdIndex(fd: u32) ?u32 {
+    const sched = @import("../../proc/sched.zig");
+    const task_mod = @import("../../proc/task.zig");
+    const idx = sched.currentTaskIndex() orelse return null;
+    const task = task_mod.getTask(idx) orelse return null;
+    if (fd >= task.fd_table.fds.len or task.fd_table.fds[fd].fd_type != .epoll) return null;
+    return task.fd_table.fds[fd].epoll_idx;
+}
+
+fn epollCtlFd(fd: u32, op: i32, target: i32, event: u64) i64 {
+    const epoll_mod = @import("../../net/epoll.zig");
+    return if (epollFdIndex(fd)) |idx| epoll_mod.epollCtl(idx, op, target, event) else -9;
+}
+
+fn epollWaitFd(fd: u32, events: u64, max_events: u32, timeout: i32) i64 {
+    const epoll_mod = @import("../../net/epoll.zig");
+    return if (epollFdIndex(fd)) |idx| epoll_mod.epollWait(idx, events, max_events, timeout) else -9;
+}
 
 // Module imports for extracted syscall implementations
 const waitpid_mod = @import("../../proc/waitpid.zig");
