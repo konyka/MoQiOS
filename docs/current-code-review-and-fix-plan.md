@@ -2349,3 +2349,10 @@ The current epoll implementation accepts `flags == 0` and `EPOLL_CLOEXEC` (`0x80
 flags fail with `EINVAL` before fd allocation. `hello83` covers the zero/invalid boundary and
 `hello84` covers CLOEXEC creation plus close. The raw gate does not exercise exec inheritance;
 the existing exec fd cleanup path remains the lifecycle boundary.
+### accept4 strict flag/backlog boundary
+
+Raw syscall #131 now rejects unrelated flags before the TCP pending queue is consumed.
+`hello85` proves the rejected path preserves one loopback backlog entry, then accepts it with
+`SOCK_CLOEXEC|SOCK_NONBLOCK` and closes the returned descriptor. The acceptance covers errno
+ordering, pending-connection preservation, recognized descriptor flags, and cleanup only; it
+does not claim broader socket or performance semantics.

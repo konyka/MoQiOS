@@ -2314,3 +2314,8 @@ CPU 0 仅置 bit 0（第一个字节为 `1`，其余为 `0`）；`cpusetsize == 
 `hello83` 覆盖零 flags 与非法 flags；`hello84` 覆盖零 flags/CLOEXEC 创建后关闭，以及非法
 flags 的 `EINVAL`。本验收不宣称 CLOEXEC 跨 `execve` 的生命周期行为；该边界由现有 exec
 fd 清理路径单独维护。
+**`accept4` strict flags/backlog boundary**：raw syscall #131 first validates flags; unrelated
+bits (for example `0x40000000`) return `EINVAL` before dequeuing a pending TCP connection.
+`hello85` establishes one loopback connection, verifies the rejected call leaves it pending, then
+accepts it with `SOCK_CLOEXEC|SOCK_NONBLOCK` and closes the resulting fd. This is a bounded flag,
+backlog, and cleanup contract, not a claim of general socket compatibility or throughput.

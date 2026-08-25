@@ -147,3 +147,6 @@
 - `epoll_create1` 当前接受 `flags == 0` 和 `EPOLL_CLOEXEC`，其它 flags 返回 `EINVAL`；
   `hello84` 锁定创建后关闭边界。跨 `execve` 的 CLOEXEC 生命周期未由该 raw gate 验收，
   继续以现有 exec fd 清理路径为实现边界。
+- `accept4`（hello85）先校验 flags；未知位在消费 TCP pending backlog 前返回 `EINVAL`。
+  验收随后以 `SOCK_CLOEXEC|SOCK_NONBLOCK` 成功接收并关闭一个 loopback 连接，锁定
+  backlog-preservation、flags 和资源清理边界，不宣称完整 socket 兼容性或性能。

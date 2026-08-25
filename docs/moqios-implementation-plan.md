@@ -609,6 +609,14 @@
 - `hello84` 已接入 build、init、ramdisk/QEMU smoke 顺序，紧随 `hello83`。
 - 本 gate 不扩展 exec 测试；CLOEXEC 跨 `execve` 的行为以现有 fd 清理路径为文档化边界。
 
+### accept4 strict flag/backlog raw acceptance gate ✅
+
+- `hello85` uses native syscall #131 with a loopback TCP listener and one pending client.
+- Unknown flags return `EINVAL` before consuming the pending connection; a subsequent
+  `SOCK_CLOEXEC|SOCK_NONBLOCK` accept succeeds and the fd is closed.
+- The gate records flag validation, backlog preservation, and cleanup only; broader socket
+  compatibility and performance remain outside this bounded contract.
+
 ### 性能优化第三阶段 ✅
 
 - ~~T1: lseek(402)~~ → SEEK_SET/SEEK_CUR/SEEK_END 文件定位
