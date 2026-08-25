@@ -285,8 +285,8 @@ pub fn build(b: *std.Build) void {
         "hello35", "hello36", "hello37", "hello38", "hello39",
          "hello40", "hello41", "hello42", "hello43", "hello44",
          "hello46", "hello47", "hello48", "hello49", "hello50",
-         "hello51", "hello52", "hello53", "hello54", "hello56",
-    "hello74", "hello75", "hello76", "hello77", "hello78", "hello79", "hello80", "hello81", "hello82", "hello83",
+      "hello51", "hello52", "hello53", "hello54", "hello56",
+      "hello74", "hello75", "hello76", "hello77", "hello78", "hello79", "hello80", "hello81", "hello82", "hello83",
     };
     for (c_programs) |name| addCUserProgram(b, name);
 
@@ -295,7 +295,7 @@ pub fn build(b: *std.Build) void {
     // (parsing the kernel's SysV initial stack) and the syscall wrappers.
     // init (PID 1) is the C replacement for user/init.S; its source lives in
     // servers/init/, everything else in user/.
-    const libc_programs = [_][]const u8{ "sh", "hello10", "hello45", "hello57", "hello58", "hello59", "hello60", "hello61", "hello62", "hello63", "hello64", "hello65", "hello66", "hello67", "hello68", "hello69", "hello70", "hello71", "hello72", "hello73" };
+    const libc_programs = [_][]const u8{ "sh", "hello10", "hello45", "hello57", "hello58", "hello59", "hello60", "hello61", "hello62", "hello63", "hello64", "hello65", "hello66", "hello67", "hello68", "hello69", "hello70", "hello71", "hello72", "hello73", "hello84" };
     for (libc_programs) |name| addLibcUserProgram(b, name, b.fmt("user/{s}.c", .{name}));
     addLibcUserProgram(b, "init", "servers/init/main.c");
     addLibcUserProgram(b, "syslogd", "servers/syslogd/main.c");
