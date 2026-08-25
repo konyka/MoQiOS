@@ -602,6 +602,13 @@
 - ~~T17: TCP TIME_WAIT优化~~ → 30s→15s + TCB复用
 - 编译验证: ✅ 全部通过
 
+### EPOLL_CLOEXEC raw acceptance gate ✅
+
+- `hello83`/`hello84` 验收 raw syscall #146：`flags == 0` 和 `EPOLL_CLOEXEC` 创建成功并可关闭，
+  无关 flags 返回 `EINVAL` 且不创建 fd。
+- `hello84` 已接入 build、init、ramdisk/QEMU smoke 顺序，紧随 `hello83`。
+- 本 gate 不扩展 exec 测试；CLOEXEC 跨 `execve` 的行为以现有 fd 清理路径为文档化边界。
+
 ### 性能优化第三阶段 ✅
 
 - ~~T1: lseek(402)~~ → SEEK_SET/SEEK_CUR/SEEK_END 文件定位

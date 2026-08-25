@@ -144,4 +144,6 @@
   唤醒次数、kmsg 读取延迟）。
 - CI（`.github`）对推送与 PR 运行 `zig build test` 并记录时长观察（非门禁）。
 - `sendmmsg/recvmmsg` 当前已完成 TCP-only bounded batch contract；完整 Unix/UDP message batching 仍需独立 transport 语义设计。
-- `epoll_create1` 当前严格拒绝未实现 flags；真正的 `EPOLL_CLOEXEC` fd 生命周期语义另行设计。
+- `epoll_create1` 当前接受 `flags == 0` 和 `EPOLL_CLOEXEC`，其它 flags 返回 `EINVAL`；
+  `hello84` 锁定创建后关闭边界。跨 `execve` 的 CLOEXEC 生命周期未由该 raw gate 验收，
+  继续以现有 exec fd 清理路径为实现边界。

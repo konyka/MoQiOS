@@ -2345,4 +2345,7 @@ The review/documentation part is complete when:
 `sendmmsg` and `recvmmsg` now process up to 16 TCP messages with explicit partial-count semantics. Unix/UDP batching remains outside this bounded contract.
 ### epoll_create1 flag boundary
 
-The current epoll implementation accepts only `flags == 0`; unsupported flags fail before fd allocation. `hello83` provides the raw acceptance gate.
+The current epoll implementation accepts `flags == 0` and `EPOLL_CLOEXEC` (`0x80000`); unrelated
+flags fail with `EINVAL` before fd allocation. `hello83` covers the zero/invalid boundary and
+`hello84` covers CLOEXEC creation plus close. The raw gate does not exercise exec inheritance;
+the existing exec fd cleanup path remains the lifecycle boundary.
