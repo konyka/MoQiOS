@@ -204,6 +204,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello82");  /* raw sched_getaffinity current-pid and CPU-0 mask boundary */
     run_test("hello83");  /* raw epoll_create1 flag boundary */
     run_test("hello84");  /* raw epoll_create1 CLOEXEC creation and close boundary */
+    run_test("hello85");  /* accept4 strict flags and backlog preservation */
 
     start_persistent_services();
 
