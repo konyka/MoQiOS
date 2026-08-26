@@ -8,6 +8,10 @@ const bo = @import("../lib/byte_order.zig");
 
 /// statx(dirfd, pathname_ptr, flags, mask, statxbuf_ptr) -> 0 or -errno.
 pub fn statx(pathname_ptr: u64, statxbuf_ptr: u64) i64 {
+    // Validate the full destination before opening a temporary fd; this keeps
+    // bad output pointers from causing needless fd-table mutation.
+    if (!copy.validateUserBufferWritable(statxbuf_ptr, 144)) return -14; // EFAULT
+
     // Read pathname
     var name_buf: [256]u8 = undefined;
     if (pathname_ptr == 0 or pathname_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT
@@ -78,7 +82,6 @@ pub fn statx(pathname_ptr: u64, statxbuf_ptr: u64) i64 {
     }
 
     // Write statx buffer to user space
-    if (statxbuf_ptr == 0 or statxbuf_ptr >= 0x0000_8000_0000_0000) return -14;
     if (copy.copyToUser(@ptrFromInt(statxbuf_ptr), &stat_buf, stat_buf.len) != stat_buf.len) return -14;
     return 0;
 }
