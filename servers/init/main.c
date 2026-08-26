@@ -206,6 +206,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello84");  /* raw epoll_create1 CLOEXEC creation and close boundary */
     run_test("hello85");  /* accept4 strict flags and backlog preservation */
     run_test("hello86");  /* raw readlink procfs fd and truncation boundary */
+    run_test("hello87");  /* statx output fault and temporary-fd cleanup */
 
     start_persistent_services();
 
