@@ -2319,3 +2319,7 @@ bits (for example `0x40000000`) return `EINVAL` before dequeuing a pending TCP c
 `hello85` establishes one loopback connection, verifies the rejected call leaves it pending, then
 accepts it with `SOCK_CLOEXEC|SOCK_NONBLOCK` and closes the resulting fd. This is a bounded flag,
 backlog, and cleanup contract, not a claim of general socket compatibility or throughput.
+**`readlink` procfs fd-target boundary**：raw syscall #182 resolves `/proc/self/exe` to the current
+shell target and `/proc/self/fd/N` to the existing descriptor's bounded type string. Invalid path or
+output pointers, and zero `bufsiz`, return `EFAULT`; unused/invalid fd paths return `EINVAL`.
+`hello86` covers ordinary-fd output, bounded truncation, error precedence, and no performance claim.

@@ -150,3 +150,6 @@
 - `accept4`（hello85）先校验 flags；未知位在消费 TCP pending backlog 前返回 `EINVAL`。
   验收随后以 `SOCK_CLOEXEC|SOCK_NONBLOCK` 成功接收并关闭一个 loopback 连接，锁定
   backlog-preservation、flags 和资源清理边界，不宣称完整 socket 兼容性或性能。
+- `readlink`（hello86）锁定 raw syscall #182 的 `/proc/self/exe` 与普通 `/proc/self/fd/N`
+  目标字符串、截断返回值、坏指针/零 bufsiz 的 `EFAULT`、无效 fd 的 `EINVAL`；仅覆盖
+  现有 procfs ABI 与错误边界，不宣称 procfs 重构、完整符号链接兼容性或性能。

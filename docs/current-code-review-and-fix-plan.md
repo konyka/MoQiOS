@@ -2356,3 +2356,9 @@ Raw syscall #131 now rejects unrelated flags before the TCP pending queue is con
 `SOCK_CLOEXEC|SOCK_NONBLOCK` and closes the returned descriptor. The acceptance covers errno
 ordering, pending-connection preservation, recognized descriptor flags, and cleanup only; it
 does not claim broader socket or performance semantics.
+### readlink procfs fd-target boundary
+
+Raw syscall #182 exposes `/proc/self/exe` and `/proc/self/fd/N` target strings with bounded output.
+`hello86` verifies ordinary-fd resolution, truncation, `EFAULT` for invalid pointers or zero size,
+and `EINVAL` for an unused descriptor. This is a narrow procfs ABI acceptance and makes no
+performance or broader symlink-compatibility claim.

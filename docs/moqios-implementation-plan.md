@@ -617,6 +617,12 @@
 - The gate records flag validation, backlog preservation, and cleanup only; broader socket
   compatibility and performance remain outside this bounded contract.
 
+### readlink procfs fd-target raw acceptance gate ✅
+
+- `hello86` covers native syscall #182 for `/proc/self/exe` and ordinary `/proc/self/fd/N`.
+- It verifies bounded truncation, `EFAULT` for bad pointers or zero `bufsiz`, and `EINVAL` for
+  an invalid descriptor; the gate is limited to current procfs ABI behavior.
+
 ### 性能优化第三阶段 ✅
 
 - ~~T1: lseek(402)~~ → SEEK_SET/SEEK_CUR/SEEK_END 文件定位
