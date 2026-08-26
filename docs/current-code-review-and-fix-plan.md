@@ -2364,7 +2364,8 @@ and `EINVAL` for an unused descriptor. This is a narrow procfs ABI acceptance an
 performance or broader symlink-compatibility claim.
 ### statx temporary-fd/output boundary
 
-Raw statx syscall #183 closes its temporary lookup descriptor before copying the output record.
+Raw statx syscall #183 validates the complete 144-byte writable output destination before opening
+its temporary lookup descriptor, then closes that descriptor before the final output copyout.
 `hello87` verifies valid output, `EFAULT` for a bad destination, repeated bad-output calls beyond
 the fd-table capacity, and a subsequent normal open/close. The acceptance locks resource cleanup
 and error ordering without claiming a broader statx ABI.

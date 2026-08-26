@@ -33,9 +33,9 @@ void _start(void) {
     failures += check(statbuf[0] != 0 || statbuf[4] != 0,
                       "valid statx output is populated");
 
-    /* statx must close its temporary fd before discovering the bad output
-     * pointer. Repeat beyond the descriptor table capacity, then prove a
-     * regular open still gets a descriptor. */
+    /* The bad output pointer is rejected before temporary fd allocation.
+     * Repeat beyond the descriptor table capacity, then prove a regular open
+     * still gets a descriptor. */
     for (int i = 0; i < MAX_FDS + 8; i++) {
         failures += check(syscall5(SYS_STATX, AT_FDCWD, (uint64_t)path, 0,
                                     STATX_BASIC_STATS, 0) == -EFAULT,

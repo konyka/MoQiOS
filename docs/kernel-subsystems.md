@@ -2324,6 +2324,7 @@ shell target and `/proc/self/fd/N` to the existing descriptor's bounded type str
 output pointers, and zero `bufsiz`, return `EFAULT`; unused/invalid fd paths return `EINVAL`.
 `hello86` covers ordinary-fd output, bounded truncation, error precedence, and no performance claim.
 **`statx` temporary-fd/output boundary**：raw syscall #183 accepts a valid path and fills the
-bounded statx output record. It closes the temporary lookup fd before validating/copying the output;
-bad output pointers return `EFAULT` without leaking descriptors. `hello87` repeats the bad-output
-case beyond `MAX_FDS`, then opens/closes a normal file to lock the close-before-open contract.
+bounded statx output record. It validates the complete 144-byte writable output buffer before opening
+the temporary lookup fd; bad output pointers return `EFAULT` without any fd-table mutation. The
+normal metadata path closes its temporary descriptor before the final copyout. `hello87` repeats the
+bad-output case beyond `MAX_FDS`, then opens/closes a normal file to lock the no-leak contract.

@@ -625,9 +625,10 @@
 
 ### statx temporary-fd/output raw acceptance gate ✅
 
-- `hello87` covers native syscall #183 with a valid path and statx output buffer.
+- `hello87` covers native syscall #183 with a valid path and statx output buffer; statx prevalidates the full 144-byte destination before temporary fd allocation, and the normal metadata path closes its temporary descriptor before the final copyout.
 - Bad output returns `EFAULT`; repeated bad-output calls beyond the fd-table capacity are followed
-  by a successful normal open/close, proving temporary lookup descriptors are closed first.
+  by a successful normal open/close, proving bad output is rejected before temporary lookup
+  descriptor allocation.
 
 ### 性能优化第三阶段 ✅
 
