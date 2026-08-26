@@ -153,3 +153,6 @@
 - `readlink`（hello86）锁定 raw syscall #182 的 `/proc/self/exe` 与普通 `/proc/self/fd/N`
   目标字符串、截断返回值、坏指针/零 bufsiz 的 `EFAULT`、无效 fd 的 `EINVAL`；仅覆盖
   现有 procfs ABI 与错误边界，不宣称 procfs 重构、完整符号链接兼容性或性能。
+- `statx`（hello87）锁定 raw syscall #183 的有效路径/输出、坏输出指针 `EFAULT`，以及
+  close-before-open 的临时 fd 清理顺序：重复坏输出超过 `MAX_FDS` 后仍可正常 open/close；
+  仅覆盖资源清理与错误边界，不宣称完整 statx 兼容性或性能。

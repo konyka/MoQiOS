@@ -2323,3 +2323,7 @@ backlog, and cleanup contract, not a claim of general socket compatibility or th
 shell target and `/proc/self/fd/N` to the existing descriptor's bounded type string. Invalid path or
 output pointers, and zero `bufsiz`, return `EFAULT`; unused/invalid fd paths return `EINVAL`.
 `hello86` covers ordinary-fd output, bounded truncation, error precedence, and no performance claim.
+**`statx` temporary-fd/output boundary**：raw syscall #183 accepts a valid path and fills the
+bounded statx output record. It closes the temporary lookup fd before validating/copying the output;
+bad output pointers return `EFAULT` without leaking descriptors. `hello87` repeats the bad-output
+case beyond `MAX_FDS`, then opens/closes a normal file to lock the close-before-open contract.

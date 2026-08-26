@@ -2362,3 +2362,9 @@ Raw syscall #182 exposes `/proc/self/exe` and `/proc/self/fd/N` target strings w
 `hello86` verifies ordinary-fd resolution, truncation, `EFAULT` for invalid pointers or zero size,
 and `EINVAL` for an unused descriptor. This is a narrow procfs ABI acceptance and makes no
 performance or broader symlink-compatibility claim.
+### statx temporary-fd/output boundary
+
+Raw statx syscall #183 closes its temporary lookup descriptor before copying the output record.
+`hello87` verifies valid output, `EFAULT` for a bad destination, repeated bad-output calls beyond
+the fd-table capacity, and a subsequent normal open/close. The acceptance locks resource cleanup
+and error ordering without claiming a broader statx ABI.

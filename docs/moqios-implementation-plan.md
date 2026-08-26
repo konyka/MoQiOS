@@ -623,6 +623,12 @@
 - It verifies bounded truncation, `EFAULT` for bad pointers or zero `bufsiz`, and `EINVAL` for
   an invalid descriptor; the gate is limited to current procfs ABI behavior.
 
+### statx temporary-fd/output raw acceptance gate ✅
+
+- `hello87` covers native syscall #183 with a valid path and statx output buffer.
+- Bad output returns `EFAULT`; repeated bad-output calls beyond the fd-table capacity are followed
+  by a successful normal open/close, proving temporary lookup descriptors are closed first.
+
 ### 性能优化第三阶段 ✅
 
 - ~~T1: lseek(402)~~ → SEEK_SET/SEEK_CUR/SEEK_END 文件定位
