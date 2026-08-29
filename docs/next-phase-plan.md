@@ -157,3 +157,6 @@
    先验证完整 144-byte 输出缓冲区、再分配临时 fd 的清理顺序：重复坏输出超过 `MAX_FDS`
    后仍可正常 open/close；
   仅覆盖资源清理与错误边界，不宣称完整 statx 兼容性或性能。
+- `copy_file_range`（hello88）锁定 raw syscall #184 的 regular-file 有界复制：显式 offset
+  回写并恢复 descriptor offset，空指针使用并推进隐式 offset；验收内容/大小、坏 fd/非 regular
+  fd/坏 offset 指针、零长度及超长参数错误与无副作用边界，不宣称吞吐或任意部分 I/O 回滚。

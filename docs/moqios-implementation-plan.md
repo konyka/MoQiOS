@@ -630,6 +630,12 @@
   by a successful normal open/close, proving bad output is rejected before temporary lookup
   descriptor allocation.
 
+### copy_file_range bounded acceptance gate ✅
+
+- `hello88` covers native syscall #184 with regular-file explicit/implicit offsets, copied content and
+  size, explicit offset writeback/descriptor restoration, and bounded preflight errors.
+- The gate does not claim throughput or rollback for failures after partial I/O.
+
 ### 性能优化第三阶段 ✅
 
 - ~~T1: lseek(402)~~ → SEEK_SET/SEEK_CUR/SEEK_END 文件定位

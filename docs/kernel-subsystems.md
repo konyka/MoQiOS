@@ -2328,3 +2328,8 @@ bounded statx output record. It validates the complete 144-byte writable output 
 the temporary lookup fd; bad output pointers return `EFAULT` without any fd-table mutation. The
 normal metadata path closes its temporary descriptor before the final copyout. `hello87` repeats the
 bad-output case beyond `MAX_FDS`, then opens/closes a normal file to lock the no-leak contract.
+**`copy_file_range` bounded offsets/errors**：raw syscall #184 accepts regular-file pairs and
+`flags == 0`; explicit offset pointers are copied back while descriptor offsets are restored,
+whereas null pointers use and advance descriptor positions. `hello88` covers copied contents/size,
+invalid fd/nonregular/offset pointers, zero or oversized lengths, and pre-I/O no-mutation errors.
+This is an ABI/rollback contract only, not a throughput claim.

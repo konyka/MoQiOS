@@ -2369,3 +2369,9 @@ its temporary lookup descriptor, then closes that descriptor before the final ou
 `hello87` verifies valid output, `EFAULT` for a bad destination, repeated bad-output calls beyond
 the fd-table capacity, and a subsequent normal open/close. The acceptance locks resource cleanup
 and error ordering without claiming a broader statx ABI.
+### copy_file_range bounded offsets/errors
+
+Raw syscall #184 copies between regular files with explicit or implicit offsets. `hello88` verifies
+explicit offset writeback and descriptor restoration, implicit offset advancement, copied content and
+size, and preflight `EBADF`/`EINVAL`/`EFAULT` errors including zero or oversized lengths. The contract
+does not claim universal error rollback after partial I/O or any throughput improvement.
