@@ -208,6 +208,7 @@
 | hello39 | setsockopt/getsockopt 用户复制、SO_ERROR 与 sockaddr 长度校验 |
 | hello40 | SysV IPC_SET 与 rt_sigsuspend 失败复制不改变状态 |
 | hello41 | copy_file_range fd 边界与显式 offset 回滚 |
+| hello89 | epoll_pwait/epoll_pwait2 临时信号掩码、超时与参数边界 |
 
 ## 快速开始
 
