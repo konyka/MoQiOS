@@ -86,11 +86,10 @@ var sigreturn_trampoline_phys: u64 = 0;
 
 /// Send a signal to a process. Returns true on success.
 /// v53.44: Uses atomic OR for SMP-safe signal bit setting.
-/// If the target is blocked in a wait primitive, wake and kick it so it can
-/// observe the signal on resume: the wait loops re-check pending_signals after
-/// a non-grant wake and either return -EINTR (handled signal) or terminate
-/// (fatal default action). Previously a task blocked in e.g. semop or
-/// epoll_wait never noticed SIGKILL — unkillable tasks.
+/// If the target is blocked in a wait primitive and the pending signal is
+/// actionable under its current mask, wake and kick it so it can observe the
+/// signal on resume. Masked or ignored signals remain pending without waking
+/// the wait.
 pub fn sendSignal(target_tid: u32, signum: u32) bool {
     if (signum == 0 or signum > 31) return false;
 
@@ -109,11 +108,14 @@ pub fn sendSignal(target_tid: u32, signum: u32) bool {
     return false;
 }
 
-/// Wake a blocked task so it can observe a newly pending signal on resume.
-/// unblockTask re-enqueues it, kickRemoteForTask IPIs the CPU it last ran on.
+/// Wake a blocked task so it can observe an actionable pending signal on
+/// resume. unblockTask re-enqueues it, kickRemoteForTask IPIs the CPU it last
+/// ran on.
 pub fn kickIfBlocked(idx: u32) void {
     const t = task.getTask(idx) orelse return;
-    if (t.state == .blocked) {
+    // Keep blocked waits asleep for signals masked by the current wait mask.
+    // The pending bit remains set and can wake the task after the mask changes.
+    if (t.state == .blocked and pendingActionable(t)) {
         task.unblockTask(idx);
         task.kickRemoteForTask(idx);
     }
@@ -226,7 +228,7 @@ pub fn pendingActionable(t: *task.Task) bool {
     while (bits != 0) {
         const bit: u5 = @intCast(@ctz(bits));
         bits &= bits - 1;
-        if (t.signal_handlers[bit] != 0 or !defaultSignalAction(@as(u32, bit) + 1)) return true;
+        if ((t.signal_handlers[bit] != 0 and t.signal_handlers[bit] != 1) or !defaultSignalAction(@as(u32, bit) + 1)) return true;
     }
     return false;
 }

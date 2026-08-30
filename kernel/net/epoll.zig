@@ -54,6 +54,8 @@ pub const MAX_EPOLL_ITEMS: u8 = 128;
 /// Approximate timer tick interval (ms).
 const TICK_MS: u64 = 10;
 
+// Timed epoll waits need an external wakeup: a task parked in hlt cannot
+// execute the in-line deadline check until something makes it runnable.
 /// EpollEvent — matches Linux struct epoll_event (8 bytes payload).
 pub const EpollEvent = extern struct {
     events: u32,
@@ -64,6 +66,7 @@ pub const EpollEvent = extern struct {
 /// waiter's kernel stack, modelled after eventfd.zig.
 const WaitNode = struct {
     task_idx: u32,
+    generation: u64,
     granted: bool = false,
     next: ?*WaitNode = null,
 };
@@ -98,6 +101,11 @@ pub const EpollInstance = struct {
     /// Cross-process references (fork/clone) — epollDestroy frees at 0 only.
     ref_count: u32 = 1,
 };
+
+var wait_deadlines: [task_mod.MAX_TASKS]u64 = @splat(0);
+var wait_instances: [task_mod.MAX_TASKS]usize = @splat(0);
+var wait_generations: [task_mod.MAX_TASKS]u64 = @splat(0);
+pub var epoll_wait_bm: u64 = 0;
 
 // ---- Global pool ----
 
@@ -585,12 +593,21 @@ fn blockOnEpoll(inst: *EpollInstance, start_tick: u64, timeout_ms: i32) BlockOut
         return .event;
     }
 
+    const generation = @atomicRmw(u64, &wait_generations[my_idx], .Add, 1, .seq_cst) +% 1;
     var node = WaitNode{
         .task_idx = my_idx,
+        .generation = generation,
         .granted = false,
         .next = inst.waiter,
     };
     inst.waiter = &node;
+
+    if (timeout_ms > 0) {
+        const ticks = (@as(u64, @intCast(timeout_ms)) + TICK_MS - 1) / TICK_MS;
+        @atomicStore(u64, &wait_deadlines[my_idx], start_tick + ticks, .seq_cst);
+        @atomicStore(usize, &wait_instances[my_idx], @intFromPtr(inst), .seq_cst);
+        _ = @atomicRmw(u64, &epoll_wait_bm, .Or, @as(u64, 1) << @intCast(my_idx), .seq_cst);
+    }
 
     if (task_mod.getTask(my_idx)) |t| {
         t.state = .blocked;
@@ -610,6 +627,7 @@ fn blockOnEpoll(inst: *EpollInstance, start_tick: u64, timeout_ms: i32) BlockOut
                 if (!granted) removeWaiterLocked(inst, &node);
                 inst.spin.release(s2);
                 if (!granted) {
+                    disarmWaitDeadline(my_idx, generation);
                     // We set our own state to .blocked above — restore it.
                     task_mod.unblockTask(my_idx);
                     return .timeout;
@@ -627,6 +645,7 @@ fn blockOnEpoll(inst: *EpollInstance, start_tick: u64, timeout_ms: i32) BlockOut
                 if (!granted) removeWaiterLocked(inst, &node);
                 inst.spin.release(s2);
                 if (!granted) {
+                    disarmWaitDeadline(my_idx, generation);
                     task_mod.unblockTask(my_idx);
                     if (sig_mod.pendingFatal(ct)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
                     return .interrupted;
@@ -635,7 +654,57 @@ fn blockOnEpoll(inst: *EpollInstance, start_tick: u64, timeout_ms: i32) BlockOut
         }
         asm volatile ("sti; hlt");
     }
+    disarmWaitDeadline(my_idx, generation);
     return .event;
+}
+
+fn disarmWaitDeadline(task_idx: u32, generation: u64) void {
+    if (@atomicLoad(u64, &wait_generations[task_idx], .seq_cst) != generation) return;
+    @atomicStore(u64, &wait_deadlines[task_idx], 0, .seq_cst);
+    @atomicStore(usize, &wait_instances[task_idx], 0, .seq_cst);
+    _ = @atomicRmw(u64, &epoll_wait_bm, .And, ~(@as(u64, 1) << @intCast(task_idx)), .seq_cst);
+}
+
+/// Wake expired waiters so their normal epoll loop can return a timeout.
+/// The instance lock serializes this unlink with readiness and signal cleanup.
+pub fn timerTick(now_tick: u64) void {
+    var bm = @atomicLoad(u64, &epoll_wait_bm, .acquire);
+    while (bm != 0) {
+        const i: u6 = @truncate(@ctz(bm));
+        bm &= bm - 1;
+        const idx: u32 = i;
+        const deadline = @atomicLoad(u64, &wait_deadlines[idx], .seq_cst);
+        if (deadline == 0 or now_tick < deadline) continue;
+        const generation = @atomicLoad(u64, &wait_generations[idx], .seq_cst);
+        const inst_addr = @atomicLoad(usize, &wait_instances[idx], .seq_cst);
+        if (inst_addr == 0) {
+            disarmWaitDeadline(idx, generation);
+            continue;
+        }
+        const inst: *EpollInstance = @ptrFromInt(inst_addr);
+        const saved = inst.spin.acquire();
+        var prev: ?*WaitNode = null;
+        var current = inst.waiter;
+        var unlinked = false;
+        while (current) |node| {
+            if (node.task_idx == idx and node.generation == generation and
+                @atomicLoad(u64, &wait_deadlines[idx], .seq_cst) == deadline and
+                @atomicLoad(usize, &wait_instances[idx], .seq_cst) == @intFromPtr(inst)) {
+                if (prev) |p| p.next = node.next else inst.waiter = node.next;
+                node.next = null;
+                unlinked = true;
+                break;
+            }
+            prev = node;
+            current = node.next;
+        }
+        inst.spin.release(saved);
+        disarmWaitDeadline(idx, generation);
+        if (unlinked) {
+            task_mod.unblockTask(idx);
+            task_mod.kickRemoteForTask(idx);
+        }
+    }
 }
 
 /// Unlink a wait node from the instance waiter list. Caller holds inst.spin.
@@ -690,8 +759,28 @@ pub fn epollDestroy(epoll_idx: u32) void {
     // Take the instance lock before wiping: an IRQ-side epollNotify may hold
     // it — wait for that critical section to finish.
     const isaved = inst.spin.acquire();
-    // Wake any task blocked in blockOnEpoll so it can observe the destroy.
-    wakeWaiterLocked(inst);
+    // Wait nodes live on blocked waiters' kernel stacks. Snapshot the complete
+    // chain while it is protected, so no node is dereferenced after its task
+    // has been made runnable.
+    const DetachedWaiter = struct {
+        task_idx: u32,
+        generation: u64,
+    };
+    var detached_waiters: [task_mod.MAX_TASKS]DetachedWaiter = undefined;
+    var detached_count: usize = 0;
+    var detached = inst.waiter;
+    inst.waiter = null;
+    while (detached) |node| {
+        const next = node.next;
+        detached_waiters[detached_count] = .{
+            .task_idx = node.task_idx,
+            .generation = node.generation,
+        };
+        detached_count += 1;
+        node.next = null;
+        @atomicStore(bool, &node.granted, true, .release);
+        detached = next;
+    }
     if (epoll_idx < 32) {
         valid_epoll_bm &= ~(@as(u32, 1) << @intCast(epoll_idx));
     }
@@ -700,4 +789,18 @@ pub fn epollDestroy(epoll_idx: u32) void {
     epoll_pool[epoll_idx] = .{};
     inst.spin = spin;
     inst.spin.release(isaved);
+
+    // The instance is detached before any task is woken. Deadline state is
+    // cleared only if this node still owns the matching task generation.
+    for (detached_waiters[0..detached_count]) |waiter| {
+        if (@atomicLoad(u64, &wait_generations[waiter.task_idx], .seq_cst) != waiter.generation) continue;
+        disarmWaitDeadline(waiter.task_idx, waiter.generation);
+        if (@atomicLoad(u64, &wait_generations[waiter.task_idx], .seq_cst) != waiter.generation) continue;
+        if (task_mod.getTask(waiter.task_idx)) |task| {
+            if (task.state == .blocked) {
+                task_mod.unblockTask(waiter.task_idx);
+                task_mod.kickRemoteForTask(waiter.task_idx);
+            }
+        }
+    }
 }

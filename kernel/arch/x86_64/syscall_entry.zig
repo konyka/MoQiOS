@@ -19,6 +19,7 @@
 const serial = @import("serial.zig");
 const fmt = @import("../../lib/fmt.zig");
 const errno = @import("../../lib/errno.zig");
+const epoll_policy = @import("../../net/epoll_policy.zig");
 const unsupported_policy = @import("../../proc/unsupported_policy.zig");
 const cpu_capacity = @import("../cpu_capacity.zig");
 
@@ -678,7 +679,6 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             checkSignalsOnSyscallReturn(frame);
         },
         146 => { // epoll_create1(flags)
-            const epoll_policy = @import("../../net/epoll_policy.zig");
             const policy_result = epoll_policy.validate(@truncate(frame.rdi));
             if (policy_result != 0) {
                 frame.rax = @bitCast(policy_result);
@@ -1226,12 +1226,11 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallClockNanosleep(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, frame.r10));
         },
         248 => { // epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)
-            _ = frame.r8; // sigsetsize
-            _ = frame.r9; // sigmask (simplified: same as epoll_wait)
             const epfd_idx: u32 = @truncate(frame.rdi);
             const max_ev: u32 = @truncate(frame.rdx);
             const timeout: i32 = @bitCast(@as(u32, @truncate(frame.r10)));
-            frame.rax = @bitCast(epollWaitFd(epfd_idx, frame.rsi, max_ev, timeout));
+            frame.rax = @bitCast(syscallEpollPwait(epfd_idx, frame.rsi, max_ev, timeout, frame.r8, frame.r9));
+            checkSignalsOnSyscallReturn(frame);
         },
         249 => { // getcpu(cpu*, node*, unused)
             frame.rax = @bitCast(syscallGetcpu(frame.rdi, frame.rsi));
@@ -2163,23 +2162,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         441 => { // epoll_pwait2(epfd, events, maxevents, timeout_ts, sigmask, sigsetsize)
             const epfd_idx: u32 = @truncate(frame.rdi);
             const max_ev: u32 = @truncate(frame.rdx);
-            const timeout_ts_ptr = frame.r10;
-            // Convert timespec (tv_sec, tv_nsec) to milliseconds
-            var timeout_ms: i32 = -1; // infinite
-            if (timeout_ts_ptr != 0 and timeout_ts_ptr < 0x0000_8000_0000_0000) {
-                const copy2 = @import("../../mm/copy_from_user.zig");
-                const bo2 = @import("../../lib/byte_order.zig");
-                var ts_buf: [16]u8 = undefined;
-                const ts_n = copy2.copyFromUser(&ts_buf, @ptrFromInt(timeout_ts_ptr), 16);
-                if (ts_n >= 16) {
-                    const tv_sec: i64 = @bitCast(bo2.readU64Le(ts_buf[0..8]));
-                    const tv_nsec: i64 = @bitCast(bo2.readU64Le(ts_buf[8..16]));
-                    timeout_ms = @intCast(@min(@max(tv_sec * 1000 + @divTrunc(tv_nsec, 1_000_000), 0), 0x7FFFFFFF));
-                }
-            }
-            _ = frame.r8; // sigmask ignored
-            _ = frame.r9; // sigsetsize ignored
-            frame.rax = @bitCast(epollWaitFd(epfd_idx, frame.rsi, max_ev, timeout_ms));
+            frame.rax = @bitCast(syscallEpollPwait2(epfd_idx, frame.rsi, max_ev, frame.r10, frame.r8, frame.r9));
+            checkSignalsOnSyscallReturn(frame);
         },
         // ── v45.0: Linux standard 424+ corrected numbering ──────────────────
         // (v44.0 #335-#343 were wrong MoQiOS custom numbers; deleted in v45.0)
@@ -2645,6 +2629,51 @@ fn epollCtlFd(fd: u32, op: i32, target: i32, event: u64) i64 {
 fn epollWaitFd(fd: u32, events: u64, max_events: u32, timeout: i32) i64 {
     const epoll_mod = @import("../../net/epoll.zig");
     return if (epollFdIndex(fd)) |idx| epoll_mod.epollWait(idx, events, max_events, timeout) else -9;
+}
+
+fn syscallEpollPwait(fd: u32, events: u64, max_events: u32, timeout: i32, sigmask_ptr: u64, sigsetsize: u64) i64 {
+    if (epoll_policy.validateTemporaryMask(sigmask_ptr, sigsetsize) != 0) return errno.EINVAL;
+    var temporary_mask: u64 = 0;
+    if (sigmask_ptr != 0) {
+        const copy = @import("../../mm/copy_from_user.zig");
+        if (!copy.validateUserBuffer(sigmask_ptr, 8)) return errno.EFAULT;
+        if (copy.copyFromUser(@as([*]u8, @ptrCast(&temporary_mask))[0..8], @ptrFromInt(sigmask_ptr), 8) != 8) return errno.EFAULT;
+    }
+    return withTemporaryEpollMask(fd, events, max_events, timeout, if (sigmask_ptr == 0) null else temporary_mask);
+}
+
+fn syscallEpollPwait2(fd: u32, events: u64, max_events: u32, timeout_ptr: u64, sigmask_ptr: u64, sigsetsize: u64) i64 {
+    if (epoll_policy.validateTemporaryMask(sigmask_ptr, sigsetsize) != 0) return errno.EINVAL;
+    var timeout_ms: i32 = -1;
+    if (timeout_ptr != 0) {
+        const copy = @import("../../mm/copy_from_user.zig");
+        const bo = @import("../../lib/byte_order.zig");
+        var ts_buf: [16]u8 = undefined;
+        if (!copy.validateUserBuffer(timeout_ptr, ts_buf.len) or copy.copyFromUser(&ts_buf, @ptrFromInt(timeout_ptr), ts_buf.len) != ts_buf.len) return errno.EFAULT;
+        const tv_sec: i64 = @bitCast(bo.readU64Le(ts_buf[0..8]));
+        const tv_nsec: i64 = @bitCast(bo.readU64Le(ts_buf[8..16]));
+        timeout_ms = switch (epoll_policy.timeoutMilliseconds(tv_sec, tv_nsec)) {
+            .milliseconds => |value| value,
+            .invalid => return errno.EINVAL,
+        };
+    }
+    var temporary_mask: u64 = 0;
+    if (sigmask_ptr != 0) {
+        const copy = @import("../../mm/copy_from_user.zig");
+        if (!copy.validateUserBuffer(sigmask_ptr, 8)) return errno.EFAULT;
+        if (copy.copyFromUser(@as([*]u8, @ptrCast(&temporary_mask))[0..8], @ptrFromInt(sigmask_ptr), 8) != 8) return errno.EFAULT;
+    }
+    return withTemporaryEpollMask(fd, events, max_events, timeout_ms, if (sigmask_ptr == 0) null else temporary_mask);
+}
+
+fn withTemporaryEpollMask(fd: u32, events: u64, max_events: u32, timeout: i32, mask: ?u64) i64 {
+    if (mask == null) return epollWaitFd(fd, events, max_events, timeout);
+    const sched = @import("../../proc/sched.zig");
+    const current = sched.currentTask() orelse return -1;
+    const saved_mask = current.signal_mask;
+    current.signal_mask = epoll_policy.temporaryMask(mask.?);
+    defer current.signal_mask = saved_mask;
+    return epollWaitFd(fd, events, max_events, timeout);
 }
 
 // Module imports for extracted syscall implementations

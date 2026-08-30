@@ -646,6 +646,9 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
             // abs_timeout) — same deadline-bitmap pattern as the futex scan.
             const posix_mq_mod = @import("../ipc/posix_mq.zig");
             posix_mq_mod.timerTick(now_ns);
+            // Drive finite epoll waits whose only wake source is timeout.
+            const epoll_mod = @import("../net/epoll.zig");
+            epoll_mod.timerTick(idt.getTickCount());
             // v53.47: Atomic load — alarm_bm/itimer_bm are modified from syscall context
             // on other CPUs. Non-atomic read-modify-write could lose newly set bits.
             var bm = @atomicLoad(u64, &alarm_bm, .acquire) |
