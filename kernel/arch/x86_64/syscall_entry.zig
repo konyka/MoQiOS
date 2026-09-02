@@ -696,6 +696,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                                 .epoll_idx = @intCast(epoll_idx),
                                 .fd_flags = if ((@as(u32, @truncate(frame.rdi)) & epoll_policy.EPOLL_CLOEXEC) != 0) 1 else 0,
                             };
+                            task.fd_table.publishFd(epfd);
                             frame.rax = @bitCast(@as(i64, epfd));
                         } else {
                             epoll_mod.epollDestroy(@intCast(epoll_idx));
@@ -4544,6 +4545,7 @@ fn syscallMemfdCreate(name_ptr: u64, flags: u32) i64 {
         .pipe_idx = pipe_idx,
         .writable = true,
     };
+    t.fd_table.publishFd(fd_slot);
 
     return @intCast(fd_slot);
 }
@@ -5483,6 +5485,7 @@ fn syscallPidfdOpen(pid: u32, flags: u32) i64 {
         .fd_type = .proc_file,
         .inode_id = 0x4000_0000_0000_0000 + (@as(u64, target.tid) << 8),
     };
+    cur.fd_table.publishFd(fd_slot);
     return @intCast(fd_slot);
 }
 
@@ -5617,8 +5620,7 @@ fn syscallDup(oldfd: u32) i64 {
     if (oldfd >= vfs_mod.MAX_FDS) return -9; // EBADF
     if (cur.fd_table.fds[oldfd].fd_type == .none) return -9; // EBADF
 
-    const newfd = cur.fd_table.allocFdAtLeast(0) orelse return -24; // EMFILE
-    return cur.fd_table.dup2(oldfd, newfd);
+    return cur.fd_table.dupFdAtLeast(oldfd, 0, 0);
 }
 
 /// alarm(seconds) — schedule SIGALRM after `seconds` seconds.
