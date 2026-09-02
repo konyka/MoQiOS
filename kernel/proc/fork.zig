@@ -10,7 +10,6 @@ const fmt = @import("../lib/fmt.zig");
 pub fn fork(frame: *SyscallFrame) i64 {
     const sched = @import("sched.zig");
     const task_mod = @import("task.zig");
-    const vfs_mod = @import("../fs/vfs.zig");
 
     const parent_idx = sched.currentTaskIndex() orelse return -1;
     const parent = task_mod.getTask(parent_idx) orelse return -1;
@@ -71,27 +70,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.as_used = parent.as_used;
     child.data_used = parent.data_used;
 
-    for (0..vfs_mod.MAX_FDS) |i| {
-        child.fd_table.fds[i] = parent.fd_table.fds[i];
-        switch (child.fd_table.fds[i].fd_type) {
-            .pipe_read, .pipe_write => {
-                const pidx = child.fd_table.fds[i].pipe_idx;
-                if (pidx < 16) {
-                    _ = vfs_mod.pipeRetain(pidx, child.fd_table.fds[i].fd_type == .pipe_write);
-                }
-            },
-            // The shallow copy duplicates readahead page pointers that stay
-            // owned by the parent — drop the child's copy (UAF/double-free).
-            .fat32_file => {
-                const readahead = @import("../fs/readahead.zig");
-                readahead.resetStateForFork(&child.fd_table.fds[i].readahead_state);
-            },
-            else => {},
-        }
-    }
-    // v53.44 fix: ext2/tcp/epoll/unix/timerfd resources are now refcounted —
-    // one reference per process per distinct index (see vfs.retainSharedResources).
-    vfs_mod.retainSharedResources(child.fd_table);
+    parent.fd_table.inheritFdTable(child.fd_table);
 
     for (0..31) |i| {
         child.signal_handlers[i] = parent.signal_handlers[i];

@@ -298,25 +298,7 @@ pub fn clone(
         child.fd_table.alloc_limit = child.nofile_cur;
 
         // v53.50: Copy free_bm bitmap — child inherits parent's fd occupancy state.
-        child.fd_table.free_bm = parent.fd_table.free_bm;
-        for (0..vfs_mod.MAX_FDS) |i| {
-            child.fd_table.fds[i] = parent.fd_table.fds[i];
-            if (child.fd_table.fds[i].fd_type == .pipe_read or child.fd_table.fds[i].fd_type == .pipe_write) {
-                const pidx = child.fd_table.fds[i].pipe_idx;
-                if (pidx < 16) {
-                    _ = vfs_mod.pipeRetain(pidx, child.fd_table.fds[i].fd_type == .pipe_write);
-                }
-            }
-            // The shallow copy duplicates readahead page pointers that stay
-            // owned by the parent — drop the child's copy (UAF/double-free).
-            if (child.fd_table.fds[i].fd_type == .fat32_file) {
-                const readahead = @import("../../fs/readahead.zig");
-                readahead.resetStateForFork(&child.fd_table.fds[i].readahead_state);
-            }
-        }
-        // v53.44 fix: ext2/tcp/epoll/unix/timerfd resources are now refcounted —
-        // one reference per process per distinct index (see vfs.retainSharedResources).
-        vfs_mod.retainSharedResources(child.fd_table);
+        parent.fd_table.inheritFdTable(child.fd_table);
     }
 
     // Signal handlers, mask, environment, cwd, pgid, sid
