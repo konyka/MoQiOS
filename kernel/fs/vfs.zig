@@ -71,6 +71,17 @@ pub const PipeBuffer = struct {
     read_refs: u32 = 0,
     /// Open write-end references — pipeRead sees EOF when 0.
     write_refs: u32 = 0,
+    /// Bytes copied for a splice reader but not yet committed.
+    read_reservation: u32 = 0,
+    /// Changes whenever this slot is allocated for a new pipe.
+    generation: u32 = 0,
+};
+
+/// Identifies one active splice read reservation, including the pipe lifetime
+/// in which it was created.
+pub const PipeReadToken = struct {
+    pipe_idx: u32 = 0,
+    generation: u32 = 0,
 };
 
 var pipes: [16]PipeBuffer = @splat(.{
@@ -139,7 +150,8 @@ pub fn allocPipe() ?u32 {
     defer pipe_lock.release(flags);
     for (0..16) |i| {
         if (pipes[i].ref_count == 0) {
-            pipes[i] = .{ .buf = @splat(0), .head = 0, .tail = 0, .ref_count = 2, .read_refs = 1, .write_refs = 1 };
+            const generation = pipes[i].generation +% 1;
+            pipes[i] = .{ .buf = @splat(0), .head = 0, .tail = 0, .ref_count = 2, .read_refs = 1, .write_refs = 1, .generation = generation };
             pipe_count += 1;
             return @intCast(i);
         }
@@ -149,6 +161,7 @@ pub fn allocPipe() ?u32 {
 
 pub fn pipeRead(pipe_idx: u32, buf: [*]u8, count: usize) i64 {
     if (pipe_idx >= 16) return -1;
+    if (count == 0) return 0;
     const flags = pipe_lock.acquire();
     const pipe = &pipes[pipe_idx];
     if (pipe.ref_count == 0) {
@@ -156,7 +169,13 @@ pub fn pipeRead(pipe_idx: u32, buf: [*]u8, count: usize) i64 {
         return -1;
     }
     var n: usize = 0;
-    while (n < count and pipe.head != pipe.tail) {
+    const reserved = pipe.read_reservation;
+    if (reserved != 0) {
+        pipe_lock.release(flags);
+        return -11; // EAGAIN: a splice reader owns the FIFO head.
+    }
+    const readable = if (pipe.tail >= pipe.head) pipe.tail - pipe.head else PIPE_BUF_SIZE - pipe.head + pipe.tail;
+    while (n < count and n < readable) {
         buf[n] = pipe.buf[pipe.head];
         pipe.head = (pipe.head + 1) % PIPE_BUF_SIZE;
         n += 1;
@@ -165,6 +184,98 @@ pub fn pipeRead(pipe_idx: u32, buf: [*]u8, count: usize) i64 {
     if (n > 0) {
         const epoll_r = @import("../net/epoll.zig");
         epoll_r.epollNotify(.pipe_write, pipe_idx, epoll_r.EPOLLOUT);
+    }
+    return @intCast(n);
+}
+
+/// Copy a stable FIFO prefix without dequeuing it. The caller must commit or
+/// release the reservation after the destination accepts bytes.
+pub fn pipeReserveRead(pipe_idx: u32, buf: [*]u8, count: usize, token: *PipeReadToken) i64 {
+    if (pipe_idx >= pipes.len) return -1;
+    const flags = pipe_lock.acquire();
+    defer pipe_lock.release(flags);
+    const pipe = &pipes[pipe_idx];
+    if (pipe.ref_count == 0 or pipe.read_reservation != 0) return -1;
+    const readable: u32 = if (pipe.tail >= pipe.head) pipe.tail - pipe.head else PIPE_BUF_SIZE - pipe.head + pipe.tail;
+    const n: u32 = @intCast(@min(count, @as(usize, readable)));
+    var i: u32 = 0;
+    while (i < n) : (i += 1) buf[i] = pipe.buf[(pipe.head + i) % PIPE_BUF_SIZE];
+    pipe.read_reservation = n;
+    token.* = .{ .pipe_idx = pipe_idx, .generation = pipe.generation };
+    return @intCast(n);
+}
+
+/// Commit the accepted prefix of a prior `pipeReserveRead`.
+pub fn pipeCommitRead(token: PipeReadToken, count: usize) i64 {
+    if (token.pipe_idx >= pipes.len) return -1;
+    const flags = pipe_lock.acquire();
+    const pipe = &pipes[token.pipe_idx];
+    if (pipe.ref_count == 0 or pipe.generation != token.generation) {
+        pipe_lock.release(flags);
+        return -1;
+    }
+    const n: u32 = @intCast(@min(count, @as(usize, pipe.read_reservation)));
+    pipe.head = (pipe.head + n) % PIPE_BUF_SIZE;
+    pipe.read_reservation -= n;
+    pipe_lock.release(flags);
+    if (n > 0) {
+        const epoll_r = @import("../net/epoll.zig");
+        epoll_r.epollNotify(.pipe_write, token.pipe_idx, epoll_r.EPOLLOUT);
+    }
+    return @intCast(n);
+}
+
+/// Cancel a prior pipe read reservation without changing FIFO contents.
+pub fn pipeReleaseRead(token: PipeReadToken) void {
+    if (token.pipe_idx >= pipes.len) return;
+    const flags = pipe_lock.acquire();
+    const pipe = &pipes[token.pipe_idx];
+    if (pipe.ref_count != 0 and pipe.generation == token.generation) {
+        pipe.read_reservation = 0;
+    }
+    pipe_lock.release(flags);
+}
+
+/// Move a bounded FIFO prefix between pipes while holding the global pipe
+/// lock, so no producer or consumer can interleave the capacity decision.
+pub fn pipeTransfer(src_idx: u32, dst_idx: u32, count: usize) i64 {
+    if (src_idx >= pipes.len or dst_idx >= pipes.len or src_idx == dst_idx) return -1;
+    const flags = pipe_lock.acquire();
+    const src = &pipes[src_idx];
+    const dst = &pipes[dst_idx];
+    if (src.ref_count == 0 or dst.ref_count == 0) {
+        pipe_lock.release(flags);
+        return -1;
+    }
+    if (src.read_reservation != 0) {
+        pipe_lock.release(flags);
+        return 0;
+    }
+    if (dst.read_refs == 0) {
+        pipe_lock.release(flags);
+        // The destination has no readers — match pipeWrite's SIGPIPE/EPIPE
+        // behavior even though this path moves bytes under the pipe lock.
+        const sig_mod = @import("../proc/signal.zig");
+        sig_mod.raiseSelf(sig_mod.SIGPIPE);
+        return -32;
+    }
+    if (dst.write_refs == 0) {
+        pipe_lock.release(flags);
+        return 0;
+    }
+    const readable: u32 = if (src.tail >= src.head) src.tail - src.head else PIPE_BUF_SIZE - src.head + src.tail;
+    const dst_readable: u32 = if (dst.tail >= dst.head) dst.tail - dst.head else PIPE_BUF_SIZE - dst.head + dst.tail;
+    const writable = (PIPE_BUF_SIZE - 1) - dst_readable;
+    const n: u32 = @intCast(@min(count, @as(usize, @min(readable, writable))));
+    var i: u32 = 0;
+    while (i < n) : (i += 1) dst.buf[(dst.tail + i) % PIPE_BUF_SIZE] = src.buf[(src.head + i) % PIPE_BUF_SIZE];
+    src.head = (src.head + n) % PIPE_BUF_SIZE;
+    dst.tail = (dst.tail + n) % PIPE_BUF_SIZE;
+    pipe_lock.release(flags);
+    if (n > 0) {
+        const epoll_r = @import("../net/epoll.zig");
+        epoll_r.epollNotify(.pipe_write, src_idx, epoll_r.EPOLLOUT);
+        epoll_r.epollNotify(.pipe_read, dst_idx, epoll_r.EPOLLIN);
     }
     return @intCast(n);
 }
@@ -215,7 +326,8 @@ pub fn pipeClose(pipe_idx: u32, write_end: bool) void {
             pipe.read_refs -|= 1;
         }
         if (pipe.ref_count == 0) {
-            pipe.* = .{ .buf = @splat(0), .head = 0, .tail = 0, .ref_count = 0 };
+            const generation = pipe.generation;
+            pipe.* = .{ .buf = @splat(0), .head = 0, .tail = 0, .ref_count = 0, .generation = generation };
             pipe_count -|= 1;
         }
     }
@@ -267,9 +379,32 @@ pub const FileDescriptor = struct {
     proc_pid: u32 = 0,
 };
 
+const TRANSFER_HOLD_MASK: u32 = 0x3FFF_FFFF;
+const SLOT_STATE_MASK: u32 = 0xC000_0000;
+const SLOT_FREE: u32 = 0x0000_0000;
+const SLOT_INITIALIZING: u32 = 0x4000_0000;
+const SLOT_LIVE: u32 = 0x8000_0000;
+const SLOT_CLOSING: u32 = 0xC000_0000;
+/// INITIALIZING with a nonzero hold-count marker means close owns teardown.
+/// Fresh descriptor construction uses plain INITIALIZING (zero marker).
+const SLOT_CLEANING: u32 = SLOT_INITIALIZING | 1;
+
+fn slotLifecycle(state: u32) u32 {
+    return state & SLOT_STATE_MASK;
+}
+
 /// Per-process FD table.
 pub const FdTable = struct {
     fds: [MAX_FDS]FileDescriptor,
+    /// Transfer holds keep slots and their underlying resources stable while
+    /// sendfile/splice may block. The top two bits encode the slot lifecycle;
+    /// the remaining bits count transfer holds.
+    transfer_state: [MAX_FDS]u32 = @splat(0),
+    /// Serializes lifecycle transitions for each slot. Descriptor fields are
+    /// only inspected after taking this lock or acquiring a LIVE hold.
+    slot_locks: [MAX_FDS]IrqSpinlock = @splat(.{}),
+    /// Serializes resource cleanup decisions across dup-shared slots.
+    lifecycle_lock: IrqSpinlock = .{},
     /// v53.49: Bitmap tracking free fd slots — bit set = free, bit clear = occupied.
     /// MAX_FDS<=64 fits in one u64. Eliminates O(N) linear scan in allocFd.
     /// SK-39: bits >= MAX_FDS stay clear so allocFd never returns an
@@ -291,10 +426,13 @@ pub const FdTable = struct {
     /// does NOT need a ~57KB stack local — important because FdTable is large
     /// and an on-stack temporary here overflowed the kernel stack at boot.
     const default_table: FdTable = blk: {
-        var table: FdTable = .{ .fds = @splat(.{}) };
+        var table: FdTable = .{ .fds = @splat(.{}), .transfer_state = @splat(SLOT_FREE) };
         table.fds[FD_STDIN] = .{ .fd_type = .special };
         table.fds[FD_STDOUT] = .{ .fd_type = .special };
         table.fds[FD_STDERR] = .{ .fd_type = .special };
+        table.transfer_state[FD_STDIN] = SLOT_LIVE;
+        table.transfer_state[FD_STDOUT] = SLOT_LIVE;
+        table.transfer_state[FD_STDERR] = SLOT_LIVE;
         break :blk table;
     };
 
@@ -316,46 +454,197 @@ pub const FdTable = struct {
     }
 
     pub fn allocFdAtLeast(self: *FdTable, min_fd: u32) ?u32 {
-        // Lock-free slot claim (pthread v2): CLONE_FILES threads share this
-        // table, so pick-and-clear must be atomic. The candidate is derived
-        // from the latest bitmap each iteration; the And's return value tells
-        // us whether WE cleared the bit — a lost race just retries.
         while (true) {
             const bm = @atomicLoad(u64, &self.free_bm, .acquire);
             const slot = RlimitPolicy.allocationCandidate(bm, min_fd, self.alloc_limit, MAX_FDS) orelse return null;
-            const bit = @as(u64, 1) << @intCast(slot);
-            const prev = @atomicRmw(u64, &self.free_bm, .And, ~bit, .acq_rel);
-            if (prev & bit != 0) return slot; // we cleared it — slot is ours
+            if (self.claimFreeSlot(slot)) return slot;
+        }
+    }
+
+    /// Claim a free slot before touching its descriptor. The lifecycle CAS is
+    /// the ownership operation; the bitmap remains an allocation hint and is
+    /// cleared before the caller starts constructing the descriptor.
+    fn claimFreeSlot(self: *FdTable, fd: u32) bool {
+        if (fd >= MAX_FDS) return false;
+        const flags = self.slot_locks[fd].acquire();
+        defer self.slot_locks[fd].release(flags);
+        return self.claimFreeSlotLocked(fd);
+    }
+
+    fn claimFreeSlotLocked(self: *FdTable, fd: u32) bool {
+        const bit = @as(u64, 1) << @intCast(fd);
+        const bm = @atomicLoad(u64, &self.free_bm, .acquire);
+        if (bm & bit == 0) return false;
+        if (@cmpxchgStrong(u32, &self.transfer_state[fd], SLOT_FREE, SLOT_INITIALIZING, .acq_rel, .acquire) != null)
+            return false;
+
+        const prev = @atomicRmw(u64, &self.free_bm, .And, ~bit, .acq_rel);
+        if (prev & bit == 0) {
+            // Repair an inconsistent hint without publishing an unowned slot.
+            @atomicStore(u32, &self.transfer_state[fd], SLOT_FREE, .release);
+            _ = @atomicRmw(u64, &self.free_bm, .Or, bit, .release);
+            return false;
+        }
+        self.fds[fd] = .{};
+        return true;
+    }
+
+    /// Make a completely initialized descriptor visible to transfer users.
+    pub fn publishFd(self: *FdTable, fd: u32) void {
+        const flags = self.slot_locks[fd].acquire();
+        defer self.slot_locks[fd].release(flags);
+        @atomicStore(u32, &self.transfer_state[fd], SLOT_LIVE, .release);
+    }
+
+    /// Copy a fully initialized descriptor into a fresh table and publish it.
+    pub fn installInheritedFd(self: *FdTable, fd: u32, desc: FileDescriptor) void {
+        if (fd >= MAX_FDS or desc.fd_type == .none) return;
+        const flags = self.slot_locks[fd].acquire();
+        defer self.slot_locks[fd].release(flags);
+        const state = @atomicLoad(u32, &self.transfer_state[fd], .acquire);
+        const expected = if (slotLifecycle(state) == SLOT_LIVE) SLOT_LIVE else SLOT_FREE;
+        if (@cmpxchgStrong(u32, &self.transfer_state[fd], expected, SLOT_INITIALIZING, .acq_rel, .acquire) != null) return;
+        self.fds[fd] = desc;
+        @atomicStore(u32, &self.transfer_state[fd], SLOT_LIVE, .release);
+    }
+
+    /// Snapshot a table for fork/clone. Holds are acquired for every occupied
+    /// slot before any descriptor is copied, so close/dup2 cannot tear down or
+    /// reuse a descriptor between the snapshot and its resource retains.
+    pub fn inheritFdTable(self: *FdTable, child: *FdTable) void {
+        while (true) {
+            var held: [MAX_FDS]bool = @splat(false);
+            var snapshot: [MAX_FDS]FileDescriptor = @splat(.{});
+            var complete = true;
+
+            for (0..MAX_FDS) |i| {
+                const state = @atomicLoad(u32, &self.transfer_state[i], .acquire);
+                if (slotLifecycle(state) == SLOT_FREE) continue;
+                if (slotLifecycle(state) != SLOT_LIVE or !self.acquireTransferFd(@intCast(i))) {
+                    complete = false;
+                    break;
+                }
+                held[i] = true;
+                snapshot[i] = self.fds[i];
+            }
+
+            if (!complete) {
+                for (0..MAX_FDS) |i| {
+                    if (held[i]) self.releaseTransferFd(@intCast(i));
+                }
+                continue;
+            }
+
+            var child_free_bm: u64 = FREE_BM_ALL;
+            for (0..MAX_FDS) |i| {
+                if (held[i]) child_free_bm &= ~(@as(u64, 1) << @intCast(i));
+            }
+            child.free_bm = child_free_bm;
+            for (0..MAX_FDS) |i| {
+                if (!held[i]) continue;
+                child.installInheritedFd(@intCast(i), snapshot[i]);
+                switch (snapshot[i].fd_type) {
+                    .pipe_read, .pipe_write => {
+                        const pidx = snapshot[i].pipe_idx;
+                        if (pidx < 16)
+                            _ = pipeRetain(pidx, snapshot[i].fd_type == .pipe_write);
+                    },
+                    .fat32_file => {
+                        const readahead_mod = @import("readahead.zig");
+                        readahead_mod.resetStateForFork(&child.fds[i].readahead_state);
+                    },
+                    else => {},
+                }
+            }
+            retainSharedResources(child);
+            for (0..MAX_FDS) |i| {
+                if (held[i]) self.releaseTransferFd(@intCast(i));
+            }
+            return;
         }
     }
 
     pub fn openFdCount(self: *const FdTable) u64 {
-        return @popCount(~self.free_bm & if (MAX_FDS >= 64) ~@as(u64, 0) else (@as(u64, 1) << MAX_FDS) - 1);
+        const free_bm = @atomicLoad(u64, &self.free_bm, .acquire);
+        return @popCount(~free_bm & if (MAX_FDS >= 64) ~@as(u64, 0) else (@as(u64, 1) << MAX_FDS) - 1);
     }
 
     /// Reserve a dup2-style explicit target below the owning task's NOFILE
     /// bound. A target reserved by allocFdAtLeast is accepted as-is.
     pub fn reserveFdForDup2(self: *FdTable, fd: u32) bool {
         if (!RlimitPolicy.fdAllowed(self.alloc_limit, fd, MAX_FDS)) return false;
-        const bit = @as(u64, 1) << @intCast(fd);
-        const already_open = self.fds[fd].fd_type != .none;
-        const already_reserved = @atomicLoad(u64, &self.free_bm, .acquire) & bit == 0;
-        if (already_open) {
-            _ = self.close(fd);
-            // Atomic claim: shared tables may race a concurrent freeFd here.
-            _ = @atomicRmw(u64, &self.free_bm, .And, ~bit, .acq_rel);
-            return true;
+        while (true) {
+            const flags = self.slot_locks[fd].acquire();
+            const state = @atomicLoad(u32, &self.transfer_state[fd], .acquire);
+            switch (slotLifecycle(state)) {
+                SLOT_FREE => {
+                    const claimed = self.claimFreeSlotLocked(fd);
+                    self.slot_locks[fd].release(flags);
+                    return claimed;
+                },
+                SLOT_LIVE => {
+                    if ((state & TRANSFER_HOLD_MASK) != 0) {
+                        self.slot_locks[fd].release(flags);
+                        return false;
+                    }
+                    @atomicStore(u32, &self.transfer_state[fd], SLOT_CLOSING, .release);
+                    // Keep the slot claimed by dup2 while the old resource is
+                    // torn down, closing the close/reuse ABA window.
+                    self.slot_locks[fd].release(flags);
+                    _ = self.finishClose(fd, true);
+                    return true;
+                },
+                else => {
+                    self.slot_locks[fd].release(flags);
+                    return false;
+                },
+            }
         }
-        if (already_reserved) return true;
-        _ = @atomicRmw(u64, &self.free_bm, .And, ~bit, .acq_rel);
-        return true;
     }
 
     /// Release an fd slot back to the free pool. Called by close() and
     /// on failure paths in open()/createPipe() that allocated but didn't use a slot.
-    /// Atomic Or: pairs with allocFdAtLeast's claim on shared (CLONE_FILES) tables.
+    /// The descriptor is cleared before FREE is published to other threads.
     pub fn freeFd(self: *FdTable, fd: u32) void {
-        _ = @atomicRmw(u64, &self.free_bm, .Or, @as(u64, 1) << @intCast(fd), .acq_rel);
+        if (fd >= MAX_FDS) return;
+        const flags = self.slot_locks[fd].acquire();
+        defer self.slot_locks[fd].release(flags);
+        const state = @atomicLoad(u32, &self.transfer_state[fd], .acquire);
+        if (slotLifecycle(state) != SLOT_INITIALIZING or (state & TRANSFER_HOLD_MASK) != 0) return;
+        self.releaseFreeSlotLocked(fd);
+    }
+
+    fn releaseFreeSlotLocked(self: *FdTable, fd: u32) void {
+        self.fds[fd] = .{};
+        @atomicStore(u32, &self.transfer_state[fd], SLOT_FREE, .release);
+        _ = @atomicRmw(u64, &self.free_bm, .Or, @as(u64, 1) << @intCast(fd), .release);
+    }
+
+    /// Pin an fd slot for a multi-step transfer. This uses a CAS rather than
+    /// the fd-table bitmap: close may run concurrently, but cannot tear down
+    /// or reuse a slot after this hold is acquired.
+    pub fn acquireTransferFd(self: *FdTable, fd: u32) bool {
+        if (fd >= MAX_FDS) return false;
+        const flags = self.slot_locks[fd].acquire();
+        defer self.slot_locks[fd].release(flags);
+        while (true) {
+            const state = @atomicLoad(u32, &self.transfer_state[fd], .acquire);
+            if (slotLifecycle(state) != SLOT_LIVE) return false;
+            if ((state & TRANSFER_HOLD_MASK) == TRANSFER_HOLD_MASK) return false;
+            if (@cmpxchgWeak(u32, &self.transfer_state[fd], state, state + 1, .acq_rel, .acquire) == null)
+                return true;
+        }
+    }
+
+    /// Release one transfer hold. If close already won the close bit, the
+    /// final holder owns deferred resource cleanup and fd-slot release.
+    pub fn releaseTransferFd(self: *FdTable, fd: u32) void {
+        if (fd >= MAX_FDS) return;
+        const flags = self.slot_locks[fd].acquire();
+        const previous = @atomicRmw(u32, &self.transfer_state[fd], .Sub, 1, .acq_rel);
+        self.slot_locks[fd].release(flags);
+        if (slotLifecycle(previous) == SLOT_CLOSING and (previous & TRANSFER_HOLD_MASK) == 1)
+            _ = self.finishClose(fd, false);
     }
 
     /// Open a file by name. Returns fd index or -1 on failure.
@@ -390,6 +679,7 @@ pub const FdTable = struct {
                 .devfs_idx = @import("devfs.zig").DIR_IDX,
                 .status_flags = status,
             };
+            self.publishFd(slot);
             return @intCast(slot);
         }
         if (name.len > 5 and name[0] == '/' and name[1] == 'd' and name[2] == 'e' and name[3] == 'v' and name[4] == '/') {
@@ -413,6 +703,7 @@ pub const FdTable = struct {
                     .status_flags = status,
                     .inode_id = 0x2000_0000_0000_0000 + @as(u64, node_idx),
                 };
+                self.publishFd(slot);
                 return @intCast(slot);
             }
             self.freeFd(slot);
@@ -434,6 +725,7 @@ pub const FdTable = struct {
                     .writable = is_writable,
                     .status_flags = status,
                 };
+                self.publishFd(slot);
                 return @intCast(slot);
             }
             self.freeFd(slot);
@@ -510,6 +802,7 @@ pub const FdTable = struct {
                 .proc_pid = pid,
                 .status_flags = status,
             };
+            self.publishFd(slot);
             return @intCast(slot);
         }
 
@@ -524,6 +817,7 @@ pub const FdTable = struct {
                 .inode_id = data_ptr,
                 .status_flags = status,
             };
+            self.publishFd(slot);
             return @intCast(slot);
         }
 
@@ -543,6 +837,7 @@ pub const FdTable = struct {
                     .status_flags = status,
                 };
                 readahead.initState(&self.fds[slot].readahead_state);
+                self.publishFd(slot);
                 return @intCast(slot);
             }
 
@@ -560,6 +855,7 @@ pub const FdTable = struct {
                         .status_flags = status,
                     };
                     readahead.initState(&self.fds[slot].readahead_state);
+                    self.publishFd(slot);
                     return @intCast(slot);
                 }
             }
@@ -581,6 +877,7 @@ pub const FdTable = struct {
                     .status_flags = status,
                 };
                 readahead.initState(&self.fds[slot].readahead_state);
+                self.publishFd(slot);
                 return @intCast(slot);
             }
 
@@ -599,6 +896,7 @@ pub const FdTable = struct {
                         .status_flags = status,
                     };
                     readahead.initState(&self.fds[slot].readahead_state);
+                    self.publishFd(slot);
                     return @intCast(slot);
                 }
             }
@@ -1043,22 +1341,65 @@ pub const FdTable = struct {
         const desc = &self.fds[fd];
         for (0..MAX_FDS) |i| {
             if (i == fd) continue;
+            const flags = self.slot_locks[i].acquire();
+            const other_state = @atomicLoad(u32, &self.transfer_state[i], .acquire);
+            if (slotLifecycle(other_state) != SLOT_LIVE and other_state != SLOT_CLEANING) {
+                self.slot_locks[i].release(flags);
+                continue;
+            }
             const other = &self.fds[i];
-            if (other.fd_type != desc.fd_type) continue;
+            if (other.fd_type != desc.fd_type) {
+                self.slot_locks[i].release(flags);
+                continue;
+            }
             switch (desc.fd_type) {
-                .ext2_file => if (other.ext2_file_idx == desc.ext2_file_idx) return true,
-                .fat32_file => if (other.fat32_file_idx == desc.fat32_file_idx) return true,
-                .tcp_socket => if (other.tcb_idx == desc.tcb_idx) return true,
-                .udp_socket => if (other.udp_port == desc.udp_port) return true,
-                .epoll => if (other.epoll_idx == desc.epoll_idx) return true,
-                .unix_socket => if (other.unix_sock_idx == desc.unix_sock_idx) return true,
-                .timerfd => if (other.timerfd_idx == desc.timerfd_idx) return true,
-                .tmpfs_file => if (other.tmpfs_idx == desc.tmpfs_idx) return true,
-                .devfs_ctrl => if (other.devfs_ctrl_idx == desc.devfs_ctrl_idx) return true,
-                .eventfd => if (other.eventfd_idx == desc.eventfd_idx) return true,
-                .ramdisk_file => if (other.file_data == desc.file_data) return true,
+                .ext2_file => if (other.ext2_file_idx == desc.ext2_file_idx) {
+                    self.slot_locks[i].release(flags);
+                    return true;
+                },
+                .fat32_file => if (other.fat32_file_idx == desc.fat32_file_idx) {
+                    self.slot_locks[i].release(flags);
+                    return true;
+                },
+                .tcp_socket => if (other.tcb_idx == desc.tcb_idx) {
+                    self.slot_locks[i].release(flags);
+                    return true;
+                },
+                .udp_socket => if (other.udp_port == desc.udp_port) {
+                    self.slot_locks[i].release(flags);
+                    return true;
+                },
+                .epoll => if (other.epoll_idx == desc.epoll_idx) {
+                    self.slot_locks[i].release(flags);
+                    return true;
+                },
+                .unix_socket => if (other.unix_sock_idx == desc.unix_sock_idx) {
+                    self.slot_locks[i].release(flags);
+                    return true;
+                },
+                .timerfd => if (other.timerfd_idx == desc.timerfd_idx) {
+                    self.slot_locks[i].release(flags);
+                    return true;
+                },
+                .tmpfs_file => if (other.tmpfs_idx == desc.tmpfs_idx) {
+                    self.slot_locks[i].release(flags);
+                    return true;
+                },
+                .devfs_ctrl => if (other.devfs_ctrl_idx == desc.devfs_ctrl_idx) {
+                    self.slot_locks[i].release(flags);
+                    return true;
+                },
+                .eventfd => if (other.eventfd_idx == desc.eventfd_idx) {
+                    self.slot_locks[i].release(flags);
+                    return true;
+                },
+                .ramdisk_file => if (other.file_data == desc.file_data) {
+                    self.slot_locks[i].release(flags);
+                    return true;
+                },
                 else => {},
             }
+            self.slot_locks[i].release(flags);
         }
         return false;
     }
@@ -1077,17 +1418,51 @@ pub const FdTable = struct {
             return @import("../ipc/posix_mq.zig").mqClose(fd);
         }
         if (fd <= FD_STDERR) return 0;
-        const desc = &self.fds[fd];
-        if (desc.fd_type == .none) return -1;
-        // v53.47: If another fd shares the same underlying resource (via dup2),
-        // skip resource cleanup — only clear this fd entry.
-        if (desc.fd_type != .pipe_read and desc.fd_type != .pipe_write) {
-            if (self.hasSharedRef(fd)) {
-                desc.* = .{};
-                self.freeFd(fd);
-                return 0;
-            }
+        const flags = self.slot_locks[fd].acquire();
+        const state = @atomicLoad(u32, &self.transfer_state[fd], .acquire);
+        if (slotLifecycle(state) != SLOT_LIVE) {
+            self.slot_locks[fd].release(flags);
+            return if (slotLifecycle(state) == SLOT_CLOSING) 0 else -1;
         }
+        @atomicStore(u32, &self.transfer_state[fd], SLOT_CLOSING | (state & TRANSFER_HOLD_MASK), .release);
+        self.slot_locks[fd].release(flags);
+        if ((state & TRANSFER_HOLD_MASK) != 0) return 0;
+        return self.finishClose(fd, false);
+    }
+
+    /// Complete close after all transfer holders have released the slot.
+    fn finishClose(self: *FdTable, fd: u32, keep_claim: bool) i64 {
+        const lifecycle_flags = self.lifecycle_lock.acquire();
+        const state = @atomicLoad(u32, &self.transfer_state[fd], .acquire);
+        if (slotLifecycle(state) != SLOT_CLOSING or (state & TRANSFER_HOLD_MASK) != 0) {
+            self.lifecycle_lock.release(lifecycle_flags);
+            return 0;
+        }
+        const flags = self.slot_locks[fd].acquire();
+        var desc = self.fds[fd];
+        // Elect the owner while this slot is still CLOSING. CLEANING is an
+        // owner marker, not another live reference: a peer that closes after
+        // this decision must drop its slot rather than skip teardown too.
+        const shared = desc.fd_type != .pipe_read and desc.fd_type != .pipe_write and self.hasSharedRef(fd);
+        if (shared) {
+            self.slot_locks[fd].release(flags);
+            self.lifecycle_lock.release(lifecycle_flags);
+            const release_flags = self.slot_locks[fd].acquire();
+            if (keep_claim) {
+                self.fds[fd] = .{};
+            } else {
+                self.releaseFreeSlotLocked(fd);
+            }
+            self.slot_locks[fd].release(release_flags);
+            return 0;
+        }
+        if (@cmpxchgStrong(u32, &self.transfer_state[fd], SLOT_CLOSING, SLOT_CLEANING, .acq_rel, .acquire) != null) {
+            self.slot_locks[fd].release(flags);
+            self.lifecycle_lock.release(lifecycle_flags);
+            return 0;
+        }
+        self.slot_locks[fd].release(flags);
+        self.lifecycle_lock.release(lifecycle_flags);
         if (desc.fd_type == .pipe_read or desc.fd_type == .pipe_write) {
             pipeClose(desc.pipe_idx, desc.fd_type == .pipe_write);
         }
@@ -1136,8 +1511,13 @@ pub const FdTable = struct {
             @import("devfs_proxy.zig").ctrlClose(desc.devfs_ctrl_idx);
         }
         // proc_file needs no special cleanup
-        desc.* = .{};
-        self.freeFd(fd);
+        const release_flags = self.slot_locks[fd].acquire();
+        if (!keep_claim) {
+            self.releaseFreeSlotLocked(fd);
+        } else {
+            self.fds[fd] = .{};
+        }
+        self.slot_locks[fd].release(release_flags);
         // The descriptor is released either way, as POSIX requires; the error
         // only reports that buffered data did not make it to disk.
         if (flush_failed) return -5; // EIO
@@ -1161,28 +1541,50 @@ pub const FdTable = struct {
         };
 
         self.fds[read_fd] = .{ .fd_type = .pipe_read, .pipe_idx = pipe_idx };
+        self.publishFd(read_fd);
         self.fds[write_fd] = .{ .fd_type = .pipe_write, .pipe_idx = pipe_idx };
+        self.publishFd(write_fd);
         return @as(i64, read_fd) | (@as(i64, write_fd) << 16);
     }
 
     /// Duplicate fd: dup2(oldfd, newfd). Returns newfd on success or -errno.
     pub fn dup2(self: *FdTable, oldfd: u32, newfd: u32) i64 {
-        const old_valid = oldfd < MAX_FDS and self.fds[oldfd].fd_type != .none;
+        const old_valid = oldfd < MAX_FDS and
+            slotLifecycle(@atomicLoad(u32, &self.transfer_state[oldfd], .acquire)) == SLOT_LIVE;
         switch (RlimitPolicy.dupExplicit(old_valid, oldfd, newfd, self.alloc_limit, MAX_FDS)) {
             .bad_old => return -1,
             .no_op => return newfd,
             .bad_target => return -9, // EBADF
             .replace => {},
         }
+        if (!self.acquireTransferFd(oldfd)) return -1;
+        defer self.releaseTransferFd(oldfd);
         if (!self.reserveFdForDup2(newfd)) return -9; // EBADF
-        self.fds[newfd] = self.fds[oldfd];
+        const source = self.fds[oldfd];
         // Increment pipe ref count if it's a pipe
-        if (self.fds[newfd].fd_type == .pipe_read or self.fds[newfd].fd_type == .pipe_write) {
-            if (self.fds[newfd].pipe_idx < 16) {
-                _ = pipeRetain(self.fds[newfd].pipe_idx, self.fds[newfd].fd_type == .pipe_write);
+        if (source.fd_type == .pipe_read or source.fd_type == .pipe_write) {
+            if (source.pipe_idx < 16) {
+                _ = pipeRetain(source.pipe_idx, source.fd_type == .pipe_write);
             }
         }
+        self.fds[newfd] = source;
+        self.publishFd(newfd);
         return newfd;
+    }
+
+    /// Duplicate into the lowest available slot at or above min_fd.
+    pub fn dupFdAtLeast(self: *FdTable, oldfd: u32, min_fd: u32, new_flags: u32) i64 {
+        if (oldfd >= MAX_FDS or !self.acquireTransferFd(oldfd)) return -1;
+        defer self.releaseTransferFd(oldfd);
+        const slot = self.allocFdAtLeast(min_fd) orelse return -24;
+        self.fds[slot] = self.fds[oldfd];
+        self.fds[slot].fd_flags = new_flags;
+        if (self.fds[slot].fd_type == .pipe_read or self.fds[slot].fd_type == .pipe_write) {
+            if (self.fds[slot].pipe_idx < 16)
+                _ = pipeRetain(self.fds[slot].pipe_idx, self.fds[slot].fd_type == .pipe_write);
+        }
+        self.publishFd(slot);
+        return @intCast(slot);
     }
 };
 
@@ -1247,10 +1649,12 @@ pub fn freeFdTable(table: *FdTable) void {
 /// existing per-fd Pipe.ref_count handling at the copy site.
 pub fn retainSharedResources(table: *FdTable) void {
     for (0..MAX_FDS) |i| {
+        if (slotLifecycle(@atomicLoad(u32, &table.transfer_state[i], .acquire)) != SLOT_LIVE) continue;
         const desc = &table.fds[i];
         if (desc.fd_type == .none) continue;
         var seen = false;
         for (0..i) |j| {
+            if (slotLifecycle(@atomicLoad(u32, &table.transfer_state[j], .acquire)) != SLOT_LIVE) continue;
             const other = &table.fds[j];
             if (other.fd_type != desc.fd_type) continue;
             switch (desc.fd_type) {
