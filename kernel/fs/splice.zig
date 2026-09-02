@@ -9,6 +9,7 @@
 const vfs = @import("vfs.zig");
 const tcp = @import("../net/tcp.zig");
 const copy = @import("../mm/copy_from_user.zig");
+const dac = @import("dac.zig");
 const sched = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 
@@ -18,9 +19,13 @@ const errno = @import("../lib/errno.zig");
 const EBADF = errno.EBADF;
 const EINVAL = errno.EINVAL;
 const EFAULT = errno.EFAULT;
+const ENOTCONN = errno.ENOTCONN;
 
 /// Maximum bytes transferred per single iteration (one page).
 const CHUNK_SIZE: u64 = 8192; // 8KB chunks for better throughput
+
+/// Linux sendfile's bounded ABI count for this kernel's file backends.
+pub const MAX_SENDFILE_COUNT: u64 = 0x7FFF_FFFF;
 
 /// splice(2) flags.
 pub const SPLICE_F_MOVE: u32 = 1;
@@ -44,6 +49,23 @@ fn fdType(fd_table: *vfs.FdTable, fd: u32) vfs.FdType {
     return fd_table.fds[fd].fd_type;
 }
 
+fn fdIsOpen(fd_table: *vfs.FdTable, fd: u32) bool {
+    return fd < vfs.MAX_FDS and fd_table.fds[fd].fd_type != .none;
+}
+
+fn readUserOffset(ptr: u64) ?u64 {
+    if (ptr == 0 or !copy.validateUserBuffer(ptr, 8) or
+        !copy.validateUserBufferWritable(ptr, 8)) return null;
+    var buf: [8]u8 = undefined;
+    if (copy.copyFromUser(&buf, @ptrFromInt(ptr), 8) != 8) return null;
+    return @bitCast(buf);
+}
+
+fn writeUserOffset(ptr: u64, offset: u64) bool {
+    var buf: [8]u8 = @bitCast(offset);
+    return copy.copyToUser(@ptrFromInt(ptr), &buf, 8) == 8;
+}
+
 /// True if the fd type represents a seekable file that can act as a
 /// sendfile input (ramdisk / FAT32 / ext2).
 fn isFileFd(ft: vfs.FdType) bool {
@@ -65,6 +87,7 @@ fn isPipeFd(ft: vfs.FdType) bool {
 /// or negative errno.
 fn readFileAt(fd_table: *vfs.FdTable, fd: u32, offset: *u64, buf: [*]u8, count: usize) i64 {
     const desc = &fd_table.fds[fd];
+    if (!dac.descriptorCanRead(desc.status_flags)) return EBADF;
 
     switch (desc.fd_type) {
         .ramdisk_file => {
@@ -100,7 +123,28 @@ fn readFileAt(fd_table: *vfs.FdTable, fd: u32, offset: *u64, buf: [*]u8, count: 
 fn writeTcpSocket(fd_table: *vfs.FdTable, fd: u32, buf: [*]const u8, count: usize) i64 {
     const desc = &fd_table.fds[fd];
     if (desc.fd_type != .tcp_socket) return EBADF;
-    return tcp.tcpSend(desc.tcb_idx, buf, @intCast(count));
+    const result = tcp.tcpSend(desc.tcb_idx, buf, @intCast(count));
+    if (result < 0 and !tcp.isEstablished(desc.tcb_idx)) return ENOTCONN;
+    return result;
+}
+
+fn destinationCapacity(fd_table: *vfs.FdTable, fd: u32, dst_type: DstType) u64 {
+    return switch (dst_type) {
+        .tcp_socket => tcp.tcpSendSpace(fd_table.fds[fd].tcb_idx),
+        .pipe_write => if (vfs.pipeState(fd_table.fds[fd].pipe_idx)) |state|
+            if (state.writable) vfs.PIPE_BUF_SIZE - 1 - state.readable else 0
+        else
+            0,
+    };
+}
+
+fn destinationPipeClosed(fd_table: *vfs.FdTable, fd: u32) bool {
+    if (vfs.pipeState(fd_table.fds[fd].pipe_idx)) |state| return !state.read_open;
+    return true;
+}
+
+fn tcpDestinationError(fd_table: *vfs.FdTable, fd: u32) i64 {
+    return if (tcp.isEstablished(fd_table.fds[fd].tcb_idx)) 0 else ENOTCONN;
 }
 
 /// Write `count` bytes from a kernel buffer to a pipe write-end fd.
@@ -119,6 +163,8 @@ fn readPipeRead(fd_table: *vfs.FdTable, fd: u32, buf: [*]u8, count: usize) i64 {
     return vfs.pipeRead(desc.pipe_idx, buf, count);
 }
 
+/// Put back bytes dequeued from a pipe when the destination accepted less.
+/// The pipe ring has exactly the freed space from the preceding read.
 /// Write `count` bytes from a kernel buffer to a file fd at its current
 /// offset.  Returns bytes written or negative errno.
 fn writeFileCurrent(fd_table: *vfs.FdTable, fd: u32, buf: [*]const u8, count: usize) i64 {
@@ -141,7 +187,20 @@ fn kernelTransfer(
     var kbuf: [CHUNK_SIZE]u8 = undefined;
 
     while (remaining > 0) {
-        const chunk: usize = if (remaining > CHUNK_SIZE) CHUNK_SIZE else @intCast(remaining);
+        if (dst_type == .tcp_socket) {
+            const state_error = tcpDestinationError(fd_table, dst_fd);
+            if (state_error < 0) return if (total > 0) total else state_error;
+        }
+        const capacity = destinationCapacity(fd_table, dst_fd, dst_type);
+        if (capacity == 0) {
+            if (dst_type == .pipe_write and destinationPipeClosed(fd_table, dst_fd)) {
+                return if (total > 0) total else writePipeWrite(fd_table, dst_fd, &kbuf, 1);
+            }
+            break;
+        }
+        const bounded = @min(remaining, @min(CHUNK_SIZE, capacity));
+        const chunk: usize = @intCast(bounded);
+        const read_offset = src_offset.*;
 
         // Read from source file
         const nread = readFileAt(fd_table, src_fd, src_offset, &kbuf, chunk);
@@ -160,19 +219,21 @@ fn kernelTransfer(
         };
 
         if (nwritten <= 0) {
+            // The read only staged data. Do not consume bytes that the
+            // destination did not accept.
+            src_offset.* = read_offset;
             // Destination error — return what we've transferred so far
             if (total > 0) return total;
             return if (nwritten < 0) nwritten else total;
         }
 
-        total += nwritten;
-        const done: u64 = @intCast(nwritten);
+        const accepted = @min(nwritten, @as(i64, @intCast(to_write)));
+        src_offset.* = read_offset + @as(u64, @intCast(accepted));
+        total += accepted;
+        const done: u64 = @intCast(accepted);
         if (done >= remaining) break;
         remaining -= done;
 
-        // If destination wrote fewer bytes than we read, the file offset
-        // was already advanced by the full read. We accept the slight
-        // discrepancy — same as Linux's behavior with short writes.
         if (@as(usize, @intCast(nwritten)) < to_write) break;
     }
 
@@ -189,16 +250,24 @@ fn kernelTransfer(
 /// current offset.  Returns the number of bytes sent.
 pub fn sysSendfile(out_fd: u32, in_fd: u32, offset_ptr: u64, count: u64) i64 {
     const fd_table = getCurrentFdTable() orelse return EBADF;
+    if (!fd_table.acquireTransferFd(in_fd)) return EBADF;
+    defer fd_table.releaseTransferFd(in_fd);
+    if (!fd_table.acquireTransferFd(out_fd)) return EBADF;
+    defer fd_table.releaseTransferFd(out_fd);
 
     // Validate input fd — must be a seekable file
+    if (!fdIsOpen(fd_table, in_fd) or !fdIsOpen(fd_table, out_fd)) return EBADF;
     const in_type = fdType(fd_table, in_fd);
-    if (!isFileFd(in_type)) return EBADF;
+    if (!isFileFd(in_type)) return EINVAL;
 
     // Validate output fd — must be socket or pipe
     const out_type = fdType(fd_table, out_fd);
     if (!isSendfileOutFd(out_type)) return EINVAL;
+    if (!dac.descriptorCanRead(fd_table.fds[in_fd].status_flags)) return EBADF;
 
     if (count == 0) return 0;
+    if (count > MAX_SENDFILE_COUNT) return EINVAL;
+    if (out_type == .tcp_socket and !tcp.isEstablished(fd_table.fds[out_fd].tcb_idx)) return ENOTCONN;
 
     // Determine starting offset
     var offset: u64 = undefined;
@@ -206,20 +275,25 @@ pub fn sysSendfile(out_fd: u32, in_fd: u32, offset_ptr: u64, count: u64) i64 {
 
     if (offset_ptr != 0) {
         // Read the offset value from user space
-        if (offset_ptr >= 0x0000_8000_0000_0000) return EFAULT;
-        if (!copy.validateUserBufferWritable(offset_ptr, 8)) return EFAULT;
-        var offset_buf: [8]u8 = undefined;
-        const copied = copy.copyFromUser(&offset_buf, @ptrFromInt(offset_ptr), 8);
-        if (copied < 8) return EFAULT;
-        offset = @bitCast(offset_buf);
+        // It is both an input and an output: preflight both permissions so
+        // an invalid destination cannot be discovered after I/O begins.
+        offset = readUserOffset(offset_ptr) orelse return EFAULT;
         update_user_offset = true;
     } else {
         // Use the fd's current offset
         offset = fd_table.fds[in_fd].offset;
     }
 
-    // If offset is past EOF, nothing to do
-    if (offset >= fd_table.fds[in_fd].file_size) return 0;
+    // The file implementations use 32-bit offsets. Check the requested
+    // range before any transfer or descriptor mutation.
+    if (offset > 0xFFFF_FFFF or count > 0xFFFF_FFFF - offset) return EINVAL;
+
+    // If offset is past EOF, nothing to do, but still honor explicit offset
+    // writeback because the pointer is an in/out argument.
+    if (offset >= fd_table.fds[in_fd].file_size) {
+        if (update_user_offset and !writeUserOffset(offset_ptr, offset)) return EFAULT;
+        return 0;
+    }
 
     // Determine destination type
     const dst_type: DstType = switch (out_type) {
@@ -230,13 +304,15 @@ pub fn sysSendfile(out_fd: u32, in_fd: u32, offset_ptr: u64, count: u64) i64 {
 
     const result = kernelTransfer(fd_table, in_fd, &offset, dst_type, out_fd, count);
 
-    // Update the fd offset (whether user-provided or not)
-    fd_table.fds[in_fd].offset = offset;
+    // An explicit offset is independent of the open file description's
+    // position. Only the NULL-offset form advances the descriptor offset.
+    if (!update_user_offset) fd_table.fds[in_fd].offset = offset;
 
-    // Write back the new offset to user space if offset_ptr was provided
-    if (update_user_offset and result > 0) {
-        var offset_buf: [8]u8 = @bitCast(offset);
-        if (copy.copyToUser(@ptrFromInt(offset_ptr), &offset_buf, 8) != 8) return EFAULT;
+    // Write back the new offset even when no bytes were accepted. The pointer
+    // was preflighted above, and a writeback fault must not be hidden.
+    if (update_user_offset) {
+        if (!writeUserOffset(offset_ptr, offset))
+            return if (result > 0) result else EFAULT;
     }
 
     return result;
@@ -251,36 +327,46 @@ pub fn sysSendfile(out_fd: u32, in_fd: u32, offset_ptr: u64, count: u64) i64 {
 ///   - pipe_read → file
 ///   - pipe_read → pipe_write
 pub fn sysSplice(fd_in: u32, off_in: u64, fd_out: u32, off_out: u64, len: u64, flags: u32) i64 {
-    _ = off_out; // output offsets not supported yet
-    _ = flags; // flags are accepted but currently informational only
-
     const fd_table = getCurrentFdTable() orelse return EBADF;
+    if (!fd_table.acquireTransferFd(fd_in)) return EBADF;
+    defer fd_table.releaseTransferFd(fd_in);
+    if (!fd_table.acquireTransferFd(fd_out)) return EBADF;
+    defer fd_table.releaseTransferFd(fd_out);
+
+    if (!fdIsOpen(fd_table, fd_in) or !fdIsOpen(fd_table, fd_out)) return EBADF;
+    if ((flags & ~(SPLICE_F_MOVE | SPLICE_F_NONBLOCK)) != 0) return EINVAL;
 
     const in_type = fdType(fd_table, fd_in);
     const out_type = fdType(fd_table, fd_out);
 
-    // At least one end must be a pipe
+    // At least one end must be a pipe. Offset pointers are meaningful only
+    // for the seekable endpoint and are rejected for stream endpoints.
     if (!isPipeFd(in_type) and !isPipeFd(out_type)) return EINVAL;
-
-    if (len == 0) return 0;
+    if (isPipeFd(in_type) and off_in != 0) return EINVAL;
+    if (isPipeFd(out_type) and off_out != 0) return EINVAL;
 
     // ── Case 1: pipe_read → tcp_socket ──────────────────────────────────
     if (in_type == .pipe_read and out_type == .tcp_socket) {
+        if (len == 0) return 0;
         return splicePipeToSocket(fd_table, fd_in, fd_out, len);
     }
 
     // ── Case 2: file → pipe_write ────────────────────────────────────────
     if (isFileFd(in_type) and out_type == .pipe_write) {
+        if (len == 0) return 0;
         return spliceFileToPipe(fd_table, fd_in, off_in, fd_out, len);
     }
 
     // ── Case 3: pipe_read → file ─────────────────────────────────────────
     if (in_type == .pipe_read and isFileFd(out_type)) {
-        return splicePipeToFile(fd_table, fd_in, fd_out, len);
+        if (!fd_table.fds[fd_out].writable) return EBADF;
+        if (len == 0) return 0;
+        return splicePipeToFile(fd_table, fd_in, fd_out, off_out, len);
     }
 
     // ── Case 4: pipe_read → pipe_write ───────────────────────────────────
     if (in_type == .pipe_read and out_type == .pipe_write) {
+        if (len == 0) return 0;
         return splicePipeToPipe(fd_table, fd_in, fd_out, len);
     }
 
@@ -289,31 +375,44 @@ pub fn sysSplice(fd_in: u32, off_in: u64, fd_out: u32, off_out: u64, len: u64, f
 
 /// pipe → socket: read from pipe, send to TCP.
 fn splicePipeToSocket(fd_table: *vfs.FdTable, pipe_fd: u32, sock_fd: u32, len: u64) i64 {
+    const state_error = tcpDestinationError(fd_table, sock_fd);
+    if (state_error < 0) return state_error;
     var remaining: u64 = len;
     var total: i64 = 0;
     var kbuf: [CHUNK_SIZE]u8 = undefined;
 
     while (remaining > 0) {
-        const chunk: usize = if (remaining > CHUNK_SIZE) CHUNK_SIZE else @intCast(remaining);
+        const capacity = tcp.tcpSendSpace(fd_table.fds[sock_fd].tcb_idx);
+        if (capacity == 0) {
+            const probe = writeTcpSocket(fd_table, sock_fd, &kbuf, 1);
+            if (probe < 0) return if (total > 0) total else probe;
+            break;
+        }
+        const chunk: usize = @intCast(@min(remaining, @min(CHUNK_SIZE, capacity)));
 
-        const nread = readPipeRead(fd_table, pipe_fd, &kbuf, chunk);
+        var reservation: vfs.PipeReadToken = .{};
+        const nread = vfs.pipeReserveRead(fd_table.fds[pipe_fd].pipe_idx, &kbuf, chunk, &reservation);
         if (nread <= 0) {
             if (total > 0) return total;
             return if (nread < 0) nread else total;
         }
+        {
+            defer vfs.pipeReleaseRead(reservation);
+            const to_send: usize = @intCast(nread);
+            const nsent = writeTcpSocket(fd_table, sock_fd, &kbuf, to_send);
+            if (nsent <= 0) {
+                if (total > 0) return total;
+                return if (nsent < 0) nsent else total;
+            }
 
-        const to_send: usize = @intCast(nread);
-        const nsent = writeTcpSocket(fd_table, sock_fd, &kbuf, to_send);
-        if (nsent <= 0) {
-            if (total > 0) return total;
-            return if (nsent < 0) nsent else total;
+            const accepted = @min(nsent, @as(i64, @intCast(to_send)));
+            _ = vfs.pipeCommitRead(reservation, @intCast(accepted));
+            total += accepted;
+            const done: u64 = @intCast(accepted);
+            if (done >= remaining) break;
+            remaining -= done;
+            if (@as(usize, @intCast(nsent)) < to_send) break;
         }
-
-        total += nsent;
-        const done: u64 = @intCast(nsent);
-        if (done >= remaining) break;
-        remaining -= done;
-        if (@as(usize, @intCast(nsent)) < to_send) break;
     }
 
     return total;
@@ -324,120 +423,143 @@ fn spliceFileToPipe(fd_table: *vfs.FdTable, file_fd: u32, off_in: u64, pipe_fd: 
     var offset: u64 = undefined;
     var update_user_offset = false;
 
+    // Check source permissions before EOF or destination-capacity shortcuts.
+    if (!dac.descriptorCanRead(fd_table.fds[file_fd].status_flags)) return EBADF;
+
     if (off_in != 0) {
         // Read offset from user space
-        if (off_in >= 0x0000_8000_0000_0000) return EFAULT;
-        if (!copy.validateUserBufferWritable(off_in, 8)) return EFAULT;
-        var offset_buf: [8]u8 = undefined;
-        const copied = copy.copyFromUser(&offset_buf, @ptrFromInt(off_in), 8);
-        if (copied < 8) return EFAULT;
-        offset = @bitCast(offset_buf);
+        offset = readUserOffset(off_in) orelse return EFAULT;
         update_user_offset = true;
     } else {
         offset = fd_table.fds[file_fd].offset;
     }
 
-    // If offset is past EOF, nothing to do
-    if (offset >= fd_table.fds[file_fd].file_size) return 0;
+    if (offset > 0xFFFF_FFFF or len > 0xFFFF_FFFF - offset) return EINVAL;
+
+    // If offset is past EOF, nothing to do.
+    if (offset >= fd_table.fds[file_fd].file_size) {
+        if (update_user_offset and !writeUserOffset(off_in, offset)) return EFAULT;
+        return 0;
+    }
 
     var remaining: u64 = len;
     var total: i64 = 0;
+    var failure: i64 = 0;
     var kbuf: [CHUNK_SIZE]u8 = undefined;
-
     while (remaining > 0) {
-        const chunk: usize = if (remaining > CHUNK_SIZE) CHUNK_SIZE else @intCast(remaining);
+        const capacity = destinationCapacity(fd_table, pipe_fd, .pipe_write);
+        if (capacity == 0) {
+            if (destinationPipeClosed(fd_table, pipe_fd)) {
+                const probe = writePipeWrite(fd_table, pipe_fd, &kbuf, 1);
+                if (total == 0 and probe < 0) failure = probe;
+            }
+            break;
+        }
+        const chunk: usize = @intCast(@min(remaining, @min(CHUNK_SIZE, capacity)));
 
+        const read_offset = offset;
         const nread = readFileAt(fd_table, file_fd, &offset, &kbuf, chunk);
         if (nread <= 0) {
-            if (total > 0) return total;
-            return if (nread < 0) nread else total;
+            if (nread < 0 and total == 0) failure = nread;
+            break;
         }
 
         const to_write: usize = @intCast(nread);
         const nwritten = writePipeWrite(fd_table, pipe_fd, &kbuf, to_write);
         if (nwritten <= 0) {
-            if (total > 0) return total;
-            return if (nwritten < 0) nwritten else total;
+            offset = read_offset;
+            if (nwritten < 0 and total == 0) failure = nwritten;
+            break;
         }
 
-        total += nwritten;
-        const done: u64 = @intCast(nwritten);
+        const accepted = @min(nwritten, @as(i64, @intCast(to_write)));
+        offset = read_offset + @as(u64, @intCast(accepted));
+        total += accepted;
+        const done: u64 = @intCast(accepted);
         if (done >= remaining) break;
         remaining -= done;
         if (@as(usize, @intCast(nwritten)) < to_write) break;
     }
 
-    // Update the fd offset
-    fd_table.fds[file_fd].offset = offset;
-
-    // Write back offset to user space if provided
-    if (update_user_offset and total > 0) {
-        var offset_buf: [8]u8 = @bitCast(offset);
-        if (copy.copyToUser(@ptrFromInt(off_in), &offset_buf, 8) != 8) return EFAULT;
+    if (!update_user_offset) {
+        fd_table.fds[file_fd].offset = offset;
+    } else if (!writeUserOffset(off_in, offset)) {
+        return if (total > 0) total else EFAULT;
     }
-
-    return total;
+    return if (total > 0) total else failure;
 }
 
 /// pipe → file: read from pipe, write to file.
-fn splicePipeToFile(fd_table: *vfs.FdTable, pipe_fd: u32, file_fd: u32, len: u64) i64 {
+fn splicePipeToFile(fd_table: *vfs.FdTable, pipe_fd: u32, file_fd: u32, off_out: u64, len: u64) i64 {
+    var file_offset = fd_table.fds[file_fd].offset;
+    var explicit_offset = false;
+    if (off_out != 0) {
+        file_offset = readUserOffset(off_out) orelse return EFAULT;
+        explicit_offset = true;
+    }
+    if (file_offset > 0xFFFF_FFFF or len > 0xFFFF_FFFF - file_offset) return EINVAL;
     var remaining: u64 = len;
     var total: i64 = 0;
+    var failure: i64 = 0;
     var kbuf: [CHUNK_SIZE]u8 = undefined;
-
     while (remaining > 0) {
-        const chunk: usize = if (remaining > CHUNK_SIZE) CHUNK_SIZE else @intCast(remaining);
+        const chunk: usize = @intCast(@min(remaining, @min(CHUNK_SIZE, 0xFFFF_FFFF - file_offset)));
+        if (chunk == 0) break;
 
-        const nread = readPipeRead(fd_table, pipe_fd, &kbuf, chunk);
+        const read_state = file_offset;
+        var reservation: vfs.PipeReadToken = .{};
+        const nread = vfs.pipeReserveRead(fd_table.fds[pipe_fd].pipe_idx, &kbuf, chunk, &reservation);
         if (nread <= 0) {
-            if (total > 0) return total;
-            return if (nread < 0) nread else total;
+            if (nread < 0 and total == 0) failure = nread;
+            break;
         }
+        {
+            defer vfs.pipeReleaseRead(reservation);
+            const to_write: usize = @intCast(nread);
+            const nwritten = if (explicit_offset)
+                fd_table.writeAtOffset(file_fd, &kbuf, to_write, file_offset)
+            else
+                writeFileCurrent(fd_table, file_fd, &kbuf, to_write);
+            if (nwritten <= 0) {
+                if (nwritten < 0 and total == 0) failure = nwritten;
+                break;
+            }
 
-        const to_write: usize = @intCast(nread);
-        const nwritten = writeFileCurrent(fd_table, file_fd, &kbuf, to_write);
-        if (nwritten <= 0) {
-            if (total > 0) return total;
-            return if (nwritten < 0) nwritten else total;
+            const accepted = @min(nwritten, @as(i64, @intCast(to_write)));
+            _ = vfs.pipeCommitRead(reservation, @intCast(accepted));
+            file_offset = if (explicit_offset) read_state else fd_table.fds[file_fd].offset;
+            if (explicit_offset) file_offset = read_state + @as(u64, @intCast(accepted));
+            total += accepted;
+            const done: u64 = @intCast(accepted);
+            if (done >= remaining) break;
+            remaining -= done;
+            if (@as(usize, @intCast(nwritten)) < to_write) break;
         }
-
-        total += nwritten;
-        const done: u64 = @intCast(nwritten);
-        if (done >= remaining) break;
-        remaining -= done;
-        if (@as(usize, @intCast(nwritten)) < to_write) break;
     }
 
-    return total;
+    if (!explicit_offset) {
+        fd_table.fds[file_fd].offset = file_offset;
+    } else if (!writeUserOffset(off_out, file_offset)) {
+        return if (total > 0) total else EFAULT;
+    }
+    return if (total > 0) total else failure;
 }
 
 /// pipe → pipe: read from one pipe, write to another.
 fn splicePipeToPipe(fd_table: *vfs.FdTable, in_fd: u32, out_fd: u32, len: u64) i64 {
     var remaining: u64 = len;
     var total: i64 = 0;
-    var kbuf: [CHUNK_SIZE]u8 = undefined;
 
     while (remaining > 0) {
-        const chunk: usize = if (remaining > CHUNK_SIZE) CHUNK_SIZE else @intCast(remaining);
-
-        const nread = readPipeRead(fd_table, in_fd, &kbuf, chunk);
-        if (nread <= 0) {
+        const moved = vfs.pipeTransfer(fd_table.fds[in_fd].pipe_idx, fd_table.fds[out_fd].pipe_idx, @intCast(@min(remaining, CHUNK_SIZE)));
+        if (moved <= 0) {
             if (total > 0) return total;
-            return if (nread < 0) nread else total;
+            return moved;
         }
-
-        const to_write: usize = @intCast(nread);
-        const nwritten = writePipeWrite(fd_table, out_fd, &kbuf, to_write);
-        if (nwritten <= 0) {
-            if (total > 0) return total;
-            return if (nwritten < 0) nwritten else total;
-        }
-
-        total += nwritten;
-        const done: u64 = @intCast(nwritten);
+        total += moved;
+        const done: u64 = @intCast(moved);
         if (done >= remaining) break;
         remaining -= done;
-        if (@as(usize, @intCast(nwritten)) < to_write) break;
     }
 
     return total;
