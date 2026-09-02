@@ -33,6 +33,7 @@ pub fn allocTcpFd(fd_table: *vfs_mod.FdTable, tcb_idx: u32) i64 {
         .tcb_idx = tcb_idx,
         .writable = true,
     };
+    fd_table.publishFd(slot);
     return @intCast(slot);
 }
 
@@ -42,6 +43,7 @@ pub fn allocUnixFd(fd_table: *vfs_mod.FdTable, unix_sock_idx: u32) i32 {
         .fd_type = .unix_socket,
         .unix_sock_idx = unix_sock_idx,
     };
+    fd_table.publishFd(slot);
     return @intCast(slot);
 }
 
@@ -81,6 +83,7 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
                     .udp_port = port,
                     .writable = true,
                 };
+                t.fd_table.publishFd(fd_slot);
                 return @intCast(fd_slot);
             }
         }
@@ -120,6 +123,7 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
                         .udp_is_v6 = true,
                         .writable = true,
                     };
+                    t.fd_table.publishFd(fd_slot6);
                     return @intCast(fd_slot6);
                 }
             }
@@ -139,6 +143,7 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
                 .fd_type = .raw_socket,
                 .writable = true,
             };
+            t.fd_table.publishFd(fd_slot);
             return @intCast(fd_slot);
         }
         return -38; // ENOSYS
@@ -795,6 +800,7 @@ pub fn socketpair(domain: u32, sock_type: u32, protocol: u32, sv_ptr: u64) i64 {
         .fd_flags = if ((sock_type & socketpair_policy.SOCK_CLOEXEC) != 0) 1 else 0,
         .status_flags = sock_type & socketpair_policy.SOCK_NONBLOCK,
     };
+    cur.fd_table.publishFd(first_fd);
     const second_fd = cur.fd_table.allocFd() orelse {
         _ = cur.fd_table.close(first_fd);
         net_mod.unix_socket.unixClose(second_idx);
@@ -806,6 +812,7 @@ pub fn socketpair(domain: u32, sock_type: u32, protocol: u32, sv_ptr: u64) i64 {
         .fd_flags = if ((sock_type & socketpair_policy.SOCK_CLOEXEC) != 0) 1 else 0,
         .status_flags = sock_type & socketpair_policy.SOCK_NONBLOCK,
     };
+    cur.fd_table.publishFd(second_fd);
     var fds: [8]u8 = undefined;
     bo.writeU32Le(fds[0..4], first_fd);
     bo.writeU32Le(fds[4..8], second_fd);

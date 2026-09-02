@@ -747,5 +747,6 @@ pub fn syscallDevfsRegister(name_ptr: u64, flags: u64) i64 {
         .devfs_generation = generation,
         .writable = true,
     };
+    cur.fd_table.publishFd(fd);
     return @intCast(fd);
 }

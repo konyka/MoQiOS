@@ -336,6 +336,7 @@ pub fn signalfd4(old_fd: u64, mask: u64, sizemask: u64, flags: u64) i64 {
 
     const slot = cur.fd_table.allocFd() orelse return -24;
     cur.fd_table.fds[slot] = .{ .fd_type = .eventfd, .eventfd_idx = eventfd_idx };
+    cur.fd_table.publishFd(slot);
     installed = true;
     return @bitCast(@as(u64, slot));
 }

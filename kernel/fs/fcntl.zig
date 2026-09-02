@@ -26,17 +26,7 @@ pub const O_APPEND: u32 = 0x400;
 /// Returns new fd or negative errno.
 fn dupFd(fd_table: *vfs.FdTable, fd: u32, min_fd: u64, new_flags: u32) i64 {
     if (!@import("../proc/rlimit.zig").Policy.dupMinimumValid(fd_table.alloc_limit, min_fd, vfs.MAX_FDS)) return -22; // EINVAL
-    const min_fd_u32: u32 = @intCast(min_fd);
-    const slot = fd_table.allocFdAtLeast(min_fd_u32) orelse return -24; // EMFILE
-    fd_table.fds[slot] = fd_table.fds[fd];
-    fd_table.fds[slot].fd_flags = new_flags;
-    // Increment pipe ref count if it's a pipe
-    if (fd_table.fds[slot].fd_type == .pipe_read or fd_table.fds[slot].fd_type == .pipe_write) {
-        if (fd_table.fds[slot].pipe_idx < 16) {
-            _ = vfs.pipeRetain(fd_table.fds[slot].pipe_idx, fd_table.fds[slot].fd_type == .pipe_write);
-        }
-    }
-    return @intCast(slot);
+    return fd_table.dupFdAtLeast(fd, @intCast(min_fd), new_flags);
 }
 
 /// fcntl syscall implementation.

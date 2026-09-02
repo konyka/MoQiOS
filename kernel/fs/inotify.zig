@@ -49,6 +49,7 @@ pub fn inotifyInit() i64 {
         .fd_type = .inotify,
         .inotify_idx = inst_idx,
     };
+    cur.fd_table.publishFd(slot);
     return @intCast(slot);
 }
 
