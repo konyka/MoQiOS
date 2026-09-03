@@ -49,7 +49,7 @@ USER_PROGRAMS=(
     hello2 hello3 hello4 hello5 hello6 hello7 hello8 sh
     hello9 hello10 hello11 hello12 hello13 hello14 hello15 hello16
     hello17 hello18 hello19 hello20 hello21 hello22 hello23 hello24
-    hello25 hello26 hello27 hello28 hello29 hello30 hello31 hello32 hello33 hello34 hello35 hello36 hello37 hello38 hello39 hello40 hello41 hello42 hello43 hello44 hello45 hello46 hello47 hello48 hello49 hello50 hello51 hello52 hello53 hello54 hello56 hello57 hello58 hello59 hello60 hello61 hello62 hello63 hello64 hello65 hello66 hello67 hello68 hello69 hello70 hello71 hello72 hello73 hello74 hello75 hello76 hello77 hello78 hello79 hello80 hello81 hello82 hello83 hello84 hello85 hello86 hello87 hello88 hello89 syslogd devmgr
+    hello25 hello26 hello27 hello28 hello29 hello30 hello31 hello32 hello33 hello34 hello35 hello36 hello37 hello38 hello39 hello40 hello41 hello42 hello43 hello44 hello45 hello46 hello47 hello48 hello49 hello50 hello51 hello52 hello53 hello54 hello56 hello57 hello58 hello59 hello60 hello61 hello62 hello63 hello64 hello65 hello66 hello67 hello68 hello69 hello70 hello71 hello72 hello73 hello74 hello75 hello76 hello77 hello78 hello79 hello80 hello81 hello82 hello83 hello84 hello85 hello86 hello87 hello88 hello89 hello90 syslogd devmgr
 )
 for program in "${USER_PROGRAMS[@]}"; do
     src="$USER_SRC_DIR/${program}.bin"
@@ -123,6 +123,7 @@ echo "========================================="
 #   MOQI_EXTRA_QEMU  extra QEMU args (e.g. "-d int,cpu_reset -D /tmp/qint.log")
 SERIAL_TARGET="${MOQI_SERIAL:-stdio}"
 SMP_COUNT="${MOQI_SMP:-2}"
+MACHINE="${MOQI_MACHINE:-q35}"
 NVME_IMAGE="${MOQI_NVME_IMG:-nvme.img}"
 AHCI_IMAGE="${MOQI_AHCI_IMG:-ahci.img}"
 EXTRA_QEMU_ARGS=()
@@ -167,7 +168,7 @@ fi
 
 # exec so callers that background this script get the QEMU PID (not a leftover shell).
 exec qemu-system-x86_64 \
-    -M q35 \
+    -M "$MACHINE" \
     -m 512M \
     -rtc base=utc,clock=vm \
     -cdrom "$ISO_FILE" \

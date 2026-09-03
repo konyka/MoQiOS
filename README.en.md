@@ -150,6 +150,7 @@ contracts with `tools/disk_fixture.sh disk.img.manifest disk.img` and
 | hello19–hello21 | TCP setup and init smoke tail |
 | hello22–hello28 | TCP socket, ext2, mkdir/unlink and directory integration tests |
 | hello89 | epoll_pwait/epoll_pwait2 temporary signal masks, timeouts, and argument boundaries |
+| hello90 | sendfile/splice offsets, pipe FIFO ordering, and argument boundaries |
 
 ## Quick Start
 
