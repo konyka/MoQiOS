@@ -92,6 +92,31 @@ var pipes: [16]PipeBuffer = @splat(.{
 });
 var pipe_count: u32 = 0;
 var pipe_lock: IrqSpinlock = .{};
+var pipe_read_waiters: [16]?*@import("../proc/task.zig").WaitNode = @splat(null);
+
+/// Detach a pipe reader before its stack WaitNode can be reused or returned.
+/// wakeOne/wakeAll may have already unlinked the node, so this is idempotent.
+/// Caller holds pipe_lock.
+fn unlinkPipeReadWaiterLocked(pipe_idx: u32, node: *@import("../proc/task.zig").WaitNode) void {
+    var prev: ?*@import("../proc/task.zig").WaitNode = null;
+    var current = pipe_read_waiters[pipe_idx];
+    while (current) |waiter| {
+        if (waiter == node) {
+            if (prev) |previous| {
+                previous.next = waiter.next;
+            } else {
+                pipe_read_waiters[pipe_idx] = waiter.next;
+            }
+            waiter.next = null;
+            return;
+        }
+        prev = waiter;
+        current = waiter.next;
+    }
+    // wakeAll clears the queue head but leaves the former nodes linked to one
+    // another. Clear our private link even when the queue no longer owns it.
+    node.next = null;
+}
 
 pub const PipeState = struct {
     readable: u32,
@@ -159,33 +184,79 @@ pub fn allocPipe() ?u32 {
     return null;
 }
 
-pub fn pipeRead(pipe_idx: u32, buf: [*]u8, count: usize) i64 {
+pub fn pipeRead(pipe_idx: u32, buf: [*]u8, count: usize, status_flags: u32) i64 {
     if (pipe_idx >= 16) return -1;
     if (count == 0) return 0;
+    const sched = @import("../proc/sched.zig");
+    const task_mod = @import("../proc/task.zig");
+    const nonblocking = (status_flags & @as(u32, 0x800)) != 0;
+    while (true) {
+        const flags = pipe_lock.acquire();
+        const pipe = &pipes[pipe_idx];
+        if (pipe.ref_count == 0) {
+            pipe_lock.release(flags);
+            return -1;
+        }
+        if (pipe.read_reservation != 0) {
+            pipe_lock.release(flags);
+            return -11; // EAGAIN: a splice reader owns the FIFO head.
+        }
+        const readable = if (pipe.tail >= pipe.head) pipe.tail - pipe.head else PIPE_BUF_SIZE - pipe.head + pipe.tail;
+        if (readable == 0) {
+            if (pipe.write_refs == 0 or nonblocking) {
+                pipe_lock.release(flags);
+                return if (pipe.write_refs == 0) 0 else -11;
+            }
+            // pipe_lock serializes the empty check and registration with
+            // pipeWrite/pipeClose, closing the lost-wakeup window.
+            const current_task = task_mod.getTask(sched.currentTaskIndex() orelse {
+                pipe_lock.release(flags);
+                return -1;
+            }) orelse {
+                pipe_lock.release(flags);
+                return -1;
+            };
+            const node = &current_task.pipe_read_wait_node;
+            node.granted = false;
+            node.next = null;
+            if (!sched.blockOn(&pipe_read_waiters[pipe_idx], node)) {
+                pipe_lock.release(flags);
+                return -1;
+            }
+            pipe_lock.release(flags);
+            sched.rescheduleAfterBlock();
+            // A signal or timeout can make this task runnable without touching
+            // the pipe queue. Detach in either case before rechecking or
+            // returning, so no waker can retain this stack address.
+            const cleanup_flags = pipe_lock.acquire();
+            unlinkPipeReadWaiterLocked(pipe_idx, node);
+            pipe_lock.release(cleanup_flags);
+            continue;
+        }
+        var n: usize = 0;
+        while (n < count and n < readable) {
+            buf[n] = pipe.buf[pipe.head];
+            pipe.head = (pipe.head + 1) % PIPE_BUF_SIZE;
+            n += 1;
+        }
+        pipe_lock.release(flags);
+        if (n > 0) {
+            const epoll_r = @import("../net/epoll.zig");
+            epoll_r.epollNotify(.pipe_write, pipe_idx, epoll_r.EPOLLOUT);
+        }
+        return @intCast(n);
+    }
+}
+
+/// Remove a task-owned pipe reader before fatal task teardown. Caller need
+/// not know which pipe the node belongs to.
+pub fn detachPipeReadWaiter(node: *@import("../proc/task.zig").WaitNode) void {
     const flags = pipe_lock.acquire();
-    const pipe = &pipes[pipe_idx];
-    if (pipe.ref_count == 0) {
-        pipe_lock.release(flags);
-        return -1;
+    for (0..pipe_read_waiters.len) |pipe_idx| {
+        unlinkPipeReadWaiterLocked(@intCast(pipe_idx), node);
     }
-    var n: usize = 0;
-    const reserved = pipe.read_reservation;
-    if (reserved != 0) {
-        pipe_lock.release(flags);
-        return -11; // EAGAIN: a splice reader owns the FIFO head.
-    }
-    const readable = if (pipe.tail >= pipe.head) pipe.tail - pipe.head else PIPE_BUF_SIZE - pipe.head + pipe.tail;
-    while (n < count and n < readable) {
-        buf[n] = pipe.buf[pipe.head];
-        pipe.head = (pipe.head + 1) % PIPE_BUF_SIZE;
-        n += 1;
-    }
+    node.next = null;
     pipe_lock.release(flags);
-    if (n > 0) {
-        const epoll_r = @import("../net/epoll.zig");
-        epoll_r.epollNotify(.pipe_write, pipe_idx, epoll_r.EPOLLOUT);
-    }
-    return @intCast(n);
 }
 
 /// Copy a stable FIFO prefix without dequeuing it. The caller must commit or
@@ -271,6 +342,10 @@ pub fn pipeTransfer(src_idx: u32, dst_idx: u32, count: usize) i64 {
     while (i < n) : (i += 1) dst.buf[(dst.tail + i) % PIPE_BUF_SIZE] = src.buf[(src.head + i) % PIPE_BUF_SIZE];
     src.head = (src.head + n) % PIPE_BUF_SIZE;
     dst.tail = (dst.tail + n) % PIPE_BUF_SIZE;
+    if (n > 0) {
+        const sched = @import("../proc/sched.zig");
+        _ = sched.wakeOne(&pipe_read_waiters[dst_idx]);
+    }
     pipe_lock.release(flags);
     if (n > 0) {
         const epoll_r = @import("../net/epoll.zig");
@@ -304,6 +379,10 @@ pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize) i64 {
         pipe.tail = next;
         n += 1;
     }
+    if (n > 0) {
+        const sched = @import("../proc/sched.zig");
+        _ = sched.wakeOne(&pipe_read_waiters[pipe_idx]);
+    }
     pipe_lock.release(flags);
     if (n > 0) {
         const epoll_w = @import("../net/epoll.zig");
@@ -331,6 +410,8 @@ pub fn pipeClose(pipe_idx: u32, write_end: bool) void {
             pipe_count -|= 1;
         }
     }
+    const sched = @import("../proc/sched.zig");
+    _ = sched.wakeAll(&pipe_read_waiters[pipe_idx]);
     pipe_lock.release(flags);
     const epoll_c = @import("../net/epoll.zig");
     epoll_c.epollNotify(.pipe_read, pipe_idx, epoll_c.EPOLLHUP);
@@ -1010,7 +1091,7 @@ pub const FdTable = struct {
                 return n;
             },
             .pipe_read => {
-                return pipeRead(desc.pipe_idx, buf, count);
+                return pipeRead(desc.pipe_idx, buf, count, desc.status_flags);
             },
             .pipe_write => return -1, // can't read from write end
             .tcp_socket => return -1, // TCP sockets use sendto/recvfrom syscalls

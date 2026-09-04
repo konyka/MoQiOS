@@ -210,6 +210,7 @@
 | hello41 | copy_file_range fd 边界与显式 offset 回滚 |
 | hello89 | epoll_pwait/epoll_pwait2 临时信号掩码、超时与参数边界 |
 | hello90 | sendfile/splice 偏移、管道 FIFO 与参数边界 |
+| hello91 | 原始系统调用 fd 生命周期：pipe、dup/dup2、fork 与 waitpid |
 
 ## 快速开始
 

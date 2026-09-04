@@ -210,6 +210,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello88");  /* copy_file_range offsets, errors, and rollback */
     run_test("hello89");  /* epoll_pwait/epoll_pwait2 masks and boundaries */
     run_test("hello90");  /* raw sendfile/splice offsets, FIFO, and boundaries */
+    run_test("hello91");  /* raw pipe fd lifecycle, duplication, fork, and waitpid */
 
     start_persistent_services();
 

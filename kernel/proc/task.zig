@@ -214,6 +214,9 @@ pub const Task = struct {
     /// Wait queue for blocking operations (waitpid, pipe, etc.).
     /// The task sleeps on this queue until woken.
     wait_queue: ?*?*WaitNode,
+    /// Pipe reads use task-owned storage so fatal exit cannot leave a stack
+    /// node in the global pipe wait queue.
+    pipe_read_wait_node: WaitNode = .{ .task_idx = 0 },
 
     /// Wait queue for parent waitpid — woken when this task exits.
     exit_waiters: ?*WaitNode,
@@ -836,6 +839,7 @@ pub fn exitTask(exit_code: i32) void {
     // pthread v2: the table may be shared with CLONE_FILES threads — only the
     // LAST reference runs the close loop and returns the table to the pool;
     // a shared table (refs > 1) is left untouched for the surviving threads.
+    @import("../fs/vfs.zig").detachPipeReadWaiter(&t.pipe_read_wait_node);
     {
         const vfs = @import("../fs/vfs.zig");
         if (vfs.releaseFdTable(t.fd_table)) {
@@ -1156,8 +1160,8 @@ pub fn createUserProcess(
         tasks[slot].data_used = 0;
         tasks[slot].nproc_cur = @import("rlimit.zig").RLIM_INFINITY;
         tasks[slot].nproc_max = @import("rlimit.zig").RLIM_INFINITY;
-    tasks[slot].fSize_cur = fsize_cur;
-    tasks[slot].fSize_max = fsize_max;
+        tasks[slot].fSize_cur = fsize_cur;
+        tasks[slot].fSize_max = fsize_max;
         tasks[slot].stack_limit = @import("rlimit.zig").Policy.initialStackLimit(
             user_stack_top,
             @import("../mm/user_space.zig").USER_STACK_BOTTOM,

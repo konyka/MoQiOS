@@ -35,6 +35,7 @@ const virtio_net_queue = kt.virtio_net_queue;
 const socketpair_policy = kt.socketpair_policy;
 const message_batch_policy = kt.message_batch_policy;
 const fallocate_policy = kt.fallocate_policy;
+const splice = kt.splice;
 const unsupported_policy = kt.unsupported_policy;
 const sched_getaffinity_policy = kt.sched_getaffinity_policy;
 const epoll_policy = kt.epoll_policy;
@@ -51,6 +52,47 @@ test "epoll_create1 accepts only zero or EPOLL_CLOEXEC" {
     try std.testing.expectEqual(@as(i64, 0), accept4_policy.validate(accept4_policy.SUPPORTED_FLAGS));
     try std.testing.expectEqual(kt.errno.EINVAL, accept4_policy.validate(1));
     try std.testing.expectEqual(kt.errno.EINVAL, accept4_policy.validate(accept4_policy.SUPPORTED_FLAGS | 1));
+}
+
+test "splice validation accepts supported flags and rejects unknown bits" {
+    try std.testing.expectEqual(@as(i64, 0), splice.validateSpliceFlags(0));
+    try std.testing.expectEqual(@as(i64, 0), splice.validateSpliceFlags(splice.SPLICE_F_MOVE | splice.SPLICE_F_NONBLOCK));
+    try std.testing.expectEqual(errno.EINVAL, splice.validateSpliceFlags(4));
+}
+
+test "splice validation rejects offsets on pipe endpoints only" {
+    try std.testing.expectEqual(@as(i64, 0), splice.validateSpliceOffsets(true, 0, false, 123));
+    try std.testing.expectEqual(@as(i64, 0), splice.validateSpliceOffsets(false, 123, true, 0));
+    try std.testing.expectEqual(errno.EINVAL, splice.validateSpliceOffsets(true, 1, false, 0));
+    try std.testing.expectEqual(errno.EINVAL, splice.validateSpliceOffsets(false, 0, true, 1));
+}
+
+test "splice endpoint classification permits only pipe-mediated directions" {
+    try std.testing.expect(splice.classifySpliceEndpoints(.file, .pipe_write));
+    try std.testing.expect(splice.classifySpliceEndpoints(.pipe_read, .tcp_socket));
+    try std.testing.expect(splice.classifySpliceEndpoints(.pipe_read, .file));
+    try std.testing.expect(splice.classifySpliceEndpoints(.pipe_read, .pipe_write));
+    try std.testing.expect(!splice.classifySpliceEndpoints(.file, .tcp_socket));
+    try std.testing.expect(!splice.classifySpliceEndpoints(.tcp_socket, .file));
+}
+
+test "sendfile count and 32-bit range validation enforce ABI boundaries" {
+    try std.testing.expectEqual(@as(i64, 0), splice.validateSendfileCount(0));
+    try std.testing.expectEqual(@as(i64, 0), splice.validateSendfileCount(splice.MAX_SENDFILE_COUNT));
+    try std.testing.expectEqual(errno.EINVAL, splice.validateSendfileCount(splice.MAX_SENDFILE_COUNT + 1));
+    try std.testing.expectEqual(@as(i64, 0), splice.validate32BitFileRange(0xFFFF_FFFF, 0));
+    try std.testing.expectEqual(@as(i64, 0), splice.validate32BitFileRange(0xFFFF_FFFE, 1));
+    try std.testing.expectEqual(errno.EINVAL, splice.validate32BitFileRange(0x1_0000_0000, 0));
+    try std.testing.expectEqual(errno.EINVAL, splice.validate32BitFileRange(0xFFFF_FFFF, 1));
+}
+
+test "splice transfer calculations cap destination and partial progress" {
+    try std.testing.expectEqual(@as(u64, 0), splice.transferCapacity(10, 0, 8192));
+    try std.testing.expectEqual(@as(u64, 10), splice.transferCapacity(10, 20, 8192));
+    try std.testing.expectEqual(@as(u64, 8192), splice.transferCapacity(9000, 9000, 8192));
+    try std.testing.expectEqual(@as(u64, 4), splice.acceptedProgress(10, 4));
+    try std.testing.expectEqual(@as(u64, 10), splice.acceptedProgress(10, 20));
+    try std.testing.expectEqual(@as(u64, 0), splice.acceptedProgress(10, -5));
 }
 
 test "sched_getaffinity validates pid before user copy" {

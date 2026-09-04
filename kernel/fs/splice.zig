@@ -34,6 +34,40 @@ pub const SPLICE_F_NONBLOCK: u32 = 2;
 /// Destination type for kernelTransfer.
 const DstType = enum { tcp_socket, pipe_write };
 
+pub const SpliceEndpoint = enum { file, pipe_read, pipe_write, tcp_socket, other };
+
+pub fn validateSpliceFlags(flags: u32) i64 {
+    return if ((flags & ~(SPLICE_F_MOVE | SPLICE_F_NONBLOCK)) != 0) EINVAL else 0;
+}
+
+pub fn validateSpliceOffsets(in_is_pipe: bool, off_in: u64, out_is_pipe: bool, off_out: u64) i64 {
+    if (in_is_pipe and off_in != 0) return EINVAL;
+    if (out_is_pipe and off_out != 0) return EINVAL;
+    return 0;
+}
+
+pub fn classifySpliceEndpoints(in_type: SpliceEndpoint, out_type: SpliceEndpoint) bool {
+    return (in_type == .pipe_read and (out_type == .tcp_socket or out_type == .file or out_type == .pipe_write)) or
+        (in_type == .file and out_type == .pipe_write);
+}
+
+pub fn validateSendfileCount(count: u64) i64 {
+    return if (count > MAX_SENDFILE_COUNT) EINVAL else 0;
+}
+
+pub fn validate32BitFileRange(offset: u64, count: u64) i64 {
+    return if (offset > 0xFFFF_FFFF or count > 0xFFFF_FFFF - offset) EINVAL else 0;
+}
+
+pub fn transferCapacity(remaining: u64, destination_capacity: u64, chunk_size: u64) u64 {
+    return @min(remaining, @min(chunk_size, destination_capacity));
+}
+
+pub fn acceptedProgress(requested: u64, written: i64) u64 {
+    if (written <= 0) return 0;
+    return @min(requested, @as(u64, @intCast(written)));
+}
+
 // ─── Internal helpers ─────────────────────────────────────────────────────
 
 /// Obtain the current task's FD table. Returns null if no current task.
@@ -160,7 +194,7 @@ fn writePipeWrite(fd_table: *vfs.FdTable, fd: u32, buf: [*]const u8, count: usiz
 fn readPipeRead(fd_table: *vfs.FdTable, fd: u32, buf: [*]u8, count: usize) i64 {
     const desc = &fd_table.fds[fd];
     if (desc.fd_type != .pipe_read) return EBADF;
-    return vfs.pipeRead(desc.pipe_idx, buf, count);
+    return vfs.pipeRead(desc.pipe_idx, buf, count, 0);
 }
 
 /// Put back bytes dequeued from a pipe when the destination accepted less.
@@ -334,7 +368,7 @@ pub fn sysSplice(fd_in: u32, off_in: u64, fd_out: u32, off_out: u64, len: u64, f
     defer fd_table.releaseTransferFd(fd_out);
 
     if (!fdIsOpen(fd_table, fd_in) or !fdIsOpen(fd_table, fd_out)) return EBADF;
-    if ((flags & ~(SPLICE_F_MOVE | SPLICE_F_NONBLOCK)) != 0) return EINVAL;
+    if (validateSpliceFlags(flags) < 0) return EINVAL;
 
     const in_type = fdType(fd_table, fd_in);
     const out_type = fdType(fd_table, fd_out);
@@ -342,8 +376,7 @@ pub fn sysSplice(fd_in: u32, off_in: u64, fd_out: u32, off_out: u64, len: u64, f
     // At least one end must be a pipe. Offset pointers are meaningful only
     // for the seekable endpoint and are rejected for stream endpoints.
     if (!isPipeFd(in_type) and !isPipeFd(out_type)) return EINVAL;
-    if (isPipeFd(in_type) and off_in != 0) return EINVAL;
-    if (isPipeFd(out_type) and off_out != 0) return EINVAL;
+    if (validateSpliceOffsets(isPipeFd(in_type), off_in, isPipeFd(out_type), off_out) < 0) return EINVAL;
 
     // ── Case 1: pipe_read → tcp_socket ──────────────────────────────────
     if (in_type == .pipe_read and out_type == .tcp_socket) {

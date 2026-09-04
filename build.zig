@@ -283,10 +283,13 @@ pub fn build(b: *std.Build) void {
         "hello25", "hello26", "hello27", "hello28", "hello29",
         "hello30", "hello31", "hello32", "hello33", "hello34",
         "hello35", "hello36", "hello37", "hello38", "hello39",
-         "hello40", "hello41", "hello42", "hello43", "hello44",
-         "hello46", "hello47", "hello48", "hello49", "hello50",
-      "hello51", "hello52", "hello53", "hello54", "hello56",
-      "hello74", "hello75", "hello76", "hello77", "hello78", "hello79", "hello80", "hello81", "hello82", "hello83", "hello85", "hello86", "hello87", "hello88", "hello89", "hello90",
+        "hello40", "hello41", "hello42", "hello43", "hello44",
+        "hello46", "hello47", "hello48", "hello49", "hello50",
+        "hello51", "hello52", "hello53", "hello54", "hello56",
+        "hello74", "hello75", "hello76", "hello77", "hello78",
+        "hello79", "hello80", "hello81", "hello82", "hello83",
+        "hello85", "hello86", "hello87", "hello88", "hello89",
+        "hello90", "hello91",
     };
     for (c_programs) |name| addCUserProgram(b, name);
 

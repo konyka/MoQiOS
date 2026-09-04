@@ -1416,6 +1416,13 @@ pub fn repairCurrentAfterBlock() void {
     }
 }
 
+/// Finish a block that was queued by a caller while holding its own lock.
+/// The caller releases that lock before invoking this so wakers can progress.
+pub fn rescheduleAfterBlock() void {
+    @call(.never_inline, forceReschedule, .{});
+    if (portable_reschedule == null) repairCurrentAfterBlock();
+}
+
 /// Portable half of `sleepOn`: link WaitNode + mark current task blocked.
 /// Does not switch away — callers that need a reschedule invoke `forceReschedule`
 /// (or install `setPortableReschedule` on non-x86 bring-up).
