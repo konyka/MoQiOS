@@ -42,6 +42,7 @@ pub fn allocUnixFd(fd_table: *vfs_mod.FdTable, unix_sock_idx: u32) i32 {
     fd_table.fds[slot] = .{
         .fd_type = .unix_socket,
         .unix_sock_idx = unix_sock_idx,
+        .writable = true,
     };
     fd_table.publishFd(slot);
     return @intCast(slot);
@@ -195,6 +196,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
             const n = copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN);
             if (n < sa.SOCKADDR_IN6_LEN) return -22; // EINVAL
             const parsed = sa.parseInet6(&sa6) orelse return -97; // EAFNOSUPPORT
+            if (parsed.port != 0 and parsed.port < 1024 and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return -1;
             const cur_port = t.fd_table.fds[fd].udp_port;
             if (parsed.port != cur_port) {
                 // EADDRINUSE when another socket owns the port (0xFFFE) or the
@@ -211,6 +213,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         if (n4 < SOCKADDR_IN_MIN_LEN) return -22;
         // Accept legacy callers that only filled port+addr; family may be unset.
         const new_port = bo.readU16BeAt(&sock_addr, 2);
+        if (new_port != 0 and new_port < 1024 and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return -1;
         const cur_port = t.fd_table.fds[fd].udp_port;
         if (new_port != cur_port) {
             // EADDRINUSE when another socket owns the port (0xFFFE) or the
@@ -233,12 +236,14 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) < sa.SOCKADDR_IN6_LEN)
             return -22;
         const parsed = sa.parseInet6(&sa6) orelse return -97; // EAFNOSUPPORT
+        if (parsed.port != 0 and parsed.port < 1024 and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return -1;
         return net_mod.tcp.tcpBind(tcb_idx, parsed.port);
     }
     if (addr_len < SOCKADDR_IN_MIN_LEN) return -22;
     var sock_addr: [8]u8 = undefined;
     if (copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), SOCKADDR_IN_MIN_LEN) != SOCKADDR_IN_MIN_LEN) return -14;
     const port = bo.readU16BeAt(&sock_addr, 2);
+    if (port != 0 and port < 1024 and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return -1;
     return net_mod.tcp.tcpBind(tcb_idx, port);
 }
 
@@ -263,6 +268,12 @@ pub fn listen(fd: u32, backlog: u32) i64 {
 
 /// accept(fd, addr_ptr, addr_len_ptr) → new fd or -errno
 pub fn accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) i64 {
+    if ((addr_ptr == 0) != (addr_len_ptr == 0)) return -14;
+    if (addr_ptr != 0 and
+        (!copy.validateUserRange(addr_ptr, 0) or
+            !copy.validateUserBuffer(addr_len_ptr, 4) or
+            !copy.validateUserBufferWritable(addr_len_ptr, 4))) return -14;
+
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
 
@@ -292,9 +303,7 @@ pub fn accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) i64 {
         return new_fd;
     }
     // SK-78: optionally fill peer sockaddr (IPv4 or IPv6).
-    if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000 and
-        addr_len_ptr != 0 and addr_len_ptr < 0x0000_8000_0000_0000)
-    {
+    if (addr_ptr != 0 or addr_len_ptr != 0) {
         if (net_mod.tcp.tcpGetAddrInfo(@intCast(new_tcb_idx))) |ainfo| {
             var sa_buf: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
             const alen = sa.encodeInetName(ainfo.is_v6, ainfo.remote_port, ainfo.remote_ip, ainfo.remote_ip6, &sa_buf);
@@ -613,18 +622,24 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
 }
 
 fn copySockaddrToUser(addr_ptr: u64, addrlen_ptr: u64, sa_buf: []const u8, alen: u32) i64 {
-    const to_copy = @min(alen, @as(u32, @intCast(sa_buf.len)));
-    if (copy.copyToUser(@ptrFromInt(addr_ptr), sa_buf[0..to_copy], to_copy) != to_copy) return -14;
-    var len_bytes: [4]u8 = @bitCast(alen);
+    if (!copy.validateUserBuffer(addrlen_ptr, 4)) return -14;
+    var len_bytes: [4]u8 = undefined;
+    if (copy.copyFromUser(&len_bytes, @ptrFromInt(addrlen_ptr), 4) != 4) return -14;
+    const user_len: u32 = @bitCast(len_bytes);
+    const to_copy = @min(@min(user_len, alen), @as(u32, @intCast(sa_buf.len)));
+    if (!copy.validateUserRange(addr_ptr, to_copy) or
+        !copy.validateUserBufferWritable(addrlen_ptr, 4)) return -14;
+    if (to_copy != 0) {
+        if (!copy.validateUserBufferWritable(addr_ptr, to_copy)) return -14;
+        if (copy.copyToUser(@ptrFromInt(addr_ptr), sa_buf[0..to_copy], to_copy) != to_copy) return -14;
+    }
+    len_bytes = @bitCast(alen);
     if (copy.copyToUser(@ptrFromInt(addrlen_ptr), &len_bytes, 4) != 4) return -14;
     return 0;
 }
 
 /// getsockname(fd, addr_ptr, addrlen_ptr) → 0 or -errno
 pub fn getsockname(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
-    if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000 or
-        addrlen_ptr == 0 or addrlen_ptr >= 0x0000_8000_0000_0000) return -22;
-
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
@@ -652,9 +667,6 @@ pub fn getsockname(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
 
 /// getpeername(fd, addr_ptr, addrlen_ptr) → 0 or -errno
 pub fn getpeername(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
-    if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000 or
-        addrlen_ptr == 0 or addrlen_ptr >= 0x0000_8000_0000_0000) return -22;
-
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
@@ -797,6 +809,7 @@ pub fn socketpair(domain: u32, sock_type: u32, protocol: u32, sv_ptr: u64) i64 {
     cur.fd_table.fds[first_fd] = .{
         .fd_type = .unix_socket,
         .unix_sock_idx = first_idx,
+        .writable = true,
         .fd_flags = if ((sock_type & socketpair_policy.SOCK_CLOEXEC) != 0) 1 else 0,
         .status_flags = sock_type & socketpair_policy.SOCK_NONBLOCK,
     };
@@ -809,6 +822,7 @@ pub fn socketpair(domain: u32, sock_type: u32, protocol: u32, sv_ptr: u64) i64 {
     cur.fd_table.fds[second_fd] = .{
         .fd_type = .unix_socket,
         .unix_sock_idx = second_idx,
+        .writable = true,
         .fd_flags = if ((sock_type & socketpair_policy.SOCK_CLOEXEC) != 0) 1 else 0,
         .status_flags = sock_type & socketpair_policy.SOCK_NONBLOCK,
     };

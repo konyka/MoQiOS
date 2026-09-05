@@ -18,6 +18,7 @@ const huge_user = @import("huge_user.zig");
 const huge_impl = @import("huge_user_impl.zig");
 const fixed_replacement = @import("map_fixed.zig");
 const vma_runtime_stats = @import("vma_runtime_stats.zig");
+const munmap_policy = @import("munmap_policy.zig");
 
 fn mmapRegionIndex(task: *task_mod.Task, region: *task_mod.MmapRegion) u6 {
     return @intCast((@intFromPtr(region) - @intFromPtr(&task.mmap_regions[0])) / @sizeOf(task_mod.MmapRegion));
@@ -142,7 +143,7 @@ fn canTrackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, anonymous
         const r = task.mmap_regions[i];
         if (anonymous and r.file_kind == 0 and
             (r.base + r.num_pages * user_space.PAGE_SIZE == base or
-            base + num_pages * user_space.PAGE_SIZE == r.base)) return true;
+                base + num_pages * user_space.PAGE_SIZE == r.base)) return true;
     }
     return false;
 }
@@ -866,6 +867,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
         // (panic in safe builds) or unmap kernel pages in ReleaseFast.
         if (base >= user_space.USER_ADDR_MAX) return -22; // EINVAL
         if (num_pages > (user_space.USER_ADDR_MAX - base) / user_space.PAGE_SIZE) return -12; // ENOMEM
+        if (@import("../ipc/sysv_shm.zig").overlapsAttachment(cur.tid, base, num_pages)) return -22; // EINVAL
         if (hasMmapOverlap(cur, base, num_pages)) {
             if (meta != null) return -12;
             return replaceFixedAnonymous(cur, base, num_pages, prot, flags);
@@ -987,21 +989,17 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
 
 /// Core munmap implementation. Returns 0 or -errno.
 pub fn munmap(addr: u64, length: u64) i64 {
-    if (length == 0) return -22; // EINVAL
-
-    const PAGE: u64 = 4096;
-    // v53.3: reject kernel-space addresses and overflow
-    const USER_SPACE_MAX = 0x0000_8000_0000_0000;
-    if (addr >= USER_SPACE_MAX) return -22; // EINVAL — kernel address
-    if (length > USER_SPACE_MAX) return -22; // EINVAL — length overflow
-    if (addr + length > USER_SPACE_MAX) return -22; // EINVAL — range overflow
-
-    const base = addr / PAGE * PAGE;
-    const end = (addr + length + PAGE - 1) / PAGE * PAGE;
-    const num_pages = (end - base) / PAGE;
+    const range = munmap_policy.validate(addr, length) orelse return -22;
+    const base = range.base;
+    const num_pages = range.num_pages;
 
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
+
+    // SysV SHM owns these frames until shmdt (or task exit).  Do not let the
+    // generic unmap path detach only part of an attachment and later free a
+    // frame still referenced by the segment.
+    if (@import("../ipc/sysv_shm.zig").overlapsAttachment(cur.tid, base, num_pages)) return -22;
 
     // Unmap pages and free physical memory
     unmapRange(cur, base, num_pages);

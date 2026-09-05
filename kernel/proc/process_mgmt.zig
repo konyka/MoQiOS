@@ -7,7 +7,7 @@ const task_mod = @import("task.zig");
 const copy = @import("../mm/copy_from_user.zig");
 const bo = @import("../lib/byte_order.zig");
 
-/// getpid() → current task TGID（线程返回其创建者进程的 tid）
+/// getpid() → current task TGID（线程返回其线程组 leader 的 tid）
 pub fn getpid() i64 {
     if (sched_mod.currentTaskIndex()) |idx| {
         if (task_mod.getTask(idx)) |current| {

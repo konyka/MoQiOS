@@ -509,8 +509,8 @@ pub const FdTable = struct {
     const default_table: FdTable = blk: {
         var table: FdTable = .{ .fds = @splat(.{}), .transfer_state = @splat(SLOT_FREE) };
         table.fds[FD_STDIN] = .{ .fd_type = .special };
-        table.fds[FD_STDOUT] = .{ .fd_type = .special };
-        table.fds[FD_STDERR] = .{ .fd_type = .special };
+        table.fds[FD_STDOUT] = .{ .fd_type = .special, .writable = true };
+        table.fds[FD_STDERR] = .{ .fd_type = .special, .writable = true };
         table.transfer_state[FD_STDIN] = SLOT_LIVE;
         table.transfer_state[FD_STDOUT] = SLOT_LIVE;
         table.transfer_state[FD_STDERR] = SLOT_LIVE;
@@ -1208,15 +1208,18 @@ pub const FdTable = struct {
     pub fn write(self: *FdTable, fd: u32, buf: [*]const u8, count: usize) i64 {
         if (fd >= MAX_FDS) return -1;
         const desc = &self.fds[fd];
+        if (!desc.writable) return -1;
 
         switch (desc.fd_type) {
             .none => return -1,
             .special => {
+                if (!desc.writable) return -1;
                 // stdout/stderr: write to serial
                 serial.writeString(buf[0..count]);
                 return @intCast(count);
             },
             .pipe_write => {
+                if (!desc.writable) return -1;
                 return pipeWrite(desc.pipe_idx, buf, count);
             },
             .pipe_read => return -1,
@@ -1623,7 +1626,7 @@ pub const FdTable = struct {
 
         self.fds[read_fd] = .{ .fd_type = .pipe_read, .pipe_idx = pipe_idx };
         self.publishFd(read_fd);
-        self.fds[write_fd] = .{ .fd_type = .pipe_write, .pipe_idx = pipe_idx };
+        self.fds[write_fd] = .{ .fd_type = .pipe_write, .pipe_idx = pipe_idx, .writable = true };
         self.publishFd(write_fd);
         return @as(i64, read_fd) | (@as(i64, write_fd) << 16);
     }

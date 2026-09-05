@@ -6,6 +6,7 @@ const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const sched_getaffinity_policy = @import("../proc/sched_getaffinity_policy.zig");
 const vfs_mod = @import("../fs/vfs.zig");
+const move_pages_policy = @import("move_pages_policy.zig");
 
 /// sched_getaffinity(pid, cpusetsize, mask_ptr) -> bytes copied or -errno.
 pub fn schedGetaffinity(pid: u32, cpusetsize: u64, mask_ptr: u64) i64 {
@@ -48,13 +49,15 @@ pub fn closefrom(lowfd: u32) i64 {
 
 /// move_pages(pid, count, pages, nodes, status_ptr, flags) -> 0.
 /// Move process pages to NUMA nodes. Stub: writes 0 for all status entries.
-pub fn movePages(count: u64, status_ptr: u64) i64 {
-    const capped = @min(count, 4096);
-    if (capped > 0 and !copy.validateUserBufferWritable(status_ptr, @intCast(capped * 4))) return -14;
-    if (status_ptr != 0 and status_ptr < 0x0000_8000_0000_0000 and count > 0) {
+pub fn movePages(pid: u32, count: u64, pages: u64, nodes: u64, status_ptr: u64, flags: u64) i64 {
+    const policy_result = move_pages_policy.validate(pid, count, pages, nodes, status_ptr, flags);
+    if (policy_result != 0) return policy_result;
+    if (count > 0) {
+        const bytes: usize = @intCast(count * @sizeOf(i32));
+        if (!copy.validateUserBufferWritable(status_ptr, bytes)) return -14;
         const zero: i32 = 0;
         var i: u64 = 0;
-        while (i < count and i < 4096) : (i += 1) {
+        while (i < count) : (i += 1) {
             if (copy.copyToUser(@ptrFromInt(status_ptr + i * 4), @as([*]const u8, @ptrCast(&zero))[0..4], 4) != 4) return -14;
         }
     }

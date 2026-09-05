@@ -8,6 +8,11 @@ const idt = @import("../arch/arch.zig").interrupts;
 pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
     if (name_ptr == 0 or name_ptr >= 0x0000_8000_0000_0000) return null;
 
+    // The old image cannot be destroyed while SHM attachment records still
+    // point at it. Reject exec before loading the replacement image; the
+    // syscall wrapper reports this as EPERM and leaves the old image intact.
+    if (hasShmAttachments()) return null;
+
     var name_buf: [64]u8 = undefined;
     const copy = @import("../mm/copy_from_user.zig");
     const copied = copy.copyFromUser(name_buf[0..], @ptrFromInt(name_ptr), 63);
@@ -177,6 +182,10 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
 pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64) ?u64 {
     const copy = @import("../mm/copy_from_user.zig");
 
+    // Keep execveat consistent with execve: attachment cleanup must happen
+    // before an address-space replacement, or the SHM records become stale.
+    if (hasShmAttachments()) return null;
+
     serial.writeString("[execveat] loading '");
     serial.writeString(name);
     serial.writeString("'\n");
@@ -323,4 +332,13 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64)
     sched.setAnchor(frame_addr);
 
     return frame_addr;
+}
+
+fn hasShmAttachments() bool {
+    const sched = @import("sched.zig");
+    const task_mod = @import("task.zig");
+    const shm = @import("../ipc/sysv_shm.zig");
+    const idx = sched.currentTaskIndex() orelse return false;
+    const cur = task_mod.getTask(idx) orelse return false;
+    return shm.hasAttachments(cur.tid);
 }

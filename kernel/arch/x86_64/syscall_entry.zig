@@ -21,6 +21,7 @@ const fmt = @import("../../lib/fmt.zig");
 const errno = @import("../../lib/errno.zig");
 const epoll_policy = @import("../../net/epoll_policy.zig");
 const unsupported_policy = @import("../../proc/unsupported_policy.zig");
+const close_range_policy = @import("../../proc/close_range_policy.zig");
 const cpu_capacity = @import("../cpu_capacity.zig");
 
 // MSR constants
@@ -1152,7 +1153,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(misc_mod.closefrom(@truncate(frame.rdi)));
         },
         231 => { // move_pages(pid, count, pages, nodes, status, flags)
-            frame.rax = @bitCast(misc_mod.movePages(frame.rsi, frame.r8));
+            frame.rax = @bitCast(misc_mod.movePages(@truncate(frame.rdi), frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9));
         },
         // ── v32.3: Priority / fchdir ─────────────────────────────────
         232 => { // getpriority(which, who)
@@ -1347,17 +1348,17 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         273 => { // sched_setaffinity(pid, cpusetsize, mask)
             frame.rax = @bitCast(syscallSchedSetaffinity(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx));
         },
-         274 => { // fallocate(fd, mode, offset, len) — pre-allocate space
-             const fd: u32 = @truncate(frame.rdi);
-             const mode: u32 = @truncate(frame.rsi);
-             const offset = frame.rdx;
-             const len = frame.r10;
-             const fallocate_policy = @import("../../fs/fallocate_policy.zig");
-             const mode_result = fallocate_policy.validate(mode);
-             if (mode_result != 0) {
-                 frame.rax = @bitCast(mode_result);
-             } else {
-                 if (offset > 0xFFFF_FFFF or len > 0xFFFF_FFFF or len > 0xFFFF_FFFF - offset) {
+        274 => { // fallocate(fd, mode, offset, len) — pre-allocate space
+            const fd: u32 = @truncate(frame.rdi);
+            const mode: u32 = @truncate(frame.rsi);
+            const offset = frame.rdx;
+            const len = frame.r10;
+            const fallocate_policy = @import("../../fs/fallocate_policy.zig");
+            const mode_result = fallocate_policy.validate(mode);
+            if (mode_result != 0) {
+                frame.rax = @bitCast(mode_result);
+            } else {
+                if (offset > 0xFFFF_FFFF or len > 0xFFFF_FFFF or len > 0xFFFF_FFFF - offset) {
                     frame.rax = @bitCast(@as(i64, -22));
                 } else {
                     // Default: allocate space by extending file to offset+len
@@ -1365,30 +1366,30 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                     const tm = @import("../../proc/task.zig");
                     if (sched.currentTaskIndex()) |cur_idx| {
                         if (tm.getTask(cur_idx)) |t| {
-                        if (fd >= t.fd_table.fds.len or t.fd_table.fds[fd].fd_type == .none) {
-                            frame.rax = @bitCast(@as(i64, -9)); // EBADF
-                        } else if (t.fd_table.fds[fd].fd_type != .ext2_file) {
-                            // mode=0 is implemented only by the ext2 extent
-                            // path; never reinterpret pipes/devices as files.
-                            frame.rax = @bitCast(@as(i64, -95)); // EOPNOTSUPP
-                        } else if (!t.fd_table.fds[fd].writable) {
-                            frame.rax = @bitCast(@as(i64, -13)); // EACCES
-                        } else {
-                            const ext2 = @import("../../fs/ext2.zig");
-                            const ext2_idx = t.fd_table.fds[fd].ext2_file_idx;
-                            if (offset + len > t.fSize_cur) {
-                                const sig = @import("../../proc/signal.zig");
-                                sig.raiseSelf(sig.SIGXFSZ);
-                                frame.rax = @bitCast(@as(i64, -27));
+                            if (fd >= t.fd_table.fds.len or t.fd_table.fds[fd].fd_type == .none) {
+                                frame.rax = @bitCast(@as(i64, -9)); // EBADF
+                            } else if (t.fd_table.fds[fd].fd_type != .ext2_file) {
+                                // mode=0 is implemented only by the ext2 extent
+                                // path; never reinterpret pipes/devices as files.
+                                frame.rax = @bitCast(@as(i64, -95)); // EOPNOTSUPP
+                            } else if (!t.fd_table.fds[fd].writable) {
+                                frame.rax = @bitCast(@as(i64, -13)); // EACCES
                             } else {
-                                const new_size: u32 = @truncate(offset + len);
-                                if (ext2.truncateFile(ext2_idx, new_size)) {
-                                    frame.rax = 0;
+                                const ext2 = @import("../../fs/ext2.zig");
+                                const ext2_idx = t.fd_table.fds[fd].ext2_file_idx;
+                                if (offset + len > t.fSize_cur) {
+                                    const sig = @import("../../proc/signal.zig");
+                                    sig.raiseSelf(sig.SIGXFSZ);
+                                    frame.rax = @bitCast(@as(i64, -27));
                                 } else {
-                                    frame.rax = @bitCast(@as(i64, -28)); // ENOSPC
+                                    const new_size: u32 = @truncate(offset + len);
+                                    if (ext2.truncateFile(ext2_idx, new_size)) {
+                                        frame.rax = 0;
+                                    } else {
+                                        frame.rax = @bitCast(@as(i64, -28)); // ENOSPC
+                                    }
                                 }
                             }
-                        }
                         } else {
                             frame.rax = @bitCast(@as(i64, -9));
                         }
@@ -1396,7 +1397,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                         frame.rax = @bitCast(@as(i64, -1));
                     }
                 }
-             }
+            }
             checkSignalsOnSyscallReturn(frame);
         },
         275 => { // posix_fadvise(fd, offset, len, advice) — readahead hints
@@ -1432,10 +1433,12 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(unsupported_policy.unshare());
         },
         283 => { // process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)
-            frame.rax = @bitCast(syscallProcessVmReadv(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx), frame.r10, @truncate(frame.r8)));
+            const process_vm = @import("../../mm/process_vm.zig");
+            frame.rax = @bitCast(process_vm.processVmReadv(@truncate(frame.rdi), frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9));
         },
         284 => { // process_vm_writev(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)
-            frame.rax = @bitCast(syscallProcessVmWritev(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx), frame.r10, @truncate(frame.r8)));
+            const process_vm = @import("../../mm/process_vm.zig");
+            frame.rax = @bitCast(process_vm.processVmWritev(@truncate(frame.rdi), frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9));
         },
         285 => { // memfd_create(name, flags) — anonymous memory file
             frame.rax = @bitCast(syscallMemfdCreate(frame.rdi, @truncate(frame.rsi)));
@@ -3154,22 +3157,6 @@ fn syscallSocket(frame: *SyscallFrame) void {
 /// RDX = addr_len
 /// Returns 0 on success, -1 on failure.
 fn syscallBind(frame: *SyscallFrame) void {
-    // Task #8: cap_net_bind required for privileged ports (< 1024).
-    if (frame.rsi != 0 and frame.rsi < 0x0000_8000_0000_0000) {
-        // sockaddr layout: [u16 family][u16 port_be]...
-        var sa: [4]u8 = undefined;
-        const copy = @import("../../mm/copy_from_user.zig");
-        const got = copy.copyFromUser(&sa, @ptrFromInt(frame.rsi), 4);
-        if (got == 4) {
-            const port: u16 = (@as(u16, sa[2]) << 8) | @as(u16, sa[3]);
-            if (port != 0 and port < 1024) {
-                if (!checkCapForCurrent("cap_net_bind")) {
-                    frame.rax = @bitCast(@as(i64, -1)); // EPERM
-                    return;
-                }
-            }
-        }
-    }
     frame.rax = @bitCast(socket_mod.bind(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));
 }
 
@@ -4423,96 +4410,6 @@ fn syscallPrlimit64(pid: u32, resource: u32, new_limit_ptr: u64, old_limit_ptr: 
     return 0;
 }
 
-/// process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)
-/// Read memory from remote process into local buffers.
-/// Used by debuggers and /proc/<pid>/mem readers.
-fn syscallProcessVmReadv(pid: u32, local_iov_ptr: u64, liovcnt: u32, remote_iov_ptr: u64, riovcnt: u32) i64 {
-    _ = pid;
-    if (local_iov_ptr == 0 or local_iov_ptr >= 0x0000_8000_0000_0000) return -14;
-    if (remote_iov_ptr == 0 or remote_iov_ptr >= 0x0000_8000_0000_0000) return -14;
-    if (liovcnt != riovcnt) return -22; // EINVAL
-
-    const copy = @import("../../mm/copy_from_user.zig");
-    const bo = @import("../../lib/byte_order.zig");
-
-    // For each iovec pair, copy remote → local
-    var total: i64 = 0;
-    var idx: u32 = 0;
-    while (idx < liovcnt) : (idx += 1) {
-        // Read local iovec (base, len)
-        var liov_buf: [16]u8 = undefined;
-        const l_off = @as(u64, idx) * 16;
-        _ = copy.copyFromUser(liov_buf[0..], @ptrFromInt(local_iov_ptr + l_off), 16);
-        const l_base: u64 = bo.readU64At(&liov_buf, 0);
-        const l_len: u64 = bo.readU64At(&liov_buf, 8);
-
-        // Read remote iovec
-        var riov_buf: [16]u8 = undefined;
-        const r_off = @as(u64, idx) * 16;
-        _ = copy.copyFromUser(riov_buf[0..], @ptrFromInt(remote_iov_ptr + r_off), 16);
-        const r_base: u64 = bo.readU64At(&riov_buf, 0);
-        const r_len: u64 = bo.readU64At(&riov_buf, 8);
-
-        const n: u64 = @min(l_len, r_len);
-        if (n > 0 and l_base > 0 and l_base < 0x0000_8000_0000_0000 and
-            r_base > 0 and r_base < 0x0000_8000_0000_0000)
-        {
-            // Copy remote → kernel buffer → local (same address space in single-process)
-            var kbuf: [4096]u8 = undefined;
-            const chunk: usize = @intCast(@min(n, 4096));
-            const from_remote = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(r_base), chunk);
-            if (from_remote > 0) {
-                const to_local = copy.copyToUser(@ptrFromInt(l_base), kbuf[0..from_remote], from_remote);
-                total += @as(i64, @intCast(to_local));
-            }
-        }
-    }
-    return total;
-}
-
-/// process_vm_writev(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)
-/// Write local buffers into remote process memory.
-fn syscallProcessVmWritev(pid: u32, local_iov_ptr: u64, liovcnt: u32, remote_iov_ptr: u64, riovcnt: u32) i64 {
-    _ = pid;
-    if (local_iov_ptr == 0 or local_iov_ptr >= 0x0000_8000_0000_0000) return -14;
-    if (remote_iov_ptr == 0 or remote_iov_ptr >= 0x0000_8000_0000_0000) return -14;
-    if (liovcnt != riovcnt) return -22;
-
-    const copy = @import("../../mm/copy_from_user.zig");
-    const bo = @import("../../lib/byte_order.zig");
-
-    var total: i64 = 0;
-    var idx: u32 = 0;
-    while (idx < liovcnt) : (idx += 1) {
-        var liov_buf: [16]u8 = undefined;
-        const l_off = @as(u64, idx) * 16;
-        _ = copy.copyFromUser(liov_buf[0..], @ptrFromInt(local_iov_ptr + l_off), 16);
-        const l_base: u64 = bo.readU64At(&liov_buf, 0);
-        const l_len: u64 = bo.readU64At(&liov_buf, 8);
-
-        var riov_buf: [16]u8 = undefined;
-        const r_off = @as(u64, idx) * 16;
-        _ = copy.copyFromUser(riov_buf[0..], @ptrFromInt(remote_iov_ptr + r_off), 16);
-        const r_base: u64 = bo.readU64At(&riov_buf, 0);
-        const r_len: u64 = bo.readU64At(&riov_buf, 8);
-
-        const n: u64 = @min(l_len, r_len);
-        if (n > 0 and l_base > 0 and l_base < 0x0000_8000_0000_0000 and
-            r_base > 0 and r_base < 0x0000_8000_0000_0000)
-        {
-            // Copy local → kernel buffer → remote
-            var kbuf: [4096]u8 = undefined;
-            const chunk: usize = @intCast(@min(n, 4096));
-            const from_local = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(l_base), chunk);
-            if (from_local > 0) {
-                const to_remote = copy.copyToUser(@ptrFromInt(r_base), kbuf[0..from_local], from_local);
-                total += @as(i64, @intCast(to_remote));
-            }
-        }
-    }
-    return total;
-}
-
 /// memfd_create(name_ptr, flags) — create an anonymous memory-backed file descriptor.
 /// Returns a new fd that behaves like a tmpfs file (backed by anonymous pipe).
 fn syscallMemfdCreate(name_ptr: u64, flags: u32) i64 {
@@ -5448,19 +5345,26 @@ fn syscallCheckCap(endpoint: u32, rights: u32) i64 {
 fn syscallCloseRange(first: u32, last: u32, flags: u32) i64 {
     const sched = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
+    const fcntl = @import("../../fs/fcntl.zig");
+    const policy_result = close_range_policy.validate(first, last, flags);
+    if (policy_result != 0) return policy_result;
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = tm.getTask(cur_idx) orelse return -1;
 
     const max_fd = cur.fd_table.fds.len;
-    const lo = @min(first, max_fd);
-    const hi = @min(last + 1, max_fd);
-    _ = flags; // CLOSE_RANGE_CLOEXEC not yet enforced
+    const lo = @min(@as(usize, first), max_fd);
+    const hi = if (last == close_range_policy.UINT_MAX)
+        max_fd
+    else
+        @min(@as(usize, last) + 1, max_fd);
 
-    var closed: u32 = 0;
     for (lo..hi) |fd| {
         if (cur.fd_table.fds[fd].fd_type != .none) {
-            _ = cur.fd_table.close(@intCast(fd));
-            closed += 1;
+            if (flags == close_range_policy.CLOSE_RANGE_CLOEXEC) {
+                cur.fd_table.fds[fd].fd_flags |= fcntl.FD_CLOEXEC;
+            } else {
+                _ = cur.fd_table.close(@intCast(fd));
+            }
         }
     }
     return 0;

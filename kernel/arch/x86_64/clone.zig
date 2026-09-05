@@ -2,6 +2,7 @@
 //
 // Implements clone() syscall and COW page table duplication.
 
+const std = @import("std");
 const serial = @import("serial.zig");
 const idt = @import("idt.zig");
 const sched = @import("../../proc/sched.zig");
@@ -23,6 +24,15 @@ const CLONE_THREAD: u64 = 0x10000;
 const CLONE_SETTLS: u64 = 0x80000;
 const CLONE_PARENT_SETTID: u64 = 0x100000;
 const CLONE_CHILD_CLEARTID: u64 = 0x200000;
+
+/// CLONE_THREAD tasks share the group's leader TID as their parent_tid.
+/// Preserve that identity when a thread creates another thread.
+fn threadGroupParentTid(parent: *const task_mod.Task, flags: u64) u32 {
+    if (flags & CLONE_THREAD != 0 and parent.is_thread and parent.parent_tid != 0) {
+        return parent.parent_tid;
+    }
+    return parent.tid;
+}
 
 /// Parent register state to replicate into child.
 pub const ParentRegs = struct {
@@ -223,6 +233,10 @@ pub fn clone(
     const parent_idx = sched.currentTaskIndex() orelse return -1;
     const parent = task_mod.getTask(parent_idx) orelse return -1;
 
+    // See fork(): until SHM attachment ownership is shared/address-space
+    // based, reject both process and CLONE_VM cloning while attached.
+    if (@import("../../ipc/sysv_shm.zig").hasAttachments(parent.tid)) return -11; // EAGAIN
+
     // RLIMIT_NPROC preflight: a thread or process created via clone counts
     // against the parent's real UID (Linux counts every task). Gate before
     // COW cloning or address-space retention so a denied clone leaks
@@ -248,7 +262,7 @@ pub fn clone(
         parent.user_entry,
         if (new_stack != 0) new_stack else parent.user_stack_top,
         child_pml4,
-        parent.tid,
+        threadGroupParentTid(parent, flags),
         false, // inherit general affinity
         @import("../../proc/capability_profile.zig").default_user_profile,
         parent.fSize_cur,
@@ -392,4 +406,13 @@ pub fn clone(
     if (flags & CLONE_THREAD != 0) serial.writeString(" THREAD");
     serial.writeString("\n");
     return @intCast(child.tid);
+}
+
+test "nested CLONE_THREAD preserves the thread group's leader TID" {
+    var parent: task_mod.Task = undefined;
+    parent.tid = 43;
+    parent.is_thread = true;
+    parent.parent_tid = 42;
+    try std.testing.expectEqual(@as(u32, 42), threadGroupParentTid(&parent, CLONE_THREAD));
+    try std.testing.expectEqual(@as(u32, 43), threadGroupParentTid(&parent, 0));
 }

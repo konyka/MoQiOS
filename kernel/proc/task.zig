@@ -95,8 +95,8 @@ pub const Task = struct {
     /// Whether this task runs in user mode.
     is_user: bool,
     /// Whether this task is a thread (clone with CLONE_THREAD, shares the
-    /// creator's address space). Threads report the creator's tid as getpid()
-    /// and are joined via pthread_join, not reaped by waitpid.
+    /// creator's address space). Threads report the thread group's leader tid
+    /// as getpid() and are joined via pthread_join, not reaped by waitpid.
     is_thread: bool = false,
     /// Job control: the task is stopped (SIGSTOP/SIGTTIN/SIGTTOU default).
     /// Stopped tasks are held in .blocked and resume only via SIGCONT —
