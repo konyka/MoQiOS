@@ -10,6 +10,9 @@ const openat2_policy = kt.openat2_policy;
 const futex_key = kt.futex_key;
 const mlock_policy = kt.mlock_policy;
 const mprotect_policy = kt.mprotect_policy;
+const munmap_policy = kt.munmap_policy;
+const process_vm_policy = kt.process_vm_policy;
+const shm_policy = kt.shm_policy;
 const cow_pte = kt.cow_pte;
 const map_fixed = kt.map_fixed;
 const vma_stats = kt.vma_stats;
@@ -40,6 +43,151 @@ const unsupported_policy = kt.unsupported_policy;
 const sched_getaffinity_policy = kt.sched_getaffinity_policy;
 const epoll_policy = kt.epoll_policy;
 const accept4_policy = kt.accept4_policy;
+const sysv_policy = kt.sysv_policy;
+const close_range_policy = kt.close_range_policy;
+const move_pages_policy = kt.move_pages_policy;
+
+test "SysV msgrcv keeps its IRQ lock cleanup scoped" {
+    const source = kt.sysv_msg_source;
+    const receive_start = std.mem.indexOf(u8, source, "pub fn msgrcv") orelse unreachable;
+    const receive_end = std.mem.indexOfPos(u8, source, receive_start, "/// msgctl") orelse unreachable;
+    const receive = source[receive_start..receive_end];
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, receive, "msg_lock.acquire()"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, receive, "defer msg_lock.release(flags);"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, receive, "msg_lock.release(flags);\n\n    // Write"));
+}
+
+test "close_range policy accepts UINT_MAX boundary" {
+    try std.testing.expectEqual(@as(i64, 0), close_range_policy.validate(3, close_range_policy.UINT_MAX, 0));
+    try std.testing.expectEqual(errno.EINVAL, close_range_policy.validate(4, 3, 0));
+    try std.testing.expectEqual(errno.EINVAL, close_range_policy.validate(3, close_range_policy.UINT_MAX, 2));
+}
+
+test "move_pages policy validates status ABI" {
+    try std.testing.expectEqual(@as(i64, 0), move_pages_policy.validate(0, 0, 0, 0, 0, 0));
+    try std.testing.expectEqual(errno.EFAULT, move_pages_policy.validate(0, 1, 0, 0, 0, 0));
+    try std.testing.expectEqual(errno.EINVAL, move_pages_policy.validate(0, 4097, 0, 0, 0x1000, 0));
+}
+
+test "process_vm policy checks user range boundaries" {
+    const user_addr_max: u64 = process_vm_policy.USER_ADDR_MAX;
+    try std.testing.expect(process_vm_policy.validUserRange(0, 0));
+    try std.testing.expect(!process_vm_policy.validUserRange(0, 1));
+    try std.testing.expect(process_vm_policy.validUserRange(user_addr_max - 1, 1));
+    try std.testing.expect(!process_vm_policy.validUserRange(user_addr_max, 1));
+    try std.testing.expect(!process_vm_policy.validUserRange(user_addr_max - 1, 2));
+    try std.testing.expect(!process_vm_policy.validUserRange(std.math.maxInt(u64), 2));
+}
+
+test "process_vm policy enforces the iovec count and array boundary" {
+    const user_addr_max: u64 = process_vm_policy.USER_ADDR_MAX;
+    const entry_size: u64 = process_vm_policy.IOV_ENTRY_SIZE;
+    const sixteen_entries: u64 = 16;
+    const seventeen_entries: u64 = 17;
+    const array_bytes: u64 = sixteen_entries * entry_size;
+
+    try std.testing.expect(process_vm_policy.validIovArray(0, 0));
+    try std.testing.expect(process_vm_policy.validIovArray(user_addr_max - array_bytes, sixteen_entries));
+    try std.testing.expect(!process_vm_policy.validIovArray(user_addr_max - array_bytes + 1, sixteen_entries));
+    try std.testing.expect(!process_vm_policy.validIovArray(std.math.maxInt(u64) - 15, 2));
+    try std.testing.expect(!process_vm_policy.validIovArray(0x1000, seventeen_entries));
+}
+
+test "process_vm policy rejects aggregate iovec length overflow" {
+    const valid: []const process_vm_policy.Iovec = &[_]process_vm_policy.Iovec{
+        .{ .base = 0x1000, .len = 3 },
+        .{ .base = 0x2000, .len = 4 },
+    };
+    const overflowing: []const process_vm_policy.Iovec = &[_]process_vm_policy.Iovec{
+        .{ .base = 0x1000, .len = std.math.maxInt(u64) },
+        .{ .base = 0x2000, .len = 1 },
+    };
+
+    try std.testing.expectEqual(@as(?u64, 7), process_vm_policy.aggregateLength(valid));
+    try std.testing.expectEqual(@as(?u64, null), process_vm_policy.aggregateLength(overflowing));
+}
+
+test "process_vm policy keeps readv and writev permissions asymmetric" {
+    const readable: process_vm_policy.Mapping = .{
+        .present = true,
+        .user = true,
+        .readable = true,
+        .writable = false,
+        .cow = false,
+        .huge = false,
+        .raw_pte_available = true,
+    };
+    const writable: process_vm_policy.Mapping = .{
+        .present = true,
+        .user = true,
+        .readable = true,
+        .writable = true,
+        .cow = false,
+        .huge = false,
+        .raw_pte_available = true,
+    };
+
+    try std.testing.expect(process_vm_policy.permits(.readv, writable, readable));
+    try std.testing.expect(!process_vm_policy.permits(.readv, readable, writable));
+    try std.testing.expect(process_vm_policy.permits(.writev, readable, writable));
+    try std.testing.expect(!process_vm_policy.permits(.writev, writable, readable));
+}
+
+test "process_vm policy rejects COW and huge mappings without raw PTE access" {
+    const readable: process_vm_policy.Mapping = .{
+        .present = true,
+        .user = true,
+        .readable = true,
+        .writable = true,
+        .cow = false,
+        .huge = false,
+        .raw_pte_available = true,
+    };
+    const cow_without_raw: process_vm_policy.Mapping = .{
+        .present = true,
+        .user = true,
+        .readable = true,
+        .writable = true,
+        .cow = true,
+        .huge = false,
+        .raw_pte_available = false,
+    };
+    const huge_without_raw: process_vm_policy.Mapping = .{
+        .present = true,
+        .user = true,
+        .readable = true,
+        .writable = true,
+        .cow = false,
+        .huge = true,
+        .raw_pte_available = false,
+    };
+
+    try std.testing.expect(!process_vm_policy.permits(.readv, cow_without_raw, readable));
+    try std.testing.expect(!process_vm_policy.permits(.readv, readable, huge_without_raw));
+    try std.testing.expect(!process_vm_policy.permits(.writev, readable, cow_without_raw));
+    try std.testing.expect(!process_vm_policy.permits(.writev, readable, huge_without_raw));
+}
+
+test "SysV IPC authorization and removal policy" {
+    const owner: sysv_policy.Owner = .{ .uid = 10, .gid = 20, .cuid = 10, .cgid = 20 };
+    try std.testing.expect(sysv_policy.modeAllows(0o640, owner, .{ .euid = 10, .egid = 99 }, true, true));
+    try std.testing.expect(sysv_policy.modeAllows(0o064, owner, .{ .euid = 99, .egid = 20 }, true, true));
+    try std.testing.expect(!sysv_policy.modeAllows(0o600, owner, .{ .euid = 99, .egid = 99 }, true, false));
+    try std.testing.expect(sysv_policy.canManage(owner, .{ .euid = 10, .egid = 99 }));
+    try std.testing.expect(!sysv_policy.canManage(owner, .{ .euid = 99, .egid = 99 }));
+    try std.testing.expect(!sysv_policy.removalCanFree(true, 1));
+    try std.testing.expect(sysv_policy.removalCanFree(true, 0));
+}
+
+test "munmap and SysV SHM policy validation" {
+    try std.testing.expectEqual(@as(u64, 1), munmap_policy.validate(0x4000, 4096).?.num_pages);
+    try std.testing.expect(munmap_policy.validate(0x4001, 4096) == null);
+    try std.testing.expect(munmap_policy.validate(munmap_policy.USER_ADDR_MAX - 4096, 8192) == null);
+    try std.testing.expect(shm_policy.flagsValid(shm_policy.SHM_RDONLY | shm_policy.SHM_EXEC));
+    try std.testing.expect(!shm_policy.flagsValid(1));
+    try std.testing.expect(shm_policy.rangeEnd(0x7000_0000, 4096, munmap_policy.USER_ADDR_MAX) != null);
+}
 
 test "epoll_create1 accepts only zero or EPOLL_CLOEXEC" {
     try std.testing.expectEqual(@as(i64, 0), epoll_policy.validate(0));
