@@ -1529,9 +1529,21 @@ Four new C regression programs were added to `user/` and wired into `build.zig`
 | `hello38` | `futex` user-word fault handling: verifies `EFAULT` when the futex word address is unmapped, `EFAULT` on a null `futex_waitv` waiter array, and `EINVAL` when `nr_waiters` exceeds the allowed limit. |
 | `hello39` | `setsockopt`/`getsockopt` user-copy and sockaddr length: round-trips `SO_REUSEADDR` and `SO_ERROR` on a TCP socket; verifies `EFAULT` when `optval` is an unmapped pointer, and that `SO_ERROR` clears on read. |
 | `hello40` | `msgctl(IPC_SET)` and `rt_sigsuspend` must not mutate kernel state after a failed user-copy: verifies `EFAULT` when the `msqid_ds` buffer pointer is unmapped, and `EINTR` (not a spurious mask change) from `rt_sigsuspend` when the supplied mask pointer is unmapped. |
-| `hello41` | `copy_file_range` fd validation and offset rollback: verifies `EBADF` for out-of-range and closed fds, `EINVAL` for special fds, and that explicit `off_in`/`off_out` pointers are correctly updated after a successful copy. |
+ | `hello41` | `copy_file_range` fd validation and offset rollback: verifies `EBADF` for out-of-range and closed fds, `EINVAL` for special fds, and that explicit `off_in`/`off_out` pointers are correctly updated after a successful copy. |
 
 All four programs emit `helloNN: PASS` on success and are mandatory smoke markers.
+
+#### process_vm self-only safety slice: hello92 (#283/#284)
+
+The x86_64 self-only slice for `process_vm_readv`/`process_vm_writev` is implemented and
+smoke-gated by `hello92`. It accepts only the caller's own PID and moves data in chunks
+through at most a 4096-byte kernel staging buffer using `copyFromUser`/`copyToUser`;
+page-boundary and user-range checks remain in force. Partial copies return the bytes
+transferred, while a zero-byte fault returns `-EFAULT`.
+
+This does not claim a true cross-process implementation. Address-space `mm` lifetime and
+refcounting, COW semantics, and safe target `mm` access remain deferred design work. The
+slice is x86_64-only; riscv64/aarch64 cross-arch skeletons do not provide this coverage.
 
 #### Validation evidence
 
@@ -1542,14 +1554,14 @@ All four programs emit `helloNN: PASS` on success and are mandatory smoke marker
 | `zig build` | x86_64 ReleaseFast | Passed |
 | `zig build -Darch=riscv64` | cross | Passed |
 | `zig build -Darch=aarch64` | cross | Passed |
-| `zig build smoke` | x86_64 single-core | Passed — `hello38`–`hello41` PASS markers present |
+| `zig build smoke` | x86_64 single-core | Passed — `hello38`–`hello41` and `hello92` PASS markers present |
 | `zig build smoke-smp-stress` | 8-core, 2 runs | Passed — all markers present in both runs |
 | `zig build -Darch=riscv64 smoke-riscv` | — | Passed |
 | `zig build -Darch=aarch64 smoke-aarch64` | — | Passed |
 
 #### Deferred items (explicit, with reasons)
 
-- **`process_vm_readv`/`process_vm_writev` true cross-process path**: current implementation accesses the target task's page table by switching CR3 under a spinlock, which is unsafe when the target address space can be concurrently freed (task exit, execve, or munmap from another CPU). A correct implementation requires address-space lifetime synchronization (a held reference on the target `mm`) and consolidation of the three existing dead/inline implementations into a single authoritative path. Deferred until the address-space manager has a reference-counted `mm` abstraction. The syscall is not claimed fixed and is not wired to a smoke gate.
+- **`process_vm_readv`/`process_vm_writev` true cross-process path**: the current x86_64 implementation intentionally accepts only the caller's own PID and does not switch CR3. The self-only safety slice is smoke-gated by `hello92` and uses at most a 4096-byte kernel staging buffer through `copyFromUser`/`copyToUser`, preserving partial-copy and zero-byte `-EFAULT` behavior. True cross-process access remains deferred until the address-space manager has a reference-counted `mm` lifetime design, including concurrent exit/execve/munmap safety and COW semantics. riscv64/aarch64 remain cross-arch skeletons without this coverage.
 - **`RwLock` IRQ-mode API defect**: `kernel/sync/rwlock.zig` exposes `readLockIrq`/`writeUnlockIrq` variants but the unlock paths do not restore the saved IRQ flags, so any call site that acquired with IRQs enabled and releases with the intent to re-enable them silently leaves interrupts disabled. No current call site in the merged tree uses these variants in a context where the bug is reachable, so it is deferred rather than fixed speculatively. It must be resolved before any IRQ-mode read-writer lock usage is introduced.
 - ~~**`~80 discarded copyToUser results`**~~ ✅ RESOLVED (2026-08): `grep -rn "_ = .*copyToUser" kernel/`
   now returns 0 hits. A later fix round required the full byte count at every previously discarded

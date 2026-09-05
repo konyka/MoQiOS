@@ -126,6 +126,8 @@ contracts with `tools/disk_fixture.sh disk.img.manifest disk.img` and
 | 110 | fstat | Get file metadata |
 | 111 | unlink | Delete file |
 | 228 | clock_gettime | Get high-resolution time |
+| 283 | process_vm_readv | Caller address space only; up to 4096-byte kernel staging with partial-copy/EFAULT boundaries |
+| 284 | process_vm_writev | Caller address space only; up to 4096-byte kernel staging with partial-copy/EFAULT boundaries |
 
 ## Test Programs
 
@@ -152,6 +154,7 @@ contracts with `tools/disk_fixture.sh disk.img.manifest disk.img` and
 | hello89 | epoll_pwait/epoll_pwait2 temporary signal masks, timeouts, and argument boundaries |
 | hello90 | sendfile/splice offsets, pipe FIFO ordering, and argument boundaries |
 | hello91 | raw fd lifecycle: pipe, dup/dup2, fork, and waitpid |
+| hello92 | self-only process_vm_readv/writev safety slice: page boundaries, partial-copy, and EFAULT boundaries |
 
 ## Quick Start
 
@@ -203,7 +206,10 @@ Register new host-runnable tests in one of those suites. GitHub CI runs the same
 non-gating JSONL duration observation in the log. Durations are observational only,
 not comparable baseline or regression data. Since 2026-08-14 a `smoke-qemu` CI job runs the
 QEMU boot-to-shell gate under TCG (`zig build smoke` single-core and `zig build smoke-smp`
-dual-core), cloning Limine at its pinned commit and verifying disk.img against the manifest;
+dual-core), including the mandatory `hello92` self-only process_vm_readv/writev marker for
+the x86_64 safety slice, cloning Limine at its pinned commit and verifying disk.img against
+the manifest; this does not cover cross-process mm lifetime/refcount/COW design or the
+riscv64/aarch64 porting skeletons;
 see the build documentation for the schema, local commands, and QEMU status limitation.
 
 See [docs/build-and-toolchain.md](docs/build-and-toolchain.md) for markers, timeouts, and known limits.

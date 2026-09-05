@@ -123,7 +123,10 @@
   当前策略只接受精确覆盖、完整跟踪的匿名私有 RW 4K PMM-owned 区域，长度最多 128 页。
   资源检查或形状不支持时返回 `ENOMEM` 且不改变原映射，成功替换后的页面为零填充。
   该策略不是全局并发安全保证。
-  `process_vm_readv/writev` 的引用计数 mm 抽象（review §5.5/§5.6）。
+  `process_vm_readv/writev` 真正跨进程访问所需的引用计数 mm 生命周期、COW 与并发语义
+  （review §5.5/§5.6）；当前仅完成 x86_64 self-only 安全切片，按最多 4096 字节内核
+  staging 通过 `copyFromUser`/`copyToUser` 传输，并保留 partial-copy/`EFAULT` 边界。
+  riscv64/aarch64 仍是移植骨架，未纳入该 syscall 覆盖。
 - riscv64/aarch64 跑通用户进程 + `main.zig` 初始化收敛到共享 arch 抽象
   （cross-arch-port-plan）。
 - 微内核服务化第一批迁移（netstack 或 vfs 迁出内核，依托已验证的 devfs

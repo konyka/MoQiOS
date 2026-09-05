@@ -6,7 +6,7 @@
 
 **当前进度**: x86_64 主路径已覆盖 M11+ 及多项扩展 (TCP、ext2、AHCI/NVMe、tmpfs/procfs、SMP)。
 系统可正常引导至调度器，并通过 QEMU 串口跑通 `init` + 各 hello 用例（包括后续 raw syscall acceptance gates）和 Shell；
-`hello6`、`hello21` 等需要交互输入的用例保留为手动集成用例；`hello38`–`hello41` 是 2026-07-28 新增的强制 smoke 门禁测试。riscv64/aarch64 当前是独立的移植骨架，分别有 QEMU smoke 门禁。
+`hello6`、`hello21` 等需要交互输入的用例保留为手动集成用例；`hello38`–`hello41` 是 2026-07-28 新增的强制 smoke 门禁测试，`hello92` 是 x86_64 self-only process_vm_readv/writev（#283/#284）安全切片的强制门禁。riscv64/aarch64 当前是独立的移植骨架，分别有 QEMU smoke 门禁；process_vm 该切片不覆盖这两个架构。
 
 | 里程碑 | 功能 | 状态 |
 |---|---|---|
@@ -177,6 +177,8 @@
 | 110 | fstat | 获取文件元数据 |
 | 111 | unlink | 删除文件 |
 | 228 | clock_gettime | 获取高精度时间 |
+| 283 | process_vm_readv | 仅当前进程地址空间；最多 4096 字节内核 staging，保留 partial-copy/EFAULT 边界 |
+| 284 | process_vm_writev | 仅当前进程地址空间；最多 4096 字节内核 staging，保留 partial-copy/EFAULT 边界 |
 
 ## 测试程序
 
@@ -211,6 +213,7 @@
 | hello89 | epoll_pwait/epoll_pwait2 临时信号掩码、超时与参数边界 |
 | hello90 | sendfile/splice 偏移、管道 FIFO 与参数边界 |
 | hello91 | 原始系统调用 fd 生命周期：pipe、dup/dup2、fork 与 waitpid |
+| hello92 | self-only process_vm_readv/writev 安全切片：页边界、partial-copy 与 EFAULT 边界 |
 
 ## 快速开始
 

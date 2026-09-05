@@ -322,7 +322,7 @@ qemu-system-x86_64 \
 | `zig build run` | 编译并启动 QEMU 仿真 |
 | `zig build debug` | 启动 QEMU 并在 1234 端口监听 GDB（`-s -S`） |
 | `zig build test` | 规范的主机测试门禁：在主机目标运行 `tests/main.zig` 的 Zig 单元测试和 `lib/moqi_libc/host_tests/run_tests.sh` 的 moqi_libc C 测试；任一失败都会使命令失败 |
-| `zig build smoke` | 单核 QEMU 限时冒烟测试，串口日志需出现 init 自动序列各 PASS 标记（`hello21 done`、`hello29: PASS` … `hello41: PASS`）、序列终点 `hello42: PASS` + `hello42 done`，以及 `MoQiOS shell`；完整判定见 `tools/qemu_smoke.sh`。此外启动早期（定时器 IRQ 使能前）会尝试一次有界 DHCP（G3），日志恰有一行大写结果标记：成功 `[DHCP] lease: a.b.c.d`，失败/无 NIC `[DHCP] no lease, static 10.0.2.15`；内部进度日志为小写 `[dhcp] ` |
+| `zig build smoke` | 单核 QEMU 限时冒烟测试，串口日志需出现 init 自动序列各 PASS 标记（`hello21 done`、`hello29: PASS` … `hello41: PASS`、`hello92: PASS`）、序列终点 `hello42: PASS` + `hello42 done`，以及 `MoQiOS shell`；`hello92` 验证 x86_64 self-only process_vm_readv/writev（syscall #283/#284）的最多 4096 字节内核 staging、partial-copy 与 `EFAULT` 边界；不覆盖跨进程 mm 生命周期/refcount/COW 设计，也不代表 riscv64/aarch64 骨架已有该覆盖。完整判定见 `tools/qemu_smoke.sh`。此外启动早期（定时器 IRQ 使能前）会尝试一次有界 DHCP（G3），日志恰有一行大写结果标记：成功 `[DHCP] lease: a.b.c.d`，失败/无 NIC `[DHCP] no lease, static 10.0.2.15`；内部进度日志为小写 `[dhcp] ` |
 | `zig build smoke-smp` | SMP QEMU 限时冒烟测试（默认 `MOQI_SMP=2`），验证 AP 启动路径仍能跑完整个 init 测试序列；`MOQI_SMP=N` 可指定任意正整数核数 |
 | `zig build smoke-smp-matrix` | 按 `MOQI_SMOKE_MATRIX_CPUS`（默认 `"1 2 3 4 6 8"`）依次运行各核数冒烟；16 核在 TCG 下需 `MOQI_SMOKE_TIMEOUT=600` |
 | `zig build smoke-smp-stress` | 连续执行 `MOQI_SMOKE_RUNS`（默认 5）次指定核数（`MOQI_SMP`，默认 2）冒烟；捕获任务槽复用、共享内核映射和调度时序回归 |
@@ -434,7 +434,7 @@ no `duration_ms`. This P1 mode does not provide QEMU runtime samples.
 | 类别 | 文件 | 说明 |
 |---|---|---|
 | 同步原语 | `sync/rwlock.zig` `sync/seqlock.zig` `sync/ticket_spinlock.zig` | 多种锁实现（尚无树内使用者，2026-08 已修复其缺陷） |
-| 内存 | `mm/process_vm.zig` | process_vm_readv/writev（116 行） |
+| 内存 | `mm/process_vm.zig` | x86_64 self-only process_vm_readv/writev（syscall #283/#284）；最多 4096 字节内核 staging，跨进程 mm 生命周期/refcount/COW 与非 x86 覆盖未实现 |
 | 其他 | `arch/x86_64/user_mode.zig` `arch/x86_64/vga.zig` | 疑似被现有实现取代的早期模块 |
 
 （`shared/sk5.zig` 与 `kernel/boot_info.zig` 经确认无引用，已于 2026-08 删除。另：
