@@ -17,6 +17,7 @@ const cow_pte = @import("cow_pte.zig");
 const filemap = @import("filemap.zig");
 const huge_impl = @import("huge_user_impl.zig");
 const policy = @import("mprotect_policy.zig");
+const mm_mod = @import("mm.zig");
 
 pub const PROT_NONE: u64 = 0;
 pub const PROT_READ: u64 = 1;
@@ -79,19 +80,22 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     if (len > user_space.USER_ADDR_MAX - addr) return EINVAL;
     // The TLB shootdown API takes a u32 page count; reject larger requests
     // before any preflight work rather than allowing a truncating cast.
-    if (len / paging.PAGE_SIZE > 0xFFFF_FFFF) return ENOMEM;
+    const len_pages = policy.pageCount(len);
+    if (len_pages > 0xFFFF_FFFF) return ENOMEM;
 
     // 4. Get current task
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task.getTask(cur_idx) orelse return -1;
+    if (cur.mm == null) return -1;
     if (cur.page_table_phys == 0) return EINVAL; // kernel thread — not allowed
+    var vm_guard = mm_mod.Mm.beginVmMutation(cur.mm, @ptrCast(cur)) catch return -35;
+    defer vm_guard.release();
 
     // H1: file-backed regions carry the prot metadata the demand-fault path
     // synthesises page permissions from. Partial overlaps split regions, so
     // count the extra slots BEFORE touching page tables — failing after the
     // PTE rewrite would leave metadata and page tables describing different
     // permissions.
-    const len_pages = (len + paging.PAGE_SIZE - 1) / paging.PAGE_SIZE;
     var slots_needed: u32 = 0;
     const free_slots: u32 = @intCast(cur.mmap_regions.len - @popCount(cur.mmap_active_bm));
     var bits = cur.mmap_active_bm;
@@ -149,13 +153,17 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
 
     // 6. Commit page-table and PTE changes. No operation below allocates or
     // returns an error after the reservations have succeeded.
-    _ = huge_impl.protectHugeOverlapsReserved(
+    const pt_used = huge_impl.protectHugeOverlapsReserved(
         cur.page_table_phys,
         addr,
         end,
         prot,
         reserved_pt[0..huge_demotions],
     );
+    // A huge block straddling the range may already have been demoted, so
+    // fewer reserved PT pages than `got_pt` can be consumed — free the rest
+    // like the data-page leftover below.
+    pmm.freePageBatch(reserved_pt[pt_used..got_pt]);
 
     var v = addr;
     var data_used: u32 = 0;
@@ -185,6 +193,13 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
                 if (cow_pte.isCow(pte_val)) {
                     const frame = pte_val & paging.ADDR_MASK;
                     if (pmm.getRefCount(frame) > 1) {
+                        // The vm_guard does not cover fault-path COW/fork, so
+                        // a concurrent fork may have bumped a sole-owned
+                        // frame's refcount 1→2 since preflight — exhausting
+                        // the reservation. Deferring leaves the COW bit set
+                        // and the PTE non-writable: the next write faults and
+                        // unshares via handleCowFault.
+                        if (policy.cowCommitAction(got_data, data_used) == .defer_to_fault) continue;
                         const new_phys = reserved_data[data_used];
                         data_used += 1;
                         const src: [*]const u8 = @ptrFromInt(hhdm.physToVirt(frame));
@@ -207,7 +222,10 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     // M8-6: one ranged TLB shootdown covers the whole rewrite — cheaper than
     // per-page invlpg on the local CPU and crucial for cross-CPU correctness
     // when the same address space is mapped on another core (CLONE_VM thread).
-    const num_pages: u32 = @intCast((end - addr) / paging.PAGE_SIZE);
+    // Must be the ceil page count: a floor count under-covers the last page
+    // of a non-page-aligned len (and zero pages skips the PCID generation
+    // bump entirely), leaving a stale translation with the old permissions.
+    const num_pages: u32 = @intCast(len_pages);
     tlb.shootdownRange(addr, num_pages, cur.page_table_phys);
 
     pmm.freePageBatch(reserved_data[data_used..got_data]);

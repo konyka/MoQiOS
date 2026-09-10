@@ -22,6 +22,24 @@ pub fn validate(addr: u64, length: u64) ?Range {
     return .{ .base = addr, .num_pages = (end - addr) / PAGE_SIZE };
 }
 
+/// True when unmapping [base, base+num_pages*PAGE) cuts region
+/// [r_base, r_base+r_pages*PAGE) in the middle, so untrackMmapRange must
+/// insert a tail piece into a free region-table slot. Edge-aligned cuts
+/// truncate or shift the region in place and need no slot.
+pub fn needsSplitSlot(r_base: u64, r_pages: u64, base: u64, num_pages: u64) bool {
+    const r_end = r_base + r_pages * PAGE_SIZE;
+    const end = base + num_pages * PAGE_SIZE;
+    return base > r_base and end < r_end;
+}
+
+/// munmap preflight: the untrack may proceed only when every mid-range split
+/// finds a free region-table slot for its tail piece — otherwise the tail
+/// would be silently dropped while its pages stay mapped (losing the RLIMIT
+/// refund and the file-backing fault info).
+pub fn canUntrack(split_slots_needed: u32, free_slots: u32) bool {
+    return split_slots_needed <= free_slots;
+}
+
 test "munmap policy requires alignment and rejects overflow" {
     const std = @import("std");
     try std.testing.expect(validate(0x4000, PAGE_SIZE).?.num_pages == 1);

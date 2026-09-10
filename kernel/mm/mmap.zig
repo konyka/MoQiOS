@@ -19,6 +19,7 @@ const huge_impl = @import("huge_user_impl.zig");
 const fixed_replacement = @import("map_fixed.zig");
 const vma_runtime_stats = @import("vma_runtime_stats.zig");
 const munmap_policy = @import("munmap_policy.zig");
+const mm_mod = @import("mm.zig");
 
 fn mmapRegionIndex(task: *task_mod.Task, region: *task_mod.MmapRegion) u6 {
     return @intCast((@intFromPtr(region) - @intFromPtr(&task.mmap_regions[0])) / @sizeOf(task_mod.MmapRegion));
@@ -763,6 +764,9 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
 
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
+    if (cur.mm == null) return -1;
+    var vm_guard = mm_mod.Mm.beginVmMutation(cur.mm, @ptrCast(cur)) catch return -35;
+    defer vm_guard.release();
 
     // ─── /dev/fb0: framebuffer mapping ───
     // A devfs fd is not a file mapping; the generic path below rejects it
@@ -995,11 +999,31 @@ pub fn munmap(addr: u64, length: u64) i64 {
 
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
+    if (cur.mm == null) return -1;
+    var vm_guard = mm_mod.Mm.beginVmMutation(cur.mm, @ptrCast(cur)) catch return -35;
+    defer vm_guard.release();
 
     // SysV SHM owns these frames until shmdt (or task exit).  Do not let the
     // generic unmap path detach only part of an attachment and later free a
     // frame still referenced by the segment.
     if (@import("../ipc/sysv_shm.zig").overlapsAttachment(cur.tid, base, num_pages)) return -22;
+
+    // Preflight the region-table capacity untrackMmapRange needs: a range
+    // cutting a region in the middle inserts a tail piece into a free slot,
+    // and with the table full the tail would be silently dropped — its pages
+    // stay mapped but lose their metadata, RLIMIT refund, and file backing.
+    // Fail before any mutation (unlike mmap/mprotect, munmap had no such
+    // preflight).
+    var split_slots: u32 = 0;
+    var untrack_bits = cur.mmap_active_bm;
+    while (untrack_bits != 0) {
+        const i: usize = @intCast(@ctz(untrack_bits));
+        untrack_bits &= untrack_bits - 1;
+        const r = &cur.mmap_regions[i];
+        if (munmap_policy.needsSplitSlot(r.base, r.num_pages, base, num_pages)) split_slots += 1;
+    }
+    const free_slots: u32 = @intCast(cur.mmap_regions.len - @popCount(cur.mmap_active_bm));
+    if (!munmap_policy.canUntrack(split_slots, free_slots)) return -12;
 
     // Unmap pages and free physical memory
     unmapRange(cur, base, num_pages);
@@ -1030,6 +1054,9 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
 
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
+    if (cur.mm == null) return -1;
+    var vm_guard = mm_mod.Mm.beginVmMutation(cur.mm, @ptrCast(cur)) catch return -35;
+    defer vm_guard.release();
 
     // Find the mapping region through the occupancy bitmap.
     var bits = cur.mmap_active_bm;
@@ -1043,9 +1070,26 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
                 // tracked region — a tail beyond old_size stays mapped.
                 // untrackMmapRange splits the region bookkeeping to match.
                 if (new_pages < old_pages) {
-                    unmapRange(cur, old_addr + new_pages * PAGE, old_pages - new_pages);
-                    untrackMmapRange(cur, old_addr + new_pages * PAGE, old_pages - new_pages);
-                    @import("../drivers/fbdev.zig").noteUnmap(cur, old_addr + new_pages * PAGE, old_pages - new_pages);
+                    const cut_base = old_addr + new_pages * PAGE;
+                    const cut_pages = old_pages - new_pages;
+                    // Same preflight as munmap: when the tracked region
+                    // outlives old_size the cut lands mid-range and the tail
+                    // piece needs a free region-table slot — with the table
+                    // full untrackMmapRange would silently drop it. Fail
+                    // before the first mutation (unmapRange).
+                    var split_slots: u32 = 0;
+                    var untrack_bits = cur.mmap_active_bm;
+                    while (untrack_bits != 0) {
+                        const r_i: usize = @intCast(@ctz(untrack_bits));
+                        untrack_bits &= untrack_bits - 1;
+                        const r2 = &cur.mmap_regions[r_i];
+                        if (munmap_policy.needsSplitSlot(r2.base, r2.num_pages, cut_base, cut_pages)) split_slots += 1;
+                    }
+                    const free_slots: u32 = @intCast(cur.mmap_regions.len - @popCount(cur.mmap_active_bm));
+                    if (!munmap_policy.canUntrack(split_slots, free_slots)) return -12;
+                    unmapRange(cur, cut_base, cut_pages);
+                    untrackMmapRange(cur, cut_base, cut_pages);
+                    @import("../drivers/fbdev.zig").noteUnmap(cur, cut_base, cut_pages);
                 }
                 return @bitCast(old_addr);
             }
