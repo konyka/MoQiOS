@@ -107,6 +107,13 @@ pub fn poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) i64 {
                             if (!state.read_open) pfds[i].revents |= POLLERR;
                         }
                     },
+                    .eventfd => {
+                        // Writable while a write of at least 1 would be
+                        // admitted without blocking (Linux: counter < 2^64-1).
+                        const eventfd_mod = @import("eventfd.zig");
+                        const eventfd_policy = @import("eventfd_policy.zig");
+                        if (eventfd_policy.writeAdmitted(eventfd_mod.eventfdGetCounter(desc.eventfd_idx), 1)) pfds[i].revents |= POLLOUT;
+                    },
                     else => {
                         pfds[i].revents |= POLLOUT; // pipes, files always writable
                     },

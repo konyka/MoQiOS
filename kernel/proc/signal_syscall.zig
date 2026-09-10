@@ -325,7 +325,7 @@ pub fn signalfd4(old_fd: u64, mask: u64, sizemask: u64, flags: u64) i64 {
 
     // Create a new eventfd-backed signalfd
     const eventfd_mod = @import("../fs/eventfd.zig");
-    const efd_idx = eventfd_mod.eventfdCreate(0);
+    const efd_idx = eventfd_mod.eventfdCreate(0, false);
     if (efd_idx < 0) return @as(i64, efd_idx);
     const eventfd_idx: u32 = @intCast(efd_idx);
     var installed = false;

@@ -1097,7 +1097,10 @@ pub const FdTable = struct {
             .tcp_socket => return -1, // TCP sockets use sendto/recvfrom syscalls
             .udp_socket => return -1, // UDP sockets use sendto/recvfrom syscalls
             .epoll => return -1,
-            .eventfd => return -1,
+            .eventfd => {
+                const eventfd_mod = @import("eventfd.zig");
+                return eventfd_mod.eventfdRead(desc.eventfd_idx, buf, count, desc.status_flags);
+            },
             .unix_socket => {
                 // read() on an AF_UNIX socket drains the socket's ring buffer.
                 const unix_mod = @import("../net/unix_socket.zig");
@@ -1244,7 +1247,10 @@ pub const FdTable = struct {
             .tcp_socket => return -1, // TCP sockets use sendto/recvfrom syscalls
             .udp_socket => return -1, // UDP sockets use sendto/recvfrom syscalls
             .epoll => return -1,
-            .eventfd => return -1,
+            .eventfd => {
+                const eventfd_mod = @import("eventfd.zig");
+                return eventfd_mod.eventfdWrite(desc.eventfd_idx, buf, count, desc.status_flags);
+            },
             .unix_socket => {
                 // write() on an AF_UNIX socket sends to the connected peer.
                 const unix_mod = @import("../net/unix_socket.zig");

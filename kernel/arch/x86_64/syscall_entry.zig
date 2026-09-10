@@ -841,15 +841,47 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             const wd: i32 = @bitCast(@as(u32, @truncate(frame.rsi)));
             frame.rax = @bitCast(inotify_mod.rmWatch(@truncate(frame.rdi), wd));
         },
-        169 => { // eventfd(initval, flags)
-            _ = frame.rsi;
-            frame.rax = @bitCast(@as(i64, eventfd_mod.eventfdCreate(frame.rdi)));
+        169 => { // eventfd2(initval, flags) — validates EFD_* flags, installs a real fd
+            frame.rax = @bitCast(eventfd_mod.eventfdCreateFd(frame.rdi, @truncate(frame.rsi)));
         },
-        170 => { // timerfd_create(clockid, flags)
-            frame.rax = @bitCast(@as(i64, timerfd_mod.timerfdCreate(@truncate(frame.rdi), @truncate(frame.rsi))));
+        170 => { // timerfd_create(clockid, flags) — validates TFD_* flags, installs a real (read-only) fd
+            const tfd_flags: u32 = @truncate(frame.rsi);
+            const tfd_idx = timerfd_mod.timerfdCreate(@truncate(frame.rdi), tfd_flags);
+            if (tfd_idx < 0) {
+                frame.rax = @bitCast(@as(i64, tfd_idx));
+            } else if (@import("../../proc/sched.zig").currentTaskIndex()) |cur_idx| {
+                const task_mod = @import("../../proc/task.zig");
+                if (task_mod.getTask(cur_idx)) |task| {
+                    if (task.fd_table.allocFd()) |tfd| {
+                        // Read-only like signalfd (vfs.write rejects .timerfd);
+                        // TFD_NONBLOCK lives on the instance (timerfdRead
+                        // checks inst.flags) and is mirrored to status_flags.
+                        task.fd_table.fds[tfd] = .{
+                            .fd_type = .timerfd,
+                            .timerfd_idx = @intCast(tfd_idx),
+                            .fd_flags = if ((tfd_flags & timerfd_mod.TFD_CLOEXEC) != 0) 1 else 0,
+                            .status_flags = tfd_flags & timerfd_mod.TFD_NONBLOCK,
+                        };
+                        task.fd_table.publishFd(tfd);
+                        frame.rax = @bitCast(@as(i64, tfd));
+                    } else {
+                        timerfd_mod.timerfdClose(@intCast(tfd_idx));
+                        frame.rax = @bitCast(@as(i64, -24));
+                    }
+                } else {
+                    timerfd_mod.timerfdClose(@intCast(tfd_idx));
+                    frame.rax = @bitCast(@as(i64, -24));
+                }
+            } else {
+                timerfd_mod.timerfdClose(@intCast(tfd_idx));
+                frame.rax = @bitCast(@as(i64, -24));
+            }
         },
         171 => { // timerfd_settime(fd, flags, new_value, old_value)
-            const tfd_idx: u32 = @truncate(frame.rdi);
+            const tfd_idx = resolveTimerfdIdx(@truncate(frame.rdi)) orelse {
+                frame.rax = @bitCast(@as(i64, -9)); // EBADF — not a timerfd fd
+                return;
+            };
             const flags: u32 = @truncate(frame.rsi);
             const new_val_ptr: u64 = frame.rdx;
             const old_val_ptr: u64 = frame.r10;
@@ -886,7 +918,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(@as(i64, result));
         },
         172 => { // timerfd_gettime(fd, curr_value)
-            const tfd_idx: u32 = @truncate(frame.rdi);
+            const tfd_idx = resolveTimerfdIdx(@truncate(frame.rdi)) orelse {
+                frame.rax = @bitCast(@as(i64, -9)); // EBADF — not a timerfd fd
+                return;
+            };
             const cur_ptr: u64 = frame.rsi;
             if (cur_ptr == 0 or cur_ptr >= 0x0000_8000_0000_0000) {
                 frame.rax = @bitCast(@as(i64, -14));
@@ -2523,6 +2558,20 @@ fn dispatchLinuxRlimitAlias(frame: *SyscallFrame, syscall_nr: u64) bool {
         .prlimit64 => syscallPrlimit64(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, frame.r10),
     });
     return true;
+}
+
+/// Resolve a timerfd fd to its pool index for timerfd_settime/gettime.
+/// Linux takes an fd; the old create returned the raw pool index, which is
+/// gone now that timerfd_create installs a real fd-table entry.
+fn resolveTimerfdIdx(fd: u32) ?u32 {
+    const sched = @import("../../proc/sched.zig");
+    const task_mod = @import("../../proc/task.zig");
+    const cur_idx = sched.currentTaskIndex() orelse return null;
+    const cur = task_mod.getTask(cur_idx) orelse return null;
+    if (fd >= cur.fd_table.fds.len) return null;
+    const desc = &cur.fd_table.fds[fd];
+    if (desc.fd_type != .timerfd) return null;
+    return desc.timerfd_idx;
 }
 
 /// Syscall #1: write(fd, buf, count)
