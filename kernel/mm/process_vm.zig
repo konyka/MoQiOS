@@ -81,7 +81,12 @@ pub fn processVmReadv(target_pid: u32, local_iov_ptr: u64, liovcnt: u64, remote_
     if (flags != 0) return EINVAL; // EINVAL: no flags are supported.
     const caller = sched_mod.currentTask() orelse return ESRCH;
     if (!supportsTarget(caller, target_pid)) return EPERM;
-    const target_page_table = caller.page_table_phys;
+    const caller_mm = caller.mm;
+    if (caller_mm) |mm| {
+        if (!mm.retain()) return ESRCH;
+        defer mm.release();
+    }
+    const target_page_table = if (caller_mm) |mm| mm.page_table_phys else caller.page_table_phys;
     if (target_page_table == 0) return ESRCH;
     if (liovcnt == 0 or riovcnt == 0) return 0;
     if (!process_vm_policy.validIovArray(local_iov_ptr, liovcnt) or !process_vm_policy.validIovArray(remote_iov_ptr, riovcnt))
@@ -134,7 +139,12 @@ pub fn processVmWritev(target_pid: u32, local_iov_ptr: u64, liovcnt: u64, remote
     if (flags != 0) return EINVAL; // EINVAL: no flags are supported.
     const caller = sched_mod.currentTask() orelse return ESRCH;
     if (!supportsTarget(caller, target_pid)) return EPERM;
-    const target_page_table = caller.page_table_phys;
+    const caller_mm = caller.mm;
+    if (caller_mm) |mm| {
+        if (!mm.retain()) return ESRCH;
+        defer mm.release();
+    }
+    const target_page_table = if (caller_mm) |mm| mm.page_table_phys else caller.page_table_phys;
     if (target_page_table == 0) return ESRCH;
     if (liovcnt == 0 or riovcnt == 0) return 0;
     if (!process_vm_policy.validIovArray(local_iov_ptr, liovcnt) or !process_vm_policy.validIovArray(remote_iov_ptr, riovcnt))

@@ -2,10 +2,22 @@ const serial = @import("../arch/arch.zig").serial;
 const syscall_entry = @import("../arch/arch.zig").syscall;
 const getPerCpu = syscall_entry.getPerCpu;
 const idt = @import("../arch/arch.zig").interrupts;
+const lifecycle_policy = @import("../mm/lifecycle_policy.zig");
+
+/// Stage 1 rejects exec from a CLONE_THREAD task because siblings still use
+/// the current address space. The syscall wrapper reports this as EPERM.
+pub fn threadedExecDenied() bool {
+    const sched = @import("sched.zig");
+    const task_mod = @import("task.zig");
+    const cur_idx = sched.currentTaskIndex() orelse return false;
+    const cur = task_mod.getTask(cur_idx) orelse return false;
+    return lifecycle_policy.execResult(cur.is_thread) != 0;
+}
 
 /// Prepare execve: load program, destroy old address space, set up new context.
 /// Returns the frame address for iretq tail, or null if loading fails (before destroying old AS).
 pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
+    if (threadedExecDenied()) return null;
     if (name_ptr == 0 or name_ptr >= 0x0000_8000_0000_0000) return null;
 
     // The old image cannot be destroyed while SHM attachment records still
@@ -91,6 +103,7 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
     const user_space = @import("../mm/user_space.zig");
     const cur_idx = sched.currentTaskIndex() orelse return null;
     const cur = task_mod.getTask(cur_idx) orelse return null;
+    const new_mm = user_space.createMmForRoot(result.pml4) orelse return null;
 
     // v53.44: Close FD_CLOEXEC file descriptors before destroying old address space.
     // POSIX requires exec to auto-close FDs with O_CLOEXEC/FD_CLOEXEC flag.
@@ -108,7 +121,9 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
 
     const lock_flags = task_mod.lockTask();
     const old_pml4 = cur.page_table_phys;
+    const old_mm = cur.mm;
     cur.page_table_phys = result.pml4;
+    cur.mm = new_mm;
     task_mod.unlockTask(lock_flags);
     cur.user_entry = result.entry;
     cur.user_stack_top = result.stack_top;
@@ -145,7 +160,7 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
     // refs (ext2 open slots) and clear the stale region table before the old
     // address space is destroyed.
     @import("../mm/mmap.zig").releaseFileRefs(cur);
-    if (old_pml4 != 0) user_space.destroyUserSpace(old_pml4);
+    if (old_mm) |mm| mm.release() else if (old_pml4 != 0) user_space.destroyUserSpace(old_pml4);
     @import("../arch/arch.zig").gdt.setRsp0(getPerCpu().cpu_id, cur.kernel_stack_top);
     // ioperm: pair every per-switch RSP0 update with the IOPB load.
     @import("ioperm.zig").loadForTask(getPerCpu().cpu_id, cur);
@@ -180,6 +195,7 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
 /// Used by execveat with non-AT_FDCWD dirfd where the combined path is
 /// already resolved in kernel memory.
 pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64) ?u64 {
+    if (threadedExecDenied()) return null;
     const copy = @import("../mm/copy_from_user.zig");
 
     // Keep execveat consistent with execve: attachment cleanup must happen
@@ -254,6 +270,7 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64)
     const user_space = @import("../mm/user_space.zig");
     const cur_idx = sched.currentTaskIndex() orelse return null;
     const cur = task_mod.getTask(cur_idx) orelse return null;
+    const new_mm = user_space.createMmForRoot(result.pml4) orelse return null;
 
     // v53.44: Close FD_CLOEXEC file descriptors before destroying old address space.
     {
@@ -270,7 +287,9 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64)
 
     const lock_flags = task_mod.lockTask();
     const old_pml4 = cur.page_table_phys;
+    const old_mm = cur.mm;
     cur.page_table_phys = result.pml4;
+    cur.mm = new_mm;
     task_mod.unlockTask(lock_flags);
     cur.user_entry = result.entry;
     cur.user_stack_top = result.stack_top;
@@ -304,7 +323,7 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64)
     // refs (ext2 open slots) and clear the stale region table before the old
     // address space is destroyed.
     @import("../mm/mmap.zig").releaseFileRefs(cur);
-    if (old_pml4 != 0) user_space.destroyUserSpace(old_pml4);
+    if (old_mm) |mm| mm.release() else if (old_pml4 != 0) user_space.destroyUserSpace(old_pml4);
     @import("../arch/arch.zig").gdt.setRsp0(getPerCpu().cpu_id, cur.kernel_stack_top);
     // ioperm: pair every per-switch RSP0 update with the IOPB load.
     @import("ioperm.zig").loadForTask(getPerCpu().cpu_id, cur);

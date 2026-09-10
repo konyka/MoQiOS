@@ -232,6 +232,7 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
         ehdr.e_entry,
         user_rsp,
         user_pml4,
+        null,
         parent_tid,
         true,
         @import("capability_profile.zig").profileForLaunch(name, initial_init_caller, initial_init_launch),
@@ -239,7 +240,6 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
         fsize_max,
     ) orelse {
         serial.writeString("[loader] Failed to create task\n");
-        user_space.destroyUserSpace(user_pml4);
         return null;
     };
 
@@ -338,6 +338,7 @@ fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32, 
         user_space.USER_CODE_BASE,
         user_rsp,
         user_pml4,
+        null,
         parent_tid,
         false,
         @import("capability_profile.zig").profileForLaunch(name, initial_init_caller, initial_init_launch),
@@ -345,7 +346,6 @@ fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32, 
         fsize_max,
     ) orelse {
         serial.writeString("[loader] Failed to create task\n");
-        user_space.destroyUserSpace(user_pml4);
         freePages(&code_pages, allocated);
         return null;
     };

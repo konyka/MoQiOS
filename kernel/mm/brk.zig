@@ -8,6 +8,7 @@ const pmm_mod = @import("../mm/pmm.zig");
 const hhdm_mod = @import("../mm/hhdm.zig");
 const mmap_mod = @import("mmap.zig");
 const paging_mod = @import("../arch/arch.zig").paging;
+const mm_mod = @import("mm.zig");
 
 const PAGE = user_space.PAGE_SIZE;
 
@@ -29,6 +30,9 @@ fn releasePages(task: *task_mod.Task, from_page: u64, to_page: u64) void {
 pub fn brk(addr: u64) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return 0;
     const cur = task_mod.getTask(cur_idx) orelse return 0;
+    if (cur.mm == null) return @bitCast(cur.brk_current);
+    var vm_guard = mm_mod.Mm.beginVmMutation(cur.mm, @ptrCast(cur)) catch return @bitCast(cur.brk_current);
+    defer vm_guard.release();
 
     if (addr == 0) return @bitCast(cur.brk_current);
 

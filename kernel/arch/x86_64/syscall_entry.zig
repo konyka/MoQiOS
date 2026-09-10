@@ -2823,6 +2823,12 @@ fn execveatWithDirfd(frame: *SyscallFrame, dirfd: i32) void {
     const sched_m = @import("../../proc/sched.zig");
     const task_m = @import("../../proc/task.zig");
     const vfs_m = @import("../../fs/vfs.zig");
+    const execve_m = @import("../../proc/execve.zig");
+
+    if (execve_m.threadedExecDenied()) {
+        frame.rax = @bitCast(errno.EPERM);
+        return;
+    }
 
     const cur_idx = sched_m.currentTaskIndex() orelse {
         frame.rax = @bitCast(@as(i64, -9));

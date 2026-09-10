@@ -21,6 +21,7 @@ const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const sched_policy = @import("sched_policy.zig");
 const creation_metadata = @import("creation_metadata.zig");
 const builtin = @import("builtin");
+const Mm = @import("../mm/mm.zig").Mm;
 
 const PAGE_SIZE: u64 = 4096;
 const KERNEL_STACK_PAGES: u64 = 32;
@@ -90,6 +91,11 @@ pub const Task = struct {
     // --- User-space fields (M5) ---
     /// Physical address of the process's PML4 page table (0 for kernel threads).
     page_table_phys: u64,
+    /// Independently owned address-space lifetime handle. Mirrors the root
+    /// above until all page-table callers are converted to Mm APIs.
+    mm: ?*Mm = null,
+    /// Pins this task slot while an operation may still access its Mm.
+    operation_refs: u32 = 0,
     /// Personality: native, linux, or windows ABI.
     personality: @import("../arch/arch.zig").syscall.Personality,
     /// Whether this task runs in user mode.
@@ -310,6 +316,76 @@ pub const Task = struct {
     /// Internal trust marker: only the boot-created init may delegate profiles.
     initial_init: bool = false,
 };
+
+pub const MAX_OPERATION_REFS: u32 = 1024;
+
+pub const TaskMmPinError = error{
+    TaskNotFound,
+    Zombie,
+    NoMm,
+    OperationRefOverflow,
+};
+
+/// Owns a task operation pin and its retained Mm. The task pointer is safe to
+/// use only while this handle is held; the operation ref prevents reaping and
+/// slot reuse. Release is deliberately Mm first, then task ref.
+pub const TaskMmPin = struct {
+    task: *Task,
+    mm: *Mm,
+    page_table_phys: u64,
+    released: bool = false,
+
+    pub fn release(self: *TaskMmPin) void {
+        if (self.released) return;
+        self.released = true;
+
+        // Lock order is task_lock -> Mm retain. Never acquire task_lock while
+        // holding Mm vm_lock. Mm release does not take vm_lock, so it belongs
+        // before the task ref drop as part of the inverse lifetime protocol.
+        self.mm.release();
+        const flags = task_lock.acquire();
+        if (@atomicLoad(u32, &self.task.operation_refs, .acquire) != 0) {
+            _ = @atomicRmw(u32, &self.task.operation_refs, .Sub, 1, .acq_rel);
+        }
+        task_lock.release(flags);
+    }
+};
+
+/// Retain a task's Mm and pin its task slot for the duration of an operation.
+/// The task lock protects both the TID lookup and the lifetime transition; Mm
+/// retention happens under that lock so reaping cannot clear the task's Mm
+/// between lookup and retain.
+pub fn pinTaskMmByTid(tid: u32) TaskMmPinError!TaskMmPin {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+
+    var saw_zombie = false;
+    var bits = slot_bitmap;
+    while (bits != 0) {
+        const i: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const t = &tasks[i];
+        if (t.tid != tid) continue;
+        if (sched_claim.load(&t.state) == .zombie) {
+            saw_zombie = true;
+            continue;
+        }
+        if (t.operation_refs >= MAX_OPERATION_REFS) return error.OperationRefOverflow;
+        const mm = t.mm orelse return error.NoMm;
+        if (!mm.retain()) return error.NoMm;
+        _ = @atomicRmw(u32, &t.operation_refs, .Add, 1, .acq_rel);
+        return .{
+            .task = t,
+            .mm = mm,
+            .page_table_phys = t.page_table_phys,
+        };
+    }
+    return if (saw_zombie) error.Zombie else error.TaskNotFound;
+}
+
+comptime {
+    _ = pinTaskMmByTid;
+}
 
 /// Tracked mmap region for munmap support.
 pub const MmapRegion = struct {
@@ -969,6 +1045,8 @@ pub fn reapZombies() u32 {
         bits &= bits - 1;
         const t = &tasks[i];
         if (t.state != .zombie) continue;
+        // An operation pin owns this slot until its Mm access is complete.
+        if (t.operation_refs != 0) continue;
         // Still current on some CPU (owner hasn't switched away yet) —
         // defer to the next reap interval instead of yanking a live kstack.
         if (isCurrentOnAnyCpu(i)) continue;
@@ -1005,7 +1083,8 @@ pub fn reapZombies() u32 {
             // G2: release file-region backing refs before the address space
             // (destroyUserSpace walks page tables, not region metadata).
             @import("../mm/mmap.zig").releaseFileRefs(t);
-            @import("../mm/user_space.zig").destroyUserSpace(t.page_table_phys);
+            if (t.mm) |mm| mm.release() else @import("../mm/user_space.zig").destroyUserSpace(t.page_table_phys);
+            t.mm = null;
         }
         freeKernelStack(t.kernel_stack);
         slot_bitmap &= ~(@as(u64, 1) << @intCast(i));
@@ -1076,19 +1155,29 @@ pub fn createUserProcess(
     user_entry: u64,
     user_stack_top: u64,
     page_table_phys: u64,
+    mm_handle: ?*Mm,
     parent_tid_val: u32,
     elf: bool,
     profile: @import("capability_profile.zig").LaunchProfile,
     fsize_cur: u64,
     fsize_max: u64,
 ) ?u32 {
+    // Ownership contract: when mm_handle is non-null, the caller transfers
+    // one retained Mm reference to this function. Every failure path below
+    // releases that transferred reference; on success, the child task stores
+    // it as its Mm owner and owns the reference thereafter.
+    const owned_mm = mm_handle orelse @import("../mm/user_space.zig").createMmForRoot(page_table_phys) orelse return null;
+    if (owned_mm.page_table_phys != page_table_phys) {
+        owned_mm.release();
+        return null;
+    }
     const slot = blk: {
         const flags = task_lock.acquire();
         defer task_lock.release(flags);
 
         const slot = reserveSlotLocked() orelse {
             serial.writeString("[task] no free task slots\n");
-            return null;
+            break :blk null;
         };
         // The stack alloc below runs WITHOUT the lock; while the bit is set
         // but the fields are still stale, a locked bitmap reader (picker /
@@ -1097,6 +1186,9 @@ pub fn createUserProcess(
         // Mark the slot .blocked for the whole creation window.
         sched_claim.store(&tasks[slot].state, .blocked);
         break :blk slot;
+    } orelse {
+        owned_mm.release();
+        return null;
     };
 
     const stack_virt = allocKernelStackForSlot(slot) orelse {
@@ -1104,6 +1196,7 @@ pub fn createUserProcess(
         const flags = task_lock.acquire();
         slot_bitmap &= ~(@as(u64, 1) << @intCast(slot));
         task_lock.release(flags);
+        owned_mm.release();
         return null;
     };
     const stack_top = stack_virt + KERNEL_STACK_PAGES * PAGE_SIZE;
@@ -1119,6 +1212,7 @@ pub fn createUserProcess(
         const fd_table = @import("../fs/vfs.zig").allocFdTable() orelse {
             serial.writeString("[task] OOM allocating fd table\n");
             slot_bitmap &= ~(@as(u64, 1) << @intCast(slot));
+            owned_mm.release();
             return null;
         };
         tasks[slot].umask_val = creation_metadata.initialTaskUmask();
@@ -1140,6 +1234,7 @@ pub fn createUserProcess(
         tasks[slot].kernel_stack_top = stack_top;
         tasks[slot].entry = null;
         tasks[slot].page_table_phys = page_table_phys;
+        tasks[slot].mm = owned_mm;
         tasks[slot].personality = .native;
         tasks[slot].is_user = true;
         tasks[slot].uid = profile.uid;
@@ -1310,6 +1405,11 @@ pub fn waitpidScanLocked(parent_idx: u32, pid: i32, status: *i32) WaitScan {
         if (t.is_thread) continue; // 线程由 pthread_join 汇合，不经 waitpid
         if (t.state != .zombie) continue;
         if (pid > 0 and t.tid != @as(u32, @intCast(pid))) continue;
+        // Keep scanning: another child may be reapable while this one is pinned.
+        if (t.operation_refs != 0) {
+            busy_child = true;
+            continue;
+        }
 
         if (isCurrentOnAnyCpu(i)) {
             busy_child = true;
@@ -1350,7 +1450,8 @@ pub fn waitpidScanLocked(parent_idx: u32, pid: i32, status: *i32) WaitScan {
             @import("ioperm.zig").freeBitmap(t);
             // G2: release file-region backing refs before the address space.
             @import("../mm/mmap.zig").releaseFileRefs(t);
-            @import("../mm/user_space.zig").destroyUserSpace(t.page_table_phys);
+            if (t.mm) |mm| mm.release() else @import("../mm/user_space.zig").destroyUserSpace(t.page_table_phys);
+            t.mm = null;
         }
         freeKernelStack(t.kernel_stack);
         slot_bitmap &= ~(@as(u64, 1) << @intCast(i));

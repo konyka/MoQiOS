@@ -14,6 +14,7 @@ const paging_mod = @import("paging.zig");
 const getPerCpu = @import("syscall_entry.zig").getPerCpu;
 const fmt = @import("../../lib/fmt.zig");
 const cow_pte_mod = @import("../../mm/cow_pte.zig");
+const lifecycle_policy = @import("../../mm/lifecycle_policy.zig");
 
 // ── CLONE flags ──────────────────────────────────────────────────────
 const CLONE_VM: u64 = 0x100;
@@ -245,32 +246,38 @@ pub fn clone(
 
     // CLONE_VM: share address space (thread) vs COW copy (process)
     const shares_vm = flags & CLONE_VM != 0;
+    const vm_policy = lifecycle_policy.cloneVmResult(flags, parent.mm != null);
+    if (vm_policy != 0) return vm_policy;
     const child_pml4 = if (shares_vm)
         parent.page_table_phys
     else
         cloneUserPages(parent.page_table_phys) orelse return -12; // ENOMEM
 
     if (shares_vm) {
-        @import("../../mm/user_space.zig").retainUserSpace(child_pml4);
+        if (parent.mm) |parent_mm| {
+            if (!parent_mm.retain()) return -12;
+        }
     } else {
         // I1: the COW clone demoted every huge block in the parent (the
         // walk is 4K-only) — no huge pages remain, clear the counts.
         for (&parent.mmap_regions) |*r| r.huge_pages = 0;
     }
 
+    // parent_mm.retain() above supplies the one retained reference transferred
+    // to createUserProcess for CLONE_VM. That function releases it on failure
+    // or installs it as the child owner on success, so clone must not release
+    // the reference after this call (including when the call returns null).
     const child_idx = task_mod.createUserProcess(
         parent.user_entry,
         if (new_stack != 0) new_stack else parent.user_stack_top,
         child_pml4,
+        if (shares_vm) parent.mm else null,
         threadGroupParentTid(parent, flags),
         false, // inherit general affinity
         @import("../../proc/capability_profile.zig").default_user_profile,
         parent.fSize_cur,
         parent.fSize_max,
-    ) orelse {
-        @import("../../mm/user_space.zig").destroyUserSpace(child_pml4);
-        return -12;
-    };
+    ) orelse return -12;
     const child = task_mod.getTask(child_idx).?;
     child.nofile_cur = parent.nofile_cur;
     child.nofile_max = parent.nofile_max;

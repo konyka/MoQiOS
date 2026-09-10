@@ -30,13 +30,14 @@ pub fn fork(frame: *SyscallFrame) i64 {
         parent.user_entry,
         parent.user_stack_top,
         child_pml4,
+        null,
         parent.tid,
         true,
         @import("capability_profile.zig").default_user_profile,
         parent.fSize_cur,
         parent.fSize_max,
     ) orelse {
-        @import("../mm/user_space.zig").destroyUserSpace(child_pml4);
+        // createUserProcess consumes and releases the child Mm/root on failure.
         return -1;
     };
     const child = task_mod.getTask(child_idx).?;

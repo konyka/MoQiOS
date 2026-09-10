@@ -10,6 +10,7 @@ const paging = @import("../arch/arch.zig").paging;
 const pcid = @import("../arch/arch.zig").pcid;
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
+const Mm = @import("mm.zig").Mm;
 
 pub const PAGE_SIZE: u64 = 4096;
 
@@ -46,6 +47,27 @@ pub const USER_HEAP_MAX: u64 = 0x0000_0001_0000_0000; // 4GB
 /// and above USER_STACK_TOP so it stays clear of the stack's demand-grow range.
 pub const USER_MMAP_BASE: u64 = 0x0000_0002_0000_0000; // 8GB
 pub const USER_MMAP_MAX: u64 = 0x0000_0004_0000_0000; // 16GB
+
+fn destroyMm(mm: *Mm) void {
+    destroyUserSpace(mm.page_table_phys);
+}
+
+/// Create a reference-counted address-space handle owning one PML4 root ref.
+pub fn createMm() ?*Mm {
+    const root = createUserSpace() orelse return null;
+    return Mm.acquire(root, destroyMm) orelse {
+        destroyUserSpace(root);
+        return null;
+    };
+}
+
+/// Adopt one already-created PML4 reference (loaders and fork use this).
+pub fn createMmForRoot(root: u64) ?*Mm {
+    return Mm.acquire(root, destroyMm) orelse {
+        destroyUserSpace(root);
+        return null;
+    };
+}
 
 /// Create a new user address space (PML4).
 /// Copies kernel-space entries (256-511) from the kernel PML4.
@@ -100,6 +122,11 @@ fn mapUserPageInner(pml4_phys: u64, virt: u64, phys: u64, writable: bool, flush:
 /// Retain a shared user address space for CLONE_VM.
 pub fn retainUserSpace(pml4_phys: u64) void {
     pmm.addRef(pml4_phys);
+}
+
+/// Retain an address space through its independently owned Mm handle.
+pub fn retainMm(mm: *Mm) bool {
+    return mm.retain();
 }
 
 /// Release a user address space. Shared CLONE_VM roots are destroyed only when

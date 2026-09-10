@@ -123,9 +123,17 @@
   当前策略只接受精确覆盖、完整跟踪的匿名私有 RW 4K PMM-owned 区域，长度最多 128 页。
   资源检查或形状不支持时返回 `ENOMEM` 且不改变原映射，成功替换后的页面为零填充。
   该策略不是全局并发安全保证。
-  `process_vm_readv/writev` 真正跨进程访问所需的引用计数 mm 生命周期、COW 与并发语义
-  （review §5.5/§5.6）；当前仅完成 x86_64 self-only 安全切片，按最多 4096 字节内核
-  staging 通过 `copyFromUser`/`copyToUser` 传输，并保留 partial-copy/`EFAULT` 边界。
+  当前 Mm/task-pin/partial-vm-lock 阶段新增独立引用计数的 `Mm`、具体 task 操作
+  pin、由 guard 持有的 Mm retain，并为当前任务的 mmap/munmap/mremap/mprotect/brk
+  入口接入 VM 锁；同时沿现有 API 能提供的精确生命周期边界，接通 task 创建、共享
+  VM clone、exec 和 reap/exit 的 Mm 所有权。该阶段仍只是生命周期与锁基础设施，
+  `process_vm_readv/writev` 继续保持 x86_64 self-only，不提供目标 task 查找、跨进程
+  访问或 CR3 切换。page fault/COW、swap、fork/clone、直接 driver/SHM unmap、
+  exec/reap teardown，以及权威 page provenance 尚未纳入；这些路径仍可能绕过
+  `Mm.vmLock` 或缺少统一生命周期协议。未完成这些路径前，不得启用真正的跨进程
+  HHDM read，只有在它们共享同一锁与生命周期协议后才可继续评审。当前 syscall
+  仍保持最多 4096 字节的内核 staging，以及 partial-copy/`EFAULT` 边界。
+  本阶段验收门禁：host tests、ReleaseSafe、x86 smoke/SMP，以及并发性评审。
   riscv64/aarch64 仍是移植骨架，未纳入该 syscall 覆盖。
 - riscv64/aarch64 跑通用户进程 + `main.zig` 初始化收敛到共享 arch 抽象
   （cross-arch-port-plan）。
