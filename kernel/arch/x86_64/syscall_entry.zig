@@ -4569,12 +4569,12 @@ fn syscallMount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64, flags: u64) i
     var fst_buf: [16]u8 = .{0} ** 16;
 
     if (source_ptr != 0 and source_ptr < 0x0000_8000_0000_0000) {
-        _ = copy.copyFromUser(src_buf[0..], @ptrFromInt(source_ptr), 63);
+        if (copy.copyFromUser(src_buf[0..], @ptrFromInt(source_ptr), 63) == 0) return -14;
     }
     if (target_ptr == 0 or target_ptr >= 0x0000_8000_0000_0000) return -14;
-    _ = copy.copyFromUser(tgt_buf[0..], @ptrFromInt(target_ptr), 127);
+    if (copy.copyFromUser(tgt_buf[0..], @ptrFromInt(target_ptr), 127) == 0) return -14;
     if (fstype_ptr != 0 and fstype_ptr < 0x0000_8000_0000_0000) {
-        _ = copy.copyFromUser(fst_buf[0..], @ptrFromInt(fstype_ptr), 15);
+        if (copy.copyFromUser(fst_buf[0..], @ptrFromInt(fstype_ptr), 15) == 0) return -14;
     }
 
     // Find string lengths
@@ -4590,7 +4590,7 @@ fn syscallUmount2(target_ptr: u64, flags: u32) i64 {
     if (target_ptr == 0 or target_ptr >= 0x0000_8000_0000_0000) return -14;
     const copy = @import("../../mm/copy_from_user.zig");
     var tgt_buf: [128]u8 = .{0} ** 128;
-    _ = copy.copyFromUser(tgt_buf[0..], @ptrFromInt(target_ptr), 127);
+    if (copy.copyFromUser(tgt_buf[0..], @ptrFromInt(target_ptr), 127) == 0) return -14;
     const tgt_len = strLen(tgt_buf[0..]);
 
     return vfs_mod.umountFs(tgt_buf[0..tgt_len], flags);
@@ -4722,7 +4722,7 @@ fn syscallVmsplice(fd: u32, iov_ptr: u64, nr_segs: u32, flags: u32) i64 {
     while (idx < nr_segs) : (idx += 1) {
         var iov_buf: [16]u8 = undefined;
         const off = @as(u64, idx) * 16;
-        _ = copy.copyFromUser(iov_buf[0..], @ptrFromInt(iov_ptr + off), 16);
+        if (copy.copyFromUser(iov_buf[0..], @ptrFromInt(iov_ptr + off), 16) < 16) return if (total > 0) total else -14;
         const base: u64 = bo.readU64At(&iov_buf, 0);
         const len: u64 = bo.readU64At(&iov_buf, 8);
 
@@ -5669,7 +5669,7 @@ fn syscallSetitimer(which: u32, new_value_ptr: u64, old_value_ptr: u64) i64 {
 
     // Read new value
     var buf: [32]u8 = undefined;
-    _ = copy.copyFromUser(&buf, @ptrFromInt(new_value_ptr), 32);
+    if (copy.copyFromUser(&buf, @ptrFromInt(new_value_ptr), 32) < 32) return -14;
 
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = tm.getTask(cur_idx) orelse return -1;

@@ -214,6 +214,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello92");  /* self-only process_vm readv/writev safety and boundaries */
     run_test("hello93");  /* eventfd2 drain/semaphore, EAGAIN/EINVAL, fork, blocking wake */
     run_test("hello94");  /* timerfd real fd, settime/gettime, EAGAIN, expiry read */
+    run_test("hello95");  /* mount/umount2/vmsplice/setitimer user-copy EFAULT */
 
     start_persistent_services();
 
