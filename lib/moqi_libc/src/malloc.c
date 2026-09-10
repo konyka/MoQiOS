@@ -80,6 +80,10 @@ static void split(struct block *b, size_t size) {
 }
 
 void *malloc(size_t size) {
+    /* Reject sizes whose align_up/header additions would wrap, handing the
+     * caller a tiny block it believes is huge. The bound also keeps
+     * grow()'s payload + sizeof(struct block) from overflowing. */
+    if (size > (size_t)-1 - (ALIGN - 1) - sizeof(struct block)) return (void *)0;
     size_t want = align_up(size == 0 ? 1 : size);
 
     heap_acquire();

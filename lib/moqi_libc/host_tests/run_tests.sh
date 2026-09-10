@@ -16,7 +16,7 @@ CC="zig cc"
 CFLAGS="-O1 -g -Wall -Wextra -Werror -fno-builtin"
 
 fail=0
-for t in test_string test_format test_malloc test_args; do
+for t in test_string test_format test_malloc test_args test_pthread_dead_reap test_pthread_join_claim; do
     echo "== $t =="
     $CC $CFLAGS -o "$OUT/$t" "$t.c"
     "$OUT/$t" || fail=1

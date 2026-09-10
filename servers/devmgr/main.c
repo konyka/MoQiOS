@@ -17,19 +17,12 @@
 #include <unistd.h>
 #include <moqi_syscalls.h>
 
+#include "snapshot_parse.h"
+
 #define DEV_PATH       "/dev"
 #define WATCH_PATH     "/dev/devfs-watch"
 #define SYS_getdents64 78
 #define POLL_NS    (1000L * 1000L * 1000L) /* 1s */
-
-/* linux_dirent64, matching kernel/fs/getdents.zig. */
-typedef struct {
-    unsigned long long ino;
-    long long          off;
-    unsigned short     reclen;
-    unsigned char      type;
-    char               name[];
-} dirent64_t;
 
 /* Snapshot the node names into one space-separated line. */
 static int snapshot(char *out, int cap) {
@@ -42,18 +35,7 @@ static int snapshot(char *out, int cap) {
         int r = (int)syscall3(SYS_getdents64, (long)fd, (long)buf, (long)sizeof(buf));
         if (r < 0) { close(fd); return -1; }
         if (r == 0) break;
-        int pos = 0;
-        while (pos < r) {
-            dirent64_t *d = (dirent64_t *)(buf + pos);
-            int len = (int)strlen(d->name);
-            if (n + len + 2 < cap) {
-                if (n) out[n++] = ' ';
-                memcpy(out + n, d->name, len);
-                n += len;
-                out[n] = '\0';
-            }
-            pos += d->reclen;
-        }
+        n = devmgr_snapshot_parse(buf, r, out, n, cap);
     }
     close(fd);
     return n;

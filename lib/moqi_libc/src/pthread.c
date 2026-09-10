@@ -12,6 +12,7 @@
 #include "../include/string.h"
 #include "../include/unistd.h"
 #include "../include/moqi_syscalls.h"
+#include "dead_reap.h"
 
 #define SYS_clone_v     243 /* clone(flags, stack, parent_tid, child_tid, tls) */
 #define SYS_futex_v     143 /* futex(uaddr, op, val, val2, uaddr2, val3) */
@@ -101,6 +102,8 @@ typedef struct TCB {
     void *specific[PTHREAD_KEYS_MAX];
     void *alloc_base;               /* join 时 free */
     volatile int detached;          /* pthread_detach 置位；join 返回 EINVAL */
+    volatile int dead_claimed;      /* 死栈链压入所有权认领（见 dead_reap.h） */
+    volatile int join_claimed;      /* join 块所有权认领（见 dead_reap.h） */
     struct TCB *dead_next;          /* 死栈链链接（仅退出后使用） */
 } TCB;
 
@@ -148,6 +151,8 @@ void __pthread_init_main(void) {
     t->retval = 0;
     t->alloc_base = 0;              /* 主线程 TCB 永不回收 */
     t->detached = 0;
+    t->dead_claimed = 0;
+    t->join_claimed = 0;
     t->dead_next = 0;
     for (int i = 0; i < PTHREAD_KEYS_MAX; i++) t->specific[i] = 0;
     syscall2(SYS_arch_prctl, ARCH_SET_FS, (long)t);
@@ -201,6 +206,8 @@ int pthread_create(pthread_t *thread, const void *attr,
     t->arg = arg;
     t->alloc_base = base;
     t->detached = 0;
+    t->dead_claimed = 0;
+    t->join_claimed = 0;
     t->dead_next = 0;
     for (int i = 0; i < PTHREAD_KEYS_MAX; i++) t->specific[i] = 0;
 
@@ -228,7 +235,7 @@ void pthread_exit(void *retval) {
     me->retval = retval;
     __atomic_store_n(&me->state, 1, __ATOMIC_SEQ_CST);
     futex_call((volatile int *)&me->state, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0);
-    if (me->detached) {
+    if (dead_reap_on_exit(&me->detached, &me->join_claimed, &me->dead_claimed)) {
         /* 压入死栈链后不再触碰本栈：直接以寄存器内联 exit syscall，
            连 _exit 的调用帧都不建。栈块由下一次 pthread_create 回收。 */
         dead_push(me);
@@ -244,22 +251,23 @@ void pthread_exit(void *retval) {
 int pthread_detach(pthread_t thread) {
     TCB *t = (TCB *)thread;
     if (__sync_lock_test_and_set(&t->detached, 1) != 0) return -22; /* EINVAL */
-    /* 已退出的线程不会再被 join：直接送入死栈链。 */
-    if (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == 1) dead_push(t);
+    /* join 已认领：块所有权归 join，退让且不压链（见 dead_reap.h）。 */
+    if (join_claim_held(&t->join_claimed)) return -22; /* EINVAL */
+    /* 已退出的线程不会再被 join：认领所有权后直接送入死栈链。 */
+    if (dead_reap_on_detach(&t->state, &t->dead_claimed)) dead_push(t);
     return 0;
 }
 
 int pthread_join(pthread_t thread, void **retval) {
     TCB *t = (TCB *)thread;
-    if (__atomic_load_n(&t->detached, __ATOMIC_ACQUIRE) != 0) return -22; /* EINVAL */
+    /* 等待前认领块所有权：认领期间 detach/exit 都不会压死栈链
+       （见 dead_reap.h），wait 后读 retval / free alloc_base 不再可能
+       触到已被 dead_drain 回收的内存。已 detach 或已有 join 认领时
+       立即返回 EINVAL，不再读可复用字段。 */
+    if (join_claim_acquire(&t->detached, &t->join_claimed) != 0) return -22; /* EINVAL */
     while (__atomic_load_n(&t->state, __ATOMIC_SEQ_CST) == 0) {
         futex_call((volatile int *)&t->state, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0, 0);
     }
-    /* 与并发 detach 的竞速（POSIX 属 UB，但必须不产生 double-free）：
-       退出线程只在看到 detached==1 时压死栈链；压链发生在 state=1 之后，
-       因此此处复见 detached==1 时该块可能已在死栈链上，所有权归
-       dead_drain，join 不得再读 retval 或 free。 */
-    if (__atomic_load_n(&t->detached, __ATOMIC_ACQUIRE) != 0) return -22; /* EINVAL */
     if (retval) *retval = t->retval;
     free(t->alloc_base);
     return 0;

@@ -100,14 +100,22 @@ static int test_success_preserves_markers_and_order(void) {
            assert_int("success waits", fixture.waits, 3);
 }
 
-static int test_only_minus_one_is_creation_failure(void) {
+static int test_any_negative_is_creation_failure(void) {
     static const long results[] = { -2, 3, 13, 14, 15, 16 };
     run_fixture(results, 6);
-    return assert_equal("non-minus-one output", fixture.output,
-                        "spawned hello2\nchild exited\n"
-                        "spawned hello3\nhello3 done\n"
-                        "spawned hello13\n") ||
-           assert_int("non-minus-one waits", fixture.waits, 3);
+    return assert_equal("negative output", fixture.output,
+                        "spawn failed hello2\nspawned hello3\nhello3 done\nspawned hello13\n") ||
+           assert_int("negative waits", fixture.waits, 2);
+}
+
+/* RLIMIT_NPROC preflight in kernel/proc/lifecycle.zig fails SYS_spawn with
+ * -EAGAIN (-11); init must not report it as a spawned child. */
+static int test_eagain_is_creation_failure(void) {
+    static const long results[] = { 2, -11, 13, 14, 15, 16 };
+    run_fixture(results, 6);
+    return assert_equal("eagain output", fixture.output,
+                        "spawned hello2\nchild exited\nspawn failed hello3\nspawned hello13\n") ||
+           assert_int("eagain waits", fixture.waits, 2);
 }
 
 static int test_failure_at(int failure_index, const char *expected_output,
@@ -123,7 +131,8 @@ static int test_failure_at(int failure_index, const char *expected_output,
 
 int main(void) {
     int failed = test_success_preserves_markers_and_order();
-    failed |= test_only_minus_one_is_creation_failure();
+    failed |= test_any_negative_is_creation_failure();
+    failed |= test_eagain_is_creation_failure();
     failed |= test_failure_at(0,
         "spawn failed hello2\nspawned hello3\nhello3 done\nspawned hello13\n", 2);
     failed |= test_failure_at(1,

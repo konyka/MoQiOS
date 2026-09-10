@@ -20,7 +20,9 @@ static unsigned long test_heap_off;
 /* Strong override of the weak hook (declared in malloc.c above, so the
  * weak attribute is already visible here). */
 void *__moqi_heap_grow(unsigned long bytes) {
-    if (test_heap_off + bytes > sizeof(test_heap)) return (void *)0;
+    /* Subtraction form: test_heap_off + bytes would wrap for near-SIZE_MAX
+     * requests, which the overflow tests above deliberately issue. */
+    if (bytes > sizeof(test_heap) - test_heap_off) return (void *)0;
     void *p = test_heap + test_heap_off;
     test_heap_off += bytes;
     return p;
@@ -97,6 +99,16 @@ int main(void) {
     CHECK(g == 0);
     void *h = moqi_malloc(16);
     CHECK(h != 0);
+
+    /* Huge sizes must fail cleanly, not wrap align_up/grow into a tiny
+     * block the caller believes is huge (heap-overflow primitive). */
+    CHECK(moqi_malloc((size_t)-1) == 0);       /* SIZE_MAX */
+    CHECK(moqi_malloc((size_t)-1 - 8) == 0);   /* wraps align_up to 0 */
+    /* Largest non-rejected size still fails gracefully via grow's hook */
+    CHECK(moqi_malloc((size_t)-1 - 15 - 32) == 0);
+    /* Heap still healthy after the rejected huge requests */
+    void *k = moqi_malloc(16);
+    CHECK(k != 0);
 
     printf("test_malloc: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
