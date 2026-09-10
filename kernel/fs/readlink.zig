@@ -7,6 +7,7 @@ const task_mod = @import("../proc/task.zig");
 const vfs_mod = @import("../fs/vfs.zig");
 const ext2_mod = @import("../fs/ext2.zig");
 const str = @import("../lib/str.zig");
+const readlink_policy = @import("readlink_policy.zig");
 
 /// readlink(path_ptr, buf_ptr, bufsiz) -> bytes written or -errno.
 pub fn readlink(path_ptr: u64, buf_ptr: u64, bufsiz: u64) i64 {
@@ -34,11 +35,7 @@ pub fn readlink(path_ptr: u64, buf_ptr: u64, bufsiz: u64) i64 {
     // /proc/self/fd/N -> return the fd target or EINVAL
     if (path.len > 14 and str.startsWith(path, "/proc/self/fd/")) {
         const fd_start = 14;
-        var fd_val: u32 = 0;
-        var i: usize = fd_start;
-        while (i < path.len and path[i] >= '0' and path[i] <= '9') : (i += 1) {
-            fd_val = fd_val * 10 + @as(u32, path[i] - '0');
-        }
+        const fd_val = readlink_policy.parseFdPrefix(path[fd_start..]) orelse return -22;
         if (sched_mod.currentTaskIndex()) |idx| {
             if (task_mod.getTask(idx)) |t| {
                 if (fd_val < vfs_mod.MAX_FDS and t.fd_table.fds[fd_val].fd_type != .none) {

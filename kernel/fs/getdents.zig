@@ -10,6 +10,7 @@ const ext2 = @import("ext2.zig");
 const tmpfs = @import("tmpfs.zig");
 const copy = @import("../mm/copy_from_user.zig");
 const bo = @import("../lib/byte_order.zig");
+const policy = @import("getdents_policy.zig");
 
 /// getdents64(fd, buf_ptr, buf_size) → bytes written, 0 on EOF, or -errno
 pub fn getdents64(fd: u32, buf_ptr: u64, buf_size: u64) i64 {
@@ -161,7 +162,7 @@ fn getdents64Tmpfs(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64, e
     var written: u64 = 0;
     var emitted: u32 = 0;
     const entries = tmpfs.tmpfsListDir(@intCast(desc.tmpfs_idx), &entries_buf, names_buf, 4096);
-    const start: u32 = @intCast(desc.offset);
+    const start: u32 = policy.clampOffset(desc.offset);
     var idx: u32 = start;
     while (idx < entries.count) : (idx += 1) {
         const e = entries.entries[idx];
@@ -188,6 +189,6 @@ fn getdents64Tmpfs(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64, e
     }
     const n: usize = @intCast(written);
     if (copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..n], n) != n) return -14;
-    desc.offset = start + emitted;
+    desc.offset = policy.nextOffset(start, emitted);
     return @intCast(written);
 }

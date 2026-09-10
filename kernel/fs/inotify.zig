@@ -6,6 +6,8 @@ const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const vfs_mod = @import("vfs.zig");
 const copy = @import("../mm/copy_from_user.zig");
+const inotify_policy = @import("inotify_policy.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 const MAX_INOTIFY_INSTANCES: u32 = 16;
 const MAX_INOTIFY_WATCHES: u32 = 32;
@@ -25,23 +27,33 @@ pub const InotifyInstance = struct {
 
 pub var inotify_instances: [MAX_INOTIFY_INSTANCES]InotifyInstance = @splat(.{});
 
+/// Global lock protecting the instance claim scan (mirrors
+/// timerfd.timer_lock) — without it two CPUs can claim the same slot.
+var pool_lock: IrqSpinlock = .{};
+
 /// Allocate an inotify instance and a file descriptor. Returns fd or -errno.
 pub fn inotifyInit() i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
     var inst_idx: u32 = MAX_INOTIFY_INSTANCES;
+    const saved = pool_lock.acquire();
     for (0..MAX_INOTIFY_INSTANCES) |i| {
         if (!inotify_instances[i].active) {
             inst_idx = @intCast(i);
             break;
         }
     }
+    // Claim the slot while still holding the lock (scan-and-initialize must
+    // be atomic across CPUs).
+    if (inst_idx < MAX_INOTIFY_INSTANCES) inotify_instances[inst_idx] = .{ .active = true };
+    pool_lock.release(saved);
     if (inst_idx >= MAX_INOTIFY_INSTANCES) return -24; // ENFILE
-    inotify_instances[inst_idx] = .{ .active = true };
 
     const slot = cur.fd_table.allocFd() orelse {
+        const saved2 = pool_lock.acquire();
         inotify_instances[inst_idx].active = false;
+        pool_lock.release(saved2);
         return -24;
     };
 
@@ -71,10 +83,7 @@ pub fn addWatch(fd: u32, path_ptr: u64, mask: u32) i64 {
     while (path_len < 256 and path_buf[path_len] != 0) : (path_len += 1) {}
 
     // Use hash of path as inode_id for watch tracking
-    var inode_id: u64 = 0;
-    for (0..path_len) |i| {
-        inode_id = inode_id * 31 + path_buf[i];
-    }
+    const inode_id = inotify_policy.hashPathId(path_buf[0..path_len]);
 
     const inst = &inotify_instances[inst_idx];
     // Update existing watch if found

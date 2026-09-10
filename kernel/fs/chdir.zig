@@ -5,6 +5,7 @@ const copy = @import("../mm/copy_from_user.zig");
 const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const vfs_mod = @import("../fs/vfs.zig");
+const chdir_policy = @import("chdir_policy.zig");
 
 /// chdir(path_ptr) -> 0 or -errno.
 pub fn chdir(path_ptr: u64) i64 {
@@ -22,70 +23,12 @@ pub fn chdir(path_ptr: u64) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    // Resolve path: if absolute, use as-is; if relative, append to cwd
-    var resolved: [256]u8 = undefined;
-    var resolved_len: usize = 0;
-
-    if (path_buf[0] == '/') {
-        @memcpy(resolved[0..path_len], path_buf[0..path_len]);
-        resolved_len = path_len;
-    } else {
-        if (cur.cwd_len > 0) {
-            @memcpy(resolved[0..cur.cwd_len], cur.cwd[0..cur.cwd_len]);
-            resolved_len = cur.cwd_len;
-        }
-        if (resolved_len > 0 and resolved[resolved_len - 1] != '/') {
-            if (resolved_len < 255) {
-                resolved[resolved_len] = '/';
-                resolved_len += 1;
-            }
-        }
-        const to_copy = @min(path_len, 256 - resolved_len);
-        @memcpy(resolved[resolved_len .. resolved_len + to_copy], path_buf[0..to_copy]);
-        resolved_len += to_copy;
-    }
-
-    // Normalize: remove trailing slash (except root)
-    while (resolved_len > 1 and resolved[resolved_len - 1] == '/') {
-        resolved_len -= 1;
-    }
-
-    // Handle ".." components
-    var pos: usize = 0;
-    var write_pos: usize = 0;
+    // Resolve path (absolute used as-is, relative joined onto cwd) and
+    // normalize "." / ".." / slashes. The result must fit alongside its NUL
+    // terminator in Task.cwd — reject instead of truncating or writing the
+    // NUL one byte past the array.
     var out_buf: [256]u8 = undefined;
-
-    while (pos < resolved_len) {
-        while (pos < resolved_len and resolved[pos] == '/') : (pos += 1) {}
-        if (pos >= resolved_len) break;
-        const start = pos;
-        while (pos < resolved_len and resolved[pos] != '/') : (pos += 1) {}
-        const component = resolved[start..pos];
-
-        if (component.len == 1 and component[0] == '.') {
-            continue;
-        } else if (component.len == 2 and component[0] == '.' and component[1] == '.') {
-            if (write_pos > 1) {
-                write_pos -= 1;
-                while (write_pos > 0 and out_buf[write_pos - 1] != '/') : (write_pos -= 1) {}
-            }
-        } else {
-            if (write_pos > 0 and out_buf[write_pos - 1] != '/') {
-                out_buf[write_pos] = '/';
-                write_pos += 1;
-            } else if (write_pos == 0) {
-                out_buf[write_pos] = '/';
-                write_pos += 1;
-            }
-            @memcpy(out_buf[write_pos .. write_pos + component.len], component);
-            write_pos += component.len;
-        }
-    }
-
-    if (write_pos == 0) {
-        out_buf[0] = '/';
-        write_pos = 1;
-    }
+    const write_pos = chdir_policy.resolve(cur.cwd[0..cur.cwd_len], path_buf[0..path_len], &out_buf) catch return -36; // ENAMETOOLONG
 
     @memcpy(cur.cwd[0..write_pos], out_buf[0..write_pos]);
     cur.cwd[write_pos] = 0;
