@@ -762,8 +762,17 @@ fn handleDemandPage(frame: *InterruptFrame, fault_addr: u64) bool {
 
     if (!in_stack_range and !in_code_range) {
         // G2: demand paging for file-backed (MAP_PRIVATE) mmap regions.
+        // handleFileFault takes the vm_lock guard itself (its critical
+        // section deliberately includes the backing disk I/O — see there).
         return handleFileFault(current, page_addr);
     }
+
+    // Serialise PTE/VM metadata mutation against mmap/munmap/mprotect/brk/
+    // mremap on other CPUs. Never pinTaskMmByTid/task_lock here — the fault
+    // path uses the current task's own Mm only (mm.zig lock-order header).
+    const mm_mod = @import("../../mm/mm.zig");
+    var vm_guard = mm_mod.Mm.beginFaultCritical(current.mm, @ptrCast(current));
+    defer vm_guard.release();
 
     // Check if this is a swap-in (page was swapped out)
     const swap = @import("../../mm/swap.zig");
@@ -887,6 +896,18 @@ fn handleFileFault(current: anytype, page_addr: u64) bool {
     const filemap = @import("../../mm/filemap.zig");
     const paging_mod = @import("paging.zig");
     const task_mod = @import("../../proc/task.zig");
+
+    // One guard around the whole outer body: serveFilePage, region-metadata
+    // reads, mapRawUserPte and the fault-around window all mutate/read PTEs
+    // and region metadata that mmap/munmap/mprotect may touch concurrently.
+    // The critical section deliberately INCLUDES the backing disk I/O below
+    // (it already runs IF=0 in the fault handler today and the storage paths
+    // poll); splitting it into a two-phase read-then-commit is a documented
+    // follow-up. handleDemandPage delegates here BEFORE taking its own
+    // guard, so this is never a nested acquire.
+    const mm_mod = @import("../../mm/mm.zig");
+    var vm_guard = mm_mod.Mm.beginFaultCritical(current.mm, @ptrCast(current));
+    defer vm_guard.release();
 
     // Serve the faulting page first — a failure here is the real SIGSEGV.
     if (!serveFilePage(current, page_addr)) return false;
@@ -1103,6 +1124,13 @@ fn handleCowFault(frame: *InterruptFrame, fault_addr: u64) bool {
 
     const current = sched.currentTask() orelse return false;
     if (current.page_table_phys == 0) return false;
+
+    // Serialise the PTE read/refcount/commit/shootdown/decRef sequence below
+    // against mmap/munmap/mprotect/brk/mremap on other CPUs (CLONE_VM threads
+    // share this page table). Never takes task_lock — current-task Mm only.
+    const mm_mod = @import("../../mm/mm.zig");
+    var vm_guard = mm_mod.Mm.beginFaultCritical(current.mm, @ptrCast(current));
+    defer vm_guard.release();
 
     const page_addr = fault_addr & ~@as(u64, paging_mod.PAGE_SIZE - 1);
 

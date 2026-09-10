@@ -178,11 +178,12 @@ inline fn eoiInline() void {
 }
 
 /// Service an in-flight shootdown broadcast for this CPU without taking an
-/// actual IPI. Used by the IPI handler and by CPUs spinning on
-/// `shootdown_lock` with IRQs disabled, so the initiator never has to wait
-/// for a waiter to re-enable interrupts. Idempotent per generation via
+/// actual IPI. Used by the IPI handler, by CPUs spinning on `shootdown_lock`
+/// with IRQs disabled, and by CPUs spinning on `Mm.vm_lock` (see
+/// `sync/servicing_spinlock.zig`), so an initiator never has to wait for a
+/// waiter to re-enable interrupts. Idempotent per generation via
 /// `acknowledged_generation`.
-fn servicePendingShootdown() void {
+pub fn servicePendingShootdown() void {
     if (@atomicLoad(u32, &shootdown_req.active, .acquire) == 0) return;
     const generation = @atomicLoad(u32, &shootdown_req.generation, .acquire);
     const cpu_id = syscall_entry.getPerCpu().cpu_id;

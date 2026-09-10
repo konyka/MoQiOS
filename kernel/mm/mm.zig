@@ -9,7 +9,7 @@
 //! for compatibility and must migrate to vmLock in the cross-process stage.
 
 const std = @import("std");
-const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+const ServicingSpinlock = @import("../sync/servicing_spinlock.zig").ServicingSpinlock;
 
 pub const Mm = struct {
     /// The terminal value is part of refs, so retain and the last release
@@ -20,7 +20,12 @@ pub const Mm = struct {
     refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
     finalized: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     page_table_phys: u64,
-    vm_lock: IrqSpinlock = .{},
+    /// Servicing spinlock: waiters spin with IRQs off while manually
+    /// servicing pending TLB shootdown broadcasts, because holders
+    /// synchronously wait for remote shootdown acks (mprotect/munmap/COW)
+    /// and an IRQ-off waiter would otherwise deadlock that protocol into a
+    /// `failShootdown` halt.
+    vm_lock: ServicingSpinlock = .{},
     vm_owner: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     finalizer: *const fn (*Mm) void,
 
@@ -79,8 +84,9 @@ pub const Mm = struct {
     }
 
     /// Stage 1 syscall mutation guard. The owner check prevents a same-task
-    /// recursive IrqSpinlock deadlock; page faults/COW/fork/clone/exec teardown
-    /// remain next prerequisites for full Mm.vmLock migration.
+    /// recursive IrqSpinlock deadlock. Fault-side PTE mutations use
+    /// beginFaultCritical instead; fork/clone COW page-table cloning and
+    /// exec/reap teardown remain next prerequisites for full vmLock coverage.
     pub fn beginVmMutation(mm: ?*Mm, owner: *const anyopaque) VmLockGuard.Error!VmLockGuard {
         const policy = @import("vm_lock_policy.zig");
         const address = @intFromPtr(owner);
@@ -112,6 +118,47 @@ pub const Mm = struct {
             target.release();
         }
     };
+
+    /// One-shot observability for the owned_by_us fault path.
+    var fault_under_guard_logged: bool = false;
+
+    /// Fault-side VM mutation guard for the page-fault handler.
+    ///
+    /// Unlike beginVmMutation this never fails and never blocks on
+    /// task/scheduler locks: the caller passes the CURRENT task's own Mm
+    /// (obtained locklessly from the per-CPU current task), which is kept
+    /// alive by the running task's own reference, so no retain is needed to
+    /// pin it — the retain below only balances VmLockGuard.release.
+    ///
+    /// If the same task already holds vm_lock (a syscall-side mutation on
+    /// this CPU faulted mid-critical-section — a bug per the lock audit),
+    /// the fault proceeds WITHOUT acquiring: a recursive IrqSpinlock take
+    /// would deadlock. The event is logged once to keep it observable.
+    pub fn beginFaultCritical(mm: ?*Mm, owner: *const anyopaque) VmLockGuard {
+        const policy = @import("vm_lock_policy.zig");
+        const address = @intFromPtr(owner);
+        const target = mm orelse return .{};
+        const already_held = target.vm_owner.load(.acquire) == address;
+        switch (policy.decideFault(true, already_held)) {
+            .no_mm => return .{},
+            .owned_by_us => {
+                if (!fault_under_guard_logged) {
+                    fault_under_guard_logged = true;
+                    @import("../arch/arch.zig").serial.writeString(
+                        "[mm] WARN: page fault under a vm_lock held by the faulting task; proceeding unguarded\n",
+                    );
+                }
+                return .{};
+            },
+            .acquire => {},
+        }
+        // A running task's own Mm is live, so retain cannot fail here; if it
+        // ever did, proceeding unguarded matches the pre-guard behaviour.
+        if (!target.retain()) return .{};
+        const flags = target.vmLock();
+        target.vm_owner.store(address, .release);
+        return .{ .mm = target, .flags = flags, .owner = address };
+    }
 };
 
 pub const TestRefState = struct {

@@ -151,6 +151,34 @@ test "current-task VM lock policy handles no Mm and recursion" {
     try std.testing.expectEqual(vm_lock_policy.Decision.acquire, vm_lock_policy.decide(true, false));
     try std.testing.expectEqual(vm_lock_policy.Decision.recursive, vm_lock_policy.decide(true, true));
 }
+
+test "fault-side VM lock policy: no Mm, acquire, or proceed when owned by us" {
+    try std.testing.expectEqual(vm_lock_policy.FaultDecision.no_mm, vm_lock_policy.decideFault(false, false));
+    try std.testing.expectEqual(vm_lock_policy.FaultDecision.no_mm, vm_lock_policy.decideFault(false, true));
+    try std.testing.expectEqual(vm_lock_policy.FaultDecision.acquire, vm_lock_policy.decideFault(true, false));
+    try std.testing.expectEqual(vm_lock_policy.FaultDecision.owned_by_us, vm_lock_policy.decideFault(true, true));
+}
+
+test "fault-side guard semantics on TestVmLockState: owned_by_us never re-acquires" {
+    var lock: mm.TestVmLockState = .{};
+    // .acquire decision takes the lock.
+    switch (vm_lock_policy.decideFault(true, lock.held)) {
+        .acquire => try std.testing.expect(lock.acquire()),
+        else => return error.TestUnexpectedResult,
+    }
+    // .owned_by_us proceeds WITHOUT acquiring — a recursive acquire on a held
+    // IrqSpinlock would deadlock, and TestVmLockState.acquire would fail.
+    switch (vm_lock_policy.decideFault(true, true)) {
+        .owned_by_us => try std.testing.expect(!lock.acquire()),
+        else => return error.TestUnexpectedResult,
+    }
+    // .no_mm touches no lock at all.
+    switch (vm_lock_policy.decideFault(false, false)) {
+        .no_mm => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(lock.release());
+}
 const shm_policy = kt.shm_policy;
 const cow_pte = kt.cow_pte;
 const map_fixed = kt.map_fixed;

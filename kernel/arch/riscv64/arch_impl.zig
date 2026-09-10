@@ -698,6 +698,9 @@ pub const tlb = struct {
         _ = target_cr3; // uniprocessor bring-up — no IPI filtering needed
         asm volatile ("sfence.vma" ::: .{ .memory = true });
     }
+
+    /// No shootdown IPI protocol on uniprocessor bring-up — nothing pending.
+    pub fn servicePendingShootdown() void {}
 };
 
 /// PCID is x86_64-only; riscv64 keeps the facade namespace as no-ops so

@@ -638,6 +638,9 @@ pub const tlb = struct {
         asm volatile ("dsb ish" ::: .{ .memory = true });
         asm volatile ("isb");
     }
+
+    /// No shootdown IPI protocol on uniprocessor bring-up — nothing pending.
+    pub fn servicePendingShootdown() void {}
 };
 
 /// PCID is x86_64-only; aarch64 keeps the facade namespace as no-ops so
