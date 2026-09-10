@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-08 (7-area full-repository audit round recorded in §6: memory-safety / concurrency / performance / userland fixes, SMP #GP root cause in TLB shootdown, all builds and SMP=1/SMP=4 smokes passed; prior: 2026-07-28 full-repository audit — copy_file_range fd/rollback, socket option user-copy/SO_ERROR/sockaddr lengths, futex EFAULT/waitv limit, SysV IPC_SET/rt_sigsuspend copies, virtio-net/e1000 rollback/timeouts, hello38-41 regression gates)
+> Last update: 2026-09-09 (§6.41: eventfd/timerfd raw-index-as-fd root fix + vfs read/write wiring with Linux semantics, hello93/hello94 acceptance in SMP=1/2 smokes, 282/282 host tests; prior: 2026-09-07/08 §6.39-6.40 — 5-way audit, 28 defects TDD-fixed incl. mprotect COW TOCTOU, ipc reply handoff, TCP send-cursor invariant, all §6.39 follow-ups closed); earlier: 2026-08 (7-area full-repository audit round recorded in §6: memory-safety / concurrency / performance / userland fixes, SMP #GP root cause in TLB shootdown, all builds and SMP=1/SMP=4 smokes passed; earlier: 2026-07-28 full-repository audit — copy_file_range fd/rollback, socket option user-copy/SO_ERROR/sockaddr lengths, futex EFAULT/waitv limit, SysV IPC_SET/rt_sigsuspend copies, virtio-net/e1000 rollback/timeouts, hello38-41 regression gates)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -2341,6 +2341,202 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 
 **后续 rlimit**：剩余资源（RLIMIT_CORE/RSS）语义差异较大，各自定稿后
 单独成批；当前 P2 的 rlimit 执行语义目标已全部完成。
+
+### 6.39 五路全仓缺陷审计（2026-09-07）：15 处缺陷 TDD 修复 + 10 项竞态/生命周期遗留
+
+- **方法**：5 路并行只读审计（mm/proc、fs/VFS、net、ipc/sched、libc/servers），
+  先与本文件既有 RESOLVED 条目对账去重；全部修复严格 TDD（先红后绿，
+  RED 证据逐条留存），纯逻辑一律下沉为 host 可测策略模块。
+- **fs（4 处）**：
+  - `inotify.zig` 路径哈希 `*31+` 溢出让任何 ≥13 字符路径触发内核 panic；
+    新建 `inotify_policy.hashPathId` 用 `*%`/`+%`（对齐 `dcache.hashName`）。
+  - `getdents.zig` tmpfs 分支对 `desc.offset` 做截断 `@intCast`，大 lseek 后
+    强转陷阱；新建 `getdents_policy.clampOffset/nextOffset`（对齐 ext2/devfs
+    既有 `@min` 钳制，且修复 start 在钳制点时的 u32 回绕）。
+  - `readlink.zig` `/proc/self/fd/N` 解析器 u32 溢出（≥10 位数字 panic /
+    回绕后误过 `MAX_FDS` 检查）；新建 `readlink_policy.parseFdPrefix`，
+    复用 `vfs.parseU32` 的 `@mulWithOverflow`/`@addWithOverflow` 模式，
+    溢出返回 EINVAL。
+  - `chdir.zig` 规范化路径达 256 字节时静默丢分隔符且 NUL 越界写
+    `cwd[256]`；新建 `chdir_policy.resolve`，所有追加对 255 界做检查，
+    超长返回 ENAMETOOLONG（`-36`），不再静默截断。host 测试锁定
+    254/255/256 边界。
+- **mm/proc（2 处）**：
+  - `mprotect.zig` TLB shootdown 用 `floor((end-addr)/PAGE)`，len 非页对齐时
+    最后一页陈旧 TLB 项存活（权限绕过），len<4096 时甚至跳过 PCID 代际
+    递增；改用 `mprotect_policy.pageCount`（溢出安全 ceil），并让预检上限
+    检查同一计数使后续 u32 强转可证安全。
+  - `task_op_policy.State.pin` 的 NoMm/OperationRefOverflow 判定顺序与同文件
+    `select` 及内核 `pinTaskMmByTid`（task.zig:373-375）相反；交换两处检查，
+    host 测试锁定双条件同时成立时返回 `OperationRefOverflow`。
+- **net（4 处）**：
+  - `socket_syscall.zig` UDP socket() 临时端口扫描误用 `ensurePort`（已注册
+    端口返回既有槽位），第二个 UDP socket 与第一个共享 49152 接收队列且
+    引用计数错乱；改用 `ensurePortExclusive` + 纯策略 `udp_util.scanAction`
+    （0xFFFE 跳过 / 0xFFFF 失败），IPv4/IPv6 两臂同修。
+  - `tcp.zig` 两处 `rcv_wnd = TCP_WINDOW - ringDataLen(...)` 在缓冲字节超过
+    32768（RECV_BUF_SIZE=65536）时 u32 下溢 → Debug 构建 panic；新建
+    `tcp_util.rcvWindowFromBuffered` 饱和到 0。
+  - `tcp.zig` `allocEphemeralPort` 用饱和加 `+|=` 使回绕守卫成死代码，
+    ~16k 次连接后所有连接永久占用 65535（四元组混叠）；改用纯策略
+    `tcp_util.nextEphemeralPort`（`+%` 回绕后钳回 49152）。
+  - `tcp.zig` IPv4 TIME_WAIT 复用谓词漏查 `remote_ip`（IPv6 孪生路径有查），
+    源端口碰撞的异主机 SYN 可劫持 TCB；新建 `tcp_util.tupleMatchV4`
+    （镜像既有 `tupleMatchV6`），谓词补 `remote_ip == src_ip`。
+- **ipc（1 处）**：`posix_timer.zig`/`posix_mq.zig` 的 timespec→ns/tick 转换对
+  用户控制的 `tv_sec` 做未检查 u64 乘法（>~1.8e10 秒溢出 → panic 或立即
+  到期）；新建共享纯模块 `kernel/ipc/time_policy.zig`（溢出/非法字段返回
+  null），posix_timer/posix_mq/timerfd 三模块统一走它；timerSettime 现在对
+  负 tv_sec/tv_nsec、`tv_nsec >= 1e9` 返回 `-EINVAL`（对齐 Linux 与 timerfd
+  既有语义）。
+- **libc/servers（4 处）**：
+  - `malloc.c` `align_up` 对近 SIZE_MAX 请求回绕，返回小块伪装巨块（堆溢出
+    原语）；入口拒绝 `size > SIZE_MAX - (ALIGN-1) - sizeof(struct block)`，
+    该界同时保证 `grow()` 的加法不溢出。host 测试锁定 SIZE_MAX 边界。
+  - `pthread.c` detach/exit 竞态双推 dead-stack 链表（x86 TSO 下双 store 均可
+    见 → 同一 TCB 入链两次 → dead_drain 死循环 + double-free）；TCB 新增
+    `dead_claimed`，两个推入站点统一走 `dead_reap.h` 的 CAS 认领。反向
+    （双读陈旧 → 泄漏）经论证在 x86 全屏障 store 下不可达，已在头文件注释
+    记录。
+  - `spawn_report.h` 只把 `-1` 当 spawn 失败，而 NPROC 预检返回 `-11`
+    （EAGAIN），init 会把失败 spawn 误报为成功并可能 reap 无关子进程；
+    改为 `tid < 0`。`test_init_spawn_reporting.sh` 此前存在但未接入
+    build.zig，本轮一并接线。
+  - `devmgr/main.c` `snapshot()` 信任 `dirent64.reclen`（reclen=0 死循环、
+    过小 reclen 越界读、name 无界 strlen）；解析循环抽为
+    `snapshot_parse.h`，按 `offsetof(dirent64_t, name)` 下界 + 缓冲上界 +
+    reclen 内界扫描，配套 `test_devmgr_snapshot.sh`  fuzz 六类畸形记录。
+- **门禁**：`zig build`、`zig build test`（264/264 zig host 测试 + libc/init/
+  devmgr 套件全绿）、QEMU smoke SMP=1 通过、SMP=2 通过。
+- **遗留（已审计确认，2026-09-08 全部收口，修复细节见 §6.40）**：
+  1. mprotect COW 预检/提交 TOCTOU（fork 可在两相间提升帧引用数，提交循环
+     无 `got_data` 上界 → 越界栈读 + 野生物理 memcpy；修法：提交耗尽预留时
+     保留 COW 位不授予写，交给缺页路径 unshare）。
+  2. mprotect 大页降级少用预留 PT 页时剩余帧泄漏（`protectHugeOverlapsReserved`
+     返回值被丢弃，补 free 即可）。
+  3. `untrackMmapRange` 中间拆分在 64 槽满时静默丢弃尾区域（munmap 无槽位
+     预检；修法：munmap 前预检拆分槽位，不足返回 ENOMEM）。
+  4. `eventfdCreate`/`inotifyInit` 池槽扫描无锁（SMP 双分配；对齐
+     `timerfdCreate` 的全局锁模式）。
+  5. `ipc.call` 应答载荷不落回调用方 msg（reply 存 pending_msg 无人消费，
+     调用方读到自己的请求回显）。
+  6. `ipc.send`/`receive` 单 waiting 槽静默覆盖 → 第二发送者永久丢唤醒
+     （修法：占用时拒绝或改 WaitNode 队列）。
+  7. `timerfdClose`/`timerTick` 只唤醒队首一个 waiter，其余阻塞读者永久
+     挂起（修法：close 唤醒全部，tick 语义按 Linux 唤醒全部）。
+  8. `posix_timer.owner_task_idx`/`posix_mq.notify_task_idx` 任务退出后不清，
+     槽位复用后信号误投无关任务（修法：exitTask 清理 + 记 tid 校验代际）。
+  9. `tcp.zig` `flushSendBuffer` 在 `sendSegment` 失败前已推进
+     `send_unacked` 且丢弃返回值 → 字节流错位且不可重传（修法：失败恢复
+     游标并 break；PMTU 检查前移到 fillTcpSegment 之前以保 SACK 块）。
+  10. `pthread_join` 竞态下等待后仍读可能已 free 的 TCB（POSIX 属 UB，但
+      现有"防护"注释所述缓解不成立；修法：join 入口 CAS 认领）。
+
+### 6.40 遗留收口（2026-09-08）：§6.39 十项全部修复 + 两项连带修复
+
+全部沿用 TDD（纯决策逻辑下沉 host 策略模块先红后绿；锁/唤醒等内核态属性以
+构建 + 代码评审验证并在条目中注明）。门禁：`zig build test`（277/277）、
+`zig build`、QEMU smoke SMP=1、SMP=2 全绿。
+
+- **项 1（mprotect COW TOCTOU）**：提交循环经 `mprotect_policy.cowCommitAction`
+  判定，预留耗尽（`data_used == got_data`，并发 fork 提升帧引用所致）时不再
+  越界消费栈数组，而是保留 COW 位不授予写，交缺页路径 unshare
+  （mprotect.zig:202）。
+- **项 2（PT 页泄漏）**：`protectHugeOverlapsReserved` 返回值接收为
+  `pt_used`，`reserved_pt[pt_used..got_pt]` 立即 `pmm.freePageBatch`
+  （mprotect.zig:156-166）。纯为丢弃返回值，无策略测试，构建 + 评审验证。
+- **项 3（munmap 拆分丢尾）**：`munmap_policy.needsSplitSlot`/`canUntrack`
+  纯策略；`munmap` 在任何变更前统计被中间切分的区域数，槽位不足返回
+  ENOMEM（mmap.zig:1009-1024）。host 测试锁定满表+中间切分拒绝、满表+
+  边对齐放行、有槽放行三边界。**连带**：`mremap` 收缩路径同一隐患，同一
+  策略在 `unmapRange` 前预检（mmap.zig:1072-1094），并补 mremap 调用点
+  边界测试。
+- **项 4（eventfd/inotify 池槽无锁）**：两模块各加模块级 `IrqSpinlock`
+  （`pool_lock`）持锁完成扫描-认领（eventfd.zig:45、inotify.zig:32），对齐
+  `timerfdCreate` 模式；inotify 的回滚路径同样持锁清位。锁属性无纯决策可
+  抽，构建 + 评审验证。
+- **项 5（ipc.call 应答丢失）**：新纯模块 `kernel/ipc/ipc_policy.zig`；
+  `call()` 唤醒路径经 `callWake` 区分应答到达/信号踢醒（并以
+  `waiting_sender` 在位防止误取第三方阻塞发送者的消息），应答经
+  `takeSlot` 拷回调用方 `msg` 并清槽（ipc.zig:444-470）。syscall 包装层
+  本就把 `msg` 回拷用户态，无需改动。**残留**：调用方在 `reply()` 到达前
+  被信号杀死时槽位残留与正常消息不可区分，需应答标记方能解决，记为观察项。
+- **项 6（ipc 单槽覆盖）**：`send()`/`receive()` 经 `sendAction`/
+  `receiveAction` 在 `waiting_sender`/`waiting_receiver` 已被占用且无对端
+  可交付时返回 `.not_ready` 拒绝第二注册者（ipc.zig:~291/~355）；未做
+  WaitNode 队列化（保持最小）。
+- **项 7（timerfd 单唤醒）**：close 与 tick 两处 `if` 单弹改为 `while`
+  全唤醒（timerfd.zig:336-345、392-401）；被唤醒读者既有路径自动重检
+  `inst.valid`（EBADF）/耗尽 expirations。循环弹栈非纯函数，构建 + 评审
+  验证。**注**：`eventfdClose`/`eventfdWrite` 同形单唤醒不在审计条目内，
+  保持原样。
+- **项 8（posix 属主槽位陈旧）**：新纯模块 `owner_gen_policy.ownerMatches`
+  （tid 代际匹配）；posix_timer/posix_mq 注册时记 `owner_tid`/`notify_tid`，
+  投递前校验代际；`exitTask` 新增 `deleteTimersForTask`/`clearNotifyForTask`
+  清理钩子（task.zig:937-943，置于 task_lock 获取前，无锁序问题）。
+- **项 9（flushSendBuffer 游标）**：`send_unacked` 仅在 `sendSegment` 成功
+  后提交（`tcp_util.flushCommitCursor`），失败恢复游标并 break
+  （tcp.zig:2682-2695）；PMTU 闸点前移至 `fillTcpSegment` 之前（v4/v6 两臂，
+  tcp.zig:949-955/999-1005），不再丢失已排队 SACK 块；新增纯函数
+  `expectedSendUnacked`/`segmentOptLen` 并锁定布局向量。
+- **项 10（pthread_join UAF）**：TCB 新增 `join_claimed`；`pthread_join` 入口
+  经 `dead_reap.h` 的 `join_claim_acquire` CAS 认领（已认领/已 detach →
+  EINVAL），`pthread_detach` 对 join 持有方退避返回 -22，`pthread_exit` 在
+  join 持有时不推死栈链表。join 持有期间块不会被 drain，原"等待后重检"
+  伪防护删除。host 测试 7 场景 26 断言覆盖全部交错。**已记录残留**：双方
+  退避交错下栈块只泄漏、无 UAF/double-free。
+- **新发现（项 9 修复中暴露，已同轮修复）**：`tcp.zig` 新 ACK 分支把
+  `send_unacked` 随 `acked` 同步推进（原 :2014），而 ACK 只应移动
+  `snd_una`/`send_head`——无 TX 失败也破坏游标不变量，重发/续发会送出幻影
+  字节。修复为单行删除 + 字段注释更正；全部 24 处 `send_unacked` 读写点已
+  grep 审计确认不变量保持。host 测试锁定 write→flush→全 ACK→续写序列下游
+  标不动。该缺陷自 TCP 初始提交即存在，v53.2 的 send_head 修复后才显现。
+- **追加（eventfd 单唤醒同形项）**：`eventfdWrite`/`eventfdClose` 的单弹改
+  全唤醒（eventfd.zig:114-126、160-168），与 timerfd 同纪律；新纯模块
+  `eventfd_policy.writeWakesReaders` 防止对空计数器无谓广播。**重要前提
+  发现**：eventfd 的 waiter 栈当前在全树无任何压栈点——`vfs.read`/`vfs.write`
+  对 `.eventfd` 直接返回 -1（vfs.zig:1100/1247），`eventfdRead`/`eventfdWrite`
+  无调用者，阻塞路径尚不存在，丢失唤醒在当前树不可达。修复先行落地（接线
+  阻塞读写后即为承重逻辑）。**vfs 未接线 eventfd 读写为功能缺口**，记为
+  后续项：接线 `eventfdRead`/`eventfdWrite` 进 vfs 并补阻塞语义与验收。
+- **扩展门禁**：riscv64/aarch64 交叉构建通过；SMP=4 压力冒烟 3 连跑通过
+  （`MOQI_SMP=4 MOQI_SMOKE_RUNS=3 tools/qemu_smoke_stress.sh`）。
+
+### 6.41 eventfd/timerfd fd 化与 vfs 接线（2026-09-09）：功能缺口收口
+
+- **根因发现（比审计记录更深）**：eventfd（syscall 169）与 timerfd
+  （syscall 170）的 create 直接把**池索引当 fd 返回**，从不安装 fd 表项——
+  close/poll/epoll/read 在这些 fd 上从未可能工作（eventfd 的 vfs 读写臂甚至
+  直接返回 -1）。timerfd 的 vfs 分发（read/close/fork retain/poll）早已存在，
+  唯独创建不安装。
+- **eventfd 接线**：`eventfdCreateFd` 校验标志（EFD_SEMAPHORE/NONBLOCK/
+  CLOEXEC，未知 -EINVAL）并安装真实 fd（可写、CLOEXEC/NONBLOCK 入
+  fd_flags/status_flags）；vfs read/write 两臂按 pipe 模式分发
+  `desc.status_flags`。语义对齐 Linux：read 排空（默认）/减一（SEMAPHORE），
+  空计数阻塞或 -EAGAIN；write 承认上界 2^64-2、val==2^64-1 拒绝，满计数
+  阻塞或 -EAGAIN；count<8 一律 -EINVAL。实例 waiter 栈拆分
+  `read_waiters`/`write_waiters`，close 双栈全唤醒；阻塞机制逐行复用
+  timerfd 的 blockTask/int$240/EINTR 模式。`epollNotify` 移出 spin（锁序修
+  正）；poll 新增显式 POLLOUT 臂（`writeAdmitted(counter,1)`，修正此前
+  blanket else 对满计数误报可写）。syscall 169 经 `eventfdCreateFd`；
+  signalfd 更新到新签名且保持只读行为不变。
+- **timerfd fd 化**：create 经 `time_policy.timerfdFlagsValid` 校验标志，
+  按 epoll_create1 模式安装只读 `.timerfd` fd（fd_flags/status_flags 镜像
+  TFD_CLOEXEC/NONBLOCK，allocFd 失败回滚 timerfdClose）；syscall 171/172
+  由裸索引改为经 fd 表解析（fd→pool idx，非 timerfd fd 返回 -EBADF）——全
+  仓无 timerfd 用户态调用者（grep 证实），旧 ABI 无消费者。
+- **TDD**：`eventfd_policy` 扩展（`COUNTER_MAX`/`readResult`/`writeValValid`/
+  `writeAdmitted`）与 `timerfdFlagsValid` 均先红后绿；signalfd 源码模式测
+  试因 create 签名变更做接口适配（意图不变）。
+- **验收**：`hello93`（eventfd：标志校验、排空、SEMAPHORE 三次减一后
+  EAGAIN、非阻塞空读/满写 EAGAIN、count<8、val 全 1、fork 共享计数、阻塞
+  读被写方唤醒）与 `hello94`（timerfd：真实 fd 可 dup、非阻塞未到期 EAGAIN、
+  settime/gettime、错误 fd EBADF、到期读回 expirations、双 close）接入
+  build/ramdisk/init 自动测试/smoke 标记。hello94 首跑暴露测试自身时序
+  脆弱点（固定 250ms sleep 对 BSP 维护节拍余量不足，非内核缺陷），改为
+  有界轮询重读后 SMP=2 两连跑稳定。
+- **门禁**：`zig build test`（282/282）、`zig build`、riscv64/aarch64 构建、
+  QEMU smoke SMP=1、SMP=2 全绿（hello93/hello94 标记均在）。
 
 ---
 
