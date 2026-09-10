@@ -11,6 +11,7 @@ const cap_mod = @import("../ipc/capability.zig");
 const vfs_mod = @import("../fs/vfs.zig");
 const net_mod = @import("mod.zig");
 const udp = @import("udp.zig");
+const udp_util = @import("udp_util.zig");
 const sa = @import("sockaddr_util.zig");
 const netif = @import("netif.zig");
 const ndp = @import("ndp.zig");
@@ -72,20 +73,27 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
     if (domain == 2 and sock_type == 2) {
         var port: u16 = 49152;
         while (port < 65535) : (port += 1) {
-            const idx = udp.ensurePort(port);
-            if (idx != 0xFFFF) {
-                // v53.49: Use allocFd() O(1) bitmap instead of duplicated linear scan
-                const fd_slot = t.fd_table.allocFd() orelse {
-                    udp.releasePort(port); // roll back the port registration
-                    return -24; // EMFILE
-                };
-                t.fd_table.fds[fd_slot] = .{
-                    .fd_type = .udp_socket,
-                    .udp_port = port,
-                    .writable = true,
-                };
-                t.fd_table.publishFd(fd_slot);
-                return @intCast(fd_slot);
+            // ensurePortExclusive: an already-registered port (0xFFFE) must be
+            // skipped — plain ensurePort would hand the new socket the EXISTING
+            // slot, sharing the first socket's receive queue and refcount.
+            const idx = udp.ensurePortExclusive(port);
+            switch (udp_util.scanAction(idx)) {
+                .skip_in_use => continue,
+                .abort_full => return -1,
+                .use => {
+                    // v53.49: Use allocFd() O(1) bitmap instead of duplicated linear scan
+                    const fd_slot = t.fd_table.allocFd() orelse {
+                        udp.releasePort(port); // roll back the port registration
+                        return -24; // EMFILE
+                    };
+                    t.fd_table.fds[fd_slot] = .{
+                        .fd_type = .udp_socket,
+                        .udp_port = port,
+                        .writable = true,
+                    };
+                    t.fd_table.publishFd(fd_slot);
+                    return @intCast(fd_slot);
+                },
             }
         }
         return -1;
@@ -112,20 +120,25 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
             // SOCK_DGRAM → IPv6 UDP socket
             var port6: u16 = 49152;
             while (port6 < 65535) : (port6 += 1) {
-                const idx6 = udp.ensurePort(port6);
-                if (idx6 != 0xFFFF) {
-                    const fd_slot6 = t.fd_table.allocFd() orelse {
-                        udp.releasePort(port6); // roll back the port registration
-                        return -24; // EMFILE
-                    };
-                    t.fd_table.fds[fd_slot6] = .{
-                        .fd_type = .udp_socket,
-                        .udp_port = port6,
-                        .udp_is_v6 = true,
-                        .writable = true,
-                    };
-                    t.fd_table.publishFd(fd_slot6);
-                    return @intCast(fd_slot6);
+                // Same exclusivity rule as the IPv4 scan above.
+                const idx6 = udp.ensurePortExclusive(port6);
+                switch (udp_util.scanAction(idx6)) {
+                    .skip_in_use => continue,
+                    .abort_full => return -1,
+                    .use => {
+                        const fd_slot6 = t.fd_table.allocFd() orelse {
+                            udp.releasePort(port6); // roll back the port registration
+                            return -24; // EMFILE
+                        };
+                        t.fd_table.fds[fd_slot6] = .{
+                            .fd_type = .udp_socket,
+                            .udp_port = port6,
+                            .udp_is_v6 = true,
+                            .writable = true,
+                        };
+                        t.fd_table.publishFd(fd_slot6);
+                        return @intCast(fd_slot6);
+                    },
                 }
             }
             return -1;

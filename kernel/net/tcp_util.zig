@@ -23,6 +23,22 @@ pub fn ringAvailable(head: u32, tail: u32, size: u32) u32 {
     return size - ringDataLen(head, tail, size) - 1;
 }
 
+/// Ring position of the next byte to send, derived from sequence state:
+/// send_unacked must equal send_head + (snd_nxt -% snd_una) so flushSendBuffer
+/// reads the payload that belongs to snd_nxt (prepareRexmitFromSeq sets the
+/// same relation when rewinding for retransmit).
+pub fn expectedSendUnacked(send_head: u32, snd_nxt: u32, snd_una: u32, size: u32) u32 {
+    return (send_head + (snd_nxt -% snd_una)) % size;
+}
+
+/// Send-ring cursor after one flushed segment: the cursor may only advance
+/// when the segment actually left (sendSegment advances snd_nxt on TX success
+/// only). On TX failure the pre-send cursor is kept so the same bytes are
+/// retried for the same snd_nxt on the next flush.
+pub fn flushCommitCursor(unacked_before: u32, can_send: u32, size: u32, sent: bool) u32 {
+    return if (sent) (unacked_before + can_send) % size else unacked_before;
+}
+
 // ─── RFC 793 modular sequence comparisons (32-bit wrap-around) ───────────────
 
 /// a < b in sequence space.
@@ -43,6 +59,55 @@ pub fn seqLeq(a: u32, b: u32) bool {
 /// True when `seq` falls in the half-open window [left, right) modularly.
 pub fn seqInWindow(seq: u32, left: u32, right: u32) bool {
     return (seq -% left) < (right -% left);
+}
+
+// ─── Connection bookkeeping (window, ephemeral ports, tuple match) ─────────
+
+/// Advertised receive window: `window` minus the bytes buffered in the recv
+/// ring, saturating at 0. RECV_BUF_SIZE exceeds TCP_WINDOW, so `buffered`
+/// can be larger than `window` — a plain subtraction underflows u32.
+pub fn rcvWindowFromBuffered(buffered: u32, window: u32) u32 {
+    return if (buffered < window) window - buffered else 0;
+}
+
+/// Advance the ephemeral port counter with wrap: 65535 → 49152. Saturating
+/// (`+|=`) would park the counter at 65535 and alias every later 4-tuple.
+pub fn nextEphemeralPort(cur: u16) u16 {
+    const next = cur +% 1;
+    return if (next < 49152) 49152 else next;
+}
+
+/// TCP option-field bytes (4-aligned) for an outbound segment. Mirrors
+/// fillTcpSegment's layout — SYN: MSS+WS+TS+SACK-permitted; data/ACK: TS (if
+/// negotiated) + SACK blocks (if any, ACK only) — so sendSegment can run the
+/// Path-MTU gate BEFORE fillTcpSegment consumes SACK state (sack_block_count)
+/// that a PMTU bail would otherwise lose.
+pub fn segmentOptLen(is_syn: bool, ts_enabled: bool, sack_permitted: bool, sack_block_count: u8, has_ack: bool) u8 {
+    var opt_len: u8 = 0;
+    if (is_syn) {
+        opt_len = 4 + 3 + 10 + 2; // MSS + WS + TS + SACK-permitted
+    } else {
+        if (ts_enabled) opt_len += 10;
+        if (sack_permitted and sack_block_count > 0 and has_ack) {
+            opt_len += 2 + 8 * sack_block_count;
+        }
+    }
+    while (opt_len % 4 != 0) opt_len += 1;
+    return opt_len;
+}
+
+/// True when an IPv4 TCP 4-tuple matches (TIME_WAIT reuse / demux helper).
+/// Mirrors `tupleMatchV6`: the remote address must match, not just ports.
+pub fn tupleMatchV4(
+    local_port: u16,
+    remote_port: u16,
+    remote_ip: [4]u8,
+    cand_local: u16,
+    cand_remote: u16,
+    cand_ip: [4]u8,
+) bool {
+    return local_port == cand_local and remote_port == cand_remote and
+        @as(u32, @bitCast(remote_ip)) == @as(u32, @bitCast(cand_ip));
 }
 
 // ─── TCP checksum (IPv4 pseudo-header + segment), RFC 793 §3.1 ───────────────

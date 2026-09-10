@@ -9,6 +9,37 @@ const bo = @import("../lib/byte_order.zig");
 
 pub const HEADER_LEN: u16 = 8;
 
+// ─── Ephemeral port allocation policy (socket() auto-bind scan) ────────────
+
+/// First port in the inclusive range [first, last] not present in `occupied`.
+/// Returns null when every candidate is taken.
+pub fn firstFreePort(occupied: []const u16, first: u16, last: u16) ?u16 {
+    var port: u16 = first;
+    while (port <= last) : (port += 1) {
+        var taken = false;
+        for (occupied) |p| {
+            if (p == port) {
+                taken = true;
+                break;
+            }
+        }
+        if (!taken) return port;
+        if (port == last) break; // u16: avoid wrap past 65535
+    }
+    return null;
+}
+
+/// Decision for one probe of `udp.ensurePortExclusive` during the ephemeral
+/// scan: a registered slot means use the port, 0xFFFE means another socket
+/// owns it (keep scanning), 0xFFFF means the port table is full (give up).
+pub const ScanAction = enum { use, skip_in_use, abort_full };
+
+pub fn scanAction(ensure_result: u16) ScanAction {
+    if (ensure_result == 0xFFFE) return .skip_in_use;
+    if (ensure_result == 0xFFFF) return .abort_full;
+    return .use;
+}
+
 /// Parsed UDP header fields (payload length excludes the 8-byte header).
 pub const UdpHdr = struct {
     src_port: u16,

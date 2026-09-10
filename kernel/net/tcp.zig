@@ -163,7 +163,7 @@ const TcpTcb = struct {
     send_buf: [SEND_BUF_SIZE]u8,
     send_head: u32,
     send_tail: u32,
-    send_unacked: u32, // offset into ring of first unacked byte
+    send_unacked: u32, // ring offset of the next byte to send (tracks snd_nxt)
 
     // Receive buffer (ring buffer)
     recv_buf: [RECV_BUF_SIZE]u8,
@@ -639,8 +639,9 @@ fn findTcbByLocalPort(local_port: u16) ?*TcpTcb {
 
 fn allocEphemeralPort() u16 {
     const port = next_ephemeral_port;
-    next_ephemeral_port +|= 1;
-    if (next_ephemeral_port < 49152) next_ephemeral_port = 49152;
+    // Wrapping advance: saturating (+|=) would park at 65535 forever,
+    // aliasing every later connection's 4-tuple.
+    next_ephemeral_port = tcp_util.nextEphemeralPort(port);
     return port;
 }
 
@@ -696,6 +697,7 @@ fn ringDataLen(head: u32, tail: u32, size: u32) u32 {
 
 /// Write TCP header + options + payload at `tcp_off` (checksum field left 0).
 /// Shared by IPv4/IPv6 TX (SK-76). Returns the TCP segment length.
+/// The option layout is mirrored by tcp_util.segmentOptLen (PMTU pre-gate).
 fn fillTcpSegment(
     tcb: *TcpTcb,
     flags: u8,
@@ -945,9 +947,12 @@ fn sendSegmentSeq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16, 
     // Loopback segments also carry the 127/8 destination as source, so the
     // peer's replies stay on lo and both pseudo-headers agree.
     const our_ip = if (loopback) tcb.remote_ip else netif.getOurIp();
+    // SK-101/105: honor Path MTU (or armed oversized raise probe). The gate
+    // runs BEFORE fillTcpSegment, which consumes SACK state
+    // (sack_block_count) a PMTU bail would otherwise lose.
+    const opt_len = tcp_util.segmentOptLen((flags & SYN) != 0, tcb.ts_enabled, tcb.sack_permitted, tcb.sack_block_count, (flags & ACK) != 0);
+    if (ipv4.HEADER_LEN + 20 + @as(u16, opt_len) + data_len > ipv4.getSendMtu(tcb.remote_ip)) return false;
     const tcp_total = fillTcpSegment(tcb, flags, data, data_len, &send_pkt, tcp_off, seq_override);
-    // SK-101/105: honor Path MTU (or armed oversized raise probe).
-    if (ipv4.HEADER_LEN + tcp_total > ipv4.getSendMtu(tcb.remote_ip)) return false;
     const csum = tcpChecksum(our_ip, tcb.remote_ip, send_pkt[tcp_off..].ptr, tcp_total);
     bo.writeU16BeAt(&send_pkt, tcp_off + 16, csum);
     ipv4.buildHeader(send_pkt[14..].ptr, our_ip, tcb.remote_ip, ipv4.PROTO_TCP, tcp_total);
@@ -992,9 +997,12 @@ fn sendSegmentV6Seq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16
     var send_pkt: [1518]u8 = undefined;
     const tcp_off: u16 = 14 + ipv6.HEADER_LEN;
     @memset(send_pkt[0 .. tcp_off + 20], 0);
+    // SK-97/105: honor Path MTU (or armed oversized raise probe). The gate
+    // runs BEFORE fillTcpSegment, which consumes SACK state
+    // (sack_block_count) a PMTU bail would otherwise lose.
+    const opt_len = tcp_util.segmentOptLen((flags & SYN) != 0, tcb.ts_enabled, tcb.sack_permitted, tcb.sack_block_count, (flags & ACK) != 0);
+    if (ipv6.HEADER_LEN + 20 + @as(u16, opt_len) + data_len > ipv6.getSendMtu(tcb.remote_ip6)) return false;
     const tcp_total = fillTcpSegment(tcb, flags, data, data_len, &send_pkt, tcp_off, seq_override);
-    // SK-97/105: honor Path MTU (or armed oversized raise probe).
-    if (ipv6.HEADER_LEN + tcp_total > ipv6.getSendMtu(tcb.remote_ip6)) return false;
     const csum = tcpChecksumV6(our_ip, tcb.remote_ip6, send_pkt[tcp_off..].ptr, tcp_total);
     bo.writeU16BeAt(&send_pkt, tcp_off + 16, csum);
     ipv6.buildHeader(send_pkt[14..].ptr, our_ip, tcb.remote_ip6, ipv6.PROTO_TCP, tcp_total);
@@ -1661,8 +1669,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
         tw_bm &= tw_bm - 1;
         if (tcbs[i].state == .time_wait and
             !tcbs[i].is_v6 and
-            tcbs[i].local_port == dst_port and
-            tcbs[i].remote_port == src_port and
+            tcp_util.tupleMatchV4(dst_port, src_port, src_ip, tcbs[i].local_port, tcbs[i].remote_port, tcbs[i].remote_ip) and
             @as(u32, @bitCast(seq_num -% tcbs[i].irs)) > 0)
         {
             // Reuse this TIME_WAIT TCB
@@ -2011,7 +2018,11 @@ fn driveTcbStateMachine(
                         // v53.2: advance send_head to free acknowledged buffer space
                         // Without this, the ring buffer permanently fills → connection deadlock
                         tcb.send_head = (tcb.send_head + acked) % SEND_BUF_SIZE;
-                        tcb.send_unacked = (tcb.send_unacked + acked) % SEND_BUF_SIZE;
+                        // send_unacked must NOT advance here: it tracks snd_nxt's
+                        // ring position (send_head + (snd_nxt -% snd_una)) and an
+                        // ACK does not move snd_nxt. Advancing it desynced the
+                        // cursor — later flushes computed phantom pending bytes
+                        // and sent stale ring data under live sequence numbers.
                         tcb.retransmit_timer = 0;
                         tcb.retransmit_count = 0;
                         tcb.tlp_sent = false;
@@ -2418,7 +2429,7 @@ fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) void
     // v53.3: only advance rcv_nxt by actually buffered bytes
     // (if recv_buf is full, to_copy < len, so we don't skip unbuffered seq nums)
     tcb.rcv_nxt +%= to_copy;
-    tcb.rcv_wnd = TCP_WINDOW - ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
+    tcb.rcv_wnd = tcp_util.rcvWindowFromBuffered(ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE), TCP_WINDOW);
 
     // Delayed ACK: every-other-segment rule (disabled by TCP_QUICKACK)
     if (tcb.options.tcp_quickack) {
@@ -2675,8 +2686,17 @@ fn flushSendBuffer(tcb: *TcpTcb) void {
         // Collect data from ring buffer (batched @memcpy)
         var seg_buf: [TCP_MSS]u8 = undefined;
         ringRead(&tcb.send_buf, SEND_BUF_SIZE, tcb.send_unacked, &seg_buf, can_send);
-        tcb.send_unacked = (tcb.send_unacked + can_send) % SEND_BUF_SIZE;
-        _ = sendSegment(tcb, ACK | PSH, &seg_buf, @intCast(can_send));
+        // Commit the cursor only when the segment actually left: on TX failure
+        // sendSegment does not advance snd_nxt, and send_unacked must stay in
+        // lockstep (send_unacked == send_head + (snd_nxt -% snd_una)) or the
+        // next segment would carry payload belonging to a later sequence
+        // number and the skipped bytes could never be retransmitted.
+        const saved_unacked = tcb.send_unacked;
+        tcb.send_unacked = tcp_util.flushCommitCursor(saved_unacked, can_send, SEND_BUF_SIZE, true);
+        if (!sendSegment(tcb, ACK | PSH, &seg_buf, @intCast(can_send))) {
+            tcb.send_unacked = tcp_util.flushCommitCursor(saved_unacked, can_send, SEND_BUF_SIZE, false);
+            break;
+        }
         if (tcb.in_recovery) tcb.prr_out +%= can_send;
         tcb.last_pace_ms = timestampMs();
         // ACK piggybacked on data — clear any pending delayed ACK
@@ -2705,7 +2725,7 @@ pub fn tcpRecv(tcb_idx: u32, buf: [*]u8, len: u32) i64 {
     ringRead(&tcb.recv_buf, RECV_BUF_SIZE, tcb.recv_head, buf, to_read);
     tcb.recv_head = (tcb.recv_head + to_read) % RECV_BUF_SIZE;
 
-    tcb.rcv_wnd = TCP_WINDOW - ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
+    tcb.rcv_wnd = tcp_util.rcvWindowFromBuffered(ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE), TCP_WINDOW);
 
     // Flush delayed ACK when app reads data (advertises updated window promptly).
     // Also sends a window update if a significant amount was consumed.
