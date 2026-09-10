@@ -134,8 +134,11 @@
   入口接入 VM 锁；同时沿现有 API 能提供的精确生命周期边界，接通 task 创建、共享
   VM clone、exec 和 reap/exit 的 Mm 所有权。该阶段仍只是生命周期与锁基础设施，
   `process_vm_readv/writev` 继续保持 x86_64 self-only，不提供目标 task 查找、跨进程
-  访问或 CR3 切换。page fault/COW、swap、fork/clone、直接 driver/SHM unmap、
-  exec/reap teardown，以及权威 page provenance 尚未纳入；这些路径仍可能绕过
+  访问或 CR3 切换。page fault/COW 的三条缺页路径（COW/demand/文件映射）与
+  fork/clone COW 页表克隆已纳入 `Mm.vm_lock` 串行化（§6.43，含 vm_lock 等待方
+  服务化 TLB shootdown 的前置停机隐患修复）；swap（含 pmm.zig:315
+  swap-reclaim PTE 写入）、直接 driver/SHM unmap、exec/reap teardown，
+  以及权威 page provenance 尚未纳入；这些路径仍可能绕过
   `Mm.vmLock` 或缺少统一生命周期协议。未完成这些路径前，不得启用真正的跨进程
   HHDM read，只有在它们共享同一锁与生命周期协议后才可继续评审。当前 syscall
   仍保持最多 4096 字节的内核 staging，以及 partial-copy/`EFAULT` 边界。

@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-09-10 (§6.42: user-copy return-value governance closed — the ~80 `_ = copyToUser` discards from §5.2q verified already cleaned (grep zero-hit), the last 6 discarded `copyFromUser` results in mount/umount2/vmsplice/setitimer fault-checked, hello95 acceptance with pre-fix kernel-panic RED and SMP=1/2 GREEN; prior: 2026-09-09 §6.41 eventfd/timerfd raw-index-as-fd root fix + vfs read/write wiring with Linux semantics, hello93/hello94 acceptance, 282/282 host tests; 2026-09-07/08 §6.39-6.40 — 5-way audit, 28 defects TDD-fixed incl. mprotect COW TOCTOU, ipc reply handoff, TCP send-cursor invariant, all §6.39 follow-ups closed); earlier: 2026-08 (7-area full-repository audit round recorded in §6: memory-safety / concurrency / performance / userland fixes, SMP #GP root cause in TLB shootdown, all builds and SMP=1/SMP=4 smokes passed; earlier: 2026-07-28 full-repository audit — copy_file_range fd/rollback, socket option user-copy/SO_ERROR/sockaddr lengths, futex EFAULT/waitv limit, SysV IPC_SET/rt_sigsuspend copies, virtio-net/e1000 rollback/timeouts, hello38-41 regression gates)
+> Last update: 2026-09-10 (§6.43: page-fault PTE mutations serialized under Mm vm_lock — ServicingSpinlock prerequisite closes a pre-existing failShootdown halt hazard (vm_lock waiters now service pending TLB shootdowns while spinning IRQ-off), decideFault/beginFaultCritical guard handleCowFault/handleDemandPage/handleFileFault, fork/clone COW page-table clone guarded at call sites, 284/284 host tests + 3-arch builds + SMP=1/2 smoke + SMP=4×3 stress green; prior: 2026-09-10 §6.42 user-copy return-value governance closed — the ~80 `_ = copyToUser` discards from §5.2q verified already cleaned (grep zero-hit), the last 6 discarded `copyFromUser` results in mount/umount2/vmsplice/setitimer fault-checked, hello95 acceptance with pre-fix kernel-panic RED and SMP=1/2 GREEN; 2026-09-09 §6.41 eventfd/timerfd raw-index-as-fd root fix + vfs read/write wiring with Linux semantics, hello93/hello94 acceptance, 282/282 host tests; 2026-09-07/08 §6.39-6.40 — 5-way audit, 28 defects TDD-fixed incl. mprotect COW TOCTOU, ipc reply handoff, TCP send-cursor invariant, all §6.39 follow-ups closed); earlier: 2026-08 (7-area full-repository audit round recorded in §6: memory-safety / concurrency / performance / userland fixes, SMP #GP root cause in TLB shootdown, all builds and SMP=1/SMP=4 smokes passed; earlier: 2026-07-28 full-repository audit — copy_file_range fd/rollback, socket option user-copy/SO_ERROR/sockaddr lengths, futex EFAULT/waitv limit, SysV IPC_SET/rt_sigsuspend copies, virtio-net/e1000 rollback/timeouts, hello38-41 regression gates)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -2579,6 +2579,69 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 - **仍开放**：§5.2q 的 TOCTOU 窗口本身（页表走过后与拷贝之间的并发 unmap）
   不在本轮范围——x86_64 已有已知 RIP `rep movsb` 指令级故障恢复兜底
   （§5.2s），异常表/逐指令恢复的统一化仍按 next-phase-plan 记录保留。
+
+### 6.43 缺页路径 vm_lock 串行化（2026-09-10）：fault 侧 PTE 变更接入 Mm 锁 + shootdown 服务化自旋前置修复
+
+- **设计发现（前置修复证据）**：vm_lock 持有者在持锁（IrqSpinlock，IRQ 关闭）
+  期间同步等待远端 TLB shootdown 确认——mprotect 的 `shootdownRange`
+  （kernel/mm/mprotect.zig:229）与 munmap/mremap 的 unmapRange。远端 CPU 若以
+  IRQ 关闭状态自旋等待 vm_lock，便永远无法响应 shootdown IPI，发起方确认等待
+  超时后 `failShootdown` 直接停机（kernel/arch/x86_64/tlb.zig:85-91、:300-304）。
+  代码库此前已为 `TlbLock` 解决过同一问题：自旋时手动服务在途广播
+  （`servicePendingShootdown`，tlb.zig:185-212）。本轮把同一模式推广到
+  vm_lock 等待方——这是 fault 侧接入 vm_lock 的前置条件（fault handler 持
+  vm_lock 时同样会发起 shootdown 同步等待）。
+- **修复明细**：
+  - 前置（步骤 1）：新增 `kernel/sync/servicing_spinlock.zig`
+    （`ServicingSpinlock`）——自旋循环经 arch 门面调用
+    `arch.tlb.servicePendingShootdown()`（x86_64 tlb.zig 改为 pub；
+    riscv64/aarch64 为 no-op stub，镜像 mprotect.zig:10 经 `arch.tlb` 的接法）。
+    `Mm.vm_lock` 切换到该锁；`beginVmMutation`/`VmLockGuard` API 不变；
+    TlbLock 不重构。
+  - fault 侧策略（TDD 先红后绿）：`vm_lock_policy.decideFault(has_mm,
+    already_held_by_us)` → `{ no_mm, acquire, owned_by_us }`；`owned_by_us` =
+    不加锁直接继续（区别于 syscall 侧 `.recursive` 报错——fault 无法中途失败，
+    重入自旋锁会自死锁）。tests/main.zig 在既有 decide 测试旁新增 2 个测试
+    （基于 `mm.TestVmLockState`，mm.zig:143-157）。**RED**：编译错误
+    "root source file struct 'mm.vm_lock_policy' has no member named
+    'decideFault'"；**GREEN**：284/284（282 基线 + 2 新）。新增
+    `Mm.beginFaultCritical`：无 mm → 空 guard；vm_owner == 当前任务 → 空
+    guard + 一次性 WARN 日志（持 guard 期间发生 fault 按锁审计结论属 bug，
+    必须可观测）；否则服务化加锁并设置 vm_owner。fault 侧只经
+    `sched.currentTask()` 的 `.mm`（per-CPU 无锁，sched.zig:240-243）取
+    Mm——绝不在 vm_lock 下走 pinTaskMmByTid/task_lock（mm.zig:3-5 锁序）。
+  - idt.zig 守护点：`handleCowFault`（current/page_table_phys 检查之后，
+    覆盖 PTE 读、refcount、私拷贝提交、shootdownRange、decRef）；
+    `handleDemandPage`（null 检查后守护栈/代码 demand 主体，含 swap-in PTE
+    更新；文件映射委派保持在自身 guard 之外，因为 `handleFileFault` 自行
+    加锁，避免嵌套 owned_by_us 噪音）；`handleFileFault`（整个外体一个
+    guard：serveFilePage、区域元数据读、mapRawUserPte、fault-around 窗口；
+    明确包含后备磁盘 I/O——该 I/O 今天本就在 IF=0 下运行且存储路径为轮询；
+    两段式 read-then-commit 拆分记录在案为后续项）。**刻意不加锁**：
+    user-copy fixup 路径（idt.zig:625-635）与 SIGSEGV/exit 路径（:653-690，
+    进入调度器/task 锁，必须保持无 guard）。fault handler 经中断门进入即
+    IF=0（idt.zig:94），服务化自旋不引入新的 IRQ 纪律变化。
+  - fork/clone（第二个提交）：仅在 `cloneUserPagesCow`（kernel/proc/
+    fork.zig:27）与 `cloneUserPages`（kernel/arch/x86_64/clone.zig:254）调用
+    点包父任务 vm_lock guard——两者把父进程全部可写 PTE 改写为只读+COW，
+    不得与并发 mmap/munmap/mprotect/brk/mremap 或 CLONE_VM 兄弟线程的 fault
+    侧 PTE 写入竞争。`createUserProcess` 保持在 guard 外（其内部取
+    task_lock，vm_lock 下持 task_lock 违反锁序）；区域元数据继承为独立后续
+    项。mprotect 的 defer_to_fault 兜底保留（无害的双保险）。
+- **锁纪律不变量**（维持）：vm_lock → pmm.lock、vm_lock → shootdown_lock，
+  永不反向；vm_lock 下永不取 task_lock；任何 beginVmMutation 临界区内无
+  copyFromUser/copyToUser（已核实，保持）。
+- **本切片覆盖/未覆盖**：已覆盖——mmap/munmap/mprotect/brk/mremap（既有）+
+  fault 侧三条路径（COW/demand/文件映射）+ fork/clone COW 页表克隆。
+  未覆盖——swap-reclaim PTE 写入（kernel/mm/pmm.zig:315
+  `swap.reclaimPages`）、直接 driver/SHM unmap、exec/reap teardown、权威
+  page provenance、fork 区域元数据读取竞争（guard 只包页表克隆调用，
+  `&parent.mmap_regions` 的读取仍在 guard 外）。
+- **门禁**：`zig build test`（284/284）、`zig build` / `-Darch=riscv64` /
+  `-Darch=aarch64` 全绿、QEMU smoke SMP=1/SMP=2 PASS、SMP=4 压测连续 3 次
+  PASS（无 `[TLB] FATAL`、无内核停机、无 PMM 异常）。
+- **提交**：`cd41358`（步骤 1-3：服务化自旋 + fault 侧守护）、`06254cc`
+  （步骤 4：fork/clone COW 克隆守护）。
 
 ---
 
