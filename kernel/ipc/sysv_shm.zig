@@ -10,6 +10,7 @@ const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const fmt = @import("../lib/fmt.zig");
 const sched = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
+const Mm = @import("../mm/mm.zig").Mm;
 const shm_policy = @import("shm_policy.zig");
 const sysv_policy = @import("sysv_policy.zig");
 const tlb = @import("../arch/arch.zig").tlb;
@@ -250,6 +251,15 @@ pub fn shmget(key: i32, size: u64, shmflg: i32) i64 {
 /// shmat(shmid, shmaddr, shmflg) -> virtual address or -errno
 /// Maps shared memory into the current process's address space.
 pub fn shmat(shmid: u32, shmaddr: u64, shmflg: u64) i64 {
+    // Lock order vm_lock → shm_lock (mmap.zig munmap precedent): the PTE
+    // installs below must be serialised against fault-side writers and
+    // unmapRange on CLONE_VM-shared tables before shm_lock protects segment
+    // metadata.
+    const cur_idx = sched.currentTaskIndex() orelse return -1; // -EPERM
+    const task = task_mod.getTask(cur_idx) orelse return -1;
+    var vm_guard = Mm.beginVmMutation(task.mm, @ptrCast(task)) catch return -35; // -EDEADLK
+    defer vm_guard.release();
+
     const flags = shm_lock.acquire();
     defer shm_lock.release(flags);
 
@@ -265,8 +275,6 @@ pub fn shmat(shmid: u32, shmaddr: u64, shmflg: u64) i64 {
     if (shmflg & shm_policy.SHM_REMAP != 0) return -22; // -EINVAL
 
     // Get current process page table
-    const cur_idx = sched.currentTaskIndex() orelse return -1; // -EPERM
-    const task = task_mod.getTask(cur_idx) orelse return -1;
     const pml4 = task.page_table_phys;
     if (pml4 == 0) return -1; // kernel thread can't attach
 
@@ -390,13 +398,18 @@ pub fn hasAttachments(tid: u32) bool {
 /// shmdt(shmaddr) -> 0 or -errno
 /// Detaches shared memory from the current process.
 pub fn shmdt(shmaddr: u64) i64 {
+    // Lock order vm_lock → shm_lock: same as shmat — the unmaps below write
+    // PTEs of a possibly CLONE_VM-shared table.
+    const cur_idx = sched.currentTaskIndex() orelse return -1;
+    const task = task_mod.getTask(cur_idx) orelse return -1;
+    var vm_guard = Mm.beginVmMutation(task.mm, @ptrCast(task)) catch return -35; // -EDEADLK
+    defer vm_guard.release();
+
     const flags = shm_lock.acquire();
     defer shm_lock.release(flags);
 
     if (shmaddr == 0 or shmaddr & (PAGE_SIZE - 1) != 0) return -22; // -EINVAL
 
-    const cur_idx = sched.currentTaskIndex() orelse return -1;
-    const task = task_mod.getTask(cur_idx) orelse return -1;
     const pml4 = task.page_table_phys;
     if (pml4 == 0) return -1;
 

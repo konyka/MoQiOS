@@ -30,6 +30,7 @@ const mmap_mod = @import("../mm/mmap.zig");
 const cap_check = @import("../proc/cap_check.zig");
 const pmm = @import("../mm/pmm.zig");
 const dma = @import("../mm/dma.zig");
+const Mm = @import("../mm/mm.zig").Mm;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const serial = @import("../arch/arch.zig").serial;
 const fmt = @import("../lib/fmt.zig");
@@ -182,6 +183,11 @@ pub fn syscallDevMapMmio(phys: u64, size: u64) i64 {
     for (0..pages) |i| {
         if (pmm.isRamPhys(phys + i * 4096)) return errno.EACCES;
     }
+
+    // Serialise the MMIO PTE installs (and their rollback unmaps) against
+    // sibling fault/unmap writers on a CLONE_VM-shared table.
+    var vm_guard = Mm.beginVmMutation(cur.mm, @ptrCast(cur)) catch return errno.EDEADLK;
+    defer vm_guard.release();
 
     const base = mmap_mod.findFreeRangePub(cur, pages) orelse return errno.ENOMEM;
     if (!mmap_mod.canTrackRegionPub(cur, base, pages)) return errno.ENOMEM;
@@ -348,6 +354,16 @@ pub fn syscallDevDmaAlloc(size: u64, out_ptr: u64) i64 {
 
     const pages: u32 = @intCast((size + 4095) / 4096);
     const buf = dma.allocCoherent(size) orelse return errno.ENOMEM;
+
+    // Lock order vm_lock → dma_lock: the slot reservation below takes
+    // dma_lock while the PTE installs (and their rollback unmaps) must be
+    // serialised against sibling fault/unmap writers on a CLONE_VM-shared
+    // table.
+    var vm_guard = Mm.beginVmMutation(cur.mm, @ptrCast(cur)) catch {
+        dma.freeCoherent(buf);
+        return errno.EDEADLK;
+    };
+    defer vm_guard.release();
 
     const base = mmap_mod.findFreeRangePub(cur, pages) orelse {
         dma.freeCoherent(buf);

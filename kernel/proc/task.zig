@@ -243,6 +243,11 @@ pub const Task = struct {
 
     /// mmap region tracking — records all mmap'd address ranges for munmap.
     /// Each entry stores (base_addr, num_pages). Max 64 regions per process.
+    /// Invariant: the region table is per-task, single-writer — only the
+    /// owning task (as current) mutates it under its Mm's vm_lock. Readers
+    /// outside that guard are safe-by-construction: fork/clone read the
+    /// PARENT's table while the parent IS the current (guarded) task, so the
+    /// post-guard copies race nothing (see fork.zig).
     mmap_regions: [64]MmapRegion = [_]MmapRegion{.{}} ** 64,
     mmap_count: u32 = 0,
     mmap_active_bm: u64 = 0,
@@ -931,7 +936,13 @@ pub fn exitTask(exit_code: i32) void {
 
     // Detach any SysV SHM segments still attached (shmat without shmdt) —
     // otherwise attach_count leaks and IPC_RMID segments are never freed.
+    // The exiting task is still current here; guard the detach unmaps with
+    // its own vm_lock (vm_lock → shm_lock) so they serialise against sibling
+    // fault/unmap writers on a CLONE_VM-shared table. A Recursive/Dying
+    // failure falls back to the pre-guard behaviour (empty guard).
     if (t.page_table_phys != 0) {
+        var vm_guard = Mm.beginVmMutation(t.mm, @ptrCast(t)) catch Mm.VmLockGuard{};
+        defer vm_guard.release();
         @import("../ipc/sysv_shm.zig").detachAllForTask(t.tid, t.page_table_phys);
     }
 
@@ -1078,7 +1089,17 @@ pub fn reapZombies() u32 {
         if (t.page_table_phys != 0) {
             // L1: release user-driver resources (IRQ registrations, DMA
             // buffers, MMIO mappings) before the address space walk.
-            @import("../drivers/userdrv.zig").cleanupTask(t, t.page_table_phys);
+            // The dead task's space may still be shared by live CLONE_VM
+            // siblings, so its MMIO/DMA PTE unmaps run under the Mm's
+            // vm_lock. This is the sanctioned task_lock → vm_lock edge (see
+            // mm.zig's header): safe because vm_lock holders never wait on
+            // task_lock and ServicingSpinlock waiters service shootdowns
+            // while spinning. The Mm is still alive — it is released below.
+            {
+                var vm_guard = Mm.beginVmMutation(t.mm, @ptrCast(t)) catch Mm.VmLockGuard{};
+                defer vm_guard.release();
+                @import("../drivers/userdrv.zig").cleanupTask(t, t.page_table_phys);
+            }
             // P1: tombstone any userspace-owned devfs nodes (drains their
             // pending requests with -EIO).
             @import("../fs/devfs_proxy.zig").cleanupTask(t);
@@ -1446,7 +1467,17 @@ pub fn waitpidScanLocked(parent_idx: u32, pid: i32, status: *i32) WaitScan {
         if (t.page_table_phys != 0) {
             // L1: release user-driver resources (IRQ registrations, DMA
             // buffers, MMIO mappings) before the address space walk.
-            @import("../drivers/userdrv.zig").cleanupTask(t, t.page_table_phys);
+            // The dead task's space may still be shared by live CLONE_VM
+            // siblings, so its MMIO/DMA PTE unmaps run under the Mm's
+            // vm_lock. This is the sanctioned task_lock → vm_lock edge (see
+            // mm.zig's header): safe because vm_lock holders never wait on
+            // task_lock and ServicingSpinlock waiters service shootdowns
+            // while spinning. The Mm is still alive — it is released below.
+            {
+                var vm_guard = Mm.beginVmMutation(t.mm, @ptrCast(t)) catch Mm.VmLockGuard{};
+                defer vm_guard.release();
+                @import("../drivers/userdrv.zig").cleanupTask(t, t.page_table_phys);
+            }
             // P1: tombstone any userspace-owned devfs nodes (drains
             // their pending requests with -EIO).
             @import("../fs/devfs_proxy.zig").cleanupTask(t);

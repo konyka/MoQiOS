@@ -95,8 +95,16 @@ test "CLONE_VM child Mm reference balances after ownership transfer" {
 }
 
 test "threaded exec is rejected before address-space replacement" {
-    try std.testing.expectEqual(@as(i64, lifecycle_policy.EPERM), lifecycle_policy.execResult(true));
-    try std.testing.expectEqual(@as(i64, 0), lifecycle_policy.execResult(false));
+    try std.testing.expectEqual(@as(i64, lifecycle_policy.EPERM), lifecycle_policy.execResult(true, false));
+    try std.testing.expectEqual(@as(i64, 0), lifecycle_policy.execResult(false, false));
+}
+
+test "exec on a shared (CLONE_VM) address space is rejected" {
+    // A CLONE_VM sibling keeps running in the old address space while exec
+    // tears it down — reject exactly like the CLONE_THREAD case.
+    try std.testing.expectEqual(@as(i64, lifecycle_policy.EPERM), lifecycle_policy.execResult(false, true));
+    try std.testing.expectEqual(@as(i64, lifecycle_policy.EPERM), lifecycle_policy.execResult(true, true));
+    try std.testing.expectEqual(@as(i64, 0), lifecycle_policy.execResult(false, false));
 }
 
 test "Mm test state rejects underflow and double finalization" {

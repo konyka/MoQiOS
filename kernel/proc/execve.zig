@@ -5,13 +5,16 @@ const idt = @import("../arch/arch.zig").interrupts;
 const lifecycle_policy = @import("../mm/lifecycle_policy.zig");
 
 /// Stage 1 rejects exec from a CLONE_THREAD task because siblings still use
-/// the current address space. The syscall wrapper reports this as EPERM.
+/// the current address space. Also rejects exec on any shared (CLONE_VM,
+/// refs > 1) Mm: teardown would race siblings still running in it.
+/// The syscall wrapper reports this as EPERM.
 pub fn threadedExecDenied() bool {
     const sched = @import("sched.zig");
     const task_mod = @import("task.zig");
     const cur_idx = sched.currentTaskIndex() orelse return false;
     const cur = task_mod.getTask(cur_idx) orelse return false;
-    return lifecycle_policy.execResult(cur.is_thread) != 0;
+    const mm_shared = if (cur.mm) |m| m.isShared() else false;
+    return lifecycle_policy.execResult(cur.is_thread, mm_shared) != 0;
 }
 
 /// Prepare execve: load program, destroy old address space, set up new context.

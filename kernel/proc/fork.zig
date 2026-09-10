@@ -103,6 +103,10 @@ pub fn fork(frame: *SyscallFrame) i64 {
     // I1: cloneUserPagesCow demoted every huge block it met (the COW walk is
     // 4K-only), so neither side has huge pages anymore — clear the counts
     // before the child inherits the region table.
+    // Safe-by-construction outside the page-table guard: region tables are
+    // per-task and single-writer, and the parent IS the current task here —
+    // its own writes happen under its vm_lock, so these reads/copies race
+    // nothing (see the mmap_regions invariant in task.zig).
     for (&parent.mmap_regions) |*r| r.huge_pages = 0;
     child.mmap_regions = parent.mmap_regions;
     child.mmap_count = parent.mmap_count;

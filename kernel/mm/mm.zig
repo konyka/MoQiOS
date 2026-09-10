@@ -4,6 +4,13 @@
 //! lock before page-table or VMA mutation.  Never hold the VM lock across a
 //! blocking scheduler operation or acquire task_lock while holding it.
 //!
+//! The single sanctioned task_lock → vm_lock edge is the reap-side
+//! userdrv.cleanupTask guard (task.zig reapZombies/waitpidScanLocked): it
+//! serialises a dead task's MMIO/DMA PTE unmaps against siblings still
+//! sharing the live space. Safe because vm_lock holders never wait on
+//! task_lock, and ServicingSpinlock waiters service pending TLB shootdowns
+//! while spinning, so the edge cannot close a cycle.
+//!
 //! Swap reclaim (pmm.allocPage OOM path) enters through
 //! beginReclaimCritical: a non-blocking tryAcquire — never waiting — that
 //! proceeds unguarded when the current task already owns the lock (the
@@ -80,6 +87,13 @@ pub const Mm = struct {
         @import("slab.zig").kfree(self);
     }
 
+    /// True while more than one reference pins this address space (a CLONE_VM
+    /// sibling, an operation pin, or an in-flight VM guard). Consulted by
+    /// exec: replacing a shared address space races its other users.
+    pub fn isShared(self: *Mm) bool {
+        return self.refs.load(.acquire) > 1;
+    }
+
     pub fn vmLock(self: *Mm) u64 {
         return self.vm_lock.acquire();
     }
@@ -90,9 +104,11 @@ pub const Mm = struct {
 
     /// Stage 1 syscall mutation guard. The owner check prevents a same-task
     /// recursive IrqSpinlock deadlock. Fault-side PTE mutations use
-    /// beginFaultCritical instead, and fork/clone COW page-table cloning is
-    /// guarded at its call sites; exec/reap teardown and swap-reclaim PTE
-    /// writes remain next prerequisites for full vmLock coverage.
+    /// beginFaultCritical instead, fork/clone COW page-table cloning is
+    /// guarded at its call sites, swap reclaim uses the non-blocking
+    /// beginReclaimCritical, and the SysV SHM/user-driver/reap PTE paths are
+    /// guarded at their call sites. Full-vm_lock coverage of the remaining
+    /// exit/exec teardown walk stays a next prerequisite.
     pub fn beginVmMutation(mm: ?*Mm, owner: *const anyopaque) VmLockGuard.Error!VmLockGuard {
         const policy = @import("vm_lock_policy.zig");
         const address = @intFromPtr(owner);

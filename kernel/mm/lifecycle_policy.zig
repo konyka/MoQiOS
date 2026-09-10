@@ -10,6 +10,8 @@ pub fn cloneVmResult(flags: u64, parent_has_mm: bool) i64 {
 }
 
 /// Threaded tasks cannot replace an address space while siblings still run.
-pub fn execResult(is_thread: bool) i64 {
-    return if (is_thread) EPERM else 0;
+/// The same holds for a shared (CLONE_VM, refs > 1) Mm without CLONE_THREAD:
+/// exec teardown would race siblings still faulting/unmapping in it.
+pub fn execResult(is_thread: bool, mm_shared: bool) i64 {
+    return if (is_thread or mm_shared) EPERM else 0;
 }
