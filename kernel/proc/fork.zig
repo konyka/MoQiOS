@@ -24,7 +24,17 @@ pub fn fork(frame: *SyscallFrame) i64 {
     // nothing and leaks nothing. EAGAIN matches Linux.
     if (!task_mod.nprocPreflight(parent.uid, parent.nproc_cur)) return -11;
 
-    const child_pml4 = cloneUserPagesCow(parent.page_table_phys, &parent.mmap_regions) orelse return -1;
+    // Guard the COW page-table clone with the parent's vm_lock: it rewrites
+    // parent PTEs (read-only + COW) and must not race a concurrent
+    // mmap/munmap/mprotect/brk/mremap or a fault-side PTE mutation by a
+    // CLONE_VM sibling thread. Only the clone call itself is covered —
+    // createUserProcess takes task_lock (ordering violation under vm_lock)
+    // and region-table inheritance is a separate follow-up.
+    const child_pml4 = blk: {
+        var vm_guard = @import("../mm/mm.zig").Mm.beginVmMutation(parent.mm, @ptrCast(parent)) catch return -1;
+        defer vm_guard.release();
+        break :blk cloneUserPagesCow(parent.page_table_phys, &parent.mmap_regions) orelse return -1;
+    };
 
     const child_idx = task_mod.createUserProcess(
         parent.user_entry,

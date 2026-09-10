@@ -85,8 +85,9 @@ pub const Mm = struct {
 
     /// Stage 1 syscall mutation guard. The owner check prevents a same-task
     /// recursive IrqSpinlock deadlock. Fault-side PTE mutations use
-    /// beginFaultCritical instead; fork/clone COW page-table cloning and
-    /// exec/reap teardown remain next prerequisites for full vmLock coverage.
+    /// beginFaultCritical instead, and fork/clone COW page-table cloning is
+    /// guarded at its call sites; exec/reap teardown and swap-reclaim PTE
+    /// writes remain next prerequisites for full vmLock coverage.
     pub fn beginVmMutation(mm: ?*Mm, owner: *const anyopaque) VmLockGuard.Error!VmLockGuard {
         const policy = @import("vm_lock_policy.zig");
         const address = @intFromPtr(owner);

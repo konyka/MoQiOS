@@ -251,7 +251,16 @@ pub fn clone(
     const child_pml4 = if (shares_vm)
         parent.page_table_phys
     else
-        cloneUserPages(parent.page_table_phys) orelse return -12; // ENOMEM
+        // Guard the COW page-table clone with the parent's vm_lock: it
+        // rewrites parent PTEs and must not race concurrent VM mutations or
+        // fault-side PTE writes. Scope is deliberately limited to the clone
+        // call — createUserProcess takes task_lock (ordering violation under
+        // vm_lock); region-metadata inheritance stays a follow-up.
+        clone: {
+            var vm_guard = @import("../../mm/mm.zig").Mm.beginVmMutation(parent.mm, @ptrCast(parent)) catch return -12; // ENOMEM
+            defer vm_guard.release();
+            break :clone cloneUserPages(parent.page_table_phys) orelse return -12; // ENOMEM
+        };
 
     if (shares_vm) {
         if (parent.mm) |parent_mm| {
