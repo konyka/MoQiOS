@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-09-10 (§6.43: page-fault PTE mutations serialized under Mm vm_lock — ServicingSpinlock prerequisite closes a pre-existing failShootdown halt hazard (vm_lock waiters now service pending TLB shootdowns while spinning IRQ-off), decideFault/beginFaultCritical guard handleCowFault/handleDemandPage/handleFileFault, fork/clone COW page-table clone guarded at call sites, 284/284 host tests + 3-arch builds + SMP=1/2 smoke + SMP=4×3 stress green; prior: 2026-09-10 §6.42 user-copy return-value governance closed — the ~80 `_ = copyToUser` discards from §5.2q verified already cleaned (grep zero-hit), the last 6 discarded `copyFromUser` results in mount/umount2/vmsplice/setitimer fault-checked, hello95 acceptance with pre-fix kernel-panic RED and SMP=1/2 GREEN; 2026-09-09 §6.41 eventfd/timerfd raw-index-as-fd root fix + vfs read/write wiring with Linux semantics, hello93/hello94 acceptance, 282/282 host tests; 2026-09-07/08 §6.39-6.40 — 5-way audit, 28 defects TDD-fixed incl. mprotect COW TOCTOU, ipc reply handoff, TCP send-cursor invariant, all §6.39 follow-ups closed); earlier: 2026-08 (7-area full-repository audit round recorded in §6: memory-safety / concurrency / performance / userland fixes, SMP #GP root cause in TLB shootdown, all builds and SMP=1/SMP=4 smokes passed; earlier: 2026-07-28 full-repository audit — copy_file_range fd/rollback, socket option user-copy/SO_ERROR/sockaddr lengths, futex EFAULT/waitv limit, SysV IPC_SET/rt_sigsuspend copies, virtio-net/e1000 rollback/timeouts, hello38-41 regression gates)
+> Last update: 2026-09-10 (§6.44: vm_lock coverage extended — swap-reclaim two-pass PTE writes under the non-blocking recursion-safe beginReclaimCritical guard (tryAcquire never waits, contention skips, fault→swapIn→allocPage recursion proceeds unguarded), SysV SHM shmat/shmdt/exit-detach and user-driver MMIO/DMA map/unmap plus reap-side cleanupTask under vm_lock (single sanctioned task_lock→vm_lock edge, cycle-freedom re-verified), shared-Mm (refs>1) exec rejected with EPERM, fork region-metadata residual closed as safe-by-construction; swap dynamic exercise remains a BLOCKED follow-up (no swapon caller; hardwired dev0/LBA0); 287/287 host tests + 3-arch builds + SMP=1/2 smoke + SMP=4×3 stress green; prior: 2026-09-10 §6.43: page-fault PTE mutations serialized under Mm vm_lock — ServicingSpinlock prerequisite closes a pre-existing failShootdown halt hazard (vm_lock waiters now service pending TLB shootdowns while spinning IRQ-off), decideFault/beginFaultCritical guard handleCowFault/handleDemandPage/handleFileFault, fork/clone COW page-table clone guarded at call sites, 284/284 host tests + 3-arch builds + SMP=1/2 smoke + SMP=4×3 stress green; prior: 2026-09-10 §6.42 user-copy return-value governance closed — the ~80 `_ = copyToUser` discards from §5.2q verified already cleaned (grep zero-hit), the last 6 discarded `copyFromUser` results in mount/umount2/vmsplice/setitimer fault-checked, hello95 acceptance with pre-fix kernel-panic RED and SMP=1/2 GREEN; 2026-09-09 §6.41 eventfd/timerfd raw-index-as-fd root fix + vfs read/write wiring with Linux semantics, hello93/hello94 acceptance, 282/282 host tests; 2026-09-07/08 §6.39-6.40 — 5-way audit, 28 defects TDD-fixed incl. mprotect COW TOCTOU, ipc reply handoff, TCP send-cursor invariant, all §6.39 follow-ups closed); earlier: 2026-08 (7-area full-repository audit round recorded in §6: memory-safety / concurrency / performance / userland fixes, SMP #GP root cause in TLB shootdown, all builds and SMP=1/SMP=4 smokes passed; earlier: 2026-07-28 full-repository audit — copy_file_range fd/rollback, socket option user-copy/SO_ERROR/sockaddr lengths, futex EFAULT/waitv limit, SysV IPC_SET/rt_sigsuspend copies, virtio-net/e1000 rollback/timeouts, hello38-41 regression gates)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -2642,6 +2642,73 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   PASS（无 `[TLB] FATAL`、无内核停机、无 PMM 异常）。
 - **提交**：`cd41358`（步骤 1-3：服务化自旋 + fault 侧守护）、`06254cc`
   （步骤 4：fork/clone COW 克隆守护）。
+
+### 6.44 vm_lock 覆盖扩展（2026-09-10）：swap-reclaim 非阻塞守护 + SHM/driver/reap PTE 路径 + 共享 Mm exec 拒绝
+
+- **设计修正**（只读设计轮核对 §6.43 残留清单时的两处更正）：
+  - swap-reclaim 从未在 pmm.lock 下运行：`allocPage`（kernel/mm/pmm.zig:297-327）
+    先释放 pmm.lock、再经 `in_swap_reclaim` CAS 进入 reclaim——"reclaim 持
+    pmm.lock 写 PTE"的担忧不成立，真实缺口只有 vm_lock 本身。
+  - reclaim 是 self-targeting：pmm.zig:320 经 `sched.currentTask()` 只扫描
+    当前任务自己的页表（`t.mm`），不存在跨任务扫描他人页表的生命周期问题；
+    竞态对手是同一 Mm 的 CLONE_VM 兄弟（fault 路径）与 unmapRange。
+- **修复明细**：
+  - A. swap reclaim 纳入 vm_lock（非阻塞、递归安全）。`allocPage` 的 OOM 路径
+    在持与不持 vm_lock 两种情形下都会到达 reclaim（fault → swapIn →
+    allocPage 递归时当前任务已持有 vm_lock），因此守护必须永不等待：
+    `ServicingSpinlock.tryAcquire`（kernel/sync/servicing_spinlock.zig:50，
+    单次原子 Xchg，保持 IRQ save/restore 契约，争用返回 null）；纯策略
+    `vm_lock_policy.decideReclaim`（kernel/mm/vm_lock_policy.zig:44）→
+    `{no_mm, owned_by_us, acquired, skip}`；`Mm.beginReclaimCritical`
+    （kernel/mm/mm.zig:198）——vm_owner == 当前任务时不加锁直接继续
+    （合法递归，区别于 beginFaultCritical 不记 WARN），否则 tryAcquire，
+    争用返回 null 使 reclaim 整体跳过（reclaim 本就是 best-effort，调用方
+    均可容忍 0 页）；retain 仅为平衡 guard 释放（同 beginFaultCritical
+    论证）。`swap.reclaimPages`/`reclaimScanPass` 改收 `*Mm`（取
+    `mm.page_table_phys`，swap.zig:222/247），两趟扫描整体包在 guard 内；
+    swapOut/swapIn 签名不变。pmm.zig:320 调用点改传 `t.mm`，`t.mm == null`
+    或 `page_table_phys == 0` 时跳过；`in_swap_reclaim` CAS 与 32 页目标
+    保持，x86-only comptime 门保持。无死锁论证：tryAcquire 永不等待；
+    vm_lock → {swap_lock, pmm.lock, shootdown_lock, blk 锁} 的外向边均已
+    存在；ServicingSpinlock 等待方自旋时服务 shootdown。
+  - B. SysV SHM 与 user-driver PTE 路径纳入 vm_lock，规范锁序
+    `vm_lock → shm_lock` / `vm_lock → dma_lock`（沿用 mmap.zig munmap →
+    overlapsAttachment 的既有先例）：shmat（sysv_shm.zig:253）与 shmdt
+    （:400）把 `Mm.beginVmMutation` 提升到 `shm_lock.acquire` 之上；
+    exitTask 的 `detachAllForTask` 调用点（task.zig:944，退出任务即当前
+    任务）同样守护；userdrv.zig 在 `syscallDevMapMmio`（:172）与
+    `syscallDevDmaAlloc` 映射入口（:345）加 guard，覆盖槽位预留、PTE
+    安装与回滚 unmap。reap 侧 `cleanupTask`（task.zig:1099 与 :1477，
+    reapZombies/waitpidScanLocked 内、task_lock 下）包
+    `beginVmMutation(t.mm, t)`：死亡任务的 MMIO/DMA PTE 解除映射否则与
+    仍共享该活空间的 CLONE_VM 兄弟竞争；Mm 此刻仍存活（释放在其后）。
+  - C. 共享 Mm 的 exec 拒绝：`lifecycle_policy.execResult`（lifecycle_policy.zig:15）
+    增加 `mm_shared` 形参，Mm refs > 1 时同 CLONE_THREAD 一样返回 EPERM；
+    execve.zig:16 经新增的 `Mm.isShared`（mm.zig:93）查询。此前
+    CLONE_VM-without-CLONE_THREAD 的 exec 会让 teardown 与兄弟任务并发。
+    预期用户可见变化 ≈ 0（pthread 风格 CLONE_VM|CLONE_THREAD 本就已被拒）。
+  - D. fork/clone 区域元数据读取（fork.zig:102-116、clone.zig 对应继承点）
+    确认为 construction-safe 并闭合该残留：区域表 per-task、单写者（owning
+    任务作为 current 在自身 vm_lock 下写）；fork 中父任务即当前任务，guard
+    之后的拷贝不与任何写者竞争。不变量注释落在 task.zig 的 mmap_regions
+    声明处与 fork.zig 继承拷贝处（仅注释，无代码变更）。
+- **新承认的锁边 task_lock → vm_lock**（仅 reap 侧 cleanupTask 守护）：安全性
+  在于 vm_lock 持有方永不等待 task_lock（mm.zig 头部锁序不变量维持），且
+  ServicingSpinlock 等待方自旋时服务在途 TLB shootdown，故此边无法成环。
+  已按边表复查无环：shm_lock/dma_lock/irq_lock 临界区内均不取 vm_lock 或
+  task_lock；vm_lock → shm_lock / vm_lock → dma_lock 与 mmap.zig:1009 先例
+  同向。该边已记录在 mm.zig 头部注释。
+- **覆盖缺口（如实声明）**：swap 今天无动态可执行路径——没有任何用户测试
+  调用 swapon，且 swapon 硬接线到 dev0/LBA0；reclaim guard 的正确性由
+  host 纯策略测试 + 编译 + SMP 压测（不触发 swap）间接覆盖，缺少真实的
+  swap 压力回归。swap-exercising 压测是 BLOCKED 后续项，需先做
+  swapon-to-scratch-device 基建，本切片不实现。
+- **门禁**：`zig build test` 287/287（284 基线 + 2 decideReclaim + 1
+  execResult 共享拒绝；两轮 RED 均为编译错误——缺 `decideReclaim` 成员 /
+  `execResult` 参数个数不符）；`zig build` / `-Darch=riscv64` /
+  `-Darch=aarch64` 全绿；QEMU smoke SMP=1、SMP=2 PASS；SMP=4 压测连续
+  3 次 PASS，串口日志无 `[TLB] FATAL`、无 `[PMM] BUG`、无停机。
+- **提交**：`1c834a0`（A：reclaim 守护）、`291e17c`（B+C+D 注释）。
 
 ---
 

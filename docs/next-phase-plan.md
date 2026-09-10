@@ -136,11 +136,21 @@
   `process_vm_readv/writev` 继续保持 x86_64 self-only，不提供目标 task 查找、跨进程
   访问或 CR3 切换。page fault/COW 的三条缺页路径（COW/demand/文件映射）与
   fork/clone COW 页表克隆已纳入 `Mm.vm_lock` 串行化（§6.43，含 vm_lock 等待方
-  服务化 TLB shootdown 的前置停机隐患修复）；swap（含 pmm.zig:315
-  swap-reclaim PTE 写入）、直接 driver/SHM unmap、exec/reap teardown，
-  以及权威 page provenance 尚未纳入；这些路径仍可能绕过
-  `Mm.vmLock` 或缺少统一生命周期协议。未完成这些路径前，不得启用真正的跨进程
-  HHDM read，只有在它们共享同一锁与生命周期协议后才可继续评审。当前 syscall
+  服务化 TLB shootdown 的前置停机隐患修复）；swap-reclaim 两趟扫描的 PTE
+  写入（Accessed 清除 + swapOut swap-entry 安装）已接入非阻塞
+  `beginReclaimCritical`（§6.44，pmm.zig OOM 路径改传 `t.mm`），SysV SHM
+  shmat/shmdt/exit-detach 与 user-driver MMIO/DMA 的映射/解除映射（含 reap
+  侧 cleanupTask，承认的 task_lock → vm_lock 边）已纳入 vm_lock，共享 Mm
+  （refs > 1）的 exec 现被 EPERM 拒绝。exec/reap 仅部分覆盖：上述 PTE
+  写入路径已串行化，但 exit/reap 的地址空间整体 teardown 走查
+  （destroyUserSpace/finalDestroy）仍在统一锁之外。剩余：reclaim 写回的
+  两阶段化（scan-then-commit——当前 swapOut 在持 vm_lock 下同步写回块
+  设备）、cleanupTask 的 exit/reap 拆分（退出时自清理 vs reap 时跨任务
+  清理的所有权边界）、CLONE_VM 兄弟间 per-task 区域表（mmap_regions）
+  发散的权威化、mlock 锁定页与 reclaim 扫描的交互缺口（mlock 区域目前
+  对 reclaim 不可见）。权威 page provenance 尚未纳入；未完成这些路径前，
+  不得启用真正的跨进程 HHDM read，只有在它们共享同一锁与生命周期协议后
+  才可继续评审。当前 syscall
   仍保持最多 4096 字节的内核 staging，以及 partial-copy/`EFAULT` 边界。
   本阶段验收门禁：host tests、ReleaseSafe、x86 smoke/SMP，以及并发性评审。
   riscv64/aarch64 仍是移植骨架，未纳入该 syscall 覆盖。
