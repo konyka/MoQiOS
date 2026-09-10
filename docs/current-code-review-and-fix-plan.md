@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-09-09 (§6.41: eventfd/timerfd raw-index-as-fd root fix + vfs read/write wiring with Linux semantics, hello93/hello94 acceptance in SMP=1/2 smokes, 282/282 host tests; prior: 2026-09-07/08 §6.39-6.40 — 5-way audit, 28 defects TDD-fixed incl. mprotect COW TOCTOU, ipc reply handoff, TCP send-cursor invariant, all §6.39 follow-ups closed); earlier: 2026-08 (7-area full-repository audit round recorded in §6: memory-safety / concurrency / performance / userland fixes, SMP #GP root cause in TLB shootdown, all builds and SMP=1/SMP=4 smokes passed; earlier: 2026-07-28 full-repository audit — copy_file_range fd/rollback, socket option user-copy/SO_ERROR/sockaddr lengths, futex EFAULT/waitv limit, SysV IPC_SET/rt_sigsuspend copies, virtio-net/e1000 rollback/timeouts, hello38-41 regression gates)
+> Last update: 2026-09-10 (§6.42: user-copy return-value governance closed — the ~80 `_ = copyToUser` discards from §5.2q verified already cleaned (grep zero-hit), the last 6 discarded `copyFromUser` results in mount/umount2/vmsplice/setitimer fault-checked, hello95 acceptance with pre-fix kernel-panic RED and SMP=1/2 GREEN; prior: 2026-09-09 §6.41 eventfd/timerfd raw-index-as-fd root fix + vfs read/write wiring with Linux semantics, hello93/hello94 acceptance, 282/282 host tests; 2026-09-07/08 §6.39-6.40 — 5-way audit, 28 defects TDD-fixed incl. mprotect COW TOCTOU, ipc reply handoff, TCP send-cursor invariant, all §6.39 follow-ups closed); earlier: 2026-08 (7-area full-repository audit round recorded in §6: memory-safety / concurrency / performance / userland fixes, SMP #GP root cause in TLB shootdown, all builds and SMP=1/SMP=4 smokes passed; earlier: 2026-07-28 full-repository audit — copy_file_range fd/rollback, socket option user-copy/SO_ERROR/sockaddr lengths, futex EFAULT/waitv limit, SysV IPC_SET/rt_sigsuspend copies, virtio-net/e1000 rollback/timeouts, hello38-41 regression gates)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -2537,6 +2537,48 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   有界轮询重读后 SMP=2 两连跑稳定。
 - **门禁**：`zig build test`（282/282）、`zig build`、riscv64/aarch64 构建、
   QEMU smoke SMP=1、SMP=2 全绿（hello93/hello94 标记均在）。
+
+### 6.42 用户拷贝返回值治理收口（2026-09-10）：最后 6 处丢弃的 copyFromUser 结果
+
+- **P3 存量核实**：§5.2q 记录的 ~80 处 `_ = copyToUser(...)` 丢弃已由此前各轮
+  分批清理完毕——全仓 grep `_ = copyToUser` / `_ = copy.copyToUser` 零命中
+  （sysinfo/uname 等站点现为 `== N else -14` 式检查）。真正剩余的只有
+  `kernel/arch/x86_64/syscall_entry.zig` 中 6 处 `_ = copy.copyFromUser(...)`，
+  本轮全部修复，grep 残渣归零。
+- **修复明细**（均为最小 diff，硬编码 -14 与文件惯例一致；字符串拷贝遵循
+  `syscallNameToHandleAt` 的 copied==0 → -14 约定，短拷贝合法——页边界处的
+  合法短字符串本就该短拷贝）：
+  - `syscallMount`（:4572/:4575/:4577）：target 强制——copied==0 → -14；
+    source/fstype 可选——非空且在用户范围内的指针 copied==0 → -14（Linux 语义：
+    坏非空指针即 EFAULT；空指针跳过拷贝）。
+  - `syscallUmount2`（:4593）：target 强制，copied==0 → -14。
+  - `syscallVmsplice`（:4725）：**本轮真正的 bug**——`iov_buf` 为
+    `undefined` 栈缓冲区且拷贝结果被丢弃，拷贝失败时垃圾 base/len 会被当作
+    用户地址继续解析。修复为 `< 16` 时 `return if (total > 0) total else -14`
+    （对齐 Linux vmsplice 部分 I/O 语义：已 splice 的段返回其字节数，否则
+    EFAULT）。
+  - `syscallSetitimer`（:5672）：同样是 `undefined` 缓冲区——拷贝失败会把
+    垃圾定时器值武装到当前任务。修复为 `< 32` → -14。
+- **验收（TDD 先红后绿）**：新增 `user/hello95.c`（raw syscall，坏指针统一用
+  hello40/hello92 的 mmap+munmap 未映射页手法）：vmsplice 未映射 iov → -14
+  及合法 iov 写读回环、setitimer 坏 new_value → -14（随后立即以零值解除
+  预修复内核可能武装的垃圾定时器）及合法零值解除、umount2 坏 target → -14、
+  mount 坏 target/source/fstype → -14、mount/umount2 合法指针往返。
+  hello95 经 `capability_profile.zig` 授予 cap_sys_mount（mount 分发有能力
+  检查）。接线：build.zig C 程序表、qemu_run.sh ramdisk 清单、init 自动
+  测试、qemu_smoke.sh FAIL/PASS/done 标记。**RED**（修复前）：vmsplice 坏
+  iov 返回 0 而非 -14，垃圾 iov 写入管道腐蚀管道状态，后续 pipe read 在内核
+  `syscallRead` 触发 "integer does not fit in destination type" panic——正是
+  未初始化缓冲区危害的实机演示。**GREEN**：SMP=1/SMP=2 smoke 全绿，
+  `hello95: PASS` / `hello95 done` 标记均在。测试自身一度踩坑：内核 pipe
+  写入两个 u32 fd，测试须用 `int32_t pipe_fds[2]`（int64_t 会把读写端拼成
+  一个值）。
+- **门禁**：`zig build test`（282/282）、`zig build`、`zig build
+  -Darch=riscv64`、`zig build -Darch=aarch64`、QEMU smoke SMP=1 与 SMP=2
+  全绿。
+- **仍开放**：§5.2q 的 TOCTOU 窗口本身（页表走过后与拷贝之间的并发 unmap）
+  不在本轮范围——x86_64 已有已知 RIP `rep movsb` 指令级故障恢复兜底
+  （§5.2s），异常表/逐指令恢复的统一化仍按 next-phase-plan 记录保留。
 
 ---
 
