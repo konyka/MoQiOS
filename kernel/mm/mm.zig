@@ -4,6 +4,11 @@
 //! lock before page-table or VMA mutation.  Never hold the VM lock across a
 //! blocking scheduler operation or acquire task_lock while holding it.
 //!
+//! Swap reclaim (pmm.allocPage OOM path) enters through
+//! beginReclaimCritical: a non-blocking tryAcquire — never waiting — that
+//! proceeds unguarded when the current task already owns the lock (the
+//! fault → swapIn → allocPage recursion) and skips on contention.
+//!
 //! Stage 1 deliberately does not select another task's Mm or switch CR3;
 //! process_vm remains self-only. Existing raw-root mapping callers are kept
 //! for compatibility and must migrate to vmLock in the cross-process stage.
@@ -157,6 +162,40 @@ pub const Mm = struct {
         // ever did, proceeding unguarded matches the pre-guard behaviour.
         if (!target.retain()) return .{};
         const flags = target.vmLock();
+        target.vm_owner.store(address, .release);
+        return .{ .mm = target, .flags = flags, .owner = address };
+    }
+
+    /// Reclaim-side VM mutation guard for swap reclaim.
+    ///
+    /// pmm.allocPage's OOM path reaches reclaim both with and without
+    /// vm_lock held, so this guard is recursion-safe and NEVER blocks:
+    ///   - vm_owner == owner (the fault → swapIn → allocPage recursion, a
+    ///     legitimate re-entry): proceed WITHOUT acquiring — unlike
+    ///     beginFaultCritical this is expected, so no WARN.
+    ///   - otherwise a single tryAcquire; on contention return null and the
+    ///     caller skips reclaim entirely (reclaim is best-effort; all
+    ///     callers handle null).
+    /// The retain only balances VmLockGuard.release (same argument as
+    /// beginFaultCritical): the current task's own reference keeps the Mm
+    /// alive for the scan.
+    pub fn beginReclaimCritical(mm: ?*Mm, owner: *const anyopaque) ?VmLockGuard {
+        const policy = @import("vm_lock_policy.zig");
+        const address = @intFromPtr(owner);
+        const target = mm orelse return null;
+        const owned_by_us = target.vm_owner.load(.acquire) == address;
+        const try_flags: ?u64 = if (owned_by_us) null else target.vm_lock.tryAcquire();
+        switch (policy.decideReclaim(true, owned_by_us, try_flags != null)) {
+            .no_mm => unreachable, // target non-null above
+            .owned_by_us => return .{},
+            .skip => return null,
+            .acquired => {},
+        }
+        const flags = try_flags.?;
+        if (!target.retain()) {
+            target.vmUnlock(flags);
+            return null;
+        }
         target.vm_owner.store(address, .release);
         return .{ .mm = target, .flags = flags, .owner = address };
     }

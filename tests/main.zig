@@ -179,6 +179,42 @@ test "fault-side guard semantics on TestVmLockState: owned_by_us never re-acquir
     }
     try std.testing.expect(lock.release());
 }
+
+test "reclaim VM lock policy: no Mm, owned-by-us recursion, acquire-or-skip" {
+    // No address space: reclaim has nothing to scan.
+    try std.testing.expectEqual(vm_lock_policy.ReclaimDecision.no_mm, vm_lock_policy.decideReclaim(false, false, false));
+    try std.testing.expectEqual(vm_lock_policy.ReclaimDecision.no_mm, vm_lock_policy.decideReclaim(false, true, false));
+    // The current task already owns vm_lock (fault → swapIn → allocPage
+    // recursion): proceed WITHOUT re-acquiring — legitimate recursion.
+    try std.testing.expectEqual(vm_lock_policy.ReclaimDecision.owned_by_us, vm_lock_policy.decideReclaim(true, true, false));
+    try std.testing.expectEqual(vm_lock_policy.ReclaimDecision.owned_by_us, vm_lock_policy.decideReclaim(true, true, true));
+    // Not owned by us: a successful non-blocking try acquires; contention
+    // skips (reclaim is best-effort — it must never wait on vm_lock).
+    try std.testing.expectEqual(vm_lock_policy.ReclaimDecision.acquired, vm_lock_policy.decideReclaim(true, false, true));
+    try std.testing.expectEqual(vm_lock_policy.ReclaimDecision.skip, vm_lock_policy.decideReclaim(true, false, false));
+}
+
+test "reclaim guard semantics on TestVmLockState: contention skips, never blocks" {
+    var lock: mm.TestVmLockState = .{};
+    // .acquired decision takes the lock.
+    switch (vm_lock_policy.decideReclaim(true, false, lock.acquire())) {
+        .acquired => {},
+        else => return error.TestUnexpectedResult,
+    }
+    // A contended try fails and the policy decides .skip — the scan is
+    // abandoned rather than spinning on a held lock.
+    try std.testing.expect(!lock.acquire());
+    switch (vm_lock_policy.decideReclaim(true, false, false)) {
+        .skip => {},
+        else => return error.TestUnexpectedResult,
+    }
+    // .owned_by_us proceeds WITHOUT acquiring (would deadlock/fail otherwise).
+    switch (vm_lock_policy.decideReclaim(true, true, false)) {
+        .owned_by_us => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(lock.release());
+}
 const shm_policy = kt.shm_policy;
 const cow_pte = kt.cow_pte;
 const map_fixed = kt.map_fixed;

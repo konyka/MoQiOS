@@ -41,4 +41,18 @@ pub const ServicingSpinlock = struct {
         @atomicStore(u32, &self.locked, 0, .release);
         arch.irq.restore(saved);
     }
+
+    /// Non-blocking acquire: a single atomic Xchg attempt. Returns the saved
+    /// IRQ flags on success (release with `release`), or null on contention —
+    /// IRQ state is restored before returning null, so the caller's interrupt
+    /// state is exactly as it entered. Used by best-effort paths (swap
+    /// reclaim) that must never wait on vm_lock.
+    pub inline fn tryAcquire(self: *ServicingSpinlock) ?u64 {
+        const saved = arch.irq.saveAndDisable();
+        if (@atomicRmw(u32, &self.locked, .Xchg, 1, .acquire) != 0) {
+            arch.irq.restore(saved);
+            return null;
+        }
+        return saved;
+    }
 };

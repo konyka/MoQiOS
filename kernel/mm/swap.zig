@@ -20,6 +20,7 @@ const serial = @import("../arch/arch.zig").serial;
 const tlb = @import("../arch/arch.zig").tlb;
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
+const Mm = @import("../mm/mm.zig").Mm;
 const idt = @import("../arch/arch.zig").interrupts;
 const block_dev = @import("../drivers/block_dev.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
@@ -211,14 +212,24 @@ pub fn swapIn(pte_val: u64) ?u64 {
 /// v53.11: Uses clock_hand for persistent scan position — distributes swap pressure across address space.
 /// v53.14: Two-pass scan — pass 1 clears Accessed bits (second chance), pass 2 swaps
 /// pages whose Accessed bits were cleared. Prevents OOM when working set is large.
-pub fn reclaimPages(pml4_phys: u64, target: u32) u32 {
+///
+/// The whole two-pass scan runs under `mm`'s vm_lock: the PTE writes below
+/// (Accessed-clear in reclaimScanPass, swap-entry install in swapOut)
+/// otherwise race sibling fault handlers and unmapRange on CLONE_VM-shared
+/// page tables. The guard is non-blocking (beginReclaimCritical): contention
+/// skips the scan, and the fault → swapIn → allocPage recursion proceeds
+/// unguarded under the lock the current task already holds.
+pub fn reclaimPages(mm: *Mm, owner: *const anyopaque, target: u32) u32 {
     if (!swap_enabled) return 0;
+
+    var guard = Mm.beginReclaimCritical(mm, owner) orelse return 0;
+    defer guard.release();
 
     var swapped: u32 = 0;
 
     var pass: u32 = 0;
     while (pass < 2 and swapped < target) : (pass += 1) {
-        swapped += reclaimScanPass(pml4_phys, target - swapped);
+        swapped += reclaimScanPass(mm, target - swapped);
     }
 
     if (swapped > 0) {
@@ -232,7 +243,9 @@ pub fn reclaimPages(pml4_phys: u64, target: u32) u32 {
 
 /// Single-pass scan for reclaimable pages.
 /// v53.13: MAX_PTE_SCAN limits total PTEs scanned per pass to avoid blocking allocPage caller.
-fn reclaimScanPass(pml4_phys: u64, target: u32) u32 {
+/// Caller must hold `mm`'s vm_lock (via reclaimPages' beginReclaimCritical).
+fn reclaimScanPass(mm: *Mm, target: u32) u32 {
+    const pml4_phys = mm.page_table_phys;
     var swapped: u32 = 0;
     var pte_scanned: u32 = 0;
     const MAX_PTE_SCAN: u32 = 65536; // ~256MB of virtual address space per reclaim pass

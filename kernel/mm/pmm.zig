@@ -311,12 +311,18 @@ pub fn allocPage() ?u64 {
             if (swap.isEnabled()) {
                 const sched = @import("../proc/sched.zig");
                 if (sched.currentTask()) |t| {
-                    if (t.page_table_phys != 0) {
-                        _ = swap.reclaimPages(t.page_table_phys, 32);
-                        const flags = lock.acquire();
-                        const result = allocPageLocked();
-                        lock.release(flags);
-                        return result;
+                    // Reclaim scans the CURRENT task's page table under its
+                    // Mm's vm_lock (swap.reclaimPages takes the non-blocking
+                    // beginReclaimCritical guard itself; contention or a
+                    // missing Mm simply skips the scan).
+                    if (t.mm) |mm| {
+                        if (mm.page_table_phys != 0) {
+                            _ = swap.reclaimPages(mm, @ptrCast(t), 32);
+                            const flags = lock.acquire();
+                            const result = allocPageLocked();
+                            lock.release(flags);
+                            return result;
+                        }
                     }
                 }
             }
