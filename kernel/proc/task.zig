@@ -935,6 +935,13 @@ pub fn exitTask(exit_code: i32) void {
         @import("../ipc/sysv_shm.zig").detachAllForTask(t.tid, t.page_table_phys);
     }
 
+    // POSIX timers are per-process: delete the exiting task's timers, and
+    // drop any mq_notify registration it left — otherwise the stale
+    // registration signals an unrelated task after reapZombies recycles the
+    // slot (getTask checks occupancy, not identity).
+    @import("../ipc/posix_timer.zig").deleteTimersForTask(idx);
+    @import("../ipc/posix_mq.zig").clearNotifyForTask(idx);
+
     const flags = task_lock.acquire();
     t.exit_code = exit_code;
     sched_claim.store(&t.state, .zombie);

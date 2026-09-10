@@ -10,6 +10,8 @@ const bo = @import("../lib/byte_order.zig");
 const copy = @import("../mm/copy_from_user.zig");
 const task = @import("../proc/task.zig");
 const sched = @import("../proc/sched.zig");
+const time_policy = @import("time_policy.zig");
+const owner_gen_policy = @import("owner_gen_policy.zig");
 
 const MAX_QUEUES: u32 = 16;
 const MAX_MSGS: u32 = 8;
@@ -51,6 +53,10 @@ pub const MqQueue = struct {
     /// Task that registered mq_notify, and the requested signal number
     /// (delivered once when a message arrives on an empty queue).
     notify_task_idx: ?u32 = null,
+    /// Tid of the registering task — a slot INDEX alone aliases after the
+    /// registrant exits and its slot is recycled; the tid match proves
+    /// identity at delivery time.
+    notify_tid: u32 = 0,
     notify_signo: i32 = 0,
     /// Senders blocked on a full queue (mq_timedsend without O_NONBLOCK)
     send_waiters: ?*task.WaitNode = null,
@@ -98,10 +104,8 @@ fn readAbsTimeout(timeout_ptr: u64) u64 {
         return 0;
     }
     const ts: *const Timespec = @ptrCast(@alignCast(&ts_buf));
-    if (ts.tv_sec < 0) return 0;
-    const sec: u64 = @intCast(ts.tv_sec);
-    const nsec: u64 = if (ts.tv_nsec >= 0) @intCast(ts.tv_nsec) else 0;
-    return sec * 1_000_000_000 + nsec;
+    // Unrepresentable/invalid timespec → no timeout, never a wrapped deadline.
+    return time_policy.timespecToNs(ts.tv_sec, ts.tv_nsec) orelse 0;
 }
 
 /// Check if timeout has expired. abs_timeout_ns == 0 means no timeout.
@@ -248,6 +252,7 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
     q.open_count = 1;
     q.notify_pid = 0;
     q.notify_task_idx = null;
+    q.notify_tid = 0;
     q.notify_signo = 0;
 
     // Apply optional attributes (only honored at creation)
@@ -384,14 +389,20 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
         // Linux requires re-arming via another mq_notify.
         if (q.count == 1 and q.recv_waiters == null and q.notify_task_idx != null) {
             const notify_idx = q.notify_task_idx.?;
+            const notify_tid = q.notify_tid;
             const notify_signo = q.notify_signo;
             q.notify_pid = 0;
             q.notify_task_idx = null;
+            q.notify_tid = 0;
             q.notify_signo = 0;
             if (notify_signo > 0 and notify_signo < 32) {
                 if (task.getTask(notify_idx)) |nt| {
-                    _ = @atomicRmw(u32, &nt.pending_signals, .Or, @as(u32, 1) << @as(u5, @intCast(notify_signo - 1)), .seq_cst);
-                    @import("../proc/signal.zig").kickIfBlocked(notify_idx);
+                    // The slot may have been recycled after the registrant
+                    // exited — only signal if the tid still matches.
+                    if (owner_gen_policy.ownerMatches(notify_tid, nt.tid)) {
+                        _ = @atomicRmw(u32, &nt.pending_signals, .Or, @as(u32, 1) << @as(u5, @intCast(notify_signo - 1)), .seq_cst);
+                        @import("../proc/signal.zig").kickIfBlocked(notify_idx);
+                    }
                 }
             }
         }
@@ -537,6 +548,7 @@ pub fn mqNotify(mqd: u32, notif_ptr: u64) i64 {
         // Unregister notification
         q.notify_pid = 0;
         q.notify_task_idx = null;
+        q.notify_tid = 0;
         q.notify_signo = 0;
         return 0;
     }
@@ -544,8 +556,29 @@ pub fn mqNotify(mqd: u32, notif_ptr: u64) i64 {
     // Register: one-shot, re-armed by another mq_notify after delivery.
     q.notify_pid = 1;
     q.notify_task_idx = sched.currentTaskIndex();
+    q.notify_tid = if (sched.currentTaskIndex()) |ci|
+        (if (task.getTask(ci)) |ct| ct.tid else 0)
+    else
+        0;
     q.notify_signo = signo;
     return 0;
+}
+
+/// Clear every mq_notify registration made by `task_idx`. Called from
+/// task.exitTask so an exited task's registration can't signal an unrelated
+/// task after its slot is recycled.
+pub fn clearNotifyForTask(task_idx: u32) void {
+    const flags = mq_lock.acquire();
+    defer mq_lock.release(flags);
+
+    for (&queues) |*q| {
+        if (q.active and q.notify_task_idx != null and q.notify_task_idx.? == task_idx) {
+            q.notify_pid = 0;
+            q.notify_task_idx = null;
+            q.notify_tid = 0;
+            q.notify_signo = 0;
+        }
+    }
 }
 
 /// mq_close(mqd) -> 0 or -errno.

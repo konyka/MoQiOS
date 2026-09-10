@@ -17,6 +17,7 @@ const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const idt = @import("../arch/arch.zig").interrupts;
 const tsc = @import("../arch/arch.zig").tsc;
 const bo = @import("../lib/byte_order.zig");
+const time_policy = @import("time_policy.zig");
 
 /// Limits.
 pub const MAX_TIMERFD_INSTANCES: u32 = 16;
@@ -75,31 +76,17 @@ var timer_pool: [MAX_TIMERFD_INSTANCES]TimerInstance = @splat(.{});
 var timer_lock: IrqSpinlock = .{};
 
 fn timespecToNs(ts: Timespec) ?u64 {
-    if (ts.tv_sec < 0 or ts.tv_nsec < 0 or ts.tv_nsec >= 1_000_000_000) return null;
-    const sec: u64 = @intCast(ts.tv_sec);
-    const nsec: u64 = @intCast(ts.tv_nsec);
-    if (sec > (std.math.maxInt(u64) - nsec) / 1_000_000_000) return null;
-    return sec * 1_000_000_000 + nsec;
+    return time_policy.timespecToNs(ts.tv_sec, ts.tv_nsec);
 }
 
 /// Convert nanoseconds to scheduler ticks (rounding up to at least 1 tick).
 fn nsToTicks(ns: u64) ?u64 {
-    if (ns == 0) return 0;
-    // ns * TICKS_PER_SEC / 1_000_000_000, but avoid overflow for large ns
-    const sec = ns / 1_000_000_000;
-    const rem_ns = ns % 1_000_000_000;
-    if (sec > std.math.maxInt(u64) / TICKS_PER_SEC) return null;
-    const ticks_from_sec = sec * TICKS_PER_SEC;
-    const ticks_from_rem = (rem_ns * TICKS_PER_SEC + 999_999_999) / 1_000_000_000;
-    if (ticks_from_sec > std.math.maxInt(u64) - ticks_from_rem) return null;
-    return ticks_from_sec + ticks_from_rem;
+    return time_policy.nsToTicks(ns, TICKS_PER_SEC);
 }
 
 /// Convert scheduler ticks to nanoseconds.
 fn ticksToNs(ticks: u64) u64 {
-    const ns_per_tick = 1_000_000_000 / TICKS_PER_SEC;
-    if (ticks > std.math.maxInt(u64) / ns_per_tick) return std.math.maxInt(u64);
-    return ticks * ns_per_tick;
+    return time_policy.ticksToNs(ticks, TICKS_PER_SEC);
 }
 
 /// Create a new timerfd instance.
@@ -109,6 +96,8 @@ pub fn timerfdCreate(clock_id: u32, flags: u32) i32 {
     if (clock_id != CLOCK_REALTIME and clock_id != CLOCK_MONOTONIC) {
         return -22; // EINVAL
     }
+    // Only TFD_NONBLOCK | TFD_CLOEXEC are recognized (Linux timerfd_create).
+    if (!time_policy.timerfdFlagsValid(flags)) return -22; // EINVAL
 
     const saved = timer_lock.acquire();
     defer timer_lock.release(saved);
@@ -346,8 +335,11 @@ pub fn timerfdClose(timerfd_idx: u32) void {
     }
     inst.ref_count = 0;
 
-    // Wake any blocked waiter
-    if (inst.waiter) |node| {
+    // Wake ALL blocked waiters (the waiter stack may hold several readers) —
+    // each woken reader unlinks defensively, re-checks inst.valid at the top
+    // of its loop and returns EBADF. Waking only the head would strand the
+    // rest on a destroyed instance (lost wakeup).
+    while (inst.waiter) |node| {
         inst.waiter = node.next;
         node.next = null;
         @atomicStore(bool, &node.granted, true, .release);
@@ -399,8 +391,11 @@ pub fn timerTick(current_tick: u64) void {
                 inst.active = false;
             }
 
-            // Wake any blocked waiter
-            if (inst.waiter) |node| {
+            // Wake ALL blocked waiters, not just the head: the first woken
+            // reader drains expirations to 0, so a single wake would leave
+            // every other reader asleep despite the expiry it should observe
+            // (Linux wakes all readers).
+            while (inst.waiter) |node| {
                 inst.waiter = node.next;
                 node.next = null;
                 @atomicStore(bool, &node.granted, true, .release);

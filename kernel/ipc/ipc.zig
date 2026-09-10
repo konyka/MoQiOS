@@ -14,6 +14,7 @@
 /// integration comes in M5.
 const task = @import("../proc/task.zig");
 const sched = @import("../proc/sched.zig");
+const ipc_policy = @import("ipc_policy.zig");
 const serial = @import("../arch/arch.zig").serial;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
@@ -284,6 +285,14 @@ pub fn send(target_ep: EndpointId, msg: *const Message) IpcError {
     var out_msg: Message = msg.*;
     out_msg.sender = @intCast(sender_ep);
 
+    // Single waiting_sender slot: registering a second blocked sender would
+    // overwrite the first sender's registration and message, stranding it
+    // .blocked forever (IPC_TIMEOUT_MS is never enforced). Reject instead.
+    if (ipc_policy.sendAction(endpoints[target_ep].waiting_receiver != null, endpoints[target_ep].waiting_sender != null) == .busy) {
+        ipc_lock.release(flags);
+        return .not_ready;
+    }
+
     if (endpoints[target_ep].waiting_receiver) |recv_idx| {
         // Receiver is already waiting — deliver immediately
         _ = task.getTask(recv_idx) orelse {
@@ -342,6 +351,13 @@ pub fn receive(ep: EndpointId, buf: *Message) IpcError {
         return .invalid_endpoint;
     }
     if (endpoints[ep].owner_task_idx != caller_idx) {
+        ipc_lock.release(flags);
+        return .not_ready;
+    }
+
+    // Single waiting_receiver slot: a second blocked receiver would
+    // overwrite the first one's registration. Reject symmetrically.
+    if (ipc_policy.receiveAction(endpoints[ep].waiting_sender != null, endpoints[ep].waiting_receiver != null) == .busy) {
         ipc_lock.release(flags);
         return .not_ready;
     }
@@ -440,14 +456,33 @@ pub fn call(target_ep: EndpointId, msg: *Message) IpcError {
     sched.forceReschedule();
     sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
 
-    // Woken by reply() or by a signal kick. Reply delivery is tracked by
-    // reply_to/call_depth rather than a payload, so a signal-kicked caller
-    // simply dies on a fatal signal or reports EINTR. (.timeout is -4.)
+    // Woken by reply() or by a signal kick. A fatal signal kills the caller
+    // either way (same as before). (.timeout is -4 == -EINTR.)
     const sig_mod = @import("../proc/signal.zig");
     if (sig_mod.pendingFatal(caller_task)) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
-    if (sig_mod.pendingActionable(caller_task)) return .timeout;
 
-    return .success;
+    // Reply payload handoff: reply() parked the reply in our endpoint's
+    // pending_msg slot. Slot presence (with no waiting_sender owning the
+    // slot) discriminates a real reply from a bare signal kick — copy the
+    // reply into the caller's buffer and clear the slot so a later
+    // receive() cannot consume it out of context.
+    const flags2 = ipc_lock.acquire();
+    var reply_msg: ?Message = null;
+    if (ipc_policy.callWake(endpoints[caller_ep].pending_msg != null, endpoints[caller_ep].waiting_sender != null) == .reply_arrived) {
+        reply_msg = ipc_policy.takeSlot(Message, &endpoints[caller_ep].pending_msg);
+    }
+    ipc_lock.release(flags2);
+
+    if (reply_msg) |m| {
+        msg.* = m;
+        return .success;
+    }
+
+    // Signal kick without a reply: an actionable signal reports EINTR so
+    // the handler can run on return; anything else is a spurious wake
+    // (mirrors receive()'s woken-without-message tail).
+    if (sig_mod.pendingActionable(caller_task)) return .timeout;
+    return .not_ready;
 }
 
 /// Reply to a caller — sends the reply message back.

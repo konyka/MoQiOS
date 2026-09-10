@@ -3,11 +3,14 @@
 /// Provides the POSIX timer API using the same tick-driven mechanism as timerfd.
 /// Max 16 timers, tick resolution ~10ms (100Hz LAPIC timer).
 /// Signal delivery is simplified: overrun count is tracked, optional SIGEV_SIGNAL queued.
+const std = @import("std");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const idt = @import("../arch/arch.zig").interrupts;
 const copy = @import("../mm/copy_from_user.zig");
 const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
+const time_policy = @import("time_policy.zig");
+const owner_gen_policy = @import("owner_gen_policy.zig");
 
 const MAX_TIMERS: u32 = 16;
 const TICKS_PER_SEC: u64 = 100;
@@ -59,33 +62,18 @@ const PosixTimer = struct {
     /// Task that created the timer — signals go here, not to the task
     /// that happens to be running when the tick fires.
     owner_task_idx: ?u32 = null,
+    /// Owner tid recorded at creation — a slot INDEX alone aliases after the
+    /// owner exits and its slot is recycled; the tid match proves identity.
+    owner_tid: u32 = 0,
 };
 
 // Global pool
 var timers: [MAX_TIMERS]PosixTimer = @splat(.{});
 var lock: IrqSpinlock = .{};
 
-/// Convert nanoseconds to ticks (rounding up, minimum 1 if ns > 0).
-fn nsToTicks(ns: u64) u64 {
-    if (ns == 0) return 0;
-    const sec = ns / 1_000_000_000;
-    const rem_ns = ns % 1_000_000_000;
-    const ticks_from_sec = sec * TICKS_PER_SEC;
-    const ticks_from_rem = (rem_ns * TICKS_PER_SEC + 999_999_999) / 1_000_000_000;
-    return ticks_from_sec + ticks_from_rem;
-}
-
-/// Convert ticks to nanoseconds.
+/// Convert ticks to nanoseconds (saturating).
 fn ticksToNs(ticks: u64) u64 {
-    return ticks * (1_000_000_000 / TICKS_PER_SEC);
-}
-
-/// Convert Timespec to nanoseconds.
-fn timespecToNs(ts: *const Timespec) u64 {
-    if (ts.tv_sec < 0) return 0;
-    const sec_ns: u64 = @intCast(ts.tv_sec);
-    const nsec: u64 = if (ts.tv_nsec >= 0) @intCast(ts.tv_nsec) else 0;
-    return sec_ns * 1_000_000_000 + nsec;
+    return time_policy.ticksToNs(ticks, TICKS_PER_SEC);
 }
 
 /// Fill a Timespec from nanoseconds.
@@ -116,6 +104,12 @@ pub fn timerCreate(clockid: u32, sigev_ptr: u64, timerid_ptr: u64) i64 {
     const saved = lock.acquire();
     defer lock.release(saved);
 
+    const owner_idx = sched_mod.currentTaskIndex();
+    const owner_tid: u32 = if (owner_idx) |oi|
+        (if (task_mod.getTask(oi)) |ot| ot.tid else 0)
+    else
+        0;
+
     for (&timers, 0..) |*t, i| {
         if (!t.valid) {
             t.* = .{
@@ -127,7 +121,8 @@ pub fn timerCreate(clockid: u32, sigev_ptr: u64, timerid_ptr: u64) i64 {
                 .overrun = 0,
                 .sigev_signo = sigev_signo,
                 .sigev_notify = sigev_notify,
-                .owner_task_idx = sched_mod.currentTaskIndex(),
+                .owner_task_idx = owner_idx,
+                .owner_tid = owner_tid,
             };
             // Write timer ID to user space
             const id: i32 = @intCast(i);
@@ -157,6 +152,12 @@ pub fn timerSettime(timerid: u32, flags: u32, new_value_ptr: u64, old_value_ptr:
         return EFAULT;
     }
     const new_val: *const Itimerspec = @ptrCast(@alignCast(&new_buf));
+
+    // Validate + convert up front: an unrepresentable user timespec is
+    // EINVAL, never a wrapped (or Debug-panicking) u64 multiply.
+    const interval_ns = time_policy.timespecToNs(new_val.it_interval.tv_sec, new_val.it_interval.tv_nsec) orelse return EINVAL;
+    const value_ns = time_policy.timespecToNs(new_val.it_value.tv_sec, new_val.it_value.tv_nsec) orelse return EINVAL;
+    const value_ticks = time_policy.nsToTicks(value_ns, TICKS_PER_SEC) orelse return EINVAL;
 
     if (old_value_ptr != 0 and !copy.validateUserBufferWritable(old_value_ptr, @sizeOf(Itimerspec))) return EFAULT;
     const saved = lock.acquire();
@@ -190,10 +191,9 @@ pub fn timerSettime(timerid: u32, flags: u32, new_value_ptr: u64, old_value_ptr:
     }
 
     // Set interval
-    t.interval_ns = timespecToNs(&new_val.it_interval);
+    t.interval_ns = interval_ns;
 
     // Set initial expiration
-    const value_ns = timespecToNs(&new_val.it_value);
     if (value_ns == 0) {
         // Disarm the timer
         t.active = false;
@@ -207,11 +207,25 @@ pub fn timerSettime(timerid: u32, flags: u32, new_value_ptr: u64, old_value_ptr:
                 // Already past — fire immediately
                 t.expiry_tick = cur_tick;
             } else {
-                t.expiry_tick = cur_tick + nsToTicks(value_ns - now_ns);
+                // Monotonic: nsToTicks(value_ns) already validated, so the
+                // smaller delta always converts.
+                const delta = time_policy.nsToTicks(value_ns - now_ns, TICKS_PER_SEC) orelse {
+                    lock.release(saved);
+                    return EINVAL;
+                };
+                if (delta > std.math.maxInt(u64) - cur_tick) {
+                    lock.release(saved);
+                    return EINVAL;
+                }
+                t.expiry_tick = cur_tick + delta;
             }
         } else {
             // Relative time
-            t.expiry_tick = cur_tick + nsToTicks(value_ns);
+            if (value_ticks > std.math.maxInt(u64) - cur_tick) {
+                lock.release(saved);
+                return EINVAL;
+            }
+            t.expiry_tick = cur_tick + value_ticks;
         }
         t.active = true;
         t.overrun = 0;
@@ -288,6 +302,20 @@ pub fn timerDelete(timerid: u32) i64 {
     return 0;
 }
 
+/// Delete all timers owned by `task_idx`. Called from task.exitTask:
+/// per-process timers die with the process (POSIX), and dropping them here
+/// also closes the stale-slot window before reapZombies recycles the slot.
+pub fn deleteTimersForTask(task_idx: u32) void {
+    const saved = lock.acquire();
+    defer lock.release(saved);
+
+    for (&timers) |*t| {
+        if (t.valid and t.owner_task_idx != null and t.owner_task_idx.? == task_idx) {
+            t.* = .{};
+        }
+    }
+}
+
 /// Called from scheduler timer tick. Checks POSIX timers for expiration.
 pub fn timerTick(current_tick: u64) void {
     const saved = lock.acquire();
@@ -300,8 +328,13 @@ pub fn timerTick(current_tick: u64) void {
             t.overrun +|= 1;
 
             if (t.interval_ns > 0) {
-                // Repeating timer: schedule next expiration
-                t.expiry_tick = current_tick + nsToTicks(t.interval_ns);
+                // Repeating timer: schedule next expiration. The interval was
+                // validated at settime; saturate (like timerfd) defensively.
+                const interval_ticks = time_policy.nsToTicks(t.interval_ns, TICKS_PER_SEC) orelse std.math.maxInt(u64);
+                t.expiry_tick = if (interval_ticks > std.math.maxInt(u64) - current_tick)
+                    std.math.maxInt(u64)
+                else
+                    current_tick + interval_ticks;
             } else {
                 // One-shot: stop
                 t.active = false;
@@ -315,8 +348,12 @@ pub fn timerTick(current_tick: u64) void {
             if (t.sigev_notify == SIGEV_SIGNAL and t.sigev_signo > 0 and t.sigev_signo < 32) {
                 if (t.owner_task_idx) |owner_idx| {
                     if (task_mod.getTask(owner_idx)) |owner| {
-                        _ = @atomicRmw(u32, &owner.pending_signals, .Or, @as(u32, 1) << @as(u5, @intCast(t.sigev_signo - 1)), .seq_cst);
-                        @import("../proc/signal.zig").kickIfBlocked(owner_idx);
+                        // The slot may have been recycled after the owner
+                        // exited — only signal if the tid still matches.
+                        if (owner_gen_policy.ownerMatches(t.owner_tid, owner.tid)) {
+                            _ = @atomicRmw(u32, &owner.pending_signals, .Or, @as(u32, 1) << @as(u5, @intCast(t.sigev_signo - 1)), .seq_cst);
+                            @import("../proc/signal.zig").kickIfBlocked(owner_idx);
+                        }
                     }
                 }
             }
