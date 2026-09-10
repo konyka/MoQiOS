@@ -12,6 +12,145 @@ const mlock_policy = kt.mlock_policy;
 const mprotect_policy = kt.mprotect_policy;
 const munmap_policy = kt.munmap_policy;
 const process_vm_policy = kt.process_vm_policy;
+const mm = kt.mm;
+const vm_lock_policy = kt.vm_lock_policy;
+const lifecycle_policy = kt.lifecycle_policy;
+const task_op_policy = kt.task_op_policy;
+
+test "task operation pin selects a live matching task over a zombie" {
+    const candidates = [_]task_op_policy.Candidate{
+        .{ .tid = 17, .zombie = true },
+        .{ .tid = 17 },
+        .{ .tid = 23 },
+    };
+    try std.testing.expectEqual(task_op_policy.Selection{ .selected = 1 }, task_op_policy.select(&candidates, 17));
+}
+
+test "task operation pin selection reports zombie and missing TIDs" {
+    const candidates = [_]task_op_policy.Candidate{.{ .tid = 17, .zombie = true }};
+    try std.testing.expectEqual(task_op_policy.Selection.zombie, task_op_policy.select(&candidates, 17));
+    try std.testing.expectEqual(task_op_policy.Selection.task_not_found, task_op_policy.select(&candidates, 23));
+}
+
+test "task operation pin selection checks Mm and ref limits" {
+    const no_mm = [_]task_op_policy.Candidate{.{ .tid = 17, .mm_available = false }};
+    const overflow = [_]task_op_policy.Candidate{.{ .tid = 17, .operation_refs = task_op_policy.MAX_OPERATION_REFS }};
+    try std.testing.expectEqual(task_op_policy.Selection.no_mm, task_op_policy.select(&no_mm, 17));
+    try std.testing.expectEqual(task_op_policy.Selection.operation_ref_overflow, task_op_policy.select(&overflow, 17));
+}
+
+test "task operation pin accepts a live task and blocks reaping" {
+    var state = task_op_policy.State{};
+    try state.pin();
+    try std.testing.expectEqual(@as(u32, 1), state.operation_refs);
+    state.zombie = true;
+    try std.testing.expect(!state.reap());
+    try std.testing.expect(state.release());
+    try std.testing.expect(state.reap());
+}
+
+test "task operation pin rejects zombies" {
+    var state = task_op_policy.State{ .zombie = true };
+    try std.testing.expectError(error.Zombie, state.pin());
+}
+
+test "task operation pin rejects a task without an Mm" {
+    var state = task_op_policy.State{ .mm_available = false };
+    try std.testing.expectError(error.NoMm, state.pin());
+}
+
+test "task operation pin rejects bounded reference overflow" {
+    var state = task_op_policy.State{ .operation_refs = task_op_policy.MAX_OPERATION_REFS };
+    try std.testing.expectError(error.OperationRefOverflow, state.pin());
+}
+
+test "task operation pin release is stable and idempotent" {
+    var state = task_op_policy.State{};
+    try state.pin();
+    try std.testing.expect(state.release());
+    try std.testing.expect(!state.release());
+    try std.testing.expectEqual(@as(u32, 0), state.operation_refs);
+}
+
+test "task operation pin cannot resurrect a reaped task" {
+    var state = task_op_policy.State{ .zombie = true, .reaped = true };
+    try std.testing.expectError(error.Zombie, state.pin());
+    try std.testing.expect(!state.reap());
+}
+
+test "CLONE_VM requires a parent Mm owner" {
+    try std.testing.expectEqual(@as(i64, lifecycle_policy.EINVAL), lifecycle_policy.cloneVmResult(lifecycle_policy.CLONE_VM, false));
+    try std.testing.expectEqual(@as(i64, 0), lifecycle_policy.cloneVmResult(lifecycle_policy.CLONE_VM, true));
+}
+
+test "CLONE_VM child Mm reference balances after ownership transfer" {
+    var state = mm.TestRefState{};
+    try std.testing.expect(state.retain());
+    try std.testing.expectEqual(@as(u32, 2), state.refs);
+    state.release();
+    try std.testing.expectEqual(@as(u32, 1), state.refs);
+    try std.testing.expect(!state.finalized);
+    state.release();
+    try std.testing.expect(state.finalized);
+}
+
+test "threaded exec is rejected before address-space replacement" {
+    try std.testing.expectEqual(@as(i64, lifecycle_policy.EPERM), lifecycle_policy.execResult(true));
+    try std.testing.expectEqual(@as(i64, 0), lifecycle_policy.execResult(false));
+}
+
+test "Mm test state rejects underflow and double finalization" {
+    var state = mm.TestRefState{};
+    try std.testing.expect(state.retain());
+    state.release();
+    state.release();
+    state.release();
+    try std.testing.expectEqual(mm.TestRefState.TERMINAL_REFS, state.refs);
+    try std.testing.expect(state.dying);
+    try std.testing.expect(state.finalized);
+    try std.testing.expect(!state.retain());
+}
+
+test "Mm test state finalizes only after the last retained reference" {
+    var state = mm.TestRefState{};
+    try std.testing.expect(state.retain());
+    state.release();
+    try std.testing.expect(!state.dying);
+    try std.testing.expect(!state.finalized);
+    state.release();
+    try std.testing.expect(state.dying);
+    try std.testing.expect(state.finalized);
+}
+
+test "Mm terminal reference state cannot be resurrected or overflow" {
+    var state = mm.TestRefState{ .refs = mm.TestRefState.MAX_LIVE_REFS };
+    try std.testing.expect(!state.retain());
+    try std.testing.expectEqual(mm.TestRefState.MAX_LIVE_REFS, state.refs);
+
+    state.refs = 1;
+    state.dying = false;
+    state.finalized = false;
+    state.release();
+    try std.testing.expectEqual(mm.TestRefState.TERMINAL_REFS, state.refs);
+    try std.testing.expect(!state.retain());
+    state.release();
+    try std.testing.expectEqual(mm.TestRefState.TERMINAL_REFS, state.refs);
+}
+
+test "Mm VM lock policy rejects recursive acquire and unlock without ownership" {
+    var lock = mm.TestVmLockState{};
+    try std.testing.expect(!lock.release());
+    try std.testing.expect(lock.acquire());
+    try std.testing.expect(!lock.acquire());
+    try std.testing.expect(lock.release());
+    try std.testing.expect(!lock.release());
+}
+
+test "current-task VM lock policy handles no Mm and recursion" {
+    try std.testing.expectEqual(vm_lock_policy.Decision.no_mm, vm_lock_policy.decide(false, false));
+    try std.testing.expectEqual(vm_lock_policy.Decision.acquire, vm_lock_policy.decide(true, false));
+    try std.testing.expectEqual(vm_lock_policy.Decision.recursive, vm_lock_policy.decide(true, true));
+}
 const shm_policy = kt.shm_policy;
 const cow_pte = kt.cow_pte;
 const map_fixed = kt.map_fixed;
@@ -759,7 +898,7 @@ test "Linux RLIMIT aliases preserve native syscall numbers" {
 }
 
 test "signalfd closes backing eventfd on later failures" {
-    const create = std.mem.indexOf(u8, kt.signal_syscall_source, "eventfdCreate(0)") orelse return error.TestUnexpectedResult;
+    const create = std.mem.indexOf(u8, kt.signal_syscall_source, "eventfdCreate(0, false)") orelse return error.TestUnexpectedResult;
     const cleanup = std.mem.indexOfPos(u8, kt.signal_syscall_source, create, "eventfdClose(eventfd_idx)") orelse return error.TestUnexpectedResult;
     const alloc = std.mem.indexOfPos(u8, kt.signal_syscall_source, cleanup, "fd_table.allocFd()") orelse return error.TestUnexpectedResult;
     try std.testing.expect(cleanup < alloc);
@@ -3777,3 +3916,482 @@ test "rtc: calendar validation rejects impossible days" {
     try std.testing.expectEqual(@as(?u8, null), rtc.decodeRtcHour(0x92, false, true));
 }
 // ─── end RTC ───
+
+// ─── Audited defect regressions (inotify hash, getdents offset clamp,
+// readlink fd parse, mprotect shootdown count, task_op pin precedence,
+// chdir cwd boundary) ───
+
+test "inotify: path hash does not overflow on long paths" {
+    const inotify_policy = kt.inotify_policy;
+    // Short inputs still match plain polynomial math.
+    try std.testing.expectEqual(@as(u64, 'a'), inotify_policy.hashPathId("a"));
+    try std.testing.expectEqual(@as(u64, 'a') * 31 + 'b', inotify_policy.hashPathId("ab"));
+    // >=13 chars overflowed u64 with plain ops (Debug panic). Must wrap.
+    _ = inotify_policy.hashPathId("/proc/meminfo");
+    var long: [256]u8 = @splat(0xFF);
+    _ = inotify_policy.hashPathId(&long);
+    // Wrapping reference for a 14-char string.
+    var ref: u64 = 0;
+    for ("WXYZWXYZWXYZWX") |c| ref = ref *% 31 +% c;
+    try std.testing.expectEqual(ref, inotify_policy.hashPathId("WXYZWXYZWXYZWX"));
+}
+
+test "getdents: tmpfs arm clamps large offsets and advances without wrap" {
+    const getdents_policy = kt.getdents_policy;
+    try std.testing.expectEqual(@as(u32, 0), getdents_policy.clampOffset(0));
+    try std.testing.expectEqual(@as(u32, 5), getdents_policy.clampOffset(5));
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), getdents_policy.clampOffset(0xFFFFFFFF));
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), getdents_policy.clampOffset(0x1_0000_0000));
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), getdents_policy.clampOffset(0xFFFF_FFFF_FFFF_FFFF));
+    // Cursor advance must not wrap u32 (start near the clamp + a full page of entries).
+    try std.testing.expectEqual(@as(u64, 0x1_0000_003F), getdents_policy.nextOffset(0xFFFFFFFF, 64));
+    try std.testing.expectEqual(@as(u64, 7), getdents_policy.nextOffset(3, 4));
+}
+
+test "readlink: /proc/self/fd/N parser rejects u32 overflow" {
+    const readlink_policy = kt.readlink_policy;
+    try std.testing.expectEqual(@as(?u32, 0), readlink_policy.parseFdPrefix("0"));
+    try std.testing.expectEqual(@as(?u32, 42), readlink_policy.parseFdPrefix("42"));
+    // Trailing junk after the digits is ignored (fd prefix only).
+    try std.testing.expectEqual(@as(?u32, 3), readlink_policy.parseFdPrefix("3abc"));
+    // Max valid u32 parses; one past it overflows.
+    try std.testing.expectEqual(@as(?u32, 0xFFFFFFFF), readlink_policy.parseFdPrefix("4294967295"));
+    try std.testing.expectEqual(@as(?u32, null), readlink_policy.parseFdPrefix("4294967296"));
+    try std.testing.expectEqual(@as(?u32, null), readlink_policy.parseFdPrefix("99999999999999999999"));
+}
+
+test "mprotect: shootdown page count is ceil(len/PAGE)" {
+    try std.testing.expectEqual(@as(u64, 1), mprotect_policy.pageCount(1));
+    try std.testing.expectEqual(@as(u64, 1), mprotect_policy.pageCount(4095));
+    try std.testing.expectEqual(@as(u64, 1), mprotect_policy.pageCount(4096));
+    try std.testing.expectEqual(@as(u64, 2), mprotect_policy.pageCount(4097));
+    try std.testing.expectEqual(@as(u64, 3), mprotect_policy.pageCount(3 * 4096));
+}
+
+test "task_op_policy: pin checks ref overflow before NoMm like the kernel" {
+    var st = task_op_policy.State{
+        .mm_available = false,
+        .operation_refs = task_op_policy.MAX_OPERATION_REFS,
+    };
+    try std.testing.expectError(error.OperationRefOverflow, st.pin());
+}
+
+test "chdir: cwd join/normalize respects the 256-byte buffer" {
+    const chdir_policy = kt.chdir_policy;
+    var out: [256]u8 = undefined;
+
+    // Normalized result of 254 and 255 bytes fits (NUL lands in bounds).
+    const path254 = "/" ++ "a" ** 253;
+    const path255 = "/" ++ "a" ** 254;
+    try std.testing.expectEqual(@as(usize, 254), try chdir_policy.resolve("/", path254, &out));
+    try std.testing.expectEqual(@as(usize, 255), try chdir_policy.resolve("/", path255, &out));
+    try std.testing.expectEqual(@as(u8, '/'), out[0]);
+    try std.testing.expectEqual(@as(u8, 'a'), out[254]);
+
+    // 256 bytes does not fit alongside the NUL — reject, don't truncate.
+    const path256 = "/" ++ "a" ** 255;
+    try std.testing.expectError(error.NameTooLong, chdir_policy.resolve("/", path256, &out));
+
+    // Relative join pushing past the limit is also rejected (no silent
+    // dropped separator, no out-of-bounds NUL).
+    const cwd = "/" ++ "c" ** 200;
+    try std.testing.expectError(error.NameTooLong, chdir_policy.resolve(cwd, "b" ** 100, &out));
+
+    // Relative join within budget still works, including "." / ".." handling.
+    try std.testing.expectEqual(@as(usize, 4), try chdir_policy.resolve("/a/b", "../c", &out));
+    try std.testing.expectEqualStrings("/a/c", out[0..4]);
+    try std.testing.expectEqual(@as(usize, 1), try chdir_policy.resolve("/a", "..", &out));
+    try std.testing.expectEqualStrings("/", out[0..1]);
+}
+
+// ─── Audited defect regressions (UDP ephemeral port exclusivity, TCP rcv_wnd
+// saturation, TCP ephemeral wrap, TIME_WAIT v4 tuple, timespec overflow) ───
+
+test "udp: socket() ephemeral scan picks the first unregistered port" {
+    // Empty table → first ephemeral port.
+    try std.testing.expectEqual(@as(?u16, 49152), udp_util.firstFreePort(&.{}, 49152, 65534));
+    // Registered ports are skipped, even when the scan starts on them.
+    try std.testing.expectEqual(@as(?u16, 49154), udp_util.firstFreePort(&.{ 49152, 49153 }, 49152, 65534));
+    try std.testing.expectEqual(@as(?u16, 49153), udp_util.firstFreePort(&.{49152}, 49152, 65534));
+    // Every candidate taken → null (table exhausted for the range).
+    try std.testing.expectEqual(@as(?u16, null), udp_util.firstFreePort(&.{ 49152, 49153, 49154 }, 49152, 49154));
+}
+
+test "udp: ensurePortExclusive result maps to skip-in-use / abort-full / use" {
+    try std.testing.expectEqual(udp_util.ScanAction.use, udp_util.scanAction(0));
+    try std.testing.expectEqual(udp_util.ScanAction.use, udp_util.scanAction(41));
+    try std.testing.expectEqual(udp_util.ScanAction.skip_in_use, udp_util.scanAction(0xFFFE));
+    try std.testing.expectEqual(udp_util.ScanAction.abort_full, udp_util.scanAction(0xFFFF));
+}
+
+test "tcp: advertised rcv_wnd saturates at zero when buffered exceeds window" {
+    // RECV_BUF_SIZE (65536) > TCP_WINDOW (32768): buffered can exceed the
+    // window; the subtraction must saturate instead of underflowing u32.
+    try std.testing.expectEqual(@as(u32, 32768), tcp_util.rcvWindowFromBuffered(0, 32768));
+    try std.testing.expectEqual(@as(u32, 1), tcp_util.rcvWindowFromBuffered(32767, 32768));
+    try std.testing.expectEqual(@as(u32, 0), tcp_util.rcvWindowFromBuffered(32768, 32768));
+    try std.testing.expectEqual(@as(u32, 0), tcp_util.rcvWindowFromBuffered(65535, 32768));
+}
+
+test "tcp: ephemeral port counter wraps 65535 → 49152 instead of saturating" {
+    try std.testing.expectEqual(@as(u16, 49153), tcp_util.nextEphemeralPort(49152));
+    try std.testing.expectEqual(@as(u16, 65535), tcp_util.nextEphemeralPort(65534));
+    // Wrap must fire — saturating at 65535 would alias every later 4-tuple.
+    try std.testing.expectEqual(@as(u16, 49152), tcp_util.nextEphemeralPort(65535));
+}
+
+test "tcp: TIME_WAIT v4 tuple match requires remote_ip like the v6 path" {
+    const ip_a: [4]u8 = .{ 10, 0, 0, 1 };
+    const ip_b: [4]u8 = .{ 10, 0, 0, 2 };
+    try std.testing.expect(tcp_util.tupleMatchV4(80, 5000, ip_a, 80, 5000, ip_a));
+    // Same ports, different source host → must NOT reuse the TCB.
+    try std.testing.expect(!tcp_util.tupleMatchV4(80, 5000, ip_a, 80, 5000, ip_b));
+    try std.testing.expect(!tcp_util.tupleMatchV4(80, 5000, ip_a, 81, 5000, ip_a));
+    try std.testing.expect(!tcp_util.tupleMatchV4(80, 5000, ip_a, 80, 5001, ip_a));
+}
+
+test "time policy: timespec→ns guards overflow and invalid fields" {
+    const time_policy = kt.time_policy;
+    try std.testing.expectEqual(@as(?u64, 0), time_policy.timespecToNs(0, 0));
+    try std.testing.expectEqual(@as(?u64, 1_500_000_000), time_policy.timespecToNs(1, 500_000_000));
+    // Largest representable value: 18446744073 s + 709551615 ns == maxInt(u64).
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), time_policy.timespecToNs(18446744073, 709551615));
+    // One ns past that must overflow → null, not a wrapped near-zero deadline.
+    try std.testing.expectEqual(@as(?u64, null), time_policy.timespecToNs(18446744073, 709551616));
+    try std.testing.expectEqual(@as(?u64, null), time_policy.timespecToNs(18446744074, 0));
+    try std.testing.expectEqual(@as(?u64, null), time_policy.timespecToNs(std.math.maxInt(i64), 0));
+    // Invalid fields rejected (same rule as timerfd's guarded conversion).
+    try std.testing.expectEqual(@as(?u64, null), time_policy.timespecToNs(-1, 0));
+    try std.testing.expectEqual(@as(?u64, null), time_policy.timespecToNs(0, -1));
+    try std.testing.expectEqual(@as(?u64, null), time_policy.timespecToNs(0, 1_000_000_000));
+    try std.testing.expectEqual(@as(?u64, 999_999_999), time_policy.timespecToNs(0, 999_999_999));
+}
+
+test "time policy: ns→ticks reports overflow, ticks→ns saturates" {
+    const time_policy = kt.time_policy;
+    try std.testing.expectEqual(@as(?u64, 0), time_policy.nsToTicks(0, 100));
+    try std.testing.expectEqual(@as(?u64, 1), time_policy.nsToTicks(1, 100));
+    try std.testing.expectEqual(@as(?u64, 100), time_policy.nsToTicks(1_000_000_000, 100));
+    try std.testing.expectEqual(@as(?u64, 100_000), time_policy.nsToTicks(1_000_000_000_000, 100));
+    // maxInt(u64) ns at 100 Hz is ~1.8e12 ticks — still fits u64.
+    try std.testing.expectEqual(@as(?u64, 1844674407371), time_policy.nsToTicks(std.math.maxInt(u64), 100));
+    // Overflow needs an absurd tick rate; the guard must report null there.
+    try std.testing.expectEqual(@as(?u64, null), time_policy.nsToTicks(std.math.maxInt(u64), std.math.maxInt(u64)));
+    try std.testing.expectEqual(@as(u64, 1_000_000_000), time_policy.ticksToNs(100, 100));
+    try std.testing.expectEqual(std.math.maxInt(u64), time_policy.ticksToNs(std.math.maxInt(u64), 100));
+}
+
+test "mprotect COW commit consumes a reservation or defers to the fault path" {
+    // The commit loop re-checks each PTE after preflight reserved exactly
+    // `reserved` data pages. While reservations remain the copy is consumed;
+    // once exhausted the PTE must keep its COW bit and stay non-writable so
+    // the next write faults and unshares via the fault path.
+    try std.testing.expectEqual(mprotect_policy.CowCommitAction.consume, mprotect_policy.cowCommitAction(1, 0));
+    try std.testing.expectEqual(mprotect_policy.CowCommitAction.consume, mprotect_policy.cowCommitAction(3, 2));
+    // A concurrent fork/clone COW between preflight and commit can bump a
+    // sole-owned frame's refcount 1→2, exhausting the reservation.
+    try std.testing.expectEqual(mprotect_policy.CowCommitAction.defer_to_fault, mprotect_policy.cowCommitAction(0, 0));
+    try std.testing.expectEqual(mprotect_policy.CowCommitAction.defer_to_fault, mprotect_policy.cowCommitAction(2, 2));
+}
+
+test "munmap untrack needs a split slot only for a mid-range cut" {
+    const S = munmap_policy.PAGE_SIZE;
+    // Region [0x10000, 0x18000): unmapping the middle splits it, so
+    // untrackMmapRange must insert a tail piece into a free table slot.
+    try std.testing.expect(munmap_policy.needsSplitSlot(0x10000, 8, 0x10000 + 2 * S, 2));
+    // Edge-aligned cuts truncate or shift the region in place — no slot.
+    try std.testing.expect(!munmap_policy.needsSplitSlot(0x10000, 8, 0x10000, 2)); // head cut
+    try std.testing.expect(!munmap_policy.needsSplitSlot(0x10000, 8, 0x10000 + 6 * S, 2)); // tail cut
+    try std.testing.expect(!munmap_policy.needsSplitSlot(0x10000, 8, 0x10000, 8)); // full cover
+    try std.testing.expect(!munmap_policy.needsSplitSlot(0x10000, 8, 0x20000, 2)); // no overlap
+}
+
+test "munmap split-slot preflight rejects only when a needed slot is missing" {
+    // Full table + mid-split → reject (ENOMEM) before any mutation.
+    try std.testing.expect(!munmap_policy.canUntrack(1, 0));
+    // Full table + edge-aligned unmap (no split) → allow.
+    try std.testing.expect(munmap_policy.canUntrack(0, 0));
+    // Free slot + split → allow.
+    try std.testing.expect(munmap_policy.canUntrack(1, 1));
+    try std.testing.expect(munmap_policy.canUntrack(2, 2));
+    try std.testing.expect(!munmap_policy.canUntrack(3, 2));
+}
+
+test "owner generation: tid must match the recorded registration" {
+    const owner_gen_policy = kt.owner_gen_policy;
+    // Same task still occupying the slot → signal it.
+    try std.testing.expect(owner_gen_policy.ownerMatches(42, 42));
+    // Slot recycled: an unrelated task with a different tid must NOT be
+    // signalled by the stale registration.
+    try std.testing.expect(!owner_gen_policy.ownerMatches(42, 43));
+    // Slot empty (owner exited, not yet re-used) → no target.
+    try std.testing.expect(!owner_gen_policy.ownerMatches(42, null));
+}
+
+// ─── Audited defect regressions (IPC endpoint slot occupancy + call reply
+// payload handoff) ───
+
+test "ipc policy: second blocked sender is rejected instead of overwriting the first" {
+    const ipc_policy = kt.ipc_policy;
+    var ep = ipc_policy.SlotModel{};
+    // First sender finds no receiver and registers + blocks.
+    try std.testing.expectEqual(ipc_policy.SendAction.block, ep.send(0xAA));
+    try std.testing.expect(ep.waiting_sender);
+    try std.testing.expectEqual(@as(?u64, 0xAA), ep.pending_msg);
+    // Second sender to the same endpoint must be rejected: registering it
+    // would overwrite the first sender's registration and message, stranding
+    // the first sender blocked forever (no timeout is enforced).
+    try std.testing.expectEqual(ipc_policy.SendAction.busy, ep.send(0xBB));
+    try std.testing.expectEqual(@as(?u64, 0xAA), ep.pending_msg); // untouched
+    // Receiver picks up the FIRST sender's message and frees the slot.
+    var got: ?u64 = null;
+    try std.testing.expectEqual(ipc_policy.ReceiveAction.pick_up, ep.receive(&got));
+    try std.testing.expectEqual(@as(?u64, 0xAA), got);
+    try std.testing.expect(!ep.waiting_sender);
+    // Slot free again: a new sender may block once more.
+    try std.testing.expectEqual(ipc_policy.SendAction.block, ep.send(0xCC));
+}
+
+test "ipc policy: second blocked receiver is rejected symmetrically" {
+    const ipc_policy = kt.ipc_policy;
+    var ep = ipc_policy.SlotModel{};
+    var got: ?u64 = null;
+    try std.testing.expectEqual(ipc_policy.ReceiveAction.block, ep.receive(&got));
+    try std.testing.expect(ep.waiting_receiver);
+    // A second blocked receiver would overwrite the registration — reject.
+    try std.testing.expectEqual(ipc_policy.ReceiveAction.busy, ep.receive(&got));
+    try std.testing.expectEqual(@as(?u64, null), got);
+    // Sender delivers into the waiting receiver and frees the slot.
+    try std.testing.expectEqual(ipc_policy.SendAction.deliver, ep.send(0x11));
+    try std.testing.expect(!ep.waiting_receiver);
+    try std.testing.expectEqual(@as(?u64, 0x11), ep.takeDelivered());
+    try std.testing.expectEqual(@as(?u64, null), ep.pending_msg);
+}
+
+test "ipc policy: call reply handoff copies the payload and clears the slot" {
+    const ipc_policy = kt.ipc_policy;
+    var ep = ipc_policy.SlotModel{};
+    // Caller blocked in call(); callee replies via reply().
+    ep.reply(0xDEAD);
+    var reply_buf: ?u64 = null;
+    try std.testing.expectEqual(ipc_policy.CallWake.reply_arrived, ep.callTakeReply(&reply_buf));
+    try std.testing.expectEqual(@as(?u64, 0xDEAD), reply_buf);
+    // Slot cleared: a later receive() cannot consume the reply out of context.
+    try std.testing.expectEqual(@as(?u64, null), ep.pending_msg);
+}
+
+test "ipc policy: signal kick is discriminated from reply arrival" {
+    const ipc_policy = kt.ipc_policy;
+    var ep = ipc_policy.SlotModel{};
+    var reply_buf: ?u64 = null;
+    // Empty slot → bare signal kick, no payload handoff.
+    try std.testing.expectEqual(ipc_policy.CallWake.signal_kick, ep.callTakeReply(&reply_buf));
+    try std.testing.expectEqual(@as(?u64, null), reply_buf);
+    // A blocked sender owns pending_msg: call() must not steal its message
+    // as a reply.
+    try std.testing.expectEqual(ipc_policy.SendAction.block, ep.send(0x77));
+    try std.testing.expectEqual(ipc_policy.CallWake.signal_kick, ep.callTakeReply(&reply_buf));
+    try std.testing.expectEqual(@as(?u64, 0x77), ep.pending_msg); // sender's msg untouched
+    try std.testing.expectEqual(@as(?u64, null), reply_buf);
+}
+
+test "ipc policy: takeSlot returns the payload once and empties the slot" {
+    const ipc_policy = kt.ipc_policy;
+    var slot: ?u64 = null;
+    try std.testing.expectEqual(@as(?u64, null), ipc_policy.takeSlot(u64, &slot));
+    slot = 42;
+    try std.testing.expectEqual(@as(?u64, 42), ipc_policy.takeSlot(u64, &slot));
+    try std.testing.expectEqual(@as(?u64, null), slot);
+}
+
+test "tcp: flush send cursor stays in lockstep with snd_nxt across fail-then-retry" {
+    // §6.39 follow-up item 9: flushSendBuffer advanced send_unacked BEFORE
+    // sendSegment and discarded the result. On TX failure snd_nxt is not
+    // advanced, so the invariant
+    //   send_unacked == (send_head + (snd_nxt -% snd_una)) % SEND_BUF_SIZE
+    // breaks and the next segment carries payload belonging to a later seq.
+    // The policy: commit the cursor only on TX success (tcp_util helper,
+    // wired into flushSendBuffer).
+    const SIZE: u32 = 256; // power-of-two ring, like SEND_BUF_SIZE
+    const send_head: u32 = 200; // start near the wrap
+    const send_tail: u32 = (send_head + 100) % SIZE; // 100 bytes pending
+    const mss: u32 = 40;
+    const snd_una: u32 = 1000;
+    var snd_nxt: u32 = snd_una;
+    var send_unacked = tcp_util.expectedSendUnacked(send_head, snd_nxt, snd_una, SIZE);
+
+    // First flush attempt: sendSegment fails (ARP unresolved / PMTU gate /
+    // full NIC TX ring) — snd_nxt does not move, so the cursor must not move.
+    var can_send = @min(tcp_util.ringDataLen(send_unacked, send_tail, SIZE), mss);
+    try std.testing.expectEqual(@as(u32, 40), can_send);
+    send_unacked = tcp_util.flushCommitCursor(send_unacked, can_send, SIZE, false);
+    try std.testing.expectEqual(tcp_util.expectedSendUnacked(send_head, snd_nxt, snd_una, SIZE), send_unacked);
+
+    // Retry: all three segments now go out, crossing the ring wrap; the
+    // invariant holds after every committed segment.
+    while (true) {
+        can_send = @min(tcp_util.ringDataLen(send_unacked, send_tail, SIZE), mss);
+        if (can_send == 0) break;
+        send_unacked = tcp_util.flushCommitCursor(send_unacked, can_send, SIZE, true);
+        snd_nxt +%= can_send; // advanceSndNxt on TX success
+        try std.testing.expectEqual(tcp_util.expectedSendUnacked(send_head, snd_nxt, snd_una, SIZE), send_unacked);
+    }
+    try std.testing.expectEqual(snd_una + 100, snd_nxt);
+    try std.testing.expectEqual(send_tail, send_unacked);
+}
+
+test "tcp: segment option length mirrors the wire layout for the PMTU pre-gate" {
+    const L = tcp_util.segmentOptLen;
+    // SYN always carries MSS(4) + WS(3) + TS(10) + SACK-permitted(2) = 19,
+    // padded to 20.
+    try std.testing.expectEqual(@as(u8, 20), L(true, false, false, 0, false));
+    // Bare data/ACK segment: no options.
+    try std.testing.expectEqual(@as(u8, 0), L(false, false, false, 0, true));
+    // TS only: 10 padded to 12.
+    try std.testing.expectEqual(@as(u8, 12), L(false, true, false, 0, true));
+    // SACK blocks need the ACK flag and SACK negotiation.
+    try std.testing.expectEqual(@as(u8, 0), L(false, false, true, 1, false));
+    try std.testing.expectEqual(@as(u8, 0), L(false, false, false, 1, true));
+    // TS + 1 SACK block: 10 + (2+8) = 20, already aligned.
+    try std.testing.expectEqual(@as(u8, 20), L(false, true, true, 1, true));
+    // TS + 2 blocks: 10 + 18 = 28; TS + 3 blocks: 10 + 26 = 36.
+    try std.testing.expectEqual(@as(u8, 28), L(false, true, true, 2, true));
+    try std.testing.expectEqual(@as(u8, 36), L(false, true, true, 3, true));
+    // 1 SACK block without TS: 10 padded to 12.
+    try std.testing.expectEqual(@as(u8, 12), L(false, false, true, 1, true));
+}
+
+test "mremap shrink needs a split slot only when the region outlives old_size" {
+    const S = munmap_policy.PAGE_SIZE;
+    // mremap shrink unmaps [old_addr + new_pages*S, old_addr + old_pages*S)
+    // and calls untrackMmapRange on it, so the same mid-split rule as munmap
+    // applies (the call site reuses needsSplitSlot/canUntrack unchanged).
+    // Region [0x10000, 16 pages) shrunk from 12 to 8 pages: the cut range
+    // [0x10000+8S, 0x10000+12S) sits strictly inside the region — the tail
+    // piece (pages 12..16) needs a free table slot.
+    try std.testing.expect(munmap_policy.needsSplitSlot(0x10000, 16, 0x10000 + 8 * S, 4));
+    try std.testing.expect(!munmap_policy.canUntrack(1, 0)); // full table → ENOMEM
+    try std.testing.expect(munmap_policy.canUntrack(1, 1));
+    // Region ends exactly at old_size ([0x10000, 12 pages), shrink 12→8):
+    // the cut is edge-aligned at the region tail — plain truncation, no slot.
+    try std.testing.expect(!munmap_policy.needsSplitSlot(0x10000, 12, 0x10000 + 8 * S, 4));
+    try std.testing.expect(munmap_policy.canUntrack(0, 0)); // full table → allow
+}
+
+test "tcp: ACK advance must not move the send cursor (snd_nxt unchanged)" {
+    // §6.39 item 9 follow-up: the ACK path advanced send_unacked by `acked`
+    // next to the (correct) send_head advance. An ACK does not move snd_nxt,
+    // so the invariant
+    //   send_unacked == (send_head + (snd_nxt -% snd_una)) % SEND_BUF_SIZE
+    // breaks: a later flush computes phantom pending bytes and sends stale
+    // ring data under live sequence numbers.
+    const SIZE: u32 = 256; // power-of-two ring, like SEND_BUF_SIZE
+    const mss: u32 = 40;
+    var send_head: u32 = 0;
+    var send_tail: u32 = 0;
+    var snd_una: u32 = 1000;
+    var snd_nxt: u32 = snd_una;
+    var send_unacked = tcp_util.expectedSendUnacked(send_head, snd_nxt, snd_una, SIZE);
+
+    // App writes 100 bytes; flush sends them all (three segments).
+    send_tail = 100;
+    while (true) {
+        const can_send = @min(tcp_util.ringDataLen(send_unacked, send_tail, SIZE), mss);
+        if (can_send == 0) break;
+        send_unacked = tcp_util.flushCommitCursor(send_unacked, can_send, SIZE, true);
+        snd_nxt +%= can_send; // advanceSndNxt on TX success
+    }
+    try std.testing.expectEqual(send_tail, send_unacked);
+
+    // Peer ACKs everything: snd_una and send_head advance by `acked`; the
+    // fixed kernel does not touch the send cursor (snd_nxt is unchanged).
+    const acked = snd_nxt -% snd_una;
+    snd_una = snd_nxt;
+    send_head = (send_head + acked) % SIZE;
+
+    // The send cursor stays at send_tail — invariant holds across the ACK.
+    try std.testing.expectEqual(tcp_util.expectedSendUnacked(send_head, snd_nxt, snd_una, SIZE), send_unacked);
+    try std.testing.expectEqual(send_tail, send_unacked);
+
+    // A follow-up write of 50 bytes flushes exactly those 50 bytes (no
+    // phantom pending from stale ring slots), crossing no stale data.
+    send_tail = (send_tail + 50) % SIZE;
+    var sent_bytes: u32 = 0;
+    while (true) {
+        const can_send = @min(tcp_util.ringDataLen(send_unacked, send_tail, SIZE), mss);
+        if (can_send == 0) break;
+        send_unacked = tcp_util.flushCommitCursor(send_unacked, can_send, SIZE, true);
+        snd_nxt +%= can_send;
+        sent_bytes += can_send;
+        try std.testing.expectEqual(tcp_util.expectedSendUnacked(send_head, snd_nxt, snd_una, SIZE), send_unacked);
+    }
+    try std.testing.expectEqual(@as(u32, 50), sent_bytes);
+    try std.testing.expectEqual(send_tail, send_unacked);
+}
+
+test "eventfd policy: a write broadcasts only when the counter is readable" {
+    const eventfd_policy = kt.eventfd_policy;
+    // val == 0 onto a zero counter: instance still unreadable → no broadcast
+    // (blocked readers must not spin through spurious wake/re-block cycles).
+    try std.testing.expect(!eventfd_policy.writeWakesReaders(0));
+    // Any nonzero counter after the write → readable → broadcast to all
+    // blocked readers (each re-checks; the first drains it to 0).
+    try std.testing.expect(eventfd_policy.writeWakesReaders(1));
+    try std.testing.expect(eventfd_policy.writeWakesReaders(std.math.maxInt(u64)));
+}
+
+test "eventfd policy: read result drains or decrements per EFD_SEMAPHORE" {
+    const eventfd_policy = kt.eventfd_policy;
+    // Default mode: return the pre-read value, drain the counter to 0.
+    const drain = eventfd_policy.readResult(5, false);
+    try std.testing.expectEqual(@as(u64, 5), drain.value);
+    try std.testing.expectEqual(@as(u64, 0), drain.counter_after);
+    // EFD_SEMAPHORE: return 1, decrement the counter by exactly 1.
+    const sem = eventfd_policy.readResult(5, true);
+    try std.testing.expectEqual(@as(u64, 1), sem.value);
+    try std.testing.expectEqual(@as(u64, 4), sem.counter_after);
+    const sem_last = eventfd_policy.readResult(1, true);
+    try std.testing.expectEqual(@as(u64, 1), sem_last.value);
+    try std.testing.expectEqual(@as(u64, 0), sem_last.counter_after);
+}
+
+test "eventfd policy: write admission caps the counter at 2^64-2" {
+    const eventfd_policy = kt.eventfd_policy;
+    const MAX = eventfd_policy.COUNTER_MAX;
+    try std.testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_FFFE), MAX);
+    // Room for the whole sum → admitted without blocking.
+    try std.testing.expect(eventfd_policy.writeAdmitted(0, 0));
+    try std.testing.expect(eventfd_policy.writeAdmitted(0, MAX));
+    try std.testing.expect(eventfd_policy.writeAdmitted(MAX, 0));
+    try std.testing.expect(eventfd_policy.writeAdmitted(5, MAX - 5));
+    // Sum would exceed 2^64-2 → caller must block (or EAGAIN), never wrap.
+    try std.testing.expect(!eventfd_policy.writeAdmitted(MAX, 1));
+    try std.testing.expect(!eventfd_policy.writeAdmitted(5, MAX - 4));
+    try std.testing.expect(!eventfd_policy.writeAdmitted(MAX, MAX));
+    // 0xFFFFFFFFFFFFFFFF is not a writable value at all (Linux: -EINVAL).
+    try std.testing.expect(!eventfd_policy.writeValValid(std.math.maxInt(u64)));
+    try std.testing.expect(eventfd_policy.writeValValid(MAX));
+    try std.testing.expect(eventfd_policy.writeValValid(0));
+}
+
+test "eventfd policy: POLLOUT predicate admits a write of 1 below the cap" {
+    const eventfd_policy = kt.eventfd_policy;
+    // poll POLLOUT for eventfd: a write of at least 1 must be admitted
+    // without blocking (Linux: counter <= 2^64-2 minus the written value).
+    try std.testing.expect(eventfd_policy.writeAdmitted(0, 1));
+    try std.testing.expect(eventfd_policy.writeAdmitted(eventfd_policy.COUNTER_MAX - 1, 1));
+    // Full counter → not writable; poll must not report POLLOUT.
+    try std.testing.expect(!eventfd_policy.writeAdmitted(eventfd_policy.COUNTER_MAX, 1));
+}
+
+test "time policy: timerfd_create accepts only TFD_CLOEXEC and TFD_NONBLOCK" {
+    const time_policy = kt.time_policy;
+    try std.testing.expect(time_policy.timerfdFlagsValid(0));
+    try std.testing.expect(time_policy.timerfdFlagsValid(0x800)); // TFD_NONBLOCK
+    try std.testing.expect(time_policy.timerfdFlagsValid(0x80000)); // TFD_CLOEXEC
+    try std.testing.expect(time_policy.timerfdFlagsValid(0x80800)); // both
+    // Anything else is -EINVAL (Linux timerfd_create).
+    try std.testing.expect(!time_policy.timerfdFlagsValid(1));
+    try std.testing.expect(!time_policy.timerfdFlagsValid(0x1000));
+    try std.testing.expect(!time_policy.timerfdFlagsValid(std.math.maxInt(u32)));
+}
