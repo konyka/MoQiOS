@@ -38,6 +38,7 @@ pub const process_vm_policy = @import("mm/process_vm_policy.zig");
 pub const mm = @import("mm/mm.zig");
 pub const vm_lock_policy = @import("mm/vm_lock_policy.zig");
 pub const lifecycle_policy = @import("mm/lifecycle_policy.zig");
+pub const swap_policy = @import("mm/swap_policy.zig");
 pub const shm_policy = @import("ipc/shm_policy.zig");
 pub const sysv_msg_source = @embedFile("ipc/sysv_msg.zig");
 pub const cow_pte = @import("mm/cow_pte.zig");

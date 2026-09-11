@@ -4467,3 +4467,63 @@ test "time policy: timerfd_create accepts only TFD_CLOEXEC and TFD_NONBLOCK" {
     try std.testing.expect(!time_policy.timerfdFlagsValid(0x1000));
     try std.testing.expect(!time_policy.timerfdFlagsValid(std.math.maxInt(u32)));
 }
+
+test "swap policy: admission rejects only the boot/system disk" {
+    const swap_policy = kt.swap_policy;
+    // The boot/root disk — the only disk fat32/ext2 address directly — must
+    // never be admitted as a swap target: writeback would scribble the root
+    // filesystem (see block_dev.discard's system-disk identification).
+    try std.testing.expect(!swap_policy.admitTarget(.virtio_blk, 0));
+    // Any other device is admissible: the QEMU smoke attaches pattern-stamped
+    // NVMe/AHCI scratch images precisely so tests can write them.
+    try std.testing.expect(swap_policy.admitTarget(.virtio_blk, 1));
+    try std.testing.expect(swap_policy.admitTarget(.ahci, 0));
+    try std.testing.expect(swap_policy.admitTarget(.nvme, 0));
+}
+
+test "swap policy: device-path normalization strips an optional /dev/ prefix" {
+    const swap_policy = kt.swap_policy;
+    try std.testing.expectEqualStrings("sda", swap_policy.deviceName("/dev/sda"));
+    try std.testing.expectEqualStrings("sda", swap_policy.deviceName("sda"));
+    try std.testing.expectEqualStrings("nvme0", swap_policy.deviceName("/dev/nvme0"));
+    // A bare "/dev/" or other prefix is not stripped.
+    try std.testing.expectEqualStrings("", swap_policy.deviceName("/dev/"));
+    try std.testing.expectEqualStrings("/sda", swap_policy.deviceName("/sda"));
+    try std.testing.expectEqualStrings("dev/sda", swap_policy.deviceName("dev/sda"));
+}
+
+test "swap policy: swapon flags word admits no flags yet" {
+    const swap_policy = kt.swap_policy;
+    try std.testing.expect(swap_policy.flagsValid(0));
+    try std.testing.expect(!swap_policy.flagsValid(1));
+    try std.testing.expect(!swap_policy.flagsValid(0x8000)); // SWAP_FLAG_PREFER
+    try std.testing.expect(!swap_policy.flagsValid(std.math.maxInt(u32)));
+}
+
+test "mprotect policy: swap entries keep their marker, only preserved permission bits move" {
+    const mprot_policy = kt.mprotect_policy;
+    // Non-present + bit1 marker = swap entry (see mm/swap.zig's PTE format):
+    // writable is preserved at bit 2, COW at bit 3, slot at bits 12-51, NX at 63.
+    const entry: u64 = 0x2 | (@as(u64, 0x12345) << 12) | (@as(u64, 1) << 2) | (@as(u64, 1) << 63);
+
+    // Not a swap entry → null (caller runs the normal present-page path).
+    try std.testing.expectEqual(@as(?u64, null), mprot_policy.swapEntryUpdate(0x0, 2));
+    try std.testing.expectEqual(@as(?u64, null), mprot_policy.swapEntryUpdate(0x5 | (0x8000_0000_0000_0000), 2)); // present page
+
+    // PROT_NONE: the entry is already not-present; leave it untouched so a
+    // later PROT_READ still finds the swap slot.
+    try std.testing.expectEqual(entry, mprot_policy.swapEntryUpdate(entry, 0).?);
+
+    // PROT_READ: drop preserved writable, set NX.
+    const ro = mprot_policy.swapEntryUpdate(entry, 1).?;
+    try std.testing.expectEqual(@as(u64, 0x2 | (0x12345 << 12) | (1 << 63)), ro);
+    // PROT_READ|WRITE: keep preserved writable, set NX.
+    const rw = mprot_policy.swapEntryUpdate(entry & ~(@as(u64, 1) << 2), 3).?;
+    try std.testing.expectEqual(@as(u64, 0x2 | (0x12345 << 12) | (1 << 2) | (1 << 63)), rw);
+    // PROT_READ|EXEC: clear NX, drop writable.
+    const rx = mprot_policy.swapEntryUpdate(entry, 5).?;
+    try std.testing.expectEqual(@as(u64, 0x2 | (0x12345 << 12)), rx);
+    // The COW-preserved bit (3) survives every update.
+    const cow = entry | (@as(u64, 1) << 3);
+    try std.testing.expectEqual(cow, mprot_policy.swapEntryUpdate(cow, 3).?);
+}

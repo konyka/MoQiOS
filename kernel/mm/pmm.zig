@@ -23,6 +23,24 @@ var lock: IrqSpinlock = .{};
 // v53.12: Guard against recursive swap reclaim (reclaimPages → swapOut → allocPage)
 var in_swap_reclaim: bool = false;
 
+/// Test hook (x86 syscall 485): while non-zero, an allocation made when
+/// free_pages <= reclaim_floor_pages takes the OOM/reclaim path first, then
+/// allocates regardless of the reclaim outcome. The floor NEVER makes an
+/// allocation fail by itself — it only moves the reclaim trigger earlier, so
+/// swap can be exercised dynamically without exhausting all of physical RAM
+/// (the QEMU smoke boots with 512 MiB, far too much to pressure inside the
+/// smoke's time budget). Reset to 0 restores normal behavior.
+var reclaim_floor_pages: u64 = 0;
+
+/// Set the reclaim floor; returns the previous value so callers can restore.
+pub fn setReclaimFloor(pages: u64) u64 {
+    return @atomicRmw(u64, &reclaim_floor_pages, .Xchg, pages, .acq_rel);
+}
+
+pub fn reclaimFloor() u64 {
+    return @atomicLoad(u64, &reclaim_floor_pages, .acquire);
+}
+
 /// Skip first 2 MB (512 pages) on Limine boots — legacy BIOS area.
 /// Arena mode (SK-5) sets this to 0.
 var min_alloc_page: u64 = 512;
@@ -294,10 +312,16 @@ pub fn initArena(phys_base: u64, length: u64) void {
 /// Allocate a single 4KB physical page. Returns physical address or null.
 /// Uses word-at-a-time bitmap scanning for performance (64 pages per iteration).
 /// v53.12: On OOM, attempts swap reclaim before returning null.
+/// v53.15: While the reclaim-floor test hook is set, dipping to/below the
+/// floor routes through the same reclaim path first, but the allocation then
+/// proceeds regardless — the floor triggers reclaim, it never fails one.
 pub fn allocPage() ?u64 {
+    var floor_triggered = false;
     {
         const flags = lock.acquire();
-        const result = allocPageLocked();
+        const floor = reclaimFloor();
+        floor_triggered = floor != 0 and free_pages <= floor;
+        const result = if (floor_triggered) null else allocPageLocked();
         lock.release(flags);
         if (result != null) return result;
     }
@@ -326,6 +350,16 @@ pub fn allocPage() ?u64 {
                     }
                 }
             }
+        }
+        // CAS lost (a reclaim is already in flight on another CPU): under a
+        // real OOM the pre-existing behavior returns null; but the floor is
+        // a heuristic trigger only and must never fail an allocation that
+        // free pages can still satisfy.
+        if (floor_triggered) {
+            const flags = lock.acquire();
+            const result = allocPageLocked();
+            lock.release(flags);
+            return result;
         }
     }
 

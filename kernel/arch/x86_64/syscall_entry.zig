@@ -2538,6 +2538,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         484 => { // devfs_register(name_ptr, flags) -> ctrl fd (fs/devfs_proxy.zig)
             frame.rax = @bitCast(@import("../../fs/devfs_proxy.zig").syscallDevfsRegister(frame.rdi, frame.rsi));
         },
+        485 => { // pmm_set_reclaim_floor(pages) — swap test hook (mm/pmm.zig)
+            frame.rax = @bitCast(@as(i64, @intCast(@import("../../mm/pmm.zig").setReclaimFloor(frame.rdi))));
+        },
         else => {
             serial.writeString("[syscall] unknown syscall: 0x");
             fmt.writeHex(syscall_nr);
@@ -5482,14 +5485,45 @@ fn syscallPidfdGetfd(pidfd: u32, targetfd: u32, flags: u32) i64 {
     return -95; // EOPNOTSUPP
 }
 
-/// swapon(path_ptr, flags) — enable swap on a block device.
-/// Simplified: ignores path, enables swap on device 0 at LBA 0.
+/// swapon(path, flags) — enable swap on an explicitly named block device.
+///
+/// `path` names the target device (e.g. "/dev/sda" or "sda"; the optional
+/// "/dev/" prefix is stripped) and is matched against the registered block
+/// devices' names. There is deliberately NO default device: the previous
+/// hardwired dev0/LBA0 behavior could scribble whatever disk happened to
+/// register first — including the boot disk. The admission policy
+/// (mm/swap_policy.zig, host-tested) rejects the boot/system disk
+/// (virtio-blk disk 0, the only disk fat32/ext2 address directly) with
+/// EPERM; unknown names are ENODEV; nonzero flags are EINVAL.
 fn syscallSwapon(path_ptr: u64, flags: u32) i64 {
-    _ = path_ptr;
-    _ = flags;
     const swap = @import("../../mm/swap.zig");
+    const swap_policy = @import("../../mm/swap_policy.zig");
+    const block_dev = @import("../../drivers/block_dev.zig");
+    const copy = @import("../../mm/copy_from_user.zig");
+
+    if (!swap_policy.flagsValid(flags)) return -22; // EINVAL
+
+    var path_buf: [256]u8 = undefined;
+    const pc = copy.copyFromUser(path_buf[0..], @ptrFromInt(path_ptr), 255);
+    if (pc == 0) return -14; // EFAULT
+    const plen = if (pc < 255) pc else 255;
+    path_buf[plen] = 0;
+    var path_len: usize = 0;
+    while (path_len < plen and path_buf[path_len] != 0) : (path_len += 1) {}
+
+    const name = swap_policy.deviceName(path_buf[0..path_len]);
+    if (name.len == 0) return -19; // ENODEV
+
+    const dev = block_dev.findByName(name) orelse return -19; // ENODEV
+    const info = block_dev.getDeviceInfo(dev) orelse return -19; // ENODEV
+    const drv_idx = block_dev.getDeviceDriverIdx(dev) orelse return -19; // ENODEV
+
+    const kind: swap_policy.DevKind = @enumFromInt(@intFromEnum(info.dev_type));
+    if (!swap_policy.admitTarget(kind, drv_idx)) return -1; // EPERM: boot/system disk
+
     if (swap.isEnabled()) return -16; // EBUSY
-    swap.init(0, 0);
+    swap.init(dev, 0);
+    if (!swap.isEnabled()) return -19; // ENODEV: device went away
     return 0;
 }
 

@@ -3,6 +3,7 @@
 /// Provides a single interface for all block devices (NVMe/AHCI/virtio-blk).
 /// Drivers register themselves after init; the dispatch functions route
 /// read/write/flush/discard calls to the appropriate driver based on device type.
+const std = @import("std");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const klog = @import("../klog.zig");
 const serial = @import("../arch/arch.zig").serial;
@@ -247,6 +248,31 @@ pub fn getDeviceInfo(dev: u8) ?BlockDevInfo {
     if (dev >= device_count) return null;
     if (!devices[dev].active) return null;
     return devices[dev].info;
+}
+
+/// 设备在各自驱动中的索引（与注册时一致），供按 (type, driver_idx)
+/// 判定设备身份的策略使用（如 swap 目标准入）。
+pub fn getDeviceDriverIdx(dev: u8) ?u8 {
+    if (dev >= device_count) return null;
+    if (!devices[dev].active) return null;
+    return devices[dev].dev_idx;
+}
+
+/// 按设备名（如 "sda"/"vblk0"/"nvme0"）查找活动设备，返回全局索引。
+pub fn findByName(name: []const u8) ?u8 {
+    const flags = blk_lock.acquire();
+    defer blk_lock.release(flags);
+
+    for (0..device_count) |i| {
+        if (!devices[i].active) continue;
+        const info = &devices[i].info;
+        if (info.name_len == name.len and
+            std.mem.eql(u8, info.name[0..info.name_len], name))
+        {
+            return @intCast(i);
+        }
+    }
+    return null;
 }
 
 pub fn getDeviceCount() u8 {
