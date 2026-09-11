@@ -143,11 +143,16 @@
   侧 cleanupTask，承认的 task_lock → vm_lock 边）已纳入 vm_lock，共享 Mm
   （refs > 1）的 exec 现被 EPERM 拒绝。exec/reap 仅部分覆盖：上述 PTE
   写入路径已串行化，但 exit/reap 的地址空间整体 teardown 走查
-  （destroyUserSpace/finalDestroy）仍在统一锁之外。剩余：reclaim 写回的
-  两阶段化（scan-then-commit——当前 swapOut 在持 vm_lock 下同步写回块
-  设备）、cleanupTask 的 exit/reap 拆分（退出时自清理 vs reap 时跨任务
+  （destroyUserSpace/finalDestroy）仍在统一锁之外。swap 已有真实动态覆盖
+  （§6.45：swapon 路径定向 + 启动盘准入拒绝 + reclaim-floor 压力钩子 +
+  hello96 SMP 验收；swap 项与 mmap 放置/mprotect/缺页/syscall 拷贝的共存
+  缺口均已修复，swapOut 的丢失写竞态已由降级-shootdown-写回两阶段关闭）。
+  剩余：reclaim 的 scan-then-commit 两阶段化（当前 reclaim 仍在持
+  vm_lock 下同步做块设备 IO）、munmap/exit 的 swap slot 回收（当前泄漏）、
+  cleanupTask 的 exit/reap 拆分（退出时自清理 vs reap 时跨任务
   清理的所有权边界）、CLONE_VM 兄弟间 per-task 区域表（mmap_regions）
-  发散的权威化、mlock 锁定页与 reclaim 扫描的交互缺口（mlock 区域目前
+  发散的权威化（放置搜索已改查页表 ground truth，区域表仍 per-task）、
+  mlock 锁定页与 reclaim 扫描的交互缺口（mlock 区域目前
   对 reclaim 不可见）。权威 page provenance 尚未纳入；未完成这些路径前，
   不得启用真正的跨进程 HHDM read，只有在它们共享同一锁与生命周期协议后
   才可继续评审。当前 syscall
