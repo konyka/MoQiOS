@@ -18,6 +18,7 @@ disk.img filter=lf
 disk.img
 disk.img.bak
 nvme.img
+ahci.img
 serial_*.log
 .qoder/
 __pycache__/
