@@ -153,7 +153,12 @@
   清理的所有权边界）、CLONE_VM 兄弟间 per-task 区域表（mmap_regions）
   发散的权威化（放置搜索已改查页表 ground truth，区域表仍 per-task）、
   mlock 锁定页与 reclaim 扫描的交互缺口（mlock 区域目前
-  对 reclaim 不可见）。权威 page provenance 尚未纳入；未完成这些路径前，
+  对 reclaim 不可见）、4-worker SMP=4 RIP=0 残留（§6.47：42 次插桩
+  复现零命中，根因未定位；hello98 常驻绊线 + RIP0-DIAG 取证已布防）、
+  mprotect(PROT_NONE) 预约项与 swap 项位型同构的疑似缺陷（§6.47，
+  待 TDD 切片）、真正的 swapoff（drain + 解除；当前为有意 no-op 占位，
+  swap 启用后整个 boot 保持武装，§6.47）。
+  权威 page provenance 尚未纳入；未完成这些路径前，
   不得启用真正的跨进程 HHDM read，只有在它们共享同一锁与生命周期协议后
   才可继续评审。当前 syscall
   仍保持最多 4096 字节的内核 staging，以及 partial-copy/`EFAULT` 边界。
