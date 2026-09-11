@@ -28,7 +28,13 @@ pub const MAX_SPACES: usize = 64;
 
 pub const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 /// CR3 bit 63: with CR4.PCIDE = 1 a MOV to CR3 with this bit set switches
-/// the PCID without invalidating that PCID's TLB entries.
+/// the PCID without invalidating that PCID's TLB entries. The bit is a
+/// write-only command bit: MOV to CR3 does NOT store it ("The instruction
+/// does not modify bit 63 of CR3, which is reserved and always 0" — SDM
+/// vol. 3A, MOV to/from control registers). Consequently a read-modify-write
+/// CR3 reload (`tlb.reloadCr3`) always writes bit 63 = 0 and stays a real
+/// flush of the current PCID's non-global entries even under PCID — verified
+/// empirically under KVM (§6.46).
 pub const CR3_NO_FLUSH: u64 = 1 << 63;
 
 /// Compose a CR3 value from a PML4 physical address, a PCID and the

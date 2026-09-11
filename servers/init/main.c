@@ -216,6 +216,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello94");  /* timerfd real fd, settime/gettime, EAGAIN, expiry read */
     run_test("hello95");  /* mount/umount2/vmsplice/setitimer user-copy EFAULT */
     run_test("hello96");  /* swapon device-targeting gate + CLONE_VM swap-reclaim stress */
+    run_test("hello97");  /* PCID no-flush CR3 vs >32-page flush fallback (stale-entry probe) */
 
     start_persistent_services();
 
