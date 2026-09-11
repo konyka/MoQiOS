@@ -190,6 +190,20 @@ pub fn isPageMapped(pml4_phys: u64, virt: u64) bool {
     return pt.entries[pt_idx].present;
 }
 
+/// Whether ANY live entry occupies this address: present pages, swap entries
+/// (reclaim-evicted but still owned), and PROT_NONE reservations (non-present
+/// but holding a frame) all count — only a zero leaf (or missing structure)
+/// is free. Placement searches must use this rather than isPageMapped: a swap
+/// entry is non-present, and reusing its address overwrites the evicted
+/// page's only reference (hello96 RED: a fresh mmap landed on a swapped-out
+/// sibling region and destroyed its swap entries).
+pub fn isPageOccupied(pml4_phys: u64, virt: u64) bool {
+    if (getPageEntryRaw(pml4_phys, virt)) |raw| return raw != 0;
+    // Missing PT structure (free), or a huge PDE — getPageEntryRaw refuses
+    // those, and a huge PDE is definitely occupied.
+    return isPageMapped(pml4_phys, virt);
+}
+
 /// Map a 2MB huge page via PD entry (no PT needed).
 pub fn mapHugePage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void {
     assertNotGlobalUser(flags);

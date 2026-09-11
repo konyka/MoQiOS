@@ -23,8 +23,18 @@ const hhdm = @import("../mm/hhdm.zig");
 const Mm = @import("../mm/mm.zig").Mm;
 const idt = @import("../arch/arch.zig").interrupts;
 const block_dev = @import("../drivers/block_dev.zig");
+const swap_policy = @import("swap_policy.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const fmt = @import("../lib/fmt.zig");
+
+// swap_policy is a pure (host-tested) module and must not import the driver
+// layer, so its DevKind mirrors BlockDevType's ordinals; keep them in sync.
+comptime {
+    if (@intFromEnum(block_dev.BlockDevType.nvme) != @intFromEnum(swap_policy.DevKind.nvme) or
+        @intFromEnum(block_dev.BlockDevType.ahci) != @intFromEnum(swap_policy.DevKind.ahci) or
+        @intFromEnum(block_dev.BlockDevType.virtio_blk) != @intFromEnum(swap_policy.DevKind.virtio_blk))
+        @compileError("swap_policy.DevKind ordinals must mirror block_dev.BlockDevType");
+}
 
 const PAGE_SIZE: u64 = 4096;
 const SWAP_MARKER_BIT: u64 = 0x2; // Bit 1 set = swap entry
@@ -37,6 +47,12 @@ var swap_dev: u8 = 0xFF; // Block device index for swap
 var swap_start_lba: u64 = 0; // Starting LBA of swap area
 var swap_enabled: bool = false;
 var swap_used: u64 = 0;
+// Effective slot count: min(MAX_SWAP_SLOTS, device capacity). Allocations
+// beyond the device's last page would write past the end of the disk — the
+// AHCI driver reports an NCQ error and the write fails (hello96 SMP=4 RED:
+// in-flight swap-out exceeded the 64MiB scratch disk's 16384 pages).
+var swap_slot_limit: u64 = 0;
+var slot_full_logged: bool = false;
 
 // Clock hand for victim selection — encodes pml4_idx (0-255) as starting scan position
 var clock_hand: u32 = 0;
@@ -65,25 +81,33 @@ pub fn init(dev: u8, start_lba: u64) void {
     };
 
     const swap_capacity_pages = info.total_sectors / SECTORS_PER_PAGE;
+    swap_slot_limit = @min(swap_capacity_pages, MAX_SWAP_SLOTS);
     serial.writeString("[swap] Enabled on device #");
     fmt.writeDecimal(dev);
     serial.writeString(" at LBA ");
     fmt.writeDecimal64(start_lba);
     serial.writeString(" capacity=");
-    fmt.writeDecimal64(@min(swap_capacity_pages, MAX_SWAP_SLOTS));
+    fmt.writeDecimal64(swap_slot_limit);
     serial.writeString(" pages\n");
 }
 
 /// Allocate a swap slot. Returns slot index or null if full.
 /// Uses u64 word-level scanning with @ctz for amortized O(1) allocation.
+/// Never hands out a slot at or past swap_slot_limit (the device's actual
+/// page capacity) — such a slot would address sectors past the end of the disk.
 fn allocSlot() ?u64 {
     const flags = swap_lock.acquire();
     defer swap_lock.release(flags);
 
+    const limit_words = (swap_slot_limit + 63) / 64;
     for (&swap_bitmap, 0..) |*word_ptr, word_idx| {
-        const word = word_ptr.*;
-        if (word == ~@as(u64, 0)) continue; // all 64 bits used
-        const free_bits = ~word;
+        if (word_idx >= limit_words) break;
+        var free_bits = ~word_ptr.*;
+        // Mask off bits past the device capacity in the final partial word.
+        if (word_idx == limit_words - 1 and swap_slot_limit % 64 != 0) {
+            free_bits &= (@as(u64, 1) << @intCast(swap_slot_limit % 64)) - 1;
+        }
+        if (free_bits == 0) continue;
         const bit: u6 = @intCast(@ctz(free_bits));
         word_ptr.* |= @as(u64, 1) << bit;
         swap_used += 1;
@@ -122,7 +146,22 @@ pub fn decodeSwapEntry(pte: u64) u64 {
 
 /// Swap out a page: write its contents to a swap slot and update PTE.
 /// Returns true on success.
-pub fn swapOut(pml4_phys: u64, virt_addr: u64, pte_ptr: *u64) bool {
+///
+/// v53.15: two-phase writeback. The PTE is first downgraded to read-only and
+/// stale writable translations are shot down (ranged invlpg) BEFORE the page
+/// is copied to disk. The whole reclaim scan holds the mm's vm_lock, so
+/// same-mm fault handlers cannot observe the intermediate state; a
+/// concurrent plain user WRITE on a sibling CPU (which takes no lock)
+/// instead faults on the read-only page, waits on vm_lock until the scan
+/// completes, then swap-in restores the page and the write lands
+/// (handleCowFault re-reads the PTE under the guard and retries on a
+/// non-present entry). Without the downgrade, stores landing after the disk
+/// copy are silently lost — hello96 RED: a swapped CLONE_VM thread stack
+/// came back stale and the thread returned to RIP=0.
+///
+/// (A batched variant with coalesced multi-page NCQ writes was tried for TCG
+/// speed and reverted: it regressed SMP=4 — see §6.45 residuals.)
+fn swapOut(pml4_phys: u64, virt_addr: u64, pte_ptr: *u64) bool {
     if (!swap_enabled) return false;
 
     const pte = pte_ptr.*;
@@ -133,9 +172,17 @@ pub fn swapOut(pml4_phys: u64, virt_addr: u64, pte_ptr: *u64) bool {
 
     // Allocate swap slot
     const slot = allocSlot() orelse {
-        serial.writeString("[swap] No free swap slots\n");
+        // Once-only: a full swap area is a steady state under sustained
+        // pressure, not a per-attempt event worth logging.
+        if (!@atomicRmw(bool, &slot_full_logged, .Xchg, true, .acq_rel))
+            serial.writeString("[swap] No free swap slots\n");
         return false;
     };
+
+    // Phase 1: revoke write access before the copy. Bit 1 is the writable bit
+    // for present pages (it doubles as the swap marker only once present=0).
+    pte_ptr.* = pte & ~@as(u64, 0x2);
+    tlb.shootdownRange(virt_addr, 1, pml4_phys);
 
     // Write page to disk
     const lba = swap_start_lba + slot * SECTORS_PER_PAGE;
@@ -143,6 +190,9 @@ pub fn swapOut(pml4_phys: u64, virt_addr: u64, pte_ptr: *u64) bool {
 
     const result = block_dev.writeSectors(swap_dev, lba, SECTORS_PER_PAGE, page_data);
     if (result != 0) {
+        // Roll back the downgrade.
+        pte_ptr.* = pte;
+        tlb.shootdownRange(virt_addr, 1, pml4_phys);
         freeSlot(slot);
         serial.writeString("[swap] Write failed\n");
         return false;
@@ -205,6 +255,7 @@ pub fn swapIn(pte_val: u64) ?u64 {
 
     return new_pte;
 }
+
 
 /// Attempt to reclaim pages when memory is low.
 /// Scans user page tables for candidate pages to swap out.

@@ -25,6 +25,36 @@ inline fn activeRoot() u64 {
     return paging.currentRoot();
 }
 
+/// x86_64 swap integration: a swap entry (non-present PTE with the bit-1
+/// marker) names a page reclaim has evicted. The range checks below must
+/// ADMIT it — the copy itself then faults, the supervisor #PF path swaps the
+/// page back in, and the retry completes. Refusing it here instead turned
+/// every syscall touching a swapped user page into a spurious EFAULT/short
+/// copy (hello96's own PASS/FAIL prints vanished that way).
+fn userPageMapped(root: u64, page: u64) bool {
+    if (paging.isUserAccessible(root, page)) return true;
+    if (comptime builtin.cpu.arch == .x86_64) {
+        if (paging.getPageEntryRaw(root, page)) |raw| {
+            return @import("swap.zig").isSwapEntry(raw);
+        }
+    }
+    return false;
+}
+
+/// Same admission for kernel-write destinations: the swap entry's preserved
+/// writable (bit 2) or preserved COW (bit 3) means the fault+swap-in retry
+/// can complete the write; neither set means genuinely read-only.
+fn userPageWritable(root: u64, page: u64) bool {
+    if (paging.isUserWritable(root, page)) return true;
+    if (comptime builtin.cpu.arch == .x86_64) {
+        if (paging.getPageEntryRaw(root, page)) |raw| {
+            const swap = @import("swap.zig");
+            if (swap.isSwapEntry(raw)) return (raw & 0xC) != 0;
+        }
+    }
+    return false;
+}
+
 /// Verify every page in [addr, addr+len) is present and user-accessible in the
 /// current address space. This rejects bad pointers before entering the copy;
 /// x86_64's instruction fixup remains the backstop for a concurrent unmap after
@@ -35,7 +65,7 @@ fn userRangeMapped(addr: u64, len: usize) bool {
     var page = addr & ~@as(u64, 0xFFF);
     const end = addr + len;
     while (page < end) : (page += 0x1000) {
-        if (!paging.isUserAccessible(root, page)) return false;
+        if (!userPageMapped(root, page)) return false;
     }
     return true;
 }
@@ -49,7 +79,7 @@ fn userRangeWritable(addr: u64, len: usize) bool {
     var page = addr & ~@as(u64, 0xFFF);
     const end = addr + len;
     while (page < end) : (page += 0x1000) {
-        if (!paging.isUserWritable(root, page)) return false;
+        if (!userPageWritable(root, page)) return false;
     }
     return true;
 }

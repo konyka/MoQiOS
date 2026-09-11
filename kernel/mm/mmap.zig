@@ -464,7 +464,11 @@ fn rangesOverlap(a_base: u64, a_pages: u64, b_base: u64, b_pages: u64) bool {
 /// live mapping, and lets the search skip straight past a conflict.
 fn firstMappedPage(task: *task_mod.Task, base: u64, num_pages: u64) ?u64 {
     for (0..num_pages) |p| {
-        if (paging_mod.isPageMapped(task.page_table_phys, base + p * user_space.PAGE_SIZE)) {
+        // isPageOccupied, not isPageMapped: swap entries and PROT_NONE
+        // reservations are non-present but the address is still owned —
+        // placing a new mapping there would destroy the swap entry (the
+        // evicted page's only reference). Pre-swap this equalled present-only.
+        if (paging_mod.isPageOccupied(task.page_table_phys, base + p * user_space.PAGE_SIZE)) {
             return p;
         }
     }

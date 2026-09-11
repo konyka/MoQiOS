@@ -74,8 +74,11 @@ pub fn brk(addr: u64) i64 {
         // overwrites a live PTE without complaint, which would strand the old
         // frame and hand the heap a region the process is still using
         // elsewhere (a MAP_FIXED mapping, or the stack in the flat layout).
+        // isPageOccupied (not isPageMapped): a swap entry is non-present but
+        // the page is still owned — mapping over it would destroy the
+        // evicted page's only reference (same class as the mmap fix).
         for (old_page..new_page) |p| {
-            if (paging_mod.isPageMapped(cur.page_table_phys, p * PAGE)) {
+            if (paging_mod.isPageOccupied(cur.page_table_phys, p * PAGE)) {
                 return @bitCast(cur.brk_current);
             }
         }

@@ -172,6 +172,17 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
         const pte_opt = paging.getProtectionPageEntry(cur.page_table_phys, v);
         const pte = pte_opt orelse continue; // skip unmapped pages
 
+        // Swap entries (non-present + bit-1 marker; the frame is on disk):
+        // the generic rewrite below would set present=1 on the swap slot and
+        // clear the marker via `writable`. Only the preserved permission
+        // bits (writable at bit 2, NX at bit 63) may move — swap-in then
+        // restores the NEW permissions (mprotect_policy.swapEntryUpdate,
+        // host-tested; hello96 RED).
+        if (policy.swapEntryUpdate(@bitCast(pte.*), prot)) |updated| {
+            pte.* = @bitCast(updated);
+            continue;
+        }
+
         if (prot == PROT_NONE) {
             // Clear present bit — keep physical frame so we can restore later.
             // On x86_64, when present=0 the CPU ignores all other bits except

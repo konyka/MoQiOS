@@ -619,6 +619,17 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
         }
     }
 
+    // Supervisor fault on a swapped-out user page: a syscall's user copy (or
+    // any kernel touch of current-task user memory) met a swap entry that the
+    // prevalidation deliberately admitted (copy_from_user.userPageMapped).
+    // Swap the page back in and re-execute the faulting instruction — the
+    // user-mode demand path does the same for direct user accesses.
+    if (!user_mode and !present and cr2 != 0 and cr2 < 0x0000_8000_0000_0000) {
+        if (trySwapInKernelFault(cr2)) {
+            return;
+        }
+    }
+
     // A supervisor fault at the dedicated rep-movsb instruction means the
     // mapping changed after prevalidation. COW handling stays first so a valid
     // kernel write to a COW page retries instead of returning a short copy.
@@ -794,6 +805,13 @@ fn handleDemandPage(frame: *InterruptFrame, fault_addr: u64) bool {
         }
     }
 
+    // A CLONE_VM sibling may have served this very page while the fault
+    // waited on vm_lock (shared page table): if the PTE is present now,
+    // simply retry the instruction instead of mapping over it.
+    if (paging_mod.getPageEntryRaw(current.page_table_phys, page_addr)) |pte_now| {
+        if ((pte_now & 1) != 0) return true;
+    }
+
     // Stack auto-growth: extend stack_limit when fault is below current limit
     if (in_stack_range and page_addr < current.stack_limit) {
         // Check we don't grow below USER_STACK_BOTTOM
@@ -948,11 +966,13 @@ fn serveFilePage(current: anytype, page_addr: u64) bool {
     const paging_mod = @import("paging.zig");
     const task_mod = @import("../../proc/task.zig");
 
-    const ri = filemap.findFileRegion(task_mod.MmapRegion, &current.mmap_regions, page_addr) orelse return false;
-    const region = &current.mmap_regions[ri];
-
-    // A swapped-out page takes precedence: after a COW copy the private page
-    // may have been swapped, and the swap entry still sits in the PTE.
+    // A swapped-out page takes precedence over ALL region metadata: the swap
+    // entry is self-describing (it preserves the writable/COW/NX bits), and
+    // reclaim scans whole page tables — not per-task region tables — so it
+    // legitimately swaps pages no tracked region of the FAULTING task covers
+    // (loader image/BSS/brk pages, or a CLONE_VM sibling's thread stack).
+    // Those must still swap back in; otherwise reclaim converts them into
+    // spurious SIGSEGVs (hello96 RED).
     const swap = @import("../../mm/swap.zig");
     if (swap.isEnabled()) {
         if (paging_mod.getPageEntryRaw(current.page_table_phys, page_addr)) |pte_val| {
@@ -967,6 +987,16 @@ fn serveFilePage(current: anytype, page_addr: u64) bool {
             }
         }
     }
+
+    // A CLONE_VM sibling may have served this very page while the fault
+    // waited on vm_lock (shared page table): if the PTE is present now,
+    // retry the instruction instead of double-serving it.
+    if (paging_mod.getPageEntryRaw(current.page_table_phys, page_addr)) |pte_now| {
+        if ((pte_now & 1) != 0) return true;
+    }
+
+    const ri = filemap.findFileRegion(task_mod.MmapRegion, &current.mmap_regions, page_addr) orelse return false;
+    const region = &current.mmap_regions[ri];
 
     const plan = filemap.planFault(task_mod.MmapRegion, region, page_addr);
     if (plan.action == .segv) return false; // whole page past EOF
@@ -1114,6 +1144,41 @@ fn serveFilePage(current: anytype, page_addr: u64) bool {
 /// - If ref_count == 1: just make the page writable (sole owner optimization)
 /// - If ref_count > 1: allocate new page, copy content, update PTE
 /// Returns true if the fault was a COW fault and was handled.
+/// Supervisor-mode #PF on a swap entry: swap the page back into the CURRENT
+/// task's address space (the fault runs in the faulting syscall's context).
+/// Returns true when the faulting instruction should be retried. The vm_lock
+/// guard is the same beginFaultCritical the user fault path uses — recursive
+/// when the syscall already holds it, blocking (with shootdown servicing)
+/// against a reclaim scan in progress on a sibling CPU.
+fn trySwapInKernelFault(fault_addr: u64) bool {
+    const paging_mod = @import("paging.zig");
+    const sched = @import("../../proc/sched.zig");
+    const swap = @import("../../mm/swap.zig");
+    if (!swap.isEnabled()) return false;
+
+    const current = sched.currentTask() orelse return false;
+    if (current.page_table_phys == 0) return false;
+
+    const mm_mod = @import("../../mm/mm.zig");
+    var vm_guard = mm_mod.Mm.beginFaultCritical(current.mm, @ptrCast(current));
+    defer vm_guard.release();
+
+    const page_addr = fault_addr & ~@as(u64, paging_mod.PAGE_SIZE - 1);
+    const pte_or_null = paging_mod.getPageEntryRaw(current.page_table_phys, page_addr);
+    if (pte_or_null) |pte_val| {
+        if (swap.isSwapEntry(pte_val)) {
+            const new_pte = swap.swapIn(pte_val) orelse return false;
+            paging_mod.setPageEntryRaw(current.page_table_phys, page_addr, new_pte);
+            asm volatile ("invlpg (%[addr])"
+                :
+                : [addr] "r" (page_addr),
+            );
+            return true;
+        }
+    }
+    return false;
+}
+
 fn handleCowFault(frame: *InterruptFrame, fault_addr: u64) bool {
     const pmm_mod = @import("../../mm/pmm.zig");
     const hhdm_mod = @import("../../mm/hhdm.zig");
@@ -1138,8 +1203,19 @@ fn handleCowFault(frame: *InterruptFrame, fault_addr: u64) bool {
     const pte = paging_mod.getPageEntry(current.page_table_phys, page_addr) orelse return false;
     const pte_val: u64 = @bitCast(pte.*);
 
+    // The mapping changed between the fault and the guard: swap reclaim
+    // (which holds this vm_lock across its whole scan) may have downgraded
+    // then swapped the page out while this fault waited. Retry the
+    // instruction — it re-faults and lands on the demand/swap-in path.
+    if ((pte_val & 1) == 0) return true;
+
     // Check COW bit is set
-    if (pte_val & COW_BIT == 0) return false;
+    if (pte_val & COW_BIT == 0) {
+        // A sibling already made the page writable (COW unshare or mprotect
+        // RW) while this fault waited on vm_lock: the fault is stale, retry.
+        if ((pte_val & 0x2) != 0) return true;
+        return false;
+    }
 
     const old_phys = pte_val & paging_mod.ADDR_MASK;
 

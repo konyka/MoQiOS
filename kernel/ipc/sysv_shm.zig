@@ -311,7 +311,7 @@ pub fn shmat(shmid: u32, shmaddr: u64, shmflg: u64) i64 {
     // able to destroy unrelated mappings.
     for (0..seg.num_pages) |p| {
         const virt = map_addr + @as(u64, @intCast(p)) * PAGE_SIZE;
-        if (paging.isPageMapped(pml4, virt)) return -22; // -EINVAL
+        if (paging.isPageOccupied(pml4, virt)) return -22; // -EINVAL
     }
 
     // Map flags
@@ -642,7 +642,8 @@ fn findFreeRegion(task: *task_mod.Task, num_pages: u32) u64 {
         // way instead of rescanning page by page.
         var p: u32 = 0;
         while (p < num_pages) : (p += 1) {
-            if (isPageMapped(task.page_table_phys, addr + @as(u64, @intCast(p)) * PAGE_SIZE)) break;
+            // Occupied, not merely present: swap entries must not be placed over.
+            if (paging.isPageOccupied(task.page_table_phys, addr + @as(u64, @intCast(p)) * PAGE_SIZE)) break;
         }
         if (p == num_pages) {
             next_free_hint = addr + region_size; // advance hint past this region
