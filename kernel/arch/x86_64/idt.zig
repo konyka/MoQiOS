@@ -676,6 +676,13 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
         fmt.writeHex(frame.error_code);
         serial.writeString("\n");
 
+        // DIAG (§6.47): a user thread fetching from RIP=0 (err=0x14) is the
+        // unresolved 4-worker SMP=4 kill — dump the dying thread's identity,
+        // this CPU's last syscall, and the state of the user stack page
+        // (present? swap entry? zeroed content?) before the task is torn
+        // down. Temporary instrumentation while the root cause is open.
+        if (frame.rip == 0) dumpRipZeroDiag(frame);
+
         if (sched_mod.currentTaskIndex()) |idx| {
             if (task_mod.getTask(idx)) |cur| {
                 if (cur.is_user) {
@@ -746,6 +753,88 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
     while (true) {
         asm volatile ("cli");
         asm volatile ("hlt");
+    }
+}
+
+/// DIAG (§6.47): dump evidence for a user-mode RIP=0 fault — tid/thread
+/// flag, last syscall on this CPU, the raw PTE covering RSP, and the stack
+/// qwords around RSP when the page is present (the slot the fatal `ret`
+/// popped is at [rsp-8]). Read-only: must not perturb the address space.
+fn dumpRipZeroDiag(frame: *InterruptFrame) void {
+    const sched_mod = @import("../../proc/sched.zig");
+    const paging_mod = @import("paging.zig");
+    const hhdm_mod = @import("../../mm/hhdm.zig");
+    const swap_mod = @import("../../mm/swap.zig");
+    const sc = @import("syscall_entry.zig");
+
+    serial.writeString("[RIP0-DIAG]");
+    if (sc.getPerCpuOrNull()) |pc| {
+        serial.writeString(" cpu=");
+        fmt.writeDecimal(pc.cpu_id);
+        serial.writeString(" last_sys=");
+        fmt.writeDecimal64(pc.last_syscall_nr);
+        // The syscall epilogue's exec/signal redirect (%gs:48/56/64) can
+        // replace RCX (user RIP) at sysretq — a stale redirect with a zero
+        // entry lands the thread at RIP=0 without touching its stack.
+        serial.writeString(" exec_pending=");
+        fmt.writeHex(pc.exec_pending);
+        serial.writeString(" exec_new_entry=0x");
+        fmt.writeHex(pc.exec_new_entry);
+        serial.writeString(" exec_new_stack=0x");
+        fmt.writeHex(pc.exec_new_stack);
+    }
+    const cur = sched_mod.currentTask() orelse {
+        serial.writeString(" no-current-task\n");
+        return;
+    };
+    serial.writeString(" tid=");
+    fmt.writeDecimal(cur.tid);
+    serial.writeString(" is_thread=");
+    fmt.writeDecimal(@intFromBool(cur.is_thread));
+    serial.writeString(" rsp=0x");
+    fmt.writeHex(frame.rsp);
+    serial.writeString(" rbp=0x");
+    fmt.writeHex(frame.rbp);
+    serial.writeString("\n");
+
+    if (cur.page_table_phys == 0) return;
+    const rsp_page = frame.rsp & ~@as(u64, 4095);
+    const pte_opt = paging_mod.getPageEntryRaw(cur.page_table_phys, rsp_page);
+    serial.writeString("[RIP0-DIAG] pte(rsp_page=0x");
+    fmt.writeHex(rsp_page);
+    serial.writeString(")=");
+    if (pte_opt) |pte| {
+        fmt.writeHex(pte);
+        if (pte & 1 != 0) {
+            serial.writeString(" PRESENT");
+        } else if (swap_mod.isSwapEntry(pte)) {
+            serial.writeString(" SWAP slot=");
+            fmt.writeDecimal64(swap_mod.decodeSwapEntry(pte));
+        } else {
+            serial.writeString(" not-present-non-swap");
+        }
+    } else {
+        serial.writeString("UNMAPPED");
+    }
+    serial.writeString("\n");
+
+    if (pte_opt) |pte| {
+        if (pte & 1 != 0) {
+            const phys = pte & paging_mod.ADDR_MASK;
+            const base: [*]const u64 = @ptrFromInt(hhdm_mod.physToVirt(phys));
+            const off = frame.rsp & 4095;
+            var start: u64 = if (off >= 64) off - 64 else 0;
+            start &= ~@as(u64, 7);
+            serial.writeString("[RIP0-DIAG] stack qwords:");
+            var a = start;
+            while (a < 4096 and a < off + 16) : (a += 8) {
+                serial.writeString(" +0x");
+                fmt.writeHex(a);
+                serial.writeString("=0x");
+                fmt.writeHex(base[a / 8]);
+            }
+            serial.writeString("\n");
+        }
     }
 }
 

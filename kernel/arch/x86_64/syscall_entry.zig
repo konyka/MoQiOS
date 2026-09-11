@@ -107,6 +107,9 @@ pub const PerCpu = extern struct {
     /// from a signal-frame push after fork) clobbers %%gs:16, and the outer
     /// epilogue must still resume through its OWN entry frame.
     anchor_switched: u8 = 0,
+    /// DIAG (§6.47): last syscall number dispatched on this CPU — lets the
+    /// page-fault path tell whether a dying thread was mid-churn or exiting.
+    last_syscall_nr: u64 = 0,
 };
 
 /// Per-CPU data array, indexed by CPU logical ID.
@@ -456,6 +459,7 @@ fn prepareSyscallCpu() void {
 pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
     prepareSyscallCpu();
     const syscall_nr = frame.rax;
+    getPerCpu().last_syscall_nr = syscall_nr; // DIAG (§6.47)
 
     if (dispatchLinuxRlimitAlias(frame, syscall_nr)) return;
 
