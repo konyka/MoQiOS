@@ -25,12 +25,14 @@ inline fn activeRoot() u64 {
     return paging.currentRoot();
 }
 
-/// x86_64 swap integration: a swap entry (non-present PTE with the bit-1
-/// marker) names a page reclaim has evicted. The range checks below must
-/// ADMIT it — the copy itself then faults, the supervisor #PF path swaps the
-/// page back in, and the retry completes. Refusing it here instead turned
-/// every syscall touching a swapped user page into a spurious EFAULT/short
-/// copy (hello96's own PASS/FAIL prints vanished that way).
+/// x86_64 swap integration: a swap entry (non-present PTE with the bit-11
+/// marker, see mm/pte_kind.zig) names a page reclaim has evicted. The range
+/// checks below must ADMIT it — the copy itself then faults, the supervisor
+/// #PF path swaps the page back in, and the retry completes. Refusing it here
+/// instead turned every syscall touching a swapped user page into a spurious
+/// EFAULT/short copy (hello96's own PASS/FAIL prints vanished that way).
+/// A PROT_NONE reservation (bit-10 marker) is NOT admitted: the copy must
+/// fail with EFAULT exactly like an unmapped page.
 fn userPageMapped(root: u64, page: u64) bool {
     if (paging.isUserAccessible(root, page)) return true;
     if (comptime builtin.cpu.arch == .x86_64) {

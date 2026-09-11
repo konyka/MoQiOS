@@ -805,13 +805,15 @@ fn dumpRipZeroDiag(frame: *InterruptFrame) void {
     serial.writeString(")=");
     if (pte_opt) |pte| {
         fmt.writeHex(pte);
-        if (pte & 1 != 0) {
-            serial.writeString(" PRESENT");
-        } else if (swap_mod.isSwapEntry(pte)) {
-            serial.writeString(" SWAP slot=");
-            fmt.writeDecimal64(swap_mod.decodeSwapEntry(pte));
-        } else {
-            serial.writeString(" not-present-non-swap");
+        switch (@import("../../mm/pte_kind.zig").classify(pte)) {
+            .present => serial.writeString(" PRESENT"),
+            .swap => {
+                serial.writeString(" SWAP slot=");
+                fmt.writeDecimal64(swap_mod.decodeSwapEntry(pte));
+            },
+            .prot_none => serial.writeString(" PROT_NONE-RESERVATION"),
+            .free => serial.writeString(" FREE"),
+            .unknown => serial.writeString(" not-present-unknown"),
         }
     } else {
         serial.writeString("UNMAPPED");
@@ -874,23 +876,31 @@ fn handleDemandPage(frame: *InterruptFrame, fault_addr: u64) bool {
     var vm_guard = mm_mod.Mm.beginFaultCritical(current.mm, @ptrCast(current));
     defer vm_guard.release();
 
-    // Check if this is a swap-in (page was swapped out)
+    // Classify any live entry at the faulting address (mm/pte_kind.zig):
+    // swap entries swap back in; PROT_NONE reservations and unknown
+    // non-present entries must SIGSEGV — never demand-fill over them (a
+    // reservation's frame is deliberately inaccessible, and the pre-§6.48
+    // encoding collision "swapped in" its frame number as a disk slot).
     const swap = @import("../../mm/swap.zig");
-    if (swap.isEnabled()) {
-        const pte_or_null = paging_mod.getPageEntryRaw(current.page_table_phys, page_addr);
-        if (pte_or_null) |pte_val| {
-            if (swap.isSwapEntry(pte_val)) {
-                // Swap in: read the page back from disk
-                const new_pte = swap.swapIn(pte_val) orelse return false;
-                // Update the PTE
-                paging_mod.setPageEntryRaw(current.page_table_phys, page_addr, new_pte);
-                // Flush TLB
-                asm volatile ("invlpg (%[addr])"
-                    :
-                    : [addr] "r" (page_addr),
-                );
-                return true;
-            }
+    const pte_kind = @import("../../mm/pte_kind.zig");
+    if (paging_mod.getPageEntryRaw(current.page_table_phys, page_addr)) |pte_val| {
+        switch (pte_kind.classify(pte_val)) {
+            .swap => {
+                if (swap.isEnabled()) {
+                    // Swap in: read the page back from disk
+                    const new_pte = swap.swapIn(pte_val) orelse return false;
+                    // Update the PTE
+                    paging_mod.setPageEntryRaw(current.page_table_phys, page_addr, new_pte);
+                    // Flush TLB
+                    asm volatile ("invlpg (%[addr])"
+                        :
+                        : [addr] "r" (page_addr),
+                    );
+                    return true;
+                }
+            },
+            .prot_none, .unknown => return false,
+            else => {},
         }
     }
 
@@ -1063,17 +1073,25 @@ fn serveFilePage(current: anytype, page_addr: u64) bool {
     // Those must still swap back in; otherwise reclaim converts them into
     // spurious SIGSEGVs (hello96 RED).
     const swap = @import("../../mm/swap.zig");
-    if (swap.isEnabled()) {
-        if (paging_mod.getPageEntryRaw(current.page_table_phys, page_addr)) |pte_val| {
-            if (swap.isSwapEntry(pte_val)) {
-                const new_pte = swap.swapIn(pte_val) orelse return false;
-                paging_mod.setPageEntryRaw(current.page_table_phys, page_addr, new_pte);
-                asm volatile ("invlpg (%[addr])"
-                    :
-                    : [addr] "r" (page_addr),
-                );
-                return true;
-            }
+    const pte_kind = @import("../../mm/pte_kind.zig");
+    if (paging_mod.getPageEntryRaw(current.page_table_phys, page_addr)) |pte_val| {
+        switch (pte_kind.classify(pte_val)) {
+            .swap => {
+                if (swap.isEnabled()) {
+                    const new_pte = swap.swapIn(pte_val) orelse return false;
+                    paging_mod.setPageEntryRaw(current.page_table_phys, page_addr, new_pte);
+                    asm volatile ("invlpg (%[addr])"
+                        :
+                        : [addr] "r" (page_addr),
+                    );
+                    return true;
+                }
+            },
+            // A PROT_NONE reservation must SIGSEGV even when region metadata
+            // covers the address — demand-serving it would silently resurrect
+            // an inaccessible page (and leak the preserved frame).
+            .prot_none, .unknown => return false,
+            else => {},
         }
     }
 

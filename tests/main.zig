@@ -4502,9 +4502,10 @@ test "swap policy: swapon flags word admits no flags yet" {
 
 test "mprotect policy: swap entries keep their marker, only preserved permission bits move" {
     const mprot_policy = kt.mprotect_policy;
-    // Non-present + bit1 marker = swap entry (see mm/swap.zig's PTE format):
-    // writable is preserved at bit 2, COW at bit 3, slot at bits 12-51, NX at 63.
-    const entry: u64 = 0x2 | (@as(u64, 0x12345) << 12) | (@as(u64, 1) << 2) | (@as(u64, 1) << 63);
+    // Non-present + bit-11 marker = swap entry (see mm/pte_kind.zig's PTE
+    // format): writable is preserved at bit 2, COW at bit 3, slot at bits
+    // 12-51, NX at 63.
+    const entry: u64 = (@as(u64, 1) << 11) | (@as(u64, 0x12345) << 12) | (@as(u64, 1) << 2) | (@as(u64, 1) << 63);
 
     // Not a swap entry → null (caller runs the normal present-page path).
     try std.testing.expectEqual(@as(?u64, null), mprot_policy.swapEntryUpdate(0x0, 2));
@@ -4516,14 +4517,70 @@ test "mprotect policy: swap entries keep their marker, only preserved permission
 
     // PROT_READ: drop preserved writable, set NX.
     const ro = mprot_policy.swapEntryUpdate(entry, 1).?;
-    try std.testing.expectEqual(@as(u64, 0x2 | (0x12345 << 12) | (1 << 63)), ro);
+    try std.testing.expectEqual(@as(u64, (1 << 11) | (0x12345 << 12) | (1 << 63)), ro);
     // PROT_READ|WRITE: keep preserved writable, set NX.
     const rw = mprot_policy.swapEntryUpdate(entry & ~(@as(u64, 1) << 2), 3).?;
-    try std.testing.expectEqual(@as(u64, 0x2 | (0x12345 << 12) | (1 << 2) | (1 << 63)), rw);
+    try std.testing.expectEqual(@as(u64, (1 << 11) | (0x12345 << 12) | (1 << 2) | (1 << 63)), rw);
     // PROT_READ|EXEC: clear NX, drop writable.
     const rx = mprot_policy.swapEntryUpdate(entry, 5).?;
-    try std.testing.expectEqual(@as(u64, 0x2 | (0x12345 << 12)), rx);
+    try std.testing.expectEqual(@as(u64, (1 << 11) | (0x12345 << 12)), rx);
     // The COW-preserved bit (3) survives every update.
     const cow = entry | (@as(u64, 1) << 3);
     try std.testing.expectEqual(cow, mprot_policy.swapEntryUpdate(cow, 3).?);
+}
+
+test "pte kind: classify distinguishes free, present, swap, prot_none and unknown" {
+    const pte_kind = kt.pte_kind;
+    try std.testing.expectEqual(pte_kind.Kind.free, pte_kind.classify(0));
+    try std.testing.expectEqual(pte_kind.Kind.present, pte_kind.classify(0x1));
+    // Present wins over both markers — a live page is never reclassified.
+    try std.testing.expectEqual(pte_kind.Kind.present, pte_kind.classify(0x12345000 | 0x7 | (1 << 10) | (1 << 11)));
+
+    // Swap entry: bit-11 marker + slot round-trip, preserved bits coexist.
+    const swap_entry = pte_kind.encodeSwapEntry(0x12345);
+    try std.testing.expectEqual(pte_kind.Kind.swap, pte_kind.classify(swap_entry));
+    try std.testing.expectEqual(pte_kind.Kind.swap, pte_kind.classify(swap_entry | 0xC | (@as(u64, 1) << 63)));
+    try std.testing.expectEqual(@as(u64, 0x12345), pte_kind.decodeSwapEntry(swap_entry));
+    const max_slot = pte_kind.encodeSwapEntry(0xF_FFFF_FFFF) | 0x4 | 0x8 | (@as(u64, 1) << 63);
+    try std.testing.expectEqual(pte_kind.Kind.swap, pte_kind.classify(max_slot));
+    try std.testing.expectEqual(@as(u64, 0xF_FFFF_FFFF), pte_kind.decodeSwapEntry(max_slot));
+    try std.testing.expectEqual(@as(u64, 0), pte_kind.decodeSwapEntry(pte_kind.encodeSwapEntry(0)));
+
+    // PROT_NONE reservation of a formerly writable page: present=0, frame
+    // and writable kept, reservation marker set — never a swap entry.
+    const reservation = (@as(u64, 0x12345) << 12) | pte_kind.PROT_NONE_MARKER | 0x6;
+    try std.testing.expectEqual(pte_kind.Kind.prot_none, pte_kind.classify(reservation));
+
+    // Legacy shape (present=0 + writable, no markers) is unknown — and the
+    // pre-fix collision must stay closed: bit 1 alone is never a swap entry.
+    try std.testing.expectEqual(pte_kind.Kind.unknown, pte_kind.classify((@as(u64, 0x12345) << 12) | 0x6));
+    try std.testing.expect(pte_kind.classify((@as(u64, 0x12345) << 12) | 0x2) != pte_kind.Kind.swap);
+}
+
+test "pte kind: a PROT_NONE reservation never classifies as a swap entry" {
+    const pte_kind = kt.pte_kind;
+    // The §6.48 collision, closed: mprotect(PROT_NONE) preserves the frame
+    // and the writable bit (bit 1) — the old swap marker. With the marker on
+    // bit 10 the reservation classifies distinctly; even the legacy unmarked
+    // shape must never be read as a swap entry (that read the PFN as a disk
+    // slot and "swapped in" garbage — silent corruption).
+    const reservation: u64 = (@as(u64, 0x12345) << 12) | pte_kind.PROT_NONE_MARKER | 0x6;
+    try std.testing.expectEqual(pte_kind.Kind.prot_none, pte_kind.classify(reservation));
+    try std.testing.expect(pte_kind.classify(reservation) != pte_kind.Kind.swap);
+    try std.testing.expectEqual(pte_kind.Kind.swap, pte_kind.classify(pte_kind.encodeSwapEntry(0x12345) | 0x6));
+}
+
+test "mprotect policy: a PROT_NONE reservation is never mistaken for a swap entry" {
+    const mprot_policy = kt.mprotect_policy;
+    // mprotect(PROT_NONE) keeps the frame and every permission bit, clearing
+    // only present — a formerly writable page keeps bit 1 set, which the
+    // pre-§6.48 swap predicate (non-present + bit 1) misread as a swap entry:
+    // a PROT_RW re-mprotect then took the swap-entry branch, left present=0
+    // and the mapping was never restored. With the bit-10 reservation marker
+    // or without any marker, swapEntryUpdate must return null so the caller
+    // runs the normal present-restoring path.
+    const legacy_reservation: u64 = (@as(u64, 0x12345) << 12) | 0x6; // writable|user + PFN
+    try std.testing.expectEqual(@as(?u64, null), mprot_policy.swapEntryUpdate(legacy_reservation, 3));
+    const marked_reservation: u64 = legacy_reservation | (@as(u64, 1) << 10);
+    try std.testing.expectEqual(@as(?u64, null), mprot_policy.swapEntryUpdate(marked_reservation, 3));
 }

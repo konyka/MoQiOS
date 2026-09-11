@@ -7,12 +7,15 @@
 ///   - Page fault handler detects swap entry, reads page back from disk
 ///   - Clock/second-chance algorithm selects victim pages
 ///
-/// PTE swap entry format (when present=0):
+/// PTE swap entry format (when present=0) — see mm/pte_kind.zig for the full
+/// non-present-entry taxonomy:
 ///   Bit 0:     present = 0
-///   Bit 1:     swap marker = 1 (distinguishes from unmapped)
+///   Bit 1:     (free — the pre-§6.48 marker; it collided with the writable
+///              bit a PROT_NONE reservation preserves, so the marker moved)
 ///   Bit 2:     preserved writable flag (from PTE bit 1)
 ///   Bit 3:     preserved COW flag (from PTE bit 9)
-///   Bits 4-11: reserved
+///   Bits 4-10: reserved
+///   Bit 11:    swap marker = 1 (distinguishes from unmapped/PROT_NONE)
 ///   Bits 12-51: swap slot index (up to 2^40 slots = 4TB swap)
 ///   Bits 52-62: reserved
 ///   Bit 63:    NX (no-execute, preserved)
@@ -37,7 +40,7 @@ comptime {
 }
 
 const PAGE_SIZE: u64 = 4096;
-const SWAP_MARKER_BIT: u64 = 0x2; // Bit 1 set = swap entry
+const pte_kind = @import("pte_kind.zig");
 const MAX_SWAP_SLOTS: u64 = 65536; // 256MB of swap
 const SECTORS_PER_PAGE: u32 = 8; // 4KB / 512B
 
@@ -131,17 +134,17 @@ fn freeSlot(slot: u64) void {
 
 /// Check if a PTE is a swap entry.
 pub fn isSwapEntry(pte: u64) bool {
-    return (pte & 1) == 0 and (pte & SWAP_MARKER_BIT) != 0;
+    return pte_kind.classify(pte) == .swap;
 }
 
 /// Encode a swap slot index into a PTE swap entry.
 pub fn encodeSwapEntry(slot: u64) u64 {
-    return SWAP_MARKER_BIT | (slot << 12);
+    return pte_kind.encodeSwapEntry(slot);
 }
 
 /// Extract the swap slot index from a PTE swap entry.
 pub fn decodeSwapEntry(pte: u64) u64 {
-    return (pte >> 12) & 0xFFFF_FFFF_F; // 40 bits
+    return pte_kind.decodeSwapEntry(pte);
 }
 
 /// Swap out a page: write its contents to a swap slot and update PTE.
@@ -180,7 +183,7 @@ fn swapOut(pml4_phys: u64, virt_addr: u64, pte_ptr: *u64) bool {
     };
 
     // Phase 1: revoke write access before the copy. Bit 1 is the writable bit
-    // for present pages (it doubles as the swap marker only once present=0).
+    // for present pages (the swap marker lives at bit 11 once present=0).
     pte_ptr.* = pte & ~@as(u64, 0x2);
     tlb.shootdownRange(virt_addr, 1, pml4_phys);
 

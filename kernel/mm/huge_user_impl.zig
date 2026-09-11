@@ -85,8 +85,10 @@ const x86 = struct {
             if (blk >= addr and blk + huge.HUGE_BYTES <= end) {
                 if (prot == 0) { // PROT_NONE
                     pde.present = false; // frame preserved, mirrors the 4K path
+                    pde.os_bits |= 0b010; // bit-10 reservation marker
                 } else {
                     pde.present = true;
+                    pde.os_bits &= 0b101; // drop any reservation marker
                     pde.no_execute = (prot & 4) == 0; // PROT_EXEC
                     pde.user = true;
                     pde.writable = (prot & 2) != 0; // PROT_WRITE
@@ -106,8 +108,10 @@ const x86 = struct {
             if (blk >= addr and blk + huge.HUGE_BYTES <= end) {
                 if (prot == 0) {
                     pde.present = false;
+                    pde.os_bits |= 0b010; // bit-10 reservation marker
                 } else {
                     pde.present = true;
+                    pde.os_bits &= 0b101; // drop any reservation marker
                     pde.no_execute = (prot & 4) == 0;
                     pde.user = true;
                     pde.writable = (prot & 2) != 0;

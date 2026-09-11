@@ -172,12 +172,13 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
         const pte_opt = paging.getProtectionPageEntry(cur.page_table_phys, v);
         const pte = pte_opt orelse continue; // skip unmapped pages
 
-        // Swap entries (non-present + bit-1 marker; the frame is on disk):
+        // Swap entries (non-present + bit-11 marker; the frame is on disk):
         // the generic rewrite below would set present=1 on the swap slot and
-        // clear the marker via `writable`. Only the preserved permission
+        // leave the marker behind. Only the preserved permission
         // bits (writable at bit 2, NX at bit 63) may move — swap-in then
         // restores the NEW permissions (mprotect_policy.swapEntryUpdate,
-        // host-tested; hello96 RED).
+        // host-tested; hello96 RED). PROT_NONE reservations (bit-10 marker)
+        // are NOT swap entries and take the normal path below.
         if (policy.swapEntryUpdate(@bitCast(pte.*), prot)) |updated| {
             pte.* = @bitCast(updated);
             continue;
@@ -187,9 +188,24 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
             // Clear present bit — keep physical frame so we can restore later.
             // On x86_64, when present=0 the CPU ignores all other bits except
             // the physical frame field, which we preserve for re-mprotect.
+            // Set the bit-10 reservation marker so fault paths can tell this
+            // entry apart from a swap entry (bit 11) and SIGSEGV the access
+            // instead of "swapping in" the frame number as a disk slot.
+            // Only LIVE entries become reservations: a never-faulted page is
+            // a zero entry, and marking it would fabricate an occupied
+            // address (isPageOccupied) that holds no frame at all.
+            if (@as(u64, @bitCast(pte.*)) != 0) pte.os_bits |= 0b010;
             pte.present = false;
+        } else if (@as(u64, @bitCast(pte.*)) == 0) {
+            // Never-faulted page (file-backed demand entry): no frame and no
+            // reservation to re-permit. The first access demand-faults with
+            // the region's prot (updated by the metadata pass below), so the
+            // entry must stay zero — setting present here would map physical
+            // frame 0 into user space.
+            continue;
         } else {
             pte.present = true;
+            pte.os_bits &= 0b101; // drop any PROT_NONE reservation marker
             // PROT_EXEC → clear no_execute; no EXEC → set no_execute
             pte.no_execute = (prot & PROT_EXEC) == 0;
             // Always user-accessible for user-space mprotect

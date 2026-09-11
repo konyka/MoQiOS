@@ -33,6 +33,7 @@ pub const splice = @import("fs/splice.zig");
 pub const futex_key = @import("sync/futex_key.zig");
 pub const mlock_policy = @import("mm/mlock_policy.zig");
 pub const mprotect_policy = @import("mm/mprotect_policy.zig");
+pub const pte_kind = @import("mm/pte_kind.zig");
 pub const munmap_policy = @import("mm/munmap_policy.zig");
 pub const process_vm_policy = @import("mm/process_vm_policy.zig");
 pub const mm = @import("mm/mm.zig");
