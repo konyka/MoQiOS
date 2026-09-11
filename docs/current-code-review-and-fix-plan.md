@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-09-11 (§6.45: swap 动态可执行化——swapon 改按路径选设备且刻意无默认（swap_policy.admitTarget 仅拒 virtio-blk 盘0/启动盘，EPERM），pmm reclaim-floor 测试钩子（syscall 485，触发 reclaim 但绝不失败分配），hello96 main+1 CLONE_VM 线程 swap 压力验收（SMP=1/2/4 全绿）；动态压力暴露并修复五个真实缺陷：isPageMapped 视 swap 项为空闲导致 mmap/brk/SHM 放置冲突（新增 isPageOccupied）、mprotect 践踏 swap 项、不可达 swap-in（无区域覆盖页/兄弟线程栈）、syscall 用户拷贝遇 swap 项 EFAULT（supervisor #PF swap-in 重试）、swap 槽位越盘界（swap_slot_limit 容量封顶）；swapOut 改两阶段写回（先降级只读+ranged-invlpg shootdown 再拷盘）关闭丢失写竞态；收窄与残留如实记录（4-worker SMP=4 的 RIP=0 未根治、批量 swapOut 变体已回退、reclaim 持锁 IO 与 slot 泄漏仍开放）；291/291 host 测试 + 3 架构构建 + SMP=1/2 smoke + SMP=4×3 压测全绿；prior: 2026-09-10 (§6.44: vm_lock coverage extended — swap-reclaim two-pass PTE writes under the non-blocking recursion-safe beginReclaimCritical guard (tryAcquire never waits, contention skips, fault→swapIn→allocPage recursion proceeds unguarded), SysV SHM shmat/shmdt/exit-detach and user-driver MMIO/DMA map/unmap plus reap-side cleanupTask under vm_lock (single sanctioned task_lock→vm_lock edge, cycle-freedom re-verified), shared-Mm (refs>1) exec rejected with EPERM, fork region-metadata residual closed as safe-by-construction; swap dynamic exercise remains a BLOCKED follow-up (no swapon caller; hardwired dev0/LBA0); 287/287 host tests + 3-arch builds + SMP=1/2 smoke + SMP=4×3 stress green; prior: 2026-09-10 §6.43: page-fault PTE mutations serialized under Mm vm_lock — ServicingSpinlock prerequisite closes a pre-existing failShootdown halt hazard (vm_lock waiters now service pending TLB shootdowns while spinning IRQ-off), decideFault/beginFaultCritical guard handleCowFault/handleDemandPage/handleFileFault, fork/clone COW page-table clone guarded at call sites, 284/284 host tests + 3-arch builds + SMP=1/2 smoke + SMP=4×3 stress green; prior: 2026-09-10 §6.42 user-copy return-value governance closed — the ~80 `_ = copyToUser` discards from §5.2q verified already cleaned (grep zero-hit), the last 6 discarded `copyFromUser` results in mount/umount2/vmsplice/setitimer fault-checked, hello95 acceptance with pre-fix kernel-panic RED and SMP=1/2 GREEN; 2026-09-09 §6.41 eventfd/timerfd raw-index-as-fd root fix + vfs read/write wiring with Linux semantics, hello93/hello94 acceptance, 282/282 host tests; 2026-09-07/08 §6.39-6.40 — 5-way audit, 28 defects TDD-fixed incl. mprotect COW TOCTOU, ipc reply handoff, TCP send-cursor invariant, all §6.39 follow-ups closed); earlier: 2026-08 (7-area full-repository audit round recorded in §6: memory-safety / concurrency / performance / userland fixes, SMP #GP root cause in TLB shootdown, all builds and SMP=1/SMP=4 smokes passed; earlier: 2026-07-28 full-repository audit — copy_file_range fd/rollback, socket option user-copy/SO_ERROR/sockaddr lengths, futex EFAULT/waitv limit, SysV IPC_SET/rt_sigsuspend copies, virtio-net/e1000 rollback/timeouts, hello38-41 regression gates)
+> Last update: 2026-09-11 (§6.46: PCID 下 flushLocal 的 >32 页 CR3-reload 回退"退化为空操作"嫌疑证伪——SDM vol.3A 明确 MOV to CR3 的 bit63 是只写命令位（"does not modify bit 63 of CR3, which is reserved and always 0"），KVM/PCID 实证 no-flush 写后立即读回 bit63 恒 0，新增 hello97 回归门（管道乒乓构造 no-flush 重入 + 64 页 mprotect 触发回退 + 探针写须缺页）在未改动内核上 KVM/TCG 双 PASS，内核零改动仅补 CR3_NO_FLUSH 注释，更正 §6.45 对批量 swapOut 变体 SMP=4 RIP=0 的错误归因；291/291 host 测试 + 3 架构构建 + TCG SMP=1/2 smoke + SMP=4×3 压测全绿；prior: 2026-09-11 (§6.45: swap 动态可执行化——swapon 改按路径选设备且刻意无默认（swap_policy.admitTarget 仅拒 virtio-blk 盘0/启动盘，EPERM），pmm reclaim-floor 测试钩子（syscall 485，触发 reclaim 但绝不失败分配），hello96 main+1 CLONE_VM 线程 swap 压力验收（SMP=1/2/4 全绿）；动态压力暴露并修复五个真实缺陷：isPageMapped 视 swap 项为空闲导致 mmap/brk/SHM 放置冲突（新增 isPageOccupied）、mprotect 践踏 swap 项、不可达 swap-in（无区域覆盖页/兄弟线程栈）、syscall 用户拷贝遇 swap 项 EFAULT（supervisor #PF swap-in 重试）、swap 槽位越盘界（swap_slot_limit 容量封顶）；swapOut 改两阶段写回（先降级只读+ranged-invlpg shootdown 再拷盘）关闭丢失写竞态；收窄与残留如实记录（4-worker SMP=4 的 RIP=0 未根治、批量 swapOut 变体已回退、reclaim 持锁 IO 与 slot 泄漏仍开放）；291/291 host 测试 + 3 架构构建 + SMP=1/2 smoke + SMP=4×3 压测全绿；prior: 2026-09-10 (§6.44: vm_lock coverage extended — swap-reclaim two-pass PTE writes under the non-blocking recursion-safe beginReclaimCritical guard (tryAcquire never waits, contention skips, fault→swapIn→allocPage recursion proceeds unguarded), SysV SHM shmat/shmdt/exit-detach and user-driver MMIO/DMA map/unmap plus reap-side cleanupTask under vm_lock (single sanctioned task_lock→vm_lock edge, cycle-freedom re-verified), shared-Mm (refs>1) exec rejected with EPERM, fork region-metadata residual closed as safe-by-construction; swap dynamic exercise remains a BLOCKED follow-up (no swapon caller; hardwired dev0/LBA0); 287/287 host tests + 3-arch builds + SMP=1/2 smoke + SMP=4×3 stress green; prior: 2026-09-10 §6.43: page-fault PTE mutations serialized under Mm vm_lock — ServicingSpinlock prerequisite closes a pre-existing failShootdown halt hazard (vm_lock waiters now service pending TLB shootdowns while spinning IRQ-off), decideFault/beginFaultCritical guard handleCowFault/handleDemandPage/handleFileFault, fork/clone COW page-table clone guarded at call sites, 284/284 host tests + 3-arch builds + SMP=1/2 smoke + SMP=4×3 stress green; prior: 2026-09-10 §6.42 user-copy return-value governance closed — the ~80 `_ = copyToUser` discards from §5.2q verified already cleaned (grep zero-hit), the last 6 discarded `copyFromUser` results in mount/umount2/vmsplice/setitimer fault-checked, hello95 acceptance with pre-fix kernel-panic RED and SMP=1/2 GREEN; 2026-09-09 §6.41 eventfd/timerfd raw-index-as-fd root fix + vfs read/write wiring with Linux semantics, hello93/hello94 acceptance, 282/282 host tests; 2026-09-07/08 §6.39-6.40 — 5-way audit, 28 defects TDD-fixed incl. mprotect COW TOCTOU, ipc reply handoff, TCP send-cursor invariant, all §6.39 follow-ups closed); earlier: 2026-08 (7-area full-repository audit round recorded in §6: memory-safety / concurrency / performance / userland fixes, SMP #GP root cause in TLB shootdown, all builds and SMP=1/SMP=4 smokes passed; earlier: 2026-07-28 full-repository audit — copy_file_range fd/rollback, socket option user-copy/SO_ERROR/sockaddr lengths, futex EFAULT/waitv limit, SysV IPC_SET/rt_sigsuspend copies, virtio-net/e1000 rollback/timeouts, hello38-41 regression gates)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -2797,6 +2797,62 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   `[TLB] FATAL`、无 `[PMM] BUG`、无停机。
 - **提交**：`e58aca0`（swapon 定向 + 准入门 + floor 钩子 + host 测试）、
   `59c3a54`（swap 共存缺口 D1-D5 + 两阶段 swapOut）、`bf49690`（hello96 + 接线）。
+
+### 6.46 PCID 下 CR3-reload 全空间 flush"空操作"嫌疑——证伪、实证与回归门（2026-09-11）
+
+- **嫌疑来源**：§6.45 残留怀疑 `flushLocal`（kernel/arch/x86_64/tlb.zig）
+  的 >32 页回退 `reloadCr3`（`mov %cr3,%rax; mov %rax,%cr3` 原样重写）在
+  PCID 下退化为空操作——理由是 switchCr3 的 A→B→A 快路径曾以 bit 63
+  （no-flush）写入 CR3，"驻留 CR3 携带 bit 63"会使原样重写不刷新任何
+  表项。受影响面被评估为全部 >32 页 flush 回退（mprotect 整段、fork COW
+  每 PT 512 页、clone 末尾全空间广播、大段 SysV SHM）及 IPI 远端路径
+  （`servicePendingShootdown`→`flushLocal`）。
+- **前提复核结论：证伪，无缺陷，内核代码零改动。** 双重证据：
+  - **权威语义**：Intel SDM vol. 3A「MOV—Move to/from Control Registers」
+    明确写道："If CR4.PCIDE = 1, bit 63 of the source operand to MOV to CR3
+    determines whether the instruction invalidates entries in the TLBs and the
+    paging-structure caches… **The instruction does not modify bit 63 of CR3,
+    which is reserved and always 0.**" 即 bit 63 是只写命令位，从不驻留于
+    CR3；`mov %cr3,%rax` 读回值 bit63 恒为 0。因此 `reloadCr3` 的原样重写
+    必然以 bit63=0 写入——PCIDE=1 下失效当前 PCID 的全部非 global 项，
+    PCIDE=0 下维持 legacy 全失效。回退语义在两种模式下都正确。
+  - **KVM 实证**（宿主机 /dev/kvm，`-enable-kvm -cpu host`，客户机串口
+    `[PCID] enabled (12-bit)`）：临时插桩在 switchCr3 每次 no-flush 写入后
+    立即读回 CR3——整次启动 94 次 no-flush 写，读回值 bit63 全部为 0
+    （例：写 `pml4=0x2f1000|pcid=2|bit63` → 读回 `0x2f1002`）。
+- **回归门 hello97（user/hello97.c，永久保留）**：SMP=1 确定性构造——
+  ① 64 页（>32 阈值）匿名映射逐页写入，保证 TLB 持有可写项；② 管道乒乓
+  驱动 parent→child→parent 调度往返，其间无本空间 shootdown，切回走
+  PCID no-flush 快路径（TCG 下为无害 legacy flush）；③ 一次 64 页
+  `mprotect(PROT_READ)` 触发 flushLocal 的 CR3-reload 回退；④ 探针写页 0
+  ——真实 flush 则写缺页进 SIGSEGV 处理程序打印 PASS（日志可见
+  `[#PF] err=0x7` 写保护违例）；若回退真退化为空操作，陈旧可写项会让写
+  静默落地打印 FAIL。**未改动的既有内核（a8c67a7）在 KVM/PCID 下直接
+  PASS**，TCG（PCID 不可用）下亦 PASS。接线：build.zig c_programs、
+  tools/qemu_run.sh USER_PROGRAMS、servers/init run_test、
+  tools/qemu_smoke.sh 标记。附注：mprotect 是唯一不经批拆分的整段
+  shootdownRange 调用点（munmap 的 unmapRange 按 32 页分批，不触发回退）。
+- **§6.45 残留归因更正**：该节把批量 swapOut 变体的 SMP=4 RIP=0 复现归因于
+  "PCID no-flush 驻留 CR3 下 CR3-reload 不刷新"——不成立：TCG 根本没有
+  PCID（`pcid.active=false`），且 bit 63 本就不驻留。该失败的真实原因未
+  定位，应与同节已列的 4-worker RIP=0 残留（线程集中退出/高强度争用下调度
+  或帧处理残缺）同源待查；批量变体回退决定维持不变。"TLB 整空间 flush 的
+  PCID 安全性"开放项就此关闭。
+- **附带观察（不属本切片处理）**：KVM 引导在 NVMe 中断驱动读取处停滞
+  （MSI-X 中断不到达，TCG 正常；疑为既有 KVM/MSI-X 缺口）。hello97 的 KVM
+  验证以 `MOQI_NVME=0` 进行，其余启动自检（AHCI/virtio-blk/ext2）在 KVM
+  下全绿并到达 shell。`[PCID] enabled` 路径由此首次获得真实（虚拟化）硬件
+  覆盖，回应了 §6.42 以来"真实硬件 PCID no-flush 路径未经硅验证"的残留。
+- **过程说明（TDD 试探已回滚）**：曾按嫌疑方向写 RED host 测试
+  （`flushingReloadValue` 构造 bit63 清零的 CR3 值）并实现对应修复；证伪后
+  全部回滚（stash 丢弃），仅在 pcid_alloc.zig 的 CR3_NO_FLUSH 注释中补充
+  bit63 只写语义以防再次误判。
+- **门禁**：`zig build test` 291/291（基线，无新增 host 测试）；`zig build`
+  / `-Darch=riscv64` / `-Darch=aarch64` 全绿；TCG smoke SMP=1、SMP=2 PASS
+  （含 `hello97: PASS`）；SMP=4 压测连续 3 次 PASS，串口无 `[TLB] FATAL`、
+  无 panic；KVM SMP=1 手工运行 hello97 PASS（串口无 `[TLB] FATAL`）。
+- **提交**：`741e5d3`（hello97 回归门 + 接线 + pcid_alloc 注释）、本节随
+  docs 提交。
 
 ---
 
