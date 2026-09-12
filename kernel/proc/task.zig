@@ -392,6 +392,58 @@ comptime {
     _ = pinTaskMmByTid;
 }
 
+/// One retained address-space reference from snapshotDistinctMms.
+/// `Mm.page_table_phys` is immutable for the Mm's lifetime, and the retained
+/// reference keeps the page-table tree alive (its final destroy is the Mm
+/// finalizer), so the snapshot stays valid after task_lock is dropped.
+pub const MmSnapshot = struct {
+    mm: *Mm,
+    page_table_phys: u64,
+};
+
+/// Snapshot every live user address space into `buf`, deduplicated by
+/// page_table_phys — CLONE_VM siblings share one page table and must be
+/// walked once. Returns the entry count. Each entry holds one retained Mm
+/// reference the caller must release.
+///
+/// Lock protocol: task_lock → Mm retain is the sanctioned order (same as
+/// pinTaskMmByTid); the caller must NOT hold any vm_lock. Zombies are
+/// skipped — their teardown (destroyUserSpace via the Mm finalizer, or the
+/// exit path) reclaims their swap slots itself (§6.49). A task mid-creation
+/// (slot reserved, fields being filled) has mm == null or
+/// page_table_phys == 0 and is skipped; a fresh fork/clone child's page
+/// table cannot contain swap entries (fork never copies non-present PTEs),
+/// and a CLONE_VM child's shared table arrives via its parent's entry.
+pub fn snapshotDistinctMms(buf: []MmSnapshot) usize {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+
+    var n: usize = 0;
+    var bits = slot_bitmap;
+    while (bits != 0 and n < buf.len) {
+        const i: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const t = &tasks[i];
+        if (sched_claim.load(&t.state) == .zombie) continue;
+        const mm = t.mm orelse continue;
+        if (t.page_table_phys == 0) continue;
+        var dup = false;
+        for (buf[0..n]) |s| {
+            if (s.page_table_phys == t.page_table_phys) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        // A dying Mm (retain fails) is already being torn down — its slots
+        // are reclaimed by that teardown, so skipping it loses nothing.
+        if (!mm.retain()) continue;
+        buf[n] = .{ .mm = mm, .page_table_phys = t.page_table_phys };
+        n += 1;
+    }
+    return n;
+}
+
 /// Tracked mmap region for munmap support.
 pub const MmapRegion = struct {
     base: u64 = 0,

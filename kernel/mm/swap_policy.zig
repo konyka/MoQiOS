@@ -43,4 +43,71 @@ pub fn flagsValid(flags: u32) bool {
     return flags == 0;
 }
 
+// ── swapoff drain state machine (§6.50) ─────────────────────────────────────
+//
+// swapoff migrates every in-use slot's page back to RAM, then disables the
+// device. While the drain runs the area is in `draining`: new swap-outs are
+// quiesced (a swap-out racing the drain would re-fill slots forever), but
+// swap-ins keep working — threads of a draining address space still fault
+// their pages back, and the drain itself swaps in. The kernel keeps the
+// authoritative state in swap.zig atomics and serialises the armed→draining
+// transition with a CAS; these pure functions are the single decision point.
+
+pub const AreaState = enum { disabled, armed, draining };
+
+/// swapoff's opening decision: only an armed area can start draining.
+pub const SwapoffBegin = enum {
+    /// armed → draining: walk all address spaces and swap every entry in.
+    begin,
+    /// Never armed (or already committed): -EINVAL.
+    not_armed,
+    /// A concurrent swapoff holds the drain: -EBUSY.
+    busy,
+};
+
+pub fn swapoffBegin(state: AreaState) SwapoffBegin {
+    return switch (state) {
+        .disabled => .not_armed,
+        .armed => .begin,
+        .draining => .busy,
+    };
+}
+
+/// swapon may only arm a fully disabled area; armed and draining are EBUSY.
+pub fn swaponAllowed(state: AreaState) bool {
+    return state == .disabled;
+}
+
+/// New swap-outs (allocSlot, and reclaim's reason to scan at all) exist only
+/// in the armed steady state.
+pub fn maySwapOut(state: AreaState) bool {
+    return state == .armed;
+}
+
+/// Swap-in serves every live state: armed, and draining (faults concurrent
+/// with the drain, and the drain walk itself).
+pub fn maySwapIn(state: AreaState) bool {
+    return state != .disabled;
+}
+
+/// How a finished drain leaves the area.
+pub const DrainFinish = enum {
+    /// All in-use slots swapped back in: disable the device.
+    commit,
+    /// PMM OOM mid-drain: a partial drain stays valid, re-arm the area and
+    /// report -ENOMEM.
+    rollback,
+};
+
+pub fn drainFinish(oom: bool) DrainFinish {
+    return if (oom) .rollback else .commit;
+}
+
+pub fn drainNextState(finish: DrainFinish) AreaState {
+    return switch (finish) {
+        .commit => .disabled,
+        .rollback => .armed,
+    };
+}
+
 const std = @import("std");

@@ -5539,14 +5539,62 @@ fn syscallSwapon(path_ptr: u64, flags: u32) i64 {
     return 0;
 }
 
-/// swapoff(path_ptr) — disable swap.
+/// swapoff(path) — drain every swapped page back to RAM, then disable swap.
+///
+/// §6.50. The path must name the ACTIVE swap device (EINVAL otherwise, and
+/// EINVAL when swap was never armed or is already off — Linux's
+/// "not an active swap area"); an unreadable path is EFAULT and an unknown
+/// device ENODEV, mirroring swapon's conventions. The drain quiesces new
+/// swap-outs first (swap.beginDrain: reclaim/allocSlot stop, swapIn keeps
+/// working), then walks every live address space — CLONE_VM siblings
+/// deduped via the shared page_table_phys — under each Mm's vm_lock and
+/// swaps every swap entry back in (frames allocated, disk reads, present
+/// PTEs reinstalled with permissions/NX preserved, slots freed). PMM OOM
+/// mid-drain rolls back to armed and returns ENOMEM; a partial drain stays
+/// valid. A concurrent swapoff already draining is EBUSY.
 fn syscallSwapoff(path_ptr: u64) i64 {
-    _ = path_ptr;
     const swap = @import("../../mm/swap.zig");
-    if (!swap.isEnabled()) return -22; // EINVAL: not enabled
-    // Cannot truly disable swap without draining all swapped pages.
-    // Accept the call (swap remains enabled).
-    return 0;
+    const swap_policy = @import("../../mm/swap_policy.zig");
+    const block_dev = @import("../../drivers/block_dev.zig");
+    const copy = @import("../../mm/copy_from_user.zig");
+    const sched = @import("../../proc/sched.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const pc = copy.copyFromUser(path_buf[0..], @ptrFromInt(path_ptr), 255);
+    if (pc == 0) return -14; // EFAULT
+    const plen = if (pc < 255) pc else 255;
+    path_buf[plen] = 0;
+    var path_len: usize = 0;
+    while (path_len < plen and path_buf[path_len] != 0) : (path_len += 1) {}
+
+    const name = swap_policy.deviceName(path_buf[0..path_len]);
+    if (name.len == 0) return -19; // ENODEV
+    const dev = block_dev.findByName(name) orelse return -19; // ENODEV
+
+    if (!swap.isEnabled()) return -22; // EINVAL: never armed / already off
+    if (dev != swap.currentDev()) return -22; // EINVAL: not the active swap area
+
+    switch (swap.beginDrain()) {
+        .not_armed => return -22, // EINVAL
+        .busy => return -16, // EBUSY: a concurrent swapoff holds the drain
+        .begin => {},
+    }
+
+    const owner: *const anyopaque = if (sched.currentTask()) |t| @ptrCast(t) else @ptrCast(&syscallSwapoff);
+    var failed = false;
+    const drained = swap.drainAll(owner) catch |err| blk: {
+        switch (err) {
+            error.OutOfMemory => failed = true, // PMM exhausted mid-drain
+        }
+        break :blk 0;
+    };
+    if (!failed and swap.getSwapUsed() != 0) {
+        // Slots no snapshotted space still held (a teardown raced the drain
+        // without finishing within the bounded poll): an incomplete drain.
+        failed = true;
+    }
+    swap.endDrain(swap_policy.drainFinish(failed), drained);
+    return if (failed) -12 else 0; // ENOMEM on rollback
 }
 
 // ── v39.0: New syscall implementations ─────────────────────────────────────

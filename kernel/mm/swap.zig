@@ -26,9 +26,11 @@ const hhdm = @import("../mm/hhdm.zig");
 const Mm = @import("../mm/mm.zig").Mm;
 const idt = @import("../arch/arch.zig").interrupts;
 const block_dev = @import("../drivers/block_dev.zig");
+const task = @import("../proc/task.zig");
 const swap_policy = @import("swap_policy.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const fmt = @import("../lib/fmt.zig");
+const std = @import("std");
 
 // swap_policy is a pure (host-tested) module and must not import the driver
 // layer, so its DevKind mirrors BlockDevType's ordinals; keep them in sync.
@@ -57,6 +59,28 @@ var swap_used: u64 = 0;
 var swap_slot_limit: u64 = 0;
 var slot_full_logged: bool = false;
 
+/// swapoff drain state (§6.50): while set, allocSlot/reclaim issue no NEW
+/// swap-outs (a swap-out racing the drain would re-fill slots forever), but
+/// swapIn keeps working — threads of a draining address space still fault
+/// their pages back, and the drain itself swaps in. Transition decisions are
+/// pure policy in swap_policy.zig (host-tested); the armed→draining edge is
+/// serialised here with a CAS so exactly one swapoff drains at a time.
+var swap_draining: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+pub fn isDraining() bool {
+    return swap_draining.load(.acquire);
+}
+
+/// Device index of the armed swap area (0xFF when disabled).
+pub fn currentDev() u8 {
+    return swap_dev;
+}
+
+fn areaState() swap_policy.AreaState {
+    if (!swap_enabled) return .disabled;
+    return if (isDraining()) .draining else .armed;
+}
+
 // Clock hand for victim selection — encodes pml4_idx (0-255) as starting scan position
 var clock_hand: u32 = 0;
 
@@ -79,6 +103,7 @@ pub fn init(dev: u8, start_lba: u64) void {
     swap_dev = dev;
     swap_start_lba = start_lba;
     swap_enabled = true;
+    swap_draining.store(false, .release);
     @memset(&swap_bitmap, 0);
     swap_used = 0;
     clock_hand = 0;
@@ -104,7 +129,11 @@ pub fn init(dev: u8, start_lba: u64) void {
 /// Uses u64 word-level scanning with @ctz for amortized O(1) allocation.
 /// Never hands out a slot at or past swap_slot_limit (the device's actual
 /// page capacity) — such a slot would address sectors past the end of the disk.
+/// While a swapoff drain runs, no new slots are issued at all
+/// (swap_policy.maySwapOut): the drain would never finish otherwise.
 fn allocSlot() ?u64 {
+    if (!swap_policy.maySwapOut(areaState())) return null;
+
     const flags = swap_lock.acquire();
     defer swap_lock.release(flags);
 
@@ -283,7 +312,8 @@ pub fn swapIn(pte_val: u64) ?u64 {
 /// skips the scan, and the fault → swapIn → allocPage recursion proceeds
 /// unguarded under the lock the current task already holds.
 pub fn reclaimPages(mm: *Mm, owner: *const anyopaque, target: u32) u32 {
-    if (!swap_enabled) return 0;
+    // Quiesced while disabled or draining (swapoff): no new swap-outs.
+    if (!swap_policy.maySwapOut(areaState())) return 0;
 
     var guard = Mm.beginReclaimCritical(mm, owner) orelse return 0;
     defer guard.release();
@@ -390,4 +420,152 @@ fn reclaimScanPass(mm: *Mm, target: u32) u32 {
     }
 
     return swapped;
+}
+
+// ── swapoff drain (§6.50) ────────────────────────────────────────────────────
+//
+// swapoff migrates every in-use slot's page back to RAM, then disables the
+// device. Three steps: beginDrain (quiesce new swap-outs), drainAll (walk
+// every live address space and swap each swap entry back in), endDrain
+// (commit when fully drained, or roll back to armed on PMM OOM — a partial
+// drain stays valid because swapIn frees a slot only after a successful
+// read).
+
+pub const DrainBegin = enum { begin, not_armed, busy };
+
+/// swapoff step 1 — quiesce. Transitions armed → draining exactly once;
+/// concurrent swapoffs lose the CAS and report busy.
+pub fn beginDrain() DrainBegin {
+    switch (swap_policy.swapoffBegin(areaState())) {
+        .not_armed => return .not_armed,
+        .busy => return .busy,
+        .begin => {},
+    }
+    if (swap_draining.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
+        return .busy;
+    return .begin;
+}
+
+/// swapoff step 3 — commit or roll back. Only the drainer calls this.
+/// Commit requires every slot drained (swap_used == 0, checked by the
+/// caller): the device is disabled and the bitmap/headers cleared. Rollback
+/// re-arms with the remaining slots still valid.
+pub fn endDrain(finish: swap_policy.DrainFinish, drained: u64) void {
+    switch (swap_policy.drainNextState(finish)) {
+        .disabled => {
+            swap_enabled = false;
+            swap_dev = 0xFF;
+            swap_slot_limit = 0;
+            swap_used = 0;
+            @memset(&swap_bitmap, 0);
+            slot_full_logged = false;
+            clock_hand = 0;
+            serial.writeString("[swap] swapoff: drained ");
+            fmt.writeDecimal64(drained);
+            serial.writeString(" pages, device disabled\n");
+        },
+        // .draining is unreachable from drainNextState; .armed is rollback.
+        .armed, .draining => {
+            serial.writeString("[swap] swapoff: drain incomplete, re-armed\n");
+        },
+    }
+    // Cleared last: while draining reads as set with enabled already false,
+    // areaState() reports .disabled, so no new drain can begin mid-commit;
+    // a fresh swapon in that window re-initialises everything via init().
+    swap_draining.store(false, .release);
+}
+
+pub const DrainError = error{OutOfMemory};
+
+/// swapoff step 2 — swap every in-use slot's page back into RAM. Returns
+/// the number of pages swapped in. error.OutOfMemory means the PMM could
+/// not supply a frame mid-drain; already-drained pages stay resident and
+/// the remaining swap entries stay valid for the rolled-back armed area.
+///
+/// Lock protocol (mm.zig header): the task-table scan needs task_lock and a
+/// vm_lock must never be held under it — so each round first takes a
+/// retained, CLONE_VM-deduplicated Mm snapshot under task_lock
+/// (task.snapshotDistinctMms), drops it, then guards each address space
+/// with its own vm_lock for the PTE walk.
+pub fn drainAll(owner: *const anyopaque) DrainError!u64 {
+    var total: u64 = 0;
+    var idle_rounds: u32 = 0;
+    while (idle_rounds < 4) {
+        const drained = try drainRound(owner);
+        total += drained;
+        if (swap_used == 0) break;
+        // Slots remain that no snapshotted space held: a concurrent exit/reap
+        // teardown (a zombie the snapshot skipped, or a space whose retain
+        // failed) frees them asynchronously — poll a few bounded rounds
+        // before giving up; the caller commits only at swap_used == 0.
+        idle_rounds = if (drained == 0) idle_rounds + 1 else 0;
+    }
+    return total;
+}
+
+fn drainRound(owner: *const anyopaque) DrainError!u64 {
+    var snaps: [task.MAX_TASKS]task.MmSnapshot = undefined;
+    const n = task.snapshotDistinctMms(&snaps);
+    defer for (snaps[0..n]) |s| s.mm.release();
+
+    var drained: u64 = 0;
+    for (snaps[0..n]) |s| {
+        // beginVmMutation cannot realistically fail here: the snapshot holds
+        // a live retain (not Dying) and the swapoff syscall holds no vm_lock
+        // (not Recursive). A skip would only defer the space to the caller's
+        // swap_used check, so continue is the safe fallback.
+        var guard = Mm.beginVmMutation(s.mm, owner) catch continue;
+        drained += drainAddressSpace(s.page_table_phys) catch |err| {
+            guard.release();
+            return err;
+        };
+        guard.release();
+    }
+    return drained;
+}
+
+/// Walk one address space's user page tables and swap in every swap entry;
+/// swapIn's reconstruction preserves the original writable/COW/NX bits.
+/// Caller holds the space's vm_lock, so fault-side swap-ins of the same
+/// space serialise against this walk.
+fn drainAddressSpace(pml4_phys: u64) DrainError!u64 {
+    var drained: u64 = 0;
+    const pml4: [*]u64 = @ptrFromInt(hhdm.physToVirt(pml4_phys));
+
+    for (0..256) |pml4_idx| {
+        if (pml4[pml4_idx] & 1 == 0) continue;
+        const pdpt: [*]u64 = @ptrFromInt(hhdm.physToVirt(pml4[pml4_idx] & 0xFFFF_FFFF_F000));
+
+        for (0..512) |pdpt_idx| {
+            if (pdpt[pdpt_idx] & 1 == 0) continue;
+            if (pdpt[pdpt_idx] & (1 << 7) != 0) continue; // 1GB huge data frame, not a PD
+
+            const pd: [*]u64 = @ptrFromInt(hhdm.physToVirt(pdpt[pdpt_idx] & 0xFFFF_FFFF_F000));
+
+            for (0..512) |pd_idx| {
+                if (pd[pd_idx] & 1 == 0) continue;
+                // A 2MB huge PDE is a data frame, not a PT. Swap entries live
+                // only at PT leaves (swapOut skips huge pages, and reclaim
+                // never descends into non-present intermediate subtrees — the
+                // §6.49 demoted-reservation subtrees therefore cannot hold
+                // one), so only present non-huge PD entries are descended.
+                if (pd[pd_idx] & (1 << 7) != 0) continue;
+
+                const pt: [*]u64 = @ptrFromInt(hhdm.physToVirt(pd[pd_idx] & 0xFFFF_FFFF_F000));
+
+                for (0..512) |pt_idx| {
+                    const pte = pt[pt_idx];
+                    if (pte_kind.classify(pte) != .swap) continue;
+                    const new_pte = swapIn(pte) orelse return error.OutOfMemory;
+                    pt[pt_idx] = new_pte;
+                    drained += 1;
+                    // No shootdown: a non-present entry has no cached
+                    // translation on any CPU, so installing a present PTE
+                    // needs no TLB maintenance (the fault path's local
+                    // invlpg covers only its own CPU's speculative state).
+                }
+            }
+        }
+    }
+    return drained;
 }

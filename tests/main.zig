@@ -4625,3 +4625,48 @@ test "filemap: a PROT_NONE region's never-faulted page SIGSEGVs instead of deman
     try std.testing.expectEqual(filemap.FaultAction.file_page, filemap.planFault(R, &r_ro, 0x100_0000).action);
     try std.testing.expectEqual(filemap.FaultAction.segv, filemap.planFault(R, &r_ro, 0x100_0000 + 4096).action);
 }
+
+test "swap policy: swapoff begin decision per area state" {
+    const swap_policy = kt.swap_policy;
+    // swapoff on a never-armed (or already committed) area is EINVAL; on an
+    // armed area the drain begins; a concurrent swapoff already draining is
+    // EBUSY — the kernel serialises the armed→draining transition with a CAS,
+    // this is the pure decision it consults first.
+    try std.testing.expectEqual(swap_policy.SwapoffBegin.not_armed, swap_policy.swapoffBegin(.disabled));
+    try std.testing.expectEqual(swap_policy.SwapoffBegin.begin, swap_policy.swapoffBegin(.armed));
+    try std.testing.expectEqual(swap_policy.SwapoffBegin.busy, swap_policy.swapoffBegin(.draining));
+}
+
+test "swap policy: swapon admission per area state" {
+    const swap_policy = kt.swap_policy;
+    // Only a fully disabled area may be (re-)armed; armed and draining both
+    // report EBUSY at the syscall layer.
+    try std.testing.expect(swap_policy.swaponAllowed(.disabled));
+    try std.testing.expect(!swap_policy.swaponAllowed(.armed));
+    try std.testing.expect(!swap_policy.swaponAllowed(.draining));
+}
+
+test "swap policy: draining quiesces new swap-outs but still serves swap-ins" {
+    const swap_policy = kt.swap_policy;
+    // The drain would never finish if reclaim could keep refilling slots, so
+    // allocSlot/reclaim are gated off while draining. Swap-in must keep
+    // working in every live state: a thread of a draining address space can
+    // still fault on its swapped pages (and the drain itself swaps in).
+    try std.testing.expect(swap_policy.maySwapOut(.armed));
+    try std.testing.expect(!swap_policy.maySwapOut(.draining));
+    try std.testing.expect(!swap_policy.maySwapOut(.disabled));
+    try std.testing.expect(swap_policy.maySwapIn(.armed));
+    try std.testing.expect(swap_policy.maySwapIn(.draining));
+    try std.testing.expect(!swap_policy.maySwapIn(.disabled));
+}
+
+test "swap policy: drain finish — commit only when fully drained, OOM rolls back to armed" {
+    const swap_policy = kt.swap_policy;
+    // PMM OOM mid-drain is not fatal: the partially drained area stays valid,
+    // the area returns to armed, and the syscall reports ENOMEM.
+    try std.testing.expectEqual(swap_policy.DrainFinish.rollback, swap_policy.drainFinish(true));
+    try std.testing.expectEqual(swap_policy.AreaState.armed, swap_policy.drainNextState(.rollback));
+    // A clean drain (all slots swapped back in) commits: device disabled.
+    try std.testing.expectEqual(swap_policy.DrainFinish.commit, swap_policy.drainFinish(false));
+    try std.testing.expectEqual(swap_policy.AreaState.disabled, swap_policy.drainNextState(.commit));
+}
