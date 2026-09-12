@@ -148,7 +148,9 @@
   hello96 SMP 验收；swap 项与 mmap 放置/mprotect/缺页/syscall 拷贝的共存
   缺口均已修复，swapOut 的丢失写竞态已由降级-shootdown-写回两阶段关闭）。
   剩余：reclaim 的 scan-then-commit 两阶段化（当前 reclaim 仍在持
-  vm_lock 下同步做块设备 IO）、munmap/exit 的 swap slot 回收（当前泄漏）、
+  vm_lock 下同步做块设备 IO）、munmap/exit 的 swap slot 回收（§6.49 已
+  修复——unmapRange/destroyUserSpace 经 pte_kind.teardownAction 分类
+  回收预约帧与 swap 槽位，hello100 常驻回归门）、
   cleanupTask 的 exit/reap 拆分（退出时自清理 vs reap 时跨任务
   清理的所有权边界）、CLONE_VM 兄弟间 per-task 区域表（mmap_regions）
   发散的权威化（放置搜索已改查页表 ground truth，区域表仍 per-task）、
@@ -157,7 +159,8 @@
   复现零命中，根因未定位；hello98 常驻绊线 + RIP0-DIAG 取证已布防）、
   mprotect(PROT_NONE) 预约项与 swap 项位型同构缺陷（§6.47 嫌疑 →
   §6.48 证实并修复：swap 标记移 bit 11、预约标记 bit 10、pte_kind
-  分类器统一，hello99 常驻回归门）、真正的 swapoff（drain + 解除；当前为有意 no-op 占位，
+  分类器统一，hello99 常驻回归门；§6.49 补齐从未缺页文件页 PROT_NONE
+  首访 SIGSEGV 与预约帧/槽位回收）、真正的 swapoff（drain + 解除；当前为有意 no-op 占位，
   swap 启用后整个 boot 保持武装，§6.47）。
   权威 page provenance 尚未纳入；未完成这些路径前，
   不得启用真正的跨进程 HHDM read，只有在它们共享同一锁与生命周期协议后

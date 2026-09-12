@@ -1,7 +1,7 @@
 # MoQiOS Current Code Review And Fix Plan
 
 > Review date: 2026-06-21
-> Last update: 2026-09-11 (§6.48: mprotect(PROT_NONE) 预约项与 swap 项位型同构嫌疑证实——原可写页预约项保留 bit1=1 与旧 swap 标记（present=0 且 bit1=1）完全同构，构成两个活跃缺陷：swap 启用时缺页把 PFN 当槽号读盘映射垃圾（QEMU RED 串口实测磁盘字节泄漏，copy_from_user 写方向经 bit2 放大准入），及 swapEntryUpdate 劫持 PROT_NONE→PROT_RW 恢复使映射永死（hello74 只查返回码故长期未暴露）；修复为编码分离——swap 标记移 OS 可用位 bit 11、预约标记 bit 10，新增纯模块 mm/pte_kind.zig 统一 classify 非 present 项（present/free/swap/prot_none/unknown），swap/mprotect_policy/mprotect/大页/idt 双缺页路径/RIP0-DIAG/copy_from_user 全站点一致化，预约项缺页一律 SIGSEGV、syscall 拷贝拒绝、恢复路径原位复活，另加固零项边界（不造幻影占用、不再把物理帧 0 映射进用户空间）；host RED（bit-11 重编码崩溃 + 预约项误判实证）→ 294/294 GREEN，hello99 五探针（拷贝拒绝/SIGSEGV/恢复/大页/swap 压力 churn）fadad68 旧内核两阶段全 RED、修复后 SMP=1/2/4 全 PASS；294/294 host 测试 + 3 架构构建 + TCG SMP=1/2 smoke + SMP=4×3 压测全绿；prior: 2026-09-11 (§6.47: 4-worker SMP=4 RIP=0 残留追查——42 次插桩复现零命中（标准 30 + 宿主加压 10 + 6-worker 放大 2，无 [TLB] FATAL/FRAMEGUARD/panic），早期 NCQ ABRT 风暴证为宿主机 /tmp tmpfs 配额伪象（稀疏刮擦盘分配失败 → QEMU 块层 ABRT，清场后 22+ 连跑零错误，大概率同为 §6.45 批量变体"硬 stall"真相），swap/vm_lock 闭环、TCG shootdown 定向、CLONE_VM 生命周期、帧/重定向机制逐项走查排除；不做投机修复，改为常驻布防——idt.zig/syscall_entry.zig 新增 RIP0-DIAG 现场转储（rip==0 用户缺页时记录 last_syscall/exec 重定向三元组/栈页 PTE/栈 qwords，单次命中即判别"栈内容归零 vs 帧腐蚀 vs swap 项滞留"），hello98（hello96 的 4-worker 变体，phase A 容忍 EBUSY——syscallSwapoff 是有意 no-op 占位）接线 build.zig/qemu_run/init/qemu_smoke 成为 SMP=4 永久绊线；附带记录 smoke 并行 limine 竞态与 ahci.img 清理缺口、mprotect(PROT_NONE) 预约项与 swap 项位型同构疑似缺陷两项待办；291/291 host 测试 + 3 架构构建 + TCG SMP=1/2 smoke + SMP=4×3 压测全绿；prior: 2026-09-11 (§6.46: PCID 下 flushLocal 的 >32 页 CR3-reload 回退"退化为空操作"嫌疑证伪——SDM vol.3A 明确 MOV to CR3 的 bit63 是只写命令位（"does not modify bit 63 of CR3, which is reserved and always 0"），KVM/PCID 实证 no-flush 写后立即读回 bit63 恒 0，新增 hello97 回归门（管道乒乓构造 no-flush 重入 + 64 页 mprotect 触发回退 + 探针写须缺页）在未改动内核上 KVM/TCG 双 PASS，内核零改动仅补 CR3_NO_FLUSH 注释，更正 §6.45 对批量 swapOut 变体 SMP=4 RIP=0 的错误归因；291/291 host 测试 + 3 架构构建 + TCG SMP=1/2 smoke + SMP=4×3 压测全绿；prior: 2026-09-11 (§6.45: swap 动态可执行化——swapon 改按路径选设备且刻意无默认（swap_policy.admitTarget 仅拒 virtio-blk 盘0/启动盘，EPERM），pmm reclaim-floor 测试钩子（syscall 485，触发 reclaim 但绝不失败分配），hello96 main+1 CLONE_VM 线程 swap 压力验收（SMP=1/2/4 全绿）；动态压力暴露并修复五个真实缺陷：isPageMapped 视 swap 项为空闲导致 mmap/brk/SHM 放置冲突（新增 isPageOccupied）、mprotect 践踏 swap 项、不可达 swap-in（无区域覆盖页/兄弟线程栈）、syscall 用户拷贝遇 swap 项 EFAULT（supervisor #PF swap-in 重试）、swap 槽位越盘界（swap_slot_limit 容量封顶）；swapOut 改两阶段写回（先降级只读+ranged-invlpg shootdown 再拷盘）关闭丢失写竞态；收窄与残留如实记录（4-worker SMP=4 的 RIP=0 未根治、批量 swapOut 变体已回退、reclaim 持锁 IO 与 slot 泄漏仍开放）；291/291 host 测试 + 3 架构构建 + SMP=1/2 smoke + SMP=4×3 压测全绿；prior: 2026-09-10 (§6.44: vm_lock coverage extended — swap-reclaim two-pass PTE writes under the non-blocking recursion-safe beginReclaimCritical guard (tryAcquire never waits, contention skips, fault→swapIn→allocPage recursion proceeds unguarded), SysV SHM shmat/shmdt/exit-detach and user-driver MMIO/DMA map/unmap plus reap-side cleanupTask under vm_lock (single sanctioned task_lock→vm_lock edge, cycle-freedom re-verified), shared-Mm (refs>1) exec rejected with EPERM, fork region-metadata residual closed as safe-by-construction; swap dynamic exercise remains a BLOCKED follow-up (no swapon caller; hardwired dev0/LBA0); 287/287 host tests + 3-arch builds + SMP=1/2 smoke + SMP=4×3 stress green; prior: 2026-09-10 §6.43: page-fault PTE mutations serialized under Mm vm_lock — ServicingSpinlock prerequisite closes a pre-existing failShootdown halt hazard (vm_lock waiters now service pending TLB shootdowns while spinning IRQ-off), decideFault/beginFaultCritical guard handleCowFault/handleDemandPage/handleFileFault, fork/clone COW page-table clone guarded at call sites, 284/284 host tests + 3-arch builds + SMP=1/2 smoke + SMP=4×3 stress green; prior: 2026-09-10 §6.42 user-copy return-value governance closed — the ~80 `_ = copyToUser` discards from §5.2q verified already cleaned (grep zero-hit), the last 6 discarded `copyFromUser` results in mount/umount2/vmsplice/setitimer fault-checked, hello95 acceptance with pre-fix kernel-panic RED and SMP=1/2 GREEN; 2026-09-09 §6.41 eventfd/timerfd raw-index-as-fd root fix + vfs read/write wiring with Linux semantics, hello93/hello94 acceptance, 282/282 host tests; 2026-09-07/08 §6.39-6.40 — 5-way audit, 28 defects TDD-fixed incl. mprotect COW TOCTOU, ipc reply handoff, TCP send-cursor invariant, all §6.39 follow-ups closed); earlier: 2026-08 (7-area full-repository audit round recorded in §6: memory-safety / concurrency / performance / userland fixes, SMP #GP root cause in TLB shootdown, all builds and SMP=1/SMP=4 smokes passed; earlier: 2026-07-28 full-repository audit — copy_file_range fd/rollback, socket option user-copy/SO_ERROR/sockaddr lengths, futex EFAULT/waitv limit, SysV IPC_SET/rt_sigsuspend copies, virtio-net/e1000 rollback/timeouts, hello38-41 regression gates)
+> Last update: 2026-09-12 (§6.49: 非 present PTE 资源回收收口——unmapPage 遇非 present 项返回 null 导致 munmap/exit 泄漏 PROT_NONE 预约帧与 swap 槽位（QEMU RED 实测 24 轮泄漏 6157 帧），修复经 pte_kind.teardownAction 纯策略分类：unmapRange/destroyUserSpace 全 teardown 路径按 present/prot_none→drop 帧引用（pmm.freePage 纪律，fork 先 COW 后预约的共享帧场景由 hello100 A2b 实证）、swap→freeSlot（fork 不复制非 present 项故槽位单持有）、free/unknown→不动；destroyUserSpace 另兜底大页预约与降级子树；§6.48 残留"从未缺页文件页 PROT_NONE 首访不 SIGSEGV"由 filemap.planFault 新增 prot_none 动作关闭；sysinfo 接通 totalswap/freeswap；hello100 六段回归门接线；smoke 默认超时 120→900；host RED（2 编译错误）→296/296 GREEN + 3 架构构建 + TCG SMP=1/2 smoke + SMP=4×3 压测全绿；prior: 2026-09-11 (§6.48: mprotect(PROT_NONE) 预约项与 swap 项位型同构嫌疑证实——原可写页预约项保留 bit1=1 与旧 swap 标记（present=0 且 bit1=1）完全同构，构成两个活跃缺陷：swap 启用时缺页把 PFN 当槽号读盘映射垃圾（QEMU RED 串口实测磁盘字节泄漏，copy_from_user 写方向经 bit2 放大准入），及 swapEntryUpdate 劫持 PROT_NONE→PROT_RW 恢复使映射永死（hello74 只查返回码故长期未暴露）；修复为编码分离——swap 标记移 OS 可用位 bit 11、预约标记 bit 10，新增纯模块 mm/pte_kind.zig 统一 classify 非 present 项（present/free/swap/prot_none/unknown），swap/mprotect_policy/mprotect/大页/idt 双缺页路径/RIP0-DIAG/copy_from_user 全站点一致化，预约项缺页一律 SIGSEGV、syscall 拷贝拒绝、恢复路径原位复活，另加固零项边界（不造幻影占用、不再把物理帧 0 映射进用户空间）；host RED（bit-11 重编码崩溃 + 预约项误判实证）→ 294/294 GREEN，hello99 五探针（拷贝拒绝/SIGSEGV/恢复/大页/swap 压力 churn）fadad68 旧内核两阶段全 RED、修复后 SMP=1/2/4 全 PASS；294/294 host 测试 + 3 架构构建 + TCG SMP=1/2 smoke + SMP=4×3 压测全绿；prior: 2026-09-11 (§6.47: 4-worker SMP=4 RIP=0 残留追查——42 次插桩复现零命中（标准 30 + 宿主加压 10 + 6-worker 放大 2，无 [TLB] FATAL/FRAMEGUARD/panic），早期 NCQ ABRT 风暴证为宿主机 /tmp tmpfs 配额伪象（稀疏刮擦盘分配失败 → QEMU 块层 ABRT，清场后 22+ 连跑零错误，大概率同为 §6.45 批量变体"硬 stall"真相），swap/vm_lock 闭环、TCG shootdown 定向、CLONE_VM 生命周期、帧/重定向机制逐项走查排除；不做投机修复，改为常驻布防——idt.zig/syscall_entry.zig 新增 RIP0-DIAG 现场转储（rip==0 用户缺页时记录 last_syscall/exec 重定向三元组/栈页 PTE/栈 qwords，单次命中即判别"栈内容归零 vs 帧腐蚀 vs swap 项滞留"），hello98（hello96 的 4-worker 变体，phase A 容忍 EBUSY——syscallSwapoff 是有意 no-op 占位）接线 build.zig/qemu_run/init/qemu_smoke 成为 SMP=4 永久绊线；附带记录 smoke 并行 limine 竞态与 ahci.img 清理缺口、mprotect(PROT_NONE) 预约项与 swap 项位型同构疑似缺陷两项待办；291/291 host 测试 + 3 架构构建 + TCG SMP=1/2 smoke + SMP=4×3 压测全绿；prior: 2026-09-11 (§6.46: PCID 下 flushLocal 的 >32 页 CR3-reload 回退"退化为空操作"嫌疑证伪——SDM vol.3A 明确 MOV to CR3 的 bit63 是只写命令位（"does not modify bit 63 of CR3, which is reserved and always 0"），KVM/PCID 实证 no-flush 写后立即读回 bit63 恒 0，新增 hello97 回归门（管道乒乓构造 no-flush 重入 + 64 页 mprotect 触发回退 + 探针写须缺页）在未改动内核上 KVM/TCG 双 PASS，内核零改动仅补 CR3_NO_FLUSH 注释，更正 §6.45 对批量 swapOut 变体 SMP=4 RIP=0 的错误归因；291/291 host 测试 + 3 架构构建 + TCG SMP=1/2 smoke + SMP=4×3 压测全绿；prior: 2026-09-11 (§6.45: swap 动态可执行化——swapon 改按路径选设备且刻意无默认（swap_policy.admitTarget 仅拒 virtio-blk 盘0/启动盘，EPERM），pmm reclaim-floor 测试钩子（syscall 485，触发 reclaim 但绝不失败分配），hello96 main+1 CLONE_VM 线程 swap 压力验收（SMP=1/2/4 全绿）；动态压力暴露并修复五个真实缺陷：isPageMapped 视 swap 项为空闲导致 mmap/brk/SHM 放置冲突（新增 isPageOccupied）、mprotect 践踏 swap 项、不可达 swap-in（无区域覆盖页/兄弟线程栈）、syscall 用户拷贝遇 swap 项 EFAULT（supervisor #PF swap-in 重试）、swap 槽位越盘界（swap_slot_limit 容量封顶）；swapOut 改两阶段写回（先降级只读+ranged-invlpg shootdown 再拷盘）关闭丢失写竞态；收窄与残留如实记录（4-worker SMP=4 的 RIP=0 未根治、批量 swapOut 变体已回退、reclaim 持锁 IO 与 slot 泄漏仍开放）；291/291 host 测试 + 3 架构构建 + SMP=1/2 smoke + SMP=4×3 压测全绿；prior: 2026-09-10 (§6.44: vm_lock coverage extended — swap-reclaim two-pass PTE writes under the non-blocking recursion-safe beginReclaimCritical guard (tryAcquire never waits, contention skips, fault→swapIn→allocPage recursion proceeds unguarded), SysV SHM shmat/shmdt/exit-detach and user-driver MMIO/DMA map/unmap plus reap-side cleanupTask under vm_lock (single sanctioned task_lock→vm_lock edge, cycle-freedom re-verified), shared-Mm (refs>1) exec rejected with EPERM, fork region-metadata residual closed as safe-by-construction; swap dynamic exercise remains a BLOCKED follow-up (no swapon caller; hardwired dev0/LBA0); 287/287 host tests + 3-arch builds + SMP=1/2 smoke + SMP=4×3 stress green; prior: 2026-09-10 §6.43: page-fault PTE mutations serialized under Mm vm_lock — ServicingSpinlock prerequisite closes a pre-existing failShootdown halt hazard (vm_lock waiters now service pending TLB shootdowns while spinning IRQ-off), decideFault/beginFaultCritical guard handleCowFault/handleDemandPage/handleFileFault, fork/clone COW page-table clone guarded at call sites, 284/284 host tests + 3-arch builds + SMP=1/2 smoke + SMP=4×3 stress green; prior: 2026-09-10 §6.42 user-copy return-value governance closed — the ~80 `_ = copyToUser` discards from §5.2q verified already cleaned (grep zero-hit), the last 6 discarded `copyFromUser` results in mount/umount2/vmsplice/setitimer fault-checked, hello95 acceptance with pre-fix kernel-panic RED and SMP=1/2 GREEN; 2026-09-09 §6.41 eventfd/timerfd raw-index-as-fd root fix + vfs read/write wiring with Linux semantics, hello93/hello94 acceptance, 282/282 host tests; 2026-09-07/08 §6.39-6.40 — 5-way audit, 28 defects TDD-fixed incl. mprotect COW TOCTOU, ipc reply handoff, TCP send-cursor invariant, all §6.39 follow-ups closed); earlier: 2026-08 (7-area full-repository audit round recorded in §6: memory-safety / concurrency / performance / userland fixes, SMP #GP root cause in TLB shootdown, all builds and SMP=1/SMP=4 smokes passed; earlier: 2026-07-28 full-repository audit — copy_file_range fd/rollback, socket option user-copy/SO_ERROR/sockaddr lengths, futex EFAULT/waitv limit, SysV IPC_SET/rt_sigsuspend copies, virtio-net/e1000 rollback/timeouts, hello38-41 regression gates)
 > Scope: current worktree code, architecture wiring, documentation consistency, and verification gates.
 > Evidence base: `git status`, `rg --files`, `kernel/main.zig`, `build.zig`, scheduler/SMP/syscall/VFS/network sources, and existing docs.
 
@@ -3046,6 +3046,105 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 - **提交**：`75e72a6`（内核修复：编码分离 + pte_kind 分类器 + host
   TDD）、`2c15eee`（hello99 + 全接线）、本节与 next-phase-plan 更新随
   docs 提交。
+
+### 6.49 非 present PTE 资源回收收口（2026-09-12）：munmap/exit 预约帧与 swap 槽位泄漏修复 + 文件映射 PROT_NONE 首访 SIGSEGV + smoke 超时默认上调
+
+- **嫌疑来源**：§6.40/§6.45/§6.48 三处已记录残留——`unmapPage` 遇非
+  present 项返回 null，于是凡 PTE teardown 一律漏掉非 present 项持有的
+  资源。本切片逐路径取证并修复，顺带关闭 §6.48 的另一残留（从未缺页的
+  文件页 PROT_NONE 下首访不 SIGSEGV）。
+- **泄漏分类学（修复前实测）**：
+  - munmap/`unmapRange`（kernel/mm/mmap.zig）：unmapPage 只看 present——
+    预约项的帧泄漏；swap 项连 PTE 都不清零（VA 持续被 `isPageOccupied`
+    判占用，槽位永泄漏）。QEMU RED 实测：24 轮
+    {mmap 1MiB, 触碰, mprotect NONE, munmap} 泄漏 6157 帧
+    （=24×256 预约帧 + 页表噪声）。
+  - `destroyUserSpace`（kernel/mm/user_space.zig）：叶层
+    `present==0 → continue` 同漏预约帧与 swap 槽；PD 层非 present 项整体
+    跳过——大页预约（bit7 置位、帧号保留）与部分 mprotect 降级大页预约
+    产生的"不可见子树"（demotePtes 对非 present PDE 降级后表指针
+    present=0，§6.48 记录的既有边界）在 exit 时连 PT 页带全部帧泄漏。
+  - mremap move/shrink、brk 收缩、exec teardown 均经 unmapRange/
+    destroyUserSpace，同源同药。
+- **fork/预约帧引用计数证明（decRef vs 直接 free 的判定依据）**：
+  `cloneUserPagesCow`（kernel/proc/fork.zig）两趟扫描均以
+  `pte == 0 or pte & 1 == 0 → continue` 跳过非 present 项——pass 1 不
+  addRef、pass 2 不复制。故：① fork 不给预约帧新增引用；② swap 项从不
+  进入子进程页表，槽位恒为单一 PTE 持有，teardown `freeSlot` 恰好一次。
+  但预约帧**仍可与子进程共享**：先 fork（present COW 页，refcount=2）再
+  mprotect(PROT_NONE)，预约项引用的帧 refcount 仍为 2。因此 teardown
+  必须与 present 页完全同纪律——`pmm.freePage`（decRef，归零才回收），
+  无条件归还位图会回收子进程仍在引用的帧。hello100 探针 A2b 实证：父
+  进程预约+munmap 后以分配风暴促使错误回收暴露，子进程读到的内容必须
+  原样。
+- **修复（单一事实源 pte_kind 分类器）**：新增纯策略
+  `pte_kind.teardownAction`（kernel/mm/pte_kind.zig:43）——present/
+  prot_none → `free_frame`（drop 一个帧引用），swap → `free_slot`，
+  free/unknown → `none`。
+  - `unmapRange`（kernel/mm/mmap.zig:114）：unmapPage 落空时经
+    getPageEntryRaw 分类——预约帧清零 PTE 后走与 present 页相同的
+    shootdown→批释放通道（非 present 项本不进 TLB，搭车仅为复用
+    freePageBatch 与 span 纪律），swap 项清零 PTE 并 freeSlot；
+    no_free 区域（MMIO/DMA）帧豁免不变。
+  - `destroyUserSpace` 叶层抽出 `teardownPtLeaves`
+    （kernel/mm/user_space.zig:226）统一分类回收；PD 层新增非 present
+    分支（:167）——bit7 大页预约 `freeContiguous(512)`，表指针子树下探
+    回收 4K 预约叶并释放 PT 页。SIGRETURN 蹦床 VA 豁免对两类帧同效。
+  - `swap.freeSlot` 转 pub 并注明单 PTE 持有契约
+    （kernel/mm/swap.zig:132）；新增 `getSwapCapacity`（:73）。
+- **PROT_NONE 首访语义修复（§6.48 残留收口）**：从未缺页的文件页是零
+  PTE，无预约标记可分类，区域 prot 元数据是唯一保护记录。`filemap.
+  planFault` 新增 `FaultAction.prot_none`（kernel/mm/filemap.zig:68），
+  `r.prot == 0` 优先于 EOF 判定（:113）；idt.zig 两个消费点改为只服务
+  `.file_page`（serveFilePage kernel/arch/x86_64/idt.zig:1111、
+  fault-around :1051）。mprotect 回 RW 后零项照常按新 prot demand-fill
+  （COW 私有写不污文件），hello46/48/74 语义保持不变（smoke 全绿）。
+- **可观测性**：sysinfo 接通 totalswap@64/freeswap@72（swap 槽位容量/
+  用量）；procs/mem_unit 顺带移至 Linux 正确偏移 80/104——旧 72/80 与
+  freeswap 字段冲突，且全仓（user/servers/moqi_libc）无消费方
+  （kernel/arch/x86_64/syscall_entry.zig:3770）。
+- **hello100（user/hello100.c，永久回归门）**：A1——24 轮预约+munmap
+  后 freeram 回基线；A2——同场景改走 fork 子进程 exit（destroyUserSpace
+  路径）；A2b——COW 共享预约帧 decRef 纪律实证；B——文件映射
+  PROT_NONE 首访 SIGSEGV（零项+prot=0），处理程序 mprotect 修复后重试
+  逐字节对，未修复页仍 SIGSEGV，mprotect RW 后私有写不污文件；A3——
+  swap 武装 + reclaim-floor 下滑动窗口 churn、不 swap-in 直接 munmap，
+  freeswap 回基线；A4——子进程 churn 后 exit 由 destroyUserSpace 回收
+  槽位。A3/A4 带反空洞断言（min freeswap 必须曾低于基线，否则判
+  vacuous FAIL）；A4 的 swap 参与观测在子进程内完成并经退出码上报
+  （fork 后 min_freeswap 各持副本，首轮实现曾在父进程观测导致假
+  vacuous）。接线 build.zig、tools/qemu_run.sh、servers/init、
+  qemu_smoke.sh。
+- **smoke 超时（条目 3）**：实测全套件空载 SMP=1 约 187s 含构建
+  （hello96-100 加入前 120s 已不够，§6.47 宿主负载事故曾需
+  MOQI_SMOKE_TIMEOUT=900）；默认 120 → 900（tools/qemu_smoke.sh:18，
+  环境变量仍可覆盖），docs/build-and-toolchain.md §9.1 同步。
+- **TDD/RED→GREEN 证据**：
+  - host RED：`zig build test` 编译错误 ×2（pte_kind 无 `TeardownAction`
+    成员、filemap.FaultAction 无 `prot_none` 成员）——缺失即 RED。
+  - host GREEN：`zig build test` 296/296（294 基线 + teardownAction 类别
+    映射 1 项 + planFault PROT_NONE 边界 1 项）。
+  - QEMU RED：5ba2bd2 内核 + 新 hello100，phase A1 首轮即 FAIL：
+    `hello100: A1 leaked frames=6157`。
+  - QEMU GREEN：SMP=1（3m07s）、SMP=2（2m59s）smoke PASS，hello100 六段
+    全 ok；hello46/48/74/96/97/98/99 保持绿。
+- **门禁**：`zig build test` 296/296；`zig build` / `-Darch=riscv64` /
+  `-Darch=aarch64` 全绿；TCG smoke SMP=1、SMP=2 PASS；SMP=4 压测 ×3 连续
+  PASS，串口无 `[TLB] FATAL`、无 FRAMEGUARD、无 RIP0-DIAG、无
+  `[SEGFAULT]`、无 `[PMM] BUG`。run-1 出现 42 次 AHCI NCQ error——
+  §6.47 已证为宿主机 /tmp tmpfs 配额伪象（稀疏刮擦盘分配失败），
+  swapOut 写失败走回滚路径不腐蚀数据（hello96/98/100 完整性校验全绿）；
+  清理 /tmp 陈旧 smoke 目录后 run-2/3 零 NCQ。
+- **提交**：`f12a3d9`（内核修复 + host TDD）、`834770f`（hello100 + 全
+  接线）、`cfbe573`（smoke 超时默认 900），本节与 next-phase-plan 更新
+  随 docs 提交。
+- **残留（记录，未处理）**：真正的 swapoff（drain + 解除）仍是有意
+  no-op（§6.47），本切片刻意不触碰；munmap 部分覆盖大页预约时
+  prescanHuge 的 demote 对非 present 大页 PDE 仍是 no-op（块保留、VA
+  段保持占用，exit 时由新增 PD 层分支兜底回收）；fork 不复制 swap 项
+  意味着子进程丢失被换出页内容（既有语义缺口——本节反向利用了这一点
+  证明槽位单持有）；reclaim 持 vm_lock 同步块 IO 的 scan-then-commit
+  两阶段化仍开放（§6.45）。
 
 ---
 
