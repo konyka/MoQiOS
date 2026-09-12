@@ -220,6 +220,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello98");  /* 4-worker CLONE_VM swap-reclaim stress (SMP=4 RIP=0 tripwire) */
     run_test("hello99");  /* PROT_NONE reservation vs swap-entry encoding (SIGSEGV/EFAULT/restore) */
     run_test("hello100"); /* non-present PTE teardown reclaim + PROT_NONE first-access SIGSEGV */
+    run_test("hello101"); /* real swapoff: drain all slots to RAM, disable, re-arm (§6.50) */
 
     start_persistent_services();
 

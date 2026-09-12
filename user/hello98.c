@@ -4,10 +4,11 @@
 /// Phase A (gate): same swapon device-targeting safety gate as hello96 —
 /// boot/system disk EPERM, unknown device ENODEV, nonzero flags EINVAL,
 /// unreadable path EFAULT, scratch disk admitted, second swapon EBUSY.
-/// One deliberate difference: enabling the scratch disk also accepts EBUSY,
-/// because syscallSwapoff is a documented no-op stub (draining swapped
-/// pages is an open item) and a preceding hello96 therefore leaves swap
-/// armed for the rest of the boot.
+/// One deliberate difference: enabling the scratch disk also accepts EBUSY.
+/// It was originally required because syscallSwapoff was a no-op stub and
+/// hello96 left swap armed for the rest of the boot; §6.50 made swapoff
+/// real, so every predecessor now disarms and this returns 0 — the EBUSY
+/// tolerance is kept as belt-and-braces against init-order changes.
 ///
 /// Phase B (stress): same reclaim-floor design as hello96, but the churn
 /// runs with the main task plus THREE CLONE_VM threads (NWORKERS=4) — the
@@ -250,11 +251,11 @@ void _start(void) {
     if (r != -EFAULT) fail_exit("swapon unmapped path not EFAULT");
 
     r = syscall3(SYS_SWAPON, (uint64_t)"/dev/sda", 0, 0);
-    /* syscallSwapoff is a documented no-op stub (draining swapped pages is
-     * an open item), so a preceding hello96 leaves swap enabled for the
-     * rest of the boot: accept EBUSY as "already armed" — the churn below
-     * exercises the same paths either way. The admission rejections above
-     * are ordered before the EBUSY check in the kernel, so they still gate. */
+    /* §6.50 made swapoff real, so a preceding hello96 disarms swap and this
+     * returns 0; accept EBUSY ("already armed") as belt-and-braces against
+     * init-order changes — the churn below exercises the same paths either
+     * way. The admission rejections above are ordered before the EBUSY
+     * check in the kernel, so they still gate. */
     if (r != 0 && r != -EBUSY) { print_dec(r); fail_exit(" swapon scratch device failed"); }
     r = syscall3(SYS_SWAPON, (uint64_t)"/dev/nvme0", 0, 0);
     if (r != -EBUSY) fail_exit("second swapon not EBUSY");

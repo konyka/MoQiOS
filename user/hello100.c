@@ -395,8 +395,9 @@ static void churn_rounds(u64 rounds) {
 }
 
 static void phase_a3(void) {
-    /* hello98/hello99 leave swap armed (syscallSwapoff is an intentional
-     * no-op, §6.47): tolerate EBUSY like hello99 does. */
+    /* §6.50 made swapoff real, so hello99 before us disarmed swap and this
+     * returns 0; tolerate EBUSY like hello99 does (belt-and-braces against
+     * init-order changes). */
     const s64 sw = syscall3(SYS_SWAPON, (u64)"/dev/sda", 0, 0);
     if (sw != 0 && sw != -16 /* EBUSY */) fail_exit("A3 swapon scratch");
 
@@ -490,7 +491,7 @@ void _start(void) {
     phase_a3();
     phase_a4();
 
-    syscall3(SYS_SWAPOFF, (u64)"/dev/sda", 0, 0); /* intentional no-op (§6.47) */
+    syscall3(SYS_SWAPOFF, (u64)"/dev/sda", 0, 0); /* real drain+disable (§6.50) */
     print("hello100: PASS (reservation frames + swap slots reclaimed; PROT_NONE SIGSEGV)\n");
     print("hello100 done\n");
     syscall1(SYS_EXIT, 0);

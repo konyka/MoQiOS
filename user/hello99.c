@@ -284,9 +284,9 @@ static u64 reserved[NRESERVED];
 static u64 churn[CHURN_WINDOW];
 
 static void phase_swap(void) {
-    /* hello98 ran before us and syscallSwapoff is an intentional no-op
-     * (§6.47), so swap may already be armed: tolerate EBUSY exactly like
-     * hello98's own phase A does. */
+    /* §6.50 made swapoff real, so hello98 before us disarmed swap and this
+     * returns 0; tolerate EBUSY exactly like hello98's own phase A does, as
+     * belt-and-braces against init-order changes. */
     const s64 sw = syscall3(SYS_SWAPON, (u64)"/dev/sda", 0, 0);
     if (sw != 0 && sw != -16 /* EBUSY */)
         fail_exit("swapon scratch device");
