@@ -162,42 +162,48 @@ pub fn destroyUserSpace(pml4_phys: u64) void {
             const pd: [*]u64 = @ptrFromInt(pd_virt);
 
             for (0..512) |pd_idx| {
-                if (pd[pd_idx] & paging.PRESENT == 0) continue;
+                const pd_raw = pd[pd_idx];
+                if (pd_raw & paging.PRESENT == 0) {
+                    // §6.49: a non-present PD entry can still own resources.
+                    // Both shapes arise from huge-user PROT_NONE handling —
+                    // nothing else in the tree writes a non-present,
+                    // non-zero PD entry:
+                    //  - bit7 set: a huge PROT_NONE reservation — the PDE
+                    //    keeps the block's base frame; free all 512 frames.
+                    //  - bit7 clear: a reservation demoted by a partial
+                    //    mprotect (demotePtes drops present on the table
+                    //    pointer) — descend and tear down the 4K leaves.
+                    if (pd_raw == 0) continue;
+                    const virt_base = (@as(u64, pml4_idx) << 39) |
+                        (@as(u64, pdpt_idx) << 30) |
+                        (@as(u64, pd_idx) << 21);
+                    if (pd_raw & (1 << 7) != 0) {
+                        const block_phys = pd_raw & paging.ADDR_MASK;
+                        if (block_phys != 0) pmm.freeContiguous(block_phys, 512);
+                        continue;
+                    }
+                    const pt_phys = pd_raw & paging.ADDR_MASK;
+                    if (pt_phys == 0) continue;
+                    const pt_virt = hhdm.physToVirt(pt_phys);
+                    teardownPtLeaves(@ptrFromInt(pt_virt), virt_base);
+                    pmm.freePage(pt_phys);
+                    continue;
+                }
                 // Check for 2MB huge page in PD
-                if (pd[pd_idx] & (1 << 7) != 0) {
+                if (pd_raw & (1 << 7) != 0) {
                     // I1: a huge block owns 512 frames (allocContiguous sets
                     // one refcount each) — a single freePage would leak the
                     // other 511.
-                    pmm.freeContiguous(pd[pd_idx] & paging.ADDR_MASK, 512);
+                    pmm.freeContiguous(pd_raw & paging.ADDR_MASK, 512);
                     continue;
                 }
 
-                const pt_phys = pd[pd_idx] & paging.ADDR_MASK;
+                const pt_phys = pd_raw & paging.ADDR_MASK;
                 const pt_virt = hhdm.physToVirt(pt_phys);
-                const pt: [*]u64 = @ptrFromInt(pt_virt);
-
-                // v53.48: Batch free user pages — collect phys addresses and
-                // flush every 128 to reduce pmm.lock acquisitions from O(N) to O(N/128).
-                var free_buf: [128]u64 = undefined;
-                var free_count: u32 = 0;
-                for (0..512) |pt_idx| {
-                    if (pt[pt_idx] & paging.PRESENT == 0) continue;
-                    const virt = (@as(u64, pml4_idx) << 39) |
-                        (@as(u64, pdpt_idx) << 30) |
-                        (@as(u64, pd_idx) << 21) |
-                        (@as(u64, pt_idx) << 12);
-                    if (virt == @import("../proc/signal.zig").SIGRETURN_TRAMPOLINE_ADDR) continue;
-                    const page_phys = pt[pt_idx] & paging.ADDR_MASK;
-                    if (page_phys != 0 and page_phys >= 512 * 4096) {
-                        free_buf[free_count] = page_phys;
-                        free_count += 1;
-                        if (free_count == 128) {
-                            pmm.freePageBatch(free_buf[0..free_count]);
-                            free_count = 0;
-                        }
-                    }
-                }
-                if (free_count > 0) pmm.freePageBatch(free_buf[0..free_count]);
+                const virt_base = (@as(u64, pml4_idx) << 39) |
+                    (@as(u64, pdpt_idx) << 30) |
+                    (@as(u64, pd_idx) << 21);
+                teardownPtLeaves(@ptrFromInt(pt_virt), virt_base);
                 pmm.freePage(pt_phys);
             }
             pmm.freePage(pd_phys);
@@ -208,6 +214,44 @@ pub fn destroyUserSpace(pml4_phys: u64) void {
     // was in progress. Restore one owned reference for the final free.
     pmm.addRef(pml4_phys);
     pmm.freePage(pml4_phys);
+}
+
+/// Tear down the 512 leaves of one user page table at destroy time
+/// (§6.49): present pages AND PROT_NONE reservations give their frames back
+/// (pmm.freePage = decRef, free at zero — a reservation frame may still be
+/// COW-shared with a forked child that inherited it while present), swap
+/// entries return their slot to the swap bitmap. Free/unknown entries hold
+/// nothing. No TLB maintenance: the address space is already dead (the last
+/// reference dropped before the walk started).
+fn teardownPtLeaves(pt: [*]u64, virt_base: u64) void {
+    const pte_kind = @import("pte_kind.zig");
+    const swap = @import("swap.zig");
+
+    // v53.48: Batch free user pages — collect phys addresses and
+    // flush every 128 to reduce pmm.lock acquisitions from O(N) to O(N/128).
+    var free_buf: [128]u64 = undefined;
+    var free_count: u32 = 0;
+    for (0..512) |pt_idx| {
+        const raw = pt[pt_idx];
+        switch (pte_kind.teardownAction(raw)) {
+            .none => continue,
+            .free_slot => swap.freeSlot(pte_kind.decodeSwapEntry(raw)),
+            .free_frame => {
+                if (virt_base | (@as(u64, pt_idx) << 12) ==
+                    @import("../proc/signal.zig").SIGRETURN_TRAMPOLINE_ADDR) continue;
+                const page_phys = raw & paging.ADDR_MASK;
+                if (page_phys != 0 and page_phys >= 512 * 4096) {
+                    free_buf[free_count] = page_phys;
+                    free_count += 1;
+                    if (free_count == 128) {
+                        pmm.freePageBatch(free_buf[0..free_count]);
+                        free_count = 0;
+                    }
+                }
+            },
+        }
+    }
+    if (free_count > 0) pmm.freePageBatch(free_buf[0..free_count]);
 }
 
 /// Get the PML4 virtual address for a user space.

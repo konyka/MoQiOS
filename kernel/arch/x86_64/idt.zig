@@ -1048,16 +1048,18 @@ fn handleFileFault(current: anytype, page_addr: u64) bool {
         if (paging_mod.getPageEntryRaw(current.page_table_phys, pa) != null) continue;
         // Past-EOF page: stop — the rest of the window is past EOF too.
         const plan = filemap.planFault(task_mod.MmapRegion, region, pa);
-        if (plan.action == .segv) break;
+        if (plan.action != .file_page) break; // past EOF or PROT_NONE region
         if (!serveFilePage(current, pa)) break;
     }
     return true;
 }
 
 /// Serve one not-present file-backed page (swap-in first, then per-kind
-/// backing). Returns false for a page wholly past EOF or an exhausted
-/// allocator — the caller turns the faulting page's false into SIGSEGV and
-/// treats a prefault page's false as "stop the window".
+/// backing). Returns false for a page wholly past EOF, a PROT_NONE region
+/// (planFault refuses it — a never-faulted page is a zero PTE whose only
+/// protection record is the region metadata), or an exhausted allocator —
+/// the caller turns the faulting page's false into SIGSEGV and treats a
+/// prefault page's false as "stop the window".
 fn serveFilePage(current: anytype, page_addr: u64) bool {
     const pmm = @import("../../mm/pmm.zig");
     const hhdm = @import("../../mm/hhdm.zig");
@@ -1106,7 +1108,7 @@ fn serveFilePage(current: anytype, page_addr: u64) bool {
     const region = &current.mmap_regions[ri];
 
     const plan = filemap.planFault(task_mod.MmapRegion, region, page_addr);
-    if (plan.action == .segv) return false; // whole page past EOF
+    if (plan.action != .file_page) return false; // whole page past EOF, or PROT_NONE region
 
     const kind: filemap.FsKind = @enumFromInt(region.file_kind);
     switch (kind) {

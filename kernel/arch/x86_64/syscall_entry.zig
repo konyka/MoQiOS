@@ -3771,11 +3771,16 @@ fn syscallUmask(mask: u32) i64 {
 /// struct sysinfo { u64 uptime; u64 loads[3]; u64 totalram; u64 freeram;
 ///                  u64 sharedram; u64 bufferram; u64 totalswap; u64 freeswap;
 ///                  u16 procs; u16 pad; u64 totalhigh; u64 freehigh; u32 mem_unit; }
+/// Field offsets follow Linux (totalswap@64, freeswap@72, procs@80,
+/// mem_unit@104; §6.49 moved procs/mem_unit to the Linux offsets when swap
+/// accounting was added — the previous 72/80 placement collided with
+/// freeswap).
 fn syscallSysinfo(info_ptr: u64) i64 {
     if (info_ptr == 0 or info_ptr >= 0x0000_8000_0000_0000) return -14;
     const copy = @import("../../mm/copy_from_user.zig");
     const tsc = @import("../../arch/x86_64/tsc.zig");
     const pmm_mod = @import("../../mm/pmm.zig");
+    const swap_mod = @import("../../mm/swap.zig");
     const bo = @import("../../lib/byte_order.zig");
     const tm = @import("../../proc/task.zig");
 
@@ -3784,6 +3789,8 @@ fn syscallSysinfo(info_ptr: u64) i64 {
     const total_pages = pmm_mod.totalPages();
     const free_pages = pmm_mod.freePages();
     const page_size: u64 = 4096;
+    const swap_capacity = swap_mod.getSwapCapacity();
+    const swap_used = swap_mod.getSwapUsed();
 
     // Count active tasks
     var proc_count: u16 = 0;
@@ -3798,11 +3805,12 @@ fn syscallSysinfo(info_ptr: u64) i64 {
     bo.writeU64Le(buf[32..40], total_pages * page_size); // totalram
     bo.writeU64Le(buf[40..48], free_pages * page_size); // freeram
     // sharedram, bufferram = 0
-    // totalswap, freeswap = 0
-    buf[72] = @truncate(proc_count); // procs (u16 LE)
-    buf[73] = @truncate(proc_count >> 8);
+    bo.writeU64Le(buf[64..72], swap_capacity * page_size); // totalswap
+    bo.writeU64Le(buf[72..80], (swap_capacity -| swap_used) * page_size); // freeswap
+    buf[80] = @truncate(proc_count); // procs (u16 LE)
+    buf[81] = @truncate(proc_count >> 8);
     // mem_unit = 1
-    bo.writeU32Le(buf[80..84], 1);
+    bo.writeU32Le(buf[104..108], 1);
 
     return if (copy.copyToUser(@ptrFromInt(info_ptr), &buf, 128) == 128) 0 else -14;
 }

@@ -4584,3 +4584,44 @@ test "mprotect policy: a PROT_NONE reservation is never mistaken for a swap entr
     const marked_reservation: u64 = legacy_reservation | (@as(u64, 1) << 10);
     try std.testing.expectEqual(@as(?u64, null), mprot_policy.swapEntryUpdate(marked_reservation, 3));
 }
+
+
+test "pte kind: teardown action reclaims exactly the resource each class holds" {
+    const pte_kind = kt.pte_kind;
+    // Free and unknown entries hold neither a frame nor a slot — tearing them
+    // down must not touch the PMM or the swap bitmap.
+    try std.testing.expectEqual(pte_kind.TeardownAction.none, pte_kind.teardownAction(0));
+    try std.testing.expectEqual(pte_kind.TeardownAction.none, pte_kind.teardownAction((@as(u64, 0x12345) << 12) | 0x6)); // legacy unknown shape
+
+    // A present page and a PROT_NONE reservation both pin a physical frame:
+    // teardown drops one reference (pmm.freePage — decRef, free at zero; the
+    // frame may still be COW-shared with a forked child that inherited it
+    // while the page was present, so an unconditional free would corrupt).
+    try std.testing.expectEqual(pte_kind.TeardownAction.free_frame, pte_kind.teardownAction((@as(u64, 0x12345) << 12) | 0x7));
+    try std.testing.expectEqual(pte_kind.TeardownAction.free_frame, pte_kind.teardownAction((@as(u64, 0x12345) << 12) | 0x7 | (@as(u64, 1) << 9) | (@as(u64, 1) << 63))); // present+COW+NX
+    try std.testing.expectEqual(pte_kind.TeardownAction.free_frame, pte_kind.teardownAction((@as(u64, 0x12345) << 12) | pte_kind.PROT_NONE_MARKER | 0x6));
+
+    // A swap entry holds a slot but no frame: free the slot only.
+    try std.testing.expectEqual(pte_kind.TeardownAction.free_slot, pte_kind.teardownAction(pte_kind.encodeSwapEntry(7)));
+    try std.testing.expectEqual(pte_kind.TeardownAction.free_slot, pte_kind.teardownAction(pte_kind.encodeSwapEntry(0xF_FFFF_FFFF) | 0xC | (@as(u64, 1) << 63)));
+}
+
+test "filemap: a PROT_NONE region's never-faulted page SIGSEGVs instead of demand-filling" {
+    const R = struct { base: u64, file_offset: u64, file_size: u64, prot: u8, shared: bool };
+    // A never-faulted file page is a zero PTE — no reservation marker for
+    // pte_kind to classify — so the region's prot metadata is the only
+    // record that the mapping forbids access (§6.48 residual).
+    const r_none = R{ .base = 0x100_0000, .file_offset = 0, .file_size = 8192, .prot = 0, .shared = false };
+    try std.testing.expectEqual(filemap.FaultAction.prot_none, filemap.planFault(R, &r_none, 0x100_0000).action);
+    try std.testing.expectEqual(filemap.FaultAction.prot_none, filemap.planFault(R, &r_none, 0x100_0000 + 4096).action);
+    // Protection wins over EOF: PROT_NONE answers prot_none even past the end.
+    try std.testing.expectEqual(filemap.FaultAction.prot_none, filemap.planFault(R, &r_none, 0x100_0000 + 64 * 4096).action);
+    // MAP_SHARED PROT_NONE is no exception.
+    const r_none_shared = R{ .base = 0x100_0000, .file_offset = 0, .file_size = 8192, .prot = 0, .shared = true };
+    try std.testing.expectEqual(filemap.FaultAction.prot_none, filemap.planFault(R, &r_none_shared, 0x100_0000).action);
+
+    // Permitted regions are unchanged: in-bounds is served, past EOF segvs.
+    const r_ro = R{ .base = 0x100_0000, .file_offset = 0, .file_size = 100, .prot = 1, .shared = false };
+    try std.testing.expectEqual(filemap.FaultAction.file_page, filemap.planFault(R, &r_ro, 0x100_0000).action);
+    try std.testing.expectEqual(filemap.FaultAction.segv, filemap.planFault(R, &r_ro, 0x100_0000 + 4096).action);
+}

@@ -36,6 +36,33 @@ pub fn classify(pte: u64) Kind {
     return .unknown;
 }
 
+/// What tearing down a mapped-then-removed PTE must reclaim (§6.49).
+/// munmap/exit used to consult only the present bit, so the two non-present
+/// resource-holding encodings leaked: a reservation's frame and a swap
+/// entry's slot were never returned.
+pub const TeardownAction = enum {
+    /// free/unknown: the entry holds neither a frame nor a slot.
+    none,
+    /// present or prot_none: the entry pins a physical frame — drop one
+    /// reference (pmm.freePage: decRef, free at zero). A reservation frame
+    /// can still be COW-shared: fork addRefs only present entries, but a
+    /// page forked while present and PROT_NONE'd afterwards keeps the
+    /// child's reference, so an unconditional free would corrupt the sharer.
+    free_frame,
+    /// swap: the entry holds a swap slot but no frame — free the slot.
+    /// fork never copies non-present entries, so a slot has exactly one
+    /// owning PTE and teardown frees it exactly once.
+    free_slot,
+};
+
+pub fn teardownAction(pte: u64) TeardownAction {
+    return switch (classify(pte)) {
+        .present, .prot_none => .free_frame,
+        .swap => .free_slot,
+        .free, .unknown => .none,
+    };
+}
+
 /// Encode a swap slot index into a PTE swap entry.
 pub fn encodeSwapEntry(slot: u64) u64 {
     return SWAP_MARKER | (slot << 12);

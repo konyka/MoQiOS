@@ -20,6 +20,8 @@ const fixed_replacement = @import("map_fixed.zig");
 const vma_runtime_stats = @import("vma_runtime_stats.zig");
 const munmap_policy = @import("munmap_policy.zig");
 const mm_mod = @import("mm.zig");
+const pte_kind = @import("pte_kind.zig");
+const swap_mod = @import("swap.zig");
 
 fn mmapRegionIndex(task: *task_mod.Task, region: *task_mod.MmapRegion) u6 {
     return @intCast((@intFromPtr(region) - @intFromPtr(&task.mmap_regions[0])) / @sizeOf(task_mod.MmapRegion));
@@ -108,6 +110,55 @@ pub fn unmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
             if (free_count == 128) {
                 flushBatch(batch_first_virt, batch_last_virt, free_buf[0..128], task.page_table_phys);
                 free_count = 0;
+            }
+        } else if (paging_mod.getPageEntryRaw(task.page_table_phys, virt)) |raw| {
+            // §6.49: a non-present leaf can still own a resource — unmapPage
+            // returns null for it, so reclaim by classification here:
+            //   prot_none reservation → drop the retained frame's reference
+            //     (same decRef-and-free-if-zero as the present path; the
+            //     frame may be COW-shared with a forked child);
+            //   swap entry → free the swap slot (the evicted page's content
+            //     is discarded with the mapping);
+            //   free/unknown → nothing to reclaim (and nothing to zero for
+            //   an already-zero slot — skip the write entirely).
+            if (raw == 0) continue;
+            switch (pte_kind.teardownAction(raw)) {
+                .none => continue,
+                .free_slot => {
+                    paging_mod.setPageEntryRaw(task.page_table_phys, virt, 0);
+                    swap_mod.freeSlot(pte_kind.decodeSwapEntry(raw));
+                },
+                .free_frame => {
+                    paging_mod.setPageEntryRaw(task.page_table_phys, virt, 0);
+                    if (isNoFreePage(task, virt)) continue;
+                    const phys = raw & paging_mod.ADDR_MASK;
+                    if (phys == 0) continue;
+                    // Non-present entries are never cached in a TLB, so no
+                    // shootdown is owed for them; routing the frame through
+                    // the same batch simply reuses its freePageBatch. Keep
+                    // the batch's span discipline so flushBatch's shootdown
+                    // window stays bounded for the present frames in it.
+                    if (free_count == 0) {
+                        batch_first_virt = virt;
+                        batch_last_virt = virt;
+                    } else {
+                        const span_pages = (virt - batch_first_virt) / 4096 + 1;
+                        if (span_pages > MAX_BATCH_SPAN) {
+                            flushBatch(batch_first_virt, batch_last_virt, free_buf[0..free_count], task.page_table_phys);
+                            free_count = 0;
+                            batch_first_virt = virt;
+                            batch_last_virt = virt;
+                        } else {
+                            batch_last_virt = virt;
+                        }
+                    }
+                    free_buf[free_count] = phys;
+                    free_count += 1;
+                    if (free_count == 128) {
+                        flushBatch(batch_first_virt, batch_last_virt, free_buf[0..128], task.page_table_phys);
+                        free_count = 0;
+                    }
+                },
             }
         }
     }

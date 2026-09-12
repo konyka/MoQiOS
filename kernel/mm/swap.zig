@@ -68,6 +68,12 @@ pub fn getSwapUsed() u64 {
     return swap_used;
 }
 
+/// Total slot capacity while swap is enabled (min of device pages and
+/// MAX_SWAP_SLOTS), 0 when disabled — backs sysinfo's totalswap/freeswap.
+pub fn getSwapCapacity() u64 {
+    return if (swap_enabled) swap_slot_limit else 0;
+}
+
 /// Initialize swap on a block device at a given LBA offset.
 pub fn init(dev: u8, start_lba: u64) void {
     swap_dev = dev;
@@ -119,8 +125,11 @@ fn allocSlot() ?u64 {
     return null;
 }
 
-/// Free a swap slot.
-fn freeSlot(slot: u64) void {
+/// Free a swap slot. Also called by PTE teardown (munmap/exit) for swap
+/// entries that are destroyed without being swapped back in (§6.49) — a slot
+/// has exactly one owning PTE (fork never copies non-present entries), so
+/// teardown frees it exactly once.
+pub fn freeSlot(slot: u64) void {
     const flags = swap_lock.acquire();
     defer swap_lock.release(flags);
 

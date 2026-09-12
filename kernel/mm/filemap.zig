@@ -60,6 +60,12 @@ pub fn mmapCachePage(key: u64) u64 {
 pub const FaultAction = enum {
     /// Whole page at/past EOF — the fault handler lets this become SIGSEGV.
     segv,
+    /// Region prot is PROT_NONE: any access must SIGSEGV, regardless of the
+    /// page's position in the file. A never-faulted page is a zero PTE, so
+    /// the region metadata is the only record of the protection — without
+    /// this the first access would be demand-filled read-only (§6.48
+    /// residual, closed in §6.49).
+    prot_none,
     /// Serve the page from the backing store (zero-fill past valid_bytes).
     file_page,
 };
@@ -102,6 +108,9 @@ pub fn findFileRegion(comptime R: type, regions: []const R, addr: u64) ?usize {
 /// Required region fields: `base`, `file_offset`, `file_size`, `prot`,
 /// `shared`. The caller must have established containment (findFileRegion).
 pub fn planFault(comptime R: type, r: *const R, fault_page: u64) FaultPlan {
+    // PROT_NONE: no access is permitted at all — SIGSEGV before consulting
+    // the file extent (protection wins over EOF).
+    if (r.prot == 0) return .{ .action = .prot_none };
     const page_index = (fault_page - r.base) / PAGE_SIZE;
     const file_off = r.file_offset + page_index * PAGE_SIZE;
     // Linux semantics: a page wholly at/past EOF faults (SIGBUS there; this
