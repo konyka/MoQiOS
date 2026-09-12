@@ -14,7 +14,11 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_DIR"
 
 SMP_COUNT="${1:-${MOQI_SMP:-1}}"
-TIMEOUT_SECONDS="${MOQI_SMOKE_TIMEOUT:-120}"
+# Default 900s: the suite (hello1-100 incl. the swap/reclaim stress tests) took
+# ~190s wall including the build on an unloaded host (§6.49 measurement), and
+# §6.47's host-load incidents needed MOQI_SMOKE_TIMEOUT=900 to pass — make the
+# margin the default instead of an environment override.
+TIMEOUT_SECONDS="${MOQI_SMOKE_TIMEOUT:-900}"
 STRICT_SMP="${MOQI_SMOKE_STRICT_SMP:-1}"
 
 if ! [[ "$SMP_COUNT" =~ ^[1-9][0-9]*$ ]]; then
