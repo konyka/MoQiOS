@@ -22,6 +22,7 @@ const munmap_policy = @import("munmap_policy.zig");
 const mm_mod = @import("mm.zig");
 const pte_kind = @import("pte_kind.zig");
 const swap_mod = @import("swap.zig");
+const builtin = @import("builtin");
 
 fn mmapRegionIndex(task: *task_mod.Task, region: *task_mod.MmapRegion) u6 {
     return @intCast((@intFromPtr(region) - @intFromPtr(&task.mmap_regions[0])) / @sizeOf(task_mod.MmapRegion));
@@ -38,9 +39,9 @@ const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_PRIVATE: u64 = 0x2;
 const MAP_SHARED: u64 = 0x1;
 const MAP_FIXED: u64 = 0x10;
-const MAP_POPULATE: u64 = 0x8000;
 const MREMAP_MAYMOVE: u32 = 0x1;
 const MREMAP_FIXED: u32 = 0x2;
+const mmap_policy = @import("mmap_policy.zig");
 
 /// Unmap pages in a range and free physical memory.
 /// TLB safety: collects physical frames during unmapping, performs the
@@ -809,13 +810,12 @@ fn moveOrNoMem(task: *task_mod.Task, region: *task_mod.MmapRegion, old_pages: u6
 
 /// Core mmap implementation. Returns mapped base address or -errno.
 pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset: u64) i64 {
-    _ = MAP_POPULATE;
-
-    if (flags & MAP_PRIVATE == 0 and flags & MAP_SHARED == 0) return -22; // EINVAL
+    if (!mmap_policy.flagsValid(flags) or !mmap_policy.protValid(prot)) return -22; // EINVAL
     if (length == 0) return -22; // EINVAL
 
-    const is_anonymous = (flags & MAP_ANONYMOUS != 0) or (fd == -1);
+    const is_anonymous = mmap_policy.isAnonymous(flags);
     const is_fixed = (flags & MAP_FIXED != 0);
+    if (is_anonymous and !mmap_policy.anonymousFlagsValid(flags)) return -22; // EINVAL
 
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
@@ -982,7 +982,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     // base is 2MiB-aligned with at least one full block. A huge region never
     // merges with neighbours (the huge-first invariant), so the capacity
     // check must not count a merge as available space.
-    const huge_attempt = meta == null and huge_on and
+    const huge_attempt = meta == null and prot != 0 and huge_on and
         huge_user.eligible(base, num_pages);
 
     if (!is_fixed and !canTrackMmapRegion(cur, base, num_pages, meta == null and !huge_attempt)) return -12;
@@ -1028,6 +1028,14 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
                 unmapRange(cur, base, mapped);
                 return -12;
             };
+            if (prot == 0 and comptime builtin.cpu.arch == .x86_64) {
+                const pte = paging_mod.getProtectionPageEntry(cur.page_table_phys, virt) orelse {
+                    unmapRange(cur, base, mapped + 1);
+                    return -12;
+                };
+                pte.os_bits |= 0b010;
+                pte.present = false;
+            }
             mapped += 1;
         }
     } else if (meta.?.kind == .ext2) {

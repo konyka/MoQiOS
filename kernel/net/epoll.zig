@@ -413,7 +413,7 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32, kmsg_cursor: u64
         .special => {
             revents |= EPOLLIN | EPOLLOUT;
         },
-        .ramdisk_file, .fat32_file, .ext2_file, .proc_file => {
+        .ramdisk_file, .fat32_file, .ext2_file, .proc_file, .pidfd => {
             revents |= EPOLLIN | EPOLLOUT;
         },
         .devfs => {

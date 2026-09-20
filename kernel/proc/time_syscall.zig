@@ -18,6 +18,10 @@ pub fn setWallClockOffset(offset_ns: i64) void {
     wall_clock_offset = offset_ns;
 }
 
+pub fn wallClockOffset() i64 {
+    return wall_clock_offset;
+}
+
 /// Get current wall-clock nanoseconds (boot time + offset).
 pub fn wallClockNanos() u64 {
     const boot_ns: i64 = @intCast(tsc.nanos());

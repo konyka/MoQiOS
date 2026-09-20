@@ -36,8 +36,10 @@ fi
 
 if [ -n "${MOQI_SMOKE_WORK_DIR:-}" ]; then
     SMOKE_WORK_DIR="$MOQI_SMOKE_WORK_DIR"
+    AUTO_WORK_DIR=0
 else
     SMOKE_WORK_DIR="$(mktemp -d "/tmp/moqios-smoke-smp${SMP_COUNT}-XXXXXX")"
+    AUTO_WORK_DIR=1
 fi
 LOG_FILE="${MOQI_SMOKE_LOG:-$SMOKE_WORK_DIR/serial.log}"
 RUN_LOG="${MOQI_SMOKE_RUN_LOG:-$SMOKE_WORK_DIR/qemu.run.log}"
@@ -117,6 +119,9 @@ cleanup() {
     fi
     if [ -z "${MOQI_SMOKE_PACKAGE_DIR:-}" ]; then
         rm -rf "$PACKAGE_DIR"
+    fi
+    if [ "$AUTO_WORK_DIR" -eq 1 ]; then
+        rm -rf "$SMOKE_WORK_DIR"
     fi
 }
 trap cleanup EXIT

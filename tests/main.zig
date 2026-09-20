@@ -10,12 +10,187 @@ const openat2_policy = kt.openat2_policy;
 const futex_key = kt.futex_key;
 const mlock_policy = kt.mlock_policy;
 const mprotect_policy = kt.mprotect_policy;
+const mmap_policy = kt.mmap_policy;
+const shared_mapping_policy = kt.shared_mapping_policy;
 const munmap_policy = kt.munmap_policy;
 const process_vm_policy = kt.process_vm_policy;
 const mm = kt.mm;
 const vm_lock_policy = kt.vm_lock_policy;
 const lifecycle_policy = kt.lifecycle_policy;
+const clone_flags_policy = kt.clone_flags_policy;
+const pidfd_policy = kt.pidfd_policy;
+const pidfd_signal_policy = kt.pidfd_signal_policy;
 const task_op_policy = kt.task_op_policy;
+const clone3_policy = kt.clone3_policy;
+const posix_timer_policy = kt.posix_timer_policy;
+const posix_mq_policy = kt.posix_mq_policy;
+const posix_mq_attr_policy = kt.posix_mq_attr_policy;
+const posix_mq_receive_policy = kt.posix_mq_receive_policy;
+const posix_mq_priority_policy = kt.posix_mq_priority_policy;
+const posix_mq_ownership_policy = kt.posix_mq_ownership_policy;
+const sysv_shm_policy = kt.sysv_shm_policy;
+const sysv_shm_lifecycle_policy = kt.sysv_shm_lifecycle_policy;
+const time_set_policy = kt.time_set_policy;
+
+test "mmap rejects unsupported flags and protection bits" {
+    try std.testing.expect(
+        mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | mmap_policy.MAP_ANONYMOUS),
+    );
+    try std.testing.expect(
+        !mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | mmap_policy.MAP_SHARED),
+    );
+    try std.testing.expect(!mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | (1 << 63)));
+    try std.testing.expect(!mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | 0x8000));
+    try std.testing.expect(mmap_policy.protValid(0));
+    try std.testing.expect(!mmap_policy.protValid(0x8));
+    try std.testing.expect(mmap_policy.anonymousFlagsValid(mmap_policy.MAP_PRIVATE | mmap_policy.MAP_ANONYMOUS));
+    try std.testing.expect(mmap_policy.anonymousFlagsValid(mmap_policy.MAP_SHARED | mmap_policy.MAP_ANONYMOUS));
+    try std.testing.expect(!mmap_policy.isAnonymous(mmap_policy.MAP_PRIVATE));
+    try std.testing.expect(mmap_policy.isAnonymous(mmap_policy.MAP_PRIVATE | mmap_policy.MAP_ANONYMOUS));
+}
+
+test "clone rejects ignored TID flags and incoherent thread combinations" {
+    try std.testing.expect(clone_flags_policy.valid(clone_flags_policy.CLONE_VM, true));
+    try std.testing.expect(!clone_flags_policy.valid(clone_flags_policy.CLONE_THREAD, true));
+    try std.testing.expect(!clone_flags_policy.valid(clone_flags_policy.CLONE_SIGHAND, true));
+    try std.testing.expect(!clone_flags_policy.valid(clone_flags_policy.CLONE_FS, true));
+    try std.testing.expect(clone_flags_policy.valid(clone_flags_policy.CLONE_VM | clone_flags_policy.CLONE_PARENT_SETTID, true));
+}
+
+test "pidfd_open accepts only zero flags" {
+    try std.testing.expect(pidfd_policy.flagsValid(0));
+    try std.testing.expect(!pidfd_policy.flagsValid(1));
+}
+
+test "pidfd_send_signal validates signal and flags" {
+    try std.testing.expect(pidfd_signal_policy.signalValid(31));
+    try std.testing.expect(!pidfd_signal_policy.signalValid(32));
+    try std.testing.expect(pidfd_signal_policy.flagsValid(0));
+    try std.testing.expect(!pidfd_signal_policy.flagsValid(1));
+    try std.testing.expect(pidfd_signal_policy.aliasesShareValidation());
+}
+
+test "absolute timer deadlines are converted from their clock domain" {
+    try std.testing.expectEqual(@as(?u64, 100), time_policy.absoluteDeltaNs(0, 1_100, 1_000, 0));
+    try std.testing.expectEqual(@as(?u64, 100), time_policy.absoluteDeltaNs(0, 1_100, 1_000, 1_000));
+    try std.testing.expectEqual(@as(?u64, 100), time_policy.absoluteDeltaNs(1, 1_100, 1_000, 99_000));
+    try std.testing.expectEqual(@as(?u64, 0), time_policy.absoluteDeltaNs(0, 900, 1_000, 0));
+    try std.testing.expect(time_policy.absoluteDeltaNs(999, 1, 1, 0) == null);
+}
+
+test "shared mmap regions remain shared across fork policy checks" {
+    try std.testing.expect(shared_mapping_policy.contains(0x4000, 2, 0x4000, 0x1000));
+    try std.testing.expect(shared_mapping_policy.contains(0x4000, 2, 0x5000, 0x1000));
+    try std.testing.expect(!shared_mapping_policy.contains(0x4000, 2, 0x6000, 0x1000));
+}
+
+test "mq_open validates creation attributes instead of silently defaulting" {
+    try std.testing.expectEqual(
+        posix_mq_attr_policy.Validation.defaults,
+        posix_mq_attr_policy.validate(false, true, 0, 0, 8, 512),
+    );
+    try std.testing.expectEqual(
+        posix_mq_attr_policy.Validation.valid,
+        posix_mq_attr_policy.validate(true, true, 8, 512, 8, 512),
+    );
+    try std.testing.expectEqual(
+        posix_mq_attr_policy.Validation.invalid,
+        posix_mq_attr_policy.validate(true, true, 0, 512, 8, 512),
+    );
+    try std.testing.expectEqual(
+        posix_mq_attr_policy.Validation.invalid,
+        posix_mq_attr_policy.validate(true, true, 8, 513, 8, 512),
+    );
+}
+
+test "timer_create requires a valid output pointer" {
+    try std.testing.expect(!posix_timer_policy.timerIdPointerValid(0));
+    try std.testing.expect(posix_timer_policy.timerIdPointerValid(0x4000));
+    try std.testing.expect(!posix_timer_policy.timerIdPointerValid(posix_timer_policy.USER_LIMIT));
+}
+
+test "timer_create rejects an invalid non-null sigevent pointer" {
+    try std.testing.expect(posix_timer_policy.sigeventPointerValid(0));
+    try std.testing.expect(posix_timer_policy.sigeventPointerValid(0x4000));
+    try std.testing.expect(!posix_timer_policy.sigeventPointerValid(posix_timer_policy.USER_LIMIT));
+}
+
+test "POSIX timers survive worker-thread exit" {
+    try std.testing.expectEqual(@as(u32, 42), posix_timer_policy.timerOwnerTid(true, 99, 42));
+    try std.testing.expect(!posix_timer_policy.shouldDeleteForExit(42, true, 99));
+    try std.testing.expect(posix_timer_policy.shouldDeleteForExit(42, false, 42));
+}
+
+test "POSIX timer policy isolates foreign timer operations" {
+    try std.testing.expect(posix_timer_policy.flagsValid(0));
+    try std.testing.expect(posix_timer_policy.flagsValid(posix_timer_policy.TIMER_ABSTIME));
+    try std.testing.expect(!posix_timer_policy.flagsValid(2));
+    try std.testing.expect(posix_timer_policy.ownerMatches(42, 42));
+    try std.testing.expect(!posix_timer_policy.ownerMatches(42, 99));
+}
+
+test "clock_settime rejects invalid clocks and overflowing timestamps" {
+    try std.testing.expectEqual(@as(?i64, 1_000_000_001), time_set_policy.requestedNanoseconds(0, 1, 1));
+    try std.testing.expect(time_set_policy.requestedNanoseconds(1, 1, 0) == null);
+    try std.testing.expect(time_set_policy.requestedNanoseconds(0, 0, 1_000_000_000) == null);
+    try std.testing.expect(time_set_policy.requestedNanoseconds(0, std.math.maxInt(u64), 0) == null);
+}
+
+test "clock_settime requires CAP_SYS_TIME" {
+    try std.testing.expect(time_set_policy.canSetRealtime(true));
+    try std.testing.expect(!time_set_policy.canSetRealtime(false));
+}
+
+test "clone3 validates size before bounded argument copying" {
+    try std.testing.expect(!clone3_policy.sizeValid(63));
+    try std.testing.expect(clone3_policy.sizeValid(64));
+    try std.testing.expect(clone3_policy.sizeValid(88));
+    try std.testing.expect(!clone3_policy.sizeValid(89));
+    try std.testing.expectEqual(@as(usize, 64), clone3_policy.copySize(64));
+}
+
+test "POSIX MQ timeout distinguishes absent and zero deadlines" {
+    try std.testing.expect(
+        std.meta.activeTag(posix_mq_policy.fromNanoseconds(false, null)) == .none,
+    );
+    try std.testing.expectEqual(@as(u64, 0), posix_mq_policy.fromNanoseconds(true, 0).deadline);
+}
+
+test "POSIX MQ rejects an undersized receive buffer" {
+    try std.testing.expect(posix_mq_receive_policy.bufferAcceptsMessage(5, 5));
+    try std.testing.expect(!posix_mq_receive_policy.bufferAcceptsMessage(4, 5));
+}
+
+test "POSIX MQ selects the highest priority message" {
+    const slots = [_]posix_mq_priority_policy.Slot{
+        .{ .used = true, .priority = 2 },
+        .{ .used = true, .priority = 7 },
+        .{ .used = true, .priority = 7 },
+    };
+    try std.testing.expectEqual(@as(?u32, 1), posix_mq_priority_policy.selectHighest(&slots, 0));
+    try std.testing.expectEqual(@as(?u32, 1), posix_mq_priority_policy.nextFree(&[_]posix_mq_priority_policy.Slot{ .{ .used = true }, .{} }, 0));
+}
+
+test "POSIX MQ ownership rejects a foreign close" {
+    var state = posix_mq_ownership_policy.State{};
+    try std.testing.expect(!posix_mq_ownership_policy.release(&state));
+    posix_mq_ownership_policy.acquire(&state);
+    try std.testing.expect(posix_mq_ownership_policy.release(&state));
+}
+
+test "SysV SHM control copies are staged outside the IRQ lock" {
+    try std.testing.expect(sysv_shm_policy.copyBeforeLock(sysv_shm_policy.IPC_SET));
+    try std.testing.expect(sysv_shm_policy.copyAfterUnlock(sysv_shm_policy.IPC_STAT));
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -1))), sysv_shm_policy.encodeKey(-1));
+}
+
+test "SysV SHM exit detach requires a VM guard" {
+    try std.testing.expect(sysv_shm_lifecycle_policy.detachAllowed(true, true));
+    try std.testing.expect(!sysv_shm_lifecycle_policy.detachAllowed(false, true));
+    try std.testing.expect(!sysv_shm_lifecycle_policy.detachAllowed(true, false));
+    try std.testing.expect(sysv_shm_lifecycle_policy.unmapOnExit(false));
+    try std.testing.expect(!sysv_shm_lifecycle_policy.unmapOnExit(true));
+}
 
 test "task operation pin selects a live matching task over a zombie" {
     const candidates = [_]task_op_policy.Candidate{
@@ -2413,22 +2588,24 @@ test "P1: noteShootdown bumps only the owning PCID's generation" {
     try std.testing.expectEqual(g0 + 1, c.generation(p));
 }
 
-test "P1: decideSwitch — skip / no-flush / flush matrix" {
+test "P1: decideSwitch — skip / gated no-flush / flush matrix" {
     const d = pcid_alloc.decideSwitch;
     const A: u64 = 0xAAAA000;
     const B: u64 = 0xBBBB000;
     // Same space already loaded on this CPU: no CR3 write at all.
-    try std.testing.expectEqual(SwitchAction.skip, d(5, A, 0, 0, A, 5, 9));
+    try std.testing.expectEqual(SwitchAction.skip, d(5, A, 0, 0, A, 5, 9, false));
     // Kernel/unregistered target (PCID 0): legacy flush write.
-    try std.testing.expectEqual(SwitchAction.flush, d(5, A, 0, 0, 0x100000, 0, 0));
-    // A→B→A with unchanged generation: no-flush fast path.
-    try std.testing.expectEqual(SwitchAction.no_flush, d(7, B, 5, 9, A, 5, 9));
+    try std.testing.expectEqual(SwitchAction.flush, d(5, A, 0, 0, 0x100000, 0, 0, false));
+    // Phase-0 containment: A→B→A always flushes until per-CPU TLB
+    // invalidation epochs prove the no-flush fast path safe.
+    try std.testing.expectEqual(SwitchAction.flush, d(7, B, 5, 9, A, 5, 9, false));
+    try std.testing.expectEqual(SwitchAction.no_flush, d(7, B, 5, 9, A, 5, 9, true));
     // Generation moved (shootdown or PCID reuse): must flush.
-    try std.testing.expectEqual(SwitchAction.flush, d(7, B, 5, 9, A, 5, 10));
+    try std.testing.expectEqual(SwitchAction.flush, d(7, B, 5, 9, A, 5, 10, true));
     // Different space, no previous record: flush.
-    try std.testing.expectEqual(SwitchAction.flush, d(7, B, 0, 0, A, 5, 9));
+    try std.testing.expectEqual(SwitchAction.flush, d(7, B, 0, 0, A, 5, 9, false));
     // PCID matches but CR3 does not (stale record): must not skip.
-    try std.testing.expect(d(5, B, 0, 0, A, 5, 9) != SwitchAction.skip);
+    try std.testing.expect(d(5, B, 0, 0, A, 5, 9, false) != SwitchAction.skip);
 }
 
 test "P1: registry refuses more than MAX_SPACES live spaces" {
@@ -4584,7 +4761,6 @@ test "mprotect policy: a PROT_NONE reservation is never mistaken for a swap entr
     const marked_reservation: u64 = legacy_reservation | (@as(u64, 1) << 10);
     try std.testing.expectEqual(@as(?u64, null), mprot_policy.swapEntryUpdate(marked_reservation, 3));
 }
-
 
 test "pte kind: teardown action reclaims exactly the resource each class holds" {
     const pte_kind = kt.pte_kind;

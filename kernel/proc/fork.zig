@@ -87,6 +87,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.data_used = parent.data_used;
 
     parent.fd_table.inheritFdTable(child.fd_table);
+    @import("../ipc/posix_mq.zig").inheritRefs(parent_idx, child_idx);
 
     for (0..31) |i| {
         child.signal_handlers[i] = parent.signal_handlers[i];

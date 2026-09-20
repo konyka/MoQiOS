@@ -68,10 +68,11 @@ pub fn decideSwitch(
     target_cr3: u64,
     target_pcid: u16,
     target_gen: u64,
+    allow_no_flush: bool,
 ) SwitchAction {
     if (target_pcid == PCID_KERNEL) return .flush;
     if (cur_pcid == target_pcid and cur_cr3 == target_cr3) return .skip;
-    if (prev_pcid == target_pcid and prev_gen == target_gen) return .no_flush;
+    if (allow_no_flush and prev_pcid == target_pcid and prev_gen == target_gen) return .no_flush;
     return .flush;
 }
 

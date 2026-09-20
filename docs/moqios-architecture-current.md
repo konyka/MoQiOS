@@ -1,7 +1,7 @@
 # MoQiOS 当前实现架构
 
-> **版本**: v0.51.0（v53.50 free_bm同步修复+fat32嵌套锁消除+TCP accept环形队列+ext2零拷贝）
-> **日期**: 2026-05-29
+> **版本**: v0.51.0（历史元数据；当前实现持续更新见 review plan）
+> **日期**: 2026-08（当前文档快照）
 > **代码统计**: 内核 67,635 行 Zig / 325 源文件（`kernel/**/*.zig`，2026-08 实测；
 >   含 `kernel/net/ipv6.zig`、`kernel/net/icmpv6.zig`、`kernel/net/ndp.zig`、
 >   `kernel/proc/cap_check.zig`、`kernel/arch/arch.zig`、`kernel/arch/x86_64/arch_impl.zig`、
@@ -76,11 +76,11 @@ MoQiOS 是一个运行在 x86_64 架构上的**单体内核** (Monolithic Kernel
 | 内核栈大小 | 32 页 = 128KB (KERNEL_STACK_PAGES) |
 | 用户代码段基址 | 0x00400000 (4MB) |
 | 用户栈顶 | 0x00800000 (8MB) |
-| 系统调用数量 | 382 dispatch 条目 (max #471, #0-#330 连续 + Linux #424-#471 完全连续) |
+| 系统调用表 | 当前 dispatch 表扩展至 #485；其中包含 Linux 编号、MoQiOS 扩展和明确的 ENOSYS 占位 |
 | 文件系统 | FAT32 + ext2 (完整 symlink/hardlink/chown/chmod) + tmpfs + procfs + ramdisk + 统一页缓存 (命中/未中统计) |
 | 网络设备 | e1000 (中断驱动) + virtio-net (Virtqueue) |
 | 内核代码量 | 67,635 行 Zig / 325 文件 |
-| 用户代码量 | 2,244 行 C/ASM |
+| 用户代码量 | 以 `user/`、`servers/`、`lib/moqi_libc/` 当前源码为准（统计会随验收程序更新） |
 
 ---
 
@@ -92,7 +92,7 @@ MoQiOS 是一个运行在 x86_64 架构上的**单体内核** (Monolithic Kernel
 （被中断代码 RAX/RCX 遭污染，详见 **1.8 节**）。三者全部修复后，系统首次**完整启动至交互式
 `MoQiOS shell`**，依次跑通 `init` 自动序列及后续用户态测试（含用户态被定时器抢占、
 ext2 多级目录读写删，QEMU 串口验证，零异常、零三重故障）。当前 init（`servers/init/main.c`，
-基于 moqi_libc；汇编版 `user/init.S` 保留为回退，不再构建）自动 spawn hello2–hello44
+基于 moqi_libc；汇编版 `user/init.S` 保留为回退，不再构建）自动 spawn 当前 hello2–hello101
 全序列（仅 hello11、hello28 不在自动序列中，hello6 因阻塞键盘输入被跳过），smoke 门禁以
 `hello44 done` + shell 提示符为准（见 `tools/qemu_smoke.sh`）。
 
@@ -568,7 +568,7 @@ QEMU / 真机
   └─ init 任务 (内核线程)
        ├─ 延迟初始化网络模块 (net/mod.zig) — 不能在 boot 阶段初始化
        └─ 加载并执行 /init (servers/init/main.c，基于 moqi_libc；汇编回退 user/init.S 保留不构建)
-            ├─ 自动 spawn hello2–hello44 全序列 (hello6 因阻塞键盘跳过，
+├─ 自动 spawn hello2–hello101 全序列 (hello6 因阻塞键盘跳过，
             │    hello11/hello28 不在自动序列中)
             └─ 序列结束后进入 shell (sh.c)
 ```
@@ -577,7 +577,7 @@ QEMU / 真机
 
 - **HHDM**: Limine 在启动时将全部物理内存映射到高地址区域，内核通过 HHDM 偏移访问物理页
 - **网络延迟初始化**: `net_mod.init()` 不能在 boot 阶段调用（会导致未解释的死锁），而是在第一个 init 内核线程中执行
-- **init**: 用户空间第一个进程（`servers/init/main.c`，基于 moqi_libc；`user/init.S` 保留为汇编回退），通过 `spawn` 系统调用启动所有测试程序和 shell
+- **init**: 用户空间第一个进程（`servers/init/main.c`，基于 moqi_libc；`user/init.S` 保留为汇编回退），通过 `spawn` 系统调用启动当前 hello2–hello101 测试程序和 shell
 
 ---
 
@@ -755,7 +755,7 @@ LAPIC Timer 中断
 - SyscallFrame 结构保存所有寄存器
 - 返回值通过 rax 传递，错误通过 rax = -errno 表示
 
-### 6.2 系统调用表 (382 dispatch 条目, max #471)
+### 6.2 系统调用表（当前源码扩展至 max #485；历史编号说明见下表）
 
 > v49.0 ext2 符号链接/硬链接: link()#86/symlink()#88从accept升级为真实ext2实现(createHardlink/createSymlink); walkPathInner递归symlink解析(深度限制8级ELOOP); readSymlinkTarget(短链接i_block内联+长链接静态缓冲区)。
 > v50.0 ioprio 进程 ABI: MoQiOS 原生 #292/#293 支持 `IOPRIO_WHO_PROCESS`；每个 Task 保存独立 I/O 优先级（默认 BE/4，fork/clone/spawn 继承），不影响 CPU 调度优先级。RT/BE 接受 data 0..7，IDLE 仅接受 data 0；PGRP/USER 返回 ENOSYS，无效 selector/value 返回 EINVAL，不存在 TID 返回 ESRCH；跨 UID 设置返回 EPERM。当前该状态尚未接入块设备调度。
@@ -765,7 +765,7 @@ LAPIC Timer 中断
 > v45.0 修正 Linux 标准编号 424-456: 删除错误的 v44.0 MoQiOS 自定义编号 (#335-#343); 修正 #424→pidfd_send_signal/#425→io_uring_setup; 新增 #426-#433 (io_uring_enter/register + mount API 全系列); 新增 #440 process_madvise/#444-#448 landlock 系列+memfd_secret+process_mrelease(正确编号)/#450 set_mempolicy_home_node(正确编号); 新增 #452 fchmodat2/#453 map_shadow_stack/#454-#456 futex2 API (wake/wait/requeue→委托 futex_mod.futex)。**424-456 完全连续无缺口**。
 > v44.0 新增 13 个 Linux 标准编号 dispatch (#335-#451): io_uring 系列 ENOSYS (io_uring_setup/enter/register); 新 mount API 系列 (open_tree/move_mount/fsopen/fsconfig/fsmount/fspick); 高级 syscall (mount_setattr/quotactl_fd/process_mrelease/set_mempolicy_home_node)。
 > v43.0 alarm/itimer 定时器集成: alarm() 仅设 deadline (不立即 sendSignal); BSP timer tick 遍历所有任务检查 alarm_deadline/itimer_real_value 过期，通过 signal.sendSignal(tid, 14) 延迟触发 SIGALRM; ITIMER_REAL interval 自动重调度。
-> v42.0 新增 15 个 Linux 标准编号 dispatch (#331-#451): 别名接线 statx/io_pgetevents/pidfd_send_signal/pidfd_getfd/faccessat2/pidfd_open/close_range/openat2; 新实现 clone3(clone_args解析)/epoll_pwait2(timespec→ms)/futex_waitv(接线futexWaitv)/cachestat(page_cache统计)/rseq(注册接受)。
+> v42.0 新增 15 个 Linux 标准编号 dispatch (#331-#451): 别名接线 statx/io_pgetevents/pidfd_send_signal/pidfd_getfd/faccessat2/pidfd_open/close_range/openat2; `pidfd_open` 当前只接受 `flags=0`，非法 flags 返回 `EINVAL`；pidfd 使用独立 fd 类型和 proc_pid 目标字段，普通 proc fd 不具备 pidfd signal 权限；#224 与 #316/#334/#424 共用同一 hardened pidfd signal helper；新实现 clone3(clone_args解析，size按64–88字节边界复制)/epoll_pwait2(timespec→ms)/futex_waitv(接线futexWaitv)/cachestat(page_cache统计)/rseq(注册接受)。
 > v41.0 替换 5 个 no-op/stub 为真实实现: madvise WILLNEED/SEQUENTIAL→page_cache.recordAccess 预热缓存+DONTNEED→解锁 MmapRegion; posix_fadvise DONTNEED→page_cache.invalidateInode 真实驱逐; execveat(AT_FDCWD)→委托 syscallExecve; fallocate(mode=0)→ext2.truncateFile 预分配; prctl PR_SET_PDEATHSIG→存储到 Task+新增 PR_GET_PDEATHSIG。Task 新增 pdeathsig 字段。
 > v40.0 新增 25 个 dispatch 条目，**全面消除所有缺口**。补齐 SysV IPC Linux 标准编号别名 (shmget/shmat/shmctl/semget/semop/semctl/shmdt/msgget/msgsnd/msgrcv/msgctl)、文件操作 (fcntl/getdents/link/symlink/chown/fchown/lchown)、新实现 getitimer/setitimer (ITIMER_REAL TSC deadline+interval)、pause (forceReschedule+EINTR)。fchdir 从 no-op 升级为真实实现。
 > v37.0 历史记录：新增 14 个 dispatch 条目 (#297-#310)，接线 MoQiOS 原生 IPC (moqipc_create_ep/destroy_ep/send/recv/call/reply/notify/get_notify) + kcmp/capget/capset/sched_setattr/sched_getattr/membarrier。当时 mlock/munlock 曾仅切换 `MmapRegion.locked`；当前用户 memory-lock ABI 已改为 ENOSYS，内部 locked 仅保留给 device/no-free 映射。
@@ -1123,7 +1123,7 @@ LAPIC Timer 中断
 **源文件**: `kernel/fs/ramdisk.zig`
 
 - 启动时由 Limine 模块加载的内存文件系统
-- 存储: init, hello2-hello44, shell 等用户程序
+- 存储: init, hello2-hello101, shell 等用户程序
 - 只读，用于存放可执行文件
 
 ### 7.3.1 写回缓存 (writeback)
@@ -1265,7 +1265,7 @@ C 版与汇编版字节级行为一致：相同的 spawn 顺序、相同的打�
 （`spawned helloN` / `helloN done` / hello2 的 `child exited`）、相同的
 waitpid 语义，smoke 门禁标记不受影响。
 
-启动时第一个用户进程，自动 spawn hello2–hello44 全序列（按 init.S 中的顺序）:
+启动时第一个用户进程，自动 spawn hello2–hello101 全序列（按 `servers/init/main.c` 中的顺序）:
 - hello2 (串口输出), hello3 (ramdisk 读写), hello4 (多进程), hello5 (ELF 加载)
 - hello7 (FAT32 写入), hello8 (网络 ARP), hello12-hello20 (信号/UDP/环境变量/execve/argv/网络/ext2)
 - hello22-hello27 (TCP socket/echo/connect), hello23-hello25 (mkdir/ext2 unlink/多级路径)
@@ -1449,7 +1449,7 @@ kernel/main.zig
 
 | 文件 | 行数 | 功能 |
 |---|---|---|
-| kernel/arch/x86_64/syscall_entry.zig | 5,248 | 系统调用入口 + 382 dispatch 条目 (v53.44 futex参数修正+pushSignalFrame检查，v53.45 信号活锁修复，v53.46 alarm/itimer位图) |
+| kernel/arch/x86_64/syscall_entry.zig | 当前源码 | 系统调用入口；dispatch 上限当前为 #485 |
 | kernel/net/tcp.zig | 1,873 | TCP 协议 (Reno/SACK/WS/TS/CORK/QUICKACK + @memcpy环形缓冲区 + v53.41 epollNotify锁外延迟，v53.46 只读查询无锁化+SACK防DoS) |
 | kernel/fs/vfs.zig | ~720 | 虚拟文件系统 + MAX_FDS=64 + procfs 路由 + inotify + allocFd |
 | kernel/arch/x86_64/idt.zig | 786 | 中断描述符表 + IRQ 分发 + COW #PF 处理 |

@@ -21,6 +21,7 @@ const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const sched_policy = @import("sched_policy.zig");
 const creation_metadata = @import("creation_metadata.zig");
 const builtin = @import("builtin");
+const std = @import("std");
 const Mm = @import("../mm/mm.zig").Mm;
 
 const PAGE_SIZE: u64 = 4096;
@@ -58,6 +59,8 @@ pub const WaitNode = struct {
 
 pub const Task = struct {
     tid: u32,
+    /// User address to clear and wake when this task exits (CLONE_CHILD_CLEARTID).
+    clear_tid_ptr: u64 = 0,
     /// v53.45: Slot index for O(1) reverse lookup (set by create functions).
     self_idx: u32 = 0,
     state: TaskState,
@@ -599,6 +602,7 @@ fn matchesCpu(t: *Task, cpu: u8) bool {
 
 fn considerReady(idx: u32, cpu: u8, best_idx: *?u32, best_key: *u16) void {
     const t = getTask(idx) orelse return;
+
     if (sched_claim.load(&t.state) == .ready and matchesCpu(t, cpu)) {
         // F3: class-aware rank — any runnable FIFO/RR task outranks every
         // OTHER task. Within the OTHER class keys are monotonic in kernel
@@ -942,6 +946,14 @@ pub fn exitTask(exit_code: i32) void {
     const idx = sched.currentTaskIndex() orelse return;
     const t = getTask(idx) orelse return;
 
+    if (t.clear_tid_ptr != 0 and t.page_table_phys != 0) {
+        const copy = @import("../mm/copy_from_user.zig");
+        var zero: [4]u8 = .{ 0, 0, 0, 0 };
+        _ = copy.copyToUser(@ptrFromInt(t.clear_tid_ptr), &zero, zero.len);
+        _ = @import("../sync/futex.zig").wakePrivate(t.page_table_phys, t.clear_tid_ptr, std.math.maxInt(u32));
+        t.clear_tid_ptr = 0;
+    }
+
     // Stamp the exit epoch: the reap gate in waitpid compares this against
     // sched_entries on the exit CPU to prove the exit-time switch epilogue
     // (running on this task's kernel stack) has completed before freeing it.
@@ -991,11 +1003,18 @@ pub fn exitTask(exit_code: i32) void {
     // The exiting task is still current here; guard the detach unmaps with
     // its own vm_lock (vm_lock → shm_lock) so they serialise against sibling
     // fault/unmap writers on a CLONE_VM-shared table. A Recursive/Dying
-    // failure falls back to the pre-guard behaviour (empty guard).
-    if (t.page_table_phys != 0) {
-        var vm_guard = Mm.beginVmMutation(t.mm, @ptrCast(t)) catch Mm.VmLockGuard{};
-        defer vm_guard.release();
-        @import("../ipc/sysv_shm.zig").detachAllForTask(t.tid, t.page_table_phys);
+    // failure skips only this detach; the remaining exit cleanup still runs.
+    if (t.page_table_phys != 0 and t.mm != null) {
+        const mm_shared_before_guard = t.mm.?.isShared();
+        var vm_guard_opt = Mm.beginVmMutation(t.mm, @ptrCast(t)) catch null;
+        if (vm_guard_opt) |*vm_guard| {
+            defer vm_guard.release();
+            @import("../ipc/sysv_shm.zig").detachAllForTask(
+                t.tid,
+                t.page_table_phys,
+                @import("../ipc/sysv_shm_lifecycle_policy.zig").unmapOnExit(mm_shared_before_guard),
+            );
+        }
     }
 
     // POSIX timers are per-process: delete the exiting task's timers, and
@@ -1004,6 +1023,7 @@ pub fn exitTask(exit_code: i32) void {
     // slot (getTask checks occupancy, not identity).
     @import("../ipc/posix_timer.zig").deleteTimersForTask(idx);
     @import("../ipc/posix_mq.zig").clearNotifyForTask(idx);
+    @import("../ipc/posix_mq.zig").closeRefsForTask(idx);
 
     const flags = task_lock.acquire();
     t.exit_code = exit_code;

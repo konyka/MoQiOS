@@ -23,6 +23,7 @@ const epoll_policy = @import("../../net/epoll_policy.zig");
 const unsupported_policy = @import("../../proc/unsupported_policy.zig");
 const close_range_policy = @import("../../proc/close_range_policy.zig");
 const cpu_capacity = @import("../cpu_capacity.zig");
+const std = @import("std");
 
 // MSR constants
 const MSR_EFER = 0xC0000080;
@@ -1173,7 +1174,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(signal_syscall_mod.tkill(@truncate(frame.rdi), @truncate(frame.rsi)));
         },
         224 => { // pidfd_send_signal(pidfd, sig, info, flags)
-            frame.rax = @bitCast(signal_syscall_mod.pidfdSendSignal(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, @truncate(frame.r10)));
+            frame.rax = @bitCast(syscallPidfdSendSignal(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, @truncate(frame.r10)));
         },
         225 => { // signalfd4(old_fd, mask, sizemask, flags)
             frame.rax = @bitCast(signal_syscall_mod.signalfd4(frame.rdi, frame.rsi, frame.rdx, frame.r10));
@@ -2148,41 +2149,59 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         435 => { // clone3(cl_args, size) — read clone_args struct, delegate to clone
             const clone_args_ptr = frame.rdi;
+            const clone3_policy = @import("../../proc/clone3_policy.zig");
+            const clone_flags_policy = @import("../../mm/clone_flags_policy.zig");
+            const clone_args_size = frame.rsi;
             if (clone_args_ptr == 0 or clone_args_ptr >= 0x0000_8000_0000_0000) {
                 frame.rax = @bitCast(@as(i64, -14)); // EFAULT
+            } else if (!clone3_policy.sizeValid(clone_args_size)) {
+                frame.rax = @bitCast(@as(i64, -22)); // EINVAL
             } else {
                 // struct clone_args { flags:u64, pidfd:u64, child_tid:u64, parent_tid:u64,
                 //   exit_signal:u64, stack:u64, stack_size:u64, tls:u64, set_tid:u64,
                 //   set_tid_size:u64, cgroup:u64 }
                 const copy = @import("../../mm/copy_from_user.zig");
                 const bo = @import("../../lib/byte_order.zig");
-                var buf: [88]u8 = undefined;
-                const n = copy.copyFromUser(&buf, @ptrFromInt(clone_args_ptr), 88);
-                if (n < 64) {
-                    frame.rax = @bitCast(@as(i64, -22)); // EINVAL
+                var buf: [clone3_policy.CURRENT_SIZE]u8 = @splat(0);
+                const n = copy.copyFromUser(&buf, @ptrFromInt(clone_args_ptr), clone3_policy.copySize(clone_args_size));
+                if (n != clone3_policy.copySize(clone_args_size)) {
+                    frame.rax = @bitCast(@as(i64, -14)); // EFAULT
                 } else {
-                    const flags = bo.readU64Le(buf[0..8]);
-                    const stack_ptr = bo.readU64Le(buf[40..48]);
-                    const parent_tid = bo.readU64Le(buf[24..32]);
-                    const child_tid = bo.readU64Le(buf[16..24]);
-                    const tls = bo.readU64Le(buf[56..64]);
-                    const regs: clone_mod.ParentRegs = .{
-                        .rbx = frame.rbx,
-                        .rcx = frame.rcx,
-                        .rdx = frame.rdx,
-                        .rsi = frame.rsi,
-                        .rdi = frame.rdi,
-                        .rbp = frame.rbp,
-                        .r8 = frame.r8,
-                        .r9 = frame.r9,
-                        .r10 = frame.r10,
-                        .r11 = frame.r11,
-                        .r12 = frame.r12,
-                        .r13 = frame.r13,
-                        .r14 = frame.r14,
-                        .r15 = frame.r15,
-                    };
-                    frame.rax = @bitCast(clone_mod.clone(flags, stack_ptr, parent_tid, child_tid, tls, regs));
+                    const flags = bo.readU64Le(buf[clone3_policy.FLAGS_OFFSET..][0..8]);
+                    if (!clone_flags_policy.valid(flags, true) or
+                        !clone3_policy.unsupportedFieldsZero(
+                            bo.readU64Le(buf[clone3_policy.PIDFD_OFFSET..][0..8]),
+                            bo.readU64Le(buf[clone3_policy.EXIT_SIGNAL_OFFSET..][0..8]),
+                            bo.readU64Le(buf[clone3_policy.STACK_SIZE_OFFSET..][0..8]),
+                            bo.readU64Le(buf[clone3_policy.SET_TID_OFFSET..][0..8]),
+                            bo.readU64Le(buf[clone3_policy.SET_TID_SIZE_OFFSET..][0..8]),
+                            bo.readU64Le(buf[clone3_policy.CGROUP_OFFSET..][0..8]),
+                        ))
+                    {
+                        frame.rax = @bitCast(@as(i64, -22)); // EINVAL
+                    } else {
+                        const stack_ptr = bo.readU64Le(buf[clone3_policy.STACK_OFFSET..][0..8]);
+                        const parent_tid = bo.readU64Le(buf[clone3_policy.PARENT_TID_OFFSET..][0..8]);
+                        const child_tid = bo.readU64Le(buf[clone3_policy.CHILD_TID_OFFSET..][0..8]);
+                        const tls = bo.readU64Le(buf[clone3_policy.TLS_OFFSET..][0..8]);
+                        const regs: clone_mod.ParentRegs = .{
+                            .rbx = frame.rbx,
+                            .rcx = frame.rcx,
+                            .rdx = frame.rdx,
+                            .rsi = frame.rsi,
+                            .rdi = frame.rdi,
+                            .rbp = frame.rbp,
+                            .r8 = frame.r8,
+                            .r9 = frame.r9,
+                            .r10 = frame.r10,
+                            .r11 = frame.r11,
+                            .r12 = frame.r12,
+                            .r13 = frame.r13,
+                            .r14 = frame.r14,
+                            .r15 = frame.r15,
+                        };
+                        frame.rax = @bitCast(clone_mod.clone(flags, stack_ptr, parent_tid, child_tid, tls, regs));
+                    }
                 }
             }
         },
@@ -3929,7 +3948,9 @@ fn syscallFsync(fd: u32) i64 {
 /// clock_nanosleep(clockid, flags, req_timespec, rem_timespec) — high-res sleep.
 /// flags: 0 = relative, 1 = TIMER_ABSTIME
 fn syscallClockNanosleep(clockid: u32, flags: u32, req_ptr: u64, rem_ptr: u64) i64 {
-    _ = clockid; // all clocks use TSC
+    const time_policy = @import("../../ipc/time_policy.zig");
+    if (clockid != time_policy.CLOCK_REALTIME and clockid != time_policy.CLOCK_MONOTONIC) return -22;
+    if (flags & ~time_policy.TIMER_ABSTIME != 0) return -22;
     if (req_ptr == 0 or req_ptr >= 0x0000_8000_0000_0000) return -14;
     const copy = @import("../../mm/copy_from_user.zig");
     const tsc = @import("../../arch/x86_64/tsc.zig");
@@ -3937,16 +3958,19 @@ fn syscallClockNanosleep(clockid: u32, flags: u32, req_ptr: u64, rem_ptr: u64) i
 
     var ts_buf: [16]u8 = undefined;
     if (copy.copyFromUser(&ts_buf, @ptrFromInt(req_ptr), 16) != 16) return -14;
-    const sec: u64 = bo.readU64Le(ts_buf[0..8]);
-    const nsec: u64 = bo.readU64Le(ts_buf[8..16]);
-    const target_ns = sec * 1_000_000_000 + nsec;
+    const sec = bo.readI64Le(ts_buf[0..8]);
+    const nsec = bo.readI64Le(ts_buf[8..16]);
+    const target_ns = time_policy.timespecToNs(sec, nsec) orelse return -22;
     if (target_ns == 0) return 0;
 
     if (flags & 1 != 0) {
         // TIMER_ABSTIME: sleep until absolute time
-        const now = tsc.nanos();
-        if (target_ns <= now) return 0;
-        const delta = target_ns - now;
+        const delta = time_policy.absoluteDeltaNs(
+            clockid,
+            target_ns,
+            tsc.nanos(),
+            @import("../../proc/time_syscall.zig").wallClockOffset(),
+        ) orelse return -22;
         const start = tsc.nanos();
         while (tsc.nanos() - start < delta) {
             asm volatile ("pause");
@@ -5325,10 +5349,12 @@ fn findTaskByPid(pid: u32) ?*@import("../../proc/task.zig").Task {
 /// clock_settime(clockid, tp_ptr) — set wall-clock time.
 /// Computes offset between requested time and TSC boot time, stores it.
 fn syscallClockSettime(clockid: u32, tp_ptr: u64) i64 {
-    _ = clockid; // Accept all clock IDs (CLOCK_REALTIME etc.)
     const copy = @import("../../mm/copy_from_user.zig");
     const bo = @import("../../lib/byte_order.zig");
     const tsc = @import("tsc.zig");
+    const time_set_policy = @import("../../proc/time_set_policy.zig");
+
+    if (!time_set_policy.canSetRealtime(checkCapForCurrent("cap_sys_time"))) return -1;
 
     if (tp_ptr == 0 or tp_ptr >= 0x0000_8000_0000_0000) return -14;
 
@@ -5338,11 +5364,11 @@ fn syscallClockSettime(clockid: u32, tp_ptr: u64) i64 {
 
     const req_sec = bo.readU64Le(ts_buf[0..8]);
     const req_nsec = bo.readU64Le(ts_buf[8..16]);
-    const req_ns: i64 = @intCast(req_sec * 1_000_000_000 + req_nsec);
+    const req_ns = time_set_policy.requestedNanoseconds(clockid, req_sec, req_nsec) orelse return -22;
 
     // offset = requested_ns - boot_ns
     const boot_ns: i64 = @intCast(tsc.nanos());
-    const offset = req_ns - boot_ns;
+    const offset = std.math.sub(i64, req_ns, boot_ns) catch return -22;
     time_mod.setWallClockOffset(offset);
     return 0;
 }
@@ -5443,7 +5469,7 @@ fn syscallCloseRange(first: u32, last: u32, flags: u32) i64 {
 /// pidfd_open(pid, flags) — open a pid file descriptor.
 /// Simplified: allocates a proc_file fd that references the target task's tid.
 fn syscallPidfdOpen(pid: u32, flags: u32) i64 {
-    _ = flags;
+    if (!@import("../../proc/pidfd_policy.zig").flagsValid(flags)) return -22; // EINVAL
     const sched = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
 
@@ -5456,8 +5482,8 @@ fn syscallPidfdOpen(pid: u32, flags: u32) i64 {
     // Allocate a fd slot
     const fd_slot = cur.fd_table.allocFd() orelse return -24; // EMFILE
     cur.fd_table.fds[fd_slot] = .{
-        .fd_type = .proc_file,
-        .inode_id = 0x4000_0000_0000_0000 + (@as(u64, target.tid) << 8),
+        .fd_type = .pidfd,
+        .proc_pid = target.tid,
     };
     cur.fd_table.publishFd(fd_slot);
     return @intCast(fd_slot);
@@ -5467,7 +5493,8 @@ fn syscallPidfdOpen(pid: u32, flags: u32) i64 {
 /// Simplified: extracts tid from fd inode_id and calls signal.sendSignal.
 fn syscallPidfdSendSignal(pidfd: u32, sig: u32, info_ptr: u64, flags: u32) i64 {
     _ = info_ptr;
-    _ = flags;
+    if (!@import("../../proc/pidfd_signal_policy.zig").flagsValid(flags)) return -22;
+    if (!@import("../../proc/pidfd_signal_policy.zig").signalValid(sig)) return -22;
     const sched = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
     const signal = @import("../../proc/signal.zig");
@@ -5477,15 +5504,13 @@ fn syscallPidfdSendSignal(pidfd: u32, sig: u32, info_ptr: u64, flags: u32) i64 {
 
     if (pidfd >= cur.fd_table.fds.len) return -9; // EBADF
     const fd = &cur.fd_table.fds[pidfd];
-    if (fd.fd_type != .proc_file) return -9;
+    if (fd.fd_type != .pidfd) return -9;
 
-    // Extract tid from inode_id
-    const target_tid: u32 = @truncate(fd.inode_id >> 8);
+    const target_tid: u32 = fd.proc_pid;
     // Verify target exists
     _ = findTaskByPid(target_tid) orelse return -3;
 
-    _ = signal.sendSignal(target_tid, sig);
-    return 0;
+    return if (signal.sendSignal(target_tid, sig)) 0 else -3; // ESRCH
 }
 
 /// pidfd_getfd(pidfd, targetfd, flags) — get fd from another process.

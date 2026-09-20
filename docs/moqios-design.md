@@ -1308,7 +1308,7 @@ moqios/
 | R1 | IPC 开销导致系统调用性能差 | 高 | 共享内存通道 + 小消息混合模型; 对热路径 (read/write) 优化为零拷贝 |
 | R2 | Windows syscall number 版本差异 | 高 | 自研 ntdll.dll 屏蔽 syscall 层; WinPers 内部使用稳定的 API 语义 |
 | R3 | SEH 实现复杂度极高 | 高 | 初期仅支持简单的 __try/__except; 编译器生成的 SEH chain 优先支持 |
-| R4 | Linux clone() 细粒度 flags 难以完全模拟 | 中 | 优先支持 CLONE_VM\|CLONE_THREAD (线程) 和普通 fork; 其他 flags 按需实现 |
+| R4 | Linux clone() 细粒度 flags 难以完全模拟 | 中 | Phase-0 先拒绝未实现 flags/组合；待 ThreadGroup、clear-TID 和共享 FD 生命周期闭合后再启用 |
 | R5 | 驱动生态为零 | 中 | 先支持 virtio 驱动 (QEMU 测试); 逐步添加 NVMe/AHCI/E1000 |
 | R6 | 两种安全模型共存复杂 | 中 | 初期简化为 UID/GID + rwx; Windows ACL 翻译为简化权限 |
 | R7 | Zig 工具链成熟度 | 低 | Zigix 已验证 Zig 适合 OS 开发; 保持 Zig 版本锁定 |

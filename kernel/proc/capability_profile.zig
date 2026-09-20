@@ -16,7 +16,8 @@ pub const SysCap = packed struct(u32) {
     cap_net_admin: bool = false,
     cap_ipc_lock: bool = false,
     cap_sys_rawio: bool = false,
-    _pad: u15 = 0,
+    cap_sys_time: bool = false,
+    _pad: u14 = 0,
 };
 
 pub const ALL_CAPS: SysCap = .{
@@ -37,6 +38,7 @@ pub const ALL_CAPS: SysCap = .{
     .cap_net_admin = true,
     .cap_ipc_lock = true,
     .cap_sys_rawio = true,
+    .cap_sys_time = true,
 };
 
 pub const NO_CAPS: SysCap = .{};

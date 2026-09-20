@@ -169,10 +169,14 @@ pub fn timerfdSettime(timerfd_idx: u32, flags: u32, new_value: *const Itimerspec
     // Calculate expiry
     if ((flags & TFD_TIMER_ABSTIME) != 0) {
         // Absolute time: convert to tick
-        const abs_ns = value_ns;
-        const current_ns = tsc.nanos();
-        if (abs_ns > current_ns) {
-            const delta = nsToTicks(abs_ns - current_ns) orelse return -22;
+        const delta_ns = time_policy.absoluteDeltaNs(
+            inst.clock_id,
+            value_ns,
+            tsc.nanos(),
+            @import("../proc/time_syscall.zig").wallClockOffset(),
+        ) orelse return -22;
+        if (delta_ns > 0) {
+            const delta = nsToTicks(delta_ns) orelse return -22;
             const now = idt.getTickCount();
             if (delta > std.math.maxInt(u64) - now) return -22;
             inst.expiry_tick = now + delta;

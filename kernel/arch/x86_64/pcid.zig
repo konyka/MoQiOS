@@ -209,6 +209,7 @@ pub fn switchCr3(pml4_phys: u64) void {
         pml4_phys,
         target_pcid,
         g1,
+        false,
     );
     if (action == .skip) return;
 

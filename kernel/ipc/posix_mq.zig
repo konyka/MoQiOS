@@ -11,6 +11,11 @@ const copy = @import("../mm/copy_from_user.zig");
 const task = @import("../proc/task.zig");
 const sched = @import("../proc/sched.zig");
 const time_policy = @import("time_policy.zig");
+const mq_timeout_policy = @import("posix_mq_policy.zig");
+const attr_policy = @import("posix_mq_attr_policy.zig");
+const receive_policy = @import("posix_mq_receive_policy.zig");
+const priority_policy = @import("posix_mq_priority_policy.zig");
+const ownership_policy = @import("posix_mq_ownership_policy.zig");
 const owner_gen_policy = @import("owner_gen_policy.zig");
 
 const MAX_QUEUES: u32 = 16;
@@ -24,6 +29,7 @@ const MsgEntry = struct {
     len: u32 = 0,
     priority: u32 = 0,
     used: bool = false,
+    reserved: bool = false,
 };
 
 /// POSIX message queue
@@ -66,6 +72,7 @@ pub const MqQueue = struct {
 
 var queues: [MAX_QUEUES]MqQueue = @splat(.{});
 var mq_lock: IrqSpinlock = .{};
+var task_refs: [task.MAX_TASKS][MAX_QUEUES]u32 = @splat(@splat(0));
 
 // ── O_* flags ──
 const O_RDONLY: u32 = 0;
@@ -88,6 +95,7 @@ const EBADF = errno.EBADF;
 const EFAULT = errno.EFAULT;
 const EINTR = errno.EINTR;
 const ETIMEDOUT = errno.ETIMEDOUT;
+const EMSGSIZE = errno.EMSGSIZE;
 
 /// Linux timespec for timeout reading.
 const Timespec = extern struct {
@@ -97,22 +105,30 @@ const Timespec = extern struct {
 
 /// Read absolute timeout from user space, return absolute time in nanoseconds.
 /// Returns 0 if timeout_ptr is NULL or invalid (caller should treat as no timeout).
-fn readAbsTimeout(timeout_ptr: u64) u64 {
-    if (timeout_ptr == 0 or timeout_ptr >= 0x0000_8000_0000_0000) return 0;
+fn readAbsTimeout(timeout_ptr: u64) error{ Fault, Invalid }!mq_timeout_policy.Timeout {
+    if (timeout_ptr == 0) return .none;
+    if (timeout_ptr >= 0x0000_8000_0000_0000) return error.Fault;
     var ts_buf: [@sizeOf(Timespec)]u8 = undefined;
     if (copy.copyFromUser(&ts_buf, @ptrFromInt(timeout_ptr), @sizeOf(Timespec)) != @sizeOf(Timespec)) {
-        return 0;
+        return error.Fault;
     }
     const ts: *const Timespec = @ptrCast(@alignCast(&ts_buf));
-    // Unrepresentable/invalid timespec → no timeout, never a wrapped deadline.
-    return time_policy.timespecToNs(ts.tv_sec, ts.tv_nsec) orelse 0;
+    const deadline = time_policy.timespecToNs(ts.tv_sec, ts.tv_nsec) orelse return error.Invalid;
+    return mq_timeout_policy.fromNanoseconds(true, deadline);
 }
 
-/// Check if timeout has expired. abs_timeout_ns == 0 means no timeout.
-fn isTimedOut(abs_timeout_ns: u64) bool {
-    if (abs_timeout_ns == 0) return false;
+fn deadlineNs(timeout: mq_timeout_policy.Timeout) ?u64 {
+    return switch (timeout) {
+        .none => null,
+        .deadline => |value| value,
+    };
+}
+
+/// Check if the supplied absolute timeout has expired.
+fn isTimedOut(abs_timeout_ns: mq_timeout_policy.Timeout) bool {
+    const deadline = deadlineNs(abs_timeout_ns) orelse return false;
     const tsc = @import("../arch/arch.zig").tsc;
-    return tsc.nanos() >= abs_timeout_ns;
+    return tsc.nanos() >= deadline;
 }
 
 // ── Timed waits (abs_timeout) ──
@@ -147,7 +163,7 @@ pub fn timerTick(now_ns: u64) void {
         bm &= bm - 1;
         const idx: u32 = i;
         const deadline = wait_deadlines[idx];
-        if (deadline == 0 or now_ns < deadline) continue;
+        if (now_ns < deadline) continue;
         disarmWaitDeadline(idx);
         // Republish like futex wakeN: a bare .ready starves on busy CPUs.
         task.unblockTask(idx);
@@ -195,22 +211,27 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
     var name_buf: [MAX_NAME_LEN]u8 = @splat(0);
     const name_len: u32 = @intCast(readUserString(name_ptr, &name_buf));
     if (name_len == 0) return EINVAL;
+    const owner_idx = sched.currentTaskIndex() orelse return EBADF;
 
     var maxmsg: i64 = 0;
     var msgsize: i64 = 0;
-    if (attr_ptr != 0 and attr_ptr < 0x0000_8000_0000_0000) {
+    const create_requested = oflag & O_CREAT != 0;
+    if (create_requested and attr_ptr != 0) {
+        if (attr_ptr >= 0x0000_8000_0000_0000) return EFAULT;
         var attr_buf: [32]u8 = undefined;
-        if (copy.copyFromUser(&attr_buf, @ptrFromInt(attr_ptr), 32) == 32) {
-            maxmsg = bo.readI64Le(attr_buf[8..16]);
-            msgsize = bo.readI64Le(attr_buf[16..24]);
-        }
+        if (copy.copyFromUser(&attr_buf, @ptrFromInt(attr_ptr), 32) != 32) return EFAULT;
+        maxmsg = bo.readI64Le(attr_buf[8..16]);
+        msgsize = bo.readI64Le(attr_buf[16..24]);
+    }
+    if (attr_policy.validate(create_requested, attr_ptr != 0, maxmsg, msgsize, MAX_MSGS, MAX_MSG_SIZE) == .invalid) {
+        return EINVAL;
     }
 
     const flags = mq_lock.acquire();
     defer mq_lock.release(flags);
 
     // Search for existing queue with this name
-    for (&queues) |*q| {
+    for (&queues, 0..) |*q, queue_idx| {
         if (q.active and str.eql(q.name[0..q.name_len], name_buf[0..name_len])) {
             if (oflag & O_CREAT != 0 and oflag & O_EXCL != 0) {
                 return EEXIST;
@@ -218,6 +239,7 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
             // Return existing fd (or assign one)
             if (q.fd < 0) q.fd = allocFd();
             q.open_count += 1;
+            task_refs[owner_idx][queue_idx] += 1;
             return @intCast(q.fd);
         }
     }
@@ -250,14 +272,17 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
     q.count = 0;
     q.marked_removed = false;
     q.open_count = 1;
+    task_refs[owner_idx][idx] = 1;
     q.notify_pid = 0;
     q.notify_task_idx = null;
     q.notify_tid = 0;
     q.notify_signo = 0;
 
     // Apply optional attributes (only honored at creation)
-    if (maxmsg > 0 and maxmsg <= MAX_MSGS) q.max_msg = @intCast(maxmsg);
-    if (msgsize > 0 and msgsize <= MAX_MSG_SIZE) q.msg_size = @intCast(msgsize);
+    if (create_requested and attr_ptr != 0) {
+        q.max_msg = @intCast(maxmsg);
+        q.msg_size = @intCast(msgsize);
+    }
 
     q.fd = allocFd();
 
@@ -301,9 +326,12 @@ pub fn mqUnlink(name_ptr: u64) i64 {
 /// mq_timedsend(mqd, msg_ptr, msg_len, msg_prio, abs_timeout) -> 0 or -errno
 /// rdi=mqd, rsi=msg_ptr, rdx=msg_len, r10=msg_prio, r8=abs_timeout
 pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_ptr: u64) i64 {
+    if (!currentTaskOwnsFd(mqd)) return EBADF;
     // Read timeout before acquiring lock
-    const abs_timeout_ns = readAbsTimeout(timeout_ptr);
-
+    const abs_timeout_ns = readAbsTimeout(timeout_ptr) catch |err| return switch (err) {
+        error.Fault => EFAULT,
+        error.Invalid => EINVAL,
+    };
 
     // Try to send, blocking on the send wait queue if the queue is full
     while (true) {
@@ -349,12 +377,12 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
                 mq_lock.release(flags);
                 return EAGAIN;
             };
-            if (abs_timeout_ns != 0) armWaitDeadline(cur_idx, abs_timeout_ns);
+            if (deadlineNs(abs_timeout_ns)) |deadline| armWaitDeadline(cur_idx, deadline);
             cur_task.state = .blocked;
             mq_lock.release(flags);
             sched.forceReschedule();
             sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
-            if (abs_timeout_ns != 0) disarmWaitDeadline(cur_idx);
+            if (deadlineNs(abs_timeout_ns) != null) disarmWaitDeadline(cur_idx);
             // Woken: wakeOne already popped our node; unlink defensively in
             // case a future wake path bypasses the queue, then re-check the
             // condition and the deadline from the top.
@@ -370,31 +398,53 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
         }
 
         // Space available — send message
-        var msg = &q.msgs[q.tail];
-        const copy_len: usize = if (msg_len > MAX_MSG_SIZE) MAX_MSG_SIZE else @intCast(msg_len);
-        const copied = copy.copyFromUser(msg.data[0..copy_len], @ptrFromInt(msg_ptr), copy_len);
-        if (copied != copy_len) {
+        var send_slots: [MAX_MSGS]priority_policy.Slot = @splat(.{});
+        for (&send_slots, 0..) |*slot, i| {
+            slot.used = q.msgs[i].used and !q.msgs[i].reserved;
+            slot.priority = q.msgs[i].priority;
+        }
+        const send_idx = priority_policy.nextFree(&send_slots, q.tail) orelse {
             mq_lock.release(flags);
+            return EAGAIN;
+        };
+        const copy_len: usize = if (msg_len > MAX_MSG_SIZE) MAX_MSG_SIZE else @intCast(msg_len);
+        q.msgs[send_idx].reserved = true;
+        mq_lock.release(flags);
+
+        var payload: [MAX_MSG_SIZE]u8 = undefined;
+        const copied = copy.copyFromUser(payload[0..copy_len], @ptrFromInt(msg_ptr), copy_len);
+
+        const commit_flags = mq_lock.acquire();
+        const commit_q = findByFd(mqd);
+        if (commit_q == null or !commit_q.?.msgs[send_idx].reserved) {
+            mq_lock.release(commit_flags);
+            return EAGAIN;
+        }
+        if (copied != copy_len) {
+            commit_q.?.msgs[send_idx].reserved = false;
+            mq_lock.release(commit_flags);
             return EFAULT;
         }
 
-        msg.len = @intCast(copy_len);
-        msg.priority = msg_prio;
-        msg.used = true;
-        q.tail = (q.tail + 1) % MAX_MSGS;
-        q.count += 1;
+        @memcpy(commit_q.?.msgs[send_idx].data[0..copy_len], payload[0..copy_len]);
+        commit_q.?.msgs[send_idx].len = @intCast(copy_len);
+        commit_q.?.msgs[send_idx].priority = msg_prio;
+        commit_q.?.msgs[send_idx].used = true;
+        commit_q.?.msgs[send_idx].reserved = false;
+        commit_q.?.tail = (send_idx + 1) % MAX_MSGS;
+        commit_q.?.count += 1;
 
         // mq_notify: a message arriving on an empty queue (with no blocked
         // receiver about to consume it) delivers the registered signal once;
         // Linux requires re-arming via another mq_notify.
-        if (q.count == 1 and q.recv_waiters == null and q.notify_task_idx != null) {
-            const notify_idx = q.notify_task_idx.?;
-            const notify_tid = q.notify_tid;
-            const notify_signo = q.notify_signo;
-            q.notify_pid = 0;
-            q.notify_task_idx = null;
-            q.notify_tid = 0;
-            q.notify_signo = 0;
+        if (commit_q.?.count == 1 and commit_q.?.recv_waiters == null and commit_q.?.notify_task_idx != null) {
+            const notify_idx = commit_q.?.notify_task_idx.?;
+            const notify_tid = commit_q.?.notify_tid;
+            const notify_signo = commit_q.?.notify_signo;
+            commit_q.?.notify_pid = 0;
+            commit_q.?.notify_task_idx = null;
+            commit_q.?.notify_tid = 0;
+            commit_q.?.notify_signo = 0;
             if (notify_signo > 0 and notify_signo < 32) {
                 if (task.getTask(notify_idx)) |nt| {
                     // The slot may have been recycled after the registrant
@@ -408,9 +458,9 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
         }
 
         // Wake a receiver blocked on the empty queue
-        _ = sched.wakeOne(&q.recv_waiters);
+        _ = sched.wakeOne(&commit_q.?.recv_waiters);
 
-        mq_lock.release(flags);
+        mq_lock.release(commit_flags);
         return 0;
     }
 }
@@ -418,10 +468,13 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
 /// mq_timedreceive(mqd, msg_ptr, msg_len, msg_prio, abs_timeout) -> bytes or -errno
 /// rdi=mqd, rsi=msg_ptr, rdx=msg_len, r10=msg_prio, r8=abs_timeout
 pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeout_ptr: u64) i64 {
+    if (!currentTaskOwnsFd(mqd)) return EBADF;
     if (prio_ptr != 0 and !copy.validateUserBufferWritable(prio_ptr, 4)) return EFAULT;
     // Read timeout before acquiring lock
-    const abs_timeout_ns = readAbsTimeout(timeout_ptr);
-
+    const abs_timeout_ns = readAbsTimeout(timeout_ptr) catch |err| return switch (err) {
+        error.Fault => EFAULT,
+        error.Invalid => EINVAL,
+    };
 
     // Try to receive, blocking on the receive wait queue if the queue is empty
     while (true) {
@@ -460,12 +513,12 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
                 mq_lock.release(flags);
                 return EAGAIN;
             };
-            if (abs_timeout_ns != 0) armWaitDeadline(cur_idx, abs_timeout_ns);
+            if (deadlineNs(abs_timeout_ns)) |deadline| armWaitDeadline(cur_idx, deadline);
             cur_task.state = .blocked;
             mq_lock.release(flags);
             sched.forceReschedule();
             sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
-            if (abs_timeout_ns != 0) disarmWaitDeadline(cur_idx);
+            if (deadlineNs(abs_timeout_ns) != null) disarmWaitDeadline(cur_idx);
             // Woken: re-check condition and deadline from the top.
             const flags2 = mq_lock.acquire();
             unlinkNode(&q.recv_waiters, &node);
@@ -478,46 +531,70 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
         }
 
         // Message available — receive it
-        var msg = &q.msgs[q.head];
-        const out_len: usize = if (msg_len < msg.len) @intCast(msg_len) else @intCast(msg.len);
-
-        const written = copy.copyToUser(@ptrFromInt(msg_ptr), msg.data[0..out_len], out_len);
-        if (written != out_len) {
+        var priority_slots: [MAX_MSGS]priority_policy.Slot = @splat(.{});
+        for (&priority_slots, 0..) |*slot, i| {
+            slot.used = q.msgs[i].used and !q.msgs[i].reserved;
+            slot.priority = q.msgs[i].priority;
+        }
+        const selected_idx = priority_policy.selectHighest(&priority_slots, q.head) orelse {
             mq_lock.release(flags);
+            return EAGAIN;
+        };
+        var msg = &q.msgs[selected_idx];
+        if (!receive_policy.bufferAcceptsMessage(msg_len, msg.len)) {
+            mq_lock.release(flags);
+            return EMSGSIZE;
+        }
+        const out_len: usize = @intCast(msg.len);
+        var payload: [MAX_MSG_SIZE]u8 = undefined;
+        @memcpy(payload[0..out_len], msg.data[0..out_len]);
+        const priority = msg.priority;
+        msg.reserved = true;
+        mq_lock.release(flags);
+
+        const payload_written = copy.copyToUser(@ptrFromInt(msg_ptr), payload[0..out_len], out_len);
+        var prio_written: usize = 4;
+        if (payload_written == out_len and prio_ptr != 0) {
+            var prio_buf: [4]u8 = undefined;
+            prio_buf[0] = @intCast(priority & 0xFF);
+            prio_buf[1] = @intCast((priority >> 8) & 0xFF);
+            prio_buf[2] = @intCast((priority >> 16) & 0xFF);
+            prio_buf[3] = @intCast((priority >> 24) & 0xFF);
+            prio_written = copy.copyToUser(@ptrFromInt(prio_ptr), &prio_buf, 4);
+        }
+        const commit_flags = mq_lock.acquire();
+        const commit_q = findByFd(mqd);
+        if (commit_q == null or !commit_q.?.msgs[selected_idx].reserved) {
+            mq_lock.release(commit_flags);
+            return EAGAIN;
+        }
+        if (payload_written != out_len or prio_written != 4) {
+            commit_q.?.msgs[selected_idx].reserved = false;
+            mq_lock.release(commit_flags);
             return EFAULT;
         }
-
-        // Write priority if requested
-        if (prio_ptr != 0) {
-            var prio_buf: [4]u8 = undefined;
-            prio_buf[0] = @intCast(msg.priority & 0xFF);
-            prio_buf[1] = @intCast((msg.priority >> 8) & 0xFF);
-            prio_buf[2] = @intCast((msg.priority >> 16) & 0xFF);
-            prio_buf[3] = @intCast((msg.priority >> 24) & 0xFF);
-            if (copy.copyToUser(@ptrFromInt(prio_ptr), &prio_buf, 4) != 4) {
-                mq_lock.release(flags);
-                return EFAULT;
-            }
-        }
-
         const result_len: i64 = @intCast(out_len);
 
         // Free slot
-        msg.used = false;
-        msg.len = 0;
-        q.head = (q.head + 1) % MAX_MSGS;
-        q.count -= 1;
+        commit_q.?.msgs[selected_idx].used = false;
+        commit_q.?.msgs[selected_idx].reserved = false;
+        commit_q.?.msgs[selected_idx].len = 0;
+        commit_q.?.count -= 1;
+        commit_q.?.head = (selected_idx + 1) % MAX_MSGS;
+        while (!commit_q.?.msgs[commit_q.?.head].used and commit_q.?.count > 0) {
+            commit_q.?.head = (commit_q.?.head + 1) % MAX_MSGS;
+        }
 
         // Wake a sender blocked on the full queue
-        _ = sched.wakeOne(&q.send_waiters);
+        _ = sched.wakeOne(&commit_q.?.send_waiters);
 
         // If queue was marked for removal and now empty and fully closed,
         // free it
-        if (q.marked_removed and q.count == 0 and q.open_count == 0) {
-            freeQueue(q);
+        if (commit_q.?.marked_removed and commit_q.?.count == 0 and commit_q.?.open_count == 0) {
+            freeQueue(commit_q.?);
         }
 
-        mq_lock.release(flags);
+        mq_lock.release(commit_flags);
         return result_len;
     }
 }
@@ -527,6 +604,7 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
 /// Registers the calling task; the requested signal (sigev_signo @ offset 8)
 /// is delivered once when a message arrives on an empty queue.
 pub fn mqNotify(mqd: u32, notif_ptr: u64) i64 {
+    if (!currentTaskOwnsFd(mqd)) return EBADF;
     // Read sigev_signo/sigev_notify before taking mq_lock (user copies walk
     // page tables). Layout matches posix_timer.Sigevent: value@0, signo@8,
     // notify@12.
@@ -589,7 +667,11 @@ pub fn mqClose(mqd: u32) i64 {
     const flags = mq_lock.acquire();
     defer mq_lock.release(flags);
 
-    const q = findByFd(mqd) orelse return EBADF;
+    const owner_idx = sched.currentTaskIndex() orelse return EBADF;
+    const queue_idx = findQueueIndexByFd(mqd) orelse return EBADF;
+    if (task_refs[owner_idx][queue_idx] == 0) return EBADF;
+    const q = &queues[queue_idx];
+    task_refs[owner_idx][queue_idx] -= 1;
     q.open_count -|= 1;
     if (q.marked_removed and q.count == 0 and q.open_count == 0) {
         freeQueue(q);
@@ -597,11 +679,40 @@ pub fn mqClose(mqd: u32) i64 {
     return 0;
 }
 
+/// Release all MQ references held by an exiting task. Called before the task
+/// becomes a zombie so unlinked queues cannot retain dead open references.
+pub fn closeRefsForTask(task_idx: u32) void {
+    if (task_idx >= task.MAX_TASKS) return;
+    const flags = mq_lock.acquire();
+    defer mq_lock.release(flags);
+    for (&queues, 0..) |*q, queue_idx| {
+        const refs = task_refs[task_idx][queue_idx];
+        if (refs == 0) continue;
+        task_refs[task_idx][queue_idx] = 0;
+        q.open_count -|= refs;
+        if (q.marked_removed and q.count == 0 and q.open_count == 0) freeQueue(q);
+    }
+}
+
+/// Fork duplicates every MQ reference held by the parent task.
+pub fn inheritRefs(parent_idx: u32, child_idx: u32) void {
+    if (parent_idx >= task.MAX_TASKS or child_idx >= task.MAX_TASKS) return;
+    const flags = mq_lock.acquire();
+    defer mq_lock.release(flags);
+    for (&queues, 0..) |*q, queue_idx| {
+        const refs = task_refs[parent_idx][queue_idx];
+        if (refs == 0 or !q.active) continue;
+        task_refs[child_idx][queue_idx] = ownership_policy.inheritedReferences(refs);
+        q.open_count += refs;
+    }
+}
+
 /// mq_getsetattr(mqd, newattr, oldattr) -> 0 or -errno
 /// rdi=mqd, rsi=newattr, rdx=oldattr
 /// Linux struct mq_attr is four 8-byte longs (32 bytes):
 /// mq_flags@0, mq_maxmsg@8, mq_msgsize@16, mq_curmsgs@24.
 pub fn mqGetSetAttr(mqd: u32, newattr_ptr: u64, oldattr_ptr: u64) i64 {
+    if (!currentTaskOwnsFd(mqd)) return EBADF;
     if (oldattr_ptr != 0 and !copy.validateUserBufferWritable(oldattr_ptr, 32)) return EFAULT;
     const flags = mq_lock.acquire();
     defer mq_lock.release(flags);
@@ -638,6 +749,19 @@ fn findByFd(fd: u32) ?*MqQueue {
         if (q.active and @as(i32, @bitCast(fd)) == q.fd) return q;
     }
     return null;
+}
+
+fn findQueueIndexByFd(fd: u32) ?u32 {
+    for (&queues, 0..) |*q, i| {
+        if (q.active and @as(i32, @bitCast(fd)) == q.fd) return @intCast(i);
+    }
+    return null;
+}
+
+fn currentTaskOwnsFd(fd: u32) bool {
+    const owner_idx = sched.currentTaskIndex() orelse return false;
+    const queue_idx = findQueueIndexByFd(fd) orelse return false;
+    return task_refs[owner_idx][queue_idx] != 0;
 }
 
 var next_mq_fd: i32 = 300; // start from high fd number to avoid conflicts

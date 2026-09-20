@@ -450,7 +450,7 @@ pub fn shmdt(shmaddr: u64) i64 {
 /// Detach every segment still attached by `tid`. Called from task.exitTask
 /// so a process that exits without shmdt doesn't leak attachments (and
 /// IPC_RMID segments waiting on attach_count get freed).
-pub fn detachAllForTask(tid: u32, pml4: u64) void {
+pub fn detachAllForTask(tid: u32, pml4: u64, unmap_pages: bool) void {
     const flags = shm_lock.acquire();
     defer shm_lock.release(flags);
 
@@ -459,11 +459,12 @@ pub fn detachAllForTask(tid: u32, pml4: u64) void {
         rec.active = false;
         const seg = findSegment(rec.shmid) orelse continue;
 
-        // Unmap all pages
-        for (0..seg.num_pages) |p| {
-            _ = paging.unmapPage(pml4, rec.base + @as(u64, @intCast(p)) * PAGE_SIZE);
+        if (unmap_pages) {
+            for (0..seg.num_pages) |p| {
+                _ = paging.unmapPage(pml4, rec.base + @as(u64, @intCast(p)) * PAGE_SIZE);
+            }
+            tlb.shootdownRange(rec.base, @intCast(seg.num_pages), pml4);
         }
-        tlb.shootdownRange(rec.base, @intCast(seg.num_pages), pml4);
         if (seg.attach_count > 0) seg.attach_count -= 1;
 
         serial.writeString("[sysv_shm] exit-detach shmid=");
@@ -481,10 +482,20 @@ pub fn detachAllForTask(tid: u32, pml4: u64) void {
 
 /// shmctl(shmid, cmd, buf) -> 0 or -errno
 pub fn shmctl(shmid: u32, cmd: i32, buf: u64) i64 {
+    const copy = @import("../mm/copy_from_user.zig");
+    if (cmd == IPC_STAT and (buf == 0 or buf >= 0x0000_8000_0000_0000)) return -14;
+    if (cmd == IPC_STAT and !copy.validateUserBufferWritable(buf, @sizeOf([6]u64))) return -14;
+    var mode_buf: [1]u64 = .{0};
+    if (cmd == IPC_SET) {
+        if (buf == 0 or buf >= 0x0000_8000_0000_0000) return -14;
+        if (copy.copyFromUser(@ptrCast(&mode_buf), @as([*]const u8, @ptrFromInt(buf)), @sizeOf(u64)) != @sizeOf(u64)) return -14;
+    }
     const flags = shm_lock.acquire();
-    defer shm_lock.release(flags);
 
-    const seg = findSegment(shmid) orelse return -22; // -EINVAL
+    const seg = findSegment(shmid) orelse {
+        shm_lock.release(flags);
+        return -22; // -EINVAL
+    };
     const cur = if (sched.currentTaskIndex()) |idx| task_mod.getTask(idx) else null;
     const can_manage = if (cur) |task|
         task.euid == 0 or task.euid == seg.perm.uid or task.euid == seg.perm.cuid
@@ -496,25 +507,30 @@ pub fn shmctl(shmid: u32, cmd: i32, buf: u64) i64 {
             if (!can_manage and cur != null) {
                 const task = cur.?;
                 const class_bits: u5 = if (task.egid == seg.perm.gid) 3 else 0;
-                if (!shm_policy.modeAllows(seg.perm.mode, class_bits, 0o4)) return -13; // -EACCES
+                if (!shm_policy.modeAllows(seg.perm.mode, class_bits, 0o4)) {
+                    shm_lock.release(flags);
+                    return -13; // -EACCES
+                }
             }
-            // Copy segment info to user buffer
-            if (buf == 0 or buf >= 0x0000_8000_0000_0000) return -14; // -EFAULT
-            const copy = @import("../mm/copy_from_user.zig");
             // Write key, size, num_pages, attach_count as a simple struct
-            var info: [6]u64 = .{
-                @intCast(seg.perm.key),
+            const info: [6]u64 = .{
+                @bitCast(@as(i64, seg.perm.key)),
                 seg.size,
                 @intCast(seg.num_pages),
                 @intCast(seg.attach_count),
                 @intCast(seg.shmid),
                 if (seg.marked_removed) @as(u64, 1) else 0,
             };
-            if (copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&info))[0..@sizeOf([6]u64)], @sizeOf([6]u64)) != @sizeOf([6]u64)) return -14;
+            const info_copy = info;
+            shm_lock.release(flags);
+            if (copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&info_copy))[0..@sizeOf([6]u64)], @sizeOf([6]u64)) != @sizeOf([6]u64)) return -14;
             return 0;
         },
         IPC_RMID => {
-            if (!can_manage) return -1; // -EPERM
+            if (!can_manage) {
+                shm_lock.release(flags);
+                return -1; // -EPERM
+            }
             seg.marked_removed = true;
             serial.writeString("[sysv_shm] marked shmid=");
             fmt.writeDecimal(shmid);
@@ -523,19 +539,23 @@ pub fn shmctl(shmid: u32, cmd: i32, buf: u64) i64 {
             if (seg.attach_count == 0) {
                 freeSegment(seg);
             }
+            shm_lock.release(flags);
             return 0;
         },
         IPC_SET => {
-            if (!can_manage) return -1; // -EPERM
+            if (!can_manage) {
+                shm_lock.release(flags);
+                return -1; // -EPERM
+            }
             // Update permission mode bits from buf (simplified: accept mode as u64)
-            if (buf == 0 or buf >= 0x0000_8000_0000_0000) return -14; // -EFAULT
-            const copy = @import("../mm/copy_from_user.zig");
-            var mode_buf: [1]u64 = .{0};
-            if (copy.copyFromUser(@ptrCast(&mode_buf), @as([*]const u8, @ptrFromInt(buf)), @sizeOf(u64)) != @sizeOf(u64)) return -14; // -EFAULT
             seg.perm.mode = @intCast(mode_buf[0] & 0o777);
+            shm_lock.release(flags);
             return 0;
         },
-        else => return -22, // -EINVAL
+        else => {
+            shm_lock.release(flags);
+            return -22; // -EINVAL
+        },
     }
 }
 

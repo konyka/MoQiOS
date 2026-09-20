@@ -15,6 +15,9 @@ const getPerCpu = @import("syscall_entry.zig").getPerCpu;
 const fmt = @import("../../lib/fmt.zig");
 const cow_pte_mod = @import("../../mm/cow_pte.zig");
 const lifecycle_policy = @import("../../mm/lifecycle_policy.zig");
+const shared_mapping_policy = @import("../../mm/shared_mapping_policy.zig");
+const clone_flags_policy = @import("../../mm/clone_flags_policy.zig");
+const copy_user = @import("../../mm/copy_from_user.zig");
 
 // ── CLONE flags ──────────────────────────────────────────────────────
 const CLONE_VM: u64 = 0x100;
@@ -65,6 +68,14 @@ fn isZeroPage(page: [*]const u8) bool {
     return true;
 }
 
+fn isSharedMapping(regions: []const task_mod.MmapRegion, virt: u64) bool {
+    for (regions) |*region| {
+        if (!region.active or !region.shared) continue;
+        if (shared_mapping_policy.contains(region.base, region.num_pages, virt, 4096)) return true;
+    }
+    return false;
+}
+
 /// Clone the user-space page tables with Copy-on-Write semantics.
 /// Returns the physical address of the new PML4, or null on OOM.
 ///
@@ -74,7 +85,7 @@ fn isZeroPage(page: [*]const u8) bool {
 /// fresh, unlinked pages — parent untouched); phase 2 downgrades and fills
 /// with zero allocations, so OOM can neither abandon a half-built child tree
 /// nor leave the parent COW-marked for a child that does not exist.
-pub fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
+pub fn cloneUserPages(parent_pml4_phys: u64, shared_regions: []const task_mod.MmapRegion) ?u64 {
     const ADDR_MASK: u64 = 0xFFFFFFFFF000;
 
     const parent_pml4: [*]const u64 = @ptrFromInt(hhdm_mod.physToVirt(parent_pml4_phys));
@@ -191,14 +202,26 @@ pub fn cloneUserPages(parent_pml4_phys: u64) ?u64 {
                     const src_phys = pte & ADDR_MASK;
 
                     const src: [*]const u8 = @ptrFromInt(hhdm_mod.physToVirt(src_phys));
-                    if (isZeroPage(src)) continue;
+                    const virt = (@as(u64, pml4_idx) << 39) |
+                        (@as(u64, pdpt_idx) << 30) |
+                        (@as(u64, pd_idx) << 21) |
+                        (@as(u64, pt_idx) << 12);
+                    const shared_mapping = isSharedMapping(shared_regions, virt);
+                    if (isZeroPage(src) and !shared_mapping) continue;
 
                     pmm_mod.addRef(src_phys);
-                    // Both sides hold the same entry. Rebuilding the child's
-                    // from `phys | (pte & 0xFFF)` dropped NX at bit 63.
-                    const shared = cow_pte_mod.sharedPte(pte);
-                    parent_pt[pt_idx] = shared;
-                    child_pt[pt_idx] = shared;
+                    if (shared_mapping) {
+                        // MAP_SHARED keeps writable access and the same frame
+                        // in both address spaces; only the reference count is
+                        // duplicated here.
+                        child_pt[pt_idx] = pte;
+                    } else {
+                        // Private mappings use COW. Rebuilding from the frame
+                        // address would drop NX at bit 63, so preserve flags.
+                        const cow = cow_pte_mod.sharedPte(pte);
+                        parent_pt[pt_idx] = cow;
+                        child_pt[pt_idx] = cow;
+                    }
                 }
             }
         }
@@ -231,8 +254,18 @@ pub fn clone(
     tls: u64,
     regs: ParentRegs,
 ) i64 {
+    if (!clone_flags_policy.valid(flags, blk: {
+        const idx = sched.currentTaskIndex() orelse break :blk false;
+        break :blk (task_mod.getTask(idx) orelse break :blk false).mm != null;
+    })) return -22; // EINVAL: unsupported or incoherent flags
     const parent_idx = sched.currentTaskIndex() orelse return -1;
     const parent = task_mod.getTask(parent_idx) orelse return -1;
+    if (flags & clone_flags_policy.TID_FLAGS != 0) {
+        if (parent_tid_ptr != 0 and !copy_user.validateUserBufferWritable(parent_tid_ptr, 4)) return -14;
+        if (child_tid_ptr != 0 and !copy_user.validateUserBufferWritable(child_tid_ptr, 4)) return -14;
+        if (flags & clone_flags_policy.CLONE_PARENT_SETTID != 0 and parent_tid_ptr == 0) return -22;
+        if (flags & clone_flags_policy.CLONE_CHILD_CLEARTID != 0 and child_tid_ptr == 0) return -22;
+    }
 
     // See fork(): until SHM attachment ownership is shared/address-space
     // based, reject both process and CLONE_VM cloning while attached.
@@ -259,7 +292,7 @@ pub fn clone(
         clone: {
             var vm_guard = @import("../../mm/mm.zig").Mm.beginVmMutation(parent.mm, @ptrCast(parent)) catch return -12; // ENOMEM
             defer vm_guard.release();
-            break :clone cloneUserPages(parent.page_table_phys) orelse return -12; // ENOMEM
+            break :clone cloneUserPages(parent.page_table_phys, &parent.mmap_regions) orelse return -12; // ENOMEM
         };
 
     if (shares_vm) {
@@ -288,6 +321,7 @@ pub fn clone(
         parent.fSize_max,
     ) orelse return -12;
     const child = task_mod.getTask(child_idx).?;
+    child.clear_tid_ptr = if (flags & clone_flags_policy.CLONE_CHILD_CLEARTID != 0) child_tid_ptr else 0;
     child.nofile_cur = parent.nofile_cur;
     child.nofile_max = parent.nofile_max;
     child.stack_cur = parent.stack_cur;
@@ -330,6 +364,12 @@ pub fn clone(
         // v53.50: Copy free_bm bitmap — child inherits parent's fd occupancy state.
         parent.fd_table.inheritFdTable(child.fd_table);
     }
+    // POSIX MQ descriptors live outside FdTable; mirror their per-task
+    // references for both fork-like clones and CLONE_FILES threads.
+    @import("../../ipc/posix_mq.zig").inheritRefs(
+        sched.currentTaskIndex() orelse return -1,
+        child_idx,
+    );
 
     // Signal handlers, mask, environment, cwd, pgid, sid
     for (0..31) |i| {
@@ -408,11 +448,19 @@ pub fn clone(
 
     // A thread's creator keeps running by definition, so unlike fork this path
     // cannot rely on the run queue draining to get the child noticed.
+    if (flags & clone_flags_policy.CLONE_PARENT_SETTID != 0) {
+        var tid_buf: [4]u8 = undefined;
+        const child_tid = child.tid;
+        tid_buf[0] = @truncate(child_tid);
+        tid_buf[1] = @truncate(child_tid >> 8);
+        tid_buf[2] = @truncate(child_tid >> 16);
+        tid_buf[3] = @truncate(child_tid >> 24);
+        if (copy_user.copyToUser(@ptrFromInt(parent_tid_ptr), &tid_buf, 4) != 4) {
+            return -14;
+        }
+    }
     child.saved_user_rsp = child_frame.rsp;
     task_mod.publishRunnable(child_idx);
-
-    _ = parent_tid_ptr;
-    _ = child_tid_ptr;
 
     serial.writeString("[clone] parent=");
     fmt.writeDecimal(parent.tid);

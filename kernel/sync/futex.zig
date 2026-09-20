@@ -265,6 +265,13 @@ pub fn wakeN(bucket: *FutexBucket, key: futex_key.Key, count: u32) u64 {
     return @intCast(woken);
 }
 
+/// Wake private waiters for a user address without re-parsing syscall flags.
+/// Used by CLONE_CHILD_CLEARTID exit cleanup after the clear store.
+pub fn wakePrivate(root: u64, addr: u64, count: u32) u64 {
+    const key = futex_key.Key{ .root = root, .addr = addr };
+    return wakeN(&buckets[hash(addr)], key, count);
+}
+
 // ── Vectored futex wait ──
 
 /// futex_waitv(waiters_ptr, nr_waiters, flags, timeout, clockid) -> woken index or -errno.
@@ -380,8 +387,7 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
             const count: u32 = @truncate(val);
             return @intCast(wakeN(bucket, key, count));
         },
-        FUTEX_LOCK_PI, FUTEX_UNLOCK_PI, FUTEX_TRYLOCK_PI,
-        FUTEX_WAIT_REQUEUE_PI, FUTEX_CMP_REQUEUE_PI => return -38, // ENOSYS: PI semantics unavailable
+        FUTEX_LOCK_PI, FUTEX_UNLOCK_PI, FUTEX_TRYLOCK_PI, FUTEX_WAIT_REQUEUE_PI, FUTEX_CMP_REQUEUE_PI => return -38, // ENOSYS: PI semantics unavailable
         else => {
             return -38; // -ENOSYS
         },

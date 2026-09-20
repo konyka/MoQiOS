@@ -11,6 +11,8 @@ const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const time_policy = @import("time_policy.zig");
 const owner_gen_policy = @import("owner_gen_policy.zig");
+const timer_policy = @import("posix_timer_policy.zig");
+const tsc = @import("../arch/arch.zig").tsc;
 
 const MAX_TIMERS: u32 = 16;
 const TICKS_PER_SEC: u64 = 100;
@@ -36,7 +38,7 @@ const SIGEV_SIGNAL: i32 = 0;
 // const SIGEV_THREAD: i32 = 2; // not supported
 
 /// Timer flags
-const TIMER_ABSTIME: u32 = 1;
+const TIMER_ABSTIME: u32 = timer_policy.TIMER_ABSTIME;
 
 /// Re-export Timespec / Itimerspec from timerfd for ABI compatibility.
 pub const Timespec = extern struct {
@@ -65,6 +67,7 @@ const PosixTimer = struct {
     /// Owner tid recorded at creation — a slot INDEX alone aliases after the
     /// owner exits and its slot is recycled; the tid match proves identity.
     owner_tid: u32 = 0,
+    owner_group_tid: u32 = 0,
 };
 
 // Global pool
@@ -87,18 +90,20 @@ fn nsToTimespec(ns: u64, ts: *Timespec) void {
 pub fn timerCreate(clockid: u32, sigev_ptr: u64, timerid_ptr: u64) i64 {
     // Validate clock ID
     if (clockid > 1) return EINVAL; // only CLOCK_REALTIME(0) and CLOCK_MONOTONIC(1)
+    if (!timer_policy.timerIdPointerValid(timerid_ptr) or
+        !copy.validateUserBufferWritable(timerid_ptr, 4)) return EFAULT;
+    if (!timer_policy.sigeventPointerValid(sigev_ptr)) return EFAULT;
 
     // Read optional sigevent from user space
     var sigev_notify: i32 = SIGEV_NONE;
     var sigev_signo: i32 = 0;
-    if (sigev_ptr != 0 and sigev_ptr < 0x0000_8000_0000_0000) {
+    if (sigev_ptr != 0) {
         var sigev_buf: [@sizeOf(Sigevent)]u8 = undefined;
         const copied = copy.copyFromUser(&sigev_buf, @ptrFromInt(sigev_ptr), @sizeOf(Sigevent));
-        if (copied == @sizeOf(Sigevent)) {
-            const sigev: *const Sigevent = @ptrCast(@alignCast(&sigev_buf));
-            sigev_notify = sigev.sigev_notify;
-            sigev_signo = sigev.sigev_signo;
-        }
+        if (copied != @sizeOf(Sigevent)) return EFAULT;
+        const sigev: *const Sigevent = @ptrCast(@alignCast(&sigev_buf));
+        sigev_notify = sigev.sigev_notify;
+        sigev_signo = sigev.sigev_signo;
     }
 
     const saved = lock.acquire();
@@ -107,6 +112,10 @@ pub fn timerCreate(clockid: u32, sigev_ptr: u64, timerid_ptr: u64) i64 {
     const owner_idx = sched_mod.currentTaskIndex();
     const owner_tid: u32 = if (owner_idx) |oi|
         (if (task_mod.getTask(oi)) |ot| ot.tid else 0)
+    else
+        0;
+    const owner_group_tid: u32 = if (owner_idx) |oi|
+        (if (task_mod.getTask(oi)) |ot| timer_policy.timerOwnerTid(ot.is_thread, ot.tid, ot.parent_tid) else 0)
     else
         0;
 
@@ -123,16 +132,15 @@ pub fn timerCreate(clockid: u32, sigev_ptr: u64, timerid_ptr: u64) i64 {
                 .sigev_notify = sigev_notify,
                 .owner_task_idx = owner_idx,
                 .owner_tid = owner_tid,
+                .owner_group_tid = owner_group_tid,
             };
             // Write timer ID to user space
             const id: i32 = @intCast(i);
             const id_bytes: [4]u8 = @bitCast(id);
-            if (timerid_ptr != 0 and timerid_ptr < 0x0000_8000_0000_0000) {
-                const written = copy.copyToUser(@ptrFromInt(timerid_ptr), &id_bytes, 4);
-                if (written != 4) {
-                    t.* = .{}; // roll back the slot on failure
-                    return EFAULT;
-                }
+            const written = copy.copyToUser(@ptrFromInt(timerid_ptr), &id_bytes, 4);
+            if (written != 4) {
+                t.* = .{}; // roll back the slot on failure
+                return EFAULT;
             }
             return 0;
         }
@@ -144,6 +152,7 @@ pub fn timerCreate(clockid: u32, sigev_ptr: u64, timerid_ptr: u64) i64 {
 /// Arms or disarms the timer.
 pub fn timerSettime(timerid: u32, flags: u32, new_value_ptr: u64, old_value_ptr: u64) i64 {
     if (timerid >= MAX_TIMERS) return EINVAL;
+    if (!timer_policy.flagsValid(flags)) return EINVAL;
     if (new_value_ptr == 0 or new_value_ptr >= 0x0000_8000_0000_0000) return EFAULT;
 
     // Read new itimerspec from user space
@@ -164,6 +173,14 @@ pub fn timerSettime(timerid: u32, flags: u32, new_value_ptr: u64, old_value_ptr:
 
     const t = &timers[timerid];
     if (!t.valid) {
+        lock.release(saved);
+        return EINVAL;
+    }
+    const current_group_tid = currentOwnerGroupTid() orelse {
+        lock.release(saved);
+        return EINVAL;
+    };
+    if (!timer_policy.ownerMatches(t.owner_group_tid, current_group_tid)) {
         lock.release(saved);
         return EINVAL;
     }
@@ -202,14 +219,22 @@ pub fn timerSettime(timerid: u32, flags: u32, new_value_ptr: u64, old_value_ptr:
         const cur_tick = idt.getTickCount();
         if ((flags & TIMER_ABSTIME) != 0) {
             // Absolute time: convert to relative ticks
-            const now_ns = getClockNs(t.clock_id);
-            if (value_ns <= now_ns) {
+            const delta_ns = time_policy.absoluteDeltaNs(
+                t.clock_id,
+                value_ns,
+                tsc.nanos(),
+                @import("../proc/time_syscall.zig").wallClockOffset(),
+            ) orelse {
+                lock.release(saved);
+                return EINVAL;
+            };
+            if (delta_ns == 0) {
                 // Already past — fire immediately
                 t.expiry_tick = cur_tick;
             } else {
                 // Monotonic: nsToTicks(value_ns) already validated, so the
                 // smaller delta always converts.
-                const delta = time_policy.nsToTicks(value_ns - now_ns, TICKS_PER_SEC) orelse {
+                const delta = time_policy.nsToTicks(delta_ns, TICKS_PER_SEC) orelse {
                     lock.release(saved);
                     return EINVAL;
                 };
@@ -246,6 +271,8 @@ pub fn timerGettime(timerid: u32, curr_value_ptr: u64) i64 {
 
     const t = &timers[timerid];
     if (!t.valid) return EINVAL;
+    const current_group_tid = currentOwnerGroupTid() orelse return EINVAL;
+    if (!timer_policy.ownerMatches(t.owner_group_tid, current_group_tid)) return EINVAL;
 
     var val: Itimerspec = .{
         .it_interval = .{ .tv_sec = 0, .tv_nsec = 0 },
@@ -281,6 +308,8 @@ pub fn timerGetoverrun(timerid: u32) i64 {
 
     const t = &timers[timerid];
     if (!t.valid) return EINVAL;
+    const current_group_tid = currentOwnerGroupTid() orelse return EINVAL;
+    if (!timer_policy.ownerMatches(t.owner_group_tid, current_group_tid)) return EINVAL;
 
     const result: i64 = @intCast(t.overrun);
     t.overrun = 0; // reset after reading
@@ -297,9 +326,17 @@ pub fn timerDelete(timerid: u32) i64 {
 
     const t = &timers[timerid];
     if (!t.valid) return EINVAL;
+    const current_group_tid = currentOwnerGroupTid() orelse return EINVAL;
+    if (!timer_policy.ownerMatches(t.owner_group_tid, current_group_tid)) return EINVAL;
 
     t.* = .{}; // reset all fields
     return 0;
+}
+
+fn currentOwnerGroupTid() ?u32 {
+    const idx = sched_mod.currentTaskIndex() orelse return null;
+    const current = task_mod.getTask(idx) orelse return null;
+    return timer_policy.timerOwnerTid(current.is_thread, current.tid, current.parent_tid);
 }
 
 /// Delete all timers owned by `task_idx`. Called from task.exitTask:
@@ -310,9 +347,9 @@ pub fn deleteTimersForTask(task_idx: u32) void {
     defer lock.release(saved);
 
     for (&timers) |*t| {
-        if (t.valid and t.owner_task_idx != null and t.owner_task_idx.? == task_idx) {
-            t.* = .{};
-        }
+        if (!t.valid) continue;
+        const exiting = task_mod.getTask(task_idx) orelse continue;
+        if (timer_policy.shouldDeleteForExit(t.owner_group_tid, exiting.is_thread, exiting.tid)) t.* = .{};
     }
 }
 
@@ -363,7 +400,9 @@ pub fn timerTick(current_tick: u64) void {
 
 /// Get current time in nanoseconds for a given clock ID.
 fn getClockNs(clock_id: u32) u64 {
-    _ = clock_id;
-    const tsc = @import("../arch/arch.zig").tsc;
-    return tsc.nanos();
+    return switch (clock_id) {
+        time_policy.CLOCK_REALTIME => @import("../proc/time_syscall.zig").wallClockNanos(),
+        time_policy.CLOCK_MONOTONIC => tsc.nanos(),
+        else => 0,
+    };
 }

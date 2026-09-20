@@ -82,6 +82,9 @@ canonical fixture check is mandatory. A non-empty `MOQI_DISK` bypasses manifest 
 and retains the existing regular-file requirement, so custom images are not rejected for
 having a different hash. The RISC-V, AArch64, and NVMe paths are unchanged.
 
+`qemu_smoke.sh` removes its automatically created temporary work directory and generated logs on
+exit. A caller-supplied `MOQI_SMOKE_WORK_DIR` is treated as caller-owned and is preserved.
+
 The checker and its fully offline contracts can be run locally:
 
 ```bash
@@ -156,7 +159,8 @@ zig cc \
 
 注意：C 程序**不使用** `user/user.ld`，由 `zig cc` 默认链接（内置自定义 `_start`）。内核目标仍禁用
 SSE；用户态 C 程序不再传 `-mno-sse/-mno-sse2`，因为 Zig 0.15.2 的 compiler-rt 在该组合下会触发
-half-float SSE 返回错误。启用跨核用户任务迁移前仍需补齐 FPU/SSE 上下文保存验证。
+half-float SSE 返回错误。x86_64 已实现按任务保存/恢复 FPU/SSE 状态（CR0.TS + #NM lazy path），
+并由 SMP smoke 门禁覆盖；后续只需继续扩展压力场景。
 
 ### 4.1.1 moqi_libc 程序（init, sh, hello10）
 
@@ -321,7 +325,7 @@ qemu-system-x86_64 \
 | `zig build` | 仅编译：生成内核镜像与用户程序；ramdisk/ISO 打包由 `tools/qemu_run.sh` 在 run/smoke 时完成 |
 | `zig build run` | 编译并启动 QEMU 仿真 |
 | `zig build debug` | 启动 QEMU 并在 1234 端口监听 GDB（`-s -S`） |
-| `zig build test` | 规范的主机测试门禁：在主机目标运行 `tests/main.zig` 的 Zig 单元测试和 `lib/moqi_libc/host_tests/run_tests.sh` 的 moqi_libc C 测试；任一失败都会使命令失败 |
+| `zig build test` | 规范的主机测试门禁：运行 `tests/main.zig`、`lib/moqi_libc/host_tests/run_tests.sh`、init/devmgr 工具测试、Limine bootstrap、disk fixture 和 duration-observer 测试；任一失败都会使命令失败 |
 | `zig build smoke` | 单核 QEMU 限时冒烟测试，串口日志需出现 init 自动序列各 PASS 标记（`hello21 done`、`hello29: PASS` … `hello41: PASS`、`hello92: PASS`）、序列终点 `hello42: PASS` + `hello42 done`，以及 `MoQiOS shell`；`hello92` 验证 x86_64 self-only process_vm_readv/writev（syscall #283/#284）的最多 4096 字节内核 staging、partial-copy 与 `EFAULT` 边界；不覆盖跨进程 mm 生命周期/refcount/COW 设计，也不代表 riscv64/aarch64 骨架已有该覆盖。完整判定见 `tools/qemu_smoke.sh`。此外启动早期（定时器 IRQ 使能前）会尝试一次有界 DHCP（G3），日志恰有一行大写结果标记：成功 `[DHCP] lease: a.b.c.d`，失败/无 NIC `[DHCP] no lease, static 10.0.2.15`；内部进度日志为小写 `[dhcp] ` |
 | `zig build smoke-smp` | SMP QEMU 限时冒烟测试（默认 `MOQI_SMP=2`），验证 AP 启动路径仍能跑完整个 init 测试序列；`MOQI_SMP=N` 可指定任意正整数核数 |
 | `zig build smoke-smp-matrix` | 按 `MOQI_SMOKE_MATRIX_CPUS`（默认 `"1 2 3 4 6 8"`）依次运行各核数冒烟；16 核在 TCG 下需 `MOQI_SMOKE_TIMEOUT=600` |
@@ -478,6 +482,10 @@ no `duration_ms`. This P1 mode does not provide QEMU runtime samples.
 2. 在 `tests/main.zig` 顶部加 `const xxx = kt.xxx;`，然后编写行为测试（已知向量、
    round-trip、边界条件），校验和等期望值请用独立实现（如 Python 版 RFC 1071）离线计算。
 3. 运行 `zig build test`；再跑 `zig build` 确认内核构建不受影响。
+
+POSIX 消息队列的属性决策属于主机测试覆盖：测试验证 `O_CREAT`、空属性、零值和超出内核
+上限的 `mq_maxmsg`/`mq_msgsize` 策略。真实 syscall 的用户指针完整拷贝与 `EFAULT` 映射仍
+由 QEMU/集成测试覆盖，不能把纯策略单测误称为用户内存测试。
 
 ### 如何新增 moqi_libc 宿主机测试
 

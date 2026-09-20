@@ -7,6 +7,21 @@
 const std = @import("std");
 
 pub const NS_PER_SEC: u64 = 1_000_000_000;
+pub const CLOCK_REALTIME: u32 = 0;
+pub const CLOCK_MONOTONIC: u32 = 1;
+pub const TIMER_ABSTIME: u32 = 1;
+
+/// Convert an absolute deadline in the selected clock domain into a monotonic
+/// delay. A deadline already in the past produces zero; invalid clock IDs
+/// return null instead of silently selecting a different clock.
+pub fn absoluteDeltaNs(clock_id: u32, deadline_ns: u64, monotonic_now_ns: u64, realtime_offset_ns: i64) ?u64 {
+    const now_ns: u64 = if (clock_id == CLOCK_REALTIME) blk: {
+        const mono: i128 = @intCast(monotonic_now_ns);
+        const wall = mono + @as(i128, realtime_offset_ns);
+        break :blk if (wall <= 0) 0 else if (wall > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(wall);
+    } else if (clock_id == CLOCK_MONOTONIC) monotonic_now_ns else return null;
+    return if (deadline_ns > now_ns) deadline_ns - now_ns else 0;
+}
 
 /// timespec → nanoseconds. Returns null for negative fields, nsec >= 1e9,
 /// or a tv_sec too large to represent in u64 nanoseconds.

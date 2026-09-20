@@ -44,6 +44,7 @@ pub const FdType = enum(u8) {
     timerfd = 11,
     tmpfs_file = 13,
     proc_file = 14,
+    pidfd = 18,
     udp_socket = 15,
     inotify = 16,
     raw_socket = 17,
@@ -1146,6 +1147,7 @@ pub const FdTable = struct {
                 desc.offset += to_copy;
                 return @intCast(to_copy);
             },
+            .pidfd => return -1,
             .inotify => return -1, // inotify uses read via special syscall path
             .raw_socket => {
                 // Raw socket: receive raw ethernet frame
@@ -1289,6 +1291,7 @@ pub const FdTable = struct {
                 return n;
             },
             .proc_file => return -1, // proc files are read-only
+            .pidfd => return -1,
             .inotify => return -1, // inotify is read-only via special path
             .raw_socket => {
                 // Raw socket: send raw ethernet frame
@@ -1317,7 +1320,7 @@ pub const FdTable = struct {
             .special => return -29, // ESPIPE - can't seek on stdin/stdout/stderr
             .pipe_read, .pipe_write => return -29, // ESPIPE - pipes don't support offset
             .tcp_socket, .udp_socket, .unix_socket, .raw_socket => return -29, // ESPIPE
-            .epoll, .eventfd, .timerfd, .inotify => return -29, // ESPIPE
+            .epoll, .eventfd, .timerfd, .inotify, .pidfd => return -29, // ESPIPE
             .devfs_ctrl => return -29, // ESPIPE — ctrl fds are sequential streams
             .ramdisk_file => {
                 if (offset >= desc.file_size) return 0;
@@ -1399,6 +1402,7 @@ pub const FdTable = struct {
                 return -29; // ESPIPE
             },
             .proc_file => return -1, // proc files are read-only
+            .pidfd => return -1,
             .fat32_file => {
                 if (!desc.writable) return -9; // EBADF
                 const gate = fsizeGate(offset, count);

@@ -207,6 +207,14 @@ const AddressSpace = struct {
 - 配套 munmap 解除映射和 msync 同步脏页
 - syscall mmap: 支持匿名映射 + 文件映射 (MAP_PRIVATE/MAP_SHARED)；G2 起文件映射改为
   页缓存支撑的按需分页 + 零拷贝 COW，详见 1.8.1
+- mmap ABI 会拒绝未实现的 `flags`/`prot` 位并返回 `EINVAL`；当前支持的 flags
+  为 `MAP_SHARED`、`MAP_PRIVATE`、`MAP_FIXED`、`MAP_ANONYMOUS`，
+  protection 位为 `PROT_READ`、`PROT_WRITE`、`PROT_EXEC`（`prot=0` 表示 `PROT_NONE`）。
+  匿名映射同时支持私有和共享语义；`MAP_SHARED|MAP_ANONYMOUS` 在 fork 后保留同一物理帧
+  与可写权限，适合作为进程间共享内存使用。
+  映射是否匿名只由 `MAP_ANONYMOUS` 标志决定；未设置该标志时，即使 `fd == -1` 也按
+  文件映射处理并返回 `EBADF`，不会把无效文件描述符静默解释为匿名映射。
+  该契约由 `mm/mmap_policy.zig` 的 host 测试覆盖，避免未知位被静默解释为已有语义。
 
 **用户地址空间布局**（两种镜像不同，范围校验必须区分）:
 
@@ -358,6 +366,9 @@ H1 再加 `shared` 字段记录 MAP_SHARED），不触碰页表；首次访问�
 - virtio-blk后端读写swap页
 - 水位线自动触发内存回收
 - #PF缺页时自动swap-in
+- swapon按路径选设备（§6.45准入纯策略拒绝启动盘，EPERM）；swapoff真drain
+  （§6.50：draining状态静默新换出、task快照按page_table_phys去重后逐Mm
+  vm_lock走查换入、PMM OOM回滚re-arm/全排空才提交解除设备；hello101回归门）
 
 ### 1.10 用户态 2MiB 大页匿名 mmap（I1）✅
 
@@ -389,7 +400,9 @@ H1 再加 `shared` 字段记录 MAP_SHARED），不触碰页表；首次访问�
   每张 PT 一次 `shootdownRange`（CR3 过滤，仅命中运行该地址空间的 CPU）；
   clone 末尾的本地 `reloadCR3` 改为对全用户空间的过滤广播 shootdown。
   此前仅本地 invlpg/reload：CLONE_VM 对端 CPU 或 PCID no-flush 重入下的
-  迁移父进程会残留可写陈旧项（理论窗口，未触发，属 CR0.WP 同类先修）。
+  迁移父进程会残留可写陈旧项（理论窗口，未触发，属 CR0.WP 同类先修）。当前
+  `pcid_alloc.decideSwitch` 默认关闭 no-flush；该优化必须在 per-MM epoch 与 CPU
+  quiescence 验证完成后才能重新启用。
 - **swap/reclaim 排除**：reclaim 扫描跳过巨大 PDE（`pd[idx] & (1<<7)`），
   巨大页不可换出——内存紧张时 demote 需要分配 PT 页，正是最分配不出的时刻。
 - **拆除**：`destroyUserSpace` 对 2MiB PDE 用 `freeContiguous` 释放全部 512 帧
@@ -723,10 +736,12 @@ const SchedStats = struct {
 
 文件: `task.zig`, `syscall_entry.zig`, `arch/x86_64/clone.zig`
 
-- syscall #56，支持CLONE_VM/CLONE_THREAD/CLONE_SETTLS；CLONE_FILES当前复制FD表，尚未实现共享FD表语义
-- CLONE_VM：共享地址空间创建轻量级线程
+- syscall #56，Phase-0 当前只接受已实现的 `CLONE_VM`、`CLONE_FILES`、`CLONE_SETTLS`；
+  `CLONE_THREAD`/`CLONE_SIGHAND`/`CLONE_FS` 及 `CLONE_PARENT_SETTID`/`CLONE_CHILD_CLEARTID`
+  在共享对象、写回和 clear/futex-wake 生命周期完成前返回 `EINVAL`。
+- `CLONE_VM`：共享地址空间路径仅作为生命周期迁移中的受控能力，完整线程组语义仍待启用。
 - 独立内核栈，FS_BASE TLS指针配置
-- 其余Linux clone标志按当前实现范围处理，完整CLONE_FILES语义仍待实现
+- 其余 Linux clone 标志不再静默忽略；完整 ThreadGroup、clear-TID 和共享 FD 语义仍待实现。
 
 ### 2.5a pthread 子集（moqi_libc，v1，2026-08-14）✅
 
@@ -1437,6 +1452,8 @@ const CapTable = [32]Capability; // 每任务
 - shmat: 4 级页表映射到进程地址空间 (0x70000000 基址)，支持 SHM_RDONLY
 - shmdt: 解除映射，isMappedAt() 4级页表walk验证物理地址匹配，支持延迟删除 (IPC_RMID 标记)
 - shmctl: IPC_STAT/IPC_RMID/IPC_SET (权限mode更新)
+- `IPC_STAT` 元数据先在 `shm_lock` 内快照，再在锁外 copyout；`IPC_SET` 先锁外 copyin，再锁内校验权限并提交，避免用户页访问运行在 IRQ 关闭状态。负 `key` 以原始 i64 位模式写入 ABI 缓冲区。
+- task exit 只有在存在 `Mm` 且成功取得 VM mutation guard 时才执行 SHM detach；guard 获取失败或任务无 `Mm` 时跳过该 detach，但继续完成其余退出清理，避免无保护修改页表。
 - findFreeRegion: next_free_hint O(n) 扫描，freeSegment 自动重置 hint
 - 系统调用: #29 (shmget), #30 (shmat), #31 (shmctl), #67 (shmdt)
 
@@ -1467,12 +1484,19 @@ const CapTable = [32]Capability; // 每任务
 
 - 16 个队列上限，8 消息/队列，512 字节/消息
 - mq_open: 创建/打开队列，O_CREAT/O_EXCL/O_NONBLOCK
+  `O_CREAT` 创建时传入的非空 `mq_attr` 必须完整可读；`mq_maxmsg`/`mq_msgsize` 必须为正且不超过
+  内核上限（8/512），否则分别返回 `EFAULT`/`EINVAL`，不会静默回退到默认属性。未带
+  `O_CREAT` 时 `mode/attr` 按 POSIX 约定忽略。
 - mq_timedsend/timedreceive: 发送/接收消息 (带优先级；阻塞在 `task.WaitNode` 等待队列上，
-  支持超时唤醒)
+  支持超时唤醒和按优先级出队（同优先级保持先入先出）。绝对超时的 `NULL` 表示不设截止时间；`{tv_sec=0,tv_nsec=0}` 是
+  已到期的合法截止时间，非法指针或 timespec 返回 `EFAULT`/`EINVAL`，不会静默变成无限等待。
+  接收缓冲区小于消息长度时返回 `EMSGSIZE` 并保留消息，不会静默截断后出队。
+  发送和接收阶段都在 IRQ 自旋锁外执行用户空间拷贝；锁内只完成槽位 reservation，用户拷贝失败时取消 reservation 并保留队列状态。
 - mq_unlink: 删除队列 (延迟释放)
+- MQ descriptor 引用按 task 记录；只有持有该引用的 task 才能执行 MQ 操作或 `mq_close`，fork/clone 会复制子 task 的引用，task 退出时自动释放其引用，避免任意高 fd 操作或关闭其他 task 的队列引用。
 - mq_notify: 注册/注销通知
 - mq_getsetattr: 获取/设置队列属性
-- 系统调用: #240-245 (标准号), #214/215/219 (备用号)
+- 系统调用: #186-191（与 x86_64 dispatcher 一致）
 
 ### 5.7 timerfd ✅
 
@@ -1482,8 +1506,24 @@ const CapTable = [32]Capability; // 每任务
 
 文件: `posix_timer.zig` (318 行)
 
+`TIMER_ABSTIME` 使用 timer 创建时选定的 clock domain：`CLOCK_REALTIME` 按墙上时钟
+（RTC/`clock_settime` offset）解释，`CLOCK_MONOTONIC` 按启动后单调时间解释；relative
+timer 仍使用 scheduler tick delta。timerfd 遵循同一规则。
+
 - 16 个定时器上限，复用 timerfd 的 tick 驱动机制 (100Hz)
 - timer_create: 创建定时器，支持 SIGEV_NONE/SIGEV_SIGNAL
+- `timer_create` 在分配槽位前要求非空且可写的 `timerid` 用户指针；无效指针返回
+  `EFAULT`，不会消耗 16 个定时器槽位中的任何一个。
+  非空 `sigevent` 指针也必须完整可读；无效输入返回 `EFAULT`，不会静默降级为
+  `SIGEV_NONE`。
+- POSIX timer ownership 按进程/线程组记录；`CLONE_THREAD` 工作线程退出不会删除线程组定时器，只有线程组 leader 退出时才清理。
+
+Clone Phase-0 safety gate：当前只接受已实现的 flags；`CLONE_THREAD`/`CLONE_SIGHAND`
+  必须与 `CLONE_VM` 同时出现；`CLONE_PARENT_SETTID` 在 child publish 前写回 child TID，`CLONE_CHILD_CLEARTID` 在 exit 时清零用户 word 并 wake private futex。其他未实现 flags 仍返回 `EINVAL`。
+
+`clock_settime` 仅允许持有 `CAP_SYS_TIME` 的任务调用；它接受 `CLOCK_REALTIME`，要求
+`tv_nsec < 1_000_000_000`，并拒绝纳秒总数无法表示为有符号 64 位值的输入。非法权限返回
+`EPERM`，非法 clock ID、非法 timespec 或溢出返回 `EINVAL`。
 - timer_settime: 设置/解除定时器 (支持 TIMER_ABSTIME)
 - timer_gettime: 读取剩余时间和间隔
 - timer_getoverrun: 读取超时计数

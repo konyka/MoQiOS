@@ -33,6 +33,7 @@ pub const ESPIPE: i64 = -29;
 pub const EROFS: i64 = -30;
 pub const EMLINK: i64 = -31;
 pub const EPIPE: i64 = -32;
+pub const EMSGSIZE: i64 = -90;
 pub const EDOM: i64 = -33;
 pub const ERANGE: i64 = -34;
 pub const EDEADLK: i64 = -35;
