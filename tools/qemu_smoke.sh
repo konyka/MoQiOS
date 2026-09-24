@@ -117,6 +117,9 @@ cleanup() {
     if [ -z "${MOQI_SMOKE_NVME_IMG:-}" ]; then
         rm -f "$SMOKE_NVME"
     fi
+    if [ -z "${MOQI_SMOKE_AHCI_IMG:-}" ]; then
+        rm -f "$SMOKE_AHCI"
+    fi
     if [ -z "${MOQI_SMOKE_PACKAGE_DIR:-}" ]; then
         rm -rf "$PACKAGE_DIR"
     fi

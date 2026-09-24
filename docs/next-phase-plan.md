@@ -43,7 +43,7 @@
 | # | 条目 | 来源 | 状态（2026-08-13 对账） |
 |---|------|------|------|
 | 1 | FAT32/ext2 写路径检查 `writeBlockUncached`/`safeWriteSectors` 返回值 | review §5.2h–j | ✅ 完成（6.23）：direct-write 丢弃点全部传播或注释约定 |
-| 2 | `vfs.syncFile` 错误传播 + 设备 flush barrier 能力上报 | review §5.2g/§5.6 | 代码已完成：`vfs.zig:1313` syncFile 返回 bool，fsync syscall 传播 `-5 EIO` |
+| 2 | `vfs.syncFile` 错误传播 + 设备 flush barrier 能力上报 | review §5.2g/§5.6 | 代码已完成：`vfs.zig:1313` syncFile 返回 bool，fsync syscall 传播 `-5 EIO`；NVMe driver flush opcode 已接入，fsync device ownership 映射仍独立待做 |
 | 3 | UDP 接收队列串行化 + MSG_TRUNC/MSG_PEEK 语义 | review §5.6 | ✅ 完成（6.23）：队列锁（J1）+ recvFromEx/recvFromV6Ex + recvfrom flags，hello50 验收；顺带修复 sendto/recvfrom flags 错读 rcx 的 ABI bug |
 | 4 | virtio-blk/virtio-net/NVMe 队列 single-flight 锁契约 | review §5.5/§5.6 | ✅ 完成（6.36）：2026-08-15 逐驱动核对后确认 virtio-blk（`io_lock`，virtio_blk.zig:167 全请求串行）与 NVMe（每队列 `io_locks` + 显式锁序注释，nvme.zig:195-210）**早已加锁**；唯一真实缺口是 virtio-net TX——`sendPacket` 无锁并发改写共享 TX free list/描述符链/avail 环/完成索引。已加 `tx_lock`（IrqSpinlock）覆盖整笔事务（alloc→publish→notify→reclaim），并新增纯队列记账模块 `virtio_net_queue.zig` + host 测试锁定 single-flight 不变量；RX 保持无锁（仅 ISR 单所有者、独立 rx_queue，见 review §6.36 审计）。P1 至此全部关闭。 |
 | 5 | `/dev/kmsg` 阻塞读/poll 唤醒，syslogd 改事件驱动 | user-space §7.1 | 代码已完成（J3：kmsg 读在最新字节处阻塞，syslogd 无轮询循环） |
@@ -154,14 +154,17 @@
   cleanupTask 的 exit/reap 拆分（退出时自清理 vs reap 时跨任务
   清理的所有权边界）、CLONE_VM 兄弟间 per-task 区域表（mmap_regions）
   发散的权威化（放置搜索已改查页表 ground truth，区域表仍 per-task）、
-  mlock 锁定页与 reclaim 扫描的交互缺口（mlock 区域目前
-  对 reclaim 不可见）、4-worker SMP=4 RIP=0 残留（§6.47：42 次插桩
+   mlock 锁定页与 reclaim 扫描的交互缺口（当前 mlock ABI 保持完整
+   ENOSYS 契约；真实实现阻塞于 per-MM accounting、RLIMIT_MEMLOCK、
+   prefault/pin、swap exclusion、MCL_FUTURE、CLONE_VM/exit/munmap 生命周期，
+   因此禁止只设置 VMA metadata 的半实现）、4-worker SMP=4 RIP=0 残留（§6.47：42 次插桩
   复现零命中，根因未定位；hello98 常驻绊线 + RIP0-DIAG 取证已布防）、
   mprotect(PROT_NONE) 预约项与 swap 项位型同构缺陷（§6.47 嫌疑 →
   §6.48 证实并修复：swap 标记移 bit 11、预约标记 bit 10、pte_kind
   分类器统一，hello99 常驻回归门；§6.49 补齐从未缺页文件页 PROT_NONE
-  首访 SIGSEGV 与预约帧/槽位回收）、真正的 swapoff（drain + 解除；当前为有意 no-op 占位，
-  swap 启用后整个 boot 保持武装，§6.47）。
+  首访 SIGSEGV 与预约帧/槽位回收）、真正的 swapoff（✅ 6.50：drain
+  状态机 + 全地址空间换入走查 + OOM 回滚 + 设备解除，hello101 常驻
+  回归门；§6.47 的 no-op 占位已移除）。
   权威 page provenance 尚未纳入；未完成这些路径前，
   不得启用真正的跨进程 HHDM read，只有在它们共享同一锁与生命周期协议后
   才可继续评审。当前 syscall

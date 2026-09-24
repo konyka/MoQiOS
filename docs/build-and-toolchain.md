@@ -85,6 +85,15 @@ having a different hash. The RISC-V, AArch64, and NVMe paths are unchanged.
 `qemu_smoke.sh` removes its automatically created temporary work directory and generated logs on
 exit. A caller-supplied `MOQI_SMOKE_WORK_DIR` is treated as caller-owned and is preserved.
 
+`qemu_run_aarch64.sh` validates positive `MOQI_SMP` and `MOQI_MEM` values and regenerates its
+automatically owned DTB on every run, preventing stale CPU/memory topology. An explicit
+`MOQI_DTB` is caller-owned and is never overwritten.
+The RISC-V smoke runner applies the same positive `MOQI_SMP`/timeout validation, and the x86
+smoke cleanup removes automatically created AHCI images as well as disk/NVMe artifacts.
+
+`qemu_smoke_matrix.sh` requires at least one positive decimal CPU count; a whitespace-only
+`MOQI_SMOKE_MATRIX_CPUS` value is rejected instead of being reported as a passing empty matrix.
+
 The checker and its fully offline contracts can be run locally:
 
 ```bash

@@ -10,6 +10,11 @@ TIMEOUT_SECONDS="${MOQI_SMOKE_TIMEOUT:-30}"
 LOG_FILE="${MOQI_SMOKE_LOG:-/tmp/moqios-smoke-riscv64.log}"
 RUN_LOG="${MOQI_SMOKE_RUN_LOG:-/tmp/moqios-smoke-riscv64.run.log}"
 
+if ! [[ "$TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: MOQI_SMOKE_TIMEOUT must be a positive decimal integer."
+    exit 2
+fi
+
 if ! command -v qemu-system-riscv64 &>/dev/null; then
     echo "ERROR: qemu-system-riscv64 not found."
     exit 1

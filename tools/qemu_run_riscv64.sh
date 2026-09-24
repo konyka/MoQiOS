@@ -31,6 +31,10 @@ fi
 
 SERIAL_TARGET="${MOQI_SERIAL:-stdio}"
 SMP_COUNT="${MOQI_SMP:-1}"
+if ! [[ "$SMP_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: MOQI_SMP must be a positive decimal integer."
+    exit 2
+fi
 DISK_IMAGE="${MOQI_DISK:-/tmp/moqios-riscv64-disk.img}"
 
 # M7: virtio-blk test disk — sector 0 starts with a known magic string.

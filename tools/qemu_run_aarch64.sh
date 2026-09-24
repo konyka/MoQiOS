@@ -18,6 +18,8 @@ cd "$PROJECT_DIR"
 
 KERNEL="zig-out/bin/moqi-kernel-aarch64.elf"
 DTB_IMAGE="${MOQI_DTB:-/tmp/moqios-aarch64-virt.dtb}"
+DTB_OWNED=0
+if [ -z "${MOQI_DTB:-}" ]; then DTB_OWNED=1; fi
 DTB_ADDR=0x4a000000
 
 if [ ! -f "$KERNEL" ]; then
@@ -34,15 +36,34 @@ fi
 
 SERIAL_TARGET="${MOQI_SERIAL:-stdio}"
 SMP_COUNT="${MOQI_SMP:-1}"
+MEMORY="${MOQI_MEM:-256M}"
 
-# Refresh DTB when missing (matches -m/-smp/gic used below).
-if [ ! -f "$DTB_IMAGE" ]; then
+if ! [[ "$SMP_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: MOQI_SMP must be a positive decimal integer."
+    exit 2
+fi
+if ! [[ "$MEMORY" =~ ^[1-9][0-9]*[KMG]$ ]]; then
+    echo "ERROR: MOQI_MEM must be a positive QEMU memory value such as 256M."
+    exit 2
+fi
+
+# Refresh the automatically owned DTB every run so it cannot become stale when
+# MOQI_SMP or MOQI_MEM changes. Explicit MOQI_DTB remains caller-owned.
+if [ "$DTB_OWNED" -eq 1 ]; then
+    DTB_TMP="${DTB_IMAGE}.tmp.$$"
+    trap 'rm -f -- "$DTB_TMP"' EXIT
     qemu-system-aarch64 \
-        -machine virt,gic-version=3,dumpdtb="$DTB_IMAGE" \
+        -machine virt,gic-version=3,dumpdtb="$DTB_TMP" \
         -cpu max \
-        -m 256M \
+        -m "$MEMORY" \
         -smp "$SMP_COUNT" \
         -display none
+    mv -f -- "$DTB_TMP" "$DTB_IMAGE"
+else
+    if [ ! -f "$DTB_IMAGE" ]; then
+        echo "ERROR: explicit MOQI_DTB does not exist: $DTB_IMAGE"
+        exit 2
+    fi
 fi
 
 echo "========================================="
@@ -55,7 +76,7 @@ exec qemu-system-aarch64 \
     -cpu max \
     -kernel "$KERNEL" \
     -device loader,file="$DTB_IMAGE",addr="$DTB_ADDR",force-raw=on \
-    -m 256M \
+    -m "$MEMORY" \
     -smp "$SMP_COUNT" \
     -serial "$SERIAL_TARGET" \
     -display none \

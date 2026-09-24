@@ -14,6 +14,11 @@ if [ -z "$MATRIX_COUNTS" ]; then
     exit 2
 fi
 
+if ! [[ "$MATRIX_COUNTS" =~ [^[:space:]] ]]; then
+    echo "ERROR: MOQI_SMOKE_MATRIX_CPUS must contain positive decimal CPU counts."
+    exit 2
+fi
+
 for smp_count in $MATRIX_COUNTS; do
     if ! [[ "$smp_count" =~ ^[1-9][0-9]*$ ]]; then
         echo "ERROR: MOQI_SMOKE_MATRIX_CPUS contains invalid CPU count '$smp_count'."

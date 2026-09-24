@@ -276,21 +276,21 @@ pub fn build(b: *std.Build) void {
 
     // C programs (.c -> static freestanding ELF stored as .bin)
     const c_programs = [_][]const u8{
-        "hello4",  "hello5",  "hello6",  "hello7",  "hello8",
-        "hello9",  "hello11", "hello12", "hello13", "hello14",
-        "hello15", "hello16", "hello17", "hello18", "hello19",
-        "hello20", "hello21", "hello22", "hello23", "hello24",
-        "hello25", "hello26", "hello27", "hello28", "hello29",
-        "hello30", "hello31", "hello32", "hello33", "hello34",
-        "hello35", "hello36", "hello37", "hello38", "hello39",
-        "hello40", "hello41", "hello42", "hello43", "hello44",
-        "hello46", "hello47", "hello48", "hello49", "hello50",
-        "hello51", "hello52", "hello53", "hello54", "hello56",
-        "hello74", "hello75", "hello76", "hello77", "hello78",
-        "hello79", "hello80", "hello81", "hello82", "hello83",
-        "hello85", "hello86", "hello87", "hello88", "hello89",
-        "hello90", "hello91", "hello92", "hello93", "hello94",
-        "hello95", "hello96", "hello97", "hello98", "hello99",
+        "hello4",   "hello5",   "hello6",  "hello7",  "hello8",
+        "hello9",   "hello11",  "hello12", "hello13", "hello14",
+        "hello15",  "hello16",  "hello17", "hello18", "hello19",
+        "hello20",  "hello21",  "hello22", "hello23", "hello24",
+        "hello25",  "hello26",  "hello27", "hello28", "hello29",
+        "hello30",  "hello31",  "hello32", "hello33", "hello34",
+        "hello35",  "hello36",  "hello37", "hello38", "hello39",
+        "hello40",  "hello41",  "hello42", "hello43", "hello44",
+        "hello46",  "hello47",  "hello48", "hello49", "hello50",
+        "hello51",  "hello52",  "hello53", "hello54", "hello56",
+        "hello74",  "hello75",  "hello76", "hello77", "hello78",
+        "hello79",  "hello80",  "hello81", "hello82", "hello83",
+        "hello85",  "hello86",  "hello87", "hello88", "hello89",
+        "hello90",  "hello91",  "hello92", "hello93", "hello94",
+        "hello95",  "hello96",  "hello97", "hello98", "hello99",
         "hello100", "hello101",
     };
     for (c_programs) |name| addCUserProgram(b, name);
@@ -386,4 +386,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_init_spawn_reporting_tests.step);
     const run_devmgr_snapshot_tests = b.addSystemCommand(&.{"./tools/tests/test_devmgr_snapshot.sh"});
     test_step.dependOn(&run_devmgr_snapshot_tests.step);
+    const run_limine_bootstrap_tests = b.addSystemCommand(&.{ "bash", "tools/tests/test_limine_bootstrap.sh" });
+    test_step.dependOn(&run_limine_bootstrap_tests.step);
+    const run_disk_fixture_tests = b.addSystemCommand(&.{ "bash", "tools/tests/test_disk_fixture.sh" });
+    test_step.dependOn(&run_disk_fixture_tests.step);
+    const run_observe_duration_tests = b.addSystemCommand(&.{ "python3", "tools/tests/test_observe_test_duration.py" });
+    test_step.dependOn(&run_observe_duration_tests.step);
 }

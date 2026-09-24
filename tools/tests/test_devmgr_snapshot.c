@@ -49,7 +49,7 @@ static int parse(char *buf, int r, char *out) {
 
 int main(void) {
     static char buf[512];
-    static char out[1024];
+    static char out[1025];
 
     /* Well-formed batch: both names are collected. */
     {
@@ -90,8 +90,12 @@ int main(void) {
         int r = emit_rec(buf, 0, "console");
         /* Clobber the NUL and the padding so no NUL remains in the record. */
         memset(buf + 19 + 7, 'X', 32 - 19 - 7);
+        memset(out, 0xA5, sizeof(out));
         int n = parse(buf, r, out);
         CHECK(n == 32 - 19); /* whole padded name field, no overrun */
+        CHECK(memcmp(out, "consoleXXXXXX", 13) == 0);
+        CHECK(out[n] == '\0');
+        CHECK((unsigned char)out[1024] == 0xA5);
     }
 
     /* Good record followed by a corrupt one: the good one is kept, the
