@@ -20,6 +20,14 @@ const lifecycle_policy = kt.lifecycle_policy;
 const clone_flags_policy = kt.clone_flags_policy;
 const pidfd_policy = kt.pidfd_policy;
 const pidfd_signal_policy = kt.pidfd_signal_policy;
+const nvme_flush_policy = kt.nvme_flush_policy;
+const ipc_lifecycle_policy = kt.ipc_lifecycle_policy;
+const ipc_endpoint_policy = kt.ipc_endpoint_policy;
+const capability_policy = kt.capability_policy;
+const capability_lifecycle_policy = kt.capability_lifecycle_policy;
+const socket_policy = kt.socket_policy;
+const socket_address_policy = kt.socket_address_policy;
+const ipc_call_reply_policy = kt.ipc_call_reply_policy;
 const task_op_policy = kt.task_op_policy;
 const clone3_policy = kt.clone3_policy;
 const posix_timer_policy = kt.posix_timer_policy;
@@ -31,6 +39,8 @@ const posix_mq_ownership_policy = kt.posix_mq_ownership_policy;
 const sysv_shm_policy = kt.sysv_shm_policy;
 const sysv_shm_lifecycle_policy = kt.sysv_shm_lifecycle_policy;
 const time_set_policy = kt.time_set_policy;
+const time_syscall = kt.time_syscall;
+const sigreturn_policy = kt.sigreturn_policy;
 
 test "mmap rejects unsupported flags and protection bits" {
     try std.testing.expect(
@@ -68,6 +78,116 @@ test "pidfd_send_signal validates signal and flags" {
     try std.testing.expect(pidfd_signal_policy.flagsValid(0));
     try std.testing.expect(!pidfd_signal_policy.flagsValid(1));
     try std.testing.expect(pidfd_signal_policy.aliasesShareValidation());
+}
+
+test "NVMe flush policy validates opcode completion" {
+    try std.testing.expectEqual(@as(u8, 0), nvme_flush_policy.OPCODE);
+    try std.testing.expect(nvme_flush_policy.statusOk(0));
+    try std.testing.expect(!nvme_flush_policy.statusOk(2));
+}
+
+test "IPC endpoints are reclaimed on owner exit" {
+    try std.testing.expect(ipc_lifecycle_policy.shouldReclaim(7, 7));
+    try std.testing.expect(!ipc_lifecycle_policy.shouldReclaim(7, 8));
+    try std.testing.expect(!ipc_lifecycle_policy.shouldReclaim(null, 7));
+    try std.testing.expectEqual(@as(i32, -1), ipc_lifecycle_policy.wakeResult(true, false));
+}
+
+test "IPC endpoint destruction requires the owner" {
+    try std.testing.expect(ipc_endpoint_policy.canDestroy(4, 4));
+    try std.testing.expect(!ipc_endpoint_policy.canDestroy(4, 5));
+    try std.testing.expect(!ipc_endpoint_policy.canDestroy(null, 4));
+}
+
+test "IPC capability grants require endpoint owner and known rights" {
+    try std.testing.expect(capability_policy.grantAllowed(4, 4, 0x0F));
+    try std.testing.expect(!capability_policy.grantAllowed(4, 5, 0x0F));
+    try std.testing.expect(!capability_policy.grantAllowed(4, 4, 0x80));
+    try std.testing.expect(!capability_policy.grantAllowed(4, 4, 0x100));
+    try std.testing.expect(!capability_policy.grantAllowed(4, 4, 0x101));
+    try std.testing.expect(capability_policy.grantTargetAllowed(4, 4, 5));
+    try std.testing.expect(!capability_policy.grantTargetAllowed(4, 5, 6));
+    try std.testing.expect(!capability_policy.grantTargetAllowed(null, 4, 5));
+}
+
+test "IPC receive authorization permits owners and receive capabilities only" {
+    try std.testing.expect(capability_policy.operationAllowed(false, true, .receive));
+    try std.testing.expect(!capability_policy.operationAllowed(false, false, .receive));
+    try std.testing.expect(capability_policy.operationAllowed(true, false, .receive));
+    try std.testing.expect(!capability_policy.operationAllowed(false, true, .send));
+    try std.testing.expect(!capability_policy.operationAllowed(false, true, .notify));
+}
+
+test "IPC capabilities reject stale endpoint generations" {
+    try std.testing.expect(capability_generation_policy.matches(7, 7));
+    try std.testing.expect(!capability_generation_policy.matches(7, 8));
+}
+
+test "IPC endpoint generations are wide enough for long-lived slot reuse" {
+    try std.testing.expect(capability_generation_policy.matches(@as(u64, 0x1_0000_0000), @as(u64, 0x1_0000_0000)));
+    try std.testing.expect(!capability_generation_policy.matches(@as(u64, 0x1_0000_0000), @as(u64, 1)));
+}
+
+test "IPC call tokens do not reuse endpoint identifiers" {
+    const call_reply = kt.ipc_call_reply_policy;
+    try std.testing.expect(call_reply.tokenBindsCallee(41, 7, 41, 7));
+    try std.testing.expect(!call_reply.tokenBindsCallee(41, 7, 41, 8));
+    try std.testing.expect(!call_reply.tokenBindsCallee(41, 7, 42, 7));
+}
+
+test "native IPC Message ABI remains exactly 256 bytes" {
+    const message = @import("kernel_shared").ipc_message;
+    try std.testing.expectEqual(@as(usize, 256), @sizeOf(message.Message));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(message.Message, "sender"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(message.Message, "reply_to"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(message.Message, "msg_type"));
+    try std.testing.expectEqual(@as(usize, 20), @offsetOf(message.Message, "flags"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(message.Message, "payload"));
+}
+
+test "task exit clears task-scoped IPC capabilities" {
+    try std.testing.expect(capability_lifecycle_policy.clearOnExit(3, true));
+    try std.testing.expect(!capability_lifecycle_policy.clearOnExit(3, false));
+}
+
+test "socket shutdown rejects unsupported how values" {
+    try std.testing.expect(socket_policy.shutdownHowValid(0));
+    try std.testing.expect(socket_policy.shutdownHowValid(2));
+    try std.testing.expect(!socket_policy.shutdownHowValid(3));
+}
+
+test "socket connect validates sockaddr lengths" {
+    try std.testing.expect(socket_address_policy.inetLengthValid(16, false));
+    try std.testing.expect(!socket_address_policy.inetLengthValid(15, false));
+    try std.testing.expect(socket_address_policy.inetLengthValid(28, true));
+    try std.testing.expect(!socket_address_policy.inetLengthValid(27, true));
+    try std.testing.expect(socket_address_policy.inet4FamilyValid(2));
+    try std.testing.expect(!socket_address_policy.inet4FamilyValid(1));
+    try std.testing.expect(!socket_address_policy.optionalUserAddressValid(0x8000, 0x8000));
+}
+
+test "x86 syscall SFMASK clears direction flag" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "wrmsr(MSR_SFMASK, 0x700)") != null);
+}
+
+test "IPC call/reply policy binds one reply to caller, callee and token" {
+    var state = ipc_call_reply_policy.State{};
+    try std.testing.expect(ipc_call_reply_policy.begin(&state, 9, 1, 7));
+    try std.testing.expect(ipc_call_reply_policy.bindCallee(&state, 2));
+    try std.testing.expect(!ipc_call_reply_policy.replyAllowed(&state, 8, 1, 2));
+    try std.testing.expect(!ipc_call_reply_policy.replyAllowed(&state, 9, 3, 2));
+    try std.testing.expect(ipc_call_reply_policy.replyAllowed(&state, 9, 1, 2));
+    try std.testing.expect(ipc_call_reply_policy.consumeReply(&state));
+    try std.testing.expect(!ipc_call_reply_policy.consumeReply(&state));
+}
+
+test "public native call/reply uses runtime token binding" {
+    try std.testing.expect(ipc_call_reply_policy.runtimeAvailable());
+}
+
+test "native IPC delegation ABI is wired through the public header and dispatch" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "486 => { // moqipc_grant_cap_to") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.moqi_syscalls_header, "SYS_moqipc_grant_cap_to 486") != null);
 }
 
 test "absolute timer deadlines are converted from their clock domain" {
@@ -139,6 +259,24 @@ test "clock_settime rejects invalid clocks and overflowing timestamps" {
 test "clock_settime requires CAP_SYS_TIME" {
     try std.testing.expect(time_set_policy.canSetRealtime(true));
     try std.testing.expect(!time_set_policy.canSetRealtime(false));
+}
+
+test "clock syscalls reject unsupported clock IDs" {
+    try std.testing.expect(time_syscall.clockIdValid(0));
+    try std.testing.expect(time_syscall.clockIdValid(1));
+    try std.testing.expect(!time_syscall.clockIdValid(999));
+}
+
+test "time output pointer failures use EFAULT" {
+    try std.testing.expectEqual(@as(i64, -14), time_pointer_policy.invalidPointerErrno(0, 0x8000));
+    try std.testing.expectEqual(@as(i64, -14), time_pointer_policy.invalidPointerErrno(0x8000, 0x8000));
+}
+
+test "sigreturn rejects unsafe user register targets and flags" {
+    try std.testing.expect(sigreturn_policy.userTargetValid(0x4000));
+    try std.testing.expect(!sigreturn_policy.userTargetValid(sigreturn_policy.USER_LIMIT));
+    try std.testing.expect(sigreturn_policy.rflagsValid(0x202));
+    try std.testing.expect(!sigreturn_policy.rflagsValid(0x4202));
 }
 
 test "clone3 validates size before bounded argument copying" {
@@ -4375,6 +4513,20 @@ test "owner generation: tid must match the recorded registration" {
     try std.testing.expect(!owner_gen_policy.ownerMatches(42, 43));
     // Slot empty (owner exited, not yet re-used) → no target.
     try std.testing.expect(!owner_gen_policy.ownerMatches(42, null));
+}
+
+test "inotify_init1 accepts only nonblock and cloexec flags" {
+    const inotify_policy = kt.inotify_policy;
+    try std.testing.expect(inotify_policy.initFlagsValid(0));
+    try std.testing.expect(inotify_policy.initFlagsValid(inotify_policy.IN_NONBLOCK));
+    try std.testing.expect(inotify_policy.initFlagsValid(inotify_policy.IN_CLOEXEC));
+    try std.testing.expect(!inotify_policy.initFlagsValid(0x400));
+}
+
+test "ipc lifecycle clears blocked state on message and error wakeups" {
+    try std.testing.expect(ipc_lifecycle_policy.clearsBlockedState(true, false));
+    try std.testing.expect(ipc_lifecycle_policy.clearsBlockedState(false, true));
+    try std.testing.expect(!ipc_lifecycle_policy.clearsBlockedState(false, false));
 }
 
 // ─── Audited defect regressions (IPC endpoint slot occupancy + call reply

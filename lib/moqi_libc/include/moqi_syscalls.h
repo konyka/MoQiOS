@@ -85,6 +85,18 @@ static inline long syscall3(long n, long a1, long a2, long a3) {
     return ret;
 }
 
+/* Native IPC capability ABI */
+#define SYS_moqipc_grant_cap 311
+#define SYS_moqipc_grant_cap_to 486
+
+static inline long moqi_grant_cap(unsigned endpoint, unsigned rights) {
+    return syscall2(SYS_moqipc_grant_cap, endpoint, rights);
+}
+
+static inline long moqi_grant_cap_to(unsigned target_tid, unsigned endpoint, unsigned rights) {
+    return syscall3(SYS_moqipc_grant_cap_to, target_tid, endpoint, rights);
+}
+
 static inline long syscall4(long n, long a1, long a2, long a3, long a4) {
     long ret;
     register long r10 __asm__("r10") = a4;
