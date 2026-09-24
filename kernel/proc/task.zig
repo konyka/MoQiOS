@@ -582,6 +582,16 @@ fn zeroSlot(slot: u32) void {
 }
 var task_lock: IrqSpinlock = .{};
 
+/// IPC authority lock order may acquire task_lock after its own lock while
+/// resolving a live recipient TID. Callers must not hold task_lock first.
+pub fn acquireIpcTaskLock() u64 {
+    return task_lock.acquire();
+}
+
+pub fn releaseIpcTaskLock(flags: u64) void {
+    task_lock.release(flags);
+}
+
 /// Bitmap of occupied task slots — bit N set means tasks[N] is non-null.
 /// Enables O(1) skip of empty slot ranges in scheduler pickNext.
 var slot_bitmap: u64 = 0;
@@ -1024,6 +1034,7 @@ pub fn exitTask(exit_code: i32) void {
     @import("../ipc/posix_timer.zig").deleteTimersForTask(idx);
     @import("../ipc/posix_mq.zig").clearNotifyForTask(idx);
     @import("../ipc/posix_mq.zig").closeRefsForTask(idx);
+    @import("../ipc/ipc.zig").clearEndpointsForTask(idx);
 
     const flags = task_lock.acquire();
     t.exit_code = exit_code;

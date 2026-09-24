@@ -10,6 +10,7 @@
 /// For M4, capabilities are simple tokens. Full capability
 /// derivation (mint, restrict) comes in M5+.
 const task = @import("../proc/task.zig");
+const authority = @import("ipc_authority.zig");
 
 /// Capability rights (bitmask).
 pub const CapRights = packed struct {
@@ -24,6 +25,7 @@ pub const CapRights = packed struct {
 pub const Capability = packed struct {
     /// Target endpoint ID.
     endpoint: u32,
+    generation: u64,
     /// Access rights.
     rights: CapRights,
     /// Whether this slot is in use.
@@ -41,6 +43,7 @@ var cap_tables: [task.MAX_TASKS]CapTable = [_]CapTable{
     [_]Capability{
         .{
             .endpoint = 0,
+            .generation = 0,
             .rights = .{ .send = false, .receive = false, .notify = false, .manage = false },
             .valid = false,
         },
@@ -49,13 +52,21 @@ var cap_tables: [task.MAX_TASKS]CapTable = [_]CapTable{
 
 /// Grant a capability to a task.
 /// Returns the capability slot index, or null if the table is full.
-pub fn grantCapability(task_idx: u32, endpoint: u32, rights: CapRights) ?u32 {
+pub fn grantCapability(task_idx: u32, endpoint: u32, generation: u64, rights: CapRights) ?u32 {
+    const flags = authority.acquire();
+    defer authority.release(flags);
+    return grantCapabilityLocked(task_idx, endpoint, generation, rights);
+}
+
+/// Grant a capability while the shared IPC authority lock is held.
+pub fn grantCapabilityLocked(task_idx: u32, endpoint: u32, generation: u64, rights: CapRights) ?u32 {
     if (task_idx >= task.MAX_TASKS) return null;
     const table = &cap_tables[task_idx];
     for (0..MAX_CAPS_PER_TASK) |i| {
         if (!table[i].valid) {
             table[i] = .{
                 .endpoint = endpoint,
+                .generation = generation,
                 .rights = rights,
                 .valid = true,
             };
@@ -67,19 +78,33 @@ pub fn grantCapability(task_idx: u32, endpoint: u32, rights: CapRights) ?u32 {
 
 /// Revoke a capability from a task.
 pub fn revokeCapability(task_idx: u32, cap_slot: u32) void {
-    if (task_idx >= task.MAX_TASKS) return;
-    if (cap_slot >= MAX_CAPS_PER_TASK) return;
+    const flags = authority.acquire();
+    defer authority.release(flags);
+    _ = revokeCapabilityLocked(task_idx, cap_slot);
+}
+
+pub fn revokeCapabilityLocked(task_idx: u32, cap_slot: u32) bool {
+    if (task_idx >= task.MAX_TASKS) return false;
+    if (cap_slot >= MAX_CAPS_PER_TASK) return false;
+    if (!cap_tables[task_idx][cap_slot].valid) return false;
     cap_tables[task_idx][cap_slot].valid = false;
+    return true;
 }
 
 /// Check if a task has a specific capability.
 /// Returns true if the task has a valid capability for the endpoint with the required rights.
-pub fn checkCapability(task_idx: u32, endpoint: u32, required: CapRights) bool {
+pub fn checkCapability(task_idx: u32, endpoint: u32, generation: u64, required: CapRights) bool {
+    const flags = authority.acquire();
+    defer authority.release(flags);
+    return checkCapabilityLocked(task_idx, endpoint, generation, required);
+}
+
+pub fn checkCapabilityLocked(task_idx: u32, endpoint: u32, generation: u64, required: CapRights) bool {
     if (task_idx >= task.MAX_TASKS) return false;
     const table = &cap_tables[task_idx];
     for (0..MAX_CAPS_PER_TASK) |i| {
         const cap = table[i];
-        if (cap.valid and cap.endpoint == endpoint) {
+        if (cap.valid and cap.endpoint == endpoint and cap.generation == generation) {
             // Check all required rights
             if (required.send and !cap.rights.send) continue;
             if (required.receive and !cap.rights.receive) continue;
@@ -93,6 +118,12 @@ pub fn checkCapability(task_idx: u32, endpoint: u32, required: CapRights) bool {
 
 /// Clear all capabilities for a task (used on task destruction).
 pub fn clearCapabilities(task_idx: u32) void {
+    const flags = authority.acquire();
+    defer authority.release(flags);
+    clearCapabilitiesLocked(task_idx);
+}
+
+pub fn clearCapabilitiesLocked(task_idx: u32) void {
     if (task_idx >= task.MAX_TASKS) return;
     for (0..MAX_CAPS_PER_TASK) |i| {
         cap_tables[task_idx][i].valid = false;
