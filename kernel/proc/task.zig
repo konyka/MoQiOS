@@ -59,6 +59,9 @@ pub const WaitNode = struct {
 
 pub const Task = struct {
     tid: u32,
+    /// Set before IPC/resource teardown so new cross-task grants cannot target
+    /// a slot that is already in its exit transaction.
+    exiting: bool = false,
     /// User address to clear and wake when this task exits (CLONE_CHILD_CLEARTID).
     clear_tid_ptr: u64 = 0,
     /// v53.45: Slot index for O(1) reverse lookup (set by create functions).
@@ -955,6 +958,7 @@ pub fn exitTask(exit_code: i32) void {
     const sched = @import("sched.zig");
     const idx = sched.currentTaskIndex() orelse return;
     const t = getTask(idx) orelse return;
+    t.exiting = true;
 
     if (t.clear_tid_ptr != 0 and t.page_table_phys != 0) {
         const copy = @import("../mm/copy_from_user.zig");

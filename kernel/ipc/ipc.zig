@@ -182,6 +182,9 @@ const Endpoint = struct {
     waiting_sender: ?u32,
     /// Task index of the owner waiting to receive a message (blocked on receive).
     waiting_receiver: ?u32,
+    /// Receiver reserved for a message that has been delivered but not yet
+    /// consumed after its wakeup.
+    delivery_receiver: ?u32,
     /// Task allowed to complete the outstanding call for this endpoint.
     reply_callee_task_idx: ?u32,
     reply_callee_tid: ?u32,
@@ -200,6 +203,7 @@ var endpoints: [MAX_ENDPOINTS]Endpoint = [_]Endpoint{
         .owner_tid = null,
         .waiting_sender = null,
         .waiting_receiver = null,
+        .delivery_receiver = null,
         .reply_callee_task_idx = null,
         .reply_callee_tid = null,
         .reply_token = 0,
@@ -229,6 +233,7 @@ pub fn createEndpoint(owner_task_idx: u32) ?EndpointId {
                 .owner_tid = owner.tid,
                 .waiting_sender = null,
                 .waiting_receiver = null,
+                .delivery_receiver = null,
                 .reply_callee_task_idx = null,
                 .reply_callee_tid = null,
                 .reply_token = 0,
@@ -261,6 +266,7 @@ pub fn destroyEndpoint(ep: EndpointId, caller_task_idx: u32) bool {
 
     var sender_to_wake: ?u32 = null;
     var receiver_to_wake: ?u32 = null;
+    const destroyed_owner = endpoints[ep].owner_task_idx;
 
     // Unblock any tasks waiting on this endpoint (unblockTask also
     // re-enqueues them — a bare state = .ready starves the task)
@@ -279,15 +285,35 @@ pub fn destroyEndpoint(ep: EndpointId, caller_task_idx: u32) bool {
     endpoints[ep].owner_tid = null;
     endpoints[ep].waiting_sender = null;
     endpoints[ep].waiting_receiver = null;
+    endpoints[ep].delivery_receiver = null;
     endpoints[ep].reply_callee_task_idx = null;
     endpoints[ep].reply_callee_tid = null;
     endpoints[ep].reply_token = 0;
     endpoints[ep].pending_msg = null;
     endpoints[ep].pending_notify = 0;
+    // An in-flight call is stored on the caller endpoint, not the endpoint
+    // being destroyed. Cancel and wake those callers before returning.
+    var call_wake: [MAX_ENDPOINTS]?u32 = @splat(null);
+    var call_wake_count: usize = 0;
+    for (1..MAX_ENDPOINTS) |i| {
+        if (endpoints[i].active and endpoints[i].reply_callee_task_idx == destroyed_owner) {
+            const caller_idx = endpoints[i].owner_task_idx orelse continue;
+            endpoints[i].reply_callee_task_idx = null;
+            endpoints[i].reply_callee_tid = null;
+            endpoints[i].reply_token = 0;
+            task_ipc_state[caller_idx].wake_error = .invalid_endpoint;
+            task_ipc_state[caller_idx].blocked_on = 0;
+            call_wake[call_wake_count] = caller_idx;
+            call_wake_count += 1;
+        }
+    }
     ipc_lock.release(flags);
 
     if (sender_to_wake) |idx| task.unblockTask(idx);
     if (receiver_to_wake) |idx| task.unblockTask(idx);
+    for (call_wake[0..call_wake_count]) |idx| {
+        if (idx) |task_idx| task.unblockTask(task_idx);
+    }
     return true;
 }
 
@@ -315,6 +341,7 @@ pub fn clearEndpointsForTask(task_idx: u32) void {
             endpoints[i].owner_tid = null;
             endpoints[i].waiting_sender = null;
             endpoints[i].waiting_receiver = null;
+            endpoints[i].delivery_receiver = null;
             endpoints[i].reply_callee_task_idx = null;
             endpoints[i].reply_callee_tid = null;
             endpoints[i].reply_token = 0;
@@ -332,6 +359,10 @@ pub fn clearEndpointsForTask(task_idx: u32) void {
         }
         if (endpoints[i].waiting_receiver == task_idx) {
             endpoints[i].waiting_receiver = null;
+        }
+        if (endpoints[i].delivery_receiver == task_idx) {
+            endpoints[i].delivery_receiver = null;
+            endpoints[i].pending_msg = null;
         }
         if (endpoints[i].reply_callee_task_idx == task_idx) {
             endpoints[i].reply_callee_task_idx = null;
@@ -379,6 +410,7 @@ pub fn grantCapabilityToTid(caller: u32, recipient_tid: u32, ep: EndpointId, rig
     const caller_task = task.getTask(caller) orelse return @intFromEnum(CapabilityGrantError.permission);
     if (!endpoints[ep].active or endpoints[ep].owner_task_idx != caller or endpoints[ep].owner_tid != caller_task.tid) return @intFromEnum(CapabilityGrantError.permission);
     const recipient = task.findTaskByTidLocked(recipient_tid) orelse return @intFromEnum(CapabilityGrantError.no_process);
+    if (task.getTask(recipient).?.exiting) return @intFromEnum(CapabilityGrantError.no_process);
     if (recipient_tid == caller_task.tid) return @intFromEnum(CapabilityGrantError.invalid);
     const slot = capability.grantCapabilityLocked(recipient, ep, endpoint_generations[ep], rights) orelse
         return @intFromEnum(CapabilityGrantError.no_memory);
@@ -393,7 +425,7 @@ pub fn grantCapabilityAuthorized(caller: u32, recipient: u32, ep: EndpointId, ri
     defer task.releaseIpcTaskLock(task_flags);
     const caller_task = task.getTask(caller) orelse return @intFromEnum(CapabilityGrantError.permission);
     if (!endpoints[ep].active or endpoints[ep].owner_task_idx != caller or endpoints[ep].owner_tid != caller_task.tid) return @intFromEnum(CapabilityGrantError.permission);
-    if (recipient >= task.MAX_TASKS or task.getTask(recipient) == null) return @intFromEnum(CapabilityGrantError.no_process);
+    if (recipient >= task.MAX_TASKS or task.getTask(recipient) == null or task.getTask(recipient).?.exiting) return @intFromEnum(CapabilityGrantError.no_process);
     const slot = capability.grantCapabilityLocked(recipient, ep, endpoint_generations[ep], rights) orelse
         return @intFromEnum(CapabilityGrantError.no_memory);
     return @intCast(slot);
@@ -474,9 +506,15 @@ fn sendInternal(sender_idx: u32, target_ep: EndpointId, msg: *const Message, req
         return .not_ready;
     }
 
+    if (endpoints[target_ep].delivery_receiver != null) {
+        ipc_lock.release(flags);
+        return .not_ready;
+    }
+
     if (endpoints[target_ep].waiting_receiver) |recv_idx| {
         // Receiver is already waiting — deliver immediately
         _ = task.getTask(recv_idx) orelse {
+            endpoints[target_ep].waiting_receiver = null;
             ipc_lock.release(flags);
             return .not_ready;
         };
@@ -484,6 +522,7 @@ fn sendInternal(sender_idx: u32, target_ep: EndpointId, msg: *const Message, req
         endpoints[target_ep].pending_msg = out_msg;
 
         endpoints[target_ep].waiting_receiver = null;
+        endpoints[target_ep].delivery_receiver = recv_idx;
         task_ipc_state[recv_idx].blocked_on = 0;
         ipc_lock.release(flags);
         // Re-enqueue only after releasing authority; unblockTask takes the
@@ -510,10 +549,12 @@ fn sendInternal(sender_idx: u32, target_ep: EndpointId, msg: *const Message, req
     sched.forceReschedule();
     sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
 
-    const wake_error = task_ipc_state[sender_idx].wake_error;
+    const wake_flags = ipc_lock.acquire();
+    const locked_wake_error = task_ipc_state[sender_idx].wake_error;
     task_ipc_state[sender_idx].wake_error = .success;
     task_ipc_state[sender_idx].blocked_on = 0;
-    if (wake_error != .success) return wake_error;
+    ipc_lock.release(wake_flags);
+    if (locked_wake_error != .success) return locked_wake_error;
 
     // The message is already queued, so delivery is guaranteed regardless —
     // but a fatal signal must still kill the sender, and an actionable one
@@ -551,6 +592,13 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
         return .not_ready;
     }
 
+    if (endpoints[ep].delivery_receiver) |reserved_idx| {
+        if (reserved_idx != caller_idx) {
+            ipc_lock.release(flags);
+            return .not_ready;
+        }
+    }
+
     // Single waiting_receiver slot: a second blocked receiver would
     // overwrite the first one's registration. Reject symmetrically.
     if (ipc_policy.receiveAction(endpoints[ep].waiting_sender != null, endpoints[ep].waiting_receiver != null) == .busy) {
@@ -563,6 +611,7 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
         if (endpoints[ep].pending_msg) |msg| {
             buf.* = msg;
             endpoints[ep].pending_msg = null;
+            endpoints[ep].delivery_receiver = null;
         }
 
         _ = task.getTask(sender_idx) orelse {
@@ -598,6 +647,7 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
     if (endpoints[ep].pending_msg) |msg| {
         buf.* = msg;
         endpoints[ep].pending_msg = null;
+        if (endpoints[ep].delivery_receiver == caller_idx) endpoints[ep].delivery_receiver = null;
         task_ipc_state[caller_idx].blocked_on = 0;
         ipc_lock.release(flags2);
         return .success;
@@ -643,6 +693,12 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
         ipc_lock.release(flags);
         return .not_ready;
     };
+    if (endpoints[caller_ep].reply_callee_task_idx != null) {
+        // One outstanding call per endpoint is the current ABI contract;
+        // reject nested calls rather than overwriting the active token.
+        ipc_lock.release(flags);
+        return .not_ready;
+    }
     if (!endpoints[target_ep].active) {
         ipc_lock.release(flags);
         return .invalid_endpoint;
@@ -675,6 +731,8 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
     if (send_result != .success) {
         const rollback_flags = ipc_lock.acquire();
         endpoints[caller_ep].reply_callee_task_idx = null;
+        endpoints[caller_ep].reply_callee_tid = null;
+        endpoints[caller_ep].reply_token = 0;
         task_ipc_state[caller_idx].call_depth -= 1;
         ipc_lock.release(rollback_flags);
         msg.reply_to = original_reply_to;
@@ -740,16 +798,36 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
         msg.* = m;
         return .success;
     }
-    if (wake_error != .success) return wake_error;
+    if (wake_error != .success) {
+        const cancel_flags = ipc_lock.acquire();
+        endpoints[caller_ep].pending_msg = null;
+        endpoints[caller_ep].reply_callee_task_idx = null;
+        endpoints[caller_ep].reply_callee_tid = null;
+        endpoints[caller_ep].reply_token = 0;
+        ipc_lock.release(cancel_flags);
+        return wake_error;
+    }
 
     // Signal kick without a reply: an actionable signal reports EINTR so
     // the handler can run on return; anything else is a spurious wake
     // (mirrors receive()'s woken-without-message tail).
     if (sig_mod.pendingActionable(caller_task)) {
+        const cancel_flags = ipc_lock.acquire();
+        endpoints[caller_ep].pending_msg = null;
+        endpoints[caller_ep].reply_callee_task_idx = null;
+        endpoints[caller_ep].reply_callee_tid = null;
+        endpoints[caller_ep].reply_token = 0;
         if (task_ipc_state[caller_idx].call_depth > 0) task_ipc_state[caller_idx].call_depth -= 1;
+        ipc_lock.release(cancel_flags);
         return .timeout;
     }
+    const cancel_flags = ipc_lock.acquire();
+    endpoints[caller_ep].pending_msg = null;
+    endpoints[caller_ep].reply_callee_task_idx = null;
+    endpoints[caller_ep].reply_callee_tid = null;
+    endpoints[caller_ep].reply_token = 0;
     if (task_ipc_state[caller_idx].call_depth > 0) task_ipc_state[caller_idx].call_depth -= 1;
+    ipc_lock.release(cancel_flags);
     return .not_ready;
 }
 

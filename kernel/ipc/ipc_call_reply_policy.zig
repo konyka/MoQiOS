@@ -10,6 +10,16 @@ pub fn tokenBindsCallee(token: u64, expected_callee_tid: u32, token_callee_tid: 
     return token != 0 and expected_callee_tid == token_callee_tid and token_callee_tid == live_callee_tid;
 }
 
+pub const ReplyBinding = struct {
+    callee_task: ?u32 = null,
+    callee_tid: ?u32 = null,
+    token: u64 = 0,
+};
+
+pub fn clearBinding(binding: *ReplyBinding) void {
+    binding.* = .{};
+}
+
 pub const State = struct {
     active: bool = false,
     token: u64 = 0,
@@ -64,4 +74,13 @@ test "call/reply is one-shot and bound to caller/callee/token" {
 test "public call/reply runtime is available after atomic registration" {
     const std = @import("std");
     try std.testing.expect(runtimeAvailable());
+}
+
+test "failed or interrupted calls clear every reply binding field" {
+    const std = @import("std");
+    var binding = ReplyBinding{ .callee_task = 4, .callee_tid = 77, .token = 9 };
+    clearBinding(&binding);
+    try std.testing.expect(binding.callee_task == null);
+    try std.testing.expect(binding.callee_tid == null);
+    try std.testing.expectEqual(@as(u64, 0), binding.token);
 }

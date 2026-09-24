@@ -185,6 +185,14 @@ test "public native call/reply uses runtime token binding" {
     try std.testing.expect(ipc_call_reply_policy.runtimeAvailable());
 }
 
+test "IPC failed call rollback clears the complete reply binding" {
+    var binding = ipc_call_reply_policy.ReplyBinding{ .callee_task = 3, .callee_tid = 44, .token = 12 };
+    ipc_call_reply_policy.clearBinding(&binding);
+    try std.testing.expect(binding.callee_task == null);
+    try std.testing.expect(binding.callee_tid == null);
+    try std.testing.expectEqual(@as(u64, 0), binding.token);
+}
+
 test "native IPC delegation ABI is wired through the public header and dispatch" {
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "486 => { // moqipc_grant_cap_to") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.moqi_syscalls_header, "SYS_moqipc_grant_cap_to 486") != null);
