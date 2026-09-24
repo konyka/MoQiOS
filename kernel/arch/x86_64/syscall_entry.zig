@@ -95,6 +95,7 @@ pub const PerCpu = extern struct {
     exec_pending: u64,
     exec_new_entry: u64,
     exec_new_stack: u64,
+    exec_new_flags: u64 = 0,
     /// Non-zero while handling a reschedule IPI — bypass single-task fast-path.
     force_reschedule: u8,
     /// CR3 this CPU is currently running (0 = not recorded yet). Updated on
@@ -394,7 +395,13 @@ pub fn syscallEntry() callconv(.naked) void {
         \\popq %%rax
         \\movq %%gs:56, %%rcx
         \\movq %%gs:64, %%rsp
+        \\cmpq $2, %%gs:48
+        \\jne 1f
+        \\movq %%gs:72, %%r11
+        \\jmp 4f
+        \\1:
         \\movq $0x202, %%r11
+        \\4:
         \\movq $0, %%gs:48
         \\jmp 3f
         \\2:
@@ -417,7 +424,7 @@ pub fn initSyscallMsrsOnThisCpu() void {
     const star: u64 = (@as(u64, 0x08) << 32) | (@as(u64, 0x1B) << 48);
     wrmsr(MSR_STAR, star);
     wrmsr(MSR_LSTAR, @intFromPtr(&syscallEntry));
-    wrmsr(MSR_SFMASK, 0x300); // TF | IF
+    wrmsr(MSR_SFMASK, 0x700); // TF | IF | DF
 }
 
 /// Pull PerCpu.saved_user_rsp (%gs:8) into the running user task (after syscall entry).
@@ -836,8 +843,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         // ── v31.1: inotify/eventfd/timerfd/getdents ──────────────
         166 => { // inotify_init1(flags)
-            _ = frame.rdi;
-            frame.rax = @bitCast(inotify_mod.inotifyInit());
+            frame.rax = @bitCast(inotify_mod.inotifyInit(@truncate(frame.rdi)));
         },
         167 => { // inotify_add_watch(fd, pathname, mask)
             frame.rax = @bitCast(inotify_mod.addWatch(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));
@@ -2564,6 +2570,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         485 => { // pmm_set_reclaim_floor(pages) — swap test hook (mm/pmm.zig)
             frame.rax = @bitCast(@as(i64, @intCast(@import("../../mm/pmm.zig").setReclaimFloor(frame.rdi))));
         },
+        486 => { // moqipc_grant_cap_to(tid, endpoint, rights)
+            frame.rax = @bitCast(syscallGrantCapTo(@truncate(frame.rdi), @truncate(frame.rsi), @truncate(frame.rdx)));
+        },
         else => {
             serial.writeString("[syscall] unknown syscall: 0x");
             fmt.writeHex(syscall_nr);
@@ -4174,7 +4183,7 @@ fn syscallPersonality(persona: u32) i64 {
 
 /// #269 clock_getres(clockid, res) — return clock resolution
 fn syscallClockGetres(clockid: u32, res_ptr: u64) i64 {
-    _ = clockid; // All clocks report same resolution
+    if (!@import("../../proc/time_syscall.zig").clockIdValid(clockid)) return -22;
     if (res_ptr == 0) return 0; // NULL is valid (just validates clockid)
     if (res_ptr >= 0x0000_8000_0000_0000) return -14;
     const copy = @import("../../mm/copy_from_user.zig");
@@ -4923,24 +4932,26 @@ fn syscallMoqipcCreateEp() i64 {
 /// moqipc_destroy_ep(ep) — destroy an endpoint, unblock waiters.
 fn syscallMoqipcDestroyEp(ep: u32) i64 {
     const ipc = @import("../../ipc/ipc.zig");
+    const sched = @import("../../proc/sched.zig");
     if (ep == 0 or ep >= ipc.MAX_ENDPOINTS) return -22;
-    ipc.destroyEndpoint(ep);
-    return 0;
+    const caller = sched.currentTaskIndex() orelse return -3;
+    return if (ipc.destroyEndpoint(ep, caller)) 0 else -1; // EPERM/invalid owner
 }
 
 /// moqipc_send(target_ep, msg_ptr) — send a 256-byte Message to target endpoint.
 /// Copies 256 bytes from user space, calls ipc.send.
 fn syscallMoqipcSend(target_ep: u32, msg_ptr: u64) i64 {
     const ipc = @import("../../ipc/ipc.zig");
+    const sched = @import("../../proc/sched.zig");
     const copy = @import("../../mm/copy_from_user.zig");
 
     if (msg_ptr == 0 or msg_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT
-
+    const caller = sched.currentTaskIndex() orelse return -3;
     var msg: ipc.Message = undefined;
     const copied = copy.copyFromUser(@as([*]u8, @ptrCast(&msg))[0..256], @ptrFromInt(msg_ptr), 256);
     if (copied != 256) return -14;
 
-    const result = ipc.send(target_ep, &msg);
+    const result = ipc.sendAuthorized(caller, target_ep, &msg);
     return @intCast(@intFromEnum(result));
 }
 
@@ -4948,12 +4959,13 @@ fn syscallMoqipcSend(target_ep: u32, msg_ptr: u64) i64 {
 /// Blocks until a message arrives. Copies result to user space.
 fn syscallMoqipcRecv(ep: u32, msg_ptr: u64) i64 {
     const ipc = @import("../../ipc/ipc.zig");
+    const sched = @import("../../proc/sched.zig");
     const copy = @import("../../mm/copy_from_user.zig");
 
     if (msg_ptr == 0 or msg_ptr >= 0x0000_8000_0000_0000) return -14;
-
+    const caller = sched.currentTaskIndex() orelse return -3;
     var msg: ipc.Message = undefined;
-    const result = ipc.receive(ep, &msg);
+    const result = ipc.receiveAuthorized(caller, ep, &msg);
     if (result != .success) return @intCast(@intFromEnum(result));
 
     const written = copy.copyToUser(@ptrFromInt(msg_ptr), @as([*]const u8, @ptrCast(&msg))[0..256], 256);
@@ -4965,15 +4977,16 @@ fn syscallMoqipcRecv(ep: u32, msg_ptr: u64) i64 {
 /// msg_ptr is both input (request) and output (reply).
 fn syscallMoqipcCall(target_ep: u32, msg_ptr: u64) i64 {
     const ipc = @import("../../ipc/ipc.zig");
+    const sched = @import("../../proc/sched.zig");
     const copy = @import("../../mm/copy_from_user.zig");
 
     if (msg_ptr == 0 or msg_ptr >= 0x0000_8000_0000_0000) return -14;
-
+    const caller = sched.currentTaskIndex() orelse return -3;
     var msg: ipc.Message = undefined;
     const copied = copy.copyFromUser(@as([*]u8, @ptrCast(&msg))[0..256], @ptrFromInt(msg_ptr), 256);
     if (copied != 256) return -14;
 
-    const result = ipc.call(target_ep, &msg);
+    const result = ipc.callAuthorized(caller, target_ep, &msg);
     if (result != .success) return @intCast(@intFromEnum(result));
 
     // Write reply back to user space
@@ -5000,14 +5013,18 @@ fn syscallMoqipcReply(caller_ep: u32, msg_ptr: u64) i64 {
 /// moqipc_notify(target_ep, bits) — async, non-blocking notification.
 fn syscallMoqipcNotify(target_ep: u32, bits: u64) i64 {
     const ipc = @import("../../ipc/ipc.zig");
-    const result = ipc.notify(target_ep, bits);
+    const sched = @import("../../proc/sched.zig");
+    const caller = sched.currentTaskIndex() orelse return -3;
+    const result = ipc.notifyAuthorized(caller, target_ep, bits);
     return @intCast(@intFromEnum(result));
 }
 
 /// moqipc_get_notify(ep) — get and clear pending notification bitmap.
 fn syscallMoqipcGetNotify(ep: u32) i64 {
     const ipc = @import("../../ipc/ipc.zig");
-    const bits = ipc.getNotify(ep);
+    const sched = @import("../../proc/sched.zig");
+    const caller = sched.currentTaskIndex() orelse return -3;
+    const bits = ipc.getNotifyAuthorized(caller, ep) orelse return -1;
     return @bitCast(@as(u64, bits));
 }
 
@@ -5390,9 +5407,11 @@ fn syscallMunlockall() i64 {
 /// rights: bitmask { send=1, receive=2, notify=4, manage=8 }
 /// Returns cap slot (>=0) or negative errno.
 fn syscallGrantCap(endpoint: u32, rights: u32) i64 {
+    const ipc = @import("../../ipc/ipc.zig");
     const cap = @import("../../ipc/capability.zig");
     const sched = @import("../../proc/sched.zig");
     const cur_idx = sched.currentTaskIndex() orelse return -1;
+    if (rights & ~@as(u32, 0x0F) != 0) return -22;
 
     const cap_rights: cap.CapRights = .{
         .send = (rights & 1) != 0,
@@ -5400,10 +5419,23 @@ fn syscallGrantCap(endpoint: u32, rights: u32) i64 {
         .notify = (rights & 4) != 0,
         .manage = (rights & 8) != 0,
     };
-    if (cap.grantCapability(cur_idx, endpoint, cap_rights)) |slot| {
-        return @intCast(slot);
-    }
-    return -12; // ENOMEM: capability table full
+    return ipc.grantCapabilityAuthorized(cur_idx, cur_idx, endpoint, cap_rights);
+}
+
+/// moqipc_grant_cap_to(target_tid, endpoint, rights) — grant to another task.
+fn syscallGrantCapTo(target_tid: u32, endpoint: u32, rights: u32) i64 {
+    const ipc = @import("../../ipc/ipc.zig");
+    const capability = @import("../../ipc/capability.zig");
+    const sched = @import("../../proc/sched.zig");
+    const caller = sched.currentTaskIndex() orelse return -3;
+    if (rights & ~@as(u32, 0x0F) != 0) return -22;
+    const cap_rights: capability.CapRights = .{
+        .send = (rights & 1) != 0,
+        .receive = (rights & 2) != 0,
+        .notify = (rights & 4) != 0,
+        .manage = (rights & 8) != 0,
+    };
+    return ipc.grantCapabilityToTid(caller, target_tid, endpoint, cap_rights);
 }
 
 /// moqipc_revoke_cap(cap_slot) — revoke a capability.
@@ -5421,8 +5453,10 @@ fn syscallRevokeCap(cap_slot: u32) i64 {
 /// Returns 0 if capability grants the required rights, -EPERM otherwise.
 fn syscallCheckCap(endpoint: u32, rights: u32) i64 {
     const cap = @import("../../ipc/capability.zig");
+    const ipc = @import("../../ipc/ipc.zig");
     const sched = @import("../../proc/sched.zig");
     const cur_idx = sched.currentTaskIndex() orelse return -1;
+    if (rights & ~@as(u32, 0x0F) != 0) return -22;
 
     const required: cap.CapRights = .{
         .send = (rights & 1) != 0,
@@ -5430,7 +5464,7 @@ fn syscallCheckCap(endpoint: u32, rights: u32) i64 {
         .notify = (rights & 4) != 0,
         .manage = (rights & 8) != 0,
     };
-    if (cap.checkCapability(cur_idx, endpoint, required)) return 0;
+    if (ipc.checkCapabilityAuthorized(cur_idx, endpoint, required)) return 0;
     return -1; // EPERM
 }
 

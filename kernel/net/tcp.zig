@@ -3424,7 +3424,7 @@ pub fn tcpShutdown(tcb_idx: u32, how: u32) i64 {
                 },
             }
         },
-        else => return -1,
+        else => return -22,
     }
     return 0;
 }

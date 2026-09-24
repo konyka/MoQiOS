@@ -13,6 +13,10 @@ var wall_clock_offset: i64 = 0;
 pub const CLOCK_REALTIME: u64 = 0;
 pub const CLOCK_MONOTONIC: u64 = 1;
 
+pub fn clockIdValid(clockid: u64) bool {
+    return clockid == CLOCK_REALTIME or clockid == CLOCK_MONOTONIC;
+}
+
 /// Set wall-clock offset so that clock_gettime returns the desired time.
 pub fn setWallClockOffset(offset_ns: i64) void {
     wall_clock_offset = offset_ns;
@@ -31,7 +35,7 @@ pub fn wallClockNanos() u64 {
 
 /// gettimeofday(tv_ptr) → 0 or -1
 pub fn gettimeofday(tv_ptr: u64) i64 {
-    if (tv_ptr == 0 or tv_ptr >= 0x0000_8000_0000_0000) return -1;
+    if (tv_ptr == 0 or tv_ptr >= 0x0000_8000_0000_0000) return -14;
 
     const ns = wallClockNanos();
     const sec = ns / 1_000_000_000;
@@ -51,7 +55,8 @@ pub fn gettimeofday(tv_ptr: u64) i64 {
 /// clock id (CLOCK_MONOTONIC included) reports the raw TSC-since-boot time,
 /// exactly as before the RTC base existed.
 pub fn clock_gettime(clockid: u64, tp_ptr: u64) i64 {
-    if (tp_ptr == 0 or tp_ptr >= 0x0000_8000_0000_0000) return -1;
+    if (!clockIdValid(clockid)) return -22;
+    if (tp_ptr == 0 or tp_ptr >= 0x0000_8000_0000_0000) return -14;
 
     const ns = if (clockid == CLOCK_REALTIME) wallClockNanos() else tsc.nanos();
     const sec = ns / 1_000_000_000;

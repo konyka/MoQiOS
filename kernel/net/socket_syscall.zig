@@ -184,7 +184,8 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     // AF_UNIX bind
     if (t.fd_table.fds[fd].fd_type == .unix_socket) {
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
-        if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -1;
+        if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -14;
+        if (!@import("socket_address_policy.zig").unixLengthValid(addr_len, SOCKADDR_UN_PATH_OFFSET)) return -22;
         if (addr_len <= SOCKADDR_UN_PATH_OFFSET) return -22; // EINVAL: family plus at least one path byte
         var sock_addr_buf: [110]u8 = undefined;
         const to_copy = @min(@as(usize, addr_len), sock_addr_buf.len);
@@ -241,9 +242,10 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     if (t.fd_table.fds[fd].fd_type != .tcp_socket) return -88; // ENOTSOCK
     const tcb_idx = t.fd_table.fds[fd].tcb_idx;
 
-    if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -1;
+    if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -14;
     const info = net_mod.tcp.tcpGetAddrInfo(tcb_idx) orelse return -1;
     if (info.is_v6) {
+        if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, true)) return -22;
         if (addr_len < sa.SOCKADDR_IN6_LEN) return -22;
         var sa6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
         if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) < sa.SOCKADDR_IN6_LEN)
@@ -253,6 +255,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         return net_mod.tcp.tcpBind(tcb_idx, parsed.port);
     }
     if (addr_len < SOCKADDR_IN_MIN_LEN) return -22;
+    if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, false)) return -22;
     var sock_addr: [8]u8 = undefined;
     if (copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), SOCKADDR_IN_MIN_LEN) != SOCKADDR_IN_MIN_LEN) return -14;
     const port = bo.readU16BeAt(&sock_addr, 2);
@@ -354,6 +357,7 @@ pub fn accept4(fd: u32, addr_ptr: u64, addr_len_ptr: u64, flags: u32) i64 {
 /// sendto(fd, buf, len, flags, addr_ptr, addr_len) → bytes sent or -errno
 pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: u32) i64 {
     _ = flags;
+    if (!@import("socket_address_policy.zig").optionalUserAddressValid(addr_ptr, 0x0000_8000_0000_0000)) return -14;
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
 
@@ -480,13 +484,20 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         const is_v6 = t.fd_table.fds[fd].udp_is_v6;
         const src_port = t.fd_table.fds[fd].udp_port;
+        var user_addr_len: u32 = 0;
+        if (addr_ptr != 0) {
+            if (addr_len_ptr == 0 or !copy.validateUserBufferWritable(addr_len_ptr, 4)) return -14;
+            var len_bytes: [4]u8 = undefined;
+            if (copy.copyFromUser(&len_bytes, @ptrFromInt(addr_len_ptr), 4) != 4) return -14;
+            user_addr_len = @bitCast(len_bytes);
+        }
         if (is_v6) {
             var tmp6: [1232]u8 = undefined;
             const to_read6 = @min(len, 1232);
             if (!copy.validateUserBufferWritable(buf, to_read6)) return -14; // EFAULT
             if (addr_ptr != 0) {
-                if (!copy.validateUserBufferWritable(addr_ptr, sa.SOCKADDR_IN6_LEN)) return -14;
-                if (addr_len_ptr != 0 and !copy.validateUserBufferWritable(addr_len_ptr, 4)) return -14;
+                const addr_copy_len = @min(user_addr_len, sa.SOCKADDR_IN6_LEN);
+                if (addr_copy_len != 0 and !copy.validateUserBufferWritable(addr_ptr, addr_copy_len)) return -14;
             }
             var src6: [16]u8 = @splat(0);
             var src_port_out6: u16 = 0;
@@ -498,16 +509,15 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
                 if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000) {
                     var sa_out6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
                     const alen = sa.writeInet6(&sa_out6, src_port_out6, src6, 0);
-                    if (copy.copyToUser(@ptrFromInt(addr_ptr), &sa_out6, alen) != alen) return -14;
-                    if (addr_len_ptr != 0 and addr_len_ptr < 0x0000_8000_0000_0000) {
-                        var al6: [4]u8 = .{
-                            @truncate(alen),
-                            @truncate(alen >> 8),
-                            @truncate(alen >> 16),
-                            @truncate(alen >> 24),
-                        };
-                        if (copy.copyToUser(@ptrFromInt(addr_len_ptr), &al6, 4) != 4) return -14;
-                    }
+                    const addr_copy_len = @min(user_addr_len, alen);
+                    if (addr_copy_len != 0 and copy.copyToUser(@ptrFromInt(addr_ptr), sa_out6[0..addr_copy_len], addr_copy_len) != addr_copy_len) return -14;
+                    var al6: [4]u8 = .{
+                        @truncate(alen),
+                        @truncate(alen >> 8),
+                        @truncate(alen >> 16),
+                        @truncate(alen >> 24),
+                    };
+                    if (copy.copyToUser(@ptrFromInt(addr_len_ptr), &al6, 4) != 4) return -14;
                 }
                 return if (msg_trunc) @as(i64, full_len6) else @intCast(to_write6);
             }
@@ -517,8 +527,8 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         const to_read2 = @min(len, 1472);
         if (!copy.validateUserBufferWritable(buf, to_read2)) return -14; // EFAULT
         if (addr_ptr != 0) {
-            if (!copy.validateUserBufferWritable(addr_ptr, 8)) return -14;
-            if (addr_len_ptr != 0 and !copy.validateUserBufferWritable(addr_len_ptr, 4)) return -14;
+            const addr_copy_len = @min(user_addr_len, SOCKADDR_IN_MIN_LEN);
+            if (addr_copy_len != 0 and !copy.validateUserBufferWritable(addr_ptr, addr_copy_len)) return -14;
         }
         var src_ip: [4]u8 = .{ 0, 0, 0, 0 };
         var src_port_out: u16 = 0;
@@ -530,12 +540,10 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
             if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000) {
                 var sa_out: [sa.SOCKADDR_IN_LEN]u8 = undefined;
                 _ = sa.writeInet4(&sa_out, src_port_out, src_ip);
-                // Preserve historical 8-byte write for short user buffers.
-                if (copy.copyToUser(@ptrFromInt(addr_ptr), &sa_out, 8) != 8) return -14;
-                if (addr_len_ptr != 0 and addr_len_ptr < 0x0000_8000_0000_0000) {
-                    var al: [4]u8 = .{ 8, 0, 0, 0 };
-                    if (copy.copyToUser(@ptrFromInt(addr_len_ptr), &al, 4) != 4) return -14;
-                }
+                const addr_copy_len = @min(user_addr_len, SOCKADDR_IN_MIN_LEN);
+                if (addr_copy_len != 0 and copy.copyToUser(@ptrFromInt(addr_ptr), sa_out[0..addr_copy_len], addr_copy_len) != addr_copy_len) return -14;
+                var al: [4]u8 = .{ 8, 0, 0, 0 };
+                if (copy.copyToUser(@ptrFromInt(addr_len_ptr), &al, 4) != 4) return -14;
             }
             return if (msg_trunc) @as(i64, full_len) else @intCast(to_write);
         } else {
@@ -577,8 +585,8 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     // AF_UNIX connect: sockaddr_un (family + path), routed to unixConnect.
     if (t.fd_table.fds[fd].fd_type == .unix_socket) {
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
-        if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -1;
-        if (addr_len <= SOCKADDR_UN_PATH_OFFSET) return -22; // EINVAL
+        if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -14;
+        if (!@import("socket_address_policy.zig").unixLengthValid(addr_len, SOCKADDR_UN_PATH_OFFSET)) return -22;
         var sock_addr_buf: [110]u8 = undefined;
         const to_copy = @min(@as(usize, addr_len), sock_addr_buf.len);
         const copied = copy.copyFromUser(sock_addr_buf[0..to_copy], @ptrFromInt(addr_ptr), to_copy);
@@ -594,8 +602,9 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
 
     // UDP connect: set default destination
     if (t.fd_table.fds[fd].fd_type == .udp_socket) {
-        if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -1;
+        if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -14;
         if (t.fd_table.fds[fd].udp_is_v6) {
+            if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, true)) return -22;
             var sa6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
             if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) < sa.SOCKADDR_IN6_LEN)
                 return -22;
@@ -605,8 +614,10 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
             t.fd_table.fds[fd].udp_dst_port = parsed.port;
             return 0;
         }
+        if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, false)) return -22;
         var sock_addr: [8]u8 = undefined;
         if (copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), 8) != 8) return -14;
+        if (bo.readU16BeAt(&sock_addr, 0) != 2) return -97;
         const dst_port = bo.readU16BeAt(&sock_addr, 2);
         const dst_ip = [4]u8{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] };
         t.fd_table.fds[fd].udp_connected = true;
@@ -618,17 +629,20 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     if (t.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
     const tcb_idx = t.fd_table.fds[fd].tcb_idx;
 
-    if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -1;
+    if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -14;
     const info = net_mod.tcp.tcpGetAddrInfo(tcb_idx) orelse return -1;
     if (info.is_v6) {
+        if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, true)) return -22;
         var sa6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
         if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) < sa.SOCKADDR_IN6_LEN)
             return -22;
         const parsed = sa.parseInet6(&sa6) orelse return -97;
         return net_mod.tcp.tcpConnectSocketV6(tcb_idx, parsed.addr, parsed.port);
     }
+    if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, false)) return -22;
     var sock_addr: [8]u8 = undefined;
     if (copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), 8) != 8) return -14;
+    if (!@import("socket_address_policy.zig").inet4FamilyValid(bo.readU16BeAt(&sock_addr, 0))) return -97;
     const port = bo.readU16BeAt(&sock_addr, 2);
     const ip = [4]u8{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] };
     return net_mod.tcp.tcpConnectSocket(tcb_idx, ip, port);
@@ -705,6 +719,7 @@ pub fn getpeername(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
 
 /// shutdown(fd, how) → 0 or -errno
 pub fn shutdown(fd: u32, how: u32) i64 {
+    if (!@import("socket_policy.zig").shutdownHowValid(how)) return -22;
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
@@ -756,8 +771,8 @@ pub fn sendmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
 
 /// recvmsg(fd, msg_ptr, flags) → bytes received or -errno
 pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
-    _ = flags;
-    if (msg_ptr == 0 or msg_ptr >= 0x0000_8000_0000_0000) return -22;
+    if (flags != 0) return -22;
+    if (msg_ptr == 0 or msg_ptr >= 0x0000_8000_0000_0000) return -14;
 
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
@@ -766,12 +781,13 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
 
     var msghdr_buf: [56]u8 = undefined;
     const hdr_copied = copy.copyFromUser(&msghdr_buf, @ptrFromInt(msg_ptr), 56);
-    if (hdr_copied < 32) return -22;
+    if (hdr_copied != msghdr_buf.len) return -14;
 
     const iov_ptr: u64 = bo.readU64At(&msghdr_buf, 16);
     const iov_len: u64 = bo.readU64At(&msghdr_buf, 24);
 
-    if (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000 or iov_len == 0 or iov_len > 1024) return -22;
+    if (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000) return -14;
+    if (iov_len == 0 or iov_len > 1024) return -22;
 
     const tcb_idx = cur.fd_table.fds[fd].tcb_idx;
     var total: usize = 0;
@@ -780,12 +796,13 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
         var iov_buf: [16]u8 = undefined;
         const src: [*]const u8 = @ptrFromInt(iov_ptr + @as(u64, @intCast(i)) * 16);
         const iov_copied = copy.copyFromUser(&iov_buf, src, 16);
-        if (iov_copied < 16) break;
+        if (iov_copied != iov_buf.len) return -14;
 
         const iov_base: u64 = bo.readU64At(&iov_buf, 0);
         const iov_sz: u64 = bo.readU64At(&iov_buf, 8);
 
-        if (iov_base == 0 or iov_base >= 0x0000_8000_0000_0000 or iov_sz == 0) continue;
+        if (iov_base == 0 or iov_base >= 0x0000_8000_0000_0000) return -14;
+        if (iov_sz == 0) return -22;
 
         var tmp: [4096]u8 = undefined;
         const to_read: u32 = @intCast(@min(iov_sz, 4096));

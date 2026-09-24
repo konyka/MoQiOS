@@ -32,7 +32,8 @@ pub var inotify_instances: [MAX_INOTIFY_INSTANCES]InotifyInstance = @splat(.{});
 var pool_lock: IrqSpinlock = .{};
 
 /// Allocate an inotify instance and a file descriptor. Returns fd or -errno.
-pub fn inotifyInit() i64 {
+pub fn inotifyInit(flags: u32) i64 {
+    if (!inotify_policy.initFlagsValid(flags)) return -22; // EINVAL
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
@@ -60,6 +61,8 @@ pub fn inotifyInit() i64 {
     cur.fd_table.fds[slot] = .{
         .fd_type = .inotify,
         .inotify_idx = inst_idx,
+        .fd_flags = if ((flags & inotify_policy.IN_CLOEXEC) != 0) 1 else 0,
+        .status_flags = flags & inotify_policy.IN_NONBLOCK,
     };
     cur.fd_table.publishFd(slot);
     return @intCast(slot);

@@ -57,6 +57,7 @@ const NVME_CMD_IDENTIFY = 0x06;
 const NVME_CMD_WRITE = 0x01;
 const NVME_CMD_READ = 0x02;
 const NVME_CMD_DSM = 0x09; // Dataset Management (NVM I/O command)
+const NVME_CMD_FLUSH = 0x00;
 
 // ─── NVMe Queue Constants ────────────────────────────────────────────────
 
@@ -707,7 +708,7 @@ pub fn init() void {
         .name_len = 5,
         // Flush command submission is not implemented yet; do not advertise
         // persistence support through the block layer.
-        .supports_flush = false,
+        .supports_flush = true,
         .max_transfer_sectors = 128, // 64KB / 512B
     }, 0);
 
@@ -1370,4 +1371,17 @@ pub fn trimSectors(lba: u64, count: u32) i32 {
         return -1;
     }
     return 0;
+}
+
+/// Flush volatile controller caches via the NVMe NVM Flush command.
+pub fn flush() i32 {
+    if (!enabled) return -1;
+    const q = selectQueue();
+    acquireChannel(q);
+    defer releaseChannel(q);
+    var cmd = zeroCommand();
+    cmd.opcode = NVME_CMD_FLUSH;
+    cmd.nsid = nsid;
+    const cpl = submitIoCmd(q, &cmd) orelse return -1;
+    return if (@import("nvme_flush_policy.zig").statusOk(cpl.status)) 0 else -1;
 }

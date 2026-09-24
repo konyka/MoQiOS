@@ -179,7 +179,8 @@ pub fn flush(dev: u8) i32 {
         .ahci => {
             return ahci.flushCache();
         },
-        .nvme, .virtio_blk => return -1,
+        .nvme => return @import("nvme.zig").flush(),
+        .virtio_blk => return -1,
     }
 }
 
