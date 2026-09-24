@@ -2,7 +2,7 @@
 
 > **版本**: v53.34
 > **日期**: 2026-06-29
-> **说明**: 本文档记录 MoQiOS 的实际实施进度和已完成里程碑。
+> **说明**: 本文档保留历史实施快照和已完成里程碑；其中“当前状态”统计并非实时数据。
 > 长期设计目标参见 [moqios-design.md](./moqios-design.md)，当前架构参见 [moqios-architecture-current.md](./moqios-architecture-current.md)。
 >
 > **2026-06-21 review 注记**: 本文的部分版本号、日期、完成度和代码统计需要重新校准。当前以
@@ -11,7 +11,7 @@
 
 ---
 
-## 当前状态
+## 历史状态快照（2026-06-29；非实时）
 
 - **内核**: 38,420 行 Zig, 123 个源文件
 - **系统调用**: 384 个 dispatch 条目 (max #472, #0-#330 连续 + #424-#471 Linux标准编号完全连续 + #472 arch_prctl), 58 个函数已提取到独立模块
@@ -922,7 +922,7 @@
 | v53.23 | 2026-06-29 | Code Review v28 Warning修复2项+Suggestion修复3项: W1-allocBlock零拷贝路径batch模式下仍同步写位图(freeBlock零拷贝路径batch模式下正确地仅标记dirty=true延迟到cacheFlush但allocBlock零拷贝路径每次都writeBlockUncached同步写位图即使batch_free_depth>0,100MB文件写入=102400次allocBlock每次1次冗余同步位图I/O,改为batch模式下dirty=true延迟到cacheFlush与freeBlock模式一致)/W2-ensureBlock间接路径用writeBlock而非writeBlockMaybeBatch(writeFile batch上下文中ensureBlock的7处writeBlock调用仍同步写穿间接块,100MB文件写入~103K次冗余同步I/O,全部替换为writeBlockMaybeBatch batch模式下延迟到cacheFlush)/S1-ensureBlock间接路径用allocPage读间接块(单/双/三间接路径每次allocPage+readBlock+freePage读取间接块,100MB文件写入~480K次PMM锁占剩余PMM锁99%,改为静态ensure_ind_buf[3][4096]u8缓冲区消除全部allocPage/freePage)/S2-ensureBlock双间接路径冗余零块写入(allocBlock已清零新分配块但双间接路径额外allocPage+memset+writeBlock再次清零同一块,改为sib_new标志跳过冗余清零与三间接路径一致)/S3-writeFile读-改-写用readBlock(readBlockCached)污染缓存(部分写入路径readBlock将数据块插入64条目块缓存驱逐位图/inode表块,改为readBlockUncached直读磁盘不插入缓存); 38408行内核 |
 | v53.4 | 2026-05-29 | Code Review v12 Warning+建议修复7项: W1-TCP FIN+部分数据缓冲交互修复(recv_buf满时processIncomingData仅推进to_copy字节但FIN handler无条件推进rcv_nxt+1导致seq不匹配连接卡死,现仅当data_fully_buffered且fin_seq==rcv_nxt时才接受FIN否则延迟等待重传)/W2-truncateFile/truncateByInode单间接块部分截断泄漏(当new_blocks_needed在12-267范围时仅整棵释放间接块条件不满足,间接块中多余数据块永久泄漏,现新增partial indirect branch释放keep..ptrs_per_block范围的指针并写回间接块)/W3-truncate 64位length静默截断为u32(高位丢弃导致truncate("/f",0x1_0000_0000)变为truncateByInode(inode,0)清空文件,新增length>0xFFFFFFFF检查返回EINVAL)/W4-truncateByInode writeInode失败未处理(释放块后inode写回失败仍返回true致双重分配,改为检查writeInode返回值失败时返回false)/W5-getdents names[64][256]u8占16KB内核栈(names改为pmm.allocContiguous(4)动态分配,defer释放,栈占用从~21KB降至~5KB)/S1-swap.zig PTE格式注释更新(bit 2=writable/bit 3=COW而非Bits 2-11 reserved)/S2-truncateByInode添加page_cache.invalidateInode(截断后陈旧缓存页返回已释放块旧数据); 37594行内核, 384 dispatch条目 |
 | v53.3 | 2026-05-29 | Code Review v11 Critical+Warning修复6项: C1-munmap内核地址校验(用户可传入addr>=0x8000_0000_0000_0000的内核空间地址导致unmap内核页表,新增USER_SPACE_MAX边界检查addr/length/addr+length三个维度)/C2-readDirEntries返回悬挂指针(use-after-free:names类型[*][*]u8存储指向栈缓冲区的指针,函数返回后指针失效,改为[*][256]u8+@memcpy深拷贝)/W1-swapIn丢失PTE可写+COW位(swapOut时将writable(bit2)/COW(bit3)编码进swap entry保留位,swapIn时从保留位恢复0x05+writable_bit+cow_bit,否则COW页swap-in后丢失写保护标志被误写)/W2-truncate/ftruncate从空实现改为真实ext2 truncation(新增pub fn truncateByInode按inode号直接操作readInode→释放块→writeInode,truncate(76)walkPathToInode→truncateByInode,ftruncate(77)复用syscallFtruncate)/W3-TCP established状态RST处理(RFC 793:seq_num在窗口内时立即closed+deactivateTcb)/W4-TCP rcv_nxt仅推进实际缓存字节数(to_copy而非len,防止recv_buf满时跳过未缓存序号导致数据丢失); 37529行内核, 384 dispatch条目 |
-| v53.2 | 2026-05-29 | Code Review v10 Critical+Warning修复5项: C1-ext2双间接块释放遗漏修复(unlinkFile/truncateFile仅释放block[13]自身未递归释放其指向的单间接块和数据块,导致大文件删除后磁盘块永久泄漏,现递归遍历双间接块→单间接块→数据块完整释放)/C2-TCP send_head在ACK后永不推进导致连接死锁(环形缓冲区空间永不释放,send_tail达到SEND_BUF_SIZE后tcpSend返回0字节,连接永久阻塞,现ACK处理中同步推进send_head释放已确认数据空间)/W1-TCP重传路径原始减法改为ringDataLen(环形缓冲区回绕时send_tail-%send_head产生接近u32_max的巨大值导致unacked<=SEND_BUF_SIZE检查失败重传被静默跳过)/W2-mmap length溢出防护(接近u64_max时length+PAGE_SIZE-1溢出为小值导致num_pages远小于实际需要映射不足页面)/W3-fork继承mmap_regions(子进程mmap_regions为空导致munmap/madvise/mlock/munlock功能失效); 37397行内核, 383 dispatch条目 |
+| v54.0 | 2026-09-24 | Native IPC capability redesign: shared authority lock linearizes endpoint generation and capability checks; endpoint incarnations use u64 generation + owner TID; #486 `moqipc_grant_cap_to(target_tid, endpoint, rights)` grants to a live foreign task while preserving #311 self-grant; send/recv/notify/get_notify use atomic authorization; exit cleanup clears endpoint and capability state together; docs/tests updated. |
 | v53.1 | 2026-05-29 | Code Review v9 Warning+建议修复3项: W1-IdentifyNamespace rsvd2 [256]→[320]修正(结构体总大小448→512匹配NVMe规范bytes 192-511)/W2-removeXattr writeInode失败回滚(与setXattr v52.7回滚模式一致)/S1-identifyNamespace lbads==0防护; 37340行内核, 383 dispatch条目 |
 | v53.0 | 2026-05-29 | Code Review v8 Critical+Warning修复2项: C1-IdentifyNamespace结构体rsvd1偏移修复([298]→[95]使lbaf从偏移334修正到128匹配NVMe规范,与v52.6修复的IdentifyController同类bug但被遗漏,rsvd2同步修正[192]→[256];v52.9之前lba_size从错误偏移读取垃圾lbads值导致扇区大小错误)/W1-NVMe完成状态掩码0xFF→0x7FF(cpl.status>>1后SCT(2bit)+Reserved(1bit)+SC(8bit)=11bit,旧掩码0xFF仅捕获8bit丢失SC高3位,SC>=32的vendor-specific错误被误判为成功); 37336行内核, 383 dispatch条目 |
 | v52.9 | 2026-05-29 | Code Review v7 Critical+Warning修复2项: C1-leftover==16时e_name_len=0修复(v52.8的过滤器允许leftover==16但此时mini-tombstone的e_name_len=0等同于条目终止标记导致扫描器提前终止,修复为leftover>Ext2XattrEntry即leftover>=20保证e_name_len>=4)/W1-setxattrat系统调用vsize>4096返回E2BIG(防止值被静默截断为前4096字节+移除@min截断); 37336行内核, 383 dispatch条目 |

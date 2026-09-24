@@ -256,9 +256,11 @@ zig build -Darch=riscv64 smoke-riscv
 zig build -Darch=aarch64 smoke-aarch64
 ```
 
-`zig build test` 是规范的主机测试门禁：它同时运行 `tests/main.zig` 的 Zig 单元测试和
-`lib/moqi_libc/host_tests/run_tests.sh` 的 moqi_libc C 宿主机测试；新增可在主机运行的
-测试应注册到这两个套件之一。GitHub CI 对推送和拉取请求经由 `tools/observe_test_duration.py`
+`zig build test` 是规范的主机测试门禁：它运行 `tests/main.zig` 的 Zig 单元测试、
+`lib/moqi_libc/host_tests/run_tests.sh` 的 moqi_libc C 宿主机测试，以及 `build.zig` 注册的
+init supervision、spawn reporting、devmgr snapshot、Limine bootstrap、disk fixture 和
+duration-observer shell/Python 合约测试；新增主机测试应注册到对应套件和 `build.zig`。
+GitHub CI 对推送和拉取请求经由 `tools/observe_test_duration.py`
 运行相同命令（host-tests 作业），并在日志打印一条非门禁 JSONL 时长观察；时长只是观察结果，
 不构成可比较的基线或回归数据。自 2026-08-14 起 CI 增加 `smoke-qemu` 作业：
 TCG 下运行 `zig build smoke`（单核）与 `zig build smoke-smp`（双核）boot-to-shell 门禁，
@@ -279,8 +281,10 @@ MoQiOS/
 │   ├── net/             # 网络协议栈 (ARP, IPv4, ICMP, UDP)
 │   ├── proc/            # 进程管理 (task, sched, loader, signal)
 │   └── debug/           # 调试 (serial, kernel_diag)
-├── user/                # 用户程序
-│   ├── init.S           # init 进程 (启动所有测试)
+├── servers/
+│   └── init/main.c      # PID 1 init（基于 moqi_libc，启动验收测试）
+├── user/                # 用户程序与汇编回退入口
+│   ├── init.S           # 历史汇编 init 回退实现（当前不参与构建）
 │   ├── sh.c             # 交互式 Shell
 │   └── hello*.c         # 测试程序
 ├── tools/
@@ -292,6 +296,7 @@ MoQiOS/
 │   ├── moqios-design.md                # 长期设计目标 (中文)
 │   └── moqios-implementation-plan.md   # 实施计划 (中文)
 ├── build.zig            # 构建配置
+├── lib/moqi_libc/        # 用户态最小 C 运行时
 └── kernel/linker.ld     # 内核链接脚本
 ```
 

@@ -50,7 +50,17 @@ static inline long sys_write(int fd, const void *buf, unsigned long n) {
 > `include/moqi_syscalls.h`，常用调用在 `include/unistd.h`。新程序应直接使用
 > moqi_libc，不再复制本节的内联汇编。
 
-### 1.3 系统调用清单（分发表共 382 个编号分支，下表为常用子集）
+### 1.3 系统调用清单（分发表当前扩展至 #486，下表为常用子集）
+
+### 1.3.1 Native IPC capability delegation
+
+`moqipc_grant_cap_to` is syscall #486. It takes `target_tid` in `rdi`,
+`endpoint` in `rsi`, and the `send|receive|notify|manage` rights bitmask in
+`rdx`. It returns the recipient capability slot or a negative errno: `EINVAL`
+for unknown rights/self-target, `EPERM` for a non-owner, `ESRCH` for an absent
+target TID, and `ENOMEM` for a full recipient table. Capabilities bind the
+endpoint's 64-bit generation, so endpoint slot reuse cannot transfer rights to
+a new incarnation. `moqi_syscalls.h` exposes `moqi_grant_cap_to()`.
 
 | 类别 | 调用 |
 |---|---|
@@ -65,7 +75,7 @@ static inline long sys_write(int fd, const void *buf, unsigned long n) {
 | 调度 | `sched_setscheduler` (#473), `sched_getscheduler` (#474), `sched_get_priority_max` (#475), `sched_get_priority_min` (#476), `sched_setattr` (#308), `sched_getattr` (#309), `sched_setaffinity` (#273), `getpriority` (#232), `setpriority` (#233) |
 
 详细行为参见 syscall 入口与分发表 `kernel/arch/x86_64/syscall_entry.zig`（`syscallDispatch`
-中的 `switch (syscall_nr)`，编号 1–476）。
+中的 `switch (syscall_nr)`，编号扩展至 #486）。
 
 > 注：调度类系统调用使用 MoQiOS 自有编号——Linux 的 156/157/146/147 在本分发表已被
 > msgget/msgsnd/epoll_create1/epoll_ctl 占用。SCHED_OTHER=0 / SCHED_FIFO=1 / SCHED_RR=2
@@ -84,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（`hello2`–`hello44`；其中 `hello11` 与 `hello28` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前为 `hello2`–`hello101`；其中 `hello11` 与 `hello28` **不**在
    init 自动序列内），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -173,7 +183,8 @@ main():
 
 ## 4. 测试程序（hello 系列）
 
-`user/hello2.c` ~ `user/hello44.c` 是渐进式功能测试，每个程序聚焦特定子系统：
+`user/hello2.c` ~ `user/hello101.c` 是渐进式功能测试；其中 hello2~hello44 是早期基础系列，
+hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启动：
 
 | 程序 | 测试焦点 |
 |---|---|
@@ -187,6 +198,7 @@ main():
 | hello43 | loopback（lo）设备：单进程内 TCP client+server over 127.0.0.1（socket/bind/listen/connect/accept + 双向回显）与 UDP sendto/recvfrom 自收发（F2） |
 | hello44 | SCHED_FIFO / SCHED_RR 实时调度类（F3） |
 | hello50 | SMP 并发压力（J1）：4 个 worker 经 sched_setaffinity 绑核（CPU 数不足返回 EINVAL 时跳过绑核、SMP=1 下共享 CPU 0），各跑 300 轮 tmpfs 文件写读校验 + pipe + loopback UDP 自收发 + 64 KiB 匿名 mmap 校验；任一轮数据错误或异常负返回 → 子进程以 10+i 退出，父进程汇总 PASS/FAIL |
+| hello45..hello101 | 当前验收门禁，覆盖 libc ABI、IPC、网络、SMP、swap 与 raw syscall；完整启动顺序以 `servers/init/main.c` 和 `tools/qemu_smoke.sh` 为准 |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。
 

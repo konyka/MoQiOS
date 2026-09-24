@@ -728,6 +728,10 @@ const SchedStats = struct {
   一个 tick（10ms）。先发 deadline 再阻塞，丢失唤醒最多 +1 tick 重试，不会永久失醒。
 - **信号协议与既有等待原语一致**：致命 pending → `exitTask`；可处理 pending → -EINTR
   并回填 `rem`。
+- x86_64 SYSCALL entry 的 `IA32_SFMASK` 同时清除 TF、IF、DF（`0x700`），保持进入
+  C/Zig 内核路径时的 SysV ABI direction-flag 契约。
+- `sigreturn` 只接受非零、低于 user limit 的恢复 RIP/RSP，并拒绝带 IOPL/NT/VM 等
+  特权位的 RFLAGS；非法 signal frame 不会进入 SYSRET redirect 路径。
 - **槽位复用防护**：`reserveSlotLocked` 在槽位可见前清理旧的 sleep_bm 位 / deadline /
   stopped 标志，杜绝上一租户残留把半建任务误唤醒进就绪队列。
 - aarch64/riscv64 的 nanosleep 仍为忙等实现（各自的 syscall 入口），列入后续轮次。
@@ -1400,11 +1404,13 @@ e1000 (中断驱动) / virtio-net (Virtqueue)
 文件: `ipc.zig`
 
 ```zig
-const Message = struct {
-    sender: u32,
-    type: u32,
-    payload: [256]u8,
-};
+const Message = extern struct {
+    sender: u64,
+    reply_to: u64,
+    msg_type: u32,
+    flags: u32,
+    payload: [232]u8,
+}; // exactly 256 bytes
 ```
 
 操作：
@@ -1424,12 +1430,20 @@ const Message = struct {
 文件: `capability.zig`
 
 ```zig
-const Capability = struct {
-    target: u32,            // 目标端点 PID
-    rights: u32,            // 权限位
-    cookie: u64,            // 防伪
+const Capability = packed struct {
+    endpoint: u32,
+    generation: u64,        // endpoint incarnation, checked atomically
+    rights: CapRights,      // send=1, receive=2, notify=4, manage=8
+    valid: bool,
 };
 const CapTable = [32]Capability; // 每任务
+
+`moqipc_grant_cap_to` 使用 syscall #486：`(target_tid, endpoint, rights)`。
+只有 endpoint owner 可以授予，目标 TID 在 authority lock 下解析并写入其 capability table；
+endpoint 重建会递增 64 位 generation，旧 capability 不能操作新 endpoint。#311 的旧自授予 ABI
+保持不变。send/recv/notify/get_notify 的 endpoint 状态和 capability generation/rights 在同一
+authority 临界区检查，避免先检查后使用的竞态；owner 只绕过 receive/get_notify，send/notify
+仍必须具备对应 capability。capability 清理与 endpoint owner exit cleanup 是同一生命周期事务。
 ```
 
 ### 5.3 eventfd (64位计数器 + EFD_SEMAPHORE) ✅
@@ -1443,6 +1457,33 @@ const CapTable = [32]Capability; // 每任务
 - poll集成：支持POLLIN/POLLOUT事件检测
 - 系统调用：#290 (eventfd2)
 
+### 5.2.1 Capability redesign and atomic authorization (v54)
+
+Native IPC endpoints are reclaimed when their owner task exits; blocked senders/receivers are
+woken after the endpoint is invalidated, preventing slot exhaustion and stale task-slot ownership.
+Explicit destroy is owner-authorized and returns an error for foreign task indices.
+Blocked send/call operations awakened by endpoint teardown return `invalid_endpoint` rather than
+reporting successful delivery of a discarded message.
+Capability grants are owner-authorized: a task cannot mint send/receive/notify/manage rights for
+an endpoint it does not own or request unknown rights bits. #486 (`moqipc_grant_cap_to`) permits
+an owner to grant the capability to a different live TID.
+Capability entries also bind the endpoint slot generation; destroying and recreating an endpoint
+invalidates old capabilities instead of allowing a stale numeric ID to authorize the new owner.
+The runtime enforces `send` and `notify` rights for foreign callers, and `receive` rights for
+non-owners; endpoint owners retain receive/get-notify authority. Capability operations are
+linearized with endpoint generation checks under the shared authority lock.
+Foreign `get_notify` reads use the same `notify` right and cannot clear another endpoint's bitmap
+without authorization.
+`moqipc_call` requires the caller's `send` capability on the target endpoint. The kernel assigns
+an opaque, one-shot call token in `Message.reply_to`; reply lookup uses that token and validates
+the bound callee slot plus TID, rather than trusting a reusable endpoint number. Callee exit
+invalidates outstanding transactions and wakes the caller with `invalid_endpoint`, while an
+immediate reply is consumed before the caller blocks. `moqipc_reply` remains ABI-compatible with
+its endpoint argument but authorizes and routes by the opaque token carried in the reply message.
+
+The native `Message` ABI is an exactly 256-byte extern struct: `sender:u64`, `reply_to:u64`,
+`msg_type:u32`, `flags:u32`, and `payload[232]`. Host tests assert these offsets and size.
+
 ### 5.4 SysV 共享内存 ✅ (v18.0, v28.0优化)
 
 文件: `sysv_shm.zig`
@@ -1454,6 +1495,7 @@ const CapTable = [32]Capability; // 每任务
 - shmctl: IPC_STAT/IPC_RMID/IPC_SET (权限mode更新)
 - `IPC_STAT` 元数据先在 `shm_lock` 内快照，再在锁外 copyout；`IPC_SET` 先锁外 copyin，再锁内校验权限并提交，避免用户页访问运行在 IRQ 关闭状态。负 `key` 以原始 i64 位模式写入 ABI 缓冲区。
 - task exit 只有在存在 `Mm` 且成功取得 VM mutation guard 时才执行 SHM detach；guard 获取失败或任务无 `Mm` 时跳过该 detach，但继续完成其余退出清理，避免无保护修改页表。
+- `mlock/mlockall/munlock/munlockall` 当前保持明确的 `ENOSYS` ABI 契约；真实实现必须先补 per-MM lock accounting、`RLIMIT_MEMLOCK`、prefault/pin、swap/reclaim exclusion、MCL_FUTURE 及 clone/exit/munmap 交互，不能用简单 VMA 标志伪装完成。
 - findFreeRegion: next_free_hint O(n) 扫描，freeSegment 自动重置 hint
 - 系统调用: #29 (shmget), #30 (shmat), #31 (shmctl), #67 (shmdt)
 
@@ -1684,7 +1726,7 @@ const SysCap = packed struct {
 - Admin Queue + IO Queue初始化（Admin 保持轮询，仅初始化期使用）
 - Doorbell机制通知控制器
 - PRP（Physical Region Page）分散/聚集
-- readSectors / writeSectors / flush 接口
+- readSectors / writeSectors / flush 接口；flush 使用 NVM opcode `0x00`，completion status 非零返回失败。
 - MSI-X 中断驱动完成（I/O 队列）：每队列一个向量（242..245），向量不足时
   多队列共享；MSI-X 不可用时回退到原有的轮询模式（行为完全不变）
 - 提交路径：获取队列通道（channel，保证每队列最多一个命令在飞，PRP 页在

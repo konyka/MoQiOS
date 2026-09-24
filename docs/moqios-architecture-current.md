@@ -755,7 +755,11 @@ LAPIC Timer 中断
 - SyscallFrame 结构保存所有寄存器
 - 返回值通过 rax 传递，错误通过 rax = -errno 表示
 
-### 6.2 系统调用表（当前源码扩展至 max #485；历史编号说明见下表）
+### 6.2 系统调用表（当前源码扩展至 max #486；历史编号说明见下表）
+
+当前新增的 MoQiOS native IPC capability delegation syscall 是 #486：
+`moqipc_grant_cap_to(target_tid, endpoint, rights)`。旧的 #311 self-table grant ABI
+保持兼容；#335-#343 仍为已删除的历史自定义编号，不可复用。
 
 > v49.0 ext2 符号链接/硬链接: link()#86/symlink()#88从accept升级为真实ext2实现(createHardlink/createSymlink); walkPathInner递归symlink解析(深度限制8级ELOOP); readSymlinkTarget(短链接i_block内联+长链接静态缓冲区)。
 > v50.0 ioprio 进程 ABI: MoQiOS 原生 #292/#293 支持 `IOPRIO_WHO_PROCESS`；每个 Task 保存独立 I/O 优先级（默认 BE/4，fork/clone/spawn 继承），不影响 CPU 调度优先级。RT/BE 接受 data 0..7，IDLE 仅接受 data 0；PGRP/USER 返回 ENOSYS，无效 selector/value 返回 EINVAL，不存在 TID 返回 ESRCH；跨 UID 设置返回 EPERM。当前该状态尚未接入块设备调度。

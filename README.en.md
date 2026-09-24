@@ -199,9 +199,10 @@ zig build -Darch=riscv64 smoke-riscv
 zig build -Darch=aarch64 smoke-aarch64
 ```
 
-`zig build test` is the canonical host test gate: it runs both the Zig unit tests in
-`tests/main.zig` and the moqi_libc C host tests in `lib/moqi_libc/host_tests/run_tests.sh`.
-Register new host-runnable tests in one of those suites. GitHub CI runs the same command through
+`zig build test` is the canonical host test gate: it runs the Zig unit tests in `tests/main.zig`,
+the moqi_libc C host tests, and the registered shell/Python contract suites for init supervision,
+spawn reporting, devmgr snapshots, Limine bootstrap, disk fixtures, and duration observations.
+Register new host-runnable tests in the appropriate suite and wire them into `build.zig`. GitHub CI runs the same command through
 `tools/observe_test_duration.py` for pushes and pull requests (host-tests job), printing one
 non-gating JSONL duration observation in the log. Durations are observational only,
 not comparable baseline or regression data. Since 2026-08-14 a `smoke-qemu` CI job runs the
@@ -226,8 +227,10 @@ MoQiOS/
 │   ├── net/             # Network stack (ARP, IPv4, ICMP, UDP)
 │   ├── proc/            # Process management (task, sched, loader, signal)
 │   └── debug/           # Debug (serial, kernel_diag)
-├── user/                # User programs
-│   ├── init.S           # Init process (launches all tests)
+├── servers/
+│   └── init/main.c      # PID 1 init (moqi_libc, launches acceptance tests)
+├── user/                # User programs and assembly fallback
+│   ├── init.S           # Historical assembly init fallback (not built)
 │   ├── sh.c             # Interactive shell
 │   └── hello*.c         # Test programs
 ├── tools/
@@ -239,13 +242,14 @@ MoQiOS/
 │   ├── moqios-design.md                # Long-term design goals (Chinese)
 │   └── moqios-implementation-plan.md   # Implementation plan (Chinese)
 ├── build.zig            # Build configuration
+├── lib/moqi_libc/        # Minimal user-space C runtime
 └── kernel/linker.ld     # Kernel linker script
 ```
 
 ## Technical Details
 
 - **Boot**: Limine Boot Protocol with HHDM direct mapping
-- **Scheduler**: Round-robin, 16-page (64KB) kernel stacks, user/kernel thread support
+- **Scheduler**: Round-robin, 32-page (128KB) kernel stacks, user/kernel thread support
 - **Memory**: 4-level page tables, user space 0x0000000000–0x7FFFFFFFFFFF, kernel higher-half mapping
 - **Interrupts**: IDT 256 vectors, timer/keyboard/NIC interrupts, syscall via MSR (LSTAR)
 - **Network**: e1000 legacy descriptors, Rx/Tx ring buffers, interrupt-driven
