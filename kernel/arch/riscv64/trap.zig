@@ -138,6 +138,7 @@ export fn trapHandler(frame: *TrapFrame) callconv(.c) *TrapFrame {
     if (interrupt and code == Cause.supervisor_timer) {
         const timer = @import("timer.zig");
         timer.onInterrupt();
+        @import("../../ipc/ipc.zig").timeoutTick(timer.getTicks());
         const sk15 = @import("../../shared/sk15.zig");
         if (sk15.isEnabled()) {
             return @ptrFromInt(sk15.onTimer(@intFromPtr(frame)));
@@ -225,8 +226,8 @@ export fn trapHandler(frame: *TrapFrame) callconv(.c) *TrapFrame {
 
 export fn trapEntry() align(4) callconv(.naked) noreturn {
     asm volatile (
-        // Swap sp with sscratch. From U: sp:=kstack, sscratch:=user_sp.
-        // From S (sscratch=0): sp:=0, sscratch:=old_sp.
+    // Swap sp with sscratch. From U: sp:=kstack, sscratch:=user_sp.
+    // From S (sscratch=0): sp:=0, sscratch:=old_sp.
         \\csrrw sp, sscratch, sp
         \\bnez sp, 1f
         \\csrr sp, sscratch

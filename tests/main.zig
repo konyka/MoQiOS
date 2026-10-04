@@ -210,6 +210,12 @@ test "native IPC delegation ABI is wired through the public header and dispatch"
     try std.testing.expect(std.mem.indexOf(u8, kt.moqi_syscalls_header, "SYS_moqipc_grant_cap_to 486") != null);
 }
 
+test "IPC timeout maintenance is wired into every timer backend" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.aarch64_trap_source, "ipc.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.riscv64_trap_source, "ipc.zig") != null);
+    try std.testing.expect(std.mem.count(u8, kt.sched_source, "timeoutTick") == 1);
+}
+
 test "absolute timer deadlines are converted from their clock domain" {
     try std.testing.expectEqual(@as(?u64, 100), time_policy.absoluteDeltaNs(0, 1_100, 1_000, 0));
     try std.testing.expectEqual(@as(?u64, 100), time_policy.absoluteDeltaNs(0, 1_100, 1_000, 1_000));

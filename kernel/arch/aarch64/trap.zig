@@ -97,6 +97,7 @@ export fn trapHandleIrq(frame: *anyopaque) callconv(.c) usize {
     const intid = gic.handleIrq();
     if (intid == gic.TIMER_PPI) {
         @import("timer.zig").onInterrupt();
+        @import("../../ipc/ipc.zig").timeoutTick(@import("timer.zig").getFirings());
         const sk15 = @import("../../shared/sk15.zig");
         if (sk15.isEnabled()) {
             return sk15.onTimer(@intFromPtr(frame));
