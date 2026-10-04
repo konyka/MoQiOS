@@ -19,6 +19,7 @@ const serial = @import("../arch/arch.zig").serial;
 const authority = @import("ipc_authority.zig");
 const ipc_lock = authority;
 const capability = @import("capability.zig");
+const arch = @import("../arch/arch.zig");
 
 // --- Deadlock prevention limits ---
 const MAX_CALL_DEPTH: u32 = 8; // Maximum nested IPC call chain depth
@@ -58,14 +59,17 @@ pub const CapabilityGrantError = enum(i64) {
 /// cancels expired wait registrations, then wakes tasks after releasing IPC
 /// authority so task_lock cannot deadlock against the scanner.
 pub fn timeoutTick(now_tick: u64) void {
-    var wake: [task.MAX_TASKS]?u32 = @splat(null);
+    const Wake = struct { idx: u32, tid: u32 };
+    var wake: [task.MAX_TASKS]?Wake = @splat(null);
     var wake_count: usize = 0;
     const flags = authority.acquire();
     for (0..task.MAX_TASKS) |i| {
         const idx: u32 = @intCast(i);
         const state = &task_ipc_state[i];
         if (state.wait_op == .none or state.block_start_tick == 0) continue;
-        if (now_tick -% state.block_start_tick < IPC_TIMEOUT_TICKS) continue;
+        if (now_tick < state.block_start_tick or now_tick - state.block_start_tick < IPC_TIMEOUT_TICKS) continue;
+        const live = task.getTask(idx) orelse continue;
+        if (live.exiting != 0) continue;
         var expired = true;
         for (1..MAX_ENDPOINTS) |ep_i| {
             if (!endpoints[ep_i].active) continue;
@@ -91,13 +95,16 @@ pub fn timeoutTick(now_tick: u64) void {
             state.block_start_tick = 0;
             state.blocked_on = 0;
             state.wake_error = .timeout;
-            wake[wake_count] = idx;
+            wake[wake_count] = .{ .idx = idx, .tid = live.tid };
             wake_count += 1;
         }
     }
     authority.release(flags);
-    for (wake[0..wake_count]) |idx| {
-        if (idx) |task_idx| task.unblockTask(task_idx);
+    for (wake[0..wake_count]) |event| {
+        if (event) |wake_event| {
+            const current = task.getTask(wake_event.idx);
+            if (current != null and current.?.tid == wake_event.tid) task.unblockTask(wake_event.idx);
+        }
     }
 }
 
@@ -597,7 +604,7 @@ fn sendInternal(sender_idx: u32, target_ep: EndpointId, msg: *const Message, req
     task_ipc_state[sender_idx].blocked_on = target_ep;
     task_ipc_state[sender_idx].wake_error = .success;
     task_ipc_state[sender_idx].wait_op = .send;
-    task_ipc_state[sender_idx].block_start_tick = @import("../arch/x86_64/idt.zig").getTickCount();
+    task_ipc_state[sender_idx].block_start_tick = arch.interrupts.getTickCount();
     ipc_lock.release(flags);
 
     // Actually yield the CPU — marking the task .blocked without rescheduling
@@ -671,6 +678,8 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
             buf.* = msg;
             endpoints[ep].pending_msg = null;
             endpoints[ep].delivery_receiver = null;
+            task_ipc_state[caller_idx].wait_op = .none;
+            task_ipc_state[caller_idx].block_start_tick = 0;
         }
 
         _ = task.getTask(sender_idx) orelse {
@@ -694,7 +703,7 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
     task_ipc_state[caller_idx].blocked_on = ep;
     task_ipc_state[caller_idx].wake_error = .success;
     task_ipc_state[caller_idx].wait_op = .receive;
-    task_ipc_state[caller_idx].block_start_tick = @import("../arch/x86_64/idt.zig").getTickCount();
+    task_ipc_state[caller_idx].block_start_tick = arch.interrupts.getTickCount();
     ipc_lock.release(flags);
 
     // Force context switch — must release lock first to avoid deadlock
@@ -709,6 +718,8 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
         buf.* = msg;
         endpoints[ep].pending_msg = null;
         if (endpoints[ep].delivery_receiver == caller_idx) endpoints[ep].delivery_receiver = null;
+        task_ipc_state[caller_idx].wait_op = .none;
+        task_ipc_state[caller_idx].block_start_tick = 0;
         task_ipc_state[caller_idx].blocked_on = 0;
         ipc_lock.release(flags2);
         return .success;
@@ -840,7 +851,7 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
     caller_task.state = .blocked;
     task_ipc_state[caller_idx].blocked_on = target_ep;
     task_ipc_state[caller_idx].wait_op = .call;
-    task_ipc_state[caller_idx].block_start_tick = @import("../arch/x86_64/idt.zig").getTickCount();
+    task_ipc_state[caller_idx].block_start_tick = arch.interrupts.getTickCount();
     ipc_lock.release(post_send_flags);
 
     // Actually yield the CPU — marking the task .blocked without rescheduling
