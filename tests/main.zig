@@ -91,6 +91,7 @@ test "IPC endpoints are reclaimed on owner exit" {
     try std.testing.expect(!ipc_lifecycle_policy.shouldReclaim(7, 8));
     try std.testing.expect(!ipc_lifecycle_policy.shouldReclaim(null, 7));
     try std.testing.expectEqual(@as(i32, -1), ipc_lifecycle_policy.wakeResult(true, false));
+    try std.testing.expectEqual(@as(i32, -1), ipc_lifecycle_policy.wakeResult(true, true));
 }
 
 test "IPC endpoint destruction requires the owner" {

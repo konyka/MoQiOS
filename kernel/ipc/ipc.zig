@@ -259,7 +259,12 @@ pub fn getEndpointGeneration(ep: EndpointId) ?u64 {
 pub fn destroyEndpoint(ep: EndpointId, caller_task_idx: u32) bool {
     if (ep == 0 or ep >= MAX_ENDPOINTS) return false;
     const flags = ipc_lock.acquire();
-    if (!@import("ipc_endpoint_policy.zig").canDestroy(endpoints[ep].owner_task_idx, caller_task_idx)) {
+    const task_flags = task.acquireIpcTaskLock();
+    const caller = task.getTask(caller_task_idx);
+    const owner_ok = caller != null and endpoints[ep].owner_task_idx == caller_task_idx and
+        endpoints[ep].owner_tid == caller.?.tid and @atomicLoad(u32, &caller.?.exiting, .acquire) == 0;
+    task.releaseIpcTaskLock(task_flags);
+    if (!owner_ok) {
         ipc_lock.release(flags);
         return false;
     }
@@ -410,7 +415,7 @@ pub fn grantCapabilityToTid(caller: u32, recipient_tid: u32, ep: EndpointId, rig
     const caller_task = task.getTask(caller) orelse return @intFromEnum(CapabilityGrantError.permission);
     if (!endpoints[ep].active or endpoints[ep].owner_task_idx != caller or endpoints[ep].owner_tid != caller_task.tid) return @intFromEnum(CapabilityGrantError.permission);
     const recipient = task.findTaskByTidLocked(recipient_tid) orelse return @intFromEnum(CapabilityGrantError.no_process);
-    if (task.getTask(recipient).?.exiting) return @intFromEnum(CapabilityGrantError.no_process);
+    if (@atomicLoad(u32, &task.getTask(recipient).?.exiting, .acquire) != 0) return @intFromEnum(CapabilityGrantError.no_process);
     if (recipient_tid == caller_task.tid) return @intFromEnum(CapabilityGrantError.invalid);
     const slot = capability.grantCapabilityLocked(recipient, ep, endpoint_generations[ep], rights) orelse
         return @intFromEnum(CapabilityGrantError.no_memory);
@@ -425,7 +430,8 @@ pub fn grantCapabilityAuthorized(caller: u32, recipient: u32, ep: EndpointId, ri
     defer task.releaseIpcTaskLock(task_flags);
     const caller_task = task.getTask(caller) orelse return @intFromEnum(CapabilityGrantError.permission);
     if (!endpoints[ep].active or endpoints[ep].owner_task_idx != caller or endpoints[ep].owner_tid != caller_task.tid) return @intFromEnum(CapabilityGrantError.permission);
-    if (recipient >= task.MAX_TASKS or task.getTask(recipient) == null or task.getTask(recipient).?.exiting) return @intFromEnum(CapabilityGrantError.no_process);
+    if (recipient >= task.MAX_TASKS or task.getTask(recipient) == null or
+        @atomicLoad(u32, &task.getTask(recipient).?.exiting, .acquire) != 0) return @intFromEnum(CapabilityGrantError.no_process);
     const slot = capability.grantCapabilityLocked(recipient, ep, endpoint_generations[ep], rights) orelse
         return @intFromEnum(CapabilityGrantError.no_memory);
     return @intCast(slot);
@@ -742,6 +748,8 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
     // Block caller until reply arrives
     const post_send_flags = ipc_lock.acquire();
     const pending_reply = endpoints[caller_ep].pending_msg != null;
+    const pre_block_error = task_ipc_state[caller_idx].wake_error;
+    task_ipc_state[caller_idx].wake_error = .success;
     if (pending_reply) {
         msg.* = endpoints[caller_ep].pending_msg.?;
         endpoints[caller_ep].pending_msg = null;
@@ -751,6 +759,14 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
         if (task_ipc_state[caller_idx].call_depth > 0) task_ipc_state[caller_idx].call_depth -= 1;
         ipc_lock.release(post_send_flags);
         return .success;
+    }
+    if (pre_block_error != .success) {
+        endpoints[caller_ep].reply_callee_task_idx = null;
+        endpoints[caller_ep].reply_callee_tid = null;
+        endpoints[caller_ep].reply_token = 0;
+        if (task_ipc_state[caller_idx].call_depth > 0) task_ipc_state[caller_idx].call_depth -= 1;
+        ipc_lock.release(post_send_flags);
+        return pre_block_error;
     }
     const caller_task = task.getTask(caller_idx) orelse {
         endpoints[caller_ep].reply_callee_task_idx = null;
