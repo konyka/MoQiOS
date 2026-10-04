@@ -62,10 +62,8 @@ pub const interrupts = struct {
         ss: u64 = 0,
     };
 
-    var tick_count: u64 = 0;
-
     pub fn getTickCount() u64 {
-        return tick_count;
+        return @import("timer.zig").getFirings();
     }
 };
 
@@ -127,7 +125,8 @@ pub const paging = struct {
     /// SK-40: root table currently loaded in the MMU (TTBR0_EL1).
     pub fn currentRoot() u64 {
         const ttbr0 = asm volatile ("mrs %[v], ttbr0_el1"
-            : [v] "=r" (-> u64));
+            : [v] "=r" (-> u64),
+        );
         return ttbr0 & 0x0000_FFFF_FFFF_FFFE;
     }
 
@@ -461,7 +460,8 @@ pub const cpu = struct {
 
     pub fn readStackPointer() u64 {
         return asm volatile ("mov %[r], sp"
-            : [r] "=r" (-> u64));
+            : [r] "=r" (-> u64),
+        );
     }
 
     pub fn pause() void {

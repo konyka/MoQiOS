@@ -6,6 +6,7 @@
 
 const uart = @import("uart.zig");
 const trap = @import("trap.zig");
+const backend_timer = @import("timer.zig");
 
 pub const serial = struct {
     pub fn init() void {
@@ -65,10 +66,8 @@ pub const interrupts = struct {
         ss: u64 = 0,
     };
 
-    var tick_count: u64 = 0;
-
     pub fn getTickCount() u64 {
-        return tick_count;
+        return backend_timer.getTicks();
     }
 };
 
@@ -129,7 +128,8 @@ pub const paging = struct {
     /// SK-40: root table currently loaded in the MMU (satp PPN → phys).
     pub fn currentRoot() u64 {
         const satp = asm volatile ("csrr %[v], satp"
-            : [v] "=r" (-> u64));
+            : [v] "=r" (-> u64),
+        );
         return (satp & 0xFFF_FFFF_FFFF) << 12;
     }
 
@@ -356,9 +356,11 @@ pub const context_switch = struct {
         frame.sstatus = (1 << 8) | (1 << 5); // SPP=1, SPIE=1
         // Keep gp/tp for medany/TLS; sp unused by first sret but needed after trap return.
         frame.gp = asm volatile ("mv %[r], gp"
-            : [r] "=r" (-> u64));
+            : [r] "=r" (-> u64),
+        );
         frame.tp = asm volatile ("mv %[r], tp"
-            : [r] "=r" (-> u64));
+            : [r] "=r" (-> u64),
+        );
         frame.sp = frame_addr;
         return frame_addr;
     }
@@ -372,9 +374,11 @@ pub const context_switch = struct {
         frame.sepc = entry;
         frame.sstatus = 1 << 5; // SPIE; SPP=0
         frame.gp = asm volatile ("mv %[r], gp"
-            : [r] "=r" (-> u64));
+            : [r] "=r" (-> u64),
+        );
         frame.tp = asm volatile ("mv %[r], tp"
-            : [r] "=r" (-> u64));
+            : [r] "=r" (-> u64),
+        );
         frame.sp = user_sp;
         return frame_addr;
     }
@@ -528,7 +532,8 @@ pub const cpu = struct {
 
     pub fn readStackPointer() u64 {
         return asm volatile ("mv %[r], sp"
-            : [r] "=r" (-> u64));
+            : [r] "=r" (-> u64),
+        );
     }
 
     pub fn pause() void {
