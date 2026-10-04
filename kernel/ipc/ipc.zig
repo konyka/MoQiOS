@@ -60,7 +60,7 @@ pub const CapabilityGrantError = enum(i64) {
 /// cancels expired wait registrations, then wakes tasks after releasing IPC
 /// authority so task_lock cannot deadlock against the scanner.
 pub fn timeoutTick(now_tick: u64) void {
-    const Wake = struct { idx: u32, tid: u32 };
+    const Wake = struct { idx: u32, tid: u32, incarnation: u64 };
     var wake: [task.MAX_TASKS]?Wake = @splat(null);
     var wake_count: usize = 0;
     const flags = authority.acquire();
@@ -69,14 +69,16 @@ pub fn timeoutTick(now_tick: u64) void {
         const state = &task_ipc_state[i];
         if (state.wait_op == .none or state.block_start_tick == 0) continue;
         if (now_tick < state.block_start_tick or now_tick - state.block_start_tick < IPC_TIMEOUT_TICKS) continue;
-        const live = task.getTask(idx) orelse {
+        const live_pin = task.pinTaskByIndex(idx, true) orelse {
             state.wait_op = .none;
             state.block_start_tick = 0;
             state.blocked_on = 0;
             state.wake_error = .success;
             continue;
         };
-        if (live.exiting != 0) {
+        var live = live_pin;
+        defer live.release();
+        if (live.task.exiting != 0) {
             state.wait_op = .none;
             state.block_start_tick = 0;
             state.blocked_on = 0;
@@ -125,14 +127,19 @@ pub fn timeoutTick(now_tick: u64) void {
             state.block_start_tick = 0;
             state.blocked_on = 0;
             state.wake_error = .timeout;
-            wake[wake_count] = .{ .idx = idx, .tid = live.tid };
+            wake[wake_count] = .{ .idx = idx, .tid = live.tid, .incarnation = live.incarnation };
             wake_count += 1;
         }
     }
     authority.release(flags);
     for (wake[0..wake_count]) |event| {
         if (event) |wake_event| {
-            task.unblockTaskIfTid(wake_event.idx, wake_event.tid);
+            if (task.pinTaskByIndex(wake_event.idx, true)) |pin_value| {
+                var pin = pin_value;
+                defer pin.release();
+                if (pin.tid == wake_event.tid and pin.incarnation == wake_event.incarnation)
+                    task.unblockTaskIfIncarnation(wake_event.idx, wake_event.tid, wake_event.incarnation);
+            }
         }
     }
 }
@@ -148,16 +155,18 @@ fn cancelWaitLocked(idx: u32, err: IpcError) void {
     task_ipc_state[idx].block_start_tick = 0;
 }
 
-const WakeEvent = struct { idx: u32, tid: u32 };
+const WakeEvent = struct { idx: u32, tid: u32, incarnation: u64 };
 
 fn appendWakeEvent(events: []?WakeEvent, count: *usize, idx: u32) void {
     if (idx >= task.MAX_TASKS) return;
-    const live = task.getTask(idx) orelse return;
+    const live_value = task.pinTaskByIndex(idx, true) orelse return;
+    var live = live_value;
+    defer live.release();
     for (events[0..count.*]) |event| {
         if (event != null and event.?.idx == idx and event.?.tid == live.tid) return;
     }
     if (count.* < events.len) {
-        events[count.*] = .{ .idx = idx, .tid = live.tid };
+        events[count.*] = .{ .idx = idx, .tid = live.tid, .incarnation = live.incarnation };
         count.* += 1;
     }
 }
@@ -165,7 +174,12 @@ fn appendWakeEvent(events: []?WakeEvent, count: *usize, idx: u32) void {
 fn wakeEvents(events: []?WakeEvent) void {
     for (events) |event| {
         if (event) |wake| {
-            task.unblockTaskIfTid(wake.idx, wake.tid);
+            if (task.pinTaskByIndex(wake.idx, true)) |pin_value| {
+                var pin = pin_value;
+                defer pin.release();
+                if (pin.tid == wake.tid and pin.incarnation == wake.incarnation)
+                    task.unblockTaskIfIncarnation(wake.idx, wake.tid, wake.incarnation);
+            }
         }
     }
 }

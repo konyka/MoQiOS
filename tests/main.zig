@@ -140,6 +140,18 @@ test "IPC timeout policy gives replies and invalidation precedence" {
     try std.testing.expect(!ipc_timeout_policy.callBindingExpires(true, true));
 }
 
+test "task lifetime refs protect slot incarnations" {
+    var slot = task_lifetime_policy.Slot{};
+    task_lifetime_policy.beginSlot(&slot);
+    var reference = task_lifetime_policy.pin(&slot).?;
+    try std.testing.expect(task_lifetime_policy.markZombie(&slot));
+    try std.testing.expect(!task_lifetime_policy.reap(&slot));
+    try std.testing.expect(task_lifetime_policy.release(&slot, &reference));
+    try std.testing.expect(task_lifetime_policy.reap(&slot));
+    task_lifetime_policy.beginSlot(&slot);
+    try std.testing.expect(!task_lifetime_policy.release(&slot, &reference));
+}
+
 test "IPC call tokens do not reuse endpoint identifiers" {
     const call_reply = kt.ipc_call_reply_policy;
     try std.testing.expect(call_reply.tokenBindsCallee(41, 7, 41, 7));

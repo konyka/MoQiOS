@@ -59,6 +59,8 @@ pub const WaitNode = struct {
 
 pub const Task = struct {
     tid: u32,
+    /// Monotonic slot incarnation used by deferred kernel references.
+    incarnation: u64 = 0,
     /// Set before IPC/resource teardown so new cross-task grants cannot target
     /// a slot that is already in its exit transaction.
     exiting: u32 = 0,
@@ -361,6 +363,46 @@ pub const TaskMmPin = struct {
         task_lock.release(flags);
     }
 };
+
+/// Generic task lifetime reference for kernel and user tasks. Unlike
+/// TaskMmPin, this does not require an address space and is safe for kernel
+/// threads. The operation reference prevents reap/slot reuse until release.
+pub const TaskPin = struct {
+    task: *Task,
+    slot: u32,
+    tid: u32,
+    incarnation: u64,
+    released: bool = false,
+
+    pub fn release(self: *TaskPin) void {
+        if (self.released) return;
+        self.released = true;
+        const flags = task_lock.acquire();
+        defer task_lock.release(flags);
+        if (self.slot >= MAX_TASKS) return;
+        if (slot_bitmap & (@as(u64, 1) << @intCast(self.slot)) == 0) return;
+        const current = &tasks[self.slot];
+        if (current.tid != self.tid or current.incarnation != self.incarnation) return;
+        if (current.operation_refs > 0) {
+            _ = @atomicRmw(u32, &current.operation_refs, .Sub, 1, .acq_rel);
+        }
+    }
+};
+
+/// Pin a live task slot while the caller may access its Task fields.
+/// Lock order is task_lock only; callers holding IPC authority may acquire it
+/// after authority, but must release the pin before deferred wakeups.
+pub fn pinTaskByIndex(idx: u32, allow_exiting: bool) ?TaskPin {
+    if (idx >= MAX_TASKS) return null;
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    if (slot_bitmap & (@as(u64, 1) << @intCast(idx)) == 0) return null;
+    const t = &tasks[idx];
+    if (t.state == .zombie or (!allow_exiting and @atomicLoad(u32, &t.exiting, .acquire) != 0)) return null;
+    if (t.operation_refs >= MAX_OPERATION_REFS) return null;
+    _ = @atomicRmw(u32, &t.operation_refs, .Add, 1, .acq_rel);
+    return .{ .task = t, .slot = idx, .tid = t.tid, .incarnation = t.incarnation };
+}
 
 /// Retain a task's Mm and pin its task slot for the duration of an operation.
 /// The task lock protects both the TID lookup and the lifetime transition; Mm
@@ -742,6 +784,8 @@ fn reserveSlotLocked() ?u32 {
     tasks[slot].sleep_deadline_ns = 0;
     tasks[slot].stopped = false;
     slot_bitmap |= @as(u64, 1) << @intCast(slot);
+    tasks[slot].incarnation +%= 1;
+    if (tasks[slot].incarnation == 0) tasks[slot].incarnation = 1;
     return slot;
 }
 
@@ -1266,6 +1310,20 @@ pub fn unblockTaskIfTid(idx: u32, tid: u32) void {
     defer task_lock.release(flags);
     const t = getTask(idx) orelse return;
     if (t.tid != tid) return;
+    if (sched_claim.load(&t.state) == .blocked and !t.stopped) {
+        sched_claim.store(&t.state, .ready);
+        const per_cpu = @import("per_cpu.zig");
+        if (per_cpu.isAnyReady()) _ = per_cpu.enqueueTask(t);
+    }
+}
+
+/// Unblock a pinned task only when both its TID and slot incarnation match.
+/// The caller may hold a TaskPin; this function acquires task_lock itself.
+pub fn unblockTaskIfIncarnation(idx: u32, tid: u32, incarnation: u64) void {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    const t = getTask(idx) orelse return;
+    if (t.tid != tid or t.incarnation != incarnation) return;
     if (sched_claim.load(&t.state) == .blocked and !t.stopped) {
         sched_claim.store(&t.state, .ready);
         const per_cpu = @import("per_cpu.zig");
