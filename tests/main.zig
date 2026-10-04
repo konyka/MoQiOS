@@ -129,6 +129,13 @@ test "IPC endpoint generations are wide enough for long-lived slot reuse" {
     try std.testing.expect(!capability_generation_policy.matches(@as(u64, 0x1_0000_0000), @as(u64, 1)));
 }
 
+test "IPC timeout policy gives replies and invalidation precedence" {
+    try std.testing.expect(ipc_timeout_policy.deadlineExpired(10, 10));
+    try std.testing.expectEqual(@as(i32, 0), ipc_timeout_policy.wakeResult(true, true, true, true));
+    try std.testing.expectEqual(@as(i32, -1), ipc_timeout_policy.wakeResult(false, true, true, true));
+    try std.testing.expectEqual(@as(i32, -4), ipc_timeout_policy.wakeResult(false, false, true, true));
+}
+
 test "IPC call tokens do not reuse endpoint identifiers" {
     const call_reply = kt.ipc_call_reply_policy;
     try std.testing.expect(call_reply.tokenBindsCallee(41, 7, 41, 7));

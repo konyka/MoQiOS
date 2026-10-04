@@ -23,9 +23,11 @@ const capability = @import("capability.zig");
 // --- Deadlock prevention limits ---
 const MAX_CALL_DEPTH: u32 = 8; // Maximum nested IPC call chain depth
 const IPC_TIMEOUT_MS: u64 = 30000; // 30 second timeout for IPC operations
+const IPC_TIMEOUT_TICKS: u64 = IPC_TIMEOUT_MS / 10;
 
 /// Per-task IPC state for deadlock prevention.
 const IpcTaskState = struct {
+    wait_op: enum { none, send, receive, call } = .none,
     call_depth: u32,
     /// Endpoint the task is currently blocked on (for deadlock detection).
     blocked_on: EndpointId,
@@ -51,6 +53,53 @@ pub const CapabilityGrantError = enum(i64) {
     no_memory = -12,
     no_process = -3,
 };
+
+/// Called from the BSP timer maintenance path at ~100 Hz. It atomically
+/// cancels expired wait registrations, then wakes tasks after releasing IPC
+/// authority so task_lock cannot deadlock against the scanner.
+pub fn timeoutTick(now_tick: u64) void {
+    var wake: [task.MAX_TASKS]?u32 = @splat(null);
+    var wake_count: usize = 0;
+    const flags = authority.acquire();
+    for (0..task.MAX_TASKS) |i| {
+        const idx: u32 = @intCast(i);
+        const state = &task_ipc_state[i];
+        if (state.wait_op == .none or state.block_start_tick == 0) continue;
+        if (now_tick -% state.block_start_tick < IPC_TIMEOUT_TICKS) continue;
+        var expired = true;
+        for (1..MAX_ENDPOINTS) |ep_i| {
+            if (!endpoints[ep_i].active) continue;
+            if (state.wait_op == .send and endpoints[ep_i].waiting_sender == idx) {
+                endpoints[ep_i].waiting_sender = null;
+                endpoints[ep_i].pending_msg = null;
+            } else if (state.wait_op == .receive and endpoints[ep_i].waiting_receiver == idx) {
+                endpoints[ep_i].waiting_receiver = null;
+            } else if (state.wait_op == .receive and endpoints[ep_i].delivery_receiver == idx) {
+                expired = false;
+            } else if (state.wait_op == .call and endpoints[ep_i].reply_callee_task_idx == idx) {
+                if (endpoints[ep_i].pending_msg != null) {
+                    expired = false;
+                } else {
+                    endpoints[ep_i].reply_callee_task_idx = null;
+                    endpoints[ep_i].reply_callee_tid = null;
+                    endpoints[ep_i].reply_token = 0;
+                }
+            }
+        }
+        if (expired) {
+            state.wait_op = .none;
+            state.block_start_tick = 0;
+            state.blocked_on = 0;
+            state.wake_error = .timeout;
+            wake[wake_count] = idx;
+            wake_count += 1;
+        }
+    }
+    authority.release(flags);
+    for (wake[0..wake_count]) |idx| {
+        if (idx) |task_idx| task.unblockTask(task_idx);
+    }
+}
 
 var next_call_token: u64 = 1;
 
@@ -547,6 +596,8 @@ fn sendInternal(sender_idx: u32, target_ep: EndpointId, msg: *const Message, req
     sender_task.state = .blocked;
     task_ipc_state[sender_idx].blocked_on = target_ep;
     task_ipc_state[sender_idx].wake_error = .success;
+    task_ipc_state[sender_idx].wait_op = .send;
+    task_ipc_state[sender_idx].block_start_tick = @import("../arch/x86_64/idt.zig").getTickCount();
     ipc_lock.release(flags);
 
     // Actually yield the CPU — marking the task .blocked without rescheduling
@@ -559,6 +610,8 @@ fn sendInternal(sender_idx: u32, target_ep: EndpointId, msg: *const Message, req
     const locked_wake_error = task_ipc_state[sender_idx].wake_error;
     task_ipc_state[sender_idx].wake_error = .success;
     task_ipc_state[sender_idx].blocked_on = 0;
+    task_ipc_state[sender_idx].wait_op = .none;
+    task_ipc_state[sender_idx].block_start_tick = 0;
     ipc_lock.release(wake_flags);
     if (locked_wake_error != .success) return locked_wake_error;
 
@@ -640,6 +693,8 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
     recv_task.state = .blocked;
     task_ipc_state[caller_idx].blocked_on = ep;
     task_ipc_state[caller_idx].wake_error = .success;
+    task_ipc_state[caller_idx].wait_op = .receive;
+    task_ipc_state[caller_idx].block_start_tick = @import("../arch/x86_64/idt.zig").getTickCount();
     ipc_lock.release(flags);
 
     // Force context switch — must release lock first to avoid deadlock
@@ -665,6 +720,8 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
         endpoints[ep].waiting_receiver = null;
     }
     task_ipc_state[caller_idx].blocked_on = 0;
+    task_ipc_state[caller_idx].wait_op = .none;
+    task_ipc_state[caller_idx].block_start_tick = 0;
     ipc_lock.release(flags2);
     if (wake_error != .success) return wake_error;
     // Signal kick (sendSignal unblocks without delivering): die on a fatal
@@ -757,6 +814,8 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
         endpoints[caller_ep].reply_callee_tid = null;
         endpoints[caller_ep].reply_token = 0;
         if (task_ipc_state[caller_idx].call_depth > 0) task_ipc_state[caller_idx].call_depth -= 1;
+        task_ipc_state[caller_idx].wait_op = .none;
+        task_ipc_state[caller_idx].block_start_tick = 0;
         ipc_lock.release(post_send_flags);
         return .success;
     }
@@ -765,6 +824,8 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
         endpoints[caller_ep].reply_callee_tid = null;
         endpoints[caller_ep].reply_token = 0;
         if (task_ipc_state[caller_idx].call_depth > 0) task_ipc_state[caller_idx].call_depth -= 1;
+        task_ipc_state[caller_idx].wait_op = .none;
+        task_ipc_state[caller_idx].block_start_tick = 0;
         ipc_lock.release(post_send_flags);
         return pre_block_error;
     }
@@ -778,6 +839,8 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
     };
     caller_task.state = .blocked;
     task_ipc_state[caller_idx].blocked_on = target_ep;
+    task_ipc_state[caller_idx].wait_op = .call;
+    task_ipc_state[caller_idx].block_start_tick = @import("../arch/x86_64/idt.zig").getTickCount();
     ipc_lock.release(post_send_flags);
 
     // Actually yield the CPU — marking the task .blocked without rescheduling
@@ -812,6 +875,8 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
 
     if (reply_msg) |m| {
         msg.* = m;
+        task_ipc_state[caller_idx].wait_op = .none;
+        task_ipc_state[caller_idx].block_start_tick = 0;
         return .success;
     }
     if (wake_error != .success) {
@@ -820,6 +885,8 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
         endpoints[caller_ep].reply_callee_task_idx = null;
         endpoints[caller_ep].reply_callee_tid = null;
         endpoints[caller_ep].reply_token = 0;
+        task_ipc_state[caller_idx].wait_op = .none;
+        task_ipc_state[caller_idx].block_start_tick = 0;
         ipc_lock.release(cancel_flags);
         return wake_error;
     }
@@ -834,6 +901,8 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
         endpoints[caller_ep].reply_callee_tid = null;
         endpoints[caller_ep].reply_token = 0;
         if (task_ipc_state[caller_idx].call_depth > 0) task_ipc_state[caller_idx].call_depth -= 1;
+        task_ipc_state[caller_idx].wait_op = .none;
+        task_ipc_state[caller_idx].block_start_tick = 0;
         ipc_lock.release(cancel_flags);
         return .timeout;
     }
