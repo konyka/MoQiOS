@@ -14,6 +14,11 @@ pub fn clearsBlockedState(wake_with_message: bool, wake_with_error: bool) bool {
     return wake_with_message or wake_with_error;
 }
 
+pub fn wakeEventUnique(existing: []const u32, idx: u32) bool {
+    for (existing) |item| if (item == idx) return false;
+    return true;
+}
+
 test "IPC endpoint is reclaimed only by its owner task exit" {
     const std = @import("std");
     try std.testing.expect(shouldReclaim(7, 7));
@@ -25,4 +30,6 @@ test "IPC endpoint is reclaimed only by its owner task exit" {
     try std.testing.expect(clearsBlockedState(true, false));
     try std.testing.expect(clearsBlockedState(false, true));
     try std.testing.expect(!clearsBlockedState(false, false));
+    try std.testing.expect(wakeEventUnique(&.{ 1, 2 }, 3));
+    try std.testing.expect(!wakeEventUnique(&.{ 1, 2 }, 2));
 }

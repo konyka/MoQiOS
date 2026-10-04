@@ -32,6 +32,7 @@ const IpcTaskState = struct {
     call_depth: u32,
     /// Endpoint the task is currently blocked on (for deadlock detection).
     blocked_on: EndpointId,
+    blocked_generation: u64 = 0,
     /// Timestamp when the task started blocking (for timeout).
     block_start_tick: u64,
     wake_error: IpcError,
@@ -138,6 +139,15 @@ pub fn timeoutTick(now_tick: u64) void {
 }
 
 var next_call_token: u64 = 1;
+
+fn cancelWaitLocked(idx: u32, err: IpcError) void {
+    if (idx >= task.MAX_TASKS) return;
+    task_ipc_state[idx].wake_error = err;
+    task_ipc_state[idx].blocked_on = 0;
+    task_ipc_state[idx].blocked_generation = 0;
+    task_ipc_state[idx].wait_op = .none;
+    task_ipc_state[idx].block_start_tick = 0;
+}
 
 /// IPC operation type.
 pub const IpcOp = enum(u8) {
@@ -362,21 +372,16 @@ pub fn destroyEndpoint(ep: EndpointId, caller_task_idx: u32) bool {
     // re-enqueues them — a bare state = .ready starves the task)
     if (endpoints[ep].waiting_sender) |sender_idx| {
         task_ipc_state[sender_idx].wake_error = .invalid_endpoint;
-        task_ipc_state[sender_idx].blocked_on = 0;
+        cancelWaitLocked(sender_idx, .invalid_endpoint);
         sender_to_wake = sender_idx;
     }
     if (endpoints[ep].waiting_receiver) |recv_idx| {
         task_ipc_state[recv_idx].wake_error = .invalid_endpoint;
-        task_ipc_state[recv_idx].blocked_on = 0;
-        task_ipc_state[recv_idx].wait_op = .none;
-        task_ipc_state[recv_idx].block_start_tick = 0;
+        cancelWaitLocked(recv_idx, .invalid_endpoint);
         receiver_to_wake = recv_idx;
     }
     if (endpoints[ep].delivery_receiver) |recv_idx| {
-        task_ipc_state[recv_idx].wake_error = .invalid_endpoint;
-        task_ipc_state[recv_idx].blocked_on = 0;
-        task_ipc_state[recv_idx].wait_op = .none;
-        task_ipc_state[recv_idx].block_start_tick = 0;
+        cancelWaitLocked(recv_idx, .invalid_endpoint);
         receiver_to_wake = recv_idx;
     }
     endpoints[ep].active = false;
@@ -400,8 +405,7 @@ pub fn destroyEndpoint(ep: EndpointId, caller_task_idx: u32) bool {
             endpoints[i].reply_callee_task_idx = null;
             endpoints[i].reply_callee_tid = null;
             endpoints[i].reply_token = 0;
-            task_ipc_state[caller_idx].wake_error = .invalid_endpoint;
-            task_ipc_state[caller_idx].blocked_on = 0;
+            cancelWaitLocked(caller_idx, .invalid_endpoint);
             call_wake[call_wake_count] = caller_idx;
             call_wake_count += 1;
         }
@@ -424,20 +428,17 @@ pub fn clearEndpointsForTask(task_idx: u32) void {
     for (1..MAX_ENDPOINTS) |i| {
         if (endpoints[i].active and endpoints[i].owner_task_idx == task_idx) {
             if (endpoints[i].waiting_sender) |idx| {
-                task_ipc_state[idx].wake_error = .invalid_endpoint;
-                task_ipc_state[idx].blocked_on = 0;
+                cancelWaitLocked(idx, .invalid_endpoint);
                 waiters[waiter_count] = idx;
                 waiter_count += 1;
             }
             if (endpoints[i].waiting_receiver) |idx| {
-                task_ipc_state[idx].wake_error = .invalid_endpoint;
-                task_ipc_state[idx].blocked_on = 0;
+                cancelWaitLocked(idx, .invalid_endpoint);
                 waiters[waiter_count] = idx;
                 waiter_count += 1;
             }
             if (endpoints[i].delivery_receiver) |idx| {
-                task_ipc_state[idx].wake_error = .invalid_endpoint;
-                task_ipc_state[idx].blocked_on = 0;
+                cancelWaitLocked(idx, .invalid_endpoint);
                 task_ipc_state[idx].wait_op = .none;
                 task_ipc_state[idx].block_start_tick = 0;
                 waiters[waiter_count] = idx;
@@ -476,8 +477,7 @@ pub fn clearEndpointsForTask(task_idx: u32) void {
             endpoints[i].reply_callee_tid = null;
             endpoints[i].reply_token = 0;
             if (endpoints[i].owner_task_idx) |caller_idx| {
-                task_ipc_state[caller_idx].wake_error = .invalid_endpoint;
-                task_ipc_state[caller_idx].blocked_on = 0;
+                cancelWaitLocked(caller_idx, .invalid_endpoint);
                 waiters[waiter_count] = caller_idx;
                 waiter_count += 1;
             }
@@ -648,6 +648,7 @@ fn sendInternal(sender_idx: u32, target_ep: EndpointId, msg: *const Message, req
     endpoints[target_ep].pending_msg = out_msg;
     sender_task.state = .blocked;
     task_ipc_state[sender_idx].blocked_on = target_ep;
+    task_ipc_state[sender_idx].blocked_generation = endpoint_generations[target_ep];
     task_ipc_state[sender_idx].wake_error = .success;
     task_ipc_state[sender_idx].wait_op = .send;
     task_ipc_state[sender_idx].block_start_tick = arch.interrupts.getTickCount();
@@ -663,6 +664,7 @@ fn sendInternal(sender_idx: u32, target_ep: EndpointId, msg: *const Message, req
     const locked_wake_error = task_ipc_state[sender_idx].wake_error;
     task_ipc_state[sender_idx].wake_error = .success;
     task_ipc_state[sender_idx].blocked_on = 0;
+    task_ipc_state[sender_idx].blocked_generation = 0;
     task_ipc_state[sender_idx].wait_op = .none;
     task_ipc_state[sender_idx].block_start_tick = 0;
     ipc_lock.release(wake_flags);
@@ -749,6 +751,7 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
     endpoints[ep].waiting_receiver = caller_idx;
     recv_task.state = .blocked;
     task_ipc_state[caller_idx].blocked_on = ep;
+    task_ipc_state[caller_idx].blocked_generation = endpoint_generations[ep];
     task_ipc_state[caller_idx].wake_error = .success;
     task_ipc_state[caller_idx].wait_op = .receive;
     task_ipc_state[caller_idx].block_start_tick = arch.interrupts.getTickCount();
@@ -762,6 +765,17 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
     const flags2 = ipc_lock.acquire();
     const wake_error = task_ipc_state[caller_idx].wake_error;
     task_ipc_state[caller_idx].wake_error = .success;
+    const generation_matches = endpoints[ep].active and
+        task_ipc_state[caller_idx].blocked_generation == endpoint_generations[ep] and
+        endpoints[ep].delivery_receiver == caller_idx;
+    if (!generation_matches) {
+        task_ipc_state[caller_idx].blocked_on = 0;
+        task_ipc_state[caller_idx].blocked_generation = 0;
+        task_ipc_state[caller_idx].wait_op = .none;
+        task_ipc_state[caller_idx].block_start_tick = 0;
+        ipc_lock.release(flags2);
+        return .invalid_endpoint;
+    }
     if (endpoints[ep].pending_msg) |msg| {
         buf.* = msg;
         endpoints[ep].pending_msg = null;
@@ -779,6 +793,7 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
         endpoints[ep].waiting_receiver = null;
     }
     task_ipc_state[caller_idx].blocked_on = 0;
+    task_ipc_state[caller_idx].blocked_generation = 0;
     task_ipc_state[caller_idx].wait_op = .none;
     task_ipc_state[caller_idx].block_start_tick = 0;
     ipc_lock.release(flags2);

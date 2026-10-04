@@ -4553,6 +4553,8 @@ test "ipc lifecycle clears blocked state on message and error wakeups" {
     try std.testing.expect(ipc_lifecycle_policy.clearsBlockedState(true, false));
     try std.testing.expect(ipc_lifecycle_policy.clearsBlockedState(false, true));
     try std.testing.expect(!ipc_lifecycle_policy.clearsBlockedState(false, false));
+    try std.testing.expect(ipc_lifecycle_policy.wakeEventUnique(&.{ 1, 2 }, 3));
+    try std.testing.expect(!ipc_lifecycle_policy.wakeEventUnique(&.{ 1, 2 }, 2));
 }
 
 // ─── Audited defect regressions (IPC endpoint slot occupancy + call reply
