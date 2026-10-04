@@ -368,6 +368,15 @@ pub fn destroyEndpoint(ep: EndpointId, caller_task_idx: u32) bool {
     if (endpoints[ep].waiting_receiver) |recv_idx| {
         task_ipc_state[recv_idx].wake_error = .invalid_endpoint;
         task_ipc_state[recv_idx].blocked_on = 0;
+        task_ipc_state[recv_idx].wait_op = .none;
+        task_ipc_state[recv_idx].block_start_tick = 0;
+        receiver_to_wake = recv_idx;
+    }
+    if (endpoints[ep].delivery_receiver) |recv_idx| {
+        task_ipc_state[recv_idx].wake_error = .invalid_endpoint;
+        task_ipc_state[recv_idx].blocked_on = 0;
+        task_ipc_state[recv_idx].wait_op = .none;
+        task_ipc_state[recv_idx].block_start_tick = 0;
         receiver_to_wake = recv_idx;
     }
     endpoints[ep].active = false;
@@ -423,6 +432,14 @@ pub fn clearEndpointsForTask(task_idx: u32) void {
             if (endpoints[i].waiting_receiver) |idx| {
                 task_ipc_state[idx].wake_error = .invalid_endpoint;
                 task_ipc_state[idx].blocked_on = 0;
+                waiters[waiter_count] = idx;
+                waiter_count += 1;
+            }
+            if (endpoints[i].delivery_receiver) |idx| {
+                task_ipc_state[idx].wake_error = .invalid_endpoint;
+                task_ipc_state[idx].blocked_on = 0;
+                task_ipc_state[idx].wait_op = .none;
+                task_ipc_state[idx].block_start_tick = 0;
                 waiters[waiter_count] = idx;
                 waiter_count += 1;
             }
