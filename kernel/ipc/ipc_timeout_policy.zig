@@ -23,6 +23,10 @@ pub fn callSendRegistrationExpires(waiting_sender_matches: bool, reply_present: 
     return waiting_sender_matches and !reply_present;
 }
 
+pub fn callBindingExpires(caller_matches: bool, reply_present: bool) bool {
+    return caller_matches and !reply_present;
+}
+
 test "IPC timeout deadlines are overflow-safe and inclusive" {
     try std.testing.expect(!deadlineExpired(0, 0));
     try std.testing.expect(!deadlineExpired(9, 10));
@@ -41,4 +45,10 @@ test "call timeout removes an undelivered send registration" {
     try std.testing.expect(callSendRegistrationExpires(true, false));
     try std.testing.expect(!callSendRegistrationExpires(true, true));
     try std.testing.expect(!callSendRegistrationExpires(false, false));
+}
+
+test "call timeout invalidates a caller binding unless reply already arrived" {
+    try std.testing.expect(callBindingExpires(true, false));
+    try std.testing.expect(!callBindingExpires(true, true));
+    try std.testing.expect(!callBindingExpires(false, false));
 }

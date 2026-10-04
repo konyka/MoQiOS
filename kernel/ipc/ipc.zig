@@ -68,8 +68,20 @@ pub fn timeoutTick(now_tick: u64) void {
         const state = &task_ipc_state[i];
         if (state.wait_op == .none or state.block_start_tick == 0) continue;
         if (now_tick < state.block_start_tick or now_tick - state.block_start_tick < IPC_TIMEOUT_TICKS) continue;
-        const live = task.getTask(idx) orelse continue;
-        if (live.exiting != 0) continue;
+        const live = task.getTask(idx) orelse {
+            state.wait_op = .none;
+            state.block_start_tick = 0;
+            state.blocked_on = 0;
+            state.wake_error = .success;
+            continue;
+        };
+        if (live.exiting != 0) {
+            state.wait_op = .none;
+            state.block_start_tick = 0;
+            state.blocked_on = 0;
+            state.wake_error = .success;
+            continue;
+        }
         var expired = true;
         if (state.wait_op == .call and state.blocked_on != 0 and state.blocked_on < MAX_ENDPOINTS and
             endpoints[state.blocked_on].active and endpoints[state.blocked_on].waiting_sender == idx and
@@ -80,7 +92,17 @@ pub fn timeoutTick(now_tick: u64) void {
         }
         for (1..MAX_ENDPOINTS) |ep_i| {
             if (!endpoints[ep_i].active) continue;
-            if (state.wait_op == .send and endpoints[ep_i].waiting_sender == idx) {
+            if (state.wait_op == .call and endpoints[ep_i].owner_task_idx == idx and
+                endpoints[ep_i].reply_callee_task_idx != null)
+            {
+                if (endpoints[ep_i].pending_msg != null) {
+                    expired = false;
+                } else {
+                    endpoints[ep_i].reply_callee_task_idx = null;
+                    endpoints[ep_i].reply_callee_tid = null;
+                    endpoints[ep_i].reply_token = 0;
+                }
+            } else if (state.wait_op == .send and endpoints[ep_i].waiting_sender == idx) {
                 endpoints[ep_i].waiting_sender = null;
                 endpoints[ep_i].pending_msg = null;
             } else if (state.wait_op == .receive and endpoints[ep_i].waiting_receiver == idx) {
@@ -687,6 +709,8 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
             endpoints[ep].delivery_receiver = null;
             task_ipc_state[caller_idx].wait_op = .none;
             task_ipc_state[caller_idx].block_start_tick = 0;
+            task_ipc_state[caller_idx].wake_error = .success;
+            task_ipc_state[caller_idx].blocked_on = 0;
         }
 
         _ = task.getTask(sender_idx) orelse {
@@ -893,6 +917,7 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
 
     if (reply_msg) |m| {
         msg.* = m;
+        task_ipc_state[caller_idx].blocked_on = 0;
         task_ipc_state[caller_idx].wait_op = .none;
         task_ipc_state[caller_idx].block_start_tick = 0;
         return .success;
@@ -905,6 +930,7 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
         endpoints[caller_ep].reply_token = 0;
         task_ipc_state[caller_idx].wait_op = .none;
         task_ipc_state[caller_idx].block_start_tick = 0;
+        task_ipc_state[caller_idx].blocked_on = 0;
         ipc_lock.release(cancel_flags);
         return wake_error;
     }
@@ -921,6 +947,7 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
         if (task_ipc_state[caller_idx].call_depth > 0) task_ipc_state[caller_idx].call_depth -= 1;
         task_ipc_state[caller_idx].wait_op = .none;
         task_ipc_state[caller_idx].block_start_tick = 0;
+        task_ipc_state[caller_idx].blocked_on = 0;
         ipc_lock.release(cancel_flags);
         return .timeout;
     }
@@ -930,6 +957,9 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
     endpoints[caller_ep].reply_callee_tid = null;
     endpoints[caller_ep].reply_token = 0;
     if (task_ipc_state[caller_idx].call_depth > 0) task_ipc_state[caller_idx].call_depth -= 1;
+    task_ipc_state[caller_idx].wait_op = .none;
+    task_ipc_state[caller_idx].block_start_tick = 0;
+    task_ipc_state[caller_idx].blocked_on = 0;
     ipc_lock.release(cancel_flags);
     return .not_ready;
 }
