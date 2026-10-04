@@ -19,6 +19,10 @@ pub fn wakeResult(reply_present: bool, invalidated: bool, expired: bool, signal_
     return 0;
 }
 
+pub fn callSendRegistrationExpires(waiting_sender_matches: bool, reply_present: bool) bool {
+    return waiting_sender_matches and !reply_present;
+}
+
 test "IPC timeout deadlines are overflow-safe and inclusive" {
     try std.testing.expect(!deadlineExpired(0, 0));
     try std.testing.expect(!deadlineExpired(9, 10));
@@ -31,4 +35,10 @@ test "IPC wake precedence preserves replies and invalidation" {
     try std.testing.expectEqual(@as(i32, 0), wakeResult(true, true, true, true));
     try std.testing.expectEqual(@as(i32, -1), wakeResult(false, true, true, true));
     try std.testing.expectEqual(@as(i32, -4), wakeResult(false, false, true, true));
+}
+
+test "call timeout removes an undelivered send registration" {
+    try std.testing.expect(callSendRegistrationExpires(true, false));
+    try std.testing.expect(!callSendRegistrationExpires(true, true));
+    try std.testing.expect(!callSendRegistrationExpires(false, false));
 }

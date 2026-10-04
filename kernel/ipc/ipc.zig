@@ -71,6 +71,13 @@ pub fn timeoutTick(now_tick: u64) void {
         const live = task.getTask(idx) orelse continue;
         if (live.exiting != 0) continue;
         var expired = true;
+        if (state.wait_op == .call and state.blocked_on != 0 and state.blocked_on < MAX_ENDPOINTS and
+            endpoints[state.blocked_on].active and endpoints[state.blocked_on].waiting_sender == idx and
+            endpoints[state.blocked_on].pending_msg != null)
+        {
+            endpoints[state.blocked_on].waiting_sender = null;
+            endpoints[state.blocked_on].pending_msg = null;
+        }
         for (1..MAX_ENDPOINTS) |ep_i| {
             if (!endpoints[ep_i].active) continue;
             if (state.wait_op == .send and endpoints[ep_i].waiting_sender == idx) {

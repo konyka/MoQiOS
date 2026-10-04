@@ -134,6 +134,8 @@ test "IPC timeout policy gives replies and invalidation precedence" {
     try std.testing.expectEqual(@as(i32, 0), ipc_timeout_policy.wakeResult(true, true, true, true));
     try std.testing.expectEqual(@as(i32, -1), ipc_timeout_policy.wakeResult(false, true, true, true));
     try std.testing.expectEqual(@as(i32, -4), ipc_timeout_policy.wakeResult(false, false, true, true));
+    try std.testing.expect(ipc_timeout_policy.callSendRegistrationExpires(true, false));
+    try std.testing.expect(!ipc_timeout_policy.callSendRegistrationExpires(true, true));
 }
 
 test "IPC call tokens do not reuse endpoint identifiers" {
