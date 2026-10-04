@@ -1418,7 +1418,7 @@ const Message = extern struct {
 | 操作 | 描述 |
 |---|---|
 | `send(dst, msg)` | 同步发送，目标未 receive 则阻塞 |
-| `receive(from)` | 阻塞等待消息（from = ANY 或具体 PID） |
+| `moqipc_recv(endpoint, message_ptr)` | 按 endpoint ID 阻塞接收消息；当前 ABI 不提供 PID/ANY 来源筛选 |
 | `call(dst, msg)` | send + receive 复合 |
 | `reply(dst, msg)` | 应答 call |
 | `notify(dst, type)` | 异步通知（事件位图） |

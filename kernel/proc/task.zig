@@ -1259,6 +1259,20 @@ pub fn unblockTask(idx: u32) void {
     }
 }
 
+/// Unblock only if the slot still belongs to the captured TID. This closes
+/// deferred-wakeup races across task slot reap and reuse.
+pub fn unblockTaskIfTid(idx: u32, tid: u32) void {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    const t = getTask(idx) orelse return;
+    if (t.tid != tid) return;
+    if (sched_claim.load(&t.state) == .blocked and !t.stopped) {
+        sched_claim.store(&t.state, .ready);
+        const per_cpu = @import("per_cpu.zig");
+        if (per_cpu.isAnyReady()) _ = per_cpu.enqueueTask(t);
+    }
+}
+
 /// Get total task count.
 pub fn getTaskCount() u32 {
     return task_count;

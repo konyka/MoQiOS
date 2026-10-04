@@ -208,6 +208,8 @@ test "IPC failed call rollback clears the complete reply binding" {
 test "native IPC delegation ABI is wired through the public header and dispatch" {
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "486 => { // moqipc_grant_cap_to") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.moqi_syscalls_header, "SYS_moqipc_grant_cap_to 486") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.moqi_syscalls_header, "SYS_moqipc_recv 300") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.moqi_syscalls_header, "SYS_moqipc_reply 302") != null);
 }
 
 test "IPC timeout maintenance is wired into every timer backend" {

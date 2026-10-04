@@ -342,7 +342,7 @@
 | 291 | readahead | ext2/FAT32 regular-file bounded best-effort page prefetch | Phase2 |
 | 292 | ioprio_set | 设置进程 I/O 优先级（MoQiOS 原生 process scope） | Phase2 |
 | 293 | ioprio_get | 获取进程 I/O 优先级（MoQiOS 原生 process scope） | Phase2 |
-| 300 | tcp_connect | TCP socket连接 | Phase 6 |
+| 300 | moqipc_recv | Native IPC endpoint receive | Phase 6 |
 | 318 | getrandom | 获取随机数 | Phase1 |
 | 158 | arch_prctl | 架构相关 (ARCH_SET_FS TLS) | Phase3 |
 | 186 | gettid | 获取线程 ID | Phase3 |
@@ -351,7 +351,7 @@
 | 262 | newfstatat | 文件状态 (*at 版本) | Phase3 |
 | 263 | unlinkat | 删除文件/目录 | Phase3 |
 | 281 | epoll_pwait | epoll等待 (带信号掩码) | Phase3 |
-| 302 | prlimit64 | 资源限制 (64位) | Phase3 |
+| 302 | moqipc_reply | Native IPC reply | Phase 3 |
 | 309 | getcpu | 获取当前 CPU/NUMA 节点 | Phase3 |
 | 400 | stat | 文件状态查询 | Phase3 |
 | 401 | lstat | 文件状态 (不跟踪符号链接) | Phase3 |

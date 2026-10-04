@@ -1023,7 +1023,7 @@ LAPIC Timer 中断
 | 290 | eventfd2 | 创建eventfd |
 | 292 | dup3 | 复制fd (带O_CLOEXEC) |
 | 293 | pipe2 | 创建管道 (带O_NONBLOCK/O_CLOEXEC) |
-| 300 | tcp_connect | TCP socket连接 |
+| 300 | moqipc_recv | Native IPC endpoint receive |
 | 318 | getrandom | 获取随机数 |
 | 158 | arch_prctl | 架构相关 (ARCH_SET_FS TLS) |
 | 186 | gettid | 获取线程 ID |
@@ -1032,7 +1032,7 @@ LAPIC Timer 中断
 | 262 | newfstatat | 文件状态 (*at 版本) |
 | 263 | unlinkat | 删除文件/目录 |
 | 281 | epoll_pwait | epoll等待 (带信号掩码) |
-| 302 | prlimit64 | 资源限制 (64位) |
+| 302 | moqipc_reply | Native IPC reply |
 | 309 | getcpu | 获取当前 CPU/NUMA 节点 |
 | 400 | stat | 文件状态查询 |
 | 401 | lstat | 文件状态 (不跟踪符号链接) |

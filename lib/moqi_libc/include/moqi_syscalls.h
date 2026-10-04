@@ -86,8 +86,25 @@ static inline long syscall3(long n, long a1, long a2, long a3) {
 }
 
 /* Native IPC capability ABI */
+#define SYS_moqipc_create_ep 297
+#define SYS_moqipc_destroy_ep 298
+#define SYS_moqipc_send 299
+#define SYS_moqipc_recv 300
+#define SYS_moqipc_call 301
+#define SYS_moqipc_reply 302
+#define SYS_moqipc_notify 303
+#define SYS_moqipc_get_notify 304
 #define SYS_moqipc_grant_cap 311
 #define SYS_moqipc_grant_cap_to 486
+
+static inline long moqi_ipc_create_ep(void) { return syscall0(SYS_moqipc_create_ep); }
+static inline long moqi_ipc_destroy_ep(unsigned endpoint) { return syscall1(SYS_moqipc_destroy_ep, endpoint); }
+static inline long moqi_ipc_send(unsigned endpoint, const void *message) { return syscall2(SYS_moqipc_send, endpoint, (long)message); }
+static inline long moqi_ipc_recv(unsigned endpoint, void *message) { return syscall2(SYS_moqipc_recv, endpoint, (long)message); }
+static inline long moqi_ipc_call(unsigned endpoint, void *message) { return syscall2(SYS_moqipc_call, endpoint, (long)message); }
+static inline long moqi_ipc_reply(unsigned endpoint, const void *message) { return syscall2(SYS_moqipc_reply, endpoint, (long)message); }
+static inline long moqi_ipc_notify(unsigned endpoint, unsigned long bits) { return syscall2(SYS_moqipc_notify, endpoint, (long)bits); }
+static inline long moqi_ipc_get_notify(unsigned endpoint) { return syscall1(SYS_moqipc_get_notify, endpoint); }
 
 static inline long moqi_grant_cap(unsigned endpoint, unsigned rights) {
     return syscall2(SYS_moqipc_grant_cap, endpoint, rights);

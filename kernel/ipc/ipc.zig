@@ -132,8 +132,7 @@ pub fn timeoutTick(now_tick: u64) void {
     authority.release(flags);
     for (wake[0..wake_count]) |event| {
         if (event) |wake_event| {
-            const current = task.getTask(wake_event.idx);
-            if (current != null and current.?.tid == wake_event.tid) task.unblockTask(wake_event.idx);
+            task.unblockTaskIfTid(wake_event.idx, wake_event.tid);
         }
     }
 }
@@ -147,6 +146,28 @@ fn cancelWaitLocked(idx: u32, err: IpcError) void {
     task_ipc_state[idx].blocked_generation = 0;
     task_ipc_state[idx].wait_op = .none;
     task_ipc_state[idx].block_start_tick = 0;
+}
+
+const WakeEvent = struct { idx: u32, tid: u32 };
+
+fn appendWakeEvent(events: []?WakeEvent, count: *usize, idx: u32) void {
+    if (idx >= task.MAX_TASKS) return;
+    const live = task.getTask(idx) orelse return;
+    for (events[0..count.*]) |event| {
+        if (event != null and event.?.idx == idx and event.?.tid == live.tid) return;
+    }
+    if (count.* < events.len) {
+        events[count.*] = .{ .idx = idx, .tid = live.tid };
+        count.* += 1;
+    }
+}
+
+fn wakeEvents(events: []?WakeEvent) void {
+    for (events) |event| {
+        if (event) |wake| {
+            task.unblockTaskIfTid(wake.idx, wake.tid);
+        }
+    }
 }
 
 /// IPC operation type.
@@ -364,8 +385,8 @@ pub fn destroyEndpoint(ep: EndpointId, caller_task_idx: u32) bool {
         return false;
     }
 
-    var sender_to_wake: ?u32 = null;
-    var receiver_to_wake: ?u32 = null;
+    var deferred: [MAX_ENDPOINTS * 3]?WakeEvent = @splat(null);
+    var deferred_count: usize = 0;
     const destroyed_owner = endpoints[ep].owner_task_idx;
 
     // Unblock any tasks waiting on this endpoint (unblockTask also
@@ -373,16 +394,16 @@ pub fn destroyEndpoint(ep: EndpointId, caller_task_idx: u32) bool {
     if (endpoints[ep].waiting_sender) |sender_idx| {
         task_ipc_state[sender_idx].wake_error = .invalid_endpoint;
         cancelWaitLocked(sender_idx, .invalid_endpoint);
-        sender_to_wake = sender_idx;
+        appendWakeEvent(&deferred, &deferred_count, sender_idx);
     }
     if (endpoints[ep].waiting_receiver) |recv_idx| {
         task_ipc_state[recv_idx].wake_error = .invalid_endpoint;
         cancelWaitLocked(recv_idx, .invalid_endpoint);
-        receiver_to_wake = recv_idx;
+        appendWakeEvent(&deferred, &deferred_count, recv_idx);
     }
     if (endpoints[ep].delivery_receiver) |recv_idx| {
         cancelWaitLocked(recv_idx, .invalid_endpoint);
-        receiver_to_wake = recv_idx;
+        appendWakeEvent(&deferred, &deferred_count, recv_idx);
     }
     endpoints[ep].active = false;
     endpoints[ep].owner_task_idx = null;
@@ -397,8 +418,6 @@ pub fn destroyEndpoint(ep: EndpointId, caller_task_idx: u32) bool {
     endpoints[ep].pending_notify = 0;
     // An in-flight call is stored on the caller endpoint, not the endpoint
     // being destroyed. Cancel and wake those callers before returning.
-    var call_wake: [MAX_ENDPOINTS]?u32 = @splat(null);
-    var call_wake_count: usize = 0;
     for (1..MAX_ENDPOINTS) |i| {
         if (endpoints[i].active and endpoints[i].reply_callee_task_idx == destroyed_owner) {
             const caller_idx = endpoints[i].owner_task_idx orelse continue;
@@ -406,43 +425,35 @@ pub fn destroyEndpoint(ep: EndpointId, caller_task_idx: u32) bool {
             endpoints[i].reply_callee_tid = null;
             endpoints[i].reply_token = 0;
             cancelWaitLocked(caller_idx, .invalid_endpoint);
-            call_wake[call_wake_count] = caller_idx;
-            call_wake_count += 1;
+            appendWakeEvent(&deferred, &deferred_count, caller_idx);
         }
     }
     ipc_lock.release(flags);
 
-    if (sender_to_wake) |idx| task.unblockTask(idx);
-    if (receiver_to_wake) |idx| task.unblockTask(idx);
-    for (call_wake[0..call_wake_count]) |idx| {
-        if (idx) |task_idx| task.unblockTask(task_idx);
-    }
+    wakeEvents(deferred[0..deferred_count]);
     return true;
 }
 
 /// Destroy every endpoint owned by an exiting task before its slot can be reused.
 pub fn clearEndpointsForTask(task_idx: u32) void {
-    var waiters: [MAX_ENDPOINTS * 3]?u32 = @splat(null);
+    var waiters: [MAX_ENDPOINTS * 3]?WakeEvent = @splat(null);
     var waiter_count: usize = 0;
     const flags = ipc_lock.acquire();
     for (1..MAX_ENDPOINTS) |i| {
         if (endpoints[i].active and endpoints[i].owner_task_idx == task_idx) {
             if (endpoints[i].waiting_sender) |idx| {
                 cancelWaitLocked(idx, .invalid_endpoint);
-                waiters[waiter_count] = idx;
-                waiter_count += 1;
+                appendWakeEvent(&waiters, &waiter_count, idx);
             }
             if (endpoints[i].waiting_receiver) |idx| {
                 cancelWaitLocked(idx, .invalid_endpoint);
-                waiters[waiter_count] = idx;
-                waiter_count += 1;
+                appendWakeEvent(&waiters, &waiter_count, idx);
             }
             if (endpoints[i].delivery_receiver) |idx| {
                 cancelWaitLocked(idx, .invalid_endpoint);
                 task_ipc_state[idx].wait_op = .none;
                 task_ipc_state[idx].block_start_tick = 0;
-                waiters[waiter_count] = idx;
-                waiter_count += 1;
+                appendWakeEvent(&waiters, &waiter_count, idx);
             }
             endpoints[i].active = false;
             endpoints[i].owner_task_idx = null;
@@ -478,8 +489,7 @@ pub fn clearEndpointsForTask(task_idx: u32) void {
             endpoints[i].reply_token = 0;
             if (endpoints[i].owner_task_idx) |caller_idx| {
                 cancelWaitLocked(caller_idx, .invalid_endpoint);
-                waiters[waiter_count] = caller_idx;
-                waiter_count += 1;
+                appendWakeEvent(&waiters, &waiter_count, caller_idx);
             }
         }
     }
@@ -491,9 +501,7 @@ pub fn clearEndpointsForTask(task_idx: u32) void {
     };
     capability.clearCapabilitiesLocked(task_idx);
     ipc_lock.release(flags);
-    for (waiters[0..waiter_count]) |idx| {
-        if (idx) |task_idx_to_wake| task.unblockTask(task_idx_to_wake);
-    }
+    wakeEvents(waiters[0..waiter_count]);
 }
 
 /// Get the task index that owns an endpoint.
