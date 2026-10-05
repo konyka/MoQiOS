@@ -52,6 +52,18 @@ pub fn release(slot: *Slot, reference: *Ref) bool {
     return true;
 }
 
+pub fn releaseAgainst(slot: *Slot, reference: *Ref, current_incarnation: u64) bool {
+    if (reference.released or slot.incarnation != current_incarnation or
+        reference.incarnation != current_incarnation or slot.refs == 0)
+    {
+        reference.released = true;
+        return false;
+    }
+    slot.refs -= 1;
+    reference.released = true;
+    return true;
+}
+
 test "task lifetime refs block reap and reject stale release" {
     var slot = Slot{};
     beginSlot(&slot);
@@ -64,4 +76,19 @@ test "task lifetime refs block reap and reject stale release" {
     beginSlot(&slot);
     try std.testing.expect(slot.incarnation != reference.incarnation);
     try std.testing.expect(!release(&slot, &reference));
+}
+
+test "stale pin release cannot decrement a reused slot" {
+    var slot = Slot{};
+    beginSlot(&slot);
+    var old = pin(&slot).?;
+    try std.testing.expect(markZombie(&slot));
+    try std.testing.expect(!reap(&slot));
+    try std.testing.expect(release(&slot, &old));
+    try std.testing.expect(reap(&slot));
+    beginSlot(&slot);
+    var fresh = pin(&slot).?;
+    try std.testing.expect(!releaseAgainst(&slot, &old, slot.incarnation));
+    try std.testing.expectEqual(@as(u32, 1), slot.refs);
+    try std.testing.expect(release(&slot, &fresh));
 }
