@@ -452,6 +452,20 @@ const Task = struct {
 
 最多 64 个任务（静态数组）。凭证字段在 fork/clone 时继承，默认值 0 (root)。
 
+### 2.1.1 TaskPin 与 slot incarnation
+
+每个任务 slot 都有一个单调递增的 `incarnation`。`reserveSlotLocked` 在 slot
+重新发布前递增它；随后 `zeroSlot` 会清空任务结构，但保留这次 incarnation。这个顺序
+也覆盖内核栈或 fd table 分配失败后再次使用同一 slot 的情况，因此失败的创建不会把
+旧的 deferred 引用与新任务混淆。`TaskPin` 保存 `slot`、`tid` 和 incarnation，释放时
+只有三者仍匹配才会减少新任务的 `operation_refs`；这使旧 pin 不能影响 slot 的后续
+incarnation。incarnation 溢出时跳过 0，回到 1。
+
+这个保证只用于身份和引用计数校验：`TaskPin` 本身不持有 `task_lock`，也不替调用者
+延长其它资源（例如 Mm）的生命周期。调用者必须在访问期间持有 pin，并在处理 deferred
+wakeup 前释放 pin；slot 只有在 zombie、无 operation refs 且满足调度器退出静默期后才
+会被 reap。
+
 ### 2.2 调度器 ✅ Per-CPU 运行队列 + Work-Stealing（2026-06-21 完成）
 
 文件: `proc/sched.zig`, `proc/per_cpu.zig`, `proc/task.zig`

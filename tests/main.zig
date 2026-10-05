@@ -20,6 +20,7 @@ const lifecycle_policy = kt.lifecycle_policy;
 const clone_flags_policy = kt.clone_flags_policy;
 const pidfd_policy = kt.pidfd_policy;
 const pidfd_signal_policy = kt.pidfd_signal_policy;
+const task_slot_lifetime = kt.task_slot_lifetime;
 const nvme_flush_policy = kt.nvme_flush_policy;
 const ipc_lifecycle_policy = kt.ipc_lifecycle_policy;
 const ipc_endpoint_policy = kt.ipc_endpoint_policy;
@@ -150,6 +151,17 @@ test "task lifetime refs protect slot incarnations" {
     try std.testing.expect(task_lifetime_policy.reap(&slot));
     task_lifetime_policy.beginSlot(&slot);
     try std.testing.expect(!task_lifetime_policy.release(&slot, &reference));
+}
+
+test "production task slot reset preserves its incarnation" {
+    var bytes = [_]u8{0} ** 32;
+    const incarnation_offset = 8;
+    const incarnation = @as(*u64, @ptrCast(@alignCast(&bytes[incarnation_offset])));
+    incarnation.* = 7;
+    task_slot_lifetime.resetPreservingIncarnation(&bytes, incarnation);
+    try std.testing.expectEqual(@as(u64, 7), incarnation.*);
+    try std.testing.expectEqual(@as(u8, 0), bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0), bytes[31]);
 }
 
 test "IPC call tokens do not reuse endpoint identifiers" {

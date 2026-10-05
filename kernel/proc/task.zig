@@ -23,6 +23,7 @@ const creation_metadata = @import("creation_metadata.zig");
 const builtin = @import("builtin");
 const std = @import("std");
 const Mm = @import("../mm/mm.zig").Mm;
+const task_slot_lifetime = @import("task_slot_lifetime.zig");
 
 const PAGE_SIZE: u64 = 4096;
 const KERNEL_STACK_PAGES: u64 = 32;
@@ -623,7 +624,10 @@ var kernel_stack_mapped: [MAX_TASKS]bool = [_]bool{false} ** MAX_TASKS;
 /// fields and restore initialized substructures afterwards.
 fn zeroSlot(slot: u32) void {
     const bytes: [*]u8 = @ptrCast(&tasks[slot]);
-    @memset(bytes[0..@sizeOf(Task)], 0);
+    task_slot_lifetime.resetPreservingIncarnation(
+        bytes[0..@sizeOf(Task)],
+        &tasks[slot].incarnation,
+    );
 }
 var task_lock: IrqSpinlock = .{};
 

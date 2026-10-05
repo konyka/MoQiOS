@@ -44,6 +44,7 @@ pub const lifecycle_policy = @import("mm/lifecycle_policy.zig");
 pub const clone_flags_policy = @import("mm/clone_flags_policy.zig");
 pub const pidfd_policy = @import("proc/pidfd_policy.zig");
 pub const pidfd_signal_policy = @import("proc/pidfd_signal_policy.zig");
+pub const task_slot_lifetime = @import("proc/task_slot_lifetime.zig");
 pub const nvme_flush_policy = @import("drivers/nvme_flush_policy.zig");
 pub const ipc_lifecycle_policy = @import("ipc/ipc_lifecycle_policy.zig");
 pub const ipc_timeout_policy = @import("ipc/ipc_timeout_policy.zig");
