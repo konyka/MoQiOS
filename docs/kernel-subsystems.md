@@ -503,6 +503,16 @@ wakeup 前释放 pin；slot 只有在 zombie、无 operation refs 且满足调�
 **API**：`schedule()` / `yield()` / `wakeup(task)` / `sleep(ms)` / `addTask(task)` /
 `per_cpu.enqueueTask(t)` / `per_cpu.tryStealForCurrent()`.
 
+**IPC task lifetime pins**：`send`、`receive`、`reply` 和 `notify` pin a remote
+wake target with `allow_exiting=false` while holding IPC authority, then release
+authority before `unblockTaskIfIncarnation`. `TaskPin` holds an operation
+reference that prevents reap/slot reuse; it does **not** hold `task_lock`.
+Every successful pin is released after the deferred wake. If pin acquisition
+fails (including operation-reference exhaustion), the IPC registration and
+queued message/notification state remain valid and the operation returns
+`.not_ready`. These
+source-contract checks do not replace SMP/QEMU runtime testing.
+
 **意义**：在此之前 SMP 模式下所有 CPU 共享一把全局 `sched_lock` + 静态任务表的亲和性
 扫描，AP 只能跑被显式绑定到自己的任务；现在 AP 通过 work-stealing **真正参与用户任务并行**，
 忙 CPU 主动卸载、闲 CPU 主动拉取。

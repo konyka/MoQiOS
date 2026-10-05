@@ -126,6 +126,7 @@ pub const posix_mq_priority_policy = @import("ipc/posix_mq_priority_policy.zig")
 pub const posix_mq_ownership_policy = @import("ipc/posix_mq_ownership_policy.zig");
 pub const owner_gen_policy = @import("ipc/owner_gen_policy.zig");
 pub const ipc_policy = @import("ipc/ipc_policy.zig");
+pub const ipc_source = @embedFile("ipc/ipc.zig");
 pub const rtc = @import("drivers/rtc.zig");
 pub const dac = @import("fs/dac.zig");
 pub const statx_source = @embedFile("fs/statx.zig");

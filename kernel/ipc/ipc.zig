@@ -643,11 +643,13 @@ fn sendInternal(sender_idx: u32, target_ep: EndpointId, msg: *const Message, req
 
     if (endpoints[target_ep].waiting_receiver) |recv_idx| {
         // Receiver is already waiting — deliver immediately
-        _ = task.getTask(recv_idx) orelse {
-            endpoints[target_ep].waiting_receiver = null;
+        var recv_pin = task.pinTaskByIndex(recv_idx, false) orelse {
+            // Keep the registration intact when the lifetime pin is exhausted;
+            // a later sender or timeout can handle the still-pending wait.
             ipc_lock.release(flags);
             return .not_ready;
         };
+        defer recv_pin.release();
 
         endpoints[target_ep].pending_msg = out_msg;
 
@@ -657,7 +659,7 @@ fn sendInternal(sender_idx: u32, target_ep: EndpointId, msg: *const Message, req
         ipc_lock.release(flags);
         // Re-enqueue only after releasing authority; unblockTask takes the
         // task lock and must not participate in an authority/task lock cycle.
-        task.unblockTask(recv_idx);
+        task.unblockTaskIfIncarnation(recv_pin.slot, recv_pin.tid, recv_pin.incarnation);
         return .success;
     }
 
@@ -744,6 +746,13 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
 
     if (endpoints[ep].waiting_sender) |sender_idx| {
         // Sender is waiting — pick up the message
+        var sender_pin = task.pinTaskByIndex(sender_idx, false) orelse {
+            // Do not consume a message or drop its sender registration unless
+            // the sender can be kept alive through the deferred wake.
+            ipc_lock.release(flags);
+            return .not_ready;
+        };
+        defer sender_pin.release();
         if (endpoints[ep].pending_msg) |msg| {
             buf.* = msg;
             endpoints[ep].pending_msg = null;
@@ -754,14 +763,10 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
             task_ipc_state[caller_idx].blocked_on = 0;
         }
 
-        _ = task.getTask(sender_idx) orelse {
-            ipc_lock.release(flags);
-            return .not_ready;
-        };
         endpoints[ep].waiting_sender = null;
         task_ipc_state[sender_idx].blocked_on = 0;
         ipc_lock.release(flags);
-        task.unblockTask(sender_idx);
+        task.unblockTaskIfIncarnation(sender_pin.slot, sender_pin.tid, sender_pin.incarnation);
         return .success;
     }
 
@@ -1059,10 +1064,15 @@ fn replyToken(token: u64, reply_msg: *const Message) IpcError {
         return .invalid_endpoint;
     }
     if (endpoints[caller_endpoint].owner_task_idx) |owner_idx| {
-        _ = task.getTask(owner_idx) orelse {
+        var owner_pin = task.pinTaskByIndex(owner_idx, false) orelse {
             ipc_lock.release(flags);
             return .not_ready;
         };
+        defer owner_pin.release();
+        if (endpoints[caller_endpoint].owner_tid != owner_pin.tid) {
+            ipc_lock.release(flags);
+            return .invalid_endpoint;
+        }
         // Decrement call depth
         if (task_ipc_state[owner_idx].call_depth > 0) {
             task_ipc_state[owner_idx].call_depth -= 1;
@@ -1075,7 +1085,7 @@ fn replyToken(token: u64, reply_msg: *const Message) IpcError {
         endpoints[caller_endpoint].reply_callee_tid = null;
         endpoints[caller_endpoint].reply_token = 0;
         ipc_lock.release(flags);
-        task.unblockTask(owner_idx);
+        task.unblockTaskIfIncarnation(owner_pin.slot, owner_pin.tid, owner_pin.incarnation);
         return .success;
     }
     ipc_lock.release(flags);
@@ -1111,14 +1121,17 @@ fn notifyInternal(caller: u32, target_ep: EndpointId, bits: NotifyBitmap, requir
 
     // If receiver is blocked on this endpoint, wake it
     if (endpoints[target_ep].waiting_receiver) |recv_idx| {
-        _ = task.getTask(recv_idx) orelse {
+        var recv_pin = task.pinTaskByIndex(recv_idx, false) orelse {
+            // Keep pending notification and registration intact if pinning is
+            // temporarily exhausted.
             ipc_lock.release(flags);
             return .not_ready;
         };
+        defer recv_pin.release();
         endpoints[target_ep].waiting_receiver = null;
         task_ipc_state[recv_idx].blocked_on = 0;
         ipc_lock.release(flags);
-        task.unblockTask(recv_idx);
+        task.unblockTaskIfIncarnation(recv_pin.slot, recv_pin.tid, recv_pin.incarnation);
         return .success;
     }
     ipc_lock.release(flags);

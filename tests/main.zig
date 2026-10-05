@@ -171,6 +171,16 @@ test "IPC call tokens do not reuse endpoint identifiers" {
     try std.testing.expect(!call_reply.tokenBindsCallee(41, 7, 42, 7));
 }
 
+test "IPC direct wake paths pin targets before consuming registrations" {
+    const source = kt.ipc_source;
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, source, "task.pinTaskByIndex("));
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, source, "task.unblockTaskIfIncarnation"));
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, source, ", false) orelse"));
+    try std.testing.expect(std.mem.indexOf(u8, source, "endpoints[caller_endpoint].owner_tid != owner_pin.tid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "Keep the registration intact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "Do not consume a message") != null);
+}
+
 test "native IPC Message ABI remains exactly 256 bytes" {
     const message = @import("kernel_shared").ipc_message;
     try std.testing.expectEqual(@as(usize, 256), @sizeOf(message.Message));
