@@ -537,7 +537,8 @@ pub fn grantCapabilityToTid(caller: u32, recipient_tid: u32, ep: EndpointId, rig
     const task_flags = task.acquireIpcTaskLock();
     defer task.releaseIpcTaskLock(task_flags);
     const caller_task = task.getTask(caller) orelse return @intFromEnum(CapabilityGrantError.permission);
-    if (!endpoints[ep].active or endpoints[ep].owner_task_idx != caller or endpoints[ep].owner_tid != caller_task.tid) return @intFromEnum(CapabilityGrantError.permission);
+    if (@atomicLoad(u32, &caller_task.exiting, .acquire) != 0 or
+        !endpoints[ep].active or endpoints[ep].owner_task_idx != caller or endpoints[ep].owner_tid != caller_task.tid) return @intFromEnum(CapabilityGrantError.permission);
     const recipient = task.findTaskByTidLocked(recipient_tid) orelse return @intFromEnum(CapabilityGrantError.no_process);
     if (@atomicLoad(u32, &task.getTask(recipient).?.exiting, .acquire) != 0) return @intFromEnum(CapabilityGrantError.no_process);
     if (recipient_tid == caller_task.tid) return @intFromEnum(CapabilityGrantError.invalid);
@@ -553,7 +554,8 @@ pub fn grantCapabilityAuthorized(caller: u32, recipient: u32, ep: EndpointId, ri
     const task_flags = task.acquireIpcTaskLock();
     defer task.releaseIpcTaskLock(task_flags);
     const caller_task = task.getTask(caller) orelse return @intFromEnum(CapabilityGrantError.permission);
-    if (!endpoints[ep].active or endpoints[ep].owner_task_idx != caller or endpoints[ep].owner_tid != caller_task.tid) return @intFromEnum(CapabilityGrantError.permission);
+    if (@atomicLoad(u32, &caller_task.exiting, .acquire) != 0 or
+        !endpoints[ep].active or endpoints[ep].owner_task_idx != caller or endpoints[ep].owner_tid != caller_task.tid) return @intFromEnum(CapabilityGrantError.permission);
     if (recipient >= task.MAX_TASKS or task.getTask(recipient) == null or
         @atomicLoad(u32, &task.getTask(recipient).?.exiting, .acquire) != 0) return @intFromEnum(CapabilityGrantError.no_process);
     const slot = capability.grantCapabilityLocked(recipient, ep, endpoint_generations[ep], rights) orelse
@@ -829,8 +831,11 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
     // signal via the same exit-by-signal path the timer tick uses, or report
     // EINTR so the handler can run on return. (.timeout is -4 == -EINTR.)
     const sig_mod = @import("../proc/signal.zig");
-    if (sig_mod.pendingFatal(recv_task)) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
-    if (sig_mod.pendingActionable(recv_task)) return .timeout;
+    const wake_pin = task.pinTaskByIndex(caller_idx, true) orelse return .not_ready;
+    var resumed_task = wake_pin;
+    defer resumed_task.release();
+    if (sig_mod.pendingFatal(resumed_task.task)) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
+    if (sig_mod.pendingActionable(resumed_task.task)) return .timeout;
     return .not_ready;
 }
 
