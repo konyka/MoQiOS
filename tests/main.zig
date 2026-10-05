@@ -173,7 +173,7 @@ test "IPC call tokens do not reuse endpoint identifiers" {
 
 test "IPC direct wake paths pin targets before consuming registrations" {
     const source = kt.ipc_source;
-    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, source, "task.pinTaskByIndex("));
+    try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, source, "task.pinTaskByIndex("));
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, source, "task.unblockTaskIfIncarnation"));
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, source, ", false) orelse"));
     try std.testing.expect(std.mem.indexOf(u8, source, "endpoints[caller_endpoint].owner_tid != owner_pin.tid") != null);

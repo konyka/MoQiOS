@@ -510,8 +510,8 @@ reference that prevents reap/slot reuse; it does **not** hold `task_lock`.
 Every successful pin is released after the deferred wake. If pin acquisition
 fails (including operation-reference exhaustion), the IPC registration and
 queued message/notification state remain valid and the operation returns
-`.not_ready`. These
-source-contract checks do not replace SMP/QEMU runtime testing.
+`.not_ready`. These source-contract checks do not replace SMP/QEMU runtime
+testing.
 
 **意义**：在此之前 SMP 模式下所有 CPU 共享一把全局 `sched_lock` + 静态任务表的亲和性
 扫描，AP 只能跑被显式绑定到自己的任务；现在 AP 通过 work-stealing **真正参与用户任务并行**，
