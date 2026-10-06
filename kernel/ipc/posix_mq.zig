@@ -314,7 +314,6 @@ pub fn detachWaiterForTask(task_idx: u32) void {
     if (task_idx >= task.MAX_TASKS) return;
     var wake: ?WakeToken = null;
     const flags = mq_lock.acquire();
-    defer mq_lock.release(flags);
     if (task.getTask(task_idx)) |t| {
         const waiter = &t.mq_waiter;
         if (waiter.linked and waiter.task_idx == task_idx) {
@@ -460,7 +459,6 @@ pub fn mqUnlink(name_ptr: u64) i64 {
     if (name_len == 0) return EINVAL;
 
     const flags = mq_lock.acquire();
-    defer mq_lock.release(flags);
 
     for (&queues) |*q| {
         if (q.active and str.eql(q.name[0..q.name_len], name_buf[0..name_len])) {
