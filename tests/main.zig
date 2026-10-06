@@ -155,6 +155,16 @@ test "task lifetime refs protect slot incarnations" {
     try std.testing.expect(!task_lifetime_policy.release(&slot, &reference));
 }
 
+test "POSIX MQ descriptor policy validates access and flags" {
+    try std.testing.expect(posix_mq_descriptor_policy.flagsValid(posix_mq_descriptor_policy.O_NONBLOCK));
+    try std.testing.expect(!posix_mq_descriptor_policy.flagsValid(3));
+    try std.testing.expect(!posix_mq_descriptor_policy.flagsValid(0x400));
+    try std.testing.expect(posix_mq_descriptor_policy.canSend(posix_mq_descriptor_policy.O_WRONLY));
+    try std.testing.expect(!posix_mq_descriptor_policy.canSend(posix_mq_descriptor_policy.O_RDONLY));
+    try std.testing.expect(posix_mq_descriptor_policy.canReceive(posix_mq_descriptor_policy.O_RDONLY));
+    try std.testing.expect(!posix_mq_descriptor_policy.canReceive(posix_mq_descriptor_policy.O_WRONLY));
+}
+
 test "production task slot reset preserves its incarnation" {
     var bytes = [_]u8{0} ** 32;
     const incarnation_offset = 8;

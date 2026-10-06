@@ -525,10 +525,6 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
             mq_lock.release(flags);
             return EACCES;
         }
-        if (q.marked_removed) {
-            mq_lock.release(flags);
-            return EBADF;
-        }
 
         if (msg_len > q.msg_size) {
             mq_lock.release(flags);
@@ -679,10 +675,6 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
         if (!descriptor_policy.accessAllows(desc.access, .receive)) {
             mq_lock.release(flags);
             return EACCES;
-        }
-        if (q.marked_removed) {
-            mq_lock.release(flags);
-            return EBADF;
         }
 
         if (q.count == 0) {
@@ -994,7 +986,10 @@ fn findQueueForDescription(task_idx: u32, mqd: u32) ?*MqQueue {
 fn openDescription(queue_idx: u32, q: *MqQueue, owner_idx: u32, oflag: u32) i64 {
     var handle_idx: ?u32 = null;
     for (0..MAX_TASK_MQ_DESCRIPTORS) |i| {
-        if (!task_handles[owner_idx][i].open) { handle_idx = @intCast(i); break; }
+        if (!task_handles[owner_idx][i].open) {
+            handle_idx = @intCast(i);
+            break;
+        }
     }
     const desc_idx = for (0..MAX_OPEN_DESCRIPTIONS) |i| {
         if (!descriptions[i].active) break @as(?u32, @intCast(i));
