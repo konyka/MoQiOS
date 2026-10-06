@@ -3408,3 +3408,18 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   unchanged. `hello107` stresses vm_lock / TLB shootdown / futex / run-queue locks from two
   pinned CPUs (an SMP regression guard; the FIFO property itself is proven by host tests with
   real threads).
+- Zombie teardown (address space, driver state, kernel stack) ran in the BSP timer interrupt
+  under `task_lock` with IRQs off. `reapZombies` / waitpid now only detach; `proc/reaper.zig`
+  tears down with IRQs on. Dead non-leader threads are auto-reaped so the 64-slot table is not
+  leaked. `hello108`: FIFO task max clock gap 553 µs during orphan exit, 100 sequential
+  CLONE_THREAD creates.
+- Duplicate reschedule IPIs are dropped while one is in flight (`resched_pending`).
+- Per-CPU RT bandwidth: 95 of every 100 hardware ticks. A spinning FIFO cannot lock the CPU
+  past that budget. RR stays POSIX (equal peers rotate; no equal peer → lower priority runs),
+  because “never yield to OTHER” stops hello44’s parent forking the second RR child.
+- SMAP on: `stac`/`clac` around `copy_from_user`/`copy_to_user`, SFMASK clears AC, nested
+  interrupts `clac`. Smoke marker `[CPU] SMEP on UMIP on SMAP on`.
+- `deadline_timer_policy` chooses the earlier of the remaining slice and a wait deadline in
+  TSC units. The LAPIC is still periodic 100 Hz until wait subsystems export a global next
+  deadline. PI futex, a preemptible kernel, and an O(1) priority bitmap runqueue remain on
+  the P3 list.

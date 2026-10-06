@@ -70,18 +70,10 @@
 ### 2.3 记录但本轮不实施（P3 路线）
 
 - 可抢占内核（syscall 体 IF=1 + preempt count）：需要逐个审计持有 IrqSpinlock 的路径。
-- TSC-deadline 高精度定时器 / tickless idle：消除 10 ms tick 量化。
+- TSC-deadline 高精度定时器 / tickless idle：策略模块 `deadline_timer_policy` 已落地，
+  内核仍用 100 Hz 周期时钟——要把 wait 的纳秒截止时间汇总成全局最早 deadline 才能改编程。
 - O(1) 优先级位图运行队列：替换 RT 感知的 O(n) `popRtAware`。
-- ~~`IrqSpinlock` 换成 ticket/MCS 锁：TAS 锁在 SMP 下没有公平性，RT 抖动不可界定。~~
-  → 第二轮已实施（§8.1）。
-- SMAP：先做审计模式（所有用户访问收敛到 `copy_from_user`，`userAccessBegin/End` 发 `stac/clac`，SFMASK 加 AC 位），再强制开启。
 - PI futex / 优先级继承：消除 RT 任务经锁发生的优先级反转。
-- 严格 RR 轮转 + RT 带宽限流（`sched_rt_runtime_us` 式 95%）：目前 RR quantum 到期仍可把
-  CPU 交给更低优先级任务。两者必须一起做——没有限流的严格 RR 会让失控的 RT 任务锁死 CPU，
-  `hello44` 的 RR 共享用例在 Linux 上也依赖限流才能让 OTHER 父进程 fork 出第二个子进程。
-- 迟到 IPI 去重（每 CPU `resched_pending`）：重复的 reschedule IPI 仍会让 OTHER 当前任务多让出一次。
-- 僵尸回收移出中断：`reapZombies` 在 BSP tick 的维护块里释放整个地址空间，QEMU 下实测
-  一次 7–15 ms 关中断；应改为 tick 只摘链、由内核线程释放。
 - `CLONE_SIGHAND`/`CLONE_FS` 共享对象与 `exit_group` 线程组语义。
 
 ## 3. 重新设计
@@ -104,11 +96,13 @@
 ### 3.2 CPU 保护位（S4/S5）
 
 - 纯策略 `kernel/arch/x86_64/cpu_protect_policy.zig`：`features(max_leaf, leaf7_ebx, leaf7_ecx)`
-  解析 CPUID.(7,0)，`cr4Bits(features)` 只返回 `CR4.SMEP(20)` / `CR4.UMIP(11)`；SMAP 只探测不开启。
-- `cpu_protect.zig`：BSP 在 `pcid.init` 之后调用 `init()`（打印 `[CPU] SMEP on|off UMIP on|off`），
-  每个 AP 在 `pcid.initThisCpu` 之后调用 `initThisCpu()` 复制同样的 CR4 位。
-- `tools/qemu_run.sh` 新增 `MOQI_CPU`（默认 `qemu64,+smep,+umip`），冒烟要求出现
-  `[CPU] SMEP on UMIP on`。
+  解析 CPUID.(7,0)。第一轮 `cr4Bits` 只返回 `CR4.SMEP(20)` / `CR4.UMIP(11)`；第二轮在
+  CPUID 报告 SMAP 时再置 `CR4.SMAP(21)`（§8.5）。
+- `cpu_protect.zig`：BSP 在 `pcid.init` 之后调用 `init()`（打印
+  `[CPU] SMEP on|off UMIP on|off SMAP on|off`），每个 AP 在 `pcid.initThisCpu` 之后调用
+  `initThisCpu()` 复制同样的 CR4 位。
+- `tools/qemu_run.sh` 的 `MOQI_CPU` 默认 `qemu64,+smep,+umip,+smap`，冒烟要求出现
+  `[CPU] SMEP on UMIP on SMAP on`。
 - `lapic.zig` 所有 ICR 发送（INIT/SIPI/fixed/NMI/广播）收敛到 `icrSend(high, low)`：两次写入
   加投递等待整体在关中断下完成。
 
@@ -183,7 +177,7 @@
 |---|---|---|---|
 | P0 | clone 标志组合、sigreturn RFLAGS 清洗、MQ 描述符 round-trip | 既有 hello35/36/57/58/69/96/98/99/101 | 既有标记 |
 | P1-1 | `sleep_policy`、`rusage_policy` | `hello102`：钉在 CPU0 的 spinner 在 `clock_nanosleep` 期间必须有进展；`alarm` 能以 `EINTR` 打断 `clock_nanosleep` 且 `rem` 合理；`TIMER_ABSTIME`；非法参数 EINVAL；超大 `nanosleep` 不 panic、可被信号打断；`getrusage` 不超过进程寿命 | `hello102: PASS` |
-| P1-2 | `cpu_protect_policy` | `hello103`：子进程执行 `sgdt` 必须被 #GP 杀死（状态 141） | `hello103: PASS`、`[CPU] SMEP on UMIP on` |
+| P1-2 | `cpu_protect_policy` | `hello103`：子进程执行 `sgdt` 必须被 #GP 杀死（状态 141） | `hello103: PASS`、`[CPU] SMEP on UMIP on SMAP on` |
 | P2-1/2 | `sched_pass_policy`、`wake_preempt_policy` | `hello104`：同钉 CPU0，OTHER 线程 futex 唤醒 SCHED_FIFO 线程，唤醒延迟上限 | `hello104: PASS` |
 | P2-3 | `deadline_hint`（含随机 arm/scan 模型测试）、`epoll_policy.timeoutDeadlineNs` | `hello105`：futex/epoll 超时的平均超出量 | `hello105: PASS` |
 | P2-4 | `sched_policy.PopChoice`、`keepsCpuOverIdle` | 既有 `hello44`（RR 共享） | `hello44: PASS` |
@@ -253,3 +247,63 @@
   旧 TAS 内核在 QEMU/TCG 下同样通过（两次：846/855、942/938 次迭代，最大 1.3 ms）——
   两个模拟 CPU 不足以复现饿死，所以 `hello107` 是 SMP 压力回归门禁，公平性本身
   由 host 测试证明。新内核：SMP=2 863/871 次，最大 1.7 ms；SMP=1 629/625 次。
+
+### 8.2 僵尸回收移出中断
+
+问题：`reapZombies` / waitpid 在 `task_lock` + IRQ-off 下走完地址空间、驱动清理和内核栈
+释放，QEMU 下一次 7–15 ms，BSP 上任何优先级的任务都跑不了。死掉的非 leader 线程还占着
+槽位直到整个进程组退出，64 槽任务表会被 64 次 `clone` 耗尽。
+
+设计：纯模块 `reap_policy.zig` 把“可否摘链”和“谁来收”从 teardown 里拆出来。
+`reapZombies` / waitpid 只做 O(1) `detach`（置 `reap_pending`、断开 parent、入队）；
+`proc/reaper.zig` 内核线程（钉在 CPU0、SCHED_FIFO 优先级 1）在开中断、不持 `task_lock`
+的情况下 `teardownDetached`。waitpid 在 `finishReap` 里等到 teardown 完成，观察语义不变。
+`pickReadyForCpu` 的槽扫描抽成 `sched_policy.SlotCursor`，满表 + 非 0 起点不再把移位计数
+溢出成 panic。
+
+验证：host 决策/队列/SlotCursor 测试；`hello108`：SCHED_FIFO 任务在孤儿退出窗口的时钟
+间隙 ≤ 4 ms，128 MB 匿名页仍被回收，连续 100 个 CLONE_THREAD 都能创建。
+SMP=1 回收窗口最大间隙 553 µs；SMP=2 451 µs；100/100 线程。
+
+### 8.3 迟到 reschedule IPI 去重
+
+问题：每次 `notifyWake` 都 `sendIpi`，已经在路上的 IPI 再来一次只会切掉 OTHER 当前任务
+多剩的时间片。
+
+设计：`ipi_kick_policy` + 每 CPU `resched_pending`。kick 时 Xchg 置位，已为 1 则不发；
+IPI 通道入口清掉，下一次 kick 可以再发。
+
+### 8.4 RT 带宽限流
+
+问题：空转的 SCHED_FIFO 可以永远占着 CPU。POSIX RR 在没有同级 peer 时时间片到期本就该
+把 CPU 交给更低优先级（hello44 的 OTHER 父进程靠这个 fork 出第二个 RR 子进程），所以
+“RR 绝不让给 OTHER”不能做——在 QEMU 上 40 轮 RR 忙等短于 1 s 限流窗口，父进程来不及 fork。
+
+设计：`rt_bandwidth_policy.Bucket` 每 CPU 每 100 个硬件 tick 允许 RT 跑 95 tick（Linux
+默认 95%）；FIFO 的 keep-CPU 还要 `mayKeep(!throttled, rank_keeps)`。RR 保持 POSIX：
+同级轮转，没有同级则让给更低优先级。
+
+### 8.5 SMAP
+
+`copy_from_user` / `copy_to_user` 早已用 `userAccessBegin/End` 括住拷贝。
+`cpu_protect_policy.cr4Bits` 现在在 CPUID 报告 SMAP 时置 CR4.SMAP；`stac`/`clac` 在
+x86 `paging.userAccessBegin/End`；syscall `SFMASK` 加 AC 位（0x40700）；`interruptDispatch`
+入口 `clac`，嵌套中断不会顶着 AC=1 跑内核。QEMU 默认 `qemu64,+smep,+umip,+smap`。
+冒烟要求 `[CPU] SMEP on UMIP on SMAP on`。
+
+### 8.6 截止时间策略（未接 LAPIC）
+
+`deadline_timer_policy.nextDeadlineTsc`：取剩余时间片与可选 wait deadline 的较早者。
+内核仍用 100 Hz 周期时钟；要接到 LAPIC TSC-deadline，需要各等待子系统导出“下一个截止
+时间”的全局最小值。
+
+### 8.7 本轮结果
+
+| 指标 | 修复前 | 修复后 | 证据 |
+|---|---|---|---|
+| host 测试 | 378 | 393/393 | `zig build test` |
+| 冒烟 SMP=1 / 2 | — | 全部 PASS，约 26 s | `qemu_smoke.sh` 1 和 2 |
+| CR4 | SMEP+UMIP | +SMAP | `[CPU] SMEP on UMIP on SMAP on` |
+| FIFO 任务看孤儿回收的最大时钟间隙 | 数毫秒级 IRQ-off | 553 / 451 µs | `hello108` |
+| 连续 CLONE_THREAD | 槽位耗尽（&lt;64） | 100/100 | `hello108` |
+| hello44 RR 共享 | — | PASS（POSIX RR，不做“不让给 OTHER”） | `hello44` |

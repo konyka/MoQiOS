@@ -516,6 +516,13 @@ wakeup 前释放 pin；slot 只有在 zombie、无 operation refs 且满足调�
   epoll / timerfd / POSIX timer / alarm / itimer），timerfd 与 POSIX timer 用
   `lib/deadline_hint.zig` 无锁门控；reap、writeback、MoqIPC 超时、TCP、ICMPv6 留在
   `bspSlowMaintenance`（100 ms）。epoll 超时改用 TSC 纳秒截止时间，阻塞时立即让出 CPU。
+- **RT 带宽限流（2026-10 第二轮）**：每 CPU 每 100 个硬件 tick 允许 RT 类跑 95 tick
+  （`rt_bandwidth_policy`）。空转的 SCHED_FIFO 过了预算必须把 CPU 给 OTHER。RR 保持 POSIX：
+  同级轮转，没有同级则时间片到期让给更低优先级（hello44 的 OTHER 父进程靠这个 fork 出
+  第二个 RR 子进程）。
+- **reschedule IPI 去重**：每 CPU `resched_pending`；已有 IPI 在路上则 `kickCpu` 不再发。
+- **僵尸回收在独立线程**：BSP tick / waitpid 只做 O(1) 摘链；`proc/reaper.zig`（钉在 CPU0
+  的低 RT 优先级内核线程）在开中断下释放地址空间。验收 `hello108`。
 
 **API**：`schedule()` / `yield()` / `wakeup(task)` / `sleep(ms)` / `addTask(task)` /
 `per_cpu.enqueueTask(t)` / `per_cpu.tryStealForCurrent()`.
@@ -1984,8 +1991,9 @@ DMA 分配/校验/释放 → munmap MMIO。标记：`hello51: PASS` / `hello51 d
   立即刷新当前 CPU 的活副本。
 - fork 语义：子进程继承位图的**独立副本**（`inheritForFork`，分配失败
   时子进程回退全拒绝并告警，不阻塞 fork）。
-- 退出语义：任务收割（reapZombies）与 waitpid 回收两处拆解点释放位图
-  页（`freeBitmap`，与 `userdrv.cleanupTask` 并列）；execve 保留位图
+- 退出语义：任务收割分两段——`reapZombies` / waitpid 在 `task_lock` 下 O(1) 摘链，
+  地址空间、驱动状态和内核栈由 `proc/reaper.zig` 内核线程在开中断下释放（`freeBitmap`
+  仍与 `userdrv.cleanupTask` 并列，只是改在 `teardownResources` 里调用）；execve 保留位图
   （同 Linux ioperm 语义）。
 
 运行时证明 `hello52`：授予 0x70/0x71 → 读 RTC 秒寄存器并验证合法 BCD
