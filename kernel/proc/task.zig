@@ -58,6 +58,21 @@ pub const WaitNode = struct {
     futex_addr: u64 = 0,
 };
 
+/// Persistent waiter storage for POSIX MQ only. Generic scheduler queues keep
+/// using WaitNode; MQ must survive a syscall stack unwind during exit.
+pub const MqWaiter = struct {
+    task_idx: u32 = 0,
+    task_incarnation: u64 = 0,
+    queue_idx: u32 = 0,
+    queue_generation: u64 = 0,
+    direction: u8 = 0,
+    waiter_generation: u64 = 0,
+    terminal: u8 = 0,
+    linked: bool = false,
+    prev: ?*MqWaiter = null,
+    next: ?*MqWaiter = null,
+};
+
 pub const Task = struct {
     tid: u32,
     /// Monotonic slot incarnation used by deferred kernel references.
@@ -232,6 +247,8 @@ pub const Task = struct {
     /// Pipe reads use task-owned storage so fatal exit cannot leave a stack
     /// node in the global pipe wait queue.
     pipe_read_wait_node: WaitNode = .{ .task_idx = 0 },
+    mq_waiter: MqWaiter = .{},
+    mq_waiter_generation: u64 = 0,
 
     /// Wait queue for parent waitpid — woken when this task exits.
     exit_waiters: ?*WaitNode,
@@ -787,6 +804,7 @@ fn reserveSlotLocked() ?u32 {
     _ = @atomicRmw(u64, &@import("sched.zig").sleep_bm, .And, ~(@as(u64, 1) << @intCast(slot)), .seq_cst);
     tasks[slot].sleep_deadline_ns = 0;
     tasks[slot].stopped = false;
+    tasks[slot].mq_waiter = .{};
     slot_bitmap |= @as(u64, 1) << @intCast(slot);
     tasks[slot].incarnation +%= 1;
     if (tasks[slot].incarnation == 0) tasks[slot].incarnation = 1;
@@ -1086,6 +1104,7 @@ pub fn exitTask(exit_code: i32) void {
     // registration signals an unrelated task after reapZombies recycles the
     // slot (getTask checks occupancy, not identity).
     @import("../ipc/posix_timer.zig").deleteTimersForTask(idx);
+    @import("../ipc/posix_mq.zig").detachWaiterForTask(idx);
     @import("../ipc/posix_mq.zig").clearNotifyForTask(idx);
     @import("../ipc/posix_mq.zig").closeRefsForTask(idx);
     @import("../ipc/ipc.zig").clearEndpointsForTask(idx);

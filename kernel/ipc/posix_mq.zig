@@ -17,6 +17,7 @@ const receive_policy = @import("posix_mq_receive_policy.zig");
 const priority_policy = @import("posix_mq_priority_policy.zig");
 const ownership_policy = @import("posix_mq_ownership_policy.zig");
 const owner_gen_policy = @import("owner_gen_policy.zig");
+const wait_policy = @import("posix_mq_wait_policy.zig");
 
 const MAX_QUEUES: u32 = 16;
 const MAX_MSGS: u32 = 8;
@@ -65,12 +66,15 @@ pub const MqQueue = struct {
     notify_tid: u32 = 0,
     notify_signo: i32 = 0,
     /// Senders blocked on a full queue (mq_timedsend without O_NONBLOCK)
-    send_waiters: ?*task.WaitNode = null,
+    send_waiters: ?*task.MqWaiter = null,
+    send_waiters_tail: ?*task.MqWaiter = null,
     /// Receivers blocked on an empty queue (mq_timedreceive without O_NONBLOCK)
-    recv_waiters: ?*task.WaitNode = null,
+    recv_waiters: ?*task.MqWaiter = null,
+    recv_waiters_tail: ?*task.MqWaiter = null,
 };
 
 var queues: [MAX_QUEUES]MqQueue = @splat(.{});
+var queue_generations: [MAX_QUEUES]u64 = @splat(0);
 var mq_lock: IrqSpinlock = .{};
 var task_refs: [task.MAX_TASKS][MAX_QUEUES]u32 = @splat(@splat(0));
 
@@ -138,14 +142,22 @@ fn isTimedOut(abs_timeout_ns: mq_timeout_policy.Timeout) bool {
 // timerTick from the BSP maintenance tick (sched.zig).
 var wait_deadlines: [task.MAX_TASKS]u64 = @splat(0);
 var wait_incarnations: [task.MAX_TASKS]u64 = @splat(0);
+var wait_queue_indices: [task.MAX_TASKS]u32 = @splat(0);
+var wait_queue_generations: [task.MAX_TASKS]u64 = @splat(0);
+var wait_directions: [task.MAX_TASKS]u8 = @splat(0);
+var wait_generations: [task.MAX_TASKS]u64 = @splat(0);
 pub var mq_wait_bm: u64 = 0;
 
 /// Arm a timed-wait deadline. Called while enqueuing under mq_lock; the tick
 /// only wakes (the waiter unlinks its own node on resume), so this is
 /// race-free with the wait queues.
-fn armWaitDeadline(task_idx: u32, deadline_ns: u64, incarnation: u64) void {
+fn armWaitDeadline(task_idx: u32, deadline_ns: u64, incarnation: u64, queue_idx: u32, queue_generation: u64, direction: u8, waiter_generation: u64) void {
     wait_deadlines[task_idx] = deadline_ns;
     wait_incarnations[task_idx] = incarnation;
+    wait_queue_indices[task_idx] = queue_idx;
+    wait_queue_generations[task_idx] = queue_generation;
+    wait_directions[task_idx] = direction;
+    wait_generations[task_idx] = waiter_generation;
     _ = @atomicRmw(u64, &mq_wait_bm, .Or, @as(u64, 1) << @intCast(task_idx), .seq_cst);
 }
 
@@ -153,16 +165,22 @@ fn armWaitDeadline(task_idx: u32, deadline_ns: u64, incarnation: u64) void {
 fn disarmWaitDeadline(task_idx: u32) void {
     wait_deadlines[task_idx] = 0;
     wait_incarnations[task_idx] = 0;
+    wait_queue_indices[task_idx] = 0;
+    wait_queue_generations[task_idx] = 0;
+    wait_directions[task_idx] = 0;
+    wait_generations[task_idx] = 0;
     _ = @atomicRmw(u64, &mq_wait_bm, .And, ~(@as(u64, 1) << @intCast(task_idx)), .seq_cst);
 }
 
-fn disarmWaitDeadlineIfToken(task_idx: u32, deadline_ns: u64, incarnation: u64) bool {
+fn disarmWaitDeadlineIfToken(task_idx: u32, deadline_ns: u64, incarnation: u64, queue_idx: u32, queue_generation: u64, direction: u8, waiter_generation: u64) bool {
     if (!@import("posix_mq_policy.zig").deadlineTokenMatches(
         deadline_ns,
         incarnation,
         wait_deadlines[task_idx],
         wait_incarnations[task_idx],
     )) return false;
+    if (wait_queue_indices[task_idx] != queue_idx or wait_queue_generations[task_idx] != queue_generation or
+        wait_directions[task_idx] != direction or wait_generations[task_idx] != waiter_generation) return false;
     disarmWaitDeadline(task_idx);
     return true;
 }
@@ -178,46 +196,151 @@ pub fn timerTick(now_ns: u64) void {
         const idx: u32 = i;
         const deadline = wait_deadlines[idx];
         const incarnation = wait_incarnations[idx];
+        const queue_idx = wait_queue_indices[idx];
+        const queue_generation = wait_queue_generations[idx];
+        const direction = wait_directions[idx];
+        const waiter_generation = wait_generations[idx];
         if (now_ns < deadline) continue;
-        if (!disarmWaitDeadlineIfToken(idx, deadline, incarnation)) continue;
-        if (task.pinTaskByIndex(idx, true)) |pin_value| {
-            var pin = pin_value;
-            defer pin.release();
-            if (pin.incarnation == incarnation) {
-                task.unblockTaskIfIncarnation(idx, pin.tid, incarnation);
+        const flags = mq_lock.acquire();
+        if (!disarmWaitDeadlineIfToken(idx, deadline, incarnation, queue_idx, queue_generation, direction, waiter_generation)) {
+            mq_lock.release(flags);
+            continue;
+        }
+        var wake: ?WakeToken = null;
+        if (idx < task.MAX_TASKS) {
+            const t = task.getTask(idx);
+            if (t != null and t.?.mq_waiter.task_incarnation == incarnation and
+                t.?.mq_waiter.waiter_generation == waiter_generation and
+                t.?.mq_waiter.queue_idx == queue_idx and t.?.mq_waiter.queue_generation == queue_generation and
+                t.?.mq_waiter.direction == direction)
+            {
+                const q = if (queue_idx < MAX_QUEUES) &queues[queue_idx] else null;
+                if (q != null and q.?.active and queue_generations[queue_idx] == queue_generation) {
+                    const w = &t.?.mq_waiter;
+                    if (claimAndDetach(q.?, w, direction, .timed_out)) wake = .{ .idx = idx, .incarnation = incarnation };
+                }
             }
         }
-        task.kickRemoteForTask(idx);
+        mq_lock.release(flags);
+        if (wake) |token| wakeTask(token);
     }
 }
 
-/// Remove `node` from `wait_queue` if still linked. Caller holds mq_lock.
-/// wakeOne already pops woken nodes; this only matters if a wake path ever
-/// bypasses the queue (defensive — mirrors futex.removeWaitNode).
-fn unlinkNode(wait_queue: *?*task.WaitNode, node: *task.WaitNode) void {
-    var prev: ?*task.WaitNode = null;
-    var cur = wait_queue.*;
-    while (cur) |n| {
-        if (n == node) {
-            if (prev) |p| {
-                p.next = n.next;
-            } else {
-                wait_queue.* = n.next;
-            }
-            return;
+const WakeToken = struct { idx: u32, incarnation: u64 };
+const WakeBatch = struct {
+    tokens: [task.MAX_TASKS]WakeToken = undefined,
+    count: u32 = 0,
+
+    fn add(self: *WakeBatch, token: WakeToken) void {
+        if (self.count < task.MAX_TASKS) {
+            self.tokens[self.count] = token;
+            self.count += 1;
         }
-        prev = n;
-        cur = n.next;
     }
+
+    fn wake(self: *WakeBatch) void {
+        for (self.tokens[0..self.count]) |token| wakeTask(token);
+    }
+};
+
+fn wakeTask(token: WakeToken) void {
+    if (task.pinTaskByIndex(token.idx, true)) |pin_value| {
+        var pin = pin_value;
+        defer pin.release();
+        if (pin.incarnation == token.incarnation) task.unblockTaskIfIncarnation(token.idx, pin.tid, token.incarnation);
+    }
+    task.kickRemoteForTask(token.idx);
+}
+
+fn waiterList(direction: u8, q: *MqQueue) struct { head: *?*task.MqWaiter, tail: *?*task.MqWaiter } {
+    return if (direction == 0) .{ .head = &q.send_waiters, .tail = &q.send_waiters_tail } else .{ .head = &q.recv_waiters, .tail = &q.recv_waiters_tail };
+}
+
+fn enqueueWaiter(q: *MqQueue, waiter: *task.MqWaiter, direction: u8) void {
+    const list = waiterList(direction, q);
+    waiter.prev = list.tail.*;
+    waiter.next = null;
+    waiter.linked = true;
+    if (list.tail.*) |tail| tail.next = waiter else list.head.* = waiter;
+    list.tail.* = waiter;
+}
+
+fn claimAndDetach(q: *MqQueue, waiter: *task.MqWaiter, direction: u8, terminal: wait_policy.Terminal) bool {
+    if (waiter.terminal != @intFromEnum(wait_policy.Terminal.queued)) return false;
+    const list = waiterList(direction, q);
+    if (waiter.prev) |prev| prev.next = waiter.next else list.head.* = waiter.next;
+    if (waiter.next) |next| next.prev = waiter.prev else list.tail.* = waiter.prev;
+    waiter.prev = null;
+    waiter.next = null;
+    waiter.linked = false;
+    waiter.terminal = @intFromEnum(terminal);
+    return true;
 }
 
 /// Free a queue slot, waking any blocked senders/receivers first so they
 /// re-check and see the queue gone (EBADF) instead of sleeping forever.
 /// Caller holds mq_lock.
-fn freeQueue(q: *MqQueue) void {
-    sched.wakeAll(&q.send_waiters);
-    sched.wakeAll(&q.recv_waiters);
+fn freeQueue(q: *MqQueue, wakes: *WakeBatch) void {
+    while (q.send_waiters) |waiter| {
+        _ = claimAndDetach(q, waiter, 0, .cancelled);
+        wakes.add(.{ .idx = waiter.task_idx, .incarnation = waiter.task_incarnation });
+    }
+    while (q.recv_waiters) |waiter| {
+        _ = claimAndDetach(q, waiter, 1, .cancelled);
+        wakes.add(.{ .idx = waiter.task_idx, .incarnation = waiter.task_incarnation });
+    }
+    q.send_waiters_tail = null;
+    q.recv_waiters_tail = null;
+    queue_generations[qIndex(q)] +%= 1;
+    if (queue_generations[qIndex(q)] == 0) queue_generations[qIndex(q)] = 1;
     q.* = .{};
+}
+
+/// Detach the current task's MQ waiter before any close/reap operation.
+/// This function deliberately owns only mq_lock; exitTask calls it after
+/// releasing task_lock to avoid the task_lock -> mq_lock inversion.
+pub fn detachWaiterForTask(task_idx: u32) void {
+    if (task_idx >= task.MAX_TASKS) return;
+    var wake: ?WakeToken = null;
+    const flags = mq_lock.acquire();
+    defer mq_lock.release(flags);
+    if (task.getTask(task_idx)) |t| {
+        const waiter = &t.mq_waiter;
+        if (waiter.linked and waiter.task_idx == task_idx) {
+            const q_idx = waiter.queue_idx;
+            const q_gen = waiter.queue_generation;
+            const direction = waiter.direction;
+            if (q_idx < MAX_QUEUES and queues[q_idx].active and queue_generations[q_idx] == q_gen) {
+                if (claimAndDetach(&queues[q_idx], waiter, direction, .cancelled)) {
+                    wake = .{ .idx = task_idx, .incarnation = waiter.task_incarnation };
+                }
+            } else {
+                waiter.linked = false;
+                waiter.prev = null;
+                waiter.next = null;
+                waiter.terminal = @intFromEnum(wait_policy.Terminal.cancelled);
+            }
+            disarmWaitDeadline(task_idx);
+        }
+    }
+    mq_lock.release(flags);
+    if (wake) |token| wakeTask(token);
+}
+
+fn qIndex(q: *MqQueue) u32 {
+    return @intCast(@divExact(@intFromPtr(q) - @intFromPtr(&queues[0]), @sizeOf(MqQueue)));
+}
+
+fn queueIndex(q: *MqQueue) u32 {
+    return qIndex(q);
+}
+
+fn wakeHead(q: *MqQueue, direction: u8) ?WakeToken {
+    const list = waiterList(direction, q);
+    const waiter = list.head.* orelse return null;
+    const token = WakeToken{ .idx = waiter.task_idx, .incarnation = waiter.task_incarnation };
+    if (!claimAndDetach(q, waiter, direction, .woken)) return null;
+    return token;
 }
 
 /// mq_open(name, oflag, mode, attr) -> fd or -errno
@@ -281,6 +404,8 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
 
     const idx = slot.?;
     var q = &queues[idx];
+    queue_generations[idx] +%= 1;
+    if (queue_generations[idx] == 0) queue_generations[idx] = 1;
 
     @memset(&q.name, 0);
     for (0..name_len) |j| q.name[j] = name_buf[j];
@@ -335,11 +460,17 @@ pub fn mqUnlink(name_ptr: u64) i64 {
             // Free only once the queue is drained AND the last open reference
             // is gone (mq_close) — an unlinked-but-open queue stays usable.
             if (q.count == 0 and q.open_count == 0) {
-                freeQueue(q);
+                var wakes = WakeBatch{};
+                freeQueue(q, &wakes);
+                mq_lock.release(flags);
+                wakes.wake();
+                return 0;
             }
+            mq_lock.release(flags);
             return 0;
         }
     }
+    mq_lock.release(flags);
     return ENOENT;
 }
 
@@ -385,29 +516,32 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
             // Enqueue while holding mq_lock so a concurrent mq_timedreceive
             // can't wakeOne before we join the queue (lost wakeup) — the
             // sysv_sem.semop pattern.
-            var node: task.WaitNode = .{ .task_idx = 0 };
             const cur_idx = sched.currentTaskIndex() orelse {
                 mq_lock.release(flags);
                 return EAGAIN; // kernel thread: cannot block
             };
-            node.task_idx = cur_idx;
             var cur_pin = task.pinTaskByIndex(cur_idx, false) orelse {
                 mq_lock.release(flags);
                 return EAGAIN;
             };
-            node.next = q.send_waiters;
-            q.send_waiters = &node;
-            if (deadlineNs(abs_timeout_ns)) |deadline| armWaitDeadline(cur_idx, deadline, cur_pin.incarnation);
+            const waiter = &cur_pin.task.mq_waiter;
+            if (waiter.linked) {
+                mq_lock.release(flags);
+                cur_pin.release();
+                return EAGAIN;
+            }
+            cur_pin.task.mq_waiter_generation +%= 1;
+            if (cur_pin.task.mq_waiter_generation == 0) cur_pin.task.mq_waiter_generation = 1;
+            waiter.* = .{ .task_idx = cur_idx, .task_incarnation = cur_pin.incarnation, .queue_idx = queueIndex(q), .queue_generation = queue_generations[queueIndex(q)], .direction = 0, .waiter_generation = cur_pin.task.mq_waiter_generation };
+            enqueueWaiter(q, waiter, 0);
+            if (deadlineNs(abs_timeout_ns)) |deadline| armWaitDeadline(cur_idx, deadline, cur_pin.incarnation, waiter.queue_idx, waiter.queue_generation, waiter.direction, waiter.waiter_generation);
             cur_pin.task.state = .blocked;
             mq_lock.release(flags);
             sched.forceReschedule();
             sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
             if (deadlineNs(abs_timeout_ns) != null) disarmWaitDeadline(cur_idx);
-            // Woken: wakeOne already popped our node; unlink defensively in
-            // case a future wake path bypasses the queue, then re-check the
-            // condition and the deadline from the top.
             const flags2 = mq_lock.acquire();
-            unlinkNode(&q.send_waiters, &node);
+            if (waiter.linked) _ = claimAndDetach(&queues[waiter.queue_idx], waiter, 0, .cancelled);
             mq_lock.release(flags2);
             // Signal kick (sendSignal unblocks without granting): die on a
             // fatal signal, or EINTR so the handler can run on return.
@@ -481,9 +615,10 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
         }
 
         // Wake a receiver blocked on the empty queue
-        _ = sched.wakeOne(&commit_q.?.recv_waiters);
+        const wake = wakeHead(commit_q.?, 1);
 
         mq_lock.release(commit_flags);
+        if (wake) |token| wakeTask(token);
         return 0;
     }
 }
@@ -524,27 +659,32 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
             }
             // Block until a sender posts a message (or mq_unlink wakes us).
             // Enqueue under mq_lock to avoid a lost wakeup (sysv_sem pattern).
-            var node: task.WaitNode = .{ .task_idx = 0 };
             const cur_idx = sched.currentTaskIndex() orelse {
                 mq_lock.release(flags);
                 return EAGAIN; // kernel thread: cannot block
             };
-            node.task_idx = cur_idx;
             var cur_pin = task.pinTaskByIndex(cur_idx, false) orelse {
                 mq_lock.release(flags);
                 return EAGAIN;
             };
-            node.next = q.recv_waiters;
-            q.recv_waiters = &node;
-            if (deadlineNs(abs_timeout_ns)) |deadline| armWaitDeadline(cur_idx, deadline, cur_pin.incarnation);
+            const waiter = &cur_pin.task.mq_waiter;
+            if (waiter.linked) {
+                mq_lock.release(flags);
+                cur_pin.release();
+                return EAGAIN;
+            }
+            cur_pin.task.mq_waiter_generation +%= 1;
+            if (cur_pin.task.mq_waiter_generation == 0) cur_pin.task.mq_waiter_generation = 1;
+            waiter.* = .{ .task_idx = cur_idx, .task_incarnation = cur_pin.incarnation, .queue_idx = queueIndex(q), .queue_generation = queue_generations[queueIndex(q)], .direction = 1, .waiter_generation = cur_pin.task.mq_waiter_generation };
+            enqueueWaiter(q, waiter, 1);
+            if (deadlineNs(abs_timeout_ns)) |deadline| armWaitDeadline(cur_idx, deadline, cur_pin.incarnation, waiter.queue_idx, waiter.queue_generation, waiter.direction, waiter.waiter_generation);
             cur_pin.task.state = .blocked;
             mq_lock.release(flags);
             sched.forceReschedule();
             sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
             if (deadlineNs(abs_timeout_ns) != null) disarmWaitDeadline(cur_idx);
-            // Woken: re-check condition and deadline from the top.
             const flags2 = mq_lock.acquire();
-            unlinkNode(&q.recv_waiters, &node);
+            if (waiter.linked) _ = claimAndDetach(&queues[waiter.queue_idx], waiter, 1, .cancelled);
             mq_lock.release(flags2);
             // Signal kick: die on a fatal signal, or EINTR (see mqTimedSend).
             const sig_mod = @import("../proc/signal.zig");
@@ -612,15 +752,21 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
         }
 
         // Wake a sender blocked on the full queue
-        _ = sched.wakeOne(&commit_q.?.send_waiters);
+        const wake = wakeHead(commit_q.?, 0);
 
         // If queue was marked for removal and now empty and fully closed,
         // free it
         if (commit_q.?.marked_removed and commit_q.?.count == 0 and commit_q.?.open_count == 0) {
-            freeQueue(commit_q.?);
+            var wakes = WakeBatch{};
+            freeQueue(commit_q.?, &wakes);
+            mq_lock.release(commit_flags);
+            if (wake) |token| wakeTask(token);
+            wakes.wake();
+            return result_len;
         }
 
         mq_lock.release(commit_flags);
+        if (wake) |token| wakeTask(token);
         return result_len;
     }
 }
@@ -700,8 +846,13 @@ pub fn mqClose(mqd: u32) i64 {
     task_refs[owner_idx][queue_idx] -= 1;
     q.open_count -|= 1;
     if (q.marked_removed and q.count == 0 and q.open_count == 0) {
-        freeQueue(q);
+        var wakes = WakeBatch{};
+        freeQueue(q, &wakes);
+        mq_lock.release(flags);
+        wakes.wake();
+        return 0;
     }
+    mq_lock.release(flags);
     return 0;
 }
 
@@ -709,15 +860,19 @@ pub fn mqClose(mqd: u32) i64 {
 /// becomes a zombie so unlinked queues cannot retain dead open references.
 pub fn closeRefsForTask(task_idx: u32) void {
     if (task_idx >= task.MAX_TASKS) return;
+    var wakes = WakeBatch{};
     const flags = mq_lock.acquire();
-    defer mq_lock.release(flags);
     for (&queues, 0..) |*q, queue_idx| {
         const refs = task_refs[task_idx][queue_idx];
         if (refs == 0) continue;
         task_refs[task_idx][queue_idx] = 0;
         q.open_count -|= refs;
-        if (q.marked_removed and q.count == 0 and q.open_count == 0) freeQueue(q);
+        if (q.marked_removed and q.count == 0 and q.open_count == 0) {
+            freeQueue(q, &wakes);
+        }
     }
+    mq_lock.release(flags);
+    wakes.wake();
 }
 
 /// Fork duplicates every MQ reference held by the parent task.
