@@ -1549,7 +1549,7 @@ The native `Message` ABI is an exactly 256-byte extern struct: `sender:u64`, `re
 文件: `posix_mq.zig` (519 行)
 
 - 16 个队列上限，8 消息/队列，512 字节/消息
-- mq_open: 创建/打开队列，O_CREAT/O_EXCL/O_NONBLOCK
+- mq_open: 创建/打开队列，O_CREAT/O_EXCL/O_NONBLOCK/O_CLOEXEC；每次成功调用都分配独立的 open description 和 mqd token（当前 token 范围为 300..331）。描述符不属于 VFS `FdTable`，每个 task 最多持有 32 个 MQ handle，系统最多同时保留 256 个 open descriptions；耗尽时返回 `EMFILE`。
   `O_CREAT` 创建时传入的非空 `mq_attr` 必须完整可读；`mq_maxmsg`/`mq_msgsize` 必须为正且不超过
   内核上限（8/512），否则分别返回 `EFAULT`/`EINVAL`，不会静默回退到默认属性。未带
   `O_CREAT` 时 `mode/attr` 按 POSIX 约定忽略。
@@ -1558,8 +1558,10 @@ The native `Message` ABI is an exactly 256-byte extern struct: `sender:u64`, `re
   已到期的合法截止时间，非法指针或 timespec 返回 `EFAULT`/`EINVAL`，不会静默变成无限等待。
   接收缓冲区小于消息长度时返回 `EMSGSIZE` 并保留消息，不会静默截断后出队。
   发送和接收阶段都在 IRQ 自旋锁外执行用户空间拷贝；锁内只完成槽位 reservation，用户拷贝失败时取消 reservation 并保留队列状态。
-- mq_unlink: 删除队列 (延迟释放)
-- MQ descriptor 引用按 task 记录；只有持有该引用的 task 才能执行 MQ 操作或 `mq_close`，fork/clone 会复制子 task 的引用，task 退出时自动释放其引用，避免任意高 fd 操作或关闭其他 task 的队列引用。
+- mq_unlink: 只删除名字空间查找项；已有 token 继续访问原 queue generation，直到所有 open descriptions 关闭且队列排空。之后 slot 才回收；同名 reopen 创建新的 queue generation，旧 token 不会通过 ABA 复用访问新队列。
+- MQ descriptor 按 task handle 解析到带 queue slot、单调 queue generation、访问模式、`O_NONBLOCK`、`O_CLOEXEC` 的 open description；因此同一名字的两次 `mq_open` 有独立 mqd、访问权限和非阻塞状态。send/receive 分别检查 `O_WRONLY`/`O_RDONLY`，发送超过 `mq_msgsize` 返回 `EMSGSIZE`。
+- 只有持有该 task handle 的 task 才能执行 MQ 操作或 `mq_close`。fork/clone 复制 handle 并共享同一个 open description（关闭任一引用只减少该 description 的引用计数）；这保持现有 inheritRefs 行为，但不声称实现 VFS `CLONE_FILES` 的完整跨表语义。task 退出时自动释放其 handles。
+- `mq_getsetattr` 报告调用者自己的 `mq_flags`，坏的 newattr 指针返回 `EFAULT`，只允许改变 `O_NONBLOCK`。`O_CLOEXEC` 在 exec 地址空间切换前关闭当前 task 标记的 MQ handles；未标记的 handles 跨 exec 保留。
 - mq_notify: 注册/注销通知
 - mq_getsetattr: 获取/设置队列属性
 - 系统调用: #186-191（与 x86_64 dispatcher 一致）
