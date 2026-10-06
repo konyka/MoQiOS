@@ -3359,5 +3359,40 @@ The PCID no-flush switch is currently gated off at runtime. Until per-MM epochs 
 quiescence prove the A-to-B-to-A path safe, every non-skipped switch uses a flushing CR3 write.
 Unsupported clone flag combinations remain rejected rather than silently ignored. The supported
 raw `CLONE_VM` TID subset now writes `CLONE_PARENT_SETTID` before publication and clears/wakes
-`CLONE_CHILD_CLEARTID` during exit; threaded/signal-sharing flags remain gated until their full
-ThreadGroup lifecycle is implemented.
+`CLONE_CHILD_CLEARTID` during exit. `CLONE_THREAD` is accepted only together with `CLONE_VM`
+(it maps onto the existing `Task.is_thread`); `CLONE_SIGHAND`/`CLONE_FS` remain gated until their
+shared objects and the full ThreadGroup lifecycle are implemented.
+
+### Realtime / security hardening round (2026-10)
+
+Full plan, findings and design: `docs/realtime-security-hardening-plan.md`. Every item went
+pure-policy host test (RED → GREEN) → QEMU acceptance program that fails on the previous kernel →
+full gates.
+
+- Baseline restored (host tests, x86 build, 9 failing smoke programs): clone `CLONE_THREAD`
+  gate, sigreturn RFLAGS sanitising, POSIX MQ descriptor encoding.
+- `clock_nanosleep` no longer busy-waits with IF=0; `nanosleep`/`clock_nanosleep` validate
+  timespecs (a negative or oversized request used to overflow-panic the kernel) and share one
+  blocking `sleepUntil`; `getrusage` reports real per-task CPU time; alarm/ITIMER_REAL wake
+  blocked tasks. RED: `hello102` saw cpu_us=534679885 for a 0.5 s process and a kernel panic on
+  `nanosleep({-1,0})`.
+- SMEP + UMIP on the BSP and every AP; all xAPIC ICR writes are IRQ-safe. RED: `hello103`'s
+  `sgdt/sidt/sldt/smsw/str` children exited 0; GREEN: all die with #GP (141).
+- Wake preemption via `sched.notifyWake` on every `.blocked → .ready` transition; forced passes
+  are typed (tick/ipi/yield) so IPIs neither advance maintenance nor refill RT quanta, and RT
+  `sched_yield` hands over to equal-rank peers. RED: `hello104` FIFO wake latency 200 ms;
+  GREEN: < 1 ms.
+- Timed waits resolve every BSP tick (timerfd/POSIX timer behind a lock-free deadline hint),
+  the x86 fine-grain tick finally drives MoqIPC timeouts, epoll uses ns deadlines and yields
+  instead of `hlt`-ing in place. RED: `hello105` futex/epoll 20 ms timeouts overshot by
+  ~217/243 ms.
+- Exposed while fixing the above: the run-queue pop could hand the CPU to the idle thread for a
+  full slice while normal tasks were queued (hidden until now by the maintenance tick truncating
+  every slice to 1); `hello44` RR sharing caught it. `epoll_wait` now checks before it yields, so
+  a signal queued before the wait still returns EINTR at once (`hello89`).
+- fbcon scrolled by moving the whole framebuffer (~4 MB, read back from video memory) inside the
+  IRQ-off serial path on every newline. Writes now paint only changed cells; scrolls defer a
+  row-by-row repaint to the idle loop, which backs off while the console is busy. RED: `hello106`
+  console write max 366 ms / mean 126 ms; GREEN: max 460 µs / mean 272 µs. The same cost was being
+  charged to the current task (`hello102` getrusage exceeded the process lifetime) and made up
+  most of the 3.5-minute smoke run, now ~25 s.

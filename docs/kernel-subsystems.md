@@ -499,6 +499,23 @@ wakeup 前释放 pin；slot 只有在 zombie、无 operation refs 且满足调�
   创建者不阻塞，缺陷即刻显形。
 - 时间片 10 个 tick（100ms），LAPIC timer ISR 触发 `schedule()`，调用
   `switchContext(prev, next)`（`arch/x86_64/context.S`）。
+- **唤醒抢占（2026-10）**：所有 `.blocked → .ready` 统一经 `task.readyFromBlockedLocked`，
+  `unblockTask*` / `publishRunnable` 释放 `task_lock` 后调用 `sched.notifyWake(t)`，由
+  `proc/wake_preempt_policy.zig` 决定：本地严格更优 → self-IPI（在 `sysretq`/`iretq` 恢复
+  IF 的第一刻切换）；远程不劣于目标 CPU 当前任务 → reschedule IPI；否则不打扰。原先散落的
+  `kickRemoteForTask` 已删除——eventfd、unix socket、timerfd、SysV sem、MoqIPC、NVMe 等
+  从不通知目标 CPU 的唤醒点自动获得同样语义。验收 `hello104`（同 CPU futex 唤醒 FIFO
+  线程，延迟从 200 ms 降到 <1 ms）。
+- **调度通道分型**：`proc/sched_pass_policy.zig` 区分 `tick` / `ipi` / `yield`。只有 BSP 的
+  硬件 tick 推进维护；强制通道保留 RT 任务原时间片（IPI 不再重置 RR quantum）；RT 任务
+  `sched_yield` 让给同级或更优；FIFO 时间片到期时若有严格更优的就绪任务则让出。
+- **idle 不再抢走就绪任务的 CPU**：`popRtAware` 的选择规则抽成 `sched_policy.PopChoice`，
+  有普通任务时跳过 idle 类（优先级 255）条目；`keepsCpuOverIdle` 保证可运行的当前任务
+  不会因为换出者“先选后入队”而被换成 idle（被改绑到别的 CPU 时仍会离开）。
+- **超时扫描每 tick 一次**：BSP 每个硬件 tick 运行 `bspTimedWaitTick`（futex / POSIX mq /
+  epoll / timerfd / POSIX timer / alarm / itimer），timerfd 与 POSIX timer 用
+  `lib/deadline_hint.zig` 无锁门控；reap、writeback、MoqIPC 超时、TCP、ICMPv6 留在
+  `bspSlowMaintenance`（100 ms）。epoll 超时改用 TSC 纳秒截止时间，阻塞时立即让出 CPU。
 
 **API**：`schedule()` / `yield()` / `wakeup(task)` / `sleep(ms)` / `addTask(task)` /
 `per_cpu.enqueueTask(t)` / `per_cpu.tryStealForCurrent()`.
@@ -762,6 +779,17 @@ const SchedStats = struct {
 - **槽位复用防护**：`reserveSlotLocked` 在槽位可见前清理旧的 sleep_bm 位 / deadline /
   stopped 标志，杜绝上一租户残留把半建任务误唤醒进就绪队列。
 - aarch64/riscv64 的 nanosleep 仍为忙等实现（各自的 syscall 入口），列入后续轮次。
+- **`clock_nanosleep` 共用同一阻塞实现（2026-10）**：此前它在 IF=0 的 syscall 里 `pause`
+  忙等（非特权 DoS，不可被信号打断，`rem` 恒为 0）。现在 `nanosleep` 与
+  `clock_nanosleep` 都经 `proc/sleep_policy.zig` 规划（`planRelative` / `planClock`：
+  `nsec ∉ [0,1e9)`、负 `sec`、未知时钟、未知 flags → EINVAL；截止时间饱和加法，超大
+  请求等价于“睡到被信号打断”，不再整数溢出 panic），再进入 `sleepUntil(deadline, rem)`。
+  `TIMER_ABSTIME` 不回写 `rem`；返回路径调用 `checkSignalsOnSyscallReturn`。
+- **alarm / ITIMER_REAL 唤醒阻塞者**：到期置 SIGALRM 后调用 `signal.kickIfBlocked`，
+  `alarm()` 能以 -EINTR 打断睡眠与阻塞等待。
+- **`getrusage` 报真实 CPU 时间**：`RUSAGE_SELF/THREAD` 返回 `utime_us`（含当前这一段
+  运行的 TSC 增量）与 `stime_us`；`RUSAGE_CHILDREN` 返回 0；其他 `who` → EINVAL，坏指针
+  → EFAULT（纯函数 `proc/rusage_policy.zig`）。验收程序 `hello102`。
 
 ### 2.5 clone() 线程 (CLONE_VM/THREAD + FS_BASE TLS) ✅
 
@@ -1993,8 +2021,9 @@ DMA 分配/校验/释放 → munmap MMIO。标记：`hello51: PASS` / `hello51 d
 
 ### 6.14 fbcon（帧缓冲文本控制台）✅
 
-文件: `kernel/drivers/fbcon.zig`（渲染胶水）、
+文件: `kernel/drivers/fbcon.zig`（帧缓冲 + 锁的胶水）、
 `kernel/drivers/fbcon_core.zig`（纯单元格/光标/滚屏逻辑，主机单测）、
+`kernel/drivers/fbcon_render.zig`（纯渲染器：增量绘制 + 延迟重绘，主机单测）、
 `kernel/drivers/fbcon_font.zig`（内嵌 VGA 8x16 字体，ASCII 32-127，
 数据源自 XFree86 vga.bdf，经 ReactOS FreeLoader，GPL-2.0-or-later）、
 `kernel/arch/x86_64/serial.zig`（挂接点）
@@ -2004,11 +2033,20 @@ DMA 分配/校验/释放 → munmap MMIO。标记：`hello51: PASS` / `hello51 d
   serial → fbcon，fbcon 绝不回调串口。`fbcon_enable` 运行期开关。
 - 渲染路径零分配（IrqSpinlock，IRQ 安全：klog 可在中断上下文经串口
   路径到达）；无帧缓冲或非 32bpp → init 置 no-op。
-- 双缓冲可用时渲染进 back_buffer，每次 writeString 末尾 `present()`
-  交换；滚屏 = 像素行 memmove + 重绘底部两行文本（倒数第二行可能含
-  触发滚屏的那个字形）。光标为两条扫描线的下划线。
-- 语义：`\n` 含回车（串口输出从不发 `\r`）、`\t` 对齐 8 列、
-  `0x08` 退格不擦除、行尾自动折行、末行滚屏。
+- **写路径 O(字节数)（2026-10）**：只绘制变化的单元格（只写显存）；滚屏只置
+  `repaint_pending`，从不在帧缓冲内搬移像素。原实现每个换行都在关中断的串口路径里
+  把整屏（1280x800 约 4 MB）逐字节上移，读回显存是 CPU 对它最慢的访问——QEMU 下
+  每行约 100 ms，所有内核日志和 `write(1)` 都要付这笔账，还会算进当前任务的 CPU 时间。
+- **延迟重绘**：内核 idle 循环调用 `fbcon.idleFlush()`，每持一次锁按单元格网格重绘
+  一行文本，行间开中断，被唤醒的任务可在行间抢占；两次重绘之间的任意次滚屏合并为
+  一次。控制台安静 20 ms（`fbcon_render.QUIET_NS`）后才重绘，写入期间 idle 重绘让路，
+  不与写者争锁。`requestRepaint()` 供 fb0 映射者退出后恢复镜像；panic 路径用无锁的
+  `panicFlush()` 立即补画（idle 不会再运行）。
+- 双缓冲可用时渲染进 back_buffer，写入/重绘完成时 `present()` 交换。光标为两条
+  扫描线的下划线。
+- 语义：`\n` 含回车（串口输出从不发 `\r`）、`\t` 以空格填到下一个 8 列制表位（或
+  行尾），满行则折行，并以 `Effect.rows` 报告被清空的行、`0x08` 退格不擦除、
+  行尾自动折行、末行滚屏。
 
 ### 6.15 PS/2 鼠标（IRQ12 + /dev/mouse）✅
 
