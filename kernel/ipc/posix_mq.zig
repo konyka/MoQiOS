@@ -252,6 +252,17 @@ fn wakeTask(token: WakeToken) void {
     task.kickRemoteForTask(token.idx);
 }
 
+fn cancelQueueWaiters(q: *MqQueue, wakes: *WakeBatch) void {
+    while (q.send_waiters) |waiter| {
+        if (claimAndDetach(q, waiter, 0, .cancelled))
+            wakes.add(.{ .idx = waiter.task_idx, .incarnation = waiter.task_incarnation });
+    }
+    while (q.recv_waiters) |waiter| {
+        if (claimAndDetach(q, waiter, 1, .cancelled))
+            wakes.add(.{ .idx = waiter.task_idx, .incarnation = waiter.task_incarnation });
+    }
+}
+
 fn waiterList(direction: u8, q: *MqQueue) struct { head: *?*task.MqWaiter, tail: *?*task.MqWaiter } {
     return if (direction == 0) .{ .head = &q.send_waiters, .tail = &q.send_waiters_tail } else .{ .head = &q.recv_waiters, .tail = &q.recv_waiters_tail };
 }
@@ -466,7 +477,10 @@ pub fn mqUnlink(name_ptr: u64) i64 {
                 wakes.wake();
                 return 0;
             }
+            var wakes = WakeBatch{};
+            cancelQueueWaiters(q, &wakes);
             mq_lock.release(flags);
+            wakes.wake();
             return 0;
         }
     }
