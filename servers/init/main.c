@@ -221,6 +221,11 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello99");  /* PROT_NONE reservation vs swap-entry encoding (SIGSEGV/EFAULT/restore) */
     run_test("hello100"); /* non-present PTE teardown reclaim + PROT_NONE first-access SIGSEGV */
     run_test("hello101"); /* real swapoff: drain all slots to RAM, disable, re-arm (§6.50) */
+    run_test("hello102"); /* blocking clock_nanosleep, nanosleep validation, real getrusage */
+    run_test("hello103"); /* CR4.UMIP: sgdt/sidt/sldt/smsw/str #GP in user mode */
+    run_test("hello104"); /* SCHED_FIFO wakeup preemption on the waker's CPU */
+    run_test("hello105"); /* futex/epoll timeouts expire on the next tick */
+    run_test("hello106"); /* console writes stay cheap while fbcon scrolls */
 
     start_persistent_services();
 

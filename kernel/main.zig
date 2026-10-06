@@ -103,6 +103,9 @@ export fn _start() callconv(.c) noreturn {
     // SMP bring-up (APs pick the state up via pcid.initThisCpu).
     @import("arch/arch.zig").pcid.init();
 
+    // SMEP/UMIP: before the first user address space, mirrored on each AP.
+    @import("arch/x86_64/cpu_protect.zig").init();
+
     // M2: Address space + DMA (shared portable mm boot — SK-25)
     subsystem_boot.initPortableMm();
 

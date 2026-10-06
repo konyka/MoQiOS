@@ -49,7 +49,7 @@ USER_PROGRAMS=(
     hello2 hello3 hello4 hello5 hello6 hello7 hello8 sh
     hello9 hello10 hello11 hello12 hello13 hello14 hello15 hello16
     hello17 hello18 hello19 hello20 hello21 hello22 hello23 hello24
-    hello25 hello26 hello27 hello28 hello29 hello30 hello31 hello32 hello33 hello34 hello35 hello36 hello37 hello38 hello39 hello40 hello41 hello42 hello43 hello44 hello45 hello46 hello47 hello48 hello49 hello50 hello51 hello52 hello53 hello54 hello56 hello57 hello58 hello59 hello60 hello61 hello62 hello63 hello64 hello65 hello66 hello67 hello68 hello69 hello70 hello71 hello72 hello73 hello74 hello75 hello76 hello77 hello78 hello79 hello80 hello81 hello82 hello83 hello84 hello85 hello86 hello87 hello88 hello89 hello90 hello91 hello92 hello93 hello94 hello95 hello96 hello97 hello98 hello99 hello100 hello101 syslogd devmgr
+    hello25 hello26 hello27 hello28 hello29 hello30 hello31 hello32 hello33 hello34 hello35 hello36 hello37 hello38 hello39 hello40 hello41 hello42 hello43 hello44 hello45 hello46 hello47 hello48 hello49 hello50 hello51 hello52 hello53 hello54 hello56 hello57 hello58 hello59 hello60 hello61 hello62 hello63 hello64 hello65 hello66 hello67 hello68 hello69 hello70 hello71 hello72 hello73 hello74 hello75 hello76 hello77 hello78 hello79 hello80 hello81 hello82 hello83 hello84 hello85 hello86 hello87 hello88 hello89 hello90 hello91 hello92 hello93 hello94 hello95 hello96 hello97 hello98 hello99 hello100 hello101 hello102 hello103 hello104 hello105 hello106 syslogd devmgr
 )
 for program in "${USER_PROGRAMS[@]}"; do
     src="$USER_SRC_DIR/${program}.bin"
@@ -108,6 +108,8 @@ echo "========================================="
 # Overridable for diagnostics:
 #   MOQI_SERIAL      serial target (default: stdio; e.g. file:/tmp/serial.log)
 #   MOQI_SMP         number of CPUs (default: 2)
+#   MOQI_CPU         QEMU CPU model (default: qemu64,+smep,+umip — the kernel
+#                    enables SMEP/UMIP whenever CPUID reports them)
 #   MOQI_DISK        raw disk image path (default: disk.img)
 #   MOQI_NVME        attach an NVMe controller when != 0 (default: 1)
 #   MOQI_NVME_IMG    NVMe scratch image path (default: nvme.img); created and
@@ -123,6 +125,7 @@ echo "========================================="
 #   MOQI_EXTRA_QEMU  extra QEMU args (e.g. "-d int,cpu_reset -D /tmp/qint.log")
 SERIAL_TARGET="${MOQI_SERIAL:-stdio}"
 SMP_COUNT="${MOQI_SMP:-2}"
+CPU_MODEL="${MOQI_CPU:-qemu64,+smep,+umip}"
 MACHINE="${MOQI_MACHINE:-q35}"
 NVME_IMAGE="${MOQI_NVME_IMG:-nvme.img}"
 AHCI_IMAGE="${MOQI_AHCI_IMG:-ahci.img}"
@@ -172,6 +175,7 @@ fi
 # exec so callers that background this script get the QEMU PID (not a leftover shell).
 exec qemu-system-x86_64 \
     -M "$MACHINE" \
+    -cpu "$CPU_MODEL" \
     -m 512M \
     -rtc base=utc,clock=vm \
     -cdrom "$ISO_FILE" \

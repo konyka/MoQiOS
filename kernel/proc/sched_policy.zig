@@ -90,6 +90,41 @@ pub fn beats(a_policy: u8, a_kernel_prio: u8, b_policy: u8, b_kernel_prio: u8) b
     return rankKey(a_policy, a_kernel_prio) < rankKey(b_policy, b_kernel_prio);
 }
 
+/// Run-queue pop choice over entries visited oldest-first (`pos` 0 = tail):
+/// the best-ranked RT entry (ties → oldest, so equal RR peers rotate);
+/// otherwise the oldest normal entry; an idle-class entry (key ≥
+/// MAX_PICK_KEY) only when nothing else is queued.
+pub const PopChoice = struct {
+    best_rt: ?u32 = null,
+    best_rt_key: u16 = OTHER_KEY_BASE,
+    first_normal: ?u32 = null,
+    first_any: ?u32 = null,
+
+    pub fn consider(self: *PopChoice, pos: u32, key: u16) void {
+        if (self.first_any == null) self.first_any = pos;
+        if (key < OTHER_KEY_BASE) {
+            if (key < self.best_rt_key) {
+                self.best_rt_key = key;
+                self.best_rt = pos;
+            }
+        } else if (key < MAX_PICK_KEY and self.first_normal == null) {
+            self.first_normal = pos;
+        }
+    }
+
+    pub fn choice(self: PopChoice) ?u32 {
+        return self.best_rt orelse self.first_normal orelse self.first_any;
+    }
+};
+
+/// A runnable current task keeps its CPU rather than switching to an
+/// idle-class pick: the outgoing task is requeued only after the pick, so the
+/// queue can hold nothing but idle at that moment. A task re-pinned to
+/// another CPU (`allowed_here` false) must still leave.
+pub fn keepsCpuOverIdle(cur_key: u16, next_key: u16, allowed_here: bool) bool {
+    return allowed_here and cur_key < MAX_PICK_KEY and next_key >= MAX_PICK_KEY;
+}
+
 /// False for SCHED_FIFO: a running FIFO task never loses the CPU to a timer
 /// tick — only to blocking or an explicit yield.
 pub fn hasQuantumExpiry(policy: u8) bool {

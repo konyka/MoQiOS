@@ -267,7 +267,6 @@ fn wakeTask(token: WakeToken) void {
         defer pin.release();
         if (pin.incarnation == token.incarnation) task.unblockTaskIfIncarnation(token.idx, pin.tid, token.incarnation);
     }
-    task.kickRemoteForTask(token.idx);
 }
 
 fn cancelQueueWaiters(q: *MqQueue, wakes: *WakeBatch) void {

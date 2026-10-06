@@ -291,7 +291,8 @@ pub fn build(b: *std.Build) void {
         "hello85",  "hello86",  "hello87", "hello88", "hello89",
         "hello90",  "hello91",  "hello92", "hello93", "hello94",
         "hello95",  "hello96",  "hello97", "hello98", "hello99",
-        "hello100", "hello101",
+        "hello100", "hello101", "hello102", "hello103", "hello104",
+        "hello105", "hello106",
     };
     for (c_programs) |name| addCUserProgram(b, name);
 

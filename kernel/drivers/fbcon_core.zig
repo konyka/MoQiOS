@@ -26,8 +26,10 @@ pub const Effect = union(enum) {
     none,
     /// The cell at (x, y) now holds `ch` — redraw that glyph.
     cell: struct { x: u16, y: u16, ch: u8 },
-    /// The grid scrolled up one line — the renderer should move the pixel
-    /// rows and redraw the (now blank) bottom line.
+    /// Cells in rows first..last (inclusive) changed without per-cell
+    /// effects (a tab's blanks) — redraw those rows.
+    rows: struct { first: u16, last: u16 },
+    /// The grid scrolled up one line — every row changed.
     scroll,
 };
 
@@ -87,19 +89,14 @@ pub const Core = struct {
                 return .none;
             },
             '\t' => {
-                // Advance to the next multiple of 8, wrapping like text.
-                const target: u16 = (self.cx + 8) & ~@as(u16, 7);
-                while (self.cx < target) {
-                    const fx = self.cx;
-                    const fy = self.cy;
-                    self.cells[fy][fx] = ' ';
-                    self.cx += 1;
-                    if (self.cx >= self.cols) {
-                        const e = self.newline();
-                        if (e == .scroll) return .scroll;
-                    }
-                }
-                return .none;
+                // Blank up to the next multiple of 8 (or the line end), then
+                // wrap like text when the line is full.
+                const first = self.cy;
+                const target: u16 = @min((self.cx + 8) & ~@as(u16, 7), self.cols);
+                @memset(self.cells[self.cy][self.cx..target], ' ');
+                self.cx = target;
+                if (self.cx >= self.cols and self.newline() == .scroll) return .scroll;
+                return .{ .rows = .{ .first = first, .last = self.cy } };
             },
             0x08 => {
                 if (self.cx > 0) self.cx -= 1;

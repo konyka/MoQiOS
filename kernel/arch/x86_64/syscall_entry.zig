@@ -1272,6 +1272,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         // ── v33.2: clock_nanosleep / epoll_pwait / getcpu ────────────
         247 => { // clock_nanosleep(clockid, flags, req, rem)
             frame.rax = @bitCast(syscallClockNanosleep(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, frame.r10));
+            checkSignalsOnSyscallReturn(frame);
         },
         248 => { // epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)
             const epfd_idx: u32 = @truncate(frame.rdi);
@@ -1667,6 +1668,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         35 => { // nanosleep(req, rem)
             frame.rax = @bitCast(syscallNanosleep(frame.rdi, frame.rsi));
+            checkSignalsOnSyscallReturn(frame);
         },
         37 => { // alarm(seconds) — set SIGALRM timer
             frame.rax = @bitCast(syscallAlarm(@truncate(frame.rdi)));
@@ -1872,7 +1874,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallGetrlimit(@truncate(frame.rdi), frame.rsi));
         },
         98 => { // getrusage(who, usage)
-            frame.rax = @bitCast(syscallGetrusage(@truncate(frame.rdi), frame.rsi));
+            frame.rax = @bitCast(syscallGetrusage(frame.rdi, frame.rsi));
         },
         99 => { // sysinfo(info)
             frame.rax = @bitCast(syscallSysinfo(frame.rdi));
@@ -1882,7 +1884,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallMremap(frame.rdi, frame.rsi, frame.rdx, @truncate(frame.r10), frame.r8));
         },
         324 => { // getrusage(who, usage)
-            frame.rax = @bitCast(syscallGetrusage(@truncate(frame.rdi), frame.rsi));
+            frame.rax = @bitCast(syscallGetrusage(frame.rdi, frame.rsi));
         },
         325 => { // dup(oldfd)
             frame.rax = @bitCast(syscallDup(@truncate(frame.rdi)));
@@ -3373,25 +3375,51 @@ fn syscallAccess(pathname_ptr: u64, mode: u32) i64 {
 /// Signal protocol matches the other wait primitives (devfs_proxy pattern):
 /// a fatal pending signal terminates via exitTask; an actionable one returns
 /// -EINTR with the remaining time written back to `rem`.
-fn syscallNanosleep(req_ptr: u64, rem_ptr: u64) i64 {
-    if (req_ptr == 0 or req_ptr >= 0x0000_8000_0000_0000) return -14;
+const UserTimespec = struct { sec: i64, nsec: i64 };
+
+fn readUserTimespec(ptr: u64) ?UserTimespec {
+    if (ptr == 0 or ptr >= 0x0000_8000_0000_0000) return null;
     const copy = @import("../../mm/copy_from_user.zig");
+    const bo = @import("../../lib/byte_order.zig");
+    var buf: [16]u8 = undefined;
+    if (copy.copyFromUser(&buf, @ptrFromInt(ptr), 16) != 16) return null;
+    return .{ .sec = bo.readI64Le(buf[0..8]), .nsec = bo.readI64Le(buf[8..16]) };
+}
+
+fn writeUserTimespec(ptr: u64, ts: @import("../../proc/sleep_policy.zig").Timespec) bool {
+    const copy = @import("../../mm/copy_from_user.zig");
+    const bo = @import("../../lib/byte_order.zig");
+    var buf: [16]u8 = undefined;
+    bo.writeU64Le(buf[0..8], ts.sec);
+    bo.writeU64Le(buf[8..16], ts.nsec);
+    return copy.copyToUser(@ptrFromInt(ptr), &buf, 16) == 16;
+}
+
+fn syscallNanosleep(req_ptr: u64, rem_ptr: u64) i64 {
+    const sleep_policy = @import("../../proc/sleep_policy.zig");
+    const tsc = @import("../../arch/x86_64/tsc.zig");
+    const ts = readUserTimespec(req_ptr) orelse return -14;
+    return switch (sleep_policy.planRelative(ts.sec, ts.nsec, tsc.nanos())) {
+        .invalid => -22,
+        .immediate => 0,
+        .sleep => |deadline| sleepUntil(deadline, rem_ptr),
+    };
+}
+
+/// Block until the monotonic `deadline` (TSC ns). The task parks in sleep_bm
+/// and sleepTimerTick wakes it, so the CPU keeps taking ticks, running other
+/// tasks and delivering signals for the whole sleep. A zero `rem_ptr` skips
+/// every remaining-time write (TIMER_ABSTIME).
+fn sleepUntil(deadline: u64, rem_ptr: u64) i64 {
+    const sleep_policy = @import("../../proc/sleep_policy.zig");
     const tsc = @import("../../arch/x86_64/tsc.zig");
     const sched = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
     const sig_mod = @import("../../proc/signal.zig");
-    var ts_buf: [16]u8 = undefined;
-    if (copy.copyFromUser(&ts_buf, @ptrFromInt(req_ptr), 16) != 16) return -14;
-    const bo = @import("../../lib/byte_order.zig");
-    const sec: u64 = bo.readU64Le(ts_buf[0..8]);
-    const nsec: u64 = bo.readU64Le(ts_buf[8..16]);
-    const target_ns = sec * 1_000_000_000 + nsec;
-    if (target_ns == 0) return 0;
 
     const cur_idx = sched.currentTaskIndex() orelse return -14;
     const cur = tm.getTask(cur_idx) orelse return -14;
     const bit = @as(u64, 1) << @intCast(cur_idx);
-    const deadline = tsc.nanos() + target_ns;
 
     while (true) {
         // Fatal signal: die through exitTask (fd cleanup + parent wakeup).
@@ -3404,14 +3432,7 @@ fn syscallNanosleep(req_ptr: u64, rem_ptr: u64) i64 {
         if (sig_mod.pendingActionable(cur)) {
             cur.sleep_deadline_ns = 0;
             _ = @atomicRmw(u64, &sched.sleep_bm, .And, ~bit, .seq_cst);
-            const now = tsc.nanos();
-            if (rem_ptr != 0 and rem_ptr < 0x0000_8000_0000_0000) {
-                const left = deadline -| now;
-                var rem_buf: [16]u8 = undefined;
-                bo.writeU64Le(rem_buf[0..8], left / 1_000_000_000);
-                bo.writeU64Le(rem_buf[8..16], left % 1_000_000_000);
-                if (copy.copyToUser(@ptrFromInt(rem_ptr), &rem_buf, 16) != 16) return -14;
-            }
+            if (rem_ptr != 0 and !writeUserTimespec(rem_ptr, sleep_policy.remaining(deadline, tsc.nanos()))) return -14;
             return -4; // EINTR
         }
         if (tsc.nanos() >= deadline) break;
@@ -3431,11 +3452,7 @@ fn syscallNanosleep(req_ptr: u64, rem_ptr: u64) i64 {
     cur.sleep_deadline_ns = 0;
     _ = @atomicRmw(u64, &sched.sleep_bm, .And, ~bit, .seq_cst);
 
-    // Write zero remaining time (fully slept)
-    if (rem_ptr != 0 and rem_ptr < 0x0000_8000_0000_0000) {
-        var zero: [16]u8 = @splat(0);
-        if (copy.copyToUser(@ptrFromInt(rem_ptr), &zero, 16) != 16) return -14;
-    }
+    if (rem_ptr != 0 and !writeUserTimespec(rem_ptr, .{ .sec = 0, .nsec = 0 })) return -14;
     return 0;
 }
 
@@ -3958,46 +3975,24 @@ fn syscallFsync(fd: u32) i64 {
 /// flags: 0 = relative, 1 = TIMER_ABSTIME
 fn syscallClockNanosleep(clockid: u32, flags: u32, req_ptr: u64, rem_ptr: u64) i64 {
     const time_policy = @import("../../ipc/time_policy.zig");
+    const sleep_policy = @import("../../proc/sleep_policy.zig");
+    const tsc = @import("../../arch/x86_64/tsc.zig");
     if (clockid != time_policy.CLOCK_REALTIME and clockid != time_policy.CLOCK_MONOTONIC) return -22;
     if (flags & ~time_policy.TIMER_ABSTIME != 0) return -22;
-    if (req_ptr == 0 or req_ptr >= 0x0000_8000_0000_0000) return -14;
-    const copy = @import("../../mm/copy_from_user.zig");
-    const tsc = @import("../../arch/x86_64/tsc.zig");
-    const bo = @import("../../lib/byte_order.zig");
-
-    var ts_buf: [16]u8 = undefined;
-    if (copy.copyFromUser(&ts_buf, @ptrFromInt(req_ptr), 16) != 16) return -14;
-    const sec = bo.readI64Le(ts_buf[0..8]);
-    const nsec = bo.readI64Le(ts_buf[8..16]);
-    const target_ns = time_policy.timespecToNs(sec, nsec) orelse return -22;
-    if (target_ns == 0) return 0;
-
-    if (flags & 1 != 0) {
-        // TIMER_ABSTIME: sleep until absolute time
-        const delta = time_policy.absoluteDeltaNs(
-            clockid,
-            target_ns,
-            tsc.nanos(),
-            @import("../../proc/time_syscall.zig").wallClockOffset(),
-        ) orelse return -22;
-        const start = tsc.nanos();
-        while (tsc.nanos() - start < delta) {
-            asm volatile ("pause");
-        }
-    } else {
-        // Relative sleep
-        const start = tsc.nanos();
-        while (tsc.nanos() - start < target_ns) {
-            asm volatile ("pause");
-        }
-    }
-
-    // Write zero remaining time
-    if (rem_ptr != 0 and rem_ptr < 0x0000_8000_0000_0000) {
-        var zero: [16]u8 = @splat(0);
-        if (copy.copyToUser(@ptrFromInt(rem_ptr), &zero, 16) != 16) return -14;
-    }
-    return 0;
+    const ts = readUserTimespec(req_ptr) orelse return -14;
+    const plan = sleep_policy.planClock(
+        clockid,
+        flags,
+        ts.sec,
+        ts.nsec,
+        tsc.nanos(),
+        @import("../../proc/time_syscall.zig").wallClockOffset(),
+    );
+    return switch (plan) {
+        .invalid => -22,
+        .immediate => 0,
+        .sleep => |deadline| sleepUntil(deadline, if (sleep_policy.writesRemaining(flags)) rem_ptr else 0),
+    };
 }
 
 /// getcpu(cpu_ptr, node_ptr, unused) — get current CPU and NUMA node.
@@ -5671,17 +5666,25 @@ fn syscallMremap(old_addr: u64, old_size: u64, new_size: u64, flags: u32, new_ad
 /// getrusage(who, usage_ptr) — get resource usage.
 /// who: 0 = RUSAGE_SELF, -1 = RUSAGE_CHILDREN.
 /// Fills struct rusage (144 bytes on x86_64) with timing data.
-fn syscallGetrusage(who: u32, usage_ptr: u64) i64 {
-    _ = who;
-    if (usage_ptr == 0 or usage_ptr >= 0x0000_8000_0000_0000) return -22; // EINVAL
+fn syscallGetrusage(who_raw: u64, usage_ptr: u64) i64 {
+    const rusage_policy = @import("../../proc/rusage_policy.zig");
+    const who = rusage_policy.classify(who_raw) orelse return -22; // EINVAL
+    if (usage_ptr == 0 or usage_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT
 
     const copy = @import("../../mm/copy_from_user.zig");
     const tsc = @import("tsc.zig");
     const sched = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
+    const bo = @import("../../lib/byte_order.zig");
 
     // struct rusage: ru_utime(16) + ru_stime(16) + rest zeroed
     var buf: [144]u8 = @splat(0);
+
+    // Children are not accumulated into their parent yet: report zero usage
+    // rather than inventing numbers.
+    if (who == .children) {
+        return if (copy.copyToUser(@ptrFromInt(usage_ptr), &buf, 144) == 144) 0 else -14;
+    }
 
     const cur_idx = sched.currentTaskIndex() orelse {
         return if (copy.copyToUser(@ptrFromInt(usage_ptr), &buf, 144) == 144) 0 else -14;
@@ -5690,23 +5693,15 @@ fn syscallGetrusage(who: u32, usage_ptr: u64) i64 {
         return if (copy.copyToUser(@ptrFromInt(usage_ptr), &buf, 144) == 144) 0 else -14;
     };
 
-    // Use TSC nanos for total uptime as user+sys time split
-    const total_ns: u64 = tsc.nanos();
-    const total_us = total_ns / 1000;
-    const user_us = total_us * 7 / 10;
-    const sys_us = total_us - user_us;
-
-    // ru_utime: timeval at offset 0 (tv_sec: i64, tv_usec: i64)
-    const user_sec: u64 = user_us / 1_000_000;
-    const user_usec: u64 = user_us % 1_000_000;
-    @memcpy(buf[0..8], &@as([8]u8, @bitCast(user_sec)));
-    @memcpy(buf[8..16], &@as([8]u8, @bitCast(user_usec)));
-
-    // ru_stime: timeval at offset 16
-    const sys_sec: u64 = sys_us / 1_000_000;
-    const sys_usec: u64 = sys_us % 1_000_000;
-    @memcpy(buf[16..24], &@as([8]u8, @bitCast(sys_sec)));
-    @memcpy(buf[24..32], &@as([8]u8, @bitCast(sys_usec)));
+    // Context-switch accounting folds each slice into utime/stime by
+    // privilege class; add the slice this task is running right now.
+    const in_flight = rusage_policy.runtimeUs(0, cur.sched_in_tsc, tsc.read(), tsc.tsc_freq_mhz);
+    const user = rusage_policy.timeval(if (cur.is_user) cur.utime_us +| in_flight else cur.utime_us);
+    const sys = rusage_policy.timeval(if (cur.is_user) cur.stime_us else cur.stime_us +| in_flight);
+    bo.writeU64Le(buf[0..8], user.sec);
+    bo.writeU64Le(buf[8..16], user.usec);
+    bo.writeU64Le(buf[16..24], sys.sec);
+    bo.writeU64Le(buf[24..32], sys.usec);
 
     // ru_maxrss at offset 32 (long): estimate from mmap regions
     var total_pages: u64 = 0;

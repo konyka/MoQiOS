@@ -16,6 +16,8 @@
 /// Among tasks of equal priority, round-robin is used.
 const task = @import("task.zig");
 const sched_policy = @import("sched_policy.zig");
+const sched_pass_policy = @import("sched_pass_policy.zig");
+const wake_preempt_policy = @import("wake_preempt_policy.zig");
 const sched_claim = @import("sched_claim.zig");
 const per_cpu = @import("per_cpu.zig");
 const idt = @import("../arch/arch.zig").interrupts;
@@ -334,6 +336,9 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
                     t.alarm_deadline = 0; // One-shot: clear after firing
                     _ = @atomicRmw(u64, &alarm_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
                     _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
+                    // A sleeper must observe SIGALRM now, not when its own
+                    // deadline passes.
+                    @import("signal.zig").kickIfBlocked(i);
                 }
                 // Check ITIMER_REAL deadline
                 if (t.itimer_real_value != 0 and now_ns >= t.itimer_real_value) {
@@ -346,6 +351,7 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
                         t.itimer_real_value = 0;
                         _ = @atomicRmw(u64, &itimer_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
                     }
+                    @import("signal.zig").kickIfBlocked(i);
                 }
             }
         }
@@ -575,6 +581,68 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
     }
 }
 
+/// Timed-wait expiry — every BSP hardware tick, so futex / mq / epoll /
+/// timerfd / POSIX timer / alarm deadlines resolve within one tick instead
+/// of one maintenance interval. Every callee is bitmap- or hint-gated, so an
+/// idle system pays a few atomic loads per tick.
+fn bspTimedWaitTick() void {
+    const now_ns = @import("../arch/arch.zig").tsc.nanos();
+    const now_tick = idt.getTickCount();
+    @import("../sync/futex.zig").timerTick(now_ns);
+    @import("../ipc/posix_mq.zig").timerTick(now_ns);
+    @import("../net/epoll.zig").timerTick(now_ns);
+    @import("../ipc/timerfd.zig").timerTick(now_tick);
+    @import("../ipc/posix_timer.zig").timerTick(now_tick);
+    alarmTimerTick(now_ns);
+}
+
+/// alarm() / setitimer(ITIMER_REAL) expiry. Bitmap scan — only tasks with
+/// an armed timer are visited. alarm_bm/itimer_bm are modified from syscall
+/// context on other CPUs, hence the atomic loads.
+fn alarmTimerTick(now_ns: u64) void {
+    var bm = @atomicLoad(u64, &alarm_bm, .acquire) |
+        @atomicLoad(u64, &itimer_bm, .acquire);
+    while (bm != 0) {
+        const i: u6 = @truncate(@ctz(bm));
+        bm &= bm - 1;
+        const t = task.getTask(@intCast(i)) orelse continue;
+        if (sched_claim.load(&t.state) == .zombie) continue;
+        if (t.alarm_deadline != 0 and now_ns >= t.alarm_deadline) {
+            t.alarm_deadline = 0; // One-shot: clear after firing
+            _ = @atomicRmw(u64, &alarm_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
+            _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
+            // A sleeper must observe SIGALRM now, not when its own
+            // deadline passes.
+            @import("signal.zig").kickIfBlocked(i);
+        }
+        if (t.itimer_real_value != 0 and now_ns >= t.itimer_real_value) {
+            _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
+            if (t.itimer_real_interval != 0) {
+                t.itimer_real_value = now_ns + t.itimer_real_interval;
+            } else {
+                t.itimer_real_value = 0;
+                _ = @atomicRmw(u64, &itimer_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
+            }
+            @import("signal.zig").kickIfBlocked(i);
+        }
+    }
+}
+
+/// Slow maintenance — every REAP_INTERVAL BSP hardware ticks (~100 ms; the
+/// tcp/icmpv6 deltas below assume exactly that cadence).
+fn bspSlowMaintenance() void {
+    // Lock order: task_lock → pmm.lock (inside reapZombies/freeKernelStack).
+    _ = task.reapZombies();
+    // Only the cheap writeback expiry scan runs here (IRQ-off); the flush
+    // itself is deferred to the writeback kernel thread.
+    _ = @import("../fs/vfs.zig").writebackTimerTick();
+    @import("../ipc/ipc.zig").timeoutTick(idt.getTickCount());
+    // TCP retransmission / TIME_WAIT / FIN_WAIT_2 / delayed ACK.
+    @import("../net/tcp.zig").timerTick(100);
+    // SK-79: NDP incomplete Neighbor Solicitation retransmit (RetransTimer).
+    @import("../net/icmpv6.zig").neighborTimerTick(100);
+}
+
 /// J2 fine-grained tick: identical decision structure to `timerTickLegacy`,
 /// but the pick/switch path runs WITHOUT `sched_lock`. Exclusion against two
 /// CPUs running the same task is provided by the atomic claim protocol
@@ -607,82 +675,20 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
     // when the frame proves the old kernel stack is no longer live.
     flushPendingRelease(frame);
 
-    // Global periodic maintenance — BSP only (one tick source for the whole
-    // system). Every callee carries its own locking (task_lock, vfs, net),
-    // so no scheduler lock is needed here.
-    if (currentCpuId() == 0) {
+    const pc_force = thisCpu();
+    const pass = sched_pass_policy.fromForceFlag(if (pc_force) |p| p.force_reschedule else 0);
+    const force_pick = pass != .tick;
+
+    // Global time-driven work — BSP hardware ticks only (one tick source for
+    // the whole system; IPI / yield passes must not advance timers). Every
+    // callee carries its own locking, so no scheduler lock is needed here.
+    if (currentCpuId() == 0 and sched_pass_policy.isTimeTick(pass)) {
+        bspTimedWaitTick();
         reap_counter +|= 1;
-    }
-    if (currentCpuId() == 0 and reap_counter >= REAP_INTERVAL) {
-        reap_counter = 0;
-        // Lock order: task_lock → pmm.lock (inside reapZombies/freeKernelStack).
-        _ = task.reapZombies();
-        // Drive writeback expiry check (~every 1 s). Only the cheap scan runs
-        // here (IRQ-off); the flush itself is deferred to the writeback kernel
-        // thread — see vfs.writebackTimerTick.
-        const vfs = @import("../fs/vfs.zig");
-        _ = vfs.writebackTimerTick();
-        // Drive timerfd expiration checks
-        const timerfd = @import("../ipc/timerfd.zig");
-        timerfd.timerTick(idt.getTickCount());
-        // Drive POSIX timer expiration checks
-        const posix_timer = @import("../ipc/posix_timer.zig");
-        posix_timer.timerTick(idt.getTickCount());
-        // v53.12: Drive TCP timer (retransmission, TIME_WAIT/FIN_WAIT_2 timeout, delayed ACK)
-        // LAPIC fires at ~100Hz (10ms/tick), REAP_INTERVAL=10 ticks → ~100ms per maintenance pass
-        const tcp = @import("../net/tcp.zig");
-        tcp.timerTick(100);
-        // SK-79: NDP incomplete Neighbor Solicitation retransmit (RetransTimer).
-        const icmpv6 = @import("../net/icmpv6.zig");
-        icmpv6.neighborTimerTick(100);
-        // Drive alarm() / setitimer(ITIMER_REAL) expiration checks
-        // v53.46: Bitmap scan — only check tasks with active timers (O(active) vs O(64)).
-        {
-            const tsc = @import("../arch/arch.zig").tsc;
-            const now_ns = tsc.nanos();
-            // Drive timed futex waits (FUTEX_WAIT/FUTEX_WAIT_BITSET with val2).
-            const futex_mod = @import("../sync/futex.zig");
-            futex_mod.timerTick(now_ns);
-            // Drive timed POSIX mq waits (mq_timedsend/mq_timedreceive with
-            // abs_timeout) — same deadline-bitmap pattern as the futex scan.
-            const posix_mq_mod = @import("../ipc/posix_mq.zig");
-            posix_mq_mod.timerTick(now_ns);
-            // Drive finite epoll waits whose only wake source is timeout.
-            const epoll_mod = @import("../net/epoll.zig");
-            epoll_mod.timerTick(idt.getTickCount());
-            // v53.47: Atomic load — alarm_bm/itimer_bm are modified from syscall context
-            // on other CPUs. Non-atomic read-modify-write could lose newly set bits.
-            var bm = @atomicLoad(u64, &alarm_bm, .acquire) |
-                @atomicLoad(u64, &itimer_bm, .acquire);
-            while (bm != 0) {
-                const i: u6 = @truncate(@ctz(bm));
-                bm &= bm - 1;
-                const t = task.getTask(@intCast(i)) orelse continue;
-                if (sched_claim.load(&t.state) == .zombie) continue;
-                // Check alarm() deadline
-                if (t.alarm_deadline != 0 and now_ns >= t.alarm_deadline) {
-                    t.alarm_deadline = 0; // One-shot: clear after firing
-                    _ = @atomicRmw(u64, &alarm_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
-                    _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
-                }
-                // Check ITIMER_REAL deadline
-                if (t.itimer_real_value != 0 and now_ns >= t.itimer_real_value) {
-                    _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
-                    if (t.itimer_real_interval != 0) {
-                        // Recurring: reschedule next expiration
-                        t.itimer_real_value = now_ns + t.itimer_real_interval;
-                    } else {
-                        // One-shot: clear after firing
-                        t.itimer_real_value = 0;
-                        _ = @atomicRmw(u64, &itimer_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
-                    }
-                }
-            }
+        if (reap_counter >= REAP_INTERVAL) {
+            reap_counter = 0;
+            bspSlowMaintenance();
         }
-        // Force scheduling on the very next tick so the BSP doesn't idle a full
-        // timeslice after this maintenance pass (which skipped scheduling).
-        setSlice(1);
-        return;
     }
 
     // Check for pending signals on current task
@@ -699,9 +705,6 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
             }
         }
     }
-
-    const pc_force = thisCpu();
-    const force_pick = pc_force != null and pc_force.?.force_reschedule != 0;
 
     if (task.getTaskCount() == 0) {
         return;
@@ -733,33 +736,36 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
         return;
     }
 
-    // F3: SCHED_FIFO has no quantum — a running FIFO task is never preempted
-    // by a plain timer tick; it leaves the CPU only by blocking, yielding or
-    // exiting. A reschedule IPI (force_pick) still preempts, and a blocked /
-    // zombie current task is switched out regardless.
+    // F3: SCHED_FIFO has no quantum — at slice expiry a running FIFO task
+    // keeps the CPU unless a strictly better-ranked task is ready (a wake
+    // path that missed its preemption notify is caught here within one
+    // slice). A blocked / zombie current task is switched out regardless.
     if (!force_pick) {
         if (getCurrentIdx()) |ci| {
             if (task.getTask(ci)) |ct| {
                 if (sched_claim.load(&ct.state) == .running and !sched_policy.hasQuantumExpiry(ct.sched_policy)) {
-                    setSlice(TIMESLICE_TICKS);
-                    return;
+                    const cur_key = sched_policy.rankKey(ct.sched_policy, ct.priority);
+                    if (sched_pass_policy.rtKeepsCpu(.tick, cur_key, peekBestRankKey())) {
+                        setSlice(TIMESLICE_TICKS);
+                        return;
+                    }
                 }
             }
         }
     }
 
-    // F3: a reschedule IPI (force_pick) must not preempt a running RT task
-    // for lower-ranked work — every remote wake would otherwise cut into
-    // FIFO/RR execution. Preempt only when a strictly better-ranked runnable
-    // exists on this CPU.
+    // F3: a forced pass must not preempt a running RT task for lower-ranked
+    // work — every remote wake would otherwise cut into FIFO/RR execution.
+    // An IPI preempts only for strictly better work; sched_yield also hands
+    // over to an equal-rank peer. A kept task resumes with the quantum it
+    // had, so IPIs cannot extend an RR slice indefinitely.
     if (force_pick) {
         if (getCurrentIdx()) |ci| {
             if (task.getTask(ci)) |ct| {
                 if (sched_claim.load(&ct.state) == .running and sched_policy.isRtClass(ct.sched_policy)) {
                     const cur_key = sched_policy.rankKey(ct.sched_policy, ct.priority);
-                    const best = peekBestRankKey();
-                    if (best == null or best.? >= cur_key) {
-                        setSlice(TIMESLICE_TICKS);
+                    if (sched_pass_policy.rtKeepsCpu(pass, cur_key, peekBestRankKey())) {
+                        setSlice(sched_pass_policy.sliceAfterKeep(forced_saved_slice[currentCpuId()], TIMESLICE_TICKS));
                         return;
                     }
                 }
@@ -788,6 +794,27 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
         if (!sched_claim.tryClaim(&kt.state)) return;
         break :blk k;
     };
+
+    // The outgoing task is requeued only after this pick, so the queue may
+    // have offered nothing but an idle thread: keep a runnable current.
+    if (getCurrentIdx()) |ci| {
+        if (ci != next_idx) {
+            if (task.getTask(ci)) |ct| {
+                if (task.getTask(next_idx)) |nt| {
+                    const here: i16 = @intCast(currentCpuId());
+                    const allowed_here = ct.cpu_affinity < 0 or ct.cpu_affinity == here;
+                    if (sched_claim.load(&ct.state) == .running and sched_policy.keepsCpuOverIdle(
+                        sched_policy.rankKey(ct.sched_policy, ct.priority),
+                        sched_policy.rankKey(nt.sched_policy, nt.priority),
+                        allowed_here,
+                    )) {
+                        if (sched_claim.releaseToReady(&nt.state)) enqueue(nt);
+                        return;
+                    }
+                }
+            }
+        }
+    }
 
     // DIAG: pinned task scheduled on a foreign CPU (catches both first
     // schedule and switches).
@@ -1176,13 +1203,64 @@ pub fn enqueue(t: *task.Task) void {
     _ = per_cpu.enqueueTask(t);
 }
 
+/// Slice the current task held when a forced pass began, restored if the
+/// pass keeps it (sched_pass_policy.sliceAfterKeep).
+var forced_saved_slice: [syscall_entry.MAX_CPUS]u64 = @splat(0);
+
 /// Called from the reschedule IPI — force an immediate scheduler pass.
 pub fn forceRescheduleFromIpi(frame: *idt.InterruptFrame) void {
+    forcedPass(frame, .ipi);
+}
+
+/// Called from the yield trap (int 252: sched_yield and blocking paths).
+pub fn forceRescheduleFromYield(frame: *idt.InterruptFrame) void {
+    forcedPass(frame, .yield);
+}
+
+fn forcedPass(frame: *idt.InterruptFrame, kind: sched_pass_policy.PassKind) void {
+    // The yield trap is a trap gate (IF may be 1): mask before publishing
+    // the pass kind so a nested timer tick cannot run as a forced pass.
+    const arch_irq = @import("../arch/arch.zig").irq;
+    const irq_flags = arch_irq.saveAndDisable();
+    defer arch_irq.restore(irq_flags);
     const pc = thisCpu();
-    if (pc) |p| p.force_reschedule = 1;
+    if (pc) |p| {
+        if (p.cpu_id < forced_saved_slice.len) forced_saved_slice[p.cpu_id] = getSlice();
+        p.force_reschedule = @intFromEnum(kind);
+    }
     setSlice(0);
     timerTick(frame);
     if (pc) |p| p.force_reschedule = 0;
+}
+
+/// Post-wake hook: `t` just became .ready and sits on its target CPU's
+/// queue. Preempt or kick that CPU when the woken task outranks what runs
+/// there (wake_preempt_policy). Call with no task_lock held. A local
+/// preemption is a self-IPI: it lands at the first IF=1 point — the
+/// syscall's sysretq or the current IRQ's iretq — so the switch happens
+/// at a safe boundary without a call into the scheduler from here.
+pub fn notifyWake(t: *task.Task) void {
+    const se = @import("../arch/arch.zig").syscall;
+    const pc = se.getPerCpuOrNull() orelse return;
+    const target: u8 = per_cpu.targetCpuFor(t);
+    if (target >= se.MAX_CPUS) return;
+    const here: u8 = @intCast(pc.cpu_id);
+    const woken_key = sched_policy.rankKey(t.sched_policy, t.priority);
+    const cur_key = runningRankKeyOn(target);
+    switch (wake_preempt_policy.decide(woken_key, cur_key, target == here)) {
+        .none => {},
+        .preempt_local, .kick_remote => kickCpu(target),
+    }
+}
+
+/// Rank of the task running on `cpu`, or null when none is (lock-free hint).
+fn runningRankKeyOn(cpu: u8) ?u16 {
+    const se = @import("../arch/arch.zig").syscall;
+    const idx = @atomicLoad(u32, &se.percpu_array[cpu].current_task_idx, .acquire);
+    if (idx == NO_TASK_IDX) return null;
+    const ct = task.getTask(idx) orelse return null;
+    if (sched_claim.load(&ct.state) != .running) return null;
+    return sched_policy.rankKey(ct.sched_policy, ct.priority);
 }
 
 /// Ask another CPU to run its scheduler (after a remote task becomes ready).
@@ -1300,6 +1378,8 @@ pub fn deliverSignalToRunningTask(t: *task.Task, iframe: *idt.InterruptFrame) bo
 pub fn kernelIdleLoop() callconv(.c) void {
     while (true) {
         idt.enableIrq();
+        // Deferred console repaint: idle priority, IRQs on between rows.
+        if (comptime builtin.cpu.arch == .x86_64) @import("../drivers/fbcon.zig").idleFlush();
         arch_cpu.waitForInterrupt();
     }
 }

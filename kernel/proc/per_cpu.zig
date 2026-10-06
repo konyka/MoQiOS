@@ -94,46 +94,29 @@ pub const PerCpuRunQueue = struct {
         return t;
     }
 
-    /// F3: RT-aware pop. When no SCHED_FIFO/RR task is queued this behaves
-    /// exactly like `pop()` (FIFO from `tail`). When at least one RT task is
-    /// queued, the best-ranked RT task wins instead; ties (equal RT priority)
-    /// resolve to the OLDEST queued entry (nearest the steal tail) so
-    /// equal-priority SCHED_RR peers rotate. The chosen entry is swapped into
-    /// the FIFO pop slot to keep the ring compact.
+    /// F3: RT-aware pop (choice rule: `sched_policy.PopChoice`). The
+    /// best-ranked RT task wins; ties (equal RT priority) resolve to the
+    /// OLDEST queued entry (nearest the steal tail) so equal-priority
+    /// SCHED_RR peers rotate. Without RT work it is FIFO from `tail`, except
+    /// that idle-class entries are passed over while normal work is queued —
+    /// otherwise an idle thread could hlt through a whole slice with ready
+    /// tasks behind it. The chosen entry is swapped into the FIFO pop slot
+    /// to keep the ring compact.
     pub fn popRtAware(self: *PerCpuRunQueue) ?*task_mod.Task {
         const sp = @import("sched_policy.zig");
         const flags = self.lock.acquire();
         defer self.lock.release(flags);
         if (self.nr_running == 0) return null;
 
-        var best_slot: u32 = 0;
-        var best_key: u16 = 0xFFFF;
-        var any_rt = false;
+        var pick: sp.PopChoice = .{};
         var i: u32 = 0;
         while (i < self.nr_running) : (i += 1) {
-            const slot = (self.tail + i) % QUEUE_SIZE;
-            const t = self.tasks[slot] orelse continue;
-            if (!sp.isRtClass(t.sched_policy)) continue;
-            any_rt = true;
-            const key = sp.rankKey(t.sched_policy, t.priority);
-            if (key < best_key) {
-                best_key = key;
-                best_slot = slot;
-            }
+            const t = self.tasks[(self.tail +% i) % QUEUE_SIZE] orelse continue;
+            pick.consider(i, sp.rankKey(t.sched_policy, t.priority));
         }
 
-        // FIFO pop slot is the oldest entry (tail); an RT winner sitting
-        // elsewhere is swapped into it so the ring stays compact.
         const pop_slot = self.tail % QUEUE_SIZE;
-        if (!any_rt) {
-            const t = self.tasks[pop_slot];
-            self.tasks[pop_slot] = null;
-            self.tail +%= 1;
-            self.nr_running -= 1;
-            self.stats.local_dequeues += 1;
-            return t;
-        }
-
+        const best_slot = (self.tail +% (pick.choice() orelse 0)) % QUEUE_SIZE;
         const chosen = self.tasks[best_slot];
         if (best_slot != pop_slot) {
             // Keep the displaced entry by moving it into the chosen slot.

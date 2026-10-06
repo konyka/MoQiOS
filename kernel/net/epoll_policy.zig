@@ -24,6 +24,13 @@ pub fn temporaryMask(mask: u64) u64 {
     return mask & ~UNBLOCKABLE_MASK;
 }
 
+/// Absolute monotonic deadline of a positive epoll_wait timeout; null for
+/// 0 (poll) and negative (infinite). Saturates instead of wrapping.
+pub fn timeoutDeadlineNs(now_ns: u64, timeout_ms: i32) ?u64 {
+    if (timeout_ms <= 0) return null;
+    return now_ns +| @as(u64, @intCast(timeout_ms)) * std.time.ns_per_ms;
+}
+
 pub const TimespecResult = union(enum) {
     milliseconds: i32,
     invalid,

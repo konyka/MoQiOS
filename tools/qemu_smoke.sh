@@ -397,6 +397,22 @@ while [ "$SECONDS" -lt "$deadline" ]; do
            ! grep -q "hello101: FAIL" "$LOG_FILE" &&
            grep -q "hello101: PASS" "$LOG_FILE" &&
           grep -q "hello101 done" "$LOG_FILE" &&
+           grep -q "\[CPU\] SMEP on UMIP on" "$LOG_FILE" &&
+           ! grep -q "hello102: FAIL" "$LOG_FILE" &&
+           grep -q "hello102: PASS" "$LOG_FILE" &&
+          grep -q "hello102 done" "$LOG_FILE" &&
+           ! grep -q "hello103: FAIL" "$LOG_FILE" &&
+           grep -q "hello103: PASS" "$LOG_FILE" &&
+          grep -q "hello103 done" "$LOG_FILE" &&
+           ! grep -q "hello104: FAIL" "$LOG_FILE" &&
+           grep -q "hello104: PASS" "$LOG_FILE" &&
+          grep -q "hello104 done" "$LOG_FILE" &&
+           ! grep -q "hello105: FAIL" "$LOG_FILE" &&
+           grep -q "hello105: PASS" "$LOG_FILE" &&
+          grep -q "hello105 done" "$LOG_FILE" &&
+           ! grep -q "hello106: FAIL" "$LOG_FILE" &&
+           grep -q "hello106: PASS" "$LOG_FILE" &&
+          grep -q "hello106 done" "$LOG_FILE" &&
         grep -q "hello81: PASS" "$LOG_FILE" &&
      grep -q "hello81 done" "$LOG_FILE" &&
      ! grep -q "hello82: FAIL" "$LOG_FILE" &&

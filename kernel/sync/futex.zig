@@ -154,7 +154,6 @@ pub fn timerTick(now_ns: u64) void {
         if (!unlinked) continue; // Already woken or cleaned up
         // Republish like wakeN: a bare .ready starves on busy CPUs.
         task_mod.unblockTask(idx);
-        task_mod.kickRemoteForTask(idx);
     }
 }
 
@@ -257,10 +256,9 @@ pub fn wakeN(bucket: *FutexBucket, key: futex_key.Key, count: u32) u64 {
     // v53.51: Republish woken tasks outside the bucket lock. A bare
     // `state = .ready` never re-enters a run queue and starves on busy CPUs
     // (pickNext drains the per-CPU queue before the bitmap fallback);
-    // unblockTask re-enqueues, kickRemoteForTask IPIs the target CPU.
+    // unblockTask re-enqueues and preempts / IPIs the target CPU as needed.
     for (woken_idx[0..woken]) |idx| {
         task_mod.unblockTask(idx);
-        task_mod.kickRemoteForTask(idx);
     }
     return @intCast(woken);
 }

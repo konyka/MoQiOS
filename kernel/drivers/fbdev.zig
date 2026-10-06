@@ -48,6 +48,8 @@ fn maybeRestoreMirrorLocked() void {
     const fbcon = @import("fbcon.zig");
     if (fbcon.fbcon_enable or !fbcon.isActive()) return;
     fbcon.fbcon_enable = true;
+    // The screen still shows the mapping owner's pixels.
+    fbcon.requestRepaint();
     const serial = @import("../arch/arch.zig").serial;
     serial.writeString("[fbcon] mirror restored (no fb0 mappings left)\n");
 }

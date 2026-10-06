@@ -109,15 +109,13 @@ pub fn sendSignal(target_tid: u32, signum: u32) bool {
 }
 
 /// Wake a blocked task so it can observe an actionable pending signal on
-/// resume. unblockTask re-enqueues it, kickRemoteForTask IPIs the CPU it last
-/// ran on.
+/// resume. unblockTask re-enqueues it and preempts / IPIs its CPU as needed.
 pub fn kickIfBlocked(idx: u32) void {
     const t = task.getTask(idx) orelse return;
     // Keep blocked waits asleep for signals masked by the current wait mask.
     // The pending bit remains set and can wake the task after the mask changes.
     if (t.state == .blocked and pendingActionable(t)) {
         task.unblockTask(idx);
-        task.kickRemoteForTask(idx);
     }
 }
 
@@ -137,9 +135,7 @@ pub fn stopTask(t: *task.Task) void {
 pub fn continueTask(t: *task.Task) void {
     if (!t.stopped) return;
     t.stopped = false;
-    const idx = t.self_idx;
-    task.unblockTask(idx);
-    task.kickRemoteForTask(idx);
+    task.unblockTask(t.self_idx);
 }
 
 /// Broadcast a signal to every task in a process group (kill(-pgid) and the

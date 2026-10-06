@@ -14,6 +14,7 @@ const std = @import("std");
 const sched = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+const DeadlineHint = @import("../lib/deadline_hint.zig").DeadlineHint;
 const idt = @import("../arch/arch.zig").interrupts;
 const tsc = @import("../arch/arch.zig").tsc;
 const bo = @import("../lib/byte_order.zig");
@@ -74,6 +75,9 @@ var timer_pool: [MAX_TIMERFD_INSTANCES]TimerInstance = @splat(.{});
 
 /// Global lock protecting the timer pool.
 var timer_lock: IrqSpinlock = .{};
+
+/// Earliest armed expiry_tick: lets the per-tick scan skip timer_lock.
+var expiry_hint: DeadlineHint = .{};
 
 fn timespecToNs(ts: Timespec) ?u64 {
     return time_policy.timespecToNs(ts.tv_sec, ts.tv_nsec);
@@ -193,6 +197,7 @@ pub fn timerfdSettime(timerfd_idx: u32, flags: u32, new_value: *const Itimerspec
 
     inst.active = true;
     inst.expirations = 0;
+    expiry_hint.arm(inst.expiry_tick);
 
     return 0;
 }
@@ -368,7 +373,9 @@ pub fn timerfdGetExpirations(timerfd_idx: u32) u64 {
 /// Called from the scheduler timer tick.
 /// Checks all active timers for expiration and wakes waiters.
 pub fn timerTick(current_tick: u64) void {
+    if (!expiry_hint.due(current_tick)) return;
     var saved = timer_lock.acquire();
+    expiry_hint.beginScan();
 
     for (&timer_pool, 0..) |*inst, i| {
         if (!inst.valid or !inst.active) continue;
@@ -389,6 +396,7 @@ pub fn timerTick(current_tick: u64) void {
                     std.math.maxInt(u64)
                 else
                     current_tick + interval_ticks;
+                expiry_hint.arm(inst.expiry_tick);
             } else {
                 // One-shot timer: stop
                 inst.expirations +|= 1;
@@ -414,6 +422,8 @@ pub fn timerTick(current_tick: u64) void {
             epoll_mod.epollNotify(.timerfd, idx, epoll_mod.EPOLLIN);
             // Re-acquire for next iteration
             saved = timer_lock.acquire();
+        } else {
+            expiry_hint.arm(inst.expiry_tick);
         }
     }
 

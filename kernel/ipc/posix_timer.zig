@@ -5,6 +5,7 @@
 /// Signal delivery is simplified: overrun count is tracked, optional SIGEV_SIGNAL queued.
 const std = @import("std");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+const DeadlineHint = @import("../lib/deadline_hint.zig").DeadlineHint;
 const idt = @import("../arch/arch.zig").interrupts;
 const copy = @import("../mm/copy_from_user.zig");
 const sched_mod = @import("../proc/sched.zig");
@@ -73,6 +74,8 @@ const PosixTimer = struct {
 // Global pool
 var timers: [MAX_TIMERS]PosixTimer = @splat(.{});
 var lock: IrqSpinlock = .{};
+/// Earliest armed expiry_tick: lets the per-tick scan skip `lock`.
+var expiry_hint: DeadlineHint = .{};
 
 /// Convert ticks to nanoseconds (saturating).
 fn ticksToNs(ticks: u64) u64 {
@@ -254,6 +257,7 @@ pub fn timerSettime(timerid: u32, flags: u32, new_value_ptr: u64, old_value_ptr:
         }
         t.active = true;
         t.overrun = 0;
+        expiry_hint.arm(t.expiry_tick);
     }
 
     lock.release(saved);
@@ -355,13 +359,17 @@ pub fn deleteTimersForTask(task_idx: u32) void {
 
 /// Called from scheduler timer tick. Checks POSIX timers for expiration.
 pub fn timerTick(current_tick: u64) void {
+    if (!expiry_hint.due(current_tick)) return;
     const saved = lock.acquire();
     defer lock.release(saved);
+    expiry_hint.beginScan();
 
     for (&timers) |*t| {
         if (!t.valid or !t.active) continue;
 
-        if (current_tick >= t.expiry_tick) {
+        if (current_tick < t.expiry_tick) {
+            expiry_hint.arm(t.expiry_tick);
+        } else {
             t.overrun +|= 1;
 
             if (t.interval_ns > 0) {
@@ -372,6 +380,7 @@ pub fn timerTick(current_tick: u64) void {
                     std.math.maxInt(u64)
                 else
                     current_tick + interval_ticks;
+                expiry_hint.arm(t.expiry_tick);
             } else {
                 // One-shot: stop
                 t.active = false;

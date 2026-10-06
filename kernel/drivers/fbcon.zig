@@ -6,29 +6,27 @@
 /// console and a missing framebuffer (or non-32bpp mode) turns fbcon into a
 /// no-op. The `fbcon_enable` gate can silence the mirror at runtime.
 /// Text state (cells, cursor, scroll) lives in the pure, host-tested
-/// fbcon_core.zig; this file only renders the core's effects. No allocation
-/// anywhere — the render path is IRQ-safe under its own IrqSpinlock (klog
-/// can log from interrupt context through the serial path).
-const builtin = @import("builtin");
-const std = @import("std");
+/// fbcon_core.zig and painting in fbcon_render.zig; this file supplies the
+/// framebuffer and the lock. No allocation anywhere — the write path is
+/// IRQ-safe under its own IrqSpinlock (klog can log from interrupt context
+/// through the serial path) and does O(bytes) work; scroll repaints run from
+/// the idle loop, one text row per lock hold.
 const fb = @import("framebuffer.zig");
 const core_mod = @import("fbcon_core.zig");
 const font = @import("fbcon_font.zig");
+const render = @import("fbcon_render.zig");
+const tsc = @import("../arch/arch.zig").tsc;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 /// Runtime gate: when false the serial mirror is silenced (serial output
 /// itself is unaffected).
 pub var fbcon_enable: bool = true;
 
-const FG: u32 = 0x00CC_CCCC; // light gray text
-const BG: u32 = 0x0000_0000; // black background
-const CURSOR: u32 = 0x00CC_CCCC;
-
 var lock: IrqSpinlock = .{};
 var active: bool = false;
 var core: core_mod.Core = undefined;
-var last_cx: u16 = 0;
-var last_cy: u16 = 0;
+var renderer: render.Renderer = .{};
+var last_write_ns: u64 = 0;
 
 /// Arm the console on the Limine framebuffer. No-op without a framebuffer
 /// or in a non-32bpp mode (the renderer writes u32 pixels).
@@ -49,7 +47,7 @@ pub fn init() void {
         return;
     }
     core = core_mod.Core.init(cols, rows);
-    fb.fillRect(0, 0, fb.getWidth(), fb.getHeight(), BG);
+    fb.fillRect(0, 0, fb.getWidth(), fb.getHeight(), render.BG);
     active = true;
 
     serial.writeString("[fbcon] ");
@@ -69,65 +67,50 @@ pub fn isActive() bool {
 /// serial → fbcon, and the UART must stay the primary console).
 pub fn writeString(s: []const u8) void {
     if (!active or !fbcon_enable) return;
-    const buf = fb.rawBuffer() orelse return;
+    const surf = surface() orelse return;
+    @atomicStore(u64, &last_write_ns, tsc.nanos(), .monotonic);
     const flags = lock.acquire();
     defer lock.release(flags);
-    const pitch = fb.getPitch();
-    for (s) |ch| {
-        switch (core.putChar(ch)) {
-            .none => {},
-            .cell => |c| drawGlyph(buf, pitch, c.x, c.y, c.ch),
-            .scroll => doScroll(buf, pitch),
-        }
+    renderer.write(&core, surf, s);
+    if (!renderer.repaint_pending) fb.present();
+}
+
+/// Idle-loop hook: advance a pending repaint one row per lock hold, so the
+/// IRQ-off window stays one text row long and a woken task preempts the
+/// repaint between rows. Backs off while the console is being written.
+pub fn idleFlush() void {
+    if (!active) return;
+    const surf = surface() orelse return;
+    while (true) {
+        if (!render.repaintMayRun(tsc.nanos(), @atomicLoad(u64, &last_write_ns, .monotonic))) return;
+        const flags = lock.acquire();
+        const step: render.Step = if (fbcon_enable) renderer.repaintStep(&core, surf) else .idle;
+        if (step == .done) fb.present();
+        lock.release(flags);
+        if (step != .more) return;
     }
-    // Hardware cursor: restore the glyph at the old position, paint a
-    // two-scanline underline at the new one.
-    if (last_cx != core.cx or last_cy != core.cy) {
-        drawGlyph(buf, pitch, last_cx, last_cy, core.cellAt(last_cx, last_cy));
-        drawCursor(buf, pitch, core.cx, core.cy);
-        last_cx = core.cx;
-        last_cy = core.cy;
-    }
+}
+
+/// Repaint everything on the next idle flush (the screen no longer shows the
+/// grid, e.g. after a userspace fb0 owner let go).
+pub fn requestRepaint() void {
+    if (!active) return;
+    const flags = lock.acquire();
+    defer lock.release(flags);
+    renderer.requestRepaint();
+}
+
+/// Panic path: the idle loop will never run again, so repaint now. Lock-free
+/// — the other CPUs are parked and may have been parked holding the lock.
+pub fn panicFlush() void {
+    if (!active or !fbcon_enable) return;
+    const surf = surface() orelse return;
+    if (!renderer.repaint_pending) return;
+    while (renderer.repaintStep(&core, surf) == .more) {}
     fb.present();
 }
 
-fn drawGlyph(buf: [*]u8, pitch: u32, gx: u16, gy: u16, ch: u8) void {
-    const glyph = if (ch >= font.FIRST and ch <= font.LAST)
-        font.data[ch - font.FIRST]
-    else
-        font.data['?' - font.FIRST];
-    const base = @as(u64, gy) * font.GLYPH_H * pitch + @as(u64, gx) * font.GLYPH_W * 4;
-    for (glyph, 0..) |bits, row| {
-        var px: [*]u32 = @ptrCast(@alignCast(buf + base + row * pitch));
-        var mask: u8 = 0x80;
-        while (mask != 0) : (mask >>= 1) {
-            px[0] = if (bits & mask != 0) FG else BG;
-            px += 1;
-        }
-    }
-}
-
-fn drawCursor(buf: [*]u8, pitch: u32, gx: u16, gy: u16) void {
-    const base = @as(u64, gy) * font.GLYPH_H * pitch + (@as(u64, gx) * font.GLYPH_W) * 4 + (font.GLYPH_H - 2) * pitch;
-    var row: u32 = 0;
-    while (row < 2) : (row += 1) {
-        const px: [*]u32 = @ptrCast(@alignCast(buf + base + row * pitch));
-        for (px[0..font.GLYPH_W]) |*p| p.* = CURSOR;
-    }
-}
-
-/// Grid scrolled: move the pixel rows up one text line, then repaint the
-/// bottom two text lines from the cell grid (the second-to-last may hold
-/// the glyph whose wrap triggered the scroll; the last is the blank line).
-fn doScroll(buf: [*]u8, pitch: u32) void {
-    const line_bytes: u64 = font.GLYPH_H * pitch;
-    const total: u64 = @as(u64, core.rows) * line_bytes;
-    std.mem.copyForwards(u8, buf[0 .. total - line_bytes], buf[line_bytes..total]);
-    var y: u16 = core.rows - 2;
-    while (y < core.rows) : (y += 1) {
-        var x: u16 = 0;
-        while (x < core.cols) : (x += 1) {
-            drawGlyph(buf, pitch, x, y, core.cellAt(x, y));
-        }
-    }
+fn surface() ?render.Surface {
+    const buf = fb.rawBuffer() orelse return null;
+    return .{ .buf = buf, .pitch = fb.getPitch() };
 }

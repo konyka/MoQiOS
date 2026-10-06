@@ -22,7 +22,8 @@ const task_mod = @import("../proc/task.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const vfs = @import("../fs/vfs.zig");
 const tcp = @import("tcp.zig");
-const idt = @import("../arch/arch.zig").interrupts;
+const tsc = @import("../arch/arch.zig").tsc;
+const epoll_policy = @import("epoll_policy.zig");
 
 // ---- Event type constants (Linux ABI) ----
 
@@ -51,11 +52,8 @@ const EMFILE = errno.EMFILE;
 pub const MAX_EPOLL_INSTANCES: u32 = 32;
 pub const MAX_EPOLL_ITEMS: u8 = 128;
 
-/// Approximate timer tick interval (ms).
-const TICK_MS: u64 = 10;
-
-// Timed epoll waits need an external wakeup: a task parked in hlt cannot
-// execute the in-line deadline check until something makes it runnable.
+// Timed epoll waits need an external wakeup: a blocked waiter cannot run
+// its in-line deadline check until timerTick makes it runnable.
 /// EpollEvent — matches Linux struct epoll_event (8 bytes payload).
 pub const EpollEvent = extern struct {
     events: u32,
@@ -267,8 +265,7 @@ pub fn epollWait(epfd_idx: u32, events_buf: u64, max_events: u32, timeout_ms: i3
     const copy = @import("../mm/copy_from_user.zig");
     if (!copy.validateUserBufferWritable(events_buf, @as(usize, max_out) * @sizeOf(EpollEvent))) return -14; // EFAULT
 
-    var start_tick: u64 = 0;
-    if (timeout_ms >= 0) start_tick = idt.getTickCount();
+    const deadline_ns = epoll_policy.timeoutDeadlineNs(tsc.nanos(), timeout_ms);
 
     while (true) {
         // Woken by epollDestroy: the instance is gone, report EBADF.
@@ -281,11 +278,10 @@ pub fn epollWait(epfd_idx: u32, events_buf: u64, max_events: u32, timeout_ms: i3
             return @intCast(n);
         }
         if (timeout_ms == 0) return 0;
-        if (timeout_ms > 0) {
-            const elapsed_ms = (idt.getTickCount() - start_tick) * TICK_MS;
-            if (elapsed_ms >= @as(u64, @intCast(timeout_ms))) return 0;
+        if (deadline_ns) |d| {
+            if (tsc.nanos() >= d) return 0;
         }
-        switch (blockOnEpoll(inst, start_tick, timeout_ms)) {
+        switch (blockOnEpoll(inst, deadline_ns)) {
             .event => {},
             .timeout => return 0,
             .interrupted => return -4, // EINTR — a signal kicked us out of the wait
@@ -572,19 +568,22 @@ fn collectEvents(inst: *EpollInstance, out: []EpollEvent, max_out: u32) u32 {
 const BlockOutcome = enum {
     /// Woken by a readiness notification (or events were already pending).
     event,
-    /// The tick-based deadline expired (caller returns 0 to userspace).
+    /// The monotonic deadline expired (caller returns 0 to userspace).
     timeout,
     /// A pending signal kicked the task out of the wait (caller returns -EINTR).
     interrupted,
 };
 
-/// Block until an event arrives, the tick-based deadline expires, or a
-/// pending signal interrupts the wait.
-fn blockOnEpoll(inst: *EpollInstance, start_tick: u64, timeout_ms: i32) BlockOutcome {
+/// Block until an event arrives, the monotonic deadline expires, or a
+/// pending signal interrupts the wait. The waiter yields the CPU right away
+/// (it used to `hlt` in place until the next tick switched it out).
+fn blockOnEpoll(inst: *EpollInstance, deadline_ns: ?u64) BlockOutcome {
     const my_idx = sched.currentTaskIndex() orelse {
         asm volatile ("sti; hlt");
         return .event;
     };
+    const ct = task_mod.getTask(my_idx) orelse return .event;
+    const sig_mod = @import("../proc/signal.zig");
 
     const saved = inst.spin.acquire();
 
@@ -602,60 +601,49 @@ fn blockOnEpoll(inst: *EpollInstance, start_tick: u64, timeout_ms: i32) BlockOut
     };
     inst.waiter = &node;
 
-    if (timeout_ms > 0) {
-        const ticks = (@as(u64, @intCast(timeout_ms)) + TICK_MS - 1) / TICK_MS;
-        @atomicStore(u64, &wait_deadlines[my_idx], start_tick + ticks, .seq_cst);
+    if (deadline_ns) |d| {
+        @atomicStore(u64, &wait_deadlines[my_idx], d, .seq_cst);
         @atomicStore(usize, &wait_instances[my_idx], @intFromPtr(inst), .seq_cst);
         _ = @atomicRmw(u64, &epoll_wait_bm, .Or, @as(u64, 1) << @intCast(my_idx), .seq_cst);
     }
 
-    if (task_mod.getTask(my_idx)) |t| {
-        t.state = .blocked;
-        asm volatile ("" ::: .{ .memory = true });
-    }
-
+    ct.state = .blocked;
     inst.spin.release(saved);
 
-    while (!@atomicLoad(bool, &node.granted, .acquire)) {
-        if (timeout_ms > 0) {
-            const elapsed_ms = (idt.getTickCount() - start_tick) * TICK_MS;
-            if (elapsed_ms >= @as(u64, @intCast(timeout_ms))) {
-                // Deadline expired: unlink our wait node unless a concurrent
-                // notify already granted it (wakeWaiterLocked holds inst.spin).
-                const s2 = inst.spin.acquire();
-                const granted = node.granted;
-                if (!granted) removeWaiterLocked(inst, &node);
-                inst.spin.release(s2);
-                if (!granted) {
-                    disarmWaitDeadline(my_idx, generation);
-                    // We set our own state to .blocked above — restore it.
-                    task_mod.unblockTask(my_idx);
-                    return .timeout;
-                }
-            }
+    while (true) {
+        // Grants, deadline unlinks and re-blocking all happen under
+        // inst.spin, so a notify racing this check is never lost. The
+        // acquire also orders our .blocked store before the pending-signal
+        // load, pairing with sendSignal (set pending, then kick if .blocked):
+        // a signal queued before the wait is seen here, not after a timeout.
+        const s2 = inst.spin.acquire();
+        if (node.granted) {
+            inst.spin.release(s2);
+            disarmWaitDeadline(my_idx, generation);
+            return .event;
         }
+        const expired = if (deadline_ns) |d| tsc.nanos() >= d else false;
         // Signal kick: sendSignal unblocks the task without granting the
-        // wait node. Bail out with EINTR (handled signal) or die via the
-        // same exit-by-signal path the timer tick uses (fatal default).
-        if (task_mod.getTask(my_idx)) |ct| {
-            const sig_mod = @import("../proc/signal.zig");
-            if (sig_mod.pendingActionable(ct)) {
-                const s2 = inst.spin.acquire();
-                const granted = node.granted;
-                if (!granted) removeWaiterLocked(inst, &node);
-                inst.spin.release(s2);
-                if (!granted) {
-                    disarmWaitDeadline(my_idx, generation);
-                    task_mod.unblockTask(my_idx);
-                    if (sig_mod.pendingFatal(ct)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
-                    return .interrupted;
-                }
-            }
+        // wait node. epollDestroy wakes waiters of a dead instance the same way.
+        const actionable = sig_mod.pendingActionable(ct);
+        if (!expired and !actionable and inst.valid) {
+            ct.state = .blocked;
+            inst.spin.release(s2);
+            sched.rescheduleAfterBlock();
+            continue;
         }
-        asm volatile ("sti; hlt");
+        removeWaiterLocked(inst, &node);
+        inst.spin.release(s2);
+        disarmWaitDeadline(my_idx, generation);
+        // Leaving without a grant: undo our own .blocked (no-op once woken).
+        task_mod.unblockTask(my_idx);
+        if (expired) return .timeout;
+        if (actionable) {
+            if (sig_mod.pendingFatal(ct)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+            return .interrupted;
+        }
+        return .event; // instance destroyed: epollWait reports EBADF
     }
-    disarmWaitDeadline(my_idx, generation);
-    return .event;
 }
 
 fn disarmWaitDeadline(task_idx: u32, generation: u64) void {
@@ -667,14 +655,14 @@ fn disarmWaitDeadline(task_idx: u32, generation: u64) void {
 
 /// Wake expired waiters so their normal epoll loop can return a timeout.
 /// The instance lock serializes this unlink with readiness and signal cleanup.
-pub fn timerTick(now_tick: u64) void {
+pub fn timerTick(now_ns: u64) void {
     var bm = @atomicLoad(u64, &epoll_wait_bm, .acquire);
     while (bm != 0) {
         const i: u6 = @truncate(@ctz(bm));
         bm &= bm - 1;
         const idx: u32 = i;
         const deadline = @atomicLoad(u64, &wait_deadlines[idx], .seq_cst);
-        if (deadline == 0 or now_tick < deadline) continue;
+        if (deadline == 0 or now_ns < deadline) continue;
         const generation = @atomicLoad(u64, &wait_generations[idx], .seq_cst);
         const inst_addr = @atomicLoad(usize, &wait_instances[idx], .seq_cst);
         if (inst_addr == 0) {
@@ -702,7 +690,6 @@ pub fn timerTick(now_tick: u64) void {
         disarmWaitDeadline(idx, generation);
         if (unlinked) {
             task_mod.unblockTask(idx);
-            task_mod.kickRemoteForTask(idx);
         }
     }
 }
@@ -799,7 +786,6 @@ pub fn epollDestroy(epoll_idx: u32) void {
         if (task_mod.getTask(waiter.task_idx)) |task| {
             if (task.state == .blocked) {
                 task_mod.unblockTask(waiter.task_idx);
-                task_mod.kickRemoteForTask(waiter.task_idx);
             }
         }
     }

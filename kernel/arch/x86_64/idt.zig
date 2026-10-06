@@ -463,7 +463,7 @@ pub const YIELD_TRAP_VECTOR: u8 = 252;
 /// must not send an EOI.
 fn handleYieldTrap(frame: *InterruptFrame) void {
     const sched = @import("../../proc/sched.zig");
-    sched.forceRescheduleFromIpi(frame);
+    sched.forceRescheduleFromYield(frame);
 }
 
 /// Reschedule IPI (vector 253) — another CPU asked this CPU to re-run its

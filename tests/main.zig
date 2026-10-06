@@ -50,6 +50,10 @@ const time_set_policy = kt.time_set_policy;
 const time_syscall = kt.time_syscall;
 const sigreturn_policy = kt.sigreturn_policy;
 
+test {
+    _ = @import("rt_hardening_test.zig");
+}
+
 test "mmap rejects unsupported flags and protection bits" {
     try std.testing.expect(
         mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | mmap_policy.MAP_ANONYMOUS),
@@ -314,7 +318,12 @@ test "native IPC delegation ABI is wired through the public header and dispatch"
 test "IPC timeout maintenance is wired into every timer backend" {
     try std.testing.expect(std.mem.indexOf(u8, kt.aarch64_trap_source, "ipc.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.riscv64_trap_source, "ipc.zig") != null);
-    try std.testing.expect(std.mem.count(u8, kt.sched_source, "timeoutTick") == 1);
+    // x86: once in the legacy tick, once in the fine-grain slow maintenance.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.sched_source, "ipc.zig\").timeoutTick("));
+    const fg_maint = std.mem.indexOf(u8, kt.sched_source, "fn bspSlowMaintenance") orelse return error.TestUnexpectedResult;
+    const fg_end = std.mem.indexOfPos(u8, kt.sched_source, fg_maint, "\n}\n") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, kt.sched_source[fg_maint..fg_end], "timeoutTick(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.sched_source, "bspSlowMaintenance();") != null);
 }
 
 test "absolute timer deadlines are converted from their clock domain" {
@@ -4318,6 +4327,15 @@ test "fbcon core: newline is CR+LF, backspace retreats, tab aligns to 8" {
     _ = core.putChar('z');
     _ = core.putChar('\t');
     try std.testing.expectEqual(@as(u16, 8), core.cx);
+    // A tab blanks cells without per-cell effects: it names the rows to repaint.
+    core.cx = 3;
+    core.cells[1][4] = 'q';
+    try std.testing.expectEqual(fbcon_core.Effect{ .rows = .{ .first = 1, .last = 1 } }, core.putChar('\t'));
+    try std.testing.expectEqual(@as(u8, ' '), core.cellAt(4, 1));
+    core.cx = 14;
+    try std.testing.expectEqual(fbcon_core.Effect{ .rows = .{ .first = 1, .last = 2 } }, core.putChar('\t'));
+    core.cx = 8;
+    core.cy = 1;
     // Control bytes without console meaning are ignored.
     try std.testing.expectEqual(fbcon_core.Effect.none, core.putChar(0x07));
     try std.testing.expectEqual(@as(u16, 8), core.cx);

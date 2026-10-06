@@ -1311,47 +1311,56 @@ pub fn blockTask(idx: u32) void {
     }
 }
 
-/// Unblock a task — sets state back to ready.
+/// Shared .blocked → .ready transition (task_lock held). Job control: a
+/// stopped task must not be revived by ordinary wait-queue wakes — only
+/// SIGCONT (continueTask clears `stopped` first).
+fn readyFromBlockedLocked(t: *Task) bool {
+    if (sched_claim.load(&t.state) != .blocked or t.stopped) return false;
+    sched_claim.store(&t.state, .ready);
+    // Task #2: republish to per-CPU queue (best-effort, full → bitmap fallback).
+    const per_cpu = @import("per_cpu.zig");
+    if (per_cpu.isAnyReady()) _ = per_cpu.enqueueTask(t);
+    return true;
+}
+
+/// Unblock a task — sets state back to ready and lets the scheduler decide
+/// whether the wake preempts (sched.notifyWake, outside task_lock).
 pub fn unblockTask(idx: u32) void {
-    const flags = task_lock.acquire();
-    defer task_lock.release(flags);
-    const t = getTask(idx) orelse return;
-    // Job control: a stopped task must not be revived by ordinary wait-queue
-    // wakes — only SIGCONT (continueTask clears `stopped` first).
-    if (sched_claim.load(&t.state) == .blocked and !t.stopped) {
-        sched_claim.store(&t.state, .ready);
-        // Task #2: republish to per-CPU queue (best-effort, full → bitmap fallback).
-        const per_cpu = @import("per_cpu.zig");
-        if (per_cpu.isAnyReady()) _ = per_cpu.enqueueTask(t);
-    }
+    const woken = blk: {
+        const flags = task_lock.acquire();
+        defer task_lock.release(flags);
+        const t = getTask(idx) orelse return;
+        if (!readyFromBlockedLocked(t)) return;
+        break :blk t;
+    };
+    @import("sched.zig").notifyWake(woken);
 }
 
 /// Unblock only if the slot still belongs to the captured TID. This closes
 /// deferred-wakeup races across task slot reap and reuse.
 pub fn unblockTaskIfTid(idx: u32, tid: u32) void {
-    const flags = task_lock.acquire();
-    defer task_lock.release(flags);
-    const t = getTask(idx) orelse return;
-    if (t.tid != tid) return;
-    if (sched_claim.load(&t.state) == .blocked and !t.stopped) {
-        sched_claim.store(&t.state, .ready);
-        const per_cpu = @import("per_cpu.zig");
-        if (per_cpu.isAnyReady()) _ = per_cpu.enqueueTask(t);
-    }
+    const woken = blk: {
+        const flags = task_lock.acquire();
+        defer task_lock.release(flags);
+        const t = getTask(idx) orelse return;
+        if (t.tid != tid or !readyFromBlockedLocked(t)) return;
+        break :blk t;
+    };
+    @import("sched.zig").notifyWake(woken);
 }
 
 /// Unblock a pinned task only when both its TID and slot incarnation match.
 /// The caller may hold a TaskPin; this function acquires task_lock itself.
 pub fn unblockTaskIfIncarnation(idx: u32, tid: u32, incarnation: u64) void {
-    const flags = task_lock.acquire();
-    defer task_lock.release(flags);
-    const t = getTask(idx) orelse return;
-    if (t.tid != tid or t.incarnation != incarnation) return;
-    if (sched_claim.load(&t.state) == .blocked and !t.stopped) {
-        sched_claim.store(&t.state, .ready);
-        const per_cpu = @import("per_cpu.zig");
-        if (per_cpu.isAnyReady()) _ = per_cpu.enqueueTask(t);
-    }
+    const woken = blk: {
+        const flags = task_lock.acquire();
+        defer task_lock.release(flags);
+        const t = getTask(idx) orelse return;
+        if (t.tid != tid or t.incarnation != incarnation) return;
+        if (!readyFromBlockedLocked(t)) return;
+        break :blk t;
+    };
+    @import("sched.zig").notifyWake(woken);
 }
 
 /// Get total task count.
@@ -1542,7 +1551,6 @@ pub fn kickChildCpus(parent_tid: u32, parent_cpu: u8) void {
     }
 }
 
-/// After a user task is published ready, kick its remote affinity CPU.
 /// Hand a freshly created task to the scheduler.
 ///
 /// Marking a task `.ready` is not enough to get it run. `pickNext` drains the
@@ -1564,19 +1572,7 @@ pub fn publishRunnable(slot: u32) void {
     asm volatile ("" ::: .{ .memory = true });
     const sched = @import("sched.zig");
     sched.enqueue(t);
-    kickRemoteForTask(slot);
-}
-
-pub fn kickRemoteForTask(slot: u32) void {
-    const t = getTask(slot) orelse return;
-    const sched = @import("sched.zig");
-    const se = @import("../arch/arch.zig").syscall;
-    // Task #2: target the queued CPU. Prefer hard affinity if set, else last_cpu.
-    const target_cpu: u8 = if (t.cpu_affinity >= 0) @intCast(t.cpu_affinity) else t.last_cpu;
-    const here: u8 = @intCast(se.getPerCpu().cpu_id);
-    if (target_cpu == here) return;
-    asm volatile ("mfence" ::: .{ .memory = true });
-    sched.kickCpu(target_cpu);
+    sched.notifyWake(t);
 }
 
 /// Result of a single waitpid zombie scan (task_lock held by caller).

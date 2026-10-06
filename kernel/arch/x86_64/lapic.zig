@@ -7,6 +7,7 @@ const io = @import("io.zig");
 const paging = @import("../../arch/x86_64/paging.zig");
 const main_mod = @import("../../main.zig");
 const fmt = @import("../../lib/fmt.zig");
+const irq = @import("arch_impl.zig").irq;
 
 /// LAPIC timer fires on this vector.
 pub const TIMER_VECTOR: u8 = 240;
@@ -67,7 +68,6 @@ pub fn id() u8 {
     return @truncate(read(REG_ID) >> 24);
 }
 
-/// Send INIT IPI to target AP (resets the AP to real mode).
 fn waitForIcrDelivery() bool {
     var polls: u32 = 0;
     while (read(REG_ICR_LOW) & (1 << 12) != 0) : (polls += 1) {
@@ -80,19 +80,27 @@ fn waitForIcrDelivery() bool {
     return true;
 }
 
-pub fn sendInitIpi(apic_id: u8) bool {
-    writeReg(REG_ICR_HIGH, @as(u32, apic_id) << 24);
-    // Delivery mode=INIT (0b101), assert level, edge trigger
-    writeReg(REG_ICR_LOW, 0x00004500);
+/// The xAPIC ICR is two registers written as a pair: an IRQ that sends its
+/// own IPI between the high and low writes would retarget ours, so the whole
+/// sequence (including the delivery wait) runs with IRQs masked.
+fn icrSend(high: u32, low: u32) bool {
+    const saved = irq.saveAndDisable();
+    defer irq.restore(saved);
+    writeReg(REG_ICR_HIGH, high);
+    writeReg(REG_ICR_LOW, low);
     return waitForIcrDelivery();
+}
+
+/// Send INIT IPI to target AP (resets the AP to real mode).
+pub fn sendInitIpi(apic_id: u8) bool {
+    // Delivery mode=INIT (0b101), assert level, edge trigger
+    return icrSend(@as(u32, apic_id) << 24, 0x00004500);
 }
 
 /// Send Startup IPI (SIPI) to target AP at given 4KB-aligned vector page.
 pub fn sendStartupIpi(apic_id: u8, vector_page: u8) bool {
-    writeReg(REG_ICR_HIGH, @as(u32, apic_id) << 24);
     // Delivery mode=Startup (0b110), assert level, vector = page frame
-    writeReg(REG_ICR_LOW, 0x00004600 | @as(u32, vector_page));
-    return waitForIcrDelivery();
+    return icrSend(@as(u32, apic_id) << 24, 0x00004600 | @as(u32, vector_page));
 }
 
 /// Send a fixed-delivery IPI carrying `vector` to the CPU with LAPIC `apic_id`.
@@ -102,28 +110,22 @@ pub fn sendStartupIpi(apic_id: u8, vector_page: u8) bool {
 /// status bit (bit 12) until the LAPIC accepts the request. Safe to target the
 /// caller's own APIC ID (self-IPI) — useful for forcing a local reschedule.
 pub fn sendIpi(apic_id: u8, vector: u8) bool {
-    writeReg(REG_ICR_HIGH, @as(u32, apic_id) << 24);
-    writeReg(REG_ICR_LOW, 0x00004000 | @as(u32, vector));
-    return waitForIcrDelivery();
+    return icrSend(@as(u32, apic_id) << 24, 0x00004000 | @as(u32, vector));
 }
 
 /// Broadcast an NMI to all CPUs except the sender (ICR "all excluding self"
 /// shorthand, delivery mode = NMI). Used by the panic path to park APs
 /// immediately instead of waiting for their next timer tick.
 pub fn sendNmiAllButSelf() bool {
-    writeReg(REG_ICR_HIGH, 0);
     // bits 19:18 = 0b11 (all excluding self), delivery mode 0b100 (NMI).
-    writeReg(REG_ICR_LOW, 0x000C4400);
-    return waitForIcrDelivery();
+    return icrSend(0, 0x000C4400);
 }
 
 /// Broadcast a fixed-delivery IPI to all CPUs except the sender.
 /// Uses the ICR "all excluding self" shorthand (destination shorthand = 0b11).
 pub fn sendIpiAllButSelf(vector: u8) bool {
-    writeReg(REG_ICR_HIGH, 0);
     // bits 19:18 = 0b11 (all excluding self) → 0x000C0000, plus assert + vector.
-    writeReg(REG_ICR_LOW, 0x000C4000 | @as(u32, vector));
-    return waitForIcrDelivery();
+    return icrSend(0, 0x000C4000 | @as(u32, vector));
 }
 
 /// Enable this AP's Local APIC (spurious-interrupt vector register) WITHOUT

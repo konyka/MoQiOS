@@ -53,6 +53,7 @@ pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) nor
     }
 
     serial.writeString("  system halted\n");
+    if (comptime builtin.cpu.arch == .x86_64) @import("drivers/fbcon.zig").panicFlush();
     arch.cpu.halt();
 }
 
