@@ -16,43 +16,40 @@
 ///   // ... critical section ...
 
 const arch = @import("../arch/arch.zig");
+const Ticket = @import("ticket_lock.zig").Ticket;
+
+/// Spin with IRQs OFF (fault-handler safe), servicing any in-flight shootdown
+/// broadcast ourselves so the current owner can complete its shootdown wait
+/// without needing our IF=1.
+fn serviceAndRelax() void {
+    arch.tlb.servicePendingShootdown();
+    arch.cpu.pause();
+}
 
 pub const ServicingSpinlock = struct {
-    locked: u32 = 0,
+    ticket: Ticket = .{},
 
+    /// Fair (FIFO ticket) acquire, see sync/ticket_lock.zig.
     pub inline fn acquire(self: *ServicingSpinlock) u64 {
         const saved = arch.irq.saveAndDisable();
-
-        while (true) {
-            if (@atomicRmw(u32, &self.locked, .Xchg, 1, .acquire) == 0) break;
-            // Failed: spin with IRQs OFF (fault-handler safe), servicing any
-            // in-flight shootdown broadcast ourselves so the current owner can
-            // complete its shootdown wait without needing our IF=1.
-            while (@atomicLoad(u32, &self.locked, .monotonic) != 0) {
-                arch.tlb.servicePendingShootdown();
-                arch.cpu.pause();
-            }
-        }
-
+        self.ticket.lock(serviceAndRelax);
         return saved;
     }
 
     pub inline fn release(self: *ServicingSpinlock, saved: u64) void {
-        @atomicStore(u32, &self.locked, 0, .release);
+        self.ticket.unlock();
         arch.irq.restore(saved);
     }
 
-    /// Non-blocking acquire: a single atomic Xchg attempt. Returns the saved
-    /// IRQ flags on success (release with `release`), or null on contention —
-    /// IRQ state is restored before returning null, so the caller's interrupt
-    /// state is exactly as it entered. Used by best-effort paths (swap
-    /// reclaim) that must never wait on vm_lock.
+    /// Non-blocking acquire: a single CAS that only succeeds on a free lock.
+    /// Returns the saved IRQ flags on success (release with `release`), or
+    /// null on contention — IRQ state is restored before returning null, so
+    /// the caller's interrupt state is exactly as it entered. Used by
+    /// best-effort paths (swap reclaim) that must never wait on vm_lock.
     pub inline fn tryAcquire(self: *ServicingSpinlock) ?u64 {
         const saved = arch.irq.saveAndDisable();
-        if (@atomicRmw(u32, &self.locked, .Xchg, 1, .acquire) != 0) {
-            arch.irq.restore(saved);
-            return null;
-        }
-        return saved;
+        if (self.ticket.tryLock()) return saved;
+        arch.irq.restore(saved);
+        return null;
     }
 };

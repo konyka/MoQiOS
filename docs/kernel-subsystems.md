@@ -2108,31 +2108,29 @@ gettimeofday 与 CLOCK_MONOTONIC 各 10000 次循环单调不减。标记：
 
 源码: `kernel/sync/`
 
-### 7.1 IrqSpinlock ✅
+### 7.1 IrqSpinlock ✅（2026-10 起为公平 ticket 锁）
 
-文件: `irq_spinlock.zig`
+文件: `irq_spinlock.zig`、核心 `ticket_lock.zig`
 
 ```zig
-const IrqSpinlock = struct {
-    locked: AtomicBool,
-    saved_rflags: u64,
-};
+const Ticket = struct { next: u32 = 0, serving: u32 = 0 }; // 空闲 ⇔ next == serving
+const IrqSpinlock = struct { ticket: Ticket = .{} };
 ```
 
-`acquire` 关中断 + 自旋；`release` 还原 RFLAGS.IF。
+`acquire` 先关中断再取号（同 CPU 的中断不可能排在被它打断的持有者后面），
+按号 FIFO 等待；`release` 只由持有者写 `serving`（load + release store，不会向
+`next` 进位），再还原 RFLAGS.IF。`tryAcquire` 只在锁空闲（`next == serving`）时
+用一次 CAS 取号，永远不会插队。32 位回绕计数，Debug 构建对释放未持有的锁断言。
+
+同一核心也用于 `ServicingSpinlock`（`Mm.vm_lock`，等待时代为处理 TLB shootdown）
+和 x86 `TlbLock`（shootdown 发起者串行化）。旧实现是 test-and-set：谁的 Xchg 先
+到缓存行谁赢，SMP 争用下等待时间无上界；ticket 锁把最坏等待限定为排在前面的持有者。
+代价：虚拟化环境下被宿主抢占的排队者会挡住后面的人（lock-waiter preemption），
+QEMU/TCG 的 SMP=2 冒烟中未观察到影响（`hello107`）。
 
 ### 7.2 TicketSpinlock ✅
 
-文件: `ticket_spinlock.zig`
-
-```zig
-const TicketSpinlock = struct {
-    next_ticket: AtomicU32,
-    serving: AtomicU32,
-};
-```
-
-公平自旋锁（FIFO），用于多核高争用场景。
+文件: `ticket_spinlock.zig` —— 现为 `IrqSpinlock` 的别名（原独立实现无树内使用者）。
 
 ### 7.3 Mutex 睡眠互斥锁 ✅
 

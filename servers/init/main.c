@@ -226,6 +226,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello104"); /* SCHED_FIFO wakeup preemption on the waker's CPU */
     run_test("hello105"); /* futex/epoll timeouts expire on the next tick */
     run_test("hello106"); /* console writes stay cheap while fbcon scrolls */
+    run_test("hello107"); /* cross-CPU kernel lock contention stays fair and bounded */
 
     start_persistent_services();
 

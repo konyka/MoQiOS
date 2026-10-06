@@ -126,6 +126,7 @@ pub const cpu_protect_policy = @import("arch/x86_64/cpu_protect_policy.zig");
 pub const wake_preempt_policy = @import("proc/wake_preempt_policy.zig");
 pub const sched_pass_policy = @import("proc/sched_pass_policy.zig");
 pub const deadline_hint = @import("lib/deadline_hint.zig");
+pub const ticket_lock = @import("sync/ticket_lock.zig");
 pub const time_pointer_policy = @import("proc/time_pointer_policy.zig");
 pub const posix_mq_policy = @import("ipc/posix_mq_policy.zig");
 pub const posix_mq_wait_policy = @import("ipc/posix_mq_wait_policy.zig");

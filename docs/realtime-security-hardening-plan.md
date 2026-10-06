@@ -72,7 +72,8 @@
 - 可抢占内核（syscall 体 IF=1 + preempt count）：需要逐个审计持有 IrqSpinlock 的路径。
 - TSC-deadline 高精度定时器 / tickless idle：消除 10 ms tick 量化。
 - O(1) 优先级位图运行队列：替换 RT 感知的 O(n) `popRtAware`。
-- `IrqSpinlock` 换成 ticket/MCS 锁：TAS 锁在 SMP 下没有公平性，RT 抖动不可界定。
+- ~~`IrqSpinlock` 换成 ticket/MCS 锁：TAS 锁在 SMP 下没有公平性，RT 抖动不可界定。~~
+  → 第二轮已实施（§8.1）。
 - SMAP：先做审计模式（所有用户访问收敛到 `copy_from_user`，`userAccessBegin/End` 发 `stac/clac`，SFMASK 加 AC 位），再强制开启。
 - PI futex / 优先级继承：消除 RT 任务经锁发生的优先级反转。
 - 严格 RR 轮转 + RT 带宽限流（`sched_rt_runtime_us` 式 95%）：目前 RR quantum 到期仍可把
@@ -223,3 +224,32 @@
 
 剩余约 6 ms 的超出量来自 100 Hz tick 粒度（扫描在 tick 边界进行，平均落后半个 tick
 加一次调度）；高精度单次定时器（LAPIC TSC-deadline 按最早截止时间编程）列在 P3 路线。
+
+## 8. 第二轮：P3 路线落地（2026-10）
+
+方法与第一轮相同：每项先写纯策略 / 数据结构模块的 host 测试（RED），再接入内核
+（GREEN），再用 QEMU 验收程序（`hello107` 起）覆盖真实路径，最后跑全部门禁
+（host 测试、riscv64/aarch64/x86_64 构建、SMP=1/2 冒烟）后按项提交。
+测试集中在 `tests/rt_round2_test.zig`。
+
+### 8.1 公平 ticket 自旋锁
+
+问题：`IrqSpinlock`、`ServicingSpinlock`（`vm_lock`）和 `TlbLock` 都是 test-and-set，
+争用时谁的 Xchg 先到缓存行谁赢——没有排队，某个 CPU 可以被无限期饿死，锁等待
+时间没有上界，RT 抖动无法界定。
+
+设计：纯核心 `kernel/sync/ticket_lock.zig`（`next`/`serving` 两个 32 位回绕计数，
+空闲 ⇔ 相等）。三个锁只是外壳：先关中断再取号，等待回调分别是 `pause` 和
+“处理 shootdown + `pause`”。`tryLock` 只在空闲时对 `next` 做一次 CAS，不会插队；
+`unlock` 只由持有者执行（load + release store，不会向 `next` 进位），Debug 构建
+断言不会释放未持有的锁。API 不变，151 处调用点无需修改。
+
+验证：
+- host（RED：模块不存在 → GREEN）：FIFO 交接模型、`tryLock` 不插队、计数回绕、
+  4 线程 × 2 万次非原子计数互斥、真实线程按到达顺序获得锁（50 轮）。
+- `hello107`：主任务与 CLONE_VM 线程（SMP≥2 时分别钉在 CPU0/1）在 400 ms 窗口内
+  并发 mmap / 缺页 / mprotect / munmap（vm_lock + TLB shootdown）、futex、
+  sched_yield；检查页内容、双方进度比 ≥ 1/4、SMP≥2 时单次迭代 ≤ 30 ms。
+  旧 TAS 内核在 QEMU/TCG 下同样通过（两次：846/855、942/938 次迭代，最大 1.3 ms）——
+  两个模拟 CPU 不足以复现饿死，所以 `hello107` 是 SMP 压力回归门禁，公平性本身
+  由 host 测试证明。新内核：SMP=2 863/871 次，最大 1.7 ms；SMP=1 629/625 次。

@@ -45,6 +45,7 @@ const smp = @import("../../smp.zig");
 const syscall_entry = @import("syscall_entry.zig");
 const serial = @import("serial.zig");
 const pcid = @import("pcid.zig");
+const Ticket = @import("../../sync/ticket_lock.zig").Ticket;
 
 /// Local-flush fallback threshold. More pages than this on a single
 /// shootdown → just reload CR3 (flushes all non-global TLB entries).
@@ -97,7 +98,12 @@ fn failShootdown(reason: []const u8) noreturn {
 /// the page-fault handler (COW/swap paths), where an `sti` window would let a
 /// timer tick nest inside the fault frame and corrupt the iretq state.
 pub const TlbLock = struct {
-    locked: u32 = 0,
+    ticket: Ticket = .{},
+
+    fn serviceAndRelax() void {
+        servicePendingShootdown();
+        asm volatile ("pause");
+    }
 
     pub fn acquire(self: *TlbLock) u64 {
         // Snapshot caller's IF state so we can restore on release.
@@ -107,26 +113,18 @@ pub const TlbLock = struct {
             \\pop %[f]
             : [f] "=r" (rflags),
         );
-
-        while (true) {
-            // Disable IRQs to take the lock atomically with respect to a
-            // local-CPU interrupt that might recursively try to shoot down.
-            asm volatile ("cli");
-            if (@atomicRmw(u32, &self.locked, .Xchg, 1, .acquire) == 0) {
-                return rflags;
-            }
-            // Failed: spin with IRQs OFF (fault-handler safe), servicing any
-            // in-flight broadcast ourselves so the current owner can complete
-            // without needing our IF=1.
-            while (@atomicLoad(u32, &self.locked, .monotonic) != 0) {
-                servicePendingShootdown();
-                asm volatile ("pause");
-            }
-        }
+        // IRQs off before taking a ticket so a local interrupt that tries to
+        // shoot down can never queue behind its own interrupted holder.
+        // Waiters are served FIFO (sync/ticket_lock.zig) and spin with IRQs
+        // OFF, servicing in-flight broadcasts so the owner can complete
+        // without needing our IF=1.
+        asm volatile ("cli");
+        self.ticket.lock(serviceAndRelax);
+        return rflags;
     }
 
     pub fn release(self: *TlbLock, saved_rflags: u64) void {
-        @atomicStore(u32, &self.locked, 0, .release);
+        self.ticket.unlock();
         asm volatile (
             \\push %[f]
             \\popfq

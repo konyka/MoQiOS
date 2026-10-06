@@ -3396,3 +3396,15 @@ full gates.
   console write max 366 ms / mean 126 ms; GREEN: max 460 µs / mean 272 µs. The same cost was being
   charged to the current task (`hello102` getrusage exceeded the process lifetime) and made up
   most of the 3.5-minute smoke run, now ~25 s.
+
+### Realtime / performance / security round 2: P3 roadmap (2026-10)
+
+Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
+`tests/rt_round2_test.zig`.
+
+- `IrqSpinlock`, `ServicingSpinlock` (`vm_lock`) and the x86 `TlbLock` were test-and-set: under
+  contention the fastest Xchg wins, so lock wait had no upper bound. All three now wrap one fair
+  FIFO ticket core (`sync/ticket_lock.zig`); `tryAcquire` never jumps the queue. The API is
+  unchanged. `hello107` stresses vm_lock / TLB shootdown / futex / run-queue locks from two
+  pinned CPUs (an SMP regression guard; the FIFO property itself is proven by host tests with
+  real threads).

@@ -52,6 +52,7 @@ const sigreturn_policy = kt.sigreturn_policy;
 
 test {
     _ = @import("rt_hardening_test.zig");
+    _ = @import("rt_round2_test.zig");
 }
 
 test "mmap rejects unsupported flags and protection bits" {
