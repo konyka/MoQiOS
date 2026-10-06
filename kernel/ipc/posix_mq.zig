@@ -347,10 +347,12 @@ fn queueIndex(q: *MqQueue) u32 {
 
 fn wakeHead(q: *MqQueue, direction: u8) ?WakeToken {
     const list = waiterList(direction, q);
-    const waiter = list.head.* orelse return null;
-    const token = WakeToken{ .idx = waiter.task_idx, .incarnation = waiter.task_incarnation };
-    if (!claimAndDetach(q, waiter, direction, .woken)) return null;
-    return token;
+    while (list.head.*) |waiter| {
+        const token = WakeToken{ .idx = waiter.task_idx, .incarnation = waiter.task_incarnation };
+        if (claimAndDetach(q, waiter, direction, .woken)) return token;
+        if (waiter.linked) _ = claimAndDetach(q, waiter, direction, .cancelled);
+    }
+    return null;
 }
 
 /// mq_open(name, oflag, mode, attr) -> fd or -errno
