@@ -4,7 +4,6 @@
 /// Messages are stored in a ring buffer per queue. Max 16 queues, 8 messages per queue.
 const serial = @import("../arch/arch.zig").serial;
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
-const fmt = @import("../lib/fmt.zig");
 const str = @import("../lib/str.zig");
 const bo = @import("../lib/byte_order.zig");
 const copy = @import("../mm/copy_from_user.zig");
@@ -15,14 +14,16 @@ const mq_timeout_policy = @import("posix_mq_policy.zig");
 const attr_policy = @import("posix_mq_attr_policy.zig");
 const receive_policy = @import("posix_mq_receive_policy.zig");
 const priority_policy = @import("posix_mq_priority_policy.zig");
-const ownership_policy = @import("posix_mq_ownership_policy.zig");
 const owner_gen_policy = @import("owner_gen_policy.zig");
 const wait_policy = @import("posix_mq_wait_policy.zig");
+const descriptor_policy = @import("posix_mq_descriptor_policy.zig");
 
 const MAX_QUEUES: u32 = 16;
 const MAX_MSGS: u32 = 8;
 const MAX_MSG_SIZE: u32 = 512;
 const MAX_NAME_LEN: u32 = 64;
+const MAX_OPEN_DESCRIPTIONS: u32 = 256;
+const MAX_TASK_MQ_DESCRIPTORS: u32 = descriptor_policy.MAX_DESCRIPTORS;
 
 /// POSIX message buffer
 const MsgEntry = struct {
@@ -38,8 +39,6 @@ pub const MqQueue = struct {
     active: bool = false,
     name: [MAX_NAME_LEN]u8 = @splat(0),
     name_len: u32 = 0,
-    /// File descriptor assigned to this queue
-    fd: i32 = -1,
     /// Ring buffer of messages
     msgs: [MAX_MSGS]MsgEntry = @splat(.{}),
     head: u32 = 0, // next read position
@@ -48,8 +47,6 @@ pub const MqQueue = struct {
     /// Queue attributes
     max_msg: u32 = MAX_MSGS,
     msg_size: u32 = MAX_MSG_SIZE,
-    /// Flags (O_NONBLOCK etc.)
-    flags: u32 = 0,
     /// Marked for removal (mq_unlink)
     marked_removed: bool = false,
     /// Open references (mq_open). The slot is freed only when an unlinked,
@@ -76,16 +73,36 @@ pub const MqQueue = struct {
 var queues: [MAX_QUEUES]MqQueue = @splat(.{});
 var queue_generations: [MAX_QUEUES]u64 = @splat(0);
 var mq_lock: IrqSpinlock = .{};
-var task_refs: [task.MAX_TASKS][MAX_QUEUES]u32 = @splat(@splat(0));
+
+const OpenDescription = struct {
+    active: bool = false,
+    queue_idx: u32 = 0,
+    queue_generation: u64 = 0,
+    description_generation: u64 = 0,
+    access: u32 = descriptor_policy.O_RDONLY,
+    status_flags: u32 = 0,
+    cloexec: bool = false,
+    refs: u32 = 0,
+};
+
+const TaskHandle = struct {
+    desc_idx: u32 = 0,
+    desc_generation: u64 = 0,
+    open: bool = false,
+};
+
+var descriptions: [MAX_OPEN_DESCRIPTIONS]OpenDescription = @splat(.{});
+var description_generations: [MAX_OPEN_DESCRIPTIONS]u64 = @splat(0);
+var task_handles: [task.MAX_TASKS][MAX_TASK_MQ_DESCRIPTORS]TaskHandle = @splat(@splat(.{}));
 
 // ── O_* flags ──
-const O_RDONLY: u32 = 0;
-const O_WRONLY: u32 = 1;
-const O_RDWR: u32 = 2;
-const O_CREAT: u32 = 0o100;
-const O_EXCL: u32 = 0o200;
-const O_NONBLOCK: u32 = 0o4000;
-const O_CLOEXEC: u32 = 0o2000000;
+const O_RDONLY = descriptor_policy.O_RDONLY;
+const O_WRONLY = descriptor_policy.O_WRONLY;
+const O_RDWR = descriptor_policy.O_RDWR;
+const O_CREAT = descriptor_policy.O_CREAT;
+const O_EXCL = descriptor_policy.O_EXCL;
+const O_NONBLOCK = descriptor_policy.O_NONBLOCK;
+const O_CLOEXEC = descriptor_policy.O_CLOEXEC;
 
 // ── Error codes ──
 const errno = @import("../lib/errno.zig");
@@ -97,6 +114,7 @@ const EAGAIN = errno.EAGAIN;
 const EMFILE = errno.EMFILE;
 const EBADF = errno.EBADF;
 const EFAULT = errno.EFAULT;
+const EACCES = errno.EACCES;
 const EINTR = errno.EINTR;
 const ETIMEDOUT = errno.ETIMEDOUT;
 const EMSGSIZE = errno.EMSGSIZE;
@@ -366,6 +384,7 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
     var name_buf: [MAX_NAME_LEN]u8 = @splat(0);
     const name_len: u32 = @intCast(readUserString(name_ptr, &name_buf));
     if (name_len == 0) return EINVAL;
+    if (!descriptor_policy.flagsValid(oflag)) return EINVAL;
     const owner_idx = sched.currentTaskIndex() orelse return EBADF;
 
     var maxmsg: i64 = 0;
@@ -387,15 +406,11 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
 
     // Search for existing queue with this name
     for (&queues, 0..) |*q, queue_idx| {
-        if (q.active and str.eql(q.name[0..q.name_len], name_buf[0..name_len])) {
+        if (q.active and !q.marked_removed and str.eql(q.name[0..q.name_len], name_buf[0..name_len])) {
             if (oflag & O_CREAT != 0 and oflag & O_EXCL != 0) {
                 return EEXIST;
             }
-            // Return existing fd (or assign one)
-            if (q.fd < 0) q.fd = allocFd();
-            q.open_count += 1;
-            task_refs[owner_idx][queue_idx] += 1;
-            return @intCast(q.fd);
+            return openDescription(@intCast(queue_idx), q, owner_idx, oflag);
         }
     }
 
@@ -423,13 +438,11 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
     for (0..name_len) |j| q.name[j] = name_buf[j];
     q.name_len = name_len;
     q.active = true;
-    q.flags = oflag & (O_NONBLOCK | O_CLOEXEC);
     q.head = 0;
     q.tail = 0;
     q.count = 0;
     q.marked_removed = false;
-    q.open_count = 1;
-    task_refs[owner_idx][idx] = 1;
+    q.open_count = 0;
     q.notify_pid = 0;
     q.notify_task_idx = null;
     q.notify_tid = 0;
@@ -441,15 +454,16 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
         q.msg_size = @intCast(msgsize);
     }
 
-    q.fd = allocFd();
-
     serial.writeString("[posix_mq] created mq=");
     serial.writeString(q.name[0..q.name_len]);
-    serial.writeString(" fd=");
-    fmt.writeDecimal64(@intCast(q.fd));
     serial.writeString("\n");
 
-    return @intCast(q.fd);
+    const opened = openDescription(idx, q, owner_idx, oflag);
+    if (opened < 0) {
+        var wakes = WakeBatch{};
+        freeQueue(q, &wakes);
+    }
+    return opened;
 }
 
 /// mq_unlink(name) -> 0 or -errno
@@ -491,7 +505,7 @@ pub fn mqUnlink(name_ptr: u64) i64 {
 /// mq_timedsend(mqd, msg_ptr, msg_len, msg_prio, abs_timeout) -> 0 or -errno
 /// rdi=mqd, rsi=msg_ptr, rdx=msg_len, r10=msg_prio, r8=abs_timeout
 pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_ptr: u64) i64 {
-    if (!currentTaskOwnsFd(mqd)) return EBADF;
+    const owner_idx = sched.currentTaskIndex() orelse return EBADF;
     // Read timeout before acquiring lock
     const abs_timeout_ns = readAbsTimeout(timeout_ptr) catch |err| return switch (err) {
         error.Fault => EFAULT,
@@ -502,10 +516,15 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
     while (true) {
         const flags = mq_lock.acquire();
 
-        const q = findByFd(mqd) orelse {
+        const desc = findDescription(owner_idx, mqd) orelse {
             mq_lock.release(flags);
             return EBADF;
         };
+        const q = &queues[desc.queue_idx];
+        if (!descriptor_policy.accessAllows(desc.access, .send)) {
+            mq_lock.release(flags);
+            return EACCES;
+        }
         if (q.marked_removed) {
             mq_lock.release(flags);
             return EBADF;
@@ -513,11 +532,11 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
 
         if (msg_len > q.msg_size) {
             mq_lock.release(flags);
-            return EINVAL;
+            return EMSGSIZE;
         }
 
         if (q.count >= q.max_msg) {
-            if (q.flags & O_NONBLOCK != 0) {
+            if (desc.status_flags & O_NONBLOCK != 0) {
                 mq_lock.release(flags);
                 return EAGAIN;
             }
@@ -586,7 +605,7 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
         const copied = copy.copyFromUser(payload[0..copy_len], @ptrFromInt(msg_ptr), copy_len);
 
         const commit_flags = mq_lock.acquire();
-        const commit_q = findByFd(mqd);
+        const commit_q = findQueueForDescription(owner_idx, mqd);
         if (commit_q == null or !commit_q.?.msgs[send_idx].reserved) {
             mq_lock.release(commit_flags);
             return EAGAIN;
@@ -640,7 +659,7 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
 /// mq_timedreceive(mqd, msg_ptr, msg_len, msg_prio, abs_timeout) -> bytes or -errno
 /// rdi=mqd, rsi=msg_ptr, rdx=msg_len, r10=msg_prio, r8=abs_timeout
 pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeout_ptr: u64) i64 {
-    if (!currentTaskOwnsFd(mqd)) return EBADF;
+    const owner_idx = sched.currentTaskIndex() orelse return EBADF;
     if (prio_ptr != 0 and !copy.validateUserBufferWritable(prio_ptr, 4)) return EFAULT;
     // Read timeout before acquiring lock
     const abs_timeout_ns = readAbsTimeout(timeout_ptr) catch |err| return switch (err) {
@@ -652,17 +671,22 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
     while (true) {
         const flags = mq_lock.acquire();
 
-        const q = findByFd(mqd) orelse {
+        const desc = findDescription(owner_idx, mqd) orelse {
             mq_lock.release(flags);
             return EBADF;
         };
+        const q = &queues[desc.queue_idx];
+        if (!descriptor_policy.accessAllows(desc.access, .receive)) {
+            mq_lock.release(flags);
+            return EACCES;
+        }
         if (q.marked_removed) {
             mq_lock.release(flags);
             return EBADF;
         }
 
         if (q.count == 0) {
-            if (q.flags & O_NONBLOCK != 0) {
+            if (desc.status_flags & O_NONBLOCK != 0) {
                 mq_lock.release(flags);
                 return EAGAIN;
             }
@@ -743,7 +767,7 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
             prio_written = copy.copyToUser(@ptrFromInt(prio_ptr), &prio_buf, 4);
         }
         const commit_flags = mq_lock.acquire();
-        const commit_q = findByFd(mqd);
+        const commit_q = findQueueForDescription(owner_idx, mqd);
         if (commit_q == null or !commit_q.?.msgs[selected_idx].reserved) {
             mq_lock.release(commit_flags);
             return EAGAIN;
@@ -790,7 +814,7 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
 /// Registers the calling task; the requested signal (sigev_signo @ offset 8)
 /// is delivered once when a message arrives on an empty queue.
 pub fn mqNotify(mqd: u32, notif_ptr: u64) i64 {
-    if (!currentTaskOwnsFd(mqd)) return EBADF;
+    const owner_idx = sched.currentTaskIndex() orelse return EBADF;
     // Read sigev_signo/sigev_notify before taking mq_lock (user copies walk
     // page tables). Layout matches posix_timer.Sigevent: value@0, signo@8,
     // notify@12.
@@ -806,7 +830,7 @@ pub fn mqNotify(mqd: u32, notif_ptr: u64) i64 {
     const flags = mq_lock.acquire();
     defer mq_lock.release(flags);
 
-    const q = findByFd(mqd) orelse return EBADF;
+    const q = findQueueForDescription(owner_idx, mqd) orelse return EBADF;
 
     if (notif_ptr == 0) {
         // Unregister notification
@@ -851,22 +875,24 @@ pub fn clearNotifyForTask(task_idx: u32) void {
 /// fully-closed, unlinked, drained queue frees its slot.
 pub fn mqClose(mqd: u32) i64 {
     const flags = mq_lock.acquire();
-    defer mq_lock.release(flags);
 
-    const owner_idx = sched.currentTaskIndex() orelse return EBADF;
-    const queue_idx = findQueueIndexByFd(mqd) orelse return EBADF;
-    if (task_refs[owner_idx][queue_idx] == 0) return EBADF;
-    const q = &queues[queue_idx];
-    task_refs[owner_idx][queue_idx] -= 1;
-    q.open_count -|= 1;
-    if (q.marked_removed and q.count == 0 and q.open_count == 0) {
-        var wakes = WakeBatch{};
-        freeQueue(q, &wakes);
+    const owner_idx = sched.currentTaskIndex() orelse {
         mq_lock.release(flags);
-        wakes.wake();
-        return 0;
+        return EBADF;
+    };
+    const handle = descriptorHandle(owner_idx, mqd) orelse {
+        mq_lock.release(flags);
+        return EBADF;
+    };
+    const desc = &descriptions[handle.desc_idx];
+    if (!desc.active or description_generations[handle.desc_idx] != handle.desc_generation) {
+        mq_lock.release(flags);
+        return EBADF;
     }
+    var wakes = WakeBatch{};
+    closeHandleLocked(owner_idx, handle.handle_idx, &wakes);
     mq_lock.release(flags);
+    wakes.wake();
     return 0;
 }
 
@@ -876,14 +902,8 @@ pub fn closeRefsForTask(task_idx: u32) void {
     if (task_idx >= task.MAX_TASKS) return;
     var wakes = WakeBatch{};
     const flags = mq_lock.acquire();
-    for (&queues, 0..) |*q, queue_idx| {
-        const refs = task_refs[task_idx][queue_idx];
-        if (refs == 0) continue;
-        task_refs[task_idx][queue_idx] = 0;
-        q.open_count -|= refs;
-        if (q.marked_removed and q.count == 0 and q.open_count == 0) {
-            freeQueue(q, &wakes);
-        }
+    for (0..MAX_TASK_MQ_DESCRIPTORS) |handle_idx| {
+        if (task_handles[task_idx][handle_idx].open) closeHandleLocked(task_idx, @intCast(handle_idx), &wakes);
     }
     mq_lock.release(flags);
     wakes.wake();
@@ -894,11 +914,16 @@ pub fn inheritRefs(parent_idx: u32, child_idx: u32) void {
     if (parent_idx >= task.MAX_TASKS or child_idx >= task.MAX_TASKS) return;
     const flags = mq_lock.acquire();
     defer mq_lock.release(flags);
-    for (&queues, 0..) |*q, queue_idx| {
-        const refs = task_refs[parent_idx][queue_idx];
-        if (refs == 0 or !q.active) continue;
-        task_refs[child_idx][queue_idx] = ownership_policy.inheritedReferences(refs);
-        q.open_count += refs;
+    for (0..MAX_TASK_MQ_DESCRIPTORS) |handle_idx| {
+        const parent_handle = task_handles[parent_idx][handle_idx];
+        if (!parent_handle.open) continue;
+        const child_handle = &task_handles[child_idx][handle_idx];
+        if (child_handle.open) continue;
+        const desc = &descriptions[parent_handle.desc_idx];
+        if (!desc.active or description_generations[parent_handle.desc_idx] != parent_handle.desc_generation) continue;
+        child_handle.* = parent_handle;
+        desc.refs += 1;
+        queues[desc.queue_idx].open_count += 1;
     }
 }
 
@@ -907,17 +932,19 @@ pub fn inheritRefs(parent_idx: u32, child_idx: u32) void {
 /// Linux struct mq_attr is four 8-byte longs (32 bytes):
 /// mq_flags@0, mq_maxmsg@8, mq_msgsize@16, mq_curmsgs@24.
 pub fn mqGetSetAttr(mqd: u32, newattr_ptr: u64, oldattr_ptr: u64) i64 {
-    if (!currentTaskOwnsFd(mqd)) return EBADF;
+    const owner_idx = sched.currentTaskIndex() orelse return EBADF;
     if (oldattr_ptr != 0 and !copy.validateUserBufferWritable(oldattr_ptr, 32)) return EFAULT;
     const flags = mq_lock.acquire();
     defer mq_lock.release(flags);
 
-    const q = findByFd(mqd) orelse return EBADF;
+    const handle = descriptorHandle(owner_idx, mqd) orelse return EBADF;
+    const desc = &descriptions[handle.desc_idx];
+    const q = &queues[desc.queue_idx];
 
     // Write old attributes if requested
     if (oldattr_ptr != 0) {
         var attr_buf: [32]u8 = @splat(0);
-        bo.writeI64Le(attr_buf[0..8], q.flags);
+        bo.writeI64Le(attr_buf[0..8], desc.status_flags);
         bo.writeI64Le(attr_buf[8..16], q.max_msg);
         bo.writeI64Le(attr_buf[16..24], q.msg_size);
         bo.writeI64Le(attr_buf[24..32], q.count);
@@ -925,46 +952,98 @@ pub fn mqGetSetAttr(mqd: u32, newattr_ptr: u64, oldattr_ptr: u64) i64 {
     }
 
     // Read new attributes if provided
-    if (newattr_ptr != 0 and newattr_ptr < 0x0000_8000_0000_0000) {
+    if (newattr_ptr != 0 and newattr_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+    if (newattr_ptr != 0) {
         var attr_buf: [32]u8 = undefined;
-        if (copy.copyFromUser(&attr_buf, @ptrFromInt(newattr_ptr), 32) == 32) {
-            const new_flags: u32 = @truncate(@as(u64, @bitCast(bo.readI64Le(attr_buf[0..8]))));
-            // Only O_NONBLOCK can be changed
-            q.flags = (q.flags & ~@as(u32, O_NONBLOCK)) | (new_flags & O_NONBLOCK);
-        }
+        if (copy.copyFromUser(&attr_buf, @ptrFromInt(newattr_ptr), 32) != 32) return EFAULT;
+        const new_flags: u32 = @truncate(@as(u64, @bitCast(bo.readI64Le(attr_buf[0..8]))));
+        desc.status_flags = (desc.status_flags & ~@as(u32, O_NONBLOCK)) | (new_flags & O_NONBLOCK);
     }
 
     return 0;
 }
 
-// ── Internal helpers ──
+// ── Internal descriptor helpers ──
 
-fn findByFd(fd: u32) ?*MqQueue {
-    for (&queues) |*q| {
-        if (q.active and @as(i32, @bitCast(fd)) == q.fd) return q;
+const HandleRef = struct { handle_idx: u32, desc_idx: u32, desc_generation: u64 };
+const Resolved = struct { queue: *MqQueue, description: *OpenDescription };
+
+fn descriptorHandle(task_idx: u32, mqd: u32) ?HandleRef {
+    const handle_idx = descriptor_policy.decodeToken(mqd) orelse return null;
+    if (handle_idx >= MAX_TASK_MQ_DESCRIPTORS) return null;
+    const handle = task_handles[task_idx][handle_idx];
+    if (!handle.open or handle.desc_idx >= MAX_OPEN_DESCRIPTIONS) return null;
+    const desc = descriptions[handle.desc_idx];
+    if (!desc.active or description_generations[handle.desc_idx] != handle.desc_generation) return null;
+    return .{ .handle_idx = handle_idx, .desc_idx = handle.desc_idx, .desc_generation = handle.desc_generation };
+}
+
+fn findDescription(task_idx: u32, mqd: u32) ?*OpenDescription {
+    const ref = descriptorHandle(task_idx, mqd) orelse return null;
+    return &descriptions[ref.desc_idx];
+}
+
+fn findQueueForDescription(task_idx: u32, mqd: u32) ?*MqQueue {
+    const desc = findDescription(task_idx, mqd) orelse return null;
+    if (desc.queue_idx >= MAX_QUEUES) return null;
+    const q = &queues[desc.queue_idx];
+    if (!q.active or queue_generations[desc.queue_idx] != desc.queue_generation) return null;
+    return q;
+}
+
+fn openDescription(queue_idx: u32, q: *MqQueue, owner_idx: u32, oflag: u32) i64 {
+    var handle_idx: ?u32 = null;
+    for (0..MAX_TASK_MQ_DESCRIPTORS) |i| {
+        if (!task_handles[owner_idx][i].open) { handle_idx = @intCast(i); break; }
     }
-    return null;
+    const desc_idx = for (0..MAX_OPEN_DESCRIPTIONS) |i| {
+        if (!descriptions[i].active) break @as(?u32, @intCast(i));
+    } else null;
+    if (handle_idx == null or desc_idx == null) return EMFILE;
+    const di = desc_idx.?;
+    description_generations[di] +%= 1;
+    if (description_generations[di] == 0) description_generations[di] = 1;
+    descriptions[di] = .{
+        .active = true,
+        .queue_idx = queue_idx,
+        .queue_generation = queue_generations[queue_idx],
+        .description_generation = description_generations[di],
+        .access = oflag & descriptor_policy.O_ACCMODE,
+        .status_flags = descriptor_policy.statusFlags(oflag),
+        .cloexec = oflag & O_CLOEXEC != 0,
+        .refs = 1,
+    };
+    task_handles[owner_idx][handle_idx.?] = .{ .desc_idx = di, .desc_generation = description_generations[di], .open = true };
+    q.open_count += 1;
+    return @intCast(descriptor_policy.DESCRIPTOR_BASE + handle_idx.?);
 }
 
-fn findQueueIndexByFd(fd: u32) ?u32 {
-    for (&queues, 0..) |*q, i| {
-        if (q.active and @as(i32, @bitCast(fd)) == q.fd) return @intCast(i);
+fn closeHandleLocked(task_idx: u32, handle_idx: u32, wakes: *WakeBatch) void {
+    const handle = &task_handles[task_idx][handle_idx];
+    if (!handle.open) return;
+    const desc_idx = handle.desc_idx;
+    const desc = &descriptions[desc_idx];
+    handle.* = .{};
+    if (desc.refs > 0) desc.refs -= 1;
+    if (desc.refs == 0) {
+        const q = &queues[desc.queue_idx];
+        q.open_count -|= 1;
+        if (q.marked_removed and q.count == 0 and q.open_count == 0) freeQueue(q, wakes);
+        desc.* = .{};
     }
-    return null;
 }
 
-fn currentTaskOwnsFd(fd: u32) bool {
-    const owner_idx = sched.currentTaskIndex() orelse return false;
-    const queue_idx = findQueueIndexByFd(fd) orelse return false;
-    return task_refs[owner_idx][queue_idx] != 0;
-}
-
-var next_mq_fd: i32 = 300; // start from high fd number to avoid conflicts
-
-fn allocFd() i32 {
-    const fd = next_mq_fd;
-    next_mq_fd += 1;
-    return fd;
+/// Close current-task MQ descriptions marked O_CLOEXEC before a new image runs.
+pub fn closeCloexecForTask(task_idx: u32) void {
+    if (task_idx >= task.MAX_TASKS) return;
+    var wakes = WakeBatch{};
+    const flags = mq_lock.acquire();
+    for (0..MAX_TASK_MQ_DESCRIPTORS) |i| {
+        const h = task_handles[task_idx][i];
+        if (h.open and descriptions[h.desc_idx].cloexec) closeHandleLocked(task_idx, @intCast(i), &wakes);
+    }
+    mq_lock.release(flags);
+    wakes.wake();
 }
 
 fn readUserString(user_ptr: u64, buf: []u8) usize {

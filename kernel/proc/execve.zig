@@ -151,6 +151,9 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
     syscall_entry.setUserTlsBase(0);
 
     // Switch to new address space
+    if (sched.currentTaskIndex()) |task_idx| {
+        @import("../ipc/posix_mq.zig").closeCloexecForTask(task_idx);
+    }
     @import("../arch/arch.zig").pcid.switchCr3(result.pml4);
     // L1: the old image's user-driver resources (IRQ registrations, DMA
     // buffers, MMIO mappings) die with it, before the address-space walk.
