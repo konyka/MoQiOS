@@ -354,6 +354,8 @@ test "POSIX MQ timeout distinguishes absent and zero deadlines" {
         std.meta.activeTag(posix_mq_policy.fromNanoseconds(false, null)) == .none,
     );
     try std.testing.expectEqual(@as(u64, 0), posix_mq_policy.fromNanoseconds(true, 0).deadline);
+    try std.testing.expect(posix_mq_policy.deadlineTokenMatches(4, 9, 4, 9));
+    try std.testing.expect(!posix_mq_policy.deadlineTokenMatches(4, 9, 4, 10));
 }
 
 test "POSIX MQ rejects an undersized receive buffer" {

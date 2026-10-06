@@ -137,20 +137,34 @@ fn isTimedOut(abs_timeout_ns: mq_timeout_policy.Timeout) bool {
 // it. Same fix as futex.zig: per-task deadline + bitmap, scanned by
 // timerTick from the BSP maintenance tick (sched.zig).
 var wait_deadlines: [task.MAX_TASKS]u64 = @splat(0);
+var wait_incarnations: [task.MAX_TASKS]u64 = @splat(0);
 pub var mq_wait_bm: u64 = 0;
 
 /// Arm a timed-wait deadline. Called while enqueuing under mq_lock; the tick
 /// only wakes (the waiter unlinks its own node on resume), so this is
 /// race-free with the wait queues.
-fn armWaitDeadline(task_idx: u32, deadline_ns: u64) void {
+fn armWaitDeadline(task_idx: u32, deadline_ns: u64, incarnation: u64) void {
     wait_deadlines[task_idx] = deadline_ns;
+    wait_incarnations[task_idx] = incarnation;
     _ = @atomicRmw(u64, &mq_wait_bm, .Or, @as(u64, 1) << @intCast(task_idx), .seq_cst);
 }
 
 /// Disarm a timed-wait deadline (woken, timed out, or wait abandoned).
 fn disarmWaitDeadline(task_idx: u32) void {
     wait_deadlines[task_idx] = 0;
+    wait_incarnations[task_idx] = 0;
     _ = @atomicRmw(u64, &mq_wait_bm, .And, ~(@as(u64, 1) << @intCast(task_idx)), .seq_cst);
+}
+
+fn disarmWaitDeadlineIfToken(task_idx: u32, deadline_ns: u64, incarnation: u64) bool {
+    if (!@import("posix_mq_policy.zig").deadlineTokenMatches(
+        deadline_ns,
+        incarnation,
+        wait_deadlines[task_idx],
+        wait_incarnations[task_idx],
+    )) return false;
+    disarmWaitDeadline(task_idx);
+    return true;
 }
 
 /// Drive timed mq waits. Called from the BSP maintenance tick (sched.zig,
@@ -163,10 +177,16 @@ pub fn timerTick(now_ns: u64) void {
         bm &= bm - 1;
         const idx: u32 = i;
         const deadline = wait_deadlines[idx];
+        const incarnation = wait_incarnations[idx];
         if (now_ns < deadline) continue;
-        disarmWaitDeadline(idx);
-        // Republish like futex wakeN: a bare .ready starves on busy CPUs.
-        task.unblockTask(idx);
+        if (!disarmWaitDeadlineIfToken(idx, deadline, incarnation)) continue;
+        if (task.pinTaskByIndex(idx, true)) |pin_value| {
+            var pin = pin_value;
+            defer pin.release();
+            if (pin.incarnation == incarnation) {
+                task.unblockTaskIfIncarnation(idx, pin.tid, incarnation);
+            }
+        }
         task.kickRemoteForTask(idx);
     }
 }
@@ -371,14 +391,14 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
                 return EAGAIN; // kernel thread: cannot block
             };
             node.task_idx = cur_idx;
-            node.next = q.send_waiters;
-            q.send_waiters = &node;
-            const cur_task = task.getTask(cur_idx) orelse {
+            var cur_pin = task.pinTaskByIndex(cur_idx, false) orelse {
                 mq_lock.release(flags);
                 return EAGAIN;
             };
-            if (deadlineNs(abs_timeout_ns)) |deadline| armWaitDeadline(cur_idx, deadline);
-            cur_task.state = .blocked;
+            node.next = q.send_waiters;
+            q.send_waiters = &node;
+            if (deadlineNs(abs_timeout_ns)) |deadline| armWaitDeadline(cur_idx, deadline, cur_pin.incarnation);
+            cur_pin.task.state = .blocked;
             mq_lock.release(flags);
             sched.forceReschedule();
             sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
@@ -392,8 +412,11 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
             // Signal kick (sendSignal unblocks without granting): die on a
             // fatal signal, or EINTR so the handler can run on return.
             const sig_mod = @import("../proc/signal.zig");
-            if (sig_mod.pendingFatal(cur_task)) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
-            if (sig_mod.pendingActionable(cur_task)) return EINTR;
+            const fatal = sig_mod.pendingFatal(cur_pin.task);
+            const actionable = sig_mod.pendingActionable(cur_pin.task);
+            cur_pin.release();
+            if (fatal) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
+            if (actionable) return EINTR;
             continue;
         }
 
@@ -507,14 +530,14 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
                 return EAGAIN; // kernel thread: cannot block
             };
             node.task_idx = cur_idx;
-            node.next = q.recv_waiters;
-            q.recv_waiters = &node;
-            const cur_task = task.getTask(cur_idx) orelse {
+            var cur_pin = task.pinTaskByIndex(cur_idx, false) orelse {
                 mq_lock.release(flags);
                 return EAGAIN;
             };
-            if (deadlineNs(abs_timeout_ns)) |deadline| armWaitDeadline(cur_idx, deadline);
-            cur_task.state = .blocked;
+            node.next = q.recv_waiters;
+            q.recv_waiters = &node;
+            if (deadlineNs(abs_timeout_ns)) |deadline| armWaitDeadline(cur_idx, deadline, cur_pin.incarnation);
+            cur_pin.task.state = .blocked;
             mq_lock.release(flags);
             sched.forceReschedule();
             sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
@@ -525,8 +548,11 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
             mq_lock.release(flags2);
             // Signal kick: die on a fatal signal, or EINTR (see mqTimedSend).
             const sig_mod = @import("../proc/signal.zig");
-            if (sig_mod.pendingFatal(cur_task)) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
-            if (sig_mod.pendingActionable(cur_task)) return EINTR;
+            const fatal = sig_mod.pendingFatal(cur_pin.task);
+            const actionable = sig_mod.pendingActionable(cur_pin.task);
+            cur_pin.release();
+            if (fatal) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
+            if (actionable) return EINTR;
             continue;
         }
 
