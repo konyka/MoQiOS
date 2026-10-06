@@ -38,6 +38,7 @@ const posix_mq_attr_policy = kt.posix_mq_attr_policy;
 const posix_mq_receive_policy = kt.posix_mq_receive_policy;
 const posix_mq_priority_policy = kt.posix_mq_priority_policy;
 const posix_mq_ownership_policy = kt.posix_mq_ownership_policy;
+const posix_mq_descriptor_policy = kt.posix_mq_descriptor_policy;
 const sysv_shm_policy = kt.sysv_shm_policy;
 const sysv_shm_lifecycle_policy = kt.sysv_shm_lifecycle_policy;
 const time_set_policy = kt.time_set_policy;
@@ -1216,6 +1217,17 @@ test "new task creation restores NOFILE defaults after zeroSlot" {
     const limit = rlimit.Policy.default(8);
     try std.testing.expectEqual(@as(u64, 8), limit.cur);
     try std.testing.expectEqual(@as(u64, 8), limit.max);
+}
+
+test "POSIX MQ uses per-open descriptions and validates descriptor semantics" {
+    const source = kt.posix_mq_source;
+    try std.testing.expect(std.mem.indexOf(u8, source, "var descriptions:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "var task_handles:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "q.fd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "q.flags") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return EMSGSIZE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "closeCloexecForTask") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "newattr_ptr >= 0x0000_8000_0000_0000") != null);
 }
 
 test "NOFILE blocks future allocations but keeps existing descriptors" {

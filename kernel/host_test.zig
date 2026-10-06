@@ -126,6 +126,7 @@ pub const posix_mq_source = @embedFile("ipc/posix_mq.zig");
 pub const posix_mq_receive_policy = @import("ipc/posix_mq_receive_policy.zig");
 pub const posix_mq_priority_policy = @import("ipc/posix_mq_priority_policy.zig");
 pub const posix_mq_ownership_policy = @import("ipc/posix_mq_ownership_policy.zig");
+pub const posix_mq_descriptor_policy = @import("ipc/posix_mq_descriptor_policy.zig");
 pub const owner_gen_policy = @import("ipc/owner_gen_policy.zig");
 pub const ipc_policy = @import("ipc/ipc_policy.zig");
 pub const ipc_source = @embedFile("ipc/ipc.zig");
