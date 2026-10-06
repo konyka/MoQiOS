@@ -33,6 +33,7 @@ const task_op_policy = kt.task_op_policy;
 const clone3_policy = kt.clone3_policy;
 const posix_timer_policy = kt.posix_timer_policy;
 const posix_mq_policy = kt.posix_mq_policy;
+const posix_mq_wait_policy = kt.posix_mq_wait_policy;
 const posix_mq_attr_policy = kt.posix_mq_attr_policy;
 const posix_mq_receive_policy = kt.posix_mq_receive_policy;
 const posix_mq_priority_policy = kt.posix_mq_priority_policy;
@@ -179,6 +180,17 @@ test "IPC direct wake paths pin targets before consuming registrations" {
     try std.testing.expect(std.mem.indexOf(u8, source, "endpoints[caller_endpoint].owner_tid != owner_pin.tid") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "Keep the registration intact") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "Do not consume a message") != null);
+}
+
+test "POSIX MQ production keeps waiter ownership and queue generations" {
+    const mq_source = kt.posix_mq_source;
+    const task_source = kt.task_source;
+    try std.testing.expect(std.mem.indexOf(u8, task_source, "mq_waiter: MqWaiter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, task_source, "detachWaiterForTask(idx)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mq_source, "queue_generations") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mq_source, "queue_generations[idx] +%= 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mq_source, "if (waiter.linked)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mq_source, "freeQueue(q, &wakes)") != null);
 }
 
 test "native IPC Message ABI remains exactly 256 bytes" {
