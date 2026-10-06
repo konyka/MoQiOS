@@ -25,7 +25,12 @@ const nvme_flush_policy = kt.nvme_flush_policy;
 const ipc_lifecycle_policy = kt.ipc_lifecycle_policy;
 const ipc_endpoint_policy = kt.ipc_endpoint_policy;
 const capability_policy = kt.capability_policy;
+const capability_generation_policy = kt.capability_generation_policy;
 const capability_lifecycle_policy = kt.capability_lifecycle_policy;
+const ipc_timeout_policy = kt.ipc_timeout_policy;
+const task_lifetime_policy = kt.task_lifetime_policy;
+const time_policy = kt.time_policy;
+const time_pointer_policy = kt.time_pointer_policy;
 const socket_policy = kt.socket_policy;
 const socket_address_policy = kt.socket_address_policy;
 const ipc_call_reply_policy = kt.ipc_call_reply_policy;
@@ -68,6 +73,21 @@ test "clone rejects ignored TID flags and incoherent thread combinations" {
     try std.testing.expect(!clone_flags_policy.valid(clone_flags_policy.CLONE_SIGHAND, true));
     try std.testing.expect(!clone_flags_policy.valid(clone_flags_policy.CLONE_FS, true));
     try std.testing.expect(clone_flags_policy.valid(clone_flags_policy.CLONE_VM | clone_flags_policy.CLONE_PARENT_SETTID, true));
+}
+
+test "clone accepts pthread-style CLONE_THREAD only inside a shared address space" {
+    const p = clone_flags_policy;
+    // moqi_libc pthread_create.
+    try std.testing.expect(p.valid(p.CLONE_VM | p.CLONE_FILES | p.CLONE_THREAD | p.CLONE_SETTLS, true));
+    try std.testing.expect(p.valid(p.CLONE_VM | p.CLONE_FILES | p.CLONE_THREAD, true));
+    try std.testing.expect(p.valid(p.CLONE_VM | p.CLONE_THREAD | p.CLONE_CHILD_CLEARTID, true));
+    // A thread group member without the group's address space is incoherent.
+    try std.testing.expect(!p.valid(p.CLONE_THREAD, true));
+    try std.testing.expect(!p.valid(p.CLONE_FILES | p.CLONE_THREAD, true));
+    try std.testing.expect(!p.valid(p.CLONE_VM | p.CLONE_THREAD, false));
+    // Shared signal-handler and fs_struct objects are still unimplemented.
+    try std.testing.expect(!p.valid(p.CLONE_VM | p.CLONE_THREAD | p.CLONE_SIGHAND, true));
+    try std.testing.expect(!p.valid(p.CLONE_VM | p.CLONE_FS | p.CLONE_FILES | p.CLONE_THREAD, true));
 }
 
 test "pidfd_open accepts only zero flags" {
@@ -165,6 +185,17 @@ test "POSIX MQ descriptor policy validates access and flags" {
     try std.testing.expect(!posix_mq_descriptor_policy.canReceive(posix_mq_descriptor_policy.O_WRONLY));
 }
 
+test "POSIX MQ descriptor tokens round-trip only inside the descriptor window" {
+    const p = posix_mq_descriptor_policy;
+    try std.testing.expectEqual(@as(u32, p.DESCRIPTOR_BASE), p.tokenValue(0));
+    try std.testing.expectEqual(@as(?u32, 0), p.decodeToken(p.tokenValue(0)));
+    try std.testing.expectEqual(@as(?u32, p.MAX_DESCRIPTORS - 1), p.decodeToken(p.tokenValue(p.MAX_DESCRIPTORS - 1)));
+    try std.testing.expect(p.decodeToken(p.DESCRIPTOR_BASE - 1) == null);
+    try std.testing.expect(p.decodeToken(p.DESCRIPTOR_BASE + p.MAX_DESCRIPTORS) == null);
+    try std.testing.expect(p.decodeToken(0) == null);
+    try std.testing.expect(p.decodeToken(std.math.maxInt(u32)) == null);
+}
+
 test "production task slot reset preserves its incarnation" {
     var bytes = [_]u8{0} ** 32;
     const incarnation_offset = 8;
@@ -178,15 +209,26 @@ test "production task slot reset preserves its incarnation" {
 
 test "IPC call tokens do not reuse endpoint identifiers" {
     const call_reply = kt.ipc_call_reply_policy;
-    try std.testing.expect(call_reply.tokenBindsCallee(41, 7, 41, 7));
-    try std.testing.expect(!call_reply.tokenBindsCallee(41, 7, 41, 8));
-    try std.testing.expect(!call_reply.tokenBindsCallee(41, 7, 42, 7));
+    try std.testing.expect(call_reply.tokenBindsCallee(41, 7, 7, 7));
+    try std.testing.expect(!call_reply.tokenBindsCallee(41, 7, 7, 8));
+    try std.testing.expect(!call_reply.tokenBindsCallee(41, 7, 8, 7));
+    try std.testing.expect(!call_reply.tokenBindsCallee(0, 7, 7, 7));
 }
 
 test "IPC direct wake paths pin targets before consuming registrations" {
     const source = kt.ipc_source;
-    try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, source, "task.pinTaskByIndex("));
-    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, source, "task.unblockTaskIfIncarnation"));
+    const pin_call = "task.pinTaskByIndex(";
+    const wake_call = "task.unblockTaskIfIncarnation";
+    var wakes: usize = 0;
+    var previous_wake: usize = 0;
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, source, cursor, wake_call)) |wake_at| : (cursor = wake_at + wake_call.len) {
+        const pin_at = std.mem.lastIndexOf(u8, source[0..wake_at], pin_call) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(pin_at >= previous_wake);
+        previous_wake = wake_at;
+        wakes += 1;
+    }
+    try std.testing.expect(wakes >= 4);
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, source, ", false) orelse"));
     try std.testing.expect(std.mem.indexOf(u8, source, "endpoints[caller_endpoint].owner_tid != owner_pin.tid") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "Keep the registration intact") != null);
@@ -277,7 +319,9 @@ test "IPC timeout maintenance is wired into every timer backend" {
 
 test "absolute timer deadlines are converted from their clock domain" {
     try std.testing.expectEqual(@as(?u64, 100), time_policy.absoluteDeltaNs(0, 1_100, 1_000, 0));
-    try std.testing.expectEqual(@as(?u64, 100), time_policy.absoluteDeltaNs(0, 1_100, 1_000, 1_000));
+    try std.testing.expectEqual(@as(?u64, 100), time_policy.absoluteDeltaNs(0, 2_100, 1_000, 1_000));
+    try std.testing.expectEqual(@as(?u64, 0), time_policy.absoluteDeltaNs(0, 1_100, 1_000, 1_000));
+    try std.testing.expectEqual(@as(?u64, 1_100), time_policy.absoluteDeltaNs(0, 1_100, 1_000, -1_000));
     try std.testing.expectEqual(@as(?u64, 100), time_policy.absoluteDeltaNs(1, 1_100, 1_000, 99_000));
     try std.testing.expectEqual(@as(?u64, 0), time_policy.absoluteDeltaNs(0, 900, 1_000, 0));
     try std.testing.expect(time_policy.absoluteDeltaNs(999, 1, 1, 0) == null);
@@ -357,11 +401,27 @@ test "time output pointer failures use EFAULT" {
     try std.testing.expectEqual(@as(i64, -14), time_pointer_policy.invalidPointerErrno(0x8000, 0x8000));
 }
 
-test "sigreturn rejects unsafe user register targets and flags" {
+test "sigreturn rejects unsafe user register targets" {
     try std.testing.expect(sigreturn_policy.userTargetValid(0x4000));
+    try std.testing.expect(!sigreturn_policy.userTargetValid(0));
     try std.testing.expect(!sigreturn_policy.userTargetValid(sigreturn_policy.USER_LIMIT));
-    try std.testing.expect(sigreturn_policy.rflagsValid(0x202));
-    try std.testing.expect(!sigreturn_policy.rflagsValid(0x4202));
+}
+
+test "sigreturn sanitizes saved RFLAGS instead of rejecting fault-frame state" {
+    const p = sigreturn_policy;
+    try std.testing.expectEqual(@as(u64, 0x202), p.sanitizeRflags(0x202));
+    // A handler entered from a #PF frame carries RF=1; sigreturn must accept it.
+    try std.testing.expectEqual(@as(u64, 0x10246), p.sanitizeRflags(0x10246));
+    // Arithmetic flags, TF, DF, AC and ID are user-owned.
+    try std.testing.expectEqual(@as(u64, 0x240fd7), p.sanitizeRflags(0x240fd7));
+    // IF and the reserved bit are forced on.
+    try std.testing.expectEqual(@as(u64, 0x202), p.sanitizeRflags(0));
+    // IOPL, NT, VM, VIF and VIP never reach user mode.
+    try std.testing.expectEqual(@as(u64, 0x202), p.sanitizeRflags(0x3202));
+    try std.testing.expectEqual(@as(u64, 0x202), p.sanitizeRflags(0x4202));
+    try std.testing.expectEqual(@as(u64, 0x202), p.sanitizeRflags(0x20202));
+    try std.testing.expectEqual(@as(u64, 0x202), p.sanitizeRflags(0x180202));
+    try std.testing.expectEqual(p.USER_RFLAGS | 0x202, p.sanitizeRflags(std.math.maxInt(u64)));
 }
 
 test "clone3 validates size before bounded argument copying" {
@@ -4536,7 +4596,6 @@ test "tcp: TIME_WAIT v4 tuple match requires remote_ip like the v6 path" {
 }
 
 test "time policy: timespec→ns guards overflow and invalid fields" {
-    const time_policy = kt.time_policy;
     try std.testing.expectEqual(@as(?u64, 0), time_policy.timespecToNs(0, 0));
     try std.testing.expectEqual(@as(?u64, 1_500_000_000), time_policy.timespecToNs(1, 500_000_000));
     // Largest representable value: 18446744073 s + 709551615 ns == maxInt(u64).
@@ -4553,7 +4612,6 @@ test "time policy: timespec→ns guards overflow and invalid fields" {
 }
 
 test "time policy: ns→ticks reports overflow, ticks→ns saturates" {
-    const time_policy = kt.time_policy;
     try std.testing.expectEqual(@as(?u64, 0), time_policy.nsToTicks(0, 100));
     try std.testing.expectEqual(@as(?u64, 1), time_policy.nsToTicks(1, 100));
     try std.testing.expectEqual(@as(?u64, 100), time_policy.nsToTicks(1_000_000_000, 100));
@@ -4886,7 +4944,6 @@ test "eventfd policy: POLLOUT predicate admits a write of 1 below the cap" {
 }
 
 test "time policy: timerfd_create accepts only TFD_CLOEXEC and TFD_NONBLOCK" {
-    const time_policy = kt.time_policy;
     try std.testing.expect(time_policy.timerfdFlagsValid(0));
     try std.testing.expect(time_policy.timerfdFlagsValid(0x800)); // TFD_NONBLOCK
     try std.testing.expect(time_policy.timerfdFlagsValid(0x80000)); // TFD_CLOEXEC

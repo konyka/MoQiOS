@@ -1010,7 +1010,7 @@ fn openDescription(queue_idx: u32, q: *MqQueue, owner_idx: u32, oflag: u32) i64 
     };
     task_handles[owner_idx][handle_idx.?] = .{ .desc_idx = di, .desc_generation = description_generations[di], .open = true };
     q.open_count += 1;
-    return @intCast(descriptor_policy.DESCRIPTOR_BASE + handle_idx.?);
+    return @intCast(descriptor_policy.tokenValue(handle_idx.?));
 }
 
 fn closeHandleLocked(task_idx: u32, handle_idx: u32, wakes: *WakeBatch) void {

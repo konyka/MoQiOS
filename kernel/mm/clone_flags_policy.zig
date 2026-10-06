@@ -9,9 +9,11 @@ pub const CLONE_SETTLS: u64 = 0x80000;
 pub const CLONE_PARENT_SETTID: u64 = 0x100000;
 pub const CLONE_CHILD_CLEARTID: u64 = 0x200000;
 
-// CLONE_FS/CLONE_SIGHAND/CLONE_THREAD do not yet have shared-object
-// lifetimes, so accepting them would silently provide copy semantics.
-pub const IMPLEMENTED_FLAGS: u64 = CLONE_VM | CLONE_FILES | CLONE_SETTLS;
+// CLONE_FS/CLONE_SIGHAND do not yet have shared-object lifetimes, so
+// accepting them would silently provide copy semantics. CLONE_THREAD is the
+// thread-group membership (`Task.is_thread`: getpid reports the tgid, waitpid
+// skips the member, exec is refused) and requires the group's address space.
+pub const IMPLEMENTED_FLAGS: u64 = CLONE_VM | CLONE_FILES | CLONE_THREAD | CLONE_SETTLS;
 pub const TID_FLAGS: u64 = CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
 
 pub fn pointerRequired(flags: u64, bit: u64) bool {
@@ -20,7 +22,7 @@ pub fn pointerRequired(flags: u64, bit: u64) bool {
 
 pub fn valid(flags: u64, has_mm: bool) bool {
     if (flags & ~(IMPLEMENTED_FLAGS | TID_FLAGS) != 0) return false;
-    if (flags & TID_FLAGS != 0 and flags & CLONE_VM == 0) return false;
+    if (flags & (TID_FLAGS | CLONE_THREAD) != 0 and flags & CLONE_VM == 0) return false;
     if (flags & CLONE_VM != 0 and !has_mm) return false;
     return true;
 }
@@ -28,6 +30,7 @@ pub fn valid(flags: u64, has_mm: bool) bool {
 test "clone policy rejects ignored TID flags and incoherent thread combinations" {
     const std = @import("std");
     try std.testing.expect(!valid(CLONE_VM | CLONE_THREAD | CLONE_SIGHAND, true));
+    try std.testing.expect(valid(CLONE_VM | CLONE_FILES | CLONE_THREAD | CLONE_SETTLS, true));
     try std.testing.expect(!valid(CLONE_THREAD, true));
     try std.testing.expect(!valid(CLONE_SIGHAND, true));
     try std.testing.expect(valid(CLONE_VM | CLONE_PARENT_SETTID, true));

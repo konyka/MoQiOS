@@ -103,7 +103,7 @@ void _start(void) {
     }
 
     const int64_t tid = syscall5(SYS_CLONE,
-                                 CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_THREAD,
+                                 CLONE_VM | CLONE_FILES | CLONE_THREAD,
                                  (uint64_t)(stack + STACK_SIZE - 16), 0, 0, 0);
 
     if (tid == 0) {

@@ -366,11 +366,17 @@ pub fn build(b: *std.Build) void {
         .{ .name = "kernel_shared", .path = "kernel/host_test.zig" },
     };
     for (host_test_modules) |m| {
-        test_module.addImport(m.name, b.createModule(.{
+        const host_module = b.createModule(.{
             .root_source_file = b.path(m.path),
             .target = b.graph.host,
             .optimize = optimize,
-        }));
+        });
+        // Zig rejects @embedFile outside a module's root directory, so the
+        // libc syscall header reaches the kernel module as a named import.
+        host_module.addAnonymousImport("moqi_syscalls_header", .{
+            .root_source_file = b.path("lib/moqi_libc/include/moqi_syscalls.h"),
+        });
+        test_module.addImport(m.name, host_module);
     }
     const lib_test = b.addTest(.{
         .root_module = test_module,

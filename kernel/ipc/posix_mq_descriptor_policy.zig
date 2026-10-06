@@ -11,7 +11,21 @@ pub const O_CREAT: u32 = 0o100;
 pub const O_EXCL: u32 = 0o200;
 pub const KNOWN_FLAGS: u32 = ACCESS_MASK | O_NONBLOCK | O_CLOEXEC | 0o100 | 0o200;
 
+/// Per-task descriptor slots. A descriptor value is `DESCRIPTOR_BASE + slot`,
+/// which keeps MQ descriptors disjoint from the fd table numbering.
+pub const MAX_DESCRIPTORS: u32 = 32;
+pub const DESCRIPTOR_BASE: u32 = 300;
+
 pub const Operation = enum { send, receive };
+
+pub fn tokenValue(slot: u32) u32 {
+    return DESCRIPTOR_BASE + slot;
+}
+
+pub fn decodeToken(mqd: u32) ?u32 {
+    if (mqd < DESCRIPTOR_BASE or mqd - DESCRIPTOR_BASE >= MAX_DESCRIPTORS) return null;
+    return mqd - DESCRIPTOR_BASE;
+}
 
 pub fn flagsValid(flags: u32) bool {
     return (flags & ~KNOWN_FLAGS) == 0 and (flags & ACCESS_MASK) != 3;

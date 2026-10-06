@@ -145,19 +145,19 @@ pub fn sigreturn() ?SigreturnResult {
     const sig_frame = readSignalFrame(user_rsp) orelse return null;
     const sigreturn_policy = @import("sigreturn_policy.zig");
     if (!sigreturn_policy.userTargetValid(sig_frame.rip) or
-        !sigreturn_policy.userTargetValid(sig_frame.rsp) or
-        !sigreturn_policy.rflagsValid(sig_frame.rflags)) return null;
+        !sigreturn_policy.userTargetValid(sig_frame.rsp)) return null;
+    const rflags = sigreturn_policy.sanitizeRflags(sig_frame.rflags);
     // M8-5b-1: per-CPU exec redirect for the syscall return path
     const pc = syscall_entry.getPerCpu();
     pc.exec_pending = 2;
     pc.exec_new_entry = sig_frame.rip;
     pc.exec_new_stack = sig_frame.rsp;
-    pc.exec_new_flags = sig_frame.rflags;
+    pc.exec_new_flags = rflags;
 
     return .{
         .rip = sig_frame.rip,
         .rsp = sig_frame.rsp,
-        .rflags = sig_frame.rflags,
+        .rflags = rflags,
         .rax = sig_frame.rax,
         .rbx = sig_frame.rbx,
         .rcx = sig_frame.rcx,
@@ -168,7 +168,7 @@ pub fn sigreturn() ?SigreturnResult {
         .r8 = sig_frame.r8,
         .r9 = sig_frame.r9,
         .r10 = sig_frame.r10,
-        .r11 = sig_frame.rflags, // r11 gets rflags for sysretq
+        .r11 = rflags, // r11 gets rflags for sysretq
         .r12 = sig_frame.r12,
         .r13 = sig_frame.r13,
         .r14 = sig_frame.r14,
