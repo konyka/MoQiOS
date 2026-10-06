@@ -130,3 +130,23 @@ pub fn keepsCpuOverIdle(cur_key: u16, next_key: u16, allowed_here: bool) bool {
 pub fn hasQuantumExpiry(policy: u8) bool {
     return policy != SCHED_FIFO;
 }
+
+/// Round-robin walk over a 64-slot occupancy bitmap: every set slot exactly
+/// once, starting at `start` (taken modulo 64) and wrapping to slot 0.
+pub const SlotCursor = struct {
+    high: u64,
+    low: u64,
+
+    pub fn init(bitmap: u64, start: u32) SlotCursor {
+        const s: u32 = start % 64;
+        const low_mask: u64 = if (s == 0) 0 else (~@as(u64, 0)) >> @intCast(64 - s);
+        return .{ .high = bitmap & ~low_mask, .low = bitmap & low_mask };
+    }
+
+    pub fn next(self: *SlotCursor) ?u32 {
+        const bits = if (self.high != 0) &self.high else if (self.low != 0) &self.low else return null;
+        const idx: u32 = @ctz(bits.*);
+        bits.* &= bits.* - 1;
+        return idx;
+    }
+};

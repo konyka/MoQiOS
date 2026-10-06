@@ -373,6 +373,10 @@ export fn frameGuardPanic(frame: *InterruptFrame) callconv(.c) noreturn {
 /// entry (e.g. a #PF inside this handler — the fork+SIGUSR1 COW fault path)
 /// clobbers the %gs:16 anchor, so the epilogue cannot trust it blindly.
 pub fn interruptDispatch(frame: *InterruptFrame) callconv(.c) u64 {
+    // Nested interrupt while copy_from_user has AC=1: clear it so the rest of
+    // the kernel cannot touch user pages with SMAP off. iretq restores the
+    // interrupted RFLAGS (and AC) for the copy.
+    @import("paging.zig").userAccessEnd();
     const se = @import("syscall_entry.zig");
     const sched = @import("../../proc/sched.zig");
     const pc = se.getPerCpu();

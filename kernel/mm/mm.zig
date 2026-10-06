@@ -5,7 +5,9 @@
 //! blocking scheduler operation or acquire task_lock while holding it.
 //!
 //! The single sanctioned task_lock → vm_lock edge is the reap-side
-//! userdrv.cleanupTask guard (task.zig reapZombies/waitpidScanLocked): it
+//! userdrv.cleanupTask guard (task.zig teardownResources) when it runs inline
+//! because the reaper thread (proc/reaper.zig) is not up yet; the reaper
+//! itself takes the guard without task_lock. The guard
 //! serialises a dead task's MMIO/DMA PTE unmaps against siblings still
 //! sharing the live space. Safe because vm_lock holders never wait on
 //! task_lock, and ServicingSpinlock waiters service pending TLB shootdowns

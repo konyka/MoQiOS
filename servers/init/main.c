@@ -227,6 +227,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello105"); /* futex/epoll timeouts expire on the next tick */
     run_test("hello106"); /* console writes stay cheap while fbcon scrolls */
     run_test("hello107"); /* cross-CPU kernel lock contention stays fair and bounded */
+    run_test("hello108"); /* orphan reaping never steals the CPU from an RT task */
 
     start_persistent_services();
 

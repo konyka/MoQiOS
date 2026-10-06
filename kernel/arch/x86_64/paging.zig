@@ -101,10 +101,18 @@ pub fn isUserWritable(root_phys: u64, virt: u64) bool {
     return pde.present and pde.huge_page and pde.user and pde.writable;
 }
 
-/// SK-40: bracket kernel touches of user pages. No-ops on x86 (SMAP is not
-/// enabled); riscv64 toggles sstatus.SUM here.
-pub fn userAccessBegin() void {}
-pub fn userAccessEnd() void {}
+/// SK-40: bracket kernel touches of user pages. On x86, `stac`/`clac` around
+/// the copy so CR4.SMAP allows the access; a no-op until cpu_protect.init
+/// sets `smap_live`. riscv64 toggles sstatus.SUM in its own paging module.
+pub var smap_live: bool = false;
+
+pub fn userAccessBegin() void {
+    if (smap_live) asm volatile ("stac" ::: .{ .memory = true });
+}
+
+pub fn userAccessEnd() void {
+    if (smap_live) asm volatile ("clac" ::: .{ .memory = true });
+}
 
 /// Map a 4KB virtual page to a physical frame.
 pub fn mapPage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void {

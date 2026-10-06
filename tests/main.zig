@@ -283,7 +283,7 @@ test "socket connect validates sockaddr lengths" {
 }
 
 test "x86 syscall SFMASK clears direction flag" {
-    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "wrmsr(MSR_SFMASK, 0x700)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "wrmsr(MSR_SFMASK, 0x40700)") != null);
 }
 
 test "IPC call/reply policy binds one reply to caller, callee and token" {

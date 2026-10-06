@@ -60,11 +60,12 @@ pub fn waitpidWithOptions(pid_raw: u64, status_ptr: u64, options: u32) i64 {
         parent.wait_cpu = @intCast(se.getPerCpu().cpu_id);
 
         switch (task_mod.waitpidScanLocked(cur_idx, pid, &exit_code)) {
-            .reaped => |child_tid| {
+            .reaped => |reaped| {
                 parent.waiting_for_child = false;
                 task_mod.unlockTask(tflags);
+                task_mod.finishReap(reaped);
                 if (!writeStatus(status_ptr, exit_code)) return -14;
-                return child_tid;
+                return reaped.tid;
             },
             .busy => {
                 // Gated zombie — nobody will re-wake us for it (its exitTask

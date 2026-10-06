@@ -24,6 +24,8 @@ const builtin = @import("builtin");
 const std = @import("std");
 const Mm = @import("../mm/mm.zig").Mm;
 const task_slot_lifetime = @import("task_slot_lifetime.zig");
+const reap_policy = @import("reap_policy.zig");
+const reaper = @import("reaper.zig");
 
 const PAGE_SIZE: u64 = 4096;
 const KERNEL_STACK_PAGES: u64 = 32;
@@ -99,6 +101,9 @@ pub const Task = struct {
     /// exit-time switch epilogue (which runs on this very stack) completed.
     exit_cpu: u8 = 255,
     exit_epoch: u64 = 0, // gate: reap when sched_entries[exit_cpu] >= exit_epoch + 3
+    /// Detached zombie queued for the reaper thread (proc/reaper.zig): its
+    /// slot stays allocated until the teardown frees it.
+    reap_pending: bool = false,
     /// Kernel stack base (lowest address, page-aligned).
     kernel_stack: u64,
     /// Kernel stack top (highest address — this is where RSP starts).
@@ -705,31 +710,13 @@ pub fn pickReadyForCpu(cpu: u8, after_idx: ?u32) ?u32 {
     // exactly like the old `best_prio = 255` initialiser.
     var best_key: u16 = sched_policy.MAX_PICK_KEY;
 
-    var pos: u32 = start;
-    var remaining: u32 = MAX_TASKS;
-    while (remaining > 0) {
-        const mask: u64 = if (pos == 0) ~@as(u64, 0) else ~@as(u64, 0) << @intCast(pos);
-        const available = slot_bitmap & mask;
-        const next_slot = if (available != 0) @ctz(available) else null;
-        if (next_slot == null or next_slot.? >= MAX_TASKS) break;
-        const idx: u32 = @intCast(next_slot.?);
-        remaining -= (idx - pos) + 1;
-        pos = idx + 1;
+    // Round-robin from `start`; a strictly better key found after the wrap
+    // still wins (equal keys keep the first, i.e. the round-robin, choice).
+    var it = sched_policy.SlotCursor.init(slot_bitmap, start);
+    while (it.next()) |idx| {
         considerReady(idx, cpu, &best_idx, &best_key);
         if (best_key == 0) break; // RT sched_priority 99 — nothing can outrank it
     }
-
-    if (best_idx == null and start > 0) {
-        const wrap_mask: u64 = if (start >= 64) 0 else (~@as(u64, 0)) >> @intCast(64 - start);
-        var bits = slot_bitmap & wrap_mask;
-        while (bits != 0) {
-            const idx: u32 = @intCast(@ctz(bits));
-            bits &= bits - 1;
-            considerReady(idx, cpu, &best_idx, &best_key);
-            if (best_key == 0) break;
-        }
-    }
-
     return best_idx;
 }
 
@@ -1206,76 +1193,134 @@ pub fn isCurrentOnOtherCpu(idx: u32, my_cpu: u32) bool {
     return false;
 }
 
-/// Reap orphaned zombie tasks — those whose parent has already exited.
-/// Zombies with a living parent are left for waitpid() to collect.
-pub fn reapZombies() u32 {
-    const flags = task_lock.acquire();
-    defer task_lock.release(flags);
+/// Quiesce-gate inputs for a zombie (task_lock held). See reap_policy.zig.
+fn zombieViewLocked(i: u32, t: *const Task) reap_policy.ZombieView {
+    const pc = @import("per_cpu.zig");
+    return .{
+        .is_zombie = t.state == .zombie,
+        .reap_pending = t.reap_pending,
+        .operation_refs = t.operation_refs,
+        // Still current on some CPU (owner hasn't switched away yet).
+        .current_somewhere = isCurrentOnAnyCpu(i),
+        .exit_cpu = t.exit_cpu,
+        .exit_epoch = t.exit_epoch,
+        .exit_cpu_entries = if (t.exit_cpu != 255)
+            @atomicLoad(u64, &pc.sched_entries[t.exit_cpu], .monotonic)
+        else
+            0,
+    };
+}
 
-    var reaped: u32 = 0;
-    var bits = slot_bitmap;
+/// The region table names file-backed or device mappings (see
+/// reap_policy.Lineage.maps_objects).
+fn mapsObjects(t: *const Task) bool {
+    var bits = t.mmap_active_bm;
     while (bits != 0) {
-        const i: u32 = @intCast(@ctz(bits));
+        const i: u6 = @truncate(@ctz(bits));
         bits &= bits - 1;
-        const t = &tasks[i];
-        if (t.state != .zombie) continue;
-        // An operation pin owns this slot until its Mm access is complete.
-        if (t.operation_refs != 0) continue;
-        // Still current on some CPU (owner hasn't switched away yet) —
-        // defer to the next reap interval instead of yanking a live kstack.
-        if (isCurrentOnAnyCpu(i)) continue;
-        // Same epilogue-safety gate as waitpid: only free the stack once a
-        // quiescing tick has passed on the exit CPU.
-        {
-            const pc = @import("per_cpu.zig");
-            if (t.exit_cpu != 255 and
-                @atomicLoad(u64, &pc.sched_entries[t.exit_cpu], .monotonic) < t.exit_epoch + 3)
-                continue;
-        }
-
-        // Check if parent is still alive
-        if (t.parent_tid != 0) {
-            if (findTaskByTidLocked(t.parent_tid) != null) {
-                // Parent still alive — leave for waitpid
-                continue;
-            }
-            // Parent gone — orphan, reap it
-        }
-
-        if (t.page_table_phys != 0) {
-            // L1: release user-driver resources (IRQ registrations, DMA
-            // buffers, MMIO mappings) before the address space walk.
-            // The dead task's space may still be shared by live CLONE_VM
-            // siblings, so its MMIO/DMA PTE unmaps run under the Mm's
-            // vm_lock. This is the sanctioned task_lock → vm_lock edge (see
-            // mm.zig's header): safe because vm_lock holders never wait on
-            // task_lock and ServicingSpinlock waiters service shootdowns
-            // while spinning. The Mm is still alive — it is released below.
-            {
-                var vm_guard = Mm.beginVmMutation(t.mm, @ptrCast(t)) catch Mm.VmLockGuard{};
-                defer vm_guard.release();
-                @import("../drivers/userdrv.zig").cleanupTask(t, t.page_table_phys);
-            }
-            // P1: tombstone any userspace-owned devfs nodes (drains their
-            // pending requests with -EIO).
-            @import("../fs/devfs_proxy.zig").cleanupTask(t);
-            // fb0: drop framebuffer mapping registry entries (restores the
-            // console mirror when the last one goes away).
-            @import("../drivers/fbdev.zig").cleanupTask(t);
-            // ioperm: return the TSS IOPB pages (allocated by ioperm_set).
-            @import("ioperm.zig").freeBitmap(t);
-            // G2: release file-region backing refs before the address space
-            // (destroyUserSpace walks page tables, not region metadata).
-            @import("../mm/mmap.zig").releaseFileRefs(t);
-            if (t.mm) |mm| mm.release() else @import("../mm/user_space.zig").destroyUserSpace(t.page_table_phys);
-            t.mm = null;
-        }
-        freeKernelStack(t.kernel_stack);
-        slot_bitmap &= ~(@as(u64, 1) << @intCast(i));
-        task_count -= 1;
-        uidTaskCountRemoveLocked(t.uid);
-        reaped += 1;
+        const r = &t.mmap_regions[i];
+        if (r.active and (r.no_free or r.file_kind != 0)) return true;
     }
+    return false;
+}
+
+/// Release everything a reaped zombie owns except its slot. Runs in the
+/// reaper thread (IRQs on, no task_lock) or, before the reaper exists,
+/// inline under task_lock.
+fn teardownResources(t: *Task) void {
+    if (t.page_table_phys != 0) {
+        // L1: release user-driver resources (IRQ registrations, DMA
+        // buffers, MMIO mappings) before the address space walk.
+        // The dead task's space may still be shared by live CLONE_VM
+        // siblings, so its MMIO/DMA PTE unmaps run under the Mm's vm_lock
+        // (when inline, this is the sanctioned task_lock → vm_lock edge, see
+        // mm.zig's header). The Mm is still alive — it is released below.
+        {
+            var vm_guard = Mm.beginVmMutation(t.mm, @ptrCast(t)) catch Mm.VmLockGuard{};
+            defer vm_guard.release();
+            @import("../drivers/userdrv.zig").cleanupTask(t, t.page_table_phys);
+        }
+        // P1: tombstone any userspace-owned devfs nodes (drains their
+        // pending requests with -EIO).
+        @import("../fs/devfs_proxy.zig").cleanupTask(t);
+        // fb0: drop framebuffer mapping registry entries (restores the
+        // console mirror when the last one goes away).
+        @import("../drivers/fbdev.zig").cleanupTask(t);
+        // ioperm: return the TSS IOPB pages (allocated by ioperm_set).
+        @import("ioperm.zig").freeBitmap(t);
+        // G2: release file-region backing refs before the address space
+        // (destroyUserSpace walks page tables, not region metadata).
+        @import("../mm/mmap.zig").releaseFileRefs(t);
+        if (t.mm) |mm| mm.release() else @import("../mm/user_space.zig").destroyUserSpace(t.page_table_phys);
+        t.mm = null;
+    }
+    freeKernelStack(t.kernel_stack);
+}
+
+fn freeSlotLocked(i: u32, t: *Task) void {
+    slot_bitmap &= ~(@as(u64, 1) << @intCast(i));
+    task_count -= 1;
+    uidTaskCountRemoveLocked(t.uid);
+}
+
+/// Hand a quiesced zombie to the reaper (task_lock held, O(1)). Unlinking
+/// the parent makes the slot invisible to waitpid / hasChildren scans while
+/// the teardown is in flight.
+fn detachLocked(i: u32, t: *Task, waiter: u32) void {
+    t.reap_pending = true;
+    t.parent_tid = 0;
+    reaper.queueLocked(i, waiter);
+}
+
+/// Reaper-thread half of a deferred reap: release the detached zombie's
+/// resources with IRQs enabled and no task_lock held, then free the slot and
+/// wake the waitpid parent, if any.
+pub fn teardownDetached(slot: u32) void {
+    const t = &tasks[slot];
+    teardownResources(t);
+    const waiter = blk: {
+        const flags = task_lock.acquire();
+        defer task_lock.release(flags);
+        freeSlotLocked(slot, t);
+        break :blk reaper.completeLocked(slot);
+    };
+    if (waiter != reap_policy.NO_WAITER) unblockTask(waiter);
+}
+
+/// Reap zombies nobody will wait for: orphans (parent already exited) and
+/// dead non-leader threads. Zombies with a living parent are left for
+/// waitpid(). Runs from the BSP maintenance tick: with the reaper thread up
+/// this only detaches (O(1) per zombie); the teardown happens off-IRQ.
+pub fn reapZombies() u32 {
+    var reaped: u32 = 0;
+    var queued = false;
+    {
+        const flags = task_lock.acquire();
+        defer task_lock.release(flags);
+        const deferred = reaper.isActive();
+        var bits = slot_bitmap;
+        while (bits != 0) {
+            const i: u32 = @intCast(@ctz(bits));
+            bits &= bits - 1;
+            const t = &tasks[i];
+            if (t.state != .zombie or t.reap_pending) continue;
+            const lineage: reap_policy.Lineage = .{
+                .is_thread = t.is_thread,
+                .parent_alive = t.parent_tid != 0 and findTaskByTidLocked(t.parent_tid) != null,
+                .maps_objects = t.is_thread and mapsObjects(t),
+            };
+            if (reap_policy.autoReap(zombieViewLocked(i, t), lineage) != .detach) continue;
+            if (deferred) {
+                detachLocked(i, t, reap_policy.NO_WAITER);
+                queued = true;
+            } else {
+                teardownResources(t);
+                freeSlotLocked(i, t);
+            }
+            reaped += 1;
+        }
+    }
+    if (queued) reaper.wake();
     return reaped;
 }
 
@@ -1582,8 +1627,16 @@ pub const WaitScan = union(enum) {
     /// A matching zombie exists but is not reapable yet (still current on its
     /// exit CPU, or the epilogue-quiesce gate has not passed).
     busy,
-    /// Reaped this child tid; its exit code is in *status.
-    reaped: u32,
+    /// Reaped this child; its exit code is in *status. Call `finishReap`
+    /// once task_lock is released.
+    reaped: Reaped,
+};
+
+pub const Reaped = struct {
+    tid: u32,
+    slot: u32,
+    /// Teardown handed to the reaper thread.
+    deferred: bool,
 };
 
 /// Expose task_lock for waitpid's atomic block protocol: the waiter must hold
@@ -1611,73 +1664,40 @@ pub fn waitpidScanLocked(parent_idx: u32, pid: i32, status: *i32) WaitScan {
         const t = &tasks[i];
         if (t.parent_tid != parent_tid_val) continue;
         if (t.is_thread) continue; // 线程由 pthread_join 汇合，不经 waitpid
-        if (t.state != .zombie) continue;
         if (pid > 0 and t.tid != @as(u32, @intCast(pid))) continue;
-        // Keep scanning: another child may be reapable while this one is pinned.
-        if (t.operation_refs != 0) {
-            busy_child = true;
-            continue;
-        }
-
-        if (isCurrentOnAnyCpu(i)) {
-            busy_child = true;
-            continue;
-        }
-
-        // The zombie is no longer current anywhere, but its exit-time
-        // switch epilogue may STILL be executing on its kernel stack on
-        // the exit CPU right now (the [switch-out → iretq] window).
-        // Reaping here freed that stack and produced the recurring
-        // commonStub #GP. Only reap once a quiescing tick (user-mode or
-        // idle frame) has passed on the exit CPU — proof the epilogue
-        // finished and the stack is no longer live.
-        {
-            const pc = @import("per_cpu.zig");
-            if (t.exit_cpu != 255 and
-                @atomicLoad(u64, &pc.sched_entries[t.exit_cpu], .monotonic) < t.exit_epoch + 3)
-            {
+        // A zombie still pinned, still current somewhere, or whose exit-time
+        // switch epilogue may still run on its kernel stack (the
+        // [switch-out → iretq] window — reaping there freed a live stack, the
+        // recurring commonStub #GP) is busy. Keep scanning: another child may
+        // be reapable meanwhile.
+        switch (reap_policy.verdict(zombieViewLocked(i, t))) {
+            .skip => continue,
+            .busy => {
                 busy_child = true;
                 continue;
-            }
+            },
+            .detach => {},
         }
 
-        // Found a quiesced zombie child — collect its exit code and reap it
+        // Found a quiesced zombie child — collect its exit code and reap it.
         status.* = t.exit_code;
         const child_tid = t.tid;
-        if (t.page_table_phys != 0) {
-            // L1: release user-driver resources (IRQ registrations, DMA
-            // buffers, MMIO mappings) before the address space walk.
-            // The dead task's space may still be shared by live CLONE_VM
-            // siblings, so its MMIO/DMA PTE unmaps run under the Mm's
-            // vm_lock. This is the sanctioned task_lock → vm_lock edge (see
-            // mm.zig's header): safe because vm_lock holders never wait on
-            // task_lock and ServicingSpinlock waiters service shootdowns
-            // while spinning. The Mm is still alive — it is released below.
-            {
-                var vm_guard = Mm.beginVmMutation(t.mm, @ptrCast(t)) catch Mm.VmLockGuard{};
-                defer vm_guard.release();
-                @import("../drivers/userdrv.zig").cleanupTask(t, t.page_table_phys);
-            }
-            // P1: tombstone any userspace-owned devfs nodes (drains
-            // their pending requests with -EIO).
-            @import("../fs/devfs_proxy.zig").cleanupTask(t);
-            // fb0: drop framebuffer mapping registry entries (restores the
-            // console mirror when the last one goes away).
-            @import("../drivers/fbdev.zig").cleanupTask(t);
-            // ioperm: return the TSS IOPB pages (allocated by ioperm_set).
-            @import("ioperm.zig").freeBitmap(t);
-            // G2: release file-region backing refs before the address space.
-            @import("../mm/mmap.zig").releaseFileRefs(t);
-            if (t.mm) |mm| mm.release() else @import("../mm/user_space.zig").destroyUserSpace(t.page_table_phys);
-            t.mm = null;
+        if (reaper.isActive()) {
+            detachLocked(i, t, parent_idx);
+            return .{ .reaped = .{ .tid = child_tid, .slot = i, .deferred = true } };
         }
-        freeKernelStack(t.kernel_stack);
-        slot_bitmap &= ~(@as(u64, 1) << @intCast(i));
-        task_count -= 1;
-        uidTaskCountRemoveLocked(t.uid);
-        return .{ .reaped = child_tid };
+        teardownResources(t);
+        freeSlotLocked(i, t);
+        return .{ .reaped = .{ .tid = child_tid, .slot = i, .deferred = false } };
     }
     return if (busy_child) .busy else .none;
+}
+
+/// Second half of a successful waitpid scan, after task_lock is released:
+/// a deferred child is torn down by the reaper thread — wait for it so the
+/// child's memory and slot are free when waitpid returns.
+pub fn finishReap(r: Reaped) void {
+    if (r.deferred) reaper.waitDone(r.slot);
 }
 
 /// Wait for a child process to exit. Returns the child's TID, or null if no
@@ -1694,7 +1714,10 @@ pub fn waitpid(parent_idx: u32, pid: i32, status: *i32) ?u32 {
         const r = waitpidScanLocked(parent_idx, pid, status);
         task_lock.release(flags);
         switch (r) {
-            .reaped => |child_tid| return child_tid,
+            .reaped => |reaped| {
+                finishReap(reaped);
+                return reaped.tid;
+            },
             .none => return null,
             .busy => {
                 // Spin with IRQs on: the reap gate needs a scheduler pass

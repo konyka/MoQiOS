@@ -18,6 +18,8 @@ const task = @import("task.zig");
 const sched_policy = @import("sched_policy.zig");
 const sched_pass_policy = @import("sched_pass_policy.zig");
 const wake_preempt_policy = @import("wake_preempt_policy.zig");
+const rt_bandwidth_policy = @import("rt_bandwidth_policy.zig");
+const ipi_kick_policy = @import("ipi_kick_policy.zig");
 const sched_claim = @import("sched_claim.zig");
 const per_cpu = @import("per_cpu.zig");
 const idt = @import("../arch/arch.zig").interrupts;
@@ -32,6 +34,31 @@ const fmt = @import("../lib/fmt.zig");
 const builtin = @import("builtin");
 
 const TIMESLICE_TICKS: u64 = 10;
+
+var rt_bw_buckets: [syscall_entry.MAX_CPUS]rt_bandwidth_policy.Bucket = @splat(.{});
+var rt_bw_ticks: [syscall_entry.MAX_CPUS]u64 = @splat(0);
+
+fn accountRtTick() void {
+    const cpu = currentCpuId();
+    if (cpu >= rt_bw_buckets.len) return;
+    rt_bw_ticks[cpu] +|= 1;
+    const now = rt_bw_ticks[cpu];
+    if (getCurrentIdx()) |ci| {
+        if (task.getTask(ci)) |ct| {
+            if (sched_policy.isRtClass(ct.sched_policy) and sched_claim.load(&ct.state) == .running) {
+                rt_bw_buckets[cpu].onRtTick(now);
+                return;
+            }
+        }
+    }
+    rt_bw_buckets[cpu].roll(now);
+}
+
+fn rtThrottledHere() bool {
+    const cpu = currentCpuId();
+    if (cpu >= rt_bw_buckets.len) return false;
+    return rt_bw_buckets[cpu].throttled(rt_bw_ticks[cpu]);
+}
 
 // M8-3: the context-switch stack anchor is now PER-CPU. `commonStub` reads/writes
 // it directly via `%gs:16` (PerCpu.saved_stack_anchor); the scheduler reaches the
@@ -678,6 +705,7 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
     const pc_force = thisCpu();
     const pass = sched_pass_policy.fromForceFlag(if (pc_force) |p| p.force_reschedule else 0);
     const force_pick = pass != .tick;
+    if (sched_pass_policy.isTimeTick(pass)) accountRtTick();
 
     // Global time-driven work — BSP hardware ticks only (one tick source for
     // the whole system; IPI / yield passes must not advance timers). Every
@@ -745,7 +773,8 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
             if (task.getTask(ci)) |ct| {
                 if (sched_claim.load(&ct.state) == .running and !sched_policy.hasQuantumExpiry(ct.sched_policy)) {
                     const cur_key = sched_policy.rankKey(ct.sched_policy, ct.priority);
-                    if (sched_pass_policy.rtKeepsCpu(.tick, cur_key, peekBestRankKey())) {
+                    const rank_keeps = sched_pass_policy.rtKeepsCpu(.tick, cur_key, peekBestRankKey());
+                    if (rt_bandwidth_policy.mayKeep(rtThrottledHere(), rank_keeps)) {
                         setSlice(TIMESLICE_TICKS);
                         return;
                     }
@@ -1227,6 +1256,7 @@ fn forcedPass(frame: *idt.InterruptFrame, kind: sched_pass_policy.PassKind) void
     if (pc) |p| {
         if (p.cpu_id < forced_saved_slice.len) forced_saved_slice[p.cpu_id] = getSlice();
         p.force_reschedule = @intFromEnum(kind);
+        if (kind == .ipi) @atomicStore(u8, &p.resched_pending, ipi_kick_policy.clear(), .release);
     }
     setSlice(0);
     timerTick(frame);
@@ -1275,6 +1305,9 @@ fn kickCpuX86(cpu_id: u8) void {
     const se = @import("../arch/arch.zig").syscall;
     if (cpu_id >= se.MAX_CPUS) return;
     if (!@import("../smp.zig").isCpuOnline(cpu_id)) return;
+    const pending = &se.percpu_array[cpu_id].resched_pending;
+    const prev = @atomicRmw(u8, pending, .Xchg, ipi_kick_policy.mark(1), .acq_rel);
+    if (!ipi_kick_policy.shouldSend(prev != 0)) return;
     const apic_id: u8 = @truncate(se.percpu_array[cpu_id].apic_id);
     asm volatile ("mfence" ::: .{ .memory = true });
     _ = lapic_mod.sendIpi(apic_id, lapic_mod.RESCHEDULE_VECTOR);

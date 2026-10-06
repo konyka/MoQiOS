@@ -110,13 +110,14 @@ test "CR4 protection bits follow CPUID leaf 7" {
     try std.testing.expectEqual(p.CR4_UMIP, p.cr4Bits(umip));
 }
 
-test "SMAP is detected but never enabled before the user-access audit" {
+test "SMAP is enabled together with SMEP and UMIP" {
     const p = cpu_protect_policy;
     const all = p.features(7, p.CPUID7_EBX_SMEP | p.CPUID7_EBX_SMAP, p.CPUID7_ECX_UMIP);
     try std.testing.expect(all.smap);
-    try std.testing.expectEqual(p.CR4_SMEP | p.CR4_UMIP, p.cr4Bits(all));
+    try std.testing.expectEqual(p.CR4_SMEP | p.CR4_UMIP | p.CR4_SMAP, p.cr4Bits(all));
     try std.testing.expectEqual(@as(u64, 1 << 20), p.CR4_SMEP);
     try std.testing.expectEqual(@as(u64, 1 << 11), p.CR4_UMIP);
+    try std.testing.expectEqual(@as(u64, 1 << 21), p.CR4_SMAP);
 }
 
 // ── P2-1: wake preemption ───────────────────────────────────────────────

@@ -6,6 +6,7 @@
 
 const serial = @import("serial.zig");
 const policy = @import("cpu_protect_policy.zig");
+const paging = @import("paging.zig");
 
 var cr4_bits: u64 = 0;
 
@@ -42,8 +43,10 @@ pub fn init() void {
     const f = policy.features(max_leaf, leaf7.ebx, leaf7.ecx);
     cr4_bits = policy.cr4Bits(f);
     setCr4Bits(cr4_bits);
+    paging.smap_live = f.smap;
     serial.writeString(if (f.smep) "[CPU] SMEP on" else "[CPU] SMEP off");
-    serial.writeString(if (f.umip) " UMIP on\n" else " UMIP off\n");
+    serial.writeString(if (f.umip) " UMIP on" else " UMIP off");
+    serial.writeString(if (f.smap) " SMAP on\n" else " SMAP off\n");
 }
 
 pub fn initThisCpu() void {

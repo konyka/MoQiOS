@@ -2,8 +2,8 @@
 //!
 //! SMEP stops the kernel from executing user pages (ret2usr); UMIP turns
 //! user-mode sgdt/sidt/sldt/smsw/str into #GP so descriptor-table addresses
-//! do not leak. SMAP is detected but stays off until every user access goes
-//! through stac/clac-bracketed copy routines.
+//! do not leak. SMAP stops the kernel from touching user pages unless the
+//! copy path has issued `stac` (RFLAGS.AC).
 
 pub const CPUID7_EBX_SMEP: u32 = 1 << 7;
 pub const CPUID7_EBX_SMAP: u32 = 1 << 20;
@@ -28,5 +28,6 @@ pub fn cr4Bits(f: Features) u64 {
     var bits: u64 = 0;
     if (f.smep) bits |= CR4_SMEP;
     if (f.umip) bits |= CR4_UMIP;
+    if (f.smap) bits |= CR4_SMAP;
     return bits;
 }

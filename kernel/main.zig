@@ -315,6 +315,10 @@ export fn _start() callconv(.c) noreturn {
     // flush outside the timer ISR (see vfs.writebackTimerTick). Created here —
     // after the BSP run queue and task subsystem are ready, before IRQs on.
     @import("fs/vfs.zig").startWritebackThread();
+    // Zombie teardown (address space, kernel stack, driver state) runs in a
+    // pinned low-RT-priority kernel thread with IRQs on instead of the BSP
+    // tick / waitpid under task_lock (see proc/reaper.zig).
+    @import("proc/reaper.zig").start();
 
     // M5.5: Load init program from ramdisk as the first user process (pid 1)
     if (loader.loadProgram("init", 0, false, true, @import("proc/rlimit.zig").RLIM_INFINITY, @import("proc/rlimit.zig").RLIM_INFINITY)) |task_idx| {

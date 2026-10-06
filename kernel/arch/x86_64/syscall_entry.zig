@@ -112,6 +112,9 @@ pub const PerCpu = extern struct {
     /// DIAG (§6.47): last syscall number dispatched on this CPU — lets the
     /// page-fault path tell whether a dying thread was mid-churn or exiting.
     last_syscall_nr: u64 = 0,
+    /// Non-zero while a reschedule IPI is in flight to this CPU. Further
+    /// kicks are dropped until the IPI pass clears it (ipi_kick_policy).
+    resched_pending: u8 = 0,
 };
 
 /// Per-CPU data array, indexed by CPU logical ID.
@@ -424,7 +427,7 @@ pub fn initSyscallMsrsOnThisCpu() void {
     const star: u64 = (@as(u64, 0x08) << 32) | (@as(u64, 0x1B) << 48);
     wrmsr(MSR_STAR, star);
     wrmsr(MSR_LSTAR, @intFromPtr(&syscallEntry));
-    wrmsr(MSR_SFMASK, 0x700); // TF | IF | DF
+    wrmsr(MSR_SFMASK, 0x40700); // TF | IF | DF | AC (SMAP enforced on entry)
 }
 
 /// Pull PerCpu.saved_user_rsp (%gs:8) into the running user task (after syscall entry).

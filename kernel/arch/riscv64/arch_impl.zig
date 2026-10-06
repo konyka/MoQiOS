@@ -588,6 +588,7 @@ pub const syscall = struct {
         exec_new_entry: u64 = 0,
         exec_new_stack: u64 = 0,
         force_reschedule: u8 = 0,
+        resched_pending: u8 = 0,
     };
 
     pub var percpu_array: [MAX_CPUS]PerCpu = .{.{}};
