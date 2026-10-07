@@ -71,6 +71,16 @@ pub fn autoReap(v: ZombieView, lineage: Lineage) Verdict {
 
 pub const NO_WAITER: u32 = 0xFFFF_FFFF;
 
+pub const WaiterToken = struct {
+    slot: u32 = NO_WAITER,
+    tid: u32 = 0,
+    incarnation: u64 = 0,
+
+    pub fn valid(self: WaiterToken) bool {
+        return self.slot != NO_WAITER;
+    }
+};
+
 /// Detached slots awaiting teardown. Caller provides the locking.
 pub fn PendingSet(comptime N: usize) type {
     if (N > 64) @compileError("PendingSet is a single u64 bitmap");
@@ -80,13 +90,13 @@ pub fn PendingSet(comptime N: usize) type {
 
         pending: Mask = 0,
         started: Mask = 0,
-        waiter: [N]u32 = [_]u32{NO_WAITER} ** N,
+        waiter: [N]WaiterToken = [_]WaiterToken{.{}} ** N,
 
         inline fn bit(slot: u32) Mask {
             return @as(Mask, 1) << @intCast(slot);
         }
 
-        pub fn add(self: *Self, slot: u32, waiter: u32) void {
+        pub fn add(self: *Self, slot: u32, waiter: WaiterToken) void {
             std.debug.assert(slot < N and self.pending & bit(slot) == 0);
             self.pending |= bit(slot);
             self.started &= ~bit(slot);
@@ -99,7 +109,7 @@ pub fn PendingSet(comptime N: usize) type {
 
         /// Register the task to wake once `slot` is torn down. False when the
         /// slot is no longer pending (nothing to wait for).
-        pub fn setWaiter(self: *Self, slot: u32, waiter: u32) bool {
+        pub fn setWaiter(self: *Self, slot: u32, waiter: WaiterToken) bool {
             if (!self.isPending(slot)) return false;
             self.waiter[slot] = waiter;
             return true;
@@ -120,15 +130,24 @@ pub fn PendingSet(comptime N: usize) type {
         }
 
         /// Teardown done: forget the slot and return its waiter.
-        pub fn complete(self: *Self, slot: u32) u32 {
+        pub fn complete(self: *Self, slot: u32) WaiterToken {
             std.debug.assert(self.isPending(slot));
             self.pending &= ~bit(slot);
             self.started &= ~bit(slot);
             const w = self.waiter[slot];
-            self.waiter[slot] = NO_WAITER;
+            self.waiter[slot] = .{};
             return w;
         }
     };
 }
 
 const std = @import("std");
+
+test "waiter tokens reject a reused slot" {
+    const Token = WaiterToken;
+    const old: Token = .{ .slot = 3, .tid = 10, .incarnation = 1 };
+    const fresh: Token = .{ .slot = 3, .tid = 11, .incarnation = 2 };
+    try std.testing.expect(old.valid());
+    try std.testing.expect(fresh.valid());
+    try std.testing.expect(old.tid != fresh.tid and old.incarnation != fresh.incarnation);
+}

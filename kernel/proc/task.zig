@@ -1269,7 +1269,11 @@ fn freeSlotLocked(i: u32, t: *Task) void {
 fn detachLocked(i: u32, t: *Task, waiter: u32) void {
     t.reap_pending = true;
     t.parent_tid = 0;
-    reaper.queueLocked(i, waiter);
+    const waiter_token: reap_policy.WaiterToken = if (waiter != reap_policy.NO_WAITER) blk: {
+        const parent = getTask(waiter) orelse break :blk .{};
+        break :blk .{ .slot = waiter, .tid = parent.tid, .incarnation = parent.incarnation };
+    } else .{};
+    reaper.queueLocked(i, waiter_token);
 }
 
 /// Reaper-thread half of a deferred reap: release the detached zombie's
@@ -1284,7 +1288,7 @@ pub fn teardownDetached(slot: u32) void {
         freeSlotLocked(slot, t);
         break :blk reaper.completeLocked(slot);
     };
-    if (waiter != reap_policy.NO_WAITER) unblockTask(waiter);
+    if (waiter.valid()) unblockTaskIfIncarnation(waiter.slot, waiter.tid, waiter.incarnation);
 }
 
 /// Reap zombies nobody will wait for: orphans (parent already exited) and

@@ -50,7 +50,7 @@ pub fn start() void {
 
 /// Queue a detached slot. Caller holds task_lock; call `wake` after
 /// releasing it.
-pub fn queueLocked(slot: u32, waiter: u32) void {
+pub fn queueLocked(slot: u32, waiter: reap_policy.WaiterToken) void {
     const f = reap_lock.acquire();
     defer reap_lock.release(f);
     set.add(slot, waiter);
@@ -79,9 +79,14 @@ pub fn waitDone(slot: u32) void {
         {
             const f = reap_lock.acquire();
             defer reap_lock.release(f);
-            if (!set.setWaiter(slot, cur_idx)) return;
+            const waiter_token: reap_policy.WaiterToken = .{
+                .slot = cur_idx,
+                .tid = cur.tid,
+                .incarnation = cur.incarnation,
+            };
+            if (!set.setWaiter(slot, waiter_token)) return;
             if (cur.is_user and signal.pendingActionable(cur)) {
-                _ = set.setWaiter(slot, reap_policy.NO_WAITER);
+                _ = set.setWaiter(slot, .{});
                 return;
             }
             sched_claim.store(&cur.state, .blocked);
@@ -93,7 +98,7 @@ pub fn waitDone(slot: u32) void {
 /// Mark `slot` torn down and return its waiter. Called by task.zig with
 /// task_lock held, in the same section that frees the slot, so a reused slot
 /// can never be queued while its previous incarnation is still pending.
-pub fn completeLocked(slot: u32) u32 {
+pub fn completeLocked(slot: u32) reap_policy.WaiterToken {
     const f = reap_lock.acquire();
     defer reap_lock.release(f);
     return set.complete(slot);
