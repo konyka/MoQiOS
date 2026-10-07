@@ -201,6 +201,12 @@ test "POSIX MQ notify registration is exclusive" {
     try std.testing.expect(std.mem.indexOf(u8, kt.posix_mq_source, "return -16") != null);
 }
 
+test "POSIX MQ getsetattr invalid descriptor releases the lock" {
+    const source = kt.posix_mq_source;
+    try std.testing.expect(std.mem.indexOf(u8, source, "descriptorHandle(owner_idx, mqd) orelse {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "mq_lock.release(flags);") != null);
+}
+
 test "POSIX MQ descriptor tokens round-trip only inside the descriptor window" {
     const p = posix_mq_descriptor_policy;
     try std.testing.expectEqual(@as(u32, p.DESCRIPTOR_BASE), p.tokenValue(0));

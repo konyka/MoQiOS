@@ -937,8 +937,10 @@ pub fn mqGetSetAttr(mqd: u32, newattr_ptr: u64, oldattr_ptr: u64) i64 {
         requested_flags = @truncate(@as(u64, @bitCast(bo.readI64Le(new_buf[0..8]))));
     }
     const flags = mq_lock.acquire();
-
-    const handle = descriptorHandle(owner_idx, mqd) orelse return EBADF;
+    const handle = descriptorHandle(owner_idx, mqd) orelse {
+        mq_lock.release(flags);
+        return EBADF;
+    };
     const desc = &descriptions[handle.desc_idx];
     const q = &queues[desc.queue_idx];
 
