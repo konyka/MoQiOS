@@ -364,15 +364,13 @@ pub fn clone(
         // v53.50: Copy free_bm bitmap — child inherits parent's fd occupancy state.
         parent.fd_table.inheritFdTable(child.fd_table);
     }
-    // POSIX MQ handles are per-task sidecar entries today. Do not duplicate
-    // them for CLONE_FILES: the shared FdTable already represents the shared
-    // descriptor lifetime. Fork-like clones copy the sidecar references.
-    if (flags & CLONE_FILES == 0) {
-        @import("../../ipc/posix_mq.zig").inheritRefs(
-            sched.currentTaskIndex() orelse return -1,
-            child_idx,
-        );
-    }
+    // The current MQ sidecar is task-local, so mirror handles for both fork
+    // and CLONE_FILES. This preserves usability for a new thread; full shared
+    // close semantics require making the sidecar part of FdTable ownership.
+    @import("../../ipc/posix_mq.zig").inheritRefs(
+        sched.currentTaskIndex() orelse return -1,
+        child_idx,
+    );
 
     // Signal handlers, mask, environment, cwd, pgid, sid
     for (0..31) |i| {

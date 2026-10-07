@@ -135,6 +135,7 @@ pub const time_pointer_policy = @import("proc/time_pointer_policy.zig");
 pub const posix_mq_policy = @import("ipc/posix_mq_policy.zig");
 pub const posix_mq_wait_policy = @import("ipc/posix_mq_wait_policy.zig");
 pub const posix_mq_source = @embedFile("ipc/posix_mq.zig");
+pub const clone_source = @embedFile("arch/x86_64/clone.zig");
 pub const posix_mq_receive_policy = @import("ipc/posix_mq_receive_policy.zig");
 pub const posix_mq_priority_policy = @import("ipc/posix_mq_priority_policy.zig");
 pub const posix_mq_ownership_policy = @import("ipc/posix_mq_ownership_policy.zig");

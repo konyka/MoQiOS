@@ -1027,7 +1027,7 @@ fn closeHandleLocked(task_idx: u32, handle_idx: u32, wakes: *WakeBatch) void {
     if (desc.refs == 0) {
         const q = &queues[desc.queue_idx];
         q.open_count -|= 1;
-        if (q.marked_removed and q.count == 0 and q.open_count == 0) freeQueue(q, wakes);
+        if (q.marked_removed and q.open_count == 0) freeQueue(q, wakes);
         desc.* = .{};
     }
 }
