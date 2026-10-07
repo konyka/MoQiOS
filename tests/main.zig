@@ -196,7 +196,9 @@ test "POSIX MQ descriptor policy validates access and flags" {
 }
 
 test "POSIX MQ notify registration is exclusive" {
-    try std.testing.expectEqual(@as(i64, -16), @as(i64, -16));
+    try std.testing.expect(std.mem.indexOf(u8, kt.posix_mq_source, "const notify_kind = bo.readU32Le(buf[12..16])") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.posix_mq_source, "sigevNotifyValid(notify_kind)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.posix_mq_source, "return -16") != null);
 }
 
 test "POSIX MQ descriptor tokens round-trip only inside the descriptor window" {
