@@ -815,6 +815,8 @@ pub fn mqNotify(mqd: u32, notif_ptr: u64) i64 {
         var buf: [16]u8 = undefined;
         if (copy.copyFromUser(&buf, @ptrFromInt(notif_ptr), 16) != 16) return EFAULT;
         signo = @bitCast(bo.readU32Le(buf[8..12]));
+        const notify_kind = bo.readU32Le(buf[12..16]);
+        if (!descriptor_policy.sigevNotifyValid(notify_kind)) return EINVAL;
         if (signo <= 0 or signo > 31) return EINVAL;
     }
 

@@ -5,6 +5,7 @@ pub const O_WRONLY: u32 = 1;
 pub const O_RDWR: u32 = 2;
 pub const O_NONBLOCK: u32 = 0o4000;
 pub const O_CLOEXEC: u32 = 0o2000000;
+pub const SIGEV_SIGNAL: u32 = 0;
 pub const ACCESS_MASK: u32 = 3;
 pub const O_ACCMODE: u32 = ACCESS_MASK;
 pub const O_CREAT: u32 = 0o100;
@@ -54,6 +55,10 @@ pub fn survivesExec(cloexec: bool) bool {
     return !cloexec;
 }
 
+pub fn sigevNotifyValid(kind: u32) bool {
+    return kind == SIGEV_SIGNAL;
+}
+
 test "MQ descriptor policy isolates access and exec flags" {
     const std = @import("std");
     try std.testing.expect(flagsValid(O_RDONLY | O_NONBLOCK));
@@ -65,4 +70,7 @@ test "MQ descriptor policy isolates access and exec flags" {
     try std.testing.expect(!canReceive(O_WRONLY));
     try std.testing.expect(survivesExec(false));
     try std.testing.expect(!survivesExec(true));
+    try std.testing.expect(sigevNotifyValid(SIGEV_SIGNAL));
+    try std.testing.expect(!sigevNotifyValid(1));
+    try std.testing.expect(!sigevNotifyValid(2));
 }

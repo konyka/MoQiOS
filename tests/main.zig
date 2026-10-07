@@ -188,6 +188,11 @@ test "POSIX MQ descriptor policy validates access and flags" {
     try std.testing.expect(!posix_mq_descriptor_policy.canSend(posix_mq_descriptor_policy.O_RDONLY));
     try std.testing.expect(posix_mq_descriptor_policy.canReceive(posix_mq_descriptor_policy.O_RDONLY));
     try std.testing.expect(!posix_mq_descriptor_policy.canReceive(posix_mq_descriptor_policy.O_WRONLY));
+    try std.testing.expect(posix_mq_descriptor_policy.accessAllows(posix_mq_descriptor_policy.O_RDWR, .send));
+    try std.testing.expect(posix_mq_descriptor_policy.accessAllows(posix_mq_descriptor_policy.O_RDWR, .receive));
+    try std.testing.expectEqual(posix_mq_descriptor_policy.O_NONBLOCK, posix_mq_descriptor_policy.statusFlags(posix_mq_descriptor_policy.O_NONBLOCK | posix_mq_descriptor_policy.O_CLOEXEC));
+    try std.testing.expect(posix_mq_descriptor_policy.sigevNotifyValid(0));
+    try std.testing.expect(!posix_mq_descriptor_policy.sigevNotifyValid(1));
 }
 
 test "POSIX MQ notify registration is exclusive" {
