@@ -176,9 +176,9 @@ test "reap verdict keeps the old quiesce gate and never detaches twice" {
 test "reap set hands each detached slot to the reaper exactly once" {
     var s: reap_policy.PendingSet(64) = .{};
     try std.testing.expect(!s.hasUnstarted());
-    s.add(5, reap_policy.NO_WAITER);
-    s.add(63, 7);
-    s.add(0, reap_policy.NO_WAITER);
+    s.add(5, .{});
+    s.add(63, .{ .slot = 7, .tid = 70, .incarnation = 1 });
+    s.add(0, .{});
     try std.testing.expect(s.isPending(5) and s.isPending(63) and s.isPending(0));
     try std.testing.expect(!s.isPending(6));
 
@@ -191,25 +191,25 @@ test "reap set hands each detached slot to the reaper exactly once" {
     try std.testing.expectEqual(@as(?u32, null), s.takeUnstarted());
     try std.testing.expect(!s.hasUnstarted());
 
-    try std.testing.expectEqual(reap_policy.NO_WAITER, s.complete(0));
+    try std.testing.expectEqual(.{}, s.complete(0));
     try std.testing.expect(!s.isPending(0));
     try std.testing.expectEqual(@as(u32, 7), s.complete(63));
-    try std.testing.expectEqual(reap_policy.NO_WAITER, s.complete(5));
+    try std.testing.expectEqual(.{}, s.complete(5));
     try std.testing.expect(!s.isPending(5) and !s.isPending(63));
 }
 
 test "reap set records the waiter that arrives after detach" {
     var s: reap_policy.PendingSet(64) = .{};
-    s.add(9, reap_policy.NO_WAITER);
-    try std.testing.expect(s.setWaiter(9, 3));
+    s.add(9, .{});
+    try std.testing.expect(s.setWaiter(9, .{ .slot = 3, .tid = 30, .incarnation = 1 }));
     try std.testing.expectEqual(@as(?u32, 9), s.takeUnstarted());
     try std.testing.expectEqual(@as(u32, 3), s.complete(9));
     // Completed: a late waiter must not block (nothing left to wait for).
     try std.testing.expect(!s.setWaiter(9, 4));
     // A re-detached slot starts clean.
-    s.add(9, reap_policy.NO_WAITER);
+    s.add(9, .{});
     try std.testing.expect(s.hasUnstarted());
-    try std.testing.expectEqual(reap_policy.NO_WAITER, s.complete(9));
+    try std.testing.expectEqual(.{}, s.complete(9));
 }
 
 test "autoreap takes orphans and dead threads but leaves children for waitpid" {

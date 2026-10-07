@@ -832,6 +832,8 @@ pub fn mqNotify(mqd: u32, notif_ptr: u64) i64 {
         return 0;
     }
 
+    if (q.notify_task_idx != null) return -16; // EBUSY
+
     // Register: one-shot, re-armed by another mq_notify after delivery.
     q.notify_pid = 1;
     q.notify_task_idx = sched.currentTaskIndex();

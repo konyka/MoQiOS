@@ -136,9 +136,13 @@ pub fn timeoutTick(now_tick: u64) void {
         if (event) |wake_event| {
             if (task.pinTaskByIndex(wake_event.idx, true)) |pin_value| {
                 var pin = pin_value;
-                defer pin.release();
-                if (pin.tid == wake_event.tid and pin.incarnation == wake_event.incarnation)
-                    task.unblockTaskIfIncarnation(wake_event.idx, wake_event.tid, wake_event.incarnation);
+                const valid = pin.tid == wake_event.tid and pin.incarnation == wake_event.incarnation;
+                const idx = pin.slot;
+                const tid = pin.tid;
+                const incarnation = pin.incarnation;
+                pin.release();
+                if (valid)
+                    task.unblockTaskIfIncarnation(idx, tid, incarnation);
             }
         }
     }
@@ -176,9 +180,12 @@ fn wakeEvents(events: []?WakeEvent) void {
         if (event) |wake| {
             if (task.pinTaskByIndex(wake.idx, true)) |pin_value| {
                 var pin = pin_value;
-                defer pin.release();
-                if (pin.tid == wake.tid and pin.incarnation == wake.incarnation)
-                    task.unblockTaskIfIncarnation(wake.idx, wake.tid, wake.incarnation);
+                const valid = pin.tid == wake.tid and pin.incarnation == wake.incarnation;
+                const idx = pin.slot;
+                const tid = pin.tid;
+                const incarnation = pin.incarnation;
+                pin.release();
+                if (valid) task.unblockTaskIfIncarnation(idx, tid, incarnation);
             }
         }
     }
@@ -651,7 +658,6 @@ fn sendInternal(sender_idx: u32, target_ep: EndpointId, msg: *const Message, req
             ipc_lock.release(flags);
             return .not_ready;
         };
-        defer recv_pin.release();
 
         endpoints[target_ep].pending_msg = out_msg;
 
@@ -661,7 +667,11 @@ fn sendInternal(sender_idx: u32, target_ep: EndpointId, msg: *const Message, req
         ipc_lock.release(flags);
         // Re-enqueue only after releasing authority; unblockTask takes the
         // task lock and must not participate in an authority/task lock cycle.
-        task.unblockTaskIfIncarnation(recv_pin.slot, recv_pin.tid, recv_pin.incarnation);
+        const wake_slot = recv_pin.slot;
+        const wake_tid = recv_pin.tid;
+        const wake_incarnation = recv_pin.incarnation;
+        recv_pin.release();
+        task.unblockTaskIfIncarnation(wake_slot, wake_tid, wake_incarnation);
         return .success;
     }
 
@@ -754,7 +764,6 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
             ipc_lock.release(flags);
             return .not_ready;
         };
-        defer sender_pin.release();
         if (endpoints[ep].pending_msg) |msg| {
             buf.* = msg;
             endpoints[ep].pending_msg = null;
@@ -768,7 +777,11 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
         endpoints[ep].waiting_sender = null;
         task_ipc_state[sender_idx].blocked_on = 0;
         ipc_lock.release(flags);
-        task.unblockTaskIfIncarnation(sender_pin.slot, sender_pin.tid, sender_pin.incarnation);
+        const wake_slot = sender_pin.slot;
+        const wake_tid = sender_pin.tid;
+        const wake_incarnation = sender_pin.incarnation;
+        sender_pin.release();
+        task.unblockTaskIfIncarnation(wake_slot, wake_tid, wake_incarnation);
         return .success;
     }
 
@@ -1073,7 +1086,6 @@ fn replyToken(token: u64, reply_msg: *const Message) IpcError {
             ipc_lock.release(flags);
             return .not_ready;
         };
-        defer owner_pin.release();
         if (endpoints[caller_endpoint].owner_tid != owner_pin.tid) {
             ipc_lock.release(flags);
             return .invalid_endpoint;
@@ -1090,7 +1102,11 @@ fn replyToken(token: u64, reply_msg: *const Message) IpcError {
         endpoints[caller_endpoint].reply_callee_tid = null;
         endpoints[caller_endpoint].reply_token = 0;
         ipc_lock.release(flags);
-        task.unblockTaskIfIncarnation(owner_pin.slot, owner_pin.tid, owner_pin.incarnation);
+        const wake_slot = owner_pin.slot;
+        const wake_tid = owner_pin.tid;
+        const wake_incarnation = owner_pin.incarnation;
+        owner_pin.release();
+        task.unblockTaskIfIncarnation(wake_slot, wake_tid, wake_incarnation);
         return .success;
     }
     ipc_lock.release(flags);
@@ -1132,11 +1148,14 @@ fn notifyInternal(caller: u32, target_ep: EndpointId, bits: NotifyBitmap, requir
             ipc_lock.release(flags);
             return .not_ready;
         };
-        defer recv_pin.release();
         endpoints[target_ep].waiting_receiver = null;
         task_ipc_state[recv_idx].blocked_on = 0;
         ipc_lock.release(flags);
-        task.unblockTaskIfIncarnation(recv_pin.slot, recv_pin.tid, recv_pin.incarnation);
+        const wake_slot = recv_pin.slot;
+        const wake_tid = recv_pin.tid;
+        const wake_incarnation = recv_pin.incarnation;
+        recv_pin.release();
+        task.unblockTaskIfIncarnation(wake_slot, wake_tid, wake_incarnation);
         return .success;
     }
     ipc_lock.release(flags);

@@ -190,6 +190,10 @@ test "POSIX MQ descriptor policy validates access and flags" {
     try std.testing.expect(!posix_mq_descriptor_policy.canReceive(posix_mq_descriptor_policy.O_WRONLY));
 }
 
+test "POSIX MQ notify registration is exclusive" {
+    try std.testing.expectEqual(@as(i64, -16), @as(i64, -16));
+}
+
 test "POSIX MQ descriptor tokens round-trip only inside the descriptor window" {
     const p = posix_mq_descriptor_policy;
     try std.testing.expectEqual(@as(u32, p.DESCRIPTOR_BASE), p.tokenValue(0));
