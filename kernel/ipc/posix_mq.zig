@@ -929,32 +929,31 @@ pub fn inheritRefs(parent_idx: u32, child_idx: u32) void {
 pub fn mqGetSetAttr(mqd: u32, newattr_ptr: u64, oldattr_ptr: u64) i64 {
     const owner_idx = sched.currentTaskIndex() orelse return EBADF;
     if (oldattr_ptr != 0 and !copy.validateUserBufferWritable(oldattr_ptr, 32)) return EFAULT;
+    if (newattr_ptr != 0 and newattr_ptr >= 0x0000_8000_0000_0000) return EFAULT;
+    var requested_flags: ?u32 = null;
+    if (newattr_ptr != 0) {
+        var new_buf: [32]u8 = undefined;
+        if (copy.copyFromUser(&new_buf, @ptrFromInt(newattr_ptr), 32) != 32) return EFAULT;
+        requested_flags = @truncate(@as(u64, @bitCast(bo.readI64Le(new_buf[0..8]))));
+    }
     const flags = mq_lock.acquire();
-    defer mq_lock.release(flags);
 
     const handle = descriptorHandle(owner_idx, mqd) orelse return EBADF;
     const desc = &descriptions[handle.desc_idx];
     const q = &queues[desc.queue_idx];
 
-    // Write old attributes if requested
+    var old_buf: [32]u8 = undefined;
     if (oldattr_ptr != 0) {
-        var attr_buf: [32]u8 = @splat(0);
-        bo.writeI64Le(attr_buf[0..8], desc.status_flags);
-        bo.writeI64Le(attr_buf[8..16], q.max_msg);
-        bo.writeI64Le(attr_buf[16..24], q.msg_size);
-        bo.writeI64Le(attr_buf[24..32], q.count);
-        if (copy.copyToUser(@ptrFromInt(oldattr_ptr), &attr_buf, 32) != 32) return EFAULT;
+        old_buf = @splat(0);
+        bo.writeI64Le(old_buf[0..8], desc.status_flags);
+        bo.writeI64Le(old_buf[8..16], q.max_msg);
+        bo.writeI64Le(old_buf[16..24], q.msg_size);
+        bo.writeI64Le(old_buf[24..32], q.count);
     }
-
-    // Read new attributes if provided
-    if (newattr_ptr != 0 and newattr_ptr >= 0x0000_8000_0000_0000) return EFAULT;
-    if (newattr_ptr != 0) {
-        var attr_buf: [32]u8 = undefined;
-        if (copy.copyFromUser(&attr_buf, @ptrFromInt(newattr_ptr), 32) != 32) return EFAULT;
-        const new_flags: u32 = @truncate(@as(u64, @bitCast(bo.readI64Le(attr_buf[0..8]))));
-        desc.status_flags = (desc.status_flags & ~@as(u32, O_NONBLOCK)) | (new_flags & O_NONBLOCK);
-    }
-
+    if (requested_flags) |new_flags| desc.status_flags = (desc.status_flags & ~@as(u32, O_NONBLOCK)) | (new_flags & O_NONBLOCK);
+    const old_flags = flags;
+    mq_lock.release(old_flags);
+    if (oldattr_ptr != 0 and copy.copyToUser(@ptrFromInt(oldattr_ptr), &old_buf, 32) != 32) return EFAULT;
     return 0;
 }
 
