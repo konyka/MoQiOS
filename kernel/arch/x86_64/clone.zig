@@ -368,10 +368,11 @@ pub fn clone(
     // The current MQ sidecar is task-local, so mirror handles for both fork
     // and CLONE_FILES. This preserves usability for a new thread; full shared
     // close semantics require making the sidecar part of FdTable ownership.
-    @import("../../ipc/posix_mq.zig").inheritRefs(
-        sched.currentTaskIndex() orelse return -1,
-        child_idx,
-    );
+    const current_idx = sched.currentTaskIndex() orelse {
+        _ = task_mod.abortUnpublishedChild(child_idx);
+        return -1;
+    };
+    @import("../../ipc/posix_mq.zig").inheritRefs(current_idx, child_idx);
 
     // Signal handlers, mask, environment, cwd, pgid, sid
     for (0..31) |i| {

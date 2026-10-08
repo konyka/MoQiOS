@@ -36,16 +36,20 @@ pub fn isActive() bool {
 }
 
 /// Start the reaper. Call once from boot context after the scheduler is up.
-pub fn start() void {
-    const slot = task.createKernelThreadAffinity(reaperMain, 0, 0) orelse return;
-    if (task.getTask(slot)) |t| {
-        t.sched_policy = sched_policy.SCHED_FIFO;
-        t.priority = sched_policy.rtToKernelPriority(REAPER_RT_PRIORITY);
-        // Kernel threads are otherwise discovered only via the bitmap fallback,
-        // which a busy CPU never reaches. Put it on CPU 0's queue now.
-        sched.enqueue(t);
-    }
+/// Failure is reported so boot cannot silently fall back to inline teardown.
+pub fn start() bool {
+    const slot = task.createKernelThreadAffinity(reaperMain, 0, 0) orelse return false;
+    const t = task.getTask(slot) orelse {
+        task.cancelUnstartedKernelThread(slot);
+        return false;
+    };
+    t.sched_policy = sched_policy.SCHED_FIFO;
+    t.priority = sched_policy.rtToKernelPriority(REAPER_RT_PRIORITY);
+    // Kernel threads are otherwise discovered only via the bitmap fallback,
+    // which a busy CPU never reaches. Put it on CPU 0's queue now.
+    sched.enqueue(t);
     @atomicStore(u8, &active, 1, .release);
+    return true;
 }
 
 /// Queue a detached slot. Caller holds task_lock; call `wake` after
@@ -67,14 +71,13 @@ pub fn wake() void {
     }
 }
 
-/// Block the current task until `slot`'s teardown has finished. A pending
-/// signal ends the wait early: the exit status is already collected, the
-/// reaper finishes the teardown on its own.
+/// Block the current task until `slot`'s teardown has finished. This internal
+/// wait is not interruptible: waitpid must not return before the detached
+/// child's slot and resources are released.
 pub fn waitDone(slot: u32) void {
     wake();
     const cur_idx = sched.currentTaskIndex() orelse return;
     const cur = task.getTask(cur_idx) orelse return;
-    const signal = @import("signal.zig");
     while (true) {
         {
             const f = reap_lock.acquire();
@@ -85,10 +88,6 @@ pub fn waitDone(slot: u32) void {
                 .incarnation = cur.incarnation,
             };
             if (!set.setWaiter(slot, waiter_token)) return;
-            if (cur.is_user and signal.pendingActionable(cur)) {
-                _ = set.setWaiter(slot, .{});
-                return;
-            }
             sched_claim.store(&cur.state, .blocked);
         }
         sched.rescheduleAfterBlock();

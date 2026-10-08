@@ -318,7 +318,10 @@ export fn _start() callconv(.c) noreturn {
     // Zombie teardown (address space, kernel stack, driver state) runs in a
     // pinned low-RT-priority kernel thread with IRQs on instead of the BSP
     // tick / waitpid under task_lock (see proc/reaper.zig).
-    @import("proc/reaper.zig").start();
+    if (!@import("proc/reaper.zig").start()) {
+        klog.log(.info, "Failed to start zombie reaper — system halted");
+        while (true) asm volatile ("hlt");
+    }
 
     // M5.5: Load init program from ramdisk as the first user process (pid 1)
     if (loader.loadProgram("init", 0, false, true, @import("proc/rlimit.zig").RLIM_INFINITY, @import("proc/rlimit.zig").RLIM_INFINITY)) |task_idx| {
