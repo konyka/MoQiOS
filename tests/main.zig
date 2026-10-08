@@ -57,6 +57,13 @@ test "runqueue tokens distinguish a reused task slot" {
     try std.testing.expect(!sched_queue_policy.tokenMatches(old, 10));
 }
 
+test "runqueue duplicate policy distinguishes task incarnation identity" {
+    const entry = sched_queue_policy.Entry{ .task = 7, .incarnation = 4 };
+    try std.testing.expect(sched_queue_policy.sameEntry(entry, .{ .task = 7, .incarnation = 4 }));
+    try std.testing.expect(!sched_queue_policy.sameEntry(entry, .{ .task = 8, .incarnation = 4 }));
+    try std.testing.expect(!sched_queue_policy.sameEntry(entry, .{ .task = 7, .incarnation = 5 }));
+}
+
 test {
     _ = @import("rt_hardening_test.zig");
     _ = @import("rt_round2_test.zig");
@@ -212,6 +219,128 @@ test "parent TID copyout aborts an unpublished child before publication" {
     try std.testing.expect(std.mem.indexOf(u8, source, "abortUnpublishedChild(child_idx)") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "abortUnpublishedChild(child_idx)").? <
         std.mem.indexOf(u8, source, "publishRunnable(child_idx)").?);
+}
+
+test "lost current task aborts the unpublished clone child" {
+    const source = kt.clone_source;
+    const current_failure = std.mem.indexOf(u8, source, "const current_idx = sched.currentTaskIndex() orelse").?;
+    const abort = std.mem.indexOfPos(u8, source, current_failure, "abortUnpublishedChild(child_idx)").?;
+    try std.testing.expect(abort > current_failure);
+}
+
+test "fd table allocation failure releases the kernel stack" {
+    const source = kt.task_source;
+    var search_from: usize = 0;
+    var matches: usize = 0;
+    while (std.mem.indexOfPos(u8, source, search_from, "OOM allocating fd table")) |fd_failure| {
+        const branch_end = std.mem.indexOfPos(u8, source, fd_failure, "};").?;
+        const stack_release = std.mem.indexOfPos(u8, source, fd_failure, "freeKernelStack(stack_virt)").?;
+        try std.testing.expect(stack_release < branch_end);
+        matches += 1;
+        search_from = branch_end + 2;
+    }
+    try std.testing.expectEqual(@as(usize, 3), matches);
+}
+
+test "flat loader transfers mapped page ownership to the user address space" {
+    const source = kt.loader_source;
+    const map_failure = std.mem.indexOf(u8, source, "Failed to map code page").?;
+    const destroy = std.mem.indexOfPos(u8, source, map_failure, "destroyUserSpace(user_pml4)").?;
+    const free_suffix = std.mem.indexOfPos(u8, source, destroy, "freePagesFrom(&code_pages, p, allocated)").?;
+    try std.testing.expect(free_suffix > destroy);
+    try std.testing.expect(std.mem.indexOfPos(u8, source, free_suffix, "freePages(&code_pages, allocated)") == null);
+}
+
+test "exec loader frees pages that never enter the page table" {
+    const source = kt.loader_source;
+    const map_failure = std.mem.indexOf(u8, source, "paging.mapPageNoFlush(new_pml4, page_vaddr, phys").?;
+    const map_catch = std.mem.indexOfPos(u8, source, map_failure, "pmm.freePage(phys)").?;
+    try std.testing.expect(map_catch > map_failure);
+    const stack_failure = std.mem.indexOf(u8, source, "mapUserPageNoFlush(new_pml4, user_stack_base, stack_phys").?;
+    const stack_free = std.mem.indexOfPos(u8, source, stack_failure, "pmm.freePage(stack_phys)").?;
+    try std.testing.expect(stack_free > stack_failure);
+}
+
+test "flat loader uses full address-space teardown for root allocation failure" {
+    const source = kt.loader_source;
+    const failure = std.mem.indexOf(u8, source, "OOM for code pages").?;
+    const teardown = std.mem.indexOfPos(u8, source, failure, "destroyUserSpace(user_pml4)").?;
+    try std.testing.expect(teardown > failure);
+    try std.testing.expect(std.mem.indexOfPos(u8, source, failure, "pmm.freePage(user_pml4)") == null);
+}
+
+test "flat loader capacity matches its fixed code-page table" {
+    const source = kt.loader_source;
+    try std.testing.expect(std.mem.indexOf(u8, source, "if (pages_needed > 256) return null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "var code_pages: [256]?u64") != null);
+}
+
+test "exec aborts destroy the newly loaded address space before returning" {
+    const source = kt.execve_source;
+    var search_from: usize = 0;
+    var matches: usize = 0;
+    while (std.mem.indexOfPos(u8, source, search_from, "currentTaskIndex() orelse")) |failure| {
+        const branch_end = std.mem.indexOfPos(u8, source, failure, "};").?;
+        const teardown = std.mem.indexOfPos(u8, source, failure, "destroyUserSpace(result.pml4)").?;
+        try std.testing.expect(teardown < branch_end);
+        matches += 1;
+        search_from = branch_end + 2;
+    }
+    try std.testing.expectEqual(@as(usize, 2), matches);
+}
+
+test "ELF loaders validate segment arithmetic and file payload bounds" {
+    const source = kt.loader_source;
+    try std.testing.expect(std.mem.indexOf(u8, source, "fn validLoadSegment").? <
+        std.mem.indexOf(u8, source, "const seg_start").?);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "validLoadSegment(phdr, file.size)"));
+    try std.testing.expect(std.mem.indexOf(u8, source, "phdr.p_filesz > phdr.p_memsz") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "phdr.p_filesz > file_size - phdr.p_offset") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "phdr.p_memsz > USER_ADDR_LIMIT - phdr.p_vaddr") != null);
+}
+
+test "boot treats reaper startup failure as fatal" {
+    const main_source = kt.main_source;
+    const reaper_start = std.mem.indexOf(u8, main_source, "proc/reaper.zig").?;
+    const init_load = std.mem.indexOfPos(u8, main_source, reaper_start, "loader.loadProgram(\"init\"").?;
+    try std.testing.expect(std.mem.indexOfPos(u8, main_source, reaper_start, "if (!@import(\"proc/reaper.zig\").start())") != null);
+    try std.testing.expect(reaper_start < init_load);
+}
+
+test "reaper startup reports kernel-thread allocation failure" {
+    const source = kt.reaper_source;
+    try std.testing.expect(std.mem.indexOf(u8, source, "pub fn start() bool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "orelse return false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return true") != null);
+}
+
+test "reaper waitDone cannot abandon detached teardown on signal" {
+    const source = kt.reaper_source;
+    const start = std.mem.indexOf(u8, source, "pub fn waitDone").?;
+    const end = std.mem.indexOfPos(u8, source, start, "pub fn completeLocked").?;
+    const body = source[start..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "set.setWaiter(slot, waiter_token)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "pendingActionable") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "sched.rescheduleAfterBlock()") != null);
+}
+
+test "sched_setaffinity pins target lifetime before mutation and migration" {
+    const source = kt.syscall_entry_source;
+    const start = std.mem.indexOf(u8, source, "fn syscallSchedSetaffinity").?;
+    const end = std.mem.indexOfPos(u8, source, start, "fn syscallStatfs").?;
+    const body = source[start..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "pinTaskByTid(pid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "pinTaskByIndex(cur_idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "target.cpu_affinity = affinity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "const was_ready = target.state == .ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "const lock_flags = task_mod2.lockTask()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "defer target_pin.release()") != null);
+    const unlock = std.mem.indexOf(u8, body, "task_mod2.unlockTask(lock_flags)").?;
+    const enqueue = std.mem.indexOf(u8, body, "enqueueTask(target)").?;
+    const old_cpu = std.mem.indexOf(u8, body, "const old_cpu = target.last_cpu").?;
+    try std.testing.expect(old_cpu < unlock);
+    try std.testing.expect(unlock < enqueue);
+    try std.testing.expect(std.mem.indexOfPos(u8, body, enqueue, "old_cpu").? > enqueue);
 }
 
 test "unlinked MQ closes can reclaim a nonempty queue" {
