@@ -1271,7 +1271,9 @@ pub fn abortUnpublishedChild(slot: u32) bool {
     const incarnation = blk: {
         const flags = task_lock.acquire();
         defer task_lock.release(flags);
-        if (slot_bitmap & (@as(u64, 1) << @intCast(slot)) == 0 or t.state != .blocked) return false;
+        if (slot_bitmap & (@as(u64, 1) << @intCast(slot)) == 0 or
+            sched_claim.load(&t.state) != .blocked or
+            @atomicLoad(u32, &t.exiting, .acquire) != 0) return false;
         @atomicStore(u32, &t.exiting, 1, .release);
         break :blk t.incarnation;
     };
@@ -1661,7 +1663,8 @@ pub fn publishRunnable(slot: u32) void {
     {
         const flags = task_lock.acquire();
         defer task_lock.release(flags);
-        if (sched_claim.load(&t.state) != .blocked) return;
+        if (sched_claim.load(&t.state) != .blocked or
+            @atomicLoad(u32, &t.exiting, .acquire) != 0) return;
         sched_claim.store(&t.state, .ready);
     }
     asm volatile ("" ::: .{ .memory = true });

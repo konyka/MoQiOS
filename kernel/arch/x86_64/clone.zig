@@ -341,6 +341,7 @@ pub fn clone(
     child.mmap_regions = parent.mmap_regions;
     child.mmap_count = parent.mmap_count;
     child.mmap_active_bm = parent.mmap_active_bm;
+    @import("../../mm/mmap.zig").retainFileRefs(child);
 
     child.brk_current = parent.brk_current;
     child.stack_limit = parent.stack_limit;

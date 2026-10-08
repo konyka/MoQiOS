@@ -457,6 +457,21 @@ pub fn releaseFileRefs(task: *task_mod.Task) void {
     task.mmap_active_bm = 0;
 }
 
+/// Retain the backing references copied into a child task's region table.
+/// Region metadata is copied by clone, so each child teardown needs its own
+/// reference even when the page tables are shared by CLONE_VM.
+pub fn retainFileRefs(task: *const task_mod.Task) void {
+    var bits = task.mmap_active_bm;
+    while (bits != 0) {
+        const i: u6 = @truncate(@ctz(bits));
+        bits &= bits - 1;
+        const r = &task.mmap_regions[i];
+        if (r.active and r.file_kind == @intFromEnum(filemap.FsKind.ext2)) {
+            ext2.retainFile(r.file_idx);
+        }
+    }
+}
+
 // ─── L1: user driver framework helpers ──────────────────────────────────────
 // dev_map_mmio / dev_dma_alloc place eager, non-demand-paged mappings that
 // must still participate in munmap and placement bookkeeping. These wrappers
