@@ -17,6 +17,7 @@ const task_mod = @import("task.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const syscall_entry = @import("../arch/arch.zig").syscall;
 const tsc = @import("../arch/arch.zig").tsc;
+const queue_policy = @import("sched_queue_policy.zig");
 
 pub const MAX_CPUS: u32 = syscall_entry.MAX_CPUS;
 pub const QUEUE_SIZE: u32 = 256;
@@ -43,8 +44,12 @@ pub const SchedStats = struct {
 };
 
 pub const PerCpuRunQueue = struct {
+    const QueueEntry = struct {
+        task: *task_mod.Task,
+        incarnation: u64,
+    };
     /// Ring buffer of ready tasks (capacity = QUEUE_SIZE).
-    tasks: [QUEUE_SIZE]?*task_mod.Task = [_]?*task_mod.Task{null} ** QUEUE_SIZE,
+    tasks: [QUEUE_SIZE]?QueueEntry = [_]?QueueEntry{null} ** QUEUE_SIZE,
     /// Local-CPU enqueue end (newest entry).
     head: u32 = 0,
     /// Dequeue/steal end (oldest entry) — FIFO pop gives round-robin fairness:
@@ -72,7 +77,7 @@ pub const PerCpuRunQueue = struct {
         defer self.lock.release(flags);
         if (self.nr_running >= QUEUE_SIZE) return false;
         const slot = self.head % QUEUE_SIZE;
-        self.tasks[slot] = t;
+        self.tasks[slot] = .{ .task = t, .incarnation = t.incarnation };
         self.head +%= 1;
         self.nr_running += 1;
         t.last_cpu = self.cpu_id;
@@ -84,14 +89,38 @@ pub const PerCpuRunQueue = struct {
     pub fn pop(self: *PerCpuRunQueue) ?*task_mod.Task {
         const flags = self.lock.acquire();
         defer self.lock.release(flags);
-        if (self.nr_running == 0) return null;
-        const slot = self.tail % QUEUE_SIZE;
-        const t = self.tasks[slot];
-        self.tasks[slot] = null;
-        self.tail +%= 1;
-        self.nr_running -= 1;
-        self.stats.local_dequeues += 1;
-        return t;
+        while (self.nr_running != 0) {
+            const slot = self.tail % QUEUE_SIZE;
+            const entry = self.tasks[slot];
+            self.tasks[slot] = null;
+            self.tail +%= 1;
+            self.nr_running -= 1;
+            self.stats.local_dequeues += 1;
+            const e = entry orelse continue;
+            if (!queue_policy.tokenMatches(.{ .task = @intFromPtr(e.task), .incarnation = e.incarnation }, e.task.incarnation)) continue;
+            return e.task;
+        }
+        return null;
+    }
+
+    fn purgeStaleLocked(self: *PerCpuRunQueue) void {
+        const queued = self.nr_running;
+        var read: u32 = 0;
+        var kept: u32 = 0;
+        while (read < queued) : (read += 1) {
+            const read_slot = (self.tail +% read) % QUEUE_SIZE;
+            const entry = self.tasks[read_slot] orelse continue;
+            if (!queue_policy.tokenMatches(.{ .task = @intFromPtr(entry.task), .incarnation = entry.incarnation }, entry.task.incarnation)) {
+                self.tasks[read_slot] = null;
+                continue;
+            }
+            const write_slot = (self.tail +% kept) % QUEUE_SIZE;
+            self.tasks[write_slot] = entry;
+            if (write_slot != read_slot) self.tasks[read_slot] = null;
+            kept += 1;
+        }
+        self.nr_running = kept;
+        self.head = self.tail +% kept;
     }
 
     /// F3: RT-aware pop (choice rule: `sched_policy.PopChoice`). The
@@ -106,27 +135,33 @@ pub const PerCpuRunQueue = struct {
         const sp = @import("sched_policy.zig");
         const flags = self.lock.acquire();
         defer self.lock.release(flags);
-        if (self.nr_running == 0) return null;
+        while (true) {
+            self.purgeStaleLocked();
+            if (self.nr_running == 0) return null;
 
-        var pick: sp.PopChoice = .{};
-        var i: u32 = 0;
-        while (i < self.nr_running) : (i += 1) {
-            const t = self.tasks[(self.tail +% i) % QUEUE_SIZE] orelse continue;
-            pick.consider(i, sp.rankKey(t.sched_policy, t.priority));
-        }
+            var pick: sp.PopChoice = .{};
+            var i: u32 = 0;
+            while (i < self.nr_running) : (i += 1) {
+                const entry = self.tasks[(self.tail +% i) % QUEUE_SIZE] orelse continue;
+                pick.consider(i, sp.rankKey(entry.task.sched_policy, entry.task.priority));
+            }
 
-        const pop_slot = self.tail % QUEUE_SIZE;
-        const best_slot = (self.tail +% (pick.choice() orelse 0)) % QUEUE_SIZE;
-        const chosen = self.tasks[best_slot];
-        if (best_slot != pop_slot) {
-            // Keep the displaced entry by moving it into the chosen slot.
-            self.tasks[best_slot] = self.tasks[pop_slot];
+            const pop_slot = self.tail % QUEUE_SIZE;
+            const best_slot = (self.tail +% (pick.choice() orelse 0)) % QUEUE_SIZE;
+            const chosen = self.tasks[best_slot];
+            if (best_slot != pop_slot) {
+                // Keep the displaced entry by moving it into the chosen slot.
+                self.tasks[best_slot] = self.tasks[pop_slot];
+            }
+            self.tasks[pop_slot] = null;
+            self.tail +%= 1;
+            self.nr_running -= 1;
+            self.stats.local_dequeues += 1;
+            const entry = chosen orelse continue;
+            if (!queue_policy.tokenMatches(.{ .task = @intFromPtr(entry.task), .incarnation = entry.incarnation }, entry.task.incarnation)) continue;
+            const task_ptr: *task_mod.Task = entry.task;
+            return task_ptr;
         }
-        self.tasks[pop_slot] = null;
-        self.tail +%= 1;
-        self.nr_running -= 1;
-        self.stats.local_dequeues += 1;
-        return chosen;
     }
 
     /// Steal up to half of `target`'s tasks into self. Returns count stolen.
@@ -156,7 +191,9 @@ pub const PerCpuRunQueue = struct {
             target.tasks[slot] = null;
             target.tail +%= 1;
             target.nr_running -= 1;
-            const tt = tt_opt orelse continue;
+            const tt_entry = tt_opt orelse continue;
+            if (!queue_policy.tokenMatches(.{ .task = @intFromPtr(tt_entry.task), .incarnation = tt_entry.incarnation }, tt_entry.task.incarnation)) continue;
+            const tt = tt_entry.task;
             // Skip tasks pinned away from us.
             if (tt.cpu_affinity >= 0 and tt.cpu_affinity != @as(i16, self.cpu_id)) {
                 // Re-insert at target's local end (head) so it stays runnable
@@ -164,7 +201,7 @@ pub const PerCpuRunQueue = struct {
                 // never loses the task.
                 if (target.nr_running < QUEUE_SIZE) {
                     const re_slot = target.head % QUEUE_SIZE;
-                    target.tasks[re_slot] = tt;
+                    target.tasks[re_slot] = tt_entry;
                     target.head +%= 1;
                     target.nr_running += 1;
                 }
@@ -176,14 +213,14 @@ pub const PerCpuRunQueue = struct {
                 // Self overflowed: put it back on target.
                 if (target.nr_running < QUEUE_SIZE) {
                     const re_slot = target.head % QUEUE_SIZE;
-                    target.tasks[re_slot] = tt;
+                    target.tasks[re_slot] = tt_entry;
                     target.head +%= 1;
                     target.nr_running += 1;
                 }
                 break;
             }
             const my_slot = self.head % QUEUE_SIZE;
-            self.tasks[my_slot] = tt;
+            self.tasks[my_slot] = tt_entry;
             self.head +%= 1;
             self.nr_running += 1;
             tt.last_cpu = self.cpu_id;

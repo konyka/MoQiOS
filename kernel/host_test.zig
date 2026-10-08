@@ -75,6 +75,7 @@ pub const pci_msix = @import("drivers/pci_msix.zig");
 pub const lo = @import("net/lo.zig");
 pub const sched_policy = @import("proc/sched_policy.zig");
 pub const sched_claim = @import("proc/sched_claim.zig");
+pub const sched_queue_policy = @import("proc/sched_queue_policy.zig");
 pub const unsupported_policy = @import("proc/unsupported_policy.zig");
 pub const sched_getaffinity_policy = @import("proc/sched_getaffinity_policy.zig");
 pub const task_op_policy = @import("proc/task_op_policy.zig");

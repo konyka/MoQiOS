@@ -457,6 +457,7 @@ pub fn clone(
         tid_buf[2] = @truncate(child_tid >> 16);
         tid_buf[3] = @truncate(child_tid >> 24);
         if (copy_user.copyToUser(@ptrFromInt(parent_tid_ptr), &tid_buf, 4) != 4) {
+            _ = task_mod.abortUnpublishedChild(child_idx);
             return -14;
         }
     }

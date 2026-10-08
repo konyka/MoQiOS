@@ -21,6 +21,7 @@ const wake_preempt_policy = @import("wake_preempt_policy.zig");
 const rt_bandwidth_policy = @import("rt_bandwidth_policy.zig");
 const ipi_kick_policy = @import("ipi_kick_policy.zig");
 const sched_claim = @import("sched_claim.zig");
+const sched_queue_policy = @import("sched_queue_policy.zig");
 const per_cpu = @import("per_cpu.zig");
 const idt = @import("../arch/arch.zig").interrupts;
 const gdt = @import("../arch/arch.zig").gdt;
@@ -1171,7 +1172,12 @@ fn peekBestRankKey() ?u16 {
     var i: u32 = 0;
     while (i < q.nr_running) : (i += 1) {
         const slot = (q.tail + i) % per_cpu.QUEUE_SIZE;
-        const t = q.tasks[slot] orelse continue;
+        const entry = q.tasks[slot] orelse continue;
+        if (!sched_queue_policy.tokenMatches(.{
+            .task = @intFromPtr(entry.task),
+            .incarnation = entry.incarnation,
+        }, entry.task.incarnation)) continue;
+        const t = entry.task;
         if (sched_claim.load(&t.state) != .ready) continue;
         const key = sched_policy.rankKey(t.sched_policy, t.priority);
         if (best == null or key < best.?) best = key;

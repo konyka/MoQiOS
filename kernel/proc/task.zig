@@ -1263,6 +1263,52 @@ fn freeSlotLocked(i: u32, t: *Task) void {
     uidTaskCountRemoveLocked(t.uid);
 }
 
+/// Abort a child that is still blocked and unpublished. Resource teardown is
+/// deliberately outside task_lock; the slot is freed only after teardown.
+pub fn abortUnpublishedChild(slot: u32) bool {
+    if (slot >= MAX_TASKS) return false;
+    const t = &tasks[slot];
+    const incarnation = blk: {
+        const flags = task_lock.acquire();
+        defer task_lock.release(flags);
+        if (slot_bitmap & (@as(u64, 1) << @intCast(slot)) == 0 or t.state != .blocked) return false;
+        @atomicStore(u32, &t.exiting, 1, .release);
+        break :blk t.incarnation;
+    };
+
+    @import("../fs/vfs.zig").detachPipeReadWaiter(&t.pipe_read_wait_node);
+    {
+        const vfs = @import("../fs/vfs.zig");
+        if (vfs.releaseFdTable(t.fd_table)) {
+            var fd: u32 = 3;
+            while (fd < vfs.MAX_FDS) : (fd += 1) {
+                if (t.fd_table.fds[fd].fd_type != .none) _ = t.fd_table.close(fd);
+            }
+            vfs.freeFdTable(t.fd_table);
+        }
+    }
+    if (t.page_table_phys != 0 and t.mm != null) {
+        const shared = t.mm.?.isShared();
+        var vm_guard = Mm.beginVmMutation(t.mm, @ptrCast(t)) catch null;
+        if (vm_guard) |*guard| {
+            defer guard.release();
+            @import("../ipc/sysv_shm.zig").detachAllForTask(t.tid, t.page_table_phys, @import("../ipc/sysv_shm_lifecycle_policy.zig").unmapOnExit(shared));
+        }
+    }
+    @import("../ipc/posix_timer.zig").deleteTimersForTask(slot);
+    @import("../ipc/posix_mq.zig").detachWaiterForTask(slot);
+    @import("../ipc/posix_mq.zig").clearNotifyForTask(slot);
+    @import("../ipc/posix_mq.zig").closeRefsForTask(slot);
+    @import("../ipc/ipc.zig").clearEndpointsForTask(slot);
+    teardownResources(t);
+
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    if (slot_bitmap & (@as(u64, 1) << @intCast(slot)) == 0 or t.incarnation != incarnation) return false;
+    freeSlotLocked(slot, t);
+    return true;
+}
+
 /// Hand a quiesced zombie to the reaper (task_lock held, O(1)). Unlinking
 /// the parent makes the slot invisible to waitpid / hasChildren scans while
 /// the teardown is in flight.

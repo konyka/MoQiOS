@@ -49,6 +49,13 @@ const sysv_shm_lifecycle_policy = kt.sysv_shm_lifecycle_policy;
 const time_set_policy = kt.time_set_policy;
 const time_syscall = kt.time_syscall;
 const sigreturn_policy = kt.sigreturn_policy;
+const sched_queue_policy = kt.sched_queue_policy;
+
+test "runqueue tokens distinguish a reused task slot" {
+    const old = sched_queue_policy.Entry{ .task = 3, .incarnation = 9 };
+    try std.testing.expect(sched_queue_policy.tokenMatches(old, 9));
+    try std.testing.expect(!sched_queue_policy.tokenMatches(old, 10));
+}
 
 test {
     _ = @import("rt_hardening_test.zig");
@@ -198,6 +205,13 @@ test "POSIX MQ descriptor policy validates access and flags" {
 test "CLONE_FILES preserves MQ handle usability until shared sidecar ownership exists" {
     try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "posix_mq.zig").? >= 0);
     try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "inheritRefs(") != null);
+}
+
+test "parent TID copyout aborts an unpublished child before publication" {
+    const source = kt.clone_source;
+    try std.testing.expect(std.mem.indexOf(u8, source, "abortUnpublishedChild(child_idx)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "abortUnpublishedChild(child_idx)").? <
+        std.mem.indexOf(u8, source, "publishRunnable(child_idx)").?);
 }
 
 test "unlinked MQ closes can reclaim a nonempty queue" {
