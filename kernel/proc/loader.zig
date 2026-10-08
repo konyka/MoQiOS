@@ -38,6 +38,17 @@ const user_stack = @import("user_stack.zig");
 const StackInfo = user_stack.StackInfo;
 pub const buildUserStack = user_stack.buildUserStack;
 
+const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
+
+fn validLoadSegment(phdr: Elf64_Phdr, file_size: u64) bool {
+    if (phdr.p_filesz > phdr.p_memsz) return false;
+    if (phdr.p_vaddr >= USER_ADDR_LIMIT) return false;
+    if (phdr.p_memsz > USER_ADDR_LIMIT - phdr.p_vaddr) return false;
+    if (phdr.p_offset > file_size) return false;
+    if (phdr.p_filesz > file_size - phdr.p_offset) return false;
+    return true;
+}
+
 /// Load a program from ramdisk. Detects ELF vs flat binary automatically.
 pub fn loadProgram(
     name: []const u8,
@@ -115,9 +126,8 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
         const seg_offset = phdr.p_offset;
         const seg_flags = phdr.p_flags;
 
-        // Validate segment is in user space
-        if (seg_vaddr >= 0x0000_8000_0000_0000) {
-            serial.writeString("[loader] Segment vaddr in kernel space\n");
+        if (!validLoadSegment(phdr, file.size)) {
+            serial.writeString("[loader] Invalid ELF segment bounds\n");
             success = false;
             break;
         }
@@ -268,6 +278,7 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
 fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32, initial_init_caller: bool, initial_init_launch: bool, fsize_cur: u64, fsize_max: u64) ?u32 {
     const binary_size = file.size;
     const pages_needed = (binary_size + paging.PAGE_SIZE - 1) / paging.PAGE_SIZE;
+    if (pages_needed > 256) return null;
 
     const user_pml4 = user_space.createUserSpace() orelse {
         serial.writeString("[loader] OOM for user PML4\n");
@@ -280,7 +291,7 @@ fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32, 
         code_pages[allocated] = pmm.allocPage() orelse {
             serial.writeString("[loader] OOM for code pages\n");
             freePages(&code_pages, allocated);
-            pmm.freePage(user_pml4);
+            user_space.destroyUserSpace(user_pml4);
             return null;
         };
     }
@@ -309,7 +320,7 @@ fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32, 
         paging.mapPageNoFlush(user_pml4, virt_addr, code_pages[p].?, code_flags) catch {
             serial.writeString("[loader] Failed to map code page\n");
             user_space.destroyUserSpace(user_pml4);
-            freePages(&code_pages, allocated);
+            freePagesFrom(&code_pages, p, allocated);
             return null;
         };
     }
@@ -317,7 +328,6 @@ fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32, 
     const stack_phys = pmm.allocPage() orelse {
         serial.writeString("[loader] OOM for stack\n");
         user_space.destroyUserSpace(user_pml4);
-        freePages(&code_pages, allocated);
         return null;
     };
     const user_stack_base = user_space.USER_STACK_TOP - paging.PAGE_SIZE;
@@ -325,7 +335,6 @@ fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32, 
         serial.writeString("[loader] Failed to map stack\n");
         pmm.freePage(stack_phys);
         user_space.destroyUserSpace(user_pml4);
-        freePages(&code_pages, allocated);
         return null;
     };
 
@@ -346,7 +355,6 @@ fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32, 
         fsize_max,
     ) orelse {
         serial.writeString("[loader] Failed to create task\n");
-        freePages(&code_pages, allocated);
         return null;
     };
 
@@ -372,7 +380,12 @@ fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32, 
 }
 
 fn freePages(pages: *[256]?u64, count: u64) void {
-    for (0..count) |i| {
+    freePagesFrom(pages, 0, count);
+}
+
+fn freePagesFrom(pages: *[256]?u64, start: usize, end: u64) void {
+    const end_idx: usize = @intCast(end);
+    for (start..end_idx) |i| {
         if (pages[i]) |phys| {
             pmm.freePage(phys);
             pages[i] = null;
@@ -402,7 +415,7 @@ pub fn loadProgramForExec(name: []const u8, argv: []const []const u8, envp: []co
         const seg_filesz = phdr.p_filesz;
         const seg_memsz = phdr.p_memsz;
         const seg_offset = phdr.p_offset;
-        if (seg_vaddr >= 0x0000_8000_0000_0000) {
+        if (!validLoadSegment(phdr, file.size)) {
             success = false;
             break;
         }
@@ -445,6 +458,7 @@ pub fn loadProgramForExec(name: []const u8, argv: []const []const u8, envp: []co
                 .global = false,
             };
             paging.mapPageNoFlush(new_pml4, page_vaddr, phys, map_flags) catch {
+                pmm.freePage(phys);
                 success = false;
                 break;
             };
@@ -465,6 +479,7 @@ pub fn loadProgramForExec(name: []const u8, argv: []const []const u8, envp: []co
     };
     const user_stack_base = user_space.USER_STACK_TOP - paging.PAGE_SIZE;
     user_space.mapUserPageNoFlush(new_pml4, user_stack_base, stack_phys, true) catch {
+        pmm.freePage(stack_phys);
         user_space.destroyUserSpace(new_pml4);
         return null;
     };

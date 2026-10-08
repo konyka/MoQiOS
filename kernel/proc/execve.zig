@@ -104,8 +104,14 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
     const sched = @import("sched.zig");
     const task_mod = @import("task.zig");
     const user_space = @import("../mm/user_space.zig");
-    const cur_idx = sched.currentTaskIndex() orelse return null;
-    const cur = task_mod.getTask(cur_idx) orelse return null;
+    const cur_idx = sched.currentTaskIndex() orelse {
+        user_space.destroyUserSpace(result.pml4);
+        return null;
+    };
+    const cur = task_mod.getTask(cur_idx) orelse {
+        user_space.destroyUserSpace(result.pml4);
+        return null;
+    };
     const new_mm = user_space.createMmForRoot(result.pml4) orelse return null;
 
     // v53.44: Close FD_CLOEXEC file descriptors before destroying old address space.
@@ -274,8 +280,14 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64)
     const sched = @import("sched.zig");
     const task_mod = @import("task.zig");
     const user_space = @import("../mm/user_space.zig");
-    const cur_idx = sched.currentTaskIndex() orelse return null;
-    const cur = task_mod.getTask(cur_idx) orelse return null;
+    const cur_idx = sched.currentTaskIndex() orelse {
+        user_space.destroyUserSpace(result.pml4);
+        return null;
+    };
+    const cur = task_mod.getTask(cur_idx) orelse {
+        user_space.destroyUserSpace(result.pml4);
+        return null;
+    };
     const new_mm = user_space.createMmForRoot(result.pml4) orelse return null;
 
     // v53.44: Close FD_CLOEXEC file descriptors before destroying old address space.
