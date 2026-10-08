@@ -4202,26 +4202,6 @@ fn syscallSchedSetaffinity(pid: u32, cpusetsize: u32, mask_ptr: u64) i64 {
     if (mask_ptr == 0 or mask_ptr >= 0x0000_8000_0000_0000) return -14;
     if (cpusetsize == 0 or cpusetsize > 128) return -22;
 
-    // Find target task (pid=0 means current)
-    const cur_idx = sched.currentTaskIndex() orelse return -1;
-    var target_idx = cur_idx;
-    if (pid != 0) {
-        // Search for task with matching tid
-        var found = false;
-        var i: u32 = 0;
-        while (i < 256) : (i += 1) {
-            if (task_mod2.getTask(i)) |t| {
-                if (t.tid == pid) {
-                    target_idx = i;
-                    found = true;
-                    break;
-                }
-            }
-        }
-        if (!found) return -3; // ESRCH
-    }
-
-    const target = task_mod2.getTask(target_idx) orelse return -1;
     const copy = @import("../../mm/copy_from_user.zig");
     var mask_buf: [32]u8 = .{0} ** 32;
     // NOTE: explicit u32 — @min(u32, comptime 32) would narrow to u6, and
@@ -4245,7 +4225,25 @@ fn syscallSchedSetaffinity(pid: u32, cpusetsize: u32, mask_ptr: u64) i64 {
         }
     }
     if (affinity < 0 or @as(u32, @intCast(affinity)) >= @import("../../smp.zig").configured_cpu_count) return -22;
+
+    // Pin the target after copying user memory. The pin closes the lookup ->
+    // mutation gap: reaping cannot free or reuse the slot while migration is
+    // being queued.
+    const cur_idx = sched.currentTaskIndex() orelse return -1;
+    var target_pin = if (pid == 0)
+        (task_mod2.pinTaskByIndex(cur_idx, false) orelse return -1)
+    else
+        (task_mod2.pinTaskByTid(pid, false) orelse return -3);
+    defer target_pin.release();
+    const target = target_pin.task;
+    const target_idx = target_pin.slot;
+    const target_cpu = @as(u32, @intCast(affinity));
+    const lock_flags = task_mod2.lockTask();
     target.cpu_affinity = affinity;
+    const was_running = target.state == .running;
+    const was_ready = target.state == .ready;
+    const old_cpu = target.last_cpu;
+    task_mod2.unlockTask(lock_flags);
 
     // Migrate a live task whose current CPU falls outside the new pin —
     // otherwise a running task keeps its old CPU forever (observed: hello44
@@ -4255,16 +4253,14 @@ fn syscallSchedSetaffinity(pid: u32, cpusetsize: u32, mask_ptr: u64) i64 {
     // current CPU switch away (to idle if nothing else is runnable) — a bare
     // reschedule is not enough: with no other runnable work the scheduler
     // just keeps the task on the wrong CPU (flaky migration).
-    if (target.state == .running and
-        target.last_cpu != @as(u32, @intCast(target.cpu_affinity)))
-    {
-        const pin_cpu: u8 = @intCast(target.cpu_affinity);
+    if ((was_running or was_ready) and old_cpu != target_cpu) {
+        const pin_cpu: u8 = @intCast(target_cpu);
         _ = @import("../../proc/per_cpu.zig").enqueueTask(target);
         sched.kickCpu(pin_cpu);
         if (target_idx == cur_idx) {
             sched.forceReschedule();
         } else {
-            sched.kickCpu(@intCast(target.last_cpu));
+            sched.kickCpu(@intCast(old_cpu));
         }
     }
     return 0;

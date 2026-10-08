@@ -427,6 +427,26 @@ pub fn pinTaskByIndex(idx: u32, allow_exiting: bool) ?TaskPin {
     return .{ .task = t, .slot = idx, .tid = t.tid, .incarnation = t.incarnation };
 }
 
+/// Pin a live task by TID while the caller accesses its Task fields.
+/// The lookup and operation reference increment are one task-lock transaction,
+/// so a matching slot cannot be reaped or reused before the pin is released.
+pub fn pinTaskByTid(tid: u32, allow_exiting: bool) ?TaskPin {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    var bits = slot_bitmap;
+    while (bits != 0) {
+        const idx: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const t = &tasks[idx];
+        if (t.tid != tid) continue;
+        if (t.state == .zombie or (!allow_exiting and @atomicLoad(u32, &t.exiting, .acquire) != 0)) return null;
+        if (t.operation_refs >= MAX_OPERATION_REFS) return null;
+        _ = @atomicRmw(u32, &t.operation_refs, .Add, 1, .acq_rel);
+        return .{ .task = t, .slot = idx, .tid = t.tid, .incarnation = t.incarnation };
+    }
+    return null;
+}
+
 /// Retain a task's Mm and pin its task slot for the duration of an operation.
 /// The task lock protects both the TID lookup and the lifetime transition; Mm
 /// retention happens under that lock so reaping cannot clear the task's Mm
@@ -903,6 +923,7 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     const fd_table = @import("../fs/vfs.zig").allocFdTable() orelse {
         serial.writeString("[task] OOM allocating fd table\n");
         slot_bitmap &= ~(@as(u64, 1) << @intCast(slot));
+        freeKernelStack(stack_virt);
         return null;
     };
     tasks[slot].umask_val = creation_metadata.initialTaskUmask();
@@ -970,6 +991,7 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     const fd_table = @import("../fs/vfs.zig").allocFdTable() orelse {
         serial.writeString("[task] OOM allocating fd table\n");
         slot_bitmap &= ~(@as(u64, 1) << @intCast(slot));
+        freeKernelStack(stack_virt);
         return null;
     };
     tasks[slot].umask_val = creation_metadata.initialTaskUmask();
@@ -1530,6 +1552,7 @@ pub fn createUserProcess(
         const fd_table = @import("../fs/vfs.zig").allocFdTable() orelse {
             serial.writeString("[task] OOM allocating fd table\n");
             slot_bitmap &= ~(@as(u64, 1) << @intCast(slot));
+            freeKernelStack(stack_virt);
             owned_mm.release();
             return null;
         };

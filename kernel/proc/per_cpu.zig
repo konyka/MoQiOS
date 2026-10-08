@@ -75,6 +75,15 @@ pub const PerCpuRunQueue = struct {
     pub fn push(self: *PerCpuRunQueue, t: *task_mod.Task) bool {
         const flags = self.lock.acquire();
         defer self.lock.release(flags);
+        const candidate = queue_policy.Entry{ .task = @intFromPtr(t), .incarnation = t.incarnation };
+        var existing: u32 = 0;
+        while (existing < self.nr_running) : (existing += 1) {
+            const entry = self.tasks[(self.tail +% existing) % QUEUE_SIZE] orelse continue;
+            if (queue_policy.sameEntry(.{
+                .task = @intFromPtr(entry.task),
+                .incarnation = entry.incarnation,
+            }, candidate)) return true;
+        }
         if (self.nr_running >= QUEUE_SIZE) return false;
         const slot = self.head % QUEUE_SIZE;
         self.tasks[slot] = .{ .task = t, .incarnation = t.incarnation };
