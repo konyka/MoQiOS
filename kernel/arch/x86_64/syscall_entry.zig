@@ -2244,7 +2244,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(unsupported_policy.mountSetattr());
         },
         443 => { // quotactl_fd(fd, cmd, id, addr) — disk quota control
-            frame.rax = 0; // accept (no quota enforcement)
+            frame.rax = @bitCast(unsupported_policy.quotactlFd());
         },
         444 => { // landlock_create_ruleset(attr, size, flags) — Linux #444
             frame.rax = @bitCast(unsupported_policy.landlock());
