@@ -2259,9 +2259,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(@as(i64, -38)); // ENOSYS (requires special page isolation)
         },
         448 => { // process_mrelease(pidfd, flags) — release dying process memory — Linux #448
-            _ = frame.rdi; // pidfd
-            _ = frame.rsi; // flags
-            frame.rax = 0; // accept (kernel reaps zombies automatically)
+            frame.rax = @bitCast(unsupported_policy.processMrelease());
         },
         449 => { // futex_waitv(waiters, nr_waiters, flags, timeout, clockid)
             _ = frame.rdx; // flags
