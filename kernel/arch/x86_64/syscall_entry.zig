@@ -2256,7 +2256,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(unsupported_policy.landlock());
         },
         447 => { // memfd_secret(flags) — create secret memfd — Linux #447
-            frame.rax = @bitCast(@as(i64, -38)); // ENOSYS (requires special page isolation)
+            frame.rax = @bitCast(unsupported_policy.memfdSecret());
         },
         448 => { // process_mrelease(pidfd, flags) — release dying process memory — Linux #448
             frame.rax = @bitCast(unsupported_policy.processMrelease());

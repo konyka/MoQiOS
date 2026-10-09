@@ -49,6 +49,7 @@ static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_QUOTACTL_FD 443
 #define SYS_RSEQ_SLICE_YIELD 471
 #define SYS_PROCESS_MRELEASE 448
+#define SYS_MEMFD_SECRET 447
 #define SYS_LANDLOCK_CREATE_RULESET 444
 #define SYS_LANDLOCK_ADD_RULE 445
 #define SYS_LANDLOCK_RESTRICT_SELF 446
@@ -108,6 +109,10 @@ void _start(void) {
                       "rseq_slice_yield #471 returns ENOSYS");
     failures += check(syscall2(SYS_PROCESS_MRELEASE, (uint64_t)-1, 0) == -ENOSYS,
                       "process_mrelease #448 returns ENOSYS");
+    failures += check(syscall1(SYS_MEMFD_SECRET, 0) == -ENOSYS,
+                      "memfd_secret #447 returns ENOSYS");
+    failures += check(syscall1(SYS_MEMFD_SECRET, 0xFFFFFFFFu) == -ENOSYS,
+                      "memfd_secret rejects flags without side effects");
     failures += check(syscall3(SYS_LANDLOCK_CREATE_RULESET, (uint64_t)ruleset_attr, sizeof(ruleset_attr), 0) == -ENOSYS,
                       "landlock_create_ruleset #444 returns ENOSYS");
     failures += check(unchanged(ruleset_attr, 0xC3, sizeof(ruleset_attr)), "landlock ruleset buffer preserved");
