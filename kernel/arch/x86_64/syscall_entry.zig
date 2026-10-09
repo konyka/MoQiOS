@@ -2525,7 +2525,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(@as(i64, -38)); // ENOSYS (namespace listing not supported)
         },
         471 => { // rseq_slice_yield(cpu_id, flags)
-            frame.rax = 0; // accept (rseq yield — no-op)
+            frame.rax = @bitCast(unsupported_policy.rseqSliceYield());
         },
         472 => { // arch_prctl(code, addr)
             frame.rax = @bitCast(syscallArchPrctl(frame.rdi, frame.rsi));

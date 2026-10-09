@@ -47,6 +47,7 @@ static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_UNSHARE 282
 #define SYS_PROCESS_MADVISE 440
 #define SYS_QUOTACTL_FD 443
+#define SYS_RSEQ_SLICE_YIELD 471
 #define SYS_LANDLOCK_CREATE_RULESET 444
 #define SYS_LANDLOCK_ADD_RULE 445
 #define SYS_LANDLOCK_RESTRICT_SELF 446
@@ -102,6 +103,8 @@ void _start(void) {
     failures += check(syscall4(SYS_QUOTACTL_FD, (uint64_t)-1, 0, 0, (uint64_t)acct_buf) == -ENOSYS,
                       "quotactl_fd #443 returns ENOSYS");
     failures += check(unchanged(acct_buf, 0xA1, sizeof(acct_buf)), "quotactl_fd preserves user buffer");
+    failures += check(syscall2(SYS_RSEQ_SLICE_YIELD, 0, 0) == -ENOSYS,
+                      "rseq_slice_yield #471 returns ENOSYS");
     failures += check(syscall3(SYS_LANDLOCK_CREATE_RULESET, (uint64_t)ruleset_attr, sizeof(ruleset_attr), 0) == -ENOSYS,
                       "landlock_create_ruleset #444 returns ENOSYS");
     failures += check(unchanged(ruleset_attr, 0xC3, sizeof(ruleset_attr)), "landlock ruleset buffer preserved");

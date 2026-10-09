@@ -22,6 +22,10 @@ pub fn quotactlFd() i64 {
     return errno.ENOSYS;
 }
 
+pub fn rseqSliceYield() i64 {
+    return errno.ENOSYS;
+}
+
 pub fn landlock() i64 {
     return errno.ENOSYS;
 }
