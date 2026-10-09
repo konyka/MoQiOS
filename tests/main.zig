@@ -1111,6 +1111,16 @@ test "unsupported syscall policy returns ENOSYS without inspecting arguments" {
     try std.testing.expectEqual(kt.errno.ENOSYS, unsupported_policy.lsm());
 }
 
+test "mount_setattr keeps the unsupported ENOSYS contract" {
+    try std.testing.expectEqual(@as(i64, -38), kt.unsupported_policy.mountSetattr());
+    const source = kt.syscall_entry_source;
+    const start = std.mem.indexOf(u8, source, "442 => { // mount_setattr").?;
+    const end = std.mem.indexOfPos(u8, source, start, "443 =>").?;
+    const body = source[start..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "unsupported_policy.mountSetattr()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "frame.rax = 0") == null);
+}
+
 test "unsupported syscall dispatches route to the pure ENOSYS policy" {
     const source = kt.syscall_entry_source;
     try expectSourceRoute(source, "281 => { // acct(filename)", "282 => {", "unsupported_policy.acct()");

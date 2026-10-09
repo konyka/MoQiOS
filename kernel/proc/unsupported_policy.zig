@@ -14,6 +14,10 @@ pub fn processMadvise() i64 {
     return errno.ENOSYS;
 }
 
+pub fn mountSetattr() i64 {
+    return errno.ENOSYS;
+}
+
 pub fn landlock() i64 {
     return errno.ENOSYS;
 }

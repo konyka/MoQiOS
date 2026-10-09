@@ -2241,7 +2241,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         // ── v45.0: Linux standard 424+ corrected numbering ──────────────────
         // (v44.0 #335-#343 were wrong MoQiOS custom numbers; deleted in v45.0)
         442 => { // mount_setattr(dfd, path, flags, attr, size)
-            frame.rax = 0; // accept
+            frame.rax = @bitCast(unsupported_policy.mountSetattr());
         },
         443 => { // quotactl_fd(fd, cmd, id, addr) — disk quota control
             frame.rax = 0; // accept (no quota enforcement)
