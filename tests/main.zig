@@ -495,6 +495,7 @@ test "IPC timeout maintenance is wired into every timer backend" {
     try std.testing.expect(std.mem.indexOfPos(u8, kt.sched_source, timed_wait, "timeoutTick(").? < fg_maint);
     const fg_end = std.mem.indexOfPos(u8, kt.sched_source, fg_maint, "\n}\n") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, kt.sched_source[fg_maint..fg_end], "timeoutTick(") == null);
+    try std.testing.expect(std.mem.indexOfPos(u8, kt.sched_source, fg_end, "timeoutTick(") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.sched_source, "bspSlowMaintenance();") != null);
 }
 

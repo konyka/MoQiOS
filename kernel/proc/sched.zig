@@ -664,6 +664,9 @@ fn bspSlowMaintenance() void {
     // Only the cheap writeback expiry scan runs here (IRQ-off); the flush
     // itself is deferred to the writeback kernel thread.
     _ = @import("../fs/vfs.zig").writebackTimerTick();
+    // Legacy scheduler builds do not run bspTimedWaitTick; keep IPC wait
+    // expiry alive on their slow BSP cadence as well.
+    @import("../ipc/ipc.zig").timeoutTick(idt.getTickCount());
     // TCP retransmission / TIME_WAIT / FIN_WAIT_2 / delayed ACK.
     @import("../net/tcp.zig").timerTick(100);
     // SK-79: NDP incomplete Neighbor Solicitation retransmit (RetransTimer).
