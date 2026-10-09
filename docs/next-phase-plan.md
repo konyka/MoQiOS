@@ -89,8 +89,8 @@
   文件大小。无效 fd 返回 `EBADF`；pipe/device 等不支持目标只接受文档规定的 `EINVAL` 或
   `EOPNOTSUPP`。验收只证明 syscall 语义、错误传播和大小不变性，不作 wall-clock、吞吐、
   分配速度或持久化性能声明。
-- `acct`/`unshare`/`process_madvise`/`mount_setattr`/`quotactl_fd`/`memfd_secret`/`process_mrelease`/`rseq_slice_yield`/Landlock（hello80）验收以当前 native dispatcher 的显式
-  `ENOSYS` unsupported boundary 为准：raw syscall #281/#282/#440/#442/#443/#444/#445/#446/#447/#448/#471 必须在目标查找、
+- `acct`/`unshare`/`process_madvise`/`mount_setattr`/`quotactl_fd`/`memfd_secret`/`process_mrelease`/`listns`/`rseq_slice_yield`/Landlock（hello80）验收以当前 native dispatcher 的显式
+  `ENOSYS` unsupported boundary 为准：raw syscall #281/#282/#440/#442/#443/#444/#445/#446/#447/#448/#470/#471 必须在目标查找、
    namespace/LSM 状态处理或用户缓冲区读写之前返回 `ENOSYS`，并保持所有 sentinel buffer 不变。
    该门禁只锁定“不支持”的 ABI 合约，不代表实现 process accounting、namespace、跨进程 madvise
    或 Landlock；若 dispatcher 仍返回 no-op 成功，验收必须失败，不能由测试放宽为成功。

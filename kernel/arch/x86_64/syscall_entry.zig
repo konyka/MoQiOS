@@ -2520,7 +2520,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = 0; // accept (simplified)
         },
         470 => { // listns(fd, cookie, buf, size)
-            frame.rax = @bitCast(@as(i64, -38)); // ENOSYS (namespace listing not supported)
+            frame.rax = @bitCast(unsupported_policy.listns());
         },
         471 => { // rseq_slice_yield(cpu_id, flags)
             frame.rax = @bitCast(unsupported_policy.rseqSliceYield());
