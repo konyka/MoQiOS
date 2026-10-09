@@ -488,11 +488,13 @@ test "native IPC delegation ABI is wired through the public header and dispatch"
 test "IPC timeout maintenance is wired into every timer backend" {
     try std.testing.expect(std.mem.indexOf(u8, kt.aarch64_trap_source, "ipc.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.riscv64_trap_source, "ipc.zig") != null);
-    // x86: once in the legacy tick, once in the fine-grain slow maintenance.
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.sched_source, "ipc.zig\").timeoutTick("));
+    // x86: the normal timed-wait tick owns expiry; slow maintenance must not duplicate it.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, kt.sched_source, "ipc.zig\").timeoutTick("));
+    const timed_wait = std.mem.indexOf(u8, kt.sched_source, "fn bspTimedWaitTick").?;
     const fg_maint = std.mem.indexOf(u8, kt.sched_source, "fn bspSlowMaintenance") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOfPos(u8, kt.sched_source, timed_wait, "timeoutTick(").? < fg_maint);
     const fg_end = std.mem.indexOfPos(u8, kt.sched_source, fg_maint, "\n}\n") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, kt.sched_source[fg_maint..fg_end], "timeoutTick(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.sched_source[fg_maint..fg_end], "timeoutTick(") == null);
     try std.testing.expect(std.mem.indexOf(u8, kt.sched_source, "bspSlowMaintenance();") != null);
 }
 

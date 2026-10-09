@@ -621,6 +621,7 @@ fn bspTimedWaitTick() void {
     @import("../net/epoll.zig").timerTick(now_ns);
     @import("../ipc/timerfd.zig").timerTick(now_tick);
     @import("../ipc/posix_timer.zig").timerTick(now_tick);
+    @import("../ipc/ipc.zig").timeoutTick(now_tick);
     alarmTimerTick(now_ns);
 }
 
@@ -664,7 +665,6 @@ fn bspSlowMaintenance() void {
     // Only the cheap writeback expiry scan runs here (IRQ-off); the flush
     // itself is deferred to the writeback kernel thread.
     _ = @import("../fs/vfs.zig").writebackTimerTick();
-    @import("../ipc/ipc.zig").timeoutTick(idt.getTickCount());
     // TCP retransmission / TIME_WAIT / FIN_WAIT_2 / delayed ACK.
     @import("../net/tcp.zig").timerTick(100);
     // SK-79: NDP incomplete Neighbor Solicitation retransmit (RetransTimer).

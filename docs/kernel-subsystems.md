@@ -815,6 +815,7 @@ const SchedStats = struct {
 - `sched_setaffinity` 按 TID 获取 `TaskPin`，在 task lock 下更新 affinity 并快照迁移状态；释放 task lock 后再执行迁移入队和 CPU kick，pin 生命周期覆盖整个过程，避免 reaping 或 slot reuse 将迁移目标替换为另一 task。
 - SysV SHM exit detach 在 `Mm.beginVmMutation` 失败时保持明确的未完成状态；当前不在无 `vm_lock` 或已释放的 PML4 上重试，完整 attachment/MM 生命周期设计仍是后续项。
 - flat binary loader 当前最多接受 256 个 code pages；`sched_setaffinity` 修改 ready task 时也会迁移其 runnable entry，避免旧 CPU 队列因 affinity 过滤而丢失该任务。
+- MoqIPC timeout 仍保持 30 秒语义，但 x86 由正常 BSP timed-wait tick 驱动过期扫描，不再依赖约 100ms slow-maintenance 扫描；authority lock、TaskPin 和 incarnation 校验保持不变。
 - clone 的失败路径会撤销尚未发布的 child，并在 fd-table 分配失败时释放非 x86 内核栈；parent-TID copyout 失败发生在 runnable publication 之前。
 - 其余 Linux clone 标志不再静默忽略；完整 ThreadGroup、clear-TID 和共享 FD 语义仍待实现。
 
