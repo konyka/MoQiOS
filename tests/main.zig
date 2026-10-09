@@ -1171,6 +1171,18 @@ test "listns keeps the unsupported ENOSYS contract" {
     try std.testing.expect(std.mem.indexOf(u8, body, "frame.rax = 0") == null);
 }
 
+test "LSM self-attribute syscalls keep the unsupported ENOSYS contract" {
+    try std.testing.expectEqual(@as(i64, -38), kt.unsupported_policy.lsm());
+    const source = kt.syscall_entry_source;
+    for ([_][]const u8{ "459 => { // lsm_get_self_attr", "460 => { // lsm_set_self_attr", "461 => { // lsm_list_modules" }) |needle| {
+        const start = std.mem.indexOf(u8, source, needle).?;
+        const end = std.mem.indexOfPos(u8, source, start, "462 =>").?;
+        const body = source[start..end];
+        try std.testing.expect(std.mem.indexOf(u8, body, "unsupported_policy.lsm()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "frame.rax = 0") == null);
+    }
+}
+
 test "unsupported syscall dispatches route to the pure ENOSYS policy" {
     const source = kt.syscall_entry_source;
     try expectSourceRoute(source, "281 => { // acct(filename)", "282 => {", "unsupported_policy.acct()");
