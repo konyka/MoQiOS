@@ -42,6 +42,10 @@ pub fn setMempolicyHomeNode() i64 {
     return errno.ENOSYS;
 }
 
+pub fn mapShadowStack() i64 {
+    return errno.ENOSYS;
+}
+
 pub fn landlock() i64 {
     return errno.ENOSYS;
 }

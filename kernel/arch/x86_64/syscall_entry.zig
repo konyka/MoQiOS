@@ -2303,7 +2303,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             }
         },
         453 => { // map_shadow_stack(addr, size, flags) — Linux #453
-            frame.rax = @bitCast(@as(i64, -38)); // ENOSYS (requires CET-SS support)
+            frame.rax = @bitCast(unsupported_policy.mapShadowStack());
         },
         454 => { // futex_wake(futex, val, mask) — Linux #454 (new futex2 API)
             // Delegate to old futex() with FUTEX_WAKE (op=1)
