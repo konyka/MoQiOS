@@ -2268,7 +2268,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(futex_mod.futexWaitv(frame.rdi, frame.rsi));
         },
         450 => { // set_mempolicy_home_node(start, len, home_node, flags) — Linux #450
-            frame.rax = 0; // accept (no NUMA support)
+            frame.rax = @bitCast(unsupported_policy.setMempolicyHomeNode());
         },
         451 => { // cachestat(fd, cachestat_range, cachestat, flags)
             frame.rax = @bitCast(syscallCachestat(@truncate(frame.rdi), frame.rsi, frame.rdx, @truncate(frame.r10)));

@@ -51,6 +51,7 @@ static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_PROCESS_MRELEASE 448
 #define SYS_MEMFD_SECRET 447
 #define SYS_LISTNS 470
+#define SYS_SET_MEMPOLICY_HOME_NODE 450
 #define SYS_LSM_GET_SELF_ATTR 459
 #define SYS_LSM_SET_SELF_ATTR 460
 #define SYS_LSM_LIST_MODULES 461
@@ -120,6 +121,8 @@ void _start(void) {
     failures += check(syscall4(SYS_LISTNS, (uint64_t)-1, 0, (uint64_t)ruleset_attr, sizeof(ruleset_attr)) == -ENOSYS,
                       "listns #470 returns ENOSYS");
     failures += check(unchanged(ruleset_attr, 0xC3, sizeof(ruleset_attr)), "listns preserves user buffer");
+    failures += check(syscall4(SYS_SET_MEMPOLICY_HOME_NODE, 0, 0, 0, 0) == -ENOSYS,
+                      "set_mempolicy_home_node #450 returns ENOSYS");
     failures += check(syscall4(SYS_LSM_GET_SELF_ATTR, 0, (uint64_t)ruleset_attr, sizeof(ruleset_attr), 0) == -ENOSYS,
                       "lsm_get_self_attr #459 returns ENOSYS");
     failures += check(unchanged(ruleset_attr, 0xC3, sizeof(ruleset_attr)), "lsm_get_self_attr preserves user buffer");
