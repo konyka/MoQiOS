@@ -1191,6 +1191,19 @@ test "map_shadow_stack keeps the unsupported ENOSYS contract" {
     try std.testing.expect(std.mem.indexOf(u8, body, "frame.rax = 0") == null);
 }
 
+test "statmount and listmount keep the unsupported ENOSYS contract" {
+    try std.testing.expectEqual(@as(i64, -38), kt.unsupported_policy.statmount());
+    try std.testing.expectEqual(@as(i64, -38), kt.unsupported_policy.listmount());
+    const source = kt.syscall_entry_source;
+    for ([_][]const u8{ "457 => { // statmount", "458 => { // listmount" }) |needle| {
+        const start = std.mem.indexOf(u8, source, needle).?;
+        const end = std.mem.indexOfPos(u8, source, start, "459 =>").?;
+        const body = source[start..end];
+        try std.testing.expect(std.mem.indexOf(u8, body, "unsupported_policy.") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "frame.rax = 0") == null);
+    }
+}
+
 test "LSM self-attribute syscalls keep the unsupported ENOSYS contract" {
     try std.testing.expectEqual(@as(i64, -38), kt.unsupported_policy.lsm());
     const source = kt.syscall_entry_source;

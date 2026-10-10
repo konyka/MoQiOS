@@ -2319,10 +2319,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(futex_mod.futex(frame.rdi, 3, frame.rdx, frame.r10, frame.rsi, 0));
         },
         457 => { // statmount(mnt_id, buf, bufsize, flags) — query mount info — Linux #457
-            frame.rax = @bitCast(@as(i64, -38)); // ENOSYS (mount info not tracked)
+            frame.rax = @bitCast(unsupported_policy.statmount());
         },
         458 => { // listmount(mnt_id, last_mnt_id, buf, bufsize, flags) — Linux #458
-            frame.rax = @bitCast(@as(i64, -38)); // ENOSYS
+            frame.rax = @bitCast(unsupported_policy.listmount());
         },
         459 => { // lsm_get_self_attr(attr, ptr, size, flags) — Linux #459
             frame.rax = @bitCast(unsupported_policy.lsm());

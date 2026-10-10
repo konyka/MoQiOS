@@ -53,6 +53,8 @@ static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_LISTNS 470
 #define SYS_SET_MEMPOLICY_HOME_NODE 450
 #define SYS_MAP_SHADOW_STACK 453
+#define SYS_STATMOUNT 457
+#define SYS_LISTMOUNT 458
 #define SYS_LSM_GET_SELF_ATTR 459
 #define SYS_LSM_SET_SELF_ATTR 460
 #define SYS_LSM_LIST_MODULES 461
@@ -126,6 +128,12 @@ void _start(void) {
                       "set_mempolicy_home_node #450 returns ENOSYS");
     failures += check(syscall3(SYS_MAP_SHADOW_STACK, 0, 4096, 0) == -ENOSYS,
                       "map_shadow_stack #453 returns ENOSYS");
+    failures += check(syscall4(SYS_STATMOUNT, 0, (uint64_t)ruleset_attr, sizeof(ruleset_attr), 0) == -ENOSYS,
+                      "statmount #457 returns ENOSYS");
+    failures += check(unchanged(ruleset_attr, 0xC3, sizeof(ruleset_attr)), "statmount preserves user buffer");
+    failures += check(syscall5(SYS_LISTMOUNT, 0, 0, (uint64_t)ruleset_attr, sizeof(ruleset_attr), 0) == -ENOSYS,
+                      "listmount #458 returns ENOSYS");
+    failures += check(unchanged(ruleset_attr, 0xC3, sizeof(ruleset_attr)), "listmount preserves user buffer");
     failures += check(syscall4(SYS_LSM_GET_SELF_ATTR, 0, (uint64_t)ruleset_attr, sizeof(ruleset_attr), 0) == -ENOSYS,
                       "lsm_get_self_attr #459 returns ENOSYS");
     failures += check(unchanged(ruleset_attr, 0xC3, sizeof(ruleset_attr)), "lsm_get_self_attr preserves user buffer");

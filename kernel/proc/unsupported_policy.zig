@@ -46,6 +46,14 @@ pub fn mapShadowStack() i64 {
     return errno.ENOSYS;
 }
 
+pub fn statmount() i64 {
+    return errno.ENOSYS;
+}
+
+pub fn listmount() i64 {
+    return errno.ENOSYS;
+}
+
 pub fn landlock() i64 {
     return errno.ENOSYS;
 }
