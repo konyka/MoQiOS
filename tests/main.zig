@@ -1204,6 +1204,16 @@ test "statmount and listmount keep the unsupported ENOSYS contract" {
     }
 }
 
+test "chroot keeps the unsupported ENOSYS contract" {
+    try std.testing.expectEqual(@as(i64, -38), kt.unsupported_policy.chroot());
+    const source = kt.syscall_entry_source;
+    const start = std.mem.indexOf(u8, source, "280 => { // chroot").?;
+    const end = std.mem.indexOfPos(u8, source, start, "281 =>").?;
+    const body = source[start..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "unsupported_policy.chroot()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "syscallChroot") == null);
+}
+
 test "LSM self-attribute syscalls keep the unsupported ENOSYS contract" {
     try std.testing.expectEqual(@as(i64, -38), kt.unsupported_policy.lsm());
     const source = kt.syscall_entry_source;

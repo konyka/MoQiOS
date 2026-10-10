@@ -1470,7 +1470,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             }
         },
         280 => { // chroot(path) — set root path
-            frame.rax = @bitCast(syscallChroot(frame.rdi));
+            frame.rax = @bitCast(unsupported_policy.chroot());
         },
         281 => { // acct(filename) — no-op (process accounting not supported)
             frame.rax = @bitCast(unsupported_policy.acct());

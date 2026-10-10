@@ -50,6 +50,10 @@ pub fn statmount() i64 {
     return errno.ENOSYS;
 }
 
+pub fn chroot() i64 {
+    return errno.ENOSYS;
+}
+
 pub fn listmount() i64 {
     return errno.ENOSYS;
 }

@@ -44,6 +44,7 @@ static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_WRITE 1
 #define SYS_EXIT 2
 #define SYS_ACCT 281
+#define SYS_CHROOT 280
 #define SYS_UNSHARE 282
 #define SYS_PROCESS_MADVISE 440
 #define SYS_QUOTACTL_FD 443
@@ -105,6 +106,8 @@ void _start(void) {
 
     print("hello80: start\n");
     failures += check(syscall1(SYS_ACCT, (uint64_t)acct_buf) == -ENOSYS, "acct #281 returns ENOSYS");
+    failures += check(syscall1(SYS_CHROOT, (uint64_t)acct_buf) == -ENOSYS, "chroot #280 returns ENOSYS");
+    failures += check(unchanged(acct_buf, 0xA1, sizeof(acct_buf)), "chroot preserves user buffer");
     failures += check(unchanged(acct_buf, 0xA1, sizeof(acct_buf)), "acct preserves user buffer");
     failures += check(syscall1(SYS_UNSHARE, 0x10000000) == -ENOSYS, "unshare #282 returns ENOSYS");
     failures += check(syscall5(SYS_PROCESS_MADVISE, (uint64_t)-1, (uint64_t)iov_buf, 1, 0, 0) == -ENOSYS,
