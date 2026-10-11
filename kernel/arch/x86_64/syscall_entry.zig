@@ -1267,10 +1267,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallFsync(@truncate(frame.rdi)));
         },
         246 => { // sync()
-            // POSIX sync() has no failure return; the result is still consumed
-            // so a flush failure is not silently discarded at the call site.
-            _ = vfs_mod.syncAll();
-            frame.rax = 0;
+            // Preserve the aggregate writeback failure so callers do not get
+            // a false durability success when a filesystem flush fails.
+            frame.rax = if (vfs_mod.syncAll()) 0 else @bitCast(@as(i64, -5)); // EIO
         },
         // ── v33.2: clock_nanosleep / epoll_pwait / getcpu ────────────
         247 => { // clock_nanosleep(clockid, flags, req, rem)

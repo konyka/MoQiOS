@@ -69,6 +69,15 @@ test {
     _ = @import("rt_round2_test.zig");
 }
 
+test "sync syscall propagates aggregate writeback failure as EIO" {
+    const source = kt.syscall_entry_source;
+    const start = std.mem.indexOf(u8, source, "246 => { // sync()").?;
+    const end = std.mem.indexOfPos(u8, source, start, "247 =>").?;
+    const body = source[start..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (vfs_mod.syncAll()) 0 else -5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "frame.rax = 0") == null);
+}
+
 test "mmap rejects unsupported flags and protection bits" {
     try std.testing.expect(
         mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | mmap_policy.MAP_ANONYMOUS),
