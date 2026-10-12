@@ -121,8 +121,16 @@ test "pipe write propagates status flags for full-pipe EAGAIN" {
 test "splice propagates nonblocking flags to transfer helpers" {
     const source = @embedFile("../kernel/fs/splice.zig");
     try std.testing.expect(std.mem.indexOf(u8, source, "splicePipeToPipe(fd_table, fd_in, fd_out, len, flags)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "flags & SPLICE_F_NONBLOCK != 0 and total == 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "splicePipeToFile(fd_table, fd_in, fd_out, off_out, len, flags)") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "moved == 0 and flags & SPLICE_F_NONBLOCK != 0") != null);
+}
+
+test "splice pipe-to-file nonblocking result distinguishes live pipe from EOF" {
+    try std.testing.expectEqual(kt.errno.EAGAIN, splice.splicePipeToFileReadResult(splice.SPLICE_F_NONBLOCK, 0, 0, true));
+    try std.testing.expectEqual(@as(i64, 0), splice.splicePipeToFileReadResult(splice.SPLICE_F_NONBLOCK, 0, 0, false));
+    try std.testing.expectEqual(@as(i64, 37), splice.splicePipeToFileReadResult(splice.SPLICE_F_NONBLOCK, 37, 0, true));
+    try std.testing.expectEqual(@as(i64, -5), splice.splicePipeToFileReadResult(splice.SPLICE_F_NONBLOCK, 0, -5, true));
+    try std.testing.expectEqual(@as(i64, 0), splice.splicePipeToFileReadResult(0, 0, 0, true));
 }
 
 test "sleep timer wiring preserves legacy scheduler wakeups and zero deadlines" {

@@ -20,6 +20,7 @@ const EBADF = errno.EBADF;
 const EINVAL = errno.EINVAL;
 const EFAULT = errno.EFAULT;
 const ENOTCONN = errno.ENOTCONN;
+const EAGAIN = errno.EAGAIN;
 
 /// Maximum bytes transferred per single iteration (one page).
 const CHUNK_SIZE: u64 = 8192; // 8KB chunks for better throughput
@@ -66,6 +67,15 @@ pub fn transferCapacity(remaining: u64, destination_capacity: u64, chunk_size: u
 pub fn acceptedProgress(requested: u64, written: i64) u64 {
     if (written <= 0) return 0;
     return @min(requested, @as(u64, @intCast(written)));
+}
+
+/// Resolve a pipe read that made no progress for pipe -> file splice.
+/// Empty live pipes return EAGAIN only for SPLICE_F_NONBLOCK; closed pipes are EOF.
+pub fn splicePipeToFileReadResult(flags: u32, total: i64, nread: i64, write_open: bool) i64 {
+    if (total > 0) return total;
+    if (nread < 0) return nread;
+    if (flags & SPLICE_F_NONBLOCK != 0 and write_open) return EAGAIN;
+    return 0;
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────
@@ -525,7 +535,6 @@ fn spliceFileToPipe(fd_table: *vfs.FdTable, file_fd: u32, off_in: u64, pipe_fd: 
 
 /// pipe → file: read from pipe, write to file.
 fn splicePipeToFile(fd_table: *vfs.FdTable, pipe_fd: u32, file_fd: u32, off_out: u64, len: u64, flags: u32) i64 {
-    _ = flags;
     var file_offset = fd_table.fds[file_fd].offset;
     var explicit_offset = false;
     if (off_out != 0) {
@@ -545,7 +554,8 @@ fn splicePipeToFile(fd_table: *vfs.FdTable, pipe_fd: u32, file_fd: u32, off_out:
         var reservation: vfs.PipeReadToken = .{};
         const nread = vfs.pipeReserveRead(fd_table.fds[pipe_fd].pipe_idx, &kbuf, chunk, &reservation);
         if (nread <= 0) {
-            if (nread < 0 and total == 0) failure = nread;
+            const pipe_state = vfs.pipeState(fd_table.fds[pipe_fd].pipe_idx);
+            failure = splicePipeToFileReadResult(flags, total, nread, if (pipe_state) |state| state.write_open else false);
             break;
         }
         {

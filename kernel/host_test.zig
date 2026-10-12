@@ -30,6 +30,15 @@ pub const getdents_policy = @import("fs/getdents_policy.zig");
 pub const readlink_policy = @import("fs/readlink_policy.zig");
 pub const chdir_policy = @import("fs/chdir_policy.zig");
 pub const splice = @import("fs/splice.zig");
+
+test "splice pipe-to-file nonblocking result distinguishes live pipe from EOF" {
+    const std = @import("std");
+    try std.testing.expectEqual(errno.EAGAIN, splice.splicePipeToFileReadResult(splice.SPLICE_F_NONBLOCK, 0, 0, true));
+    try std.testing.expectEqual(@as(i64, 0), splice.splicePipeToFileReadResult(splice.SPLICE_F_NONBLOCK, 0, 0, false));
+    try std.testing.expectEqual(@as(i64, 37), splice.splicePipeToFileReadResult(splice.SPLICE_F_NONBLOCK, 37, 0, true));
+    try std.testing.expectEqual(@as(i64, -5), splice.splicePipeToFileReadResult(splice.SPLICE_F_NONBLOCK, 0, -5, true));
+    try std.testing.expectEqual(@as(i64, 0), splice.splicePipeToFileReadResult(0, 0, 0, true));
+}
 pub const futex_key = @import("sync/futex_key.zig");
 pub const mlock_policy = @import("mm/mlock_policy.zig");
 pub const mprotect_policy = @import("mm/mprotect_policy.zig");
