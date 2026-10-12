@@ -101,6 +101,17 @@ test "pipe2 validates and propagates nonblocking flags" {
     try std.testing.expect(std.mem.indexOf(u8, body, "fds[write_fd].status_flags |= O_NONBLOCK") != null);
 }
 
+test "FIONBIO updates status flags without changing descriptor flags" {
+    const source = @embedFile("../kernel/fs/ioctl.zig");
+    const start = std.mem.indexOf(u8, source, "FIONBIO =>").?;
+    const end = std.mem.indexOfPos(u8, source, start, "else => return -25").?;
+    const body = source[start..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "status_flags |= 0x800") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "status_flags &= ~@as(u32, 0x800)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "fd_flags |= 0x800") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "fd_flags &= ~@as(u32, 0x800)") == null);
+}
+
 test "sleep timer wiring preserves legacy scheduler wakeups and zero deadlines" {
     const source = kt.sched_source;
     const legacy = std.mem.indexOf(u8, source, "fn timerTickLegacy").?;

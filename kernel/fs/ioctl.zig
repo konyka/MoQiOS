@@ -161,9 +161,9 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
             if (copied < 4) return -14;
 
             if (nonblock != 0) {
-                cur.fd_table.fds[fd_idx].fd_flags |= 0x800; // O_NONBLOCK
+                cur.fd_table.fds[fd_idx].status_flags |= 0x800; // O_NONBLOCK
             } else {
-                cur.fd_table.fds[fd_idx].fd_flags &= ~@as(u32, 0x800);
+                cur.fd_table.fds[fd_idx].status_flags &= ~@as(u32, 0x800);
             }
             return 0;
         },
