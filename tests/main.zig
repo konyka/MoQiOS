@@ -91,6 +91,16 @@ test "vmsplice validates flags and loops over large iovecs" {
     try std.testing.expect(std.mem.indexOf(u8, body, "if (written < copied)") != null);
 }
 
+test "pipe2 validates and propagates nonblocking flags" {
+    const source = kt.syscall_entry_source;
+    const start = std.mem.indexOf(u8, source, "fn syscallPipe2").?;
+    const end = std.mem.indexOfPos(u8, source, start, "fn syscallMincore").?;
+    const body = source[start..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "flags & ~(O_CLOEXEC | O_NONBLOCK) != 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "fds[read_fd].status_flags |= O_NONBLOCK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "fds[write_fd].status_flags |= O_NONBLOCK") != null);
+}
+
 test "sleep timer wiring preserves legacy scheduler wakeups and zero deadlines" {
     const source = kt.sched_source;
     const legacy = std.mem.indexOf(u8, source, "fn timerTickLegacy").?;

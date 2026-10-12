@@ -4021,6 +4021,9 @@ fn syscallGetcpu(cpu_ptr: u64, node_ptr: u64) i64 {
 /// pipe2(pipefd_ptr, flags) — create pipe with O_CLOEXEC/O_NONBLOCK.
 fn syscallPipe2(pipefd_ptr: u64, flags: u32) i64 {
     if (pipefd_ptr == 0 or pipefd_ptr >= 0x0000_8000_0000_0000) return -14;
+    const O_CLOEXEC: u32 = 0x80000;
+    const O_NONBLOCK: u32 = 0x800;
+    if (flags & ~(O_CLOEXEC | O_NONBLOCK) != 0) return -22;
     const copy = @import("../../mm/copy_from_user.zig");
     if (!copy.validateUserBufferWritable(pipefd_ptr, 8)) return -14;
     const sched = @import("../../proc/sched.zig");
@@ -4032,10 +4035,13 @@ fn syscallPipe2(pipefd_ptr: u64, flags: u32) i64 {
     const read_fd: u32 = @intCast(@as(u64, @intCast(result & 0xFFFF)));
     const write_fd: u32 = @intCast(@as(u64, @intCast(result >> 16)) & 0xFFFF);
 
-    const O_CLOEXEC: u32 = 0x80000;
     if (flags & O_CLOEXEC != 0) {
         if (read_fd < vfs_mod.MAX_FDS) cur.fd_table.fds[read_fd].fd_flags = 1;
         if (write_fd < vfs_mod.MAX_FDS) cur.fd_table.fds[write_fd].fd_flags = 1;
+    }
+    if (flags & O_NONBLOCK != 0) {
+        if (read_fd < vfs_mod.MAX_FDS) cur.fd_table.fds[read_fd].status_flags |= O_NONBLOCK;
+        if (write_fd < vfs_mod.MAX_FDS) cur.fd_table.fds[write_fd].status_flags |= O_NONBLOCK;
     }
 
     const bo = @import("../../lib/byte_order.zig");
