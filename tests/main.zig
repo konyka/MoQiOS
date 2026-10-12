@@ -74,7 +74,9 @@ test "sync syscall propagates aggregate writeback failure as EIO" {
     const start = std.mem.indexOf(u8, source, "246 => { // sync()").?;
     const end = std.mem.indexOfPos(u8, source, start, "247 =>").?;
     const body = source[start..end];
-    try std.testing.expect(std.mem.indexOf(u8, body, "if (vfs_mod.syncAll()) 0 else -5") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, body, "if (vfs_mod.syncAll()) 0 else @bitCast(@as(i64, -5))") != null,
+    );
     try std.testing.expect(std.mem.indexOf(u8, body, "frame.rax = 0") == null);
 }
 
