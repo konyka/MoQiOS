@@ -356,7 +356,7 @@ pub fn pipeTransfer(src_idx: u32, dst_idx: u32, count: usize) i64 {
     return @intCast(n);
 }
 
-pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize) i64 {
+pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u32) i64 {
     if (pipe_idx >= 16) return -1;
     const flags = pipe_lock.acquire();
     const pipe = &pipes[pipe_idx];
@@ -389,7 +389,7 @@ pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize) i64 {
         const epoll_w = @import("../net/epoll.zig");
         epoll_w.epollNotify(.pipe_read, pipe_idx, epoll_w.EPOLLIN);
     }
-    return if (n == 0) -1 else @intCast(n);
+    return if (n == 0 and status_flags & 0x800 != 0) -11 else if (n == 0) -1 else @intCast(n);
 }
 
 /// Drop one reference to one end of a pipe; frees the slot when both ends
@@ -1225,7 +1225,7 @@ pub const FdTable = struct {
             },
             .pipe_write => {
                 if (!desc.writable) return -1;
-                return pipeWrite(desc.pipe_idx, buf, count);
+                return pipeWrite(desc.pipe_idx, buf, count, desc.status_flags);
             },
             .pipe_read => return -1,
             .fat32_file => {

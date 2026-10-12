@@ -112,6 +112,12 @@ test "FIONBIO updates status flags without changing descriptor flags" {
     try std.testing.expect(std.mem.indexOf(u8, body, "fd_flags &= ~@as(u32, 0x800)") == null);
 }
 
+test "pipe write propagates status flags for full-pipe EAGAIN" {
+    const source = @embedFile("../kernel/fs/vfs.zig");
+    try std.testing.expect(std.mem.indexOf(u8, source, "pipeWrite(desc.pipe_idx, buf, count, desc.status_flags)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "status_flags & 0x800 != 0) -11") != null);
+}
+
 test "sleep timer wiring preserves legacy scheduler wakeups and zero deadlines" {
     const source = kt.sched_source;
     const legacy = std.mem.indexOf(u8, source, "fn timerTickLegacy").?;

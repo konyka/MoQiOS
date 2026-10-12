@@ -186,7 +186,7 @@ fn tcpDestinationError(fd_table: *vfs.FdTable, fd: u32) i64 {
 fn writePipeWrite(fd_table: *vfs.FdTable, fd: u32, buf: [*]const u8, count: usize) i64 {
     const desc = &fd_table.fds[fd];
     if (desc.fd_type != .pipe_write) return EBADF;
-    return vfs.pipeWrite(desc.pipe_idx, buf, count);
+    return vfs.pipeWrite(desc.pipe_idx, buf, count, desc.status_flags);
 }
 
 /// Read up to `count` bytes from a pipe read-end fd into a kernel buffer.
