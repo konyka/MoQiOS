@@ -381,33 +381,33 @@ pub fn sysSplice(fd_in: u32, off_in: u64, fd_out: u32, off_out: u64, len: u64, f
     // ── Case 1: pipe_read → tcp_socket ──────────────────────────────────
     if (in_type == .pipe_read and out_type == .tcp_socket) {
         if (len == 0) return 0;
-        return splicePipeToSocket(fd_table, fd_in, fd_out, len);
+        return splicePipeToSocket(fd_table, fd_in, fd_out, len, flags);
     }
 
     // ── Case 2: file → pipe_write ────────────────────────────────────────
     if (isFileFd(in_type) and out_type == .pipe_write) {
         if (len == 0) return 0;
-        return spliceFileToPipe(fd_table, fd_in, off_in, fd_out, len);
+        return spliceFileToPipe(fd_table, fd_in, off_in, fd_out, len, flags);
     }
 
     // ── Case 3: pipe_read → file ─────────────────────────────────────────
     if (in_type == .pipe_read and isFileFd(out_type)) {
         if (!fd_table.fds[fd_out].writable) return EBADF;
         if (len == 0) return 0;
-        return splicePipeToFile(fd_table, fd_in, fd_out, off_out, len);
+        return splicePipeToFile(fd_table, fd_in, fd_out, off_out, len, flags);
     }
 
     // ── Case 4: pipe_read → pipe_write ───────────────────────────────────
     if (in_type == .pipe_read and out_type == .pipe_write) {
         if (len == 0) return 0;
-        return splicePipeToPipe(fd_table, fd_in, fd_out, len);
+        return splicePipeToPipe(fd_table, fd_in, fd_out, len, flags);
     }
 
     return EINVAL;
 }
 
 /// pipe → socket: read from pipe, send to TCP.
-fn splicePipeToSocket(fd_table: *vfs.FdTable, pipe_fd: u32, sock_fd: u32, len: u64) i64 {
+fn splicePipeToSocket(fd_table: *vfs.FdTable, pipe_fd: u32, sock_fd: u32, len: u64, flags: u32) i64 {
     const state_error = tcpDestinationError(fd_table, sock_fd);
     if (state_error < 0) return state_error;
     var remaining: u64 = len;
@@ -427,7 +427,7 @@ fn splicePipeToSocket(fd_table: *vfs.FdTable, pipe_fd: u32, sock_fd: u32, len: u
         const nread = vfs.pipeReserveRead(fd_table.fds[pipe_fd].pipe_idx, &kbuf, chunk, &reservation);
         if (nread <= 0) {
             if (total > 0) return total;
-            return if (nread < 0) nread else total;
+            return if (nread < 0) nread else if (flags & SPLICE_F_NONBLOCK != 0) -11 else total;
         }
         {
             defer vfs.pipeReleaseRead(reservation);
@@ -452,7 +452,7 @@ fn splicePipeToSocket(fd_table: *vfs.FdTable, pipe_fd: u32, sock_fd: u32, len: u
 }
 
 /// file → pipe: read from file at the given (or current) offset, write to pipe.
-fn spliceFileToPipe(fd_table: *vfs.FdTable, file_fd: u32, off_in: u64, pipe_fd: u32, len: u64) i64 {
+fn spliceFileToPipe(fd_table: *vfs.FdTable, file_fd: u32, off_in: u64, pipe_fd: u32, len: u64, flags: u32) i64 {
     var offset: u64 = undefined;
     var update_user_offset = false;
 
@@ -486,6 +486,7 @@ fn spliceFileToPipe(fd_table: *vfs.FdTable, file_fd: u32, off_in: u64, pipe_fd: 
                 const probe = writePipeWrite(fd_table, pipe_fd, &kbuf, 1);
                 if (total == 0 and probe < 0) failure = probe;
             }
+            if (flags & SPLICE_F_NONBLOCK != 0 and total == 0) failure = -11;
             break;
         }
         const chunk: usize = @intCast(@min(remaining, @min(CHUNK_SIZE, capacity)));
@@ -523,7 +524,8 @@ fn spliceFileToPipe(fd_table: *vfs.FdTable, file_fd: u32, off_in: u64, pipe_fd: 
 }
 
 /// pipe → file: read from pipe, write to file.
-fn splicePipeToFile(fd_table: *vfs.FdTable, pipe_fd: u32, file_fd: u32, off_out: u64, len: u64) i64 {
+fn splicePipeToFile(fd_table: *vfs.FdTable, pipe_fd: u32, file_fd: u32, off_out: u64, len: u64, flags: u32) i64 {
+    _ = flags;
     var file_offset = fd_table.fds[file_fd].offset;
     var explicit_offset = false;
     if (off_out != 0) {
@@ -579,7 +581,7 @@ fn splicePipeToFile(fd_table: *vfs.FdTable, pipe_fd: u32, file_fd: u32, off_out:
 }
 
 /// pipe → pipe: read from one pipe, write to another.
-fn splicePipeToPipe(fd_table: *vfs.FdTable, in_fd: u32, out_fd: u32, len: u64) i64 {
+fn splicePipeToPipe(fd_table: *vfs.FdTable, in_fd: u32, out_fd: u32, len: u64, flags: u32) i64 {
     var remaining: u64 = len;
     var total: i64 = 0;
 
@@ -587,7 +589,7 @@ fn splicePipeToPipe(fd_table: *vfs.FdTable, in_fd: u32, out_fd: u32, len: u64) i
         const moved = vfs.pipeTransfer(fd_table.fds[in_fd].pipe_idx, fd_table.fds[out_fd].pipe_idx, @intCast(@min(remaining, CHUNK_SIZE)));
         if (moved <= 0) {
             if (total > 0) return total;
-            return moved;
+            return if (moved == 0 and flags & SPLICE_F_NONBLOCK != 0) -11 else moved;
         }
         total += moved;
         const done: u64 = @intCast(moved);

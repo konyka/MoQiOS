@@ -118,6 +118,13 @@ test "pipe write propagates status flags for full-pipe EAGAIN" {
     try std.testing.expect(std.mem.indexOf(u8, source, "status_flags & 0x800 != 0) -11") != null);
 }
 
+test "splice propagates nonblocking flags to transfer helpers" {
+    const source = @embedFile("../kernel/fs/splice.zig");
+    try std.testing.expect(std.mem.indexOf(u8, source, "splicePipeToPipe(fd_table, fd_in, fd_out, len, flags)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "flags & SPLICE_F_NONBLOCK != 0 and total == 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "moved == 0 and flags & SPLICE_F_NONBLOCK != 0") != null);
+}
+
 test "sleep timer wiring preserves legacy scheduler wakeups and zero deadlines" {
     const source = kt.sched_source;
     const legacy = std.mem.indexOf(u8, source, "fn timerTickLegacy").?;
