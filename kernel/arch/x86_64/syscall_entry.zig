@@ -4742,7 +4742,9 @@ fn syscallIoprioGet(which: u32, who: u32) i64 {
 
 /// vmsplice(fd, iov, nr_segs, flags) — splice user-space pages into a pipe.
 fn syscallVmsplice(fd: u32, iov_ptr: u64, nr_segs: u32, flags: u32) i64 {
-    _ = flags;
+    const splice_policy = @import("../../fs/splice.zig");
+    const flag_error = splice_policy.validateSpliceFlags(flags);
+    if (flag_error != 0) return flag_error;
     if (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000) return -14;
     if (nr_segs == 0 or nr_segs > 1024) return -22;
 
@@ -4765,15 +4767,20 @@ fn syscallVmsplice(fd: u32, iov_ptr: u64, nr_segs: u32, flags: u32) i64 {
         const base: u64 = bo.readU64At(&iov_buf, 0);
         const len: u64 = bo.readU64At(&iov_buf, 8);
 
-        if (base > 0 and base < 0x0000_8000_0000_0000 and len > 0) {
-            // Copy user data to kernel buffer, then write to fd
+        if (base == 0 or base >= 0x0000_8000_0000_0000) return if (total > 0) total else -14;
+        if (len == 0) continue;
+        if (len > 0x0000_8000_0000_0000 - base) return if (total > 0) total else -14;
+        var done: u64 = 0;
+        while (done < len) {
             var src_buf: [4096]u8 = undefined;
-            const chunk: usize = @intCast(@min(len, 4096));
-            const copied = copy.copyFromUser(src_buf[0..chunk], @ptrFromInt(base), chunk);
-            if (copied > 0) {
-                const written = t.fd_table.write(fd, &src_buf, copied);
-                if (written > 0) total += written;
-            }
+            const chunk: usize = @intCast(@min(len - done, src_buf.len));
+            const copied = copy.copyFromUser(src_buf[0..chunk], @ptrFromInt(base + done), chunk);
+            if (copied < chunk) return if (total > 0) total else -14;
+            const written = t.fd_table.write(fd, &src_buf, copied);
+            if (written <= 0) return if (total > 0) total else written;
+            total += written;
+            done += @intCast(written);
+            if (written < copied) return total;
         }
     }
     return total;

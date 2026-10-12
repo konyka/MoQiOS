@@ -80,6 +80,17 @@ test "sync syscall propagates aggregate writeback failure as EIO" {
     try std.testing.expect(std.mem.indexOf(u8, body, "frame.rax = 0") == null);
 }
 
+test "vmsplice validates flags and loops over large iovecs" {
+    const source = kt.syscall_entry_source;
+    const start = std.mem.indexOf(u8, source, "fn syscallVmsplice").?;
+    const end = std.mem.indexOfPos(u8, source, start, "fn syscallNameToHandleAt").?;
+    const body = source[start..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "validateSpliceFlags(flags)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "while (done < len)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (written <= 0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (written < copied)") != null);
+}
+
 test "sleep timer wiring preserves legacy scheduler wakeups and zero deadlines" {
     const source = kt.sched_source;
     const legacy = std.mem.indexOf(u8, source, "fn timerTickLegacy").?;
