@@ -166,10 +166,9 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
             const file_copy_end = @min(page_end_in_seg, seg_filesz);
 
             if (file_copy_end > file_copy_start) {
-                const copy_len = file_copy_end - file_copy_start;
-                const src_offset_in_file = seg_offset + file_copy_start;
-                // Where in the page to write (offset for page alignment)
                 const page_offset = if (page_vaddr < seg_vaddr) seg_vaddr - page_vaddr else 0;
+                const copy_len = @min(file_copy_end - file_copy_start, paging.PAGE_SIZE - page_offset);
+                const src_offset_in_file = seg_offset + file_copy_start;
                 if (src_offset_in_file + copy_len <= file.size) {
                     @memcpy(
                         dst[page_offset .. page_offset + copy_len],

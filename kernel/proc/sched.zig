@@ -156,7 +156,7 @@ pub fn sleepTimerTick(now_ns: u64) void {
         // 造成永久失醒（任务 .blocked 而 sleep_bm 为 0）。deadline==0 的
         // 瞬态位无害：unblockTask 对非 .blocked 任务是 no-op，位由任务
         // 自己在退出睡眠循环时清除。
-        if (now_ns >= deadline) task.unblockTask(@intCast(i));
+        if (deadline != 0 and now_ns >= deadline) task.unblockTask(@intCast(i));
     }
 }
 
@@ -307,6 +307,10 @@ pub fn timerTick(frame: *idt.InterruptFrame) void {
 /// Lock order: sched_lock → task_lock → queue lock (no ABBA).
 fn timerTickLegacy(frame: *idt.InterruptFrame) void {
     var flags = sched_lock.acquire();
+
+    // Legacy scheduling still needs to drive nanosleep deadlines; the
+    // fine-grained path is the only other caller of sleepTimerTick.
+    sleepTimerTick(@import("../arch/arch.zig").tsc.nanos());
 
     // Global periodic maintenance — BSP only (one tick source for the whole system).
     if (currentCpuId() == 0) {

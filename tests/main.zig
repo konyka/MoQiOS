@@ -80,6 +80,18 @@ test "sync syscall propagates aggregate writeback failure as EIO" {
     try std.testing.expect(std.mem.indexOf(u8, body, "frame.rax = 0") == null);
 }
 
+test "sleep timer wiring preserves legacy scheduler wakeups and zero deadlines" {
+    const source = kt.sched_source;
+    const legacy = std.mem.indexOf(u8, source, "fn timerTickLegacy").?;
+    const legacy_end = std.mem.indexOfPos(u8, source, legacy, "fn timerTickFg").?;
+    const legacy_body = source[legacy..legacy_end];
+    try std.testing.expect(std.mem.indexOf(u8, legacy_body, "sleepTimerTick(") != null);
+    const sleep_start = std.mem.indexOf(u8, source, "pub fn sleepTimerTick").?;
+    const sleep_end = std.mem.indexOfPos(u8, source, sleep_start, "// M8-2").?;
+    const sleep_body = source[sleep_start..sleep_end];
+    try std.testing.expect(std.mem.indexOf(u8, sleep_body, "deadline != 0 and now_ns >= deadline") != null);
+}
+
 test "mmap rejects unsupported flags and protection bits" {
     try std.testing.expect(
         mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | mmap_policy.MAP_ANONYMOUS),
@@ -308,6 +320,13 @@ test "ELF loaders validate segment arithmetic and file payload bounds" {
     try std.testing.expect(std.mem.indexOf(u8, source, "phdr.p_filesz > phdr.p_memsz") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "phdr.p_filesz > file_size - phdr.p_offset") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "phdr.p_memsz > USER_ADDR_LIMIT - phdr.p_vaddr") != null);
+}
+
+test "ELF loader bounds unaligned first-page copies" {
+    const source = kt.loader_source;
+    const copy_len = std.mem.indexOf(u8, source, "const copy_len = @min(file_copy_end - file_copy_start, paging.PAGE_SIZE - page_offset)").?;
+    const copy = std.mem.indexOfPos(u8, source, copy_len, "dst[page_offset .. page_offset + copy_len]").?;
+    try std.testing.expect(copy > copy_len);
 }
 
 test "boot treats reaper startup failure as fatal" {
