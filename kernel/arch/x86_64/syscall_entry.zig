@@ -3321,6 +3321,7 @@ fn syscallLseek(fd: u32, offset: u64, whence: u32) i64 {
     if (fd >= vfs_mod.MAX_FDS) return -9; // EBADF
     const desc = &cur.fd_table.fds[fd];
     if (desc.fd_type == .none) return -9;
+    if (desc.fd_type != .ext2_file and desc.fd_type != .fat32_file) return -22; // EINVAL
 
     const off: i64 = @bitCast(offset);
     var new_off: i64 = 0;

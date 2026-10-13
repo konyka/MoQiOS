@@ -80,6 +80,15 @@ test "sync syscall propagates aggregate writeback failure as EIO" {
     try std.testing.expect(std.mem.indexOf(u8, body, "frame.rax = 0") == null);
 }
 
+test "fsync rejects non-file descriptors" {
+    const source = kt.syscall_entry_source;
+    const start = std.mem.indexOf(u8, source, "fn syscallFsync").?;
+    const end = std.mem.indexOfPos(u8, source, start, "fn syscallFtruncate").?;
+    const body = source[start..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "desc.fd_type != .ext2_file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "return -22; // EINVAL") != null);
+}
+
 test "vmsplice validates flags and loops over large iovecs" {
     const source = kt.syscall_entry_source;
     const start = std.mem.indexOf(u8, source, "fn syscallVmsplice").?;
