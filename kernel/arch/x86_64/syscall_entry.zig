@@ -3321,8 +3321,6 @@ fn syscallLseek(fd: u32, offset: u64, whence: u32) i64 {
     if (fd >= vfs_mod.MAX_FDS) return -9; // EBADF
     const desc = &cur.fd_table.fds[fd];
     if (desc.fd_type == .none) return -9;
-    if (desc.fd_type != .ext2_file and desc.fd_type != .fat32_file) return -22; // EINVAL
-
     const off: i64 = @bitCast(offset);
     var new_off: i64 = 0;
     switch (whence) {
@@ -3515,6 +3513,7 @@ fn syscallFtruncate(fd: u32, length: u64) i64 {
     if (fd >= vfs_mod.MAX_FDS) return -9;
     const desc = &cur.fd_table.fds[fd];
     if (desc.fd_type == .none) return -9;
+    if (desc.fd_type != .ext2_file and desc.fd_type != .fat32_file) return -22; // EINVAL
     if (!desc.writable) return -22; // EINVAL — fd not open for writing
     return truncateDesc(desc, length);
 }
@@ -4760,6 +4759,7 @@ fn syscallVmsplice(fd: u32, iov_ptr: u64, nr_segs: u32, flags: u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = tm.getTask(cur_idx) orelse return -1;
     if (fd >= vfs_mod.MAX_FDS or t.fd_table.fds[fd].fd_type == .none) return -9;
+    if (t.fd_table.fds[fd].fd_type != .pipe_write) return -9;
 
     const copy = @import("../../mm/copy_from_user.zig");
     const bo = @import("../../lib/byte_order.zig");

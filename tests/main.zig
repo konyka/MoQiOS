@@ -85,7 +85,8 @@ test "fsync rejects non-file descriptors" {
     const start = std.mem.indexOf(u8, source, "fn syscallFsync").?;
     const end = std.mem.indexOfPos(u8, source, start, "fn syscallFtruncate").?;
     const body = source[start..end];
-    try std.testing.expect(std.mem.indexOf(u8, body, "desc.fd_type != .ext2_file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (desc.fd_type == .none) return -9").? <
+        std.mem.indexOf(u8, body, "if (desc.fd_type != .ext2_file and desc.fd_type != .fat32_file)").?);
     try std.testing.expect(std.mem.indexOf(u8, body, "return -22; // EINVAL") != null);
 }
 
@@ -98,6 +99,7 @@ test "vmsplice validates flags and loops over large iovecs" {
     try std.testing.expect(std.mem.indexOf(u8, body, "while (done < len)") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "if (written <= 0)") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "if (written < copied)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "fd_type != .pipe_write") != null);
 }
 
 test "pipe2 validates and propagates nonblocking flags" {
