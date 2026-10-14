@@ -90,6 +90,16 @@ test "fsync rejects non-file descriptors" {
     try std.testing.expect(std.mem.indexOf(u8, body, "return -22; // EINVAL") != null);
 }
 
+test "page cache pins mmap frames before releasing cache lock" {
+    const cache = @embedFile("../kernel/fs/page_cache.zig");
+    const start = std.mem.indexOf(u8, cache, "pub fn getPageFramePinned").?;
+    const end = std.mem.indexOfPos(u8, cache, start, "pub fn copyPageAndRecord").?;
+    const body = cache[start..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "pmm.addRef(phys)") != null);
+    const idt = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, idt, "getPageFramePinned(region.inode_id, key)") != null);
+}
+
 test "vmsplice validates flags and loops over large iovecs" {
     const source = kt.syscall_entry_source;
     const start = std.mem.indexOf(u8, source, "fn syscallVmsplice").?;

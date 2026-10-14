@@ -239,6 +239,26 @@ pub fn getPageFrame(inode_id: u64, page_offset: u64) ?u64 {
     return null;
 }
 
+/// Return a cached frame with the caller's mapping reference acquired while
+/// cache_lock is held. Eviction cannot free or recycle the frame between the
+/// lookup and the reference increment.
+pub fn getPageFramePinned(inode_id: u64, page_offset: u64) ?u64 {
+    const flags = cache_lock.acquire();
+    defer cache_lock.release(flags);
+    const key = CacheKey{ .inode_id = inode_id, .page_offset = page_offset };
+    var slot = hash_buckets[hashKey(key)];
+    while (slot) |s| {
+        if (pages[s].valid and pages[s].key.inode_id == inode_id and pages[s].key.page_offset == page_offset) {
+            const phys = pages[s].phys;
+            pmm.addRef(phys);
+            pages[s].referenced = true;
+            return phys;
+        }
+        slot = pages[s].hash_next;
+    }
+    return null;
+}
+
 /// Copy-out variant of readPageAndRecord: returns the prefetch hint on a hit,
 /// null on a miss. The data is copied under the lock (see copyPage).
 pub fn copyPageAndRecord(inode_id: u64, page_offset: u64, page_off: u32, dst: [*]u8, len: u32) ?u32 {

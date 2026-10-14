@@ -1181,8 +1181,7 @@ fn serveFilePage(current: anytype, page_addr: u64) bool {
             const key = filemap.mmapCacheKey(plan.file_off / paging_mod.PAGE_SIZE);
 
             // Cache hit: map the cached frame zero-copy.
-            if (page_cache.getPageFrame(region.inode_id, key)) |phys| {
-                pmm.addRef(phys);
+            if (page_cache.getPageFramePinned(region.inode_id, key)) |phys| {
                 if (region.shared) {
                     // Mapped writable without COW — writes go straight to the
                     // cache frame, so the dirty bit cannot be observed later;
