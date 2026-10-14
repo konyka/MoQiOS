@@ -154,6 +154,14 @@ test "splice pipe-to-file nonblocking result distinguishes live pipe from EOF" {
     try std.testing.expectEqual(@as(i64, 0), splice.splicePipeToFileReadResult(0, 0, 0, true));
 }
 
+test "blocking splice reservations use the pipe read wait path" {
+    const source = @embedFile("../kernel/fs/vfs.zig");
+    try std.testing.expect(std.mem.indexOf(u8, source, "pub fn pipeReserveReadWait") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "sched.blockOn(&pipe_read_waiters[pipe_idx]") != null);
+    const splice = @embedFile("../kernel/fs/splice.zig");
+    try std.testing.expect(std.mem.count(u8, splice, "pipeReserveReadWait(") >= 2);
+}
+
 test "sleep timer wiring preserves legacy scheduler wakeups and zero deadlines" {
     const source = kt.sched_source;
     const legacy = std.mem.indexOf(u8, source, "fn timerTickLegacy").?;

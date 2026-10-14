@@ -277,6 +277,61 @@ pub fn pipeReserveRead(pipe_idx: u32, buf: [*]u8, count: usize, token: *PipeRead
     return @intCast(n);
 }
 
+/// Reserve a FIFO prefix, waiting for data when the pipe is live and the
+/// caller is blocking. The empty check and waiter registration share
+/// pipe_lock, matching pipeRead's lost-wakeup protection.
+pub fn pipeReserveReadWait(pipe_idx: u32, buf: [*]u8, count: usize, token: *PipeReadToken, nonblocking: bool) i64 {
+    const sched = @import("../proc/sched.zig");
+    const task_mod = @import("../proc/task.zig");
+    while (true) {
+        if (pipe_idx >= pipes.len) return -1;
+        const flags = pipe_lock.acquire();
+        const pipe = &pipes[pipe_idx];
+        if (pipe.ref_count == 0) {
+            pipe_lock.release(flags);
+            return -1;
+        }
+        if (pipe.read_reservation != 0) {
+            pipe_lock.release(flags);
+            return -11;
+        }
+        const readable: u32 = if (pipe.tail >= pipe.head) pipe.tail - pipe.head else PIPE_BUF_SIZE - pipe.head + pipe.tail;
+        if (readable == 0) {
+            if (pipe.write_refs == 0 or nonblocking) {
+                pipe_lock.release(flags);
+                return if (pipe.write_refs == 0) 0 else -11;
+            }
+            const current = task_mod.getTask(sched.currentTaskIndex() orelse {
+                pipe_lock.release(flags);
+                return -1;
+            }) orelse {
+                pipe_lock.release(flags);
+                return -1;
+            };
+            const node = &current.pipe_read_wait_node;
+            node.granted = false;
+            node.next = null;
+            if (!sched.blockOn(&pipe_read_waiters[pipe_idx], node)) {
+                pipe_lock.release(flags);
+                return -1;
+            }
+            pipe_lock.release(flags);
+            sched.rescheduleAfterBlock();
+            const cleanup = pipe_lock.acquire();
+            unlinkPipeReadWaiterLocked(pipe_idx, node);
+            pipe_lock.release(cleanup);
+            continue;
+        }
+        const n: u32 = @intCast(@min(count, @as(usize, readable)));
+        var i: u32 = 0;
+        while (i < n) : (i += 1) buf[i] = pipe.buf[(pipe.head + i) % PIPE_BUF_SIZE];
+        pipe.read_reservation = n;
+        token.* = .{ .pipe_idx = pipe_idx, .generation = pipe.generation };
+        pipe_lock.release(flags);
+        return @intCast(n);
+    }
+}
+
 /// Commit the accepted prefix of a prior `pipeReserveRead`.
 pub fn pipeCommitRead(token: PipeReadToken, count: usize) i64 {
     if (token.pipe_idx >= pipes.len) return -1;
