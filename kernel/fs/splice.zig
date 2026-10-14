@@ -78,6 +78,14 @@ pub fn splicePipeToFileReadResult(flags: u32, total: i64, nread: i64, write_open
     return 0;
 }
 
+pub fn pipeTransferResult(flags: u32, input_status: u32, output_status: u32, total: i64, moved: i64) i64 {
+    if (total > 0) return total;
+    if (moved < 0) return moved;
+    if (moved == 0 and (flags & SPLICE_F_NONBLOCK != 0 or
+        input_status & 0x800 != 0 or output_status & 0x800 != 0)) return -11;
+    return moved;
+}
+
 // ─── Internal helpers ─────────────────────────────────────────────────────
 
 /// Obtain the current task's FD table. Returns null if no current task.
@@ -601,7 +609,13 @@ fn splicePipeToPipe(fd_table: *vfs.FdTable, in_fd: u32, out_fd: u32, len: u64, f
         const moved = vfs.pipeTransfer(fd_table.fds[in_fd].pipe_idx, fd_table.fds[out_fd].pipe_idx, @intCast(@min(remaining, CHUNK_SIZE)));
         if (moved <= 0) {
             if (total > 0) return total;
-            return if (moved == 0 and flags & SPLICE_F_NONBLOCK != 0) -11 else moved;
+            return pipeTransferResult(
+                flags,
+                fd_table.fds[in_fd].status_flags,
+                fd_table.fds[out_fd].status_flags,
+                total,
+                moved,
+            );
         }
         total += moved;
         const done: u64 = @intCast(moved);
