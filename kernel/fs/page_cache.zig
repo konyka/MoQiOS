@@ -446,6 +446,42 @@ pub fn insertPageOwned(inode_id: u64, page_offset: u64, phys: u64, data_len: u32
     return pages[new_slot].data;
 }
 
+pub const OwnedInsertResult = union(enum) {
+    full,
+    inserted: u64,
+    existing: u64,
+};
+
+/// Insert an owned frame or atomically acquire an existing frame for the key.
+/// `existing` carries a mapping reference acquired under cache_lock; `full`
+/// leaves the incoming frame owned by the caller.
+pub fn insertPageOwnedOrGet(inode_id: u64, page_offset: u64, phys: u64, data_len: u32) OwnedInsertResult {
+    const flags = cache_lock.acquire();
+    defer cache_lock.release(flags);
+    const key = CacheKey{ .inode_id = inode_id, .page_offset = page_offset };
+    var slot = hash_buckets[hashKey(key)];
+    while (slot) |s| {
+        if (pages[s].valid and pages[s].key.inode_id == inode_id and pages[s].key.page_offset == page_offset) {
+            const existing_phys = pages[s].phys;
+            pmm.addRef(existing_phys);
+            pages[s].referenced = true;
+            return .{ .existing = existing_phys };
+        }
+        slot = pages[s].hash_next;
+    }
+    const new_slot = allocSlotOwned(phys) orelse return .full;
+    pages[new_slot].key = key;
+    pages[new_slot].valid = true;
+    pages[new_slot].dirty = false;
+    pages[new_slot].referenced = true;
+    if (data_len < PAGE_SIZE) @memset(pages[new_slot].data[data_len..PAGE_SIZE], 0);
+    pages[new_slot].hash_next = hash_buckets[hashKey(key)];
+    hash_buckets[hashKey(key)] = @intCast(new_slot);
+    inodeListInsert(new_slot);
+    page_count += 1;
+    return .{ .inserted = phys };
+}
+
 /// Flush all dirty pages for a given inode.
 /// Calls the provided writeback function for each dirty page.
 /// Uses per-inode linked list for O(pages_of_inode) instead of O(MAX_PAGES).

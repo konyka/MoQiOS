@@ -111,6 +111,15 @@ test "page cache insertions recheck duplicate keys under the cache lock" {
     try std.testing.expect(std.mem.indexOf(u8, owned_body, "return null") != null);
 }
 
+test "owned page insertion distinguishes existing frame from full cache" {
+    const source = @embedFile("../kernel/fs/page_cache.zig");
+    try std.testing.expect(std.mem.indexOf(u8, source, "pub const OwnedInsertResult") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "existing: u64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "pub fn insertPageOwnedOrGet") != null);
+    const idt = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, idt, "insertPageOwnedOrGet(region.inode_id, key, scratch, 4096)") != null);
+}
+
 test "full page-cache flushes expose writeback failure" {
     const cache = @embedFile("../kernel/fs/page_cache.zig");
     try std.testing.expect(std.mem.indexOf(u8, cache, "pub fn flushInode(inode_id: u64, writeback_fn: *const fn") != null);

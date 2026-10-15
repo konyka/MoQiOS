@@ -1224,16 +1224,29 @@ fn serveFilePage(current: anytype, page_addr: u64) bool {
 
             // Transfer the scratch frame to the page cache (mmap namespace)
             // so every mapping of this file page shares it zero-copy.
-            if (page_cache.insertPageOwned(region.inode_id, key, scratch, 4096) == null) {
+            var owned = page_cache.insertPageOwnedOrGet(region.inode_id, key, scratch, 4096);
+            if (owned == .existing) {
+                const existing_phys = owned.existing;
+                pmm.freePage(scratch);
+                if (region.shared and plan.shared_write) page_cache.markDirty(region.inode_id, key);
+                return mapRawUserPte(current, page_addr, if (region.shared) filemap.sharedPte(existing_phys, region.prot) else filemap.filePte(existing_phys, plan.cow, plan.executable), existing_phys);
+            }
+            if (owned == .full) {
                 if (region.shared) {
                     // Cache full: flush this inode's dirty mmap pages (making
                     // slots evictable) and retry once. Failing that, refuse
                     // the fault — a private copy would silently lose shared
                     // writes, which is worse than a SIGSEGV.
                     vfs.flushMappedInode(region.inode_id);
-                    if (page_cache.insertPageOwned(region.inode_id, key, scratch, 4096) == null) {
+                    owned = page_cache.insertPageOwnedOrGet(region.inode_id, key, scratch, 4096);
+                    if (owned == .full) {
                         pmm.freePage(scratch);
                         return false;
+                    }
+                    if (owned == .existing) {
+                        const existing_phys = owned.existing;
+                        pmm.freePage(scratch);
+                        return mapRawUserPte(current, page_addr, filemap.sharedPte(existing_phys, region.prot), existing_phys);
                     }
                 } else {
                     // Cache full — fall back to an exclusively owned copy.
