@@ -823,6 +823,7 @@ const SchedStats = struct {
 - `fsync`/`fdatasync` 仅接受 ext2/FAT32 regular-file descriptors；pipe、socket、eventfd 等非文件描述符返回 `EINVAL`。
 - mmap file-cache 命中使用 `getPageFramePinned`：在 `cache_lock` 内先增加映射引用，再把物理帧交给 page-table fault path，避免 eviction 在 lookup 与 `addRef` 之间释放/复用帧。
 - page-cache insertion 在 `cache_lock` 内二次检查 `(inode_id, page_offset)`；并发 miss 不会创建 duplicate key，owned insertion 遇到已存在页面返回 null 并保留 incoming frame 由调用方释放。
+- AArch64 paging facade 的 `isPageMapped` 现在读取真实 user mapping；AArch64/RISC-V `unmapPage` 返回被移除的物理帧，保持 shared paging API 的回收/验证 contract。
 - mmap fault 使用 `insertPageOwnedOrGet` 区分 cache full、刚插入和已存在 frame；duplicate 命中返回已在锁内 pin 的现有物理帧，incoming scratch frame 由 fault path 释放，不会误判为 cache full。
 - full `syncAll`/`syncFile` 现在消费 page-cache `FlushResult.failed`；dirty MAP_SHARED 页面写回失败会向 `sync`/`fsync`/`msync` 传播为 `EIO`，失败页面保持 dirty 供后续重试。
 - `splice(pipe_read, ..., file, ..., len, SPLICE_F_NONBLOCK)` 在空但仍有写端时以零进度返回 `-EAGAIN`；所有写端关闭时的空读是 EOF，返回 0。负错误保持不变，已有部分传输优先返回正的部分字节数；显式和隐式文件偏移都沿用原有更新规则。

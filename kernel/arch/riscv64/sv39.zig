@@ -78,14 +78,17 @@ pub fn mapPage(va: usize, pa: usize, flags: MapFlags) bool {
     return true;
 }
 
-pub fn unmapPage(va: usize) void {
-    const slot = walkAlloc(va, false) orelse return;
+pub fn unmapPage(va: usize) ?usize {
+    const slot = walkAlloc(va, false) orelse return null;
+    const old = slot.pte.*;
+    if ((old & PTE_V) == 0) return null;
     slot.pte.* = 0;
     // Local TLB shootdown for this VA.
     asm volatile ("sfence.vma %[va], zero"
         :
         : [va] "r" (va),
         : .{ .memory = true });
+    return @intCast((old >> 10) << 12);
 }
 
 pub fn isMapped(va: usize) bool {

@@ -111,8 +111,7 @@ pub const paging = struct {
         _ = pml4_phys;
         if (!sv39.isMapped(@intCast(virt))) return null;
         // Sv39 unmap does not return the old phys; callers that free must track it.
-        sv39.unmapPage(@intCast(virt));
-        return null;
+        return @intCast(sv39.unmapPage(@intCast(virt)) orelse return null);
     }
 
     pub fn isPageMapped(pml4_phys: u64, virt: u64) bool {

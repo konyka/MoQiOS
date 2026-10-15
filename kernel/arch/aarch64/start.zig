@@ -212,7 +212,7 @@ export fn kmain(x0_dtb: usize) callconv(.c) noreturn {
     }
     putStr("  map/unmap R/W: OK\n");
 
-    paging.unmapPage(test_va);
+    _ = paging.unmapPage(test_va);
     trap.armPageFaultTest();
     asm volatile (
         \\ldr x0, [%[va]]

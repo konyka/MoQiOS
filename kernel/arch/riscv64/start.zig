@@ -203,7 +203,7 @@ export fn kmain(hartid: usize, dtb: usize) callconv(.c) noreturn {
     }
     putStr("  map/unmap R/W: OK\n");
 
-    sv39.unmapPage(test_va);
+    _ = sv39.unmapPage(test_va);
     pmm.freePage(test_pa);
 
     trap.armPageFaultTest();

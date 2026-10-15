@@ -133,16 +133,19 @@ pub fn mapPage(va: usize, pa: usize, flags: u8) bool {
     return true;
 }
 
-pub fn unmapPage(va: usize) void {
+pub fn unmapPage(va: usize) ?usize {
     const l1 = tableAt(root_phys);
     const l1d = l1[idxL1(va)];
-    if ((l1d & (DESC_VALID | DESC_TABLE)) != (DESC_VALID | DESC_TABLE)) return;
+    if ((l1d & (DESC_VALID | DESC_TABLE)) != (DESC_VALID | DESC_TABLE)) return null;
     const l2 = tableAt(@intCast(l1d & 0x0000fffffffff000));
     const l2d = l2[idxL2(va)];
-    if ((l2d & (DESC_VALID | DESC_TABLE)) != (DESC_VALID | DESC_TABLE)) return;
+    if ((l2d & (DESC_VALID | DESC_TABLE)) != (DESC_VALID | DESC_TABLE)) return null;
     const l3 = tableAt(@intCast(l2d & 0x0000fffffffff000));
+    const old = l3[idxL3(va)];
+    if ((old & DESC_VALID) == 0) return null;
     l3[idxL3(va)] = 0;
     tlbInvalidate(va);
+    return old & 0x0000fffffffff000;
 }
 
 /// SK-40: valid descriptor with AP[1] set — page is EL0-accessible.

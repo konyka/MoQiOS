@@ -107,15 +107,12 @@ pub const paging = struct {
 
     pub fn unmapPage(pml4_phys: u64, virt: u64) ?u64 {
         _ = pml4_phys;
-        a64pag.unmapPage(@intCast(virt));
-        return null;
+        return @intCast(a64pag.unmapPage(@intCast(virt)) orelse return null);
     }
 
     pub fn isPageMapped(pml4_phys: u64, virt: u64) bool {
         _ = pml4_phys;
-        _ = virt;
-        // a64 paging has no isMapped helper yet.
-        return false;
+        return a64pag.isUserMapped(@intCast(virt));
     }
 
     pub fn mapHugePage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void {

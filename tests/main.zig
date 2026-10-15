@@ -100,6 +100,15 @@ test "page cache pins mmap frames before releasing cache lock" {
     try std.testing.expect(std.mem.indexOf(u8, idt, "getPageFramePinned(region.inode_id, key)") != null);
 }
 
+test "non-x86 paging facades preserve mapping query and unmap contracts" {
+    const aarch = @embedFile("../kernel/arch/aarch64/arch_impl.zig");
+    const riscv = @embedFile("../kernel/arch/riscv64/arch_impl.zig");
+    try std.testing.expect(std.mem.indexOf(u8, aarch, "a64pag.isUserMapped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aarch, "a64pag.unmapPage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, riscv, "sv39.unmapPage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aarch, "return false;\n    }\n\n    pub fn mapHugePage") == null);
+}
+
 test "page cache insertions recheck duplicate keys under the cache lock" {
     const source = @embedFile("../kernel/fs/page_cache.zig");
     const plain = std.mem.indexOf(u8, source, "pub fn insertPage(").?;
