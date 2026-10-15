@@ -167,9 +167,8 @@ test "pipe-to-pipe splice honors descriptor nonblocking status" {
     const source = @embedFile("../kernel/fs/splice.zig");
     try std.testing.expect(std.mem.indexOf(u8, source, "input_status & 0x800") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "output_status & 0x800") != null);
-    try std.testing.expectEqual(@as(i64, -11), splice.pipeTransferResult(0, 0x800, 0, 0, 0));
-    try std.testing.expectEqual(@as(i64, -11), splice.pipeTransferResult(0, 0, 0x800, 0, 0));
-    try std.testing.expectEqual(@as(i64, 17), splice.pipeTransferResult(0, 0x800, 0, 0, 17));
+    try std.testing.expectEqual(@as(i64, -11), splice.pipeTransferResult(0, 0));
+    try std.testing.expectEqual(@as(i64, 17), splice.pipeTransferResult(0, 17));
 }
 
 test "blocking splice reservations use the pipe read wait path" {

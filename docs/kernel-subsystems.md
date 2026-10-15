@@ -819,7 +819,7 @@ const SchedStats = struct {
 - `ioctl(FIONBIO)` 同样修改 descriptor 的 `status_flags` 中的 `O_NONBLOCK`，不会触碰 `fd_flags` 的 close-on-exec 状态；非零参数启用，零参数清除。
 - pipe 写端同样遵守 `O_NONBLOCK`：满 pipe 且零进度时返回 `EAGAIN`，读端关闭时仍优先返回 `EPIPE`。
 - splice 的 pipe→file/socket reservation 路径在阻塞模式下等待 live pipe 数据；`SPLICE_F_NONBLOCK` 或 descriptor `O_NONBLOCK` 返回零进度 `EAGAIN`，写端关闭保持 EOF。pipe→pipe 的完整阻塞 transfer 仍是后续项。
-- pipe→pipe splice 在零进度时也检查输入和输出 descriptor 的 `O_NONBLOCK`；任一端非阻塞即返回 `EAGAIN`。完整阻塞 transfer/wait queue 语义仍是后续项。
+- pipe→pipe splice 在零进度时返回 `EAGAIN`，避免 destination-full 或空源 pipe 被伪报为 EOF/成功；完整阻塞 source/destination wait queue 语义仍是后续项。
 - `fsync`/`fdatasync` 仅接受 ext2/FAT32 regular-file descriptors；pipe、socket、eventfd 等非文件描述符返回 `EINVAL`。
 - mmap file-cache 命中使用 `getPageFramePinned`：在 `cache_lock` 内先增加映射引用，再把物理帧交给 page-table fault path，避免 eviction 在 lookup 与 `addRef` 之间释放/复用帧。
 - full `syncAll`/`syncFile` 现在消费 page-cache `FlushResult.failed`；dirty MAP_SHARED 页面写回失败会向 `sync`/`fsync`/`msync` 传播为 `EIO`，失败页面保持 dirty 供后续重试。
