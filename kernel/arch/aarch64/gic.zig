@@ -154,7 +154,7 @@ pub fn handleIrq() u32 {
     const intid: u32 = @truncate(iar);
     if (intid < 1020) {
         if (intid == TIMER_PPI) {
-            @import("timer.zig").onInterrupt();
+            // Timer service is owned by trapHandleIrq after dispatch.
         }
         writeIccEoir1(iar);
     }

@@ -107,6 +107,22 @@ test "non-x86 paging facades preserve mapping query and unmap contracts" {
     try std.testing.expect(std.mem.indexOf(u8, aarch, "a64pag.unmapPage") != null);
     try std.testing.expect(std.mem.indexOf(u8, riscv, "sv39.unmapPage") != null);
     try std.testing.expect(std.mem.indexOf(u8, aarch, "return false;\n    }\n\n    pub fn mapHugePage") == null);
+    try std.testing.expect(std.mem.indexOf(u8, aarch, "a64pag.isUserWritable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, riscv, "sv39.isUserWritable") != null);
+}
+
+test "AArch64 timer has one hardware timer service owner" {
+    const gic = @embedFile("../kernel/arch/aarch64/gic.zig");
+    const trap = @embedFile("../kernel/arch/aarch64/trap.zig");
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, gic, ".onInterrupt("));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trap, ".onInterrupt("));
+}
+
+test "RISC-V mapPage fences newly installed translations" {
+    const source = @embedFile("../kernel/arch/riscv64/sv39.zig");
+    const start = std.mem.indexOf(u8, source, "pub fn mapPage").?;
+    const end = std.mem.indexOfPos(u8, source, start, "pub fn unmapPage").?;
+    try std.testing.expect(std.mem.indexOf(u8, source[start..end], "sfence.vma") != null);
 }
 
 test "page cache insertions recheck duplicate keys under the cache lock" {

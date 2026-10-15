@@ -75,6 +75,10 @@ fn walkAlloc(va: usize, create: bool) ?struct { pte: *u64 } {
 pub fn mapPage(va: usize, pa: usize, flags: MapFlags) bool {
     const slot = walkAlloc(va, true) orelse return false;
     slot.pte.* = pteLeaf(pa, flags);
+    asm volatile ("sfence.vma %[va], zero"
+        :
+        : [va] "r" (va),
+        : .{ .memory = true });
     return true;
 }
 
@@ -100,6 +104,11 @@ pub fn isMapped(va: usize) bool {
 pub fn isUserMapped(va: usize) bool {
     const slot = walkAlloc(va, false) orelse return false;
     return (slot.pte.* & (PTE_V | PTE_U)) == (PTE_V | PTE_U);
+}
+
+pub fn isUserWritable(va: usize) bool {
+    const slot = walkAlloc(va, false) orelse return false;
+    return (slot.pte.* & (PTE_V | PTE_U | PTE_W)) == (PTE_V | PTE_U | PTE_W);
 }
 
 fn mapRangeIdentity(phys_lo: usize, phys_hi: usize, flags: MapFlags) bool {
