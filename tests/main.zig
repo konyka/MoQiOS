@@ -100,6 +100,17 @@ test "page cache pins mmap frames before releasing cache lock" {
     try std.testing.expect(std.mem.indexOf(u8, idt, "getPageFramePinned(region.inode_id, key)") != null);
 }
 
+test "page cache insertions recheck duplicate keys under the cache lock" {
+    const source = @embedFile("../kernel/fs/page_cache.zig");
+    const plain = std.mem.indexOf(u8, source, "pub fn insertPage(").?;
+    const owned = std.mem.indexOf(u8, source, "pub fn insertPageOwned").?;
+    const plain_body = source[plain..owned];
+    const owned_body = source[owned..std.mem.indexOfPos(u8, source, owned, "pub fn flushInode").?];
+    try std.testing.expect(std.mem.indexOf(u8, plain_body, "var existing = hash_buckets[bucket]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, owned_body, "var existing = hash_buckets[bucket]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, owned_body, "return null") != null);
+}
+
 test "full page-cache flushes expose writeback failure" {
     const cache = @embedFile("../kernel/fs/page_cache.zig");
     try std.testing.expect(std.mem.indexOf(u8, cache, "pub fn flushInode(inode_id: u64, writeback_fn: *const fn") != null);

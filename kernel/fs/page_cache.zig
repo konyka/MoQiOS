@@ -372,6 +372,15 @@ pub fn insertPage(inode_id: u64, page_offset: u64, data: *const [PAGE_SIZE]u8, d
     const key = CacheKey{ .inode_id = inode_id, .page_offset = page_offset };
     const bucket = hashKey(key);
 
+    var existing = hash_buckets[bucket];
+    while (existing) |s| {
+        if (pages[s].valid and pages[s].key.inode_id == inode_id and pages[s].key.page_offset == page_offset) {
+            pages[s].referenced = true;
+            return pages[s].data;
+        }
+        existing = pages[s].hash_next;
+    }
+
     const new_slot = allocSlot() orelse return null;
 
     pages[new_slot].key = key;
@@ -404,6 +413,15 @@ pub fn insertPageOwned(inode_id: u64, page_offset: u64, phys: u64, data_len: u32
 
     const key = CacheKey{ .inode_id = inode_id, .page_offset = page_offset };
     const bucket = hashKey(key);
+
+    var existing = hash_buckets[bucket];
+    while (existing) |s| {
+        if (pages[s].valid and pages[s].key.inode_id == inode_id and pages[s].key.page_offset == page_offset) {
+            pages[s].referenced = true;
+            return null;
+        }
+        existing = pages[s].hash_next;
+    }
 
     const new_slot = allocSlotOwned(phys) orelse return null;
 

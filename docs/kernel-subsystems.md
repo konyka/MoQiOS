@@ -822,6 +822,7 @@ const SchedStats = struct {
 - pipe→pipe splice 在零进度时返回 `EAGAIN`，避免 destination-full 或空源 pipe 被伪报为 EOF/成功；完整阻塞 source/destination wait queue 语义仍是后续项。
 - `fsync`/`fdatasync` 仅接受 ext2/FAT32 regular-file descriptors；pipe、socket、eventfd 等非文件描述符返回 `EINVAL`。
 - mmap file-cache 命中使用 `getPageFramePinned`：在 `cache_lock` 内先增加映射引用，再把物理帧交给 page-table fault path，避免 eviction 在 lookup 与 `addRef` 之间释放/复用帧。
+- page-cache insertion 在 `cache_lock` 内二次检查 `(inode_id, page_offset)`；并发 miss 不会创建 duplicate key，owned insertion 遇到已存在页面返回 null 并保留 incoming frame 由调用方释放。
 - full `syncAll`/`syncFile` 现在消费 page-cache `FlushResult.failed`；dirty MAP_SHARED 页面写回失败会向 `sync`/`fsync`/`msync` 传播为 `EIO`，失败页面保持 dirty 供后续重试。
 - `splice(pipe_read, ..., file, ..., len, SPLICE_F_NONBLOCK)` 在空但仍有写端时以零进度返回 `-EAGAIN`；所有写端关闭时的空读是 EOF，返回 0。负错误保持不变，已有部分传输优先返回正的部分字节数；显式和隐式文件偏移都沿用原有更新规则。
 - MoqIPC timeout 仍保持 30 秒语义，但 x86 由正常 BSP timed-wait tick 驱动过期扫描，不再依赖约 100ms slow-maintenance 扫描；authority lock、TaskPin 和 incarnation 校验保持不变。
