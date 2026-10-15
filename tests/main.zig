@@ -100,6 +100,15 @@ test "page cache pins mmap frames before releasing cache lock" {
     try std.testing.expect(std.mem.indexOf(u8, idt, "getPageFramePinned(region.inode_id, key)") != null);
 }
 
+test "full page-cache flushes expose writeback failure" {
+    const cache = @embedFile("../kernel/fs/page_cache.zig");
+    try std.testing.expect(std.mem.indexOf(u8, cache, "pub fn flushInode(inode_id: u64, writeback_fn: *const fn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cache, ") FlushResult") != null);
+    const vfs = @embedFile("../kernel/fs/vfs.zig");
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "return ext2_ok and fat32_ok and !mmap_result.failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "return ordinary_ok and !mmap_result.failed") != null);
+}
+
 test "vmsplice validates flags and loops over large iovecs" {
     const source = kt.syscall_entry_source;
     const start = std.mem.indexOf(u8, source, "fn syscallVmsplice").?;

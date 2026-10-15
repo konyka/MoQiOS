@@ -439,8 +439,8 @@ pub fn insertPageOwned(inode_id: u64, page_offset: u64, phys: u64, data_len: u32
 /// scan, so the data is not lost and a persistent I/O error cannot spin the
 /// retry loop. A page re-dirtied by a concurrent writePage during the flush
 /// keeps its dirty bit, so the newer data is flushed on a later pass.
-pub fn flushInode(inode_id: u64, writeback_fn: *const fn (u64, u64, *[PAGE_SIZE]u8) bool) u32 {
-    var flushed: u32 = 0;
+pub fn flushInode(inode_id: u64, writeback_fn: *const fn (u64, u64, *[PAGE_SIZE]u8) bool) FlushResult {
+    var result: FlushResult = .{};
     while (true) {
         var tmp: [PAGE_SIZE]u8 = undefined;
         var page_offset: u64 = 0;
@@ -481,12 +481,13 @@ pub fn flushInode(inode_id: u64, writeback_fn: *const fn (u64, u64, *[PAGE_SIZE]
                 dirtySet(flushed_slot);
             }
             cache_lock.release(flags);
+            result.failed = true;
             break;
         }
         cache_lock.release(flags);
-        flushed += 1;
+        result.flushed += 1;
     }
-    return flushed;
+    return result;
 }
 
 pub const FlushResult = struct {
@@ -554,8 +555,8 @@ pub fn flushInodeRange(
 }
 
 /// Flush ALL dirty pages. Same drop-the-lock-for-I/O pattern as flushInode.
-pub fn flushAll(writeback_fn: *const fn (u64, u64, *[PAGE_SIZE]u8) bool) u32 {
-    var flushed: u32 = 0;
+pub fn flushAll(writeback_fn: *const fn (u64, u64, *[PAGE_SIZE]u8) bool) FlushResult {
+    var result: FlushResult = .{};
     while (true) {
         var tmp: [PAGE_SIZE]u8 = undefined;
         var key: CacheKey = .{ .inode_id = 0, .page_offset = 0 };
@@ -598,12 +599,13 @@ pub fn flushAll(writeback_fn: *const fn (u64, u64, *[PAGE_SIZE]u8) bool) u32 {
                 dirtySet(flushed_slot);
             }
             cache_lock.release(flags);
+            result.failed = true;
             break;
         }
         cache_lock.release(flags);
-        flushed += 1;
+        result.flushed += 1;
     }
-    return flushed;
+    return result;
 }
 
 /// Invalidate all cached pages for a given inode.

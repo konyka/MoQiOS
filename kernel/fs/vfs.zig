@@ -1974,8 +1974,8 @@ pub fn syncAll() bool {
     // exactly the shared-mapping writeback set. Pages that fail to write stay
     // dirty for a later pass; they do not flip the return value (matching the
     // pre-H1 contract, which had no page-cache component at all).
-    _ = page_cache.flushAll(mappedPageWriteback);
-    return ext2_ok and fat32_ok;
+    const mmap_result = page_cache.flushAll(mappedPageWriteback);
+    return ext2_ok and fat32_ok and !mmap_result.failed;
 }
 
 /// Sync a specific file's dirty buffers to disk.
@@ -1984,12 +1984,13 @@ pub fn syncAll() bool {
 pub fn syncFile(inode_id: u64, fs_type: writeback.FsType) bool {
     // H1: also flush this inode's dirty mmap-owned cache pages, so fsync on a
     // file with a dirty MAP_SHARED mapping persists the mapping's writes.
-    _ = page_cache.flushInode(inode_id, mappedPageWriteback);
-    return switch (fs_type) {
+    const mmap_result = page_cache.flushInode(inode_id, mappedPageWriteback);
+    const ordinary_ok = switch (fs_type) {
         .ext2 => writeback.flushFile(inode_id, .ext2, ext2WriteFlush),
         .fat32 => writeback.flushFile(inode_id, .fat32, fat32WriteFlush),
         .none => true,
     };
+    return ordinary_ok and !mmap_result.failed;
 }
 
 /// Flush ordinary writeback buffers and dirty mmap pages in [first_byte,
