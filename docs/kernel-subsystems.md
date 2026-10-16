@@ -826,6 +826,7 @@ const SchedStats = struct {
 - AArch64 paging facade 的 `isPageMapped` 现在读取真实 user mapping；AArch64/RISC-V `unmapPage` 返回被移除的物理帧，保持 shared paging API 的回收/验证 contract。
 - 非 x86 `isUserAccessible` 与 `isUserWritable` 分离：只读 user 页不能通过 kernel copy-to-user 写入检查；AArch64 timer service 由 trap 单一拥有者驱动，GIC 只负责 acknowledge/EOI。
 - RISC-V Sv39 在 map/unmap 修改 PTE 后执行本地 `sfence.vma`，避免旧 invalid/old translation 在重映射后继续生效。
+- AArch64/RISC-V 尚未实现 2 MiB huge-page backend 时，`mapHugePage` 显式返回 `UnsupportedHugePage`，不会静默只映射一个 4 KiB base page。
 - mmap fault 使用 `insertPageOwnedOrGet` 区分 cache full、刚插入和已存在 frame；duplicate 命中返回已在锁内 pin 的现有物理帧，incoming scratch frame 由 fault path 释放，不会误判为 cache full。
 - full `syncAll`/`syncFile` 现在消费 page-cache `FlushResult.failed`；dirty MAP_SHARED 页面写回失败会向 `sync`/`fsync`/`msync` 传播为 `EIO`，失败页面保持 dirty 供后续重试。
 - `splice(pipe_read, ..., file, ..., len, SPLICE_F_NONBLOCK)` 在空但仍有写端时以零进度返回 `-EAGAIN`；所有写端关闭时的空读是 EOF，返回 0。负错误保持不变，已有部分传输优先返回正的部分字节数；显式和隐式文件偏移都沿用原有更新规则。

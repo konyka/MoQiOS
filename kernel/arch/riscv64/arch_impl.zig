@@ -120,8 +120,11 @@ pub const paging = struct {
     }
 
     pub fn mapHugePage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void {
-        // No Sv39 huge helper yet — fall back to a single 4K map of the base.
-        try mapPage(pml4_phys, virt, phys, flags);
+        _ = pml4_phys;
+        _ = virt;
+        _ = phys;
+        _ = flags;
+        return error.UnsupportedHugePage;
     }
 
     /// SK-40: root table currently loaded in the MMU (satp PPN → phys).
@@ -142,7 +145,8 @@ pub const paging = struct {
     /// Bring-up maps every user page writable and has no copy-on-write, so
     /// there is no read-only user page for a kernel write to trip over yet.
     pub fn isUserWritable(root_phys: u64, virt: u64) bool {
-        return isUserAccessible(root_phys, virt);
+        _ = root_phys;
+        return sv39.isUserWritable(@intCast(virt));
     }
 
     /// SK-40: S-mode loads/stores to U pages trap unless sstatus.SUM is set.

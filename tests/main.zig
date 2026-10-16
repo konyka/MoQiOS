@@ -109,6 +109,8 @@ test "non-x86 paging facades preserve mapping query and unmap contracts" {
     try std.testing.expect(std.mem.indexOf(u8, aarch, "return false;\n    }\n\n    pub fn mapHugePage") == null);
     try std.testing.expect(std.mem.indexOf(u8, aarch, "a64pag.isUserWritable") != null);
     try std.testing.expect(std.mem.indexOf(u8, riscv, "sv39.isUserWritable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aarch, "error.UnsupportedHugePage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, riscv, "error.UnsupportedHugePage") != null);
 }
 
 test "AArch64 timer has one hardware timer service owner" {
