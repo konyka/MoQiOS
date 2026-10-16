@@ -168,7 +168,9 @@ pub fn isUserWritable(va: usize) bool {
     if ((l1d & (DESC_VALID | DESC_TABLE)) != (DESC_VALID | DESC_TABLE)) return false;
     const l2d = tableAt(@intCast(l1d & 0x0000fffffffff000))[idxL2(va)];
     const leaf = if ((l2d & DESC_TABLE) == 0) l2d else tableAt(@intCast(l2d & 0x0000fffffffff000))[idxL3(va)];
-    return (leaf & DESC_VALID) != 0 and (leaf & (@as(u64, 1) << 7)) == 0;
+    const ap_el0 = @as(u64, 1) << 6;
+    const ap_rw = @as(u64, 1) << 7;
+    return (leaf & DESC_VALID) != 0 and (leaf & ap_el0) != 0 and (leaf & ap_rw) == 0;
 }
 
 fn mapBlock2MIdentity(pa: usize, flags: u8) bool {

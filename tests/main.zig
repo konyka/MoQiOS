@@ -113,6 +113,16 @@ test "non-x86 paging facades preserve mapping query and unmap contracts" {
     try std.testing.expect(std.mem.indexOf(u8, riscv, "error.UnsupportedHugePage") != null);
 }
 
+test "AArch64 writable pages require EL0 access and RW AP bits" {
+    const source = @embedFile("../kernel/arch/aarch64/paging.zig");
+    const start = std.mem.indexOf(u8, source, "pub fn isUserWritable").?;
+    const end = std.mem.indexOfPos(u8, source, start, "fn mapBlock2MIdentity").?;
+    const body = source[start..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "ap_el0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "leaf & ap_el0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "leaf & ap_rw") != null);
+}
+
 test "AArch64 timer has one hardware timer service owner" {
     const gic = @embedFile("../kernel/arch/aarch64/gic.zig");
     const trap = @embedFile("../kernel/arch/aarch64/trap.zig");
