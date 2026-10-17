@@ -204,6 +204,12 @@ fn mapRange2M(phys_lo: usize, phys_hi: usize, flags: u8) bool {
     return true;
 }
 
+/// Failure contract: fatal, no retry. Both boot callers halt (`wfi`)
+/// immediately when this returns false, so the root frame and any
+/// intermediate L2/L3 tables allocated before the failure are
+/// intentionally NOT freed — the machine never allocates again.
+/// Do not add a teardown walk here: the MMU state at early-boot failure
+/// is not guaranteed and the halt makes reclamation moot.
 pub fn initIdentity(regions: []const @import("fdt.zig").MemRegion) bool {
     root_phys = pmm.allocPage();
     if (root_phys == 0) return false;

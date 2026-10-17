@@ -148,6 +148,19 @@ test "virtio net queue rejects sizes beyond fixed ring storage" {
     try std.testing.expect(std.mem.indexOf(u8, policy, "pub fn init(state: *QueueState, size: u16) bool") != null);
 }
 
+test "non-x86 identity init failure is an explicit fatal no-retry contract" {
+    const aarch = @embedFile("../kernel/arch/aarch64/paging.zig");
+    try std.testing.expect(std.mem.indexOf(u8, aarch, "Failure contract: fatal, no retry") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aarch, "intentionally NOT freed") != null);
+    const riscv = @embedFile("../kernel/arch/riscv64/sv39.zig");
+    try std.testing.expect(std.mem.indexOf(u8, riscv, "Failure contract: fatal, no retry") != null);
+    try std.testing.expect(std.mem.indexOf(u8, riscv, "intentionally NOT freed") != null);
+    const aarch_start = @embedFile("../kernel/arch/aarch64/start.zig");
+    try std.testing.expect(std.mem.indexOf(u8, aarch_start, "M9-3 FAILED: MMU enable") != null);
+    const riscv_start = @embedFile("../kernel/arch/riscv64/start.zig");
+    try std.testing.expect(std.mem.indexOf(u8, riscv_start, "M3 FAILED: Sv39 enable") != null);
+}
+
 test "page cache insertions recheck duplicate keys under the cache lock" {
     const source = @embedFile("../kernel/fs/page_cache.zig");
     const plain = std.mem.indexOf(u8, source, "pub fn insertPage(").?;

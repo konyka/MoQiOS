@@ -121,6 +121,10 @@ fn mapRangeIdentity(phys_lo: usize, phys_hi: usize, flags: MapFlags) bool {
 }
 
 /// Build root PT, identity-map DRAM regions + UART, enable Sv39.
+/// Failure contract: fatal, no retry. The boot caller shuts the machine
+/// down (`sbiShutdown`) when this returns false, so the root frame and
+/// any intermediate page tables allocated before the failure are
+/// intentionally NOT freed — no further allocation ever happens.
 pub fn initIdentity(regions: []const @import("fdt.zig").MemRegion) bool {
     root_phys = pmm.allocPage() orelse return false;
 
