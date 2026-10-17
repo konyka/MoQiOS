@@ -1490,7 +1490,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(process_vm.processVmWritev(@truncate(frame.rdi), frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9));
         },
         285 => { // memfd_create(name, flags) — anonymous memory file
-            frame.rax = @bitCast(syscallMemfdCreate(frame.rdi, @truncate(frame.rsi)));
+            frame.rax = @bitCast(unsupported_policy.memfdCreate());
         },
         286 => { // get_robust_list(pid, head_ptr, len_ptr)
             frame.rax = @bitCast(syscallGetRobustList(@truncate(frame.rdi), frame.rsi, frame.rdx));

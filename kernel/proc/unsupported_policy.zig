@@ -54,6 +54,10 @@ pub fn chroot() i64 {
     return errno.ENOSYS;
 }
 
+pub fn memfdCreate() i64 {
+    return errno.ENOSYS;
+}
+
 pub fn listmount() i64 {
     return errno.ENOSYS;
 }

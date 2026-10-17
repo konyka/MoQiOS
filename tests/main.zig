@@ -1411,6 +1411,16 @@ test "chroot keeps the unsupported ENOSYS contract" {
     try std.testing.expect(std.mem.indexOf(u8, body, "syscallChroot") == null);
 }
 
+test "memfd_create keeps the unsupported ENOSYS contract" {
+    try std.testing.expectEqual(@as(i64, -38), kt.unsupported_policy.memfdCreate());
+    const source = kt.syscall_entry_source;
+    const start = std.mem.indexOf(u8, source, "285 => { // memfd_create").?;
+    const end = std.mem.indexOfPos(u8, source, start, "286 =>").?;
+    const body = source[start..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "unsupported_policy.memfdCreate()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "syscallMemfdCreate") == null);
+}
+
 test "LSM self-attribute syscalls keep the unsupported ENOSYS contract" {
     try std.testing.expectEqual(@as(i64, -38), kt.unsupported_policy.lsm());
     const source = kt.syscall_entry_source;
