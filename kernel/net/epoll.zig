@@ -74,6 +74,7 @@ pub const EpollItem = struct {
     fd: i32 = -1,
     fd_generation: u64 = 0,
     registration_generation: u64 = 0,
+    target_epoll_generation: u64 = 0,
     events: u32 = 0,
     data: u64 = 0,
     fd_type: vfs.FdType = .none,
@@ -206,6 +207,16 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
     if (!cur.fd_table.acquireTransferFd(@intCast(fd))) return EBADF;
     defer cur.fd_table.releaseTransferFd(@intCast(fd));
     const current = computeCurrentEvents(desc.fd_type, resourceIdxFromDesc(desc), desc.offset);
+    var target_epoll_generation: u64 = 0;
+    if (desc.fd_type == .epoll) {
+        if (acquireInstance(resourceIdxFromDesc(desc))) |target| {
+            target_epoll_generation = target.generation;
+            var target_borrow = target;
+            target_borrow.release();
+        }
+    }
+    var nested_ready = false;
+    defer if (nested_ready) epollNotify(.epoll, epfd_idx, EPOLLIN);
 
     const saved = inst.spin.acquire();
     defer inst.spin.release(saved);
@@ -240,6 +251,7 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
                 .fd = fd,
                 .fd_generation = identity.generation,
                 .registration_generation = inst.next_registration_generation,
+                .target_epoll_generation = target_epoll_generation,
                 .events = ev.events,
                 .data = ev.data,
                 .fd_type = desc.fd_type,
@@ -254,6 +266,7 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
 
             if (current & (ev.events & ~EPOLLET & ~EPOLLONESHOT) != 0) {
                 addToReadyListLocked(inst, @intCast(s));
+                nested_ready = true;
             }
         },
         EPOLL_CTL_MOD => {
@@ -279,6 +292,7 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
                         if (!item.on_ready) {
                             if (current & (ev.events & ~EPOLLET & ~EPOLLONESHOT) != 0) {
                                 addToReadyListLocked(inst, i);
+                                nested_ready = true;
                             }
                         }
                         break;
@@ -300,7 +314,7 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
                         inst.items[i].fd_type == desc.fd_type and
                         inst.items[i].resource_idx == resourceIdxFromDesc(desc))
                     {
-                        if (inst.items[i].on_ready) removeFromReadyList(inst, inst.items[i].fd);
+                        if (inst.items[i].on_ready) removeFromReadyListSlot(inst, i);
                         inst.items[i] = .{};
                         inst.in_use_bm[w] &= ~(@as(u64, 1) << @intCast(bit));
                         inst.item_count -= 1;
@@ -428,7 +442,13 @@ fn propagateNestedReadyLocked(initial: u32) void {
                     bits &= bits - 1;
                     const item_idx: u8 = @intCast(w * 64 + @as(u32, bit));
                     const item = &parent_inst.items[item_idx];
-                    if (item.is_disabled or item.fd_type != .epoll or item.resource_idx != child) continue;
+                    if (item.is_disabled or item.fd_type != .epoll or item.resource_idx != child or
+                        item.target_epoll_generation != epoll_pool[child].generation or
+                        item.events & EPOLLIN == 0) continue;
+                    if (item.is_et) {
+                        if (item.last_reported == EPOLLIN) continue;
+                        item.last_reported = EPOLLIN;
+                    }
                     if (!item.on_ready) {
                         addToReadyListLocked(parent_inst, item_idx);
                         became_ready = true;
@@ -601,12 +621,12 @@ fn addToReadyListLocked(inst: *EpollInstance, slot: u8) void {
     inst.ready_tail = slot;
 }
 
-fn removeFromReadyList(inst: *EpollInstance, fd: i32) void {
+fn removeFromReadyListSlot(inst: *EpollInstance, slot: u8) void {
     var prev: ?u8 = null;
     var cur = inst.ready_head;
     while (cur) |idx| {
         const next = inst.items[idx].ready_next;
-        if (inst.items[idx].fd == fd) {
+        if (idx == slot) {
             if (prev) |p| {
                 inst.items[p].ready_next = next;
             } else {

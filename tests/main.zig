@@ -195,11 +195,20 @@ test "epoll ctl probes before taking the instance lock" {
     try std.testing.expect(probe < lock);
 }
 
+test "epoll delete removes the exact ready-list slot" {
+    const source = kt.epoll_source;
+    try std.testing.expect(std.mem.indexOf(u8, source, "removeFromReadyListSlot(inst, i)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "fn removeFromReadyListSlot") != null);
+}
+
 test "nested epoll readiness propagates without reacquiring the pool lock" {
     const source = kt.epoll_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "propagateNestedReadyLocked") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "visited: u32") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "pending |= @as(u32, 1) << @intCast(parent)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "target_epoll_generation != epoll_pool[child].generation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "item.events & EPOLLIN == 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "if (item.is_et)") != null);
 }
 
 test "virtio net queue rejects sizes beyond fixed ring storage" {

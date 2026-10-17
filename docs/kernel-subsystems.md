@@ -824,6 +824,7 @@ const SchedStats = struct {
 - epoll pool 生命周期采用 slot generation + transient active borrow；persistent `ref_count` 仅表示 fork/clone fd ownership，pool metadata 到 instance payload 遵守 `pool_lock -> inst.spin`。
 - epoll registration 额外捕获 fd slot incarnation；readiness probe 持有 transfer hold，并校验 live descriptor 的 generation、类型和 resource index，避免 close/reuse 后把旧注册绑定到新 fd。
 - nested epoll 在 child ready transition 后于既有 `pool_lock` 临界区内向父实例传播 ready 状态并唤醒 waiter；传播使用 visited bitmap，避免循环 epoll 图递归获取锁或无限传播。
+- nested propagation 只接受目标 child generation 仍匹配、父 registration 关注 `EPOLLIN` 的项，并遵守 ET 的 `last_reported` 抑制；EPOLL_CTL_DEL 按 ready-list slot 删除，避免 fd 数字复用误删节点。
 - mmap file-cache 命中使用 `getPageFramePinned`：在 `cache_lock` 内先增加映射引用，再把物理帧交给 page-table fault path，避免 eviction 在 lookup 与 `addRef` 之间释放/复用帧。
 - page-cache insertion 在 `cache_lock` 内二次检查 `(inode_id, page_offset)`；并发 miss 不会创建 duplicate key，owned insertion 遇到已存在页面返回 null 并保留 incoming frame 由调用方释放。
 - AArch64 paging facade 的 `isPageMapped` 现在读取真实 user mapping；AArch64/RISC-V `unmapPage` 返回被移除的物理帧，保持 shared paging API 的回收/验证 contract。
