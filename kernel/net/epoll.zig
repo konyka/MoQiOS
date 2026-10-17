@@ -98,10 +98,36 @@ pub const EpollInstance = struct {
     valid: bool = false,
     /// Cross-process references (fork/clone) — epollDestroy frees at 0 only.
     ref_count: u32 = 1,
+    generation: u64 = 1,
+    active_ops: u32 = 0,
+    closing: bool = false,
+};
+
+pub const InstanceBorrow = struct {
+    instance: *EpollInstance,
+    slot: u32,
+    generation: u64,
+    released: bool = false,
+
+    pub fn release(self: *InstanceBorrow) void {
+        if (self.released) return;
+        self.released = true;
+        const saved = pool_lock.acquire();
+        const inst = &epoll_pool[self.slot];
+        if (inst.generation == self.generation and inst.active_ops > 0) {
+            inst.active_ops -= 1;
+            if (inst.closing and inst.active_ops == 0) {
+                const next_generation = inst.generation +% 1;
+                epoll_pool[self.slot] = .{ .generation = next_generation };
+            }
+        }
+        pool_lock.release(saved);
+    }
 };
 
 var wait_deadlines: [task_mod.MAX_TASKS]u64 = @splat(0);
-var wait_instances: [task_mod.MAX_TASKS]usize = @splat(0);
+var wait_instance_slots: [task_mod.MAX_TASKS]u32 = @splat(0);
+var wait_instance_generations: [task_mod.MAX_TASKS]u64 = @splat(0);
 var wait_generations: [task_mod.MAX_TASKS]u64 = @splat(0);
 pub var epoll_wait_bm: u64 = 0;
 
@@ -114,12 +140,22 @@ var valid_epoll_bm: u32 = 0;
 /// pool_lock -> inst.spin (epollNotify may run from IRQ context).
 var pool_lock: IrqSpinlock = .{};
 
-/// Obtain a pointer to an epoll instance by index.
-pub fn getInstance(idx: u32) ?*EpollInstance {
+pub fn acquireInstance(idx: u32) ?InstanceBorrow {
     if (idx >= MAX_EPOLL_INSTANCES) return null;
+    const saved = pool_lock.acquire();
+    defer pool_lock.release(saved);
     const inst = &epoll_pool[idx];
-    if (!inst.valid) return null;
-    return inst;
+    if (!inst.valid or inst.closing) return null;
+    inst.active_ops += 1;
+    return .{ .instance = inst, .slot = idx, .generation = inst.generation };
+}
+
+fn epollSlotOf(inst: *const EpollInstance) u32 {
+    return @intCast((@intFromPtr(inst) - @intFromPtr(&epoll_pool[0])) / @sizeOf(EpollInstance));
+}
+
+fn instanceGenerationOf(inst: *const EpollInstance) u64 {
+    return inst.generation;
 }
 
 // ---- Public API ----
@@ -131,20 +167,32 @@ pub fn epollCreate() i32 {
     const psaved = pool_lock.acquire();
     defer pool_lock.release(psaved);
     const all_mask: u32 = if (MAX_EPOLL_INSTANCES >= 32) 0xFFFFFFFF else (@as(u32, 1) << MAX_EPOLL_INSTANCES) - 1;
-    const free_mask = ~valid_epoll_bm & all_mask;
-    if (free_mask == 0) return @intCast(EMFILE);
-    const i: u5 = @intCast(@ctz(free_mask));
+    var free_mask = ~valid_epoll_bm & all_mask;
+    var selected: ?u5 = null;
+    while (free_mask != 0) {
+        const candidate: u5 = @intCast(@ctz(free_mask));
+        free_mask &= free_mask - 1;
+        if (!epoll_pool[candidate].closing) {
+            selected = candidate;
+            break;
+        }
+    }
+    const i = selected orelse return @intCast(EMFILE);
+    const generation = epoll_pool[i].generation;
     valid_epoll_bm |= @as(u32, 1) << i;
     epoll_pool[i] = .{
         .owner_task_idx = cur_idx,
         .valid = true,
+        .generation = generation,
     };
     return @intCast(i);
 }
 
 /// Control an epoll instance — add, modify, or delete an fd registration.
 pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
-    const inst = getInstance(epfd_idx) orelse return EBADF;
+    var borrow = acquireInstance(epfd_idx) orelse return EBADF;
+    defer borrow.release();
+    const inst = borrow.instance;
     if (fd < 0) return EBADF;
 
     const cur_idx = sched.currentTaskIndex() orelse return EBADF;
@@ -197,7 +245,7 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
 
             const current = computeCurrentEvents(desc.fd_type, resourceIdxFromDesc(desc), desc.offset);
             if (current & (ev.events & ~EPOLLET & ~EPOLLONESHOT) != 0) {
-                addToReadyList(inst, @intCast(s));
+                addToReadyListLocked(inst, @intCast(s));
             }
         },
         EPOLL_CTL_MOD => {
@@ -221,7 +269,7 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
                         if (!item.on_ready) {
                             const current = computeCurrentEvents(item.fd_type, item.resource_idx, desc.offset);
                             if (current & (ev.events & ~EPOLLET & ~EPOLLONESHOT) != 0) {
-                                addToReadyList(inst, i);
+                                addToReadyListLocked(inst, i);
                             }
                         }
                         break;
@@ -260,7 +308,9 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
 /// Wait for events on an epoll instance.
 pub fn epollWait(epfd_idx: u32, events_buf: u64, max_events: u32, timeout_ms: i32) i64 {
     if (max_events == 0 or max_events > MAX_EPOLL_ITEMS) return EINVAL;
-    const inst = getInstance(epfd_idx) orelse return EBADF;
+    var borrow = acquireInstance(epfd_idx) orelse return EBADF;
+    defer borrow.release();
+    const inst = borrow.instance;
     const max_out: u32 = @min(max_events, MAX_EPOLL_ITEMS);
     const copy = @import("../mm/copy_from_user.zig");
     if (!copy.validateUserBufferWritable(events_buf, @as(usize, max_out) * @sizeOf(EpollEvent))) return -14; // EFAULT
@@ -425,7 +475,9 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32, kmsg_cursor: u64
             }
         },
         .epoll => {
-            const inst = getInstance(resource_idx) orelse return EPOLLERR;
+            var borrow = acquireInstance(resource_idx) orelse return EPOLLERR;
+            defer borrow.release();
+            const inst = borrow.instance;
             if (inst.ready_head != null) revents |= EPOLLIN;
             revents |= EPOLLOUT;
         },
@@ -603,7 +655,8 @@ fn blockOnEpoll(inst: *EpollInstance, deadline_ns: ?u64) BlockOutcome {
 
     if (deadline_ns) |d| {
         @atomicStore(u64, &wait_deadlines[my_idx], d, .seq_cst);
-        @atomicStore(usize, &wait_instances[my_idx], @intFromPtr(inst), .seq_cst);
+        @atomicStore(u32, &wait_instance_slots[my_idx], epollSlotOf(inst), .seq_cst);
+        @atomicStore(u64, &wait_instance_generations[my_idx], instanceGenerationOf(inst), .seq_cst);
         _ = @atomicRmw(u64, &epoll_wait_bm, .Or, @as(u64, 1) << @intCast(my_idx), .seq_cst);
     }
 
@@ -649,7 +702,8 @@ fn blockOnEpoll(inst: *EpollInstance, deadline_ns: ?u64) BlockOutcome {
 fn disarmWaitDeadline(task_idx: u32, generation: u64) void {
     if (@atomicLoad(u64, &wait_generations[task_idx], .seq_cst) != generation) return;
     @atomicStore(u64, &wait_deadlines[task_idx], 0, .seq_cst);
-    @atomicStore(usize, &wait_instances[task_idx], 0, .seq_cst);
+    @atomicStore(u32, &wait_instance_slots[task_idx], 0, .seq_cst);
+    @atomicStore(u64, &wait_instance_generations[task_idx], 0, .seq_cst);
     _ = @atomicRmw(u64, &epoll_wait_bm, .And, ~(@as(u64, 1) << @intCast(task_idx)), .seq_cst);
 }
 
@@ -664,12 +718,19 @@ pub fn timerTick(now_ns: u64) void {
         const deadline = @atomicLoad(u64, &wait_deadlines[idx], .seq_cst);
         if (deadline == 0 or now_ns < deadline) continue;
         const generation = @atomicLoad(u64, &wait_generations[idx], .seq_cst);
-        const inst_addr = @atomicLoad(usize, &wait_instances[idx], .seq_cst);
-        if (inst_addr == 0) {
+        const inst_slot = @atomicLoad(u32, &wait_instance_slots[idx], .seq_cst);
+        const inst_generation = @atomicLoad(u64, &wait_instance_generations[idx], .seq_cst);
+        if (inst_slot >= MAX_EPOLL_INSTANCES or inst_generation == 0) {
             disarmWaitDeadline(idx, generation);
             continue;
         }
-        const inst: *EpollInstance = @ptrFromInt(inst_addr);
+        var borrow = acquireInstance(inst_slot) orelse {
+            disarmWaitDeadline(idx, generation);
+            continue;
+        };
+        defer borrow.release();
+        if (borrow.generation != inst_generation) continue;
+        const inst = borrow.instance;
         const saved = inst.spin.acquire();
         var prev: ?*WaitNode = null;
         var current = inst.waiter;
@@ -677,7 +738,8 @@ pub fn timerTick(now_ns: u64) void {
         while (current) |node| {
             if (node.task_idx == idx and node.generation == generation and
                 @atomicLoad(u64, &wait_deadlines[idx], .seq_cst) == deadline and
-                @atomicLoad(usize, &wait_instances[idx], .seq_cst) == @intFromPtr(inst)) {
+                @atomicLoad(u32, &wait_instance_slots[idx], .seq_cst) == inst_slot and
+                @atomicLoad(u64, &wait_instance_generations[idx], .seq_cst) == inst_generation) {
                 if (prev) |p| p.next = node.next else inst.waiter = node.next;
                 node.next = null;
                 unlinked = true;
@@ -736,14 +798,21 @@ pub fn epollRetain(epoll_idx: u32) void {
 pub fn epollDestroy(epoll_idx: u32) void {
     if (epoll_idx >= MAX_EPOLL_INSTANCES) return;
     const psaved = pool_lock.acquire();
-    defer pool_lock.release(psaved);
     const inst = &epoll_pool[epoll_idx];
+    if (!inst.valid or inst.closing) {
+        pool_lock.release(psaved);
+        return;
+    }
     // Shared across fork/clone: drop one reference, free only at zero.
     if (inst.valid and inst.ref_count > 1) {
         inst.ref_count -= 1;
+        pool_lock.release(psaved);
         return;
     }
-    // Take the instance lock before wiping: an IRQ-side epollNotify may hold
+    inst.closing = true;
+    inst.valid = false;
+    valid_epoll_bm &= ~(@as(u32, 1) << @intCast(epoll_idx));
+    // Take the instance lock before detaching: an IRQ-side epollNotify may hold
     // it — wait for that critical section to finish.
     const isaved = inst.spin.acquire();
     // Wait nodes live on blocked waiters' kernel stacks. Snapshot the complete
@@ -768,14 +837,8 @@ pub fn epollDestroy(epoll_idx: u32) void {
         @atomicStore(bool, &node.granted, true, .release);
         detached = next;
     }
-    if (epoll_idx < 32) {
-        valid_epoll_bm &= ~(@as(u32, 1) << @intCast(epoll_idx));
-    }
-    // Wipe the instance but preserve the lock word we are holding.
-    const spin = inst.spin;
-    epoll_pool[epoll_idx] = .{};
-    inst.spin = spin;
     inst.spin.release(isaved);
+    pool_lock.release(psaved);
 
     // The instance is detached before any task is woken. Deadline state is
     // cleared only if this node still owns the matching task generation.
@@ -789,4 +852,10 @@ pub fn epollDestroy(epoll_idx: u32) void {
             }
         }
     }
+    const final_lock = pool_lock.acquire();
+    if (inst.active_ops == 0 and inst.closing) {
+        const generation = inst.generation +% 1;
+        epoll_pool[epoll_idx] = .{ .generation = generation };
+    }
+    pool_lock.release(final_lock);
 }

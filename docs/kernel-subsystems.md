@@ -821,6 +821,7 @@ const SchedStats = struct {
 - splice 的 pipe→file/socket reservation 路径在阻塞模式下等待 live pipe 数据；`SPLICE_F_NONBLOCK` 或 descriptor `O_NONBLOCK` 返回零进度 `EAGAIN`，写端关闭保持 EOF。pipe→pipe 的完整阻塞 transfer 仍是后续项。
 - pipe→pipe splice 在零进度时返回 `EAGAIN`，避免 destination-full 或空源 pipe 被伪报为 EOF/成功；完整阻塞 source/destination wait queue 语义仍是后续项。
 - `fsync`/`fdatasync` 仅接受 ext2/FAT32 regular-file descriptors；pipe、socket、eventfd 等非文件描述符返回 `EINVAL`。
+- epoll pool 生命周期采用 slot generation + transient active borrow；persistent `ref_count` 仅表示 fork/clone fd ownership，pool metadata 到 instance payload 遵守 `pool_lock -> inst.spin`。
 - mmap file-cache 命中使用 `getPageFramePinned`：在 `cache_lock` 内先增加映射引用，再把物理帧交给 page-table fault path，避免 eviction 在 lookup 与 `addRef` 之间释放/复用帧。
 - page-cache insertion 在 `cache_lock` 内二次检查 `(inode_id, page_offset)`；并发 miss 不会创建 duplicate key，owned insertion 遇到已存在页面返回 null 并保留 incoming frame 由调用方释放。
 - AArch64 paging facade 的 `isPageMapped` 现在读取真实 user mapping；AArch64/RISC-V `unmapPage` 返回被移除的物理帧，保持 shared paging API 的回收/验证 contract。
