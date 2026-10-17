@@ -108,6 +108,7 @@ test "non-x86 paging facades preserve mapping query and unmap contracts" {
     try std.testing.expect(std.mem.indexOf(u8, riscv, "sv39.unmapPage") != null);
     try std.testing.expect(std.mem.indexOf(u8, aarch, "return false;\n    }\n\n    pub fn mapHugePage") == null);
     try std.testing.expect(std.mem.indexOf(u8, aarch, "a64pag.isUserWritable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aarch, "a64pag.isMapped") != null);
     try std.testing.expect(std.mem.indexOf(u8, riscv, "sv39.isUserWritable") != null);
     try std.testing.expect(std.mem.indexOf(u8, aarch, "error.UnsupportedHugePage") != null);
     try std.testing.expect(std.mem.indexOf(u8, riscv, "error.UnsupportedHugePage") != null);
@@ -121,6 +122,8 @@ test "AArch64 writable pages require EL0 access and RW AP bits" {
     try std.testing.expect(std.mem.indexOf(u8, body, "ap_el0") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "leaf & ap_el0") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "leaf & ap_rw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "if ((l2d & DESC_VALID) == 0) return false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "if ((l3d & DESC_VALID) == 0) return false") != null);
 }
 
 test "AArch64 timer has one hardware timer service owner" {

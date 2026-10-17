@@ -112,7 +112,7 @@ pub const paging = struct {
 
     pub fn isPageMapped(pml4_phys: u64, virt: u64) bool {
         _ = pml4_phys;
-        return a64pag.isUserMapped(@intCast(virt));
+        return a64pag.isMapped(@intCast(virt));
     }
 
     pub fn mapHugePage(pml4_phys: u64, virt: u64, phys: u64, flags: MapFlags) !void {

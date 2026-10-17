@@ -163,11 +163,25 @@ pub fn isUserMapped(va: usize) bool {
     return (l3d & (@as(u64, 1) << 6)) != 0; // page: AP[1]
 }
 
+pub fn isMapped(va: usize) bool {
+    const l1d = tableAt(root_phys)[idxL1(va)];
+    if ((l1d & (DESC_VALID | DESC_TABLE)) != (DESC_VALID | DESC_TABLE)) return false;
+    const l2d = tableAt(@intCast(l1d & 0x0000fffffffff000))[idxL2(va)];
+    if ((l2d & DESC_VALID) == 0) return false;
+    if ((l2d & DESC_TABLE) == 0) return true;
+    return (tableAt(@intCast(l2d & 0x0000fffffffff000))[idxL3(va)] & DESC_VALID) != 0;
+}
+
 pub fn isUserWritable(va: usize) bool {
     const l1d = tableAt(root_phys)[idxL1(va)];
     if ((l1d & (DESC_VALID | DESC_TABLE)) != (DESC_VALID | DESC_TABLE)) return false;
     const l2d = tableAt(@intCast(l1d & 0x0000fffffffff000))[idxL2(va)];
-    const leaf = if ((l2d & DESC_TABLE) == 0) l2d else tableAt(@intCast(l2d & 0x0000fffffffff000))[idxL3(va)];
+    if ((l2d & DESC_VALID) == 0) return false;
+    const leaf = if ((l2d & DESC_TABLE) == 0) l2d else blk: {
+        const l3d = tableAt(@intCast(l2d & 0x0000fffffffff000))[idxL3(va)];
+        if ((l3d & DESC_VALID) == 0) return false;
+        break :blk l3d;
+    };
     const ap_el0 = @as(u64, 1) << 6;
     const ap_rw = @as(u64, 1) << 7;
     return (leaf & DESC_VALID) != 0 and (leaf & ap_el0) != 0 and (leaf & ap_rw) == 0;
