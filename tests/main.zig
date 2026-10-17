@@ -183,6 +183,23 @@ test "epoll registrations validate fd slot incarnations" {
     try std.testing.expect(std.mem.indexOf(u8, epoll, "fd_generation: u64") != null);
     try std.testing.expect(std.mem.indexOf(u8, epoll, "acquireTransferFd") != null);
     try std.testing.expect(std.mem.indexOf(u8, epoll, "snapshotFdIdentity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, epoll, "registration_generation: u64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, epoll, "item.registration_generation == snapshot.registration_generation") != null);
+}
+
+test "epoll ctl probes before taking the instance lock" {
+    const source = kt.epoll_source;
+    const ctl = std.mem.indexOf(u8, source, "pub fn epollCtl").?;
+    const lock = std.mem.indexOfPos(u8, source, ctl, "const saved = inst.spin.acquire();").?;
+    const probe = std.mem.indexOfPos(u8, source, ctl, "const current = computeCurrentEvents").?;
+    try std.testing.expect(probe < lock);
+}
+
+test "nested epoll readiness propagates without reacquiring the pool lock" {
+    const source = kt.epoll_source;
+    try std.testing.expect(std.mem.indexOf(u8, source, "propagateNestedReadyLocked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "visited: u32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "pending |= @as(u32, 1) << @intCast(parent)") != null);
 }
 
 test "virtio net queue rejects sizes beyond fixed ring storage" {

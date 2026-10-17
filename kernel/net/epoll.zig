@@ -73,6 +73,7 @@ const WaitNode = struct {
 pub const EpollItem = struct {
     fd: i32 = -1,
     fd_generation: u64 = 0,
+    registration_generation: u64 = 0,
     events: u32 = 0,
     data: u64 = 0,
     fd_type: vfs.FdType = .none,
@@ -102,6 +103,7 @@ pub const EpollInstance = struct {
     generation: u64 = 1,
     active_ops: u32 = 0,
     closing: bool = false,
+    next_registration_generation: u64 = 1,
 };
 
 pub const InstanceBorrow = struct {
@@ -201,6 +203,9 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
     if (fd >= @as(i32, @intCast(vfs.MAX_FDS))) return EBADF;
     const identity = cur.fd_table.snapshotFdIdentity(@intCast(fd)) orelse return EBADF;
     const desc = &identity.desc;
+    if (!cur.fd_table.acquireTransferFd(@intCast(fd))) return EBADF;
+    defer cur.fd_table.releaseTransferFd(@intCast(fd));
+    const current = computeCurrentEvents(desc.fd_type, resourceIdxFromDesc(desc), desc.offset);
 
     const saved = inst.spin.acquire();
     defer inst.spin.release(saved);
@@ -214,7 +219,7 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
                     const bit = @ctz(bits);
                     bits &= bits - 1;
                     const i: u8 = @intCast(w * 64 + @as(u32, bit));
-                    if (inst.items[i].fd == fd) return EEXIST;
+                    if (inst.items[i].fd == fd and inst.items[i].fd_generation == identity.generation) return EEXIST;
                 }
             }
             var slot: ?u8 = null;
@@ -234,6 +239,7 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
             inst.items[s] = .{
                 .fd = fd,
                 .fd_generation = identity.generation,
+                .registration_generation = inst.next_registration_generation,
                 .events = ev.events,
                 .data = ev.data,
                 .fd_type = desc.fd_type,
@@ -242,10 +248,10 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
                 .is_oneshot = (ev.events & EPOLLONESHOT) != 0,
                 .in_use = true,
             };
+            inst.next_registration_generation +%= 1;
             inst.item_count += 1;
             inst.in_use_bm[s >> 6] |= @as(u64, 1) << @intCast(s & 63);
 
-            const current = computeCurrentEvents(desc.fd_type, resourceIdxFromDesc(desc), desc.offset);
             if (current & (ev.events & ~EPOLLET & ~EPOLLONESHOT) != 0) {
                 addToReadyListLocked(inst, @intCast(s));
             }
@@ -259,7 +265,9 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
                     bits &= bits - 1;
                     const i: u8 = @intCast(w * 64 + @as(u32, bit));
                     const item = &inst.items[i];
-                    if (item.fd == fd) {
+                    if (item.fd == fd and item.fd_generation == identity.generation and
+                        item.fd_type == desc.fd_type and item.resource_idx == resourceIdxFromDesc(desc))
+                    {
                         const ev = copyEventFromUser(event_ptr) orelse return EINVAL;
                         item.events = ev.events;
                         item.data = ev.data;
@@ -269,7 +277,6 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
                         item.last_reported = 0;
                         found = true;
                         if (!item.on_ready) {
-                            const current = computeCurrentEvents(item.fd_type, item.resource_idx, desc.offset);
                             if (current & (ev.events & ~EPOLLET & ~EPOLLONESHOT) != 0) {
                                 addToReadyListLocked(inst, i);
                             }
@@ -289,7 +296,10 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
                     const bit = @ctz(bits);
                     bits &= bits - 1;
                     const i: u8 = @intCast(w * 64 + @as(u32, bit));
-                    if (inst.items[i].fd == fd) {
+                    if (inst.items[i].fd == fd and inst.items[i].fd_generation == identity.generation and
+                        inst.items[i].fd_type == desc.fd_type and
+                        inst.items[i].resource_idx == resourceIdxFromDesc(desc))
+                    {
                         if (inst.items[i].on_ready) removeFromReadyList(inst, inst.items[i].fd);
                         inst.items[i] = .{};
                         inst.in_use_bm[w] &= ~(@as(u64, 1) << @intCast(bit));
@@ -349,6 +359,7 @@ pub fn epollNotify(fd_type: vfs.FdType, resource_idx: u32, ready_events: u32) vo
     // and instance storage, and may run concurrently on another CPU.
     const psaved = pool_lock.acquire();
     defer pool_lock.release(psaved);
+    var newly_ready: u32 = 0;
     var ebm = valid_epoll_bm;
     while (ebm != 0) {
         const ei = @ctz(ebm);
@@ -378,12 +389,58 @@ pub fn epollNotify(fd_type: vfs.FdType, resource_idx: u32, ready_events: u32) vo
 
                 if (!item.on_ready) {
                     addToReadyListLocked(inst, i);
+                    newly_ready |= @as(u32, 1) << @intCast(ei);
                 }
             }
         }
 
         wakeWaiterLocked(inst);
         inst.spin.release(saved);
+    }
+    propagateNestedReadyLocked(newly_ready);
+}
+
+/// Propagate child-epoll readiness while pool_lock is already held. Keeping
+/// this as an iterative walk avoids recursive pool-lock acquisition and also
+/// bounds cyclic epoll graphs with the visited bitmap.
+fn propagateNestedReadyLocked(initial: u32) void {
+    var pending = initial;
+    var visited: u32 = 0;
+    while (pending != 0) {
+        const child = @ctz(pending);
+        pending &= pending - 1;
+        const child_bit = @as(u32, 1) << @intCast(child);
+        if ((visited & child_bit) != 0) continue;
+        visited |= child_bit;
+
+        var ebm = valid_epoll_bm;
+        while (ebm != 0) {
+            const parent = @ctz(ebm);
+            ebm &= ebm - 1;
+            if (parent == child) continue;
+            const parent_inst = &epoll_pool[parent];
+            const saved = parent_inst.spin.acquire();
+            var became_ready = false;
+            for (0..2) |w| {
+                var bits = parent_inst.in_use_bm[w];
+                while (bits != 0) {
+                    const bit = @ctz(bits);
+                    bits &= bits - 1;
+                    const item_idx: u8 = @intCast(w * 64 + @as(u32, bit));
+                    const item = &parent_inst.items[item_idx];
+                    if (item.is_disabled or item.fd_type != .epoll or item.resource_idx != child) continue;
+                    if (!item.on_ready) {
+                        addToReadyListLocked(parent_inst, item_idx);
+                        became_ready = true;
+                    }
+                }
+            }
+            if (became_ready) {
+                wakeWaiterLocked(parent_inst);
+                pending |= @as(u32, 1) << @intCast(parent);
+            }
+            parent_inst.spin.release(saved);
+        }
     }
 }
 
@@ -575,6 +632,7 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
         slot: u8,
         fd: i32,
         fd_generation: u64,
+        registration_generation: u64,
         fd_type: vfs.FdType,
         resource_idx: u32,
         events: u32,
@@ -610,6 +668,7 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
             .slot = idx,
             .fd = item.fd,
             .fd_generation = item.fd_generation,
+            .registration_generation = item.registration_generation,
             .fd_type = item.fd_type,
             .resource_idx = item.resource_idx,
             .events = item.events,
@@ -649,6 +708,8 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
         const update_saved = inst.spin.acquire();
         const item = &inst.items[snapshot.slot];
         const still_registered = item.in_use and item.fd == snapshot.fd and
+            item.fd_generation == snapshot.fd_generation and
+            item.registration_generation == snapshot.registration_generation and
             item.fd_type == snapshot.fd_type and item.resource_idx == snapshot.resource_idx;
         if (still_registered and count < max_out) {
             out[count] = .{
