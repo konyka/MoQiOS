@@ -567,6 +567,19 @@ fn removeFromReadyList(inst: *EpollInstance, fd: i32) void {
 fn collectEvents(inst: *EpollInstance, out: []EpollEvent, max_out: u32) u32 {
     const saved = inst.spin.acquire();
 
+    const ReadySnapshot = struct {
+        slot: u8,
+        fd: i32,
+        fd_type: vfs.FdType,
+        resource_idx: u32,
+        events: u32,
+        data: u64,
+        is_et: bool,
+        is_oneshot: bool,
+        kmsg_cursor: u64,
+    };
+    var snapshots: [MAX_EPOLL_ITEMS]ReadySnapshot = undefined;
+    var snapshot_count: usize = 0;
     const scan_head = inst.ready_head;
     inst.ready_head = null;
     inst.ready_tail = null;
@@ -588,31 +601,52 @@ fn collectEvents(inst: *EpollInstance, out: []EpollEvent, max_out: u32) u32 {
             continue;
         }
 
-        const current = computeCurrentEvents(item.fd_type, item.resource_idx, kmsgCursorForItem(inst, item.fd));
-        const interest = item.events & ~EPOLLET & ~EPOLLONESHOT;
-        const matched = current & interest;
-        const always_report = current & (EPOLLERR | EPOLLHUP);
-        const final_events = matched | always_report;
-
-        if (final_events != 0 and count < max_out) {
-            out[count] = .{
-                .events = final_events,
-                .data = item.data,
-            };
-            count += 1;
-
-            if (item.is_oneshot) {
-                item.is_disabled = true;
-            } else if (!item.is_et) {
-                if (matched != 0) {
-                    addToReadyListLocked(inst, @intCast(idx));
-                }
-            }
-        }
+        snapshots[snapshot_count] = .{
+            .slot = idx,
+            .fd = item.fd,
+            .fd_type = item.fd_type,
+            .resource_idx = item.resource_idx,
+            .events = item.events,
+            .data = item.data,
+            .is_et = item.is_et,
+            .is_oneshot = item.is_oneshot,
+            .kmsg_cursor = kmsgCursorForItem(inst, item.fd),
+        };
+        snapshot_count += 1;
         cur = next;
     }
 
     inst.spin.release(saved);
+
+    // Readiness probes may acquire another epoll instance. Do them without
+    // holding the parent spinlock, preserving pool_lock -> inst.spin order.
+    for (snapshots[0..snapshot_count]) |snapshot| {
+        const current = computeCurrentEvents(snapshot.fd_type, snapshot.resource_idx, snapshot.kmsg_cursor);
+        const interest = snapshot.events & ~EPOLLET & ~EPOLLONESHOT;
+        const matched = current & interest;
+        const always_report = current & (EPOLLERR | EPOLLHUP);
+        const final_events = matched | always_report;
+        if (final_events == 0) continue;
+
+        const update_saved = inst.spin.acquire();
+        const item = &inst.items[snapshot.slot];
+        const still_registered = item.in_use and item.fd == snapshot.fd and
+            item.fd_type == snapshot.fd_type and item.resource_idx == snapshot.resource_idx;
+        if (still_registered and count < max_out) {
+            out[count] = .{
+                .events = final_events,
+                .data = snapshot.data,
+            };
+            count += 1;
+
+            if (snapshot.is_oneshot) {
+                item.is_disabled = true;
+            } else if (!snapshot.is_et and matched != 0) {
+                addToReadyListLocked(inst, snapshot.slot);
+            }
+        }
+        inst.spin.release(update_saved);
+    }
     return count;
 }
 
@@ -739,7 +773,8 @@ pub fn timerTick(now_ns: u64) void {
             if (node.task_idx == idx and node.generation == generation and
                 @atomicLoad(u64, &wait_deadlines[idx], .seq_cst) == deadline and
                 @atomicLoad(u32, &wait_instance_slots[idx], .seq_cst) == inst_slot and
-                @atomicLoad(u64, &wait_instance_generations[idx], .seq_cst) == inst_generation) {
+                @atomicLoad(u64, &wait_instance_generations[idx], .seq_cst) == inst_generation)
+            {
                 if (prev) |p| p.next = node.next else inst.waiter = node.next;
                 node.next = null;
                 unlinked = true;

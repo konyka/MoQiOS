@@ -162,8 +162,16 @@ test "epoll immediate-ready control uses locked ready helper" {
 
 test "epoll operational callers use borrowed instances instead of raw lookup" {
     const source = kt.epoll_source;
-    try std.testing.expect(std.mem.count(u8, source, "getInstance(") == 1);
+    try std.testing.expect(std.mem.count(u8, source, "getInstance(") == 0);
     try std.testing.expect(std.mem.count(u8, source, "acquireInstance(") >= 4);
+}
+
+test "nested epoll probes do not hold the parent instance lock" {
+    const source = kt.epoll_source;
+    const collect = std.mem.indexOf(u8, source, "fn collectEvents").?;
+    const release = std.mem.indexOfPos(u8, source, collect, "inst.spin.release(saved);").?;
+    const probe = std.mem.indexOfPos(u8, source, collect, "computeCurrentEvents").?;
+    try std.testing.expect(release < probe);
 }
 
 test "virtio net queue rejects sizes beyond fixed ring storage" {
