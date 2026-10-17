@@ -72,6 +72,7 @@ const WaitNode = struct {
 /// EpollItem — per-fd registration within an epoll instance.
 pub const EpollItem = struct {
     fd: i32 = -1,
+    fd_generation: u64 = 0,
     events: u32 = 0,
     data: u64 = 0,
     fd_type: vfs.FdType = .none,
@@ -198,8 +199,8 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
     const cur_idx = sched.currentTaskIndex() orelse return EBADF;
     const cur = task_mod.getTask(cur_idx) orelse return EBADF;
     if (fd >= @as(i32, @intCast(vfs.MAX_FDS))) return EBADF;
-    const desc = &cur.fd_table.fds[@as(u32, @intCast(fd))];
-    if (desc.fd_type == .none) return EBADF;
+    const identity = cur.fd_table.snapshotFdIdentity(@intCast(fd)) orelse return EBADF;
+    const desc = &identity.desc;
 
     const saved = inst.spin.acquire();
     defer inst.spin.release(saved);
@@ -232,6 +233,7 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
 
             inst.items[s] = .{
                 .fd = fd,
+                .fd_generation = identity.generation,
                 .events = ev.events,
                 .data = ev.data,
                 .fd_type = desc.fd_type,
@@ -314,6 +316,8 @@ pub fn epollWait(epfd_idx: u32, events_buf: u64, max_events: u32, timeout_ms: i3
     const max_out: u32 = @min(max_events, MAX_EPOLL_ITEMS);
     const copy = @import("../mm/copy_from_user.zig");
     if (!copy.validateUserBufferWritable(events_buf, @as(usize, max_out) * @sizeOf(EpollEvent))) return -14; // EFAULT
+    const cur_idx = sched.currentTaskIndex() orelse return EBADF;
+    const cur = task_mod.getTask(cur_idx) orelse return EBADF;
 
     const deadline_ns = epoll_policy.timeoutDeadlineNs(tsc.nanos(), timeout_ms);
 
@@ -321,7 +325,7 @@ pub fn epollWait(epfd_idx: u32, events_buf: u64, max_events: u32, timeout_ms: i3
         // Woken by epollDestroy: the instance is gone, report EBADF.
         if (!inst.valid) return EBADF;
         var out_events: [MAX_EPOLL_ITEMS]EpollEvent = undefined;
-        const n = collectEvents(inst, &out_events, max_out);
+        const n = collectEvents(inst, cur.fd_table, &out_events, max_out);
         if (n > 0) {
             const bytes: usize = @as(usize, n) * @sizeOf(EpollEvent);
             if (copy.copyToUser(@ptrFromInt(events_buf), @ptrCast(&out_events), bytes) != bytes) return -14; // EFAULT
@@ -564,12 +568,13 @@ fn removeFromReadyList(inst: *EpollInstance, fd: i32) void {
     }
 }
 
-fn collectEvents(inst: *EpollInstance, out: []EpollEvent, max_out: u32) u32 {
+fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent, max_out: u32) u32 {
     const saved = inst.spin.acquire();
 
     const ReadySnapshot = struct {
         slot: u8,
         fd: i32,
+        fd_generation: u64,
         fd_type: vfs.FdType,
         resource_idx: u32,
         events: u32,
@@ -604,6 +609,7 @@ fn collectEvents(inst: *EpollInstance, out: []EpollEvent, max_out: u32) u32 {
         snapshots[snapshot_count] = .{
             .slot = idx,
             .fd = item.fd,
+            .fd_generation = item.fd_generation,
             .fd_type = item.fd_type,
             .resource_idx = item.resource_idx,
             .events = item.events,
@@ -621,12 +627,24 @@ fn collectEvents(inst: *EpollInstance, out: []EpollEvent, max_out: u32) u32 {
     // Readiness probes may acquire another epoll instance. Do them without
     // holding the parent spinlock, preserving pool_lock -> inst.spin order.
     for (snapshots[0..snapshot_count]) |snapshot| {
+        if (snapshot.fd < 0 or !fd_table.acquireTransferFd(@intCast(snapshot.fd))) continue;
+        const target_identity = fd_table.snapshotFdIdentity(@intCast(snapshot.fd));
+        if (target_identity == null or target_identity.?.generation != snapshot.fd_generation or
+            target_identity.?.desc.fd_type != snapshot.fd_type or
+            resourceIdxFromDesc(&target_identity.?.desc) != snapshot.resource_idx)
+        {
+            fd_table.releaseTransferFd(@intCast(snapshot.fd));
+            continue;
+        }
         const current = computeCurrentEvents(snapshot.fd_type, snapshot.resource_idx, snapshot.kmsg_cursor);
         const interest = snapshot.events & ~EPOLLET & ~EPOLLONESHOT;
         const matched = current & interest;
         const always_report = current & (EPOLLERR | EPOLLHUP);
         const final_events = matched | always_report;
-        if (final_events == 0) continue;
+        if (final_events == 0) {
+            fd_table.releaseTransferFd(@intCast(snapshot.fd));
+            continue;
+        }
 
         const update_saved = inst.spin.acquire();
         const item = &inst.items[snapshot.slot];
@@ -646,6 +664,7 @@ fn collectEvents(inst: *EpollInstance, out: []EpollEvent, max_out: u32) u32 {
             }
         }
         inst.spin.release(update_saved);
+        fd_table.releaseTransferFd(@intCast(snapshot.fd));
     }
     return count;
 }

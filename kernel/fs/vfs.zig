@@ -533,6 +533,8 @@ fn slotLifecycle(state: u32) u32 {
 /// Per-process FD table.
 pub const FdTable = struct {
     fds: [MAX_FDS]FileDescriptor,
+    /// Incarnation of each numeric fd slot; incremented whenever the slot is released.
+    fd_generations: [MAX_FDS]u64 = @splat(1),
     /// Transfer holds keep slots and their underlying resources stable while
     /// sendfile/splice may block. The top two bits encode the slot lifecycle;
     /// the remaining bits count transfer holds.
@@ -563,7 +565,7 @@ pub const FdTable = struct {
     /// does NOT need a ~57KB stack local — important because FdTable is large
     /// and an on-stack temporary here overflowed the kernel stack at boot.
     const default_table: FdTable = blk: {
-        var table: FdTable = .{ .fds = @splat(.{}), .transfer_state = @splat(SLOT_FREE) };
+        var table: FdTable = .{ .fds = @splat(.{}), .fd_generations = @splat(1), .transfer_state = @splat(SLOT_FREE) };
         table.fds[FD_STDIN] = .{ .fd_type = .special };
         table.fds[FD_STDOUT] = .{ .fd_type = .special, .writable = true };
         table.fds[FD_STDERR] = .{ .fd_type = .special, .writable = true };
@@ -582,6 +584,20 @@ pub const FdTable = struct {
         const src: [*]const u8 = @ptrCast(&default_table);
         const out: [*]u8 = @ptrCast(dst);
         @memcpy(out[0..@sizeOf(FdTable)], src[0..@sizeOf(FdTable)]);
+    }
+
+    pub const FdIdentity = struct {
+        desc: FileDescriptor,
+        generation: u64,
+    };
+
+    /// Snapshot a live descriptor and its slot incarnation under the slot lock.
+    pub fn snapshotFdIdentity(self: *FdTable, fd: u32) ?FdIdentity {
+        if (fd >= MAX_FDS) return null;
+        const flags = self.slot_locks[fd].acquire();
+        defer self.slot_locks[fd].release(flags);
+        if (slotLifecycle(@atomicLoad(u32, &self.transfer_state[fd], .acquire)) != SLOT_LIVE) return null;
+        return .{ .desc = self.fds[fd], .generation = self.fd_generations[fd] };
     }
 
     /// Allocate the lowest free fd slot at or above min_fd. The table's
@@ -634,7 +650,7 @@ pub const FdTable = struct {
     }
 
     /// Copy a fully initialized descriptor into a fresh table and publish it.
-    pub fn installInheritedFd(self: *FdTable, fd: u32, desc: FileDescriptor) void {
+    pub fn installInheritedFd(self: *FdTable, fd: u32, desc: FileDescriptor, generation: u64) void {
         if (fd >= MAX_FDS or desc.fd_type == .none) return;
         const flags = self.slot_locks[fd].acquire();
         defer self.slot_locks[fd].release(flags);
@@ -642,6 +658,7 @@ pub const FdTable = struct {
         const expected = if (slotLifecycle(state) == SLOT_LIVE) SLOT_LIVE else SLOT_FREE;
         if (@cmpxchgStrong(u32, &self.transfer_state[fd], expected, SLOT_INITIALIZING, .acq_rel, .acquire) != null) return;
         self.fds[fd] = desc;
+        self.fd_generations[fd] = generation;
         @atomicStore(u32, &self.transfer_state[fd], SLOT_LIVE, .release);
     }
 
@@ -679,7 +696,7 @@ pub const FdTable = struct {
             child.free_bm = child_free_bm;
             for (0..MAX_FDS) |i| {
                 if (!held[i]) continue;
-                child.installInheritedFd(@intCast(i), snapshot[i]);
+                child.installInheritedFd(@intCast(i), snapshot[i], self.fd_generations[i]);
                 switch (snapshot[i].fd_type) {
                     .pipe_read, .pipe_write => {
                         const pidx = snapshot[i].pipe_idx;
@@ -753,6 +770,7 @@ pub const FdTable = struct {
 
     fn releaseFreeSlotLocked(self: *FdTable, fd: u32) void {
         self.fds[fd] = .{};
+        self.fd_generations[fd] +%= 1;
         @atomicStore(u32, &self.transfer_state[fd], SLOT_FREE, .release);
         _ = @atomicRmw(u64, &self.free_bm, .Or, @as(u64, 1) << @intCast(fd), .release);
     }

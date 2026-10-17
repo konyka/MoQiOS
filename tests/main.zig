@@ -174,6 +174,17 @@ test "nested epoll probes do not hold the parent instance lock" {
     try std.testing.expect(release < probe);
 }
 
+test "epoll registrations validate fd slot incarnations" {
+    const vfs = kt.vfs_source;
+    const epoll = kt.epoll_source;
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "fd_generations: [MAX_FDS]u64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "fd_generations[fd] +%= 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "snapshotFdIdentity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, epoll, "fd_generation: u64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, epoll, "acquireTransferFd") != null);
+    try std.testing.expect(std.mem.indexOf(u8, epoll, "snapshotFdIdentity") != null);
+}
+
 test "virtio net queue rejects sizes beyond fixed ring storage" {
     const source = @embedFile("../kernel/drivers/virtio_net.zig");
     try std.testing.expect(std.mem.indexOf(u8, source, "qsize == 0 or qsize > QUEUE_SIZE") != null);
