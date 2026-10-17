@@ -140,6 +140,32 @@ test "RISC-V mapPage fences newly installed translations" {
     try std.testing.expect(std.mem.indexOf(u8, source[start..end], "sfence.vma") != null);
 }
 
+test "epoll lifecycle policy separates transient borrows from slot recycle" {
+    var slot: kt.epoll_lifecycle_policy.Slot = .{ .state = .open, .generation = 8 };
+    try std.testing.expect(kt.epoll_lifecycle_policy.acquire(&slot, 8));
+    try std.testing.expect(!kt.epoll_lifecycle_policy.acquire(&slot, 7));
+    try std.testing.expect(kt.epoll_lifecycle_policy.beginClose(&slot, 8));
+    try std.testing.expect(!kt.epoll_lifecycle_policy.recycle(&slot));
+    try std.testing.expect(kt.epoll_lifecycle_policy.release(&slot));
+    try std.testing.expect(kt.epoll_lifecycle_policy.recycle(&slot));
+}
+
+test "epoll immediate-ready control uses locked ready helper" {
+    const source = kt.epoll_source;
+    const add = std.mem.indexOf(u8, source, "EPOLL_CTL_ADD").?;
+    const mod = std.mem.indexOf(u8, source, "EPOLL_CTL_MOD").?;
+    const end = std.mem.indexOfPos(u8, source, mod, "EPOLL_CTL_DEL").?;
+    try std.testing.expect(std.mem.indexOfPos(u8, source, add, "addToReadyListLocked") != null);
+    try std.testing.expect(std.mem.indexOfPos(u8, source, mod, "addToReadyListLocked") != null);
+    try std.testing.expect(std.mem.indexOfPos(u8, source, end, "addToReadyList(inst") == null);
+}
+
+test "epoll operational callers use borrowed instances instead of raw lookup" {
+    const source = kt.epoll_source;
+    try std.testing.expect(std.mem.count(u8, source, "getInstance(") == 1);
+    try std.testing.expect(std.mem.count(u8, source, "acquireInstance(") >= 4);
+}
+
 test "virtio net queue rejects sizes beyond fixed ring storage" {
     const source = @embedFile("../kernel/drivers/virtio_net.zig");
     try std.testing.expect(std.mem.indexOf(u8, source, "qsize == 0 or qsize > QUEUE_SIZE") != null);
