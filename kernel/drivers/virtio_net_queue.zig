@@ -52,7 +52,8 @@ pub const QueueState = struct {
 };
 
 /// Initialize an empty queue with `size` descriptors linked in a free list.
-pub fn init(state: *QueueState, size: u16) void {
+pub fn init(state: *QueueState, size: u16) bool {
+    if (size == 0 or size > MAX_QUEUE_SIZE) return false;
     state.num = size;
     state.free_head = 0;
     state.free_count = size;
@@ -69,6 +70,7 @@ pub fn init(state: *QueueState, size: u16) void {
     }
     @memset(state.avail_ring[0..MAX_QUEUE_SIZE], 0);
     @memset(state.used_ring[0..MAX_QUEUE_SIZE], 0);
+    return true;
 }
 
 /// Allocate the head of the free list, or null when the queue is full.

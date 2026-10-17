@@ -250,7 +250,7 @@ fn initVirtqueue(vq: *Virtqueue, io_base: u64, queue_idx: u16) !void {
     const base = io_base;
     io.outw(@intCast(base + VIRTIO_PCI_QUEUE_SEL), queue_idx);
     const qsize = io.inw(@intCast(base + VIRTIO_PCI_QUEUE_NUM));
-    if (qsize == 0) return error.BadQueue;
+    if (qsize == 0 or qsize > QUEUE_SIZE) return error.BadQueue;
     vq.num = qsize;
 
     // Allocate 3 pages for desc+avail+used

@@ -140,6 +140,14 @@ test "RISC-V mapPage fences newly installed translations" {
     try std.testing.expect(std.mem.indexOf(u8, source[start..end], "sfence.vma") != null);
 }
 
+test "virtio net queue rejects sizes beyond fixed ring storage" {
+    const source = @embedFile("../kernel/drivers/virtio_net.zig");
+    try std.testing.expect(std.mem.indexOf(u8, source, "qsize == 0 or qsize > QUEUE_SIZE") != null);
+    const policy = @embedFile("../kernel/drivers/virtio_net_queue.zig");
+    try std.testing.expect(std.mem.indexOf(u8, policy, "size == 0 or size > MAX_QUEUE_SIZE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, policy, "pub fn init(state: *QueueState, size: u16) bool") != null);
+}
+
 test "page cache insertions recheck duplicate keys under the cache lock" {
     const source = @embedFile("../kernel/fs/page_cache.zig");
     const plain = std.mem.indexOf(u8, source, "pub fn insertPage(").?;

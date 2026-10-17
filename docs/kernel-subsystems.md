@@ -828,6 +828,7 @@ const SchedStats = struct {
 - 非 x86 `isUserAccessible` 与 `isUserWritable` 分离：只读 user 页不能通过 kernel copy-to-user 写入检查；AArch64 timer service 由 trap 单一拥有者驱动，GIC 只负责 acknowledge/EOI。
 - AArch64 `isUserWritable` 同时要求页表 AP 的 EL0 access bit（AP[1]）和 RW 状态（AP[2] 清零）；EL1-only RW（AP=00）不能作为用户写目标。
 - RISC-V Sv39 在 map/unmap 修改 PTE 后执行本地 `sfence.vma`，避免旧 invalid/old translation 在重映射后继续生效。
+- virtio-net advertised queue size 必须为 `1..128`；驱动拒绝超过静态 descriptor/avail/used ring 存储的设备值，避免 DMA/ring 数组越界。
 - AArch64/RISC-V 尚未实现 2 MiB huge-page backend 时，`mapHugePage` 显式返回 `UnsupportedHugePage`，不会静默只映射一个 4 KiB base page。
 - mmap fault 使用 `insertPageOwnedOrGet` 区分 cache full、刚插入和已存在 frame；duplicate 命中返回已在锁内 pin 的现有物理帧，incoming scratch frame 由 fault path 释放，不会误判为 cache full。
 - full `syncAll`/`syncFile` 现在消费 page-cache `FlushResult.failed`；dirty MAP_SHARED 页面写回失败会向 `sync`/`fsync`/`msync` 传播为 `EIO`，失败页面保持 dirty 供后续重试。
