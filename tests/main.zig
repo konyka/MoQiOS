@@ -169,6 +169,14 @@ test "full page-cache flushes expose writeback failure" {
     try std.testing.expect(std.mem.indexOf(u8, vfs, "return ordinary_ok and !mmap_result.failed") != null);
 }
 
+test "mapped inode flush reports page-cache failure to recovery callers" {
+    const source = @embedFile("../kernel/fs/vfs.zig");
+    try std.testing.expect(std.mem.indexOf(u8, source, "pub fn flushMappedInode(inode_id: u64) bool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return !page_cache.flushInode(inode_id, mappedPageWriteback).failed") != null);
+    const idt = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, idt, "if (!vfs.flushMappedInode(region.inode_id))") != null);
+}
+
 test "vmsplice validates flags and loops over large iovecs" {
     const source = kt.syscall_entry_source;
     const start = std.mem.indexOf(u8, source, "fn syscallVmsplice").?;

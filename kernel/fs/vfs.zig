@@ -1892,8 +1892,8 @@ fn mappedPageWriteback(inode_id: u64, page_offset: u64, data: *[4096]u8) bool {
 /// H1: flush an inode's dirty mmap-owned cache pages to disk. Called when a
 /// MAP_SHARED ext2/fat32 region is released (munmap/exit/exec) and from the
 /// MAP_SHARED fault path's cache-full recovery.
-pub fn flushMappedInode(inode_id: u64) void {
-    _ = page_cache.flushInode(inode_id, mappedPageWriteback);
+pub fn flushMappedInode(inode_id: u64) bool {
+    return !page_cache.flushInode(inode_id, mappedPageWriteback).failed;
 }
 
 // ---------------------------------------------------------------------------

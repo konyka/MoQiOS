@@ -1237,7 +1237,10 @@ fn serveFilePage(current: anytype, page_addr: u64) bool {
                     // slots evictable) and retry once. Failing that, refuse
                     // the fault — a private copy would silently lose shared
                     // writes, which is worse than a SIGSEGV.
-                    vfs.flushMappedInode(region.inode_id);
+                    if (!vfs.flushMappedInode(region.inode_id)) {
+                        pmm.freePage(scratch);
+                        return false;
+                    }
                     owned = page_cache.insertPageOwnedOrGet(region.inode_id, key, scratch, 4096);
                     if (owned == .full) {
                         pmm.freePage(scratch);

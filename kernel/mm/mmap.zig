@@ -318,7 +318,7 @@ fn releaseRegionBacking(r: *task_mod.MmapRegion) void {
         (r.file_kind == @intFromEnum(filemap.FsKind.ext2) or
             r.file_kind == @intFromEnum(filemap.FsKind.fat32)))
     {
-        vfs.flushMappedInode(r.inode_id);
+        _ = vfs.flushMappedInode(r.inode_id);
     }
     if (r.file_kind == @intFromEnum(filemap.FsKind.ext2)) {
         ext2.closeFile(r.file_idx);
@@ -355,7 +355,7 @@ fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
             (r.file_kind == @intFromEnum(filemap.FsKind.ext2) or
                 r.file_kind == @intFromEnum(filemap.FsKind.fat32)))
         {
-            vfs.flushMappedInode(r.inode_id);
+        _ = vfs.flushMappedInode(r.inode_id);
         }
 
         if (base <= r.base and end >= r_end) {

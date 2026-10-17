@@ -831,6 +831,7 @@ const SchedStats = struct {
 - AArch64/RISC-V 尚未实现 2 MiB huge-page backend 时，`mapHugePage` 显式返回 `UnsupportedHugePage`，不会静默只映射一个 4 KiB base page。
 - mmap fault 使用 `insertPageOwnedOrGet` 区分 cache full、刚插入和已存在 frame；duplicate 命中返回已在锁内 pin 的现有物理帧，incoming scratch frame 由 fault path 释放，不会误判为 cache full。
 - full `syncAll`/`syncFile` 现在消费 page-cache `FlushResult.failed`；dirty MAP_SHARED 页面写回失败会向 `sync`/`fsync`/`msync` 传播为 `EIO`，失败页面保持 dirty 供后续重试。
+- MAP_SHARED cache-full fault recovery also checks mapped flush failure and refuses the fault after freeing scratch; teardown callers intentionally discard the bool because unmap/exit/exec are irreversible, while later `sync*` calls remain the reportable EIO path.
 - `splice(pipe_read, ..., file, ..., len, SPLICE_F_NONBLOCK)` 在空但仍有写端时以零进度返回 `-EAGAIN`；所有写端关闭时的空读是 EOF，返回 0。负错误保持不变，已有部分传输优先返回正的部分字节数；显式和隐式文件偏移都沿用原有更新规则。
 - MoqIPC timeout 仍保持 30 秒语义，但 x86 由正常 BSP timed-wait tick 驱动过期扫描，不再依赖约 100ms slow-maintenance 扫描；authority lock、TaskPin 和 incarnation 校验保持不变。
 - clone 的失败路径会撤销尚未发布的 child，并在 fd-table 分配失败时释放非 x86 内核栈；parent-TID copyout 失败发生在 runnable publication 之前。
