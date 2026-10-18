@@ -273,8 +273,12 @@ test "fat32 open-file lifetime defers unlink reclamation" {
     try std.testing.expect(std.mem.indexOf(u8, fat32, "unlink_pending: bool = false") != null);
     try std.testing.expect(std.mem.indexOf(u8, fat32, "pub fn retainFile") != null);
     try std.testing.expect(std.mem.indexOf(u8, fat32, "pub fn closeFile") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fat32, "pub fn openFileRetained") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fat32, "if (!found_entry)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fat32, "if (!fi.active or fi.unlink_pending or fi.is_dir)") != null);
     try std.testing.expect(std.mem.indexOf(u8, fat32, "files[file_idx].ref_count != 0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, vfs, "fat32.retainFile(idx)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "fat32.openFileRetained(name)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "retainFile(source.fat32_file_idx)") != null);
     try std.testing.expect(std.mem.indexOf(u8, vfs, "@import(\"fat32.zig\").closeFile") != null);
     try std.testing.expect(std.mem.indexOf(u8, vfs, ".fat32_file => @import(\"fat32.zig\").retainFile") != null);
 }

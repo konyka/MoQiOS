@@ -978,7 +978,7 @@ pub const FdTable = struct {
 
         const fat32 = @import("fat32.zig");
         if (fat32.isActive()) {
-            var fi = fat32.openFile(name);
+            var fi = fat32.openFileRetained(name);
             if (fi >= 0) {
                 const idx: u32 = @intCast(fi);
                 if (o_trunc and is_writable) _ = fat32.truncateFile(idx, 0);
@@ -992,7 +992,6 @@ pub const FdTable = struct {
                     .status_flags = status,
                 };
                 readahead.initState(&self.fds[slot].readahead_state);
-                fat32.retainFile(idx);
                 self.publishFd(slot);
                 return @intCast(slot);
             }
@@ -1001,6 +1000,7 @@ pub const FdTable = struct {
                 fi = fat32.createFile(name);
                 if (fi >= 0) {
                     const idx: u32 = @intCast(fi);
+                    fat32.retainFile(idx);
                     self.fds[slot] = .{
                         .fd_type = .fat32_file,
                         .offset = 0,
@@ -1624,6 +1624,9 @@ pub const FdTable = struct {
                 self.releaseFreeSlotLocked(fd);
             }
             self.slot_locks[fd].release(release_flags);
+            if (desc.fd_type == .fat32_file) {
+                @import("fat32.zig").closeFile(desc.fat32_file_idx);
+            }
             @import("../net/epoll.zig").invalidateFdRegistrations(self, fd, fd_generation);
             return 0;
         }
@@ -1740,6 +1743,9 @@ pub const FdTable = struct {
                 _ = pipeRetain(source.pipe_idx, source.fd_type == .pipe_write);
             }
         }
+        if (source.fd_type == .fat32_file) {
+            @import("fat32.zig").retainFile(source.fat32_file_idx);
+        }
         self.fds[newfd] = source;
         self.publishFd(newfd);
         return newfd;
@@ -1755,6 +1761,9 @@ pub const FdTable = struct {
         if (self.fds[slot].fd_type == .pipe_read or self.fds[slot].fd_type == .pipe_write) {
             if (self.fds[slot].pipe_idx < 16)
                 _ = pipeRetain(self.fds[slot].pipe_idx, self.fds[slot].fd_type == .pipe_write);
+        }
+        if (self.fds[slot].fd_type == .fat32_file) {
+            @import("fat32.zig").retainFile(self.fds[slot].fat32_file_idx);
         }
         self.publishFd(slot);
         return @intCast(slot);

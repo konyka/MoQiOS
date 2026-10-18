@@ -268,6 +268,15 @@ fn getFATEntry(cluster: u32) ?u32 {
 fn listRootDir() void {
     if (!fat32_active) return;
 
+    const guard = fs_lock.acquire();
+    for (files) |fi| {
+        if (fi.ref_count != 0) {
+            fs_lock.release(guard);
+            return;
+        }
+    }
+    fs_lock.release(guard);
+
     file_count = 0;
     var cluster: u32 = fat32_root_cluster;
     // SK-66: pending LFN slots in forward-scan order (last-marker first).
@@ -378,7 +387,7 @@ pub fn openFile(name: []const u8) i64 {
     // linear files[] scan; the slot is defensively revalidated so a stale or
     // conflicted entry degrades to the slow path instead of a wrong open.
     if (dcache.lookup(.fat32, fat32_root_cluster, name)) |idx| {
-        if (idx < file_count and files[idx].active and !files[idx].is_dir and
+        if (idx < file_count and files[idx].active and !files[idx].unlink_pending and !files[idx].is_dir and
             nameMatches(&files[idx], name))
         {
             return @intCast(idx);
@@ -387,9 +396,24 @@ pub fn openFile(name: []const u8) i64 {
 
     for (0..file_count) |i| {
         const fi = files[i];
-        if (!fi.active) continue; // v53.51: skip tombstoned slots
+        if (!fi.active or fi.unlink_pending) continue;
         if (nameMatches(&fi, name) and !fi.is_dir) {
             dcache.fill(.fat32, fat32_root_cluster, name, @intCast(i));
+            return @intCast(i);
+        }
+    }
+    return -1;
+}
+
+/// Resolve and retain a FAT32 file as one atomic namespace operation.
+pub fn openFileRetained(name: []const u8) i64 {
+    if (!fat32_active) return -1;
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    for (0..file_count) |i| {
+        if (!files[i].active or files[i].unlink_pending or files[i].is_dir) continue;
+        if (nameMatches(&files[i], name)) {
+            files[i].ref_count +%= 1;
             return @intCast(i);
         }
     }
@@ -554,7 +578,7 @@ pub fn getFileName(idx: u32) ?[]const u8 {
     defer fs_lock.release(flags);
     if (idx >= file_count) return null;
     const len = files[idx].name_len;
-    if (len == 0) return null;
+    if (!files[idx].active or files[idx].unlink_pending or len == 0) return null;
     return files[idx].name[0..len];
 }
 
@@ -820,7 +844,7 @@ pub fn createFile(name: []const u8) i64 {
                     break;
                 }
             }
-            if (match) return @intCast(i);
+            if (match and !files[i].unlink_pending) return @intCast(i);
         }
     }
     if (free_slot == null and file_count >= MAX_FILES) return -1;
@@ -1269,7 +1293,7 @@ pub fn deleteFile(file_idx: u32) bool {
     // every path, including the bail-outs after the 0xE5 write below.
     defer dcache.invalidateFs(.fat32);
     const fi = files[file_idx];
-    if (!fi.active) { // v53.51: already tombstoned
+    if (!fi.active or fi.unlink_pending or fi.is_dir) {
         fs_lock.release(flags);
         return false;
     }
@@ -1280,6 +1304,7 @@ pub fn deleteFile(file_idx: u32) bool {
     const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
     var dir_cluster: u32 = fat32_root_cluster;
     var dir_safety: u32 = 0;
+    var found_entry = false;
     scan: while (dir_cluster >= 2 and dir_cluster < 0x0FFFFFF8 and dir_safety < 65536) : (dir_safety += 1) {
         const base_lba = clusterToLBA(dir_cluster);
         var sec: u32 = 0;
@@ -1305,11 +1330,17 @@ pub fn deleteFile(file_idx: u32) bool {
                         fs_lock.release(flags);
                         return false;
                     }
+                    found_entry = true;
                     break :scan;
                 }
             }
         }
         dir_cluster = getFATEntry(dir_cluster) orelse break :scan;
+    }
+
+    if (!found_entry) {
+        fs_lock.release(flags);
+        return false;
     }
 
     // Open descriptors keep the slot and its cluster chain alive. The
