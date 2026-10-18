@@ -34,6 +34,8 @@ pub const FileInfo = struct {
     // v53.51: deleteFile tombstones the slot instead of shifting files[], so
     // indices held by open fds and writeback buffers stay stable.
     active: bool = false,
+    ref_count: u32 = 0,
+    unlink_pending: bool = false,
 };
 
 var partitions: [MAX_PARTITIONS]Partition = @splat(.{
@@ -881,7 +883,7 @@ pub fn createFile(name: []const u8) i64 {
     fat_util.setDirEntrySize(&short_ent, 0);
     write_slots[lfn_count] = short_ent;
 
-    if (!writeRootEntryRun(dest, write_slots[0 .. need])) {
+    if (!writeRootEntryRun(dest, write_slots[0..need])) {
         _ = setFATEntry(new_cluster, 0);
         return -1;
     }
@@ -1310,6 +1312,15 @@ pub fn deleteFile(file_idx: u32) bool {
         dir_cluster = getFATEntry(dir_cluster) orelse break :scan;
     }
 
+    // Open descriptors keep the slot and its cluster chain alive. The
+    // directory name is tombstoned above, but cluster reclamation waits for
+    // the final fd release.
+    if (files[file_idx].ref_count != 0) {
+        files[file_idx].unlink_pending = true;
+        fs_lock.release(flags);
+        return true;
+    }
+
     // v53.51: Flush+drop writeback extents staged for this inode BEFORE the
     // cluster chain is freed — a later flush would write into freed clusters.
     // The flush callback re-enters writeFile, which acquires fs_lock, so the
@@ -1357,4 +1368,24 @@ pub fn deleteFile(file_idx: u32) bool {
 
     fs_lock.release(flags);
     return true;
+}
+
+pub fn retainFile(file_idx: u32) void {
+    if (file_idx >= file_count) return;
+    const flags = fs_lock.acquire();
+    if (files[file_idx].active) files[file_idx].ref_count +%= 1;
+    fs_lock.release(flags);
+}
+
+pub fn closeFile(file_idx: u32) void {
+    if (file_idx >= file_count) return;
+    const flags = fs_lock.acquire();
+    if (!files[file_idx].active or files[file_idx].ref_count == 0) {
+        fs_lock.release(flags);
+        return;
+    }
+    files[file_idx].ref_count -= 1;
+    const pending = files[file_idx].unlink_pending and files[file_idx].ref_count == 0;
+    fs_lock.release(flags);
+    if (pending) _ = deleteFile(file_idx);
 }

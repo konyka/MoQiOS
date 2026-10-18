@@ -266,6 +266,19 @@ test "fd close invalidates exact epoll registrations" {
     try std.testing.expect(std.mem.indexOf(u8, vfs, "invalidateFdRegistrations(self, fd, fd_generation)") != null);
 }
 
+test "fat32 open-file lifetime defers unlink reclamation" {
+    const fat32 = @embedFile("../kernel/fs/fat32.zig");
+    const vfs = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, fat32, "ref_count: u32 = 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fat32, "unlink_pending: bool = false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fat32, "pub fn retainFile") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fat32, "pub fn closeFile") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fat32, "files[file_idx].ref_count != 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "fat32.retainFile(idx)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "@import(\"fat32.zig\").closeFile") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, ".fat32_file => @import(\"fat32.zig\").retainFile") != null);
+}
+
 test "virtio net queue rejects sizes beyond fixed ring storage" {
     const source = @embedFile("../kernel/drivers/virtio_net.zig");
     try std.testing.expect(std.mem.indexOf(u8, source, "qsize == 0 or qsize > QUEUE_SIZE") != null);

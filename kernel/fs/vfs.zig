@@ -992,6 +992,7 @@ pub const FdTable = struct {
                     .status_flags = status,
                 };
                 readahead.initState(&self.fds[slot].readahead_state);
+                fat32.retainFile(idx);
                 self.publishFd(slot);
                 return @intCast(slot);
             }
@@ -1010,6 +1011,7 @@ pub const FdTable = struct {
                         .status_flags = status,
                     };
                     readahead.initState(&self.fds[slot].readahead_state);
+                    fat32.retainFile(idx);
                     self.publishFd(slot);
                     return @intCast(slot);
                 }
@@ -1647,6 +1649,7 @@ pub const FdTable = struct {
         if (desc.fd_type == .fat32_file) {
             flush_failed = !writeback.invalidateFile(desc.inode_id, .fat32, fat32WriteFlush);
             readahead.invalidateCache(&desc.readahead_state);
+            @import("fat32.zig").closeFile(desc.fat32_file_idx);
         }
         if (desc.fd_type == .tcp_socket) {
             const tcp = @import("../net/tcp.zig");
@@ -1829,6 +1832,7 @@ pub fn retainSharedResources(table: *FdTable) void {
             if (other.fd_type != desc.fd_type) continue;
             switch (desc.fd_type) {
                 .ext2_file => seen = other.ext2_file_idx == desc.ext2_file_idx,
+                .fat32_file => seen = other.fat32_file_idx == desc.fat32_file_idx,
                 .tcp_socket => seen = other.tcb_idx == desc.tcb_idx,
                 .udp_socket => seen = other.udp_port == desc.udp_port,
                 .epoll => seen = other.epoll_idx == desc.epoll_idx,
@@ -1843,6 +1847,7 @@ pub fn retainSharedResources(table: *FdTable) void {
         if (seen) continue;
         switch (desc.fd_type) {
             .ext2_file => @import("ext2.zig").retainFile(desc.ext2_file_idx),
+            .fat32_file => @import("fat32.zig").retainFile(desc.fat32_file_idx),
             .tmpfs_file => @import("tmpfs.zig").tmpfsRetain(@intCast(desc.tmpfs_idx)),
             .tcp_socket => {
                 const tcp = @import("../net/tcp.zig");

@@ -829,6 +829,7 @@ const SchedStats = struct {
 - `EPOLL_CTL_ADD/MOD` 在 registration 发布后重新探测 readiness，避免 probe 与加锁之间的通知 TOCTOU；child queue drain 后会清除父 nested ET 的 `last_reported`，允许下一次 ready transition 重新唤醒。
 - `EPOLL_CTL_MOD` 推进 registration incarnation，避免旧 probe 修改新配置；LT 的 HUP/ERR 事件保持可重复 ready；self-epoll registration 返回 `ELOOP`。
 - fd close/dup2 replacement 在 descriptor teardown 前按 `(FdTable, fd, generation)` 精确清理 epoll registration，避免 close/reuse 反复创建不可删除的 stale item 耗尽 registration pool。
+- FAT32 open descriptors now hold per-slot references; unlink tombstones the directory entry but defers cluster reclamation and slot reuse until the final inherited/duplicated fd closes.
 - mmap file-cache 命中使用 `getPageFramePinned`：在 `cache_lock` 内先增加映射引用，再把物理帧交给 page-table fault path，避免 eviction 在 lookup 与 `addRef` 之间释放/复用帧。
 - page-cache insertion 在 `cache_lock` 内二次检查 `(inode_id, page_offset)`；并发 miss 不会创建 duplicate key，owned insertion 遇到已存在页面返回 null 并保留 incoming frame 由调用方释放。
 - AArch64 paging facade 的 `isPageMapped` 现在读取真实 user mapping；AArch64/RISC-V `unmapPage` 返回被移除的物理帧，保持 shared paging API 的回收/验证 contract。
