@@ -241,6 +241,7 @@ test "epoll preserves ready registrations beyond max_events" {
     const source = kt.epoll_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "const delivered = count < max_out") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "!snapshot.is_et or !delivered") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "final_events != 0") != null);
 }
 
 test "epoll wake state and nested readiness use synchronized loads" {
@@ -248,6 +249,13 @@ test "epoll wake state and nested readiness use synchronized loads" {
     try std.testing.expect(std.mem.indexOf(u8, source, "@atomicLoad(bool, &node.granted, .acquire)") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "const saved = inst.spin.acquire();") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "@atomicLoad(bool, &inst.valid, .acquire)") != null);
+}
+
+test "epoll MOD advances registration incarnation and rejects self cycles" {
+    const source = kt.epoll_source;
+    try std.testing.expect(std.mem.indexOf(u8, source, "item.registration_generation +%= 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "if (resourceIdxFromDesc(desc) == epfd_idx) return ELOOP") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "const child_empty = child_inst.ready_head == null") != null);
 }
 
 test "virtio net queue rejects sizes beyond fixed ring storage" {

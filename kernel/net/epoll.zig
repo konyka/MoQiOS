@@ -47,6 +47,7 @@ const EINVAL = errno.EINVAL;
 const ENOENT = errno.ENOENT;
 const ENOSPC = errno.ENOSPC;
 const EMFILE = errno.EMFILE;
+const ELOOP = errno.ELOOP;
 
 /// Limits.
 pub const MAX_EPOLL_INSTANCES: u32 = 32;
@@ -208,6 +209,7 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
     const desc = &identity.desc;
     var target_epoll_generation: u64 = 0;
     if (desc.fd_type == .epoll) {
+        if (resourceIdxFromDesc(desc) == epfd_idx) return ELOOP;
         const target = acquireInstance(resourceIdxFromDesc(desc)) orelse return EBADF;
         target_epoll_generation = target.generation;
         var target_borrow = target;
@@ -285,6 +287,7 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
                         item.is_oneshot = (ev.events & EPOLLONESHOT) != 0;
                         item.is_disabled = false;
                         item.last_reported = 0;
+                        item.registration_generation +%= 1;
                         found = true;
                         needs_readiness_recheck = true;
                         break;
@@ -463,8 +466,14 @@ fn propagateNestedReadyLocked(initial: u32) void {
 fn resetNestedEdgeState(child_slot: u32, child_generation: u64) void {
     const psaved = pool_lock.acquire();
     defer pool_lock.release(psaved);
-    if (child_slot >= MAX_EPOLL_INSTANCES or !epoll_pool[child_slot].valid or
+    if (child_slot >= MAX_EPOLL_INSTANCES or !@atomicLoad(bool, &epoll_pool[child_slot].valid, .acquire) or
         epoll_pool[child_slot].generation != child_generation) return;
+
+    const child_inst = &epoll_pool[child_slot];
+    const child_saved = child_inst.spin.acquire();
+    const child_empty = child_inst.ready_head == null;
+    child_inst.spin.release(child_saved);
+    if (!child_empty) return;
 
     var ebm = valid_epoll_bm & ~(@as(u32, 1) << @intCast(child_slot));
     while (ebm != 0) {
@@ -789,7 +798,7 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
 
             if (snapshot.is_oneshot and delivered) {
                 item.is_disabled = true;
-            } else if (matched != 0 and (!snapshot.is_et or !delivered)) {
+            } else if (final_events != 0 and (!snapshot.is_et or !delivered)) {
                 addToReadyListLocked(inst, snapshot.slot);
             }
         }
