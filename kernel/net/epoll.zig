@@ -202,21 +202,22 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
     const cur_idx = sched.currentTaskIndex() orelse return EBADF;
     const cur = task_mod.getTask(cur_idx) orelse return EBADF;
     if (fd >= @as(i32, @intCast(vfs.MAX_FDS))) return EBADF;
-    const identity = cur.fd_table.snapshotFdIdentity(@intCast(fd)) orelse return EBADF;
-    const desc = &identity.desc;
     if (!cur.fd_table.acquireTransferFd(@intCast(fd))) return EBADF;
     defer cur.fd_table.releaseTransferFd(@intCast(fd));
-    const current = computeCurrentEvents(desc.fd_type, resourceIdxFromDesc(desc), desc.offset);
+    const identity = cur.fd_table.snapshotFdIdentity(@intCast(fd)) orelse return EBADF;
+    const desc = &identity.desc;
     var target_epoll_generation: u64 = 0;
     if (desc.fd_type == .epoll) {
-        if (acquireInstance(resourceIdxFromDesc(desc))) |target| {
-            target_epoll_generation = target.generation;
-            var target_borrow = target;
-            target_borrow.release();
-        }
+        const target = acquireInstance(resourceIdxFromDesc(desc)) orelse return EBADF;
+        target_epoll_generation = target.generation;
+        var target_borrow = target;
+        target_borrow.release();
     }
-    var nested_ready = false;
-    defer if (nested_ready) epollNotify(.epoll, epfd_idx, EPOLLIN);
+    var needs_readiness_recheck = false;
+    defer if (needs_readiness_recheck) {
+        const current = computeCurrentEvents(desc.fd_type, resourceIdxFromDesc(desc), desc.offset);
+        if (current != 0) epollNotify(desc.fd_type, resourceIdxFromDesc(desc), current);
+    };
 
     const saved = inst.spin.acquire();
     defer inst.spin.release(saved);
@@ -263,11 +264,7 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
             inst.next_registration_generation +%= 1;
             inst.item_count += 1;
             inst.in_use_bm[s >> 6] |= @as(u64, 1) << @intCast(s & 63);
-
-            if (current & (ev.events & ~EPOLLET & ~EPOLLONESHOT) != 0) {
-                addToReadyListLocked(inst, @intCast(s));
-                nested_ready = true;
-            }
+            needs_readiness_recheck = true;
         },
         EPOLL_CTL_MOD => {
             var found = false;
@@ -289,12 +286,7 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
                         item.is_disabled = false;
                         item.last_reported = 0;
                         found = true;
-                        if (!item.on_ready) {
-                            if (current & (ev.events & ~EPOLLET & ~EPOLLONESHOT) != 0) {
-                                addToReadyListLocked(inst, i);
-                                nested_ready = true;
-                            }
-                        }
+                        needs_readiness_recheck = true;
                         break;
                     }
                 }
@@ -380,6 +372,7 @@ pub fn epollNotify(fd_type: vfs.FdType, resource_idx: u32, ready_events: u32) vo
         ebm &= ebm - 1;
         const inst = &epoll_pool[ei];
         const saved = inst.spin.acquire();
+        var instance_became_ready = false;
 
         for (0..2) |w| {
             var bits = inst.in_use_bm[w];
@@ -404,11 +397,12 @@ pub fn epollNotify(fd_type: vfs.FdType, resource_idx: u32, ready_events: u32) vo
                 if (!item.on_ready) {
                     addToReadyListLocked(inst, i);
                     newly_ready |= @as(u32, 1) << @intCast(ei);
+                    instance_became_ready = true;
                 }
             }
         }
 
-        wakeWaiterLocked(inst);
+        if (instance_became_ready) wakeWaiterLocked(inst);
         inst.spin.release(saved);
     }
     propagateNestedReadyLocked(newly_ready);
@@ -461,6 +455,37 @@ fn propagateNestedReadyLocked(initial: u32) void {
             }
             parent_inst.spin.release(saved);
         }
+    }
+}
+
+/// Clear edge-triggered parent state after a child epoll queue drains. This
+/// arms the parent for the next child readiness transition.
+fn resetNestedEdgeState(child_slot: u32, child_generation: u64) void {
+    const psaved = pool_lock.acquire();
+    defer pool_lock.release(psaved);
+    if (child_slot >= MAX_EPOLL_INSTANCES or !epoll_pool[child_slot].valid or
+        epoll_pool[child_slot].generation != child_generation) return;
+
+    var ebm = valid_epoll_bm & ~(@as(u32, 1) << @intCast(child_slot));
+    while (ebm != 0) {
+        const parent = @ctz(ebm);
+        ebm &= ebm - 1;
+        const parent_inst = &epoll_pool[parent];
+        const saved = parent_inst.spin.acquire();
+        for (0..2) |w| {
+            var bits = parent_inst.in_use_bm[w];
+            while (bits != 0) {
+                const bit = @ctz(bits);
+                bits &= bits - 1;
+                const item = &parent_inst.items[@intCast(w * 64 + @as(u32, bit))];
+                if (item.fd_type == .epoll and item.resource_idx == child_slot and
+                    item.target_epoll_generation == child_generation and item.is_et)
+                {
+                    item.last_reported = 0;
+                }
+            }
+        }
+        parent_inst.spin.release(saved);
     }
 }
 
@@ -655,6 +680,7 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
         registration_generation: u64,
         fd_type: vfs.FdType,
         resource_idx: u32,
+        target_epoll_generation: u64,
         events: u32,
         data: u64,
         is_et: bool,
@@ -664,6 +690,9 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
     var snapshots: [MAX_EPOLL_ITEMS]ReadySnapshot = undefined;
     var snapshot_count: usize = 0;
     const scan_head = inst.ready_head;
+    const drained_ready_queue = scan_head != null;
+    const drained_slot = epollSlotOf(inst);
+    const drained_generation = inst.generation;
     inst.ready_head = null;
     inst.ready_tail = null;
     // First pass: only clear on_ready flag (preserve ready_next for second pass)
@@ -691,6 +720,7 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
             .registration_generation = item.registration_generation,
             .fd_type = item.fd_type,
             .resource_idx = item.resource_idx,
+            .target_epoll_generation = item.target_epoll_generation,
             .events = item.events,
             .data = item.data,
             .is_et = item.is_et,
@@ -702,6 +732,7 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
     }
 
     inst.spin.release(saved);
+    if (drained_ready_queue) resetNestedEdgeState(drained_slot, drained_generation);
 
     // Readiness probes may acquire another epoll instance. Do them without
     // holding the parent spinlock, preserving pool_lock -> inst.spin order.
@@ -715,7 +746,20 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
             fd_table.releaseTransferFd(@intCast(snapshot.fd));
             continue;
         }
+        var child_borrow: ?InstanceBorrow = null;
+        if (snapshot.fd_type == .epoll) {
+            child_borrow = acquireInstance(snapshot.resource_idx) orelse {
+                fd_table.releaseTransferFd(@intCast(snapshot.fd));
+                continue;
+            };
+            if (child_borrow.?.generation != snapshot.target_epoll_generation) {
+                child_borrow.?.release();
+                fd_table.releaseTransferFd(@intCast(snapshot.fd));
+                continue;
+            }
+        }
         const current = computeCurrentEvents(snapshot.fd_type, snapshot.resource_idx, snapshot.kmsg_cursor);
+        if (child_borrow) |*borrowed| borrowed.release();
         const interest = snapshot.events & ~EPOLLET & ~EPOLLONESHOT;
         const matched = current & interest;
         const always_report = current & (EPOLLERR | EPOLLHUP);

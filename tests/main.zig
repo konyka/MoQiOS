@@ -187,12 +187,12 @@ test "epoll registrations validate fd slot incarnations" {
     try std.testing.expect(std.mem.indexOf(u8, epoll, "item.registration_generation == snapshot.registration_generation") != null);
 }
 
-test "epoll ctl probes before taking the instance lock" {
+test "epoll ctl rechecks readiness after registration" {
     const source = kt.epoll_source;
     const ctl = std.mem.indexOf(u8, source, "pub fn epollCtl").?;
-    const lock = std.mem.indexOfPos(u8, source, ctl, "const saved = inst.spin.acquire();").?;
-    const probe = std.mem.indexOfPos(u8, source, ctl, "const current = computeCurrentEvents").?;
-    try std.testing.expect(probe < lock);
+    const recheck = std.mem.indexOfPos(u8, source, ctl, "needs_readiness_recheck").?;
+    const notify = std.mem.indexOfPos(u8, source, recheck, "epollNotify(desc.fd_type").?;
+    try std.testing.expect(recheck < notify);
 }
 
 test "epoll delete removes the exact ready-list slot" {
@@ -209,6 +209,32 @@ test "nested epoll readiness propagates without reacquiring the pool lock" {
     try std.testing.expect(std.mem.indexOf(u8, source, "target_epoll_generation != epoll_pool[child].generation") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "item.events & EPOLLIN == 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "if (item.is_et)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "acquireInstance(snapshot.resource_idx) orelse") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "target_epoll_generation") != null);
+}
+
+test "epoll rejects dead nested targets and removes stale target errors" {
+    const source = kt.epoll_source;
+    const ctl = std.mem.indexOf(u8, source, "pub fn epollCtl").?;
+    const target = std.mem.indexOfPos(u8, source, ctl, "acquireInstance(resourceIdxFromDesc(desc)) orelse return EBADF");
+    try std.testing.expect(target != null);
+    const collect = std.mem.indexOf(u8, source, "fn collectEvents").?;
+    try std.testing.expect(std.mem.indexOfPos(u8, source, collect, "acquireInstance(snapshot.resource_idx) orelse") != null);
+}
+
+test "epoll notification wakes only on a newly ready instance" {
+    const source = kt.epoll_source;
+    try std.testing.expect(std.mem.indexOf(u8, source, "if (instance_became_ready) wakeWaiterLocked(inst)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "resetNestedEdgeState") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "item.last_reported = 0") != null);
+}
+
+test "epoll ctl pins the fd before taking its identity snapshot" {
+    const source = kt.epoll_source;
+    const ctl = std.mem.indexOf(u8, source, "pub fn epollCtl").?;
+    const pin = std.mem.indexOfPos(u8, source, ctl, "acquireTransferFd").?;
+    const snapshot = std.mem.indexOfPos(u8, source, ctl, "snapshotFdIdentity").?;
+    try std.testing.expect(pin < snapshot);
 }
 
 test "virtio net queue rejects sizes beyond fixed ring storage" {
