@@ -1607,6 +1607,7 @@ pub const FdTable = struct {
         }
         const flags = self.slot_locks[fd].acquire();
         var desc = self.fds[fd];
+        const fd_generation = self.fd_generations[fd];
         // Elect the owner while this slot is still CLOSING. CLEANING is an
         // owner marker, not another live reference: a peer that closes after
         // this decision must drop its slot rather than skip teardown too.
@@ -1621,6 +1622,7 @@ pub const FdTable = struct {
                 self.releaseFreeSlotLocked(fd);
             }
             self.slot_locks[fd].release(release_flags);
+            @import("../net/epoll.zig").invalidateFdRegistrations(self, fd, fd_generation);
             return 0;
         }
         if (@cmpxchgStrong(u32, &self.transfer_state[fd], SLOT_CLOSING, SLOT_CLEANING, .acq_rel, .acquire) != null) {
@@ -1630,6 +1632,7 @@ pub const FdTable = struct {
         }
         self.slot_locks[fd].release(flags);
         self.lifecycle_lock.release(lifecycle_flags);
+        @import("../net/epoll.zig").invalidateFdRegistrations(self, fd, fd_generation);
         if (desc.fd_type == .pipe_read or desc.fd_type == .pipe_write) {
             pipeClose(desc.pipe_idx, desc.fd_type == .pipe_write);
         }

@@ -258,6 +258,14 @@ test "epoll MOD advances registration incarnation and rejects self cycles" {
     try std.testing.expect(std.mem.indexOf(u8, source, "const child_empty = child_inst.ready_head == null") != null);
 }
 
+test "fd close invalidates exact epoll registrations" {
+    const epoll = kt.epoll_source;
+    const vfs = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, epoll, "invalidateFdRegistrations") != null);
+    try std.testing.expect(std.mem.indexOf(u8, epoll, "item.fd_table == fd_table") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "invalidateFdRegistrations(self, fd, fd_generation)") != null);
+}
+
 test "virtio net queue rejects sizes beyond fixed ring storage" {
     const source = @embedFile("../kernel/drivers/virtio_net.zig");
     try std.testing.expect(std.mem.indexOf(u8, source, "qsize == 0 or qsize > QUEUE_SIZE") != null);

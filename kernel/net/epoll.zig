@@ -1,7 +1,7 @@
 /// epoll — Linux-compatible event multiplexing.
 ///
 /// Provides epoll_create1, epoll_ctl, and epoll_wait system calls.
-/// Uses a simple array-based fd management (max 64 fds per instance)
+/// Uses a simple array-based fd management (max 128 fds per instance)
 /// instead of a red-black tree, which is adequate for the typical
 /// number of concurrent connections in MoQiOS.
 ///
@@ -73,6 +73,7 @@ const WaitNode = struct {
 /// EpollItem — per-fd registration within an epoll instance.
 pub const EpollItem = struct {
     fd: i32 = -1,
+    fd_table: ?*vfs.FdTable = null,
     fd_generation: u64 = 0,
     registration_generation: u64 = 0,
     target_epoll_generation: u64 = 0,
@@ -252,6 +253,7 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
 
             inst.items[s] = .{
                 .fd = fd,
+                .fd_table = cur.fd_table,
                 .fd_generation = identity.generation,
                 .registration_generation = inst.next_registration_generation,
                 .target_epoll_generation = target_epoll_generation,
@@ -409,6 +411,39 @@ pub fn epollNotify(fd_type: vfs.FdType, resource_idx: u32, ready_events: u32) vo
         inst.spin.release(saved);
     }
     propagateNestedReadyLocked(newly_ready);
+}
+
+/// Remove registrations that belong to a descriptor incarnation being closed.
+/// The table pointer prevents an unrelated process' same-numbered fd from
+/// invalidating a live registration in a shared epoll instance.
+pub fn invalidateFdRegistrations(fd_table: *vfs.FdTable, fd: u32, generation: u64) void {
+    const psaved = pool_lock.acquire();
+    defer pool_lock.release(psaved);
+    var ebm = valid_epoll_bm;
+    while (ebm != 0) {
+        const ei = @ctz(ebm);
+        ebm &= ebm - 1;
+        const inst = &epoll_pool[ei];
+        const saved = inst.spin.acquire();
+        for (0..2) |w| {
+            var bits = inst.in_use_bm[w];
+            while (bits != 0) {
+                const bit = @ctz(bits);
+                bits &= bits - 1;
+                const slot: u8 = @intCast(w * 64 + @as(u32, bit));
+                const item = &inst.items[slot];
+                if (item.in_use and item.fd_table == fd_table and item.fd == @as(i32, @intCast(fd)) and
+                    item.fd_generation == generation)
+                {
+                    if (item.on_ready) removeFromReadyListSlot(inst, slot);
+                    inst.items[slot] = .{};
+                    inst.in_use_bm[w] &= ~(@as(u64, 1) << @intCast(bit));
+                    inst.item_count -= 1;
+                }
+            }
+        }
+        inst.spin.release(saved);
+    }
 }
 
 /// Propagate child-epoll readiness while pool_lock is already held. Keeping
