@@ -831,6 +831,7 @@ const SchedStats = struct {
 - fd close/dup2 replacement 在 descriptor teardown 前按 `(FdTable, fd, generation)` 精确清理 epoll registration，避免 close/reuse 反复创建不可删除的 stale item 耗尽 registration pool。
 - FAT32 open descriptors now hold per-slot references; unlink tombstones the directory entry but defers cluster reclamation and slot reuse until the final inherited/duplicated fd closes.
 - FAT32 namespace lookup excludes `unlink_pending` slots; open+retain is atomic under the FAT32 lock, duplicate descriptors retain the shared slot, and directory rescan refuses to overwrite slots with live references.
+- Pending FAT32 unlink is finalized by the last close through a separate reclaim path; writeback and complete FAT-chain I/O are required before the slot is recycled.
 - mmap file-cache 命中使用 `getPageFramePinned`：在 `cache_lock` 内先增加映射引用，再把物理帧交给 page-table fault path，避免 eviction 在 lookup 与 `addRef` 之间释放/复用帧。
 - page-cache insertion 在 `cache_lock` 内二次检查 `(inode_id, page_offset)`；并发 miss 不会创建 duplicate key，owned insertion 遇到已存在页面返回 null 并保留 incoming frame 由调用方释放。
 - AArch64 paging facade 的 `isPageMapped` 现在读取真实 user mapping；AArch64/RISC-V `unmapPage` 返回被移除的物理帧，保持 shared paging API 的回收/验证 contract。

@@ -273,6 +273,9 @@ test "fat32 open-file lifetime defers unlink reclamation" {
     try std.testing.expect(std.mem.indexOf(u8, fat32, "unlink_pending: bool = false") != null);
     try std.testing.expect(std.mem.indexOf(u8, fat32, "pub fn retainFile") != null);
     try std.testing.expect(std.mem.indexOf(u8, fat32, "pub fn closeFile") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fat32, "deleteFileInternal(file_idx, true)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fat32, "if (!writeback.invalidateFile(wb_inode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fat32, "const next_cluster = getFATEntry(cluster) orelse") != null);
     try std.testing.expect(std.mem.indexOf(u8, fat32, "pub fn openFileRetained") != null);
     try std.testing.expect(std.mem.indexOf(u8, fat32, "if (!found_entry)") != null);
     try std.testing.expect(std.mem.indexOf(u8, fat32, "if (!fi.active or fi.unlink_pending or fi.is_dir)") != null);

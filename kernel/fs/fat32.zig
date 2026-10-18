@@ -1286,6 +1286,10 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
 }
 
 pub fn deleteFile(file_idx: u32) bool {
+    return deleteFileInternal(file_idx, false);
+}
+
+fn deleteFileInternal(file_idx: u32, allow_pending: bool) bool {
     if (!fat32_active or file_idx >= file_count) return false;
     var flags = fs_lock.acquire();
     // K1 dcache: deleting tombstones a slot that createFile may later reuse
@@ -1293,7 +1297,7 @@ pub fn deleteFile(file_idx: u32) bool {
     // every path, including the bail-outs after the 0xE5 write below.
     defer dcache.invalidateFs(.fat32);
     const fi = files[file_idx];
-    if (!fi.active or fi.unlink_pending or fi.is_dir) {
+    if (!fi.active or (!allow_pending and fi.unlink_pending) or fi.is_dir) {
         fs_lock.release(flags);
         return false;
     }
@@ -1304,8 +1308,8 @@ pub fn deleteFile(file_idx: u32) bool {
     const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
     var dir_cluster: u32 = fat32_root_cluster;
     var dir_safety: u32 = 0;
-    var found_entry = false;
-    scan: while (dir_cluster >= 2 and dir_cluster < 0x0FFFFFF8 and dir_safety < 65536) : (dir_safety += 1) {
+    var found_entry = allow_pending;
+    scan: while (!allow_pending and dir_cluster >= 2 and dir_cluster < 0x0FFFFFF8 and dir_safety < 65536) : (dir_safety += 1) {
         const base_lba = clusterToLBA(dir_cluster);
         var sec: u32 = 0;
         while (sec < fat32_sectors_per_cluster) : (sec += 1) {
@@ -1359,7 +1363,10 @@ pub fn deleteFile(file_idx: u32) bool {
     const writeback = @import("writeback.zig");
     const wb_inode: u64 = 0x2000_0000_0000_0000 + @as(u64, fi.first_cluster);
     fs_lock.release(flags);
-    _ = writeback.invalidateFile(wb_inode, .fat32, writebackFlush);
+    if (!writeback.invalidateFile(wb_inode, .fat32, writebackFlush)) {
+        fs_lock.release(flags);
+        return false;
+    }
     flags = fs_lock.acquire();
     // The slot may have been reused while the lock was dropped; bail out if
     // it no longer refers to the file being deleted.
@@ -1373,10 +1380,33 @@ pub fn deleteFile(file_idx: u32) bool {
     var cluster: u32 = fi.first_cluster;
     var safety: u32 = 0;
     while (cluster >= 2 and cluster < 0x0FFFFFF8 and safety < 65536) : (safety += 1) {
-        const next_cluster = getFATEntry(cluster) orelse break;
-        if (!setFATEntry(cluster, 0)) break;
+        cluster = getFATEntry(cluster) orelse {
+            fs_lock.release(flags);
+            return false;
+        };
+    }
+    if (safety >= 65536) {
+        fs_lock.release(flags);
+        return false;
+    }
+
+    cluster = fi.first_cluster;
+    safety = 0;
+    while (cluster >= 2 and cluster < 0x0FFFFFF8 and safety < 65536) : (safety += 1) {
+        const next_cluster = getFATEntry(cluster) orelse {
+            fs_lock.release(flags);
+            return false;
+        };
+        if (!setFATEntry(cluster, 0)) {
+            fs_lock.release(flags);
+            return false;
+        }
         noteFreedCluster(cluster); // G5: batch a discard extent
         cluster = next_cluster;
+    }
+    if (safety >= 65536) {
+        fs_lock.release(flags);
+        return false;
     }
     flushDiscard(); // G5: issue coalesced discards for the freed chain
     // No cache invalidation needed — setFATEntry keeps cache consistent
@@ -1418,5 +1448,5 @@ pub fn closeFile(file_idx: u32) void {
     files[file_idx].ref_count -= 1;
     const pending = files[file_idx].unlink_pending and files[file_idx].ref_count == 0;
     fs_lock.release(flags);
-    if (pending) _ = deleteFile(file_idx);
+    if (pending) _ = deleteFileInternal(file_idx, true);
 }
