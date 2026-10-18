@@ -237,6 +237,19 @@ test "epoll ctl pins the fd before taking its identity snapshot" {
     try std.testing.expect(pin < snapshot);
 }
 
+test "epoll preserves ready registrations beyond max_events" {
+    const source = kt.epoll_source;
+    try std.testing.expect(std.mem.indexOf(u8, source, "const delivered = count < max_out") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "!snapshot.is_et or !delivered") != null);
+}
+
+test "epoll wake state and nested readiness use synchronized loads" {
+    const source = kt.epoll_source;
+    try std.testing.expect(std.mem.indexOf(u8, source, "@atomicLoad(bool, &node.granted, .acquire)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "const saved = inst.spin.acquire();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "@atomicLoad(bool, &inst.valid, .acquire)") != null);
+}
+
 test "virtio net queue rejects sizes beyond fixed ring storage" {
     const source = @embedFile("../kernel/drivers/virtio_net.zig");
     try std.testing.expect(std.mem.indexOf(u8, source, "qsize == 0 or qsize > QUEUE_SIZE") != null);

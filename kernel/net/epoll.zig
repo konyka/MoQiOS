@@ -120,7 +120,7 @@ pub const InstanceBorrow = struct {
         const inst = &epoll_pool[self.slot];
         if (inst.generation == self.generation and inst.active_ops > 0) {
             inst.active_ops -= 1;
-            if (inst.closing and inst.active_ops == 0) {
+            if (@atomicLoad(bool, &inst.closing, .acquire) and inst.active_ops == 0) {
                 const next_generation = inst.generation +% 1;
                 epoll_pool[self.slot] = .{ .generation = next_generation };
             }
@@ -149,7 +149,7 @@ pub fn acquireInstance(idx: u32) ?InstanceBorrow {
     const saved = pool_lock.acquire();
     defer pool_lock.release(saved);
     const inst = &epoll_pool[idx];
-    if (!inst.valid or inst.closing) return null;
+    if (!@atomicLoad(bool, &inst.valid, .acquire) or @atomicLoad(bool, &inst.closing, .acquire)) return null;
     inst.active_ops += 1;
     return .{ .instance = inst, .slot = idx, .generation = inst.generation };
 }
@@ -176,7 +176,7 @@ pub fn epollCreate() i32 {
     while (free_mask != 0) {
         const candidate: u5 = @intCast(@ctz(free_mask));
         free_mask &= free_mask - 1;
-        if (!epoll_pool[candidate].closing) {
+        if (!@atomicLoad(bool, &epoll_pool[candidate].closing, .acquire)) {
             selected = candidate;
             break;
         }
@@ -339,7 +339,7 @@ pub fn epollWait(epfd_idx: u32, events_buf: u64, max_events: u32, timeout_ms: i3
 
     while (true) {
         // Woken by epollDestroy: the instance is gone, report EBADF.
-        if (!inst.valid) return EBADF;
+        if (!@atomicLoad(bool, &inst.valid, .acquire)) return EBADF;
         var out_events: [MAX_EPOLL_ITEMS]EpollEvent = undefined;
         const n = collectEvents(inst, cur.fd_table, &out_events, max_out);
         if (n > 0) {
@@ -584,7 +584,10 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32, kmsg_cursor: u64
             var borrow = acquireInstance(resource_idx) orelse return EPOLLERR;
             defer borrow.release();
             const inst = borrow.instance;
-            if (inst.ready_head != null) revents |= EPOLLIN;
+            const saved = inst.spin.acquire();
+            const ready = inst.ready_head != null;
+            inst.spin.release(saved);
+            if (ready) revents |= EPOLLIN;
             revents |= EPOLLOUT;
         },
         .eventfd => {
@@ -732,7 +735,6 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
     }
 
     inst.spin.release(saved);
-    if (drained_ready_queue) resetNestedEdgeState(drained_slot, drained_generation);
 
     // Readiness probes may acquire another epoll instance. Do them without
     // holding the parent spinlock, preserving pool_lock -> inst.spin order.
@@ -775,21 +777,30 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
             item.fd_generation == snapshot.fd_generation and
             item.registration_generation == snapshot.registration_generation and
             item.fd_type == snapshot.fd_type and item.resource_idx == snapshot.resource_idx;
-        if (still_registered and count < max_out) {
-            out[count] = .{
-                .events = final_events,
-                .data = snapshot.data,
-            };
-            count += 1;
+        if (still_registered) {
+            const delivered = count < max_out;
+            if (delivered) {
+                out[count] = .{
+                    .events = final_events,
+                    .data = snapshot.data,
+                };
+                count += 1;
+            }
 
-            if (snapshot.is_oneshot) {
+            if (snapshot.is_oneshot and delivered) {
                 item.is_disabled = true;
-            } else if (!snapshot.is_et and matched != 0) {
+            } else if (matched != 0 and (!snapshot.is_et or !delivered)) {
                 addToReadyListLocked(inst, snapshot.slot);
             }
         }
         inst.spin.release(update_saved);
         fd_table.releaseTransferFd(@intCast(snapshot.fd));
+    }
+    if (drained_ready_queue) {
+        const state_saved = inst.spin.acquire();
+        const queue_empty = inst.ready_head == null;
+        inst.spin.release(state_saved);
+        if (queue_empty) resetNestedEdgeState(drained_slot, drained_generation);
     }
     return count;
 }
@@ -848,7 +859,7 @@ fn blockOnEpoll(inst: *EpollInstance, deadline_ns: ?u64) BlockOutcome {
         // load, pairing with sendSignal (set pending, then kick if .blocked):
         // a signal queued before the wait is seen here, not after a timeout.
         const s2 = inst.spin.acquire();
-        if (node.granted) {
+        if (@atomicLoad(bool, &node.granted, .acquire)) {
             inst.spin.release(s2);
             disarmWaitDeadline(my_idx, generation);
             return .event;
@@ -857,7 +868,7 @@ fn blockOnEpoll(inst: *EpollInstance, deadline_ns: ?u64) BlockOutcome {
         // Signal kick: sendSignal unblocks the task without granting the
         // wait node. epollDestroy wakes waiters of a dead instance the same way.
         const actionable = sig_mod.pendingActionable(ct);
-        if (!expired and !actionable and inst.valid) {
+        if (!expired and !actionable and @atomicLoad(bool, &inst.valid, .acquire)) {
             ct.state = .blocked;
             inst.spin.release(s2);
             sched.rescheduleAfterBlock();
@@ -969,7 +980,7 @@ pub fn epollRetain(epoll_idx: u32) void {
     const psaved = pool_lock.acquire();
     defer pool_lock.release(psaved);
     const inst = &epoll_pool[epoll_idx];
-    if (!inst.valid) return;
+    if (!@atomicLoad(bool, &inst.valid, .acquire)) return;
     inst.ref_count += 1;
 }
 
@@ -978,18 +989,18 @@ pub fn epollDestroy(epoll_idx: u32) void {
     if (epoll_idx >= MAX_EPOLL_INSTANCES) return;
     const psaved = pool_lock.acquire();
     const inst = &epoll_pool[epoll_idx];
-    if (!inst.valid or inst.closing) {
+    if (!@atomicLoad(bool, &inst.valid, .acquire) or @atomicLoad(bool, &inst.closing, .acquire)) {
         pool_lock.release(psaved);
         return;
     }
     // Shared across fork/clone: drop one reference, free only at zero.
-    if (inst.valid and inst.ref_count > 1) {
+    if (@atomicLoad(bool, &inst.valid, .acquire) and inst.ref_count > 1) {
         inst.ref_count -= 1;
         pool_lock.release(psaved);
         return;
     }
-    inst.closing = true;
-    inst.valid = false;
+    @atomicStore(bool, &inst.closing, true, .release);
+    @atomicStore(bool, &inst.valid, false, .release);
     valid_epoll_bm &= ~(@as(u32, 1) << @intCast(epoll_idx));
     // Take the instance lock before detaching: an IRQ-side epollNotify may hold
     // it — wait for that critical section to finish.
@@ -1032,7 +1043,7 @@ pub fn epollDestroy(epoll_idx: u32) void {
         }
     }
     const final_lock = pool_lock.acquire();
-    if (inst.active_ops == 0 and inst.closing) {
+    if (inst.active_ops == 0 and @atomicLoad(bool, &inst.closing, .acquire)) {
         const generation = inst.generation +% 1;
         epoll_pool[epoll_idx] = .{ .generation = generation };
     }
