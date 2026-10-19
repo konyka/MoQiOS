@@ -630,7 +630,10 @@ fn setFATEntry(cluster: u32, value: u32) bool {
     // v53.52: propagate the write result — a failed FAT update must not be
     // reported as success (the cache now diverges from disk either way, but
     // the caller decides whether to continue or roll back).
-    if (safeWriteSectors(sector, 1, fbuf) <= 0) return false;
+    if (safeWriteSectors(sector, 1, fbuf) <= 0) {
+        fat_cache_sector = 0xFFFFFFFF;
+        return false;
+    }
     // Cache stays valid — no invalidation needed
     return true;
 }
@@ -1286,6 +1289,8 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
 }
 
 pub fn deleteFile(file_idx: u32) bool {
+    if (file_idx < file_count and files[file_idx].unlink_pending and files[file_idx].ref_count == 0)
+        return deleteFileInternal(file_idx, true);
     return deleteFileInternal(file_idx, false);
 }
 
@@ -1364,6 +1369,10 @@ fn deleteFileInternal(file_idx: u32, allow_pending: bool) bool {
     const wb_inode: u64 = 0x2000_0000_0000_0000 + @as(u64, fi.first_cluster);
     fs_lock.release(flags);
     if (!writeback.invalidateFile(wb_inode, .fat32, writebackFlush)) {
+        flags = fs_lock.acquire();
+        if (file_idx < file_count and files[file_idx].active and files[file_idx].first_cluster == fi.first_cluster) {
+            files[file_idx].unlink_pending = true;
+        }
         fs_lock.release(flags);
         return false;
     }
