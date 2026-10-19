@@ -606,6 +606,11 @@ fn writebackFlush(file_idx: u32, byte_offset: u64, data: [*]const u8, len: u32) 
     return writeFile(file_idx, @intCast(byte_offset), data, len) == len;
 }
 
+fn mmapPageFlush(inode_id: u64, page_offset: u64, data: *[4096]u8) bool {
+    const filemap = @import("../mm/filemap.zig");
+    return writePageByInode(@intCast(inode_id - 0x2000_0000_0000_0000), filemap.mmapCachePage(page_offset), data);
+}
+
 /// Write one FAT entry. Returns false when the backing sector cannot be read
 /// on a cache miss — mirroring getFATEntry, the stale cache contents must not
 /// be modified and written back over an unread sector.
@@ -1237,10 +1242,13 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
     const writeback = @import("writeback.zig");
     const wb_inode: u64 = 0x2000_0000_0000_0000 + @as(u64, fi.first_cluster);
     fs_lock.release(flags);
-    _ = writeback.invalidateFile(wb_inode, .fat32, writebackFlush);
+    if (@import("page_cache.zig").flushInode(wb_inode, mmapPageFlush).failed or
+        !writeback.invalidateFile(wb_inode, .fat32, writebackFlush)) return false;
     flags = fs_lock.acquire();
     // The slot may have been reused while the lock was dropped.
-    if (!files[file_idx].active or files[file_idx].first_cluster != fi.first_cluster) {
+    if (!files[file_idx].active or files[file_idx].first_cluster != fi.first_cluster or files[file_idx].ref_count != 0) {
+        if (files[file_idx].active and files[file_idx].first_cluster == fi.first_cluster and files[file_idx].ref_count != 0)
+            files[file_idx].unlink_pending = true;
         fs_lock.release(flags);
         return false;
     }
@@ -1368,7 +1376,9 @@ fn deleteFileInternal(file_idx: u32, allow_pending: bool) bool {
     const writeback = @import("writeback.zig");
     const wb_inode: u64 = 0x2000_0000_0000_0000 + @as(u64, fi.first_cluster);
     fs_lock.release(flags);
-    if (!writeback.invalidateFile(wb_inode, .fat32, writebackFlush)) {
+    if (@import("page_cache.zig").flushInode(wb_inode, mmapPageFlush).failed or
+        !writeback.invalidateFile(wb_inode, .fat32, writebackFlush))
+    {
         flags = fs_lock.acquire();
         if (file_idx < file_count and files[file_idx].active and files[file_idx].first_cluster == fi.first_cluster) {
             files[file_idx].unlink_pending = true;
@@ -1386,13 +1396,23 @@ fn deleteFileInternal(file_idx: u32, allow_pending: bool) bool {
 
     // Free the cluster chain in FAT
     // v53.38: Use getFATEntry/setFATEntry for FAT cache reuse (P3 fix — N reads → ceil(N/128))
+    const max_cluster = fat32_total_data_clusters + 2;
     var cluster: u32 = fi.first_cluster;
     var safety: u32 = 0;
     while (cluster >= 2 and cluster < 0x0FFFFFF8 and safety < 65536) : (safety += 1) {
-        cluster = getFATEntry(cluster) orelse {
+        if (cluster >= max_cluster) {
+            fs_lock.release(flags);
+            return false;
+        }
+        const next = getFATEntry(cluster) orelse {
             fs_lock.release(flags);
             return false;
         };
+        if (next != 0 and (next < 2 or (next >= max_cluster and next < 0x0FFFFFF8))) {
+            fs_lock.release(flags);
+            return false;
+        }
+        cluster = next;
     }
     if (safety >= 65536) {
         fs_lock.release(flags);
@@ -1402,10 +1422,18 @@ fn deleteFileInternal(file_idx: u32, allow_pending: bool) bool {
     cluster = fi.first_cluster;
     safety = 0;
     while (cluster >= 2 and cluster < 0x0FFFFFF8 and safety < 65536) : (safety += 1) {
+        if (cluster >= max_cluster) {
+            fs_lock.release(flags);
+            return false;
+        }
         const next_cluster = getFATEntry(cluster) orelse {
             fs_lock.release(flags);
             return false;
         };
+        if (next_cluster != 0 and (next_cluster < 2 or (next_cluster >= max_cluster and next_cluster < 0x0FFFFFF8))) {
+            fs_lock.release(flags);
+            return false;
+        }
         if (!setFATEntry(cluster, 0)) {
             fs_lock.release(flags);
             return false;
