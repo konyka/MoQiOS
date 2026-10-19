@@ -611,6 +611,22 @@ fn mmapPageFlush(inode_id: u64, page_offset: u64, data: *[4096]u8) bool {
     return writePageByInode(@intCast(inode_id - 0x2000_0000_0000_0000), filemap.mmapCachePage(page_offset), data);
 }
 
+fn zeroFileTail(first_cluster: u32, offset: u32) bool {
+    const cluster_size = @as(u32, fat32_sectors_per_cluster) * SECTOR_SIZE;
+    const in_cluster = offset % cluster_size;
+    if (in_cluster == 0 and offset != 0) return true;
+    var cluster = first_cluster;
+    var remaining = offset / cluster_size;
+    while (remaining > 0) : (remaining -= 1) {
+        cluster = getFATEntry(cluster) orelse return false;
+        if (cluster < 2 or cluster >= 0x0FFFFFF8) return false;
+    }
+    const buf: [*]u8 = @ptrFromInt(write_buf_virt);
+    if (virtio_blk.readSectors(clusterToLBA(cluster), fat32_sectors_per_cluster, buf) <= 0) return false;
+    @memset(buf[in_cluster..cluster_size], 0);
+    return safeWriteSectors(clusterToLBA(cluster), fat32_sectors_per_cluster, buf) > 0;
+}
+
 /// Write one FAT entry. Returns false when the backing sector cannot be read
 /// on a cache miss — mirroring getFATEntry, the stale cache contents must not
 /// be modified and written back over an unread sector.
@@ -1267,6 +1283,7 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
     var safety: u32 = 0;
     var last_kept: u32 = 0;
     var tail_ok = true;
+    var tail_start: u32 = 0;
     while (cluster >= 2 and cluster < 0x0FFFFFF8 and safety < 65536) : (safety += 1) {
         const next = getFATEntry(cluster) orelse {
             tail_ok = false;
@@ -1274,12 +1291,7 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
         };
         if (ci < keep) {
             last_kept = cluster;
-        } else {
-            if (!setFATEntry(cluster, 0)) {
-                tail_ok = false;
-                break;
-            }
-            noteFreedCluster(cluster); // G5: batch a discard extent
+            if (ci + 1 == keep) tail_start = next;
         }
         cluster = next;
         ci += 1;
@@ -1289,14 +1301,33 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
         fs_lock.release(flags);
         return false;
     }
-    flushDiscard(); // G5: issue coalesced discards for the freed tail
-    // Terminate the chain at the last kept cluster.
-    if (last_kept >= 2) {
-        if (!setFATEntry(last_kept, 0x0FFFFFFF)) {
+    if (!zeroFileTail(fi.first_cluster, new_size)) {
+        fs_lock.release(flags);
+        return false;
+    }
+    if (last_kept >= 2 and !setFATEntry(last_kept, 0x0FFFFFFF)) {
+        fs_lock.release(flags);
+        return false;
+    }
+    var tail_cluster = tail_start;
+    var tail_safety: u32 = 0;
+    while (tail_cluster >= 2 and tail_cluster < 0x0FFFFFF8 and tail_safety < 65536) : (tail_safety += 1) {
+        const next_tail = getFATEntry(tail_cluster) orelse {
+            fs_lock.release(flags);
+            return false;
+        };
+        if (!setFATEntry(tail_cluster, 0)) {
             fs_lock.release(flags);
             return false;
         }
+        noteFreedCluster(tail_cluster);
+        tail_cluster = next_tail;
     }
+    if (tail_safety >= 65536) {
+        fs_lock.release(flags);
+        return false;
+    }
+    flushDiscard(); // G5: issue coalesced discards for the freed tail
 
     const old_size = files[file_idx].size;
     const old_last_cluster = files[file_idx].last_cluster;
