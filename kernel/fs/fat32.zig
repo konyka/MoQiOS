@@ -1246,31 +1246,48 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
         !writeback.invalidateFile(wb_inode, .fat32, writebackFlush)) return false;
     flags = fs_lock.acquire();
     // The slot may have been reused while the lock was dropped.
-    if (!files[file_idx].active or files[file_idx].first_cluster != fi.first_cluster or files[file_idx].ref_count != 0) {
-        if (files[file_idx].active and files[file_idx].first_cluster == fi.first_cluster and files[file_idx].ref_count != 0)
-            files[file_idx].unlink_pending = true;
+    if (!files[file_idx].active or files[file_idx].first_cluster != fi.first_cluster or
+        files[file_idx].size != fi.size or files[file_idx].last_cluster != fi.last_cluster)
+    {
         fs_lock.release(flags);
         return false;
     }
 
     const cluster_size = @as(u32, fat32_sectors_per_cluster) * SECTOR_SIZE;
-    var keep: u32 = (new_size + cluster_size - 1) / cluster_size;
+    const keep_u64 = (@as(u64, new_size) + @as(u64, cluster_size) - 1) / @as(u64, cluster_size);
+    if (keep_u64 > 0xFFFF_FFFF) {
+        fs_lock.release(flags);
+        return false;
+    }
+    var keep: u32 = @intCast(keep_u64);
     if (keep == 0) keep = 1; // createFile invariant: a file always owns >= 1 cluster
 
     var cluster: u32 = fi.first_cluster;
     var ci: u32 = 0;
     var safety: u32 = 0;
     var last_kept: u32 = 0;
+    var tail_ok = true;
     while (cluster >= 2 and cluster < 0x0FFFFFF8 and safety < 65536) : (safety += 1) {
-        const next = getFATEntry(cluster) orelse break;
+        const next = getFATEntry(cluster) orelse {
+            tail_ok = false;
+            break;
+        };
         if (ci < keep) {
             last_kept = cluster;
         } else {
-            if (!setFATEntry(cluster, 0)) break;
+            if (!setFATEntry(cluster, 0)) {
+                tail_ok = false;
+                break;
+            }
             noteFreedCluster(cluster); // G5: batch a discard extent
         }
         cluster = next;
         ci += 1;
+    }
+    if (safety >= 65536) tail_ok = false;
+    if (!tail_ok) {
+        fs_lock.release(flags);
+        return false;
     }
     flushDiscard(); // G5: issue coalesced discards for the freed tail
     // Terminate the chain at the last kept cluster.
@@ -1281,6 +1298,8 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
         }
     }
 
+    const old_size = files[file_idx].size;
+    const old_last_cluster = files[file_idx].last_cluster;
     files[file_idx].size = new_size;
     if (last_kept >= 2) files[file_idx].last_cluster = last_kept;
     // The cached chain-walk position may point past the freed tail.
@@ -1289,6 +1308,10 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
     // v53.52: clusters beyond the new size are already freed; if the on-disk
     // size update fails, report it instead of claiming a clean truncate.
     const dir_ok = updateDirEntry(file_idx);
+    if (!dir_ok) {
+        files[file_idx].size = old_size;
+        files[file_idx].last_cluster = old_last_cluster;
+    }
 
     const page_cache = @import("page_cache.zig");
     page_cache.invalidateInode(wb_inode);

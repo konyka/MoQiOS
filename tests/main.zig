@@ -290,6 +290,13 @@ test "fat32 open-file lifetime defers unlink reclamation" {
     try std.testing.expect(std.mem.indexOf(u8, vfs, ".fat32_file => @import(\"fat32.zig\").retainFile") != null);
 }
 
+test "fat32 truncate preserves old metadata on failed directory update" {
+    const fat32 = @embedFile("../kernel/fs/fat32.zig");
+    try std.testing.expect(std.mem.indexOf(u8, fat32, "const old_size = files[file_idx].size") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fat32, "if (!tail_ok)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "!fat32.truncateFile(idx, 0)") != null);
+}
+
 test "virtio net queue rejects sizes beyond fixed ring storage" {
     const source = @embedFile("../kernel/drivers/virtio_net.zig");
     try std.testing.expect(std.mem.indexOf(u8, source, "qsize == 0 or qsize > QUEUE_SIZE") != null);

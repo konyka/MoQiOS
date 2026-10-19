@@ -981,7 +981,10 @@ pub const FdTable = struct {
             var fi = fat32.openFileRetained(name);
             if (fi >= 0) {
                 const idx: u32 = @intCast(fi);
-                if (o_trunc and is_writable) _ = fat32.truncateFile(idx, 0);
+                if (o_trunc and is_writable and !fat32.truncateFile(idx, 0)) {
+                    _ = self.close(@intCast(slot));
+                    return -5;
+                }
                 self.fds[slot] = .{
                     .fd_type = .fat32_file,
                     .offset = 0,
