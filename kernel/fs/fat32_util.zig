@@ -20,7 +20,8 @@ pub const Partition = struct {
 
 /// Parse MBR primary partition entry `idx` (0..3) from a 512-byte boot sector.
 /// Returns null for an empty entry (partition type == 0).
-pub fn parsePartition(buf: [*]const u8, idx: u32) ?Partition {
+pub fn parsePartition(buf: *const [512]u8, idx: u32) ?Partition {
+    if (idx >= MAX_PARTITIONS) return null;
     const off = 446 + idx * 16;
     const ptype = buf[off + 4];
     if (ptype == 0) return null;
@@ -57,7 +58,7 @@ pub const Bpb = struct {
 /// Parse and validate a FAT32 BPB from a 512-byte boot sector whose volume
 /// begins at absolute `lba_start`. Returns null if it is not a valid FAT32
 /// volume (bad sector size / geometry / FS-type signature).
-pub fn parseBpb(buf: [*]const u8, lba_start: u32) ?Bpb {
+pub fn parseBpb(buf: *const [512]u8, lba_start: u32) ?Bpb {
     const bytes_per_sector: u16 = @bitCast([2]u8{ buf[11], buf[12] });
     const sectors_per_cluster: u8 = buf[13];
     const reserved_sectors: u16 = @bitCast([2]u8{ buf[14], buf[15] });
@@ -67,7 +68,9 @@ pub fn parseBpb(buf: [*]const u8, lba_start: u32) ?Bpb {
     const fat_size_32: u32 = @bitCast([4]u8{ buf[36], buf[37], buf[38], buf[39] });
     const root_cluster: u32 = @bitCast([4]u8{ buf[44], buf[45], buf[46], buf[47] });
 
-    if (bytes_per_sector != 512 or sectors_per_cluster == 0 or reserved_sectors == 0) return null;
+    if (bytes_per_sector != 512 or sectors_per_cluster == 0 or
+        sectors_per_cluster > 128 or (sectors_per_cluster & (sectors_per_cluster - 1)) != 0 or
+        reserved_sectors == 0 or num_fats == 0 or fat_size_32 == 0) return null;
 
     // FS type string at 82..87 should read "FAT32"; also accept images that
     // omit it as long as the extended boot signature (0x29 @ 66) or a leading
@@ -77,9 +80,15 @@ pub fn parseBpb(buf: [*]const u8, lba_start: u32) ?Bpb {
     if (!sig_ok and buf[66] != 0x29 and buf[82] != 'F') return null;
 
     const total_sectors: u32 = if (total_sectors_32 != 0) total_sectors_32 else total_sectors_16;
-    const fat_start = lba_start + reserved_sectors;
-    const data_start = fat_start + @as(u32, num_fats) * fat_size_32;
-    const data_sectors = total_sectors - @as(u32, reserved_sectors) - @as(u32, num_fats) * fat_size_32;
+    const fat_span = @as(u64, num_fats) * fat_size_32;
+    const metadata = @as(u64, reserved_sectors) + fat_span;
+    if (total_sectors == 0 or metadata >= total_sectors) return null;
+    const fat_start_u64 = @as(u64, lba_start) + reserved_sectors;
+    const data_start_u64 = fat_start_u64 + fat_span;
+    if (data_start_u64 > 0xFFFF_FFFF) return null;
+    const data_sectors = total_sectors - @as(u32, @intCast(metadata));
+    const total_data_clusters = data_sectors / @as(u32, sectors_per_cluster);
+    if (total_data_clusters == 0 or root_cluster < 2 or root_cluster >= total_data_clusters + 2) return null;
 
     return .{
         .bytes_per_sector = bytes_per_sector,
@@ -89,10 +98,10 @@ pub fn parseBpb(buf: [*]const u8, lba_start: u32) ?Bpb {
         .root_cluster = root_cluster,
         .total_sectors = total_sectors,
         .fat_size_sectors = fat_size_32,
-        .fat_start = fat_start,
-        .data_start = data_start,
+        .fat_start = @intCast(fat_start_u64),
+        .data_start = @intCast(data_start_u64),
         .sector_mask = sectors_per_cluster - 1,
-        .total_data_clusters = data_sectors / @as(u32, sectors_per_cluster),
+        .total_data_clusters = total_data_clusters,
     };
 }
 
@@ -100,6 +109,7 @@ pub fn parseBpb(buf: [*]const u8, lba_start: u32) ?Bpb {
 
 /// LBA of the first sector of data `cluster` (valid clusters start at 2).
 pub fn clusterToLba(data_start: u32, sectors_per_cluster: u8, cluster: u32) u32 {
+    if (cluster < 2 or sectors_per_cluster == 0) return 0;
     return data_start + (cluster - 2) * @as(u32, sectors_per_cluster);
 }
 
@@ -107,6 +117,7 @@ pub const FatLoc = struct { sector: u32, offset: u32 };
 
 /// Sector + byte offset of the 32-bit FAT entry describing `cluster`.
 pub fn fatEntryLocation(fat_start: u32, bytes_per_sector: u16, cluster: u32) FatLoc {
+    if (bytes_per_sector == 0) return .{ .sector = 0, .offset = 0 };
     const fat_offset = cluster * 4;
     return .{
         .sector = fat_start + fat_offset / @as(u32, bytes_per_sector),
@@ -410,7 +421,7 @@ pub fn utf8ToUtf16(src: []const u8, out: []u16) ?u32 {
             const c2 = src[i + 2];
             if ((c1 & 0xC0) != 0x80 or (c2 & 0xC0) != 0x80) return null;
             cp = (@as(u32, c0 & 0x0F) << 12) | (@as(u32, c1 & 0x3F) << 6) | (c2 & 0x3F);
-            if (cp < 0x800) return null;
+            if (cp < 0x800 or (cp >= 0xD800 and cp <= 0xDFFF)) return null;
             adv = 3;
         } else if ((c0 & 0xF8) == 0xF0) {
             if (i + 3 >= src.len) return null;
@@ -628,7 +639,7 @@ pub fn buildLfnEntries(
     if (utf8_name.len == 0 or out_entries.len == 0) return null;
     var units: [260]u16 = undefined;
     const nunits = utf8ToUtf16(utf8_name, units[0..]) orelse return null;
-    if (nunits == 0) return null;
+    if (nunits == 0 or nunits > 255) return null;
     const nslots = (nunits + 12) / 13;
     if (nslots == 0 or nslots > MAX_LFN_SLOTS or nslots > out_entries.len) return null;
     const sum = lfnChecksum(short_name);

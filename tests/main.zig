@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const kt = @import("kernel_shared");
+const fat32_util = kt.fat32_util;
 
 const byte_order = kt.byte_order;
 const aio_policy = kt.aio_policy;
@@ -288,6 +289,22 @@ test "fat32 open-file lifetime defers unlink reclamation" {
     try std.testing.expect(std.mem.indexOf(u8, vfs, "retainFile(source.fat32_file_idx)") != null);
     try std.testing.expect(std.mem.indexOf(u8, vfs, "@import(\"fat32.zig\").closeFile") != null);
     try std.testing.expect(std.mem.indexOf(u8, vfs, ".fat32_file => @import(\"fat32.zig\").retainFile") != null);
+}
+
+test "fat32 utility rejects malformed geometry and UTF-8" {
+    var b = [_]u8{0} ** 512;
+    try std.testing.expect(fat32_util.parsePartition(&b, 4) == null);
+    b[11] = 0;
+    b[12] = 2;
+    b[13] = 1;
+    b[14] = 1;
+    b[16] = 1;
+    b[32] = 1;
+    b[36] = 1;
+    try std.testing.expect(fat32_util.parseBpb(&b, 0) == null);
+    var utf16: [8]u16 = undefined;
+    try std.testing.expect(fat32_util.utf8ToUtf16(&[_]u8{ 0xED, 0xA0, 0x80 }, &utf16) == null);
+    try std.testing.expect(fat32_util.clusterToLba(100, 8, 0) == 0);
 }
 
 test "fat32 truncate preserves old metadata on failed directory update" {

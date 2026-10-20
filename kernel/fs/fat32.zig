@@ -165,7 +165,7 @@ fn parseMBR(buf: [*]const u8) void {
     partition_count = 0;
     var i: u32 = 0;
     while (i < 4) : (i += 1) {
-        const part = fat_util.parsePartition(buf, i) orelse continue;
+        const part = fat_util.parsePartition(@ptrCast(buf), i) orelse continue;
 
         partitions[partition_count] = part;
         partition_count += 1;
@@ -214,7 +214,7 @@ fn tryMountFAT32() void {
     }
 
     // Parse + validate the FAT32 BPB (pure geometry math in fat32_util).
-    const bpb = fat_util.parseBpb(buf, lba) orelse {
+    const bpb = fat_util.parseBpb(@ptrCast(buf), lba) orelse {
         serial.writeString("[fs] Not a valid FAT32 filesystem\n");
         return;
     };
