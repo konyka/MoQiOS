@@ -313,6 +313,12 @@ test "fat32 utility rejects malformed geometry and UTF-8" {
     try std.testing.expect(fat32_util.buildLfnEntries("a\x00b", &short_name, lfn_slots[0..]) == null);
 }
 
+test "fat32 root directory growth rolls back an unlinked cluster" {
+    const source = kt.fat32_source;
+    try std.testing.expect(std.mem.indexOf(u8, source, "if (!setFATEntry(last, nc))") != null);
+    try std.testing.expect(std.mem.indexOfPos(u8, source, "if (!setFATEntry(last, nc))", "setFATEntry(nc, 0)") != null);
+}
+
 test "fat32 truncate preserves old metadata on failed directory update" {
     const fat32 = @embedFile("../kernel/fs/fat32.zig");
     try std.testing.expect(std.mem.indexOf(u8, fat32, "const old_size = files[file_idx].size") != null);

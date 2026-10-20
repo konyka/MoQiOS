@@ -31,6 +31,7 @@ pub const readlink_policy = @import("fs/readlink_policy.zig");
 pub const chdir_policy = @import("fs/chdir_policy.zig");
 pub const splice = @import("fs/splice.zig");
 pub const fat32_util = @import("fs/fat32_util.zig");
+pub const fat32_source = @embedFile("fs/fat32.zig");
 
 test "splice pipe-to-file nonblocking result distinguishes live pipe from EOF" {
     const std = @import("std");

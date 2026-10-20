@@ -792,7 +792,10 @@ fn growRootDir() bool {
         _ = setFATEntry(nc, 0); // best-effort release; on failure the cluster leaks until fsck
         return false;
     }
-    if (!setFATEntry(last, nc)) return false;
+    if (!setFATEntry(last, nc)) {
+        _ = setFATEntry(nc, 0);
+        return false;
+    }
     return true;
 }
 
