@@ -85,10 +85,10 @@ pub fn parseBpb(buf: *const [512]u8, lba_start: u32) ?Bpb {
     if (total_sectors == 0 or metadata >= total_sectors) return null;
     const fat_start_u64 = @as(u64, lba_start) + reserved_sectors;
     const data_start_u64 = fat_start_u64 + fat_span;
-    if (data_start_u64 > 0xFFFF_FFFF) return null;
+    if (data_start_u64 > 0xFFFF_FFFF or @as(u64, lba_start) + total_sectors > 0x1_0000_0000) return null;
     const data_sectors = total_sectors - @as(u32, @intCast(metadata));
     const total_data_clusters = data_sectors / @as(u32, sectors_per_cluster);
-    if (total_data_clusters == 0 or root_cluster < 2 or root_cluster >= total_data_clusters + 2) return null;
+    if (total_data_clusters == 0 or root_cluster < 2 or @as(u64, root_cluster - 2) >= total_data_clusters) return null;
 
     return .{
         .bytes_per_sector = bytes_per_sector,
@@ -110,23 +110,27 @@ pub fn parseBpb(buf: *const [512]u8, lba_start: u32) ?Bpb {
 /// LBA of the first sector of data `cluster` (valid clusters start at 2).
 pub fn clusterToLba(data_start: u32, sectors_per_cluster: u8, cluster: u32) u32 {
     if (cluster < 2 or sectors_per_cluster == 0) return 0;
-    return data_start + (cluster - 2) * @as(u32, sectors_per_cluster);
+    const lba = @as(u64, data_start) + @as(u64, cluster - 2) * sectors_per_cluster;
+    return if (lba <= 0xFFFF_FFFF) @intCast(lba) else 0;
 }
 
 pub const FatLoc = struct { sector: u32, offset: u32 };
 
 /// Sector + byte offset of the 32-bit FAT entry describing `cluster`.
 pub fn fatEntryLocation(fat_start: u32, bytes_per_sector: u16, cluster: u32) FatLoc {
-    if (bytes_per_sector == 0) return .{ .sector = 0, .offset = 0 };
-    const fat_offset = cluster * 4;
+    if (bytes_per_sector < 4 or bytes_per_sector % 4 != 0) return .{ .sector = 0, .offset = 0 };
+    const fat_offset = @as(u64, cluster) * 4;
+    const sector = @as(u64, fat_start) + fat_offset / bytes_per_sector;
+    if (sector > 0xFFFF_FFFF) return .{ .sector = 0, .offset = 0 };
     return .{
-        .sector = fat_start + fat_offset / @as(u32, bytes_per_sector),
-        .offset = fat_offset % @as(u32, bytes_per_sector),
+        .sector = @intCast(sector),
+        .offset = @intCast(fat_offset % bytes_per_sector),
     };
 }
 
 /// Extract the 28-bit FAT32 entry value from a sector buffer at `offset`.
-pub fn fatEntryValue(sector_buf: [*]const u8, offset: u32) u32 {
+pub fn fatEntryValue(sector_buf: []const u8, offset: u32) ?u32 {
+    if (offset > sector_buf.len or sector_buf.len - offset < 4) return null;
     const raw: u32 = @bitCast([4]u8{
         sector_buf[offset],
         sector_buf[offset + 1],
@@ -346,18 +350,20 @@ pub fn assembleLfnUtf8(
         if (!isLfnAttr(entry[11])) return null;
         const first = entry[0];
         if (first == 0x00 or first == 0xE5) return null;
+        if ((first & 0xA0) != 0 or entry[12] != 0 or entry[26] != 0 or entry[27] != 0) return null;
         const seq: u32 = lfnSequence(first);
         if (seq == 0 or seq > MAX_LFN_SLOTS) return null;
         if (i == 0) {
             if (!isLastLfnSlot(first)) return null;
+            max_seq = seq;
         } else if (isLastLfnSlot(first)) {
             return null;
         }
+        if (i > 0 and seq != max_seq - @as(u32, @intCast(i))) return null;
         if (lfnEntryChecksum(entry) != expect) return null;
         if (slot_present[seq - 1]) return null;
         slot_lens[seq - 1] = decodeLfnEntryChars(entry, &slot_chars[seq - 1]);
         slot_present[seq - 1] = true;
-        if (seq > max_seq) max_seq = seq;
     }
     if (max_seq != lfn_entries.len) return null;
     for (0..max_seq) |si| {

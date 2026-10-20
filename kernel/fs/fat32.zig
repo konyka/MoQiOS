@@ -262,7 +262,7 @@ fn getFATEntry(cluster: u32) ?u32 {
         if (virtio_blk.readSectors(loc.sector, 1, fbuf) <= 0) return null;
         fat_cache_sector = loc.sector;
     }
-    return fat_util.fatEntryValue(fbuf, loc.offset);
+    return fat_util.fatEntryValue(fbuf[0..fat32_bytes_per_sector], loc.offset) orelse 0;
 }
 
 fn listRootDir() void {

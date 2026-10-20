@@ -305,6 +305,8 @@ test "fat32 utility rejects malformed geometry and UTF-8" {
     var utf16: [8]u16 = undefined;
     try std.testing.expect(fat32_util.utf8ToUtf16(&[_]u8{ 0xED, 0xA0, 0x80 }, &utf16) == null);
     try std.testing.expect(fat32_util.clusterToLba(100, 8, 0) == 0);
+    var fat_sector = [_]u8{0} ** 512;
+    try std.testing.expect(fat32_util.fatEntryValue(&fat_sector, 509) == null);
 }
 
 test "fat32 truncate preserves old metadata on failed directory update" {
