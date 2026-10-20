@@ -838,6 +838,7 @@ const SchedStats = struct {
 - FAT32 partial truncate zeros the retained cluster tail and detaches the live chain before freeing tail clusters, preventing retry after FAT I/O failure from traversing reclaimed clusters.
 - FAT32 utility parsers reject undersized/invalid BPB geometry, out-of-range MBR entries, invalid root/cluster arithmetic, and surrogate UTF-8; these contracts are exercised by host tests.
 - FAT32 utility arithmetic returns checked/sentinel results for invalid cluster and FAT-entry offsets; LFN assembly requires reserved fields and exact forward sequence order.
+- FAT32 driver callers reject invalid utility sentinels before sector I/O, including malformed FAT-chain clusters that would otherwise target MBR sector zero.
 - mmap file-cache 命中使用 `getPageFramePinned`：在 `cache_lock` 内先增加映射引用，再把物理帧交给 page-table fault path，避免 eviction 在 lookup 与 `addRef` 之间释放/复用帧。
 - page-cache insertion 在 `cache_lock` 内二次检查 `(inode_id, page_offset)`；并发 miss 不会创建 duplicate key，owned insertion 遇到已存在页面返回 null 并保留 incoming frame 由调用方释放。
 - AArch64 paging facade 的 `isPageMapped` 现在读取真实 user mapping；AArch64/RISC-V `unmapPage` 返回被移除的物理帧，保持 shared paging API 的回收/验证 contract。

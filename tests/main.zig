@@ -307,6 +307,10 @@ test "fat32 utility rejects malformed geometry and UTF-8" {
     try std.testing.expect(fat32_util.clusterToLba(100, 8, 0) == 0);
     var fat_sector = [_]u8{0} ** 512;
     try std.testing.expect(fat32_util.fatEntryValue(&fat_sector, 509) == null);
+    try std.testing.expect(fat32_util.fatEntryLocation(0xFFFF_FFF0, 512, 0x4000_0000).sector == 0);
+    var lfn_slots: [20][32]u8 = undefined;
+    var short_name = [_]u8{ 'T', 'E', 'S', 'T', ' ', ' ', ' ', ' ', 'T', 'X', 'T' };
+    try std.testing.expect(fat32_util.buildLfnEntries("a\x00b", &short_name, lfn_slots[0..]) == null);
 }
 
 test "fat32 truncate preserves old metadata on failed directory update" {

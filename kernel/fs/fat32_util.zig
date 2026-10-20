@@ -25,11 +25,14 @@ pub fn parsePartition(buf: *const [512]u8, idx: u32) ?Partition {
     const off = 446 + idx * 16;
     const ptype = buf[off + 4];
     if (ptype == 0) return null;
+    const lba_start: u32 = @bitCast([4]u8{ buf[off + 8], buf[off + 9], buf[off + 10], buf[off + 11] });
+    const sector_count: u32 = @bitCast([4]u8{ buf[off + 12], buf[off + 13], buf[off + 14], buf[off + 15] });
+    if (lba_start == 0 or sector_count == 0) return null;
     return .{
         .bootable = buf[off] == 0x80,
         .type = ptype,
-        .lba_start = @bitCast([4]u8{ buf[off + 8], buf[off + 9], buf[off + 10], buf[off + 11] }),
-        .sector_count = @bitCast([4]u8{ buf[off + 12], buf[off + 13], buf[off + 14], buf[off + 15] }),
+        .lba_start = lba_start,
+        .sector_count = sector_count,
     };
 }
 
@@ -359,7 +362,9 @@ pub fn assembleLfnUtf8(
         } else if (isLastLfnSlot(first)) {
             return null;
         }
-        if (i > 0 and seq != max_seq - @as(u32, @intCast(i))) return null;
+        if (i > 0) {
+            if (i >= max_seq or seq != max_seq - @as(u32, @intCast(i))) return null;
+        }
         if (lfnEntryChecksum(entry) != expect) return null;
         if (slot_present[seq - 1]) return null;
         slot_lens[seq - 1] = decodeLfnEntryChars(entry, &slot_chars[seq - 1]);
@@ -390,6 +395,7 @@ pub fn assembleLfnUtf8(
             } else {
                 cp = unit;
             }
+            if (out_len > out.len) return null;
             const wrote = utf8EncodeCp(cp, out[out_len..]) orelse return null;
             out_len += wrote;
         }
@@ -643,6 +649,7 @@ pub fn buildLfnEntries(
     out_entries: [][32]u8,
 ) ?u32 {
     if (utf8_name.len == 0 or out_entries.len == 0) return null;
+    for (utf8_name) |byte| if (byte == 0) return null;
     var units: [260]u16 = undefined;
     const nunits = utf8ToUtf16(utf8_name, units[0..]) orelse return null;
     if (nunits == 0 or nunits > 255) return null;

@@ -246,6 +246,7 @@ fn tryMountFAT32() void {
 }
 
 fn clusterToLBA(cluster: u32) u32 {
+    if (cluster < 2 or cluster >= fat32_total_data_clusters + 2) return 0;
     return fat_util.clusterToLba(fat32_data_start, fat32_sectors_per_cluster, cluster);
 }
 
@@ -253,7 +254,9 @@ fn clusterToLBA(cluster: u32) u32 {
 /// NOT marked cached in that case, so stale cache contents are never consumed
 /// (previously the failure was ignored and the sector marked valid anyway).
 fn getFATEntry(cluster: u32) ?u32 {
+    if (cluster < 2 or cluster >= fat32_total_data_clusters + 2) return null;
     const loc = fat_util.fatEntryLocation(fat32_fat_start, fat32_bytes_per_sector, cluster);
+    if (loc.sector == 0 and fat32_fat_start != 0) return null;
 
     // v53.36: Single-sector FAT cache (P2 fix — 128x I/O reduction)
     // v53.37: DMA-safe HHDM buffer (Critical fix — BSS globals not DMA-safe)
