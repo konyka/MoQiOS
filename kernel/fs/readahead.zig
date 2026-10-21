@@ -87,9 +87,15 @@ fn insertCachedBlock(state: *ReadaheadState, block_num: u64, data: [*]const u8, 
         }
     }
     const replacement = pmm.allocPage() orelse return false;
+    // Evict the OLDEST entry (cache[0]). The previous shift moved the whole
+    // array down and then freed cache[MAX_WINDOW-1]: that aliased
+    // cache[MAX_WINDOW-2] with the freed page (dangling entry, double free at
+    // close) and silently dropped old cache[0]'s page (one 4 KiB leak per
+    // prefetched block).
+    const evicted = state.cache[0];
     var i: usize = 0;
     while (i < MAX_WINDOW - 1) : (i += 1) state.cache[i] = state.cache[i + 1];
-    if (state.cache[MAX_WINDOW - 1].valid and state.cache[MAX_WINDOW - 1].data != 0) pmm.freePage(state.cache[MAX_WINDOW - 1].data);
+    if (evicted.valid and evicted.data != 0) pmm.freePage(evicted.data);
     const virt: u64 = hhdm.physToVirt(replacement);
     const dst: [*]u8 = @ptrFromInt(virt);
     const copy_len = @min(block_size, @as(u32, 4096));

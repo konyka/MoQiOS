@@ -139,6 +139,11 @@ pub fn deriveGeometry(sb: *const Ext2Superblock) ?Geometry {
     const block_size: u32 = @as(u32, 1024) << @intCast(sb.log_block_size);
     var inode_sz: u32 = if (sb.rev_level >= 1) sb.inode_size else 128;
     if (inode_sz == 0) inode_sz = 128;
+    // An inode-per-group value beyond one bitmap block (8 bits per byte) is
+    // impossible for any real ext2 volume; larger values made
+    // index * inode_size arithmetic in inodeLocation overflow on hostile
+    // images (e2fsprogs caps this at 8*block_size for the same reason).
+    if (sb.inodes_per_group > block_size * 8) return null;
     const groups_count = (sb.blocks_count + sb.blocks_per_group - 1) / sb.blocks_per_group;
     if (groups_count == 0) return null;
     return .{

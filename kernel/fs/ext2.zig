@@ -634,10 +634,13 @@ fn readSymlinkTarget(inode: *const Ext2Inode) ?[]const u8 {
     const size = inode.size;
     if (size == 0) return null;
 
-    // Short symlink: target stored inline in i_block (up to 60 bytes)
+    // Short symlink: target stored inline in i_block (up to 60 bytes). `size`
+    // comes straight off the disk — clamp it to the 60 usable bytes of
+    // i_block or a corrupt inode reads past the struct.
     if (inode.blocks == 0) {
+        const inline_len = @min(size, @as(u32, 60));
         const block_bytes: [*]const u8 = @ptrCast(&inode.block);
-        return block_bytes[0..size];
+        return block_bytes[0..inline_len];
     }
 
     // Long symlink: target stored in data block — copy to static buffer
@@ -834,7 +837,14 @@ pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
         } else {
             // Cache miss — read from disk
             const phys_block = resolveBlock(&f.inode, logical_block);
-            if (phys_block == 0) break;
+            if (phys_block == 0) {
+                // Sparse hole: POSIX reads zeros. Returning EIO (or a short
+                // read) here made every ftruncate-grown file unreadable.
+                @memset(buf[read_total .. read_total + chunk], 0);
+                read_total += chunk;
+                current_offset += chunk;
+                continue;
+            }
             const tmp_phys = pmm.allocPage() orelse break;
             const tmp: [*]u8 = @ptrFromInt(hhdm.physToVirt(tmp_phys));
             // v53.28: Use readBlockUncached to avoid polluting ext2 block cache with data blocks
@@ -1450,51 +1460,6 @@ pub fn truncateByInode(inode_num: u32, new_size: u32) bool {
 
 /// Rename a file: remove old entry from source dir, add entry in dest dir.
 /// Supports cross-directory rename (old_path and new_path can be in different dirs).
-pub fn renameFile(old_path: []const u8, new_path: []const u8) bool {
-    const flags = fs_lock.acquire();
-    defer fs_lock.release(flags);
-    if (!active) return false;
-
-    // Resolve source: parent dir + old filename
-    const old_resolved = resolveParent(old_path) orelse return false;
-    const old_parent_inode = old_resolved.parent;
-    const old_filename = old_resolved.name;
-
-    // Resolve destination: parent dir + new filename
-    const new_resolved = resolveParent(new_path) orelse return false;
-    const new_parent_inode = new_resolved.parent;
-    const new_filename = new_resolved.name;
-
-    // Find the file's inode
-    var old_parent_ino_data: Ext2Inode = undefined;
-    if (!readInode(old_parent_inode, &old_parent_ino_data)) return false;
-    const file_inode_num = findDirEntryCached(old_parent_inode, &old_parent_ino_data, old_filename) orelse return false;
-
-    // Read file inode to get file_type
-    var file_inode: Ext2Inode = undefined;
-    if (!readInode(file_inode_num, &file_inode)) return false;
-    const file_type: u8 = if (eu.isDirectory(file_inode.mode)) 2 else 1;
-
-    // If destination exists, remove it first (overwrite semantics)
-    var new_parent_inode_data: Ext2Inode = undefined;
-    if (readInode(new_parent_inode, &new_parent_inode_data)) {
-        if (findDirEntryCached(new_parent_inode, &new_parent_inode_data, new_filename)) |_| {
-            _ = removeDirEntry(new_parent_inode, new_filename);
-        }
-    }
-
-    // Remove old directory entry
-    if (!removeDirEntry(old_parent_inode, old_filename)) return false;
-
-    // Add new directory entry (possibly in a different directory)
-    if (!addDirEntry(new_parent_inode, file_inode_num, new_filename, file_type)) return false;
-
-    serial.writeString("[ext2] renamed to: ");
-    serial.writeString(new_filename);
-    serial.writeString("\n");
-    return true;
-}
-
 // ─── Write support ──────────────────────────────────────────────────────────
 
 fn writeBlockUncached(block_num: u32, buf: [*]const u8) bool {
@@ -2593,67 +2558,19 @@ pub fn unlinkFile(path: []const u8) bool {
     var file_inode: Ext2Inode = undefined;
     if (!readInode(file_inode_num, &file_inode)) return false;
 
-    const is_symlink = (eu.isSymlink(file_inode.mode));
+    // POSIX: unlink() must refuse directories (EISDIR). Unlinking one here
+    // freed its blocks while every child entry became an orphan and the
+    // parent's links_count stayed incremented — fsck-level corruption.
+    // Directories go through rmdirFile.
+    if (eu.isDirectory(file_inode.mode)) return false;
 
     // v50.0: decrement links_count for hardlinked files
     if (file_inode.links_count > 1) {
         file_inode.links_count -= 1;
         _ = writeInode(file_inode_num, &file_inode);
     } else {
-        // Last link: free data blocks
-        // v53.51: flush+drop staged writeback extents BEFORE the inode's blocks
-        // are freed — a later flush would write into a freed inode.
-        invalidateWriteback(file_inode_num, &flags);
-        // v53.15: Batch mode — defer cacheFlush+writeGroupDescs+writeSuperblock
-        batch_free_depth += 1;
-        defer {
-            batch_free_depth -= 1;
-            if (batch_free_depth == 0) {
-                cacheFlushUnlocked();
-                writeGroupDescs();
-                writeSuperblock();
-                flushDiscard(); // G5: issue coalesced discards for batched frees
-            }
-        }
-        // v53.5: invalidate page cache before freeing blocks
-        const page_cache = @import("page_cache.zig");
-        page_cache.invalidateInode(0x3000_0000_0000_0000 + @as(u64, file_inode_num));
-
-        if (is_symlink and file_inode.blocks == 0) {
-            // Short symlink: target inline in i_block, no data blocks to free
-        } else if (is_symlink) {
-            // Long symlink: only block[0] is used
-            if (file_inode.block[0] != 0) {
-                freeBlock(file_inode.block[0]);
-            }
-        } else {
-            // Regular file: free direct blocks (0-11)
-            for (0..EXT2_INODE_DIRECT) |i| {
-                if (file_inode.block[i] != 0) {
-                    freeBlock(file_inode.block[i]);
-                }
-            }
-
-            // v53.18: Use helper functions instead of inlined code — fixes orelse break
-            // silent space leak on OOM (helper functions use orelse return false)
-            const ptrs_per_block = block_size / 4;
-            if (file_inode.block[12] != 0) {
-                if (!freeSingleIndirectTree(file_inode.block[12], ptrs_per_block)) return false;
-            }
-
-            // Free double indirect block (block[13]) and all blocks it points to
-            if (file_inode.block[13] != 0) {
-                if (!freeDoubleIndirectTree(file_inode.block[13], ptrs_per_block)) return false;
-            }
-
-            // v53.5: Free triple indirect block (block[14]) and all blocks it points to
-            if (file_inode.block[14] != 0) {
-                if (!freeTripleIndirectTree(file_inode.block[14], ptrs_per_block)) return false;
-            }
-        }
-
-        // Free the inode
-        freeInode(file_inode_num);
+        // Last link: free data blocks and the inode
+        _ = freeInodeData(file_inode_num, &file_inode, &flags);
     }
 
     // Remove directory entry from parent
@@ -2666,6 +2583,224 @@ pub fn unlinkFile(path: []const u8) bool {
 }
 
 // ─── Hard link creation ────────────────────────────────────────────────────
+
+/// Free an inode's data blocks and the inode itself — the shared last-link
+/// tail of unlink and rename-overwrite. Handles inline and long symlinks.
+/// `flags` is the caller's fs_lock flag set (invalidateWriteback may drop and
+/// re-take the lock). Returns false when an indirect-tree walk hit an I/O
+/// error mid-free; the caller has already detached the directory entry, so
+/// the failure is a best-effort leak, not a link inconsistency.
+fn freeInodeData(file_inode_num: u32, file_inode: *Ext2Inode, flags: *@TypeOf(fs_lock.acquire())) bool {
+    // v53.51: flush+drop staged writeback extents BEFORE the inode's blocks
+    // are freed — a later flush would write into a freed inode.
+    invalidateWriteback(file_inode_num, flags);
+    // v53.15: Batch mode — defer cacheFlush+writeGroupDescs+writeSuperblock
+    batch_free_depth += 1;
+    defer {
+        batch_free_depth -= 1;
+        if (batch_free_depth == 0) {
+            cacheFlushUnlocked();
+            writeGroupDescs();
+            writeSuperblock();
+            flushDiscard(); // G5: issue coalesced discards for batched frees
+        }
+    }
+    // v53.5: invalidate page cache before freeing blocks
+    const page_cache = @import("page_cache.zig");
+    page_cache.invalidateInode(0x3000_0000_0000_0000 + @as(u64, file_inode_num));
+
+    const is_symlink = eu.isSymlink(file_inode.mode);
+    if (is_symlink and file_inode.blocks == 0) {
+        // Short symlink: target inline in i_block, no data blocks to free
+    } else if (is_symlink) {
+        // Long symlink: only block[0] is used
+        if (file_inode.block[0] != 0) {
+            freeBlock(file_inode.block[0]);
+        }
+    } else {
+        // Regular file: free direct blocks (0-11)
+        for (0..EXT2_INODE_DIRECT) |i| {
+            if (file_inode.block[i] != 0) {
+                freeBlock(file_inode.block[i]);
+            }
+        }
+
+        // v53.18: helper functions use orelse return false — no silent leak
+        const ptrs_per_block = block_size / 4;
+        if (file_inode.block[12] != 0) {
+            if (!freeSingleIndirectTree(file_inode.block[12], ptrs_per_block)) return false;
+        }
+        if (file_inode.block[13] != 0) {
+            if (!freeDoubleIndirectTree(file_inode.block[13], ptrs_per_block)) return false;
+        }
+        if (file_inode.block[14] != 0) {
+            if (!freeTripleIndirectTree(file_inode.block[14], ptrs_per_block)) return false;
+        }
+    }
+
+    freeInode(file_inode_num);
+    return true;
+}
+
+fn eqlStr(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, 0..) |c, i| {
+        if (c != b[i]) return false;
+    }
+    return true;
+}
+
+/// rename(oldpath, newpath) — POSIX rename for regular files and symlinks.
+/// The new entry is created BEFORE the old one is removed (a failure then
+/// leaves the filesystem untouched, and rename("f","f") is a successful
+/// no-op instead of orphaning the file); an overwritten target is released
+/// with unlink semantics afterwards.
+pub fn renameFile(old_path: []const u8, new_path: []const u8) bool {
+    var flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active) return false;
+
+    // Resolve source: parent dir + old filename
+    const old_resolved = resolveParent(old_path) orelse return false;
+    const old_parent_inode = old_resolved.parent;
+    const old_filename = old_resolved.name;
+
+    // Resolve destination: parent dir + new filename
+    const new_resolved = resolveParent(new_path) orelse return false;
+    const new_parent_inode = new_resolved.parent;
+    const new_filename = new_resolved.name;
+
+    // "." and ".." must never be (re)written by rename.
+    if (eqlStr(new_filename, ".") or eqlStr(new_filename, "..")) return false;
+
+    // Find the file's inode
+    var old_parent_ino_data: Ext2Inode = undefined;
+    if (!readInode(old_parent_inode, &old_parent_ino_data)) return false;
+    const file_inode_num = findDirEntryCached(old_parent_inode, &old_parent_ino_data, old_filename) orelse return false;
+
+    // Read file inode to get file_type
+    var file_inode: Ext2Inode = undefined;
+    if (!readInode(file_inode_num, &file_inode)) return false;
+    // Directory renames need ".." rewiring and both parents' links_count
+    // maintained (plus a subtree-cycle check); until that exists, refuse
+    // rather than corrupt the namespace.
+    if (eu.isDirectory(file_inode.mode)) return false;
+    const file_type: u8 = 1;
+
+    // Same directory + same name: POSIX rename(2) succeeds as a no-op.
+    if (old_parent_inode == new_parent_inode and eqlStr(old_filename, new_filename)) return true;
+
+    // Read destination parent once.
+    var new_parent_inode_data: Ext2Inode = undefined;
+    if (!readInode(new_parent_inode, &new_parent_inode_data)) return false;
+
+    // Remember an overwritten target (released after the rename commits).
+    var replaced_inode_num: ?u32 = null;
+    if (findDirEntryCached(new_parent_inode, &new_parent_inode_data, new_filename)) |victim_num| {
+        if (victim_num != file_inode_num) replaced_inode_num = victim_num;
+    }
+
+    // Order matters: add the new entry first; only then remove the old one.
+    if (!addDirEntry(new_parent_inode, file_inode_num, new_filename, file_type)) return false;
+    if (!removeDirEntry(old_parent_inode, old_filename)) {
+        // Roll the add back so the file is not hard-linked twice.
+        _ = removeDirEntry(new_parent_inode, new_filename);
+        return false;
+    }
+
+    // Release the replaced target with unlink semantics.
+    if (replaced_inode_num) |victim_num| {
+        var victim_ino: Ext2Inode = undefined;
+        if (readInode(victim_num, &victim_ino) and !eu.isDirectory(victim_ino.mode)) {
+            if (victim_ino.links_count > 1) {
+                victim_ino.links_count -= 1;
+                _ = writeInode(victim_num, &victim_ino);
+            } else {
+                _ = freeInodeData(victim_num, &victim_ino, &flags);
+            }
+        }
+    }
+
+    serial.writeString("[ext2] renamed to: ");
+    serial.writeString(new_filename);
+    serial.writeString("\n");
+    return true;
+}
+
+
+/// rmdir — remove an empty directory. The name must resolve to a directory
+/// whose only entries are "." and "..". Removes the parent's entry, decrements
+/// the parent's links_count (it held a link on this directory's name), and
+/// frees the directory's single block and inode.
+pub fn rmdirFile(path: []const u8) bool {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active) return false;
+
+    const resolved = resolveParent(path) orelse return false;
+    const parent_inode_num = resolved.parent;
+    const filename = resolved.name;
+
+    var parent_inode: Ext2Inode = undefined;
+    if (!readInode(parent_inode_num, &parent_inode)) return false;
+    const dir_inode_num = findDirEntryCached(parent_inode_num, &parent_inode, filename) orelse return false;
+
+    var dir_inode: Ext2Inode = undefined;
+    if (!readInode(dir_inode_num, &dir_inode)) return false;
+    if (!eu.isDirectory(dir_inode.mode)) return false; // ENOTDIR
+
+    // Empty check: the directory's single data block may contain only "."
+    // and "..". A directory with indirect blocks is not empty by definition.
+    if (dir_inode.block[0] == 0) return false;
+    if (dir_inode.block[1] != 0 or dir_inode.block[12] != 0) return false;
+
+    const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
+    if (!readBlockUncached(resolveBlock(&dir_inode, 0), buf)) return false;
+    var pos: usize = 0;
+    while (pos + 8 <= block_size) {
+        const rec_len = @as(u16, buf[pos + 4]) | (@as(u16, buf[pos + 5]) << 8);
+        if (rec_len < 8) return false;
+        const name_len = buf[pos + 6];
+        if (pos + rec_len > block_size) return false;
+        if (name_len != 0) {
+            const is_dot = name_len == 1 and buf[pos + 8] == '.';
+            const is_dotdot = name_len == 2 and buf[pos + 8] == '.' and buf[pos + 9] == '.';
+            if (!is_dot and !is_dotdot) return false; // ENOTEMPTY
+        }
+        pos += rec_len;
+    }
+
+    // v53.51-style bookkeeping around the frees (flush superblock/group
+    // descriptors at batch end, coalesced discards).
+    batch_free_depth += 1;
+    defer {
+        batch_free_depth -= 1;
+        if (batch_free_depth == 0) {
+            cacheFlushUnlocked();
+            writeGroupDescs();
+            writeSuperblock();
+            flushDiscard();
+        }
+    }
+    const page_cache = @import("page_cache.zig");
+    page_cache.invalidateInode(0x3000_0000_0000_0000 + @as(u64, dir_inode_num));
+
+    if (!removeDirEntry(parent_inode_num, filename)) return false;
+    // The parent held a link on this directory's name (and the directory's
+    // ".." pointed back at the parent — createDir incremented it).
+    if (parent_inode.links_count > 1) {
+        parent_inode.links_count -= 1;
+        _ = writeInode(parent_inode_num, &parent_inode);
+    }
+    freeBlock(dir_inode.block[0]);
+    freeInode(dir_inode_num);
+
+    serial.writeString("[ext2] rmdir: ");
+    serial.writeString(filename);
+    serial.writeString("\n");
+    return true;
+}
+
 
 /// Create a hard link: newpath → same inode as oldpath.
 /// Returns 0 on success, -errno on failure.

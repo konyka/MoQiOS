@@ -176,10 +176,13 @@ fn resolvePath(path: []const u8, out_name: *[MAX_NAME_LEN]u8, out_name_len: *u8)
                 continue;
             }
             if (i == inner.len) {
-                // last component
-                const len = @min(comp.len, MAX_NAME_LEN);
-                @memcpy(out_name[0..len], comp[0..len]);
-                out_name_len.* = @intCast(len);
+                // last component — a name longer than the on-disk maximum is
+                // a lookup miss (POSIX ENAMETOOLONG), never a silent
+                // truncation: truncation aliased distinct long names onto
+                // one entry.
+                if (comp.len > MAX_NAME_LEN) return null;
+                @memcpy(out_name[0..comp.len], comp[0..comp.len]);
+                out_name_len.* = @intCast(comp.len);
                 return parent;
             }
             // intermediate directory component
@@ -509,6 +512,12 @@ pub fn tmpfsMkdir(path: []const u8) i64 {
 }
 
 pub fn tmpfsMkdirAuthorized(path: []const u8, requested_mode: u32, umask_val: u32, euid: u32, egid: u32, effective_caps: capability.SysCap) i64 {
+    // POSIX: mkdir on any existing path is EEXIST. Routing the create flag
+    // straight through the open path used to "succeed" on an existing file or
+    // directory while bumping its open_count — a reference nobody releases,
+    // pinning the slot past unlink.
+    const probe = tmpfsOpenAuthorized(path, false, false, euid, egid, effective_caps, 0, requested_mode, umask_val);
+    if (probe >= 0) return -17;
     const result = tmpfsOpenAuthorized(path, true, true, euid, egid, effective_caps, 0, requested_mode, umask_val);
     if (result < 0) return result;
     // tmpfsOpen already created as dir; just return success

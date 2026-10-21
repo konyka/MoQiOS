@@ -14,25 +14,11 @@ pub fn write(fd: u64, buf: u64, count: u64) i64 {
     const n: usize = @intCast(count);
     if (n == 0) return 0;
 
-    // stdout/stderr → serial
-    if (fd == 1 or fd == 2) {
-        var pos: usize = 0;
-        while (pos < n) {
-            const chunk = @min(n - pos, 4096);
-            var kbuf: [4096]u8 = undefined;
-            const copied = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(buf + pos), chunk);
-            if (copied == 0) break;
-            // One locked writeString per chunk: per-byte writeByte calls would
-            // drop the serial lock between bytes and let concurrent writers on
-            // other CPUs interleave character-by-character (SMP smoke marker
-            // smearing). Chunk granularity also costs one lock acquisition
-            // instead of `copied`.
-            serial.writeString(kbuf[0..copied]);
-            pos += copied;
-            if (copied < chunk) break;
-        }
-        return @intCast(pos);
-    }
+    // stdout/stderr used to be hard-coded to the serial port before the fd
+    // table was consulted — which made dup2(pipe, 1) redirection useless and
+    // broke every shell pipeline. Unredirected fd 1/2 are `.special`
+    // descriptors that fd_table.write routes to the serial console with the
+    // same one-lock-per-chunk discipline, so go through the table instead.
 
     // VFS write
     if (sched_mod.currentTaskIndex()) |cur_idx| {

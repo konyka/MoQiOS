@@ -1157,7 +1157,12 @@ pub const FdTable = struct {
                 // Refresh the cached size: another fd may have grown the file
                 // through a different ext2 open slot (each slot keeps its own
                 // inode copy), so this descriptor's file_size can be stale.
-                desc.file_size = ext2.refreshSize(desc.ext2_file_idx);
+                // Take the max with the on-disk inode size — never shrink:
+                // this fd's own writeback-staged bytes extend file_size past
+                // the on-disk inode (flushed only by the writeback thread),
+                // and letting the stale disk size win turned a write-then-
+                // read into a false EOF (v53.51 regression).
+                desc.file_size = @max(desc.file_size, ext2.refreshSize(desc.ext2_file_idx));
                 if (desc.offset >= desc.file_size) return 0;
                 // 1. Check writeback cache (read-after-write consistency)
                 const n_cached = writeback.readBuffered(desc.inode_id, desc.offset, buf, @intCast(count), .ext2);
@@ -1427,9 +1432,9 @@ pub const FdTable = struct {
             },
             .ext2_file => {
                 const ext2 = @import("ext2.zig");
-                // Same stale-size refresh as read(): another open slot may
-                // have grown the file since this descriptor cached file_size.
-                desc.file_size = ext2.refreshSize(desc.ext2_file_idx);
+                // Same max-of-sizes rule as read(): never let the stale
+                // on-disk size hide this fd's staged bytes below EOF.
+                desc.file_size = @max(desc.file_size, ext2.refreshSize(desc.ext2_file_idx));
                 if (offset >= desc.file_size) return 0;
                 const n_cached = writeback.readBuffered(desc.inode_id, offset, buf, @intCast(count), .ext2);
                 if (n_cached > 0) return @intCast(n_cached);

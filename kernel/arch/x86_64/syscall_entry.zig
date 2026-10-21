@@ -1820,8 +1820,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         83 => { // mkdir(pathname, mode)
             frame.rax = @bitCast(dir_ops_mod.mkdirWithMode(frame.rdi, @truncate(frame.rsi)));
         },
-        84 => { // rmdir(pathname) — delegate to unlink for dirs
-            frame.rax = @bitCast(unlink_mod.unlink(frame.rdi));
+        84 => { // rmdir(pathname) — POSIX empty-directory removal
+            frame.rax = @bitCast(unlink_mod.rmdir(frame.rdi));
         },
         85 => { // creat(pathname, mode)
             const O_WRONLY: u32 = 0x1;
