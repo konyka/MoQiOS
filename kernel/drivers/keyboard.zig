@@ -1,5 +1,6 @@
 const serial = @import("../arch/arch.zig").serial;
 const io = @import("../arch/arch.zig").io;
+const ps2_policy = @import("ps2_policy.zig");
 
 const PS2_DATA: u16 = 0x60;
 const PS2_STATUS: u16 = 0x64;
@@ -95,6 +96,19 @@ pub fn init() void {
 
 /// Called from IRQ1 handler. Reads scancode and converts to character.
 pub fn handleInterrupt() void {
+    // Both channels share the one output register (0x60): only decode bytes
+    // the controller marked as keyboard data (status bit 5 = 0). Aux bytes
+    // are left for the mouse IRQ12 handler, or dropped when no mouse is armed.
+    const mouse = @import("mouse.zig");
+    switch (ps2_policy.keyboardAction(io.inb(PS2_STATUS), mouse.isPresent())) {
+        .ignore => return,
+        .discard => {
+            _ = io.inb(PS2_DATA);
+            return;
+        },
+        .consume => {},
+    }
+
     const scancode = io.inb(PS2_DATA);
 
     // Extended key prefix (E0)

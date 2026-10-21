@@ -13,6 +13,7 @@ const eth = @import("eth.zig");
 const ipv6 = @import("ipv6.zig");
 const ipv4 = @import("ipv4.zig");
 const ndp = @import("ndp.zig");
+const na_policy = @import("ndp_na_policy.zig");
 const bo = @import("../lib/byte_order.zig");
 
 // ── ICMPv6 message types (RFC 4443 + RFC 4861) ─────────────────────────────
@@ -384,6 +385,7 @@ fn handleNeighborAdvertisement(src_ip: [16]u8, data: [*]const u8, len: u16) void
         return;
     }
 
+    var tlla: ?[6]u8 = null;
     var off: u16 = 24;
     while (off + 2 <= len) {
         const opt_type = data[off];
@@ -392,15 +394,28 @@ fn handleNeighborAdvertisement(src_ip: [16]u8, data: [*]const u8, len: u16) void
         const opt_len: u16 = @as(u16, opt_units) * 8;
         if (off + opt_len > len) break;
         if (opt_type == OPT_TARGET_LL_ADDR and opt_len >= 8) {
-            const target_mac: [6]u8 = .{
+            tlla = .{
                 data[off + 2], data[off + 3], data[off + 4],
                 data[off + 5], data[off + 6], data[off + 7],
             };
-            ndp.update(target, target_mac);
-            return;
+            break;
         }
         off += opt_len;
     }
+
+    // RFC 4861 §7.2.5: honour the S/O flags instead of overwriting blindly.
+    const na = na_policy.parseFlags(data[4], tlla);
+    if (!na.solicited) return;
+    const state: na_policy.EntryState = if (ndp.probeState(target)) |s| switch (s) {
+        .incomplete => .incomplete,
+        .reachable => .reachable,
+        .stale => .stale,
+        .delay => .delay,
+        .probe => .probe,
+    } else .none;
+    const needs_cached = state != .none and state != .incomplete;
+    const cached: ?[6]u8 = if (needs_cached) ndp.lookup(target) else null;
+    if (na_policy.decide(state, na, cached)) |mac| ndp.update(target, mac);
 }
 
 /// Build a Neighbor Advertisement frame into `out`, claiming `target` is at

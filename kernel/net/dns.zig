@@ -12,8 +12,9 @@ const udp = @import("udp.zig");
 const netif = @import("netif.zig");
 const idt = @import("../arch/arch.zig").interrupts;
 const bo = @import("../lib/byte_order.zig");
+const dns_policy = @import("dns_policy.zig");
 
-const DNS_PORT: u16 = 53;
+const DNS_PORT: u16 = dns_policy.DNS_PORT;
 const DNS_CACHE_SIZE: u32 = 16;
 const DNS_QUERY_TIMEOUT: u64 = 200; // ticks (~2 seconds)
 
@@ -37,7 +38,12 @@ var cache: [DNS_CACHE_SIZE]DnsCacheEntry = @splat(.{
     .ip = .{ 0, 0, 0, 0 },
     .ttl = 0,
 });
-var query_id: u16 = 0x1234;
+fn newQueryId() u16 {
+    const random = @import("../drivers/random.zig");
+    var b: [2]u8 = undefined;
+    random.getRandomBytes(&b, 2);
+    return bo.readU16BeAt(&b, 0);
+}
 
 /// Resolve a hostname to an IPv4 address.
 /// Returns [4]u8 on success, or .{0,0,0,0} on failure.
@@ -105,8 +111,8 @@ fn queryDns(hostname: []const u8, dns_server: [4]u8) [4]u8 {
     defer udp.releasePort(12345);
 
     // DNS Header (big-endian / network byte order)
+    const query_id = newQueryId();
     bo.writeU16BeAt(&pkt, 0, query_id); // id
-    query_id +%= 1;
     bo.writeU16BeAt(&pkt, 2, 0x0100); // flags: standard query, recursion desired
     bo.writeU16BeAt(&pkt, 4, 1); // qdcount
     // ancount, nscount, arcount already zero (@splat)
@@ -138,9 +144,8 @@ fn queryDns(hostname: []const u8, dns_server: [4]u8) [4]u8 {
         var src_port: u16 = 0;
 
         const n = udp.recvFrom(12345, &buf, @intCast(buf.len), &src_ip, &src_port);
-        if (n > 0 and src_port == DNS_PORT) {
-            const resp_id = bo.readU16BeAt(&buf, 0);
-            const result = parseResponse(&buf, @intCast(n), resp_id);
+        if (n >= 2 and dns_policy.acceptResponse(src_ip, src_port, dns_server, bo.readU16BeAt(&buf, 0), query_id)) {
+            const result = parseResponse(&buf, @intCast(n), query_id);
             if (result[0] != 0 or result[1] != 0 or result[2] != 0 or result[3] != 0) {
                 // Cache the result
                 addToCache(hostname, result, 300); // Default TTL 5 minutes

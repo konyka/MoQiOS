@@ -150,8 +150,7 @@ pub fn writeSectors(dev: u8, lba: u64, count: u32, buf: [*]const u8) i32 {
             return 0;
         },
         .virtio_blk => {
-            // virtio_blk.writeSectors 不支持 disk_id 选择，默认用 device 0
-            const result = virtio_blk.writeSectors(lba, count, buf);
+            const result = virtio_blk.writeSectorsDisk(devices[dev].dev_idx, lba, count, buf);
             if (result < 0) return -1;
             return 0;
         },

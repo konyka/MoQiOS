@@ -4,11 +4,13 @@ const eth = @import("eth.zig");
 const ipv4 = @import("ipv4.zig");
 const arp = @import("arp.zig");
 const bo = @import("../lib/byte_order.zig");
+const echo_policy = @import("icmp_echo_policy.zig");
 
-/// Build an ICMP echo reply frame into `out` from an echo `req` of `req_len`
-/// bytes. Pure: no ARP/NIC side effects, so it is arch-clean and testable in
-/// isolation. `reply_src_ip`/`reply_src_mac` are ours; `reply_dst_*` are the
-/// requester's. Returns the total ethernet frame length.
+/// Build an ICMP echo reply frame into `out` (which must hold at least 256
+/// bytes) from an echo `req` of `req_len` bytes. Pure: no ARP/NIC side
+/// effects, so it is arch-clean and testable in isolation.
+/// `reply_src_ip`/`reply_src_mac` are ours; `reply_dst_*` are the requester's.
+/// Returns the total ethernet frame length.
 pub fn buildEchoReply(
     out: [*]u8,
     req: [*]const u8,
@@ -18,22 +20,37 @@ pub fn buildEchoReply(
     reply_src_mac: [6]u8,
     reply_dst_mac: [6]u8,
 ) u16 {
+    return buildEchoReplyMtu(out[0..256], req, req_len, netif.MAX_MTU, reply_src_ip, reply_dst_ip, reply_src_mac, reply_dst_mac);
+}
+
+/// RFC 792: echo the whole request, bounded by the interface `mtu` (one
+/// unfragmented datagram) and by `out.len`.
+pub fn buildEchoReplyMtu(
+    out: []u8,
+    req: [*]const u8,
+    req_len: u32,
+    mtu: u32,
+    reply_src_ip: [4]u8,
+    reply_dst_ip: [4]u8,
+    reply_src_mac: [6]u8,
+    reply_dst_mac: [6]u8,
+) u16 {
     // ICMP message: copy the request (type, code, checksum, id, seq, data).
-    // Cap at 222 so the reply fits the caller's 256-byte frame (34 = eth+ipv4).
-    const icmp_total: u16 = @intCast(@min(req_len, @as(u32, 222)));
-    @memcpy(out[34..][0..icmp_total], req[0..icmp_total]);
+    const icmp_total = echo_policy.replyIcmpLen(req_len, mtu, @intCast(out.len));
+    const o = out.ptr;
+    @memcpy(o[34..][0..icmp_total], req[0..icmp_total]);
 
     // Type=0 (echo reply), code=0, clear + recompute checksum.
-    out[34] = 0;
-    out[35] = 0;
-    out[36] = 0;
-    out[37] = 0;
-    const csum = ipv4.checksum(out + 34, icmp_total);
-    bo.writeU16BeAt(out, 36, csum);
+    o[34] = 0;
+    o[35] = 0;
+    o[36] = 0;
+    o[37] = 0;
+    const csum = ipv4.checksum(o + 34, icmp_total);
+    bo.writeU16BeAt(o, 36, csum);
 
     // IPv4 header at offset 14, ethernet frame at offset 0.
-    ipv4.buildHeader(out + 14, reply_src_ip, reply_dst_ip, ipv4.PROTO_ICMP, icmp_total);
-    return eth.buildFrame(out, reply_dst_mac, reply_src_mac, eth.ETHERTYPE_IPV4, 20 + icmp_total);
+    ipv4.buildHeader(o + 14, reply_src_ip, reply_dst_ip, ipv4.PROTO_ICMP, icmp_total);
+    return eth.buildFrame(o, reply_dst_mac, reply_src_mac, eth.ETHERTYPE_IPV4, 20 + icmp_total);
 }
 
 /// Parsed ICMP Destination Unreachable / Fragmentation Needed (SK-101).
@@ -69,8 +86,8 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
             return;
         };
 
-        var pkt: [256]u8 = undefined;
-        const frame_len = buildEchoReply(&pkt, data, len, dst_ip, src_ip, our_mac, dst_mac);
+        var pkt: [echo_policy.FRAME_BUF_LEN]u8 = undefined;
+        const frame_len = buildEchoReplyMtu(&pkt, data, len, netif.getMtu(), dst_ip, src_ip, our_mac, dst_mac);
         _ = nic.sendPacket(&pkt, frame_len);
     } else if (icmp_type == 3 and icmp_code == 4) {
         // SK-101: Fragmentation Needed → Path MTU.

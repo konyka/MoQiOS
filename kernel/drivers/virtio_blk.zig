@@ -577,6 +577,76 @@ pub noinline fn writeSectors(lba: u64, count: u32, buf: [*]const u8) i64 {
     return @intCast(count * SECTOR_SIZE);
 }
 
+pub fn writeSectorsDisk(disk_id: u32, lba: u64, count: u32, buf: [*]const u8) i64 {
+    if (disk_id == 0) return writeSectorsToDev(&device, lba, count, buf);
+    if (disk_id == 1) return writeSectorsToDev(&device2, lba, count, buf);
+    return -1;
+}
+
+fn writeSectorsToDev(dev: *VirtioBlkDevice, lba: u64, count: u32, buf: [*]const u8) i64 {
+    if (!dev.active) return -1;
+    if (count == 0 or count > 128) return -1;
+
+    const flags = io_lock.acquire();
+    defer io_lock.release(flags);
+
+    const buf_phys = virtToPhys(@intFromPtr(buf));
+
+    const req: *volatile BlkReqHeader = @ptrFromInt(dev.req_header_virt);
+    req.type = VIRTIO_BLK_T_OUT;
+    req.reserved = 0;
+    req.sector = lba;
+
+    const status_byte: *volatile u8 = @ptrFromInt(dev.status_virt);
+    status_byte.* = 0xFF;
+
+    const d0 = getDesc(dev.queue_virt, 0);
+    d0.addr = dev.req_header_phys;
+    d0.len = @sizeOf(BlkReqHeader);
+    d0.flags = 1 << 0;
+    d0.next = 1;
+
+    const d1 = getDesc(dev.queue_virt, 1);
+    d1.addr = buf_phys;
+    d1.len = count * SECTOR_SIZE;
+    d1.flags = 1 << 0; // NEXT (no WRITE flag = device reads)
+    d1.next = 2;
+
+    const d2 = getDesc(dev.queue_virt, 2);
+    d2.addr = dev.status_phys;
+    d2.len = 1;
+    d2.flags = 1 << 1;
+    d2.next = 0;
+
+    const avail = getAvail(dev.queue_virt);
+    const avail_idx = avail.idx;
+    avail.ring[avail_idx % dev.queue_num] = 0;
+    asm volatile ("" ::: .{ .memory = true });
+    avail.idx = avail_idx + 1;
+
+    io.outw(@intCast(dev.io_base + VIRTIO_PCI_QUEUE_NOTIFY), 0);
+
+    const used = getUsed(dev.queue_virt);
+    var timeout: u32 = 10_000_000;
+    while (timeout > 0) : (timeout -= 1) {
+        if (used.idx != dev.last_used_idx) {
+            dev.last_used_idx = used.idx;
+            break;
+        }
+        asm volatile ("pause");
+    }
+    if (timeout == 0) {
+        serial.writeString("[virtio-blk] write timeout\n");
+        return -1;
+    }
+    if (status_byte.* != VIRTIO_BLK_S_OK) {
+        serial.writeString("[virtio-blk] write error\n");
+        return -1;
+    }
+
+    return @intCast(count * SECTOR_SIZE);
+}
+
 /// Discard (deallocate) `count` sectors starting at `lba` on disk 0 via a
 /// VIRTIO_BLK_T_DISCARD request through the same io_lock submit path as
 /// read/write. No-op (returns 0) when the device did not offer

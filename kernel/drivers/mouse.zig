@@ -11,6 +11,7 @@
 /// dx/dy are signed per-packet deltas, dy already negated so up = positive.
 const builtin = @import("builtin");
 const ps2 = @import("ps2.zig");
+const ps2_policy = @import("ps2_policy.zig");
 
 /// Decoded mouse event as read from /dev/mouse (4 bytes).
 pub const Event = struct {
@@ -138,9 +139,12 @@ fn disable(serial: anytype) void {
 }
 
 /// IRQ12 handler (idt.zig handleIrq): read the data byte and assemble.
+/// Only aux-channel bytes (status OBF + bit 5) are consumed; a keyboard byte
+/// in the shared output register is left for the IRQ1 handler.
 pub fn handleInterrupt() void {
     if (!present) return;
     const io = @import("../arch/arch.zig").io;
+    if (!ps2_policy.mouseShouldConsume(io.inb(ps2.STATUS))) return;
     const byte = io.inb(ps2.DATA);
     if (assembler.feed(byte)) |packet| {
         const ev = decodePacket(packet);
