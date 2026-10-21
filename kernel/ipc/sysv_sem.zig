@@ -299,6 +299,10 @@ pub fn semctl(semid: u32, semnum: i32, cmd: i32, arg: i32) i64 {
         SETVAL => {
             if (!canAccess(s, false, true)) return errno.EACCES;
             if (semnum < 0 or @as(u32, @intCast(semnum)) >= s.nsems) return errno.EINVAL;
+            // semval is non-negative by definition (Linux rejects SETVAL<0);
+            // a negative value wedges every future P/V into permanent
+            // blocking.
+            if (arg < 0) return errno.EINVAL;
             s.values[@intCast(semnum)] = arg;
             // Mirror the V-op wake: raising the value may let a blocked
             // P-waiter's operation succeed — wake one so it re-checks.
