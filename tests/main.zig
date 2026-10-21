@@ -68,6 +68,10 @@ test "runqueue duplicate policy distinguishes task incarnation identity" {
 test {
     _ = @import("rt_hardening_test.zig");
     _ = @import("rt_round2_test.zig");
+    _ = @import("tcp_recv_test.zig");
+    _ = @import("ext2_unlink_test.zig");
+    _ = @import("stat_fields_test.zig");
+    _ = @import("sysv_msg_test.zig");
 }
 
 test "sync syscall propagates aggregate writeback failure as EIO" {
