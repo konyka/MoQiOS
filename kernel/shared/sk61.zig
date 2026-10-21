@@ -130,9 +130,18 @@ pub fn announce() void {
     fatbuf[8] = 0x64;
     fatbuf[11] = 0xF0; // top 4 bits ignored by 28-bit mask
 
-    const eoc = fu.fatEntryValue(&fatbuf, 0) orelse return false;
-    const bad = fu.fatEntryValue(&fatbuf, 4) orelse return false;
-    const nxt = fu.fatEntryValue(&fatbuf, 8) orelse return false;
+    const eoc = fu.fatEntryValue(&fatbuf, 0) orelse {
+        fail("fatEntryValue eoc");
+        return;
+    };
+    const bad = fu.fatEntryValue(&fatbuf, 4) orelse {
+        fail("fatEntryValue bad");
+        return;
+    };
+    const nxt = fu.fatEntryValue(&fatbuf, 8) orelse {
+        fail("fatEntryValue next");
+        return;
+    };
     if (eoc != 0x0FFFFFF8 or !fu.isEndOfChain(eoc)) {
         fail("eoc entry");
         return;

@@ -13,6 +13,7 @@ const tlb_mod = @import("../arch/arch.zig").tlb;
 const filemap = @import("filemap.zig");
 const vfs = @import("../fs/vfs.zig");
 const ext2 = @import("../fs/ext2.zig");
+const fat32 = @import("../fs/fat32.zig");
 const tmpfs = @import("../fs/tmpfs.zig");
 const huge_user = @import("huge_user.zig");
 const huge_impl = @import("huge_user_impl.zig");
@@ -323,6 +324,9 @@ fn releaseRegionBacking(r: *task_mod.MmapRegion) void {
     if (r.file_kind == @intFromEnum(filemap.FsKind.ext2)) {
         ext2.closeFile(r.file_idx);
     }
+    if (r.file_kind == @intFromEnum(filemap.FsKind.fat32)) {
+        fat32.closeFile(r.file_idx);
+    }
     r.file_kind = 0;
     r.shared = false;
 }
@@ -430,6 +434,9 @@ fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
                     if (r.file_kind == @intFromEnum(filemap.FsKind.ext2)) {
                         ext2.retainFile(r.file_idx);
                     }
+                    if (r.file_kind == @intFromEnum(filemap.FsKind.fat32)) {
+                        fat32.retainFile(r.file_idx);
+                    }
                     task.mmap_count += 1;
                     task.mmap_active_bm |= @as(u64, 1) << mmapRegionIndex(task, r2);
                     break;
@@ -466,8 +473,12 @@ pub fn retainFileRefs(task: *const task_mod.Task) void {
         const i: u6 = @truncate(@ctz(bits));
         bits &= bits - 1;
         const r = &task.mmap_regions[i];
-        if (r.active and r.file_kind == @intFromEnum(filemap.FsKind.ext2)) {
+        if (!r.active) continue;
+        if (r.file_kind == @intFromEnum(filemap.FsKind.ext2)) {
             ext2.retainFile(r.file_idx);
+        }
+        if (r.file_kind == @intFromEnum(filemap.FsKind.fat32)) {
+            fat32.retainFile(r.file_idx);
         }
     }
 }
@@ -916,11 +927,13 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
                 // not leak the reference.
             },
             .fat32 => {
-                // fat32 open slots are never freed on close (vfs.close only
-                // invalidates readahead), so the index stays valid for the
-                // life of the mapping without a retain.
                 m.idx = desc.fat32_file_idx;
                 m.inode = desc.inode_id;
+                // NOTE: like ext2, the open slot is retained only once the
+                // mapping is known to succeed (see below) — fat32 slots ARE
+                // reclaimed once the last reference drops after an unlink,
+                // so an unreferenced mapping could fault on (or write into)
+                // a reused slot after close(fd) + unlink + create.
             },
             .none => unreachable,
         }
@@ -1053,11 +1066,15 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
             }
             mapped += 1;
         }
-    } else if (meta.?.kind == .ext2) {
-        // The mapping is known to succeed: retain the ext2 open slot so the
-        // fault path can read after close(fd). Balanced by
+    } else if (meta.?.kind == .ext2 or meta.?.kind == .fat32) {
+        // The mapping is known to succeed: retain the ext2/fat32 open slot so
+        // the fault path can read after close(fd). Balanced by
         // releaseRegionBacking on untrack and releaseFileRefs on exit/exec.
-        ext2.retainFile(meta.?.idx);
+        if (meta.?.kind == .ext2) {
+            ext2.retainFile(meta.?.idx);
+        } else {
+            fat32.retainFile(meta.?.idx);
+        }
     }
 
     // Track the mapping region for munmap (records backing metadata for G2).

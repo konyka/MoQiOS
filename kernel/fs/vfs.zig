@@ -982,7 +982,13 @@ pub const FdTable = struct {
             if (fi >= 0) {
                 const idx: u32 = @intCast(fi);
                 if (o_trunc and is_writable and !fat32.truncateFile(idx, 0)) {
-                    _ = self.close(@intCast(slot));
+                    // The slot is still SLOT_INITIALIZING: close() rejects
+                    // non-LIVE slots without releasing either the fd slot or
+                    // the openFileRetained reference. Drop the reference and
+                    // return the slot explicitly (freeFd is the documented
+                    // open-failure primitive).
+                    fat32.closeFile(idx);
+                    self.freeFd(slot);
                     return -5;
                 }
                 self.fds[slot] = .{
@@ -1003,7 +1009,10 @@ pub const FdTable = struct {
                 fi = fat32.createFile(name);
                 if (fi >= 0) {
                     const idx: u32 = @intCast(fi);
-                    fat32.retainFile(idx);
+                    // One retain for this fd — close() balances it with one
+                    // closeFile. (A second retain used to live here and in
+                    // the pre-publish position, leaking +1 per created file
+                    // and pinning unlinked clusters forever.)
                     self.fds[slot] = .{
                         .fd_type = .fat32_file,
                         .offset = 0,

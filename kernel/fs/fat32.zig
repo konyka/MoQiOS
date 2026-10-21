@@ -624,10 +624,30 @@ fn zeroFileTail(first_cluster: u32, offset: u32) bool {
         cluster = getFATEntry(cluster) orelse return false;
         if (cluster < 2 or cluster >= 0x0FFFFFF8) return false;
     }
-    const buf: [*]u8 = @ptrFromInt(write_buf_virt);
-    if (virtio_blk.readSectors(clusterToLBA(cluster), fat32_sectors_per_cluster, buf) <= 0) return false;
-    @memset(buf[in_cluster..cluster_size], 0);
-    return safeWriteSectors(clusterToLBA(cluster), fat32_sectors_per_cluster, buf) > 0;
+    // write_buf_virt is a single 4 KiB page: whole-cluster I/O is only safe
+    // while a cluster fits in it (same bound as zeroCluster/writeFile).
+    if (fat32_sectors_per_cluster <= 8) {
+        const buf: [*]u8 = @ptrFromInt(write_buf_virt);
+        if (virtio_blk.readSectors(clusterToLBA(cluster), fat32_sectors_per_cluster, buf) <= 0) return false;
+        @memset(buf[in_cluster..cluster_size], 0);
+        return safeWriteSectors(clusterToLBA(cluster), fat32_sectors_per_cluster, buf) > 0;
+    }
+    // Large clusters: sector_buf_virt holds one sector. The tail sector keeps
+    // its live prefix (read-modify-write); every later sector of the cluster
+    // lies fully past the truncation point and is written as zeroes.
+    const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
+    const lba0 = clusterToLBA(cluster);
+    const tail_sector = in_cluster / SECTOR_SIZE;
+    const in_sector = in_cluster % SECTOR_SIZE;
+    if (virtio_blk.readSectors(lba0 + tail_sector, 1, buf) <= 0) return false;
+    @memset(buf[in_sector..SECTOR_SIZE], 0);
+    if (safeWriteSectors(lba0 + tail_sector, 1, buf) <= 0) return false;
+    @memset(buf[0..SECTOR_SIZE], 0);
+    var s: u32 = tail_sector + 1;
+    while (s < fat32_sectors_per_cluster) : (s += 1) {
+        if (safeWriteSectors(lba0 + s, 1, buf) <= 0) return false;
+    }
+    return true;
 }
 
 /// Write one FAT entry. Returns false when the backing sector cannot be read
@@ -1311,6 +1331,35 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
         fs_lock.release(flags);
         return false;
     }
+    // Publish the new size to the on-disk directory entry BEFORE touching the
+    // cluster chain. If this fails, nothing below has run, so the rollback
+    // below restores a fully consistent (size, chain) pair. A directory
+    // update that lands while the chain is still whole is legal FAT32 state:
+    // clusters beyond the published size are simply slack until the cut.
+    const old_size = files[file_idx].size;
+    const old_last_cluster = files[file_idx].last_cluster;
+    const old_walk_cluster = files[file_idx].last_walk_cluster;
+    const old_walk_idx = files[file_idx].last_walk_idx;
+    files[file_idx].size = new_size;
+    if (last_kept >= 2) files[file_idx].last_cluster = last_kept;
+    // The cached chain-walk position may point past the freed tail.
+    files[file_idx].last_walk_cluster = 0;
+    files[file_idx].last_walk_idx = 0;
+    // v53.52: if the on-disk size update fails, report it instead of claiming
+    // a clean truncate — with the order above, the file is still exactly its
+    // old self on disk, so a full memory rollback is safe here.
+    if (!updateDirEntry(file_idx)) {
+        files[file_idx].size = old_size;
+        files[file_idx].last_cluster = old_last_cluster;
+        files[file_idx].last_walk_cluster = old_walk_cluster;
+        files[file_idx].last_walk_idx = old_walk_idx;
+        fs_lock.release(flags);
+        return false;
+    }
+    // Detach, then reclaim the tail. A failure after the EOC write leaves the
+    // published (shrunk) size with a longer-than-needed chain — legal state —
+    // and at worst leaks unreachable clusters until fsck, so neither failure
+    // path may roll the size back any more.
     if (last_kept >= 2 and !setFATEntry(last_kept, 0x0FFFFFFF)) {
         fs_lock.release(flags);
         return false;
@@ -1335,25 +1384,10 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
     }
     flushDiscard(); // G5: issue coalesced discards for the freed tail
 
-    const old_size = files[file_idx].size;
-    const old_last_cluster = files[file_idx].last_cluster;
-    files[file_idx].size = new_size;
-    if (last_kept >= 2) files[file_idx].last_cluster = last_kept;
-    // The cached chain-walk position may point past the freed tail.
-    files[file_idx].last_walk_cluster = 0;
-    files[file_idx].last_walk_idx = 0;
-    // v53.52: clusters beyond the new size are already freed; if the on-disk
-    // size update fails, report it instead of claiming a clean truncate.
-    const dir_ok = updateDirEntry(file_idx);
-    if (!dir_ok) {
-        files[file_idx].size = old_size;
-        files[file_idx].last_cluster = old_last_cluster;
-    }
-
     const page_cache = @import("page_cache.zig");
     page_cache.invalidateInode(wb_inode);
     fs_lock.release(flags);
-    return dir_ok;
+    return true;
 }
 
 pub fn deleteFile(file_idx: u32) bool {
