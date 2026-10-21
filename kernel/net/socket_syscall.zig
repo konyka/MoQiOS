@@ -813,6 +813,8 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
             if (copied != @as(usize, @intCast(result))) return if (total == 0) -14 else @intCast(total);
             total += @intCast(result);
         }
+        // An empty-ring -EAGAIN must not collapse into a 0 (EOF) return.
+        if (result < 0 and total == 0) return result;
         if (result <= 0) break;
     }
     return @intCast(total);

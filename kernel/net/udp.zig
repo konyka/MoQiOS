@@ -140,6 +140,19 @@ pub fn hasQueuedDatagram(port: u16) bool {
     return false;
 }
 
+/// Length of the datagram the next recvFromEx/recvFromV6Ex on `port` would
+/// return (FIONREAD); 0 when none is queued for that address family.
+pub fn nextDatagramLen(port: u16, is_v6: bool) u32 {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const port_idx = findPortIdxLocked(port) orelse return 0;
+    for (0..QUEUE_DEPTH) |i| {
+        const entry = &queues[port_idx][i];
+        if (entry.valid and entry.is_v6 == is_v6) return entry.data_len;
+    }
+    return 0;
+}
+
 /// J1: the port lookup and the queue insert share one critical section.
 /// Previously the caller looked the index up under its own lock hold and
 /// passed it here; a concurrent releasePort swap-remove in between could

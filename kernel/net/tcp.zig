@@ -27,6 +27,7 @@ const icmpv6 = @import("icmpv6.zig");
 const socket_opt = @import("socket_opt.zig");
 const bo = @import("../lib/byte_order.zig");
 const tcp_util = @import("tcp_util.zig");
+const tcp_recv_policy = @import("tcp_recv_policy.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 // v53.13: Global TCP lock — protects TCB array, tcb_active_bitmap, and all TCB fields.
@@ -121,20 +122,8 @@ const CWR: u8 = 0x80; // Congestion Window Reduced (SK-131)
 /// AccECN AE flag in TCP header byte12 bit0 (ex-NS) (SK-139).
 const AE: u8 = 0x01;
 
-// TCP states (RFC 793)
-const TcpState = enum(u8) {
-    closed,
-    syn_sent,
-    syn_received,
-    established,
-    fin_wait_1,
-    fin_wait_2,
-    closing,
-    time_wait,
-    close_wait,
-    last_ack,
-    listen,
-};
+// TCP states (RFC 793) — shared with the pure recv policy.
+const TcpState = tcp_recv_policy.TcpState;
 
 // ─── TCP Control Block (TCB) ──────────────────────────────────────────────
 
@@ -2782,21 +2771,21 @@ fn flushSendBuffer(tcb: *TcpTcb) void {
     }
 }
 
-/// Receive data from an established connection.
-/// Returns number of bytes read, 0 if none available or at EOF, -1 on error/closed.
+/// Receive data from a connection. Returns bytes read; 0 only at EOF (peer
+/// FIN seen or connection closed, ring drained); -EAGAIN when the ring is
+/// empty but the peer may still send (no blocking wait exists yet, so this
+/// applies regardless of O_NONBLOCK); -ENOTCONN on a listening socket;
+/// -1 for an invalid/inactive TCB.
 pub fn tcpRecv(tcb_idx: u32, buf: [*]u8, len: u32) i64 {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return -1;
-    if (tcb.state == .closed) return -1;
 
     const available = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
-    if (available == 0) {
-        // 0 is also EOF in .close_wait (remote sent FIN, buffer drained).
-        return 0;
-    }
+    const decision = tcp_recv_policy.decide(tcb.state, available);
+    if (decision != .read_data) return tcp_recv_policy.emptyResult(decision);
 
     const to_read = @min(available, len);
     ringRead(&tcb.recv_buf, RECV_BUF_SIZE, tcb.recv_head, buf, to_read);
@@ -2806,7 +2795,7 @@ pub fn tcpRecv(tcb_idx: u32, buf: [*]u8, len: u32) i64 {
 
     // Flush delayed ACK when app reads data (advertises updated window promptly).
     // Also sends a window update if a significant amount was consumed.
-    if (tcb.delayed_ack_pending or (to_read > mssForTcb(tcb) and tcb.state == .established)) {
+    if (tcb.state != .closed and (tcb.delayed_ack_pending or (to_read > mssForTcb(tcb) and tcb.state == .established))) {
         tcb.delayed_ack_pending = false;
         tcb.delayed_ack_ms = 0;
         _ = sendSegment(tcb, ACK, undefined, 0);

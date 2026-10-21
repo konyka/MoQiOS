@@ -132,6 +132,7 @@ void _start(void) {
                 print(" bytes\n");
                 break;
             }
+            if (recv_len == -11) continue; /* EAGAIN: no data yet, poll again */
             if (recv_len < 0) {
                 print("hello19: connection closed by remote\n");
                 break;

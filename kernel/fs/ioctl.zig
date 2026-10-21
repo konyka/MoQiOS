@@ -106,8 +106,9 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
                 const cur = task_mod.getTask(cur_idx) orelse return -3;
                 pgid = cur.pgid;
             }
-            const pgid_bytes: [*]const u8 = @ptrCast(&pgid);
-            if (copy.copyToUser(@ptrFromInt(arg), pgid_bytes[0..2], 2) != 2) return -14;
+            const pid_t_val: u32 = pgid;
+            const pgid_bytes: [*]const u8 = @ptrCast(&pid_t_val);
+            if (copy.copyToUser(@ptrFromInt(arg), pgid_bytes[0..4], 4) != 4) return -14;
             return 0;
         },
         TIOCSPGRP => {
@@ -134,11 +135,22 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
                 const desc = cur.fd_table.fds[fd_idx];
                 if (desc.fd_type == .none) return -9; // EBADF
 
-                // For pipe_read, calculate available bytes
-                if (desc.fd_type == .pipe_read) {
-                    if (vfs.pipeState(desc.pipe_idx)) |state| nread = @intCast(state.readable);
+                switch (desc.fd_type) {
+                    .pipe_read => {
+                        if (vfs.pipeState(desc.pipe_idx)) |state| nread = @intCast(state.readable);
+                    },
+                    .tcp_socket => {
+                        const tcp_mod = @import("../net/tcp.zig");
+                        nread = @intCast(tcp_mod.tcpRecvAvailable(desc.tcb_idx));
+                    },
+                    .udp_socket => {
+                        // Linux: size of the next pending datagram, not the queue total.
+                        const udp_mod = @import("../net/udp.zig");
+                        nread = @intCast(udp_mod.nextDatagramLen(desc.udp_port, desc.udp_is_v6));
+                    },
+                    // Other fd types have no readable-byte count to report.
+                    else => {},
                 }
-                // For other fd types, report 0 (no special read buffer)
             }
 
             const nr_bytes: [*]const u8 = @ptrCast(&nread);

@@ -91,12 +91,15 @@ static int str_eq_n(const char *a, const char *b, int n) {
     return 1;
 }
 
-/* Bounded non-blocking recv: pump lo between attempts. */
+/* Bounded non-blocking recv: pump lo between attempts. An empty TCP
+ * receive buffer reports EAGAIN (-11) while the peer may still send; 0 is
+ * EOF. UDP still reports an empty queue as 0. Retry on both "no data yet"
+ * shapes. */
 static int64_t recv_pumped(int64_t fd, char *buf, uint64_t len, uint8_t *src, uint64_t *srclen) {
     for (int attempt = 0; attempt < 1000; attempt++) {
         netpoll();
         int64_t n = syscall6(SYS_RECVFROM, (uint64_t)fd, (uint64_t)buf, len, 0, (uint64_t)src, (uint64_t)srclen);
-        if (n != 0) return n;
+        if (n != 0 && n != -11) return n;
     }
     return 0;
 }
