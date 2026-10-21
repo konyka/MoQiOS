@@ -56,6 +56,7 @@ int main(int argc, char **argv, char **envp) {
     prev[0] = '\0';
 
     int wfd = open(WATCH_PATH, 0, 0);
+    int watch_errors = 0;
     if (wfd >= 0) {
         /* Event-driven: the first read returns the current counter
          * immediately (fresh cursor), later reads block until the next
@@ -64,10 +65,16 @@ int main(int argc, char **argv, char **envp) {
             unsigned long long counter = 0;
             long n = read(wfd, &counter, sizeof(counter));
             if (n < 0) {
-                /* Node gone or interrupted — re-report, then keep going. */
+                /* Node gone or interrupted — re-report, then keep going. A
+                 * persistently failing read (node deleted, fd dead) used to
+                 * spin at 100%% CPU; after several consecutive errors close
+                 * the watch and drop into the 1 s polling loop below. */
                 report_change(cur, prev, (int)sizeof(cur));
-                continue;
+                if (++watch_errors < 8) continue;
+                close(wfd);
+                break;
             }
+            watch_errors = 0;
             report_change(cur, prev, (int)sizeof(cur));
         }
     }

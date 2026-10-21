@@ -240,7 +240,11 @@ int main(int argc, char **argv, char **envp) {
     spawn_created("sh");
     for (;;) {
         if (reap_child((int *)0) < 0) {
-            for (;;) __asm__ volatile ("pause");
+            /* Nothing left to reap (all services exited and spawn failed):
+             * park on a 1 s cadence so PID 1 keeps the reap loop alive
+             * without pinning a CPU at 100%. */
+            struct timespec idle = { .tv_sec = 1, .tv_nsec = 0 };
+            nanosleep(&idle, (void *)0);
         }
     }
 }
