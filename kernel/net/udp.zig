@@ -146,24 +146,34 @@ pub fn hasQueuedDatagram(port: u16) bool {
 /// point the index at a different port's queue, delivering the datagram to
 /// the wrong socket (or effectively dropping it for the real owner).
 fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, payload: []const u8, is_v6: bool) void {
-    const saved = udp_lock.acquire();
-    defer udp_lock.release(saved);
+    const was_inserted = blk: {
+        const saved = udp_lock.acquire();
+        defer udp_lock.release(saved);
 
-    const port_idx = findPortIdxLocked(port) orelse return;
-    const actual = @min(payload.len, MAX_UDP_PAYLOAD);
-    for (0..QUEUE_DEPTH) |i| {
-        if (!queues[port_idx][i].valid) {
-            queues[port_idx][i].src_ip = src_ip;
-            queues[port_idx][i].src_port = src_port;
-            queues[port_idx][i].dst_port = dst_port;
-            queues[port_idx][i].data_len = @intCast(actual);
-            @memcpy(queues[port_idx][i].data[0..actual], payload[0..actual]);
-            queues[port_idx][i].is_v6 = is_v6;
-            queues[port_idx][i].valid = true;
-            return;
+        const port_idx = findPortIdxLocked(port) orelse break :blk false;
+        const actual = @min(payload.len, MAX_UDP_PAYLOAD);
+        for (0..QUEUE_DEPTH) |i| {
+            if (!queues[port_idx][i].valid) {
+                queues[port_idx][i].src_ip = src_ip;
+                queues[port_idx][i].src_port = src_port;
+                queues[port_idx][i].dst_port = dst_port;
+                queues[port_idx][i].data_len = @intCast(actual);
+                @memcpy(queues[port_idx][i].data[0..actual], payload[0..actual]);
+                queues[port_idx][i].is_v6 = is_v6;
+                queues[port_idx][i].valid = true;
+                break :blk true;
+            }
         }
-    }
-    // Queue full - packet dropped (no accounting yet)
+        // Queue full - packet dropped (no accounting yet)
+        break :blk false;
+    };
+    if (!was_inserted) return;
+    // The datagram arrival is the readiness edge: without this notify, an
+    // epoll item registered EPOLLIN on an empty queue never enters the ready
+    // list (readiness is only re-probed on epoll_ctl and ready-list drain),
+    // so epoll_wait blocks forever even though a datagram is queued. Notified
+    // with udp_lock released — epollNotify walks pool/instance locks.
+    @import("epoll.zig").epollNotify(.udp_socket, port, @import("epoll.zig").EPOLLIN);
 }
 
 pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) void {

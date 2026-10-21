@@ -213,6 +213,16 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
         if (resourceIdxFromDesc(desc) == epfd_idx) return ELOOP;
         const target = acquireInstance(resourceIdxFromDesc(desc)) orelse return EBADF;
         target_epoll_generation = target.generation;
+        // Linux rejects a registration that would create a cycle. Beyond the
+        // self-loop above, an indirect cycle (epfd → target → … → epfd)
+        // circulates readiness between members: every collect re-probes a
+        // permanently non-empty child ready list, so epoll_wait returns
+        // immediately forever and real EAGAIN can never surface.
+        if (nestedChainReaches(target.instance, epfd_idx)) {
+            var cycle_borrow = target;
+            cycle_borrow.release();
+            return ELOOP;
+        }
         var target_borrow = target;
         target_borrow.release();
     }
@@ -446,11 +456,46 @@ pub fn invalidateFdRegistrations(fd_table: *vfs.FdTable, fd: u32, generation: u6
     }
 }
 
+/// True when the child-epoll chain reachable from `start` contains
+/// `epfd_idx`. Used by EPOLL_CTL_ADD on an epoll fd to reject indirect
+/// registration cycles. Bounded by the visited bitmap: MAX_EPOLL_INSTANCES
+/// is 32, so a u32 covers every instance.
+fn nestedChainReaches(start: *EpollInstance, epfd_idx: u32) bool {
+    var visited: u32 = 0;
+    var pending: u32 = @as(u32, 1) << @intCast(epollSlotOf(start));
+    while (pending != 0) {
+        const cur_bit = @as(u32, 1) << @intCast(@ctz(pending));
+        pending &= ~cur_bit;
+        if ((visited & cur_bit) != 0) continue;
+        visited |= cur_bit;
+        const cur_idx: u32 = @ctz(cur_bit);
+        if (cur_idx == epfd_idx) return true;
+        var child = acquireInstance(cur_idx) orelse continue;
+        const saved = child.instance.spin.acquire();
+        var found: u32 = 0;
+        for (0..2) |w| {
+            var bits = child.instance.in_use_bm[w];
+            while (bits != 0) {
+                const bit = @ctz(bits);
+                bits &= bits - 1;
+                const i: u8 = @intCast(w * 64 + @as(u32, bit));
+                const item = &child.instance.items[i];
+                if (item.fd_type == .epoll and !item.is_disabled) {
+                    found |= @as(u32, 1) << @intCast(item.resource_idx);
+                }
+            }
+        }
+        child.instance.spin.release(saved);
+        child.release();
+        pending |= found & ~visited;
+    }
+    return false;
+}
+
 /// Propagate child-epoll readiness while pool_lock is already held. Keeping
 /// this as an iterative walk avoids recursive pool-lock acquisition and also
 /// bounds cyclic epoll graphs with the visited bitmap.
-fn propagateNestedReadyLocked(initial: u32) void {
-    var pending = initial;
+fn propagateNestedReadyLocked(initial: u32) void {    var pending = initial;
     var visited: u32 = 0;
     while (pending != 0) {
         const child = @ctz(pending);
@@ -836,6 +881,14 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
             } else if (final_events != 0 and (!snapshot.is_et or !delivered)) {
                 addToReadyListLocked(inst, snapshot.slot);
             }
+            if (snapshot.is_et and delivered) {
+                // Delivery consumed this edge. Clearing last_reported makes
+                // the NEXT identical notify a fresh edge that re-queues the
+                // item; without this, an ET reader that drains and blocks
+                // again is never woken by the next same-mask event (the
+                // notify-side mask-equality suppression eats it).
+                item.last_reported = 0;
+            }
         }
         inst.spin.release(update_saved);
         fd_table.releaseTransferFd(@intCast(snapshot.fd));
@@ -843,6 +896,13 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
     if (drained_ready_queue) {
         const state_saved = inst.spin.acquire();
         const queue_empty = inst.ready_head == null;
+        // A concurrent epoll_wait may have installed a waiter in the window
+        // between our drain (ready list emptied) and the LT/undelivered
+        // re-inserts above. A non-empty ready list must wake that waiter —
+        // epollNotify skips the wake when the item is already on_ready, so
+        // this is the only place the wakeup can come from (Linux
+        // ep_done_scan wakes when rdllist is non-empty, for the same reason).
+        if (!queue_empty) wakeWaiterLocked(inst);
         inst.spin.release(state_saved);
         if (queue_empty) resetNestedEdgeState(drained_slot, drained_generation);
     }
