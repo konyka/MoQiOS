@@ -71,10 +71,20 @@ const WaitNode = struct {
 };
 
 /// EpollItem — per-fd registration within an epoll instance.
+/// (fd, fd_generation) is the registration key used by epoll_ctl, as in
+/// Linux's (file, fd) key. (probe_fd, probe_generation) is the live fd in
+/// fd_table that readiness probes go through: it starts equal to the key and
+/// is moved to a surviving duplicate when the probed fd closes while the
+/// resource is still open (see invalidateFdRegistrations).
 pub const EpollItem = struct {
     fd: i32 = -1,
     fd_table: ?*vfs.FdTable = null,
     fd_generation: u64 = 0,
+    probe_fd: i32 = -1,
+    probe_generation: u64 = 0,
+    /// Open-resource identity (resourceKeyFromDesc) used to recognise a
+    /// duplicate of the probed fd; null when duplicates cannot be told apart.
+    resource_key: ?u64 = null,
     registration_generation: u64 = 0,
     target_epoll_generation: u64 = 0,
     events: u32 = 0,
@@ -265,6 +275,9 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
                 .fd = fd,
                 .fd_table = cur.fd_table,
                 .fd_generation = identity.generation,
+                .probe_fd = fd,
+                .probe_generation = identity.generation,
+                .resource_key = resourceKeyFromDesc(desc),
                 .registration_generation = inst.next_registration_generation,
                 .target_epoll_generation = target_epoll_generation,
                 .events = ev.events,
@@ -423,12 +436,21 @@ pub fn epollNotify(fd_type: vfs.FdType, resource_idx: u32, ready_events: u32) vo
     propagateNestedReadyLocked(newly_ready);
 }
 
-/// Remove registrations that belong to a descriptor incarnation being closed.
+/// A descriptor incarnation is closing. Registrations probed through it move
+/// to another live fd of the same table that still refers to the same open
+/// resource (a dup/dup2 copy keeps the registration alive, as Linux ties it
+/// to the open file description); without such a copy they are removed.
 /// The table pointer prevents an unrelated process' same-numbered fd from
-/// invalidating a live registration in a shared epoll instance.
+/// touching a live registration in a shared epoll instance. vfs calls this
+/// before tearing the resource down, so a copy found here names the same
+/// live resource, never a recycled index.
+/// Lock order: pool_lock -> inst.spin -> FdTable slot lock (a leaf: no
+/// slot-lock holder calls into epoll).
 pub fn invalidateFdRegistrations(fd_table: *vfs.FdTable, fd: u32, generation: u64) void {
     const psaved = pool_lock.acquire();
     defer pool_lock.release(psaved);
+    var dup: ?SurvivingFd = null;
+    var dup_looked_up = false;
     var ebm = valid_epoll_bm;
     while (ebm != 0) {
         const ei = @ctz(ebm);
@@ -442,9 +464,20 @@ pub fn invalidateFdRegistrations(fd_table: *vfs.FdTable, fd: u32, generation: u6
                 bits &= bits - 1;
                 const slot: u8 = @intCast(w * 64 + @as(u32, bit));
                 const item = &inst.items[slot];
-                if (item.in_use and item.fd_table == fd_table and item.fd == @as(i32, @intCast(fd)) and
-                    item.fd_generation == generation)
+                if (item.in_use and item.fd_table == fd_table and item.probe_fd == @as(i32, @intCast(fd)) and
+                    item.probe_generation == generation)
                 {
+                    // Every item probed through this incarnation names the
+                    // same descriptor, so one lookup serves them all.
+                    if (!dup_looked_up) {
+                        dup = survivingDuplicate(fd_table, fd, item.fd_type, item.resource_key);
+                        dup_looked_up = true;
+                    }
+                    if (dup) |copy| {
+                        item.probe_fd = @intCast(copy.fd);
+                        item.probe_generation = copy.generation;
+                        continue;
+                    }
                     if (item.on_ready) removeFromReadyListSlot(inst, slot);
                     inst.items[slot] = .{};
                     inst.in_use_bm[w] &= ~(@as(u64, 1) << @intCast(bit));
@@ -454,6 +487,48 @@ pub fn invalidateFdRegistrations(fd_table: *vfs.FdTable, fd: u32, generation: u6
         }
         inst.spin.release(saved);
     }
+}
+
+const SurvivingFd = struct {
+    fd: u32,
+    generation: u64,
+};
+
+/// Another LIVE fd of `fd_table` naming the same open resource as the
+/// closing `fd`. Only LIVE slots qualify: a CLOSING/CLEANING copy runs its
+/// own invalidation after this one (it needs pool_lock), and while a copy
+/// is LIVE its resource cannot be torn down, so the key cannot be stale.
+fn survivingDuplicate(fd_table: *vfs.FdTable, fd: u32, fd_type: vfs.FdType, key: ?u64) ?SurvivingFd {
+    const want = key orelse return null;
+    for (0..vfs.MAX_FDS) |i| {
+        if (i == fd) continue;
+        const identity = fd_table.snapshotFdIdentity(@intCast(i)) orelse continue;
+        if (identity.desc.fd_type != fd_type) continue;
+        if (resourceKeyFromDesc(&identity.desc) != want) continue;
+        return .{ .fd = @intCast(i), .generation = identity.generation };
+    }
+    return null;
+}
+
+/// Identity of the open resource behind a descriptor, comparable between
+/// fds of the same type in one table (the fields vfs hasSharedRef and the
+/// pipe ref counts use). null for types whose copies are indistinguishable.
+fn resourceKeyFromDesc(desc: *const vfs.FileDescriptor) ?u64 {
+    return switch (desc.fd_type) {
+        .pipe_read, .pipe_write => desc.pipe_idx,
+        .ext2_file => desc.ext2_file_idx,
+        .fat32_file => desc.fat32_file_idx,
+        .tcp_socket => desc.tcb_idx,
+        .udp_socket => desc.udp_port,
+        .epoll => desc.epoll_idx,
+        .unix_socket => desc.unix_sock_idx,
+        .timerfd => desc.timerfd_idx,
+        .tmpfs_file => desc.tmpfs_idx,
+        .devfs_ctrl => desc.devfs_ctrl_idx,
+        .eventfd => desc.eventfd_idx,
+        .ramdisk_file => desc.file_data,
+        else => null,
+    };
 }
 
 /// True when the child-epoll chain reachable from `start` contains
@@ -598,6 +673,7 @@ fn resourceIdxFromDesc(desc: *const vfs.FileDescriptor) u32 {
         .epoll => desc.epoll_idx,
         .eventfd => desc.eventfd_idx,
         .timerfd => desc.timerfd_idx,
+        .unix_socket => desc.unix_sock_idx,
         .devfs => desc.devfs_idx,
         .devfs_ctrl => desc.devfs_ctrl_idx,
         else => 0,
@@ -690,7 +766,9 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32, kmsg_cursor: u64
             if (timerfd_mod.timerfdGetExpirations(resource_idx) > 0) revents |= EPOLLIN;
             revents |= EPOLLOUT;
         },
-        .unix_socket => {},
+        .unix_socket => {
+            revents |= @import("unix_socket.zig").unixEpollEvents(resource_idx);
+        },
         .none => {},
         .tmpfs_file => {
             revents |= EPOLLIN | EPOLLOUT;
@@ -769,6 +847,8 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
         slot: u8,
         fd: i32,
         fd_generation: u64,
+        probe_fd: i32,
+        probe_generation: u64,
         registration_generation: u64,
         fd_type: vfs.FdType,
         resource_idx: u32,
@@ -809,6 +889,8 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
             .slot = idx,
             .fd = item.fd,
             .fd_generation = item.fd_generation,
+            .probe_fd = item.probe_fd,
+            .probe_generation = item.probe_generation,
             .registration_generation = item.registration_generation,
             .fd_type = item.fd_type,
             .resource_idx = item.resource_idx,
@@ -817,7 +899,7 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
             .data = item.data,
             .is_et = item.is_et,
             .is_oneshot = item.is_oneshot,
-            .kmsg_cursor = kmsgCursorForItem(inst, item.fd),
+            .kmsg_cursor = kmsgCursorForItem(inst, item.probe_fd),
         };
         snapshot_count += 1;
         cur = next;
@@ -828,24 +910,24 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
     // Readiness probes may acquire another epoll instance. Do them without
     // holding the parent spinlock, preserving pool_lock -> inst.spin order.
     for (snapshots[0..snapshot_count]) |snapshot| {
-        if (snapshot.fd < 0 or !fd_table.acquireTransferFd(@intCast(snapshot.fd))) continue;
-        const target_identity = fd_table.snapshotFdIdentity(@intCast(snapshot.fd));
-        if (target_identity == null or target_identity.?.generation != snapshot.fd_generation or
+        if (snapshot.probe_fd < 0 or !fd_table.acquireTransferFd(@intCast(snapshot.probe_fd))) continue;
+        const target_identity = fd_table.snapshotFdIdentity(@intCast(snapshot.probe_fd));
+        if (target_identity == null or target_identity.?.generation != snapshot.probe_generation or
             target_identity.?.desc.fd_type != snapshot.fd_type or
             resourceIdxFromDesc(&target_identity.?.desc) != snapshot.resource_idx)
         {
-            fd_table.releaseTransferFd(@intCast(snapshot.fd));
+            fd_table.releaseTransferFd(@intCast(snapshot.probe_fd));
             continue;
         }
         var child_borrow: ?InstanceBorrow = null;
         if (snapshot.fd_type == .epoll) {
             child_borrow = acquireInstance(snapshot.resource_idx) orelse {
-                fd_table.releaseTransferFd(@intCast(snapshot.fd));
+                fd_table.releaseTransferFd(@intCast(snapshot.probe_fd));
                 continue;
             };
             if (child_borrow.?.generation != snapshot.target_epoll_generation) {
                 child_borrow.?.release();
-                fd_table.releaseTransferFd(@intCast(snapshot.fd));
+                fd_table.releaseTransferFd(@intCast(snapshot.probe_fd));
                 continue;
             }
         }
@@ -856,7 +938,7 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
         const always_report = current & (EPOLLERR | EPOLLHUP);
         const final_events = matched | always_report;
         if (final_events == 0) {
-            fd_table.releaseTransferFd(@intCast(snapshot.fd));
+            fd_table.releaseTransferFd(@intCast(snapshot.probe_fd));
             continue;
         }
 
@@ -891,7 +973,7 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
             }
         }
         inst.spin.release(update_saved);
-        fd_table.releaseTransferFd(@intCast(snapshot.fd));
+        fd_table.releaseTransferFd(@intCast(snapshot.probe_fd));
     }
     if (drained_ready_queue) {
         const state_saved = inst.spin.acquire();

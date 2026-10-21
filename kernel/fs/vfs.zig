@@ -1633,6 +1633,10 @@ pub const FdTable = struct {
         const shared = desc.fd_type != .pipe_read and desc.fd_type != .pipe_write and self.hasSharedRef(fd);
         if (shared) {
             self.slot_locks[fd].release(flags);
+            // epoll moves this fd's registrations onto the surviving copy.
+            // Under lifecycle_lock, so that copy's own close (which recycles
+            // the resource index) cannot run before the move.
+            @import("../net/epoll.zig").invalidateFdRegistrations(self, fd, fd_generation);
             self.lifecycle_lock.release(lifecycle_flags);
             const release_flags = self.slot_locks[fd].acquire();
             if (keep_claim) {
@@ -1644,7 +1648,6 @@ pub const FdTable = struct {
             if (desc.fd_type == .fat32_file) {
                 @import("fat32.zig").closeFile(desc.fat32_file_idx);
             }
-            @import("../net/epoll.zig").invalidateFdRegistrations(self, fd, fd_generation);
             return 0;
         }
         if (@cmpxchgStrong(u32, &self.transfer_state[fd], SLOT_CLOSING, SLOT_CLEANING, .acq_rel, .acquire) != null) {

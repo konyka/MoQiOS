@@ -22,6 +22,7 @@ pub const UNIX_SOCK_BUF_SIZE: u32 = 8192;
 pub const MAX_UNIX_SOCKETS: u32 = 32;
 pub const UNIX_PATH_MAX: u8 = 108;
 pub const UNIX_BACKLOG_MAX: u8 = 4;
+const EPOLLERR: u32 = 0x008;
 
 /// Write `count` bytes from `src` into ring buffer at `write_pos`.
 /// Uses @memcpy for contiguous chunks (handles wraparound at buffer boundary).
@@ -83,6 +84,41 @@ pub const UnixSocket = struct {
 
 var unix_sockets: [MAX_UNIX_SOCKETS]UnixSocket = @splat(.{});
 var unix_lock: IrqSpinlock = .{};
+
+/// epoll notifications collected under unix_lock and fired after it is
+/// released (epoll's pool_lock -> inst.spin never nests inside unix_lock).
+/// They are wake-up hints only: epoll recomputes the real readiness with
+/// unixEpollEvents, so over-notifying is harmless.
+const EpollWake = struct {
+    in: u32 = 0,
+    out: u32 = 0,
+    hup: u32 = 0,
+
+    comptime {
+        if (MAX_UNIX_SOCKETS > 32) @compileError("EpollWake masks hold 32 sockets");
+    }
+
+    fn bit(idx: u32) u32 {
+        return if (idx < MAX_UNIX_SOCKETS) @as(u32, 1) << @intCast(idx) else 0;
+    }
+
+    fn fire(self: *const EpollWake) void {
+        const epoll = @import("epoll.zig");
+        var all = self.in | self.out | self.hup;
+        while (all != 0) {
+            const i: u32 = @ctz(all);
+            all &= all - 1;
+            const b = bit(i);
+            var events: u32 = 0;
+            if (self.in & b != 0) events |= epoll.EPOLLIN;
+            if (self.out & b != 0) events |= epoll.EPOLLOUT;
+            // epollNotify filters by interest and HUP is rarely requested;
+            // a hang-up also makes read (EOF) and send (error) non-blocking.
+            if (self.hup & b != 0) events |= epoll.EPOLLIN | epoll.EPOLLOUT | epoll.EPOLLHUP;
+            epoll.epollNotify(.unix_socket, i, events);
+        }
+    }
+};
 
 /// Create a new Unix domain socket.
 /// Returns socket index (>= 0) or negative errno on failure.
@@ -211,6 +247,8 @@ pub fn unixConnect(idx: u32, path: [*]const u8, path_len: usize) i32 {
     if (idx >= MAX_UNIX_SOCKETS) return -9; // EBADF
     if (path_len == 0 or path_len > UNIX_PATH_MAX) return -22; // EINVAL
 
+    var wake: EpollWake = .{};
+    defer wake.fire();
     const saved = unix_lock.acquire();
     defer unix_lock.release(saved);
 
@@ -249,6 +287,7 @@ pub fn unixConnect(idx: u32, path: [*]const u8, path_len: usize) i32 {
         // Add connector to listener's backlog
         peer.backlog[peer.backlog_count] = @intCast(idx);
         peer.backlog_count += 1;
+        wake.in |= EpollWake.bit(peer_i);
 
         // Wake any accept waiter
         if (peer.accept_waiters) |node| {
@@ -273,6 +312,8 @@ pub fn unixConnect(idx: u32, path: [*]const u8, path_len: usize) i32 {
 pub fn unixAccept(idx: u32) i32 {
     if (idx >= MAX_UNIX_SOCKETS) return -9; // EBADF
 
+    var wake: EpollWake = .{};
+    defer wake.fire();
     const saved = unix_lock.acquire();
     defer unix_lock.release(saved);
 
@@ -318,6 +359,7 @@ pub fn unixAccept(idx: u32) i32 {
     const conn_sock = &unix_sockets[conn_idx];
     conn_sock.connected = true;
     conn_sock.peer_idx = @intCast(new_idx);
+    wake.out |= EpollWake.bit(conn_idx);
 
     return @intCast(new_idx);
 }
@@ -329,6 +371,8 @@ pub fn unixAccept(idx: u32) i32 {
 pub fn unixSend(idx: u32, data: [*]const u8, len: usize) i64 {
     if (idx >= MAX_UNIX_SOCKETS) return -9; // EBADF
 
+    var wake: EpollWake = .{};
+    defer wake.fire();
     const saved = unix_lock.acquire();
     defer unix_lock.release(saved);
 
@@ -351,6 +395,7 @@ pub fn unixSend(idx: u32, data: [*]const u8, len: usize) i64 {
 
         // Wake any read waiter on peer
         if (n > 0) {
+            wake.in |= EpollWake.bit(peer_i);
             if (peer.read_waiters) |node| {
                 peer.read_waiters = node.next;
                 node.next = null;
@@ -384,6 +429,7 @@ pub fn unixSend(idx: u32, data: [*]const u8, len: usize) i64 {
         ringWrite(&peer.buffer, peer.buf_write, data, len);
         peer.buf_write = (peer.buf_write + @as(u32, @intCast(len))) % UNIX_SOCK_BUF_SIZE;
         peer.buf_count += @as(u32, @intCast(len));
+        wake.in |= EpollWake.bit(peer_i);
 
         // Wake any read waiter on peer
         if (peer.read_waiters) |node| {
@@ -405,6 +451,8 @@ pub fn unixSend(idx: u32, data: [*]const u8, len: usize) i64 {
 pub fn unixRecv(idx: u32, buf: [*]u8, len: usize) i64 {
     if (idx >= MAX_UNIX_SOCKETS) return -9; // EBADF
 
+    var wake: EpollWake = .{};
+    defer wake.fire();
     const saved = unix_lock.acquire();
     defer unix_lock.release(saved);
 
@@ -428,6 +476,7 @@ pub fn unixRecv(idx: u32, buf: [*]u8, len: usize) i64 {
             // Validate the back-reference before touching the peer's waiters —
             // its slot may have been realloc'd to an unrelated socket.
             if (peer.active and peer.connected and peer.peer_idx == @as(u8, @intCast(idx))) {
+                wake.out |= EpollWake.bit(sock.peer_idx);
                 if (peer.write_waiters != null) {
                     const node = peer.write_waiters.?;
                     peer.write_waiters = node.next;
@@ -462,6 +511,7 @@ pub fn unixRecv(idx: u32, buf: [*]u8, len: usize) i64 {
             sock.buf_read = (sock.buf_read + @as(u32, @intCast(actual_discard))) % UNIX_SOCK_BUF_SIZE;
             sock.buf_count -= @as(u32, @intCast(actual_discard));
         }
+        wake.out |= sendersIntoLocked(idx);
 
         // Wake any write waiter on peer
         if (sock.peer_idx < MAX_UNIX_SOCKETS) {
@@ -487,6 +537,8 @@ pub fn unixRecv(idx: u32, buf: [*]u8, len: usize) i64 {
 pub fn unixClose(idx: u32) void {
     if (idx >= MAX_UNIX_SOCKETS) return;
 
+    var wake: EpollWake = .{};
+    defer wake.fire();
     const saved = unix_lock.acquire();
     defer unix_lock.release(saved);
 
@@ -531,6 +583,12 @@ pub fn unixClose(idx: u32) void {
         }
         sock.accept_waiters = null;
     }
+    // Connectors still queued on this listener can never be accepted now.
+    if (sock.listening) {
+        for (sock.backlog[0..sock.backlog_count]) |queued| wake.hup |= EpollWake.bit(queued);
+    }
+    // DGRAM senders aimed at this socket now fail instead of blocking.
+    wake.out |= sendersIntoLocked(idx);
 
     // Notify peer that we closed
     if (sock.connected and sock.peer_idx < MAX_UNIX_SOCKETS) {
@@ -542,6 +600,7 @@ pub fn unixClose(idx: u32) void {
             // into this (soon-to-be-reused) slot.
             peer.connected = false;
             peer.peer_idx = 255;
+            wake.hup |= EpollWake.bit(sock.peer_idx);
             // Wake peer's read waiters so they can detect EOF
             var cur = peer.read_waiters;
             while (cur) |node| {
@@ -555,6 +614,57 @@ pub fn unixClose(idx: u32) void {
     }
 
     sock.* = .{};
+}
+
+/// Current epoll readiness of socket `idx`; EPOLLERR once the slot is free.
+pub fn unixEpollEvents(idx: u32) u32 {
+    const policy = @import("unix_epoll_policy.zig");
+    if (idx >= MAX_UNIX_SOCKETS) return EPOLLERR;
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+    const sock = &unix_sockets[idx];
+    if (!sock.active) return EPOLLERR;
+    return policy.events(.{
+        .stream = sock.sock_type == SOCK_STREAM,
+        .rx_bytes = sock.buf_count,
+        .listening = sock.listening,
+        .pending_connections = sock.backlog_count,
+        .disconnected = !sock.connected,
+        .connect_pending = sock.sock_type == SOCK_STREAM and !sock.connected and queuedOnBacklogLocked(idx),
+        .peer_free = sendRoomLocked(idx),
+    });
+}
+
+/// Free bytes in the ring this socket sends into, or null when there is no
+/// valid peer (send fails instead of blocking). Mirrors unixSend's checks.
+fn sendRoomLocked(idx: u32) ?u32 {
+    const sock = &unix_sockets[idx];
+    const peer_i: u32 = sock.peer_idx;
+    if (peer_i >= MAX_UNIX_SOCKETS or !unix_sockets[peer_i].active) return null;
+    const peer = &unix_sockets[peer_i];
+    if (sock.sock_type == SOCK_STREAM) {
+        if (!sock.connected or !peer.connected or peer.peer_idx != @as(u8, @intCast(idx))) return null;
+    }
+    return UNIX_SOCK_BUF_SIZE - peer.buf_count;
+}
+
+/// Sockets whose sends land in `idx`'s ring (they may become writable).
+fn sendersIntoLocked(idx: u32) u32 {
+    var mask: u32 = 0;
+    for (&unix_sockets, 0..) |*other, i| {
+        if (i != idx and other.active and other.peer_idx == idx) mask |= EpollWake.bit(@intCast(i));
+    }
+    return mask;
+}
+
+fn queuedOnBacklogLocked(idx: u32) bool {
+    for (&unix_sockets) |*listener| {
+        if (!listener.active or !listener.listening) continue;
+        for (listener.backlog[0..listener.backlog_count]) |queued| {
+            if (queued == idx) return true;
+        }
+    }
+    return false;
 }
 
 /// Check if a socket has data available to read.
