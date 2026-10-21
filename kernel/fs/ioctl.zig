@@ -113,10 +113,12 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
         },
         TIOCSPGRP => {
             if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14;
-            var pgid: u16 = undefined;
-            const pgid_bytes: [*]u8 = @ptrCast(&pgid);
-            const copied = copy.copyFromUser(pgid_bytes[0..2], @ptrFromInt(arg), 2);
-            if (copied < 2) return -14;
+            var pid_t_val: i32 = undefined;
+            const pgid_bytes: [*]u8 = @ptrCast(&pid_t_val);
+            const copied = copy.copyFromUser(pgid_bytes[0..4], @ptrFromInt(arg), 4);
+            if (copied < 4) return -14;
+            if (pid_t_val < 0 or pid_t_val > 0xFFFF) return -22; // EINVAL
+            const pgid: u16 = @intCast(pid_t_val);
             // 作业控制：只有控制终端的 owner 会话能设置前台组，且目标组必须
             // 属于该会话（kernel/proc/jobctl.zig 单一终端模型）。
             const jc = @import("../proc/jobctl.zig");

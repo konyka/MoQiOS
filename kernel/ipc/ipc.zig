@@ -96,9 +96,9 @@ pub fn timeoutTick(now_tick: u64) void {
         for (1..MAX_ENDPOINTS) |ep_i| {
             if (!endpoints[ep_i].active) continue;
             if (state.wait_op == .call and endpoints[ep_i].owner_task_idx == idx and
-                endpoints[ep_i].reply_callee_task_idx != null)
+                (endpoints[ep_i].reply_callee_task_idx != null or endpoints[ep_i].reply_msg != null))
             {
-                if (endpoints[ep_i].pending_msg != null) {
+                if (endpoints[ep_i].reply_msg != null) {
                     expired = false;
                 } else {
                     endpoints[ep_i].reply_callee_task_idx = null;
@@ -113,7 +113,7 @@ pub fn timeoutTick(now_tick: u64) void {
             } else if (state.wait_op == .receive and endpoints[ep_i].delivery_receiver == idx) {
                 expired = false;
             } else if (state.wait_op == .call and endpoints[ep_i].reply_callee_task_idx == idx) {
-                if (endpoints[ep_i].pending_msg != null) {
+                if (endpoints[ep_i].reply_msg != null) {
                     expired = false;
                 } else {
                     endpoints[ep_i].reply_callee_task_idx = null;
@@ -330,6 +330,10 @@ const Endpoint = struct {
     pending_notify: NotifyBitmap,
     /// Buffered message for the waiting receiver.
     pending_msg: ?Message,
+    /// Reply to this endpoint's outstanding call(), parked by reply(). Kept
+    /// apart from pending_msg so a third-party sender blocked on this
+    /// endpoint during the call is neither overwritten nor taken as the reply.
+    reply_msg: ?Message,
     /// Whether this endpoint is in use.
     active: bool,
 };
@@ -346,6 +350,7 @@ var endpoints: [MAX_ENDPOINTS]Endpoint = [_]Endpoint{
         .reply_token = 0,
         .pending_notify = 0,
         .pending_msg = null,
+        .reply_msg = null,
         .active = false,
     },
 } ** MAX_ENDPOINTS;
@@ -376,6 +381,7 @@ pub fn createEndpoint(owner_task_idx: u32) ?EndpointId {
                 .reply_token = 0,
                 .pending_notify = 0,
                 .pending_msg = null,
+                .reply_msg = null,
                 .active = true,
             };
             return @intCast(i);
@@ -436,6 +442,7 @@ pub fn destroyEndpoint(ep: EndpointId, caller_task_idx: u32) bool {
     endpoints[ep].reply_callee_tid = null;
     endpoints[ep].reply_token = 0;
     endpoints[ep].pending_msg = null;
+    endpoints[ep].reply_msg = null;
     endpoints[ep].pending_notify = 0;
     // An in-flight call is stored on the caller endpoint, not the endpoint
     // being destroyed. Cancel and wake those callers before returning.
@@ -486,6 +493,7 @@ pub fn clearEndpointsForTask(task_idx: u32) void {
             endpoints[i].reply_callee_tid = null;
             endpoints[i].reply_token = 0;
             endpoints[i].pending_msg = null;
+            endpoints[i].reply_msg = null;
             endpoints[i].pending_notify = 0;
         }
     }
@@ -932,12 +940,12 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
 
     // Block caller until reply arrives
     const post_send_flags = ipc_lock.acquire();
-    const pending_reply = endpoints[caller_ep].pending_msg != null;
+    const pending_reply = ipc_policy.callWake(endpoints[caller_ep].reply_msg != null) == .reply_arrived;
     const pre_block_error = task_ipc_state[caller_idx].wake_error;
     task_ipc_state[caller_idx].wake_error = .success;
     if (pending_reply) {
-        msg.* = endpoints[caller_ep].pending_msg.?;
-        endpoints[caller_ep].pending_msg = null;
+        msg.* = endpoints[caller_ep].reply_msg.?;
+        endpoints[caller_ep].reply_msg = null;
         endpoints[caller_ep].reply_callee_task_idx = null;
         endpoints[caller_ep].reply_callee_tid = null;
         endpoints[caller_ep].reply_token = 0;
@@ -990,14 +998,13 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
     if (sig_mod.pendingFatal(caller_task)) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
 
     // Reply payload handoff: reply() parked the reply in our endpoint's
-    // pending_msg slot. Slot presence (with no waiting_sender owning the
-    // slot) discriminates a real reply from a bare signal kick — copy the
-    // reply into the caller's buffer and clear the slot so a later
-    // receive() cannot consume it out of context.
+    // dedicated reply_msg slot. Slot presence discriminates a real reply
+    // from a bare signal kick; pending_msg belongs to third-party senders
+    // and is never touched here.
     const flags2 = ipc_lock.acquire();
     var reply_msg: ?Message = null;
-    if (ipc_policy.callWake(endpoints[caller_ep].pending_msg != null, endpoints[caller_ep].waiting_sender != null) == .reply_arrived) {
-        reply_msg = ipc_policy.takeSlot(Message, &endpoints[caller_ep].pending_msg);
+    if (ipc_policy.callWake(endpoints[caller_ep].reply_msg != null) == .reply_arrived) {
+        reply_msg = ipc_policy.takeSlot(Message, &endpoints[caller_ep].reply_msg);
     }
     ipc_lock.release(flags2);
 
@@ -1010,7 +1017,7 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
     }
     if (wake_error != .success) {
         const cancel_flags = ipc_lock.acquire();
-        endpoints[caller_ep].pending_msg = null;
+        endpoints[caller_ep].reply_msg = null;
         endpoints[caller_ep].reply_callee_task_idx = null;
         endpoints[caller_ep].reply_callee_tid = null;
         endpoints[caller_ep].reply_token = 0;
@@ -1026,7 +1033,7 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
     // (mirrors receive()'s woken-without-message tail).
     if (sig_mod.pendingActionable(caller_task)) {
         const cancel_flags = ipc_lock.acquire();
-        endpoints[caller_ep].pending_msg = null;
+        endpoints[caller_ep].reply_msg = null;
         endpoints[caller_ep].reply_callee_task_idx = null;
         endpoints[caller_ep].reply_callee_tid = null;
         endpoints[caller_ep].reply_token = 0;
@@ -1038,7 +1045,7 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
         return .timeout;
     }
     const cancel_flags = ipc_lock.acquire();
-    endpoints[caller_ep].pending_msg = null;
+    endpoints[caller_ep].reply_msg = null;
     endpoints[caller_ep].reply_callee_task_idx = null;
     endpoints[caller_ep].reply_callee_tid = null;
     endpoints[caller_ep].reply_token = 0;
@@ -1105,8 +1112,9 @@ fn replyToken(token: u64, reply_msg: *const Message) IpcError {
         }
         task_ipc_state[owner_idx].blocked_on = 0;
 
-        // Store reply message
-        endpoints[caller_endpoint].pending_msg = reply_msg.*;
+        // Store reply message in the reply slot; pending_msg may hold a
+        // third-party sender's blocked message.
+        endpoints[caller_endpoint].reply_msg = reply_msg.*;
         endpoints[caller_endpoint].reply_callee_task_idx = null;
         endpoints[caller_endpoint].reply_callee_tid = null;
         endpoints[caller_endpoint].reply_token = 0;

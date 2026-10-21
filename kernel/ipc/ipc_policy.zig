@@ -2,7 +2,11 @@
 //! (kernel/ipc/ipc.zig).
 //!
 //! Each endpoint has exactly one waiting_sender slot, one waiting_receiver
-//! slot, and one pending_msg payload slot. The decisions below are shared by
+//! slot, one pending_msg payload slot for inbound send/receive traffic, and
+//! one reply_msg slot owned by the endpoint's outstanding call(). Keeping the
+//! reply out of pending_msg means a third-party sender blocked on the
+//! caller's endpoint can never be overwritten by (or mistaken for) the
+//! reply. The decisions below are shared by
 //! the kernel and the host tests so both agree on one state machine:
 //!
 //!   send:    receiver waiting  → deliver into pending_msg + wake receiver
@@ -15,10 +19,11 @@
 //!   receive: sender waiting    → take pending_msg + wake sender
 //!            receiver slot busy → reject (symmetric overwrite)
 //!            otherwise         → register waiting_receiver, block
+//!   reply:   park the reply in the caller endpoint's reply_msg slot
 //!   call:    after the caller is resumed, a reply is present iff the
-//!            caller endpoint's pending_msg slot is occupied and no
-//!            waiting_sender owns the slot; a bare signal kick leaves the
-//!            slot empty.
+//!            caller endpoint's reply_msg slot is occupied; a bare signal
+//!            kick leaves it empty. Abandoning the call clears only
+//!            reply_msg, never pending_msg.
 //!
 //! Pure module: no kernel imports — host-testable via kernel/host_test.zig.
 
@@ -58,19 +63,18 @@ pub fn receiveAction(sender_waiting: bool, receiver_waiting: bool) ReceiveAction
 
 /// What the call() wake path found after being resumed.
 pub const CallWake = enum {
-    /// pending_msg holds the reply: copy it out and clear the slot.
+    /// reply_msg holds the reply: copy it out and clear the slot.
     reply_arrived,
     /// Woken without a reply (signal kick): no payload to hand off.
     signal_kick,
 };
 
 /// After a call() caller is resumed, decide whether a reply payload is
-/// waiting. reply() parks the reply in the caller endpoint's pending_msg
-/// slot, so slot presence discriminates a real reply from a bare signal
-/// kick. A registered waiting_sender owns the slot (its blocked message),
-/// so the slot must not be taken as a reply in that case.
-pub fn callWake(reply_pending: bool, sender_registered: bool) CallWake {
-    if (reply_pending and !sender_registered) return .reply_arrived;
+/// waiting. reply() parks the reply in the caller endpoint's dedicated
+/// reply_msg slot, so slot presence alone discriminates a real reply from a
+/// bare signal kick; pending_msg (third-party senders) is irrelevant.
+pub fn callWake(reply_pending: bool) CallWake {
+    if (reply_pending) return .reply_arrived;
     return .signal_kick;
 }
 
@@ -89,6 +93,7 @@ pub const SlotModel = struct {
     waiting_sender: bool = false,
     waiting_receiver: bool = false,
     pending_msg: ?u64 = null,
+    reply_msg: ?u64 = null,
 
     /// Mirror of kernel send(): deliver to a waiting receiver, reject a
     /// second sender, otherwise register and block.
@@ -128,18 +133,25 @@ pub const SlotModel = struct {
         return takeSlot(u64, &self.pending_msg);
     }
 
-    /// Mirror of kernel reply(): park the reply in pending_msg.
+    /// Mirror of kernel reply(): park the reply in reply_msg, leaving any
+    /// third-party sender's pending_msg untouched.
     pub fn reply(self: *SlotModel, payload: u64) void {
-        self.pending_msg = payload;
+        self.reply_msg = payload;
     }
 
-    /// Mirror of the call() wake path: take the reply iff the slot holds
-    /// one, otherwise report a signal kick.
+    /// Mirror of the call() wake path: take the reply iff the reply slot
+    /// holds one, otherwise report a signal kick.
     pub fn callTakeReply(self: *SlotModel, out: *?u64) CallWake {
-        const wake = callWake(self.pending_msg != null, self.waiting_sender);
+        const wake = callWake(self.reply_msg != null);
         if (wake == .reply_arrived) {
-            out.* = takeSlot(u64, &self.pending_msg);
+            out.* = takeSlot(u64, &self.reply_msg);
         }
         return wake;
+    }
+
+    /// Mirror of call() abandoning its wait (signal / error / spurious
+    /// wake): only the reply slot is cleared, never a sender's pending_msg.
+    pub fn cancelCall(self: *SlotModel) void {
+        self.reply_msg = null;
     }
 };

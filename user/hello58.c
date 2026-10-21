@@ -40,7 +40,7 @@ int main(int argc, char **argv, char **envp) {
     CHECK(sid == pid, "setsid sid==pid");
     CHECK(getpgid(0) == pid, "setsid pgid==pid");
     CHECK(getsid(0) == pid, "getsid==pid");
-    unsigned short mainpg = (unsigned short)pid;
+    int mainpg = (int)pid; /* pid_t: TIOCSPGRP reads 4 bytes */
     CHECK(ioctl2(0, TIOCSPGRP, (long)&mainpg) == 0, "ctty claim + fg self");
 
     /* 2. 后台组子进程带 handler 读 fd0 → 立即 EINTR 且 handler 触发 */
@@ -80,7 +80,7 @@ int main(int argc, char **argv, char **envp) {
     int st3 = 0;
     long wr = waitpid(b, &st3, 1);
     CHECK(wr == 0, "bg read stops (no early exit)");
-    unsigned short bgpg = (unsigned short)b;
+    int bgpg = (int)b;
     long ior = ioctl2(0, TIOCSPGRP, (long)&bgpg);
     CHECK(ior == 0, "TIOCSPGRP ok");
     kill(b, SIGCONT);
