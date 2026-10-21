@@ -807,10 +807,17 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
     const flags2 = ipc_lock.acquire();
     const wake_error = task_ipc_state[caller_idx].wake_error;
     task_ipc_state[caller_idx].wake_error = .success;
-    const generation_matches = endpoints[ep].active and
-        task_ipc_state[caller_idx].blocked_generation == endpoint_generations[ep] and
-        endpoints[ep].delivery_receiver == caller_idx;
-    if (!generation_matches) {
+    const endpoint_valid = endpoints[ep].active and
+        task_ipc_state[caller_idx].blocked_generation == endpoint_generations[ep];
+    // The wake either delivered to us or ended our wait — either way the
+    // endpoint must not keep pointing at a receiver that is running again.
+    // Signal kicks and moqipc_notify unblock without touching this field;
+    // leaving it registered made every later send() deliver into a task that
+    // is no longer waiting, permanently bricking the endpoint.
+    if (endpoints[ep].waiting_receiver == caller_idx) {
+        endpoints[ep].waiting_receiver = null;
+    }
+    if (!endpoint_valid) {
         task_ipc_state[caller_idx].blocked_on = 0;
         task_ipc_state[caller_idx].blocked_generation = 0;
         task_ipc_state[caller_idx].wait_op = .none;
@@ -818,22 +825,24 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
         ipc_lock.release(flags2);
         return .invalid_endpoint;
     }
-    if (endpoints[ep].pending_msg) |msg| {
-        buf.* = msg;
-        endpoints[ep].pending_msg = null;
-        if (endpoints[ep].delivery_receiver == caller_idx) endpoints[ep].delivery_receiver = null;
-        task_ipc_state[caller_idx].wait_op = .none;
-        task_ipc_state[caller_idx].block_start_tick = 0;
-        task_ipc_state[caller_idx].blocked_on = 0;
-        ipc_lock.release(flags2);
-        return .success;
+    if (endpoints[ep].delivery_receiver == caller_idx) {
+        if (endpoints[ep].pending_msg) |msg| {
+            buf.* = msg;
+            endpoints[ep].pending_msg = null;
+            endpoints[ep].delivery_receiver = null;
+            task_ipc_state[caller_idx].wait_op = .none;
+            task_ipc_state[caller_idx].block_start_tick = 0;
+            task_ipc_state[caller_idx].blocked_on = 0;
+            ipc_lock.release(flags2);
+            return .success;
+        }
+        // Delivery was reserved but no message is staged: drop the
+        // reservation instead of stranding the endpoint behind it.
+        endpoints[ep].delivery_receiver = null;
     }
-    // Woken without a message (signal kick or endpoint teardown): drop our
-    // receiver registration so a later send() does not deliver to a task
-    // that is no longer waiting.
-    if (endpoints[ep].waiting_receiver == caller_idx) {
-        endpoints[ep].waiting_receiver = null;
-    }
+    // Woken without a message (signal kick or moqipc_notify): the endpoint is
+    // alive, so report the wait as interrupted (EINTR when a signal handler
+    // must run) or not-ready (EAGAIN) — never invalid_endpoint.
     task_ipc_state[caller_idx].blocked_on = 0;
     task_ipc_state[caller_idx].blocked_generation = 0;
     task_ipc_state[caller_idx].wait_op = .none;

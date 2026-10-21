@@ -77,18 +77,18 @@ pub const PerCpuRunQueue = struct {
         defer self.lock.release(flags);
         const candidate = queue_policy.Entry{ .task = @intFromPtr(t), .incarnation = t.incarnation };
         var existing: u32 = 0;
-        while (existing < self.nr_running) : (existing += 1) {
+        while (existing < @atomicLoad(u32, &self.nr_running, .monotonic)) : (existing += 1) {
             const entry = self.tasks[(self.tail +% existing) % QUEUE_SIZE] orelse continue;
             if (queue_policy.sameEntry(.{
                 .task = @intFromPtr(entry.task),
                 .incarnation = entry.incarnation,
             }, candidate)) return true;
         }
-        if (self.nr_running >= QUEUE_SIZE) return false;
+        if (@atomicLoad(u32, &self.nr_running, .monotonic) >= QUEUE_SIZE) return false;
         const slot = self.head % QUEUE_SIZE;
         self.tasks[slot] = .{ .task = t, .incarnation = t.incarnation };
         self.head +%= 1;
-        self.nr_running += 1;
+        _ = @atomicRmw(u32, &self.nr_running, .Add, 1, .monotonic);
         t.last_cpu = self.cpu_id;
         self.stats.local_enqueues += 1;
         return true;
@@ -98,12 +98,12 @@ pub const PerCpuRunQueue = struct {
     pub fn pop(self: *PerCpuRunQueue) ?*task_mod.Task {
         const flags = self.lock.acquire();
         defer self.lock.release(flags);
-        while (self.nr_running != 0) {
+        while (@atomicLoad(u32, &self.nr_running, .monotonic) != 0) {
             const slot = self.tail % QUEUE_SIZE;
             const entry = self.tasks[slot];
             self.tasks[slot] = null;
             self.tail +%= 1;
-            self.nr_running -= 1;
+            _ = @atomicRmw(u32, &self.nr_running, .Sub, 1, .monotonic);
             self.stats.local_dequeues += 1;
             const e = entry orelse continue;
             if (!queue_policy.tokenMatches(.{ .task = @intFromPtr(e.task), .incarnation = e.incarnation }, e.task.incarnation)) continue;
@@ -113,7 +113,7 @@ pub const PerCpuRunQueue = struct {
     }
 
     fn purgeStaleLocked(self: *PerCpuRunQueue) void {
-        const queued = self.nr_running;
+        const queued = @atomicLoad(u32, &self.nr_running, .monotonic);
         var read: u32 = 0;
         var kept: u32 = 0;
         while (read < queued) : (read += 1) {
@@ -128,7 +128,7 @@ pub const PerCpuRunQueue = struct {
             if (write_slot != read_slot) self.tasks[read_slot] = null;
             kept += 1;
         }
-        self.nr_running = kept;
+        @atomicStore(u32, &self.nr_running, kept, .monotonic);
         self.head = self.tail +% kept;
     }
 
@@ -146,11 +146,11 @@ pub const PerCpuRunQueue = struct {
         defer self.lock.release(flags);
         while (true) {
             self.purgeStaleLocked();
-            if (self.nr_running == 0) return null;
+            if (@atomicLoad(u32, &self.nr_running, .monotonic) == 0) return null;
 
             var pick: sp.PopChoice = .{};
             var i: u32 = 0;
-            while (i < self.nr_running) : (i += 1) {
+            while (i < @atomicLoad(u32, &self.nr_running, .monotonic)) : (i += 1) {
                 const entry = self.tasks[(self.tail +% i) % QUEUE_SIZE] orelse continue;
                 pick.consider(i, sp.rankKey(entry.task.sched_policy, entry.task.priority));
             }
@@ -164,7 +164,7 @@ pub const PerCpuRunQueue = struct {
             }
             self.tasks[pop_slot] = null;
             self.tail +%= 1;
-            self.nr_running -= 1;
+            _ = @atomicRmw(u32, &self.nr_running, .Sub, 1, .monotonic);
             self.stats.local_dequeues += 1;
             const entry = chosen orelse continue;
             if (!queue_policy.tokenMatches(.{ .task = @intFromPtr(entry.task), .incarnation = entry.incarnation }, entry.task.incarnation)) continue;
@@ -189,17 +189,17 @@ pub const PerCpuRunQueue = struct {
 
         // Task #6: count the attempt on the thief side regardless of outcome.
         self.stats.steal_attempts += 1;
-        const want: u32 = target.nr_running / 2;
+        const want: u32 = @atomicLoad(u32, &target.nr_running, .monotonic) / 2;
         if (want == 0) return 0;
         var stolen: u32 = 0;
         var attempts: u32 = 0;
-        while (stolen < want and attempts < target.nr_running) : (attempts += 1) {
-            if (target.nr_running == 0) break;
+        while (stolen < want and attempts < @atomicLoad(u32, &target.nr_running, .monotonic)) : (attempts += 1) {
+            if (@atomicLoad(u32, &target.nr_running, .monotonic) == 0) break;
             const slot = target.tail % QUEUE_SIZE;
             const tt_opt = target.tasks[slot];
             target.tasks[slot] = null;
             target.tail +%= 1;
-            target.nr_running -= 1;
+            _ = @atomicRmw(u32, &target.nr_running, .Sub, 1, .monotonic);
             const tt_entry = tt_opt orelse continue;
             if (!queue_policy.tokenMatches(.{ .task = @intFromPtr(tt_entry.task), .incarnation = tt_entry.incarnation }, tt_entry.task.incarnation)) continue;
             const tt = tt_entry.task;
@@ -208,30 +208,30 @@ pub const PerCpuRunQueue = struct {
                 // Re-insert at target's local end (head) so it stays runnable
                 // on its pinned CPU. This walks the loop's tail forward but
                 // never loses the task.
-                if (target.nr_running < QUEUE_SIZE) {
+                if (@atomicLoad(u32, &target.nr_running, .monotonic) < QUEUE_SIZE) {
                     const re_slot = target.head % QUEUE_SIZE;
                     target.tasks[re_slot] = tt_entry;
                     target.head +%= 1;
-                    target.nr_running += 1;
+                    _ = @atomicRmw(u32, &target.nr_running, .Add, 1, .monotonic);
                 }
                 continue;
             }
             // Push into self (we already hold target.lock; self is local —
             // no races on its head, but bump nr_running atomically wrt readers).
-            if (self.nr_running >= QUEUE_SIZE) {
+            if (@atomicLoad(u32, &self.nr_running, .monotonic) >= QUEUE_SIZE) {
                 // Self overflowed: put it back on target.
-                if (target.nr_running < QUEUE_SIZE) {
+                if (@atomicLoad(u32, &target.nr_running, .monotonic) < QUEUE_SIZE) {
                     const re_slot = target.head % QUEUE_SIZE;
                     target.tasks[re_slot] = tt_entry;
                     target.head +%= 1;
-                    target.nr_running += 1;
+                    _ = @atomicRmw(u32, &target.nr_running, .Add, 1, .monotonic);
                 }
                 break;
             }
             const my_slot = self.head % QUEUE_SIZE;
             self.tasks[my_slot] = tt_entry;
             self.head +%= 1;
-            self.nr_running += 1;
+            _ = @atomicRmw(u32, &self.nr_running, .Add, 1, .monotonic);
             tt.last_cpu = self.cpu_id;
             stolen += 1;
         }
