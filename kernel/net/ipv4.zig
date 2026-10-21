@@ -109,6 +109,15 @@ pub fn parseHeader(data: [*]const u8, frame_len: ?u32) ?Ipv4Info {
         if (total_len > flen) return null;
     }
 
+    // No reassembly exists: a fragment (MF set, or a non-first fragment) is
+    // not a complete datagram. Parsing it anyway let a non-first fragment's
+    // bytes masquerade as a full L4 header (blind UDP injection with checksum
+    // 0); dropping fragments loses only datagrams larger than the link MTU,
+    // which the stack never emits. Field layout: bits 15 reserved, 14 DF
+    // (not a fragment indicator), 13 MF, 12-0 fragment offset.
+    const flags_frg = bo.readU16BeAt(data, 6);
+    if (flags_frg & 0x3FFF != 0) return null;
+
     const payload_len = total_len - ihl;
 
     return .{

@@ -349,13 +349,61 @@ inline fn deactivateTcb(tcb: *TcpTcb) void {
     tcb.active = false;
 }
 
+/// Marker for a backlog ring entry whose handshake died (never a real TCB
+/// index — MAX_CONNECTIONS is 64).
+const INVALID_PENDING: u32 = 0xFFFF_FFFF;
+
+/// True when the TCB index still sits in some listen backlog ring.
+fn tcbInListenBacklog(tcb_idx: u32) bool {
+    var lbm = listen_active_bitmap;
+    while (lbm != 0) {
+        const i = @ctz(lbm);
+        lbm &= lbm - 1;
+        const ls = &listen_slots[i];
+        var scan = ls.pending_head;
+        while (scan != ls.pending_tail) : (scan += 1) {
+            if (ls.pending_tpbs[scan % LISTEN_BACKLOG] == tcb_idx) return true;
+        }
+    }
+    return false;
+}
+
+/// Release a backlog TCB whose handshake died. Such an entry has no fd
+/// reference (ref_count stays at the allocTcb baseline of 1), so the
+/// keep-slot-active rule of closeTcbRemote would otherwise pin the TCB slot
+/// — and, repeated, exhaust all 64 slots. Drop it from the ring and free the
+/// slot; tcpAccept skips the invalidated entry.
+fn releaseOrphanedBacklogTcb(tcb_idx: u32) void {
+    var lbm = listen_active_bitmap;
+    while (lbm != 0) {
+        const i = @ctz(lbm);
+        lbm &= lbm - 1;
+        const ls = &listen_slots[i];
+        var scan = ls.pending_head;
+        while (scan != ls.pending_tail) : (scan += 1) {
+            if (ls.pending_tpbs[scan % LISTEN_BACKLOG] == tcb_idx) {
+                ls.pending_tpbs[scan % LISTEN_BACKLOG] = INVALID_PENDING;
+                deactivateTcb(&tcbs[tcb_idx]);
+                return;
+            }
+        }
+    }
+}
+
 /// Remote-driven teardown (RST, timeouts, LAST_ACK): mark the TCB closed, but
 /// keep the slot active while open fds still reference it (ref_count > 0) —
 /// freeing the slot here would let a realloc'd TCB be mistaken for this one.
 /// The slot is freed by tcpClose once the last fd reference is dropped.
+/// Exception: a backlog entry has no fd and will never be accepted once dead,
+/// so release it (and its ring entry) right here.
 inline fn closeTcbRemote(tcb: *TcpTcb) void {
     tcb.state = .closed;
-    if (tcb.ref_count == 0) deactivateTcb(tcb);
+    if (tcb.ref_count == 0) {
+        deactivateTcb(tcb);
+        return;
+    }
+    const idx = tcbIdx(tcb);
+    if (tcbInListenBacklog(idx)) releaseOrphanedBacklogTcb(idx);
 }
 
 pub fn initTcbs() void {
@@ -494,94 +542,105 @@ fn allocTcb() ?*TcpTcb {
     const i: u6 = @intCast(@ctz(free_bitmap));
     _ = @atomicRmw(u64, &tcb_active_bitmap, .Or, @as(u64, 1) << i, .release);
     tcbs[i].active = true;
-    tcbs[i].state = .closed;
-    tcbs[i].send_head = 0;
-    tcbs[i].send_tail = 0;
-    tcbs[i].send_unacked = 0;
-    tcbs[i].recv_head = 0;
-    tcbs[i].recv_tail = 0;
-    tcbs[i].retransmit_timer = 0;
-    tcbs[i].retransmit_count = 0;
-    tcbs[i].cwnd = TCP_MSS;
-    tcbs[i].ssthresh = 65535;
-    tcbs[i].dup_ack_count = 0;
-    tcbs[i].in_recovery = false;
-    tcbs[i].recover_seq = 0;
-    tcbs[i].recover_fs = 0;
-    tcbs[i].prr_delivered = 0;
-    tcbs[i].prr_out = 0;
-    tcbs[i].undo_cwnd = 0;
-    tcbs[i].undo_ssthresh = 0;
-    tcbs[i].frto = 0;
-    tcbs[i].snd_max = 0;
-    tcbs[i].tlp_sent = false;
-    tcbs[i].head_xmit_ms = 0;
-    tcbs[i].rack_tx_seq = @splat(0);
-    tcbs[i].rack_tx_ms = @splat(0);
-    tcbs[i].rack_tx_next = 0;
-    tcbs[i].rack_xmit_ts = 0;
-    tcbs[i].rack_rtt_ms = 0;
-    tcbs[i].rack_timer_ms = 0;
-    tcbs[i].delivery_rate = 0;
-    tcbs[i].rate_sample_ms = 0;
-    tcbs[i].min_rtt_ms = 0;
-    tcbs[i].last_pace_ms = 0;
-    tcbs[i].bbr_startup = true;
-    tcbs[i].bbr_probe_rtt = false;
-    tcbs[i].bbr_probe_rtt_start_ms = 0;
-    tcbs[i].bbr_last_probe_rtt_ms = 0;
-    tcbs[i].bbr_prior_cwnd = 0;
-    tcbs[i].bbr_prior_min_rtt_ms = 0;
-    tcbs[i].bbr_cycle_idx = 0;
-    tcbs[i].bbr_cycle_ms = 0;
-    tcbs[i].cubic_w_max = 0;
-    tcbs[i].cubic_epoch_ms = 0;
-    tcbs[i].cubic_k_ms = 0;
-    tcbs[i].hystart_css = false;
-    tcbs[i].hystart_round_end = 0;
-    tcbs[i].hystart_round_min = 0;
-    tcbs[i].hystart_last_ack_ms = 0;
-    tcbs[i].ecn_ok = false;
-    tcbs[i].accecn_ok = false;
-    tcbs[i].ecn_ece_pending = false;
-    tcbs[i].ecn_cwr_pending = false;
-    tcbs[i].ecn_reduced = false;
-    tcbs[i].ecn_undo = false;
-    tcbs[i].ecn_prr = false;
-    tcbs[i].ace_ce_count = 0;
-    tcbs[i].ace_peer = 0;
-    tcbs[i].ace_peer_valid = false;
-    tcbs[i].ace_last_react_ms = 0;
-    tcbs[i].ip_ce_rx = 0;
-    tcbs[i].ace_delivered = 0;
-    tcbs[i].l4s_rtt_ce = 0;
-    tcbs[i].l4s_rtt_delivered = 0;
-    tcbs[i].l4s_rtt_start_ms = 0;
-    tcbs[i].l4s_ce_ewma = 0;
-    tcbs[i].snd_wnd_scale = 0;
-    tcbs[i].rcv_wnd_scale = 2;
-    tcbs[i].ws_requested = 2;
-    tcbs[i].ws_enabled = false;
-    tcbs[i].ts_recent = 0;
-    tcbs[i].ts_val_last = 0;
-    tcbs[i].ts_enabled = false;
-    tcbs[i].srtt = 0;
-    tcbs[i].rttvar = 0;
-    tcbs[i].rto = RETRANSMIT_MS;
-    tcbs[i].idle_ms = 0;
-    tcbs[i].keepalive_probes = 0;
-    tcbs[i].nagle_pending = false;
-    tcbs[i].persist_timer_ms = 0;
-    tcbs[i].persist_rto_ms = RETRANSMIT_MS;
-    tcbs[i].delayed_ack_pending = false;
-    tcbs[i].delayed_ack_ms = 0;
-    tcbs[i].ref_count = 1;
-    tcbs[i].options = .{};
+    initTcbState(&tcbs[i]);
     tcbs[i].is_v6 = false;
     tcbs[i].remote_ip6 = @splat(0);
     tcbs[i].remote_ip = .{ 0, 0, 0, 0 };
-    tcbs[i].peer_mss = 0;
     return &tcbs[i];
+}
+
+/// Reset every connection-state field of a TCB: ring cursors, the whole
+/// congestion/recovery stack, RTT estimators, option negotiation, timers.
+/// Slot identity is NOT touched here — `active`, the local/remote address
+/// tuple and is_v6 belong to the allocation/reuse site. TIME_WAIT reuse MUST
+/// go through this: otherwise unread receive-ring bytes of the dead
+/// connection are handed to the new one and stale negotiation flags (a
+/// lingering window scale above all) corrupt the new connection.
+fn initTcbState(t: *TcpTcb) void {
+    t.state = .closed;
+    t.send_head = 0;
+    t.send_tail = 0;
+    t.send_unacked = 0;
+    t.recv_head = 0;
+    t.recv_tail = 0;
+    t.retransmit_timer = 0;
+    t.retransmit_count = 0;
+    t.cwnd = TCP_MSS;
+    t.ssthresh = 65535;
+    t.dup_ack_count = 0;
+    t.in_recovery = false;
+    t.recover_seq = 0;
+    t.recover_fs = 0;
+    t.prr_delivered = 0;
+    t.prr_out = 0;
+    t.undo_cwnd = 0;
+    t.undo_ssthresh = 0;
+    t.frto = 0;
+    t.snd_max = 0;
+    t.tlp_sent = false;
+    t.head_xmit_ms = 0;
+    t.rack_tx_seq = @splat(0);
+    t.rack_tx_ms = @splat(0);
+    t.rack_tx_next = 0;
+    t.rack_xmit_ts = 0;
+    t.rack_rtt_ms = 0;
+    t.rack_timer_ms = 0;
+    t.delivery_rate = 0;
+    t.rate_sample_ms = 0;
+    t.min_rtt_ms = 0;
+    t.last_pace_ms = 0;
+    t.bbr_startup = true;
+    t.bbr_probe_rtt = false;
+    t.bbr_probe_rtt_start_ms = 0;
+    t.bbr_last_probe_rtt_ms = 0;
+    t.bbr_prior_cwnd = 0;
+    t.bbr_prior_min_rtt_ms = 0;
+    t.bbr_cycle_idx = 0;
+    t.bbr_cycle_ms = 0;
+    t.cubic_w_max = 0;
+    t.cubic_epoch_ms = 0;
+    t.cubic_k_ms = 0;
+    t.hystart_css = false;
+    t.hystart_round_end = 0;
+    t.hystart_round_min = 0;
+    t.hystart_last_ack_ms = 0;
+    t.ecn_ok = false;
+    t.accecn_ok = false;
+    t.ecn_ece_pending = false;
+    t.ecn_cwr_pending = false;
+    t.ecn_reduced = false;
+    t.ecn_undo = false;
+    t.ecn_prr = false;
+    t.ace_ce_count = 0;
+    t.ace_peer = 0;
+    t.ace_peer_valid = false;
+    t.ace_last_react_ms = 0;
+    t.ip_ce_rx = 0;
+    t.ace_delivered = 0;
+    t.l4s_rtt_ce = 0;
+    t.l4s_rtt_delivered = 0;
+    t.l4s_rtt_start_ms = 0;
+    t.l4s_ce_ewma = 0;
+    t.snd_wnd_scale = 0;
+    t.rcv_wnd_scale = 2;
+    t.ws_requested = 2;
+    t.ws_enabled = false;
+    t.ts_recent = 0;
+    t.ts_val_last = 0;
+    t.ts_enabled = false;
+    t.srtt = 0;
+    t.rttvar = 0;
+    t.rto = RETRANSMIT_MS;
+    t.idle_ms = 0;
+    t.keepalive_probes = 0;
+    t.nagle_pending = false;
+    t.persist_timer_ms = 0;
+    t.persist_rto_ms = RETRANSMIT_MS;
+    t.delayed_ack_pending = false;
+    t.delayed_ack_ms = 0;
+    t.ref_count = 1;
+    t.options = .{};
+    t.peer_mss = 0;
 }
 
 /// Add a cross-process reference (fork/clone fd-table copy).
@@ -1670,10 +1729,13 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
         if (tcbs[i].state == .time_wait and
             !tcbs[i].is_v6 and
             tcp_util.tupleMatchV4(dst_port, src_port, src_ip, tcbs[i].local_port, tcbs[i].remote_port, tcbs[i].remote_ip) and
-            @as(u32, @bitCast(seq_num -% tcbs[i].irs)) > 0)
+            tcp_util.seqGt(seq_num, tcbs[i].irs))
         {
-            // Reuse this TIME_WAIT TCB
+            // Reuse this TIME_WAIT TCB — full state reset so no receive-ring
+            // bytes, congestion state or negotiation flag of the dead
+            // connection can reach the new one.
             const reuse_tcb = &tcbs[i];
+            initTcbState(reuse_tcb);
             reuse_tcb.iss = generateIss();
             reuse_tcb.snd_una = reuse_tcb.iss;
             reuse_tcb.snd_nxt = reuse_tcb.iss;
@@ -1681,9 +1743,6 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
             reuse_tcb.rcv_nxt = seq_num + 1;
             reuse_tcb.rcv_wnd = TCP_WINDOW;
             reuse_tcb.state = .syn_received;
-            reuse_tcb.retransmit_timer = 0;
-            reuse_tcb.sack_block_count = 0;
-            reuse_tcb.sack_scoreboard_count = 0;
 
             if (opts.ws_shift) |peer_ws| {
                 reuse_tcb.snd_wnd_scale = peer_ws;
@@ -1783,9 +1842,10 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
             tcbs[i].local_port == dst_port and
             tcbs[i].remote_port == src_port and
             ipv6.addrEq(tcbs[i].remote_ip6, src_ip) and
-            @as(u32, @bitCast(seq_num -% tcbs[i].irs)) > 0)
+            tcp_util.seqGt(seq_num, tcbs[i].irs))
         {
             const reuse_tcb = &tcbs[i];
+            initTcbState(reuse_tcb);
             reuse_tcb.iss = generateIss();
             reuse_tcb.snd_una = reuse_tcb.iss;
             reuse_tcb.snd_nxt = reuse_tcb.iss;
@@ -1793,9 +1853,6 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
             reuse_tcb.rcv_nxt = seq_num + 1;
             reuse_tcb.rcv_wnd = TCP_WINDOW;
             reuse_tcb.state = .syn_received;
-            reuse_tcb.retransmit_timer = 0;
-            reuse_tcb.sack_block_count = 0;
-            reuse_tcb.sack_scoreboard_count = 0;
             if (opts.ws_shift) |peer_ws| {
                 reuse_tcb.snd_wnd_scale = peer_ws;
                 reuse_tcb.ws_enabled = true;
@@ -1916,6 +1973,11 @@ fn driveTcbStateMachine(
     switch (tcb.state) {
         .syn_sent => {
             if (flags & (SYN | ACK) == (SYN | ACK)) {
+                // RFC 9293: in SYN-SENT an ACK is only acceptable when
+                // SEG.ACK == SND.NXT (= ISS+1). Anything else is a blind
+                // injection (the checksum carries no secret): drop it and
+                // let our SYN retransmission proceed.
+                if (ack_num != tcb.snd_nxt) return;
                 // SYN-ACK received — handshake complete
                 tcb.irs = seq_num;
                 tcb.rcv_nxt = seq_num + 1;
@@ -1976,6 +2038,9 @@ fn driveTcbStateMachine(
         .syn_received => {
             // Third ACK of three-way handshake (from client)
             if (flags & ACK != 0) {
+                // The ACK must acknowledge our SYN-ACK exactly; an unmatched
+                // ACK would let anyone establish a backlog connection blind.
+                if (ack_num != tcb.snd_nxt) return;
                 tcb.snd_una = ack_num;
                 tcb.snd_wnd = window;
                 tcb.state = .established;
@@ -2271,9 +2336,14 @@ fn driveTcbStateMachine(
         },
         .fin_wait_1 => {
             if (flags & FIN != 0) {
+                // RFC 9293: a FIN is only consumable at exactly RCV.NXT —
+                // the established branch enforces this and the close states
+                // must not be weaker, or a blind FIN kills the half-close.
+                const fin_seq = seq_num +% payload_len;
+                if (fin_seq != tcb.rcv_nxt) return;
                 // v53.6/v53.10: RFC 793 — FIN+ACK (our FIN confirmed) → TIME_WAIT; FIN only (simultaneous close) → CLOSING
                 tcb.rcv_nxt +%= 1;
-                if (flags & ACK != 0 and ack_num >= tcb.snd_nxt) {
+                if (flags & ACK != 0 and tcp_util.seqLeq(tcb.snd_nxt, ack_num)) {
                     // Our FIN was ACKed (ack covers snd_nxt which includes FIN seq) → TIME_WAIT
                     tcb.snd_una = ack_num;
                     tcb.retransmit_timer = 0; // v53.10: Reset for TIME_WAIT 2MSL
@@ -2300,6 +2370,10 @@ fn driveTcbStateMachine(
                 pending_idx.* = tcbIdx(tcb);
             }
             if (flags & FIN != 0) {
+                // Same exact-sequence rule as fin_wait_1: ignore a blind or
+                // stale FIN; the peer retransmits it after our next ACK.
+                const fin_seq = seq_num +% payload_len;
+                if (fin_seq != tcb.rcv_nxt) return;
                 tcb.rcv_nxt +%= 1;
                 tcb.retransmit_timer = 0; // v53.10: Reset for TIME_WAIT 2MSL
                 tcb.state = .time_wait;
@@ -2309,6 +2383,9 @@ fn driveTcbStateMachine(
         },
         .last_ack => {
             if (flags & ACK != 0) {
+                // Only our peer's ACK of our FIN closes the connection; a
+                // blind ACK must not retire it.
+                if (!tcp_util.seqLeq(tcb.snd_nxt, ack_num)) return;
                 closeTcbRemote(tcb);
                 tcpLog("[tcp] LAST_ACK → CLOSED\n");
             }
@@ -2321,8 +2398,8 @@ fn driveTcbStateMachine(
             }
         },
         .closing => {
-            // v53.11: Only transition to TIME_WAIT when our FIN is actually ACKed (ack_num >= snd_nxt)
-            if (flags & ACK != 0 and ack_num >= tcb.snd_nxt) {
+            // v53.11: Only transition to TIME_WAIT when our FIN is actually ACKed (modular compare)
+            if (flags & ACK != 0 and tcp_util.seqLeq(tcb.snd_nxt, ack_num)) {
                 tcb.retransmit_timer = 0; // v53.10: Reset for TIME_WAIT 2MSL
                 tcb.state = .time_wait;
                 tcpLog("[tcp] CLOSING → TIME_WAIT\n");
@@ -3157,6 +3234,10 @@ pub fn tcpListen(tcb_idx: u32) i64 {
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active or tcb.local_port == 0) return -1;
+    // Only a fresh (closed) or already-listening socket may listen; turning a
+    // connected TCB into a listener would silently kill its traffic and
+    // re-bind the port's backlog to the wrong owner (EISCONN).
+    if (tcb.state != .closed and tcb.state != .listen) return -1;
 
     tcb.state = .listen;
 
@@ -3254,9 +3335,19 @@ pub fn tcpAccept(tcb_idx: u32, owner_task: u32) i64 {
 
     if (ls.pending_head == ls.pending_tail) return -11; // EAGAIN: no pending connections
 
-    // v53.50: O(1) ring buffer dequeue — no array shift needed
-    const pending_idx = ls.pending_tpbs[ls.pending_head % LISTEN_BACKLOG];
-    ls.pending_head += 1;
+    // v53.50: O(1) ring buffer dequeue — no array shift needed. Entries
+    // invalidated by a failed handshake (INVALID_PENDING) or otherwise no
+    // longer established are skipped instead of being handed to the acceptor.
+    var pending_idx: u32 = INVALID_PENDING;
+    while (ls.pending_head != ls.pending_tail) {
+        const cand = ls.pending_tpbs[ls.pending_head % LISTEN_BACKLOG];
+        ls.pending_head += 1;
+        if (cand < MAX_CONNECTIONS and tcbs[cand].active and tcbs[cand].state == .established) {
+            pending_idx = cand;
+            break;
+        }
+    }
+    if (pending_idx == INVALID_PENDING) return -11; // EAGAIN: backlog drained to stale entries
 
     if (pending_idx >= MAX_CONNECTIONS) return -1;
     const new_tcb = &tcbs[pending_idx];
