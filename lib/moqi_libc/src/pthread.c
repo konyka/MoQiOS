@@ -142,6 +142,14 @@ void __pthread_init_main(void) {
         return;
     }
     char *base = malloc(tls_block_size + tls_align + sizeof(TCB));
+    if (base == 0) {
+        /* Heap exhausted at startup: fall back to the static TCB (same
+         * layout as the tls_block_size == 0 path) instead of writing through
+         * a near-NULL pointer. __thread storage is unavailable in this
+         * degraded mode, which beats a SIGSEGV before main(). */
+        syscall2(SYS_arch_prctl, ARCH_SET_FS, (long)&main_tcb);
+        return;
+    }
     char *tls_start = (char *)tls_align_up((unsigned long)base, tls_align);
     TCB *t = (TCB *)(tls_start + tls_block_size);
     tls_init_block(tls_start);

@@ -405,9 +405,16 @@ pub fn loadProgramForExec(name: []const u8, argv: []const []const u8, envp: []co
     var success = true;
     var loaded_segments: u32 = 0;
     const phnum = ehdr.e_phnum;
+    // Auxv AT_PHDR source: prefer a PT_PHDR segment's virtual address, fall
+    // back to e_phoff (file offset == virtual address for the non-PIE
+    // executables this loader maps), matching the spawn path below.
+    var phdr_addr: u64 = 0;
 
     for (0..phnum) |i| {
         const phdr = elf.readPhdr(file.data, file.size, ehdr, i) orelse break;
+        if (phdr.p_type == elf.PT_PHDR) {
+            phdr_addr = phdr.p_vaddr;
+        }
         if (phdr.p_type != PT_LOAD) continue;
 
         const seg_vaddr = phdr.p_vaddr;
@@ -483,7 +490,17 @@ pub fn loadProgramForExec(name: []const u8, argv: []const []const u8, envp: []co
         return null;
     };
 
-    const user_rsp = buildUserStack(stack_phys, user_space.USER_STACK_TOP, argv, envp, .{});
+    // AT_PHDR/AT_PHNUM must reach the execve initial stack too: moqi_libc's
+    // crt0 scans auxv for PT_TLS via those entries, and without them every
+    // __thread variable in an execve'd program silently loses its TLS block.
+    if (phdr_addr == 0 and ehdr.e_phoff > 0) {
+        phdr_addr = ehdr.e_phoff; // file offset = virtual address for non-PIE executables
+    }
+    const user_rsp = buildUserStack(stack_phys, user_space.USER_STACK_TOP, argv, envp, .{
+        .phdr_addr = phdr_addr,
+        .phnum = phnum,
+        .entry = ehdr.e_entry,
+    });
 
     {
         serial.writeString("[loader-exec] entry=0x");

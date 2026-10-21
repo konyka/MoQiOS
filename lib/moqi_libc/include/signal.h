@@ -11,14 +11,23 @@
 #define SIG_DFL ((void (*)(int))0)
 #define SIG_IGN ((void (*)(int))1)
 
-/* Matches the kernel's expected sigaction layout (kernel reads 28 bytes):
- * the handler pointer is the first 8 bytes of the struct. */
+/* Linux struct sigaction layout: the kernel reads the handler at offset 0
+ * and, when the full struct is addressable, applies the u64 sa_mask from
+ * offset 24 (see kernel/proc/signal_syscall.zig). The mask must therefore
+ * stay the fourth field; earlier field orders made every sigaction() write
+ * the restorer into the kernel's mask slot and silently clear the task's
+ * signal mask. */
 struct ksigaction {
     void (*handler)(int);
-    unsigned long mask;
     unsigned long flags;
     void *restorer;
+    unsigned long mask;
 };
+
+_Static_assert(__builtin_offsetof(struct ksigaction, mask) == 24,
+               "kernel reads sa_mask at offset 24");
+_Static_assert(__builtin_offsetof(struct ksigaction, handler) == 0,
+               "kernel reads the handler at offset 0");
 
 long sigaction(int sig, const struct ksigaction *act, struct ksigaction *oldact);
 

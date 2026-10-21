@@ -45,9 +45,9 @@ pub const StackInfo = struct {
 ///
 /// Stack layout (high address to low, SP points at argc):
 ///   [string area: argv strings, env strings]  ← bottom of stack page
+///   ... alignment pad (0 or 1 slot, keeps SP 16-byte aligned) ...
 ///   AT_NULL entry (16 bytes)
 ///   auxv entries (16 bytes each)
-///   ... alignment pad (0 or 1 slot, keeps SP 16-byte aligned) ...
 ///   NULL (envp terminator, 8 bytes)
 ///   envp pointers (8 bytes each)
 ///   NULL (argv terminator, 8 bytes)
@@ -55,9 +55,11 @@ pub const StackInfo = struct {
 ///   argc (8 bytes)                             ← SP
 ///
 /// argv and envp are contiguous from SP: envp == &argv[argc + 1]. The
-/// alignment pad (when needed) sits between the envp terminator and the
-/// auxv, never between argv and envp, so user-space crt0 can parse both
-/// arrays unconditionally.
+/// alignment pad sits ABOVE the AT_NULL terminator: user-space crt0 locates
+/// auxv as envp + 1 and stops at the first zero a_type, so a pad between the
+/// envp terminator and the first auxv entry would terminate the scan at once
+/// and hide every AT_* entry (TLS setup included). Nothing scans above
+/// AT_NULL, so the pad is safe there.
 pub fn buildUserStack(
     stack_phys: u64,
     stack_top: u64,
@@ -107,6 +109,15 @@ pub fn buildUserStack(
         }
     }.f;
 
+    // Pad to ensure 16-byte alignment of the final SP. The pad sits above
+    // the AT_NULL terminator (see the layout comment): crt0 reads the first
+    // auxv a_type at envp + 1, so the pad must never land there. The auxv
+    // block below is an even number of 8-byte pushes, so SP is 16-aligned
+    // exactly when argc + nenv is odd; the pad fixes the even case.
+    if ((argc + nenv) % 2 == 0) {
+        push64(&pos, page_base, 0);
+    }
+
     // AT_NULL entry (auxv terminator)
     push64(&pos, page_base, 0); // a_val = 0
     push64(&pos, page_base, AT_NULL); // a_type = AT_NULL
@@ -154,17 +165,6 @@ pub fn buildUserStack(
     if (info.phdr_addr != 0) {
         push64(&pos, page_base, info.phdr_addr);
         push64(&pos, page_base, AT_PHDR);
-    }
-
-    // Pad to ensure 16-byte alignment of final SP. The pad sits between
-    // the envp terminator and the auxv so argc/argv/envp stay contiguous
-    // from SP upwards.
-    {
-        const remaining_pushes: u64 = argc + 2 + nenv + 1;
-        const final_pos = pos - remaining_pushes * 8;
-        if (final_pos % 16 != 0) {
-            push64(&pos, page_base, 0);
-        }
     }
 
     // envp terminator
