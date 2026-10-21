@@ -28,6 +28,7 @@ const socket_opt = @import("socket_opt.zig");
 const bo = @import("../lib/byte_order.zig");
 const tcp_util = @import("tcp_util.zig");
 const tcp_recv_policy = @import("tcp_recv_policy.zig");
+const tcp_port_policy = @import("tcp_port_policy.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 // v53.13: Global TCP lock — protects TCB array, tcb_active_bitmap, and all TCB fields.
@@ -291,6 +292,15 @@ const TcpTcb = struct {
     idle_ms: u32, // ms since last data received
     keepalive_probes: u32, // number of keepalive probes sent without response
     nagle_pending: bool, // Nagle: data is pending but held for ACK
+    /// close()/shutdown(SHUT_WR) requested our FIN while the send ring still
+    /// held unsent bytes; the FIN goes out (and the state advances) once
+    /// send_unacked == send_tail. See maybeSendPendingFin.
+    fin_pending: bool = false,
+    /// A valid RST tore the connection down: a drained recv reports
+    /// ECONNRESET instead of EOF.
+    reset_by_peer: bool = false,
+    /// local_port was set by bind(); otherwise connect() treats it as stale.
+    bound_explicitly: bool = false,
     /// Zero-window persist probe timer (SK-110).
     persist_timer_ms: u32,
     /// Current persist probe interval (SK-110); doubles after each probe.
@@ -532,6 +542,10 @@ fn allocTcb() ?*TcpTcb {
     _ = @atomicRmw(u64, &tcb_active_bitmap, .Or, @as(u64, 1) << i, .release);
     tcbs[i].active = true;
     initTcbState(&tcbs[i]);
+    // The previous occupant's port must not survive: it would block bind()
+    // of that port and alias a 4-tuple if connect() reused it.
+    tcbs[i].local_port = 0;
+    tcbs[i].remote_port = 0;
     tcbs[i].is_v6 = false;
     tcbs[i].remote_ip6 = @splat(0);
     tcbs[i].remote_ip = .{ 0, 0, 0, 0 };
@@ -623,6 +637,9 @@ fn initTcbState(t: *TcpTcb) void {
     t.idle_ms = 0;
     t.keepalive_probes = 0;
     t.nagle_pending = false;
+    t.fin_pending = false;
+    t.reset_by_peer = false;
+    t.bound_explicitly = false;
     t.persist_timer_ms = 0;
     t.persist_rto_ms = RETRANSMIT_MS;
     t.delayed_ack_pending = false;
@@ -685,11 +702,25 @@ fn findTcbByLocalPort(local_port: u16) ?*TcpTcb {
     return null;
 }
 
-fn allocEphemeralPort() u16 {
-    const port = next_ephemeral_port;
+/// Pick an ephemeral port no other active TCB (TIME_WAIT included) holds, so
+/// a counter wrap cannot alias a long-lived connection's 4-tuple. `self` is
+/// the TCB being connected; its own (stale) port does not count as in use.
+/// Returns 0 when every ephemeral port is taken. Caller must hold tcp_lock.
+fn allocEphemeralPort(self: *const TcpTcb) u16 {
+    var in_use: [MAX_CONNECTIONS]u16 = undefined;
+    var n: usize = 0;
+    var bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
+    while (bm != 0) {
+        const i = @ctz(bm);
+        bm &= bm - 1;
+        if (&tcbs[i] == self) continue;
+        in_use[n] = tcbs[i].local_port;
+        n += 1;
+    }
+    const port = tcp_port_policy.pickEphemeralPort(next_ephemeral_port, in_use[0..n]) orelse return 0;
     // Wrapping advance: saturating (+|=) would park at 65535 forever,
     // aliasing every later connection's 4-tuple.
-    next_ephemeral_port = tcp_util.nextEphemeralPort(port);
+    next_ephemeral_port = tcp_port_policy.nextEphemeralPort(port);
     return port;
 }
 
@@ -1951,6 +1982,12 @@ fn driveTcbStateMachine(
             // RFC 793: RST is valid if seq_num is within the receive window
             const in_window = seq_num -% tcb.rcv_nxt < tcb.rcv_wnd;
             if (in_window) {
+                // After the peer's FIN (CLOSE_WAIT/CLOSING/LAST_ACK/TIME_WAIT)
+                // its stream already ended in order: recv keeps reporting EOF.
+                tcb.reset_by_peer = switch (tcb.state) {
+                    .syn_received, .fin_wait_1, .fin_wait_2 => true,
+                    else => false,
+                };
                 closeTcbRemote(tcb);
                 tcpLog("[tcp] RST received, connection reset\n");
                 return;
@@ -2047,6 +2084,7 @@ fn driveTcbStateMachine(
                 // RST is valid if seq_num is within window
                 const in_window = seq_num -% tcb.rcv_nxt < tcb.rcv_wnd;
                 if (in_window) {
+                    tcb.reset_by_peer = true;
                     closeTcbRemote(tcb);
                     tcpLog("[tcp] RST received, connection reset\n");
                     return;
@@ -2322,6 +2360,9 @@ fn driveTcbStateMachine(
                 }
                 // else: FIN deferred — peer will retransmit after we ACK the partial data
             }
+            // Last, so a peer FIN in this segment (→ CLOSE_WAIT) is not
+            // overwritten: our deferred FIN then goes out as LAST_ACK.
+            maybeSendPendingFin(tcb);
         },
         .fin_wait_1 => {
             if (flags & FIN != 0) {
@@ -2332,8 +2373,8 @@ fn driveTcbStateMachine(
                 if (fin_seq != tcb.rcv_nxt) return;
                 // v53.6/v53.10: RFC 793 — FIN+ACK (our FIN confirmed) → TIME_WAIT; FIN only (simultaneous close) → CLOSING
                 tcb.rcv_nxt +%= 1;
-                if (flags & ACK != 0 and tcp_util.seqLeq(tcb.snd_nxt, ack_num)) {
-                    // Our FIN was ACKed (ack covers snd_nxt which includes FIN seq) → TIME_WAIT
+                if (flags & ACK != 0 and ourFinAcked(tcb, ack_num)) {
+                    // Our FIN was ACKed → TIME_WAIT
                     tcb.snd_una = ack_num;
                     tcb.retransmit_timer = 0; // v53.10: Reset for TIME_WAIT 2MSL
                     tcb.state = .time_wait;
@@ -2341,12 +2382,23 @@ fn driveTcbStateMachine(
                     tcpLog("[tcp] FIN+ACK in FIN_WAIT_1 → TIME_WAIT\n");
                 } else {
                     // Simultaneous close, our FIN not yet ACKed → CLOSING
+                    if (flags & ACK != 0) absorbDataAckBeforeFin(tcb, ack_num, window);
                     tcb.state = .closing;
                     _ = sendSegment(tcb, ACK, undefined, 0);
                     tcpLog("[tcp] FIN (no ACK) in FIN_WAIT_1 → CLOSING\n");
                 }
             } else if (flags & ACK != 0) {
+                // Data sent just before the FIN may still be in flight: an
+                // ACK short of the FIN only retires data, or FIN_WAIT_2
+                // (which never retransmits) would strand it and the FIN.
+                if (!ourFinAcked(tcb, ack_num)) {
+                    absorbDataAckBeforeFin(tcb, ack_num, window);
+                    return;
+                }
                 tcb.snd_una = ack_num;
+                tcb.send_head = tcb.send_tail;
+                tcb.send_unacked = tcb.send_tail;
+                tcb.snd_nxt = ack_num;
                 tcb.retransmit_timer = 0; // v53.10: Reset for FIN_WAIT_2 timeout
                 tcb.state = .fin_wait_2;
                 tcpLog("[tcp] ACK in FIN_WAIT_1 → FIN_WAIT_2\n");
@@ -2374,7 +2426,10 @@ fn driveTcbStateMachine(
             if (flags & ACK != 0) {
                 // Only our peer's ACK of our FIN closes the connection; a
                 // blind ACK must not retire it.
-                if (!tcp_util.seqLeq(tcb.snd_nxt, ack_num)) return;
+                if (!ourFinAcked(tcb, ack_num)) {
+                    absorbDataAckBeforeFin(tcb, ack_num, window);
+                    return;
+                }
                 closeTcbRemote(tcb);
                 tcpLog("[tcp] LAST_ACK → CLOSED\n");
             }
@@ -2385,13 +2440,21 @@ fn driveTcbStateMachine(
                 pending_events.* |= epoll.EPOLLIN;
                 pending_idx.* = tcbIdx(tcb);
             }
+            // Bytes queued before the peer's FIN still need ACK progress and
+            // window updates to drain ahead of our (possibly deferred) FIN.
+            if (flags & ACK != 0) {
+                absorbDataAckBeforeFin(tcb, ack_num, window);
+                maybeSendPendingFin(tcb);
+            }
         },
         .closing => {
             // v53.11: Only transition to TIME_WAIT when our FIN is actually ACKed (modular compare)
-            if (flags & ACK != 0 and tcp_util.seqLeq(tcb.snd_nxt, ack_num)) {
+            if (flags & ACK != 0 and ourFinAcked(tcb, ack_num)) {
                 tcb.retransmit_timer = 0; // v53.10: Reset for TIME_WAIT 2MSL
                 tcb.state = .time_wait;
                 tcpLog("[tcp] CLOSING → TIME_WAIT\n");
+            } else if (flags & ACK != 0) {
+                absorbDataAckBeforeFin(tcb, ack_num, window);
             }
         },
         .time_wait => {
@@ -2524,7 +2587,11 @@ pub fn tcpConnect(remote_ip: [4]u8, remote_port: u16, owner_task: u32) i64 {
     defer tcp_lock.release(lock_flags);
     const tcb = allocTcb() orelse return -1;
 
-    tcb.local_port = allocEphemeralPort();
+    tcb.local_port = allocEphemeralPort(tcb);
+    if (tcb.local_port == 0) {
+        deactivateTcb(tcb);
+        return -1;
+    }
     tcb.remote_port = remote_port;
     tcb.remote_ip = remote_ip;
     tcb.owner_task = owner_task;
@@ -2557,8 +2624,10 @@ pub fn tcpConnectSocket(tcb_idx: u32, remote_ip: [4]u8, remote_port: u16) i64 {
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active or tcb.state != .closed or tcb.is_v6) return -1;
 
-    if (tcb.local_port == 0) {
-        tcb.local_port = allocEphemeralPort();
+    // A nonzero port bind() did not set is a leftover of the slot's previous
+    // connection; reusing it could collide with a live TCB's 4-tuple.
+    if (tcp_port_policy.connectNeedsEphemeral(tcb.local_port, tcb.bound_explicitly)) {
+        tcb.local_port = allocEphemeralPort(tcb);
         if (tcb.local_port == 0) return -1;
     }
 
@@ -2589,8 +2658,10 @@ pub fn tcpConnectSocketV6(tcb_idx: u32, remote_ip6: [16]u8, remote_port: u16) i6
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active or tcb.state != .closed or !tcb.is_v6) return -1;
 
-    if (tcb.local_port == 0) {
-        tcb.local_port = allocEphemeralPort();
+    // A nonzero port bind() did not set is a leftover of the slot's previous
+    // connection; reusing it could collide with a live TCB's 4-tuple.
+    if (tcp_port_policy.connectNeedsEphemeral(tcb.local_port, tcb.bound_explicitly)) {
+        tcb.local_port = allocEphemeralPort(tcb);
         if (tcb.local_port == 0) return -1;
     }
 
@@ -2636,7 +2707,7 @@ pub fn tcpSend(tcb_idx: u32, data: [*]const u8, len: u32) i64 {
     defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
-    if (!tcb.active or tcb.state != .established) return -1;
+    if (!tcb.active or tcb.state != .established or tcb.fin_pending) return -1;
 
     // Copy data to send ring buffer (batched @memcpy)
     const used = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
@@ -2686,7 +2757,7 @@ pub fn tcpSendFromUser(tcb_idx: u32, user_addr: u64, len: u32) i64 {
 
         const lock_flags = tcp_lock.acquire();
         const tcb = &tcbs[tcb_idx];
-        if (!tcb.active or tcb.state != .established) {
+        if (!tcb.active or tcb.state != .established or tcb.fin_pending) {
             tcp_lock.release(lock_flags);
             return if (total > 0) @intCast(total) else -1;
         }
@@ -2771,6 +2842,115 @@ fn flushSendBuffer(tcb: *TcpTcb) void {
     }
 }
 
+/// Flush ahead of our FIN the way Linux pushes pending frames on close: cork
+/// and Nagle would otherwise hold a final partial segment that no later
+/// write or uncork is going to release.
+fn flushSendBufferForFin(tcb: *TcpTcb) void {
+    const saved_cork = tcb.options.tcp_cork;
+    const saved_nodelay = tcb.options.tcp_nodelay;
+    tcb.options.tcp_cork = false;
+    tcb.options.tcp_nodelay = true;
+    flushSendBuffer(tcb);
+    tcb.options.tcp_cork = saved_cork;
+    tcb.options.tcp_nodelay = saved_nodelay;
+}
+
+/// Send the FIN that close()/shutdown(SHUT_WR) requested once every queued
+/// byte has left (send_unacked == send_tail), so the FIN's sequence number
+/// (snd_nxt) lands after the data instead of skipping it. The state moves
+/// to FIN_WAIT_1 / LAST_ACK only when the FIN actually left: from then on
+/// the existing FIN retransmit paths (RTO, ring-drained RTO) own it. On TX
+/// failure the request stays pending and the next timer tick retries.
+/// Caller must hold tcp_lock.
+fn maybeSendPendingFin(tcb: *TcpTcb) void {
+    if (!tcb.fin_pending) return;
+    const next: TcpState = switch (tcb.state) {
+        .established => .fin_wait_1,
+        .close_wait => .last_ack,
+        else => {
+            // Torn down (RST/timeout) before the ring drained.
+            tcb.fin_pending = false;
+            return;
+        },
+    };
+    flushSendBufferForFin(tcb);
+    if (tcb.send_unacked != tcb.send_tail) return;
+    if (!sendSegment(tcb, FIN | ACK, undefined, 0)) return;
+    tcb.fin_pending = false;
+    tcb.state = next;
+    tcb.nagle_pending = false;
+    tcpLog("[tcp] FIN sent after send ring drained\n");
+}
+
+/// Request our FIN on an ESTABLISHED / CLOSE_WAIT TCB (close, SHUT_WR,
+/// SHUT_RDWR). Sends it now if the ring drains, else defers it.
+fn requestFin(tcb: *TcpTcb) void {
+    tcb.fin_pending = true;
+    maybeSendPendingFin(tcb);
+}
+
+/// True once our FIN has left (FIN_WAIT_1 / CLOSING / LAST_ACK). The FIN is
+/// only sent with the send ring drained, so every ring byte precedes it.
+fn finSent(tcb: *const TcpTcb) bool {
+    return switch (tcb.state) {
+        .fin_wait_1, .closing, .last_ack => true,
+        else => false,
+    };
+}
+
+/// Sequence number our FIN occupies: the ring holds exactly [snd_una, FIN).
+/// Unlike snd_nxt this survives an RTO rewind of the send cursor.
+fn finSeq(tcb: *const TcpTcb) u32 {
+    return tcb.snd_una +% ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
+}
+
+/// `ack_num` acknowledges our FIN (and therefore all data before it).
+fn ourFinAcked(tcb: *const TcpTcb, ack_num: u32) bool {
+    return ack_num == finSeq(tcb) +% 1;
+}
+
+/// After a retransmission rewind re-sent all data up to the FIN, resend the
+/// FIN itself at its own sequence number.
+fn resendFinIfRewound(tcb: *TcpTcb) void {
+    if (!finSent(tcb)) return;
+    if (tcb.send_unacked != tcb.send_tail) return;
+    if (tcb.snd_nxt != finSeq(tcb)) return;
+    _ = sendSegment(tcb, FIN | ACK, undefined, 0);
+}
+
+/// ACK that does not (yet) cover our FIN in CLOSE_WAIT / FIN_WAIT_1 /
+/// LAST_ACK: retire the acknowledged ring bytes and reset the RTO state so
+/// queued data — and then the FIN — keep draining. Dup, blind and
+/// out-of-range ACKs only refresh the window. Keeps send_unacked ==
+/// send_head + (snd_nxt -% snd_una).
+fn absorbDataAckBeforeFin(tcb: *TcpTcb, ack_num: u32, window: u32) void {
+    tcb.snd_wnd = window;
+    const acked = ack_num -% tcb.snd_una;
+    // Before the FIN only sent bytes are ackable; once it is out every ring
+    // byte has been sent at least once (an RTO rewind may sit below them).
+    const limit = if (finSent(tcb))
+        ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE)
+    else
+        tcb.snd_nxt -% tcb.snd_una;
+    if (acked != 0 and acked <= limit and acked <= SEND_BUF_SIZE) {
+        tcb.snd_una = ack_num;
+        tcb.send_head = (tcb.send_head + acked) % SEND_BUF_SIZE;
+        if (tcp_util.seqLt(tcb.snd_nxt, tcb.snd_una)) {
+            tcb.snd_nxt = tcb.snd_una;
+            tcb.send_unacked = tcb.send_head;
+        }
+        tcb.retransmit_timer = 0;
+        tcb.retransmit_count = 0;
+        tcb.tlp_sent = false;
+        tcb.head_xmit_ms = 0;
+        updateScoreboard(tcb, &.{});
+    }
+    if (finSent(tcb)) {
+        flushSendBufferForFin(tcb);
+        resendFinIfRewound(tcb);
+    }
+}
+
 /// Receive data from a connection. Returns bytes read; 0 only at EOF (peer
 /// FIN seen or connection closed, ring drained); -EAGAIN when the ring is
 /// empty but the peer may still send (no blocking wait exists yet, so this
@@ -2784,7 +2964,7 @@ pub fn tcpRecv(tcb_idx: u32, buf: [*]u8, len: u32) i64 {
     if (!tcb.active) return -1;
 
     const available = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
-    const decision = tcp_recv_policy.decide(tcb.state, available);
+    const decision = tcp_recv_policy.decide(tcb.state, available, tcb.reset_by_peer);
     if (decision != .read_data) return tcp_recv_policy.emptyResult(decision);
 
     const to_read = @min(available, len);
@@ -2855,16 +3035,9 @@ pub fn tcpClose(tcb_idx: u32) i64 {
     }
 
     switch (tcb.state) {
-        .established => {
-            tcb.state = .fin_wait_1;
-            _ = sendSegment(tcb, FIN | ACK, undefined, 0);
-            tcpLog("[tcp] FIN sent → FIN_WAIT_1\n");
-        },
-        .close_wait => {
-            tcb.state = .last_ack;
-            _ = sendSegment(tcb, FIN | ACK, undefined, 0);
-            tcpLog("[tcp] FIN sent → LAST_ACK\n");
-        },
+        // Queued bytes go out first; the FIN follows once the ring drains
+        // (FIN_WAIT_1 / LAST_ACK from then on).
+        .established, .close_wait => requestFin(tcb),
         .listen => {
             // Clear the listen slot so the port stops answering SYNs, and
             // free pending backlog TCBs nobody can accept anymore.
@@ -3035,16 +3208,15 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
                 prepareRexmitFromHole(tcb);
                 flushSendBuffer(tcb);
                 // v53.13: If all pending data has been retransmitted, also retransmit FIN
-                if (tcb.send_unacked == tcb.send_tail) {
-                    if (tcb.state == .fin_wait_1 or tcb.state == .last_ack or tcb.state == .closing) {
-                        _ = sendSegment(tcb, FIN | ACK, undefined, 0);
-                    }
-                }
+                resendFinIfRewound(tcb);
             } else if (tcb.state == .syn_sent) {
                 // Retransmit SYN
                 _ = sendSegment(tcb, probeEcnSynFlags(true), undefined, 0);
-            } else if (tcb.state == .fin_wait_1 or tcb.state == .last_ack or tcb.state == .closing) {
-                // v53.12: Include .closing — FIN must be retransmitted if ACK is lost
+            } else if (finSent(tcb)) {
+                // v53.12: Include .closing — FIN must be retransmitted if ACK is lost.
+                // Rewind to the FIN's own seq: snd_nxt already counts it, and
+                // resending at snd_nxt would carry FIN+1 and bump snd_nxt again.
+                tcb.snd_nxt = finSeq(tcb);
                 _ = sendSegment(tcb, FIN | ACK, undefined, 0);
             }
             tcpLog("[tcp] RTO retransmit\n");
@@ -3065,7 +3237,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
     // ── Zero-window persist (SK-110) ─────────────────────────────────
     // When the peer advertises snd_wnd=0 but we still have unsent data,
     // periodically probe with 1 byte so a lost window update cannot stall forever.
-    if (tcb.state == .established) {
+    if (tcb.state == .established or tcb.state == .close_wait) {
         const unsent = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
         if (probePersistActive(tcb.snd_wnd, unsent)) {
             tcb.persist_timer_ms +%= ms_elapsed;
@@ -3135,6 +3307,10 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             }
         }
     }
+
+    // Deferred FIN (close/shutdown with a non-empty send ring): pacing,
+    // window reopen or a failed TX may have held it; retry every tick.
+    maybeSendPendingFin(tcb);
 }
 
 // ─── Listening / Server Socket Support ──────────────────────────────────────
@@ -3212,6 +3388,7 @@ pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
     }
 
     tcb.local_port = port;
+    tcb.bound_explicitly = port != 0;
     return 0;
 }
 
@@ -3448,16 +3625,7 @@ pub fn tcpShutdown(tcb_idx: u32, how: u32) i64 {
         1 => {
             // SHUT_WR: send FIN
             switch (tcb.state) {
-                .established => {
-                    tcb.state = .fin_wait_1;
-                    _ = sendSegment(tcb, FIN | ACK, undefined, 0);
-                    tcpLog("[tcp] shutdown FIN → FIN_WAIT_1\n");
-                },
-                .close_wait => {
-                    tcb.state = .last_ack;
-                    _ = sendSegment(tcb, FIN | ACK, undefined, 0);
-                    tcpLog("[tcp] shutdown FIN → LAST_ACK\n");
-                },
+                .established, .close_wait => requestFin(tcb),
                 else => {},
             }
         },
@@ -3465,16 +3633,7 @@ pub fn tcpShutdown(tcb_idx: u32, how: u32) i64 {
             // SHUT_RDWR: shutdown both directions
             tcb.recv_head = tcb.recv_tail;
             switch (tcb.state) {
-                .established => {
-                    tcb.state = .fin_wait_1;
-                    _ = sendSegment(tcb, FIN | ACK, undefined, 0);
-                    tcpLog("[tcp] shutdown RDWR FIN → FIN_WAIT_1\n");
-                },
-                .close_wait => {
-                    tcb.state = .last_ack;
-                    _ = sendSegment(tcb, FIN | ACK, undefined, 0);
-                    tcpLog("[tcp] shutdown RDWR FIN → LAST_ACK\n");
-                },
+                .established, .close_wait => requestFin(tcb),
                 .listen => {
                     // Same teardown as tcpClose's .listen arm: clear the
                     // listen slot so the port stops answering SYNs, and free

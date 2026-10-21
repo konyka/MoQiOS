@@ -28,15 +28,20 @@ pub const RecvDecision = enum {
     would_block,
     /// Listening socket: recv is not meaningful.
     not_connected,
+    /// Connection aborted by a peer RST and ring drained: ECONNRESET.
+    reset,
 };
 
 /// Classify a recv() on a TCB in `state` whose receive ring holds
 /// `available` bytes. 0 is reserved for EOF so the standard
 /// `while ((n = recv(fd, ...)) > 0)` loop does not stop on a transiently
-/// empty ring.
-pub fn decide(state: TcpState, available: u32) RecvDecision {
+/// empty ring. `reset_by_peer` (a valid RST tore the connection down) turns
+/// the drained-ring result into ECONNRESET: an aborted stream must not look
+/// like an orderly EOF. Bytes buffered before the RST are still delivered.
+pub fn decide(state: TcpState, available: u32, reset_by_peer: bool) RecvDecision {
     if (state == .listen) return .not_connected;
     if (available > 0) return .read_data;
+    if (reset_by_peer) return .reset;
     return switch (state) {
         // No FIN from the peer yet: more data can still arrive.
         .syn_sent, .syn_received, .established, .fin_wait_1, .fin_wait_2 => .would_block,
@@ -53,5 +58,6 @@ pub fn emptyResult(decision: RecvDecision) i64 {
         .read_data, .eof => 0,
         .would_block => errno.EAGAIN,
         .not_connected => errno.ENOTCONN,
+        .reset => errno.ECONNRESET,
     };
 }
