@@ -45,6 +45,10 @@ pub const EventfdInstance = struct {
     /// Cross-process references (fork/clone) — eventfdClose frees at 0 only.
     ref_count: u32 = 1,
     valid: bool = false,
+    /// Slot incarnation, bumped on every create and preserved across close:
+    /// a blocked reader/writer that wakes to a different generation was
+    /// closed out (the slot got reused) and must return EBADF.
+    generation: u64 = 0,
 };
 
 /// WaitNode for blocking read/write — stack-allocated on the waiter's kernel
@@ -77,6 +81,7 @@ pub fn eventfdCreate(init_val: u64, semaphore: bool) i32 {
                 .owner_task_idx = cur_idx,
                 .ref_count = 1,
                 .valid = true,
+                .generation = inst.generation +% 1,
             };
             return @intCast(i);
         }
@@ -188,12 +193,19 @@ pub fn eventfdRead(eventfd_idx: u32, buf: [*]u8, count: usize, status_flags: u32
     const nonblocking = (status_flags & EFD_NONBLOCK) != 0;
     const inst = &eventfd_pool[eventfd_idx];
 
+    var generation: ?u64 = null;
     while (true) {
         const saved = inst.spin.acquire();
         if (!inst.valid) {
             inst.spin.release(saved);
             return -9; // EBADF — destroyed (eventfdClose) while we waited
         }
+        if (generation) |g| {
+            if (inst.generation != g) {
+                inst.spin.release(saved);
+                return -9; // EBADF — closed and the slot reused while we waited
+            }
+        } else generation = inst.generation;
         if (inst.counter > 0) {
             const res = eventfd_policy.readResult(inst.counter, inst.semaphore);
             inst.counter = res.counter_after;
@@ -233,12 +245,19 @@ pub fn eventfdWrite(eventfd_idx: u32, buf: [*]const u8, count: usize, status_fla
     const nonblocking = (status_flags & EFD_NONBLOCK) != 0;
     const inst = &eventfd_pool[eventfd_idx];
 
+    var generation: ?u64 = null;
     while (true) {
         const saved = inst.spin.acquire();
         if (!inst.valid) {
             inst.spin.release(saved);
             return -9; // EBADF
         }
+        if (generation) |g| {
+            if (inst.generation != g) {
+                inst.spin.release(saved);
+                return -9; // EBADF — closed and the slot reused while we waited
+            }
+        } else generation = inst.generation;
         if (eventfd_policy.writeAdmitted(inst.counter, val)) {
             inst.counter += val;
             // Broadcast to blocked readers iff the counter became readable

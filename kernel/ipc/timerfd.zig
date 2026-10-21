@@ -68,6 +68,10 @@ pub const TimerInstance = struct {
     flags: u32 = 0,
     waiter: ?*WaitNode = null,
     valid: bool = false,
+    /// Slot incarnation, bumped on every create and preserved across close:
+    /// a blocked reader that wakes to a different generation was closed out
+    /// (the slot got reused) and must return EBADF.
+    generation: u64 = 0,
 };
 
 // Global pool
@@ -116,6 +120,7 @@ pub fn timerfdCreate(clock_id: u32, flags: u32) i32 {
                 .expirations = 0,
                 .flags = flags,
                 .valid = true,
+                .generation = inst.generation +% 1,
             };
             return @intCast(i);
         }
@@ -262,6 +267,7 @@ pub fn timerfdRead(timerfd_idx: u32, buf: [*]u8, count: usize) i64 {
     if (timerfd_idx >= MAX_TIMERFD_INSTANCES) return -1;
     if (count < 8) return -1;
 
+    var generation: ?u64 = null;
     while (true) {
         const saved = timer_lock.acquire();
         const inst = &timer_pool[timerfd_idx];
@@ -269,6 +275,12 @@ pub fn timerfdRead(timerfd_idx: u32, buf: [*]u8, count: usize) i64 {
             timer_lock.release(saved);
             return -9; // EBADF — destroyed (timerfdClose) while we waited
         }
+        if (generation) |g| {
+            if (inst.generation != g) {
+                timer_lock.release(saved);
+                return -9; // EBADF — closed and the slot reused while we waited
+            }
+        } else generation = inst.generation;
         if (inst.expirations > 0) {
             const val = inst.expirations;
             inst.expirations = 0;
@@ -359,7 +371,7 @@ pub fn timerfdClose(timerfd_idx: u32) void {
     const epoll_mod = @import("../net/epoll.zig");
     epoll_mod.epollNotify(.timerfd, timerfd_idx, epoll_mod.EPOLLHUP);
 
-    inst.* = .{};
+    inst.* = .{ .generation = inst.generation };
 }
 
 /// Get the current expiration count (for epoll computeCurrentEvents).

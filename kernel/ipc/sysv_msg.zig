@@ -10,6 +10,7 @@ const bo = @import("../lib/byte_order.zig");
 const task = @import("../proc/task.zig");
 const sched = @import("../proc/sched.zig");
 const sysv_policy = @import("sysv_policy.zig");
+const select_policy = @import("sysv_msg_select_policy.zig");
 
 const MAX_QUEUES: u32 = 16;
 const MAX_MSGS_PER_Q: u32 = 8;
@@ -21,6 +22,8 @@ const MsgBuf = struct {
     len: u32 = 0,
     /// Message type (must be > 0)
     mtype: i64 = 0,
+    /// Per-queue enqueue order; msgrcv selects by this, not ring position.
+    seq: u64 = 0,
     used: bool = false,
 };
 
@@ -36,6 +39,8 @@ pub const MsgQueue = struct {
     head: u32 = 0,
     tail: u32 = 0,
     count: u32 = 0,
+    /// Next seq stamped on an enqueued message (monotonic per queue)
+    next_seq: u64 = 0,
     /// Total bytes in queue
     total_bytes: u32 = 0,
     /// Max bytes allowed
@@ -212,6 +217,8 @@ pub fn msgsnd(msqid: u32, msgp: u64, msgsz: u64, msgflg: i32) i64 {
         }
     }
     const idx = insert_idx orelse return EAGAIN;
+    local_msg.seq = q.next_seq;
+    q.next_seq += 1;
     q.msgs[idx] = local_msg;
     q.tail = (idx + 1) % MAX_MSGS_PER_Q;
     q.count += 1;
@@ -241,45 +248,17 @@ pub fn msgrcv(msqid: u32, msgp: u64, msgsz: u64, msgtyp: i64, msgflg: i32) i64 {
             return EAGAIN; // simplified: no blocking
         }
 
-        // Find matching message by type
-        // msgtyp == 0: first message
-        // msgtyp > 0: first message with that type
-        // msgtyp < 0: message with the LOWEST type <= |msgtyp|
-        // Typed receives free middle slots, leaving holes in the ring — scan all
-        // MAX_MSGS_PER_Q slots and skip !used ones in every path (q.count only
-        // tracks how many slots are used, not where they are).
-        var found_idx: ?u32 = null;
-
-        if (msgtyp == 0) {
-            // First used message starting from head
-            var i: u32 = 0;
-            while (i < MAX_MSGS_PER_Q) : (i += 1) {
-                const idx = (q.head + i) % MAX_MSGS_PER_Q;
-                if (q.msgs[idx].used) {
-                    found_idx = idx;
-                    break;
-                }
-            }
-        } else {
-            // |msgtyp| — minInt(i64) has no positive counterpart; clamp to maxInt
-            const abs_type: i64 = if (msgtyp == std.math.minInt(i64)) std.math.maxInt(i64) else -msgtyp;
-            var i: u32 = 0;
-            while (i < MAX_MSGS_PER_Q) : (i += 1) {
-                const idx = (q.head + i) % MAX_MSGS_PER_Q;
-                const msg = &q.msgs[idx];
-                if (!msg.used) continue;
-                if (msgtyp > 0 and msg.mtype == msgtyp) {
-                    found_idx = idx;
-                    break;
-                }
-                if (msgtyp < 0 and msg.mtype <= abs_type) {
-                    // Keep scanning: must pick the lowest type, not the first match
-                    if (found_idx == null or msg.mtype < q.msgs[found_idx.?].mtype) {
-                        found_idx = idx;
-                    }
-                }
-            }
+        // Find matching message by type, oldest (smallest seq) first:
+        // msgtyp == 0: oldest message
+        // msgtyp > 0: oldest message with that type
+        // msgtyp < 0: LOWEST type <= |msgtyp|, oldest within that type
+        // Typed receives free middle slots that msgsnd may back-fill, so ring
+        // position is not age order — select by seq over all slots.
+        var candidates: [MAX_MSGS_PER_Q]select_policy.Slot = undefined;
+        for (&q.msgs, 0..) |*m, i| {
+            candidates[i] = .{ .used = m.used, .mtype = m.mtype, .seq = m.seq };
         }
+        const found_idx: ?u32 = if (select_policy.select(&candidates, msgtyp)) |i| @intCast(i) else null;
 
         if (found_idx == null) {
             if (msgflg & IPC_NOWAIT != 0) return EAGAIN;

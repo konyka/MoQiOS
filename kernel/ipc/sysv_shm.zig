@@ -504,10 +504,19 @@ pub fn shmctl(shmid: u32, cmd: i32, buf: u64) i64 {
 
     switch (cmd) {
         IPC_STAT => {
-            if (!can_manage and cur != null) {
-                const task = cur.?;
-                const class_bits: u5 = if (task.egid == seg.perm.gid) 3 else 0;
-                if (!shm_policy.modeAllows(seg.perm.mode, class_bits, 0o4)) {
+            if (cur) |task| {
+                const segment_owner: sysv_policy.Owner = .{
+                    .uid = seg.perm.uid,
+                    .gid = seg.perm.gid,
+                    .cuid = seg.perm.cuid,
+                    .cgid = seg.perm.cgid,
+                };
+                const credentials: sysv_policy.Credentials = .{
+                    .euid = task.euid,
+                    .egid = task.egid,
+                    .cap_sys_admin = task.effective_caps.cap_sys_admin,
+                };
+                if (!sysv_policy.modeAllows(seg.perm.mode, segment_owner, credentials, true, false)) {
                     shm_lock.release(flags);
                     return -13; // -EACCES
                 }
