@@ -824,6 +824,7 @@ const SchedStats = struct {
 - `fsync`/`fdatasync` 仅接受 ext2/FAT32 regular-file descriptors；pipe、socket、eventfd 等非文件描述符返回 `EINVAL`。
 - TCP `recv`/`recvfrom`/`recvmsg` 三态：有数据返回字节数；空接收环且对端仍可发送（syn_*/established/fin_wait_*）返回 `-EAGAIN`；对端已关闭（close_wait/closing/last_ack/time_wait/closed）返回 0（EOF）。尚无阻塞 recv（不论 O_NONBLOCK 均为 EAGAIN）。FIONREAD 对 TCP 报可读字节数、对 UDP 报队首数据报长度。（§6.53）
 - ext2 最后一个链接被 unlink/rename 覆盖时，若 inode 仍被打开则只摘目录项并持久化 links_count=0，回收延迟到最后一次 close（tmpfs/FAT32 同语义）；fstat/statx 对 ext2 fd 报真实 inode 号、mode、nlink、uid/gid 与 `max(盘上, fd 缓存)` 尺寸。（§6.53）
+- epoll 注册在 fd 关闭时迁移到同表中仍存活的同资源副本（dup 场景），无副本才删除；unix_socket 报 IN/OUT/HUP/ERR 并在收发/连接/关闭时通知。TCP close/SHUT_WR 先冲刷发送环、环排空后才发 FIN；被对端 RST 的连接空读返回 `-ECONNRESET`；临时端口跳过已占用端口。MoqIPC call 的 reply 走独立 `reply_msg` 槽，不与入站 send 的 `pending_msg` 互相覆盖。moqi_libc malloc 检测同线程重入（malloc 返回 NULL、free 延迟），free 拒绝 double free 与非堆指针。（§6.54）
 - SysV msgrcv 按入队单调 seq 选择（msgtyp=0 严格 FIFO）；shmctl(IPC_STAT) 按 mode 读权限裁决；timerfd/eventfd 阻塞读写以槽位 generation 识别 close+复用，返回 EBADF。（§6.53）
 - `ftruncate`/`truncate` 接受全部有真实截断后端的可写 regular-file fd（ext2/FAT32/tmpfs），RLIMIT_FSIZE 的 SIGXFSZ/EFBIG 门先于后端分发；c76438a 曾误把 fsync 的类型门套到 ftruncate 上使 tmpfs 无法截断（§6.51 修复，hello42/hello66 锁定）。
 - epoll pool 生命周期采用 slot generation + transient active borrow；persistent `ref_count` 仅表示 fork/clone fd ownership，pool metadata 到 instance payload 遵守 `pool_lock -> inst.spin`。

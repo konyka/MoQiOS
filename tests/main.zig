@@ -72,6 +72,10 @@ test {
     _ = @import("ext2_unlink_test.zig");
     _ = @import("stat_fields_test.zig");
     _ = @import("sysv_msg_test.zig");
+    _ = @import("unix_epoll_test.zig");
+    _ = @import("tcp_port_test.zig");
+    _ = @import("ipc_reply_test.zig");
+    _ = @import("net_misc_test.zig");
 }
 
 test "sync syscall propagates aggregate writeback failure as EIO" {
