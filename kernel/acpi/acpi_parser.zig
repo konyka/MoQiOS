@@ -71,6 +71,25 @@ fn initX86(rsdp_phys: u64) void {
         return;
     }
 
+    // ACPI §5.2.5.3: the byte sum of the first 20 bytes must be 0, and for
+    // revision >= 2 the extended checksum covers the full 36-byte structure.
+    // A wrong RSDP would point every later parse at garbage.
+    const rsdp_bytes: [*]const u8 = @ptrFromInt(hhdm.physToVirt(rsdp_phys));
+    var sum: u8 = 0;
+    for (0..20) |i| sum +%= rsdp_bytes[i];
+    if (sum != 0) {
+        serial.writeString("[ACPI] RSDP checksum mismatch\n");
+        return;
+    }
+    if (rsdp.revision >= 2) {
+        var xsum: u8 = 0;
+        for (0..36) |i| xsum +%= rsdp_bytes[i];
+        if (xsum != 0) {
+            serial.writeString("[ACPI] RSDP extended checksum mismatch\n");
+            return;
+        }
+    }
+
     serial.writeString("[ACPI] RSDP found, revision: ");
     fmt.writeDecimal(rsdp.revision);
     serial.writeString("\n");
@@ -106,7 +125,11 @@ fn parseRsdt(rsdt_phys: u64) void {
 
     if (len < @sizeOf(tables.SdtHeader)) return;
 
-    const entry_count = (len - @sizeOf(tables.SdtHeader)) / 4;
+    // MADT/MCFG rule: a corrupt length must not walk entries past the mapped
+    // 2 MiB window — clamp the table length before deriving the entry count.
+    const map_window: u32 = 2 * 1024 * 1024;
+    const safe_len = @min(len, map_window);
+    const entry_count = (safe_len - @sizeOf(tables.SdtHeader)) / 4;
 
     mapAcpiPage(rsdt_phys);
 
@@ -144,10 +167,12 @@ fn parseXsdt(xsdt_phys: u64) void {
 
     // Trusting the firmware length field: if length < header size the u32
     // subtraction below underflows to ~4G and the loop walks entries far
-    // past the mapped table (same guard as parseRsdt).
+    // past the mapped table. Apply parseRsdt's window clamp as well (the old
+    // comment referenced a guard parseRsdt did not actually have).
     if (xsdt.length < @sizeOf(tables.SdtHeader)) return;
-
-    const entry_count = (xsdt.length - @sizeOf(tables.SdtHeader)) / 8;
+    const map_window: u64 = 2 * 1024 * 1024;
+    const safe_len = @min(@as(u64, xsdt.length), map_window);
+    const entry_count: u32 = @intCast((safe_len - @sizeOf(tables.SdtHeader)) / 8);
     const entries: [*]const u64 = @ptrFromInt(@intFromPtr(xsdt) + @sizeOf(tables.SdtHeader));
 
     var i: u32 = 0;

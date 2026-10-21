@@ -74,33 +74,17 @@ fn initBackBuffer() void {
         return;
     }
 
-    // 分配连续物理页
-    const phys = pmm.allocPage() orelse return;
+    // 分配物理连续的页：HHDM 直映射天然覆盖整段连续内存，因此不需要任何
+    // 额外的内核 VA 映射。旧实现从单页起步、再对 virt+i*PAGE 逐页 mapPage
+    // —— mapPage 无条件覆盖已有 PTE，等于把 phys+1..phys+N-1 这些【别的
+    // 子系统的物理帧】的 HHDM 别名翻译改指向新分配的页，任何经
+    // hhdm.physToVirt 访问那些帧的内核代码都会读/写到错误内存。
+    // 连续分配失败时退回单缓冲（正确，只是滚动重绘变慢）。
+    const phys = pmm.allocContiguous(pages_needed) orelse {
+        serial.writeString("[framebuffer] Back buffer allocation failed, single-buffered\n");
+        return;
+    };
     const virt = hhdm.physToVirt(phys);
-
-    // 如果需要多页，逐页映射
-    if (pages_needed > 1) {
-        const pml4 = paging.getKernelPml4();
-        const flags = paging.MapFlags{
-            .writable = true,
-            .user = false,
-            .no_execute = true,
-            .global = true,
-        };
-        var i: u64 = 1;
-        while (i < pages_needed) : (i += 1) {
-            const extra_phys = pmm.allocPage() orelse {
-                // 分配失败，放弃双缓冲
-                serial.writeString("[framebuffer] Back buffer allocation failed, single-buffered\n");
-                return;
-            };
-            paging.mapPage(pml4, virt + i * paging.PAGE_SIZE, extra_phys, flags) catch {
-                pmm.freePage(extra_phys);
-                serial.writeString("[framebuffer] Back buffer map failed, single-buffered\n");
-                return;
-            };
-        }
-    }
 
     back_buffer_phys = phys;
     back_buffer = @ptrFromInt(virt);

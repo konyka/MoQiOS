@@ -82,9 +82,11 @@ fn currentTask() ?*task_mod.Task {
 }
 
 /// Kernel-owned IRQ lines a user driver may never claim: the keyboard (1),
-/// the PIC cascade (2), and the IRQ lines of NICs the kernel already drives.
+/// the PIC cascade (2), the PS/2 auxiliary port / mouse (12 — idt dispatches
+/// IRQ 12 straight to the kernel mouse driver, and a user claim would silence
+/// it), the RTC (8), and the IRQ lines of NICs the kernel already drives.
 fn isKernelOwnedGsi(gsi: u8) bool {
-    if (gsi == 1 or gsi == 2) return true;
+    if (gsi == 1 or gsi == 2 or gsi == 8 or gsi == 12) return true;
     const e1000 = @import("e1000.zig");
     if (e1000.isActive() and e1000.getIrqLine() == gsi) return true;
     const vnet = @import("virtio_net.zig");
@@ -459,6 +461,12 @@ pub fn syscallDevDmaFree(va: u64) i64 {
     }
     const e = entry.?.*;
     dma_lock.release(flags);
+
+    // Same discipline as alloc: the PTE teardown and the region untracking
+    // must be serialised against sibling fault/unmap writers on a
+    // CLONE_VM-shared table (lock order vm_lock → dma_lock).
+    var vm_guard = Mm.beginVmMutation(cur.mm, @ptrCast(cur)) catch return errno.EDEADLK;
+    defer vm_guard.release();
 
     // Unmap without freeing through the PMM path, drop the region bookkeeping,
     // then return the frames via the DMA allocator's own accounting.

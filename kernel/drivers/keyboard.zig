@@ -64,8 +64,11 @@ pub fn init() void {
     const flags = ps2.lock.acquire();
     defer ps2.lock.release(flags);
 
-    // Clear any pending output from the keyboard controller
-    while ((io.inb(PS2_STATUS) & 0x01) != 0) {
+    // Clear any pending output from the keyboard controller. Bounded: a
+    // wedged controller that keeps re-asserting OBF must not hang the boot
+    // with IRQs off and the PS/2 lock held (same call the mouse driver made).
+    var drains: u32 = 0;
+    while ((io.inb(PS2_STATUS) & 0x01) != 0 and drains < 64) : (drains += 1) {
         _ = io.inb(PS2_DATA);
     }
 
@@ -74,8 +77,17 @@ pub fn init() void {
 
     // Enable keyboard scanning
     io.outb(PS2_DATA, 0xF4);
-    // Read acknowledge
-    while ((io.inb(PS2_STATUS) & 0x01) == 0) {}
+    // Read acknowledge — bounded, like ps2.waitRead: a missing keyboard or a
+    // controller that never answers must not spin the boot forever. The
+    // keyboard simply does not work in that case.
+    var tries: u32 = 0;
+    while ((io.inb(PS2_STATUS) & 0x01) == 0) {
+        tries += 1;
+        if (tries >= 100_000) {
+            serial.writeString("[keyboard] no ACK from controller, continuing without keyboard\n");
+            return;
+        }
+    }
     _ = io.inb(PS2_DATA);
 
     serial.writeString("[keyboard] PS/2 keyboard initialized\n");

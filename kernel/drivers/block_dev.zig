@@ -97,7 +97,7 @@ pub fn registerDevice(info: BlockDevInfo, dev_idx: u8) u8 {
 
     // 打印注册信息
     serial.writeString("[block_dev] Registered device #");
-    var buf: [8]u8 = undefined;
+    var buf: [20]u8 = undefined;
     serial.writeString(formatUint(&buf, idx));
     serial.writeString(" type=");
     serial.writeString(@tagName(info.dev_type));

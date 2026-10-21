@@ -41,20 +41,47 @@ pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) nor
         }
     }
 
-    serial.writeString("\n!!! KERNEL PANIC !!!\n");
-    serial.writeString("  message: ");
-    serial.writeString(msg);
-    serial.writeString("\n");
-
-    if (ret_addr) |addr| {
-        serial.writeString("  ret_addr: 0x");
-        fmt.writeHex(addr);
+    // Dump via the lock-free COM1 path: the parked APs halt mid-execution and
+    // may hold the serial IrqSpinlock — a normal writeString would spin on
+    // that ticket ticket forever and the panic would produce no output at
+    // all. Same rationale as the recursive-panic guard above, but for
+    // cross-CPU lock state.
+    if (comptime builtin.cpu.arch == .x86_64) {
+        writeRaw("\n!!! KERNEL PANIC !!!\n  message: ");
+        writeRaw(msg);
+        writeRaw("\n");
+        if (ret_addr) |addr| {
+            writeRaw("  ret_addr: 0x");
+            writeRawHex(addr);
+            writeRaw("\n");
+        }
+        writeRaw("  system halted\n");
+    } else {
+        serial.writeString("\n!!! KERNEL PANIC !!!\n  message: ");
+        serial.writeString(msg);
         serial.writeString("\n");
+        if (ret_addr) |addr| {
+            serial.writeString("  ret_addr: 0x");
+            fmt.writeHex(addr);
+            serial.writeString("\n");
+        }
+        serial.writeString("  system halted\n");
     }
-
-    serial.writeString("  system halted\n");
     if (comptime builtin.cpu.arch == .x86_64) @import("drivers/fbcon.zig").panicFlush();
     arch.cpu.halt();
+}
+
+fn writeRawHex(v_in: u64) void {
+    const hex = "0123456789abcdef";
+    var buf: [16]u8 = undefined;
+    var v = v_in;
+    var i: usize = 16;
+    while (i > 0) {
+        i -= 1;
+        buf[i] = hex[v & 0xF];
+        v >>= 4;
+    }
+    writeRaw(&buf);
 }
 
 /// Lock-free COM1 (port 0x3F8) write for recursive panics, where the serial
