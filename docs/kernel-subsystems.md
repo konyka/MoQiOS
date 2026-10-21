@@ -513,8 +513,9 @@ wakeup 前释放 pin；slot 只有在 zombie、无 operation refs 且满足调�
   有普通任务时跳过 idle 类（优先级 255）条目；`keepsCpuOverIdle` 保证可运行的当前任务
   不会因为换出者“先选后入队”而被换成 idle（被改绑到别的 CPU 时仍会离开）。
 - **超时扫描每 tick 一次**：BSP 每个硬件 tick 运行 `bspTimedWaitTick`（futex / POSIX mq /
-  epoll / timerfd / POSIX timer / alarm / itimer），timerfd 与 POSIX timer 用
-  `lib/deadline_hint.zig` 无锁门控；reap、writeback、MoqIPC 超时、TCP、ICMPv6 留在
+  epoll / timerfd / POSIX timer / alarm / itimer / **MoqIPC 超时**——§6.51 起
+  timeoutTick 仅由此处驱动，`bspSlowMaintenance` 不再重复扫描），timerfd 与 POSIX timer 用
+  `lib/deadline_hint.zig` 无锁门控；reap、writeback、TCP、ICMPv6 留在
   `bspSlowMaintenance`（100 ms）。epoll 超时改用 TSC 纳秒截止时间，阻塞时立即让出 CPU。
 - **RT 带宽限流（2026-10 第二轮）**：每 CPU 每 100 个硬件 tick 允许 RT 类跑 95 tick
   （`rt_bandwidth_policy`）。空转的 SCHED_FIFO 过了预算必须把 CPU 给 OTHER。RR 保持 POSIX：
@@ -821,6 +822,7 @@ const SchedStats = struct {
 - splice 的 pipe→file/socket reservation 路径在阻塞模式下等待 live pipe 数据；`SPLICE_F_NONBLOCK` 或 descriptor `O_NONBLOCK` 返回零进度 `EAGAIN`，写端关闭保持 EOF。pipe→pipe 的完整阻塞 transfer 仍是后续项。
 - pipe→pipe splice 在零进度时返回 `EAGAIN`，避免 destination-full 或空源 pipe 被伪报为 EOF/成功；完整阻塞 source/destination wait queue 语义仍是后续项。
 - `fsync`/`fdatasync` 仅接受 ext2/FAT32 regular-file descriptors；pipe、socket、eventfd 等非文件描述符返回 `EINVAL`。
+- `ftruncate`/`truncate` 接受全部有真实截断后端的可写 regular-file fd（ext2/FAT32/tmpfs），RLIMIT_FSIZE 的 SIGXFSZ/EFBIG 门先于后端分发；c76438a 曾误把 fsync 的类型门套到 ftruncate 上使 tmpfs 无法截断（§6.51 修复，hello42/hello66 锁定）。
 - epoll pool 生命周期采用 slot generation + transient active borrow；persistent `ref_count` 仅表示 fork/clone fd ownership，pool metadata 到 instance payload 遵守 `pool_lock -> inst.spin`。
 - epoll registration 额外捕获 fd slot incarnation；readiness probe 持有 transfer hold，并校验 live descriptor 的 generation、类型和 resource index，避免 close/reuse 后把旧注册绑定到新 fd。
 - nested epoll 在 child ready transition 后于既有 `pool_lock` 临界区内向父实例传播 ready 状态并唤醒 waiter；传播使用 visited bitmap，避免循环 epoll 图递归获取锁或无限传播。
@@ -829,13 +831,23 @@ const SchedStats = struct {
 - `EPOLL_CTL_ADD/MOD` 在 registration 发布后重新探测 readiness，避免 probe 与加锁之间的通知 TOCTOU；child queue drain 后会清除父 nested ET 的 `last_reported`，允许下一次 ready transition 重新唤醒。
 - `EPOLL_CTL_MOD` 推进 registration incarnation，避免旧 probe 修改新配置；LT 的 HUP/ERR 事件保持可重复 ready；self-epoll registration 返回 `ELOOP`。
 - fd close/dup2 replacement 在 descriptor teardown 前按 `(FdTable, fd, generation)` 精确清理 epoll registration，避免 close/reuse 反复创建不可删除的 stale item 耗尽 registration pool。
+- UDP 数据报入队（`udp_lock` 释放后）调用 `epollNotify(.udp_socket, port, EPOLLIN)`——到达即边，空队列时注册的 `epoll_wait` 不再依赖 ctl/collect 的反应式探测。（§6.51）
+- ET 事件交付时清零该 item 的 `last_reported`：下一个同 mask notify 是新边并重新入队，"读尽 EAGAIN 后阻塞"的 ET 读者不会被连续同 mask 通知饿死。（§6.51）
+- collectEvents drain 结束时 ready list 非空则唤醒 waiter（Linux `ep_done_scan` 语义）：封住 drain 与回插之间并发 `epoll_wait` 安装 waiter 的 lost-wakeup 窗口。（§6.51）
+- `EPOLL_CTL_ADD` 沿 child epoll 链（`nestedChainReaches`，visited bitmap 有界）检测间接环，构成环返回 `ELOOP`——环上就绪互相传播会使 `epoll_wait` 永久 busy-loop。（§6.51）
+- MoqIPC receive 被信号/`moqipc_notify` 踢醒时统一清理 `waiting_receiver` 注册并按唤醒来源分类返回：endpoint 失效才报 `invalid_endpoint`，存活 endpoint 的无投递唤醒报 EINTR（信号）/EAGAIN（notify）——注册残留曾让 endpoint 对所有 sender 永久报废。（§6.51）
+- `alarm`/`itimer` deadline 字段与 per-CPU run-queue 的 `nr_running` 计数全部原子访问（tick 扫描器跨 CPU 与 syscall 上下文并发）。（§6.51）
+- execve 初始栈与 spawn 路径一样携带 AT_PHDR/AT_PHNUM（PT_PHDR 段地址优先、`e_phoff` 回退）；栈 16 字节对齐 pad 位于 AT_NULL 之上——envp 终止符与第一个 auxv 项之间不允许出现零字（crt0 从 `envp+1` 开始扫描 auxv，先见零即终止，TLS 初始化随之失效）。行为级 host 测试锁定两种奇偶组合。（§6.51）
+- moqi_libc `struct ksigaction` 为 Linux 字段序 {handler, flags, restorer, mask}（`_Static_assert` 锁定 mask@24/handler@0）：内核在完整结构可寻址时从 offset 24 读 `sa_mask` 应用，字段序错位曾使每次 `sigaction()` 把 restorer 当掩码写入并静默清零信号掩码。（§6.51）
 - FAT32 open descriptors now hold per-slot references; unlink tombstones the directory entry but defers cluster reclamation and slot reuse until the final inherited/duplicated fd closes.
 - FAT32 namespace lookup excludes `unlink_pending` slots; open+retain is atomic under the FAT32 lock, duplicate descriptors retain the shared slot, and directory rescan refuses to overwrite slots with live references.
 - Pending FAT32 unlink is finalized by the last close through a separate reclaim path; writeback and complete FAT-chain I/O are required before the slot is recycled.
 - Failed FAT32 reclaim remains explicitly pending and can be retried; failed FAT writes invalidate the FAT cache rather than publishing stale in-memory entries.
 - FAT32 truncate/unlink flush dirty mmap page-cache data before staged writeback and cluster reclamation; reclaim rechecks fd references after dropped-lock I/O and rejects malformed FAT links.
-- FAT32 truncate revalidates the file size/chain snapshot after unlocked flush I/O, uses widened size arithmetic, preserves old metadata on directory-update failure, and O_TRUNC propagates truncate failure instead of publishing a stale fd.
-- FAT32 partial truncate zeros the retained cluster tail and detaches the live chain before freeing tail clusters, preventing retry after FAT I/O failure from traversing reclaimed clusters.
+- FAT32 truncate revalidates the file size/chain snapshot after unlocked flush I/O, uses widened size arithmetic, preserves old metadata on directory-update failure, and O_TRUNC propagates truncate failure instead of publishing a stale fd. (§6.51: the O_TRUNC failure path releases the retained slot via `closeFile` + `freeFd` — `close()` rejects a still-INITIALIZING slot and used to leak both the fd slot and the reference; the create path holds exactly one reference per fd.)
+- FAT32 partial truncate zeros the retained cluster tail and detaches the live chain before freeing tail clusters, preventing retry after FAT I/O failure from traversing reclaimed clusters. (§6.51 reorder: the new size is published to memory and the on-disk directory entry BEFORE the EOC detach — a directory-update failure now rolls back to a fully consistent (size, chain) pair; a failure after the EOC write leaves the legal shrunk-size-with-slack-chain state and never rolls the size back.)
+- FAT32 mmap-backed regions retain the open slot exactly like ext2 (create success, split, fork copy, and release balance the reference) — since slots ARE reclaimed once the last reference drops after unlink, an unreferenced mapping could otherwise fault on or write into a reused slot after close(fd)+unlink+create. (§6.51)
+- FAT32 `zeroFileTail` handles sectors-per-cluster > 8 with per-sector RMW instead of whole-cluster I/O through the single 4 KiB bounce buffer, which overwrote adjacent physical pages. (§6.51)
 - FAT32 utility parsers reject undersized/invalid BPB geometry, out-of-range MBR entries, invalid root/cluster arithmetic, and surrogate UTF-8; these contracts are exercised by host tests.
 - FAT32 utility arithmetic returns checked/sentinel results for invalid cluster and FAT-entry offsets; LFN assembly requires reserved fields and exact forward sequence order.
 - FAT32 driver callers reject invalid utility sentinels before sector I/O, including malformed FAT-chain clusters that would otherwise target MBR sector zero.
