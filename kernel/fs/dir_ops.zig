@@ -57,6 +57,18 @@ pub fn fstat(fd: u64, stat_ptr: u64) i64 {
     const size: i64 = @intCast(fdesc.file_size);
     bo.writeI64Le(stat_buf[48..56], size);
 
+    if (fdesc.fd_type == .ext2_file) {
+        var info: @import("stat_info.zig").StatInfo = .{};
+        if (@import("ext2.zig").statInode(fdesc.ext2_file_idx, &info)) {
+            bo.writeU64Le(stat_buf[8..16], info.ino);
+            bo.writeU64Le(stat_buf[16..24], info.nlink);
+            bo.writeU32Le(stat_buf[24..28], info.mode);
+            bo.writeU32Le(stat_buf[28..32], info.uid);
+            bo.writeU32Le(stat_buf[32..36], info.gid);
+            bo.writeU64Le(stat_buf[48..56], @max(info.size, fdesc.file_size));
+        }
+    }
+
     if (copy.copyToUser(@ptrFromInt(stat_ptr), &stat_buf, stat_buf.len) != stat_buf.len) return -14;
     return 0;
 }

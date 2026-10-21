@@ -17,6 +17,7 @@ const trim_ranges = @import("../lib/trim_ranges.zig");
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const eu = @import("ext2_util.zig");
+const unlink_policy = @import("ext2_unlink_policy.zig");
 const dcache = @import("dcache.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
@@ -103,6 +104,9 @@ pub const Ext2File = struct {
     /// Cross-process references (fork/clone). closeFile frees only at 0,
     /// so a parent closing its fd cannot dangle the child's open-file index.
     ref_count: u32 = 1,
+    /// Last directory entry was removed while this slot was open: the inode
+    /// (links_count 0 on disk) is reclaimed by the last closeFile.
+    unlink_pending: bool = false,
 };
 
 var open_files: [MAX_OPEN_FILES]Ext2File = undefined;
@@ -599,7 +603,7 @@ fn walkPathInner(start_inode: u32, path: []const u8, depth: u32) i64 {
                 if (resolved_fd < 0) return resolved_fd;
                 // Get the inode from the opened file, then close it
                 const resolved_inode = open_files[@intCast(resolved_fd)].inode_num;
-                closeFileUnlocked(@intCast(resolved_fd)); // v52.1 fix: use closeFile to also clear path
+                _ = closeFileUnlocked(@intCast(resolved_fd)); // v52.1 fix: use closeFile to also clear path
                 return walkPathInner(resolved_inode, remaining, depth + 1);
             }
         }
@@ -959,25 +963,61 @@ pub fn refreshSize(file_idx: u32) u64 {
 }
 
 pub fn closeFile(file_idx: u32) void {
-    const flags = fs_lock.acquire();
+    var flags = fs_lock.acquire();
     defer fs_lock.release(flags);
-    closeFileUnlocked(file_idx);
+    // Final close of an unlinked inode: flush staged writeback extents while
+    // the slot is still live (they flush through it), then reclaim.
+    if (closeWouldReclaim(file_idx)) invalidateWriteback(open_files[file_idx].inode_num, &flags);
+    const reclaim_inode = closeFileUnlocked(file_idx);
+    if (reclaim_inode != 0) reclaimUnlinkedInode(reclaim_inode, &flags);
 }
 
-/// Lock-free closeFile for callers that already hold fs_lock.
-fn closeFileUnlocked(file_idx: u32) void {
-    if (file_idx >= open_count) return;
+/// Number of open slots (other than `exclude`) that reference `inode_num`.
+fn openSlotsForInode(inode_num: u32, exclude: ?u32) u32 {
+    var n: u32 = 0;
+    for (0..open_count) |i| {
+        if (exclude) |e| if (i == e) continue;
+        if (open_files[i].inode_num == inode_num) n += 1;
+    }
+    return n;
+}
+
+fn closeWouldReclaim(file_idx: u32) bool {
+    if (file_idx >= open_count) return false;
     const f = &open_files[file_idx];
-    if (f.inode_num == 0) return;
+    if (f.inode_num == 0) return false;
+    return unlink_policy.reclaimOnClose(f.unlink_pending, f.ref_count, openSlotsForInode(f.inode_num, file_idx));
+}
+
+/// Lock-free closeFile for callers that already hold fs_lock. Returns the
+/// inode number the caller must reclaim (pending unlink, last reference), or 0.
+fn closeFileUnlocked(file_idx: u32) u32 {
+    if (file_idx >= open_count) return 0;
+    const f = &open_files[file_idx];
+    if (f.inode_num == 0) return 0;
+    const reclaim = closeWouldReclaim(file_idx);
+    const inode_num = f.inode_num;
     // Shared across fork/clone: drop one reference, free only at zero.
     if (f.ref_count > 1) {
         f.ref_count -= 1;
-        return;
+        return 0;
     }
     f.ref_count = 0;
     f.inode_num = 0;
+    f.unlink_pending = false;
     // v52.3: clear full path to prevent stale data leak
     @memset(open_file_paths[file_idx][0..128], 0);
+    return if (reclaim) inode_num else 0;
+}
+
+/// Free an unlinked-while-open inode after its last open slot is gone. The
+/// on-disk inode is authoritative for the block map; a nonzero links_count
+/// means it was relinked and must not be freed.
+fn reclaimUnlinkedInode(inode_num: u32, flags: *@TypeOf(fs_lock.acquire())) void {
+    var inode: Ext2Inode = undefined;
+    if (!readInode(inode_num, &inode)) return;
+    if (inode.links_count != 0) return;
+    _ = freeInodeData(inode_num, &inode, flags);
 }
 
 /// Add a reference to an open file slot (fork/clone fd-table copy).
@@ -1002,7 +1042,7 @@ pub fn listDir(path: []const u8, callback: *const fn ([*]const u8, u32) void) vo
         const r = walkPath(2, path);
         if (r < 0) break :blk @as(u32, 0);
         const inum = open_files[@intCast(r)].inode_num;
-        closeFileUnlocked(@intCast(r)); // v52.1 fix: close fd to avoid leak
+        _ = closeFileUnlocked(@intCast(r)); // v52.1 fix: close fd to avoid leak
         break :blk inum;
     };
     if (inode_num == 0) return;
@@ -2564,14 +2604,9 @@ pub fn unlinkFile(path: []const u8) bool {
     // Directories go through rmdirFile.
     if (eu.isDirectory(file_inode.mode)) return false;
 
-    // v50.0: decrement links_count for hardlinked files
-    if (file_inode.links_count > 1) {
-        file_inode.links_count -= 1;
-        _ = writeInode(file_inode_num, &file_inode);
-    } else {
-        // Last link: free data blocks and the inode
-        _ = freeInodeData(file_inode_num, &file_inode, &flags);
-    }
+    // v50.0: decrement links_count for hardlinked files; the last link is
+    // freed now or, if still open, on the last close.
+    releaseLink(file_inode_num, &file_inode, &flags);
 
     // Remove directory entry from parent
     if (!removeDirEntry(parent_inode_num, filename)) return false;
@@ -2640,6 +2675,31 @@ fn freeInodeData(file_inode_num: u32, file_inode: *Ext2Inode, flags: *@TypeOf(fs
 
     freeInode(file_inode_num);
     return true;
+}
+
+/// Drop one link from a non-directory inode whose directory entry is being
+/// removed (unlink, rename-overwrite victim). The last link of an inode that
+/// is still open is not freed: writeback extents keyed by the inode number
+/// would otherwise be flushed into a reused inode. Instead links_count 0 is
+/// persisted (also in every open slot's cached copy, which writeFile/truncate
+/// write back) and the slots are marked pending; the last close reclaims.
+fn releaseLink(inode_num: u32, inode: *Ext2Inode, flags: *@TypeOf(fs_lock.acquire())) void {
+    switch (unlink_policy.onLinkRemoved(inode.links_count, openSlotsForInode(inode_num, null))) {
+        .decrement => {
+            inode.links_count -= 1;
+            _ = writeInode(inode_num, inode);
+        },
+        .free_now => _ = freeInodeData(inode_num, inode, flags),
+        .defer_until_close => {
+            inode.links_count = 0;
+            _ = writeInode(inode_num, inode);
+            for (0..open_count) |i| {
+                if (open_files[i].inode_num != inode_num) continue;
+                open_files[i].inode.links_count = 0;
+                open_files[i].unlink_pending = true;
+            }
+        },
+    }
 }
 
 fn eqlStr(a: []const u8, b: []const u8) bool {
@@ -2712,12 +2772,7 @@ pub fn renameFile(old_path: []const u8, new_path: []const u8) bool {
     if (replaced_inode_num) |victim_num| {
         var victim_ino: Ext2Inode = undefined;
         if (readInode(victim_num, &victim_ino) and !eu.isDirectory(victim_ino.mode)) {
-            if (victim_ino.links_count > 1) {
-                victim_ino.links_count -= 1;
-                _ = writeInode(victim_num, &victim_ino);
-            } else {
-                _ = freeInodeData(victim_num, &victim_ino, &flags);
-            }
+            releaseLink(victim_num, &victim_ino, &flags);
         }
     }
 
@@ -3616,4 +3671,30 @@ pub fn buildCombinedPath(buf: []u8, dir_path: []const u8, rel_path: []const u8) 
     @memcpy(buf[pos..total], rel_path);
     buf[total] = 0;
     return buf[0..total];
+}
+
+// ─── stat support (fstat/statx) ─────────────────────────────────────────────
+
+/// Fill `out` from the authoritative on-disk inode behind open slot
+/// `file_idx`. Returns false (leaving `out` untouched) if the slot is free
+/// or the inode cannot be read.
+pub fn statInode(file_idx: u32, out: *@import("stat_info.zig").StatInfo) bool {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active or file_idx >= open_count) return false;
+    const inode_num = open_files[file_idx].inode_num;
+    if (inode_num == 0) return false;
+    var inode: Ext2Inode = undefined;
+    if (!readInode(inode_num, &inode)) return false;
+    out.* = @import("stat_info.zig").fromExt2(inode_num, .{
+        .mode = inode.mode,
+        .uid_lo = inode.uid,
+        .uid_hi = @as(u16, inode.osd2[4]) | (@as(u16, inode.osd2[5]) << 8),
+        .gid_lo = inode.gid,
+        .gid_hi = @as(u16, inode.osd2[6]) | (@as(u16, inode.osd2[7]) << 8),
+        .links_count = inode.links_count,
+        .size_lo = inode.size,
+        .size_hi = inode.dir_acl,
+    });
+    return true;
 }
