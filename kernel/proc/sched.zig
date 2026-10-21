@@ -363,8 +363,8 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
                 const t = task.getTask(@intCast(i)) orelse continue;
                 if (t.state == .zombie) continue;
                 // Check alarm() deadline
-                if (t.alarm_deadline != 0 and now_ns >= t.alarm_deadline) {
-                    t.alarm_deadline = 0; // One-shot: clear after firing
+                if (@atomicLoad(u64, &t.alarm_deadline, .monotonic) != 0 and now_ns >= @atomicLoad(u64, &t.alarm_deadline, .monotonic)) {
+                    @atomicStore(u64, &t.alarm_deadline, 0, .monotonic); // One-shot: clear after firing
                     _ = @atomicRmw(u64, &alarm_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
                     _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
                     // A sleeper must observe SIGALRM now, not when its own
@@ -372,14 +372,14 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
                     @import("signal.zig").kickIfBlocked(i);
                 }
                 // Check ITIMER_REAL deadline
-                if (t.itimer_real_value != 0 and now_ns >= t.itimer_real_value) {
+                if (@atomicLoad(u64, &t.itimer_real_value, .monotonic) != 0 and now_ns >= @atomicLoad(u64, &t.itimer_real_value, .monotonic)) {
                     _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
                     if (t.itimer_real_interval != 0) {
                         // Recurring: reschedule next expiration
-                        t.itimer_real_value = now_ns + t.itimer_real_interval;
+                        @atomicStore(u64, &t.itimer_real_value, now_ns + t.itimer_real_interval, .monotonic);
                     } else {
                         // One-shot: clear after firing
-                        t.itimer_real_value = 0;
+                        @atomicStore(u64, &t.itimer_real_value, 0, .monotonic);
                         _ = @atomicRmw(u64, &itimer_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
                     }
                     @import("signal.zig").kickIfBlocked(i);
@@ -639,20 +639,20 @@ fn alarmTimerTick(now_ns: u64) void {
         bm &= bm - 1;
         const t = task.getTask(@intCast(i)) orelse continue;
         if (sched_claim.load(&t.state) == .zombie) continue;
-        if (t.alarm_deadline != 0 and now_ns >= t.alarm_deadline) {
-            t.alarm_deadline = 0; // One-shot: clear after firing
+        if (@atomicLoad(u64, &t.alarm_deadline, .monotonic) != 0 and now_ns >= @atomicLoad(u64, &t.alarm_deadline, .monotonic)) {
+            @atomicStore(u64, &t.alarm_deadline, 0, .monotonic); // One-shot: clear after firing
             _ = @atomicRmw(u64, &alarm_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
             _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
             // A sleeper must observe SIGALRM now, not when its own
             // deadline passes.
             @import("signal.zig").kickIfBlocked(i);
         }
-        if (t.itimer_real_value != 0 and now_ns >= t.itimer_real_value) {
+        if (@atomicLoad(u64, &t.itimer_real_value, .monotonic) != 0 and now_ns >= @atomicLoad(u64, &t.itimer_real_value, .monotonic)) {
             _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
             if (t.itimer_real_interval != 0) {
-                t.itimer_real_value = now_ns + t.itimer_real_interval;
+                @atomicStore(u64, &t.itimer_real_value, now_ns + t.itimer_real_interval, .monotonic);
             } else {
-                t.itimer_real_value = 0;
+                @atomicStore(u64, &t.itimer_real_value, 0, .monotonic);
                 _ = @atomicRmw(u64, &itimer_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
             }
             @import("signal.zig").kickIfBlocked(i);
@@ -668,9 +668,8 @@ fn bspSlowMaintenance() void {
     // Only the cheap writeback expiry scan runs here (IRQ-off); the flush
     // itself is deferred to the writeback kernel thread.
     _ = @import("../fs/vfs.zig").writebackTimerTick();
-    // Legacy scheduler builds do not run bspTimedWaitTick; keep IPC wait
-    // expiry alive on their slow BSP cadence as well.
-    @import("../ipc/ipc.zig").timeoutTick(idt.getTickCount());
+    // IPC wait expiry is owned by bspTimedWaitTick above; slow maintenance
+    // must not duplicate the scan (pinned by the host test contract).
     // TCP retransmission / TIME_WAIT / FIN_WAIT_2 / delayed ACK.
     @import("../net/tcp.zig").timerTick(100);
     // SK-79: NDP incomplete Neighbor Solicitation retransmit (RetransTimer).

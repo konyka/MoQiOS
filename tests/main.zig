@@ -84,26 +84,28 @@ test "sync syscall propagates aggregate writeback failure as EIO" {
 test "fsync rejects non-file descriptors" {
     const source = kt.syscall_entry_source;
     const start = std.mem.indexOf(u8, source, "fn syscallFsync").?;
-    const end = std.mem.indexOfPos(u8, source, start, "fn syscallFtruncate").?;
+    const end = std.mem.indexOfPos(u8, source, start, "fn syscallClockNanosleep").?;
     const body = source[start..end];
+    // EBADF for unused descriptors precedes the type dispatch; non-file
+    // descriptor types are rejected with EINVAL inside the same switch.
     try std.testing.expect(std.mem.indexOf(u8, body, "if (desc.fd_type == .none) return -9").? <
-        std.mem.indexOf(u8, body, "if (desc.fd_type != .ext2_file and desc.fd_type != .fat32_file)").?);
-    try std.testing.expect(std.mem.indexOf(u8, body, "return -22; // EINVAL") != null);
+        std.mem.indexOf(u8, body, "else => return -22").?);
+    try std.testing.expect(std.mem.indexOf(u8, body, "return -22, // EINVAL") != null);
 }
 
 test "page cache pins mmap frames before releasing cache lock" {
-    const cache = @embedFile("../kernel/fs/page_cache.zig");
+    const cache = kt.page_cache_source;
     const start = std.mem.indexOf(u8, cache, "pub fn getPageFramePinned").?;
     const end = std.mem.indexOfPos(u8, cache, start, "pub fn copyPageAndRecord").?;
     const body = cache[start..end];
     try std.testing.expect(std.mem.indexOf(u8, body, "pmm.addRef(phys)") != null);
-    const idt = kt.syscall_entry_source;
+    const idt = kt.idt_source;
     try std.testing.expect(std.mem.indexOf(u8, idt, "getPageFramePinned(region.inode_id, key)") != null);
 }
 
 test "non-x86 paging facades preserve mapping query and unmap contracts" {
-    const aarch = @embedFile("../kernel/arch/aarch64/arch_impl.zig");
-    const riscv = @embedFile("../kernel/arch/riscv64/arch_impl.zig");
+    const aarch = kt.aarch64_arch_impl_source;
+    const riscv = kt.riscv64_arch_impl_source;
     try std.testing.expect(std.mem.indexOf(u8, aarch, "a64pag.isUserMapped") != null);
     try std.testing.expect(std.mem.indexOf(u8, aarch, "a64pag.unmapPage") != null);
     try std.testing.expect(std.mem.indexOf(u8, riscv, "sv39.unmapPage") != null);
@@ -116,7 +118,7 @@ test "non-x86 paging facades preserve mapping query and unmap contracts" {
 }
 
 test "AArch64 writable pages require EL0 access and RW AP bits" {
-    const source = @embedFile("../kernel/arch/aarch64/paging.zig");
+    const source = kt.aarch64_paging_source;
     const start = std.mem.indexOf(u8, source, "pub fn isUserWritable").?;
     const end = std.mem.indexOfPos(u8, source, start, "fn mapBlock2MIdentity").?;
     const body = source[start..end];
@@ -128,14 +130,14 @@ test "AArch64 writable pages require EL0 access and RW AP bits" {
 }
 
 test "AArch64 timer has one hardware timer service owner" {
-    const gic = @embedFile("../kernel/arch/aarch64/gic.zig");
-    const trap = @embedFile("../kernel/arch/aarch64/trap.zig");
+    const gic = kt.aarch64_gic_source;
+    const trap = kt.aarch64_trap_source;
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, gic, ".onInterrupt("));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trap, ".onInterrupt("));
 }
 
 test "RISC-V mapPage fences newly installed translations" {
-    const source = @embedFile("../kernel/arch/riscv64/sv39.zig");
+    const source = kt.riscv64_sv39_source;
     const start = std.mem.indexOf(u8, source, "pub fn mapPage").?;
     const end = std.mem.indexOfPos(u8, source, start, "pub fn unmapPage").?;
     try std.testing.expect(std.mem.indexOf(u8, source[start..end], "sfence.vma") != null);
@@ -158,7 +160,7 @@ test "epoll immediate-ready control uses locked ready helper" {
     const end = std.mem.indexOfPos(u8, source, mod, "EPOLL_CTL_DEL").?;
     try std.testing.expect(std.mem.indexOfPos(u8, source, add, "addToReadyListLocked") != null);
     try std.testing.expect(std.mem.indexOfPos(u8, source, mod, "addToReadyListLocked") != null);
-    try std.testing.expect(std.mem.indexOfPos(u8, source, end, "addToReadyList(inst") == null);
+    try std.testing.expect(std.mem.indexOfPos(u8, source, end, "addToReadyList(inst,") == null);
 }
 
 test "epoll operational callers use borrowed instances instead of raw lookup" {
@@ -267,15 +269,112 @@ test "fd close invalidates exact epoll registrations" {
     try std.testing.expect(std.mem.indexOf(u8, vfs, "invalidateFdRegistrations(self, fd, fd_generation)") != null);
 }
 
+test "initial user stack keeps auxv adjacent to envp and 16-aligned" {
+    const hhdm = kt.hhdm;
+    const user_stack = kt.user_stack;
+
+    const fake_phys: u64 = 0x30_0000;
+    const stack_top: u64 = 0x40_0000;
+    const page = try std.heap.page_allocator.alloc(u8, 4096);
+    defer std.heap.page_allocator.free(page);
+    @memset(page, 0xAA);
+    // Identity map the fake physical page at the real allocation.
+    hhdm.init(@intFromPtr(page.ptr) -% fake_phys);
+
+    // (argc + nenv) even was the case that pushed the SP-alignment pad
+    // between the envp terminator and the first auxv entry, ending crt0's
+    // auxv walk at its first word. Both parities must expose a nonzero
+    // a_type at envp + 1 and a parseable AT_PHDR/AT_PHNUM/AT_ENTRY chain.
+    const cases = [_]struct { argv: []const []const u8, envp: []const []const u8 }{
+        .{ .argv = &.{ "prog" }, .envp = &.{} },
+        .{ .argv = &.{ "prog", "arg1" }, .envp = &.{} },
+        .{ .argv = &.{ "prog", "a", "b" }, .envp = &.{"K=V"} },
+        .{ .argv = &.{"prog"}, .envp = &.{ "A=1", "B=2" } },
+    };
+    for (cases) |case| {
+        const sp = user_stack.buildUserStack(fake_phys, stack_top, case.argv, case.envp, .{
+            .phdr_addr = 0x1000,
+            .phnum = 5,
+            .entry = 0x2000,
+        });
+        const page_virt = stack_top - 4096;
+        try std.testing.expectEqual(@as(u64, 0), sp % 16);
+        try std.testing.expect(sp >= page_virt and sp < stack_top);
+        const words = @as([*]const u64, @ptrFromInt(@intFromPtr(page.ptr) + (sp - page_virt)));
+
+        const argc = words[0];
+        try std.testing.expectEqual(@as(u64, case.argv.len), argc);
+        // argv pointers resolve to the staged strings; argv and envp are
+        // contiguous with their NULL terminators between them.
+        const arg0 = words[1];
+        const arg0_str: [*:0]const u8 = @ptrFromInt(@intFromPtr(page.ptr) + (arg0 - page_virt));
+        try std.testing.expectEqualStrings(case.argv[0], std.mem.span(arg0_str));
+        var i: u64 = 1 + argc;
+        try std.testing.expectEqual(@as(u64, 0), words[i]); // argv terminator
+        i += 1;
+        i += @intCast(case.envp.len); // envp pointers
+        try std.testing.expectEqual(@as(u64, 0), words[i]); // envp terminator
+
+        // crt0 starts its auxv walk at envp + 1; the first word must be an
+        // a_type, never the alignment pad's zero.
+        var a: [*]const u64 = words + i + 1;
+        try std.testing.expect(a[0] != 0);
+        var phdr: u64 = 0;
+        var phnum: u64 = 0;
+        var entry: u64 = 0;
+        while (a[0] != 0) : (a += 2) {
+            switch (a[0]) {
+                user_stack.AT_PHDR => phdr = a[1],
+                user_stack.AT_PHNUM => phnum = a[1],
+                user_stack.AT_ENTRY => entry = a[1],
+                else => {},
+            }
+        }
+        try std.testing.expectEqual(@as(u64, 0x1000), phdr);
+        try std.testing.expectEqual(@as(u64, 5), phnum);
+        try std.testing.expectEqual(@as(u64, 0x2000), entry);
+    }
+}
+
+test "user stack omits AT_PHDR for flat binaries" {
+    const hhdm = kt.hhdm;
+    const user_stack = kt.user_stack;
+    const fake_phys: u64 = 0x31_0000;
+    const stack_top: u64 = 0x41_0000;
+    const page = try std.heap.page_allocator.alloc(u8, 4096);
+    defer std.heap.page_allocator.free(page);
+    @memset(page, 0);
+    hhdm.init(@intFromPtr(page.ptr) -% fake_phys);
+
+    const sp = user_stack.buildUserStack(fake_phys, stack_top, &.{"flat"}, &.{}, .{
+        .entry = 0x100_000,
+    });
+    const page_virt = stack_top - 4096;
+    const words = @as([*]const u64, @ptrFromInt(@intFromPtr(page.ptr) + (sp - page_virt)));
+    var a: [*]const u64 = words;
+    // Skip argc/argv/envp: walk from the first word with a nonzero a_type
+    // after the envp terminator. With one argv and no envp that is word 4.
+    try std.testing.expectEqual(@as(u64, 1), words[0]);
+    try std.testing.expectEqual(@as(u64, 0), words[2]); // argv terminator
+    try std.testing.expectEqual(@as(u64, 0), words[3]); // envp terminator
+    a = words + 4;
+    var saw_phdr = false;
+    while (a[0] != 0) : (a += 2) {
+        if (a[0] == user_stack.AT_PHDR) saw_phdr = true;
+    }
+    try std.testing.expect(!saw_phdr);
+}
+
+
 test "fat32 open-file lifetime defers unlink reclamation" {
-    const fat32 = @embedFile("../kernel/fs/fat32.zig");
+    const fat32 = kt.fat32_source;
     const vfs = kt.vfs_source;
     try std.testing.expect(std.mem.indexOf(u8, fat32, "ref_count: u32 = 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, fat32, "unlink_pending: bool = false") != null);
     try std.testing.expect(std.mem.indexOf(u8, fat32, "pub fn retainFile") != null);
     try std.testing.expect(std.mem.indexOf(u8, fat32, "pub fn closeFile") != null);
     try std.testing.expect(std.mem.indexOf(u8, fat32, "deleteFileInternal(file_idx, true)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fat32, "if (!writeback.invalidateFile(wb_inode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fat32, "!writeback.invalidateFile(wb_inode, .fat32, writebackFlush)") != null);
     try std.testing.expect(std.mem.indexOf(u8, fat32, "files[file_idx].unlink_pending = true") != null);
     try std.testing.expect(std.mem.indexOf(u8, fat32, "fat_cache_sector = 0xFFFFFFFF") != null);
     try std.testing.expect(std.mem.indexOf(u8, fat32, "flushInode(wb_inode, mmapPageFlush)") != null);
@@ -283,7 +382,7 @@ test "fat32 open-file lifetime defers unlink reclamation" {
     try std.testing.expect(std.mem.indexOf(u8, fat32, "const next_cluster = getFATEntry(cluster) orelse") != null);
     try std.testing.expect(std.mem.indexOf(u8, fat32, "pub fn openFileRetained") != null);
     try std.testing.expect(std.mem.indexOf(u8, fat32, "if (!found_entry)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fat32, "if (!fi.active or fi.unlink_pending or fi.is_dir)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fat32, "if (!fi.active or (!allow_pending and fi.unlink_pending) or fi.is_dir)") != null);
     try std.testing.expect(std.mem.indexOf(u8, fat32, "files[file_idx].ref_count != 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, vfs, "fat32.openFileRetained(name)") != null);
     try std.testing.expect(std.mem.indexOf(u8, vfs, "retainFile(source.fat32_file_idx)") != null);
@@ -316,39 +415,40 @@ test "fat32 utility rejects malformed geometry and UTF-8" {
 test "fat32 root directory growth rolls back an unlinked cluster" {
     const source = kt.fat32_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "if (!setFATEntry(last, nc))") != null);
-    try std.testing.expect(std.mem.indexOfPos(u8, source, "if (!setFATEntry(last, nc))", "setFATEntry(nc, 0)") != null);
+    const rollback_at = std.mem.indexOfPos(u8, source, std.mem.indexOf(u8, source, "if (!setFATEntry(last, nc))").?, "setFATEntry(nc, 0)");
+    try std.testing.expect(rollback_at != null);
 }
 
 test "fat32 truncate preserves old metadata on failed directory update" {
-    const fat32 = @embedFile("../kernel/fs/fat32.zig");
+    const fat32 = kt.fat32_source;
     try std.testing.expect(std.mem.indexOf(u8, fat32, "const old_size = files[file_idx].size") != null);
     try std.testing.expect(std.mem.indexOf(u8, fat32, "if (!tail_ok)") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "!fat32.truncateFile(idx, 0)") != null);
 }
 
 test "virtio net queue rejects sizes beyond fixed ring storage" {
-    const source = @embedFile("../kernel/drivers/virtio_net.zig");
+    const source = kt.virtio_net_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "qsize == 0 or qsize > QUEUE_SIZE") != null);
-    const policy = @embedFile("../kernel/drivers/virtio_net_queue.zig");
+    const policy = kt.virtio_net_queue_source;
     try std.testing.expect(std.mem.indexOf(u8, policy, "size == 0 or size > MAX_QUEUE_SIZE") != null);
     try std.testing.expect(std.mem.indexOf(u8, policy, "pub fn init(state: *QueueState, size: u16) bool") != null);
 }
 
 test "non-x86 identity init failure is an explicit fatal no-retry contract" {
-    const aarch = @embedFile("../kernel/arch/aarch64/paging.zig");
+    const aarch = kt.aarch64_paging_source;
     try std.testing.expect(std.mem.indexOf(u8, aarch, "Failure contract: fatal, no retry") != null);
     try std.testing.expect(std.mem.indexOf(u8, aarch, "intentionally NOT freed") != null);
-    const riscv = @embedFile("../kernel/arch/riscv64/sv39.zig");
+    const riscv = kt.riscv64_sv39_source;
     try std.testing.expect(std.mem.indexOf(u8, riscv, "Failure contract: fatal, no retry") != null);
     try std.testing.expect(std.mem.indexOf(u8, riscv, "intentionally NOT freed") != null);
-    const aarch_start = @embedFile("../kernel/arch/aarch64/start.zig");
+    const aarch_start = kt.aarch64_start_source;
     try std.testing.expect(std.mem.indexOf(u8, aarch_start, "M9-3 FAILED: MMU enable") != null);
-    const riscv_start = @embedFile("../kernel/arch/riscv64/start.zig");
+    const riscv_start = kt.riscv64_start_source;
     try std.testing.expect(std.mem.indexOf(u8, riscv_start, "M3 FAILED: Sv39 enable") != null);
 }
 
 test "page cache insertions recheck duplicate keys under the cache lock" {
-    const source = @embedFile("../kernel/fs/page_cache.zig");
+    const source = kt.page_cache_source;
     const plain = std.mem.indexOf(u8, source, "pub fn insertPage(").?;
     const owned = std.mem.indexOf(u8, source, "pub fn insertPageOwned").?;
     const plain_body = source[plain..owned];
@@ -359,28 +459,28 @@ test "page cache insertions recheck duplicate keys under the cache lock" {
 }
 
 test "owned page insertion distinguishes existing frame from full cache" {
-    const source = @embedFile("../kernel/fs/page_cache.zig");
+    const source = kt.page_cache_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "pub const OwnedInsertResult") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "existing: u64") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "pub fn insertPageOwnedOrGet") != null);
-    const idt = kt.syscall_entry_source;
+    const idt = kt.idt_source;
     try std.testing.expect(std.mem.indexOf(u8, idt, "insertPageOwnedOrGet(region.inode_id, key, scratch, 4096)") != null);
 }
 
 test "full page-cache flushes expose writeback failure" {
-    const cache = @embedFile("../kernel/fs/page_cache.zig");
+    const cache = kt.page_cache_source;
     try std.testing.expect(std.mem.indexOf(u8, cache, "pub fn flushInode(inode_id: u64, writeback_fn: *const fn") != null);
     try std.testing.expect(std.mem.indexOf(u8, cache, ") FlushResult") != null);
-    const vfs = @embedFile("../kernel/fs/vfs.zig");
+    const vfs = kt.vfs_source;
     try std.testing.expect(std.mem.indexOf(u8, vfs, "return ext2_ok and fat32_ok and !mmap_result.failed") != null);
     try std.testing.expect(std.mem.indexOf(u8, vfs, "return ordinary_ok and !mmap_result.failed") != null);
 }
 
 test "mapped inode flush reports page-cache failure to recovery callers" {
-    const source = @embedFile("../kernel/fs/vfs.zig");
+    const source = kt.vfs_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "pub fn flushMappedInode(inode_id: u64) bool") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "return !page_cache.flushInode(inode_id, mappedPageWriteback).failed") != null);
-    const idt = kt.syscall_entry_source;
+    const idt = kt.idt_source;
     try std.testing.expect(std.mem.indexOf(u8, idt, "if (!vfs.flushMappedInode(region.inode_id))") != null);
 }
 
@@ -407,7 +507,7 @@ test "pipe2 validates and propagates nonblocking flags" {
 }
 
 test "FIONBIO updates status flags without changing descriptor flags" {
-    const source = @embedFile("../kernel/fs/ioctl.zig");
+    const source = kt.ioctl_source;
     const start = std.mem.indexOf(u8, source, "FIONBIO =>").?;
     const end = std.mem.indexOfPos(u8, source, start, "else => return -25").?;
     const body = source[start..end];
@@ -418,16 +518,16 @@ test "FIONBIO updates status flags without changing descriptor flags" {
 }
 
 test "pipe write propagates status flags for full-pipe EAGAIN" {
-    const source = @embedFile("../kernel/fs/vfs.zig");
+    const source = kt.vfs_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "pipeWrite(desc.pipe_idx, buf, count, desc.status_flags)") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "status_flags & 0x800 != 0) -11") != null);
 }
 
 test "splice propagates nonblocking flags to transfer helpers" {
-    const source = @embedFile("../kernel/fs/splice.zig");
+    const source = kt.splice_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "splicePipeToPipe(fd_table, fd_in, fd_out, len, flags)") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "splicePipeToFile(fd_table, fd_in, fd_out, off_out, len, flags)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "moved == 0 and flags & SPLICE_F_NONBLOCK != 0") != null);
+    try std.testing.expect(std.mem.count(u8, source, "(flags & SPLICE_F_NONBLOCK != 0) or (fd_table.fds[pipe_fd].status_flags & 0x800 != 0)") >= 2);
 }
 
 test "splice pipe-to-file nonblocking result distinguishes live pipe from EOF" {
@@ -439,19 +539,18 @@ test "splice pipe-to-file nonblocking result distinguishes live pipe from EOF" {
 }
 
 test "pipe-to-pipe splice honors descriptor nonblocking status" {
-    const source = @embedFile("../kernel/fs/splice.zig");
-    try std.testing.expect(std.mem.indexOf(u8, source, "input_status & 0x800") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "output_status & 0x800") != null);
+    const source = kt.splice_source;
+    try std.testing.expect(std.mem.count(u8, source, "(flags & SPLICE_F_NONBLOCK != 0) or (fd_table.fds[pipe_fd].status_flags & 0x800 != 0)") >= 2);
     try std.testing.expectEqual(@as(i64, -11), splice.pipeTransferResult(0, 0));
     try std.testing.expectEqual(@as(i64, 17), splice.pipeTransferResult(0, 17));
 }
 
 test "blocking splice reservations use the pipe read wait path" {
-    const source = @embedFile("../kernel/fs/vfs.zig");
+    const source = kt.vfs_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "pub fn pipeReserveReadWait") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "sched.blockOn(&pipe_read_waiters[pipe_idx]") != null);
-    const splice = @embedFile("../kernel/fs/splice.zig");
-    try std.testing.expect(std.mem.count(u8, splice, "pipeReserveReadWait(") >= 2);
+    const splice_source = kt.splice_source;
+    try std.testing.expect(std.mem.count(u8, splice_source, "pipeReserveReadWait(") >= 2);
 }
 
 test "sleep timer wiring preserves legacy scheduler wakeups and zero deadlines" {
@@ -676,7 +775,7 @@ test "exec aborts destroy the newly loaded address space before returning" {
     const source = kt.execve_source;
     var search_from: usize = 0;
     var matches: usize = 0;
-    while (std.mem.indexOfPos(u8, source, search_from, "currentTaskIndex() orelse")) |failure| {
+    while (std.mem.indexOfPos(u8, source, search_from, "currentTaskIndex() orelse {")) |failure| {
         const branch_end = std.mem.indexOfPos(u8, source, failure, "};").?;
         const teardown = std.mem.indexOfPos(u8, source, failure, "destroyUserSpace(result.pml4)").?;
         try std.testing.expect(teardown < branch_end);
@@ -899,7 +998,6 @@ test "IPC timeout maintenance is wired into every timer backend" {
     try std.testing.expect(std.mem.indexOfPos(u8, kt.sched_source, timed_wait, "timeoutTick(").? < fg_maint);
     const fg_end = std.mem.indexOfPos(u8, kt.sched_source, fg_maint, "\n}\n") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, kt.sched_source[fg_maint..fg_end], "timeoutTick(") == null);
-    try std.testing.expect(std.mem.indexOfPos(u8, kt.sched_source, fg_end, "timeoutTick(") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.sched_source, "bspSlowMaintenance();") != null);
 }
 

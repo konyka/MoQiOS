@@ -3513,7 +3513,11 @@ fn syscallFtruncate(fd: u32, length: u64) i64 {
     if (fd >= vfs_mod.MAX_FDS) return -9;
     const desc = &cur.fd_table.fds[fd];
     if (desc.fd_type == .none) return -9;
-    if (desc.fd_type != .ext2_file and desc.fd_type != .fat32_file) return -22; // EINVAL
+    // Truncation is a regular-file operation on every real backend (ext2,
+    // FAT32 and tmpfs alike); ramdisk/proc and special fds are rejected by
+    // truncateDesc's dispatch. The RLIMIT_FSIZE gate inside truncateDesc
+    // deliberately runs before that dispatch — hello66 pins EFBIG/SIGXFSZ
+    // for a tmpfs fd.
     if (!desc.writable) return -22; // EINVAL — fd not open for writing
     return truncateDesc(desc, length);
 }
@@ -3950,11 +3954,13 @@ fn syscallFsync(fd: u32) i64 {
     if (fd >= vfs_mod.MAX_FDS) return -9; // EBADF
     const desc = &cur.fd_table.fds[fd];
     if (desc.fd_type == .none) return -9;
-    // Sync file's dirty buffers via VFS
+    // Sync file's dirty buffers via VFS. Pipes, sockets, eventfd and other
+    // non-file descriptors cannot be synced (POSIX EINVAL) — the .none case
+    // above already reported EBADF.
     const wb_type: @import("../../fs/writeback.zig").FsType = switch (desc.fd_type) {
         .ext2_file => .ext2,
         .fat32_file => .fat32,
-        else => .none,
+        else => return -22, // EINVAL
     };
     if (wb_type != .none) {
         // v53.51: writeback buffers are keyed by inode_id, not by per-FS slot
@@ -5750,7 +5756,7 @@ fn syscallAlarm(seconds: u32) i64 {
     const cur_idx = sched.currentTaskIndex() orelse return 0;
     const cur = tm.getTask(cur_idx) orelse return 0;
 
-    const prev_deadline: u64 = cur.alarm_deadline;
+    const prev_deadline: u64 = @atomicLoad(u64, &cur.alarm_deadline, .monotonic);
     const now_ns: u64 = tsc.nanos();
     var prev_remaining: u64 = 0;
     if (prev_deadline > now_ns) {
@@ -5758,11 +5764,11 @@ fn syscallAlarm(seconds: u32) i64 {
     }
 
     if (seconds == 0) {
-        cur.alarm_deadline = 0; // Cancel alarm
+        @atomicStore(u64, &cur.alarm_deadline, 0, .monotonic); // Cancel alarm
         // v53.47: Atomic RMW — alarm_bm is read by BSP timerTick on another CPU
         _ = @atomicRmw(u64, &sched.alarm_bm, .And, ~(@as(u64, 1) << @intCast(cur_idx)), .seq_cst);
     } else {
-        cur.alarm_deadline = now_ns + @as(u64, seconds) * 1_000_000_000;
+        @atomicStore(u64, &cur.alarm_deadline, now_ns + @as(u64, seconds) * 1_000_000_000, .monotonic);
         _ = @atomicRmw(u64, &sched.alarm_bm, .Or, @as(u64, 1) << @intCast(cur_idx), .seq_cst);
         // SIGALRM will be delivered by BSP timer tick when deadline expires
     }
@@ -5792,8 +5798,9 @@ fn syscallGetitimer(which: u32, curr_value_ptr: u64) i64 {
         // ITIMER_REAL
         const now_ns: u64 = tsc.nanos();
         var remaining_ns: u64 = 0;
-        if (cur.itimer_real_value > now_ns) {
-            remaining_ns = cur.itimer_real_value - now_ns;
+        const itimer_deadline = @atomicLoad(u64, &cur.itimer_real_value, .monotonic);
+        if (itimer_deadline > now_ns) {
+            remaining_ns = itimer_deadline - now_ns;
         }
         const val_sec: u64 = remaining_ns / 1_000_000_000;
         const val_usec: u64 = (remaining_ns % 1_000_000_000) / 1000;
@@ -5843,11 +5850,11 @@ fn syscallSetitimer(which: u32, new_value_ptr: u64, old_value_ptr: u64) i64 {
         const val_ns = val_sec * 1_000_000_000 + val_usec * 1000;
 
         if (val_ns == 0) {
-            cur.itimer_real_value = 0; // Disarm
+            @atomicStore(u64, &cur.itimer_real_value, 0, .monotonic); // Disarm
             // v53.47: Atomic RMW — itimer_bm is read by BSP timerTick on another CPU
             _ = @atomicRmw(u64, &sched.itimer_bm, .And, ~(@as(u64, 1) << @intCast(cur_idx)), .seq_cst);
         } else {
-            cur.itimer_real_value = tsc.nanos() + val_ns;
+            @atomicStore(u64, &cur.itimer_real_value, tsc.nanos() + val_ns, .monotonic);
             _ = @atomicRmw(u64, &sched.itimer_bm, .Or, @as(u64, 1) << @intCast(cur_idx), .seq_cst);
         }
     }

@@ -191,10 +191,10 @@ test "reap set hands each detached slot to the reaper exactly once" {
     try std.testing.expectEqual(@as(?u32, null), s.takeUnstarted());
     try std.testing.expect(!s.hasUnstarted());
 
-    try std.testing.expectEqual(.{}, s.complete(0));
+    try std.testing.expectEqual(reap_policy.WaiterToken{}, s.complete(0));
     try std.testing.expect(!s.isPending(0));
-    try std.testing.expectEqual(@as(u32, 7), s.complete(63));
-    try std.testing.expectEqual(.{}, s.complete(5));
+    try std.testing.expectEqual(@as(u32, 7), s.complete(63).slot);
+    try std.testing.expectEqual(reap_policy.WaiterToken{}, s.complete(5));
     try std.testing.expect(!s.isPending(5) and !s.isPending(63));
 }
 
@@ -203,13 +203,13 @@ test "reap set records the waiter that arrives after detach" {
     s.add(9, .{});
     try std.testing.expect(s.setWaiter(9, .{ .slot = 3, .tid = 30, .incarnation = 1 }));
     try std.testing.expectEqual(@as(?u32, 9), s.takeUnstarted());
-    try std.testing.expectEqual(@as(u32, 3), s.complete(9));
+    try std.testing.expectEqual(@as(u32, 3), s.complete(9).slot);
     // Completed: a late waiter must not block (nothing left to wait for).
-    try std.testing.expect(!s.setWaiter(9, 4));
+    try std.testing.expect(!s.setWaiter(9, .{ .slot = 4 }));
     // A re-detached slot starts clean.
     s.add(9, .{});
     try std.testing.expect(s.hasUnstarted());
-    try std.testing.expectEqual(.{}, s.complete(9));
+    try std.testing.expectEqual(reap_policy.WaiterToken{}, s.complete(9));
 }
 
 test "autoreap takes orphans and dead threads but leaves children for waitpid" {
