@@ -10,6 +10,8 @@
 ///      EACCES (the mapping can never write the file).
 ///   F. a page past EOF at mmap time becomes readable once the file grows;
 ///      a page still past EOF raises SIGBUS.
+///   G. mincore reports real residency; msync rejects bad flags.
+///   H. brk does not grow across a not-yet-faulted file mapping.
 
 #include <stdint.h>
 
@@ -53,6 +55,8 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_UNLINK      111
 #define SYS_MPROTECT    164
 #define SYS_MUNMAP      12
+#define SYS_MINCORE     27
+#define SYS_MSYNC       26
 #define EACCES 13
 
 #define SIGUSR1 10
@@ -213,6 +217,38 @@ void _start(void) {
     }
     syscall1(SYS_CLOSE, (uint64_t)gfd);
     syscall1(SYS_UNLINK, (uint64_t)gpath);
+
+    /* G. mincore / msync */
+    int64_t am = syscall6(SYS_MMAP, 0, 2 * 4096, 3, 0x22, (uint64_t)-1, 0);
+    check(am > 0, "G: map 2 anonymous pages");
+    if (am > 0) {
+        unsigned char vec[2] = { 0xff, 0xff };
+        ((volatile char *)am)[0] = 1;
+        syscall6(28, (uint64_t)am + 4096, 4096, 4 /* MADV_DONTNEED */, 0, 0, 0);
+        check(syscall3(SYS_MINCORE, (uint64_t)am, 2 * 4096, (uint64_t)vec) == 0, "G: mincore succeeds");
+        check((vec[0] & 1) == 1, "G: touched page is resident");
+        check(syscall3(SYS_MSYNC, (uint64_t)am, 4096, 4 | 1) == -22, "G: msync MS_SYNC|MS_ASYNC is EINVAL");
+        check(syscall3(SYS_MSYNC, (uint64_t)am, 4096, 0x40) == -22, "G: msync unknown flag is EINVAL");
+        check(syscall3(SYS_MSYNC, (uint64_t)am, 4096, 4) == 0, "G: msync MS_SYNC succeeds");
+        syscall2(SYS_MUNMAP, (uint64_t)am, 2 * 4096);
+    }
+
+    /* H. brk vs un-faulted file mapping */
+    uint64_t brk0 = (uint64_t)syscall1(7, 0);
+    uint64_t above = (brk0 + 0x10000 + 4095) & ~4095ULL;
+    static const char hpath[] = "hello112-brk";
+    int64_t hfd = syscall3(SYS_OPEN, (uint64_t)hpath, 2 | 64 | 512, 0666);
+    syscall3(SYS_WRITE, (uint64_t)hfd, (uint64_t)block, 4096);
+    int64_t hm = syscall6(SYS_MMAP, above, 4096, 1, 0x02 | 0x10 /* PRIVATE|FIXED */, (uint64_t)hfd, 0);
+    check(hm == (int64_t)above, "H: file mapped just above the break");
+    if (hm == (int64_t)above) {
+        uint64_t got = (uint64_t)syscall1(7, above + 2 * 4096);
+        check(got == brk0, "H: brk refuses to grow across the mapping");
+        check(((volatile char *)hm)[0] == 'b', "H: mapping still serves the file");
+        syscall2(SYS_MUNMAP, (uint64_t)hm, 4096);
+    }
+    syscall1(SYS_CLOSE, (uint64_t)hfd);
+    syscall1(SYS_UNLINK, (uint64_t)hpath);
 
     print(failures == 0 ? "hello112: PASS\n" : "hello112: FAIL\n");
     print("hello112 done\n");

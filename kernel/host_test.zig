@@ -55,6 +55,7 @@ test "splice pipe-to-file nonblocking result distinguishes live pipe from EOF" {
 pub const futex_key = @import("sync/futex_key.zig");
 pub const mlock_policy = @import("mm/mlock_policy.zig");
 pub const mprotect_policy = @import("mm/mprotect_policy.zig");
+pub const msync_policy = @import("mm/msync_policy.zig");
 pub const mmap_policy = @import("mm/mmap_policy.zig");
 pub const shared_mapping_policy = @import("mm/shared_mapping_policy.zig");
 pub const pte_kind = @import("mm/pte_kind.zig");

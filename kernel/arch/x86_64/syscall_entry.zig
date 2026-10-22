@@ -4093,10 +4093,16 @@ fn syscallMincore(addr: u64, length: u64, vec_ptr: u64) i64 {
     const num_pages = (length + 4095) / 4096;
     if (!copy.validateUserBufferWritable(vec_ptr, @intCast(num_pages))) return -14;
 
-    // Write all-ones (all pages resident)
+    // Bit 0 = resident: a present 4K PTE or a present huge PDE. Swapped-out,
+    // never-faulted and PROT_NONE-reserved pages report 0.
+    const paging_mod = @import("paging.zig");
+    const root = @import("../../proc/sched.zig").currentTask().?.page_table_phys;
     var i: u64 = 0;
     while (i < num_pages) : (i += 1) {
-        const byte: u8 = 1; // page resident
+        const va = addr + i * 4096;
+        const resident = paging_mod.getPageEntry(root, va) != null or
+            (if (paging_mod.getPdEntry(root, va)) |pde| pde.present and pde.huge_page else false);
+        const byte: u8 = @intFromBool(resident);
         if (copy.copyToUser(@ptrFromInt(vec_ptr + i), @as([*]const u8, @ptrCast(&byte))[0..1], 1) != 1) return -14;
     }
     return 0;
@@ -4881,8 +4887,9 @@ fn strLen(buf: []const u8) usize {
 /// MS_INVALIDATE=2: invalidate cached data.
 /// Uses page_cache.flushAll for file-backed pages via global writeback.
 fn syscallMsync(addr: u64, length: u64, flags: u32) i64 {
-    _ = flags;
-    if (addr & 0xFFF != 0) return -22; // EINVAL: addr not page-aligned
+    const msync_policy = @import("../../mm/msync_policy.zig");
+    if (msync_policy.validate(addr, flags)) |err| return err;
+    if (msync_policy.pageSpan(addr, length) == null) return -12; // ENOMEM
     if (length == 0) return 0;
 
     // Flush all dirty buffers to disk (writeback + page_cache).

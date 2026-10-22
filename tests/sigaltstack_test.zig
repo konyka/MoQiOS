@@ -99,3 +99,21 @@ test "mprotect PROT_WRITE on a shared mapping of a read-only fd is refused" {
     try std.testing.expect(mp.writeGrantAllowed(3, false, false));
     try std.testing.expect(mp.writeGrantAllowed(1, true, false));
 }
+
+const ms = @import("kernel_shared").msync_policy;
+
+test "msync rejects unaligned addresses and bad flag combinations" {
+    try std.testing.expectEqual(@as(?i64, null), ms.validate(0x1000, ms.MS_SYNC));
+    try std.testing.expectEqual(@as(?i64, null), ms.validate(0x1000, ms.MS_ASYNC | ms.MS_INVALIDATE));
+    try std.testing.expectEqual(@as(?i64, null), ms.validate(0x1000, 0));
+    try std.testing.expectEqual(@as(?i64, ms.EINVAL), ms.validate(0x1001, ms.MS_SYNC));
+    try std.testing.expectEqual(@as(?i64, ms.EINVAL), ms.validate(0x1000, ms.MS_SYNC | ms.MS_ASYNC));
+    try std.testing.expectEqual(@as(?i64, ms.EINVAL), ms.validate(0x1000, 0x10));
+}
+
+test "msync page span rejects wrapping ranges" {
+    try std.testing.expectEqual(@as(?u64, 1), ms.pageSpan(0x1000, 1));
+    try std.testing.expectEqual(@as(?u64, 2), ms.pageSpan(0x1000, 0x1001));
+    try std.testing.expectEqual(@as(?u64, null), ms.pageSpan(0x1000, ~@as(u64, 0)));
+    try std.testing.expectEqual(@as(?u64, null), ms.pageSpan(~@as(u64, 0xFFF), 0x2000));
+}

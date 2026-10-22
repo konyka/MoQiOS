@@ -561,7 +561,7 @@ fn pagesFree(task: *task_mod.Task, base: u64, num_pages: u64) bool {
     return firstMappedPage(task, base, num_pages) == null;
 }
 
-fn hasMmapOverlap(task: *task_mod.Task, base: u64, num_pages: u64) bool {
+pub fn hasMmapOverlap(task: *task_mod.Task, base: u64, num_pages: u64) bool {
     vma_runtime_stats.recordScan(task.mmap_active_bm);
     var bits = task.mmap_active_bm;
     while (bits != 0) {
