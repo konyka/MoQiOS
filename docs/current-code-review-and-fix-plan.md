@@ -3789,7 +3789,10 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   `item.fd_table`（别的进程的表）探测；而 FdTable 池槽被 freeFdTable 归还后
   `initInto` 会重置 `transfer_state`，若此时另一进程正持有 transfer hold，释放时会
   破坏新表的计数。需要先给 FdTable 加分配代数并让 init 等待在途 hold 归零，属于
-  设计改动，不做局部补丁。
+  设计改动，不做局部补丁。直接用"代数校验 + CAS 增加 refs"跨表钉住同样不安全：
+  `initInto` 以普通 memcpy 覆盖 `refs`，与并发 CAS 竞争。触发条件很窄——注册由父进程
+  发起、epoll fd 经 fork 继承、父进程随后关闭自己那份 fd；子进程自建 epoll 注册自己的
+  fd 不受影响（注册键含 `item.fd_table`）。维持现状并记录为已知限制。
 - fat32/ext2 早期残留见 §6.51–§6.54 残留表（ext2 时间戳/blocks 已修）。
 
 | Gate | Result | Notes |
