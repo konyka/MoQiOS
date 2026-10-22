@@ -3648,18 +3648,11 @@ fn syscallMadvise(addr: u64, length: u64, advice: u32) i64 {
                 }
             }
         },
-        4 => { // MADV_DONTNEED — hint that pages can be reclaimed
-            // Mark as not-locked so swap/page-cache can reclaim
-            var bits = cur.mmap_active_bm;
-            while (bits != 0) {
-                const i: usize = @intCast(@ctz(bits));
-                bits &= bits - 1;
-                const r = &cur.mmap_regions[i];
-                if (addr >= r.base and addr < r.base + r.num_pages * 0x1000) {
-                    r.locked = false;
-                    break;
-                }
-            }
+        4 => { // MADV_DONTNEED — drop the pages, keep the mapping
+            // Linux semantics: private anonymous pages read back zero-filled,
+            // file pages are re-faulted. This used to be a silent no-op, so
+            // allocators that recycle memory with DONTNEED saw stale bytes.
+            return @import("../../mm/mmap.zig").madviseDontneed(addr, length);
         },
         else => return -22, // EINVAL
     }

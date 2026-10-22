@@ -1087,6 +1087,114 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
 }
 
 /// Core munmap implementation. Returns 0 or -errno.
+/// MADV_DONTNEED: drop the pages of [addr, addr+length) while keeping the
+/// mapping itself (regions, protections, RLIMIT accounting untouched).
+/// Private anonymous pages read back as zero-filled on the next access;
+/// file-backed pages are re-faulted from the page cache. Only ranges fully
+/// covered by tracked regions are accepted (EINVAL otherwise, like Linux
+/// for unmapped holes is ENOMEM — we keep the stricter subset); SysV SHM
+/// attachments and no-free (MMIO/DMA) regions are refused because their
+/// frames are owned elsewhere.
+pub fn madviseDontneed(addr: u64, length: u64) i64 {
+    // madvise rounds a non-page-multiple length up (addr must be aligned).
+    if (length > 0xFFFF_FFFF_FFFF_F000) return -22;
+    const rounded = (length + user_space.PAGE_SIZE - 1) & ~(user_space.PAGE_SIZE - 1);
+    const range = munmap_policy.validate(addr, rounded) orelse return -22;
+    const base = range.base;
+    const num_pages = range.num_pages;
+
+    const cur_idx = sched.currentTaskIndex() orelse return -1;
+    const cur = task_mod.getTask(cur_idx) orelse return -1;
+    if (cur.mm == null) return -1;
+    var vm_guard = mm_mod.Mm.beginVmMutation(cur.mm, @ptrCast(cur)) catch return -35;
+    defer vm_guard.release();
+
+    if (@import("../ipc/sysv_shm.zig").overlapsAttachment(cur.tid, base, num_pages)) return -22;
+
+    // Every page must lie in a tracked region, and none may be no_free.
+    const page = user_space.PAGE_SIZE;
+    var p: u64 = 0;
+    while (p < num_pages) : (p += 1) {
+        const va = base + p * page;
+        var covered = false;
+        var bits = cur.mmap_active_bm;
+        while (bits != 0) {
+            const i: usize = @intCast(@ctz(bits));
+            bits &= bits - 1;
+            const r = &cur.mmap_regions[i];
+            if (va >= r.base and va < r.base + r.num_pages * page) {
+                if (r.no_free) return -22;
+                covered = true;
+                break;
+            }
+        }
+        if (!covered) return -12; // ENOMEM: range not mapped
+    }
+
+    // Shared mappings: write dirty file pages back before dropping them, as
+    // munmap does, so DONTNEED never discards data.
+    var bits = cur.mmap_active_bm;
+    while (bits != 0) {
+        const i: usize = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const r = &cur.mmap_regions[i];
+        const r_end = r.base + r.num_pages * page;
+        if (r.base >= base + num_pages * page or r_end <= base) continue;
+        if (r.shared and
+            (r.file_kind == @intFromEnum(filemap.FsKind.ext2) or
+                r.file_kind == @intFromEnum(filemap.FsKind.fat32)))
+        {
+            _ = vfs.flushMappedInode(r.inode_id);
+        }
+    }
+
+    // Anonymous regions are eagerly populated and have no demand-fill path,
+    // so their pages are reset in place: a privately owned frame is zeroed,
+    // a COW-shared frame (fork sibling holds a reference) is replaced by a
+    // fresh zero page so the sibling keeps its data. File-backed regions are
+    // unmapped and re-fault from the page cache. Huge blocks are demoted
+    // first by unmapRange's prescan; for the anonymous zeroing pass a huge
+    // PDE is simply skipped (getPageEntryRaw refuses it) — rare, and leaving
+    // the bytes is the old (no-op) behaviour, never a corruption.
+    var pg: u64 = 0;
+    while (pg < num_pages) : (pg += 1) {
+        const va = base + pg * page;
+        const is_file = blk: {
+            var rb = cur.mmap_active_bm;
+            while (rb != 0) {
+                const i: usize = @intCast(@ctz(rb));
+                rb &= rb - 1;
+                const r = &cur.mmap_regions[i];
+                if (va >= r.base and va < r.base + r.num_pages * page) break :blk r.file_kind != 0;
+            }
+            break :blk false;
+        };
+        if (is_file) {
+            unmapRange(cur, va, 1);
+            continue;
+        }
+        const raw = paging_mod.getPageEntryRaw(cur.page_table_phys, va) orelse continue;
+        if (raw & 1 == 0) continue; // not present (swap / reservation): leave it
+        const phys = raw & paging_mod.ADDR_MASK;
+        if (pmm_mod.getRefCount(phys) <= 1) {
+            const dst: [*]u8 = @ptrFromInt(hhdm_mod.physToVirt(phys));
+            @memset(dst[0..user_space.PAGE_SIZE], 0);
+        } else {
+            const fresh = pmm_mod.allocPage() orelse return -12;
+            const dst: [*]u8 = @ptrFromInt(hhdm_mod.physToVirt(fresh));
+            @memset(dst[0..user_space.PAGE_SIZE], 0);
+            // Writable private page again (drop the COW bit), same NX/U bits.
+            const cow_bit: u64 = 1 << 9;
+            var new_pte = (raw & ~paging_mod.ADDR_MASK & ~cow_bit) | fresh;
+            if (raw & cow_bit != 0) new_pte |= 1 << 1;
+            paging_mod.setPageEntryRaw(cur.page_table_phys, va, new_pte);
+            tlb_mod.shootdownRange(va, 1, cur.page_table_phys);
+            pmm_mod.freePage(phys); // drop our reference to the shared frame
+        }
+    }
+    return 0;
+}
+
 pub fn munmap(addr: u64, length: u64) i64 {
     const range = munmap_policy.validate(addr, length) orelse return -22;
     const base = range.base;
