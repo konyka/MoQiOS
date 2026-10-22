@@ -119,6 +119,16 @@ fn removeWaitNode(bucket: *FutexBucket, node: *task_mod.WaitNode) void {
     }
 }
 
+/// Whether `node` is still on `bucket`'s wait list. Caller holds bucket.lock.
+fn nodeLinked(bucket: *FutexBucket, node: *task_mod.WaitNode) bool {
+    var current = bucket.head;
+    while (current) |n| {
+        if (n == node) return true;
+        current = n.next;
+    }
+    return false;
+}
+
 /// v53.51: Drive timed futex waits. Called from the BSP maintenance tick
 /// (sched.zig, alongside the alarm/itimer deadline scans). Unlinks expired
 /// waiters and republishes them; the woken waiter observes granted == false
@@ -369,7 +379,13 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
                     if (deadline != 0) disarmWaitDeadline(cur_idx);
                     return 0;
                 }
-                const expired = deadline != 0 and tsc.nanos() >= deadline;
+                // timerTick unlinks a timed-out node under this lock, judged
+                // by the BSP's clock. This CPU's clock may still read just
+                // before the deadline, so an unlinked, ungranted node is the
+                // authoritative timeout — re-blocking on the clock alone
+                // would sleep forever with nothing left to wake us.
+                const unlinked_by_timeout = deadline != 0 and !nodeLinked(bucket, &node);
+                const expired = unlinked_by_timeout or (deadline != 0 and tsc.nanos() >= deadline);
                 const fatal = sig_mod.pendingFatal(cur_task);
                 const actionable = sig_mod.pendingActionable(cur_task);
                 if (!expired and fatal == null and !actionable) {
