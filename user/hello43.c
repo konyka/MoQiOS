@@ -6,8 +6,10 @@
 ///   UDP: socket → bind 127.0.0.1:19043 → sendto self → netpoll → recvfrom,
 ///        verifying payload and that the source address is 127.0.0.1.
 ///
-/// Sockets here are non-blocking; netpoll (syscall 104) pumps the loopback
-/// queue between steps, which is what drives the handshake and delivery.
+/// The handshake and the first echo use MSG_DONTWAIT polling with netpoll
+/// (syscall 104) pumping the loopback queue between steps. A second phase
+/// exercises blocking recv: queued data returns at once, an empty ring with
+/// SO_RCVTIMEO sleeps and reports EAGAIN, and a peer close reports EOF.
 
 #include <stdint.h>
 
@@ -51,6 +53,11 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_SENDTO   121
 #define SYS_RECVFROM 122
 #define SYS_CONNECT  124
+#define SYS_SETSOCKOPT 132
+#define SYS_CLOCK_GETTIME 228
+#define SOL_SOCKET   1
+#define SO_RCVTIMEO  20
+#define CLOCK_MONOTONIC 1
 
 #define AF_INET      2
 #define SOCK_STREAM  1
@@ -77,6 +84,12 @@ static void netpoll(void) {
     syscall1(SYS_NETPOLL, 0);
 }
 
+static int64_t now_ms(void) {
+    int64_t ts[2] = { 0, 0 };
+    syscall2(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, (uint64_t)ts);
+    return ts[0] * 1000 + ts[1] / 1000000;
+}
+
 /* sockaddr_in, 16 bytes: family(2) port(2, BE) addr(4) zero(8) */
 static void mk_addr(uint8_t *a, uint16_t port) {
     for (int i = 0; i < 16; i++) a[i] = 0;
@@ -98,7 +111,9 @@ static int str_eq_n(const char *a, const char *b, int n) {
 static int64_t recv_pumped(int64_t fd, char *buf, uint64_t len, uint8_t *src, uint64_t *srclen) {
     for (int attempt = 0; attempt < 1000; attempt++) {
         netpoll();
-        int64_t n = syscall6(SYS_RECVFROM, (uint64_t)fd, (uint64_t)buf, len, 0, (uint64_t)src, (uint64_t)srclen);
+        /* MSG_DONTWAIT (0x40): this loop pumps lo itself, so each attempt must
+         * return at once instead of sleeping in a blocking recv. */
+        int64_t n = syscall6(SYS_RECVFROM, (uint64_t)fd, (uint64_t)buf, len, 0x40, (uint64_t)src, (uint64_t)srclen);
         if (n != 0 && n != -11) return n;
     }
     return 0;
@@ -148,8 +163,37 @@ void _start(void) {
     if (recv_pumped(cli, buf, 64, 0, 0) != 11) fail("tcp recv pong");
     if (!str_eq_n(buf, "lo-tcp-pong", 11)) fail("tcp pong payload");
 
-    syscall1(SYS_CLOSE, (uint64_t)afd);
+    /* ── Blocking recv (no MSG_DONTWAIT, no O_NONBLOCK) ─────────────── */
+    /* (a) Bytes already queued: a blocking recv returns them at once. The
+     * send path drains the loopback queue itself, so no netpoll is needed. */
+    if (syscall6(SYS_SENDTO, (uint64_t)cli, (uint64_t)"blk-1", 5, 0, 0, 0) != 5) fail("tcp send blk-1");
+    for (int i = 0; i < 64; i++) buf[i] = 0;
+    if (syscall6(SYS_RECVFROM, (uint64_t)afd, (uint64_t)buf, 64, 0, 0, 0) != 5) fail("tcp blocking recv data");
+    if (!str_eq_n(buf, "blk-1", 5)) fail("tcp blocking recv payload");
+
+    /* (b) Empty ring + SO_RCVTIMEO 200 ms: the recv must sleep and then
+     * report EAGAIN, not return immediately. */
+    int64_t tv[2] = { 0, 200000 }; /* tv_sec, tv_usec */
+    if (syscall6(SYS_SETSOCKOPT, (uint64_t)afd, SOL_SOCKET, SO_RCVTIMEO, (uint64_t)tv, 16, 0) != 0)
+        fail("tcp SO_RCVTIMEO");
+    const int64_t t0 = now_ms();
+    const int64_t rt = syscall6(SYS_RECVFROM, (uint64_t)afd, (uint64_t)buf, 64, 0, 0, 0);
+    const int64_t waited = now_ms() - t0;
+    if (rt != -11) fail("tcp blocking recv timeout errno");
+    if (waited < 150) fail("tcp blocking recv did not wait");
+
+    /* (c) Peer close while the ring is empty: a blocking recv reports EOF. */
     syscall1(SYS_CLOSE, (uint64_t)cli);
+    int64_t eof = -1;
+    for (int attempt = 0; attempt < 1000; attempt++) {
+        netpoll();
+        eof = syscall6(SYS_RECVFROM, (uint64_t)afd, (uint64_t)buf, 64, 0, 0, 0);
+        if (eof != -11) break; /* -11 only while the FIN is still in flight */
+    }
+    if (eof != 0) fail("tcp blocking recv eof");
+    print("hello43: tcp blocking recv ok\n");
+
+    syscall1(SYS_CLOSE, (uint64_t)afd);
     syscall1(SYS_CLOSE, (uint64_t)srv);
     print("hello43: tcp loopback ok\n");
 

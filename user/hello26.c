@@ -27,6 +27,14 @@ static inline int64_t syscall2(uint64_t nr, uint64_t a1, uint64_t a2) {
     return ret;
 }
 
+static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
+    int64_t ret;
+    register uint64_t rdx __asm__("rdx") = a3;
+    register uint64_t r10 __asm__("r10") = a4;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx), "r"(r10) : "rcx", "r11", "memory");
+    return ret;
+}
+
 static inline int64_t syscall3(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3) {
     int64_t ret;
     register uint64_t rdx __asm__("rdx") = a3;
@@ -111,7 +119,7 @@ void _start(void) {
             char buf[128];
             for (int i = 0; i < 128; i++) buf[i] = 0;
 
-            int64_t n = syscall3(SYS_RECVFROM, (uint64_t)client_fd, (uint64_t)buf, 128);
+            int64_t n = syscall4(SYS_RECVFROM, (uint64_t)client_fd, (uint64_t)buf, 128, 0x40 /* MSG_DONTWAIT */);
             print("hello26: recv=");
             print_dec(n);
             print("\n");

@@ -622,6 +622,7 @@ fn bspTimedWaitTick() void {
     @import("../sync/futex.zig").timerTick(now_ns);
     @import("../ipc/posix_mq.zig").timerTick(now_ns);
     @import("../net/epoll.zig").timerTick(now_ns);
+    @import("../net/tcp.zig").recvTimerTick(now_ns);
     @import("../ipc/timerfd.zig").timerTick(now_tick);
     @import("../ipc/posix_timer.zig").timerTick(now_tick);
     @import("../ipc/ipc.zig").timeoutTick(now_tick);
@@ -672,6 +673,12 @@ fn bspSlowMaintenance() void {
     // must not duplicate the scan (pinned by the host test contract).
     // TCP retransmission / TIME_WAIT / FIN_WAIT_2 / delayed ACK.
     @import("../net/tcp.zig").timerTick(100);
+    // Loopback frames are otherwise only delivered by the NIC IRQ bottom
+    // half and the net_poll syscall. A task blocked in recv on a 127/8
+    // connection pumps neither, so give lo a kernel-side drain on this
+    // cadence. Runs after tcp.timerTick released tcp_lock (drain re-enters
+    // the RX path, which takes tcp_lock itself).
+    _ = @import("../net/lo.zig").drain();
     // SK-79: NDP incomplete Neighbor Solicitation retransmit (RetransTimer).
     @import("../net/icmpv6.zig").neighborTimerTick(100);
 }

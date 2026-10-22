@@ -474,7 +474,8 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         const to_read = @min(len, 4096);
         if (!copy.validateUserBufferWritable(buf, to_read)) return -14; // EFAULT
         const tcb_idx = t.fd_table.fds[fd].tcb_idx;
-        const result = net_mod.tcp.tcpRecv(tcb_idx, &tmp_buf, to_read);
+        const nonblock = net_mod.tcp_recv_policy.nonblockRequested(t.fd_table.fds[fd].status_flags, flags);
+        const result = net_mod.tcp.tcpRecvBlocking(tcb_idx, &tmp_buf, to_read, nonblock);
         if (result > 0) {
             const copied = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf))[0..@intCast(result)], @intCast(result));
             if (copied != @as(usize, @intCast(result))) return -14; // EFAULT
@@ -807,7 +808,11 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
         var tmp: [4096]u8 = undefined;
         const to_read: u32 = @intCast(@min(iov_sz, 4096));
         if (!copy.validateUserBufferWritable(iov_base, to_read)) return if (total == 0) -14 else @intCast(total);
-        const result = net_mod.tcp.tcpRecv(tcb_idx, &tmp, to_read);
+        // Only the first segment may wait: once bytes were delivered, a
+        // further empty ring ends the call with the short count (stream
+        // semantics), never a second sleep.
+        const nonblock = total != 0 or net_mod.tcp_recv_policy.nonblockRequested(cur.fd_table.fds[fd].status_flags, 0);
+        const result = net_mod.tcp.tcpRecvBlocking(tcb_idx, &tmp, to_read, nonblock);
         if (result > 0) {
             const copied = copy.copyToUser(@ptrFromInt(iov_base), &tmp, @intCast(result));
             if (copied != @as(usize, @intCast(result))) return if (total == 0) -14 else @intCast(total);

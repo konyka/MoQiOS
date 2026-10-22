@@ -36,7 +36,26 @@ const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 // Lock order: tcp_lock → e1000.tx_lock (sendSegment acquires tx_lock internally).
 // Acquired at the entry of every public function; private helpers (sendSegment, flushSendBuffer,
 // processIncomingData, allocTcb, deactivateTcb) are called from within the lock and must NOT re-acquire.
-var tcp_lock: IrqSpinlock = .{};
+var tcp_lock: TcpLock = .{};
+
+/// tcp_lock with deferred reader wakes: every release first detaches the
+/// blocked-recv waiters marked during the critical section (markRecvWake),
+/// drops the spinlock, and only then wakes them. unblockTask takes task_lock,
+/// which must never nest inside tcp_lock, and this keeps every one of the
+/// many release sites (incl. `defer`) correct without touching each.
+const TcpLock = struct {
+    inner: IrqSpinlock = .{},
+
+    inline fn acquire(self: *TcpLock) u64 {
+        return self.inner.acquire();
+    }
+
+    inline fn release(self: *TcpLock, saved: u64) void {
+        const chain = if (recv_wake_pending != 0) takeRecvWakesLocked() else null;
+        self.inner.release(saved);
+        if (chain != null) wakeRecvChain(chain);
+    }
+};
 
 // v53.14: Debug logging no-op — avoids serial I/O (87μs/char polling UART) inside
 // tcp_lock critical sections. Serial polling in locked code caused ~170ms lock hold
@@ -329,6 +348,101 @@ const TcpTcb = struct {
 
 var tcbs: [MAX_CONNECTIONS]TcpTcb = undefined;
 
+/// Per-slot incarnation, bumped every time allocTcb hands the slot out. A
+/// blocking recv captures it before waiting and re-checks it on every
+/// retry: if the slot was closed and reused for a different connection in
+/// between, the waiter must not read the new connection's bytes.
+var tcb_generations: [MAX_CONNECTIONS]u64 = @splat(0);
+
+/// Blocking-recv waiter, stack-allocated on the waiter's kernel stack.
+pub const RecvWaitNode = struct {
+    task_idx: u32,
+    granted: bool = false,
+    next: ?*RecvWaitNode = null,
+};
+
+/// Per-slot list of blocked readers (tcp_lock protects the list heads).
+var recv_waiters: [MAX_CONNECTIONS]?*RecvWaitNode = @splat(null);
+
+/// Bitmap of TCB slots whose readers must be woken once tcp_lock is
+/// released. Set under tcp_lock wherever a blocked reader's wait condition
+/// can change (data, FIN, RST, teardown); drained by flushRecvWakes.
+var recv_wake_pending: u64 = 0;
+
+/// Mark `tcb`'s blocked readers for wake-up (call with tcp_lock held).
+inline fn markRecvWake(tcb: *const TcpTcb) void {
+    const idx: u6 = @intCast(tcbIdx(tcb));
+    if (recv_waiters[idx] != null) recv_wake_pending |= @as(u64, 1) << idx;
+}
+
+/// Unlink every waiter of the slots marked by markRecvWake (tcp_lock held)
+/// and return them as one detached chain; the caller wakes the chain after
+/// releasing tcp_lock (unblockTask takes task_lock, which must not nest
+/// inside tcp_lock).
+fn takeRecvWakesLocked() ?*RecvWaitNode {
+    var chain: ?*RecvWaitNode = null;
+    var bm = recv_wake_pending;
+    recv_wake_pending = 0;
+    while (bm != 0) {
+        const i = @ctz(bm);
+        bm &= bm - 1;
+        var cur = recv_waiters[i];
+        recv_waiters[i] = null;
+        while (cur) |node| {
+            cur = node.next;
+            node.next = chain;
+            chain = node;
+        }
+    }
+    return chain;
+}
+
+/// Wake a chain detached by takeRecvWakesLocked (tcp_lock NOT held). The
+/// node may live on the woken task's stack: read every field before the
+/// granted store publishes it.
+fn wakeRecvChain(chain: ?*RecvWaitNode) void {
+    const task_mod = @import("../proc/task.zig");
+    var cur = chain;
+    while (cur) |node| {
+        const next = node.next;
+        const idx = node.task_idx;
+        node.next = null;
+        @atomicStore(bool, &node.granted, true, .release);
+        task_mod.unblockTask(idx);
+        cur = next;
+    }
+}
+
+/// Remove `node` from slot `idx`'s waiter list if still linked (tcp_lock held).
+fn unlinkRecvWaiterLocked(idx: u32, node: *RecvWaitNode) void {
+    var link: *?*RecvWaitNode = &recv_waiters[idx];
+    while (link.*) |cur| {
+        if (cur == node) {
+            link.* = cur.next;
+            cur.next = null;
+            return;
+        }
+        link = &cur.next;
+    }
+}
+
+/// Current incarnation of a TCB slot (0 if out of range).
+pub fn tcbGeneration(tcb_idx: u32) u64 {
+    if (tcb_idx >= MAX_CONNECTIONS) return 0;
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    return tcb_generations[tcb_idx];
+}
+
+/// SO_RCVTIMEO of a TCB in milliseconds (0 = wait forever).
+pub fn tcpRecvTimeoutMs(tcb_idx: u32) u32 {
+    if (tcb_idx >= MAX_CONNECTIONS) return 0;
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (!tcbs[tcb_idx].active) return 0;
+    return tcbs[tcb_idx].options.rcv_timeout_ms;
+}
+
 /// Bitmap tracking active TCB slots (1 = active, 0 = free).
 /// Enables O(1) skip of empty slots via @ctz instead of linear scan.
 // v53.15: All accesses use @atomicLoad/@atomicRmw for SMP-safe lock-free snapshot in timerTick.
@@ -346,6 +460,7 @@ inline fn deactivateTcb(tcb: *TcpTcb) void {
     const idx: u6 = @intCast(tcbIdx(tcb));
     _ = @atomicRmw(u64, &tcb_active_bitmap, .And, ~(@as(u64, 1) << idx), .release);
     tcb.active = false;
+    markRecvWake(tcb);
 }
 
 /// Marker for a backlog ring entry whose handshake died (never a real TCB
@@ -397,6 +512,7 @@ fn releaseOrphanedBacklogTcb(tcb_idx: u32) void {
 /// so release it (and its ring entry) right here.
 inline fn closeTcbRemote(tcb: *TcpTcb) void {
     tcb.state = .closed;
+    markRecvWake(tcb); // blocked readers now see EOF / ECONNRESET
     if (tcb.ref_count == 0) {
         deactivateTcb(tcb);
         return;
@@ -541,6 +657,7 @@ fn allocTcb() ?*TcpTcb {
     const i: u6 = @intCast(@ctz(free_bitmap));
     _ = @atomicRmw(u64, &tcb_active_bitmap, .Or, @as(u64, 1) << i, .release);
     tcbs[i].active = true;
+    tcb_generations[i] +%= 1;
     initTcbState(&tcbs[i]);
     // The previous occupant's port must not survive: it would block bind()
     // of that port and alias a 4-tuple if connect() reused it.
@@ -1755,6 +1872,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
             // bytes, congestion state or negotiation flag of the dead
             // connection can reach the new one.
             const reuse_tcb = &tcbs[i];
+            tcb_generations[i] +%= 1; // a new connection on this slot
             initTcbState(reuse_tcb);
             reuse_tcb.iss = generateIss();
             reuse_tcb.snd_una = reuse_tcb.iss;
@@ -1865,6 +1983,7 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
             tcp_util.seqGt(seq_num, tcbs[i].irs))
         {
             const reuse_tcb = &tcbs[i];
+            tcb_generations[i] +%= 1; // a new connection on this slot
             initTcbState(reuse_tcb);
             reuse_tcb.iss = generateIss();
             reuse_tcb.snd_una = reuse_tcb.iss;
@@ -2351,6 +2470,7 @@ fn driveTcbStateMachine(
                 if (data_fully_buffered and fin_seq == tcb.rcv_nxt) {
                     tcb.rcv_nxt +%= 1;
                     tcb.state = .close_wait;
+                    markRecvWake(tcb); // empty-ring readers now see EOF
                     tcb.delayed_ack_pending = false; // ACK is immediate for FIN
                     _ = sendSegment(tcb, ACK, undefined, 0);
                     tcpLog("[tcp] remote closed (FIN received)\n");
@@ -2373,6 +2493,7 @@ fn driveTcbStateMachine(
                 if (fin_seq != tcb.rcv_nxt) return;
                 // v53.6/v53.10: RFC 793 — FIN+ACK (our FIN confirmed) → TIME_WAIT; FIN only (simultaneous close) → CLOSING
                 tcb.rcv_nxt +%= 1;
+                markRecvWake(tcb); // peer FIN: empty-ring readers now see EOF
                 if (flags & ACK != 0 and ourFinAcked(tcb, ack_num)) {
                     // Our FIN was ACKed → TIME_WAIT
                     tcb.snd_una = ack_num;
@@ -2416,6 +2537,7 @@ fn driveTcbStateMachine(
                 const fin_seq = seq_num +% payload_len;
                 if (fin_seq != tcb.rcv_nxt) return;
                 tcb.rcv_nxt +%= 1;
+                markRecvWake(tcb); // peer FIN: empty-ring readers now see EOF
                 tcb.retransmit_timer = 0; // v53.10: Reset for TIME_WAIT 2MSL
                 tcb.state = .time_wait;
                 _ = sendSegment(tcb, ACK, undefined, 0);
@@ -2554,6 +2676,7 @@ fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) void
     const to_copy = @min(len, recv_free);
     ringWrite(&tcb.recv_buf, RECV_BUF_SIZE, tcb.recv_tail, data, to_copy);
     tcb.recv_tail = (tcb.recv_tail + to_copy) % RECV_BUF_SIZE;
+    if (to_copy > 0) markRecvWake(tcb);
 
     // v53.3: only advance rcv_nxt by actually buffered bytes
     // (if recv_buf is full, to_copy < len, so we don't skip unbuffered seq nums)
@@ -2773,10 +2896,18 @@ pub fn tcpSendFromUser(tcb_idx: u32, user_addr: u64, len: u32) i64 {
     }
 
     if (len > 0) {
-        const lock_flags = tcp_lock.acquire();
-        defer tcp_lock.release(lock_flags);
-        const tcb = &tcbs[tcb_idx];
-        if (tcb.active and tcb.state == .established) flushSendBuffer(tcb);
+        var loop_dst = false;
+        {
+            const lock_flags = tcp_lock.acquire();
+            defer tcp_lock.release(lock_flags);
+            const tcb = &tcbs[tcb_idx];
+            if (tcb.active and tcb.state == .established) flushSendBuffer(tcb);
+            loop_dst = tcb.active and !tcb.is_v6 and netif.isLoopback(tcb.remote_ip);
+        }
+        // A 127/8 peer may be blocked in recv waiting for these segments and
+        // pumps nothing itself; deliver the loopback queue now, outside
+        // tcp_lock (drain re-enters the RX path, which takes tcp_lock).
+        if (loop_dst) _ = lo_dev.drain();
     }
     return total;
 }
@@ -2962,7 +3093,114 @@ pub fn tcpRecv(tcb_idx: u32, buf: [*]u8, len: u32) i64 {
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return -1;
+    return recvLocked(tcb, buf, len);
+}
 
+/// Blocking recv: identical to tcpRecv when data, EOF or an error is
+/// available, or when `nonblock` is set; otherwise sleeps until the ring
+/// gets data, the peer closes or resets, a signal arrives (-EINTR), the
+/// SO_RCVTIMEO deadline passes (-EAGAIN), or the slot is torn down / reused
+/// for another connection (-EBADF).
+///
+/// Lost-wakeup freedom: the emptiness check and the waiter insertion happen
+/// under one tcp_lock hold, and every producer marks the slot for wake-up
+/// under that same lock (markRecvWake); the wake itself runs after release.
+/// A wake racing the block transition is harmless: the waiter re-checks
+/// `granted`/the ring on every loop iteration and a pending timer tick
+/// re-runs it on a timed wait.
+pub fn tcpRecvBlocking(tcb_idx: u32, buf: [*]u8, len: u32, nonblock: bool) i64 {
+    if (tcb_idx >= MAX_CONNECTIONS) return -1;
+    const task_mod = @import("../proc/task.zig");
+    const sched = @import("../proc/sched.zig");
+    const sig_mod = @import("../proc/signal.zig");
+    const tsc = @import("../arch/arch.zig").tsc;
+
+    var generation: ?u64 = null;
+    var deadline: ?u64 = null;
+    var deadline_set = false;
+    while (true) {
+        var node: RecvWaitNode = .{ .task_idx = 0 };
+        const cur_idx = sched.currentTaskIndex() orelse return -1;
+        {
+            const lock_flags = tcp_lock.acquire();
+            defer tcp_lock.release(lock_flags);
+            const tcb = &tcbs[tcb_idx];
+            if (!tcb.active) return if (generation == null) -1 else -9; // EBADF: torn down while we waited
+            if (generation) |g| {
+                if (tcb_generations[tcb_idx] != g) return -9; // EBADF: slot reused for another connection
+            } else generation = tcb_generations[tcb_idx];
+            if (!deadline_set) {
+                deadline = tcp_recv_policy.recvDeadlineNs(tsc.nanos(), tcb.options.rcv_timeout_ms);
+                deadline_set = true;
+            }
+
+            const available = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
+            const decision = tcp_recv_policy.decide(tcb.state, available, tcb.reset_by_peer);
+            if (!tcp_recv_policy.shouldBlock(decision, nonblock, tcp_recv_policy.timedOut(deadline, tsc.nanos())))
+                return recvLocked(tcb, buf, len);
+
+            // Commit to waiting: link the node, mark ourselves blocked, and
+            // publish an optional deadline before tcp_lock is released.
+            node.task_idx = cur_idx;
+            node.next = recv_waiters[tcb_idx];
+            recv_waiters[tcb_idx] = &node;
+            task_mod.blockTask(cur_idx);
+            if (deadline) |d| armRecvDeadline(cur_idx, d);
+        }
+
+        sched.forceReschedule();
+        sched.repairCurrentAfterBlock();
+
+        {
+            const lock_flags = tcp_lock.acquire();
+            defer tcp_lock.release(lock_flags);
+            unlinkRecvWaiterLocked(tcb_idx, &node);
+        }
+        if (deadline != null) disarmRecvDeadline(cur_idx);
+
+        if (task_mod.getTask(cur_idx)) |ct| {
+            if (sig_mod.pendingFatal(ct)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+            if (sig_mod.pendingActionable(ct)) return -4; // EINTR
+        }
+        // Loop: re-check generation, ring, state and deadline.
+    }
+}
+
+/// Timed-recv deadlines, per task slot. A nonzero entry means "this task is
+/// blocked in tcpRecvBlocking with an SO_RCVTIMEO"; recvTimerTick unblocks it
+/// once the deadline passes and the waiter re-evaluates (timedOut → EAGAIN).
+var recv_deadline_ns: [64]u64 = @splat(0);
+var recv_deadline_bm: u64 = 0;
+
+fn armRecvDeadline(task_idx: u32, deadline: u64) void {
+    if (task_idx >= 64) return;
+    @atomicStore(u64, &recv_deadline_ns[task_idx], deadline, .release);
+    _ = @atomicRmw(u64, &recv_deadline_bm, .Or, @as(u64, 1) << @intCast(task_idx), .seq_cst);
+}
+
+fn disarmRecvDeadline(task_idx: u32) void {
+    if (task_idx >= 64) return;
+    _ = @atomicRmw(u64, &recv_deadline_bm, .And, ~(@as(u64, 1) << @intCast(task_idx)), .seq_cst);
+    @atomicStore(u64, &recv_deadline_ns[task_idx], 0, .release);
+}
+
+/// Wake timed-out recv waiters. Runs every BSP tick (sched.bspTimedWaitTick).
+/// Waking is a hint: the waiter itself decides on timeout, so a stale or
+/// spurious wake only costs one re-check.
+pub fn recvTimerTick(now_ns: u64) void {
+    var bm = @atomicLoad(u64, &recv_deadline_bm, .acquire);
+    if (bm == 0) return;
+    const task_mod = @import("../proc/task.zig");
+    while (bm != 0) {
+        const i: u6 = @truncate(@ctz(bm));
+        bm &= bm - 1;
+        const d = @atomicLoad(u64, &recv_deadline_ns[i], .acquire);
+        if (d != 0 and now_ns >= d) task_mod.unblockTask(i);
+    }
+}
+
+/// recv body shared by the blocking and non-blocking entry points (tcp_lock held).
+fn recvLocked(tcb: *TcpTcb, buf: [*]u8, len: u32) i64 {
     const available = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
     const decision = tcp_recv_policy.decide(tcb.state, available, tcb.reset_by_peer);
     if (decision != .read_data) return tcp_recv_policy.emptyResult(decision);

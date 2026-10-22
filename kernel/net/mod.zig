@@ -9,6 +9,7 @@ const ipv6 = @import("ipv6.zig");
 const icmpv6 = @import("icmpv6.zig");
 const ndp = @import("ndp.zig");
 pub const tcp = @import("tcp.zig");
+pub const tcp_recv_policy = @import("tcp_recv_policy.zig");
 pub const epoll = @import("epoll.zig");
 pub const unix_socket = @import("unix_socket.zig");
 pub const socket_opt = @import("socket_opt.zig");

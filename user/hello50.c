@@ -139,9 +139,10 @@ static int64_t recv_pumped_flags(int64_t fd, uint8_t *buf, uint64_t len, uint64_
                                  uint8_t *src, uint64_t *srclen) {
     for (int attempt = 0; attempt < 1000; attempt++) {
         syscall1(SYS_NETPOLL, 0);
-        int64_t n = syscall6(SYS_RECVFROM, (uint64_t)fd, (uint64_t)buf, len, flags,
+        /* MSG_DONTWAIT (0x40): the loop pumps lo itself between attempts. */
+        int64_t n = syscall6(SYS_RECVFROM, (uint64_t)fd, (uint64_t)buf, len, flags | 0x40,
                              (uint64_t)src, (uint64_t)srclen);
-        if (n != 0) return n;
+        if (n != 0 && n != -11) return n;
     }
     return 0;
 }
