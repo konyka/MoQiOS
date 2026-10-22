@@ -130,6 +130,10 @@ void _start(void) {
     uint64_t old_mask = 0;
     uint64_t temporary_mask = (uint64_t)1 << (SIGUSR2 - 1);
     uint64_t signal_mask = (uint64_t)1 << (SIGUSR2 - 1);
+    /* Mask used while queueing SIGUSR1: an UNBLOCKED self-signal is delivered
+     * before tkill returns (POSIX/Linux), so SIGUSR1 is held blocked here and
+     * only the epoll_pwait temporary mask (SIGUSR2 alone) lets it through. */
+    uint64_t queue_mask = signal_mask | ((uint64_t)1 << (SIGUSR1 - 1));
     struct sigaction_raw handled = {(uint64_t)sigusr1_handler, 0, 0, 0};
     struct timespec_raw ts = {0, 0};
     int64_t epfd = -1;
@@ -183,13 +187,15 @@ void _start(void) {
                       "queue blocked SIGUSR2");
     failures += check(epoll_pwait_raw(epfd, &returned, 1, 10, &temporary_mask, 8) == 0,
                       "epoll_pwait ignores temporarily blocked signal");
+    syscall6(SYS_SIGPROCMASK, 2, (uint64_t)&queue_mask, 0, 8, 0, 0);
     failures += check(syscall2(SYS_TKILL, (uint64_t)pid, SIGUSR1) == 0,
                       "queue SIGUSR1");
     failures += check(epoll_pwait_raw(epfd, &returned, 1, 10, &temporary_mask, 8) == -EINTR &&
                       handled_signal == SIGUSR1, "epoll_pwait handled signal interrupts");
     old_mask = 0;
     failures += check(syscall6(SYS_SIGPROCMASK, 0, 0, (uint64_t)&old_mask, 8, 0, 0) == 0 &&
-                      old_mask == signal_mask, "epoll_pwait restores signal mask");
+                      old_mask == queue_mask, "epoll_pwait restores signal mask");
+    syscall6(SYS_SIGPROCMASK, 2, (uint64_t)&signal_mask, 0, 8, 0, 0);
     failures += check(syscall4(SYS_RT_SIGTIMEDWAIT, (uint64_t)&signal_mask, 0, 0, 8) == SIGUSR2,
                       "consume blocked SIGUSR2 after restoration");
 
@@ -216,13 +222,15 @@ void _start(void) {
     handled_signal = 0;
     failures += check(syscall2(SYS_TKILL, (uint64_t)pid, SIGUSR2) == 0,
                       "queue SIGUSR2");
+    syscall6(SYS_SIGPROCMASK, 2, (uint64_t)&queue_mask, 0, 8, 0, 0);
     failures += check(syscall2(SYS_TKILL, (uint64_t)pid, SIGUSR1) == 0,
                       "queue SIGUSR1 for epoll_pwait2");
     failures += check(epoll_pwait2_raw(epfd, &returned, 1, &ts, &temporary_mask, 8) == -EINTR &&
                       handled_signal == SIGUSR1, "epoll_pwait2 handled signal interrupts");
     old_mask = 0;
     failures += check(syscall6(SYS_SIGPROCMASK, 0, 0, (uint64_t)&old_mask, 8, 0, 0) == 0 &&
-                      old_mask == signal_mask, "epoll_pwait2 restores signal mask");
+                      old_mask == queue_mask, "epoll_pwait2 restores signal mask");
+    syscall6(SYS_SIGPROCMASK, 2, (uint64_t)&signal_mask, 0, 8, 0, 0);
     failures += check(syscall4(SYS_RT_SIGTIMEDWAIT, (uint64_t)&signal_mask, 0, 0, 8) == SIGUSR2,
                       "consume blocked SIGUSR2 after epoll_pwait2");
 

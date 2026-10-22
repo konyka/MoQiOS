@@ -381,6 +381,9 @@ fn commitSignalStateForExec(cur: *@import("task.zig").Task, new_pml4: u64) void 
     // Caught signals revert to SIG_DFL (the handler addresses pointed into
     // the old image); SIG_IGN survives exec. Mask and pending set are kept.
     for (&cur.signal_handlers) |*h| h.* = exec_policy.execHandlerAfter(h.*);
+    // sa_mask/sa_flags describe handlers of the old image; none survive.
+    cur.signal_sa_masks = @splat(0);
+    cur.signal_sa_flags = @splat(0);
     cur.sigaltstack_base = 0;
     cur.sigaltstack_size = 0;
     // CLONE_CHILD_CLEARTID address is meaningless in the new image (Linux

@@ -521,6 +521,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         14 => {
             syscallSigprocmask(frame);
+            // Unblocking a pending signal delivers it before the call returns.
+            checkSignalsOnSyscallReturn(frame);
         },
         15 => {
             syscallSigreturn(frame);
@@ -539,6 +541,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         62 => {
             syscallKill(frame);
+            // POSIX: kill() to oneself delivers before returning.
+            checkSignalsOnSyscallReturn(frame);
         },
         96 => {
             syscallGettimeofday(frame);
@@ -1181,6 +1185,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         223 => { // tkill(tid, sig)
             frame.rax = @bitCast(signal_syscall_mod.tkill(@truncate(frame.rdi), @truncate(frame.rsi)));
+            // POSIX: a signal sent to oneself is delivered before the call returns.
+            checkSignalsOnSyscallReturn(frame);
         },
         224 => { // pidfd_send_signal(pidfd, sig, info, flags)
             frame.rax = @bitCast(syscallPidfdSendSignal(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, @truncate(frame.r10)));
@@ -2762,8 +2768,18 @@ fn withTemporaryEpollMask(fd: u32, events: u64, max_events: u32, timeout: i32, m
     const current = sched.currentTask() orelse return -1;
     const saved_mask = current.signal_mask;
     current.signal_mask = epoll_policy.temporaryMask(mask.?);
-    defer current.signal_mask = saved_mask;
-    return epollWaitFd(fd, events, max_events, timeout);
+    const rc = epollWaitFd(fd, events, max_events, timeout);
+    if (rc == -4) {
+        // EINTR: keep the temporary mask until the handler that interrupted
+        // the wait has been delivered on syscall return; signal delivery then
+        // saves `saved_sigmask` into the frame so sigreturn restores it.
+        // Restoring here first re-blocked the signal and the handler never ran.
+        current.saved_sigmask = saved_mask;
+        current.restore_sigmask_pending = true;
+    } else {
+        current.signal_mask = saved_mask;
+    }
+    return rc;
 }
 
 // Module imports for extracted syscall implementations
@@ -3089,10 +3105,20 @@ fn syscallNetPoll(frame: *SyscallFrame) void {
 }
 
 pub fn checkSignalsOnSyscallReturn(frame: *SyscallFrame) void {
-    const sig_mod = @import("../../proc/signal.zig");
     const sched = @import("../../proc/sched.zig");
-
     const current = sched.currentTask() orelse return;
+    deliverSignalOnSyscallReturn(frame, current);
+    // A deferred temporary-mask restore not consumed by a handler frame
+    // (no deliverable signal, ignored, default action) happens now.
+    if (current.restore_sigmask_pending) {
+        current.restore_sigmask_pending = false;
+        current.signal_mask = current.saved_sigmask;
+    }
+}
+
+fn deliverSignalOnSyscallReturn(frame: *SyscallFrame, current: anytype) void {
+    const sig_mod = @import("../../proc/signal.zig");
+
     if (!current.is_user) return;
     if (current.pending_signals == 0) return;
     if (current.pending_signals & ~@as(u32, @truncate(current.signal_mask)) == 0) return;

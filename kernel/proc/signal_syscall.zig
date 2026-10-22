@@ -73,6 +73,14 @@ pub fn sigaction(signum: u32, act_ptr: u64, oldact_ptr: u64) i64 {
         @memset(&old_buf, 0);
         const handler_bytes: [*]const u8 = @ptrCast(&old_handler);
         @memcpy(old_buf[0..8], handler_bytes[0..8]);
+        const old_flags = current.signal_sa_flags[signum - 1];
+        const flag_bytes: [*]const u8 = @ptrCast(&old_flags);
+        @memcpy(old_buf[8..16], flag_bytes[0..8]);
+        // mask@24 is 8 bytes but the legacy-sized buffer is only 28; write
+        // its low 4 bytes (signals 1-32), which is every signal this kernel has.
+        const old_mask = current.signal_sa_masks[signum - 1];
+        const mask_bytes: [*]const u8 = @ptrCast(&old_mask);
+        @memcpy(old_buf[24..28], mask_bytes[0..4]);
         if (copy.copyToUser(@ptrFromInt(oldact_ptr), &old_buf, 28) != 28) return -14;
     }
 
@@ -82,16 +90,20 @@ pub fn sigaction(signum: u32, act_ptr: u64, oldact_ptr: u64) i64 {
         const copied = copy.copyFromUser(&act_buf, @ptrFromInt(act_ptr), 28);
         if (copied != 28) return -14;
         const new_handler: u64 = @bitCast(act_buf[0..8].*);
-        current.signal_handlers[signum - 1] = new_handler;
-
-        // Full Linux struct present → apply the u64 sa_mask from offset 24.
-        if (copy.validateUserBuffer(act_ptr, 152)) {
-            var mask_buf: [8]u8 = undefined;
-            if (copy.copyFromUser(&mask_buf, @ptrFromInt(act_ptr + 24), 8) == 8) {
-                const new_mask: u64 = @bitCast(mask_buf);
-                current.signal_mask = action_policy.sanitizeMask(new_mask);
-            }
+        // Layout (Linux x86_64 / moqi_libc ksigaction): handler@0, flags@8,
+        // restorer@16, mask@24. sa_mask is a PER-HANDLER mask applied only
+        // while that handler runs (signal.pushSignalFrame) — it used to be
+        // written straight into the task mask, permanently blocking those
+        // signals after a single sigaction call.
+        const new_flags: u64 = @bitCast(act_buf[8..16].*);
+        var new_sa_mask: u64 = 0;
+        var mask_buf: [8]u8 = undefined;
+        if (copy.validateUserBuffer(act_ptr, 32) and copy.copyFromUser(&mask_buf, @ptrFromInt(act_ptr + 24), 8) == 8) {
+            new_sa_mask = action_policy.sanitizeMask(@bitCast(mask_buf));
         }
+        current.signal_handlers[signum - 1] = new_handler;
+        current.signal_sa_masks[signum - 1] = new_sa_mask;
+        current.signal_sa_flags[signum - 1] = new_flags;
     }
 
     return 0;
@@ -176,6 +188,26 @@ pub fn sigreturn() ?SigreturnResult {
     if (!sigreturn_policy.userTargetValid(sig_frame.rip) or
         !sigreturn_policy.userTargetValid(sig_frame.rsp)) return null;
     const rflags = sigreturn_policy.sanitizeRflags(sig_frame.rflags);
+    // Restore the interrupted mask (the handler ran with sa_mask | signum
+    // added) and the interrupted x87/SSE state.
+    if (sched.currentTask()) |cur| {
+        cur.signal_mask = @import("signal_delivery_policy.zig").restoredMask(sig_frame.saved_mask);
+    }
+    if (comptime @import("builtin").cpu.arch == .x86_64) {
+        // MXCSR comes from user memory: reserved bits set would make fxrstor
+        // raise #GP in the kernel. Clear them (MXCSR_MASK default 0xFFBF).
+        var fpu: [512]u8 align(16) = sig_frame.fpu;
+        const mxcsr = @as(u32, fpu[24]) | (@as(u32, fpu[25]) << 8) | (@as(u32, fpu[26]) << 16) | (@as(u32, fpu[27]) << 24);
+        const clean = mxcsr & 0xFFBF;
+        fpu[24] = @truncate(clean);
+        fpu[25] = @truncate(clean >> 8);
+        fpu[26] = @truncate(clean >> 16);
+        fpu[27] = @truncate(clean >> 24);
+        asm volatile ("fxrstor (%[buf])"
+            :
+            : [buf] "r" (@as([*]const u8, @ptrCast(&fpu))),
+            : .{ .memory = true });
+    }
     // M8-5b-1: per-CPU exec redirect for the syscall return path
     const pc = syscall_entry.getPerCpu();
     pc.exec_pending = 2;

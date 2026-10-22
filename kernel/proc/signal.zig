@@ -24,17 +24,22 @@ pub const SIGSTOP: u32 = 19;
 pub const SIGTTIN: u32 = 21;
 pub const SIGTTOU: u32 = 22;
 pub const SIGXFSZ: u32 = 25;
+pub const SIGTSTP: u32 = 20;
+pub const SIGURG: u32 = 23;
+pub const SIGWINCH: u32 = 28;
 
 /// Default disposition of a signal when no handler is installed.
 pub const SigDefault = enum { terminate, ignore, stop, cont };
 
-/// POSIX default actions. SIGCHLD is ignored, SIGSTOP/SIGTTIN/SIGTTOU stop
-/// the process, SIGCONT continues it, everything else terminates.
+/// POSIX default actions. SIGCHLD/SIGURG/SIGWINCH are ignored,
+/// SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU stop the process, SIGCONT continues it,
+/// everything else terminates. (SIGTSTP used to terminate, so `kill -TSTP`
+/// killed a process instead of suspending it.)
 pub fn defaultAction(signum: u32) SigDefault {
     return switch (signum) {
-        SIGCHLD => .ignore,
+        SIGCHLD, SIGURG, SIGWINCH => .ignore,
         SIGCONT => .cont,
-        SIGSTOP, SIGTTIN, SIGTTOU => .stop,
+        SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU => .stop,
         else => .terminate,
     };
 }
@@ -63,7 +68,22 @@ pub const SignalFrame = extern struct {
     rflags: u64,
     rsp: u64,
     signum: u64,
+    /// Task mask at the moment the signal interrupted the task; sigreturn
+    /// restores it (the handler ran with sa_mask | signum added).
+    saved_mask: u64,
+    _pad: u64,
+    /// FXSAVE image of the interrupted x87/SSE state (512 bytes, 16-aligned
+    /// within the frame). The handler shares the task's FPU, so without this
+    /// any SSE use in the handler corrupted the interrupted code's xmm
+    /// registers and MXCSR.
+    fpu: [512]u8 align(16),
 };
+
+comptime {
+    // fxsave/fxrstor need a 16-byte-aligned operand: the frame is placed at
+    // handler_rsp + 8 with handler_rsp ≡ 8 (mod 16), i.e. frame ≡ 0 (mod 16).
+    if (@offsetOf(SignalFrame, "fpu") % 16 != 0) @compileError("SignalFrame.fpu must be 16-aligned");
+}
 
 /// Sigreturn trampoline code — copied to user memory at a fixed address.
 /// The SignalFrame sits ABOVE the handler's entry RSP (the handler only ever
@@ -163,7 +183,13 @@ pub fn sendSignalToPgrp(pgid: u16, signum: u32) u32 {
                     stopTask(t);
                 }
             },
-            .cont => continueTask(t),
+            .cont => {
+                // Continue, and queue the bit like the single-target path so
+                // an installed SIGCONT handler actually runs.
+                continueTask(t);
+                _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << @intCast(signum - 1), .seq_cst);
+                kickIfBlocked(@intCast(i));
+            },
             else => {
                 _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << @intCast(signum - 1), .seq_cst);
                 // 致命信号必须能终止已停止的任务：先解除停止态再唤醒。
@@ -370,6 +396,17 @@ pub fn pushSignalFrame(
     frame.rflags = user_rflags;
     frame.rsp = user_rsp;
     frame.signum = signum;
+    // A deferred temporary-mask restore (epoll_pwait/pselect EINTR) means
+    // the mask to resume with is the pre-call mask, not the temporary one.
+    frame.saved_mask = if (t.restore_sigmask_pending) t.saved_sigmask else t.signal_mask;
+    if (comptime @import("builtin").cpu.arch == .x86_64) {
+        // The task is the current one on this CPU and its FPU state is live
+        // in the registers (eager switch-in restore). Snapshot it.
+        asm volatile ("fxsave (%[buf])"
+            :
+            : [buf] "r" (@as([*]u8, @ptrCast(&frame.fpu))),
+            : .{ .memory = true });
+    }
 
     const copy = @import("../mm/copy_from_user.zig");
     const frame_src: [*]const u8 = @ptrCast(&frame);
@@ -384,6 +421,15 @@ pub fn pushSignalFrame(
     if (copy.copyToUser(@ptrFromInt(handler_rsp), ret_src[0..8], 8) != 8) {
         return .{ .new_rsp = 0, .handler = 0 };
     }
+
+    // Commit the handler's mask and one-shot reset only once the frame is
+    // on the user stack (a failed push leaves the task untouched).
+    const dp = @import("signal_delivery_policy.zig");
+    const sa_mask = t.signal_sa_masks[signum - 1];
+    const sa_flags = t.signal_sa_flags[signum - 1];
+    t.signal_mask = dp.handlerMask(t.signal_mask, signum, sa_mask, sa_flags);
+    t.restore_sigmask_pending = false; // now carried by frame.saved_mask
+    t.signal_handlers[signum - 1] = dp.handlerAfterDelivery(handler_addr, sa_flags);
 
     return .{ .new_rsp = handler_rsp, .handler = handler_addr };
 }

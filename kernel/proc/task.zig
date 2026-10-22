@@ -114,8 +114,12 @@ pub const Task = struct {
     entry: ?TaskFunc,
     /// Whether this task has ever been scheduled.
     started: bool,
-    /// Exit code (valid when state == .zombie).
+    /// Exit code (valid when state == .zombie). Internal form: the exit()
+    /// status, or 128 + sig for a signal/fault death.
     exit_code: i32,
+    /// True when the task left through the exit()/_exit() syscall, which
+    /// lets waitpid tell exit(137) from a SIGKILL (wait_status_policy).
+    exited_via_syscall: bool = false,
 
     // --- User-space fields (M5) ---
     /// Physical address of the process's PML4 page table (0 for kernel threads).
@@ -212,6 +216,17 @@ pub const Task = struct {
     /// Signal handler addresses. 0 = default (terminate for now).
     /// Index 0 = signal 1 (SIGHUP), ..., index 30 = signal 31 (SIGUSR2).
     signal_handlers: [31]u64,
+    /// Per-signal sa_mask: added to the task mask while that handler runs
+    /// (signal_frame saves and sigreturn restores the previous mask).
+    signal_sa_masks: [31]u64 = @splat(0),
+    /// Per-signal sa_flags (SA_NODEFER, SA_RESETHAND honoured at delivery).
+    signal_sa_flags: [31]u64 = @splat(0),
+    /// pselect/epoll_pwait/sigsuspend semantics (Linux TIF_RESTORE_SIGMASK):
+    /// when a call that installed a temporary mask is interrupted, the
+    /// original mask is restored only after the signal handler that caused
+    /// the EINTR has been delivered. `restore_sigmask_pending` arms that.
+    saved_sigmask: u64 = 0,
+    restore_sigmask_pending: bool = false,
 
     /// Alternate signal stack base address (0 = not set, use user RSP).
     sigaltstack_base: u64,
@@ -1755,8 +1770,10 @@ pub fn waitpidScanLocked(parent_idx: u32, pid: i32, status: *i32) WaitScan {
             .detach => {},
         }
 
-        // Found a quiesced zombie child — collect its exit code and reap it.
-        status.* = t.exit_code;
+        // Found a quiesced zombie child — collect its exit status (Linux
+        // wait-status encoding) and reap it.
+        const wsp = @import("wait_status_policy.zig");
+        status.* = wsp.encode(wsp.fromInternal(t.exit_code, t.exited_via_syscall));
         const child_tid = t.tid;
         if (reaper.isActive()) {
             detachLocked(i, t, parent_idx);

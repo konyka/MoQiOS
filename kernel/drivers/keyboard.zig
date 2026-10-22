@@ -153,16 +153,15 @@ pub fn handleInterrupt() void {
             ch = ch - 'a' + 1; // Ctrl+A = 0x01, etc.
         }
 
-        // Ctrl+C (0x03): send SIGINT to all user tasks and push char to buffer
+        // Ctrl+C (0x03): SIGINT goes to the terminal's foreground process
+        // group only (POSIX job control). Broadcasting it to every user task
+        // used to kill init, which installs no SIGINT handler, along with
+        // background jobs and other sessions.
         if (ch == 0x03) {
             const signal = @import("../proc/signal.zig");
-            const task_mod = @import("../proc/task.zig");
-
-            for (0..task_mod.MAX_TASKS) |i| {
-                const t = task_mod.getTask(@intCast(i)) orelse continue;
-                if (!t.is_user or t.state == .zombie) continue;
-                _ = signal.sendSignal(t.tid, signal.SIGINT);
-            }
+            const jobctl = @import("../proc/jobctl.zig");
+            const fg = jobctl.foreground_pgid;
+            if (fg != 0) _ = signal.sendSignalToPgrp(fg, signal.SIGINT);
 
             push(ch);
             extended = false;

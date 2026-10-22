@@ -690,6 +690,15 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
         if (sched_mod.currentTaskIndex()) |idx| {
             if (task_mod.getTask(idx)) |cur| {
                 if (cur.is_user) {
+                    // A synchronous fault cannot be deferred: returning to the
+                    // faulting instruction re-faults forever. If SIGSEGV is
+                    // blocked or ignored, Linux force-kills (force_sig): reset
+                    // it to SIG_DFL and unblock it before delivery.
+                    const segv_bit = @as(u64, 1) << (sig_mod.SIGSEGV - 1);
+                    if (cur.signal_handlers[sig_mod.SIGSEGV - 1] == 1 or (cur.signal_mask & segv_bit) != 0) {
+                        cur.signal_handlers[sig_mod.SIGSEGV - 1] = 0;
+                        cur.signal_mask &= ~segv_bit;
+                    }
                     _ = sig_mod.sendSignal(cur.tid, sig_mod.SIGSEGV);
                     if (sched_mod.deliverSignalToRunningTask(cur, frame)) {
                         return;

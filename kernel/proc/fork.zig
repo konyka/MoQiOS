@@ -91,6 +91,8 @@ pub fn fork(frame: *SyscallFrame) i64 {
 
     for (0..31) |i| {
         child.signal_handlers[i] = parent.signal_handlers[i];
+        child.signal_sa_masks[i] = parent.signal_sa_masks[i];
+        child.signal_sa_flags[i] = parent.signal_sa_flags[i];
     }
     child.signal_mask = parent.signal_mask;
     child.env_count = parent.env_count;
