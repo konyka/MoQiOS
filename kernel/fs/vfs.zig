@@ -1336,7 +1336,9 @@ pub const FdTable = struct {
                 const gate = fsizeGate(desc.offset, count);
                 if (gate < 0) return gate;
                 // Use writeback for delayed write coalescing
-                return bufferedWrite(desc, desc.ext2_file_idx, buf, @intCast(gate), .ext2);
+                const n = bufferedWrite(desc, desc.ext2_file_idx, buf, @intCast(gate), .ext2);
+                if (n > 0) @import("ext2.zig").touchModified(desc.ext2_file_idx);
+                return n;
             },
             .tcp_socket => return -1, // TCP sockets use sendto/recvfrom syscalls
             .udp_socket => return -1, // UDP sockets use sendto/recvfrom syscalls
@@ -1507,7 +1509,9 @@ pub const FdTable = struct {
                 if (!desc.writable) return -9; // EBADF
                 const gate = fsizeGate(offset, count);
                 if (gate < 0) return gate;
-                return bufferedWriteAt(desc, desc.ext2_file_idx, buf, @intCast(gate), offset, .ext2);
+                const n = bufferedWriteAt(desc, desc.ext2_file_idx, buf, @intCast(gate), offset, .ext2);
+                if (n > 0) @import("ext2.zig").touchModified(desc.ext2_file_idx);
+                return n;
             },
             .tmpfs_file => {
                 if (!desc.writable) return -9; // EBADF

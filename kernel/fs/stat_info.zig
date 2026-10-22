@@ -14,6 +14,11 @@ pub const StatInfo = struct {
     gid: u32 = 0,
     nlink: u32 = 0,
     size: u64 = 0,
+    /// 512-byte sectors allocated (ext2 i_blocks already counts in 512 B).
+    blocks: u64 = 0,
+    atime: u64 = 0,
+    mtime: u64 = 0,
+    ctime: u64 = 0,
 };
 
 /// Raw ext2 inode fields needed for stat (base inode + osd2/dir_acl high
@@ -27,6 +32,10 @@ pub const Ext2Raw = struct {
     links_count: u16,
     size_lo: u32,
     size_hi: u32,
+    blocks: u32 = 0,
+    atime: u32 = 0,
+    mtime: u32 = 0,
+    ctime: u32 = 0,
 };
 
 /// ext2 i_mode already uses the POSIX S_IF* encoding; keep type + permission
@@ -56,5 +65,9 @@ pub fn fromExt2(inode_num: u32, raw: Ext2Raw) StatInfo {
         .gid = ext2Id(raw.gid_lo, raw.gid_hi),
         .nlink = raw.links_count,
         .size = ext2Size(raw.mode, raw.size_lo, raw.size_hi),
+        .blocks = raw.blocks,
+        .atime = raw.atime,
+        .mtime = raw.mtime,
+        .ctime = raw.ctime,
     };
 }

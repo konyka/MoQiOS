@@ -45,3 +45,24 @@ test "fromExt2 uses the real inode number and link count" {
     try std.testing.expectEqual(@as(u32, 3), s.nlink);
     try std.testing.expectEqual(@as(u64, 5000), s.size);
 }
+
+test "fromExt2 carries blocks and timestamps" {
+    const s = p.fromExt2(5, .{
+        .mode = 0o100644,
+        .uid_lo = 0,
+        .uid_hi = 0,
+        .gid_lo = 0,
+        .gid_hi = 0,
+        .links_count = 1,
+        .size_lo = 5000,
+        .size_hi = 0,
+        .blocks = 16,
+        .atime = 100,
+        .mtime = 200,
+        .ctime = 300,
+    });
+    try std.testing.expectEqual(@as(u64, 16), s.blocks);
+    try std.testing.expectEqual(@as(u64, 100), s.atime);
+    try std.testing.expectEqual(@as(u64, 200), s.mtime);
+    try std.testing.expectEqual(@as(u64, 300), s.ctime);
+}

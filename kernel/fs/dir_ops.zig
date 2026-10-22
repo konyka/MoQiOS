@@ -66,6 +66,11 @@ pub fn fstat(fd: u64, stat_ptr: u64) i64 {
             bo.writeU32Le(stat_buf[28..32], info.uid);
             bo.writeU32Le(stat_buf[32..36], info.gid);
             bo.writeU64Le(stat_buf[48..56], @max(info.size, fdesc.file_size));
+            bo.writeU64Le(stat_buf[56..64], 4096); // st_blksize
+            bo.writeU64Le(stat_buf[64..72], info.blocks);
+            bo.writeU64Le(stat_buf[72..80], info.atime);
+            bo.writeU64Le(stat_buf[88..96], info.mtime);
+            bo.writeU64Le(stat_buf[104..112], info.ctime);
         }
     }
 

@@ -1359,6 +1359,7 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
     if (new_size >= f.inode.size) {
         // Growing: just update size (blocks will be allocated on write)
         f.inode.size = new_size;
+        stampModified(&f.inode);
         _ = writeInode(f.inode_num, &f.inode);
         return true;
     }
@@ -1419,6 +1420,7 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
 
     f.inode.size = new_size;
     f.inode.blocks = new_blocks_needed * (block_size / 512);
+    stampModified(&f.inode);
     if (!writeInode(f.inode_num, &f.inode)) return false; // v53.4: check writeInode result
     return true;
 }
@@ -1437,6 +1439,7 @@ pub fn truncateByInode(inode_num: u32, new_size: u32) bool {
     if (new_size >= inode.size) {
         // Growing: just update size (blocks allocated on write)
         inode.size = new_size;
+        stampModified(&inode);
         if (!writeInode(inode_num, &inode)) return false; // v53.4: check writeInode result
         return true;
     }
@@ -1494,6 +1497,7 @@ pub fn truncateByInode(inode_num: u32, new_size: u32) bool {
 
     inode.size = new_size;
     inode.blocks = new_blocks_needed * (block_size / 512);
+    stampModified(&inode);
     if (!writeInode(inode_num, &inode)) return false; // v53.4: check writeInode result
     return true;
 }
@@ -1937,6 +1941,7 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
     const new_end = offset + written;
     if (new_end > f.inode.size) {
         f.inode.size = new_end;
+        stampModified(&f.inode);
         if (!writeInode(f.inode_num, &f.inode)) return -1;
     }
 
@@ -2150,6 +2155,8 @@ pub fn createFile(name: []const u8) i64 {
     new_inode.blocks = 0;
     new_inode.size = 0;
     new_inode.block = @splat(0);
+    stampModified(&new_inode);
+    new_inode.atime = new_inode.mtime;
 
     if (!writeInode(new_inode_num, &new_inode)) {
         freeInode(new_inode_num);
@@ -3678,6 +3685,41 @@ pub fn buildCombinedPath(buf: []u8, dir_path: []const u8, rel_path: []const u8) 
 /// Fill `out` from the authoritative on-disk inode behind open slot
 /// `file_idx`. Returns false (leaving `out` untouched) if the slot is free
 /// or the inode cannot be read.
+/// Wall-clock seconds for inode timestamps (0 before the RTC offset is set).
+fn nowSeconds() u32 {
+    if (comptime @import("builtin").cpu.arch != .x86_64) return 0;
+    return @truncate(@import("../proc/time_syscall.zig").wallClockNanos() / 1_000_000_000);
+}
+
+/// Content change: mtime and ctime advance together (POSIX).
+fn stampModified(inode: *Ext2Inode) void {
+    const t = nowSeconds();
+    inode.mtime = t;
+    inode.ctime = t;
+}
+
+/// write() through the writeback cache: the data reaches the inode only
+/// at flush time, but POSIX requires mtime/ctime to change when write()
+/// returns. Stamp the slot's inode now.
+pub fn touchModified(file_idx: u32) void {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active or file_idx >= open_count) return;
+    const f = &open_files[file_idx];
+    if (f.inode_num == 0) return;
+    const t = nowSeconds();
+    if (f.inode.mtime == t and f.inode.ctime == t) return;
+    // Only the timestamps change: the on-disk copy stays authoritative for
+    // every other field (the slot's copy may lag another slot's writes).
+    var disk_inode: Ext2Inode = undefined;
+    if (!readInode(f.inode_num, &disk_inode)) return;
+    disk_inode.mtime = t;
+    disk_inode.ctime = t;
+    if (!writeInode(f.inode_num, &disk_inode)) return;
+    f.inode.mtime = t;
+    f.inode.ctime = t;
+}
+
 pub fn statInode(file_idx: u32, out: *@import("stat_info.zig").StatInfo) bool {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
@@ -3695,6 +3737,10 @@ pub fn statInode(file_idx: u32, out: *@import("stat_info.zig").StatInfo) bool {
         .links_count = inode.links_count,
         .size_lo = inode.size,
         .size_hi = inode.dir_acl,
+        .blocks = inode.blocks,
+        .atime = inode.atime,
+        .mtime = inode.mtime,
+        .ctime = inode.ctime,
     });
     return true;
 }
