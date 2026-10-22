@@ -188,18 +188,34 @@ fn isNoFreePage(task: *task_mod.Task, virt: u64) bool {
 /// Whether adding a disjoint range can be represented without dropping metadata.
 /// `anonymous` because only anonymous regions merge with neighbours (G2):
 /// a file region always needs a free slot of its own.
-fn canTrackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, anonymous: bool) bool {
+///
+/// Must accept exactly the merges trackMmapRegion performs: approving a
+/// "merge" that trackMmapRegion then refuses (different prot/sharing, huge
+/// or no_free neighbour) reached its `unreachable` with a full table.
+fn canTrackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, anonymous: bool, prot: u8, shared: bool) bool {
     if (task.mmap_count < task.mmap_regions.len) return true;
+    if (!anonymous) return false;
     var bits = task.mmap_active_bm;
     while (bits != 0) {
         const i: u6 = @truncate(@ctz(bits));
         bits &= bits - 1;
-        const r = task.mmap_regions[i];
-        if (anonymous and r.file_kind == 0 and
-            (r.base + r.num_pages * user_space.PAGE_SIZE == base or
-                base + num_pages * user_space.PAGE_SIZE == r.base)) return true;
+        if (anonMergeSide(&task.mmap_regions[i], base, num_pages, prot, shared) != .none) return true;
     }
     return false;
+}
+
+const MergeSide = enum { none, after, before };
+
+/// Whether an anonymous, non-huge range [base, +num_pages) merges into `r`.
+fn anonMergeSide(r: *const task_mod.MmapRegion, base: u64, num_pages: u64, prot: u8, shared: bool) MergeSide {
+    // L1: never merge into a no_free region — the neighbour's frames would
+    // inherit the no-free accounting (or vice versa). Prot/sharing must
+    // match: the region records one prot for the whole range.
+    if (!r.active or r.huge_pages != 0 or r.no_free or !filemap.canMergeAnon(r.file_kind, 0)) return .none;
+    if (r.prot != prot or r.shared != shared) return .none;
+    if (r.base + r.num_pages * user_space.PAGE_SIZE == base) return .after;
+    if (base + num_pages * user_space.PAGE_SIZE == r.base) return .before;
+    return .none;
 }
 
 /// Check the metadata capacity for MAP_FIXED before destroying old mappings.
@@ -261,26 +277,20 @@ fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, meta: ?Regio
     // charge the data ledger, independent of RLIMIT_AS.
     const writable_private = (prot & 2) != 0 and !shared;
     if (writable_private) task.data_used += num_pages * user_space.PAGE_SIZE;
-    const new_kind: u8 = if (meta) |m| @intFromEnum(m.kind) else 0;
     // Try to merge with an adjacent existing region (anonymous only)
     if (meta == null and huge_pages == 0) {
         for (&task.mmap_regions) |*r| {
-            // L1: never merge into a no_free region — a merge would make the
-            // anonymous neighbour's frames inherit the no-free accounting
-            // (or vice versa) and corrupt PMM ownership.
-            if (!r.active or r.huge_pages != 0 or r.no_free or !filemap.canMergeAnon(r.file_kind, new_kind)) continue;
-            // Only merge when the protection and sharing match: a merge with
-            // a different prot would make the RLIMIT_DATA refund imprecise
-            // (the region records one prot for the whole range).
-            if (r.prot != prot or r.shared != shared) continue;
-            if (r.base + r.num_pages * 4096 == base) {
-                r.num_pages += num_pages;
-                return;
-            }
-            if (base + num_pages * 4096 == r.base) {
-                r.base = base;
-                r.num_pages += num_pages;
-                return;
+            switch (anonMergeSide(r, base, num_pages, prot, shared)) {
+                .none => continue,
+                .after => {
+                    r.num_pages += num_pages;
+                    return;
+                },
+                .before => {
+                    r.base = base;
+                    r.num_pages += num_pages;
+                    return;
+                },
             }
         }
     }
@@ -500,7 +510,7 @@ pub fn findFreeRangePub(task: *task_mod.Task, num_pages: u64) ?u64 {
 
 /// True when a non-mergeable region of `num_pages` still fits the table.
 pub fn canTrackRegionPub(task: *task_mod.Task, base: u64, num_pages: u64) bool {
-    return canTrackMmapRegion(task, base, num_pages, false);
+    return canTrackMmapRegion(task, base, num_pages, false, 0, false);
 }
 
 /// Track an already-mapped range as a no_free region (see MmapRegion.no_free).
@@ -1018,7 +1028,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     const huge_attempt = meta == null and prot != 0 and huge_on and
         huge_user.eligible(base, num_pages);
 
-    if (!is_fixed and !canTrackMmapRegion(cur, base, num_pages, meta == null and !huge_attempt)) return -12;
+    if (!is_fixed and !canTrackMmapRegion(cur, base, num_pages, meta == null and !huge_attempt, @intCast(prot & 7), shared)) return -12;
 
     var huge_count: u32 = 0;
     if (meta == null) {

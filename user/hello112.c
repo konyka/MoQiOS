@@ -12,6 +12,8 @@
 ///      a page still past EOF raises SIGBUS.
 ///   G. mincore reports real residency; msync rejects bad flags.
 ///   H. brk does not grow across a not-yet-faulted file mapping.
+///   I. with the region table full, an adjacent mapping whose prot differs
+///      (so it cannot merge) fails with ENOMEM instead of panicking.
 
 #include <stdint.h>
 
@@ -249,6 +251,33 @@ void _start(void) {
     }
     syscall1(SYS_CLOSE, (uint64_t)hfd);
     syscall1(SYS_UNLINK, (uint64_t)hpath);
+
+    /* I. full region table + adjacent non-mergeable mapping */
+    {
+        static int64_t maps[80];
+        static uint64_t prots[80];
+        int n = 0;
+        uint64_t base = 0x300000000ULL;
+        while (n < 80) {
+            uint64_t prot = (n & 1) ? 1 : 3;
+            int64_t r = syscall6(SYS_MMAP, base + (uint64_t)n * 4096, 4096, prot, 0x22 | 0x10, (uint64_t)-1, 0);
+            if (r < 0) break;
+            maps[n] = r;
+            prots[n] = prot;
+            n++;
+        }
+        check(n > 0 && n < 80, "I: region table fills up");
+        if (n > 0) {
+            uint64_t other = prots[n - 1] == 3 ? 1 : 3;
+            int64_t r = syscall6(SYS_MMAP, base + (uint64_t)n * 4096, 4096, other, 0x22, (uint64_t)-1, 0);
+            check(r == -ENOMEM, "I: unmergeable adjacent hint is ENOMEM (no panic)");
+            if (r > 0) syscall2(SYS_MUNMAP, (uint64_t)r, 4096);
+            int64_t same = syscall6(SYS_MMAP, base + (uint64_t)n * 4096, 4096, prots[n - 1], 0x22, (uint64_t)-1, 0);
+            check(same == (int64_t)(base + (uint64_t)n * 4096), "I: mergeable adjacent hint still succeeds");
+            if (same > 0) syscall2(SYS_MUNMAP, (uint64_t)same, 4096);
+        }
+        for (int i = 0; i < n; i++) syscall2(SYS_MUNMAP, (uint64_t)maps[i], 4096);
+    }
 
     print(failures == 0 ? "hello112: PASS\n" : "hello112: FAIL\n");
     print("hello112 done\n");
