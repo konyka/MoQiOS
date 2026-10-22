@@ -10,6 +10,7 @@
 ///   - No directory support
 ///   - No seeking (sequential read only)
 ///   - Single-process focused (FD table per task)
+const std = @import("std");
 const ramdisk = @import("ramdisk.zig");
 const serial = @import("../arch/arch.zig").serial;
 const readahead = @import("readahead.zig");
@@ -1812,6 +1813,54 @@ pub const MAX_FD_TABLES: u32 = 64;
 var fd_table_pool: [MAX_FD_TABLES]FdTable = undefined;
 var fd_table_used: u64 = 0;
 
+// Cross-process access (epoll probing another task's table) needs to know a
+// table is still the same allocation and keep it from being reinitialised
+// mid-access. These live OUTSIDE FdTable on purpose: initInto memcpys the
+// whole struct, which would race any counter kept inside it.
+//   ready bit — set after initInto, cleared first in freeFdTable
+//   generation — bumped in freeFdTable; a pin names the generation it saw
+//   pins — freeFdTable waits for 0 before the slot can be reallocated
+var fd_table_ready: u64 = 0;
+var fd_table_gen: [MAX_FD_TABLES]u64 = @splat(1);
+var fd_table_pins: [MAX_FD_TABLES]u32 = @splat(0);
+
+fn tableSlot(table: *const FdTable) usize {
+    return (@intFromPtr(table) - @intFromPtr(&fd_table_pool)) / @sizeOf(FdTable);
+}
+
+/// Allocation generation of a live table (stable for its whole lifetime).
+pub fn tableGeneration(table: *const FdTable) u64 {
+    return @atomicLoad(u64, &fd_table_gen[tableSlot(table)], .seq_cst);
+}
+
+/// Pin `table` if it is still the allocation identified by `gen`. A pinned
+/// table is not freed or reinitialised until unpinFdTable. Non-blocking, so
+/// it may be called under spinlocks.
+pub fn pinFdTable(table: *FdTable, gen: u64) bool {
+    const slot = tableSlot(table);
+    _ = @atomicRmw(u32, &fd_table_pins[slot], .Add, 1, .seq_cst);
+    const ready = @atomicLoad(u64, &fd_table_ready, .seq_cst) & (@as(u64, 1) << @intCast(slot)) != 0;
+    if (ready and @atomicLoad(u64, &fd_table_gen[slot], .seq_cst) == gen) return true;
+    _ = @atomicRmw(u32, &fd_table_pins[slot], .Sub, 1, .seq_cst);
+    return false;
+}
+
+pub fn unpinFdTable(table: *FdTable) void {
+    _ = @atomicRmw(u32, &fd_table_pins[tableSlot(table)], .Sub, 1, .seq_cst);
+}
+
+pub const PinnedTable = struct { table: *FdTable, gen: u64 };
+
+/// Pin the live table in pool slot `slot`, if any (for cross-table scans).
+pub fn pinLiveTableSlot(slot: u32) ?PinnedTable {
+    if (slot >= MAX_FD_TABLES) return null;
+    if (@atomicLoad(u64, &fd_table_ready, .seq_cst) & (@as(u64, 1) << @intCast(slot)) == 0) return null;
+    const table = &fd_table_pool[slot];
+    const gen = @atomicLoad(u64, &fd_table_gen[slot], .seq_cst);
+    if (!pinFdTable(table, gen)) return null;
+    return .{ .table = table, .gen = gen };
+}
+
 /// Allocate an initialized FdTable from the pool with refs == 1.
 /// Returns null when the pool is exhausted (OOM — treat like a task-slot
 /// failure at the call site).
@@ -1826,6 +1875,7 @@ pub fn allocFdTable() ?*FdTable {
         const table = &fd_table_pool[slot];
         FdTable.initInto(table);
         table.refs = 1;
+        _ = @atomicRmw(u64, &fd_table_ready, .Or, bit, .seq_cst);
         return table;
     }
 }
@@ -1847,8 +1897,14 @@ pub fn releaseFdTable(table: *FdTable) bool {
 /// Return a table to the pool. Call only after releaseFdTable reported the
 /// last reference and all fds have been closed.
 pub fn freeFdTable(table: *FdTable) void {
-    const slot = (@intFromPtr(table) - @intFromPtr(&fd_table_pool)) / @sizeOf(FdTable);
-    _ = @atomicRmw(u64, &fd_table_used, .And, ~(@as(u64, 1) << @intCast(slot)), .acq_rel);
+    const slot = tableSlot(table);
+    const bit = @as(u64, 1) << @intCast(slot);
+    // Retire this allocation for cross-table users before the slot can be
+    // reused: new pins fail on the generation, existing pins are drained.
+    _ = @atomicRmw(u64, &fd_table_ready, .And, ~bit, .seq_cst);
+    _ = @atomicRmw(u64, &fd_table_gen[slot], .Add, 1, .seq_cst);
+    while (@atomicLoad(u32, &fd_table_pins[slot], .seq_cst) != 0) std.atomic.spinLoopHint();
+    _ = @atomicRmw(u64, &fd_table_used, .And, ~bit, .acq_rel);
 }
 
 /// v53.44 fix: fork/clone used to copy fd tables without refcounting shared

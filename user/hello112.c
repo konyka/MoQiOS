@@ -14,6 +14,8 @@
 ///   H. brk does not grow across a not-yet-faulted file mapping.
 ///   I. with the region table full, an adjacent mapping whose prot differs
 ///      (so it cannot merge) fails with ENOMEM instead of panicking.
+///   J. an epoll registration survives the registering process closing its
+///      fd while a fork child still holds the same pipe end.
 
 #include <stdint.h>
 
@@ -43,6 +45,14 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
     return ret;
 }
 
+static inline int64_t syscall4_(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
+    int64_t ret;
+    register uint64_t rdx __asm__("rdx") = a3;
+    register uint64_t r10 __asm__("r10") = a4;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx), "r"(r10) : "rcx", "r11", "memory");
+    return ret;
+}
+
 #define SYS_WRITE       1
 #define SYS_EXIT        2
 #define SYS_WAITPID     6
@@ -58,6 +68,11 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_MPROTECT    164
 #define SYS_MUNMAP      12
 #define SYS_MINCORE     27
+#define SYS_PIPE        22
+#define SYS_EPOLL_CREATE1 146
+#define SYS_EPOLL_CTL   147
+#define SYS_EPOLL_WAIT  148
+#define SYS_NANOSLEEP   35
 #define SYS_MSYNC       26
 #define EACCES 13
 
@@ -277,6 +292,33 @@ void _start(void) {
             if (same > 0) syscall2(SYS_MUNMAP, (uint64_t)same, 4096);
         }
         for (int i = 0; i < n; i++) syscall2(SYS_MUNMAP, (uint64_t)maps[i], 4096);
+    }
+
+    /* J. epoll registration vs fork + close of the registering copy */
+    {
+        int32_t pfd[2] = { -1, -1 };
+        int64_t ep = syscall1(SYS_EPOLL_CREATE1, 0);
+        check(syscall1(SYS_PIPE, (uint64_t)pfd) == 0 && ep >= 0, "J: pipe + epoll_create1");
+        struct { uint32_t events; uint64_t data; } ev = { 1 /* EPOLLIN */, 77 }, out = { 0, 0 };
+        check(syscall4_(SYS_EPOLL_CTL, (uint64_t)ep, 1 /* ADD */, (uint64_t)pfd[0], (uint64_t)&ev) == 0, "J: register pipe read end");
+        int64_t c = syscall1(SYS_FORK, 0);
+        if (c == 0) {
+            /* child keeps pfd[0]; wait until the parent closed its copy */
+            int64_t ts[2] = { 0, 100 * 1000000 };
+            syscall2(SYS_NANOSLEEP, (uint64_t)ts, 0);
+            int64_t n = syscall4_(SYS_EPOLL_WAIT, (uint64_t)ep, (uint64_t)&out, 1, 2000);
+            syscall1(SYS_EXIT, (n == 1 && out.data == 77) ? 0 : 1);
+            for (;;) {}
+        }
+        syscall1(SYS_CLOSE, (uint64_t)pfd[0]);
+        int64_t ts2[2] = { 0, 200 * 1000000 };
+        syscall2(SYS_NANOSLEEP, (uint64_t)ts2, 0);
+        syscall3(SYS_WRITE, (uint64_t)pfd[1], (uint64_t)"x", 1);
+        int32_t jst = 0;
+        syscall3(SYS_WAITPID, (uint64_t)c, (uint64_t)&jst, 0);
+        check((jst & 0x7f) == 0 && ((jst >> 8) & 0xff) == 0, "J: child sees EPOLLIN after the parent closed its copy");
+        syscall1(SYS_CLOSE, (uint64_t)pfd[1]);
+        syscall1(SYS_CLOSE, (uint64_t)ep);
     }
 
     print(failures == 0 ? "hello112: PASS\n" : "hello112: FAIL\n");

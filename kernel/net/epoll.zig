@@ -78,7 +78,11 @@ const WaitNode = struct {
 /// resource is still open (see invalidateFdRegistrations).
 pub const EpollItem = struct {
     fd: i32 = -1,
+    /// Table the probe fd lives in, and that table's allocation generation
+    /// (vfs.tableGeneration). After fork the probe may move to the child's
+    /// table when the registering process closes its copy.
     fd_table: ?*vfs.FdTable = null,
+    fd_table_gen: u64 = 0,
     fd_generation: u64 = 0,
     probe_fd: i32 = -1,
     probe_generation: u64 = 0,
@@ -274,6 +278,7 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
             inst.items[s] = .{
                 .fd = fd,
                 .fd_table = cur.fd_table,
+                .fd_table_gen = vfs.tableGeneration(cur.fd_table),
                 .fd_generation = identity.generation,
                 .probe_fd = fd,
                 .probe_generation = identity.generation,
@@ -451,6 +456,7 @@ pub fn invalidateFdRegistrations(fd_table: *vfs.FdTable, fd: u32, generation: u6
     defer pool_lock.release(psaved);
     var dup: ?SurvivingFd = null;
     var dup_looked_up = false;
+    const table_gen = vfs.tableGeneration(fd_table);
     var ebm = valid_epoll_bm;
     while (ebm != 0) {
         const ei = @ctz(ebm);
@@ -464,7 +470,8 @@ pub fn invalidateFdRegistrations(fd_table: *vfs.FdTable, fd: u32, generation: u6
                 bits &= bits - 1;
                 const slot: u8 = @intCast(w * 64 + @as(u32, bit));
                 const item = &inst.items[slot];
-                if (item.in_use and item.fd_table == fd_table and item.probe_fd == @as(i32, @intCast(fd)) and
+                if (item.in_use and item.fd_table == fd_table and item.fd_table_gen == table_gen and
+                    item.probe_fd == @as(i32, @intCast(fd)) and
                     item.probe_generation == generation)
                 {
                     // Every item probed through this incarnation names the
@@ -474,6 +481,8 @@ pub fn invalidateFdRegistrations(fd_table: *vfs.FdTable, fd: u32, generation: u6
                         dup_looked_up = true;
                     }
                     if (dup) |copy| {
+                        item.fd_table = copy.table;
+                        item.fd_table_gen = copy.table_gen;
                         item.probe_fd = @intCast(copy.fd);
                         item.probe_generation = copy.generation;
                         continue;
@@ -490,22 +499,51 @@ pub fn invalidateFdRegistrations(fd_table: *vfs.FdTable, fd: u32, generation: u6
 }
 
 const SurvivingFd = struct {
+    table: *vfs.FdTable,
+    table_gen: u64,
     fd: u32,
     generation: u64,
 };
 
-/// Another LIVE fd of `fd_table` naming the same open resource as the
-/// closing `fd`. Only LIVE slots qualify: a CLOSING/CLEANING copy runs its
-/// own invalidation after this one (it needs pool_lock), and while a copy
-/// is LIVE its resource cannot be torn down, so the key cannot be stale.
+/// Another LIVE fd naming the same open resource as the closing `fd`:
+/// first in the same table (dup/dup2), then in any other live table (a
+/// fork copy — Linux keeps the registration until the last reference to
+/// the open file closes). Only LIVE slots qualify: a CLOSING/CLEANING copy
+/// runs its own invalidation after this one (it needs pool_lock), and while
+/// a copy is LIVE its resource cannot be torn down, so the key is not stale.
+/// A table is pinned only while it is scanned; a migrated item re-validates
+/// the table generation on every later use.
 fn survivingDuplicate(fd_table: *vfs.FdTable, fd: u32, fd_type: vfs.FdType, key: ?u64) ?SurvivingFd {
     const want = key orelse return null;
+    if (scanTableFor(fd_table, vfs.tableGeneration(fd_table), fd, fd_type, want)) |hit| return hit;
+    if (!crossProcessKey(fd_type)) return null;
+    for (0..vfs.MAX_FD_TABLES) |slot| {
+        const pinned = vfs.pinLiveTableSlot(@intCast(slot)) orelse continue;
+        defer vfs.unpinFdTable(pinned.table);
+        if (pinned.table == fd_table) continue;
+        if (scanTableFor(pinned.table, pinned.gen, null, fd_type, want)) |hit| return hit;
+    }
+    return null;
+}
+
+/// Types whose resource index names one open object shared only by
+/// inheritance (fork/dup), never by independent opens. File slots can be
+/// shared by unrelated opens of the same file, so a registration must not
+/// migrate into another process through them.
+fn crossProcessKey(fd_type: vfs.FdType) bool {
+    return switch (fd_type) {
+        .pipe_read, .pipe_write, .tcp_socket, .udp_socket, .epoll, .unix_socket, .timerfd, .eventfd, .devfs_ctrl => true,
+        else => false,
+    };
+}
+
+fn scanTableFor(table: *vfs.FdTable, table_gen: u64, skip_fd: ?u32, fd_type: vfs.FdType, want: u64) ?SurvivingFd {
     for (0..vfs.MAX_FDS) |i| {
-        if (i == fd) continue;
-        const identity = fd_table.snapshotFdIdentity(@intCast(i)) orelse continue;
+        if (skip_fd != null and i == skip_fd.?) continue;
+        const identity = table.snapshotFdIdentity(@intCast(i)) orelse continue;
         if (identity.desc.fd_type != fd_type) continue;
         if (resourceKeyFromDesc(&identity.desc) != want) continue;
-        return .{ .fd = @intCast(i), .generation = identity.generation };
+        return .{ .table = table, .table_gen = table_gen, .fd = @intCast(i), .generation = identity.generation };
     }
     return null;
 }
@@ -840,11 +878,13 @@ fn removeFromReadyListSlot(inst: *EpollInstance, slot: u8) void {
     }
 }
 
-fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent, max_out: u32) u32 {
+fn collectEvents(inst: *EpollInstance, waiter_table: *vfs.FdTable, out: []EpollEvent, max_out: u32) u32 {
     const saved = inst.spin.acquire();
 
     const ReadySnapshot = struct {
         slot: u8,
+        table: ?*vfs.FdTable,
+        table_gen: u64,
         fd: i32,
         fd_generation: u64,
         probe_fd: i32,
@@ -887,6 +927,8 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
 
         snapshots[snapshot_count] = .{
             .slot = idx,
+            .table = item.fd_table,
+            .table_gen = item.fd_table_gen,
             .fd = item.fd,
             .fd_generation = item.fd_generation,
             .probe_fd = item.probe_fd,
@@ -910,6 +952,13 @@ fn collectEvents(inst: *EpollInstance, fd_table: *vfs.FdTable, out: []EpollEvent
     // Readiness probes may acquire another epoll instance. Do them without
     // holding the parent spinlock, preserving pool_lock -> inst.spin order.
     for (snapshots[0..snapshot_count]) |snapshot| {
+        // Probe through the table the registration lives in (the caller's
+        // own for an ordinary registration, a fork child's after migration),
+        // pinned so it cannot be freed and reused during the probe.
+        const fd_table = snapshot.table orelse waiter_table;
+        const pinned = fd_table != waiter_table;
+        if (pinned and !vfs.pinFdTable(fd_table, snapshot.table_gen)) continue;
+        defer if (pinned) vfs.unpinFdTable(fd_table);
         if (snapshot.probe_fd < 0 or !fd_table.acquireTransferFd(@intCast(snapshot.probe_fd))) continue;
         const target_identity = fd_table.snapshotFdIdentity(@intCast(snapshot.probe_fd));
         if (target_identity == null or target_identity.?.generation != snapshot.probe_generation or
