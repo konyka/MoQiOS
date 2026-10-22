@@ -88,7 +88,7 @@ void _start(void) {
     check(syscall2(SYS_KILL, (uint64_t)child, 0) == 0, "A: kill(child, 0) == 0 for a live child");
     check(syscall2(SYS_KILL, 999999, 0) == -ESRCH, "A: kill(bogus, 0) == -ESRCH");
     int32_t st = 0;
-    syscall2(SYS_WAITPID, (uint64_t)child, (uint64_t)&st);
+    syscall3(SYS_WAITPID, (uint64_t)child, (uint64_t)&st, 0);
 
     /* B. kill(0, sig) hits our own process group (including ourselves). */
     install(SIGUSR1, (uint64_t)on_usr1);
@@ -100,7 +100,7 @@ void _start(void) {
     child = syscall1(SYS_FORK, 0);
     if (child == 0) { syscall1(SYS_EXIT, 7); for (;;) {} }
     st = 0;
-    check(syscall2(SYS_WAITPID, (uint64_t)child, (uint64_t)&st) == child, "C: waitpid reaps the child");
+    check(syscall3(SYS_WAITPID, (uint64_t)child, (uint64_t)&st, 0) == child, "C: waitpid reaps the child");
     for (int i = 0; i < 50 && chld_hits == 0; i++) nap_ms(10);
     check(chld_hits >= 1, "C: SIGCHLD delivered to the parent");
     check(((st >> 8) & 0xff) == 7 && (st & 0x7f) == 0, "C: wait status is WIFEXITED/WEXITSTATUS 7");

@@ -288,32 +288,40 @@ fn readSignalFrame(addr: u64) ?sig_mod.SignalFrame {
 }
 
 /// sigaltstack(ss_ptr, old_ss_ptr) → 0 or -errno
+///
+/// stack_t: ss_sp@0 (u64), ss_flags@8 (i32), ss_size@16 (u64). Validation
+/// and the on-stack/EPERM rule live in sigaltstack_policy.zig; delivery to
+/// the stack for SA_ONSTACK handlers is in signal.pushSignalFrame.
 pub fn sigaltstack(ss_ptr: u64, old_ss_ptr: u64) i64 {
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
+    const alt_policy = @import("sigaltstack_policy.zig");
+    const user_rsp = syscall_entry.getPerCpu().saved_user_rsp;
+    const current: alt_policy.AltStack = .{ .base = cur.sigaltstack_base, .size = cur.sigaltstack_size };
 
     if (old_ss_ptr != 0 and !copy.validateUserBufferWritable(old_ss_ptr, 24)) return -14;
     if (ss_ptr != 0 and !copy.validateUserBuffer(ss_ptr, 24)) return -14;
-    // Return old sigaltstack if requested
-    if (old_ss_ptr != 0) {
-        var old_ss: [24]u8 = undefined;
-        @memset(&old_ss, 0);
-        const sp: u64 = cur.sigaltstack_base;
-        const sz: u64 = cur.sigaltstack_size;
-        const flags: u32 = if (sp != 0) 0 else 2; // SS_DISABLE
-        bo.writeU64Le(old_ss[0..8], sp);
-        bo.writeU32Le(old_ss[8..12], flags);
-        bo.writeU64Le(old_ss[16..24], sz);
-        if (copy.copyToUser(@ptrFromInt(old_ss_ptr), &old_ss, 24) != 24) return -14;
-    }
-    // Set new sigaltstack if requested
+
+    var next: ?alt_policy.AltStack = null;
     if (ss_ptr != 0) {
         var ss_buf: [24]u8 = undefined;
         if (copy.copyFromUser(ss_buf[0..], @ptrFromInt(ss_ptr), 24) != 24) return -14;
-        const sp: u64 = bo.readU64Le(ss_buf[0..8]);
-        const sz: u64 = bo.readU64Le(ss_buf[16..24]);
-        cur.sigaltstack_base = sp;
-        cur.sigaltstack_size = sz;
+        switch (alt_policy.set(user_rsp, current, bo.readU64Le(ss_buf[0..8]), bo.readU32Le(ss_buf[8..12]), bo.readU64Le(ss_buf[16..24]))) {
+            .ok => |a| next = a,
+            .err => |e| return e,
+        }
+    }
+    if (old_ss_ptr != 0) {
+        var old_ss: [24]u8 = undefined;
+        @memset(&old_ss, 0);
+        bo.writeU64Le(old_ss[0..8], current.base);
+        bo.writeU32Le(old_ss[8..12], alt_policy.currentFlags(user_rsp, current));
+        bo.writeU64Le(old_ss[16..24], current.size);
+        if (copy.copyToUser(@ptrFromInt(old_ss_ptr), &old_ss, 24) != 24) return -14;
+    }
+    if (next) |a| {
+        cur.sigaltstack_base = a.base;
+        cur.sigaltstack_size = a.size;
     }
     return 0;
 }

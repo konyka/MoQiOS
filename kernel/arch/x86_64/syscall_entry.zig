@@ -3181,9 +3181,9 @@ fn deliverSignalOnSyscallReturn(frame: *SyscallFrame, current: anytype) void {
 
     const result = sig_mod.pushSignalFrame(current, signum, user_rsp, user_rip, user_rflags, &gprs);
 
-    // v53.45: Drop signal if delivery fails — avoids livelock when user stack
-    // is permanently unmapped. Signal was already dequeued by dequeueSignal.
-    if (result.new_rsp == 0) return;
+    // Frame write failed: die by SIGSEGV (Linux force_sigsegv) instead of
+    // dropping the signal. exitTask does not return.
+    if (result.new_rsp == 0) @import("../../proc/task.zig").exitTask(128 + @as(i32, @intCast(sig_mod.SIGSEGV)));
 
     frame.rdi = signum;
     frame.rcx = handler_addr;

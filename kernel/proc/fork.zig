@@ -95,6 +95,8 @@ pub fn fork(frame: *SyscallFrame) i64 {
         child.signal_sa_flags[i] = parent.signal_sa_flags[i];
     }
     child.signal_mask = parent.signal_mask;
+    child.sigaltstack_base = parent.sigaltstack_base;
+    child.sigaltstack_size = parent.sigaltstack_size;
     child.env_count = parent.env_count;
     for (0..parent.env_count) |i| {
         child.env_vars[i] = parent.env_vars[i];

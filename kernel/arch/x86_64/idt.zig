@@ -651,7 +651,7 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
 
     // Path 3: User-mode demand paging (page not present, from user space)
     if (user_mode and !present) {
-        if (handleDemandPage(frame, cr2)) {
+        if (handleDemandPage(cr2)) {
             return; // Successfully handled
         }
         // Failed demand page — log the address before falling through to
@@ -855,7 +855,15 @@ fn dumpRipZeroDiag(frame: *InterruptFrame) void {
 
 /// Demand paging — allocate and map a page for a user-space fault address.
 /// Returns true if the fault was in a valid user region and was handled.
-fn handleDemandPage(frame: *InterruptFrame, fault_addr: u64) bool {
+/// Fault in one not-present user page of the current task the way a user
+/// access would (stack growth, file/swap backing). Used by the kernel before
+/// writing a signal frame: kernel-mode stores to not-present user pages have
+/// no demand path, so an unfaulted stack page would otherwise fail the push.
+pub fn prefaultUserPage(addr: u64) bool {
+    return handleDemandPage(addr);
+}
+
+fn handleDemandPage(fault_addr: u64) bool {
     const pmm = @import("../../mm/pmm.zig");
     const hhdm = @import("../../mm/hhdm.zig");
     const paging_mod = @import("paging.zig");
@@ -969,7 +977,6 @@ fn handleDemandPage(frame: *InterruptFrame, fault_addr: u64) bool {
     };
     if (in_stack_range) current.as_used += paging_mod.PAGE_SIZE;
 
-    _ = frame;
     return true;
 }
 

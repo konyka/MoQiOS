@@ -78,6 +78,7 @@ test {
     _ = @import("net_misc_test.zig");
     _ = @import("signal_proc_test.zig");
     _ = @import("signal_delivery_test.zig");
+    _ = @import("sigaltstack_test.zig");
     _ = @import("wait_status_test.zig");
 }
 

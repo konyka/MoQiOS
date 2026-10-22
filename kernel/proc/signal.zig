@@ -339,7 +339,9 @@ pub const GpRegs = extern struct {
 /// `user_rip` is the current user RIP (where execution would return).
 /// `user_rflags` is the current RFLAGS.
 /// `gprs` holds the interrupted GPR set to be restored by sigreturn.
-/// Returns the new user RSP (handler entry RSP) and the handler address.
+/// Returns the new user RSP (handler entry RSP) and the handler address;
+/// new_rsp == 0 means the frame could not be written, and the caller must
+/// kill the task with SIGSEGV (Linux force_sigsegv) rather than drop it.
 ///
 /// User stack layout after delivery:
 ///   [higher address]
@@ -375,7 +377,13 @@ pub fn pushSignalFrame(
     // red zone (leaf functions keep live locals there without moving RSP).
     // sigreturn restores frame.rsp — the original user_rsp — so the gap is
     // invisible to the interrupted code (signal_frame_policy.zig).
-    const handler_rsp = @import("signal_frame_policy.zig").handlerRsp(user_rsp, @sizeOf(SignalFrame)) orelse
+    // SA_ONSTACK handlers run on the sigaltstack unless already on it.
+    const alt_policy = @import("sigaltstack_policy.zig");
+    const frame_top = alt_policy.deliveryTop(user_rsp, t.signal_sa_flags[signum - 1], .{
+        .base = t.sigaltstack_base,
+        .size = t.sigaltstack_size,
+    });
+    const handler_rsp = @import("signal_frame_policy.zig").handlerRsp(frame_top, @sizeOf(SignalFrame)) orelse
         return .{ .new_rsp = 0, .handler = 0 };
 
     const frame_addr = handler_rsp + 8;
@@ -415,6 +423,17 @@ pub fn pushSignalFrame(
             :
             : [buf] "r" (@as([*]u8, @ptrCast(&frame.fpu))),
             : .{ .memory = true });
+    }
+
+    if (comptime @import("builtin").cpu.arch == .x86_64) {
+        const paging = @import("../arch/arch.zig").paging;
+        const idt = @import("../arch/x86_64/idt.zig");
+        var page = handler_rsp & ~@as(u64, 0xFFF);
+        const end = frame_addr + @sizeOf(SignalFrame);
+        while (page < end) : (page += 0x1000) {
+            const raw = paging.getPageEntryRaw(t.page_table_phys, page) orelse 0;
+            if (raw & 1 == 0 and !idt.prefaultUserPage(page)) break;
+        }
     }
 
     const copy = @import("../mm/copy_from_user.zig");

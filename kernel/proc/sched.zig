@@ -1414,9 +1414,10 @@ pub fn deliverSignalToRunningTask(t: *task.Task, iframe: *idt.InterruptFrame) bo
 
     const result = sig_mod.pushSignalFrame(t, signum, user_rsp, user_rip, user_rflags, &gprs);
 
-    // v53.45: Drop signal if delivery fails — avoids livelock when user stack
-    // is permanently unmapped. Signal was already dequeued by dequeueSignal.
-    if (result.new_rsp == 0) return false;
+    // The frame could not be written (stack unmapped, read-only or
+    // exhausted). Linux force_sigsegv: the task dies by SIGSEGV instead of
+    // silently losing the signal. exitTask does not return.
+    if (result.new_rsp == 0) task.exitTask(128 + @as(i32, @intCast(sig_mod.SIGSEGV)));
 
     // Modify the InterruptFrame to jump to the signal handler
     iframe.rip = handler_addr;
