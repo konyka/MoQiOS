@@ -1,7 +1,7 @@
 #!/bin/bash
 # tools/gdb_stall_probe.sh — SMP stall forensics helper.
 #
-# Boots the x86_64 kernel in QEMU with a GDB stub (no halt-at-start), SMP=4,
+# Boots the x86_64 kernel in QEMU with a GDB stub (no halt-at-start), SMP=$PROBE_SMP (default 4),
 # serial to a temp log. Watches the log: on reaching the shell marker the run
 # is a pass and the next iteration starts; on no log growth for STALL_SECS
 # the run is presumed stalled and a batch GDB session dumps every vCPU's
@@ -17,6 +17,7 @@ cd "$PROJECT_DIR"
 
 MAX_ITER="${1:-6}"
 STALL_SECS="${STALL_SECS:-90}"
+PROBE_SMP="${PROBE_SMP:-4}"
 GDB_PORT="${GDB_PORT:-1234}"
 OUT_DIR="$(mktemp -d "/tmp/stall-probe-$(date +%s)-XXXX")"
 
@@ -28,24 +29,32 @@ printf "=== per-vCPU registers ===\n"
 thread apply all info registers rip rsp eflags
 printf "=== per-vCPU backtraces ===\n"
 thread apply all bt 6
+printf "=== per-CPU current ===\n"
+set $c = 0
+while $c < 8
+  printf "cpu %d current_task_idx=%u\n", $c, 'arch.x86_64.syscall_entry.percpu_array'[$c].current_task_idx
+  set $c = $c + 1
+end
 printf "=== task table ===\n"
 set $bm = 'proc.task.slot_bitmap'
 printf "slot_bitmap = 0x%lx\n", $bm
-printf "task_lock.locked = %d\n", 'proc.task.task_lock'.locked
+printf "futex_wait_bm = 0x%lx\n", 'sync.futex.futex_wait_bm'
 printf "sleep_bm = 0x%lx\n", 'proc.sched.sleep_bm'
 printf "ctty_owner_sid = %d foreground_pgid = %d\n", 'proc.jobctl.ctty_owner_sid', 'proc.jobctl.foreground_pgid'
 set $i = 0
 while $i < 64
   if ($bm >> $i) & 1
     set $t = &'proc.task.tasks'[$i]
-    printf "slot %2d tid=%3d parent=%3d state=%d stopped=%d is_thread=%d is_user=%d sid=%d pgid=%d sleep_deadline=%lu wait_child=%d\n", $i, $t.tid, $t.parent_tid, $t.state, $t.stopped, $t.is_thread, $t.is_user, $t.sid, $t.pgid, $t.sleep_deadline_ns, $t.waiting_for_child
-    if $t.is_user && $t.state != 1
+    printf "slot %2d tid=%3d parent=%3d state=%d stopped=%d is_thread=%d is_user=%d sid=%d pgid=%d sleep_deadline=%lu wait_child=%d pending=0x%x mask=0x%lx futex_deadline=%lu futex_seq=%lu last_cpu=%d\n", $i, $t.tid, $t.parent_tid, $t.state, $t.stopped, $t.is_thread, $t.is_user, $t.sid, $t.pgid, $t.sleep_deadline_ns, $t.waiting_for_child, $t.pending_signals, $t.signal_mask, 'sync.futex.wait_deadlines'[$i], 'sync.futex.wait_seq'[$i], $t.last_cpu
+    if $t.is_user
       printf "--- saved frame at saved_rsp=0x%lx ---\n", $t.saved_rsp
       x/24gx $t.saved_rsp
+      printf "kstack 0x%lx..0x%lx\n", $t.kernel_stack, $t.kernel_stack_top
     end
   end
   set $i = $i + 1
 end
+printf "tsc nanos source: see run log\n"
 detach
 quit
 EOF
@@ -60,7 +69,7 @@ for ((iter = 1; iter <= MAX_ITER; iter++)); do
     # the canonical fixture must stay untouched (qemu_run.sh verifies its
     # SHA-256 when MOQI_DISK is unset).
     cp --reflink=auto disk.img "$OUT_DIR/disk-$iter.img"
-    MOQI_SERIAL="file:$LOG" MOQI_SMP=4 \
+    MOQI_SERIAL="file:$LOG" MOQI_SMP="$PROBE_SMP" \
         MOQI_DISK="$OUT_DIR/disk-$iter.img" \
         MOQI_EXTRA_QEMU="-gdb tcp::$GDB_PORT" \
         ./tools/qemu_run.sh >"$OUT_DIR/run-$iter.qemu.log" 2>&1 &

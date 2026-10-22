@@ -377,6 +377,7 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
                 if (node.granted) {
                     bucket.lock.release(flags2);
                     if (deadline != 0) disarmWaitDeadline(cur_idx);
+                    sched_mod.repairCurrentAfterBlock();
                     return 0;
                 }
                 // timerTick unlinks a timed-out node under this lock, judged
@@ -411,6 +412,12 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
                 }
                 bucket.lock.release(flags2);
                 if (deadline != 0) disarmWaitDeadline(cur_idx);
+                // forceReschedule may have resumed us without switching (no
+                // runnable peer), leaving state == .blocked while we keep
+                // running. Returning to user space like that lets the next
+                // preemption drop the task from the runnable set for good
+                // (SMP=8 hello105: ETIMEDOUT already in rax, task .blocked).
+                sched_mod.repairCurrentAfterBlock();
                 if (expired) return -110; // -ETIMEDOUT
                 if (fatal) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
                 if (actionable) return -4; // -EINTR

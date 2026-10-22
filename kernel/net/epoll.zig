@@ -1050,7 +1050,13 @@ fn blockOnEpoll(inst: *EpollInstance, deadline_ns: ?u64) BlockOutcome {
             disarmWaitDeadline(my_idx, generation);
             return .event;
         }
-        const expired = if (deadline_ns) |d| tsc.nanos() >= d else false;
+        // timerTick judges expiry on the BSP's clock and unlinks the node
+        // under inst.spin before waking us; this CPU's clock may still read
+        // just before the deadline. An unlinked, ungranted timed node is the
+        // authoritative timeout — re-blocking on the clock alone would sleep
+        // forever with the deadline already disarmed.
+        const unlinked_by_timeout = deadline_ns != null and !waiterLinkedLocked(inst, &node);
+        const expired = unlinked_by_timeout or (if (deadline_ns) |d| tsc.nanos() >= d else false);
         // Signal kick: sendSignal unblocks the task without granting the
         // wait node. epollDestroy wakes waiters of a dead instance the same way.
         const actionable = sig_mod.pendingActionable(ct);
@@ -1130,6 +1136,16 @@ pub fn timerTick(now_ns: u64) void {
             task_mod.unblockTask(idx);
         }
     }
+}
+
+/// Whether `node` is still on the instance waiter list. Caller holds inst.spin.
+fn waiterLinkedLocked(inst: *EpollInstance, node: *WaitNode) bool {
+    var current = inst.waiter;
+    while (current) |n| {
+        if (n == node) return true;
+        current = n.next;
+    }
+    return false;
 }
 
 /// Unlink a wait node from the instance waiter list. Caller holds inst.spin.

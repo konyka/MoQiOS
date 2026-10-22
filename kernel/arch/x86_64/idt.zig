@@ -1380,15 +1380,20 @@ fn handleCowFault(frame: *InterruptFrame, fault_addr: u64) bool {
 
     const page_addr = fault_addr & ~@as(u64, paging_mod.PAGE_SIZE - 1);
 
-    // Get the PTE for this page
-    const pte = paging_mod.getPageEntry(current.page_table_phys, page_addr) orelse return false;
-    const pte_val: u64 = @bitCast(pte.*);
-
     // The mapping changed between the fault and the guard: swap reclaim
     // (which holds this vm_lock across its whole scan) may have downgraded
-    // then swapped the page out while this fault waited. Retry the
-    // instruction — it re-faults and lands on the demand/swap-in path.
-    if ((pte_val & 1) == 0) return true;
+    // then swapped the page out while this fault waited, or munmap removed
+    // it. The fault was taken on a PRESENT page, so a now-non-present 4K
+    // entry means it is stale: retry the instruction — it re-faults as
+    // not-present and lands on the demand/swap-in (or SIGSEGV) path.
+    // getPageEntry filters non-present entries, so this must be checked on
+    // the raw entry first; returning false here killed a CLONE_VM thread
+    // whose page was swapped out under it (SMP=8 hello98, err=0x7).
+    if (paging_mod.getPageEntryRaw(current.page_table_phys, page_addr)) |raw| {
+        if ((raw & 1) == 0) return true;
+    }
+    const pte = paging_mod.getPageEntry(current.page_table_phys, page_addr) orelse return false;
+    const pte_val: u64 = @bitCast(pte.*);
 
     // Check COW bit is set
     if (pte_val & COW_BIT == 0) {

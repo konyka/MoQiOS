@@ -508,7 +508,7 @@ fn clientRoundTrip(comptime i: usize, comptime op: u32, ctx: *devfs.IoCtx, buf: 
             }
             node.lock.release(flags);
         }
-        sched.forceReschedule();
+        sched.rescheduleAfterBlock();
         unlinkWaiter(&node.space_wq, &wn, &node.lock);
         if (checkSignals()) |rc| return rc; // nothing enqueued yet
     }
@@ -540,7 +540,7 @@ fn clientRoundTrip(comptime i: usize, comptime op: u32, ctx: *devfs.IoCtx, buf: 
             }
             node.lock.release(flags);
         }
-        sched.forceReschedule();
+        sched.rescheduleAfterBlock();
         unlinkWaiter(&node.client_wq, &wn, &node.lock);
         if (checkSignals()) |rc| {
             const flags = node.lock.acquire();
@@ -586,7 +586,7 @@ pub fn ctrlRead(idx: u32, generation: u32, buf: [*]u8, count: usize) i64 {
             }
             node.lock.release(flags);
         }
-        sched.forceReschedule();
+        sched.rescheduleAfterBlock();
         unlinkWaiter(&node.owner_wq, &wn, &node.lock);
         if (checkSignals()) |rc| return rc;
     }

@@ -119,7 +119,7 @@ fn kmsgRead(ctx: *devfs.IoCtx, buf: [*]u8, count: usize) i64 {
                 return @intCast(res.n);
             },
             .blocked => {
-                sched.forceReschedule();
+                sched.rescheduleAfterBlock();
                 klog.kmsgUnlinkWaiter(&node);
                 const cur_idx = sched.currentTaskIndex() orelse return 0;
                 const cur = task_mod.getTask(cur_idx) orelse return 0;
@@ -292,7 +292,7 @@ fn watchRead(ctx: *devfs.IoCtx, buf: [*]u8, count: usize) i64 {
             }
             watch_lock.release(flags);
         }
-        sched.forceReschedule();
+        sched.rescheduleAfterBlock();
         watchUnlinkWaiter(&node);
         const cur_idx = sched.currentTaskIndex() orelse return 0;
         const cur_task = task_mod.getTask(cur_idx) orelse return 0;
