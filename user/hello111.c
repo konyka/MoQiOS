@@ -1,6 +1,7 @@
 /// hello111: POSIX kill(2) semantics and SIGCHLD.
 ///
-///   A. kill(pid, 0) probes: 0 for a live child, -ESRCH for a bogus pid.
+///   A. kill(pid, 0) probes: 0 for a live child, -ESRCH for a bogus pid;
+///      kill(-1, 0) reaches the other processes.
 ///   B. kill(0, sig) reaches the caller's own process group.
 ///   C. a child's exit raises SIGCHLD in the parent (handler runs).
 ///   D. with SIGCHLD set to SIG_IGN, exited children are reaped
@@ -87,6 +88,7 @@ void _start(void) {
     if (child == 0) { nap_ms(300); syscall1(SYS_EXIT, 0); for (;;) {} }
     check(syscall2(SYS_KILL, (uint64_t)child, 0) == 0, "A: kill(child, 0) == 0 for a live child");
     check(syscall2(SYS_KILL, 999999, 0) == -ESRCH, "A: kill(bogus, 0) == -ESRCH");
+    check(syscall2(SYS_KILL, (uint64_t)-1, 0) == 0, "A: kill(-1, 0) finds other processes");
     int32_t st = 0;
     syscall3(SYS_WAITPID, (uint64_t)child, (uint64_t)&st, 0);
 

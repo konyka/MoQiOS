@@ -44,14 +44,15 @@ pub fn maySignal(sender: *task_mod.Task, target: *task_mod.Task) bool {
     );
 }
 
-/// kill(2): pid > 0 one process, 0 the caller's process group, < -1 group
+/// kill(2): pid > 0 one process, 0 the caller's process group, -1 every
+/// process the caller may signal (except init and itself), < -1 group
 /// -pid. signum 0 performs only the existence/permission check. Returns 0,
 /// -ESRCH when no target exists, -EPERM when every target was refused.
 pub fn killPosix(pid: i64, signum: u32) i64 {
     const id_policy = @import("proc_id_policy.zig");
     if (signum > 31) return -22;
-    if (pid == -1) return -22; // kill(-1): broadcast not supported in v1
     const cur = sched.currentTask() orelse return -3;
+    if (pid == -1) return killAll(cur, signum);
 
     if (pid > 0) {
         const tid = id_policy.killTargetTid(pid) orelse return -3;
@@ -79,6 +80,29 @@ pub fn killPosix(pid: i64, signum: u32) i64 {
     return 0;
 }
 
+
+/// kill(-1, sig): every process but init and the caller's own (see
+/// kill_broadcast_policy.zig for the target and return-value rules).
+fn killAll(cur: *task_mod.Task, signum: u32) i64 {
+    const bp = @import("kill_broadcast_policy.zig");
+    const init_tid = @atomicLoad(u32, &task_mod.init_tid, .acquire);
+    const self_group = threadGroupId(cur);
+    var candidates: u32 = 0;
+    for (0..task_mod.MAX_TASKS) |i| {
+        const t = task_mod.getTask(@intCast(i)) orelse continue;
+        if (!bp.isTarget(.{
+            .is_user = t.is_user,
+            .is_thread = t.is_thread,
+            .zombie = t.state == .zombie,
+            .is_init = init_tid != 0 and t.tid == init_tid,
+            .same_thread_group = threadGroupId(t) == self_group,
+        })) continue;
+        candidates += 1;
+        if (signum == 0 or !maySignal(cur, t)) continue;
+        _ = sig_mod.sendSignal(t.tid, signum);
+    }
+    return bp.result(candidates);
+}
 
 /// sigaction(signum, act_ptr, oldact_ptr) → 0 or -errno
 ///

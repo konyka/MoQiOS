@@ -325,6 +325,9 @@ export fn _start() callconv(.c) noreturn {
 
     // M5.5: Load init program from ramdisk as the first user process (pid 1)
     if (loader.loadProgram("init", 0, false, true, @import("proc/rlimit.zig").RLIM_INFINITY, @import("proc/rlimit.zig").RLIM_INFINITY)) |task_idx| {
+        if (@import("proc/task.zig").getTask(task_idx)) |init_task| {
+            @atomicStore(u32, &@import("proc/task.zig").init_tid, init_task.tid, .release);
+        }
         serial.writeString("[kernel] init launched as task ");
         fmt.writeDecimal(task_idx);
         serial.writeString("\n");

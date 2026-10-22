@@ -611,6 +611,9 @@ var tasks: [MAX_TASKS]Task = undefined;
 var next_tid: u32 = 1;
 var task_count: u32 = 0;
 
+/// tid of the init process (excluded from kill(-1)); 0 until init is launched.
+pub var init_tid: u32 = 0;
+
 // A fixed table keeps the task-lock hot path O(1) without introducing
 // allocator failure into task creation/reap. Entries are keyed by UID rather
 // than using UID as an array index because the default user profile is UID
