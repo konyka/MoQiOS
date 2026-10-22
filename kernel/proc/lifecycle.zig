@@ -2,12 +2,14 @@ const serial = @import("../arch/arch.zig").serial;
 const fmt = @import("../lib/fmt.zig");
 
 /// Syscall #2: exit(status)
+/// Linux semantics: only the low 8 bits of status reach the parent.
 pub fn exit(status: u64) void {
     const t = @import("task.zig");
+    const code = @import("proc_id_policy.zig").exitCode(status);
     serial.writeString("[exit] task exited with code ");
-    fmt.writeDecimal64(status);
+    fmt.writeDecimal64(@intCast(code));
     serial.writeString("\n");
-    t.exitTask(@intCast(status));
+    t.exitTask(code);
 }
 
 /// Syscall #5: spawn(name_ptr) — load and start a program from ramdisk.
@@ -81,14 +83,18 @@ pub fn spawn(name_ptr: u64) i64 {
 
 /// Syscall #62: kill(pid, signum)
 /// pid > 0: 单进程；pid < -1: 广播到进程组 -pid（kill(-pgid)）；pid == -1: 暂不支持。
+/// pid 超出 tid（u32）或 pgid（u16）范围时不可能有目标，返回 ESRCH。
 pub fn kill(target_pid: i64, signum: u32) i64 {
     const sig_mod = @import("signal.zig");
+    const id_policy = @import("proc_id_policy.zig");
     if (target_pid == -1) return -22; // EINVAL — kill(-1) 不在 v1 范围
+    if (target_pid == 0) return -1; // kill(0) 不在 v1 范围（沿用旧返回值）
     if (target_pid < -1) {
-        const pgid: u16 = @intCast(-target_pid);
+        const pgid = id_policy.killTargetPgid(target_pid) orelse return -3; // ESRCH
         return if (sig_mod.sendSignalToPgrp(pgid, signum) > 0) 0 else -1;
     }
-    if (sig_mod.sendSignal(@intCast(target_pid), signum)) {
+    const tid = id_policy.killTargetTid(target_pid) orelse return -3; // ESRCH
+    if (sig_mod.sendSignal(tid, signum)) {
         return 0;
     }
     return -1;

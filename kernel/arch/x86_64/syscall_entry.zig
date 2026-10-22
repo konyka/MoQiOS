@@ -3049,19 +3049,13 @@ fn syscallSigreturn(frame: *SyscallFrame) void {
 }
 
 fn syscallKill(frame: *SyscallFrame) void {
-    // Task #8: cap_kill required when targeting a different process.
+    // Task #8: cap_kill required when targeting a different process; process
+    // group broadcast (pid < 0) always needs it. The pid is compared at full
+    // width so (1<<32)|self does not pass as "self".
     const pid_signed: i64 = @bitCast(frame.rdi);
-    const target_pid: u32 = @truncate(frame.rdi);
-    if (currentTaskCaps()) |info| {
-        // 进程组广播（pid<0）与跨进程单发同样需要 cap_kill；-1 时按目标校验。
-        if (pid_signed > 0 and info.tid != target_pid and !@field(info.t.effective_caps, "cap_kill")) {
-            frame.rax = @bitCast(@as(i64, -1)); // EPERM
-            return;
-        }
-        if (pid_signed < 0 and !@field(info.t.effective_caps, "cap_kill")) {
-            frame.rax = @bitCast(@as(i64, -1)); // EPERM
-            return;
-        }
+    if (!signal_syscall_mod.currentMayKill(pid_signed)) {
+        frame.rax = @bitCast(@as(i64, -1)); // EPERM
+        return;
     }
     frame.rax = @bitCast(lifecycle_mod.kill(pid_signed, @truncate(frame.rsi)));
 }
@@ -5554,6 +5548,8 @@ fn syscallPidfdSendSignal(pidfd: u32, sig: u32, info_ptr: u64, flags: u32) i64 {
     const target_tid: u32 = fd.proc_pid;
     // Verify target exists
     _ = findTaskByPid(target_tid) orelse return -3;
+    // Holding a pidfd grants no signal permission: same gate as kill/tkill.
+    if (!signal_syscall_mod.currentMaySignalTask(target_tid)) return -1; // EPERM
 
     return if (signal.sendSignal(target_tid, sig)) 0 else -3; // ESRCH
 }

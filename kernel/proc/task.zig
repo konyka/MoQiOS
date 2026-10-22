@@ -1170,7 +1170,7 @@ pub fn exitTask(exit_code: i32) void {
     // 根因：SMP=1 下 D 总在 C 首次阻塞前退完所以不触发）。此刻本任务已标
     // .zombie 且仍是某 CPU 的当前任务，reap 静默门保证槽位不会被提前回收，
     // 指针 t 在广播期间保持有效。
-    if (t.is_user and t.sid == @as(u16, @intCast(t.tid))) {
+    if (t.is_user and @import("proc_id_policy.zig").groupIdIsTid(t.sid, t.tid)) {
         @import("jobctl.zig").onSessionLeaderExit(t);
     }
 

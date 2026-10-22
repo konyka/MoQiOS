@@ -308,6 +308,7 @@ pub const GpRegs = extern struct {
 ///
 /// User stack layout after delivery:
 ///   [higher address]
+///   128-byte red zone below the interrupted RSP (left untouched)
 ///   SignalFrame (saved context)
 ///   sigreturn_trampoline_addr (8 bytes — handler return address)
 ///   [lower address] <- RSP when handler is entered
@@ -335,16 +336,12 @@ pub fn pushSignalFrame(
     // handler clobbered the saved rsp/rip slots and sigreturn resumed with a
     // corrupted stack (observed as hello13's waitpid getting a stack address
     // as pid). The handler's RSP must satisfy the ABI: RSP+8 is 16-aligned
-    // at entry, and the frame (handler_rsp+8 .. +8+sizeof) must not overrun
-    // the pre-signal user RSP.
-
-    const total_size: u64 = @sizeOf(SignalFrame) + 8;
-
-    var handler_rsp = (user_rsp - total_size) & ~@as(u64, 15);
-    handler_rsp += 8;
-    if (handler_rsp + total_size > user_rsp) {
-        handler_rsp -= 16;
-    }
+    // at entry, and the frame must stay below the interrupted code's 128-byte
+    // red zone (leaf functions keep live locals there without moving RSP).
+    // sigreturn restores frame.rsp — the original user_rsp — so the gap is
+    // invisible to the interrupted code (signal_frame_policy.zig).
+    const handler_rsp = @import("signal_frame_policy.zig").handlerRsp(user_rsp, @sizeOf(SignalFrame)) orelse
+        return .{ .new_rsp = 0, .handler = 0 };
 
     const frame_addr = handler_rsp + 8;
 

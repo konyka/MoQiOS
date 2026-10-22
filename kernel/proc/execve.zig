@@ -155,6 +155,7 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
     // scheduler, so the stale base would otherwise survive into the new image.
     cur.tls_base = 0;
     syscall_entry.setUserTlsBase(0);
+    commitSignalStateForExec(cur, result.pml4);
 
     // Switch to new address space
     if (sched.currentTaskIndex()) |task_idx| {
@@ -328,6 +329,7 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64)
     // scheduler, so the stale base would otherwise survive into the new image.
     cur.tls_base = 0;
     syscall_entry.setUserTlsBase(0);
+    commitSignalStateForExec(cur, result.pml4);
 
     @import("../arch/arch.zig").pcid.switchCr3(result.pml4);
     // L1: the old image's user-driver resources (IRQ registrations, DMA
@@ -369,6 +371,23 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64)
     sched.setAnchor(frame_addr);
 
     return frame_addr;
+}
+
+/// Signal and thread state that belongs to the replaced image. Runs only
+/// after the new address space is committed to `cur`, so a failed exec
+/// leaves the old image's state untouched.
+fn commitSignalStateForExec(cur: *@import("task.zig").Task, new_pml4: u64) void {
+    const exec_policy = @import("signal_exec_policy.zig");
+    // Caught signals revert to SIG_DFL (the handler addresses pointed into
+    // the old image); SIG_IGN survives exec. Mask and pending set are kept.
+    for (&cur.signal_handlers) |*h| h.* = exec_policy.execHandlerAfter(h.*);
+    cur.sigaltstack_base = 0;
+    cur.sigaltstack_size = 0;
+    // CLONE_CHILD_CLEARTID address is meaningless in the new image (Linux
+    // mm_release clears it on exec).
+    cur.clear_tid_ptr = 0;
+    // Handlers installed by the new image return through the trampoline.
+    @import("signal.zig").setupSigreturnTrampoline(new_pml4);
 }
 
 fn hasShmAttachments() bool {

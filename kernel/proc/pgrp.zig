@@ -10,6 +10,7 @@
 ///   - setsid() creates a new session AND new process group
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const task_mod = @import("task.zig");
+const id_policy = @import("proc_id_policy.zig");
 const sched = @import("sched.zig");
 
 var pgrp_lock: IrqSpinlock = .{};
@@ -40,6 +41,7 @@ pub fn sysSetpgid(pid_arg: u64, pgid_arg: u64) i64 {
         target_idx = cur_idx;
         target_tid = cur.tid;
     } else {
+        if (pid_arg > 0xFFFF_FFFF) return ESRCH;
         target_tid = @intCast(pid_arg);
         // Find the task with this tid by scanning task array
         for (0..task_mod.MAX_TASKS) |i| {
@@ -63,12 +65,17 @@ pub fn sysSetpgid(pid_arg: u64, pgid_arg: u64) i64 {
         // since we don't track exec state
     }
 
-    // Determine the new pgid
-    const new_pgid: u16 = if (pgid_arg == 0) @intCast(target_tid) else @intCast(pgid_arg);
+    // Determine the new pgid. pgid is stored as u16: an id that does not fit
+    // (including a negative pgid, or a target tid above 0xFFFF becoming a
+    // group leader) is rejected rather than truncated.
+    const new_pgid: u16 = if (pgid_arg == 0)
+        id_policy.groupIdForTid(target_tid) orelse return EINVAL
+    else
+        id_policy.groupIdFromArg(pgid_arg) orelse return EINVAL;
 
     // The new pgid must match an existing process group (i.e., some process
     // with pgid == new_pgid) or be equal to target_tid (creating a new group)
-    if (new_pgid != @as(u16, @intCast(target_tid))) {
+    if (!id_policy.groupIdIsTid(new_pgid, target_tid)) {
         // Verify that the pgid exists (some process has this pgid)
         // and that it's in the same session
         var found_group = false;
@@ -83,13 +90,13 @@ pub fn sysSetpgid(pid_arg: u64, pgid_arg: u64) i64 {
         if (!found_group) return EPERM;
     } else {
         // Session leader check only applies when creating a NEW group
-        if (target.sid == @as(u16, @intCast(target.tid))) {
+        if (id_policy.groupIdIsTid(target.sid, target.tid)) {
             return EPERM;
         }
     }
 
     // Cannot change pgid of a session leader
-    if (target.sid == @as(u16, @intCast(target.tid))) {
+    if (id_policy.groupIdIsTid(target.sid, target.tid)) {
         return EPERM;
     }
 
@@ -109,6 +116,7 @@ pub fn sysGetpgid(pid_arg: u64) i64 {
         return cur.pgid;
     }
 
+    if (pid_arg > 0xFFFF_FFFF) return ESRCH;
     const tid: u32 = @intCast(pid_arg);
     // Scan task array under our lock
     var found_idx: ?u32 = null;
@@ -135,12 +143,13 @@ pub fn sysSetsid() i64 {
     const cur = task_mod.getTask(cur_idx) orelse return ESRCH;
 
     // Cannot be a process group leader already
-    if (cur.pgid == @as(u16, @intCast(cur.tid))) {
+    if (id_policy.groupIdIsTid(cur.pgid, cur.tid)) {
         return EPERM;
     }
 
-    // Create new session: sid = pid, pgid = pid
-    const new_id: u16 = @intCast(cur.tid);
+    // Create new session: sid = pid, pgid = pid. A tid above 0xFFFF cannot
+    // be stored in the u16 sid/pgid fields.
+    const new_id: u16 = id_policy.groupIdForTid(cur.tid) orelse return EINVAL;
     cur.sid = new_id;
     cur.pgid = new_id;
 
@@ -162,6 +171,7 @@ pub fn sysGetsid(pid_arg: u64) i64 {
         return cur.sid;
     }
 
+    if (pid_arg > 0xFFFF_FFFF) return ESRCH;
     const tid: u32 = @intCast(pid_arg);
     // Scan task array under our lock
     var found_idx: ?u32 = null;

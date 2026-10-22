@@ -13,6 +13,34 @@ const bo = @import("../lib/byte_order.zig");
 
 // Access syscall_entry globals for sigreturn
 const syscall_entry = @import("../arch/arch.zig").syscall;
+const perm_policy = @import("signal_perm_policy.zig");
+const action_policy = @import("signal_action_policy.zig");
+
+/// Thread-group id (the pid getpid() reports) of a task.
+fn threadGroupId(t: *task_mod.Task) u32 {
+    return if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid;
+}
+
+/// Permission gate for signalling the single task `target_tid` from the
+/// current task (tkill, rt_sigqueueinfo, rt_tgsigqueueinfo,
+/// pidfd_send_signal). Signalling your own process is allowed; anything
+/// else needs cap_kill. A missing target is allowed here so the caller
+/// still reports ESRCH. No current task means a kernel-internal caller.
+pub fn currentMaySignalTask(target_tid: u32) bool {
+    const cur = sched.currentTask() orelse return true;
+    if (@field(cur.effective_caps, "cap_kill")) return true;
+    const idx = task_mod.findTaskByTid(target_tid) orelse return true;
+    const target = task_mod.getTask(idx) orelse return true;
+    return perm_policy.maySignalTask(threadGroupId(cur), threadGroupId(target), false);
+}
+
+/// Permission gate for kill(pid, ...) from the current task; `pid` is the
+/// raw signed argument (see signal_perm_policy.mayKill).
+pub fn currentMayKill(pid: i64) bool {
+    const cur = sched.currentTask() orelse return true;
+    const cap = @field(cur.effective_caps, "cap_kill");
+    return perm_policy.mayKill(cur.tid, pid, cap) or perm_policy.mayKill(threadGroupId(cur), pid, cap);
+}
 
 /// sigaction(signum, act_ptr, oldact_ptr) → 0 or -errno
 ///
@@ -27,6 +55,8 @@ const syscall_entry = @import("../arch/arch.zig").syscall;
 /// probe succeeds the applied mask is 0 — their behavior is unchanged.
 pub fn sigaction(signum: u32, act_ptr: u64, oldact_ptr: u64) i64 {
     if (signum == 0 or signum > 31) return -22;
+    // SIGKILL/SIGSTOP cannot be caught or ignored; a pure query is fine.
+    if (!action_policy.actionChangeAllowed(signum, act_ptr != 0)) return -22;
 
     const current = sched.currentTask() orelse return -1;
     const old_handler = current.signal_handlers[signum - 1];
@@ -59,8 +89,7 @@ pub fn sigaction(signum: u32, act_ptr: u64, oldact_ptr: u64) i64 {
             var mask_buf: [8]u8 = undefined;
             if (copy.copyFromUser(&mask_buf, @ptrFromInt(act_ptr + 24), 8) == 8) {
                 const new_mask: u64 = @bitCast(mask_buf);
-                const unblockable = (@as(u64, 1) << 8) | (@as(u64, 1) << 18);
-                current.signal_mask = new_mask & ~unblockable;
+                current.signal_mask = action_policy.sanitizeMask(new_mask);
             }
         }
     }
@@ -248,7 +277,7 @@ pub fn rtSigsuspend(mask_ptr: u64, sigsetsize: u64) i64 {
     var new_mask: u64 = 0;
     const mask_bytes: [*]u8 = @ptrCast(&new_mask);
     if (copy.copyFromUser(mask_bytes[0..width], @ptrFromInt(mask_ptr), width) != width) return -14;
-    cur.signal_mask = new_mask;
+    cur.signal_mask = action_policy.sanitizeMask(new_mask);
     return -4; // EINTR
 }
 
@@ -284,6 +313,7 @@ pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_s
 pub fn rtSigqueueinfo(tgid: u32, sig: u32, uinfo_ptr: u64) i64 {
     _ = uinfo_ptr;
     if (sig == 0 or sig > 64) return -22;
+    if (!currentMaySignalTask(tgid)) return -1; // EPERM
     if (sig_mod.sendSignal(tgid, sig)) return 0;
     return -3; // ESRCH
 }
@@ -291,6 +321,7 @@ pub fn rtSigqueueinfo(tgid: u32, sig: u32, uinfo_ptr: u64) i64 {
 /// tkill(tid, sig) → 0 or -errno
 pub fn tkill(tid: u32, sig: u32) i64 {
     if (sig == 0 or sig > 64) return -22;
+    if (!currentMaySignalTask(tid)) return -1; // EPERM
     if (sig_mod.sendSignal(tid, sig)) return 0;
     return -3; // ESRCH
 }
@@ -308,6 +339,7 @@ pub fn pidfdSendSignal(pidfd: u32, sig: u32, info_ptr: u64, flags: u32) i64 {
     if (desc.fd_type != .proc_file) return -9;
 
     const target_pid: u32 = @intCast(desc.proc_pid);
+    if (!currentMaySignalTask(target_pid)) return -1; // EPERM
     if (sig_mod.sendSignal(target_pid, sig)) return 0;
     return -3;
 }
@@ -322,9 +354,9 @@ pub fn signalfd4(old_fd: u64, mask: u64, sizemask: u64, flags: u64) i64 {
     if (old_fd != @as(u64, @bitCast(@as(i64, -1))) and old_fd < 0x0000_8000_0000_0000) {
         const cur_idx = sched.currentTaskIndex() orelse return -3;
         const cur = task_mod.getTask(cur_idx) orelse return -3;
-        const fd: u32 = @intCast(old_fd);
-        if (fd < vfs_mod.MAX_FDS and cur.fd_table.fds[fd].fd_type == .eventfd) {
-            return @bitCast(old_fd);
+        if (old_fd < vfs_mod.MAX_FDS) {
+            const fd: u32 = @intCast(old_fd);
+            if (cur.fd_table.fds[fd].fd_type == .eventfd) return @bitCast(old_fd);
         }
     }
 
