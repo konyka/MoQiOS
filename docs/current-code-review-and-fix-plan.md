@@ -3532,7 +3532,7 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   udp → 新增 `nextDatagramLen`（与 recvFrom 同一队首选择规则）。
   **回归程序适配**：hello43 的 `recv_pumped`、hello19 的 recv 轮询原把非零/负值当
   结果或"对端关闭"，现把 -11 视作"再泵一次"（UDP 空队列仍报 0，二者同等重试）。
-  **未做（留作后续）**：阻塞 recv——tcp.zig 无接收等待队列，空读不论 O_NONBLOCK
+  **未做（留作后续；§6.55 `e0c7f11` 已实现）**：阻塞 recv——tcp.zig 无接收等待队列，空读不论 O_NONBLOCK
   均为 EAGAIN；RST 关闭报 0 而非 ECONNRESET；从未连接的 closed TCB 报 0 而非
   ENOTCONN（TCB 无法与已关闭连接区分）；UDP 空队列仍报 0。
 - **ext2 unlink-while-open 延迟回收**（`fs/ext2_unlink_policy.zig`）：最后一个链接
@@ -3549,7 +3549,7 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   真实（硬链接可见，fstat 原报 0）；uid/gid 拼高 16 位；size 取
   `max(盘上, fd 缓存)`（不把 writeback 未落盘的写入报小）。结构体布局不变，失败
   回退原行为，非 ext2 类型不变。TIOCGPGRP 改为零扩展拷 4 字节（原 2 字节、高位
-  栈垃圾）。**残留**：时间戳/blocks 仍为 0；TIOCSPGRP 仍只读 2 字节。
+  栈垃圾）。**残留（均已在后续轮次关闭）**：时间戳/blocks（§6.55 ext2 时间戳）；TIOCSPGRP 4 字节（§6.54）。
 - **sysv_msg FIFO**（`ipc/sysv_msg_select_policy.zig`）：每条消息入队打单调
   `seq`；三种 msgtyp 的接收统一为"匹配集中 seq 最小者"（msgtyp<0：类型最小、同
   类型 seq 最小）。修复前 typed receive 留下的洞被 msgsnd 回填，FIFO 接收先拿到
@@ -3583,7 +3583,7 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   lifecycle_lock → pool_lock → inst.spin → slot_lock 无环（epoll 释放 inst.spin
   之后才 `releaseTransferFd`，后者是唯一可能递归进 finishClose 的路径）。
   `resourceIdxFromDesc` 补上 `.unix_socket`（此前所有 unix fd 映射到 0 互相冲突）。
-  **未做**：跨进程（fork 后仅子进程持副本）仍按旧行为删除——需要资源级引用计数；
+  **未做（§6.55 已实现，见“epoll 注册跨 fork 存活”）**：跨进程（fork 后仅子进程持副本）仍按旧行为删除——需要资源级引用计数；
   探测改用 `item.fd_table`（§6.51 缺陷 B）同样搁置：FdTable 来自静态池，freeFdTable
   后重新分配会把 fd_generations 重置为 1，新进程的 fd 可通过三重校验冒充旧注册。
 - **unix_socket epoll 事件**（§6.51 残留 #2，`net/unix_epoll_policy.zig`）：
@@ -3799,7 +3799,10 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   再次出现时按 reaper/TLB shootdown 方向排查。
 - futex 仅实现 private WAIT/WAKE（WAKE 以 INT_MAX 即可广播）；共享键、REQUEUE、
   PI、WAKE_OP、BITSET 返回 `-ENOSYS`——hello69 固化的既定契约，非缺陷。
-- fat32/ext2 早期残留见 §6.51–§6.54 残留表（ext2 时间戳/blocks 已修）。
+- ext2 崩溃于最后一次 close 之前会留下 links=0 的已分配孤儿 inode（ext2 无 orphan
+  list，需 fsck）；truncate 在 `updateDirEntry` 失败时旧数据已被清零（I/O 失败窗口，
+  完全消除需要日志）。两者都是文件系统一致性设计，不做局部补丁。
+- fbcon 无 CJK/UTF-8（功能缺口）；树顶 usb/gpu/input 空骨架目录（建议删除或标注）。
 
 | Gate | Result | Notes |
 |---|---|---|
