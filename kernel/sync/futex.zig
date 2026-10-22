@@ -50,11 +50,17 @@ pub var buckets: [FUTEX_HASH_BUCKETS]FutexBucket = @splat(.{ .head = null, .lock
 /// pattern as alarm_bm / itimer_bm.
 var wait_deadlines: [task_mod.MAX_TASKS]u64 = @splat(0);
 var wait_buckets: [task_mod.MAX_TASKS]?*FutexBucket = @splat(null);
+/// Arm sequence per task slot. The tick snapshots it before acting and only
+/// disarms if it is unchanged, so a waiter that finished and immediately
+/// started a NEW timed wait in the gap cannot have its fresh deadline wiped
+/// (or be timed out early) by the stale scan.
+var wait_seq: [task_mod.MAX_TASKS]u64 = @splat(0);
 pub var futex_wait_bm: u64 = 0;
 
 /// Arm a timed-wait deadline. Caller holds bucket.lock while enqueuing, and
 /// timerTick unlinks under the same lock, so arming here is race-free.
 fn armWaitDeadline(task_idx: u32, bucket: *FutexBucket, deadline_ns: u64) void {
+    _ = @atomicRmw(u64, &wait_seq[task_idx], .Add, 1, .seq_cst);
     wait_buckets[task_idx] = bucket;
     wait_deadlines[task_idx] = deadline_ns;
     // Atomic RMW — futex_wait_bm is read by the BSP timer tick on another CPU.
@@ -63,6 +69,7 @@ fn armWaitDeadline(task_idx: u32, bucket: *FutexBucket, deadline_ns: u64) void {
 
 /// Disarm a timed-wait deadline (woken, timed out, or wait abandoned).
 fn disarmWaitDeadline(task_idx: u32) void {
+    _ = @atomicRmw(u64, &wait_seq[task_idx], .Add, 1, .seq_cst);
     wait_deadlines[task_idx] = 0;
     _ = @atomicRmw(u64, &futex_wait_bm, .And, ~(@as(u64, 1) << @intCast(task_idx)), .seq_cst);
     wait_buckets[task_idx] = null;
@@ -122,16 +129,21 @@ pub fn timerTick(now_ns: u64) void {
         const i: u6 = @truncate(@ctz(bm));
         bm &= bm - 1;
         const idx: u32 = i;
+        const seq = @atomicLoad(u64, &wait_seq[idx], .seq_cst);
         const deadline = wait_deadlines[idx];
         if (deadline == 0 or now_ns < deadline) continue;
-        const bucket = wait_buckets[idx] orelse {
-            disarmWaitDeadline(idx);
-            continue;
-        };
+        const bucket = wait_buckets[idx] orelse continue;
         // Unlink the waiter under its bucket lock (races with wakeN, which
         // removes the node under the same lock — loser finds nothing).
         var unlinked = false;
         const irq_flags = bucket.lock.acquire();
+        // Re-validate under the bucket lock: the waiter disarms/re-arms with
+        // this lock held around its node lifetime, so an unchanged sequence
+        // here proves the deadline we read still belongs to this wait.
+        if (@atomicLoad(u64, &wait_seq[idx], .seq_cst) != seq) {
+            bucket.lock.release(irq_flags);
+            continue;
+        }
         var prev: ?*task_mod.WaitNode = null;
         var current = bucket.head;
         while (current) |n| {
@@ -147,10 +159,10 @@ pub fn timerTick(now_ns: u64) void {
             prev = n;
             current = n.next;
         }
+        // Drop the deadline only if this is still the same armed wait (the
+        // sequence check above ran under the same bucket lock).
+        if (@atomicLoad(u64, &wait_seq[idx], .seq_cst) == seq) disarmWaitDeadline(idx);
         bucket.lock.release(irq_flags);
-        // Drop the deadline either way so a stale bit cannot fire on a later
-        // untimed wait when the slot is reused.
-        disarmWaitDeadline(idx);
         if (!unlinked) continue; // Already woken or cleaned up
         // Republish like wakeN: a bare .ready starves on busy CPUs.
         task_mod.unblockTask(idx);
@@ -317,6 +329,14 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
                 error.Invalid => return -22, // -EINVAL
             };
             var node: task_mod.WaitNode = .{ .task_idx = 0 };
+            // Fault the futex word in BEFORE taking the IRQ-off bucket lock:
+            // a swapped-out page is swapped back in by the copy's fault path,
+            // which would otherwise run disk I/O with IRQs disabled under a
+            // spinlock. The locked re-read below is then a resident-page read.
+            // (The page can be re-swapped between the two reads only under
+            // extreme reclaim pressure; the locked read still returns the
+            // correct value, merely slowly — no correctness loss.)
+            _ = copyUserU32(addr) catch return -14; // -EFAULT
             const irq_flags = bucket.lock.acquire();
             // v53.51: Check-and-enqueue atomically w.r.t. FUTEX_WAKE — the
             // canonical futex protocol. Reading *addr before taking the lock
