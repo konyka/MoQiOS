@@ -44,6 +44,8 @@ static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_SIGRETURN   15
 #define SYS_GETPID      39
 #define SYS_TKILL       223
+#define SYS_RT_SIGTIMEDWAIT 221
+#define SYS_CLOCK_GETTIME 228
 
 #define SIGKILL  9
 #define SIGUSR1  10
@@ -163,6 +165,24 @@ void _start(void) {
     check(install(SIGKILL, on_usr1, 0, 0) == -22, "E: sigaction(SIGKILL, handler) is EINVAL");
     check(install(SIGSTOP, (void (*)(int))1, 0, 0) == -22, "E: sigaction(SIGSTOP, SIG_IGN) is EINVAL");
     check(syscall3(SYS_SIGACTION, SIGKILL, 0, (uint64_t)&cur) == 0, "E: querying SIGKILL is allowed");
+
+    /* F. sigtimedwait blocks until its timeout, then EAGAIN; a pending
+     *    blocked signal in the set returns at once with its number. */
+    uint64_t wait_set = bit(SIGUSR2);
+    set_mask(bit(SIGUSR2));
+    int64_t ts0[2] = { 0, 0 }, ts1[2] = { 0, 0 };
+    int64_t tmo[2] = { 0, 200000000 }; /* 200 ms */
+    syscall2(SYS_CLOCK_GETTIME, 1, (uint64_t)ts0);
+    const int64_t w1 = syscall4(SYS_RT_SIGTIMEDWAIT, (uint64_t)&wait_set, 0, (uint64_t)tmo, 8);
+    syscall2(SYS_CLOCK_GETTIME, 1, (uint64_t)ts1);
+    const int64_t waited_ms = (ts1[0] - ts0[0]) * 1000 + (ts1[1] - ts0[1]) / 1000000;
+    check(w1 == -11, "F: sigtimedwait times out with EAGAIN");
+    check(waited_ms >= 150, "F: sigtimedwait actually waited");
+    raise_sig(SIGUSR2);
+    check(syscall4(SYS_RT_SIGTIMEDWAIT, (uint64_t)&wait_set, 0, (uint64_t)tmo, 8) == SIGUSR2,
+          "F: pending signal returned by sigtimedwait");
+    check(usr2_hits == 1, "F: consumed signal did not run its handler");
+    set_mask(0);
 
     print(failures == 0 ? "hello109: PASS\n" : "hello109: FAIL\n");
     print("hello109 done\n");

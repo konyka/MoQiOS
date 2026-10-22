@@ -1176,6 +1176,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         220 => { // rt_sigsuspend(mask, sigsetsize)
             frame.rax = @bitCast(signal_syscall_mod.rtSigsuspend(frame.rdi, frame.rsi));
+            // Deliver the waking signal (and run the deferred mask restore).
+            checkSignalsOnSyscallReturn(frame);
         },
         221 => { // rt_sigtimedwait(sigset, info, timeout, sigsetsize)
             frame.rax = @bitCast(signal_syscall_mod.rtSigtimedwait(frame.rdi, frame.rsi, frame.rdx, frame.r10));

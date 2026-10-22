@@ -44,6 +44,10 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_MSGGET         156
 #define SYS_MSGCTL         159
 #define SYS_RT_SIGSUSPEND  220
+#define SYS_SIGACTION      13
+#define SYS_GETPID         39
+#define SYS_TKILL          223
+#define SIGUSR1            10
 
 #define EFAULT 14
 #define EINTR  4
@@ -56,6 +60,9 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define MAP_PRIVATE   2
 #define MAP_ANONYMOUS 0x20
 #define PAGE          4096
+
+static volatile int usr1_seen = 0;
+static void on_usr1(int s) { (void)s; usr1_seen = 1; }
 
 static void print(const char *s) {
     uint64_t n = 0;
@@ -109,10 +116,20 @@ void _start(void) {
     if (syscall3(SYS_MSGCTL, msgid, IPC_STAT, (uint64_t)msg_info) != 0) fail("msgctl stat after set");
     if (msg_info[4] != new_mode) fail("msgctl mode after set");
 
-    observed_mask = (uint64_t)1 << 2;
-    if (syscall2(SYS_RT_SIGSUSPEND, (uint64_t)&observed_mask, 4) != -EINTR) fail("rt_sigsuspend success");
+    /* Standard sigsuspend pattern: SIGUSR1 is blocked and already pending;
+     * sigsuspend with a mask that unblocks it runs the handler, returns
+     * EINTR, and restores the ORIGINAL mask (not the temporary one). */
+    struct { uint64_t handler, flags, restorer, mask; } act = { (uint64_t)on_usr1, 0, 0, 0 };
+    if (syscall3(SYS_SIGACTION, SIGUSR1, (uint64_t)&act, 0) != 0) fail("sigaction SIGUSR1");
+    uint64_t blocked = observed_mask | ((uint64_t)1 << (SIGUSR1 - 1));
+    if (syscall6(SYS_SIGPROCMASK, 2, (uint64_t)&blocked, 0, 8, 0, 0) != 0) fail("block SIGUSR1");
+    syscall2(SYS_TKILL, (uint64_t)syscall1(SYS_GETPID, 0), SIGUSR1);
+    if (usr1_seen) fail("blocked SIGUSR1 delivered early");
+    uint64_t suspend_mask = (uint64_t)1 << 2;
+    if (syscall2(SYS_RT_SIGSUSPEND, (uint64_t)&suspend_mask, 4) != -EINTR) fail("rt_sigsuspend success");
+    if (!usr1_seen) fail("rt_sigsuspend did not run the handler");
     if (syscall6(SYS_SIGPROCMASK, 2, 0, (uint64_t)&expected_mask, 8, 0, 0) != 0) fail("sigprocmask get after success");
-    if (expected_mask != observed_mask) fail("rt_sigsuspend mask");
+    if (expected_mask != blocked) fail("rt_sigsuspend mask");
 
     syscall3(SYS_MSGCTL, msgid, IPC_RMID, 0);
     syscall3(SYS_SHMCTL, shmid, IPC_RMID, 0);

@@ -309,14 +309,35 @@ pub fn rtSigsuspend(mask_ptr: u64, sigsetsize: u64) i64 {
     var new_mask: u64 = 0;
     const mask_bytes: [*]u8 = @ptrCast(&new_mask);
     if (copy.copyFromUser(mask_bytes[0..width], @ptrFromInt(mask_ptr), width) != width) return -14;
+
+    // POSIX: atomically install the temporary mask and sleep until a signal
+    // that is deliverable under it arrives; always return EINTR, and restore
+    // the original mask only AFTER the handler has run (deferred restore,
+    // same mechanism as epoll_pwait — the handler frame saves saved_sigmask).
+    // It used to return EINTR at once and leave the temporary mask in place.
+    const saved = cur.signal_mask;
     cur.signal_mask = action_policy.sanitizeMask(new_mask);
+    while (!sig_mod.pendingActionable(cur) and sig_mod.pendingFatal(cur) == null) {
+        task_mod.blockTask(cur_idx);
+        // sendSignal → kickIfBlocked unblocks us once the signal is pending
+        // and actionable under the current (temporary) mask. Re-check after
+        // blocking so a signal raced in before the block is not lost.
+        if (sig_mod.pendingActionable(cur) or sig_mod.pendingFatal(cur) != null) {
+            task_mod.unblockTask(cur_idx);
+            break;
+        }
+        sched.forceReschedule();
+        sched.repairCurrentAfterBlock();
+    }
+    if (sig_mod.pendingFatal(cur)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+    cur.saved_sigmask = saved;
+    cur.restore_sigmask_pending = true;
     return -4; // EINTR
 }
 
 /// rt_sigtimedwait(sigset_ptr, info_ptr, timeout_ptr, sigset_size) → signal number or -errno
 pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_size: u64) i64 {
     _ = info_ptr;
-    _ = timeout_ptr;
 
     if (sigset_size == 0 or sigset_ptr == 0 or sigset_ptr >= 0x0000_8000_0000_0000) return -22;
 
@@ -332,13 +353,41 @@ pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_s
 
     // Atomic load + Rmw like dequeueSignal: a plain read-modify-write races
     // with sendSignal's atomic Rmw on another CPU and can lose a signal bit.
-    const pending = @atomicLoad(u32, &cur.pending_signals, .seq_cst) & mask;
-    if (pending != 0) {
-        const bit: u5 = @intCast(@ctz(pending));
-        _ = @atomicRmw(u32, &cur.pending_signals, .And, ~(@as(u32, 1) << bit), .seq_cst);
-        return @as(i64, bit) + 1;
+    // Optional relative timeout: null pointer = wait forever; {0,0} = poll.
+    var deadline: ?u64 = null;
+    const tsc = @import("../arch/arch.zig").tsc;
+    if (timeout_ptr != 0) {
+        var ts: [16]u8 = undefined;
+        if (copy.copyFromUser(&ts, @ptrFromInt(timeout_ptr), 16) != 16) return -14;
+        const sec: i64 = @bitCast(ts[0..8].*);
+        const nsec: i64 = @bitCast(ts[8..16].*);
+        if (sec < 0 or nsec < 0 or nsec >= 1_000_000_000) return -22;
+        const total = @as(u64, @intCast(sec)) *| 1_000_000_000 +| @as(u64, @intCast(nsec));
+        deadline = tsc.nanos() +| total;
     }
-    return -11; // EAGAIN
+
+    while (true) {
+        // Atomic load + Rmw like dequeueSignal: a plain read-modify-write
+        // races with sendSignal's atomic Rmw on another CPU.
+        const pending = @atomicLoad(u32, &cur.pending_signals, .seq_cst) & mask;
+        if (pending != 0) {
+            const bit: u5 = @intCast(@ctz(pending));
+            _ = @atomicRmw(u32, &cur.pending_signals, .And, ~(@as(u32, 1) << bit), .seq_cst);
+            return @as(i64, bit) + 1;
+        }
+        // A signal outside the wait set that would run a handler ends the
+        // wait with EINTR; a fatal one kills the task.
+        if (sig_mod.pendingFatal(cur)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+        if (sig_mod.pendingActionable(cur)) return -4; // EINTR
+        if (deadline) |d| {
+            if (tsc.nanos() >= d) return -11; // EAGAIN: timed out
+        }
+        // Sleep until the next tick (timed wait) or a signal kick. The waited
+        // signals are normally blocked by the caller, so kickIfBlocked does not
+        // wake us for them: yield one tick at a time and re-check. Coarse but
+        // bounded (tick = 10 ms) and lost-wakeup free by construction.
+        sched.forceReschedule();
+    }
 }
 
 /// rt_sigqueueinfo(tgid, sig, uinfo_ptr) → 0 or -errno
