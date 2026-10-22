@@ -66,3 +66,25 @@ test "fromExt2 carries blocks and timestamps" {
     try std.testing.expectEqual(@as(u64, 200), s.mtime);
     try std.testing.expectEqual(@as(u64, 300), s.ctime);
 }
+
+const fu = @import("kernel_shared").fat32_util;
+
+test "FAT timestamps round-trip at 2-second resolution" {
+    const cases = [_]u64{ 315532800, 951782400, 1700000000, 1792659426, 4102444798 };
+    for (cases) |t| {
+        const s = fu.unixToDos(t);
+        try std.testing.expectEqual(t - (t % 2), fu.dosToUnix(s.date, s.time));
+    }
+}
+
+test "FAT timestamps clamp to the FAT epoch and treat date 0 as unset" {
+    const s = fu.unixToDos(0);
+    try std.testing.expectEqual(@as(u64, 315532800), fu.dosToUnix(s.date, s.time));
+    try std.testing.expectEqual(@as(u64, 0), fu.dosToUnix(0, 0));
+}
+
+test "FAT directory entry write time is stored at offsets 22..25" {
+    var e: [32]u8 = @splat(0);
+    fu.setDirEntryMtime(&e, fu.unixToDos(1700000000));
+    try std.testing.expectEqual(@as(u64, 1700000000), fu.dirEntryMtime(&e));
+}

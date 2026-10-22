@@ -31,6 +31,8 @@ pub const FileInfo = struct {
     last_walk_cluster: u32 = 0, // v53.38: cached cluster for readFile chain walk (P1 fix)
     last_walk_idx: u32 = 0, // v53.38: cluster index of last_walk_cluster
     is_dir: bool,
+    /// Last-write time in Unix seconds (directory entry @22/@24); 0 = unset.
+    mtime: u64 = 0,
     // v53.51: deleteFile tombstones the slot instead of shifting files[], so
     // indices held by open fds and writeback buffers stay stable.
     active: bool = false,
@@ -328,6 +330,7 @@ fn listRootDir() void {
                     .first_cluster = fat_util.dirEntryFirstCluster(entry),
                     .last_cluster = 0,
                     .is_dir = fat_util.isDirectoryAttr(attr),
+                    .mtime = fat_util.dirEntryMtime(entry),
                     .active = true,
                 };
 
@@ -955,6 +958,10 @@ pub fn createFile(name: []const u8) i64 {
     short_ent[11] = fat_util.ATTR_ARCHIVE;
     fat_util.setDirEntryFirstCluster(&short_ent, new_cluster);
     fat_util.setDirEntrySize(&short_ent, 0);
+    const created = nowSeconds();
+    const stamp = fat_util.unixToDos(created);
+    fat_util.setDirEntryCtime(&short_ent, stamp);
+    fat_util.setDirEntryMtime(&short_ent, stamp);
     write_slots[lfn_count] = short_ent;
 
     if (!writeRootEntryRun(dest, write_slots[0..need])) {
@@ -969,6 +976,7 @@ pub fn createFile(name: []const u8) i64 {
         .first_cluster = new_cluster,
         .last_cluster = new_cluster,
         .is_dir = false,
+        .mtime = created,
         .active = true,
     };
     @memcpy(fi.name[0..name.len], name);
@@ -1216,6 +1224,31 @@ pub fn writePageByInode(first_cluster: u32, page_idx: u64, data: *const [4096]u8
 /// v53.52: returns false when the on-disk entry could not be updated (scan
 /// I/O error, entry not found, or the sector write failed) — the in-memory
 /// size then diverges from disk and the caller must not claim success.
+fn nowSeconds() u64 {
+    if (comptime @import("builtin").cpu.arch != .x86_64) return 0;
+    return @import("../proc/time_syscall.zig").wallClockNanos() / 1_000_000_000;
+}
+
+/// mtime for fstat (Unix seconds, 0 when never stamped).
+pub fn getMtime(idx: u32) u64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (idx >= file_count) return 0;
+    return files[idx].mtime;
+}
+
+/// write() staged in the writeback cache: POSIX requires mtime to change
+/// when write() returns, but the data and the directory entry are only
+/// written at flush time. Record the time now; the flush's updateDirEntry
+/// (or a later size change) persists it. In-memory only, so a crash before
+/// flush loses the stamp along with the data.
+pub fn touchModified(idx: u32) void {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (idx >= file_count or !files[idx].active) return;
+    files[idx].mtime = nowSeconds();
+}
+
 fn updateDirEntry(file_idx: u32) bool {
     if (file_idx >= file_count) return false;
     const fi = files[file_idx];
@@ -1242,6 +1275,10 @@ fn updateDirEntry(file_idx: u32) bool {
                 const entry = buf + off;
                 if (fat_util.dirEntryFirstCluster(entry) == fi.first_cluster) {
                     fat_util.setDirEntrySize(entry, fi.size);
+                    // Every caller is a content change (write growth, truncate).
+                    const now = nowSeconds();
+                    fat_util.setDirEntryMtime(entry, fat_util.unixToDos(now));
+                    files[file_idx].mtime = now;
                     return safeWriteSectors(lba, 1, buf) > 0;
                 }
             }

@@ -668,3 +668,77 @@ pub fn buildLfnEntries(
     }
     return nslots;
 }
+
+// ─── FAT timestamps (local time is taken as UTC) ────────────────────────
+
+/// Days since 1970-01-01 for a civil date (proleptic Gregorian).
+fn daysFromCivil(y_in: i64, m: u32, d: u32) i64 {
+    const y = if (m <= 2) y_in - 1 else y_in;
+    const era = @divFloor(y, 400);
+    const yoe: i64 = y - era * 400;
+    const mp: i64 = if (m > 2) m - 3 else m + 9;
+    const doy: i64 = @divFloor(153 * mp + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+pub const DosStamp = struct { date: u16, time: u16 };
+
+/// Unix seconds → FAT date/time (2-second resolution, years 1980..2107).
+/// Out-of-range values clamp to the FAT epoch/limit.
+pub fn unixToDos(unix: u64) DosStamp {
+    const min_unix: u64 = 315532800; // 1980-01-01
+    const max_unix: u64 = 4354819198; // 2107-12-31 23:59:58
+    const t = @min(@max(unix, min_unix), max_unix);
+    const days: i64 = @intCast(t / 86400);
+    const secs: u32 = @intCast(t % 86400);
+    // civil from days (inverse of daysFromCivil)
+    const z = days + 719468;
+    const era = @divFloor(z, 146097);
+    const doe = z - era * 146097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const d: u32 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
+    const m: u32 = @intCast(if (mp < 10) mp + 3 else mp - 9);
+    const y: i64 = yoe + era * 400 + @as(i64, if (m <= 2) 1 else 0);
+    const year_off: u16 = @intCast(y - 1980);
+    return .{
+        .date = (year_off << 9) | (@as(u16, @intCast(m)) << 5) | @as(u16, @intCast(d)),
+        .time = (@as(u16, @intCast(secs / 3600)) << 11) | (@as(u16, @intCast((secs / 60) % 60)) << 5) | @as(u16, @intCast((secs % 60) / 2)),
+    };
+}
+
+/// FAT date/time → Unix seconds. A zero date (never stamped) maps to 0.
+pub fn dosToUnix(date: u16, time: u16) u64 {
+    if (date == 0) return 0;
+    const y: i64 = 1980 + @as(i64, date >> 9);
+    const m: u32 = @max(1, @min(12, (date >> 5) & 0xF));
+    const d: u32 = @max(1, date & 0x1F);
+    const days = daysFromCivil(y, m, d);
+    const secs: u64 = @as(u64, time >> 11) * 3600 + @as(u64, (time >> 5) & 0x3F) * 60 + @as(u64, time & 0x1F) * 2;
+    return @as(u64, @intCast(days)) * 86400 + secs;
+}
+
+/// Write-time (@22/@24), creation (@14/@16) and access date (@18) fields.
+pub fn setDirEntryMtime(entry: [*]u8, s: DosStamp) void {
+    entry[22] = @truncate(s.time);
+    entry[23] = @truncate(s.time >> 8);
+    entry[24] = @truncate(s.date);
+    entry[25] = @truncate(s.date >> 8);
+    entry[18] = @truncate(s.date);
+    entry[19] = @truncate(s.date >> 8);
+}
+
+pub fn setDirEntryCtime(entry: [*]u8, s: DosStamp) void {
+    entry[14] = @truncate(s.time);
+    entry[15] = @truncate(s.time >> 8);
+    entry[16] = @truncate(s.date);
+    entry[17] = @truncate(s.date >> 8);
+}
+
+pub fn dirEntryMtime(entry: [*]const u8) u64 {
+    const time: u16 = @bitCast([2]u8{ entry[22], entry[23] });
+    const date: u16 = @bitCast([2]u8{ entry[24], entry[25] });
+    return dosToUnix(date, time);
+}

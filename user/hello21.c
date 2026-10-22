@@ -67,6 +67,24 @@ void _start(void) {
     print_dec(n);
     print("\n");
 
+    // fstat must report a modification time set by write() itself and a
+    // block count once the data is on disk.
+    {
+        static uint64_t st[18];
+        int64_t r = syscall3(110, (uint64_t)fd, (uint64_t)st, 0);
+        uint64_t mtime = st[11];           /* st_mtime @88 */
+        syscall3(74, (uint64_t)fd, 0, 0);  /* fsync */
+        if (r == 0) r = syscall3(110, (uint64_t)fd, (uint64_t)st, 0);
+        if (r == 0 && st[8] > 0 && mtime > 1600000000) print("hello21: fstat times/blocks ok\n"); /* st_blocks @64 */
+        else {
+            print("hello21: fstat times/blocks FAIL blocks=");
+            print_dec((int64_t)st[8]);
+            print(" mtime=");
+            print_dec((int64_t)mtime);
+            print("\n");
+        }
+    }
+
     // Close the file
     syscall1(SYS_CLOSE, (uint64_t)fd);
 

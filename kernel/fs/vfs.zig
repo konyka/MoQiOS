@@ -1327,7 +1327,9 @@ pub const FdTable = struct {
                 const gate = fsizeGate(desc.offset, count);
                 if (gate < 0) return gate;
                 // Use writeback for delayed write coalescing
-                return bufferedWrite(desc, desc.fat32_file_idx, buf, @intCast(gate), .fat32);
+                const n = bufferedWrite(desc, desc.fat32_file_idx, buf, @intCast(gate), .fat32);
+                if (n > 0) @import("fat32.zig").touchModified(desc.fat32_file_idx);
+                return n;
             },
             .ramdisk_file => return -1,
             .ext2_file => {
@@ -1503,7 +1505,9 @@ pub const FdTable = struct {
                 if (gate < 0) return gate;
                 // Stage through the writeback cache like write() does so that
                 // write()-then-pwrite() ordering survives a later flush.
-                return bufferedWriteAt(desc, desc.fat32_file_idx, buf, @intCast(gate), offset, .fat32);
+                const n = bufferedWriteAt(desc, desc.fat32_file_idx, buf, @intCast(gate), offset, .fat32);
+                if (n > 0) @import("fat32.zig").touchModified(desc.fat32_file_idx);
+                return n;
             },
             .ext2_file => {
                 if (!desc.writable) return -9; // EBADF

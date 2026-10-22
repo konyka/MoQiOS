@@ -57,6 +57,16 @@ pub fn fstat(fd: u64, stat_ptr: u64) i64 {
     const size: i64 = @intCast(fdesc.file_size);
     bo.writeI64Le(stat_buf[48..56], size);
 
+    if (fdesc.fd_type == .fat32_file) {
+        const fat32 = @import("fat32.zig");
+        const mtime = fat32.getMtime(fdesc.fat32_file_idx);
+        bo.writeU64Le(stat_buf[56..64], 4096); // st_blksize
+        bo.writeU64Le(stat_buf[64..72], (fdesc.file_size + 511) / 512); // st_blocks
+        // FAT keeps one write time; report it for all three (atime is a date only).
+        bo.writeU64Le(stat_buf[72..80], mtime);
+        bo.writeU64Le(stat_buf[88..96], mtime);
+        bo.writeU64Le(stat_buf[104..112], mtime);
+    }
     if (fdesc.fd_type == .ext2_file) {
         var info: @import("stat_info.zig").StatInfo = .{};
         if (@import("ext2.zig").statInode(fdesc.ext2_file_idx, &info)) {

@@ -237,6 +237,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
        ! grep -q "hello67: FAIL" "$LOG_FILE" &&
        grep -q "\[NVMe\] MSI-X interrupts enabled" "$LOG_FILE" &&
        grep -q "\[ahci\] boot write+readback verified" "$LOG_FILE" &&
+       grep -q "hello21: fstat times/blocks ok" "$LOG_FILE" &&
        grep -q "hello21 done" "$LOG_FILE" &&
        grep -q "hello29: PASS" "$LOG_FILE" &&
        grep -q "hello29: fsync PASS" "$LOG_FILE" &&
