@@ -228,6 +228,10 @@ pub const Task = struct {
     saved_sigmask: u64 = 0,
     restore_sigmask_pending: bool = false,
 
+    /// Set by the file-fault path when the faulting page lies wholly past
+    /// EOF; the user #PF path then raises SIGBUS instead of SIGSEGV.
+    fault_sigbus: bool = false,
+
     /// Alternate signal stack base address (0 = not set, use user RSP).
     sigaltstack_base: u64,
 

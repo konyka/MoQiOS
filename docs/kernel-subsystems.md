@@ -270,8 +270,9 @@ H1 再加 `shared` 字段记录 MAP_SHARED），不触碰页表；首次访问�
   判定——ramdisk fd 永远不可写，否则 EROFS 不可达）；ramdisk 只读 MAP_SHARED 允许，
   缺页时与 MAP_PRIVATE 一样复制为私有页（安全选择：ramdisk 帧是 Limine 模块内存、不属于
   PMM，直接映射会让 unmap 把它喂给空闲池；只读共享与私有副本字节相同，无观测差异）。
-- **EOF 语义**：整页越过 EOF 的访问 → SIGSEGV（Linux 是 SIGBUS，本内核统一 SEGV，状态码 139）；
-  最后一个部分页正常供给，尾部清零。`file_size` 取 mmap 时的快照。
+- **EOF 语义**：整页越过 EOF 的访问 → SIGBUS（Linux 语义，§6.55 起；此前为 SIGSEGV）；
+  最后一个部分页正常供给，尾部清零。`file_size` 取 mmap 时的快照，判越界前刷新为实际
+  大小（含 writeback 暂存），映射后增长的页可访问。
 - **零拷贝共享帧**：tmpfs 直接映射其数据页；ext2/fat32 经 page_cache
   （命中 `getPageFrame` 直接拿物理帧；未命中先 `readFile` 填充缓存再取）。
   共享帧一律先 `pmm.addRef` 再以"只读 + COW 位(bit9)"映射——即使 PROT_WRITE，
@@ -320,8 +321,8 @@ H1 再加 `shared` 字段记录 MAP_SHARED），不触碰页表；首次访问�
   MAP_SHARED 文件区域内的页跳过一次 COW 降级（否则子进程首写会被复制成私有页，
   父进程永远看不到），addRef 记账不变；munmap/exit 时各地址空间 decRef 平衡。
 - **mremap/mprotect 补齐（H1）**：文件区域允许**原地增长**（新页不预映射，按需缺页；
-  越过记录文件大小的页访问即 SIGSEGV，与 Linux 允许增长过 EOF 但访问即 SIGBUS 的
-  语义对应；移动文件区域仍拒绝——moveMapping 会把未缺页的共享帧换成私有零页）。
+  越过文件实际大小的页访问即 SIGBUS，与 Linux 允许增长过 EOF 但访问即 SIGBUS 的
+  语义一致；移动文件区域仍拒绝——moveMapping 会把未缺页的共享帧换成私有零页）。
   mprotect 在改 PTE 之外同步更新文件区域的 prot 元数据（`filemap.planProtUpdate`
   分类 cover/head/tail/middle，部分覆盖时拆区域、ext2 片各补一次 retain，拆前先做
   槽位容量检查）；对获得 PROT_WRITE 的 MAP_SHARED ext2/fat32 区域，顺手把已缓存页
@@ -346,7 +347,7 @@ H1 再加 `shared` 字段记录 MAP_SHARED），不触碰页表；首次访问�
   同一地址空间多线程并发缺同一文件页时后写 PTE 者胜出（与既有匿名按需分页同级竞态）。
 - **运行时覆盖**：`user/hello46.c`（tmpfs 文件写模式串 → MAP_PRIVATE 映射 →
   close(fd) 后验证内容 → 尾部清零 → 写穿透后 pread 验证文件不变（COW）→
-  fork 子进程缺页继承区域 + 越过 EOF 整页 SIGSEGV(139)），
+  fork 子进程缺页继承区域 + 越过 EOF 整页 SIGBUS），
   门禁标记 `hello46: PASS` / `hello46 done`；
   `user/hello48.c`（tmpfs MAP_SHARED fork 后子写父读零系统调用可见 →
   ext2 MAP_SHARED 写透 + msync 后另一 fd pread 验证落盘 →
@@ -826,7 +827,7 @@ const SchedStats = struct {
 - ext2 最后一个链接被 unlink/rename 覆盖时，若 inode 仍被打开则只摘目录项并持久化 links_count=0，回收延迟到最后一次 close（tmpfs/FAT32 同语义）；fstat/statx 对 ext2 fd 报真实 inode 号、mode、nlink、uid/gid 与 `max(盘上, fd 缓存)` 尺寸。（§6.53）
 - epoll 注册在 fd 关闭时迁移到同表中仍存活的同资源副本（dup 场景），无副本才删除；unix_socket 报 IN/OUT/HUP/ERR 并在收发/连接/关闭时通知。TCP close/SHUT_WR 先冲刷发送环、环排空后才发 FIN；被对端 RST 的连接空读返回 `-ECONNRESET`；临时端口跳过已占用端口。MoqIPC call 的 reply 走独立 `reply_msg` 槽，不与入站 send 的 `pending_msg` 互相覆盖。moqi_libc malloc 检测同线程重入（malloc 返回 NULL、free 延迟），free 拒绝 double free 与非堆指针。（§6.54）
 - 信号：sigaction 遵守 `sa_mask`/`SA_NODEFER`/`SA_RESETHAND`，信号帧保存 FXSAVE 并跳过 red zone；sigsuspend、epoll_pwait 的临时掩码在返回用户态后才恢复；rt_sigtimedwait 阻塞并支持超时；同步 SIGSEGV 被阻塞/忽略时强制默认动作；Ctrl+C 只发前台进程组。kill 遵守 POSIX 权限（同 uid/root）、`kill(pid,0)` 探测、`kill(0,sig)` 发本组、`kill(-1,sig)` 发除 init 与自身外的全部进程、`-ESRCH`/`-EPERM`。子进程退出投递 SIGCHLD，父进程 SIG_IGN SIGCHLD 时自动回收。waitpid 返回 Linux 状态编码；孤儿 getppid 返回 1；会话首进程退出只向前台组与含停止成员的孤儿组发 SIGHUP。SA_ONSTACK 处理程序在 sigaltstack 上运行（在栈上修改为 EPERM，CLONE_VM 线程与 exec 清空）；信号帧无法写入时进程以 SIGSEGV 终止而非丢弃信号。（§6.55）
-- TCP recv 在环空时阻塞到数据/EOF/RST/信号/`SO_RCVTIMEO`；madvise(MADV_DONTNEED) 真实丢页（匿名页清零或换零页，文件页重读）；futex 在关中断锁外预取用户字；pmm 引用计数饱和后钉住不再递减（泄漏优先于 UAF）；只读 fd 的 MAP_SHARED 映射不能经 mprotect 获得 PROT_WRITE（EACCES）。（§6.55）
+- TCP recv 在环空时阻塞到数据/EOF/RST/信号/`SO_RCVTIMEO`；madvise(MADV_DONTNEED) 真实丢页（匿名页清零或换零页，文件页重读）；futex 在关中断锁外预取用户字；pmm 引用计数饱和后钉住不再递减（泄漏优先于 UAF）；只读 fd 的 MAP_SHARED 映射不能经 mprotect 获得 PROT_WRITE（EACCES）；文件映射整页越过 EOF 的访问投递 SIGBUS，越界判定前刷新文件实际大小（含 writeback 暂存），映射后文件增长的页可正常访问。（§6.55）
 - SysV msgrcv 按入队单调 seq 选择（msgtyp=0 严格 FIFO）；shmctl(IPC_STAT) 按 mode 读权限裁决；timerfd/eventfd 阻塞读写以槽位 generation 识别 close+复用，返回 EBADF。（§6.53）
 - `ftruncate`/`truncate` 接受全部有真实截断后端的可写 regular-file fd（ext2/FAT32/tmpfs），RLIMIT_FSIZE 的 SIGXFSZ/EFBIG 门先于后端分发；c76438a 曾误把 fsync 的类型门套到 ftruncate 上使 tmpfs 无法截断（§6.51 修复，hello42/hello66 锁定）。
 - epoll pool 生命周期采用 slot generation + transient active borrow；persistent `ref_count` 仅表示 fork/clone fd ownership，pool metadata 到 instance payload 遵守 `pool_lock -> inst.spin`。

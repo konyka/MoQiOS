@@ -8,7 +8,7 @@
 ///      unchanged (COW on the shared backing frame).
 ///   4. In a forked child (which inherits the region metadata but no faulted
 ///      pages), a never-touched page demand-faults correctly from the file,
-///      and a whole page past EOF raises SIGSEGV (waitpid status 139).
+///      and a whole page past EOF raises SIGBUS (Linux semantics).
 
 #include <stdint.h>
 
@@ -160,26 +160,26 @@ void _start(void) {
         fail("private writes not visible through mapping");
 
     /* 4. Child: demand fault on the page the parent never touched (page 1),
-          then SIGSEGV on a whole page past EOF (page 3). */
+          then SIGBUS on a whole page past EOF (page 3). */
     const int64_t child = syscall1(SYS_FORK, 0);
     if (child < 0) fail("fork");
     if (child == 0) {
         for (uint64_t i = PAGE; i < 2 * PAGE; i++) {
             if (p[i] != pattern(i)) syscall1(SYS_EXIT, 1);
         }
-        p[3 * PAGE] = 0xFF; /* whole page past EOF — must SIGSEGV */
+        p[3 * PAGE] = 0xFF; /* whole page past EOF — must SIGBUS */
         syscall1(SYS_EXIT, 1); /* reached only if the fault was not delivered */
         for (;;) {}
     }
     int64_t status = 0;
     syscall3(SYS_WAITPID, (uint64_t)-1, (uint64_t)&status, 0);
-    /* Linux wait status: exit(1) is 1 << 8; a SIGSEGV death is WTERMSIG 11. */
+    /* Linux wait status: exit(1) is 1 << 8; a SIGBUS death is WTERMSIG 7. */
     if (status == (1 << 8)) fail("child demand fault on inherited region");
-    if (status != 11) fail("past-EOF page did not SIGSEGV");
+    if (status != 7) fail("past-EOF page did not SIGBUS");
 
     if (syscall3(SYS_MUNMAP, (uint64_t)base, MAP_LEN, 0) != 0) fail("munmap");
 
-    print("hello46: PASS (file mmap demand paging, COW, EOF SIGSEGV)\n");
+    print("hello46: PASS (file mmap demand paging, COW, EOF SIGBUS)\n");
     print("hello46 done\n");
     syscall1(SYS_EXIT, 0);
     for (;;) {}

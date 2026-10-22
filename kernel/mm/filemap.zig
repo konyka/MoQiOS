@@ -113,8 +113,8 @@ pub fn planFault(comptime R: type, r: *const R, fault_page: u64) FaultPlan {
     if (r.prot == 0) return .{ .action = .prot_none };
     const page_index = (fault_page - r.base) / PAGE_SIZE;
     const file_off = r.file_offset + page_index * PAGE_SIZE;
-    // Linux semantics: a page wholly at/past EOF faults (SIGBUS there; this
-    // kernel delivers SIGSEGV). The last partial page is served, tail zeroed.
+    // Linux semantics: a page wholly at/past EOF raises SIGBUS (the #PF path
+    // maps .segv to SIGBUS). The last partial page is served, tail zeroed.
     if (file_off >= r.file_size) return .{ .action = .segv };
     const remaining = r.file_size - file_off;
     return .{

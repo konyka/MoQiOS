@@ -694,12 +694,14 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
                     // faulting instruction re-faults forever. If SIGSEGV is
                     // blocked or ignored, Linux force-kills (force_sig): reset
                     // it to SIG_DFL and unblock it before delivery.
-                    const segv_bit = @as(u64, 1) << (sig_mod.SIGSEGV - 1);
-                    if (cur.signal_handlers[sig_mod.SIGSEGV - 1] == 1 or (cur.signal_mask & segv_bit) != 0) {
-                        cur.signal_handlers[sig_mod.SIGSEGV - 1] = 0;
-                        cur.signal_mask &= ~segv_bit;
+                    const fault_sig = if (cur.fault_sigbus) sig_mod.SIGBUS else sig_mod.SIGSEGV;
+                    cur.fault_sigbus = false;
+                    const fault_bit = @as(u64, 1) << @intCast(fault_sig - 1);
+                    if (cur.signal_handlers[fault_sig - 1] == 1 or (cur.signal_mask & fault_bit) != 0) {
+                        cur.signal_handlers[fault_sig - 1] = 0;
+                        cur.signal_mask &= ~fault_bit;
                     }
-                    _ = sig_mod.sendSignal(cur.tid, sig_mod.SIGSEGV);
+                    _ = sig_mod.sendSignal(cur.tid, fault_sig);
                     if (sched_mod.deliverSignalToRunningTask(cur, frame)) {
                         return;
                     }
@@ -717,7 +719,7 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
         if (present) serial.writeString(", protection");
         serial.writeString(")\n");
 
-        task_mod.exitTask(139);
+        task_mod.exitTask(128 + @as(i32, @intCast(sig_mod.SIGSEGV)));
         return;
     }
 
@@ -1028,7 +1030,7 @@ fn mapZeroPrivatePage(current: anytype, page_addr: u64, prot: u8) bool {
 /// writes land on tmpfs's page or the page-cache frame directly; for
 /// ext2/fat32 the cache page is marked dirty and flushed at munmap/exit/
 /// exec (mmap.zig releaseRegionBacking) and by msync→vfs.syncAll. Pages
-/// wholly past EOF return false, which the caller turns into SIGSEGV.
+/// wholly past EOF return false and set task.fault_sigbus (→ SIGBUS).
 fn handleFileFault(current: anytype, page_addr: u64) bool {
     const filemap = @import("../../mm/filemap.zig");
     const paging_mod = @import("paging.zig");
@@ -1080,6 +1082,25 @@ fn handleFileFault(current: anytype, page_addr: u64) bool {
 /// protection record is the region metadata), or an exhausted allocator —
 /// the caller turns the faulting page's false into SIGSEGV and treats a
 /// prefault page's false as "stop the window".
+/// Live size of a file region's backing file (0 when unknown/stale).
+fn currentFileSize(region: anytype) u64 {
+    const filemap = @import("../../mm/filemap.zig");
+    const wb = @import("../../fs/writeback.zig");
+    const kind: filemap.FsKind = @enumFromInt(region.file_kind);
+    return switch (kind) {
+        .ext2 => @max(@import("../../fs/ext2.zig").refreshSize(region.file_idx), wb.stagedEnd(region.inode_id, .ext2)),
+        .fat32 => @max(@import("../../fs/fat32.zig").getFileSize(region.file_idx), wb.stagedEnd(region.inode_id, .fat32)),
+        .tmpfs => blk: {
+            const tmpfs = @import("../../fs/tmpfs.zig");
+            const idx: u8 = @intCast(region.file_idx);
+            // ctime is the generation tag: a recycled slot is another file.
+            if (tmpfs.tmpfsGetCtime(idx) != region.file_data) break :blk 0;
+            break :blk tmpfs.tmpfsGetSize(idx);
+        },
+        .ramdisk, .none => 0,
+    };
+}
+
 fn serveFilePage(current: anytype, page_addr: u64) bool {
     const pmm = @import("../../mm/pmm.zig");
     const hhdm = @import("../../mm/hhdm.zig");
@@ -1127,8 +1148,24 @@ fn serveFilePage(current: anytype, page_addr: u64) bool {
     const ri = filemap.findFileRegion(task_mod.MmapRegion, &current.mmap_regions, page_addr) orelse return false;
     const region = &current.mmap_regions[ri];
 
-    const plan = filemap.planFault(task_mod.MmapRegion, region, page_addr);
-    if (plan.action != .file_page) return false; // whole page past EOF, or PROT_NONE region
+    var plan = filemap.planFault(task_mod.MmapRegion, region, page_addr);
+    if (plan.action == .segv) {
+        // file_size is a snapshot from mmap time; the file may have grown
+        // since (write/ftruncate through another fd). Refresh and replan
+        // before declaring the page past EOF.
+        const fresh = currentFileSize(region);
+        if (fresh > region.file_size) {
+            region.file_size = fresh;
+            plan = filemap.planFault(task_mod.MmapRegion, region, page_addr);
+        }
+    }
+    if (plan.action == .segv) {
+        // Linux: an access to a page wholly past EOF of a file mapping is
+        // SIGBUS, not SIGSEGV. The user #PF path reads this marker.
+        current.fault_sigbus = true;
+        return false;
+    }
+    if (plan.action != .file_page) return false; // PROT_NONE region
 
     const kind: filemap.FsKind = @enumFromInt(region.file_kind);
     switch (kind) {

@@ -152,6 +152,25 @@ fn findOrAllocBufferLocked(inode_id: u64, file_idx: u32, byte_offset: u64, fs_ty
     bmSet(&in_use_bm, oldest_idx);
     return &dirty_buffers[oldest_idx];
 }
+/// End offset of the furthest extent staged for an inode (0 if none).
+/// Staged writes extend the file before the on-disk inode is updated, so
+/// size checks outside a descriptor (mmap EOF) must include them.
+pub fn stagedEnd(inode_id: u64, fs_type: FsType) u64 {
+    var end: u64 = 0;
+    const flags = wb_lock.acquire();
+    defer wb_lock.release(flags);
+    for (0..BM_WORDS) |w| {
+        var bits = in_use_bm[w];
+        while (bits != 0) {
+            const bit = @ctz(bits);
+            bits &= bits - 1;
+            const b = &dirty_buffers[w * 64 + @as(u32, bit)];
+            if (b.fs_type == fs_type and b.inode_id == inode_id) end = @max(end, b.byte_offset + b.data_len);
+        }
+    }
+    return end;
+}
+
 pub fn readBuffered(inode_id: u64, byte_offset: u64, buf: [*]u8, len: u32, fs_type: FsType) u32 {
     // v53.35: Return actual bytes copied (0 = miss) instead of bool.
     // Fixes W4: VFS was returning min(count,4096) regardless of data_len,

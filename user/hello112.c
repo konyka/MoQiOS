@@ -8,6 +8,8 @@
 ///      memory) kills the process with SIGSEGV instead of being dropped.
 ///   E. mprotect(PROT_WRITE) on a MAP_SHARED mapping of a read-only fd is
 ///      EACCES (the mapping can never write the file).
+///   F. a page past EOF at mmap time becomes readable once the file grows;
+///      a page still past EOF raises SIGBUS.
 
 #include <stdint.h>
 
@@ -182,6 +184,35 @@ void _start(void) {
     }
     syscall1(SYS_CLOSE, (uint64_t)rfd);
     syscall1(SYS_UNLINK, (uint64_t)path);
+
+    /* F. file growth after mmap; past-EOF access is SIGBUS */
+    static const char gpath[] = "hello112-grow";
+    static char block[4096];
+    for (int i = 0; i < 4096; i++) block[i] = 'a';
+    int64_t gfd = syscall3(SYS_OPEN, (uint64_t)gpath, 2 | 64 | 512, 0666);
+    check(gfd >= 0, "F: create file");
+    syscall3(SYS_WRITE, (uint64_t)gfd, (uint64_t)block, 4096);
+    int64_t gm = syscall6(SYS_MMAP, 0, 3 * 4096, 1, 0x01, (uint64_t)gfd, 0);
+    check(gm > 0, "F: map 3 pages of a 1-page file");
+    if (gm > 0) {
+        volatile char *gp = (volatile char *)gm;
+        check(gp[0] == 'a', "F: first page served");
+        for (int i = 0; i < 4096; i++) block[i] = 'b';
+        syscall3(SYS_WRITE, (uint64_t)gfd, (uint64_t)block, 4096);
+        check(gp[4096] == 'b', "F: page added after mmap is served");
+        int64_t c = syscall1(SYS_FORK, 0);
+        if (c == 0) {
+            (void)gp[2 * 4096];
+            syscall1(SYS_EXIT, 0);
+            for (;;) {}
+        }
+        int32_t gst = 0;
+        syscall3(SYS_WAITPID, (uint64_t)c, (uint64_t)&gst, 0);
+        check((gst & 0x7f) == 7, "F: page still past EOF raises SIGBUS");
+        syscall2(SYS_MUNMAP, (uint64_t)gm, 3 * 4096);
+    }
+    syscall1(SYS_CLOSE, (uint64_t)gfd);
+    syscall1(SYS_UNLINK, (uint64_t)gpath);
 
     print(failures == 0 ? "hello112: PASS\n" : "hello112: FAIL\n");
     print("hello112 done\n");

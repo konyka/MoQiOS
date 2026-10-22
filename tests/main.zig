@@ -3406,7 +3406,7 @@ test "G2: planFault computes file offset, EOF clamp and COW permissions" {
     try std.testing.expect(p.action == .file_page);
     try std.testing.expectEqual(@as(u64, 8192), p.file_off);
     try std.testing.expectEqual(@as(u32, 1808), p.valid_bytes);
-    // Page 3: wholly past EOF → SIGSEGV (Linux SIGBUS semantics).
+    // Page 3: wholly past EOF → .segv plan, delivered as SIGBUS.
     p = filemap.planFault(G2Region, &r, 0x400000 + 3 * PAGE);
     try std.testing.expect(p.action == .segv);
 
