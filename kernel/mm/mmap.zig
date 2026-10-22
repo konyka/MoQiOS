@@ -237,6 +237,8 @@ pub const RegionFileMeta = struct {
     /// H1: MAP_SHARED — faults map the backing frame writable (no COW) and
     /// ext2/fat32 regions flush dirty cache pages on release.
     shared: bool,
+    /// The fd allows writing (O_WRONLY/O_RDWR); see MmapRegion.may_write.
+    may_write: bool = true,
     prot: u8,
     offset: u64,
     size: u64,
@@ -294,6 +296,7 @@ fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, meta: ?Regio
             r.shared = shared;
             if (meta) |m| {
                 r.file_kind = @intFromEnum(m.kind);
+                r.may_write = m.may_write;
                 r.file_offset = m.offset;
                 r.file_size = m.size;
                 r.file_idx = m.idx;
@@ -424,6 +427,7 @@ fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
                         // independently.
                         .file_kind = r.file_kind,
                         .shared = r.shared,
+                        .may_write = r.may_write,
                         .prot = r.prot,
                         .file_offset = tail_offset,
                         .file_size = r.file_size,
@@ -897,6 +901,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
         var m = RegionFileMeta{
             .kind = kind,
             .shared = shared,
+            .may_write = kind != .ramdisk and (desc.status_flags & 0x03) != 0,
             .prot = @intCast(prot & 7),
             .offset = offset,
             .size = desc.file_size,

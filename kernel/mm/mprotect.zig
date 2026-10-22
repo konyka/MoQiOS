@@ -45,6 +45,7 @@ fn insertRegionPiece(cur: *task.Task, base: u64, num_pages: u64, proto: *const t
                 .no_free = proto.no_free,
                 .file_kind = proto.file_kind,
                 .shared = proto.shared,
+                .may_write = proto.may_write,
                 .prot = prot,
                 .file_offset = file_offset,
                 .file_size = proto.file_size,
@@ -104,7 +105,11 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
         bits &= bits - 1;
         const r = &cur.mmap_regions[i];
         if (r.file_kind == 0) continue; // anonymous faults never read prot
-        slots_needed += filemap.planProtUpdate(r.base, r.num_pages, addr, len_pages).slots_needed;
+        const plan = filemap.planProtUpdate(r.base, r.num_pages, addr, len_pages);
+        // A shared mapping of a read-only fd can never become writable:
+        // the write would land in the file the caller cannot write.
+        if (plan.overlap != .none and !policy.writeGrantAllowed(prot, r.shared, r.may_write)) return EACCES;
+        slots_needed += plan.slots_needed;
     }
     if (slots_needed > free_slots) return ENOMEM;
 

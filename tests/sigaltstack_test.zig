@@ -90,3 +90,12 @@ test "kill(-1) is ESRCH only with no candidates" {
     try std.testing.expectEqual(kb.ESRCH, kb.result(0));
     try std.testing.expectEqual(@as(i64, 0), kb.result(3));
 }
+
+const mp = @import("kernel_shared").mprotect_policy;
+
+test "mprotect PROT_WRITE on a shared mapping of a read-only fd is refused" {
+    try std.testing.expect(!mp.writeGrantAllowed(3, true, false));
+    try std.testing.expect(mp.writeGrantAllowed(3, true, true));
+    try std.testing.expect(mp.writeGrantAllowed(3, false, false));
+    try std.testing.expect(mp.writeGrantAllowed(1, true, false));
+}

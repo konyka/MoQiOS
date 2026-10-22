@@ -579,6 +579,9 @@ pub const MmapRegion = struct {
     /// COW marker, fork keeps the frame shared, and ext2/fat32 regions flush
     /// their dirty page-cache pages when the region is released.
     shared: bool = false,
+    /// Linux VM_MAYWRITE for MAP_SHARED file regions: false when the fd was
+    /// opened read-only, so mprotect cannot later grant PROT_WRITE (EACCES).
+    may_write: bool = true,
     /// Byte offset in the file that corresponds to `base`.
     file_offset: u64 = 0,
     /// File size snapshot taken at mmap time — drives the EOF/SIGSEGV rule.

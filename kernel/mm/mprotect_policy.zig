@@ -52,3 +52,11 @@ pub fn swapEntryUpdate(pte: u64, prot: u64) ?u64 {
     if ((prot & 4) != 0) e &= ~(@as(u64, 1) << 63) else e |= @as(u64, 1) << 63;
     return e;
 }
+
+/// Linux VM_MAYWRITE: PROT_WRITE may be granted on a MAP_SHARED file region
+/// only when its fd was writable. Private mappings are always allowed (writes
+/// go to private COW copies).
+pub fn writeGrantAllowed(prot: u64, shared: bool, may_write: bool) bool {
+    if (prot & 2 == 0) return true;
+    return !shared or may_write;
+}

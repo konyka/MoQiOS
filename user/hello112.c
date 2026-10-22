@@ -6,6 +6,8 @@
 ///   C. a handler without SA_ONSTACK stays on the normal stack.
 ///   D. a signal whose frame cannot be written (RSP points at unmapped
 ///      memory) kills the process with SIGSEGV instead of being dropped.
+///   E. mprotect(PROT_WRITE) on a MAP_SHARED mapping of a read-only fd is
+///      EACCES (the mapping can never write the file).
 
 #include <stdint.h>
 
@@ -44,6 +46,12 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_FORK        57
 #define SYS_KILL        62
 #define SYS_SIGALTSTACK 218
+#define SYS_OPEN        9
+#define SYS_CLOSE       11
+#define SYS_UNLINK      111
+#define SYS_MPROTECT    164
+#define SYS_MUNMAP      12
+#define EACCES 13
 
 #define SIGUSR1 10
 #define SIGUSR2 31
@@ -155,6 +163,25 @@ void _start(void) {
     int32_t st = 0;
     int64_t r = syscall3(SYS_WAITPID, (uint64_t)child, (uint64_t)&st, 0);
     check(r == child && (st & 0x7f) == SIGSEGV, "D: undeliverable signal kills with SIGSEGV");
+
+    /* E. shared mapping of a read-only fd */
+    static const char path[] = "hello112-ro";
+    int64_t wfd = syscall3(SYS_OPEN, (uint64_t)path, 2 | 64 | 512, 0666);
+    check(wfd >= 0, "E: create file");
+    static const char page_data[16] = "hello112 data";
+    syscall3(SYS_WRITE, (uint64_t)wfd, (uint64_t)page_data, sizeof(page_data));
+    syscall1(SYS_CLOSE, (uint64_t)wfd);
+    int64_t rfd = syscall3(SYS_OPEN, (uint64_t)path, 0, 0);
+    check(rfd >= 0, "E: reopen read-only");
+    int64_t sm = syscall6(SYS_MMAP, 0, 4096, 1, 0x01, (uint64_t)rfd, 0);
+    check(sm > 0, "E: MAP_SHARED PROT_READ of a read-only fd");
+    if (sm > 0) {
+        check(syscall3(SYS_MPROTECT, (uint64_t)sm, 4096, 3) == -EACCES, "E: mprotect(PROT_WRITE) is EACCES");
+        check(syscall3(SYS_MPROTECT, (uint64_t)sm, 4096, 1) == 0, "E: mprotect(PROT_READ) still allowed");
+        syscall2(SYS_MUNMAP, (uint64_t)sm, 4096);
+    }
+    syscall1(SYS_CLOSE, (uint64_t)rfd);
+    syscall1(SYS_UNLINK, (uint64_t)path);
 
     print(failures == 0 ? "hello112: PASS\n" : "hello112: FAIL\n");
     print("hello112 done\n");
