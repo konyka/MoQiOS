@@ -1202,7 +1202,8 @@ pub const FdTable = struct {
             },
             .timerfd => {
                 const timerfd_mod = @import("../ipc/timerfd.zig");
-                return timerfd_mod.timerfdRead(desc.timerfd_idx, buf, count);
+                // O_NONBLOCK set later with fcntl(F_SETFL) counts, not only TFD_NONBLOCK at create.
+                return timerfd_mod.timerfdRead(desc.timerfd_idx, buf, count, (desc.status_flags & 0x800) != 0);
             },
             .devfs => {
                 const devfs = @import("devfs.zig");

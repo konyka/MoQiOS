@@ -7,6 +7,10 @@
 ///   D. mprotect(PROT_WRITE) on a SHM_RDONLY attachment is refused.
 ///   E. semop wakes every waiter that can proceed, not just the oldest one.
 ///   F. an AF_UNIX listener's stale backlog entry cannot rewire a reused slot.
+///   G. clone() with an unusable stack or TLS address fails with EINVAL
+///      instead of halting the machine when the child is first dispatched.
+///   H. 64-bit fd arguments that do not fit 32 bits are EBADF, not a panic;
+///      eventfd2 with a huge initval cannot overflow the counter later.
 
 #include <stdint.h>
 
@@ -39,7 +43,12 @@ static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_WAITPID   6
 #define SYS_NANOSLEEP 35
 #define SYS_FORK      57
+#define SYS_CLONE     243
 #define SYS_MPROTECT  164
+#define SYS_CLOSE     11
+#define SYS_READ      10
+#define SYS_DUP2      33
+#define SYS_EVENTFD2  169
 #define SYS_POLL      162
 #define SYS_SHMGET    149
 #define SYS_SHMAT     150
@@ -60,6 +69,15 @@ static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SETVAL     16
 #define EINVAL     22
 #define ENOSPC     28
+
+static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+    int64_t ret;
+    register uint64_t rdx __asm__("rdx") = a3;
+    register uint64_t r10 __asm__("r10") = a4;
+    register uint64_t r8 __asm__("r8") = a5;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx), "r"(r10), "r"(r8) : "rcx", "r11", "memory");
+    return ret;
+}
 
 static void print(const char *s) {
     uint64_t n = 0;
@@ -151,6 +169,27 @@ void _start(void) {
         syscall3(SYS_WAITPID, (uint64_t)a, (uint64_t)&sa, 0);
         check(((sa >> 8) & 0xff) == 11, "E: V(sem1) then releases the older waiter");
         syscall3(SYS_SEMCTL, (uint64_t)ss, 0, 0 /* IPC_RMID */);
+    }
+
+    /* G: hostile clone arguments (CLONE_VM = 0x100, CLONE_SETTLS = 0x80000) */
+    check(syscall5(SYS_CLONE, 0x100, 0x1000, 0, 0, 0) == -EINVAL, "G: clone with a stack below the floor is EINVAL");
+    check(syscall5(SYS_CLONE, 0x100, 0x8000000000000000ULL, 0, 0, 0) == -EINVAL, "G: clone with a kernel-half stack is EINVAL");
+    check(syscall5(SYS_CLONE, 0x100 | 0x80000, 0x7f0000, 0, 0, 0x8000000000000000ULL) == -EINVAL, "G: clone with a non-canonical TLS is EINVAL");
+
+    /* H */
+    check(syscall1(SYS_CLOSE, 0x100000000ULL) < 0, "H: close(1<<32) fails instead of panicking");
+    check(syscall3(SYS_READ, 0x100000000ULL, 0, 0) < 0, "H: read(1<<32) fails instead of panicking");
+    check(syscall2(SYS_DUP2, 0x100000000ULL, 5) < 0, "H: dup2(1<<32, 5) fails instead of panicking");
+    int64_t efd = syscall2(SYS_EVENTFD2, 0xFFFFFFFFFFFFFFFFULL, 0);
+    if (efd >= 0) {
+        uint64_t one = 1;
+        syscall3(SYS_WRITE, (uint64_t)efd, (uint64_t)&one, 8);
+        struct pollfd pe = { (int32_t)efd, 4 /* POLLOUT */, 0 };
+        syscall3(SYS_POLL, (uint64_t)&pe, 1, 0);
+        check(1, "H: eventfd2(huge initval) then write+poll does not panic");
+        syscall1(SYS_CLOSE, (uint64_t)efd);
+    } else {
+        check(1, "H: eventfd2(huge initval) rejected");
     }
 
     print(failures == 0 ? "hello113: PASS\n" : "hello113: FAIL\n");

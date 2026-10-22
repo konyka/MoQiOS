@@ -663,10 +663,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(socket_mod.sendmmsg(@truncate(frame.rdi), frame.rsi, frame.rdx, @truncate(frame.r10)));
         },
         136 => { // pread64(fd, buf, count, offset)
-            frame.rax = @bitCast(file_io_mod.pread(@intCast(frame.rdi), frame.rsi, frame.rdx, frame.r10));
+            frame.rax = @bitCast(file_io_mod.pread(fdArg(frame.rdi), frame.rsi, frame.rdx, frame.r10));
         },
         137 => { // pwrite64(fd, buf, count, offset)
-            frame.rax = @bitCast(file_io_mod.pwrite(@intCast(frame.rdi), frame.rsi, frame.rdx, frame.r10));
+            frame.rax = @bitCast(file_io_mod.pwrite(fdArg(frame.rdi), frame.rsi, frame.rdx, frame.r10));
             checkSignalsOnSyscallReturn(frame);
         },
         138 => { // readv(fd, iov, iovcnt)
@@ -816,7 +816,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 frame.rax = @bitCast(errno.EINVAL);
                 return;
             }
-            const dup_result = proc_mgmt_mod.dup2(@intCast(frame.rdi), @intCast(frame.rsi));
+            const dup_result = proc_mgmt_mod.dup2(fdArg(frame.rdi), fdArg(frame.rsi));
             if (dup_result >= 0 and (frame.rdx & O_CLOEXEC) != 0) {
                 const sched_mod = @import("../../proc/sched.zig");
                 const task_mod3 = @import("../../proc/task.zig");
@@ -860,7 +860,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(inotify_mod.rmWatch(@truncate(frame.rdi), wd));
         },
         169 => { // eventfd2(initval, flags) — validates EFD_* flags, installs a real fd
-            frame.rax = @bitCast(eventfd_mod.eventfdCreateFd(frame.rdi, @truncate(frame.rsi)));
+            // initval is an unsigned int: a wider value would put the counter at or above
+            // COUNTER_MAX and overflow the first write/poll admission check.
+            frame.rax = @bitCast(eventfd_mod.eventfdCreateFd(@as(u32, @truncate(frame.rdi)), @truncate(frame.rsi)));
         },
         170 => { // timerfd_create(clockid, flags) — validates TFD_* flags, installs a real (read-only) fd
             const tfd_flags: u32 = @truncate(frame.rsi);
@@ -1642,10 +1644,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         // ── v39.0: Linux standard syscall number aliases (x86_64 ABI) ──────
         // Programs compiled against standard Linux headers use these numbers.
         17 => { // pread64(fd, buf, count, offset)
-            frame.rax = @bitCast(file_io_mod.pread(@intCast(frame.rdi), frame.rsi, frame.rdx, frame.r10));
+            frame.rax = @bitCast(file_io_mod.pread(fdArg(frame.rdi), frame.rsi, frame.rdx, frame.r10));
         },
         18 => { // pwrite64(fd, buf, count, offset)
-            frame.rax = @bitCast(file_io_mod.pwrite(@intCast(frame.rdi), frame.rsi, frame.rdx, frame.r10));
+            frame.rax = @bitCast(file_io_mod.pwrite(fdArg(frame.rdi), frame.rsi, frame.rdx, frame.r10));
             checkSignalsOnSyscallReturn(frame);
         },
         19 => { // readv(fd, iov, iovcnt)
@@ -2699,18 +2701,25 @@ fn syscallOpenat2(dirfd_raw: u64, pathname: u64, how_ptr: u64, size: u64) i64 {
     return file_io_mod.openWithMode(pathname, @truncate(how.flags), @truncate(how.mode));
 }
 
+/// A syscall fd argument is a full 64-bit register; anything that does not
+/// fit a u32 is simply an invalid descriptor. A plain @intCast panics a
+/// Debug kernel (close(1 << 32)), so saturate: maxInt(u32) is never a valid fd.
+inline fn fdArg(v: u64) u32 {
+    return if (v > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(v);
+}
+
 /// Syscall #10: read(fd, buf, count)
 /// RDI = fd, RSI = buffer pointer in user space, RDX = count
 /// Returns bytes read on success, 0 on EOF, -1 on error.
 fn syscallRead(frame: *SyscallFrame) void {
-    frame.rax = @bitCast(file_io_mod.read(@intCast(frame.rdi), frame.rsi, frame.rdx));
+    frame.rax = @bitCast(file_io_mod.read(fdArg(frame.rdi), frame.rsi, frame.rdx));
 }
 
 /// Syscall #11: close(fd)
 /// RDI = fd
 /// Returns 0 on success, -1 on error.
 fn syscallClose(frame: *SyscallFrame) void {
-    frame.rax = @bitCast(file_io_mod.close(@intCast(frame.rdi)));
+    frame.rax = @bitCast(file_io_mod.close(fdArg(frame.rdi)));
 }
 
 const paging = @import("../../arch/x86_64/paging.zig");
@@ -2883,7 +2892,7 @@ fn syscallPipe(frame: *SyscallFrame) void {
 /// Syscall #33: dup2(oldfd, newfd)
 /// RDI = oldfd, RSI = newfd
 fn syscallDup2(frame: *SyscallFrame) void {
-    frame.rax = @bitCast(proc_mgmt_mod.dup2(@intCast(frame.rdi), @intCast(frame.rsi)));
+    frame.rax = @bitCast(proc_mgmt_mod.dup2(fdArg(frame.rdi), fdArg(frame.rsi)));
 }
 
 fn syscallFork(frame: *SyscallFrame) void {

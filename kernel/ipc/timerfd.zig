@@ -263,9 +263,9 @@ fn unlinkWaiter(inst: *TimerInstance, node: *WaitNode) void {
 /// Read from a timerfd instance.
 /// Returns 8 on success (u64 expiration count), -EBADF if the instance was
 /// destroyed while waiting, -EINTR on signal, -EAGAIN if non-blocking.
-pub fn timerfdRead(timerfd_idx: u32, buf: [*]u8, count: usize) i64 {
-    if (timerfd_idx >= MAX_TIMERFD_INSTANCES) return -1;
-    if (count < 8) return -1;
+pub fn timerfdRead(timerfd_idx: u32, buf: [*]u8, count: usize, nonblock: bool) i64 {
+    if (timerfd_idx >= MAX_TIMERFD_INSTANCES) return -9; // EBADF
+    if (count < 8) return -22; // EINVAL
 
     var generation: ?u64 = null;
     while (true) {
@@ -289,7 +289,7 @@ pub fn timerfdRead(timerfd_idx: u32, buf: [*]u8, count: usize) i64 {
             bo.writeU64At(buf, 0, val);
             return 8;
         }
-        if ((inst.flags & TFD_NONBLOCK) != 0) {
+        if (nonblock or (inst.flags & TFD_NONBLOCK) != 0) {
             timer_lock.release(saved);
             return -11; // EAGAIN
         }

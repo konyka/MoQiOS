@@ -444,14 +444,10 @@ pub fn loadProgramForExec(name: []const u8, argv: []const []const u8, envp: []co
             const dst: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
             @memset(dst[0..paging.PAGE_SIZE], 0);
 
-            const ps = page_vaddr -| seg_vaddr;
-            const pe = ps + paging.PAGE_SIZE;
-            const fcs = if (ps < seg_filesz) ps else seg_filesz;
-            const fce = @min(pe, seg_filesz);
-            if (fce > fcs) {
-                const cl = fce - fcs;
-                const soff = seg_offset + fcs;
-                const poff: usize = if (page_vaddr < seg_vaddr) @intCast(seg_vaddr - page_vaddr) else 0;
+            if (@import("segment_copy_policy.zig").window(page_vaddr, seg_vaddr, seg_filesz)) |w| {
+                const soff = seg_offset + w.file_off;
+                const poff: usize = @intCast(w.page_off);
+                const cl: usize = @intCast(w.len);
                 if (soff + cl <= file.size) {
                     @memcpy(dst[poff .. poff + cl], file.data[soff .. soff + cl]);
                 }

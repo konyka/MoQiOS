@@ -258,13 +258,16 @@ pub fn clone(
         const idx = sched.currentTaskIndex() orelse break :blk false;
         break :blk (task_mod.getTask(idx) orelse break :blk false).mm != null;
     })) return -22; // EINVAL: unsupported or incoherent flags
+    if (clone_flags_policy.checkPointers(flags, new_stack, tls) != .ok) return -22; // EINVAL
     const parent_idx = sched.currentTaskIndex() orelse return -1;
     const parent = task_mod.getTask(parent_idx) orelse return -1;
-    if (flags & clone_flags_policy.TID_FLAGS != 0) {
-        if (parent_tid_ptr != 0 and !copy_user.validateUserBufferWritable(parent_tid_ptr, 4)) return -14;
-        if (child_tid_ptr != 0 and !copy_user.validateUserBufferWritable(child_tid_ptr, 4)) return -14;
-        if (flags & clone_flags_policy.CLONE_PARENT_SETTID != 0 and parent_tid_ptr == 0) return -22;
-        if (flags & clone_flags_policy.CLONE_CHILD_CLEARTID != 0 and child_tid_ptr == 0) return -22;
+    // Only the pointers the flags name are consulted; an unused argument
+    // register may hold anything.
+    if (flags & clone_flags_policy.CLONE_PARENT_SETTID != 0) {
+        if (parent_tid_ptr == 0 or !copy_user.validateUserBufferWritable(parent_tid_ptr, 4)) return -14;
+    }
+    if (flags & clone_flags_policy.CLONE_CHILD_CLEARTID != 0) {
+        if (child_tid_ptr == 0 or !copy_user.validateUserBufferWritable(child_tid_ptr, 4)) return -14;
     }
 
     // See fork(): until SHM attachment ownership is shared/address-space

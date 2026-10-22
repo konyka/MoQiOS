@@ -142,6 +142,33 @@ pub fn copyFromUser(dst: []u8, src_user: [*]const u8, count: usize) usize {
     return copied;
 }
 
+/// Copy a user C string into `dst`, stopping at the NUL or when `dst` is full.
+///
+/// A fixed-count copy fails outright when the string ends near the end of a
+/// mapping (the count spans an unmapped page), which made exec drop such
+/// arguments. This reads one page at a time, so only the bytes up to the NUL
+/// have to be mapped. Returns the number of string bytes copied (without the
+/// NUL), or null when the very first byte is unreadable. An over-long string
+/// is truncated to `dst.len` bytes, like the fixed-size buffers it feeds.
+pub fn copyStringFromUser(dst: []u8, src_user: u64) ?usize {
+    if (dst.len == 0) return null;
+    var n: usize = 0;
+    var addr = src_user;
+    while (n < dst.len) {
+        if (!validateUserRange(addr, 1)) return if (n == 0) null else n;
+        const in_page: usize = 0x1000 - @as(usize, @intCast(addr & 0xFFF));
+        const want = @min(in_page, dst.len - n);
+        if (copyFromUser(dst[n..], @ptrFromInt(addr), want) != want) return if (n == 0) null else n;
+        var i: usize = 0;
+        while (i < want) : (i += 1) {
+            if (dst[n + i] == 0) return n + i;
+        }
+        n += want;
+        addr += want;
+    }
+    return n;
+}
+
 /// Safely copy bytes from kernel buffer to user space.
 /// Returns the number of bytes successfully copied.
 /// Validates that the destination range is in user space before copying.

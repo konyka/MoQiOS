@@ -30,11 +30,9 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
 
     var name_buf: [64]u8 = undefined;
     const copy = @import("../mm/copy_from_user.zig");
-    const copied = copy.copyFromUser(name_buf[0..], @ptrFromInt(name_ptr), 63);
-    if (copied == 0) return null;
-    name_buf[if (copied < 63) copied else 63] = 0;
-    var len: usize = 0;
-    while (len < copied and name_buf[len] != 0) : (len += 1) {}
+    const len = copy.copyStringFromUser(name_buf[0..63], name_ptr) orelse return null;
+    if (len == 0) return null;
+    name_buf[len] = 0;
     const name = name_buf[0..len];
 
     serial.writeString("[execve] loading '");
@@ -56,11 +54,8 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
             if (pc < 8) break;
             const arg_ptr: u64 = @bitCast(ptr_bytes);
             if (arg_ptr == 0 or arg_ptr >= 0x0000_8000_0000_0000) break;
-            const ac = copy.copyFromUser(argv_buffers[i][0..], @ptrFromInt(arg_ptr), 127);
-            if (ac == 0) break;
-            argv_buffers[i][if (ac < 127) ac else 127] = 0;
-            var al: usize = 0;
-            while (al < ac and argv_buffers[i][al] != 0) : (al += 1) {}
+            const al = copy.copyStringFromUser(argv_buffers[i][0..127], arg_ptr) orelse break;
+            argv_buffers[i][al] = 0;
             argv_slices[i] = argv_buffers[i][0..al];
             argc = i + 1;
         }
@@ -83,11 +78,8 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
             if (pc < 8) break;
             const env_ptr: u64 = @bitCast(ptr_bytes);
             if (env_ptr == 0 or env_ptr >= 0x0000_8000_0000_0000) break;
-            const ec = copy.copyFromUser(envp_buffers[i][0..], @ptrFromInt(env_ptr), 127);
-            if (ec == 0) break;
-            envp_buffers[i][if (ec < 127) ec else 127] = 0;
-            var el: usize = 0;
-            while (el < ec and envp_buffers[i][el] != 0) : (el += 1) {}
+            const el = copy.copyStringFromUser(envp_buffers[i][0..127], env_ptr) orelse break;
+            envp_buffers[i][el] = 0;
             envp_slices[i] = envp_buffers[i][0..el];
             envc = i + 1;
         }
@@ -234,11 +226,8 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64)
             if (pc < 8) break;
             const arg_ptr: u64 = @bitCast(ptr_bytes);
             if (arg_ptr == 0 or arg_ptr >= 0x0000_8000_0000_0000) break;
-            const ac = copy.copyFromUser(argv_buffers[i][0..], @ptrFromInt(arg_ptr), 127);
-            if (ac == 0) break;
-            argv_buffers[i][if (ac < 127) ac else 127] = 0;
-            var al: usize = 0;
-            while (al < ac and argv_buffers[i][al] != 0) : (al += 1) {}
+            const al = copy.copyStringFromUser(argv_buffers[i][0..127], arg_ptr) orelse break;
+            argv_buffers[i][al] = 0;
             argv_slices[i] = argv_buffers[i][0..al];
             argc = i + 1;
         }
@@ -261,11 +250,8 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64)
             if (pc < 8) break;
             const env_ptr: u64 = @bitCast(ptr_bytes);
             if (env_ptr == 0 or env_ptr >= 0x0000_8000_0000_0000) break;
-            const ec = copy.copyFromUser(envp_buffers[i][0..], @ptrFromInt(env_ptr), 127);
-            if (ec == 0) break;
-            envp_buffers[i][if (ec < 127) ec else 127] = 0;
-            var el: usize = 0;
-            while (el < ec and envp_buffers[i][el] != 0) : (el += 1) {}
+            const el = copy.copyStringFromUser(envp_buffers[i][0..127], env_ptr) orelse break;
+            envp_buffers[i][el] = 0;
             envp_slices[i] = envp_buffers[i][0..el];
             envc = i + 1;
         }

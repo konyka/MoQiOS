@@ -127,6 +127,7 @@ pub const signal_frame_policy = @import("proc/signal_frame_policy.zig");
 pub const signal_delivery_policy = @import("proc/signal_delivery_policy.zig");
 pub const sigaltstack_policy = @import("proc/sigaltstack_policy.zig");
 pub const kill_broadcast_policy = @import("proc/kill_broadcast_policy.zig");
+pub const segment_copy_policy = @import("proc/segment_copy_policy.zig");
 pub const wait_status_policy = @import("proc/wait_status_policy.zig");
 pub const accept4_policy = @import("net/accept4_policy.zig");
 pub const eth = @import("net/eth.zig");
