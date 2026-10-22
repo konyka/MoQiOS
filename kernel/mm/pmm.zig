@@ -1,5 +1,6 @@
 /// Physical Memory Manager — bitmap allocator for 4KB page frames.
 /// Limine memmap init (x86) or compact arena init (SK-5 shared path).
+const std = @import("std");
 const builtin = @import("builtin");
 const limine = @import("../limine.zig");
 const hhdm = @import("hhdm.zig");
@@ -506,12 +507,7 @@ pub fn freeContiguous(phys: u64, count: usize) void {
         const page = first + j;
         if (page >= total_pages) break;
         if (ref_counts[page] == 0) continue; // Skip double-free silently
-        ref_counts[page] -= 1;
-        if (ref_counts[page] == 0) {
-            setBit(page);
-            free_pages += 1;
-            if (page < next_free_hint) next_free_hint = page;
-        }
+        dropRefLocked(page);
     }
 }
 
@@ -550,13 +546,23 @@ pub fn freePage(addr: u64) void {
         serial.writeString("\n");
         return;
     }
+    dropRefLocked(page);
+    lock.release(flags);
+}
+
+/// A saturated count no longer tracks the true number of holders, so it is
+/// pinned: decrementing it could free a page that is still mapped. Leaking a
+/// page is the safe failure mode.
+const REF_SATURATED: u16 = std.math.maxInt(u16);
+
+fn dropRefLocked(page: u64) void {
+    if (ref_counts[page] == REF_SATURATED) return;
     ref_counts[page] -= 1;
     if (ref_counts[page] == 0) {
         setBit(page);
         free_pages += 1;
         if (page < next_free_hint) next_free_hint = page;
     }
-    lock.release(flags);
 }
 
 /// Increment reference count (for CoW).
@@ -588,12 +594,7 @@ pub fn freePageBatch(addrs: []const u64) void {
         const page = pageFromPhys(addr);
         if (page >= total_pages) continue;
         if (ref_counts[page] == 0) continue; // Skip double-free silently
-        ref_counts[page] -= 1;
-        if (ref_counts[page] == 0) {
-            setBit(page);
-            free_pages += 1;
-            if (page < next_free_hint) next_free_hint = page;
-        }
+        dropRefLocked(page);
     }
 }
 
@@ -603,7 +604,7 @@ pub fn decRef(addr: u64) u16 {
     defer lock.release(flags);
     const page = pageFromPhys(addr);
     if (page >= total_pages) return 0;
-    if (ref_counts[page] > 0) ref_counts[page] -= 1;
+    if (ref_counts[page] > 0 and ref_counts[page] != REF_SATURATED) ref_counts[page] -= 1;
     return ref_counts[page];
 }
 
@@ -615,7 +616,7 @@ pub fn decRefNoFree(addr: u64) ?u16 {
     defer lock.release(flags);
     const page = pageFromPhys(addr);
     if (page >= total_pages or ref_counts[page] == 0) return null;
-    ref_counts[page] -= 1;
+    if (ref_counts[page] != REF_SATURATED) ref_counts[page] -= 1;
     return ref_counts[page];
 }
 
