@@ -76,6 +76,7 @@ test {
     _ = @import("tcp_port_test.zig");
     _ = @import("ipc_reply_test.zig");
     _ = @import("net_misc_test.zig");
+    _ = @import("signal_proc_test.zig");
 }
 
 test "sync syscall propagates aggregate writeback failure as EIO" {

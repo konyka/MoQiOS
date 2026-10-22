@@ -1,5 +1,6 @@
 //! Pure TCP receive-path policy: what recv() returns when the receive ring
-//! is empty, as a function of connection state. Host-testable (no arch deps).
+//! is empty, as a function of connection state, and whether a blocking
+//! reader waits instead. Host-testable (no arch deps).
 
 const errno = @import("../lib/errno.zig");
 
@@ -24,7 +25,8 @@ pub const RecvDecision = enum {
     read_data,
     /// Peer FIN seen (or connection torn down) and ring drained: return 0.
     eof,
-    /// Peer may still send: a non-blocking reader gets EAGAIN.
+    /// Peer may still send: a blocking reader waits (see shouldBlock); a
+    /// non-blocking or timed-out reader gets EAGAIN.
     would_block,
     /// Listening socket: recv is not meaningful.
     not_connected,
@@ -50,6 +52,38 @@ pub fn decide(state: TcpState, available: u32, reset_by_peer: bool) RecvDecision
         .close_wait, .closing, .last_ack, .time_wait, .closed => .eof,
         .listen => .not_connected,
     };
+}
+
+/// fd status flag (fcntl F_SETFL / SOCK_NONBLOCK / FIONBIO).
+pub const O_NONBLOCK: u32 = 0x800;
+/// Per-call recv flag: this one call does not wait.
+pub const MSG_DONTWAIT: u32 = 0x40;
+
+/// A recv is nonblocking when the fd carries O_NONBLOCK or the call passes
+/// MSG_DONTWAIT.
+pub fn nonblockRequested(status_flags: u32, msg_flags: u32) bool {
+    return (status_flags & O_NONBLOCK) != 0 or (msg_flags & MSG_DONTWAIT) != 0;
+}
+
+/// Whether recv() should sleep instead of returning `emptyResult(decision)`.
+/// Only a would-block ring waits, and only for a blocking reader whose
+/// SO_RCVTIMEO deadline (if any) has not passed — an expired wait keeps the
+/// would-block EAGAIN result (Linux SO_RCVTIMEO semantics).
+pub fn shouldBlock(decision: RecvDecision, nonblock: bool, timeout_expired: bool) bool {
+    return decision == .would_block and !nonblock and !timeout_expired;
+}
+
+/// Absolute monotonic deadline for an SO_RCVTIMEO of `timeout_ms`; null
+/// (wait forever) when no timeout is set. Saturates instead of wrapping.
+pub fn recvDeadlineNs(now_ns: u64, timeout_ms: u32) ?u64 {
+    if (timeout_ms == 0) return null;
+    return now_ns +| @as(u64, timeout_ms) * 1_000_000;
+}
+
+/// True once `now_ns` reached the deadline; never without one.
+pub fn timedOut(deadline_ns: ?u64, now_ns: u64) bool {
+    const d = deadline_ns orelse return false;
+    return now_ns >= d;
 }
 
 /// recv() return value for a decision that copies no data.
