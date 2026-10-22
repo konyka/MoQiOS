@@ -13,6 +13,9 @@
 #define SIGTTIN 21
 #define SIGCONT 18
 #define SIGHUP 1
+#ifndef SIGSTOP
+#define SIGSTOP 19
+#endif
 #define SIGKILLv 9
 
 static long ioctl2(long fd, long req, long arg) {
@@ -126,6 +129,10 @@ int main(int argc, char **argv, char **envp) {
             close(pfd[0]);
             struct ksigaction sa = { on_sighup, 0, 0, 0 };
             sigaction(SIGHUP, &sa, 0);
+            /* POSIX: only a newly orphaned group WITH STOPPED MEMBERS gets
+             * SIGHUP+SIGCONT (running background groups are left alone).
+             * Stop ourselves; the orphaning must wake and hang us up. */
+            kill(getpid(), SIGSTOP);
             while (!sighup_seen) nanosleep(&ts, 0);
             char h = 'H';
             syscall3(SYS_write, pfd[1], (long)&h, 1);
@@ -133,7 +140,10 @@ int main(int argc, char **argv, char **envp) {
         }
         close(pfd[0]);
         close(pfd[1]);
-        _exit(0); // 会话长退出 → C 成孤儿 → 应收 SIGHUP
+        /* Let C reach its SIGSTOP before the leader exits. */
+        struct timespec w = { 0, 50 * 1000 * 1000 };
+        nanosleep(&w, 0);
+        _exit(0); // 会话长退出 → C 所在组成孤儿且含停止成员 → SIGHUP+SIGCONT
     }
     close(pfd[1]);
     /* 等 C 的 SIGHUP 报告（pipe 读在本内核是非阻塞的：空管道返回 0，轮询到有界） */

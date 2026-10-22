@@ -85,15 +85,32 @@ pub fn tcSetForegroundPgrp(new_pgid: u16) i64 {
     return 0;
 }
 
-/// 会话长退出的孤儿组处理：同会话成员收 SIGHUP，停止者同时被 SIGCONT 唤醒
-/// （近似 POSIX 孤儿进程组规则，v1 简化版）。
+/// 会话长（控制进程）退出，POSIX 规则：
+///  1. 若它是控制终端的会话长，终端前台进程组收 SIGHUP；
+///  2. 会话中因此成为孤儿且含停止成员的进程组收 SIGHUP + SIGCONT
+///     （停止的孤儿组否则永远无人唤醒）。
+/// 旧实现向整个会话（含后台运行中的组）广播 SIGHUP，会杀掉 nohup 式后台作业
+/// 之外所有运行中的后台进程。
 pub fn onSessionLeaderExit(leader: *task_mod.Task) void {
+    const fg: u16 = if (ctty_owner_sid == leader.sid) foreground_pgid else 0;
     for (0..task_mod.MAX_TASKS) |i| {
         const t = task_mod.getTask(@intCast(i)) orelse continue;
         if (t.tid == leader.tid or t.state == .zombie) continue;
         if (t.sid != leader.sid) continue;
+        const in_fg = fg != 0 and t.pgid == fg;
+        const stopped_orphan = groupHasStopped(t.pgid, leader.sid);
+        if (!in_fg and !stopped_orphan) continue;
         _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << @intCast(sig_mod.SIGHUP - 1), .seq_cst);
-        sig_mod.continueTask(t);
+        if (stopped_orphan) sig_mod.continueTask(t);
         sig_mod.kickIfBlocked(@intCast(i));
     }
+}
+
+fn groupHasStopped(pgid: u16, sid: u16) bool {
+    for (0..task_mod.MAX_TASKS) |i| {
+        const t = task_mod.getTask(@intCast(i)) orelse continue;
+        if (t.state == .zombie or t.sid != sid or t.pgid != pgid) continue;
+        if (t.stopped) return true;
+    }
+    return false;
 }

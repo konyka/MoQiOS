@@ -1117,7 +1117,12 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             const tm = @import("../../proc/task.zig");
             if (sched.currentTaskIndex()) |idx| {
                 if (tm.getTask(idx)) |t| {
-                    frame.rax = t.parent_tid;
+                    // An orphan's parent pid is init (1): POSIX reparenting.
+                    // The reaper already auto-reaps orphans (parent_alive ==
+                    // false), so only the reported pid needed fixing — it
+                    // used to name the dead parent forever.
+                    const ppid = t.parent_tid;
+                    frame.rax = if (ppid != 0 and tm.findTaskByTid(ppid) == null) 1 else ppid;
                 } else {
                     frame.rax = 0;
                 }
