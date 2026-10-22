@@ -20,3 +20,15 @@ pub fn mayKill(sender_tid: u32, pid: i64, has_cap_kill: bool) bool {
     if (pid > 0) return pid == @as(i64, sender_tid);
     return false;
 }
+
+/// Credentials relevant to signal permission (POSIX kill(2)).
+pub const Creds = struct { uid: u32, euid: u32, suid: u32 };
+
+/// POSIX: an unprivileged sender may signal a target when the sender's real
+/// or effective uid equals the target's real or saved uid. Privileged
+/// (cap_kill) senders may signal anyone; signalling oneself is always fine.
+pub fn credsAllow(sender: Creds, target: Creds, has_cap_kill: bool, same_task: bool) bool {
+    if (has_cap_kill or same_task) return true;
+    return sender.uid == target.uid or sender.uid == target.suid or
+        sender.euid == target.uid or sender.euid == target.suid;
+}

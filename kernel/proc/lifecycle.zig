@@ -82,25 +82,6 @@ pub fn spawn(name_ptr: u64) i64 {
     return -1;
 }
 
-/// Syscall #62: kill(pid, signum)
-/// pid > 0: 单进程；pid < -1: 广播到进程组 -pid（kill(-pgid)）；pid == -1: 暂不支持。
-/// pid 超出 tid（u32）或 pgid（u16）范围时不可能有目标，返回 ESRCH。
-pub fn kill(target_pid: i64, signum: u32) i64 {
-    const sig_mod = @import("signal.zig");
-    const id_policy = @import("proc_id_policy.zig");
-    if (target_pid == -1) return -22; // EINVAL — kill(-1) 不在 v1 范围
-    if (target_pid == 0) return -1; // kill(0) 不在 v1 范围（沿用旧返回值）
-    if (target_pid < -1) {
-        const pgid = id_policy.killTargetPgid(target_pid) orelse return -3; // ESRCH
-        return if (sig_mod.sendSignalToPgrp(pgid, signum) > 0) 0 else -1;
-    }
-    const tid = id_policy.killTargetTid(target_pid) orelse return -3; // ESRCH
-    if (sig_mod.sendSignal(tid, signum)) {
-        return 0;
-    }
-    return -1;
-}
-
 /// Syscall #63: uname(buf)
 /// RDI = pointer to user buffer (390 bytes: 6 fields × 65 bytes)
 pub fn uname(buf_ptr: u64) i64 {

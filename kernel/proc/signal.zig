@@ -163,12 +163,21 @@ pub fn continueTask(t: *task.Task) void {
 /// disposition; everything else goes through the normal pending-signal path.
 /// Returns the number of tasks signalled.
 pub fn sendSignalToPgrp(pgid: u16, signum: u32) u32 {
+    return sendSignalToPgrpFiltered(pgid, signum, null);
+}
+
+/// Group broadcast; with a `sender`, members the sender may not signal
+/// (POSIX kill permission) are skipped.
+pub fn sendSignalToPgrpFiltered(pgid: u16, signum: u32, sender: ?*task.Task) u32 {
     if (signum == 0 or signum > 31) return 0;
     const action = defaultAction(signum);
     var sent: u32 = 0;
     for (0..task.MAX_TASKS) |i| {
         const t = task.getTask(@intCast(i)) orelse continue;
         if (t.pgid != pgid or t.state == .zombie) continue;
+        if (sender) |snd| {
+            if (!@import("signal_syscall.zig").maySignal(snd, t)) continue;
+        }
         sent += 1;
         switch (action) {
             .stop => {

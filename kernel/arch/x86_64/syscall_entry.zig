@@ -3070,12 +3070,11 @@ fn syscallKill(frame: *SyscallFrame) void {
     // Task #8: cap_kill required when targeting a different process; process
     // group broadcast (pid < 0) always needs it. The pid is compared at full
     // width so (1<<32)|self does not pass as "self".
+    // POSIX kill(2): same-uid senders may signal, kill(pid, 0) probes,
+    // kill(0) targets the caller's group, and a missing target is ESRCH
+    // (signal_syscall.killPosix; permission per target via maySignal).
     const pid_signed: i64 = @bitCast(frame.rdi);
-    if (!signal_syscall_mod.currentMayKill(pid_signed)) {
-        frame.rax = @bitCast(@as(i64, -1)); // EPERM
-        return;
-    }
-    frame.rax = @bitCast(lifecycle_mod.kill(pid_signed, @truncate(frame.rsi)));
+    frame.rax = @bitCast(signal_syscall_mod.killPosix(pid_signed, @truncate(frame.rsi)));
 }
 
 fn syscallNetSend(frame: *SyscallFrame) void {

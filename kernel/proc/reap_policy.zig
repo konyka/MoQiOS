@@ -54,6 +54,9 @@ pub const Lineage = struct {
     /// leader's, so tearing it down while the group lives would close the
     /// leader's mapped files and unmap shared MMIO.
     maps_objects: bool,
+    /// The parent set SIGCHLD to SIG_IGN: POSIX says its children are reaped
+    /// automatically and never become waitable zombies.
+    parent_ignores_sigchld: bool = false,
 };
 
 /// Reaping nobody waits for: orphans, and non-leader threads (joined through
@@ -66,6 +69,7 @@ pub fn autoReap(v: ZombieView, lineage: Lineage) Verdict {
     if (base != .detach) return base;
     if (!lineage.parent_alive) return .detach;
     if (lineage.is_thread and !lineage.maps_objects) return .detach;
+    if (!lineage.is_thread and lineage.parent_ignores_sigchld) return .detach;
     return .skip;
 }
 

@@ -230,6 +230,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello108"); /* orphan reaping never steals the CPU from an RT task */
     run_test("hello109"); /* sigaction sa_mask/SA_RESETHAND, FPU-preserving signal frames */
     run_test("hello110"); /* madvise(MADV_DONTNEED) drops anonymous pages */
+    run_test("hello111"); /* kill(2) permission/probe/group, SIGCHLD, SIG_IGN auto-reap */
 
     start_persistent_services();
 

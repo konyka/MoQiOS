@@ -1176,7 +1176,14 @@ pub fn exitTask(exit_code: i32) void {
             }
         }
     }
+    const sigchld_parent = t.parent_tid;
+    const notify_parent = t.is_user and !t.is_thread and sigchld_parent != 0;
     task_lock.release(flags);
+
+    // POSIX: the parent of an exiting child receives SIGCHLD (default
+    // action: ignore). Sent outside task_lock — sendSignal/kickIfBlocked
+    // re-take it. Threads report through clear_tid, not SIGCHLD.
+    if (notify_parent) _ = @import("signal.zig").sendSignal(sigchld_parent, 17);
 
     // 作业控制：会话长退出 → 同会话成员收 SIGHUP（孤儿进程组，近似规则）。
     // 必须在 task_lock 之外调用：广播路径的 kickIfBlocked/continueTask 会经
@@ -1393,10 +1400,12 @@ pub fn reapZombies() u32 {
             bits &= bits - 1;
             const t = &tasks[i];
             if (t.state != .zombie or t.reap_pending) continue;
+            const parent_idx = if (t.parent_tid != 0) findTaskByTidLocked(t.parent_tid) else null;
             const lineage: reap_policy.Lineage = .{
                 .is_thread = t.is_thread,
-                .parent_alive = t.parent_tid != 0 and findTaskByTidLocked(t.parent_tid) != null,
+                .parent_alive = parent_idx != null,
                 .maps_objects = t.is_thread and mapsObjects(t),
+                .parent_ignores_sigchld = if (parent_idx) |pi| tasks[pi].signal_handlers[17 - 1] == 1 else false,
             };
             if (reap_policy.autoReap(zombieViewLocked(i, t), lineage) != .detach) continue;
             if (deferred) {

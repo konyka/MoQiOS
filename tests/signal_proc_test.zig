@@ -141,3 +141,17 @@ test "signal frame placement fails instead of wrapping on a tiny rsp" {
     try std.testing.expectEqual(@as(?u64, null), signal_frame_policy.handlerRsp(100, SIGNAL_FRAME_SIZE));
     try std.testing.expect(signal_frame_policy.handlerRsp(4096, SIGNAL_FRAME_SIZE) != null);
 }
+
+test "signal permission: same uid may signal, foreign uid may not" {
+    const sp = @import("kernel_shared").signal_perm_policy;
+    const a: sp.Creds = .{ .uid = 1000, .euid = 1000, .suid = 1000 };
+    const b: sp.Creds = .{ .uid = 1000, .euid = 1000, .suid = 1000 };
+    const other: sp.Creds = .{ .uid = 0, .euid = 0, .suid = 0 };
+    try std.testing.expect(sp.credsAllow(a, b, false, false));
+    try std.testing.expect(!sp.credsAllow(a, other, false, false));
+    try std.testing.expect(sp.credsAllow(a, other, true, false));
+    try std.testing.expect(sp.credsAllow(a, other, false, true));
+    // setuid program: target saved uid matches the sender's real uid.
+    const setuid_child: sp.Creds = .{ .uid = 0, .euid = 0, .suid = 1000 };
+    try std.testing.expect(sp.credsAllow(a, setuid_child, false, false));
+}

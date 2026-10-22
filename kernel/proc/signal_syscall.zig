@@ -28,19 +28,57 @@ fn threadGroupId(t: *task_mod.Task) u32 {
 /// still reports ESRCH. No current task means a kernel-internal caller.
 pub fn currentMaySignalTask(target_tid: u32) bool {
     const cur = sched.currentTask() orelse return true;
-    if (@field(cur.effective_caps, "cap_kill")) return true;
     const idx = task_mod.findTaskByTid(target_tid) orelse return true;
     const target = task_mod.getTask(idx) orelse return true;
-    return perm_policy.maySignalTask(threadGroupId(cur), threadGroupId(target), false);
+    return maySignal(cur, target);
 }
 
-/// Permission gate for kill(pid, ...) from the current task; `pid` is the
-/// raw signed argument (see signal_perm_policy.mayKill).
-pub fn currentMayKill(pid: i64) bool {
-    const cur = sched.currentTask() orelse return true;
-    const cap = @field(cur.effective_caps, "cap_kill");
-    return perm_policy.mayKill(cur.tid, pid, cap) or perm_policy.mayKill(threadGroupId(cur), pid, cap);
+/// POSIX kill(2) permission for one target: cap_kill, the sender's own
+/// thread group, or matching real/effective vs real/saved uids.
+pub fn maySignal(sender: *task_mod.Task, target: *task_mod.Task) bool {
+    return perm_policy.credsAllow(
+        .{ .uid = sender.uid, .euid = sender.euid, .suid = sender.suid },
+        .{ .uid = target.uid, .euid = target.euid, .suid = target.suid },
+        @field(sender.effective_caps, "cap_kill"),
+        threadGroupId(sender) == threadGroupId(target),
+    );
 }
+
+/// kill(2): pid > 0 one process, 0 the caller's process group, < -1 group
+/// -pid. signum 0 performs only the existence/permission check. Returns 0,
+/// -ESRCH when no target exists, -EPERM when every target was refused.
+pub fn killPosix(pid: i64, signum: u32) i64 {
+    const id_policy = @import("proc_id_policy.zig");
+    if (signum > 31) return -22;
+    if (pid == -1) return -22; // kill(-1): broadcast not supported in v1
+    const cur = sched.currentTask() orelse return -3;
+
+    if (pid > 0) {
+        const tid = id_policy.killTargetTid(pid) orelse return -3;
+        const idx = task_mod.findTaskByTid(tid) orelse return -3;
+        const target = task_mod.getTask(idx) orelse return -3;
+        if (!maySignal(cur, target)) return -1;
+        if (signum == 0) return 0;
+        return if (sig_mod.sendSignal(tid, signum)) 0 else -3;
+    }
+
+    const pgid: u16 = if (pid == 0) cur.pgid else (id_policy.killTargetPgid(pid) orelse return -3);
+    var found = false;
+    var allowed = false;
+    for (0..task_mod.MAX_TASKS) |i| {
+        const t = task_mod.getTask(@intCast(i)) orelse continue;
+        if (t.pgid != pgid or t.state == .zombie or !t.is_user) continue;
+        found = true;
+        if (!maySignal(cur, t)) continue;
+        allowed = true;
+    }
+    if (!found) return -3;
+    if (!allowed) return -1;
+    if (signum == 0) return 0;
+    _ = sig_mod.sendSignalToPgrpFiltered(pgid, signum, cur);
+    return 0;
+}
+
 
 /// sigaction(signum, act_ptr, oldact_ptr) → 0 or -errno
 ///
