@@ -3753,6 +3753,12 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   0.5–2.5 ms，stolen 0–2.5 ms），阈值未放宽。未定位到单一根因提交，判断为本节
   futex 锁外预取（关中断临界区内不再做换入 I/O）等改动的副作用；保留为观察项，
   再次出现时按 reaper/TLB shootdown 方向排查。
+- **SMP=8 waitpid 偶发挂起（既有缺陷，未修）**：子进程打印完成并 `[exit]` 后，父进程
+  （init）不再从 waitpid 返回。HEAD 上 8 次中 1 次（hello29 退出后）；基线 `c88ec46`
+  10 次中 1 次（hello98 退出后），另 1 次为已由 `61abc96` 修复的 futex 超时挂起。
+  SMP=1/2/4 与双核压测从未复现。怀疑 waitpid 停放协议（`waiting_for_child` + hlt
+  自旋 + tick 抢占 .blocked 当前任务）与 exitTask 唤醒在多核下的交错窗口，需要用
+  `tools/gdb_stall_probe.sh` 在 SMP=8 下抓现场，未做投机修复。
 - futex 仅实现 private WAIT/WAKE（WAKE 以 INT_MAX 即可广播）；共享键、REQUEUE、
   PI、WAKE_OP、BITSET 返回 `-ENOSYS`——hello69 固化的既定契约，非缺陷。
 - epoll 跨进程注册（fork 后仅子进程持副本）与 `item.fd_table` 生命周期（§6.54 未做项）。
