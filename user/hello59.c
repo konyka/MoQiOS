@@ -11,7 +11,7 @@ static int failures;
 #define CHECK(cond, name) do { if (!(cond)) { print("hello59: FAIL " name "\n"); failures++; } } while (0)
 
 #define STACK_DEFAULT (8ULL * 1024 * 1024)
-#define SIGSEGV_STATUS (128 + 11)
+#define SIGSEGV_STATUS 11 /* Linux wait status: WTERMSIG */
 
 __attribute__((noinline)) static void recurse_forever(volatile unsigned long depth) {
     /* 每层带一个栈上缓冲区，确保帧足够大，快速越过 64 KiB 地板 */

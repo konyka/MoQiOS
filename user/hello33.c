@@ -131,13 +131,14 @@ static int64_t run_case(int which, const char *label) {
     print(label);
     print("=");
     if (which == PROBE_USER_WRITE) {
-        /// 128 + SIGSEGV. Anything else means the page took the store, and the
-        /// cases below would be measuring nothing.
-        print(status == 139 ? "SIGSEGV (page is read-only)\n"
+        /// Killed by SIGSEGV (Linux wait status: WTERMSIG == 11). Anything
+        /// else means the page took the store, and the cases below would be
+        /// measuring nothing.
+        print(status == 11 ? "SIGSEGV (page is read-only)\n"
                             : "UNPROTECTED — later cases prove nothing\n");
     } else if (status == 0) {
         print("rejected\n");
-    } else if (status == 1) {
+    } else if (status == (1 << 8)) {
         print("WRITTEN\n");
     } else {
         print("inconclusive (");
@@ -163,7 +164,7 @@ void _start(void) {
     /// Establishes the premise: a store the process makes itself must fault,
     /// otherwise "the kernel declined to write" would prove nothing.
     print("hello33: premise check\n");
-    const int premise_ok = run_case(PROBE_USER_WRITE, "user_store") == 139;
+    const int premise_ok = run_case(PROBE_USER_WRITE, "user_store") == 11;
 
     int written = 0;
     if (run_case(DEST_MMAP_RO, "mmap_ro") == 1) written++;

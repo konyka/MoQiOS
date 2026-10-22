@@ -58,7 +58,7 @@ int main(int argc, char **argv, char **envp) {
     }
     int st = 0;
     waitpid(a, &st, 0);
-    CHECK(st == 42, "bg read SIGTTIN handler+EINTR");
+    CHECK(st == (42 << 8), "bg read SIGTTIN handler+EINTR");
 
     /* 3. 后台组子进程默认动作读 fd0 → 停住不返回；前台化 + SIGCONT 后进入键盘读 */
     long b = fork();
@@ -113,7 +113,7 @@ int main(int argc, char **argv, char **envp) {
     long w1 = waitpid(e1, &sx1, 0);
     long w2 = waitpid(e2, &sx2, 0);
     CHECK(w1 == e1 && w2 == e2, "kill(-pgid) both reaped");
-    CHECK(sx1 == 128 + SIGKILLv && sx2 == 128 + SIGKILLv, "kill(-pgid) both dead");
+    CHECK(sx1 == SIGKILLv && sx2 == SIGKILLv, "kill(-pgid) both dead");
 
     /* 5. 孤儿进程组：子会话长退出 → 成员收 SIGHUP（经继承的 pipe 回报） */
     int pfd[2];

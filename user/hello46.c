@@ -173,8 +173,9 @@ void _start(void) {
     }
     int64_t status = 0;
     syscall3(SYS_WAITPID, (uint64_t)-1, (uint64_t)&status, 0);
-    if (status == 1) fail("child demand fault on inherited region");
-    if (status != 139) fail("past-EOF page did not SIGSEGV");
+    /* Linux wait status: exit(1) is 1 << 8; a SIGSEGV death is WTERMSIG 11. */
+    if (status == (1 << 8)) fail("child demand fault on inherited region");
+    if (status != 11) fail("past-EOF page did not SIGSEGV");
 
     if (syscall3(SYS_MUNMAP, (uint64_t)base, MAP_LEN, 0) != 0) fail("munmap");
 

@@ -42,7 +42,7 @@ static inline int64_t syscall3(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 
 /* Exit status the kernel reports for a user task killed by #GP (vector 13):
    handleException → exitTask(128 + vector). */
-#define EXIT_GP 141
+#define EXIT_GP 13 /* Linux wait status: WTERMSIG == #GP vector */
 
 #define RTC_INDEX 0x70
 #define RTC_DATA  0x71

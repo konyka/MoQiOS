@@ -252,7 +252,7 @@ static void phase_a2b(void) {
         syscall3(SYS_WRITE, (u64)p[1], (u64)&x, 1);
         s64 status = 0;
         syscall3(SYS_WAITPID, (u64)-1, (u64)&status, 0);
-        if (status == 3) fail_exit("A2b COW-shared reservation frame corrupted by munmap");
+        if ((status >> 8) == 3) fail_exit("A2b COW-shared reservation frame corrupted by munmap");
         if (status != 0) fail_exit("A2b child status");
     }
     const s64 leaked = (s64)base_free - (s64)freeram_pages();
@@ -463,7 +463,7 @@ static void phase_a4(void) {
         }
         s64 status = 0;
         syscall3(SYS_WAITPID, (u64)-1, (u64)&status, 0);
-        if (status == 2) fail_exit("A4 swap never engaged in child (vacuous test)");
+        if ((status >> 8) == 2) fail_exit("A4 swap never engaged in child (vacuous test)");
         if (status != 0) fail_exit("A4 child status");
     }
 

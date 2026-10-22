@@ -26,7 +26,7 @@ static inline int64_t syscall3(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_WAITPID 6
 #define SYS_FORK    57
 
-#define GP_STATUS (128 + 13)
+#define GP_STATUS 13 /* Linux wait status: WTERMSIG == #GP vector */
 
 enum probe { CONTROL, SGDT, SIDT, SLDT, SMSW, STR, NPROBES };
 

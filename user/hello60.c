@@ -11,7 +11,7 @@ static int failures;
 
 #define PROT_RW 3            /* PROT_READ|PROT_WRITE */
 #define MAP_PRIV_ANON 0x22   /* MAP_PRIVATE|MAP_ANONYMOUS */
-#define SIGSEGV_STATUS (128 + 11)
+#define SIGSEGV_STATUS 11 /* Linux wait status: WTERMSIG */
 
 static long mmap_raw(long addr, long len, long prot, long flags, long fd, long off) {
     return syscall6(SYS_mmap, addr, len, prot, flags, fd, off);

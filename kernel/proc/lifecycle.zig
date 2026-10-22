@@ -9,6 +9,7 @@ pub fn exit(status: u64) void {
     serial.writeString("[exit] task exited with code ");
     fmt.writeDecimal64(@intCast(code));
     serial.writeString("\n");
+    if (@import("sched.zig").currentTask()) |cur| cur.exited_via_syscall = true;
     t.exitTask(code);
 }
 
