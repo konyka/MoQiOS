@@ -17,7 +17,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
     // SHM attachment ownership is not inherited by fork yet. Reject rather
     // than converting shared pages into private COW pages or leaking a child
     // attachment that IPC_RMID could later free underneath it.
-    if (@import("../ipc/sysv_shm.zig").hasAttachments(parent.tid)) return -11; // EAGAIN
+    if (@import("../ipc/sysv_shm.zig").hasAttachments(parent.page_table_phys)) return -11; // EAGAIN
 
     // RLIMIT_NPROC preflight: the child counts against the parent's real
     // UID. Check before any page-table cloning so a denied fork costs

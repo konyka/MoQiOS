@@ -65,6 +65,10 @@ const MAX_ATTACH_RECS: u32 = 128;
 const AttachRec = struct {
     active: bool = false,
     tid: u32 = 0,
+    /// Address space the attachment lives in. Sibling CLONE_VM threads share
+    /// it, so lookups (munmap/mprotect guards, shmdt) match on this rather
+    /// than on the attaching thread alone.
+    pml4: u64 = 0,
     shmid: u32 = 0,
     base: u64 = 0,
 };
@@ -79,10 +83,10 @@ fn hasFreeAttachRec() bool {
 }
 
 /// Record an attachment. Caller holds shm_lock and checked hasFreeAttachRec.
-fn addAttachRec(tid: u32, shmid: u32, base: u64) void {
+fn addAttachRec(tid: u32, pml4: u64, shmid: u32, base: u64) void {
     for (&attach_recs) |*rec| {
         if (!rec.active) {
-            rec.* = .{ .active = true, .tid = tid, .shmid = shmid, .base = base };
+            rec.* = .{ .active = true, .tid = tid, .pml4 = pml4, .shmid = shmid, .base = base };
             return;
         }
     }
@@ -236,7 +240,7 @@ pub fn shmget(key: i32, size: u64, shmflg: i32) i64 {
                 serial.writeString("[sysv_shm] created shmid=");
                 fmt.writeDecimal(seg.shmid);
                 serial.writeString(" key=");
-                fmt.writeDecimal64(@intCast(seg.perm.key));
+                fmt.writeDecimal64(@bitCast(@as(i64, seg.perm.key)));
                 serial.writeString(" pages=");
                 fmt.writeDecimal(seg.num_pages);
                 serial.writeString("\n");
@@ -340,12 +344,17 @@ pub fn shmat(shmid: u32, shmaddr: u64, shmflg: u64) i64 {
                 const page_index = installed[q];
                 const rv = map_addr + @as(u64, page_index) * PAGE_SIZE;
                 if (isMappedAt(pml4, rv, seg.phys_pages[page_index])) {
-                    _ = paging.unmapPage(pml4, rv);
+                    releaseMapping(pml4, rv);
                 }
             }
             if (installed_count > 0) tlb.shootdownRange(map_addr, installed_count, pml4);
             return -12; // -ENOMEM
         };
+        // The mapping owns a reference of its own on top of the segment's:
+        // reclaim skips frames with refcount > 1 (it must not swap SHM out
+        // from under the other attachers), and address-space teardown drops
+        // exactly the reference the mapping took.
+        pmm.addRef(seg.phys_pages[p]);
         installed[installed_count] = @intCast(p);
         installed_count += 1;
     }
@@ -355,7 +364,7 @@ pub fn shmat(shmid: u32, shmaddr: u64, shmflg: u64) i64 {
     tlb.shootdownRange(map_addr, @intCast(seg.num_pages), pml4);
 
     seg.attach_count += 1;
-    addAttachRec(task.tid, shmid, map_addr);
+    addAttachRec(task.tid, pml4, shmid, map_addr);
 
     serial.writeString("[sysv_shm] shmat shmid=");
     fmt.writeDecimal(shmid);
@@ -366,16 +375,16 @@ pub fn shmat(shmid: u32, shmaddr: u64, shmflg: u64) i64 {
     return @intCast(map_addr);
 }
 
-/// True if [base, base + num_pages) intersects an attachment owned by `tid`.
+/// True if [base, base + num_pages) intersects an attachment in address space `pml4`.
 /// The generic munmap path uses this guard so only shmdt can release SHM pages.
-pub fn overlapsAttachment(tid: u32, base: u64, num_pages: u64) bool {
+pub fn overlapsAttachment(pml4: u64, base: u64, num_pages: u64) bool {
     const size_result = @mulWithOverflow(num_pages, PAGE_SIZE);
     if (size_result[1] != 0) return true;
     const range_end = shm_policy.rangeEnd(base, size_result[0], USER_ADDR_MAX) orelse return true;
     const flags = shm_lock.acquire();
     defer shm_lock.release(flags);
     for (attach_recs) |rec| {
-        if (!rec.active or rec.tid != tid) continue;
+        if (!rec.active or rec.pml4 != pml4) continue;
         const seg = findSegment(rec.shmid) orelse continue;
         const attached_end = rec.base + @as(u64, seg.num_pages) * PAGE_SIZE;
         if (base < attached_end and rec.base < range_end) return true;
@@ -386,11 +395,11 @@ pub fn overlapsAttachment(tid: u32, base: u64, num_pages: u64) bool {
 /// Fork/clone cannot safely duplicate SHM attachment ownership yet: a COW
 /// child would turn shared pages private, while CLONE_VM exit would unmap the
 /// sibling's attachment. Callers must reject the operation while attached.
-pub fn hasAttachments(tid: u32) bool {
+pub fn hasAttachments(pml4: u64) bool {
     const flags = shm_lock.acquire();
     defer shm_lock.release(flags);
     for (attach_recs) |rec| {
-        if (rec.active and rec.tid == tid) return true;
+        if (rec.active and rec.pml4 == pml4) return true;
     }
     return false;
 }
@@ -417,13 +426,13 @@ pub fn shmdt(shmaddr: u64) i64 {
     // physical frame at an address could detach another mapping that happens
     // to use the same segment, and would corrupt attach_count.
     for (&attach_recs) |*rec| {
-        if (!rec.active or rec.tid != task.tid or rec.base != shmaddr) continue;
+        if (!rec.active or rec.pml4 != pml4 or rec.base != shmaddr) continue;
         const seg = findSegment(rec.shmid) orelse return -22;
         if (!isMappedRange(pml4, shmaddr, seg)) return -22;
         // Unmap all pages
         for (0..seg.num_pages) |p| {
             const virt = shmaddr + @as(u64, @intCast(p)) * PAGE_SIZE;
-            _ = paging.unmapPage(pml4, virt);
+            releaseMapping(pml4, virt);
         }
         // Invalidate every CPU that may still run this address space before
         // the attachment is considered gone.
@@ -455,13 +464,30 @@ pub fn detachAllForTask(tid: u32, pml4: u64, unmap_pages: bool) void {
     defer shm_lock.release(flags);
 
     for (&attach_recs) |*rec| {
-        if (!rec.active or rec.tid != tid) continue;
+        if (!rec.active) continue;
+        // Sole user of the address space: every attachment in it goes, including
+        // ones made by sibling threads that exited earlier. Otherwise only this
+        // thread's own records are considered.
+        if (unmap_pages) {
+            if (rec.pml4 != pml4) continue;
+        } else if (rec.tid != tid) continue;
+        const seg = findSegment(rec.shmid) orelse {
+            rec.active = false;
+            continue;
+        };
+
+        if (!unmap_pages) {
+            // The address space outlives this thread (CLONE_VM): the mapping
+            // is still live for the siblings, so the attachment must stay
+            // counted. Hand it to a surviving task of the same mm; dropping
+            // it here let IPC_RMID free frames a sibling still maps.
+            if (adoptAttachment(rec, tid, pml4)) continue;
+        }
         rec.active = false;
-        const seg = findSegment(rec.shmid) orelse continue;
 
         if (unmap_pages) {
             for (0..seg.num_pages) |p| {
-                _ = paging.unmapPage(pml4, rec.base + @as(u64, @intCast(p)) * PAGE_SIZE);
+                releaseMapping(pml4, rec.base + @as(u64, @intCast(p)) * PAGE_SIZE);
             }
             tlb.shootdownRange(rec.base, @intCast(seg.num_pages), pml4);
         }
@@ -578,6 +604,23 @@ fn findSegment(shmid: u32) ?*ShmSegment {
 }
 
 /// Free `count` pages from a freshly allocated (not yet published) page list.
+/// Remove a SHM PTE and drop the reference its mapping took in shmat.
+fn releaseMapping(pml4: u64, virt: u64) void {
+    if (paging.unmapPage(pml4, virt)) |phys| pmm.freePage(phys);
+}
+
+/// Re-own `rec` to another live, non-zombie task running on page table
+/// `pml4` (not `exiting_tid`). False when no such task exists.
+fn adoptAttachment(rec: *AttachRec, exiting_tid: u32, pml4: u64) bool {
+    for (0..task_mod.MAX_TASKS) |i| {
+        const t = task_mod.getTask(@intCast(i)) orelse continue;
+        if (t.tid == exiting_tid or t.page_table_phys != pml4 or t.state == .zombie) continue;
+        rec.tid = t.tid;
+        return true;
+    }
+    return false;
+}
+
 fn freePages(phys_pages: *[MAX_PAGES_PER_SEG]u64, count: u32) void {
     for (0..count) |p| {
         if (phys_pages[p] != 0) {

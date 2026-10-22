@@ -92,6 +92,15 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     var vm_guard = mm_mod.Mm.beginVmMutation(cur.mm, @ptrCast(cur)) catch return -35;
     defer vm_guard.release();
 
+    // SysV SHM pages belong to the segment, not to the address space: their
+    // frames carry no PMM reference of their own and the attachment record
+    // assumes the PTEs stay as shmat installed them. Changing their
+    // protection would both bypass the segment's permission (a SHM_RDONLY
+    // attach becoming writable) and, via PROT_NONE, strand the frames for a
+    // double free at exit. Only shmat/shmdt may touch them (as munmap, mmap
+    // and brk already enforce).
+    if (@import("../ipc/sysv_shm.zig").overlapsAttachment(cur.page_table_phys, addr, len_pages)) return EINVAL;
+
     // H1: file-backed regions carry the prot metadata the demand-fault path
     // synthesises page permissions from. Partial overlaps split regions, so
     // count the extra slots BEFORE touching page tables — failing after the

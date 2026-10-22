@@ -143,14 +143,16 @@ pub fn semget(key: i32, nsems: i32, semflg: i32) i64 {
     return @intCast(sid);
 }
 
-/// semop(semid, sops, nsops) -> 0 or -errno
-/// Supports blocking: P operations (op < 0) sleep until the semaphore
-/// value allows the operation. V operations (op > 0) wake blocked waiters.
+/// semop(semid, sem_num, op) -> 0 or -errno
+///
+/// op < 0 blocks until the value can absorb it; op == 0 blocks until the
+/// value is zero; op > 0 adds. Every successful change wakes ALL waiters of
+/// the set: they wait on different semaphores and with different amounts, so
+/// waking only the oldest could pick one that still cannot proceed and strand
+/// another that now can. Each waiter re-checks its own condition and blocks
+/// again if it still fails.
 pub fn semop(semid: u32, sem_num: u32, op: i16) i64 {
-    const MAX_RETRIES: u32 = 64; // prevent infinite loops on race
-    var retries: u32 = 0;
-
-    while (retries < MAX_RETRIES) : (retries += 1) {
+    while (true) {
         const flags = sem_lock.acquire();
 
         const s = findSemSet(semid) orelse {
@@ -173,91 +175,74 @@ pub fn semop(semid: u32, sem_num: u32, op: i16) i64 {
         const val: i32 = @intCast(op);
         const new_val = std.math.add(i32, s.values[sem_num], val) catch {
             sem_lock.release(flags);
-            return errno.EINVAL;
+            return errno.ERANGE;
         };
 
-        if (new_val < 0) {
-            // v53.44: Add to wait queue while holding lock to prevent lost wakeup.
-            // Previously: released lock first, then called sleepOn — V operation
-            // could fire wakeOne before we joined the queue, losing the wakeup.
-            var node: task.WaitNode = .{ .task_idx = 0 };
-            const cur_idx = sched.currentTaskIndex() orelse {
-                sem_lock.release(flags);
-                return -1;
-            };
-            node.task_idx = cur_idx;
-            node.granted = false;
-            node.next = s.wait_queue;
-            s.wait_queue = &node;
-            s.waiter_count += 1;
-            const cur_task = task.getTask(cur_idx) orelse {
-                sem_lock.release(flags);
-                return -1;
-            };
-            cur_task.state = .blocked;
+        const must_wait = new_val < 0 or (op == 0 and s.values[sem_num] != 0);
+        if (!must_wait) {
+            if (op != 0) {
+                s.values[sem_num] = new_val;
+                // The value changed: a P-waiter may now fit, a wait-for-zero
+                // waiter may now see zero.
+                sched.wakeAll(&s.wait_queue);
+            }
             sem_lock.release(flags);
-            sched.forceReschedule();
-            sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
-            if (!node.granted) {
-                // Interrupted (EIDRM / signal) before being granted — unlink
-                // our stack WaitNode from the queue first, otherwise a later
-                // V-op wakeOne would dereference freed stack memory.
-                const flags2 = sem_lock.acquire();
-                var prev: ?*task.WaitNode = null;
-                var cur_node = s.wait_queue;
-                while (cur_node) |n| {
-                    if (n == &node) {
-                        if (prev) |p| {
-                            p.next = n.next;
-                        } else {
-                            s.wait_queue = n.next;
-                        }
-                        break;
-                    }
-                    prev = n;
-                    cur_node = n.next;
-                }
-                if (s.waiter_count == 0) {
-                    sem_lock.release(flags2);
-                    return errno.EIDRM;
-                }
-                s.waiter_count -= 1;
-                const removed_after_detach = sysv_policy.removalCanFree(s.marked_removed, s.waiter_count);
-                if (removed_after_detach) s.* = .{};
-                sem_lock.release(flags2);
-                // Signal kick (sendSignal unblocks without granting): die on
-                // a fatal signal via the same exit-by-signal path the timer
-                // tick uses, or report EINTR so the handler can run on return.
-                const sig_mod = @import("../proc/signal.zig");
-                if (sig_mod.pendingFatal(cur_task)) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
-                if (sig_mod.pendingActionable(cur_task)) return -4; // -EINTR
-                return errno.EIDRM; // interrupted (EIDRM / signal)
-            }
-            const flags2 = sem_lock.acquire();
-            if (s.waiter_count == 0) {
-                sem_lock.release(flags2);
-                return errno.EIDRM;
-            }
-            s.waiter_count -= 1;
-            const removed_after_wake = sysv_policy.removalCanFree(s.marked_removed, s.waiter_count);
-            sem_lock.release(flags2);
-            if (removed_after_wake) return errno.EIDRM;
-            continue; // re-acquire lock and re-check condition
+            return 0;
         }
 
-        // Operation can proceed
-        s.values[sem_num] = new_val;
-
-        // If this is a V operation (releasing), wake one blocked waiter
-        if (op > 0) {
-            _ = sched.wakeOne(&s.wait_queue);
-        }
-
+        // Join the wait queue while still holding the lock so a concurrent
+        // change cannot slip between the check and the enqueue.
+        const cur_idx = sched.currentTaskIndex() orelse {
+            sem_lock.release(flags);
+            return -1;
+        };
+        const cur_task = task.getTask(cur_idx) orelse {
+            sem_lock.release(flags);
+            return -1;
+        };
+        var node: task.WaitNode = .{ .task_idx = cur_idx };
+        node.granted = false;
+        node.next = s.wait_queue;
+        s.wait_queue = &node;
+        s.waiter_count += 1;
+        cur_task.state = .blocked;
         sem_lock.release(flags);
-        return 0;
-    }
+        sched.forceReschedule();
+        sched.repairCurrentAfterBlock(); // forceReschedule may return without switching
 
-    return errno.EAGAIN; // too many retries (shouldn't happen normally)
+        const flags2 = sem_lock.acquire();
+        // Our node lives on this stack: take it off the queue unless a waker
+        // already detached the whole queue (wakeAll empties it).
+        {
+            var prev: ?*task.WaitNode = null;
+            var cur_node = s.wait_queue;
+            while (cur_node) |n| {
+                if (n == &node) {
+                    if (prev) |p| p.next = n.next else s.wait_queue = n.next;
+                    break;
+                }
+                prev = n;
+                cur_node = n.next;
+            }
+        }
+        if (s.waiter_count > 0) s.waiter_count -= 1;
+        const gone = !s.active or s.semid != semid;
+        if (!gone and sysv_policy.removalCanFree(s.marked_removed, s.waiter_count)) {
+            // Last waiter out of a removed set releases the slot.
+            s.* = .{};
+            sem_lock.release(flags2);
+            return errno.EIDRM;
+        }
+        const removed = gone or s.marked_removed;
+        sem_lock.release(flags2);
+        if (removed) return errno.EIDRM;
+
+        // Fatal / handled signals end the wait; a plain wake (grant, SIGCONT,
+        // yield without a switch) just re-evaluates the condition.
+        const sig_mod = @import("../proc/signal.zig");
+        if (sig_mod.pendingFatal(cur_task)) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
+        if (!node.granted and sig_mod.pendingActionable(cur_task)) return -4; // -EINTR
+    }
 }
 
 /// semctl(semid, semnum, cmd, arg) -> value or -errno
@@ -304,9 +289,8 @@ pub fn semctl(semid: u32, semnum: i32, cmd: i32, arg: i32) i64 {
             // blocking.
             if (arg < 0) return errno.EINVAL;
             s.values[@intCast(semnum)] = arg;
-            // Mirror the V-op wake: raising the value may let a blocked
-            // P-waiter's operation succeed — wake one so it re-checks.
-            if (arg > 0) _ = sched.wakeOne(&s.wait_queue);
+            // Any change may let a P-waiter (or a wait-for-zero waiter) proceed.
+            sched.wakeAll(&s.wait_queue);
             return 0;
         },
         GETVAL => {

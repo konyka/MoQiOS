@@ -170,7 +170,7 @@ pub fn msgget(key: i32, msgflg: i32) i64 {
     serial.writeString("[sysv_msg] created msgid=");
     fmt.writeDecimal(mid);
     serial.writeString(" key=");
-    fmt.writeDecimal64(@intCast(key));
+    fmt.writeDecimal64(@bitCast(@as(i64, key)));
     serial.writeString("\n");
 
     return @intCast(mid);
@@ -330,11 +330,14 @@ pub fn msgctl(msqid: u32, cmd: i32, buf: u64) i64 {
         const q = findById(msqid) orelse return EINVAL;
         if (q.marked_removed) return EIDRM;
         if (!canManage(q)) return errno.EPERM;
-        q.marked_removed = true;
-        serial.writeString("[sysv_msg] marked msgid=");
+        // Linux deletes the queue and its messages at once. No sysv_msg call
+        // blocks, so no task can be holding the slot; leaving it "marked" made
+        // every later msgsnd/msgrcv/msgctl fail with EIDRM and the slot was
+        // never reclaimed (16 leaks exhaust msgget for everyone).
+        serial.writeString("[sysv_msg] removed msgid=");
         fmt.writeDecimal(msqid);
-        serial.writeString(" for removal\n");
-        if (q.count == 0) q.* = .{};
+        serial.writeString("\n");
+        q.* = .{};
         return 0;
     }
 
@@ -367,7 +370,7 @@ pub fn msgctl(msqid: u32, cmd: i32, buf: u64) i64 {
         msg_lock.release(flags);
         return errno.EACCES;
     }
-    info = .{ @intCast(q.key), @intCast(q.msgid), @intCast(q.count), @intCast(q.total_bytes), @intCast(q.mode), 0 };
+    info = .{ @bitCast(@as(i64, q.key)), @intCast(q.msgid), @intCast(q.count), @intCast(q.total_bytes), @intCast(q.mode), 0 };
     msg_lock.release(flags);
     const info_size = @sizeOf([6]u64);
     if (!copy.validateUserBufferWritable(buf, info_size)) return EFAULT;

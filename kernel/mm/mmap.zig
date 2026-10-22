@@ -969,7 +969,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
         // (panic in safe builds) or unmap kernel pages in ReleaseFast.
         if (base >= user_space.USER_ADDR_MAX) return -22; // EINVAL
         if (num_pages > (user_space.USER_ADDR_MAX - base) / user_space.PAGE_SIZE) return -12; // ENOMEM
-        if (@import("../ipc/sysv_shm.zig").overlapsAttachment(cur.tid, base, num_pages)) return -22; // EINVAL
+        if (@import("../ipc/sysv_shm.zig").overlapsAttachment(cur.page_table_phys, base, num_pages)) return -22; // EINVAL
         if (hasMmapOverlap(cur, base, num_pages)) {
             if (meta != null) return -12;
             return replaceFixedAnonymous(cur, base, num_pages, prot, flags);
@@ -1124,7 +1124,7 @@ pub fn madviseDontneed(addr: u64, length: u64) i64 {
     var vm_guard = mm_mod.Mm.beginVmMutation(cur.mm, @ptrCast(cur)) catch return -35;
     defer vm_guard.release();
 
-    if (@import("../ipc/sysv_shm.zig").overlapsAttachment(cur.tid, base, num_pages)) return -22;
+    if (@import("../ipc/sysv_shm.zig").overlapsAttachment(cur.page_table_phys, base, num_pages)) return -22;
 
     // Every page must lie in a tracked region, and none may be no_free.
     const page = user_space.PAGE_SIZE;
@@ -1224,7 +1224,7 @@ pub fn munmap(addr: u64, length: u64) i64 {
     // SysV SHM owns these frames until shmdt (or task exit).  Do not let the
     // generic unmap path detach only part of an attachment and later free a
     // frame still referenced by the segment.
-    if (@import("../ipc/sysv_shm.zig").overlapsAttachment(cur.tid, base, num_pages)) return -22;
+    if (@import("../ipc/sysv_shm.zig").overlapsAttachment(cur.page_table_phys, base, num_pages)) return -22;
 
     // Preflight the region-table capacity untrackMmapRange needs: a range
     // cutting a region in the middle inserts a tail piece into a free slot,

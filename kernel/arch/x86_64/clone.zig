@@ -269,7 +269,7 @@ pub fn clone(
 
     // See fork(): until SHM attachment ownership is shared/address-space
     // based, reject both process and CLONE_VM cloning while attached.
-    if (@import("../../ipc/sysv_shm.zig").hasAttachments(parent.tid)) return -11; // EAGAIN
+    if (@import("../../ipc/sysv_shm.zig").hasAttachments(parent.page_table_phys)) return -11; // EAGAIN
 
     // RLIMIT_NPROC preflight: a thread or process created via clone counts
     // against the parent's real UID (Linux counts every task). Gate before

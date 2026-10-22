@@ -399,5 +399,5 @@ fn hasShmAttachments() bool {
     const shm = @import("../ipc/sysv_shm.zig");
     const idx = sched.currentTaskIndex() orelse return false;
     const cur = task_mod.getTask(idx) orelse return false;
-    return shm.hasAttachments(cur.tid);
+    return shm.hasAttachments(cur.page_table_phys);
 }

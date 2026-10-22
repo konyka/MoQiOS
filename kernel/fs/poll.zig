@@ -45,8 +45,10 @@ pub fn poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) i64 {
         var ready_count: u64 = 0;
         for (0..@min(nfds, 128)) |i| {
             pfds[i].revents = 0;
+            // A negative fd means "ignore this entry" (POSIX); test before casting.
+            if (pfds[i].fd < 0) continue;
             const fd: u32 = @intCast(pfds[i].fd);
-            if (fd >= vfs_mod.MAX_FDS or pfds[i].fd < 0) continue;
+            if (fd >= vfs_mod.MAX_FDS) continue;
             const desc = &t.fd_table.fds[fd];
             if (desc.fd_type == .none) {
                 pfds[i].revents = POLLNVAL;

@@ -85,7 +85,7 @@ pub fn brk(addr: u64) i64 {
         // Demand-paged mappings (file mmap, SysV SHM) own their range before
         // any PTE exists; the PTE scan above cannot see them.
         if (mmap_mod.hasMmapOverlap(cur, old_page * PAGE, new_page - old_page) or
-            @import("../ipc/sysv_shm.zig").overlapsAttachment(cur.tid, old_page * PAGE, new_page - old_page))
+            @import("../ipc/sysv_shm.zig").overlapsAttachment(cur.page_table_phys, old_page * PAGE, new_page - old_page))
         {
             return @bitCast(cur.brk_current);
         }

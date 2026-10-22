@@ -232,6 +232,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello110"); /* madvise(MADV_DONTNEED) drops anonymous pages */
     run_test("hello111"); /* kill(2) permission/probe/group, SIGCHLD, SIG_IGN auto-reap */
     run_test("hello112"); /* sigaltstack delivery, undeliverable signal -> SIGSEGV */
+    run_test("hello113"); /* SysV IPC / poll hardening */
 
     start_persistent_services();
 

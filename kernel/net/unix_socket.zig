@@ -335,7 +335,14 @@ pub fn unixAccept(idx: u32) i32 {
 
     // Backlog entries are raw indices — validate before use (the connector
     // may have been closed and its slot realloc'd while queued).
-    if (conn_idx >= MAX_UNIX_SOCKETS or !unix_sockets[conn_idx].active) return -103; // ECONNABORTED
+    // A queued connector that is no longer a pending stream client (closed and
+    // its slot reused by something else, or already paired) must not be rewired.
+    if (conn_idx >= MAX_UNIX_SOCKETS) return -103; // ECONNABORTED
+    {
+        const queued = &unix_sockets[conn_idx];
+        if (!queued.active or queued.sock_type != SOCK_STREAM or queued.connected or queued.listening)
+            return -103; // ECONNABORTED
+    }
 
     // Create a new socket for the accepted connection
     var new_idx: u32 = MAX_UNIX_SOCKETS;
@@ -498,7 +505,9 @@ pub fn unixRecv(idx: u32, buf: [*]u8, len: usize) i64 {
         const hi = sock.buffer[sock.buf_read];
         sock.buf_read = (sock.buf_read + 1) % UNIX_SOCK_BUF_SIZE;
         sock.buf_count -= 2;
-        const dgram_len: usize = @as(usize, lo) | (@as(usize, hi) << 8);
+        // A length prefix larger than what is buffered can only come from
+        // stray bytes in the ring; never trust it past buf_count.
+        const dgram_len: usize = @min(@as(usize, lo) | (@as(usize, hi) << 8), @as(usize, sock.buf_count));
 
         const to_read = @min(len, dgram_len);
         ringRead(&sock.buffer, sock.buf_read, buf, to_read);
@@ -590,6 +599,10 @@ pub fn unixClose(idx: u32) void {
     // DGRAM senders aimed at this socket now fail instead of blocking.
     wake.out |= sendersIntoLocked(idx);
 
+    // Drop this socket from every listener's backlog: its slot is about to be
+    // reusable, and a stale entry would let accept() rewire an unrelated socket.
+    purgeFromBacklogsLocked(idx);
+
     // Notify peer that we closed
     if (sock.connected and sock.peer_idx < MAX_UNIX_SOCKETS) {
         const peer = &unix_sockets[sock.peer_idx];
@@ -614,6 +627,21 @@ pub fn unixClose(idx: u32) void {
     }
 
     sock.* = .{};
+}
+
+fn purgeFromBacklogsLocked(idx: u32) void {
+    for (&unix_sockets) |*l| {
+        if (!l.active or !l.listening or l.backlog_count == 0) continue;
+        var w: u8 = 0;
+        var r: u8 = 0;
+        while (r < l.backlog_count) : (r += 1) {
+            if (l.backlog[r] == idx) continue;
+            l.backlog[w] = l.backlog[r];
+            w += 1;
+        }
+        for (w..l.backlog_count) |j| l.backlog[j] = 255;
+        l.backlog_count = w;
+    }
 }
 
 /// Current epoll readiness of socket `idx`; EPOLLERR once the slot is free.
