@@ -3976,7 +3976,7 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   - 运行时争用测试（hello114 O 段）：5 个进程同时读同一文件并列目录，另一个被 `SIGKILL` 在读到一半时
     杀掉，之后卷仍可读、`umount` 成功（说明锁没有被遗留持有）。SMP=1/2/8 均通过。变异验证：把 `lock()`
     改成空操作，SMP=8 下 3 项 O 检查失败，SMP=2 下解析器共享状态被破坏、内核直接 `integer overflow`
-    停机。hello114 在加入 mmap 段前为 133 项检查，现为 159 项。
+    停机。hello114 在加入 mmap 段前为 133 项检查，现为 180 项（mmap 段 25 项，目录描述符 Q 段 21 项）。
 - **第五轮自审：mmap**：
   - 卷内文件 `mmap` 返回 ENODEV（`mmap` 只认 ramdisk/tmpfs/ext2/fat32 四种 fd 类型），而这是用户对已挂载
     文件系统最先会做的事之一（动态链接器、`mmap` 读大文件）。先写运行时测试确认 RED（两项失败），再实现。
@@ -4013,8 +4013,15 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     随调用改写；改写后仍断言"凭证被转发"这一真正要保护的性质。
   - 验证：Q 段 21 项（含 htree 目录内的 `openat`、`..` 越出目录、绝对路径忽略 dirfd、非目录 dirfd、
     `fchdir` 后相对打开、cwd 下的 `statx`/`access`/`readlink`/`statfs`/`chdir("..")`）。
+  - **未解释的一次停滞（如实记录）**：本轮 SMP=2（MBR 数据盘）冒烟有一次在 `hello90: start` 之后无任何输出直到
+    200 秒超时，无 panic、无存储错误。`hello90` 是 FAT32/ext2 的 sendfile/splice 测试，在 hello114 之前运行，
+    当时尚无卷被挂载。此后复现尝试均未再现：同配置重跑 4 次、仓库的 `gdb_stall_probe.sh`（SMP=2）连续 14 次启动、
+    双核压测 5 轮、GPT 盘 SMP=2/8、MBR 盘 SMP=1/8，全部通过。因此**原因未知**：既不能证明与本轮改动无关
+    （`openat` 的入口确实被改成经 `at_path`），也没有证据表明相关；没有抓到停滞现场，所以不下结论。
+    历史上 §6.45/§6.47 记录过一类由宿主 `/tmp` 压力造成的伪停滞，但这次没有存储错误，不能据此归因。
+    如再出现，用 `tools/gdb_stall_probe.sh` 抓现场。
 - **验证**：host 测试 671/671（594→671：ext4 20、NTFS 19、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；锁守卫 1；virtio 索引守卫 1；
-  真实镜像、`debugfs`/`ntfsls` 交叉核对、敌对输入）；三架构构建；`hello114` 159 项运行时检查（含 25 项 mmap 检查）（NVMe/AHCI 两段默认 skip），MBR
+  真实镜像、`debugfs`/`ntfsls` 交叉核对、敌对输入）；三架构构建；`hello114` 180 项运行时检查（含 25 项 mmap、21 项目录描述符检查）（NVMe/AHCI 两段默认 skip），MBR
   默认镜像 SMP=1/2/8 通过，GPT 镜像（`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`）通过；
   变异验证（删 EROFS 守卫 → 7 项 FAIL；忽略挂载代数 → 过期 fd 项 FAIL；关掉挂载规则 → 7 项 FAIL；
   关掉 DAC 检查 → 7 项 FAIL；GPT 解析恒失败 → 43 项 FAIL；statfs 绕过卷路由 → 9 项 FAIL；access 绕过卷分支 → 9 项 FAIL；目录游标缓存恒未命中 → 1900 项目录列表 228865 ms 对 693 ms，时间预算检查 FAIL；睡眠锁：解锁不保持 held → 交接测试 FAIL，早醒不摘节点 → 竞态测试 FAIL；rofs_lock 改回自旋锁 → 源码守卫 FAIL）。
