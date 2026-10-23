@@ -3943,11 +3943,24 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     `e2fsck` 干净）并纳入 ext4 全部 host 测试矩阵，读取、目录、稀疏文件、statfs 均通过。
   - statfs 路径解析一度用 `rofs.open`（要求目标可读）；改为只要求路径目录可搜索的 `rofs.reach`，与
     Linux 一致，由运行时检查"对不可读文件 statfs 成功、穿过封闭目录 EACCES"锁定。
-- **验证**：host 测试 642/642（594→642：ext4 17、NTFS 13、GPT 5、挂载路径 5、DAC 7、EROFS 守卫表 1；
-  真实镜像、`debugfs`/`ntfsls` 交叉核对、敌对输入）；三架构构建；`hello114` 114 项运行时检查（NVMe/AHCI 两段默认 skip），MBR
+- **第三轮自审发现并修正的问题**：
+  - **NTFS 大目录列表是 O(N²)**：`readDirAt(n)` 每次从根重走整棵 B 树。实测 136 项的 fixture 列完要
+    821 次设备读（整树只需 10 次）；6000 项目录读第 5600–5700 项要 56261 次读，全程持 `rofs_lock`，
+    其它进程对卷的所有操作都被卡住。改为可恢复游标 `DirCursor`，1912 项目录列完共 4142 次读（约 2 次/项）。
+  - **缓存第一版有同类缺陷**：getdents 在缓冲区装不下下一项时会探测一次再返回，下次调用再要同一位置；
+    把游标"就地推进"会让第二次必然未命中而重扫。抽出纯模块 `fs/dir_cursor_cache.zig`（推进不覆盖原位置，
+    LRU，时钟回绕安全），7 个 host 测试，其中一个模拟 5000 项"探测 + 重取"序列，断言未命中数为 0。
+  - **virtio 队列索引溢出 panic（通用缺陷，非本特性引入）**：`avail.idx = avail_idx + 1` 在 Zig Debug/
+    ReleaseSafe 下是受检加法，`avail.idx` 是自由运行的 u16，第 65536 次请求必然 `integer overflow` 停机。
+    新特性第一次把一块 virtio 盘读到那个量级（列大目录）才暴露；影响 virtio-blk 与 virtio-net 共 8 处，
+    改为 `+%`，并加源码守卫测试（把其中一处改回 `+ 1`，测试失败，已验证）。
+  - hello114 的"两个交错读者"最初共用一份已见数组，检查形同虚设；改为各自独立统计。
+  - GPT/MBR 数据盘增加第 3 个分区（1900 项 NTFS 根目录），`gpt_test` 随之更新为 14 MiB / 3 个分区。
+- **验证**：host 测试 655/655（594→655：ext4 17、NTFS 18、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、EROFS 守卫表 1；virtio 索引守卫 1；
+  真实镜像、`debugfs`/`ntfsls` 交叉核对、敌对输入）；三架构构建；`hello114` 127 项运行时检查（NVMe/AHCI 两段默认 skip），MBR
   默认镜像 SMP=1/2/8 通过，GPT 镜像（`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`）通过；
   变异验证（删 EROFS 守卫 → 7 项 FAIL；忽略挂载代数 → 过期 fd 项 FAIL；关掉挂载规则 → 7 项 FAIL；
-  关掉 DAC 检查 → 7 项 FAIL；GPT 解析恒失败 → 43 项 FAIL；statfs 绕过卷路由 → 9 项 FAIL；access 绕过卷分支 → 9 项 FAIL）。
+  关掉 DAC 检查 → 7 项 FAIL；GPT 解析恒失败 → 43 项 FAIL；statfs 绕过卷路由 → 9 项 FAIL；access 绕过卷分支 → 9 项 FAIL；目录游标缓存恒未命中 → 1900 项目录列表 228865 ms 对 693 ms，时间预算检查 FAIL）。
 - **未做 / 已知限制**：写入（ext4 与 NTFS）；ext4 日志回放；元数据校验和验证；NTFS
   压缩/加密/$ATTRIBUTE_LIST/$UpCase 大小写折叠；GPT 备份表不使用且仅支持主表在 LBA 2、≤32 扇区
   的布局；DAC 不跟踪补充组；卷内再挂载；NTFS 位图超过 64 MiB 的卷 statfs 返回 EOPNOTSUPP；`faccessat` 的 dirfd 仍被忽略（沿用既有行为）；VFS 仍是"扁平命名 + 前缀路由"而非通用挂载树，
@@ -3955,7 +3968,7 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 
 | Gate | Result | Notes |
 |---|---|---|
-| `zig build test`（0.16.0） | Passed 642/642 | 594→642 |
+| `zig build test`（0.16.0） | Passed 655/655 | 594→655 |
 | `zig build` / riscv64 / aarch64 | Passed | 三架构 |
 | smoke SMP=1 / 2 / 8（MBR 数据盘） | Passed | hello114 PASS，90 项 ok；I/J 段默认 skip |
 | smoke SMP=1 / 2 / 8（GPT 数据盘） | Passed | SMP=1/2/8 均 PASS；GPT 变异（`isProtectiveMbr` 恒 false）→ 43 项 FAIL |

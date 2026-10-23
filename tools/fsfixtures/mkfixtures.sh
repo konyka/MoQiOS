@@ -92,26 +92,40 @@ for i in $(seq 1 120); do
     ntfscp -f -q "$OUT/ntfs.img" "$WORK/f.txt" "file_with_a_long_name_number_$i.txt"
 done
 
+# NTFS with a large root directory: 1900 long names force a multi-level
+# $INDEX_ALLOCATION tree, which is what directory listing has to stay fast on.
+truncate -s 4M "$OUT/ntfs_bigdir.img"
+mkntfs -q -F -f -s 512 -c 1024 -L MOQIBIGD "$OUT/ntfs_bigdir.img" >/dev/null 2>&1
+: > "$WORK/empty.bin"
+for i in $(seq 0 1899); do
+    ntfscp -f -q "$OUT/ntfs_bigdir.img" "$WORK/empty.bin" "$(printf 'bigdir_entry_with_a_long_name_%04d.txt' "$i")"
+done
+
 # MBR-partitioned data disk for the QEMU smoke (attached as the 2nd virtio
-# disk, "vblk1"): p1 = ext4 (type 83), p2 = NTFS (type 7).
-truncate -s 10M "$OUT/datadisk.img"
+# disk, "vblk1"): p1 = ext4 (type 83), p2 = NTFS (type 7), p3 = NTFS with a
+# 1900-entry root directory.
+truncate -s 14M "$OUT/datadisk.img"
 sfdisk -q "$OUT/datadisk.img" <<'PT'
 label: dos
 unit: sectors
 start=2048, size=8192, type=83
 start=10240, size=8192, type=7
+start=18432, size=8192, type=7
 PT
 dd if="$OUT/ext4_1k.img" of="$OUT/datadisk.img" bs=512 seek=2048 conv=notrunc status=none
 dd if="$OUT/ntfs.img" of="$OUT/datadisk.img" bs=512 seek=10240 conv=notrunc status=none
+dd if="$OUT/ntfs_bigdir.img" of="$OUT/datadisk.img" bs=512 seek=18432 conv=notrunc status=none
 
 # Same layout behind a GPT (protective MBR + header + 128 entries + backup).
-truncate -s 10M "$OUT/datadisk_gpt.img"
+truncate -s 14M "$OUT/datadisk_gpt.img"
 sfdisk -q "$OUT/datadisk_gpt.img" <<'PT'
 label: gpt
 unit: sectors
 start=2048, size=8192, type=0FC63DAF-8483-4772-8E79-3D69D8478480
 start=10240, size=8192, type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
+start=18432, size=8192, type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
 PT
 dd if="$OUT/ext4_1k.img" of="$OUT/datadisk_gpt.img" bs=512 seek=2048 conv=notrunc status=none
 dd if="$OUT/ntfs.img" of="$OUT/datadisk_gpt.img" bs=512 seek=10240 conv=notrunc status=none
-echo "wrote $OUT/{ext4_1k,ext4_4k,ext3_1k,ext4_bigalloc,ntfs,datadisk,datadisk_gpt}.img"
+dd if="$OUT/ntfs_bigdir.img" of="$OUT/datadisk_gpt.img" bs=512 seek=18432 conv=notrunc status=none
+echo "wrote $OUT/{ext4_1k,ext4_4k,ext3_1k,ext4_bigalloc,ntfs,ntfs_bigdir,datadisk,datadisk_gpt}.img"

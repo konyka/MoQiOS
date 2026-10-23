@@ -11,7 +11,7 @@ fn load(buf: []u8) !void {
     try std.testing.expectEqual(buf.len, n);
 }
 
-const DISK_SECTORS: u64 = 10 * 1024 * 1024 / 512;
+const DISK_SECTORS: u64 = 14 * 1024 * 1024 / 512;
 
 test "protective MBR and header of a real sfdisk GPT" {
     var head: [34 * 512]u8 = undefined;
@@ -36,7 +36,10 @@ test "partition extents match the table sfdisk wrote" {
     const p1 = gpt.entryAt(h, array, 1, DISK_SECTORS).?;
     try std.testing.expectEqual(@as(u64, 10240), p1.first_lba);
     try std.testing.expectEqual(@as(u64, 8192), p1.sectors);
-    try std.testing.expect(gpt.entryAt(h, array, 2, DISK_SECTORS) == null); // unused
+    const p2 = gpt.entryAt(h, array, 2, DISK_SECTORS).?;
+    try std.testing.expectEqual(@as(u64, 18432), p2.first_lba);
+    try std.testing.expectEqual(@as(u64, 8192), p2.sectors);
+    try std.testing.expect(gpt.entryAt(h, array, 3, DISK_SECTORS) == null); // unused
     try std.testing.expect(gpt.entryAt(h, array, 200, DISK_SECTORS) == null); // out of range
 }
 

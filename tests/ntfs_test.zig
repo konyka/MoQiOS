@@ -292,3 +292,136 @@ test "statfs rejects a bitmap that is shorter than the volume" {
     v.total_clusters = (@as(u64, 1) << 40); // beyond the scan cap
     try std.testing.expectError(error.Unsupported, v.freeClusters());
 }
+
+const big_path = "tests/fixtures/fs/ntfs_bigdir.img";
+
+const NameList = struct {
+    names: std.ArrayList([]u8),
+    fn add(c: *NameList, d: *const fr.DirEntry) bool {
+        const copy = std.testing.allocator.dupe(u8, d.nameSlice()) catch return false;
+        c.names.append(std.testing.allocator, copy) catch {
+            std.testing.allocator.free(copy);
+            return false;
+        };
+        return true;
+    }
+};
+
+fn freeNames(l: *NameList) void {
+    for (l.names.items) |n| std.testing.allocator.free(n);
+    l.names.deinit(std.testing.allocator);
+}
+
+test "big directory: the cursor yields exactly what the whole-tree walk yields" {
+    var img = try Image.open(big_path);
+    defer img.close();
+    const v = try mountImage(&img);
+    var want: NameList = .{ .names = .empty };
+    defer freeNames(&want);
+    try v.walkDir(ntfs.ROOT_REF, &want, NameList.add);
+    // 1900 files plus the system files mkntfs keeps in the root.
+    try std.testing.expect(want.names.items.len >= 1900);
+
+    var cur: ntfs.Volume.DirCursor = .{};
+    var e: fr.DirEntry = undefined;
+    var i: usize = 0;
+    while (try v.nextDirEntry(ntfs.ROOT_REF, &cur, &e)) : (i += 1) {
+        try std.testing.expect(i < want.names.items.len);
+        try std.testing.expectEqualStrings(want.names.items[i], e.nameSlice());
+    }
+    try std.testing.expectEqual(want.names.items.len, i);
+    // once finished it stays finished
+    try std.testing.expect(!(try v.nextDirEntry(ntfs.ROOT_REF, &cur, &e)));
+}
+
+test "big directory: a cursor copy resumes from any position" {
+    var img = try Image.open(big_path);
+    defer img.close();
+    const v = try mountImage(&img);
+    var want: NameList = .{ .names = .empty };
+    defer freeNames(&want);
+    try v.walkDir(ntfs.ROOT_REF, &want, NameList.add);
+
+    // Walk once, saving a copy of the cursor at every 37th entry, then resume
+    // each saved copy (after unrelated reads reused the scratch blocks) and
+    // check the next few names.
+    var cur: ntfs.Volume.DirCursor = .{};
+    var e: fr.DirEntry = undefined;
+    var saved: std.ArrayList(struct { at: usize, c: ntfs.Volume.DirCursor }) = .empty;
+    defer saved.deinit(std.testing.allocator);
+    var i: usize = 0;
+    while (true) {
+        if (i % 37 == 0) try saved.append(std.testing.allocator, .{ .at = i, .c = cur });
+        if (!try v.nextDirEntry(ntfs.ROOT_REF, &cur, &e)) break;
+        i += 1;
+    }
+    try std.testing.expect(saved.items.len > 40);
+    for (saved.items) |s| {
+        var c = s.c;
+        _ = try v.resolve("/bigdir_entry_with_a_long_name_1234.txt", true); // disturbs scratch
+        var k: usize = 0;
+        while (k < 5 and s.at + k < want.names.items.len) : (k += 1) {
+            try std.testing.expect(try v.nextDirEntry(ntfs.ROOT_REF, &c, &e));
+            try std.testing.expectEqualStrings(want.names.items[s.at + k], e.nameSlice());
+        }
+    }
+}
+
+test "big directory: listing with a cursor costs reads proportional to the directory, not its square" {
+    var img = try Image.open(big_path);
+    defer img.close();
+    const v = try mountImage(&img);
+
+    img.reads = 0;
+    var full: NameList = .{ .names = .empty };
+    defer freeNames(&full);
+    try v.walkDir(ntfs.ROOT_REF, &full, NameList.add);
+    const walk_reads = img.reads;
+
+    img.reads = 0;
+    var cur: ntfs.Volume.DirCursor = .{};
+    var e: fr.DirEntry = undefined;
+    var n: usize = 0;
+    while (try v.nextDirEntry(ntfs.ROOT_REF, &cur, &e)) n += 1;
+    const cursor_reads = img.reads;
+    try std.testing.expectEqual(full.names.items.len, n);
+    // Each call re-reads the MFT record and the blocks on its path (measured:
+    // ~2 reads per entry on this depth-3 tree), nothing like entries^2 / 2 (~1.8M).
+    try std.testing.expect(cursor_reads < n * 8);
+    try std.testing.expect(walk_reads < n);
+    try std.testing.expect(cur.depth == 0 and cur.done);
+}
+
+test "big directory: readDirAt agrees with the walk at the edges" {
+    var img = try Image.open(big_path);
+    defer img.close();
+    const v = try mountImage(&img);
+    var want: NameList = .{ .names = .empty };
+    defer freeNames(&want);
+    try v.walkDir(ntfs.ROOT_REF, &want, NameList.add);
+    var e: fr.DirEntry = undefined;
+    for ([_]usize{ 0, 1, want.names.items.len / 2, want.names.items.len - 1 }) |k| {
+        try std.testing.expect(try v.readDirAt(ntfs.ROOT_REF, k, &e));
+        try std.testing.expectEqualStrings(want.names.items[k], e.nameSlice());
+    }
+    try std.testing.expect(!(try v.readDirAt(ntfs.ROOT_REF, want.names.items.len, &e)));
+    try std.testing.expect(!(try v.readDirAt(ntfs.ROOT_REF, want.names.items.len + 1000, &e)));
+}
+
+test "a directory cursor never runs away on a hostile tree" {
+    var img = try Image.open(big_path);
+    defer img.close();
+    const v = try mountImage(&img);
+    // Point the cursor at a block number far outside the index: it must fail
+    // cleanly, not loop or read out of bounds.
+    var cur: ntfs.Volume.DirCursor = .{};
+    var e: fr.DirEntry = undefined;
+    _ = try v.nextDirEntry(ntfs.ROOT_REF, &cur, &e);
+    cur.depth = 1;
+    cur.vcn[1] = 0x7fff_ffff;
+    cur.off[1] = 0;
+    try std.testing.expectError(error.Corrupt, v.nextDirEntry(ntfs.ROOT_REF, &cur, &e));
+    // And a depth beyond the supported maximum is refused.
+    var deep: ntfs.Volume.DirCursor = .{ .started = true, .depth = 200 };
+    try std.testing.expectError(error.Corrupt, v.nextDirEntry(ntfs.ROOT_REF, &deep, &e));
+}

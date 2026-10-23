@@ -404,7 +404,7 @@ pub fn readSectors(lba: u64, count: u32, buf: [*]u8) i64 {
     const avail_idx = avail.idx;
     avail.ring[avail_idx % device.queue_num] = 0; // start descriptor
     asm volatile ("" ::: .{ .memory = true });
-    avail.idx = avail_idx + 1;
+    avail.idx = avail_idx +% 1;
 
     // Notify the device
     writeReg16(VIRTIO_PCI_QUEUE_NOTIFY, 0);
@@ -482,7 +482,7 @@ fn readSectorsFromDev(dev: *VirtioBlkDevice, lba: u64, count: u32, buf: [*]u8) i
     const avail_idx = avail.idx;
     avail.ring[avail_idx % dev.queue_num] = 0;
     asm volatile ("" ::: .{ .memory = true });
-    avail.idx = avail_idx + 1;
+    avail.idx = avail_idx +% 1;
 
     io.outw(@intCast(dev.io_base + VIRTIO_PCI_QUEUE_NOTIFY), 0);
 
@@ -551,7 +551,7 @@ pub noinline fn writeSectors(lba: u64, count: u32, buf: [*]const u8) i64 {
     const avail_idx = avail.idx;
     avail.ring[avail_idx % device.queue_num] = 0;
     asm volatile ("" ::: .{ .memory = true });
-    avail.idx = avail_idx + 1;
+    avail.idx = avail_idx +% 1;
 
     writeReg16(VIRTIO_PCI_QUEUE_NOTIFY, 0);
 
@@ -622,7 +622,7 @@ fn writeSectorsToDev(dev: *VirtioBlkDevice, lba: u64, count: u32, buf: [*]const 
     const avail_idx = avail.idx;
     avail.ring[avail_idx % dev.queue_num] = 0;
     asm volatile ("" ::: .{ .memory = true });
-    avail.idx = avail_idx + 1;
+    avail.idx = avail_idx +% 1;
 
     io.outw(@intCast(dev.io_base + VIRTIO_PCI_QUEUE_NOTIFY), 0);
 
@@ -699,7 +699,7 @@ pub fn discard(lba: u64, count: u32) i32 {
     const avail_idx = avail.idx;
     avail.ring[avail_idx % device.queue_num] = 0;
     asm volatile ("" ::: .{ .memory = true });
-    avail.idx = avail_idx + 1;
+    avail.idx = avail_idx +% 1;
 
     writeReg16(VIRTIO_PCI_QUEUE_NOTIFY, 0);
 

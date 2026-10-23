@@ -467,7 +467,7 @@ fn populateRxQueue() !void {
         const avail_idx = avail.idx;
         avail.ring[avail_idx % QUEUE_SIZE] = hdr_idx;
         asm volatile ("" ::: .{ .memory = true });
-        avail.idx = avail_idx + 1;
+        avail.idx = avail_idx +% 1;
     }
 
     // Notify device
@@ -542,7 +542,7 @@ pub fn sendPacket(pkt: [*]const u8, len: u32) bool {
     const avail_idx = avail.idx;
     avail.ring[avail_idx % QUEUE_SIZE] = hdr_idx;
     asm volatile ("" ::: .{ .memory = true });
-    avail.idx = avail_idx + 1;
+    avail.idx = avail_idx +% 1;
 
     // Notify device (queue 1 = TX)
     io.outw(@intCast(device.io_base + VIRTIO_PCI_QUEUE_NOTIFY), 1);
@@ -624,7 +624,7 @@ fn processRxQueue() void {
         const avail_idx = avail.idx;
         avail.ring[avail_idx % QUEUE_SIZE] = @intCast(elem.id);
         asm volatile ("" ::: .{ .memory = true });
-        avail.idx = avail_idx + 1;
+        avail.idx = avail_idx +% 1;
 
         vq.last_used_idx +%= 1;
     }

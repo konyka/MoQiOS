@@ -1,7 +1,7 @@
 /// hello114: read-only ext4 and NTFS volumes on the second virtio disk.
 ///
 /// The disk (tests/fixtures/fs/datadisk.img, vblk1) holds an MBR with
-/// p1 = ext4 and p2 = NTFS, built by tools/fsfixtures/mkfixtures.sh.
+/// p1 = ext4, p2 = NTFS and p3 = NTFS with a 1900-entry root, built by tools/fsfixtures/mkfixtures.sh.
 ///
 ///   A. mount ext4 (vblk1p1) at /mnt/e and NTFS (vblk1p2) at /mnt/n
 ///   B. read small / large / sparse files and compare against the generator
@@ -14,6 +14,8 @@
 ///   I/J. (only when the scratch NVMe / SATA disk holds an ext4 volume)
 ///   L. permissions: the process runs as uid/gid 1000; files owned by 4242 are
 ///      checked against their other-class bits, the owner's own against the owner class
+///   N. a 1900-entry NTFS directory (multi-level index): complete, duplicate-free
+///      listings with small buffers, two interleaved readers, rewind; listing time bounded
 ///   M. statfs/fstatfs: real block and inode counts, read-only flag, cached NTFS count
 ///   K. mount-point rules: '/', /dev, /proc, /tmp, nested and '..'-disguised
 ///      targets are refused; equivalent spellings name one mount
@@ -68,6 +70,7 @@ static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_SYMLINK   88
 #define SYS_TRUNCATE  210
 #define SYS_ACCESS    198
+#define SYS_CLOCK_GETTIME 228
 #define SYS_STATFS    276
 #define SYS_FSTATFS   277
 
@@ -157,6 +160,72 @@ static int list_dir(const char *path, int *has_sub, int *numbered, int *total, i
     return 0;
 }
 
+#define BIG_N 1900
+#ifndef NTFS_LIST_BUDGET_MS
+#define NTFS_LIST_BUDGET_MS 10000
+#endif
+struct big_stats { int total, named, dups, dot, dotdot, bad; uint8_t seen[BIG_N]; };
+
+static void big_clear(struct big_stats *st) {
+    st->total = st->named = st->dups = st->dot = st->dotdot = st->bad = 0;
+    for (int i = 0; i < BIG_N; i++) st->seen[i] = 0;
+}
+
+static uint64_t now_ms(void) {
+    struct { int64_t sec; int64_t nsec; } ts;
+    syscall2(SYS_CLOCK_GETTIME, 1 /* CLOCK_MONOTONIC */, (uint64_t)&ts);
+    return (uint64_t)ts.sec * 1000 + (uint64_t)ts.nsec / 1000000;
+}
+
+/* Read one getdents64 chunk of at most `bufsz` bytes from `fd`, tallying
+ * "bigdir_entry_with_a_long_name_NNNN.txt" entries into `st`. Returns the
+ * getdents result (0 at the end, negative errno on failure). */
+static int64_t big_step(int64_t fd, uint64_t bufsz, struct big_stats *st) {
+    static char buf[2048];
+    static const char prefix[] = "bigdir_entry_with_a_long_name_";
+    int64_t n = syscall3(SYS_GETDENTS, (uint64_t)fd, (uint64_t)buf, bufsz);
+    if (n <= 0) return n;
+    int64_t off = 0;
+    while (off < n) {
+        struct dirent64 *d = (struct dirent64 *)(buf + off);
+        st->total++;
+        const char *nm = d->name;
+        if (streq(nm, ".")) st->dot++;
+        else if (streq(nm, "..")) st->dotdot++;
+        else {
+            int i = 0;
+            while (prefix[i] && nm[i] == prefix[i]) i++;
+            if (prefix[i] == 0) {
+                int v = 0, digits = 0;
+                const char *q = nm + i;
+                while (*q >= '0' && *q <= '9' && digits < 4) { v = v * 10 + (*q - '0'); q++; digits++; }
+                if (digits == 4 && streq(q, ".txt") && v < BIG_N) {
+                    st->named++;
+                    if (st->seen[v]) st->dups++;
+                    st->seen[v] = 1;
+                } else st->bad++;
+            }
+        }
+        off += d->reclen;
+    }
+    return n;
+}
+
+static int big_complete(const struct big_stats *st) {
+    for (int i = 0; i < BIG_N; i++) if (!st->seen[i]) return 0;
+    return 1;
+}
+
+static void print_u64(uint64_t v) {
+    char num[24]; int k = 0;
+    if (v == 0) num[k++] = '0';
+    while (v) { num[k++] = (char)('0' + v % 10); v /= 10; }
+    char out[24]; for (int j = 0; j < k; j++) out[j] = num[k - 1 - j]; out[k] = 0;
+    print(out);
+}
+
+static struct big_stats bs_main, bs_a, bs_b;
+
 /* Mount `src` at `target` and expect `want`. If the mount unexpectedly
  * succeeds it is undone, so one wrongly accepted mount cannot keep the
  * partition busy and make every later refusal pass for the wrong reason. */
@@ -177,7 +246,7 @@ void _start(void) {
     check(syscall4(SYS_MOUNT, (uint64_t)"/dev/nosuchdisk", (uint64_t)"/mnt/x", (uint64_t)"ext4", 0) == -ENODEV, "H: unknown device is ENODEV");
     check(syscall4(SYS_MOUNT, (uint64_t)"/dev/vblk1p2", (uint64_t)"/mnt/x", (uint64_t)"ext4", 0) == -EINVAL, "H: NTFS partition mounted as ext4 is EINVAL");
     check(syscall4(SYS_MOUNT, (uint64_t)"/dev/vblk1p1", (uint64_t)"/mnt/x", (uint64_t)"ntfs", 0) == -EINVAL, "H: ext4 partition mounted as ntfs is EINVAL");
-    check(syscall4(SYS_MOUNT, (uint64_t)"/dev/vblk1p3", (uint64_t)"/mnt/x", (uint64_t)"ext4", 0) == -ENODEV, "H: empty partition slot is ENODEV");
+    check(syscall4(SYS_MOUNT, (uint64_t)"/dev/vblk1p4", (uint64_t)"/mnt/x", (uint64_t)"ext4", 0) == -ENODEV, "H: empty partition slot is ENODEV");
 
     /* A */
     check(syscall4(SYS_MOUNT, (uint64_t)"/dev/vblk1p1", (uint64_t)"/mnt/e", (uint64_t)"ext4", 0) == 0, "A: mount ext4 vblk1p1 at /mnt/e");
@@ -400,6 +469,52 @@ void _start(void) {
     }
     check(syscall3(SYS_READLINK, (uint64_t)"/mnt/p/link", (uint64_t)link, 63) == 9, "L: a symlink's own mode never blocks readlink");
     check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/p", 0) == 0, "L: umount");
+
+    /* N: a large NTFS directory. Entry names are 38 bytes, so a 200-byte
+     * buffer holds three entries and listing 1900 of them takes ~640 getdents
+     * calls; each must resume where the last stopped without rescanning. */
+    {
+        check(syscall4(SYS_MOUNT, (uint64_t)"/dev/vblk1p3", (uint64_t)"/mnt/big", (uint64_t)"ntfs", 0) == 0, "N: mount the big-directory volume");
+        big_clear(&bs_main);
+        int64_t bfd = syscall2(SYS_OPEN, (uint64_t)"/mnt/big", O_RDONLY);
+        uint64_t t0 = now_ms();
+        int64_t r;
+        while ((r = big_step(bfd, 200, &bs_main)) > 0) {}
+        uint64_t took = now_ms() - t0;
+        check(bfd >= 0 && r == 0, "N: the listing ends cleanly");
+        check(bs_main.named == BIG_N && bs_main.dups == 0 && big_complete(&bs_main), "N: all 1900 names appear exactly once with small buffers");
+        check(bs_main.dot == 1 && bs_main.dotdot == 1 && bs_main.bad == 0, "N: . and .. once each, no malformed names");
+        check(bs_main.total >= BIG_N + 2, "N: system files are listed too");
+        print("hello114:   info N: 1900-entry listing took "); print_u64(took); print(" ms\n");
+        check(took < NTFS_LIST_BUDGET_MS, "N: listing time is linear (a rescan per call would take far longer)");
+
+        big_clear(&bs_main);
+        check(syscall3(SYS_LSEEK, (uint64_t)bfd, 0, 0) == 0, "N: lseek(0) rewinds the directory");
+        while ((r = big_step(bfd, 1024, &bs_main)) > 0) {}
+        check(r == 0 && bs_main.named == BIG_N && bs_main.dups == 0 && big_complete(&bs_main), "N: a second listing after the rewind is complete");
+
+        /* two readers of the same directory with different buffer sizes,
+         * stepped alternately, each with its own tally */
+        int64_t fa = syscall2(SYS_OPEN, (uint64_t)"/mnt/big", O_RDONLY);
+        int64_t fb = syscall2(SYS_OPEN, (uint64_t)"/mnt/big", O_RDONLY);
+        big_clear(&bs_a); big_clear(&bs_b);
+        int64_t ra = 1, rb = 1;
+        int clean = 1;
+        while (ra > 0 || rb > 0) {
+            if (ra > 0) { ra = big_step(fa, 200, &bs_a); if (ra < 0) clean = 0; }
+            if (rb > 0) { rb = big_step(fb, 150, &bs_b); if (rb < 0) clean = 0; }
+        }
+        check(clean, "N: two interleaved readers never see an error");
+        check(bs_a.named == BIG_N && bs_a.dups == 0 && big_complete(&bs_a), "N: reader A (interleaved) saw every name exactly once");
+        check(bs_b.named == BIG_N && bs_b.dups == 0 && big_complete(&bs_b), "N: reader B (interleaved) saw every name exactly once");
+        syscall1(SYS_CLOSE, (uint64_t)fa);
+        syscall1(SYS_CLOSE, (uint64_t)fb);
+        syscall1(SYS_CLOSE, (uint64_t)bfd);
+
+        n = slurp("/mnt/big/bigdir_entry_with_a_long_name_1234.txt", small, sizeof(small));
+        check(n == 0, "N: lookup of one entry deep in the tree works");
+        check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/big", 0) == 0, "N: umount");
+    }
 
     /* I: a volume on the NVMe controller (its read path sleeps until the
      * completion interrupt, unlike virtio-blk's polling). The smoke gives

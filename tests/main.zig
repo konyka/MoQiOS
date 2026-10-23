@@ -84,6 +84,7 @@ test {
     _ = @import("mount_path_test.zig");
     _ = @import("rofs_access_test.zig");
     _ = @import("gpt_test.zig");
+    _ = @import("dir_cursor_cache_test.zig");
     _ = @import("ntfs_test.zig");
     _ = @import("wait_status_test.zig");
 }
@@ -5990,4 +5991,23 @@ test "swap policy: drain finish — commit only when fully drained, OOM rolls ba
     // A clean drain (all slots swapped back in) commits: device disabled.
     try std.testing.expectEqual(swap_policy.DrainFinish.commit, swap_policy.drainFinish(false));
     try std.testing.expectEqual(swap_policy.AreaState.disabled, swap_policy.drainNextState(.commit));
+}
+
+test "virtio available-ring indices wrap instead of trapping" {
+    // avail.idx is a free-running u16. A checked `+ 1` panics the kernel on the
+    // 65536th request, which a busy disk (a large directory listing) reaches.
+    const sources = [_][]const u8{ kt.virtio_blk_source, kt.virtio_net_source };
+    for (sources) |src| {
+        var count: usize = 0;
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, src, pos, "avail.idx = ")) |at| {
+            const eol = std.mem.indexOfScalarPos(u8, src, at, '\n') orelse src.len;
+            const line = src[at..eol];
+            try std.testing.expect(std.mem.indexOf(u8, line, "+% 1") != null);
+            try std.testing.expect(std.mem.indexOf(u8, line, " + 1") == null);
+            count += 1;
+            pos = eol;
+        }
+        try std.testing.expect(count >= 3);
+    }
 }

@@ -608,11 +608,18 @@ pub const Volume = struct {
         init_size: u64 = 0,
     };
 
-    /// Walk the whole directory B-tree of `dir_ref`, calling `visit` for every
-    /// user-visible name in tree order. `visit` returns false to stop.
-    pub fn walkDir(self: *const Volume, dir_ref: u64, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *const fr.DirEntry) bool) Error!void {
-        var rbuf: [MAX_RECORD]u8 = undefined;
-        const rec = try self.loadRecord(dir_ref & REF_MASK, &rbuf);
+    /// A directory's index as found in its MFT record: the resident
+    /// $INDEX_ROOT (`root`, entries in [entries_off, total)) and the location of
+    /// its $INDEX_ALLOCATION blocks. Slices point into the caller's record buffer.
+    const IndexView = struct {
+        root: []const u8,
+        entries_off: usize,
+        total: usize,
+        alloc: IndexAlloc,
+    };
+
+    fn openIndex(self: *const Volume, dir_ref: u64, rbuf: []u8) Error!IndexView {
+        const rec = try self.loadRecord(dir_ref & REF_MASK, rbuf);
         if (r16(rec, 0x16) & REC_IS_DIR == 0) return error.NotDir;
 
         var root_off: usize = 0;
@@ -638,9 +645,33 @@ pub const Volume = struct {
         const entries_off: usize = hdr_off + r32(root, hdr_off);
         const total: usize = hdr_off + r32(root, hdr_off + 4);
         if (entries_off < hdr_off + 16 or total > root.len or entries_off > total) return error.Corrupt;
+        return .{ .root = root, .entries_off = entries_off, .total = total, .alloc = alloc };
+    }
 
+    /// Read, validate and un-fixup the index block at `vcn` into `blk`.
+    fn loadIndexBlock(self: *const Volume, alloc: *const IndexAlloc, vcn: u64, blk: []u8) Error!struct { entries_off: usize, total: usize } {
+        // A block's VCN counts clusters when the index block is at least one
+        // cluster wide, and 512-byte units when blocks are smaller than a cluster.
+        const unit: u64 = if (self.index_block_size >= self.cluster_size) self.cluster_size else 512;
+        const byte = std.math.mul(u64, vcn, unit) catch return error.Corrupt;
+        const got = try self.readRuns(alloc.pairs, alloc.start_vcn, alloc.size, alloc.init_size, byte, blk);
+        if (got != blk.len) return error.Corrupt;
+        if (!std.mem.eql(u8, blk[0..4], "INDX")) return error.Corrupt;
+        try self.applyFixup(blk);
+        const hdr_off: usize = 24;
+        const entries_off: usize = hdr_off + r32(blk, hdr_off);
+        const total: usize = hdr_off + r32(blk, hdr_off + 4);
+        if (entries_off < hdr_off + 16 or total > blk.len or entries_off > total) return error.Corrupt;
+        return .{ .entries_off = entries_off, .total = total };
+    }
+
+    /// Walk the whole directory B-tree of `dir_ref`, calling `visit` for every
+    /// user-visible name in tree order. `visit` returns false to stop.
+    pub fn walkDir(self: *const Volume, dir_ref: u64, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *const fr.DirEntry) bool) Error!void {
+        var rbuf: [MAX_RECORD]u8 = undefined;
+        const ix = try self.openIndex(dir_ref, &rbuf);
         var visits: u32 = 0;
-        _ = try self.walkEntries(root, entries_off, total, &alloc, 0, ctx, visit, &visits);
+        _ = try self.walkEntries(ix.root, ix.entries_off, ix.total, &ix.alloc, 0, ctx, visit, &visits);
     }
 
     fn walkEntries(
@@ -680,31 +711,21 @@ pub const Volume = struct {
         visits: *u32,
     ) Error!bool {
         if (depth > MAX_TREE_DEPTH) return error.Corrupt;
-        // A block's VCN counts clusters when the index block is at least one
-        // cluster wide, and 512-byte units when blocks are smaller than a cluster.
-        const unit: u64 = if (self.index_block_size >= self.cluster_size) self.cluster_size else 512;
-        const byte = std.math.mul(u64, vcn, unit) catch return error.Corrupt;
         // One buffer per level: the parent's block stays intact while we descend.
         const blk = self.scratch.blocks[depth - 1][0..self.index_block_size];
-        const got = try self.readRuns(alloc.pairs, alloc.start_vcn, alloc.size, alloc.init_size, byte, blk);
-        if (got != blk.len) return error.Corrupt;
-        if (!std.mem.eql(u8, blk[0..4], "INDX")) return error.Corrupt;
-        try self.applyFixup(blk);
-        const hdr_off: usize = 24;
-        const entries_off: usize = hdr_off + r32(blk, hdr_off);
-        const total: usize = hdr_off + r32(blk, hdr_off + 4);
-        if (entries_off < hdr_off + 16 or total > blk.len or entries_off > total) return error.Corrupt;
-        return self.walkEntries(blk, entries_off, total, alloc, depth, ctx, visit, visits);
+        const hdr = try self.loadIndexBlock(alloc, vcn, blk);
+        return self.walkEntries(blk, hdr.entries_off, hdr.total, alloc, depth, ctx, visit, visits);
     }
 
-    fn emit(blk: []const u8, e: Entry, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *const fr.DirEntry) bool) Error!bool {
+    /// Decode a directory entry into `d`. False for an 8.3 alias, which is hidden.
+    fn decodeEntry(blk: []const u8, e: Entry, d: *fr.DirEntry) Error!bool {
         const key = blk[e.key_off .. e.key_off + e.key_len];
         const name_len: usize = key[0x40];
         const namespace = key[0x41];
         if (0x42 + name_len * 2 > key.len) return error.Corrupt;
-        if (namespace == NS_DOS) return false; // 8.3 alias of a Win32 entry
+        if (namespace == NS_DOS) return false;
         const flags = r32(key, 0x38);
-        var d: fr.DirEntry = .{ .ino = e.ref & REF_MASK };
+        d.ino = e.ref & REF_MASK;
         d.kind = if (flags & FILE_ATTR_DIRECTORY_IDX != 0) .directory else if (flags & FILE_ATTR_REPARSE != 0) .symlink else .regular;
         var o: usize = 0;
         var i: usize = 0;
@@ -726,6 +747,12 @@ pub const Volume = struct {
         }
         if (o == 0) return error.Corrupt;
         d.name_len = @intCast(o);
+        return true;
+    }
+
+    fn emit(blk: []const u8, e: Entry, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *const fr.DirEntry) bool) Error!bool {
+        var d: fr.DirEntry = undefined;
+        if (!try decodeEntry(blk, e, &d)) return false; // 8.3 alias of a Win32 entry
         return !visit(ctx, &d);
     }
 
@@ -747,23 +774,99 @@ pub const Volume = struct {
         return c.found orelse error.NotFound;
     }
 
-    const NthCtx = struct { target: u64, seen: u64 = 0, out: *fr.DirEntry, hit: bool = false };
+    /// Resumable position in a directory's B-tree, in tree order. It holds only
+    /// (block, entry offset) per level — no pointers into buffers — so a copy
+    /// can be stored and resumed later, after other operations reused the
+    /// volume's scratch blocks. Level 0 is the resident $INDEX_ROOT, deeper
+    /// levels are $INDEX_ALLOCATION blocks.
+    pub const DirCursor = struct {
+        started: bool = false,
+        done: bool = false,
+        depth: u8 = 0,
+        /// Loop steps taken over the cursor's whole life (bounds hostile trees).
+        visits: u32 = 0,
+        vcn: [MAX_TREE_DEPTH]u64 = @splat(0),
+        /// Offset of the entry to examine next at each level; 0 = "first entry".
+        off: [MAX_TREE_DEPTH]u32 = @splat(0),
+        /// The subtree left of the entry at `off` is finished.
+        descended: [MAX_TREE_DEPTH]bool = @splat(false),
+    };
 
-    fn nthVisit(c: *NthCtx, d: *const fr.DirEntry) bool {
-        if (c.seen == c.target) {
-            c.out.* = d.*;
-            c.hit = true;
-            return false;
+    /// Produce the next visible entry of directory `dir_ref` after `cur`'s
+    /// position into `out`. False at the end. On error `cur` is unspecified and
+    /// must be discarded. Cost is the tree depth, not the number of entries
+    /// already returned.
+    pub fn nextDirEntry(self: *const Volume, dir_ref: u64, cur: *DirCursor, out: *fr.DirEntry) Error!bool {
+        if (cur.done) return false;
+        var rbuf: [MAX_RECORD]u8 = undefined;
+        const ix = try self.openIndex(dir_ref, &rbuf);
+        // Per call: which levels hold their block in scratch right now, and each one's end offset.
+        var loaded: [MAX_TREE_DEPTH]bool = @splat(false);
+        var limits: [MAX_TREE_DEPTH]usize = @splat(0);
+        if (!cur.started) {
+            cur.started = true;
+            cur.depth = 0;
+            cur.off[0] = @intCast(ix.entries_off);
+            cur.descended[0] = false;
         }
-        c.seen += 1;
-        return true;
+        while (true) {
+            cur.visits +%= 1;
+            if (cur.visits > MAX_VISITS) return error.Corrupt;
+            const lvl: usize = cur.depth;
+            if (lvl >= MAX_TREE_DEPTH) return error.Corrupt;
+            var blk: []const u8 = undefined;
+            var limit: usize = undefined;
+            if (lvl == 0) {
+                blk = ix.root;
+                limit = ix.total;
+            } else {
+                const buf = self.scratch.blocks[lvl - 1][0..self.index_block_size];
+                if (!loaded[lvl]) {
+                    const hdr = try self.loadIndexBlock(&ix.alloc, cur.vcn[lvl], buf);
+                    limits[lvl] = hdr.total;
+                    loaded[lvl] = true;
+                    if (cur.off[lvl] == 0) cur.off[lvl] = @intCast(hdr.entries_off);
+                }
+                blk = buf;
+                limit = limits[lvl];
+            }
+            const off: usize = cur.off[lvl];
+            const e = try parseEntry(blk, off, limit);
+            if (e.has_sub and !cur.descended[lvl]) {
+                if (ix.alloc.pairs.len == 0) return error.Corrupt;
+                if (lvl + 1 >= MAX_TREE_DEPTH) return error.Corrupt;
+                cur.descended[lvl] = true;
+                cur.depth += 1;
+                const nl = lvl + 1;
+                cur.vcn[nl] = e.sub_vcn;
+                cur.off[nl] = 0;
+                cur.descended[nl] = false;
+                loaded[nl] = false;
+                continue;
+            }
+            if (e.last) {
+                if (lvl == 0) {
+                    cur.done = true;
+                    return false;
+                }
+                cur.depth -= 1; // the parent re-reads the entry that owns this subtree
+                continue;
+            }
+            cur.off[lvl] = @intCast(off + e.len);
+            cur.descended[lvl] = false;
+            if (try decodeEntry(blk, e, out)) return true;
+        }
     }
 
     /// Visible entry number `index` (0-based, tree order); false past the end.
+    /// Walks from the start; callers that list sequentially keep a DirCursor.
     pub fn readDirAt(self: *const Volume, dir_ref: u64, index: u64, out: *fr.DirEntry) Error!bool {
-        var c: NthCtx = .{ .target = index, .out = out };
-        try self.walkDir(dir_ref, &c, nthVisit);
-        return c.hit;
+        var cur: DirCursor = .{};
+        var skipped: u64 = 0;
+        while (skipped < index) : (skipped += 1) {
+            if (!try self.nextDirEntry(dir_ref, &cur, out)) return false;
+        }
+        return self.nextDirEntry(dir_ref, &cur, out);
     }
 
     // ─── Symlinks and paths ─────────────────────────────────────────────

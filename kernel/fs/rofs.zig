@@ -20,6 +20,7 @@ const block_dev = @import("../drivers/block_dev.zig");
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
 const access = @import("rofs_access_policy.zig");
+const dir_cache = @import("dir_cursor_cache.zig");
 
 pub const MAX_MOUNTS: usize = 4;
 const SECTOR: u64 = 512;
@@ -62,7 +63,13 @@ const Mount = struct {
     /// NTFS free-cluster count, computed on the first statfs. The volume is
     /// read-only, so it never changes while mounted.
     ntfs_free: ?u64 = null,
+    /// Resumable NTFS directory positions, so listing a big directory does not
+    /// restart from the first entry on every getdents call.
+    dir_cursors: DirCache = .{},
 };
+
+const DIR_CURSORS: usize = 4;
+const DirCache = dir_cache.Cache(ntfs.Volume.DirCursor, DIR_CURSORS);
 
 var rofs_lock: IrqSpinlock = .{};
 var mounts: [MAX_MOUNTS]Mount = @splat(.{});
@@ -415,20 +422,46 @@ pub fn dirNext(slot: u8, gen: u32, ref: Ref, pos: u64, out: *fr.DirEntry, next: 
             // More than a handful of consecutive dot entries cannot be a real directory.
             return -5;
         },
-        .ntfs => {
-            var idx: u64 = pos - 2;
-            var guard: u32 = 0;
-            while (guard < 4) : (guard += 1) {
-                const hit = m.ntfs_vol.readDirAt(ref, idx, out) catch |e| return mapErr(e);
-                if (!hit) return 0;
-                idx += 1;
-                if (isDotName(out.nameSlice())) continue;
-                next.* = idx + 2;
-                return 1;
-            }
-            return -5;
-        },
+        .ntfs => return ntfsDirNext(m, ref, pos - 2, out, next),
         .none => return -19,
+    }
+}
+
+/// Entry number `start` of NTFS directory `ref` (not counting the synthetic
+/// "." and ".."), resuming from a cached cursor when one sits exactly there.
+/// Without one the directory is rescanned from its first entry.
+///
+/// The position a call resumed from is left in the cache: getdents asks for
+/// the entry after the last one that fitted, finds it does not fit, and the
+/// next call asks for that same position again.
+fn ntfsDirNext(m: *Mount, ref: Ref, start: u64, out: *fr.DirEntry, next: *u64) i64 {
+    var cur: ntfs.Volume.DirCursor = .{};
+    var idx: u64 = 0;
+    if (m.dir_cursors.find(ref, start)) |hit| {
+        cur = hit;
+        idx = start;
+    }
+    var dots: u32 = 0;
+    while (true) {
+        const hit = m.ntfs_vol.nextDirEntry(ref, &cur, out) catch |e| {
+            m.dir_cursors.forget(ref);
+            return mapErr(e);
+        };
+        if (!hit) {
+            m.dir_cursors.forget(ref);
+            return 0;
+        }
+        idx += 1;
+        if (idx <= start) continue; // still skipping to the requested position
+        if (isDotName(out.nameSlice())) {
+            // NTFS indexes a "." entry; the synthetic ones already cover it.
+            dots += 1;
+            if (dots >= 4) return -5;
+            continue;
+        }
+        m.dir_cursors.put(ref, idx, cur); // entry number `idx` comes next
+        next.* = idx + 2;
+        return 1;
     }
 }
 
