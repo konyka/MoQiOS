@@ -3973,8 +3973,12 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   - 验证：NVMe 并发读 SMP=1/2/4 通过；AHCI 并发读 SMP=1/2 通过（该次运行为腾出 `/dev/sda` 临时关闭了
     占用它做 swap 的 hello96/98/99/100/101，故 smoke 脚本因缺少它们的标记返回 1，hello114 自身 PASS；
     `servers/init/main.c` 已还原，`git diff` 为空）。
+  - 运行时争用测试（hello114 O 段）：5 个进程同时读同一文件并列目录，另一个被 `SIGKILL` 在读到一半时
+    杀掉，之后卷仍可读、`umount` 成功（说明锁没有被遗留持有）。SMP=1/2/8 均通过。变异验证：把 `lock()`
+    改成空操作，SMP=8 下 3 项 O 检查失败，SMP=2 下解析器共享状态被破坏、内核直接 `integer overflow`
+    停机。hello114 现为 133 项检查。
 - **验证**：host 测试 662/662（594→662：ext4 17、NTFS 18、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、EROFS 守卫表 1；锁守卫 1；virtio 索引守卫 1；
-  真实镜像、`debugfs`/`ntfsls` 交叉核对、敌对输入）；三架构构建；`hello114` 127 项运行时检查（NVMe/AHCI 两段默认 skip），MBR
+  真实镜像、`debugfs`/`ntfsls` 交叉核对、敌对输入）；三架构构建；`hello114` 133 项运行时检查（NVMe/AHCI 两段默认 skip），MBR
   默认镜像 SMP=1/2/8 通过，GPT 镜像（`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`）通过；
   变异验证（删 EROFS 守卫 → 7 项 FAIL；忽略挂载代数 → 过期 fd 项 FAIL；关掉挂载规则 → 7 项 FAIL；
   关掉 DAC 检查 → 7 项 FAIL；GPT 解析恒失败 → 43 项 FAIL；statfs 绕过卷路由 → 9 项 FAIL；access 绕过卷分支 → 9 项 FAIL；目录游标缓存恒未命中 → 1900 项目录列表 228865 ms 对 693 ms，时间预算检查 FAIL；睡眠锁：解锁不保持 held → 交接测试 FAIL，早醒不摘节点 → 竞态测试 FAIL；rofs_lock 改回自旋锁 → 源码守卫 FAIL）。

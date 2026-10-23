@@ -16,6 +16,8 @@
 ///      checked against their other-class bits, the owner's own against the owner class
 ///   N. a 1900-entry NTFS directory (multi-level index): complete, duplicate-free
 ///      listings with small buffers, two interleaved readers, rewind; listing time bounded
+///   O. five processes read one file concurrently while a sixth is killed mid-read;
+///      the volume lock must hand over cleanly and the volume must still work afterwards
 ///   M. statfs/fstatfs: real block and inode counts, read-only flag, cached NTFS count
 ///   K. mount-point rules: '/', /dev, /proc, /tmp, nested and '..'-disguised
 ///      targets are refused; equivalent spellings name one mount
@@ -70,6 +72,8 @@ static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_SYMLINK   88
 #define SYS_TRUNCATE  210
 #define SYS_ACCESS    198
+#define SYS_KILL      62
+#define SYS_SCHED_YIELD 24
 #define SYS_CLOCK_GETTIME 228
 #define SYS_STATFS    276
 #define SYS_FSTATFS   277
@@ -514,6 +518,58 @@ void _start(void) {
         n = slurp("/mnt/big/bigdir_entry_with_a_long_name_1234.txt", small, sizeof(small));
         check(n == 0, "N: lookup of one entry deep in the tree works");
         check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/big", 0) == 0, "N: umount");
+    }
+
+    /* O: contention on the volume lock. A holder that is preempted (timer
+     * tick) keeps the lock; the others must sleep on it, not spin, and a
+     * waiter that is signalled must leave the queue without losing its turn
+     * or wedging the rest. */
+    {
+        check(syscall4(SYS_MOUNT, (uint64_t)"/dev/vblk1p1", (uint64_t)"/mnt/o", (uint64_t)"ext4", 0) == 0, "O: mount ext4 for the contention test");
+        enum { READERS = 5 };
+        int64_t kids[READERS];
+        for (int k = 0; k < READERS; k++) {
+            kids[k] = syscall1(SYS_FORK, 0);
+            if (kids[k] == 0) {
+                int good = 1;
+                for (int round = 0; round < 4; round++) {
+                    int64_t got = slurp("/mnt/o/big.bin", big, sizeof(big));
+                    int same = (got == 300000);
+                    for (int64_t i = 0; same && i < 300000; i++) if (big[i] != big_byte((uint64_t)i)) same = 0;
+                    if (!same) good = 0;
+                    /* also hit the directory path so the lock is taken by different operations */
+                    int a, b, c, d2, e2;
+                    if (list_dir("/mnt/o/dir/sub", &a, &b, &c, &d2, &e2) != 0) good = 0;
+                }
+                syscall1(SYS_EXIT, good ? 0 : 1);
+                for (;;) {}
+            }
+        }
+        /* the victim: reads forever until killed */
+        int64_t victim = syscall1(SYS_FORK, 0);
+        if (victim == 0) {
+            for (;;) {
+                int64_t got = slurp("/mnt/o/big.bin", big, sizeof(big));
+                if (got != 300000) syscall1(SYS_EXIT, 2);
+            }
+        }
+        for (int i = 0; i < 300; i++) syscall1(SYS_SCHED_YIELD, 0);
+        check(victim > 0 && syscall2(SYS_KILL, (uint64_t)victim, 9) == 0, "O: SIGKILL the reader that is mid-read");
+        int32_t vst = 0;
+        int64_t vw = syscall3(SYS_WAITPID, (uint64_t)victim, (uint64_t)&vst, 0);
+        check(vw == victim, "O: the killed reader is reaped");
+        int all_ok = 1;
+        for (int k = 0; k < READERS; k++) {
+            int32_t st = 0;
+            int64_t w = syscall3(SYS_WAITPID, (uint64_t)kids[k], (uint64_t)&st, 0);
+            if (w != kids[k] || ((st >> 8) & 0xff) != 0 || (st & 0x7f) != 0) all_ok = 0;
+        }
+        check(all_ok, "O: all five concurrent readers got correct data and exited cleanly");
+        n = slurp("/mnt/o/big.bin", big, sizeof(big));
+        ok = (n == 300000);
+        for (int64_t i = 0; ok && i < 300000; i++) if (big[i] != big_byte((uint64_t)i)) ok = 0;
+        check(ok, "O: the volume still reads correctly after the contention and the kill");
+        check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/o", 0) == 0, "O: umount succeeds (the lock is not left held)");
     }
 
     /* I: a volume on the NVMe controller (its read path sleeps until the
