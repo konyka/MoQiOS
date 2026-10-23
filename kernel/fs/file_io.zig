@@ -5,6 +5,7 @@ const serial = @import("../arch/arch.zig").serial;
 const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const copy = @import("../mm/copy_from_user.zig");
+const at_path = @import("at_path.zig");
 const vfs_mod = @import("vfs.zig");
 
 const EFAULT: i64 = 14;
@@ -55,6 +56,13 @@ pub fn open(name_ptr: u64, flags: u32) i64 {
 
 /// Open with an optional creation mode; null preserves the legacy 0666 default.
 pub fn openWithMode(name_ptr: u64, flags: u32, requested_mode: ?u32) i64 {
+    return openAt(at_path.AT_FDCWD, name_ptr, flags, requested_mode);
+}
+
+/// openat(dirfd, name, flags, mode). A relative name is looked up from the
+/// directory `dirfd` names when that is a directory on a mounted volume,
+/// otherwise from the working directory as before.
+pub fn openAt(dirfd: i64, name_ptr: u64, flags: u32, requested_mode: ?u32) i64 {
     if (name_ptr >= 0x0000_8000_0000_0000 or name_ptr == 0) return -1;
 
     var name_buf: [256]u8 = undefined;
@@ -69,20 +77,12 @@ pub fn openWithMode(name_ptr: u64, flags: u32, requested_mode: ?u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    // A relative name opened from a directory inside a mounted ext4/NTFS
-    // volume has to be resolved against the cwd here: the FD table does not
-    // know the task. Names elsewhere keep their flat-filesystem behaviour.
     var joined: [256]u8 = undefined;
-    var use_name = name;
-    if (name.len > 0 and name[0] != '/' and cur.cwd_len > 1 and vfs_mod.rofsRoute(cur.cwd[0..cur.cwd_len]) != null) {
-        const cwd = cur.cwd[0..cur.cwd_len];
-        if (cwd.len + 1 + name.len < joined.len) {
-            @memcpy(joined[0..cwd.len], cwd);
-            joined[cwd.len] = '/';
-            @memcpy(joined[cwd.len + 1 ..][0..name.len], name);
-            use_name = joined[0 .. cwd.len + 1 + name.len];
-        } else return -36; // ENAMETOOLONG
-    }
+    const use_name = switch (at_path.resolve(cur, dirfd, name, &joined)) {
+        .keep => name,
+        .path => |p| p,
+        .err => |e| return e,
+    };
 
     const result = cur.fd_table.openWithCreationCredentials(use_name, flags, requested_mode, cur.umask_val, cur.euid, cur.egid, cur.effective_caps);
     return @bitCast(result);

@@ -463,3 +463,41 @@ test "an index node whose depth disagrees with its parent is Corrupt, not follow
     var b: [16]u8 = undefined;
     try std.testing.expectError(error.Corrupt, v.readFile(&in2, 3 * 2048, &b));
 }
+
+fn denyNothing(_: *anyopaque, _: fr.Stat) bool {
+    return true;
+}
+
+test "resolveCheckedFrom walks relative to a directory inode, and pathOf is its inverse" {
+    for (images) |path| {
+        var img = try Image.open(path);
+        defer img.close();
+        const v = try ext4.Volume.mount(img.reader());
+        var dummy: u8 = 0;
+        const chk: ext4.Volume.SearchCheck = .{ .ctx = &dummy, .allow = denyNothing };
+
+        const dir = try v.resolve("/dir", true);
+        const sub = try v.resolve("/dir/sub", true);
+        // relative names resolve inside the starting directory
+        try std.testing.expectEqual(sub, try v.resolveCheckedFrom(dir, "sub", true, chk));
+        try std.testing.expectEqual(try v.resolve("/dir/sub/n.txt", true), try v.resolveCheckedFrom(dir, "sub/n.txt", true, chk));
+        try std.testing.expectEqual(try v.resolve("/small.txt", true), try v.resolveCheckedFrom(sub, "../../small.txt", true, chk));
+        // ".." from the root stays at the root
+        try std.testing.expectEqual(ext4.ROOT_INO, try v.resolveCheckedFrom(dir, "../../../..", true, chk));
+        try std.testing.expectError(error.NotFound, v.resolveCheckedFrom(dir, "no_such_file", true, chk));
+        try std.testing.expectError(error.NotDir, v.resolveCheckedFrom(try v.resolve("/small.txt", true), "x", true, chk));
+
+        var buf: [256]u8 = undefined;
+        try std.testing.expectEqualStrings("/dir/sub", try v.pathOf(sub, &buf));
+        try std.testing.expectEqualStrings("/dir", try v.pathOf(dir, &buf));
+        try std.testing.expectEqualStrings("", try v.pathOf(ext4.ROOT_INO, &buf));
+        // round trip: resolving the path gives the inode back
+        const p = try v.pathOf(sub, &buf);
+        try std.testing.expectEqual(sub, try v.resolve(p, true));
+        // a regular file has no directory path
+        try std.testing.expectError(error.NotDir, v.pathOf(try v.resolve("/small.txt", true), &buf));
+        // too small a buffer is refused, not truncated
+        var tiny: [5]u8 = undefined;
+        try std.testing.expectError(error.NameTooLong, v.pathOf(sub, &tiny));
+    }
+}

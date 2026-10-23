@@ -8,9 +8,15 @@ const vfs_mod = @import("../fs/vfs.zig");
 const ext2_mod = @import("../fs/ext2.zig");
 const str = @import("../lib/str.zig");
 const readlink_policy = @import("readlink_policy.zig");
+const at_path = @import("at_path.zig");
 
 /// readlink(path_ptr, buf_ptr, bufsiz) -> bytes written or -errno.
 pub fn readlink(path_ptr: u64, buf_ptr: u64, bufsiz: u64) i64 {
+    return readlinkAt(at_path.AT_FDCWD, path_ptr, buf_ptr, bufsiz);
+}
+
+/// readlinkat(dirfd, path, buf, bufsiz).
+pub fn readlinkAt(dirfd: i64, path_ptr: u64, buf_ptr: u64, bufsiz: u64) i64 {
     if (path_ptr == 0 or path_ptr >= 0x0000_8000_0000_0000 or
         buf_ptr == 0 or buf_ptr >= 0x0000_8000_0000_0000 or bufsiz == 0)
     {
@@ -22,7 +28,15 @@ pub fn readlink(path_ptr: u64, buf_ptr: u64, bufsiz: u64) i64 {
     name_buf[if (copied < 255) copied else 255] = 0;
     var len: usize = 0;
     while (len < 256 and name_buf[len] != 0) : (len += 1) {}
-    const path = name_buf[0..len];
+    var path: []const u8 = name_buf[0..len];
+    var joined: [256]u8 = undefined;
+    if (sched_mod.currentTask()) |ct| {
+        switch (at_path.resolve(ct, dirfd, path, &joined)) {
+            .keep => {},
+            .path => |p| path = p,
+            .err => |e| return e,
+        }
+    }
 
     // /proc/self/exe -> /bin/sh (or current executable)
     if (str.eql(path, "/proc/self/exe")) {

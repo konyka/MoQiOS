@@ -5,9 +5,10 @@ const copy = @import("../mm/copy_from_user.zig");
 const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const bo = @import("../lib/byte_order.zig");
+const at_path = @import("at_path.zig");
 
 /// statx(dirfd, pathname_ptr, flags, mask, statxbuf_ptr) -> 0 or -errno.
-pub fn statx(pathname_ptr: u64, statxbuf_ptr: u64) i64 {
+pub fn statx(dirfd: i64, pathname_ptr: u64, statxbuf_ptr: u64) i64 {
     // Validate the full destination before opening a temporary fd; this keeps
     // bad output pointers from causing needless fd-table mutation.
     if (!copy.validateUserBufferWritable(statxbuf_ptr, 144)) return -14; // EFAULT
@@ -27,7 +28,13 @@ pub fn statx(pathname_ptr: u64, statxbuf_ptr: u64) i64 {
     // Try to open and fstat
     var stat_buf: [144]u8 = undefined;
     @memset(&stat_buf, 0);
-    const fd_result = cur.fd_table.openWithCredentials(name, 0, cur.euid, cur.egid, cur.effective_caps); // O_RDONLY
+    var joined: [256]u8 = undefined;
+    const use_name = switch (at_path.resolve(cur, dirfd, name, &joined)) {
+        .keep => name,
+        .path => |p| p,
+        .err => |e| return e,
+    };
+    const fd_result = cur.fd_table.openWithCredentials(use_name, 0, cur.euid, cur.egid, cur.effective_caps); // O_RDONLY
     if (fd_result >= 0) {
         const fd: u32 = @intCast(fd_result);
         const fd_entry = &cur.fd_table.fds[fd];

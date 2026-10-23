@@ -966,6 +966,56 @@ pub const Volume = struct {
     pub fn resolveChecked(self: *const Volume, path: []const u8, follow_last: bool, check: SearchCheck) Error!u64 {
         return self.walk(ROOT_REF, path, 0, follow_last, check);
     }
+
+    /// resolveChecked() relative to directory record `start` (openat with a
+    /// directory descriptor). ".." at the volume root stays at the root.
+    pub fn resolveCheckedFrom(self: *const Volume, start: u64, path: []const u8, follow_last: bool, check: SearchCheck) Error!u64 {
+        return self.walk(start & REF_MASK, path, 0, follow_last, check);
+    }
+
+    const NameOfCtx = struct {
+        child: u64,
+        name: [fr.MAX_NAME]u8 = undefined,
+        len: usize = 0,
+        found: bool = false,
+    };
+
+    fn nameOfVisit(c: *NameOfCtx, d: *const fr.DirEntry) bool {
+        if ((d.ino & REF_MASK) != c.child) return true;
+        const nm = d.nameSlice();
+        if (std.mem.eql(u8, nm, ".") or std.mem.eql(u8, nm, "..")) return true;
+        @memcpy(c.name[0..nm.len], nm);
+        c.len = nm.len;
+        c.found = true;
+        return false;
+    }
+
+    const MAX_PATH_DEPTH: u32 = 64;
+
+    /// Path of directory record `ref` from the volume root with a leading
+    /// slash ("/$Extend"); empty for the root. See ext4.Volume.pathOf.
+    pub fn pathOf(self: *const Volume, ref: u64, out: []u8) Error![]const u8 {
+        var end: usize = out.len;
+        var cur = ref & REF_MASK;
+        var depth: u32 = 0;
+        while (cur != ROOT_REF) : (depth += 1) {
+            if (depth >= MAX_PATH_DEPTH) return error.Loop;
+            const f = try self.readFile(cur);
+            if (!f.is_dir) return error.NotDir;
+            const parent = try self.parentOf(cur);
+            if (parent == cur) return error.Corrupt;
+            var c: NameOfCtx = .{ .child = cur };
+            try self.walkDir(parent, &c, nameOfVisit);
+            if (!c.found) return error.Corrupt;
+            if (c.len + 1 > end) return error.NameTooLong;
+            end -= c.len;
+            @memcpy(out[end..][0..c.len], c.name[0..c.len]);
+            end -= 1;
+            out[end] = '/';
+            cur = parent;
+        }
+        return out[end..];
+    }
 };
 
 /// ASCII-only case-insensitive equality (see the module note on $UpCase).

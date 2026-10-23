@@ -6,6 +6,7 @@ const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const vfs_mod = @import("../fs/vfs.zig");
 const chdir_policy = @import("chdir_policy.zig");
+const at_path = @import("at_path.zig");
 
 /// chdir(path_ptr) -> 0 or -errno.
 pub fn chdir(path_ptr: u64) i64 {
@@ -44,12 +45,26 @@ pub fn chdir(path_ptr: u64) i64 {
     return 0;
 }
 
-/// fchdir(fd) -> 0 or -errno.
+/// fchdir(fd) -> 0 or -errno. A descriptor naming a directory on a mounted
+/// volume changes the working directory to it; a regular file is ENOTDIR.
+/// For other filesystems the descriptor is only validated (unchanged).
 pub fn fchdir(fd: u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
     if (fd >= vfs_mod.MAX_FDS or cur.fd_table.fds[fd].fd_type == .none) {
         return -9; // -EBADF
     }
+    if (cur.fd_table.fds[fd].fd_type != .rofs_file) return 0;
+
+    var pbuf: [256]u8 = undefined;
+    const path = switch (at_path.dirFdPath(cur, fd, &pbuf)) {
+        .ok => |p| p,
+        .err => |e| return e,
+    };
+    // The mount target alone is what dirFdPath returns for the volume root.
+    if (path.len == 0 or path.len >= cur.cwd.len) return -36;
+    @memcpy(cur.cwd[0..path.len], path);
+    cur.cwd[path.len] = 0;
+    cur.cwd_len = @intCast(path.len);
     return 0;
 }

@@ -568,4 +568,49 @@ pub const Volume = struct {
     pub fn resolveChecked(self: *const Volume, path: []const u8, follow_last: bool, check: SearchCheck) Error!u32 {
         return self.walk(ROOT_INO, path, 0, follow_last, check);
     }
+
+    /// resolveChecked() relative to directory inode `start` (openat with a
+    /// directory descriptor). ".." at the volume root stays at the root.
+    pub fn resolveCheckedFrom(self: *const Volume, start: u32, path: []const u8, follow_last: bool, check: SearchCheck) Error!u32 {
+        return self.walk(start, path, 0, follow_last, check);
+    }
+
+    const MAX_PATH_DEPTH: u32 = 64;
+
+    /// Path of directory `ino` from the volume root, with a leading slash
+    /// ("/dir/sub"); empty for the root itself. Built right to left into
+    /// `out` by asking each parent which entry names the child, so it needs
+    /// no stored path. Directories cannot be hard-linked, so the answer is
+    /// unique. The result is a slice of `out`.
+    pub fn pathOf(self: *const Volume, ino: u32, out: []u8) Error![]const u8 {
+        var end: usize = out.len;
+        var cur = ino;
+        var depth: u32 = 0;
+        while (cur != ROOT_INO) : (depth += 1) {
+            if (depth >= MAX_PATH_DEPTH) return error.Loop;
+            const node = try self.readInode(cur);
+            if (!node.isDir()) return error.NotDir;
+            const parent = try self.lookup(&node, "..");
+            if (parent == cur) return error.Corrupt;
+            const pnode = try self.readInode(parent);
+            var e: fr.DirEntry = undefined;
+            var pos: u64 = 0;
+            var found = false;
+            while (try self.readDir(&pnode, pos, &e)) |next| : (pos = next) {
+                const nm = e.nameSlice();
+                if (e.ino != cur) continue;
+                if (std.mem.eql(u8, nm, ".") or std.mem.eql(u8, nm, "..")) continue;
+                if (nm.len + 1 > end) return error.NameTooLong;
+                end -= nm.len;
+                @memcpy(out[end..][0..nm.len], nm);
+                end -= 1;
+                out[end] = '/';
+                found = true;
+                break;
+            }
+            if (!found) return error.Corrupt;
+            cur = parent;
+        }
+        return out[end..];
+    }
 };

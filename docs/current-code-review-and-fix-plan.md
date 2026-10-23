@@ -4001,7 +4001,19 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   - 初版整文件测试只做逐 extent 读，两个变异都没抓到；原因是单 extent 读不会跨叶子边界。加入整文件长读后才抓到。
   - 调查 `execve` 时读了加载器：`loadProgramForExec` 只在 ramdisk 里找文件，因此**任何磁盘文件系统（含既有的
     ext2/fat32）上的程序都不能 exec**，不是本特性独有的缺口。这里未做运行验证，仅是读代码的结论；列入已知限制。
-- **验证**：host 测试 669/669（594→669：ext4 19、NTFS 18、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；锁守卫 1；virtio 索引守卫 1；
+- **第七轮自审：目录描述符**：
+  - 文档声称相对路径和 `chdir` 在卷内可用，但从未测过 `openat(dirfd, …)`、`fchdir` 以及"cwd 在卷内时的
+    `statx`/`readlink`"。写了 hello114 Q 段先看 RED：`openat` 忽略 dirfd（按 cwd 解析，结果错或 ENOENT）、
+    非目录 dirfd 不报 ENOTDIR、`fchdir` 只校验 fd 就返回 0（**静默空操作**：随后的相对打开读到别的目录）、
+    `statx`/`readlink` 用相对路径找不到文件。7 项失败。
+  - 修复：解析器新增 `resolveCheckedFrom`（从目录记录起步）与 `pathOf`（目录记录 → 卷内路径），在真实镜像上
+    host 测试（NTFS 用 `ntfsinfo` 查出的 `$Extend`=11、`$ObjId`=25、`$Quota`=24 作为独立事实）。内核侧 `at_path.zig`
+    把 (dirfd, 名字) 或 (cwd, 名字) 重建成绝对路径再走既有查找，`openat`/`statx`/`readlinkat`/`fchdir` 接入。
+  - 两个既有的源码守卫测试断言了旧的调用形式（`openWithMode(frame.rsi…)`、statx 里的 `openWithCredentials(name…`），
+    随调用改写；改写后仍断言"凭证被转发"这一真正要保护的性质。
+  - 验证：Q 段 21 项（含 htree 目录内的 `openat`、`..` 越出目录、绝对路径忽略 dirfd、非目录 dirfd、
+    `fchdir` 后相对打开、cwd 下的 `statx`/`access`/`readlink`/`statfs`/`chdir("..")`）。
+- **验证**：host 测试 671/671（594→671：ext4 20、NTFS 19、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；锁守卫 1；virtio 索引守卫 1；
   真实镜像、`debugfs`/`ntfsls` 交叉核对、敌对输入）；三架构构建；`hello114` 159 项运行时检查（含 25 项 mmap 检查）（NVMe/AHCI 两段默认 skip），MBR
   默认镜像 SMP=1/2/8 通过，GPT 镜像（`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`）通过；
   变异验证（删 EROFS 守卫 → 7 项 FAIL；忽略挂载代数 → 过期 fd 项 FAIL；关掉挂载规则 → 7 项 FAIL；
@@ -4013,7 +4025,7 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 
 | Gate | Result | Notes |
 |---|---|---|
-| `zig build test`（0.16.0） | Passed 669/669 | 594→669 |
+| `zig build test`（0.16.0） | Passed 671/671 | 594→671 |
 | `zig build` / riscv64 / aarch64 | Passed | 三架构 |
 | smoke SMP=1 / 2 / 8（MBR 数据盘） | Passed | hello114 PASS，90 项 ok；I/J 段默认 skip |
 | smoke SMP=1 / 2 / 8（GPT 数据盘） | Passed | SMP=1/2/8 均 PASS；GPT 变异（`isProtectiveMbr` 恒 false）→ 43 项 FAIL |

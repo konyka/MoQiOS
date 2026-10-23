@@ -370,6 +370,13 @@ H1 再加 `shared` 字段记录 MAP_SHARED），不触碰页表；首次访问�
   也不依赖卷是否仍挂载。上限 32 MiB（超出 ENOMEM，更大的文件仍可 `read`）。映射区域按匿名私有区域记账
   （`munmap`/`mprotect`/`fork`/RLIMIT 走既有路径，没有新的区域种类）。NTFS 稀疏文件的空洞映射为零页。
   纯策略在 `mm/rofs_map_policy.zig`（host 测试：错误顺序、上限、页数、尾页有效字节、溢出）。
+- **dirfd 与相对路径**（`fs/at_path.zig`）：`openat`、`statx`、`readlinkat` 的 `dirfd` 现在对卷内目录
+  描述符生效；`fchdir(fd)` 对卷内目录真正切换 cwd；`statx`、`readlink`、`access`、`statfs` 在 cwd 位于卷内时
+  可用相对路径。卷目录 fd 只带（挂载槽、代数、记录号）而没有路径，所以路径是重建的：挂载点 + 卷内路径
+  （`pathOf` 逐级向父目录查"哪个名字指向我"，从右往左拼）+ 调用者的相对名，再走常规的绝对路径查找，
+  因此符号链接、`..` 出卷、权限检查都沿用既有逻辑。取舍：fd 之上的各级目录会被重新做搜索权限检查，而
+  Linux 信任 fd 不再检查；只读卷上权限不会在 fd 打开后变化，所以只有"打开目录后降权"的进程才会看到差异。
+  非目录 fd 作 dirfd 返回 ENOTDIR；其它文件系统的 dirfd 处理不变；`openat2` 仍只接受 `AT_FDCWD`/0。
 - **已知限制**：mremap 文件区域仅支持原地增长/收缩（移动返回 ENOMEM）；
   MAP_SHARED 可写页与随后对同一 inode 的 `write()` 系统调用之间不做一致性保证
   （writeFile 会 invalidate 该 inode 的缓存页，未刷出的映射写入可能丢失——请先
@@ -1123,7 +1130,7 @@ const FdTable = struct {
   系统文件（它们是真实的目录项）。$LogFile 被忽略，未干净卸载的卷按原样读取。
 - **已知限制**：dup 在本内核复制描述符（各自 offset），与 POSIX 共享 offset 不同，对 rofs 同
   样适用；ext4 inode 的 uid/gid 由低 16 位与高 16 位合并；NTFS 不提供 xattr/ADS；卷内不能再挂载别的文件系统。
-- **验证**：host 测试（ext4 19、NTFS 18、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；含 bigalloc 镜像 `ext4_bigalloc.img`、statfs 数值与 `dumpe2fs` / `$Bitmap` popcount 交叉核对；真实
+- **验证**：host 测试（ext4 20、NTFS 19、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；含 bigalloc 镜像 `ext4_bigalloc.img`、statfs 数值与 `dumpe2fs` / `$Bitmap` popcount 交叉核对；真实
   `tools/fsfixtures/mkfixtures.sh` 生成的镜像，`debugfs` / `ntfsls` 交叉核对；含敌对超级块/
   引导扇区/损坏 extent 树/fixup 撕裂）；`hello114` 运行时检查 159 项（含并发读，另有 NVMe 4 项、AHCI 4 项仅在手动提供镜像时运行）（另有 NVMe、AHCI 两段默认 skip）（SMP=1/2/8，MBR 与 GPT 两种
   数据盘镜像，`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`），变异验证——去掉 EROFS 守卫

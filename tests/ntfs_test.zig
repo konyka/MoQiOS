@@ -425,3 +425,36 @@ test "a directory cursor never runs away on a hostile tree" {
     var deep: ntfs.Volume.DirCursor = .{ .started = true, .depth = 200 };
     try std.testing.expectError(error.Corrupt, v.nextDirEntry(ntfs.ROOT_REF, &deep, &e));
 }
+
+fn allowAll(_: *anyopaque, _: fr.Stat) bool {
+    return true;
+}
+
+test "resolveCheckedFrom and pathOf on an NTFS system directory" {
+    var img = try Image.open(path);
+    defer img.close();
+    const v = try mountImage(&img);
+    var dummy: u8 = 0;
+    const chk: ntfs.Volume.SearchCheck = .{ .ctx = &dummy, .allow = allowAll };
+    // Facts from `ntfsinfo`: $Extend is record 11 (parent 5), $ObjId is 25, $Quota is 24.
+    const extend = try v.resolve("/$Extend", true);
+    try std.testing.expectEqual(@as(u64, 11), extend);
+    try std.testing.expectEqual(@as(u64, 25), try v.resolveCheckedFrom(extend, "$ObjId", true, chk));
+    try std.testing.expectEqual(@as(u64, 24), try v.resolveCheckedFrom(extend, "$quota", true, chk)); // case-insensitive
+    try std.testing.expectEqual(@as(u64, 24), try v.resolveCheckedFrom(extend, "./$Quota", true, chk));
+    try std.testing.expectEqual(ntfs.ROOT_REF, try v.resolveCheckedFrom(extend, "..", true, chk));
+    try std.testing.expectEqual(ntfs.ROOT_REF, try v.resolveCheckedFrom(extend, "../../..", true, chk));
+    // from the root, a name resolves as with resolve()
+    try std.testing.expectEqual(try v.resolve("/small.txt", true), try v.resolveCheckedFrom(ntfs.ROOT_REF, "small.txt", true, chk));
+    try std.testing.expectError(error.NotFound, v.resolveCheckedFrom(extend, "missing", true, chk));
+    try std.testing.expectError(error.NotDir, v.resolveCheckedFrom(try v.resolve("/small.txt", true), "x", true, chk));
+
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("/$Extend", try v.pathOf(extend, &buf));
+    try std.testing.expectEqualStrings("", try v.pathOf(ntfs.ROOT_REF, &buf));
+    try std.testing.expectError(error.NotDir, v.pathOf(try v.resolve("/small.txt", true), &buf));
+    var tiny: [3]u8 = undefined;
+    try std.testing.expectError(error.NameTooLong, v.pathOf(extend, &tiny));
+    // the path found for $Extend resolves back to it
+    try std.testing.expectEqual(extend, try v.resolve(try v.pathOf(extend, &buf), true));
+}

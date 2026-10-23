@@ -2181,7 +2181,7 @@ test "creation syscall dispatch forwards mode registers" {
         source,
         "255 => { // openat(dirfd, pathname, flags, mode)",
         "256 => { // unlinkat",
-        "file_io_mod.openWithMode(frame.rsi, @truncate(frame.rdx), @truncate(frame.r10))",
+        "file_io_mod.openAt(dirfdArg(frame.rdi), frame.rsi, @truncate(frame.rdx), @truncate(frame.r10))",
     );
     try expectSourceRoute(
         source,
@@ -2417,9 +2417,12 @@ test "UID 1000 create ownership remains outside DAC phase one" {
 }
 
 test "user metadata probes forward effective DAC credentials" {
+    // statx resolves its path through at_path (a volume directory fd or cwd may
+    // rewrite the name) but must still open with the caller's credentials.
+    const statx_forwarding = "openWithCredentials(use_name, 0, cur.euid, cur.egid, cur.effective_caps)";
     const forwarding = "openWithCredentials(name, 0, cur.euid, cur.egid, cur.effective_caps)";
 
-    try std.testing.expect(std.mem.indexOf(u8, kt.statx_source, forwarding) != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.statx_source, statx_forwarding) != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, forwarding) != null);
 }
 

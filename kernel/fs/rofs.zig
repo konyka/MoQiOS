@@ -323,6 +323,20 @@ pub fn open(slot: u8, path: []const u8, follow: bool, creds: Creds) union(enum) 
     return .{ .ok = o };
 }
 
+/// Path of directory `ref` inside its volume ("/dir/sub", empty for the root),
+/// written into `out`. Fails with ENODEV for a stale descriptor.
+pub fn pathOf(slot: u8, gen: u32, ref: Ref, out: []u8) union(enum) { ok: []const u8, err: i64 } {
+    rofs_lock.lock();
+    defer rofs_lock.unlock();
+    const m = live(slot, gen) orelse return .{ .err = -19 };
+    const p = switch (m.kind) {
+        .ext4 => m.ext4_vol.pathOf(@intCast(ref), out),
+        .ntfs => m.ntfs_vol.pathOf(ref, out),
+        .none => return .{ .err = -19 },
+    } catch |e| return .{ .err = mapErr(e) };
+    return .{ .ok = p };
+}
+
 /// Resolve `path` needing only search permission on the directories along the
 /// way (what stat-like calls such as statfs require); the target's own mode is
 /// not consulted. 0 on success or a negative errno.

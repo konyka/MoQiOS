@@ -2275,6 +2275,20 @@ pub fn rofsRoute(path: []const u8) ?RofsPath {
     return best;
 }
 
+/// Mount target of rofs mount `slot`, copied into `out`; null if not mounted.
+pub fn rofsTargetOf(slot: u8, out: []u8) ?[]const u8 {
+    const lf = mount_lock.acquire();
+    defer mount_lock.release(lf);
+    for (&mount_table) |*mp| {
+        if (!mp.active or mp.rofs_slot != slot) continue;
+        const t = mp.target[0..mp.target_len];
+        if (t.len > out.len) return null;
+        @memcpy(out[0..t.len], t);
+        return out[0..t.len];
+    }
+    return null;
+}
+
 fn rofsKindForType(fs_type: []const u8) ?@import("rofs.zig").FsKind {
     const rofs = @import("rofs.zig");
     if (eqlStr(fs_type, "ext4") or eqlStr(fs_type, "ext3") or eqlStr(fs_type, "ext2r")) return rofs.FsKind.ext4;

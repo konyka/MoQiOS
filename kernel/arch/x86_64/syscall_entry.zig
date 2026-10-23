@@ -1002,7 +1002,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(readlink_mod.readlink(frame.rdi, frame.rsi, frame.rdx));
         },
         183 => { // statx(dirfd, pathname, flags, mask, statxbuf)
-            frame.rax = @bitCast(statx_mod.statx(frame.rsi, frame.r8));
+            frame.rax = @bitCast(statx_mod.statx(dirfdArg(frame.rdi), frame.rsi, frame.r8));
         },
         184 => { // copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)
             _ = frame.r9;
@@ -1321,8 +1321,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         // ── v33.5: *at() variants ────────────────────────────────────
         255 => { // openat(dirfd, pathname, flags, mode)
-            _ = frame.rdi; // dirfd: simplified, ignore dirfd, use cwd
-            frame.rax = @bitCast(file_io_mod.openWithMode(frame.rsi, @truncate(frame.rdx), @truncate(frame.r10)));
+            frame.rax = @bitCast(file_io_mod.openAt(dirfdArg(frame.rdi), frame.rsi, @truncate(frame.rdx), @truncate(frame.r10)));
         },
         256 => { // unlinkat(dirfd, pathname, flags)
             _ = frame.rdi;
@@ -1338,8 +1337,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallAccess(frame.rsi, @truncate(frame.rdx)));
         },
         259 => { // readlinkat(dirfd, pathname, buf, bufsiz)
-            _ = frame.rdi;
-            frame.rax = @bitCast(readlink_mod.readlink(frame.rsi, frame.rdx, frame.r10));
+            frame.rax = @bitCast(readlink_mod.readlinkAt(dirfdArg(frame.rdi), frame.rsi, frame.rdx, frame.r10));
         },
         260 => { // fchmodat(dirfd, pathname, mode, flags) — chmod via path
             const copy = @import("../../mm/copy_from_user.zig");
@@ -2128,7 +2126,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         // ── v42.0: Linux standard number aliases (331+) + new implementations ──
         331 => { // statx(dirfd, pathname, flags, mask, statxbuf) — alias of #183
-            frame.rax = @bitCast(statx_mod.statx(frame.rsi, frame.r8));
+            frame.rax = @bitCast(statx_mod.statx(dirfdArg(frame.rdi), frame.rsi, frame.r8));
         },
         332 => { // io_pgetevents(ctx_id, min_nr, nr, events, timeout, usig) — alias of #216
             frame.rax = @bitCast(aio_mod.ioGetevents(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8));
@@ -2719,6 +2717,12 @@ fn syscallMmap(frame: *SyscallFrame) void {
 /// Returns fd on success, -1 on failure.
 fn syscallOpen(frame: *SyscallFrame) void {
     frame.rax = @bitCast(file_io_mod.openWithMode(frame.rdi, @truncate(frame.rsi), @truncate(frame.rdx)));
+}
+
+/// A raw dirfd register as the signed 32-bit value userspace passed
+/// (AT_FDCWD is -100).
+fn dirfdArg(raw: u64) i64 {
+    return @as(i64, @as(i32, @bitCast(@as(u32, @truncate(raw)))));
 }
 
 /// openat2(dirfd, pathname, how, size) — validate the fixed open_how prefix

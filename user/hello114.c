@@ -20,6 +20,8 @@
 ///      the volume lock must hand over cleanly and the volume must still work afterwards
 ///   P. mmap of a file on a volume: PROT_READ MAP_PRIVATE/MAP_SHARED serve the file's bytes,
 ///      a write mapping is refused, offsets work, the mapping outlives close(fd)
+///   Q. directory descriptors: openat() relative to a volume directory fd, fchdir() into one,
+///      fchdir() on a regular file is ENOTDIR
 ///   M. statfs/fstatfs: real block and inode counts, read-only flag, cached NTFS count
 ///   K. mount-point rules: '/', /dev, /proc, /tmp, nested and '..'-disguised
 ///      targets are refused; equivalent spellings name one mount
@@ -47,6 +49,15 @@ static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
     register uint64_t rdx __asm__("rdx") = a3;
     register uint64_t r10 __asm__("r10") = a4;
     __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx), "r"(r10) : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+    int64_t ret;
+    register uint64_t rdx __asm__("rdx") = a3;
+    register uint64_t r10 __asm__("r10") = a4;
+    register uint64_t r8 __asm__("r8") = a5;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx), "r"(r10), "r"(r8) : "rcx", "r11", "memory");
     return ret;
 }
 
@@ -85,6 +96,10 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_SYMLINK   88
 #define SYS_TRUNCATE  210
 #define SYS_ACCESS    198
+#define SYS_OPENAT    255
+#define SYS_STATX     183
+#define SYS_FCHDIR    81
+#define SYS_GETCWD    79
 #define SYS_MMAP      8
 #define SYS_MUNMAP    12
 #define SYS_KILL      62
@@ -545,6 +560,69 @@ void _start(void) {
         n = slurp("/mnt/big/bigdir_entry_with_a_long_name_1234.txt", small, sizeof(small));
         check(n == 0, "N: lookup of one entry deep in the tree works");
         check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/big", 0) == 0, "N: umount");
+    }
+
+    /* Q: directory descriptors on a volume */
+    {
+        check(syscall4(SYS_MOUNT, (uint64_t)"/dev/vblk1p1", (uint64_t)"/mnt/q", (uint64_t)"ext4", 0) == 0, "Q: mount ext4 for the directory-fd tests");
+        int64_t dfd = syscall2(SYS_OPEN, (uint64_t)"/mnt/q/dir", O_RDONLY);
+        check(dfd >= 0, "Q: open a volume directory");
+        /* openat(dirfd, "sub/n.txt") must resolve inside that directory, not against the cwd */
+        int64_t afd = syscall4(SYS_OPENAT, (uint64_t)dfd, (uint64_t)"sub/n.txt", O_RDONLY, 0);
+        uint8_t qb[16];
+        int64_t qn = afd >= 0 ? syscall3(SYS_READ, (uint64_t)afd, (uint64_t)qb, 16) : -1;
+        check(afd >= 0 && qn == 7 && qb[0] == 'n', "Q: openat(dirfd, relative path) resolves inside the directory");
+        if (afd >= 0) syscall1(SYS_CLOSE, (uint64_t)afd);
+        afd = syscall4(SYS_OPENAT, (uint64_t)dfd, (uint64_t)"file_217.txt", O_RDONLY, 0);
+        qn = afd >= 0 ? syscall3(SYS_READ, (uint64_t)afd, (uint64_t)qb, 16) : -1;
+        check(afd >= 0 && qn == 4 && qb[0] == '2' && qb[1] == '1' && qb[2] == '7', "Q: openat finds a file in an htree directory");
+        if (afd >= 0) syscall1(SYS_CLOSE, (uint64_t)afd);
+        check(syscall4(SYS_OPENAT, (uint64_t)dfd, (uint64_t)"nope.txt", O_RDONLY, 0) == -ENOENT, "Q: openat of a missing name is ENOENT");
+        afd = syscall4(SYS_OPENAT, (uint64_t)dfd, (uint64_t)"../small.txt", O_RDONLY, 0);
+        qn = afd >= 0 ? syscall3(SYS_READ, (uint64_t)afd, (uint64_t)qb, 16) : -1;
+        check(afd >= 0 && qn == 9 && qb[0] == 'h', "Q: openat with '..' climbs out of the directory");
+        if (afd >= 0) syscall1(SYS_CLOSE, (uint64_t)afd);
+        /* an absolute path ignores dirfd */
+        afd = syscall4(SYS_OPENAT, (uint64_t)dfd, (uint64_t)"/mnt/q/small.txt", O_RDONLY, 0);
+        check(afd >= 0, "Q: openat with an absolute path ignores dirfd");
+        if (afd >= 0) syscall1(SYS_CLOSE, (uint64_t)afd);
+        /* a non-directory fd as dirfd */
+        int64_t ffd = syscall2(SYS_OPEN, (uint64_t)"/mnt/q/small.txt", O_RDONLY);
+        check(syscall4(SYS_OPENAT, (uint64_t)ffd, (uint64_t)"x", O_RDONLY, 0) == -ENOTDIR, "Q: a regular file as dirfd is ENOTDIR");
+        /* fchdir */
+        check(syscall1(SYS_FCHDIR, (uint64_t)ffd) == -ENOTDIR, "Q: fchdir on a regular file is ENOTDIR");
+        syscall1(SYS_CLOSE, (uint64_t)ffd);
+        check(syscall1(SYS_FCHDIR, (uint64_t)dfd) == 0, "Q: fchdir into a volume directory succeeds");
+        qn = slurp("file_5.txt", qb, sizeof(qb));
+        check(qn == 2 && qb[0] == '5', "Q: relative open after fchdir reads from that directory");
+        syscall1(SYS_CHDIR, (uint64_t)"/");
+        syscall1(SYS_CLOSE, (uint64_t)dfd);
+        /* relative paths from a volume cwd, for the calls that resolve by path */
+        check(syscall1(SYS_CHDIR, (uint64_t)"/mnt/q/dir") == 0, "Q: chdir into the volume directory");
+        {
+            static uint64_t stx[24];
+            int64_t sr = syscall5(SYS_STATX, (uint64_t)-100, (uint64_t)"sub/n.txt", 0, 0x7ff, (uint64_t)stx);
+            check(sr == 0 && stx[5] == 7, "Q: statx of a relative path from a volume cwd reports the file size");
+            sr = syscall5(SYS_STATX, (uint64_t)-100, (uint64_t)"nope", 0, 0x7ff, (uint64_t)stx);
+            check(sr == -ENOENT, "Q: statx of a missing relative name is ENOENT");
+        }
+        check(syscall2(SYS_ACCESS, (uint64_t)"file_1.txt", 4) == 0, "Q: access(R_OK) of a relative path from a volume cwd");
+        check(syscall2(SYS_ACCESS, (uint64_t)"nope.txt", 0) == -ENOENT, "Q: access of a missing relative name is ENOENT");
+        {
+            char lk[64];
+            for (int i = 0; i < 64; i++) lk[i] = 0;
+            int64_t lr = syscall3(SYS_READLINK, (uint64_t)"../link", (uint64_t)lk, 63);
+            check(lr == 9 && streq(lk, "small.txt"), "Q: readlink of a relative path from a volume cwd");
+        }
+        {
+            struct kstatfs_t sfq;
+            check(syscall2(SYS_STATFS, (uint64_t)"sub", (uint64_t)&sfq) == 0 && sfq.w[0] == 0xEF53, "Q: statfs of a relative path from a volume cwd reports the volume");
+        }
+        check(syscall1(SYS_CHDIR, (uint64_t)"/mnt/q/dir/sub") == 0 && syscall1(SYS_CHDIR, (uint64_t)"..") == 0, "Q: chdir('..') from a volume directory");
+        qn = slurp("file_5.txt", qb, sizeof(qb));
+        check(qn == 2 && qb[0] == '5', "Q: cwd is /mnt/q/dir after chdir('..')");
+        syscall1(SYS_CHDIR, (uint64_t)"/");
+        check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/q", 0) == 0, "Q: umount");
     }
 
     /* P: mmap of files on a mounted volume. */
