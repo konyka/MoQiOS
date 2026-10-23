@@ -3956,11 +3956,28 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     改为 `+%`，并加源码守卫测试（把其中一处改回 `+ 1`，测试失败，已验证）。
   - hello114 的"两个交错读者"最初共用一份已见数组，检查形同虚设；改为各自独立统计。
   - GPT/MBR 数据盘增加第 3 个分区（1900 项 NTFS 根目录），`gpt_test` 随之更新为 14 MiB / 3 个分区。
-- **验证**：host 测试 655/655（594→655：ext4 17、NTFS 18、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、EROFS 守卫表 1；virtio 索引守卫 1；
+- **第四轮自审：并发路径（我自己引入的死锁）**：
+  - 首版 `rofs_lock` 是关中断自旋锁，注释里写着"锁内做设备 I/O 可接受（只读 + 小卷）"。这个判断对
+    virtio-blk 与 AHCI（轮询）成立，对 NVMe 不成立：NVMe 读会挂起任务等 MSI-X 完成中断。之前 NVMe 的
+    挂载读测试只有单个读者，从未覆盖。给 hello114 的 I 段加了"父子进程同时读 NVMe 卷"之后，SMP=1 与 2
+    都**挂死**（`mount` 后读完 300000 字节，`fork` 之后无输出）。
+  - 机制用 gdb 证实而非推测：CPU0 `IF=0` 停在 `rofs.readAt` → `IrqSpinlock.acquire` → ticket 自旋；
+    CPU1 在 idle；NVMe 通道 `io_in_flight=0`、`io_done=1`。即持锁任务已被切走、完成早已到达，但等锁者
+    关着中断自旋，无人能让持锁者重新运行。
+  - 修复：新增睡眠锁 `sync/sleep_lock.zig`（FIFO 所有权交接，唤醒者把锁直接交给最老等待者，新来者不能
+    插队），对调度器泛型化，用真线程 + 模型调度器做 host 测试（互斥、到达序、交接不被抢、无授权的早醒
+    会重新排队、调度器前自旋、tryLock）。变异验证：解锁时不保持 `held` → 交接测试失败；早醒不摘节点
+    → 竞态测试失败（带期限，不会挂住测试进程）。`rofs_lock` 改用它；`mountFs`/`umountFs` 重构为
+    `mount_op_lock`（睡眠）+ `mount_lock`（仅短临界区），卸载先摘路由项再销毁卷。另加源码守卫测试：
+    `rofs.zig` 不得再出现 `IrqSpinlock`，设备挂载必须在 `mount_lock` 作用域之外（改回自旋锁即失败）。
+  - 验证：NVMe 并发读 SMP=1/2/4 通过；AHCI 并发读 SMP=1/2 通过（该次运行为腾出 `/dev/sda` 临时关闭了
+    占用它做 swap 的 hello96/98/99/100/101，故 smoke 脚本因缺少它们的标记返回 1，hello114 自身 PASS；
+    `servers/init/main.c` 已还原，`git diff` 为空）。
+- **验证**：host 测试 662/662（594→662：ext4 17、NTFS 18、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、EROFS 守卫表 1；锁守卫 1；virtio 索引守卫 1；
   真实镜像、`debugfs`/`ntfsls` 交叉核对、敌对输入）；三架构构建；`hello114` 127 项运行时检查（NVMe/AHCI 两段默认 skip），MBR
   默认镜像 SMP=1/2/8 通过，GPT 镜像（`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`）通过；
   变异验证（删 EROFS 守卫 → 7 项 FAIL；忽略挂载代数 → 过期 fd 项 FAIL；关掉挂载规则 → 7 项 FAIL；
-  关掉 DAC 检查 → 7 项 FAIL；GPT 解析恒失败 → 43 项 FAIL；statfs 绕过卷路由 → 9 项 FAIL；access 绕过卷分支 → 9 项 FAIL；目录游标缓存恒未命中 → 1900 项目录列表 228865 ms 对 693 ms，时间预算检查 FAIL）。
+  关掉 DAC 检查 → 7 项 FAIL；GPT 解析恒失败 → 43 项 FAIL；statfs 绕过卷路由 → 9 项 FAIL；access 绕过卷分支 → 9 项 FAIL；目录游标缓存恒未命中 → 1900 项目录列表 228865 ms 对 693 ms，时间预算检查 FAIL；睡眠锁：解锁不保持 held → 交接测试 FAIL，早醒不摘节点 → 竞态测试 FAIL；rofs_lock 改回自旋锁 → 源码守卫 FAIL）。
 - **未做 / 已知限制**：写入（ext4 与 NTFS）；ext4 日志回放；元数据校验和验证；NTFS
   压缩/加密/$ATTRIBUTE_LIST/$UpCase 大小写折叠；GPT 备份表不使用且仅支持主表在 LBA 2、≤32 扇区
   的布局；DAC 不跟踪补充组；卷内再挂载；NTFS 位图超过 64 MiB 的卷 statfs 返回 EOPNOTSUPP；`faccessat` 的 dirfd 仍被忽略（沿用既有行为）；VFS 仍是"扁平命名 + 前缀路由"而非通用挂载树，
@@ -3968,7 +3985,7 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 
 | Gate | Result | Notes |
 |---|---|---|
-| `zig build test`（0.16.0） | Passed 655/655 | 594→655 |
+| `zig build test`（0.16.0） | Passed 662/662 | 594→662 |
 | `zig build` / riscv64 / aarch64 | Passed | 三架构 |
 | smoke SMP=1 / 2 / 8（MBR 数据盘） | Passed | hello114 PASS，90 项 ok；I/J 段默认 skip |
 | smoke SMP=1 / 2 / 8（GPT 数据盘） | Passed | SMP=1/2/8 均 PASS；GPT 变异（`isProtectiveMbr` 恒 false）→ 43 项 FAIL |

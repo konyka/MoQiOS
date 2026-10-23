@@ -532,6 +532,26 @@ void _start(void) {
                 ok = (n == 300000);
                 for (int64_t i = 0; ok && i < 300000; i++) if (big[i] != big_byte((uint64_t)i)) ok = 0;
                 check(ok, "I: 300000 bytes through NVMe match");
+                /* Two processes reading the same device at once: the read path
+                 * must not hold something a sleeping reader cannot give up. */
+                {
+                    int64_t kid = syscall1(SYS_FORK, 0);
+                    int good = 1;
+                    for (int round = 0; round < 3; round++) {
+                        int64_t got = slurp("/mnt/nv/big.bin", big, sizeof(big));
+                        int same = (got == 300000);
+                        for (int64_t i = 0; same && i < 300000; i++) if (big[i] != big_byte((uint64_t)i)) same = 0;
+                        if (!same) good = 0;
+                    }
+                    if (kid == 0) {
+                        syscall1(SYS_EXIT, good ? 0 : 1);
+                        for (;;) {}
+                    }
+                    int32_t kst = 0;
+                    syscall3(SYS_WAITPID, (uint64_t)kid, (uint64_t)&kst, 0);
+                    check(kid > 0 && good, "I: parent reads the NVMe volume correctly while a child reads it too");
+                    check(kid > 0 && ((kst >> 8) & 0xff) == 0 && (kst & 0x7f) == 0, "I: the child reading concurrently got correct data");
+                }
                 check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/nv", 0) == 0, "I: umount nvme0 volume");
             }
         }
@@ -549,6 +569,24 @@ void _start(void) {
                 ok = (n == 300000);
                 for (int64_t i = 0; ok && i < 300000; i++) if (big[i] != big_byte((uint64_t)i)) ok = 0;
                 check(ok, "J: 300000 bytes through AHCI match");
+                {
+                    int64_t kid = syscall1(SYS_FORK, 0);
+                    int good = 1;
+                    for (int round = 0; round < 3; round++) {
+                        int64_t got = slurp("/mnt/sa/big.bin", big, sizeof(big));
+                        int same = (got == 300000);
+                        for (int64_t i = 0; same && i < 300000; i++) if (big[i] != big_byte((uint64_t)i)) same = 0;
+                        if (!same) good = 0;
+                    }
+                    if (kid == 0) {
+                        syscall1(SYS_EXIT, good ? 0 : 1);
+                        for (;;) {}
+                    }
+                    int32_t kst = 0;
+                    syscall3(SYS_WAITPID, (uint64_t)kid, (uint64_t)&kst, 0);
+                    check(kid > 0 && good, "J: parent reads the AHCI volume correctly while a child reads it too");
+                    check(kid > 0 && ((kst >> 8) & 0xff) == 0 && (kst & 0x7f) == 0, "J: the child reading concurrently got correct data");
+                }
                 check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/sa", 0) == 0, "J: umount sda volume");
             }
         }

@@ -2233,9 +2233,16 @@ pub const MountPoint = struct {
 
 var mount_table: [MAX_MOUNTS]MountPoint = @splat(.{});
 
-/// Guards mount_table. Routing takes it for the table walk only (a copy of
-/// the result leaves the lock), so it never nests around device I/O.
+/// Guards mount_table. Taken only for short table reads and writes and never
+/// across device I/O (a task parked in an NVMe read would leave every path
+/// lookup, which routes through here, spinning with interrupts off).
 var mount_lock: IrqSpinlock = .{};
+
+/// Serialises whole mount/umount operations, device reads included. It sleeps,
+/// so a mount that waits for a completion interrupt does not wedge other CPUs.
+/// Because only the holder changes which slots are in use, the free-slot and
+/// overlap checks stay valid after mount_lock is dropped for the device I/O.
+var mount_op_lock: @import("../sync/task_sleep_lock.zig").SleepLock = .{};
 
 const mount_path = @import("mount_path_policy.zig");
 
@@ -2363,19 +2370,22 @@ pub fn mountFs(source: []const u8, target: []const u8, fs_type: []const u8, flag
     if (target.len == 0) return -22; // -EINVAL
     if (target.len > 128 or source.len > 64 or fs_type.len > 16) return -36; // -ENAMETOOLONG
 
-    // One mount/umount at a time: slot choice, the overlap check and the
-    // device mount below must be atomic with respect to each other. The
-    // lock is held across rofs.mountVolume's device reads; routing waits on
-    // it briefly, which only delays path lookups during a (rare) mount.
-    const mount_flags = mount_lock.acquire();
-    defer mount_lock.release(mount_flags);
+    // One mount/umount at a time. The operation lock is a sleeping lock; the
+    // table spinlock below is only held for the short reads and the final
+    // write, never around the device reads in rofsResolveSource/mountVolume.
+    mount_op_lock.lock();
+    defer mount_op_lock.unlock();
 
-    // Find free slot
+    // Find a free slot (mount_op_lock keeps it free until we fill it).
     var slot: ?u32 = null;
-    for (0..MAX_MOUNTS) |i| {
-        if (!mount_table[i].active) {
-            slot = @intCast(i);
-            break;
+    {
+        const lf = mount_lock.acquire();
+        defer mount_lock.release(lf);
+        for (0..MAX_MOUNTS) |i| {
+            if (!mount_table[i].active) {
+                slot = @intCast(i);
+                break;
+            }
         }
     }
     if (slot == null) return -28; // -ENOSPC
@@ -2401,9 +2411,13 @@ pub fn mountFs(source: []const u8, target: []const u8, fs_type: []const u8, flag
             .is_root, .reserved => return -16, // EBUSY
         }
         // Stacking mounts is not modelled: no target may equal or nest with another.
-        for (&mount_table) |*other| {
-            if (!other.active or other.rofs_slot == 0xFF) continue;
-            if (mount_path.overlaps(other.target[0..other.target_len], norm_target)) return -16; // EBUSY
+        {
+            const lf = mount_lock.acquire();
+            defer mount_lock.release(lf);
+            for (&mount_table) |*other| {
+                if (!other.active or other.rofs_slot == 0xFF) continue;
+                if (mount_path.overlaps(other.target[0..other.target_len], norm_target)) return -16; // EBUSY
+            }
         }
         mount_target = norm_target;
         const win = rofsResolveSource(source) orelse return -19; // ENODEV
@@ -2418,25 +2432,31 @@ pub fn mountFs(source: []const u8, target: []const u8, fs_type: []const u8, flag
         };
     }
 
-    // Copy source
-    @memset(&mp.source, 0);
-    for (0..source.len) |j| mp.source[j] = source[j];
-    mp.source_len = @intCast(source.len);
+    // Publish the entry. Routing ignores it until `active` is set, and the
+    // whole record becomes visible to rofsRoute at once under the table lock.
+    {
+        const lf = mount_lock.acquire();
+        defer mount_lock.release(lf);
+        // Copy source
+        @memset(&mp.source, 0);
+        for (0..source.len) |j| mp.source[j] = source[j];
+        mp.source_len = @intCast(source.len);
 
-    // Copy target
-    @memset(&mp.target, 0);
-    for (0..mount_target.len) |j| mp.target[j] = mount_target[j];
-    mp.target_len = @intCast(mount_target.len);
+        // Copy target
+        @memset(&mp.target, 0);
+        for (0..mount_target.len) |j| mp.target[j] = mount_target[j];
+        mp.target_len = @intCast(mount_target.len);
 
-    // Copy fs_type
-    @memset(&mp.fs_type, 0);
-    for (0..fs_type.len) |j| mp.fs_type[j] = fs_type[j];
-    mp.fs_type_len = @intCast(fs_type.len);
+        // Copy fs_type
+        @memset(&mp.fs_type, 0);
+        for (0..fs_type.len) |j| mp.fs_type[j] = fs_type[j];
+        mp.fs_type_len = @intCast(fs_type.len);
 
-    // Volumes of these types are always mounted read-only.
-    mp.flags = if (rofs_slot != 0xFF) flags | 1 else flags;
-    mp.rofs_slot = rofs_slot;
-    mp.active = true;
+        // Volumes of these types are always mounted read-only.
+        mp.flags = if (rofs_slot != 0xFF) flags | 1 else flags;
+        mp.rofs_slot = rofs_slot;
+        mp.active = true;
+    }
 
     // Initialize filesystem based on type
     if (rofs_slot != 0xFF) {
@@ -2476,26 +2496,39 @@ pub fn mountFs(source: []const u8, target: []const u8, fs_type: []const u8, flag
 pub fn umountFs(target: []const u8, mflags: u32) i64 {
     _ = mflags;
     if (target.len == 0) return -22; // -EINVAL
-    const umount_flags = mount_lock.acquire();
-    defer mount_lock.release(umount_flags);
+    mount_op_lock.lock();
+    defer mount_op_lock.unlock();
 
     var umount_buf: [256]u8 = undefined;
     const want = normalizeAbs(target, &umount_buf) orelse target;
-    for (&mount_table) |*mp| {
-        if (!mp.active) continue;
-        const t = mp.target[0..mp.target_len];
-        if (eqlStr(t, target) or eqlStr(t, want)) {
-            serial.writeString("[vfs] umount: ");
-            serial.writeString(target);
-            serial.writeString("\n");
-            if (mp.rofs_slot != 0xFF) {
-                @import("rofs.zig").umountVolume(mp.rofs_slot) catch {};
+
+    // Take the entry out of the routing table first, under the table lock, so
+    // no new path lookup can reach the volume; then tear the volume down with
+    // no spinlock held (umountVolume takes the volume's sleeping lock).
+    var rofs_slot: u8 = 0xFF;
+    var found = false;
+    {
+        const lf = mount_lock.acquire();
+        defer mount_lock.release(lf);
+        for (&mount_table) |*mp| {
+            if (!mp.active) continue;
+            const t = mp.target[0..mp.target_len];
+            if (eqlStr(t, target) or eqlStr(t, want)) {
+                rofs_slot = mp.rofs_slot;
+                mp.* = .{};
+                found = true;
+                break;
             }
-            mp.* = .{};
-            return 0;
         }
     }
-    return -22; // -EINVAL (not mounted)
+    if (!found) return -22; // -EINVAL (not mounted)
+    serial.writeString("[vfs] umount: ");
+    serial.writeString(target);
+    serial.writeString("\n");
+    if (rofs_slot != 0xFF) {
+        @import("rofs.zig").umountVolume(rofs_slot) catch {};
+    }
+    return 0;
 }
 
 fn eqlStr(a: []const u8, b: []const u8) bool {

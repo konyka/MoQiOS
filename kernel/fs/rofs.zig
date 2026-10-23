@@ -5,7 +5,7 @@
 //! Reads go through a per-mount 4 KiB page cache (direct-mapped, LRU-free) so
 //! the parsers' many tiny metadata reads do not each hit the device.
 //!
-//! One lock (`rofs_lock`) serialises every operation: the parsers carry shared
+//! One sleeping lock (`rofs_lock`) serialises every operation: the parsers carry shared
 //! scratch buffers and the cache is not re-entrant. Holding it across device
 //! I/O is deliberate and cheap here (read-only, small volumes).
 
@@ -14,7 +14,7 @@ const builtin = @import("builtin");
 const fr = @import("fs_reader.zig");
 const ext4 = @import("ext4.zig");
 const ntfs = @import("ntfs.zig");
-const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+const SleepLock = @import("../sync/task_sleep_lock.zig").SleepLock;
 const serial = @import("../arch/arch.zig").serial;
 const block_dev = @import("../drivers/block_dev.zig");
 const pmm = @import("../mm/pmm.zig");
@@ -71,7 +71,10 @@ const Mount = struct {
 const DIR_CURSORS: usize = 4;
 const DirCache = dir_cache.Cache(ntfs.Volume.DirCursor, DIR_CURSORS);
 
-var rofs_lock: IrqSpinlock = .{};
+/// Held across device reads, which may park the task until a completion
+/// interrupt (NVMe). A spinlock would be held by a task that is switched out
+/// while the next caller spins with interrupts off, so this one sleeps.
+var rofs_lock: SleepLock = .{};
 var mounts: [MAX_MOUNTS]Mount = @splat(.{});
 var next_generation: u32 = 1;
 
@@ -164,8 +167,8 @@ pub fn mountVolume(dev: u8, base: u64, len: u64, want: ?FsKind) MountError!u8 {
     if (base % SECTOR != 0 or len == 0 or len % SECTOR != 0) return error.Range;
     if (base > info.total_sectors * SECTOR or len > info.total_sectors * SECTOR - base) return error.Range;
 
-    const flags = rofs_lock.acquire();
-    defer rofs_lock.release(flags);
+    rofs_lock.lock();
+    defer rofs_lock.unlock();
 
     var idx: ?usize = null;
     for (&mounts, 0..) |*m, i| {
@@ -212,8 +215,8 @@ pub fn mountVolume(dev: u8, base: u64, len: u64, want: ?FsKind) MountError!u8 {
 
 pub fn umountVolume(slot: u8) MountError!void {
     if (slot >= MAX_MOUNTS) return error.NoDevice;
-    const flags = rofs_lock.acquire();
-    defer rofs_lock.release(flags);
+    rofs_lock.lock();
+    defer rofs_lock.unlock();
     const m = &mounts[slot];
     if (!m.active) return error.NoDevice;
     freeMountMem(m);
@@ -304,8 +307,8 @@ fn mayTraverse(ctx: *anyopaque, st: fr.Stat) bool {
 /// Negative errno on failure.
 pub fn open(slot: u8, path: []const u8, follow: bool, creds: Creds) union(enum) { ok: Opened, err: i64 } {
     if (slot >= MAX_MOUNTS) return .{ .err = -19 };
-    const flags = rofs_lock.acquire();
-    defer rofs_lock.release(flags);
+    rofs_lock.lock();
+    defer rofs_lock.unlock();
     const m = &mounts[slot];
     if (!m.active) return .{ .err = -19 };
     var sc: SearchCtx = .{ .creds = creds };
@@ -325,8 +328,8 @@ pub fn open(slot: u8, path: []const u8, follow: bool, creds: Creds) union(enum) 
 /// not consulted. 0 on success or a negative errno.
 pub fn reach(slot: u8, path: []const u8, creds: Creds) i64 {
     if (slot >= MAX_MOUNTS) return -19;
-    const flags = rofs_lock.acquire();
-    defer rofs_lock.release(flags);
+    rofs_lock.lock();
+    defer rofs_lock.unlock();
     const m = &mounts[slot];
     if (!m.active) return -19;
     var sc: SearchCtx = .{ .creds = creds };
@@ -342,8 +345,8 @@ pub fn reach(slot: u8, path: []const u8, creds: Creds) i64 {
 /// way, the object's own bits not). Null if it cannot be resolved.
 pub fn metaFor(slot: u8, path: []const u8, creds: Creds) ?access.Meta {
     if (slot >= MAX_MOUNTS) return null;
-    const flags = rofs_lock.acquire();
-    defer rofs_lock.release(flags);
+    rofs_lock.lock();
+    defer rofs_lock.unlock();
     const m = &mounts[slot];
     if (!m.active) return null;
     var sc: SearchCtx = .{ .creds = creds };
@@ -357,16 +360,16 @@ pub fn metaFor(slot: u8, path: []const u8, creds: Creds) ?access.Meta {
 }
 
 pub fn statRef(slot: u8, gen: u32, ref: Ref) union(enum) { ok: Opened, err: i64 } {
-    const flags = rofs_lock.acquire();
-    defer rofs_lock.release(flags);
+    rofs_lock.lock();
+    defer rofs_lock.unlock();
     const m = live(slot, gen) orelse return .{ .err = -19 };
     return if (statOf(m, ref)) |o| .{ .ok = o } else |e| .{ .err = mapErr(e) };
 }
 
 /// Read file data. Returns bytes read (0 at EOF) or a negative errno.
 pub fn readAt(slot: u8, gen: u32, ref: Ref, offset: u64, buf: []u8) i64 {
-    const flags = rofs_lock.acquire();
-    defer rofs_lock.release(flags);
+    rofs_lock.lock();
+    defer rofs_lock.unlock();
     const m = live(slot, gen) orelse return -19;
     switch (m.kind) {
         .ext4 => {
@@ -391,8 +394,8 @@ pub fn readAt(slot: u8, gen: u32, ref: Ref, offset: u64, buf: []u8) i64 {
 ///
 /// Returns 1 with `out` and `next` filled, 0 at the end, or a negative errno.
 pub fn dirNext(slot: u8, gen: u32, ref: Ref, pos: u64, out: *fr.DirEntry, next: *u64) i64 {
-    const flags = rofs_lock.acquire();
-    defer rofs_lock.release(flags);
+    rofs_lock.lock();
+    defer rofs_lock.unlock();
     const m = live(slot, gen) orelse return -19;
     if (pos < 2) {
         out.* = .{ .ino = ref, .kind = .directory, .name_len = @intCast(pos + 1) };
@@ -470,8 +473,8 @@ fn isDotName(n: []const u8) bool {
 }
 
 pub fn readLink(slot: u8, gen: u32, ref: Ref, buf: []u8) i64 {
-    const flags = rofs_lock.acquire();
-    defer rofs_lock.release(flags);
+    rofs_lock.lock();
+    defer rofs_lock.unlock();
     const m = live(slot, gen) orelse return -19;
     switch (m.kind) {
         .ext4 => {
@@ -490,8 +493,8 @@ pub fn readLink(slot: u8, gen: u32, ref: Ref, buf: []u8) i64 {
 /// statfs for the volume a descriptor or path belongs to. NTFS scans its
 /// allocation bitmap the first time (cached afterwards).
 pub fn statFs(slot: u8, gen: ?u32) union(enum) { ok: fr.FsStat, err: i64 } {
-    const flags = rofs_lock.acquire();
-    defer rofs_lock.release(flags);
+    rofs_lock.lock();
+    defer rofs_lock.unlock();
     const m: *Mount = if (gen) |g| (live(slot, g) orelse return .{ .err = -19 }) else blk: {
         if (slot >= MAX_MOUNTS or !mounts[slot].active) return .{ .err = -19 };
         break :blk &mounts[slot];

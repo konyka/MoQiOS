@@ -85,6 +85,7 @@ test {
     _ = @import("rofs_access_test.zig");
     _ = @import("gpt_test.zig");
     _ = @import("dir_cursor_cache_test.zig");
+    _ = @import("sleep_lock_test.zig");
     _ = @import("ntfs_test.zig");
     _ = @import("wait_status_test.zig");
 }
@@ -6009,5 +6010,28 @@ test "virtio available-ring indices wrap instead of trapping" {
             pos = eol;
         }
         try std.testing.expect(count >= 3);
+    }
+}
+
+test "the read-only volume lock sleeps; no spinlock is held across device I/O" {
+    // rofs reads can park the task until a completion interrupt (NVMe). A
+    // spinlock held across that leaves the next caller spinning with
+    // interrupts off while the holder is switched out: a hard hang.
+    try std.testing.expect(std.mem.indexOf(u8, kt.rofs_source, "IrqSpinlock") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.rofs_source, "var rofs_lock: SleepLock") != null);
+    // mount/umount: the table spinlock is taken in short scopes only. The
+    // device mount must happen outside any mount_lock scope.
+    const mount_start = std.mem.indexOf(u8, kt.vfs_source, "pub fn mountFs(") orelse return error.TestUnexpectedResult;
+    const mount_end = std.mem.indexOfPos(u8, kt.vfs_source, mount_start, "pub fn umountFs(") orelse return error.TestUnexpectedResult;
+    const body = kt.vfs_source[mount_start..mount_end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "mount_op_lock.lock();") != null);
+    const device_mount = std.mem.indexOf(u8, body, "rofs.mountVolume(") orelse return error.TestUnexpectedResult;
+    // every `mount_lock.acquire()` before the device mount must be released (its scope closed) first
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, body, pos, "mount_lock.acquire()")) |acq| {
+        if (acq > device_mount) break;
+        const rel = std.mem.indexOfPos(u8, body, acq, "mount_lock.release(") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(rel < device_mount);
+        pos = acq + 1;
     }
 }

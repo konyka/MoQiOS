@@ -353,6 +353,15 @@ H1 再加 `shared` 字段记录 MAP_SHARED），不触碰页表；首次访问�
   缓存 4 个位置（LRU）。getdents 在缓冲区装不下下一项时会多探一项，下次调用再要同一位置，因此
   **推进游标时不覆盖原位置**，两次都命中。位置不在缓存里（如 lseek 到任意偏移）退化为从头跳过，
   结果仍正确。ext4 目录按字节偏移恢复，本来就是线性的。
+- **并发与锁**：`rofs_lock` 是**睡眠锁**（`sync/sleep_lock.zig`，FIFO 所有权交接，唤醒最老的等待者；
+  内核实例化见 `sync/task_sleep_lock.zig`）。原先它是关中断的 `IrqSpinlock`，而 NVMe 读会让任务挂起等
+  完成中断：持锁任务被切走后，下一个想用该卷的任务在关中断下自旋，两边都无法前进。用 gdb 抓到的现场：
+  CPU0 `IF=0` 停在 `rofs.readAt` 的 ticket 自旋里，CPU1 空闲，`io_in_flight=0 io_done=1`（完成早已到达，
+  持锁者无法被调度回来）。`mountFs`/`umountFs` 同理：整次挂载由 `mount_op_lock`（睡眠锁）串行化，路由表
+  自旋锁 `mount_lock` 只在短临界区内取放，不包住任何设备 I/O（每个 `open()` 都要过 `rofsRoute`）。
+  卸载先在表锁下摘掉路由项，再在无自旋锁的情况下销毁卷。AHCI/virtio-blk 读是轮询、不会挂起任务，
+  因此不受影响（并发读在两者上同样验证通过）。睡眠锁只能用在可睡眠的上下文，rofs 的所有调用者都是
+  syscall 路径。
 - **已知限制**：mremap 文件区域仅支持原地增长/收缩（移动返回 ENOMEM）；
   MAP_SHARED 可写页与随后对同一 inode 的 `write()` 系统调用之间不做一致性保证
   （writeFile 会 invalidate 该 inode 的缓存页，未刷出的映射写入可能丢失——请先
@@ -1106,9 +1115,9 @@ const FdTable = struct {
   系统文件（它们是真实的目录项）。$LogFile 被忽略，未干净卸载的卷按原样读取。
 - **已知限制**：dup 在本内核复制描述符（各自 offset），与 POSIX 共享 offset 不同，对 rofs 同
   样适用；ext4 inode 的 uid/gid 由低 16 位与高 16 位合并；NTFS 不提供 xattr/ADS；卷内不能再挂载别的文件系统。
-- **验证**：host 测试（ext4 17、NTFS 18、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、EROFS 守卫表 1；含 bigalloc 镜像 `ext4_bigalloc.img`、statfs 数值与 `dumpe2fs` / `$Bitmap` popcount 交叉核对；真实
+- **验证**：host 测试（ext4 17、NTFS 18、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、EROFS 守卫表 1；含 bigalloc 镜像 `ext4_bigalloc.img`、statfs 数值与 `dumpe2fs` / `$Bitmap` popcount 交叉核对；真实
   `tools/fsfixtures/mkfixtures.sh` 生成的镜像，`debugfs` / `ntfsls` 交叉核对；含敌对超级块/
-  引导扇区/损坏 extent 树/fixup 撕裂）；`hello114` 运行时检查 127 项（另有 NVMe、AHCI 两段默认 skip）（SMP=1/2/8，MBR 与 GPT 两种
+  引导扇区/损坏 extent 树/fixup 撕裂）；`hello114` 运行时检查 127 项（含并发读，另有 NVMe 4 项、AHCI 4 项仅在手动提供镜像时运行）（另有 NVMe、AHCI 两段默认 skip）（SMP=1/2/8，MBR 与 GPT 两种
   数据盘镜像，`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`），变异验证——去掉 EROFS 守卫
   则 7 项失败，忽略挂载代数则过期 fd 检查失败，关掉挂载规则则 7 项失败，关掉 DAC 检查则 7
   项失败。NVMe（中断驱动）与 AHCI 上的真实挂载读取（I/J 段）需要手动提供带 ext4 的镜像
