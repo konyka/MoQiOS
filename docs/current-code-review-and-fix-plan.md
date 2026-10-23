@@ -3976,9 +3976,20 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   - 运行时争用测试（hello114 O 段）：5 个进程同时读同一文件并列目录，另一个被 `SIGKILL` 在读到一半时
     杀掉，之后卷仍可读、`umount` 成功（说明锁没有被遗留持有）。SMP=1/2/8 均通过。变异验证：把 `lock()`
     改成空操作，SMP=8 下 3 项 O 检查失败，SMP=2 下解析器共享状态被破坏、内核直接 `integer overflow`
-    停机。hello114 现为 133 项检查。
-- **验证**：host 测试 662/662（594→662：ext4 17、NTFS 18、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、EROFS 守卫表 1；锁守卫 1；virtio 索引守卫 1；
-  真实镜像、`debugfs`/`ntfsls` 交叉核对、敌对输入）；三架构构建；`hello114` 133 项运行时检查（NVMe/AHCI 两段默认 skip），MBR
+    停机。hello114 在加入 mmap 段前为 133 项检查，现为 159 项。
+- **第五轮自审：mmap**：
+  - 卷内文件 `mmap` 返回 ENODEV（`mmap` 只认 ramdisk/tmpfs/ext2/fat32 四种 fd 类型），而这是用户对已挂载
+    文件系统最先会做的事之一（动态链接器、`mmap` 读大文件）。先写运行时测试确认 RED（两项失败），再实现。
+  - 设计取舍：缺页路径在 VM 自旋锁下运行且关中断，卷读可能睡眠（卷睡眠锁、NVMe 完成中断），所以不能走
+    缺页路径按需读。改为 mmap 时在 VM 锁之外预读到私有帧，再在锁内一次性装入（`Prefetch`：帧列表放在连续页里，
+    每条失败路径都释放未移交的帧）。代价：上限 32 MiB，eager 分配；收益：不引入新的区域种类，
+    `munmap`/`mprotect`/`fork`/RLIMIT 全部走既有匿名私有区域的路径。
+  - 验证：hello114 P 段 25 项（ext4 内容逐字节、`close(fd)` 后仍有效、`munmap`、页对齐偏移、EACCES/EINVAL/
+    ENODEV/ENOMEM、私有可写副本与 fork 后父子隔离、卷上文件不变、20 轮 map/unmap 后空闲内存不变、
+    卷卸载后经旧 fd 的 mmap 失败、NTFS 内容与稀疏文件空洞）。开发中暴露的唯一问题是测试自身：
+    `munmap` 要求长度页对齐（沿用既有 `munmap_policy`），我传了 300000。
+- **验证**：host 测试 667/667（594→667：ext4 17、NTFS 18、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；锁守卫 1；virtio 索引守卫 1；
+  真实镜像、`debugfs`/`ntfsls` 交叉核对、敌对输入）；三架构构建；`hello114` 159 项运行时检查（含 25 项 mmap 检查）（NVMe/AHCI 两段默认 skip），MBR
   默认镜像 SMP=1/2/8 通过，GPT 镜像（`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`）通过；
   变异验证（删 EROFS 守卫 → 7 项 FAIL；忽略挂载代数 → 过期 fd 项 FAIL；关掉挂载规则 → 7 项 FAIL；
   关掉 DAC 检查 → 7 项 FAIL；GPT 解析恒失败 → 43 项 FAIL；statfs 绕过卷路由 → 9 项 FAIL；access 绕过卷分支 → 9 项 FAIL；目录游标缓存恒未命中 → 1900 项目录列表 228865 ms 对 693 ms，时间预算检查 FAIL；睡眠锁：解锁不保持 held → 交接测试 FAIL，早醒不摘节点 → 竞态测试 FAIL；rofs_lock 改回自旋锁 → 源码守卫 FAIL）。
@@ -3989,7 +4000,7 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 
 | Gate | Result | Notes |
 |---|---|---|
-| `zig build test`（0.16.0） | Passed 662/662 | 594→662 |
+| `zig build test`（0.16.0） | Passed 667/667 | 594→667 |
 | `zig build` / riscv64 / aarch64 | Passed | 三架构 |
 | smoke SMP=1 / 2 / 8（MBR 数据盘） | Passed | hello114 PASS，90 项 ok；I/J 段默认 skip |
 | smoke SMP=1 / 2 / 8（GPT 数据盘） | Passed | SMP=1/2/8 均 PASS；GPT 变异（`isProtectiveMbr` 恒 false）→ 43 项 FAIL |

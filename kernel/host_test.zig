@@ -139,6 +139,7 @@ pub const rofs_access_policy = @import("fs/rofs_access_policy.zig");
 pub const gpt = @import("fs/gpt.zig");
 pub const dir_cursor_cache = @import("fs/dir_cursor_cache.zig");
 pub const sleep_lock = @import("sync/sleep_lock.zig");
+pub const rofs_map_policy = @import("mm/rofs_map_policy.zig");
 pub const wait_status_policy = @import("proc/wait_status_policy.zig");
 pub const accept4_policy = @import("net/accept4_policy.zig");
 pub const eth = @import("net/eth.zig");

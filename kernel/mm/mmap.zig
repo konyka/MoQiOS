@@ -43,6 +43,8 @@ const MAP_FIXED: u64 = 0x10;
 const MREMAP_MAYMOVE: u32 = 0x1;
 const MREMAP_FIXED: u32 = 0x2;
 const mmap_policy = @import("mmap_policy.zig");
+const rofs_map = @import("rofs_map_policy.zig");
+const rofs = @import("../fs/rofs.zig");
 
 /// Unmap pages in a range and free physical memory.
 /// TLB safety: collects physical frames during unmapping, performs the
@@ -848,6 +850,94 @@ fn moveOrNoMem(task: *task_mod.Task, region: *task_mod.MmapRegion, old_pages: u6
     return moveMapping(task, region, new_base, old_pages, new_pages);
 }
 
+/// Pages of a mounted-volume file, copied into private frames BEFORE the VM
+/// lock is taken: reading the volume can sleep (its lock, an NVMe completion),
+/// which the page-fault path and VM-lock holders must never do. The mapping
+/// then installs the frames and owns them; anything not yet handed over is
+/// freed by release().
+const Prefetch = struct {
+    list_phys: u64 = 0,
+    list_pages: usize = 0,
+    frames: [*]u64 = undefined,
+    /// Frames allocated so far.
+    count: u64 = 0,
+    /// Frames [0, given) now belong to the address space.
+    given: u64 = 0,
+
+    fn release(self: *Prefetch) void {
+        if (self.list_phys == 0) return;
+        var i = self.given;
+        while (i < self.count) : (i += 1) pmm_mod.freePage(self.frames[@intCast(i)]);
+        pmm_mod.freeContiguous(self.list_phys, self.list_pages);
+        self.* = .{};
+    }
+};
+
+fn prefetchVolumeFile(
+    mount: u8,
+    gen: u32,
+    ref: u64,
+    file_size: u64,
+    offset: u64,
+    length: u64,
+    out: *Prefetch,
+) i64 {
+    const pages = rofs_map.pageCount(length);
+    const list_pages: usize = @intCast((pages * 8 + user_space.PAGE_SIZE - 1) / user_space.PAGE_SIZE);
+    const list = pmm_mod.allocContiguous(list_pages) orelse return -12;
+    out.* = .{ .list_phys = list, .list_pages = list_pages, .frames = @ptrFromInt(hhdm_mod.physToVirt(list)) };
+    var i: u64 = 0;
+    while (i < pages) : (i += 1) {
+        const phys = pmm_mod.allocPage() orelse {
+            out.release();
+            return -12;
+        };
+        out.frames[@intCast(i)] = phys;
+        out.count = i + 1;
+        const dst: [*]u8 = @ptrFromInt(hhdm_mod.physToVirt(phys));
+        @memset(dst[0..user_space.PAGE_SIZE], 0); // the tail of a partial page stays zero
+        const want = rofs_map.validBytes(file_size, offset, i);
+        if (want == 0) continue;
+        const got = rofs.readAt(mount, gen, ref, offset + i * user_space.PAGE_SIZE, dst[0..want]);
+        if (got != @as(i64, want)) {
+            out.release();
+            return if (got < 0) got else -5; // EIO: the volume returned less than it promised
+        }
+    }
+    return 0;
+}
+
+/// Install the prefetched frames at [base, base + count pages) as an ordinary
+/// private mapping. On failure the pages mapped so far are unmapped (freeing
+/// their frames) and the rest stay owned by `pf`.
+fn mapPrefetched(cur: *task_mod.Task, base: u64, pf: *Prefetch, prot: u64) bool {
+    const map_flags = paging_mod.MapFlags{
+        .writable = (prot & 2) != 0,
+        .user = true,
+        .no_execute = (prot & 4) == 0,
+        .global = false,
+    };
+    var mapped: u64 = 0;
+    while (mapped < pf.count) : (mapped += 1) {
+        const virt = base + mapped * user_space.PAGE_SIZE;
+        paging_mod.mapPage(cur.page_table_phys, virt, pf.frames[@intCast(mapped)], map_flags) catch {
+            unmapRange(cur, base, mapped);
+            return false;
+        };
+        pf.given = mapped + 1;
+        if (prot == 0 and comptime builtin.cpu.arch == .x86_64) {
+            // PROT_NONE: same reservation encoding as an anonymous mapping.
+            const pte = paging_mod.getProtectionPageEntry(cur.page_table_phys, virt) orelse {
+                unmapRange(cur, base, mapped + 1);
+                return false;
+            };
+            pte.os_bits |= 0b010;
+            pte.present = false;
+        }
+    }
+    return true;
+}
+
 /// Core mmap implementation. Returns mapped base address or -errno.
 pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset: u64) i64 {
     if (!mmap_policy.flagsValid(flags) or !mmap_policy.protValid(prot)) return -22; // EINVAL
@@ -860,6 +950,29 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
     if (cur.mm == null) return -1;
+
+    // ─── Files on a mounted ext4/NTFS volume ───
+    // Read their pages now, outside the VM lock (see Prefetch). The result is
+    // an ordinary private mapping initialised from the file.
+    var pf: Prefetch = .{};
+    defer pf.release();
+    if (!is_anonymous and fd >= 0 and fd < vfs.MAX_FDS) {
+        const vd = &cur.fd_table.fds[@intCast(fd)];
+        if (vd.fd_type == .rofs_file) {
+            const vol_shared = (flags & MAP_SHARED) != 0;
+            switch (rofs_map.admit(vd.rofs_is_dir, offset, length, prot, vol_shared)) {
+                .ok => {},
+                .invalid => return -22,
+                .no_device => return -19,
+                .access => return -13,
+                .no_memory => return -12,
+            }
+            if ((vd.status_flags & 0x03) == 1) return -9; // O_WRONLY
+            const r = prefetchVolumeFile(vd.rofs_mount, vd.rofs_gen, vd.rofs_ref, vd.file_size, offset, length, &pf);
+            if (r != 0) return r;
+        }
+    }
+
     var vm_guard = mm_mod.Mm.beginVmMutation(cur.mm, @ptrCast(cur)) catch return -35;
     defer vm_guard.release();
 
@@ -882,7 +995,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     // File mappings are demand-paged: nothing is mapped here, the region
     // metadata below drives the page-fault path (handleFileFault in idt.zig).
     var meta: ?RegionFileMeta = null;
-    if (!is_anonymous) {
+    if (!is_anonymous and pf.list_phys == 0) {
         // Linux: the offset must be page-aligned.
         if (!filemap.offsetValid(offset)) return -22; // EINVAL
         if (fd < 0 or fd >= vfs.MAX_FDS) return -9; // EBADF
@@ -971,7 +1084,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
         if (num_pages > (user_space.USER_ADDR_MAX - base) / user_space.PAGE_SIZE) return -12; // ENOMEM
         if (@import("../ipc/sysv_shm.zig").overlapsAttachment(cur.page_table_phys, base, num_pages)) return -22; // EINVAL
         if (hasMmapOverlap(cur, base, num_pages)) {
-            if (meta != null) return -12;
+            if (meta != null or pf.list_phys != 0) return -12;
             return replaceFixedAnonymous(cur, base, num_pages, prot, flags);
         }
         if (!pagesFree(cur, base, num_pages)) return -12;
@@ -996,7 +1109,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
             // slot first — the generic search steps by 4K and would almost
             // never pick one. Falls back to a 4K-only mapping when no
             // aligned slot fits.
-            base = if (meta == null and huge_on and num_pages >= huge_user.HUGE_PAGES)
+            base = if (meta == null and pf.list_phys == 0 and huge_on and num_pages >= huge_user.HUGE_PAGES)
                 (findFreeRangeAligned2M(cur, hint, num_pages) orelse
                     findFreeRangeFrom(cur, hint, num_pages, null) orelse
                     findFreeRangeFrom(cur, user_space.USER_MMAP_BASE, num_pages, null) orelse
@@ -1016,7 +1129,9 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     if (!rlimit.Policy.asChargeOk(cur.as_used, map_bytes, cur.as_cur)) return -12; // ENOMEM
     // RLIMIT_DATA: writable private mappings (anonymous or file-private)
     // charge an independent data ledger on top of RLIMIT_AS.
-    const shared = (flags & MAP_SHARED) != 0;
+    // A volume file is mapped as a private copy even when MAP_SHARED was
+    // asked for (read-only; admit() already refused shared + write).
+    const shared = (flags & MAP_SHARED) != 0 and pf.list_phys == 0;
     const writable_private = (prot & 2) != 0 and !shared;
     if (writable_private and
         !rlimit.Policy.dataChargeOk(cur.data_used, map_bytes, cur.data_cur)) return -12; // ENOMEM
@@ -1025,13 +1140,16 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     // base is 2MiB-aligned with at least one full block. A huge region never
     // merges with neighbours (the huge-first invariant), so the capacity
     // check must not count a merge as available space.
-    const huge_attempt = meta == null and prot != 0 and huge_on and
+    const huge_attempt = meta == null and pf.list_phys == 0 and prot != 0 and huge_on and
         huge_user.eligible(base, num_pages);
 
     if (!is_fixed and !canTrackMmapRegion(cur, base, num_pages, meta == null and !huge_attempt, @intCast(prot & 7), shared)) return -12;
 
     var huge_count: u32 = 0;
-    if (meta == null) {
+    if (pf.list_phys != 0) {
+        if (pf.count != num_pages) return -12; // cannot happen: both derive from `length`
+        if (!mapPrefetched(cur, base, &pf, prot)) return -12;
+    } else if (meta == null) {
         // Anonymous: allocate and map zeroed pages eagerly (unchanged).
         const writable = (prot & 2) != 0;
         const executable = (prot & 4) != 0;

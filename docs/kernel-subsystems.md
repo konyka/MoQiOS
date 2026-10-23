@@ -362,6 +362,14 @@ H1 再加 `shared` 字段记录 MAP_SHARED），不触碰页表；首次访问�
   卸载先在表锁下摘掉路由项，再在无自旋锁的情况下销毁卷。AHCI/virtio-blk 读是轮询、不会挂起任务，
   因此不受影响（并发读在两者上同样验证通过）。睡眠锁只能用在可睡眠的上下文，rofs 的所有调用者都是
   syscall 路径。
+- **mmap**：卷内文件可以 `mmap`（之前返回 ENODEV）。语义是"用文件内容初始化的私有映射"：mmap 时先在
+  VM 锁**之外**把页读进私有帧（读卷可能睡眠——卷锁、NVMe 完成中断——而缺页路径和持 VM 锁者都不能睡），
+  再在锁内一次性装入页表。因此：`MAP_PRIVATE` 可读可写（写只改内存副本，文件不变，fork 后父子互不可见）；
+  `MAP_SHARED` 只读可用（内容等同私有副本，不随之后文件变化——卷本身只读也不会变）；`MAP_SHARED|PROT_WRITE`
+  返回 EACCES；目录 ENODEV；偏移必须页对齐（EINVAL）；文件尾部的半页补零；映射不依赖原 fd，`close(fd)` 后仍有效，
+  也不依赖卷是否仍挂载。上限 32 MiB（超出 ENOMEM，更大的文件仍可 `read`）。映射区域按匿名私有区域记账
+  （`munmap`/`mprotect`/`fork`/RLIMIT 走既有路径，没有新的区域种类）。NTFS 稀疏文件的空洞映射为零页。
+  纯策略在 `mm/rofs_map_policy.zig`（host 测试：错误顺序、上限、页数、尾页有效字节、溢出）。
 - **已知限制**：mremap 文件区域仅支持原地增长/收缩（移动返回 ENOMEM）；
   MAP_SHARED 可写页与随后对同一 inode 的 `write()` 系统调用之间不做一致性保证
   （writeFile 会 invalidate 该 inode 的缓存页，未刷出的映射写入可能丢失——请先
@@ -1115,9 +1123,9 @@ const FdTable = struct {
   系统文件（它们是真实的目录项）。$LogFile 被忽略，未干净卸载的卷按原样读取。
 - **已知限制**：dup 在本内核复制描述符（各自 offset），与 POSIX 共享 offset 不同，对 rofs 同
   样适用；ext4 inode 的 uid/gid 由低 16 位与高 16 位合并；NTFS 不提供 xattr/ADS；卷内不能再挂载别的文件系统。
-- **验证**：host 测试（ext4 17、NTFS 18、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、EROFS 守卫表 1；含 bigalloc 镜像 `ext4_bigalloc.img`、statfs 数值与 `dumpe2fs` / `$Bitmap` popcount 交叉核对；真实
+- **验证**：host 测试（ext4 17、NTFS 18、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；含 bigalloc 镜像 `ext4_bigalloc.img`、statfs 数值与 `dumpe2fs` / `$Bitmap` popcount 交叉核对；真实
   `tools/fsfixtures/mkfixtures.sh` 生成的镜像，`debugfs` / `ntfsls` 交叉核对；含敌对超级块/
-  引导扇区/损坏 extent 树/fixup 撕裂）；`hello114` 运行时检查 133 项（含并发读，另有 NVMe 4 项、AHCI 4 项仅在手动提供镜像时运行）（另有 NVMe、AHCI 两段默认 skip）（SMP=1/2/8，MBR 与 GPT 两种
+  引导扇区/损坏 extent 树/fixup 撕裂）；`hello114` 运行时检查 159 项（含并发读，另有 NVMe 4 项、AHCI 4 项仅在手动提供镜像时运行）（另有 NVMe、AHCI 两段默认 skip）（SMP=1/2/8，MBR 与 GPT 两种
   数据盘镜像，`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`），变异验证——去掉 EROFS 守卫
   则 7 项失败，忽略挂载代数则过期 fd 检查失败，关掉挂载规则则 7 项失败，关掉 DAC 检查则 7
   项失败。NVMe（中断驱动）与 AHCI 上的真实挂载读取（I/J 段）需要手动提供带 ext4 的镜像

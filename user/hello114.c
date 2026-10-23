@@ -18,6 +18,8 @@
 ///      listings with small buffers, two interleaved readers, rewind; listing time bounded
 ///   O. five processes read one file concurrently while a sixth is killed mid-read;
 ///      the volume lock must hand over cleanly and the volume must still work afterwards
+///   P. mmap of a file on a volume: PROT_READ MAP_PRIVATE/MAP_SHARED serve the file's bytes,
+///      a write mapping is refused, offsets work, the mapping outlives close(fd)
 ///   M. statfs/fstatfs: real block and inode counts, read-only flag, cached NTFS count
 ///   K. mount-point rules: '/', /dev, /proc, /tmp, nested and '..'-disguised
 ///      targets are refused; equivalent spellings name one mount
@@ -48,6 +50,17 @@ static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
     return ret;
 }
 
+static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3,
+                               uint64_t a4, uint64_t a5, uint64_t a6) {
+    int64_t ret;
+    register uint64_t rdx __asm__("rdx") = a3;
+    register uint64_t r10 __asm__("r10") = a4;
+    register uint64_t r8 __asm__("r8") = a5;
+    register uint64_t r9 __asm__("r9") = a6;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx), "r"(r10), "r"(r8), "r"(r9) : "rcx", "r11", "memory");
+    return ret;
+}
+
 #define SYS_WRITE     1
 #define SYS_EXIT      2
 #define SYS_WAITPID   6
@@ -72,6 +85,8 @@ static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_SYMLINK   88
 #define SYS_TRUNCATE  210
 #define SYS_ACCESS    198
+#define SYS_MMAP      8
+#define SYS_MUNMAP    12
 #define SYS_KILL      62
 #define SYS_SCHED_YIELD 24
 #define SYS_CLOCK_GETTIME 228
@@ -86,6 +101,11 @@ static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define EBUSY   16
 #define ENOTDIR 20
 
+#define PROT_READ    0x1
+#define PROT_WRITE   0x2
+#define MAP_SHARED   0x01
+#define MAP_PRIVATE  0x02
+#define ENODEV_ 19
 #define O_RDONLY 0
 #define O_WRONLY 1
 #define O_RDWR   2
@@ -110,6 +130,13 @@ static int streq(const char *a, const char *b) {
     return *a == *b;
 }
 static int strlen_(const char *s) { int n = 0; while (s[n]) n++; return n; }
+
+#define SYS_SYSINFO 99
+static uint64_t freeram_pages_(void) {
+    static uint64_t sinfo[16];
+    syscall1(SYS_SYSINFO, (uint64_t)sinfo);
+    return sinfo[5] / 4096; /* freeram @40, in bytes here */
+}
 
 static uint8_t big_byte(uint64_t i) { return (uint8_t)(i * 7 + i / 251); }
 
@@ -518,6 +545,121 @@ void _start(void) {
         n = slurp("/mnt/big/bigdir_entry_with_a_long_name_1234.txt", small, sizeof(small));
         check(n == 0, "N: lookup of one entry deep in the tree works");
         check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/big", 0) == 0, "N: umount");
+    }
+
+    /* P: mmap of files on a mounted volume. */
+    {
+        check(syscall4(SYS_MOUNT, (uint64_t)"/dev/vblk1p1", (uint64_t)"/mnt/mm", (uint64_t)"ext4", 0) == 0, "P: mount ext4 for the mmap tests");
+        int64_t mfd = syscall2(SYS_OPEN, (uint64_t)"/mnt/mm/big.bin", O_RDONLY);
+        int64_t mp = syscall6(SYS_MMAP, 0, 300000, PROT_READ, MAP_PRIVATE, (uint64_t)mfd, 0);
+        check(mp > 0 || mp < -4095, "P: mmap(PROT_READ, MAP_PRIVATE) of a volume file succeeds");
+        if (mp > 0 || mp < -4095) {
+            const uint8_t *m = (const uint8_t *)mp;
+            int same = 1;
+            for (uint64_t i = 0; same && i < 300000; i++) if (m[i] != big_byte(i)) same = 0;
+            check(same, "P: all 300000 mapped bytes match the file");
+            syscall1(SYS_CLOSE, (uint64_t)mfd);
+            same = 1;
+            for (uint64_t i = 0; same && i < 300000; i += 997) if (m[i] != big_byte(i)) same = 0;
+            check(same, "P: the mapping outlives close(fd)");
+            check(syscall2(SYS_MUNMAP, (uint64_t)mp, 74 * 4096) == 0, "P: munmap (page-aligned length)");
+        } else {
+            syscall1(SYS_CLOSE, (uint64_t)mfd);
+        }
+        mfd = syscall2(SYS_OPEN, (uint64_t)"/mnt/mm/big.bin", O_RDONLY);
+        int64_t mo = syscall6(SYS_MMAP, 0, 8192, PROT_READ, MAP_SHARED, (uint64_t)mfd, 8192);
+        check(mo > 0 || mo < -4095, "P: mmap with a page-aligned offset succeeds");
+        if (mo > 0 || mo < -4095) {
+            const uint8_t *m = (const uint8_t *)mo;
+            int same = 1;
+            for (uint64_t i = 0; same && i < 8192; i++) if (m[i] != big_byte(8192 + i)) same = 0;
+            check(same, "P: an offset mapping shows the file from that offset");
+            syscall2(SYS_MUNMAP, (uint64_t)mo, 8192);
+        }
+        check(syscall6(SYS_MMAP, 0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, (uint64_t)mfd, 0) == -13, "P: a writable shared mapping of a read-only volume is EACCES");
+        check(syscall6(SYS_MMAP, 0, 4096, PROT_READ, MAP_PRIVATE, (uint64_t)mfd, 100) == -22, "P: an unaligned offset is EINVAL");
+        syscall1(SYS_CLOSE, (uint64_t)mfd);
+        {
+            int64_t dfd = syscall2(SYS_OPEN, (uint64_t)"/mnt/mm/dir", O_RDONLY);
+            check(syscall6(SYS_MMAP, 0, 4096, PROT_READ, MAP_PRIVATE, (uint64_t)dfd, 0) == -19, "P: mmap of a directory is ENODEV");
+            syscall1(SYS_CLOSE, (uint64_t)dfd);
+        }
+        /* a private writable mapping is a copy: writes stay in memory, the file is unchanged */
+        mfd = syscall2(SYS_OPEN, (uint64_t)"/mnt/mm/small.txt", O_RDONLY);
+        int64_t pw = syscall6(SYS_MMAP, 0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, (uint64_t)mfd, 0);
+        check(pw > 0 || pw < -4095, "P: a private writable mapping is allowed");
+        if (pw > 0 || pw < -4095) {
+            uint8_t *m = (uint8_t *)pw;
+            check(m[0] == 'h' && m[8] == '\n' && m[9] == 0 && m[4095] == 0, "P: a short file reads as its bytes, then zeros to the end of the page");
+            m[0] = 'J';
+            check(m[0] == 'J', "P: the private copy is writable");
+            int64_t kid = syscall1(SYS_FORK, 0);
+            if (kid == 0) {
+                /* the child sees the parent's value, and its own write is private */
+                int ok2 = (m[0] == 'J');
+                m[0] = 'K';
+                syscall1(SYS_EXIT, ok2 && m[0] == 'K' ? 0 : 1);
+                for (;;) {}
+            }
+            int32_t kst = 0;
+            syscall3(SYS_WAITPID, (uint64_t)kid, (uint64_t)&kst, 0);
+            check(((kst >> 8) & 0xff) == 0 && (kst & 0x7f) == 0, "P: a forked child inherits the copy and writes to its own");
+            check(m[0] == 'J', "P: the child's write is not visible in the parent");
+            uint8_t again[16];
+            n = slurp("/mnt/mm/small.txt", again, sizeof(again));
+            check(n == 9 && again[0] == 'h', "P: the file on the volume is unchanged");
+            syscall2(SYS_MUNMAP, (uint64_t)pw, 4096);
+        }
+        syscall1(SYS_CLOSE, (uint64_t)mfd);
+        /* no frames leak across many map/unmap cycles */
+        {
+            mfd = syscall2(SYS_OPEN, (uint64_t)"/mnt/mm/big.bin", O_RDONLY);
+            uint64_t before = freeram_pages_();
+            int cycles_ok = 1;
+            for (int c = 0; c < 20; c++) {
+                int64_t mm2 = syscall6(SYS_MMAP, 0, 74 * 4096, PROT_READ, MAP_PRIVATE, (uint64_t)mfd, 0);
+                if (!(mm2 > 0 || mm2 < -4095)) { cycles_ok = 0; break; }
+                volatile uint8_t sink = *(volatile uint8_t *)mm2; (void)sink;
+                if (syscall2(SYS_MUNMAP, (uint64_t)mm2, 74 * 4096) != 0) cycles_ok = 0;
+            }
+            uint64_t after = freeram_pages_();
+            check(cycles_ok, "P: 20 map/unmap cycles of a 300 KB file succeed");
+            check(before >= after ? before - after < 16 : 1, "P: free memory is unchanged after those cycles (no leaked frames)");
+            syscall1(SYS_CLOSE, (uint64_t)mfd);
+        }
+        /* a mapping bigger than the cap is refused cleanly */
+        mfd = syscall2(SYS_OPEN, (uint64_t)"/mnt/mm/big.bin", O_RDONLY);
+        check(syscall6(SYS_MMAP, 0, (uint64_t)33 << 20, PROT_READ, MAP_PRIVATE, (uint64_t)mfd, 0) == -12, "P: a mapping over the 32 MiB cap is ENOMEM");
+        syscall1(SYS_CLOSE, (uint64_t)mfd);
+        /* a mapping whose descriptor outlives the mount cannot be created */
+        mfd = syscall2(SYS_OPEN, (uint64_t)"/mnt/mm/small.txt", O_RDONLY);
+        check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/mm", 0) == 0, "P: umount");
+        check(syscall6(SYS_MMAP, 0, 4096, PROT_READ, MAP_PRIVATE, (uint64_t)mfd, 0) < 0, "P: mmap through an fd whose volume was unmounted fails");
+        syscall1(SYS_CLOSE, (uint64_t)mfd);
+        /* the same on NTFS */
+        check(syscall4(SYS_MOUNT, (uint64_t)"/dev/vblk1p2", (uint64_t)"/mnt/mn", (uint64_t)"ntfs", 0) == 0, "P: mount ntfs for the mmap test");
+        mfd = syscall2(SYS_OPEN, (uint64_t)"/mnt/mn/big.bin", O_RDONLY);
+        int64_t nm = syscall6(SYS_MMAP, 0, 300000, PROT_READ, MAP_PRIVATE, (uint64_t)mfd, 0);
+        check(nm > 0 || nm < -4095, "P: mmap of an NTFS file succeeds");
+        if (nm > 0 || nm < -4095) {
+            const uint8_t *m = (const uint8_t *)nm;
+            int same = 1;
+            for (uint64_t i = 0; same && i < 300000; i++) if (m[i] != big_byte(i)) same = 0;
+            check(same, "P: all 300000 mapped NTFS bytes match the file");
+            syscall2(SYS_MUNMAP, (uint64_t)nm, 74 * 4096);
+        }
+        syscall1(SYS_CLOSE, (uint64_t)mfd);
+        mfd = syscall2(SYS_OPEN, (uint64_t)"/mnt/mn/sparse.bin", O_RDONLY);
+        int64_t sm = syscall6(SYS_MMAP, 0, 24 * 16384 + 5003, PROT_READ, MAP_PRIVATE, (uint64_t)mfd, 0);
+        if (sm > 0 || sm < -4095) {
+            const uint8_t *m = (const uint8_t *)sm;
+            check(m[0] == 'A' && m[100] == 0 && m[16384] == 'B' && m[24 * 16384 + 5000] == 'E', "P: an NTFS sparse file maps with its holes as zeros");
+            syscall2(SYS_MUNMAP, (uint64_t)sm, ((24 * 16384 + 5003 + 4095) / 4096) * 4096);
+        } else {
+            check(0, "P: an NTFS sparse file maps with its holes as zeros");
+        }
+        syscall1(SYS_CLOSE, (uint64_t)mfd);
+        check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/mn", 0) == 0, "P: umount ntfs");
     }
 
     /* O: contention on the volume lock. A holder that is preempted (timer
