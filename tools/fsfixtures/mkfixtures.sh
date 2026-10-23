@@ -71,6 +71,21 @@ mke2fs -q -t ext4 -O ^has_journal -b 4096 -N 1024 -L MOQI4K -d "$WORK/src" "$OUT
 truncate -s 4M "$OUT/ext3_1k.img"
 mke2fs -q -t ext3 -b 1024 -N 1024 -L MOQIEXT3 -d "$WORK/src" "$OUT/ext3_1k.img"
 
+# ext4 with a depth-2 extent tree: frag.bin holds 1 KiB of data at every 2 KiB
+# (5000 leaf extents), which no ordinary file layout produces.
+python3 - "$WORK" <<'PY'
+import os, sys
+root = os.path.join(sys.argv[1], "deepsrc")
+os.makedirs(root, exist_ok=True)
+with open(os.path.join(root, "frag.bin"), "wb") as f:
+    for k in range(5000):
+        f.seek(k * 2048); f.write(bytes([k & 0xFF]) * 1024)
+PY
+truncate -s 24M "$OUT/ext4_deep.img"
+mke2fs -q -t ext4 -O ^has_journal -b 1024 -N 1024 -L MOQIDEEP \
+    -U 77777777-8888-9999-aaaa-bbbbbbbbbbbb -E hash_seed=77777777-8888-9999-aaaa-bbbbbbbbbbbb \
+    -d "$WORK/deepsrc" "$OUT/ext4_deep.img"
+
 # ext4 with bigalloc: 16 KiB allocation clusters over 1 KiB blocks (extents still
 # address blocks; only the bitmaps and free counts are per cluster). No journal.
 truncate -s 12M "$OUT/ext4_bigalloc.img"
@@ -128,4 +143,4 @@ PT
 dd if="$OUT/ext4_1k.img" of="$OUT/datadisk_gpt.img" bs=512 seek=2048 conv=notrunc status=none
 dd if="$OUT/ntfs.img" of="$OUT/datadisk_gpt.img" bs=512 seek=10240 conv=notrunc status=none
 dd if="$OUT/ntfs_bigdir.img" of="$OUT/datadisk_gpt.img" bs=512 seek=18432 conv=notrunc status=none
-echo "wrote $OUT/{ext4_1k,ext4_4k,ext3_1k,ext4_bigalloc,ntfs,ntfs_bigdir,datadisk,datadisk_gpt}.img"
+echo "wrote $OUT/{ext4_1k,ext4_4k,ext3_1k,ext4_bigalloc,ext4_deep,ntfs,ntfs_bigdir,datadisk,datadisk_gpt}.img"

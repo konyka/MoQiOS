@@ -1123,7 +1123,7 @@ const FdTable = struct {
   系统文件（它们是真实的目录项）。$LogFile 被忽略，未干净卸载的卷按原样读取。
 - **已知限制**：dup 在本内核复制描述符（各自 offset），与 POSIX 共享 offset 不同，对 rofs 同
   样适用；ext4 inode 的 uid/gid 由低 16 位与高 16 位合并；NTFS 不提供 xattr/ADS；卷内不能再挂载别的文件系统。
-- **验证**：host 测试（ext4 17、NTFS 18、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；含 bigalloc 镜像 `ext4_bigalloc.img`、statfs 数值与 `dumpe2fs` / `$Bitmap` popcount 交叉核对；真实
+- **验证**：host 测试（ext4 19、NTFS 18、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；含 bigalloc 镜像 `ext4_bigalloc.img`、statfs 数值与 `dumpe2fs` / `$Bitmap` popcount 交叉核对；真实
   `tools/fsfixtures/mkfixtures.sh` 生成的镜像，`debugfs` / `ntfsls` 交叉核对；含敌对超级块/
   引导扇区/损坏 extent 树/fixup 撕裂）；`hello114` 运行时检查 159 项（含并发读，另有 NVMe 4 项、AHCI 4 项仅在手动提供镜像时运行）（另有 NVMe、AHCI 两段默认 skip）（SMP=1/2/8，MBR 与 GPT 两种
   数据盘镜像，`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`），变异验证——去掉 EROFS 守卫

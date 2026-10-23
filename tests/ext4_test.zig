@@ -381,3 +381,85 @@ test "the bigalloc image really is bigalloc, and still reads like the others" {
     const n = try readAll(&v, "/dir/sub/n.txt", &buf);
     try std.testing.expectEqualStrings("nested\n", buf[0..n]);
 }
+
+test "a depth-2 extent tree (5000 leaf extents) reads back exactly" {
+    // frag.bin has one 1 KiB block of data at every 2 KiB, so its extent
+    // tree needs two levels of index nodes. The ordinary fixtures are depth
+    // 0/1; this one exercises the multi-level descent and the hole logic
+    // between extents (checked against debugfs: 60 index nodes, 4980 leaves).
+    var img = try Image.open("tests/fixtures/fs/ext4_deep.img");
+    defer img.close();
+    const v = try ext4.Volume.mount(img.reader());
+    const ino = try v.resolve("/frag.bin", true);
+    const in = try v.readInode(ino);
+    try std.testing.expectEqual(@as(u64, 4999 * 2048 + 1024), in.size);
+    var buf: [2048]u8 = undefined;
+    var k: usize = 0;
+    while (k < 5000) : (k += 1) {
+        const n = try v.readFile(&in, @as(u64, k) * 2048, &buf);
+        const want: usize = if (k == 4999) 1024 else 2048;
+        try std.testing.expectEqual(want, n);
+        // first KiB is the pattern byte, second KiB (the hole) is zero
+        for (buf[0..1024]) |c| try std.testing.expectEqual(@as(u8, @truncate(k)), c);
+        for (buf[1024..n]) |c| try std.testing.expectEqual(@as(u8, 0), c);
+    }
+    // One read over the WHOLE file. A leaf holds ~83 extents (~170 KB), so this
+    // crosses ~60 leaf boundaries and ~1 index-node boundary. A hole reported
+    // at the end of a leaf that is longer than the real gap would swallow the
+    // data after it; single-extent reads cannot see that, a long read does.
+    const whole = try std.testing.allocator.alloc(u8, @intCast(in.size));
+    defer std.testing.allocator.free(whole);
+    const got = try v.readFile(&in, 0, whole);
+    try std.testing.expectEqual(whole.len, got);
+    for (whole, 0..) |c, i| {
+        const blk = i / 2048;
+        const within = i % 2048;
+        const expect: u8 = if (within < 1024) @truncate(blk) else 0;
+        if (c != expect) {
+            std.debug.print("mismatch at byte {d}: got {d} want {d}\n", .{ i, c, expect });
+            return error.TestExpectedEqual;
+        }
+    }
+    // and unaligned long reads starting at assorted places, ending past leaf edges
+    const starts = [_]u64{ 1, 1500, 160_000, 169_999, 170_000, 340_001, 5_000_000, 10_000_000 };
+    for (starts) |st| {
+        var chunk: [300_000]u8 = undefined;
+        const n = try v.readFile(&in, st, &chunk);
+        const want: usize = @intCast(@min(@as(u64, chunk.len), in.size - st));
+        try std.testing.expectEqual(want, n);
+        for (chunk[0..n], 0..) |c, i| try std.testing.expectEqual(whole[@intCast(st + i)], c);
+    }
+}
+
+test "an index node whose depth disagrees with its parent is Corrupt, not followed" {
+    // The root (in the inode) is depth 2 and points at a depth-1 node. Find
+    // that node's block from the inode itself instead of hard-coding it, then
+    // claim the node is depth 5: the descent must refuse it.
+    var img = try Image.open("tests/fixtures/fs/ext4_deep.img");
+    defer img.close();
+    const clean = try ext4.Volume.mount(img.reader());
+    const in = try clean.readInode(try clean.resolve("/frag.bin", true));
+    // first index entry of the in-inode root: ei_leaf_lo @ +4, ei_leaf_hi @ +8
+    // after the 12-byte header, so entry 0 starts at byte 12 of i_block.
+    const lo = std.mem.readInt(u32, in.iblock[12 + 4 ..][0..4], .little);
+    const hi = std.mem.readInt(u16, in.iblock[12 + 8 ..][0..2], .little);
+    const node_block: u64 = @as(u64, lo) | (@as(u64, hi) << 32);
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, in.iblock[6..8], .little)); // root depth
+
+    const Patch = struct {
+        inner: fr.Reader,
+        depth_at: u64,
+        fn read(ctx: *anyopaque, offset: u64, buf: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!self.inner.read(offset, buf)) return false;
+            if (self.depth_at >= offset and self.depth_at < offset + buf.len) buf[@intCast(self.depth_at - offset)] = 5;
+            return true;
+        }
+    };
+    var patch: Patch = .{ .inner = img.reader(), .depth_at = node_block * 1024 + 6 };
+    const rd: fr.Reader = .{ .ctx = &patch, .read_fn = Patch.read };
+    const v = try ext4.Volume.mount(rd);
+    const in2 = try v.readInode(try v.resolve("/frag.bin", true));
+    var b: [16]u8 = undefined;
+    try std.testing.expectError(error.Corrupt, v.readFile(&in2, 3 * 2048, &b));
+}

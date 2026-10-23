@@ -3988,7 +3988,20 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     ENODEV/ENOMEM、私有可写副本与 fork 后父子隔离、卷上文件不变、20 轮 map/unmap 后空闲内存不变、
     卷卸载后经旧 fd 的 mmap 失败、NTFS 内容与稀疏文件空洞）。开发中暴露的唯一问题是测试自身：
     `munmap` 要求长度页对齐（沿用既有 `munmap_policy`），我传了 300000。
-- **验证**：host 测试 667/667（594→667：ext4 17、NTFS 18、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；锁守卫 1；virtio 索引守卫 1；
+- **第六轮自审：ext4 多层 extent 树**：
+  - 之前所有 ext4 fixture 的 extent 树深度都是 0 或 1，多层索引节点的下降逻辑（`mapExtent` 里逐层收窄
+    `bound`、子节点深度校验）从未被真实数据执行过。新增 `ext4_deep.img`：`frag.bin` 每 2 KiB 放 1 KiB
+    数据，共 5000 个叶子 extent，`debugfs` 确认深度 2（60 个索引节点、4980 个叶子）。
+  - 逐 extent 读、整文件一次读、多个非对齐长读都与生成器逐字节核对；另有一个测试把深度 1 的节点深度字段
+    改成 5，要求报 Corrupt 而不是跟随。
+  - 变异验证（对 `kernel/fs/ext4.zig` 逐个改动，测试须失败）：空洞结束位置忽略子树边界 → 失败；下降时把
+    边界放宽而不是收窄 → 失败；删除子节点深度校验 → 失败。**第四个变异存活**：把"首个 extent 之前的空洞"
+    也按 `bound` 截断改成不截断，测试仍通过——有效镜像上子节点首个 extent 总在下一个索引项之前，该截断只在
+    损坏的树上才起作用，属于防御性代码，没有有效数据能触发它，故不声称已覆盖。
+  - 初版整文件测试只做逐 extent 读，两个变异都没抓到；原因是单 extent 读不会跨叶子边界。加入整文件长读后才抓到。
+  - 调查 `execve` 时读了加载器：`loadProgramForExec` 只在 ramdisk 里找文件，因此**任何磁盘文件系统（含既有的
+    ext2/fat32）上的程序都不能 exec**，不是本特性独有的缺口。这里未做运行验证，仅是读代码的结论；列入已知限制。
+- **验证**：host 测试 669/669（594→669：ext4 19、NTFS 18、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；锁守卫 1；virtio 索引守卫 1；
   真实镜像、`debugfs`/`ntfsls` 交叉核对、敌对输入）；三架构构建；`hello114` 159 项运行时检查（含 25 项 mmap 检查）（NVMe/AHCI 两段默认 skip），MBR
   默认镜像 SMP=1/2/8 通过，GPT 镜像（`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`）通过；
   变异验证（删 EROFS 守卫 → 7 项 FAIL；忽略挂载代数 → 过期 fd 项 FAIL；关掉挂载规则 → 7 项 FAIL；
@@ -3996,11 +4009,11 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 - **未做 / 已知限制**：写入（ext4 与 NTFS）；ext4 日志回放；元数据校验和验证；NTFS
   压缩/加密/$ATTRIBUTE_LIST/$UpCase 大小写折叠；GPT 备份表不使用且仅支持主表在 LBA 2、≤32 扇区
   的布局；DAC 不跟踪补充组；卷内再挂载；NTFS 位图超过 64 MiB 的卷 statfs 返回 EOPNOTSUPP；`faccessat` 的 dirfd 仍被忽略（沿用既有行为）；VFS 仍是"扁平命名 + 前缀路由"而非通用挂载树，
-  挂载点祖先目录（如 `/mnt`）本身不会作为目录出现在 `getdents("/")` 中。
+  挂载点祖先目录（如 `/mnt`）本身不会作为目录出现在 `getdents("/")` 中；程序不能从任何磁盘文件系统 `exec`（加载器只读 ramdisk）。
 
 | Gate | Result | Notes |
 |---|---|---|
-| `zig build test`（0.16.0） | Passed 667/667 | 594→667 |
+| `zig build test`（0.16.0） | Passed 669/669 | 594→669 |
 | `zig build` / riscv64 / aarch64 | Passed | 三架构 |
 | smoke SMP=1 / 2 / 8（MBR 数据盘） | Passed | hello114 PASS，90 项 ok；I/J 段默认 skip |
 | smoke SMP=1 / 2 / 8（GPT 数据盘） | Passed | SMP=1/2/8 均 PASS；GPT 变异（`isProtectiveMbr` 恒 false）→ 43 项 FAIL |
