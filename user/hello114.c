@@ -22,6 +22,8 @@
 ///      a write mapping is refused, offsets work, the mapping outlives close(fd)
 ///   Q. directory descriptors: openat() relative to a volume directory fd, fchdir() into one,
 ///      fchdir() on a regular file is ENOTDIR
+///   R. descriptor-based calls on a volume fd: nothing may modify or sync the volume, and an
+///      unsupported call must fail cleanly (never act on another filesystem's object)
 ///   M. statfs/fstatfs: real block and inode counts, read-only flag, cached NTFS count
 ///   K. mount-point rules: '/', /dev, /proc, /tmp, nested and '..'-disguised
 ///      targets are refused; equivalent spellings name one mount
@@ -96,6 +98,15 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_SYMLINK   88
 #define SYS_TRUNCATE  210
 #define SYS_ACCESS    198
+#define SYS_FSYNC     74
+#define SYS_FTRUNCATE 77
+#define SYS_FCHMOD    91
+#define SYS_FCHOWN    93
+#define SYS_FALLOCATE 274
+#define SYS_FLOCK     73
+#define SYS_SENDFILE  40
+#define SYS_PWRITE    18
+#define SYS_COPY_FILE_RANGE 184
 #define SYS_OPENAT    255
 #define SYS_STATX     183
 #define SYS_FCHDIR    81
@@ -560,6 +571,97 @@ void _start(void) {
         n = slurp("/mnt/big/bigdir_entry_with_a_long_name_1234.txt", small, sizeof(small));
         check(n == 0, "N: lookup of one entry deep in the tree works");
         check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/big", 0) == 0, "N: umount");
+    }
+
+    /* R: descriptor-based calls on a volume descriptor. The descriptors of the
+     * other filesystems carry index fields that default to 0; a handler that
+     * did not check the descriptor type could act on whatever object sits at
+     * index 0 of ext2/fat32/tmpfs. Each call below must be refused outright,
+     * and a file on the writable disk must be untouched afterwards. */
+    {
+        /* a canary on the writable root disk: slot 0 of its open-file tables */
+        int64_t cfd = syscall2(SYS_OPEN, (uint64_t)"/hello114-canary", O_RDWR | O_CREAT | O_TRUNC);
+        int canary_ok = cfd >= 0 && syscall3(SYS_WRITE, (uint64_t)cfd, (uint64_t)"canary-data-0123456789", 22) == 22;
+        check(syscall4(SYS_MOUNT, (uint64_t)"/dev/vblk1p1", (uint64_t)"/mnt/r", (uint64_t)"ext4", 0) == 0, "R: mount ext4 for the descriptor-call tests");
+        int64_t rfd = syscall2(SYS_OPEN, (uint64_t)"/mnt/r/small.txt", O_RDONLY);
+        check(rfd >= 0, "R: open a volume file");
+        check(syscall2(SYS_FTRUNCATE, (uint64_t)rfd, 0) < 0, "R: ftruncate on a volume fd is refused");
+        check(syscall2(SYS_FCHMOD, (uint64_t)rfd, 0777) < 0, "R: fchmod on a volume fd is refused");
+        check(syscall3(SYS_FCHOWN, (uint64_t)rfd, 0, 0) < 0, "R: fchown on a volume fd is refused");
+        check(syscall4(SYS_FALLOCATE, (uint64_t)rfd, 0, 0, 4096) < 0, "R: fallocate on a volume fd is refused");
+        check(syscall3(SYS_WRITE, (uint64_t)rfd, (uint64_t)"x", 1) < 0, "R: write on a volume fd is refused");
+        check(syscall4(SYS_PWRITE, (uint64_t)rfd, (uint64_t)"x", 1, 0) < 0, "R: pwrite on a volume fd is refused");
+        int64_t fs_r = syscall1(SYS_FSYNC, (uint64_t)rfd);
+        print("hello114:   info R: fsync on a volume fd returned "); print_u64(fs_r < 0 ? (uint64_t)(-fs_r) : (uint64_t)fs_r); print(fs_r < 0 ? " (negative errno)\n" : "\n");
+        check(fs_r == 0 || fs_r == -22, "R: fsync on a volume fd is 0 or EINVAL, like any file with nothing to sync");
+        /* the canary must be exactly as written */
+        if (canary_ok) {
+            syscall3(SYS_LSEEK, (uint64_t)cfd, 0, 0);
+            uint8_t cb[32];
+            int64_t cn = syscall3(SYS_READ, (uint64_t)cfd, (uint64_t)cb, 32);
+            int same = (cn == 22);
+            const char *want = "canary-data-0123456789";
+            for (int i = 0; same && i < 22; i++) if (cb[i] != (uint8_t)want[i]) same = 0;
+            check(same, "R: the writable-disk canary file is unchanged by all of the above");
+        } else {
+            check(0, "R: the writable-disk canary file is unchanged by all of the above");
+        }
+        /* sendfile with a volume fd as the source into a pipe */
+        int32_t pp[2];
+        if (syscall1(22, (uint64_t)pp) == 0) {
+            int64_t sf = syscall4(SYS_SENDFILE, (uint64_t)pp[1], (uint64_t)rfd, 0, 9);
+            uint8_t sb[16];
+            int64_t sn = sf > 0 ? syscall3(SYS_READ, (uint64_t)pp[0], (uint64_t)sb, 16) : -1;
+            print("hello114:   info R: sendfile from a volume fd returned "); print_u64(sf < 0 ? (uint64_t)(-sf) : (uint64_t)sf); print(sf < 0 ? " (negative errno)\n" : "\n");
+            check(sf == 9 && sn == 9 && sb[0] == 'h' && sb[8] == '\n', "R: sendfile from a volume fd copies the file's bytes");
+            syscall1(SYS_CLOSE, (uint64_t)pp[0]);
+            syscall1(SYS_CLOSE, (uint64_t)pp[1]);
+        }
+        /* copy_file_range: a volume file is never a valid destination */
+        {
+            int64_t dst = syscall2(SYS_OPEN, (uint64_t)"/hello114-canary", O_RDWR);
+            if (dst >= 0) {
+                int64_t cr = syscall5(SYS_COPY_FILE_RANGE, (uint64_t)dst, 0, (uint64_t)rfd, 0, 4);
+                check(cr < 0, "R: copy_file_range into a volume fd is refused");
+                syscall1(SYS_CLOSE, (uint64_t)dst);
+            }
+        }
+        /* ...but a volume file is a valid source for copy_file_range. The destination is a
+         * freshly created file, so the result must be exactly the 9 bytes of the source. */
+        {
+            int64_t dst = syscall2(SYS_OPEN, (uint64_t)"/hello114-copy", O_RDWR | O_CREAT | O_TRUNC);
+            if (dst >= 0) {
+                syscall3(SYS_LSEEK, (uint64_t)rfd, 0, 0);
+                int64_t cr = syscall5(SYS_COPY_FILE_RANGE, (uint64_t)rfd, 0, (uint64_t)dst, 0, 9);
+                print("hello114:   info R: copy_file_range from a volume fd returned "); print_u64(cr < 0 ? (uint64_t)(-cr) : (uint64_t)cr); print(cr < 0 ? " (negative errno)\n" : "\n");
+                syscall3(SYS_LSEEK, (uint64_t)dst, 0, 0);
+                uint8_t cc[16];
+                int64_t cn = syscall3(SYS_READ, (uint64_t)dst, (uint64_t)cc, 16);
+                check(cr == 9 && cn == 9 && cc[0] == 'h' && cc[8] == '\n', "R: copy_file_range from a volume fd copies exactly the file's 9 bytes");
+                syscall1(SYS_CLOSE, (uint64_t)dst);
+                syscall1(87, (uint64_t)"/hello114-copy"); /* unlink */
+            } else {
+                check(0, "R: copy_file_range from a volume fd copies exactly the file's 9 bytes");
+            }
+        }
+        /* a splice from a volume file into a pipe */
+        {
+            int32_t sp[2];
+            if (syscall1(22, (uint64_t)sp) == 0) {
+                syscall3(SYS_LSEEK, (uint64_t)rfd, 0, 0);
+                int64_t sr = syscall6(145 /* splice */, (uint64_t)rfd, 0, (uint64_t)sp[1], 0, 9, 0);
+                uint8_t sb2[16];
+                int64_t sn2 = sr > 0 ? syscall3(SYS_READ, (uint64_t)sp[0], (uint64_t)sb2, 16) : -1;
+                print("hello114:   info R: splice from a volume fd returned "); print_u64(sr < 0 ? (uint64_t)(-sr) : (uint64_t)sr); print(sr < 0 ? " (negative errno)\n" : "\n");
+                check(sr == 9 && sn2 == 9 && sb2[0] == 'h', "R: splice from a volume fd into a pipe copies the file's bytes");
+                syscall1(SYS_CLOSE, (uint64_t)sp[0]);
+                syscall1(SYS_CLOSE, (uint64_t)sp[1]);
+            }
+        }
+        syscall1(SYS_CLOSE, (uint64_t)rfd);
+        if (cfd >= 0) syscall1(SYS_CLOSE, (uint64_t)cfd);
+        syscall1(87, (uint64_t)"/hello114-canary"); /* unlink */
+        check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/r", 0) == 0, "R: umount");
     }
 
     /* Q: directory descriptors on a volume */

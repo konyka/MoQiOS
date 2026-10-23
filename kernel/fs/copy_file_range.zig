@@ -16,6 +16,11 @@ fn isRegularFile(fd_type: @import("vfs.zig").FdType) bool {
     };
 }
 
+/// A volume file can be copied FROM but, being read-only, never TO.
+fn isCopySource(fd_type: @import("vfs.zig").FdType) bool {
+    return isRegularFile(fd_type) or fd_type == .rofs_file;
+}
+
 /// copyFileRange(fd_in, off_in_ptr, fd_out, off_out_ptr, len) -> bytes copied or -errno.
 pub fn copyFileRange(fd_in: u32, off_in_ptr: u64, fd_out: u32, off_out_ptr: u64, len: u64) i64 {
     if (len == 0 or len > 0x7FFFFFFF) return EINVAL;
@@ -25,7 +30,7 @@ pub fn copyFileRange(fd_in: u32, off_in_ptr: u64, fd_out: u32, off_out_ptr: u64,
     // Validate untrusted fd numbers before indexing the descriptor array.
     if (fd_in >= cur.fd_table.fds.len or fd_out >= cur.fd_table.fds.len) return EBADF;
     if (cur.fd_table.fds[fd_in].fd_type == .none or cur.fd_table.fds[fd_out].fd_type == .none) return EBADF;
-    if (!isRegularFile(cur.fd_table.fds[fd_in].fd_type) or !isRegularFile(cur.fd_table.fds[fd_out].fd_type)) return EINVAL;
+    if (!isCopySource(cur.fd_table.fds[fd_in].fd_type) or !isRegularFile(cur.fd_table.fds[fd_out].fd_type)) return EINVAL;
 
     // Read optional offset pointers
     var off_in_val: u64 = 0;

@@ -123,6 +123,13 @@ fn isFileFd(ft: vfs.FdType) bool {
     return ft == .ramdisk_file or ft == .fat32_file or ft == .ext2_file;
 }
 
+/// A file that can be the SOURCE of sendfile / splice. A file on a mounted
+/// read-only volume qualifies as a source but, being read-only, never as the
+/// destination, so it is deliberately not part of isFileFd.
+fn isFileSource(ft: vfs.FdType) bool {
+    return isFileFd(ft) or ft == .rofs_file;
+}
+
 /// True if the fd type can be a sendfile output target (socket or pipe).
 fn isSendfileOutFd(ft: vfs.FdType) bool {
     return ft == .tcp_socket or ft == .pipe_write;
@@ -162,6 +169,15 @@ fn readFileAt(fd_table: *vfs.FdTable, fd: u32, offset: *u64, buf: [*]u8, count: 
             if (offset.* >= desc.file_size) return 0;
             const ext2 = @import("ext2.zig");
             const n = ext2.readFile(desc.ext2_file_idx, @intCast(offset.*), buf, @intCast(count));
+            if (n > 0) offset.* += @intCast(n);
+            return n;
+        },
+        .rofs_file => {
+            if (desc.rofs_is_dir) return -21; // EISDIR
+            if (offset.* >= desc.file_size) return 0;
+            const rofs = @import("rofs.zig");
+            const want: usize = @intCast(@min(@as(u64, count), desc.file_size - offset.*));
+            const n = rofs.readAt(desc.rofs_mount, desc.rofs_gen, desc.rofs_ref, offset.*, buf[0..want]);
             if (n > 0) offset.* += @intCast(n);
             return n;
         },
@@ -309,7 +325,7 @@ pub fn sysSendfile(out_fd: u32, in_fd: u32, offset_ptr: u64, count: u64) i64 {
     // Validate input fd — must be a seekable file
     if (!fdIsOpen(fd_table, in_fd) or !fdIsOpen(fd_table, out_fd)) return EBADF;
     const in_type = fdType(fd_table, in_fd);
-    if (!isFileFd(in_type)) return EINVAL;
+    if (!isFileSource(in_type)) return EINVAL;
 
     // Validate output fd — must be socket or pipe
     const out_type = fdType(fd_table, out_fd);
@@ -402,7 +418,7 @@ pub fn sysSplice(fd_in: u32, off_in: u64, fd_out: u32, off_out: u64, len: u64, f
     }
 
     // ── Case 2: file → pipe_write ────────────────────────────────────────
-    if (isFileFd(in_type) and out_type == .pipe_write) {
+    if (isFileSource(in_type) and out_type == .pipe_write) {
         if (len == 0) return 0;
         return spliceFileToPipe(fd_table, fd_in, off_in, fd_out, len, flags);
     }

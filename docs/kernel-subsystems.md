@@ -377,6 +377,12 @@ H1 再加 `shared` 字段记录 MAP_SHARED），不触碰页表；首次访问�
   因此符号链接、`..` 出卷、权限检查都沿用既有逻辑。取舍：fd 之上的各级目录会被重新做搜索权限检查，而
   Linux 信任 fd 不再检查；只读卷上权限不会在 fd 打开后变化，所以只有"打开目录后降权"的进程才会看到差异。
   非目录 fd 作 dirfd 返回 ENOTDIR；其它文件系统的 dirfd 处理不变；`openat2` 仍只接受 `AT_FDCWD`/0。
+- **按描述符的系统调用**：对卷内 fd，`write`/`pwrite`/`ftruncate`/`fchmod`/`fchown`/`fallocate` 都被拒绝，
+  `fsync` 返回 EINVAL（没有可同步的内容）。这些处理函数按描述符类型分派，而其它文件系统的描述符里
+  ext2/fat32/tmpfs 的下标字段默认是 0；若某个处理函数不检查类型，就会对别的文件系统里 0 号对象动手。
+  运行时在可写根盘上放一个"金丝雀"文件，对卷 fd 调用上述全部操作后断言金丝雀字节不变。
+  `sendfile`、`splice`（卷文件 → 管道）和 `copy_file_range`（源）可以读卷文件；卷文件不能做 `splice` /
+  `copy_file_range` / `sendfile` 的目标（只读）。
 - **已知限制**：mremap 文件区域仅支持原地增长/收缩（移动返回 ENOMEM）；
   MAP_SHARED 可写页与随后对同一 inode 的 `write()` 系统调用之间不做一致性保证
   （writeFile 会 invalidate 该 inode 的缓存页，未刷出的映射写入可能丢失——请先
@@ -1132,7 +1138,7 @@ const FdTable = struct {
   样适用；ext4 inode 的 uid/gid 由低 16 位与高 16 位合并；NTFS 不提供 xattr/ADS；卷内不能再挂载别的文件系统。
 - **验证**：host 测试（ext4 20、NTFS 19、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；含 bigalloc 镜像 `ext4_bigalloc.img`、statfs 数值与 `dumpe2fs` / `$Bitmap` popcount 交叉核对；真实
   `tools/fsfixtures/mkfixtures.sh` 生成的镜像，`debugfs` / `ntfsls` 交叉核对；含敌对超级块/
-  引导扇区/损坏 extent 树/fixup 撕裂）；`hello114` 运行时检查 180 项（含并发读，另有 NVMe 4 项、AHCI 4 项仅在手动提供镜像时运行）（另有 NVMe、AHCI 两段默认 skip）（SMP=1/2/8，MBR 与 GPT 两种
+  引导扇区/损坏 extent 树/fixup 撕裂）；`hello114` 运行时检查 195 项（含并发读，另有 NVMe 4 项、AHCI 4 项仅在手动提供镜像时运行）（另有 NVMe、AHCI 两段默认 skip）（SMP=1/2/8，MBR 与 GPT 两种
   数据盘镜像，`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`），变异验证——去掉 EROFS 守卫
   则 7 项失败，忽略挂载代数则过期 fd 检查失败，关掉挂载规则则 7 项失败，关掉 DAC 检查则 7
   项失败。NVMe（中断驱动）与 AHCI 上的真实挂载读取（I/J 段）需要手动提供带 ext4 的镜像

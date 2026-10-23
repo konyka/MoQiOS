@@ -3976,7 +3976,7 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   - 运行时争用测试（hello114 O 段）：5 个进程同时读同一文件并列目录，另一个被 `SIGKILL` 在读到一半时
     杀掉，之后卷仍可读、`umount` 成功（说明锁没有被遗留持有）。SMP=1/2/8 均通过。变异验证：把 `lock()`
     改成空操作，SMP=8 下 3 项 O 检查失败，SMP=2 下解析器共享状态被破坏、内核直接 `integer overflow`
-    停机。hello114 在加入 mmap 段前为 133 项检查，现为 180 项（mmap 段 25 项，目录描述符 Q 段 21 项）。
+    停机。hello114 在加入 mmap 段前为 133 项检查，现为 195 项（mmap 段 25 项，目录描述符 Q 段 21 项，按描述符调用 R 段 15 项）。
 - **第五轮自审：mmap**：
   - 卷内文件 `mmap` 返回 ENODEV（`mmap` 只认 ramdisk/tmpfs/ext2/fat32 四种 fd 类型），而这是用户对已挂载
     文件系统最先会做的事之一（动态链接器、`mmap` 读大文件）。先写运行时测试确认 RED（两项失败），再实现。
@@ -4020,8 +4020,26 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     （`openat` 的入口确实被改成经 `at_path`），也没有证据表明相关；没有抓到停滞现场，所以不下结论。
     历史上 §6.45/§6.47 记录过一类由宿主 `/tmp` 压力造成的伪停滞，但这次没有存储错误，不能据此归因。
     如再出现，用 `tools/gdb_stall_probe.sh` 抓现场。
+- **第八轮自审：按描述符的系统调用**：
+  - 担心的是类型串扰：卷 fd 的 ext2/fat32/tmpfs 下标默认为 0，处理函数若不检查描述符类型就会操作别的文件系统的
+    0 号对象。逐个读了 `ftruncate`/`fchmod`/`fchown`/`fallocate`/`fsync`，它们都按 `fd_type` 判断，卷 fd 被干净拒绝。
+    运行时验证：在可写根盘上放一个金丝雀文件，对卷 fd 做上述全部调用后金丝雀字节不变。
+  - 真实缺陷：`sendfile`/`splice`/`copy_file_range` 无法以卷文件为源（EINVAL），因为 `splice.zig::readFileAt` 与
+    `isFileFd`、`copy_file_range.zig::isRegularFile` 只列了 ramdisk/fat32/ext2/tmpfs。给 `readFileAt` 加 `rofs_file`
+    分支，新增 `isFileSource`（源可以是卷文件，目的地不行，所以没有直接放宽 `isFileFd`，它同时决定 splice 的输出端）
+    和 `isCopySource`。
+  - 测试自身的错误（运行前被自己发现）：我先后把 `splice` 写成 275（实为 `posix_fadvise`）、把
+    `copy_file_range` 写成 326（实为 `alarm`），导致那两项会拿垃圾参数去调用别的系统调用；对照分发表改为 145 和 184。
+  - 变异验证：去掉 `readFileAt` 的 `rofs_file` 分支 → sendfile/splice/copy_file_range 三项失败；让 `copy_file_range`
+    重新拒绝卷源 → 其对应一项失败。
+  - 测试里一次弱化被撤回（如实记录）：`copy_file_range` 的"拷贝内容"检查最初在真实（未变异）内核上失败，我一度把
+    它放宽成"前 9 字节匹配即可"。失败现象是：目标文件以 `O_RDWR|O_TRUNC` 打开、写入 9 字节后读回得到 16 字节。
+    **原因未查明**，至少有两种可能：(a) 该盘上 `O_TRUNC` 对已存在文件没有生效；(b) 同一文件当时还有另一个已打开、
+    带未刷写数据的描述符（金丝雀的 `cfd`），其暂存的写回数据在截断后仍被读回。没有为区分二者做实验。放宽检查会掩盖这一
+    现象，所以改为新建一个全新的目标文件、要求读回恰为源文件的 9 字节，并在用完后 `unlink`；这样检查的是 `copy_file_range`
+    本身，不依赖未查清的行为。这个现象本身（根盘 ext2 上"截断 + 另一描述符有暂存写"的读回）列入待查，与卷支持无关。
 - **验证**：host 测试 671/671（594→671：ext4 20、NTFS 19、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；锁守卫 1；virtio 索引守卫 1；
-  真实镜像、`debugfs`/`ntfsls` 交叉核对、敌对输入）；三架构构建；`hello114` 180 项运行时检查（含 25 项 mmap、21 项目录描述符检查）（NVMe/AHCI 两段默认 skip），MBR
+  真实镜像、`debugfs`/`ntfsls` 交叉核对、敌对输入）；三架构构建；`hello114` 195 项运行时检查（含 25 项 mmap、21 项目录描述符、15 项按描述符调用检查）（NVMe/AHCI 两段默认 skip），MBR
   默认镜像 SMP=1/2/8 通过，GPT 镜像（`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`）通过；
   变异验证（删 EROFS 守卫 → 7 项 FAIL；忽略挂载代数 → 过期 fd 项 FAIL；关掉挂载规则 → 7 项 FAIL；
   关掉 DAC 检查 → 7 项 FAIL；GPT 解析恒失败 → 43 项 FAIL；statfs 绕过卷路由 → 9 项 FAIL；access 绕过卷分支 → 9 项 FAIL；目录游标缓存恒未命中 → 1900 项目录列表 228865 ms 对 693 ms，时间预算检查 FAIL；睡眠锁：解锁不保持 held → 交接测试 FAIL，早醒不摘节点 → 竞态测试 FAIL；rofs_lock 改回自旋锁 → 源码守卫 FAIL）。
