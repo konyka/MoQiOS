@@ -835,7 +835,7 @@ pub const FdTable = struct {
         // target shadows same-named paths of the flat filesystems, as a
         // real mount does. The volumes are read-only: anything that would
         // create, truncate or write is refused before touching the volume.
-        if (rofsOpen(self, slot, name, flags, status)) |res| return res;
+        if (rofsOpen(self, slot, name, flags, status, .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override })) |res| return res;
 
         // /dev — devfs device nodes (fs/devfs.zig). Built-in nodes (null,
         // zero, full, random, urandom, kmsg, pci, tty, devfs-watch) are
@@ -1789,7 +1789,7 @@ pub const FdTable = struct {
     /// not under any rofs mount (the caller continues with the other
     /// filesystems); otherwise the fd or a negative errno, with `slot` already
     /// consumed or released.
-    fn rofsOpen(self: *FdTable, slot: u32, name: []const u8, flags: u32, status: u32) ?i64 {
+    fn rofsOpen(self: *FdTable, slot: u32, name: []const u8, flags: u32, status: u32, creds: @import("rofs.zig").Creds) ?i64 {
         var norm: [256]u8 = undefined;
         const path = normalizeAbs(name, &norm) orelse return null;
         const route = rofsRoute(path) orelse {
@@ -1805,7 +1805,7 @@ pub const FdTable = struct {
         const rofs = @import("rofs.zig");
         // O_NOFOLLOW (0x20000) opens a final symlink itself rather than its target.
         const follow = (flags & 0x20000) == 0;
-        const res = rofs.open(route.slot, route.rest, follow);
+        const res = rofs.open(route.slot, route.rest, follow, creds);
         switch (res) {
             .err => |e| {
                 self.freeFd(slot);
@@ -2233,35 +2233,15 @@ pub const MountPoint = struct {
 
 var mount_table: [MAX_MOUNTS]MountPoint = @splat(.{});
 
-/// Collapse "." / ".." / duplicate slashes of an absolute path into `out`.
-/// Returns null for relative paths (the flat filesystems keep resolving
-/// those themselves) or when the result does not fit.
+/// Guards mount_table. Routing takes it for the table walk only (a copy of
+/// the result leaves the lock), so it never nests around device I/O.
+var mount_lock: IrqSpinlock = .{};
+
+const mount_path = @import("mount_path_policy.zig");
+
+/// See mount_path_policy.normalizeAbs.
 pub fn normalizeAbs(path: []const u8, out: *[256]u8) ?[]const u8 {
-    if (path.len == 0 or path[0] != '/' or path.len > 255) return null;
-    var w: usize = 0;
-    var i: usize = 0;
-    while (i < path.len) {
-        while (i < path.len and path[i] == '/') i += 1;
-        if (i >= path.len) break;
-        const start = i;
-        while (i < path.len and path[i] != '/') i += 1;
-        const comp = path[start..i];
-        if (comp.len == 1 and comp[0] == '.') continue;
-        if (comp.len == 2 and comp[0] == '.' and comp[1] == '.') {
-            while (w > 0 and out[w - 1] != '/') w -= 1;
-            if (w > 0) w -= 1;
-            continue;
-        }
-        if (w + 1 + comp.len > 255) return null;
-        out[w] = '/';
-        @memcpy(out[w + 1 ..][0..comp.len], comp);
-        w += 1 + comp.len;
-    }
-    if (w == 0) {
-        out[0] = '/';
-        w = 1;
-    }
-    return out[0..w];
+    return mount_path.normalizeAbs(path, out);
 }
 
 /// A path that falls inside a mounted ext4/NTFS volume.
@@ -2274,36 +2254,18 @@ pub const RofsPath = struct {
 /// Longest-prefix match of `path` against active rofs mount targets.
 /// "/mnt" matches "/mnt", "/mnt/a/b" but not "/mntx".
 pub fn rofsRoute(path: []const u8) ?RofsPath {
+    const lf = mount_lock.acquire();
+    defer mount_lock.release(lf);
     var best: ?RofsPath = null;
     var best_len: usize = 0;
     for (&mount_table) |*mp| {
         if (!mp.active or mp.rofs_slot == 0xFF) continue;
         const t = mp.target[0..mp.target_len];
-        if (t.len == 0 or t.len < best_len) continue;
-        if (path.len < t.len or !std.mem.eql(u8, path[0..t.len], t)) continue;
-        var rest = path[t.len..];
-        if (t.len > 1) {
-            // must end on a component boundary
-            if (rest.len != 0 and rest[0] != '/') continue;
-        }
-        while (rest.len > 0 and rest[0] == '/') rest = rest[1..];
-        best = .{ .slot = mp.rofs_slot, .rest = rest };
+        if (t.len < best_len or !mount_path.under(path, t)) continue;
+        best = .{ .slot = mp.rofs_slot, .rest = mount_path.rest(path, t) };
         best_len = t.len;
     }
     return best;
-}
-
-/// True when `path` is a mount point itself or an ancestor of one, so the
-/// directory exists even though no backing filesystem names it.
-pub fn rofsIsMountAncestor(path: []const u8) bool {
-    for (&mount_table) |*mp| {
-        if (!mp.active or mp.rofs_slot == 0xFF) continue;
-        const t = mp.target[0..mp.target_len];
-        if (t.len < path.len) continue;
-        if (!std.mem.eql(u8, t[0..path.len], path)) continue;
-        if (t.len == path.len or path.len == 0 or t[path.len] == '/' or path[path.len - 1] == '/') return true;
-    }
-    return false;
 }
 
 fn rofsKindForType(fs_type: []const u8) ?@import("rofs.zig").FsKind {
@@ -2313,22 +2275,76 @@ fn rofsKindForType(fs_type: []const u8) ?@import("rofs.zig").FsKind {
     return null;
 }
 
+/// Highest partition number accepted in a "<dev>p<N>" source name. GPT can
+/// hold 128 entries; MBR is limited to four primaries.
+const MAX_PART_NUM: u32 = 128;
+
+/// Locate partition `num` (1-based) of `dev`. Tries GPT first (a protective
+/// MBR in sector 0 plus a CRC-valid header), then classic MBR primaries.
+fn rofsPartitionWindow(dev: u8, total_sectors: u64, num: u32) ?struct { base: u64, len: u64 } {
+    const gpt = @import("gpt.zig");
+    const fat = @import("fat32_util.zig");
+    const block_dev = @import("../drivers/block_dev.zig");
+    const pmm = @import("../mm/pmm.zig");
+    const hhdm = @import("../mm/hhdm.zig");
+
+    // Header + up to 128 × 128-byte entries = 33 sectors from LBA 1 (LBA 2..33
+    // hold the array): read sectors 0..33 into one DMA-safe page pair.
+    const pages: usize = 5; // 34 sectors = 17408 bytes
+    const phys = pmm.allocContiguous(pages) orelse return null;
+    defer pmm.freeContiguous(phys, pages);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+
+    var got: u32 = 0;
+    while (got < 34) {
+        const n: u32 = @min(@as(u32, 8), 34 - got);
+        if (block_dev.readSectors(dev, got, n, buf + @as(usize, got) * 512) != 0) return null;
+        got += n;
+    }
+
+    const sec0: *const [512]u8 = @ptrCast(buf);
+    if (gpt.isProtectiveMbr(sec0)) {
+        const sec1: *const [512]u8 = @ptrCast(buf + 512);
+        if (gpt.parseHeader(sec1, total_sectors)) |h| {
+            // The entry array may be longer than what was read; only the
+            // common 128×128 layout fits, anything else is refused (never guessed).
+            const need = h.arrayBytes();
+            if (h.entries_lba != 2 or need > 32 * 512) return null;
+            const array = buf[2 * 512 ..][0..@as(usize, @intCast(need))];
+            if (!gpt.arrayCrcOk(h, array)) return null;
+            const p = gpt.entryAt(h, array, num - 1, total_sectors) orelse return null;
+            return .{ .base = p.first_lba * 512, .len = p.sectors * 512 };
+        } else |_| {
+            // A protective MBR with no usable GPT behind it: do not fall back
+            // to reading its single 0xEE entry as a real partition.
+            return null;
+        }
+    }
+
+    if (num > fat.MAX_PARTITIONS) return null;
+    if (sec0[510] != 0x55 or sec0[511] != 0xAA) return null;
+    const p = fat.parsePartition(sec0, num - 1) orelse return null;
+    const base = @as(u64, p.lba_start) * 512;
+    const len = @as(u64, p.sector_count) * 512;
+    if (base >= total_sectors * 512 or len > total_sectors * 512 - base) return null;
+    return .{ .base = base, .len = len };
+}
+
 /// Resolve a "source" such as "/dev/vblk1" or "/dev/vblk1p2" to a block
 /// device plus the byte window of the volume on it.
 fn rofsResolveSource(source: []const u8) ?struct { dev: u8, base: u64, len: u64 } {
     const block_dev = @import("../drivers/block_dev.zig");
-    const fat = @import("fat32_util.zig");
     var name = source;
     if (name.len >= 5 and std.mem.eql(u8, name[0..5], "/dev/")) name = name[5..];
     if (name.len == 0) return null;
 
-    // Optional trailing "p<N>" partition suffix (N = 1..4, MBR primary).
+    // Optional trailing "p<N>" partition suffix.
     var part: u32 = 0;
     var dev_name = name;
     if (std.mem.lastIndexOfScalar(u8, name, 'p')) |pi| {
         if (pi > 0 and pi + 1 < name.len) {
             const num = std.fmt.parseInt(u32, name[pi + 1 ..], 10) catch 0;
-            if (num >= 1 and num <= fat.MAX_PARTITIONS and block_dev.findByName(name[0..pi]) != null) {
+            if (num >= 1 and num <= MAX_PART_NUM and block_dev.findByName(name[0..pi]) != null) {
                 part = num;
                 dev_name = name[0..pi];
             }
@@ -2336,29 +2352,23 @@ fn rofsResolveSource(source: []const u8) ?struct { dev: u8, base: u64, len: u64 
     }
     const dev = block_dev.findByName(dev_name) orelse return null;
     const info = block_dev.getDeviceInfo(dev) orelse return null;
-    const total = info.total_sectors * 512;
-    if (part == 0) return .{ .dev = dev, .base = 0, .len = total };
-
-    var sec0: [512]u8 align(8) = undefined;
-    const pmm = @import("../mm/pmm.zig");
-    const hhdm = @import("../mm/hhdm.zig");
-    const page = pmm.allocPage() orelse return null;
-    defer pmm.freePage(page);
-    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(page));
-    if (block_dev.readSectors(dev, 0, 1, buf) != 0) return null;
-    @memcpy(&sec0, buf[0..512]);
-    if (sec0[510] != 0x55 or sec0[511] != 0xAA) return null;
-    const p = fat.parsePartition(&sec0, part - 1) orelse return null;
-    const base = @as(u64, p.lba_start) * 512;
-    const len = @as(u64, p.sector_count) * 512;
-    if (base >= total or len > total - base) return null;
-    return .{ .dev = dev, .base = base, .len = len };
+    const total = info.total_sectors;
+    if (part == 0) return .{ .dev = dev, .base = 0, .len = total * 512 };
+    const w = rofsPartitionWindow(dev, total, part) orelse return null;
+    return .{ .dev = dev, .base = w.base, .len = w.len };
 }
 
 /// mount(source, target, fs_type, flags) -> 0 or -errno
 pub fn mountFs(source: []const u8, target: []const u8, fs_type: []const u8, flags: u64) i64 {
     if (target.len == 0) return -22; // -EINVAL
     if (target.len > 128 or source.len > 64 or fs_type.len > 16) return -36; // -ENAMETOOLONG
+
+    // One mount/umount at a time: slot choice, the overlap check and the
+    // device mount below must be atomic with respect to each other. The
+    // lock is held across rofs.mountVolume's device reads; routing waits on
+    // it briefly, which only delays path lookups during a (rare) mount.
+    const mount_flags = mount_lock.acquire();
+    defer mount_lock.release(mount_flags);
 
     // Find free slot
     var slot: ?u32 = null;
@@ -2376,12 +2386,26 @@ pub fn mountFs(source: []const u8, target: []const u8, fs_type: []const u8, flag
     // ext4/ext3/ntfs: a real block-device mount, read-only. Do this before
     // recording the mount so a failure leaves the table untouched.
     var rofs_slot: u8 = 0xFF;
+    var mount_target: []const u8 = target;
+    var norm_buf: [256]u8 = undefined;
     if (rofsKindForType(fs_type)) |kind| {
-        if (target[0] != '/' or std.mem.indexOf(u8, target, "..") != null) return -22;
-        // Targets must be unique: stacking mounts is not modelled.
-        for (&mount_table) |*other| {
-            if (other.active and other.rofs_slot != 0xFF and eqlStr(other.target[0..other.target_len], target)) return -16; // EBUSY
+        // The target is stored normalised, so "/mnt//e/" and "/mnt/e" are one
+        // mount point and ".." cannot hide a target inside a built-in tree.
+        const norm_target = normalizeAbs(target, &norm_buf) orelse return -22;
+        switch (mount_path.checkTarget(norm_target)) {
+            .ok => {},
+            .too_long => return -36,
+            .not_absolute => return -22,
+            // "/" and the trees that have their own filesystem would be
+            // shadowed by a read-only volume.
+            .is_root, .reserved => return -16, // EBUSY
         }
+        // Stacking mounts is not modelled: no target may equal or nest with another.
+        for (&mount_table) |*other| {
+            if (!other.active or other.rofs_slot == 0xFF) continue;
+            if (mount_path.overlaps(other.target[0..other.target_len], norm_target)) return -16; // EBUSY
+        }
+        mount_target = norm_target;
         const win = rofsResolveSource(source) orelse return -19; // ENODEV
         const rofs = @import("rofs.zig");
         rofs_slot = rofs.mountVolume(win.dev, win.base, win.len, kind) catch |e| return switch (e) {
@@ -2401,8 +2425,8 @@ pub fn mountFs(source: []const u8, target: []const u8, fs_type: []const u8, flag
 
     // Copy target
     @memset(&mp.target, 0);
-    for (0..target.len) |j| mp.target[j] = target[j];
-    mp.target_len = @intCast(target.len);
+    for (0..mount_target.len) |j| mp.target[j] = mount_target[j];
+    mp.target_len = @intCast(mount_target.len);
 
     // Copy fs_type
     @memset(&mp.fs_type, 0);
@@ -2452,11 +2476,15 @@ pub fn mountFs(source: []const u8, target: []const u8, fs_type: []const u8, flag
 pub fn umountFs(target: []const u8, mflags: u32) i64 {
     _ = mflags;
     if (target.len == 0) return -22; // -EINVAL
+    const umount_flags = mount_lock.acquire();
+    defer mount_lock.release(umount_flags);
 
+    var umount_buf: [256]u8 = undefined;
+    const want = normalizeAbs(target, &umount_buf) orelse target;
     for (&mount_table) |*mp| {
         if (!mp.active) continue;
         const t = mp.target[0..mp.target_len];
-        if (eqlStr(t, target)) {
+        if (eqlStr(t, target) or eqlStr(t, want)) {
             serial.writeString("[vfs] umount: ");
             serial.writeString(target);
             serial.writeString("\n");

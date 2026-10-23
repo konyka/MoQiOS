@@ -16,7 +16,7 @@
 const std = @import("std");
 const fr = @import("fs_reader.zig");
 
-pub const Error = error{ Io, Corrupt, Unsupported, NotFound, NotDir, IsDir, Loop, NameTooLong, Invalid };
+pub const Error = error{ Io, Corrupt, Unsupported, NotFound, NotDir, IsDir, Loop, NameTooLong, Invalid, Access };
 
 pub const ROOT_INO: u32 = 2;
 
@@ -495,7 +495,14 @@ pub const Volume = struct {
         return n;
     }
 
-    fn walk(self: *const Volume, start: u32, path: []const u8, depth: u8, follow_last: bool) Error!u32 {
+    /// Optional policy hook for path resolution: called with every directory the
+    /// walk is about to search; returning false aborts with error.Access.
+    pub const SearchCheck = struct {
+        ctx: *anyopaque,
+        allow: *const fn (ctx: *anyopaque, st: fr.Stat) bool,
+    };
+
+    fn walk(self: *const Volume, start: u32, path: []const u8, depth: u8, follow_last: bool, check: ?SearchCheck) Error!u32 {
         if (depth > MAX_SYMLINK_DEPTH) return error.Loop;
         var cur = start;
         var rest = path;
@@ -512,6 +519,7 @@ pub const Volume = struct {
 
             const dir = try self.readInode(cur);
             if (!dir.isDir()) return error.NotDir;
+            if (check) |c| if (!c.allow(c.ctx, self.stat(&dir))) return error.Access;
             const ino = try self.lookup(&dir, comp);
             const child = try self.readInode(ino);
             if (child.isLnk() and (!last or follow_last)) {
@@ -519,7 +527,7 @@ pub const Volume = struct {
                 const n = try self.readLink(&child, &link);
                 // Absolute targets are resolved against this volume's root.
                 const base: u32 = if (n > 0 and link[0] == '/') ROOT_INO else cur;
-                cur = try self.walk(base, link[0..n], depth + 1, true);
+                cur = try self.walk(base, link[0..n], depth + 1, true, check);
                 continue;
             }
             cur = ino;
@@ -528,6 +536,11 @@ pub const Volume = struct {
 
     /// Resolve a path (relative to the volume root) to an inode number.
     pub fn resolve(self: *const Volume, path: []const u8, follow_last: bool) Error!u32 {
-        return self.walk(ROOT_INO, path, 0, follow_last);
+        return self.walk(ROOT_INO, path, 0, follow_last, null);
+    }
+
+    /// resolve() that asks `check` for permission to search each directory.
+    pub fn resolveChecked(self: *const Volume, path: []const u8, follow_last: bool, check: SearchCheck) Error!u32 {
+        return self.walk(ROOT_INO, path, 0, follow_last, check);
     }
 };

@@ -244,3 +244,69 @@ test "a corrupt extent tree is reported, not followed" {
     in2.iblock[6] = 99; // depth beyond the limit
     try std.testing.expectError(error.Corrupt, v.mapBlock(&in2, 0));
 }
+
+const DenyCtx = struct { denied_ino: u64, calls: usize = 0 };
+fn denyOne(ctx: *anyopaque, st: fr.Stat) bool {
+    const c: *DenyCtx = @ptrCast(@alignCast(ctx));
+    c.calls += 1;
+    return st.ino != c.denied_ino;
+}
+
+test "a search check can veto any directory on the path" {
+    var img = try Image.open(images[0]);
+    defer img.close();
+    const v = try ext4.Volume.mount(img.reader());
+    const dir_ino = try v.resolve("/dir", true);
+    var ctx: DenyCtx = .{ .denied_ino = dir_ino };
+    const chk: ext4.Volume.SearchCheck = .{ .ctx = &ctx, .allow = denyOne };
+    // the root is searchable, /dir is not: reaching anything inside it is refused
+    try std.testing.expectError(error.Access, v.resolveChecked("/dir/sub/n.txt", true, chk));
+    try std.testing.expectError(error.Access, v.resolveChecked("/dir/file_1.txt", true, chk));
+    // the directory itself can still be named (only searching INSIDE it is vetoed)
+    try std.testing.expectEqual(dir_ino, try v.resolveChecked("/dir", true, chk));
+    // paths that never enter it are unaffected
+    _ = try v.resolveChecked("/small.txt", true, chk);
+    // the check really ran for each traversed directory
+    try std.testing.expect(ctx.calls >= 3);
+}
+
+const access = kt.rofs_access_policy;
+
+fn metaOf(st: fr.Stat) access.Meta {
+    return .{ .mode = st.mode, .uid = st.uid, .gid = st.gid };
+}
+
+fn canOpen(v: *const ext4.Volume, p: []const u8, who: access.Creds) !bool {
+    const Sc = struct {
+        creds: access.Creds,
+        fn allow(ctx: *anyopaque, st: fr.Stat) bool {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            return access.canSearch(metaOf(st), s.creds);
+        }
+    };
+    var sc: Sc = .{ .creds = who };
+    const ino = v.resolveChecked(p, true, .{ .ctx = &sc, .allow = Sc.allow }) catch |e| switch (e) {
+        error.Access => return false,
+        else => return e,
+    };
+    const in = try v.readInode(ino);
+    return access.allows(metaOf(v.stat(&in)), who, access.R);
+}
+
+test "permission matrix on the real fixture (owner 1000, others 4242)" {
+    var img = try Image.open(images[0]);
+    defer img.close();
+    const v = try ext4.Volume.mount(img.reader());
+    const me: access.Creds = .{ .euid = 1000, .egid = 1000 };
+    const root_c: access.Creds = .{ .euid = 0, .egid = 0 };
+    try std.testing.expect(try canOpen(&v, "/perm/world.txt", me));
+    try std.testing.expect(!try canOpen(&v, "/perm/private.txt", me));
+    try std.testing.expect(!try canOpen(&v, "/perm/group.txt", me));
+    try std.testing.expect(try canOpen(&v, "/perm/mine_open.txt", me));
+    try std.testing.expect(!try canOpen(&v, "/perm/mine_closed.txt", me)); // owner class 000
+    try std.testing.expect(!try canOpen(&v, "/perm/locked/inside.txt", me));
+    try std.testing.expect(!try canOpen(&v, "/perm/listonly/inside.txt", me));
+    // root reads everything (these files have no execute bit; read needs none)
+    try std.testing.expect(try canOpen(&v, "/perm/private.txt", root_c));
+    try std.testing.expect(try canOpen(&v, "/perm/locked/inside.txt", root_c));
+}

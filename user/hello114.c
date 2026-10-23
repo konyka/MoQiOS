@@ -11,6 +11,11 @@
 ///   F. dup'd and forked descriptors read valid data
 ///   G. umount: an open fd fails afterwards, a reused slot never leaks data
 ///   H. error cases: bad device, wrong type, double mount, missing file
+///   I/J. (only when the scratch NVMe / SATA disk holds an ext4 volume)
+///   L. permissions: the process runs as uid/gid 1000; files owned by 4242 are
+///      checked against their other-class bits, the owner's own against the owner class
+///   K. mount-point rules: '/', /dev, /proc, /tmp, nested and '..'-disguised
+///      targets are refused; equivalent spellings name one mount
 
 #include <stdint.h>
 
@@ -64,6 +69,7 @@ static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 
 #define EROFS   30
 #define ENOENT  2
+#define EACCES  13
 #define ENODEV  19
 #define EINVAL  22
 #define EBUSY   16
@@ -145,6 +151,15 @@ static int list_dir(const char *path, int *has_sub, int *numbered, int *total, i
     }
     syscall1(SYS_CLOSE, (uint64_t)fd);
     return 0;
+}
+
+/* Mount `src` at `target` and expect `want`. If the mount unexpectedly
+ * succeeds it is undone, so one wrongly accepted mount cannot keep the
+ * partition busy and make every later refusal pass for the wrong reason. */
+static int mount_expect(const char *src, const char *target, const char *type, int64_t want) {
+    int64_t r = syscall4(SYS_MOUNT, (uint64_t)src, (uint64_t)target, (uint64_t)type, 0);
+    if (r == 0 && want != 0) syscall2(SYS_UMOUNT2, (uint64_t)target, 0);
+    return r == want;
 }
 
 struct kstat_t { uint64_t w[18]; };   /* matches the 144-byte struct stat layout */
@@ -302,6 +317,77 @@ void _start(void) {
     check(n == 9, "G: the remounted volume works");
     check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/again", 0) == 0, "G: final umount");
     check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/again", 0) < 0, "G: umount of a non-mount fails");
+
+    /* K: mount-point rules */
+    check(mount_expect("/dev/vblk1p1", "/", "ext4", -EBUSY), "K: mounting over / is refused");
+    check(mount_expect("/dev/vblk1p1", "/dev", "ext4", -EBUSY), "K: mounting over /dev is refused");
+    check(mount_expect("/dev/vblk1p1", "/proc/x", "ext4", -EBUSY), "K: mounting inside /proc is refused");
+    check(mount_expect("/dev/vblk1p1", "/tmp", "ext4", -EBUSY), "K: mounting over /tmp is refused");
+    check(mount_expect("/dev/vblk1p1", "/mnt/../dev", "ext4", -EBUSY), "K: '..' cannot smuggle a target into /dev");
+    check(mount_expect("/dev/vblk1p1", "mnt/rel", "ext4", -EINVAL), "K: a relative target is EINVAL");
+    check(mount_expect("/dev/vblk1p1", "//mnt///k1/", "ext4", 0), "K: a sloppy spelling mounts");
+    check(mount_expect("/dev/vblk1p2", "/mnt/k1", "ntfs", -EBUSY), "K: the normalised target is taken (same mount point)");
+    check(mount_expect("/dev/vblk1p2", "/mnt/k1/sub", "ntfs", -EBUSY), "K: nesting inside a mount is refused");
+    check(mount_expect("/dev/vblk1p2", "/mnt", "ntfs", -EBUSY), "K: mounting above an existing mount is refused");
+    n = slurp("/mnt/./k1/../k1/small.txt", small, sizeof(small));
+    check(n == 9, "K: a path with . and .. reaches the mount");
+    check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/x/../k1/", 0) == 0, "K: umount accepts an equivalent spelling");
+    check(syscall2(SYS_OPEN, (uint64_t)"/mnt/k1/small.txt", O_RDONLY) < 0, "K: the volume is gone after umount");
+
+    /* L: permissions. The process is uid/gid 1000 and unprivileged. */
+    check(syscall4(SYS_MOUNT, (uint64_t)"/dev/vblk1p1", (uint64_t)"/mnt/p", (uint64_t)"ext4", 0) == 0, "L: mount for the permission checks");
+    check(syscall2(SYS_OPEN, (uint64_t)"/mnt/p/perm/world.txt", O_RDONLY) >= 0, "L: world-readable file owned by someone else opens");
+    check(syscall2(SYS_OPEN, (uint64_t)"/mnt/p/perm/private.txt", O_RDONLY) == -EACCES, "L: mode 0600 owned by another user is EACCES");
+    check(syscall2(SYS_OPEN, (uint64_t)"/mnt/p/perm/group.txt", O_RDONLY) == -EACCES, "L: mode 0640 of another user/group is EACCES");
+    check(slurp("/mnt/p/perm/mine_open.txt", small, sizeof(small)) == 18, "L: my own 0600 file reads");
+    check(syscall2(SYS_OPEN, (uint64_t)"/mnt/p/perm/mine_closed.txt", O_RDONLY) == -EACCES, "L: owner class 000 beats a readable other class");
+    check(syscall2(SYS_OPEN, (uint64_t)"/mnt/p/perm/locked", O_RDONLY) == -EACCES, "L: a 0700 directory of another user cannot be listed");
+    check(syscall2(SYS_OPEN, (uint64_t)"/mnt/p/perm/locked/inside.txt", O_RDONLY) == -EACCES, "L: nor searched");
+    check(syscall2(SYS_OPEN, (uint64_t)"/mnt/p/perm/listonly/inside.txt", O_RDONLY) == -EACCES, "L: a list-only directory (0744) cannot be searched");
+    fd = syscall2(SYS_OPEN, (uint64_t)"/mnt/p/perm/listonly", O_RDONLY);
+    check(fd >= 0, "L: ...but it can be opened to list");
+    syscall1(SYS_CLOSE, (uint64_t)fd);
+    check(syscall1(SYS_CHDIR, (uint64_t)"/mnt/p/perm/locked") == -EACCES, "L: chdir into a closed directory is EACCES");
+    check(syscall3(SYS_READLINK, (uint64_t)"/mnt/p/link", (uint64_t)link, 63) == 9, "L: a symlink's own mode never blocks readlink");
+    check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/p", 0) == 0, "L: umount");
+
+    /* I: a volume on the NVMe controller (its read path sleeps until the
+     * completion interrupt, unlike virtio-blk's polling). The smoke gives
+     * nvme0 the ext4 fixture; without it the mount is EINVAL and we skip. */
+    {
+        int64_t mr = syscall4(SYS_MOUNT, (uint64_t)"/dev/nvme0", (uint64_t)"/mnt/nv", (uint64_t)"ext4", 0);
+        if (mr == -EINVAL) {
+            print("hello114:   skip I: nvme0 holds no ext4 volume\n");
+        } else {
+            check(mr == 0, "I: mount ext4 from /dev/nvme0");
+            if (mr == 0) {
+                n = slurp("/mnt/nv/small.txt", small, sizeof(small));
+                check(n == 9 && small[0] == 'h', "I: read a file through the NVMe read path");
+                n = slurp("/mnt/nv/big.bin", big, sizeof(big));
+                ok = (n == 300000);
+                for (int64_t i = 0; ok && i < 300000; i++) if (big[i] != big_byte((uint64_t)i)) ok = 0;
+                check(ok, "I: 300000 bytes through NVMe match");
+                check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/nv", 0) == 0, "I: umount nvme0 volume");
+            }
+        }
+    }
+
+    /* J: the same through the AHCI/SATA driver (non-NCQ polling or NCQ). */
+    {
+        int64_t mr = syscall4(SYS_MOUNT, (uint64_t)"/dev/sda", (uint64_t)"/mnt/sa", (uint64_t)"ext4", 0);
+        if (mr == -EINVAL) {
+            print("hello114:   skip J: sda holds no ext4 volume\n");
+        } else {
+            check(mr == 0, "J: mount ext4 from /dev/sda");
+            if (mr == 0) {
+                n = slurp("/mnt/sa/big.bin", big, sizeof(big));
+                ok = (n == 300000);
+                for (int64_t i = 0; ok && i < 300000; i++) if (big[i] != big_byte((uint64_t)i)) ok = 0;
+                check(ok, "J: 300000 bytes through AHCI match");
+                check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/sa", 0) == 0, "J: umount sda volume");
+            }
+        }
+    }
 
     print(failures == 0 ? "hello114: PASS\n" : "hello114: FAIL\n");
     print("hello114 done\n");

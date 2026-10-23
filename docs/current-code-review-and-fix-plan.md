@@ -3917,21 +3917,37 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   - **测试自身的问题**：测试程序缺 `cap_sys_mount`（所有挂载 EPERM，补进 `capability_profile`）；
     稀疏文件缓冲区 310000 字节小于 24×16384+5003 = 398347；`dup` 在本内核复制描述符、不共享
     offset，断言从"共享 offset"改为"读到有效数据"，行为差异在文档中记录。
-- **验证**：host 测试 616/616（594→616，新增 ext4 11、NTFS 10、EROFS 守卫表 1；真实镜像、`debugfs`/
-  `ntfsls` 交叉核对、敌对输入）；三架构构建；`hello114` 64 项运行时检查，SMP=1/2 通过；
-  变异验证（删 EROFS 守卫 → 7 项 FAIL；忽略挂载代数 → 过期 fd 项 FAIL）；5 轮双核压测；
-  SMP=8 × 8 全部通过（见 Gate 表）。
+- **自审发现并修正的问题（首版提交之后）**：
+  - 挂载目标未规范化，可挂到 `/`、`/dev`、`/proc` 等位置遮蔽设备节点；嵌套/重复目标也被接受。
+    现由 `fs/mount_path_policy.zig` 规范化并拒绝（EBUSY），umount 接受等价拼写。
+  - `mount_table` 无锁，mount/umount 与 `rofsRoute` 并发有竞态。现加 `mount_lock`（IrqSpinlock）。
+  - 无调用者的死代码 `rofsIsMountAncestor` 已删除。
+  - 读路径没有任何 DAC：任何用户可读 0600 属他人的文件。现 open 时对路径每级目录检查 x、对目标检查 r
+    （`fs/rofs_access_policy.zig`，ext4/NTFS 解析器新增 `SearchCheck` 回调与 `Error.Access`）。
+    NTFS 无 POSIX 权限信息，固定 0o555/0o444、uid 0，故恒允许读取。
+  - 只认 MBR。现支持 GPT（`fs/gpt.zig`，保护性 MBR + 头/条目数组 CRC32 校验；保护性 MBR 无有效
+    GPT 时拒绝而不回退 MBR）。
+  - NVMe（中断驱动）与 AHCI 上的真实块设备 I/O 路径此前没有验证。已手动在两者上挂载 ext4 并读
+    300000 字节通过；**默认 smoke 中 I/J 段是 skip**，需 `MOQI_SMOKE_NVME_IMG` /
+    `MOQI_SMOKE_AHCI_IMG` 指向含 ext4 的镜像才会运行（AHCI 还需临时关闭占用 `/dev/sda` 做 swap
+    的 hello96/98/99/100/101）。
+- **验证**：host 测试 635/635（594→635：ext4 13、NTFS 11、GPT 5、挂载路径 5、DAC 6、EROFS 守卫表 1；
+  真实镜像、`debugfs`/`ntfsls` 交叉核对、敌对输入）；三架构构建；`hello114` 90 项运行时检查，MBR
+  默认镜像 SMP=1/2/8 通过，GPT 镜像（`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`）通过；
+  变异验证（删 EROFS 守卫 → 7 项 FAIL；忽略挂载代数 → 过期 fd 项 FAIL；关掉挂载规则 → 7 项 FAIL；
+  关掉 DAC 检查 → 7 项 FAIL；GPT 解析恒失败 → 43 项 FAIL）。
 - **未做 / 已知限制**：写入（ext4 与 NTFS）；ext4 日志回放；元数据校验和验证；NTFS
-  压缩/加密/$ATTRIBUTE_LIST/$UpCase 大小写折叠；GPT 分区表（只认 MBR 主分区）；卷内再挂载；
-  `statfs`；VFS 仍是"扁平命名 + 前缀路由"而非通用挂载树，挂载点祖先目录（如 `/mnt`）本身
-  不会作为目录出现在 `getdents("/")` 中；ext4/NTFS 读路径未做 DAC 权限检查。
+  压缩/加密/$ATTRIBUTE_LIST/$UpCase 大小写折叠；GPT 备份表不使用且仅支持主表在 LBA 2、≤32 扇区
+  的布局；DAC 不跟踪补充组；卷内再挂载；`statfs`；VFS 仍是"扁平命名 + 前缀路由"而非通用挂载树，
+  挂载点祖先目录（如 `/mnt`）本身不会作为目录出现在 `getdents("/")` 中。
 
 | Gate | Result | Notes |
 |---|---|---|
-| `zig build test`（0.16.0） | Passed 616/616 | 594→616：ext4 11、NTFS 10、EROFS 守卫表 1 |
+| `zig build test`（0.16.0） | Passed 635/635 | 594→635 |
 | `zig build` / riscv64 / aarch64 | Passed | 三架构 |
-| smoke SMP=1 / SMP=2 / `smoke-smp-stress`（5 轮） | Passed | 含 hello114 |
-| smoke SMP=8 × 8 | Passed 8/8 | 每轮 hello114 PASS，第二块 virtio 盘在 8 核下无挂起 |
+| smoke SMP=1 / 2 / 8（MBR 数据盘） | Passed | hello114 PASS，90 项 ok；I/J 段默认 skip |
+| smoke SMP=1 / 2 / 8（GPT 数据盘） | Passed | SMP=1/2/8 均 PASS；GPT 变异（`isProtectiveMbr` 恒 false）→ 43 项 FAIL |
+| `smoke-smp-stress` | Passed 5/5 | 双核连续 5 轮 |
 
 ---
 

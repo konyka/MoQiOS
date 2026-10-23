@@ -22,7 +22,7 @@
 const std = @import("std");
 const fr = @import("fs_reader.zig");
 
-pub const Error = error{ Io, Corrupt, Unsupported, NotFound, NotDir, IsDir, Loop, NameTooLong, Invalid };
+pub const Error = error{ Io, Corrupt, Unsupported, NotFound, NotDir, IsDir, Loop, NameTooLong, Invalid, Access };
 
 pub const ROOT_REF: u64 = 5;
 
@@ -754,7 +754,12 @@ pub const Volume = struct {
         return error.Corrupt;
     }
 
-    fn walk(self: *const Volume, start: u64, path: []const u8, depth: u8, follow_last: bool) Error!u64 {
+    pub const SearchCheck = struct {
+        ctx: *anyopaque,
+        allow: *const fn (ctx: *anyopaque, st: fr.Stat) bool,
+    };
+
+    fn walk(self: *const Volume, start: u64, path: []const u8, depth: u8, follow_last: bool, check: ?SearchCheck) Error!u64 {
         if (depth > MAX_SYMLINK_DEPTH) return error.Loop;
         var cur = start;
         var rest = path;
@@ -774,13 +779,14 @@ pub const Volume = struct {
             }
             const dir = try self.readFile(cur);
             if (!dir.is_dir) return error.NotDir;
+            if (check) |c| if (!c.allow(c.ctx, stat(&dir))) return error.Access;
             const child = try self.lookup(cur, comp);
             const cf = try self.readFile(child);
             if (fileKind(&cf) == .symlink and (!last or follow_last)) {
                 var link: [512]u8 = undefined;
                 const n = try self.readLink(child, &link);
                 const base: u64 = if (n > 0 and link[0] == '/') ROOT_REF else cur;
-                cur = try self.walk(base, link[0..n], depth + 1, true);
+                cur = try self.walk(base, link[0..n], depth + 1, true, check);
                 continue;
             }
             cur = child;
@@ -788,7 +794,11 @@ pub const Volume = struct {
     }
 
     pub fn resolve(self: *const Volume, path: []const u8, follow_last: bool) Error!u64 {
-        return self.walk(ROOT_REF, path, 0, follow_last);
+        return self.walk(ROOT_REF, path, 0, follow_last, null);
+    }
+
+    pub fn resolveChecked(self: *const Volume, path: []const u8, follow_last: bool, check: SearchCheck) Error!u64 {
+        return self.walk(ROOT_REF, path, 0, follow_last, check);
     }
 };
 

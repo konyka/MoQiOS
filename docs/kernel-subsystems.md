@@ -1045,9 +1045,22 @@ const FdTable = struct {
   `mkntfs` 镜像做测试。`rofs.zig` 是内核胶水：挂载表（4 槽）、每挂载 16×4 KiB 直接映射页
   缓存、一把 `rofs_lock` 串行化全部操作（只读 + 小卷，锁内做设备 I/O 可接受）。
 - **挂载**：`mount(source, target, "ext4"|"ext3"|"ntfs"|"ntfs3", flags)`，`source` 为
-  `/dev/<块设备名>[p<1-4>]`（`vblk1`、`vblk1p2`；MBR 主分区），`target` 为绝对路径。始终
-  只读（flags 强制置 `MS_RDONLY`）。同一设备+起点不能重复挂载（EBUSY）；类型与内容不符
-  返回 EINVAL，设备/分区不存在 ENODEV。第二块 virtio-blk 盘注册为 `vblk1`。
+  `/dev/<块设备名>[p<N>]`（`vblk1`、`vblk1p2`、`nvme0`、`sda`）。分区表先试 **GPT**
+  （`fs/gpt.zig`：保护性 MBR + 头部 CRC32 + 条目数组 CRC32，仅接受主表在 LBA 2、数组 ≤32 扇区的
+  布局，最多 128 个分区；备份表不使用），保护性 MBR 后若没有有效 GPT 则**拒绝**而不退回 MBR；
+  否则按 MBR 主分区 1-4 解析。始终只读（flags 强制置 `MS_RDONLY`）。同一设备+起点不能重复
+  挂载（EBUSY）；类型与内容不符返回 EINVAL，设备/分区不存在 ENODEV。第二块 virtio-blk 盘注册
+  为 `vblk1`。
+- **挂载目标规则**（`fs/mount_path_policy.zig`，纯函数，host 测试）：`target` 必须是绝对
+  路径并先做规范化（`//`、`.`、`..` 折叠，存储的是规范形式，`umount` 接受等价拼写）；拒绝
+  `/`、`/dev`、`/proc`、`/tmp`、`/sys` 及其子路径（EBUSY，否则卷会遮蔽设备节点/内核伪文件系统）；
+  与已有挂载相同或嵌套（任一方向）同样 EBUSY；相对路径 EINVAL。挂载表由 `mount_lock`
+  保护，`rofsRoute`、mount、umount 都在锁内。
+- **权限（DAC）**（`fs/rofs_access_policy.zig`）：open 时对路径上**每一级目录**要求搜索（x）
+  权限，对目标要求读（r）权限（符号链接自身不检查，目标照常检查）；owner/group/other 只匹配
+  其中一类，root 与 `cap_dac_override` 绕过读写检查但不绕过"没有任何 x 位"的目录/文件；
+  不跟踪补充组。目录列表（getdents）的权限由 open 时的读权限覆盖。**NTFS 没有 POSIX 权限
+  信息，内核报告固定的 0o555/0o444、uid 0，因此 NTFS 上 DAC 实际恒允许读取。**
 - **路径路由**：`vfs.rofsRoute` 对绝对路径做最长前缀匹配（按路径分量边界，`/mnt` 不匹配
   `/mntx`）；相对路径在 `openWithMode` 里用任务 cwd 拼接后再路由（cwd 在卷内时）。
   `chdir` 到卷内目标必须存在且是目录。
@@ -1077,12 +1090,16 @@ const FdTable = struct {
   压缩/加密数据、靠 $ATTRIBUTE_LIST 跨扩展记录的文件。根目录会列出 `$MFT`、`$Bitmap` 等
   系统文件（它们是真实的目录项）。$LogFile 被忽略，未干净卸载的卷按原样读取。
 - **已知限制**：dup 在本内核复制描述符（各自 offset），与 POSIX 共享 offset 不同，对 rofs 同
-  样适用；ext4 / NTFS 用户权限位按文件上的 mode / 固定 0444 报告，读取路径未做 DAC 检查；
+  样适用；ext4 inode 的 uid/gid 取低 16 位并合并高位字段；
   不提供 `statfs`；NTFS 不提供 xattr/ADS；卷内不能再挂载别的文件系统。
-- **验证**：host 测试 22 个（ext4 11、NTFS 10、EROFS 守卫表 1；真实 `tools/fsfixtures/mkfixtures.sh` 生成的镜像，`debugfs` /
-  `ntfsls` 交叉核对；含敌对超级块/引导扇区/损坏 extent 树/fixup 撕裂）；`hello114`
-  64 项运行时检查（SMP=1/2/8），并经变异验证——去掉 EROFS 守卫则 7 项失败，忽略挂载代数则
-  过期 fd 检查失败。
+- **验证**：host 测试（ext4 13、NTFS 11、GPT 5、挂载路径 5、DAC 6、EROFS 守卫表 1；真实
+  `tools/fsfixtures/mkfixtures.sh` 生成的镜像，`debugfs` / `ntfsls` 交叉核对；含敌对超级块/
+  引导扇区/损坏 extent 树/fixup 撕裂）；`hello114` 运行时检查 90 项（SMP=1/2/8，MBR 与 GPT 两种
+  数据盘镜像，`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`），变异验证——去掉 EROFS 守卫
+  则 7 项失败，忽略挂载代数则过期 fd 检查失败，关掉挂载规则则 7 项失败，关掉 DAC 检查则 7
+  项失败。NVMe（中断驱动）与 AHCI 上的真实挂载读取（I/J 段）需要手动提供带 ext4 的镜像
+  （`MOQI_SMOKE_NVME_IMG`、`MOQI_SMOKE_AHCI_IMG`），**默认 smoke 中这两段是 skip**；手动运行时
+  两者均读取 300000 字节通过。
 
 **/dev 设备节点**：全部由 devfs 注册表提供（见 3.8），`open` 的 `/dev/` 分支
 查表分发到节点 ops；未注册名字返回 `-ENOENT`。

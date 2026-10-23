@@ -19,7 +19,7 @@ const serial = @import("../arch/arch.zig").serial;
 const block_dev = @import("../drivers/block_dev.zig");
 const pmm = @import("../mm/pmm.zig");
 const hhdm = @import("../mm/hhdm.zig");
-const mbr = @import("fat32_util.zig");
+const access = @import("rofs_access_policy.zig");
 
 pub const MAX_MOUNTS: usize = 4;
 const SECTOR: u64 = 512;
@@ -29,6 +29,7 @@ const PAGE: u64 = 4096;
 pub const FsKind = enum(u8) { none = 0, ext4 = 1, ntfs = 2 };
 
 pub const Error = ext4.Error;
+pub const Creds = access.Creds;
 
 const CachePage = struct {
     valid: bool = false,
@@ -254,6 +255,7 @@ fn mapErr(e: anyerror) i64 {
         error.IsDir => -21, // EISDIR
         error.Loop => -40, // ELOOP
         error.NameTooLong => -36, // ENAMETOOLONG
+        error.Access => -13, // EACCES
         error.Unsupported => -95, // EOPNOTSUPP
         error.Io => -5,
         else => -5, // EIO: Corrupt, Invalid
@@ -275,19 +277,36 @@ fn statOf(m: *Mount, ref: Ref) anyerror!Opened {
     }
 }
 
-/// Resolve `path` (relative to the volume root). Negative errno on failure.
-pub fn open(slot: u8, path: []const u8, follow: bool) union(enum) { ok: Opened, err: i64 } {
+fn metaOf(st: fr.Stat) access.Meta {
+    return .{ .mode = st.mode, .uid = st.uid, .gid = st.gid };
+}
+
+const SearchCtx = struct { creds: Creds };
+
+fn mayTraverse(ctx: *anyopaque, st: fr.Stat) bool {
+    const c: *SearchCtx = @ptrCast(@alignCast(ctx));
+    return access.canSearch(metaOf(st), c.creds);
+}
+
+/// Resolve `path` (relative to the volume root) for a caller with `creds`.
+/// Every directory on the way must be searchable; a regular file must be
+/// readable and a directory listable (the access an O_RDONLY open implies).
+/// Negative errno on failure.
+pub fn open(slot: u8, path: []const u8, follow: bool, creds: Creds) union(enum) { ok: Opened, err: i64 } {
     if (slot >= MAX_MOUNTS) return .{ .err = -19 };
     const flags = rofs_lock.acquire();
     defer rofs_lock.release(flags);
     const m = &mounts[slot];
     if (!m.active) return .{ .err = -19 };
+    var sc: SearchCtx = .{ .creds = creds };
     const ref: Ref = switch (m.kind) {
-        .ext4 => m.ext4_vol.resolve(path, follow) catch |e| return .{ .err = mapErr(e) },
-        .ntfs => m.ntfs_vol.resolve(path, follow) catch |e| return .{ .err = mapErr(e) },
+        .ext4 => m.ext4_vol.resolveChecked(path, follow, .{ .ctx = &sc, .allow = mayTraverse }) catch |e| return .{ .err = mapErr(e) },
+        .ntfs => m.ntfs_vol.resolveChecked(path, follow, .{ .ctx = &sc, .allow = mayTraverse }) catch |e| return .{ .err = mapErr(e) },
         .none => return .{ .err = -19 },
     };
     const o = statOf(m, ref) catch |e| return .{ .err = mapErr(e) };
+    // A symlink's own permissions are never checked (they are always 0777).
+    if (o.kind != .symlink and !access.allows(metaOf(o.stat), creds, access.R)) return .{ .err = -13 };
     return .{ .ok = o };
 }
 

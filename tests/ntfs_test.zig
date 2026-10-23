@@ -244,3 +244,23 @@ test "hostile boot sectors and fixups are rejected, never crash" {
     const rd: fr.Reader = .{ .ctx = &p, .read_fn = Patch.read };
     try std.testing.expectError(error.Corrupt, ntfs.Volume.mount(rd, &scratch));
 }
+
+const NDeny = struct { calls: usize = 0, deny_all: bool = false };
+fn ntfsCheck(ctx: *anyopaque, st: fr.Stat) bool {
+    _ = st;
+    const c: *NDeny = @ptrCast(@alignCast(ctx));
+    c.calls += 1;
+    return !c.deny_all;
+}
+
+test "a search check vetoes NTFS lookups too" {
+    var img = try Image.open(path);
+    defer img.close();
+    const v = try mountImage(&img);
+    var ctx: NDeny = .{};
+    const chk: ntfs.Volume.SearchCheck = .{ .ctx = &ctx, .allow = ntfsCheck };
+    _ = try v.resolveChecked("/small.txt", true, chk);
+    try std.testing.expect(ctx.calls >= 1);
+    ctx.deny_all = true;
+    try std.testing.expectError(error.Access, v.resolveChecked("/small.txt", true, chk));
+}

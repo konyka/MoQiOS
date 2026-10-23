@@ -66,7 +66,9 @@ pub fn readlink(path_ptr: u64, buf_ptr: u64, bufsiz: u64) i64 {
         if (vfs_mod.normalizeAbs(path, &norm)) |abs| {
             if (vfs_mod.rofsRoute(abs)) |route| {
                 const rofs = @import("rofs.zig");
-                switch (rofs.open(route.slot, route.rest, false)) {
+                const cur_task = sched_mod.currentTask();
+                const creds: rofs.Creds = if (cur_task) |ct| .{ .euid = ct.euid, .egid = ct.egid, .cap_dac_override = ct.effective_caps.cap_dac_override } else .{ .euid = 0, .egid = 0 };
+                switch (rofs.open(route.slot, route.rest, false, creds)) {
                     .err => |e| return e,
                     .ok => |o| {
                         if (o.kind != .symlink) return -22; // EINVAL: not a symlink
