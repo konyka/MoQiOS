@@ -40,3 +40,25 @@ test "aligned segment and empty file part" {
     try std.testing.expectEqual(@as(?p.Window, null), p.window(0x2001000, 0x2000000, 100));
     try std.testing.expectEqual(@as(?p.Window, null), p.window(0x2000000, 0x2000000, 0));
 }
+
+const guard = @import("kernel_shared").rofs_guard_policy;
+
+test "rofs guard table names every path operand of the mutating syscalls" {
+    const rename = guard.lookup(82).?;
+    try std.testing.expectEqual(@as(u8, 0), rename.a);
+    try std.testing.expectEqual(@as(u8, 1), rename.b);
+    // symlink: only the link path (arg 1) is created, the target is plain data
+    const sym = guard.lookup(88).?;
+    try std.testing.expectEqual(@as(u8, 1), sym.a);
+    try std.testing.expectEqual(guard.NONE, sym.b);
+    // renameat2: oldpath in rsi, newpath in r10
+    const r2 = guard.lookup(261).?;
+    try std.testing.expectEqual(@as(u8, 1), r2.a);
+    try std.testing.expectEqual(@as(u8, 3), r2.b);
+    try std.testing.expectEqual(@as(?guard.Entry, null), guard.lookup(0));
+    try std.testing.expectEqual(@as(?guard.Entry, null), guard.lookup(10)); // read
+    // every entry is unique
+    for (guard.table, 0..) |e, i| {
+        for (guard.table[i + 1 ..]) |f| try std.testing.expect(e.nr != f.nr);
+    }
+}

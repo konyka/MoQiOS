@@ -57,6 +57,25 @@ pub fn fstat(fd: u64, stat_ptr: u64) i64 {
     const size: i64 = @intCast(fdesc.file_size);
     bo.writeI64Le(stat_buf[48..56], size);
 
+    if (fdesc.fd_type == .rofs_file) {
+        const rofs = @import("rofs.zig");
+        switch (rofs.statRef(fdesc.rofs_mount, fdesc.rofs_gen, fdesc.rofs_ref)) {
+            .err => |e| return e,
+            .ok => |o| {
+                bo.writeU64Le(stat_buf[8..16], o.stat.ino);
+                bo.writeU64Le(stat_buf[16..24], o.stat.nlink);
+                bo.writeU32Le(stat_buf[24..28], o.stat.mode);
+                bo.writeU32Le(stat_buf[28..32], o.stat.uid);
+                bo.writeU32Le(stat_buf[32..36], o.stat.gid);
+                bo.writeU64Le(stat_buf[48..56], o.stat.size);
+                bo.writeU64Le(stat_buf[56..64], 4096);
+                bo.writeU64Le(stat_buf[64..72], o.stat.blocks);
+                bo.writeU64Le(stat_buf[72..80], o.stat.atime);
+                bo.writeU64Le(stat_buf[88..96], o.stat.mtime);
+                bo.writeU64Le(stat_buf[104..112], o.stat.ctime);
+            },
+        }
+    }
     if (fdesc.fd_type == .fat32_file) {
         const fat32 = @import("fat32.zig");
         const mtime = fat32.getMtime(fdesc.fat32_file_idx);

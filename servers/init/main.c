@@ -233,6 +233,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello111"); /* kill(2) permission/probe/group, SIGCHLD, SIG_IGN auto-reap */
     run_test("hello112"); /* sigaltstack delivery, undeliverable signal -> SIGSEGV */
     run_test("hello113"); /* SysV IPC / poll hardening */
+    run_test("hello114"); /* read-only ext4 / NTFS volumes on the 2nd virtio disk */
 
     start_persistent_services();
 

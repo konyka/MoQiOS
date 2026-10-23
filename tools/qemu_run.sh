@@ -49,7 +49,7 @@ USER_PROGRAMS=(
     hello2 hello3 hello4 hello5 hello6 hello7 hello8 sh
     hello9 hello10 hello11 hello12 hello13 hello14 hello15 hello16
     hello17 hello18 hello19 hello20 hello21 hello22 hello23 hello24
-    hello25 hello26 hello27 hello28 hello29 hello30 hello31 hello32 hello33 hello34 hello35 hello36 hello37 hello38 hello39 hello40 hello41 hello42 hello43 hello44 hello45 hello46 hello47 hello48 hello49 hello50 hello51 hello52 hello53 hello54 hello56 hello57 hello58 hello59 hello60 hello61 hello62 hello63 hello64 hello65 hello66 hello67 hello68 hello69 hello70 hello71 hello72 hello73 hello74 hello75 hello76 hello77 hello78 hello79 hello80 hello81 hello82 hello83 hello84 hello85 hello86 hello87 hello88 hello89 hello90 hello91 hello92 hello93 hello94 hello95 hello96 hello97 hello98 hello99 hello100 hello101 hello102 hello103 hello104 hello105 hello106 hello107 hello108 hello109 hello110 hello111 hello112 hello113 syslogd devmgr
+    hello25 hello26 hello27 hello28 hello29 hello30 hello31 hello32 hello33 hello34 hello35 hello36 hello37 hello38 hello39 hello40 hello41 hello42 hello43 hello44 hello45 hello46 hello47 hello48 hello49 hello50 hello51 hello52 hello53 hello54 hello56 hello57 hello58 hello59 hello60 hello61 hello62 hello63 hello64 hello65 hello66 hello67 hello68 hello69 hello70 hello71 hello72 hello73 hello74 hello75 hello76 hello77 hello78 hello79 hello80 hello81 hello82 hello83 hello84 hello85 hello86 hello87 hello88 hello89 hello90 hello91 hello92 hello93 hello94 hello95 hello96 hello97 hello98 hello99 hello100 hello101 hello102 hello103 hello104 hello105 hello106 hello107 hello108 hello109 hello110 hello111 hello112 hello113 hello114 syslogd devmgr
 )
 for program in "${USER_PROGRAMS[@]}"; do
     src="$USER_SRC_DIR/${program}.bin"
@@ -111,6 +111,8 @@ echo "========================================="
 #   MOQI_CPU         QEMU CPU model (default: qemu64,+smep,+umip,+smap — the kernel
 #                    enables SMEP/UMIP/SMAP whenever CPUID reports them)
 #   MOQI_DISK        raw disk image path (default: disk.img)
+#   MOQI_DATA_DISK   attach the read-only ext4/NTFS data disk when != 0 (default: 1)
+#   MOQI_DATA_IMG    data disk image path (default: tests/fixtures/fs/datadisk.img)
 #   MOQI_NVME        attach an NVMe controller when != 0 (default: 1)
 #   MOQI_NVME_IMG    NVMe scratch image path (default: nvme.img); created and
 #                    pattern-stamped automatically when NVMe is enabled
@@ -139,6 +141,16 @@ fi
 if ! [[ "$SMP_COUNT" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: MOQI_SMP must be a positive decimal integer (got '$SMP_COUNT')."
     exit 2
+fi
+
+# Optional second virtio-blk disk carrying read-only ext4/NTFS test volumes
+# (tests/fixtures/fs/datadisk.img). Attached read-only so a kernel bug can
+# never damage the fixture. The kernel exposes it as "vblk1".
+DATA_ARGS=()
+DATA_IMAGE="${MOQI_DATA_IMG:-tests/fixtures/fs/datadisk.img}"
+if [ "${MOQI_DATA_DISK:-1}" != "0" ] && [ -f "$DATA_IMAGE" ]; then
+    DATA_ARGS=(-drive file="$DATA_IMAGE",format=raw,if=none,id=disk1,readonly=on
+        -device virtio-blk-pci,drive=disk1)
 fi
 
 # Optional NVMe controller (scratch image; the virtio-blk disk above stays
@@ -184,6 +196,7 @@ exec qemu-system-x86_64 \
     -device virtio-blk-pci,drive=disk0 \
     "${NVME_ARGS[@]}" \
     "${AHCI_ARGS[@]}" \
+    "${DATA_ARGS[@]}" \
     -netdev user,id=net0 \
     -device e1000,netdev=net0 \
     -smp "$SMP_COUNT" \

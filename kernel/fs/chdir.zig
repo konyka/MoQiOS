@@ -30,6 +30,14 @@ pub fn chdir(path_ptr: u64) i64 {
     var out_buf: [256]u8 = undefined;
     const write_pos = chdir_policy.resolve(cur.cwd[0..cur.cwd_len], path_buf[0..path_len], &out_buf) catch return -36; // ENAMETOOLONG
 
+    // A target inside a mounted ext4/NTFS volume must exist and be a directory.
+    if (vfs_mod.rofsRoute(out_buf[0..write_pos])) |route| {
+        switch (@import("rofs.zig").open(route.slot, route.rest, true)) {
+            .err => |e| return e,
+            .ok => |o| if (o.kind != .directory) return -20, // ENOTDIR
+        }
+    }
+
     @memcpy(cur.cwd[0..write_pos], out_buf[0..write_pos]);
     cur.cwd[write_pos] = 0;
     cur.cwd_len = @intCast(write_pos);

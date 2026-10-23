@@ -58,6 +58,10 @@ pub const FdType = enum(u8) {
     /// devfs_ctrl_idx selects the proxy node. Read dequeues requests,
     /// write completes them; close kills the node.
     devfs_ctrl = 21,
+    /// Read-only ext4/NTFS volume object (fs/rofs.zig): rofs_mount selects
+    /// the mount, rofs_gen is the mount generation it was opened under, and
+    /// rofs_ref the inode / MFT record number.
+    rofs_file = 22,
 };
 
 pub const PIPE_BUF_SIZE: u32 = 4096;
@@ -483,6 +487,10 @@ pub const FileDescriptor = struct {
     file_data: u64 = 0,
     fat32_file_idx: u32 = 0,
     ext2_file_idx: u32 = 0,
+    rofs_mount: u8 = 0,
+    rofs_gen: u32 = 0,
+    rofs_ref: u64 = 0,
+    rofs_is_dir: bool = false,
     pipe_idx: u32 = 0,
     tcb_idx: u32 = 0,
     epoll_idx: u32 = 0,
@@ -823,6 +831,12 @@ pub const FdTable = struct {
         // Status flags visible via F_GETFL: access mode + O_APPEND + O_NONBLOCK.
         const status = flags & (0x03 | 0x400 | 0x800);
 
+        // Mounted ext4/NTFS volumes (fs/rofs.zig). Checked first so a mount
+        // target shadows same-named paths of the flat filesystems, as a
+        // real mount does. The volumes are read-only: anything that would
+        // create, truncate or write is refused before touching the volume.
+        if (rofsOpen(self, slot, name, flags, status)) |res| return res;
+
         // /dev — devfs device nodes (fs/devfs.zig). Built-in nodes (null,
         // zero, full, random, urandom, kmsg, pci, tty, devfs-watch) are
         // registered at kernel init; userspace-owned nodes (devfs_proxy,
@@ -1153,6 +1167,15 @@ pub const FdTable = struct {
                 }
                 return n;
             },
+            .rofs_file => {
+                if (desc.rofs_is_dir) return -21; // EISDIR
+                if (desc.offset >= desc.file_size) return 0;
+                const rofs = @import("rofs.zig");
+                const want = @min(count, @as(usize, @intCast(@min(desc.file_size - desc.offset, 0x7FFF_FFFF))));
+                const n = rofs.readAt(desc.rofs_mount, desc.rofs_gen, desc.rofs_ref, desc.offset, buf[0..want]);
+                if (n > 0) desc.offset += @intCast(n);
+                return n;
+            },
             .ext2_file => {
                 const ext2 = @import("ext2.zig");
                 // Refresh the cached size: another fd may have grown the file
@@ -1334,6 +1357,7 @@ pub const FdTable = struct {
                 return n;
             },
             .ramdisk_file => return -1,
+            .rofs_file => return -30, // EROFS
             .ext2_file => {
                 if (!desc.writable) return -1;
                 if ((desc.status_flags & 0x400) != 0) desc.offset = desc.file_size;
@@ -1436,6 +1460,13 @@ pub const FdTable = struct {
                 const n = fat32.readFile(desc.fat32_file_idx, @intCast(offset), buf, @intCast(count));
                 return n;
             },
+            .rofs_file => {
+                if (desc.rofs_is_dir) return -21; // EISDIR
+                if (offset >= desc.file_size) return 0;
+                const rofs = @import("rofs.zig");
+                const want = @min(count, @as(usize, @intCast(@min(desc.file_size - offset, 0x7FFF_FFFF))));
+                return rofs.readAt(desc.rofs_mount, desc.rofs_gen, desc.rofs_ref, offset, buf[0..want]);
+            },
             .ext2_file => {
                 const ext2 = @import("ext2.zig");
                 // Same max-of-sizes rule as read(): never let the stale
@@ -1511,6 +1542,7 @@ pub const FdTable = struct {
                 if (n > 0) @import("fat32.zig").touchModified(desc.fat32_file_idx);
                 return n;
             },
+            .rofs_file => return -30, // EROFS
             .ext2_file => {
                 if (!desc.writable) return -9; // EBADF
                 const gate = fsizeGate(offset, count);
@@ -1751,6 +1783,53 @@ pub const FdTable = struct {
         self.fds[write_fd] = .{ .fd_type = .pipe_write, .pipe_idx = pipe_idx, .writable = true };
         self.publishFd(write_fd);
         return @as(i64, read_fd) | (@as(i64, write_fd) << 16);
+    }
+
+    /// Open `name` on a mounted rofs volume. Returns null when the path is
+    /// not under any rofs mount (the caller continues with the other
+    /// filesystems); otherwise the fd or a negative errno, with `slot` already
+    /// consumed or released.
+    fn rofsOpen(self: *FdTable, slot: u32, name: []const u8, flags: u32, status: u32) ?i64 {
+        var norm: [256]u8 = undefined;
+        const path = normalizeAbs(name, &norm) orelse return null;
+        const route = rofsRoute(path) orelse {
+            // A mount point's ancestors (e.g. "/" -> "/mnt") are not backed
+            // by the volume; let the other filesystems answer for them.
+            return null;
+        };
+        // Read-only: no write access, creation or truncation.
+        if ((flags & 0x03) != 0 or (flags & (0x40 | 0x200)) != 0) {
+            self.freeFd(slot);
+            return -30; // EROFS
+        }
+        const rofs = @import("rofs.zig");
+        // O_NOFOLLOW (0x20000) opens a final symlink itself rather than its target.
+        const follow = (flags & 0x20000) == 0;
+        const res = rofs.open(route.slot, route.rest, follow);
+        switch (res) {
+            .err => |e| {
+                self.freeFd(slot);
+                return e;
+            },
+            .ok => |o| {
+                self.fds[slot] = .{
+                    .fd_type = .rofs_file,
+                    .offset = 0,
+                    .file_size = o.stat.size,
+                    .rofs_mount = route.slot,
+                    .rofs_gen = o.gen,
+                    .rofs_ref = o.ref,
+                    .rofs_is_dir = o.kind == .directory,
+                    .writable = false,
+                    .status_flags = status,
+                    // mount slot in the high bits keeps ids distinct from the
+                    // per-filesystem prefixes used by locks and the page cache
+                    .inode_id = 0x5000_0000_0000_0000 + (@as(u64, route.slot) << 40) + (o.ref & 0xFF_FFFF_FFFF),
+                };
+                self.publishFd(slot);
+                return @intCast(slot);
+            },
+        }
     }
 
     /// Duplicate fd: dup2(oldfd, newfd). Returns newfd on success or -errno.
@@ -2148,9 +2227,133 @@ pub const MountPoint = struct {
     fs_type_len: u32 = 0,
     /// Mount flags (MS_RDONLY=1, MS_NOSUID=2, etc.)
     flags: u64 = 0,
+    /// Slot in fs/rofs.zig when this is an ext4/ntfs volume mount.
+    rofs_slot: u8 = 0xFF,
 };
 
 var mount_table: [MAX_MOUNTS]MountPoint = @splat(.{});
+
+/// Collapse "." / ".." / duplicate slashes of an absolute path into `out`.
+/// Returns null for relative paths (the flat filesystems keep resolving
+/// those themselves) or when the result does not fit.
+pub fn normalizeAbs(path: []const u8, out: *[256]u8) ?[]const u8 {
+    if (path.len == 0 or path[0] != '/' or path.len > 255) return null;
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < path.len) {
+        while (i < path.len and path[i] == '/') i += 1;
+        if (i >= path.len) break;
+        const start = i;
+        while (i < path.len and path[i] != '/') i += 1;
+        const comp = path[start..i];
+        if (comp.len == 1 and comp[0] == '.') continue;
+        if (comp.len == 2 and comp[0] == '.' and comp[1] == '.') {
+            while (w > 0 and out[w - 1] != '/') w -= 1;
+            if (w > 0) w -= 1;
+            continue;
+        }
+        if (w + 1 + comp.len > 255) return null;
+        out[w] = '/';
+        @memcpy(out[w + 1 ..][0..comp.len], comp);
+        w += 1 + comp.len;
+    }
+    if (w == 0) {
+        out[0] = '/';
+        w = 1;
+    }
+    return out[0..w];
+}
+
+/// A path that falls inside a mounted ext4/NTFS volume.
+pub const RofsPath = struct {
+    slot: u8,
+    /// Path inside the volume, relative to its root (no leading slash).
+    rest: []const u8,
+};
+
+/// Longest-prefix match of `path` against active rofs mount targets.
+/// "/mnt" matches "/mnt", "/mnt/a/b" but not "/mntx".
+pub fn rofsRoute(path: []const u8) ?RofsPath {
+    var best: ?RofsPath = null;
+    var best_len: usize = 0;
+    for (&mount_table) |*mp| {
+        if (!mp.active or mp.rofs_slot == 0xFF) continue;
+        const t = mp.target[0..mp.target_len];
+        if (t.len == 0 or t.len < best_len) continue;
+        if (path.len < t.len or !std.mem.eql(u8, path[0..t.len], t)) continue;
+        var rest = path[t.len..];
+        if (t.len > 1) {
+            // must end on a component boundary
+            if (rest.len != 0 and rest[0] != '/') continue;
+        }
+        while (rest.len > 0 and rest[0] == '/') rest = rest[1..];
+        best = .{ .slot = mp.rofs_slot, .rest = rest };
+        best_len = t.len;
+    }
+    return best;
+}
+
+/// True when `path` is a mount point itself or an ancestor of one, so the
+/// directory exists even though no backing filesystem names it.
+pub fn rofsIsMountAncestor(path: []const u8) bool {
+    for (&mount_table) |*mp| {
+        if (!mp.active or mp.rofs_slot == 0xFF) continue;
+        const t = mp.target[0..mp.target_len];
+        if (t.len < path.len) continue;
+        if (!std.mem.eql(u8, t[0..path.len], path)) continue;
+        if (t.len == path.len or path.len == 0 or t[path.len] == '/' or path[path.len - 1] == '/') return true;
+    }
+    return false;
+}
+
+fn rofsKindForType(fs_type: []const u8) ?@import("rofs.zig").FsKind {
+    const rofs = @import("rofs.zig");
+    if (eqlStr(fs_type, "ext4") or eqlStr(fs_type, "ext3") or eqlStr(fs_type, "ext2r")) return rofs.FsKind.ext4;
+    if (eqlStr(fs_type, "ntfs") or eqlStr(fs_type, "ntfs3")) return rofs.FsKind.ntfs;
+    return null;
+}
+
+/// Resolve a "source" such as "/dev/vblk1" or "/dev/vblk1p2" to a block
+/// device plus the byte window of the volume on it.
+fn rofsResolveSource(source: []const u8) ?struct { dev: u8, base: u64, len: u64 } {
+    const block_dev = @import("../drivers/block_dev.zig");
+    const fat = @import("fat32_util.zig");
+    var name = source;
+    if (name.len >= 5 and std.mem.eql(u8, name[0..5], "/dev/")) name = name[5..];
+    if (name.len == 0) return null;
+
+    // Optional trailing "p<N>" partition suffix (N = 1..4, MBR primary).
+    var part: u32 = 0;
+    var dev_name = name;
+    if (std.mem.lastIndexOfScalar(u8, name, 'p')) |pi| {
+        if (pi > 0 and pi + 1 < name.len) {
+            const num = std.fmt.parseInt(u32, name[pi + 1 ..], 10) catch 0;
+            if (num >= 1 and num <= fat.MAX_PARTITIONS and block_dev.findByName(name[0..pi]) != null) {
+                part = num;
+                dev_name = name[0..pi];
+            }
+        }
+    }
+    const dev = block_dev.findByName(dev_name) orelse return null;
+    const info = block_dev.getDeviceInfo(dev) orelse return null;
+    const total = info.total_sectors * 512;
+    if (part == 0) return .{ .dev = dev, .base = 0, .len = total };
+
+    var sec0: [512]u8 align(8) = undefined;
+    const pmm = @import("../mm/pmm.zig");
+    const hhdm = @import("../mm/hhdm.zig");
+    const page = pmm.allocPage() orelse return null;
+    defer pmm.freePage(page);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(page));
+    if (block_dev.readSectors(dev, 0, 1, buf) != 0) return null;
+    @memcpy(&sec0, buf[0..512]);
+    if (sec0[510] != 0x55 or sec0[511] != 0xAA) return null;
+    const p = fat.parsePartition(&sec0, part - 1) orelse return null;
+    const base = @as(u64, p.lba_start) * 512;
+    const len = @as(u64, p.sector_count) * 512;
+    if (base >= total or len > total - base) return null;
+    return .{ .dev = dev, .base = base, .len = len };
+}
 
 /// mount(source, target, fs_type, flags) -> 0 or -errno
 pub fn mountFs(source: []const u8, target: []const u8, fs_type: []const u8, flags: u64) i64 {
@@ -2170,6 +2373,27 @@ pub fn mountFs(source: []const u8, target: []const u8, fs_type: []const u8, flag
     const idx = slot.?;
     var mp = &mount_table[idx];
 
+    // ext4/ext3/ntfs: a real block-device mount, read-only. Do this before
+    // recording the mount so a failure leaves the table untouched.
+    var rofs_slot: u8 = 0xFF;
+    if (rofsKindForType(fs_type)) |kind| {
+        if (target[0] != '/' or std.mem.indexOf(u8, target, "..") != null) return -22;
+        // Targets must be unique: stacking mounts is not modelled.
+        for (&mount_table) |*other| {
+            if (other.active and other.rofs_slot != 0xFF and eqlStr(other.target[0..other.target_len], target)) return -16; // EBUSY
+        }
+        const win = rofsResolveSource(source) orelse return -19; // ENODEV
+        const rofs = @import("rofs.zig");
+        rofs_slot = rofs.mountVolume(win.dev, win.base, win.len, kind) catch |e| return switch (e) {
+            error.NoDevice => -19,
+            error.BadFs => -22, // not a valid filesystem of that type
+            error.NoSlot => -28,
+            error.Busy => -16,
+            error.NoMemory => -12,
+            error.Range => -22,
+        };
+    }
+
     // Copy source
     @memset(&mp.source, 0);
     for (0..source.len) |j| mp.source[j] = source[j];
@@ -2185,11 +2409,15 @@ pub fn mountFs(source: []const u8, target: []const u8, fs_type: []const u8, flag
     for (0..fs_type.len) |j| mp.fs_type[j] = fs_type[j];
     mp.fs_type_len = @intCast(fs_type.len);
 
-    mp.flags = flags;
+    // Volumes of these types are always mounted read-only.
+    mp.flags = if (rofs_slot != 0xFF) flags | 1 else flags;
+    mp.rofs_slot = rofs_slot;
     mp.active = true;
 
     // Initialize filesystem based on type
-    if (eqlStr(fs_type, "tmpfs")) {
+    if (rofs_slot != 0xFF) {
+        // already mounted above
+    } else if (eqlStr(fs_type, "tmpfs")) {
         const tmpfs = @import("tmpfs.zig");
         tmpfs.init();
     } else if (eqlStr(fs_type, "ext2")) {
@@ -2217,6 +2445,10 @@ pub fn mountFs(source: []const u8, target: []const u8, fs_type: []const u8, flag
 }
 
 /// umount(target, flags) -> 0 or -errno
+///
+/// Open descriptors on the volume are not pinned: they carry the mount
+/// generation, so after unmount they fail with ENODEV instead of reading a
+/// different volume that reuses the slot.
 pub fn umountFs(target: []const u8, mflags: u32) i64 {
     _ = mflags;
     if (target.len == 0) return -22; // -EINVAL
@@ -2228,6 +2460,9 @@ pub fn umountFs(target: []const u8, mflags: u32) i64 {
             serial.writeString("[vfs] umount: ");
             serial.writeString(target);
             serial.writeString("\n");
+            if (mp.rofs_slot != 0xFF) {
+                @import("rofs.zig").umountVolume(mp.rofs_slot) catch {};
+            }
             mp.* = .{};
             return 0;
         }

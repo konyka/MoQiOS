@@ -5,6 +5,7 @@ const serial = @import("../arch/arch.zig").serial;
 const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const copy = @import("../mm/copy_from_user.zig");
+const vfs_mod = @import("vfs.zig");
 
 const EFAULT: i64 = 14;
 
@@ -68,7 +69,22 @@ pub fn openWithMode(name_ptr: u64, flags: u32, requested_mode: ?u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    const result = cur.fd_table.openWithCreationCredentials(name, flags, requested_mode, cur.umask_val, cur.euid, cur.egid, cur.effective_caps);
+    // A relative name opened from a directory inside a mounted ext4/NTFS
+    // volume has to be resolved against the cwd here: the FD table does not
+    // know the task. Names elsewhere keep their flat-filesystem behaviour.
+    var joined: [256]u8 = undefined;
+    var use_name = name;
+    if (name.len > 0 and name[0] != '/' and cur.cwd_len > 1 and vfs_mod.rofsRoute(cur.cwd[0..cur.cwd_len]) != null) {
+        const cwd = cur.cwd[0..cur.cwd_len];
+        if (cwd.len + 1 + name.len < joined.len) {
+            @memcpy(joined[0..cwd.len], cwd);
+            joined[cwd.len] = '/';
+            @memcpy(joined[cwd.len + 1 ..][0..name.len], name);
+            use_name = joined[0 .. cwd.len + 1 + name.len];
+        } else return -36; // ENAMETOOLONG
+    }
+
+    const result = cur.fd_table.openWithCreationCredentials(use_name, flags, requested_mode, cur.umask_val, cur.euid, cur.egid, cur.effective_caps);
     return @bitCast(result);
 }
 

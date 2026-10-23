@@ -171,6 +171,19 @@ export fn _start() callconv(.c) noreturn {
             .max_transfer_sectors = 128,
         }, 0);
     }
+    if (virtio_blk.hasSecondDisk()) {
+        var vb1_name: [16]u8 = @splat(0);
+        @memcpy(vb1_name[0..5], "vblk1");
+        _ = block_dev.registerDevice(.{
+            .dev_type = .virtio_blk,
+            .sector_size = 512,
+            .total_sectors = virtio_blk.getCapacitySecond(),
+            .name = vb1_name,
+            .name_len = 5,
+            .supports_flush = false,
+            .max_transfer_sectors = 128,
+        }, 1);
+    }
     if (ahci.hasActiveDisk()) {
         var ahci_name: [16]u8 = @splat(0);
         ahci_name[0] = 's';

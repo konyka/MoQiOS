@@ -45,10 +45,20 @@ pub fn statx(pathname_ptr: u64, statxbuf_ptr: u64) i64 {
         const attrs: u64 = 0;
         bo.writeU64Le(stat_buf[off..], attrs);
         off += 8;
+        var rofs_stat: ?@import("fs_reader.zig").Stat = null;
+        if (fd_entry.fd_type == .rofs_file) {
+            switch (@import("rofs.zig").statRef(fd_entry.rofs_mount, fd_entry.rofs_gen, fd_entry.rofs_ref)) {
+                .ok => |o| rofs_stat = o.stat,
+                .err => |e| {
+                    _ = cur.fd_table.close(fd);
+                    return e;
+                },
+            }
+        }
         var ext2_info: @import("stat_info.zig").StatInfo = .{};
         const have_ext2_info = fd_entry.fd_type == .ext2_file and
             @import("ext2.zig").statInode(fd_entry.ext2_file_idx, &ext2_info);
-        const nlink: u32 = if (have_ext2_info) ext2_info.nlink else 1;
+        const nlink: u32 = if (have_ext2_info) ext2_info.nlink else if (rofs_stat) |r| r.nlink else 1;
         bo.writeU32Le(stat_buf[off..], nlink);
         off += 4;
         var uid: u32 = 0;
@@ -65,6 +75,11 @@ pub fn statx(pathname_ptr: u64, statxbuf_ptr: u64) i64 {
             const file_type = if (metadata.is_dir) @as(u16, 0o040000) else @as(u16, 0o100000);
             mode = file_type | @as(u16, @intCast(metadata.mode & 0o777));
         }
+        if (rofs_stat) |r| {
+            uid = r.uid;
+            gid = r.gid;
+            mode = @truncate(r.mode);
+        }
         if (have_ext2_info) {
             uid = ext2_info.uid;
             gid = ext2_info.gid;
@@ -77,10 +92,10 @@ pub fn statx(pathname_ptr: u64, statxbuf_ptr: u64) i64 {
         bo.writeU16Le(stat_buf[off..], mode);
         off += 2;
         off += 2; // padding
-        const ino: u64 = if (have_ext2_info) ext2_info.ino else fd;
+        const ino: u64 = if (have_ext2_info) ext2_info.ino else if (rofs_stat) |r| r.ino else fd;
         bo.writeU64Le(stat_buf[off..], ino);
         off += 8;
-        const size: u64 = if (have_ext2_info) @max(ext2_info.size, fd_entry.file_size) else fd_entry.file_size;
+        const size: u64 = if (have_ext2_info) @max(ext2_info.size, fd_entry.file_size) else if (rofs_stat) |r| r.size else fd_entry.file_size;
         bo.writeU64Le(stat_buf[off..], size);
         off += 8;
 

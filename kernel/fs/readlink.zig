@@ -40,7 +40,7 @@ pub fn readlink(path_ptr: u64, buf_ptr: u64, bufsiz: u64) i64 {
             if (task_mod.getTask(idx)) |t| {
                 if (fd_val < vfs_mod.MAX_FDS and t.fd_table.fds[fd_val].fd_type != .none) {
                     const type_str = switch (t.fd_table.fds[fd_val].fd_type) {
-                        .ramdisk_file, .fat32_file, .ext2_file, .tmpfs_file => "file",
+                        .ramdisk_file, .fat32_file, .ext2_file, .tmpfs_file, .rofs_file => "file",
                         .pipe_read, .pipe_write => "pipe",
                         .tcp_socket, .udp_socket, .unix_socket => "socket",
                         .epoll => "anon_inode:[eventpoll]",
@@ -58,6 +58,28 @@ pub fn readlink(path_ptr: u64, buf_ptr: u64, bufsiz: u64) i64 {
             }
         }
         return -22; // -EINVAL
+    }
+
+    // ext4 / NTFS symlink: resolve the path without following the last component.
+    {
+        var norm: [256]u8 = undefined;
+        if (vfs_mod.normalizeAbs(path, &norm)) |abs| {
+            if (vfs_mod.rofsRoute(abs)) |route| {
+                const rofs = @import("rofs.zig");
+                switch (rofs.open(route.slot, route.rest, false)) {
+                    .err => |e| return e,
+                    .ok => |o| {
+                        if (o.kind != .symlink) return -22; // EINVAL: not a symlink
+                        var tmp: [512]u8 = undefined;
+                        const n = rofs.readLink(route.slot, o.gen, o.ref, &tmp);
+                        if (n < 0) return n;
+                        const tlen = @min(@as(usize, @intCast(n)), @as(usize, @intCast(bufsiz)));
+                        if (copy.copyToUser(@ptrFromInt(buf_ptr), tmp[0..tlen], tlen) != tlen) return -14;
+                        return @intCast(tlen);
+                    },
+                }
+            }
+        }
     }
 
     // v50.0: try ext2 symlink

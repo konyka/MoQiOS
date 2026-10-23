@@ -28,6 +28,11 @@ pub fn getdents64(fd: u32, buf_ptr: u64, buf_size: u64) i64 {
         return getdents64Ext2(desc, buf_ptr, buf_size);
     }
 
+    // ext4 / NTFS directory
+    if (desc.fd_type == .rofs_file) {
+        return getdents64Rofs(desc, buf_ptr, buf_size);
+    }
+
     // tmpfs directory
     if (desc.fd_type == .tmpfs_file) {
         return getdents64Tmpfs(desc, buf_ptr, buf_size, cur.euid, cur.egid, cur.effective_caps);
@@ -85,6 +90,54 @@ fn getdents64Devfs(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i
     const n: usize = @intCast(written);
     if (copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..n], n) != n) return -14;
     desc.offset = cursor;
+    return @intCast(written);
+}
+
+/// Directory listing of a mounted ext4/NTFS volume. desc.offset is the opaque
+/// resume cookie rofs.dirNext hands out (it counts "." and ".." too).
+fn getdents64Rofs(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i64 {
+    const rofs = @import("rofs.zig");
+    const fsr = @import("fs_reader.zig");
+    if (!desc.rofs_is_dir) return -20; // ENOTDIR
+    var kbuf: [4096]u8 = undefined;
+    var written: u64 = 0;
+    var emitted: u32 = 0;
+    var pos: u64 = desc.offset;
+    const limit = @min(buf_size, 4096);
+    while (true) {
+        var e: fsr.DirEntry = undefined;
+        var next: u64 = 0;
+        const r = rofs.dirNext(desc.rofs_mount, desc.rofs_gen, desc.rofs_ref, pos, &e, &next);
+        if (r < 0) {
+            if (emitted > 0) break; // hand over what we have; the error returns next call
+            return r;
+        }
+        if (r == 0) break;
+        const nlen: usize = e.name_len;
+        const reclen: u16 = @intCast(19 + nlen + 1);
+        const padded: u16 = (reclen + 7) & ~@as(u16, 7);
+        if (written + padded > limit) break;
+        const base: usize = @intCast(written);
+        bo.writeU64Le(kbuf[base .. base + 8], e.ino);
+        bo.writeU64Le(kbuf[base + 8 .. base + 16], next);
+        bo.writeU16Le(kbuf[base + 16 .. base + 18], padded);
+        kbuf[base + 18] = fsr.dType(e.kind);
+        @memcpy(kbuf[base + 19 .. base + 19 + nlen], e.name[0..nlen]);
+        @memset(kbuf[base + 19 + nlen .. base + padded], 0);
+        written += padded;
+        emitted += 1;
+        pos = next;
+    }
+    if (emitted == 0) {
+        // Nothing fit: a too-small buffer is EINVAL, a finished directory is 0.
+        var e: fsr.DirEntry = undefined;
+        var next: u64 = 0;
+        const probe = rofs.dirNext(desc.rofs_mount, desc.rofs_gen, desc.rofs_ref, pos, &e, &next);
+        return if (probe > 0) -22 else probe;
+    }
+    const n: usize = @intCast(written);
+    if (copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..n], n) != n) return -14;
+    desc.offset = pos;
     return @intCast(written);
 }
 

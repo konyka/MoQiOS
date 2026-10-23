@@ -771,6 +771,8 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32, kmsg_cursor: u64
         .ramdisk_file, .fat32_file, .ext2_file, .proc_file, .pidfd => {
             revents |= EPOLLIN | EPOLLOUT;
         },
+        // Read-only volume files are always readable and never writable.
+        .rofs_file => revents |= EPOLLIN,
         .devfs => {
             // Device node readiness comes from the node's poll op
             // (fs/devfs.zig). kmsg_cursor carries this fd's ring position

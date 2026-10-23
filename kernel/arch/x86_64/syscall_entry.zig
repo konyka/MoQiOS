@@ -473,6 +473,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
     getPerCpu().last_syscall_nr = syscall_nr; // DIAG (§6.47)
 
     if (dispatchLinuxRlimitAlias(frame, syscall_nr)) return;
+    if (rofsGuard(frame, syscall_nr)) return;
 
     switch (syscall_nr) {
         1 => {
@@ -2599,6 +2600,50 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
     }
 }
 
+/// Refuse path-mutating syscalls aimed at a read-only ext4/NTFS volume
+/// (fs/rofs_guard_policy.zig lists them and where their paths live). Returns
+/// true when the call was answered here.
+fn rofsGuard(frame: *SyscallFrame, nr: u64) bool {
+    const entry = @import("../../fs/rofs_guard_policy.zig").lookup(nr) orelse return false;
+    if (!@import("../../fs/rofs.zig").anyActive()) return false;
+    const regs = [_]u64{ frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9 };
+    const sched = @import("../../proc/sched.zig");
+    const cur = sched.currentTask() orelse return false;
+    var idx = entry.a;
+    var pass: u32 = 0;
+    while (pass < 2) : (pass += 1) {
+        if (idx != @import("../../fs/rofs_guard_policy.zig").NONE and idx < regs.len) {
+            if (pathOnRofs(cur, regs[idx])) {
+                frame.rax = @bitCast(@as(i64, -30)); // EROFS
+                return true;
+            }
+        }
+        idx = entry.b;
+    }
+    return false;
+}
+
+fn pathOnRofs(cur: anytype, ptr: u64) bool {
+    if (ptr == 0 or ptr >= 0x0000_8000_0000_0000) return false;
+    const copy = @import("../../mm/copy_from_user.zig");
+    var raw: [256]u8 = undefined;
+    const n = copy.copyStringFromUser(raw[0..255], ptr) orelse return false;
+    if (n == 0) return false;
+    var joined: [512]u8 = undefined;
+    var full: []const u8 = raw[0..n];
+    if (raw[0] != '/') {
+        const cwd = cur.cwd[0..cur.cwd_len];
+        if (cwd.len + 1 + n > joined.len) return false;
+        @memcpy(joined[0..cwd.len], cwd);
+        joined[cwd.len] = '/';
+        @memcpy(joined[cwd.len + 1 ..][0..n], raw[0..n]);
+        full = joined[0 .. cwd.len + 1 + n];
+    }
+    var norm: [256]u8 = undefined;
+    const abs = vfs_mod.normalizeAbs(full, &norm) orelse return false;
+    return vfs_mod.rofsRoute(abs) != null;
+}
+
 fn dispatchLinuxRlimitAlias(frame: *SyscallFrame, syscall_nr: u64) bool {
     const sched = @import("../../proc/sched.zig");
     const current = sched.currentTask() orelse return false;
@@ -3356,6 +3401,15 @@ fn syscallLseek(fd: u32, offset: u64, whence: u32) i64 {
     if (fd >= vfs_mod.MAX_FDS) return -9; // EBADF
     const desc = &cur.fd_table.fds[fd];
     if (desc.fd_type == .none) return -9;
+    // offset of a rofs directory is the getdents resume cookie, not a byte
+    // position; only rewinding it (lseek(fd, 0, SEEK_SET)) is meaningful.
+    if (desc.fd_type == .rofs_file and desc.rofs_is_dir) {
+        if (whence == 0 and offset == 0) {
+            desc.offset = 0;
+            return 0;
+        }
+        return -22; // EINVAL
+    }
     const off: i64 = @bitCast(offset);
     var new_off: i64 = 0;
     switch (whence) {

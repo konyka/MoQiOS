@@ -733,6 +733,16 @@ pub fn getCapacity() u64 {
     return device.capacity_sectors;
 }
 
+/// A second virtio-blk disk, if one is attached. It is never the boot disk,
+/// so the block layer exposes it as "vblk1" for data volumes.
+pub fn hasSecondDisk() bool {
+    return device2.active;
+}
+
+pub fn getCapacitySecond() u64 {
+    return device2.capacity_sectors;
+}
+
 fn virtToPhys(virt: u64) u64 {
     return hhdm.virtToPhys(virt);
 }

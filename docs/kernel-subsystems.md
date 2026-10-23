@@ -1037,6 +1037,53 @@ const FdTable = struct {
 
 **挂载管理** (v18.0): `mountFs` / `umountFs`，16 挂载点表，支持 tmpfs/ext2/vfat/proc/ramfs 类型。系统调用 #165 (mount), #166 (umount2)。
 
+**只读 ext4 / ext3 / ext2 与 NTFS 卷**（§6.56，`fs/ext4.zig`、`fs/ntfs.zig`、`fs/rofs.zig`、
+`fs/fs_reader.zig`、`fs/rofs_guard_policy.zig`）：
+
+- **分层**：`ext4.zig` / `ntfs.zig` 是纯解析器——无 I/O、无分配、无全局状态，只通过
+  `fs_reader.Reader`（`read(offset, buf)`）取字节，因此可在 host 上直接对真实 `mke2fs` /
+  `mkntfs` 镜像做测试。`rofs.zig` 是内核胶水：挂载表（4 槽）、每挂载 16×4 KiB 直接映射页
+  缓存、一把 `rofs_lock` 串行化全部操作（只读 + 小卷，锁内做设备 I/O 可接受）。
+- **挂载**：`mount(source, target, "ext4"|"ext3"|"ntfs"|"ntfs3", flags)`，`source` 为
+  `/dev/<块设备名>[p<1-4>]`（`vblk1`、`vblk1p2`；MBR 主分区），`target` 为绝对路径。始终
+  只读（flags 强制置 `MS_RDONLY`）。同一设备+起点不能重复挂载（EBUSY）；类型与内容不符
+  返回 EINVAL，设备/分区不存在 ENODEV。第二块 virtio-blk 盘注册为 `vblk1`。
+- **路径路由**：`vfs.rofsRoute` 对绝对路径做最长前缀匹配（按路径分量边界，`/mnt` 不匹配
+  `/mntx`）；相对路径在 `openWithMode` 里用任务 cwd 拼接后再路由（cwd 在卷内时）。
+  `chdir` 到卷内目标必须存在且是目录。
+- **fd 与代数**：新 fd 类型 `rofs_file`（`rofs_mount`、`rofs_gen`、`rofs_ref`）。每次挂载
+  分配新的 generation；卸载后槽位被复用时，旧 fd 带着旧 generation，读取返回 ENODEV，
+  不会读到占用该槽位的另一个卷（即使 inode 号相同）。umount 不等待 fd 关闭。
+- **支持的 syscall**：open（O_NOFOLLOW 打开符号链接本身）、read、pread、lseek、fstat、
+  statx、getdents64（`.`/`..` 合成，恢复游标由 rofs 管理，目录上只允许 `lseek(0)` 倒带）、
+  readlink、chdir、epoll（恒可读）。
+- **只读保证**：写打开 / `O_CREAT` / `O_TRUNC` 返回 EROFS；fd 上 write/pwrite 返回 EROFS；
+  路径型修改类 syscall（rename、mkdir、rmdir、link、unlink、symlink、chmod、chown、
+  truncate、mkdirat、fchmodat、renameat2、setxattrat、removexattrat 等）由 dispatch 层的
+  `rofsGuard` 统一拦截——`rofs_guard_policy.zig` 是（syscall 号 → 路径参数寄存器）表，
+  对每个路径参数做 cwd 拼接、规范化、前缀路由，命中卷即 EROFS。rename 的**任一**端在卷内
+  都拒绝。
+- **ext4 能力**：extent 树（任意深度、未初始化 extent 读零）与经典直接/间接块映射（ext3/
+  ext2）、32/64 位组描述符、flex_bg、任意块大小、htree 目录（线性扫描——内部 dx 节点看起来
+  像空目录项，线性遍历能看到所有叶子项）、快/慢符号链接、稀疏文件。**不支持**（挂载返回
+  EOPNOTSUPP 级错误）：meta_bg、日志设备、MMP、压缩、dirdata；inline_data / 加密 / casefold
+  的 inode 读取时返回 Unsupported。需要日志恢复的卷以只读方式挂载并**不回放日志**
+  （打印警告），可能显示比最后一次提交更旧的状态。元数据校验和不验证。
+- **NTFS 能力**：任意扇区/簇/记录大小、碎片化 $MFT、所有 MFT 记录与索引块的 update
+  sequence fixup、常驻与非常驻 $DATA（含稀疏 run 与 initialized_size）、
+  $INDEX_ROOT + $INDEX_ALLOCATION B 树目录（整树遍历）、8.3 别名隐藏、UTF-16→UTF-8、
+  symlink / junction 重解析点。文件名匹配仅 ASCII 大小写不敏感（NTFS 本身经 $UpCase），
+  非 ASCII 名字只匹配相同拼写——可能漏匹配大小写不同的拼写，但不会匹配错文件。**不支持**：
+  压缩/加密数据、靠 $ATTRIBUTE_LIST 跨扩展记录的文件。根目录会列出 `$MFT`、`$Bitmap` 等
+  系统文件（它们是真实的目录项）。$LogFile 被忽略，未干净卸载的卷按原样读取。
+- **已知限制**：dup 在本内核复制描述符（各自 offset），与 POSIX 共享 offset 不同，对 rofs 同
+  样适用；ext4 / NTFS 用户权限位按文件上的 mode / 固定 0444 报告，读取路径未做 DAC 检查；
+  不提供 `statfs`；NTFS 不提供 xattr/ADS；卷内不能再挂载别的文件系统。
+- **验证**：host 测试 22 个（ext4 11、NTFS 10、EROFS 守卫表 1；真实 `tools/fsfixtures/mkfixtures.sh` 生成的镜像，`debugfs` /
+  `ntfsls` 交叉核对；含敌对超级块/引导扇区/损坏 extent 树/fixup 撕裂）；`hello114`
+  64 项运行时检查（SMP=1/2/8），并经变异验证——去掉 EROFS 守卫则 7 项失败，忽略挂载代数则
+  过期 fd 检查失败。
+
 **/dev 设备节点**：全部由 devfs 注册表提供（见 3.8），`open` 的 `/dev/` 分支
 查表分发到节点 ops；未注册名字返回 `-ENOENT`。
 
