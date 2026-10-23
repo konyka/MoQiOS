@@ -264,3 +264,31 @@ test "a search check vetoes NTFS lookups too" {
     ctx.deny_all = true;
     try std.testing.expectError(error.Access, v.resolveChecked("/small.txt", true, chk));
 }
+
+test "statfs counts free clusters and MFT records from the bitmaps" {
+    var img = try Image.open(path);
+    defer img.close();
+    const v = try mountImage(&img);
+    // Cross-checked outside the kernel: popcount of `ntfscat '$Bitmap'` gives
+    // 2352 of 4095 clusters in use, and the $MFT bitmap has 143 of 188 records used.
+    const free = try v.freeClusters();
+    try std.testing.expectEqual(@as(u64, 1743), free);
+    const s = try v.fsStat(free);
+    try std.testing.expectEqual(@as(u32, 0x5346544e), s.magic);
+    try std.testing.expectEqual(@as(u32, 1024), s.block_size);
+    try std.testing.expectEqual(@as(u64, 4095), s.blocks);
+    try std.testing.expectEqual(@as(u64, 1743), s.bfree);
+    try std.testing.expectEqual(@as(u64, 1743), s.bavail);
+    try std.testing.expectEqual(@as(u64, 188), s.files);
+    try std.testing.expectEqual(@as(u64, 45), s.ffree);
+}
+
+test "statfs rejects a bitmap that is shorter than the volume" {
+    var img = try Image.open(path);
+    defer img.close();
+    var v = try mountImage(&img);
+    v.total_clusters *= 64; // claims far more clusters than $Bitmap describes
+    try std.testing.expectError(error.Corrupt, v.freeClusters());
+    v.total_clusters = (@as(u64, 1) << 40); // beyond the scan cap
+    try std.testing.expectError(error.Unsupported, v.freeClusters());
+}

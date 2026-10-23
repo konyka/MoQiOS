@@ -1,6 +1,7 @@
 //! Host tests for kernel/fs/ext4.zig against real mke2fs images
 //! (tools/fsfixtures/mkfixtures.sh): ext4 with 1 KiB and 4 KiB blocks (extents,
-//! 64bit, flex_bg, metadata_csum, htree) and ext3 (indirect block maps).
+//! 64bit, flex_bg, metadata_csum, htree), ext3 (indirect block maps) and ext4
+//! with bigalloc (16 KiB clusters over 1 KiB blocks).
 
 const std = @import("std");
 const kt = @import("kernel_shared");
@@ -12,6 +13,7 @@ const images = [_][]const u8{
     "tests/fixtures/fs/ext4_1k.img",
     "tests/fixtures/fs/ext4_4k.img",
     "tests/fixtures/fs/ext3_1k.img",
+    "tests/fixtures/fs/ext4_bigalloc.img",
 };
 
 fn bigByte(i: usize) u8 {
@@ -309,4 +311,73 @@ test "permission matrix on the real fixture (owner 1000, others 4242)" {
     // root reads everything (these files have no execute bit; read needs none)
     try std.testing.expect(try canOpen(&v, "/perm/private.txt", root_c));
     try std.testing.expect(try canOpen(&v, "/perm/locked/inside.txt", root_c));
+}
+
+test "statfs numbers match dumpe2fs for every fixture" {
+    const want = [_]struct { path: []const u8, bs: u32, blocks: u64, bfree: u64, bavail: u64, files: u64, ffree: u64 }{
+        .{ .path = images[0], .bs = 1024, .blocks = 4096, .bfree = 2092, .bavail = 2092 - 204, .files = 1024, .ffree = 694 },
+        .{ .path = images[1], .bs = 4096, .blocks = 1024, .bfree = 535, .bavail = 535 - 51, .files = 1024, .ffree = 695 },
+        .{ .path = images[2], .bs = 1024, .blocks = 4096, .bfree = 2134, .bavail = 2134 - 204, .files = 1024, .ffree = 695 },
+        .{ .path = images[3], .bs = 1024, .blocks = 12288, .bfree = 6192, .bavail = 6192 - 614, .files = 1024, .ffree = 695 },
+    };
+    for (want) |w| {
+        var img = try Image.open(w.path);
+        defer img.close();
+        const v = try ext4.Volume.mount(img.reader());
+        const s = v.fsStat();
+        try std.testing.expectEqual(@as(u32, 0xEF53), s.magic);
+        try std.testing.expectEqual(w.bs, s.block_size);
+        try std.testing.expectEqual(w.blocks, s.blocks);
+        try std.testing.expectEqual(w.bfree, s.bfree);
+        try std.testing.expectEqual(w.bavail, s.bavail);
+        try std.testing.expectEqual(w.files, s.files);
+        try std.testing.expectEqual(w.ffree, s.ffree);
+        try std.testing.expect(s.bavail <= s.bfree and s.bfree <= s.blocks);
+    }
+}
+
+test "statfs clamps hostile counters instead of underflowing" {
+    var img = try Image.open(images[0]);
+    defer img.close();
+    var v = try ext4.Volume.mount(img.reader());
+    v.free_blocks = 5;
+    v.reserved_blocks = 1000; // more reserved than free: nothing available
+    v.free_inodes = 0xFFFF_FFFF; // more free than exist
+    const s = v.fsStat();
+    try std.testing.expectEqual(@as(u64, 0), s.bavail);
+    try std.testing.expectEqual(@as(u64, 5), s.bfree);
+    try std.testing.expectEqual(@as(u64, 1024), s.ffree);
+    v.free_blocks = 1 << 40; // more free than the volume holds
+    try std.testing.expectEqual(@as(u64, 4096), v.fsStat().bfree);
+}
+
+test "encodeStatfs lays out the Linux x86_64 struct" {
+    var buf: [fr.STATFS_SIZE]u8 = undefined;
+    fr.encodeStatfs(.{ .magic = 0xEF53, .block_size = 4096, .blocks = 10, .bfree = 6, .bavail = 5, .files = 100, .ffree = 90, .name_max = 255, .fsid = 0x1122 }, &buf);
+    const r = std.mem.readInt;
+    try std.testing.expectEqual(@as(u64, 0xEF53), r(u64, buf[0..8], .little));
+    try std.testing.expectEqual(@as(u64, 4096), r(u64, buf[8..16], .little));
+    try std.testing.expectEqual(@as(u64, 10), r(u64, buf[16..24], .little));
+    try std.testing.expectEqual(@as(u64, 6), r(u64, buf[24..32], .little));
+    try std.testing.expectEqual(@as(u64, 5), r(u64, buf[32..40], .little));
+    try std.testing.expectEqual(@as(u64, 100), r(u64, buf[40..48], .little));
+    try std.testing.expectEqual(@as(u64, 90), r(u64, buf[48..56], .little));
+    try std.testing.expectEqual(@as(u64, 0x1122), r(u64, buf[56..64], .little));
+    try std.testing.expectEqual(@as(u64, 255), r(u64, buf[64..72], .little));
+    try std.testing.expectEqual(@as(u64, 4096), r(u64, buf[72..80], .little));
+    try std.testing.expectEqual(@as(u64, 1), r(u64, buf[80..88], .little)); // ST_RDONLY
+}
+
+test "the bigalloc image really is bigalloc, and still reads like the others" {
+    var img = try Image.open(images[3]);
+    defer img.close();
+    // RO_COMPAT_BIGALLOC (0x200) in s_feature_ro_compat; cluster size is block << log_cluster_size.
+    var sb: [1024]u8 = undefined;
+    try std.testing.expect(img.reader().read(1024, &sb));
+    try std.testing.expect(std.mem.readInt(u32, sb[0x64..][0..4], .little) & 0x200 != 0);
+    try std.testing.expectEqual(@as(u32, 4), std.mem.readInt(u32, sb[0x1C..][0..4], .little)); // 1 KiB << 4 = 16 KiB
+    const v = try ext4.Volume.mount(img.reader());
+    var buf: [64]u8 = undefined;
+    const n = try readAll(&v, "/dir/sub/n.txt", &buf);
+    try std.testing.expectEqualStrings("nested\n", buf[0..n]);
 }

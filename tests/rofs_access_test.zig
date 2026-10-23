@@ -59,3 +59,21 @@ test "combined masks need every requested bit" {
     try std.testing.expect(a.allows(owner_only, alice, a.R | a.W));
     try std.testing.expect(a.allows(world_read, bob, 0));
 }
+
+test "access(2) verdicts on a read-only volume" {
+    // F_OK only needs the object to exist.
+    try std.testing.expectEqual(a.AccessVerdict.ok, a.accessVerdict(owner_only, bob, a.F_OK));
+    // Read follows the permission bits.
+    try std.testing.expectEqual(a.AccessVerdict.ok, a.accessVerdict(owner_only, alice, a.R));
+    try std.testing.expectEqual(a.AccessVerdict.denied, a.accessVerdict(owner_only, bob, a.R));
+    // Execute: a plain file without x bits is denied to everyone, root included.
+    try std.testing.expectEqual(a.AccessVerdict.denied, a.accessVerdict(owner_only, alice, a.X));
+    try std.testing.expectEqual(a.AccessVerdict.denied, a.accessVerdict(owner_only, root, a.X));
+    try std.testing.expectEqual(a.AccessVerdict.ok, a.accessVerdict(locked_dir, alice, a.X));
+    // Write is EROFS no matter who asks or what the mode says.
+    try std.testing.expectEqual(a.AccessVerdict.read_only, a.accessVerdict(owner_only, alice, a.W));
+    try std.testing.expectEqual(a.AccessVerdict.read_only, a.accessVerdict(world_read, root, a.R | a.W));
+    // Unknown mode bits are rejected before anything else.
+    try std.testing.expectEqual(a.AccessVerdict.invalid, a.accessVerdict(owner_only, alice, 8));
+    try std.testing.expectEqual(a.AccessVerdict.invalid, a.accessVerdict(owner_only, alice, 0x100 | a.R));
+}

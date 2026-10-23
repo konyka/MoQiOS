@@ -71,6 +71,13 @@ mke2fs -q -t ext4 -O ^has_journal -b 4096 -N 1024 -L MOQI4K -d "$WORK/src" "$OUT
 truncate -s 4M "$OUT/ext3_1k.img"
 mke2fs -q -t ext3 -b 1024 -N 1024 -L MOQIEXT3 -d "$WORK/src" "$OUT/ext3_1k.img"
 
+# ext4 with bigalloc: 16 KiB allocation clusters over 1 KiB blocks (extents still
+# address blocks; only the bitmaps and free counts are per cluster). No journal.
+truncate -s 12M "$OUT/ext4_bigalloc.img"
+mke2fs -q -t ext4 -O bigalloc,^has_journal -C 16384 -b 1024 -N 1024 -L MOQIBIG \
+    -U 66666666-7777-8888-9999-000000000000 -E hash_seed=66666666-7777-8888-9999-000000000000 \
+    -d "$WORK/src" "$OUT/ext4_bigalloc.img"
+
 # NTFS: 512-byte sectors, 1 KiB clusters. ntfscp cannot create directories, so
 # the root holds the files; 120 long names push the root index into
 # $INDEX_ALLOCATION blocks. Big/sparse files are non-resident.
@@ -107,4 +114,4 @@ start=10240, size=8192, type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
 PT
 dd if="$OUT/ext4_1k.img" of="$OUT/datadisk_gpt.img" bs=512 seek=2048 conv=notrunc status=none
 dd if="$OUT/ntfs.img" of="$OUT/datadisk_gpt.img" bs=512 seek=10240 conv=notrunc status=none
-echo "wrote $OUT/{ext4_1k,ext4_4k,ext3_1k,ntfs,datadisk,datadisk_gpt}.img"
+echo "wrote $OUT/{ext4_1k,ext4_4k,ext3_1k,ext4_bigalloc,ntfs,datadisk,datadisk_gpt}.img"

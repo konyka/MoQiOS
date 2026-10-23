@@ -338,6 +338,14 @@ H1 再加 `shared` 字段记录 MAP_SHARED），不触碰页表；首次访问�
   且 `size >= 24`；`size < 24`、无效 `dirfd`、非零 `resolve`、未知 `flags` 和无效
   `how` 指针分别拒绝并返回 `EINVAL`、`EBADF`、`EINVAL`、`EINVAL`、`EFAULT`。成功返回
   的 fd 必须由调用者关闭。`user/hello75.c` 以 raw syscall 同时验收 #320/#437。
+- **statfs / fstatfs**：卷内路径或卷内 fd 返回该卷自己的数字（其余路径仍是内置的固定值）。ext4 取
+  超级块计数器（总块数、空闲块、保留块 → `bavail`、inode 总数/空闲数），日志未回放的卷空闲数可能略旧；
+  NTFS 扫描 `$Bitmap` 得到空闲簇（首次扫描后缓存到挂载槽，只读卷不会变）、扫描 `$MFT` 的 `$BITMAP` 得到
+  MFT 记录总数/空闲数，位图上限 64 MiB（约 5.4 亿簇），更大的卷返回 EOPNOTSUPP。`f_flags` 恒带
+  `ST_RDONLY`。statfs 只要求路径上各级目录可搜索，不要求目标文件可读（与 Linux 一致）。
+- **access(2)**：卷内路径按文件真实 mode/owner 判定而非"能否打开"：`F_OK` 只要求存在；`R_OK`/`X_OK`
+  看权限位（普通文件无任何执行位时 `X_OK` 对 root 也是 EACCES）；含 `W_OK` 一律 EROFS（root 亦然）；
+  未知 mode 位 EINVAL；路径上目录不可搜索 EACCES，缺失 ENOENT。卷外路径仍只检查存在性。
 - **已知限制**：mremap 文件区域仅支持原地增长/收缩（移动返回 ENOMEM）；
   MAP_SHARED 可写页与随后对同一 inode 的 `write()` 系统调用之间不做一致性保证
   （writeFile 会 invalidate 该 inode 的缓存页，未刷出的映射写入可能丢失——请先
@@ -1090,11 +1098,10 @@ const FdTable = struct {
   压缩/加密数据、靠 $ATTRIBUTE_LIST 跨扩展记录的文件。根目录会列出 `$MFT`、`$Bitmap` 等
   系统文件（它们是真实的目录项）。$LogFile 被忽略，未干净卸载的卷按原样读取。
 - **已知限制**：dup 在本内核复制描述符（各自 offset），与 POSIX 共享 offset 不同，对 rofs 同
-  样适用；ext4 inode 的 uid/gid 取低 16 位并合并高位字段；
-  不提供 `statfs`；NTFS 不提供 xattr/ADS；卷内不能再挂载别的文件系统。
-- **验证**：host 测试（ext4 13、NTFS 11、GPT 5、挂载路径 5、DAC 6、EROFS 守卫表 1；真实
+  样适用；ext4 inode 的 uid/gid 由低 16 位与高 16 位合并；NTFS 不提供 xattr/ADS；卷内不能再挂载别的文件系统。
+- **验证**：host 测试（ext4 17、NTFS 13、GPT 5、挂载路径 5、DAC 7、EROFS 守卫表 1；含 bigalloc 镜像 `ext4_bigalloc.img`、statfs 数值与 `dumpe2fs` / `$Bitmap` popcount 交叉核对；真实
   `tools/fsfixtures/mkfixtures.sh` 生成的镜像，`debugfs` / `ntfsls` 交叉核对；含敌对超级块/
-  引导扇区/损坏 extent 树/fixup 撕裂）；`hello114` 运行时检查 90 项（SMP=1/2/8，MBR 与 GPT 两种
+  引导扇区/损坏 extent 树/fixup 撕裂）；`hello114` 运行时检查 114 项（另有 NVMe、AHCI 两段默认 skip）（SMP=1/2/8，MBR 与 GPT 两种
   数据盘镜像，`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`），变异验证——去掉 EROFS 守卫
   则 7 项失败，忽略挂载代数则过期 fd 检查失败，关掉挂载规则则 7 项失败，关掉 DAC 检查则 7
   项失败。NVMe（中断驱动）与 AHCI 上的真实挂载读取（I/J 段）需要手动提供带 ext4 的镜像

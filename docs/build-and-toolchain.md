@@ -411,7 +411,7 @@ no `duration_ms`. This P1 mode does not provide QEMU runtime samples.
 | `iso_root/boot/ramdisk.bin` | 打包好的 ramdisk |
 | `moqios.iso` | 最终 ISO |
 | `disk.img` | virtio-blk 后端磁盘镜像 |
-| `tests/fixtures/fs/*.img` | ext4（1 KiB / 4 KiB 块）、ext3、NTFS 测试卷与 MBR 数据盘 `datadisk.img`、GPT 数据盘 `datadisk_gpt.img`（`MOQI_DATA_IMG` 可指向任一）；由 `tools/fsfixtures/mkfixtures.sh` 重新生成（需要 e2fsprogs 的 `mke2fs`/`e2fsck`、ntfs-3g 的 `mkntfs`/`ntfscp`、`sfdisk`）。`qemu_run.sh` 以 `readonly=on` 把 `datadisk.img` 挂为第二块 virtio-blk（`MOQI_DATA_DISK=0` 关闭，`MOQI_DATA_IMG` 换镜像）；host 测试按相对路径读取其余镜像 |
+| `tests/fixtures/fs/*.img` | ext4（1 KiB / 4 KiB 块）、ext4 bigalloc（`ext4_bigalloc.img`）、ext3、NTFS 测试卷与 MBR 数据盘 `datadisk.img`、GPT 数据盘 `datadisk_gpt.img`（`MOQI_DATA_IMG` 可指向任一）；由 `tools/fsfixtures/mkfixtures.sh` 重新生成（需要 e2fsprogs 的 `mke2fs`/`e2fsck`、ntfs-3g 的 `mkntfs`/`ntfscp`、`sfdisk`）。`qemu_run.sh` 以 `readonly=on` 把 `datadisk.img` 挂为第二块 virtio-blk（`MOQI_DATA_DISK=0` 关闭，`MOQI_DATA_IMG` 换镜像）；host 测试按相对路径读取其余镜像 |
 | `nvme.img` | NVMe scratch 镜像（qemu_run.sh 自动创建/写模式串） |
 | `ext2.img` | ext2 测试镜像 |
 | `.zig-cache/` | Zig 编译缓存 |

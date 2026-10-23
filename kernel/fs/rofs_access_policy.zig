@@ -57,3 +57,18 @@ pub fn canList(m: Meta, c: Creds) bool {
 pub fn canRead(m: Meta, c: Creds) bool {
     return allows(m, c, R);
 }
+
+pub const F_OK: u32 = 0;
+
+/// Outcome of access(2) on an existing object of a read-only volume.
+pub const AccessVerdict = enum { ok, invalid, read_only, denied };
+
+/// access(path, mode): `mode` is F_OK or a mask of R/W/X. Bits beyond those are
+/// EINVAL. Asking for write on a read-only volume is EROFS (even for root, as
+/// on Linux); otherwise the permission bits decide, and F_OK needs nothing.
+pub fn accessVerdict(m: Meta, c: Creds, mode: u32) AccessVerdict {
+    if (mode & ~(R | W | X) != 0) return .invalid;
+    if (mode & W != 0) return .read_only;
+    if (mode == F_OK) return .ok;
+    return if (allows(m, c, mode)) .ok else .denied;
+}

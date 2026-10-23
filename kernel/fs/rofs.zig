@@ -59,6 +59,9 @@ const Mount = struct {
     generation: u32 = 0,
     label: [32]u8 = @splat(0),
     label_len: u8 = 0,
+    /// NTFS free-cluster count, computed on the first statfs. The volume is
+    /// read-only, so it never changes while mounted.
+    ntfs_free: ?u64 = null,
 };
 
 var rofs_lock: IrqSpinlock = .{};
@@ -310,6 +313,42 @@ pub fn open(slot: u8, path: []const u8, follow: bool, creds: Creds) union(enum) 
     return .{ .ok = o };
 }
 
+/// Resolve `path` needing only search permission on the directories along the
+/// way (what stat-like calls such as statfs require); the target's own mode is
+/// not consulted. 0 on success or a negative errno.
+pub fn reach(slot: u8, path: []const u8, creds: Creds) i64 {
+    if (slot >= MAX_MOUNTS) return -19;
+    const flags = rofs_lock.acquire();
+    defer rofs_lock.release(flags);
+    const m = &mounts[slot];
+    if (!m.active) return -19;
+    var sc: SearchCtx = .{ .creds = creds };
+    switch (m.kind) {
+        .ext4 => _ = m.ext4_vol.resolveChecked(path, true, .{ .ctx = &sc, .allow = mayTraverse }) catch |e| return mapErr(e),
+        .ntfs => _ = m.ntfs_vol.resolveChecked(path, true, .{ .ctx = &sc, .allow = mayTraverse }) catch |e| return mapErr(e),
+        .none => return -19,
+    }
+    return 0;
+}
+
+/// Mode and owner of the object at `path` (search permission enforced on the
+/// way, the object's own bits not). Null if it cannot be resolved.
+pub fn metaFor(slot: u8, path: []const u8, creds: Creds) ?access.Meta {
+    if (slot >= MAX_MOUNTS) return null;
+    const flags = rofs_lock.acquire();
+    defer rofs_lock.release(flags);
+    const m = &mounts[slot];
+    if (!m.active) return null;
+    var sc: SearchCtx = .{ .creds = creds };
+    const ref: Ref = switch (m.kind) {
+        .ext4 => m.ext4_vol.resolveChecked(path, true, .{ .ctx = &sc, .allow = mayTraverse }) catch return null,
+        .ntfs => m.ntfs_vol.resolveChecked(path, true, .{ .ctx = &sc, .allow = mayTraverse }) catch return null,
+        .none => return null,
+    };
+    const o = statOf(m, ref) catch return null;
+    return metaOf(o.stat);
+}
+
 pub fn statRef(slot: u8, gen: u32, ref: Ref) union(enum) { ok: Opened, err: i64 } {
     const flags = rofs_lock.acquire();
     defer rofs_lock.release(flags);
@@ -412,6 +451,26 @@ pub fn readLink(slot: u8, gen: u32, ref: Ref, buf: []u8) i64 {
             return @intCast(n);
         },
         .none => return -19,
+    }
+}
+
+/// statfs for the volume a descriptor or path belongs to. NTFS scans its
+/// allocation bitmap the first time (cached afterwards).
+pub fn statFs(slot: u8, gen: ?u32) union(enum) { ok: fr.FsStat, err: i64 } {
+    const flags = rofs_lock.acquire();
+    defer rofs_lock.release(flags);
+    const m: *Mount = if (gen) |g| (live(slot, g) orelse return .{ .err = -19 }) else blk: {
+        if (slot >= MAX_MOUNTS or !mounts[slot].active) return .{ .err = -19 };
+        break :blk &mounts[slot];
+    };
+    switch (m.kind) {
+        .ext4 => return .{ .ok = m.ext4_vol.fsStat() },
+        .ntfs => {
+            if (m.ntfs_free == null) m.ntfs_free = m.ntfs_vol.freeClusters() catch |e| return .{ .err = mapErr(e) };
+            const st = m.ntfs_vol.fsStat(m.ntfs_free.?) catch |e| return .{ .err = mapErr(e) };
+            return .{ .ok = st };
+        },
+        .none => return .{ .err = -19 },
     }
 }
 

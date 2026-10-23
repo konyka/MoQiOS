@@ -33,6 +33,7 @@ const ATTR_ATTRIBUTE_LIST: u32 = 0x20;
 const ATTR_FILE_NAME: u32 = 0x30;
 const ATTR_DATA: u32 = 0x80;
 const ATTR_INDEX_ROOT: u32 = 0x90;
+const ATTR_BITMAP: u32 = 0xB0;
 const ATTR_INDEX_ALLOCATION: u32 = 0xA0;
 const ATTR_REPARSE_POINT: u32 = 0xC0;
 const ATTR_END: u32 = 0xFFFFFFFF;
@@ -57,6 +58,10 @@ const MAX_RECORD: u32 = 4096;
 pub const MAX_INDEX_BLOCK: u32 = 8192;
 pub const MAX_TREE_DEPTH: u32 = 8;
 const MAX_VISITS: u32 = 1 << 22;
+/// Largest allocation bitmap statfs will scan (64 MiB = 512 Mi clusters).
+const MAX_BITMAP_SCAN: u64 = 64 * 1024 * 1024;
+const BITMAP_RECORD: u64 = 6;
+const NTFS_SUPER_MAGIC: u32 = 0x5346544e;
 const MAX_SYMLINK_DEPTH: u8 = 8;
 const EPOCH_DIFF_100NS: u64 = 116444736000000000; // 1601 → 1970
 
@@ -501,6 +506,64 @@ pub const Volume = struct {
             return n;
         }
         return self.readRuns(s.pairs, s.start_vcn, s.size, s.init_size, offset, buf);
+    }
+
+    // ─── Volume statistics ──────────────────────────────────────────────
+
+    /// Zero bits among the first `nbits` of attribute `attr` of record `ref`
+    /// (an allocation bitmap), scanned in 4 KiB steps.
+    fn countClear(self: *const Volume, ref: u64, attr: u32, nbits: u64) Error!u64 {
+        var rbuf: [MAX_RECORD]u8 = undefined;
+        const found = try self.findStream(ref, attr, &rbuf);
+        const s = found.s;
+        const need = (nbits + 7) / 8;
+        if (need > MAX_BITMAP_SCAN) return error.Unsupported;
+        if (s.size < need) return error.Corrupt;
+        var chunk: [4096]u8 = undefined;
+        var clear: u64 = 0;
+        var pos: u64 = 0;
+        while (pos < need) {
+            const want: usize = @intCast(@min(@as(u64, chunk.len), need - pos));
+            if (s.resident) {
+                if (pos + want > s.res_len) return error.Corrupt;
+                @memcpy(chunk[0..want], found.rec[s.res_off + @as(usize, @intCast(pos)) ..][0..want]);
+            } else {
+                const n = try self.readRuns(s.pairs, s.start_vcn, s.size, s.init_size, pos, chunk[0..want]);
+                if (n != want) return error.Corrupt;
+            }
+            var i: usize = 0;
+            while (i < want) : (i += 1) {
+                const first = (pos + i) * 8;
+                var b = chunk[i];
+                // Bits past the end of the volume are padding and count as used.
+                if (first + 8 > nbits) b |= @as(u8, 0xFF) << @intCast(nbits - first);
+                clear += 8 - @popCount(b);
+            }
+            pos += want;
+        }
+        return clear;
+    }
+
+    /// Free clusters, from $Bitmap. Cost is proportional to the volume size.
+    pub fn freeClusters(self: *const Volume) Error!u64 {
+        return self.countClear(BITMAP_RECORD, ATTR_DATA, self.total_clusters);
+    }
+
+    /// statfs numbers; `free_clusters` is the result of freeClusters().
+    pub fn fsStat(self: *const Volume, free_clusters: u64) Error!fr.FsStat {
+        const total = self.mft_size / self.record_size;
+        const free_recs = try self.countClear(0, ATTR_BITMAP, total);
+        return .{
+            .magic = NTFS_SUPER_MAGIC,
+            .block_size = self.cluster_size,
+            .blocks = self.total_clusters,
+            .bfree = free_clusters,
+            .bavail = free_clusters,
+            .files = total,
+            .ffree = free_recs,
+            .name_max = 255,
+            .fsid = self.serial,
+        };
     }
 
     // ─── Directories ────────────────────────────────────────────────────

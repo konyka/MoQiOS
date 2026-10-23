@@ -3931,19 +3931,31 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     300000 字节通过；**默认 smoke 中 I/J 段是 skip**，需 `MOQI_SMOKE_NVME_IMG` /
     `MOQI_SMOKE_AHCI_IMG` 指向含 ext4 的镜像才会运行（AHCI 还需临时关闭占用 `/dev/sda` 做 swap
     的 hello96/98/99/100/101）。
-- **验证**：host 测试 635/635（594→635：ext4 13、NTFS 11、GPT 5、挂载路径 5、DAC 6、EROFS 守卫表 1；
-  真实镜像、`debugfs`/`ntfsls` 交叉核对、敌对输入）；三架构构建；`hello114` 90 项运行时检查，MBR
+- **第二轮自审（GPT 提交之后）发现并修正的问题**：
+  - `statfs`/`fstatfs` 是个桩：不论路径，一律返回写死的 4 GiB ext2 数字，卷上的 `df` 之类会得到假数据。
+    现卷内路径/fd 返回该卷真实数字（ext4 取超级块计数器并对敌对值夹紧；NTFS 扫 `$Bitmap` 与 `$MFT` 的
+    `$BITMAP`，首次后缓存）。期望值来自独立工具：`dumpe2fs`，以及对 `ntfscat '$Bitmap'` 的 popcount
+    （NTFS 簇数 4095 不是 8 的倍数，顺带覆盖了位图尾部填充位）。
+  - `access(2)` 忽略 mode，且任何失败都报 ENOENT：对他人 0600 文件 `access(R_OK)` 报"不存在"，
+    `access(W_OK)` 在只读卷上报成功。现 F_OK 只查存在、R/X 看权限位、W 一律 EROFS、未知位 EINVAL，
+    路径目录不可搜索报 EACCES（纯函数 `accessVerdict`，host 测试 + 11 项运行时检查）。
+  - 文档声称支持 bigalloc，但从未有过 bigalloc 镜像。新增 `ext4_bigalloc.img`（16 KiB 簇 / 1 KiB 块，
+    `e2fsck` 干净）并纳入 ext4 全部 host 测试矩阵，读取、目录、稀疏文件、statfs 均通过。
+  - statfs 路径解析一度用 `rofs.open`（要求目标可读）；改为只要求路径目录可搜索的 `rofs.reach`，与
+    Linux 一致，由运行时检查"对不可读文件 statfs 成功、穿过封闭目录 EACCES"锁定。
+- **验证**：host 测试 642/642（594→642：ext4 17、NTFS 13、GPT 5、挂载路径 5、DAC 7、EROFS 守卫表 1；
+  真实镜像、`debugfs`/`ntfsls` 交叉核对、敌对输入）；三架构构建；`hello114` 114 项运行时检查（NVMe/AHCI 两段默认 skip），MBR
   默认镜像 SMP=1/2/8 通过，GPT 镜像（`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`）通过；
   变异验证（删 EROFS 守卫 → 7 项 FAIL；忽略挂载代数 → 过期 fd 项 FAIL；关掉挂载规则 → 7 项 FAIL；
-  关掉 DAC 检查 → 7 项 FAIL；GPT 解析恒失败 → 43 项 FAIL）。
+  关掉 DAC 检查 → 7 项 FAIL；GPT 解析恒失败 → 43 项 FAIL；statfs 绕过卷路由 → 9 项 FAIL；access 绕过卷分支 → 9 项 FAIL）。
 - **未做 / 已知限制**：写入（ext4 与 NTFS）；ext4 日志回放；元数据校验和验证；NTFS
   压缩/加密/$ATTRIBUTE_LIST/$UpCase 大小写折叠；GPT 备份表不使用且仅支持主表在 LBA 2、≤32 扇区
-  的布局；DAC 不跟踪补充组；卷内再挂载；`statfs`；VFS 仍是"扁平命名 + 前缀路由"而非通用挂载树，
+  的布局；DAC 不跟踪补充组；卷内再挂载；NTFS 位图超过 64 MiB 的卷 statfs 返回 EOPNOTSUPP；`faccessat` 的 dirfd 仍被忽略（沿用既有行为）；VFS 仍是"扁平命名 + 前缀路由"而非通用挂载树，
   挂载点祖先目录（如 `/mnt`）本身不会作为目录出现在 `getdents("/")` 中。
 
 | Gate | Result | Notes |
 |---|---|---|
-| `zig build test`（0.16.0） | Passed 635/635 | 594→635 |
+| `zig build test`（0.16.0） | Passed 642/642 | 594→642 |
 | `zig build` / riscv64 / aarch64 | Passed | 三架构 |
 | smoke SMP=1 / 2 / 8（MBR 数据盘） | Passed | hello114 PASS，90 项 ok；I/J 段默认 skip |
 | smoke SMP=1 / 2 / 8（GPT 数据盘） | Passed | SMP=1/2/8 均 PASS；GPT 变异（`isProtectiveMbr` 恒 false）→ 43 项 FAIL |

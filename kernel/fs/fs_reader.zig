@@ -3,6 +3,8 @@
 //! Reader backed by a block device (with its own cache), host tests supply
 //! one backed by an image file.
 
+const std = @import("std");
+
 pub const Reader = struct {
     ctx: *anyopaque,
     /// Fill `buf` from byte `offset` of the volume. False on any I/O error or
@@ -59,4 +61,38 @@ pub fn dType(kind: FileKind) u8 {
         .symlink => 10,
         else => 0,
     };
+}
+
+/// Filesystem-wide statistics for statfs(2). Block counts are in `block_size`
+/// units; `bavail` is what an unprivileged user may still allocate.
+pub const FsStat = struct {
+    magic: u32 = 0,
+    block_size: u32 = 0,
+    blocks: u64 = 0,
+    bfree: u64 = 0,
+    bavail: u64 = 0,
+    files: u64 = 0,
+    ffree: u64 = 0,
+    name_max: u32 = 255,
+    fsid: u64 = 0,
+};
+
+pub const ST_RDONLY: u64 = 1;
+pub const STATFS_SIZE: usize = 120;
+
+/// Linux x86_64 `struct statfs`. The volumes are always mounted read-only.
+pub fn encodeStatfs(st: FsStat, out: *[STATFS_SIZE]u8) void {
+    @memset(out, 0);
+    const w = std.mem.writeInt;
+    w(u64, out[0..8], st.magic, .little);
+    w(u64, out[8..16], st.block_size, .little);
+    w(u64, out[16..24], st.blocks, .little);
+    w(u64, out[24..32], st.bfree, .little);
+    w(u64, out[32..40], st.bavail, .little);
+    w(u64, out[40..48], st.files, .little);
+    w(u64, out[48..56], st.ffree, .little);
+    w(u64, out[56..64], st.fsid, .little);
+    w(u64, out[64..72], st.name_max, .little);
+    w(u64, out[72..80], st.block_size, .little);
+    w(u64, out[80..88], ST_RDONLY, .little);
 }

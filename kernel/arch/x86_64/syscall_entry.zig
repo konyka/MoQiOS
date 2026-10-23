@@ -3426,7 +3426,6 @@ fn syscallLseek(fd: u32, offset: u64, whence: u32) i64 {
 /// access(pathname, mode) — check file accessibility.
 /// Simplified: try to open the file, return 0 if it exists.
 fn syscallAccess(pathname_ptr: u64, mode: u32) i64 {
-    _ = mode;
     if (pathname_ptr == 0 or pathname_ptr >= 0x0000_8000_0000_0000) return -14;
     const copy = @import("../../mm/copy_from_user.zig");
     const sched = @import("../../proc/sched.zig");
@@ -3439,9 +3438,13 @@ fn syscallAccess(pathname_ptr: u64, mode: u32) i64 {
     while (len < 256 and name_buf[len] != 0) : (len += 1) {}
     const name = name_buf[0..len];
 
-    // F_OK: just check existence
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = tm.getTask(cur_idx) orelse return -1;
+
+    // Mounted ext4/NTFS volumes answer from the file's real mode and owner.
+    if (rofsAccess(cur, name, mode)) |r| return r;
+
+    // Other filesystems: existence only (F_OK semantics).
     const fd_result = cur.fd_table.openWithCredentials(name, 0, cur.euid, cur.egid, cur.effective_caps);
     if (fd_result >= 0) {
         const fd: u32 = @intCast(fd_result);
@@ -3449,6 +3452,39 @@ fn syscallAccess(pathname_ptr: u64, mode: u32) i64 {
         return 0;
     }
     return -2; // ENOENT
+}
+
+/// access(2) for a path on a read-only volume; null when it is not on one.
+/// Directories on the way need search permission, the target is judged by
+/// rofs_access_policy.accessVerdict (write is always EROFS).
+fn rofsAccess(cur: anytype, name: []const u8, mode: u32) ?i64 {
+    const rofs = @import("../../fs/rofs.zig");
+    const policy = @import("../../fs/rofs_access_policy.zig");
+    if (!rofs.anyActive() or name.len == 0) return null;
+    var joined: [512]u8 = undefined;
+    var full: []const u8 = name;
+    if (name[0] != '/') {
+        const cwd = cur.cwd[0..cur.cwd_len];
+        if (cwd.len + 1 + name.len > joined.len) return null;
+        @memcpy(joined[0..cwd.len], cwd);
+        joined[cwd.len] = '/';
+        @memcpy(joined[cwd.len + 1 ..][0..name.len], name);
+        full = joined[0 .. cwd.len + 1 + name.len];
+    }
+    var norm: [256]u8 = undefined;
+    const abs = vfs_mod.normalizeAbs(full, &norm) orelse return null;
+    const route = vfs_mod.rofsRoute(abs) orelse return null;
+    const creds: rofs.Creds = .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override };
+    // Resolve through search checks only: the target's own bits are judged below.
+    const reach = rofs.reach(route.slot, route.rest, creds);
+    if (reach < 0) return reach;
+    const meta = rofs.metaFor(route.slot, route.rest, creds) orelse return -2;
+    return switch (policy.accessVerdict(meta, creds, mode)) {
+        .ok => 0,
+        .invalid => -22,
+        .read_only => -30,
+        .denied => -13,
+    };
 }
 
 /// nanosleep(req_timespec, rem_timespec) — high-resolution sleep.
@@ -4363,11 +4399,58 @@ fn syscallSchedSetaffinity(pid: u32, cpusetsize: u32, mask_ptr: u64) i64 {
     return 0;
 }
 
-/// #276 statfs(path, buf) — return filesystem statistics
+/// #276 statfs(path, buf) — return filesystem statistics. Paths on a mounted
+/// ext4/NTFS volume report that volume's real numbers; everything else keeps
+/// the built-in figures.
 fn syscallStatfs(path_ptr: u64, buf_ptr: u64) i64 {
-    _ = path_ptr; // Ignore path, return global fs stats
     if (buf_ptr == 0 or buf_ptr >= 0x0000_8000_0000_0000) return -14;
+    if (path_ptr != 0 and path_ptr < 0x0000_8000_0000_0000 and @import("../../fs/rofs.zig").anyActive()) {
+        if (rofsStatfsByPath(path_ptr, buf_ptr)) |r| return r;
+    }
     return writeStatfsBuf(buf_ptr);
+}
+
+/// statfs for a path under a rofs mount, or null when it is not on one.
+fn rofsStatfsByPath(path_ptr: u64, buf_ptr: u64) ?i64 {
+    const copy = @import("../../mm/copy_from_user.zig");
+    const sched = @import("../../proc/sched.zig");
+    const rofs = @import("../../fs/rofs.zig");
+    const cur = sched.currentTask() orelse return null;
+    var raw: [256]u8 = undefined;
+    const n = copy.copyStringFromUser(raw[0..255], path_ptr) orelse return null;
+    if (n == 0) return null;
+    var joined: [512]u8 = undefined;
+    var full: []const u8 = raw[0..n];
+    if (raw[0] != '/') {
+        const cwd = cur.cwd[0..cur.cwd_len];
+        if (cwd.len + 1 + n > joined.len) return null;
+        @memcpy(joined[0..cwd.len], cwd);
+        joined[cwd.len] = '/';
+        @memcpy(joined[cwd.len + 1 ..][0..n], raw[0..n]);
+        full = joined[0 .. cwd.len + 1 + n];
+    }
+    var norm: [256]u8 = undefined;
+    const abs = vfs_mod.normalizeAbs(full, &norm) orelse return null;
+    const route = vfs_mod.rofsRoute(abs) orelse return null;
+    // The path must exist and be searchable by this caller (statfs needs no
+    // read permission on the file itself, as on Linux).
+    const creds: rofs.Creds = .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override };
+    const reach = rofs.reach(route.slot, route.rest, creds);
+    if (reach < 0) return reach;
+    return rofsStatfsReply(rofs.statFs(route.slot, null), buf_ptr);
+}
+
+fn rofsStatfsReply(res: anytype, buf_ptr: u64) i64 {
+    const copy = @import("../../mm/copy_from_user.zig");
+    const fr = @import("../../fs/fs_reader.zig");
+    switch (res) {
+        .err => |e| return e,
+        .ok => |st| {
+            var buf: [fr.STATFS_SIZE]u8 = undefined;
+            fr.encodeStatfs(st, &buf);
+            return if (copy.copyToUser(@ptrFromInt(buf_ptr), &buf, buf.len) == buf.len) 0 else -14;
+        },
+    }
 }
 
 /// #277 fstatfs(fd, buf) — return filesystem statistics for open file
@@ -4378,6 +4461,11 @@ fn syscallFstatfs(fd: u32, buf_ptr: u64) i64 {
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task_mod2.getTask(cur_idx) orelse return -1;
     if (fd >= vfs_mod.MAX_FDS or cur.fd_table.fds[fd].fd_type == .none) return -9; // EBADF
+    const d = &cur.fd_table.fds[fd];
+    if (d.fd_type == .rofs_file) {
+        const rofs = @import("../../fs/rofs.zig");
+        return rofsStatfsReply(rofs.statFs(d.rofs_mount, d.rofs_gen), buf_ptr);
+    }
     return writeStatfsBuf(buf_ptr);
 }
 

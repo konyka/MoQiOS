@@ -14,6 +14,7 @@
 ///   I/J. (only when the scratch NVMe / SATA disk holds an ext4 volume)
 ///   L. permissions: the process runs as uid/gid 1000; files owned by 4242 are
 ///      checked against their other-class bits, the owner's own against the owner class
+///   M. statfs/fstatfs: real block and inode counts, read-only flag, cached NTFS count
 ///   K. mount-point rules: '/', /dev, /proc, /tmp, nested and '..'-disguised
 ///      targets are refused; equivalent spellings name one mount
 
@@ -66,6 +67,9 @@ static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_CHMOD     90
 #define SYS_SYMLINK   88
 #define SYS_TRUNCATE  210
+#define SYS_ACCESS    198
+#define SYS_STATFS    276
+#define SYS_FSTATFS   277
 
 #define EROFS   30
 #define ENOENT  2
@@ -163,6 +167,7 @@ static int mount_expect(const char *src, const char *target, const char *type, i
 }
 
 struct kstat_t { uint64_t w[18]; };   /* matches the 144-byte struct stat layout */
+struct kstatfs_t { uint64_t w[15]; }; /* 120-byte struct statfs: type bsize blocks bfree bavail files ffree fsid namelen frsize flags */
 
 void _start(void) {
     print("hello114: read-only ext4 and NTFS volumes\n");
@@ -252,6 +257,30 @@ void _start(void) {
     check(syscall3(SYS_READLINK, (uint64_t)"/mnt/e/small.txt", (uint64_t)link, 63) == -EINVAL, "D: readlink on a regular file is EINVAL");
     check(syscall2(SYS_OPEN, (uint64_t)"/mnt/e/missing.txt", O_RDONLY) == -ENOENT, "D: opening a missing file is ENOENT");
 
+    /* M: statfs / fstatfs report the volume's own numbers (the expected
+     * values are what dumpe2fs and a popcount of the NTFS $Bitmap say about
+     * the fixtures, see tests/ext4_test.zig and tests/ntfs_test.zig). */
+    {
+        struct kstatfs_t sf;
+        int64_t sr = syscall2(SYS_STATFS, (uint64_t)"/mnt/e/dir/sub", (uint64_t)&sf);
+        check(sr == 0 && sf.w[0] == 0xEF53 && sf.w[1] == 1024 && sf.w[2] == 4096, "M: statfs on ext4 reports type, block size and block count");
+        check(sr == 0 && sf.w[3] == 2092 && sf.w[4] == 2092 - 204 && sf.w[5] == 1024 && sf.w[6] == 694, "M: ext4 free blocks, reserved blocks and inodes match dumpe2fs");
+        check(sr == 0 && (sf.w[10] & 1) != 0 && sf.w[8] == 255, "M: the volume is flagged read-only, name max 255");
+        sr = syscall2(SYS_STATFS, (uint64_t)"/mnt/n", (uint64_t)&sf);
+        check(sr == 0 && sf.w[0] == 0x5346544e && sf.w[1] == 1024 && sf.w[2] == 4095, "M: statfs on NTFS reports type, cluster size and cluster count");
+        check(sr == 0 && sf.w[3] == 1743 && sf.w[4] == 1743 && sf.w[5] == 188 && sf.w[6] == 45, "M: NTFS free clusters and MFT records come from the bitmaps");
+        sr = syscall2(SYS_STATFS, (uint64_t)"/mnt/n", (uint64_t)&sf);
+        check(sr == 0 && sf.w[3] == 1743, "M: a second NTFS statfs (cached count) agrees");
+        fd = syscall2(SYS_OPEN, (uint64_t)"/mnt/e/small.txt", O_RDONLY);
+        sr = syscall2(SYS_FSTATFS, (uint64_t)fd, (uint64_t)&sf);
+        check(fd >= 0 && sr == 0 && sf.w[0] == 0xEF53 && sf.w[2] == 4096, "M: fstatfs on a volume fd");
+        syscall1(SYS_CLOSE, (uint64_t)fd);
+        check(syscall2(SYS_STATFS, (uint64_t)"/mnt/e/nope", (uint64_t)&sf) == -ENOENT, "M: statfs on a missing path is ENOENT");
+        check(syscall2(SYS_STATFS, (uint64_t)"/mnt/e/small.txt", 0) == -14, "M: a null buffer is EFAULT");
+        sr = syscall2(SYS_STATFS, (uint64_t)"/", (uint64_t)&sf);
+        check(sr == 0 && sf.w[2] != 4096 && sf.w[2] != 4095, "M: a path outside any volume keeps the built-in figures");
+    }
+
     /* E */
     check(syscall2(SYS_OPEN, (uint64_t)"/mnt/e/small.txt", O_WRONLY) == -EROFS, "E: open for writing is EROFS");
     check(syscall2(SYS_OPEN, (uint64_t)"/mnt/n/small.txt", O_RDWR) == -EROFS, "E: ntfs open read-write is EROFS");
@@ -298,6 +327,10 @@ void _start(void) {
     /* G: unmount with the fd still open */
     check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/e", 0) == 0, "G: umount ext4 with an open fd");
     check(syscall3(SYS_READ, (uint64_t)fd, (uint64_t)d, 8) < 0, "G: the open fd now fails instead of reading stale data");
+    {
+        struct kstatfs_t sf2;
+        check(syscall2(SYS_FSTATFS, (uint64_t)fd, (uint64_t)&sf2) == -ENODEV, "M: fstatfs on an fd whose volume was unmounted is ENODEV");
+    }
     syscall1(SYS_CLOSE, (uint64_t)fd);
     check(syscall2(SYS_OPEN, (uint64_t)"/mnt/e/small.txt", O_RDONLY) < 0, "G: the unmounted path is gone");
     /* Slot reuse: free both slots, mount ext4 (takes slot 0), open a file,
@@ -348,6 +381,23 @@ void _start(void) {
     check(fd >= 0, "L: ...but it can be opened to list");
     syscall1(SYS_CLOSE, (uint64_t)fd);
     check(syscall1(SYS_CHDIR, (uint64_t)"/mnt/p/perm/locked") == -EACCES, "L: chdir into a closed directory is EACCES");
+    /* access(2): the mode argument is honoured, not just existence */
+    check(syscall2(SYS_ACCESS, (uint64_t)"/mnt/p/perm/private.txt", 0) == 0, "L: access F_OK only needs the file to exist");
+    check(syscall2(SYS_ACCESS, (uint64_t)"/mnt/p/perm/private.txt", 4) == -EACCES, "L: access R_OK on another user's 0600 file is EACCES");
+    check(syscall2(SYS_ACCESS, (uint64_t)"/mnt/p/perm/world.txt", 4) == 0, "L: access R_OK on a world-readable file is 0");
+    check(syscall2(SYS_ACCESS, (uint64_t)"/mnt/p/perm/world.txt", 2) == -EROFS, "L: access W_OK on a read-only volume is EROFS");
+    check(syscall2(SYS_ACCESS, (uint64_t)"/mnt/p/perm/world.txt", 6) == -EROFS, "L: access R_OK|W_OK is EROFS too");
+    check(syscall2(SYS_ACCESS, (uint64_t)"/mnt/p/perm/world.txt", 1) == -EACCES, "L: access X_OK on a file without execute bits is EACCES");
+    check(syscall2(SYS_ACCESS, (uint64_t)"/mnt/p/perm/world.txt", 8) == -EINVAL, "L: access with unknown mode bits is EINVAL");
+    check(syscall2(SYS_ACCESS, (uint64_t)"/mnt/p/perm/locked/inside.txt", 0) == -EACCES, "L: access cannot look through a closed directory");
+    check(syscall2(SYS_ACCESS, (uint64_t)"/mnt/p/perm/nope.txt", 0) == -ENOENT, "L: access on a missing file is ENOENT");
+    check(syscall2(SYS_ACCESS, (uint64_t)"/mnt/p/perm", 1) == 0, "L: access X_OK on a searchable directory is 0");
+    check(syscall2(SYS_ACCESS, (uint64_t)"/mnt/p/perm/locked", 1) == -EACCES, "L: access X_OK on a 0700 directory of another user is EACCES");
+    {
+        struct kstatfs_t sf3;
+        check(syscall2(SYS_STATFS, (uint64_t)"/mnt/p/perm/locked/inside.txt", (uint64_t)&sf3) == -EACCES, "L: statfs cannot reach through a closed directory");
+        check(syscall2(SYS_STATFS, (uint64_t)"/mnt/p/perm/private.txt", (uint64_t)&sf3) == 0, "L: statfs needs only search permission, not read on the file");
+    }
     check(syscall3(SYS_READLINK, (uint64_t)"/mnt/p/link", (uint64_t)link, 63) == 9, "L: a symlink's own mode never blocks readlink");
     check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/p", 0) == 0, "L: umount");
 

@@ -111,6 +111,7 @@ pub const Volume = struct {
     inodes_count: u32,
     blocks_count: u64,
     free_blocks: u64,
+    reserved_blocks: u64,
     free_inodes: u32,
     incompat: u32,
     huge_file: bool,
@@ -150,8 +151,10 @@ pub const Volume = struct {
 
         var blocks_count: u64 = r32(&sb, 0x4);
         var free_blocks: u64 = r32(&sb, 0x0C);
+        var reserved_blocks: u64 = r32(&sb, 0x08);
         if (is64) {
             blocks_count |= @as(u64, r32(&sb, 0x150)) << 32;
+            reserved_blocks |= @as(u64, r32(&sb, 0x154)) << 32;
             free_blocks |= @as(u64, r32(&sb, 0x158)) << 32;
         }
         const first_data = r32(&sb, 0x14);
@@ -175,6 +178,7 @@ pub const Volume = struct {
             .inodes_count = inodes_count,
             .blocks_count = blocks_count,
             .free_blocks = free_blocks,
+            .reserved_blocks = reserved_blocks,
             .free_inodes = r32(&sb, 0x10),
             .incompat = incompat,
             .huge_file = r32(&sb, 0x64) & RO_COMPAT_HUGE_FILE != 0,
@@ -232,6 +236,27 @@ pub const Volume = struct {
         // A free inode has mode 0 and no links; reaching one means a stale link.
         if (in.mode == 0) return error.Corrupt;
         return in;
+    }
+
+    /// statfs numbers from the superblock counters. They are exact for a
+    /// cleanly unmounted volume; one that needs journal recovery may report
+    /// slightly stale free counts (the journal is not replayed).
+    pub fn fsStat(self: *const Volume) fr.FsStat {
+        const free = @min(self.free_blocks, self.blocks_count);
+        const avail = if (free > self.reserved_blocks) free - self.reserved_blocks else 0;
+        var fsid: u64 = 0;
+        for (0..8) |i| fsid |= @as(u64, self.uuid[i] ^ self.uuid[i + 8]) << @intCast(8 * i);
+        return .{
+            .magic = MAGIC,
+            .block_size = self.block_size,
+            .blocks = self.blocks_count,
+            .bfree = free,
+            .bavail = avail,
+            .files = self.inodes_count,
+            .ffree = @min(self.free_inodes, self.inodes_count),
+            .name_max = 255,
+            .fsid = fsid,
+        };
     }
 
     pub fn stat(self: *const Volume, in: *const Inode) fr.Stat {
