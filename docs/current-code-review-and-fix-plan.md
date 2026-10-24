@@ -4098,7 +4098,7 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   并行 GPT SMP=2 猎捕跑了 107 次启动：4 次停滞，**四次的现场都是同一个签名**——某任务停在 `nvme.parkUntilInterrupt`、
   `init` 在 `waitpid`、两个 CPU 都 `hlt` 且 `IF=1`（`hello29` 一次，`hello21` 三次；停在不同测试是因为停在下一次落盘的地方）。
   约 4%/次启动。所以这个竞态不是我引入的，上一节的修复针对的就是它。最终构建在同样的并行猎捕里没有再出现这个签名。
-- **两次内核态故障（未解释；一次完整转储保留，一次只剩串口片段）**：
+- **两次内核态故障（找到并复现了一个可造成同类崩溃的窗口并已修复；自然发生的故障是否全部由它引起，未证实）**：
   (1) 早先 `hello50` 的 `fork` 期间：`#GP`，`RIP=0xaaaaaaaaaaaaaaaa`，`CS=0x8`（内核态），`RSP` 落在刚 fork 出的子进程
   （tid 69）的内核栈内，而 CPU0 当前任务是父进程（tid 67）；完整转储因我重启猎捕脚本时它会删自己的目录而丢失。
   (2) 最终构建的猎捕第 18 次启动（`hello44` 刚被 spawn 之后），转储已保存（`/tmp/keep_evidence/h4_r18`，不在仓库里）：
@@ -4109,8 +4109,28 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   与 slot 5 的内核栈有关。**转储没有显示的**：谁、何时让第二个 CPU 进入了那条栈；我据此怀疑"同一个任务被两个 CPU 同时运行
   （新发布的任务被重复调度）"，但这只是对现象的一种读法，**没有验证**，我没有读完调度器的 claim/发布路径去证实或证伪。
   (3) 发生率比较：最终构建约 250 次启动出现 2 次，干净的 `3fb2487` 107 次启动出现 0 次。若两者发生率相同，107 次里期望约 0.9 次，
-  所以 0 对 2 **不构成统计上的差别**；我既不能说是本次会话的改动引入了它们，也不能说与之无关。唯一诚实的结论是"原因未知，
-  证据有限"。要继续查：在 `forcedPass`/`switchTo`/`publishRunnable` 处加"同一任务同时 current 于两个 CPU"的断言并长时间并行猎捕。
+  所以 0 对 2 **不构成统计上的差别**；仅凭发生率不能判断是否本次会话的改动引入。
+  (4) **后续读法的纠正**：重读转储后，故障 CPU1 的 `RSP` 在 slot 5 的内核栈上，而 CPU1 自己的 `current_task_idx=0`，
+  CPU0 的 `current=5`——也就是说 CPU1 在**别的任务的内核栈上**运行，原因不是"同一任务被调度两次"，而是下面的窗口。
+  (5) **根因（已复现）**：`sched.releaseOldTask` 在 CPU 仍站在旧任务内核栈上时就 `releaseToReady` 并入队，使该任务立刻可被
+  另一个 CPU 认领；但这个 CPU 还要走完 `interruptDispatch` 的返回路径和 `commonStub` 的尾声，这些都在旧栈上执行。
+  另一个 CPU 一旦认领并运行该任务，就会和仍在旧栈尾声里的原 CPU 同时使用同一条内核栈，互相覆盖栈帧。
+  (6) **放大实验**：在 `releaseOldTask` 的 `releaseToReady` 之后临时加 200k 次 `pause` 自旋（把窗口拉长），**未修复代码 4/4 次启动 panic**，
+  其中一次与 h4_r18 完全同签名（`RIP=0xffff800000362000`、"cast causes pointer to be null"）。临时自旋已移除（`grep TEMPORARY` 为 0）。
+  (7) **修复**：`PerCpu` 新增 `pending_release`（`gs:116`，编译期断言偏移）；`releaseOldTask` 只记录“待发布的旧任务”而不发布；
+  `commonStub` 在切到新栈（`movq %rax,%rsp`）之后、帧守卫之前，若 `pending_release` 非空就以对齐的栈调用 `pendingReleaseFlushStub`
+  → `sched.pendingReleaseFlush()` 完成 `releaseToReady`+入队。这样旧任务只有在本 CPU 已离开它的内核栈之后才能被他核认领。
+  已有未发布项时先 flush；没有 per-CPU 数据时回退为直接发布。源码守卫测试“a task switched away from is published only after the CPU
+  has left its kernel stack”已验证能咬住（把 `releaseToReady` 放回 `releaseOldTask` → 测试失败，还原后通过）。
+  (8) **修复后的验证**：同一放大器下，修复构建 4 次启动均无 panic（只是慢），其中只有 **1 次**在 240 秒预算内完整到达 shell
+  （第二次重跑我中途终止了，所以完整通过的放大样本只有 1 个）。
+  (9) **修复构建的自然猎捕**：4 路并行 GPT SMP=2 共 69 次启动全部到达 shell（另有 1 次因并行启动 limine 的已知竞态
+  `limine/limine` 缺失而没有启动，与内核无关），0 次停滞、0 次内核态故障/panic；hello114 的 214 项检查在五个配置下 0 FAIL，
+  `smoke-smp-stress` 5/5。这与“未修复构建约 2/250 次出现内核态故障”相容，但 69 次的样本量在约 1% 发生率下期望值只有约 0.7 次，
+  **不足以证明自然故障已消除**。
+  (10) **仍未证实的**：自然发生率（约 2/250）太低，修复后是否使自然故障归零需要更长的并行猎捕，统计上还不能下结论；
+  `hello50` 那次 `#GP RIP=0xaaaa…` 转储已丢，是否同因没有证明；`timerTickLegacy` 等 legacy 路径（`sched_fine_grain_enable` 关闭时）、
+  `apBootstrapIdle`、`portableKernelSwitch` 仍直接把旧任务置为 ready，**我没有审查它们是否有同样的窗口**。
 - **并行猎捕脚本的两个教训**：(a) 看门狗用"60 秒无新输出"判停滞会把真实的慢阶段（旧游标缓存下 98 秒）误判为挂起，
   判停滞应同时要求两个 CPU 都 `hlt`；(b) 脚本不要在开头 `rm -rf` 自己的输出目录，否则重启会销毁已捕获的证据。
   另外 `tools/gdb_stall_probe.sh` 里 `x/24gx` 会读过内核栈顶而让整段转储中途报错，已改为 `x/20gx`。
@@ -4120,7 +4140,7 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   hello114 T 段 14 项逐个检查常用 fd 系统调用对 `-1`/`1<<32` 返回错误而不是停机。T 段在修复前会在第一个未处理的调用上
   panic 并停止，所以它一次只能暴露一个缺陷；我先用 `grep` 扫了同类模式再统一修。`at_path.zig` 与 `execveat` 辅助函数里
   的 `@intCast(dirfd)` 已有前置范围判断，`close_range` 里的是循环范围内的值，未改。
-- **验证**：host 测试 671/671（594→671：ext4 20、NTFS 19、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；锁守卫 1；virtio 索引守卫 1；
+- **验证**：host 测试 679/679（594→679：ext4 20、NTFS 19、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；锁守卫 1；virtio 索引守卫 1；调度发布时机守卫 1；
   真实镜像、`debugfs`/`ntfsls` 交叉核对、敌对输入）；三架构构建；`hello114` 214 项运行时检查（含 mmap 25、目录描述符 21、按描述符调用 15、截断 4、fd 范围 14 项）（NVMe/AHCI 两段默认 skip），MBR
   默认镜像 SMP=1/2/8 通过，GPT 镜像（`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`）通过；
   变异验证（删 EROFS 守卫 → 7 项 FAIL；忽略挂载代数 → 过期 fd 项 FAIL；关掉挂载规则 → 7 项 FAIL；
@@ -4132,11 +4152,11 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 
 | Gate | Result | Notes |
 |---|---|---|
-| `zig build test`（0.16.0） | Passed 671/671 | 594→671 |
+| `zig build test`（0.16.0） | Passed 679/679 | 594→679 |
 | `zig build` / riscv64 / aarch64 | Passed | 三架构 |
 | smoke SMP=1 / 2 / 8（MBR 数据盘） | Passed | hello114 PASS，90 项 ok；I/J 段默认 skip |
 | smoke SMP=1 / 2 / 8（GPT 数据盘） | Passed | SMP=1/2/8 均 PASS；GPT 变异（`isProtectiveMbr` 恒 false）→ 43 项 FAIL |
-| `smoke-smp-stress` | Passed 5/5 | 双核连续 5 轮 |
+| `smoke-smp-stress` | Passed 5/5 | 双核连续 5 轮（含调度发布修复的最终构建） |
 
 ---
 

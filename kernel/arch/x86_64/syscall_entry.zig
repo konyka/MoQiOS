@@ -115,6 +115,11 @@ pub const PerCpu = extern struct {
     /// Non-zero while a reschedule IPI is in flight to this CPU. Further
     /// kicks are dropped until the IPI pass clears it (ipi_kick_policy).
     resched_pending: u8 = 0,
+    /// Task index whose release to .ready is deferred until this CPU has left
+    /// that task's kernel stack (0xFFFFFFFF = none). sched.releaseOldTask fills
+    /// it; commonStub's epilogue flushes it right after `movq %rax, %rsp`.
+    /// Offset is hard-coded in commonStub (%%gs:116) and asserted below.
+    pending_release: u32 = 0xFFFFFFFF,
 };
 
 /// Per-CPU data array, indexed by CPU logical ID.
@@ -205,6 +210,8 @@ comptime {
         @compileError("PerCpu.cpu_id offset changed — update %gs: offset");
     if (@offsetOf(PerCpu, "slice_remaining") != 24)
         @compileError("PerCpu.slice_remaining offset changed — update %gs: offset");
+    if (@offsetOf(PerCpu, "pending_release") != 116)
+        @compileError("PerCpu.pending_release offset changed — update idt.commonStub (%gs:116)");
 }
 
 // v53.48: Fast per-CPU field access via %gs:offset — eliminates rdmsr

@@ -1003,12 +1003,39 @@ fn flushPendingRelease(frame: *idt.InterruptFrame) void {
 /// underneath us (waitpid parent, exitTask, signal kill) is left untouched
 /// and must NOT be re-enqueued.
 fn releaseOldTask(old_task: *task.Task) void {
+    // Do not publish yet. At this point the CPU has moved the anchor and the
+    // current-task index but is still executing on old_task's kernel stack (it
+    // runs on through interruptDispatch's return and commonStub's epilogue). A
+    // task that is .ready can be claimed by another CPU, which resumes it on
+    // that same stack and overwrites frames this CPU still needs. Widening the
+    // gap with a busy-wait here made the kernel fault in every boot, including
+    // the signature of a crash seen in the wild. The epilogue publishes the task
+    // (pendingReleaseFlush) right after it has left the stack.
+    const pc = thisCpu() orelse {
+        publishOldTask(old_task);
+        return;
+    };
+    if (pc.pending_release != NO_TASK_IDX) pendingReleaseFlush(); // never drop an earlier one
+    pc.pending_release = old_task.self_idx;
+}
+
+fn publishOldTask(old_task: *task.Task) void {
     if (sched_claim.releaseToReady(&old_task.state)) {
         // Task #2: re-publish to its target per-CPU queue so the next
         // pickNextFg picks it up from the local fast-path. Best-effort —
         // a full queue just falls back to the bitmap scan.
         if (per_cpu.isAnyReady()) _ = per_cpu.enqueueTask(old_task);
     }
+}
+
+/// Publish the task recorded by releaseOldTask. Runs from commonStub's epilogue
+/// after the CPU has switched to the incoming frame, with interrupts off.
+pub fn pendingReleaseFlush() void {
+    const pc = thisCpu() orelse return;
+    const idx = pc.pending_release;
+    if (idx == NO_TASK_IDX) return;
+    pc.pending_release = NO_TASK_IDX;
+    if (task.getTask(idx)) |t| publishOldTask(t);
 }
 
 /// J2 fine-grained pick — same three-stage fallback as `pickNext` (local

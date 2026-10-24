@@ -6040,3 +6040,35 @@ test "the read-only volume lock sleeps; no spinlock is held across device I/O" {
         pos = acq + 1;
     }
 }
+
+test "a task switched away from is published only after the CPU has left its kernel stack" {
+    // releaseToReady makes a task claimable by every other CPU. The scheduler
+    // pass that decides the switch still runs on the old task's kernel stack
+    // and returns through commonStub's epilogue on it, so publishing inside the
+    // pass let another CPU resume that task on a stack still in use. The pass
+    // must only record the task; commonStub's epilogue publishes it after
+    // `movq %rax, %rsp`.
+    const sched = kt.sched_source;
+    const rel = std.mem.indexOf(u8, sched, "fn releaseOldTask(old_task: *task.Task) void {") orelse return error.TestUnexpectedResult;
+    const rel_end = std.mem.indexOfPos(u8, sched, rel, "fn publishOldTask(") orelse return error.TestUnexpectedResult;
+    const body = sched[rel..rel_end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "releaseToReady") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "enqueueTask") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "pc.pending_release = old_task.self_idx;") != null);
+    // publishOldTask is defined once and called from exactly two places: the flush
+    // (the normal path) and releaseOldTask's fallback for a CPU without per-CPU
+    // data yet (early boot, no other CPU can claim anything then).
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, sched, "publishOldTask("));
+    const flush_fn = std.mem.indexOf(u8, sched, "pub fn pendingReleaseFlush() void {") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, sched[flush_fn..], "publishOldTask(t)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "publishOldTask(old_task)") != null);
+
+    const idt = kt.idt_source;
+    const stack_switch = std.mem.indexOf(u8, idt, "\\\\movq %%rax, %%rsp") orelse return error.TestUnexpectedResult;
+    const flush = std.mem.indexOfPos(u8, idt, stack_switch, "call pendingReleaseFlushStub") orelse return error.TestUnexpectedResult;
+    const pops = std.mem.indexOfPos(u8, idt, stack_switch, "\\\\popq %%r15") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(stack_switch < flush and flush < pops);
+    try std.testing.expect(std.mem.indexOf(u8, idt, "cmpl $0xFFFFFFFF, %%gs:116") != null);
+    // the offset the assembly hard-codes is asserted next to the field
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "@offsetOf(PerCpu, \"pending_release\") != 116") != null);
+}

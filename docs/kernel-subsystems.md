@@ -613,8 +613,15 @@ testing.
 - **换出任务最后发布**：`timerTickFg` 的切换路径把旧任务的 `.running → .ready` +
   重新入队推迟到锚点/current/CR3 全部切换完之后（`releaseOldTask`）。在此之前旧任务
   保持 `.running` 不可认领，任何远程 CPU 都无法在本 CPU 仍运行于其内核栈上时开始执行
-  它——旧代码在 `sched_lock` 释放前就重新发布旧任务，整个中断尾声都是双栈窗口；现在
-  该窗口收窄到 [release → iretq]。cmpxchg 同时兼任旧的 `state == .running` 检查：
+  它——旧代码在 `sched_lock` 释放前就重新发布旧任务，整个中断尾声都是双栈窗口。
+  后来发现仅推迟到 `releaseOldTask` 仍不够：该函数运行时 CPU 还站在旧任务的内核栈上，
+  `interruptDispatch` 的返回与 `commonStub` 尾声都还要用这条栈，他核此时认领旧任务就会
+  与之共用同一内核栈（放大实验下稳定 panic）。现在 `releaseOldTask` 只把旧任务索引记入
+  per-CPU `pending_release`（`gs:116`），由 `commonStub` 在 `movq %rax,%rsp` 切到新栈之后
+  调用 `sched.pendingReleaseFlush()` 才真正 `releaseToReady` + 入队；旧任务因此只在
+  本 CPU 已离开其内核栈后才可被认领。没有 per-CPU 数据时回退为直接发布。
+  legacy 路径（`sched_fine_grain_enable` 关闭）与 `apBootstrapIdle`/`portableKernelSwitch`
+  未审查。cmpxchg 同时兼任旧的 `state == .running` 检查：
   切换窗口内自行阻塞/退出的任务（waitpid 父进程、exitTask、信号杀死）发布失败，
   不会被重新入队。
 - **`sched_lock` 还剩什么**：细粒度模式下热路径不再使用它，仅保留给 legacy 回滚体

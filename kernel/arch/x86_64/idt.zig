@@ -253,6 +253,20 @@ export fn commonStub() callconv(.naked) void {
         \\// resume through its own entry frame.
         \\movq %%rax, %%rsp
         \\
+        \\// Publish a task the scheduler switched away from. Doing it here, and not
+        \\// in the scheduler pass, is the point: until the instruction above this
+        \\// CPU was still running on that task's kernel stack, and a task another
+        \\// CPU can claim must not have a live stack. PerCpu.pending_release sits at
+        \\// %%gs:116 (offset asserted in syscall_entry.zig). rbp is free to clobber:
+        \\// the incoming frame's rbp is restored by the pops below.
+        \\cmpl $0xFFFFFFFF, %%gs:116
+        \\je 4f
+        \\movq %%rsp, %%rbp
+        \\andq $-16, %%rsp
+        \\call pendingReleaseFlushStub
+        \\movq %%rbp, %%rsp
+        \\4:
+        \\
         \\// FRAME GUARD (SMP #GP hunt): validate the frame about to be popped.
         \\// A bad rip/cs here would fault inside iretq with the stack already
         \\// half-consumed; catch it while the frame is still fully intact.
@@ -391,6 +405,11 @@ pub fn interruptDispatch(frame: *InterruptFrame) callconv(.c) u64 {
     }
     pc.anchor_switched = prev_switched;
     return @intFromPtr(frame);
+}
+
+/// Called by commonStub's epilogue once the CPU is on the incoming task's frame.
+export fn pendingReleaseFlushStub() callconv(.c) void {
+    @import("../../proc/sched.zig").pendingReleaseFlush();
 }
 
 /// Dispatch body — decides whether to handle as exception (halt) or IRQ.
