@@ -121,17 +121,22 @@ int main(int argc, char **argv, char **envp) {
     /* 5. 孤儿进程组：子会话长退出 → 成员收 SIGHUP（经继承的 pipe 回报） */
     int pfd[2];
     if (pipe(pfd) != 0) { print("hello58: FAIL pipe\n"); return 1; }
+    int rfd[2]; /* C -> D: "about to stop myself" */
+    if (pipe(rfd) != 0) { print("hello58: FAIL pipe\n"); return 1; }
     long d = fork();
     if (d == 0) {
         setsid(); // 子会话长（D 自己有 sid==tid）
         long c = fork();
         if (c == 0) {
             close(pfd[0]);
+            close(rfd[0]);
             struct ksigaction sa = { on_sighup, 0, 0, 0 };
             sigaction(SIGHUP, &sa, 0);
             /* POSIX: only a newly orphaned group WITH STOPPED MEMBERS gets
              * SIGHUP+SIGCONT (running background groups are left alone).
              * Stop ourselves; the orphaning must wake and hang us up. */
+            char r = 'R';
+            syscall3(SYS_write, rfd[1], (long)&r, 1);
             kill(getpid(), SIGSTOP);
             while (!sighup_seen) nanosleep(&ts, 0);
             char h = 'H';
@@ -140,12 +145,23 @@ int main(int argc, char **argv, char **envp) {
         }
         close(pfd[0]);
         close(pfd[1]);
+        close(rfd[1]);
+        /* Count the grace period from C's "about to stop" message, not from fork:
+         * SIGHUP goes only to a group orphaned WITH a stopped member, so a slow
+         * scheduler must not let the leader exit before C has stopped. */
+        {
+            char rb = 0;
+            struct timespec rp = { 0, 5 * 1000 * 1000 };
+            for (int i = 0; i < 2000 && read(rfd[0], &rb, 1) != 1; i++) nanosleep(&rp, 0);
+        }
         /* Let C reach its SIGSTOP before the leader exits. */
         struct timespec w = { 0, 50 * 1000 * 1000 };
         nanosleep(&w, 0);
         _exit(0); // 会话长退出 → C 所在组成孤儿且含停止成员 → SIGHUP+SIGCONT
     }
     close(pfd[1]);
+    close(rfd[0]);
+    close(rfd[1]);
     /* 等 C 的 SIGHUP 报告（pipe 读在本内核是非阻塞的：空管道返回 0，轮询到有界） */
     char buf[4] = { 0 };
     long rn = 0;
