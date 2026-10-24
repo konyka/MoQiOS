@@ -1301,7 +1301,14 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
     }
     const fi = files[file_idx];
 
-    if (new_size >= fi.size) {
+    // Writes are staged in a buffer shared by every descriptor of the file and
+    // reach `fi.size` only when flushed. A truncate shorter than the staged data
+    // but not shorter than the flushed size would otherwise be treated as growth
+    // and leave the staged bytes in place to be flushed after the "truncate".
+    const staged_end: u64 = @import("writeback.zig").stagedEnd(0x2000_0000_0000_0000 + @as(u64, fi.first_cluster), .fat32);
+    const effective_size: u64 = @max(@as(u64, fi.size), staged_end);
+
+    if (new_size >= effective_size) {
         // Growing: just update the size (clusters are allocated on write).
         if (new_size > fi.size) {
             files[file_idx].size = new_size;
@@ -1324,12 +1331,19 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
     if (@import("page_cache.zig").flushInode(wb_inode, mmapPageFlush).failed or
         !writeback.invalidateFile(wb_inode, .fat32, writebackFlush)) return false;
     flags = fs_lock.acquire();
-    // The slot may have been reused while the lock was dropped.
-    if (!files[file_idx].active or files[file_idx].first_cluster != fi.first_cluster or
-        files[file_idx].size != fi.size or files[file_idx].last_cluster != fi.last_cluster)
-    {
+    // The slot may have been reused while the lock was dropped. Flushing the
+    // staged data above can itself have grown the file (size, and with it
+    // last_cluster), so only the identity of the file is compared; everything
+    // else is re-read from the slot below.
+    if (!files[file_idx].active or files[file_idx].first_cluster != fi.first_cluster) {
         fs_lock.release(flags);
         return false;
+    }
+    // The flush may have extended the file: truncating to `new_size` still has
+    // to shrink it, so check against the size as it is now.
+    if (new_size >= files[file_idx].size) {
+        fs_lock.release(flags);
+        return true;
     }
 
     const cluster_size = @as(u32, fat32_sectors_per_cluster) * SECTOR_SIZE;

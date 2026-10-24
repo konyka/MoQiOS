@@ -24,6 +24,10 @@
 ///      fchdir() on a regular file is ENOTDIR
 ///   R. descriptor-based calls on a volume fd: nothing may modify or sync the volume, and an
 ///      unsupported call must fail cleanly (never act on another filesystem's object)
+///   S. truncation on the writable root disk while ANOTHER descriptor of the same file holds
+///      unflushed or newer data (O_TRUNC, ftruncate, truncate(path)); not a volume feature, but
+///      found while testing one
+///   T. descriptor numbers outside the table (-1, 1<<32) are rejected by the common fd syscalls
 ///   M. statfs/fstatfs: real block and inode counts, read-only flag, cached NTFS count
 ///   K. mount-point rules: '/', /dev, /proc, /tmp, nested and '..'-disguised
 ///      targets are refused; equivalent spellings name one mount
@@ -183,6 +187,7 @@ static int64_t slurp(const char *path, uint8_t *buf, uint64_t cap) {
 }
 
 static uint8_t big[400000];
+static uint8_t small_probe_buf[256];
 
 struct dirent64 { uint64_t ino; int64_t off; uint16_t reclen; uint8_t type; char name[]; };
 
@@ -571,6 +576,86 @@ void _start(void) {
         n = slurp("/mnt/big/bigdir_entry_with_a_long_name_1234.txt", small, sizeof(small));
         check(n == 0, "N: lookup of one entry deep in the tree works");
         check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/big", 0) == 0, "N: umount");
+    }
+
+    /* S: truncation on the writable ext2 root disk when a second descriptor of the
+     * same file exists. Each open ext2 slot keeps its own copy of the inode and
+     * writes are staged in a shared buffer, so truncating through one descriptor
+     * must account for what the other one wrote. */
+    {
+        static const char data22[] = "canary-data-0123456789";
+        uint8_t sb[32];
+
+        /* A: O_TRUNC while another descriptor has an unflushed write */
+        int64_t a1 = syscall2(SYS_OPEN, (uint64_t)"/h114-s-a", O_RDWR | O_CREAT | O_TRUNC);
+        syscall3(SYS_WRITE, (uint64_t)a1, (uint64_t)data22, 22);
+        int64_t a2 = syscall2(SYS_OPEN, (uint64_t)"/h114-s-a", O_RDWR | O_TRUNC);
+        syscall3(SYS_WRITE, (uint64_t)a2, (uint64_t)"hello fs\n", 9);
+        syscall3(SYS_LSEEK, (uint64_t)a2, 0, 0);
+        int64_t an = syscall3(SYS_READ, (uint64_t)a2, (uint64_t)sb, 32);
+        check(an == 9 && sb[0] == 'h' && sb[8] == '\n', "S: O_TRUNC discards another descriptor's unflushed data (reads back exactly 9 bytes)");
+        syscall1(SYS_CLOSE, (uint64_t)a1);
+        syscall1(SYS_CLOSE, (uint64_t)a2);
+        syscall1(87, (uint64_t)"/h114-s-a");
+
+        /* B: ftruncate to a shorter length while another descriptor has an unflushed write */
+        int64_t b1 = syscall2(SYS_OPEN, (uint64_t)"/h114-s-b", O_RDWR | O_CREAT | O_TRUNC);
+        syscall3(SYS_WRITE, (uint64_t)b1, (uint64_t)data22, 22);
+        int64_t b2 = syscall2(SYS_OPEN, (uint64_t)"/h114-s-b", O_RDWR);
+        int64_t br = syscall2(SYS_FTRUNCATE, (uint64_t)b2, 5);
+        syscall3(SYS_LSEEK, (uint64_t)b2, 0, 0);
+        int64_t bn = syscall3(SYS_READ, (uint64_t)b2, (uint64_t)sb, 32);
+        check(br == 0 && bn == 5 && sb[0] == 'c' && sb[4] == 'r', "S: ftruncate(5) shortens a file whose data another descriptor has not flushed");
+        syscall1(SYS_CLOSE, (uint64_t)b1);
+        syscall1(SYS_CLOSE, (uint64_t)b2);
+        syscall1(87, (uint64_t)"/h114-s-b");
+
+        /* C: truncate(path) while another descriptor has an unflushed write */
+        int64_t c1 = syscall2(SYS_OPEN, (uint64_t)"/h114-s-c", O_RDWR | O_CREAT | O_TRUNC);
+        syscall3(SYS_WRITE, (uint64_t)c1, (uint64_t)data22, 22);
+        int64_t cr = syscall2(SYS_TRUNCATE, (uint64_t)"/h114-s-c", 5);
+        syscall3(SYS_LSEEK, (uint64_t)c1, 0, 0);
+        int64_t cn = syscall3(SYS_READ, (uint64_t)c1, (uint64_t)sb, 32);
+        check(cr == 0 && cn == 5 && sb[0] == 'c' && sb[4] == 'r', "S: truncate(path, 5) shortens a file whose data another descriptor has not flushed");
+        syscall1(SYS_CLOSE, (uint64_t)c1);
+        syscall1(87, (uint64_t)"/h114-s-c");
+
+        /* F: a descriptor opened BEFORE another one wrote and synced the data has a stale
+         * copy of the inode (size 0, no block pointers). The writer is CLOSED before the
+         * truncate so nothing can rewrite the inode behind it. Truncating through the stale
+         * descriptor must not wipe the blocks the writer allocated: the kept prefix has to
+         * survive. */
+        int64_t f1 = syscall2(SYS_OPEN, (uint64_t)"/h114-s-f", O_RDWR | O_CREAT | O_TRUNC);
+        int64_t f2 = syscall2(SYS_OPEN, (uint64_t)"/h114-s-f", O_RDWR);
+        syscall3(SYS_WRITE, (uint64_t)f1, (uint64_t)data22, 22);
+        syscall1(SYS_FSYNC, (uint64_t)f1);
+        syscall1(SYS_CLOSE, (uint64_t)f1);
+        int64_t fr = syscall2(SYS_FTRUNCATE, (uint64_t)f2, 5);
+        syscall1(SYS_CLOSE, (uint64_t)f2);
+        int64_t f3 = syscall2(SYS_OPEN, (uint64_t)"/h114-s-f", O_RDONLY);
+        int64_t fn = syscall3(SYS_READ, (uint64_t)f3, (uint64_t)sb, 32);
+        check(fr == 0 && fn == 5 && sb[0] == 'c' && sb[1] == 'a' && sb[4] == 'r', "S: truncating through a descriptor with a stale inode keeps the prefix another descriptor wrote");
+        syscall1(SYS_CLOSE, (uint64_t)f3);
+        syscall1(87, (uint64_t)"/h114-s-f");
+    }
+
+    /* T: an out-of-range descriptor number must be an error, not a kernel panic. A write()
+     * with fd = -1 (the value a failed open() returns) is the common way to hit this. */
+    {
+        check(syscall3(SYS_WRITE, (uint64_t)-1, (uint64_t)"x", 1) < 0, "T: write(-1, ...) fails instead of panicking the kernel");
+        check(syscall3(SYS_WRITE, (uint64_t)0x100000000ULL, (uint64_t)"x", 1) < 0, "T: write(1<<32, ...) fails instead of panicking the kernel");
+        check(syscall3(SYS_READ, (uint64_t)-1, (uint64_t)small_probe_buf, 4) < 0, "T: read(-1, ...) fails instead of panicking the kernel");
+        check(syscall4(SYS_PWRITE, (uint64_t)-1, (uint64_t)"x", 1, 0) < 0, "T: pwrite(-1, ...) fails instead of panicking the kernel");
+        check(syscall4(SYS_PREAD, (uint64_t)-1, (uint64_t)small_probe_buf, 4, 0) < 0, "T: pread(-1, ...) fails instead of panicking the kernel");
+        check(syscall3(SYS_LSEEK, (uint64_t)-1, 0, 0) < 0, "T: lseek(-1, ...) fails instead of panicking the kernel");
+        check(syscall2(SYS_FSTAT, (uint64_t)-1, (uint64_t)small_probe_buf) < 0, "T: fstat(-1, ...) fails instead of panicking the kernel");
+        check(syscall1(SYS_FSYNC, (uint64_t)-1) < 0, "T: fsync(-1) fails instead of panicking the kernel");
+        check(syscall2(SYS_FTRUNCATE, (uint64_t)-1, 0) < 0, "T: ftruncate(-1, 0) fails instead of panicking the kernel");
+        check(syscall1(SYS_CLOSE, (uint64_t)-1) < 0, "T: close(-1) fails instead of panicking the kernel");
+        check(syscall1(SYS_DUP, (uint64_t)-1) < 0, "T: dup(-1) fails instead of panicking the kernel");
+        check(syscall1(SYS_FCHDIR, (uint64_t)-1) < 0, "T: fchdir(-1) fails instead of panicking the kernel");
+        check(syscall3(16 /* ioctl */, (uint64_t)-1, 0x541B /* FIONREAD */, (uint64_t)small_probe_buf) < 0, "T: ioctl(-1, FIONREAD) fails instead of panicking the kernel");
+        check(syscall3(16 /* ioctl */, (uint64_t)-1, 0x5421 /* FIONBIO */, (uint64_t)small_probe_buf) < 0, "T: ioctl(-1, FIONBIO) fails instead of panicking the kernel");
     }
 
     /* R: descriptor-based calls on a volume descriptor. The descriptors of the

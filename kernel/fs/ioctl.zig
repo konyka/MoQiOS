@@ -130,7 +130,7 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
             if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14;
             const cur_idx = sched.currentTaskIndex() orelse return -3;
             const cur = task_mod.getTask(cur_idx) orelse return -3;
-            const fd_idx: u32 = @intCast(fd);
+            const fd_idx: u32 = if (fd > 0xFFFF_FFFF) 0xFFFF_FFFF else @intCast(fd);
             var nread: i32 = 0;
 
             if (fd_idx < vfs.MAX_FDS) {
@@ -163,7 +163,7 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
             if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14;
             const cur_idx = sched.currentTaskIndex() orelse return -3;
             const cur = task_mod.getTask(cur_idx) orelse return -3;
-            const fd_idx: u32 = @intCast(fd);
+            const fd_idx: u32 = if (fd > 0xFFFF_FFFF) 0xFFFF_FFFF else @intCast(fd);
 
             if (fd_idx >= vfs.MAX_FDS) return -9;
             if (cur.fd_table.fds[fd_idx].fd_type == .none) return -9;

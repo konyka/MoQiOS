@@ -11,6 +11,13 @@ const vfs_mod = @import("vfs.zig");
 const EFAULT: i64 = 14;
 
 /// write(fd, buf, count) → bytes written or -errno
+/// A descriptor number is a full 64-bit register. Anything that does not fit a
+/// u32 cannot name an open descriptor, so map it to maxInt(u32), which the fd
+/// table rejects; a plain @intCast would panic the kernel for write(-1, ...).
+fn fdIndex(fd: u64) u32 {
+    return if (fd > 0xFFFF_FFFF) 0xFFFF_FFFF else @intCast(fd);
+}
+
 pub fn write(fd: u64, buf: u64, count: u64) i64 {
     if (buf == 0 or buf >= 0x0000_8000_0000_0000 or count > 0x7FFFFFFF) return -1;
     const n: usize = @intCast(count);
@@ -31,7 +38,7 @@ pub fn write(fd: u64, buf: u64, count: u64) i64 {
                 var kbuf: [4096]u8 = undefined;
                 const copied = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(buf + pos), chunk);
                 if (copied == 0) break;
-                const result = cur.fd_table.write(@intCast(fd), &kbuf, copied);
+                const result = cur.fd_table.write(fdIndex(fd), &kbuf, copied);
                 // Propagate a first-chunk error (e.g. -28 ENOSPC from the
                 // writeback cache) instead of reporting a 0-byte write that
                 // callers would retry forever — mirrors pwrite below.
