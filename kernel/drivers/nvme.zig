@@ -1058,6 +1058,13 @@ fn submitIoCmd(queue_idx: u32, cmd: *const NvmeCommand) ?NvmeCompletion {
         const tail = io_sq_tail[q];
         sq[tail] = cmd.*;
         io_sq_tail[q] = (io_sq_tail[q] + 1) % QUEUE_DEPTH;
+        // The caller owns the channel, so no other command can complete on this
+        // queue now. Clear the completion mailbox BEFORE the doorbell: once the
+        // doorbell is written the interrupt may arrive at any moment, even
+        // before waitCompletionIrq runs, and must find the mailbox empty and
+        // leave its result there. Clearing it later (as the wait used to) could
+        // erase a completion the ISR had already delivered.
+        io_done[q] = false;
         writeDoorbell(io_sq_doorbell[q], io_sq_tail[q]);
         io_locks[q].release(flags);
     }
@@ -1095,7 +1102,15 @@ fn waitCompletionIrq(q: u32) ?NvmeCompletion {
         io_locks[q].release(flags);
         return cpl;
     }
-    io_done[q] = false;
+    // The interrupt may already have run: it consumed the CQ entry (so the
+    // harvest above found nothing) and left the result in the mailbox, with no
+    // waiter linked to wake. Take it now instead of parking for a wake that
+    // has already happened.
+    if (io_done[q]) {
+        const delivered = io_result[q];
+        io_locks[q].release(flags);
+        return delivered;
+    }
     if (my_idx) |idx| {
         node.task_idx = idx;
         node.next = io_cpl_wait[q];
@@ -1110,6 +1125,7 @@ fn waitCompletionIrq(q: u32) ?NvmeCompletion {
         flags = io_locks[q].acquire();
         if (io_done[q]) {
             result = io_result[q];
+            unlinkWaitLocked(&io_cpl_wait[q], &node); // no-op when the ISR already popped it
             io_locks[q].release(flags);
             break;
         }

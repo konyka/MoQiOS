@@ -107,7 +107,7 @@ fn getdents64Rofs(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i6
     while (true) {
         var e: fsr.DirEntry = undefined;
         var next: u64 = 0;
-        const r = rofs.dirNext(desc.rofs_mount, desc.rofs_gen, desc.rofs_ref, pos, &e, &next);
+        const r = rofs.dirNext(desc.rofs_mount, desc.rofs_gen, desc.rofs_ref, @intFromPtr(desc), pos, &e, &next);
         if (r < 0) {
             if (emitted > 0) break; // hand over what we have; the error returns next call
             return r;
@@ -132,7 +132,7 @@ fn getdents64Rofs(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i6
         // Nothing fit: a too-small buffer is EINVAL, a finished directory is 0.
         var e: fsr.DirEntry = undefined;
         var next: u64 = 0;
-        const probe = rofs.dirNext(desc.rofs_mount, desc.rofs_gen, desc.rofs_ref, pos, &e, &next);
+        const probe = rofs.dirNext(desc.rofs_mount, desc.rofs_gen, desc.rofs_ref, @intFromPtr(desc), pos, &e, &next);
         return if (probe > 0) -22 else probe;
     }
     const n: usize = @intCast(written);

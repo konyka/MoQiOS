@@ -407,7 +407,7 @@ pub fn readAt(slot: u8, gen: u32, ref: Ref, offset: u64, buf: []u8) i64 {
 /// are offset by 2 for the synthetic entries.
 ///
 /// Returns 1 with `out` and `next` filled, 0 at the end, or a negative errno.
-pub fn dirNext(slot: u8, gen: u32, ref: Ref, pos: u64, out: *fr.DirEntry, next: *u64) i64 {
+pub fn dirNext(slot: u8, gen: u32, ref: Ref, owner: u64, pos: u64, out: *fr.DirEntry, next: *u64) i64 {
     rofs_lock.lock();
     defer rofs_lock.unlock();
     const m = live(slot, gen) orelse return -19;
@@ -439,7 +439,7 @@ pub fn dirNext(slot: u8, gen: u32, ref: Ref, pos: u64, out: *fr.DirEntry, next: 
             // More than a handful of consecutive dot entries cannot be a real directory.
             return -5;
         },
-        .ntfs => return ntfsDirNext(m, ref, pos - 2, out, next),
+        .ntfs => return ntfsDirNext(m, ref, owner, pos - 2, out, next),
         .none => return -19,
     }
 }
@@ -448,24 +448,30 @@ pub fn dirNext(slot: u8, gen: u32, ref: Ref, pos: u64, out: *fr.DirEntry, next: 
 /// "." and ".."), resuming from a cached cursor when one sits exactly there.
 /// Without one the directory is rescanned from its first entry.
 ///
-/// The position a call resumed from is left in the cache: getdents asks for
-/// the entry after the last one that fitted, finds it does not fit, and the
-/// next call asks for that same position again.
-fn ntfsDirNext(m: *Mount, ref: Ref, start: u64, out: *fr.DirEntry, next: *u64) i64 {
+/// `owner` identifies the open directory descriptor, so two readers of one
+/// directory keep separate positions (see dir_cursor_cache.zig). A stale match
+/// after a descriptor number is reused is harmless: a cursor depends only on
+/// the directory's content, which is read-only.
+///
+/// The position a call resumed from is kept once more: getdents asks for the
+/// entry after the last one that fitted, finds it does not fit, and the next
+/// call asks for that same position again.
+fn ntfsDirNext(m: *Mount, ref: Ref, owner: u64, start: u64, out: *fr.DirEntry, next: *u64) i64 {
     var cur: ntfs.Volume.DirCursor = .{};
     var idx: u64 = 0;
-    if (m.dir_cursors.find(ref, start)) |hit| {
+    const resumed = m.dir_cursors.find(ref, owner, start);
+    if (resumed) |hit| {
         cur = hit;
         idx = start;
     }
     var dots: u32 = 0;
     while (true) {
         const hit = m.ntfs_vol.nextDirEntry(ref, &cur, out) catch |e| {
-            m.dir_cursors.forget(ref);
+            m.dir_cursors.forget(ref, owner);
             return mapErr(e);
         };
         if (!hit) {
-            m.dir_cursors.forget(ref);
+            m.dir_cursors.forget(ref, owner);
             return 0;
         }
         idx += 1;
@@ -476,7 +482,7 @@ fn ntfsDirNext(m: *Mount, ref: Ref, start: u64, out: *fr.DirEntry, next: *u64) i
             if (dots >= 4) return -5;
             continue;
         }
-        m.dir_cursors.put(ref, idx, cur); // entry number `idx` comes next
+        m.dir_cursors.advance(ref, owner, if (resumed != null) start else null, idx, cur);
         next.* = idx + 2;
         return 1;
     }

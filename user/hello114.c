@@ -562,10 +562,14 @@ void _start(void) {
         big_clear(&bs_a); big_clear(&bs_b);
         int64_t ra = 1, rb = 1;
         int clean = 1;
+        uint64_t il0 = now_ms();
         while (ra > 0 || rb > 0) {
             if (ra > 0) { ra = big_step(fa, 200, &bs_a); if (ra < 0) clean = 0; }
             if (rb > 0) { rb = big_step(fb, 150, &bs_b); if (rb < 0) clean = 0; }
         }
+        uint64_t il_took = now_ms() - il0;
+        print("hello114:   info N: two interleaved readers took "); print_u64(il_took); print(" ms\n");
+        check(il_took < 10 * (took + 100), "N: two interleaved readers cost about as much as two sequential listings (no cursor thrash)");
         check(clean, "N: two interleaved readers never see an error");
         check(bs_a.named == BIG_N && bs_a.dups == 0 && big_complete(&bs_a), "N: reader A (interleaved) saw every name exactly once");
         check(bs_b.named == BIG_N && bs_b.dups == 0 && big_complete(&bs_b), "N: reader B (interleaved) saw every name exactly once");

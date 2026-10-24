@@ -87,6 +87,7 @@ test {
     _ = @import("dir_cursor_cache_test.zig");
     _ = @import("sleep_lock_test.zig");
     _ = @import("rofs_map_test.zig");
+    _ = @import("nvme_mailbox_test.zig");
     _ = @import("ntfs_test.zig");
     _ = @import("wait_status_test.zig");
 }

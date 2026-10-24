@@ -154,6 +154,7 @@ pub const trim_ranges = @import("lib/trim_ranges.zig");
 pub const pcid_alloc = @import("mm/pcid_alloc.zig");
 pub const huge_user = @import("mm/huge_user.zig");
 pub const nvme_queue = @import("drivers/nvme_queue.zig");
+pub const nvme_mailbox = @import("drivers/nvme_mailbox.zig");
 pub const virtio_net_queue = @import("drivers/virtio_net_queue.zig");
 pub const socketpair_policy = @import("net/socketpair_policy.zig");
 pub const message_batch_policy = @import("net/message_batch_policy.zig");

@@ -2,103 +2,154 @@ const std = @import("std");
 const dcc = @import("kernel_shared").dir_cursor_cache;
 
 const Cur = struct { tag: u32 = 0 };
-const Cache = dcc.Cache(Cur, 4);
+const Cache = dcc.Cache(Cur, 8);
 
-test "an advanced position never replaces the one it came from" {
-    // The getdents pattern: serve entry P, probe P+1 (does it fit?), then the
-    // next call asks for P+1 again. Both asks must hit.
-    var c: Cache = .{};
-    c.put(7, 10, .{ .tag = 10 });
-    const at10 = c.find(7, 10).?;
-    try std.testing.expectEqual(@as(u32, 10), at10.tag);
-    c.put(7, 11, .{ .tag = 11 }); // advanced from 10: 10 must stay available
-    try std.testing.expectEqual(@as(u32, 10), c.find(7, 10).?.tag);
-    try std.testing.expectEqual(@as(u32, 11), c.find(7, 11).?.tag);
-    // asking for 11 again (the probe, then the real call) keeps hitting
-    try std.testing.expect(c.find(7, 11) != null);
-    try std.testing.expect(c.find(7, 11) != null);
-}
+/// A reader as getdents drives it: per call, `fit` entries are returned, then
+/// one more is fetched and does not fit (the probe), and the next call asks for
+/// that same entry again. Every fetch is "take the cursor at my position, step
+/// it, remember where it stands".
+const Reader = struct {
+    owner: u64,
+    dir: u64,
+    fit: u32,
+    pos: u64 = 0,
+    misses: u32 = 0,
+    fetches: u32 = 0,
 
-test "a sequential listing with probes never misses after the first entry" {
-    var c: Cache = .{};
-    var misses: usize = 0;
-    var cur: Cur = .{};
-    var idx: u64 = 0;
-    while (idx < 5000) {
-        // serve entry idx
-        if (idx == 0) {
-            cur = .{};
-        } else if (c.find(1, idx)) |hit| {
-            cur = hit;
-        } else {
-            misses += 1;
-            cur = .{ .tag = @intCast(idx) };
-        }
-        cur.tag = @intCast(idx + 1);
-        c.put(1, idx + 1, cur);
-        // probe idx+1 (did not fit), then the next call asks for it again
-        try std.testing.expect(c.find(1, idx + 1) != null);
-        idx += 1;
+    fn fetch(self: *Reader, c: *Cache) void {
+        self.fetches += 1;
+        const hit = c.find(self.dir, self.owner, self.pos);
+        if (hit == null) self.misses += 1;
+        c.advance(self.dir, self.owner, if (hit != null) self.pos else null, self.pos + 1, .{ .tag = @intCast(self.pos + 1) });
     }
-    try std.testing.expectEqual(@as(usize, 0), misses);
+
+    fn call(self: *Reader, c: *Cache) void {
+        var i: u32 = 0;
+        while (i < self.fit) : (i += 1) {
+            self.fetch(c);
+            self.pos += 1;
+        }
+        self.fetch(c); // the probe: the position does not move
+    }
+};
+
+fn run(c: *Cache, readers: []Reader, entries: u64) void {
+    var more = true;
+    while (more) {
+        more = false;
+        for (readers) |*r| {
+            if (r.pos < entries) {
+                r.call(c);
+                more = true;
+            }
+        }
+    }
 }
 
-test "two readers of one directory and a reader of another do not evict each other" {
-    var c: Cache = .{};
-    c.put(1, 100, .{ .tag = 1 });
-    c.put(1, 500, .{ .tag = 2 });
-    c.put(2, 100, .{ .tag = 3 });
-    try std.testing.expectEqual(@as(u32, 1), c.find(1, 100).?.tag);
-    try std.testing.expectEqual(@as(u32, 2), c.find(1, 500).?.tag);
-    try std.testing.expectEqual(@as(u32, 3), c.find(2, 100).?.tag);
-    try std.testing.expect(c.find(2, 500) == null);
-    try std.testing.expect(c.find(3, 100) == null);
+fn totalMisses(readers: []const Reader) u32 {
+    var m: u32 = 0;
+    for (readers) |r| m += r.misses;
+    return m;
 }
 
-test "putting the same position twice refreshes it instead of using a second slot" {
+test "one reader: the probe and the retake both hit" {
     var c: Cache = .{};
-    for (0..20) |i| c.put(9, 42, .{ .tag = @intCast(i) });
-    try std.testing.expectEqual(@as(u32, 19), c.find(9, 42).?.tag);
-    // three other positions still fit alongside it
-    c.put(9, 1, .{});
-    c.put(9, 2, .{});
-    c.put(9, 3, .{});
-    try std.testing.expect(c.find(9, 42) != null);
+    var r = [_]Reader{.{ .owner = 1, .dir = 5, .fit = 3 }};
+    run(&c, &r, 1900);
+    try std.testing.expectEqual(@as(u32, 1), r[0].misses); // only the very first fetch
+    try std.testing.expect(c.held(1) <= 2);
+}
+
+test "readers in lockstep at the same position never evict each other" {
+    // Identical positions, identical buffer sizes: the case that thrashed when
+    // slots were keyed by position alone.
+    var c: Cache = .{};
+    var r = [_]Reader{
+        .{ .owner = 1, .dir = 5, .fit = 3 },
+        .{ .owner = 2, .dir = 5, .fit = 3 },
+    };
+    run(&c, &r, 1900);
+    try std.testing.expectEqual(@as(u32, 2), totalMisses(&r));
+}
+
+test "readers with different buffer sizes of one directory" {
+    for ([_][2]u32{ .{ 3, 2 }, .{ 5, 4 }, .{ 1, 1 }, .{ 7, 1 } }) |fits| {
+        var c: Cache = .{};
+        var r = [_]Reader{
+            .{ .owner = 1, .dir = 5, .fit = fits[0] },
+            .{ .owner = 2, .dir = 5, .fit = fits[1] },
+        };
+        run(&c, &r, 1900);
+        try std.testing.expectEqual(@as(u32, 2), totalMisses(&r));
+    }
+}
+
+test "four readers fit in eight slots; each holds at most two" {
+    var c: Cache = .{};
+    var r = [_]Reader{
+        .{ .owner = 1, .dir = 5, .fit = 3 },
+        .{ .owner = 2, .dir = 5, .fit = 2 },
+        .{ .owner = 3, .dir = 6, .fit = 4 },
+        .{ .owner = 4, .dir = 6, .fit = 1 },
+    };
+    run(&c, &r, 600);
+    try std.testing.expectEqual(@as(u32, 4), totalMisses(&r));
+    for (r) |x| try std.testing.expect(c.held(x.owner) <= 2);
+}
+
+test "more readers than the cache holds still list correctly, only slower" {
+    // Correctness never depends on a hit: a miss rebuilds the cursor. Past the
+    // capacity round-robin access defeats LRU, so misses are expected here.
+    var c: Cache = .{};
+    var r = [_]Reader{
+        .{ .owner = 1, .dir = 5, .fit = 3 }, .{ .owner = 2, .dir = 5, .fit = 3 },
+        .{ .owner = 3, .dir = 5, .fit = 3 }, .{ .owner = 4, .dir = 5, .fit = 3 },
+        .{ .owner = 5, .dir = 5, .fit = 3 }, .{ .owner = 6, .dir = 5, .fit = 3 },
+    };
+    run(&c, &r, 120);
+    for (r) |x| try std.testing.expect(x.pos >= 120); // every reader reached the end
+    try std.testing.expect(totalMisses(&r) > 6); // and the limit is real, so say so
+}
+
+test "an owner never sees another owner's or another directory's position" {
+    var c: Cache = .{};
+    c.put(5, 1, 40, .{ .tag = 40 });
+    try std.testing.expect(c.find(5, 2, 40) == null); // other owner
+    try std.testing.expect(c.find(6, 1, 40) == null); // other directory
+    try std.testing.expect(c.find(5, 1, 41) == null); // other position
+    try std.testing.expectEqual(@as(u32, 40), c.find(5, 1, 40).?.tag);
+}
+
+test "forget drops one owner's positions in one directory only" {
+    var c: Cache = .{};
+    c.put(5, 1, 10, .{});
+    c.put(5, 1, 11, .{});
+    c.put(5, 2, 10, .{});
+    c.put(6, 1, 10, .{});
+    c.forget(5, 1);
+    try std.testing.expect(c.find(5, 1, 10) == null);
+    try std.testing.expect(c.find(5, 1, 11) == null);
+    try std.testing.expect(c.find(5, 2, 10) != null);
+    try std.testing.expect(c.find(6, 1, 10) != null);
 }
 
 test "the least recently used slot is recycled when the cache is full" {
     var c: Cache = .{};
-    c.put(1, 1, .{ .tag = 1 });
-    c.put(1, 2, .{ .tag = 2 });
-    c.put(1, 3, .{ .tag = 3 });
-    c.put(1, 4, .{ .tag = 4 });
-    _ = c.find(1, 1); // touch 1: now 2 is the oldest
-    c.put(1, 5, .{ .tag = 5 });
-    try std.testing.expect(c.find(1, 2) == null);
-    try std.testing.expect(c.find(1, 1) != null);
-    try std.testing.expect(c.find(1, 5) != null);
+    var i: u64 = 0;
+    while (i < 8) : (i += 1) c.put(1, i, 0, .{ .tag = @intCast(i) });
+    _ = c.find(1, 0, 0); // touch owner 0: owner 1 is now the oldest
+    c.put(1, 99, 0, .{});
+    try std.testing.expect(c.find(1, 1, 0) == null);
+    try std.testing.expect(c.find(1, 0, 0) != null);
+    try std.testing.expect(c.find(1, 99, 0) != null);
 }
 
 test "the age comparison survives clock wraparound" {
     var c: Cache = .{};
-    c.clock = 0xFFFF_FFFE;
-    c.put(1, 1, .{ .tag = 1 });
-    c.put(1, 2, .{ .tag = 2 });
-    c.put(1, 3, .{ .tag = 3 }); // clock wraps past zero here
-    c.put(1, 4, .{ .tag = 4 });
-    c.put(1, 5, .{ .tag = 5 }); // evicts the oldest: position 1
-    try std.testing.expect(c.find(1, 1) == null);
-    try std.testing.expect(c.find(1, 2) != null);
-    try std.testing.expect(c.find(1, 5) != null);
-}
-
-test "forget drops only the named directory" {
-    var c: Cache = .{};
-    c.put(1, 5, .{});
-    c.put(1, 6, .{});
-    c.put(2, 5, .{});
-    c.forget(1);
-    try std.testing.expect(c.find(1, 5) == null);
-    try std.testing.expect(c.find(1, 6) == null);
-    try std.testing.expect(c.find(2, 5) != null);
+    c.clock = 0xFFFF_FFFC;
+    var i: u64 = 0;
+    while (i < 9) : (i += 1) c.put(1, i, 0, .{}); // the clock wraps past zero in here
+    try std.testing.expect(c.find(1, 0, 0) == null); // oldest was recycled
+    try std.testing.expect(c.find(1, 8, 0) != null);
+    try std.testing.expect(c.find(1, 1, 0) != null);
 }

@@ -350,7 +350,7 @@ H1 再加 `shared` 字段记录 MAP_SHARED），不触碰页表；首次访问�
   列完要 O(N²) 次设备读，且全程持 `rofs_lock`；实测 6000 项目录第 5600–5700 项就要 5.6 万次读）。
   现在 `ntfs.Volume.nextDirEntry` 用可复制的 `DirCursor`（每层只存 块号 + 项偏移，不含指针，可在
   scratch 块被别的操作复用后继续）逐项推进，开销是树深而非已返回项数；`fs/dir_cursor_cache.zig` 每挂载
-  缓存 4 个位置（LRU）。getdents 在缓冲区装不下下一项时会多探一项，下次调用再要同一位置，因此
+  缓存 4 个位置（LRU，按打开的目录描述符区分所有者，每个读者最多占两个槽）。getdents 在缓冲区装不下下一项时会多探一项，下次调用再要同一位置，因此
   **推进游标时不覆盖原位置**，两次都命中。位置不在缓存里（如 lseek 到任意偏移）退化为从头跳过，
   结果仍正确。ext4 目录按字节偏移恢复，本来就是线性的。
 - **并发与锁**：`rofs_lock` 是**睡眠锁**（`sync/sleep_lock.zig`，FIFO 所有权交接，唤醒最老的等待者；
@@ -1138,7 +1138,7 @@ const FdTable = struct {
   样适用；ext4 inode 的 uid/gid 由低 16 位与高 16 位合并；NTFS 不提供 xattr/ADS；卷内不能再挂载别的文件系统。
 - **验证**：host 测试（ext4 20、NTFS 19、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；含 bigalloc 镜像 `ext4_bigalloc.img`、statfs 数值与 `dumpe2fs` / `$Bitmap` popcount 交叉核对；真实
   `tools/fsfixtures/mkfixtures.sh` 生成的镜像，`debugfs` / `ntfsls` 交叉核对；含敌对超级块/
-  引导扇区/损坏 extent 树/fixup 撕裂）；`hello114` 运行时检查 213 项（含并发读，另有 NVMe 4 项、AHCI 4 项仅在手动提供镜像时运行）（另有 NVMe、AHCI 两段默认 skip）（SMP=1/2/8，MBR 与 GPT 两种
+  引导扇区/损坏 extent 树/fixup 撕裂）；`hello114` 运行时检查 214 项（含并发读，另有 NVMe 4 项、AHCI 4 项仅在手动提供镜像时运行）（另有 NVMe、AHCI 两段默认 skip）（SMP=1/2/8，MBR 与 GPT 两种
   数据盘镜像，`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`），变异验证——去掉 EROFS 守卫
   则 7 项失败，忽略挂载代数则过期 fd 检查失败，关掉挂载规则则 7 项失败，关掉 DAC 检查则 7
   项失败。NVMe（中断驱动）与 AHCI 上的真实挂载读取（I/J 段）需要手动提供带 ext4 的镜像
