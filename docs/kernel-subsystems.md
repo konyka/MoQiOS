@@ -620,6 +620,10 @@ testing.
   per-CPU `pending_release`（`gs:116`），由 `commonStub` 在 `movq %rax,%rsp` 切到新栈之后
   调用 `sched.pendingReleaseFlush()` 才真正 `releaseToReady` + 入队；旧任务因此只在
   本 CPU 已离开其内核栈后才可被认领。没有 per-CPU 数据时回退为直接发布。
+  对已阻塞/退出的旧任务（`releaseToReady` 本来就失败），`pending_release` 同时充当"仍在
+  本 CPU 栈上"的标记：`recordOldTask` 先于 `setCurrentIdx` 写入它，`task.isCurrentOnOtherCpu`
+  / `isCurrentOnAnyCpu` 先读 `current_task_idx` 再读 `pending_release`，所以别的 CPU 的
+  选取路径不会在 [setCurrentIdx → 尾声] 之间认领刚被唤醒的旧任务。
   legacy 路径（`sched_fine_grain_enable` 关闭）与 `apBootstrapIdle`/`portableKernelSwitch`
   未审查。cmpxchg 同时兼任旧的 `state == .running` 检查：
   切换窗口内自行阻塞/退出的任务（waitpid 父进程、exitTask、信号杀死）发布失败，

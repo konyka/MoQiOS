@@ -4129,8 +4129,33 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   `smoke-smp-stress` 5/5。这与“未修复构建约 2/250 次出现内核态故障”相容，但 69 次的样本量在约 1% 发生率下期望值只有约 0.7 次，
   **不足以证明自然故障已消除**。
   (10) **仍未证实的**：自然发生率（约 2/250）太低，修复后是否使自然故障归零需要更长的并行猎捕，统计上还不能下结论；
-  `hello50` 那次 `#GP RIP=0xaaaa…` 转储已丢，是否同因没有证明；`timerTickLegacy` 等 legacy 路径（`sched_fine_grain_enable` 关闭时）、
-  `apBootstrapIdle`、`portableKernelSwitch` 仍直接把旧任务置为 ready，**我没有审查它们是否有同样的窗口**。
+  `hello50` 那次 `#GP RIP=0xaaaa…` 转储已丢，是否同因没有证明。
+  (11) **后续审查（同一窗口的第二半，另一个提交）**：上面的修复只管住了任务**仍是 `.running`** 的情形（`releaseToReady` 要等 `.running`
+  才会成功）。对已经**阻塞或退出**的旧任务（`.blocked`/`.zombie`），`releaseToReady` 本来就失败，不存在“发布”这一步，
+  能挡住别的 CPU 认领它的只有 `task.isCurrentOnOtherCpu` 对 `current_task_idx` 的检查。而 `timerTickFg` 的顺序是：
+  先 `setCurrentIdx(next_idx)`（旧任务不再是本 CPU 的 current），之后才走到 `releaseOldTask`；对阻塞/退出的任务，在这两步之间，
+  别的 CPU 上的唤醒路径可以把它改成 `.ready`，选取路径看到“它不是任何 CPU 的 current”就认领，而本 CPU 仍在它的内核栈上。
+  我在放大器里只对非 `.running` 的旧任务自旋时，**用前一个提交的构建复现了这一点**：panic 为 `integer overflow`，
+  调用点 `sched_claim.load` 内的 `@enumFromInt`（`releaseOldTask` → `sched_claim.load(&old_task.state)`；消息是 integer overflow，
+  反汇编里该处调用的是 invalidEnumValue，我推断两个 panic 桩被合并了），也就是它读到的状态字节不是合法的 `TaskState`，
+  推断这块内存正被另一个 CPU 当作别的数据覆写；两次启动都如此，之后又在已提交的版本上重复了一次（2/2 panic）。
+  注意：自旋 20k 时新旧顺序都通过（各 2 次），不能区分两者；区分发生在 200k。
+  修复：新增 `recordOldTask`，把 `pending_release` 标记**先于** `setCurrentIdx` 写入（`@atomicStore .release`），并让
+  `isCurrentOnOtherCpu` / `isCurrentOnAnyCpu` 把“`pending_release` 指向该任务”也视为“仍在该 CPU 上”（先读 `current_task_idx`，再读
+  `pending_release`；写入顺序相反，所以读者看到新的 current 就一定看得到标记）。`pendingReleaseFlush` 先清标记再发布。
+  守卫测试扩充为同时检查：`recordOldTask` 在 `timerTickFg` 里先于最后一个 `setCurrentIdx(next_idx)`；两个 `isCurrent*` 函数里有
+  `@atomicLoad(u32, &pc.pending_release, .acquire) == idx`。两个变异（去掉一处标记读取；把 `recordOldTask` 挪到 `setCurrentIdx` 之后）
+  都使该测试失败，还原后 679/679。（第一次写的守卫是“`pending_release` 出现在函数体内”，**变异后仍然通过**——它匹配到了注释里的词；
+  我是靠做变异才发现，改成匹配具体的 `@atomicLoad` 表达式。）
+  (12) **没有完全搞清楚的地方**：把放大自旋加到 200k 时，修复后的构建在 `hello58`（会话长退出 → 孤儿进程组 SIGHUP）一段**停滞**
+  （两次，现场：两个 CPU 都在 `hlt`，`pending_release` 均为空，停在 `hello58` 的 fork 子进程之一处于停止态且带 `sleep_deadline`，
+  父进程在读管道）。把自旋降到 20k、80k 时同一测试通过（20k 两次、80k 两次、另有一轮 80k 的 4 次启动全部通过）；把
+  `hello58` 里的等待由 50 ms 改到 600 ms、自旋保持 200k 时 2 次通过。所以停滞在 200k 自旋下依赖于该测试里固定的 50 ms 时序，
+  我**倾向于认为是放大器本身把“子进程先进入 SIGSTOP、再等 50 ms”的测试前提打破了**（200k 次 `pause` 在 QEMU TCG 下远超 50 ms），
+  但这是推断，**没有证明**那一次停滞不是内核里的丢唤醒；也没有在不加放大器的构建上看到过这个停滞（门禁与压测见下）。
+  (13) **仍未审查**：`timerTickLegacy`（`sched_fine_grain_enable` 关闭时的回滚路径，直接 `old_task.state = .ready`）、
+  `apBootstrapIdle`、`portableKernelSwitch`/`nativeTrapFramePreempt`（非 x86 的软件帧路径）有没有同样的窗口，我只读了代码，没有放大验证；
+  x86_64 默认构建走的是 `timerTickFg`。
 - **并行猎捕脚本的两个教训**：(a) 看门狗用"60 秒无新输出"判停滞会把真实的慢阶段（旧游标缓存下 98 秒）误判为挂起，
   判停滞应同时要求两个 CPU 都 `hlt`；(b) 脚本不要在开头 `rm -rf` 自己的输出目录，否则重启会销毁已捕获的证据。
   另外 `tools/gdb_stall_probe.sh` 里 `x/24gx` 会读过内核栈顶而让整段转储中途报错，已改为 `x/20gx`。
@@ -4140,7 +4165,7 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   hello114 T 段 14 项逐个检查常用 fd 系统调用对 `-1`/`1<<32` 返回错误而不是停机。T 段在修复前会在第一个未处理的调用上
   panic 并停止，所以它一次只能暴露一个缺陷；我先用 `grep` 扫了同类模式再统一修。`at_path.zig` 与 `execveat` 辅助函数里
   的 `@intCast(dirfd)` 已有前置范围判断，`close_range` 里的是循环范围内的值，未改。
-- **验证**：host 测试 679/679（594→679：ext4 20、NTFS 19、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；锁守卫 1；virtio 索引守卫 1；调度发布时机守卫 1；
+- **验证**：host 测试 679/679（594→679：ext4 20、NTFS 19、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；锁守卫 1；virtio 索引守卫 1；调度发布时机守卫 1（含标记先于 current 的顺序与 `isCurrent*` 读标记；两个变异均咬住）；
   真实镜像、`debugfs`/`ntfsls` 交叉核对、敌对输入）；三架构构建；`hello114` 214 项运行时检查（含 mmap 25、目录描述符 21、按描述符调用 15、截断 4、fd 范围 14 项）（NVMe/AHCI 两段默认 skip），MBR
   默认镜像 SMP=1/2/8 通过，GPT 镜像（`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`）通过；
   变异验证（删 EROFS 守卫 → 7 项 FAIL；忽略挂载代数 → 过期 fd 项 FAIL；关掉挂载规则 → 7 项 FAIL；
@@ -4156,7 +4181,7 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
 | `zig build` / riscv64 / aarch64 | Passed | 三架构 |
 | smoke SMP=1 / 2 / 8（MBR 数据盘） | Passed | hello114 PASS，90 项 ok；I/J 段默认 skip |
 | smoke SMP=1 / 2 / 8（GPT 数据盘） | Passed | SMP=1/2/8 均 PASS；GPT 变异（`isProtectiveMbr` 恒 false）→ 43 项 FAIL |
-| `smoke-smp-stress` | Passed 5/5 | 双核连续 5 轮（含调度发布修复的最终构建） |
+| `smoke-smp-stress` | Passed 5/5 | 双核连续 5 轮（含两处调度发布修复的最终构建） |
 
 ---
 

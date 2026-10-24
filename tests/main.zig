@@ -6049,14 +6049,14 @@ test "a task switched away from is published only after the CPU has left its ker
     // must only record the task; commonStub's epilogue publishes it after
     // `movq %rax, %rsp`.
     const sched = kt.sched_source;
-    const rel = std.mem.indexOf(u8, sched, "fn releaseOldTask(old_task: *task.Task) void {") orelse return error.TestUnexpectedResult;
+    const rel = std.mem.indexOf(u8, sched, "fn recordOldTask(old_task: *task.Task) void {") orelse return error.TestUnexpectedResult;
     const rel_end = std.mem.indexOfPos(u8, sched, rel, "fn publishOldTask(") orelse return error.TestUnexpectedResult;
     const body = sched[rel..rel_end];
     try std.testing.expect(std.mem.indexOf(u8, body, "releaseToReady") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "enqueueTask") == null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "pc.pending_release = old_task.self_idx;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "&pc.pending_release, old_task.self_idx") != null);
     // publishOldTask is defined once and called from exactly two places: the flush
-    // (the normal path) and releaseOldTask's fallback for a CPU without per-CPU
+    // (the normal path) and recordOldTask's fallback for a CPU without per-CPU
     // data yet (early boot, no other CPU can claim anything then).
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, sched, "publishOldTask("));
     const flush_fn = std.mem.indexOf(u8, sched, "pub fn pendingReleaseFlush() void {") orelse return error.TestUnexpectedResult;
@@ -6071,4 +6071,24 @@ test "a task switched away from is published only after the CPU has left its ker
     try std.testing.expect(std.mem.indexOf(u8, idt, "cmpl $0xFFFFFFFF, %%gs:116") != null);
     // the offset the assembly hard-codes is asserted next to the field
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "@offsetOf(PerCpu, \"pending_release\") != 116") != null);
+
+    // A blocked or exited task is not .running, so releaseToReady cannot hold it
+    // back; only the marker keeps another CPU from claiming it. It must be stored
+    // before current_task_idx moves on, and the task-level "is it live elsewhere"
+    // checks must consult it.
+    const tick = std.mem.indexOf(u8, sched, "fn timerTickFg(frame: *idt.InterruptFrame) void {") orelse return error.TestUnexpectedResult;
+    const tick_end = std.mem.indexOfPos(u8, sched, tick, "\n}\n") orelse return error.TestUnexpectedResult;
+    const tick_body = sched[tick..tick_end];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, tick_body, "recordOldTask(old_task);"));
+    const record_call = std.mem.indexOf(u8, tick_body, "recordOldTask(old_task);") orelse return error.TestUnexpectedResult;
+    const set_current = std.mem.lastIndexOf(u8, tick_body, "setCurrentIdx(next_idx);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(record_call < set_current);
+    // Read the marker as code, not as a word in a comment.
+    const tsk = kt.task_source;
+    const other = std.mem.indexOf(u8, tsk, "pub fn isCurrentOnOtherCpu(") orelse return error.TestUnexpectedResult;
+    const other_end = std.mem.indexOfPos(u8, tsk, other, "\n}\n") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, tsk[other..other_end], "@atomicLoad(u32, &pc.pending_release, .acquire) == idx") != null);
+    const any = std.mem.indexOf(u8, tsk, "fn isCurrentOnAnyCpu(") orelse return error.TestUnexpectedResult;
+    const any_end = std.mem.indexOfPos(u8, tsk, any, "\n}\n") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, tsk[any..any_end], "@atomicLoad(u32, &pc.pending_release, .acquire) == idx") != null);
 }

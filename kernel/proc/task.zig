@@ -1228,6 +1228,7 @@ fn isCurrentOnAnyCpu(idx: u32) bool {
     const se = @import("../arch/x86_64/syscall_entry.zig");
     for (se.configuredPerCpuSlice()) |*pc| {
         if (@atomicLoad(u32, &pc.current_task_idx, .acquire) == idx) return true;
+        if (@atomicLoad(u32, &pc.pending_release, .acquire) == idx) return true;
     }
     return false;
 }
@@ -1242,7 +1243,13 @@ pub fn isCurrentOnOtherCpu(idx: u32, my_cpu: u32) bool {
     const se = @import("../arch/x86_64/syscall_entry.zig");
     for (se.configuredPerCpuSlice(), 0..) |*pc, cpu| {
         if (cpu == my_cpu) continue;
+        // current_task_idx first, pending_release second: the switching CPU stores
+        // pending_release before it moves current_task_idx, so a reader that sees
+        // the new current index is guaranteed to see the marker as well.
         if (@atomicLoad(u32, &pc.current_task_idx, .acquire) == idx) return true;
+        // A task the CPU has switched away from is still on that CPU's kernel
+        // stack until commonStub's epilogue publishes it (sched.recordOldTask).
+        if (@atomicLoad(u32, &pc.pending_release, .acquire) == idx) return true;
     }
     return false;
 }

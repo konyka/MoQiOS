@@ -941,6 +941,15 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
         setupInitialFrame(new_task);
     }
 
+    // Record the outgoing task as still live on this CPU BEFORE current_task_idx
+    // moves on. A task that blocked or exited is not .running, so releaseToReady
+    // cannot hold it back: a waker on another CPU can turn it .ready and a picker
+    // there may claim it, and the only thing keeping it off a second CPU is
+    // task.isCurrentOnOtherCpu. That check reads current_task_idx and
+    // pending_release, so pending_release must already name the task when the
+    // current index changes, or the stack is shared for the gap in between.
+    recordOldTask(old_task);
+
     switchAnchor(new_task.saved_rsp);
     // RSP0 tracks the incoming task's stack at EVERY switch, unconditionally:
     // any path that skips it leaves an IRQ window where the interrupt frame
@@ -949,18 +958,16 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
     gdt.setRsp0(currentCpuId(), new_task.kernel_stack_top);
     setCurrentIdx(next_idx);
 
-    // J2: publish the outgoing task LAST, after the anchor/current/CR3 moves.
-    // Until the release cmpxchg lands the task stays .running and unclaimable.
+    // The outgoing task is published by commonStub's epilogue (see
+    // recordOldTask / pendingReleaseFlush), after this CPU left its stack.
     if (new_task.page_table_phys != 0) {
         if (old_task.page_table_phys != new_task.page_table_phys) {
             const pt = new_task.page_table_phys;
             pcid.switchCr3(pt);
             setupUserCpuState(new_task);
-            deferReleaseOldTask(old_task);
             return;
         }
         setupUserCpuState(new_task);
-        deferReleaseOldTask(old_task);
     } else {
         // Switching to a kernel thread (idle/writeback/…). RSP0 MUST move to
         // the kernel thread's own stack: leaving it on the previous USER
@@ -976,20 +983,8 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
         if (old_task.page_table_phys != 0) {
             const kernel_pml4 = paging.getKernelPml4();
             pcid.switchCr3(kernel_pml4);
-            deferReleaseOldTask(old_task);
-            return;
         }
-        deferReleaseOldTask(old_task);
     }
-}
-
-/// Publish the outgoing task immediately after the anchor/current/CR3 moves.
-/// (An attempt to defer this to the next scheduler entry was reverted: it
-/// hung task progress under real load — the remaining [release → iretq]
-/// window is a handful of epilogue instructions and has never been observed
-/// to collide; documented here and in the review doc.)
-fn deferReleaseOldTask(old_task: *task.Task) void {
-    releaseOldTask(old_task);
 }
 
 /// No-op after the L3 revert (kept so the call site documents the intent).
@@ -997,26 +992,25 @@ fn flushPendingRelease(frame: *idt.InterruptFrame) void {
     _ = frame;
 }
 
-/// Publish the outgoing task as runnable again — the last step of a
-/// fine-grained context switch. The cmpxchg doubles as the legacy
-/// `if (old_task.state == .running)` check: a task that blocked or exited
-/// underneath us (waitpid parent, exitTask, signal kill) is left untouched
-/// and must NOT be re-enqueued.
-fn releaseOldTask(old_task: *task.Task) void {
-    // Do not publish yet. At this point the CPU has moved the anchor and the
-    // current-task index but is still executing on old_task's kernel stack (it
-    // runs on through interruptDispatch's return and commonStub's epilogue). A
-    // task that is .ready can be claimed by another CPU, which resumes it on
-    // that same stack and overwrites frames this CPU still needs. Widening the
-    // gap with a busy-wait here made the kernel fault in every boot, including
-    // the signature of a crash seen in the wild. The epilogue publishes the task
-    // (pendingReleaseFlush) right after it has left the stack.
+/// Note the task this CPU is switching away from, to be published later by
+/// commonStub's epilogue (pendingReleaseFlush).
+///
+/// The CPU keeps running on old_task's kernel stack until that epilogue's
+/// `movq %rax, %rsp`: it runs on through interruptDispatch's return path. For a
+/// task that is still .running nothing can claim it meanwhile, since the
+/// release cmpxchg has not happened yet. A task that blocked or exited is
+/// different: a waker on another CPU may turn it .ready and a picker there may
+/// claim it. The only thing keeping it off a second CPU is
+/// task.isCurrentOnOtherCpu, which consults this marker as well as
+/// current_task_idx. So the marker has to be stored BEFORE current_task_idx is
+/// moved on, and the readers load current_task_idx first and this marker second.
+fn recordOldTask(old_task: *task.Task) void {
     const pc = thisCpu() orelse {
         publishOldTask(old_task);
         return;
     };
-    if (pc.pending_release != NO_TASK_IDX) pendingReleaseFlush(); // never drop an earlier one
-    pc.pending_release = old_task.self_idx;
+    if (@atomicLoad(u32, &pc.pending_release, .monotonic) != NO_TASK_IDX) pendingReleaseFlush(); // never drop an earlier one
+    @atomicStore(u32, &pc.pending_release, old_task.self_idx, .release);
 }
 
 fn publishOldTask(old_task: *task.Task) void {
@@ -1028,13 +1022,16 @@ fn publishOldTask(old_task: *task.Task) void {
     }
 }
 
-/// Publish the task recorded by releaseOldTask. Runs from commonStub's epilogue
+/// Publish the task recorded by recordOldTask. Runs from commonStub's epilogue
 /// after the CPU has switched to the incoming frame, with interrupts off.
 pub fn pendingReleaseFlush() void {
     const pc = thisCpu() orelse return;
-    const idx = pc.pending_release;
+    const idx = @atomicLoad(u32, &pc.pending_release, .monotonic);
     if (idx == NO_TASK_IDX) return;
-    pc.pending_release = NO_TASK_IDX;
+    // Clear the marker first: the CPU is off the old stack by now, and a task
+    // that is published while the marker still named it would be skipped by
+    // every other CPU's picker as "still current elsewhere".
+    @atomicStore(u32, &pc.pending_release, NO_TASK_IDX, .release);
     if (task.getTask(idx)) |t| publishOldTask(t);
 }
 
@@ -1562,7 +1559,7 @@ pub fn sleepOn(queue: *?*task.WaitNode, node: *task.WaitNode) bool {
 /// found no runnable peer on this CPU it RESUMES the blocked current task
 /// without switching; the task then keeps executing (possibly back to user
 /// space) with state == .blocked, and a later preemption drops it from the
-/// runnable set for good — releaseOldTask only re-publishes .running tasks
+/// runnable set for good — the epilogue publish (pendingReleaseFlush) only re-publishes .running tasks
 /// (observed as SMP=4 smoke stalls: task frozen with no wait flags set).
 /// Same contract as the waitpid park repair: on return we are by
 /// construction this CPU's current task, so the state must be .running —
