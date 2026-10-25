@@ -4157,9 +4157,23 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   而不是从 fork 起算），内核不变、放大器仍是 200k：3/3 次启动到达 shell。同一个内核、同样的放大，只有测试的等待起点不同，
   结果从“2 次停滞”变为“3/3 通过”，这支持“是测试的时序前提被放大器打破”而不是内核丢唤醒；样本很小（3 次），不是证明。
   握手版本保留在 `user/hello58.c`：它去掉了测试对“fork 之后 50 ms 内子进程一定已停止”的隐含假设，在慢调度器（含 TCG 下加压）下也成立。
-  (13) **仍未审查**：`timerTickLegacy`（`sched_fine_grain_enable` 关闭时的回滚路径，直接 `old_task.state = .ready`）、
-  `apBootstrapIdle`、`portableKernelSwitch`/`nativeTrapFramePreempt`（非 x86 的软件帧路径）有没有同样的窗口，我只读了代码，没有放大验证；
-  x86_64 默认构建走的是 `timerTickFg`。
+  (13) **其余路径（只读代码得出的结论，没有放大验证）**：riscv64/aarch64 的 `MAX_CPUS` 都是 1，只有一个 CPU，不存在“另一个 CPU 认领”，
+  `portableKernelSwitch`/`nativeTrapFramePreempt` 在这里没有该窗口；`apBootstrapIdle` 每个 AP 只调用一次，进入的是该 CPU 自己的 idle 任务，
+  没有“旧任务”要发布；`timerTickLegacy` 在 `sched_fine_grain_enable = true` 时是编译期不可达的回滚路径，它在 `sched_lock` 内直接
+  `old_task.state = .ready` 并入队，窗口与修复前相同，**如果有人把回滚开关关掉，这个窗口会回来**，当前没有对它做任何修改。
+  (14) **最终构建上抓到的两次停滞（原因未查明）**：对最终构建（`b93fff9`，无放大器）再做 4 路并行 GPT SMP=2 猎捕（分两批，各批的启动总数我没有保留，所以不给出发生率），
+  出现 **2 次**同签名的停滞（`h2_r16`、`h4_r6`，转储在 `/tmp/keep_evidence`，不在仓库）：串口停在 `hello2` 的
+  `[exit] task exited with code 42` 之后，init（slot 4，tid 5）`state=blocked`、`pending_signals=0x10000`（SIGCHLD）、
+  `waiting_for_child=0`；hello2（slot 5）`state=zombie`、`parent_tid=0`（`h4_r6` 里 `reap_pending=1`，即已交给 reaper，
+  `reaper.set.pending=0x20`、`started=0x0`、等待队列为空）；两个 CPU 都在 `hlt` 且 `IF=1`，`pending_release` 均为空，
+  `resched_pending=0`。CPU0 的 `current_task_idx` 是“无”，且 `sched_entries[0]=0`、`sched_entries[1]=6096`——**CPU0 在整个启动期间一次
+  调度器 tick 都没有进入过**，而 CPU1 进入了 6096 次。含义（推断，非证明）：reaper 线程固定在 CPU0（`createKernelThreadAffinity(.., 0, 0)`），
+  CPU0 的定时器 tick 没有到达调度器，于是 reaper 永远得不到运行，init 就一直等 hello2 的 teardown 完成。
+  **没有查明 CPU0 的 LAPIC 定时器为什么没有触发**（可能是 QEMU 侧，也可能是内核对 LAPIC 的初始化/校准）；
+  我试过用 gdb 读 LAPIC 寄存器，但 MMIO 不可读（读出来全是 0xffffffff）；改用 QEMU monitor 的 `info lapic` 重新猎捕（142 次启动：141 次到达 shell，1 次 QEMU 没有启动，是并行启动 limine 的已知竞态 `limine/limine` 缺失，与内核无关），
+  **没有再抓到停滞**，所以没有拿到 LAPIC 的寄存器状态。
+  这两次停滞与调度发布修复无关：`pending_release` 是空的，且停滞发生在第一个子进程 hello2 就结束的位置。
+  是否是本会话之前就有的缺陷，没有基线数据（早先 107 次干净构建启动没有这个签名，但样本不足以排除）。
 - **并行猎捕脚本的两个教训**：(a) 看门狗用"60 秒无新输出"判停滞会把真实的慢阶段（旧游标缓存下 98 秒）误判为挂起，
   判停滞应同时要求两个 CPU 都 `hlt`；(b) 脚本不要在开头 `rm -rf` 自己的输出目录，否则重启会销毁已捕获的证据。
   另外 `tools/gdb_stall_probe.sh` 里 `x/24gx` 会读过内核栈顶而让整段转储中途报错，已改为 `x/20gx`。

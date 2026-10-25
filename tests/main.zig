@@ -6091,4 +6091,8 @@ test "a task switched away from is published only after the CPU has left its ker
     const any = std.mem.indexOf(u8, tsk, "fn isCurrentOnAnyCpu(") orelse return error.TestUnexpectedResult;
     const any_end = std.mem.indexOfPos(u8, tsk, any, "\n}\n") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, tsk[any..any_end], "@atomicLoad(u32, &pc.pending_release, .acquire) == idx") != null);
+
+    // The rollback tick still publishes the old task inside the pass, on its own
+    // stack. It is only safe to keep as dead code; turning it on brings the window back.
+    try std.testing.expect(std.mem.indexOf(u8, sched, "pub const sched_fine_grain_enable: bool = true;") != null);
 }
