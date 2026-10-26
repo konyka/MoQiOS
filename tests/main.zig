@@ -6104,3 +6104,28 @@ test "FAT32 only claims root names: a path inside a directory is left to ext2" {
     try std.testing.expect(!fat32_util.isRootName("/testdir/x"));
     try std.testing.expect(!fat32_util.isRootName("a/"));
 }
+
+test "chmod is reserved to the owner or CAP_FOWNER" {
+    try std.testing.expect(dac.mayChmod(1000, 1000, false));
+    try std.testing.expect(!dac.mayChmod(0, 1000, false));
+    try std.testing.expect(!dac.mayChmod(4242, 1000, false));
+    try std.testing.expect(dac.mayChmod(4242, 1000, true));
+    try std.testing.expect(dac.mayChmod(4242, 0, false));
+}
+
+test "chown: giving a file away needs CAP_CHOWN, the owner may only pick its own group" {
+    // file owned by root:root, caller 1000:1000 without capabilities
+    try std.testing.expect(!dac.mayChown(0, 0, 1000, 1000, false, 1000, 1000));
+    try std.testing.expect(!dac.mayChown(0, 0, 1000, 1000, false, null, 1000));
+    try std.testing.expect(!dac.mayChown(0, 0, 1000, 1000, false, 0, 0)); // non-owner, no-op ids
+    // my own file
+    try std.testing.expect(dac.mayChown(1000, 1000, 1000, 1000, false, 1000, 1000));
+    try std.testing.expect(dac.mayChown(1000, 5, 1000, 1000, false, null, 1000)); // into my own group
+    try std.testing.expect(!dac.mayChown(1000, 1000, 1000, 1000, false, 0, null)); // give to root
+    try std.testing.expect(!dac.mayChown(1000, 1000, 1000, 1000, false, null, 0)); // a group I am not in
+    try std.testing.expect(dac.mayChown(1000, 1000, 1000, 1000, false, null, null));
+    try std.testing.expect(dac.mayChown(0, 0, 1000, 1000, false, null, null)); // chown(-1,-1): nothing to authorize
+    // capabilities
+    try std.testing.expect(dac.mayChown(0, 0, 1000, 1000, true, 1000, 1000));
+    try std.testing.expect(dac.mayChown(1000, 1000, 0, 0, false, 0, 0));
+}

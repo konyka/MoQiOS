@@ -3111,79 +3111,88 @@ pub fn readSymlinkByPath(path: []const u8) ?[]const u8 {
 
 /// Set owner (uid/gid) for a path. Returns 0 on success, -errno on failure.
 /// Pass -1 (0xFFFF) to leave uid or gid unchanged.
-pub fn setOwner(path: []const u8, uid: u16, gid: u16) i64 {
-    const flags = fs_lock.acquire();
-    defer fs_lock.release(flags);
-    if (!active) return -5; // EIO
+/// Credentials of the caller of chmod/chown. The setters below authorize
+/// against the inode's current owner under fs_lock (dac.mayChmod/mayChown),
+/// so the check and the update see the same inode.
+pub const Who = struct {
+    euid: u32,
+    egid: u32,
+    cap_fowner: bool = false,
+    cap_chown: bool = false,
+};
 
-    const inode_num = walkPathToInodeUnlocked(path) orelse return -2; // ENOENT
+fn inodeUid(inode: *const Ext2Inode) u32 {
+    return @as(u32, inode.uid) | (@as(u32, inode.osd2[4]) << 16) | (@as(u32, inode.osd2[5]) << 24);
+}
+
+fn inodeGid(inode: *const Ext2Inode) u32 {
+    return @as(u32, inode.gid) | (@as(u32, inode.osd2[6]) << 16) | (@as(u32, inode.osd2[7]) << 24);
+}
+
+fn chownLocked(inode_num: u32, uid: u16, gid: u16, who: Who) i64 {
     var inode: Ext2Inode = undefined;
     if (!readInode(inode_num, &inode)) return -5;
-
+    const dac = @import("dac.zig");
+    const want_uid: ?u32 = if (uid != 0xFFFF) uid else null;
+    const want_gid: ?u32 = if (gid != 0xFFFF) gid else null;
+    if (!dac.mayChown(inodeUid(&inode), inodeGid(&inode), who.euid, who.egid, who.cap_chown, want_uid, want_gid)) return -1; // EPERM
     if (uid != 0xFFFF) inode.uid = uid;
     if (gid != 0xFFFF) inode.gid = gid;
     if (!writeInode(inode_num, &inode)) return -5;
     return 0;
 }
 
-/// Set owner without following final symlink (for lchown).
-pub fn setOwnerNoFollow(path: []const u8, uid: u16, gid: u16) i64 {
-    const flags = fs_lock.acquire();
-    defer fs_lock.release(flags);
-    if (!active) return -5;
-
-    const inode_num = walkPathToInodeNoFollowUnlocked(path) orelse return -2;
+fn chmodLocked(inode_num: u32, new_mode: u16, who: Who) i64 {
     var inode: Ext2Inode = undefined;
     if (!readInode(inode_num, &inode)) return -5;
-
-    if (uid != 0xFFFF) inode.uid = uid;
-    if (gid != 0xFFFF) inode.gid = gid;
-    if (!writeInode(inode_num, &inode)) return -5;
-    return 0;
-}
-
-/// Set owner (uid/gid) for an inode by number. Used by fchown via fd→inode mapping.
-pub fn setOwnerByInode(inode_num: u32, uid: u16, gid: u16) i64 {
-    const flags = fs_lock.acquire();
-    defer fs_lock.release(flags);
-    if (!active) return -5;
-    var inode: Ext2Inode = undefined;
-    if (!readInode(inode_num, &inode)) return -5;
-
-    if (uid != 0xFFFF) inode.uid = uid;
-    if (gid != 0xFFFF) inode.gid = gid;
-    if (!writeInode(inode_num, &inode)) return -5;
-    return 0;
-}
-
-/// Set permission mode for a path. Returns 0 on success, -errno on failure.
-/// mode is the lower 12 bits (file type preserved).
-pub fn setMode(path: []const u8, new_mode: u16) i64 {
-    const flags = fs_lock.acquire();
-    defer fs_lock.release(flags);
-    if (!active) return -5;
-
-    const inode_num = walkPathToInodeUnlocked(path) orelse return -2;
-    var inode: Ext2Inode = undefined;
-    if (!readInode(inode_num, &inode)) return -5;
-
+    if (!@import("dac.zig").mayChmod(inodeUid(&inode), who.euid, who.cap_fowner)) return -1; // EPERM
     // Preserve file type bits (upper 4), replace permission bits (lower 12)
     inode.mode = (inode.mode & 0xF000) | (new_mode & 0x0FFF);
     if (!writeInode(inode_num, &inode)) return -5;
     return 0;
 }
 
-/// Set permission mode for an inode by number. Used by fchmod via fd→inode mapping.
-pub fn setModeByInode(inode_num: u32, new_mode: u16) i64 {
+pub fn setOwner(path: []const u8, uid: u16, gid: u16, who: Who) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active) return -5; // EIO
+    const inode_num = walkPathToInodeUnlocked(path) orelse return -2; // ENOENT
+    return chownLocked(inode_num, uid, gid, who);
+}
+
+/// Set owner without following final symlink (for lchown).
+pub fn setOwnerNoFollow(path: []const u8, uid: u16, gid: u16, who: Who) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return -5;
-    var inode: Ext2Inode = undefined;
-    if (!readInode(inode_num, &inode)) return -5;
+    const inode_num = walkPathToInodeNoFollowUnlocked(path) orelse return -2;
+    return chownLocked(inode_num, uid, gid, who);
+}
 
-    inode.mode = (inode.mode & 0xF000) | (new_mode & 0x0FFF);
-    if (!writeInode(inode_num, &inode)) return -5;
-    return 0;
+/// Set owner (uid/gid) for an inode by number. Used by fchown via fd→inode mapping.
+pub fn setOwnerByInode(inode_num: u32, uid: u16, gid: u16, who: Who) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active) return -5;
+    return chownLocked(inode_num, uid, gid, who);
+}
+
+/// Set permission mode for a path. Returns 0 on success, -errno on failure.
+/// mode is the lower 12 bits (file type preserved).
+pub fn setMode(path: []const u8, new_mode: u16, who: Who) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active) return -5;
+    const inode_num = walkPathToInodeUnlocked(path) orelse return -2;
+    return chmodLocked(inode_num, new_mode, who);
+}
+
+/// Set permission mode for an inode by number. Used by fchmod via fd→inode mapping.
+pub fn setModeByInode(inode_num: u32, new_mode: u16, who: Who) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active) return -5;
+    return chmodLocked(inode_num, new_mode, who);
 }
 
 /// Get inode number from an open ext2 file index.

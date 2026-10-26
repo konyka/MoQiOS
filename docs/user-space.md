@@ -420,9 +420,19 @@ objects created by `O_CREAT` or `mkdir` receive the caller's effective
 UID/GID, and their permissions are `(requested_mode & 0777) & ~(umask & 0777)`
 before the object becomes visible. Existing objects keep their metadata;
 `O_CREAT|O_EXCL` returns `-17` (`EEXIST`) without modifying them. This phase
-does not enforce unlink, rmdir, rename, chmod, or chown; it does not revalidate
+does not enforce unlink, rmdir or rename; it does not revalidate
 already-open descriptors and does not alter ext2, ramdisk, devfs, or FAT32
 behavior. Group management, ACLs, and setuid behavior are outside this boundary.
+
+chmod/fchmod/fchmodat/fchmodat2 and chown/fchown/lchown on the ext2 root disk
+are authorized against the inode's current owner (`fs/dac.zig` `mayChmod` /
+`mayChown`, checked under the ext2 lock): changing permission bits needs the
+owner, uid 0 or `CAP_FOWNER`; giving a file to another user needs `CAP_CHOWN`;
+the owner may change the group only to its effective group (supplementary groups
+are not tracked); a non-owner is refused with `-1` (`EPERM`). `chown(-1, -1)`
+changes nothing and succeeds. ext2 does not yet record the creator of a new
+file (its owner is root), so an unprivileged process cannot chmod a file it has
+just created on ext2.
 
 Independent of DAC, descriptor access modes are enforced at read time
 regardless of filesystem: reading a descriptor opened `O_WRONLY` fails with

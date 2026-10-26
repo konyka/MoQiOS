@@ -113,6 +113,9 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_FSYNC     74
 #define SYS_FTRUNCATE 77
 #define SYS_FCHMOD    91
+#define SYS_CHOWN     92
+#define SYS_LCHOWN    94
+#define EPERM   1
 #define SYS_FCHOWN    93
 #define SYS_FALLOCATE 274
 #define SYS_FLOCK     73
@@ -588,6 +591,41 @@ void _start(void) {
         n = slurp("/mnt/big/bigdir_entry_with_a_long_name_1234.txt", small, sizeof(small));
         check(n == 0, "N: lookup of one entry deep in the tree works");
         check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/big", 0) == 0, "N: umount");
+    }
+
+    /* U: ownership rules for chmod/chown on the writable ext2 root disk. This process runs
+     * as uid/gid 1000 without CAP_FOWNER/CAP_CHOWN; /writetest.txt (from hello21) belongs to
+     * root, mode 0644. Only the owner (or CAP_FOWNER) may chmod; only CAP_CHOWN may give a
+     * file away, and the owner may only change the group to one of its own. */
+    {
+        struct kstat_t st0, st1;
+        int64_t wf = syscall2(SYS_OPEN, (uint64_t)"/writetest.txt", O_RDONLY);
+        int have = wf >= 0 && syscall2(SYS_FSTAT, (uint64_t)wf, (uint64_t)&st0) == 0;
+        if (wf >= 0) syscall1(SYS_CLOSE, (uint64_t)wf);
+        check(have && (uint32_t)(st0.w[3] >> 32) == 0 && (uint32_t)(st0.w[4] & 0xffffffff) == 0, "U: /writetest.txt is owned by root");
+        check(syscall2(SYS_CHMOD, (uint64_t)"/writetest.txt", 0777) == -EPERM, "U: chmod of a root-owned file by uid 1000 is EPERM");
+        check(syscall4(SYS_FCHMODAT, (uint64_t)-100, (uint64_t)"/writetest.txt", 0777, 0) == -EPERM, "U: fchmodat of a root-owned file by uid 1000 is EPERM");
+        check(syscall3(SYS_CHOWN, (uint64_t)"/writetest.txt", 1000, 1000) == -EPERM, "U: chown of a root-owned file to myself is EPERM");
+        check(syscall3(SYS_LCHOWN, (uint64_t)"/writetest.txt", 1000, 1000) == -EPERM, "U: lchown of a root-owned file is EPERM");
+        wf = syscall2(SYS_OPEN, (uint64_t)"/writetest.txt", O_RDONLY);
+        int same = wf >= 0 && syscall2(SYS_FSTAT, (uint64_t)wf, (uint64_t)&st1) == 0 &&
+                   st1.w[3] == st0.w[3] && st1.w[4] == st0.w[4];
+        if (wf >= 0) {
+            check(syscall2(SYS_FCHMOD, (uint64_t)wf, 0777) == -EPERM, "U: fchmod of a root-owned file by uid 1000 is EPERM");
+            check(syscall3(SYS_FCHOWN, (uint64_t)wf, 1000, 1000) == -EPERM, "U: fchown of a root-owned file by uid 1000 is EPERM");
+            syscall1(SYS_CLOSE, (uint64_t)wf);
+        }
+        check(same, "U: the root-owned file's mode and owner are unchanged");
+        /* A file this process creates on ext2 is still owned by root (ext2 does not record the
+         * creator; see the known limits), so it is not "my own file": chmod and chown on it are
+         * refused like any other root-owned file. */
+        syscall1(SYS_UNLINK, (uint64_t)"testdir/h114-own");
+        int64_t of = syscall2(SYS_OPEN, (uint64_t)"testdir/h114-own", O_RDWR | O_CREAT | O_TRUNC);
+        if (of >= 0) syscall1(SYS_CLOSE, (uint64_t)of);
+        check(of >= 0 && syscall2(SYS_CHMOD, (uint64_t)"testdir/h114-own", 0600) == -EPERM, "U: chmod of a freshly created (root-owned) ext2 file is EPERM");
+        check(syscall3(SYS_CHOWN, (uint64_t)"testdir/h114-own", 1000, 1000) == -EPERM, "U: chown of it to myself is EPERM");
+        check(syscall3(SYS_CHOWN, (uint64_t)"testdir/h114-own", (uint64_t)-1, (uint64_t)-1) == 0, "U: chown(-1, -1) changes nothing and is allowed (as on Linux)");
+        syscall1(SYS_UNLINK, (uint64_t)"testdir/h114-own");
     }
 
     /* S: truncation on the writable ext2 root disk when a second descriptor of the

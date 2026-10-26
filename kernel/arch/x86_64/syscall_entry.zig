@@ -1374,9 +1374,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                     frame.rax = @bitCast(@as(i64, -2));
                     return;
                 };
-                frame.rax = @bitCast(ext2_mod.setModeByInode(inode_num, @truncate(frame.rdx)));
+                frame.rax = @bitCast(ext2_mod.setModeByInode(inode_num, @truncate(frame.rdx), ext2Who()));
             } else {
-                frame.rax = @bitCast(ext2_mod.setMode(path_buf[0..plen], @truncate(frame.rdx)));
+                frame.rax = @bitCast(ext2_mod.setMode(path_buf[0..plen], @truncate(frame.rdx), ext2Who()));
             }
         },
         261 => { // renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
@@ -1871,7 +1871,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             path_buf[if (pc < 255) pc else 255] = 0;
             var plen: usize = 0;
             while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
-            frame.rax = @bitCast(ext2_mod.setMode(path_buf[0..plen], @truncate(frame.rsi)));
+            frame.rax = @bitCast(ext2_mod.setMode(path_buf[0..plen], @truncate(frame.rsi), ext2Who()));
         },
         91 => { // fchmod(fd, mode)
             const ext2_mod = @import("../../fs/ext2.zig");
@@ -1891,7 +1891,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 return;
             }
             const inode_num = ext2_mod.getInodeNum(t.fd_table.fds[fd].ext2_file_idx);
-            frame.rax = @bitCast(ext2_mod.setModeByInode(inode_num, @truncate(frame.rsi)));
+            frame.rax = @bitCast(ext2_mod.setModeByInode(inode_num, @truncate(frame.rsi), ext2Who()));
         },
         95 => { // umask(mask)
             frame.rax = @bitCast(syscallUmask(@truncate(frame.rdi)));
@@ -2053,7 +2053,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             path_buf[if (pc < 255) pc else 255] = 0;
             var plen: usize = 0;
             while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
-            frame.rax = @bitCast(ext2_mod.setOwner(path_buf[0..plen], @truncate(frame.rsi), @truncate(frame.rdx)));
+            frame.rax = @bitCast(ext2_mod.setOwner(path_buf[0..plen], @truncate(frame.rsi), @truncate(frame.rdx), ext2Who()));
         },
         93 => { // fchown(fd, owner, group)
             const ext2_mod = @import("../../fs/ext2.zig");
@@ -2073,7 +2073,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 return;
             }
             const inode_num = ext2_mod.getInodeNum(t.fd_table.fds[fd].ext2_file_idx);
-            frame.rax = @bitCast(ext2_mod.setOwnerByInode(inode_num, @truncate(frame.rsi), @truncate(frame.rdx)));
+            frame.rax = @bitCast(ext2_mod.setOwnerByInode(inode_num, @truncate(frame.rsi), @truncate(frame.rdx), ext2Who()));
         },
         94 => { // lchown(pathname, owner, group) — does NOT follow symlink
             const copy = @import("../../mm/copy_from_user.zig");
@@ -2087,7 +2087,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             path_buf[if (pc < 255) pc else 255] = 0;
             var plen: usize = 0;
             while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
-            frame.rax = @bitCast(ext2_mod.setOwnerNoFollow(path_buf[0..plen], @truncate(frame.rsi), @truncate(frame.rdx)));
+            frame.rax = @bitCast(ext2_mod.setOwnerNoFollow(path_buf[0..plen], @truncate(frame.rsi), @truncate(frame.rdx), ext2Who()));
         },
         // ── v40.0: New MoQiOS syscalls (#327-#330) ─────────────────────────
         327 => { // getitimer(which, curr_value)
@@ -2319,9 +2319,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                     frame.rax = @bitCast(@as(i64, -2));
                     return;
                 };
-                frame.rax = @bitCast(ext2_mod.setModeByInode(inode_num, @truncate(frame.rdx)));
+                frame.rax = @bitCast(ext2_mod.setModeByInode(inode_num, @truncate(frame.rdx), ext2Who()));
             } else {
-                frame.rax = @bitCast(ext2_mod.setMode(path_buf[0..plen], @truncate(frame.rdx)));
+                frame.rax = @bitCast(ext2_mod.setMode(path_buf[0..plen], @truncate(frame.rdx), ext2Who()));
             }
         },
         453 => { // map_shadow_stack(addr, size, flags) — Linux #453
@@ -2742,6 +2742,18 @@ fn syscallMmap(frame: *SyscallFrame) void {
 /// Returns fd on success, -1 on failure.
 fn syscallOpen(frame: *SyscallFrame) void {
     frame.rax = @bitCast(file_io_mod.openWithMode(frame.rdi, @truncate(frame.rsi), @truncate(frame.rdx)));
+}
+
+/// The current task's credentials for ext2 chmod/chown authorization. With
+/// no current task (never on a syscall path) the call is refused as uid 1000.
+fn ext2Who() @import("../../fs/ext2.zig").Who {
+    const cur = @import("../../proc/sched.zig").currentTask() orelse return .{ .euid = 1000, .egid = 1000 };
+    return .{
+        .euid = cur.euid,
+        .egid = cur.egid,
+        .cap_fowner = cur.effective_caps.cap_fowner,
+        .cap_chown = cur.effective_caps.cap_chown,
+    };
 }
 
 /// A raw dirfd register as the signed 32-bit value userspace passed
