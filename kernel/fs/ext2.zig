@@ -536,12 +536,18 @@ fn readInode(inode_num: u32, out: *Ext2Inode) bool {
 // ─── Directory operations ─────────────────────────────────────────────────
 
 pub fn openFile(name: []const u8) i64 {
+    return openFileAs(name, null);
+}
+
+/// Open by path, checking search permission on every directory traversed
+/// when `who` is given. -13 (EACCES) on a denied directory, -1 otherwise.
+pub fn openFileAs(name: []const u8, who: ?Who) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return -1;
 
     // Start from root inode (2)
-    const result = walkPath(2, name);
+    const result = walkPathInner(2, name, 0, who);
     if (result >= 0) {
         // v52.0: store path for execveat dirfd resolution
         const idx: usize = @intCast(result);
@@ -553,11 +559,11 @@ pub fn openFile(name: []const u8) i64 {
 }
 
 fn walkPath(start_inode: u32, path: []const u8) i64 {
-    return walkPathInner(start_inode, path, 0);
+    return walkPathInner(start_inode, path, 0, null);
 }
 
 /// Inner walkPath with symlink depth tracking (max 8 levels).
-fn walkPathInner(start_inode: u32, path: []const u8, depth: u32) i64 {
+fn walkPathInner(start_inode: u32, path: []const u8, depth: u32, who: ?Who) i64 {
     if (depth > 8) return -40; // ELOOP: too many symlinks
 
     var current_inode = start_inode;
@@ -580,6 +586,9 @@ fn walkPathInner(start_inode: u32, path: []const u8, depth: u32) i64 {
 
         // Must be a directory
         if (!eu.isDirectory(inode.mode)) return -1;
+        if (who) |w| {
+            if (!@import("dac.zig").allows(inodeMeta(&inode), w.creds(), @import("dac.zig").Access.search)) return -13;
+        }
 
         // Search directory entries for component (K1: dcache hit skips the scan)
         const found = findDirEntryCached(current_inode, &inode, component) orelse return -1;
@@ -594,17 +603,17 @@ fn walkPathInner(start_inode: u32, path: []const u8, depth: u32) i64 {
             const new_start: u32 = if (target.len > 0 and target[0] == '/') 2 else current_inode;
             if (is_last) {
                 // Final component: resolve symlink target and open it
-                return walkPathInner(new_start, target, depth + 1);
+                return walkPathInner(new_start, target, depth + 1, who);
             } else {
                 // Intermediate: resolve symlink, then continue with remaining path
                 const remaining = path[pos..];
                 // First resolve symlink to get intermediate inode
-                const resolved_fd = walkPathInner(new_start, target, depth + 1);
+                const resolved_fd = walkPathInner(new_start, target, depth + 1, who);
                 if (resolved_fd < 0) return resolved_fd;
                 // Get the inode from the opened file, then close it
                 const resolved_inode = open_files[@intCast(resolved_fd)].inode_num;
                 _ = closeFileUnlocked(@intCast(resolved_fd)); // v52.1 fix: use closeFile to also clear path
-                return walkPathInner(resolved_inode, remaining, depth + 1);
+                return walkPathInner(resolved_inode, remaining, depth + 1, who);
             }
         }
 

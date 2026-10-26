@@ -645,6 +645,15 @@ void _start(void) {
             if (still >= 0) syscall1(SYS_CLOSE, (uint64_t)still);
             syscall1(SYS_UNLINK, (uint64_t)"testdir/h114-stolen");
             syscall1(SYS_UNLINK, (uint64_t)"/rootdir/h114-hl");
+            /* Path walk: a root 0700 directory denies search to others, so even a 0644 file
+             * inside it cannot be reached (open, stat, access, truncate). */
+            check(syscall2(SYS_OPEN, (uint64_t)"/closeddir/open.txt", O_RDONLY) == -EACCES, "U: open of a 0644 file inside root's 0700 directory is EACCES");
+            {
+                static uint64_t cstx[24];
+                check(syscall5(SYS_STATX, (uint64_t)-100, (uint64_t)"/closeddir/open.txt", 0, 0x7ff, (uint64_t)cstx) == -EACCES, "U: statx through root's 0700 directory is EACCES");
+            }
+            check(syscall2(SYS_ACCESS, (uint64_t)"/closeddir/open.txt", 0) == -EACCES, "U: access(F_OK) through root's 0700 directory is EACCES");
+            check(syscall2(SYS_OPEN, (uint64_t)"/rootdir/target.txt", O_RDONLY) >= 0, "U: a 0644 file in root's 0755 directory still opens");
             /* a 0700 root directory: listing it needs read permission on it */
             check(syscall2(SYS_OPEN, (uint64_t)"/lost+found", O_RDONLY) == -EACCES, "U: opening root's 0700 /lost+found to list it is EACCES");
             /* a 0777 directory stays usable */

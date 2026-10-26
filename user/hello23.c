@@ -81,6 +81,18 @@ void _start(void) {
     syscall3(SYS_CHOWN, (uint64_t)"rootdir", 0, 0);
     syscall3(SYS_CHOWN, (uint64_t)"rootdir/empty", 0, 0);
     syscall3(SYS_CHOWN, (uint64_t)"rootdir/target.txt", 0, 0);
+    /* A root-owned 0700 directory holding a world-readable file: reaching the
+     * file requires search permission on the directory. */
+    syscall2(SYS_MKDIR, (uint64_t)"closeddir", 0700);
+    int64_t cf = syscall3(SYS_OPEN, (uint64_t)"closeddir/open.txt", 0x241, 0644);
+    if (cf >= 0) {
+        syscall3(SYS_WRITE, (uint64_t)cf, (uint64_t)"readable\n", 9);
+        syscall1(SYS_CLOSE, (uint64_t)cf);
+    }
+    syscall2(SYS_CHMOD, (uint64_t)"closeddir/open.txt", 0644);
+    syscall2(SYS_CHMOD, (uint64_t)"closeddir", 0700);
+    syscall3(SYS_CHOWN, (uint64_t)"closeddir/open.txt", 0, 0);
+    syscall3(SYS_CHOWN, (uint64_t)"closeddir", 0, 0);
     print("hello23: namespace fixture ready\n");
 
     print("hello23: mkdir OK\n");

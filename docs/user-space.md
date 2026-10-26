@@ -452,9 +452,10 @@ reported before whether the attribute exists.
 Namespace mutation (create, mkdir, symlink, unlink, rmdir, rename and hardlink)
 checks search permission on intermediate directories and write+search on the
 final parent while holding the ext2 lock. A denial is `-13` (`EACCES`), not a
-fallback to FAT32. Ordinary open does not yet check search permission on the
-intermediate directories. Sticky-bit semantics are not implemented; tmpfs and
-FAT32 namespace mutation still has no parent-directory DAC.
+fallback to FAT32. Opening a path (and statx, access and truncate by path)
+checks search permission on every directory walked; a denial is `-13`
+(`EACCES`). Sticky-bit semantics are not implemented; tmpfs and FAT32
+namespace mutation still has no parent-directory DAC.
 
 Independent of DAC, descriptor access modes are enforced at read time
 regardless of filesystem: reading a descriptor opened `O_WRONLY` fails with

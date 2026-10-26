@@ -3510,7 +3510,7 @@ fn syscallAccessAt(dirfd: i64, pathname_ptr: u64, mode: u32) i64 {
         _ = cur.fd_table.close(fd);
         return 0;
     }
-    return -2; // ENOENT
+    return if (fd_result == -13) -13 else -2; // EACCES (path search) or ENOENT
 }
 
 /// access(2) for a path on a read-only volume; null when it is not on one.

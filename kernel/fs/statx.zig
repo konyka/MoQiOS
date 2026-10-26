@@ -108,7 +108,8 @@ pub fn statx(dirfd: i64, pathname_ptr: u64, statxbuf_ptr: u64) i64 {
 
         _ = cur.fd_table.close(fd);
     } else {
-        return -2; // ENOENT
+        // A directory on the path that denies search is EACCES, not ENOENT.
+        return if (fd_result == -13) -13 else -2;
     }
 
     // Write statx buffer to user space

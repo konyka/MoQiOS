@@ -1047,7 +1047,11 @@ pub const FdTable = struct {
 
         const ext2 = @import("ext2.zig");
         if (ext2.isActive()) {
-            const fi = ext2.openFile(name);
+            const fi = ext2.openFileAs(name, .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override });
+            if (fi == -13) {
+                self.freeFd(slot);
+                return -13; // EACCES: a directory on the path denies search
+            }
             if (fi >= 0) {
                 const idx: u32 = @intCast(fi);
                 // Existing ext2 file: judge the requested access against the
