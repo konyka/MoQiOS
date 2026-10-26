@@ -181,7 +181,10 @@ pub fn mkdirWithMode(name_ptr: u64, requested_mode: ?u32) i64 {
 
     const ext2 = @import("ext2.zig");
     if (ext2.isActive()) {
-        const result = ext2.createDir(name);
+        const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
+        const cur = task_mod.getTask(cur_idx) orelse return -1;
+        const cm = @import("../proc/creation_metadata.zig").decide(null, .directory, requested_mode, cur.umask_val, cur.euid, cur.egid).metadata;
+        const result = ext2.createDir(name, .{ .uid = cm.uid, .gid = cm.gid, .perm = @truncate(cm.mode) });
         if (result > 0) {
             ext2.closeFile(@intCast(result));
             return 0;

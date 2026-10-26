@@ -151,7 +151,7 @@ static int64_t run_case(int which, const char *label) {
 void _start(void) {
     print("hello33: read-only destination test\n");
 
-    const int64_t fd = syscall3(SYS_OPEN, (uint64_t)"/tmp/h33.txt", 0x41, 0);
+    const int64_t fd = syscall3(SYS_OPEN, (uint64_t)"/tmp/h33.txt", 0x41, 0644);
     if (fd < 0) {
         print("hello33: SKIP (cannot create file)\n");
         print("hello33 done\n");

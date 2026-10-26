@@ -91,7 +91,7 @@ void _start(void) {
     int created = 0;
     for (int i = 0; i < NFILES; i++) {
         path[tag] = (char)('a' + i);
-        int64_t fd = syscall3(SYS_OPEN, (uint64_t)path, 0x41, 0);
+        int64_t fd = syscall3(SYS_OPEN, (uint64_t)path, 0x41, 0644);
         if (fd >= 0) {
             created++;
             syscall1(SYS_CLOSE, (uint64_t)fd);
@@ -126,7 +126,7 @@ void _start(void) {
     /// fsync used to ignore its fd entirely, flush every dirty buffer of both
     /// filesystems, and return 0 unconditionally. It now flushes just this file
     /// and validates the descriptor, so check both outcomes.
-    int64_t efd = syscall3(SYS_OPEN, (uint64_t)"fsync_probe.txt", 0x41, 0);
+    int64_t efd = syscall3(SYS_OPEN, (uint64_t)"fsync_probe.txt", 0x41, 0644);
     if (efd < 0) {
         print("hello29: fsync SKIP (create failed)\n");
     } else {

@@ -430,9 +430,16 @@ are authorized against the inode's current owner (`fs/dac.zig` `mayChmod` /
 owner, uid 0 or `CAP_FOWNER`; giving a file to another user needs `CAP_CHOWN`;
 the owner may change the group only to its effective group (supplementary groups
 are not tracked); a non-owner is refused with `-1` (`EPERM`). `chown(-1, -1)`
-changes nothing and succeeds. ext2 does not yet record the creator of a new
-file (its owner is root), so an unprivileged process cannot chmod a file it has
-just created on ext2.
+changes nothing and succeeds.
+
+Opening an existing ext2 file applies the same open decision as tmpfs
+(`dac.decideExistingOpen` against the inode's owner and mode bits, before any
+truncation); a denial is `-13` (`EACCES`). New ext2 files, directories and
+symlinks record the creator's effective UID/GID, and files/directories get
+`(requested_mode & 0777) & ~(umask & 0777)`; symlinks are always 0777. Programs
+must therefore pass a real mode to `open(O_CREAT)` — a zero mode creates a file
+nobody but root can open. Search permission on the directories along a path,
+and directory write permission for unlink/rename/link/rmdir, are not checked.
 
 Independent of DAC, descriptor access modes are enforced at read time
 regardless of filesystem: reading a descriptor opened `O_WRONLY` fails with

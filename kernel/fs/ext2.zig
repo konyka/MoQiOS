@@ -2146,7 +2146,31 @@ fn writeSuperblock() void {
 
 /// Create a new file in the root directory of the ext2 filesystem.
 /// Returns file index (>= 0) on success, -1 on failure.
-pub fn createFile(name: []const u8) i64 {
+/// Owner and permission bits for a newly created inode: the caller's
+/// effective ids, and the requested mode already reduced by the umask
+/// (creation_metadata.decide). Callers without credentials (kernel-internal)
+/// pass `kernel_creator`.
+pub const Creator = struct {
+    uid: u32,
+    gid: u32,
+    perm: u16,
+};
+
+pub fn kernelCreator(perm: u16) Creator {
+    return .{ .uid = 0, .gid = 0, .perm = perm };
+}
+
+fn stampCreator(inode: *Ext2Inode, type_bits: u16, c: Creator) void {
+    inode.mode = type_bits | (c.perm & 0o7777);
+    inode.uid = @truncate(c.uid);
+    inode.gid = @truncate(c.gid);
+    inode.osd2[4] = @truncate(c.uid >> 16);
+    inode.osd2[5] = @truncate(c.uid >> 24);
+    inode.osd2[6] = @truncate(c.gid >> 16);
+    inode.osd2[7] = @truncate(c.gid >> 24);
+}
+
+pub fn createFile(name: []const u8, creator: Creator) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return -1;
@@ -2169,7 +2193,7 @@ pub fn createFile(name: []const u8) i64 {
     // Initialize the new inode as a regular file
     var new_inode: Ext2Inode = undefined;
     @memset(@as([*]u8, @ptrCast(&new_inode))[0..@sizeOf(Ext2Inode)], 0);
-    new_inode.mode = 0x81A4; // regular file, 0644 permissions
+    stampCreator(&new_inode, 0x8000, creator); // regular file
     new_inode.links_count = 1;
     new_inode.blocks = 0;
     new_inode.size = 0;
@@ -2311,7 +2335,7 @@ fn addDirEntry(dir_inode_num: u32, target_inode: u32, entry_name: []const u8, fi
 /// Create a new directory in the ext2 filesystem.
 /// Supports multi-level paths (e.g., "testdir/subdir").
 /// Returns file index (>= 0) on success, 0 if already exists, -1 on failure.
-pub fn createDir(name: []const u8) i64 {
+pub fn createDir(name: []const u8, creator: Creator) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return -1;
@@ -2335,7 +2359,7 @@ pub fn createDir(name: []const u8) i64 {
     // Initialize as a directory inode
     var new_inode: Ext2Inode = undefined;
     @memset(@as([*]u8, @ptrCast(&new_inode))[0..@sizeOf(Ext2Inode)], 0);
-    new_inode.mode = 0x41FF; // directory, 0777 permissions
+    stampCreator(&new_inode, 0x4000, creator); // directory
     new_inode.links_count = 2; // "." + parent's entry
     new_inode.blocks = 0;
     new_inode.size = 0;
@@ -2924,7 +2948,7 @@ pub fn createHardlink(oldpath: []const u8, newpath: []const u8) i64 {
 
 /// Create a symbolic link: linkpath → target.
 /// Returns 0 on success, -errno on failure.
-pub fn createSymlink(target: []const u8, linkpath: []const u8) i64 {
+pub fn createSymlink(target: []const u8, linkpath: []const u8, creator: Creator) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return -5;
@@ -2948,7 +2972,8 @@ pub fn createSymlink(target: []const u8, linkpath: []const u8) i64 {
     const inode_bytes: [*]u8 = @ptrCast(&new_inode);
     @memset(inode_bytes[0..@sizeOf(Ext2Inode)], 0);
     // ext2 stores mode as u16 with permission bits; symlink = 0xA000
-    new_inode.mode = 0xA1FF; // S_IFLNK | 0777
+    // A symlink's own permission bits are always 0777 (never consulted).
+    stampCreator(&new_inode, 0xA000, .{ .uid = creator.uid, .gid = creator.gid, .perm = 0o777 });
     new_inode.size = @intCast(target.len);
     new_inode.links_count = 1;
 
@@ -3193,6 +3218,18 @@ pub fn setModeByInode(inode_num: u32, new_mode: u16, who: Who) i64 {
     defer fs_lock.release(flags);
     if (!active) return -5;
     return chmodLocked(inode_num, new_mode, who);
+}
+
+/// Owner and permission bits of an open slot's inode, for open-time DAC.
+pub fn openMeta(file_idx: u32) ?@import("dac.zig").Metadata {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active or file_idx >= open_count) return null;
+    const inode_num = open_files[file_idx].inode_num;
+    if (inode_num == 0) return null;
+    var inode: Ext2Inode = undefined;
+    if (!readInode(inode_num, &inode)) return null;
+    return .{ .mode = inode.mode, .uid = inodeUid(&inode), .gid = inodeGid(&inode) };
 }
 
 /// Get inode number from an open ext2 file index.

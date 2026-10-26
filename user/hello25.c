@@ -48,7 +48,7 @@ void _start(void) {
     print("hello25: ext2 multi-level path test\n");
 
     // Step 1: Create file in subdirectory (O_WRONLY | O_CREAT = 0x41)
-    int64_t fd = syscall3(SYS_OPEN, (uint64_t)"testdir/subfile.txt", 0x41, 0);
+    int64_t fd = syscall3(SYS_OPEN, (uint64_t)"testdir/subfile.txt", 0x41, 0644);
     print("hello25: create testdir/subfile.txt=");
     print_dec(fd);
     print("\n");

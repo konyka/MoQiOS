@@ -46,7 +46,7 @@ void _start(void) {
     print("hello21: ext2 write test\n");
 
     // Try to create a new file (O_WRONLY | O_CREAT = 0x01 | 0x40 = 0x41)
-    int64_t fd = syscall3(SYS_OPEN, (uint64_t)"writetest.txt", 0x41, 0);
+    int64_t fd = syscall3(SYS_OPEN, (uint64_t)"writetest.txt", 0x41, 0644);
     print("hello21: create=");
     print_dec(fd);
     print("\n");

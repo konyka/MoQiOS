@@ -55,7 +55,7 @@ void _start(void) {
     print("hello77: start\n");
 
     const char data[] = "Hello from readahead";
-    int64_t fd = syscall3(SYS_OPEN, (uint64_t)"readahead77.txt", 0x41, 0);
+    int64_t fd = syscall3(SYS_OPEN, (uint64_t)"readahead77.txt", 0x41, 0644);
     failures += check(fd >= 0, "create regular ext2/FAT32 file");
     if (fd >= 0) {
         failures += check(syscall3(SYS_WRITE, (uint64_t)fd, (uint64_t)data, sizeof(data) - 1) == (int64_t)(sizeof(data) - 1),

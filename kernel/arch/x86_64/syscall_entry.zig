@@ -2036,7 +2036,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             var ll: usize = 0;
             while (ll < 256 and lnk_buf[ll] != 0) : (ll += 1) {}
             if (ext2_mod.isActive()) {
-                frame.rax = @bitCast(ext2_mod.createSymlink(tgt_buf[0..tl], lnk_buf[0..ll]));
+                frame.rax = @bitCast(ext2_mod.createSymlink(tgt_buf[0..tl], lnk_buf[0..ll], ext2Creator()));
             } else {
                 frame.rax = @bitCast(@as(i64, -38)); // ENOSYS
             }
@@ -2132,7 +2132,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             while (tl < 256 and tgt_buf[tl] != 0) : (tl += 1) {}
             var ll: usize = 0;
             while (ll < 256 and lnk_buf[ll] != 0) : (ll += 1) {}
-            frame.rax = @bitCast(ext2_mod.createSymlink(tgt_buf[0..tl], lnk_buf[0..ll]));
+            frame.rax = @bitCast(ext2_mod.createSymlink(tgt_buf[0..tl], lnk_buf[0..ll], ext2Creator()));
         },
         // ── v42.0: Linux standard number aliases (331+) + new implementations ──
         331 => { // statx(dirfd, pathname, flags, mask, statxbuf) — alias of #183
@@ -2742,6 +2742,12 @@ fn syscallMmap(frame: *SyscallFrame) void {
 /// Returns fd on success, -1 on failure.
 fn syscallOpen(frame: *SyscallFrame) void {
     frame.rax = @bitCast(file_io_mod.openWithMode(frame.rdi, @truncate(frame.rsi), @truncate(frame.rdx)));
+}
+
+/// Owner of a new ext2 object created by the current task.
+fn ext2Creator() @import("../../fs/ext2.zig").Creator {
+    const cur = @import("../../proc/sched.zig").currentTask() orelse return @import("../../fs/ext2.zig").kernelCreator(0o777);
+    return .{ .uid = cur.euid, .gid = cur.egid, .perm = 0o777 };
 }
 
 /// The current task's credentials for ext2 chmod/chown authorization. With

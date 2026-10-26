@@ -616,16 +616,56 @@ void _start(void) {
             syscall1(SYS_CLOSE, (uint64_t)wf);
         }
         check(same, "U: the root-owned file's mode and owner are unchanged");
-        /* A file this process creates on ext2 is still owned by root (ext2 does not record the
-         * creator; see the known limits), so it is not "my own file": chmod and chown on it are
-         * refused like any other root-owned file. */
+        /* Opening a root-owned 0644 ext2 file for writing (or truncating it) is a write
+         * permission check: uid 1000 is in the "other" class, which has r-- only. */
+        {
+            int64_t w1 = syscall2(SYS_OPEN, (uint64_t)"/writetest.txt", O_WRONLY);
+            check(w1 == -EACCES, "U: open(O_WRONLY) of a root-owned 0644 ext2 file is EACCES");
+            if (w1 >= 0) syscall1(SYS_CLOSE, (uint64_t)w1);
+            int64_t w2 = syscall2(SYS_OPEN, (uint64_t)"/writetest.txt", O_RDWR | O_TRUNC);
+            check(w2 == -EACCES, "U: open(O_RDWR|O_TRUNC) of it is EACCES");
+            if (w2 >= 0) syscall1(SYS_CLOSE, (uint64_t)w2);
+            check(syscall2(SYS_TRUNCATE, (uint64_t)"/writetest.txt", 0) == -EACCES, "U: truncate(path) of it is EACCES");
+            int64_t rr = syscall2(SYS_OPEN, (uint64_t)"/writetest.txt", O_RDONLY);
+            int64_t rn = -1;
+            if (rr >= 0) { uint8_t tb[32]; rn = syscall3(SYS_READ, (uint64_t)rr, (uint64_t)tb, 32); syscall1(SYS_CLOSE, (uint64_t)rr); }
+            check(rr >= 0 && rn == (int64_t)(st0.w[6]), "U: it is still readable and its size is unchanged");
+            /* a 0700 root directory: listing it needs read permission on it */
+            check(syscall2(SYS_OPEN, (uint64_t)"/lost+found", O_RDONLY) == -EACCES, "U: opening root's 0700 /lost+found to list it is EACCES");
+            /* a 0777 directory stays usable */
+            int64_t td = syscall2(SYS_OPEN, (uint64_t)"/testdir", O_RDONLY);
+            check(td >= 0, "U: opening the 0777 /testdir is allowed");
+            if (td >= 0) syscall1(SYS_CLOSE, (uint64_t)td);
+        }
+        /* A file this process creates on ext2 belongs to it (euid/egid 1000) with the requested
+         * mode reduced by the umask (022): chmod works, giving it away does not, keeping my own
+         * ids does. The path is inside an ext2 directory; a bare root name would land on FAT32. */
         syscall1(SYS_UNLINK, (uint64_t)"testdir/h114-own");
-        int64_t of = syscall2(SYS_OPEN, (uint64_t)"testdir/h114-own", O_RDWR | O_CREAT | O_TRUNC);
+        int64_t of = syscall3(SYS_OPEN, (uint64_t)"testdir/h114-own", O_RDWR | O_CREAT | O_TRUNC, 0666);
+        struct kstat_t so;
+        int got = of >= 0 && syscall2(SYS_FSTAT, (uint64_t)of, (uint64_t)&so) == 0;
         if (of >= 0) syscall1(SYS_CLOSE, (uint64_t)of);
-        check(of >= 0 && syscall2(SYS_CHMOD, (uint64_t)"testdir/h114-own", 0600) == -EPERM, "U: chmod of a freshly created (root-owned) ext2 file is EPERM");
-        check(syscall3(SYS_CHOWN, (uint64_t)"testdir/h114-own", 1000, 1000) == -EPERM, "U: chown of it to myself is EPERM");
-        check(syscall3(SYS_CHOWN, (uint64_t)"testdir/h114-own", (uint64_t)-1, (uint64_t)-1) == 0, "U: chown(-1, -1) changes nothing and is allowed (as on Linux)");
+        check(got && (uint32_t)(so.w[3] >> 32) == 1000 && (uint32_t)(so.w[4] & 0xffffffff) == 1000, "U: a new ext2 file is owned by its creator (1000:1000)");
+        check(got && ((uint32_t)so.w[3] & 0777) == 0644, "U: a new ext2 file gets mode 0666 & ~umask(022) = 0644");
+        check(syscall2(SYS_CHMOD, (uint64_t)"testdir/h114-own", 0600) == 0, "U: chmod of my own ext2 file succeeds");
+        check(syscall3(SYS_CHOWN, (uint64_t)"testdir/h114-own", 0, (uint64_t)-1) == -EPERM, "U: giving my file to root is EPERM");
+        check(syscall3(SYS_CHOWN, (uint64_t)"testdir/h114-own", (uint64_t)-1, 0) == -EPERM, "U: moving my file into a group I am not in is EPERM");
+        check(syscall3(SYS_CHOWN, (uint64_t)"testdir/h114-own", 1000, 1000) == 0, "U: chown to my own uid/gid is allowed");
+        check(syscall3(SYS_CHOWN, (uint64_t)"testdir/h114-own", (uint64_t)-1, (uint64_t)-1) == 0, "U: chown(-1, -1) changes nothing and is allowed");
+        /* after chmod 0600 I can still open my file read-write */
+        int64_t o2 = syscall2(SYS_OPEN, (uint64_t)"testdir/h114-own", O_RDWR);
+        check(o2 >= 0, "U: the owner opens its 0600 file read-write");
+        if (o2 >= 0) syscall1(SYS_CLOSE, (uint64_t)o2);
         syscall1(SYS_UNLINK, (uint64_t)"testdir/h114-own");
+        /* mkdir on ext2 records the creator too */
+        syscall1(SYS_RMDIR, (uint64_t)"testdir/h114-d");
+        check(syscall2(SYS_MKDIR, (uint64_t)"testdir/h114-d", 0750) == 0, "U: mkdir an ext2 directory");
+        int64_t dd = syscall2(SYS_OPEN, (uint64_t)"testdir/h114-d", O_RDONLY);
+        struct kstat_t sd;
+        int gd = dd >= 0 && syscall2(SYS_FSTAT, (uint64_t)dd, (uint64_t)&sd) == 0;
+        if (dd >= 0) syscall1(SYS_CLOSE, (uint64_t)dd);
+        check(gd && (uint32_t)(sd.w[3] >> 32) == 1000 && ((uint32_t)sd.w[3] & 07777) == 0750 && ((uint32_t)sd.w[3] & 0170000) == 0040000, "U: the new directory is 1000-owned, mode 0750 & ~022 = 0750");
+        syscall1(SYS_RMDIR, (uint64_t)"testdir/h114-d");
     }
 
     /* S: truncation on the writable ext2 root disk when a second descriptor of the
@@ -637,7 +677,7 @@ void _start(void) {
         uint8_t sb[32];
 
         /* A: O_TRUNC while another descriptor has an unflushed write */
-        int64_t a1 = syscall2(SYS_OPEN, (uint64_t)"/h114-s-a", O_RDWR | O_CREAT | O_TRUNC);
+        int64_t a1 = syscall3(SYS_OPEN, (uint64_t)"/h114-s-a", O_RDWR | O_CREAT | O_TRUNC, 0644);
         syscall3(SYS_WRITE, (uint64_t)a1, (uint64_t)data22, 22);
         int64_t a2 = syscall2(SYS_OPEN, (uint64_t)"/h114-s-a", O_RDWR | O_TRUNC);
         syscall3(SYS_WRITE, (uint64_t)a2, (uint64_t)"hello fs\n", 9);
@@ -649,7 +689,7 @@ void _start(void) {
         syscall1(87, (uint64_t)"/h114-s-a");
 
         /* B: ftruncate to a shorter length while another descriptor has an unflushed write */
-        int64_t b1 = syscall2(SYS_OPEN, (uint64_t)"/h114-s-b", O_RDWR | O_CREAT | O_TRUNC);
+        int64_t b1 = syscall3(SYS_OPEN, (uint64_t)"/h114-s-b", O_RDWR | O_CREAT | O_TRUNC, 0644);
         syscall3(SYS_WRITE, (uint64_t)b1, (uint64_t)data22, 22);
         int64_t b2 = syscall2(SYS_OPEN, (uint64_t)"/h114-s-b", O_RDWR);
         int64_t br = syscall2(SYS_FTRUNCATE, (uint64_t)b2, 5);
@@ -661,7 +701,7 @@ void _start(void) {
         syscall1(87, (uint64_t)"/h114-s-b");
 
         /* C: truncate(path) while another descriptor has an unflushed write */
-        int64_t c1 = syscall2(SYS_OPEN, (uint64_t)"/h114-s-c", O_RDWR | O_CREAT | O_TRUNC);
+        int64_t c1 = syscall3(SYS_OPEN, (uint64_t)"/h114-s-c", O_RDWR | O_CREAT | O_TRUNC, 0644);
         syscall3(SYS_WRITE, (uint64_t)c1, (uint64_t)data22, 22);
         int64_t cr = syscall2(SYS_TRUNCATE, (uint64_t)"/h114-s-c", 5);
         syscall3(SYS_LSEEK, (uint64_t)c1, 0, 0);
@@ -672,7 +712,7 @@ void _start(void) {
 
         /* G: the same three cases on the ext2 half of the root disk. The VFS tries FAT32 first
          * and FAT32 has no directories, so a path under testdir/ can only be an ext2 file. */
-        int64_t g1 = syscall2(SYS_OPEN, (uint64_t)"testdir/h114-g", O_RDWR | O_CREAT | O_TRUNC);
+        int64_t g1 = syscall3(SYS_OPEN, (uint64_t)"testdir/h114-g", O_RDWR | O_CREAT | O_TRUNC, 0644);
         int64_t g2 = syscall2(SYS_OPEN, (uint64_t)"testdir/h114-g", O_RDWR);
         syscall3(SYS_WRITE, (uint64_t)g1, (uint64_t)data22, 22);
         int64_t gr = syscall2(SYS_FTRUNCATE, (uint64_t)g2, 5);
@@ -714,7 +754,7 @@ void _start(void) {
          * truncate so nothing can rewrite the inode behind it. Truncating through the stale
          * descriptor must not wipe the blocks the writer allocated: the kept prefix has to
          * survive. */
-        int64_t f1 = syscall2(SYS_OPEN, (uint64_t)"/h114-s-f", O_RDWR | O_CREAT | O_TRUNC);
+        int64_t f1 = syscall3(SYS_OPEN, (uint64_t)"/h114-s-f", O_RDWR | O_CREAT | O_TRUNC, 0644);
         int64_t f2 = syscall2(SYS_OPEN, (uint64_t)"/h114-s-f", O_RDWR);
         syscall3(SYS_WRITE, (uint64_t)f1, (uint64_t)data22, 22);
         syscall1(SYS_FSYNC, (uint64_t)f1);
@@ -754,7 +794,7 @@ void _start(void) {
      * and a file on the writable disk must be untouched afterwards. */
     {
         /* a canary on the writable root disk: slot 0 of its open-file tables */
-        int64_t cfd = syscall2(SYS_OPEN, (uint64_t)"/hello114-canary", O_RDWR | O_CREAT | O_TRUNC);
+        int64_t cfd = syscall3(SYS_OPEN, (uint64_t)"/hello114-canary", O_RDWR | O_CREAT | O_TRUNC, 0644);
         int canary_ok = cfd >= 0 && syscall3(SYS_WRITE, (uint64_t)cfd, (uint64_t)"canary-data-0123456789", 22) == 22;
         check(syscall4(SYS_MOUNT, (uint64_t)"/dev/vblk1p1", (uint64_t)"/mnt/r", (uint64_t)"ext4", 0) == 0, "R: mount ext4 for the descriptor-call tests");
         int64_t rfd = syscall2(SYS_OPEN, (uint64_t)"/mnt/r/small.txt", O_RDONLY);
@@ -803,7 +843,7 @@ void _start(void) {
         /* ...but a volume file is a valid source for copy_file_range. The destination is a
          * freshly created file, so the result must be exactly the 9 bytes of the source. */
         {
-            int64_t dst = syscall2(SYS_OPEN, (uint64_t)"/hello114-copy", O_RDWR | O_CREAT | O_TRUNC);
+            int64_t dst = syscall3(SYS_OPEN, (uint64_t)"/hello114-copy", O_RDWR | O_CREAT | O_TRUNC, 0644);
             if (dst >= 0) {
                 syscall3(SYS_LSEEK, (uint64_t)rfd, 0, 0);
                 int64_t cr = syscall5(SYS_COPY_FILE_RANGE, (uint64_t)rfd, 0, (uint64_t)dst, 0, 9);
@@ -873,7 +913,7 @@ void _start(void) {
          * that name is the canary. */
         {
             syscall1(SYS_CHDIR, (uint64_t)"/");
-            int64_t cv = syscall2(SYS_OPEN, (uint64_t)"h114-at", O_RDWR | O_CREAT | O_TRUNC);
+            int64_t cv = syscall3(SYS_OPEN, (uint64_t)"h114-at", O_RDWR | O_CREAT | O_TRUNC, 0644);
             if (cv >= 0) { syscall3(SYS_WRITE, (uint64_t)cv, (uint64_t)"keep", 4); syscall1(SYS_CLOSE, (uint64_t)cv); }
             check(cv >= 0, "Q: create the root-disk canary h114-at");
             check(syscall3(SYS_UNLINKAT, (uint64_t)dfd, (uint64_t)"h114-at", 0) == -EROFS, "Q: unlinkat(volume dirfd, name) is EROFS");

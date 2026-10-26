@@ -50,7 +50,7 @@ void _start(void) {
     print("hello24: ext2 unlink test\n");
 
     // Step 1: Create file (O_WRONLY | O_CREAT = 0x41)
-    int64_t fd = syscall3(SYS_OPEN, (uint64_t)"unlinktest.txt", 0x41, 0);
+    int64_t fd = syscall3(SYS_OPEN, (uint64_t)"unlinktest.txt", 0x41, 0644);
     print("hello24: create=");
     print_dec(fd);
     print("\n");

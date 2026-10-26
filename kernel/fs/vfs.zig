@@ -1050,6 +1050,21 @@ pub const FdTable = struct {
             const fi = ext2.openFile(name);
             if (fi >= 0) {
                 const idx: u32 = @intCast(fi);
+                // Existing ext2 file: judge the requested access against the
+                // inode's owner and mode bits before truncating or publishing
+                // (same decision tmpfs uses). Search permission on the
+                // directories along the path is not checked (known limit).
+                const dac = @import("dac.zig");
+                const meta = ext2.openMeta(idx) orelse {
+                    ext2.closeFile(idx);
+                    self.freeFd(slot);
+                    return -5;
+                };
+                if (!dac.decideExistingOpen(meta, .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override }, flags).allowed) {
+                    ext2.closeFile(idx);
+                    self.freeFd(slot);
+                    return -13; // EACCES
+                }
                 if (o_trunc and is_writable) _ = ext2.truncateFile(idx, 0);
                 self.fds[slot] = .{
                     .fd_type = .ext2_file,
@@ -1067,7 +1082,8 @@ pub const FdTable = struct {
 
             // ext2 create file if O_CREAT
             if (o_creat) {
-                const ci = ext2.createFile(name);
+                const cm = @import("../proc/creation_metadata.zig").decide(null, .regular_file, requested_mode, umask_val, euid, egid).metadata;
+                const ci = ext2.createFile(name, .{ .uid = cm.uid, .gid = cm.gid, .perm = @truncate(cm.mode) });
                 if (ci >= 0) {
                     const idx: u32 = @intCast(ci);
                     self.fds[slot] = .{
