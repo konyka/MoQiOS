@@ -2418,12 +2418,11 @@ test "UID 1000 create ownership remains outside DAC phase one" {
 }
 
 test "user metadata probes forward effective DAC credentials" {
-    // statx resolves its path through at_path (a volume directory fd or cwd may
-    // rewrite the name) but must still open with the caller's credentials.
-    const statx_forwarding = "openWithCredentials(use_name, 0, cur.euid, cur.egid, cur.effective_caps)";
-    const forwarding = "openWithCredentials(name, 0, cur.euid, cur.egid, cur.effective_caps)";
+    // statx and access resolve their paths through at_path (a volume directory
+    // fd or cwd may rewrite the name) but must retain the caller's credentials.
+    const forwarding = "openWithCredentials(use_name, 0, cur.euid, cur.egid, cur.effective_caps)";
 
-    try std.testing.expect(std.mem.indexOf(u8, kt.statx_source, statx_forwarding) != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.statx_source, forwarding) != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, forwarding) != null);
 }
 

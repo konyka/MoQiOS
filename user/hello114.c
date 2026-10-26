@@ -102,6 +102,8 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_SYMLINK   88
 #define SYS_TRUNCATE  210
 #define SYS_ACCESS    198
+#define SYS_FACCESSAT 258
+#define SYS_FACCESSAT2 321
 #define SYS_FSYNC     74
 #define SYS_FTRUNCATE 77
 #define SYS_FCHMOD    91
@@ -816,9 +818,16 @@ void _start(void) {
         afd = syscall4(SYS_OPENAT, (uint64_t)dfd, (uint64_t)"/mnt/q/small.txt", O_RDONLY, 0);
         check(afd >= 0, "Q: openat with an absolute path ignores dirfd");
         if (afd >= 0) syscall1(SYS_CLOSE, (uint64_t)afd);
+        check(syscall4(SYS_FACCESSAT, (uint64_t)dfd, (uint64_t)"sub/n.txt", 4, 0) == 0, "Q: faccessat resolves a relative path from dirfd");
+        check(syscall4(SYS_FACCESSAT, (uint64_t)dfd, (uint64_t)"file_217.txt", 0, 0) == 0, "Q: faccessat finds a file in an htree directory");
+        check(syscall4(SYS_FACCESSAT, (uint64_t)dfd, (uint64_t)"../small.txt", 4, 0) == 0, "Q: faccessat with '..' climbs out of the directory");
+        check(syscall4(SYS_FACCESSAT, (uint64_t)dfd, (uint64_t)"nope.txt", 0, 0) == -ENOENT, "Q: faccessat of a missing name is ENOENT");
+        check(syscall4(SYS_FACCESSAT2, (uint64_t)dfd, (uint64_t)"sub/n.txt", 4, 0) == 0, "Q: faccessat2 resolves a relative path from dirfd");
+        check(syscall4(SYS_FACCESSAT, (uint64_t)-1, (uint64_t)"/mnt/q/small.txt", 0, 0) == 0, "Q: faccessat with an absolute path ignores dirfd");
         /* a non-directory fd as dirfd */
         int64_t ffd = syscall2(SYS_OPEN, (uint64_t)"/mnt/q/small.txt", O_RDONLY);
         check(syscall4(SYS_OPENAT, (uint64_t)ffd, (uint64_t)"x", O_RDONLY, 0) == -ENOTDIR, "Q: a regular file as dirfd is ENOTDIR");
+        check(syscall4(SYS_FACCESSAT, (uint64_t)ffd, (uint64_t)"x", 0, 0) == -ENOTDIR, "Q: faccessat with a regular file as dirfd is ENOTDIR");
         /* fchdir */
         check(syscall1(SYS_FCHDIR, (uint64_t)ffd) == -ENOTDIR, "Q: fchdir on a regular file is ENOTDIR");
         syscall1(SYS_CLOSE, (uint64_t)ffd);

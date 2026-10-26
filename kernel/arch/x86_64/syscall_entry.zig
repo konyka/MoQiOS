@@ -1340,8 +1340,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         // ── v33.6: more *at() variants ───────────────────────────────
         258 => { // faccessat(dirfd, pathname, mode, flags)
-            _ = frame.rdi;
-            frame.rax = @bitCast(syscallAccess(frame.rsi, @truncate(frame.rdx)));
+            frame.rax = @bitCast(syscallAccessAt(dirfdArg(frame.rdi), frame.rsi, @truncate(frame.rdx)));
         },
         259 => { // readlinkat(dirfd, pathname, buf, bufsiz)
             frame.rax = @bitCast(readlink_mod.readlinkAt(dirfdArg(frame.rdi), frame.rsi, frame.rdx, frame.r10));
@@ -1625,8 +1624,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallOpenat2(frame.rdi, frame.rsi, frame.rdx, frame.r10));
         },
         321 => { // faccessat2(dirfd, pathname, mode, flags) — enhanced access
-            _ = frame.rdi;
-            frame.rax = @bitCast(syscallAccess(frame.rsi, @truncate(frame.rdx)));
+            frame.rax = @bitCast(syscallAccessAt(dirfdArg(frame.rdi), frame.rsi, @truncate(frame.rdx)));
         },
         322 => { // execveat(dirfd, pathname, argv, envp, flags)
             const dirfd: i32 = @bitCast(@as(u32, @truncate(frame.rdi)));
@@ -2246,8 +2244,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallPidfdGetfd(@truncate(frame.rdi), @truncate(frame.rsi), @truncate(frame.rdx)));
         },
         439 => { // faccessat2(dirfd, pathname, mode, flags) — alias of #321 (dup)
-            _ = frame.rdi;
-            frame.rax = @bitCast(syscallAccess(frame.rsi, @truncate(frame.rdx)));
+            frame.rax = @bitCast(syscallAccessAt(dirfdArg(frame.rdi), frame.rsi, @truncate(frame.rdx)));
         },
         440 => { // process_madvise(pidfd, iov, nr_iov, advice, flags) — Linux #440
             frame.rax = @bitCast(unsupported_policy.processMadvise());
@@ -3435,8 +3432,13 @@ fn syscallLseek(fd: u32, offset: u64, whence: u32) i64 {
 }
 
 /// access(pathname, mode) — check file accessibility.
-/// Simplified: try to open the file, return 0 if it exists.
 fn syscallAccess(pathname_ptr: u64, mode: u32) i64 {
+    return syscallAccessAt(@import("../../fs/at_path.zig").AT_FDCWD, pathname_ptr, mode);
+}
+
+/// Resolve relative names from dirfd when it denotes a directory on a mounted
+/// volume; other filesystems keep their existing dirfd behavior.
+fn syscallAccessAt(dirfd: i64, pathname_ptr: u64, mode: u32) i64 {
     if (pathname_ptr == 0 or pathname_ptr >= 0x0000_8000_0000_0000) return -14;
     const copy = @import("../../mm/copy_from_user.zig");
     const sched = @import("../../proc/sched.zig");
@@ -3451,12 +3453,18 @@ fn syscallAccess(pathname_ptr: u64, mode: u32) i64 {
 
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = tm.getTask(cur_idx) orelse return -1;
+    var joined: [256]u8 = undefined;
+    const use_name = switch (@import("../../fs/at_path.zig").resolve(cur, dirfd, name, &joined)) {
+        .keep => name,
+        .path => |p| p,
+        .err => |e| return e,
+    };
 
     // Mounted ext4/NTFS volumes answer from the file's real mode and owner.
-    if (rofsAccess(cur, name, mode)) |r| return r;
+    if (rofsAccess(cur, use_name, mode)) |r| return r;
 
     // Other filesystems: existence only (F_OK semantics).
-    const fd_result = cur.fd_table.openWithCredentials(name, 0, cur.euid, cur.egid, cur.effective_caps);
+    const fd_result = cur.fd_table.openWithCredentials(use_name, 0, cur.euid, cur.egid, cur.effective_caps);
     if (fd_result >= 0) {
         const fd: u32 = @intCast(fd_result);
         _ = cur.fd_table.close(fd);
