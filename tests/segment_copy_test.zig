@@ -51,10 +51,27 @@ test "rofs guard table names every path operand of the mutating syscalls" {
     const sym = guard.lookup(88).?;
     try std.testing.expectEqual(@as(u8, 1), sym.a);
     try std.testing.expectEqual(guard.NONE, sym.b);
-    // renameat2: oldpath in rsi, newpath in r10
+    // renameat2: oldpath in rsi relative to rdi, newpath in r10 relative to rdx
     const r2 = guard.lookup(261).?;
     try std.testing.expectEqual(@as(u8, 1), r2.a);
     try std.testing.expectEqual(@as(u8, 3), r2.b);
+    try std.testing.expectEqual(@as(u8, 0), r2.da);
+    try std.testing.expectEqual(@as(u8, 2), r2.db);
+    // the single-path *at() mutators resolve rsi against the dirfd in rdi
+    for ([_]u64{ 256, 257, 260, 452, 463, 466 }) |nr| {
+        const e = guard.lookup(nr).?;
+        try std.testing.expectEqual(@as(u8, 1), e.a);
+        try std.testing.expectEqual(@as(u8, 0), e.da);
+    }
+    // a plain-path call has no dirfd
+    try std.testing.expectEqual(guard.NONE, guard.lookup(87).?.da);
+}
+
+test "unlinkat flags: AT_REMOVEDIR selects rmdir, anything else is EINVAL" {
+    try std.testing.expectEqual(guard.UnlinkAtAction.unlink, guard.unlinkAtAction(0));
+    try std.testing.expectEqual(guard.UnlinkAtAction.rmdir, guard.unlinkAtAction(0x200));
+    try std.testing.expectEqual(guard.UnlinkAtAction.invalid, guard.unlinkAtAction(0x1));
+    try std.testing.expectEqual(guard.UnlinkAtAction.invalid, guard.unlinkAtAction(0x200 | 0x100));
     try std.testing.expectEqual(@as(?guard.Entry, null), guard.lookup(0));
     try std.testing.expectEqual(@as(?guard.Entry, null), guard.lookup(10)); // read
     // every entry is unique

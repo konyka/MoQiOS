@@ -1331,8 +1331,13 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(file_io_mod.openAt(dirfdArg(frame.rdi), frame.rsi, @truncate(frame.rdx), @truncate(frame.r10)));
         },
         256 => { // unlinkat(dirfd, pathname, flags)
-            _ = frame.rdi;
-            frame.rax = @bitCast(unlink_mod.unlink(frame.rsi));
+            // A volume dirfd was already answered by rofsGuard; other dirfds keep
+            // the flat filesystems' existing relative-name handling.
+            frame.rax = @bitCast(switch (@import("../../fs/rofs_guard_policy.zig").unlinkAtAction(@truncate(frame.rdx))) {
+                .unlink => unlink_mod.unlink(frame.rsi),
+                .rmdir => unlink_mod.rmdir(frame.rsi),
+                .invalid => errno.EINVAL,
+            });
         },
         257 => { // mkdirat(dirfd, pathname, mode)
             _ = frame.rdi;
@@ -2606,44 +2611,60 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
 /// (fs/rofs_guard_policy.zig lists them and where their paths live). Returns
 /// true when the call was answered here.
 fn rofsGuard(frame: *SyscallFrame, nr: u64) bool {
-    const entry = @import("../../fs/rofs_guard_policy.zig").lookup(nr) orelse return false;
+    const policy = @import("../../fs/rofs_guard_policy.zig");
+    const entry = policy.lookup(nr) orelse return false;
     if (!@import("../../fs/rofs.zig").anyActive()) return false;
     const regs = [_]u64{ frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9 };
     const sched = @import("../../proc/sched.zig");
     const cur = sched.currentTask() orelse return false;
-    var idx = entry.a;
-    var pass: u32 = 0;
-    while (pass < 2) : (pass += 1) {
-        if (idx != @import("../../fs/rofs_guard_policy.zig").NONE and idx < regs.len) {
-            if (pathOnRofs(cur, regs[idx])) {
+    const operands = [_][2]u8{ .{ entry.a, entry.da }, .{ entry.b, entry.db } };
+    for (operands) |op| {
+        if (op[0] == policy.NONE or op[0] >= regs.len) continue;
+        const dirfd: i64 = if (op[1] != policy.NONE and op[1] < regs.len) dirfdArg(regs[op[1]]) else @import("../../fs/at_path.zig").AT_FDCWD;
+        switch (pathOnRofs(cur, dirfd, regs[op[0]])) {
+            .no => {},
+            .yes => {
                 frame.rax = @bitCast(@as(i64, -30)); // EROFS
                 return true;
-            }
+            },
+            // A volume dirfd that cannot be resolved (not a directory, volume
+            // gone): fail here rather than letting the handler fall back to the
+            // bare relative name on another filesystem.
+            .err => |e| {
+                frame.rax = @bitCast(e);
+                return true;
+            },
         }
-        idx = entry.b;
     }
     return false;
 }
 
-fn pathOnRofs(cur: anytype, ptr: u64) bool {
-    if (ptr == 0 or ptr >= 0x0000_8000_0000_0000) return false;
+fn pathOnRofs(cur: anytype, dirfd: i64, ptr: u64) union(enum) { no, yes, err: i64 } {
+    if (ptr == 0 or ptr >= 0x0000_8000_0000_0000) return .no;
     const copy = @import("../../mm/copy_from_user.zig");
     var raw: [256]u8 = undefined;
-    const n = copy.copyStringFromUser(raw[0..255], ptr) orelse return false;
-    if (n == 0) return false;
+    const n0 = copy.copyStringFromUser(raw[0..255], ptr) orelse return .no;
+    if (n0 == 0) return .no;
+    var at_buf: [256]u8 = undefined;
+    const name: []const u8 = switch (@import("../../fs/at_path.zig").resolve(cur, dirfd, raw[0..n0], &at_buf)) {
+        .keep => raw[0..n0],
+        .path => |p| p,
+        .err => |e| return .{ .err = e },
+    };
+    const n = name.len;
     var joined: [512]u8 = undefined;
-    var full: []const u8 = raw[0..n];
-    if (raw[0] != '/') {
+    var full: []const u8 = name;
+    if (name[0] != '/') {
         const cwd = cur.cwd[0..cur.cwd_len];
-        if (cwd.len + 1 + n > joined.len) return false;
+        if (cwd.len + 1 + n > joined.len) return .no;
         @memcpy(joined[0..cwd.len], cwd);
         joined[cwd.len] = '/';
-        @memcpy(joined[cwd.len + 1 ..][0..n], raw[0..n]);
+        @memcpy(joined[cwd.len + 1 ..][0..n], name);
         full = joined[0 .. cwd.len + 1 + n];
     }
     var norm: [256]u8 = undefined;
-    const abs = vfs_mod.normalizeAbs(full, &norm) orelse return false;
-    return vfs_mod.rofsRoute(abs) != null;
+    const abs = vfs_mod.normalizeAbs(full, &norm) orelse return .no;
+    return if (vfs_mod.rofsRoute(abs) != null) .yes else .no;
 }
 
 fn dispatchLinuxRlimitAlias(frame: *SyscallFrame, syscall_nr: u64) bool {

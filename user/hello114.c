@@ -104,6 +104,12 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_ACCESS    198
 #define SYS_FACCESSAT 258
 #define SYS_FACCESSAT2 321
+#define SYS_UNLINKAT  256
+#define SYS_MKDIRAT   257
+#define SYS_FCHMODAT  260
+#define SYS_RENAMEAT2 261
+#define SYS_FCHMODAT2 452
+#define AT_REMOVEDIR  0x200
 #define SYS_FSYNC     74
 #define SYS_FTRUNCATE 77
 #define SYS_FCHMOD    91
@@ -824,6 +830,33 @@ void _start(void) {
         check(syscall4(SYS_FACCESSAT, (uint64_t)dfd, (uint64_t)"nope.txt", 0, 0) == -ENOENT, "Q: faccessat of a missing name is ENOENT");
         check(syscall4(SYS_FACCESSAT2, (uint64_t)dfd, (uint64_t)"sub/n.txt", 4, 0) == 0, "Q: faccessat2 resolves a relative path from dirfd");
         check(syscall4(SYS_FACCESSAT, (uint64_t)-1, (uint64_t)"/mnt/q/small.txt", 0, 0) == 0, "Q: faccessat with an absolute path ignores dirfd");
+        /* Mutating *at() calls with a volume directory as dirfd must be EROFS. They must never
+         * fall back to the bare relative name on the writable root disk: a root-disk file with
+         * that name is the canary. */
+        {
+            syscall1(SYS_CHDIR, (uint64_t)"/");
+            int64_t cv = syscall2(SYS_OPEN, (uint64_t)"h114-at", O_RDWR | O_CREAT | O_TRUNC);
+            if (cv >= 0) { syscall3(SYS_WRITE, (uint64_t)cv, (uint64_t)"keep", 4); syscall1(SYS_CLOSE, (uint64_t)cv); }
+            check(cv >= 0, "Q: create the root-disk canary h114-at");
+            check(syscall3(SYS_UNLINKAT, (uint64_t)dfd, (uint64_t)"h114-at", 0) == -EROFS, "Q: unlinkat(volume dirfd, name) is EROFS");
+            int64_t cr = syscall2(SYS_OPEN, (uint64_t)"h114-at", O_RDONLY);
+            check(cr >= 0, "Q: unlinkat through a volume dirfd did not delete the root-disk file of the same name");
+            if (cr >= 0) syscall1(SYS_CLOSE, (uint64_t)cr);
+            syscall1(SYS_UNLINK, (uint64_t)"h114-at");
+            int64_t mr = syscall3(SYS_MKDIRAT, (uint64_t)dfd, (uint64_t)"h114-atdir", 0755);
+            check(mr == -EROFS, "Q: mkdirat(volume dirfd, name) is EROFS");
+            if (mr == 0) syscall1(SYS_RMDIR, (uint64_t)"h114-atdir");
+            check(syscall4(SYS_FCHMODAT, (uint64_t)dfd, (uint64_t)"sub/n.txt", 0777, 0) == -EROFS, "Q: fchmodat(volume dirfd, name) is EROFS");
+            check(syscall4(SYS_FCHMODAT2, (uint64_t)dfd, (uint64_t)"sub/n.txt", 0777, 0) == -EROFS, "Q: fchmodat2(volume dirfd, name) is EROFS");
+            check(syscall5(SYS_RENAMEAT2, (uint64_t)dfd, (uint64_t)"sub/n.txt", (uint64_t)dfd, (uint64_t)"moved", 0) == -EROFS, "Q: renameat2 between volume dirfds is EROFS");
+            check(syscall3(SYS_UNLINKAT, (uint64_t)-100, (uint64_t)"/mnt/q/small.txt", 0) == -EROFS, "Q: unlinkat(AT_FDCWD, absolute volume path) is EROFS");
+            /* AT_REMOVEDIR on the writable root disk removes an empty directory; unknown flags are EINVAL */
+            syscall1(SYS_RMDIR, (uint64_t)"/h114-rmd");
+            check(syscall1(SYS_MKDIR, (uint64_t)"/h114-rmd") == 0, "Q: mkdir a root-disk directory for AT_REMOVEDIR");
+            check(syscall3(SYS_UNLINKAT, (uint64_t)-100, (uint64_t)"/h114-rmd", 0x1) == -EINVAL, "Q: unlinkat with an unknown flag is EINVAL");
+            check(syscall3(SYS_UNLINKAT, (uint64_t)-100, (uint64_t)"/h114-rmd", AT_REMOVEDIR) == 0, "Q: unlinkat(AT_REMOVEDIR) removes an empty directory");
+            check(syscall1(SYS_RMDIR, (uint64_t)"/h114-rmd") < 0, "Q: the directory is gone after unlinkat(AT_REMOVEDIR)");
+        }
         /* a non-directory fd as dirfd */
         int64_t ffd = syscall2(SYS_OPEN, (uint64_t)"/mnt/q/small.txt", O_RDONLY);
         check(syscall4(SYS_OPENAT, (uint64_t)ffd, (uint64_t)"x", O_RDONLY, 0) == -ENOTDIR, "Q: a regular file as dirfd is ENOTDIR");
