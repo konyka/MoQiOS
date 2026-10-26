@@ -3294,7 +3294,7 @@ const Ext2XattrEntry = extern struct {
 /// Returns 0 on success, -errno on failure.
 /// Uses standard ext2 xattr layout: entries grow forward from header,
 /// values grow backward from end of block (v52.3 fix).
-pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
+pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8, who: ?Who) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return -5;
@@ -3302,6 +3302,9 @@ pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
 
     var inode: Ext2Inode = undefined;
     if (!readInode(inode_num, &inode)) return -5;
+    if (who) |w| {
+        if (!@import("dac.zig").allows(inodeMeta(&inode), w.creds(), @import("dac.zig").Access.write)) return -13;
+    }
 
     // If inode has no EA block yet, allocate one
     var ea_block: u32 = inode.file_acl;
@@ -3532,7 +3535,7 @@ pub fn setXattr(inode_num: u32, name: []const u8, value: []const u8) i64 {
 
 /// Get extended attribute value from an inode.
 /// Returns bytes written to value_buf, or -errno.
-pub fn getXattr(inode_num: u32, name: []const u8, value_buf: [*]u8, buf_size: u32) i64 {
+pub fn getXattr(inode_num: u32, name: []const u8, value_buf: [*]u8, buf_size: u32, who: ?Who) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return -5;
@@ -3540,6 +3543,9 @@ pub fn getXattr(inode_num: u32, name: []const u8, value_buf: [*]u8, buf_size: u3
 
     var inode: Ext2Inode = undefined;
     if (!readInode(inode_num, &inode)) return -5;
+    if (who) |w| {
+        if (!@import("dac.zig").allows(inodeMeta(&inode), w.creds(), @import("dac.zig").Access.read)) return -13;
+    }
 
     const ea_block = inode.file_acl;
     if (ea_block == 0) return -61; // ENODATA
@@ -3584,13 +3590,16 @@ pub fn getXattr(inode_num: u32, name: []const u8, value_buf: [*]u8, buf_size: u3
 
 /// List extended attribute names for an inode.
 /// Returns bytes written to list_buf, or -errno.
-pub fn listXattr(inode_num: u32, list_buf: [*]u8, buf_size: u32) i64 {
+pub fn listXattr(inode_num: u32, list_buf: [*]u8, buf_size: u32, who: ?Who) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return -5;
 
     var inode: Ext2Inode = undefined;
     if (!readInode(inode_num, &inode)) return -5;
+    if (who) |w| {
+        if (!@import("dac.zig").allows(inodeMeta(&inode), w.creds(), @import("dac.zig").Access.read)) return -13;
+    }
 
     const ea_block = inode.file_acl;
     if (ea_block == 0) return 0; // no attributes, 0 bytes written
@@ -3644,7 +3653,7 @@ pub fn listXattr(inode_num: u32, list_buf: [*]u8, buf_size: u32) i64 {
 
 /// Remove extended attribute from an inode.
 /// Returns 0 on success, -errno on failure.
-pub fn removeXattr(inode_num: u32, name: []const u8) i64 {
+pub fn removeXattr(inode_num: u32, name: []const u8, who: ?Who) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return -5;
@@ -3652,6 +3661,9 @@ pub fn removeXattr(inode_num: u32, name: []const u8) i64 {
 
     var inode: Ext2Inode = undefined;
     if (!readInode(inode_num, &inode)) return -5;
+    if (who) |w| {
+        if (!@import("dac.zig").allows(inodeMeta(&inode), w.creds(), @import("dac.zig").Access.write)) return -13;
+    }
 
     const ea_block = inode.file_acl;
     if (ea_block == 0) return -61; // ENODATA

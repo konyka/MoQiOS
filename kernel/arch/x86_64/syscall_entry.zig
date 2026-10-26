@@ -2419,7 +2419,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 frame.rax = @bitCast(@as(i64, -2));
                 return;
             };
-            frame.rax = @bitCast(ext2_mod.setXattr(inode_num, actual_name, val_buf[0..vc]));
+            frame.rax = @bitCast(ext2_mod.setXattr(inode_num, actual_name, val_buf[0..vc], ext2Who()));
         },
         464 => { // getxattrat(dfd, path, flags, name, value, size)
             const copy = @import("../../mm/copy_from_user.zig");
@@ -2458,7 +2458,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             // Get value into temp buffer, then copy to user
             var val_buf: [4096]u8 = undefined;
             const bsize: u32 = @truncate(frame.r8);
-            const result = ext2_mod.getXattr(inode_num, actual_name, &val_buf, @min(bsize, 4096));
+            const result = ext2_mod.getXattr(inode_num, actual_name, &val_buf, @min(bsize, 4096), ext2Who());
             if (result > 0) {
                 if (copy.copyToUser(@ptrFromInt(frame.r9), val_buf[0..@intCast(result)], @intCast(result)) != @as(usize, @intCast(result))) {
                     frame.rax = @bitCast(@as(i64, -14));
@@ -2487,7 +2487,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             };
             var list_buf: [4096]u8 = undefined;
             const bsize: u32 = @truncate(frame.r8);
-            const result = ext2_mod.listXattr(inode_num, &list_buf, @min(bsize, 4096));
+            const result = ext2_mod.listXattr(inode_num, &list_buf, @min(bsize, 4096), ext2Who());
             if (result > 0) {
                 if (copy.copyToUser(@ptrFromInt(frame.r10), list_buf[0..@intCast(result)], @intCast(result)) != @as(usize, @intCast(result))) {
                     frame.rax = @bitCast(@as(i64, -14));
@@ -2530,7 +2530,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 frame.rax = @bitCast(@as(i64, -2));
                 return;
             };
-            frame.rax = @bitCast(ext2_mod.removeXattr(inode_num, actual_name));
+            frame.rax = @bitCast(ext2_mod.removeXattr(inode_num, actual_name, ext2Who()));
         },
         467 => { // open_tree_attr(dfd, path, flags, attr)
             frame.rax = 0; // accept (simplified)

@@ -109,6 +109,10 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_FCHMODAT  260
 #define SYS_RENAMEAT2 261
 #define SYS_FCHMODAT2 452
+#define SYS_SETXATTRAT    463
+#define SYS_GETXATTRAT    464
+#define SYS_LISTXATTRAT   465
+#define SYS_REMOVEXATTRAT 466
 #define AT_REMOVEDIR  0x200
 #define SYS_FSYNC     74
 #define SYS_FTRUNCATE 77
@@ -647,6 +651,40 @@ void _start(void) {
             int64_t td = syscall2(SYS_OPEN, (uint64_t)"/testdir", O_RDONLY);
             check(td >= 0, "U: opening the 0777 /testdir is allowed");
             if (td >= 0) syscall1(SYS_CLOSE, (uint64_t)td);
+        }
+        /* user.* extended attributes follow the file's own permissions: reading needs read access,
+         * writing/removing needs write access. /writetest.txt is root 0644, so uid 1000 may read
+         * its xattrs (there are none: ENODATA) but must not set or remove any. */
+        {
+            static const char xname[] = "user.h114";
+            check(syscall6(SYS_SETXATTRAT, (uint64_t)-100, (uint64_t)"/writetest.txt", 0, (uint64_t)xname, 1, (uint64_t)"v") == -EACCES, "U: setxattrat on a root-owned 0644 file by uid 1000 is EACCES");
+            check(syscall4(SYS_REMOVEXATTRAT, (uint64_t)-100, (uint64_t)"/writetest.txt", 0, (uint64_t)xname) == -EACCES, "U: removexattrat on it is EACCES");
+            /* 0700 /lost+found: no read permission for others */
+            uint8_t xb[16];
+            check(syscall6(SYS_GETXATTRAT, (uint64_t)-100, (uint64_t)"/lost+found", 0, (uint64_t)xname, 16, (uint64_t)xb) == -EACCES, "U: getxattrat on a root-only 0700 directory is EACCES");
+            check(syscall5(SYS_LISTXATTRAT, (uint64_t)-100, (uint64_t)"/lost+found", 0, (uint64_t)xb, 16) == -EACCES, "U: listxattrat on a root-only 0700 directory is EACCES");
+            /* root 0644 file: others hold the read bit but no execute bit, so a read-class
+             * xattr call must be allowed (ENODATA: there is no such attribute), not refused as
+             * if it needed search permission */
+            int64_t rg = syscall6(SYS_GETXATTRAT, (uint64_t)-100, (uint64_t)"/writetest.txt", 0, (uint64_t)xname, 16, (uint64_t)xb);
+            check(rg == -61 /* ENODATA */, "U: getxattrat on a root-owned 0644 file needs only read permission (ENODATA, not EACCES)");
+            int64_t rl = syscall5(SYS_LISTXATTRAT, (uint64_t)-100, (uint64_t)"/writetest.txt", 0, (uint64_t)xb, 16);
+            check(rl >= 0, "U: listxattrat on a root-owned 0644 file needs only read permission");
+        }
+        /* and on my own file everything works */
+        {
+            static const char xname[] = "user.h114";
+            syscall1(SYS_UNLINK, (uint64_t)"testdir/h114-x");
+            int64_t xf = syscall3(SYS_OPEN, (uint64_t)"testdir/h114-x", O_RDWR | O_CREAT | O_TRUNC, 0644);
+            if (xf >= 0) syscall1(SYS_CLOSE, (uint64_t)xf);
+            uint8_t xb[16];
+            int64_t sx = syscall6(SYS_SETXATTRAT, (uint64_t)-100, (uint64_t)"testdir/h114-x", 0, (uint64_t)xname, 3, (uint64_t)"val");
+            print("hello114:   info U: setxattrat returned "); print_u64(sx < 0 ? (uint64_t)(-sx) : (uint64_t)sx); print(sx < 0 ? " (negative errno)\n" : "\n");
+            check(xf >= 0 && sx == 0, "U: setxattrat on my own file succeeds");
+            int64_t gr = syscall6(SYS_GETXATTRAT, (uint64_t)-100, (uint64_t)"testdir/h114-x", 0, (uint64_t)xname, 16, (uint64_t)xb);
+            check(gr == 3 && xb[0] == 'v' && xb[2] == 'l', "U: getxattrat reads it back");
+            check(syscall4(SYS_REMOVEXATTRAT, (uint64_t)-100, (uint64_t)"testdir/h114-x", 0, (uint64_t)xname) == 0, "U: removexattrat on my own file succeeds");
+            syscall1(SYS_UNLINK, (uint64_t)"testdir/h114-x");
         }
         /* A file this process creates on ext2 belongs to it (euid/egid 1000) with the requested
          * mode reduced by the umask (022): chmod works, giving it away does not, keeping my own

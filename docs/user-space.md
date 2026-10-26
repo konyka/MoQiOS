@@ -445,6 +445,10 @@ symlinks record the creator's effective UID/GID, and files/directories get
 must therefore pass a real mode to `open(O_CREAT)` — a zero mode creates a file
 nobody but root can open.
 
+`user.*` extended attributes on ext2 follow the file's own mode: set/remove need
+write permission, get/list need read permission, and a denial (`-13`) is
+reported before whether the attribute exists.
+
 Namespace mutation (create, mkdir, symlink, unlink, rmdir, rename and hardlink)
 checks search permission on intermediate directories and write+search on the
 final parent while holding the ext2 lock. A denial is `-13` (`EACCES`), not a
