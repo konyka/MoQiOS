@@ -6129,3 +6129,19 @@ test "chown: giving a file away needs CAP_CHOWN, the owner may only pick its own
     try std.testing.expect(dac.mayChown(0, 0, 1000, 1000, true, 1000, 1000));
     try std.testing.expect(dac.mayChown(1000, 1000, 0, 0, false, 0, 0));
 }
+
+test "DAC directory search and write-search permissions" {
+    const no_search: dac.Metadata = .{ .mode = 0o0700, .uid = 0, .gid = 0 };
+    const world: dac.Metadata = .{ .mode = 0o0777, .uid = 0, .gid = 0 };
+    const list_only: dac.Metadata = .{ .mode = 0o0744, .uid = 0, .gid = 0 };
+    const who: dac.Credentials = .{ .euid = 1000, .egid = 1000 };
+    try std.testing.expect(!dac.allows(no_search, who, dac.Access.search));
+    try std.testing.expect(!dac.allows(no_search, who, dac.Access.write_search));
+    try std.testing.expect(dac.allows(no_search, .{ .euid = 0, .egid = 0 }, dac.Access.read));
+    try std.testing.expect(!dac.allows(no_search, who, dac.Access.read)); // others have no bits at all
+    try std.testing.expect(dac.allows(world, who, dac.Access.write_search));
+    try std.testing.expect(dac.allows(list_only, who, dac.Access.read));
+    try std.testing.expect(!dac.allows(list_only, who, dac.Access.search));
+    try std.testing.expect(dac.allows(no_search, .{ .euid = 0, .egid = 0 }, dac.Access.write_search));
+    try std.testing.expect(dac.allows(no_search, .{ .euid = 1000, .egid = 1000, .cap_dac_override = true }, dac.Access.write_search));
+}

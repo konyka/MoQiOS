@@ -630,6 +630,17 @@ void _start(void) {
             int64_t rn = -1;
             if (rr >= 0) { uint8_t tb[32]; rn = syscall3(SYS_READ, (uint64_t)rr, (uint64_t)tb, 32); syscall1(SYS_CLOSE, (uint64_t)rr); }
             check(rr >= 0 && rn == (int64_t)(st0.w[6]), "U: it is still readable and its size is unchanged");
+            /* Namespace changes need write+search permission on the parent directory. /rootdir (prepared by hello23) is root-owned
+             * 0755, so uid 1000 may not remove, rename or link there. */
+            check(syscall1(SYS_UNLINK, (uint64_t)"/rootdir/target.txt") == -EACCES, "U: unlink in root's 0755 /rootdir is EACCES");
+            check(syscall2(SYS_RENAME, (uint64_t)"/rootdir/target.txt", (uint64_t)"testdir/h114-stolen") == -EACCES, "U: rename out of root's 0755 /rootdir is EACCES");
+            check(syscall2(86 /* link */, (uint64_t)"/rootdir/target.txt", (uint64_t)"/rootdir/h114-hl") == -EACCES, "U: link into root's 0755 /rootdir is EACCES");
+            check(syscall1(SYS_RMDIR, (uint64_t)"/rootdir/empty") == -EACCES, "U: rmdir in root's 0755 /rootdir is EACCES");
+            int64_t still = syscall2(SYS_OPEN, (uint64_t)"/rootdir/target.txt", O_RDONLY);
+            check(still >= 0, "U: /rootdir/target.txt is still there");
+            if (still >= 0) syscall1(SYS_CLOSE, (uint64_t)still);
+            syscall1(SYS_UNLINK, (uint64_t)"testdir/h114-stolen");
+            syscall1(SYS_UNLINK, (uint64_t)"/rootdir/h114-hl");
             /* a 0700 root directory: listing it needs read permission on it */
             check(syscall2(SYS_OPEN, (uint64_t)"/lost+found", O_RDONLY) == -EACCES, "U: opening root's 0700 /lost+found to list it is EACCES");
             /* a 0777 directory stays usable */
@@ -929,11 +940,11 @@ void _start(void) {
             check(syscall5(SYS_RENAMEAT2, (uint64_t)dfd, (uint64_t)"sub/n.txt", (uint64_t)dfd, (uint64_t)"moved", 0) == -EROFS, "Q: renameat2 between volume dirfds is EROFS");
             check(syscall3(SYS_UNLINKAT, (uint64_t)-100, (uint64_t)"/mnt/q/small.txt", 0) == -EROFS, "Q: unlinkat(AT_FDCWD, absolute volume path) is EROFS");
             /* AT_REMOVEDIR on the writable root disk removes an empty directory; unknown flags are EINVAL */
-            syscall1(SYS_RMDIR, (uint64_t)"/h114-rmd");
-            check(syscall1(SYS_MKDIR, (uint64_t)"/h114-rmd") == 0, "Q: mkdir a root-disk directory for AT_REMOVEDIR");
-            check(syscall3(SYS_UNLINKAT, (uint64_t)-100, (uint64_t)"/h114-rmd", 0x1) == -EINVAL, "Q: unlinkat with an unknown flag is EINVAL");
-            check(syscall3(SYS_UNLINKAT, (uint64_t)-100, (uint64_t)"/h114-rmd", AT_REMOVEDIR) == 0, "Q: unlinkat(AT_REMOVEDIR) removes an empty directory");
-            check(syscall1(SYS_RMDIR, (uint64_t)"/h114-rmd") < 0, "Q: the directory is gone after unlinkat(AT_REMOVEDIR)");
+            syscall1(SYS_RMDIR, (uint64_t)"testdir/h114-rmd");
+            check(syscall1(SYS_MKDIR, (uint64_t)"testdir/h114-rmd") == 0, "Q: mkdir a root-disk directory for AT_REMOVEDIR");
+            check(syscall3(SYS_UNLINKAT, (uint64_t)-100, (uint64_t)"testdir/h114-rmd", 0x1) == -EINVAL, "Q: unlinkat with an unknown flag is EINVAL");
+            check(syscall3(SYS_UNLINKAT, (uint64_t)-100, (uint64_t)"testdir/h114-rmd", AT_REMOVEDIR) == 0, "Q: unlinkat(AT_REMOVEDIR) removes an empty directory");
+            check(syscall1(SYS_RMDIR, (uint64_t)"testdir/h114-rmd") < 0, "Q: the directory is gone after unlinkat(AT_REMOVEDIR)");
         }
         /* a non-directory fd as dirfd */
         int64_t ffd = syscall2(SYS_OPEN, (uint64_t)"/mnt/q/small.txt", O_RDONLY);

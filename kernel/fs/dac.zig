@@ -1,10 +1,14 @@
-pub const Access = packed struct(u2) {
+pub const Access = packed struct(u3) {
     read_bit: bool = false,
     write_bit: bool = false,
+    execute_bit: bool = false,
 
     pub const read: Access = .{ .read_bit = true };
     pub const write: Access = .{ .write_bit = true };
     pub const read_write: Access = .{ .read_bit = true, .write_bit = true };
+    /// Directory search + namespace mutation (create/unlink/rename/link/rmdir).
+    pub const search: Access = .{ .execute_bit = true };
+    pub const write_search: Access = .{ .write_bit = true, .execute_bit = true };
 };
 
 pub const Metadata = struct {
@@ -52,6 +56,7 @@ pub fn allows(metadata: Metadata, credentials: Credentials, access: Access) bool
     const class_bits = (metadata.mode >> shift) & 0x7;
     if (access.read_bit and (class_bits & 0x4) == 0) return false;
     if (access.write_bit and (class_bits & 0x2) == 0) return false;
+    if (access.execute_bit and (class_bits & 0x1) == 0) return false;
     return true;
 }
 

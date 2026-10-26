@@ -661,10 +661,14 @@ fn readSymlinkTarget(inode: *const Ext2Inode) ?[]const u8 {
     return symlink_buf[0..copy_len];
 }
 
-/// Resolve a path to its parent directory inode and the final filename component.
-/// Resolves symlinks in intermediate directory components (v50.0).
-/// Returns (parent_inode_num, filename) or null on failure.
-fn resolveParent(path: []const u8) ?struct { parent: u32, name: []const u8 } {
+/// Shared parent-directory path resolution, including intermediate symlinks.
+/// The checked form enforces directory DAC; resolveParent below preserves the
+/// legacy unauthorized lookup for read-only callers.
+const ParentRef = struct { parent: u32, name: []const u8 };
+
+const ParentError = error{ DacDenied, Invalid };
+
+fn resolveParentChecked(path: []const u8, who: ?Who, access: @import("dac.zig").Access) ParentError!ParentRef {
     // Find the last '/' to split parent path from filename
     var last_slash: usize = 0;
     for (0..path.len) |i| {
@@ -672,7 +676,7 @@ fn resolveParent(path: []const u8) ?struct { parent: u32, name: []const u8 } {
     }
 
     const filename = path[last_slash..];
-    if (filename.len == 0) return null; // trailing '/' or empty
+    if (filename.len == 0) return error.Invalid; // trailing '/' or empty
 
     // Walk to parent directory
     var parent_inode: u32 = 2; // start from root
@@ -689,11 +693,14 @@ fn resolveParent(path: []const u8) ?struct { parent: u32, name: []const u8 } {
             const component = parent_path[start..pos];
 
             var inode: Ext2Inode = undefined;
-            if (!readInode(parent_inode, &inode)) return null;
-            if (!eu.isDirectory(inode.mode)) return null;
+            if (!readInode(parent_inode, &inode)) return error.Invalid;
+            if (!eu.isDirectory(inode.mode)) return error.Invalid;
+            if (who) |w| {
+                if (!@import("dac.zig").allows(inodeMeta(&inode), w.creds(), @import("dac.zig").Access.search)) return error.DacDenied;
+            }
 
             const dir_inode = parent_inode; // directory containing this component
-            parent_inode = findDirEntryCached(dir_inode, &inode, component) orelse return null;
+            parent_inode = findDirEntryCached(dir_inode, &inode, component) orelse return error.Invalid;
 
             // v52.2: resolve symlinks in intermediate components (no fd allocation)
             var found_inode: Ext2Inode = undefined;
@@ -702,16 +709,27 @@ fn resolveParent(path: []const u8) ?struct { parent: u32, name: []const u8 } {
             {
                 if (readSymlinkTarget(&found_inode)) |target| {
                     const new_start: u32 = if (target.len > 0 and target[0] == '/') 2 else dir_inode;
-                    const resolved = walkPathToInodeResolve(new_start, target, 1) orelse return null;
+                    const resolved = walkPathToInodeResolve(new_start, target, 1) orelse return error.Invalid;
                     parent_inode = resolved;
                 } else {
-                    return null;
+                    return error.Invalid;
                 }
             }
         }
     }
 
+    if (who) |w| {
+        var pino: Ext2Inode = undefined;
+        if (!readInode(parent_inode, &pino)) return error.Invalid;
+        if (!eu.isDirectory(pino.mode)) return error.Invalid;
+        if (!@import("dac.zig").allows(inodeMeta(&pino), w.creds(), access)) return error.DacDenied;
+    }
     return .{ .parent = parent_inode, .name = filename };
+}
+
+/// Path resolution without authorization (read-only lookups).
+fn resolveParent(path: []const u8) ?ParentRef {
+    return resolveParentChecked(path, null, .{}) catch null;
 }
 
 /// K1 dcache: probe (parent_inode_num, name) first; a hit skips the directory
@@ -2170,7 +2188,7 @@ fn stampCreator(inode: *Ext2Inode, type_bits: u16, c: Creator) void {
     inode.osd2[7] = @truncate(c.gid >> 24);
 }
 
-pub fn createFile(name: []const u8, creator: Creator) i64 {
+pub fn createFile(name: []const u8, creator: Creator, who: ?Who) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return -1;
@@ -2182,7 +2200,7 @@ pub fn createFile(name: []const u8, creator: Creator) i64 {
     }
 
     // Resolve parent directory and filename
-    const resolved = resolveParent(name) orelse return -1;
+    const resolved = resolveParentChecked(name, who, @import("dac.zig").Access.write_search) catch |e| return if (e == error.DacDenied) -13 else -1;
     const parent_inode_num = resolved.parent;
     const filename = resolved.name;
 
@@ -2335,7 +2353,7 @@ fn addDirEntry(dir_inode_num: u32, target_inode: u32, entry_name: []const u8, fi
 /// Create a new directory in the ext2 filesystem.
 /// Supports multi-level paths (e.g., "testdir/subdir").
 /// Returns file index (>= 0) on success, 0 if already exists, -1 on failure.
-pub fn createDir(name: []const u8, creator: Creator) i64 {
+pub fn createDir(name: []const u8, creator: Creator, who: ?Who) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return -1;
@@ -2348,7 +2366,7 @@ pub fn createDir(name: []const u8, creator: Creator) i64 {
     }
 
     // Resolve parent directory and directory name
-    const resolved = resolveParent(name) orelse return -1;
+    const resolved = resolveParentChecked(name, who, @import("dac.zig").Access.write_search) catch |e| return if (e == error.DacDenied) -13 else -1;
     const parent_inode_num = resolved.parent;
     const dirname = resolved.name;
 
@@ -2629,42 +2647,42 @@ fn removeDirEntry(parent_inode_num: u32, name: []const u8) bool {
 
 /// Unlink (delete) a file from the ext2 filesystem.
 /// Supports multi-level paths, hardlinks, and symlinks (v50.0).
-pub fn unlinkFile(path: []const u8) bool {
+pub fn unlinkFile(path: []const u8, who: ?Who) i64 {
     var flags = fs_lock.acquire();
     defer fs_lock.release(flags);
-    if (!active) return false;
+    if (!active) return -1;
 
     // Resolve parent directory and filename
-    const resolved = resolveParent(path) orelse return false;
+    const resolved = resolveParentChecked(path, who, @import("dac.zig").Access.write_search) catch |e| return if (e == error.DacDenied) -13 else -1;
     const parent_inode_num = resolved.parent;
     const filename = resolved.name;
 
     // Find the file's inode number via findDirEntry on parent
     var parent_inode: Ext2Inode = undefined;
-    if (!readInode(parent_inode_num, &parent_inode)) return false;
-    const file_inode_num = findDirEntryCached(parent_inode_num, &parent_inode, filename) orelse return false;
+    if (!readInode(parent_inode_num, &parent_inode)) return -1;
+    const file_inode_num = findDirEntryCached(parent_inode_num, &parent_inode, filename) orelse return -1;
 
     // Read file inode
     var file_inode: Ext2Inode = undefined;
-    if (!readInode(file_inode_num, &file_inode)) return false;
+    if (!readInode(file_inode_num, &file_inode)) return -1;
 
     // POSIX: unlink() must refuse directories (EISDIR). Unlinking one here
     // freed its blocks while every child entry became an orphan and the
     // parent's links_count stayed incremented — fsck-level corruption.
     // Directories go through rmdirFile.
-    if (eu.isDirectory(file_inode.mode)) return false;
+    if (eu.isDirectory(file_inode.mode)) return -1;
 
     // v50.0: decrement links_count for hardlinked files; the last link is
     // freed now or, if still open, on the last close.
     releaseLink(file_inode_num, &file_inode, &flags);
 
     // Remove directory entry from parent
-    if (!removeDirEntry(parent_inode_num, filename)) return false;
+    if (!removeDirEntry(parent_inode_num, filename)) return -1;
 
     serial.writeString("[ext2] unlinked: ");
     serial.writeString(filename);
     serial.writeString("\n");
-    return true;
+    return 0;
 }
 
 // ─── Hard link creation ────────────────────────────────────────────────────
@@ -2765,44 +2783,44 @@ fn eqlStr(a: []const u8, b: []const u8) bool {
 /// leaves the filesystem untouched, and rename("f","f") is a successful
 /// no-op instead of orphaning the file); an overwritten target is released
 /// with unlink semantics afterwards.
-pub fn renameFile(old_path: []const u8, new_path: []const u8) bool {
+pub fn renameFile(old_path: []const u8, new_path: []const u8, who: ?Who) i64 {
     var flags = fs_lock.acquire();
     defer fs_lock.release(flags);
-    if (!active) return false;
+    if (!active) return -1;
 
     // Resolve source: parent dir + old filename
-    const old_resolved = resolveParent(old_path) orelse return false;
+    const old_resolved = resolveParentChecked(old_path, who, @import("dac.zig").Access.write_search) catch |e| return if (e == error.DacDenied) -13 else -1;
     const old_parent_inode = old_resolved.parent;
     const old_filename = old_resolved.name;
 
     // Resolve destination: parent dir + new filename
-    const new_resolved = resolveParent(new_path) orelse return false;
+    const new_resolved = resolveParentChecked(new_path, who, @import("dac.zig").Access.write_search) catch |e| return if (e == error.DacDenied) -13 else -1;
     const new_parent_inode = new_resolved.parent;
     const new_filename = new_resolved.name;
 
     // "." and ".." must never be (re)written by rename.
-    if (eqlStr(new_filename, ".") or eqlStr(new_filename, "..")) return false;
+    if (eqlStr(new_filename, ".") or eqlStr(new_filename, "..")) return -1;
 
     // Find the file's inode
     var old_parent_ino_data: Ext2Inode = undefined;
-    if (!readInode(old_parent_inode, &old_parent_ino_data)) return false;
-    const file_inode_num = findDirEntryCached(old_parent_inode, &old_parent_ino_data, old_filename) orelse return false;
+    if (!readInode(old_parent_inode, &old_parent_ino_data)) return -1;
+    const file_inode_num = findDirEntryCached(old_parent_inode, &old_parent_ino_data, old_filename) orelse return -1;
 
     // Read file inode to get file_type
     var file_inode: Ext2Inode = undefined;
-    if (!readInode(file_inode_num, &file_inode)) return false;
+    if (!readInode(file_inode_num, &file_inode)) return -1;
     // Directory renames need ".." rewiring and both parents' links_count
     // maintained (plus a subtree-cycle check); until that exists, refuse
     // rather than corrupt the namespace.
-    if (eu.isDirectory(file_inode.mode)) return false;
+    if (eu.isDirectory(file_inode.mode)) return -1;
     const file_type: u8 = 1;
 
     // Same directory + same name: POSIX rename(2) succeeds as a no-op.
-    if (old_parent_inode == new_parent_inode and eqlStr(old_filename, new_filename)) return true;
+    if (old_parent_inode == new_parent_inode and eqlStr(old_filename, new_filename)) return 0;
 
     // Read destination parent once.
     var new_parent_inode_data: Ext2Inode = undefined;
-    if (!readInode(new_parent_inode, &new_parent_inode_data)) return false;
+    if (!readInode(new_parent_inode, &new_parent_inode_data)) return -1;
 
     // Remember an overwritten target (released after the rename commits).
     var replaced_inode_num: ?u32 = null;
@@ -2811,11 +2829,11 @@ pub fn renameFile(old_path: []const u8, new_path: []const u8) bool {
     }
 
     // Order matters: add the new entry first; only then remove the old one.
-    if (!addDirEntry(new_parent_inode, file_inode_num, new_filename, file_type)) return false;
+    if (!addDirEntry(new_parent_inode, file_inode_num, new_filename, file_type)) return -1;
     if (!removeDirEntry(old_parent_inode, old_filename)) {
         // Roll the add back so the file is not hard-linked twice.
         _ = removeDirEntry(new_parent_inode, new_filename);
-        return false;
+        return -1;
     }
 
     // Release the replaced target with unlink semantics.
@@ -2829,7 +2847,7 @@ pub fn renameFile(old_path: []const u8, new_path: []const u8) bool {
     serial.writeString("[ext2] renamed to: ");
     serial.writeString(new_filename);
     serial.writeString("\n");
-    return true;
+    return 0;
 }
 
 
@@ -2837,40 +2855,40 @@ pub fn renameFile(old_path: []const u8, new_path: []const u8) bool {
 /// whose only entries are "." and "..". Removes the parent's entry, decrements
 /// the parent's links_count (it held a link on this directory's name), and
 /// frees the directory's single block and inode.
-pub fn rmdirFile(path: []const u8) bool {
+pub fn rmdirFile(path: []const u8, who: ?Who) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
-    if (!active) return false;
+    if (!active) return -1;
 
-    const resolved = resolveParent(path) orelse return false;
+    const resolved = resolveParentChecked(path, who, @import("dac.zig").Access.write_search) catch |e| return if (e == error.DacDenied) -13 else -1;
     const parent_inode_num = resolved.parent;
     const filename = resolved.name;
 
     var parent_inode: Ext2Inode = undefined;
-    if (!readInode(parent_inode_num, &parent_inode)) return false;
-    const dir_inode_num = findDirEntryCached(parent_inode_num, &parent_inode, filename) orelse return false;
+    if (!readInode(parent_inode_num, &parent_inode)) return -1;
+    const dir_inode_num = findDirEntryCached(parent_inode_num, &parent_inode, filename) orelse return -1;
 
     var dir_inode: Ext2Inode = undefined;
-    if (!readInode(dir_inode_num, &dir_inode)) return false;
-    if (!eu.isDirectory(dir_inode.mode)) return false; // ENOTDIR
+    if (!readInode(dir_inode_num, &dir_inode)) return -1;
+    if (!eu.isDirectory(dir_inode.mode)) return -1; // ENOTDIR
 
     // Empty check: the directory's single data block may contain only "."
     // and "..". A directory with indirect blocks is not empty by definition.
-    if (dir_inode.block[0] == 0) return false;
-    if (dir_inode.block[1] != 0 or dir_inode.block[12] != 0) return false;
+    if (dir_inode.block[0] == 0) return -1;
+    if (dir_inode.block[1] != 0 or dir_inode.block[12] != 0) return -1;
 
     const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
-    if (!readBlockUncached(resolveBlock(&dir_inode, 0), buf)) return false;
+    if (!readBlockUncached(resolveBlock(&dir_inode, 0), buf)) return -1;
     var pos: usize = 0;
     while (pos + 8 <= block_size) {
         const rec_len = @as(u16, buf[pos + 4]) | (@as(u16, buf[pos + 5]) << 8);
-        if (rec_len < 8) return false;
+        if (rec_len < 8) return -1;
         const name_len = buf[pos + 6];
-        if (pos + rec_len > block_size) return false;
+        if (pos + rec_len > block_size) return -1;
         if (name_len != 0) {
             const is_dot = name_len == 1 and buf[pos + 8] == '.';
             const is_dotdot = name_len == 2 and buf[pos + 8] == '.' and buf[pos + 9] == '.';
-            if (!is_dot and !is_dotdot) return false; // ENOTEMPTY
+            if (!is_dot and !is_dotdot) return -1; // ENOTEMPTY
         }
         pos += rec_len;
     }
@@ -2890,7 +2908,7 @@ pub fn rmdirFile(path: []const u8) bool {
     const page_cache = @import("page_cache.zig");
     page_cache.invalidateInode(0x3000_0000_0000_0000 + @as(u64, dir_inode_num));
 
-    if (!removeDirEntry(parent_inode_num, filename)) return false;
+    if (!removeDirEntry(parent_inode_num, filename)) return -1;
     // The parent held a link on this directory's name (and the directory's
     // ".." pointed back at the parent — createDir incremented it).
     if (parent_inode.links_count > 1) {
@@ -2903,13 +2921,13 @@ pub fn rmdirFile(path: []const u8) bool {
     serial.writeString("[ext2] rmdir: ");
     serial.writeString(filename);
     serial.writeString("\n");
-    return true;
+    return 0;
 }
 
 
 /// Create a hard link: newpath → same inode as oldpath.
 /// Returns 0 on success, -errno on failure.
-pub fn createHardlink(oldpath: []const u8, newpath: []const u8) i64 {
+pub fn createHardlink(oldpath: []const u8, newpath: []const u8, who: ?Who) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return -5; // EIO
@@ -2924,7 +2942,7 @@ pub fn createHardlink(oldpath: []const u8, newpath: []const u8) i64 {
     if (eu.isDirectory(old_inode_data.mode)) return -1; // EPERM: cannot hardlink directories
 
     // 2. Resolve newpath's parent directory + filename
-    const resolved = resolveParent(newpath) orelse return -2;
+    const resolved = resolveParentChecked(newpath, who, @import("dac.zig").Access.write_search) catch |e| return if (e == error.DacDenied) -13 else -2;
     if (resolved.name.len == 0) return -2;
 
     // Check that newpath doesn't already exist
@@ -2948,13 +2966,13 @@ pub fn createHardlink(oldpath: []const u8, newpath: []const u8) i64 {
 
 /// Create a symbolic link: linkpath → target.
 /// Returns 0 on success, -errno on failure.
-pub fn createSymlink(target: []const u8, linkpath: []const u8, creator: Creator) i64 {
+pub fn createSymlink(target: []const u8, linkpath: []const u8, creator: Creator, who: ?Who) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return -5;
 
     // 1. Resolve linkpath's parent directory + filename
-    const resolved = resolveParent(linkpath) orelse return -2;
+    const resolved = resolveParentChecked(linkpath, who, @import("dac.zig").Access.write_search) catch |e| return if (e == error.DacDenied) -13 else -2;
     if (resolved.name.len == 0) return -2;
 
     // Check that linkpath doesn't already exist
@@ -3136,18 +3154,27 @@ pub fn readSymlinkByPath(path: []const u8) ?[]const u8 {
 
 /// Set owner (uid/gid) for a path. Returns 0 on success, -errno on failure.
 /// Pass -1 (0xFFFF) to leave uid or gid unchanged.
-/// Credentials of the caller of chmod/chown. The setters below authorize
-/// against the inode's current owner under fs_lock (dac.mayChmod/mayChown),
-/// so the check and the update see the same inode.
+/// Credentials for inode and namespace authorization. Checks run under
+/// fs_lock, so the decision and the metadata/namespace update see the same
+/// on-disk state.
 pub const Who = struct {
     euid: u32,
     egid: u32,
     cap_fowner: bool = false,
     cap_chown: bool = false,
+    cap_dac_override: bool = false,
+
+    fn creds(self: Who) @import("dac.zig").Credentials {
+        return .{ .euid = self.euid, .egid = self.egid, .cap_dac_override = self.cap_dac_override };
+    }
 };
 
 fn inodeUid(inode: *const Ext2Inode) u32 {
     return @as(u32, inode.uid) | (@as(u32, inode.osd2[4]) << 16) | (@as(u32, inode.osd2[5]) << 24);
+}
+
+fn inodeMeta(inode: *const Ext2Inode) @import("dac.zig").Metadata {
+    return .{ .mode = inode.mode, .uid = inodeUid(inode), .gid = inodeGid(inode) };
 }
 
 fn inodeGid(inode: *const Ext2Inode) u32 {

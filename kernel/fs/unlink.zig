@@ -1,10 +1,11 @@
 /// unlink — delete a file by path.
 ///
-/// Tries ext2 first, then FAT32.
+/// Tries ext2 first, then FAT32; an ext2 permission denial is final.
 /// Extracted from syscall_entry.zig (v18.9).
 const copy = @import("../mm/copy_from_user.zig");
 const ext2 = @import("../fs/ext2.zig");
 const fat32 = @import("../fs/fat32.zig");
+const sched = @import("../proc/sched.zig");
 
 /// Copy a NUL-terminated user path into a kernel buffer. Shared by the
 /// unlink/rmdir wrappers; a 256-byte buffer matches every other path-taking
@@ -20,6 +21,11 @@ fn copyPath(path_ptr: u64, buf: *[256]u8) ?[]const u8 {
     return buf[0..name_len];
 }
 
+fn caller() ?@import("../fs/ext2.zig").Who {
+    const cur = sched.currentTask() orelse return null;
+    return .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override };
+}
+
 /// unlink(path_ptr) -> 0 or -errno.
 pub fn unlink(path_ptr: u64) i64 {
     var name_buf: [256]u8 = undefined;
@@ -33,7 +39,8 @@ pub fn unlink(path_ptr: u64) i64 {
 
     // Try ext2 first
     if (ext2.isActive()) {
-        if (ext2.unlinkFile(name)) return 0;
+        const r = ext2.unlinkFile(name, caller());
+        if (r == 0 or r == -13) return r;
     }
 
     // Try FAT32
@@ -70,8 +77,7 @@ pub fn rmdir(path_ptr: u64) i64 {
     }
 
     if (ext2.isActive()) {
-        if (ext2.rmdirFile(name)) return 0;
-        return -1;
+        return ext2.rmdirFile(name, caller());
     }
     return -1;
 }

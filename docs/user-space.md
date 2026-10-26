@@ -398,7 +398,12 @@ it starts as UID/GID `0` with `ALL_CAPS`. A later launch receives a capability
 profile only when the caller is the trusted initial `init` task and the ramdisk
 name matches exactly: `hello14` gets `CAP_NET_RAW`, `hello51`/`hello52` get
 `CAP_SYS_RAWIO`, `hello54` gets `CAP_SYS_RAWIO` plus `CAP_KILL`, and
-`hello13`/`hello58` get `CAP_KILL`. All other names remain unprivileged.
+`hello13`/`hello58` get `CAP_KILL`, and `hello95`/`hello114` get
+`CAP_SYS_MOUNT`. The legacy ext2 fixture programs
+`hello21`/`hello23`/`hello24`/`hello25`/`hello29`/`hello77` get
+`CAP_DAC_OVERRIDE|CAP_CHOWN` so they can prepare and exercise files in the
+root-owned 0755 root directory; `hello114` does not receive those capabilities.
+All other names remain unprivileged.
 
 AF_INET `SOCK_RAW` creation and the custom raw network send/receive syscalls
 return `EPERM` unless the current task has `CAP_NET_RAW`; TCP and UDP sockets
@@ -438,8 +443,14 @@ truncation); a denial is `-13` (`EACCES`). New ext2 files, directories and
 symlinks record the creator's effective UID/GID, and files/directories get
 `(requested_mode & 0777) & ~(umask & 0777)`; symlinks are always 0777. Programs
 must therefore pass a real mode to `open(O_CREAT)` — a zero mode creates a file
-nobody but root can open. Search permission on the directories along a path,
-and directory write permission for unlink/rename/link/rmdir, are not checked.
+nobody but root can open.
+
+Namespace mutation (create, mkdir, symlink, unlink, rmdir, rename and hardlink)
+checks search permission on intermediate directories and write+search on the
+final parent while holding the ext2 lock. A denial is `-13` (`EACCES`), not a
+fallback to FAT32. Ordinary open does not yet check search permission on the
+intermediate directories. Sticky-bit semantics are not implemented; tmpfs and
+FAT32 namespace mutation still has no parent-directory DAC.
 
 Independent of DAC, descriptor access modes are enforced at read time
 regardless of filesystem: reading a descriptor opened `O_WRONLY` fails with

@@ -2013,7 +2013,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             var nl: usize = 0;
             while (nl < 256 and new_buf[nl] != 0) : (nl += 1) {}
             if (ext2_mod.isActive()) {
-                frame.rax = @bitCast(ext2_mod.createHardlink(old_buf[0..ol], new_buf[0..nl]));
+                frame.rax = @bitCast(ext2_mod.createHardlink(old_buf[0..ol], new_buf[0..nl], ext2Who()));
             } else {
                 frame.rax = @bitCast(@as(i64, -38)); // ENOSYS
             }
@@ -2036,7 +2036,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             var ll: usize = 0;
             while (ll < 256 and lnk_buf[ll] != 0) : (ll += 1) {}
             if (ext2_mod.isActive()) {
-                frame.rax = @bitCast(ext2_mod.createSymlink(tgt_buf[0..tl], lnk_buf[0..ll], ext2Creator()));
+                frame.rax = @bitCast(ext2_mod.createSymlink(tgt_buf[0..tl], lnk_buf[0..ll], ext2Creator(), ext2Who()));
             } else {
                 frame.rax = @bitCast(@as(i64, -38)); // ENOSYS
             }
@@ -2113,7 +2113,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             while (ol < 256 and old_buf[ol] != 0) : (ol += 1) {}
             var nl: usize = 0;
             while (nl < 256 and new_buf[nl] != 0) : (nl += 1) {}
-            frame.rax = @bitCast(ext2_mod.createHardlink(old_buf[0..ol], new_buf[0..nl]));
+            frame.rax = @bitCast(ext2_mod.createHardlink(old_buf[0..ol], new_buf[0..nl], ext2Who()));
         },
         330 => { // symlink(target, linkpath) — same as #88
             const copy = @import("../../mm/copy_from_user.zig");
@@ -2132,7 +2132,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             while (tl < 256 and tgt_buf[tl] != 0) : (tl += 1) {}
             var ll: usize = 0;
             while (ll < 256 and lnk_buf[ll] != 0) : (ll += 1) {}
-            frame.rax = @bitCast(ext2_mod.createSymlink(tgt_buf[0..tl], lnk_buf[0..ll], ext2Creator()));
+            frame.rax = @bitCast(ext2_mod.createSymlink(tgt_buf[0..tl], lnk_buf[0..ll], ext2Creator(), ext2Who()));
         },
         // ── v42.0: Linux standard number aliases (331+) + new implementations ──
         331 => { // statx(dirfd, pathname, flags, mask, statxbuf) — alias of #183
@@ -2759,6 +2759,7 @@ fn ext2Who() @import("../../fs/ext2.zig").Who {
         .egid = cur.egid,
         .cap_fowner = cur.effective_caps.cap_fowner,
         .cap_chown = cur.effective_caps.cap_chown,
+        .cap_dac_override = cur.effective_caps.cap_dac_override,
     };
 }
 
@@ -3755,8 +3756,8 @@ fn syscallRename(old_ptr: u64, new_ptr: u64) i64 {
     var new_len: usize = 0;
     while (new_len < 256 and new_buf[new_len] != 0) : (new_len += 1) {}
     const ext2 = @import("../../fs/ext2.zig");
-    const ok = ext2.renameFile(old_buf[0..old_len], new_buf[0..new_len]);
-    return if (ok) @as(i64, 0) else @as(i64, -18); // EXDEV
+    const r = ext2.renameFile(old_buf[0..old_len], new_buf[0..new_len], ext2Who());
+    return if (r == 0 or r == -13) r else -18; // EXDEV
 }
 
 // ── v32.4: madvise / getrlimit / setrlimit ──────────────────────────

@@ -78,6 +78,15 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
     if (std.mem.eql(u8, name, "hello54")) {
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_sys_rawio = true, .cap_kill = true }, .initial_init = false };
     }
+    // Legacy ext2 fixture programs write in the root-owned 0755 root directory.
+    // They exercise filesystem mechanics, not DAC; keep their pre-DAC fixture
+    // privileges explicit rather than weakening the filesystem checks.
+    if (std.mem.eql(u8, name, "hello21") or std.mem.eql(u8, name, "hello23") or
+        std.mem.eql(u8, name, "hello24") or std.mem.eql(u8, name, "hello25") or
+        std.mem.eql(u8, name, "hello29") or std.mem.eql(u8, name, "hello77"))
+    {
+        return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_dac_override = true, .cap_chown = true }, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello13") or std.mem.eql(u8, name, "hello58")) {
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_kill = true }, .initial_init = false };
     }

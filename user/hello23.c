@@ -23,6 +23,8 @@ static inline int64_t syscall3(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_OPEN   9
 #define SYS_CLOSE  11
 #define SYS_MKDIR  123
+#define SYS_CHMOD  90
+#define SYS_CHOWN  92
 
 static void print(const char *s) {
     int len = 0;
@@ -62,6 +64,24 @@ void _start(void) {
     print("hello23: mkdir2=");
     print_dec(r3);
     print("\n");
+
+    /* Fixture for hello114's namespace-permission checks: a root-owned 0755
+     * directory containing a root-owned file and an empty directory. This test
+     * has CAP_DAC_OVERRIDE|CAP_CHOWN so it can prepare the fixture in /. */
+    syscall2(SYS_MKDIR, (uint64_t)"rootdir", 0755);
+    syscall2(SYS_MKDIR, (uint64_t)"rootdir/empty", 0755);
+    int64_t fixture = syscall3(SYS_OPEN, (uint64_t)"rootdir/target.txt", 0x241, 0644);
+    if (fixture >= 0) {
+        syscall3(SYS_WRITE, (uint64_t)fixture, (uint64_t)"root-target\n", 12);
+        syscall1(SYS_CLOSE, (uint64_t)fixture);
+    }
+    syscall2(SYS_CHMOD, (uint64_t)"rootdir", 0755);
+    syscall2(SYS_CHMOD, (uint64_t)"rootdir/empty", 0755);
+    syscall2(SYS_CHMOD, (uint64_t)"rootdir/target.txt", 0644);
+    syscall3(SYS_CHOWN, (uint64_t)"rootdir", 0, 0);
+    syscall3(SYS_CHOWN, (uint64_t)"rootdir/empty", 0, 0);
+    syscall3(SYS_CHOWN, (uint64_t)"rootdir/target.txt", 0, 0);
+    print("hello23: namespace fixture ready\n");
 
     print("hello23: mkdir OK\n");
 

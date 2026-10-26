@@ -1155,7 +1155,7 @@ const FdTable = struct {
   样适用；ext4 inode 的 uid/gid 由低 16 位与高 16 位合并；NTFS 不提供 xattr/ADS；卷内不能再挂载别的文件系统。
 - **验证**：host 测试（ext4 20、NTFS 19、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；含 bigalloc 镜像 `ext4_bigalloc.img`、statfs 数值与 `dumpe2fs` / `$Bitmap` popcount 交叉核对；真实
   `tools/fsfixtures/mkfixtures.sh` 生成的镜像，`debugfs` / `ntfsls` 交叉核对；含敌对超级块/
-  引导扇区/损坏 extent 树/fixup 撕裂）；`hello114` 运行时检查 237 项（含并发读，另有 NVMe 4 项、AHCI 4 项仅在手动提供镜像时运行）（另有 NVMe、AHCI 两段默认 skip）（SMP=1/2/8，MBR 与 GPT 两种
+  引导扇区/损坏 extent 树/fixup 撕裂）；`hello114` 运行时检查 266 项（含并发读，另有 NVMe 4 项、AHCI 4 项仅在手动提供镜像时运行）（另有 NVMe、AHCI 两段默认 skip）（SMP=1/2/8，MBR 与 GPT 两种
   数据盘镜像，`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`），变异验证——去掉 EROFS 守卫
   则 7 项失败，忽略挂载代数则过期 fd 检查失败，关掉挂载规则则 7 项失败，关掉 DAC 检查则 7
   项失败。NVMe（中断驱动）与 AHCI 上的真实挂载读取（I/J 段）需要手动提供带 ext4 的镜像
@@ -1213,6 +1213,11 @@ const FdTable = struct {
 - 截断释放：`truncateFile` / `truncateByInode` 共用单/双/三级间接块 tail-trim helper，缩小时释放尾部数据块和空的间接树并失效 inode 页缓存
 - 目录条目读写
 - 多级路径解析（`resolveParent`）
+- **DAC 与创建者**：打开已有文件在截断/发布 fd 前按 inode owner/mode 判定（`dac.decideExistingOpen`）；
+  `chmod`/`chown` 族按属主与 CAP_FOWNER/CAP_CHOWN 授权。新建文件、目录、符号链接记录 euid/egid（含 osd2 高 16 位），
+  文件/目录权限为 `(requested & 0777) & ~umask`。命名空间修改（create/mkdir/symlink/unlink/rmdir/rename/hardlink）
+  在 fs_lock 内检查中间目录 search 与父目录 write+search，拒绝返回 EACCES，不再回落到 FAT32 的同名文件。
+  普通 open 仍不检查中间目录 search；粘滞位、补充组未实现。
 - 操作: `readFile` / `writeFile` / `createFile` / `createDir` / `unlinkFile` / `listDirInode` / `truncate`
 - TRIM (G5)：`freeBlock` 把释放的数据块记入 discard 积攒缓冲（非批量时立即
   下发；`batch_free_depth` 批量释放时在 defer 收尾统一经 `trim_ranges.coalesce`

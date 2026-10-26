@@ -1083,7 +1083,7 @@ pub const FdTable = struct {
             // ext2 create file if O_CREAT
             if (o_creat) {
                 const cm = @import("../proc/creation_metadata.zig").decide(null, .regular_file, requested_mode, umask_val, euid, egid).metadata;
-                const ci = ext2.createFile(name, .{ .uid = cm.uid, .gid = cm.gid, .perm = @truncate(cm.mode) });
+                const ci = ext2.createFile(name, .{ .uid = cm.uid, .gid = cm.gid, .perm = @truncate(cm.mode) }, .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override });
                 if (ci >= 0) {
                     const idx: u32 = @intCast(ci);
                     self.fds[slot] = .{
