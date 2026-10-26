@@ -1355,8 +1355,19 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
     if (file_idx >= open_count) return false;
     const f = &open_files[file_idx];
     if (f.inode_num == 0) return false;
+    const inode_num = f.inode_num;
 
-    if (new_size >= f.inode.size) {
+    // Each open slot keeps its own inode copy, and writes are staged in a buffer
+    // shared by every descriptor of the file; neither reaches f.inode.size until
+    // flushed. Compare against the on-disk size and the end of the staged data,
+    // or a truncate below them is taken for growth and leaves the staged bytes
+    // to be flushed after it (the file grows back). Same fix as FAT32's.
+    var disk_inode: Ext2Inode = undefined;
+    if (readInode(inode_num, &disk_inode) and disk_inode.size > f.inode.size) f.inode.size = disk_inode.size;
+    const staged_end: u64 = @import("writeback.zig").stagedEnd(0x3000_0000_0000_0000 + @as(u64, inode_num), .ext2);
+    const effective_size: u64 = @max(@as(u64, f.inode.size), staged_end);
+
+    if (new_size >= effective_size) {
         // Growing: just update size (blocks will be allocated on write)
         f.inode.size = new_size;
         stampModified(&f.inode);
@@ -1365,10 +1376,18 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
     }
 
     // v53.51: flush+drop staged writeback extents before freeing blocks.
-    const inode_num = f.inode_num;
     invalidateWriteback(inode_num, &flags);
     // fs_lock was dropped — make sure the slot still refers to the same inode.
     if (f.inode_num != inode_num) return false;
+    // The flush may have written through another slot and grown the file on
+    // disk; the blocks freed below must be judged against that, not the stale copy.
+    if (readInode(inode_num, &disk_inode)) f.inode = disk_inode;
+    if (new_size >= f.inode.size) {
+        f.inode.size = new_size;
+        stampModified(&f.inode);
+        _ = writeInode(f.inode_num, &f.inode);
+        return true;
+    }
 
     // Shrinking: free blocks beyond new_size
     // v53.15: Batch mode — defer cacheFlush+writeGroupDescs+writeSuperblock

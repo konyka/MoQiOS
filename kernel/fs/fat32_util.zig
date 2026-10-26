@@ -464,6 +464,19 @@ pub fn utf8ToUtf16(src: []const u8, out: []u16) ?u32 {
     return o;
 }
 
+/// The FAT32 volume is flat: this driver only knows root-directory entries.
+/// A path with a '/' after its first character names something inside a
+/// directory, which FAT32 here cannot hold, so it is not a FAT32 name: open
+/// and create must return "not found" and let the VFS try ext2. Accepting it
+/// created a root entry literally named "testdir/x" (invalid on FAT, flagged
+/// by fsck) that shadowed the ext2 file of the same path. A single leading
+/// '/' is still part of the stored name, as it always was.
+pub fn isRootName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name[1..]) |c| if (c == '/') return false;
+    return true;
+}
+
 /// True when `name` round-trips through 8.3 encode/decode (case-insensitive).
 pub fn fits83Name(name: []const u8) bool {
     if (name.len == 0 or name.len > 12) return false;

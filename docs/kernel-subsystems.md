@@ -910,6 +910,8 @@ const SchedStats = struct {
 - FAT32 truncate revalidates the file size/chain snapshot after unlocked flush I/O, uses widened size arithmetic, preserves old metadata on directory-update failure, and O_TRUNC propagates truncate failure instead of publishing a stale fd. (§6.51: the O_TRUNC failure path releases the retained slot via `closeFile` + `freeFd` — `close()` rejects a still-INITIALIZING slot and used to leak both the fd slot and the reference; the create path holds exactly one reference per fd.)
 - FAT32 partial truncate zeros the retained cluster tail and detaches the live chain before freeing tail clusters, preventing retry after FAT I/O failure from traversing reclaimed clusters. (§6.51 reorder: the new size is published to memory and the on-disk directory entry BEFORE the EOC detach — a directory-update failure now rolls back to a fully consistent (size, chain) pair; a failure after the EOC write leaves the legal shrunk-size-with-slack-chain state and never rolls the size back.)
 - FAT32 mmap-backed regions retain the open slot exactly like ext2 (create success, split, fork copy, and release balance the reference) — since slots ARE reclaimed once the last reference drops after unlink, an unreferenced mapping could otherwise fault on or write into a reused slot after close(fd)+unlink+create. (§6.51)
+- The FAT32 driver only knows root-directory entries, so `open`/`create` refuse any name with a `/` after its first character (`fat32_util.isRootName`); such a path falls through to ext2. Before this, `testdir/x` was created as a FAT32 root entry literally named `testdir/x` (invalid on FAT) and the ext2 file of the same path was unreachable.
+- ext2 `truncateFile` compares the new length with the largest of the slot's inode copy, the on-disk inode and the end of the data staged in the shared writeback buffer (same rule as FAT32), and re-reads the on-disk inode after flushing before deciding which blocks to free.
 - FAT32 `zeroFileTail` handles sectors-per-cluster > 8 with per-sector RMW instead of whole-cluster I/O through the single 4 KiB bounce buffer, which overwrote adjacent physical pages. (§6.51)
 - FAT32 utility parsers reject undersized/invalid BPB geometry, out-of-range MBR entries, invalid root/cluster arithmetic, and surrogate UTF-8; these contracts are exercised by host tests.
 - FAT32 utility arithmetic returns checked/sentinel results for invalid cluster and FAT-entry offsets; LFN assembly requires reserved fields and exact forward sequence order.
@@ -1149,7 +1151,7 @@ const FdTable = struct {
   样适用；ext4 inode 的 uid/gid 由低 16 位与高 16 位合并；NTFS 不提供 xattr/ADS；卷内不能再挂载别的文件系统。
 - **验证**：host 测试（ext4 20、NTFS 19、GPT 5、挂载路径 5、DAC 7、目录游标缓存 7、睡眠锁 6、mmap 策略 5、EROFS 守卫表 1；含 bigalloc 镜像 `ext4_bigalloc.img`、statfs 数值与 `dumpe2fs` / `$Bitmap` popcount 交叉核对；真实
   `tools/fsfixtures/mkfixtures.sh` 生成的镜像，`debugfs` / `ntfsls` 交叉核对；含敌对超级块/
-  引导扇区/损坏 extent 树/fixup 撕裂）；`hello114` 运行时检查 214 项（含并发读，另有 NVMe 4 项、AHCI 4 项仅在手动提供镜像时运行）（另有 NVMe、AHCI 两段默认 skip）（SMP=1/2/8，MBR 与 GPT 两种
+  引导扇区/损坏 extent 树/fixup 撕裂）；`hello114` 运行时检查 218 项（含并发读，另有 NVMe 4 项、AHCI 4 项仅在手动提供镜像时运行）（另有 NVMe、AHCI 两段默认 skip）（SMP=1/2/8，MBR 与 GPT 两种
   数据盘镜像，`MOQI_DATA_IMG=tests/fixtures/fs/datadisk_gpt.img`），变异验证——去掉 EROFS 守卫
   则 7 项失败，忽略挂载代数则过期 fd 检查失败，关掉挂载规则则 7 项失败，关掉 DAC 检查则 7
   项失败。NVMe（中断驱动）与 AHCI 上的真实挂载读取（I/J 段）需要手动提供带 ext4 的镜像

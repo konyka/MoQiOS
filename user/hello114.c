@@ -624,6 +624,45 @@ void _start(void) {
         syscall1(SYS_CLOSE, (uint64_t)c1);
         syscall1(87, (uint64_t)"/h114-s-c");
 
+        /* G: the same three cases on the ext2 half of the root disk. The VFS tries FAT32 first
+         * and FAT32 has no directories, so a path under testdir/ can only be an ext2 file. */
+        int64_t g1 = syscall2(SYS_OPEN, (uint64_t)"testdir/h114-g", O_RDWR | O_CREAT | O_TRUNC);
+        int64_t g2 = syscall2(SYS_OPEN, (uint64_t)"testdir/h114-g", O_RDWR);
+        syscall3(SYS_WRITE, (uint64_t)g1, (uint64_t)data22, 22);
+        int64_t gr = syscall2(SYS_FTRUNCATE, (uint64_t)g2, 5);
+        syscall3(SYS_LSEEK, (uint64_t)g2, 0, 0);
+        int64_t gn = syscall3(SYS_READ, (uint64_t)g2, (uint64_t)sb, 32);
+        check(g1 >= 0 && g2 >= 0, "S: ext2 testdir/ files open");
+        {
+            /* The file must be a real entry of the ext2 directory testdir. If the FAT32 driver
+             * took the path it would be a root entry literally named "testdir/h114-g" and
+             * would not be listed here. */
+            int seen_g = 0;
+            int64_t dfd = syscall2(SYS_OPEN, (uint64_t)"testdir", O_RDONLY);
+            static char dbuf[1024];
+            int64_t dn = dfd >= 0 ? syscall3(SYS_GETDENTS, (uint64_t)dfd, (uint64_t)dbuf, sizeof(dbuf)) : -1;
+            for (int64_t off = 0; off < dn;) {
+                struct dirent64 *d = (struct dirent64 *)(dbuf + off);
+                if (streq(d->name, "h114-g")) seen_g = 1;
+                off += d->reclen;
+            }
+            if (dfd >= 0) syscall1(SYS_CLOSE, (uint64_t)dfd);
+            check(seen_g, "S: testdir/h114-g is created inside the ext2 directory, not as a FAT32 root entry");
+        }
+        check(gr == 0 && gn == 5 && sb[0] == 'c' && sb[4] == 'r', "S: ext2 ftruncate(5) shortens a file whose data another descriptor has not flushed");
+        /* The read above is clamped to EOF, so it cannot tell whether the staged bytes were
+         * dropped. Closing does not flush an ext2 file, but fsync does: after it, anything
+         * still staged has reached the disk, and the file must still be 5 bytes, not 22. */
+        syscall1(SYS_CLOSE, (uint64_t)g1);
+        syscall1(SYS_CLOSE, (uint64_t)g2);
+        int64_t g3 = syscall2(SYS_OPEN, (uint64_t)"testdir/h114-g", O_RDWR);
+        syscall1(SYS_FSYNC, (uint64_t)g3);
+        syscall3(SYS_LSEEK, (uint64_t)g3, 0, 0);
+        int64_t g3n = syscall3(SYS_READ, (uint64_t)g3, (uint64_t)sb, 32);
+        check(g3 >= 0 && g3n == 5, "S: ext2 file stays 5 bytes after fsync flushes the other descriptor's staged data (not regrown)");
+        syscall1(SYS_CLOSE, (uint64_t)g3);
+        syscall1(87, (uint64_t)"testdir/h114-g");
+
         /* F: a descriptor opened BEFORE another one wrote and synced the data has a stale
          * copy of the inode (size 0, no block pointers). The writer is CLOSED before the
          * truncate so nothing can rewrite the inode behind it. Truncating through the stale

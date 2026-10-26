@@ -385,7 +385,7 @@ fn nameMatches(fi: *const FileInfo, name: []const u8) bool {
 /// Open a file by name from the FAT32 filesystem.
 /// Returns index into files array, or -1 on error.
 pub fn openFile(name: []const u8) i64 {
-    if (!fat32_active) return -1;
+    if (!fat32_active or !fat_util.isRootName(name)) return -1;
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
 
@@ -413,7 +413,7 @@ pub fn openFile(name: []const u8) i64 {
 
 /// Resolve and retain a FAT32 file as one atomic namespace operation.
 pub fn openFileRetained(name: []const u8) i64 {
-    if (!fat32_active) return -1;
+    if (!fat32_active or !fat_util.isRootName(name)) return -1;
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     for (0..file_count) |i| {
@@ -872,7 +872,7 @@ fn writeRootEntryRun(place: DirPlace, slots: []const [32]u8) bool {
 }
 
 pub fn createFile(name: []const u8) i64 {
-    if (!fat32_active) return -1;
+    if (!fat32_active or !fat_util.isRootName(name)) return -1;
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     // K1 dcache: createFile may reuse a tombstoned files[] slot under a

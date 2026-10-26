@@ -6096,3 +6096,12 @@ test "a task switched away from is published only after the CPU has left its ker
     // stack. It is only safe to keep as dead code; turning it on brings the window back.
     try std.testing.expect(std.mem.indexOf(u8, sched, "pub const sched_fine_grain_enable: bool = true;") != null);
 }
+
+test "FAT32 only claims root names: a path inside a directory is left to ext2" {
+    try std.testing.expect(fat32_util.isRootName("writetest.txt"));
+    try std.testing.expect(fat32_util.isRootName("/h48_shared.dat"));
+    try std.testing.expect(!fat32_util.isRootName(""));
+    try std.testing.expect(!fat32_util.isRootName("testdir/subfile.txt"));
+    try std.testing.expect(!fat32_util.isRootName("/testdir/x"));
+    try std.testing.expect(!fat32_util.isRootName("a/"));
+}
