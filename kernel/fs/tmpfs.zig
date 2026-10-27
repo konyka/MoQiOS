@@ -127,6 +127,11 @@ fn pageAtAlloc(entry: *TmpfsEntry, page_idx: u32) u64 {
     return phys;
 }
 
+fn dirMeta(idx: u8) dac.Metadata {
+    const e = &entries[idx];
+    return .{ .mode = e.mode, .uid = e.uid, .gid = e.gid };
+}
+
 fn findEntry(name: []const u8, parent: u8) ?u8 {
     var bm = active_bm;
     while (bm != 0) {
@@ -229,7 +234,8 @@ pub fn init() void {
         .size = 0,
         .pages = [_]?u64{null} ** PAGES_PER_FILE,
         .page_count = 0,
-        .mode = 0o755,
+        // /tmp: world-writable with the sticky bit, as on every Unix.
+        .mode = 0o1777,
         .uid = 0,
         .gid = 0,
         .ctime = 0,
@@ -305,6 +311,7 @@ pub fn tmpfsOpenAuthorized(path: []const u8, create: bool, is_dir: bool, euid: u
     }
 
     if (create) {
+        if (!dac.allows(dirMeta(parent), .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override }, dac.Access.write_search)) return -13;
         const idx = createEntryLocked(name, name_len, parent, is_dir, requested_mode, umask_val, euid, egid) orelse return -1;
         return @intCast(idx);
     }
@@ -465,8 +472,21 @@ pub fn tmpfsRetain(idx: u8) void {
     if (entries[idx].active) entries[idx].open_count +|= 1;
 }
 
-/// Unlink (delete) a file or empty directory.
+/// Unlink (delete) a file or empty directory (kernel-internal, unauthorized).
 pub fn tmpfsUnlink(path: []const u8) i64 {
+    return tmpfsUnlinkAuthorized(path, null);
+}
+
+pub const Remover = struct {
+    euid: u32,
+    egid: u32,
+    effective_caps: capability.SysCap,
+};
+
+/// Unlink with the caller's credentials: write+search on the parent, and in
+/// a sticky directory only the entry's owner, the directory's owner, uid 0 or
+/// CAP_FOWNER (dac.mayRemoveEntry). -13 (EACCES) when refused.
+pub fn tmpfsUnlinkAuthorized(path: []const u8, who: ?Remover) i64 {
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
 
@@ -479,6 +499,11 @@ pub fn tmpfsUnlink(path: []const u8) i64 {
     const name = name_buf[0..name_len];
     const idx = findEntry(name, parent) orelse return -1;
     const entry = &entries[idx];
+
+    if (who) |w| {
+        const creds: dac.Credentials = .{ .euid = w.euid, .egid = w.egid, .cap_dac_override = w.effective_caps.cap_dac_override };
+        if (!dac.mayRemoveEntry(dirMeta(parent), entry.uid, creds, w.effective_caps.cap_fowner)) return -13;
+    }
 
     if (entry.is_dir) {
         // directory must be empty — bitmap scan
@@ -504,6 +529,38 @@ pub fn tmpfsUnlink(path: []const u8) i64 {
         entry.deleted = false;
     }
     return 0;
+}
+
+/// chmod on a tmpfs path: owner, uid 0 or CAP_FOWNER (dac.mayChmod).
+/// -2 when the path does not exist, -1 (EPERM) when refused.
+pub fn tmpfsChmod(path: []const u8, new_mode: u32, who: Remover) i64 {
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    const idx = lookupLocked(path) orelse return -2;
+    const e = &entries[idx];
+    if (!dac.mayChmod(e.uid, who.euid, who.effective_caps.cap_fowner)) return -1;
+    e.mode = new_mode & 0o7777;
+    return 0;
+}
+
+/// chown on a tmpfs path (dac.mayChown); null ids mean "unchanged".
+pub fn tmpfsChown(path: []const u8, uid: ?u32, gid: ?u32, who: Remover) i64 {
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    const idx = lookupLocked(path) orelse return -2;
+    const e = &entries[idx];
+    if (!dac.mayChown(e.uid, e.gid, who.euid, who.egid, who.effective_caps.cap_chown, uid, gid)) return -1;
+    if (uid) |u| e.uid = u;
+    if (gid) |g| e.gid = g;
+    return 0;
+}
+
+fn lookupLocked(path: []const u8) ?u8 {
+    var name_buf: [MAX_NAME_LEN]u8 = undefined;
+    var name_len: u8 = 0;
+    const parent = resolvePath(path, &name_buf, &name_len) orelse return null;
+    if (name_len == 1 and name_buf[0] == '/') return 0;
+    return findEntry(name_buf[0..name_len], parent);
 }
 
 /// Create a directory.

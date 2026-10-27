@@ -425,9 +425,16 @@ objects created by `O_CREAT` or `mkdir` receive the caller's effective
 UID/GID, and their permissions are `(requested_mode & 0777) & ~(umask & 0777)`
 before the object becomes visible. Existing objects keep their metadata;
 `O_CREAT|O_EXCL` returns `-17` (`EEXIST`) without modifying them. This phase
-does not enforce unlink, rmdir or rename; it does not revalidate
-already-open descriptors and does not alter ext2, ramdisk, devfs, or FAT32
-behavior. Group management, ACLs, and setuid behavior are outside this boundary.
+does not revalidate already-open descriptors and does not alter ramdisk, devfs,
+or FAT32 behavior. Group management, ACLs, and setuid behavior are outside this
+boundary.
+
+The tmpfs root (`/tmp`) is mode `1777`. Creating an entry needs write+search on
+its parent directory; unlink/rmdir need the same and, in a sticky directory,
+additionally that the caller owns the entry or the directory, is uid 0, or holds
+`CAP_FOWNER` (`dac.mayRemoveEntry`). chmod and chown on `/tmp` paths use the
+same owner rules as ext2. A denial is `-13` (`EACCES`) for namespace changes and
+`-1` (`EPERM`) for chmod/chown.
 
 chmod/fchmod/fchmodat/fchmodat2 and chown/fchown/lchown on the ext2 root disk
 are authorized against the inode's current owner (`fs/dac.zig` `mayChmod` /

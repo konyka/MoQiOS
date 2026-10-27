@@ -6145,3 +6145,23 @@ test "DAC directory search and write-search permissions" {
     try std.testing.expect(dac.allows(no_search, .{ .euid = 0, .egid = 0 }, dac.Access.write_search));
     try std.testing.expect(dac.allows(no_search, .{ .euid = 1000, .egid = 1000, .cap_dac_override = true }, dac.Access.write_search));
 }
+
+test "sticky directory: only the entry owner, the directory owner or CAP_FOWNER may remove" {
+    const tmp: dac.Metadata = .{ .mode = 0o1777, .uid = 0, .gid = 0 };
+    const plain: dac.Metadata = .{ .mode = 0o0777, .uid = 0, .gid = 0 };
+    const closed: dac.Metadata = .{ .mode = 0o0755, .uid = 0, .gid = 0 };
+    const alice: dac.Credentials = .{ .euid = 1000, .egid = 1000 };
+    // another user's file in /tmp
+    try std.testing.expect(!dac.mayRemoveEntry(tmp, 2000, alice, false));
+    // my own file in /tmp
+    try std.testing.expect(dac.mayRemoveEntry(tmp, 1000, alice, false));
+    // CAP_FOWNER and root bypass the sticky rule
+    try std.testing.expect(dac.mayRemoveEntry(tmp, 2000, alice, true));
+    try std.testing.expect(dac.mayRemoveEntry(tmp, 2000, .{ .euid = 0, .egid = 0 }, false));
+    // the directory's owner may remove anything in it
+    try std.testing.expect(dac.mayRemoveEntry(.{ .mode = 0o1777, .uid = 1000, .gid = 0 }, 2000, alice, false));
+    // without the sticky bit, write on the directory is enough
+    try std.testing.expect(dac.mayRemoveEntry(plain, 2000, alice, false));
+    // no write on the directory: never
+    try std.testing.expect(!dac.mayRemoveEntry(closed, 1000, alice, false));
+}

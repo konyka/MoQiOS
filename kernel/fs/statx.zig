@@ -80,7 +80,7 @@ pub fn statx(dirfd: i64, pathname_ptr: u64, statxbuf_ptr: u64) i64 {
             uid = metadata.uid;
             gid = metadata.gid;
             const file_type = if (metadata.is_dir) @as(u16, 0o040000) else @as(u16, 0o100000);
-            mode = file_type | @as(u16, @intCast(metadata.mode & 0o777));
+            mode = file_type | @as(u16, @intCast(metadata.mode & 0o7777)); // incl. setuid/setgid/sticky
         }
         if (rofs_stat) |r| {
             uid = r.uid;

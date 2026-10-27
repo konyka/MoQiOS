@@ -53,7 +53,7 @@ static long log_size = 0;
 /* (Re)open the log file in append mode and adopt its current size.
  * Returns 0 on success, -1 on failure (log_fd left closed). */
 static int log_open_append(void) {
-    log_fd = open(LOG_PATH, LOG_OPEN_FLAGS, 0);
+    log_fd = open(LOG_PATH, LOG_OPEN_FLAGS, 0644);
     if (log_fd < 0) return -1;
     /* lseek SEEK_END reports the size cached by the vfs at open(); with
      * O_APPEND the kernel resets the offset to end-of-file before every
@@ -66,7 +66,7 @@ static int log_open_append(void) {
 /* Simple rotation: discard the current log and start over empty. */
 static int log_rotate(void) {
     close(log_fd);
-    log_fd = open(LOG_PATH, LOG_OPEN_FLAGS_TRUNC, 0);
+    log_fd = open(LOG_PATH, LOG_OPEN_FLAGS_TRUNC, 0644);
     if (log_fd < 0) return -1;
     log_size = 0;
     return 0;

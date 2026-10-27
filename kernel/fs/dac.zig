@@ -97,3 +97,15 @@ pub fn mayChown(file_uid: u32, file_gid: u32, euid: u32, egid: u32, cap_chown: b
     }
     return true;
 }
+
+pub const S_ISVTX: u32 = 0o1000;
+
+/// Removing or renaming away entry `victim` from directory `dir`. Needs
+/// write+search on the directory; in a sticky directory (S_ISVTX, e.g. /tmp)
+/// additionally only the entry's owner, the directory's owner, uid 0 or
+/// CAP_FOWNER may do it.
+pub fn mayRemoveEntry(dir: Metadata, victim_uid: u32, credentials: Credentials, cap_fowner: bool) bool {
+    if (!allows(dir, credentials, Access.write_search)) return false;
+    if (dir.mode & S_ISVTX == 0) return true;
+    return credentials.euid == 0 or cap_fowner or credentials.euid == victim_uid or credentials.euid == dir.uid;
+}

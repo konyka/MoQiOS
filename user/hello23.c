@@ -93,6 +93,16 @@ void _start(void) {
     syscall2(SYS_CHMOD, (uint64_t)"closeddir", 0700);
     syscall3(SYS_CHOWN, (uint64_t)"closeddir/open.txt", 0, 0);
     syscall3(SYS_CHOWN, (uint64_t)"closeddir", 0, 0);
+    /* tmpfs fixtures: a root-owned file in /tmp and a root-owned 0755
+     * directory holding a root-owned file. */
+    int64_t tf = syscall3(SYS_OPEN, (uint64_t)"/tmp/h114-rootfile", 0x241, 0644);
+    if (tf >= 0) syscall1(SYS_CLOSE, (uint64_t)tf);
+    syscall3(SYS_CHOWN, (uint64_t)"/tmp/h114-rootfile", 0, 0);
+    syscall2(SYS_MKDIR, (uint64_t)"/tmp/h114-rootdir", 0755);
+    int64_t tdf = syscall3(SYS_OPEN, (uint64_t)"/tmp/h114-rootdir/f", 0x241, 0644);
+    if (tdf >= 0) syscall1(SYS_CLOSE, (uint64_t)tdf);
+    syscall3(SYS_CHOWN, (uint64_t)"/tmp/h114-rootdir/f", 0, 0);
+    syscall3(SYS_CHOWN, (uint64_t)"/tmp/h114-rootdir", 0, 0);
     print("hello23: namespace fixture ready\n");
 
     print("hello23: mkdir OK\n");

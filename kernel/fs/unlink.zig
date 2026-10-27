@@ -21,6 +21,11 @@ fn copyPath(path_ptr: u64, buf: *[256]u8) ?[]const u8 {
     return buf[0..name_len];
 }
 
+fn tmpfsCaller() ?@import("../fs/tmpfs.zig").Remover {
+    const cur = sched.currentTask() orelse return null;
+    return .{ .euid = cur.euid, .egid = cur.egid, .effective_caps = cur.effective_caps };
+}
+
 fn caller() ?@import("../fs/ext2.zig").Who {
     const cur = sched.currentTask() orelse return null;
     return .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override };
@@ -34,7 +39,7 @@ pub fn unlink(path_ptr: u64) i64 {
     // tmpfs: /tmp paths route there, mirroring the open path in vfs.zig.
     if (name.len >= 4 and name[0] == '/' and name[1] == 't' and name[2] == 'm' and name[3] == 'p') {
         const tmpfs = @import("../fs/tmpfs.zig");
-        return tmpfs.tmpfsUnlink(name);
+        return tmpfs.tmpfsUnlinkAuthorized(name, tmpfsCaller());
     }
 
     // Try ext2 first
@@ -73,7 +78,7 @@ pub fn rmdir(path_ptr: u64) i64 {
 
     if (name.len >= 4 and name[0] == '/' and name[1] == 't' and name[2] == 'm' and name[3] == 'p') {
         const tmpfs = @import("../fs/tmpfs.zig");
-        return tmpfs.tmpfsUnlink(name);
+        return tmpfs.tmpfsUnlinkAuthorized(name, tmpfsCaller());
     }
 
     if (ext2.isActive()) {

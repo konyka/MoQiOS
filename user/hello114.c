@@ -726,6 +726,46 @@ void _start(void) {
         syscall1(SYS_RMDIR, (uint64_t)"testdir/h114-d");
     }
 
+    /* V: tmpfs (/tmp). The tmpfs root is a world-writable sticky directory (1777), as /tmp
+     * is everywhere: anyone may create there, but only an entry's owner (or the directory's
+     * owner, or CAP_FOWNER) may remove or rename it. A root-owned 0755 directory inside it
+     * (prepared by hello23 with CAP_DAC_OVERRIDE) refuses creation and removal by others. */
+    {
+        int64_t mine = syscall3(SYS_OPEN, (uint64_t)"/tmp/h114-v-mine", O_RDWR | O_CREAT | O_TRUNC, 0644);
+        check(mine >= 0, "V: uid 1000 can create a file in /tmp");
+        if (mine >= 0) syscall1(SYS_CLOSE, (uint64_t)mine);
+        check(syscall1(SYS_UNLINK, (uint64_t)"/tmp/h114-v-mine") == 0, "V: and remove its own file again");
+        /* metadata on tmpfs follows the same owner rules as ext2 */
+        int64_t om = syscall3(SYS_OPEN, (uint64_t)"/tmp/h114-v-own", O_RDWR | O_CREAT | O_TRUNC, 0666);
+        check(om >= 0 && syscall2(SYS_CHMOD, (uint64_t)"/tmp/h114-v-own", 0600) == 0, "V: chmod of my own tmpfs file succeeds");
+        check(om >= 0 && syscall3(SYS_CHOWN, (uint64_t)"/tmp/h114-v-own", 0, (uint64_t)-1) == -EPERM, "V: giving my tmpfs file to root is EPERM");
+        check(om >= 0 && syscall3(SYS_CHOWN, (uint64_t)"/tmp/h114-v-own", 1000, 1000) == 0, "V: chown of my tmpfs file to my own ids succeeds");
+        if (om >= 0) syscall1(SYS_CLOSE, (uint64_t)om);
+        check(syscall2(SYS_CHMOD, (uint64_t)"/tmp/h114-rootfile", 0777) == -EPERM, "V: chmod of root's tmpfs file by uid 1000 is EPERM");
+        check(syscall3(SYS_CHOWN, (uint64_t)"/tmp/h114-rootfile", 1000, 1000) == -EPERM, "V: chown of root's tmpfs file is EPERM");
+        syscall1(SYS_UNLINK, (uint64_t)"/tmp/h114-v-own");
+        {
+            /* statx reports tmpfs owners (fstat does not), so use it to check the fixtures */
+            static uint64_t vx[24];
+            int vr = syscall5(SYS_STATX, (uint64_t)-100, (uint64_t)"/tmp/h114-rootfile", 0, 0x7ff, (uint64_t)vx) == 0;
+            /* uid (u32) at byte 20, i.e. w[2] high half */
+            check(vr && (uint32_t)(vx[2] >> 32) == 0, "V: the /tmp fixture file is root-owned");
+            vr = syscall5(SYS_STATX, (uint64_t)-100, (uint64_t)"/tmp", 0, 0x7ff, (uint64_t)vx) == 0;
+            /* this kernel's statx layout: mode (u16) at byte 28, i.e. w[3] high half */
+            check(vr && ((uint32_t)(vx[3] >> 32) & 07777) == 01777, "V: /tmp is mode 1777 (world-writable, sticky)");
+        }
+        check(syscall1(SYS_UNLINK, (uint64_t)"/tmp/h114-rootfile") == -EACCES, "V: unlink of root's file in the sticky /tmp is EACCES");
+        int64_t still = syscall2(SYS_OPEN, (uint64_t)"/tmp/h114-rootfile", O_RDONLY);
+        check(still >= 0, "V: root's file in /tmp is still there");
+        if (still >= 0) syscall1(SYS_CLOSE, (uint64_t)still);
+        check(syscall3(SYS_OPEN, (uint64_t)"/tmp/h114-rootdir/x", O_RDWR | O_CREAT, 0644) == -EACCES, "V: create inside root's 0755 tmpfs directory is EACCES");
+        check(syscall2(SYS_MKDIR, (uint64_t)"/tmp/h114-rootdir/d", 0755) == -EACCES, "V: mkdir inside root's 0755 tmpfs directory is EACCES");
+        check(syscall1(SYS_UNLINK, (uint64_t)"/tmp/h114-rootdir/f") == -EACCES, "V: unlink inside root's 0755 tmpfs directory is EACCES");
+        int64_t inner = syscall2(SYS_OPEN, (uint64_t)"/tmp/h114-rootdir/f", O_RDONLY);
+        check(inner >= 0, "V: the file inside root's tmpfs directory is still there");
+        if (inner >= 0) syscall1(SYS_CLOSE, (uint64_t)inner);
+    }
+
     /* S: truncation on the writable ext2 root disk when a second descriptor of the
      * same file exists. Each open ext2 slot keeps its own copy of the inode and
      * writes are staged in a shared buffer, so truncating through one descriptor

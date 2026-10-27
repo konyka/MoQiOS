@@ -1871,6 +1871,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             path_buf[if (pc < 255) pc else 255] = 0;
             var plen: usize = 0;
             while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
+            if (tmpfsPath(path_buf[0..plen])) {
+                frame.rax = @bitCast(@import("../../fs/tmpfs.zig").tmpfsChmod(path_buf[0..plen], @truncate(frame.rsi), tmpfsWho()));
+                return;
+            }
             frame.rax = @bitCast(ext2_mod.setMode(path_buf[0..plen], @truncate(frame.rsi), ext2Who()));
         },
         91 => { // fchmod(fd, mode)
@@ -2053,6 +2057,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             path_buf[if (pc < 255) pc else 255] = 0;
             var plen: usize = 0;
             while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
+            if (tmpfsPath(path_buf[0..plen])) {
+                frame.rax = @bitCast(@import("../../fs/tmpfs.zig").tmpfsChown(path_buf[0..plen], idArg(frame.rsi), idArg(frame.rdx), tmpfsWho()));
+                return;
+            }
             frame.rax = @bitCast(ext2_mod.setOwner(path_buf[0..plen], @truncate(frame.rsi), @truncate(frame.rdx), ext2Who()));
         },
         93 => { // fchown(fd, owner, group)
@@ -2742,6 +2750,22 @@ fn syscallMmap(frame: *SyscallFrame) void {
 /// Returns fd on success, -1 on failure.
 fn syscallOpen(frame: *SyscallFrame) void {
     frame.rax = @bitCast(file_io_mod.openWithMode(frame.rdi, @truncate(frame.rsi), @truncate(frame.rdx)));
+}
+
+/// "/tmp" or "/tmp/..." — the paths tmpfs owns (same prefix rule as vfs).
+fn tmpfsPath(p: []const u8) bool {
+    return p.len >= 4 and p[0] == '/' and p[1] == 't' and p[2] == 'm' and p[3] == 'p' and (p.len == 4 or p[4] == '/');
+}
+
+/// A chown id argument: -1 (as u32) means "leave unchanged".
+fn idArg(raw: u64) ?u32 {
+    const v: u32 = @truncate(raw);
+    return if (v == 0xFFFF_FFFF) null else v;
+}
+
+fn tmpfsWho() @import("../../fs/tmpfs.zig").Remover {
+    const cur = @import("../../proc/sched.zig").currentTask() orelse return .{ .euid = 1000, .egid = 1000, .effective_caps = .{} };
+    return .{ .euid = cur.euid, .egid = cur.egid, .effective_caps = cur.effective_caps };
 }
 
 /// Owner of a new ext2 object created by the current task.
