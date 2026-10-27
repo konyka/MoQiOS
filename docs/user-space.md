@@ -418,7 +418,8 @@ access against them and `mq_unlink` is limited to the owner (or root /
 `kcmp` only compares processes the caller owns unless it holds
 `CAP_SYS_PTRACE`. The realtime acceptance tests `hello44`/`hello104`/`hello108`
 get only `CAP_SYS_NICE`.
-`sethostname`, `setdomainname`, `swapon` and `swapoff` require `CAP_SYS_ADMIN`;
+`sethostname`, `setdomainname`, `swapon`, `swapoff` and the swap test hook
+`pmm_set_reclaim_floor` require `CAP_SYS_ADMIN`;
 `mount` and `umount2` require `CAP_SYS_MOUNT`; without them they return `-1`
 (`EPERM`) and change nothing.
 
