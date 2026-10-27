@@ -664,9 +664,15 @@ fn setFATEntry(cluster: u32, value: u32) bool {
     // v53.52: propagate the write result — a failed FAT update must not be
     // reported as success (the cache now diverges from disk either way, but
     // the caller decides whether to continue or roll back).
-    if (safeWriteSectors(sector, 1, fbuf) <= 0) {
-        fat_cache_sector = 0xFFFFFFFF;
-        return false;
+    // Every FAT copy gets the sector: writing only FAT #0 left the mirror FAT
+    // stale, so fsck/other systems saw two disagreeing allocation tables.
+    var copies: [4]u32 = undefined;
+    const ncopies = fat_util.fatCopySectors(fat32_fat_start, fat32_fat_size_sectors, fat32_num_fats, sector, &copies);
+    for (copies[0..ncopies]) |lba| {
+        if (safeWriteSectors(lba, 1, fbuf) <= 0) {
+            fat_cache_sector = 0xFFFFFFFF;
+            return false;
+        }
     }
     // Cache stays valid — no invalidation needed
     return true;
@@ -985,10 +991,7 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
     // Allocate additional clusters if needed
     var needed_clusters: u32 = (offset + count + cluster_size - 1) / cluster_size;
     if (needed_clusters == 0) needed_clusters = 1;
-    var current_clusters: u32 = 0;
-    if (fi.size > 0) {
-        current_clusters = (fi.size + cluster_size - 1) / cluster_size;
-    }
+    var current_clusters: u32 = fat_util.ownedClusters(fi.size, cluster_size, fi.first_cluster >= 2 and fi.first_cluster < 0x0FFFFFF8);
 
     while (current_clusters < needed_clusters) : (current_clusters += 1) {
         var c: u32 = fi.first_cluster;

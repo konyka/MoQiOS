@@ -1183,7 +1183,10 @@ const FdTable = struct {
 - Boot Sector (BPB)；FSInfo metadata is not currently implemented.
 - FAT 表读写：单扇区 FAT 缓存（`fat_cache_sector`，v53.36，顺序读 I/O 减少约 128 倍）
 - 空闲簇扫描游标（`last_free_cluster`，v53.38，O(N) 分配扫描）
-- 8.3 短文件名 + LFN（长文件名）支持
+- 8.3 短文件名 + LFN（长文件名）支持；挂载扫描遇到带“最后一片”标记的 LFN 片段即重新开始一条链
+  （`fat32_util.LfnAccumulator`），已删除文件遗留的孤立片段不会吞掉下一个文件的长名
+- 根目录只有一层：带 `/`（首字符之后）的名字不是 FAT32 名字（`isRootName`），交给 ext2
+- 新建文件预分配一个首簇，首次写入复用它（`ownedClusters`）；FAT 更新写入每一份 FAT（`fatCopySectors`，按 BPB_NumFATs）
 - 操作: 读/写/创建/删除/目录列表
 - 全局 `fs_lock`（IrqSpinlock）串行化文件系统操作；文件数据写回经 `fs/writeback.zig`
   按稳定 inode 标识（而非打开文件句柄）缓冲，多毫秒级延迟刷盘由专用 writeback 内核线程

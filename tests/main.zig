@@ -6247,3 +6247,24 @@ test "fat32 root scan: an orphaned LFN chain does not swallow the next file's lo
     // take() consumes the chain
     try std.testing.expectEqual(@as(?u32, null), acc.take(&short_name, out[0..]));
 }
+
+test "fat32: clusters a file already owns count its preallocated first cluster" {
+    // createFile gives an empty file one cluster; the first write must reuse it.
+    try std.testing.expectEqual(@as(u32, 1), fat32_util.ownedClusters(0, 512, true));
+    try std.testing.expectEqual(@as(u32, 0), fat32_util.ownedClusters(0, 512, false));
+    try std.testing.expectEqual(@as(u32, 1), fat32_util.ownedClusters(30, 512, true));
+    try std.testing.expectEqual(@as(u32, 1), fat32_util.ownedClusters(512, 512, true));
+    try std.testing.expectEqual(@as(u32, 2), fat32_util.ownedClusters(513, 512, true));
+    try std.testing.expectEqual(@as(u32, 8), fat32_util.ownedClusters(4096, 512, true));
+}
+
+test "fat32: FAT updates are mirrored to every FAT copy" {
+    var lbas: [4]u32 = undefined;
+    // fat_start 32, 504 sectors per FAT, 2 FATs, entry in sector 3 of the FAT
+    try std.testing.expectEqual(@as(u32, 2), fat32_util.fatCopySectors(32, 504, 2, 32 + 3, &lbas));
+    try std.testing.expectEqual(@as(u32, 35), lbas[0]);
+    try std.testing.expectEqual(@as(u32, 32 + 504 + 3), lbas[1]);
+    // a single-FAT volume writes once; a bogus count is clamped to the buffer
+    try std.testing.expectEqual(@as(u32, 1), fat32_util.fatCopySectors(32, 504, 1, 35, &lbas));
+    try std.testing.expectEqual(@as(u32, 4), fat32_util.fatCopySectors(32, 504, 9, 35, &lbas));
+}

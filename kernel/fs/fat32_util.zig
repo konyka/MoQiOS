@@ -145,6 +145,28 @@ pub fn fatEntryValue(sector_buf: []const u8, offset: u32) ?u32 {
 
 // ─── Cluster classification (28-bit masked) ────────────────────────────────
 
+/// Clusters a file's chain holds for `size` bytes. A file created empty
+/// already owns one cluster (createFile preallocates it), so an empty file
+/// with a first cluster counts as one — the first write must reuse it rather
+/// than append a second cluster and leave the first one forever unused.
+pub fn ownedClusters(size: u32, cluster_size: u32, has_first_cluster: bool) u32 {
+    if (cluster_size == 0) return 0;
+    const by_size = (size + cluster_size - 1) / cluster_size;
+    if (by_size == 0 and has_first_cluster) return 1;
+    return by_size;
+}
+
+/// Sector LBAs of `sector` (an LBA inside FAT #0) in every FAT copy, so a FAT
+/// update reaches the mirror FATs too (BPB_NumFATs; mirroring is on unless
+/// BPB_ExtFlags says otherwise, which this driver does not use). Returns the
+/// number of LBAs written into `out`.
+pub fn fatCopySectors(fat_start: u32, fat_size_sectors: u32, num_fats: u8, sector: u32, out: []u32) u32 {
+    const rel = sector - fat_start;
+    const n: u32 = @min(@as(u32, @max(num_fats, 1)), @as(u32, @intCast(out.len)));
+    for (0..n) |i| out[i] = fat_start + @as(u32, @intCast(i)) * fat_size_sectors + rel;
+    return n;
+}
+
 pub fn isEndOfChain(entry: u32) bool {
     return (entry & 0x0FFFFFFF) >= 0x0FFFFFF8;
 }
