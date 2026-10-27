@@ -1549,11 +1549,13 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         294 => { // vmsplice(fd, iov, nr_segs, flags) — splice user pages into pipe
             frame.rax = @bitCast(syscallVmsplice(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx), @truncate(frame.r10)));
         },
-        295 => { // name_to_handle_at(dirfd, path, handle, mount_id, flags) — simplified
-            frame.rax = @bitCast(syscallNameToHandleAt(@truncate(frame.rdi), frame.rsi, frame.rdx, frame.r10));
+        295 => { // name_to_handle_at(dirfd, path, handle, mount_id, flags)
+            // File handles are not supported (open_by_handle_at cannot resolve
+            // one), so do not fabricate a handle for any path, real or not.
+            frame.rax = @bitCast(unsupported_policy.fileHandles());
         },
-        296 => { // open_by_handle_at(mount_fd, handle, flags) — simplified
-            frame.rax = @bitCast(syscallOpenByHandleAt(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));
+        296 => { // open_by_handle_at(mount_fd, handle, flags)
+            frame.rax = @bitCast(unsupported_policy.fileHandles());
         },
         // ── v37.0: MoQiOS native IPC + 性能优化 ──────────────────────────────
         297 => { // moqipc_create_ep() — create IPC endpoint for current task
@@ -5060,52 +5062,6 @@ fn syscallVmsplice(fd: u32, iov_ptr: u64, nr_segs: u32, flags: u32) i64 {
         }
     }
     return total;
-}
-
-/// name_to_handle_at(dirfd, pathname, handle_ptr, mount_id_ptr, flags)
-/// Simplified: fill handle with inode number and return mount_id=0.
-fn syscallNameToHandleAt(dirfd: u32, path_ptr: u64, handle_ptr: u64, mount_id_ptr: u64) i64 {
-    _ = dirfd;
-    if (path_ptr == 0 or path_ptr >= 0x0000_8000_0000_0000) return -14;
-    if (handle_ptr == 0 or handle_ptr >= 0x0000_8000_0000_0000) return -14;
-
-    const copy = @import("../../mm/copy_from_user.zig");
-    const bo = @import("../../lib/byte_order.zig");
-
-    // Read pathname
-    var path_buf: [256]u8 = .{0} ** 256;
-    const copied = copy.copyFromUser(path_buf[0..], @ptrFromInt(path_ptr), 255);
-    if (copied == 0) return -14;
-
-    // Resolve to inode (simplified: just use path hash as handle)
-    var hash: u64 = 0;
-    for (path_buf[0..copied]) |c| {
-        hash = hash *% 31 +% @as(u64, c);
-    }
-
-    // Write struct file_handle: { u32 handle_bytes; u32 handle_type; u8 f_handle[] }
-    // Minimal: handle_bytes=8, handle_type=1, f_handle=hash
-    var hbuf: [16]u8 = undefined;
-    bo.writeU32Le(hbuf[0..4], 8); // handle_bytes
-    bo.writeU32Le(hbuf[4..8], 1); // handle_type (EXT4=1)
-    bo.writeU64Le(hbuf[8..16], hash);
-    if (copy.copyToUser(@ptrFromInt(handle_ptr), hbuf[0..], 16) != 16) return -14;
-
-    // Write mount_id = 0
-    if (mount_id_ptr != 0 and mount_id_ptr < 0x0000_8000_0000_0000) {
-        var mid: [4]u8 = .{ 0, 0, 0, 0 };
-        if (copy.copyToUser(@ptrFromInt(mount_id_ptr), mid[0..], 4) != 4) return -14;
-    }
-    return 0;
-}
-
-/// open_by_handle_at(mount_fd, handle_ptr, flags) — open file by handle.
-/// Simplified: not supported, returns EOPNOTSUPP.
-fn syscallOpenByHandleAt(mount_fd: u32, handle_ptr: u64, flags: u32) i64 {
-    _ = mount_fd;
-    _ = handle_ptr;
-    _ = flags;
-    return -95; // EOPNOTSUPP
 }
 
 // ── v36.0: helpers ───────────────────────────────────────────────────────────

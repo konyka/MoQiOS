@@ -82,6 +82,9 @@ static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_SCHED_SETSCHEDULER 473
 #define SYS_SCHED_GETSCHEDULER 474
 #define SYS_KCMP 305
+#define SYS_NAME_TO_HANDLE_AT 295
+#define SYS_OPEN_BY_HANDLE_AT 296
+#define ENOENT 2
 #define ENOSYS 38
 
 static void print(const char *s) {
@@ -175,6 +178,22 @@ void _start(void) {
     failures += check(unchanged(rule_attr, 0xD4, sizeof(rule_attr)), "landlock rule buffer preserved");
     failures += check(syscall2(SYS_LANDLOCK_RESTRICT_SELF, (uint64_t)-1, 0) == -ENOSYS,
                       "landlock_restrict_self #446 returns ENOSYS");
+    /* name_to_handle_at must not hand out a "handle" for a path that does not
+     * exist (it used to hash the path string). File handles are not supported:
+     * open_by_handle_at is ENOSYS-class, so name_to_handle_at must say so too
+     * and leave the caller's buffers untouched. */
+    {
+        uint8_t handle[32];
+        int32_t mount_id = 0x5A5A5A5A;
+        for (int i = 0; i < 32; i++) handle[i] = 0xE5;
+        int64_t nh = syscall5(SYS_NAME_TO_HANDLE_AT, (uint64_t)-100, (uint64_t)"/no/such/file", (uint64_t)handle, (uint64_t)&mount_id, 0);
+        failures += check(nh == -ENOSYS, "name_to_handle_at returns ENOSYS (file handles are not supported)");
+        failures += check(unchanged(handle, 0xE5, sizeof(handle)) && mount_id == 0x5A5A5A5A,
+                          "name_to_handle_at leaves the handle and mount id untouched");
+        failures += check(syscall3(SYS_OPEN_BY_HANDLE_AT, (uint64_t)-1, (uint64_t)handle, 0) == -ENOSYS,
+                          "open_by_handle_at returns ENOSYS");
+    }
+
     /* mseal promises that a mapping can no longer be changed; reporting success
      * without sealing anything would silently defeat that hardening. */
     failures += check(syscall3(SYS_MSEAL, (uint64_t)acct_buf & ~0xFFFull, 4096, 0) == -ENOSYS,

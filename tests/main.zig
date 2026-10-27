@@ -509,7 +509,7 @@ test "mapped inode flush reports page-cache failure to recovery callers" {
 test "vmsplice validates flags and loops over large iovecs" {
     const source = kt.syscall_entry_source;
     const start = std.mem.indexOf(u8, source, "fn syscallVmsplice").?;
-    const end = std.mem.indexOfPos(u8, source, start, "fn syscallNameToHandleAt").?;
+    const end = std.mem.indexOfPos(u8, source, start, "// ── v36.0: helpers").?;
     const body = source[start..end];
     try std.testing.expect(std.mem.indexOf(u8, body, "validateSpliceFlags(flags)") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "while (done < len)") != null);
@@ -1772,6 +1772,9 @@ test "unsupported syscall dispatches route to the pure ENOSYS policy" {
     try expectSourceRoute(source, "460 => { // lsm_set_self_attr", "461 => {", "unsupported_policy.lsm()");
     try expectSourceRoute(source, "461 => { // lsm_list_modules", "462 => {", "unsupported_policy.lsm()");
     try expectSourceRoute(source, "462 => { // mseal", "463 => {", "unsupported_policy.mseal()");
+    try expectSourceRoute(source, "295 => { // name_to_handle_at", "296 => {", "unsupported_policy.fileHandles()");
+    try expectSourceRoute(source, "296 => { // open_by_handle_at", "297 => {", "unsupported_policy.fileHandles()");
+    try std.testing.expectEqual(kt.errno.ENOSYS, unsupported_policy.fileHandles());
     try std.testing.expectEqual(kt.errno.ENOSYS, unsupported_policy.mseal());
 }
 

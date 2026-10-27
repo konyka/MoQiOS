@@ -74,3 +74,8 @@ pub fn lsm() i64 {
 pub fn mseal() i64 {
     return errno.ENOSYS;
 }
+
+/// name_to_handle_at / open_by_handle_at: no file-handle support.
+pub fn fileHandles() i64 {
+    return errno.ENOSYS;
+}
