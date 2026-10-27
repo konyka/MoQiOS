@@ -2371,17 +2371,11 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         461 => { // lsm_list_modules(ids, size, flags) — Linux #461
             frame.rax = @bitCast(unsupported_policy.lsm());
         },
-        462 => { // mseal(addr, len, flags) — seal memory mapping — Linux #462
-            // Mark mmap region as sealed (prevent mprotect/munmap/mremap)
-            const addr = frame.rdi;
-            const len = frame.rsi;
-            if (addr == 0 or addr >= 0x0000_8000_0000_0000) {
-                frame.rax = @bitCast(@as(i64, -14)); // EFAULT
-            } else {
-                // Accept sealing — record in mmap region (simplified: just accept)
-                _ = len;
-                frame.rax = 0;
-            }
+        462 => { // mseal(addr, len, flags) — Linux #462
+            // Sealing is not implemented: mprotect/munmap/mremap would still
+            // change the range. Reporting success would silently defeat the
+            // caller's hardening, so refuse like every other unsupported call.
+            frame.rax = @bitCast(unsupported_policy.mseal());
         },
         // ── v52.0: xattr-at real implementation ────────────────────────────────
         463 => { // setxattrat(dfd, path, flags, name, value, size)

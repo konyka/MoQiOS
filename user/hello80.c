@@ -63,6 +63,7 @@ static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_LANDLOCK_CREATE_RULESET 444
 #define SYS_LANDLOCK_ADD_RULE 445
 #define SYS_LANDLOCK_RESTRICT_SELF 446
+#define SYS_MSEAL 462
 #define ENOSYS 38
 
 static void print(const char *s) {
@@ -156,6 +157,10 @@ void _start(void) {
     failures += check(unchanged(rule_attr, 0xD4, sizeof(rule_attr)), "landlock rule buffer preserved");
     failures += check(syscall2(SYS_LANDLOCK_RESTRICT_SELF, (uint64_t)-1, 0) == -ENOSYS,
                       "landlock_restrict_self #446 returns ENOSYS");
+    /* mseal promises that a mapping can no longer be changed; reporting success
+     * without sealing anything would silently defeat that hardening. */
+    failures += check(syscall3(SYS_MSEAL, (uint64_t)acct_buf & ~0xFFFull, 4096, 0) == -ENOSYS,
+                      "mseal #462 returns ENOSYS instead of claiming a seal it does not enforce");
 
     if (failures == 0) print("hello80: PASS (raw unsupported syscall ENOSYS/no-mutation contracts)\nhello80 done\n");
     else print("hello80: FAILURES\nhello80 done\n");

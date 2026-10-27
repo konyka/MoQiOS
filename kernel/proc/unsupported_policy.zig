@@ -69,3 +69,8 @@ pub fn landlock() i64 {
 pub fn lsm() i64 {
     return errno.ENOSYS;
 }
+
+/// mseal: sealing is not enforced, so it must not be reported as done.
+pub fn mseal() i64 {
+    return errno.ENOSYS;
+}

@@ -1771,6 +1771,8 @@ test "unsupported syscall dispatches route to the pure ENOSYS policy" {
     try expectSourceRoute(source, "459 => { // lsm_get_self_attr", "460 => {", "unsupported_policy.lsm()");
     try expectSourceRoute(source, "460 => { // lsm_set_self_attr", "461 => {", "unsupported_policy.lsm()");
     try expectSourceRoute(source, "461 => { // lsm_list_modules", "462 => {", "unsupported_policy.lsm()");
+    try expectSourceRoute(source, "462 => { // mseal", "463 => {", "unsupported_policy.mseal()");
+    try std.testing.expectEqual(kt.errno.ENOSYS, unsupported_policy.mseal());
 }
 
 test "fallocate policy rejects unsupported modes before mutation" {
