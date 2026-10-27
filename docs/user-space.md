@@ -406,6 +406,9 @@ name matches exactly: `hello14` gets `CAP_NET_RAW`, `hello51`/`hello52` get
 root-owned 0755 root directory; `hello114` does not receive those capabilities.
 All other names remain unprivileged.
 
+`setpriority` follows Linux: changing another user's process needs
+`CAP_SYS_NICE`, and lowering a nice value (raising priority) always does;
+the new value is clamped to [-20, 19] and a pid beyond 32 bits is `ESRCH`.
 `sethostname`, `setdomainname`, `swapon` and `swapoff` require `CAP_SYS_ADMIN`;
 `mount` and `umount2` require `CAP_SYS_MOUNT`; without them they return `-1`
 (`EPERM`) and change nothing.

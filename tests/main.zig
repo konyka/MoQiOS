@@ -6178,3 +6178,24 @@ test "sticky directory: only the entry owner, the directory owner or CAP_FOWNER 
     // no write on the directory: never
     try std.testing.expect(!dac.mayRemoveEntry(closed, 1000, alice, false));
 }
+
+test "setpriority: only the owner may renice, and only CAP_SYS_NICE may raise priority" {
+    const np = kt.nice_policy;
+    const base: np.Request = .{ .caller_euid = 1000, .caller_uid = 1000, .target_uid = 1000, .target_euid = 1000, .cap_sys_nice = false, .current_nice = 0, .new_nice = 5 };
+    try std.testing.expect(np.maySetNice(base)); // lower my own priority
+    var r = base;
+    r.new_nice = -5;
+    try std.testing.expect(!np.maySetNice(r)); // raise it: needs CAP_SYS_NICE
+    r.cap_sys_nice = true;
+    try std.testing.expect(np.maySetNice(r));
+    r = base;
+    r.target_uid = 0;
+    r.target_euid = 0;
+    try std.testing.expect(!np.maySetNice(r)); // another user's process
+    r.caller_euid = 0;
+    try std.testing.expect(np.maySetNice(r)); // root may
+    r = base;
+    r.current_nice = 5;
+    r.new_nice = 5;
+    try std.testing.expect(np.maySetNice(r)); // unchanged value
+}

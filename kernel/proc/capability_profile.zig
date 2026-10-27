@@ -17,7 +17,9 @@ pub const SysCap = packed struct(u32) {
     cap_ipc_lock: bool = false,
     cap_sys_rawio: bool = false,
     cap_sys_time: bool = false,
-    _pad: u14 = 0,
+    /// Raise scheduling priority / renice another user's process.
+    cap_sys_nice: bool = false,
+    _pad: u13 = 0,
 };
 
 pub const ALL_CAPS: SysCap = .{
@@ -39,6 +41,7 @@ pub const ALL_CAPS: SysCap = .{
     .cap_ipc_lock = true,
     .cap_sys_rawio = true,
     .cap_sys_time = true,
+    .cap_sys_nice = true,
 };
 
 pub const NO_CAPS: SysCap = .{};

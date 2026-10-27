@@ -71,6 +71,11 @@ static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_SWAPOFF 319
 #define SYS_UMOUNT2 289
 #define EPERM 1
+#define SYS_GETPPID 205
+#define SYS_GETPRIORITY 232
+#define SYS_SETPRIORITY 233
+#define SYS_GETPID_L 39
+#define ESRCH 3
 #define ENOSYS 38
 
 static void print(const char *s) {
@@ -190,6 +195,29 @@ void _start(void) {
                           "swapoff by an unprivileged process is EPERM");
         failures += check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/none", 0) == -EPERM,
                           "umount2 by an unprivileged process is EPERM");
+    }
+
+    /* setpriority on another user's process (our parent is init, uid 0) needs
+     * CAP_SYS_NICE; on our own process lowering the priority is always allowed,
+     * raising it (a lower nice) is not. Out-of-range arguments must not panic. */
+    {
+        int64_t ppid = syscall1(SYS_GETPPID, 0);
+        int64_t before = syscall2(SYS_GETPRIORITY, 0, (uint64_t)ppid);
+        failures += check(syscall3(SYS_SETPRIORITY, 0, (uint64_t)ppid, 19) == -EPERM,
+                          "setpriority on init (another user's process) is EPERM");
+        failures += check(syscall2(SYS_GETPRIORITY, 0, (uint64_t)ppid) == before,
+                          "init's priority is unchanged");
+        int64_t me = syscall1(SYS_GETPID_L, 0);
+        failures += check(syscall3(SYS_SETPRIORITY, 0, (uint64_t)me, 5) == 0,
+                          "setpriority lowering my own priority (nice 5) succeeds");
+        failures += check(syscall3(SYS_SETPRIORITY, 0, 0, (uint64_t)-5) == -EPERM,
+                          "setpriority raising my own priority (nice -5) without CAP_SYS_NICE is EPERM");
+        failures += check(syscall3(SYS_SETPRIORITY, 0, 1ull << 40, 0) == -ESRCH,
+                          "setpriority with a pid beyond 32 bits is ESRCH, not a kernel panic");
+        failures += check(syscall2(SYS_GETPRIORITY, 0, 1ull << 40) == -ESRCH,
+                          "getpriority with a pid beyond 32 bits is ESRCH, not a kernel panic");
+        failures += check(syscall3(SYS_SETPRIORITY, 0, 0, 1ull << 40) == 0,
+                          "setpriority with an absurd nice clamps to 19 instead of panicking");
     }
 
     if (failures == 0) print("hello80: PASS (raw unsupported syscall ENOSYS/no-mutation contracts)\nhello80 done\n");

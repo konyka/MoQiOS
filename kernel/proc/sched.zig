@@ -1831,10 +1831,8 @@ pub fn getNice(t: *task.Task) i32 {
 }
 
 /// Syscall #140: getpriority(which, who)
-/// which: PRIO_PROCESS=0, PRIO_PGRP=1, PRIO_USER=2
-/// Simplified: only supports PRIO_PROCESS + who=0 (current process).
-/// Returns 20 - nice on success (range 1-40), negative errno on failure.
-/// Linux convention: the raw syscall returns (20 - nice).
+/// Only PRIO_PROCESS is supported. A pid that does not fit in 32 bits names
+/// no task (ESRCH) — it must never reach an @intCast.
 pub fn sysGetpriority(which: u64, who: u64) i64 {
     const PRIO_PROCESS: u64 = 0;
     if (which != PRIO_PROCESS) return -22; // -EINVAL
@@ -1844,21 +1842,15 @@ pub fn sysGetpriority(which: u64, who: u64) i64 {
 
     // who == 0 means current process
     if (who != 0) {
-        // Look up by TID
+        if (who > 0xFFFF_FFFF) return -3; // -ESRCH
         const target_idx = task.findTaskByTid(@intCast(who)) orelse return -3; // -ESRCH
         const target = task.getTask(target_idx) orelse return -3;
-        const nice_val: i32 = @as(i32, @intCast(target.priority)) - 20;
-        return 20 - nice_val;
+        return 20 - @as(i64, getNice(target));
     }
 
-    const nice_val: i32 = @as(i32, @intCast(cur.priority)) - 20;
-    return 20 - nice_val;
+    return 20 - @as(i64, getNice(cur));
 }
 
-/// Syscall #141: setpriority(which, who, prio)
-/// which: PRIO_PROCESS=0, PRIO_PGRP=1, PRIO_USER=2
-/// prio is the nice value (-20..19).
-/// Simplified: only supports PRIO_PROCESS + who=0 (current process).
 pub fn sysSetpriority(which: u64, who: u64, prio: i64) i64 {
     const PRIO_PROCESS: u64 = 0;
     if (which != PRIO_PROCESS) return -22; // -EINVAL
@@ -1866,13 +1858,24 @@ pub fn sysSetpriority(which: u64, who: u64, prio: i64) i64 {
     const cur_idx = currentTaskIndex() orelse return -1;
     const cur = task.getTask(cur_idx) orelse return -1;
 
+    var target = cur;
     if (who != 0) {
+        if (who > 0xFFFF_FFFF) return -3; // -ESRCH
         const target_idx = task.findTaskByTid(@intCast(who)) orelse return -3; // -ESRCH
-        const target = task.getTask(target_idx) orelse return -3;
-        setNice(target, @intCast(prio));
-        return 0;
+        target = task.getTask(target_idx) orelse return -3;
     }
-
-    setNice(cur, @intCast(prio));
+    // Clamp before narrowing: an arbitrary 64-bit nice must not panic the kernel.
+    const nice: i32 = @intCast(@max(-20, @min(19, prio)));
+    const policy = @import("nice_policy.zig");
+    if (!policy.maySetNice(.{
+        .caller_euid = cur.euid,
+        .caller_uid = cur.uid,
+        .target_uid = target.uid,
+        .target_euid = target.euid,
+        .cap_sys_nice = cur.effective_caps.cap_sys_nice,
+        .current_nice = getNice(target),
+        .new_nice = nice,
+    })) return -1; // -EPERM
+    setNice(target, nice);
     return 0;
 }
