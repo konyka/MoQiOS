@@ -740,6 +740,21 @@ void _start(void) {
         check(om >= 0 && syscall2(SYS_CHMOD, (uint64_t)"/tmp/h114-v-own", 0600) == 0, "V: chmod of my own tmpfs file succeeds");
         check(om >= 0 && syscall3(SYS_CHOWN, (uint64_t)"/tmp/h114-v-own", 0, (uint64_t)-1) == -EPERM, "V: giving my tmpfs file to root is EPERM");
         check(om >= 0 && syscall3(SYS_CHOWN, (uint64_t)"/tmp/h114-v-own", 1000, 1000) == 0, "V: chown of my tmpfs file to my own ids succeeds");
+        /* the same rules by descriptor: fchmod/fchown on tmpfs fds */
+        if (om >= 0) {
+            check(syscall2(SYS_FCHMOD, (uint64_t)om, 0640) == 0, "V: fchmod on my own tmpfs fd succeeds");
+            static uint64_t fx[24];
+            int fr = syscall5(SYS_STATX, (uint64_t)-100, (uint64_t)"/tmp/h114-v-own", 0, 0x7ff, (uint64_t)fx) == 0;
+            check(fr && ((uint32_t)(fx[3] >> 32) & 07777) == 0640, "V: statx shows the mode set by fchmod");
+            check(syscall3(SYS_FCHOWN, (uint64_t)om, 0, (uint64_t)-1) == -EPERM, "V: fchown giving my tmpfs file to root is EPERM");
+            check(syscall3(SYS_FCHOWN, (uint64_t)om, 1000, 1000) == 0, "V: fchown of my tmpfs fd to my own ids succeeds");
+        }
+        {
+            int64_t rf = syscall2(SYS_OPEN, (uint64_t)"/tmp/h114-rootfile", O_RDONLY);
+            check(rf >= 0 && syscall2(SYS_FCHMOD, (uint64_t)rf, 0777) == -EPERM, "V: fchmod of root's tmpfs file through a read-only fd is EPERM");
+            check(rf >= 0 && syscall3(SYS_FCHOWN, (uint64_t)rf, 1000, 1000) == -EPERM, "V: fchown of root's tmpfs file through an fd is EPERM");
+            if (rf >= 0) syscall1(SYS_CLOSE, (uint64_t)rf);
+        }
         if (om >= 0) syscall1(SYS_CLOSE, (uint64_t)om);
         check(syscall2(SYS_CHMOD, (uint64_t)"/tmp/h114-rootfile", 0777) == -EPERM, "V: chmod of root's tmpfs file by uid 1000 is EPERM");
         check(syscall3(SYS_CHOWN, (uint64_t)"/tmp/h114-rootfile", 1000, 1000) == -EPERM, "V: chown of root's tmpfs file is EPERM");

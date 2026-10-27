@@ -537,6 +537,19 @@ pub fn tmpfsChmod(path: []const u8, new_mode: u32, who: Remover) i64 {
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
     const idx = lookupLocked(path) orelse return -2;
+    return chmodLocked(idx, new_mode, who);
+}
+
+/// fchmod on an open tmpfs descriptor (same rules as tmpfsChmod).
+pub fn tmpfsChmodIdx(idx: u8, new_mode: u32, who: Remover) i64 {
+    if (idx >= MAX_FILES) return -9;
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    if (!entries[idx].active) return -9;
+    return chmodLocked(idx, new_mode, who);
+}
+
+fn chmodLocked(idx: u8, new_mode: u32, who: Remover) i64 {
     const e = &entries[idx];
     if (!dac.mayChmod(e.uid, who.euid, who.effective_caps.cap_fowner)) return -1;
     e.mode = new_mode & 0o7777;
@@ -548,6 +561,19 @@ pub fn tmpfsChown(path: []const u8, uid: ?u32, gid: ?u32, who: Remover) i64 {
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
     const idx = lookupLocked(path) orelse return -2;
+    return chownLocked(idx, uid, gid, who);
+}
+
+/// fchown on an open tmpfs descriptor (same rules as tmpfsChown).
+pub fn tmpfsChownIdx(idx: u8, uid: ?u32, gid: ?u32, who: Remover) i64 {
+    if (idx >= MAX_FILES) return -9;
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    if (!entries[idx].active) return -9;
+    return chownLocked(idx, uid, gid, who);
+}
+
+fn chownLocked(idx: u8, uid: ?u32, gid: ?u32, who: Remover) i64 {
     const e = &entries[idx];
     if (!dac.mayChown(e.uid, e.gid, who.euid, who.egid, who.effective_caps.cap_chown, uid, gid)) return -1;
     if (uid) |u| e.uid = u;

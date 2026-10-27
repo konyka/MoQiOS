@@ -433,7 +433,8 @@ The tmpfs root (`/tmp`) is mode `1777`. Creating an entry needs write+search on
 its parent directory; unlink/rmdir need the same and, in a sticky directory,
 additionally that the caller owns the entry or the directory, is uid 0, or holds
 `CAP_FOWNER` (`dac.mayRemoveEntry`). chmod and chown on `/tmp` paths use the
-same owner rules as ext2. A denial is `-13` (`EACCES`) for namespace changes and
+same owner rules as ext2, both by path and through an open descriptor
+(`fchmod`/`fchown`). A denial is `-13` (`EACCES`) for namespace changes and
 `-1` (`EPERM`) for chmod/chown.
 
 chmod/fchmod/fchmodat/fchmodat2 and chown/fchown/lchown on the ext2 root disk

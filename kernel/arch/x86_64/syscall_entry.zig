@@ -1889,7 +1889,11 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 frame.rax = @bitCast(@as(i64, -9));
                 return;
             };
-            const fd: u32 = @truncate(frame.rdi);
+            const fd: u32 = fdArg(frame.rdi);
+            if (fd < vfs_mod.MAX_FDS and t.fd_table.fds[fd].fd_type == .tmpfs_file) {
+                frame.rax = @bitCast(@import("../../fs/tmpfs.zig").tmpfsChmodIdx(@intCast(t.fd_table.fds[fd].tmpfs_idx), @truncate(frame.rsi), tmpfsWho()));
+                return;
+            }
             if (fd >= vfs_mod.MAX_FDS or t.fd_table.fds[fd].fd_type != .ext2_file) {
                 frame.rax = @bitCast(@as(i64, -9));
                 return;
@@ -2075,7 +2079,11 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 frame.rax = @bitCast(@as(i64, -9));
                 return;
             };
-            const fd: u32 = @truncate(frame.rdi);
+            const fd: u32 = fdArg(frame.rdi);
+            if (fd < vfs_mod.MAX_FDS and t.fd_table.fds[fd].fd_type == .tmpfs_file) {
+                frame.rax = @bitCast(@import("../../fs/tmpfs.zig").tmpfsChownIdx(@intCast(t.fd_table.fds[fd].tmpfs_idx), idArg(frame.rsi), idArg(frame.rdx), tmpfsWho()));
+                return;
+            }
             if (fd >= vfs_mod.MAX_FDS or t.fd_table.fds[fd].fd_type != .ext2_file) {
                 frame.rax = @bitCast(@as(i64, -9));
                 return;
