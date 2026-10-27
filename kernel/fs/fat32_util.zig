@@ -330,6 +330,41 @@ fn utf8EncodeCp(cp: u32, out: []u8) ?u32 {
     return null;
 }
 
+/// Collects the LFN slots that precede a short entry during a forward
+/// directory scan. A slot carrying the last-slot marker (0x40) always begins a
+/// new name: anything collected before it belongs to an earlier, orphaned
+/// chain (for example a deleted file whose short entry was tombstoned but
+/// whose LFN slots were left behind) and must not be glued onto this one.
+pub const LfnAccumulator = struct {
+    raw: [MAX_LFN_SLOTS][32]u8 = undefined,
+    count: u32 = 0,
+
+    pub fn reset(self: *LfnAccumulator) void {
+        self.count = 0;
+    }
+
+    pub fn push(self: *LfnAccumulator, entry: [*]const u8) void {
+        if (isLastLfnSlot(entry[0])) self.count = 0;
+        if (self.count >= MAX_LFN_SLOTS) {
+            self.count = 0;
+            return;
+        }
+        @memcpy(self.raw[self.count][0..32], entry[0..32]);
+        self.count += 1;
+    }
+
+    /// Assemble the pending chain for `short_name` and clear it. Null when
+    /// nothing is pending or the chain does not belong to this short entry.
+    pub fn take(self: *LfnAccumulator, short_name: *const [11]u8, out: []u8) ?u32 {
+        if (self.count == 0) return null;
+        var ptrs: [MAX_LFN_SLOTS][*]const u8 = undefined;
+        for (0..self.count) |i| ptrs[i] = &self.raw[i];
+        const n = self.count;
+        self.count = 0;
+        return assembleLfnUtf8(ptrs[0..n], short_name, out);
+    }
+};
+
 /// Assemble one or more on-disk LFN directory entries into a UTF-8 name.
 ///
 /// `lfn_entries` must be in forward-scan order: the first entry carries the

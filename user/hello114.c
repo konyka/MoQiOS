@@ -799,7 +799,11 @@ void _start(void) {
         check(an == 9 && sb[0] == 'h' && sb[8] == '\n', "S: O_TRUNC discards another descriptor's unflushed data (reads back exactly 9 bytes)");
         syscall1(SYS_CLOSE, (uint64_t)a1);
         syscall1(SYS_CLOSE, (uint64_t)a2);
-        syscall1(87, (uint64_t)"/h114-s-a");
+        {
+            int64_t ur = syscall1(87, (uint64_t)"/h114-s-a");
+            check(ur == 0, "S: unlink of my own FAT32 root file succeeds (ext2's root permissions must not block it)");
+            check(syscall2(SYS_OPEN, (uint64_t)"/h114-s-a", O_RDONLY) < 0, "S: the FAT32 file is gone after unlink");
+        }
 
         /* B: ftruncate to a shorter length while another descriptor has an unflushed write */
         int64_t b1 = syscall3(SYS_OPEN, (uint64_t)"/h114-s-b", O_RDWR | O_CREAT | O_TRUNC, 0644);

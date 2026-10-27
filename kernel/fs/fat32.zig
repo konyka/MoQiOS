@@ -285,8 +285,7 @@ fn listRootDir() void {
     file_count = 0;
     var cluster: u32 = fat32_root_cluster;
     // SK-66: pending LFN slots in forward-scan order (last-marker first).
-    var lfn_raw: [fat_util.MAX_LFN_SLOTS][32]u8 = undefined;
-    var lfn_count: u32 = 0;
+    var lfn: fat_util.LfnAccumulator = .{};
 
     root_scan: while (cluster >= 2 and cluster < 0x0FFFFFF8) {
         const base_lba = clusterToLBA(cluster);
@@ -304,21 +303,16 @@ fn listRootDir() void {
 
                 if (first_byte == 0x00) break :root_scan; // End of directory
                 if (first_byte == 0xE5) {
-                    lfn_count = 0; // orphaned LFN chain
+                    lfn.reset(); // orphaned LFN chain
                     continue;
                 }
                 const attr = buf[entry_off + 11];
                 if (fat_util.isLfnAttr(attr)) {
-                    if (lfn_count < fat_util.MAX_LFN_SLOTS) {
-                        @memcpy(lfn_raw[lfn_count][0..32], (buf + entry_off)[0..32]);
-                        lfn_count += 1;
-                    } else {
-                        lfn_count = 0;
-                    }
+                    lfn.push(buf + entry_off);
                     continue;
                 }
                 if (fat_util.isVolumeLabelAttr(attr)) {
-                    lfn_count = 0;
+                    lfn.reset();
                     continue;
                 }
 
@@ -337,14 +331,7 @@ fn listRootDir() void {
                 var short_name: [11]u8 = undefined;
                 @memcpy(short_name[0..11], entry[0..11]);
                 var ni: u32 = 0;
-                if (lfn_count > 0) {
-                    var ptrs: [fat_util.MAX_LFN_SLOTS][*]const u8 = undefined;
-                    for (0..lfn_count) |i| ptrs[i] = &lfn_raw[i];
-                    if (fat_util.assembleLfnUtf8(ptrs[0..lfn_count], &short_name, fi.name[0..])) |nlen| {
-                        ni = nlen;
-                    }
-                    lfn_count = 0;
-                }
+                if (lfn.take(&short_name, fi.name[0..])) |nlen| ni = nlen;
                 if (ni == 0) {
                     ni = fat_util.decode83Name(&short_name, fi.name[0..]);
                 }

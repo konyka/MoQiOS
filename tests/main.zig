@@ -6224,3 +6224,26 @@ test "setpriority: only the owner may renice, and only CAP_SYS_NICE may raise pr
     r.new_nice = 5;
     try std.testing.expect(np.maySetNice(r)); // unchanged value
 }
+
+test "fat32 root scan: an orphaned LFN chain does not swallow the next file's long name" {
+    // Bytes as found on the committed disk.img: a deleted file left its two
+    // LFN slots ("unlinktest.txt") behind, then a live file follows with its
+    // own two-slot LFN chain and short entry.
+    var short_name = [_]u8{ 'F', 'S', 'Y', 'N', 'C', '_', '~', '1', 'T', 'X', 'T' };
+    var orphan_short = [_]u8{ 'U', 'N', 'L', 'I', 'N', 'K', '~', '1', 'T', 'X', 'T' };
+    var orphan: [2][32]u8 = undefined;
+    var live: [2][32]u8 = undefined;
+    try std.testing.expectEqual(@as(?u32, 2), fat32_util.buildLfnEntries("unlinktest.txt", &orphan_short, orphan[0..]));
+    try std.testing.expectEqual(@as(?u32, 2), fat32_util.buildLfnEntries("fsync_probe.txt", &short_name, live[0..]));
+
+    var acc: fat32_util.LfnAccumulator = .{};
+    acc.push(&orphan[0]);
+    acc.push(&orphan[1]);
+    acc.push(&live[0]);
+    acc.push(&live[1]);
+    var out: [256]u8 = undefined;
+    const n = acc.take(&short_name, out[0..]) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("fsync_probe.txt", out[0..n]);
+    // take() consumes the chain
+    try std.testing.expectEqual(@as(?u32, null), acc.take(&short_name, out[0..]));
+}

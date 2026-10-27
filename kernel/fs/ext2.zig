@@ -677,7 +677,7 @@ const ParentRef = struct { parent: u32, name: []const u8 };
 
 const ParentError = error{ DacDenied, Invalid };
 
-fn resolveParentChecked(path: []const u8, who: ?Who, access: @import("dac.zig").Access) ParentError!ParentRef {
+fn resolveParentChecked(path: []const u8, who: ?Who, access: @import("dac.zig").Access, must_exist: bool) ParentError!ParentRef {
     // Find the last '/' to split parent path from filename
     var last_slash: usize = 0;
     for (0..path.len) |i| {
@@ -731,14 +731,21 @@ fn resolveParentChecked(path: []const u8, who: ?Who, access: @import("dac.zig").
         var pino: Ext2Inode = undefined;
         if (!readInode(parent_inode, &pino)) return error.Invalid;
         if (!eu.isDirectory(pino.mode)) return error.Invalid;
-        if (!@import("dac.zig").allows(inodeMeta(&pino), w.creds(), access)) return error.DacDenied;
+        if (!@import("dac.zig").allows(inodeMeta(&pino), w.creds(), access)) {
+            // Removing/renaming a name ext2 does not have is not an ext2
+            // permission question: report "not here" so the caller can try the
+            // other filesystem (FAT32 shares the root namespace). Creation
+            // (`must_exist == false`) is still refused outright.
+            if (must_exist and findDirEntryCached(parent_inode, &pino, filename) == null) return error.Invalid;
+            return error.DacDenied;
+        }
     }
     return .{ .parent = parent_inode, .name = filename };
 }
 
 /// Path resolution without authorization (read-only lookups).
 fn resolveParent(path: []const u8) ?ParentRef {
-    return resolveParentChecked(path, null, .{}) catch null;
+    return resolveParentChecked(path, null, .{}, false) catch null;
 }
 
 /// K1 dcache: probe (parent_inode_num, name) first; a hit skips the directory
@@ -2209,7 +2216,7 @@ pub fn createFile(name: []const u8, creator: Creator, who: ?Who) i64 {
     }
 
     // Resolve parent directory and filename
-    const resolved = resolveParentChecked(name, who, @import("dac.zig").Access.write_search) catch |e| return if (e == error.DacDenied) -13 else -1;
+    const resolved = resolveParentChecked(name, who, @import("dac.zig").Access.write_search, false) catch |e| return if (e == error.DacDenied) -13 else -1;
     const parent_inode_num = resolved.parent;
     const filename = resolved.name;
 
@@ -2375,7 +2382,7 @@ pub fn createDir(name: []const u8, creator: Creator, who: ?Who) i64 {
     }
 
     // Resolve parent directory and directory name
-    const resolved = resolveParentChecked(name, who, @import("dac.zig").Access.write_search) catch |e| return if (e == error.DacDenied) -13 else -1;
+    const resolved = resolveParentChecked(name, who, @import("dac.zig").Access.write_search, false) catch |e| return if (e == error.DacDenied) -13 else -1;
     const parent_inode_num = resolved.parent;
     const dirname = resolved.name;
 
@@ -2662,7 +2669,7 @@ pub fn unlinkFile(path: []const u8, who: ?Who) i64 {
     if (!active) return -1;
 
     // Resolve parent directory and filename
-    const resolved = resolveParentChecked(path, who, @import("dac.zig").Access.write_search) catch |e| return if (e == error.DacDenied) -13 else -1;
+    const resolved = resolveParentChecked(path, who, @import("dac.zig").Access.write_search, true) catch |e| return if (e == error.DacDenied) -13 else -1;
     const parent_inode_num = resolved.parent;
     const filename = resolved.name;
 
@@ -2798,12 +2805,12 @@ pub fn renameFile(old_path: []const u8, new_path: []const u8, who: ?Who) i64 {
     if (!active) return -1;
 
     // Resolve source: parent dir + old filename
-    const old_resolved = resolveParentChecked(old_path, who, @import("dac.zig").Access.write_search) catch |e| return if (e == error.DacDenied) -13 else -1;
+    const old_resolved = resolveParentChecked(old_path, who, @import("dac.zig").Access.write_search, true) catch |e| return if (e == error.DacDenied) -13 else -1;
     const old_parent_inode = old_resolved.parent;
     const old_filename = old_resolved.name;
 
     // Resolve destination: parent dir + new filename
-    const new_resolved = resolveParentChecked(new_path, who, @import("dac.zig").Access.write_search) catch |e| return if (e == error.DacDenied) -13 else -1;
+    const new_resolved = resolveParentChecked(new_path, who, @import("dac.zig").Access.write_search, false) catch |e| return if (e == error.DacDenied) -13 else -1;
     const new_parent_inode = new_resolved.parent;
     const new_filename = new_resolved.name;
 
@@ -2869,7 +2876,7 @@ pub fn rmdirFile(path: []const u8, who: ?Who) i64 {
     defer fs_lock.release(flags);
     if (!active) return -1;
 
-    const resolved = resolveParentChecked(path, who, @import("dac.zig").Access.write_search) catch |e| return if (e == error.DacDenied) -13 else -1;
+    const resolved = resolveParentChecked(path, who, @import("dac.zig").Access.write_search, true) catch |e| return if (e == error.DacDenied) -13 else -1;
     const parent_inode_num = resolved.parent;
     const filename = resolved.name;
 
@@ -2951,7 +2958,7 @@ pub fn createHardlink(oldpath: []const u8, newpath: []const u8, who: ?Who) i64 {
     if (eu.isDirectory(old_inode_data.mode)) return -1; // EPERM: cannot hardlink directories
 
     // 2. Resolve newpath's parent directory + filename
-    const resolved = resolveParentChecked(newpath, who, @import("dac.zig").Access.write_search) catch |e| return if (e == error.DacDenied) -13 else -2;
+    const resolved = resolveParentChecked(newpath, who, @import("dac.zig").Access.write_search, false) catch |e| return if (e == error.DacDenied) -13 else -2;
     if (resolved.name.len == 0) return -2;
 
     // Check that newpath doesn't already exist
@@ -2981,7 +2988,7 @@ pub fn createSymlink(target: []const u8, linkpath: []const u8, creator: Creator,
     if (!active) return -5;
 
     // 1. Resolve linkpath's parent directory + filename
-    const resolved = resolveParentChecked(linkpath, who, @import("dac.zig").Access.write_search) catch |e| return if (e == error.DacDenied) -13 else -2;
+    const resolved = resolveParentChecked(linkpath, who, @import("dac.zig").Access.write_search, false) catch |e| return if (e == error.DacDenied) -13 else -2;
     if (resolved.name.len == 0) return -2;
 
     // Check that linkpath doesn't already exist
