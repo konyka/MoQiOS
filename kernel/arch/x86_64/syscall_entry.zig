@@ -2606,7 +2606,12 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(@import("../../fs/devfs_proxy.zig").syscallDevfsRegister(frame.rdi, frame.rsi));
         },
         485 => { // pmm_set_reclaim_floor(pages) — swap test hook (mm/pmm.zig)
-            frame.rax = @bitCast(@as(i64, @intCast(@import("../../mm/pmm.zig").setReclaimFloor(frame.rdi))));
+            // System-wide allocator behavior: same privilege as swapon/swapoff.
+            if (!checkCapForCurrent("cap_sys_admin")) {
+                frame.rax = @bitCast(@as(i64, -1)); // EPERM
+            } else {
+                frame.rax = @bitCast(@as(i64, @intCast(@min(@import("../../mm/pmm.zig").setReclaimFloor(frame.rdi), std.math.maxInt(i64)))));
+            }
         },
         486 => { // moqipc_grant_cap_to(tid, endpoint, rights)
             frame.rax = @bitCast(syscallGrantCapTo(@truncate(frame.rdi), @truncate(frame.rsi), @truncate(frame.rdx)));

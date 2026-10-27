@@ -92,6 +92,7 @@ static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define EACCES 13
 #define O_RDWR_ 2
 #define O_CREAT_ 0x40
+#define SYS_PMM_SET_RECLAIM_FLOOR 485
 #define ENOSYS 38
 
 static void print(const char *s) {
@@ -200,6 +201,15 @@ void _start(void) {
         failures += check(syscall3(SYS_OPEN_BY_HANDLE_AT, (uint64_t)-1, (uint64_t)handle, 0) == -ENOSYS,
                           "open_by_handle_at returns ENOSYS");
     }
+
+    /* The reclaim-floor test hook changes how every physical allocation in the
+     * system behaves; an unprivileged process must not be able to set it. The
+     * hook returns the previous floor, so a refused call must also leave it at 0
+     * (checked by restoring with a second refused call). */
+    failures += check(syscall1(SYS_PMM_SET_RECLAIM_FLOOR, 1ull << 40) == -EPERM,
+                      "pmm_set_reclaim_floor by an unprivileged process is EPERM");
+    failures += check(syscall1(SYS_PMM_SET_RECLAIM_FLOOR, 0) == -EPERM,
+                      "and so is resetting it (the floor was never changed)");
 
     /* POSIX message queues carry an owner and a mode like files: init (uid 0)
      * created /h80-root with 0600 and /h80-open with 0666. */
