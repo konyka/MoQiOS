@@ -411,6 +411,10 @@ All other names remain unprivileged.
 the new value is clamped to [-20, 19] and a pid beyond 32 bits is `ESRCH`.
 `sched_setaffinity`, `sched_setscheduler` and `sched_setattr` on another user's
 process need `CAP_SYS_NICE`, and entering `SCHED_FIFO`/`SCHED_RR` always does.
+POSIX message queues record their creator's euid/egid and
+`(mode & 0777) & ~umask`; `mq_open` of an existing queue checks the requested
+access against them and `mq_unlink` is limited to the owner (or root /
+`CAP_DAC_OVERRIDE`); denials are `-13` (`EACCES`).
 `kcmp` only compares processes the caller owns unless it holds
 `CAP_SYS_PTRACE`. The realtime acceptance tests `hello44`/`hello104`/`hello108`
 get only `CAP_SYS_NICE`.

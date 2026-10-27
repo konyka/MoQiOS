@@ -85,6 +85,13 @@ static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_NAME_TO_HANDLE_AT 295
 #define SYS_OPEN_BY_HANDLE_AT 296
 #define ENOENT 2
+#define SYS_MQ_OPEN 186
+#define SYS_MQ_UNLINK 187
+#define SYS_MQ_TIMEDSEND 188
+#define SYS_CLOSE 11
+#define EACCES 13
+#define O_RDWR_ 2
+#define O_CREAT_ 0x40
 #define ENOSYS 38
 
 static void print(const char *s) {
@@ -192,6 +199,29 @@ void _start(void) {
                           "name_to_handle_at leaves the handle and mount id untouched");
         failures += check(syscall3(SYS_OPEN_BY_HANDLE_AT, (uint64_t)-1, (uint64_t)handle, 0) == -ENOSYS,
                           "open_by_handle_at returns ENOSYS");
+    }
+
+    /* POSIX message queues carry an owner and a mode like files: init (uid 0)
+     * created /h80-root with 0600 and /h80-open with 0666. */
+    {
+        failures += check(syscall4(SYS_MQ_OPEN, (uint64_t)"/h80-root", O_RDWR_, 0, 0) == -EACCES,
+                          "mq_open of root's 0600 queue by uid 1000 is EACCES");
+        failures += check(syscall1(SYS_MQ_UNLINK, (uint64_t)"/h80-root") == -EACCES,
+                          "mq_unlink of root's queue by uid 1000 is EACCES");
+        int64_t still = syscall4(SYS_MQ_OPEN, (uint64_t)"/h80-root", O_RDWR_ | O_CREAT_ | 0x80 /* O_EXCL */, 0600, 0);
+        failures += check(still == -17 /* EEXIST */, "root's queue still exists after the refused unlink");
+        if (still >= 0) syscall1(SYS_CLOSE, (uint64_t)still);
+        /* init's umask (022) turned the requested 0666 into 0644 */
+        int64_t oq = syscall4(SYS_MQ_OPEN, (uint64_t)"/h80-open", 0 /* O_RDONLY */, 0, 0);
+        failures += check(oq >= 0, "mq_open(O_RDONLY) of root's 0644 queue by uid 1000 succeeds");
+        if (oq >= 0) syscall1(SYS_CLOSE, (uint64_t)oq);
+        failures += check(syscall4(SYS_MQ_OPEN, (uint64_t)"/h80-open", O_RDWR_, 0, 0) == -EACCES,
+                          "mq_open(O_RDWR) of it is EACCES: the creator's umask removed the others' write bit");
+        int64_t mine = syscall4(SYS_MQ_OPEN, (uint64_t)"/h80-mine", O_RDWR_ | O_CREAT_, 0600, 0);
+        failures += check(mine >= 0, "uid 1000 creates its own 0600 queue");
+        if (mine >= 0) syscall1(SYS_CLOSE, (uint64_t)mine);
+        failures += check(syscall1(SYS_MQ_UNLINK, (uint64_t)"/h80-mine") == 0,
+                          "and may unlink its own queue");
     }
 
     /* mseal promises that a mapping can no longer be changed; reporting success

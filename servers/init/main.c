@@ -199,6 +199,15 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello77");  /* bounded raw ext2 readahead validation for #291 */
     run_test("hello78");  /* raw Unix socketpair #53 boundary and bidirectional I/O */
     run_test("hello79");  /* raw fallocate #274 mode boundary and size preservation */
+    /* hello80 fixture: a root-owned POSIX message queue that only root may
+     * open (0600), and one created as 0666 that init's umask (022) leaves
+     * 0644. Kept open by nobody. */
+    {
+        long q = syscall4(186 /* mq_open */, (long)"/h80-root", O_RDWR | O_CREAT, 0600, 0);
+        if (q >= 0) syscall1(SYS_close, q); /* mq descriptors close with close() */
+        q = syscall4(186 /* mq_open */, (long)"/h80-open", O_RDWR | O_CREAT, 0666, 0);
+        if (q >= 0) syscall1(SYS_close, q); /* mq descriptors close with close() */
+    }
     run_test("hello80");  /* raw unsupported syscall ENOSYS and user-buffer preservation */
      run_test("hello81");  /* bounded TCP sendmmsg/recvmmsg validation */
     run_test("hello82");  /* raw sched_getaffinity current-pid and CPU-0 mask boundary */

@@ -47,6 +47,11 @@ pub const MqQueue = struct {
     /// Queue attributes
     max_msg: u32 = MAX_MSGS,
     msg_size: u32 = MAX_MSG_SIZE,
+    /// Owner and permission bits recorded at creation (like a file): mq_open
+    /// checks them against the requested access, mq_unlink against the owner.
+    uid: u32 = 0,
+    gid: u32 = 0,
+    mode: u32 = 0,
     /// Marked for removal (mq_unlink)
     marked_removed: bool = false,
     /// Open references (mq_open). The slot is freed only when an unlinked,
@@ -374,8 +379,24 @@ fn wakeHead(q: *MqQueue, direction: u8) ?WakeToken {
 
 /// mq_open(name, oflag, mode, attr) -> fd or -errno
 /// rdi=name, rsi=oflag, rdx=mode, r10=attr
+const dac = @import("../fs/dac.zig");
+
+fn callerCreds() dac.Credentials {
+    const cur = sched.currentTask() orelse return .{ .euid = 0, .egid = 0, .cap_dac_override = true };
+    return .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override };
+}
+
+fn accessFor(oflag: u32) dac.Access {
+    return switch (oflag & descriptor_policy.O_ACCMODE) {
+        descriptor_policy.O_WRONLY => dac.Access.write,
+        descriptor_policy.O_RDWR => dac.Access.read_write,
+        else => dac.Access.read,
+    };
+}
+
 pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
-    _ = mode;
+    const creds = callerCreds();
+    const umask_val: u32 = if (sched.currentTask()) |cur| cur.umask_val else 0;
 
     // Read name and attributes BEFORE taking mq_lock: user copies walk page
     // tables and must not run with IRQs off. Linux struct mq_attr is four
@@ -409,6 +430,7 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
             if (oflag & O_CREAT != 0 and oflag & O_EXCL != 0) {
                 return EEXIST;
             }
+            if (!dac.allows(.{ .mode = q.mode, .uid = q.uid, .gid = q.gid }, creds, accessFor(oflag))) return -13; // EACCES
             return openDescription(@intCast(queue_idx), q, owner_idx, oflag);
         }
     }
@@ -441,6 +463,9 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
     q.tail = 0;
     q.count = 0;
     q.marked_removed = false;
+    q.uid = creds.euid;
+    q.gid = creds.egid;
+    q.mode = (mode & 0o777) & ~(umask_val & 0o777);
     q.open_count = 0;
     q.notify_pid = 0;
     q.notify_task_idx = null;
@@ -475,8 +500,14 @@ pub fn mqUnlink(name_ptr: u64) i64 {
 
     const flags = mq_lock.acquire();
 
+    const creds = callerCreds();
     for (&queues) |*q| {
         if (q.active and str.eql(q.name[0..q.name_len], name_buf[0..name_len])) {
+            // Like unlinking a file in a sticky directory: owner or privileged.
+            if (creds.euid != 0 and !creds.cap_dac_override and creds.euid != q.uid) {
+                mq_lock.release(flags);
+                return -13; // EACCES
+            }
             serial.writeString("[posix_mq] unlink mq=");
             serial.writeString(q.name[0..q.name_len]);
             serial.writeString("\n");
