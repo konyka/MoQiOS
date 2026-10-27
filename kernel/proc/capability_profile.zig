@@ -93,6 +93,12 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
     if (std.mem.eql(u8, name, "hello13") or std.mem.eql(u8, name, "hello58")) {
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_kill = true }, .initial_init = false };
     }
+    // Realtime-scheduling acceptance tests switch themselves into SCHED_FIFO/RR.
+    if (std.mem.eql(u8, name, "hello44") or std.mem.eql(u8, name, "hello104") or
+        std.mem.eql(u8, name, "hello108"))
+    {
+        return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_sys_nice = true }, .initial_init = false };
+    }
     // Swap acceptance tests enable and drain swap devices (system-wide state).
     if (std.mem.eql(u8, name, "hello96") or std.mem.eql(u8, name, "hello98") or
         std.mem.eql(u8, name, "hello99") or std.mem.eql(u8, name, "hello100") or

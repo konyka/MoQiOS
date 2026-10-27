@@ -4455,6 +4455,7 @@ fn syscallSchedSetaffinity(pid: u32, cpusetsize: u32, mask_ptr: u64) i64 {
         (task_mod2.pinTaskByTid(pid, false) orelse return -3);
     defer target_pin.release();
     const target = target_pin.task;
+    if (!maySchedule(target, false)) return -1; // EPERM
     const target_idx = target_pin.slot;
     const target_cpu = @as(u32, @intCast(affinity));
     const lock_flags = task_mod2.lockTask();
@@ -5310,6 +5311,13 @@ fn syscallMoqipcGetNotify(ep: u32) i64 {
 fn syscallKcmp(pid1: u32, pid2: u32, kcmp_type: u32, idx1: u64, idx2: u64) i64 {
     const t1 = findTaskByPid(pid1) orelse return -3; // ESRCH
     const t2 = findTaskByPid(pid2) orelse return -3;
+    {
+        const np = @import("../../proc/nice_policy.zig");
+        const cur = @import("../../proc/sched.zig").currentTask() orelse return -3;
+        const ptrace = cur.effective_caps.cap_sys_ptrace;
+        if (!np.mayKcmp(cur.euid, cur.uid, t1.uid, t1.euid, ptrace) or
+            !np.mayKcmp(cur.euid, cur.uid, t2.uid, t2.euid, ptrace)) return -1; // EPERM
+    }
 
     switch (kcmp_type) {
         0 => { // KCMP_FILE — compare fd tables
@@ -5463,6 +5471,12 @@ const SchedAttr = extern struct {
 
 /// sched_setattr(pid, attr_ptr, flags) — set scheduling attributes.
 /// pid=0 means current process.
+/// Scheduler-call authorization for `target` (proc/nice_policy.zig).
+fn maySchedule(target: *@import("../../proc/task.zig").Task, wants_rt: bool) bool {
+    const cur = @import("../../proc/sched.zig").currentTask() orelse return false;
+    return @import("../../proc/nice_policy.zig").maySetScheduling(cur.euid, cur.uid, target.uid, target.euid, cur.effective_caps.cap_sys_nice, wants_rt);
+}
+
 fn syscallSchedSetattr(pid: u32, attr_ptr: u64, flags: u32) i64 {
     _ = flags;
     const copy = @import("../../mm/copy_from_user.zig");
@@ -5478,6 +5492,7 @@ fn syscallSchedSetattr(pid: u32, attr_ptr: u64, flags: u32) i64 {
     if (policy > 6) return -22; // EINVAL
 
     const target = findTaskByPid(pid) orelse return -3;
+    if (!maySchedule(target, policy == 1 or policy == 2)) return -1; // EPERM
     target.sched_policy = policy;
 
     // Map sched_priority to kernel priority (0=highest, 255=lowest)
@@ -5560,6 +5575,7 @@ fn syscallSchedSetscheduler(pid: u32, policy: u32, param_ptr: u64) i64 {
     if (!sp.validatePriority(pol, param)) return -22; // EINVAL
 
     const target = findTaskByPid(pid) orelse return -3; // ESRCH
+    if (!maySchedule(target, sp.isRtClass(pol))) return -1; // EPERM
     target.sched_policy = pol;
     if (sp.isRtClass(pol)) {
         target.priority = sp.rtToKernelPriority(@intCast(param));

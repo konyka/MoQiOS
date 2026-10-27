@@ -2469,6 +2469,28 @@ test "capability launch profiles grant only exact trusted compatibility names" {
     try std.testing.expectEqual(@as(u32, @bitCast(hello13)), @as(u32, @bitCast(hello58)));
 }
 
+test "only the realtime acceptance tests receive CAP_SYS_NICE" {
+    inline for ([_][]const u8{ "hello44", "hello104", "hello108" }) |name| {
+        const caps = capability_profile.profileForLaunch(name, true, false).caps;
+        try std.testing.expect(caps.cap_sys_nice);
+        try std.testing.expectEqual(@as(u32, 1), @popCount(@as(u32, @bitCast(caps))));
+        try std.testing.expect(!capability_profile.profileForLaunch(name, false, false).caps.cap_sys_nice);
+    }
+    try std.testing.expect(!capability_profile.profileForLaunch("hello80", true, false).caps.cap_sys_nice);
+}
+
+test "scheduler calls: owner may change non-RT policy, RT and other users need CAP_SYS_NICE" {
+    const np = kt.nice_policy;
+    try std.testing.expect(np.maySetScheduling(1000, 1000, 1000, 1000, false, false));
+    try std.testing.expect(!np.maySetScheduling(1000, 1000, 1000, 1000, false, true));
+    try std.testing.expect(np.maySetScheduling(1000, 1000, 1000, 1000, true, true));
+    try std.testing.expect(!np.maySetScheduling(1000, 1000, 0, 0, false, false));
+    try std.testing.expect(np.maySetScheduling(0, 0, 1000, 1000, false, true));
+    try std.testing.expect(np.mayKcmp(1000, 1000, 1000, 1000, false));
+    try std.testing.expect(!np.mayKcmp(1000, 1000, 0, 0, false));
+    try std.testing.expect(np.mayKcmp(1000, 1000, 0, 0, true));
+}
+
 test "only the swap acceptance tests receive CAP_SYS_ADMIN" {
     inline for ([_][]const u8{ "hello96", "hello98", "hello99", "hello100", "hello101" }) |name| {
         const caps = capability_profile.profileForLaunch(name, true, false).caps;

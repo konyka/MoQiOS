@@ -76,6 +76,12 @@ static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_SETPRIORITY 233
 #define SYS_GETPID_L 39
 #define ESRCH 3
+#define SYS_SCHED_SETAFFINITY 273
+#define SYS_SCHED_SETATTR 308
+#define SYS_SCHED_GETATTR 309
+#define SYS_SCHED_SETSCHEDULER 473
+#define SYS_SCHED_GETSCHEDULER 474
+#define SYS_KCMP 305
 #define ENOSYS 38
 
 static void print(const char *s) {
@@ -218,6 +224,48 @@ void _start(void) {
                           "getpriority with a pid beyond 32 bits is ESRCH, not a kernel panic");
         failures += check(syscall3(SYS_SETPRIORITY, 0, 0, 1ull << 40) == 0,
                           "setpriority with an absurd nice clamps to 19 instead of panicking");
+    }
+
+    /* The rest of the scheduler interface follows the same owner/CAP_SYS_NICE
+     * rules, and realtime classes always need CAP_SYS_NICE. kcmp may only
+     * inspect processes the caller could ptrace-read (here: its own). */
+    {
+        int64_t ppid = syscall1(SYS_GETPPID, 0);
+        uint64_t mask = 1;
+        failures += check(syscall3(SYS_SCHED_SETAFFINITY, (uint64_t)ppid, 8, (uint64_t)&mask) == -EPERM,
+                          "sched_setaffinity on init is EPERM");
+        failures += check(syscall3(SYS_SCHED_SETAFFINITY, 0, 8, (uint64_t)&mask) == 0,
+                          "sched_setaffinity on myself succeeds");
+        int32_t prio = 10;
+        int64_t init_pol = syscall1(SYS_SCHED_GETSCHEDULER, (uint64_t)ppid);
+        int32_t zero_prio = 0;
+        failures += check(syscall3(SYS_SCHED_SETSCHEDULER, (uint64_t)ppid, 0, (uint64_t)&zero_prio) == -EPERM,
+                          "sched_setscheduler on init is EPERM");
+        failures += check(syscall3(SYS_SCHED_SETSCHEDULER, (uint64_t)ppid, 0, (uint64_t)&prio) == -22,
+                          "sched_setscheduler with an invalid priority is EINVAL before any permission check");
+        failures += check(syscall1(SYS_SCHED_GETSCHEDULER, (uint64_t)ppid) == init_pol,
+                          "init's scheduling policy is unchanged");
+        failures += check(syscall3(SYS_SCHED_SETSCHEDULER, 0, 1 /* SCHED_FIFO */, (uint64_t)&prio) == -EPERM,
+                          "sched_setscheduler(SCHED_FIFO) on myself without CAP_SYS_NICE is EPERM");
+        failures += check(syscall1(SYS_SCHED_GETSCHEDULER, 0) == 0,
+                          "my policy stays SCHED_OTHER");
+        int32_t zero = 0;
+        failures += check(syscall3(SYS_SCHED_SETSCHEDULER, 0, 0, (uint64_t)&zero) == 0,
+                          "sched_setscheduler(SCHED_OTHER) on myself succeeds");
+        /* struct sched_attr: size, policy, flags(u64), nice, priority, ... (48 bytes) */
+        uint32_t attr[12];
+        for (int i = 0; i < 12; i++) attr[i] = 0;
+        attr[0] = 48; attr[1] = 1; /* SCHED_FIFO */ attr[5] = 10;
+        failures += check(syscall3(SYS_SCHED_SETATTR, 0, (uint64_t)attr, 0) == -EPERM,
+                          "sched_setattr(SCHED_FIFO) on myself without CAP_SYS_NICE is EPERM");
+        attr[1] = 0; attr[5] = 0; attr[4] = 0;
+        failures += check(syscall3(SYS_SCHED_SETATTR, (uint64_t)ppid, (uint64_t)attr, 0) == -EPERM,
+                          "sched_setattr on init is EPERM");
+        failures += check(syscall5(SYS_KCMP, (uint64_t)ppid, (uint64_t)ppid, 1 /* KCMP_VM */, 0, 0) == -EPERM,
+                          "kcmp on init (another user's process) is EPERM");
+        int64_t me = syscall1(SYS_GETPID_L, 0);
+        failures += check(syscall5(SYS_KCMP, (uint64_t)me, (uint64_t)me, 1 /* KCMP_VM */, 0, 0) == 0,
+                          "kcmp of myself with myself is 0");
     }
 
     if (failures == 0) print("hello80: PASS (raw unsupported syscall ENOSYS/no-mutation contracts)\nhello80 done\n");

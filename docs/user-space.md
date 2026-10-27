@@ -409,6 +409,11 @@ All other names remain unprivileged.
 `setpriority` follows Linux: changing another user's process needs
 `CAP_SYS_NICE`, and lowering a nice value (raising priority) always does;
 the new value is clamped to [-20, 19] and a pid beyond 32 bits is `ESRCH`.
+`sched_setaffinity`, `sched_setscheduler` and `sched_setattr` on another user's
+process need `CAP_SYS_NICE`, and entering `SCHED_FIFO`/`SCHED_RR` always does.
+`kcmp` only compares processes the caller owns unless it holds
+`CAP_SYS_PTRACE`. The realtime acceptance tests `hello44`/`hello104`/`hello108`
+get only `CAP_SYS_NICE`.
 `sethostname`, `setdomainname`, `swapon` and `swapoff` require `CAP_SYS_ADMIN`;
 `mount` and `umount2` require `CAP_SYS_MOUNT`; without them they return `-1`
 (`EPERM`) and change nothing.
