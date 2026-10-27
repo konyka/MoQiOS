@@ -1393,13 +1393,13 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallWait4(frame.rdi, frame.rsi, @truncate(frame.rdx), frame.r10));
         },
         264 => { // sethostname(name, len)
-            frame.rax = @bitCast(syscallSethostname(frame.rdi, @truncate(frame.rsi)));
+            frame.rax = @bitCast(if (!checkCapForCurrent("cap_sys_admin")) @as(i64, -1) else syscallSethostname(frame.rdi, @truncate(frame.rsi)));
         },
         265 => { // gethostname(name, len)
             frame.rax = @bitCast(syscallGethostname(frame.rdi, @truncate(frame.rsi)));
         },
         266 => { // setdomainname(name, len)
-            frame.rax = @bitCast(syscallSetdomainname(frame.rdi, @truncate(frame.rsi)));
+            frame.rax = @bitCast(if (!checkCapForCurrent("cap_sys_admin")) @as(i64, -1) else syscallSetdomainname(frame.rdi, @truncate(frame.rsi)));
         },
         267 => { // getdomainname(name, len)
             frame.rax = @bitCast(syscallGetdomainname(frame.rdi, @truncate(frame.rsi)));
@@ -1531,7 +1531,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             }
         },
         289 => { // umount2(target, flags)
-            frame.rax = @bitCast(syscallUmount2(frame.rdi, @truncate(frame.rsi)));
+            // Same privilege as mount(#288): detaching a filesystem is system-wide.
+            frame.rax = @bitCast(if (!checkCapForCurrent("cap_sys_mount")) @as(i64, -1) else syscallUmount2(frame.rdi, @truncate(frame.rsi)));
         },
         290 => { // sync_file_range(fd, offset, nbytes, flags) — writeback control
             frame.rax = @bitCast(syscallSyncFileRange(@truncate(frame.rdi), frame.rsi, frame.rdx, @truncate(frame.r10)));
@@ -1620,10 +1621,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallPidfdGetfd(@truncate(frame.rdi), @truncate(frame.rsi), @truncate(frame.rdx)));
         },
         318 => { // swapon(path, flags) — enable swap on device
-            frame.rax = @bitCast(syscallSwapon(frame.rdi, @truncate(frame.rsi)));
+            frame.rax = @bitCast(if (!checkCapForCurrent("cap_sys_admin")) @as(i64, -1) else syscallSwapon(frame.rdi, @truncate(frame.rsi)));
         },
         319 => { // swapoff(path) — disable swap
-            frame.rax = @bitCast(syscallSwapoff(frame.rdi));
+            frame.rax = @bitCast(if (!checkCapForCurrent("cap_sys_admin")) @as(i64, -1) else syscallSwapoff(frame.rdi));
         },
         320 => { // openat2(dirfd, pathname, how, size) — enhanced open
             frame.rax = @bitCast(syscallOpenat2(frame.rdi, frame.rsi, frame.rdx, frame.r10));

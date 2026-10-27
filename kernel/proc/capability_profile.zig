@@ -90,6 +90,13 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
     if (std.mem.eql(u8, name, "hello13") or std.mem.eql(u8, name, "hello58")) {
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_kill = true }, .initial_init = false };
     }
+    // Swap acceptance tests enable and drain swap devices (system-wide state).
+    if (std.mem.eql(u8, name, "hello96") or std.mem.eql(u8, name, "hello98") or
+        std.mem.eql(u8, name, "hello99") or std.mem.eql(u8, name, "hello100") or
+        std.mem.eql(u8, name, "hello101"))
+    {
+        return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_sys_admin = true }, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello95") or std.mem.eql(u8, name, "hello114")) {
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_sys_mount = true }, .initial_init = false };
     }

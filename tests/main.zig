@@ -2469,6 +2469,17 @@ test "capability launch profiles grant only exact trusted compatibility names" {
     try std.testing.expectEqual(@as(u32, @bitCast(hello13)), @as(u32, @bitCast(hello58)));
 }
 
+test "only the swap acceptance tests receive CAP_SYS_ADMIN" {
+    inline for ([_][]const u8{ "hello96", "hello98", "hello99", "hello100", "hello101" }) |name| {
+        const caps = capability_profile.profileForLaunch(name, true, false).caps;
+        try std.testing.expect(caps.cap_sys_admin);
+        try std.testing.expectEqual(@as(u32, 1), @popCount(@as(u32, @bitCast(caps))));
+        try std.testing.expect(!capability_profile.profileForLaunch(name, false, false).caps.cap_sys_admin);
+    }
+    try std.testing.expect(!capability_profile.profileForLaunch("hello80", true, false).caps.cap_sys_admin);
+    try std.testing.expect(!capability_profile.profileForLaunch("hello114", true, false).caps.cap_sys_admin);
+}
+
 test "untrusted callers cannot receive named profiles" {
     inline for ([_][]const u8{ "hello14", "hello51", "hello52", "hello54", "hello13", "hello58" }) |name| {
         const profile = capability_profile.profileForLaunch(name, false, false);

@@ -399,11 +399,16 @@ profile only when the caller is the trusted initial `init` task and the ramdisk
 name matches exactly: `hello14` gets `CAP_NET_RAW`, `hello51`/`hello52` get
 `CAP_SYS_RAWIO`, `hello54` gets `CAP_SYS_RAWIO` plus `CAP_KILL`, and
 `hello13`/`hello58` get `CAP_KILL`, and `hello95`/`hello114` get
-`CAP_SYS_MOUNT`. The legacy ext2 fixture programs
+`CAP_SYS_MOUNT`, and the swap acceptance tests `hello96`/`hello98`/`hello99`/
+`hello100`/`hello101` get only `CAP_SYS_ADMIN`. The legacy ext2 fixture programs
 `hello21`/`hello23`/`hello24`/`hello25`/`hello29`/`hello77` get
 `CAP_DAC_OVERRIDE|CAP_CHOWN` so they can prepare and exercise files in the
 root-owned 0755 root directory; `hello114` does not receive those capabilities.
 All other names remain unprivileged.
+
+`sethostname`, `setdomainname`, `swapon` and `swapoff` require `CAP_SYS_ADMIN`;
+`mount` and `umount2` require `CAP_SYS_MOUNT`; without them they return `-1`
+(`EPERM`) and change nothing.
 
 AF_INET `SOCK_RAW` creation and the custom raw network send/receive syscalls
 return `EPERM` unless the current task has `CAP_NET_RAW`; TCP and UDP sockets

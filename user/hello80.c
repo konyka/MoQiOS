@@ -64,6 +64,13 @@ static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_LANDLOCK_ADD_RULE 445
 #define SYS_LANDLOCK_RESTRICT_SELF 446
 #define SYS_MSEAL 462
+#define SYS_SETHOSTNAME 264
+#define SYS_GETHOSTNAME 265
+#define SYS_SETDOMAINNAME 266
+#define SYS_SWAPON 318
+#define SYS_SWAPOFF 319
+#define SYS_UMOUNT2 289
+#define EPERM 1
 #define ENOSYS 38
 
 static void print(const char *s) {
@@ -161,6 +168,29 @@ void _start(void) {
      * without sealing anything would silently defeat that hardening. */
     failures += check(syscall3(SYS_MSEAL, (uint64_t)acct_buf & ~0xFFFull, 4096, 0) == -ENOSYS,
                       "mseal #462 returns ENOSYS instead of claiming a seal it does not enforce");
+
+    /* Privileged system-wide state: this program runs as uid 1000 with no
+     * capabilities, so every call below must be refused (EPERM) and leave
+     * the state unchanged. */
+    {
+        char before[65], after[65];
+        for (int i = 0; i < 65; i++) { before[i] = 0; after[i] = 0; }
+        syscall2(SYS_GETHOSTNAME, (uint64_t)before, 64);
+        failures += check(syscall2(SYS_SETHOSTNAME, (uint64_t)"h80-pwned", 9) == -EPERM,
+                          "sethostname by an unprivileged process is EPERM");
+        syscall2(SYS_GETHOSTNAME, (uint64_t)after, 64);
+        int same = 1;
+        for (int i = 0; i < 65; i++) if (before[i] != after[i]) same = 0;
+        failures += check(same, "the hostname is unchanged");
+        failures += check(syscall2(SYS_SETDOMAINNAME, (uint64_t)"h80-pwned", 9) == -EPERM,
+                          "setdomainname by an unprivileged process is EPERM");
+        failures += check(syscall2(SYS_SWAPON, (uint64_t)"/dev/vblk1", 0) == -EPERM,
+                          "swapon by an unprivileged process is EPERM");
+        failures += check(syscall1(SYS_SWAPOFF, (uint64_t)"/dev/vblk1") == -EPERM,
+                          "swapoff by an unprivileged process is EPERM");
+        failures += check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/none", 0) == -EPERM,
+                          "umount2 by an unprivileged process is EPERM");
+    }
 
     if (failures == 0) print("hello80: PASS (raw unsupported syscall ENOSYS/no-mutation contracts)\nhello80 done\n");
     else print("hello80: FAILURES\nhello80 done\n");
