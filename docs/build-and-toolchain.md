@@ -84,6 +84,9 @@ having a different hash. The RISC-V, AArch64, and NVMe paths are unchanged.
 
 `qemu_smoke.sh` removes its automatically created temporary work directory and generated logs on
 exit. A caller-supplied `MOQI_SMOKE_WORK_DIR` is treated as caller-owned and is preserved.
+A caller-supplied `MOQI_SMOKE_DISK` is likewise caller-owned: it is booted as given (so a disk can
+be carried across runs or prepared beforehand) and must already exist; only the default private
+copy is refreshed from `disk.img`.
 
 `qemu_run_aarch64.sh` validates positive `MOQI_SMP` and `MOQI_MEM` values and regenerates its
 automatically owned DTB on every run, preventing stale CPU/memory topology. An explicit

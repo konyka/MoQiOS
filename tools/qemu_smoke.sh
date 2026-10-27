@@ -86,7 +86,15 @@ if [ -z "${MOQI_SMOKE_PACKAGE_DIR:-}" ]; then
     rm -rf "$PACKAGE_DIR"
 fi
 mkdir -p "$PACKAGE_DIR"
-cp --reflink=auto disk.img "$SMOKE_DISK"
+# A caller-supplied MOQI_SMOKE_DISK is caller-owned: boot it as given (it may
+# be a disk deliberately carried over from an earlier run). Only the private
+# default copy is refreshed from the canonical fixture.
+if [ -z "${MOQI_SMOKE_DISK:-}" ]; then
+    cp --reflink=auto disk.img "$SMOKE_DISK"
+elif [ ! -f "$SMOKE_DISK" ]; then
+    echo "ERROR: MOQI_SMOKE_DISK does not exist: $SMOKE_DISK" >&2
+    exit 1
+fi
 
 MOQI_SMP="$SMP_COUNT" \
 MOQI_SERIAL="file:$LOG_FILE" \

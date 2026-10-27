@@ -1187,6 +1187,7 @@ const FdTable = struct {
   （`fat32_util.LfnAccumulator`），已删除文件遗留的孤立片段不会吞掉下一个文件的长名
 - 根目录只有一层：带 `/`（首字符之后）的名字不是 FAT32 名字（`isRootName`），交给 ext2
 - 新建文件预分配一个首簇，首次写入复用它（`ownedClusters`）；FAT 更新写入每一份 FAT（`fatCopySectors`，按 BPB_NumFATs）
+- 与 ext2 同盘：BPB 声明整盘，但 ext2 从 LBA 32768 开始；ext2 挂载后分配器上界收紧到 ext2 起点之前（`allocLimitCluster`，`shared_disk_foreign_lba`）
 - 操作: 读/写/创建/删除/目录列表
 - 全局 `fs_lock`（IrqSpinlock）串行化文件系统操作；文件数据写回经 `fs/writeback.zig`
   按稳定 inode 标识（而非打开文件句柄）缓冲，多毫秒级延迟刷盘由专用 writeback 内核线程

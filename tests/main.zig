@@ -6268,3 +6268,20 @@ test "fat32: FAT updates are mirrored to every FAT copy" {
     try std.testing.expectEqual(@as(u32, 1), fat32_util.fatCopySectors(32, 504, 1, 35, &lbas));
     try std.testing.expectEqual(@as(u32, 4), fat32_util.fatCopySectors(32, 504, 9, 35, &lbas));
 }
+
+test "fat32: the allocator never hands out clusters past the end of the FAT32 region" {
+    // Root disk layout: FAT32 BPB at LBA 0 claims 65536 sectors, but ext2
+    // starts at LBA 32768. data_start 1040, 1 sector per cluster.
+    const limit = fat32_util.allocLimitCluster(1040, 1, 64496, 32768);
+    // cluster c lives at LBA 1040 + (c - 2); the last one below 32768 is 31729
+    try std.testing.expectEqual(@as(u32, 31730), limit); // exclusive bound
+    try std.testing.expectEqual(@as(u32, 32767), 1040 + (limit - 1 - 2));
+    // no foreign volume: the BPB's own cluster count is the bound
+    try std.testing.expectEqual(@as(u32, 64496 + 2), fat32_util.allocLimitCluster(1040, 1, 64496, 0));
+    // a foreign volume beyond the BPB's own end changes nothing
+    try std.testing.expectEqual(@as(u32, 64496 + 2), fat32_util.allocLimitCluster(1040, 1, 64496, 1 << 20));
+    // 8 sectors per cluster: a cluster that would straddle the boundary is excluded
+    try std.testing.expectEqual(@as(u32, 2 + (32768 - 1040) / 8), fat32_util.allocLimitCluster(1040, 8, 8062, 32768));
+    // a foreign volume inside the FAT32 metadata leaves nothing to allocate
+    try std.testing.expectEqual(@as(u32, 2), fat32_util.allocLimitCluster(1040, 1, 64496, 512));
+}

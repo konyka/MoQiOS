@@ -82,7 +82,7 @@ fn flushDiscard() void {
     }
 }
 
-const DISK_LBA_OFFSET: u64 = 32768;
+pub const DISK_LBA_OFFSET: u64 = 32768;
 
 var group_descs_phys: u64 = 0;
 var group_descs_virt: u64 = 0;

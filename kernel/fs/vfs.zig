@@ -2501,6 +2501,7 @@ pub fn mountFs(source: []const u8, target: []const u8, fs_type: []const u8, flag
     } else if (eqlStr(fs_type, "ext2")) {
         const ext2 = @import("ext2.zig");
         ext2.init();
+        if (ext2.isActive()) @import("fat32.zig").shared_disk_foreign_lba = @intCast(ext2.DISK_LBA_OFFSET);
     } else if (eqlStr(fs_type, "vfat") or eqlStr(fs_type, "fat32")) {
         const fat32 = @import("fat32.zig");
         fat32.init();

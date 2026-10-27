@@ -145,6 +145,20 @@ pub fn fatEntryValue(sector_buf: []const u8, offset: u32) ?u32 {
 
 // ─── Cluster classification (28-bit masked) ────────────────────────────────
 
+/// Exclusive upper bound on allocatable cluster numbers. `foreign_lba` is the
+/// first sector of another volume that shares the disk with this FAT32 volume
+/// (0 when there is none). The BPB of the boot disk claims the whole disk even
+/// though ext2 starts at LBA 32768, so without this bound the allocator handed
+/// out clusters that lie inside ext2. A cluster that would straddle the
+/// boundary is excluded too.
+pub fn allocLimitCluster(data_start: u32, sectors_per_cluster: u8, total_data_clusters: u32, foreign_lba: u32) u32 {
+    const own = total_data_clusters + 2;
+    if (foreign_lba == 0 or sectors_per_cluster == 0) return own;
+    if (foreign_lba <= data_start) return 2;
+    const fits: u32 = (foreign_lba - data_start) / @as(u32, sectors_per_cluster);
+    return @min(own, fits + 2);
+}
+
 /// Clusters a file's chain holds for `size` bytes. A file created empty
 /// already owns one cluster (createFile preallocates it), so an empty file
 /// with a first cluster counts as one — the first write must reuse it rather

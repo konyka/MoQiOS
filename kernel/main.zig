@@ -257,6 +257,8 @@ export fn _start() callconv(.c) noreturn {
     // ext2 filesystem (on first virtio-blk disk at LBA offset 32768)
     const ext2 = @import("fs/ext2.zig");
     ext2.init();
+    // FAT32 and ext2 share the boot disk; FAT32 must not allocate into ext2.
+    if (ext2.isActive()) @import("fs/fat32.zig").shared_disk_foreign_lba = @intCast(ext2.DISK_LBA_OFFSET);
 
     // v53.33: Register writeback flush callbacks for eviction-time flushing
     // (SK-46: shared boot fragment).

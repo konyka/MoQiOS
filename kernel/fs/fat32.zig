@@ -70,6 +70,10 @@ var fat_cache_sector: u32 = 0xFFFFFFFF;
 var fat_cache_phys: u64 = 0;
 var fat_cache_buf_virt: u64 = 0;
 var last_free_cluster: u32 = 2; // v53.38: allocCluster scan cursor (O(N) vs O(N×M))
+/// First LBA of another volume on the same disk (0 = none). The boot disk
+/// carries FAT32 at LBA 0 and ext2 at ext2.DISK_LBA_OFFSET; the FAT32 BPB
+/// still claims the whole disk, so allocations must stop short of ext2.
+pub var shared_disk_foreign_lba: u32 = 0;
 
 // G5 TRIM: extents of freed clusters accumulate here and are coalesced into
 // maximal contiguous sector ranges before issuing block_dev.discard. Static
@@ -681,7 +685,8 @@ fn setFATEntry(cluster: u32, value: u32) bool {
 fn allocCluster() ?u32 {
     const entries_per_sector = @as(u32, fat32_bytes_per_sector) / 4;
     const total_fat_entries = fat32_fat_size_sectors * entries_per_sector;
-    const max_cluster = if (fat32_total_data_clusters + 2 < total_fat_entries) fat32_total_data_clusters + 2 else total_fat_entries;
+    const by_bpb = fat_util.allocLimitCluster(fat32_data_start, fat32_sectors_per_cluster, fat32_total_data_clusters, shared_disk_foreign_lba);
+    const max_cluster = if (by_bpb < total_fat_entries) by_bpb else total_fat_entries;
 
     // v53.38: Resume scan from cursor — O(N) amortized vs O(N×M) from cluster 2
     var cluster: u32 = last_free_cluster;
