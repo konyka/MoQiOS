@@ -3,6 +3,7 @@ pub const Credentials = struct {
     euid: u32,
     egid: u32,
     cap_sys_admin: bool = false,
+    groups: []const u32 = &.{},
 };
 
 pub const Owner = struct {
@@ -16,7 +17,7 @@ pub fn modeAllows(mode: u32, owner: Owner, credentials: Credentials, read: bool,
     if (credentials.cap_sys_admin) return true;
     const shift: u5 = if (credentials.euid == owner.uid)
         6
-    else if (credentials.egid == owner.gid)
+    else if (@import("../proc/group_policy.zig").member(credentials.egid, credentials.groups, owner.gid))
         3
     else
         0;

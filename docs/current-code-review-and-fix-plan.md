@@ -4445,6 +4445,21 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   - 测试工具注意：本仓库的 msgctl 号是 159（不是 Linux 的 71）；第一次写的场景 D 用错了号，结果两项“失败”与内核无关，已改正。
   - 验证：host 700/700；hello115 45 项全部 ok。变异（确认重新编译）：`dac.allows` 恢复 `euid == 0` 分支 → host 1 项失败、hello115
     “不能打开 0000 文件”FAIL。门禁：三架构构建通过，五组冒烟 hello114 各 302 ok、hello115 各 45 ok、0 FAIL、0 次内核态故障，stress 5/5。
+- **第三十五轮：实现补充组（前几轮“未解决”中的一项）**：
+  - 问题：内核没有补充组，`getgroups`/`setgroups` 不存在；权限位的组类只比较有效 gid，所以通过附加组授予的访问（例如 0640
+    root:60 文件给组 60 的成员读）一律被拒，chown 时属主也只能把组改成自己的有效 gid。
+  - 实现：任务结构增加 `groups[32]`/`ngroups`，fork/clone 继承、execve 保留。纯函数 `proc/group_policy.zig`：`member`、`get`（size 0
+    报数量；缓冲区小于数量 EINVAL）、`checkSet`（需要 CAP_SETGID；超过 32 个或负数 EINVAL）。系统调用 `getgroups`=#487、
+    `setgroups`=#488（本系统原生编号，Linux 编号 115/116 在这里已被 TCP 调用占用）。`dac.allows`、`rofs_access_policy.allows`、
+    `sysv_policy.modeAllows`、SysV shm 的 attach 检查都改用 `member`；凭证结构新增 `groups` 切片，各调用点从当前任务填入。
+    tmpfs/vfs 那些只接收 (euid, egid, caps) 参数的路径用 `proc/current_groups.forCaller`：只有参数确实来自当前用户任务时才取它的组，
+    内核内部的合成凭证不带组。新增 `dac.mayChownIn`：属主可把组改成自己所属的任一组。
+  - RED：hello115 场景 E（以 root 用 setresgid 建 root:60/root:70 文件和 0640 队列，setgroups({50,60}) 后降为 1000:1000 逐项检查），
+    未修改内核上 10 项 FAIL。
+  - 验证：host 701/701（新增补充组策略测试）；hello115 67 项全部 ok。变异（确认重新编译）：`member` 忽略补充组 → host 1 项失败、
+    hello115 3 项 FAIL（tmpfs/ext2 组成员读取）。门禁：三架构构建通过，五组冒烟 hello114 各 302 ok、hello115 各 67 ok、0 FAIL、
+    0 次内核态故障，stress 5/5。
+  - 没做的：SysV IPC 的 IPC_SET 只改 mode，不能改属主/属组；文件 capability、SECBIT 不支持。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；

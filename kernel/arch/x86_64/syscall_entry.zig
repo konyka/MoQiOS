@@ -2608,6 +2608,12 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         486 => { // moqipc_grant_cap_to(tid, endpoint, rights)
             frame.rax = @bitCast(syscallGrantCapTo(@truncate(frame.rdi), @truncate(frame.rsi), @truncate(frame.rdx)));
         },
+        487 => { // getgroups(size, list)
+            frame.rax = @bitCast(cred_mod.getgroups(@bitCast(frame.rdi), frame.rsi));
+        },
+        488 => { // setgroups(size, list) — CAP_SETGID
+            frame.rax = @bitCast(cred_mod.setgroups(@bitCast(frame.rdi), frame.rsi));
+        },
         else => {
             serial.writeString("[syscall] unknown syscall: 0x");
             fmt.writeHex(syscall_nr);
@@ -2786,6 +2792,7 @@ fn ext2Who() @import("../../fs/ext2.zig").Who {
         .cap_fowner = cur.effective_caps.cap_fowner,
         .cap_chown = cur.effective_caps.cap_chown,
         .cap_dac_override = cur.effective_caps.cap_dac_override,
+        .groups = cur.groups[0..cur.ngroups],
     };
 }
 
@@ -3559,7 +3566,7 @@ fn rofsAccess(cur: anytype, name: []const u8, mode: u32) ?i64 {
     var norm: [256]u8 = undefined;
     const abs = vfs_mod.normalizeAbs(full, &norm) orelse return null;
     const route = vfs_mod.rofsRoute(abs) orelse return null;
-    const creds: rofs.Creds = .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override };
+    const creds: rofs.Creds = .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] };
     // Resolve through search checks only: the target's own bits are judged below.
     const reach = rofs.reach(route.slot, route.rest, creds);
     if (reach < 0) return reach;
@@ -4520,7 +4527,7 @@ fn rofsStatfsByPath(path_ptr: u64, buf_ptr: u64) ?i64 {
     const route = vfs_mod.rofsRoute(abs) orelse return null;
     // The path must exist and be searchable by this caller (statfs needs no
     // read permission on the file itself, as on Linux).
-    const creds: rofs.Creds = .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override };
+    const creds: rofs.Creds = .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] };
     const reach = rofs.reach(route.slot, route.rest, creds);
     if (reach < 0) return reach;
     return rofsStatfsReply(rofs.statFs(route.slot, null), buf_ptr);

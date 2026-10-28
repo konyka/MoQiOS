@@ -6429,3 +6429,28 @@ test "only hello115 starts as root with just the ID capabilities" {
     try std.testing.expectEqual(@as(u32, 1000), untrusted.uid);
     try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(untrusted.caps)));
 }
+
+test "supplementary groups select the group class and widen chown targets" {
+    const gp = kt.group_policy;
+    const sup = [_]u32{ 50, 60 };
+    try std.testing.expect(gp.member(1000, &sup, 1000));
+    try std.testing.expect(gp.member(1000, &sup, 60));
+    try std.testing.expect(!gp.member(1000, &sup, 70));
+    // 0640 root:60 file, caller 1000:1000 in supplementary group 60 reads it
+    const meta: dac.Metadata = .{ .mode = 0o640, .uid = 0, .gid = 60 };
+    try std.testing.expect(dac.allows(meta, .{ .euid = 1000, .egid = 1000, .groups = &sup }, .read));
+    try std.testing.expect(!dac.allows(meta, .{ .euid = 1000, .egid = 1000, .groups = &sup }, .write));
+    try std.testing.expect(!dac.allows(meta, .{ .euid = 1000, .egid = 1000 }, .read));
+    // the owner may hand its file to a supplementary group, not to a foreign one
+    try std.testing.expect(dac.mayChownIn(1000, 1000, 1000, 1000, &sup, false, null, 50));
+    try std.testing.expect(!dac.mayChownIn(1000, 1000, 1000, 1000, &sup, false, null, 70));
+    // getgroups/setgroups argument rules
+    try std.testing.expectEqual(gp.GetResult{ .count = 2 }, gp.get(0, 2));
+    try std.testing.expectEqual(gp.GetResult{ .copy = 2 }, gp.get(5, 2));
+    try std.testing.expectEqual(gp.GetResult.einval, gp.get(1, 2));
+    try std.testing.expectEqual(gp.GetResult.einval, gp.get(-1, 0));
+    try std.testing.expectEqual(gp.SetCheck.eperm, gp.checkSet(1, false));
+    try std.testing.expectEqual(gp.SetCheck.einval, gp.checkSet(gp.NGROUPS_MAX + 1, true));
+    try std.testing.expectEqual(gp.SetCheck.einval, gp.checkSet(-1, true));
+    try std.testing.expectEqual(gp.SetCheck.ok, gp.checkSet(0, true));
+}

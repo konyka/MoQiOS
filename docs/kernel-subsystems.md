@@ -1892,6 +1892,9 @@ const SysCap = packed struct {
   chmod/sticky 目录删除用 `CAP_FOWNER`，chown 用 `CAP_CHOWN`，SysV IPC 用 `CAP_SYS_ADMIN`，POSIX MQ unlink 用 `CAP_DAC_OVERRIDE`，
   nice/调度用 `CAP_SYS_NICE`，kcmp 用 `CAP_SYS_PTRACE`。root 启动时持有全部 capability，因此行为不变；用 `capset` 或降权丢掉
   capability 的 uid 0 进程与普通用户一样受权限位约束。
+- 补充组（`proc/group_policy.zig`）：`getgroups`(#487)/`setgroups`(#488，本系统编号；需要 `CAP_SETGID`，最多 32 个)。
+  fork/clone 继承、execve 保留。属于有效 gid 或任一补充组即选中权限位的组类（ext2/tmpfs/只读卷 DAC、SysV IPC）；文件属主可把文件的组改成
+  自己所属的任一组。
 - `reboot`：要求 `CAP_SYS_BOOT`
 - `mount`：要求 `CAP_SYS_ADMIN`
 

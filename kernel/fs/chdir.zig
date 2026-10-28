@@ -33,7 +33,7 @@ pub fn chdir(path_ptr: u64) i64 {
 
     // A target inside a mounted ext4/NTFS volume must exist and be a directory.
     if (vfs_mod.rofsRoute(out_buf[0..write_pos])) |route| {
-        switch (@import("rofs.zig").open(route.slot, route.rest, true, .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override })) {
+        switch (@import("rofs.zig").open(route.slot, route.rest, true, .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] })) {
             .err => |e| return e,
             .ok => |o| if (o.kind != .directory) return -20, // ENOTDIR
         }

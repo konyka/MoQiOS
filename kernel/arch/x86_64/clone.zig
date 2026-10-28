@@ -407,6 +407,8 @@ pub fn clone(
     child.egid = parent.egid;
     child.suid = parent.suid;
     child.sgid = parent.sgid;
+    child.groups = parent.groups;
+    child.ngroups = parent.ngroups;
     child.umask_val = @import("../../proc/creation_metadata.zig").inheritedTaskUmask(parent.umask_val);
     child.effective_caps = parent.effective_caps;
     child.permitted_caps = parent.permitted_caps;

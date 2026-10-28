@@ -383,7 +383,7 @@ const dac = @import("../fs/dac.zig");
 
 fn callerCreds() dac.Credentials {
     const cur = sched.currentTask() orelse return .{ .euid = 0, .egid = 0, .cap_dac_override = true };
-    return .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override };
+    return .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] };
 }
 
 fn accessFor(oflag: u32) dac.Access {

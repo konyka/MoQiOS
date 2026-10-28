@@ -52,7 +52,7 @@ const SEMGET_FLAGS = IPC_CREAT | IPC_EXCL | 0o777;
 
 fn credentials() sysv_policy.Credentials {
     if (sched.currentTaskIndex()) |idx| {
-        if (task.getTask(idx)) |t| return .{ .euid = t.euid, .egid = t.egid, .cap_sys_admin = t.effective_caps.cap_sys_admin };
+        if (task.getTask(idx)) |t| return .{ .euid = t.euid, .egid = t.egid, .cap_sys_admin = t.effective_caps.cap_sys_admin, .groups = t.groups[0..t.ngroups] };
     }
     return .{ .euid = 0, .egid = 0, .cap_sys_admin = true };
 }

@@ -28,7 +28,7 @@ fn tmpfsCaller() ?@import("../fs/tmpfs.zig").Remover {
 
 fn caller() ?@import("../fs/ext2.zig").Who {
     const cur = sched.currentTask() orelse return null;
-    return .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override };
+    return .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] };
 }
 
 /// unlink(path_ptr) -> 0 or -errno.

@@ -18,6 +18,7 @@ pub const Creds = struct {
     euid: u32,
     egid: u32,
     cap_dac_override: bool = false,
+    groups: []const u32 = &.{},
 };
 
 pub const R: u32 = 4;
@@ -28,7 +29,7 @@ pub const S_IFMT: u32 = 0o170000;
 pub const S_IFDIR: u32 = 0o040000;
 
 fn classBits(m: Meta, c: Creds) u32 {
-    const shift: u5 = if (c.euid == m.uid) 6 else if (c.egid == m.gid) 3 else 0;
+    const shift: u5 = if (c.euid == m.uid) 6 else if (@import("../proc/group_policy.zig").member(c.egid, c.groups, m.gid)) 3 else 0;
     return (m.mode >> shift) & 0o7;
 }
 

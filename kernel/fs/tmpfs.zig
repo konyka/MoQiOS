@@ -300,7 +300,7 @@ pub fn tmpfsOpenAuthorized(path: []const u8, create: bool, is_dir: bool, euid: u
         if (!entry.is_dir) {
             const decision = dac.decideExistingOpen(
                 .{ .mode = entry.mode, .uid = entry.uid, .gid = entry.gid },
-                .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override },
+                .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override, .groups = @import("../proc/current_groups.zig").forCaller(euid, egid) },
                 flags,
             );
             if (!decision.allowed) return -13;
@@ -311,7 +311,7 @@ pub fn tmpfsOpenAuthorized(path: []const u8, create: bool, is_dir: bool, euid: u
     }
 
     if (create) {
-        if (!dac.allows(dirMeta(parent), .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override }, dac.Access.write_search)) return -13;
+        if (!dac.allows(dirMeta(parent), .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override, .groups = @import("../proc/current_groups.zig").forCaller(euid, egid) }, dac.Access.write_search)) return -13;
         const idx = createEntryLocked(name, name_len, parent, is_dir, requested_mode, umask_val, euid, egid) orelse return -1;
         return @intCast(idx);
     }
@@ -501,7 +501,7 @@ pub fn tmpfsUnlinkAuthorized(path: []const u8, who: ?Remover) i64 {
     const entry = &entries[idx];
 
     if (who) |w| {
-        const creds: dac.Credentials = .{ .euid = w.euid, .egid = w.egid, .cap_dac_override = w.effective_caps.cap_dac_override };
+        const creds: dac.Credentials = .{ .euid = w.euid, .egid = w.egid, .cap_dac_override = w.effective_caps.cap_dac_override, .groups = @import("../proc/current_groups.zig").forCaller(w.euid, w.egid) };
         if (!dac.mayRemoveEntry(dirMeta(parent), entry.uid, creds, w.effective_caps.cap_fowner)) return -13;
     }
 
@@ -575,7 +575,7 @@ pub fn tmpfsChownIdx(idx: u8, uid: ?u32, gid: ?u32, who: Remover) i64 {
 
 fn chownLocked(idx: u8, uid: ?u32, gid: ?u32, who: Remover) i64 {
     const e = &entries[idx];
-    if (!dac.mayChown(e.uid, e.gid, who.euid, who.egid, who.effective_caps.cap_chown, uid, gid)) return -1;
+    if (!dac.mayChownIn(e.uid, e.gid, who.euid, who.egid, @import("../proc/current_groups.zig").forCaller(who.euid, who.egid), who.effective_caps.cap_chown, uid, gid)) return -1;
     if (uid) |u| e.uid = u;
     if (gid) |g| e.gid = g;
     return 0;
@@ -694,7 +694,7 @@ pub fn tmpfsCanListDir(idx: u8, euid: u32, egid: u32, effective_caps: capability
     if (!entry.active or entry.deleted or !entry.is_dir) return false;
     return dac.canListDirectory(
         .{ .mode = entry.mode, .uid = entry.uid, .gid = entry.gid },
-        .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override },
+        .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override, .groups = @import("../proc/current_groups.zig").forCaller(euid, egid) },
     );
 }
 

@@ -134,6 +134,8 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.egid = parent.egid;
     child.suid = parent.suid;
     child.sgid = parent.sgid;
+    child.groups = parent.groups;
+    child.ngroups = parent.ngroups;
     child.umask_val = @import("creation_metadata.zig").inheritedTaskUmask(parent.umask_val);
     child.pgid = parent.pgid;
     child.sid = parent.sid;

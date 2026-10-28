@@ -21,6 +21,8 @@ pub const Credentials = struct {
     euid: u32,
     egid: u32,
     cap_dac_override: bool = false,
+    /// Supplementary groups: membership in any of them selects the group class.
+    groups: []const u32 = &.{},
 };
 
 pub const OpenDecision = struct {
@@ -49,7 +51,7 @@ pub fn allows(metadata: Metadata, credentials: Credentials, access: Access) bool
 
     const shift: u5 = if (credentials.euid == metadata.uid)
         6
-    else if (credentials.egid == metadata.gid)
+    else if (@import("../proc/group_policy.zig").member(credentials.egid, credentials.groups, metadata.gid))
         3
     else
         0;
@@ -80,16 +82,20 @@ pub fn mayChmod(file_uid: u32, euid: u32, cap_fowner: bool) bool {
 
 /// chown/fchown/lchown. `new_uid`/`new_gid` of null mean "leave unchanged"
 /// (the -1 argument). Giving a file to another user needs CAP_CHOWN; the
-/// owner may change the group only to its own effective group (supplementary
-/// groups are not tracked), anything else needs CAP_CHOWN. Re-stating the
-/// current ids is always allowed for the owner.
+/// owner may change the group only to a group it belongs to (its effective
+/// group or a supplementary group), anything else needs CAP_CHOWN.
+/// Re-stating the current ids is always allowed for the owner.
 pub fn mayChown(file_uid: u32, file_gid: u32, euid: u32, egid: u32, cap_chown: bool, new_uid: ?u32, new_gid: ?u32) bool {
+    return mayChownIn(file_uid, file_gid, euid, egid, &.{}, cap_chown, new_uid, new_gid);
+}
+
+pub fn mayChownIn(file_uid: u32, file_gid: u32, euid: u32, egid: u32, groups: []const u32, cap_chown: bool, new_uid: ?u32, new_gid: ?u32) bool {
     if (cap_chown) return true;
     if (new_uid) |u| {
         if (u != file_uid) return false;
     }
     if (new_gid) |g| {
-        if (g != file_gid and (euid != file_uid or g != egid)) return false;
+        if (g != file_gid and (euid != file_uid or !@import("../proc/group_policy.zig").member(egid, groups, g))) return false;
     }
     if ((new_uid != null or new_gid != null) and euid != file_uid) {
         // A non-owner re-stating the current ids changes nothing, but Linux

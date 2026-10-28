@@ -1,6 +1,6 @@
 // kernel/proc/credentials.zig — Credential management syscalls
 //
-// setuid/setgid/setreuid/setregid/setresuid/getresuid/setresgid/getresgid/unshare
+// setuid/setgid/setreuid/setregid/setresuid/getresuid/setresgid/getresgid/getgroups/setgroups
 
 const sched = @import("sched.zig");
 const task_mod = @import("task.zig");
@@ -127,5 +127,47 @@ pub fn getresgid120(rgid_ptr: u64, egid_ptr: u64, sgid_ptr: u64) i64 {
     if (copy.copyToUser(@ptrFromInt(rgid_ptr), @as([*]const u8, @ptrCast(&t.gid))[0..4], 4) != 4) return -14;
     if (copy.copyToUser(@ptrFromInt(egid_ptr), @as([*]const u8, @ptrCast(&t.egid))[0..4], 4) != 4) return -14;
     if (copy.copyToUser(@ptrFromInt(sgid_ptr), @as([*]const u8, @ptrCast(&t.sgid))[0..4], 4) != 4) return -14;
+    return 0;
+}
+
+const groups = @import("group_policy.zig");
+
+/// getgroups(size, list) — supplementary group IDs of the caller.
+pub fn getgroups(size: i64, list_ptr: u64) i64 {
+    const t = getCurrentTask() orelse return -1;
+    const n = t.ngroups;
+    switch (groups.get(size, n)) {
+        .einval => return -22,
+        .count => |c| return c,
+        .copy => |c| {
+            if (c == 0) return 0;
+            const bytes = c * 4;
+            if (list_ptr == 0 or !copy.validateUserBufferWritable(list_ptr, bytes)) return -14;
+            if (copy.copyToUser(@ptrFromInt(list_ptr), @as([*]const u8, @ptrCast(&t.groups))[0..bytes], bytes) != bytes) return -14;
+            return c;
+        },
+    }
+}
+
+/// setgroups(size, list) — replace the supplementary groups (CAP_SETGID).
+pub fn setgroups(size: i64, list_ptr: u64) i64 {
+    var buf: [groups.NGROUPS_MAX]u32 = undefined;
+    const caller = getCurrentTask() orelse return -1;
+    switch (groups.checkSet(size, caller.effective_caps.cap_setgid)) {
+        .eperm => return -1,
+        .einval => return -22,
+        .ok => {},
+    }
+    const n: u32 = @intCast(size);
+    if (n > 0) {
+        const bytes = n * 4;
+        if (list_ptr == 0 or !copy.validateUserBuffer(list_ptr, bytes)) return -14;
+        if (copy.copyFromUser(@as([*]u8, @ptrCast(&buf))[0..bytes], @ptrFromInt(list_ptr), bytes) != bytes) return -14;
+    }
+    const lock_flags = task_mod.lockTask();
+    defer task_mod.unlockTask(lock_flags);
+    const t = getCurrentTaskMut() orelse return -1;
+    @memcpy(t.groups[0..n], buf[0..n]);
+    t.ngroups = n;
     return 0;
 }

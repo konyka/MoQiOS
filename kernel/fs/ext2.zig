@@ -3214,9 +3214,10 @@ pub const Who = struct {
     cap_fowner: bool = false,
     cap_chown: bool = false,
     cap_dac_override: bool = false,
+    groups: []const u32 = &.{},
 
     fn creds(self: Who) @import("dac.zig").Credentials {
-        return .{ .euid = self.euid, .egid = self.egid, .cap_dac_override = self.cap_dac_override };
+        return .{ .euid = self.euid, .egid = self.egid, .cap_dac_override = self.cap_dac_override, .groups = self.groups };
     }
 };
 
@@ -3238,7 +3239,7 @@ fn chownLocked(inode_num: u32, uid: u16, gid: u16, who: Who) i64 {
     const dac = @import("dac.zig");
     const want_uid: ?u32 = if (uid != 0xFFFF) uid else null;
     const want_gid: ?u32 = if (gid != 0xFFFF) gid else null;
-    if (!dac.mayChown(inodeUid(&inode), inodeGid(&inode), who.euid, who.egid, who.cap_chown, want_uid, want_gid)) return -1; // EPERM
+    if (!dac.mayChownIn(inodeUid(&inode), inodeGid(&inode), who.euid, who.egid, who.groups, who.cap_chown, want_uid, want_gid)) return -1; // EPERM
     if (uid != 0xFFFF) inode.uid = uid;
     if (gid != 0xFFFF) inode.gid = gid;
     if (!writeInode(inode_num, &inode)) return -5;

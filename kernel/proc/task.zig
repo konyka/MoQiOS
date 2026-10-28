@@ -264,6 +264,10 @@ pub const Task = struct {
     suid: u32 = 0,
     /// Saved set-group-ID. Default 0 (root).
     sgid: u32 = 0,
+    /// Supplementary groups (setgroups/getgroups); `ngroups` entries of
+    /// `groups` are valid. Inherited on fork/clone, kept across execve.
+    groups: [@import("group_policy.zig").NGROUPS_MAX]u32 = @splat(0),
+    ngroups: u32 = 0,
 
     /// Wait queue for blocking operations (waitpid, pipe, etc.).
     /// The task sleeps on this queue until woken.

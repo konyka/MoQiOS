@@ -81,7 +81,7 @@ pub fn readlinkAt(dirfd: i64, path_ptr: u64, buf_ptr: u64, bufsiz: u64) i64 {
             if (vfs_mod.rofsRoute(abs)) |route| {
                 const rofs = @import("rofs.zig");
                 const cur_task = sched_mod.currentTask();
-                const creds: rofs.Creds = if (cur_task) |ct| .{ .euid = ct.euid, .egid = ct.egid, .cap_dac_override = ct.effective_caps.cap_dac_override } else .{ .euid = 0, .egid = 0, .cap_dac_override = true };
+                const creds: rofs.Creds = if (cur_task) |ct| .{ .euid = ct.euid, .egid = ct.egid, .cap_dac_override = ct.effective_caps.cap_dac_override, .groups = ct.groups[0..ct.ngroups] } else .{ .euid = 0, .egid = 0, .cap_dac_override = true };
                 switch (rofs.open(route.slot, route.rest, false, creds)) {
                     .err => |e| return e,
                     .ok => |o| {

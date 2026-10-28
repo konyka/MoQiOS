@@ -136,7 +136,7 @@ pub fn shmget(key: i32, size: u64, shmflg: i32) i64 {
     const owner_uid: u32 = if (owner) |task| task.euid else 0;
     const owner_gid: u32 = if (owner) |task| task.egid else 0;
     const credentials: sysv_policy.Credentials = if (owner) |task|
-        .{ .euid = task.euid, .egid = task.egid, .cap_sys_admin = task.effective_caps.cap_sys_admin }
+        .{ .euid = task.euid, .egid = task.egid, .cap_sys_admin = task.effective_caps.cap_sys_admin, .groups = task.groups[0..task.ngroups] }
     else
         .{ .euid = 0, .egid = 0, .cap_sys_admin = true };
     // Phase 1 (locked): lookup existing segment and validate the request.
@@ -287,7 +287,7 @@ pub fn shmat(shmid: u32, shmaddr: u64, shmflg: u64) i64 {
     if (!task.effective_caps.cap_sys_admin) {
         const class_bits: u5 = if (task.euid == seg.perm.uid)
             6
-        else if (task.egid == seg.perm.gid)
+        else if (@import("../proc/group_policy.zig").member(task.egid, task.groups[0..task.ngroups], seg.perm.gid))
             3
         else
             0;
@@ -541,6 +541,7 @@ pub fn shmctl(shmid: u32, cmd: i32, buf: u64) i64 {
                     .euid = task.euid,
                     .egid = task.egid,
                     .cap_sys_admin = task.effective_caps.cap_sys_admin,
+                    .groups = task.groups[0..task.ngroups],
                 };
                 if (!sysv_policy.modeAllows(seg.perm.mode, segment_owner, credentials, true, false)) {
                     shm_lock.release(flags);

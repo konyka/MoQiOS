@@ -835,7 +835,7 @@ pub const FdTable = struct {
         // target shadows same-named paths of the flat filesystems, as a
         // real mount does. The volumes are read-only: anything that would
         // create, truncate or write is refused before touching the volume.
-        if (rofsOpen(self, slot, name, flags, status, .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override })) |res| return res;
+        if (rofsOpen(self, slot, name, flags, status, .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override, .groups = @import("../proc/current_groups.zig").forCaller(euid, egid) })) |res| return res;
 
         // /dev — devfs device nodes (fs/devfs.zig). Built-in nodes (null,
         // zero, full, random, urandom, kmsg, pci, tty, devfs-watch) are
@@ -1047,7 +1047,7 @@ pub const FdTable = struct {
 
         const ext2 = @import("ext2.zig");
         if (ext2.isActive()) {
-            const fi = ext2.openFileAs(name, .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override });
+            const fi = ext2.openFileAs(name, .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override, .groups = @import("../proc/current_groups.zig").forCaller(euid, egid) });
             if (fi == -13) {
                 self.freeFd(slot);
                 return -13; // EACCES: a directory on the path denies search
@@ -1064,7 +1064,7 @@ pub const FdTable = struct {
                     self.freeFd(slot);
                     return -5;
                 };
-                if (!dac.decideExistingOpen(meta, .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override }, flags).allowed) {
+                if (!dac.decideExistingOpen(meta, .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override, .groups = @import("../proc/current_groups.zig").forCaller(euid, egid) }, flags).allowed) {
                     ext2.closeFile(idx);
                     self.freeFd(slot);
                     return -13; // EACCES
@@ -1087,7 +1087,7 @@ pub const FdTable = struct {
             // ext2 create file if O_CREAT
             if (o_creat) {
                 const cm = @import("../proc/creation_metadata.zig").decide(null, .regular_file, requested_mode, umask_val, euid, egid).metadata;
-                const ci = ext2.createFile(name, .{ .uid = cm.uid, .gid = cm.gid, .perm = @truncate(cm.mode) }, .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override });
+                const ci = ext2.createFile(name, .{ .uid = cm.uid, .gid = cm.gid, .perm = @truncate(cm.mode) }, .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override, .groups = @import("../proc/current_groups.zig").forCaller(euid, egid) });
                 if (ci >= 0) {
                     const idx: u32 = @intCast(ci);
                     self.fds[slot] = .{
