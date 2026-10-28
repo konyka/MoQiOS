@@ -4387,6 +4387,22 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     0 FAIL、0 次内核态故障，stress 5/5。
   - 没做的：提交的 `disk.img` 本身仍带着旧的 e2fsck 错误（inode 12/13/14 的额外大小、块 100 重复引用等），需重做基线并更新
     `disk.img.manifest`，单独提交。
+- **第三十一轮：从干净的 FAT32 启动一次，fsck.fat 报孤立长文件名和空闲簇统计错误**：
+  - 做法：用 `fsck.fat -a` 修好基线副本（再删掉 4 个重复的 `fsync_probe.txt`），e2fsck/fsck.fat 都 0 错后，用当前内核启动一次。
+    `fsck.fat -n` 报 12 条 “Orphaned long file name part”（`hello112-*`、`hello90-*`、`/h114-s-*`、`/hello114-*` 等测试删掉的
+    文件），以及 “Free cluster summary wrong (64482 vs. really 64479)”，rc=1。
+  - 原因 1：`deleteFileInternal` 只把短目录项的首字节写成 0xE5，前面属于这个文件的 LFN 槽原样留在盘上。本仓库的扫描已能跳过孤立
+    LFN（第二十六轮），但其他系统和 fsck 会看到残片，目录槽也一直不能复用。修复：扫描时记录短项前面连续的 LFN 槽（位置和内容，
+    可跨扇区）；纯函数 `fat32_util.ownedLfnRun` 只认“以 0x40 标记开头、序号递减到 1、校验和与短名一致”的那一段，把它和短项一起
+    标成 0xE5。同扇区的随短项一次写入；更早扇区的随后逐个写（短项已删除，即使失败也只是留一个无主的 LFN 段）。更早的孤立段不动。
+  - 原因 2：FSInfo 扇区里的空闲簇数和下一个空闲簇提示，驱动从来不维护，FAT 一变化就过时。修复：BPB 解析出 FSInfo 扇区位置
+    （`Bpb.fsinfo_lba`）；每次挂载后第一次改 FAT 之前，按规范把这两个字段写成 0xFFFFFFFF（“未知”，由读取方自己统计）。
+    签名不对时不改。读这个扇区用独立的页，不碰可能装着调用者数据的 `sector_buf`/`write_buf`。
+  - 验证：host 698/698（新增 `ownedLfnRun`、`invalidateFsInfo`、BPB FSInfo 位置三个测试）。同一块干净盘用修复后的内核启动一次：
+    `fsck.fat -n` rc=0（只剩规范允许的 “Free cluster summary uninitialized”），`e2fsck -fn` rc=0，hello114 302 ok、0 FAIL。
+    变异（确认重新编译）：`owned` 恒为 0 且不写 FSInfo → 同样的 12 条孤立 LFN 中的 10 条以上和 “Free cluster summary wrong”
+    重新出现。门禁：三架构构建通过，五组冒烟 `hello114` 各 302 ok、0 FAIL、0 次内核态故障，stress 5/5。
+  - FAT32 没有 rename，删除是唯一会留下 LFN 的路径。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；

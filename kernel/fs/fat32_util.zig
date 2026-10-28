@@ -56,6 +56,8 @@ pub const Bpb = struct {
     data_start: u32,
     sector_mask: u32,
     total_data_clusters: u32,
+    /// Absolute LBA of the FSInfo sector, 0 when the volume declares none.
+    fsinfo_lba: u32 = 0,
 };
 
 /// Parse and validate a FAT32 BPB from a 512-byte boot sector whose volume
@@ -93,7 +95,14 @@ pub fn parseBpb(buf: *const [512]u8, lba_start: u32) ?Bpb {
     const total_data_clusters = data_sectors / @as(u32, sectors_per_cluster);
     if (total_data_clusters == 0 or root_cluster < 2 or @as(u64, root_cluster - 2) >= total_data_clusters) return null;
 
+    const fsinfo_rel: u16 = @bitCast([2]u8{ buf[48], buf[49] });
+    const fsinfo_lba: u32 = if (fsinfo_rel != 0 and fsinfo_rel != 0xFFFF and fsinfo_rel < reserved_sectors)
+        lba_start + fsinfo_rel
+    else
+        0;
+
     return .{
+        .fsinfo_lba = fsinfo_lba,
         .bytes_per_sector = bytes_per_sector,
         .sectors_per_cluster = sectors_per_cluster,
         .reserved_sectors = reserved_sectors,
@@ -106,6 +115,19 @@ pub fn parseBpb(buf: *const [512]u8, lba_start: u32) ?Bpb {
         .sector_mask = sectors_per_cluster - 1,
         .total_data_clusters = total_data_clusters,
     };
+}
+
+/// Mark the FSInfo free-cluster count and next-free hint as unknown
+/// (0xFFFFFFFF). The driver does not track them, so once the FAT changes the
+/// stored values are stale; "unknown" is the spec-sanctioned way to say so.
+/// Returns false (and leaves the sector alone) when it is not a valid FSInfo.
+pub fn invalidateFsInfo(sector: []u8) bool {
+    if (sector.len < 512) return false;
+    const lead: u32 = @bitCast([4]u8{ sector[0], sector[1], sector[2], sector[3] });
+    const struc: u32 = @bitCast([4]u8{ sector[484], sector[485], sector[486], sector[487] });
+    if (lead != 0x41615252 or struc != 0x61417272) return false;
+    @memset(sector[488..496], 0xFF);
+    return true;
 }
 
 // ─── Cluster / FAT arithmetic ──────────────────────────────────────────────
@@ -364,6 +386,28 @@ fn utf8EncodeCp(cp: u32, out: []u8) ?u32 {
         return 4;
     }
     return null;
+}
+
+/// Number of trailing LFN slots in `slots` (forward-scan order, the run
+/// directly preceding a short entry) that belong to `short_name`: a chain
+/// that starts with the last-slot marker, counts down to sequence 1 and
+/// carries the short name's checksum. Deleting the file must tombstone
+/// exactly these; an older orphaned run in front of them is not touched.
+pub fn ownedLfnRun(slots: []const [*]const u8, short_name: *const [11]u8) u32 {
+    const sum = lfnChecksum(short_name);
+    var k: u32 = 0;
+    var expect_seq: u32 = 1;
+    var i = slots.len;
+    while (i > 0) {
+        i -= 1;
+        const e = slots[i];
+        if (lfnEntryChecksum(e) != sum or lfnSequence(e[0]) != expect_seq) return 0;
+        k += 1;
+        if (isLastLfnSlot(e[0])) return k;
+        expect_seq += 1;
+        if (expect_seq > MAX_LFN_SLOTS) return 0;
+    }
+    return 0;
 }
 
 /// Collects the LFN slots that precede a short entry during a forward

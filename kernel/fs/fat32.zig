@@ -64,6 +64,10 @@ var fat32_fat_size_sectors: u32 = 0;
 var write_buf_phys: u64 = 0;
 var write_buf_virt: u64 = 0;
 var fat32_total_data_clusters: u32 = 0;
+var fat32_fsinfo_lba: u32 = 0;
+/// FSInfo free-count/next-free are marked unknown before the first FAT
+/// change of this mount (the driver does not maintain them).
+var fsinfo_invalidated: bool = false;
 // v53.36: Single-sector FAT cache — 128x I/O reduction for sequential reads (P2 fix)
 // v53.37: DMA-safe buffer via PMM (Critical fix — BSS not in HHDM, virtToPhys invalid)
 var fat_cache_sector: u32 = 0xFFFFFFFF;
@@ -237,6 +241,8 @@ fn tryMountFAT32() void {
     fat32_sector_mask = bpb.sector_mask;
     fat32_fat_size_sectors = bpb.fat_size_sectors;
     fat32_total_data_clusters = bpb.total_data_clusters;
+    fat32_fsinfo_lba = bpb.fsinfo_lba;
+    fsinfo_invalidated = false;
     fat32_active = true;
 
     serial.writeString("[fs] FAT32 mounted: ");
@@ -647,7 +653,22 @@ fn zeroFileTail(first_cluster: u32, offset: u32) bool {
 /// Write one FAT entry. Returns false when the backing sector cannot be read
 /// on a cache miss — mirroring getFATEntry, the stale cache contents must not
 /// be modified and written back over an unread sector.
+fn invalidateFsInfoOnce() bool {
+    if (fsinfo_invalidated or fat32_fsinfo_lba == 0) return true;
+    // A private page: sector_buf/write_buf may hold the caller's in-flight data.
+    const phys = pmm.allocPage() orelse return false;
+    defer pmm.freePage(phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(phys));
+    if (virtio_blk.readSectors(fat32_fsinfo_lba, 1, buf) <= 0) return false;
+    if (fat_util.invalidateFsInfo(buf[0..512])) {
+        if (safeWriteSectors(fat32_fsinfo_lba, 1, buf) <= 0) return false;
+    }
+    fsinfo_invalidated = true;
+    return true;
+}
+
 fn setFATEntry(cluster: u32, value: u32) bool {
+    if (!invalidateFsInfoOnce()) return false;
     const fat_offset = cluster * 4;
     const sector = fat32_fat_start + fat_offset / @as(u32, fat32_bytes_per_sector);
     const offset = fat_offset % @as(u32, fat32_bytes_per_sector);
@@ -1462,6 +1483,13 @@ fn deleteFileInternal(file_idx: u32, allow_pending: bool) bool {
     var dir_cluster: u32 = fat32_root_cluster;
     var dir_safety: u32 = 0;
     var found_entry = allow_pending;
+    // LFN slots seen since the last non-LFN entry (they may sit in earlier
+    // sectors). The file's own long-name slots are tombstoned with it;
+    // leaving them behind makes fsck report orphaned LFN parts.
+    var lfn_raw: [fat_util.MAX_LFN_SLOTS][32]u8 = undefined;
+    var lfn_lba: [fat_util.MAX_LFN_SLOTS]u32 = undefined;
+    var lfn_off: [fat_util.MAX_LFN_SLOTS]u32 = undefined;
+    var lfn_n: u32 = 0;
     scan: while (!allow_pending and dir_cluster >= 2 and dir_cluster < 0x0FFFFFF8 and dir_safety < 65536) : (dir_safety += 1) {
         const base_lba = clusterToLBA(dir_cluster);
         var sec: u32 = 0;
@@ -1472,13 +1500,34 @@ fn deleteFileInternal(file_idx: u32, allow_pending: bool) bool {
             for (0..16) |i| {
                 const off: u32 = @intCast(i * 32);
                 if (buf[off] == 0x00) break :scan;
-                if (buf[off] == 0xE5) continue;
+                if (buf[off] == 0xE5) {
+                    lfn_n = 0;
+                    continue;
+                }
                 const attr = buf[off + 11];
-                if (fat_util.isLfnAttr(attr) or fat_util.isVolumeLabelAttr(attr)) continue;
+                if (fat_util.isLfnAttr(attr)) {
+                    if (fat_util.isLastLfnSlot(buf[off])) lfn_n = 0;
+                    if (lfn_n >= fat_util.MAX_LFN_SLOTS) lfn_n = 0;
+                    @memcpy(lfn_raw[lfn_n][0..32], buf[off .. off + 32]);
+                    lfn_lba[lfn_n] = lba;
+                    lfn_off[lfn_n] = off;
+                    lfn_n += 1;
+                    continue;
+                }
+                if (fat_util.isVolumeLabelAttr(attr)) {
+                    lfn_n = 0;
+                    continue;
+                }
 
                 const entry = buf + off;
                 if (fat_util.dirEntryFirstCluster(entry) == fi.first_cluster) {
+                    var ptrs: [fat_util.MAX_LFN_SLOTS][*]const u8 = undefined;
+                    for (0..lfn_n) |k| ptrs[k] = &lfn_raw[k];
+                    const owned = fat_util.ownedLfnRun(ptrs[0..lfn_n], entry[0..11]);
                     buf[off] = 0xE5;
+                    for (lfn_n - owned..lfn_n) |k| {
+                        if (lfn_lba[k] == lba) buf[lfn_off[k]] = 0xE5;
+                    }
                     // v53.52: abort if the tombstone never reached the disk —
                     // freeing the cluster chain below while the live entry
                     // still references it would hand those clusters to the
@@ -1488,8 +1537,17 @@ fn deleteFileInternal(file_idx: u32, allow_pending: bool) bool {
                         return false;
                     }
                     found_entry = true;
+                    // Slots in earlier sectors: best effort once the short
+                    // entry is gone (scans skip a run with no owner).
+                    for (lfn_n - owned..lfn_n) |k| {
+                        if (lfn_lba[k] == lba) continue;
+                        if (virtio_blk.readSectors(lfn_lba[k], 1, buf) <= 0) continue;
+                        buf[lfn_off[k]] = 0xE5;
+                        _ = safeWriteSectors(lfn_lba[k], 1, buf);
+                    }
                     break :scan;
                 }
+                lfn_n = 0;
             }
         }
         dir_cluster = getFATEntry(dir_cluster) orelse break :scan;

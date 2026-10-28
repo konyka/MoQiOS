@@ -6319,3 +6319,58 @@ test "ext2: a freed inode record is marked deleted for fsck" {
     eu.markInodeDeleted(&ino2, 0);
     try std.testing.expect(ino2.dtime != 0);
 }
+
+test "fat32: deleting a file tombstones exactly its own long-name slots" {
+    var sn: [11]u8 = undefined;
+    @memcpy(sn[0..], "HELLO1~1TXT");
+    var own: [4][32]u8 = undefined;
+    const n = fat32_util.buildLfnEntries("hello112-grow-long-name.txt", &sn, own[0..]).?;
+    try std.testing.expectEqual(@as(u32, 3), n);
+    // an older orphaned single-slot run for another name sits in front
+    var other_sn: [11]u8 = undefined;
+    @memcpy(other_sn[0..], "OTHER   TXT");
+    var orphan: [1][32]u8 = undefined;
+    _ = fat32_util.buildLfnEntries("other.txt", &other_sn, orphan[0..]).?;
+    var ptrs: [4][*]const u8 = .{ &orphan[0], &own[0], &own[1], &own[2] };
+    try std.testing.expectEqual(@as(u32, 3), fat32_util.ownedLfnRun(ptrs[0..], &sn));
+    try std.testing.expectEqual(@as(u32, 3), fat32_util.ownedLfnRun(ptrs[1..], &sn));
+    // a run whose checksum does not match is not ours
+    try std.testing.expectEqual(@as(u32, 0), fat32_util.ownedLfnRun(ptrs[1..], &other_sn));
+    // an incomplete run (missing the last-slot marker) is not ours either
+    try std.testing.expectEqual(@as(u32, 0), fat32_util.ownedLfnRun(ptrs[2..], &sn));
+    try std.testing.expectEqual(@as(u32, 0), fat32_util.ownedLfnRun(ptrs[0..0], &sn));
+}
+
+test "fat32: FSInfo free-count and next-free hint become unknown" {
+    var sec = [_]u8{0} ** 512;
+    std.mem.writeInt(u32, sec[0..4], 0x41615252, .little);
+    std.mem.writeInt(u32, sec[484..488], 0x61417272, .little);
+    std.mem.writeInt(u32, sec[488..492], 64482, .little);
+    std.mem.writeInt(u32, sec[492..496], 2, .little);
+    sec[510] = 0x55;
+    sec[511] = 0xAA;
+    try std.testing.expect(fat32_util.invalidateFsInfo(sec[0..]));
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), std.mem.readInt(u32, sec[488..492], .little));
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), std.mem.readInt(u32, sec[492..496], .little));
+    try std.testing.expectEqual(@as(u8, 0x55), sec[510]);
+    // not an FSInfo sector: untouched
+    var junk = [_]u8{0x11} ** 512;
+    try std.testing.expect(!fat32_util.invalidateFsInfo(junk[0..]));
+    for (junk) |b| try std.testing.expectEqual(@as(u8, 0x11), b);
+}
+
+test "fat32: BPB exposes the FSInfo sector" {
+    var b = [_]u8{0} ** 512;
+    std.mem.writeInt(u16, b[11..13], 512, .little);
+    b[13] = 1;
+    std.mem.writeInt(u16, b[14..16], 32, .little);
+    b[16] = 2;
+    std.mem.writeInt(u32, b[32..36], 65536, .little);
+    std.mem.writeInt(u32, b[36..40], 504, .little);
+    std.mem.writeInt(u32, b[44..48], 2, .little);
+    std.mem.writeInt(u16, b[48..50], 1, .little);
+    @memcpy(b[82..87], "FAT32");
+    try std.testing.expectEqual(@as(u32, 2048 + 1), fat32_util.parseBpb(&b, 2048).?.fsinfo_lba);
+    std.mem.writeInt(u16, b[48..50], 0xFFFF, .little);
+    try std.testing.expectEqual(@as(u32, 0), fat32_util.parseBpb(&b, 0).?.fsinfo_lba);
+}
