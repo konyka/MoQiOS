@@ -201,6 +201,19 @@ pub fn inodeLocation(
     };
 }
 
+/// Reset the extended area (bytes 128..inode_size) of a freshly allocated
+/// inode record. A reused slot otherwise keeps the previous owner's
+/// in-inode xattrs and timestamps. i_extra_isize = 32 matches e2fsprogs.
+pub fn initExtraInode(rec: []u8, inode_size: u32) void {
+    if (inode_size <= @sizeOf(Ext2Inode) or rec.len < inode_size) return;
+    const base = @sizeOf(Ext2Inode);
+    @memset(rec[base..inode_size], 0);
+    if (inode_size - base >= 2) {
+        rec[base] = 32;
+        rec[base + 1] = 0;
+    }
+}
+
 // ─── Logical block classification ──────────────────────────────────────────
 
 pub const BlockAddr = union(enum) {

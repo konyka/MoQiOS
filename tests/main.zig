@@ -6285,3 +6285,22 @@ test "fat32: the allocator never hands out clusters past the end of the FAT32 re
     // a foreign volume inside the FAT32 metadata leaves nothing to allocate
     try std.testing.expectEqual(@as(u32, 2), fat32_util.allocLimitCluster(1040, 1, 64496, 512));
 }
+
+test "ext2: a freshly allocated inode gets a clean extended area" {
+    const eu = kt.ext2_util;
+    // 256-byte inodes on this volume: bytes 128..256 are the extended area.
+    var rec: [256]u8 = undefined;
+    @memset(&rec, 0xAB); // stale bytes left by an earlier owner of the slot
+    eu.initExtraInode(rec[0..], 256);
+    // i_extra_isize = 32 (the size e2fsprogs writes for the fields it knows),
+    // every other extended byte is zero.
+    try std.testing.expectEqual(@as(u16, 32), std.mem.readInt(u16, rec[128..130], .little));
+    for (rec[130..256]) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    // the base inode is left alone (the caller writes it separately)
+    for (rec[0..128]) |b| try std.testing.expectEqual(@as(u8, 0xAB), b);
+    // 128-byte inodes have no extended area: nothing changes
+    var small: [128]u8 = undefined;
+    @memset(&small, 0xCD);
+    eu.initExtraInode(small[0..], 128);
+    for (small) |b| try std.testing.expectEqual(@as(u8, 0xCD), b);
+}

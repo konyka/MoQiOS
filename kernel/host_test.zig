@@ -114,6 +114,7 @@ pub const hhdm = @import("mm/hhdm.zig");
 pub const user_stack = @import("proc/user_stack.zig");
 pub const tcp_recv_policy = @import("net/tcp_recv_policy.zig");
 pub const ext2_unlink_policy = @import("fs/ext2_unlink_policy.zig");
+pub const ext2_util = @import("fs/ext2_util.zig");
 pub const stat_info = @import("fs/stat_info.zig");
 pub const sysv_msg_select_policy = @import("ipc/sysv_msg_select_policy.zig");
 pub const unix_epoll_policy = @import("net/unix_epoll_policy.zig");

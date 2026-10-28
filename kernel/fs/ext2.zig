@@ -1574,6 +1574,17 @@ fn writeBlock(block_num: u32, buf: [*]const u8) bool {
 }
 
 fn writeInode(inode_num: u32, inode: *const Ext2Inode) bool {
+    return writeInodeRecord(inode_num, inode, false);
+}
+
+/// First write of a just-allocated inode: also resets the slot's extended
+/// area so a reused slot does not hand the previous owner's in-inode
+/// xattrs/timestamps to the new file.
+fn writeNewInode(inode_num: u32, inode: *const Ext2Inode) bool {
+    return writeInodeRecord(inode_num, inode, true);
+}
+
+fn writeInodeRecord(inode_num: u32, inode: *const Ext2Inode, fresh: bool) bool {
     const gds: [*]const Ext2GroupDesc = @ptrFromInt(group_descs_virt);
     const group = groupForInode(inode_num) orelse return false;
     const loc = eu.inodeLocation(inode_num, inodes_per_group, inode_size, block_size, gds[group].bg_inode_table);
@@ -1587,6 +1598,8 @@ fn writeInode(inode_num: u32, inode: *const Ext2Inode) bool {
     // (eliminates allocPage/freePage + 2 memcpy per call; ~102K calls for 100MB file)
     if (cacheLookup(target_block)) |idx| {
         if (offset_in_block + copy_len <= block_size) {
+            if (fresh and offset_in_block + inode_size <= block_size)
+                eu.initExtraInode(cache[idx].data[offset_in_block .. offset_in_block + inode_size], inode_size);
             @memcpy(cache[idx].data[offset_in_block .. offset_in_block + copy_len], inode_bytes[0..copy_len]);
             if (batch_free_depth > 0) {
                 cache[idx].dirty = true;
@@ -1610,6 +1623,8 @@ fn writeInode(inode_num: u32, inode: *const Ext2Inode) bool {
     if (!readBlock(target_block, buf)) return false;
 
     if (offset_in_block + copy_len <= block_size) {
+        if (fresh and offset_in_block + inode_size <= block_size)
+            eu.initExtraInode(buf[offset_in_block .. offset_in_block + inode_size], inode_size);
         @memcpy(buf[offset_in_block .. offset_in_block + copy_len], inode_bytes[0..copy_len]);
         if (!writeBlockMaybeBatch(target_block, buf)) return false;
     } else {
@@ -2235,7 +2250,7 @@ pub fn createFile(name: []const u8, creator: Creator, who: ?Who) i64 {
     stampModified(&new_inode);
     new_inode.atime = new_inode.mtime;
 
-    if (!writeInode(new_inode_num, &new_inode)) {
+    if (!writeNewInode(new_inode_num, &new_inode)) {
         freeInode(new_inode_num);
         return -1;
     }
@@ -2433,7 +2448,7 @@ pub fn createDir(name: []const u8, creator: Creator, who: ?Who) i64 {
     if (!writeBlock(dir_block, buf)) return -1;
 
     // Write the new inode
-    if (!writeInode(new_inode_num, &new_inode)) return -1;
+    if (!writeNewInode(new_inode_num, &new_inode)) return -1;
 
     // Add entry to parent directory
     if (!addDirEntry(parent_inode_num, new_inode_num, dirname, 2)) return -1; // file_type=2 (dir)
@@ -3031,7 +3046,7 @@ pub fn createSymlink(target: []const u8, linkpath: []const u8, creator: Creator,
     }
 
     // 3. Write the new inode
-    if (!writeInode(new_inode_num, &new_inode)) return -5;
+    if (!writeNewInode(new_inode_num, &new_inode)) return -5;
 
     // 4. Add directory entry: file_type = 7 (EXT2_FT_SYMLINK)
     if (!addDirEntry(resolved.parent, new_inode_num, resolved.name, 7)) return -28;

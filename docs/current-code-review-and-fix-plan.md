@@ -4347,7 +4347,13 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     `fsync_probe.txt` 两次都是 5 个，31 个已分配簇全部可达、两份 FAT 0 处不一致，没有测试失败。
   - 没做的：`e2fsck` 对基线镜像本身就报若干 ext2 不一致（inode 额外大小、testdir 下未连接的目录），本轮复现前后相同，与 FAT32 越界无关，
     另查；提交的 `disk.img` 的基线清理仍未做。
-- **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
+- **- **第二十九轮：ext2 新建 inode 扩展区未清零（内存泄漏到磁盘、e2fsck 报错）**：
+  - 卷 `inode_size=256`，`Ext2Inode` 只定义了前 128 字节。`writeInode` 只写 `copy_len = min(inode_size, 128)`，因此新建 inode 的 128..256 字节保留了先前占用该槽的 inode 的垃圾（包含内核指针）。
+  - 基线 `disk.img` 中 inode 12/14 的 `i_extra_isize` 分别为 6680/6680，尾部含 `0xffff8000...` 指针，`e2fsck -fn` 报 “额外的大小（无效的值）”。复用释放槽时会把这些垃圾交给新 inode（用特制盘证明：`user.secret=leaked` 出现在新 `/rootdir` 上）。
+  - 修复：在 `ext2_util.zig` 新增 `initExtraInode(rec, inode_size)`：若 `inode_size>128` 则清零扩展区并设 `i_extra_isize=32`（e2fsprogs 惯例）。`writeNewInode`（仅在 `allocInode` 后首次写时使用）在写入 base inode 前调用它。`createFile`/`createDir`/`createSymlink` 已全部改用 `writeNewInode`。
+  - 验证：host 测试新增 “ext2: a freshly allocated inode gets a clean extended area”（694/694 pass）；复现盘重测后 inode 13 尾部全零、`e2fsck` 不再因扩展区报错（基线遗留的其他问题仍存，未查明当前内核是否仍会产生）；三架构 build 通过，五组冒烟 `hello114:ok` 数目 302/0/0，stress 5/5。变异测试：`writeNewInode` 仍能写入 256 字节 inode、跨块边界、缓存路径和 fallback 路径均触发 `initExtraInode`。
+  - 文档已同步本节。
+SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；
     `init`（tid 5）在 `waitpid`；它的子进程 `hello29`（tid 30）停在 `fsync` 里，保存的返回地址落在
