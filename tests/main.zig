@@ -6454,3 +6454,26 @@ test "supplementary groups select the group class and widen chown targets" {
     try std.testing.expectEqual(gp.SetCheck.einval, gp.checkSet(-1, true));
     try std.testing.expectEqual(gp.SetCheck.ok, gp.checkSet(0, true));
 }
+
+test "credentials: execve copies euid into the saved uid and drops capabilities without a root uid" {
+    const cp = kt.cred_policy;
+    const all: cp.Caps = .{ .effective = 0, .permitted = 0x60 };
+    // uid 1000 with root kept only as the saved uid: the new program is unprivileged
+    const a = cp.afterExec(.{ .r = 1000, .e = 1000, .s = 0 }, .{ .r = 1000, .e = 1000, .s = 0 }, all);
+    try std.testing.expectEqual(@as(u32, 1000), a.uid.s);
+    try std.testing.expectEqual(@as(u32, 1000), a.gid.s);
+    try std.testing.expectEqual(@as(u32, 0), a.caps.permitted);
+    try std.testing.expectEqual(@as(u32, 0), a.caps.effective);
+    // root: permitted kept, effective raised to permitted
+    const b = cp.afterExec(.{ .r = 0, .e = 0, .s = 0 }, .{ .r = 0, .e = 0, .s = 0 }, all);
+    try std.testing.expectEqual(@as(u32, 0x60), b.caps.permitted);
+    try std.testing.expectEqual(@as(u32, 0x60), b.caps.effective);
+    // real root, effective 1000: permitted kept but nothing effective
+    const c = cp.afterExec(.{ .r = 0, .e = 1000, .s = 0 }, .{ .r = 0, .e = 0, .s = 0 }, all);
+    try std.testing.expectEqual(@as(u32, 1000), c.uid.s);
+    try std.testing.expectEqual(@as(u32, 0x60), c.caps.permitted);
+    try std.testing.expectEqual(@as(u32, 0), c.caps.effective);
+    // never more than the task already had
+    const d = cp.afterExec(.{ .r = 0, .e = 0, .s = 0 }, .{ .r = 0, .e = 0, .s = 0 }, .{ .effective = 0, .permitted = 0 });
+    try std.testing.expectEqual(@as(u32, 0), d.caps.effective);
+}

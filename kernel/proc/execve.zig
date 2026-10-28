@@ -148,6 +148,7 @@ pub fn prepareExec(name_ptr: u64, argv_ptr: u64, envp_ptr: u64) ?u64 {
     cur.tls_base = 0;
     syscall_entry.setUserTlsBase(0);
     commitSignalStateForExec(cur, result.pml4);
+    @import("credentials.zig").applyExec(cur);
 
     // Switch to new address space
     if (sched.currentTaskIndex()) |task_idx| {
@@ -316,6 +317,7 @@ pub fn prepareExecWithKernelPath(name: []const u8, argv_ptr: u64, envp_ptr: u64)
     cur.tls_base = 0;
     syscall_entry.setUserTlsBase(0);
     commitSignalStateForExec(cur, result.pml4);
+    @import("credentials.zig").applyExec(cur);
 
     @import("../arch/arch.zig").pcid.switchCr3(result.pml4);
     // L1: the old image's user-driver resources (IRQ registrations, DMA

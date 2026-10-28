@@ -80,3 +80,29 @@ pub fn capsAfterUidChange(old: Ids, new: Ids, caps: Caps) Caps {
     if (old.e != 0 and new.e == 0) out.effective = out.permitted;
     return out;
 }
+
+pub const ExecCreds = struct {
+    uid: Ids,
+    gid: Ids,
+    caps: Caps,
+};
+
+/// Credentials after execve(2). Programs carry no set-user-ID bits or file
+/// capabilities (the ramdisk has no file metadata), so:
+/// - saved IDs become the effective IDs (execve(2));
+/// - capabilities(7) "root" rule: if the real or effective uid is 0 the
+///   program is treated as having full file capabilities, so permitted
+///   stays (bounded by what the task already had) and effective = permitted
+///   when euid is 0 — otherwise both sets are emptied (no ambient set).
+pub fn afterExec(uid: Ids, gid: Ids, caps: Caps) ExecCreds {
+    const new_uid: Ids = .{ .r = uid.r, .e = uid.e, .s = uid.e };
+    const new_gid: Ids = .{ .r = gid.r, .e = gid.e, .s = gid.e };
+    var out = caps;
+    if (uid.r == 0 or uid.e == 0) {
+        out.effective = if (uid.e == 0) out.permitted else 0;
+    } else {
+        out.permitted = 0;
+        out.effective = 0;
+    }
+    return .{ .uid = new_uid, .gid = new_gid, .caps = out };
+}

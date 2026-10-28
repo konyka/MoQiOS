@@ -171,3 +171,17 @@ pub fn setgroups(size: i64, list_ptr: u64) i64 {
     t.ngroups = n;
     return 0;
 }
+
+/// Apply execve(2) credential rules to the calling task (cred_policy.afterExec).
+pub fn applyExec(t: *task_mod.Task) void {
+    const lock_flags = task_mod.lockTask();
+    defer task_mod.unlockTask(lock_flags);
+    const ec = policy.afterExec(uidIds(t), gidIds(t), .{
+        .effective = @bitCast(t.effective_caps),
+        .permitted = @bitCast(t.permitted_caps),
+    });
+    t.suid = ec.uid.s;
+    t.sgid = ec.gid.s;
+    t.effective_caps = @bitCast(ec.caps.effective);
+    t.permitted_caps = @bitCast(ec.caps.permitted);
+}

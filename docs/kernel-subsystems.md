@@ -1878,7 +1878,7 @@ const SysCap = packed struct {
 | `capable(task, cap) bool` | 检查任务是否持有指定 capability |
 | `requireCap(task, cap) !void` | 要求 capability，缺失则返回 EPERM |
 | `dropCap(task, cap)` | 从 effective 集中移除指定 capability |
-| `computeExecCaps(parent, child)` | execve 时计算子进程 capability（继承规则） |
+| `computeExecCaps(parent, child)` | 旧接口，execve 不再使用；execve 走 `cred_policy.afterExec`（见下） |
 
 **syscall 检查点集成**
 
@@ -1892,6 +1892,9 @@ const SysCap = packed struct {
   chmod/sticky 目录删除用 `CAP_FOWNER`，chown 用 `CAP_CHOWN`，SysV IPC 用 `CAP_SYS_ADMIN`，POSIX MQ unlink 用 `CAP_DAC_OVERRIDE`，
   nice/调度用 `CAP_SYS_NICE`，kcmp 用 `CAP_SYS_PTRACE`。root 启动时持有全部 capability，因此行为不变；用 `capset` 或降权丢掉
   capability 的 uid 0 进程与普通用户一样受权限位约束。
+- execve（`cred_policy.afterExec`）：saved uid/gid 改为有效 uid/gid；程序没有 set-user-ID 位和文件 capability，所以按 capabilities(7)
+  的 root 规则：real 或 effective uid 为 0 时 permitted 保留、effective 在 euid 为 0 时等于 permitted，否则为空；两者都不为 0 时
+  permitted 和 effective 都清空。
 - 补充组（`proc/group_policy.zig`）：`getgroups`(#487)/`setgroups`(#488，本系统编号；需要 `CAP_SETGID`，最多 32 个)。
   fork/clone 继承、execve 保留。属于有效 gid 或任一补充组即选中权限位的组类（ext2/tmpfs/只读卷 DAC、SysV IPC）；文件属主可把文件的组改成
   自己所属的任一组。

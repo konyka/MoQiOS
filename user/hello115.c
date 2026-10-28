@@ -11,6 +11,8 @@
 ///   E. supplementary groups: setgroups needs CAP_SETGID, getgroups reports
 ///      them, and membership grants the group class of a file's mode (tmpfs
 ///      and ext2) and of a SysV queue's mode.
+///   F. execve: the saved uid becomes the effective uid, and a program run
+///      without any root uid gets no capabilities (hello116 reports back).
 ///   C. without CAP_SETUID a process may still "set" its own uid (no-op) and
 ///      shuffle among its own real/effective/saved ids, but not pick others.
 
@@ -59,6 +61,8 @@ static inline int64_t syscall3(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define IPC_RMID      0
 #define EACCES_       13
 #define SYS_GETGROUPS 487
+#define SYS_EXECVE    59
+#define SYS_CAPSET_   307
 #define SYS_SETGROUPS 488
 #define KEEP          0xFFFFFFFFull
 #define CAP_SETUID_BIT (1u << 5)
@@ -292,6 +296,42 @@ static void cleanup_group_fixtures(int64_t q) {
     if (q >= 0) check(syscall3(SYS_MSGCTL, (uint64_t)q, IPC_RMID, 0) == 0, "E: cleanup the queue");
 }
 
+/* fork; in the child run `prep` then execve hello116; return its report bits */
+static int exec_report(int prep) {
+    int64_t kid = syscall1(SYS_FORK, 0);
+    if (kid == 0) {
+        if (prep == 1) {
+            /* drop to uid 1000 but keep root as the saved uid */
+            if (syscall3(SYS_SETRESUID, 1000, 1000, 0) != 0) syscall1(SYS_EXIT, 200);
+        } else {
+            /* stay root, effective set empty, permitted {SETUID, SETGID} */
+            uint32_t hdr[2] = { 0x20080522u, 0 };
+            uint32_t data[6] = { 0, CAP_SETUID_BIT | CAP_SETGID_BIT, 0, 0, 0, 0 };
+            if (syscall2(SYS_CAPSET_, (uint64_t)hdr, (uint64_t)data) != 0) syscall1(SYS_EXIT, 201);
+        }
+        const char *argv[2] = { "hello116", 0 };
+        syscall3(SYS_EXECVE, (uint64_t)"hello116", (uint64_t)argv, 0);
+        syscall1(SYS_EXIT, 202);
+        for (;;) {}
+    }
+    int32_t st = 0;
+    syscall3(SYS_WAITPID, (uint64_t)kid, (uint64_t)&st, 0);
+    if (kid <= 0 || (st & 0x7f) != 0) return -1;
+    return (st >> 8) & 0xff;
+}
+
+static void exec_credentials(void) {
+    int b = exec_report(1);
+    check(b >= 0 && b < 200, "F: setresuid(1000,1000,0) then execve hello116");
+    check(b >= 0 && (b & 1), "F: after execve the saved uid equals the effective uid");
+    check(b >= 0 && (b & 2), "F: a program run with no root uid has no permitted capabilities");
+    check(b >= 0 && !(b & 16), "F: so it cannot setuid(0) back to root");
+    b = exec_report(2);
+    check(b >= 0 && b < 200, "F: root with an empty effective set execs hello116");
+    check(b >= 0 && (b & 8) && !(b & 2), "F: euid 0 keeps its permitted capabilities across execve");
+    check(b >= 0 && (b & 4), "F: and euid 0 gets them effective (effective = permitted)");
+}
+
 int main_(void) {
     print("hello115: identity changes and capabilities\n");
     uint32_t r, e, s;
@@ -306,6 +346,7 @@ int main_(void) {
     int64_t gq = run_groups_child();
     check(gq >= 0, "E: supplementary groups scenario");
     cleanup_group_fixtures(gq);
+    exec_credentials();
     /* the scenario's uid-1000 queue: find it again (the child's variable is
      * gone) by trying the ids a fresh boot hands out, as its owner */
     {

@@ -4460,6 +4460,19 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     hello115 3 项 FAIL（tmpfs/ext2 组成员读取）。门禁：三架构构建通过，五组冒烟 hello114 各 302 ok、hello115 各 67 ok、0 FAIL、
     0 次内核态故障，stress 5/5。
   - 没做的：SysV IPC 的 IPC_SET 只改 mode，不能改属主/属组；文件 capability、SECBIT 不支持。
+- **第三十六轮：execve 不改凭证，降权进程 exec 后仍能回到 root**：
+  - 问题：execve 完全不碰 uid 和 capability。`setresuid(1000,1000,0)`（保留 root 为 saved uid）后 exec 一个程序，新程序的 saved uid
+    仍是 0、权能集原样保留，它可以 `setuid(0)` 回到 root；反过来，root 把 effective 集清空、permitted 保留后 exec，新程序的 effective
+    集仍是空的。`cap_check.computeExecCaps` 存在但从来没被调用。
+  - RED：hello115 场景 F + 新的 exec 目标程序 hello116（把 saved uid、权能集、能否 setuid(0) 编码进退出码），未修改内核上 4 项 FAIL。
+  - 修复：纯函数 `cred_policy.afterExec`：saved uid/gid 改为有效值（execve(2)）；ramdisk 里的程序没有 set-user-ID 位和文件
+    capability，按 capabilities(7) 的 root 规则——real 或 effective uid 为 0 时 permitted 保留，euid 为 0 时 effective 等于 permitted；
+    否则 permitted/effective 都清空。`credentials.applyExec` 在 execve 和 execveat 两条路径提交新映像时调用。
+  - 验证：host 702/702（新增 afterExec 测试）；hello115 74 项全部 ok。变异（确认重新编译）：execve 不调用 `applyExec` → hello115 4 项
+    FAIL。门禁：三架构构建通过；MBR SMP=1/2、GPT SMP=2/8 冒烟各 hello114 302 ok、hello115 74 ok、0 FAIL；stress 5/5。
+  - 门禁中的一次失败（如实）：MBR SMP=8 那次 hello107 报 “unbounded iteration latency”（thread 1 只跑了 133 次，单次最长 33.5 ms，
+    阈值 30 ms；正常约 800 次、1–4 ms）。hello107 不调用任何凭证相关调用，和本轮改动无关的可能性大，但原因未查明。同一内核随后单独
+    连跑 4 次 SMP=8，全部通过（最长 1.1–1.4 ms）。记为偶发，待查。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；
