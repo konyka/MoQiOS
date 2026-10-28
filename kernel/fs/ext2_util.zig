@@ -214,6 +214,14 @@ pub fn initExtraInode(rec: []u8, inode_size: u32) void {
     }
 }
 
+/// Mark an inode record as deleted the way Linux/e2fsck expect: no links
+/// and a non-zero dtime. Without this a freed slot still looks live to fsck
+/// (its blocks and its ".." reference keep being counted).
+pub fn markInodeDeleted(inode: *Ext2Inode, now: u32) void {
+    inode.links_count = 0;
+    inode.dtime = if (now == 0) 1 else now;
+}
+
 // ─── Logical block classification ──────────────────────────────────────────
 
 pub const BlockAddr = union(enum) {

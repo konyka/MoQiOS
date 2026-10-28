@@ -67,12 +67,11 @@ fi
 "$SCRIPT_DIR/disk_fixture.sh" disk.img.manifest disk.img
 
 mkdir -p "$SMOKE_WORK_DIR" "$(dirname "$LOG_FILE")" "$(dirname "$RUN_LOG")" "$(dirname "$SMOKE_DISK")"
-if [ -z "${MOQI_SMOKE_LOG:-}" ]; then
-    rm -f "$LOG_FILE"
-fi
-if [ -z "${MOQI_SMOKE_RUN_LOG:-}" ]; then
-    rm -f "$RUN_LOG"
-fi
+# The serial and run logs are outputs of this run even when the caller names
+# them: a log left over from an earlier run would otherwise satisfy the PASS
+# markers before this QEMU has written anything.
+: > "$LOG_FILE"
+: > "$RUN_LOG"
 if [ -z "${MOQI_SMOKE_DISK:-}" ]; then
     rm -f "$SMOKE_DISK"
 fi

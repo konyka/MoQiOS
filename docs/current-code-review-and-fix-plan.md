@@ -4347,13 +4347,47 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     `fsync_probe.txt` 两次都是 5 个，31 个已分配簇全部可达、两份 FAT 0 处不一致，没有测试失败。
   - 没做的：`e2fsck` 对基线镜像本身就报若干 ext2 不一致（inode 额外大小、testdir 下未连接的目录），本轮复现前后相同，与 FAT32 越界无关，
     另查；提交的 `disk.img` 的基线清理仍未做。
-- **- **第二十九轮：ext2 新建 inode 扩展区未清零（内存泄漏到磁盘、e2fsck 报错）**：
-  - 卷 `inode_size=256`，`Ext2Inode` 只定义了前 128 字节。`writeInode` 只写 `copy_len = min(inode_size, 128)`，因此新建 inode 的 128..256 字节保留了先前占用该槽的 inode 的垃圾（包含内核指针）。
-  - 基线 `disk.img` 中 inode 12/14 的 `i_extra_isize` 分别为 6680/6680，尾部含 `0xffff8000...` 指针，`e2fsck -fn` 报 “额外的大小（无效的值）”。复用释放槽时会把这些垃圾交给新 inode（用特制盘证明：`user.secret=leaked` 出现在新 `/rootdir` 上）。
-  - 修复：在 `ext2_util.zig` 新增 `initExtraInode(rec, inode_size)`：若 `inode_size>128` 则清零扩展区并设 `i_extra_isize=32`（e2fsprogs 惯例）。`writeNewInode`（仅在 `allocInode` 后首次写时使用）在写入 base inode 前调用它。`createFile`/`createDir`/`createSymlink` 已全部改用 `writeNewInode`。
-  - 验证：host 测试新增 “ext2: a freshly allocated inode gets a clean extended area”（694/694 pass）；复现盘重测后 inode 13 尾部全零、`e2fsck` 不再因扩展区报错（基线遗留的其他问题仍存，未查明当前内核是否仍会产生）；三架构 build 通过，五组冒烟 `hello114:ok` 数目 302/0/0，stress 5/5。变异测试：`writeNewInode` 仍能写入 256 字节 inode、跨块边界、缓存路径和 fallback 路径均触发 `initExtraInode`。
-  - 文档已同步本节。
-SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
+- **第二十九轮：ext2 新建 inode 的扩展区沿用旧槽内容（信息泄漏 / e2fsck 报错）**：
+  - 卷的 `inode_size=256`，而 `Ext2Inode` 只有前 128 字节。`writeInode` 只写 `min(inode_size, 128)` 字节，新分配的 inode 会保留该槽
+    之前的 128..256 字节：旧的 `i_extra_isize`、in-inode xattr、扩展时间戳。基线 `disk.img` 的 inode 12/14 的 `i_extra_isize=6680`，尾部
+    含内核地址（`0xffff8000...`），`e2fsck -fn` 报“额外的大小（无效的值）”；这些垃圾是哪个版本的内核写进去的，未查明。
+  - 复现：用 debugfs 在磁盘副本上建一个文件，给它加 in-inode xattr `user.secret=leaked`，然后删除（槽 13 空出来、尾部保留）。用修复前的
+    内核启动后，hello23 新建的 `/rootdir` 正好落在 inode 13，`debugfs stat` 显示它带着 `user.secret = "leaked"`。
+  - 修复：纯函数 `ext2_util.initExtraInode` 把扩展区清零，并写入 `i_extra_isize=32`（与 e2fsprogs 一致；inode_size=128 时不改动）。
+    `writeNewInode` 只在 `allocInode` 之后的第一次写入时调用它，缓存路径和回退路径都覆盖到；`createFile`/`createDir`/`createSymlink`
+    都改用它。之后的普通 `writeInode` 仍然只写前 128 字节。
+  - 验证：host 测试 “ext2: a freshly allocated inode gets a clean extended area”，694/694 通过。同样的复现盘用修复后的内核启动：inode 13
+    不再带 xattr；这次启动新建的 inode 16–20 都是 `i_extra_isize=32`、尾部其余字节为 0；e2fsck 仍有 2 条“额外的大小”，都来自基线里的
+    inode 12/14。变异：让 `initExtraInode` 直接返回（确认已重新编译），host 测试失败（expected 32, found 43947），复现盘上
+    `user.secret=leaked` 再次出现；恢复源码后 694/694。门禁：三架构构建通过，MBR SMP=1/2/8 和 GPT SMP=2/8 五组冒烟 `hello114` 各
+    302 项 ok、0 FAIL、0 次内核态故障，stress 5/5。
+  - 更正（如实）：提交 `bdbabf5` 时门禁还没跑完，该提交里写的变异和复现结果当时也没做（那段文字是预写的，而且把下一节的标题弄坏了）。
+    上面这些结果是提交之后补跑的，本节文字已改为实际结果。
+  - 没做的：基线 `disk.img` 其余 e2fsck 报错（未连接的目录、引用计数、位图差异、组目录计数）是否由当前内核产生，下一轮再查。
+- **第三十轮：从干净的 ext2 启动一次就被 e2fsck 判为不一致（删除的 inode 仍像“活的”）**：
+  - 先用 `e2fsck -fy` 修好基线镜像的副本（e2fsck 0 错），用当前内核启动一次，再跑 `e2fsck -fn`：报“未被连接的目录 inode 22
+    （之前位于 /testdir）”、`..` 指向 /testdir、/testdir 引用计数应为 3、块位图 +108、inode 位图 +22、组 #0 目录计数 (4, counted=7)。
+    所以这些不一致是当前内核产生的，不只是基线遗留。
+  - 原因 1：`freeInode` 只清 inode 位图位，不改 inode 记录本身——`links_count` 和 `dtime=0` 都保持原样。e2fsck 把 `dtime==0` 且链接数
+    非零的记录当作在用 inode，于是被 rmdir 的目录 22 被当成“未连接的目录”，它的块和 `..` 也被计入。修复：纯函数
+    `ext2_util.markInodeDeleted`（links=0，dtime=当前时间；没有墙钟时取 1，避免 0）；`freeInodeAs` 在清位图前先把记录标为已删除。
+    unlink、rename 覆盖、最后一次 close 回收、创建失败回滚都经过 `freeInode`，因此都覆盖到。
+  - 原因 2：`bg_used_dirs_count` 从来没有维护：mkdir 不加，rmdir 不减。修复：`createDir` 成功加入父目录后加 1，`rmdirFile` 通过
+    `freeInodeAs(…, true)` 减 1。
+  - 顺带发现的测试缺陷：hello114 的 `syscall1(SYS_MKDIR, "testdir/h114-rmd")` 漏传 mode，内核拿到寄存器里的残值（这次是 0251）。
+    改为显式传 0755。
+  - 测试工具漏洞（如实）：`qemu_smoke.sh` 在调用者设置了 `MOQI_SMOKE_LOG` 时不清空旧串口日志，判定 PASS 的标记直接从上一次运行
+    的日志里匹配。本轮一次 QEMU 没起来的启动（1.8 秒）因此报了 PASS。证明：给一个 1 MiB 的空盘、留着旧日志，旧脚本 rc=0 PASS，
+    新脚本 rc=1。现在串口日志和运行日志每次启动前都截断。此前几轮用 `MOQI_SMOKE_LOG` 的单次复现脚本（`disk_run2`、xr 复现）可能
+    受影响；正式门禁 `gates12.sh` 不设置 `MOQI_SMOKE_LOG`，不受影响。第二十九轮的复现结果是在这个修正之前得到的；
+    那几次启动的耗时（约 60 秒）和盘上 inode 的变化表明它们确实启动了，但仍按“工具当时有漏洞”记录。
+  - 验证：host 695/695（新增 “ext2: a freed inode record is marked deleted for fsck”）。干净盘启动一次后 `e2fsck -fn` 0 错，
+    hello114 302 ok、0 FAIL。变异（均确认重新编译）：跳过标记删除 → “未连接目录 22”、位图差异重新出现；不维护 used_dirs →
+    “组 #0 的目录计数错误 (2, counted=7)”。门禁：三架构构建通过，MBR SMP=1/2/8、GPT SMP=2/8 五组冒烟 `hello114` 各 302 ok、
+    0 FAIL、0 次内核态故障，stress 5/5。
+  - 没做的：提交的 `disk.img` 本身仍带着旧的 e2fsck 错误（inode 12/13/14 的额外大小、块 100 重复引用等），需重做基线并更新
+    `disk.img.manifest`，单独提交。
+- **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；
     `init`（tid 5）在 `waitpid`；它的子进程 `hello29`（tid 30）停在 `fsync` 里，保存的返回地址落在

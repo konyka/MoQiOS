@@ -1047,7 +1047,7 @@ void _start(void) {
             check(syscall3(SYS_UNLINKAT, (uint64_t)-100, (uint64_t)"/mnt/q/small.txt", 0) == -EROFS, "Q: unlinkat(AT_FDCWD, absolute volume path) is EROFS");
             /* AT_REMOVEDIR on the writable root disk removes an empty directory; unknown flags are EINVAL */
             syscall1(SYS_RMDIR, (uint64_t)"testdir/h114-rmd");
-            check(syscall1(SYS_MKDIR, (uint64_t)"testdir/h114-rmd") == 0, "Q: mkdir a root-disk directory for AT_REMOVEDIR");
+            check(syscall2(SYS_MKDIR, (uint64_t)"testdir/h114-rmd", 0755) == 0, "Q: mkdir a root-disk directory for AT_REMOVEDIR");
             check(syscall3(SYS_UNLINKAT, (uint64_t)-100, (uint64_t)"testdir/h114-rmd", 0x1) == -EINVAL, "Q: unlinkat with an unknown flag is EINVAL");
             check(syscall3(SYS_UNLINKAT, (uint64_t)-100, (uint64_t)"testdir/h114-rmd", AT_REMOVEDIR) == 0, "Q: unlinkat(AT_REMOVEDIR) removes an empty directory");
             check(syscall1(SYS_RMDIR, (uint64_t)"testdir/h114-rmd") < 0, "Q: the directory is gone after unlinkat(AT_REMOVEDIR)");

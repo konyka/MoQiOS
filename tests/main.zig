@@ -6304,3 +6304,18 @@ test "ext2: a freshly allocated inode gets a clean extended area" {
     eu.initExtraInode(small[0..], 128);
     for (small) |b| try std.testing.expectEqual(@as(u8, 0xCD), b);
 }
+
+test "ext2: a freed inode record is marked deleted for fsck" {
+    const eu = kt.ext2_util;
+    var ino = std.mem.zeroes(eu.Ext2Inode);
+    ino.mode = 0o40755;
+    ino.links_count = 2;
+    eu.markInodeDeleted(&ino, 1_700_000_000);
+    try std.testing.expectEqual(@as(u16, 0), ino.links_count);
+    try std.testing.expectEqual(@as(u32, 1_700_000_000), ino.dtime);
+    // without a wall clock dtime must still be non-zero, or fsck treats the slot as in use
+    var ino2 = std.mem.zeroes(eu.Ext2Inode);
+    ino2.links_count = 1;
+    eu.markInodeDeleted(&ino2, 0);
+    try std.testing.expect(ino2.dtime != 0);
+}

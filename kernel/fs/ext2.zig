@@ -2452,6 +2452,13 @@ pub fn createDir(name: []const u8, creator: Creator, who: ?Who) i64 {
 
     // Add entry to parent directory
     if (!addDirEntry(parent_inode_num, new_inode_num, dirname, 2)) return -1; // file_type=2 (dir)
+    {
+        const gds: [*]Ext2GroupDesc = @ptrFromInt(group_descs_virt);
+        if (groupForInode(new_inode_num)) |g| {
+            gds[g].bg_used_dirs_count +|= 1;
+            writeGroupDescs();
+        }
+    }
 
     // Increment parent links count (for ".." pointing to parent)
     var parent_inode: Ext2Inode = undefined;
@@ -2547,7 +2554,19 @@ fn freeBlock(block_num: u32) void {
 
 /// Mark an inode as free in the bitmap.
 fn freeInode(inode_num: u32) void {
+    freeInodeAs(inode_num, false);
+}
+
+/// Free an inode slot. The on-disk record is first marked deleted
+/// (links 0, dtime set) so fsck does not keep counting the freed slot and
+/// its blocks; a freed directory also leaves the group's used-dirs count.
+fn freeInodeAs(inode_num: u32, was_dir: bool) void {
     const group = groupForInode(inode_num) orelse return;
+    var dead: Ext2Inode = undefined;
+    if (readInode(inode_num, &dead)) {
+        eu.markInodeDeleted(&dead, nowSeconds());
+        _ = writeInode(inode_num, &dead);
+    }
     const index = (inode_num - 1) % inodes_per_group;
 
     const gds: [*]Ext2GroupDesc = @ptrFromInt(group_descs_virt);
@@ -2589,6 +2608,7 @@ fn freeInode(inode_num: u32) void {
 
     gd.bg_free_inodes_count += 1;
     sb.free_inodes_count += 1;
+    if (was_dir and gd.bg_used_dirs_count > 0) gd.bg_used_dirs_count -= 1;
 
     // v53.16: Skip flushes during batch operations (caller flushes at end)
     if (batch_free_depth == 0) {
@@ -2947,7 +2967,7 @@ pub fn rmdirFile(path: []const u8, who: ?Who) i64 {
         _ = writeInode(parent_inode_num, &parent_inode);
     }
     freeBlock(dir_inode.block[0]);
-    freeInode(dir_inode_num);
+    freeInodeAs(dir_inode_num, true);
 
     serial.writeString("[ext2] rmdir: ");
     serial.writeString(filename);
