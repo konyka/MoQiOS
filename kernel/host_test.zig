@@ -32,6 +32,7 @@ pub const chdir_policy = @import("fs/chdir_policy.zig");
 pub const splice = @import("fs/splice.zig");
 pub const fat32_util = @import("fs/fat32_util.zig");
 pub const fat32_source = @embedFile("fs/fat32.zig");
+pub const procfs_source = @embedFile("fs/procfs.zig");
 pub const page_cache_source = @embedFile("fs/page_cache.zig");
 pub const splice_source = @embedFile("fs/splice.zig");
 pub const ioctl_source = @embedFile("fs/ioctl.zig");

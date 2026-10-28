@@ -4473,6 +4473,17 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   - 门禁中的一次失败（如实）：MBR SMP=8 那次 hello107 报 “unbounded iteration latency”（thread 1 只跑了 133 次，单次最长 33.5 ms，
     阈值 30 ms；正常约 800 次、1–4 ms）。hello107 不调用任何凭证相关调用，和本轮改动无关的可能性大，但原因未查明。同一内核随后单独
     连跑 4 次 SMP=8，全部通过（最长 1.1–1.4 ms）。记为偶发，待查。
+- **第三十七轮：跨进程调用复核；/proc/PID/maps 遍历未固定的页表**：
+  - 复核（未改）：`process_vm_readv/writev` 只允许目标是自己的进程；`pidfd_getfd` 返回 EOPNOTSUPP；`move_pages` 只接受 pid 0；
+    `prlimit64` 改别的进程要 CAP_SYS_RESOURCE；用户态驱动调用（MMIO/IRQ/DMA）与 `ioperm_set` 都要 CAP_SYS_RAWIO，MMIO 还拒绝映射 RAM；
+    IPC 权能授予只允许端点属主。
+  - 缺陷：`/proc/PID/maps` 先不加锁找到目标任务，再直接遍历它的 `page_table_phys`。同一文件里的 `/proc/PID/rss` 已经在 task_lock 下
+    取页表并 `retainUserSpace`，maps 没有——目标在读取期间退出时，页表页会被释放、重用，读者在已释放的页上遍历。
+  - 修复：与 rss 相同：在 task_lock 下用 `findTaskByTidLocked` 取页表根并保留引用，解锁后遍历，结束时 `destroyUserSpace` 释放引用。
+  - 证据（如实）：竞态本身没有在 QEMU 里复现。host 源码结构测试检查“加锁取根 → 保留 → 遍历 → defer 释放”的顺序并禁止通过任务指针
+    取页表，旧代码上该测试失败；hello68 新增两项，确认 maps 能列出新映射的页、munmap 后不再列出（修复前后都通过，只覆盖功能）。
+  - 门禁：host 703/703，三架构构建通过，五组冒烟 hello114 各 302 ok、hello115 各 74 ok、0 FAIL、0 次内核态故障（这次 SMP=8 的
+    hello107 也通过），stress 5/5。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；

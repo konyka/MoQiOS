@@ -6477,3 +6477,20 @@ test "credentials: execve copies euid into the saved uid and drops capabilities 
     const d = cp.afterExec(.{ .r = 0, .e = 0, .s = 0 }, .{ .r = 0, .e = 0, .s = 0 }, .{ .effective = 0, .permitted = 0 });
     try std.testing.expectEqual(@as(u32, 0), d.caps.effective);
 }
+
+test "procfs: /proc/PID/maps pins the target address space before walking it" {
+    const src = kt.procfs_source;
+    const start = std.mem.indexOf(u8, src, "fn generatePidMaps(").?;
+    const end = std.mem.indexOfPos(u8, src, start, "\nfn ").?;
+    const body = src[start..end];
+    // looked up and retained under task_lock, released after the walk
+    const lock = std.mem.indexOf(u8, body, "lockTask()").?;
+    const retain = std.mem.indexOf(u8, body, "retainUserSpace(root)").?;
+    const unlock = std.mem.indexOf(u8, body, "unlockTask(flags)").?;
+    const walk = std.mem.indexOf(u8, body, "enumerateVMAs(root").?;
+    try std.testing.expect(lock < retain and retain < walk);
+    try std.testing.expect(std.mem.indexOf(u8, body, "defer user_space.destroyUserSpace(root)") != null);
+    _ = unlock;
+    // never walks through an unpinned task pointer
+    try std.testing.expect(std.mem.indexOf(u8, body, "t.page_table_phys") == null);
+}

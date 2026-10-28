@@ -115,16 +115,23 @@ fn generatePidStatus(pid: u32, buf: [*]u8, max_len: u32) u32 {
 }
 
 fn generatePidMaps(pid: u32, buf: [*]u8, max_len: u32) u32 {
-    _ = @import("../proc/task.zig"); // referenced by findTaskByPid
+    const task_mod = @import("../proc/task.zig");
+    const user_space = @import("../mm/user_space.zig");
     const paging_mod = @import("../arch/arch.zig").paging;
-    const t = findTaskByPid(pid) orelse {
+    // Pin the target's address space before walking it: the target may exit
+    // (and its page tables be freed and reused) while this reader runs.
+    const flags = task_mod.lockTask();
+    const idx = task_mod.findTaskByTidLocked(pid) orelse {
+        task_mod.unlockTask(flags);
         return appendStr(buf, 0, max_len, "# no such process\n");
     };
-    if (t.page_table_phys == 0) {
-        return appendStr(buf, 0, max_len, "# kernel thread\n");
-    }
+    const root = (task_mod.getTask(idx) orelse unreachable).page_table_phys;
+    if (root != 0) user_space.retainUserSpace(root);
+    task_mod.unlockTask(flags);
+    if (root == 0) return appendStr(buf, 0, max_len, "# kernel thread\n");
+    defer user_space.destroyUserSpace(root);
     var vmas: [32]paging_mod.VMAEntry = undefined;
-    const count = paging_mod.enumerateVMAs(t.page_table_phys, &vmas);
+    const count = paging_mod.enumerateVMAs(root, &vmas);
     var pos: u32 = 0;
     for (0..count) |i| {
         const vma = vmas[i];
