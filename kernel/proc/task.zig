@@ -658,6 +658,15 @@ fn uidTaskCountAddLocked(uid: u32) void {
     }
 }
 
+/// Caller must hold task_lock. A task's real UID changed (setuid family):
+/// move its RLIMIT_NPROC accounting so the reap-time removal, keyed by the
+/// stored uid, balances.
+pub fn moveRealUidLocked(old_uid: u32, new_uid: u32) void {
+    if (old_uid == new_uid) return;
+    uidTaskCountRemoveLocked(old_uid);
+    uidTaskCountAddLocked(new_uid);
+}
+
 fn uidTaskCountRemoveLocked(uid: u32) void {
     if (uidCountSlot(uid)) |slot| {
         if (uid_task_count[slot].count > 0) uid_task_count[slot].count -= 1;

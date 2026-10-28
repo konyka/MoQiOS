@@ -4412,6 +4412,26 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     `disk.img.manifest` 的 sha256 更新为 `a31e1f3a…`；`docs/build-and-toolchain.md` 写明基线应满足两个 fsck 都返回 0。
   - 验证：新基线 `fsck.fat -n`、`e2fsck -fn` 都是 0；用它连续启动两次（同一块盘），每次之后两个 fsck 仍为 0、hello114 302 ok。
     全套门禁：host 698/698，三架构构建，五组冒烟各 302 ok、0 FAIL、0 次内核态故障，stress 5/5。
+- **第三十三轮：setuid 一类调用改了身份却不动 capability（降权无效）**：
+  - 问题：capability 只在启动时由档案赋值，之后只有 `capset` 会改。`setuid(1000)` 后进程的 uid/euid/suid 全是 1000，但
+    permitted/effective 集原样保留——“root 先降权再处理不可信输入”这种标准做法在本系统里不降任何权限；它还能随时把 uid 改回 0。
+    另外，权限判断是“euid==0 就放行”，与 capability 模型不一致；`setuid`/`setgid` 在分发处先要求 CAP_SETUID/CAP_SETGID，
+    连“设成自己的 uid”这种 POSIX 允许的无特权调用也被拒绝；real uid 变化时 RLIMIT_NPROC 的按 uid 计数不迁移（回收时按新 uid 减，
+    旧 uid 的计数永远不归零）。第二十三轮复核时只看了“非 root 只能切到自己已有的 uid”，漏掉了这一点，在此更正。
+  - 修复：纯函数模块 `proc/cred_policy.zig`：
+    - 授权：持有 CAP_SETUID（gid 为 CAP_SETGID）可以设任意值；否则每个新值都必须是当前 real/effective/saved 之一
+      （`setreuid` 的 real 只能取 real/effective；`setuid` 无特权时只改 effective），euid 0 本身不再授权。
+    - capability（capabilities(7)，不支持 SECBIT）：r/e/s 原本有 0、变化后都不为 0 → 清空 permitted 和 effective；
+      euid 0→非 0 → 清空 effective；euid 非 0→0 → effective 恢复为 permitted。
+    - `credentials.zig` 的六个 set 调用都改用它；real uid 变化时 `task.moveRealUidLocked` 迁移 NPROC 计数。
+      分发处去掉 `setuid`/`setgid` 前置的权能检查（检查移到策略内部）。
+  - 新测试 hello115：以 uid 0、只持有 CAP_SETUID|CAP_SETGID 启动（启动档案只对 init 启动的 hello115 生效），三个场景各在子进程里跑：
+    临时降权再恢复、永久降权后无法回到 root、无特权时在自己的 id 之间切换。共 25 项。
+  - RED：未修改的 credentials.zig/syscall_entry.zig + hello115，7 项 FAIL（降权后 capability 仍在、降权后 setgid(0) 成功等）。
+  - 验证：host 700/700（新增策略测试和启动档案测试）。变异（均确认重新编译）：capability 不调整 → host 1 项失败、hello115 10 项
+    FAIL；无特权时任意 id 都放行 → host 1 项失败、hello115 8 项 FAIL。门禁：三架构构建通过，五组冒烟 hello114 各 302 ok、
+    hello115 各 25 ok、0 FAIL、0 次内核态故障，stress 5/5。
+  - 没做的：补充组（setgroups/getgroups）仍未实现，DAC 只看 egid；文件 capability 和 SECBIT_* 不支持。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；

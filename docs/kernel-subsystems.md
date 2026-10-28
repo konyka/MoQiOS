@@ -1884,7 +1884,10 @@ const SysCap = packed struct {
 
 - `kill`：要求 `CAP_KILL`
 - `bind`（特权端口 <1024）：要求 `CAP_NET_BIND_SERVICE`
-- `setuid` / `setgid`：要求 `CAP_SETUID` / `CAP_SETGID`
+- `setuid`/`setgid`/`setreuid`/`setregid`/`setresuid`/`setresgid`（`proc/cred_policy.zig`）：设成任意 ID 要求 `CAP_SETUID`/`CAP_SETGID`；
+  没有时只能在自己现有的 real/effective/saved ID 之间切换（euid 为 0 本身不授权）。uid 变化后 capability 按 capabilities(7) 调整：
+  r/e/s 中原本有 0、变化后都不为 0 → 清空 permitted 和 effective；euid 0→非 0 → 清空 effective；euid 非 0→0 → effective 恢复为
+  permitted。real uid 变化时 RLIMIT_NPROC 的按 uid 计数随之迁移。
 - `reboot`：要求 `CAP_SYS_BOOT`
 - `mount`：要求 `CAP_SYS_ADMIN`
 

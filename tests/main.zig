@@ -6374,3 +6374,54 @@ test "fat32: BPB exposes the FSInfo sector" {
     std.mem.writeInt(u16, b[48..50], 0xFFFF, .little);
     try std.testing.expectEqual(@as(u32, 0), fat32_util.parseBpb(&b, 0).?.fsinfo_lba);
 }
+
+test "credentials: uid changes follow capabilities(7) and CAP_SETUID gates arbitrary ids" {
+    const cp = kt.cred_policy;
+    const K = cp.KEEP;
+    const root: cp.Ids = .{ .r = 0, .e = 0, .s = 0 };
+    const all: cp.Caps = .{ .effective = 0xFFFF, .permitted = 0xFFFF };
+    // root drops to 1000 for good: every capability goes with it
+    const dropped = cp.setOne(root, 1000, true).?;
+    try std.testing.expectEqual(@as(u32, 1000), dropped.s);
+    const c1 = cp.capsAfterUidChange(root, dropped, all);
+    try std.testing.expectEqual(@as(u32, 0), c1.permitted);
+    try std.testing.expectEqual(@as(u32, 0), c1.effective);
+    // temporary drop (saved uid stays 0): effective cleared, permitted kept
+    const tmp = cp.setres(root, K, 1000, K, true).?;
+    const c2 = cp.capsAfterUidChange(root, tmp, all);
+    try std.testing.expectEqual(@as(u32, 0), c2.effective);
+    try std.testing.expectEqual(@as(u32, 0xFFFF), c2.permitted);
+    // ... and back to euid 0 without CAP_SETUID (0 is the saved uid): effective restored
+    const back = cp.setres(tmp, K, 0, K, false).?;
+    const c3 = cp.capsAfterUidChange(tmp, back, c2);
+    try std.testing.expectEqual(@as(u32, 0xFFFF), c3.effective);
+    // an unprivileged user cannot pick a foreign id, even when its euid is 0 ...
+    const u: cp.Ids = .{ .r = 1000, .e = 1000, .s = 1000 };
+    try std.testing.expect(cp.setOne(u, 0, false) == null);
+    try std.testing.expect(cp.setres(u, K, 0, K, false) == null);
+    try std.testing.expect(cp.setre(u, 0, K, false) == null);
+    try std.testing.expect(cp.setres(.{ .r = 0, .e = 0, .s = 0 }, 4242, K, K, false) == null);
+    // ... but may swap among its own ids
+    const own = cp.setres(.{ .r = 1000, .e = 2000, .s = 3000 }, 3000, 1000, 2000, false).?;
+    try std.testing.expectEqual(@as(u32, 3000), own.r);
+    // unprivileged setuid changes only the effective id
+    const eff = cp.setOne(.{ .r = 1000, .e = 2000, .s = 2000 }, 1000, false).?;
+    try std.testing.expectEqual(@as(u32, 2000), eff.s);
+    try std.testing.expectEqual(@as(u32, 1000), eff.e);
+    // setreuid: setting the real id moves the saved id to the new effective id
+    const re = cp.setre(.{ .r = 1000, .e = 1000, .s = 0 }, 1000, 1000, false).?;
+    try std.testing.expectEqual(@as(u32, 1000), re.s);
+    // a non-root user's capabilities are untouched by its own id shuffles
+    const c4 = cp.capsAfterUidChange(u, u, .{ .effective = 4, .permitted = 4 });
+    try std.testing.expectEqual(@as(u32, 4), c4.effective);
+}
+
+test "only hello115 starts as root with just the ID capabilities" {
+    const p = capability_profile.profileForLaunch("hello115", true, false);
+    try std.testing.expectEqual(@as(u32, 0), p.uid);
+    try std.testing.expect(p.caps.cap_setuid and p.caps.cap_setgid);
+    try std.testing.expectEqual(@as(u32, 2), @popCount(@as(u32, @bitCast(p.caps))));
+    const untrusted = capability_profile.profileForLaunch("hello115", false, false);
+    try std.testing.expectEqual(@as(u32, 1000), untrusted.uid);
+    try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(untrusted.caps)));
+}

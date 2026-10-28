@@ -20,27 +20,57 @@ fn getCurrentTask() ?*const task_mod.Task {
     return null;
 }
 
-/// setuid(uid) — set real and effective user ID.
+const policy = @import("cred_policy.zig");
+
+fn uidIds(t: *const task_mod.Task) policy.Ids {
+    return .{ .r = t.uid, .e = t.euid, .s = t.suid };
+}
+
+fn gidIds(t: *const task_mod.Task) policy.Ids {
+    return .{ .r = t.gid, .e = t.egid, .s = t.sgid };
+}
+
+/// Install new user IDs: capabilities follow capabilities(7), and the
+/// per-real-UID task count (RLIMIT_NPROC) moves with the real UID.
+fn applyUids(t: *task_mod.Task, new: policy.Ids) void {
+    const old = uidIds(t);
+    const caps = policy.capsAfterUidChange(old, new, .{
+        .effective = @bitCast(t.effective_caps),
+        .permitted = @bitCast(t.permitted_caps),
+    });
+    t.effective_caps = @bitCast(caps.effective);
+    t.permitted_caps = @bitCast(caps.permitted);
+    if (new.r != old.r) task_mod.moveRealUidLocked(old.r, new.r);
+    t.uid = new.r;
+    t.euid = new.e;
+    t.suid = new.s;
+}
+
+fn applyGids(t: *task_mod.Task, new: policy.Ids) void {
+    t.gid = new.r;
+    t.egid = new.e;
+    t.sgid = new.s;
+}
+
+/// setuid(uid) — CAP_SETUID sets real/effective/saved; otherwise only the
+/// effective ID, and only to the real or saved ID.
 pub fn setuid(uid: u32) i64 {
     const lock_flags = task_mod.lockTask();
     defer task_mod.unlockTask(lock_flags);
     const t = getCurrentTaskMut() orelse return -1;
-    if (t.euid != 0 and uid != t.uid and uid != t.suid) return -1; // EPERM
-    t.uid = uid;
-    t.euid = uid;
-    t.suid = uid;
+    const new = policy.setOne(uidIds(t), uid, t.effective_caps.cap_setuid) orelse return if (uid == policy.KEEP) -22 else -1;
+    applyUids(t, new);
     return 0;
 }
 
-/// setgid(gid) — set real and effective group ID.
+/// setgid(gid) — CAP_SETGID sets real/effective/saved; otherwise only the
+/// effective ID, and only to the real or saved ID.
 pub fn setgid(gid: u32) i64 {
     const lock_flags = task_mod.lockTask();
     defer task_mod.unlockTask(lock_flags);
     const t = getCurrentTaskMut() orelse return -1;
-    if (t.egid != 0 and gid != t.gid and gid != t.sgid) return -1;
-    t.gid = gid;
-    t.egid = gid;
-    t.sgid = gid;
+    const new = policy.setOne(gidIds(t), gid, t.effective_caps.cap_setgid) orelse return if (gid == policy.KEEP) -22 else -1;
+    applyGids(t, new);
     return 0;
 }
 
@@ -49,13 +79,7 @@ pub fn setreuid(ruid: u32, euid: u32) i64 {
     const lock_flags = task_mod.lockTask();
     defer task_mod.unlockTask(lock_flags);
     const t = getCurrentTaskMut() orelse return -1;
-    if (ruid != 0xFFFFFFFF and t.euid != 0 and ruid != t.uid and ruid != t.suid) return -1;
-    if (euid != 0xFFFFFFFF and t.euid != 0 and euid != t.uid and euid != t.euid and euid != t.suid) return -1;
-    if (ruid != 0xFFFFFFFF) t.uid = ruid;
-    if (euid != 0xFFFFFFFF) {
-        t.euid = euid;
-        t.suid = euid;
-    }
+    applyUids(t, policy.setre(uidIds(t), ruid, euid, t.effective_caps.cap_setuid) orelse return -1);
     return 0;
 }
 
@@ -64,13 +88,7 @@ pub fn setregid(rgid: u32, egid: u32) i64 {
     const lock_flags = task_mod.lockTask();
     defer task_mod.unlockTask(lock_flags);
     const t = getCurrentTaskMut() orelse return -1;
-    if (rgid != 0xFFFFFFFF and t.egid != 0 and rgid != t.gid and rgid != t.sgid) return -1;
-    if (egid != 0xFFFFFFFF and t.egid != 0 and egid != t.gid and egid != t.egid and egid != t.sgid) return -1;
-    if (rgid != 0xFFFFFFFF) t.gid = rgid;
-    if (egid != 0xFFFFFFFF) {
-        t.egid = egid;
-        t.sgid = egid;
-    }
+    applyGids(t, policy.setre(gidIds(t), rgid, egid, t.effective_caps.cap_setgid) orelse return -1);
     return 0;
 }
 
@@ -79,14 +97,7 @@ pub fn setresuid(ruid: u32, euid: u32, suid: u32) i64 {
     const lock_flags = task_mod.lockTask();
     defer task_mod.unlockTask(lock_flags);
     const t = getCurrentTaskMut() orelse return -1;
-    if (t.euid != 0) {
-        for ([_]u32{ ruid, euid, suid }) |val| {
-            if (val != 0xFFFFFFFF and val != t.uid and val != t.euid and val != t.suid) return -1;
-        }
-    }
-    if (ruid != 0xFFFFFFFF) t.uid = ruid;
-    if (euid != 0xFFFFFFFF) t.euid = euid;
-    if (suid != 0xFFFFFFFF) t.suid = suid;
+    applyUids(t, policy.setres(uidIds(t), ruid, euid, suid, t.effective_caps.cap_setuid) orelse return -1);
     return 0;
 }
 
@@ -105,14 +116,7 @@ pub fn setresgid(rgid: u32, egid: u32, sgid: u32) i64 {
     const lock_flags = task_mod.lockTask();
     defer task_mod.unlockTask(lock_flags);
     const t = getCurrentTaskMut() orelse return -1;
-    if (t.egid != 0) {
-        for ([_]u32{ rgid, egid, sgid }) |val| {
-            if (val != 0xFFFFFFFF and val != t.gid and val != t.egid and val != t.sgid) return -1;
-        }
-    }
-    if (rgid != 0xFFFFFFFF) t.gid = rgid;
-    if (egid != 0xFFFFFFFF) t.egid = egid;
-    if (sgid != 0xFFFFFFFF) t.sgid = sgid;
+    applyGids(t, policy.setres(gidIds(t), rgid, egid, sgid, t.effective_caps.cap_setgid) orelse return -1);
     return 0;
 }
 

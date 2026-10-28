@@ -106,6 +106,11 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
     {
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_sys_admin = true }, .initial_init = false };
     }
+    // Identity-change test: starts as root holding only the two ID capabilities,
+    // so dropping them is observable through capget.
+    if (std.mem.eql(u8, name, "hello115")) {
+        return .{ .uid = 0, .gid = 0, .caps = .{ .cap_setuid = true, .cap_setgid = true }, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello95") or std.mem.eql(u8, name, "hello114")) {
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_sys_mount = true }, .initial_init = false };
     }

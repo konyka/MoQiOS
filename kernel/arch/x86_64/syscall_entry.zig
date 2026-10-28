@@ -973,19 +973,11 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(getdents_mod.getdents64(@truncate(frame.rdi), frame.rsi, frame.rdx));
         },
         // ── v31.2: credentials/readlink/statx/copy_file_range/flock ──
-        174 => { // setuid(uid)
-            if (!checkCapForCurrent("cap_setuid")) {
-                frame.rax = @bitCast(@as(i64, -1)); // EPERM
-            } else {
-                frame.rax = @bitCast(cred_mod.setuid(@truncate(frame.rdi)));
-            }
+        174 => { // setuid(uid) — CAP_SETUID checked inside (unprivileged may return to its real/saved uid)
+            frame.rax = @bitCast(cred_mod.setuid(@truncate(frame.rdi)));
         },
         175 => { // setgid(gid)
-            if (!checkCapForCurrent("cap_setgid")) {
-                frame.rax = @bitCast(@as(i64, -1)); // EPERM
-            } else {
-                frame.rax = @bitCast(cred_mod.setgid(@truncate(frame.rdi)));
-            }
+            frame.rax = @bitCast(cred_mod.setgid(@truncate(frame.rdi)));
         },
         176 => { // setreuid(ruid, euid)
             frame.rax = @bitCast(cred_mod.setreuid(@truncate(frame.rdi), @truncate(frame.rsi)));
