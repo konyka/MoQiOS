@@ -284,7 +284,7 @@ pub fn shmat(shmid: u32, shmaddr: u64, shmflg: u64) i64 {
 
     var requested_access: u5 = if (shmflg & shm_policy.SHM_RDONLY != 0) 0o4 else 0o6;
     if (shmflg & shm_policy.SHM_EXEC != 0) requested_access |= 0o1;
-    if (task.euid != 0) {
+    if (!task.effective_caps.cap_sys_admin) {
         const class_bits: u5 = if (task.euid == seg.perm.uid)
             6
         else if (task.egid == seg.perm.gid)
@@ -524,7 +524,7 @@ pub fn shmctl(shmid: u32, cmd: i32, buf: u64) i64 {
     };
     const cur = if (sched.currentTaskIndex()) |idx| task_mod.getTask(idx) else null;
     const can_manage = if (cur) |task|
-        task.euid == 0 or task.euid == seg.perm.uid or task.euid == seg.perm.cuid
+        task.effective_caps.cap_sys_admin or task.euid == seg.perm.uid or task.euid == seg.perm.cuid
     else
         false;
 

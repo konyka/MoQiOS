@@ -9,7 +9,9 @@ const locked_dir: a.Meta = .{ .mode = 0o040700, .uid = 1000, .gid = 1000 };
 const alice: a.Creds = .{ .euid = 1000, .egid = 1000 };
 const bob: a.Creds = .{ .euid = 2000, .egid = 2000 };
 const grp: a.Creds = .{ .euid = 3000, .egid = 50 };
-const root: a.Creds = .{ .euid = 0, .egid = 0 };
+// root as launched: uid 0 holding CAP_DAC_OVERRIDE (uid 0 by itself grants nothing)
+const root: a.Creds = .{ .euid = 0, .egid = 0, .cap_dac_override = true };
+const bare_root: a.Creds = .{ .euid = 0, .egid = 0 };
 
 test "owner, group and other classes" {
     try std.testing.expect(a.canRead(owner_only, alice));
@@ -52,6 +54,9 @@ test "root and CAP_DAC_OVERRIDE bypass read/write but not a missing execute bit"
     try std.testing.expect(a.allows(exe, root, a.X));
     const capped: a.Creds = .{ .euid = 2000, .egid = 2000, .cap_dac_override = true };
     try std.testing.expect(a.canRead(owner_only, capped));
+    // uid 0 that dropped CAP_DAC_OVERRIDE is just another user
+    try std.testing.expect(!a.canRead(owner_only, bare_root));
+    try std.testing.expect(!a.canSearch(locked_dir, bare_root));
 }
 
 test "combined masks need every requested bit" {

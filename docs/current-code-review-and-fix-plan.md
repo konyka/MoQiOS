@@ -4432,6 +4432,19 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     FAIL；无特权时任意 id 都放行 → host 1 项失败、hello115 8 项 FAIL。门禁：三架构构建通过，五组冒烟 hello114 各 302 ok、
     hello115 各 25 ok、0 FAIL、0 次内核态故障，stress 5/5。
   - 没做的：补充组（setgroups/getgroups）仍未实现，DAC 只看 egid；文件 capability 和 SECBIT_* 不支持。
+- **第三十四轮：uid 0 不带任何 capability 也能绕过所有权限检查**：
+  - 问题：上一轮让 setuid 一类调用按 capabilities(7) 调整权能，但各处权限判断仍是“`euid == 0` 或持有某权能”就放行：文件 DAC
+    （`dac.allows`、只读卷 `rofs_access_policy.allows`）、chmod、chown、sticky 目录删除、SysV msg/sem/shm 的模式位和管理权、
+    POSIX MQ unlink、nice/调度/kcmp。于是 root 用 `capset` 丢掉全部权能后，照样能读 0000 文件、改别人的文件属主、看别人的 0600
+    队列、调高自己的优先级——“降权”只在 setuid 一条路径上有效。
+  - RED：hello115 新增场景 D（以 uid 0 启动，`capset` 清空权能后逐项尝试），未修改内核上 8 项 FAIL。
+  - 修复：上述 11 处判断去掉 `euid == 0` 分支，只看对应权能：DAC/MQ unlink 用 CAP_DAC_OVERRIDE，chmod 和 sticky 删除用 CAP_FOWNER，
+    chown 用 CAP_CHOWN，SysV IPC 用 CAP_SYS_ADMIN，nice/调度用 CAP_SYS_NICE，kcmp 用 CAP_SYS_PTRACE。root 启动时持有全部权能
+    （`ALL_CAPS`），所以正常 root 行为不变；没有当前任务的内核内部路径（readlink 回退）显式带上 CAP_DAC_OVERRIDE。
+  - 改了旧测试：6 个 host 测试原先断言“uid 0 不带权能也放行”，改为断言带权能放行、不带权能拒绝。
+  - 测试工具注意：本仓库的 msgctl 号是 159（不是 Linux 的 71）；第一次写的场景 D 用错了号，结果两项“失败”与内核无关，已改正。
+  - 验证：host 700/700；hello115 45 项全部 ok。变异（确认重新编译）：`dac.allows` 恢复 `euid == 0` 分支 → host 1 项失败、hello115
+    “不能打开 0000 文件”FAIL。门禁：三架构构建通过，五组冒烟 hello114 各 302 ok、hello115 各 45 ok、0 FAIL、0 次内核态故障，stress 5/5。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；

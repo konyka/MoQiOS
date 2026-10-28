@@ -2374,10 +2374,11 @@ test "DAC uses owner group and other mode classes with strict precedence" {
     try std.testing.expect(!dac.allows(meta, .{ .euid = 11, .egid = 21 }, .read));
 }
 
-test "DAC root and CAP_DAC_OVERRIDE bypass mode denial" {
+test "DAC: CAP_DAC_OVERRIDE bypasses mode denial, uid 0 alone does not" {
     const meta: dac.Metadata = .{ .mode = 0, .uid = 10, .gid = 20 };
 
-    try std.testing.expect(dac.allows(meta, .{ .euid = 0, .egid = 30 }, .read_write));
+    try std.testing.expect(dac.allows(meta, .{ .euid = 0, .egid = 30, .cap_dac_override = true }, .read_write));
+    try std.testing.expect(!dac.allows(meta, .{ .euid = 0, .egid = 30 }, .read));
     try std.testing.expect(dac.allows(meta, .{ .euid = 30, .egid = 30, .cap_dac_override = true }, .read_write));
     try std.testing.expect(!dac.allows(meta, .{ .euid = 30, .egid = 30 }, .read));
 }
@@ -2488,7 +2489,8 @@ test "scheduler calls: owner may change non-RT policy, RT and other users need C
     try std.testing.expect(!np.maySetScheduling(1000, 1000, 1000, 1000, false, true));
     try std.testing.expect(np.maySetScheduling(1000, 1000, 1000, 1000, true, true));
     try std.testing.expect(!np.maySetScheduling(1000, 1000, 0, 0, false, false));
-    try std.testing.expect(np.maySetScheduling(0, 0, 1000, 1000, false, true));
+    try std.testing.expect(!np.maySetScheduling(0, 0, 1000, 1000, false, true)); // uid 0 without CAP_SYS_NICE
+    try std.testing.expect(np.maySetScheduling(0, 0, 1000, 1000, true, true));
     try std.testing.expect(np.mayKcmp(1000, 1000, 1000, 1000, false));
     try std.testing.expect(!np.mayKcmp(1000, 1000, 0, 0, false));
     try std.testing.expect(np.mayKcmp(1000, 1000, 0, 0, true));
@@ -6148,7 +6150,8 @@ test "chmod is reserved to the owner or CAP_FOWNER" {
     try std.testing.expect(!dac.mayChmod(0, 1000, false));
     try std.testing.expect(!dac.mayChmod(4242, 1000, false));
     try std.testing.expect(dac.mayChmod(4242, 1000, true));
-    try std.testing.expect(dac.mayChmod(4242, 0, false));
+    try std.testing.expect(!dac.mayChmod(4242, 0, false)); // uid 0 without CAP_FOWNER
+    try std.testing.expect(dac.mayChmod(0, 0, false)); // ... still owns its own files
 }
 
 test "chown: giving a file away needs CAP_CHOWN, the owner may only pick its own group" {
@@ -6165,7 +6168,8 @@ test "chown: giving a file away needs CAP_CHOWN, the owner may only pick its own
     try std.testing.expect(dac.mayChown(0, 0, 1000, 1000, false, null, null)); // chown(-1,-1): nothing to authorize
     // capabilities
     try std.testing.expect(dac.mayChown(0, 0, 1000, 1000, true, 1000, 1000));
-    try std.testing.expect(dac.mayChown(1000, 1000, 0, 0, false, 0, 0));
+    try std.testing.expect(!dac.mayChown(1000, 1000, 0, 0, false, 0, 0)); // uid 0 without CAP_CHOWN
+    try std.testing.expect(dac.mayChown(1000, 1000, 0, 0, true, 0, 0));
 }
 
 test "DAC directory search and write-search permissions" {

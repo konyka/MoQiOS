@@ -300,7 +300,7 @@ test "permission matrix on the real fixture (owner 1000, others 4242)" {
     defer img.close();
     const v = try ext4.Volume.mount(img.reader());
     const me: access.Creds = .{ .euid = 1000, .egid = 1000 };
-    const root_c: access.Creds = .{ .euid = 0, .egid = 0 };
+    const root_c: access.Creds = .{ .euid = 0, .egid = 0, .cap_dac_override = true };
     try std.testing.expect(try canOpen(&v, "/perm/world.txt", me));
     try std.testing.expect(!try canOpen(&v, "/perm/private.txt", me));
     try std.testing.expect(!try canOpen(&v, "/perm/group.txt", me));
@@ -311,6 +311,8 @@ test "permission matrix on the real fixture (owner 1000, others 4242)" {
     // root reads everything (these files have no execute bit; read needs none)
     try std.testing.expect(try canOpen(&v, "/perm/private.txt", root_c));
     try std.testing.expect(try canOpen(&v, "/perm/locked/inside.txt", root_c));
+    // uid 0 without CAP_DAC_OVERRIDE gets the "others" class like anyone else
+    try std.testing.expect(!try canOpen(&v, "/perm/private.txt", .{ .euid = 0, .egid = 0 }));
 }
 
 test "statfs numbers match dumpe2fs for every fixture" {

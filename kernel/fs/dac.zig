@@ -45,7 +45,7 @@ pub fn accessForOpen(flags: u32) Access {
 }
 
 pub fn allows(metadata: Metadata, credentials: Credentials, access: Access) bool {
-    if (credentials.euid == 0 or credentials.cap_dac_override) return true;
+    if (credentials.cap_dac_override) return true;
 
     const shift: u5 = if (credentials.euid == metadata.uid)
         6
@@ -72,9 +72,10 @@ pub fn decideExistingOpen(metadata: Metadata, credentials: Credentials, flags: u
 }
 
 /// chmod/fchmod/fchmodat: only the file's owner, or a holder of CAP_FOWNER,
-/// may change its permission bits (POSIX; uid 0 counts as holding it).
+/// may change its permission bits. Privilege is the capability, not uid 0
+/// (a root process that dropped its capabilities is an ordinary owner).
 pub fn mayChmod(file_uid: u32, euid: u32, cap_fowner: bool) bool {
-    return euid == 0 or cap_fowner or euid == file_uid;
+    return cap_fowner or euid == file_uid;
 }
 
 /// chown/fchown/lchown. `new_uid`/`new_gid` of null mean "leave unchanged"
@@ -83,7 +84,7 @@ pub fn mayChmod(file_uid: u32, euid: u32, cap_fowner: bool) bool {
 /// groups are not tracked), anything else needs CAP_CHOWN. Re-stating the
 /// current ids is always allowed for the owner.
 pub fn mayChown(file_uid: u32, file_gid: u32, euid: u32, egid: u32, cap_chown: bool, new_uid: ?u32, new_gid: ?u32) bool {
-    if (euid == 0 or cap_chown) return true;
+    if (cap_chown) return true;
     if (new_uid) |u| {
         if (u != file_uid) return false;
     }
@@ -102,10 +103,10 @@ pub const S_ISVTX: u32 = 0o1000;
 
 /// Removing or renaming away entry `victim` from directory `dir`. Needs
 /// write+search on the directory; in a sticky directory (S_ISVTX, e.g. /tmp)
-/// additionally only the entry's owner, the directory's owner, uid 0 or
+/// additionally only the entry's owner, the directory's owner or a holder of
 /// CAP_FOWNER may do it.
 pub fn mayRemoveEntry(dir: Metadata, victim_uid: u32, credentials: Credentials, cap_fowner: bool) bool {
     if (!allows(dir, credentials, Access.write_search)) return false;
     if (dir.mode & S_ISVTX == 0) return true;
-    return credentials.euid == 0 or cap_fowner or credentials.euid == victim_uid or credentials.euid == dir.uid;
+    return cap_fowner or credentials.euid == victim_uid or credentials.euid == dir.uid;
 }

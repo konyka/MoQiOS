@@ -13,7 +13,7 @@ pub const Owner = struct {
 };
 
 pub fn modeAllows(mode: u32, owner: Owner, credentials: Credentials, read: bool, write: bool) bool {
-    if (credentials.euid == 0 or credentials.cap_sys_admin) return true;
+    if (credentials.cap_sys_admin) return true;
     const shift: u5 = if (credentials.euid == owner.uid)
         6
     else if (credentials.egid == owner.gid)
@@ -27,7 +27,7 @@ pub fn modeAllows(mode: u32, owner: Owner, credentials: Credentials, read: bool,
 }
 
 pub fn canManage(owner: Owner, credentials: Credentials) bool {
-    return credentials.euid == 0 or credentials.cap_sys_admin or
+    return credentials.cap_sys_admin or
         credentials.euid == owner.uid or credentials.euid == owner.cuid;
 }
 

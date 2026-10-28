@@ -34,7 +34,7 @@ fn classBits(m: Meta, c: Creds) u32 {
 
 /// May `c` perform every access in `want` (a mask of R/W/X) on `m`?
 pub fn allows(m: Meta, c: Creds, want: u32) bool {
-    const privileged = c.euid == 0 or c.cap_dac_override;
+    const privileged = c.cap_dac_override;
     if (privileged) {
         // Execute still needs some execute bit on a non-directory.
         if (want & X != 0 and m.mode & S_IFMT != S_IFDIR and m.mode & 0o111 == 0) return false;

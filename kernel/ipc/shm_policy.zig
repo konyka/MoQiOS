@@ -63,5 +63,6 @@ test "existing shmget lookup preserves exclusive and access semantics" {
     try std.testing.expectEqual(ExistingLookup.allow, existingLookup(false, 0, 0o600, owner, other));
     try std.testing.expectEqual(ExistingLookup.access_denied, existingLookup(false, 0o400, 0o600, owner, other));
     try std.testing.expectEqual(ExistingLookup.allow, existingLookup(false, 0o400, 0o604, owner, other));
-    try std.testing.expectEqual(ExistingLookup.allow, existingLookup(false, 0o600, 0, owner, .{ .euid = 0, .egid = 0 }));
+    try std.testing.expectEqual(ExistingLookup.allow, existingLookup(false, 0o600, 0, owner, .{ .euid = 0, .egid = 0, .cap_sys_admin = true }));
+    try std.testing.expectEqual(ExistingLookup.access_denied, existingLookup(false, 0o600, 0, owner, .{ .euid = 0, .egid = 0 }));
 }

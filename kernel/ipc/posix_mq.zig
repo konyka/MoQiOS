@@ -504,7 +504,7 @@ pub fn mqUnlink(name_ptr: u64) i64 {
     for (&queues) |*q| {
         if (q.active and str.eql(q.name[0..q.name_len], name_buf[0..name_len])) {
             // Like unlinking a file in a sticky directory: owner or privileged.
-            if (creds.euid != 0 and !creds.cap_dac_override and creds.euid != q.uid) {
+            if (!creds.cap_dac_override and creds.euid != q.uid) {
                 mq_lock.release(flags);
                 return -13; // EACCES
             }

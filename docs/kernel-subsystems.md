@@ -1888,6 +1888,10 @@ const SysCap = packed struct {
   没有时只能在自己现有的 real/effective/saved ID 之间切换（euid 为 0 本身不授权）。uid 变化后 capability 按 capabilities(7) 调整：
   r/e/s 中原本有 0、变化后都不为 0 → 清空 permitted 和 effective；euid 0→非 0 → 清空 effective；euid 非 0→0 → effective 恢复为
   permitted。real uid 变化时 RLIMIT_NPROC 的按 uid 计数随之迁移。
+- 特权只看 capability，不看 uid：文件 DAC（ext2/tmpfs/只读卷，`fs/dac.zig`、`fs/rofs_access_policy.zig`）用 `CAP_DAC_OVERRIDE`，
+  chmod/sticky 目录删除用 `CAP_FOWNER`，chown 用 `CAP_CHOWN`，SysV IPC 用 `CAP_SYS_ADMIN`，POSIX MQ unlink 用 `CAP_DAC_OVERRIDE`，
+  nice/调度用 `CAP_SYS_NICE`，kcmp 用 `CAP_SYS_PTRACE`。root 启动时持有全部 capability，因此行为不变；用 `capset` 或降权丢掉
+  capability 的 uid 0 进程与普通用户一样受权限位约束。
 - `reboot`：要求 `CAP_SYS_BOOT`
 - `mount`：要求 `CAP_SYS_ADMIN`
 
