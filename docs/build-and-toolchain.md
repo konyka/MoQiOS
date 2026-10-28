@@ -82,7 +82,16 @@ canonical fixture check is mandatory. A non-empty `MOQI_DISK` bypasses manifest 
 and retains the existing regular-file requirement, so custom images are not rejected for
 having a different hash. The RISC-V, AArch64, and NVMe paths are unchanged.
 
-`qemu_smoke.sh` removes its automatically created temporary work directory and generated logs on
+The fixture is expected to be internally consistent: `fsck.fat -n disk.img` and
+`e2fsck -fn "disk.img?offset=16777216"` both exit 0 (the FAT32 volume starts at LBA 0, the ext2
+volume at LBA 32768). After the kernel fixes of 2026-10 the image was rebuilt from the previous
+one by repairing both volumes, removing four duplicate `fsync_probe.txt` entries left by older
+kernels, and scrubbing kernel addresses that older kernels had leaked into the extended area of
+ext2 inodes 12-14; the file set the tests rely on is unchanged.
+
+`qemu_smoke.sh` truncates its serial and run logs before every boot (also when the caller names
+them via `MOQI_SMOKE_LOG`/`MOQI_SMOKE_RUN_LOG`), so markers from an earlier run cannot satisfy the
+PASS checks. It removes its automatically created temporary work directory and generated logs on
 exit. A caller-supplied `MOQI_SMOKE_WORK_DIR` is treated as caller-owned and is preserved.
 A caller-supplied `MOQI_SMOKE_DISK` is likewise caller-owned: it is booted as given (so a disk can
 be carried across runs or prepared beforehand) and must already exist; only the default private

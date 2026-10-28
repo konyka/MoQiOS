@@ -4403,6 +4403,15 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     变异（确认重新编译）：`owned` 恒为 0 且不写 FSInfo → 同样的 12 条孤立 LFN 中的 10 条以上和 “Free cluster summary wrong”
     重新出现。门禁：三架构构建通过，五组冒烟 `hello114` 各 302 ok、0 FAIL、0 次内核态故障，stress 5/5。
   - FAT32 没有 rename，删除是唯一会留下 LFN 的路径。
+- **第三十二轮：重做基线 `disk.img`（前几轮“未解决”中的一项）**：
+  - 旧基线本身就不一致：FAT32 有 10 条孤立 LFN、5 个同名 `fsync_probe.txt`、多个文件的簇链比大小长、两份 FAT 有 26 处不同；
+    ext2 的 inode 12/13/14 扩展区含内核地址（`i_extra_isize` 6680/5032），块 100 被 inode 15/16 重复引用，inode 13/16 无目录项。
+  - 做法：`fsck.fat -a` 修 FAT32 并删掉 4 个重复的 `fsync_probe.txt`；`e2fsck -fy` 修 ext2（13/16 被放进 lost+found，内容是旧测试的
+    “hello from subdir!”/“Hello from”，随后删除）；把仍在用的 inode 12–14 扩展区里的内核地址清零（`i_extra_isize=32`）。测试依赖的文件
+    （FAT32：TEST.TXT、fsync_probe.txt、/h48_shared.dat、writetest.txt；ext2：testdir、anotherdir、writetest.txt、lost+found）都保留。
+    `disk.img.manifest` 的 sha256 更新为 `a31e1f3a…`；`docs/build-and-toolchain.md` 写明基线应满足两个 fsck 都返回 0。
+  - 验证：新基线 `fsck.fat -n`、`e2fsck -fn` 都是 0；用它连续启动两次（同一块盘），每次之后两个 fsck 仍为 0、hello114 302 ok。
+    全套门禁：host 698/698，三架构构建，五组冒烟各 302 ok、0 FAIL、0 次内核态故障，stress 5/5。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；
