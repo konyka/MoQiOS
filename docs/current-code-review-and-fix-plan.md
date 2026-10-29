@@ -4728,6 +4728,36 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     该 CPU 之后的 kick 都会被合并掉；但停滞日志里没有 `[LAPIC] WARN: ICR delivery timeout`，所以不是这次停滞的原因（未改）。
   - 验证：host 720/720；riscv64/aarch64 构建通过；冒烟 MBR SMP=1/2/8、GPT SMP=2/8 五组 0 FAIL、hello102 PASS；
     stress 5/5（负载峰值 7.58）。五组冒烟里 hello108 各窗口 nvcsw=nivcsw=0。
+- **第五十四轮：“停在 hello2 退出之后”的 CPU0 停滞——原因已找到并修复（6.56 节 (14) 的未解项）**：
+  - 现场（这次有 LAPIC 寄存器）：4 路并行 SMP=2 猎捕（QEMU monitor + gdb），28 次启动抓到 2 次停滞。
+    `hs_w3_r3` 是这个签名：串口停在 hello2 的 `[exit] task exited with code 42`；**CPU0 的 LAPIC：`ISR=242`、`IRR=240`、`PPR=0xf0`**；
+    `idt.tick_count=0`、`sched_entries[0]=0`（CPU0 从未处理过一次定时器中断）、reaper 有待处理项但从未开始。CPU1 的 LAPIC 正常。
+    另一次（`hs_w4_r5`）是不同的签名（hello114 O 段并发读者阶段，CPU0 `ISR` 为空、`IRR=240`、`tick_count=7999`），**与本问题无关**。
+    该转储里一个读者（tid 334）是 `.ready`、两个 CPU 都在 `hlt` 且 IF=1，而 CPU0 有待处理的定时器中断——下一个 tick 就会调度它，
+    所以单个快照**无法区分**“真的停住”和“恰好在这一瞬间”；hello114 O 段本来就慢，而猎捕脚本只按 40 秒无输出判停。
+    不把它算作缺陷，也不声称不是；后续的探针应隔几秒取两次快照再判断。
+  - 原因：向量 242 是 NVMe 第 0 个 MSI-X 向量。NVMe（和 AHCI）在 `nvme.init()` 里做一次中断驱动的启动自测，而 LAPIC 的 MMIO
+    映射（`lapic_base`）要到很久之后的 `lapic.init` 才设置；在那之前 `lapic.eoi()` 因 `lapic_base == 0` 直接返回。自测通常
+    在中断到达前就从完成队列里自己取到了结果（快路径），所以多数启动没事；**当完成中断赶在取结果之前送达时**，ISR 位 242 永远
+    不会被清，其优先级类（0xF）高于定时器 240 所在的类，于是 CPU0 的定时器中断永远被挡住。reaper 固定在 CPU0，所以第一个需要
+    回收的进程（hello2）之后 init 就一直等。CPU0 上没有 tick，就没有调度，这与之前转储里的 `sched_entries[0]=0` 完全吻合。
+  - 放大实验：临时让启动阶段（无当前任务时）的 NVMe 等待跳过“自己取结果”，强制完成经由中断送达——**未修复 3/3 停在同一处**
+    （串口最后一行都是 hello2 的退出），**修复后 3/3 到达 shell**；放大器已移除（`grep TEMPORARY` 为 0）。另做探针：在
+    `lapic.init` 里读 ISR/IRR，6/6 次启动的 IRR 都挂着向量 242（中断确实在 LAPIC 可用前到达）。第一版放大器写法有语法错误、
+    编译失败，那 3 次结果跑的是旧 ELF，作废后重做。
+  - 先排除的假设（如实）：最初怀疑是这一点，但第一个探针在 `lapic.init` 处读到 ISR 为空，就暂时放下了——那只说明那几次启动里
+    中断还挂在 IRR、没有被接受；真正的停滞现场（ISR=242）是 monitor 猎捕拿到的。
+  - 修复：`lapic.mapEarly(phys)`——只做 MMIO 映射并发布 `lapic_base`，不碰定时器；`main.zig` 在 ACPI 解析之后、任何驱动初始化
+    之前调用；`lapic.init` 复用它。源码守卫测试检查 `mapEarly` 先于 `ahci.init()` 与 `nvme.init()`；把调用挪回 `lapic.init`
+    之前的变异使该测试失败，恢复后 721/721。
+  - 验证：host 721/721（新增 1 个源码顺序守卫）；riscv64/aarch64 构建通过；冒烟 MBR SMP=1/2/8、GPT SMP=2/8 五组 0 FAIL 且都到达 shell。
+    stress 第一次第 4 轮 hello108 FAIL（reaping max_gap 6073 µs、stolen 16694 µs，**窗口内 nvcsw=nivcsw=0**）；
+    那一轮运行期间宿主机负载从 2.8 升到 18.45（负载记录与该轮串口日志的时间对得上）。重跑 stress 5/5（负载峰值 7.16）。
+  - hello108 的新证据（第五十三轮加的诊断第一次拿到失败样本）：失败窗口里 RT 任务**一次都没有被调度器换下**，
+    所以丢掉的约 6 ms 不是内核调度决策造成的，只能是中断处理/关中断的内核代码，或宿主机没有给 vCPU 时间。结合负载同步飙升，
+    我倾向于后者，但**没有证明**：要区分这两者，需要在客户机里记录中断处理耗时（未做）。
+  - 影响范围：之前文档把停滞归为“可能是 QEMU 侧或 LAPIC 校准问题”，这个猜测是错的。之前 6.56 节 (14) 的两次（`h2_r16`、`h4_r6`）
+    与本次签名相同（CPU0 `sched_entries=0`），**推断**同因；那两次没有 LAPIC 寄存器，不是直接证据。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；
@@ -4832,7 +4862,7 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   `portableKernelSwitch`/`nativeTrapFramePreempt` 在这里没有该窗口；`apBootstrapIdle` 每个 AP 只调用一次，进入的是该 CPU 自己的 idle 任务，
   没有“旧任务”要发布；`timerTickLegacy` 在 `sched_fine_grain_enable = true` 时是编译期不可达的回滚路径，它在 `sched_lock` 内直接
   `old_task.state = .ready` 并入队，窗口与修复前相同，**如果有人把回滚开关关掉，这个窗口会回来**，当前没有对它做任何修改。
-  (14) **最终构建上抓到的两次停滞（原因未查明）**：对最终构建（`b93fff9`，无放大器）再做 4 路并行 GPT SMP=2 猎捕（分两批，各批的启动总数我没有保留，所以不给出发生率），
+  (14) **最终构建上抓到的两次停滞（原因已在第五十四轮查明并修复：LAPIC 映射前到达的 NVMe MSI 的 EOI 被丢弃，ISR 242 挡住了 CPU0 的定时器）**：对最终构建（`b93fff9`，无放大器）再做 4 路并行 GPT SMP=2 猎捕（分两批，各批的启动总数我没有保留，所以不给出发生率），
   出现 **2 次**同签名的停滞（`h2_r16`、`h4_r6`，转储在 `/tmp/keep_evidence`，不在仓库）：串口停在 `hello2` 的
   `[exit] task exited with code 42` 之后，init（slot 4，tid 5）`state=blocked`、`pending_signals=0x10000`（SIGCHLD）、
   `waiting_for_child=0`；hello2（slot 5）`state=zombie`、`parent_tid=0`（`h4_r6` 里 `reap_pending=1`，即已交给 reaper，

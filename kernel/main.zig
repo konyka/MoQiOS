@@ -122,6 +122,11 @@ export fn _start() callconv(.c) noreturn {
         serial.writeString(" CPUs detected\n");
     }
 
+    // LAPIC MMIO before any driver can take an interrupt: the storage boot
+    // self-tests below are MSI-driven, and their EOIs are dropped while the
+    // LAPIC is unmapped (see lapic.mapEarly). The timer starts later.
+    lapic.mapEarly(if (acpi.info.lapic_address != 0) acpi.info.lapic_address else 0xFEE00000);
+
     // M2: Slab allocator (shared boot fragment — SK-32)
     subsystem_boot.initSlab();
 

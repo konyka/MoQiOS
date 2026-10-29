@@ -825,6 +825,19 @@ test "ELF loader bounds unaligned first-page copies" {
     try std.testing.expect(copy > copy_len);
 }
 
+test "the LAPIC is mapped before any driver can take an MSI, so its EOI is never dropped" {
+    // An NVMe/AHCI MSI taken while lapic_base was still 0 had its EOI
+    // silently skipped; the vector stayed in-service and masked the timer
+    // (vector 240 < 242) on CPU0 for good.
+    const main_source = kt.main_source;
+    const early = std.mem.indexOf(u8, main_source, "lapic.mapEarly(").?;
+    const ahci = std.mem.indexOf(u8, main_source, "ahci.init();").?;
+    const nvme = std.mem.indexOf(u8, main_source, "nvme.init();").?;
+    try std.testing.expect(early < ahci and early < nvme);
+    const lapic_src = kt.lapic_source;
+    try std.testing.expect(std.mem.indexOf(u8, lapic_src, "pub fn mapEarly(lapic_phys: u64) void") != null);
+}
+
 test "boot treats reaper startup failure as fatal" {
     const main_source = kt.main_source;
     const reaper_start = std.mem.indexOf(u8, main_source, "proc/reaper.zig").?;

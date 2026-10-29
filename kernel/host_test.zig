@@ -233,6 +233,7 @@ pub const loader_source = @embedFile("proc/loader.zig");
 pub const execve_source = @embedFile("proc/execve.zig");
 pub const reaper_source = @embedFile("proc/reaper.zig");
 pub const main_source = @embedFile("main.zig");
+pub const lapic_source = @embedFile("arch/x86_64/lapic.zig");
 pub const unsupported_policy = @import("proc/unsupported_policy.zig");
 pub const signal_syscall_source = @embedFile("proc/signal_syscall.zig");
 pub const file_io_source = @embedFile("fs/file_io.zig");

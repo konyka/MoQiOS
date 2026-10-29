@@ -549,6 +549,9 @@ wakeup 前释放 pin；slot 只有在 zombie、无 operation refs 且满足调�
   创建者不阻塞，缺陷即刻显形。
 - 时间片 10 个 tick（100ms），LAPIC timer ISR 触发 `schedule()`，调用
   `switchContext(prev, next)`（`arch/x86_64/context.S`）。
+- **LAPIC 映射先于驱动**：`lapic.mapEarly` 在 ACPI 解析之后、任何驱动初始化之前映射 LAPIC MMIO（定时器仍在 `lapic.init` 启动）。
+  NVMe/AHCI 的启动自测是 MSI 中断驱动的；LAPIC 未映射时 `eoi()` 是空操作，被漏掉 EOI 的向量 242 会一直处于 in-service，
+  按优先级挡住 CPU0 的定时器（240），CPU0 从此不再调度（review 第五十四轮）。
 - **唤醒抢占（2026-10）**：所有 `.blocked → .ready` 统一经 `task.readyFromBlockedLocked`，
   `unblockTask*` / `publishRunnable` 释放 `task_lock` 后调用 `sched.notifyWake(t)`，由
   `proc/wake_preempt_policy.zig` 决定：本地严格更优 → self-IPI（在 `sysretq`/`iretq` 恢复

@@ -161,8 +161,16 @@ pub fn setBase(base: u64) void {
     lapic_base = base;
 }
 
-/// Initialize the BSP's Local APIC and start the periodic timer.
-pub fn init(lapic_phys: u64) void {
+/// Map the BSP's LAPIC MMIO window and publish `lapic_base`, without touching
+/// the timer. Must run before any device can deliver an MSI: the NVMe/AHCI
+/// boot self-tests take real interrupts long before `init`, and `eoi()` is a
+/// no-op while `lapic_base` is 0. A skipped EOI leaves that vector in-service
+/// for good, and the in-service priority (vector 242 > timer 240) then masks
+/// the BSP timer forever — CPU0 never schedules again (observed: ISR=242,
+/// IRR=240, PPR=0xf0, zero scheduler ticks on CPU0, reaper pinned there
+/// never runs, init waits on hello2's teardown).
+pub fn mapEarly(lapic_phys: u64) void {
+    if (lapic_base != 0) return;
     // Map LAPIC MMIO region using a 2MB huge page to avoid splitting
     const virt = hhdm.physToVirt(lapic_phys);
     if (!paging.isPageMapped(paging.getKernelPml4(), virt)) {
@@ -180,6 +188,11 @@ pub fn init(lapic_phys: u64) void {
     }
 
     lapic_base = virt;
+}
+
+/// Initialize the BSP's Local APIC and start the periodic timer.
+pub fn init(lapic_phys: u64) void {
+    mapEarly(lapic_phys);
 
     // Enable APIC: set bit 8 in SVR, spurious vector 0xFF
     writeReg(REG_SVR, 0x100 | 0xFF);
