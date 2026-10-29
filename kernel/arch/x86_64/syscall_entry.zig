@@ -1382,10 +1382,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             }
         },
         261 => { // renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
-            _ = frame.rdi;
-            _ = frame.rdx;
-            _ = frame.r8;
-            frame.rax = @bitCast(syscallRename(frame.rsi, frame.r10));
+            // dirfds: a volume dirfd was answered by rofsGuard (EROFS); the
+            // flat filesystems resolve names without a directory fd.
+            frame.rax = @bitCast(syscallRenameFlags(frame.rsi, frame.r10, @truncate(frame.r8)));
         },
         // ── v34.0: Syscall 补全第四轮 ─────────────────────────────────────
         262 => { // vfork() — delegate to fork (COW semantics via full copy)
@@ -3772,6 +3771,19 @@ fn truncateDesc(desc: *vfs_mod.FileDescriptor, length: u64) i64 {
 
 /// rename(oldpath, newpath) — rename a file.
 fn syscallRename(old_ptr: u64, new_ptr: u64) i64 {
+    return syscallRenameFlags(old_ptr, new_ptr, 0);
+}
+
+/// rename/renameat2. /tmp↔/tmp goes to tmpfs (all three modes); a rename
+/// between /tmp and anything else is EXDEV; other paths go to ext2, which
+/// only implements a plain rename, so NOREPLACE/EXCHANGE there are EINVAL
+/// (Linux's answer for a filesystem without those flags).
+fn syscallRenameFlags(old_ptr: u64, new_ptr: u64, flags: u32) i64 {
+    const rename_policy = @import("../../fs/rename_policy.zig");
+    const mode = switch (rename_policy.mode(flags)) {
+        .ok => |m| m,
+        .err => |e| return e,
+    };
     if (old_ptr == 0 or old_ptr >= 0x0000_8000_0000_0000 or
         new_ptr == 0 or new_ptr >= 0x0000_8000_0000_0000) return -14;
     const copy = @import("../../mm/copy_from_user.zig");
@@ -3786,8 +3798,19 @@ fn syscallRename(old_ptr: u64, new_ptr: u64) i64 {
     while (old_len < 256 and old_buf[old_len] != 0) : (old_len += 1) {}
     var new_len: usize = 0;
     while (new_len < 256 and new_buf[new_len] != 0) : (new_len += 1) {}
+    const old_path = old_buf[0..old_len];
+    const new_path = new_buf[0..new_len];
+    switch (rename_policy.route(old_path, new_path)) {
+        .cross => return -18, // EXDEV
+        .tmpfs => {
+            const cur = @import("../../proc/sched.zig").currentTask() orelse return -1;
+            return @import("../../fs/tmpfs.zig").tmpfsRename(old_path, new_path, mode, .{ .euid = cur.euid, .egid = cur.egid, .effective_caps = cur.effective_caps });
+        },
+        .other => {},
+    }
+    if (mode != .replace) return -22;
     const ext2 = @import("../../fs/ext2.zig");
-    const r = ext2.renameFile(old_buf[0..old_len], new_buf[0..new_len], ext2Who());
+    const r = ext2.renameFile(old_path, new_path, ext2Who());
     return if (r == 0 or r == -13) r else -18; // EXDEV
 }
 

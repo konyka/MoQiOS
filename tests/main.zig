@@ -6426,14 +6426,17 @@ test "credentials: uid changes follow capabilities(7) and CAP_SETUID gates arbit
     try std.testing.expectEqual(@as(u32, 4), c4.effective);
 }
 
-test "only hello115 starts as root with just the ID capabilities" {
-    const p = capability_profile.profileForLaunch("hello115", true, false);
-    try std.testing.expectEqual(@as(u32, 0), p.uid);
-    try std.testing.expect(p.caps.cap_setuid and p.caps.cap_setgid);
-    try std.testing.expectEqual(@as(u32, 2), @popCount(@as(u32, @bitCast(p.caps))));
-    const untrusted = capability_profile.profileForLaunch("hello115", false, false);
-    try std.testing.expectEqual(@as(u32, 1000), untrusted.uid);
-    try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(untrusted.caps)));
+test "only hello115 and hello119 start as root with just the ID capabilities" {
+    for ([_][]const u8{ "hello115", "hello119" }) |name| {
+        const p = capability_profile.profileForLaunch(name, true, false);
+        try std.testing.expectEqual(@as(u32, 0), p.uid);
+        try std.testing.expect(p.caps.cap_setuid and p.caps.cap_setgid);
+        try std.testing.expectEqual(@as(u32, 2), @popCount(@as(u32, @bitCast(p.caps))));
+        const untrusted = capability_profile.profileForLaunch(name, false, false);
+        try std.testing.expectEqual(@as(u32, 1000), untrusted.uid);
+        try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(untrusted.caps)));
+    }
+    try std.testing.expectEqual(@as(u32, 1000), capability_profile.profileForLaunch("hello118", true, false).uid);
 }
 
 test "supplementary groups select the group class and widen chown targets" {
@@ -6730,4 +6733,37 @@ test "memfd seals vs mmap: a shared mapping of a write-sealed file can never bec
     try std.testing.expect(mp.mapMayWrite(mp.F_SEAL_WRITE, false, true)); // private COW
     try std.testing.expect(mp.mapMayWrite(mp.F_SEAL_GROW, true, true));
     try std.testing.expect(!mp.mapMayWrite(0, true, false)); // read-only fd
+}
+
+test "renameat2 flags: NOREPLACE, EXCHANGE, and EINVAL for unknown, WHITEOUT and both together" {
+    const rp = kt.rename_policy;
+    try std.testing.expectEqual(rp.Mode.replace, rp.mode(0).ok);
+    try std.testing.expectEqual(rp.Mode.noreplace, rp.mode(rp.RENAME_NOREPLACE).ok);
+    try std.testing.expectEqual(rp.Mode.exchange, rp.mode(rp.RENAME_EXCHANGE).ok);
+    try std.testing.expectEqual(@as(i64, -22), rp.mode(rp.RENAME_NOREPLACE | rp.RENAME_EXCHANGE).err);
+    try std.testing.expectEqual(@as(i64, -22), rp.mode(rp.RENAME_WHITEOUT).err);
+    try std.testing.expectEqual(@as(i64, -22), rp.mode(0x100).err);
+}
+
+test "rename routing: /tmp to /tmp is tmpfs, /tmp to elsewhere is EXDEV, /tmpx is not /tmp" {
+    const rp = kt.rename_policy;
+    try std.testing.expectEqual(rp.Route.tmpfs, rp.route("/tmp/a", "/tmp/b"));
+    try std.testing.expectEqual(rp.Route.cross, rp.route("/tmp/a", "/b"));
+    try std.testing.expectEqual(rp.Route.cross, rp.route("/a", "/tmp/b"));
+    try std.testing.expectEqual(rp.Route.other, rp.route("/a", "/b"));
+    try std.testing.expectEqual(rp.Route.other, rp.route("/tmpx/a", "/b"));
+}
+
+test "rename target rules: type mismatch, non-empty directory, NOREPLACE and EXCHANGE" {
+    const rp = kt.rename_policy;
+    try std.testing.expectEqual(@as(i64, 0), rp.checkTarget(.replace, false, .{ .exists = false }));
+    try std.testing.expectEqual(@as(i64, 0), rp.checkTarget(.replace, false, .{ .exists = true }));
+    try std.testing.expectEqual(@as(i64, -21), rp.checkTarget(.replace, false, .{ .exists = true, .is_dir = true }));
+    try std.testing.expectEqual(@as(i64, -20), rp.checkTarget(.replace, true, .{ .exists = true }));
+    try std.testing.expectEqual(@as(i64, -39), rp.checkTarget(.replace, true, .{ .exists = true, .is_dir = true, .empty = false }));
+    try std.testing.expectEqual(@as(i64, 0), rp.checkTarget(.replace, true, .{ .exists = true, .is_dir = true }));
+    try std.testing.expectEqual(@as(i64, -17), rp.checkTarget(.noreplace, false, .{ .exists = true }));
+    try std.testing.expectEqual(@as(i64, 0), rp.checkTarget(.noreplace, false, .{ .exists = false }));
+    try std.testing.expectEqual(@as(i64, -2), rp.checkTarget(.exchange, false, .{ .exists = false }));
+    try std.testing.expectEqual(@as(i64, 0), rp.checkTarget(.exchange, true, .{ .exists = true }));
 }

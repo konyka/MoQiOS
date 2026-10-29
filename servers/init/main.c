@@ -246,6 +246,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello115"); /* setuid family drops capabilities (capabilities(7)) */
     run_test("hello117"); /* prctl: PDEATHSIG delivery, NO_NEW_PRIVS */
     run_test("hello118"); /* memfd_create */
+    run_test("hello119"); /* rename on tmpfs */
 
     start_persistent_services();
 

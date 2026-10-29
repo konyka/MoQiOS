@@ -6,6 +6,7 @@ const hhdm = @import("../mm/hhdm.zig");
 const capability = @import("../proc/capability_profile.zig");
 const creation_metadata = @import("../proc/creation_metadata.zig");
 const dac = @import("dac.zig");
+const rename_policy = @import("rename_policy.zig");
 
 const MAX_FILES = 64;
 const MAX_NAME_LEN = 60;
@@ -583,6 +584,115 @@ pub fn tmpfsUnlinkAuthorized(path: []const u8, who: ?Remover) i64 {
         entry.active = false;
         entry.deleted = false;
     }
+    return 0;
+}
+
+fn hasChildren(dir: u8) bool {
+    var bm = active_bm;
+    while (bm != 0) {
+        const ci: u8 = @intCast(@ctz(bm));
+        bm &= bm - 1;
+        if (!entries[ci].deleted and ci != dir and entries[ci].parent_idx == dir) return true;
+    }
+    return false;
+}
+
+/// Whether directory `anc` is `dir` or one of its ancestors.
+fn isAncestorOrSelf(anc: u8, dir: u8) bool {
+    var d = dir;
+    var hops: u32 = 0;
+    while (hops <= MAX_FILES) : (hops += 1) {
+        if (d == anc) return true;
+        if (d == 0 or d >= MAX_FILES) return false;
+        d = entries[d].parent_idx;
+    }
+    return false;
+}
+
+/// Removing `victim` from `parent` for rename: -13 without write+search on
+/// the directory, -1 (EPERM) when only the sticky rule refuses it.
+fn mayDetach(parent: u8, victim: u8, who: ?Remover) i64 {
+    const w = who orelse return 0;
+    const creds: dac.Credentials = .{ .euid = w.euid, .egid = w.egid, .cap_dac_override = w.effective_caps.cap_dac_override, .groups = @import("../proc/current_groups.zig").forCaller(w.euid, w.egid) };
+    if (!dac.allows(dirMeta(parent), creds, dac.Access.write_search)) return -13;
+    if (!dac.mayRemoveEntry(dirMeta(parent), entries[victim].uid, creds, w.effective_caps.cap_fowner)) return -1;
+    return 0;
+}
+
+/// rename/renameat2 inside tmpfs. Lookup, permission checks and the update
+/// happen under one hold of tmpfs_lock, so the operation is atomic for every
+/// other tmpfs caller. Open descriptors and mappings refer to entry indices,
+/// not names, and keep working. A replaced target is tombstoned exactly like
+/// unlink (freed at its last close).
+pub fn tmpfsRename(old_path: []const u8, new_path: []const u8, m: rename_policy.Mode, who: ?Remover) i64 {
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+
+    var old_name: [MAX_NAME_LEN]u8 = undefined;
+    var old_len: u8 = 0;
+    const old_parent = resolvePath(old_path, &old_name, &old_len) orelse return -2;
+    var new_name: [MAX_NAME_LEN]u8 = undefined;
+    var new_len: u8 = 0;
+    const new_parent = resolvePath(new_path, &new_name, &new_len) orelse return -2;
+    const is_root = struct {
+        fn f(n: []const u8) bool {
+            return n.len == 1 and n[0] == '/';
+        }
+    }.f;
+    if (is_root(old_name[0..old_len]) or is_root(new_name[0..new_len])) return -16; // EBUSY
+
+    const src = findEntry(old_name[0..old_len], old_parent) orelse return -2;
+    const dst = findEntry(new_name[0..new_len], new_parent);
+    if (dst != null and dst.? == src) return 0; // same file: no-op
+
+    const src_is_dir = entries[src].is_dir;
+    const target: rename_policy.Target = if (dst) |d| .{
+        .exists = true,
+        .is_dir = entries[d].is_dir,
+        .empty = !entries[d].is_dir or !hasChildren(d),
+    } else .{ .exists = false };
+    const rule = rename_policy.checkTarget(m, src_is_dir, target);
+    if (rule != 0) return rule;
+
+    // A directory cannot move below itself (for EXCHANGE: in either direction).
+    if (src_is_dir and isAncestorOrSelf(src, new_parent)) return -22;
+    if (m == .exchange and entries[dst.?].is_dir and isAncestorOrSelf(dst.?, old_parent)) return -22;
+
+    const r1 = mayDetach(old_parent, src, who);
+    if (r1 != 0) return r1;
+    if (dst) |d| {
+        const r2 = mayDetach(new_parent, d, who);
+        if (r2 != 0) return r2;
+    } else if (who) |w| {
+        const creds: dac.Credentials = .{ .euid = w.euid, .egid = w.egid, .cap_dac_override = w.effective_caps.cap_dac_override, .groups = @import("../proc/current_groups.zig").forCaller(w.euid, w.egid) };
+        if (!dac.allows(dirMeta(new_parent), creds, dac.Access.write_search)) return -13;
+    }
+
+    if (m == .exchange) {
+        const d = dst.?;
+        const tmp_name = entries[d].name;
+        const tmp_len = entries[d].name_len;
+        entries[d].name = entries[src].name;
+        entries[d].name_len = entries[src].name_len;
+        entries[d].parent_idx = old_parent;
+        entries[src].name = tmp_name;
+        entries[src].name_len = tmp_len;
+        entries[src].parent_idx = new_parent;
+        return 0;
+    }
+
+    if (dst) |d| {
+        const victim = &entries[d];
+        victim.deleted = true;
+        if (victim.open_count == 0) {
+            freeEntryPages(d);
+            victim.active = false;
+            victim.deleted = false;
+        }
+    }
+    @memcpy(entries[src].name[0..new_len], new_name[0..new_len]);
+    entries[src].name_len = new_len;
+    entries[src].parent_idx = new_parent;
     return 0;
 }
 

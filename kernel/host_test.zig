@@ -109,6 +109,7 @@ pub const group_policy = @import("proc/group_policy.zig");
 pub const prctl_policy = @import("proc/prctl_policy.zig");
 pub const syslog_policy = @import("proc/syslog_policy.zig");
 pub const memfd_policy = @import("fs/memfd_policy.zig");
+pub const rename_policy = @import("fs/rename_policy.zig");
 pub const sched_claim = @import("proc/sched_claim.zig");
 pub const sched_queue_policy = @import("proc/sched_queue_policy.zig");
 pub const sched_getaffinity_policy = @import("proc/sched_getaffinity_policy.zig");

@@ -1291,6 +1291,9 @@ const Pipe = struct {
 - Ext2完整实现：目录项创建/删除/重命名/枚举
 - 系统调用：#82(rename), #84(mkdir), #111(unlink), #123(mkdir旧号), #217(getdents64)
 - 多级路径解析支持
+- rename 路由（`fs/rename_policy.zig`）：`/tmp`↔`/tmp` 走 `tmpfs.tmpfsRename`（文件与目录、覆盖、`RENAME_NOREPLACE`、
+  `RENAME_EXCHANGE`、粘滞目录规则、禁止移入自身子树），跨 `/tmp` 边界为 EXDEV，其余走 ext2（只支持普通 rename，
+  其它 flag 为 EINVAL）。renameat2 的未知位、`RENAME_WHITEOUT`、NOREPLACE|EXCHANGE 为 EINVAL。hello119 验收。
 - 目录读取只对 tmpfs 可达：VFS 目前没有返回 ext2 目录描述符的路径，
   所以 `getdents64` 的 ext2 分支从用户态触达不到
 

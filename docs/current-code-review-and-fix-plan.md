@@ -4690,6 +4690,26 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   - **hello108 偶发失败的统计（如实）**：/tmp 下保留的 249 次 stress 运行里 hello108 FAIL 12 次（约 5%），
     多数是 reaping 窗口 max_gap≈7.5 ms，也有 baseline 本身就超标的（说明不全是回收造成的）。负载高低与失败没有明显对应。
     原因**未查明**，列为后续调查项；本轮改动不涉及调度和回收路径。
+- **第五十二轮：tmpfs rename 与 renameat2 flags**：
+  - 问题：(1) `/tmp` 内的 rename 全部失败——`syscallRename` 只调用 ext2，失败一律报 EXDEV；
+    (2) `renameat2` 丢弃了 flags：`RENAME_NOREPLACE` 被当成普通 rename（会覆盖目标，调用者恰恰要求不覆盖），
+    `RENAME_EXCHANGE` 与非法位也不报错。
+  - 修复：纯函数 `fs/rename_policy.zig`（`mode`：未知位、WHITEOUT、NOREPLACE|EXCHANGE 为 EINVAL；`route`：`/tmp`↔`/tmp` 走 tmpfs，
+    跨 `/tmp` 边界为 EXDEV，`/tmpx` 不算 `/tmp`；`checkTarget`：EISDIR/ENOTDIR/ENOTEMPTY/EEXIST/ENOENT）。
+    `tmpfs.tmpfsRename` 在一次持有 tmpfs_lock 内完成查找、权限和修改：两端父目录需要 write+search，粘滞目录按
+    `dac.mayRemoveEntry`（只有 sticky 规则拒绝时为 EPERM，缺目录权限为 EACCES）；目录不能移到自己的子树下（EINVAL）；
+    被覆盖的目标按 unlink 语义处理（仍被打开时延迟到最后一次 close 释放）；EXCHANGE 交换两个条目的名字与父目录。
+    打开的描述符与 mmap 只引用条目号，不受影响。ext2 只实现普通 rename，NOREPLACE/EXCHANGE 在 ext2 上返回 EINVAL
+    （Linux 对不支持这些 flag 的文件系统也是 EINVAL），不再静默忽略。
+  - hello119（27 项）：启动档案与 hello115 相同（uid 0、只有 CAP_SETUID|CAP_SETGID），E 段由降到 uid 1000 的子进程检查粘滞规则。
+  - TDD 与证据：hello119 在旧内核上 24 项 FAIL；host 测试 3 个（rename_policy）+ 启动档案测试扩充。**如实**：`rename_policy.zig`
+    是在 host 测试之前写好的（当时门禁在跑，不能改已接入的源码），所以 host 测试没有经历“编译失败”这一步；运行时 RED 是真实的。
+    变异：去掉 tmpfs rename 的 sticky 检查 → E 段 2 项 FAIL（第一次变异写法让函数参数未使用、编译失败，冒烟跑的是旧 ELF，结果作废后重做）。
+  - 没做的：ext2 上的 NOREPLACE/EXCHANGE；目录 rename 在 ext2 上仍被拒绝；renameat2 的 dirfd 对平面文件系统仍不参与解析
+    （卷目录描述符由 rofsGuard 返回 EROFS）。
+  - 验证：host 719/719（新增 3 个）；riscv64/aarch64 构建通过；冒烟 MBR SMP=1/2/8、GPT SMP=2/8 五组 0 FAIL、hello119 PASS；
+    stress 5/5（门禁期间负载峰值 5.88）。门禁前单次 SMP=1 冒烟里 hello108 又失败一次（baseline 6160 µs、reaping 7593 µs，
+    当时负载 14），记入上面的 hello108 调查项。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；
@@ -4829,7 +4849,7 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   压缩/加密/$ATTRIBUTE_LIST/$UpCase 大小写折叠；GPT 备份表不使用且仅支持主表在 LBA 2、≤32 扇区
   的布局；DAC 不跟踪补充组；卷内再挂载；NTFS 位图超过 64 MiB 的卷 statfs 返回 EOPNOTSUPP；`faccessat`/`faccessat2` 的 dirfd 只对卷内目录描述符生效（其它文件系统沿用既有行为）；VFS 仍是"扁平命名 + 前缀路由"而非通用挂载树，
   挂载点祖先目录（如 `/mnt`）本身不会作为目录出现在 `getdents("/")` 中；程序不能从任何磁盘文件系统 `exec`（加载器只读 ramdisk）。
-  FAT32（只有根目录，无属主模型）不做 DAC；tmpfs 的 `rename` 不存在（本内核 rename 只服务 ext2）；
+  FAT32（只有根目录，无属主模型）不做 DAC；tmpfs 的 `rename` 不存在（本内核 rename 只服务 ext2；已在第五十二轮补上）；
   `execveat` 的 dirfd 分支因加载器只读 ramdisk 而总是失败。
 
 | Gate | Result | Notes |
