@@ -195,6 +195,7 @@ pub const sigreturn_policy = @import("proc/sigreturn_policy.zig");
 pub const sleep_policy = @import("proc/sleep_policy.zig");
 pub const rusage_policy = @import("proc/rusage_policy.zig");
 pub const cpu_protect_policy = @import("arch/x86_64/cpu_protect_policy.zig");
+pub const irq_time_policy = @import("arch/x86_64/irq_time_policy.zig");
 pub const wake_preempt_policy = @import("proc/wake_preempt_policy.zig");
 pub const sched_pass_policy = @import("proc/sched_pass_policy.zig");
 pub const deadline_hint = @import("lib/deadline_hint.zig");

@@ -859,6 +859,11 @@ const SchedStats = struct {
   `TIMER_ABSTIME` 不回写 `rem`；返回路径调用 `checkSignalsOnSyscallReturn`。
 - **alarm / ITIMER_REAL 唤醒阻塞者**：到期置 SIGALRM 后调用 `signal.kickIfBlocked`，
   `alarm()` 能以 -EINTR 打断睡眠与阻塞等待。
+- **中断耗时计量（`/proc/irqtime`，x86_64）**：`interruptDispatch` 在分发前后按 CPU 累计 TSC 周期
+  （`arch/x86_64/irq_time_policy.zig`，只计最外层；从用户态进入时把嵌套深度清零，因为有些从中断进入的内核路径
+  不经原路返回——例如在异常处理里结束任务——否则深度会卡在非零、计数从此停止）。每行
+  `cpu<N> total_us=… max_us=… count=… depth=…`。hello108 用它在测量窗口前后取差值，区分时间是被中断处理拿走的
+  还是被宿主机拿走的。
 - **`getrusage` 报真实 CPU 时间**：`RUSAGE_SELF/THREAD` 返回 `utime_us`（含当前这一段
   运行的 TSC 增量）与 `stime_us`；`RUSAGE_CHILDREN` 返回 0；其他 `who` → EINVAL，坏指针
   → EFAULT（纯函数 `proc/rusage_policy.zig`）。验收程序 `hello102`。

@@ -357,3 +357,46 @@ test "LAPIC deadline is the earlier of the remaining slice and the next wait" {
     // A wait later than the slice is ignored.
     try std.testing.expectEqual(@as(u64, 1_300), p.nextDeadlineTsc(1_000, 100, 3, 9_000));
 }
+
+// ── interrupt time accounting (hello108 diagnosis) ──────────────────────
+
+test "interrupt time is accumulated per CPU at the outermost level only" {
+    const p = kt.irq_time_policy;
+    var a: p.Acc = .{};
+    a.enter(100, true);
+    a.exit(250);
+    try std.testing.expectEqual(@as(u64, 150), a.total_cycles);
+    try std.testing.expectEqual(@as(u64, 1), a.count);
+    // A nested interrupt inside an outer one is part of the outer span.
+    a.enter(1_000, true);
+    a.enter(1_100, false);
+    a.exit(1_200);
+    a.exit(1_500);
+    try std.testing.expectEqual(@as(u64, 650), a.total_cycles);
+    try std.testing.expectEqual(@as(u64, 500), a.max_cycles);
+    try std.testing.expectEqual(@as(u64, 2), a.count);
+    // An unmatched exit and a backwards clock change nothing.
+    a.exit(9_999);
+    a.enter(5_000, true);
+    a.exit(4_000);
+    try std.testing.expectEqual(@as(u64, 650), a.total_cycles);
+    // An interrupt path that never returned (depth leaked) is recovered at
+    // the next entry from user mode instead of silencing the counter.
+    a.enter(6_000, false);
+    a.enter(7_000, true);
+    a.exit(7_400);
+    try std.testing.expectEqual(@as(u64, 1_050), a.total_cycles);
+    try std.testing.expectEqual(@as(u32, 0), a.depth);
+    try std.testing.expectEqual(@as(u64, 3), p.cyclesToUs(3_000, 1_000));
+    try std.testing.expectEqual(@as(u64, 0), p.cyclesToUs(3_000, 0));
+}
+
+test "the interrupt dispatcher brackets the handlers with the irq time accumulator" {
+    const src = kt.idt_source;
+    const at = std.mem.indexOf(u8, src, "pub fn interruptDispatch(").?;
+    const body = src[at..][0..std.mem.indexOf(u8, src[at..], "\n}\n").?];
+    const enter = std.mem.indexOf(u8, body, "irqTimeEnter(frame)").?;
+    const inner = std.mem.indexOf(u8, body, "interruptDispatchInner(frame)").?;
+    const exit = std.mem.indexOf(u8, body, "irqTimeExit()").?;
+    try std.testing.expect(enter < inner and inner < exit);
+}

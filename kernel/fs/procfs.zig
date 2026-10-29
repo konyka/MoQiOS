@@ -16,6 +16,7 @@ pub const ProcFile = enum(u8) {
     stat,
     sched_stats,
     vma_stats,
+    irqtime,
 };
 
 /// Generate proc file content into the provided buffer.
@@ -38,6 +39,7 @@ pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
         .stat => generateStat(buf, max_len),
         .sched_stats => generateSchedStats(buf, max_len),
         .vma_stats => generateVmaStats(buf, max_len),
+        .irqtime => generateIrqTime(buf, max_len),
     };
 }
 
@@ -344,6 +346,33 @@ fn generateSchedStats(buf: [*]u8, max_len: u32) u32 {
             stats.queue_depth_sum / stats.sample_count;
         pos = appendDec(buf, pos, max_len, avg);
         pos = appendChar(buf, pos, max_len, '\n');
+    }
+    return pos;
+}
+
+/// One line per configured CPU: `cpu<N> total_us=<t> max_us=<m> count=<c>` —
+/// time spent in the interrupt dispatcher (x86_64; elsewhere all zero).
+fn generateIrqTime(buf: [*]u8, max_len: u32) u32 {
+    var pos: u32 = 0;
+    if (comptime @import("builtin").cpu.arch != .x86_64) return pos;
+    const idt = @import("../arch/x86_64/idt.zig");
+    const p = @import("../arch/x86_64/irq_time_policy.zig");
+    const mhz = @import("../arch/x86_64/tsc.zig").tsc_freq_mhz;
+    const ncpu = @min(@import("../smp.zig").configured_cpu_count, idt.irq_acc.len);
+    var c: u32 = 0;
+    while (c < ncpu) : (c += 1) {
+        const a = idt.irq_acc[c];
+        pos = appendStr(buf, pos, max_len, "cpu");
+        pos = appendDec(buf, pos, max_len, c);
+        pos = appendStr(buf, pos, max_len, " total_us=");
+        pos = appendDec(buf, pos, max_len, p.cyclesToUs(a.total_cycles, mhz));
+        pos = appendStr(buf, pos, max_len, " max_us=");
+        pos = appendDec(buf, pos, max_len, p.cyclesToUs(a.max_cycles, mhz));
+        pos = appendStr(buf, pos, max_len, " count=");
+        pos = appendDec(buf, pos, max_len, a.count);
+        pos = appendStr(buf, pos, max_len, " depth=");
+        pos = appendDec(buf, pos, max_len, a.depth);
+        pos = appendStr(buf, pos, max_len, "\n");
     }
     return pos;
 }

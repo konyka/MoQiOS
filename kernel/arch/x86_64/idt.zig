@@ -398,13 +398,32 @@ pub fn interruptDispatch(frame: *InterruptFrame) callconv(.c) u64 {
     // for its own pass) does not erase an outer pass's already-done switch.
     const prev_switched = pc.anchor_switched;
     pc.anchor_switched = 0;
+    irqTimeEnter(frame);
     interruptDispatchInner(frame);
+    irqTimeExit();
     if (pc.anchor_switched != 0) {
         pc.anchor_switched = prev_switched;
         return sched.getAnchor();
     }
     pc.anchor_switched = prev_switched;
     return @intFromPtr(frame);
+}
+
+const irq_time = @import("irq_time_policy.zig");
+/// Per-CPU time spent in the interrupt dispatcher (outermost level only),
+/// read by /proc/irqtime. Each slot is written only by its own CPU, with
+/// IRQs off (we are inside the handler); readers may see a torn snapshot,
+/// which only costs diagnostic precision.
+pub var irq_acc: [irq_time.MAX_CPUS]irq_time.Acc = @splat(.{});
+
+inline fn irqTimeEnter(frame: *const InterruptFrame) void {
+    const cpu = @import("syscall_entry.zig").gsReadCpuId();
+    if (cpu < irq_acc.len) irq_acc[cpu].enter(@import("tsc.zig").read(), frame.cs & 3 == 3);
+}
+
+inline fn irqTimeExit() void {
+    const cpu = @import("syscall_entry.zig").gsReadCpuId();
+    if (cpu < irq_acc.len) irq_acc[cpu].exit(@import("tsc.zig").read());
 }
 
 /// Called by commonStub's epilogue once the CPU is on the incoming task's frame.

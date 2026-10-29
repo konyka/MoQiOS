@@ -929,6 +929,8 @@ pub const FdTable = struct {
                 pfile = .sched_stats;
             } else if (rest.len == 9 and str.eql(rest, "vma_stats")) {
                 pfile = .vma_stats;
+            } else if (rest.len == 7 and str.eql(rest, "irqtime")) {
+                pfile = .irqtime;
             } else if (rest.len > 0) {
                 // /proc/[pid]/status or /proc/[pid]/maps
                 var digit_end: usize = 0;
