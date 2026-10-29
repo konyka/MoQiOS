@@ -144,7 +144,10 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.stack_limit = parent.stack_limit;
     @memcpy(child.comm[0..16], parent.comm[0..16]);
     child.sched_policy = parent.sched_policy;
-    child.pdeathsig = parent.pdeathsig;
+    // prctl(2): the parent-death signal is cleared in the child of a fork;
+    // no_new_privs is inherited.
+    child.pdeathsig = 0;
+    child.no_new_privs = parent.no_new_privs;
 
     // Task #8: inherit POSIX capability sets verbatim.
     child.effective_caps = parent.effective_caps;

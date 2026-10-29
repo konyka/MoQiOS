@@ -4610,6 +4610,21 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     `qemu-system-misc`，aarch64 在 `qemu-system-arm`，工作流只装了前者。此前各轮“门禁通过”只指本地门禁，没有核对远端 CI，如实更正。
   - 修复：smoke-cross-arch 同时安装 `qemu-system-arm`。本地 `zig build -Darch=aarch64 smoke-aarch64` PASS。推送后远端 run 40879538918
     （提交 2ba9a1c）三个 job 全部 success——工作流第一次通过。今后每轮提交后核对远端 CI。
+- **第四十七轮：PR_SET_PDEATHSIG 只存不发；没有 PR_SET_NO_NEW_PRIVS**：
+  - 问题：`prctl(PR_SET_PDEATHSIG)` 把信号号存进任务后就再也没人用——父进程退出时不发送；值不做校验（任意 u64 截断后都接受）；fork
+    还把它原样继承给子进程（Linux 规定 fork 的子进程清零）。`PR_SET_NO_NEW_PRIVS`/`PR_GET_NO_NEW_PRIVS` 不存在（返回 EINVAL）。
+  - RED：新测试 hello117（三个场景，15 项）。旧内核 6 项 FAIL：无效信号被接受、fork 继承、NO_NEW_PRIVS 三项、孤儿在父进程退出后仍睡满
+    10 秒。第一版场景 A 只检查管道 EOF，新旧内核都通过（孤儿睡完自然退出也会 EOF），改为同时检查等待时间 < 3 秒后才成为有效的 RED。
+  - 修复：纯函数 `proc/prctl_policy.zig`：`pdeathsigValid`（0 或 1..31——内核只投递标准信号）、`setNoNewPrivs`（只能设为 1，其余参数
+    必须为 0）、`getNoNewPrivsArgsValid`、`deathSignalFor`（只给非线程、父进程正是退出者、设置了信号的子进程）。`exitTask` 在
+    task_lock 内收集目标，解锁后逐个 `sendSignal`；fork 清零 pdeathsig；任务新增 `no_new_privs`（fork/clone 继承，exec 保留）。
+  - 没做的：本系统没有 set-user-ID 程序和文件 capability，`no_new_privs` 目前不影响 execve 的结果（execve 本来就不会提升权限），只提供
+    Linux 兼容的查询/设置语义。
+  - 验证：host 710/710（新增 prctl 策略测试）；hello117 PASS。门禁：三架构构建通过；MBR SMP=1/8、GPT SMP=2/8 冒烟 0 FAIL，hello117 各 PASS。
+  - 门禁中的失败与 A/B（如实）：MBR SMP=2 那次 hello107+hello108 FAIL、第一次 stress 第 4 次启动 hello108 FAIL。这次改动正好在
+    hello108 测量的 `exitTask` 路径上，所以不能直接归为宿主机竞争：做了交替 A/B——同一批用户程序，HEAD 内核（不含退出时发送）与新内核
+    各 6 次 SMP=2 启动，宿主机 load 2–16。新内核 6/6 hello108 stolen 0、hello107 最长 1.1–1.3 ms；旧内核 6 次中 1 次 stolen 7.3 ms，
+    其余为 0（旧内核每次因 hello117 本身 FAIL，这是预期）。没有观察到新内核更差。之后 stress 重跑 5/5 通过（load ≈ 2–5）。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；

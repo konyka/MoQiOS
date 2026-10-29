@@ -344,6 +344,8 @@ pub const Task = struct {
 
     /// Parent death signal (0 = none). Delivered to child when parent exits.
     pdeathsig: u32 = 0,
+    /// PR_SET_NO_NEW_PRIVS: one-way, inherited by fork/clone, kept across exec.
+    no_new_privs: bool = false,
 
     // --- FPU / SSE state (Task #1: lazy save/restore via CR0.TS + #NM) ---
     /// FXSAVE/FXRSTOR area. Hardware requires 16-byte alignment; the
@@ -1206,7 +1208,27 @@ pub fn exitTask(exit_code: i32) void {
     }
     const sigchld_parent = t.parent_tid;
     const notify_parent = t.is_user and !t.is_thread and sigchld_parent != 0;
+    // prctl(PR_SET_PDEATHSIG): children that asked to be told about this
+    // task's death. Collected under task_lock, signalled after it.
+    var death_tids: [MAX_TASKS]u32 = undefined;
+    var death_sigs: [MAX_TASKS]u32 = undefined;
+    var death_n: u32 = 0;
+    {
+        var bits = slot_bitmap;
+        while (bits != 0) {
+            const ci: u32 = @intCast(@ctz(bits));
+            bits &= bits - 1;
+            const c = &tasks[ci];
+            if (c == t or c.state == .zombie) continue;
+            if (@import("prctl_policy.zig").deathSignalFor(c.parent_tid, t.tid, c.is_thread, c.pdeathsig)) |sig| {
+                death_tids[death_n] = c.tid;
+                death_sigs[death_n] = sig;
+                death_n += 1;
+            }
+        }
+    }
     task_lock.release(flags);
+    for (0..death_n) |k| _ = @import("signal.zig").sendSignal(death_tids[k], death_sigs[k]);
 
     // POSIX: the parent of an exiting child receives SIGCHLD (default
     // action: ignore). Sent outside task_lock — sendSignal/kickIfBlocked

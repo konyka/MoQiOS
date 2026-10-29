@@ -6613,3 +6613,24 @@ test "fsync/sync flush the disk the filesystems live on, not global device 0" {
     const fs = std.mem.indexOf(u8, se, "fn syscallFsync(").?;
     try std.testing.expect(std.mem.indexOfPos(u8, se, fs, "flushRootDiskCache()").? < std.mem.indexOfPos(u8, se, fs, "\n}\n").?);
 }
+
+test "prctl: PDEATHSIG validated, NO_NEW_PRIVS is a one-way flag" {
+    const pp = kt.prctl_policy;
+    try std.testing.expect(pp.pdeathsigValid(0));
+    try std.testing.expect(pp.pdeathsigValid(9));
+    try std.testing.expect(pp.pdeathsigValid(31));
+    try std.testing.expect(!pp.pdeathsigValid(32)); // no real-time signals to deliver
+    try std.testing.expect(!pp.pdeathsigValid(0xFFFF_FFFF_0000_0009));
+    // PR_SET_NO_NEW_PRIVS: arg2 must be exactly 1 and the rest 0; it cannot be cleared
+    try std.testing.expectEqual(pp.NnpSet.set, pp.setNoNewPrivs(1, 0, 0, 0));
+    try std.testing.expectEqual(pp.NnpSet.einval, pp.setNoNewPrivs(0, 0, 0, 0));
+    try std.testing.expectEqual(pp.NnpSet.einval, pp.setNoNewPrivs(2, 0, 0, 0));
+    try std.testing.expectEqual(pp.NnpSet.einval, pp.setNoNewPrivs(1, 1, 0, 0));
+    try std.testing.expect(pp.getNoNewPrivsArgsValid(0, 0, 0, 0));
+    try std.testing.expect(!pp.getNoNewPrivsArgsValid(1, 0, 0, 0));
+    // death signal targets: only non-thread children of the exiting task that asked for one
+    try std.testing.expectEqual(@as(?u32, 9), pp.deathSignalFor(100, 100, false, 9));
+    try std.testing.expectEqual(@as(?u32, null), pp.deathSignalFor(100, 100, false, 0));
+    try std.testing.expectEqual(@as(?u32, null), pp.deathSignalFor(100, 100, true, 9));
+    try std.testing.expectEqual(@as(?u32, null), pp.deathSignalFor(101, 100, false, 9));
+}

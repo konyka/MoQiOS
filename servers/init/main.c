@@ -244,6 +244,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello113"); /* SysV IPC / poll hardening */
     run_test("hello114"); /* read-only ext4 / NTFS volumes on the 2nd virtio disk */
     run_test("hello115"); /* setuid family drops capabilities (capabilities(7)) */
+    run_test("hello117"); /* prctl: PDEATHSIG delivery, NO_NEW_PRIVS */
 
     start_persistent_services();
 

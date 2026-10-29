@@ -4083,9 +4083,6 @@ fn syscallSysinfo(info_ptr: u64) i64 {
 /// prctl(option, arg2, arg3, arg4, arg5) — process control.
 /// Supports: PR_SET_NAME(15), PR_GET_NAME(16), PR_SET_PDEATHSIG(1).
 fn syscallPrctl(option: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) i64 {
-    _ = arg3;
-    _ = arg4;
-    _ = arg5;
     const sched = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
     const copy = @import("../../mm/copy_from_user.zig");
@@ -4107,9 +4104,19 @@ fn syscallPrctl(option: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) i64 {
             if (arg2 == 0 or arg2 >= 0x0000_8000_0000_0000) return -14;
             return if (copy.copyToUser(@ptrFromInt(arg2), cur.comm[0..16], 16) == 16) 0 else -14;
         },
-        1 => { // PR_SET_PDEATHSIG — store signal to send on parent death
+        1 => { // PR_SET_PDEATHSIG — signal sent to this task when its parent exits
+            if (!@import("../../proc/prctl_policy.zig").pdeathsigValid(arg2)) return -22;
             cur.pdeathsig = @truncate(arg2);
             return 0;
+        },
+        38 => { // PR_SET_NO_NEW_PRIVS
+            if (@import("../../proc/prctl_policy.zig").setNoNewPrivs(arg2, arg3, arg4, arg5) != .set) return -22;
+            cur.no_new_privs = true;
+            return 0;
+        },
+        39 => { // PR_GET_NO_NEW_PRIVS
+            if (!@import("../../proc/prctl_policy.zig").getNoNewPrivsArgsValid(arg2, arg3, arg4, arg5)) return -22;
+            return if (cur.no_new_privs) 1 else 0;
         },
         2 => { // PR_GET_PDEATHSIG — read back parent death signal
             if (arg2 == 0 or arg2 >= 0x0000_8000_0000_0000) return -14;
