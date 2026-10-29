@@ -1898,6 +1898,8 @@ const SysCap = packed struct {
 - execve（`cred_policy.afterExec`）：saved uid/gid 改为有效 uid/gid；程序没有 set-user-ID 位和文件 capability，所以按 capabilities(7)
   的 root 规则：real 或 effective uid 为 0 时 permitted 保留、effective 在 euid 为 0 时等于 permitted，否则为空；两者都不为 0 时
   permitted 和 effective 都清空。
+- syslog(2)（`proc/syslog_policy.zig`）：读 64 KiB kmsg 环；READ_ALL 从上次 CLEAR 后读、READ 消费全局未读游标、READ_CLEAR/CLEAR/
+  SIZE_UNREAD/SIZE_BUFFER；除 SIZE_BUFFER 外需 CAP_SYS_ADMIN；console 动作接受但无作用。
 - prctl（`proc/prctl_policy.zig`）：`PR_SET_PDEATHSIG` 取 0 或 1..31，父进程退出时向非线程子进程发送（`exitTask` 收集、解锁后发送），
   fork 的子进程清零；`PR_SET_NO_NEW_PRIVS` 只能置 1（参数必须为 1,0,0,0），fork/clone 继承、exec 保留，目前不改变 execve 结果
   （没有 set-user-ID 程序和文件 capability）。

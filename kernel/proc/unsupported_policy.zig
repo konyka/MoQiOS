@@ -79,3 +79,15 @@ pub fn mseal() i64 {
 pub fn fileHandles() i64 {
     return errno.ENOSYS;
 }
+
+pub fn openTreeAttr() i64 {
+    return errno.ENOSYS;
+}
+
+pub fn fileGetattr() i64 {
+    return errno.ENOSYS;
+}
+
+pub fn fileSetattr() i64 {
+    return errno.ENOSYS;
+}

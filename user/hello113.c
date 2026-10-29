@@ -289,6 +289,14 @@ void _start(void) {
         syscall1(SYS_CLOSE, (uint64_t)tx);
     }
 
+    /* L: syslog(2) without privilege: only the buffer-size query is allowed */
+    {
+        char lb[64];
+        check(syscall3(278, 3, (uint64_t)lb, sizeof(lb)) == -1, "L: syslog READ_ALL is EPERM without CAP_SYS_ADMIN");
+        check(syscall3(278, 5, 0, 0) == -1, "L: syslog CLEAR is EPERM without CAP_SYS_ADMIN");
+        check(syscall3(278, 10, 0, 0) > 0, "L: syslog SIZE_BUFFER is allowed and reports the ring size");
+    }
+
     print(failures == 0 ? "hello113: PASS\n" : "hello113: FAIL\n");
     print("hello113 done\n");
     syscall1(SYS_EXIT, failures == 0 ? 0 : 1);

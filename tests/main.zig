@@ -6634,3 +6634,40 @@ test "prctl: PDEATHSIG validated, NO_NEW_PRIVS is a one-way flag" {
     try std.testing.expectEqual(@as(?u32, null), pp.deathSignalFor(100, 100, true, 9));
     try std.testing.expectEqual(@as(?u32, null), pp.deathSignalFor(101, 100, false, 9));
 }
+
+test "open_tree_attr / file_getattr / file_setattr are ENOSYS, not a silent success" {
+    try std.testing.expectEqual(kt.errno.ENOSYS, unsupported_policy.openTreeAttr());
+    try std.testing.expectEqual(kt.errno.ENOSYS, unsupported_policy.fileGetattr());
+    try std.testing.expectEqual(kt.errno.ENOSYS, unsupported_policy.fileSetattr());
+    const se = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, se, "frame.rax = 0; // accept (simplified)") == null);
+}
+
+test "syslog(2): action decoding, privilege and the global read cursor" {
+    const sp = kt.syslog_policy;
+    // reads/clears need privilege; the size query does not
+    try std.testing.expectEqual(sp.Action.read_all, sp.decode(3).?);
+    try std.testing.expectEqual(sp.Action.read_unread, sp.decode(2).?);
+    try std.testing.expectEqual(sp.Action.read_clear, sp.decode(4).?);
+    try std.testing.expectEqual(sp.Action.clear, sp.decode(5).?);
+    try std.testing.expectEqual(sp.Action.size_unread, sp.decode(9).?);
+    try std.testing.expectEqual(sp.Action.size_buffer, sp.decode(10).?);
+    try std.testing.expectEqual(sp.Action.console_level, sp.decode(8).?);
+    try std.testing.expectEqual(sp.Error.eperm, sp.check(3, 100, false).?);
+    try std.testing.expectEqual(sp.Error.eperm, sp.check(5, 0, false).?);
+    try std.testing.expect(sp.check(10, 0, false) == null);
+    // bad type, negative length, bad console level
+    try std.testing.expectEqual(sp.Error.einval, sp.check(42, 0, true).?);
+    try std.testing.expectEqual(sp.Error.einval, sp.check(3, -1, true).?);
+    try std.testing.expectEqual(sp.Error.einval, sp.check(8, 9, true).?);
+    try std.testing.expect(sp.check(3, 0, true) == null);
+    // "clear" moves a cursor; reads of type 3 start from it, type 2 from the unread cursor
+    var st = sp.State{};
+    try std.testing.expectEqual(@as(u64, 0), st.startFor(.read_all, 0));
+    st.clear(500);
+    try std.testing.expectEqual(@as(u64, 500), st.startFor(.read_all, 100)); // oldest 100, cleared to 500
+    try std.testing.expectEqual(@as(u64, 600), st.startFor(.read_all, 600)); // ring dropped past it
+    try std.testing.expectEqual(@as(u64, 0), st.startFor(.read_unread, 0));
+    st.consumed(700);
+    try std.testing.expectEqual(@as(u64, 700), st.startFor(.read_unread, 0));
+}

@@ -157,6 +157,13 @@ void _start(void) {
                       "memfd_secret #447 returns ENOSYS");
     failures += check(syscall1(SYS_MEMFD_SECRET, 0xFFFFFFFFu) == -ENOSYS,
                       "memfd_secret rejects flags without side effects");
+    failures += check(syscall4(467 /* open_tree_attr */, (uint64_t)-100, (uint64_t)"/", 0, (uint64_t)ruleset_attr) == -ENOSYS,
+                      "open_tree_attr #467 returns ENOSYS");
+    failures += check(syscall2(468 /* file_getattr */, 1, (uint64_t)ruleset_attr) == -ENOSYS,
+                      "file_getattr #468 returns ENOSYS");
+    failures += check(unchanged(ruleset_attr, 0xC3, sizeof(ruleset_attr)), "file_getattr preserves user buffer");
+    failures += check(syscall2(469 /* file_setattr */, 1, (uint64_t)ruleset_attr) == -ENOSYS,
+                      "file_setattr #469 returns ENOSYS");
     failures += check(syscall4(SYS_LISTNS, (uint64_t)-1, 0, (uint64_t)ruleset_attr, sizeof(ruleset_attr)) == -ENOSYS,
                       "listns #470 returns ENOSYS");
     failures += check(unchanged(ruleset_attr, 0xC3, sizeof(ruleset_attr)), "listns preserves user buffer");

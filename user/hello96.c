@@ -242,6 +242,29 @@ __attribute__((noreturn)) static void fail_exit(const char *tag) {
 void _start(void) {
     print("hello96: swap gate + SMP reclaim stress\n");
 
+    /* ── Phase 0: syslog(2) reads the kernel log ring (this test holds
+     *    CAP_SYS_ADMIN, which syslog accepts in place of CAP_SYSLOG) ─────── */
+    {
+        static char logbuf[65536];
+        int64_t cap = syscall3(278, 10, 0, 0); /* SYSLOG_ACTION_SIZE_BUFFER */
+        if (cap < 4096) fail_exit("syslog SIZE_BUFFER too small");
+        int64_t got = syscall3(278, 3, (uint64_t)logbuf, sizeof(logbuf)); /* READ_ALL */
+        if (got <= 0) fail_exit("syslog READ_ALL returned no data");
+        int found = 0;
+        const char *needle = "TSC initialized";
+        for (int64_t i = 0; i + 15 <= got && !found; i++) {
+            int k = 0;
+            while (k < 15 && logbuf[i + k] == needle[k]) k++;
+            if (k == 15) found = 1;
+        }
+        if (!found) fail_exit("syslog READ_ALL lacks a known boot line");
+        if (syscall3(278, 5, 0, 0) != 0) fail_exit("syslog CLEAR");
+        int64_t after = syscall3(278, 3, (uint64_t)logbuf, sizeof(logbuf));
+        if (after < 0 || after >= got) fail_exit("syslog READ_ALL after CLEAR did not shrink");
+        if (syscall3(278, 42, 0, 0) != -EINVAL) fail_exit("syslog bad type not EINVAL");
+        print("hello96: syslog READ_ALL/CLEAR ok\n");
+    }
+
     /* ── Phase A: swapon device-targeting safety gate ────────────────── */
     int64_t r = syscall3(SYS_SWAPON, (uint64_t)"/dev/vblk0", 0, 0);
     if (r != -EPERM) fail_exit("swapon boot disk not EPERM");

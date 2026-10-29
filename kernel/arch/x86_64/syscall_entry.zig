@@ -2522,14 +2522,16 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             };
             frame.rax = @bitCast(ext2_mod.removeXattr(inode_num, actual_name, ext2Who()));
         },
-        467 => { // open_tree_attr(dfd, path, flags, attr)
-            frame.rax = 0; // accept (simplified)
+        // These used to return 0 without doing anything: a caller "set" file
+        // attributes or got an uninitialised attr buffer back as success.
+        467 => { // open_tree_attr(dfd, path, flags, attr) — new mount API, not supported
+            frame.rax = @bitCast(unsupported_policy.openTreeAttr());
         },
-        468 => { // file_getattr(fd, attr)
-            frame.rax = 0; // accept (simplified)
+        468 => { // file_getattr(fd, attr) — not supported
+            frame.rax = @bitCast(unsupported_policy.fileGetattr());
         },
-        469 => { // file_setattr(fd, attr)
-            frame.rax = 0; // accept (simplified)
+        469 => { // file_setattr(fd, attr) — not supported
+            frame.rax = @bitCast(unsupported_policy.fileSetattr());
         },
         470 => { // listns(fd, cookie, buf, size)
             frame.rax = @bitCast(unsupported_policy.listns());
@@ -4624,16 +4626,47 @@ fn writeStatfsBuf(buf_ptr: u64) i64 {
 
 /// #278 syslog(type, buf, len) — kernel log control
 fn syscallSyslog(log_type: u32, buf_ptr: u64, len: u32) i64 {
-    _ = buf_ptr;
-    _ = len;
-    // type 3 = read, type 7 = set log level, type 10 = size of log buffer
-    switch (log_type) {
-        3 => return 0, // read: no buffered log data
-        7 => return 0, // set level: accept but ignore
-        10 => return 0, // size of log buffer: 0
-        else => return 0,
+    const sp = @import("../../proc/syslog_policy.zig");
+    const klog = @import("../../klog.zig");
+    const copy = @import("../../mm/copy_from_user.zig");
+    const t: i64 = @as(i32, @bitCast(log_type));
+    const n: i64 = @as(i32, @bitCast(len));
+    if (sp.check(t, n, checkCapForCurrent("cap_sys_admin"))) |e| return switch (e) {
+        .eperm => -1,
+        .einval => -22,
+    };
+    const action = sp.decode(t).?;
+    switch (action) {
+        .close, .open, .console_off, .console_on, .console_level => return 0,
+        .size_buffer => return @intCast(klog.KMSG_CAP),
+        .size_unread => return @intCast(klog.kmsgNewestPos() - syslog_state.startFor(.read_unread, klog.kmsgOldestPos())),
+        .clear => {
+            syslog_state.clear(klog.kmsgNewestPos());
+            return 0;
+        },
+        .read_unread, .read_all, .read_clear => {
+            if (n == 0) return 0;
+            if (buf_ptr == 0 or !copy.validateUserBufferWritable(buf_ptr, @intCast(n))) return -14;
+            var pos = syslog_state.startFor(action, klog.kmsgOldestPos());
+            var total: usize = 0;
+            var chunk: [512]u8 = undefined;
+            while (total < n) {
+                const want = @min(chunk.len, @as(usize, @intCast(n)) - total);
+                const res = klog.kmsgRead(pos, chunk[0..want]);
+                if (res.n == 0) break;
+                if (copy.copyToUser(@ptrFromInt(buf_ptr + total), chunk[0..res.n], res.n) != res.n) return -14;
+                total += res.n;
+                pos = res.new_pos;
+            }
+            if (action == .read_unread) syslog_state.consumed(pos);
+            if (action == .read_clear) syslog_state.clear(klog.kmsgNewestPos());
+            return @intCast(total);
+        },
     }
 }
+
+/// syslog(2) cursors on the kmsg ring (kernel-wide, like Linux).
+var syslog_state: @import("../../proc/syslog_policy.zig").State = .{};
 
 /// #279 reboot(cmd) — system reboot/halt
 fn syscallReboot(cmd: u32) i64 {

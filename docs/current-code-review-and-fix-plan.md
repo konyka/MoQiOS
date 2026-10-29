@@ -4625,6 +4625,28 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     hello108 测量的 `exitTask` 路径上，所以不能直接归为宿主机竞争：做了交替 A/B——同一批用户程序，HEAD 内核（不含退出时发送）与新内核
     各 6 次 SMP=2 启动，宿主机 load 2–16。新内核 6/6 hello108 stolen 0、hello107 最长 1.1–1.3 ms；旧内核 6 次中 1 次 stolen 7.3 ms，
     其余为 0（旧内核每次因 hello117 本身 FAIL，这是预期）。没有观察到新内核更差。之后 stress 重跑 5/5 通过（load ≈ 2–5）。
+- **第四十八轮：三个“假成功”的系统调用；syslog(2) 什么都不返回**：
+  - 问题 1：467 `open_tree_attr`、468 `file_getattr`、469 `file_setattr` 不做任何事就返回 0（注释写着 “accept (simplified)”）。
+    调用者以为设好了文件属性，或者拿着未初始化的 attr 缓冲区当结果。改为与其他未实现调用一样返回 ENOSYS（`unsupported_policy`），
+    hello80 新增 4 项（旧内核 3 项 FAIL）。
+  - 问题 2：278 `syslog`/klogctl 对任何参数都返回 0：读内核日志永远读到 0 字节、缓冲区大小报 0，也不检查权限。内核其实一直有 64 KiB 的
+    kmsg 环（`/dev/kmsg` 用它）。实现：纯函数 `proc/syslog_policy.zig`（动作解码、权限——除 SIZE_BUFFER 外都要 CAP_SYS_ADMIN、长度与
+    console level 校验、全局 clear/unread 游标）；内核按动作读环（READ_ALL 从上次 CLEAR 之后读，READ 消费共享未读游标，READ_CLEAR、
+    CLEAR、SIZE_UNREAD、SIZE_BUFFER）。console 相关动作接受但无作用（串口始终输出）。
+  - RED：hello96（持有 CAP_SYS_ADMIN）新增 syslog 段——READ_ALL 能读到启动时的 “TSC initialized”、CLEAR 后变少、非法类型 EINVAL；
+    hello113（无权能）新增 L 段 3 项。旧实现下 hello96 FAIL、hello113 3 项 FAIL。冒烟门禁新增 “hello96: syslog READ_ALL/CLEAR ok”。
+  - 验证：host 712/712（新增 2 个测试）；hello80/96/113 全部通过。门禁见本节末尾。
+  - hello108 失败率排查（如实）：统计本机保留的全部串口日志，10-24 到 10-28 的 160 次启动 hello108 0 次 FAIL，10-29 的 105 次有 14 次 FAIL，
+    看起来像回归。于是在 git worktree 里构建 10-28 最后一次提交 727f843，与当前工作区（含本轮全部改动）交替各启动 10 次 SMP=2：
+    两边 hello108 的 stolen 全是 0、hello107 最长 1.0–2.8 ms，宿主机 load 0.9–6。没有复现任何差异。10-29 的失败集中在宿主机被别的
+    项目（多个死循环、cmake、GUI 测试）占用的时段，与第四十、四十二轮的结论一致；“失败率上升”更可能来自当天宿主机负载，而不是代码，
+    但没有在相同高负载下做 A/B，不能完全排除。
+  - A/B 中的另一个现象：当前工作区那一侧有 1 次停在 hello2 退出之后（init 阻塞、没有 shell）。这与第 6.56 节 (14) 记录的“CPU0 定时器
+    tick 从未进入调度器、reaper 得不到运行”的签名相同，是已知未查明的问题；10-29 另一次 stress 启动也停在同一位置。旧内核 10 次中没出现，
+    样本太少，不能判断是否与本轮有关。
+  - 本轮 stress（如实）：前三次 stress 各有一次启动 hello108 FAIL。最后一次附带 5 秒一次的宿主机负载记录：失败那次启动（23:04–23:07）期间
+    load 14–18，占 CPU 的是另一会话的两个 `sh -c 'while :; do :; done'`（各约 88%）和别的项目的 test_editor_shell、cmake。宿主机空闲后
+    重跑 5/5 通过（整个过程宿主机 load 峰值 3.95）。门禁：host 712/712，三架构构建通过，五组冒烟 0 FAIL。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；
