@@ -349,6 +349,21 @@ void _start(void) {
         syscall1(SYS_SCHED_YIELD, 0);
         free_after = freeram_pages();
     }
+    {
+        /* Diagnostic: the raw interrupt-time table (longest handler since
+         * boot: its vector and its start in ms of TSC time), and now. */
+        int64_t fd = syscall3(SYS_OPEN, (uint64_t)"/proc/irqtime", 0, 0);
+        static char t[512];
+        int64_t n = fd >= 0 ? syscall3(SYS_READ, (uint64_t)fd, (uint64_t)t, sizeof(t) - 1) : 0;
+        if (fd >= 0) syscall1(SYS_CLOSE, (uint64_t)fd);
+        if (n > 0) {
+            t[n] = 0;
+            print("hello108:   now_ms=");
+            print_dec(now_ns() / 1000000);
+            print(" irqtime:\n");
+            print(t);
+        }
+    }
     print("hello108:   free_pages_before=");
     print_dec((int64_t)free_before);
     print(" after=");

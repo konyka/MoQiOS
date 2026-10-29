@@ -400,3 +400,23 @@ test "the interrupt dispatcher brackets the handlers with the irq time accumulat
     const exit = std.mem.indexOf(u8, body, "irqTimeExit()").?;
     try std.testing.expect(enter < inner and inner < exit);
 }
+
+test "the longest interrupt remembers its vector and when it started" {
+    const p = kt.irq_time_policy;
+    var a: p.Acc = .{};
+    a.enterVec(100, true, 240);
+    a.exit(200);
+    a.enterVec(1_000, true, 242);
+    a.exit(1_900); // longest so far
+    a.enterVec(5_000, true, 240);
+    a.exit(5_100);
+    try std.testing.expectEqual(@as(u64, 900), a.max_cycles);
+    try std.testing.expectEqual(@as(u8, 242), a.max_vector);
+    try std.testing.expectEqual(@as(u64, 1_000), a.max_start_tsc);
+    // A nested interrupt is attributed to the outer vector.
+    a.enterVec(10_000, true, 241);
+    a.enterVec(10_100, false, 240);
+    a.exit(10_200);
+    a.exit(12_000);
+    try std.testing.expectEqual(@as(u8, 241), a.max_vector);
+}

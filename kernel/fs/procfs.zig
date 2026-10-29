@@ -372,6 +372,10 @@ fn generateIrqTime(buf: [*]u8, max_len: u32) u32 {
         pos = appendDec(buf, pos, max_len, a.count);
         pos = appendStr(buf, pos, max_len, " depth=");
         pos = appendDec(buf, pos, max_len, a.depth);
+        pos = appendStr(buf, pos, max_len, " max_vec=");
+        pos = appendDec(buf, pos, max_len, a.max_vector);
+        pos = appendStr(buf, pos, max_len, " max_at_ms=");
+        pos = appendDec(buf, pos, max_len, p.cyclesToUs(a.max_start_tsc, mhz) / 1000);
         pos = appendStr(buf, pos, max_len, "\n");
     }
     return pos;

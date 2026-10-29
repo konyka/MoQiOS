@@ -418,7 +418,7 @@ pub var irq_acc: [irq_time.MAX_CPUS]irq_time.Acc = @splat(.{});
 
 inline fn irqTimeEnter(frame: *const InterruptFrame) void {
     const cpu = @import("syscall_entry.zig").gsReadCpuId();
-    if (cpu < irq_acc.len) irq_acc[cpu].enter(@import("tsc.zig").read(), frame.cs & 3 == 3);
+    if (cpu < irq_acc.len) irq_acc[cpu].enterVec(@import("tsc.zig").read(), frame.cs & 3 == 3, @truncate(frame.vector));
 }
 
 inline fn irqTimeExit() void {

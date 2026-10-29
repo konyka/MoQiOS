@@ -12,6 +12,11 @@ pub const Acc = struct {
     total_cycles: u64 = 0,
     max_cycles: u64 = 0,
     count: u64 = 0,
+    /// Vector of the outermost interrupt currently being timed, and of the
+    /// longest one so far (with the TSC at which it started).
+    cur_vector: u8 = 0,
+    max_vector: u8 = 0,
+    max_start_tsc: u64 = 0,
 
     /// `from_user`: the interrupted context was user mode, so this entry is
     /// the outermost one whatever `depth` says. Some kernel paths entered
@@ -24,13 +29,23 @@ pub const Acc = struct {
         self.depth += 1;
     }
 
+    /// `enter` that also records which vector the outermost level is.
+    pub fn enterVec(self: *Acc, now: u64, from_user: bool, vector: u8) void {
+        self.enter(now, from_user);
+        if (self.depth == 1) self.cur_vector = vector;
+    }
+
     pub fn exit(self: *Acc, now: u64) void {
         if (self.depth == 0) return;
         self.depth -= 1;
         if (self.depth != 0) return;
         const d = if (now >= self.start_tsc) now - self.start_tsc else 0;
         self.total_cycles +|= d;
-        if (d > self.max_cycles) self.max_cycles = d;
+        if (d > self.max_cycles) {
+            self.max_cycles = d;
+            self.max_vector = self.cur_vector;
+            self.max_start_tsc = self.start_tsc;
+        }
         self.count +|= 1;
     }
 };

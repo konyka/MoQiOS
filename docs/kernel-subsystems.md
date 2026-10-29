@@ -862,7 +862,8 @@ const SchedStats = struct {
 - **中断耗时计量（`/proc/irqtime`，x86_64）**：`interruptDispatch` 在分发前后按 CPU 累计 TSC 周期
   （`arch/x86_64/irq_time_policy.zig`，只计最外层；从用户态进入时把嵌套深度清零，因为有些从中断进入的内核路径
   不经原路返回——例如在异常处理里结束任务——否则深度会卡在非零、计数从此停止）。每行
-  `cpu<N> total_us=… max_us=… count=… depth=…`。hello108 用它在测量窗口前后取差值，区分时间是被中断处理拿走的
+  `cpu<N> total_us=… max_us=… count=… depth=… max_vec=… max_at_ms=…`（最长一次中断的向量号及其开始时刻，
+  用于判断长中断来自哪个处理程序，例如向量 14 即缺页处理中的同步 I/O）。hello108 用它在测量窗口前后取差值，区分时间是被中断处理拿走的
   还是被宿主机拿走的。
 - **`getrusage` 报真实 CPU 时间**：`RUSAGE_SELF/THREAD` 返回 `utime_us`（含当前这一段
   运行的 TSC 增量）与 `stime_us`；`RUSAGE_CHILDREN` 返回 0；其他 `who` → EINVAL，坏指针
