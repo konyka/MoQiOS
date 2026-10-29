@@ -490,10 +490,13 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         2 => {
             syscallExit(frame);
         },
-        3 => {
-            const diag = @import("../../debug/kernel_diag.zig");
-            diag.dumpFull();
-            frame.rax = 0;
+        3 => { // kernel diagnostics dump: task table with page-table/kstack addresses, printed with IRQs off
+            if (!checkCapForCurrent("cap_sys_admin")) {
+                frame.rax = @bitCast(@as(i64, -1)); // EPERM
+            } else {
+                @import("../../debug/kernel_diag.zig").dumpFull();
+                frame.rax = 0;
+            }
         },
         4 => {
             syscallGetpid(frame);

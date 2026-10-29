@@ -4540,6 +4540,19 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     因 hello107/hello108 FAIL（新的提前退出生效）；当时宿主机 load ≈ 18，另有不属于本任务的进程（其他项目的 zig 编译、16 个由别的
     会话启动的 `timeout 200 sh -c 'while :; do :; done'`）占满 CPU。负载降到 ≈ 4 后两组单独重跑都通过（hello107 最长 1.0–1.1 ms，
     hello108 stolen 0–1.2 ms）。这与上面的实验结论一致。
+- **第四十一轮：原生 #3 内核状态转储对任何进程开放；hello83 误用它当 close**：
+  - 问题：原生 3 号调用直接 `kernel_diag.dumpFull()`：把内存统计、整张任务表（含每个任务的页表物理地址、内核栈虚拟地址）、调度统计
+    打到串口/fbcon。没有任何权限检查，uid 1000 的进程可以随时调用；打印期间串口锁关中断、逐字节轮询 UART，也是一个可由普通用户
+    触发的长时间关中断路径。
+  - 顺带发现：hello83 把 3 号当成 Linux 的 close（本系统 close 是 11 号）——它每次运行都会触发一次转储，epoll fd 也从没关闭；冒烟
+    日志里每次都有两段 “=== Task Diagnostics ===”，此前没人注意。
+  - RED：hello113 新增场景 J（以 uid 1000、无权能调用 3 号），旧内核 FAIL（返回 0 并打印了转储）。
+  - 修复：3 号要求 CAP_SYS_ADMIN，否则 EPERM。hello83 改为调用 11 号 close 并检查返回值。
+  - 复核（未改）：`reboot` 要 CAP_SYS_REBOOT；`syslog` 不返回任何数据；`chroot`、`acct`、`unshare`、新挂载 API（open_tree/
+    move_mount/fsopen/fsconfig/fsmount/fspick）、`mount_setattr`、landlock、`memfd_secret`、`process_mrelease` 都返回 ENOSYS 或等价。
+  - 验证：hello113 J 通过、hello83 PASS，冒烟日志里不再出现转储；host 704/704。修复只是一处权能检查，去掉它即回到 RED 那次的内核，
+    未另做变异。门禁（宿主机空闲，load ≈ 1–2）：三架构构建通过，五组冒烟 hello113 各 32 ok、hello114 各 308 ok、hello115 各 74 ok、
+    0 FAIL、0 次转储、0 次内核态故障，stress 5/5。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；

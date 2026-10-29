@@ -12,6 +12,9 @@
 ///   I. a path string that ends right before an unmapped page is accepted by
 ///      every path-taking call (the kernel must stop at the NUL, not demand
 ///      255 readable bytes).
+///   J. the native kernel-state dump (#3: task table with page-table and
+///      kernel-stack addresses, IRQs off while it prints) is not available to
+///      an unprivileged process.
 ///   H. 64-bit fd arguments that do not fit 32 bits are EBADF, not a panic;
 ///      eventfd2 with a huge initval cannot overflow the counter later.
 
@@ -248,6 +251,9 @@ void _start(void) {
             syscall2(SYS_MUNMAP, (uint64_t)base, 4096);
         }
     }
+
+    /* J (hello113 runs as uid 1000 without capabilities) */
+    check(syscall1(3, 0) == -1, "J: the kernel diagnostics dump (#3) is EPERM without CAP_SYS_ADMIN");
 
     print(failures == 0 ? "hello113: PASS\n" : "hello113: FAIL\n");
     print("hello113 done\n");
