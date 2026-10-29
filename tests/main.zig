@@ -6722,3 +6722,12 @@ test "memfd seals vs mmap: F_SEAL_WRITE forbids new shared writable mappings and
     try std.testing.expectEqual(mp.AddResult{ .ok = mp.F_SEAL_WRITE }, mp.addSealsMapped(0, mp.F_SEAL_WRITE, 0));
     try std.testing.expectEqual(mp.AddResult{ .ok = mp.F_SEAL_GROW }, mp.addSealsMapped(0, mp.F_SEAL_GROW, 1));
 }
+
+test "memfd seals vs mmap: a shared mapping of a write-sealed file can never become writable" {
+    const mp = kt.memfd_policy;
+    try std.testing.expect(!mp.mapMayWrite(mp.F_SEAL_WRITE, true, true));
+    try std.testing.expect(!mp.mapMayWrite(mp.F_SEAL_FUTURE_WRITE, true, true));
+    try std.testing.expect(mp.mapMayWrite(mp.F_SEAL_WRITE, false, true)); // private COW
+    try std.testing.expect(mp.mapMayWrite(mp.F_SEAL_GROW, true, true));
+    try std.testing.expect(!mp.mapMayWrite(0, true, false)); // read-only fd
+}

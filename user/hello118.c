@@ -59,6 +59,8 @@ static inline int64_t syscall3(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_MMAP      8
 #define SYS_MUNMAP    12
 #define EINVAL_       22
+#define EACCES_       13
+#define SYS_MPROTECT  164
 
 static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
     int64_t ret;
@@ -182,6 +184,7 @@ void _start(void) {
             check(syscall6(SYS_MMAP, 0, 4096, 3, 1, (uint64_t)m, 0) == -EPERM_, "E: a new MAP_SHARED|PROT_WRITE mapping of a write-sealed memfd is EPERM");
             int64_t ro = syscall6(SYS_MMAP, 0, 4096, 1, 1, (uint64_t)m, 0);
             check(ro > 0 && *(volatile char *)ro == 'M', "E: a shared read-only mapping still works and sees the data");
+            check(ro > 0 && syscall3(SYS_MPROTECT, (uint64_t)ro, 4096, 3) == -EACCES_, "E: mprotect cannot make a shared mapping of a write-sealed memfd writable");
             if (ro > 0) syscall2(SYS_MUNMAP, (uint64_t)ro, 4096);
             int64_t pr = syscall6(SYS_MMAP, 0, 4096, 3, 2 /* MAP_PRIVATE */, (uint64_t)m, 0);
             check(pr > 0, "E: a private writable (COW) mapping still works");

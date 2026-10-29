@@ -59,6 +59,14 @@ pub fn mmapAllowed(seals: u32, shared: bool, writable: bool) bool {
     return seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) == 0;
 }
 
+/// Whether a mapping may ever be made writable by mprotect (Linux clears
+/// VM_MAYWRITE on shared mappings of write-sealed files). `fd_writable` is
+/// the descriptor's write access; private mappings are COW and unaffected.
+pub fn mapMayWrite(seals: u32, shared: bool, fd_writable: bool) bool {
+    if (!shared) return true;
+    return fd_writable and seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) == 0;
+}
+
 /// F_ADD_SEALS when `shared_writable_maps` shared writable mappings exist:
 /// F_SEAL_WRITE would be bypassed through them, so it is EBUSY (Linux);
 /// F_SEAL_FUTURE_WRITE only stops new writers and is allowed.

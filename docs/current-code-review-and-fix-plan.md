@@ -4675,9 +4675,21 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     只回退这两个挂钩时 2 项 FAIL。
   - 门禁中的一次失败（如实）：第一次门禁的 stress 没有运行——门禁进行中我改了 tmpfs.zig（给新的 `ebusy` 分支），stress 步骤重新编译
     内核时遇到“switch 未处理所有情况”的编译错误。冒烟五组用的是之前编好的内核，结果有效；但 stress 不算通过。之后门禁期间不再改源码。
-  - 没做的：mprotect 把已有的共享只读映射改成可写时，没有检查 WRITE 封印。
+  - 没做的：mprotect 把已有的共享只读映射改成可写时，没有检查 WRITE 封印（已在第五十一轮补上）。
   - 验证：host 715/715；冒烟 MBR SMP=1/2/8 与 GPT SMP=2/8 五组 0 FAIL、hello118 PASS。stress 第二次门禁时 hello108（延迟测试）
     失败一次，当时宿主机负载峰值 18.70；负载回落后重跑 stress 5/5 PASS（负载峰值 6.83）。代码未改。
+- **第五十一轮：mprotect 与写封印**：
+  - 问题：共享只读映射一个 memfd 后再加 F_SEAL_WRITE（或在封印后建只读共享映射），`mprotect(PROT_WRITE)` 仍成功，
+    封印可被绕过。Linux 在这种映射上清掉 VM_MAYWRITE，mprotect 返回 EACCES。
+  - 修复：`memfd_policy.mapMayWrite(seals, shared, fd_writable)`；`sysMprotect` 预检阶段对重叠的 tmpfs 区域实时读取封印
+    （ctime 代号不匹配即视为已失效、不加限制），不允许时返回 EACCES，此时页表尚未改动。私有 COW 映射不受影响。
+  - TDD：host 测试先写（编译失败）；hello118 新增 1 项；只回退 mprotect.zig 时该项 FAIL，恢复后 PASS。
+  - 验证：host 716/716；riscv64/aarch64 构建通过；冒烟 MBR SMP=1/2/8、GPT SMP=2/8 五组 0 FAIL、hello118 PASS。
+    stress 第一次第 2 轮 hello108 FAIL（baseline max_gap 1924 µs、reaping 2455 µs / stolen 6746 µs，超过 4 ms 预算），
+    **当时负载只有约 3.7**，所以这次不能归因于宿主机高负载；重跑 5/5 PASS（期间负载峰值 18.44）。
+  - **hello108 偶发失败的统计（如实）**：/tmp 下保留的 249 次 stress 运行里 hello108 FAIL 12 次（约 5%），
+    多数是 reaping 窗口 max_gap≈7.5 ms，也有 baseline 本身就超标的（说明不全是回收造成的）。负载高低与失败没有明显对应。
+    原因**未查明**，列为后续调查项；本轮改动不涉及调度和回收路径。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；

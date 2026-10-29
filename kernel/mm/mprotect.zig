@@ -118,6 +118,14 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
         // A shared mapping of a read-only fd can never become writable:
         // the write would land in the file the caller cannot write.
         if (plan.overlap != .none and !policy.writeGrantAllowed(prot, r.shared, r.may_write)) return EACCES;
+        // Nor can a shared mapping of a write-sealed memfd, whether the seal
+        // came before or after the mapping (seals are read live).
+        if (plan.overlap != .none and r.file_kind == @intFromEnum(filemap.FsKind.tmpfs)) {
+            const tmpfs = @import("../fs/tmpfs.zig");
+            const tidx: u8 = @intCast(r.file_idx);
+            const seals = if (tmpfs.tmpfsGetCtime(tidx) == r.file_data) tmpfs.tmpfsGetSeals(tidx) orelse 0 else 0;
+            if (!policy.writeGrantAllowed(prot, r.shared, @import("../fs/memfd_policy.zig").mapMayWrite(seals, r.shared, r.may_write))) return EACCES;
+        }
         slots_needed += plan.slots_needed;
     }
     if (slots_needed > free_slots) return ENOMEM;
