@@ -6686,3 +6686,39 @@ test "memfd_create: flag and name validation" {
     try std.testing.expect(mp.nameLenValid(249));
     try std.testing.expect(!mp.nameLenValid(250));
 }
+
+test "memfd seals: add rules and what each seal forbids" {
+    const mp = kt.memfd_policy;
+    // a memfd created without MFD_ALLOW_SEALING starts with F_SEAL_SEAL (nothing can be added)
+    try std.testing.expectEqual(mp.F_SEAL_SEAL, mp.initialSeals(0));
+    try std.testing.expectEqual(@as(u32, 0), mp.initialSeals(mp.MFD_ALLOW_SEALING));
+    // adding: unknown bits EINVAL, F_SEAL_SEAL present EPERM, otherwise OR-ed in
+    try std.testing.expectEqual(mp.AddResult{ .ok = mp.F_SEAL_GROW }, mp.addSeals(0, mp.F_SEAL_GROW));
+    try std.testing.expectEqual(mp.AddResult{ .ok = mp.F_SEAL_GROW | mp.F_SEAL_SHRINK }, mp.addSeals(mp.F_SEAL_GROW, mp.F_SEAL_SHRINK));
+    try std.testing.expectEqual(mp.AddResult.eperm, mp.addSeals(mp.F_SEAL_SEAL, mp.F_SEAL_GROW));
+    try std.testing.expectEqual(mp.AddResult.einval, mp.addSeals(0, 0x100));
+    // what the seals forbid
+    try std.testing.expect(!mp.writeAllowed(mp.F_SEAL_WRITE, 0, 1, 10));
+    try std.testing.expect(mp.writeAllowed(mp.F_SEAL_GROW, 0, 4, 10)); // inside the current size
+    try std.testing.expect(!mp.writeAllowed(mp.F_SEAL_GROW, 8, 4, 10)); // would grow
+    try std.testing.expect(mp.writeAllowed(0, 8, 4, 10));
+    try std.testing.expect(!mp.truncateAllowed(mp.F_SEAL_SHRINK, 5, 10));
+    try std.testing.expect(mp.truncateAllowed(mp.F_SEAL_SHRINK, 20, 10));
+    try std.testing.expect(!mp.truncateAllowed(mp.F_SEAL_GROW, 20, 10));
+    try std.testing.expect(mp.truncateAllowed(mp.F_SEAL_GROW | mp.F_SEAL_SHRINK, 10, 10)); // no change
+}
+
+test "memfd seals vs mmap: F_SEAL_WRITE forbids new shared writable mappings and is refused while one exists" {
+    const mp = kt.memfd_policy;
+    // mapping a sealed file
+    try std.testing.expect(!mp.mmapAllowed(mp.F_SEAL_WRITE, true, true));
+    try std.testing.expect(!mp.mmapAllowed(mp.F_SEAL_FUTURE_WRITE, true, true));
+    try std.testing.expect(mp.mmapAllowed(mp.F_SEAL_WRITE, true, false)); // shared read-only is fine
+    try std.testing.expect(mp.mmapAllowed(mp.F_SEAL_WRITE, false, true)); // private COW is fine
+    try std.testing.expect(mp.mmapAllowed(0, true, true));
+    // sealing while a shared writable mapping exists: EBUSY for WRITE, not for FUTURE_WRITE
+    try std.testing.expectEqual(mp.AddResult.ebusy, mp.addSealsMapped(0, mp.F_SEAL_WRITE, 1));
+    try std.testing.expectEqual(mp.AddResult{ .ok = mp.F_SEAL_FUTURE_WRITE }, mp.addSealsMapped(0, mp.F_SEAL_FUTURE_WRITE, 1));
+    try std.testing.expectEqual(mp.AddResult{ .ok = mp.F_SEAL_WRITE }, mp.addSealsMapped(0, mp.F_SEAL_WRITE, 0));
+    try std.testing.expectEqual(mp.AddResult{ .ok = mp.F_SEAL_GROW }, mp.addSealsMapped(0, mp.F_SEAL_GROW, 1));
+}

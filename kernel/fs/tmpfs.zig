@@ -37,6 +37,10 @@ const TmpfsEntry = struct {
     // and the slot is only freed once the last open fd closes.
     open_count: u16,
     deleted: bool,
+    /// File seals (memfd_policy.F_SEAL_*). Ordinary tmpfs files carry
+    /// F_SEAL_SEAL (no seals can be added, as on Linux); memfds start from
+    /// memfd_policy.initialSeals.
+    seals: u32 = 0x0001,
 };
 
 pub const Metadata = struct {
@@ -363,6 +367,7 @@ pub fn tmpfsWrite(idx: u8, offset: u64, data: [*]const u8, count: u32) i64 {
 
     const entry = &entries[idx];
     if (!entry.active or entry.is_dir) return -1;
+    if (!@import("memfd_policy.zig").writeAllowed(entry.seals, offset, count, entry.size)) return -1; // EPERM: sealed
     if (offset >= MAX_FILE_SIZE) return -1;
 
     const start: u32 = @intCast(offset);
@@ -404,8 +409,38 @@ pub fn tmpfsTruncate(idx: u8, new_size: u32) bool {
 
     const entry = &entries[idx];
     if (!entry.active or entry.is_dir or new_size > MAX_FILE_SIZE) return false;
+    if (!@import("memfd_policy.zig").truncateAllowed(entry.seals, new_size, entry.size)) return false;
     truncateLocked(entry, new_size);
     return true;
+}
+
+/// Current seals of a tmpfs file (F_GET_SEALS); null for a directory or a
+/// dead slot.
+pub fn tmpfsGetSeals(idx: u8) ?u32 {
+    if (idx >= MAX_FILES) return null;
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    const entry = &entries[idx];
+    if (!entry.active or entry.is_dir) return null;
+    return entry.seals;
+}
+
+/// F_ADD_SEALS: 0, or -EPERM / -EINVAL / -EBUSY as memfd_policy decides.
+/// `shared_writable_maps` is the caller's count of live MAP_SHARED
+/// PROT_WRITE mappings of this file (taken without tmpfs_lock).
+pub fn tmpfsAddSeals(idx: u8, add: u32, shared_writable_maps: u32) i64 {
+    if (idx >= MAX_FILES) return -22;
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    const entry = &entries[idx];
+    if (!entry.active or entry.is_dir) return -22;
+    switch (@import("memfd_policy.zig").addSealsMapped(entry.seals, add, shared_writable_maps)) {
+        .ok => |v| entry.seals = v,
+        .eperm => return -1,
+        .einval => return -22,
+        .ebusy => return -16,
+    }
+    return 0;
 }
 
 fn truncateLocked(entry: *TmpfsEntry, new_size: u32) void {
@@ -473,6 +508,14 @@ pub fn tmpfsCreateAnonymous(euid: u32, egid: u32) ?u8 {
     const idx = createEntryLocked("", 0, 0, false, 0o777, 0, euid, egid) orelse return null;
     entries[idx].deleted = true;
     return idx;
+}
+
+/// Set the initial seals of a just-created memfd.
+pub fn tmpfsSetInitialSeals(idx: u8, seals: u32) void {
+    if (idx >= MAX_FILES) return;
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    entries[idx].seals = seals;
 }
 
 /// Retain one open reference (fork/clone fd-table copy — see

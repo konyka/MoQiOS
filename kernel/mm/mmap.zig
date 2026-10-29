@@ -1038,6 +1038,9 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
                 m.data = desc.file_data;
             },
             .tmpfs => {
+                // A write seal forbids new shared writable mappings (EPERM).
+                const seals = tmpfs.tmpfsGetSeals(@intCast(desc.tmpfs_idx)) orelse 0;
+                if (!@import("../fs/memfd_policy.zig").mmapAllowed(seals, shared, (prot & 2) != 0)) return -1;
                 m.idx = desc.tmpfs_idx;
                 // ctime doubles as a generation tag: after unlink+close the
                 // entry is freed and a recycled slot gets a fresh ctime, so a

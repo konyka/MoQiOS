@@ -1899,7 +1899,9 @@ const SysCap = packed struct {
   的 root 规则：real 或 effective uid 为 0 时 permitted 保留、effective 在 euid 为 0 时等于 permitted，否则为空；两者都不为 0 时
   permitted 和 effective 都清空。
 - memfd_create(2)（`fs/memfd_policy.zig`、`tmpfs.tmpfsCreateAnonymous`）：无目录项、出生即 unlinked 的 tmpfs 普通文件，最后一次 close
-  释放；flags 只接受 MFD_CLOEXEC/MFD_ALLOW_SEALING（封印未实现）；名字 ≤ 249 字节。
+  释放；flags 只接受 MFD_CLOEXEC/MFD_ALLOW_SEALING；名字 ≤ 249 字节。fcntl F_ADD_SEALS/F_GET_SEALS：SEAL/SHRINK/GROW/WRITE
+  （FUTURE_WRITE 同 WRITE），在 tmpfs 写入/截断内部执行；无 MFD_ALLOW_SEALING 的 memfd 与普通 tmpfs 文件为 F_SEAL_SEAL。
+  有 WRITE 封印时新的共享可写 mmap 为 EPERM；存在共享可写映射时加 F_SEAL_WRITE 为 EBUSY。未覆盖：mprotect 授写不查封印。
 - syslog(2)（`proc/syslog_policy.zig`）：读 64 KiB kmsg 环；READ_ALL 从上次 CLEAR 后读、READ 消费全局未读游标、READ_CLEAR/CLEAR/
   SIZE_UNREAD/SIZE_BUFFER；除 SIZE_BUFFER 外需 CAP_SYS_ADMIN；console 动作接受但无作用。
 - prctl（`proc/prctl_policy.zig`）：`PR_SET_PDEATHSIG` 取 0 或 1..31，父进程退出时向非线程子进程发送（`exitTask` 收集、解锁后发送），

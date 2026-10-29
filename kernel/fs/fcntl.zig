@@ -16,6 +16,8 @@ pub const F_GETLK: u64 = 5;
 pub const F_SETLK: u64 = 6;
 pub const F_SETLKW: u64 = 7;
 pub const F_DUPFD_CLOEXEC: u64 = 1030;
+pub const F_ADD_SEALS: u64 = 1033;
+pub const F_GET_SEALS: u64 = 1034;
 
 pub const FD_CLOEXEC: u32 = 1;
 
@@ -64,6 +66,18 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
         },
         F_DUPFD_CLOEXEC => {
             return dupFd(t.fd_table, fd, arg, FD_CLOEXEC);
+        },
+        F_ADD_SEALS, F_GET_SEALS => {
+            // Seals live on tmpfs files (memfds are tmpfs files); every
+            // other file type is EINVAL, as on Linux.
+            if (t.fd_table.fds[fd].fd_type != .tmpfs_file) return -22;
+            const tmpfs = @import("tmpfs.zig");
+            const idx: u8 = @intCast(t.fd_table.fds[fd].tmpfs_idx);
+            if (cmd == F_GET_SEALS) return @intCast(tmpfs.tmpfsGetSeals(idx) orelse return -22);
+            // Linux: adding seals needs a writable descriptor.
+            if (!t.fd_table.fds[fd].writable) return -1;
+            const maps = @import("../proc/task.zig").countSharedWritableTmpfsMaps(idx, tmpfs.tmpfsGetCtime(idx));
+            return tmpfs.tmpfsAddSeals(idx, @truncate(arg), maps);
         },
         F_GETLK, F_SETLK, F_SETLKW => {
             const file_lock = @import("file_lock.zig");

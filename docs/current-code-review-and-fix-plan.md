@@ -4661,6 +4661,23 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   - 验证：host 713/713；hello80、hello118 PASS。门禁：三架构构建通过；MBR SMP=1/2、GPT SMP=2/8 冒烟 0 FAIL，hello118 各 PASS；stress 5/5。
     MBR SMP=8 那次 hello105/106/107/108 四个延迟测试同时 FAIL（hello118 PASS），门禁期间宿主机 load 峰值 20.45；随后连跑两次 MBR SMP=8
     都 0 FAIL（load 7–9）。四个延迟测试一起变差是宿主机 CPU 竞争的特征（第四十轮）。
+- **第五十轮：memfd 文件封印（F_ADD_SEALS / F_GET_SEALS）**：
+  - 上一轮 MFD_ALLOW_SEALING 被接受但封印没实现。纯函数（`fs/memfd_policy.zig`）：`initialSeals`（没有 MFD_ALLOW_SEALING 时出生即 F_SEAL_SEAL）、
+    `addSeals`（未知位 EINVAL，已有 F_SEAL_SEAL 时 EPERM，否则按位或）、`writeAllowed`（WRITE/FUTURE_WRITE 禁止写入，GROW 禁止写过末尾）、
+    `truncateAllowed`（SHRINK 禁止缩小，GROW 禁止扩大）。tmpfs 条目新增 `seals`（普通 tmpfs 文件默认 F_SEAL_SEAL，与 Linux 一样不能加封印），
+    在 `tmpfsWrite`/`tmpfsTruncate` 内部执行，因此所有写入和截断路径都受约束；fcntl 1033/1034 只对 tmpfs 文件有效，加封印要求可写描述符。
+    F_SEAL_FUTURE_WRITE 按 F_SEAL_WRITE 处理（这里没有需要保留的共享可写映射语义）。
+  - TDD：host 测试先写（编译失败）；hello118 新增 E 段 17 项，旧内核 13 项 FAIL。我写的一项检查最初断言“已封印后非法位也是 EPERM”，与
+    Linux 的检查顺序（先查非法位 EINVAL）相反，内核实现是对的，改正了测试。
+  - 与 mmap 的交互（同一轮补上）：`memfd_policy.mmapAllowed`——有 WRITE/FUTURE_WRITE 封印时新的 MAP_SHARED|PROT_WRITE 映射返回 EPERM，
+    共享只读与私有 COW 映射不受影响；`addSealsMapped`——还有共享可写映射时加 F_SEAL_WRITE 返回 EBUSY（FUTURE_WRITE 允许）。映射计数由
+    `task.countSharedWritableTmpfsMaps` 在 task_lock 下扫描所有任务的区域表（按 tmpfs 条目号与 ctime 代号匹配）。hello118 新增 5 项，
+    只回退这两个挂钩时 2 项 FAIL。
+  - 门禁中的一次失败（如实）：第一次门禁的 stress 没有运行——门禁进行中我改了 tmpfs.zig（给新的 `ebusy` 分支），stress 步骤重新编译
+    内核时遇到“switch 未处理所有情况”的编译错误。冒烟五组用的是之前编好的内核，结果有效；但 stress 不算通过。之后门禁期间不再改源码。
+  - 没做的：mprotect 把已有的共享只读映射改成可写时，没有检查 WRITE 封印。
+  - 验证：host 715/715；冒烟 MBR SMP=1/2/8 与 GPT SMP=2/8 五组 0 FAIL、hello118 PASS。stress 第二次门禁时 hello108（延迟测试）
+    失败一次，当时宿主机负载峰值 18.70；负载回落后重跑 stress 5/5 PASS（负载峰值 6.83）。代码未改。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；

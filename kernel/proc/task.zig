@@ -1065,6 +1065,33 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
 }
 
 /// Get task by index. Returns null if slot is empty or out of range.
+/// Live MAP_SHARED|PROT_WRITE regions of tmpfs entry `idx` (generation
+/// `gen` = its ctime) across every task — F_ADD_SEALS(F_SEAL_WRITE) must
+/// fail while one exists. CLONE_VM siblings copy region tables, so a shared
+/// address space may be counted more than once; only zero vs non-zero
+/// matters to the caller.
+pub fn countSharedWritableTmpfsMaps(idx: u32, gen: u64) u32 {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    const tmpfs_kind: u8 = @intFromEnum(@import("../mm/filemap.zig").FsKind.tmpfs);
+    var n: u32 = 0;
+    var bits = slot_bitmap;
+    while (bits != 0) {
+        const i: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const t = &tasks[i];
+        if (t.state == .zombie) continue;
+        var rb = t.mmap_active_bm;
+        while (rb != 0) {
+            const ri: u6 = @truncate(@ctz(rb));
+            rb &= rb - 1;
+            const r = &t.mmap_regions[ri];
+            if (r.active and r.shared and r.prot & 2 != 0 and r.file_kind == tmpfs_kind and r.file_idx == idx and r.file_data == gen) n += 1;
+        }
+    }
+    return n;
+}
+
 pub fn getTask(idx: u32) ?*Task {
     if (idx >= MAX_TASKS) return null;
     if (slot_bitmap & (@as(u64, 1) << @intCast(idx)) == 0) return null;

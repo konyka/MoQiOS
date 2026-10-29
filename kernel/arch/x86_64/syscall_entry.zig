@@ -4870,6 +4870,7 @@ fn syscallMemfdCreate(name_ptr: u64, flags: u32) i64 {
         t.fd_table.freeFd(fd_slot);
         return -23; // ENFILE: tmpfs table full
     };
+    tmpfs.tmpfsSetInitialSeals(idx, mp.initialSeals(flags));
     t.fd_table.fds[fd_slot] = .{
         .fd_type = .tmpfs_file,
         .offset = 0,
