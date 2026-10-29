@@ -91,8 +91,12 @@ ext2 inodes 12-14; the file set the tests rely on is unchanged.
 
 `qemu_smoke.sh` truncates its serial and run logs before every boot (also when the caller names
 them via `MOQI_SMOKE_LOG`/`MOQI_SMOKE_RUN_LOG`), so markers from an earlier run cannot satisfy the
-PASS checks. It removes its automatically created temporary work directory and generated logs on
-exit. A caller-supplied `MOQI_SMOKE_WORK_DIR` is treated as caller-owned and is preserved.
+PASS checks. Once a test prints `helloN: FAIL` and init has reached the shell, it fails at once
+instead of waiting for the timeout. It removes its automatically created temporary work directory and
+generated logs on exit. `qemu_run.sh` serialises Limine preparation and `bios-install` with `flock`
+(`MOQI_LIMINE_LOCK`, default `/tmp/moqios-limine.lock`) so parallel runs do not delete the shared
+`limine/limine` utility under each other. Latency tests (hello105/107/108) run under TCG and measure
+host wall-clock time, so they are only meaningful on an otherwise idle host. A caller-supplied `MOQI_SMOKE_WORK_DIR` is treated as caller-owned and is preserved.
 A caller-supplied `MOQI_SMOKE_DISK` is likewise caller-owned: it is booted as given (so a disk can
 be carried across runs or prepared beforehand) and must already exist; only the default private
 copy is refreshed from `disk.img`.

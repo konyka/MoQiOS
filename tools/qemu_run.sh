@@ -30,6 +30,12 @@ if [ ! -f "$KERNEL" ]; then
     exit 1
 fi
 
+# limine_prepare deletes and rebuilds the shared limine/limine utility, so
+# concurrent runs (parallel smoke jobs) must not interleave prepare with
+# another run's bios-install. Hold one lock across both steps.
+LIMINE_LOCK_FILE="${MOQI_LIMINE_LOCK:-/tmp/moqios-limine.lock}"
+exec {LIMINE_LOCK_FD}>"$LIMINE_LOCK_FILE"
+flock "$LIMINE_LOCK_FD"
 limine_prepare "$LIMINE_DIR"
 
 # Create ISO structure
@@ -89,6 +95,8 @@ xorriso -as mkisofs \
 
 # Install Limine BIOS stages
 limine_bios_install "$LIMINE_DIR" "$ISO_FILE"
+flock -u "$LIMINE_LOCK_FD"
+exec {LIMINE_LOCK_FD}>&-
 
 # Launch QEMU
 echo "========================================="

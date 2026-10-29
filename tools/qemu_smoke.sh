@@ -181,6 +181,14 @@ check_fatal_output() {
         echo "Serial log: $LOG_FILE"
         exit 1
     fi
+    # A test that reported FAIL can never satisfy the PASS markers; once init
+    # has reached the shell nothing else will run, so stop waiting.
+    if [ -f "$LOG_FILE" ] && grep -aqE "^hello[0-9]+: FAIL"$'\r'"?\$" "$LOG_FILE" && grep -aq "MoQiOS shell" "$LOG_FILE"; then
+        echo "FAIL: a test reported FAIL during smoke (SMP=$SMP_COUNT)."
+        grep -aE "^hello[0-9]+: +FAIL|^hello[0-9]+: FAIL" "$LOG_FILE" | head -20
+        echo "Serial log: $LOG_FILE"
+        exit 1
+    fi
     if { [ -f "$LOG_FILE" ] && grep -aq "KERNEL PANIC" "$LOG_FILE"; } ||
        { [ -f "$RUN_LOG" ] && grep -aq "KERNEL PANIC" "$RUN_LOG"; }; then
         echo "FAIL: the kernel panicked during smoke (SMP=$SMP_COUNT)."
