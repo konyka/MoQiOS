@@ -5156,3 +5156,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   TSC units. The LAPIC is still periodic 100 Hz until wait subsystems export a global next
   deadline. PI futex, a preemptible kernel, and an O(1) priority bitmap runqueue remain on
   the P3 list.
+
+### 已知限制：缺页路径中的同步磁盘 I/O 关中断执行（/proc/irqtime 定位）
+
+- 现象：`/proc/irqtime` 的 `max_vec=14`，单次约 90ms（QEMU 模拟盘）。
+- 原因：#PF 门为中断门（`type_attr=0x8E`，进入时 IF=0）；`handleDemandPage` 的 swap-in（`swap.swapIn`）
+  与文件映射缺页直接调用 `block_dev.readSectors`，AHCI 非 NCQ 路径为轮询 DMA，整个读盘期间本 CPU 关中断，
+  定时器/IPI 被推迟。
+- 判定：非逻辑错误，属于"缺页 I/O 不可睡眠"的架构限制；正确性不受影响，只影响该 CPU 的中断延迟。
+- 后续方向：缺页路径在持 vm_lock 的前提下开中断、改为阻塞式 I/O 等待完成中断（需先厘清 vm_lock 与 IRQ
+  上下文的锁序，避免中断处理再次缺页时自锁），或预读/在系统调用上下文提前换入。
