@@ -1358,7 +1358,12 @@ fn kickCpuX86(cpu_id: u8) void {
     if (!ipi_kick_policy.shouldSend(prev != 0)) return;
     const apic_id: u8 = @truncate(se.percpu_array[cpu_id].apic_id);
     asm volatile ("mfence" ::: .{ .memory = true });
-    _ = lapic_mod.sendIpi(apic_id, lapic_mod.RESCHEDULE_VECTOR);
+    // Only a failed send resets the flag: after a delivered IPI the target
+    // may already have run its pass and cleared it, and re-marking here
+    // would leave it set with no IPI in flight.
+    if (ipi_kick_policy.resetAfterSend(lapic_mod.sendIpi(apic_id, lapic_mod.RESCHEDULE_VECTOR))) {
+        @atomicStore(u8, pending, ipi_kick_policy.clear(), .release);
+    }
 }
 
 /// Deliver a pending signal to the currently running user task.

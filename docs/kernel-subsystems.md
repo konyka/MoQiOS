@@ -1297,8 +1297,12 @@ const Pipe = struct {
 - 系统调用：#82(rename), #84(mkdir), #111(unlink), #123(mkdir旧号), #217(getdents64)
 - 多级路径解析支持
 - rename 路由（`fs/rename_policy.zig`）：`/tmp`↔`/tmp` 走 `tmpfs.tmpfsRename`（文件与目录、覆盖、`RENAME_NOREPLACE`、
-  `RENAME_EXCHANGE`、粘滞目录规则、禁止移入自身子树），跨 `/tmp` 边界为 EXDEV，其余走 ext2（只支持普通 rename，
-  其它 flag 为 EINVAL）。renameat2 的未知位、`RENAME_WHITEOUT`、NOREPLACE|EXCHANGE 为 EINVAL。hello119 验收。
+  `RENAME_EXCHANGE`、粘滞目录规则、禁止移入自身子树），跨 `/tmp` 边界为 EXDEV，其余走 ext2（普通 rename 与
+  `RENAME_NOREPLACE`；覆盖已有文件时原地改写目标目录项的 inode 号；文件覆盖目录为 EISDIR；`RENAME_EXCHANGE` 为 EINVAL）。
+  renameat2 的未知位、`RENAME_WHITEOUT`、NOREPLACE|EXCHANGE 为 EINVAL。FAT32 没有 rename：根目录下的裸文件名
+  （O_CREAT 时落在 FAT32）改名仍返回 EXDEV。hello119 验收。
+- 调度 IPI 合并（`ipi_kick_policy`）：`kickCpuX86` 先把目标 CPU 的 `resched_pending` 置 1 再发 IPI；若 LAPIC 没接受
+  （ICR 超时），立即清回 0（`resetAfterSend`），否则此后发给该 CPU 的所有 kick 都会被合并掉。发送成功时发送方不碰该标志。
 - 目录读取只对 tmpfs 可达：VFS 目前没有返回 ext2 目录描述符的路径，
   所以 `getdents64` 的 ext2 分支从用户态触达不到
 

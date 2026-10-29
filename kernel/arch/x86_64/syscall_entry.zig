@@ -3776,8 +3776,8 @@ fn syscallRename(old_ptr: u64, new_ptr: u64) i64 {
 
 /// rename/renameat2. /tmp↔/tmp goes to tmpfs (all three modes); a rename
 /// between /tmp and anything else is EXDEV; other paths go to ext2, which
-/// only implements a plain rename, so NOREPLACE/EXCHANGE there are EINVAL
-/// (Linux's answer for a filesystem without those flags).
+/// implements plain and NOREPLACE renames; EXCHANGE there is EINVAL
+/// (Linux's answer for a filesystem without that flag).
 fn syscallRenameFlags(old_ptr: u64, new_ptr: u64, flags: u32) i64 {
     const rename_policy = @import("../../fs/rename_policy.zig");
     const mode = switch (rename_policy.mode(flags)) {
@@ -3808,10 +3808,13 @@ fn syscallRenameFlags(old_ptr: u64, new_ptr: u64, flags: u32) i64 {
         },
         .other => {},
     }
-    if (mode != .replace) return -22;
+    // ext2 implements plain and NOREPLACE renames; EXCHANGE is EINVAL.
+    if (mode == .exchange) return -22;
     const ext2 = @import("../../fs/ext2.zig");
-    const r = ext2.renameFile(old_path, new_path, ext2Who());
-    return if (r == 0 or r == -13) r else -18; // EXDEV
+    const r = ext2.renameFileMode(old_path, new_path, ext2Who(), mode == .noreplace);
+    // Other failures keep the historical EXDEV answer (the path may belong
+    // to FAT32, which has no rename).
+    return if (r == 0 or r == -13 or r == -17 or r == -21) r else -18; // EXDEV
 }
 
 // ── v32.4: madvise / getrlimit / setrlimit ──────────────────────────

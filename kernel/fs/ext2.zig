@@ -2695,6 +2695,35 @@ fn removeDirEntry(parent_inode_num: u32, name: []const u8) bool {
     return false; // not found
 }
 
+/// Point the entry `name` in directory `parent_inode_num` at `new_inode`, in
+/// place. Used by rename onto an existing name. False when not found or on
+/// I/O error.
+fn retargetDirEntry(parent_inode_num: u32, name: []const u8, new_inode: u32) bool {
+    defer dcache.invalidateParent(.ext2, parent_inode_num);
+    var parent_inode: Ext2Inode = undefined;
+    if (!readInode(parent_inode_num, &parent_inode)) return false;
+    const buf_phys = pmm.allocPage() orelse return false;
+    defer pmm.freePage(buf_phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+    var offset: u32 = 0;
+    while (offset < parent_inode.size) : (offset += block_size) {
+        const phys_block = resolveBlock(&parent_inode, offset / block_size);
+        if (phys_block == 0) continue;
+        if (!readBlock(phys_block, buf)) return false;
+        var pos: u32 = 0;
+        while (pos < block_size and offset + pos < parent_inode.size) {
+            const view = eu.readDirEntry(buf, pos, block_size) orelse break;
+            if (view.inode != 0 and eqlStr(buf[view.name_pos .. view.name_pos + view.name_len], name)) {
+                const entry: *Ext2DirEntry = @ptrCast(@alignCast(buf + pos));
+                entry.inode = new_inode;
+                return writeBlock(phys_block, buf);
+            }
+            pos += view.rec_len;
+        }
+    }
+    return false;
+}
+
 // ─── File unlink ────────────────────────────────────────────────────────────
 
 /// Unlink (delete) a file from the ext2 filesystem.
@@ -2836,6 +2865,12 @@ fn eqlStr(a: []const u8, b: []const u8) bool {
 /// no-op instead of orphaning the file); an overwritten target is released
 /// with unlink semantics afterwards.
 pub fn renameFile(old_path: []const u8, new_path: []const u8, who: ?Who) i64 {
+    return renameFileMode(old_path, new_path, who, false);
+}
+
+/// rename with RENAME_NOREPLACE semantics when `noreplace`: an existing
+/// target is EEXIST and nothing changes.
+pub fn renameFileMode(old_path: []const u8, new_path: []const u8, who: ?Who, noreplace: bool) i64 {
     var flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return -1;
@@ -2877,15 +2912,37 @@ pub fn renameFile(old_path: []const u8, new_path: []const u8, who: ?Who) i64 {
     // Remember an overwritten target (released after the rename commits).
     var replaced_inode_num: ?u32 = null;
     if (findDirEntryCached(new_parent_inode, &new_parent_inode_data, new_filename)) |victim_num| {
+        if (noreplace) return -17; // EEXIST
         if (victim_num != file_inode_num) replaced_inode_num = victim_num;
     }
+    // A file cannot replace a directory (its entry would be retargeted and
+    // the directory orphaned).
+    if (replaced_inode_num) |victim_num| {
+        var victim_ino: Ext2Inode = undefined;
+        if (!readInode(victim_num, &victim_ino)) return -1;
+        if (eu.isDirectory(victim_ino.mode)) return -21; // EISDIR
+    }
 
-    // Order matters: add the new entry first; only then remove the old one.
-    if (!addDirEntry(new_parent_inode, file_inode_num, new_filename, file_type)) return -1;
-    if (!removeDirEntry(old_parent_inode, old_filename)) {
-        // Roll the add back so the file is not hard-linked twice.
-        _ = removeDirEntry(new_parent_inode, new_filename);
-        return -1;
+    if (replaced_inode_num != null) {
+        // Overwrite: point the existing target entry at the source inode in
+        // place (one block write, so the name never disappears or appears
+        // twice). addDirEntry appends without a duplicate check, so adding
+        // a second entry with the same name used to leave the victim's entry
+        // first in the directory: lookups kept finding the victim (rename
+        // looked like a no-op) while its link count was dropped anyway.
+        if (!retargetDirEntry(new_parent_inode, new_filename, file_inode_num)) return -1;
+        if (!removeDirEntry(old_parent_inode, old_filename)) {
+            _ = retargetDirEntry(new_parent_inode, new_filename, replaced_inode_num.?);
+            return -1;
+        }
+    } else {
+        // Order matters: add the new entry first; only then remove the old one.
+        if (!addDirEntry(new_parent_inode, file_inode_num, new_filename, file_type)) return -1;
+        if (!removeDirEntry(old_parent_inode, old_filename)) {
+            // Roll the add back so the file is not hard-linked twice.
+            _ = removeDirEntry(new_parent_inode, new_filename);
+            return -1;
+        }
     }
 
     // Release the replaced target with unlink semantics.

@@ -277,6 +277,22 @@ test "a second kick while a reschedule IPI is already pending is dropped" {
     try std.testing.expectEqual(@as(u8, 0), p.clear());
 }
 
+test "a kick whose IPI was never delivered does not leave the CPU marked pending" {
+    const p = ipi_kick_policy;
+    // Delivered: the sender leaves the flag alone (the target owns clearing).
+    try std.testing.expect(!p.resetAfterSend(true));
+    // Not delivered (ICR timeout): nothing will ever clear the flag, and
+    // every later kick to that CPU would be coalesced into a lost IPI.
+    try std.testing.expect(p.resetAfterSend(false));
+}
+
+test "kickCpuX86 applies afterSend to the result of sendIpi" {
+    const src = kt.sched_source;
+    const at = std.mem.indexOf(u8, src, "fn kickCpuX86(").?;
+    const body = src[at..][0..std.mem.indexOf(u8, src[at..], "\n}\n").?];
+    try std.testing.expect(std.mem.indexOf(u8, body, "ipi_kick_policy.resetAfterSend(lapic_mod.sendIpi(apic_id, lapic_mod.RESCHEDULE_VECTOR))") != null);
+}
+
 // ── R2-4: RT bandwidth + strict RR ──────────────────────────────────────
 
 const rt_bw = kt.rt_bandwidth_policy;

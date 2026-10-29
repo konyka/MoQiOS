@@ -12,6 +12,11 @@
 ///      target is missing); NOREPLACE|EXCHANGE and unknown bits are EINVAL.
 ///   D. Between /tmp and another filesystem: EXDEV. A missing source is
 ///      ENOENT.
+///   F. ext2 (testdir/, the root filesystem's 0777 directory; bare names in
+///      the root land on FAT32): RENAME_NOREPLACE is EEXIST onto an existing
+///      name and renames to a free one; a plain rename onto an existing file
+///      replaces it (the new contents are what the name opens); a file onto a
+///      directory is EISDIR; RENAME_EXCHANGE is EINVAL.
 ///   E. Sticky /tmp: another user cannot rename root's file away (EPERM via
 ///      the sticky rule), checked in a child that drops to uid 1000. The
 ///      launch profile starts this program as uid 0 with only
@@ -172,6 +177,27 @@ void _start(void) {
     check(pid > 0 && syscall3(SYS_WAITPID, (uint64_t)pid, (uint64_t)&status, 0) == pid &&
           ((status >> 8) & 0xff) == 0, "E: another user cannot rename root's file out of sticky /tmp");
     check(first("/tmp/h119-root") == 'R', "E: the file is still there");
+
+    /* F: ext2 (testdir/ is on ext2; bare root names land on FAT32) — plain rename and RENAME_NOREPLACE */
+    if (mkfile("testdir/h119-e2a", "1") == 0 && mkfile("testdir/h119-e2b", "2") == 0) {
+        check(ren2("testdir/h119-e2a", "testdir/h119-e2b", RENAME_NOREPLACE) == -EEXIST_, "F: ext2 RENAME_NOREPLACE onto an existing name is EEXIST");
+        check(first("testdir/h119-e2a") == '1' && first("testdir/h119-e2b") == '2', "F: and both files are unchanged");
+        check(ren2("testdir/h119-e2a", "testdir/h119-e2c", RENAME_NOREPLACE) == 0 && first("testdir/h119-e2c") == '1' && first("testdir/h119-e2a") == -1,
+              "F: ext2 RENAME_NOREPLACE to a free name renames");
+        check(ren2("testdir/h119-e2c", "testdir/h119-e2b", RENAME_EXCHANGE) == -EINVAL_, "F: ext2 RENAME_EXCHANGE is EINVAL (not implemented, not ignored)");
+        mkfile("testdir/h119-e2c", "3");
+        const int64_t pr = ren("testdir/h119-e2c", "testdir/h119-e2b");
+        check(pr == 0 && first("testdir/h119-e2b") == '3' && first("testdir/h119-e2c") == -1,
+              "F: ext2 rename onto an existing file replaces it (the new contents are visible)");
+        check(syscall2(SYS_MKDIR, (uint64_t)"testdir/h119-e2d", 0755) == 0 &&
+              ren("testdir/h119-e2b", "testdir/h119-e2d") == -EISDIR_, "F: ext2 file onto a directory is EISDIR");
+        syscall1(SYS_RMDIR, (uint64_t)"testdir/h119-e2d");
+        syscall1(SYS_UNLINK, (uint64_t)"testdir/h119-e2b");
+        syscall1(SYS_UNLINK, (uint64_t)"testdir/h119-e2c");
+        syscall1(SYS_UNLINK, (uint64_t)"testdir/h119-e2a");
+    } else {
+        check(0, "F: create ext2 fixtures");
+    }
 
     /* cleanup */
     syscall1(SYS_UNLINK, (uint64_t)"/tmp/h119-root");

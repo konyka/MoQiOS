@@ -20,3 +20,12 @@ pub fn mark(prev: u8) u8 {
 pub fn clear() u8 {
     return 0;
 }
+
+/// Whether the sender must reset the flag after its send attempt. Only an IPI
+/// the LAPIC never accepted (ICR delivery timeout): no pass will run to clear
+/// the flag, so every later kick to that CPU would be coalesced away. After a
+/// delivered IPI the sender must NOT touch it — the target may already have
+/// cleared it, and re-marking would strand it set with nothing in flight.
+pub fn resetAfterSend(delivered: bool) bool {
+    return !delivered;
+}

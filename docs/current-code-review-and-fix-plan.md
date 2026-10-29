@@ -4705,7 +4705,7 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   - TDD 与证据：hello119 在旧内核上 24 项 FAIL；host 测试 3 个（rename_policy）+ 启动档案测试扩充。**如实**：`rename_policy.zig`
     是在 host 测试之前写好的（当时门禁在跑，不能改已接入的源码），所以 host 测试没有经历“编译失败”这一步；运行时 RED 是真实的。
     变异：去掉 tmpfs rename 的 sticky 检查 → E 段 2 项 FAIL（第一次变异写法让函数参数未使用、编译失败，冒烟跑的是旧 ELF，结果作废后重做）。
-  - 没做的：ext2 上的 NOREPLACE/EXCHANGE；目录 rename 在 ext2 上仍被拒绝；renameat2 的 dirfd 对平面文件系统仍不参与解析
+  - 没做的：ext2 上的 NOREPLACE/EXCHANGE（NOREPLACE 已在第五十五轮补上）；目录 rename 在 ext2 上仍被拒绝；renameat2 的 dirfd 对平面文件系统仍不参与解析
     （卷目录描述符由 rofsGuard 返回 EROFS）。
   - 验证：host 719/719（新增 3 个）；riscv64/aarch64 构建通过；冒烟 MBR SMP=1/2/8、GPT SMP=2/8 五组 0 FAIL、hello119 PASS；
     stress 5/5（门禁期间负载峰值 5.88）。门禁前单次 SMP=1 冒烟里 hello108 又失败一次（baseline 6160 µs、reaping 7593 µs，
@@ -4758,7 +4758,24 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     我倾向于后者，但**没有证明**：要区分这两者，需要在客户机里记录中断处理耗时（未做）。
   - 影响范围：之前文档把停滞归为“可能是 QEMU 侧或 LAPIC 校准问题”，这个猜测是错的。之前 6.56 节 (14) 的两次（`h2_r16`、`h4_r6`）
     与本次签名相同（CPU0 `sched_entries=0`），**推断**同因；那两次没有 LAPIC 寄存器，不是直接证据。
-- **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
+- **第五十五轮：ext2 rename 覆盖目标是坏的；ext2 RENAME_NOREPLACE；调度 IPI 发送失败**：
+  - **ext2 rename 覆盖已有文件时并没有替换（已有缺陷，第五十二轮的测试没覆盖到）**：`renameFile` 先 `addDirEntry` 再删源项；
+    `addDirEntry` 只在目录末尾追加、不查重名，于是目录里出现两个同名项，查找总是先命中旧的那个——**改名看起来什么都没发生**，
+    但旧文件的链接数照样被 `releaseLink` 减掉了（目录项还在、inode 却可能被释放）。为 hello119 写 ext2 用例时发现：
+    `rename` 返回 0，打开目标读到的仍是旧内容（`'2'` 而不是 `'1'`），源名消失。
+    修复：覆盖时用新增的 `retargetDirEntry` 原地把目标目录项的 inode 号改成源文件（一次块写，名字不会消失也不会重复），
+    再删源项（失败则改回）；文件覆盖目录返回 EISDIR（此前会把目录项改指文件、孤立整个目录）。
+  - ext2 `RENAME_NOREPLACE`：`renameFileMode(.., noreplace)`，目标存在即 EEXIST、不做任何改动；`RENAME_EXCHANGE` 仍为 EINVAL。
+  - 测试注意：根目录下的裸文件名在 O_CREAT 时落在 **FAT32**（`vfs` 先试 FAT32），而 rename 只走 ext2，所以 hello119 的 F 段用
+    ext2 的 `testdir/`。FAT32 没有 rename，对它的改名仍返回 EXDEV（未改，记为已知限制）。
+  - hello119 F 段 6 项：旧内核 4 项 FAIL；只回退原地改写（其余修复保留）时 2 项 FAIL（覆盖与 EISDIR）；修复后全过。
+  - 调度 IPI：`kickCpuX86` 先置 `resched_pending=1` 再发 IPI，`sendIpi` 失败（ICR 超时）时标志永远不会被清，此后发给该 CPU 的
+    kick 全被合并掉。现在失败即清回 0（`ipi_kick_policy.resetAfterSend`）；**发送成功时不能写回 1**——目标可能已跑完调度并清了
+    标志，再写 1 会让它卡在“有 IPI 在路上”。（我第一版就是无条件写回，写完源码守卫后自己发现了这个竞态并改掉。）host 测试先写
+    （编译失败）；把重置去掉的变异使源码守卫失败。运行时没有触发路径（ICR 超时在 QEMU 里不出现），**没有运行时证据**。
+  - 验证：host 723/723；riscv64/aarch64 构建通过；冒烟 MBR SMP=1/8、GPT SMP=2/8 0 FAIL、hello119 PASS。门禁里 MBR SMP=2 的
+    hello108 FAIL 一次（reaping max_gap 2714 µs、stolen 11910 µs，窗口内 nvcsw=nivcsw=0，当时负载约 5），stress 第 1 轮 hello107/108 FAIL
+    （期间负载峰值 18.64）；本轮改动不涉及调度路径之外的时序（IPI 改动只在发送失败时生效）。重跑 MBR SMP=2 0 FAIL、stress 5/5（负载峰值 9.03）。
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；
     `init`（tid 5）在 `waitpid`；它的子进程 `hello29`（tid 30）停在 `fsync` 里，保存的返回地址落在
