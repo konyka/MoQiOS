@@ -3808,9 +3808,11 @@ fn syscallRenameFlags(old_ptr: u64, new_ptr: u64, flags: u32) i64 {
         },
         .other => {},
     }
-    // ext2 implements plain and NOREPLACE renames; EXCHANGE is EINVAL.
-    if (mode == .exchange) return -22;
     const ext2 = @import("../../fs/ext2.zig");
+    if (mode == .exchange) {
+        const xr = ext2.renameExchange(old_path, new_path, ext2Who());
+        return if (xr == 0 or xr == -2 or xr == -5 or xr == -13 or xr == -22) xr else -18;
+    }
     const r = ext2.renameFileMode(old_path, new_path, ext2Who(), mode == .noreplace);
     // Other failures keep the historical EXDEV answer (the path may belong
     // to FAT32, which has no rename).

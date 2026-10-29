@@ -184,7 +184,11 @@ void _start(void) {
         check(first("testdir/h119-e2a") == '1' && first("testdir/h119-e2b") == '2', "F: and both files are unchanged");
         check(ren2("testdir/h119-e2a", "testdir/h119-e2c", RENAME_NOREPLACE) == 0 && first("testdir/h119-e2c") == '1' && first("testdir/h119-e2a") == -1,
               "F: ext2 RENAME_NOREPLACE to a free name renames");
-        check(ren2("testdir/h119-e2c", "testdir/h119-e2b", RENAME_EXCHANGE) == -EINVAL_, "F: ext2 RENAME_EXCHANGE is EINVAL (not implemented, not ignored)");
+        check(ren2("testdir/h119-e2c", "testdir/h119-e2b", RENAME_EXCHANGE) == 0 && first("testdir/h119-e2c") == '2' && first("testdir/h119-e2b") == '1',
+              "F: ext2 RENAME_EXCHANGE swaps two files");
+        check(ren2("testdir/h119-e2c", "testdir/h119-e2b", RENAME_EXCHANGE) == 0 && first("testdir/h119-e2c") == '1' && first("testdir/h119-e2b") == '2',
+              "F: and swaps them back");
+        check(ren2("testdir/h119-e2c", "testdir/h119-nope", RENAME_EXCHANGE) == -ENOENT_, "F: ext2 RENAME_EXCHANGE with a missing target is ENOENT");
         mkfile("testdir/h119-e2c", "3");
         const int64_t pr = ren("testdir/h119-e2c", "testdir/h119-e2b");
         check(pr == 0 && first("testdir/h119-e2b") == '3' && first("testdir/h119-e2c") == -1,
@@ -215,6 +219,12 @@ void _start(void) {
         check(ren("testdir/h119-gb/sub", "testdir/h119-gd") == 0 && first("testdir/h119-gd/f") == '7' && first("testdir/h119-gb/sub/f") == -1,
               "G: directory replaces an existing empty directory (cross-parent)");
         check(ren("testdir/h119-gd", "testdir/h119-gb/sub") == 0 && first("testdir/h119-gb/sub/f") == '7', "G: and moves back");
+        check(mkfile("testdir/h119-gx", "9") == 0 && ren2("testdir/h119-gx", "testdir/h119-gb/sub", RENAME_EXCHANGE) == 0 &&
+              first("testdir/h119-gx/f") == '7' && first("testdir/h119-gb/sub") == '9', "G: RENAME_EXCHANGE swaps a directory and a file across parents");
+        check(ren2("testdir/h119-gx", "testdir/h119-gb/sub", RENAME_EXCHANGE) == 0 && first("testdir/h119-gb/sub/f") == '7' && first("testdir/h119-gx") == '9',
+              "G: and swaps them back");
+        check(ren2("testdir/h119-gb", "testdir/h119-gb/sub/f", RENAME_EXCHANGE) == -EINVAL_, "G: RENAME_EXCHANGE of a directory into its own subtree is EINVAL");
+        syscall1(SYS_UNLINK, (uint64_t)"testdir/h119-gx");
         check(syscall1(SYS_UNLINK, (uint64_t)"testdir/h119-gb/sub/f") == 0 && syscall1(SYS_RMDIR, (uint64_t)"testdir/h119-gb/sub") == 0 &&
               syscall1(SYS_RMDIR, (uint64_t)"testdir/h119-gb") == 0, "G: the moved tree removes cleanly (links consistent)");
         syscall1(SYS_RMDIR, (uint64_t)"testdir/h119-gd");

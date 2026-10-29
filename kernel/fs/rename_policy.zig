@@ -86,3 +86,13 @@ pub fn dirReplaceLinkDelta(old_parent: u32, new_parent: u32) LinkDelta {
     _ = new_parent;
     return .{ .old_parent = -1, .new_parent = 0 };
 }
+
+/// links_count changes for RENAME_EXCHANGE of `a` (in `old_parent`) and
+/// `b` (in `new_parent`): each parent gains a link for every directory that
+/// arrives and loses one for every directory that leaves. Same parent: none.
+pub fn exchangeLinkDelta(old_parent: u32, new_parent: u32, a_is_dir: bool, b_is_dir: bool) LinkDelta {
+    if (old_parent == new_parent) return .{ .old_parent = 0, .new_parent = 0 };
+    const a: i32 = @intFromBool(a_is_dir);
+    const b: i32 = @intFromBool(b_is_dir);
+    return .{ .old_parent = b - a, .new_parent = a - b };
+}

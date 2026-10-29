@@ -6809,3 +6809,19 @@ test "directory rename over an empty directory: the victim's link goes, so the o
     try std.testing.expectEqual(@as(i32, -1), cross.old_parent);
     try std.testing.expectEqual(@as(i32, 0), cross.new_parent);
 }
+
+test "rename exchange link deltas: only a directory/non-directory swap across parents moves a link" {
+    const rp = kt.rename_policy;
+    // a = entry in old parent, b = entry in new parent
+    const dd = rp.exchangeLinkDelta(5, 9, true, true);
+    try std.testing.expectEqual(@as(i32, 0), dd.old_parent);
+    try std.testing.expectEqual(@as(i32, 0), dd.new_parent);
+    const df = rp.exchangeLinkDelta(5, 9, true, false); // dir leaves old parent, file arrives
+    try std.testing.expectEqual(@as(i32, -1), df.old_parent);
+    try std.testing.expectEqual(@as(i32, 1), df.new_parent);
+    const fd = rp.exchangeLinkDelta(5, 9, false, true);
+    try std.testing.expectEqual(@as(i32, 1), fd.old_parent);
+    try std.testing.expectEqual(@as(i32, -1), fd.new_parent);
+    const same = rp.exchangeLinkDelta(5, 5, true, false);
+    try std.testing.expectEqual(@as(i32, 0), same.old_parent + same.new_parent);
+}

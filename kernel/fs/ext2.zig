@@ -2699,6 +2699,18 @@ fn removeDirEntry(parent_inode_num: u32, name: []const u8) bool {
 /// place. Used by rename onto an existing name. False when not found or on
 /// I/O error.
 fn retargetDirEntry(parent_inode_num: u32, name: []const u8, new_inode: u32) bool {
+    return retargetDirEntryTyped(parent_inode_num, name, new_inode, null);
+}
+
+/// Directory-entry file_type for an inode mode (1 file, 2 dir, 7 symlink).
+fn direntType(mode: u16) u8 {
+    if (eu.isDirectory(mode)) return 2;
+    if (mode & 0xF000 == 0xA000) return 7;
+    return 1;
+}
+
+/// `retargetDirEntry` that also rewrites the entry's file_type when given.
+fn retargetDirEntryTyped(parent_inode_num: u32, name: []const u8, new_inode: u32, new_type: ?u8) bool {
     defer dcache.invalidateParent(.ext2, parent_inode_num);
     var parent_inode: Ext2Inode = undefined;
     if (!readInode(parent_inode_num, &parent_inode)) return false;
@@ -2716,6 +2728,7 @@ fn retargetDirEntry(parent_inode_num: u32, name: []const u8, new_inode: u32) boo
             if (view.inode != 0 and eqlStr(buf[view.name_pos .. view.name_pos + view.name_len], name)) {
                 const entry: *Ext2DirEntry = @ptrCast(@alignCast(buf + pos));
                 entry.inode = new_inode;
+                if (new_type) |t| entry.file_type = t;
                 return writeBlock(phys_block, buf);
             }
             pos += view.rec_len;
@@ -3066,6 +3079,68 @@ fn renameDirUnlocked(old_parent: u32, old_name: []const u8, new_parent: u32, new
     serial.writeString(new_name);
     serial.writeString("\n");
     return 0;
+}
+
+/// RENAME_EXCHANGE: swap the inodes behind `old_path` and `new_path`
+/// atomically under fs_lock. Both must exist (ENOENT). A directory may not
+/// be swapped into its own subtree (EINVAL). Moved directories get their
+/// ".." rewritten; link counts follow `rename_policy.exchangeLinkDelta`.
+pub fn renameExchange(old_path: []const u8, new_path: []const u8, who: ?Who) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active) return -1;
+    const rp = @import("rename_policy.zig");
+    const a_res = resolveParentChecked(old_path, who, @import("dac.zig").Access.write_search, true) catch |e| return if (e == error.DacDenied) -13 else -2;
+    const b_res = resolveParentChecked(new_path, who, @import("dac.zig").Access.write_search, true) catch |e| return if (e == error.DacDenied) -13 else -2;
+    const pa = a_res.parent;
+    const pb = b_res.parent;
+    if (eqlStr(a_res.name, ".") or eqlStr(a_res.name, "..") or eqlStr(b_res.name, ".") or eqlStr(b_res.name, "..")) return -22;
+    var pa_d: Ext2Inode = undefined;
+    var pb_d: Ext2Inode = undefined;
+    if (!readInode(pa, &pa_d) or !readInode(pb, &pb_d)) return -5;
+    const ia = findDirEntryCached(pa, &pa_d, a_res.name) orelse return -2;
+    const ib = findDirEntryCached(pb, &pb_d, b_res.name) orelse return -2;
+    if (ia == ib) return 0;
+    var ad: Ext2Inode = undefined;
+    var bd: Ext2Inode = undefined;
+    if (!readInode(ia, &ad) or !readInode(ib, &bd)) return -5;
+    const a_dir = eu.isDirectory(ad.mode);
+    const b_dir = eu.isDirectory(bd.mode);
+    if (pa != pb) {
+        // a lands in pb, b lands in pa: neither may land inside itself.
+        if (a_dir and inChain(ia, pb)) return -22;
+        if (b_dir and inChain(ib, pa)) return -22;
+    }
+    if (!retargetDirEntryTyped(pa, a_res.name, ib, direntType(bd.mode))) return -5;
+    if (!retargetDirEntryTyped(pb, b_res.name, ia, direntType(ad.mode))) {
+        _ = retargetDirEntryTyped(pa, a_res.name, ia, direntType(ad.mode));
+        return -5;
+    }
+    if (pa != pb) {
+        if (a_dir) _ = retargetDirEntry(ia, "..", pb);
+        if (b_dir) _ = retargetDirEntry(ib, "..", pa);
+        const d = rp.exchangeLinkDelta(pa, pb, a_dir, b_dir);
+        adjustLinks(pa, d.old_parent);
+        adjustLinks(pb, d.new_parent);
+    }
+    return 0;
+}
+
+/// Whether `ino` is `start` or one of its ancestors (via ".."). Unreadable
+/// or too-deep chains count as a cycle (refuse rather than corrupt).
+fn inChain(ino: u32, start: u32) bool {
+    var cur = start;
+    var depth: u32 = 0;
+    while (depth < 64) : (depth += 1) {
+        if (cur == ino) return true;
+        if (cur == 2) return false;
+        var d: Ext2Inode = undefined;
+        if (!readInode(cur, &d)) return true;
+        const up = findDirEntryCached(cur, &d, "..") orelse return true;
+        if (up == cur) return false;
+        cur = up;
+    }
+    return true;
 }
 
 /// rmdir — remove an empty directory. The name must resolve to a directory

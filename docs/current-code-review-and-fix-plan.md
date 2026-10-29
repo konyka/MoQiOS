@@ -5179,4 +5179,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   目标存在被拒、移动后的树能完整删除——验证链接计数一致）。变异：去掉回环检查 → G 段 3 项 FAIL。
 - 验证：host 全部通过；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/4 PASS、hello119 PASS（6 个 EXCEPTION 与基线一致，均为故意触发的故障测试）。
 - 补充：以目录覆盖空目录已实现（hello119 G 段扩为 9 项，host 新增 1 个测试先 RED 后 GREEN；冒烟 SMP=1/2/4 PASS）。
-- 没做的：ext2 RENAME_EXCHANGE。
+- ext2 RENAME_EXCHANGE 已实现（`ext2.renameExchange`）：fs_lock 下原位交换两个目录项指向的 inode（同时改写 file_type），
+  跨父目录时被移动的目录改写 `..`，链接计数按 `rename_policy.exchangeLinkDelta`（每个父目录：迁入的目录 +1、迁出的目录 −1）；
+  两端都必须存在（ENOENT），目录不能换进自身子树（EINVAL）。hello119 F/G 段新增 6 项（文件互换与还原、缺失目标、跨父目录目录↔文件互换与还原、
+  自身子树 EINVAL）；host 新增 1 个测试先 RED 后 GREEN；变异去掉回环检查 → 2 项 FAIL。冒烟 SMP=1/2/4 PASS，三架构构建通过。
