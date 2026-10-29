@@ -57,3 +57,19 @@ pub fn checkTarget(m: Mode, src_is_dir: bool, target: Target) i64 {
     if (target.is_dir and !target.empty) return -39; // ENOTEMPTY
     return 0;
 }
+
+/// links_count changes when a directory moves from `old_parent` to
+/// `new_parent`: its ".." stops counting as a link to the old parent and
+/// starts counting toward the new one. Same parent: nothing changes.
+pub fn dirMoveLinkDelta(old_parent: u32, new_parent: u32) struct { old_parent: i32, new_parent: i32 } {
+    if (old_parent == new_parent) return .{ .old_parent = 0, .new_parent = 0 };
+    return .{ .old_parent = -1, .new_parent = 1 };
+}
+
+/// `dest_chain`: the destination parent and its ancestors up to the root,
+/// nearest first. Moving `moved` there makes a loop if `moved` is on that
+/// chain (into itself or into one of its descendants): EINVAL.
+pub fn dirMoveCreatesCycle(moved: u32, dest_chain: []const u32) bool {
+    for (dest_chain) |ino| if (ino == moved) return true;
+    return false;
+}

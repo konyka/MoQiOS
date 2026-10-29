@@ -4705,7 +4705,7 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   - TDD 与证据：hello119 在旧内核上 24 项 FAIL；host 测试 3 个（rename_policy）+ 启动档案测试扩充。**如实**：`rename_policy.zig`
     是在 host 测试之前写好的（当时门禁在跑，不能改已接入的源码），所以 host 测试没有经历“编译失败”这一步；运行时 RED 是真实的。
     变异：去掉 tmpfs rename 的 sticky 检查 → E 段 2 项 FAIL（第一次变异写法让函数参数未使用、编译失败，冒烟跑的是旧 ELF，结果作废后重做）。
-  - 没做的：ext2 上的 NOREPLACE/EXCHANGE（NOREPLACE 已在第五十五轮补上）；目录 rename 在 ext2 上仍被拒绝；renameat2 的 dirfd 对平面文件系统仍不参与解析
+  - 没做的：ext2 上的 NOREPLACE/EXCHANGE（NOREPLACE 已在第五十五轮补上）；目录 rename 在 ext2 上仍被拒绝（已补上，见下方“ext2 目录 rename”）；renameat2 的 dirfd 对平面文件系统仍不参与解析
     （卷目录描述符由 rofsGuard 返回 EROFS）。
   - 验证：host 719/719（新增 3 个）；riscv64/aarch64 构建通过；冒烟 MBR SMP=1/2/8、GPT SMP=2/8 五组 0 FAIL、hello119 PASS；
     stress 5/5（门禁期间负载峰值 5.88）。门禁前单次 SMP=1 冒烟里 hello108 又失败一次（baseline 6160 µs、reaping 7593 µs，
@@ -5166,3 +5166,15 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 判定：非逻辑错误，属于"缺页 I/O 不可睡眠"的架构限制；正确性不受影响，只影响该 CPU 的中断延迟。
 - 后续方向：缺页路径在持 vm_lock 的前提下开中断、改为阻塞式 I/O 等待完成中断（需先厘清 vm_lock 与 IRQ
   上下文的锁序，避免中断处理再次缺页时自锁），或预读/在系统调用上下文提前换入。
+
+### ext2 目录 rename
+
+- 此前 `renameFileMode` 遇到目录一律返回 -1（系统调用层再变成 EXDEV）。现由 `renameDirUnlocked` 处理：
+  同父目录改名只改条目；跨父目录时改写目录自己的 `..` 指向新父目录，并把一个链接从旧父目录移到新父目录
+  （`rename_policy.dirMoveLinkDelta`）。目标父目录沿 `..` 回溯到根，经过被移动目录即 EINVAL
+  （`rename_policy.dirMoveCreatesCycle`，回溯超过 64 层返回 ELOOP）。目标名已存在一律 EEXIST（未实现以目录覆盖空目录）。
+- 系统调用层不再把 EINVAL/ELOOP/EIO 改写成 EXDEV。
+- TDD：host 2 个新测试先编译失败（RED）后通过；hello119 新增 G 段 5 项（同父改名、跨父移动内容跟随、移入自身子树 EINVAL、
+  目标存在被拒、移动后的树能完整删除——验证链接计数一致）。变异：去掉回环检查 → G 段 3 项 FAIL。
+- 验证：host 全部通过；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/4 PASS、hello119 PASS（6 个 EXCEPTION 与基线一致，均为故意触发的故障测试）。
+- 没做的：以目录覆盖已存在的空目录；ext2 RENAME_EXCHANGE。

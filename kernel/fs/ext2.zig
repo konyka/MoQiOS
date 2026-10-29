@@ -2896,10 +2896,9 @@ pub fn renameFileMode(old_path: []const u8, new_path: []const u8, who: ?Who, nor
     // Read file inode to get file_type
     var file_inode: Ext2Inode = undefined;
     if (!readInode(file_inode_num, &file_inode)) return -1;
-    // Directory renames need ".." rewiring and both parents' links_count
-    // maintained (plus a subtree-cycle check); until that exists, refuse
-    // rather than corrupt the namespace.
-    if (eu.isDirectory(file_inode.mode)) return -1;
+    if (eu.isDirectory(file_inode.mode)) {
+        return renameDirUnlocked(old_parent_inode, old_filename, new_parent_inode, new_filename, file_inode_num);
+    }
     const file_type: u8 = 1;
 
     // Same directory + same name: POSIX rename(2) succeeds as a no-op.
@@ -2959,6 +2958,62 @@ pub fn renameFileMode(old_path: []const u8, new_path: []const u8, who: ?Who, nor
     return 0;
 }
 
+
+/// Directory rename (fs_lock held). The destination name must not exist —
+/// replacing an existing empty directory is refused (EEXIST) to keep the
+/// one-block directory bookkeeping simple. The destination parent may not
+/// be the moved directory or one of its descendants (EINVAL). On a
+/// cross-parent move the directory's ".." is rewritten and one link moves
+/// from the old parent to the new one.
+fn renameDirUnlocked(old_parent: u32, old_name: []const u8, new_parent: u32, new_name: []const u8, dir_ino: u32) i64 {
+    const rp = @import("rename_policy.zig");
+    if (old_parent == new_parent and eqlStr(old_name, new_name)) return 0;
+
+    var new_parent_data: Ext2Inode = undefined;
+    if (!readInode(new_parent, &new_parent_data)) return -1;
+    if (findDirEntryCached(new_parent, &new_parent_data, new_name) != null) return -17; // EEXIST
+
+    // Ancestor chain of the destination parent via "..", nearest first.
+    var chain: [64]u32 = undefined;
+    var n: usize = 0;
+    var cur = new_parent;
+    while (n < chain.len) {
+        chain[n] = cur;
+        n += 1;
+        if (cur == 2) break;
+        var cur_data: Ext2Inode = undefined;
+        if (!readInode(cur, &cur_data)) return -1;
+        const up = findDirEntryCached(cur, &cur_data, "..") orelse return -1;
+        if (up == cur) break;
+        cur = up;
+    }
+    if (n == chain.len and chain[n - 1] != 2) return -40; // ELOOP: chain too deep to verify
+    if (rp.dirMoveCreatesCycle(dir_ino, chain[0..n])) return -22; // EINVAL
+
+    if (!addDirEntry(new_parent, dir_ino, new_name, 2)) return -1;
+    if (!removeDirEntry(old_parent, old_name)) {
+        _ = removeDirEntry(new_parent, new_name);
+        return -1;
+    }
+
+    const delta = rp.dirMoveLinkDelta(old_parent, new_parent);
+    if (delta.new_parent != 0) {
+        if (!retargetDirEntry(dir_ino, "..", new_parent)) return -5; // EIO
+        if (readInode(new_parent, &new_parent_data)) {
+            new_parent_data.links_count +|= 1;
+            _ = writeInode(new_parent, &new_parent_data);
+        }
+        var old_parent_data: Ext2Inode = undefined;
+        if (readInode(old_parent, &old_parent_data) and old_parent_data.links_count > 1) {
+            old_parent_data.links_count -= 1;
+            _ = writeInode(old_parent, &old_parent_data);
+        }
+    }
+    serial.writeString("[ext2] renamed dir to: ");
+    serial.writeString(new_name);
+    serial.writeString("\n");
+    return 0;
+}
 
 /// rmdir — remove an empty directory. The name must resolve to a directory
 /// whose only entries are "." and "..". Removes the parent's entry, decrements

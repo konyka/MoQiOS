@@ -3814,7 +3814,7 @@ fn syscallRenameFlags(old_ptr: u64, new_ptr: u64, flags: u32) i64 {
     const r = ext2.renameFileMode(old_path, new_path, ext2Who(), mode == .noreplace);
     // Other failures keep the historical EXDEV answer (the path may belong
     // to FAT32, which has no rename).
-    return if (r == 0 or r == -13 or r == -17 or r == -21) r else -18; // EXDEV
+    return if (r == 0 or r == -5 or r == -13 or r == -17 or r == -21 or r == -22 or r == -40) r else -18; // EXDEV
 }
 
 // ── v32.4: madvise / getrlimit / setrlimit ──────────────────────────

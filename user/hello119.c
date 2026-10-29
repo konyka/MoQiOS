@@ -199,6 +199,23 @@ void _start(void) {
         check(0, "F: create ext2 fixtures");
     }
 
+    /* G: ext2 directory rename — same-parent, cross-parent (contents follow), cycle and EEXIST */
+    if (syscall2(SYS_MKDIR, (uint64_t)"testdir/h119-ga", 0755) == 0 && syscall2(SYS_MKDIR, (uint64_t)"testdir/h119-gb", 0755) == 0 &&
+        mkfile("testdir/h119-ga/f", "7") == 0) {
+        check(ren("testdir/h119-ga", "testdir/h119-gc") == 0 && first("testdir/h119-gc/f") == '7' && first("testdir/h119-ga/f") == -1,
+              "G: ext2 directory rename in the same parent keeps its contents");
+        check(ren("testdir/h119-gc", "testdir/h119-gb/sub") == 0 && first("testdir/h119-gb/sub/f") == '7',
+              "G: ext2 directory moves into another directory with its contents");
+        check(ren("testdir/h119-gb", "testdir/h119-gb/sub/loop") == -EINVAL_, "G: moving a directory into its own subtree is EINVAL");
+        check(syscall2(SYS_MKDIR, (uint64_t)"testdir/h119-gd", 0755) == 0 &&
+              ren("testdir/h119-gb/sub", "testdir/h119-gd") == -EEXIST_, "G: directory onto an existing name is refused");
+        check(syscall1(SYS_UNLINK, (uint64_t)"testdir/h119-gb/sub/f") == 0 && syscall1(SYS_RMDIR, (uint64_t)"testdir/h119-gb/sub") == 0 &&
+              syscall1(SYS_RMDIR, (uint64_t)"testdir/h119-gb") == 0, "G: the moved tree removes cleanly (links consistent)");
+        syscall1(SYS_RMDIR, (uint64_t)"testdir/h119-gd");
+    } else {
+        check(0, "G: create ext2 directory fixtures");
+    }
+
     /* cleanup */
     syscall1(SYS_UNLINK, (uint64_t)"/tmp/h119-root");
     syscall1(SYS_UNLINK, (uint64_t)"/tmp/h119-y");

@@ -6780,3 +6780,22 @@ test "rename target rules: type mismatch, non-empty directory, NOREPLACE and EXC
     try std.testing.expectEqual(@as(i64, -2), rp.checkTarget(.exchange, false, .{ .exists = false }));
     try std.testing.expectEqual(@as(i64, 0), rp.checkTarget(.exchange, true, .{ .exists = true }));
 }
+
+test "directory rename link deltas: a cross-parent move shifts one link from the old parent to the new" {
+    const rp = kt.rename_policy;
+    const same = rp.dirMoveLinkDelta(5, 5);
+    try std.testing.expectEqual(@as(i32, 0), same.old_parent);
+    try std.testing.expectEqual(@as(i32, 0), same.new_parent);
+    const cross = rp.dirMoveLinkDelta(5, 9);
+    try std.testing.expectEqual(@as(i32, -1), cross.old_parent);
+    try std.testing.expectEqual(@as(i32, 1), cross.new_parent);
+}
+
+test "directory rename cycle check: the destination parent chain may not pass through the moved directory" {
+    const rp = kt.rename_policy;
+    // ancestors of the destination parent, nearest first, ending at root (2)
+    try std.testing.expect(rp.dirMoveCreatesCycle(12, &.{ 12, 2 })); // into itself
+    try std.testing.expect(rp.dirMoveCreatesCycle(12, &.{ 15, 12, 2 })); // into a descendant
+    try std.testing.expect(!rp.dirMoveCreatesCycle(12, &.{ 13, 2 })); // into a sibling
+    try std.testing.expect(!rp.dirMoveCreatesCycle(12, &.{2})); // into root
+}
