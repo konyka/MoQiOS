@@ -170,8 +170,26 @@ pub fn mkdirWithMode(name_ptr: u64, requested_mode: ?u32) i64 {
 
     var len: usize = 0;
     while (len < copied and name_buf[len] != 0) : (len += 1) {}
-    const name = name_buf[0..len];
+    return mkdirName(name_buf[0..len], requested_mode);
+}
 
+/// mkdirat: resolve `name_ptr` under `dirfd` first.
+pub fn mkdirAt(dirfd: i64, name_ptr: u64, requested_mode: ?u32) i64 {
+    if (name_ptr >= 0x0000_8000_0000_0000 or name_ptr == 0) return -1;
+    var name_buf: [256]u8 = undefined;
+    const copied = copy.copyPathFromUser(name_buf[0..], name_ptr, 255);
+    if (copied == 0) return -1;
+    var len: usize = 0;
+    while (len < copied and len < 255 and name_buf[len] != 0) : (len += 1) {}
+    var join_buf: [256]u8 = undefined;
+    const name = switch (@import("dirfd_name.zig").resolve(dirfd, name_buf[0..len], &join_buf)) {
+        .ok => |n| n,
+        .err => |e| return e,
+    };
+    return mkdirName(name, requested_mode);
+}
+
+fn mkdirName(name: []const u8, requested_mode: ?u32) i64 {
     if (name.len >= 4 and name[0] == '/' and name[1] == 't' and name[2] == 'm' and name[3] == 'p') {
         const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
         const cur = task_mod.getTask(cur_idx) orelse return -1;

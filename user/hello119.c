@@ -56,6 +56,8 @@ static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_OPEN      9
 #define SYS_READ      10
 #define SYS_CLOSE     11
+#define SYS_UNLINKAT  256
+#define SYS_MKDIRAT   257
 #define SYS_FORK      57
 #define SYS_RENAME    82
 #define SYS_UNLINK    87
@@ -242,6 +244,14 @@ void _start(void) {
                   first("testdir/h119-hc") == '5', "H: a directory fd on one side and AT_FDCWD on the other");
             check(syscall5(SYS_RENAMEAT2, 999, (uint64_t)"h119-hc", AT_FDCWD, (uint64_t)"testdir/h119-hd", 0) == -9 &&
                   first("testdir/h119-hc") == '5', "H: a bad directory fd is EBADF and nothing moves");
+            check(syscall3(SYS_MKDIRAT, (uint64_t)dfd, (uint64_t)"h119-hdir", 0755) == 0 &&
+                  mkfile("testdir/h119-hdir/f", "6") == 0, "H: mkdirat creates the directory under the directory fd");
+            check(syscall3(SYS_UNLINKAT, (uint64_t)dfd, (uint64_t)"h119-hdir/f", 0) == 0 && first("testdir/h119-hdir/f") == -1,
+                  "H: unlinkat removes a file under the directory fd");
+            check(syscall3(SYS_UNLINKAT, (uint64_t)dfd, (uint64_t)"h119-hdir", 0x200) == 0 &&
+                  syscall2(SYS_OPEN, (uint64_t)"testdir/h119-hdir", 0) < 0, "H: unlinkat(AT_REMOVEDIR) removes the directory under the directory fd");
+            check(syscall3(SYS_UNLINKAT, (uint64_t)dfd, (uint64_t)"h119-hc", 0) == 0 && first("testdir/h119-hc") == -1,
+                  "H: unlinkat of the renamed file");
             syscall1(SYS_UNLINK, (uint64_t)"testdir/h119-hc");
         } else {
             check(0, "H: open testdir as a directory fd");

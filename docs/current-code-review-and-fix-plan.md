@@ -4708,6 +4708,7 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   - 没做的：ext2 上的 NOREPLACE/EXCHANGE（均已补上：NOREPLACE 第五十五轮，EXCHANGE 见下方“ext2 目录 rename”）；目录 rename 在 ext2 上仍被拒绝（已补上，见下方“ext2 目录 rename”）；renameat2 的 dirfd 对平面文件系统仍不参与解析
     （卷目录描述符由 rofsGuard 返回 EROFS）——已补上：ext2 目录描述符按其保存的路径拼接相对名（`fs/at_join_policy.zig`），
     无效描述符 EBADF、非目录类描述符 ENOTDIR；hello119 H 段 3 项旧内核全 FAIL、新内核 PASS。
+    同一解析（`fs/dirfd_name.zig`）现也用于 unlinkat（含 AT_REMOVEDIR）与 mkdirat：H 段新增 4 项，旧派发器下 3 项 FAIL。
   - 验证：host 719/719（新增 3 个）；riscv64/aarch64 构建通过；冒烟 MBR SMP=1/2/8、GPT SMP=2/8 五组 0 FAIL、hello119 PASS；
     stress 5/5（门禁期间负载峰值 5.88）。门禁前单次 SMP=1 冒烟里 hello108 又失败一次（baseline 6160 µs、reaping 7593 µs，
     当时负载 14），记入上面的 hello108 调查项。

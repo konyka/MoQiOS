@@ -35,6 +35,22 @@ fn caller() ?@import("../fs/ext2.zig").Who {
 pub fn unlink(path_ptr: u64) i64 {
     var name_buf: [256]u8 = undefined;
     const name = copyPath(path_ptr, &name_buf) orelse return -1;
+    return unlinkName(name);
+}
+
+/// unlinkat: resolve `path_ptr` under `dirfd` first.
+pub fn unlinkAt(dirfd: i64, path_ptr: u64, as_dir: bool) i64 {
+    var name_buf: [256]u8 = undefined;
+    const raw = copyPath(path_ptr, &name_buf) orelse return -1;
+    var join_buf: [256]u8 = undefined;
+    const name = switch (@import("dirfd_name.zig").resolve(dirfd, raw, &join_buf)) {
+        .ok => |n| n,
+        .err => |e| return e,
+    };
+    return if (as_dir) rmdirName(name) else unlinkName(name);
+}
+
+pub fn unlinkName(name: []const u8) i64 {
 
     // tmpfs: /tmp paths route there, mirroring the open path in vfs.zig.
     if (name.len >= 4 and name[0] == '/' and name[1] == 't' and name[2] == 'm' and name[3] == 'p') {
@@ -75,6 +91,10 @@ pub fn unlink(path_ptr: u64) i64 {
 pub fn rmdir(path_ptr: u64) i64 {
     var name_buf: [256]u8 = undefined;
     const name = copyPath(path_ptr, &name_buf) orelse return -1;
+    return rmdirName(name);
+}
+
+pub fn rmdirName(name: []const u8) i64 {
 
     if (name.len >= 4 and name[0] == '/' and name[1] == 't' and name[2] == 'm' and name[3] == 'p') {
         const tmpfs = @import("../fs/tmpfs.zig");
