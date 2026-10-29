@@ -6494,3 +6494,23 @@ test "procfs: /proc/PID/maps pins the target address space before walking it" {
     // never walks through an unpinned task pointer
     try std.testing.expect(std.mem.indexOf(u8, body, "t.page_table_phys") == null);
 }
+
+test "ext2: every path-to-inode resolution used by syscalls checks search permission" {
+    const src = kt.ext2_source;
+    // the unchecked walkers are gone; one resolver takes the caller's credentials
+    try std.testing.expect(std.mem.indexOf(u8, src, "pub fn walkPathToInodePublic(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "pub fn walkPathToInodeNoFollow(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "fn walkPathToInodeResolve(") == null);
+    const r = std.mem.indexOf(u8, src, "fn resolveInode(").?;
+    const r_end = std.mem.indexOfPos(u8, src, r, "\n}\n").?;
+    const body = src[r..r_end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "Access.search") != null);
+    // symlink targets are resolved with the same credentials
+    try std.testing.expect(std.mem.indexOf(u8, body, "resolveInode(new_start, target, depth + 1, who, true)") != null);
+    const se = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, se, "walkPathToInodePublic") == null);
+    // native truncate(76) is the authorized #210 path
+    const t76 = std.mem.indexOf(u8, se, "        76 => {").?;
+    const t76_end = std.mem.indexOfPos(u8, se, t76, "},").?;
+    try std.testing.expect(std.mem.indexOf(u8, se[t76..t76_end], "syscallTruncate(") != null);
+}

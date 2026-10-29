@@ -654,6 +654,20 @@ void _start(void) {
             }
             check(syscall2(SYS_ACCESS, (uint64_t)"/closeddir/open.txt", 0) == -EACCES, "U: access(F_OK) through root's 0700 directory is EACCES");
             check(syscall2(SYS_OPEN, (uint64_t)"/rootdir/target.txt", O_RDONLY) >= 0, "U: a 0644 file in root's 0755 directory still opens");
+            /* every path-taking ext2 call honours the same rules, not only open/stat */
+            check(syscall2(76 /* native truncate */, (uint64_t)"/rootdir/target.txt", 0) == -EACCES, "U: native truncate(76) of root's 0644 file is EACCES");
+            check(syscall2(76 /* native truncate */, (uint64_t)"/closeddir/open.txt", 0) == -EACCES, "U: native truncate(76) through root's 0700 directory is EACCES");
+            check(syscall2(86 /* link */, (uint64_t)"/closeddir/open.txt", (uint64_t)"testdir/h114-hl2") == -EACCES, "U: link of a file inside root's 0700 directory is EACCES");
+            syscall1(SYS_UNLINK, (uint64_t)"testdir/h114-hl2");
+            {
+                uint8_t xb[16];
+                check(syscall6(SYS_GETXATTRAT, (uint64_t)-100, (uint64_t)"/closeddir/open.txt", 0, (uint64_t)"user.h114", 16, (uint64_t)xb) == -EACCES, "U: getxattrat through root's 0700 directory is EACCES");
+                check(syscall5(SYS_LISTXATTRAT, (uint64_t)-100, (uint64_t)"/closeddir/open.txt", 0, (uint64_t)xb, 16) == -EACCES, "U: listxattrat through root's 0700 directory is EACCES");
+            }
+            {
+                int64_t ts = slurp("/rootdir/target.txt", small, sizeof(small));
+                check(ts == 12, "U: root's /rootdir/target.txt still holds its 12 bytes");
+            }
             /* a 0700 root directory: listing it needs read permission on it */
             check(syscall2(SYS_OPEN, (uint64_t)"/lost+found", O_RDONLY) == -EACCES, "U: opening root's 0700 /lost+found to list it is EACCES");
             /* a 0777 directory stays usable */

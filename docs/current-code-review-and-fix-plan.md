@@ -4484,6 +4484,22 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     取页表，旧代码上该测试失败；hello68 新增两项，确认 maps 能列出新映射的页、munmap 后不再列出（修复前后都通过，只覆盖功能）。
   - 门禁：host 703/703，三架构构建通过，五组冒烟 hello114 各 302 ok、hello115 各 74 ok、0 FAIL、0 次内核态故障（这次 SMP=8 的
     hello107 也通过），stress 5/5。
+- **第三十八轮：ext2 路径解析绕过目录 search 权限；原生 truncate(76) 完全不检查权限**：
+  - 问题 1：原生 76 号 `truncate(path, len)` 直接按路径找 inode 并截断，没有任何权限检查（210 号 truncate 走带凭证的 open，是对的）。
+    复现时旧内核返回 -2（ENOENT），原因是它把用户缓冲区原样拷 255 字节、不在 NUL 处截断，路径带着 NUL 和后面的字节去匹配，正常
+    字符串永远找不到文件——所以这次没有截掉数据，它在实践中是“坏掉的、无权限检查的”调用；能否构造出可利用的输入，未查明。
+    无论如何，它应当和 210 号走同一条带权限检查的路径。
+  - 问题 2：`link`、`chmod`、`chown`/`lchown`、`fchmodat(AT_SYMLINK_NOFOLLOW)`、`getxattrat`/`listxattrat`/`setxattrat`/`removexattrat`
+    用的是 `walkPathToInodePublic`/`walkPathToInodeNoFollow`：一路解析下去不检查经过的目录有没有 search 权限，而 open/stat/access
+    会检查。于是 uid 1000 能对 root 0700 目录里的文件做硬链接、读它的 xattr。另外 `resolveParentChecked` 解析中间符号链接时也换成了
+    不带凭证的解析，目标路径上的目录不检查。
+  - RED：hello114 新增 6 项，旧内核 5 项 FAIL（两项 truncate(76)、link、getxattrat、listxattrat）。
+  - 修复：ext2 只保留一个解析器 `resolveInode(start, path, depth, who, follow_final)`，每经过一个目录检查 search，符号链接目标用同样的
+    凭证解析；对外的 `walkPathToInodeAs(path, who, follow)` 给系统调用用（拒绝时 EACCES）。删除两个不带凭证的公开解析函数；ext2 内部的
+    link/chown/chmod 与 `resolveParentChecked` 都改用它。76 号改为调用 210 号的 `syscallTruncate`。
+  - 验证：host 704/704（新增源码结构测试：不带凭证的解析函数不存在、解析器检查 search 并带凭证解析符号链接、76 号走
+    `syscallTruncate`）；hello114 308 项全部 ok。变异（确认重新编译）：解析器去掉 search 检查 → hello114 3 项 FAIL（link、getxattrat、
+    listxattrat）。门禁：三架构构建通过，五组冒烟 hello114 各 308 ok、hello115 各 74 ok、0 FAIL、0 次内核态故障，stress 5/5。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；

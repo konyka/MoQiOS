@@ -718,7 +718,8 @@ fn resolveParentChecked(path: []const u8, who: ?Who, access: @import("dac.zig").
             {
                 if (readSymlinkTarget(&found_inode)) |target| {
                     const new_start: u32 = if (target.len > 0 and target[0] == '/') 2 else dir_inode;
-                    const resolved = walkPathToInodeResolve(new_start, target, 1) orelse return error.Invalid;
+                    const resolved = resolveInode(new_start, target, 1, who, true) catch |e|
+                        return if (e == error.DacDenied) error.DacDenied else error.Invalid;
                     parent_inode = resolved;
                 } else {
                     return error.Invalid;
@@ -2984,7 +2985,7 @@ pub fn createHardlink(oldpath: []const u8, newpath: []const u8, who: ?Who) i64 {
     if (!active) return -5; // EIO
 
     // 1. Resolve oldpath to its inode number (v52.1: use symlink-resolving version)
-    const old_inode = walkPathToInodeUnlocked(oldpath) orelse return -2; // ENOENT
+    const old_inode = walkPathToInodeAsUnlocked(oldpath, who, true) catch |e| return if (e == error.DacDenied) -13 else -2;
 
     // Read the old inode to check it's not a directory
     var old_inode_data: Ext2Inode = undefined;
@@ -3074,35 +3075,26 @@ pub fn createSymlink(target: []const u8, linkpath: []const u8, creator: Creator,
     return 0;
 }
 
-/// Resolve a path to its inode number (public for xattr/chown/chmod dispatch).
-/// Resolves symlinks in intermediate path components (v52.2 fix: no fd allocation).
-pub fn walkPathToInodePublic(path: []const u8) ?u32 {
+pub const ResolveError = error{ NotFound, DacDenied };
+
+/// Path -> inode for a user request: every directory traversed needs search
+/// permission for `who` (as open/stat already require). DacDenied maps to
+/// EACCES, NotFound to ENOENT.
+pub fn walkPathToInodeAs(path: []const u8, who: Who, follow_final: bool) ResolveError!u32 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
-    return walkPathToInodeUnlocked(path);
+    if (!active) return error.NotFound;
+    return resolveInode(2, path, 0, who, follow_final);
 }
 
-/// Lock-free walkPathToInodePublic for callers that already hold fs_lock.
-fn walkPathToInodeUnlocked(path: []const u8) ?u32 {
-    return walkPathToInodeResolve(2, path, 0);
+fn walkPathToInodeAsUnlocked(path: []const u8, who: ?Who, follow_final: bool) ResolveError!u32 {
+    return resolveInode(2, path, 0, who, follow_final);
 }
 
-/// Resolve a path to its inode number WITHOUT following the final component symlink.
-/// Used by lchown, lstat, etc. Intermediate symlinks ARE resolved.
-pub fn walkPathToInodeNoFollow(path: []const u8) ?u32 {
-    const flags = fs_lock.acquire();
-    defer fs_lock.release(flags);
-    return walkPathToInodeNoFollowUnlocked(path);
-}
-
-/// Lock-free walkPathToInodeNoFollow for callers that already hold fs_lock.
-fn walkPathToInodeNoFollowUnlocked(path: []const u8) ?u32 {
-    return walkPathToInodeResolveNoFollow(2, path, 0);
-}
-
-/// Like walkPathToInodeResolve, but the final component is NOT followed if symlink.
-fn walkPathToInodeResolveNoFollow(start_inode: u32, path: []const u8, depth: u32) ?u32 {
-    if (depth > 8) return null;
+/// Shared resolver: intermediate symlinks are always followed (fully), the
+/// final one only when `follow_final`.
+fn resolveInode(start_inode: u32, path: []const u8, depth: u32, who: ?Who, follow_final: bool) ResolveError!u32 {
+    if (depth > 8) return error.NotFound; // ELOOP equivalent
 
     var current_inode = start_inode;
     var pos: u32 = 0;
@@ -3117,59 +3109,19 @@ fn walkPathToInodeResolveNoFollow(start_inode: u32, path: []const u8, depth: u32
         const is_last = (pos >= path.len);
 
         var inode: Ext2Inode = undefined;
-        if (!readInode(current_inode, &inode)) return null;
-        if (!eu.isDirectory(inode.mode)) return null;
-
-        const found = findDirEntryCached(current_inode, &inode, component) orelse return null;
-
-        // Check if symlink — resolve for intermediate, but NOT for final component
-        var found_inode: Ext2Inode = undefined;
-        if (readInode(found, &found_inode) and eu.isSymlink(found_inode.mode)) {
-            if (is_last) {
-                // lchown/lstat: return the symlink inode itself
-                return found;
-            }
-            const target = readSymlinkTarget(&found_inode) orelse return null;
-            const new_start: u32 = if (target.len > 0 and target[0] == '/') 2 else current_inode;
-            const resolved = walkPathToInodeResolveNoFollow(new_start, target, depth + 1) orelse return null;
-            current_inode = resolved;
-        } else {
-            current_inode = found;
+        if (!readInode(current_inode, &inode)) return error.NotFound;
+        if (!eu.isDirectory(inode.mode)) return error.NotFound;
+        if (who) |w| {
+            if (!@import("dac.zig").allows(inodeMeta(&inode), w.creds(), @import("dac.zig").Access.search)) return error.DacDenied;
         }
-    }
 
-    return current_inode;
-}
+        const found = findDirEntryCached(current_inode, &inode, component) orelse return error.NotFound;
 
-/// Walk path to inode with symlink resolution, without allocating fd slots.
-/// Returns inode number or null on failure.
-fn walkPathToInodeResolve(start_inode: u32, path: []const u8, depth: u32) ?u32 {
-    if (depth > 8) return null; // ELOOP equivalent
-
-    var current_inode = start_inode;
-    var pos: u32 = 0;
-
-    while (pos < path.len) {
-        while (pos < path.len and path[pos] == '/') pos += 1;
-        if (pos >= path.len) break;
-
-        const start = pos;
-        while (pos < path.len and path[pos] != '/') pos += 1;
-        const component = path[start..pos];
-
-        var inode: Ext2Inode = undefined;
-        if (!readInode(current_inode, &inode)) return null;
-        if (!eu.isDirectory(inode.mode)) return null; // not a directory
-
-        const found = findDirEntryCached(current_inode, &inode, component) orelse return null;
-
-        // Check if symlink
         var found_inode: Ext2Inode = undefined;
-        if (readInode(found, &found_inode) and eu.isSymlink(found_inode.mode)) {
-            const target = readSymlinkTarget(&found_inode) orelse return null;
+        if (readInode(found, &found_inode) and eu.isSymlink(found_inode.mode) and (!is_last or follow_final)) {
+            const target = readSymlinkTarget(&found_inode) orelse return error.NotFound;
             const new_start: u32 = if (target.len > 0 and target[0] == '/') 2 else current_inode;
-            const resolved = walkPathToInodeResolve(new_start, target, depth + 1) orelse return null;
-            current_inode = resolved;
+            current_inode = try resolveInode(new_start, target, depth + 1, who, true);
         } else {
             current_inode = found;
         }
@@ -3260,7 +3212,7 @@ pub fn setOwner(path: []const u8, uid: u16, gid: u16, who: Who) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return -5; // EIO
-    const inode_num = walkPathToInodeUnlocked(path) orelse return -2; // ENOENT
+    const inode_num = walkPathToInodeAsUnlocked(path, who, true) catch |e| return if (e == error.DacDenied) -13 else -2;
     return chownLocked(inode_num, uid, gid, who);
 }
 
@@ -3269,7 +3221,7 @@ pub fn setOwnerNoFollow(path: []const u8, uid: u16, gid: u16, who: Who) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return -5;
-    const inode_num = walkPathToInodeNoFollowUnlocked(path) orelse return -2;
+    const inode_num = walkPathToInodeAsUnlocked(path, who, false) catch |e| return if (e == error.DacDenied) -13 else -2;
     return chownLocked(inode_num, uid, gid, who);
 }
 
@@ -3287,7 +3239,7 @@ pub fn setMode(path: []const u8, new_mode: u16, who: Who) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return -5;
-    const inode_num = walkPathToInodeUnlocked(path) orelse return -2;
+    const inode_num = walkPathToInodeAsUnlocked(path, who, true) catch |e| return if (e == error.DacDenied) -13 else -2;
     return chmodLocked(inode_num, new_mode, who);
 }
 

@@ -1362,8 +1362,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 return;
             }
             if (flags & 0x100 != 0) {
-                const inode_num = ext2_mod.walkPathToInodeNoFollow(path_buf[0..plen]) orelse {
-                    frame.rax = @bitCast(@as(i64, -2));
+                const inode_num = ext2_mod.walkPathToInodeAs(path_buf[0..plen], ext2Who(), false) catch |e| {
+                    frame.rax = @bitCast(@as(i64, if (e == error.DacDenied) -13 else -2));
                     return;
                 };
                 frame.rax = @bitCast(ext2_mod.setModeByInode(inode_num, @truncate(frame.rdx), ext2Who()));
@@ -1783,39 +1783,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         75 => { // fdatasync(fd)
             frame.rax = @bitCast(syscallFsync(@truncate(frame.rdi)));
         },
-        76 => { // truncate(path, length) — v53.3: real implementation
-            const ext2_mod = @import("../../fs/ext2.zig");
-            const copy = @import("../../mm/copy_from_user.zig");
-            const length: u64 = frame.rsi;
-            if (length > 0xFFFFFFFF) { // v53.4: reject lengths that don't fit in u32
-                frame.rax = @bitCast(@as(i64, -22)); // EINVAL
-                return;
-            }
-            var path_buf: [256]u8 = undefined;
-            const plen = copy.copyFromUser(path_buf[0..], @ptrFromInt(frame.rdi), 255);
-            if (plen == 0) {
-                frame.rax = @bitCast(@as(i64, -14));
-                return;
-            } // EFAULT
-            const inode_num = ext2_mod.walkPathToInodePublic(path_buf[0..plen]) orelse {
-                frame.rax = @bitCast(@as(i64, -2));
-                return; // ENOENT
-            }; // v53.3: truncate by inode directly, no open_files needed
-            if (@import("../../proc/sched.zig").currentTask()) |t| {
-                const old_size = ext2_mod.getInodeSize(inode_num) orelse return;
-                if (length > old_size and length > t.fSize_cur) {
-                    const sig = @import("../../proc/signal.zig");
-                    sig.raiseSelf(sig.SIGXFSZ);
-                    frame.rax = @bitCast(@as(i64, -27));
-                    checkSignalsOnSyscallReturn(frame);
-                    return;
-                }
-            }
-            if (!ext2_mod.truncateByInode(inode_num, @truncate(length))) {
-                frame.rax = @bitCast(@as(i64, -5)); // EIO
-                return;
-            }
-            frame.rax = 0;
+        76 => { // truncate(path, length) — native alias of #210: same authorized path
+            frame.rax = @bitCast(syscallTruncate(frame.rdi, frame.rsi));
             checkSignalsOnSyscallReturn(frame);
         },
         77 => { // ftruncate(fd, length) — v53.3: call real implementation
@@ -2326,8 +2295,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 return;
             }
             if (flags & 0x100 != 0) {
-                const inode_num = ext2_mod.walkPathToInodeNoFollow(path_buf[0..plen]) orelse {
-                    frame.rax = @bitCast(@as(i64, -2));
+                const inode_num = ext2_mod.walkPathToInodeAs(path_buf[0..plen], ext2Who(), false) catch |e| {
+                    frame.rax = @bitCast(@as(i64, if (e == error.DacDenied) -13 else -2));
                     return;
                 };
                 frame.rax = @bitCast(ext2_mod.setModeByInode(inode_num, @truncate(frame.rdx), ext2Who()));
@@ -2420,8 +2389,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 return;
             }
             // Resolve path to inode and set xattr
-            const inode_num = ext2_mod.walkPathToInodePublic(path_buf[0..plen]) orelse {
-                frame.rax = @bitCast(@as(i64, -2));
+            const inode_num = ext2_mod.walkPathToInodeAs(path_buf[0..plen], ext2Who(), true) catch |e| {
+                frame.rax = @bitCast(@as(i64, if (e == error.DacDenied) -13 else -2));
                 return;
             };
             frame.rax = @bitCast(ext2_mod.setXattr(inode_num, actual_name, val_buf[0..vc], ext2Who()));
@@ -2456,8 +2425,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 frame.rax = @bitCast(@as(i64, -1)); // EPERM
                 return;
             }
-            const inode_num = ext2_mod.walkPathToInodePublic(path_buf[0..plen]) orelse {
-                frame.rax = @bitCast(@as(i64, -2));
+            const inode_num = ext2_mod.walkPathToInodeAs(path_buf[0..plen], ext2Who(), true) catch |e| {
+                frame.rax = @bitCast(@as(i64, if (e == error.DacDenied) -13 else -2));
                 return;
             };
             // Get value into temp buffer, then copy to user
@@ -2486,8 +2455,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             path_buf[if (pc < 255) pc else 255] = 0;
             var plen: usize = 0;
             while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
-            const inode_num = ext2_mod.walkPathToInodePublic(path_buf[0..plen]) orelse {
-                frame.rax = @bitCast(@as(i64, -2));
+            const inode_num = ext2_mod.walkPathToInodeAs(path_buf[0..plen], ext2Who(), true) catch |e| {
+                frame.rax = @bitCast(@as(i64, if (e == error.DacDenied) -13 else -2));
                 return;
             };
             var list_buf: [4096]u8 = undefined;
@@ -2531,8 +2500,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 frame.rax = @bitCast(@as(i64, -1)); // EPERM
                 return;
             }
-            const inode_num = ext2_mod.walkPathToInodePublic(path_buf[0..plen]) orelse {
-                frame.rax = @bitCast(@as(i64, -2));
+            const inode_num = ext2_mod.walkPathToInodeAs(path_buf[0..plen], ext2Who(), true) catch |e| {
+                frame.rax = @bitCast(@as(i64, if (e == error.DacDenied) -13 else -2));
                 return;
             };
             frame.rax = @bitCast(ext2_mod.removeXattr(inode_num, actual_name, ext2Who()));
