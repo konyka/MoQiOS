@@ -247,6 +247,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello117"); /* prctl: PDEATHSIG delivery, NO_NEW_PRIVS */
     run_test("hello118"); /* memfd_create */
     run_test("hello119"); /* rename on tmpfs */
+    run_test("hello120"); /* mseal */
 
     start_persistent_services();
 

@@ -2351,10 +2351,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(unsupported_policy.lsm());
         },
         462 => { // mseal(addr, len, flags) — Linux #462
-            // Sealing is not implemented: mprotect/munmap/mremap would still
-            // change the range. Reporting success would silently defeat the
-            // caller's hardening, so refuse like every other unsupported call.
-            frame.rax = @bitCast(unsupported_policy.mseal());
+            frame.rax = @bitCast(@import("../../mm/mseal.zig").sysMseal(frame.rdi, frame.rsi, frame.rdx));
         },
         // ── v52.0: xattr-at real implementation ────────────────────────────────
         463 => { // setxattrat(dfd, path, flags, name, value, size)

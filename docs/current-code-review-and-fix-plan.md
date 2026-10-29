@@ -5183,3 +5183,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   跨父目录时被移动的目录改写 `..`，链接计数按 `rename_policy.exchangeLinkDelta`（每个父目录：迁入的目录 +1、迁出的目录 −1）；
   两端都必须存在（ENOENT），目录不能换进自身子树（EINVAL）。hello119 F/G 段新增 6 项（文件互换与还原、缺失目标、跨父目录目录↔文件互换与还原、
   自身子树 EINVAL）；host 新增 1 个测试先 RED 后 GREEN；变异去掉回环检查 → 2 项 FAIL。冒烟 SMP=1/2/4 PASS，三架构构建通过。
+
+### mseal(2) 真实实现
+
+- 此前 #462 返回 ENOSYS（§ 第五十轮：避免谎报成功）。现在真正执行封印：`Mm.seals` 记录范围，munmap/mprotect/mremap/MAP_FIXED
+  在持 vm_lock 后检查重叠并返回 EPERM；fork 复制封印；hello80 的旧断言（ENOSYS）改为只检查非法 flags 为 EINVAL。
+- TDD：host 测试（参数规则、重叠判定、表满）先编译失败后通过；源码路由测试改为要求 `mseal.zig.sysMseal`。hello120（16 项）在旧内核上
+  12 项 FAIL（真实 RED），新内核全部通过。变异：去掉 munmap 的封印检查 → 2 项 FAIL。
+- 验证：host 全部通过；三架构构建通过；冒烟 SMP=1/2/4 PASS。
+- 限制：封印表固定 32 段，满了返回 ENOMEM；不支持 madvise 破坏性建议的封印检查（本系统的 MADV_DONTNEED 会丢弃匿名页内容，Linux 对
+  只读私有匿名封印页拒绝该操作——此处未实现）。

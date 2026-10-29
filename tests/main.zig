@@ -1787,11 +1787,10 @@ test "unsupported syscall dispatches route to the pure ENOSYS policy" {
     try expectSourceRoute(source, "459 => { // lsm_get_self_attr", "460 => {", "unsupported_policy.lsm()");
     try expectSourceRoute(source, "460 => { // lsm_set_self_attr", "461 => {", "unsupported_policy.lsm()");
     try expectSourceRoute(source, "461 => { // lsm_list_modules", "462 => {", "unsupported_policy.lsm()");
-    try expectSourceRoute(source, "462 => { // mseal", "463 => {", "unsupported_policy.mseal()");
+    try expectSourceRoute(source, "462 => { // mseal", "463 => {", "mseal.zig\").sysMseal(");
     try expectSourceRoute(source, "295 => { // name_to_handle_at", "296 => {", "unsupported_policy.fileHandles()");
     try expectSourceRoute(source, "296 => { // open_by_handle_at", "297 => {", "unsupported_policy.fileHandles()");
     try std.testing.expectEqual(kt.errno.ENOSYS, unsupported_policy.fileHandles());
-    try std.testing.expectEqual(kt.errno.ENOSYS, unsupported_policy.mseal());
 }
 
 test "fallocate policy rejects unsupported modes before mutation" {
@@ -6824,4 +6823,25 @@ test "rename exchange link deltas: only a directory/non-directory swap across pa
     try std.testing.expectEqual(@as(i32, -1), fd.new_parent);
     const same = rp.exchangeLinkDelta(5, 5, true, false);
     try std.testing.expectEqual(@as(i32, 0), same.old_parent + same.new_parent);
+}
+
+test "mseal: argument rules, overlap detection and the bounded seal table" {
+    const sp = kt.mseal_policy;
+    try std.testing.expectEqual(@as(i64, -22), sp.validate(0x1001, 0x1000, 0)); // unaligned
+    try std.testing.expectEqual(@as(i64, -22), sp.validate(0x1000, 0x1000, 1)); // flags must be 0
+    try std.testing.expectEqual(@as(i64, 0), sp.validate(0x1000, 0, 0)); // len 0: no-op
+    try std.testing.expectEqual(@as(i64, -22), sp.validate(0xFFFF_FFFF_FFFF_F000, 0x2000, 0)); // wraps
+    try std.testing.expectEqual(@as(i64, 0), sp.validate(0x1000, 0x1001, 0)); // len rounds up
+
+    var t: sp.Table = .{};
+    try std.testing.expect(!t.overlaps(0x1000, 0x1000));
+    try std.testing.expect(t.add(0x10000, 0x3000));
+    try std.testing.expect(t.overlaps(0x12000, 0x1000));
+    try std.testing.expect(t.overlaps(0xF000, 0x2000)); // straddles the start
+    try std.testing.expect(!t.overlaps(0x13000, 0x1000)); // just after
+    try std.testing.expect(!t.overlaps(0xF000, 0x1000)); // just before
+    try std.testing.expect(t.add(0x11000, 0x1000)); // re-seal inside: idempotent
+    var n: usize = 0;
+    while (n < sp.MAX_SEALS) : (n += 1) _ = t.add(0x100000 + n * 0x10000, 0x1000);
+    try std.testing.expect(!t.add(0x9000_0000, 0x1000)); // table full: ENOMEM at the caller
 }

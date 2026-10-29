@@ -1086,6 +1086,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
         if (base >= user_space.USER_ADDR_MAX) return -22; // EINVAL
         if (num_pages > (user_space.USER_ADDR_MAX - base) / user_space.PAGE_SIZE) return -12; // ENOMEM
         if (@import("../ipc/sysv_shm.zig").overlapsAttachment(cur.page_table_phys, base, num_pages)) return -22; // EINVAL
+        if (mm_mod.Mm.sealed(cur.mm, base, num_pages * user_space.PAGE_SIZE)) return -1; // EPERM: mseal
         if (hasMmapOverlap(cur, base, num_pages)) {
             if (meta != null or pf.list_phys != 0) return -12;
             return replaceFixedAnonymous(cur, base, num_pages, prot, flags);
@@ -1346,6 +1347,7 @@ pub fn munmap(addr: u64, length: u64) i64 {
     // generic unmap path detach only part of an attachment and later free a
     // frame still referenced by the segment.
     if (@import("../ipc/sysv_shm.zig").overlapsAttachment(cur.page_table_phys, base, num_pages)) return -22;
+    if (mm_mod.Mm.sealed(cur.mm, base, num_pages * user_space.PAGE_SIZE)) return -1; // EPERM: mseal
 
     // Preflight the region-table capacity untrackMmapRange needs: a range
     // cutting a region in the middle inserts a tail piece into a free slot,
@@ -1396,6 +1398,8 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
     if (cur.mm == null) return -1;
     var vm_guard = mm_mod.Mm.beginVmMutation(cur.mm, @ptrCast(cur)) catch return -35;
     defer vm_guard.release();
+    if (mm_mod.Mm.sealed(cur.mm, old_addr, old_pages * PAGE)) return -1; // EPERM: mseal
+    if ((mflags & MREMAP_FIXED) != 0 and mm_mod.Mm.sealed(cur.mm, new_addr_hint, new_pages * PAGE)) return -1;
 
     // Find the mapping region through the occupancy bitmap.
     var bits = cur.mmap_active_bm;

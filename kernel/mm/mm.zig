@@ -42,6 +42,15 @@ pub const Mm = struct {
     vm_lock: ServicingSpinlock = .{},
     vm_owner: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     finalizer: *const fn (*Mm) void,
+    /// mseal(2) ranges. Written under vm_lock; a fresh address space (exec)
+    /// starts empty, fork copies the parent's (Linux: seals are inherited).
+    seals: @import("mseal_policy.zig").Table = .{},
+
+    /// Whether [base, base+len) touches a sealed range (caller holds vm_lock).
+    pub fn sealed(mm: ?*Mm, base: u64, len: u64) bool {
+        const m = mm orelse return false;
+        return m.seals.overlaps(base, len);
+    }
 
     pub fn acquire(page_table_phys: u64, finalizer: *const fn (*Mm) void) ?*Mm {
         const slab = @import("slab.zig");

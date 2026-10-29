@@ -242,10 +242,10 @@ void _start(void) {
                           "and may unlink its own queue");
     }
 
-    /* mseal promises that a mapping can no longer be changed; reporting success
-     * without sealing anything would silently defeat that hardening. */
-    failures += check(syscall3(SYS_MSEAL, (uint64_t)acct_buf & ~0xFFFull, 4096, 0) == -ENOSYS,
-                      "mseal #462 returns ENOSYS instead of claiming a seal it does not enforce");
+    /* mseal is enforced now (hello120 covers sealing); here only check that
+     * an invalid request is refused instead of being reported as sealed. */
+    failures += check(syscall3(SYS_MSEAL, (uint64_t)acct_buf & ~0xFFFull, 4096, 1) == -22,
+                      "mseal #462 rejects unknown flags (EINVAL)");
 
     /* Privileged system-wide state: this program runs as uid 1000 with no
      * capabilities, so every call below must be refused (EPERM) and leave

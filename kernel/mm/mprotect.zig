@@ -91,6 +91,7 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     if (cur.page_table_phys == 0) return EINVAL; // kernel thread — not allowed
     var vm_guard = mm_mod.Mm.beginVmMutation(cur.mm, @ptrCast(cur)) catch return -35;
     defer vm_guard.release();
+    if (mm_mod.Mm.sealed(cur.mm, addr, len_pages * paging.PAGE_SIZE)) return -1; // EPERM: mseal
 
     // SysV SHM pages belong to the segment, not to the address space: their
     // frames carry no PMM reference of their own and the attachment record

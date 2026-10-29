@@ -117,6 +117,10 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.mmap_regions = parent.mmap_regions;
     child.mmap_count = parent.mmap_count;
     child.mmap_active_bm = parent.mmap_active_bm;
+    // mseal: seals follow the copied mappings into the child.
+    if (parent.mm) |pm| if (child.mm) |cm| {
+        cm.seals = pm.seals;
+    };
 
     // G2: the child inherits file-backed regions. Each ext2 region piece
     // holds an open-slot reference (taken at mmap time); the child needs its

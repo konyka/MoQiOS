@@ -1916,6 +1916,10 @@ const SysCap = packed struct {
 - execve（`cred_policy.afterExec`）：saved uid/gid 改为有效 uid/gid；程序没有 set-user-ID 位和文件 capability，所以按 capabilities(7)
   的 root 规则：real 或 effective uid 为 0 时 permitted 保留、effective 在 euid 为 0 时等于 permitted，否则为空；两者都不为 0 时
   permitted 和 effective 都清空。
+- mseal(2)（#462，`mm/mseal.zig`、纯规则 `mm/mseal_policy.zig`）：封印记录在地址空间对象 `Mm.seals`（最多 32 段，CLONE_VM 兄弟共享，
+  fork 复制给子进程，exec 新建地址空间时清空）。被封印范围内 munmap、mprotect、mremap（源或 MREMAP_FIXED 目标）及 MAP_FIXED 覆盖
+  一律 EPERM（与封印部分重叠的请求整体拒绝），读写不受影响。参数：flags 非 0 或地址未对齐为 EINVAL，len=0 为空操作，
+  范围中有未映射页或封印表满为 ENOMEM。hello120 回归门。
 - memfd_create(2)（`fs/memfd_policy.zig`、`tmpfs.tmpfsCreateAnonymous`）：无目录项、出生即 unlinked 的 tmpfs 普通文件，最后一次 close
   释放；flags 只接受 MFD_CLOEXEC/MFD_ALLOW_SEALING；名字 ≤ 249 字节。fcntl F_ADD_SEALS/F_GET_SEALS：SEAL/SHRINK/GROW/WRITE
   （FUTURE_WRITE 同 WRITE），在 tmpfs 写入/截断内部执行；无 MFD_ALLOW_SEALING 的 memfd 与普通 tmpfs 文件为 F_SEAL_SEAL。
