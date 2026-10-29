@@ -139,8 +139,9 @@ void _start(void) {
     failures += check(syscall1(SYS_ACCT, (uint64_t)acct_buf) == -ENOSYS, "acct #281 returns ENOSYS");
     failures += check(syscall1(SYS_CHROOT, (uint64_t)acct_buf) == -ENOSYS, "chroot #280 returns ENOSYS");
     failures += check(unchanged(acct_buf, 0xA1, sizeof(acct_buf)), "chroot preserves user buffer");
-    failures += check(syscall2(SYS_MEMFD_CREATE, (uint64_t)acct_buf, 0) == -ENOSYS,
-                      "memfd_create #285 returns ENOSYS");
+    /* memfd_create is implemented now (hello118); an unknown flag must still fail without side effects */
+    failures += check(syscall2(SYS_MEMFD_CREATE, (uint64_t)acct_buf, 0x100) == -22,
+                      "memfd_create #285 rejects unknown flags");
     failures += check(unchanged(acct_buf, 0xA1, sizeof(acct_buf)), "acct preserves user buffer");
     failures += check(syscall1(SYS_UNSHARE, 0x10000000) == -ENOSYS, "unshare #282 returns ENOSYS");
     failures += check(syscall5(SYS_PROCESS_MADVISE, (uint64_t)-1, (uint64_t)iov_buf, 1, 0, 0) == -ENOSYS,

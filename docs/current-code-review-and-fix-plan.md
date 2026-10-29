@@ -4647,6 +4647,20 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   - 本轮 stress（如实）：前三次 stress 各有一次启动 hello108 FAIL。最后一次附带 5 秒一次的宿主机负载记录：失败那次启动（23:04–23:07）期间
     load 14–18，占 CPU 的是另一会话的两个 `sh -c 'while :; do :; done'`（各约 88%）和别的项目的 test_editor_shell、cmake。宿主机空闲后
     重跑 5/5 通过（整个过程宿主机 load 峰值 3.95）。门禁：host 712/712，三架构构建通过，五组冒烟 0 FAIL。
+- **第四十九轮：实现 memfd_create(2)**：
+  - 此前 285 号返回 ENOSYS（hello80 锁定为“不支持”）。tmpfs 已经有“unlink 后仍打开、最后一次 close 释放”的状态，memfd 直接复用：
+    `tmpfs.tmpfsCreateAnonymous` 建一个出生即 `deleted` 的普通文件条目——没有目录项、任何路径都找不到、最后一次 close 释放页面；属主为
+    创建者，mode 0777。读写、lseek、ftruncate、fstat、fork 共享都沿用 tmpfs 文件的现有路径。
+  - 纯函数 `fs/memfd_policy.zig`：flags 只接受 MFD_CLOEXEC|MFD_ALLOW_SEALING（MFD_HUGETLB 与未知位 EINVAL——没有 hugetlbfs）；名字最长
+    249 字节（Linux 的 NAME_MAX 减去 “memfd:” 前缀）。MFD_ALLOW_SEALING 接受但封印未实现。
+  - RED：新测试 hello118（16 项：读写回读、ftruncate 扩展为零、fstat 大小、同名两个 memfd 互相独立、/tmp 下不出现文件、fork 共享、
+    MFD_CLOEXEC、100 次创建/写/关闭不耗尽 64 项 tmpfs 表、非法 flags 与过长名字 EINVAL）；旧内核 6 项 FAIL（其余项依赖 fd 存在而被跳过）。
+    hello80 原先断言 285 返回 ENOSYS，改为断言未知 flags 返回 EINVAL；对应的 host 源码测试改为断言走 `syscallMemfdCreate` 且匿名条目
+    出生即 deleted。
+  - 没做的：文件封印（F_ADD_SEALS/F_GET_SEALS）；memfd 受 tmpfs 单文件 2.25 MiB 和全局 64 项的限制。
+  - 验证：host 713/713；hello80、hello118 PASS。门禁：三架构构建通过；MBR SMP=1/2、GPT SMP=2/8 冒烟 0 FAIL，hello118 各 PASS；stress 5/5。
+    MBR SMP=8 那次 hello105/106/107/108 四个延迟测试同时 FAIL（hello118 PASS），门禁期间宿主机 load 峰值 20.45；随后连跑两次 MBR SMP=8
+    都 0 FAIL（load 7–9）。四个延迟测试一起变差是宿主机 CPU 竞争的特征（第四十轮）。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；

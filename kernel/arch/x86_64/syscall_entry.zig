@@ -1516,8 +1516,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             const process_vm = @import("../../mm/process_vm.zig");
             frame.rax = @bitCast(process_vm.processVmWritev(@truncate(frame.rdi), frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9));
         },
-        285 => { // memfd_create(name, flags) — anonymous memory file
-            frame.rax = @bitCast(unsupported_policy.memfdCreate());
+        285 => { // memfd_create(name, flags) — anonymous tmpfs-backed file
+            frame.rax = @bitCast(syscallMemfdCreate(frame.rdi, @truncate(frame.rsi)));
         },
         286 => { // get_robust_list(pid, head_ptr, len_ptr)
             frame.rax = @bitCast(syscallGetRobustList(@truncate(frame.rdi), frame.rsi, frame.rdx));
@@ -4846,40 +4846,40 @@ fn syscallPrlimit64(pid: u32, resource: u32, new_limit_ptr: u64, old_limit_ptr: 
     return 0;
 }
 
-/// memfd_create(name_ptr, flags) — create an anonymous memory-backed file descriptor.
-/// Returns a new fd that behaves like a tmpfs file (backed by anonymous pipe).
+/// memfd_create(name_ptr, flags) — an anonymous regular file in tmpfs with no
+/// directory entry (freed on the last close). The name is only checked for
+/// length (it is a debugging label on Linux). MFD_ALLOW_SEALING is accepted
+/// but seals are not implemented; MFD_HUGETLB is EINVAL.
 fn syscallMemfdCreate(name_ptr: u64, flags: u32) i64 {
-    _ = flags;
-    _ = name_ptr; // name is only for debugging (/proc/self/fd/ symlink)
-
+    const mp = @import("../../fs/memfd_policy.zig");
+    const copy = @import("../../mm/copy_from_user.zig");
     const sched_mod = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
+    const tmpfs = @import("../../fs/tmpfs.zig");
+    if (!mp.flagsValid(flags)) return -22;
+    var name_buf: [251]u8 = undefined;
+    const n = copy.copyPathFromUser(&name_buf, name_ptr, 251);
+    if (n == 0) return -14; // EFAULT
+    if (name_buf[n - 1] != 0) return -22; // no NUL within 250 bytes: longer than 249
+    if (!mp.nameLenValid(n - 1)) return -22;
+
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = tm.getTask(cur_idx) orelse return -1;
-
-    // v53.50: Use allocFd() — previously used linear scan bypassing free_bm bitmap
     const fd_slot = t.fd_table.allocFd() orelse return -24; // EMFILE
-
-    // Allocate an anonymous pipe as memfd (reusing pipe infrastructure)
-    const pipe_idx = vfs_mod.allocPipe() orelse {
-        t.fd_table.freeFd(fd_slot); // v53.50: restore fd slot on allocPipe failure
-        return -28; // ENOSPC
-    };
-    // allocPipe sets ref_count=2 (for read+write ends), but memfd is a single fd.
-    // Reduce ref_count to 1 since we only hold one reference.
-    if (!vfs_mod.pipeMakeSingleEnded(pipe_idx)) {
-        vfs_mod.pipeClose(pipe_idx, false);
-        vfs_mod.pipeClose(pipe_idx, true);
+    const idx = tmpfs.tmpfsCreateAnonymous(t.euid, t.egid) orelse {
         t.fd_table.freeFd(fd_slot);
-        return -5;
-    }
+        return -23; // ENFILE: tmpfs table full
+    };
     t.fd_table.fds[fd_slot] = .{
-        .fd_type = .pipe_read,
-        .pipe_idx = pipe_idx,
+        .fd_type = .tmpfs_file,
+        .offset = 0,
+        .file_size = 0,
+        .tmpfs_idx = idx,
         .writable = true,
+        .status_flags = 2, // O_RDWR
+        .fd_flags = if (flags & mp.MFD_CLOEXEC != 0) @import("../../fs/fcntl.zig").FD_CLOEXEC else 0,
     };
     t.fd_table.publishFd(fd_slot);
-
     return @intCast(fd_slot);
 }
 

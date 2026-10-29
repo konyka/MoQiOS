@@ -1739,14 +1739,16 @@ test "chroot keeps the unsupported ENOSYS contract" {
     try std.testing.expect(std.mem.indexOf(u8, body, "syscallChroot") == null);
 }
 
-test "memfd_create keeps the unsupported ENOSYS contract" {
-    try std.testing.expectEqual(@as(i64, -38), kt.unsupported_policy.memfdCreate());
+test "memfd_create is implemented on an anonymous tmpfs entry" {
     const source = kt.syscall_entry_source;
     const start = std.mem.indexOf(u8, source, "285 => { // memfd_create").?;
-    const end = std.mem.indexOfPos(u8, source, start, "286 =>").?;
-    const body = source[start..end];
-    try std.testing.expect(std.mem.indexOf(u8, body, "unsupported_policy.memfdCreate()") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "syscallMemfdCreate") == null);
+    const end = std.mem.indexOfPos(u8, source, start, "},").?;
+    try std.testing.expect(std.mem.indexOf(u8, source[start..end], "syscallMemfdCreate(") != null);
+    const tm = kt.tmpfs_source;
+    const f = std.mem.indexOf(u8, tm, "pub fn tmpfsCreateAnonymous(").?;
+    const f_end = std.mem.indexOfPos(u8, tm, f, "\n}\n").?;
+    // born unlinked: never found by path, freed on the last close
+    try std.testing.expect(std.mem.indexOf(u8, tm[f..f_end], "entries[idx].deleted = true;") != null);
 }
 
 test "LSM self-attribute syscalls keep the unsupported ENOSYS contract" {
@@ -6670,4 +6672,17 @@ test "syslog(2): action decoding, privilege and the global read cursor" {
     try std.testing.expectEqual(@as(u64, 0), st.startFor(.read_unread, 0));
     st.consumed(700);
     try std.testing.expectEqual(@as(u64, 700), st.startFor(.read_unread, 0));
+}
+
+test "memfd_create: flag and name validation" {
+    const mp = kt.memfd_policy;
+    try std.testing.expect(mp.flagsValid(0));
+    try std.testing.expect(mp.flagsValid(mp.MFD_CLOEXEC));
+    try std.testing.expect(mp.flagsValid(mp.MFD_CLOEXEC | mp.MFD_ALLOW_SEALING));
+    try std.testing.expect(!mp.flagsValid(mp.MFD_HUGETLB)); // no hugetlbfs
+    try std.testing.expect(!mp.flagsValid(0x100));
+    // Linux: the name (without the "memfd:" prefix) may be at most 249 bytes
+    try std.testing.expect(mp.nameLenValid(0));
+    try std.testing.expect(mp.nameLenValid(249));
+    try std.testing.expect(!mp.nameLenValid(250));
 }

@@ -463,6 +463,18 @@ pub fn tmpfsClose(idx: u8) void {
     }
 }
 
+/// memfd_create backing: a regular file with no directory entry. It starts
+/// already `deleted`, so no path lookup can find it and the last close frees
+/// its pages (the unlink-while-open state). Returns the entry index or null
+/// when the table is full. Owner is the creator; mode 0777 like Linux memfds.
+pub fn tmpfsCreateAnonymous(euid: u32, egid: u32) ?u8 {
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    const idx = createEntryLocked("", 0, 0, false, 0o777, 0, euid, egid) orelse return null;
+    entries[idx].deleted = true;
+    return idx;
+}
+
 /// Retain one open reference (fork/clone fd-table copy — see
 /// vfs.retainSharedResources).
 pub fn tmpfsRetain(idx: u8) void {
