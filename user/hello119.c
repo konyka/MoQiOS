@@ -41,6 +41,13 @@ static inline int64_t syscall3(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
     __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx) : "rcx", "r11", "memory");
     return ret;
 }
+static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
+    int64_t ret;
+    register uint64_t rdx __asm__("rdx") = a3;
+    register uint64_t r10 __asm__("r10") = a4;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx), "r"(r10) : "rcx", "r11", "memory");
+    return ret;
+}
 static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     int64_t ret;
     register uint64_t rdx __asm__("rdx") = a3;
@@ -58,6 +65,9 @@ static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_CLOSE     11
 #define SYS_UNLINKAT  256
 #define SYS_MKDIRAT   257
+#define SYS_FCHMODAT  260
+#define SYS_FCHMODAT2 452
+#define SYS_FSTAT     110
 #define SYS_FORK      57
 #define SYS_RENAME    82
 #define SYS_UNLINK    87
@@ -116,6 +126,17 @@ static int first(const char *path) {
 static int64_t ren(const char *a, const char *b) { return syscall2(SYS_RENAME, (uint64_t)a, (uint64_t)b); }
 static int64_t ren2(const char *a, const char *b, uint64_t flags) {
     return syscall5(SYS_RENAMEAT2, AT_FDCWD, (uint64_t)a, AT_FDCWD, (uint64_t)b, flags);
+}
+
+static uint32_t mode_of(const char *path) {
+    int64_t fd = syscall2(SYS_OPEN, (uint64_t)path, 0);
+    if (fd < 0) return 0xFFFFFFFF;
+    uint64_t st[18];
+    for (int i = 0; i < 18; i++) st[i] = 0;
+    int64_t r = syscall2(SYS_FSTAT, (uint64_t)fd, (uint64_t)st);
+    syscall1(SYS_CLOSE, (uint64_t)fd);
+    if (r != 0) return 0xFFFFFFFF;
+    return (uint32_t)(st[3] & 0xFFFFFFFF) & 07777;
 }
 
 void _start(void) {
@@ -250,6 +271,10 @@ void _start(void) {
                   "H: unlinkat removes a file under the directory fd");
             check(syscall3(SYS_UNLINKAT, (uint64_t)dfd, (uint64_t)"h119-hdir", 0x200) == 0 &&
                   syscall2(SYS_OPEN, (uint64_t)"testdir/h119-hdir", 0) < 0, "H: unlinkat(AT_REMOVEDIR) removes the directory under the directory fd");
+            check(syscall4(SYS_FCHMODAT, (uint64_t)dfd, (uint64_t)"h119-hc", 0600, 0) == 0 && mode_of("testdir/h119-hc") == 0600,
+                  "H: fchmodat changes the mode of a name under the directory fd");
+            check(syscall4(SYS_FCHMODAT2, (uint64_t)dfd, (uint64_t)"h119-hc", 0640, 0) == 0 && mode_of("testdir/h119-hc") == 0640,
+                  "H: fchmodat2 changes the mode of a name under the directory fd");
             check(syscall3(SYS_UNLINKAT, (uint64_t)dfd, (uint64_t)"h119-hc", 0) == 0 && first("testdir/h119-hc") == -1,
                   "H: unlinkat of the renamed file");
             syscall1(SYS_UNLINK, (uint64_t)"testdir/h119-hc");

@@ -1363,6 +1363,14 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             path_buf[if (pc < 255) pc else 255] = 0;
             var plen: usize = 0;
             while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
+            var at_join: [256]u8 = undefined;
+            const at_name = switch (@import("../../fs/dirfd_name.zig").resolve(dirfdArg(frame.rdi), path_buf[0..plen], &at_join)) {
+                .ok => |n| n,
+                .err => |e| {
+                    frame.rax = @bitCast(e);
+                    return;
+                },
+            };
             // AT_SYMLINK_NOFOLLOW (0x100) — if set, don't follow final symlink
             const flags: u32 = @truncate(frame.r10);
             // Reject unknown flags (only AT_SYMLINK_NOFOLLOW is valid for fchmodat)
@@ -1371,13 +1379,13 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 return;
             }
             if (flags & 0x100 != 0) {
-                const inode_num = ext2_mod.walkPathToInodeAs(path_buf[0..plen], ext2Who(), false) catch |e| {
+                const inode_num = ext2_mod.walkPathToInodeAs(at_name, ext2Who(), false) catch |e| {
                     frame.rax = @bitCast(@as(i64, if (e == error.DacDenied) -13 else -2));
                     return;
                 };
                 frame.rax = @bitCast(ext2_mod.setModeByInode(inode_num, @truncate(frame.rdx), ext2Who()));
             } else {
-                frame.rax = @bitCast(ext2_mod.setMode(path_buf[0..plen], @truncate(frame.rdx), ext2Who()));
+                frame.rax = @bitCast(ext2_mod.setMode(at_name, @truncate(frame.rdx), ext2Who()));
             }
         },
         261 => { // renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
@@ -2292,7 +2300,6 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         452 => { // fchmodat2(dfd, filename, mode, flags) — Linux #452
             const copy = @import("../../mm/copy_from_user.zig");
             const ext2_mod = @import("../../fs/ext2.zig");
-            _ = frame.rdi; // dfd (AT_FDCWD or dirfd — simplified)
             var path_buf: [256]u8 = undefined;
             const pc = copy.copyPathFromUser(path_buf[0..], frame.rsi, 255);
             if (pc == 0) {
@@ -2302,6 +2309,14 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             path_buf[if (pc < 255) pc else 255] = 0;
             var plen: usize = 0;
             while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
+            var at_join: [256]u8 = undefined;
+            const at_name = switch (@import("../../fs/dirfd_name.zig").resolve(dirfdArg(frame.rdi), path_buf[0..plen], &at_join)) {
+                .ok => |n| n,
+                .err => |e| {
+                    frame.rax = @bitCast(e);
+                    return;
+                },
+            };
             // v52.4: flags handling consistent with fchmodat #260
             const flags: u32 = @truncate(frame.r10);
             if (flags & ~@as(u32, 0x100) != 0) {
@@ -2309,13 +2324,13 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 return;
             }
             if (flags & 0x100 != 0) {
-                const inode_num = ext2_mod.walkPathToInodeAs(path_buf[0..plen], ext2Who(), false) catch |e| {
+                const inode_num = ext2_mod.walkPathToInodeAs(at_name, ext2Who(), false) catch |e| {
                     frame.rax = @bitCast(@as(i64, if (e == error.DacDenied) -13 else -2));
                     return;
                 };
                 frame.rax = @bitCast(ext2_mod.setModeByInode(inode_num, @truncate(frame.rdx), ext2Who()));
             } else {
-                frame.rax = @bitCast(ext2_mod.setMode(path_buf[0..plen], @truncate(frame.rdx), ext2Who()));
+                frame.rax = @bitCast(ext2_mod.setMode(at_name, @truncate(frame.rdx), ext2Who()));
             }
         },
         453 => { // map_shadow_stack(addr, size, flags) — Linux #453
