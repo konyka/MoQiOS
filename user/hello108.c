@@ -70,6 +70,7 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_NANOSLEEP          35
 #define SYS_FORK               57
 #define SYS_SYSINFO            99
+#define SYS_GETRUSAGE          98
 #define SYS_CLOCK_GETTIME      228
 #define SYS_CLONE              243
 #define SYS_SETAFFINITY        273
@@ -185,13 +186,24 @@ static void grandchild(void) {
     syscall1(SYS_EXIT, 0);
 }
 
-struct gaps { int64_t max; int64_t stolen; };
+struct gaps { int64_t max; int64_t stolen; int64_t nvcsw; int64_t nivcsw; };
+
+/* ru_nvcsw / ru_nivcsw of this task (struct rusage longs 16 and 17). */
+static void csw(int64_t *vol, int64_t *invol) {
+    int64_t ru[18];
+    for (int i = 0; i < 18; i++) ru[i] = 0;
+    syscall2(SYS_GETRUSAGE, 0, (uint64_t)ru);
+    *vol = ru[16];
+    *invol = ru[17];
+}
 
 /// Spin for `ns`: the largest gap between two clock reads, and the total
 /// time lost in gaps of at least STOLEN_MIN_NS (reaping split over several
 /// maintenance passes shows up there even when each piece is short).
 static struct gaps spin_gaps(int64_t ns) {
-    struct gaps g = { 0, 0 };
+    struct gaps g = { 0, 0, 0, 0 };
+    int64_t v0, i0;
+    csw(&v0, &i0);
     const int64_t start = now_ns();
     int64_t prev = start;
     while (prev - start < ns) {
@@ -201,6 +213,13 @@ static struct gaps spin_gaps(int64_t ns) {
         if (d >= STOLEN_MIN_NS) g.stolen += d;
         prev = t;
     }
+    int64_t v1, i1;
+    csw(&v1, &i1);
+    /* Diagnostic: did the scheduler switch this task out during the window
+     * (involuntary > 0), or was the time lost while it stayed current
+     * (interrupt handlers, the hypervisor)? */
+    g.nvcsw = v1 - v0;
+    g.nivcsw = i1 - i0;
     return g;
 }
 
@@ -256,11 +275,19 @@ void _start(void) {
     print_dec(base.max / 1000);
     print(" stolen_us=");
     print_dec(base.stolen / 1000);
+    print(" nvcsw=");
+    print_dec(base.nvcsw);
+    print(" nivcsw=");
+    print_dec(base.nivcsw);
     print("\n");
     print("hello108:   reaping  max_gap_us=");
     print_dec(win.max / 1000);
     print(" stolen_us=");
     print_dec(win.stolen / 1000);
+    print(" nvcsw=");
+    print_dec(win.nvcsw);
+    print(" nivcsw=");
+    print_dec(win.nivcsw);
     print("\n");
     if (win.max > MAX_GAP_NS || win.stolen > MAX_STOLEN_NS) {
         print("hello108: FAIL RT task lost the CPU to reaping\n");

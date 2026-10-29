@@ -571,7 +571,10 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
         } else {
             old_task.stime_us += elapsed_us;
         }
-        old_task.nivcsw += 1;
+        switch (@import("rusage_policy.zig").switchKind(sched_claim.load(&old_task.state) == .running)) {
+            .involuntary => old_task.nivcsw += 1,
+            .voluntary => old_task.nvcsw += 1,
+        }
     }
     new_task.sched_in_tsc = now_tsc;
 
@@ -933,7 +936,10 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
         } else {
             old_task.stime_us += elapsed_us;
         }
-        old_task.nivcsw += 1;
+        switch (@import("rusage_policy.zig").switchKind(sched_claim.load(&old_task.state) == .running)) {
+            .involuntary => old_task.nivcsw += 1,
+            .voluntary => old_task.nvcsw += 1,
+        }
     }
     new_task.sched_in_tsc = now_tsc;
 

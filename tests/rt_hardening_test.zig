@@ -81,6 +81,16 @@ test "getrusage accepts only SELF, CHILDREN and THREAD" {
     try std.testing.expectEqual(@as(?p.Who, .children), p.classify(0xFFFF_FFFF));
 }
 
+test "context switches are voluntary only when the outgoing task stopped running" {
+    const p = rusage_policy;
+    try std.testing.expectEqual(p.SwitchKind.involuntary, p.switchKind(true));
+    try std.testing.expectEqual(p.SwitchKind.voluntary, p.switchKind(false));
+    // struct rusage (x86_64): ru_nvcsw / ru_nivcsw are the last two longs.
+    try std.testing.expectEqual(@as(usize, 128), p.NVCSW_OFFSET);
+    try std.testing.expectEqual(@as(usize, 136), p.NIVCSW_OFFSET);
+    try std.testing.expectEqual(@as(usize, 144), p.RUSAGE_SIZE);
+}
+
 test "getrusage adds the in-flight slice of a running task" {
     const p = rusage_policy;
     try std.testing.expectEqual(@as(u64, 100), p.runtimeUs(100, 0, 999, 1_000));

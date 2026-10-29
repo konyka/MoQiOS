@@ -196,6 +196,7 @@ static void probe_getrusage(int64_t start_ns) {
     check(syscall2(SYS_GETRUSAGE, (uint64_t)(int64_t)RUSAGE_CHILDREN, (uint64_t)&kids) == 0,
           "getrusage(CHILDREN)");
     check(syscall2(SYS_GETRUSAGE, 5, (uint64_t)&ru) == -EINVAL, "getrusage(5) EINVAL");
+
 }
 
 static void probe_spinner_progress(void) {
@@ -210,11 +211,22 @@ static void probe_spinner_progress(void) {
     for (int i = 0; i < 2000 && spinner_count == 0; i++) syscall1(SYS_SCHED_YIELD, 0);
     check(spinner_count != 0, "spinner started");
 
+    /* ru_nvcsw (rest[12]) / ru_nivcsw (rest[13]). With the spinner runnable
+     * on the same CPU, every sleep hands the CPU over: a voluntary switch.
+     * (Without a peer the CPU has nothing to switch to and the task waits in
+     * place, so the count is only asserted here.) */
+    struct rusage csw_a, csw_b;
+    syscall2(SYS_GETRUSAGE, RUSAGE_SELF, (uint64_t)&csw_a);
     const uint64_t before = spinner_count;
     const int64_t t0 = now_ns();
     const int64_t r = clock_sleep(CLOCK_MONOTONIC, 0, 0, 200 * NS_PER_MS, 0);
     const int64_t slept = now_ns() - t0;
     const uint64_t after = spinner_count;
+    syscall2(SYS_GETRUSAGE, RUSAGE_SELF, (uint64_t)&csw_b);
+    report("nvcsw_delta", csw_b.rest[12] - csw_a.rest[12]);
+    report("nivcsw_delta", csw_b.rest[13] - csw_a.rest[13]);
+    check(csw_b.rest[12] >= csw_a.rest[12] + 1, "getrusage counts the sleep as a voluntary switch");
+    check(csw_b.rest[13] >= csw_a.rest[13], "ru_nivcsw never decreases");
     report("relative_slept_ms", slept / NS_PER_MS);
     check(r == 0, "relative clock_nanosleep returns 0");
     check(slept >= 190 * NS_PER_MS, "relative clock_nanosleep slept the full interval");

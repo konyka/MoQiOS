@@ -24,3 +24,17 @@ pub const Timeval = struct { sec: u64, usec: u64 };
 pub fn timeval(us: u64) Timeval {
     return .{ .sec = us / 1_000_000, .usec = us % 1_000_000 };
 }
+
+/// struct rusage layout (x86_64): 2 timevals, then 14 longs; the context
+/// switch counters are the last two.
+pub const RUSAGE_SIZE: usize = 144;
+pub const NVCSW_OFFSET: usize = 128;
+pub const NIVCSW_OFFSET: usize = 136;
+
+pub const SwitchKind = enum { voluntary, involuntary };
+
+/// A switch is involuntary when the outgoing task was still runnable
+/// (preempted); it is voluntary when the task blocked, slept or exited.
+pub fn switchKind(still_running: bool) SwitchKind {
+    return if (still_running) .involuntary else .voluntary;
+}

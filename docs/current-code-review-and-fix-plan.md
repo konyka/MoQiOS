@@ -4710,6 +4710,24 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   - 验证：host 719/719（新增 3 个）；riscv64/aarch64 构建通过；冒烟 MBR SMP=1/2/8、GPT SMP=2/8 五组 0 FAIL、hello119 PASS；
     stress 5/5（门禁期间负载峰值 5.88）。门禁前单次 SMP=1 冒烟里 hello108 又失败一次（baseline 6160 µs、reaping 7593 µs，
     当时负载 14），记入上面的 hello108 调查项。
+- **第五十三轮：getrusage 的上下文切换计数 + hello108 诊断**：
+  - 问题：`ru_nvcsw`/`ru_nivcsw` 恒为 0（字段从未写出），内核里的 `nivcsw` 还把阻塞、睡眠也算成非自愿切换，`nvcsw` 从不递增。
+  - 修复：`rusage_policy.switchKind`——切换时出让方仍是 `.running` 记为非自愿（被抢占），否则记为自愿；两个调度切换点都改用它；
+    getrusage 在偏移 128/136 写出两个计数。
+  - TDD：host 测试先写（编译失败）；hello102 新增两项。**第一版检查写错了（如实）**：它断言“三次 5 ms 睡眠后 nvcsw 至少 +3”，
+    SMP=1 通过，但门禁 SMP=8 时 `nvcsw=0` FAIL——这个任务固定在 CPU0、同一 CPU 上没有别的可运行任务，睡眠时调度器无处可切
+    （`sleepUntil` 在原地等，见 `repairCurrentAfterBlock`），所以不发生上下文切换，计数 0 是对的。该门禁作废并中止。
+    改为在 hello102 已有的“同 CPU 上有自旋线程”场景里测量：200 ms 睡眠期间 CPU 让给自旋线程，nvcsw 至少 +1。
+    旧内核 `nvcsw_delta=0` FAIL；新内核 SMP=1 与 SMP=8 均 `nvcsw_delta=1 nivcsw_delta=0` PASS。
+  - hello108 诊断：每个测量窗口额外打印窗口内的 nvcsw/nivcsw（不改判定标准）。目的：下次失败时区分“调度器把 RT 任务换下去了”
+    （nivcsw>0）和“任务一直是当前任务、时间被中断处理或宿主机拿走”（两者都为 0）。
+  - 猎捕（如实）：3 路并行 SMP=2 冒烟共 24 次，**hello108 0 次失败**（所以这个诊断还没有拿到失败样本），所有窗口 nvcsw=nivcsw=0；
+    **另有 1 次是 6.56 节 (14) 记录的那个“停在 hello2 退出之后”的停滞签名**（`w1-r2`，串口停在 `[exit] task exited with code 42`，
+    没有 gdb 转储）。这说明该停滞在当前构建上仍会出现（约 1/24，样本很小），原因仍未查明。
+    只读排查过的一个候选：`kickCpuX86` 先把 `resched_pending` 置 1 再发 IPI，若 `sendIpi` 因 ICR 超时失败，标志不会被清，
+    该 CPU 之后的 kick 都会被合并掉；但停滞日志里没有 `[LAPIC] WARN: ICR delivery timeout`，所以不是这次停滞的原因（未改）。
+  - 验证：host 720/720；riscv64/aarch64 构建通过；冒烟 MBR SMP=1/2/8、GPT SMP=2/8 五组 0 FAIL、hello102 PASS；
+    stress 5/5（负载峰值 7.58）。五组冒烟里 hello108 各窗口 nvcsw=nivcsw=0。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；

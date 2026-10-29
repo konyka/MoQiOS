@@ -6055,6 +6055,8 @@ fn syscallGetrusage(who_raw: u64, usage_ptr: u64) i64 {
     }
     const maxrss_kb: u64 = total_pages * 4; // 4KB pages to KB
     @memcpy(buf[32..40], &@as([8]u8, @bitCast(maxrss_kb)));
+    bo.writeU64Le(buf[rusage_policy.NVCSW_OFFSET..][0..8], cur.nvcsw);
+    bo.writeU64Le(buf[rusage_policy.NIVCSW_OFFSET..][0..8], cur.nivcsw);
 
     return if (copy.copyToUser(@ptrFromInt(usage_ptr), &buf, 144) == 144) 0 else -14;
 }
