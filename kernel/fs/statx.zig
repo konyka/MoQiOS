@@ -16,7 +16,7 @@ pub fn statx(dirfd: i64, pathname_ptr: u64, statxbuf_ptr: u64) i64 {
     // Read pathname
     var name_buf: [256]u8 = undefined;
     if (pathname_ptr == 0 or pathname_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT
-    const copied = copy.copyFromUser(&name_buf, @ptrFromInt(pathname_ptr), 255);
+    const copied = copy.copyPathFromUser(&name_buf, pathname_ptr, 255);
     if (copied == 0) return -14;
     var len: usize = 0;
     while (len < copied and name_buf[len] != 0) : (len += 1) {}

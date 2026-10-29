@@ -169,6 +169,31 @@ pub fn copyStringFromUser(dst: []u8, src_user: u64) ?usize {
     return n;
 }
 
+/// Copy a NUL-terminated path argument of at most `max` bytes. Only the
+/// bytes up to and including the NUL are read, so a string that ends right
+/// before an unmapped page is accepted. Returns the bytes copied including
+/// the NUL; `min(dst.len, max)` when no NUL appears within that many bytes
+/// (the caller truncates, as with a plain fixed-size copy); 0 when the
+/// string runs into an unreadable page (EFAULT).
+pub fn copyPathFromUser(dst: []u8, src_user: u64, max: usize) usize {
+    const limit = @min(dst.len, max);
+    var n: usize = 0;
+    var addr = src_user;
+    while (n < limit) {
+        if (!validateUserRange(addr, 1)) return 0;
+        const in_page: usize = 0x1000 - @as(usize, @intCast(addr & 0xFFF));
+        const want = @min(in_page, limit - n);
+        if (copyFromUser(dst[n..], @ptrFromInt(addr), want) != want) return 0;
+        var i: usize = 0;
+        while (i < want) : (i += 1) {
+            if (dst[n + i] == 0) return n + i + 1;
+        }
+        n += want;
+        addr += want;
+    }
+    return limit;
+}
+
 /// Safely copy bytes from kernel buffer to user space.
 /// Returns the number of bytes successfully copied.
 /// Validates that the destination range is in user space before copying.

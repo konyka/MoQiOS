@@ -79,7 +79,7 @@ pub fn addWatch(fd: u32, path_ptr: u64, mask: u32) i64 {
 
     if (path_ptr == 0 or path_ptr >= 0x0000_8000_0000_0000) return -14;
     var path_buf: [256]u8 = undefined;
-    const n = copy.copyFromUser(path_buf[0..], @ptrFromInt(path_ptr), 255);
+    const n = copy.copyPathFromUser(path_buf[0..], path_ptr, 255);
     if (n == 0) return -14;
     path_buf[if (n < 255) n else 255] = 0;
     var path_len: usize = 0;

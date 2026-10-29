@@ -13,7 +13,7 @@ pub fn chdir(path_ptr: u64) i64 {
     if (path_ptr == 0 or path_ptr >= 0x0000_8000_0000_0000) return -1;
 
     var path_buf: [256]u8 = undefined;
-    const copied = copy.copyFromUser(path_buf[0..], @ptrFromInt(path_ptr), 255);
+    const copied = copy.copyPathFromUser(path_buf[0..], path_ptr, 255);
     if (copied == 0) return -1;
     path_buf[if (copied < 255) copied else 255] = 0;
     var path_len: usize = 0;

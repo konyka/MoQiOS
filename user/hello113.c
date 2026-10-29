@@ -9,6 +9,9 @@
 ///   F. an AF_UNIX listener's stale backlog entry cannot rewire a reused slot.
 ///   G. clone() with an unusable stack or TLS address fails with EINVAL
 ///      instead of halting the machine when the child is first dispatched.
+///   I. a path string that ends right before an unmapped page is accepted by
+///      every path-taking call (the kernel must stop at the NUL, not demand
+///      255 readable bytes).
 ///   H. 64-bit fd arguments that do not fit 32 bits are EBADF, not a panic;
 ///      eventfd2 with a huge initval cannot overflow the counter later.
 
@@ -60,6 +63,18 @@ static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_MSGGET    156
 #define SYS_MSGSND    157
 #define SYS_MSGCTL    159
+#define SYS_MMAP      8
+#define SYS_MUNMAP    12
+#define SYS_OPEN      9
+#define SYS_STATX     183
+#define SYS_ACCESS    198
+#define SYS_CHDIR     80
+#define SYS_MKDIR     83
+#define SYS_RMDIR     84
+#define SYS_UNLINK    87
+#define SYS_CHMOD     90
+#define SYS_TRUNCATE  210
+#define SYS_READLINK  182
 
 #define IPC_CREAT  01000
 #define IPC_RMID   0
@@ -76,6 +91,16 @@ static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
     register uint64_t r10 __asm__("r10") = a4;
     register uint64_t r8 __asm__("r8") = a5;
     __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx), "r"(r10), "r"(r8) : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
+    int64_t ret;
+    register uint64_t rdx __asm__("rdx") = a3;
+    register uint64_t r10 __asm__("r10") = a4;
+    register uint64_t r8 __asm__("r8") = a5;
+    register uint64_t r9 __asm__("r9") = a6;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx), "r"(r10), "r"(r8), "r"(r9) : "rcx", "r11", "memory");
     return ret;
 }
 
@@ -190,6 +215,38 @@ void _start(void) {
         syscall1(SYS_CLOSE, (uint64_t)efd);
     } else {
         check(1, "H: eventfd2(huge initval) rejected");
+    }
+
+    /* I */
+    {
+        /* two pages; unmap the second so the string's NUL is the last mapped byte */
+        int64_t base = syscall6(SYS_MMAP, 0, 8192, 3, 0x22, (uint64_t)-1, 0);
+        check(base > 0, "I: mmap two pages");
+        if (base > 0) {
+            check(syscall2(SYS_MUNMAP, (uint64_t)base + 4096, 4096) == 0, "I: unmap the second page");
+            char *edge = (char *)base + 4096 - 8;
+            const char *name = "/tmp/i1"; /* 7 chars + NUL = 8 bytes, ends at the page boundary */
+            for (int k = 0; k < 8; k++) edge[k] = name[k];
+            int64_t fd = syscall3(SYS_OPEN, (uint64_t)edge, 0x41 /* O_WRONLY|O_CREAT */, 0644);
+            check(fd >= 0, "I: open() accepts a path ending at the last mapped byte");
+            if (fd >= 0) syscall1(SYS_CLOSE, (uint64_t)fd);
+            check(syscall2(SYS_ACCESS, (uint64_t)edge, 0) == 0, "I: access() too");
+            static uint64_t stx[32];
+            check(syscall5(SYS_STATX, (uint64_t)-100, (uint64_t)edge, 0, 0x7ff, (uint64_t)stx) == 0, "I: statx() too");
+            check(syscall2(SYS_CHMOD, (uint64_t)edge, 0600) == 0, "I: chmod() too");
+            check(syscall2(SYS_TRUNCATE, (uint64_t)edge, 0) == 0, "I: truncate() too");
+            check(syscall1(SYS_UNLINK, (uint64_t)edge) == 0, "I: unlink() too");
+            const char *dname = "/tmp/i2";
+            for (int k = 0; k < 8; k++) edge[k] = dname[k];
+            check(syscall2(SYS_MKDIR, (uint64_t)edge, 0755) == 0, "I: mkdir() too");
+            check(syscall1(SYS_CHDIR, (uint64_t)edge) == 0, "I: chdir() too");
+            syscall1(SYS_CHDIR, (uint64_t)"/");
+            check(syscall1(SYS_RMDIR, (uint64_t)edge) == 0, "I: rmdir() too");
+            /* the kernel still refuses a string that runs into the unmapped page */
+            for (int k = 0; k < 8; k++) edge[k] = 'x';
+            check(syscall3(SYS_OPEN, (uint64_t)edge, 0, 0) == -14, "I: an unterminated path running off the mapping is EFAULT");
+            syscall2(SYS_MUNMAP, (uint64_t)base, 4096);
+        }
     }
 
     print(failures == 0 ? "hello113: PASS\n" : "hello113: FAIL\n");

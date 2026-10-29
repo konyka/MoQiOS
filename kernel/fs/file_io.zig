@@ -70,11 +70,11 @@ pub fn openWithMode(name_ptr: u64, flags: u32, requested_mode: ?u32) i64 {
 /// directory `dirfd` names when that is a directory on a mounted volume,
 /// otherwise from the working directory as before.
 pub fn openAt(dirfd: i64, name_ptr: u64, flags: u32, requested_mode: ?u32) i64 {
-    if (name_ptr >= 0x0000_8000_0000_0000 or name_ptr == 0) return -1;
+    if (name_ptr >= 0x0000_8000_0000_0000 or name_ptr == 0) return -14; // EFAULT
 
     var name_buf: [256]u8 = undefined;
-    const copied = copy.copyFromUser(name_buf[0..], @ptrFromInt(name_ptr), 255);
-    if (copied == 0) return -1;
+    const copied = copy.copyPathFromUser(name_buf[0..], name_ptr, 255);
+    if (copied == 0) return -14; // EFAULT
     name_buf[if (copied < 255) copied else 255] = 0;
 
     var len: usize = 0;

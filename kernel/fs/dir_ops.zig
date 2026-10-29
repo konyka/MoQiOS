@@ -164,7 +164,7 @@ pub fn mkdirWithMode(name_ptr: u64, requested_mode: ?u32) i64 {
     if (name_ptr >= 0x0000_8000_0000_0000 or name_ptr == 0) return -1;
 
     var name_buf: [256]u8 = undefined;
-    const copied = copy.copyFromUser(name_buf[0..], @ptrFromInt(name_ptr), 255);
+    const copied = copy.copyPathFromUser(name_buf[0..], name_ptr, 255);
     if (copied == 0) return -1;
     name_buf[if (copied < 255) copied else 255] = 0;
 

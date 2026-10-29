@@ -19,7 +19,7 @@ pub fn spawn(name_ptr: u64) i64 {
 
     var name_buf: [64]u8 = undefined;
     const copy = @import("../mm/copy_from_user.zig");
-    const copied = copy.copyFromUser(name_buf[0..], @ptrFromInt(name_ptr), 63);
+    const copied = copy.copyPathFromUser(name_buf[0..], name_ptr, 63);
     if (copied == 0) return -1;
     name_buf[if (copied < 63) copied else 63] = 0;
 

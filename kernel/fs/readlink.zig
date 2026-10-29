@@ -23,7 +23,7 @@ pub fn readlinkAt(dirfd: i64, path_ptr: u64, buf_ptr: u64, bufsiz: u64) i64 {
         return -14; // -EFAULT
     }
     var name_buf: [256]u8 = undefined;
-    const copied = copy.copyFromUser(name_buf[0..], @ptrFromInt(path_ptr), 255);
+    const copied = copy.copyPathFromUser(name_buf[0..], path_ptr, 255);
     if (copied == 0) return -14;
     name_buf[if (copied < 255) copied else 255] = 0;
     var len: usize = 0;

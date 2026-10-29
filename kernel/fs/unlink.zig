@@ -13,7 +13,7 @@ const sched = @import("../proc/sched.zig");
 /// deleted the wrong file).
 fn copyPath(path_ptr: u64, buf: *[256]u8) ?[]const u8 {
     if (path_ptr == 0 or path_ptr >= 0x0000_8000_0000_0000) return null;
-    const copied = copy.copyFromUser(buf[0..], @ptrFromInt(path_ptr), 255);
+    const copied = copy.copyPathFromUser(buf[0..], path_ptr, 255);
     if (copied == 0) return null;
     buf[if (copied < 255) copied else 255] = 0;
     var name_len: usize = 0;

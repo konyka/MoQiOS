@@ -4500,6 +4500,24 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   - 验证：host 704/704（新增源码结构测试：不带凭证的解析函数不存在、解析器检查 search 并带凭证解析符号链接、76 号走
     `syscallTruncate`）；hello114 308 项全部 ok。变异（确认重新编译）：解析器去掉 search 检查 → hello114 3 项 FAIL（link、getxattrat、
     listxattrat）。门禁：三架构构建通过，五组冒烟 hello114 各 308 ok、hello115 各 74 ok、0 FAIL、0 次内核态故障，stress 5/5。
+- **第三十九轮：路径参数必须有 255 个可读字节（合法路径被拒）**：
+  - 问题：41 处路径/名字参数用 `copyFromUser(buf, ptr, 255)`（或 15/63/127）一次拷固定长度。`copyFromUser` 要求整段都映射，否则返回 0
+    （调用方当作 EFAULT）。于是一个以 NUL 结尾、但离未映射页不足 255 字节的合法路径（例如放在一页末尾的字符串）被所有路径调用拒绝。
+    Linux 的 `strncpy_from_user` 读到 NUL 就停。这也是上一轮 76 号 truncate 返回 ENOENT 的同类问题来源之一。
+  - RED：hello113 新增场景 I：mmap 两页、unmap 第二页，把 "/tmp/i1\0" 放在第一页最后 8 字节，依次调用 open/access/statx/chmod/
+    truncate/unlink/mkdir/chdir/rmdir。旧内核 9 项全部 FAIL。
+  - 修复：新增 `copy_from_user.copyPathFromUser(dst, ptr, max)`：按页拷、遇到 NUL 立即停止；没有 NUL 时返回 `min(dst.len, max)`
+    （调用方原有的截断逻辑不变）；读到未映射页返回 0（EFAULT）。41 处路径/名字拷贝（包括 mount/umount、spawn、prctl(PR_SET_NAME)）
+    全部改用它。顺带：open 对坏指针原来返回 -1（EPERM），改为 -14（EFAULT）——hello113 新增的“没有 NUL 并跑出映射的路径是 EFAULT”
+    检查暴露了这一点。
+  - 验证：hello113 场景 I 全部 ok（hello113 共 31 项）；host 704/704。变异（确认重新编译）：`copyPathFromUser` 退回一次拷满固定长度 →
+    hello113 9 项 FAIL。门禁：三架构构建通过；MBR SMP=1/2/8、GPT SMP=2 冒烟 0 FAIL；hello114 各 308 ok、hello115 各 74 ok。
+  - 门禁中的失败（如实）：
+    - GPT SMP=8 那次 hello107 报 “unbounded iteration latency”（thread 1 单次最长 30.6 ms，阈值 30 ms）——与第三十六轮同一现象。
+    - 第一次 stress 的第 2 次启动里 hello107（两线程只跑了 37/7 次，单次最长约 90 ms）和 hello108（RT 任务在回收孤儿进程时被抢走
+      117 ms）都 FAIL，冒烟脚本因此一直等不到 PASS 标记，我在约 10 分钟后手动终止。同一内核随后重跑 stress，5/5 通过。
+    - 这两个测试都只测调度/锁延迟，不走本轮改动的路径拷贝；失败时宿主机 16 核、load average 约 2.6。原因未查明，两次都记为
+      偶发。hello107/hello108 的偶发失败已在 SMP=8 和 stress 中各出现过，应单独排查。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；
