@@ -103,7 +103,8 @@
   fork COW 部分 ✅ 6.34（三阶段事务化克隆，两条路径）；文件映射部分 ✅ 6.35
   以 fault-around 预缺页收口：真 2MiB PDE 与零拷贝 MAP_SHARED 设计物理上
   不兼容（后备帧逐 4K 分配不连续），分析定论见 kernel-subsystems §1.8.1。
-- smoke 门禁 CI 化（当前 CI 只跑主机测试；QEMU 门禁依赖本地环境，review §1）。
+- ~~smoke 门禁 CI 化~~（✅ 已在 `.github/workflows/test.yml`：host-tests、x86 smoke SMP=1/2、riscv64/aarch64 smoke；
+  2026-10 修复 aarch64 job 缺 `qemu-system-arm` 导致工作流从未通过的问题，见 review 第四十六轮）。
 - rlimit 扩展到 NOFILE 之外的资源（先定执行语义再实现，避免 stub 蔓延）——
   ~~RLIMIT_STACK~~（✅ 6.31：缺页增长地板执行 + 真实 set/get/prlimit64，hello59 验收）、
   ~~RLIMIT_AS~~（✅ 6.33：as_used 计费 + mmap/brk/mremap/栈增长执行点，hello60 验收）、

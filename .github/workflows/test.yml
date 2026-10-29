@@ -60,7 +60,10 @@ jobs:
           curl -sSfL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | sudo tar -xJ -C /opt
           echo "/opt/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
       - name: Install cross-architecture QEMU
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc
+        # Ubuntu ships qemu-system-riscv64 in qemu-system-misc but
+        # qemu-system-aarch64 in qemu-system-arm; without the latter the
+        # AArch64 step failed on every run ("qemu-system-aarch64 not found").
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc qemu-system-arm
       - name: Smoke RISC-V 64
         run: zig build -Darch=riscv64 smoke-riscv
         env:

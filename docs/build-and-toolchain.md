@@ -522,8 +522,9 @@ POSIX 消息队列的属性决策属于主机测试覆盖：测试验证 `O_CREA
 
 GitHub CI 还分三个层次运行 QEMU：`smoke-qemu` 保持 x86_64 的单核/双核
 boot-to-shell 测试（安装 `qemu-system-x86` 与 `xorriso`）；`smoke-cross-arch`
-安装 `qemu-system-misc` 并串行运行当前稳定的 `smoke-riscv` 与
-`smoke-aarch64` 合约。跨架构 job 的标记范围以各自 smoke 脚本及本章命令表为准，
+安装 `qemu-system-misc`（riscv64）与 `qemu-system-arm`（aarch64）并串行运行当前稳定的 `smoke-riscv` 与
+`smoke-aarch64` 合约。2026-10 之前该 job 只装了 `qemu-system-misc`，AArch64 一步每次都报
+`qemu-system-aarch64 not found`，整个工作流因此从未绿过（host-tests 与 smoke-qemu 本身一直通过）。跨架构 job 的标记范围以各自 smoke 脚本及本章命令表为准，
 不将 SK-20+ 等未验证里程碑纳入 CI 声称。
 
 如果被测 decl 因一小处内核改动即可变为纯函数（如把纯 helper 下沉到叶子模块），可以做

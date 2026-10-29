@@ -4604,6 +4604,11 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     `flush(0)`，冒烟里该标记 0 次、门禁超时失败；修复后标记出现在 hello29 fsync 处。
   - 没做的：第二块 virtio 盘（只读数据盘）不需要屏障；NVMe/AHCI 上的文件系统目前不存在，所以没有按挂载点映射设备的通用方案。
   - 门禁：host 709/709，三架构构建通过，五组冒烟 0 FAIL、每组都出现一次 flush 标记，stress 5/5。
+- **第四十六轮：GitHub CI 从未通过**：
+  - 发现：`gh run list` 显示远端 “Test” 工作流在能查到的全部历史里没有一次 success。三个 job 中 host-tests 与 smoke-qemu（x86 SMP=1/2）
+    一直通过，失败的是 smoke-cross-arch 的 AArch64 一步：`ERROR: qemu-system-aarch64 not found`。Ubuntu 把 riscv64 放在
+    `qemu-system-misc`，aarch64 在 `qemu-system-arm`，工作流只装了前者。此前各轮“门禁通过”只指本地门禁，没有核对远端 CI，如实更正。
+  - 修复：smoke-cross-arch 同时安装 `qemu-system-arm`。本地 `zig build -Darch=aarch64 smoke-aarch64` PASS。推送后的 CI 结果见下。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；
