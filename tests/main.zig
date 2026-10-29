@@ -98,7 +98,8 @@ test "sync syscall propagates aggregate writeback failure as EIO" {
     const end = std.mem.indexOfPos(u8, source, start, "247 =>").?;
     const body = source[start..end];
     try std.testing.expect(
-        std.mem.indexOf(u8, body, "if (vfs_mod.syncAll()) 0 else @bitCast(@as(i64, -5))") != null,
+        std.mem.indexOf(u8, body, "const all_ok = vfs_mod.syncAll();") != null and
+            std.mem.indexOf(u8, body, "if (all_ok and flushRootDiskCache()) 0 else @bitCast(@as(i64, -5))") != null,
     );
     try std.testing.expect(std.mem.indexOf(u8, body, "frame.rax = 0") == null);
 }
@@ -6549,4 +6550,66 @@ test "SysV IPC_SET: owner may hand an object to another uid/gid; the creator ids
     try std.testing.expectEqual(@as(u32, 0o640), ext.mode);
     try std.testing.expectEqual(@as(u32, 2000), ext.uid);
     try std.testing.expectEqual(@as(u32, 60), ext.gid);
+}
+
+test "rlimit: every Linux resource round-trips; out-of-range resources are EINVAL" {
+    const rl = kt.rlimit;
+    try std.testing.expectEqual(@as(u32, 16), rl.RLIM_NLIMITS);
+    // the six enforced resources keep their dedicated fields; the rest live in the recorded table
+    try std.testing.expect(rl.recordedSlot(4) != null); // RLIMIT_CORE
+    try std.testing.expect(rl.recordedSlot(5) != null); // RLIMIT_RSS
+    try std.testing.expect(rl.recordedSlot(15) != null); // RLIMIT_RTTIME
+    try std.testing.expect(rl.recordedSlot(7) == null); // NOFILE has its own field
+    try std.testing.expect(rl.recordedSlot(16) == null);
+    try std.testing.expect(!rl.resourceValid(16));
+    try std.testing.expect(rl.resourceValid(0));
+    var table = rl.RecordedLimits{};
+    const core = rl.recordedSlot(4).?;
+    try std.testing.expectEqual(rl.RLIM_INFINITY, table.get(core).cur);
+    // lowering needs no privilege; raising the hard limit back does
+    try table.set(core, .{ .cur = 0, .max = 0 }, false);
+    try std.testing.expectEqual(@as(u64, 0), table.get(core).max);
+    try std.testing.expectError(error.WouldLowerHardLimit, table.set(core, .{ .cur = 0, .max = 10 }, false));
+    try table.set(core, .{ .cur = 0, .max = 10 }, true);
+    try std.testing.expectError(error.InvalidLimit, table.set(core, .{ .cur = 11, .max = 10 }, true));
+    try std.testing.expectEqual(@as(u64, 10), table.get(core).max);
+}
+
+test "rlimit: every task-creation path resets the recorded limits after zeroSlot" {
+    const src = kt.task_source;
+    // zeroSlot clears field defaults, so each place that resets fSize_max must
+    // also reset recorded_limits (else new tasks start with 0/0 limits)
+    const fs = std.mem.count(u8, src, "tasks[slot].fSize_max = ");
+    const rl = std.mem.count(u8, src, "tasks[slot].recorded_limits = .{};");
+    try std.testing.expect(fs >= 3);
+    try std.testing.expectEqual(fs, rl);
+}
+
+test "virtio-blk: FLUSH is negotiated when offered and fsync reaches it" {
+    const vb = kt.virtio_blk_policy;
+    // the driver accepts exactly DISCARD and FLUSH out of what the device offers
+    try std.testing.expectEqual(@as(u32, vb.F_FLUSH | vb.F_DISCARD), vb.negotiate(vb.F_FLUSH | vb.F_DISCARD | (1 << 5)));
+    try std.testing.expectEqual(@as(u32, vb.F_FLUSH), vb.negotiate(vb.F_FLUSH));
+    try std.testing.expectEqual(@as(u32, 0), vb.negotiate(1 << 5));
+    try std.testing.expectEqual(@as(u32, 4), vb.T_FLUSH);
+    try std.testing.expectEqual(@as(u32, 1 << 9), vb.F_FLUSH);
+    // block_dev routes a virtio flush to the driver instead of failing it
+    const bd = kt.block_dev_source;
+    const f = std.mem.indexOf(u8, bd, "pub fn flush(dev: u8) i32 {").?;
+    const f_end = std.mem.indexOfPos(u8, bd, f, "\n}\n").?;
+    try std.testing.expect(std.mem.indexOf(u8, bd[f..f_end], ".virtio_blk => return -1") == null);
+}
+
+test "fsync/sync flush the disk the filesystems live on, not global device 0" {
+    const se = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, se, "supportsFlush(0)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "block_dev.flush(0)") == null);
+    const h = std.mem.indexOf(u8, se, "fn flushRootDiskCache() bool {").?;
+    const h_end = std.mem.indexOfPos(u8, se, h, "\n}\n").?;
+    try std.testing.expect(std.mem.indexOf(u8, se[h..h_end], "findByDriver(.virtio_blk, 0)") != null);
+    // both durability calls use it
+    const sync = std.mem.indexOf(u8, se, "246 => { // sync()").?;
+    try std.testing.expect(std.mem.indexOfPos(u8, se, sync, "flushRootDiskCache()").? < std.mem.indexOfPos(u8, se, sync, "247 =>").?);
+    const fs = std.mem.indexOf(u8, se, "fn syscallFsync(").?;
+    try std.testing.expect(std.mem.indexOfPos(u8, se, fs, "flushRootDiskCache()").? < std.mem.indexOfPos(u8, se, fs, "\n}\n").?);
 }

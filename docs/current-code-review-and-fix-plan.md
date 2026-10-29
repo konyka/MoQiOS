@@ -4578,6 +4578,32 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
     hello115 各 85 ok；stress 5/5（这也补上了第四十二轮未通过的 stress）。MBR SMP=2 那次 hello107 FAIL（thread 1 只跑 31 次、单次
     79 ms，当时宿主机 load ≈ 9），负载降到 2–5 后连跑两次 MBR SMP=2 都通过（最长 1.1/1.6 ms）——第四十轮的宿主机竞争现象，hello107
     不走 IPC 路径。
+- **第四十四轮：rlimit 未执行资源一律“假成功”，越界资源号也返回成功**：
+  - 问题：`setrlimit` 对 6 个已执行资源以外的任何资源号（包括 CORE、RSS 和 ≥16 的非法值）直接返回 0，不保存；`getrlimit`/`prlimit64`
+    读它们时永远返回无穷大。程序 `setrlimit(RLIMIT_CORE, 0)` 后读回来仍是无穷大；非法资源号不报 EINVAL。
+  - 修复：`rlimit.RecordedLimits` 为其余 10 个 Linux 资源保存 cur/max（规则与已执行资源相同：cur>max 为 EINVAL，无 CAP_SYS_RESOURCE
+    提高硬限为 EPERM），fork/clone 继承；`resourceValid`/`recordedSlot` 决定资源号映射，≥16 为 EINVAL。内核不按这些值执行，
+    `docs/rlimit.md` 写明。
+  - 实现中发现的问题：第一版 GREEN 时 hello59 仍然失败——`zeroSlot` 会清掉结构体字段默认值，新任务的记录值是 0/0 而不是无穷大。
+    与其他限制一样在任务创建的三处显式重置；新增 host 源码测试，要求每处重置 `fSize_max` 的地方也重置 `recorded_limits`。
+  - RED：hello59 新增第 7 段 11 项，旧内核 8 项 FAIL。验证：host 707/707（新增 2 个测试）；hello59 PASS。门禁（与第四十五轮同一批）：
+    三架构构建通过，五组冒烟 0 FAIL、hello59 PASS，stress 5/5。此前单独跑这一轮的 stress 两次各有一次 hello108 FAIL（宿主机 load 7–18，
+    另有 16 个其他会话的死循环进程），按第四十轮的结论与宿主机竞争相关，hello108 不调用 rlimit。
+- **第四十五轮：fsync/sync 从没把 ext2/FAT32 的数据刷出磁盘写缓存（next-phase-plan P1 #2 “fsync device ownership 映射”）**：
+  - 问题 1：fsync 在写回完成后调用 `block_dev.flush(0)`，假定文件系统在全局 0 号块设备上。实际注册顺序是 NVMe 第一个（#0），ext2/FAT32
+    所在的 virtio 启动盘是 #1，所以每次 fsync 都去刷了 NVMe 盘。
+  - 问题 2：即使选对了盘也没用——virtio-blk 驱动只协商 DISCARD，不协商 VIRTIO_BLK_F_FLUSH，也没有 T_FLUSH 请求，注册时
+    `supports_flush = false`，`block_dev.flush` 对 virtio 直接返回 -1。QEMU 默认 `cache=writeback` 下设备有易失写缓存，
+    fsync 返回 0 后数据仍可能只在宿主机缓存里。`sync()` 则完全没有设备屏障。
+  - 修复：纯函数 `drivers/virtio_blk_policy.zig`（特性位/请求类型常量、`negotiate` = DISCARD|FLUSH）；驱动协商 FLUSH、实现
+    `virtio_blk.flush()`（header + status 两个描述符，与读写共用 `io_lock`）、`supportsFlush()`，启动盘按协商结果注册；
+    `block_dev.flush` 把 virtio 交给驱动；`block_dev.findByDriver(type, driver_idx)` 按驱动身份找设备；fsync 和 sync 都调用
+    `flushRootDiskCache()`（找 virtio 0 号盘，有写缓存才下发屏障）。
+  - 证据：host 测试（协商结果、block_dev 不再拒绝 virtio、fsync/sync 不再用全局 0 号设备并都走新函数；一条旧测试锁定的 sync 文本相应更新）。
+    冒烟门禁新增 “[virtio-blk] first cache flush completed” 标记（hello29 的 fsync 触发）。RED：把协商退回只要 DISCARD、fsync 退回
+    `flush(0)`，冒烟里该标记 0 次、门禁超时失败；修复后标记出现在 hello29 fsync 处。
+  - 没做的：第二块 virtio 盘（只读数据盘）不需要屏障；NVMe/AHCI 上的文件系统目前不存在，所以没有按挂载点映射设备的通用方案。
+  - 门禁：host 709/709，三架构构建通过，五组冒烟 0 FAIL、每组都出现一次 flush 标记，stress 5/5。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；

@@ -81,6 +81,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.nproc_max = parent.nproc_max;
     child.fSize_cur = parent.fSize_cur;
     child.fSize_max = parent.fSize_max;
+    child.recorded_limits = parent.recorded_limits;
     // The child's address space mirrors the parent's (COW), so it starts with
     // the same charged usage.
     child.as_used = parent.as_used;

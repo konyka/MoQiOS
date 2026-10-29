@@ -167,7 +167,7 @@ export fn _start() callconv(.c) noreturn {
             .total_sectors = virtio_blk.getCapacity(),
             .name = vb_name,
             .name_len = 5,
-            .supports_flush = false,
+            .supports_flush = virtio_blk.supportsFlush(),
             .max_transfer_sectors = 128,
         }, 0);
     }

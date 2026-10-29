@@ -185,3 +185,12 @@ moqi_libc exposes the wrappers in `lib/moqi_libc/include/resource.h`
 (`getrlimit`, `setrlimit`, `prlimit64` over native syscalls 236/237/238,
 16-byte `struct rlimit`); the ABI is pinned by the
 `test_rlimit_abi` host test.
+
+## 未执行的资源（2026-10）
+
+Linux 定义 16 个资源（`RLIM_NLIMITS`）。NOFILE/STACK/AS/DATA/NPROC/FSIZE 有执行点并各自保存在 `Task` 字段里；其余 10 个
+（CPU、CORE、RSS、MEMLOCK、LOCKS、SIGPENDING、MSGQUEUE、NICE、RTPRIO、RTTIME）保存在 `Task.recorded_limits`
+（`rlimit.RecordedLimits`）：`getrlimit`/`setrlimit`/`prlimit64` 读写回同样的值，遵守 `cur <= max`（否则 EINVAL）和
+“没有 CAP_SYS_RESOURCE 不能提高硬限”（EPERM），fork/clone 继承、exec 保留。内核**不**按这些值做任何事（没有 core dump、
+CPU 时间信号、驻留集或锁数量限制）。资源号 ≥ 16 一律 EINVAL（此前 setrlimit 对任何未知资源返回 0，getrlimit 返回无穷大）。
+hello59 第 7 段验收。

@@ -119,6 +119,7 @@ const VirtioBlkDevice = struct {
     pci_dev: u8,
     pci_func: u8,
     discard_supported: bool,
+    flush_supported: bool = false,
 };
 
 var device: VirtioBlkDevice = .{
@@ -255,14 +256,13 @@ fn initDevice(dev: *const pci.PciDevice, out: *VirtioBlkDevice) !void {
     io.outb(@intCast(base + VIRTIO_PCI_STATUS), VIRTIO_STATUS_ACK);
     io.outb(@intCast(base + VIRTIO_PCI_STATUS), VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER);
 
-    // Negotiate features — accept DISCARD (G5) when the device offers it,
-    // nothing else. Legacy virtio exposes bits 0-31 in this register.
+    // Negotiate features — DISCARD (G5) and FLUSH (volatile write cache)
+    // when the device offers them, nothing else. Legacy virtio exposes bits
+    // 0-31 in this register.
     const dev_features = io.inl(@intCast(base + VIRTIO_PCI_DEVICE_FEATURES));
-    var driver_features: u32 = 0;
-    out.discard_supported = (dev_features & VIRTIO_BLK_F_DISCARD) != 0;
-    if (out.discard_supported) {
-        driver_features |= VIRTIO_BLK_F_DISCARD;
-    }
+    const driver_features = @import("virtio_blk_policy.zig").negotiate(dev_features);
+    out.discard_supported = (driver_features & VIRTIO_BLK_F_DISCARD) != 0;
+    out.flush_supported = (driver_features & @import("virtio_blk_policy.zig").F_FLUSH) != 0;
     io.outl(@intCast(base + VIRTIO_PCI_DRIVER_FEATURES), driver_features);
 
     io.outb(@intCast(base + VIRTIO_PCI_STATUS), VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
@@ -353,6 +353,9 @@ fn initDevice(dev: *const pci.PciDevice, out: *VirtioBlkDevice) !void {
     serial.writeString("\n");
     if (out.discard_supported) {
         serial.writeString("[virtio-blk] DISCARD supported\n");
+    }
+    if (out.flush_supported) {
+        serial.writeString("[virtio-blk] FLUSH supported (volatile write cache)\n");
     }
 }
 
@@ -724,6 +727,73 @@ pub fn discard(lba: u64, count: u32) i32 {
 
     return 0;
 }
+
+/// The device negotiated VIRTIO_BLK_F_FLUSH: it has a volatile write cache,
+/// so completed writes are durable only after flush().
+pub fn supportsFlush() bool {
+    return device.active and device.flush_supported;
+}
+
+/// VIRTIO_BLK_T_FLUSH on disk 0: header + status descriptors, no data.
+/// Returns 0 on success (or when the device needs no flush), -1 on error.
+pub fn flush() i32 {
+    if (!device.active or !device.flush_supported) return 0;
+
+    const flags = io_lock.acquire();
+    defer io_lock.release(flags);
+
+    const req: *volatile BlkReqHeader = @ptrFromInt(device.req_header_virt);
+    req.type = @import("virtio_blk_policy.zig").T_FLUSH;
+    req.reserved = 0;
+    req.sector = 0;
+
+    const status_byte: *volatile u8 = @ptrFromInt(device.status_virt);
+    status_byte.* = 0xFF;
+
+    const vq_virt = device.queue_virt;
+    const d0 = getDesc(vq_virt, 0);
+    d0.addr = device.req_header_phys;
+    d0.len = @sizeOf(BlkReqHeader);
+    d0.flags = 1 << 0; // NEXT
+    d0.next = 1;
+    const d1 = getDesc(vq_virt, 1);
+    d1.addr = device.status_phys;
+    d1.len = 1;
+    d1.flags = 1 << 1; // WRITE
+    d1.next = 0;
+
+    const avail = getAvail(vq_virt);
+    const avail_idx = avail.idx;
+    avail.ring[avail_idx % device.queue_num] = 0;
+    asm volatile ("" ::: .{ .memory = true });
+    avail.idx = avail_idx +% 1;
+
+    writeReg16(VIRTIO_PCI_QUEUE_NOTIFY, 0);
+
+    const used = getUsed(device.queue_virt);
+    var timeout: u32 = 10_000_000;
+    while (timeout > 0) : (timeout -= 1) {
+        if (used.idx != device.last_used_idx) {
+            device.last_used_idx = used.idx;
+            break;
+        }
+        asm volatile ("pause");
+    }
+    if (timeout == 0) {
+        serial.writeString("[virtio-blk] flush timeout\n");
+        return -1;
+    }
+    if (status_byte.* != VIRTIO_BLK_S_OK) {
+        serial.writeString("[virtio-blk] flush error\n");
+        return -1;
+    }
+    if (flush_count == 0) serial.writeString("[virtio-blk] first cache flush completed\n");
+    flush_count +%= 1;
+    return 0;
+}
+
+/// Completed VIRTIO_BLK_T_FLUSH requests (diagnostics / tests).
+pub var flush_count: u32 = 0;
 
 pub fn hasActiveDisk() bool {
     return device.active;

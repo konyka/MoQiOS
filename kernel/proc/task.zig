@@ -202,6 +202,9 @@ pub const Task = struct {
     /// file writes in the write path.
     fSize_cur: u64 = @import("rlimit.zig").RLIM_INFINITY,
     fSize_max: u64 = @import("rlimit.zig").RLIM_INFINITY,
+    /// Limits without an enforcement point (CORE, RSS, CPU, ...): recorded
+    /// so get/set/prlimit64 round-trip; inherited on fork/clone and exec.
+    recorded_limits: @import("rlimit.zig").RecordedLimits = .{},
 
     /// Bitmask of pending signals (bit N = signal N+1 is pending).
     /// Signals 1-31 supported. Bit 0 = SIGHUP (1), bit 30 = SIGUSR2 (31).
@@ -979,6 +982,7 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     tasks[slot].fd_table.alloc_limit = tasks[slot].nofile_cur;
     tasks[slot].fSize_cur = @import("rlimit.zig").RLIM_INFINITY;
     tasks[slot].fSize_max = @import("rlimit.zig").RLIM_INFINITY;
+    tasks[slot].recorded_limits = .{};
     tasks[slot].cwd[0] = '/';
     tasks[slot].cwd_len = 1;
     tasks[slot].cpu_affinity = affinity;
@@ -1047,6 +1051,7 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     tasks[slot].fd_table.alloc_limit = tasks[slot].nofile_cur;
     tasks[slot].fSize_cur = @import("rlimit.zig").RLIM_INFINITY;
     tasks[slot].fSize_max = @import("rlimit.zig").RLIM_INFINITY;
+    tasks[slot].recorded_limits = .{};
     tasks[slot].cwd[0] = '/';
     tasks[slot].cwd_len = 1;
     tasks[slot].cpu_affinity = -1;
@@ -1652,6 +1657,8 @@ pub fn createUserProcess(
         tasks[slot].nproc_max = @import("rlimit.zig").RLIM_INFINITY;
         tasks[slot].fSize_cur = fsize_cur;
         tasks[slot].fSize_max = fsize_max;
+        // zeroSlot cleared the field defaults: start every recorded limit at infinity.
+        tasks[slot].recorded_limits = .{};
         tasks[slot].stack_limit = @import("rlimit.zig").Policy.initialStackLimit(
             user_stack_top,
             @import("../mm/user_space.zig").USER_STACK_BOTTOM,

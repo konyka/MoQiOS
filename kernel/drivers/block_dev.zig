@@ -179,7 +179,7 @@ pub fn flush(dev: u8) i32 {
             return ahci.flushCache();
         },
         .nvme => return @import("nvme.zig").flush(),
-        .virtio_blk => return -1,
+        .virtio_blk => return @import("virtio_blk.zig").flush(),
     }
 }
 
@@ -256,6 +256,17 @@ pub fn getDeviceDriverIdx(dev: u8) ?u8 {
     if (dev >= device_count) return null;
     if (!devices[dev].active) return null;
     return devices[dev].dev_idx;
+}
+
+/// 按 (驱动类型, 驱动内索引) 查找活动设备，返回全局索引——文件系统按驱动
+/// 访问磁盘（ext2/FAT32 直接调用 virtio_blk），全局索引取决于注册顺序。
+pub fn findByDriver(dev_type: BlockDevType, driver_idx: u8) ?u8 {
+    const flags = blk_lock.acquire();
+    defer blk_lock.release(flags);
+    for (0..device_count) |i| {
+        if (devices[i].active and devices[i].info.dev_type == dev_type and devices[i].dev_idx == driver_idx) return @intCast(i);
+    }
+    return null;
 }
 
 /// 按设备名（如 "sda"/"vblk0"/"nvme0"）查找活动设备，返回全局索引。

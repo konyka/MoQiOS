@@ -95,7 +95,8 @@ PASS checks. Once a test prints `helloN: FAIL` and init has reached the shell, i
 instead of waiting for the timeout. It removes its automatically created temporary work directory and
 generated logs on exit. `qemu_run.sh` serialises Limine preparation and `bios-install` with `flock`
 (`MOQI_LIMINE_LOCK`, default `/tmp/moqios-limine.lock`) so parallel runs do not delete the shared
-`limine/limine` utility under each other. Latency tests (hello105/107/108) run under TCG and measure
+`limine/limine` utility under each other. The smoke gate also requires `[virtio-blk] first cache flush completed` (hello29's fsync must reach the boot disk's
+write cache; QEMU's default `cache=writeback` advertises VIRTIO_BLK_F_FLUSH). Latency tests (hello105/107/108) run under TCG and measure
 host wall-clock time, so they are only meaningful on an otherwise idle host. A caller-supplied `MOQI_SMOKE_WORK_DIR` is treated as caller-owned and is preserved.
 A caller-supplied `MOQI_SMOKE_DISK` is likewise caller-owned: it is booted as given (so a disk can
 be carried across runs or prepared beforehand) and must already exist; only the default private

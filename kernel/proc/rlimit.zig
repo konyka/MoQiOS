@@ -161,3 +161,51 @@ pub const Policy = struct {
         return @as(u64, uid_count) < cur;
     }
 };
+
+// ── Resources without an enforcement point ────────────────────────────
+//
+// Linux defines RLIM_NLIMITS = 16 resources. NOFILE/STACK/AS/DATA/NPROC/
+// FSIZE are enforced and keep dedicated Task fields. The others (CPU, CORE,
+// RSS, MEMLOCK, LOCKS, SIGPENDING, MSGQUEUE, NICE, RTPRIO, RTTIME) are
+// recorded per task so get/set/prlimit64 round-trip with the usual
+// cur <= max and hard-limit rules, but the kernel does not act on them:
+// there are no core dumps, CPU-time signals, resident-set or lock limits.
+// Resource numbers outside 0..15 are EINVAL, as on Linux.
+
+pub const RLIM_NLIMITS: u32 = 16;
+
+const enforced = [_]u32{ 1, 2, 3, 6, 7, 9 }; // FSIZE DATA STACK NPROC NOFILE AS
+
+pub fn resourceValid(resource: u32) bool {
+    return resource < RLIM_NLIMITS;
+}
+
+pub const RECORDED_COUNT: u32 = RLIM_NLIMITS - enforced.len;
+
+/// Index into RecordedLimits for a resource without its own Task field.
+pub fn recordedSlot(resource: u32) ?u32 {
+    if (!resourceValid(resource)) return null;
+    for (enforced) |e| if (e == resource) return null;
+    var slot: u32 = 0;
+    var r: u32 = 0;
+    while (r < resource) : (r += 1) {
+        var is_enf = false;
+        for (enforced) |e| if (e == r) {
+            is_enf = true;
+        };
+        if (!is_enf) slot += 1;
+    }
+    return slot;
+}
+
+pub const RecordedLimits = struct {
+    v: [RECORDED_COUNT]Limit = @splat(.{ .cur = RLIM_INFINITY, .max = RLIM_INFINITY }),
+
+    pub fn get(self: *const RecordedLimits, slot: u32) Limit {
+        return self.v[slot];
+    }
+
+    pub fn set(self: *RecordedLimits, slot: u32, next: Limit, privileged: bool) Policy.Error!void {
+        self.v[slot] = try Policy.applyBytes(self.v[slot], next, privileged);
+    }
+};

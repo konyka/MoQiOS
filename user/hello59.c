@@ -69,6 +69,29 @@ int main(int argc, char **argv, char **envp) {
     CHECK(getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur == 256 * 1024,
           "parent limit intact");
 
+    /* 7. 未执行的资源也要能读写回（RLIMIT_CORE），并被 fork 继承；越界资源号 EINVAL；
+     *    无 CAP_SYS_RESOURCE 时不能把硬限调回去 */
+    struct rlimit core;
+    CHECK(getrlimit(RLIMIT_CORE, &core) == 0 && core.rlim_cur == RLIM_INFINITY, "RLIMIT_CORE default infinity");
+    struct rlimit core_set = { 0, 4096 };
+    CHECK(setrlimit(RLIMIT_CORE, &core_set) == 0, "set RLIMIT_CORE 0/4096");
+    CHECK(getrlimit(RLIMIT_CORE, &core) == 0 && core.rlim_cur == 0 && core.rlim_max == 4096, "RLIMIT_CORE reads back");
+    CHECK(prlimit64(0, RLIMIT_CORE, 0, &old) == 0 && old.rlim_max == 4096, "prlimit64 reads RLIMIT_CORE");
+    struct rlimit core_raise = { 0, 8192 };
+    CHECK(setrlimit(RLIMIT_CORE, &core_raise) == -1, "raising the RLIMIT_CORE hard limit is EPERM");
+    struct rlimit core_bad = { 5000, 4096 };
+    CHECK(setrlimit(RLIMIT_CORE, &core_bad) == -22, "RLIMIT_CORE cur>max is EINVAL");
+    CHECK(getrlimit(16, &core) == -22, "getrlimit(16) is EINVAL");
+    CHECK(setrlimit(16, &core_set) == -22, "setrlimit(16) is EINVAL");
+    CHECK(prlimit64(0, 16, 0, &old) == -22, "prlimit64(16) is EINVAL");
+    long kid = fork();
+    if (kid == 0) {
+        struct rlimit k;
+        _exit(getrlimit(RLIMIT_CORE, &k) == 0 && k.rlim_max == 4096 ? 0 : 9);
+    }
+    int kst = -1;
+    CHECK(waitpid(kid, &kst, 0) == kid && kst == 0, "RLIMIT_CORE inherited by fork");
+
     if (failures == 0) {
         print("hello59: PASS\n");
         exit(0);

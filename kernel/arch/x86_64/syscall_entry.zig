@@ -1293,7 +1293,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         246 => { // sync()
             // Preserve the aggregate writeback failure so callers do not get
             // a false durability success when a filesystem flush fails.
-            frame.rax = if (vfs_mod.syncAll()) 0 else @bitCast(@as(i64, -5)); // EIO
+            const all_ok = vfs_mod.syncAll();
+            frame.rax = if (all_ok and flushRootDiskCache()) 0 else @bitCast(@as(i64, -5)); // EIO
         },
         // ── v33.2: clock_nanosleep / epoll_pwait / getcpu ────────────
         247 => { // clock_nanosleep(clockid, flags, req, rem)
@@ -3863,8 +3864,6 @@ const RLIMIT_STACK: u32 = 3;
 const RLIMIT_AS: u32 = 9;
 const RLIMIT_DATA: u32 = 2;
 const RLIMIT_FSIZE: u32 = 1;
-const RLIMIT_CORE: u32 = 4;
-const RLIMIT_RSS: u32 = 5;
 const RLIMIT_NPROC: u32 = 6;
 
 const RLIM_INFINITY: u64 = 0xFFFF_FFFF_FFFF_FFFF;
@@ -3902,13 +3901,16 @@ fn syscallGetrlimit(resource: u32, rlim_ptr: u64) i64 {
                 rlim.rlim_max = task.fSize_max;
             }
         },
-        RLIMIT_CORE, RLIMIT_RSS => {
-            rlim.rlim_cur = RLIM_INFINITY;
-            rlim.rlim_max = RLIM_INFINITY;
-        },
         else => {
-            rlim.rlim_cur = RLIM_INFINITY;
-            rlim.rlim_max = RLIM_INFINITY;
+            const rl = @import("../../proc/rlimit.zig");
+            const slot = rl.recordedSlot(resource) orelse return -22; // EINVAL: not a resource
+            const sched = @import("../../proc/sched.zig");
+            const tm = @import("../../proc/task.zig");
+            const idx = sched.currentTaskIndex() orelse return -3;
+            const task = tm.getTask(idx) orelse return -3;
+            const l = task.recorded_limits.get(slot);
+            rlim.rlim_cur = l.cur;
+            rlim.rlim_max = l.max;
         },
     }
 
@@ -3918,25 +3920,34 @@ fn syscallGetrlimit(resource: u32, rlim_ptr: u64) i64 {
     return if (copy.copyToUser(@ptrFromInt(rlim_ptr), &buf, 16) == 16) 0 else -14;
 }
 
-/// setrlimit(resource, rlim_ptr) — set resource limit.
-/// Real per-task operation for RLIMIT_NOFILE and RLIMIT_STACK; other
-/// resources are accepted but not enforced (return 0).
+/// setrlimit(resource, rlim_ptr) — set resource limit. NOFILE/STACK/AS/
+/// DATA/NPROC/FSIZE are enforced; the other Linux resources are recorded
+/// per task (rlimit.RecordedLimits) with the same cur<=max / hard-limit
+/// rules but no enforcement. Resource numbers >= 16 are EINVAL.
 fn syscallSetrlimit(resource: u32, rlim_ptr: u64) i64 {
     if (rlim_ptr == 0 or rlim_ptr >= 0x0000_8000_0000_0000) return -14;
     const copy = @import("../../mm/copy_from_user.zig");
     const bo = @import("../../lib/byte_order.zig");
     var buf: [16]u8 = undefined;
     if (copy.copyFromUser(&buf, @ptrFromInt(rlim_ptr), 16) != 16) return -14;
-    if (resource != RLIMIT_NOFILE and resource != RLIMIT_STACK and resource != RLIMIT_AS and resource != RLIMIT_DATA and resource != RLIMIT_NPROC and resource != RLIMIT_FSIZE) return 0;
-    const next = @import("../../proc/rlimit.zig").Limit{ .cur = bo.readU64At(&buf, 0), .max = bo.readU64At(&buf, 8) };
+    const rl = @import("../../proc/rlimit.zig");
+    if (!rl.resourceValid(resource)) return -22; // EINVAL
+    const next = rl.Limit{ .cur = bo.readU64At(&buf, 0), .max = bo.readU64At(&buf, 8) };
     const sched = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
     const idx = sched.currentTaskIndex() orelse return -3;
-    const policy = @import("../../proc/rlimit.zig").Policy;
+    const policy = rl.Policy;
     const lock_flags = tm.lockTask();
     defer tm.unlockTask(lock_flags);
     const task = tm.getTask(idx) orelse return -3;
     const privileged = @field(task.effective_caps, "cap_sys_resource");
+    if (rl.recordedSlot(resource)) |slot| {
+        task.recorded_limits.set(slot, next, privileged) catch |err| return switch (err) {
+            error.InvalidLimit => -22,
+            error.WouldLowerHardLimit => -1,
+        };
+        return 0;
+    }
     if (resource == RLIMIT_STACK) {
         const applied = policy.applyBytes(.{ .cur = task.stack_cur, .max = task.stack_max }, next, privileged) catch |err| return switch (err) {
             error.InvalidLimit => -22,
@@ -4150,6 +4161,17 @@ fn syscallArchPrctl(code: u64, addr: u64) i64 {
 
 // ── v33.1: fsync ────────────────────────────────────────────────────
 
+/// Flush barrier for the disk FAT32 and ext2 live on: the boot virtio-blk
+/// disk (driver index 0), which is not necessarily global block device 0
+/// (NVMe registers first). A device without a volatile write cache is
+/// write-through, so completed writeback is already durable.
+fn flushRootDiskCache() bool {
+    const block_dev = @import("../../drivers/block_dev.zig");
+    const dev = block_dev.findByDriver(.virtio_blk, 0) orelse return true;
+    if (!block_dev.supportsFlush(dev)) return true;
+    return block_dev.flush(dev) == 0;
+}
+
 /// fsync(fd) / fdatasync(fd) — flush file's dirty buffers to disk.
 fn syscallFsync(fd: u32) i64 {
     const sched = @import("../../proc/sched.zig");
@@ -4171,11 +4193,7 @@ fn syscallFsync(fd: u32) i64 {
         // v53.51: writeback buffers are keyed by inode_id, not by per-FS slot
         // index, so fsync addresses the file by the descriptor's inode_id.
         if (!vfs_mod.syncFile(desc.inode_id, wb_type)) return -5; // EIO
-        // FAT32/ext2 currently live on block device 0. Only devices that
-        // advertise a volatile write cache need a flush barrier; the others are
-        // write-through, so writeback completion is already durable.
-        const block_dev = @import("../../drivers/block_dev.zig");
-        if (block_dev.supportsFlush(0) and block_dev.flush(0) != 0) return -5; // EIO
+        if (!flushRootDiskCache()) return -5; // EIO
     }
     return 0;
 }
@@ -4703,8 +4721,10 @@ fn syscallPrlimit64(pid: u32, resource: u32, new_limit_ptr: u64, old_limit_ptr: 
                 old_limit.rlim_max = target.fSize_max;
             },
             else => {
-                old_limit.rlim_cur = RLIM_INFINITY;
-                old_limit.rlim_max = RLIM_INFINITY;
+                const slot = @import("../../proc/rlimit.zig").recordedSlot(resource) orelse return -22; // EINVAL
+                const l = target.recorded_limits.get(slot);
+                old_limit.rlim_cur = l.cur;
+                old_limit.rlim_max = l.max;
             },
         }
     }
@@ -4721,7 +4741,7 @@ fn syscallPrlimit64(pid: u32, resource: u32, new_limit_ptr: u64, old_limit_ptr: 
         if (new_limit_ptr >= 0x0000_8000_0000_0000) return -14;
         var nbuf: [16]u8 = undefined;
         if (copy.copyFromUser(nbuf[0..], @ptrFromInt(new_limit_ptr), 16) != 16) return -14;
-        if (resource == RLIMIT_NOFILE or resource == RLIMIT_STACK or resource == RLIMIT_AS or resource == RLIMIT_DATA or resource == RLIMIT_NPROC or resource == RLIMIT_FSIZE) {
+        {
             const next = @import("../../proc/rlimit.zig").Limit{ .cur = bo.readU64At(&nbuf, 0), .max = bo.readU64At(&nbuf, 8) };
             const policy = @import("../../proc/rlimit.zig").Policy;
             const lock_flags = tm.lockTask();
@@ -4766,6 +4786,12 @@ fn syscallPrlimit64(pid: u32, resource: u32, new_limit_ptr: u64, old_limit_ptr: 
                 };
                 target.fSize_cur = applied.cur;
                 target.fSize_max = applied.max;
+            } else if (resource != RLIMIT_NOFILE) {
+                const slot = @import("../../proc/rlimit.zig").recordedSlot(resource).?;
+                target.recorded_limits.set(slot, next, privileged) catch |err| return switch (err) {
+                    error.InvalidLimit => -22,
+                    error.WouldLowerHardLimit => -1,
+                };
             } else {
                 const applied = policy.apply(.{ .cur = target.nofile_cur, .max = target.nofile_max }, next, vfs_mod.MAX_FDS, privileged) catch |err| return switch (err) {
                     error.InvalidLimit => -22,

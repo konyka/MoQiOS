@@ -337,6 +337,7 @@ pub fn clone(
     child.nproc_max = parent.nproc_max;
     child.fSize_cur = parent.fSize_cur;
     child.fSize_max = parent.fSize_max;
+    child.recorded_limits = parent.recorded_limits;
     // The clone's address space mirrors (or with CLONE_VM shares) the
     // parent's, so it starts with the same charged usage.
     child.as_used = parent.as_used;

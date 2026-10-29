@@ -256,6 +256,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
        grep -q "hello21 done" "$LOG_FILE" &&
        grep -q "hello29: PASS" "$LOG_FILE" &&
        grep -q "hello29: fsync PASS" "$LOG_FILE" &&
+       grep -q "\[virtio-blk\] first cache flush completed" "$LOG_FILE" &&
        grep -q "hello30: brk/mmap PASS" "$LOG_FILE" &&
        grep -q "hello31: child TLS ok" "$LOG_FILE" &&
        grep -q "hello31: TLS PASS" "$LOG_FILE" &&
