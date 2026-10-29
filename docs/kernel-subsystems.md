@@ -1756,7 +1756,7 @@ The native `Message` ABI is an exactly 256-byte extern struct: `sender:u64`, `re
 - shmget: 创建/查找段，分配物理页并清零
 - shmat: 4 级页表映射到进程地址空间 (0x70000000 基址)，支持 SHM_RDONLY
 - shmdt: 解除映射，isMappedAt() 4级页表walk验证物理地址匹配，支持延迟删除 (IPC_RMID 标记)
-- shmctl: IPC_STAT/IPC_RMID/IPC_SET (权限mode更新)
+- shmctl: IPC_STAT/IPC_RMID/IPC_SET（mode 与属主 uid/gid，见下）
 - `IPC_STAT` 元数据先在 `shm_lock` 内快照，再在锁外 copyout；`IPC_SET` 先锁外 copyin，再锁内校验权限并提交，避免用户页访问运行在 IRQ 关闭状态。负 `key` 以原始 i64 位模式写入 ABI 缓冲区。
 - task exit 只有在存在 `Mm` 且成功取得 VM mutation guard 时才执行 SHM detach；guard 获取失败或任务无 `Mm` 时跳过该 detach，但继续完成其余退出清理，避免无保护修改页表。
 - `mlock/mlockall/munlock/munlockall` 当前保持明确的 `ENOSYS` ABI 契约；真实实现必须先补 per-MM lock accounting、`RLIMIT_MEMLOCK`、prefault/pin、swap/reclaim exclusion、MCL_FUTURE 及 clone/exit/munmap 交互，不能用简单 VMA 标志伪装完成。
@@ -1770,7 +1770,7 @@ The native `Message` ABI is an exactly 256-byte extern struct: `sender:u64`, `re
 - 16 个信号量集上限，32 信号量/集
 - semget: 创建/查找信号量集，IPC_CREAT/IPC_EXCL
 - semop: P/V 操作，P 操作用 sched.sleepOn 阻塞等待，V 操作用 wakeOne 唤醒等待者，IPC_RMID 用 wakeAll 通知
-- semctl: IPC_RMID/IPC_STAT/IPC_SET (权限mode更新)/SETVAL/GETVAL
+- semctl: IPC_RMID/IPC_STAT/IPC_SET（arg ≤ 0777 为 mode；更大的值是 IPC_SET 缓冲区指针）/SETVAL/GETVAL
 - 系统调用: #64 (semget), #65 (semop), #66 (semctl)
 
 ### 5.5b SysV 消息队列 ✅ (v18.1, v28.0 IPC_SET)
@@ -1781,7 +1781,10 @@ The native `Message` ABI is an exactly 256-byte extern struct: `sender:u64`, `re
 - msgget: 创建/查找消息队列
 - msgsnd: 发送消息 (含 mtype 类型字段)
 - msgrcv: 接收消息，支持按类型过滤 (正/负/零)
-- msgctl: IPC_STAT/IPC_RMID/IPC_SET (权限mode更新)
+- msgctl: IPC_STAT/IPC_RMID/IPC_SET（mode 与属主 uid/gid）
+- IPC_SET 缓冲区（`sysv_policy.readSetRequest`）：一个 u64 = 只改 mode（原有 ABI）；首字带 bit 63（`IPC_SET_EXTENDED`）时为
+  三个 u64 `{mode|EXT, uid, gid}`，uid/gid 为 0xFFFFFFFF 表示不改。属主、创建者或 CAP_SYS_ADMIN 可以设置；创建者 uid/gid 不变，
+  因此把对象交给别人后创建者仍可管理（与 Linux 一致）。
 - 系统调用: #68 (msgget), #69 (msgsnd), #70 (msgrcv), #71 (msgctl)
 
 ### 5.6 POSIX 消息队列 ✅ (v18.0)

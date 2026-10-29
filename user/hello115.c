@@ -13,6 +13,9 @@
 ///      and ext2) and of a SysV queue's mode.
 ///   F. execve: the saved uid becomes the effective uid, and a program run
 ///      without any root uid gets no capabilities (hello116 reports back).
+///   G. SysV IPC_SET transfers ownership: the owner of a msg queue, semaphore
+///      set and shm segment can hand it to another uid/gid; the new owner then
+///      manages it, a stranger cannot, and the creator keeps its rights.
 ///   C. without CAP_SETUID a process may still "set" its own uid (no-op) and
 ///      shuffle among its own real/effective/saved ids, but not pick others.
 
@@ -32,6 +35,14 @@ static inline int64_t syscall3(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
     int64_t ret;
     register uint64_t rdx __asm__("rdx") = a3;
     __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx) : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
+    int64_t ret;
+    register uint64_t rdx __asm__("rdx") = a3;
+    register uint64_t r10 __asm__("r10") = a4;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx), "r"(r10) : "rcx", "r11", "memory");
     return ret;
 }
 
@@ -61,6 +72,14 @@ static inline int64_t syscall3(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define IPC_RMID      0
 #define EACCES_       13
 #define SYS_GETGROUPS 487
+#define SYS_SEMGET    153
+#define SYS_SEMCTL    155
+#define SYS_SHMGET    149
+#define SYS_SHMCTL    152
+#define IPC_SET_      1
+#define IPC_STAT_     2
+#define IPC_RMID_     0
+#define IPC_SET_EXT   (1ull << 63)
 #define SYS_EXECVE    59
 #define SYS_CAPSET_   307
 #define SYS_SETGROUPS 488
@@ -332,6 +351,52 @@ static void exec_credentials(void) {
     check(b >= 0 && (b & 4), "F: and euid 0 gets them effective (effective = permitted)");
 }
 
+/* In a child: become `uid` and try IPC_SET (mode 0600) on the three objects. */
+static int set_as(uint32_t uid, int64_t q, int64_t sem, int64_t shm) {
+    int64_t kid = syscall1(SYS_FORK, 0);
+    if (kid == 0) {
+        /* back to euid 0 through the saved uid (restores CAP_SETUID), then drop to `uid` */
+        if (syscall3(SYS_SETRESUID, KEEP, 0, KEEP) != 0 || syscall1(SYS_SETUID, uid) != 0) syscall1(SYS_EXIT, 2);
+        uint64_t mode = 0600;
+        int ok = syscall3(SYS_MSGCTL, (uint64_t)q, IPC_SET_, (uint64_t)&mode) == 0;
+        ok &= syscall4(SYS_SEMCTL, (uint64_t)sem, 0, IPC_SET_, 0600) == 0;
+        ok &= syscall3(SYS_SHMCTL, (uint64_t)shm, IPC_SET_, (uint64_t)&mode) == 0;
+        syscall1(SYS_EXIT, ok ? 0 : 1);
+        for (;;) {}
+    }
+    int32_t st = 0;
+    syscall3(SYS_WAITPID, (uint64_t)kid, (uint64_t)&st, 0);
+    return kid > 0 && st == 0;
+}
+
+static void ipc_set_owner(void) {
+    /* created by uid 1000 (cuid stays 1000) */
+    /* objects created as uid 1000 (cuid stays 1000); setresuid keeps root
+     * saved so the children below may switch to other uids */
+    check(syscall3(SYS_SETRESUID, KEEP, 1000, KEEP) == 0, "G: become euid 1000 (saved uid stays 0)");
+    int64_t q = syscall2(SYS_MSGGET, IPC_PRIVATE, IPC_CREAT | 0600);
+    int64_t sem = syscall3(SYS_SEMGET, IPC_PRIVATE, 1, IPC_CREAT | 0600);
+    int64_t shm = syscall3(SYS_SHMGET, IPC_PRIVATE, 4096, IPC_CREAT | 0600);
+    check(q >= 0 && sem >= 0 && shm >= 0, "G: uid 1000 creates a queue, a semaphore set and a segment");
+    check(!set_as(2000, q, sem, shm), "G: uid 2000 cannot IPC_SET objects it does not own");
+
+    uint64_t give[3] = { 0640 | IPC_SET_EXT, 2000, 60 };
+    check(syscall3(SYS_MSGCTL, (uint64_t)q, IPC_SET_, (uint64_t)give) == 0, "G: the owner gives the queue to 2000:60");
+    check(syscall4(SYS_SEMCTL, (uint64_t)sem, 0, IPC_SET_, (uint64_t)give) == 0, "G: and the semaphore set");
+    check(syscall3(SYS_SHMCTL, (uint64_t)shm, IPC_SET_, (uint64_t)give) == 0, "G: and the segment");
+    uint64_t qi[6] = { 0 };
+    /* 0640 owned by 2000:60: euid 1000 is now "other" and may not even read it */
+    check(syscall3(SYS_MSGCTL, (uint64_t)q, IPC_STAT_, (uint64_t)qi) == -EACCES_, "G: after the transfer the old owner is \"other\" on a 0640 queue");
+
+    check(set_as(2000, q, sem, shm), "G: the new owner 2000 may IPC_SET all three");
+    check(!set_as(4242, q, sem, shm), "G: a stranger still may not");
+    check(set_as(1000, q, sem, shm), "G: the creator keeps the right to manage them");
+
+    syscall3(SYS_MSGCTL, (uint64_t)q, IPC_RMID_, 0);
+    syscall4(SYS_SEMCTL, (uint64_t)sem, 0, IPC_RMID_, 0);
+    syscall3(SYS_SHMCTL, (uint64_t)shm, IPC_RMID_, 0);
+}
+
 int main_(void) {
     print("hello115: identity changes and capabilities\n");
     uint32_t r, e, s;
@@ -347,6 +412,7 @@ int main_(void) {
     check(gq >= 0, "E: supplementary groups scenario");
     cleanup_group_fixtures(gq);
     exec_credentials();
+    check(in_child(ipc_set_owner), "G: IPC_SET ownership transfer scenario");
     /* the scenario's uid-1000 queue: find it again (the child's variable is
      * gone) by trying the ids a fresh boot hands out, as its owner */
     {

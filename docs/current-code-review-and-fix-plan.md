@@ -4566,6 +4566,18 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   - stress 未通过（如实）：两次 stress 各有一次启动 hello108 FAIL（stolen 37 ms / 16 ms，hello107 同时只跑了 89 / 400 次）。两次都发生在宿主机
     被其他项目占用的时候（load 7–12：别的会话的 python 网络矩阵测试、cmake、GUI 测试），属于第四十轮记录的宿主机竞争现象。本轮只在两个
     旧式 UDP 调用入口加了权能检查，不涉及调度和回收路径。宿主机空闲后需要补跑 stress。
+- **第四十三轮：SysV IPC_SET 只能改 mode，不能转移属主（此前“未解决”中的一项）**：
+  - 问题：msgctl/semctl/shmctl 的 IPC_SET 只读一个 u64 当 mode，没有办法改 `ipc_perm.uid/gid`，对象无法交给另一个用户管理。
+  - 设计：保留原有一字 ABI（只改 mode，hello40 等旧调用不变）；首字带 bit 63（`IPC_SET_EXTENDED`，任何合法 mode 都不含它）时读三个 u64
+    `{mode|EXT, uid, gid}`，0xFFFFFFFF 表示该项不改。semctl 的第 4 个参数本来就是 mode 值，大于 0777 时按缓冲区指针处理。纯函数
+    `sysv_policy.applySet`（权限：属主/创建者/CAP_SYS_ADMIN；创建者 id 不变）、`decodeSet`/`isExtendedSet`、`readSetRequest`
+    （锁外拷入）。三个运行时都改用它。
+  - RED：host 测试先写（编译失败）；hello115 新增场景 G（uid 1000 建队列/信号量/共享内存，用扩展 IPC_SET 交给 2000:60，再由不同 uid 的
+    子进程验证管理权），旧内核 3 项 FAIL——旧内核接受了调用但忽略 uid/gid。
+  - 验证：host 705/705；hello115 场景 G 全部 ok（hello115 共 85 项）。门禁：三架构构建通过；MBR SMP=1/8、GPT SMP=2/8 冒烟 0 FAIL，
+    hello115 各 85 ok；stress 5/5（这也补上了第四十二轮未通过的 stress）。MBR SMP=2 那次 hello107 FAIL（thread 1 只跑 31 次、单次
+    79 ms，当时宿主机 load ≈ 9），负载降到 2–5 后连跑两次 MBR SMP=2 都通过（最长 1.1/1.6 ms）——第四十轮的宿主机竞争现象，hello107
+    不走 IPC 路径。
 - **SMP=2 偶发停滞——原因已找到并修复（NVMe 完成信箱竞态）**：
   - 上一段记录的停滞原先标为"原因未知"。这一轮并行跑了 4 路带调试器的 GPT SMP=2 启动（各自独立的 ISO、user_bin、
     NVMe/AHCI 镜像和 gdb 端口），约 110 次启动里抓到 1 次，并保存了完整任务表：两个 CPU 都在 `hlt` 且 `IF=1`；

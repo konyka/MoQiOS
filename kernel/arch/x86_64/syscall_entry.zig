@@ -791,7 +791,13 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             const semnum: i32 = @bitCast(@as(u32, @truncate(frame.rsi)));
             const cmd: i32 = @bitCast(@as(u32, @truncate(frame.rdx)));
             const arg: i32 = @bitCast(@as(u32, @truncate(frame.r10)));
-            frame.rax = @bitCast(sem_mod.semctl(@truncate(frame.rdi), semnum, cmd, arg));
+            frame.rax = @bitCast(if (cmd == 1 and frame.r10 > 0o777)
+                // IPC_SET: a value above 0777 cannot be a mode (the native ABI
+                // passes the mode itself), so it is a pointer to the
+                // sysv_policy.readSetRequest buffer {mode|EXT, uid, gid}.
+                sem_mod.semctlSetFromUser(@truncate(frame.rdi), frame.r10)
+            else
+                sem_mod.semctl(@truncate(frame.rdi), semnum, cmd, arg));
         },
         156 => { // msgget(key, msgflg)
             const msg_mod = @import("../../ipc/sysv_msg.zig");
@@ -1937,7 +1943,13 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             const semnum: i32 = @bitCast(@as(u32, @truncate(frame.rsi)));
             const cmd: i32 = @bitCast(@as(u32, @truncate(frame.rdx)));
             const arg: i32 = @bitCast(@as(u32, @truncate(frame.r10)));
-            frame.rax = @bitCast(sem_mod.semctl(@truncate(frame.rdi), semnum, cmd, arg));
+            frame.rax = @bitCast(if (cmd == 1 and frame.r10 > 0o777)
+                // IPC_SET: a value above 0777 cannot be a mode (the native ABI
+                // passes the mode itself), so it is a pointer to the
+                // sysv_policy.readSetRequest buffer {mode|EXT, uid, gid}.
+                sem_mod.semctlSetFromUser(@truncate(frame.rdi), frame.r10)
+            else
+                sem_mod.semctl(@truncate(frame.rdi), semnum, cmd, arg));
         },
         67 => { // shmdt(shmaddr)
             const shm_mod = @import("../../ipc/sysv_shm.zig");

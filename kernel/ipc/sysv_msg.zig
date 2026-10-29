@@ -344,15 +344,15 @@ pub fn msgctl(msqid: u32, cmd: i32, buf: u64) i64 {
     if (buf == 0 or buf >= 0x0000_8000_0000_0000) return EFAULT;
     const copy = @import("../mm/copy_from_user.zig");
     if (cmd == IPC_SET) {
-        if (!copy.validateUserBuffer(buf, @sizeOf(u64))) return EFAULT;
-        var mode_buf: u64 = 0;
-        if (copy.copyFromUser(@as([*]u8, @ptrCast(&mode_buf))[0..@sizeOf(u64)], @ptrFromInt(buf), @sizeOf(u64)) != @sizeOf(u64)) return EFAULT;
+        const req = sysv_policy.readSetRequest(buf) orelse return EFAULT;
         const flags = msg_lock.acquire();
         defer msg_lock.release(flags);
         const q = findById(msqid) orelse return EINVAL;
         if (q.marked_removed) return EIDRM;
-        if (!canManage(q)) return errno.EPERM;
-        q.mode = @intCast(mode_buf & 0o777);
+        const r = sysv_policy.applySet(owner(q), credentials(), req) orelse return errno.EPERM;
+        q.uid = r.owner.uid;
+        q.gid = r.owner.gid;
+        q.mode = @intCast(r.mode);
         return 0;
     }
 

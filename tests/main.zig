@@ -6517,3 +6517,36 @@ test "ext2: every path-to-inode resolution used by syscalls checks search permis
     const t76_end = std.mem.indexOfPos(u8, se, t76, "},").?;
     try std.testing.expect(std.mem.indexOf(u8, se[t76..t76_end], "syscallTruncate(") != null);
 }
+
+test "SysV IPC_SET: owner may hand an object to another uid/gid; the creator ids never change" {
+    const owner: sysv_policy.Owner = .{ .uid = 1000, .gid = 1000, .cuid = 1000, .cgid = 1000 };
+    const K = sysv_policy.IPC_SET_KEEP;
+    // owner transfers ownership and changes the mode
+    const r = sysv_policy.applySet(owner, .{ .euid = 1000, .egid = 1000 }, .{ .mode = 0o640, .uid = 2000, .gid = 60 }).?;
+    try std.testing.expectEqual(@as(u32, 2000), r.owner.uid);
+    try std.testing.expectEqual(@as(u32, 60), r.owner.gid);
+    try std.testing.expectEqual(@as(u32, 1000), r.owner.cuid);
+    try std.testing.expectEqual(@as(u32, 0o640), r.mode);
+    // KEEP leaves a field alone; mode bits above 0777 are ignored
+    const k = sysv_policy.applySet(owner, .{ .euid = 1000, .egid = 1000 }, .{ .mode = 0o7644, .uid = K, .gid = K }).?;
+    try std.testing.expectEqual(@as(u32, 1000), k.owner.uid);
+    try std.testing.expectEqual(@as(u32, 0o644), k.mode);
+    // the creator keeps management rights after giving the object away
+    const after: sysv_policy.Owner = r.owner;
+    try std.testing.expect(sysv_policy.applySet(after, .{ .euid = 1000, .egid = 1000 }, .{ .mode = 0o600, .uid = K, .gid = K }) != null);
+    // a stranger may not
+    try std.testing.expect(sysv_policy.applySet(owner, .{ .euid = 4242, .egid = 4242 }, .{ .mode = 0o600, .uid = 4242, .gid = K }) == null);
+    // CAP_SYS_ADMIN may
+    try std.testing.expect(sysv_policy.applySet(owner, .{ .euid = 4242, .egid = 4242, .cap_sys_admin = true }, .{ .mode = 0o600, .uid = 4242, .gid = K }) != null);
+    // buffer decoding: the one-word form only sets the mode
+    try std.testing.expect(!sysv_policy.isExtendedSet(0o600));
+    const old = sysv_policy.decodeSet(0o600, null);
+    try std.testing.expectEqual(K, old.uid);
+    try std.testing.expectEqual(@as(u32, 0o600), old.mode);
+    const ext_first = 0o640 | sysv_policy.IPC_SET_EXTENDED;
+    try std.testing.expect(sysv_policy.isExtendedSet(ext_first));
+    const ext = sysv_policy.decodeSet(ext_first, .{ 2000, 60 });
+    try std.testing.expectEqual(@as(u32, 0o640), ext.mode);
+    try std.testing.expectEqual(@as(u32, 2000), ext.uid);
+    try std.testing.expectEqual(@as(u32, 60), ext.gid);
+}

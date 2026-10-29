@@ -511,10 +511,9 @@ pub fn shmctl(shmid: u32, cmd: i32, buf: u64) i64 {
     const copy = @import("../mm/copy_from_user.zig");
     if (cmd == IPC_STAT and (buf == 0 or buf >= 0x0000_8000_0000_0000)) return -14;
     if (cmd == IPC_STAT and !copy.validateUserBufferWritable(buf, @sizeOf([6]u64))) return -14;
-    var mode_buf: [1]u64 = .{0};
+    var set_req: sysv_policy.SetRequest = .{ .mode = 0 };
     if (cmd == IPC_SET) {
-        if (buf == 0 or buf >= 0x0000_8000_0000_0000) return -14;
-        if (copy.copyFromUser(@ptrCast(&mode_buf), @as([*]const u8, @ptrFromInt(buf)), @sizeOf(u64)) != @sizeOf(u64)) return -14;
+        set_req = sysv_policy.readSetRequest(buf) orelse return -14;
     }
     const flags = shm_lock.acquire();
 
@@ -579,12 +578,19 @@ pub fn shmctl(shmid: u32, cmd: i32, buf: u64) i64 {
             return 0;
         },
         IPC_SET => {
-            if (!can_manage) {
+            const task = cur orelse {
                 shm_lock.release(flags);
                 return -1; // -EPERM
-            }
-            // Update permission mode bits from buf (simplified: accept mode as u64)
-            seg.perm.mode = @intCast(mode_buf[0] & 0o777);
+            };
+            const seg_owner: sysv_policy.Owner = .{ .uid = seg.perm.uid, .gid = seg.perm.gid, .cuid = seg.perm.cuid, .cgid = seg.perm.cgid };
+            const caller: sysv_policy.Credentials = .{ .euid = task.euid, .egid = task.egid, .cap_sys_admin = task.effective_caps.cap_sys_admin, .groups = task.groups[0..task.ngroups] };
+            const r = sysv_policy.applySet(seg_owner, caller, set_req) orelse {
+                shm_lock.release(flags);
+                return -1; // -EPERM
+            };
+            seg.perm.uid = r.owner.uid;
+            seg.perm.gid = r.owner.gid;
+            seg.perm.mode = @intCast(r.mode);
             shm_lock.release(flags);
             return 0;
         },

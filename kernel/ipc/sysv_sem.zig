@@ -245,6 +245,20 @@ pub fn semop(semid: u32, sem_num: u32, op: i16) i64 {
     }
 }
 
+/// semctl(IPC_SET) with a user buffer pointer instead of a mode value
+/// (sysv_policy.readSetRequest format): sets owner uid/gid and mode.
+pub fn semctlSetFromUser(semid: u32, buf: u64) i64 {
+    const req = sysv_policy.readSetRequest(buf) orelse return errno.EFAULT;
+    const flags = sem_lock.acquire();
+    defer sem_lock.release(flags);
+    const s = findSemSet(semid) orelse return errno.EINVAL;
+    const r = sysv_policy.applySet(owner(s), credentials(), req) orelse return errno.EPERM;
+    s.uid = r.owner.uid;
+    s.gid = r.owner.gid;
+    s.mode = @intCast(r.mode);
+    return 0;
+}
+
 /// semctl(semid, semnum, cmd, arg) -> value or -errno
 pub fn semctl(semid: u32, semnum: i32, cmd: i32, arg: i32) i64 {
     const flags = sem_lock.acquire();
@@ -276,9 +290,8 @@ pub fn semctl(semid: u32, semnum: i32, cmd: i32, arg: i32) i64 {
             return @intCast(s.nsems);
         },
         IPC_SET => {
-            if (!canManage(s)) return errno.EPERM;
-            // Update permission mode bits from arg (lower 9 bits: rwxrwxrwx)
-            s.mode = @intCast(arg & 0o777);
+            const r = sysv_policy.applySet(owner(s), credentials(), .{ .mode = @intCast(arg & 0o777) }) orelse return errno.EPERM;
+            s.mode = @intCast(r.mode);
             return 0;
         },
         SETVAL => {
