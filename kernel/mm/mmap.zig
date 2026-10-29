@@ -1261,6 +1261,14 @@ pub fn madviseDontneed(addr: u64, length: u64) i64 {
             const r = &cur.mmap_regions[i];
             if (va >= r.base and va < r.base + r.num_pages * page) {
                 if (r.no_free) return -22;
+                // mseal: discarding a sealed read-only private anonymous
+                // page would change contents the caller cannot change.
+                if (@import("mseal_policy.zig").discardBlocked(
+                    mm_mod.Mm.sealed(cur.mm, va, page),
+                    r.file_kind == 0 and !r.shared,
+                    // Anonymous regions do not track prot; the PTE does.
+                    if (r.file_kind == 0) ((paging_mod.getPageEntryRaw(cur.page_table_phys, va) orelse 0) & 0x2) != 0 else (r.prot & 0x2) != 0,
+                )) return -1; // EPERM
                 covered = true;
                 break;
             }

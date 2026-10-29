@@ -1918,7 +1918,7 @@ const SysCap = packed struct {
   permitted 和 effective 都清空。
 - mseal(2)（#462，`mm/mseal.zig`、纯规则 `mm/mseal_policy.zig`）：封印记录在地址空间对象 `Mm.seals`（最多 32 段，CLONE_VM 兄弟共享，
   fork 复制给子进程，exec 新建地址空间时清空）。被封印范围内 munmap、mprotect、mremap（源或 MREMAP_FIXED 目标）及 MAP_FIXED 覆盖
-  一律 EPERM（与封印部分重叠的请求整体拒绝），读写不受影响。参数：flags 非 0 或地址未对齐为 EINVAL，len=0 为空操作，
+  一律 EPERM（与封印部分重叠的请求整体拒绝），读写不受影响；MADV_DONTNEED 对封印的私有匿名只读页 EPERM，可写页照常丢弃。参数：flags 非 0 或地址未对齐为 EINVAL，len=0 为空操作，
   范围中有未映射页或封印表满为 ENOMEM。hello120 回归门。
 - memfd_create(2)（`fs/memfd_policy.zig`、`tmpfs.tmpfsCreateAnonymous`）：无目录项、出生即 unlinked 的 tmpfs 普通文件，最后一次 close
   释放；flags 只接受 MFD_CLOEXEC/MFD_ALLOW_SEALING；名字 ≤ 249 字节。fcntl F_ADD_SEALS/F_GET_SEALS：SEAL/SHRINK/GROW/WRITE

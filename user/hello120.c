@@ -55,6 +55,8 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define EINVAL_       22
 #define ENOMEM_       12
 #define PAGE          4096
+#define SYS_MADVISE   28
+#define MADV_DONTNEED 4
 
 static void print(const char *s) {
     uint64_t n = 0;
@@ -100,6 +102,24 @@ void _start(void) {
     /* C */
     check(syscall3(SYS_MPROTECT, a + 3 * PAGE, PAGE, PROT_R) == 0 && p[3 * PAGE] == 'N', "C: an unsealed neighbour can still be re-protected");
     check(syscall2(SYS_MUNMAP, a + 2 * PAGE, PAGE) == 0, "C: an unsealed neighbour can still be unmapped");
+
+    /* E: destructive madvise — writable sealed pages may be discarded, read-only ones not */
+    {
+        int64_t r = syscall6(SYS_MMAP, 0, 2 * PAGE, PROT_RW, MAP_PRIV_ANON, (uint64_t)-1, 0);
+        if (r > 0) {
+            volatile char *q = (volatile char *)r;
+            q[0] = 'W';
+            q[PAGE] = 'R';
+            check(syscall3(SYS_MPROTECT, (uint64_t)r + PAGE, PAGE, PROT_R) == 0 &&
+                  syscall3(SYS_MSEAL, (uint64_t)r, 2 * PAGE, 0) == 0, "E: seal a writable page and a read-only page");
+            check(syscall3(SYS_MADVISE, (uint64_t)r + PAGE, PAGE, MADV_DONTNEED) == -EPERM_ && q[PAGE] == 'R',
+                  "E: MADV_DONTNEED on a sealed read-only anonymous page is EPERM");
+            check(syscall3(SYS_MADVISE, (uint64_t)r, PAGE, MADV_DONTNEED) == 0 && q[0] == 0,
+                  "E: MADV_DONTNEED on a sealed writable page is allowed");
+        } else {
+            check(0, "E: mmap");
+        }
+    }
 
     /* D */
     {

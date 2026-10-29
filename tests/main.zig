@@ -6845,3 +6845,11 @@ test "mseal: argument rules, overlap detection and the bounded seal table" {
     while (n < sp.MAX_SEALS) : (n += 1) _ = t.add(0x100000 + n * 0x10000, 0x1000);
     try std.testing.expect(!t.add(0x9000_0000, 0x1000)); // table full: ENOMEM at the caller
 }
+
+test "mseal: destructive madvise is refused only on sealed, private, anonymous, read-only pages" {
+    const sp = kt.mseal_policy;
+    try std.testing.expect(sp.discardBlocked(true, true, false)); // sealed anon read-only
+    try std.testing.expect(!sp.discardBlocked(true, true, true)); // writable: caller could zero it anyway
+    try std.testing.expect(!sp.discardBlocked(true, false, false)); // file-backed: re-read from the file
+    try std.testing.expect(!sp.discardBlocked(false, true, false)); // not sealed
+}

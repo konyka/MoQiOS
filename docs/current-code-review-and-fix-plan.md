@@ -5191,5 +5191,5 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 测试（参数规则、重叠判定、表满）先编译失败后通过；源码路由测试改为要求 `mseal.zig.sysMseal`。hello120（16 项）在旧内核上
   12 项 FAIL（真实 RED），新内核全部通过。变异：去掉 munmap 的封印检查 → 2 项 FAIL。
 - 验证：host 全部通过；三架构构建通过；冒烟 SMP=1/2/4 PASS。
-- 限制：封印表固定 32 段，满了返回 ENOMEM；不支持 madvise 破坏性建议的封印检查（本系统的 MADV_DONTNEED 会丢弃匿名页内容，Linux 对
-  只读私有匿名封印页拒绝该操作——此处未实现）。
+- 限制：封印表固定 32 段，满了返回 ENOMEM；MADV_DONTNEED 的封印检查已补上：被封印的私有匿名只读页返回 EPERM（`mseal_policy.discardBlocked`，可写性取自 PTE，
+  因为匿名区域不记录 prot），可写页仍可丢弃（与 Linux 一致）；hello120 新增 E 段 3 项，host 新增 1 个测试先 RED 后 GREEN。

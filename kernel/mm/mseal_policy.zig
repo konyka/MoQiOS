@@ -48,3 +48,10 @@ pub const Table = struct {
         return true;
     }
 };
+
+/// MADV_DONTNEED / MADV_FREE on a sealed page: Linux refuses (EPERM) when
+/// the page is private anonymous and not writable, since discarding it
+/// would change contents the caller could not otherwise change.
+pub fn discardBlocked(sealed: bool, anonymous: bool, writable: bool) bool {
+    return sealed and anonymous and !writable;
+}
