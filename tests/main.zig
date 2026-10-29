@@ -6853,3 +6853,14 @@ test "mseal: destructive madvise is refused only on sealed, private, anonymous, 
     try std.testing.expect(!sp.discardBlocked(true, false, false)); // file-backed: re-read from the file
     try std.testing.expect(!sp.discardBlocked(false, true, false)); // not sealed
 }
+
+test "at-path join with a stored directory path: absolute names and AT_FDCWD pass through, relative names join" {
+    const ap = kt.at_join_policy;
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("/abs", ap.joinStored("/a/b", "/abs", &buf).?);
+    try std.testing.expectEqualStrings("/a/b/x", ap.joinStored("/a/b", "x", &buf).?);
+    try std.testing.expectEqualStrings("/a/b/x", ap.joinStored("/a/b/", "x", &buf).?);
+    try std.testing.expectEqualStrings("testdir/x", ap.joinStored("testdir", "x", &buf).?);
+    var long: [300]u8 = @splat('a');
+    try std.testing.expect(ap.joinStored("/d", long[0..260], &buf) == null);
+}

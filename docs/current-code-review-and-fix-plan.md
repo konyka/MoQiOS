@@ -4705,8 +4705,9 @@ blockTask；修复前复现器 3/3 轮首迭代即冻结，修复后 4/4 轮（2
   - TDD 与证据：hello119 在旧内核上 24 项 FAIL；host 测试 3 个（rename_policy）+ 启动档案测试扩充。**如实**：`rename_policy.zig`
     是在 host 测试之前写好的（当时门禁在跑，不能改已接入的源码），所以 host 测试没有经历“编译失败”这一步；运行时 RED 是真实的。
     变异：去掉 tmpfs rename 的 sticky 检查 → E 段 2 项 FAIL（第一次变异写法让函数参数未使用、编译失败，冒烟跑的是旧 ELF，结果作废后重做）。
-  - 没做的：ext2 上的 NOREPLACE/EXCHANGE（NOREPLACE 已在第五十五轮补上）；目录 rename 在 ext2 上仍被拒绝（已补上，见下方“ext2 目录 rename”）；renameat2 的 dirfd 对平面文件系统仍不参与解析
-    （卷目录描述符由 rofsGuard 返回 EROFS）。
+  - 没做的：ext2 上的 NOREPLACE/EXCHANGE（均已补上：NOREPLACE 第五十五轮，EXCHANGE 见下方“ext2 目录 rename”）；目录 rename 在 ext2 上仍被拒绝（已补上，见下方“ext2 目录 rename”）；renameat2 的 dirfd 对平面文件系统仍不参与解析
+    （卷目录描述符由 rofsGuard 返回 EROFS）——已补上：ext2 目录描述符按其保存的路径拼接相对名（`fs/at_join_policy.zig`），
+    无效描述符 EBADF、非目录类描述符 ENOTDIR；hello119 H 段 3 项旧内核全 FAIL、新内核 PASS。
   - 验证：host 719/719（新增 3 个）；riscv64/aarch64 构建通过；冒烟 MBR SMP=1/2/8、GPT SMP=2/8 五组 0 FAIL、hello119 PASS；
     stress 5/5（门禁期间负载峰值 5.88）。门禁前单次 SMP=1 冒烟里 hello108 又失败一次（baseline 6160 µs、reaping 7593 µs，
     当时负载 14），记入上面的 hello108 调查项。

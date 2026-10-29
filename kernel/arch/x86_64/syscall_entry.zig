@@ -1384,7 +1384,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         261 => { // renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
             // dirfds: a volume dirfd was answered by rofsGuard (EROFS); the
             // flat filesystems resolve names without a directory fd.
-            frame.rax = @bitCast(syscallRenameFlags(frame.rsi, frame.r10, @truncate(frame.r8)));
+            frame.rax = @bitCast(syscallRenameAt(dirfdArg(frame.rdi), frame.rsi, dirfdArg(frame.rdx), frame.r10, @truncate(frame.r8)));
         },
         // ── v34.0: Syscall 补全第四轮 ─────────────────────────────────────
         262 => { // vfork() — delegate to fork (COW semantics via full copy)
@@ -3768,14 +3768,41 @@ fn truncateDesc(desc: *vfs_mod.FileDescriptor, length: u64) i64 {
 
 /// rename(oldpath, newpath) — rename a file.
 fn syscallRename(old_ptr: u64, new_ptr: u64) i64 {
-    return syscallRenameFlags(old_ptr, new_ptr, 0);
+    return syscallRenameAt(-100, old_ptr, -100, new_ptr, 0);
 }
 
 /// rename/renameat2. /tmp↔/tmp goes to tmpfs (all three modes); a rename
 /// between /tmp and anything else is EXDEV; other paths go to ext2, which
 /// implements plain and NOREPLACE renames; EXCHANGE there is EINVAL
 /// (Linux's answer for a filesystem without that flag).
-fn syscallRenameFlags(old_ptr: u64, new_ptr: u64, flags: u32) i64 {
+/// A relative *at() name under an ext2 directory descriptor becomes the
+/// directory's stored path joined with the name. AT_FDCWD, absolute names
+/// and volume (rofs) descriptors keep the name: rofsGuard already answered
+/// a volume dirfd. Other descriptors: EBADF / ENOTDIR.
+fn renameAtName(dirfd: i64, name: []const u8, buf: *[256]u8) union(enum) { ok: []const u8, err: i64 } {
+    if (dirfd == -100 or name.len == 0 or name[0] == '/') return .{ .ok = name };
+    if (dirfd < 0) return .{ .err = -9 };
+    const vfs_m = @import("../../fs/vfs.zig");
+    const cur = @import("../../proc/sched.zig").currentTask() orelse return .{ .err = -9 };
+    if (dirfd >= vfs_m.MAX_FDS) return .{ .err = -9 };
+    const d = &cur.fd_table.fds[@intCast(dirfd)];
+    switch (d.fd_type) {
+        .rofs_file => return .{ .ok = name },
+        .ext2_file => {
+            const dir = @import("../../fs/ext2.zig").getOpenFilePath(d.ext2_file_idx) orelse return .{ .err = -9 };
+            const joined = @import("../../fs/at_join_policy.zig").joinStored(dir, name, buf) orelse return .{ .err = -36 };
+            return .{ .ok = joined };
+        },
+        .none => return .{ .err = -9 },
+        else => return .{ .err = -20 }, // ENOTDIR
+    }
+}
+
+fn syscallRenameAt(old_dirfd: i64, old_ptr: u64, new_dirfd: i64, new_ptr: u64, flags: u32) i64 {
+    return syscallRenameFlagsAt(old_dirfd, old_ptr, new_dirfd, new_ptr, flags);
+}
+
+fn syscallRenameFlagsAt(old_dirfd: i64, old_ptr: u64, new_dirfd: i64, new_ptr: u64, flags: u32) i64 {
     const rename_policy = @import("../../fs/rename_policy.zig");
     const mode = switch (rename_policy.mode(flags)) {
         .ok => |m| m,
@@ -3795,8 +3822,16 @@ fn syscallRenameFlags(old_ptr: u64, new_ptr: u64, flags: u32) i64 {
     while (old_len < 256 and old_buf[old_len] != 0) : (old_len += 1) {}
     var new_len: usize = 0;
     while (new_len < 256 and new_buf[new_len] != 0) : (new_len += 1) {}
-    const old_path = old_buf[0..old_len];
-    const new_path = new_buf[0..new_len];
+    var old_join: [256]u8 = undefined;
+    var new_join: [256]u8 = undefined;
+    const old_path = switch (renameAtName(old_dirfd, old_buf[0..old_len], &old_join)) {
+        .ok => |p| p,
+        .err => |e| return e,
+    };
+    const new_path = switch (renameAtName(new_dirfd, new_buf[0..new_len], &new_join)) {
+        .ok => |p| p,
+        .err => |e| return e,
+    };
     switch (rename_policy.route(old_path, new_path)) {
         .cross => return -18, // EXDEV
         .tmpfs => {

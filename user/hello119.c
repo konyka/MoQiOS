@@ -232,6 +232,23 @@ void _start(void) {
         check(0, "G: create ext2 directory fixtures");
     }
 
+    /* H: renameat2 relative to an ext2 directory descriptor */
+    {
+        int64_t dfd = syscall2(SYS_OPEN, (uint64_t)"testdir", 0);
+        if (dfd >= 0 && mkfile("testdir/h119-ha", "5") == 0) {
+            check(syscall5(SYS_RENAMEAT2, (uint64_t)dfd, (uint64_t)"h119-ha", (uint64_t)dfd, (uint64_t)"h119-hb", 0) == 0 &&
+                  first("testdir/h119-hb") == '5' && first("testdir/h119-ha") == -1, "H: renameat2 resolves both names under a directory fd");
+            check(syscall5(SYS_RENAMEAT2, (uint64_t)dfd, (uint64_t)"h119-hb", AT_FDCWD, (uint64_t)"testdir/h119-hc", 0) == 0 &&
+                  first("testdir/h119-hc") == '5', "H: a directory fd on one side and AT_FDCWD on the other");
+            check(syscall5(SYS_RENAMEAT2, 999, (uint64_t)"h119-hc", AT_FDCWD, (uint64_t)"testdir/h119-hd", 0) == -9 &&
+                  first("testdir/h119-hc") == '5', "H: a bad directory fd is EBADF and nothing moves");
+            syscall1(SYS_UNLINK, (uint64_t)"testdir/h119-hc");
+        } else {
+            check(0, "H: open testdir as a directory fd");
+        }
+        if (dfd >= 0) syscall1(SYS_CLOSE, (uint64_t)dfd);
+    }
+
     /* cleanup */
     syscall1(SYS_UNLINK, (uint64_t)"/tmp/h119-root");
     syscall1(SYS_UNLINK, (uint64_t)"/tmp/h119-y");
