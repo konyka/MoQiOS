@@ -5172,9 +5172,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 此前 `renameFileMode` 遇到目录一律返回 -1（系统调用层再变成 EXDEV）。现由 `renameDirUnlocked` 处理：
   同父目录改名只改条目；跨父目录时改写目录自己的 `..` 指向新父目录，并把一个链接从旧父目录移到新父目录
   （`rename_policy.dirMoveLinkDelta`）。目标父目录沿 `..` 回溯到根，经过被移动目录即 EINVAL
-  （`rename_policy.dirMoveCreatesCycle`，回溯超过 64 层返回 ELOOP）。目标名已存在一律 EEXIST（未实现以目录覆盖空目录）。
+  （`rename_policy.dirMoveCreatesCycle`，回溯超过 64 层返回 ELOOP）。目标名已存在时：NOREPLACE 为 EEXIST，目标是文件为 ENOTDIR，非空目录为 ENOTEMPTY，空目录则原位替换并释放
+  （链接计数按 `rename_policy.dirReplaceLinkDelta`：旧父目录少一个链接，新父目录净不变）。
 - 系统调用层不再把 EINVAL/ELOOP/EIO 改写成 EXDEV。
 - TDD：host 2 个新测试先编译失败（RED）后通过；hello119 新增 G 段 5 项（同父改名、跨父移动内容跟随、移入自身子树 EINVAL、
   目标存在被拒、移动后的树能完整删除——验证链接计数一致）。变异：去掉回环检查 → G 段 3 项 FAIL。
 - 验证：host 全部通过；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/4 PASS、hello119 PASS（6 个 EXCEPTION 与基线一致，均为故意触发的故障测试）。
-- 没做的：以目录覆盖已存在的空目录；ext2 RENAME_EXCHANGE。
+- 补充：以目录覆盖空目录已实现（hello119 G 段扩为 9 项，host 新增 1 个测试先 RED 后 GREEN；冒烟 SMP=1/2/4 PASS）。
+- 没做的：ext2 RENAME_EXCHANGE。

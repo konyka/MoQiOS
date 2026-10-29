@@ -2897,7 +2897,7 @@ pub fn renameFileMode(old_path: []const u8, new_path: []const u8, who: ?Who, nor
     var file_inode: Ext2Inode = undefined;
     if (!readInode(file_inode_num, &file_inode)) return -1;
     if (eu.isDirectory(file_inode.mode)) {
-        return renameDirUnlocked(old_parent_inode, old_filename, new_parent_inode, new_filename, file_inode_num);
+        return renameDirUnlocked(old_parent_inode, old_filename, new_parent_inode, new_filename, file_inode_num, noreplace);
     }
     const file_type: u8 = 1;
 
@@ -2959,19 +2959,59 @@ pub fn renameFileMode(old_path: []const u8, new_path: []const u8, who: ?Who, nor
 }
 
 
-/// Directory rename (fs_lock held). The destination name must not exist —
-/// replacing an existing empty directory is refused (EEXIST) to keep the
-/// one-block directory bookkeeping simple. The destination parent may not
+/// Empty check: the directory's single data block may contain only "."
+/// and "..". A directory with more blocks is not empty by definition.
+fn dirIsEmpty(dir_inode: *const Ext2Inode) bool {
+    if (dir_inode.block[0] == 0) return false;
+    if (dir_inode.block[1] != 0 or dir_inode.block[12] != 0) return false;
+    const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
+    if (!readBlockUncached(resolveBlock(dir_inode, 0), buf)) return false;
+    var pos: usize = 0;
+    while (pos + 8 <= block_size) {
+        const rec_len = @as(u16, buf[pos + 4]) | (@as(u16, buf[pos + 5]) << 8);
+        if (rec_len < 8) return false;
+        const name_len = buf[pos + 6];
+        if (pos + rec_len > block_size) return false;
+        if (name_len != 0) {
+            const is_dot = name_len == 1 and buf[pos + 8] == '.';
+            const is_dotdot = name_len == 2 and buf[pos + 8] == '.' and buf[pos + 9] == '.';
+            if (!is_dot and !is_dotdot) return false;
+        }
+        pos += rec_len;
+    }
+    return true;
+}
+
+/// Directory rename (fs_lock held). An existing destination must be an
+/// empty directory (ENOTDIR / ENOTEMPTY otherwise, EEXIST under NOREPLACE);
+/// it is replaced in place and freed. The destination parent may not
 /// be the moved directory or one of its descendants (EINVAL). On a
 /// cross-parent move the directory's ".." is rewritten and one link moves
 /// from the old parent to the new one.
-fn renameDirUnlocked(old_parent: u32, old_name: []const u8, new_parent: u32, new_name: []const u8, dir_ino: u32) i64 {
+fn adjustLinks(ino: u32, delta: i32) void {
+    if (delta == 0) return;
+    var d: Ext2Inode = undefined;
+    if (!readInode(ino, &d)) return;
+    if (delta > 0) d.links_count +|= @intCast(delta) else if (d.links_count > 1) d.links_count -= 1;
+    _ = writeInode(ino, &d);
+}
+
+fn renameDirUnlocked(old_parent: u32, old_name: []const u8, new_parent: u32, new_name: []const u8, dir_ino: u32, noreplace: bool) i64 {
     const rp = @import("rename_policy.zig");
     if (old_parent == new_parent and eqlStr(old_name, new_name)) return 0;
 
     var new_parent_data: Ext2Inode = undefined;
     if (!readInode(new_parent, &new_parent_data)) return -1;
-    if (findDirEntryCached(new_parent, &new_parent_data, new_name) != null) return -17; // EEXIST
+    var victim: ?u32 = null;
+    if (findDirEntryCached(new_parent, &new_parent_data, new_name)) |v| {
+        if (noreplace) return -17; // EEXIST
+        var vd: Ext2Inode = undefined;
+        if (!readInode(v, &vd)) return -1;
+        if (!eu.isDirectory(vd.mode)) return -20; // ENOTDIR
+        if (v == dir_ino) return 0;
+        if (!dirIsEmpty(&vd)) return -39; // ENOTEMPTY
+        victim = v;
+    }
 
     // Ancestor chain of the destination parent via "..", nearest first.
     var chain: [64]u32 = undefined;
@@ -2990,23 +3030,36 @@ fn renameDirUnlocked(old_parent: u32, old_name: []const u8, new_parent: u32, new
     if (n == chain.len and chain[n - 1] != 2) return -40; // ELOOP: chain too deep to verify
     if (rp.dirMoveCreatesCycle(dir_ino, chain[0..n])) return -22; // EINVAL
 
-    if (!addDirEntry(new_parent, dir_ino, new_name, 2)) return -1;
-    if (!removeDirEntry(old_parent, old_name)) {
-        _ = removeDirEntry(new_parent, new_name);
-        return -1;
+    if (victim) |v| {
+        if (!retargetDirEntry(new_parent, new_name, dir_ino)) return -1;
+        if (!removeDirEntry(old_parent, old_name)) {
+            _ = retargetDirEntry(new_parent, new_name, v);
+            return -1;
+        }
+    } else {
+        if (!addDirEntry(new_parent, dir_ino, new_name, 2)) return -1;
+        if (!removeDirEntry(old_parent, old_name)) {
+            _ = removeDirEntry(new_parent, new_name);
+            return -1;
+        }
     }
 
-    const delta = rp.dirMoveLinkDelta(old_parent, new_parent);
-    if (delta.new_parent != 0) {
+    if (old_parent != new_parent) {
         if (!retargetDirEntry(dir_ino, "..", new_parent)) return -5; // EIO
-        if (readInode(new_parent, &new_parent_data)) {
-            new_parent_data.links_count +|= 1;
-            _ = writeInode(new_parent, &new_parent_data);
-        }
-        var old_parent_data: Ext2Inode = undefined;
-        if (readInode(old_parent, &old_parent_data) and old_parent_data.links_count > 1) {
-            old_parent_data.links_count -= 1;
-            _ = writeInode(old_parent, &old_parent_data);
+    }
+    const delta = if (victim != null) rp.dirReplaceLinkDelta(old_parent, new_parent) else rp.dirMoveLinkDelta(old_parent, new_parent);
+    adjustLinks(new_parent, delta.new_parent);
+    adjustLinks(old_parent, delta.old_parent);
+
+    if (victim) |v| {
+        var vd: Ext2Inode = undefined;
+        if (readInode(v, &vd)) {
+            @import("page_cache.zig").invalidateInode(0x3000_0000_0000_0000 + @as(u64, v));
+            dcache.invalidateParent(.ext2, v);
+            freeBlock(vd.block[0]);
+            freeInodeAs(v, true);
+            writeGroupDescs();
+            writeSuperblock();
         }
     }
     serial.writeString("[ext2] renamed dir to: ");
@@ -3036,26 +3089,7 @@ pub fn rmdirFile(path: []const u8, who: ?Who) i64 {
     if (!readInode(dir_inode_num, &dir_inode)) return -1;
     if (!eu.isDirectory(dir_inode.mode)) return -1; // ENOTDIR
 
-    // Empty check: the directory's single data block may contain only "."
-    // and "..". A directory with indirect blocks is not empty by definition.
-    if (dir_inode.block[0] == 0) return -1;
-    if (dir_inode.block[1] != 0 or dir_inode.block[12] != 0) return -1;
-
-    const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
-    if (!readBlockUncached(resolveBlock(&dir_inode, 0), buf)) return -1;
-    var pos: usize = 0;
-    while (pos + 8 <= block_size) {
-        const rec_len = @as(u16, buf[pos + 4]) | (@as(u16, buf[pos + 5]) << 8);
-        if (rec_len < 8) return -1;
-        const name_len = buf[pos + 6];
-        if (pos + rec_len > block_size) return -1;
-        if (name_len != 0) {
-            const is_dot = name_len == 1 and buf[pos + 8] == '.';
-            const is_dotdot = name_len == 2 and buf[pos + 8] == '.' and buf[pos + 9] == '.';
-            if (!is_dot and !is_dotdot) return -1; // ENOTEMPTY
-        }
-        pos += rec_len;
-    }
+    if (!dirIsEmpty(&dir_inode)) return -1; // ENOTEMPTY (or unreadable)
 
     // v53.51-style bookkeeping around the frees (flush superblock/group
     // descriptors at batch end, coalesced discards).

@@ -208,7 +208,13 @@ void _start(void) {
               "G: ext2 directory moves into another directory with its contents");
         check(ren("testdir/h119-gb", "testdir/h119-gb/sub/loop") == -EINVAL_, "G: moving a directory into its own subtree is EINVAL");
         check(syscall2(SYS_MKDIR, (uint64_t)"testdir/h119-gd", 0755) == 0 &&
-              ren("testdir/h119-gb/sub", "testdir/h119-gd") == -EEXIST_, "G: directory onto an existing name is refused");
+              ren2("testdir/h119-gb/sub", "testdir/h119-gd", RENAME_NOREPLACE) == -EEXIST_, "G: NOREPLACE onto an existing directory is EEXIST");
+        check(ren("testdir/h119-gd", "testdir/h119-gb") == -ENOTEMPTY_, "G: directory onto a non-empty directory is ENOTEMPTY");
+        check(mkfile("testdir/h119-gf", "x") == 0 && ren("testdir/h119-gd", "testdir/h119-gf") == -ENOTDIR_, "G: directory onto a file is ENOTDIR");
+        syscall1(SYS_UNLINK, (uint64_t)"testdir/h119-gf");
+        check(ren("testdir/h119-gb/sub", "testdir/h119-gd") == 0 && first("testdir/h119-gd/f") == '7' && first("testdir/h119-gb/sub/f") == -1,
+              "G: directory replaces an existing empty directory (cross-parent)");
+        check(ren("testdir/h119-gd", "testdir/h119-gb/sub") == 0 && first("testdir/h119-gb/sub/f") == '7', "G: and moves back");
         check(syscall1(SYS_UNLINK, (uint64_t)"testdir/h119-gb/sub/f") == 0 && syscall1(SYS_RMDIR, (uint64_t)"testdir/h119-gb/sub") == 0 &&
               syscall1(SYS_RMDIR, (uint64_t)"testdir/h119-gb") == 0, "G: the moved tree removes cleanly (links consistent)");
         syscall1(SYS_RMDIR, (uint64_t)"testdir/h119-gd");

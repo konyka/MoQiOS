@@ -6799,3 +6799,13 @@ test "directory rename cycle check: the destination parent chain may not pass th
     try std.testing.expect(!rp.dirMoveCreatesCycle(12, &.{ 13, 2 })); // into a sibling
     try std.testing.expect(!rp.dirMoveCreatesCycle(12, &.{2})); // into root
 }
+
+test "directory rename over an empty directory: the victim's link goes, so the old parent loses one and the new parent nets zero" {
+    const rp = kt.rename_policy;
+    const same = rp.dirReplaceLinkDelta(5, 5);
+    try std.testing.expectEqual(@as(i32, -1), same.old_parent);
+    try std.testing.expectEqual(@as(i32, 0), same.new_parent);
+    const cross = rp.dirReplaceLinkDelta(5, 9);
+    try std.testing.expectEqual(@as(i32, -1), cross.old_parent);
+    try std.testing.expectEqual(@as(i32, 0), cross.new_parent);
+}

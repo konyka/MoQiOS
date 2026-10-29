@@ -61,7 +61,9 @@ pub fn checkTarget(m: Mode, src_is_dir: bool, target: Target) i64 {
 /// links_count changes when a directory moves from `old_parent` to
 /// `new_parent`: its ".." stops counting as a link to the old parent and
 /// starts counting toward the new one. Same parent: nothing changes.
-pub fn dirMoveLinkDelta(old_parent: u32, new_parent: u32) struct { old_parent: i32, new_parent: i32 } {
+pub const LinkDelta = struct { old_parent: i32, new_parent: i32 };
+
+pub fn dirMoveLinkDelta(old_parent: u32, new_parent: u32) LinkDelta {
     if (old_parent == new_parent) return .{ .old_parent = 0, .new_parent = 0 };
     return .{ .old_parent = -1, .new_parent = 1 };
 }
@@ -72,4 +74,15 @@ pub fn dirMoveLinkDelta(old_parent: u32, new_parent: u32) struct { old_parent: i
 pub fn dirMoveCreatesCycle(moved: u32, dest_chain: []const u32) bool {
     for (dest_chain) |ino| if (ino == moved) return true;
     return false;
+}
+
+/// links_count changes when a directory replaces an existing empty
+/// directory in `new_parent`: the victim's ".." link on the new parent goes
+/// away while the moved directory's ".." takes its place, and the old
+/// parent loses the moved directory's link. Applied to one inode when the
+/// parents are the same (sum: -1).
+pub fn dirReplaceLinkDelta(old_parent: u32, new_parent: u32) LinkDelta {
+    _ = old_parent;
+    _ = new_parent;
+    return .{ .old_parent = -1, .new_parent = 0 };
 }
