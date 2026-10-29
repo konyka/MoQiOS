@@ -3205,11 +3205,22 @@ fn syscallNetRecv(frame: *SyscallFrame) void {
     frame.rax = @bitCast(raw_net_mod.netRecv(frame.rdi, frame.rsi));
 }
 
+// The legacy port-addressed UDP calls take any source/receive port and so
+// bypass socket ownership (draining another socket's queue, forging a
+// privileged source port): same privilege as the raw frame calls.
 fn syscallUdpSend(frame: *SyscallFrame) void {
+    if (!checkCapForCurrent("cap_net_raw")) {
+        frame.rax = @bitCast(@as(i64, -1)); // EPERM
+        return;
+    }
     frame.rax = @bitCast(raw_net_mod.udpSend(@truncate(frame.rdi), @truncate(frame.rsi), @truncate(frame.rdx), frame.r10, frame.r8));
 }
 
 fn syscallUdpRecv(frame: *SyscallFrame) void {
+    if (!checkCapForCurrent("cap_net_raw")) {
+        frame.rax = @bitCast(@as(i64, -1)); // EPERM
+        return;
+    }
     frame.rax = @bitCast(raw_net_mod.udpRecv(@truncate(frame.rdi), frame.rsi, frame.rdx, frame.r10, frame.r8));
 }
 

@@ -15,6 +15,10 @@
 ///   J. the native kernel-state dump (#3: task table with page-table and
 ///      kernel-stack addresses, IRQs off while it prints) is not available to
 ///      an unprivileged process.
+///   K. the legacy port-addressed UDP calls (#102 udp_send with any source
+///      port, #103 udp_recv from any port) bypass socket ownership: without
+///      CAP_NET_RAW they are refused, so another process's socket queue cannot
+///      be drained and privileged source ports cannot be forged.
 ///   H. 64-bit fd arguments that do not fit 32 bits are EBADF, not a panic;
 ///      eventfd2 with a huge initval cannot overflow the counter later.
 
@@ -67,6 +71,12 @@ static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_MSGSND    157
 #define SYS_MSGCTL    159
 #define SYS_MMAP      8
+#define SYS_SOCKET    117
+#define SYS_BIND      118
+#define SYS_SENDTO    121
+#define SYS_RECVFROM  122
+#define SYS_UDP_SEND  102
+#define SYS_UDP_RECV  103
 #define SYS_MUNMAP    12
 #define SYS_OPEN      9
 #define SYS_STATX     183
@@ -254,6 +264,30 @@ void _start(void) {
 
     /* J (hello113 runs as uid 1000 without capabilities) */
     check(syscall1(3, 0) == -1, "J: the kernel diagnostics dump (#3) is EPERM without CAP_SYS_ADMIN");
+
+    /* K: a bound socket owns its port's queue */
+    {
+        int64_t rx = syscall3(SYS_SOCKET, 2 /* AF_INET */, 2 /* SOCK_DGRAM */, 0);
+        int64_t tx = syscall3(SYS_SOCKET, 2, 2, 0);
+        uint8_t addr[16] = { 2, 0, 0x30, 0x39 /* 12345 */, 127, 0, 0, 1 };
+        check(rx >= 0 && tx >= 0 && syscall3(SYS_BIND, (uint64_t)rx, (uint64_t)addr, 16) == 0, "K: bind a UDP socket to 127.0.0.1:12345");
+        const char *secret = "secret";
+        check(syscall6(SYS_SENDTO, (uint64_t)tx, (uint64_t)secret, 6, 0, (uint64_t)addr, 16) == 6, "K: queue a datagram for it");
+        for (int i = 0; i < 50; i++) syscall1(104, 0); /* deliver it into the bound queue */
+        char steal[16];
+        check(syscall5(SYS_UDP_RECV, 12345, (uint64_t)steal, sizeof(steal), 0, 0) == -1, "K: udp_recv(#103) on someone's port is EPERM without CAP_NET_RAW");
+        check(syscall5(SYS_UDP_SEND, 0x7f000001, 12345, 53, (uint64_t)"x", 1) == -1, "K: udp_send(#102) with a forged source port is EPERM without CAP_NET_RAW");
+        char got[16];
+        int64_t n = 0;
+        /* loopback frames are delivered by the net_poll (#104) pump */
+        for (int i = 0; i < 1000 && n <= 0; i++) {
+            syscall1(104, 0);
+            n = syscall6(SYS_RECVFROM, (uint64_t)rx, (uint64_t)got, sizeof(got), 0x40 /* MSG_DONTWAIT */, 0, 0);
+        }
+        check(n == 6 && got[0] == 's', "K: the socket owner still receives its datagram");
+        syscall1(SYS_CLOSE, (uint64_t)rx);
+        syscall1(SYS_CLOSE, (uint64_t)tx);
+    }
 
     print(failures == 0 ? "hello113: PASS\n" : "hello113: FAIL\n");
     print("hello113 done\n");

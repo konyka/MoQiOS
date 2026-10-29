@@ -74,7 +74,7 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
     if (initial_init and std.mem.eql(u8, name, "init")) return initial_init_profile;
     if (!initial_init_caller) return default_user_profile;
 
-    if (std.mem.eql(u8, name, "hello14")) return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_net_raw = true }, .initial_init = false };
+    if (std.mem.eql(u8, name, "hello14") or std.mem.eql(u8, name, "hello15")) return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_net_raw = true }, .initial_init = false };
     if (std.mem.eql(u8, name, "hello51") or std.mem.eql(u8, name, "hello52")) {
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_sys_rawio = true }, .initial_init = false };
     }
