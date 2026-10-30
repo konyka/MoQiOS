@@ -8,12 +8,17 @@ const bo = @import("../lib/byte_order.zig");
 const at_path = @import("at_path.zig");
 
 /// statx(dirfd, pathname_ptr, flags, mask, statxbuf_ptr) -> 0 or -errno.
-pub fn statx(dirfd: i64, pathname_ptr: u64, statxbuf_ptr: u64) i64 {
+/// AT_EMPTY_PATH with an empty name describes `dirfd` itself. Timestamps and
+/// block counts are reported only for filesystems that keep them (ext2, the
+/// read-only volumes, FAT32's write time); the mask says which fields are valid.
+pub fn statx(dirfd: i64, pathname_ptr: u64, flags: u32, mask: u32, statxbuf_ptr: u64) i64 {
+    const si = @import("stat_info.zig");
     // Validate the full destination before opening a temporary fd; this keeps
     // bad output pointers from causing needless fd-table mutation.
     if (!copy.validateUserBufferWritable(statxbuf_ptr, 144)) return -14; // EFAULT
+    const args = si.checkStatxArgs(flags, mask);
+    if (args.err != 0) return args.err;
 
-    // Read pathname
     var name_buf: [256]u8 = undefined;
     if (pathname_ptr == 0 or pathname_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT
     const copied = copy.copyPathFromUser(&name_buf, pathname_ptr, 255);
@@ -25,94 +30,91 @@ pub fn statx(dirfd: i64, pathname_ptr: u64, statxbuf_ptr: u64) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    // Try to open and fstat
-    var stat_buf: [144]u8 = undefined;
-    @memset(&stat_buf, 0);
+    var out: [144]u8 = undefined;
+    // AT_EMPTY_PATH with an empty name: stat the descriptor itself.
+    if (len == 0) {
+        if (!args.empty_path) return -2;
+        if (dirfd < 0 or dirfd >= @import("vfs.zig").MAX_FDS) return -9;
+        const d = &cur.fd_table.fds[@intCast(dirfd)];
+        if (d.fd_type == .none) return -9;
+        const common = describe(d, @intCast(dirfd)) orelse return -2;
+        si.packStatx(&out, common);
+        return if (copy.copyToUser(@ptrFromInt(statxbuf_ptr), &out, out.len) != out.len) -14 else 0;
+    }
+
     var joined: [256]u8 = undefined;
     const use_name = switch (at_path.resolve(cur, dirfd, name, &joined)) {
         .keep => name,
         .path => |p| p,
         .err => |e| return e,
     };
-    const fd_result = cur.fd_table.openWithCredentials(use_name, 0, cur.euid, cur.egid, cur.effective_caps); // O_RDONLY
-    if (fd_result >= 0) {
-        const fd: u32 = @intCast(fd_result);
-        const fd_entry = &cur.fd_table.fds[fd];
-
-        // Fill statx fields: stx_mask(4), stx_blksize(4), stx_attributes(8),
-        // stx_nlink(4), stx_uid(4), stx_gid(4), stx_mode(2), pad(2),
-        // stx_ino(8), stx_size(8), stx_blocks(8), stx_attributes_mask(8)
-        var off: usize = 0;
-        const stx_mask: u32 = 0x7FF; // STATX_BASIC
-        bo.writeU32Le(stat_buf[off..], stx_mask);
-        off += 4;
-        const blksize: u32 = 4096;
-        bo.writeU32Le(stat_buf[off..], blksize);
-        off += 4;
-        const attrs: u64 = 0;
-        bo.writeU64Le(stat_buf[off..], attrs);
-        off += 8;
-        var rofs_stat: ?@import("fs_reader.zig").Stat = null;
-        if (fd_entry.fd_type == .rofs_file) {
-            switch (@import("rofs.zig").statRef(fd_entry.rofs_mount, fd_entry.rofs_gen, fd_entry.rofs_ref)) {
-                .ok => |o| rofs_stat = o.stat,
-                .err => |e| {
-                    _ = cur.fd_table.close(fd);
-                    return e;
-                },
+    // AT_SYMLINK_NOFOLLOW on an ext2 symlink: describe the link inode itself
+    // (a normal open would follow it).
+    if (!args.follow) {
+        const ext2 = @import("ext2.zig");
+        if (ext2.isActive() and !isSpecialTree(use_name)) {
+            if (ext2.statPathNoFollow(use_name, .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] })) |r| {
+                switch (r) {
+                    .ok => |info| {
+                        si.packStatx(&out, .{ .mode = info.mode, .nlink = info.nlink, .uid = info.uid, .gid = info.gid, .ino = info.ino, .size = info.size, .blocks = info.blocks, .times = .{ .atime = info.atime, .mtime = info.mtime, .ctime = info.ctime } });
+                        return if (copy.copyToUser(@ptrFromInt(statxbuf_ptr), &out, out.len) != out.len) -14 else 0;
+                    },
+                    .err => |e| return e,
+                }
             }
         }
-        var ext2_info: @import("stat_info.zig").StatInfo = .{};
-        const have_ext2_info = fd_entry.fd_type == .ext2_file and
-            @import("ext2.zig").statInode(fd_entry.ext2_file_idx, &ext2_info);
-        const nlink: u32 = if (have_ext2_info) ext2_info.nlink else if (rofs_stat) |r| r.nlink else 1;
-        bo.writeU32Le(stat_buf[off..], nlink);
-        off += 4;
-        var uid: u32 = 0;
-        var gid: u32 = 0;
-        var mode: u16 = if (fd_entry.fd_type == .tcp_socket) @as(u16, 0o140777) else @as(u16, 0o100644);
-        if (fd_entry.fd_type == .tmpfs_file) {
-            const tmpfs = @import("tmpfs.zig");
-            const metadata = tmpfs.tmpfsGetMetadata(@intCast(fd_entry.tmpfs_idx)) orelse {
-                _ = cur.fd_table.close(fd);
-                return -2;
-            };
-            uid = metadata.uid;
-            gid = metadata.gid;
-            const file_type = if (metadata.is_dir) @as(u16, 0o040000) else @as(u16, 0o100000);
-            mode = file_type | @as(u16, @intCast(metadata.mode & 0o7777)); // incl. setuid/setgid/sticky
-        }
-        if (rofs_stat) |r| {
-            uid = r.uid;
-            gid = r.gid;
-            mode = @truncate(r.mode);
-        }
-        if (have_ext2_info) {
-            uid = ext2_info.uid;
-            gid = ext2_info.gid;
-            mode = @truncate(ext2_info.mode);
-        }
-        bo.writeU32Le(stat_buf[off..], uid);
-        off += 4;
-        bo.writeU32Le(stat_buf[off..], gid);
-        off += 4;
-        bo.writeU16Le(stat_buf[off..], mode);
-        off += 2;
-        off += 2; // padding
-        const ino: u64 = if (have_ext2_info) ext2_info.ino else if (rofs_stat) |r| r.ino else fd;
-        bo.writeU64Le(stat_buf[off..], ino);
-        off += 8;
-        const size: u64 = if (have_ext2_info) @max(ext2_info.size, fd_entry.file_size) else if (rofs_stat) |r| r.size else fd_entry.file_size;
-        bo.writeU64Le(stat_buf[off..], size);
-        off += 8;
-
-        _ = cur.fd_table.close(fd);
-    } else {
+    }
+    const open_flags: u32 = 0;
+    const fd_result = cur.fd_table.openWithCredentials(use_name, open_flags, cur.euid, cur.egid, cur.effective_caps);
+    if (fd_result < 0) {
         // A directory on the path that denies search is EACCES, not ENOENT.
         return if (fd_result == -13) -13 else -2;
     }
+    const fd: u32 = @intCast(fd_result);
+    const common = describe(&cur.fd_table.fds[fd], fd);
+    _ = cur.fd_table.close(fd);
+    si.packStatx(&out, common orelse return -2);
+    return if (copy.copyToUser(@ptrFromInt(statxbuf_ptr), &out, out.len) != out.len) -14 else 0;
+}
 
-    // Write statx buffer to user space
-    if (copy.copyToUser(@ptrFromInt(statxbuf_ptr), &stat_buf, stat_buf.len) != stat_buf.len) return -14;
-    return 0;
+/// /tmp, /dev, /proc and mounted volumes are not ext2 paths.
+fn isSpecialTree(name: []const u8) bool {
+    const policy = @import("at_join_policy.zig");
+    const rel = if (name.len > 0 and name[0] == '/') name[1..] else name;
+    if (policy.namesRootTree(rel)) return true;
+    var norm: [256]u8 = undefined;
+    const vfs = @import("vfs.zig");
+    const abs = vfs.normalizeAbs(if (name.len > 0 and name[0] == '/') name else "/", &norm) orelse return false;
+    return vfs.rofsRoute(abs) != null;
+}
+
+fn describe(d: *const @import("vfs.zig").FileDescriptor, fd: u32) ?@import("stat_info.zig").Common {
+    const si = @import("stat_info.zig");
+    var c: si.Common = .{ .mode = if (d.fd_type == .tcp_socket) 0o140777 else 0o100644, .ino = fd, .size = d.file_size };
+    switch (d.fd_type) {
+        .tmpfs_file => {
+            const m = @import("tmpfs.zig").tmpfsGetMetadata(@intCast(d.tmpfs_idx)) orelse return null;
+            c.uid = m.uid;
+            c.gid = m.gid;
+            c.mode = (if (m.is_dir) @as(u32, 0o040000) else 0o100000) | (m.mode & 0o7777); // incl. setuid/setgid/sticky
+        },
+        .rofs_file => switch (@import("rofs.zig").statRef(d.rofs_mount, d.rofs_gen, d.rofs_ref)) {
+            .ok => |o| {
+                c = .{ .mode = o.stat.mode, .nlink = o.stat.nlink, .uid = o.stat.uid, .gid = o.stat.gid, .ino = o.stat.ino, .size = o.stat.size, .blocks = o.stat.blocks, .times = .{ .atime = o.stat.atime, .mtime = o.stat.mtime, .ctime = o.stat.ctime } };
+            },
+            .err => return null,
+        },
+        .ext2_file => {
+            var info: si.StatInfo = .{};
+            if (!@import("ext2.zig").statInode(d.ext2_file_idx, &info)) return null;
+            c = .{ .mode = info.mode, .nlink = info.nlink, .uid = info.uid, .gid = info.gid, .ino = info.ino, .size = @max(info.size, d.file_size), .blocks = info.blocks, .times = .{ .atime = info.atime, .mtime = info.mtime, .ctime = info.ctime } };
+        },
+        .fat32_file => {
+            const mt = @import("fat32.zig").getMtime(d.fat32_file_idx);
+            c.blocks = (d.file_size + 511) / 512;
+            c.times = .{ .atime = mt, .mtime = mt, .ctime = mt }; // FAT keeps one write time
+        },
+        else => {},
+    }
+    return c;
 }

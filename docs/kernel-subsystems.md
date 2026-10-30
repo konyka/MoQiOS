@@ -925,6 +925,11 @@ const SchedStats = struct {
 - `EPOLL_CTL_ADD` 沿 child epoll 链（`nestedChainReaches`，visited bitmap 有界）检测间接环，构成环返回 `ELOOP`——环上就绪互相传播会使 `epoll_wait` 永久 busy-loop。（§6.51）
 - MoqIPC receive 被信号/`moqipc_notify` 踢醒时统一清理 `waiting_receiver` 注册并按唤醒来源分类返回：endpoint 失效才报 `invalid_endpoint`，存活 endpoint 的无投递唤醒报 EINTR（信号）/EAGAIN（notify）——注册残留曾让 endpoint 对所有 sender 永久报废。（§6.51）
 - `alarm`/`itimer` deadline 字段与 per-CPU run-queue 的 `nr_running` 计数全部原子访问（tick 扫描器跨 CPU 与 syscall 上下文并发）。（§6.51）
+- **statx 的字段与标志（hello125）**：此前 `statx` 的 mask 声称 `STATX_BASIC_STATS`，却不写 blocks 和任何时间戳（全是 0），还忽略 flags 与 mask。
+  现在 `stat_info.packStatx` 按 struct statx 偏移精确打包，mask 只包含真正填写的字段：ext2、只读卷报告 atime/mtime/ctime 与 blocks，FAT32 只有一个写入时间
+  （三者同值），tmpfs 没有时间戳和块数所以 mask 不含它们、字节为 0（不伪造 1970 年）。flags：`AT_EMPTY_PATH`（空名字描述 dirfd 本身，含目录 fd；不带该标志的空名字 ENOENT，坏 fd EBADF）、
+  `AT_SYMLINK_NOFOLLOW`（ext2 上描述符号链接 inode 本身，`ext2.statPathNoFollow`；默认跟随）、`AT_NO_AUTOMOUNT` 与同步类型位接受；未知 flags 或保留的 mask 最高位 EINVAL。
+  限制：NOFOLLOW 对 /tmp、/dev、/proc 与只读卷路径按默认方式处理（这些文件系统里没有可描述的符号链接）。
 - **linkat / symlinkat / fchownat（原生 #490 / #491 / #492，hello124）**：补上 dirfd 版本，路径一律经 `at_path.resolve`（cwd 与任意目录 fd）。
   纯策略在 `fs/at_flags_policy.zig`：`linkat` 只认 `AT_SYMLINK_FOLLOW`（未带时链接 symlink 本身，`ext2.createHardlinkMode(follow=false)`；
   传统 `link` 仍跟随），`AT_EMPTY_PATH` 需要 CAP_DAC_READ_SEARCH（无人持有）所以空名字是 ENOENT，其它位 EINVAL；跨 `/tmp` 边界 EXDEV，

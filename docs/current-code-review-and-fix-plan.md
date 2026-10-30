@@ -5258,3 +5258,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 测试先编译失败后通过；hello124（23 项）在 HEAD 上全部 FAIL，新内核 PASS。
 - 变异：`linkat` 无视 AT_SYMLINK_FOLLOW（一律跟随）→ hello124 1 项 FAIL，恢复后 PASS。
 - 验证：host 745/745；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）3/3 PASS。
+
+### statx 字段与标志（hello125）
+
+- 问题：`statx` 的 mask 写死 0x7FF，但只填 type/mode/nlink/uid/gid/ino/size；blocks 与 atime/mtime/ctime 全是 0，调用者读到“1970 年”；flags 与 mask 被丢弃，
+  所以没有 `AT_EMPTY_PATH`（`fstatat(fd, "", AT_EMPTY_PATH)` 是标准用法）、没有 `AT_SYMLINK_NOFOLLOW`（`lstat` 语义），未知 flags 不报错。
+- 修复：纯函数 `stat_info.packStatx`/`checkStatxArgs`（host 测试先编译失败后通过：精确偏移、mask 只含已填字段、flags/mask 校验）；`statx.zig` 重写为
+  `describe(fd)` + 打包，`ext2.statPathNoFollow`；分发层传入 flags（rdx）与 mask（r10）。同时更新两个按旧源码形状写的守卫测试。
+- TDD：hello125（17 项）在 HEAD 上 10 项 FAIL，新内核 PASS；hello87（statx 输出故障与临时 fd 清理）仍 PASS。
+- 变异：`AT_SYMLINK_NOFOLLOW` 分支停用 → hello125 1 项 FAIL，恢复后 PASS。
+- 验证：host 746/746；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL（hello87 同样 PASS）；stress（SMP=2）3/3 PASS。

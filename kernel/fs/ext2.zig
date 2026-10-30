@@ -4097,6 +4097,31 @@ pub fn touchModified(file_idx: u32) void {
     f.inode.ctime = t;
 }
 
+/// lstat-style lookup: the inode `path` names, without following a final
+/// symlink. Null when ext2 is inactive; DAC on the directories walked applies.
+pub fn statPathNoFollow(path: []const u8, who: Who) ?union(enum) { ok: @import("stat_info.zig").StatInfo, err: i64 } {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active) return null;
+    const inode_num = walkPathToInodeAsUnlocked(path, who, false) catch |e| return .{ .err = if (e == error.DacDenied) -13 else -2 };
+    var inode: Ext2Inode = undefined;
+    if (!readInode(inode_num, &inode)) return .{ .err = -5 };
+    return .{ .ok = @import("stat_info.zig").fromExt2(inode_num, .{
+        .mode = inode.mode,
+        .uid_lo = inode.uid,
+        .uid_hi = @as(u16, inode.osd2[4]) | (@as(u16, inode.osd2[5]) << 8),
+        .gid_lo = inode.gid,
+        .gid_hi = @as(u16, inode.osd2[6]) | (@as(u16, inode.osd2[7]) << 8),
+        .links_count = inode.links_count,
+        .size_lo = inode.size,
+        .size_hi = inode.dir_acl,
+        .blocks = inode.blocks,
+        .atime = inode.atime,
+        .mtime = inode.mtime,
+        .ctime = inode.ctime,
+    }) };
+}
+
 pub fn statInode(file_idx: u32, out: *@import("stat_info.zig").StatInfo) bool {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);

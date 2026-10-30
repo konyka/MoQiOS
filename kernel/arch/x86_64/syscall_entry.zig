@@ -1010,7 +1010,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(readlink_mod.readlink(frame.rdi, frame.rsi, frame.rdx));
         },
         183 => { // statx(dirfd, pathname, flags, mask, statxbuf)
-            frame.rax = @bitCast(statx_mod.statx(dirfdArg(frame.rdi), frame.rsi, frame.r8));
+            frame.rax = @bitCast(statx_mod.statx(dirfdArg(frame.rdi), frame.rsi, @truncate(frame.rdx), @truncate(frame.r10), frame.r8));
         },
         184 => { // copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)
             _ = frame.r9;
@@ -2140,7 +2140,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         // ── v42.0: Linux standard number aliases (331+) + new implementations ──
         331 => { // statx(dirfd, pathname, flags, mask, statxbuf) — alias of #183
-            frame.rax = @bitCast(statx_mod.statx(dirfdArg(frame.rdi), frame.rsi, frame.r8));
+            frame.rax = @bitCast(statx_mod.statx(dirfdArg(frame.rdi), frame.rsi, @truncate(frame.rdx), @truncate(frame.r10), frame.r8));
         },
         332 => { // io_pgetevents(ctx_id, min_nr, nr, events, timeout, usig) — alias of #216
             frame.rax = @bitCast(aio_mod.ioGetevents(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8));

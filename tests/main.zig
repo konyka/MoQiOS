@@ -2270,11 +2270,11 @@ test "statx routes tmpfs fields through locked metadata accessor" {
     try std.testing.expect(std.mem.indexOf(u8, kt.tmpfs_source, "pub fn tmpfsGetMetadata(idx: u8) ?Metadata") != null);
     try expectSourceRoute(
         kt.statx_source,
-        "if (fd_entry.fd_type == .tmpfs_file)",
-        "bo.writeU16Le(stat_buf[off..], mode)",
-        "tmpfs.tmpfsGetMetadata(@intCast(fd_entry.tmpfs_idx))",
+        ".tmpfs_file => {",
+        ".rofs_file => switch",
+        "tmpfsGetMetadata(@intCast(d.tmpfs_idx))",
     );
-    try std.testing.expect(std.mem.indexOf(u8, kt.statx_source, "if (metadata.is_dir) @as(u16, 0o040000) else @as(u16, 0o100000)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.statx_source, "if (m.is_dir) @as(u32, 0o040000) else 0o100000") != null);
 }
 
 test "creat dispatch creates truncates and opens writable with caller mode" {
@@ -2449,8 +2449,7 @@ test "user metadata probes forward effective DAC credentials" {
     // statx and access resolve their paths through at_path (a volume directory
     // fd or cwd may rewrite the name) but must retain the caller's credentials.
     const forwarding = "openWithCredentials(use_name, 0, cur.euid, cur.egid, cur.effective_caps)";
-
-    try std.testing.expect(std.mem.indexOf(u8, kt.statx_source, forwarding) != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.statx_source, "openWithCredentials(use_name, open_flags, cur.euid, cur.egid, cur.effective_caps)") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, forwarding) != null);
 }
 
@@ -7046,4 +7045,45 @@ test "linkat/fchownat flag policy and cross-filesystem link routing" {
     // symlinks cannot be created on tmpfs.
     try std.testing.expectEqual(@as(i64, -1), ap.symlinkRoute("/tmp/l"));
     try std.testing.expectEqual(@as(i64, 0), ap.symlinkRoute("testdir/l"));
+}
+
+test "statx layout reports exactly the fields it fills and rejects bad flags/masks" {
+    const sp = kt.stat_info;
+    var buf: [144]u8 = @splat(0xAA);
+    const with_times = sp.Common{ .mode = 0o100644, .nlink = 2, .uid = 7, .gid = 8, .ino = 99, .size = 1234, .blocks = 8, .times = .{ .atime = 10, .mtime = 20, .ctime = 30 } };
+    sp.packStatx(&buf, with_times);
+    const rd32 = struct {
+        fn f(b: []const u8, o: usize) u32 {
+            return @as(u32, b[o]) | (@as(u32, b[o + 1]) << 8) | (@as(u32, b[o + 2]) << 16) | (@as(u32, b[o + 3]) << 24);
+        }
+    }.f;
+    const rd64 = struct {
+        fn f(b: []const u8, o: usize) u64 {
+            return @as(u64, rd32(b, o)) | (@as(u64, rd32(b, o + 4)) << 32);
+        }
+    }.f;
+    try std.testing.expectEqual(@as(u32, 0x7FF), rd32(&buf, 0));
+    try std.testing.expectEqual(@as(u32, 2), rd32(&buf, 16));
+    try std.testing.expectEqual(@as(u32, 7), rd32(&buf, 20));
+    try std.testing.expectEqual(@as(u64, 99), rd64(&buf, 32));
+    try std.testing.expectEqual(@as(u64, 1234), rd64(&buf, 40));
+    try std.testing.expectEqual(@as(u64, 8), rd64(&buf, 48));
+    try std.testing.expectEqual(@as(u64, 10), rd64(&buf, 64)); // atime.tv_sec
+    try std.testing.expectEqual(@as(u32, 0), rd32(&buf, 72)); // atime.tv_nsec
+    try std.testing.expectEqual(@as(u64, 30), rd64(&buf, 96)); // ctime
+    try std.testing.expectEqual(@as(u64, 20), rd64(&buf, 112)); // mtime
+    try std.testing.expectEqual(@as(u64, 0), rd64(&buf, 80)); // btime not provided
+    // Unknown times/blocks: the mask must not claim them, and the bytes are zero.
+    var b2: [144]u8 = @splat(0xAA);
+    sp.packStatx(&b2, .{ .mode = 0o100644, .nlink = 1, .size = 5, .ino = 3 });
+    try std.testing.expectEqual(@as(u32, 0x31F), rd32(&b2, 0));
+    try std.testing.expectEqual(@as(u64, 0), rd64(&b2, 64));
+    try std.testing.expectEqual(@as(u64, 0), rd64(&b2, 48));
+    // flags / mask validation
+    try std.testing.expectEqual(@as(i64, 0), sp.checkStatxArgs(0, 0x7FF).err_or_zero());
+    try std.testing.expectEqual(@as(i64, 0), sp.checkStatxArgs(0x100 | 0x1000 | 0x800, 0).err_or_zero());
+    try std.testing.expectEqual(@as(i64, -22), sp.checkStatxArgs(0x2, 0).err_or_zero());
+    try std.testing.expectEqual(@as(i64, -22), sp.checkStatxArgs(0, 0x8000_0000).err_or_zero());
+    try std.testing.expect(sp.checkStatxArgs(0x1000, 0).empty_path);
+    try std.testing.expect(!sp.checkStatxArgs(0, 0).empty_path);
 }
