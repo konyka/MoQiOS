@@ -22,10 +22,12 @@ pub fn waitpidWithOptions(pid_raw: u64, status_ptr: u64, options: u32) i64 {
     else
         @intCast(pid_raw);
 
+    const opt_rc = @import("proc_id_policy.zig").waitOptionsErrno(options);
+    if (opt_rc != 0) return opt_rc;
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     if (status_ptr != 0 and !copy.validateUserBufferWritable(status_ptr, 4)) return -14;
 
-    if (!task_mod.hasChildren(cur_idx)) return -10; // -ECHILD
+    if (!task_mod.hasMatchingChild(cur_idx, pid)) return -10; // -ECHILD: nothing waitpid(pid) could select
 
     var exit_code: i32 = 0;
     if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {

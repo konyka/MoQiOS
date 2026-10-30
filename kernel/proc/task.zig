@@ -1667,6 +1667,20 @@ pub fn createUserProcess(
         tasks[slot].umask_val = creation_metadata.initialTaskUmask();
         tasks[slot].self_idx = slot;
         tasks[slot].tid = tid;
+        // Group and session are inherited from the spawning parent, as fork does
+        // (setsid refuses a group leader, so a program started by init must not
+        // begin as one). The very first task has no parent and leads its own;
+        // getpgid/getsid used to answer 0 for it, which no group can be.
+        {
+            const pp = @import("proc_id_policy.zig");
+            if (findTaskByTidLocked(parent_tid_val)) |parent_idx| {
+                tasks[slot].pgid = tasks[parent_idx].pgid;
+                tasks[slot].sid = tasks[parent_idx].sid;
+            } else {
+                tasks[slot].pgid = pp.rootGroupId(tid);
+                tasks[slot].sid = pp.rootGroupId(tid);
+            }
+        }
         // Not runnable yet. fork/clone still have to build the child's
         // interrupt frame, and the loader still has to set up brk; a picker
         // that grabbed the task now would run it with `started == false` and
@@ -1850,7 +1864,7 @@ pub fn waitpidScanLocked(parent_idx: u32, pid: i32, status: *i32) WaitScan {
         const t = &tasks[i];
         if (t.parent_tid != parent_tid_val) continue;
         if (t.is_thread) continue; // 线程由 pthread_join 汇合，不经 waitpid
-        if (pid > 0 and t.tid != @as(u32, @intCast(pid))) continue;
+        if (!@import("proc_id_policy.zig").waitMatches(pid, t.tid, t.pgid, parent.pgid)) continue;
         // A zombie still pinned, still current somewhere, or whose exit-time
         // switch epilogue may still run on its kernel stack (the
         // [switch-out → iretq] window — reaping there freed a live stack, the
@@ -1929,6 +1943,23 @@ pub fn hasChildrenLocked(parent_idx: u32) bool {
         bits &= bits - 1;
         const t = &tasks[i];
         if (t.parent_tid == parent_tid_val and !t.is_thread) return true;
+    }
+    return false;
+}
+
+/// Does `parent_idx` have a child that waitpid(`pid`) could ever select? A pid
+/// that names no child (or an empty group) is ECHILD, not a reason to block.
+pub fn hasMatchingChild(parent_idx: u32, pid: i32) bool {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    const parent = getTask(parent_idx) orelse return false;
+    var bits = slot_bitmap;
+    while (bits != 0) {
+        const i: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const t = &tasks[i];
+        if (t.parent_tid != parent.tid or t.is_thread) continue;
+        if (@import("proc_id_policy.zig").waitMatches(pid, t.tid, t.pgid, parent.pgid)) return true;
     }
     return false;
 }

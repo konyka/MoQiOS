@@ -260,6 +260,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello130"); /* fcntl/dup3/pipe semantics */
     run_test("hello131"); /* mmap/munmap/mprotect/mremap/brk argument rules */
     run_test("hello132"); /* clocks and sleeping */
+    run_test("hello133"); /* wait status, options, orphaning, pgrp/session */
 
     start_persistent_services();
 

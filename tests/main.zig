@@ -7412,3 +7412,37 @@ test "clock ids: which clock reads which time source, and which ones sleep/timer
     try std.testing.expectEqual(@as(u64, 1_000_000), ts.resolutionNs(6));
     try std.testing.expectEqual(@as(u64, 1_000_000), ts.resolutionNs(5));
 }
+
+test "root user tasks start as leaders of their own group and session; wait options are validated" {
+    const pp = kt.proc_id_policy;
+    // a task with no parent to inherit from leads group and session = its tid (when it fits u16)
+    try std.testing.expectEqual(@as(u16, 5), pp.rootGroupId(5));
+    try std.testing.expectEqual(@as(u16, 0), pp.rootGroupId(0));
+    try std.testing.expectEqual(@as(u16, 0), pp.rootGroupId(0x1_0000)); // too large: stays 0 (unnamed), never wraps
+    try std.testing.expectEqual(@as(u16, 0xFFFF), pp.rootGroupId(0xFFFF));
+    // wait4/waitpid options: WNOHANG, WUNTRACED, WCONTINUED, __WNOTHREAD, __WALL, __WCLONE
+    try std.testing.expectEqual(@as(i64, 0), pp.waitOptionsErrno(0));
+    try std.testing.expectEqual(@as(i64, 0), pp.waitOptionsErrno(1));
+    try std.testing.expectEqual(@as(i64, 0), pp.waitOptionsErrno(1 | 2 | 8));
+    try std.testing.expectEqual(@as(i64, 0), pp.waitOptionsErrno(0x20000000 | 0x40000000 | 0x80000000));
+    try std.testing.expectEqual(@as(i64, -22), pp.waitOptionsErrno(0x4));
+    try std.testing.expectEqual(@as(i64, -22), pp.waitOptionsErrno(0x10));
+    try std.testing.expectEqual(@as(i64, -22), pp.waitOptionsErrno(0x1000_0000));
+}
+
+test "waitpid child selection: pid > 0, -1, 0 and < -1" {
+    const pp = kt.proc_id_policy;
+    // pid > 0: exactly that child
+    try std.testing.expect(pp.waitMatches(5, 5, 9, 9));
+    try std.testing.expect(!pp.waitMatches(5, 6, 9, 9));
+    // pid == -1: any child
+    try std.testing.expect(pp.waitMatches(-1, 6, 1, 9));
+    // pid == 0: a child in the caller's own process group
+    try std.testing.expect(pp.waitMatches(0, 6, 9, 9));
+    try std.testing.expect(!pp.waitMatches(0, 6, 4, 9));
+    // pid < -1: a child in group -pid
+    try std.testing.expect(pp.waitMatches(-4, 6, 4, 9));
+    try std.testing.expect(!pp.waitMatches(-4, 6, 5, 9));
+    // pid == INT_MIN must not overflow when negated
+    try std.testing.expect(!pp.waitMatches(@import("std").math.minInt(i32), 6, 4, 9));
+}

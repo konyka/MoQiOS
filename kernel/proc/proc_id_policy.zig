@@ -40,3 +40,34 @@ pub fn groupIdForTid(tid: u32) ?u16 {
 pub fn groupIdIsTid(group_id: u16, tid: u32) bool {
     return @as(u32, group_id) == tid;
 }
+
+/// Group/session id of a task that has no parent to inherit one from: it
+/// leads its own, named by its tid. Ids that do not fit the u16 field stay 0
+/// (no group) rather than wrapping onto someone else's.
+pub fn rootGroupId(tid: u32) u16 {
+    return if (tid <= MAX_GROUP_ID) @intCast(tid) else 0;
+}
+
+const WNOHANG: u32 = 0x1;
+const WUNTRACED: u32 = 0x2;
+const WCONTINUED: u32 = 0x8;
+const WNOTHREAD: u32 = 0x2000_0000;
+const WALL: u32 = 0x4000_0000;
+const WCLONE: u32 = 0x8000_0000;
+
+/// wait4/waitpid options: only the defined bits are valid, the rest EINVAL.
+pub fn waitOptionsErrno(options: u32) i64 {
+    const valid = WNOHANG | WUNTRACED | WCONTINUED | WNOTHREAD | WALL | WCLONE;
+    return if ((options & ~valid) != 0) -22 else 0;
+}
+
+/// Does a child (`child_tid`, in group `child_pgid`) satisfy waitpid(`pid`)
+/// for a caller in group `caller_pgid`? pid > 0 names one child, -1 any child,
+/// 0 any child in the caller's group, < -1 any child in group -pid.
+pub fn waitMatches(pid: i32, child_tid: u32, child_pgid: u16, caller_pgid: u16) bool {
+    if (pid > 0) return child_tid == @as(u32, @intCast(pid));
+    if (pid == -1) return true;
+    if (pid == 0) return child_pgid == caller_pgid;
+    if (pid == @import("std").math.minInt(i32)) return false;
+    return child_pgid == @as(u32, @intCast(-pid)) and -pid <= MAX_GROUP_ID;
+}

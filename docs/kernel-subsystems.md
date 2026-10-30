@@ -925,6 +925,12 @@ const SchedStats = struct {
 - `EPOLL_CTL_ADD` 沿 child epoll 链（`nestedChainReaches`，visited bitmap 有界）检测间接环，构成环返回 `ELOOP`——环上就绪互相传播会使 `epoll_wait` 永久 busy-loop。（§6.51）
 - MoqIPC receive 被信号/`moqipc_notify` 踢醒时统一清理 `waiting_receiver` 注册并按唤醒来源分类返回：endpoint 失效才报 `invalid_endpoint`，存活 endpoint 的无投递唤醒报 EINTR（信号）/EAGAIN（notify）——注册残留曾让 endpoint 对所有 sender 永久报废。（§6.51）
 - `alarm`/`itimer` deadline 字段与 per-CPU run-queue 的 `nr_running` 计数全部原子访问（tick 扫描器跨 CPU 与 syscall 上下文并发）。（§6.51）
+- **进程生命周期：wait 选项、选择规则、初始进程组（hello133）**：(1) `wait4`/`waitpid` 的 options 只允许定义过的位（`WNOHANG`、`WUNTRACED`、`WCONTINUED`、`__WNOTHREAD`、`__WALL`、`__WCLONE`），其余 EINVAL
+  （此前任何值都被接受，`wait4(pid, 0, 0x4, 0)` 会被当成阻塞等待，进程在那里无限挂住）。(2) **子进程选择规则统一**（`proc_id_policy.waitMatches`）：`pid > 0` 指定的子进程、`-1` 任意子进程、`0` 与调用者同组的子进程、`< -1` 属于组 `-pid` 的子进程；
+  扫描（`waitpidScanLocked`）与“有没有可能等到”的判断（`task.hasMatchingChild`）用同一条规则。此前 `pid == 0` 和 `pid < -1` 被当成“任意子进程”，而“有子进程”只看有没有任何子进程，
+  所以等一个不存在的 pid 会阻塞而不是 ECHILD。(3) **spawn 出的程序的进程组与会话**：`createUserTask` 此前把 `pgid`/`sid` 留成 0，`getpgid(0)` 返回 0（没有任何进程组可以是 0）。现在继承 spawn 它的父任务的组和会话（与 fork 一致；
+  `setsid` 拒绝已是组长的进程，所以 init 启动的程序不能一开始就是组长），第一个没有父任务的任务才以自己的 tid 为组长。已核对无误：退出码低 8 位、`exit(137)` 与 SIGKILL 的区分、`WTERMSIG`、`WNOHANG`、
+  对已回收子进程再等是 ECHILD、`waitpid(-1)` 先返回先退出者、`getppid`、`setsid` 的组长/会话长语义、`setpgid` 的 ESRCH/EINVAL。
 - **时钟 id 与睡眠（hello132）**：`clock_gettime`/`clock_getres`/`clock_nanosleep` 此前只认 `CLOCK_REALTIME`(0) 与 `CLOCK_MONOTONIC`(1)，其余全是 EINVAL，而 glibc/musl/运行时普遍会读
   `CLOCK_MONOTONIC_RAW`、`CLOCK_BOOTTIME`、`CLOCK_*_COARSE` 与 CPU 时间时钟。现在 `proc/clock_ids.zig`（纯，host 测试）给出映射：`REALTIME` 与 `REALTIME_COARSE` 读墙钟（RTC 起点 + TSC），
   `MONOTONIC`、`MONOTONIC_RAW`、`MONOTONIC_COARSE`、`BOOTTIME` 读单调时钟（本内核不做时间校正也不挂起，所以彼此一致），`PROCESS_CPUTIME_ID`/`THREAD_CPUTIME_ID` 读调用任务的 CPU 时间

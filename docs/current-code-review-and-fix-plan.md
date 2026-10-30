@@ -5356,3 +5356,15 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 测试先编译失败后通过；hello132（35 项）在 HEAD 上 9 项 FAIL（4 个新时钟 id、2 个 CPU 时钟、MONOTONIC_RAW 单调性、`gettimeofday(NULL)`、`clock_getres(RAW)`），新内核 PASS。第一版探测曾含 `time()`，但它在原生编号 #201 上是 getuid，探测写错了，已去掉。nanosleep 的无效参数（nsec 越界、负数、NULL）、绝对截止时间在过去/未来、`gettimeofday` 与 `CLOCK_REALTIME` 一致等核对无误。
 - 变异：从映射表里去掉 `CLOCK_MONOTONIC_RAW` → hello132 3 项 FAIL，恢复后 PASS。
 - 验证：host 763/763；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）3/3 PASS。
+
+### 进程生命周期：wait 选项、选择规则、初始进程组（hello133）
+
+- 问题：(1) `wait4` 的 options 不校验，未定义位被接受，调用者以为在 `WNOHANG` 之类的语义里，实际阻塞等待；(2) `waitpid(0)`、`waitpid(-pgid)` 被当成 `waitpid(-1)`，
+  等不存在的 pid 阻塞而不是 ECHILD（“有子进程”只判断有没有任何子进程）；(3) spawn 出的程序 `pgid`/`sid` 为 0，`getpgid(0)` 返回 0。
+- 修复：`proc_id_policy.waitOptionsErrno/waitMatches/rootGroupId`；`waitpidScanLocked` 与 `hasMatchingChild` 共用 `waitMatches`；`createUserTask` 继承父任务的组和会话。
+- 回归（如实）：第一版把 spawn 出的程序一律设为自己的组长，`hello58`（setsid 与作业控制）两项失败——`setsid` 拒绝组长，init 启动的程序不该一开始就是组长；
+  改为继承父任务的组与会话后恢复。另外第一次运行因我的探测里 wait4 选项值 `0x40000000`（`__WALL`，合法）造成永久阻塞，smoke 超时，改用真正未定义的 `0x4`。
+- TDD：host 新增 3 个测试（根组 id 与选项、选择规则）先编译失败后通过；hello133（33 项）在 HEAD 上 3 项 FAIL（选项、wait4 回收、`getpgid(0)`），新内核 PASS。第一版的 `waitpid(0)` 检查写得太弱（总能通过），变异让 `pid == 0` 选任意子进程时它**没有**失败——这是变异检查发现的测试缺陷；
+  改为让子进程离开本组后断言 `waitpid(0)` 为 ECHILD、`waitpid(-1)` 仍看到它，并增加 `waitpid(-pgid)`，再变异才失败。
+- 变异：`pid == 0` 改为选任意子进程 → hello133 `waitpid(0) does not select a child that left our group` FAIL，恢复后 PASS。
+- 验证：host 765/765；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL（hello58 同样 PASS）；stress（SMP=2）5/5 PASS。
