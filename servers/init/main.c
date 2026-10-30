@@ -258,6 +258,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello128"); /* rename/truncate/read/write/chmod errnos */
     run_test("hello129"); /* lseek/pread/pwrite/ftruncate/O_APPEND semantics */
     run_test("hello130"); /* fcntl/dup3/pipe semantics */
+    run_test("hello131"); /* mmap/munmap/mprotect/mremap/brk argument rules */
 
     start_persistent_services();
 

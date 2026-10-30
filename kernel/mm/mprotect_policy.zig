@@ -60,3 +60,28 @@ pub fn writeGrantAllowed(prot: u64, shared: bool, may_write: bool) bool {
     if (prot & 2 == 0) return true;
     return !shared or may_write;
 }
+
+/// Argument screening that happens before any address-space work.
+pub const Early = union(enum) { proceed, noop, err: i64 };
+
+/// mprotect(addr, len, prot): the address must be page aligned and `prot`
+/// must use only PROT_READ|WRITE|EXEC; after that a zero length succeeds
+/// without touching anything (Linux), it is not an error.
+pub fn early(addr: u64, len: u64, prot: u64) Early {
+    if (addr % PAGE_SIZE != 0) return .{ .err = -22 };
+    if (len == 0) return .noop; // Linux returns before looking at prot
+    if (prot & ~@as(u64, 7) != 0) return .{ .err = -22 };
+    return .proceed;
+}
+
+/// mprotect over a range in which only `mapped` of `total` pages exist is
+/// ENOMEM; the pages that do exist are still changed on Linux, but a caller
+/// that sees ENOMEM must know part of the request was not applied.
+pub fn coverageErrno(total: u64, mapped: u64) i64 {
+    return if (total == 0 or mapped < total) -12 else 0;
+}
+
+/// mremap of a range that is not entirely mapped is EFAULT.
+pub fn remapSourceErrno(total: u64, mapped: u64) i64 {
+    return if (total == 0 or mapped < total) -14 else 0;
+}

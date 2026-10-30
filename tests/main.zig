@@ -7370,3 +7370,21 @@ test "shared open-file description: status flags live next to the offset" {
     const t = pool.promote(0).?;
     try std.testing.expectEqual(@as(u32, 0), pool.flags(t));
 }
+
+test "mprotect/mremap argument rules: zero length, holes and unmapped sources" {
+    const mp = kt.mprotect_policy;
+    // len == 0 is a successful no-op (after the alignment check), not EINVAL
+    try std.testing.expectEqual(mp.Early.noop, mp.early(0x1000, 0, 3));
+    try std.testing.expectEqual(mp.Early{ .err = -22 }, mp.early(0x1001, 0, 3)); // alignment is checked first
+    try std.testing.expectEqual(mp.Early{ .err = -22 }, mp.early(0x1000, 4096, 0x100)); // unknown PROT bits
+    try std.testing.expectEqual(mp.Early.noop, mp.early(0x1000, 0, 0x100)); // len 0 wins over prot (Linux order)
+    try std.testing.expectEqual(mp.Early.proceed, mp.early(0x1000, 4096, 7));
+    // a range with a hole is ENOMEM; fully covered is fine
+    try std.testing.expectEqual(@as(i64, 0), mp.coverageErrno(4, 4));
+    try std.testing.expectEqual(@as(i64, -12), mp.coverageErrno(4, 3));
+    try std.testing.expectEqual(@as(i64, -12), mp.coverageErrno(1, 0));
+    // mremap of a source that is not (fully) mapped is EFAULT
+    try std.testing.expectEqual(@as(i64, 0), mp.remapSourceErrno(2, 2));
+    try std.testing.expectEqual(@as(i64, -14), mp.remapSourceErrno(2, 1));
+    try std.testing.expectEqual(@as(i64, -14), mp.remapSourceErrno(2, 0));
+}

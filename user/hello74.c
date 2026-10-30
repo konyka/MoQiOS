@@ -112,8 +112,8 @@ void _start(void) {
         }
         failures += check(syscall2(SYS_MUNMAP, (u64)fault_page, PAGE) == 0, "fault page cleanup");
 
-        failures += check(syscall3(SYS_MPROTECT, (u64)(base + PAGE), 0, PROT_NONE) == -EINVAL,
-                          "zero length is EINVAL");
+        failures += check(syscall3(SYS_MPROTECT, (u64)(base + PAGE), 0, PROT_NONE) == 0,
+                          "zero length is a successful no-op (Linux)");
         failures += check(syscall3(SYS_MPROTECT, (u64)(base + PAGE + 1), PAGE, PROT_READ) == -EINVAL,
                           "unaligned address is EINVAL");
         failures += check(syscall3(SYS_MPROTECT, (u64)base, PAGE, 8) == -EINVAL,

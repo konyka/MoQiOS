@@ -5338,3 +5338,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   管道 EAGAIN/EOF/EPIPE、`pipe2` 标志、满管道短写）核对无误。
 - 变异：副本继承源的描述符标志 → hello130 3 项 FAIL，恢复后 PASS。
 - 验证：host 761/761；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### mprotect / mremap 的错误码（hello131）
+
+- 问题：4 处与 Linux 不符。`mprotect` 长度 0 返回 EINVAL（应是成功的空操作）；`mprotect` 范围含未映射页或超出映射末尾时静默返回 0（应为 ENOMEM，分配器依赖它探测洞）；
+  `mremap` 的源地址未映射返回 EINVAL（应为 EFAULT）。`hello74` 把第一条旧行为写成了断言。
+- 修复：`mprotect_policy.early/coverageErrno/remapSourceErrno`；`sysMprotect` 在 VM 保护下统计已映射页，提交后按覆盖情况返回；`mremap` 末尾的“找不到区域”按是否有映射区分 EFAULT 与 EINVAL。
+- TDD：host 测试先编译失败后通过；hello131（31 项，覆盖 mmap/munmap/mprotect/mremap/brk）在 HEAD 上 4 项 FAIL，新内核 PASS。mmap/munmap/brk 的 20 余项参数规则核对无误，未改动。
+- 变异：`coverageErrno` 恒返回 0 → hello131 2 项 FAIL，恢复后 PASS。
+- 验证：host 762/762；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL（hello74 同样 PASS）；stress（SMP=2）5/5 PASS。

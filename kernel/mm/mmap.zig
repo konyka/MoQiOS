@@ -1551,5 +1551,8 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
         if (r.file_kind != 0) return -12; // ENOMEM
         return moveOrNoMem(cur, r, old_pages, new_pages, mflags, new_addr_hint);
     }
+    // Not the base of a tracked region. A page-aligned address in which nothing is
+    // mapped is EFAULT on Linux; anything else (e.g. not a region start) stays EINVAL.
+    if (old_addr % PAGE == 0 and old_addr < user_space.USER_ADDR_MAX and !paging_mod.isPageOccupied(cur.page_table_phys, old_addr) and !hasMmapOverlap(cur, old_addr, 1)) return @import("mprotect_policy.zig").remapSourceErrno(1, 0); // EFAULT
     return -22; // EINVAL: old_addr not found
 }

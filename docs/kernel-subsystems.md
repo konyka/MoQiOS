@@ -925,6 +925,11 @@ const SchedStats = struct {
 - `EPOLL_CTL_ADD` 沿 child epoll 链（`nestedChainReaches`，visited bitmap 有界）检测间接环，构成环返回 `ELOOP`——环上就绪互相传播会使 `epoll_wait` 永久 busy-loop。（§6.51）
 - MoqIPC receive 被信号/`moqipc_notify` 踢醒时统一清理 `waiting_receiver` 注册并按唤醒来源分类返回：endpoint 失效才报 `invalid_endpoint`，存活 endpoint 的无投递唤醒报 EINTR（信号）/EAGAIN（notify）——注册残留曾让 endpoint 对所有 sender 永久报废。（§6.51）
 - `alarm`/`itimer` deadline 字段与 per-CPU run-queue 的 `nr_running` 计数全部原子访问（tick 扫描器跨 CPU 与 syscall 上下文并发）。（§6.51）
+- **mprotect / mremap 的参数与错误码（hello131）**：`mprotect(addr, 0, prot)` 此前是 EINVAL，Linux 里是成功的空操作（先检查对齐，再看长度，最后才检查 `prot` 位；`mprotect_policy.early`）。
+  范围里有未映射的洞时，`mprotect` 应返回 ENOMEM（已有页仍按请求修改，所以在提交之后才报告；`mprotect_policy.coverageErrno`），原先对不存在的页直接静默跳过、返回 0。
+  `mremap` 的源地址对齐但根本没有映射时是 EFAULT（`remapSourceErrno`），原先是 EINVAL；不是区域起点的地址仍是 EINVAL。`mmap` 的参数校验（长度 0、`MAP_SHARED|MAP_PRIVATE` 同时/都没有、未知 `PROT` 位、
+  `MAP_FIXED` 未对齐、坏 fd、过大长度、文件偏移未对齐、不可映射设备）、`munmap` 的对齐与长度 0、对已卸载范围再次 `munmap`、`brk` 增长/收缩/拒绝过低地址已核对无误。
+  `hello74` 里“mprotect 长度 0 是 EINVAL”的断言记录的是旧行为，改为“成功的空操作”。
 - **fcntl / dup / pipe 的描述符语义（hello130）**：(1) `dup2`/`dup3` 的副本此前整个拷贝源描述符，把源的 `FD_CLOEXEC` 也带过去（`dup3(.., 0)` 本应清零）；现在副本的描述符标志恰好是调用者要求的（`namespace_policy.dupFdFlags`，
   `dup`/`dup2`/`F_DUPFD` 为 0，`dup3(O_CLOEXEC)`/`F_DUPFD_CLOEXEC` 为 `FD_CLOEXEC`）。(2) 源描述符未打开时 `dup*` 返回 EBADF（原先裸 `-1`，`rlimit.Policy.dupExplicitErrno`）。(3) **文件状态标志属于打开文件描述**：
   `O_NONBLOCK`/`O_APPEND` 与偏移一起存在共享池的同一个槽里（`shared_offset.Pool.flags/setFlags`），`F_SETFL` 经 `vfs.setStatusFlags` 写入共享值、`F_GETFL` 经 `vfs.statusFlagsOf` 读，所以通过 dup 修改对原描述符可见；

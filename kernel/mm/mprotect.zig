@@ -67,12 +67,12 @@ fn insertRegionPiece(cur: *task.Task, base: u64, num_pages: u64, proto: *const t
 
 /// sysMprotect(addr, len, prot) → 0 on success, negative errno on failure.
 pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
-    // 1. Validate addr is page-aligned
-    if (addr % paging.PAGE_SIZE != 0) return EINVAL;
-    if (len == 0) return EINVAL;
-
-    // 2. Validate prot — valid bits are 0..7 (NONE|READ|WRITE|EXEC)
-    if (prot & ~@as(u64, 7) != 0) return EINVAL;
+    // 1-2. Alignment, zero length (a successful no-op) and PROT bits, in Linux's order.
+    switch (policy.early(addr, len, prot)) {
+        .err => |e| return e,
+        .noop => return 0,
+        .proceed => {},
+    }
 
     // 3. Reject kernel-half ranges — kernel stacks and DMA pages share PML4
     // entries 256-511, so flipping U/S+writable there must not be possible.
@@ -92,6 +92,17 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     var vm_guard = mm_mod.Mm.beginVmMutation(cur.mm, @ptrCast(cur)) catch return -35;
     defer vm_guard.release();
     if (mm_mod.Mm.sealed(cur.mm, addr, len_pages * paging.PAGE_SIZE)) return -1; // EPERM: mseal
+
+    // A hole in the range is ENOMEM on Linux. The pages that do exist are still
+    // changed, so the result is reported after the commit.
+    var mapped_pages: u64 = 0;
+    {
+        var pg: u64 = 0;
+        while (pg < len_pages) : (pg += 1) {
+            const va = addr + pg * paging.PAGE_SIZE;
+            if (paging.isPageOccupied(cur.page_table_phys, va) or @import("mmap.zig").hasMmapOverlap(cur, va, 1)) mapped_pages += 1;
+        }
+    }
 
     // SysV SHM pages belong to the segment, not to the address space: their
     // frames carry no PMM reference of their own and the attachment record
@@ -331,5 +342,5 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
         }
     }
 
-    return 0;
+    return policy.coverageErrno(len_pages, mapped_pages);
 }
