@@ -5432,3 +5432,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 变异：`selectReadable` 去掉 `POLLHUP` → hello139 A 段 `select calls it readable (EOF)` FAIL，恢复后 PASS。
 - 验证：host 780/780；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### ppoll / pselect6（hello140）
+
+- 问题：`ppoll`、`pselect6` 都未实现（ENOSYS）；现代 libc 的 `poll`/`select`/`pselect` 默认走这两个调用。
+- 修复：`poll`/`select` 拆成 `pollWait`/`selectWait` 核心，加上 `ppoll`/`pselect6` 入口（timespec 超时 + 临时信号掩码，`poll_policy.timespecWait`、`poll.readTempMask/beginTempMask/endTempMask`）；新增原生编号 #493/#494；返回前 `checkSignalsOnSyscallReturn`，使被临时掩码放行的信号在调用返回前运行 handler。
+- 已知差异：不更新用户的 timeout（Linux 的 `pselect6` 会写回剩余时间，ppoll 也会）；`exceptfds` 仍恒为空。
+- 排查过程（如实）：探测 D 段的“已关闭 fd 为 EBADF”最初用了 fd 77，大于 fd 表大小（64），按 Linux 语义 `nfds` 被截断所以应当被忽略——这是探测写错，不是内核缺陷，改用表内的已关闭 fd 40。
+- TDD：host 新增 1 个测试（timespec 超时），hello140（26 项）在 HEAD 上 19 项 FAIL（ENOSYS），新内核 PASS。
+
+- 变异：第一次尝试把“正常返回时恢复旧掩码”改坏，居然没有测试失败（探测只覆盖了被信号打断的路径）——补上 A2 段（带全屏蔽临时掩码的正常返回后掩码必须不变）后，同一变异让 A2 两项 FAIL，恢复后 PASS。
+- 验证：host 781/781；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS（门禁在补充 A2 检查之前跑完，补充后又单独跑了 SMP=2 冒烟 PASS）。

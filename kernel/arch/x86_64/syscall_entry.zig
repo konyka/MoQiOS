@@ -2519,6 +2519,14 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         492 => { // fchownat(dirfd, pathname, owner, group, flags)
             frame.rax = @bitCast(syscallFchownat(dirfdArg(frame.rdi), frame.rsi, frame.rdx, frame.r10, @truncate(frame.r8)));
         },
+        493 => { // ppoll(fds, nfds, tmo_p, sigmask, sigsetsize)
+            frame.rax = @bitCast(poll_mod.ppoll(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8));
+            checkSignalsOnSyscallReturn(frame);
+        },
+        494 => { // pselect6(nfds, readfds, writefds, exceptfds, timespec, {sigmask, size})
+            frame.rax = @bitCast(select_mod.pselect6(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9));
+            checkSignalsOnSyscallReturn(frame);
+        },
         else => {
             serial.writeString("[syscall] unknown syscall: 0x");
             fmt.writeHex(syscall_nr);

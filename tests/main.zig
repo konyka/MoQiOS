@@ -7634,3 +7634,14 @@ test "select readiness and wait slicing" {
     try std.testing.expectEqual(@as(u64, 5_000_000), pp.sliceDeadline(0, null, 5));
     try std.testing.expectEqual(@as(u64, 2_000_000), pp.sliceDeadline(0, 2_000_000, 5));
 }
+
+test "ppoll and pselect6 timespec timeouts round up and reject bad fields" {
+    const pp = kt.poll_policy;
+    try std.testing.expect(pp.timespecWait(-1, 0) == null);
+    try std.testing.expect(pp.timespecWait(0, 1_000_000_000) == null);
+    try std.testing.expectEqual(@as(u64, 0), pp.timespecWait(0, 0).?.ms);
+    try std.testing.expectEqual(@as(u64, 1), pp.timespecWait(0, 1).?.ms);
+    try std.testing.expectEqual(@as(u64, 2), pp.timespecWait(0, 1_000_001).?.ms);
+    try std.testing.expectEqual(@as(u64, 1500), pp.timespecWait(1, 500_000_000).?.ms);
+    try std.testing.expect(pp.timespecWait(std.math.maxInt(i64), 0).? == .forever);
+}

@@ -38,6 +38,14 @@ pub fn selectTimeout(sec: i64, usec: i64) ?Wait {
     return .{ .ms = ms };
 }
 
+/// A struct timespec from ppoll(2) / pselect6(2) (null = invalid). Fractions
+/// of a millisecond round up, like selectTimeout.
+pub fn timespecWait(sec: i64, nsec: i64) ?Wait {
+    if (sec < 0 or nsec < 0 or nsec >= 1_000_000_000) return null;
+    const whole = std.math.mul(u64, @intCast(sec), 1000) catch return .forever;
+    return .{ .ms = whole +| (@as(u64, @intCast(nsec)) + 999_999) / 1_000_000 };
+}
+
 pub fn nfdsValid(nfds: u64, nofile_limit: u64) bool {
     return nfds <= nofile_limit;
 }
@@ -92,6 +100,18 @@ test "select timeout validation and rounding" {
     try std.testing.expectEqual(@as(u64, 100), selectTimeout(0, 100_000).?.ms);
     try std.testing.expectEqual(@as(u64, 2500), selectTimeout(2, 500_000).?.ms);
     try std.testing.expect(selectTimeout(std.math.maxInt(i64), 0).? == .forever);
+}
+
+test "timespec wait validation and rounding" {
+    try std.testing.expect(timespecWait(-1, 0) == null);
+    try std.testing.expect(timespecWait(0, -1) == null);
+    try std.testing.expect(timespecWait(0, 1_000_000_000) == null);
+    try std.testing.expectEqual(@as(u64, 0), timespecWait(0, 0).?.ms);
+    try std.testing.expectEqual(@as(u64, 1), timespecWait(0, 1).?.ms);
+    try std.testing.expectEqual(@as(u64, 1), timespecWait(0, 1_000_000).?.ms);
+    try std.testing.expectEqual(@as(u64, 2), timespecWait(0, 1_000_001).?.ms);
+    try std.testing.expectEqual(@as(u64, 1500), timespecWait(1, 500_000_000).?.ms);
+    try std.testing.expect(timespecWait(std.math.maxInt(i64), 0).? == .forever);
 }
 
 test "revents always reports errors and hangups, only requested data events" {

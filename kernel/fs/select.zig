@@ -15,6 +15,44 @@ const SET_BYTES: usize = 16;
 
 /// select(nfds, readfds_ptr, writefds_ptr, exceptfds_ptr, timeout_ptr) -> ready count or -errno.
 pub fn select(nfds_raw: u64, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr: u64, timeout_ptr: u64) i64 {
+    var wait: pp.Wait = .forever;
+    if (timeout_ptr != 0) {
+        if (!copy.validateUserBuffer(timeout_ptr, 16)) return -14;
+        var tv: [16]u8 = undefined;
+        if (copy.copyFromUser(&tv, @ptrFromInt(timeout_ptr), 16) != 16) return -14;
+        const sec: i64 = @bitCast(bo.readU64Le(tv[0..8]));
+        const usec: i64 = @bitCast(bo.readU64Le(tv[8..16]));
+        wait = pp.selectTimeout(sec, usec) orelse return -22;
+    }
+    return selectWait(nfds_raw, readfds_ptr, writefds_ptr, exceptfds_ptr, wait);
+}
+
+/// pselect6(nfds, r, w, e, timespec, {sigmask, size}): select with a timespec
+/// timeout and a temporary signal mask.
+pub fn pselect6(nfds_raw: u64, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr: u64, timeout_ptr: u64, sigdata_ptr: u64) i64 {
+    var mask_ptr: u64 = 0;
+    var mask_size: u64 = 0;
+    if (sigdata_ptr != 0) {
+        var raw: [16]u8 = undefined;
+        if (!copy.validateUserBuffer(sigdata_ptr, 16) or copy.copyFromUser(&raw, @ptrFromInt(sigdata_ptr), 16) != 16) return -14;
+        mask_ptr = bo.readU64Le(raw[0..8]);
+        mask_size = bo.readU64Le(raw[8..16]);
+    }
+    const mask = switch (poll_mod.readTempMask(mask_ptr, mask_size)) {
+        .ok => |m| m,
+        .err => |e| return e,
+    };
+    const wait = switch (poll_mod.readTimespecWait(timeout_ptr)) {
+        .ok => |w| w,
+        .err => |e| return e,
+    };
+    const saved = poll_mod.beginTempMask(mask);
+    const rc = selectWait(nfds_raw, readfds_ptr, writefds_ptr, exceptfds_ptr, wait);
+    poll_mod.endTempMask(saved, rc);
+    return rc;
+}
+
+fn selectWait(nfds_raw: u64, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr: u64, wait: pp.Wait) i64 {
     if (nfds_raw > 0x7FFF_FFFF) return -22; // negative nfds
     // Linux clamps nfds to the descriptor table size.
     const nfds: usize = @intCast(@min(nfds_raw, vfs_mod.MAX_FDS));
@@ -24,16 +62,6 @@ pub fn select(nfds_raw: u64, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr:
     if (readfds_ptr != 0 and !copy.validateUserBufferWritable(readfds_ptr, SET_BYTES)) return -14;
     if (writefds_ptr != 0 and !copy.validateUserBufferWritable(writefds_ptr, SET_BYTES)) return -14;
     if (exceptfds_ptr != 0 and !copy.validateUserBufferWritable(exceptfds_ptr, SET_BYTES)) return -14;
-    if (timeout_ptr != 0 and !copy.validateUserBuffer(timeout_ptr, 16)) return -14;
-
-    var wait: pp.Wait = .forever;
-    if (timeout_ptr != 0) {
-        var tv: [16]u8 = undefined;
-        if (copy.copyFromUser(&tv, @ptrFromInt(timeout_ptr), 16) != 16) return -14;
-        const sec: i64 = @bitCast(bo.readU64Le(tv[0..8]));
-        const usec: i64 = @bitCast(bo.readU64Le(tv[8..16]));
-        wait = pp.selectTimeout(sec, usec) orelse return -22;
-    }
 
     var read_fds: [SET_BYTES]u8 = @splat(0);
     var write_fds: [SET_BYTES]u8 = @splat(0);
