@@ -128,7 +128,7 @@ var open_count: u32 = 0;
 // *Unlocked variants (the lock is not recursive).
 var fs_lock: IrqSpinlock = .{};
 
-// ─── Open file path table (v52.0: for execveat dirfd resolution) ──────────
+// ─── Open file path table (paths of open slots, for *at() directory fds) ───
 var open_file_paths: [MAX_OPEN_FILES][256]u8 = @splat(@splat(0));
 
 // ─── Initialization ───────────────────────────────────────────────────────
@@ -549,7 +549,7 @@ pub fn openFileAs(name: []const u8, who: ?Who) i64 {
     // Start from root inode (2)
     const result = walkPathInner(2, name, 0, who);
     if (result >= 0) {
-        // v52.0: store path for execveat dirfd resolution
+        // Store the path for *at() directory-descriptor resolution
         const idx: usize = @intCast(result);
         const copy_len = @min(name.len, 255);
         @memcpy(open_file_paths[idx][0..copy_len], name[0..copy_len]);
@@ -3977,7 +3977,7 @@ fn eql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-// ─── Open file path lookup for execveat (v52.0) ─────────────────────────────
+// ─── Open file path lookup for *at() directory descriptors ─────────────────
 
 /// Get the path used to open file_idx. Returns null if not found.
 pub fn getOpenFilePath(file_idx: u32) ?[]const u8 {
@@ -4012,29 +4012,6 @@ pub fn dirCheckAs(path: []const u8, who: Who) i64 {
     if (!eu.isDirectory(inode.mode)) return -20;
     if (!@import("dac.zig").allows(inodeMeta(&inode), who.creds(), @import("dac.zig").Access.search)) return -13;
     return 0;
-}
-
-/// Build a combined path: dir_path + "/" + relative_path into buf.
-/// Returns slice of buf, or null on overflow.
-/// Handles trailing slash in dir_path to avoid double-"//".
-pub fn buildCombinedPath(buf: []u8, dir_path: []const u8, rel_path: []const u8) ?[]const u8 {
-    // Trim trailing slashes from dir_path (but keep at least "/")
-    var dp_end: usize = dir_path.len;
-    while (dp_end > 1 and dir_path[dp_end - 1] == '/') dp_end -= 1;
-    const dp = dir_path[0..dp_end];
-    // Only add separator if dir_path doesn't already end with '/'
-    const need_sep: bool = dp.len > 0 and dp[dp.len - 1] != '/';
-    const total = dp.len + (if (need_sep) @as(usize, 1) else @as(usize, 0)) + rel_path.len;
-    if (total >= buf.len) return null;
-    @memcpy(buf[0..dp.len], dp);
-    var pos = dp.len;
-    if (need_sep) {
-        buf[pos] = '/';
-        pos += 1;
-    }
-    @memcpy(buf[pos..total], rel_path);
-    buf[total] = 0;
-    return buf[0..total];
 }
 
 // ─── stat support (fstat/statx) ─────────────────────────────────────────────

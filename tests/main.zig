@@ -805,7 +805,9 @@ test "exec aborts destroy the newly loaded address space before returning" {
         matches += 1;
         search_from = branch_end + 2;
     }
-    try std.testing.expectEqual(@as(usize, 2), matches);
+    try std.testing.expectEqual(@as(usize, 1), matches);
+    // A failed Mm allocation also tears the new space down.
+    try std.testing.expect(std.mem.indexOf(u8, source, "createMmForRoot(result.pml4) orelse {\n        user_space.destroyUserSpace(result.pml4);") != null);
 }
 
 test "ELF loaders validate segment arithmetic and file payload bounds" {
@@ -6949,4 +6951,42 @@ test "ext2 readlink copies the target out under fs_lock (no slice into a stack i
     const start = std.mem.indexOf(u8, src, "pub fn readSymlinkByPath(").?;
     const end = std.mem.indexOfPos(u8, src, start, "\n}\n").?;
     try std.testing.expect(std.mem.indexOf(u8, src[start..end], "return readSymlinkTarget(") == null);
+}
+
+test "exec name policy: only ramdisk names (bare or directly under /) are executable" {
+    const ep = kt.exec_policy;
+    try std.testing.expectEqualStrings("hello2", ep.programName("hello2").ok);
+    try std.testing.expectEqualStrings("hello2", ep.programName("/hello2").ok);
+    try std.testing.expectEqual(@as(i64, -2), ep.programName("").err);
+    try std.testing.expectEqual(@as(i64, -2), ep.programName("/").err);
+    try std.testing.expectEqual(@as(i64, -2), ep.programName("/testdir/hello2").err);
+    try std.testing.expectEqual(@as(i64, -2), ep.programName("/tmp/x").err);
+    var long: [80]u8 = @splat('a');
+    try std.testing.expectEqual(@as(i64, -36), ep.programName(long[0..64]).err);
+}
+
+test "execveat flags: AT_EMPTY_PATH and AT_SYMLINK_NOFOLLOW are known, others EINVAL" {
+    const ep = kt.exec_policy;
+    try std.testing.expectEqual(@as(i64, 0), ep.checkAtFlags(0));
+    try std.testing.expectEqual(@as(i64, 0), ep.checkAtFlags(0x1000));
+    try std.testing.expectEqual(@as(i64, 0), ep.checkAtFlags(0x100));
+    try std.testing.expectEqual(@as(i64, -22), ep.checkAtFlags(0x2));
+    try std.testing.expectEqual(@as(i64, -22), ep.checkAtFlags(0x200));
+}
+
+test "exec failures map to Linux errnos, not a blanket EPERM" {
+    const ep = kt.exec_policy;
+    try std.testing.expectEqual(@as(i64, -1), ep.errno(.denied));
+    try std.testing.expectEqual(@as(i64, -2), ep.errno(.not_found));
+    try std.testing.expectEqual(@as(i64, -8), ep.errno(.bad_format));
+    try std.testing.expectEqual(@as(i64, -12), ep.errno(.no_memory));
+    try std.testing.expectEqual(@as(i64, -14), ep.errno(.fault));
+}
+
+test "exec reports ENOEXEC for a ramdisk file that is not ELF before loading it" {
+    const src = kt.execve_source;
+    const find = std.mem.indexOf(u8, src, "ramdisk.findFile(name) orelse return .{ .err = policy.errno(.not_found) }").?;
+    const enoexec = std.mem.indexOfPos(u8, src, find, "parseHeader(file.data, file.size) == null) return .{ .err = policy.errno(.bad_format) }").?;
+    const load = std.mem.indexOfPos(u8, src, find, "loader.loadProgramForExec(").?;
+    try std.testing.expect(enoexec < load);
 }

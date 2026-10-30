@@ -1643,23 +1643,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallAccessAt(dirfdArg(frame.rdi), frame.rsi, @truncate(frame.rdx)));
         },
         322 => { // execveat(dirfd, pathname, argv, envp, flags)
-            const dirfd: i32 = @bitCast(@as(u32, @truncate(frame.rdi)));
-            const flags: u32 = @truncate(frame.r8);
-            const AT_FDCWD: i32 = -100;
-            if ((dirfd == AT_FDCWD or dirfd == 0) and flags == 0) {
-                // Equivalent to execve(pathname, argv, envp) — delegate
-                frame.rdi = frame.rsi; // pathname
-                frame.rsi = frame.rdx; // argv
-                frame.rdx = frame.r10; // envp
-                syscallExecve(frame);
-                return;
-            }
-            // v52.0: non-AT_FDCWD dirfd — resolve dir path and concatenate
-            if (dirfd > 0 and flags == 0) {
-                execveatWithDirfd(frame, dirfd);
-                return;
-            }
-            frame.rax = @bitCast(@as(i64, -38)); // ENOSYS for unsupported flags
+            execTail(frame, execve_mod.prepareExecAt(dirfdArg(frame.rdi), frame.rsi, frame.rdx, frame.r10, @truncate(frame.r8)));
         },
         // ── v39.0: Linux standard syscall number aliases (x86_64 ABI) ──────
         // Programs compiled against standard Linux headers use these numbers.
@@ -3062,125 +3046,17 @@ fn syscallFork(frame: *SyscallFrame) void {
 
 /// Syscall #59: execve(filename, argv, envp) — replace current process with new program
 fn syscallExecve(frame: *SyscallFrame) void {
-    const frame_addr = execve_mod.prepareExec(frame.rdi, frame.rsi, frame.rdx) orelse {
-        frame.rax = @bitCast(errno.EPERM);
-        return;
-    };
-
-    asm volatile (
-        \\movq %[anchor], %%rsp
-        \\popq %%r15
-        \\popq %%r14
-        \\popq %%r13
-        \\popq %%r12
-        \\popq %%r11
-        \\popq %%r10
-        \\popq %%r9
-        \\popq %%r8
-        \\popq %%rbp
-        \\popq %%rdi
-        \\popq %%rsi
-        \\popq %%rdx
-        \\popq %%rcx
-        \\popq %%rbx
-        \\popq %%rax
-        \\addq $16, %%rsp
-        \\swapgs
-        \\iretq
-        :
-        : [anchor] "r" (frame_addr),
-        : .{ .memory = true });
-    unreachable;
+    execTail(frame, execve_mod.prepareExec(frame.rdi, frame.rsi, frame.rdx));
 }
 
-/// v52.0: execveat helper for non-AT_FDCWD dirfd resolution.
-/// Resolves dirfd to its stored path, concatenates with relative pathname,
-/// and calls prepareExecWithKernelPath.
-fn execveatWithDirfd(frame: *SyscallFrame, dirfd: i32) void {
-    const copy = @import("../../mm/copy_from_user.zig");
-    const ext2_mod = @import("../../fs/ext2.zig");
-    const sched_m = @import("../../proc/sched.zig");
-    const task_m = @import("../../proc/task.zig");
-    const vfs_m = @import("../../fs/vfs.zig");
-    const execve_m = @import("../../proc/execve.zig");
-
-    if (execve_m.threadedExecDenied()) {
-        frame.rax = @bitCast(errno.EPERM);
-        return;
-    }
-
-    const cur_idx = sched_m.currentTaskIndex() orelse {
-        frame.rax = @bitCast(@as(i64, -9));
-        return;
-    };
-    const t = task_m.getTask(cur_idx) orelse {
-        frame.rax = @bitCast(@as(i64, -9));
-        return;
-    };
-    const fd: u32 = @intCast(dirfd);
-    if (fd >= vfs_m.MAX_FDS or t.fd_table.fds[fd].fd_type != .ext2_file) {
-        frame.rax = @bitCast(@as(i64, -9));
-        return;
-    }
-    const ext2_idx = t.fd_table.fds[fd].ext2_file_idx;
-    const dir_path = ext2_mod.getOpenFilePath(ext2_idx) orelse {
-        frame.rax = @bitCast(@as(i64, -9));
-        return;
-    };
-
-    // v52.3: use stack buffers (512 bytes safe for kernel stack, avoids SMP race)
-    var rel_buf: [256]u8 = undefined;
-    var combined: [256]u8 = undefined;
-
-    const rc = copy.copyPathFromUser(rel_buf[0..], frame.rsi, 255);
-    if (rc == 0) {
-        frame.rax = @bitCast(@as(i64, -14));
-        return;
-    }
-    rel_buf[if (rc < 255) rc else 255] = 0;
-    var rlen: usize = 0;
-    while (rlen < 256 and rel_buf[rlen] != 0) : (rlen += 1) {}
-
-    // v52.4: absolute pathname — dirfd is ignored per POSIX/Linux semantics
-    if (rlen > 0 and rel_buf[0] == '/') {
-        const frame_addr = execve_mod.prepareExecWithKernelPath(rel_buf[0..rlen], frame.rdx, frame.r10) orelse {
-            frame.rax = @bitCast(@as(i64, -13));
+/// Return the errno of a failed exec, or jump into the new image.
+fn execTail(frame: *SyscallFrame, prepared: execve_mod.Prepared) void {
+    const frame_addr = switch (prepared) {
+        .frame => |f| f,
+        .err => |e| {
+            frame.rax = @bitCast(e);
             return;
-        };
-        asm volatile (
-            \\movq %[anchor], %%rsp
-            \\popq %%r15
-            \\popq %%r14
-            \\popq %%r13
-            \\popq %%r12
-            \\popq %%r11
-            \\popq %%r10
-            \\popq %%r9
-            \\popq %%r8
-            \\popq %%rbp
-            \\popq %%rdi
-            \\popq %%rsi
-            \\popq %%rdx
-            \\popq %%rcx
-            \\popq %%rbx
-            \\popq %%rax
-            \\addq $16, %%rsp
-            \\swapgs
-            \\iretq
-            :
-            : [anchor] "r" (frame_addr),
-            : .{ .memory = true });
-        unreachable;
-    }
-
-    const path = ext2_mod.buildCombinedPath(&combined, dir_path, rel_buf[0..rlen]) orelse {
-        frame.rax = @bitCast(@as(i64, -36));
-        return;
-    };
-
-    const frame_addr = execve_mod.prepareExecWithKernelPath(path, frame.rdx, frame.r10) orelse {
-        frame.rax = @bitCast(@as(i64, -13));
-        return;
+        },
     };
 
     asm volatile (

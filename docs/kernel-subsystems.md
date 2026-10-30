@@ -925,6 +925,13 @@ const SchedStats = struct {
 - `EPOLL_CTL_ADD` 沿 child epoll 链（`nestedChainReaches`，visited bitmap 有界）检测间接环，构成环返回 `ELOOP`——环上就绪互相传播会使 `epoll_wait` 永久 busy-loop。（§6.51）
 - MoqIPC receive 被信号/`moqipc_notify` 踢醒时统一清理 `waiting_receiver` 注册并按唤醒来源分类返回：endpoint 失效才报 `invalid_endpoint`，存活 endpoint 的无投递唤醒报 EINTR（信号）/EAGAIN（notify）——注册残留曾让 endpoint 对所有 sender 永久报废。（§6.51）
 - `alarm`/`itimer` deadline 字段与 per-CPU run-queue 的 `nr_running` 计数全部原子访问（tick 扫描器跨 CPU 与 syscall 上下文并发）。（§6.51）
+- execve/execveat（hello122）：两者共用 `execve.prepareExecAt` → `prepareExecName`（此前 execveat 有一份复制的实现，
+  漏掉了 `posix_mq.closeCloexecForTask`，带 O_CLOEXEC 的消息队列描述符会穿过 execveat 留下来）。名字经 `dirfd_name.resolve`
+  按 cwd 或 dirfd 解析（任意文件系统的目录 fd；空闲 fd EBADF，非目录 ENOTDIR），再由 `proc/exec_policy.programName` 映射到
+  ramdisk：程序只存在于平坦的 ramdisk，解析结果是根下的单段名（带不带前导斜杠）才可执行，更深的路径 ENOENT。
+  失败返回 Linux 错误码而不是一律 EPERM：找不到 ENOENT、不是 ELF ENOEXEC、地址空间分配失败 ENOMEM、路径指针坏 EFAULT、
+  execveat 未知 flags EINVAL；EPERM 只留给多线程 exec 和仍有 SysV SHM 附着的情况。`AT_EMPTY_PATH` 被接受但空名字
+  得到 ENOENT（程序不能以描述符形式打开）。
 - execve 初始栈与 spawn 路径一样携带 AT_PHDR/AT_PHNUM（PT_PHDR 段地址优先、`e_phoff` 回退）；栈 16 字节对齐 pad 位于 AT_NULL 之上——envp 终止符与第一个 auxv 项之间不允许出现零字（crt0 从 `envp+1` 开始扫描 auxv，先见零即终止，TLS 初始化随之失效）。行为级 host 测试锁定两种奇偶组合。（§6.51）
 - moqi_libc `struct ksigaction` 为 Linux 字段序 {handler, flags, restorer, mask}（`_Static_assert` 锁定 mask@24/handler@0）：内核在完整结构可寻址时从 offset 24 读 `sa_mask` 应用，字段序错位曾使每次 `sigaction()` 把 restorer 当掩码写入并静默清零信号掩码。（§6.51）
 - FAT32 open descriptors now hold per-slot references; unlink tombstones the directory entry but defers cluster reclamation and slot reuse until the final inherited/duplicated fd closes.
@@ -2241,7 +2248,7 @@ DMA 分配/校验/释放 → munmap MMIO。标记：`hello51: PASS` / `hello51 d
   传入任务的位图**拷贝**进去（`ioperm.loadForTask` →
   `gdt.loadIoBitmap`，仿 Linux `tss_copy_io_bitmap`）。加载与 TSS
   RSP0 更新严格同点：`sched.setupUserCpuState`、`sched.tryStealTask`、
-  `execve`（两处）、`waitpid` 唤醒恢复、
+  `execve`（execve 与 execveat 共用 `prepareExecName`）、`waitpid` 唤醒恢复、
   `syscall_entry.prepareSyscallCpu`（惰性再同步）。漏掉任何一处都会把
   前一个任务的端口权限泄漏给下一个任务。`ioperm_set` 本身在改完位图后
   立即刷新当前 CPU 的活副本。

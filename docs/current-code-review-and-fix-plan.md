@@ -5223,3 +5223,18 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   被旧的 `moqios-local-cache`（13 GB 构建缓存）占满，冒烟的私有磁盘镜像写不下去，与内核改动无关；清掉缓存后重跑全部通过。
   aarch64 交叉构建同样因此失败（clang 临时文件写 `/tmp`），用 `TMPDIR` 指到家目录后通过。
 
+### execve/execveat 的错误码与名字解析（hello122）
+
+- 问题：(1) execve 的任何失败都返回 EPERM（找不到程序、不是 ELF、内存不足都一样），execveat 用 dirfd 时一律 EACCES，
+  非零 flags 一律 ENOSYS；(2) execveat 自带一份 prepareExec 的复制品，两份已经分叉——复制品漏掉了
+  `posix_mq.closeCloexecForTask`（O_CLOEXEC 的 POSIX 消息队列描述符穿过 execveat 保留）；(3) execveat 只认 ext2 dirfd，
+  `dirfd == 0` 被当成 AT_FDCWD；execve 不看 cwd（`chdir /testdir` 后 `execve("hello2")` 仍执行根下的程序）；
+  (4) `createMmForRoot` 失败时新地址空间泄漏。
+- 修复：`proc/exec_policy.zig`（`programName`、`checkAtFlags`、`errno`），`execve.prepareExecAt`/`prepareExecName` 单一实现，
+  返回 `Prepared{frame|err}`；系统调用层共用 `execTail`；删除 `execveatWithDirfd` 和不再使用的 `ext2.buildCombinedPath`。
+- TDD：host 新增 4 个测试（名字映射、flags、错误码表、ENOEXEC 在加载前判定）先编译失败后通过；源码守卫“exec 中止时销毁新地址空间”
+  改为检查单一实现并覆盖 `createMmForRoot` 失败分支。hello122（15 项）RED/GREEN 见下。
+- ENOEXEC 的运行时用例：hello2/hello3 是平坦二进制（spawn 能装载，exec 只认 ELF），exec 它们现在得到 ENOEXEC。
+  第一版 hello122 用 hello2 作 exec 目标，新旧内核 B 段都失败，查明后改用 ELF 程序 hello11（同样以 42 退出）——如实记录。
+- RED/GREEN：hello122（16 项）在未改动的内核上 12 项 FAIL，新内核 PASS。变异：解析后的名字不再使用（直接用原始名字）→ 3 项 FAIL。
+- 验证：host 743/743；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）3/3 PASS。
