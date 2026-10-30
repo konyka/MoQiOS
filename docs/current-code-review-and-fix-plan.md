@@ -5380,3 +5380,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 新增 5 个测试先编译失败后通过；hello134（31 项）在 HEAD 上 18 项 FAIL，新内核 PASS。
 - 变异：`socket()` 重新拒绝 `SOCK_CLOEXEC|SOCK_NONBLOCK` → hello134 A 段 3 项 FAIL，恢复后 PASS。
 - 验证：host 769/769；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### 信号调用参数（hello135）
+
+- 问题：探测 sigaction/kill/tkill/sigprocmask/sigpending/默认动作等共约 60 项，只有 `tkill` 有 2 项偏差：`tkill(self, 0)` 返回 EINVAL（应为 0，仅做存在性探测）；`tkill(负数, sig)` 因 tid 以 u32 解析而得到 ESRCH（应为 EINVAL）。
+- 修复：`proc_id_policy.tkillTargetTid`（纯策略）；`tkill` 先校验 tid 与 sig 范围，再依次 ESRCH、EPERM，`sig==0` 返回 0。
+- 已知缺口（未在本切片处理）：`sigaction`/`kill` 把信号号限制在 1–31，`pending_signals` 是 `u32`，Linux 的实时信号 32–64 不可用。扩展需要改 pending 位宽与处理函数数组，影响面大，留作单独切片。
+- TDD：host 新增 1 个测试；hello135 在 HEAD 上 2 项 FAIL，新内核 PASS。
+- 变异：`tkill(…, 0)` 改回 EINVAL → hello135 B 段 1 项 FAIL，恢复后 PASS。
+- 验证：host 770/770；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）3/3 PASS。

@@ -925,6 +925,7 @@ const SchedStats = struct {
 - `EPOLL_CTL_ADD` 沿 child epoll 链（`nestedChainReaches`，visited bitmap 有界）检测间接环，构成环返回 `ELOOP`——环上就绪互相传播会使 `epoll_wait` 永久 busy-loop。（§6.51）
 - MoqIPC receive 被信号/`moqipc_notify` 踢醒时统一清理 `waiting_receiver` 注册并按唤醒来源分类返回：endpoint 失效才报 `invalid_endpoint`，存活 endpoint 的无投递唤醒报 EINTR（信号）/EAGAIN（notify）——注册残留曾让 endpoint 对所有 sender 永久报废。（§6.51）
 - `alarm`/`itimer` deadline 字段与 per-CPU run-queue 的 `nr_running` 计数全部原子访问（tick 扫描器跨 CPU 与 syscall 上下文并发）。（§6.51）
+- **tkill 参数（hello135）**：`tkill(tid, sig)` 此前把 `sig==0` 当作 EINVAL（Linux 里 0 是存在性/权限探测），并把 `tid` 当 `u32`，负数 tid 被截成巨大的正数而得到 ESRCH。现在 tid 按有符号 `pid_t` 解析（`proc_id_policy.tkillTargetTid`：≤0 或 >0x7fffffff → EINVAL），顺序为 EINVAL → ESRCH → EPERM → `sig==0` 返回 0 → 投递。sigaction/kill/sigprocmask/sigpending 等其余信号调用经 hello135 探测未发现偏差。
 - **AF_UNIX 与 socket() 参数（hello134）**：(1) `socket()` 此前把 `type` 整个当作类型，`SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK`（现代 libc 的默认写法）得到 EINVAL，且无视 `protocol`、未知族返回 `-38`。现在
   `namespace_policy.socketArgs` 拆出类型与 `SOCK_CLOEXEC`/`SOCK_NONBLOCK`（作用在新描述符上），未知族 `EAFNOSUPPORT`，未知类型或未知标志位 `EINVAL`，AF_UNIX 的非零 protocol、AF_INET 的 TCP/UDP 与类型不符的 protocol
   `EPROTONOSUPPORT`。(2) **AF_UNIX 流套接字的阻塞语义**：`read/recv/accept` 在没有数据/连接时此前直接返回 EAGAIN（`unixRecv/unixAccept` 只有非阻塞路径，等待队列有消费者却没有生产者）。新增

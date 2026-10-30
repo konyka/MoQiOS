@@ -7519,3 +7519,12 @@ test "stream send after the peer is gone is EPIPE, before any connection is ENOT
     try std.testing.expectEqual(@as(i64, 0), np.streamSendErrno(true, true));
     try std.testing.expectEqual(@as(i64, 0), np.streamSendErrno(false, true)); // queued: handled elsewhere
 }
+
+test "tkill target tid must be a positive pid_t" {
+    const ip = kt.proc_id_policy;
+    try std.testing.expectEqual(@as(?u32, 1), ip.tkillTargetTid(1));
+    try std.testing.expectEqual(@as(?u32, 0x7FFF_FFFF), ip.tkillTargetTid(0x7FFF_FFFF));
+    try std.testing.expectEqual(@as(?u32, null), ip.tkillTargetTid(0));
+    try std.testing.expectEqual(@as(?u32, null), ip.tkillTargetTid(-5));
+    try std.testing.expectEqual(@as(?u32, null), ip.tkillTargetTid(0x8000_0000));
+}

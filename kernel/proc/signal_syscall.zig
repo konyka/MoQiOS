@@ -470,9 +470,13 @@ pub fn rtSigqueueinfo(tgid: u32, sig: u32, uinfo_ptr: u64) i64 {
 }
 
 /// tkill(tid, sig) → 0 or -errno
-pub fn tkill(tid: u32, sig: u32) i64 {
-    if (sig == 0 or sig > 64) return -22;
+pub fn tkill(tid_arg: i64, sig: u32) i64 {
+    const id_policy = @import("proc_id_policy.zig");
+    if (sig > 64) return -22;
+    const tid = id_policy.tkillTargetTid(tid_arg) orelse return -22;
+    _ = task_mod.findTaskByTid(tid) orelse return -3; // ESRCH
     if (!currentMaySignalTask(tid)) return -1; // EPERM
+    if (sig == 0) return 0; // existence and permission probe
     if (sig_mod.sendSignal(tid, sig)) return 0;
     return -3; // ESRCH
 }

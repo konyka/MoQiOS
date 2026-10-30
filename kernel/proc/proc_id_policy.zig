@@ -16,6 +16,12 @@ pub fn killTargetTid(pid: i64) ?u32 {
     return @intCast(pid);
 }
 
+/// tkill(tid, sig) target tid, or null when tid is not a positive pid_t.
+pub fn tkillTargetTid(tid: i64) ?u32 {
+    if (tid <= 0 or tid > 0x7FFF_FFFF) return null;
+    return @intCast(tid);
+}
+
 /// kill(pid < -1) process group, or null when -pid cannot be a pgid.
 pub fn killTargetPgid(pid: i64) ?u16 {
     if (pid >= -1 or pid < -@as(i64, MAX_GROUP_ID)) return null;

@@ -1202,7 +1202,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(signal_syscall_mod.rtSigqueueinfo(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx));
         },
         223 => { // tkill(tid, sig)
-            frame.rax = @bitCast(signal_syscall_mod.tkill(@truncate(frame.rdi), @truncate(frame.rsi)));
+            frame.rax = @bitCast(signal_syscall_mod.tkill(@as(i32, @truncate(@as(i64, @bitCast(frame.rdi)))), @truncate(frame.rsi)));
             // POSIX: a signal sent to oneself is delivered before the call returns.
             checkSignalsOnSyscallReturn(frame);
         },

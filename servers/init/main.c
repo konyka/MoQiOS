@@ -262,6 +262,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello132"); /* clocks and sleeping */
     run_test("hello133"); /* wait status, options, orphaning, pgrp/session */
     run_test("hello134"); /* socket flags and AF_UNIX semantics */
+    run_test("hello135"); /* signal call argument and errno rules */
 
     start_persistent_services();
 
