@@ -5581,3 +5581,19 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 新增 1 个测试（`sendTimeoutResult`）；hello150 E 段（设置超时、写 30000 字节返回部分字节且约 150 ms、下一次写 `EAGAIN`、读者腾出空间后立即写成功）在 HEAD 上因写永远阻塞而冒烟超时，新内核 PASS。
 - 变异：让 `snd_ms` 恒为 0（不取套接字的发送超时）→ hello150 E 段的写永远阻塞，冒烟超时；恢复后 PASS。
 - 验证：host 793/793；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、GPT SMP=2 hello150 PASS、0 FAIL；SMP=8 第一次运行停在 hello144 D 段（已知的间歇性停顿，0 个 FAIL），重跑 PASS；stress（SMP=2）5/5 PASS。
+
+### TCP 套接字的 read/write、阻塞发送、SO_SNDTIMEO，以及五个大块传输缺陷（hello151）
+
+- 问题：`read(2)`/`write(2)` 在 TCP 套接字描述符上返回 -1；`sendto` 在 64 KB 发送环满时返回短写或 0 而不阻塞，`SO_SNDTIMEO` 不生效。要让一次 300000 字节的阻塞写跑通，必须真正把数据发过 1 MB 以内的多个窗口，这条路径此前没有任何测试覆盖，一次就暴露出五个独立的 TCP 缺陷（见 `docs/kernel-subsystems.md` 的 hello151 条）。
+- 修复：`tcp.tcpSendBlocking`/`waitSendSpace`（发送等待者链 + ACK 唤醒 + 超时）；`vfs` 的 `read`/`write` 接 `tcpRecvBlocking`/`tcpSendBlocking`；`sendto`/`sendmsg` 改用阻塞发送；`dataSegmentCap`、`bumpDupAck`、`prrCwnd`、`snd_max` 初值与 `unackedPending`、`oooReport`、RTO 清 SACK 记分板。
+- 排查过程（如实）：
+  - 第一个现象是 B 段写者睡死，加追踪后发现 `sendSegment` 因 MTU 门禁对每个满段返回 false（时间戳选项）。
+  - 修好后 C 段出现内核 panic“integer overflow”，用 `addr2line`/`objdump -l` 定位到 `dup_ack_count += 1`（`u3`）。
+  - 接着 B 段仍偶发停住：追踪显示 `cwnd=0`、`rec=true`、无在途数据——PRR 把窗口算成 0。
+  - 再之后 B 段在约三分之一的运行里写者返回短写：RTO 追踪显示 `retransmit_count` 到 6 后连接被关闭；第一批追踪里 `max=0` 暴露了 `snd_max` 初值问题（空闲连接 `RTO#1` 就在没有数据时触发），修复后仍有一类停住，追踪显示发送方 `sb0` 记分板覆盖了从 `snd_una` 起整个窗口、而接收方 `rcv_nxt == snd_una`——接收方把丢弃的乱序段报告成了 SACK。
+  - 中途我写错过两次探测：C 段第二次写返回 100（缓冲区被 ACK 释放出了一点空间，不是失败），改成循环到写入不再成功；追踪时用了 55 秒的冒烟超时，短于完整 init 序列，得到的“全部失败”不是真实结果，已丢弃。
+- 已知差异：接收方没有乱序队列；`SO_SNDBUF` 不改变发送环；`hello108` 偶发失败仍在。
+- TDD：host 新增 9 个测试（`dataSegmentCap`、`bumpDupAck`、`prrCwnd`、`unackedPending`、七处 `snd_max` 播种、`oooReport`、RTO 清记分板、`bdpWindow`、BBR 路径都带下限）；hello151（A：`write`/`read`/`O_NONBLOCK`/EOF；B：300000 字节阻塞写，读者收齐且字节完整；C：`SO_SNDTIMEO`）在 HEAD 上 11 项 FAIL。
+- 又一个缺陷（循环验证时才暴露）：带宽时延积（BDP）算出的窗口在回环上只有几个字节（亚毫秒 RTT、稀疏速率样本），BBR 的 Startup/ProbeBW/ProbeRTT 退出把它直接当作 `cwnd`/`ssthresh`，发送方一次只发几个字节（追踪里 `cwnd=9`、`ssthresh=13`），B 段约 1/10 的运行在超时内写不完。`tcp_util.bdpWindow` 给这些路径加上两个 SMSS 的下限。
+- 变异：去掉 `dataSegmentCap` 的选项扣减、`bumpDupAck` 改回回绕加法、`oooReport` 对领先段改成报告、RTO 不清记分板，各自被对应的 host 测试抓住（`dataSegmentCap` 变异报 `expected 1448, found 1460`）；`prrCwnd`/`bdpWindow` 的变异使测试编译失败（多余变量），不算有效证据，这两项靠各自的数值断言覆盖。
+- 验证：host 802/802；x86_64/riscv64/aarch64 构建通过；hello151 在循环冒烟里 10/10 PASS（修复 `bdpWindow` 前约 1/3 的运行 B 段停住）；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

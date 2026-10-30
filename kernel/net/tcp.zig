@@ -51,7 +51,7 @@ const TcpLock = struct {
     }
 
     inline fn release(self: *TcpLock, saved: u64) void {
-        const chain = if (recv_wake_pending != 0) takeRecvWakesLocked() else null;
+        const chain = if (recv_wake_pending != 0 or send_wake_pending != 0) takeRecvWakesLocked() else null;
         self.inner.release(saved);
         if (chain != null) wakeRecvChain(chain);
     }
@@ -369,10 +369,24 @@ var recv_waiters: [MAX_CONNECTIONS]?*RecvWaitNode = @splat(null);
 /// can change (data, FIN, RST, teardown); drained by flushRecvWakes.
 var recv_wake_pending: u64 = 0;
 
-/// Mark `tcb`'s blocked readers for wake-up (call with tcp_lock held).
+/// Per-slot list of blocked writers (waiting for send-ring space) and the
+/// bitmap of slots whose writers must be woken once tcp_lock is released.
+var send_waiters: [MAX_CONNECTIONS]?*RecvWaitNode = @splat(null);
+var send_wake_pending: u64 = 0;
+
+/// Mark `tcb`'s blocked readers for wake-up (call with tcp_lock held). A
+/// blocked writer re-checks on every such event too: teardown, reset and
+/// state changes all end its wait.
 inline fn markRecvWake(tcb: *const TcpTcb) void {
     const idx: u6 = @intCast(tcbIdx(tcb));
     if (recv_waiters[idx] != null) recv_wake_pending |= @as(u64, 1) << idx;
+    if (send_waiters[idx] != null) send_wake_pending |= @as(u64, 1) << idx;
+}
+
+/// Mark `tcb`'s blocked writers for wake-up: an ACK freed send-ring space.
+inline fn markSendWake(tcb: *const TcpTcb) void {
+    const idx: u6 = @intCast(tcbIdx(tcb));
+    if (send_waiters[idx] != null) send_wake_pending |= @as(u64, 1) << idx;
 }
 
 /// Unlink every waiter of the slots marked by markRecvWake (tcp_lock held)
@@ -388,6 +402,19 @@ fn takeRecvWakesLocked() ?*RecvWaitNode {
         bm &= bm - 1;
         var cur = recv_waiters[i];
         recv_waiters[i] = null;
+        while (cur) |node| {
+            cur = node.next;
+            node.next = chain;
+            chain = node;
+        }
+    }
+    bm = send_wake_pending;
+    send_wake_pending = 0;
+    while (bm != 0) {
+        const i = @ctz(bm);
+        bm &= bm - 1;
+        var cur = send_waiters[i];
+        send_waiters[i] = null;
         while (cur) |node| {
             cur = node.next;
             node.next = chain;
@@ -415,7 +442,15 @@ fn wakeRecvChain(chain: ?*RecvWaitNode) void {
 
 /// Remove `node` from slot `idx`'s waiter list if still linked (tcp_lock held).
 fn unlinkRecvWaiterLocked(idx: u32, node: *RecvWaitNode) void {
-    var link: *?*RecvWaitNode = &recv_waiters[idx];
+    unlinkWaiterFrom(&recv_waiters[idx], node);
+}
+
+fn unlinkSendWaiterLocked(idx: u32, node: *RecvWaitNode) void {
+    unlinkWaiterFrom(&send_waiters[idx], node);
+}
+
+fn unlinkWaiterFrom(head: *?*RecvWaitNode, node: *RecvWaitNode) void {
+    var link: *?*RecvWaitNode = head;
     while (link.*) |cur| {
         if (cur == node) {
             link.* = cur.next;
@@ -1698,11 +1733,12 @@ fn applyBdpCwndFloor(tcb: *TcpTcb) void {
 
 /// BBR-lite Startup: grow toward 2·BDP; on reach, Drain to 1·BDP (SK-121/148).
 fn applyBbrStartup(tcb: *TcpTcb, acked: u32, smss: u32) void {
-    const target = if (tcb.accecn_ok)
+    const raw_target = if (tcb.accecn_ok)
         probeL4sStartupCwnd(tcb.delivery_rate, tcb.min_rtt_ms, tcb.l4s_ce_ewma)
     else
         probeBbrStartupCwnd(tcb.delivery_rate, tcb.min_rtt_ms);
-    if (target == 0) return;
+    if (raw_target == 0) return;
+    const target = tcp_util.bdpWindow(raw_target, smss);
     if (tcb.cwnd < target) {
         const step = @max(acked, smss);
         const next = tcb.cwnd +% step;
@@ -1717,8 +1753,9 @@ fn applyBbrStartup(tcb: *TcpTcb, acked: u32, smss: u32) void {
         tcb.bbr_cycle_ms = 0;
         const bdp = probeBdpBytes(tcb.delivery_rate, tcb.min_rtt_ms);
         if (bdp > 0) {
-            tcb.ssthresh = bdp;
-            if (tcb.cwnd > bdp) tcb.cwnd = bdp;
+            const w = tcp_util.bdpWindow(bdp, smss);
+            tcb.ssthresh = w;
+            if (tcb.cwnd > w) tcb.cwnd = w;
         }
     }
 }
@@ -1729,7 +1766,7 @@ fn applyBbrProbeBw(tcb: *TcpTcb, acked: u32) void {
     if (bdp == 0) return;
     advanceBbrCycle(tcb);
     const gain = bbrCycleGainFor(tcb);
-    const target = probeBbrCycleCwnd(bdp, gain);
+    const target = tcp_util.bdpWindow(probeBbrCycleCwnd(bdp, gain), mssForTcb(tcb));
     if (target == 0) return;
     if (tcb.cwnd < target) {
         const next = tcb.cwnd +% acked;
@@ -1837,8 +1874,9 @@ fn maybeExitProbeRtt(tcb: *TcpTcb) void {
     if (tcb.min_rtt_ms == 0) tcb.min_rtt_ms = tcb.bbr_prior_min_rtt_ms;
     const bdp = probeBdpBytes(tcb.delivery_rate, tcb.min_rtt_ms);
     if (bdp > 0) {
-        tcb.cwnd = bdp;
-        tcb.ssthresh = bdp;
+        const w = tcp_util.bdpWindow(bdp, mssForTcb(tcb));
+        tcb.cwnd = w;
+        tcb.ssthresh = w;
     } else if (tcb.bbr_prior_cwnd > 0) {
         tcb.cwnd = tcb.bbr_prior_cwnd;
     }
@@ -1893,6 +1931,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
             reuse_tcb.iss = generateIss();
             reuse_tcb.snd_una = reuse_tcb.iss;
             reuse_tcb.snd_nxt = reuse_tcb.iss;
+            reuse_tcb.snd_max = reuse_tcb.iss;
             reuse_tcb.irs = seq_num;
             reuse_tcb.rcv_nxt = seq_num + 1;
             reuse_tcb.rcv_wnd = TCP_WINDOW;
@@ -1932,6 +1971,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
     new_tcb.iss = generateIss();
     new_tcb.snd_una = new_tcb.iss;
     new_tcb.snd_nxt = new_tcb.iss;
+    new_tcb.snd_max = new_tcb.iss;
     new_tcb.snd_wnd = TCP_WINDOW;
     new_tcb.irs = seq_num;
     new_tcb.rcv_nxt = seq_num + 1;
@@ -2004,6 +2044,7 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
             reuse_tcb.iss = generateIss();
             reuse_tcb.snd_una = reuse_tcb.iss;
             reuse_tcb.snd_nxt = reuse_tcb.iss;
+            reuse_tcb.snd_max = reuse_tcb.iss;
             reuse_tcb.irs = seq_num;
             reuse_tcb.rcv_nxt = seq_num + 1;
             reuse_tcb.rcv_wnd = TCP_WINDOW;
@@ -2037,6 +2078,7 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
     new_tcb.iss = generateIss();
     new_tcb.snd_una = new_tcb.iss;
     new_tcb.snd_nxt = new_tcb.iss;
+    new_tcb.snd_max = new_tcb.iss;
     new_tcb.snd_wnd = TCP_WINDOW;
     new_tcb.irs = seq_num;
     new_tcb.rcv_nxt = seq_num + 1;
@@ -2245,6 +2287,7 @@ fn driveTcbStateMachine(
                         // v53.2: advance send_head to free acknowledged buffer space
                         // Without this, the ring buffer permanently fills → connection deadlock
                         tcb.send_head = (tcb.send_head + acked) % SEND_BUF_SIZE;
+                        markSendWake(tcb);
                         // send_unacked must NOT advance here: it tracks snd_nxt's
                         // ring position (send_head + (snd_nxt -% snd_una)) and an
                         // ACK does not move snd_nxt. Advancing it desynced the
@@ -2400,7 +2443,7 @@ fn driveTcbStateMachine(
                             0;
                         noteDelivery(tcb, delivered);
 
-                        tcb.dup_ack_count += 1;
+                        tcb.dup_ack_count = tcp_util.bumpDupAck(tcb.dup_ack_count);
 
                         // SK-112/118/126/127: DupThresh, IsLost, or any RACK-lost hole.
                         const rack_hole = nextRackLostHole(tcb);
@@ -2535,6 +2578,7 @@ fn driveTcbStateMachine(
                 tcb.snd_una = ack_num;
                 tcb.send_head = tcb.send_tail;
                 tcb.send_unacked = tcb.send_tail;
+                markSendWake(tcb);
                 tcb.snd_nxt = ack_num;
                 tcb.retransmit_timer = 0; // v53.10: Reset for FIN_WAIT_2 timeout
                 tcb.state = .fin_wait_2;
@@ -2671,15 +2715,14 @@ fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) void
     if (seq != tcb.rcv_nxt) {
         if (tcb.sack_permitted and len > 0) {
             const seg_end = seq +% len;
-            if (tcp_util.seqLeq(seg_end, tcb.rcv_nxt)) {
+            switch (tcp_util.oooReport(seq, seg_end, tcb.rcv_nxt)) {
                 // SK-115: fully duplicate segment → RFC 2883 DSACK as first block.
-                reportDsack(tcb, seq, seg_end);
-            } else if (tcp_util.seqLt(tcb.rcv_nxt, seq)) {
-                // Pure out-of-order ahead of rcv_nxt.
-                addSackBlock(tcb, seq, seg_end);
-            } else {
+                .dsack_whole => reportDsack(tcb, seq, seg_end),
+                // Ahead of rcv_nxt: the segment is dropped (no out-of-order
+                // queue), so it must not be advertised as received.
+                .none => {},
                 // Straddles rcv_nxt: DSACK the already-received prefix.
-                reportDsack(tcb, seq, tcb.rcv_nxt);
+                .dsack_prefix => reportDsack(tcb, seq, tcb.rcv_nxt),
             }
         }
         // Send ACK with expected seq (and SACK/DSACK blocks if available)
@@ -2737,6 +2780,7 @@ pub fn tcpConnect(remote_ip: [4]u8, remote_port: u16, owner_task: u32) i64 {
     tcb.iss = generateIss();
     tcb.snd_una = tcb.iss;
     tcb.snd_nxt = tcb.iss;
+    tcb.snd_max = tcb.iss;
     tcb.snd_wnd = TCP_WINDOW;
     tcb.rcv_nxt = 0;
     tcb.rcv_wnd = TCP_WINDOW;
@@ -2775,6 +2819,7 @@ pub fn tcpConnectSocket(tcb_idx: u32, remote_ip: [4]u8, remote_port: u16) i64 {
     tcb.iss = generateIss();
     tcb.snd_una = tcb.iss;
     tcb.snd_nxt = tcb.iss;
+    tcb.snd_max = tcb.iss;
     tcb.snd_wnd = TCP_WINDOW;
     tcb.rcv_nxt = 0;
     tcb.rcv_wnd = TCP_WINDOW;
@@ -2809,6 +2854,7 @@ pub fn tcpConnectSocketV6(tcb_idx: u32, remote_ip6: [16]u8, remote_port: u16) i6
     tcb.iss = generateIss();
     tcb.snd_una = tcb.iss;
     tcb.snd_nxt = tcb.iss;
+    tcb.snd_max = tcb.iss;
     tcb.snd_wnd = TCP_WINDOW;
     tcb.rcv_nxt = 0;
     tcb.rcv_wnd = TCP_WINDOW;
@@ -2941,7 +2987,11 @@ fn flushSendBuffer(tcb: *TcpTcb) void {
         const in_flight = pipeBytes(tcb);
         const effective_wnd = @min(tcb.cwnd, tcb.snd_wnd);
         const window_avail = if (effective_wnd > in_flight) effective_wnd - in_flight else 0;
-        const can_send = @min(pending, window_avail, mss);
+        // Options ride in the same MTU as the payload: cap the data so the
+        // whole segment (headers + options + payload) fits.
+        const opt_len = tcp_util.segmentOptLen(false, tcb.ts_enabled, tcb.sack_permitted, tcb.sack_block_count, true);
+        const seg_cap = tcp_util.dataSegmentCap(mss, opt_len);
+        const can_send = @min(pending, window_avail, seg_cap);
 
         if (can_send == 0) break;
 
@@ -2958,11 +3008,11 @@ fn flushSendBuffer(tcb: *TcpTcb) void {
         }
 
         // TCP_CORK: only send full MSS segments (coalesce small writes)
-        if (tcb.options.tcp_cork and can_send < mss) break;
+        if (tcb.options.tcp_cork and can_send < seg_cap) break;
 
         // Nagle algorithm: if TCP_NODELAY is disabled and there is unacknowledged
         // data in flight, only send a full MSS segment (coalesce small writes).
-        if (!tcb.options.tcp_nodelay and !tcb.options.tcp_cork and in_flight > 0 and can_send < mss) {
+        if (!tcb.options.tcp_nodelay and !tcb.options.tcp_cork and in_flight > 0 and can_send < seg_cap) {
             tcb.nagle_pending = true;
             break;
         }
@@ -3082,6 +3132,7 @@ fn absorbDataAckBeforeFin(tcb: *TcpTcb, ack_num: u32, window: u32) void {
     if (acked != 0 and acked <= limit and acked <= SEND_BUF_SIZE) {
         tcb.snd_una = ack_num;
         tcb.send_head = (tcb.send_head + acked) % SEND_BUF_SIZE;
+        markSendWake(tcb);
         if (tcp_util.seqLt(tcb.snd_nxt, tcb.snd_una)) {
             tcb.snd_nxt = tcb.snd_una;
             tcb.send_unacked = tcb.send_head;
@@ -3125,6 +3176,15 @@ pub fn tcpRecv(tcb_idx: u32, buf: [*]u8, len: u32) i64 {
 /// `granted`/the ring on every loop iteration and a pending timer tick
 /// re-runs it on a timed wait.
 pub fn tcpRecvBlocking(tcb_idx: u32, buf: [*]u8, len: u32, nonblock: bool) i64 {
+    const r = tcpRecvBlockingWait(tcb_idx, buf, len, nonblock);
+    // Reading opened the window and queued an ACK; on a 127/8 connection the
+    // sender only sees it once the loopback queue is drained, so pump it now
+    // instead of waiting for the maintenance tick.
+    if (r > 0) _ = lo_dev.drain();
+    return r;
+}
+
+fn tcpRecvBlockingWait(tcb_idx: u32, buf: [*]u8, len: u32, nonblock: bool) i64 {
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const task_mod = @import("../proc/task.zig");
     const sched = @import("../proc/sched.zig");
@@ -3179,6 +3239,112 @@ pub fn tcpRecvBlocking(tcb_idx: u32, buf: [*]u8, len: u32, nonblock: bool) i64 {
             if (sig_mod.pendingActionable(ct)) return -4; // EINTR
         }
         // Loop: re-check generation, ring, state and deadline.
+    }
+}
+
+/// State a blocking send carries between its waits.
+const SendWait = struct {
+    generation: ?u64 = null,
+    deadline: ?u64 = null,
+    deadline_set: bool = false,
+};
+
+/// Sleep until the send ring of `tcb_idx` has room, the connection changes,
+/// a signal arrives, or the SO_SNDTIMEO deadline passes. 0 = retry the send;
+/// -11 timed out, -4 interrupted, -9 slot torn down or reused. Same
+/// lost-wakeup discipline as tcpRecvBlocking: the fullness check and the
+/// waiter insertion share one tcp_lock hold, ACK processing marks the slot
+/// under that lock (markSendWake) and the wake runs after release.
+fn waitSendSpace(tcb_idx: u32, st: *SendWait) i64 {
+    const task_mod = @import("../proc/task.zig");
+    const sched = @import("../proc/sched.zig");
+    const sig_mod = @import("../proc/signal.zig");
+    const tsc = @import("../arch/arch.zig").tsc;
+
+    var node: RecvWaitNode = .{ .task_idx = 0 };
+    const cur_idx = sched.currentTaskIndex() orelse return -1;
+    {
+        const lock_flags = tcp_lock.acquire();
+        defer tcp_lock.release(lock_flags);
+        const tcb = &tcbs[tcb_idx];
+        if (!tcb.active) return if (st.generation == null) -1 else -9;
+        if (st.generation) |g| {
+            if (tcb_generations[tcb_idx] != g) return -9;
+        } else st.generation = tcb_generations[tcb_idx];
+        if (!st.deadline_set) {
+            st.deadline = tcp_recv_policy.recvDeadlineNs(tsc.nanos(), tcb.options.snd_timeout_ms);
+            st.deadline_set = true;
+        }
+        // A connection that can no longer send, or a ring with room: retry
+        // now, the send reports the real error / progress.
+        if (tcb.state != .established or tcb.fin_pending) return 0;
+        const used = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
+        if (SEND_BUF_SIZE - 1 - used > 0) return 0;
+        if (tcp_recv_policy.timedOut(st.deadline, tsc.nanos())) return -11;
+
+        node.task_idx = cur_idx;
+        node.next = send_waiters[tcb_idx];
+        send_waiters[tcb_idx] = &node;
+        task_mod.blockTask(cur_idx);
+        if (st.deadline) |d| armRecvDeadline(cur_idx, d);
+    }
+
+    sched.forceReschedule();
+    sched.repairCurrentAfterBlock();
+
+    {
+        const lock_flags = tcp_lock.acquire();
+        defer tcp_lock.release(lock_flags);
+        unlinkSendWaiterLocked(tcb_idx, &node);
+    }
+    if (st.deadline != null) disarmRecvDeadline(cur_idx);
+
+    if (task_mod.getTask(cur_idx)) |ct| {
+        if (sig_mod.pendingFatal(ct)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+        if (sig_mod.pendingActionable(ct)) return -4;
+    }
+    return 0;
+}
+
+/// Kernel-buffer send that also pumps the loopback queue, so a 127/8 peer
+/// blocked in recv sees the segments without waiting for the maintenance tick.
+fn tcpSendKernel(tcb_idx: u32, data: [*]const u8, len: u32) i64 {
+    const r = tcpSend(tcb_idx, data, len);
+    if (r > 0) _ = lo_dev.drain();
+    return r;
+}
+
+/// write()/send() on a TCP socket: queue all `len` bytes, sleeping while the
+/// send ring is full (blocking sockets), until SO_SNDTIMEO runs out or a
+/// signal arrives. A non-blocking call, or one cut short after progress,
+/// reports the bytes queued; EAGAIN only when nothing was. `is_user` says
+/// whether `addr` is a user address (copied in stages) or a kernel pointer.
+pub fn tcpSendBlocking(tcb_idx: u32, addr: u64, is_user: bool, len: u32, nonblock: bool) i64 {
+    if (tcb_idx >= MAX_CONNECTIONS) return -1;
+    const np = @import("../fs/namespace_policy.zig");
+    var st: SendWait = .{};
+    var done: u32 = 0;
+    while (true) {
+        const rest = len - done;
+        const r = if (is_user)
+            tcpSendFromUser(tcb_idx, addr + done, rest)
+        else
+            tcpSendKernel(tcb_idx, @ptrFromInt(addr + done), rest);
+        const result: i64 = if (r == 0) -11 else r;
+        switch (np.writeProgress(len, done, result, nonblock)) {
+            .done => return len,
+            .again => {
+                done += @intCast(result);
+                continue;
+            },
+            .partial => return @as(i64, done) + @max(result, 0),
+            .fail => return result,
+            .wait => {},
+        }
+        const w = waitSendSpace(tcb_idx, &st);
+        if (w == 0) continue;
+        if (done == 0) return w;
+        return @intCast(done);
     }
 }
 
@@ -3399,7 +3565,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
     }
 
     // Check for unacknowledged data (use snd_max so rexmit rewind still counts).
-    if (tcp_util.seqLt(tcb.snd_una, tcb.snd_max) or tcb.snd_nxt != tcb.snd_una) {
+    if (tcp_util.unackedPending(tcb.snd_una, tcb.snd_nxt, tcb.snd_max)) {
         tcb.retransmit_timer +%= ms_elapsed;
         // Use per-TCB RTO if available, otherwise fall back to RETRANSMIT_MS
         const current_rto = if (tcb.rto > 0) tcb.rto else RETRANSMIT_MS;
@@ -3421,6 +3587,9 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
         if (tcb.retransmit_timer >= current_rto) {
             tcb.retransmit_timer = 0;
             tcb.retransmit_count += 1;
+            // RFC 2018 §8: a receiver may renege on SACKed data, so after an
+            // RTO nothing is trusted as delivered; resend from snd_una.
+            tcb.sack_scoreboard_count = 0;
             if (tcb.retransmit_count > 5) {
                 // Give up
                 tcpLog("[tcp] retransmit timeout, closing\n");
@@ -3935,29 +4104,6 @@ fn reportDsack(tcb: *TcpTcb, left: u32, right: u32) void {
     if (tcb.sack_block_count < 4) tcb.sack_block_count += 1;
 }
 
-/// Add or merge a SACK block on the receiver side.
-fn addSackBlock(tcb: *TcpTcb, left: u32, right: u32) void {
-    // Try to merge with existing blocks
-    for (0..tcb.sack_block_count) |i| {
-        const blk = &tcb.sack_blocks[i];
-        if (blk.left == right or blk.right == left) {
-            // Merge
-            if (left < blk.left) blk.left = left;
-            if (right > blk.right) blk.right = right;
-            return;
-        }
-        if (left >= blk.left and right <= blk.right) return; // already covered
-    }
-    // Add new block
-    if (tcb.sack_block_count < 4) {
-        tcb.sack_blocks[tcb.sack_block_count] = .{ .left = left, .right = right };
-        tcb.sack_block_count += 1;
-    } else {
-        // Replace the oldest (last) block
-        tcb.sack_blocks[3] = .{ .left = left, .right = right };
-    }
-}
-
 /// RFC 6675 UpdateScoreboard: clip by [snd_una,snd_nxt), merge overlap/adjacent,
 /// keep at most 4 highest ranges (SK-113).
 pub fn probeMergeScoreboard(
@@ -4238,7 +4384,7 @@ fn applyPrr(tcb: *TcpTcb, delivered_data: u32) void {
         tcb.prr_out,
         delivered_data,
     );
-    tcb.cwnd = pipe + sndcnt;
+    tcb.cwnd = tcp_util.prrCwnd(pipe, sndcnt, mssForTcb(tcb));
 }
 
 /// RFC 2883 DSACK: first block already cum-ACKed, or subset of a later block (SK-115).

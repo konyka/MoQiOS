@@ -36,6 +36,7 @@ pub const procfs_source = @embedFile("fs/procfs.zig");
 pub const ext2_source = @embedFile("fs/ext2.zig");
 pub const page_cache_source = @embedFile("fs/page_cache.zig");
 pub const splice_source = @embedFile("fs/splice.zig");
+pub const tcp_source = @embedFile("net/tcp.zig");
 pub const ioctl_source = @embedFile("fs/ioctl.zig");
 pub const virtio_net_source = @embedFile("drivers/virtio_net.zig");
 pub const virtio_net_queue_source = @embedFile("drivers/virtio_net_queue.zig");

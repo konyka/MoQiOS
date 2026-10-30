@@ -96,6 +96,66 @@ pub fn segmentOptLen(is_syn: bool, ts_enabled: bool, sack_permitted: bool, sack_
     return opt_len;
 }
 
+/// Duplicate-ACK counter step. The counter is a u3: a peer that keeps sending
+/// duplicate ACKs (a zero-window receiver answering probes, a long recovery)
+/// must saturate it, not overflow-panic the kernel.
+pub fn bumpDupAck(count: u3) u3 {
+    return count +| 1;
+}
+
+/// Congestion window after a PRR step (RFC 6937): the bytes in flight plus what
+/// PRR allows to send now. With nothing in flight and sndcnt 0 that would be a
+/// window of 0 — no segment, hence no ACK to leave recovery and no RTO armed:
+/// the connection would sit there for good. Linux guarantees the same thing
+/// (sndcnt >= 1 segment when the pipe is empty), so at least one SMSS may go.
+pub fn prrCwnd(pipe: u32, sndcnt: u32, smss: u32) u32 {
+    const w = pipe +| sndcnt;
+    if (pipe == 0 and w < smss) return smss;
+    return w;
+}
+
+/// Whether the retransmission timer has anything to guard: data (or a SYN/FIN)
+/// sent and not yet acknowledged. `snd_max` is the highest sequence ever sent
+/// and must start at the initial send sequence: left at 0 it compares below
+/// every snd_una >= 2^31 in serial arithmetic, so an idle connection with a
+/// high ISS looked permanently "unacked", fired spurious RTOs (cwnd reset,
+/// backoff) and was finally closed after six of them.
+pub fn unackedPending(snd_una: u32, snd_nxt: u32, snd_max: u32) bool {
+    return seqLt(snd_una, snd_max) or snd_nxt != snd_una;
+}
+
+/// What the receiver reports for a data segment that is not at `rcv_nxt`.
+/// The receive path keeps no out-of-order data, so a SACK block for a segment
+/// ahead of `rcv_nxt` would promise bytes that are thrown away: the sender
+/// would mark them delivered, never resend them once the hole is filled and
+/// stall until the connection is given up. Only data the receiver really holds
+/// may be reported (RFC 2883 DSACK of duplicates).
+pub const OooReport = enum { none, dsack_whole, dsack_prefix };
+
+pub fn oooReport(seq: u32, seg_end: u32, rcv_nxt: u32) OooReport {
+    if (seqLeq(seg_end, rcv_nxt)) return .dsack_whole;
+    if (seqLt(rcv_nxt, seq)) return .none;
+    return .dsack_prefix;
+}
+
+/// A window derived from the bandwidth-delay product, never below two segments.
+/// Delivery-rate x min-RTT is a handful of bytes on loopback (sub-millisecond
+/// RTT, sparse samples); using it raw as cwnd/ssthresh left the sender
+/// trickling out segments of a few bytes. Same floor as the CUBIC/Reno paths.
+pub fn bdpWindow(bdp: u32, smss: u32) u32 {
+    const floor = 2 *| @max(smss, 1);
+    return @max(bdp, floor);
+}
+
+/// Payload bytes one data segment may carry: the MSS is the bound on TCP
+/// payload, but every segment also carries its options (timestamps, SACK
+/// blocks) inside the same MTU, so a full-MSS payload would be refused by the
+/// Path-MTU gate and could never leave the send ring. Never below 1.
+pub fn dataSegmentCap(mss: u32, opt_len: u32) u32 {
+    if (opt_len >= mss) return 1;
+    return mss - opt_len;
+}
+
 /// True when an IPv4 TCP 4-tuple matches (TIME_WAIT reuse / demux helper).
 /// Mirrors `tupleMatchV6`: the remote address must match, not just ports.
 pub fn tupleMatchV4(

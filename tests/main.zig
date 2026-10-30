@@ -7854,3 +7854,106 @@ test "a timed-out blocking write reports what was sent, else EAGAIN" {
     try std.testing.expectEqual(@as(i64, -11), kt.namespace_policy.sendTimeoutResult(0));
     try std.testing.expectEqual(@as(i64, 8192), kt.namespace_policy.sendTimeoutResult(8192));
 }
+
+test "tcp: a full data segment fits the MTU together with its options" {
+    // Ethernet: MSS 1460 + 20 IP + 20 TCP = 1500. With timestamps (12 option
+    // bytes) the payload must shrink or the PMTU gate refuses the segment and
+    // the send ring can never drain.
+    try std.testing.expectEqual(@as(u32, 1460), tcp_util.dataSegmentCap(1460, 0));
+    try std.testing.expectEqual(@as(u32, 1448), tcp_util.dataSegmentCap(1460, 12));
+    try std.testing.expectEqual(@as(u32, 1424), tcp_util.dataSegmentCap(1460, 36));
+    for ([_]u8{ 0, 12, 20, 28, 36 }) |opt| {
+        const cap = tcp_util.dataSegmentCap(1460, opt);
+        try std.testing.expect(20 + 20 + @as(u32, opt) + cap <= 1500);
+    }
+    // Degenerate MSS never yields a zero-length "full" segment.
+    try std.testing.expectEqual(@as(u32, 1), tcp_util.dataSegmentCap(8, 12));
+}
+
+test "tcp: the duplicate-ACK counter saturates instead of overflowing" {
+    var c: u3 = 0;
+    for (0..100) |_| c = tcp_util.bumpDupAck(c);
+    try std.testing.expectEqual(@as(u3, 7), c);
+    try std.testing.expectEqual(@as(u3, 1), tcp_util.bumpDupAck(0));
+    try std.testing.expectEqual(@as(u3, 3), tcp_util.bumpDupAck(2));
+}
+
+test "tcp: PRR never leaves an empty pipe with a zero congestion window" {
+    // Nothing in flight and nothing allowed: one segment must still go out,
+    // otherwise no ACK ever arrives to end recovery and no RTO is armed.
+    try std.testing.expectEqual(@as(u32, 1448), tcp_util.prrCwnd(0, 0, 1448));
+    try std.testing.expectEqual(@as(u32, 1448), tcp_util.prrCwnd(0, 100, 1448));
+    // Otherwise the window is exactly pipe + sndcnt.
+    try std.testing.expectEqual(@as(u32, 4000), tcp_util.prrCwnd(0, 4000, 1448));
+    try std.testing.expectEqual(@as(u32, 2896), tcp_util.prrCwnd(1448, 1448, 1448));
+    try std.testing.expectEqual(@as(u32, 1448), tcp_util.prrCwnd(1448, 0, 1448));
+    try std.testing.expectEqual(@as(u32, 0xffff_ffff), tcp_util.prrCwnd(0xffff_fff0, 0x100, 1448));
+}
+
+test "tcp: an idle connection has nothing unacked whatever its initial sequence" {
+    // snd_max initialised to the ISS: idle means una == nxt == max.
+    for ([_]u32{ 0, 1000, 0x7fff_ffff, 0x8000_0000, 0x8000_0001, 3946014917, 0xffff_ffff }) |iss| {
+        try std.testing.expect(!tcp_util.unackedPending(iss, iss, iss));
+        // After sending 100 bytes the data is pending until acknowledged.
+        try std.testing.expect(tcp_util.unackedPending(iss, iss +% 100, iss +% 100));
+        try std.testing.expect(!tcp_util.unackedPending(iss +% 100, iss +% 100, iss +% 100));
+    }
+    // The old default (snd_max = 0) made every ISS >= 2^31 look unacked.
+    try std.testing.expect(tcp_util.unackedPending(3946014917, 3946014917, 0));
+}
+
+test "tcp: every place that seeds snd_nxt from the ISS also seeds snd_max" {
+    const src = kt.tcp_source;
+    var from: usize = 0;
+    var seeds: usize = 0;
+    while (std.mem.indexOfPos(u8, src, from, ".snd_nxt = ")) |at| {
+        from = at + 1;
+        const line_end = std.mem.indexOfPos(u8, src, at, "\n").?;
+        const line = src[at..line_end];
+        if (std.mem.indexOf(u8, line, ".iss;") == null) continue;
+        seeds += 1;
+        const next_end = std.mem.indexOfPos(u8, src, line_end + 1, "\n").?;
+        const next = src[line_end + 1 .. next_end];
+        try std.testing.expect(std.mem.indexOf(u8, next, ".snd_max = ") != null);
+    }
+    try std.testing.expect(seeds >= 7);
+}
+
+test "tcp: the receiver never SACKs data it did not keep" {
+    // rcv_nxt = 1000. A segment ahead of it is dropped (no out-of-order queue),
+    // so reporting it as SACKed made the sender treat it as delivered and
+    // never resend it: the connection stalled until it gave up.
+    try std.testing.expectEqual(tcp_util.OooReport.none, tcp_util.oooReport(2000, 2500, 1000));
+    try std.testing.expectEqual(tcp_util.OooReport.none, tcp_util.oooReport(1001, 1100, 1000));
+    // A duplicate of data already received: DSACK it (RFC 2883).
+    try std.testing.expectEqual(tcp_util.OooReport.dsack_whole, tcp_util.oooReport(500, 800, 1000));
+    try std.testing.expectEqual(tcp_util.OooReport.dsack_whole, tcp_util.oooReport(500, 1000, 1000));
+    // A segment straddling rcv_nxt: the part before it is a duplicate.
+    try std.testing.expectEqual(tcp_util.OooReport.dsack_prefix, tcp_util.oooReport(900, 1100, 1000));
+    // Sequence wrap-around.
+    try std.testing.expectEqual(tcp_util.OooReport.none, tcp_util.oooReport(10, 60, 0xffff_ff00));
+    try std.testing.expectEqual(tcp_util.OooReport.dsack_whole, tcp_util.oooReport(0xffff_ff00, 0xffff_ff80, 10));
+}
+
+test "tcp: the retransmit timeout forgets the SACK scoreboard" {
+    const src = kt.tcp_source;
+    const at = std.mem.indexOf(u8, src, "tcb.retransmit_count += 1;").?;
+    const win = src[at .. at + 400];
+    try std.testing.expect(std.mem.indexOf(u8, win, "tcb.sack_scoreboard_count = 0;") != null);
+}
+
+test "tcp: BDP-derived windows never fall below two segments" {
+    // Loopback: ~1 ms RTT and a sparse rate sample give a BDP of a few bytes.
+    try std.testing.expectEqual(@as(u32, 2896), tcp_util.bdpWindow(9, 1448));
+    try std.testing.expectEqual(@as(u32, 2896), tcp_util.bdpWindow(0, 1448));
+    try std.testing.expectEqual(@as(u32, 100_000), tcp_util.bdpWindow(100_000, 1448));
+    try std.testing.expectEqual(@as(u32, 2), tcp_util.bdpWindow(0, 0));
+    try std.testing.expectEqual(@as(u32, 0xffff_ffff), tcp_util.bdpWindow(0xffff_ffff, 1448));
+}
+
+test "tcp: every BBR path that assigns a BDP window applies the floor" {
+    const src = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, src, "tcb.ssthresh = bdp;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "tcb.cwnd = bdp;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "tcp_util.bdpWindow(probeBbrCycleCwnd(bdp, gain)") != null);
+}

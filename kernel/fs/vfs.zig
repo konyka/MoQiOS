@@ -1338,7 +1338,11 @@ pub const FdTable = struct {
                 return pipeRead(desc.pipe_idx, buf, count, desc.status_flags);
             },
             .pipe_write => return -1, // can't read from write end
-            .tcp_socket => return -1, // TCP sockets use sendto/recvfrom syscalls
+            .tcp_socket => {
+                // read() on a TCP socket is recv(): waits for data, 0 at EOF.
+                const tcp = @import("../net/tcp.zig");
+                return tcp.tcpRecvBlocking(desc.tcb_idx, buf, @intCast(count), @import("namespace_policy.zig").nonblockRequested(desc.status_flags, 0));
+            },
             .udp_socket => return -1, // UDP sockets use sendto/recvfrom syscalls
             .epoll => return -1,
             .eventfd => {
@@ -1504,7 +1508,11 @@ pub const FdTable = struct {
                 if (n > 0) @import("ext2.zig").touchModified(desc.ext2_file_idx);
                 return n;
             },
-            .tcp_socket => return -1, // TCP sockets use sendto/recvfrom syscalls
+            .tcp_socket => {
+                // write() on a TCP socket is send(): all bytes queued, waiting for ring space.
+                const tcp = @import("../net/tcp.zig");
+                return tcp.tcpSendBlocking(desc.tcb_idx, @intFromPtr(buf), false, @intCast(count), @import("namespace_policy.zig").nonblockRequested(desc.status_flags, 0));
+            },
             .udp_socket => return -1, // UDP sockets use sendto/recvfrom syscalls
             .epoll => return -1,
             .eventfd => {
