@@ -79,7 +79,7 @@ void _start(void) {
     int64_t read_only = syscall3(SYS_OPEN, (uint64_t)"test.txt", 0, 0);
     if (read_only < 0) fail("open read-only target");
     if (syscall6(SYS_COPY_FILE_RANGE, (uint64_t)src, (uint64_t)&failed_offset,
-                 (uint64_t)read_only, 0, 1, 0) != -1) fail("write failure result");
+                 (uint64_t)read_only, 0, 1, 0) != -9) fail("write failure result (EBADF: output fd not open for writing)");
     if (syscall3(SYS_READ, (uint64_t)src, (uint64_t)source, 3) != 3 ||
         source[0] != 'd' || source[1] != 'e' || source[2] != 'f') fail("write failure rollback");
     syscall1(SYS_CLOSE, (uint64_t)read_only);

@@ -11,14 +11,17 @@ const sched = @import("../proc/sched.zig");
 /// unlink/rmdir wrappers; a 256-byte buffer matches every other path-taking
 /// syscall (the old 64-byte unlink buffer silently truncated long paths and
 /// deleted the wrong file).
-fn copyPath(path_ptr: u64, buf: *[256]u8) ?[]const u8 {
-    if (path_ptr == 0 or path_ptr >= 0x0000_8000_0000_0000) return null;
+const PathCopy = union(enum) { ok: []const u8, err: i64 };
+
+fn copyPath(path_ptr: u64, buf: *[256]u8) PathCopy {
+    if (path_ptr == 0 or path_ptr >= 0x0000_8000_0000_0000) return .{ .err = -14 };
     const copied = copy.copyPathFromUser(buf[0..], path_ptr, 255);
-    if (copied == 0) return null;
+    const rc = @import("namespace_policy.zig").pathCopyErrno(buf[0..], copied, 255);
+    if (rc != 0) return .{ .err = rc }; // EFAULT or ENAMETOOLONG
     buf[if (copied < 255) copied else 255] = 0;
     var name_len: usize = 0;
     while (name_len < copied and buf[name_len] != 0) : (name_len += 1) {}
-    return buf[0..name_len];
+    return .{ .ok = buf[0..name_len] };
 }
 
 fn tmpfsCaller() ?@import("../fs/tmpfs.zig").Remover {
@@ -39,7 +42,10 @@ pub fn unlink(path_ptr: u64) i64 {
 /// unlinkat: resolve `path_ptr` under `dirfd` first.
 pub fn unlinkAt(dirfd: i64, path_ptr: u64, as_dir: bool) i64 {
     var name_buf: [256]u8 = undefined;
-    const raw = copyPath(path_ptr, &name_buf) orelse return -1;
+    const raw = switch (copyPath(path_ptr, &name_buf)) {
+        .ok => |n| n,
+        .err => |e| return e,
+    };
     var join_buf: [256]u8 = undefined;
     const name = switch (@import("dirfd_name.zig").resolve(dirfd, raw, &join_buf)) {
         .ok => |n| n,

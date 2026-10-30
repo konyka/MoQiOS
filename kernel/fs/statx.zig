@@ -22,7 +22,8 @@ pub fn statx(dirfd: i64, pathname_ptr: u64, flags: u32, mask: u32, statxbuf_ptr:
     var name_buf: [256]u8 = undefined;
     if (pathname_ptr == 0 or pathname_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT
     const copied = copy.copyPathFromUser(&name_buf, pathname_ptr, 255);
-    if (copied == 0) return -14;
+    const path_rc = @import("namespace_policy.zig").pathCopyErrno(&name_buf, copied, 255);
+    if (path_rc != 0) return path_rc; // EFAULT or ENAMETOOLONG
     var len: usize = 0;
     while (len < copied and name_buf[len] != 0) : (len += 1) {}
     const name = name_buf[0..len];

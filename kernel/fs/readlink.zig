@@ -24,7 +24,8 @@ pub fn readlinkAt(dirfd: i64, path_ptr: u64, buf_ptr: u64, bufsiz: u64) i64 {
     }
     var name_buf: [256]u8 = undefined;
     const copied = copy.copyPathFromUser(name_buf[0..], path_ptr, 255);
-    if (copied == 0) return -14;
+    const path_rc = @import("namespace_policy.zig").pathCopyErrno(name_buf[0..], copied, 255);
+    if (path_rc != 0) return path_rc; // EFAULT or ENAMETOOLONG
     name_buf[if (copied < 255) copied else 255] = 0;
     var len: usize = 0;
     while (len < 256 and name_buf[len] != 0) : (len += 1) {}
@@ -100,10 +101,18 @@ pub fn readlinkAt(dirfd: i64, path_ptr: u64, buf_ptr: u64, bufsiz: u64) i64 {
 
     // v50.0: try ext2 symlink
     var target_buf: [256]u8 = undefined;
-    if (ext2_mod.readSymlinkByPath(path, &target_buf)) |target| {
-        const tlen = @min(target.len, @as(usize, @intCast(bufsiz)));
-        if (copy.copyToUser(@ptrFromInt(buf_ptr), target[0..tlen], tlen) != tlen) return -14;
-        return @intCast(tlen);
+    switch (ext2_mod.readlinkPath(path, &target_buf)) {
+        .target => |target| {
+            const tlen = @min(target.len, @as(usize, @intCast(bufsiz)));
+            if (copy.copyToUser(@ptrFromInt(buf_ptr), target[0..tlen], tlen) != tlen) return -14;
+            return @intCast(tlen);
+        },
+        .not_symlink => return -22, // EINVAL: it exists but is not a symbolic link
+        .missing, .not_ext2 => {},
+    }
+    // tmpfs has no symbolic links: an existing entry is EINVAL, a missing one ENOENT.
+    if (path.len >= 4 and path[0] == '/' and path[1] == 't' and path[2] == 'm' and path[3] == 'p' and (path.len == 4 or path[4] == '/')) {
+        if (@import("tmpfs.zig").tmpfsMetadataByPath(path) != null) return -22;
     }
 
     return -2; // -ENOENT

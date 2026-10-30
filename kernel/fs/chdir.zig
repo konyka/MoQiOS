@@ -14,7 +14,8 @@ pub fn chdir(path_ptr: u64) i64 {
 
     var path_buf: [256]u8 = undefined;
     const copied = copy.copyPathFromUser(path_buf[0..], path_ptr, 255);
-    if (copied == 0) return -1;
+    const path_rc = @import("namespace_policy.zig").pathCopyErrno(path_buf[0..], copied, 255);
+    if (path_rc != 0) return path_rc; // EFAULT or ENAMETOOLONG
     path_buf[if (copied < 255) copied else 255] = 0;
     var path_len: usize = 0;
     while (path_len < copied and path_buf[path_len] != 0) : (path_len += 1) {}

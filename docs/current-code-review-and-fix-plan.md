@@ -5293,3 +5293,17 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   hello127（32 项：ext2 16、tmpfs 15 加一个总结）在 HEAD 上 24 项 FAIL，新内核 PASS。tmpfs 没有符号链接，所以 ELOOP 项只测 ext2。
 - 变异：目录以写方式打开不再 EISDIR → hello127 4 项 FAIL（ext2、tmpfs 各 2），恢复后 PASS。
 - 验证：host 750/750（含新增 mkramdisk 脚本测试）；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL（hello114 的 U/V 段同样 PASS）；stress（SMP=2）3/3 PASS。
+
+### read/write/rename/readlink 与超长路径的错误码（hello128）
+
+- 问题：ext2/tmpfs 上 14 项错误码不对。`write()` 到只读描述符和只读打开的目录返回裸 `-1`（EPERM，应为 EBADF）；`read()` 目录在 ext2 上返回目录项原始字节、在 tmpfs 上返回 0
+  （应为 EISDIR）；`readlink` 对普通文件返回 ENOENT（应为 EINVAL）；`rename` 的源不存在被改写成 EXDEV；tmpfs `rename` 路径经过文件得 ENOENT（应为 ENOTDIR）；
+  超过 255 字节的路径被**静默截断后继续执行**——`open(O_CREAT)` 会创建一个名字被截短的文件，`unlink` 会删掉另一个文件。
+- 修复：`namespace_policy.readGate/writeGate/pathCopyErrno`；`FdTable.write/read`；`ext2.readlinkPath`、`renameFileMode` 的真实 errno；tmpfs `resolveErrno`；
+  七个入口（open/mkdir/mkdirat/unlink/rmdir/statx/readlink/chdir）检查 `pathCopyErrno`。
+- 回归（如实）：smoke 卡住不结束，原因是 `hello41` 断言 `copy_file_range` 写只读目标得 `-1`；这是旧行为被写进了测试，Linux 答案是 EBADF，已更正断言。
+  第一次运行把 smoke 放进 300 秒前台限制被转为后台，未影响结果。
+- TDD：host 新增 3 个测试（读写闸门、`pathCopyErrno`、源码守卫）先 RED；hello128（ext2 15 项 + tmpfs 11 项）在 HEAD 上 14 项 FAIL，新内核 PASS。
+- 未做：约 36 个 `copyPathFromUser` 调用点（主要是 syscall_entry.zig 里的 chmod/chown/link/symlink/xattr/execve 等）仍会截断超长路径；需要统一成一个带错误码的路径读取函数。
+- 变异：`writeGate` 恒放行 → hello128 4 项 FAIL（ext2、tmpfs 各 2）加 hello41 的新断言 FAIL；恢复后 PASS。
+- 验证：host 753/753；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL（hello41 同样 PASS）；stress（SMP=2）3/3 PASS。

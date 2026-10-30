@@ -51,3 +51,28 @@ pub fn openExisting(k: Kind, flags: u32) i64 {
 pub fn openMissing(flags: u32) i64 {
     return if ((flags & O_CREAT) != 0) 0 else -2;
 }
+
+/// read(2) on a descriptor: the errno the descriptor kind alone decides, or 0
+/// when the read may proceed to the filesystem.
+pub fn readGate(is_directory: bool) i64 {
+    return if (is_directory) -21 else 0; // EISDIR
+}
+
+/// write(2)/pwrite(2): a descriptor not open for writing is EBADF (a
+/// directory is never open for writing, so it is EBADF too on Linux when
+/// opened read-only; opening one for writing already failed with EISDIR).
+pub fn writeGate(writable: bool) i64 {
+    return if (writable) 0 else -9; // EBADF
+}
+
+/// Classify the result of `copyPathFromUser(buf, ptr, max)`: it returns the
+/// bytes copied including the NUL, `max` when no NUL appeared within `max`
+/// bytes, and 0 when the string ran into unreadable memory. A full window with
+/// no terminator means the path is longer than the kernel accepts (ENAMETOOLONG)
+/// rather than something to truncate and act on.
+pub fn pathCopyErrno(buf: []const u8, copied: usize, max: usize) i64 {
+    if (copied == 0) return -14; // EFAULT
+    if (copied < max) return 0;
+    // copied == max: fits only if the last copied byte is the terminator
+    return if (buf[copied - 1] == 0) 0 else -36;
+}

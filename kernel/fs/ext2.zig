@@ -2908,7 +2908,7 @@ pub fn renameFile(old_path: []const u8, new_path: []const u8, who: ?Who) i64 {
 pub fn renameFileMode(old_path: []const u8, new_path: []const u8, who: ?Who, noreplace: bool) i64 {
     var flags = fs_lock.acquire();
     defer fs_lock.release(flags);
-    if (!active) return -1;
+    if (!active) return -2;
 
     // Resolve source: parent dir + old filename
     const old_resolved = resolveParentChecked(old_path, who, @import("dac.zig").Access.write_search, true) catch |e| return parentErrno(e);
@@ -2921,16 +2921,16 @@ pub fn renameFileMode(old_path: []const u8, new_path: []const u8, who: ?Who, nor
     const new_filename = new_resolved.name;
 
     // "." and ".." must never be (re)written by rename.
-    if (eqlStr(new_filename, ".") or eqlStr(new_filename, "..")) return -1;
+    if (eqlStr(new_filename, ".") or eqlStr(new_filename, "..")) return -22; // EINVAL
 
     // Find the file's inode
     var old_parent_ino_data: Ext2Inode = undefined;
-    if (!readInode(old_parent_inode, &old_parent_ino_data)) return -1;
-    const file_inode_num = findDirEntryCached(old_parent_inode, &old_parent_ino_data, old_filename) orelse return -1;
+    if (!readInode(old_parent_inode, &old_parent_ino_data)) return -5;
+    const file_inode_num = findDirEntryCached(old_parent_inode, &old_parent_ino_data, old_filename) orelse return -2; // ENOENT
 
     // Read file inode to get file_type
     var file_inode: Ext2Inode = undefined;
-    if (!readInode(file_inode_num, &file_inode)) return -1;
+    if (!readInode(file_inode_num, &file_inode)) return -5;
     if (eu.isDirectory(file_inode.mode)) {
         return renameDirUnlocked(old_parent_inode, old_filename, new_parent_inode, new_filename, file_inode_num, noreplace);
     }
@@ -2941,7 +2941,7 @@ pub fn renameFileMode(old_path: []const u8, new_path: []const u8, who: ?Who, nor
 
     // Read destination parent once.
     var new_parent_inode_data: Ext2Inode = undefined;
-    if (!readInode(new_parent_inode, &new_parent_inode_data)) return -1;
+    if (!readInode(new_parent_inode, &new_parent_inode_data)) return -5;
 
     // Remember an overwritten target (released after the rename commits).
     var replaced_inode_num: ?u32 = null;
@@ -2953,7 +2953,7 @@ pub fn renameFileMode(old_path: []const u8, new_path: []const u8, who: ?Who, nor
     // the directory orphaned).
     if (replaced_inode_num) |victim_num| {
         var victim_ino: Ext2Inode = undefined;
-        if (!readInode(victim_num, &victim_ino)) return -1;
+        if (!readInode(victim_num, &victim_ino)) return -5;
         if (eu.isDirectory(victim_ino.mode)) return -21; // EISDIR
     }
 
@@ -2971,7 +2971,7 @@ pub fn renameFileMode(old_path: []const u8, new_path: []const u8, who: ?Who, nor
         }
     } else {
         // Order matters: add the new entry first; only then remove the old one.
-        if (!addDirEntry(new_parent_inode, file_inode_num, new_filename, file_type)) return -1;
+        if (!addDirEntry(new_parent_inode, file_inode_num, new_filename, file_type)) return -28; // ENOSPC
         if (!removeDirEntry(old_parent_inode, old_filename)) {
             // Roll the add back so the file is not hard-linked twice.
             _ = removeDirEntry(new_parent_inode, new_filename);
@@ -3387,25 +3387,36 @@ fn resolveInode(start_inode: u32, path: []const u8, depth: u32, who: ?Who, follo
 /// inode's i_block (a stack copy here) and a long one in the shared
 /// symlink_buf, so neither may be handed out after the lock is released.
 pub fn readSymlinkByPath(path: []const u8, out: *[256]u8) ?[]const u8 {
+    return switch (readlinkPath(path, out)) {
+        .target => |t| t,
+        else => null,
+    };
+}
+
+pub const ReadlinkResult = union(enum) { target: []const u8, not_symlink, missing, not_ext2 };
+
+/// readlink(2) on ext2: the target, EINVAL when the name exists but is not a
+/// symlink (`not_symlink`), ENOENT when it does not (`missing`).
+pub fn readlinkPath(path: []const u8, out: *[256]u8) ReadlinkResult {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
-    if (!active) return null;
+    if (!active) return .not_ext2;
 
     // Resolve parent and find the entry
-    const resolved = resolveParent(path) orelse return null;
+    const resolved = resolveParent(path) orelse return .missing;
     var parent_inode: Ext2Inode = undefined;
-    if (!readInode(resolved.parent, &parent_inode)) return null;
-    const entry_inode_num = findDirEntryCached(resolved.parent, &parent_inode, resolved.name) orelse return null;
+    if (!readInode(resolved.parent, &parent_inode)) return .missing;
+    const entry_inode_num = findDirEntryCached(resolved.parent, &parent_inode, resolved.name) orelse return .missing;
 
     // Read the entry's inode and check it's a symlink
     var entry_inode: Ext2Inode = undefined;
-    if (!readInode(entry_inode_num, &entry_inode)) return null;
-    if (!eu.isSymlink(entry_inode.mode)) return null; // not a symlink
+    if (!readInode(entry_inode_num, &entry_inode)) return .missing;
+    if (!eu.isSymlink(entry_inode.mode)) return .not_symlink;
 
-    const target = readSymlinkTarget(&entry_inode) orelse return null;
+    const target = readSymlinkTarget(&entry_inode) orelse return .missing;
     const n = @min(target.len, out.len);
     @memcpy(out[0..n], target[0..n]);
-    return out[0..n];
+    return .{ .target = out[0..n] };
 }
 
 // ─── chown/chmod inode persistence (v51.0) ─────────────────────────────────

@@ -673,10 +673,10 @@ pub fn tmpfsRename(old_path: []const u8, new_path: []const u8, m: rename_policy.
 
     var old_name: [MAX_NAME_LEN]u8 = undefined;
     var old_len: u8 = 0;
-    const old_parent = resolvePath(old_path, &old_name, &old_len) orelse return -2;
+    const old_parent = resolvePath(old_path, &old_name, &old_len) orelse return resolveErrno(old_path);
     var new_name: [MAX_NAME_LEN]u8 = undefined;
     var new_len: u8 = 0;
-    const new_parent = resolvePath(new_path, &new_name, &new_len) orelse return -2;
+    const new_parent = resolvePath(new_path, &new_name, &new_len) orelse return resolveErrno(new_path);
     const is_root = struct {
         fn f(n: []const u8) bool {
             return n.len == 1 and n[0] == '/';

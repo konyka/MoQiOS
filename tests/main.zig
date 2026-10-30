@@ -7185,3 +7185,34 @@ test "vfs uses the Linux x86_64 O_DIRECTORY value (0x10000), not O_LARGEFILE's 0
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "(flags & 0o100000)") == null);
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "o_creat and (flags & 0x10000) != 0") != null);
 }
+
+test "read/write gates: EISDIR for reading a directory, EBADF for writing without write access" {
+    const np = kt.namespace_policy;
+    try std.testing.expectEqual(@as(i64, -21), np.readGate(true));
+    try std.testing.expectEqual(@as(i64, 0), np.readGate(false));
+    try std.testing.expectEqual(@as(i64, -9), np.writeGate(false));
+    try std.testing.expectEqual(@as(i64, 0), np.writeGate(true));
+}
+
+test "fd-table write paths answer EBADF, not a bare -1, for a non-writable descriptor" {
+    const src = kt.vfs_source;
+    const start = std.mem.indexOf(u8, src, "pub fn write(self: *FdTable, fd: u32").?;
+    const body = src[start .. std.mem.indexOfPos(u8, src, start, "return n;\n            },\n            .tcp_socket").?];
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (!desc.writable) return -1;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "namespace_policy.zig\").writeGate(desc.writable)") != null);
+}
+
+test "path-length classification: a copy with no NUL inside the limit is ENAMETOOLONG" {
+    const np = kt.namespace_policy;
+    var full: [255]u8 = @splat('a'); // 255 bytes copied, no terminator: the path did not fit
+    try std.testing.expectEqual(@as(i64, -36), np.pathCopyErrno(&full, 255, 255));
+    var fits: [256]u8 = @splat('a');
+    fits[10] = 0; // "aaaaaaaaaa" + NUL
+    try std.testing.expectEqual(@as(i64, 0), np.pathCopyErrno(&fits, 11, 255));
+    // exactly 255 characters plus the NUL does not fit the 255-byte copy window either
+    var edge: [256]u8 = @splat('b');
+    edge[254] = 0; // 254 chars + NUL = 255 bytes copied
+    try std.testing.expectEqual(@as(i64, 0), np.pathCopyErrno(&edge, 255, 255));
+    // nothing copied is a fault, handled by the caller (EFAULT)
+    try std.testing.expectEqual(@as(i64, -14), np.pathCopyErrno(&fits, 0, 255));
+}

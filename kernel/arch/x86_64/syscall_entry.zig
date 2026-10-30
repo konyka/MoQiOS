@@ -3975,9 +3975,10 @@ fn syscallRenameFlagsAt(old_dirfd: i64, old_ptr: u64, new_dirfd: i64, new_ptr: u
         return if (xr == 0 or xr == -2 or xr == -5 or xr == -13 or xr == -22) xr else -18;
     }
     const r = ext2.renameFileMode(old_path, new_path, ext2Who(), mode == .noreplace);
-    // Other failures keep the historical EXDEV answer (the path may belong
-    // to FAT32, which has no rename).
-    return if (r == 0 or r == -5 or r == -13 or r == -17 or r == -20 or r == -21 or r == -22 or r == -39 or r == -40) r else -18; // EXDEV
+    // ext2 answers with the real errno. A name it does not have may still be a
+    // FAT32 file, which has no rename: that case alone keeps the historical EXDEV.
+    if (r == -2 and @import("../../fs/fat32.zig").isActive() and @import("../../fs/fat32_util.zig").isRootName(old_path)) return -18;
+    return r;
 }
 
 // ── v32.4: madvise / getrlimit / setrlimit ──────────────────────────

@@ -1216,6 +1216,7 @@ pub const FdTable = struct {
             },
             .ext2_file => {
                 const ext2 = @import("ext2.zig");
+                if (@import("namespace_policy.zig").readGate(if (ext2.openFileIsDir(desc.ext2_file_idx)) |d| d else false) != 0) return -21;
                 // Refresh the cached size: another fd may have grown the file
                 // through a different ext2 open slot (each slot keeps its own
                 // inode copy), so this descriptor's file_size can be stale.
@@ -1284,6 +1285,7 @@ pub const FdTable = struct {
             },
             .tmpfs_file => {
                 const tmpfs = @import("tmpfs.zig");
+                if (@import("namespace_policy.zig").readGate(if (tmpfs.tmpfsGetMetadata(@intCast(desc.tmpfs_idx))) |m| m.is_dir else false) != 0) return -21;
                 if (desc.offset >= desc.file_size) return 0;
                 const n = tmpfs.tmpfsRead(@intCast(desc.tmpfs_idx), desc.offset, buf, @intCast(count));
                 if (n > 0) {
@@ -1366,25 +1368,25 @@ pub const FdTable = struct {
     /// Write to a file descriptor from a kernel buffer.
     /// Returns number of bytes written, -1 on error.
     pub fn write(self: *FdTable, fd: u32, buf: [*]const u8, count: usize) i64 {
-        if (fd >= MAX_FDS) return -1;
+        if (fd >= MAX_FDS) return -9; // EBADF
         const desc = &self.fds[fd];
-        if (!desc.writable) return -1;
+        if (desc.fd_type == .none) return -9;
+        // A descriptor not open for writing is EBADF (not EPERM).
+        const open_gate = @import("namespace_policy.zig").writeGate(desc.writable);
+        if (open_gate != 0) return open_gate;
 
         switch (desc.fd_type) {
-            .none => return -1,
+            .none => return -9,
             .special => {
-                if (!desc.writable) return -1;
                 // stdout/stderr: write to serial
                 serial.writeString(buf[0..count]);
                 return @intCast(count);
             },
             .pipe_write => {
-                if (!desc.writable) return -1;
                 return pipeWrite(desc.pipe_idx, buf, count, desc.status_flags);
             },
             .pipe_read => return -1,
             .fat32_file => {
-                if (!desc.writable) return -1;
                 // O_APPEND: every sequential write goes to the current end.
                 if ((desc.status_flags & 0x400) != 0) desc.offset = desc.file_size;
                 const gate = fsizeGate(desc.offset, count);
@@ -1397,7 +1399,6 @@ pub const FdTable = struct {
             .ramdisk_file => return -1,
             .rofs_file => return -30, // EROFS
             .ext2_file => {
-                if (!desc.writable) return -1;
                 if ((desc.status_flags & 0x400) != 0) desc.offset = desc.file_size;
                 const gate = fsizeGate(desc.offset, count);
                 if (gate < 0) return gate;
@@ -1422,7 +1423,6 @@ pub const FdTable = struct {
             .devfs => {
                 const devfs = @import("devfs.zig");
                 if (desc.devfs_idx == devfs.DIR_IDX) return -21; // EISDIR
-                if (!desc.writable) return -1;
                 const ops = devfs.opsAt(desc.devfs_idx) orelse return -1;
                 const write_op = ops.write orelse return -1;
                 var ctx: devfs.IoCtx = .{ .offset = desc.offset, .status_flags = desc.status_flags, .generation = desc.devfs_generation };
@@ -1432,11 +1432,9 @@ pub const FdTable = struct {
             },
             .devfs_ctrl => {
                 // Owner end of a userspace node: complete a request.
-                if (!desc.writable) return -1;
                 return @import("devfs_proxy.zig").ctrlWrite(desc.devfs_ctrl_idx, desc.devfs_generation, buf, count);
             },
             .tmpfs_file => {
-                if (!desc.writable) return -1;
                 if ((desc.status_flags & 0x400) != 0) desc.offset = desc.file_size;
                 const gate = fsizeGate(desc.offset, count);
                 if (gate < 0) return gate;

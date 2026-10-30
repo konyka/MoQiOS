@@ -74,7 +74,8 @@ pub fn openAt(dirfd: i64, name_ptr: u64, flags: u32, requested_mode: ?u32) i64 {
 
     var name_buf: [256]u8 = undefined;
     const copied = copy.copyPathFromUser(name_buf[0..], name_ptr, 255);
-    if (copied == 0) return -14; // EFAULT
+    const path_rc = @import("namespace_policy.zig").pathCopyErrno(name_buf[0..], copied, 255);
+    if (path_rc != 0) return path_rc; // EFAULT or ENAMETOOLONG
     name_buf[if (copied < 255) copied else 255] = 0;
 
     var len: usize = 0;

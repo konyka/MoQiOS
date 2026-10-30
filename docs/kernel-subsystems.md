@@ -925,6 +925,12 @@ const SchedStats = struct {
 - `EPOLL_CTL_ADD` 沿 child epoll 链（`nestedChainReaches`，visited bitmap 有界）检测间接环，构成环返回 `ELOOP`——环上就绪互相传播会使 `epoll_wait` 永久 busy-loop。（§6.51）
 - MoqIPC receive 被信号/`moqipc_notify` 踢醒时统一清理 `waiting_receiver` 注册并按唤醒来源分类返回：endpoint 失效才报 `invalid_endpoint`，存活 endpoint 的无投递唤醒报 EINTR（信号）/EAGAIN（notify）——注册残留曾让 endpoint 对所有 sender 永久报废。（§6.51）
 - `alarm`/`itimer` deadline 字段与 per-CPU run-queue 的 `nr_running` 计数全部原子访问（tick 扫描器跨 CPU 与 syscall 上下文并发）。（§6.51）
+- **read/write/rename/readlink 与超长路径的错误码（hello128）**：`write()`/`pwrite()` 对不可写描述符（含只读打开的目录）现在是 EBADF（原先裸 `-1`=EPERM），`FdTable.write`
+  入口统一经 `namespace_policy.writeGate`；`read()` 目录是 EISDIR（ext2 之前会返回 8 字节目录内容，tmpfs 返回 0）；`readlink` 对存在但不是符号链接的名字是 EINVAL
+  （`ext2.readlinkPath` 区分 `not_symlink`/`missing`，tmpfs 存在的条目也是 EINVAL）；`rename` 源不存在是 ENOENT（原先被改写成 EXDEV，现在只有 FAT32 根下的名字才保留 EXDEV），
+  tmpfs 的 `rename` 路径经过文件是 ENOTDIR；路径超过 255 字节时 open/mkdir/unlink/rmdir/statx/readlink/chdir 返回 ENAMETOOLONG，而不是截断后对截断的名字操作
+  （`namespace_policy.pathCopyErrno` 判断“拷满窗口且没有结尾 NUL”）。其余 `copyPathFromUser` 调用点（约 36 处，多在 syscall_entry.zig）仍会截断，已记入待办。
+  `hello41` 原先断言 `copy_file_range` 写入只读目标得 `-1`，Linux 的答案是 EBADF，断言随之更正。
 - **命名空间调用在 ext2/tmpfs 上返回 Linux 错误码（hello127）**：此前 unlink、rmdir、mkdir、open 的大多数失败都是裸 `-1`（用户态看到 EPERM）。
   纯策略 `fs/namespace_policy.zig` 给出规则，两个文件系统共用：`unlink` 目录 EISDIR；`rmdir` 非目录 ENOTDIR、非空 ENOTEMPTY；`mkdir` 已存在
   EEXIST（原先对已存在的目录“幂等成功”，对文件则创建失败为 EPERM）；缺失 ENOENT；`open`：`O_CREAT|O_EXCL` 已存在 EEXIST，`O_DIRECTORY` 对文件 ENOTDIR，

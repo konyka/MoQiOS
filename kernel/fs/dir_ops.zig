@@ -177,7 +177,8 @@ pub fn mkdirWithMode(name_ptr: u64, requested_mode: ?u32) i64 {
 
     var name_buf: [256]u8 = undefined;
     const copied = copy.copyPathFromUser(name_buf[0..], name_ptr, 255);
-    if (copied == 0) return -1;
+    const path_rc = @import("namespace_policy.zig").pathCopyErrno(name_buf[0..], copied, 255);
+    if (path_rc != 0) return path_rc; // EFAULT or ENAMETOOLONG
     name_buf[if (copied < 255) copied else 255] = 0;
 
     var len: usize = 0;
@@ -195,7 +196,8 @@ pub fn mkdirAt(dirfd: i64, name_ptr: u64, requested_mode: ?u32) i64 {
     if (name_ptr >= 0x0000_8000_0000_0000 or name_ptr == 0) return -1;
     var name_buf: [256]u8 = undefined;
     const copied = copy.copyPathFromUser(name_buf[0..], name_ptr, 255);
-    if (copied == 0) return -1;
+    const path_rc = @import("namespace_policy.zig").pathCopyErrno(name_buf[0..], copied, 255);
+    if (path_rc != 0) return path_rc; // EFAULT or ENAMETOOLONG
     var len: usize = 0;
     while (len < copied and len < 255 and name_buf[len] != 0) : (len += 1) {}
     var join_buf: [256]u8 = undefined;
