@@ -5400,3 +5400,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 变异：`sigaction` 重新把上限设回 31 → hello136 A 段 3 项以上 FAIL，恢复后 PASS。
 - 验证：host 770/770；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### siginfo_t 与 ucontext_t（hello137）
+
+- 问题：hello136 记录的“`SA_SIGINFO`/`siginfo` 未实现”缺口。SA_SIGINFO handler 的 `rsi`/`rdx` 是垃圾值；`rt_sigqueueinfo` 丢弃 uinfo；`rt_sigtimedwait` 忽略 info 指针；SIGSEGV handler 拿不到故障地址，也不能改写恢复点；SIGCHLD 不带子进程 pid/状态。
+- 修复：新增 `kernel/proc/siginfo_policy.zig`（纯策略：siginfo 编码/解码、`queueinfoAllowed`、`childInfo`、`faultInfo`、`UContext` 布局并用 comptime 断言偏移）；`SignalFrame` 改为 `{signum, fpu, info, uc}`，`pushSignalFrame` 填充并返回 `info_addr/uc_addr`，两条投递路径（syscall 返回、定时器中断）把它们放进 `rsi/rdx`；`sigreturn` 改为从 `uc.gregs/uc.sigmask` 恢复；`Task.sig_info[64]` 在发送时记录；`sendSignalInfo` 供 tkill/queueinfo/SIGCHLD/故障使用；删除未被引用的 `popSignalFrame`。
+- 已知差异：同号信号合并为一次，只保留最后一次 info；`uc.fpregs` 为 0（浮点状态仍在帧内的 FXSAVE 区，不通过 mcontext 暴露）；`uc_stack` 只报告当前 sigaltstack 配置；`si_utime/si_stime` 为 0。
+- 排查过程（如实）：探测第一版因 `-ffreestanding` 下结构体赋值生成 `memcpy` 导致链接失败，改为逐字段拷贝；`si_uid` 检查最初写死 0，改为与 `getuid()` 比较。红灯运行：旧内核在第一次 SA_SIGINFO 投递时进程就因垃圾指针崩溃，只打印了 1 项 ok，没有 PASS——这符合“不实现 siginfo”的预期，但意味着红灯无法逐项计数。
+- TDD：host 新增 4 个测试（siginfo 布局/往返、queueinfo 权限、child/fault 信息、导出可达）；hello137（27 项）在 HEAD 上进程崩溃，新内核 PASS。
+
+- 变异：`rt_sigqueueinfo` 改回不带 info 的 `sendSignal` → hello137 C 段 2 项 FAIL，恢复后 PASS。
+- 验证：host 771/771；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

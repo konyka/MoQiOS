@@ -10,6 +10,7 @@
 /// the saved register state, then modify the return RIP to point to the
 /// user's signal handler. The sigreturn syscall restores the original context.
 const task = @import("task.zig");
+const siginfo = @import("siginfo_policy.zig");
 
 /// Highest signal number (SIGRTMAX); the first real-time signal is 32.
 pub const MAX_SIGNAL: u32 = 64;
@@ -54,34 +55,18 @@ pub fn defaultAction(signum: u32) SigDefault {
 /// After the handler returns, it calls the sigreturn trampoline
 /// which restores this frame.
 pub const SignalFrame = extern struct {
-    rax: u64,
-    rbx: u64,
-    rcx: u64,
-    rdx: u64,
-    rsi: u64,
-    rdi: u64,
-    rbp: u64,
-    r8: u64,
-    r9: u64,
-    r10: u64,
-    r11: u64,
-    r12: u64,
-    r13: u64,
-    r14: u64,
-    r15: u64,
-    rip: u64,
-    rflags: u64,
-    rsp: u64,
     signum: u64,
-    /// Task mask at the moment the signal interrupted the task; sigreturn
-    /// restores it (the handler ran with sa_mask | signum added).
-    saved_mask: u64,
-    _pad: u64,
     /// FXSAVE image of the interrupted x87/SSE state (512 bytes, 16-aligned
     /// within the frame). The handler shares the task's FPU, so without this
     /// any SSE use in the handler corrupted the interrupted code's xmm
     /// registers and MXCSR.
     fpu: [512]u8 align(16),
+    /// siginfo_t handed to SA_SIGINFO handlers (rsi).
+    info: [siginfo.SIGINFO_SIZE]u8,
+    /// ucontext_t handed to SA_SIGINFO handlers (rdx). Its gregs and sigmask
+    /// are what sigreturn restores, so a handler may edit them (rip, rsp,
+    /// registers, the mask to resume with).
+    uc: siginfo.UContext,
 };
 
 comptime {
@@ -116,6 +101,26 @@ var sigreturn_trampoline_phys: u64 = 0;
 /// signal on resume. Masked or ignored signals remain pending without waking
 /// the wait.
 pub fn sendSignal(target_tid: u32, signum: u32) bool {
+    return sendSignalInfo(target_tid, signum, senderInfo());
+}
+
+fn tgidOf(t: *task.Task) u32 {
+    return if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid;
+}
+
+/// siginfo for a signal sent by the running task (kill): SI_USER with its
+/// pid and uid; SI_KERNEL when no user task is current.
+pub fn senderInfo() siginfo.Info {
+    const sched = @import("sched.zig");
+    const cur = sched.currentTask() orelse return .{ .code = siginfo.SI_KERNEL };
+    if (!cur.is_user) return .{ .code = siginfo.SI_KERNEL };
+    return .{ .code = siginfo.SI_USER, .a = siginfo.pidUid(tgidOf(cur), cur.uid) };
+}
+
+/// sendSignal with an explicit siginfo (tkill, rt_sigqueueinfo, SIGCHLD,
+/// faults). The info is recorded before the pending bit is set so the
+/// delivery that consumes the bit sees it.
+pub fn sendSignalInfo(target_tid: u32, signum: u32, info: siginfo.Info) bool {
     if (signum == 0 or signum > MAX_SIGNAL) return false;
 
     for (0..task.MAX_TASKS) |i| {
@@ -125,6 +130,7 @@ pub fn sendSignal(target_tid: u32, signum: u32) bool {
             // handler 在恢复后投递；致命信号必须先解除停止态否则杀不死。
             if (signum == SIGCONT) continueTask(t);
             if (defaultAction(signum) == .terminate and t.stopped) t.stopped = false;
+            t.sig_info[signum - 1] = info;
             _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
             kickIfBlocked(@intCast(i));
             return true;
@@ -176,6 +182,7 @@ pub fn sendSignalToPgrp(pgid: u16, signum: u32) u32 {
 pub fn sendSignalToPgrpFiltered(pgid: u16, signum: u32, sender: ?*task.Task) u32 {
     if (signum == 0 or signum > MAX_SIGNAL) return 0;
     const action = defaultAction(signum);
+    const info: siginfo.Info = if (sender != null) senderInfo() else .{ .code = siginfo.SI_KERNEL };
     var sent: u32 = 0;
     for (0..task.MAX_TASKS) |i| {
         const t = task.getTask(@intCast(i)) orelse continue;
@@ -184,6 +191,7 @@ pub fn sendSignalToPgrpFiltered(pgid: u16, signum: u32, sender: ?*task.Task) u32
             if (!@import("signal_syscall.zig").maySignal(snd, t)) continue;
         }
         sent += 1;
+        t.sig_info[signum - 1] = info;
         switch (action) {
             .stop => {
                 const h = t.signal_handlers[signum - 1];
@@ -363,7 +371,7 @@ pub fn pushSignalFrame(
     user_rip: u64,
     user_rflags: u64,
     gprs: *const GpRegs,
-) struct { new_rsp: u64, handler: u64 } {
+) struct { new_rsp: u64, handler: u64, info_addr: u64 = 0, uc_addr: u64 = 0 } {
     const handler_addr = t.signal_handlers[signum - 1];
 
     // Layout (stack grows down; the handler only writes BELOW its entry RSP):
@@ -396,29 +404,38 @@ pub fn pushSignalFrame(
     var frame: SignalFrame = undefined;
     const fb: [*]u8 = @ptrCast(&frame);
     @memset(fb[0..@sizeOf(SignalFrame)], 0);
-    // Full interrupted GPR set — sigreturn restores these verbatim.
-    frame.rax = gprs.rax;
-    frame.rbx = gprs.rbx;
-    frame.rcx = gprs.rcx;
-    frame.rdx = gprs.rdx;
-    frame.rsi = gprs.rsi;
-    frame.rdi = gprs.rdi;
-    frame.rbp = gprs.rbp;
-    frame.r8 = gprs.r8;
-    frame.r9 = gprs.r9;
-    frame.r10 = gprs.r10;
-    frame.r11 = gprs.r11;
-    frame.r12 = gprs.r12;
-    frame.r13 = gprs.r13;
-    frame.r14 = gprs.r14;
-    frame.r15 = gprs.r15;
-    frame.rip = user_rip;
-    frame.rflags = user_rflags;
-    frame.rsp = user_rsp;
     frame.signum = signum;
+    // The info recorded when the signal was sent; consumed by this delivery.
+    const sent = t.sig_info[signum - 1];
+    t.sig_info[signum - 1] = .{};
+    frame.info = siginfo.encode(signum, sent);
     // A deferred temporary-mask restore (epoll_pwait/pselect EINTR) means
     // the mask to resume with is the pre-call mask, not the temporary one.
-    frame.saved_mask = if (t.restore_sigmask_pending) t.saved_sigmask else t.signal_mask;
+    // Full interrupted context in ucontext form — sigreturn restores it
+    // verbatim, so a handler may edit it.
+    var uc = &frame.uc;
+    uc.sigmask = if (t.restore_sigmask_pending) t.saved_sigmask else t.signal_mask;
+    uc.ss_sp = t.sigaltstack_base;
+    uc.ss_size = t.sigaltstack_size;
+    uc.gregs[siginfo.REG_RAX] = gprs.rax;
+    uc.gregs[siginfo.REG_RBX] = gprs.rbx;
+    uc.gregs[siginfo.REG_RCX] = gprs.rcx;
+    uc.gregs[siginfo.REG_RDX] = gprs.rdx;
+    uc.gregs[siginfo.REG_RSI] = gprs.rsi;
+    uc.gregs[siginfo.REG_RDI] = gprs.rdi;
+    uc.gregs[siginfo.REG_RBP] = gprs.rbp;
+    uc.gregs[siginfo.REG_R8] = gprs.r8;
+    uc.gregs[siginfo.REG_R9] = gprs.r9;
+    uc.gregs[siginfo.REG_R10] = gprs.r10;
+    uc.gregs[siginfo.REG_R11] = gprs.r11;
+    uc.gregs[siginfo.REG_R12] = gprs.r12;
+    uc.gregs[siginfo.REG_R13] = gprs.r13;
+    uc.gregs[siginfo.REG_R14] = gprs.r14;
+    uc.gregs[siginfo.REG_R15] = gprs.r15;
+    uc.gregs[siginfo.REG_RIP] = user_rip;
+    uc.gregs[siginfo.REG_EFL] = user_rflags;
+    uc.gregs[siginfo.REG_RSP] = user_rsp;
+    if (signum == SIGSEGV or signum == SIGBUS) uc.gregs[siginfo.REG_CR2] = sent.a;
     if (comptime @import("builtin").cpu.arch == .x86_64) {
         // The task is the current one on this CPU and its FPU state is live
         // in the registers (eager switch-in restore). Snapshot it.
@@ -459,27 +476,13 @@ pub fn pushSignalFrame(
     const sa_mask = t.signal_sa_masks[signum - 1];
     const sa_flags = t.signal_sa_flags[signum - 1];
     t.signal_mask = dp.handlerMask(t.signal_mask, signum, sa_mask, sa_flags);
-    t.restore_sigmask_pending = false; // now carried by frame.saved_mask
+    t.restore_sigmask_pending = false; // now carried by uc.sigmask
     t.signal_handlers[signum - 1] = dp.handlerAfterDelivery(handler_addr, sa_flags);
 
-    return .{ .new_rsp = handler_rsp, .handler = handler_addr };
-}
-
-/// Restore context from a signal frame on sigreturn.
-/// The user RSP points to the SignalFrame. We read it and return
-/// the saved RIP, RSP, RFLAGS so the syscall return path can use them.
-/// `frame_addr` is user-controlled, so it is copied in rather than dereferenced;
-/// null means the range is not fully mapped user memory.
-pub fn popSignalFrame(frame_addr: u64) ?struct { rip: u64, rsp: u64, rflags: u64, rax: u64 } {
-    if (frame_addr == 0 or frame_addr >= 0x0000_8000_0000_0000) return null;
-    var frame: SignalFrame = undefined;
-    const dst: [*]u8 = @ptrCast(&frame);
-    const copy = @import("../mm/copy_from_user.zig");
-    if (copy.copyFromUser(dst[0..@sizeOf(SignalFrame)], @ptrFromInt(frame_addr), @sizeOf(SignalFrame)) != @sizeOf(SignalFrame)) return null;
     return .{
-        .rip = frame.rip,
-        .rsp = frame.rsp,
-        .rflags = frame.rflags,
-        .rax = frame.rax,
+        .new_rsp = handler_rsp,
+        .handler = handler_addr,
+        .info_addr = frame_addr + @offsetOf(SignalFrame, "info"),
+        .uc_addr = frame_addr + @offsetOf(SignalFrame, "uc"),
     };
 }

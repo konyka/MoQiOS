@@ -7528,3 +7528,9 @@ test "tkill target tid must be a positive pid_t" {
     try std.testing.expectEqual(@as(?u32, null), ip.tkillTargetTid(-5));
     try std.testing.expectEqual(@as(?u32, null), ip.tkillTargetTid(0x8000_0000));
 }
+
+test "siginfo policy is reachable from the host test root" {
+    const sp = kt.siginfo_policy;
+    try std.testing.expectEqual(@as(usize, 128), sp.SIGINFO_SIZE);
+    try std.testing.expectEqual(@as(usize, 432), @sizeOf(sp.UContext));
+}

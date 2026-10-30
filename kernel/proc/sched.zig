@@ -1458,6 +1458,8 @@ pub fn deliverSignalToRunningTask(t: *task.Task, iframe: *idt.InterruptFrame) bo
     iframe.rip = handler_addr;
     iframe.rsp = result.new_rsp;
     iframe.rdi = signum;
+    iframe.rsi = result.info_addr;
+    iframe.rdx = result.uc_addr;
     return true;
 }
 

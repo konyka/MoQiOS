@@ -210,6 +210,10 @@ pub const Task = struct {
     /// Signals 1-64 supported. Bit 0 = SIGHUP (1), bit 63 = SIGRTMAX (64).
     pending_signals: u64,
 
+    /// siginfo of the most recent send of each signal (siginfo_policy.Info),
+    /// recorded before the pending bit is set; same-number sends coalesce.
+    sig_info: [64]@import("siginfo_policy.zig").Info = @splat(.{}),
+
     /// Signal mask — blocked signals (bit N = signal N+1 is blocked).
     /// SIGKILL (9) and SIGSTOP (19) cannot be blocked.
     /// 64-bit to match the rt_* sigset_t ABI: bit N = signal N+1, 1-64.
@@ -1259,7 +1263,10 @@ pub fn exitTask(exit_code: i32) void {
     // POSIX: the parent of an exiting child receives SIGCHLD (default
     // action: ignore). Sent outside task_lock — sendSignal/kickIfBlocked
     // re-take it. Threads report through clear_tid, not SIGCHLD.
-    if (notify_parent) _ = @import("signal.zig").sendSignal(sigchld_parent, 17);
+    if (notify_parent) {
+        const sp = @import("siginfo_policy.zig");
+        _ = @import("signal.zig").sendSignalInfo(sigchld_parent, 17, sp.childInfo(t.tid, t.uid, exit_code, t.exited_via_syscall));
+    }
 
     // 作业控制：会话长退出 → 同会话成员收 SIGHUP（孤儿进程组，近似规则）。
     // 必须在 task_lock 之外调用：广播路径的 kickIfBlocked/continueTask 会经

@@ -739,7 +739,7 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
                         cur.signal_handlers[fault_sig - 1] = 0;
                         cur.signal_mask &= ~fault_bit;
                     }
-                    _ = sig_mod.sendSignal(cur.tid, fault_sig);
+                    _ = sig_mod.sendSignalInfo(cur.tid, fault_sig, @import("../../proc/siginfo_policy.zig").faultInfo(fault_sig == sig_mod.SIGBUS, (err & 0x1) != 0, cr2));
                     if (sched_mod.deliverSignalToRunningTask(cur, frame)) {
                         return;
                     }

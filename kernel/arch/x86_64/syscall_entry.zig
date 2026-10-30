@@ -3323,6 +3323,8 @@ fn deliverSignalOnSyscallReturn(frame: *SyscallFrame, current: anytype) void {
     if (result.new_rsp == 0) @import("../../proc/task.zig").exitTask(128 + @as(i32, @intCast(sig_mod.SIGSEGV)));
 
     frame.rdi = signum;
+    frame.rsi = result.info_addr;
+    frame.rdx = result.uc_addr;
     frame.rcx = handler_addr;
     const pc = getPerCpu();
     pc.exec_pending = 3;

@@ -246,14 +246,16 @@ pub fn sigreturn() ?SigreturnResult {
     // unmapped stack (fatal — there is no per-syscall recovery) and would feed
     // kernel memory straight back into user registers when RSP points high.
     const sig_frame = readSignalFrame(user_rsp) orelse return null;
+    const gregs = &sig_frame.uc.gregs;
+    const si = @import("siginfo_policy.zig");
     const sigreturn_policy = @import("sigreturn_policy.zig");
-    if (!sigreturn_policy.userTargetValid(sig_frame.rip) or
-        !sigreturn_policy.userTargetValid(sig_frame.rsp)) return null;
-    const rflags = sigreturn_policy.sanitizeRflags(sig_frame.rflags);
+    if (!sigreturn_policy.userTargetValid(gregs[si.REG_RIP]) or
+        !sigreturn_policy.userTargetValid(gregs[si.REG_RSP])) return null;
+    const rflags = sigreturn_policy.sanitizeRflags(gregs[si.REG_EFL]);
     // Restore the interrupted mask (the handler ran with sa_mask | signum
     // added) and the interrupted x87/SSE state.
     if (sched.currentTask()) |cur| {
-        cur.signal_mask = @import("signal_delivery_policy.zig").restoredMask(sig_frame.saved_mask);
+        cur.signal_mask = @import("signal_delivery_policy.zig").restoredMask(sig_frame.uc.sigmask);
     }
     if (comptime @import("builtin").cpu.arch == .x86_64) {
         // MXCSR comes from user memory: reserved bits set would make fxrstor
@@ -273,29 +275,29 @@ pub fn sigreturn() ?SigreturnResult {
     // M8-5b-1: per-CPU exec redirect for the syscall return path
     const pc = syscall_entry.getPerCpu();
     pc.exec_pending = 2;
-    pc.exec_new_entry = sig_frame.rip;
-    pc.exec_new_stack = sig_frame.rsp;
+    pc.exec_new_entry = gregs[si.REG_RIP];
+    pc.exec_new_stack = gregs[si.REG_RSP];
     pc.exec_new_flags = rflags;
 
     return .{
-        .rip = sig_frame.rip,
-        .rsp = sig_frame.rsp,
+        .rip = gregs[si.REG_RIP],
+        .rsp = gregs[si.REG_RSP],
         .rflags = rflags,
-        .rax = sig_frame.rax,
-        .rbx = sig_frame.rbx,
-        .rcx = sig_frame.rcx,
-        .rdx = sig_frame.rdx,
-        .rsi = sig_frame.rsi,
-        .rdi = sig_frame.rdi,
-        .rbp = sig_frame.rbp,
-        .r8 = sig_frame.r8,
-        .r9 = sig_frame.r9,
-        .r10 = sig_frame.r10,
+        .rax = gregs[si.REG_RAX],
+        .rbx = gregs[si.REG_RBX],
+        .rcx = gregs[si.REG_RCX],
+        .rdx = gregs[si.REG_RDX],
+        .rsi = gregs[si.REG_RSI],
+        .rdi = gregs[si.REG_RDI],
+        .rbp = gregs[si.REG_RBP],
+        .r8 = gregs[si.REG_R8],
+        .r9 = gregs[si.REG_R9],
+        .r10 = gregs[si.REG_R10],
         .r11 = rflags, // r11 gets rflags for sysretq
-        .r12 = sig_frame.r12,
-        .r13 = sig_frame.r13,
-        .r14 = sig_frame.r14,
-        .r15 = sig_frame.r15,
+        .r12 = gregs[si.REG_R12],
+        .r13 = gregs[si.REG_R13],
+        .r14 = gregs[si.REG_R14],
+        .r15 = gregs[si.REG_R15],
     };
 }
 
@@ -407,7 +409,8 @@ pub fn rtSigsuspend(mask_ptr: u64, sigsetsize: u64) i64 {
 
 /// rt_sigtimedwait(sigset_ptr, info_ptr, timeout_ptr, sigset_size) → signal number or -errno
 pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_size: u64) i64 {
-    _ = info_ptr;
+    const si = @import("siginfo_policy.zig");
+    if (info_ptr != 0 and !copy.validateUserBufferWritable(info_ptr, si.SIGINFO_SIZE)) return -14;
 
     if (sigset_size == 0 or sigset_ptr == 0 or sigset_ptr >= 0x0000_8000_0000_0000) return -22;
 
@@ -442,6 +445,12 @@ pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_s
         if (pending != 0) {
             const bit: u6 = @intCast(@ctz(pending));
             _ = @atomicRmw(u64, &cur.pending_signals, .And, ~(@as(u64, 1) << bit), .seq_cst);
+            const taken = cur.sig_info[bit];
+            cur.sig_info[bit] = .{};
+            if (info_ptr != 0) {
+                const raw = si.encode(@as(u32, bit) + 1, taken);
+                if (copy.copyToUser(@ptrFromInt(info_ptr), &raw, raw.len) != raw.len) return -14;
+            }
             return @as(i64, bit) + 1;
         }
         // A signal outside the wait set that would run a handler ends the
@@ -461,10 +470,18 @@ pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_s
 
 /// rt_sigqueueinfo(tgid, sig, uinfo_ptr) → 0 or -errno
 pub fn rtSigqueueinfo(tgid: u32, sig: u32, uinfo_ptr: u64) i64 {
-    _ = uinfo_ptr;
-    if (sig == 0 or sig > 64) return -22;
+    const si = @import("siginfo_policy.zig");
+    if (sig > 64) return -22;
+    var raw: [si.SIGINFO_SIZE]u8 = undefined;
+    if (copy.copyFromUser(&raw, @ptrFromInt(uinfo_ptr), raw.len) != raw.len) return -14;
+    const info = si.decode(&raw);
+    const cur = sched.currentTask();
+    const to_self = if (cur) |c| threadGroupId(c) == tgid else true;
+    if (!si.queueinfoAllowed(info.code, to_self)) return -1; // EPERM
+    _ = task_mod.findTaskByTid(tgid) orelse return -3; // ESRCH
     if (!currentMaySignalTask(tgid)) return -1; // EPERM
-    if (sig_mod.sendSignal(tgid, sig)) return 0;
+    if (sig == 0) return 0;
+    if (sig_mod.sendSignalInfo(tgid, sig, info)) return 0;
     return -3; // ESRCH
 }
 
@@ -476,7 +493,9 @@ pub fn tkill(tid_arg: i64, sig: u32) i64 {
     _ = task_mod.findTaskByTid(tid) orelse return -3; // ESRCH
     if (!currentMaySignalTask(tid)) return -1; // EPERM
     if (sig == 0) return 0; // existence and permission probe
-    if (sig_mod.sendSignal(tid, sig)) return 0;
+    var info = sig_mod.senderInfo();
+    if (info.code == @import("siginfo_policy.zig").SI_USER) info.code = @import("siginfo_policy.zig").SI_TKILL;
+    if (sig_mod.sendSignalInfo(tid, sig, info)) return 0;
     return -3; // ESRCH
 }
 

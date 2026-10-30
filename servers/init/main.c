@@ -264,6 +264,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello134"); /* socket flags and AF_UNIX semantics */
     run_test("hello135"); /* signal call argument and errno rules */
     run_test("hello136"); /* real-time signals 32..64 */
+    run_test("hello137"); /* siginfo and ucontext */
 
     start_persistent_services();
 
