@@ -91,7 +91,13 @@ fn isSpecialTree(name: []const u8) bool {
 
 fn describe(d: *const @import("vfs.zig").FileDescriptor, fd: u32) ?@import("stat_info.zig").Common {
     const si = @import("stat_info.zig");
-    var c: si.Common = .{ .mode = if (d.fd_type == .tcp_socket) 0o140777 else 0o100644, .ino = fd, .size = d.file_size };
+    const dir_ops = @import("dir_ops.zig");
+    const fsp = @import("fd_stat_policy.zig");
+    const kind = dir_ops.descriptorKind(d);
+    // Descriptors without a directory entry of their own; the filesystem
+    // cases below replace all of this.
+    var c: si.Common = .{ .mode = fsp.mode(kind, d.writable), .nlink = @intCast(fsp.nlink(kind)), .ino = dir_ops.descriptorIno(d, fd), .size = d.file_size };
+    if (kind == .regular) c.mode = 0o100644;
     switch (d.fd_type) {
         .tmpfs_file => {
             const m = @import("tmpfs.zig").tmpfsGetMetadata(@intCast(d.tmpfs_idx)) orelse return null;

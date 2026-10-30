@@ -26,6 +26,37 @@ pub fn getcwd(buf_ptr: u64, buf_size: u64) i64 {
     return @intCast(total);
 }
 
+/// What kind of object a descriptor is, for descriptors that have no
+/// directory entry of their own (see fd_stat_policy.zig).
+pub fn descriptorKind(d: *const vfs_mod.FileDescriptor) @import("fd_stat_policy.zig").Kind {
+    return switch (d.fd_type) {
+        .special => .char_device,
+        .pipe_read, .pipe_write => .pipe,
+        .tcp_socket, .udp_socket, .unix_socket, .raw_socket => .socket,
+        .eventfd, .epoll, .timerfd, .inotify, .pidfd, .devfs_ctrl => .anon,
+        .devfs => if (d.devfs_idx == @import("devfs.zig").DIR_IDX) .directory else .char_device,
+        else => .regular,
+    };
+}
+
+/// A stable inode number for a descriptor's object: type tag + resource index.
+pub fn descriptorIno(d: *const vfs_mod.FileDescriptor, fd: u64) u64 {
+    const res: u64 = switch (d.fd_type) {
+        .pipe_read, .pipe_write => d.pipe_idx,
+        .tcp_socket => d.tcb_idx,
+        .udp_socket => d.udp_port,
+        .unix_socket => d.unix_sock_idx,
+        .eventfd => d.eventfd_idx,
+        .epoll => d.epoll_idx,
+        .timerfd => d.timerfd_idx,
+        .inotify => d.inotify_idx,
+        .devfs => d.devfs_idx,
+        .devfs_ctrl => d.devfs_ctrl_idx,
+        else => fd,
+    };
+    return @import("fd_stat_policy.zig").syntheticIno(@intFromEnum(d.fd_type), res);
+}
+
 /// fstat(fd, stat_ptr) → 0 or -errno
 pub fn fstat(fd: u64, stat_ptr: u64) i64 {
     if (stat_ptr == 0 or stat_ptr >= 0x0000_8000_0000_0000) return -1;
@@ -41,18 +72,15 @@ pub fn fstat(fd: u64, stat_ptr: u64) i64 {
     var stat_buf: [144]u8 = undefined;
     @memset(&stat_buf, 0);
 
-    const ino: u64 = fd;
-    bo.writeU64Le(stat_buf[8..16], ino);
-
-    var mode: u32 = 0o100000; // S_IFREG
-    if (fdesc.fd_type == .special) {
-        mode = 0o020000; // S_IFCHR
-    } else if (fdesc.fd_type == .pipe_read or fdesc.fd_type == .pipe_write) {
-        mode = 0o010000; // S_IFIFO
-    }
-    mode |= 0o444;
-    if (fdesc.writable) mode |= 0o222;
-    bo.writeU32Le(stat_buf[24..28], mode);
+    // Fallback metadata for descriptors without a directory entry of their
+    // own (pipes, sockets, event objects, devices, the console). Filesystem
+    // backed descriptors overwrite all of this below.
+    const fsp = @import("fd_stat_policy.zig");
+    const fd_kind = descriptorKind(&fdesc);
+    bo.writeU64Le(stat_buf[8..16], descriptorIno(&fdesc, fd));
+    bo.writeU64Le(stat_buf[16..24], fsp.nlink(fd_kind));
+    bo.writeU32Le(stat_buf[24..28], fsp.mode(fd_kind, fdesc.writable));
+    bo.writeU64Le(stat_buf[56..64], 4096); // st_blksize
 
     const size: i64 = @intCast(fdesc.file_size);
     bo.writeI64Le(stat_buf[48..56], size);

@@ -7805,3 +7805,20 @@ test "ext2 directory path assembly: join, depth limit, loop detection" {
     try std.testing.expectEqual(dp.Step.invalid, dp.nextStep(12, 12, &.{12}));
     try std.testing.expectEqual(dp.Step.invalid, dp.nextStep(12, 7, &.{ 12, 7 }));
 }
+
+test "fd stat policy: type bits, permissions, link counts and synthetic inodes" {
+    const fp = kt.fd_stat_policy;
+    try std.testing.expectEqual(fp.S_IFIFO, fp.typeBits(.pipe));
+    try std.testing.expectEqual(fp.S_IFSOCK, fp.typeBits(.socket));
+    try std.testing.expectEqual(fp.S_IFCHR, fp.typeBits(.char_device));
+    try std.testing.expectEqual(fp.S_IFDIR, fp.typeBits(.directory));
+    try std.testing.expectEqual(fp.S_IFREG, fp.typeBits(.anon));
+    try std.testing.expectEqual(fp.S_IFIFO | 0o600, fp.mode(.pipe, true));
+    try std.testing.expectEqual(fp.S_IFSOCK | 0o600, fp.mode(.socket, false));
+    try std.testing.expectEqual(fp.S_IFCHR | 0o666, fp.mode(.char_device, true));
+    try std.testing.expectEqual(@as(u32, 0), fp.mode(.anon, true) & 0o111);
+    try std.testing.expectEqual(@as(u64, 1), fp.nlink(.pipe));
+    try std.testing.expectEqual(@as(u64, 2), fp.nlink(.directory));
+    try std.testing.expect(fp.syntheticIno(1, 3) != fp.syntheticIno(2, 3));
+    try std.testing.expect(fp.syntheticIno(1, 3) != fp.syntheticIno(1, 4));
+}

@@ -45,7 +45,7 @@ set $i = 0
 while $i < 64
   if ($bm >> $i) & 1
     set $t = &'proc.task.tasks'[$i]
-    printf "slot %2d tid=%3d parent=%3d state=%d stopped=%d is_thread=%d is_user=%d sid=%d pgid=%d sleep_deadline=%lu wait_child=%d pending=0x%x mask=0x%lx futex_deadline=%lu futex_seq=%lu last_cpu=%d\n", $i, $t.tid, $t.parent_tid, $t.state, $t.stopped, $t.is_thread, $t.is_user, $t.sid, $t.pgid, $t.sleep_deadline_ns, $t.waiting_for_child, $t.pending_signals, $t.signal_mask, 'sync.futex.wait_deadlines'[$i], 'sync.futex.wait_seq'[$i], $t.last_cpu
+    printf "slot %2d tid=%3d parent=%3d state=%d stopped=%d is_thread=%d is_user=%d sid=%d pgid=%d sleep_deadline=%lu wait_child=%d pending=0x%lx mask=0x%lx futex_deadline=%lu futex_seq=%lu last_cpu=%d\n", $i, $t.tid, $t.parent_tid, $t.state, $t.stopped, $t.is_thread, $t.is_user, $t.sid, $t.pgid, $t.sleep_deadline_ns, $t.waiting_for_child, $t.pending_signals, $t.signal_mask, 'sync.futex.wait_deadlines'[$i], 'sync.futex.wait_seq'[$i], $t.last_cpu
     if $t.is_user
       printf "--- saved frame at saved_rsp=0x%lx ---\n", $t.saved_rsp
       x/20gx $t.saved_rsp

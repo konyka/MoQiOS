@@ -275,6 +275,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello145"); /* UDP sendmsg/recvmsg, AF_UNIX receive timeout */
     run_test("hello146"); /* sendmmsg / recvmmsg */
     run_test("hello147"); /* directory fd follows its directory across rename */
+    run_test("hello148"); /* fstat file types for every descriptor kind */
 
     start_persistent_services();
 

@@ -5531,3 +5531,23 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 变异：`dirFdBase` 改回只用打开时的路径 → hello147 A、B 段共 5 项 FAIL，恢复后 PASS。
 - 验证：host 789/789；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### fstat 对各类描述符报告正确的文件类型（hello148）
+
+- 问题：`fstat` 对 socket、eventfd、epoll、`/dev/null`、`/dev` 目录一律报告 `S_IFREG`；`st_ino` 是 fd 号；`st_nlink`、`st_blksize` 为 0。
+- 修复：新增 `fs/fd_stat_policy.zig`（纯策略：类型位、权限、link 数、合成 inode），`dir_ops.fstat` 先用它填充，再由 ext2/tmpfs/FAT32/rofs 覆盖。
+- 已知差异：`statx(AT_EMPTY_PATH)` 描述描述符时共用同一套推导（`dir_ops.descriptorKind/descriptorIno`）；按路径名的 `stat`/`statx` 先打开临时描述符再描述，所以对 `/dev/null` 这类路径名会得到同样的类型，但没有单独的路径名探测覆盖它们；合成 inode 在对象被回收复用后会重复；`st_rdev` 仍为 0（没有设备号）；`st_atime/mtime/ctime` 对非磁盘描述符为 0；`st_size` 沿用描述符里的 `file_size`（管道里排队的字节数不体现）。
+- 排查过程（如实）：我最初把 eventfd/epoll 的检查写成“不是普通文件”，这是我对 Linux 行为的想当然——Linux 的匿名 inode 恰恰报告 `S_IFREG|0600`，所以检查改成断言真实的 Linux 值，内核实现是按 Linux 来的。
+- TDD：host 新增 1 个测试；hello148（25 项，含 statx(AT_EMPTY_PATH) 一致性）在 HEAD 上 11 项 FAIL（其中 statx 的 3 项），新内核 PASS，新内核 PASS。
+- 变异：`typeBits(.socket)` 改成 `S_IFREG` → host 的 `fd stat policy` 测试失败；QEMU 里同一类变异使 hello148 A 段的 socket 检查 FAIL，恢复后 PASS。
+- 验证：host 790/790；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=2 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS；SMP=8 见下一节：该配置有一个与本改动无关的间歇性停顿，第一次门禁运行因它超时，之后用本改动连跑 5 次 SMP=8 全部通过。
+
+#### 门禁中发现的既有间歇性停顿：SMP=8 在 hello144 D 段（与本改动无关，未修复）
+
+- 现象：本轮 SMP=8 冒烟第一次超时（200 s 没有出现结束标记），日志停在 `hello144` C 段之后、D 段“阻塞接收被另一进程发来的数据报唤醒”的 `fork` 之后（`[fork] parent=433 child=434`、`[exit] task exited`，然后再无输出），0 个 FAIL 行。
+- 它不是本改动引入的：把本改动 `git stash` 掉，在 HEAD 上连跑 4 次 SMP=8，第 3 次同样停在同一位置（rc=1）。用本改动再跑 5 次 SMP=8 全部通过，另有 3 次中 2 次通过——即约 1/4 到 1/5 的概率，与有无本改动无关。
+- 用 `tools/gdb_stall_probe.sh`（PROBE_SMP=8）抓到一次现场：8 个 CPU 全部停在 `kernelIdleLoop`（`hlt`，`IF=1`），没有任何 CPU 在运行用户任务；父进程（slot 11，tid 433）是 `state=2 blocked`，`sleep_deadline_ns=310266773022`、`sleep_bm=0x800`（恰好是它的位）、`pending=0x10000`；子进程（tid 434）已是 `state=3 zombie`，它的父进程（tid 433）正在 `udpWaitForDatagram` 里 5 ms 一片地 `sleepUntil`。也就是说：睡眠位在、截止时间也在，但没有任何 CPU 的定时器 tick 把它叫醒。
+- 已排除/已知：8 个 CPU 全在 `hlt` 且中断开着；`sleepTimerTick` 在每个 CPU 的每次 tick 上都会运行，所以应当被某个 CPU 的下一次 LAPIC 定时器中断唤醒；我另外在 SMP=8 上给每个 CPU 读 `clock_gettime`，各 CPU 的单调时钟一致（相差 <1 ms，只有个别窗口出现 ~240 ms 的跳变，说明 vCPU 偶尔被宿主机挂起，不是各 CPU 时钟不同步）。
+- 没有查明根因：怀疑是“8 个 vCPU 同时 `hlt` 且全部错过了 LAPIC 定时器中断”或 QEMU 在宿主机负载下丢了定时器中断（宿主机负载平均约 1–3）。需要 `-d int` 或 LAPIC 计数器才能继续确认。这一项我记为待办，没有放宽任何阈值，也没有改超时。
+- 与 hello144 的关系：hello144 的 D 段是唯一一个“父进程在内核里 5 ms 一片轮询睡眠、同时等待另一个进程发 UDP”的测试，所以最容易暴露“睡眠唤醒丢失”；在 SMP=1/2 上从未出现。
+
