@@ -3264,7 +3264,7 @@ fn deliverSignalOnSyscallReturn(frame: *SyscallFrame, current: anytype) void {
 
     if (!current.is_user) return;
     if (current.pending_signals == 0) return;
-    if (current.pending_signals & ~@as(u32, @truncate(current.signal_mask)) == 0) return;
+    if (current.pending_signals & ~current.signal_mask == 0) return;
 
     const signum = sig_mod.dequeueSignal(current) orelse return;
 

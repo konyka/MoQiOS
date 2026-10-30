@@ -661,12 +661,12 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
             commit_q.?.notify_task_idx = null;
             commit_q.?.notify_tid = 0;
             commit_q.?.notify_signo = 0;
-            if (notify_signo > 0 and notify_signo < 32) {
+            if (notify_signo > 0 and notify_signo <= 64) {
                 if (task.getTask(notify_idx)) |nt| {
                     // The slot may have been recycled after the registrant
                     // exited — only signal if the tid still matches.
                     if (owner_gen_policy.ownerMatches(notify_tid, nt.tid)) {
-                        _ = @atomicRmw(u32, &nt.pending_signals, .Or, @as(u32, 1) << @as(u5, @intCast(notify_signo - 1)), .seq_cst);
+                        _ = @atomicRmw(u64, &nt.pending_signals, .Or, @as(u64, 1) << @as(u6, @intCast(notify_signo - 1)), .seq_cst);
                         @import("../proc/signal.zig").kickIfBlocked(notify_idx);
                     }
                 }
@@ -848,7 +848,7 @@ pub fn mqNotify(mqd: u32, notif_ptr: u64) i64 {
         signo = @bitCast(bo.readU32Le(buf[8..12]));
         const notify_kind = bo.readU32Le(buf[12..16]);
         if (!descriptor_policy.sigevNotifyValid(notify_kind)) return EINVAL;
-        if (signo <= 0 or signo > 31) return EINVAL;
+        if (signo <= 0 or signo > 64) return EINVAL;
     }
 
     const flags = mq_lock.acquire();

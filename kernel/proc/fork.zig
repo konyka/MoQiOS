@@ -90,7 +90,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
     parent.fd_table.inheritFdTable(child.fd_table);
     @import("../ipc/posix_mq.zig").inheritRefs(parent_idx, child_idx);
 
-    for (0..31) |i| {
+    for (0..64) |i| {
         child.signal_handlers[i] = parent.signal_handlers[i];
         child.signal_sa_masks[i] = parent.signal_sa_masks[i];
         child.signal_sa_flags[i] = parent.signal_sa_flags[i];

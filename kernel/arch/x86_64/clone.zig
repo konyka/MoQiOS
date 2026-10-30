@@ -379,7 +379,7 @@ pub fn clone(
     @import("../../ipc/posix_mq.zig").inheritRefs(current_idx, child_idx);
 
     // Signal handlers, mask, environment, cwd, pgid, sid
-    for (0..31) |i| {
+    for (0..64) |i| {
         child.signal_handlers[i] = parent.signal_handlers[i];
         child.signal_sa_masks[i] = parent.signal_sa_masks[i];
         child.signal_sa_flags[i] = parent.signal_sa_flags[i];

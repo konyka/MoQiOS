@@ -1,7 +1,7 @@
 //! Pure pidfd_send_signal argument and descriptor policy.
 
 pub fn signalValid(sig: u32) bool {
-    return sig <= 31;
+    return sig <= 64;
 }
 
 pub fn flagsValid(flags: u32) bool {
@@ -15,8 +15,8 @@ pub fn aliasesShareValidation() bool {
 test "pidfd_send_signal rejects invalid signal and flags" {
     const std = @import("std");
     try std.testing.expect(signalValid(0));
-    try std.testing.expect(signalValid(31));
-    try std.testing.expect(!signalValid(32));
+    try std.testing.expect(signalValid(64));
+    try std.testing.expect(!signalValid(65));
     try std.testing.expect(flagsValid(0));
     try std.testing.expect(!flagsValid(1));
     try std.testing.expect(aliasesShareValidation());

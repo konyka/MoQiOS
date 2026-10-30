@@ -634,8 +634,8 @@ test "pidfd_open accepts only zero flags" {
 }
 
 test "pidfd_send_signal validates signal and flags" {
-    try std.testing.expect(pidfd_signal_policy.signalValid(31));
-    try std.testing.expect(!pidfd_signal_policy.signalValid(32));
+    try std.testing.expect(pidfd_signal_policy.signalValid(64));
+    try std.testing.expect(!pidfd_signal_policy.signalValid(65));
     try std.testing.expect(pidfd_signal_policy.flagsValid(0));
     try std.testing.expect(!pidfd_signal_policy.flagsValid(1));
     try std.testing.expect(pidfd_signal_policy.aliasesShareValidation());

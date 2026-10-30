@@ -391,13 +391,13 @@ pub fn timerTick(current_tick: u64) void {
             // whatever task happens to be running when the tick fires.
             // kickIfBlocked wakes an owner blocked in a wait primitive so it
             // can die/handle on resume (same mechanism as sendSignal).
-            if (t.sigev_notify == SIGEV_SIGNAL and t.sigev_signo > 0 and t.sigev_signo < 32) {
+            if (t.sigev_notify == SIGEV_SIGNAL and t.sigev_signo > 0 and t.sigev_signo <= 64) {
                 if (t.owner_task_idx) |owner_idx| {
                     if (task_mod.getTask(owner_idx)) |owner| {
                         // The slot may have been recycled after the owner
                         // exited — only signal if the tid still matches.
                         if (owner_gen_policy.ownerMatches(t.owner_tid, owner.tid)) {
-                            _ = @atomicRmw(u32, &owner.pending_signals, .Or, @as(u32, 1) << @as(u5, @intCast(t.sigev_signo - 1)), .seq_cst);
+                            _ = @atomicRmw(u64, &owner.pending_signals, .Or, @as(u64, 1) << @as(u6, @intCast(t.sigev_signo - 1)), .seq_cst);
                             @import("../proc/signal.zig").kickIfBlocked(owner_idx);
                         }
                     }

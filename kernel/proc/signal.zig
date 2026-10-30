@@ -1,6 +1,7 @@
 /// Signal handling — POSIX-like signals for MoQiOS.
 ///
-/// Supported signals: 1 (SIGHUP) through 31 (SIGUSR2).
+/// Supported signals: 1 (SIGHUP) through 64 (SIGRTMAX); 32..64 are the
+/// real-time signals (default action: terminate).
 /// Signal delivery happens at two points:
 ///   1. Syscall return path (sysretq) — check before restoring to user mode
 ///   2. Timer tick return path (iretq) — check in scheduler before switching
@@ -9,6 +10,9 @@
 /// the saved register state, then modify the return RIP to point to the
 /// user's signal handler. The sigreturn syscall restores the original context.
 const task = @import("task.zig");
+
+/// Highest signal number (SIGRTMAX); the first real-time signal is 32.
+pub const MAX_SIGNAL: u32 = 64;
 
 pub const SIGKILL: u32 = 9;
 pub const SIGPIPE: u32 = 13;
@@ -112,7 +116,7 @@ var sigreturn_trampoline_phys: u64 = 0;
 /// signal on resume. Masked or ignored signals remain pending without waking
 /// the wait.
 pub fn sendSignal(target_tid: u32, signum: u32) bool {
-    if (signum == 0 or signum > 31) return false;
+    if (signum == 0 or signum > MAX_SIGNAL) return false;
 
     for (0..task.MAX_TASKS) |i| {
         const t = task.getTask(@intCast(i)) orelse continue;
@@ -121,7 +125,7 @@ pub fn sendSignal(target_tid: u32, signum: u32) bool {
             // handler 在恢复后投递；致命信号必须先解除停止态否则杀不死。
             if (signum == SIGCONT) continueTask(t);
             if (defaultAction(signum) == .terminate and t.stopped) t.stopped = false;
-            _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << @intCast(signum - 1), .seq_cst);
+            _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
             kickIfBlocked(@intCast(i));
             return true;
         }
@@ -170,7 +174,7 @@ pub fn sendSignalToPgrp(pgid: u16, signum: u32) u32 {
 /// Group broadcast; with a `sender`, members the sender may not signal
 /// (POSIX kill permission) are skipped.
 pub fn sendSignalToPgrpFiltered(pgid: u16, signum: u32, sender: ?*task.Task) u32 {
-    if (signum == 0 or signum > 31) return 0;
+    if (signum == 0 or signum > MAX_SIGNAL) return 0;
     const action = defaultAction(signum);
     var sent: u32 = 0;
     for (0..task.MAX_TASKS) |i| {
@@ -187,7 +191,7 @@ pub fn sendSignalToPgrpFiltered(pgid: u16, signum: u32, sender: ?*task.Task) u32
                     // SIG_IGN：忽略该成员。
                 } else if (signum != SIGSTOP and h != 0) {
                     // 已装 handler：走普通 pending 投递（handler 运行，读得 EINTR）。
-                    _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << @intCast(signum - 1), .seq_cst);
+                    _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
                     kickIfBlocked(@intCast(i));
                 } else {
                     stopTask(t);
@@ -197,11 +201,11 @@ pub fn sendSignalToPgrpFiltered(pgid: u16, signum: u32, sender: ?*task.Task) u32
                 // Continue, and queue the bit like the single-target path so
                 // an installed SIGCONT handler actually runs.
                 continueTask(t);
-                _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << @intCast(signum - 1), .seq_cst);
+                _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
                 kickIfBlocked(@intCast(i));
             },
             else => {
-                _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << @intCast(signum - 1), .seq_cst);
+                _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
                 // 致命信号必须能终止已停止的任务：先解除停止态再唤醒。
                 if (defaultAction(signum) == .terminate and t.stopped) t.stopped = false;
                 kickIfBlocked(@intCast(i));
@@ -214,10 +218,10 @@ pub fn sendSignalToPgrpFiltered(pgid: u16, signum: u32, sender: ?*task.Task) u32
 /// Raise a signal on the current task itself (e.g. SIGPIPE from pipeWrite).
 /// Delivery happens on the usual syscall-return / timer-tick paths.
 pub fn raiseSelf(signum: u32) void {
-    if (signum == 0 or signum > 31) return;
+    if (signum == 0 or signum > MAX_SIGNAL) return;
     const sched = @import("sched.zig");
     const t = sched.currentTask() orelse return;
-    _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << @intCast(signum - 1), .seq_cst);
+    _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
 }
 
 /// Lowest pending, unblocked signal that has no user handler installed and
@@ -226,10 +230,10 @@ pub fn raiseSelf(signum: u32) void {
 /// through task.exitTask(128 + signum), the same exit-by-signal path the
 /// scheduler tick uses (sched.deliverSignalToRunningTask).
 pub fn pendingFatal(t: *task.Task) ?u32 {
-    const pending = (@atomicLoad(u32, &t.pending_signals, .seq_cst) & ~@as(u32, @truncate(t.signal_mask))) & 0x7FFFFFFF;
+    const pending = @atomicLoad(u64, &t.pending_signals, .seq_cst) & ~t.signal_mask;
     var bits = pending;
     while (bits != 0) {
-        const bit: u5 = @intCast(@ctz(bits));
+        const bit: u6 = @intCast(@ctz(bits));
         bits &= bits - 1;
         const signum = @as(u32, bit) + 1;
         if (t.signal_handlers[bit] == 0 and !defaultSignalAction(signum)) return signum;
@@ -246,7 +250,7 @@ pub fn pendingFatal(t: *task.Task) ?u32 {
 /// interrupts a blocking syscall when a signal is actually delivered
 /// (handler installed) or terminates the process.
 pub fn pendingAny(t: *task.Task) bool {
-    return (@atomicLoad(u32, &t.pending_signals, .seq_cst) & ~@as(u32, @truncate(t.signal_mask)) & 0x7FFFFFFF) != 0;
+    return (@atomicLoad(u64, &t.pending_signals, .seq_cst) & ~t.signal_mask) != 0;
 }
 
 /// True if a pending, unblocked signal would actually be acted on: a handler
@@ -255,10 +259,10 @@ pub fn pendingAny(t: *task.Task) bool {
 /// observed as waitpid returning spurious -EINTR after an earlier child's
 /// SIGCHLD landed while waiting for a second child.
 pub fn pendingActionable(t: *task.Task) bool {
-    const pending = (@atomicLoad(u32, &t.pending_signals, .seq_cst) & ~@as(u32, @truncate(t.signal_mask))) & 0x7FFFFFFF;
+    const pending = @atomicLoad(u64, &t.pending_signals, .seq_cst) & ~t.signal_mask;
     var bits = pending;
     while (bits != 0) {
-        const bit: u5 = @intCast(@ctz(bits));
+        const bit: u6 = @intCast(@ctz(bits));
         bits &= bits - 1;
         if ((t.signal_handlers[bit] != 0 and t.signal_handlers[bit] != 1) or !defaultSignalAction(@as(u32, bit) + 1)) return true;
     }
@@ -269,13 +273,11 @@ pub fn pendingActionable(t: *task.Task) bool {
 /// Returns the lowest signal number, or null if none.
 /// v53.44: O(1) with @ctz instead of O(31) linear scan.
 pub fn dequeueSignal(t: *task.Task) ?u32 {
-    // v53.45: Mask bit 31 — signals 1-31 only, @ctz returning 31 would
-    // index signal_handlers[31] which is out of bounds (array has 31 slots, 0-30).
-    const pending = (@atomicLoad(u32, &t.pending_signals, .seq_cst) & ~@as(u32, @truncate(t.signal_mask))) & 0x7FFFFFFF;
+    const pending = @atomicLoad(u64, &t.pending_signals, .seq_cst) & ~t.signal_mask;
     if (pending == 0) return null;
 
-    const bit: u5 = @intCast(@ctz(pending));
-    _ = @atomicRmw(u32, &t.pending_signals, .And, ~(@as(u32, 1) << bit), .seq_cst);
+    const bit: u6 = @intCast(@ctz(pending));
+    _ = @atomicRmw(u64, &t.pending_signals, .And, ~(@as(u64, 1) << bit), .seq_cst);
     return @as(u32, bit) + 1;
 }
 

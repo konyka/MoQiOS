@@ -207,23 +207,22 @@ pub const Task = struct {
     recorded_limits: @import("rlimit.zig").RecordedLimits = .{},
 
     /// Bitmask of pending signals (bit N = signal N+1 is pending).
-    /// Signals 1-31 supported. Bit 0 = SIGHUP (1), bit 30 = SIGUSR2 (31).
-    pending_signals: u32,
+    /// Signals 1-64 supported. Bit 0 = SIGHUP (1), bit 63 = SIGRTMAX (64).
+    pending_signals: u64,
 
     /// Signal mask — blocked signals (bit N = signal N+1 is blocked).
     /// SIGKILL (9) and SIGSTOP (19) cannot be blocked.
-    /// 64-bit to match the rt_* sigset_t ABI; only bits 0-30 are meaningful
-    /// (pending_signals stays u32 — signals 1-31 are supported).
+    /// 64-bit to match the rt_* sigset_t ABI: bit N = signal N+1, 1-64.
     signal_mask: u64,
 
     /// Signal handler addresses. 0 = default (terminate for now).
-    /// Index 0 = signal 1 (SIGHUP), ..., index 30 = signal 31 (SIGUSR2).
-    signal_handlers: [31]u64,
+    /// Index 0 = signal 1 (SIGHUP), ..., index 63 = signal 64 (SIGRTMAX).
+    signal_handlers: [64]u64,
     /// Per-signal sa_mask: added to the task mask while that handler runs
     /// (signal_frame saves and sigreturn restores the previous mask).
-    signal_sa_masks: [31]u64 = @splat(0),
+    signal_sa_masks: [64]u64 = @splat(0),
     /// Per-signal sa_flags (SA_NODEFER, SA_RESETHAND honoured at delivery).
-    signal_sa_flags: [31]u64 = @splat(0),
+    signal_sa_flags: [64]u64 = @splat(0),
     /// pselect/epoll_pwait/sigsuspend semantics (Linux TIF_RESTORE_SIGMASK):
     /// when a call that installed a temporary mask is interrupted, the
     /// original mask is restored only after the signal handler that caused

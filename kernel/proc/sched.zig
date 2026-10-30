@@ -366,14 +366,14 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
                 if (@atomicLoad(u64, &t.alarm_deadline, .monotonic) != 0 and now_ns >= @atomicLoad(u64, &t.alarm_deadline, .monotonic)) {
                     @atomicStore(u64, &t.alarm_deadline, 0, .monotonic); // One-shot: clear after firing
                     _ = @atomicRmw(u64, &alarm_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
-                    _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
+                    _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << 13, .seq_cst);
                     // A sleeper must observe SIGALRM now, not when its own
                     // deadline passes.
                     @import("signal.zig").kickIfBlocked(i);
                 }
                 // Check ITIMER_REAL deadline
                 if (@atomicLoad(u64, &t.itimer_real_value, .monotonic) != 0 and now_ns >= @atomicLoad(u64, &t.itimer_real_value, .monotonic)) {
-                    _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
+                    _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << 13, .seq_cst);
                     if (t.itimer_real_interval != 0) {
                         // Recurring: reschedule next expiration
                         @atomicStore(u64, &t.itimer_real_value, now_ns + t.itimer_real_interval, .monotonic);
@@ -397,7 +397,7 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
         if (task.getTask(ci)) |ct| {
             // Exited tasks stay cur_idx until we switch away — don't burn timeslice.
             if (ct.state == .zombie) setSlice(0);
-            if (ct.is_user and ct.pending_signals != 0 and ct.pending_signals & ~@as(u32, @truncate(ct.signal_mask)) != 0) {
+            if (ct.is_user and ct.pending_signals != 0 and ct.pending_signals & ~ct.signal_mask != 0) {
                 sched_lock.release(flags);
                 // Resume through the frame when the handler was entered.
                 // Otherwise fall through to a normal reschedule: returning here
@@ -646,13 +646,13 @@ fn alarmTimerTick(now_ns: u64) void {
         if (@atomicLoad(u64, &t.alarm_deadline, .monotonic) != 0 and now_ns >= @atomicLoad(u64, &t.alarm_deadline, .monotonic)) {
             @atomicStore(u64, &t.alarm_deadline, 0, .monotonic); // One-shot: clear after firing
             _ = @atomicRmw(u64, &alarm_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
-            _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
+            _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << 13, .seq_cst);
             // A sleeper must observe SIGALRM now, not when its own
             // deadline passes.
             @import("signal.zig").kickIfBlocked(i);
         }
         if (@atomicLoad(u64, &t.itimer_real_value, .monotonic) != 0 and now_ns >= @atomicLoad(u64, &t.itimer_real_value, .monotonic)) {
-            _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << 13, .seq_cst);
+            _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << 13, .seq_cst);
             if (t.itimer_real_interval != 0) {
                 @atomicStore(u64, &t.itimer_real_value, now_ns + t.itimer_real_interval, .monotonic);
             } else {
@@ -740,7 +740,7 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
         if (task.getTask(ci)) |ct| {
             // Exited tasks stay cur_idx until we switch away — don't burn timeslice.
             if (sched_claim.load(&ct.state) == .zombie) setSlice(0);
-            if (ct.is_user and ct.pending_signals != 0 and ct.pending_signals & ~@as(u32, @truncate(ct.signal_mask)) != 0) {
+            if (ct.is_user and ct.pending_signals != 0 and ct.pending_signals & ~ct.signal_mask != 0) {
                 // Resume through the frame when the handler was entered.
                 // Otherwise fall through to a normal reschedule: returning here
                 // would skip scheduling on every tick for as long as the signal

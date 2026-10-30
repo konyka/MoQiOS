@@ -5389,3 +5389,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 新增 1 个测试；hello135 在 HEAD 上 2 项 FAIL，新内核 PASS。
 - 变异：`tkill(…, 0)` 改回 EINVAL → hello135 B 段 1 项 FAIL，恢复后 PASS。
 - 验证：host 770/770；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）3/3 PASS。
+
+### 实时信号 32–64（hello136）
+
+- 问题：内核只支持信号 1–31，`pending_signals` 为 `u32`，处理函数数组 31 项；`sigaction(32..64)` 返回 EINVAL，`kill/tkill(34)` 无法投递，pthread 取消、`SIGRTMIN` 家族都不可用。hello135 阶段已把它记为已知缺口。
+- 修复：`signal.MAX_SIGNAL = 64`；`Task.pending_signals: u64`，`signal_handlers/signal_sa_masks/signal_sa_flags: [64]`；`sendSignal`/`sendSignalToPgrp`/`raiseSelf`/`dequeueSignal`/`pendingFatal`/`pendingActionable` 全部改为 64 位；`rtSigpending`、`rtSigtimedwait`、`killPosix`、`sigaction`、`pidfd_send_signal`、POSIX 定时器与消息队列通知改为 1–64；fork/clone 复制 64 项；`jobctl`、`sched`、`syscall_entry` 的 32 位截断掩码改为 64 位。
+- 已知差异：实时信号不排队计数，重复发送合并为一次（Linux 会排队）；`siginfo`/`SA_SIGINFO` 的信息结构未实现。
+- 排查过程（如实）：E 段第一版探测在同一次 `sigprocmask(UNBLOCK)` 后只立即收到一个信号，其余在下一个 tick 边界投递——这是既有的投递时机（每次返回投递一个），不是缺陷，探测改为循环等待而非固定睡眠；红灯运行在旧内核上 10 项 FAIL 后挂起超时，说明旧内核也无法完成后续项。
+- TDD：hello136（A–G 共 26 项）在 HEAD 上 10 项以上 FAIL；`pidfd_signal_policy` 的 host 测试先改为期望 64 后随实现通过。
+
+- 变异：`sigaction` 重新把上限设回 31 → hello136 A 段 3 项以上 FAIL，恢复后 PASS。
+- 验证：host 770/770；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

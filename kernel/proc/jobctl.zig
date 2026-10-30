@@ -39,7 +39,7 @@ pub fn stdinJobCheck() i64 {
     if (cur.pgid == foreground_pgid) return 0;
 
     // 后台组：SIGTTIN 被阻塞或忽略 → EIO。
-    const sig_bit: u32 = 1 << @intCast(sig_mod.SIGTTIN - 1);
+    const sig_bit: u64 = @as(u64, 1) << @intCast(sig_mod.SIGTTIN - 1);
     if (cur.signal_mask & sig_bit != 0) return -5; // EIO
     const handler = cur.signal_handlers[sig_mod.SIGTTIN - 1];
     if (handler == 1) return -5; // SIG_IGN
@@ -59,7 +59,7 @@ pub fn stdinJobCheck() i64 {
         asm volatile ("hlt" ::: .{ .memory = true });
         // 被致命信号解除停止：交给信号路径处理（返回 EINTR 让其终结）。
         if (!cur.stopped and cur.pgid != foreground_pgid and
-            (cur.pending_signals & ~@as(u32, @truncate(cur.signal_mask))) != 0) return -4;
+            (cur.pending_signals & ~cur.signal_mask) != 0) return -4;
     }
     return 0;
 }
@@ -100,7 +100,7 @@ pub fn onSessionLeaderExit(leader: *task_mod.Task) void {
         const in_fg = fg != 0 and t.pgid == fg;
         const stopped_orphan = groupHasStopped(t.pgid, leader.sid);
         if (!in_fg and !stopped_orphan) continue;
-        _ = @atomicRmw(u32, &t.pending_signals, .Or, @as(u32, 1) << @intCast(sig_mod.SIGHUP - 1), .seq_cst);
+        _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(sig_mod.SIGHUP - 1), .seq_cst);
         if (stopped_orphan) sig_mod.continueTask(t);
         sig_mod.kickIfBlocked(@intCast(i));
     }

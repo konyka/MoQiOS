@@ -50,7 +50,7 @@ pub fn maySignal(sender: *task_mod.Task, target: *task_mod.Task) bool {
 /// -ESRCH when no target exists, -EPERM when every target was refused.
 pub fn killPosix(pid: i64, signum: u32) i64 {
     const id_policy = @import("proc_id_policy.zig");
-    if (signum > 31) return -22;
+    if (signum > 64) return -22;
     const cur = sched.currentTask() orelse return -3;
     if (pid == -1) return killAll(cur, signum);
 
@@ -116,7 +116,7 @@ fn killAll(cur: *task_mod.Task, signum: u32) i64 {
 /// struct. For the legacy users restorer@24 is 0, so even when the wider
 /// probe succeeds the applied mask is 0 — their behavior is unchanged.
 pub fn sigaction(signum: u32, act_ptr: u64, oldact_ptr: u64) i64 {
-    if (signum == 0 or signum > 31) return -22;
+    if (signum == 0 or signum > 64) return -22;
     // SIGKILL/SIGSTOP cannot be caught or ignored; a pure query is fine.
     if (!action_policy.actionChangeAllowed(signum, act_ptr != 0)) return -22;
 
@@ -357,7 +357,7 @@ pub fn rtSigpending(set_ptr: u64, sigsetsize: u64) i64 {
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
     if (set_ptr != 0) {
-        const pending: u64 = @intCast(cur.pending_signals);
+        const pending: u64 = @atomicLoad(u64, &cur.pending_signals, .seq_cst);
         const bytes: [*]const u8 = @ptrCast(&pending);
         if (copy.copyToUser(@ptrFromInt(set_ptr), bytes[0..8], 8) != 8) return -14;
     } else {
@@ -415,8 +415,7 @@ pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_s
     const width: usize = @intCast(@min(sigset_size, @as(u64, 8)));
     const copied = copy.copyFromUser(mask_buf[0..width], @ptrFromInt(sigset_ptr), width);
     if (copied == 0) return -14;
-    // Only signals 1-31 exist — the upper word of an 8-byte sigset is inert.
-    const mask: u32 = @truncate(@as(u64, @bitCast(mask_buf)));
+    const mask: u64 = @bitCast(mask_buf);
 
     const cur_idx = sched.currentTaskIndex() orelse return -3;
     const cur = task_mod.getTask(cur_idx) orelse return -3;
@@ -439,10 +438,10 @@ pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_s
     while (true) {
         // Atomic load + Rmw like dequeueSignal: a plain read-modify-write
         // races with sendSignal's atomic Rmw on another CPU.
-        const pending = @atomicLoad(u32, &cur.pending_signals, .seq_cst) & mask;
+        const pending = @atomicLoad(u64, &cur.pending_signals, .seq_cst) & mask;
         if (pending != 0) {
-            const bit: u5 = @intCast(@ctz(pending));
-            _ = @atomicRmw(u32, &cur.pending_signals, .And, ~(@as(u32, 1) << bit), .seq_cst);
+            const bit: u6 = @intCast(@ctz(pending));
+            _ = @atomicRmw(u64, &cur.pending_signals, .And, ~(@as(u64, 1) << bit), .seq_cst);
             return @as(i64, bit) + 1;
         }
         // A signal outside the wait set that would run a handler ends the
