@@ -88,3 +88,20 @@ pub fn pathFromCopy(buf: []const u8, copied: usize, max: usize) PathCopy {
     while (n < copied and buf[n] != 0) : (n += 1) {}
     return .{ .ok = buf[0..n] };
 }
+
+/// pread/pwrite take a signed off_t; a negative value is EINVAL.
+pub fn positionedOffsetErrno(offset: u64) i64 {
+    return if ((offset >> 63) != 0) -22 else 0;
+}
+
+pub const TailZero = struct { block: u32, from: u32, len: u32 };
+
+/// After a file is cut down to `new_size`, the last block it still owns keeps
+/// the old bytes past the new end. They must be zeroed, or a later extension
+/// (ftruncate up, or a write past the end that leaves a hole) shows data that
+/// was supposed to be gone. Null when the size falls on a block boundary.
+pub fn truncateTail(new_size: u32, block_size: u32) ?TailZero {
+    if (new_size == 0 or block_size == 0 or new_size % block_size == 0) return null;
+    const from = new_size % block_size;
+    return .{ .block = new_size / block_size, .from = from, .len = block_size - from };
+}

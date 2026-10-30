@@ -1404,6 +1404,20 @@ fn invalidateWriteback(inode_num: u32, flags: *u64) void {
 }
 
 /// Truncate a file to the given length. Frees blocks beyond the new size.
+/// Zero the bytes of the last kept block that lie past `new_size` (see
+/// namespace_policy.truncateTail). Holds fs_lock; a missing block (hole) needs nothing.
+fn zeroTruncatedTail(inode: *const Ext2Inode, new_size: u32) void {
+    const tail = @import("namespace_policy.zig").truncateTail(new_size, block_size) orelse return;
+    const phys = resolveBlock(inode, tail.block);
+    if (phys == 0) return;
+    const buf_phys = pmm.allocPage() orelse return;
+    defer pmm.freePage(buf_phys);
+    const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+    if (!readBlock(phys, buf)) return;
+    @memset(buf[tail.from..][0..tail.len], 0);
+    _ = writeBlock(phys, buf);
+}
+
 pub fn truncateFile(file_idx: u32, new_size: u32) bool {
     var flags = fs_lock.acquire();
     defer fs_lock.release(flags);
@@ -1493,6 +1507,7 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
         if (keep == 0) f.inode.block[14] = 0;
     }
 
+    zeroTruncatedTail(&f.inode, new_size);
     f.inode.size = new_size;
     f.inode.blocks = new_blocks_needed * (block_size / 512);
     stampModified(&f.inode);
@@ -1570,6 +1585,7 @@ pub fn truncateByInode(inode_num: u32, new_size: u32) bool {
         if (keep == 0) inode.block[14] = 0;
     }
 
+    zeroTruncatedTail(&inode, new_size);
     inode.size = new_size;
     inode.blocks = new_blocks_needed * (block_size / 512);
     stampModified(&inode);

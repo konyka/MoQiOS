@@ -193,6 +193,31 @@ pub fn readBuffered(inode_id: u64, byte_offset: u64, buf: [*]u8, len: u32, fs_ty
     }
     return 0;
 }
+/// Overlay every staged extent of `inode_id` that intersects the read window
+/// [byte_offset, byte_offset+len) onto `buf`, which already holds the on-disk
+/// bytes. Returns the highest buffer index written (0 if nothing overlapped),
+/// so a read of a hole or a partly staged range sees the newest data. Unlike
+/// readBuffered this works for reads that start anywhere in an extent.
+pub fn overlayStaged(inode_id: u64, byte_offset: u64, buf: [*]u8, len: u32, fs_type: FsType) u32 {
+    const ov = @import("writeback_overlap.zig");
+    var reach: u32 = 0;
+    const flags = wb_lock.acquire();
+    defer wb_lock.release(flags);
+    for (0..BM_WORDS) |w| {
+        var bits = in_use_bm[w];
+        while (bits != 0) {
+            const bit = @ctz(bits);
+            bits &= bits - 1;
+            const b = &dirty_buffers[w * 64 + @as(u32, bit)];
+            if (b.fs_type != fs_type or b.inode_id != inode_id) continue;
+            const hit = ov.overlap(.{ .offset = b.byte_offset, .len = b.data_len }, byte_offset, len) orelse continue;
+            @memcpy(buf[hit.dst..][0..hit.copy], b.data[hit.skip..][0..hit.copy]);
+            reach = @max(reach, hit.dst + hit.copy);
+        }
+    }
+    return reach;
+}
+
 /// Flush one file's dirty buffers. Returns false if any buffer could not be
 /// written; those stay dirty, so the caller must not report success.
 pub fn flushFile(inode_id: u64, fs_type: FsType, comptime write_fn: fn (u32, u64, [*]const u8, u32) bool) bool {

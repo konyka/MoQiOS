@@ -166,6 +166,8 @@ pub fn close(fd: u32) i64 {
 /// pread64(fd, buf_ptr, count, offset) → bytes read or -errno
 /// Reads from a file at a specific offset without changing the fd's current position.
 pub fn pread(fd: u32, buf_ptr: u64, count: u64, offset: u64) i64 {
+    const off_rc = @import("namespace_policy.zig").positionedOffsetErrno(offset);
+    if (off_rc != 0) return off_rc;
     if (buf_ptr == 0 or buf_ptr >= 0x0000_8000_0000_0000 or count > 0x7FFFFFFF) return -1;
     const n: usize = @intCast(count);
     if (n == 0) return 0;
@@ -207,6 +209,8 @@ pub fn pread(fd: u32, buf_ptr: u64, count: u64, offset: u64) i64 {
 /// pwrite64(fd, buf_ptr, count, offset) → bytes written or -errno
 /// Writes to a file at a specific offset without changing the fd's current position.
 pub fn pwrite(fd: u32, buf_ptr: u64, count: u64, offset: u64) i64 {
+    const off_rc = @import("namespace_policy.zig").positionedOffsetErrno(offset);
+    if (off_rc != 0) return off_rc;
     if (buf_ptr == 0 or buf_ptr >= 0x0000_8000_0000_0000 or count > 0x7FFFFFFF) return -1;
     const n: usize = @intCast(count);
     if (n == 0) return 0;

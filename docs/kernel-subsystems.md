@@ -925,6 +925,12 @@ const SchedStats = struct {
 - `EPOLL_CTL_ADD` 沿 child epoll 链（`nestedChainReaches`，visited bitmap 有界）检测间接环，构成环返回 `ELOOP`——环上就绪互相传播会使 `epoll_wait` 永久 busy-loop。（§6.51）
 - MoqIPC receive 被信号/`moqipc_notify` 踢醒时统一清理 `waiting_receiver` 注册并按唤醒来源分类返回：endpoint 失效才报 `invalid_endpoint`，存活 endpoint 的无投递唤醒报 EINTR（信号）/EAGAIN（notify）——注册残留曾让 endpoint 对所有 sender 永久报废。（§6.51）
 - `alarm`/`itimer` deadline 字段与 per-CPU run-queue 的 `nr_running` 计数全部原子访问（tick 扫描器跨 CPU 与 syscall 上下文并发）。（§6.51）
+- **ext2 读写一致性与偏移语义（hello129）**：ext2 的写先暂存在 writeback 缓冲里，读只在**读起点恰好等于某个暂存区起点**时才能命中；`pread` 读刚写入的数据（起点落在暂存区中间）
+  于是读到旧的磁盘内容或 0，洞里的字节也不是 0。现在读路径统一走 `FdTable.ext2ReadMerged`：先读磁盘（缓冲预清零，洞读 0），再用 `writeback.overlayStaged` 把所有相交的暂存区叠上去
+  （纯算术在 `fs/writeback_overlap.zig`：起点在区内、区前伸入、越过区尾、完全不相交、不回绕），`read` 与 `pread` 共用。`pread`/`pwrite` 的偏移是有符号 off_t，最高位为 1 是 EINVAL
+  （`namespace_policy.positionedOffsetErrno`）。`truncate`/`ftruncate` 缩小后，保留的最后一块里超出新大小的字节现在会清零（`namespace_policy.truncateTail` + `ext2.zeroTruncatedTail`），
+  否则之后再扩大会把已“删除”的数据读回来。`lseek`（SEEK_SET/CUR/END、负位置/非法 whence EINVAL、坏 fd EBADF）、`O_APPEND`、`O_TRUNC`、只读描述符 `ftruncate` 失败在 ext2 与 tmpfs 上都已核对无误。
+  **未做**：`dup` 出的描述符与原描述符不共享偏移（每个槽位各存一份 `offset`）；POSIX 要求共享同一个打开文件描述，需要引入共享的 open-file description，记入待办。
 - **read/write/rename/readlink 与超长路径的错误码（hello128）**：`write()`/`pwrite()` 对不可写描述符（含只读打开的目录）现在是 EBADF（原先裸 `-1`=EPERM），`FdTable.write`
   入口统一经 `namespace_policy.writeGate`；`read()` 目录是 EISDIR（ext2 之前会返回 8 字节目录内容，tmpfs 返回 0）；`readlink` 对存在但不是符号链接的名字是 EINVAL
   （`ext2.readlinkPath` 区分 `not_symlink`/`missing`，tmpfs 存在的条目也是 EINVAL）；`rename` 源不存在是 ENOENT（原先被改写成 EXDEV，现在只有 FAT32 根下的名字才保留 EXDEV），

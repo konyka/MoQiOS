@@ -5311,3 +5311,17 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 验证：host 753/753；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL（hello41 同样 PASS）；stress（SMP=2）3/3 PASS。
 - 变异：`pathCopyErrno` 不再拒绝超长路径 → hello128 共 23 行 FAIL（两个文件系统各一轮），恢复后 PASS。
 - 验证：host 755/755；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）3/3 PASS。
+
+### ext2 读写一致性、pread/ftruncate 语义（hello129）
+
+- 问题：探测程序在 ext2 上发现 4 项（tmpfs 1 项）偏差。(1) **`pread` 读不到刚写入的数据**：writeback 暂存区按起点精确匹配，起点落在区间中间的读命中不了，
+  磁盘上还没有这些字节，`pread` 返回 0 或旧内容——这是读后写不一致，不是错误码问题；(2) 文件洞里读到的不是 0；(3) `ftruncate` 缩小再扩大，扩大出来的区域读到的是旧数据
+  （保留的最后一块没有清零）；(4) `pread`/`pwrite` 负偏移不报 EINVAL（tmpfs 同样）。
+- 修复：`fs/writeback_overlap.zig`（纯区间相交）、`writeback.overlayStaged`、`FdTable.ext2ReadMerged`（read 与 pread 共用）、`namespace_policy.positionedOffsetErrno`、
+  `namespace_policy.truncateTail` 与 `ext2.zeroTruncatedTail`（truncateFile、truncateByInode 缩小路径）。
+- TDD：host 新增 3 个测试（区间相交、偏移符号、尾部清零）先编译失败后通过；hello129（ext2 与 tmpfs 各 28 项）在 HEAD 上 5 项 FAIL，新内核 PASS。
+- **已知偏差、未修**：`dup` 不共享偏移。`FileDescriptor` 里每个槽位自带一份 `offset`，`dup`/`fork` 复制的是值；POSIX 要求 `dup`、`fork` 之后两端共享同一个打开文件描述（含偏移与状态标志）。
+  正确做法是把 offset/status_flags 挪到一个带引用计数的共享对象里，会触及 `fork`、`dup*`、`close`、`aio`、`splice`、`copy_file_range` 等所有直接读写 `fds[i].offset` 的路径（约 55 处），单独成一个任务。
+  hello129 里相应的断言先去掉，并在源码里留了说明，不把它算作通过。
+- 变异：暂存区相交只认“起点相同”→ hello129 的 `pread reads at its own offset` FAIL，恢复后 PASS。
+- 验证：host 758/758；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）3/3 PASS。

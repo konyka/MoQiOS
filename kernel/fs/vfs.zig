@@ -1227,23 +1227,8 @@ pub const FdTable = struct {
                 // read into a false EOF (v53.51 regression).
                 desc.file_size = @max(desc.file_size, ext2.refreshSize(desc.ext2_file_idx));
                 if (desc.offset >= desc.file_size) return 0;
-                // 1. Check writeback cache (read-after-write consistency)
-                const n_cached = writeback.readBuffered(desc.inode_id, desc.offset, buf, @intCast(count), .ext2);
-                if (n_cached > 0) {
-                    desc.offset += @as(u64, n_cached);
-                    return @intCast(n_cached);
-                }
-                // v53.32: Removed VFS-level readahead for ext2 — ext2ReadBlock was
-                // missing DISK_LBA_OFFSET (read from disk start, not ext2 partition)
-                // and bypassed ext2 block mapping (assumed contiguous layout).
-                // ext2.readFile has its own page_cache prefetch (prefetchPages) that
-                // correctly uses resolveBlock + readBlockUncached with LBA offset.
-                // Also removed VFS-level recordAccess which used 4KB page numbers
-                // conflicting with ext2's 1KB block numbers in the same tracker.
-                const n = ext2.readFile(desc.ext2_file_idx, @intCast(desc.offset), buf, @intCast(count));
-                if (n > 0) {
-                    desc.offset += @intCast(n);
-                }
+                const n = ext2ReadMerged(desc, buf, count, desc.offset);
+                if (n > 0) desc.offset += @intCast(n);
                 return n;
             },
             .pipe_read => {
@@ -1468,6 +1453,26 @@ pub const FdTable = struct {
     /// Read from a file descriptor at a specific offset without mutating the shared offset.
     /// Returns number of bytes read, 0 on EOF, or negative errno.
     /// Used by pread64/preadv to avoid temporary offset mutation.
+    /// Read `count` bytes at `offset` of an ext2 file as the process must see
+    /// them: the on-disk bytes with every staged (not yet written back) extent
+    /// laid over them. The file size is the larger of the descriptor's and the
+    /// inode's, so bytes staged beyond the on-disk EOF are readable, and a hole
+    /// below EOF reads as zeros.
+    fn ext2ReadMerged(desc: *FileDescriptor, buf: [*]u8, count: usize, offset: u64) i64 {
+        const ext2 = @import("ext2.zig");
+        desc.file_size = @max(desc.file_size, ext2.refreshSize(desc.ext2_file_idx));
+        if (offset >= desc.file_size) return 0;
+        const want: u32 = @intCast(@min(@as(u64, count), @min(desc.file_size - offset, 4096)));
+        if (want == 0) return 0;
+        @memset(buf[0..want], 0);
+        const disk = ext2.readFile(desc.ext2_file_idx, @intCast(offset), buf, want);
+        const disk_n: u32 = if (disk > 0) @intCast(disk) else 0;
+        const staged = writeback.overlayStaged(desc.inode_id, offset, buf, want, .ext2);
+        // The result extends as far as either the disk read or a staged extent reached;
+        // anything between is a hole and stays zero.
+        return @intCast(@max(disk_n, staged, want));
+    }
+
     pub fn readAtOffset(self: *FdTable, fd: u32, buf: [*]u8, count: usize, offset: u64) i64 {
         if (fd >= MAX_FDS) return -9; // EBADF
         const desc = &self.fds[fd];
@@ -1509,10 +1514,7 @@ pub const FdTable = struct {
                 // on-disk size hide this fd's staged bytes below EOF.
                 desc.file_size = @max(desc.file_size, ext2.refreshSize(desc.ext2_file_idx));
                 if (offset >= desc.file_size) return 0;
-                const n_cached = writeback.readBuffered(desc.inode_id, offset, buf, @intCast(count), .ext2);
-                if (n_cached > 0) return @intCast(n_cached);
-                const n = ext2.readFile(desc.ext2_file_idx, @intCast(offset), buf, @intCast(count));
-                return n;
+                return ext2ReadMerged(desc, buf, count, offset);
             },
             .tmpfs_file => {
                 const tmpfs = @import("tmpfs.zig");

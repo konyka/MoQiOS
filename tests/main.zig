@@ -7265,3 +7265,44 @@ test "syscall_entry reads user paths through the checked helper (no raw 255-byte
     // The helper (userPathResult) is the only unchecked 255-byte reader left.
     try std.testing.expectEqual(@as(usize, 1), raw);
 }
+
+test "writeback overlap: a staged extent serves any read that falls inside it, not only one at its start" {
+    const wo = kt.writeback_overlap;
+    // extent [100, 110) holds 10 bytes
+    const e = wo.Extent{ .offset = 100, .len = 10 };
+    // read exactly at the start
+    try std.testing.expectEqual(wo.Hit{ .skip = 0, .copy = 4, .dst = 0 }, wo.overlap(e, 100, 4).?);
+    // read inside: starts 3 bytes in, wants 4
+    try std.testing.expectEqual(wo.Hit{ .skip = 3, .copy = 4, .dst = 0 }, wo.overlap(e, 103, 4).?);
+    // read running past the end of the extent: only the 2 staged bytes
+    try std.testing.expectEqual(wo.Hit{ .skip = 8, .copy = 2, .dst = 0 }, wo.overlap(e, 108, 5).?);
+    // read starting before the extent but reaching into it: bytes land after the gap
+    try std.testing.expectEqual(wo.Hit{ .skip = 0, .copy = 3, .dst = 7 }, wo.overlap(e, 93, 10).?);
+    // disjoint
+    try std.testing.expect(wo.overlap(e, 110, 4) == null);
+    try std.testing.expect(wo.overlap(e, 90, 10) == null);
+    try std.testing.expect(wo.overlap(e, 100, 0) == null);
+    // a read window larger than a page is clamped by the caller; offsets near u64 max do not wrap
+    try std.testing.expect(wo.overlap(.{ .offset = 0xFFFF_FFFF_FFFF_FFF0, .len = 8 }, 0xFFFF_FFFF_FFFF_FFF4, 4) != null);
+}
+
+test "positioned I/O offsets are signed: a value with the top bit set is EINVAL" {
+    const np = kt.namespace_policy;
+    try std.testing.expectEqual(@as(i64, 0), np.positionedOffsetErrno(0));
+    try std.testing.expectEqual(@as(i64, 0), np.positionedOffsetErrno(0x7FFF_FFFF_FFFF_FFFF));
+    try std.testing.expectEqual(@as(i64, -22), np.positionedOffsetErrno(0x8000_0000_0000_0000));
+    try std.testing.expectEqual(@as(i64, -22), np.positionedOffsetErrno(@bitCast(@as(i64, -1))));
+}
+
+test "truncate tail zeroing: bytes past the new size in the last kept block must be cleared" {
+    const np = kt.namespace_policy;
+    // 1 KiB blocks. Shrinking 10 -> 4 keeps block 0 and must zero [4, 1024) in it.
+    try std.testing.expectEqual(np.TailZero{ .block = 0, .from = 4, .len = 1020 }, np.truncateTail(4, 1024).?);
+    // 2500 -> block 2, offset 452
+    try std.testing.expectEqual(np.TailZero{ .block = 2, .from = 452, .len = 572 }, np.truncateTail(2500, 1024).?);
+    // block-aligned sizes and zero need nothing
+    try std.testing.expect(np.truncateTail(2048, 1024) == null);
+    try std.testing.expect(np.truncateTail(0, 1024) == null);
+    // 4 KiB blocks
+    try std.testing.expectEqual(np.TailZero{ .block = 0, .from = 100, .len = 3996 }, np.truncateTail(100, 4096).?);
+}
