@@ -2624,6 +2624,15 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         489 => { // utimensat(dirfd, pathname, times, flags) — pathname NULL = futimens(dirfd)
             frame.rax = @bitCast(syscallUtimensat(dirfdArg(frame.rdi), frame.rsi, frame.rdx, @truncate(frame.r10)));
         },
+        490 => { // linkat(olddirfd, oldpath, newdirfd, newpath, flags)
+            frame.rax = @bitCast(syscallLinkat(dirfdArg(frame.rdi), frame.rsi, dirfdArg(frame.rdx), frame.r10, @truncate(frame.r8)));
+        },
+        491 => { // symlinkat(target, newdirfd, linkpath)
+            frame.rax = @bitCast(syscallSymlinkat(frame.rdi, dirfdArg(frame.rsi), frame.rdx));
+        },
+        492 => { // fchownat(dirfd, pathname, owner, group, flags)
+            frame.rax = @bitCast(syscallFchownat(dirfdArg(frame.rdi), frame.rsi, frame.rdx, frame.r10, @truncate(frame.r8)));
+        },
         else => {
             serial.writeString("[syscall] unknown syscall: 0x");
             fmt.writeHex(syscall_nr);
@@ -2804,6 +2813,113 @@ fn ext2Who() @import("../../fs/ext2.zig").Who {
         .cap_dac_override = cur.effective_caps.cap_dac_override,
         .groups = cur.groups[0..cur.ngroups],
     };
+}
+
+/// Copy a user path into `buf`, resolve it under `dirfd`, and return the name
+/// to look up (or a negative errno).
+fn atPathArg(dirfd: i64, ptr: u64, buf: *[256]u8, join: *[256]u8) union(enum) { ok: []const u8, err: i64 } {
+    const copy = @import("../../mm/copy_from_user.zig");
+    const cur = @import("../../proc/sched.zig").currentTask() orelse return .{ .err = -1 };
+    if (ptr == 0 or ptr >= 0x0000_8000_0000_0000) return .{ .err = -14 };
+    const n = copy.copyPathFromUser(buf, ptr, 255);
+    if (n == 0) return .{ .err = -14 };
+    buf[if (n < 255) n else 255] = 0;
+    var len: usize = 0;
+    while (len < 255 and buf[len] != 0) : (len += 1) {}
+    if (len == 0) return .{ .err = -2 };
+    return switch (@import("../../fs/at_path.zig").resolve(cur, dirfd, buf[0..len], join)) {
+        .keep => .{ .ok = buf[0..len] },
+        .path => |p| .{ .ok = p },
+        .err => |e| .{ .err = e },
+    };
+}
+
+fn onRofs(name: []const u8) bool {
+    var norm: [256]u8 = undefined;
+    const abs = vfs_mod.normalizeAbs(if (name.len > 0 and name[0] == '/') name else "/", &norm) orelse return false;
+    return vfs_mod.rofsRoute(abs) != null;
+}
+
+fn syscallLinkat(old_dirfd: i64, old_ptr: u64, new_dirfd: i64, new_ptr: u64, flags: u32) i64 {
+    const fp = @import("../../fs/at_flags_policy.zig");
+    const follow = switch (fp.linkFlags(flags)) {
+        .ok => |f| f,
+        .err => |e| return e,
+    };
+    var ob: [256]u8 = undefined;
+    var oj: [256]u8 = undefined;
+    var nb: [256]u8 = undefined;
+    var nj: [256]u8 = undefined;
+    const old = switch (atPathArg(old_dirfd, old_ptr, &ob, &oj)) {
+        .ok => |p| p,
+        .err => |e| return e,
+    };
+    const new = switch (atPathArg(new_dirfd, new_ptr, &nb, &nj)) {
+        .ok => |p| p,
+        .err => |e| return e,
+    };
+    if (onRofs(old) or onRofs(new)) return -30; // EROFS
+    const route = fp.linkRoute(old, new);
+    if (route != 0) return route;
+    const ext2_mod = @import("../../fs/ext2.zig");
+    if (!ext2_mod.isActive()) return -38;
+    return ext2_mod.createHardlinkMode(old, new, follow, ext2Who());
+}
+
+fn syscallSymlinkat(target_ptr: u64, new_dirfd: i64, link_ptr: u64) i64 {
+    const copy = @import("../../mm/copy_from_user.zig");
+    const fp = @import("../../fs/at_flags_policy.zig");
+    if (target_ptr == 0 or target_ptr >= 0x0000_8000_0000_0000) return -14;
+    var tgt: [256]u8 = undefined;
+    const tc = copy.copyPathFromUser(&tgt, target_ptr, 255);
+    if (tc == 0) return -14;
+    tgt[if (tc < 255) tc else 255] = 0;
+    var tl: usize = 0;
+    while (tl < 255 and tgt[tl] != 0) : (tl += 1) {}
+    if (tl == 0) return -2;
+    var lb: [256]u8 = undefined;
+    var lj: [256]u8 = undefined;
+    const link = switch (atPathArg(new_dirfd, link_ptr, &lb, &lj)) {
+        .ok => |p| p,
+        .err => |e| return e,
+    };
+    if (onRofs(link)) return -30;
+    const route = fp.symlinkRoute(link);
+    if (route != 0) return route;
+    const ext2_mod = @import("../../fs/ext2.zig");
+    if (!ext2_mod.isActive()) return -38;
+    return ext2_mod.createSymlink(tgt[0..tl], link, ext2Creator(), ext2Who());
+}
+
+fn syscallFchownat(dirfd: i64, path_ptr: u64, owner: u64, group: u64, flags: u32) i64 {
+    const fp = @import("../../fs/at_flags_policy.zig");
+    const ext2_mod = @import("../../fs/ext2.zig");
+    const cf = switch (fp.chownFlags(flags)) {
+        .ok => |f| f,
+        .err => |e| return e,
+    };
+    if (cf.empty_path and path_ptr == 0) { // fchown(dirfd)
+        const cur = @import("../../proc/sched.zig").currentTask() orelse return -1;
+        if (dirfd < 0 or dirfd >= vfs_mod.MAX_FDS) return -9;
+        const d = &cur.fd_table.fds[@intCast(dirfd)];
+        return switch (d.fd_type) {
+            .none => -9,
+            .tmpfs_file => @import("../../fs/tmpfs.zig").tmpfsChownIdx(@intCast(d.tmpfs_idx), idArg(owner), idArg(group), tmpfsWho()),
+            .ext2_file => ext2_mod.setOwnerByInode(ext2_mod.getInodeNum(d.ext2_file_idx), @truncate(owner), @truncate(group), ext2Who()),
+            .rofs_file => -30,
+            else => -1,
+        };
+    }
+    var nb: [256]u8 = undefined;
+    var nj: [256]u8 = undefined;
+    const name = switch (atPathArg(dirfd, path_ptr, &nb, &nj)) {
+        .ok => |p| p,
+        .err => |e| return e,
+    };
+    if (onRofs(name)) return -30;
+    if (tmpfsPath(name)) return @import("../../fs/tmpfs.zig").tmpfsChown(name, idArg(owner), idArg(group), tmpfsWho());
+    if (cf.follow) return ext2_mod.setOwner(name, @truncate(owner), @truncate(group), ext2Who());
+    return ext2_mod.setOwnerNoFollow(name, @truncate(owner), @truncate(group), ext2Who());
 }
 
 /// utimensat(dirfd, pathname, times, flags). Only ext2 keeps timestamps;

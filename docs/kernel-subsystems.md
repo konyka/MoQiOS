@@ -925,6 +925,12 @@ const SchedStats = struct {
 - `EPOLL_CTL_ADD` 沿 child epoll 链（`nestedChainReaches`，visited bitmap 有界）检测间接环，构成环返回 `ELOOP`——环上就绪互相传播会使 `epoll_wait` 永久 busy-loop。（§6.51）
 - MoqIPC receive 被信号/`moqipc_notify` 踢醒时统一清理 `waiting_receiver` 注册并按唤醒来源分类返回：endpoint 失效才报 `invalid_endpoint`，存活 endpoint 的无投递唤醒报 EINTR（信号）/EAGAIN（notify）——注册残留曾让 endpoint 对所有 sender 永久报废。（§6.51）
 - `alarm`/`itimer` deadline 字段与 per-CPU run-queue 的 `nr_running` 计数全部原子访问（tick 扫描器跨 CPU 与 syscall 上下文并发）。（§6.51）
+- **linkat / symlinkat / fchownat（原生 #490 / #491 / #492，hello124）**：补上 dirfd 版本，路径一律经 `at_path.resolve`（cwd 与任意目录 fd）。
+  纯策略在 `fs/at_flags_policy.zig`：`linkat` 只认 `AT_SYMLINK_FOLLOW`（未带时链接 symlink 本身，`ext2.createHardlinkMode(follow=false)`；
+  传统 `link` 仍跟随），`AT_EMPTY_PATH` 需要 CAP_DAC_READ_SEARCH（无人持有）所以空名字是 ENOENT，其它位 EINVAL；跨 `/tmp` 边界 EXDEV，
+  tmpfs 内部没有硬链接/符号链接（EPERM）；只读卷 EROFS。`symlinkat` 只解析链接路径，目标原样保存。`fchownat` 认 `AT_SYMLINK_NOFOLLOW`
+  与 `AT_EMPTY_PATH`（路径为 NULL 即 fchown(dirfd)，ext2/tmpfs fd 均可），授权沿用 chown 的 `mayChownIn`。顺带修复：硬链接目录项的
+  file_type 现在用 `direntType`（链接一个 symlink 时记为 7，而不是 1）。
 - **utimensat / futimens（原生 #489，hello123）**：此前内核没有任何改时间戳的调用。`utimensat(dirfd, path, times, flags)`，
   `path == NULL` 即 futimens（dirfd 就是文件）；flags 只认 `AT_SYMLINK_NOFOLLOW`，其它 EINVAL。纯策略在 `fs/utimens_policy.zig`：
   `times == NULL` 两项都是现在；`UTIME_NOW` / `UTIME_OMIT`；`tv_nsec` 超界 EINVAL；显式时间必须落在磁盘的 32 位秒数内，

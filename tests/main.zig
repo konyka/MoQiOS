@@ -7021,3 +7021,29 @@ test "utimensat policy: nsec validation, UTIME_NOW/OMIT and who may set what" {
     try std.testing.expectEqual(@as(i64, 0), up.authorize(now, false, false, true));
     try std.testing.expectEqual(@as(i64, -13), up.authorize(now, false, false, false));
 }
+
+test "linkat/fchownat flag policy and cross-filesystem link routing" {
+    const ap = kt.at_flags_policy;
+    // linkat: AT_SYMLINK_FOLLOW (0x400) selects following; AT_EMPTY_PATH (0x1000) needs
+    // CAP_DAC_READ_SEARCH, which no program here holds, so it is ENOENT for an empty name.
+    try std.testing.expectEqual(false, ap.linkFlags(0).ok);
+    try std.testing.expectEqual(true, ap.linkFlags(0x400).ok);
+    try std.testing.expectEqual(@as(i64, -22), ap.linkFlags(0x100).err);
+    try std.testing.expectEqual(@as(i64, -22), ap.linkFlags(0x2).err);
+    try std.testing.expectEqual(@as(i64, -2), ap.linkFlags(0x1000).err);
+    // fchownat: AT_SYMLINK_NOFOLLOW (0x100) and AT_EMPTY_PATH (0x1000) only.
+    const c0 = ap.chownFlags(0).ok;
+    try std.testing.expect(c0.follow and !c0.empty_path);
+    const c1 = ap.chownFlags(0x100 | 0x1000).ok;
+    try std.testing.expect(!c1.follow and c1.empty_path);
+    try std.testing.expectEqual(@as(i64, -22), ap.chownFlags(0x400).err);
+    // linking across the /tmp boundary is EXDEV; inside /tmp tmpfs has no hard links (EPERM).
+    try std.testing.expectEqual(@as(i64, -18), ap.linkRoute("/tmp/a", "testdir/b"));
+    try std.testing.expectEqual(@as(i64, -18), ap.linkRoute("testdir/a", "/tmp/b"));
+    try std.testing.expectEqual(@as(i64, -1), ap.linkRoute("/tmp/a", "/tmp/b"));
+    try std.testing.expectEqual(@as(i64, 0), ap.linkRoute("testdir/a", "/testdir/b"));
+    try std.testing.expectEqual(@as(i64, 0), ap.linkRoute("/tmpx/a", "b"));
+    // symlinks cannot be created on tmpfs.
+    try std.testing.expectEqual(@as(i64, -1), ap.symlinkRoute("/tmp/l"));
+    try std.testing.expectEqual(@as(i64, 0), ap.symlinkRoute("testdir/l"));
+}

@@ -5249,3 +5249,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 限制：tmpfs 与 FAT32 没有时间戳字段，utimensat 在它们上返回 EPERM；atime 只在显式设置时更新（没有 relatime 式的读访问更新）。
 - 变异：`setTimes` 的授权改为恒允许 → hello123 D 段 3 项 FAIL，恢复后 PASS。
 - 验证：host 744/744；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）3/3 PASS。
+
+### linkat / symlinkat / fchownat（hello124）
+
+- 问题：只有传统的 link/symlink/chown，没有带 dirfd 的版本，`ln`、`cp -a`、`install` 在目录 fd 下无法工作；另外 `createHardlink` 给目录项写死
+  file_type 1，链接一个符号链接时类型错误。
+- 实现：原生 #490/#491/#492 与纯策略 `fs/at_flags_policy.zig`（标志与跨文件系统路由）；`ext2.createHardlinkMode`。
+- TDD：host 测试先编译失败后通过；hello124（23 项）在 HEAD 上全部 FAIL，新内核 PASS。
+- 变异：`linkat` 无视 AT_SYMLINK_FOLLOW（一律跟随）→ hello124 1 项 FAIL，恢复后 PASS。
+- 验证：host 745/745；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）3/3 PASS。

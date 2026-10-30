@@ -251,6 +251,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello121"); /* cwd and directory fds in path lookup */
     run_test("hello122"); /* execve/execveat errnos and name resolution */
     run_test("hello123"); /* utimensat/futimens */
+    run_test("hello124"); /* linkat/symlinkat/fchownat */
 
     start_persistent_services();
 

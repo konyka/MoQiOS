@@ -3201,12 +3201,18 @@ pub fn rmdirFile(path: []const u8, who: ?Who) i64 {
 /// Create a hard link: newpath → same inode as oldpath.
 /// Returns 0 on success, -errno on failure.
 pub fn createHardlink(oldpath: []const u8, newpath: []const u8, who: ?Who) i64 {
+    return createHardlinkMode(oldpath, newpath, true, who);
+}
+
+/// link(2) resolves a final symlink in oldpath (`follow`), as the traditional
+/// call did here; linkat(2) without AT_SYMLINK_FOLLOW links the symlink itself.
+pub fn createHardlinkMode(oldpath: []const u8, newpath: []const u8, follow: bool, who: ?Who) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return -5; // EIO
 
     // 1. Resolve oldpath to its inode number (v52.1: use symlink-resolving version)
-    const old_inode = walkPathToInodeAsUnlocked(oldpath, who, true) catch |e| return if (e == error.DacDenied) -13 else -2;
+    const old_inode = walkPathToInodeAsUnlocked(oldpath, who, follow) catch |e| return if (e == error.DacDenied) -13 else -2;
 
     // Read the old inode to check it's not a directory
     var old_inode_data: Ext2Inode = undefined;
@@ -3225,7 +3231,7 @@ pub fn createHardlink(oldpath: []const u8, newpath: []const u8, who: ?Who) i64 {
     }
 
     // 3. Add directory entry pointing to old_inode with same file_type
-    const ft: u8 = if (eu.isDirectory(old_inode_data.mode)) 2 else 1;
+    const ft: u8 = direntType(old_inode_data.mode);
     if (!addDirEntry(resolved.parent, old_inode, resolved.name, ft)) return -28; // ENOSPC
 
     // 4. Increment links_count
