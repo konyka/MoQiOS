@@ -7784,3 +7784,24 @@ test "irq time: windowed maximum resets on take, boot-wide maximum stays" {
     try std.testing.expectEqual(@as(u64, 200), n.total_cycles);
     try std.testing.expectEqual(@as(u8, 32), n.max_vector);
 }
+
+test "ext2 directory path assembly: join, depth limit, loop detection" {
+    const dp = kt.ext2_dirpath;
+    var c: dp.Chain = .{};
+    var out: [dp.MAX_PATH + 1]u8 = undefined;
+    try std.testing.expectEqualStrings("/", try dp.join(&c, &out));
+    try std.testing.expect(c.push("c"));
+    try std.testing.expect(c.push("b"));
+    try std.testing.expect(c.push("a"));
+    try std.testing.expectEqualStrings("/a/b/c", try dp.join(&c, &out));
+    try std.testing.expect(!c.push(""));
+    var big: dp.Chain = .{};
+    const name: [200]u8 = @splat('x');
+    try std.testing.expect(big.push(&name));
+    try std.testing.expect(big.push(&name));
+    try std.testing.expectError(error.TooLong, dp.join(&big, &out));
+    try std.testing.expectEqual(dp.Step.done, dp.nextStep(dp.ROOT_INO, dp.ROOT_INO, &.{}));
+    try std.testing.expectEqual(dp.Step.up, dp.nextStep(12, 7, &.{12}));
+    try std.testing.expectEqual(dp.Step.invalid, dp.nextStep(12, 12, &.{12}));
+    try std.testing.expectEqual(dp.Step.invalid, dp.nextStep(12, 7, &.{ 12, 7 }));
+}

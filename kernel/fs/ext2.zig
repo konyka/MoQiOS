@@ -630,8 +630,9 @@ fn walkPathFollow(start_inode: u32, path: []const u8, depth: u32, who: ?Who, fol
         current_inode = found;
     }
 
-    // Open the file
-    if (current_inode == start_inode) return -21; // path was just "/": a directory, not a file
+    // Open the file. A path that never left its starting directory ("/", ".")
+    // names that directory itself; opening it read-only is legal and the
+    // namespace policy (openExisting) decides about write access.
 
     var inode: Ext2Inode = undefined;
     if (!readInode(current_inode, &inode)) return -5;
@@ -818,6 +819,90 @@ fn findDirEntry(inode: *const Ext2Inode, name: []const u8) ?u32 {
         offset += block_size;
     }
     return null;
+}
+
+/// Name of the entry in directory `inode` that points at `target_ino`, copied
+/// into `out`. "." and ".." are skipped. Null when there is no such entry.
+fn findNameOfInode(inode: *const Ext2Inode, target_ino: u32, out: *[256]u8) ?usize {
+    const dir_size = inode.size;
+    var offset: u32 = 0;
+    while (offset < dir_size) {
+        const phys_block = resolveBlock(inode, offset / block_size);
+        if (phys_block == 0) {
+            offset += block_size;
+            continue;
+        }
+        const buf: [*]const u8 = cacheLookupPtr(phys_block) orelse blk: {
+            const buf_phys = pmm.allocPage() orelse return null;
+            defer pmm.freePage(buf_phys);
+            const tmp: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
+            if (!readBlock(phys_block, tmp)) return null;
+            break :blk cacheLookupPtr(phys_block) orelse return null;
+        };
+        var pos: u32 = 0;
+        while (pos < block_size and offset + pos < dir_size) {
+            const entry = eu.readDirEntry(buf, pos, block_size) orelse break;
+            if (entry.inode == target_ino and entry.name_len > 0) {
+                const name = buf[entry.name_pos..][0..entry.name_len];
+                const dots = (entry.name_len == 1 and name[0] == '.') or
+                    (entry.name_len == 2 and name[0] == '.' and name[1] == '.');
+                if (!dots) {
+                    @memcpy(out[0..entry.name_len], name);
+                    return entry.name_len;
+                }
+            }
+            pos += entry.rec_len;
+        }
+        offset += block_size;
+    }
+    return null;
+}
+
+/// Absolute path of the directory with inode `ino`, rebuilt from the inode
+/// chain (each directory's ".." and the parent's entry for the child), so a
+/// directory that was renamed or moved after being opened is found under its
+/// current name. Null when the chain cannot be walked (the directory was
+/// removed, the tree is corrupt or looping, or the path is too long).
+pub fn dirPathOfInode(ino: u32, out: *[256]u8) ?[]const u8 {
+    const dp = @import("ext2_dirpath.zig");
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active) return null;
+    var chain: dp.Chain = .{};
+    var seen: [dp.MAX_DEPTH + 1]u32 = undefined;
+    var nseen: usize = 0;
+    var cur = ino;
+    while (true) {
+        var inode: Ext2Inode = undefined;
+        if (!readInode(cur, &inode) or !eu.isDirectory(inode.mode) or inode.links_count == 0) return null;
+        seen[nseen] = cur;
+        nseen += 1;
+        const parent = findDirEntry(&inode, "..") orelse return null;
+        switch (dp.nextStep(cur, parent, seen[0..nseen])) {
+            .done => break,
+            .invalid => return null,
+            .up => {},
+        }
+        var pino: Ext2Inode = undefined;
+        if (!readInode(parent, &pino) or !eu.isDirectory(pino.mode)) return null;
+        var name: [256]u8 = undefined;
+        const n = findNameOfInode(&pino, cur, &name) orelse return null;
+        if (!chain.push(name[0..n])) return null;
+        if (nseen > dp.MAX_DEPTH) return null;
+        cur = parent;
+    }
+    var joined: [dp.MAX_PATH + 1]u8 = undefined;
+    const p = dp.join(&chain, &joined) catch return null;
+    @memcpy(out[0..p.len], p);
+    return out[0..p.len];
+}
+
+/// Inode number behind an open slot, or null for a free slot.
+pub fn openFileInode(file_idx: u32) ?u32 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active or file_idx >= open_count or open_files[file_idx].inode_num == 0) return null;
+    return open_files[file_idx].inode_num;
 }
 
 // ─── Block resolution (direct + single/double/triple indirect) ─────────────

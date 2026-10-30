@@ -274,6 +274,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello144"); /* UDP receive: blocking, timeout, non-blocking */
     run_test("hello145"); /* UDP sendmsg/recvmsg, AF_UNIX receive timeout */
     run_test("hello146"); /* sendmmsg / recvmmsg */
+    run_test("hello147"); /* directory fd follows its directory across rename */
 
     start_persistent_services();
 

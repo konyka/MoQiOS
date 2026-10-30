@@ -5520,3 +5520,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 变异：`takeWindow` 不再清零窗口最大值 → 两个 host 窗口测试失败，恢复后 788/788。
 - 验证：host 788/788；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL（hello108 本次 PASS，新字段输出正常）；stress（SMP=2）5/5 PASS。
+
+### ext2 目录描述符跟随 inode（hello147）
+
+- 问题：ext2 目录 fd 作 `dirfd` 或 `fchdir` 的目标时用打开时的路径，目录之后被改名/移动，fd 下的相对名解析和 `fchdir` 都指向旧路径（hello121 起的已知限制）。另有 `open("/", O_RDONLY)` 在 ext2 上返回 EISDIR，无法对根目录取描述符。
+- 修复：`ext2.dirPathOfInode`（沿 `..` 和父目录条目名从 inode 重建路径）、`ext2.openFileInode`、纯函数 `ext2_dirpath.zig`（拼接、深度/长度上限、环检测）；`at_path.dirFdBase` 优先用重建的路径，重建失败（目录已删除、链损坏）才回退到打开时的路径；`walkPathFollow` 不再把以起始目录结尾的路径当作错误。
+- 已知差异：每次解析要沿父链读目录块（最多 32 级），没有缓存；重建出的路径对多个硬链接/目录硬链接（ext2 不允许目录硬链接）不是问题，但目录被并发改名时可能读到中间状态；`fchdir` 之后的 cwd 仍然保存为路径字符串，之后再改名 cwd 目录，cwd 不会自动跟随（这是 cwd 的另一个已知限制，不是目录 fd 的）。
+- 排查过程（如实）：探测 C 段最初只是想确认“没改名的目录 fd 仍可用”，却发现根目录取不到描述符——先怀疑我的 dirfd 重建把根目录算错，打印返回值后才看出是 `open("/")` 本身返回 EISDIR（`-21` 之前我误读成了 `q=-009`，那是 `openat` 的结果）；追到 `walkPathFollow` 的 `current_inode == start_inode` 检查，它自第一版 ext2 起就在。去掉后根目录描述符可用，读它仍是 EISDIR，写方式打开仍是 EISDIR。
+- TDD：host 新增 1 个测试（路径拼接、深度限制、环检测）；hello147（19 项）在 HEAD 上 8 项 FAIL，新内核 PASS。
+
+- 变异：`dirFdBase` 改回只用打开时的路径 → hello147 A、B 段共 5 项 FAIL，恢复后 PASS。
+- 验证：host 789/789；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

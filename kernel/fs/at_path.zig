@@ -3,8 +3,9 @@
 //! Directory descriptors on every filesystem take part: a mounted ext4/NTFS
 //! volume, the ext2 root disk, tmpfs and /dev.
 //!
-//! An ext2 directory fd uses the path it was opened by (renaming the
-//! directory afterwards leaves that path stale; Linux follows the inode).
+//! An ext2 directory fd follows its inode: the path is rebuilt from the
+//! inode chain (ext2.dirPathOfInode), so a directory renamed or moved after
+//! it was opened is still found; the path it was opened by is only a fallback.
 //! A volume directory fd carries (mount slot, generation, record number) and
 //! no path, so the path is rebuilt: the mount target plus the directory's
 //! path inside the volume (found by asking each parent for the child's name)
@@ -73,7 +74,13 @@ pub fn dirFdBase(cur: *task_mod.Task, fd: u32, out: *[256]u8) union(enum) { ok: 
             const ext2 = @import("ext2.zig");
             const is_dir = ext2.openFileIsDir(d.ext2_file_idx) orelse return .{ .err = -9 };
             if (!is_dir) return .{ .err = -20 };
-            const stored = ext2.getOpenFilePath(d.ext2_file_idx) orelse return .{ .err = -9 };
+            // Follow the inode, not the path it was opened by: the directory
+            // may have been renamed or moved since. Fall back to the opening
+            // path only when the inode chain cannot be walked.
+            var rebuilt: [256]u8 = undefined;
+            const ino = ext2.openFileInode(d.ext2_file_idx) orelse return .{ .err = -9 };
+            const stored = ext2.dirPathOfInode(ino, &rebuilt) orelse
+                (ext2.getOpenFilePath(d.ext2_file_idx) orelse return .{ .err = -9 });
             var tmp: [257]u8 = undefined;
             var n: usize = 0;
             if (stored.len == 0 or stored[0] != '/') {
