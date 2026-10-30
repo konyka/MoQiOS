@@ -28,7 +28,8 @@ pub const OpenHow = struct {
 /// the exact negative errno that openat2 should return before opening anything.
 pub fn validate(dirfd: i64, how: OpenHow, size: u64) i64 {
     if (size != SIZE) return errno.EINVAL;
-    if (dirfd != AT_FDCWD and dirfd != 0) return errno.EBADF;
+    // Any real descriptor may name the starting directory; at_path judges it.
+    if (dirfd != AT_FDCWD and dirfd < 0) return errno.EBADF;
     if ((how.flags & ~SUPPORTED_FLAGS) != 0) return errno.EINVAL;
     if ((how.mode & ~@as(u64, 0o777)) != 0) return errno.EINVAL;
     if (how.resolve != 0) return errno.EINVAL;

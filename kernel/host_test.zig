@@ -240,4 +240,6 @@ pub const lapic_source = @embedFile("arch/x86_64/lapic.zig");
 pub const unsupported_policy = @import("proc/unsupported_policy.zig");
 pub const signal_syscall_source = @embedFile("proc/signal_syscall.zig");
 pub const file_io_source = @embedFile("fs/file_io.zig");
+pub const unlink_source = @embedFile("fs/unlink.zig");
+pub const dir_ops_source = @embedFile("fs/dir_ops.zig");
 pub const readv_source = @embedFile("fs/readv.zig");

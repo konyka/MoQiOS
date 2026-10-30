@@ -1864,7 +1864,7 @@ test "mprotect transaction policy enforces fixed resource caps" {
     ));
 }
 
-test "openat2 policy validates size, dirfd, flags, mode, and resolve" {
+test "openat2 policy validates size, dirfd, flags, mode, and resolve (a real dirfd is accepted)" {
     try std.testing.expectEqual(@as(i64, 0), openat2_policy.validate(
         openat2_policy.AT_FDCWD,
         .{ .flags = openat2_policy.O_CREAT, .mode = 0o644, .resolve = 0 },
@@ -1881,6 +1881,11 @@ test "openat2 policy validates size, dirfd, flags, mode, and resolve" {
         openat2_policy.SIZE - 1,
     ));
     try std.testing.expectEqual(kt.errno.EBADF, openat2_policy.validate(
+        -5,
+        .{ .flags = 0, .mode = 0, .resolve = 0 },
+        openat2_policy.SIZE,
+    ));
+    try std.testing.expectEqual(@as(i64, 0), openat2_policy.validate(
         3,
         .{ .flags = 0, .mode = 0, .resolve = 0 },
         openat2_policy.SIZE,
@@ -2208,7 +2213,7 @@ test "creation syscall dispatch forwards mode registers" {
         source,
         "257 => { // mkdirat(dirfd, pathname, mode)",
         "258 => { // faccessat",
-        "dir_ops_mod.mkdirWithMode(frame.rsi, @truncate(frame.rdx))",
+        "dir_ops_mod.mkdirAt(dirfdArg(frame.rdi), frame.rsi, @truncate(frame.rdx))",
     );
     try expectSourceRoute(
         source,
@@ -6863,4 +6868,85 @@ test "at-path join with a stored directory path: absolute names and AT_FDCWD pas
     try std.testing.expectEqualStrings("testdir/x", ap.joinStored("testdir", "x", &buf).?);
     var long: [300]u8 = @splat('a');
     try std.testing.expect(ap.joinStored("/d", long[0..260], &buf) == null);
+}
+
+test "relative names join the working directory; plain names from the root stay bare" {
+    const ap = kt.at_join_policy;
+    var buf: [256]u8 = undefined;
+    try std.testing.expect(ap.underCwd("/", "f", &buf) == .keep);
+    try std.testing.expect(ap.underCwd("", "f", &buf) == .keep);
+    try std.testing.expect(ap.underCwd("/testdir", "/abs", &buf) == .keep);
+    try std.testing.expect(ap.underCwd("/testdir", "", &buf) == .keep);
+    try std.testing.expectEqualStrings("/testdir/f", ap.underCwd("/testdir", "f", &buf).path);
+    try std.testing.expectEqualStrings("/tmp/a/b", ap.underCwd("/tmp/a", "b", &buf).path);
+    try std.testing.expectEqualStrings("/tmp/x", ap.underCwd("/", "tmp/x", &buf).path);
+    try std.testing.expectEqualStrings("/tmp", ap.underCwd("/", "tmp", &buf).path);
+    try std.testing.expect(ap.underCwd("/", "tmpx", &buf) == .keep);
+    try std.testing.expectEqualStrings("hello2", ap.underCwd("/", "./hello2", &buf).path);
+    try std.testing.expectEqualStrings("hello2", ap.underCwd("/testdir", "../hello2", &buf).path);
+    try std.testing.expectEqualStrings("/", ap.underCwd("/testdir", "..", &buf).path);
+    try std.testing.expectEqualStrings("/a/c/d", ap.underCwd("/a/b", "../c/./d", &buf).path);
+    try std.testing.expectEqualStrings("testdir/x", ap.underCwd("/", "testdir/x", &buf).path[1..]);
+    var long: [300]u8 = @splat('a');
+    try std.testing.expect(ap.underCwd("/d", long[0..255], &buf) == .too_long);
+}
+
+test "directory-descriptor joins: a stored relative path counts from the root" {
+    const ap = kt.at_join_policy;
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("/testdir/x", ap.absJoin("testdir", "x", &buf).path);
+    try std.testing.expectEqualStrings("/testdir/x", ap.absJoin("/testdir/", "x", &buf).path);
+    try std.testing.expectEqualStrings("hello2", ap.absJoin("testdir", "../hello2", &buf).path);
+    try std.testing.expectEqualStrings("/dev/null", ap.absJoin("/dev", "null", &buf).path);
+    try std.testing.expectEqualStrings("/tmp/d/f", ap.absJoin("/tmp/d", "f", &buf).path);
+}
+
+test "relative names from the root that name /tmp, /dev or /proc must become absolute" {
+    const ap = kt.at_join_policy;
+    try std.testing.expect(ap.namesRootTree("tmp"));
+    try std.testing.expect(ap.namesRootTree("tmp/x"));
+    try std.testing.expect(ap.namesRootTree("dev/null"));
+    try std.testing.expect(ap.namesRootTree("proc/meminfo"));
+    try std.testing.expect(!ap.namesRootTree("tmpx"));
+    try std.testing.expect(!ap.namesRootTree("testdir/tmp"));
+    try std.testing.expect(!ap.namesRootTree("hello2"));
+    try std.testing.expect(!ap.namesRootTree(""));
+}
+
+test "every /tmp routing check stops at a component boundary (/tmpfoo is not tmpfs)" {
+    const sources = [_][]const u8{ kt.vfs_source, kt.tmpfs_source, kt.unlink_source, kt.dir_ops_source };
+    for (sources) |src| {
+        var pos: usize = 0;
+        var seen: usize = 0;
+        while (std.mem.indexOfPos(u8, src, pos, "[3] == 'p'")) |i| {
+            const line_end = std.mem.indexOfScalarPos(u8, src, i, '\n') orelse src.len;
+            try std.testing.expect(std.mem.indexOf(u8, src[i..line_end], "[4] == '/'") != null);
+            seen += 1;
+            pos = i + 1;
+        }
+        try std.testing.expect(seen > 0);
+    }
+}
+
+test "chdir '..' leaves no trailing slash" {
+    const cp = kt.chdir_policy;
+    var out: [256]u8 = undefined;
+    var n = try cp.resolve("/tmp/d", "..", &out);
+    try std.testing.expectEqualStrings("/tmp", out[0..n]);
+    n = try cp.resolve("/a/b/c", "../..", &out);
+    try std.testing.expectEqualStrings("/a", out[0..n]);
+    n = try cp.resolve("/a/b", "../x", &out);
+    try std.testing.expectEqualStrings("/a/x", out[0..n]);
+    n = try cp.resolve("/a", "..", &out);
+    try std.testing.expectEqualStrings("/", out[0..n]);
+    n = try cp.resolve("/", "..", &out);
+    try std.testing.expectEqualStrings("/", out[0..n]);
+}
+
+test "ext2 readlink copies the target out under fs_lock (no slice into a stack inode)" {
+    const src = kt.ext2_source;
+    try std.testing.expect(std.mem.indexOf(u8, src, "pub fn readSymlinkByPath(path: []const u8, out: *[256]u8) ?[]const u8") != null);
+    const start = std.mem.indexOf(u8, src, "pub fn readSymlinkByPath(").?;
+    const end = std.mem.indexOfPos(u8, src, start, "\n}\n").?;
+    try std.testing.expect(std.mem.indexOf(u8, src[start..end], "return readSymlinkTarget(") == null);
 }

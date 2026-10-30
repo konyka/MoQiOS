@@ -76,6 +76,18 @@ pub fn fstat(fd: u64, stat_ptr: u64) i64 {
             },
         }
     }
+    if (fdesc.fd_type == .tmpfs_file) {
+        const tmpfs = @import("tmpfs.zig");
+        if (tmpfs.tmpfsGetMetadata(@intCast(fdesc.tmpfs_idx))) |m| {
+            const kind: u32 = if (m.is_dir) 0o040000 else 0o100000;
+            bo.writeU64Le(stat_buf[16..24], 1);
+            bo.writeU32Le(stat_buf[24..28], kind | (m.mode & 0o7777));
+            bo.writeU32Le(stat_buf[28..32], m.uid);
+            bo.writeU32Le(stat_buf[32..36], m.gid);
+            bo.writeI64Le(stat_buf[48..56], @intCast(tmpfs.tmpfsGetSize(@intCast(fdesc.tmpfs_idx))));
+            bo.writeU64Le(stat_buf[56..64], 4096);
+        }
+    }
     if (fdesc.fd_type == .fat32_file) {
         const fat32 = @import("fat32.zig");
         const mtime = fat32.getMtime(fdesc.fat32_file_idx);
@@ -170,7 +182,12 @@ pub fn mkdirWithMode(name_ptr: u64, requested_mode: ?u32) i64 {
 
     var len: usize = 0;
     while (len < copied and name_buf[len] != 0) : (len += 1) {}
-    return mkdirName(name_buf[0..len], requested_mode);
+    var join_buf: [256]u8 = undefined;
+    const name = switch (@import("dirfd_name.zig").resolve(-100, name_buf[0..len], &join_buf)) {
+        .ok => |n| n,
+        .err => |e| return e,
+    };
+    return mkdirName(name, requested_mode);
 }
 
 /// mkdirat: resolve `name_ptr` under `dirfd` first.
@@ -190,7 +207,7 @@ pub fn mkdirAt(dirfd: i64, name_ptr: u64, requested_mode: ?u32) i64 {
 }
 
 fn mkdirName(name: []const u8, requested_mode: ?u32) i64 {
-    if (name.len >= 4 and name[0] == '/' and name[1] == 't' and name[2] == 'm' and name[3] == 'p') {
+    if (name.len >= 4 and name[0] == '/' and name[1] == 't' and name[2] == 'm' and name[3] == 'p' and (name.len == 4 or name[4] == '/')) {
         const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
         const cur = task_mod.getTask(cur_idx) orelse return -1;
         const mode = requested_mode orelse @import("../proc/creation_metadata.zig").DEFAULT_DIRECTORY_MODE;

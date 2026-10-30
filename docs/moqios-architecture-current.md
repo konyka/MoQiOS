@@ -1118,7 +1118,7 @@ LAPIC Timer 中断
 - **allocCluster 游标** (v53.38): last_free_cluster 游标 — O(N×M)→O(N) 摊还
 - **readFile 簇链缓存** (v53.38): last_walk_cluster/last_walk_idx — O(N²)→O(N) 顺序读
 - 缓存: 在内存中维护打开文件数组，避免频繁磁盘 I/O
-- 路径解析: 支持绝对路径和相对路径 (相对于 cwd)
+- 路径解析: 支持绝对路径和相对路径 (相对于 cwd 或 *at() 的目录 fd；ext2、tmpfs、/dev 与 ext4/NTFS 卷的目录 fd 都可用，统一由 `fs/at_path.zig` 解析；`chdir` 校验目标存在且是可搜索的目录)
 - **并发模型**: 粗粒度 `fs_lock` (IrqSpinlock) 串行化 FAT32 操作；ext2 同样采用
   粗粒度 `fs_lock`。两文件系统均无细粒度 inode 级锁。
 

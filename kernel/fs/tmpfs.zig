@@ -155,7 +155,7 @@ fn findEntry(name: []const u8, parent: u8) ?u8 {
 
 /// Strip "/tmp" prefix and return the inner path.
 fn stripPrefix(path: []const u8) []const u8 {
-    if (path.len >= 4 and path[0] == '/' and path[1] == 't' and path[2] == 'm' and path[3] == 'p') {
+    if (path.len >= 4 and path[0] == '/' and path[1] == 't' and path[2] == 'm' and path[3] == 'p' and (path.len == 4 or path[4] == '/')) {
         if (path.len == 4) return "/";
         return path[4..];
     }
@@ -765,7 +765,10 @@ pub fn tmpfsMkdirAuthorized(path: []const u8, requested_mode: u32, umask_val: u3
     // directory while bumping its open_count — a reference nobody releases,
     // pinning the slot past unlink.
     const probe = tmpfsOpenAuthorized(path, false, false, euid, egid, effective_caps, 0, requested_mode, umask_val);
-    if (probe >= 0) return -17;
+    if (probe >= 0) {
+        tmpfsClose(@intCast(probe));
+        return -17;
+    }
     const result = tmpfsOpenAuthorized(path, true, true, euid, egid, effective_caps, 0, requested_mode, umask_val);
     if (result < 0) return result;
     // tmpfsOpen already created as dir; just return success
@@ -779,6 +782,41 @@ pub fn tmpfsGetSize(idx: u8) u32 {
     defer tmpfs_lock.release(state_held);
     if (!entries[idx].active) return 0;
     return entries[idx].size;
+}
+
+/// Absolute path ("/tmp/a/b") of the tmpfs directory `idx`, for a directory
+/// descriptor used as an *at() dirfd or by fchdir. ENOTDIR for a file,
+/// ENOENT once the directory (or an ancestor) has been removed.
+pub fn tmpfsDirPath(idx: u32, out: *[256]u8) union(enum) { ok: []const u8, err: i64 } {
+    if (idx >= MAX_FILES) return .{ .err = -9 };
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    if (!entries[idx].active or entries[idx].deleted) return .{ .err = -2 };
+    if (!entries[idx].is_dir) return .{ .err = -20 };
+    var chain: [MAX_FILES]u8 = undefined;
+    var depth: usize = 0;
+    var cur: u8 = @intCast(idx);
+    while (cur != 0) {
+        if (depth >= chain.len) return .{ .err = -40 };
+        const e = &entries[cur];
+        if (!e.active or e.deleted or e.parent_idx >= MAX_FILES) return .{ .err = -2 };
+        chain[depth] = cur;
+        depth += 1;
+        cur = e.parent_idx;
+    }
+    const root = "/tmp";
+    @memcpy(out[0..root.len], root);
+    var n: usize = root.len;
+    while (depth > 0) {
+        depth -= 1;
+        const e = &entries[chain[depth]];
+        const name = e.name[0..e.name_len];
+        if (n + 1 + name.len > out.len) return .{ .err = -36 };
+        out[n] = '/';
+        @memcpy(out[n + 1 ..][0..name.len], name);
+        n += 1 + name.len;
+    }
+    return .{ .ok = out[0..n] };
 }
 
 pub fn tmpfsGetMetadata(idx: u8) ?Metadata {

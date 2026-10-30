@@ -129,7 +129,7 @@ var open_count: u32 = 0;
 var fs_lock: IrqSpinlock = .{};
 
 // ─── Open file path table (v52.0: for execveat dirfd resolution) ──────────
-var open_file_paths: [MAX_OPEN_FILES][128]u8 = @splat(@splat(0));
+var open_file_paths: [MAX_OPEN_FILES][256]u8 = @splat(@splat(0));
 
 // ─── Initialization ───────────────────────────────────────────────────────
 
@@ -551,7 +551,7 @@ pub fn openFileAs(name: []const u8, who: ?Who) i64 {
     if (result >= 0) {
         // v52.0: store path for execveat dirfd resolution
         const idx: usize = @intCast(result);
-        const copy_len = @min(name.len, 127);
+        const copy_len = @min(name.len, 255);
         @memcpy(open_file_paths[idx][0..copy_len], name[0..copy_len]);
         open_file_paths[idx][copy_len] = 0;
     }
@@ -1041,7 +1041,7 @@ fn closeFileUnlocked(file_idx: u32) u32 {
     f.inode_num = 0;
     f.unlink_pending = false;
     // v52.3: clear full path to prevent stale data leak
-    @memset(open_file_paths[file_idx][0..128], 0);
+    @memset(open_file_paths[file_idx][0..256], 0);
     return if (reclaim) inode_num else 0;
 }
 
@@ -2271,7 +2271,7 @@ pub fn createFile(name: []const u8, creator: Creator, who: ?Who) i64 {
                 .offset = 0,
             };
             // v52.0: store path
-            const copy_len = @min(name.len, 127);
+            const copy_len = @min(name.len, 255);
             @memcpy(open_file_paths[i][0..copy_len], name[0..copy_len]);
             open_file_paths[i][copy_len] = 0;
             if (i >= open_count) open_count = @intCast(i + 1);
@@ -2477,7 +2477,7 @@ pub fn createDir(name: []const u8, creator: Creator, who: ?Who) i64 {
                 .offset = 0,
             };
             // v52.0: store path
-            const copy_len = @min(name.len, 127);
+            const copy_len = @min(name.len, 255);
             @memcpy(open_file_paths[i][0..copy_len], name[0..copy_len]);
             open_file_paths[i][copy_len] = 0;
             if (i >= open_count) open_count = @intCast(i + 1);
@@ -3355,7 +3355,10 @@ fn resolveInode(start_inode: u32, path: []const u8, depth: u32, who: ?Who, follo
 
 /// Read symlink target by path. Returns target slice or null.
 /// Uses static symlink_buf for long symlinks (caller must copy before next call).
-pub fn readSymlinkByPath(path: []const u8) ?[]const u8 {
+/// The target is copied into `out` under fs_lock: a short target lives in the
+/// inode's i_block (a stack copy here) and a long one in the shared
+/// symlink_buf, so neither may be handed out after the lock is released.
+pub fn readSymlinkByPath(path: []const u8, out: *[256]u8) ?[]const u8 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return null;
@@ -3371,7 +3374,10 @@ pub fn readSymlinkByPath(path: []const u8) ?[]const u8 {
     if (!readInode(entry_inode_num, &entry_inode)) return null;
     if (!eu.isSymlink(entry_inode.mode)) return null; // not a symlink
 
-    return readSymlinkTarget(&entry_inode);
+    const target = readSymlinkTarget(&entry_inode) orelse return null;
+    const n = @min(target.len, out.len);
+    @memcpy(out[0..n], target[0..n]);
+    return out[0..n];
 }
 
 // ─── chown/chmod inode persistence (v51.0) ─────────────────────────────────
@@ -3981,9 +3987,31 @@ pub fn getOpenFilePath(file_idx: u32) ?[]const u8 {
     if (open_files[file_idx].inode_num == 0) return null;
     // Find null terminator
     var len: usize = 0;
-    while (len < 128 and open_file_paths[file_idx][len] != 0) : (len += 1) {}
+    while (len < 256 and open_file_paths[file_idx][len] != 0) : (len += 1) {}
     if (len == 0) return null;
     return open_file_paths[file_idx][0..len];
+}
+
+/// Is the open slot a directory? Null for a free or invalid slot.
+pub fn openFileIsDir(file_idx: u32) ?bool {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active or file_idx >= open_count or open_files[file_idx].inode_num == 0) return null;
+    return eu.isDirectory(open_files[file_idx].inode.mode);
+}
+
+/// chdir check: 0 when `path` names a directory the caller may search,
+/// otherwise -ENOENT / -ENOTDIR / -EACCES.
+pub fn dirCheckAs(path: []const u8, who: Who) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active) return -2;
+    const ino = resolveInode(2, path, 0, who, true) catch |e| return if (e == error.DacDenied) -13 else -2;
+    var inode: Ext2Inode = undefined;
+    if (!readInode(ino, &inode)) return -5;
+    if (!eu.isDirectory(inode.mode)) return -20;
+    if (!@import("dac.zig").allows(inodeMeta(&inode), who.creds(), @import("dac.zig").Access.search)) return -13;
+    return 0;
 }
 
 /// Build a combined path: dir_path + "/" + relative_path into buf.

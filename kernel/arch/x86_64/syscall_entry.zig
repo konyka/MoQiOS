@@ -1851,11 +1851,13 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             path_buf[if (pc < 255) pc else 255] = 0;
             var plen: usize = 0;
             while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
-            if (tmpfsPath(path_buf[0..plen])) {
-                frame.rax = @bitCast(@import("../../fs/tmpfs.zig").tmpfsChmod(path_buf[0..plen], @truncate(frame.rsi), tmpfsWho()));
+            var cwd_join: [256]u8 = undefined;
+            const name = atName(frame, -100, path_buf[0..plen], &cwd_join) orelse return;
+            if (tmpfsPath(name)) {
+                frame.rax = @bitCast(@import("../../fs/tmpfs.zig").tmpfsChmod(name, @truncate(frame.rsi), tmpfsWho()));
                 return;
             }
-            frame.rax = @bitCast(ext2_mod.setMode(path_buf[0..plen], @truncate(frame.rsi), ext2Who()));
+            frame.rax = @bitCast(ext2_mod.setMode(name, @truncate(frame.rsi), ext2Who()));
         },
         91 => { // fchmod(fd, mode)
             const ext2_mod = @import("../../fs/ext2.zig");
@@ -2006,8 +2008,12 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             while (ol < 256 and old_buf[ol] != 0) : (ol += 1) {}
             var nl: usize = 0;
             while (nl < 256 and new_buf[nl] != 0) : (nl += 1) {}
+            var old_join: [256]u8 = undefined;
+            var new_join: [256]u8 = undefined;
+            const old_name = atName(frame, -100, old_buf[0..ol], &old_join) orelse return;
+            const new_name = atName(frame, -100, new_buf[0..nl], &new_join) orelse return;
             if (ext2_mod.isActive()) {
-                frame.rax = @bitCast(ext2_mod.createHardlink(old_buf[0..ol], new_buf[0..nl], ext2Who()));
+                frame.rax = @bitCast(ext2_mod.createHardlink(old_name, new_name, ext2Who()));
             } else {
                 frame.rax = @bitCast(@as(i64, -38)); // ENOSYS
             }
@@ -2029,8 +2035,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             while (tl < 256 and tgt_buf[tl] != 0) : (tl += 1) {}
             var ll: usize = 0;
             while (ll < 256 and lnk_buf[ll] != 0) : (ll += 1) {}
+            var lnk_join: [256]u8 = undefined;
+            const lnk_name = atName(frame, -100, lnk_buf[0..ll], &lnk_join) orelse return;
             if (ext2_mod.isActive()) {
-                frame.rax = @bitCast(ext2_mod.createSymlink(tgt_buf[0..tl], lnk_buf[0..ll], ext2Creator(), ext2Who()));
+                frame.rax = @bitCast(ext2_mod.createSymlink(tgt_buf[0..tl], lnk_name, ext2Creator(), ext2Who()));
             } else {
                 frame.rax = @bitCast(@as(i64, -38)); // ENOSYS
             }
@@ -2047,11 +2055,13 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             path_buf[if (pc < 255) pc else 255] = 0;
             var plen: usize = 0;
             while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
-            if (tmpfsPath(path_buf[0..plen])) {
-                frame.rax = @bitCast(@import("../../fs/tmpfs.zig").tmpfsChown(path_buf[0..plen], idArg(frame.rsi), idArg(frame.rdx), tmpfsWho()));
+            var cwd_join: [256]u8 = undefined;
+            const name = atName(frame, -100, path_buf[0..plen], &cwd_join) orelse return;
+            if (tmpfsPath(name)) {
+                frame.rax = @bitCast(@import("../../fs/tmpfs.zig").tmpfsChown(name, idArg(frame.rsi), idArg(frame.rdx), tmpfsWho()));
                 return;
             }
-            frame.rax = @bitCast(ext2_mod.setOwner(path_buf[0..plen], @truncate(frame.rsi), @truncate(frame.rdx), ext2Who()));
+            frame.rax = @bitCast(ext2_mod.setOwner(name, @truncate(frame.rsi), @truncate(frame.rdx), ext2Who()));
         },
         93 => { // fchown(fd, owner, group)
             const ext2_mod = @import("../../fs/ext2.zig");
@@ -2089,7 +2099,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             path_buf[if (pc < 255) pc else 255] = 0;
             var plen: usize = 0;
             while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
-            frame.rax = @bitCast(ext2_mod.setOwnerNoFollow(path_buf[0..plen], @truncate(frame.rsi), @truncate(frame.rdx), ext2Who()));
+            var cwd_join: [256]u8 = undefined;
+            const name = atName(frame, -100, path_buf[0..plen], &cwd_join) orelse return;
+            frame.rax = @bitCast(ext2_mod.setOwnerNoFollow(name, @truncate(frame.rsi), @truncate(frame.rdx), ext2Who()));
         },
         // ── v40.0: New MoQiOS syscalls (#327-#330) ─────────────────────────
         327 => { // getitimer(which, curr_value)
@@ -2115,7 +2127,11 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             while (ol < 256 and old_buf[ol] != 0) : (ol += 1) {}
             var nl: usize = 0;
             while (nl < 256 and new_buf[nl] != 0) : (nl += 1) {}
-            frame.rax = @bitCast(ext2_mod.createHardlink(old_buf[0..ol], new_buf[0..nl], ext2Who()));
+            var old_join: [256]u8 = undefined;
+            var new_join: [256]u8 = undefined;
+            const old_name = atName(frame, -100, old_buf[0..ol], &old_join) orelse return;
+            const new_name = atName(frame, -100, new_buf[0..nl], &new_join) orelse return;
+            frame.rax = @bitCast(ext2_mod.createHardlink(old_name, new_name, ext2Who()));
         },
         330 => { // symlink(target, linkpath) — same as #88
             const copy = @import("../../mm/copy_from_user.zig");
@@ -2134,7 +2150,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             while (tl < 256 and tgt_buf[tl] != 0) : (tl += 1) {}
             var ll: usize = 0;
             while (ll < 256 and lnk_buf[ll] != 0) : (ll += 1) {}
-            frame.rax = @bitCast(ext2_mod.createSymlink(tgt_buf[0..tl], lnk_buf[0..ll], ext2Creator(), ext2Who()));
+            var lnk_join: [256]u8 = undefined;
+            const lnk_name = atName(frame, -100, lnk_buf[0..ll], &lnk_join) orelse return;
+            frame.rax = @bitCast(ext2_mod.createSymlink(tgt_buf[0..tl], lnk_name, ext2Creator(), ext2Who()));
         },
         // ── v42.0: Linux standard number aliases (331+) + new implementations ──
         331 => { // statx(dirfd, pathname, flags, mask, statxbuf) — alias of #183
@@ -2371,8 +2389,6 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         463 => { // setxattrat(dfd, path, flags, name, value, size)
             const copy = @import("../../mm/copy_from_user.zig");
             const ext2_mod = @import("../../fs/ext2.zig");
-            _ = frame.rdi; // dfd
-            _ = frame.rdx; // flags
             // Copy path
             var path_buf: [256]u8 = undefined;
             const pc = copy.copyPathFromUser(path_buf[0..], frame.rsi, 255);
@@ -2415,7 +2431,11 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 return;
             }
             // Resolve path to inode and set xattr
-            const inode_num = ext2_mod.walkPathToInodeAs(path_buf[0..plen], ext2Who(), true) catch |e| {
+            var at_join: [256]u8 = undefined;
+            const at_name = atName(frame, dirfdArg(frame.rdi), path_buf[0..plen], &at_join) orelse return;
+            // AT_SYMLINK_NOFOLLOW (0x100): act on a final symlink itself.
+            const follow = (frame.rdx & 0x100) == 0;
+            const inode_num = ext2_mod.walkPathToInodeAs(at_name, ext2Who(), follow) catch |e| {
                 frame.rax = @bitCast(@as(i64, if (e == error.DacDenied) -13 else -2));
                 return;
             };
@@ -2424,8 +2444,6 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         464 => { // getxattrat(dfd, path, flags, name, value, size)
             const copy = @import("../../mm/copy_from_user.zig");
             const ext2_mod = @import("../../fs/ext2.zig");
-            _ = frame.rdi; // dfd
-            _ = frame.rdx; // flags
             var path_buf: [256]u8 = undefined;
             const pc = copy.copyPathFromUser(path_buf[0..], frame.rsi, 255);
             if (pc == 0) {
@@ -2451,7 +2469,11 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 frame.rax = @bitCast(@as(i64, -1)); // EPERM
                 return;
             }
-            const inode_num = ext2_mod.walkPathToInodeAs(path_buf[0..plen], ext2Who(), true) catch |e| {
+            var at_join: [256]u8 = undefined;
+            const at_name = atName(frame, dirfdArg(frame.rdi), path_buf[0..plen], &at_join) orelse return;
+            // AT_SYMLINK_NOFOLLOW (0x100): act on a final symlink itself.
+            const follow = (frame.rdx & 0x100) == 0;
+            const inode_num = ext2_mod.walkPathToInodeAs(at_name, ext2Who(), follow) catch |e| {
                 frame.rax = @bitCast(@as(i64, if (e == error.DacDenied) -13 else -2));
                 return;
             };
@@ -2470,8 +2492,6 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         465 => { // listxattrat(dfd, path, flags, list, size)
             const copy = @import("../../mm/copy_from_user.zig");
             const ext2_mod = @import("../../fs/ext2.zig");
-            _ = frame.rdi; // dfd
-            _ = frame.rdx; // flags
             var path_buf: [256]u8 = undefined;
             const pc = copy.copyPathFromUser(path_buf[0..], frame.rsi, 255);
             if (pc == 0) {
@@ -2481,7 +2501,11 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             path_buf[if (pc < 255) pc else 255] = 0;
             var plen: usize = 0;
             while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
-            const inode_num = ext2_mod.walkPathToInodeAs(path_buf[0..plen], ext2Who(), true) catch |e| {
+            var at_join: [256]u8 = undefined;
+            const at_name = atName(frame, dirfdArg(frame.rdi), path_buf[0..plen], &at_join) orelse return;
+            // AT_SYMLINK_NOFOLLOW (0x100): act on a final symlink itself.
+            const follow = (frame.rdx & 0x100) == 0;
+            const inode_num = ext2_mod.walkPathToInodeAs(at_name, ext2Who(), follow) catch |e| {
                 frame.rax = @bitCast(@as(i64, if (e == error.DacDenied) -13 else -2));
                 return;
             };
@@ -2499,8 +2523,6 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         466 => { // removexattrat(dfd, path, flags, name)
             const copy = @import("../../mm/copy_from_user.zig");
             const ext2_mod = @import("../../fs/ext2.zig");
-            _ = frame.rdi; // dfd
-            _ = frame.rdx; // flags
             var path_buf: [256]u8 = undefined;
             const pc = copy.copyPathFromUser(path_buf[0..], frame.rsi, 255);
             if (pc == 0) {
@@ -2526,7 +2548,11 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 frame.rax = @bitCast(@as(i64, -1)); // EPERM
                 return;
             }
-            const inode_num = ext2_mod.walkPathToInodeAs(path_buf[0..plen], ext2Who(), true) catch |e| {
+            var at_join: [256]u8 = undefined;
+            const at_name = atName(frame, dirfdArg(frame.rdi), path_buf[0..plen], &at_join) orelse return;
+            // AT_SYMLINK_NOFOLLOW (0x100): act on a final symlink itself.
+            const follow = (frame.rdx & 0x100) == 0;
+            const inode_num = ext2_mod.walkPathToInodeAs(at_name, ext2Who(), follow) catch |e| {
                 frame.rax = @bitCast(@as(i64, if (e == error.DacDenied) -13 else -2));
                 return;
             };
@@ -2793,6 +2819,18 @@ fn ext2Who() @import("../../fs/ext2.zig").Who {
     };
 }
 
+/// A path argument relative to `dirfd` (AT_FDCWD = the working directory),
+/// as at_path resolves it; null with frame.rax set to the error.
+fn atName(frame: *SyscallFrame, dirfd: i64, raw: []const u8, buf: *[256]u8) ?[]const u8 {
+    return switch (@import("../../fs/dirfd_name.zig").resolve(dirfd, raw, buf)) {
+        .ok => |n| n,
+        .err => |e| {
+            frame.rax = @bitCast(e);
+            return null;
+        },
+    };
+}
+
 /// A raw dirfd register as the signed 32-bit value userspace passed
 /// (AT_FDCWD is -100).
 fn dirfdArg(raw: u64) i64 {
@@ -2821,7 +2859,7 @@ fn syscallOpenat2(dirfd_raw: u64, pathname: u64, how_ptr: u64, size: u64) i64 {
     const validation = policy.validate(dirfd, how, size);
     if (validation != 0) return validation;
 
-    return file_io_mod.openWithMode(pathname, @truncate(how.flags), @truncate(how.mode));
+    return file_io_mod.openAt(dirfd, pathname, @truncate(how.flags), @truncate(how.mode));
 }
 
 /// A syscall fd argument is a full 64-bit register; anything that does not
@@ -3720,8 +3758,14 @@ fn syscallTruncate(path_ptr: u64, length: u64) i64 {
 
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = tm.getTask(cur_idx) orelse return -1;
+    var joined: [256]u8 = undefined;
+    const use_name = switch (@import("../../fs/at_path.zig").resolve(cur, @import("../../fs/at_path.zig").AT_FDCWD, name, &joined)) {
+        .keep => name,
+        .path => |p| p,
+        .err => |e| return e,
+    };
     // O_WRONLY (0x01): truncate requires write access to the file.
-    const fd_result = cur.fd_table.openWithCredentials(name, 1, cur.euid, cur.egid, cur.effective_caps);
+    const fd_result = cur.fd_table.openWithCredentials(use_name, 1, cur.euid, cur.egid, cur.effective_caps);
     if (fd_result < 0) return fd_result;
     const fd: u32 = @intCast(fd_result);
     const result = truncateDesc(&cur.fd_table.fds[fd], length);

@@ -33,9 +33,7 @@ fn caller() ?@import("../fs/ext2.zig").Who {
 
 /// unlink(path_ptr) -> 0 or -errno.
 pub fn unlink(path_ptr: u64) i64 {
-    var name_buf: [256]u8 = undefined;
-    const name = copyPath(path_ptr, &name_buf) orelse return -1;
-    return unlinkName(name);
+    return unlinkAt(-100, path_ptr, false);
 }
 
 /// unlinkat: resolve `path_ptr` under `dirfd` first.
@@ -53,7 +51,7 @@ pub fn unlinkAt(dirfd: i64, path_ptr: u64, as_dir: bool) i64 {
 pub fn unlinkName(name: []const u8) i64 {
 
     // tmpfs: /tmp paths route there, mirroring the open path in vfs.zig.
-    if (name.len >= 4 and name[0] == '/' and name[1] == 't' and name[2] == 'm' and name[3] == 'p') {
+    if (name.len >= 4 and name[0] == '/' and name[1] == 't' and name[2] == 'm' and name[3] == 'p' and (name.len == 4 or name[4] == '/')) {
         const tmpfs = @import("../fs/tmpfs.zig");
         return tmpfs.tmpfsUnlinkAuthorized(name, tmpfsCaller());
     }
@@ -89,14 +87,12 @@ pub fn unlinkName(name: []const u8) i64 {
 /// semantics: ext2 gets a real empty-dir implementation (unlink used to
 /// accept directories and corrupt the namespace), tmpfs already validates.
 pub fn rmdir(path_ptr: u64) i64 {
-    var name_buf: [256]u8 = undefined;
-    const name = copyPath(path_ptr, &name_buf) orelse return -1;
-    return rmdirName(name);
+    return unlinkAt(-100, path_ptr, true);
 }
 
 pub fn rmdirName(name: []const u8) i64 {
 
-    if (name.len >= 4 and name[0] == '/' and name[1] == 't' and name[2] == 'm' and name[3] == 'p') {
+    if (name.len >= 4 and name[0] == '/' and name[1] == 't' and name[2] == 'm' and name[3] == 'p' and (name.len == 4 or name[4] == '/')) {
         const tmpfs = @import("../fs/tmpfs.zig");
         return tmpfs.tmpfsUnlinkAuthorized(name, tmpfsCaller());
     }

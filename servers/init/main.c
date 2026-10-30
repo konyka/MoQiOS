@@ -248,6 +248,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello118"); /* memfd_create */
     run_test("hello119"); /* rename on tmpfs */
     run_test("hello120"); /* mseal */
+    run_test("hello121"); /* cwd and directory fds in path lookup */
 
     start_persistent_services();
 

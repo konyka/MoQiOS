@@ -376,7 +376,17 @@ H1 再加 `shared` 字段记录 MAP_SHARED），不触碰页表；首次访问�
   （`pathOf` 逐级向父目录查"哪个名字指向我"，从右往左拼）+ 调用者的相对名，再走常规的绝对路径查找，
   因此符号链接、`..` 出卷、权限检查都沿用既有逻辑。取舍：fd 之上的各级目录会被重新做搜索权限检查，而
   Linux 信任 fd 不再检查；只读卷上权限不会在 fd 打开后变化，所以只有"打开目录后降权"的进程才会看到差异。
-  非目录 fd 作 dirfd 返回 ENOTDIR；其它文件系统的 dirfd 处理不变；`openat2` 仍只接受 `AT_FDCWD`/0。
+  非目录 fd 作 dirfd 返回 ENOTDIR；`openat2` 也接受任意目录 fd。
+  **所有文件系统的目录 fd 与 cwd**（hello121）：`at_path.resolve` 现在统一处理 ext2 目录 fd（用打开时的路径）、
+  tmpfs 目录 fd（沿父链重建 `/tmp/...`）、`/dev` 目录 fd，空闲 fd 为 EBADF，非目录为 ENOTDIR；`dirfd_name.resolve`
+  只是它的薄包装。`AT_FDCWD` 下的相对名在 cwd 不是根时与 cwd 拼接并规范化（`at_join_policy.underCwd`/`absJoin`），
+  落在根下的单段名去掉前导斜杠交给平坦文件系统（ramdisk/FAT32 只认裸名），`tmp/`、`dev/`、`proc/` 开头的名字变成绝对路径。
+  接入的调用：open/openat/openat2/creat、mkdir/mkdirat、unlink/unlinkat/rmdir、rename/renameat2、chmod/fchmodat(2)、
+  chown/lchown、access/faccessat(2)、statx、readlink/readlinkat、link、symlink（只解析链接路径，目标原样保存）、truncate、
+  setxattrat/getxattrat/listxattrat/removexattrat（同时支持 `AT_SYMLINK_NOFOLLOW`）。`chdir` 现在校验目标：
+  不存在 ENOENT、不是目录 ENOTDIR、不可搜索 EACCES（ext2、tmpfs、/dev；挂载点的上级目录和 /proc 不校验），失败时 cwd 不变；
+  `fchdir` 对上述各类目录 fd 都真正切换 cwd。限制：ext2 目录 fd 记录的是打开时的路径，目录之后被改名，fd 下的相对名
+  仍按旧路径解析（Linux 跟随 inode）。顺带修复：`/tmpX` 不再被当成 `/tmp/X`（五处 `/tmp` 前缀判断都要求在分量边界）。
   修改类调用（`unlinkat`、`mkdirat`、`fchmodat`、`fchmodat2`、`renameat2` 的两个路径、`setxattrat`、`removexattrat`）
   由分发前的 EROFS 守卫按各自的 dirfd 展开路径再判断（`fs/rofs_guard_policy.zig` 的 `da`/`db` 字段），卷目录 fd
   下的名字一律 EROFS，卷目录 fd 无法解析时直接返回该错误，绝不退回到根盘上的同名文件。`unlinkat` 支持

@@ -54,10 +54,10 @@ pub fn resolve(cwd: []const u8, path: []const u8, out: *[CWD_BUF_LEN]u8) Resolve
         if (component.len == 1 and component[0] == '.') {
             continue;
         } else if (component.len == 2 and component[0] == '.' and component[1] == '.') {
-            if (write_pos > 1) {
-                write_pos -= 1;
-                while (write_pos > 0 and out[write_pos - 1] != '/') : (write_pos -= 1) {}
-            }
+            // Drop the last component and the slash before it ("/a/b" -> "/a",
+            // "/a" -> "" which becomes "/" below).
+            while (write_pos > 0 and out[write_pos - 1] != '/') : (write_pos -= 1) {}
+            if (write_pos > 0) write_pos -= 1;
         } else {
             const sep: usize = if (write_pos == 0 or out[write_pos - 1] != '/') 1 else 0;
             // Leave room for the caller's NUL terminator.

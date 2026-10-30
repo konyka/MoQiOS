@@ -881,7 +881,7 @@ pub const FdTable = struct {
         }
 
         // tmpfs: paths starting with /tmp/
-        if (name.len >= 4 and name[0] == '/' and name[1] == 't' and name[2] == 'm' and name[3] == 'p') {
+        if (name.len >= 4 and name[0] == '/' and name[1] == 't' and name[2] == 'm' and name[3] == 'p' and (name.len == 4 or name[4] == '/')) {
             const tmpfs = @import("tmpfs.zig");
             const is_dir = o_creat and (flags & 0o100000) != 0; // O_DIRECTORY
             const result = tmpfs.tmpfsOpenAuthorized(name, o_creat, is_dir, euid, egid, effective_caps, flags, requested_mode, umask_val);
@@ -2295,6 +2295,19 @@ pub fn rofsRoute(path: []const u8) ?RofsPath {
         best_len = t.len;
     }
     return best;
+}
+
+/// Is `path` (normalised) a proper ancestor of an active mount target, such
+/// as "/mnt" for a volume mounted at "/mnt/e"?
+pub fn isMountAncestor(path: []const u8) bool {
+    const lf = mount_lock.acquire();
+    defer mount_lock.release(lf);
+    for (&mount_table) |*mp| {
+        if (!mp.active) continue;
+        const t = mp.target[0..mp.target_len];
+        if (t.len > path.len and mount_path.under(t, path)) return true;
+    }
+    return false;
 }
 
 /// Mount target of rofs mount `slot`, copied into `out`; null if not mounted.
