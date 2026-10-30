@@ -7760,3 +7760,27 @@ test "udp receive policy: empty queue waits, fails with EAGAIN or delivers" {
     try std.testing.expect(up.timedOut(10, 10));
     try std.testing.expect(!up.timedOut(null, 1 << 60));
 }
+
+test "irq time: windowed maximum resets on take, boot-wide maximum stays" {
+    const p = kt.irq_time_policy;
+    var a: p.Acc = .{};
+    a.enterVec(0, true, 14);
+    a.exit(1000);
+    _ = a.takeWindow();
+    a.enterVec(2000, true, 240);
+    a.exit(2100);
+    a.enterVec(3000, true, 14);
+    a.exit(3800);
+    const w = a.takeWindow();
+    try std.testing.expectEqual(@as(u64, 800), w.cycles);
+    try std.testing.expectEqual(@as(u8, 14), w.vector);
+    try std.testing.expectEqual(@as(u64, 0), a.takeWindow().cycles);
+    try std.testing.expectEqual(@as(u64, 1000), a.max_cycles);
+    var n: p.Acc = .{};
+    n.enterVec(100, false, 32);
+    n.enterVec(150, false, 33);
+    n.exit(180);
+    n.exit(300);
+    try std.testing.expectEqual(@as(u64, 200), n.total_cycles);
+    try std.testing.expectEqual(@as(u8, 32), n.max_vector);
+}

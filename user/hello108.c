@@ -187,7 +187,7 @@ static void grandchild(void) {
     syscall1(SYS_EXIT, 0);
 }
 
-struct gaps { int64_t max; int64_t stolen; int64_t nvcsw; int64_t nivcsw; int64_t irq_us; int64_t irq_max_us; };
+struct gaps { int64_t max; int64_t stolen; int64_t nvcsw; int64_t nivcsw; int64_t irq_us; int64_t irq_max_us; int64_t irq_vec; };
 
 /* CPU0's interrupt-handler time from /proc/irqtime
  * ("cpu0 total_us=T max_us=M count=C"). -1 when unavailable. */
@@ -218,6 +218,36 @@ static void irq0(int64_t *total_us, int64_t *max_us) {
     *max_us = vals[1];
 }
 
+/* CPU0's longest single interrupt since the previous read of
+ * /proc/irqwindow ("cpu0 win_max_us=M win_vec=V win_at_ms=T"); reading starts a
+ * new window. -1 when unavailable. */
+static void irqwin0(int64_t *max_us, int64_t *vec) {
+    *max_us = -1;
+    *vec = -1;
+    int64_t fd = syscall3(SYS_OPEN, (uint64_t)"/proc/irqwindow", 0, 0);
+    if (fd < 0) return;
+    static char b[512];
+    int64_t n = syscall3(SYS_READ, (uint64_t)fd, (uint64_t)b, sizeof(b) - 1);
+    syscall1(SYS_CLOSE, (uint64_t)fd);
+    if (n <= 0) return;
+    b[n] = 0;
+    const char *keys[2] = { "win_max_us=", "win_vec=" };
+    int64_t vals[2] = { -1, -1 };
+    for (int k = 0; k < 2; k++) {
+        for (int64_t i = 0; b[i] && b[i] != '\n'; i++) {
+            int j = 0;
+            while (keys[k][j] && b[i + j] == keys[k][j]) j++;
+            if (keys[k][j]) continue;
+            int64_t v = 0;
+            for (int64_t q = i + j; b[q] >= '0' && b[q] <= '9'; q++) v = v * 10 + (b[q] - '0');
+            vals[k] = v;
+            break;
+        }
+    }
+    *max_us = vals[0];
+    *vec = vals[1];
+}
+
 /* ru_nvcsw / ru_nivcsw of this task (struct rusage longs 16 and 17). */
 static void csw(int64_t *vol, int64_t *invol) {
     int64_t ru[18];
@@ -231,10 +261,11 @@ static void csw(int64_t *vol, int64_t *invol) {
 /// time lost in gaps of at least STOLEN_MIN_NS (reaping split over several
 /// maintenance passes shows up there even when each piece is short).
 static struct gaps spin_gaps(int64_t ns) {
-    struct gaps g = { 0, 0, 0, 0, 0, 0 };
-    int64_t v0, i0, q0, qm0;
+    struct gaps g = { 0, 0, 0, 0, 0, 0, -1 };
+    int64_t v0, i0, q0, qm0, wm, wv;
     csw(&v0, &i0);
     irq0(&q0, &qm0);
+    irqwin0(&wm, &wv); /* start a fresh interrupt window */
     const int64_t start = now_ns();
     int64_t prev = start;
     while (prev - start < ns) {
@@ -258,7 +289,7 @@ static struct gaps spin_gaps(int64_t ns) {
     int64_t q1, qm1;
     irq0(&q1, &qm1);
     g.irq_us = (q0 >= 0 && q1 >= 0) ? q1 - q0 : -1;
-    g.irq_max_us = qm1;
+    irqwin0(&g.irq_max_us, &g.irq_vec); /* longest handler inside this window */
     return g;
 }
 
@@ -320,8 +351,10 @@ void _start(void) {
     print_dec(base.nivcsw);
     print(" cpu0_irq_us=");
     print_dec(base.irq_us);
-    print(" cpu0_irq_max_us=");
+    print(" cpu0_win_irq_max_us=");
     print_dec(base.irq_max_us);
+    print(" vec=");
+    print_dec(base.irq_vec);
     print("\n");
     print("hello108:   reaping  max_gap_us=");
     print_dec(win.max / 1000);
@@ -333,8 +366,10 @@ void _start(void) {
     print_dec(win.nivcsw);
     print(" cpu0_irq_us=");
     print_dec(win.irq_us);
-    print(" cpu0_irq_max_us=");
+    print(" cpu0_win_irq_max_us=");
     print_dec(win.irq_max_us);
+    print(" vec=");
+    print_dec(win.irq_vec);
     print("\n");
     if (win.max > MAX_GAP_NS || win.stolen > MAX_STOLEN_NS) {
         print("hello108: FAIL RT task lost the CPU to reaping\n");

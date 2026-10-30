@@ -1020,6 +1020,8 @@ pub const FdTable = struct {
                 pfile = .vma_stats;
             } else if (rest.len == 7 and str.eql(rest, "irqtime")) {
                 pfile = .irqtime;
+            } else if (rest.len == 9 and str.eql(rest, "irqwindow")) {
+                pfile = .irqwindow;
             } else if (rest.len > 0) {
                 // /proc/[pid]/status or /proc/[pid]/maps
                 var digit_end: usize = 0;
@@ -1382,7 +1384,7 @@ pub const FdTable = struct {
             .proc_file => {
                 const procfs = @import("procfs.zig");
                 var scratch: [4096]u8 = undefined;
-                const generated = procfs.procRead(desc.proc_file_type, desc.proc_pid, &scratch, 4096);
+                const generated = if (procfs.consumesOnRead(desc.proc_file_type) and desc.offset != 0) 0 else procfs.procRead(desc.proc_file_type, desc.proc_pid, &scratch, 4096);
                 if (desc.offset >= generated) return 0;
                 const avail = generated - @as(u32, @intCast(desc.offset));
                 const to_copy = @min(@as(u32, @intCast(count)), avail);
@@ -1633,7 +1635,7 @@ pub const FdTable = struct {
             .proc_file => {
                 const procfs = @import("procfs.zig");
                 var scratch: [4096]u8 = undefined;
-                const generated = procfs.procRead(desc.proc_file_type, desc.proc_pid, &scratch, 4096);
+                const generated = if (procfs.consumesOnRead(desc.proc_file_type) and desc.offset != 0) 0 else procfs.procRead(desc.proc_file_type, desc.proc_pid, &scratch, 4096);
                 if (offset >= generated) return 0;
                 const avail = generated - @as(u32, @intCast(offset));
                 const to_copy = @min(@as(u32, @intCast(count)), avail);

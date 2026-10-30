@@ -17,7 +17,17 @@ pub const ProcFile = enum(u8) {
     sched_stats,
     vma_stats,
     irqtime,
+    /// Longest interrupt per CPU since the previous read of this file (a read
+    /// starts a new window); `irqtime` keeps the boot-wide maxima.
+    irqwindow,
 };
+
+/// Files whose content is consumed by generating it (a read starts a new
+/// window). vfs.read must generate them only for the first read of a
+/// descriptor, otherwise the EOF read would eat the next window.
+pub fn consumesOnRead(file: ProcFile) bool {
+    return file == .irqwindow;
+}
 
 /// Generate proc file content into the provided buffer.
 /// Returns the number of bytes written (may exceed max_len, caller must handle offset).
@@ -40,6 +50,7 @@ pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
         .sched_stats => generateSchedStats(buf, max_len),
         .vma_stats => generateVmaStats(buf, max_len),
         .irqtime => generateIrqTime(buf, max_len),
+        .irqwindow => generateIrqWindow(buf, max_len),
     };
 }
 
@@ -376,6 +387,31 @@ fn generateIrqTime(buf: [*]u8, max_len: u32) u32 {
         pos = appendDec(buf, pos, max_len, a.max_vector);
         pos = appendStr(buf, pos, max_len, " max_at_ms=");
         pos = appendDec(buf, pos, max_len, p.cyclesToUs(a.max_start_tsc, mhz) / 1000);
+        pos = appendStr(buf, pos, max_len, "\n");
+    }
+    return pos;
+}
+
+fn generateIrqWindow(buf: [*]u8, max_len: u32) u32 {
+    var pos: u32 = 0;
+    if (comptime @import("builtin").cpu.arch != .x86_64) return pos;
+    const idt = @import("../arch/x86_64/idt.zig");
+    const p = @import("../arch/x86_64/irq_time_policy.zig");
+    const mhz = @import("../arch/x86_64/tsc.zig").tsc_freq_mhz;
+    const ncpu = @min(@import("../smp.zig").configured_cpu_count, idt.irq_acc.len);
+    var c: u32 = 0;
+    while (c < ncpu) : (c += 1) {
+        // Each slot is written only by its own CPU; the reset below races with
+        // at most one interrupt exit, which can only drop that one sample.
+        const w = idt.irq_acc[c].takeWindow();
+        pos = appendStr(buf, pos, max_len, "cpu");
+        pos = appendDec(buf, pos, max_len, c);
+        pos = appendStr(buf, pos, max_len, " win_max_us=");
+        pos = appendDec(buf, pos, max_len, p.cyclesToUs(w.cycles, mhz));
+        pos = appendStr(buf, pos, max_len, " win_vec=");
+        pos = appendDec(buf, pos, max_len, w.vector);
+        pos = appendStr(buf, pos, max_len, " win_at_ms=");
+        pos = appendDec(buf, pos, max_len, p.cyclesToUs(w.start_tsc, mhz) / 1000);
         pos = appendStr(buf, pos, max_len, "\n");
     }
     return pos;
