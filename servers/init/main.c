@@ -261,6 +261,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello131"); /* mmap/munmap/mprotect/mremap/brk argument rules */
     run_test("hello132"); /* clocks and sleeping */
     run_test("hello133"); /* wait status, options, orphaning, pgrp/session */
+    run_test("hello134"); /* socket flags and AF_UNIX semantics */
 
     start_persistent_services();
 

@@ -7446,3 +7446,76 @@ test "waitpid child selection: pid > 0, -1, 0 and < -1" {
     // pid == INT_MIN must not overflow when negated
     try std.testing.expect(!pp.waitMatches(@import("std").math.minInt(i32), 6, 4, 9));
 }
+
+test "socket blocking policy: EAGAIN only for non-blocking sockets, EOF and errors never block" {
+    const np = kt.namespace_policy;
+    const B = np.SockWait;
+    // empty receive queue on a blocking socket: wait; on a non-blocking one: EAGAIN
+    try std.testing.expectEqual(B.wait, np.recvWait(false, true, false));
+    try std.testing.expectEqual(B.eagain, np.recvWait(true, true, false));
+    // a peer that is gone (connected stream with a closed peer, or never connected) is EOF, never a wait
+    try std.testing.expectEqual(B.eof, np.recvWait(false, true, true));
+    try std.testing.expectEqual(B.eof, np.recvWait(true, true, true));
+    // data in the queue is always read, even when the peer is gone
+    try std.testing.expectEqual(B.proceed, np.recvWait(false, false, true));
+    // MSG_DONTWAIT behaves like O_NONBLOCK for this call only
+    try std.testing.expect(np.nonblockRequested(0x800, 0));
+    try std.testing.expect(np.nonblockRequested(0, 0x40));
+    try std.testing.expect(!np.nonblockRequested(0, 0));
+    // accept: empty backlog waits unless non-blocking
+    try std.testing.expectEqual(B.wait, np.acceptWait(false));
+    try std.testing.expectEqual(B.eagain, np.acceptWait(true));
+    // send into a full buffer waits unless non-blocking
+    try std.testing.expectEqual(B.wait, np.sendWait(false, true));
+    try std.testing.expectEqual(B.eagain, np.sendWait(true, true));
+    try std.testing.expectEqual(B.proceed, np.sendWait(false, false));
+}
+
+test "socket() argument policy: type flags, address family, protocol" {
+    const np = kt.namespace_policy;
+    // SOCK_CLOEXEC / SOCK_NONBLOCK are flags on top of the type, not a different type
+    const ok = np.socketArgs(1, 1 | 0x80000 | 0x800, 0).ok;
+    try std.testing.expectEqual(@as(u32, 1), ok.sock_type);
+    try std.testing.expect(ok.cloexec and ok.nonblock);
+    const plain = np.socketArgs(1, 2, 0).ok;
+    try std.testing.expectEqual(@as(u32, 2), plain.sock_type);
+    try std.testing.expect(!plain.cloexec and !plain.nonblock);
+    // errors
+    try std.testing.expectEqual(@as(i64, -97), np.socketArgs(99, 1, 0).err); // EAFNOSUPPORT
+    try std.testing.expectEqual(@as(i64, -22), np.socketArgs(1, 77, 0).err); // unknown type
+    try std.testing.expectEqual(@as(i64, -22), np.socketArgs(1, 1 | 0x100000, 0).err); // unknown flag bits
+    try std.testing.expectEqual(@as(i64, -93), np.socketArgs(1, 1, 5).err); // EPROTONOSUPPORT
+    try std.testing.expectEqual(@as(i64, 0), @as(i64, if (np.socketArgs(1, 1, 0) == .ok) 0 else -1));
+    // internet families keep their protocol numbers: TCP=6 with STREAM, UDP=17 with DGRAM, 0 = default
+    try std.testing.expect(np.socketArgs(2, 1, 6) == .ok);
+    try std.testing.expect(np.socketArgs(2, 2, 17) == .ok);
+    try std.testing.expectEqual(@as(i64, -93), np.socketArgs(2, 1, 17).err);
+    try std.testing.expectEqual(@as(i64, -93), np.socketArgs(2, 2, 6).err);
+    // SOCK_RAW (3) is a valid type
+    try std.testing.expect(np.socketArgs(2, 3, 1) == .ok);
+    // a bad descriptor or a non-socket: EBADF vs ENOTSOCK
+    try std.testing.expectEqual(@as(i64, -9), np.socketFdErrno(false, false));
+    try std.testing.expectEqual(@as(i64, -88), np.socketFdErrno(true, false));
+    try std.testing.expectEqual(@as(i64, 0), np.socketFdErrno(true, true));
+}
+
+test "unix stream connect: data sent before accept is kept, not refused" {
+    const np = kt.namespace_policy;
+    // A connector that is queued on a backlog but not yet accepted may already send:
+    // the bytes wait in its own pending buffer until accept pairs it.
+    try std.testing.expectEqual(np.StreamSend.queue_pending, np.streamSendState(.{ .connected = false, .queued = true }));
+    try std.testing.expectEqual(np.StreamSend.deliver, np.streamSendState(.{ .connected = true, .queued = false }));
+    try std.testing.expectEqual(np.StreamSend.not_connected, np.streamSendState(.{ .connected = false, .queued = false }));
+    // and reading from a queued, not yet accepted connector waits instead of reporting EOF
+    try std.testing.expectEqual(np.SockWait.wait, np.streamRecvState(.{ .connected = false, .queued = true }, false));
+    try std.testing.expectEqual(np.SockWait.eagain, np.streamRecvState(.{ .connected = false, .queued = true }, true));
+    try std.testing.expectEqual(np.SockWait.eof, np.streamRecvState(.{ .connected = false, .queued = false }, false));
+}
+
+test "stream send after the peer is gone is EPIPE, before any connection is ENOTCONN" {
+    const np = kt.namespace_policy;
+    try std.testing.expectEqual(@as(i64, -32), np.streamSendErrno(true, false)); // was connected, peer closed
+    try std.testing.expectEqual(@as(i64, -107), np.streamSendErrno(false, false)); // never connected
+    try std.testing.expectEqual(@as(i64, 0), np.streamSendErrno(true, true));
+    try std.testing.expectEqual(@as(i64, 0), np.streamSendErrno(false, true)); // queued: handled elsewhere
+}

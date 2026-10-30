@@ -925,6 +925,13 @@ const SchedStats = struct {
 - `EPOLL_CTL_ADD` 沿 child epoll 链（`nestedChainReaches`，visited bitmap 有界）检测间接环，构成环返回 `ELOOP`——环上就绪互相传播会使 `epoll_wait` 永久 busy-loop。（§6.51）
 - MoqIPC receive 被信号/`moqipc_notify` 踢醒时统一清理 `waiting_receiver` 注册并按唤醒来源分类返回：endpoint 失效才报 `invalid_endpoint`，存活 endpoint 的无投递唤醒报 EINTR（信号）/EAGAIN（notify）——注册残留曾让 endpoint 对所有 sender 永久报废。（§6.51）
 - `alarm`/`itimer` deadline 字段与 per-CPU run-queue 的 `nr_running` 计数全部原子访问（tick 扫描器跨 CPU 与 syscall 上下文并发）。（§6.51）
+- **AF_UNIX 与 socket() 参数（hello134）**：(1) `socket()` 此前把 `type` 整个当作类型，`SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK`（现代 libc 的默认写法）得到 EINVAL，且无视 `protocol`、未知族返回 `-38`。现在
+  `namespace_policy.socketArgs` 拆出类型与 `SOCK_CLOEXEC`/`SOCK_NONBLOCK`（作用在新描述符上），未知族 `EAFNOSUPPORT`，未知类型或未知标志位 `EINVAL`，AF_UNIX 的非零 protocol、AF_INET 的 TCP/UDP 与类型不符的 protocol
+  `EPROTONOSUPPORT`。(2) **AF_UNIX 流套接字的阻塞语义**：`read/recv/accept` 在没有数据/连接时此前直接返回 EAGAIN（`unixRecv/unixAccept` 只有非阻塞路径，等待队列有消费者却没有生产者）。新增
+  `unixRecvBlocking/unixAcceptBlocking`：在对应等待栈上阻塞，被 `send/connect/close` 唤醒后重检，`O_NONBLOCK` 或 `MSG_DONTWAIT` 才返回 EAGAIN，信号返回 EINTR；对端已关闭或从未连接是 EOF 而不是等待。(3) **connect 之后、accept 之前**
+  发送的数据此前被 ENOTCONN 拒绝：现在暂存在客户端的 `pending` 缓冲（1 KiB），`accept` 时移进服务端新套接字的环形缓冲，客户端此时阻塞的 read 也被唤醒；这种“排队中”的客户端读会等待而不是 EOF。(4) 对端关闭之后的 send 是 EPIPE，
+  从未连接过的是 ENOTCONN（`was_connected`）。(5) 坏 fd（空槽）给 `listen/shutdown/accept/bind` 是 EBADF，非套接字是 ENOTSOCK（此前一律 ENOTSOCK）；`shutdown` 现在支持 AF_UNIX（`SHUT_WR` 让对端读到 EOF，未连接 ENOTCONN）。
+  数据报套接字的消息边界、`EADDRINUSE`、`listen` 前未 `bind` 的 EINVAL、重复 `bind` 的 EINVAL、非阻塞 accept 的 EAGAIN 等已核对无误。限制：`socketpair` 仍只支持 `SOCK_STREAM`；`SHUT_WR` 目前只唤醒对端，没有给流打 EOF 标记。
 - **进程生命周期：wait 选项、选择规则、初始进程组（hello133）**：(1) `wait4`/`waitpid` 的 options 只允许定义过的位（`WNOHANG`、`WUNTRACED`、`WCONTINUED`、`__WNOTHREAD`、`__WALL`、`__WCLONE`），其余 EINVAL
   （此前任何值都被接受，`wait4(pid, 0, 0x4, 0)` 会被当成阻塞等待，进程在那里无限挂住）。(2) **子进程选择规则统一**（`proc_id_policy.waitMatches`）：`pid > 0` 指定的子进程、`-1` 任意子进程、`0` 与调用者同组的子进程、`< -1` 属于组 `-pid` 的子进程；
   扫描（`waitpidScanLocked`）与“有没有可能等到”的判断（`task.hasMatchingChild`）用同一条规则。此前 `pid == 0` 和 `pid < -1` 被当成“任意子进程”，而“有子进程”只看有没有任何子进程，

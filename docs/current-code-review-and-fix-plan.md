@@ -5368,3 +5368,15 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   改为让子进程离开本组后断言 `waitpid(0)` 为 ECHILD、`waitpid(-1)` 仍看到它，并增加 `waitpid(-pgid)`，再变异才失败。
 - 变异：`pid == 0` 改为选任意子进程 → hello133 `waitpid(0) does not select a child that left our group` FAIL，恢复后 PASS。
 - 验证：host 765/765；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL（hello58 同样 PASS）；stress（SMP=2）5/5 PASS。
+
+### AF_UNIX 与 socket() 参数（hello134）
+
+- 问题：18 项偏差。`socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK)` 是 EINVAL；阻塞的 `accept`/`read` 立即返回 EAGAIN，所以任何普通的 UNIX 域服务器（accept 之后读）都无法工作；
+  客户端 connect 成功后、服务端 accept 前发的数据被拒绝；对端关闭后写入是 ENOTCONN 而不是 EPIPE；坏 fd 一律 ENOTSOCK。
+- 修复：`namespace_policy.socketArgs/socketFdErrno/recvWait/acceptWait/sendWait/streamSendState/streamRecvState/streamSendErrno`（纯策略，host 测试）；`unix_socket.parkOn` + `unixRecvBlocking/unixAcceptBlocking/unixShutdown`；
+  客户端 `pending` 缓冲与 `was_connected`；`socket()` 拆分类型与标志。
+- 排查过程（如实）：第一轮探测有 24 项 FAIL，其中一部分是我的探测写错了——`sendto` 是 6 参数调用，我只传了 3 个，第 4–6 个寄存器里是垃圾，得到 EFAULT；`socketpair` 只支持 STREAM，数据报测试改用两个绑定的数据报套接字；
+  D0 段与 C 段重用同一个路径，第二次 bind 得到合法的 EADDRINUSE（第一个服务端还没关）。这些都修了探测，不是内核。另外一次 smoke 因为 `accept` 在服务端阻塞、而客户端先 connect 后等 accept，卡到超时，才发现“排队中”的客户端需要暂存发送数据。
+- TDD：host 新增 5 个测试先编译失败后通过；hello134（31 项）在 HEAD 上 18 项 FAIL，新内核 PASS。
+- 变异：`socket()` 重新拒绝 `SOCK_CLOEXEC|SOCK_NONBLOCK` → hello134 A 段 3 项 FAIL，恢复后 PASS。
+- 验证：host 769/769；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

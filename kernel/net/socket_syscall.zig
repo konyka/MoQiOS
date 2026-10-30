@@ -52,8 +52,25 @@ pub fn allocUnixFd(fd_table: *vfs_mod.FdTable, unix_sock_idx: u32) i32 {
 // ── Syscall implementations ────────────────────────────────────────
 
 /// socket(domain, type, protocol) → fd or -errno
-pub fn socket(domain: u32, sock_type: u32, protocol: u32) i64 {
-    _ = protocol;
+pub fn socket(domain: u32, type_and_flags: u32, protocol: u32) i64 {
+    const np = @import("../fs/namespace_policy.zig");
+    const parsed = switch (np.socketArgs(domain, type_and_flags, protocol)) {
+        .ok => |a| a,
+        .err => |e| return e,
+    };
+    const fd = socketCreate(domain, parsed.sock_type);
+    if (fd < 0) return fd;
+    // SOCK_CLOEXEC / SOCK_NONBLOCK belong to the new descriptor, not to the socket type.
+    const cur_idx = sched_mod.currentTaskIndex() orelse return fd;
+    const t = task_mod.getTask(cur_idx) orelse return fd;
+    if (fd < vfs_mod.MAX_FDS) {
+        if (parsed.cloexec) t.fd_table.fds[@intCast(fd)].fd_flags = 1;
+        if (parsed.nonblock) vfs_mod.setStatusFlags(&t.fd_table.fds[@intCast(fd)], t.fd_table.fds[@intCast(fd)].status_flags | 0x800);
+    }
+    return fd;
+}
+
+fn socketCreate(domain: u32, sock_type: u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
 
@@ -179,7 +196,8 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
 
-    if (fd >= vfs_mod.MAX_FDS) return -88; // ENOTSOCK
+    if (fd >= vfs_mod.MAX_FDS) return -9; // EBADF
+    if (t.fd_table.fds[fd].fd_type == .none) return -9;
 
     // AF_UNIX bind
     if (t.fd_table.fds[fd].fd_type == .unix_socket) {
@@ -268,7 +286,7 @@ pub fn listen(fd: u32, backlog: u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
 
-    if (fd >= vfs_mod.MAX_FDS) return -88;
+    if (fd >= vfs_mod.MAX_FDS or t.fd_table.fds[fd].fd_type == .none) return -9; // EBADF
 
     if (t.fd_table.fds[fd].fd_type == .unix_socket) {
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
@@ -293,12 +311,13 @@ pub fn accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
 
-    if (fd >= vfs_mod.MAX_FDS) return -88;
+    if (fd >= vfs_mod.MAX_FDS) return -9;
+    if (t.fd_table.fds[fd].fd_type == .none) return -9;
 
     // AF_UNIX accept
     if (t.fd_table.fds[fd].fd_type == .unix_socket) {
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
-        const new_sock_idx = net_mod.unix_socket.unixAccept(unix_idx);
+        const new_sock_idx = net_mod.unix_socket.unixAcceptBlocking(unix_idx, @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, 0));
         if (new_sock_idx < 0) return @as(i64, new_sock_idx);
         const new_fd = allocUnixFd(t.fd_table, @intCast(new_sock_idx));
         if (new_fd < 0) {
@@ -462,7 +481,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         const to_read = @min(len, 8192);
         if (!copy.validateUserBufferWritable(buf, to_read)) return -14; // EFAULT
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
-        const result = net_mod.unix_socket.unixRecv(unix_idx, &tmp_buf, to_read);
+        const result = net_mod.unix_socket.unixRecvBlocking(unix_idx, &tmp_buf, to_read, @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, flags));
         if (result > 0) {
             const copied = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf))[0..@intCast(result)], @intCast(result));
             if (copied != @as(usize, @intCast(result))) return -14; // EFAULT
@@ -724,7 +743,11 @@ pub fn shutdown(fd: u32, how: u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    if (fd >= vfs_mod.MAX_FDS or cur.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
+    if (fd >= vfs_mod.MAX_FDS or cur.fd_table.fds[fd].fd_type == .none) return -9; // EBADF
+    if (cur.fd_table.fds[fd].fd_type == .unix_socket) {
+        return net_mod.unix_socket.unixShutdown(cur.fd_table.fds[fd].unix_sock_idx, how);
+    }
+    if (cur.fd_table.fds[fd].fd_type != .tcp_socket) return -88; // ENOTSOCK
     const result = net_mod.tcp.tcpShutdown(cur.fd_table.fds[fd].tcb_idx, how);
     return result;
 }

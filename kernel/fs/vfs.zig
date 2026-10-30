@@ -1346,7 +1346,7 @@ pub const FdTable = struct {
             .unix_socket => {
                 // read() on an AF_UNIX socket drains the socket's ring buffer.
                 const unix_mod = @import("../net/unix_socket.zig");
-                return unix_mod.unixRecv(desc.unix_sock_idx, buf, count);
+                return unix_mod.unixRecvBlocking(desc.unix_sock_idx, buf, count, @import("namespace_policy.zig").nonblockRequested(desc.status_flags, 0));
             },
             .timerfd => {
                 const timerfd_mod = @import("../ipc/timerfd.zig");

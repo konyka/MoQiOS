@@ -22,6 +22,7 @@ pub const UNIX_SOCK_BUF_SIZE: u32 = 8192;
 pub const MAX_UNIX_SOCKETS: u32 = 32;
 pub const UNIX_PATH_MAX: u8 = 108;
 pub const UNIX_BACKLOG_MAX: u8 = 4;
+pub const UNIX_PENDING_MAX: u16 = 1024;
 const EPOLLERR: u32 = 0x008;
 
 /// Write `count` bytes from `src` into ring buffer at `write_pos`.
@@ -72,6 +73,13 @@ pub const UnixSocket = struct {
     buf_read: u32 = 0,
     buf_write: u32 = 0,
     buf_count: u32 = 0,
+    // Bytes a stream client sent after connect() but before the listener accepted:
+    // they wait here and move to the accepted socket's ring at accept().
+    pending: [UNIX_PENDING_MAX]u8 = @splat(0),
+    pending_len: u16 = 0,
+    /// Set on connect/accept and kept after the peer closes, so a later send says
+    /// EPIPE rather than ENOTCONN.
+    was_connected: bool = false,
     // Wait queues
     read_waiters: ?*WaitNode = null,
     write_waiters: ?*WaitNode = null,
@@ -168,12 +176,14 @@ pub fn unixSocketPair() i32 {
         .active = true,
         .sock_type = SOCK_STREAM,
         .connected = true,
+        .was_connected = true,
         .peer_idx = @intCast(second_idx),
     };
     unix_sockets[second_idx] = .{
         .active = true,
         .sock_type = SOCK_STREAM,
         .connected = true,
+        .was_connected = true,
         .peer_idx = @intCast(first_idx),
     };
     return @as(i32, @intCast(first_idx)) | (@as(i32, @intCast(second_idx)) << 8);
@@ -359,14 +369,36 @@ pub fn unixAccept(idx: u32) i32 {
         .active = true,
         .sock_type = SOCK_STREAM,
         .connected = true,
+        .was_connected = true,
         .peer_idx = @intCast(conn_idx),
     };
 
     // Mark the connector as connected to the new socket
     const conn_sock = &unix_sockets[conn_idx];
     conn_sock.connected = true;
+    conn_sock.was_connected = true;
     conn_sock.peer_idx = @intCast(new_idx);
     wake.out |= EpollWake.bit(conn_idx);
+    // A client that blocked in read() while queued can now be served.
+    {
+        var cur = conn_sock.read_waiters;
+        while (cur) |node| {
+            cur = node.next;
+            @atomicStore(bool, &node.granted, true, .release);
+            @import("../proc/task.zig").unblockTask(node.task_idx);
+        }
+        conn_sock.read_waiters = null;
+    }
+    // Bytes the client sent while it was still queued now reach the server's ring.
+    if (conn_sock.pending_len > 0) {
+        const nsock = &unix_sockets[new_idx];
+        const n: usize = conn_sock.pending_len;
+        ringWrite(&nsock.buffer, nsock.buf_write, &conn_sock.pending, n);
+        nsock.buf_write = (nsock.buf_write + @as(u32, @intCast(n))) % UNIX_SOCK_BUF_SIZE;
+        nsock.buf_count += @as(u32, @intCast(n));
+        conn_sock.pending_len = 0;
+        wake.in |= EpollWake.bit(new_idx);
+    }
 
     return @intCast(new_idx);
 }
@@ -387,7 +419,22 @@ pub fn unixSend(idx: u32, data: [*]const u8, len: usize) i64 {
     if (!sock.active) return -9; // EBADF
 
     if (sock.sock_type == SOCK_STREAM) {
-        if (!sock.connected) return -107; // ENOTCONN
+        if (!sock.connected) {
+            // connect() succeeded but the listener has not accepted yet: keep the bytes.
+            const queued = queuedOnBacklogLocked(idx);
+            switch (np.streamSendState(.{ .connected = false, .queued = queued })) {
+                .not_connected => return np.streamSendErrno(sock.was_connected, false),
+                .deliver => unreachable,
+                .queue_pending => {
+                    const room: usize = UNIX_PENDING_MAX - sock.pending_len;
+                    const n: usize = @min(len, room);
+                    if (n == 0 and len > 0) return -11; // EAGAIN
+                    @memcpy(sock.pending[sock.pending_len..][0..n], data[0..n]);
+                    sock.pending_len += @intCast(n);
+                    return @intCast(n);
+                },
+            }
+        }
         const peer_i: u32 = sock.peer_idx;
         if (peer_i >= MAX_UNIX_SOCKETS or !unix_sockets[peer_i].active) return -32; // EPIPE
 
@@ -468,7 +515,7 @@ pub fn unixRecv(idx: u32, buf: [*]u8, len: usize) i64 {
     if (sock.buf_count == 0) {
         // STREAM with no peer (never connected, or peer closed): no data can
         // ever arrive — report EOF instead of EAGAIN.
-        if (sock.sock_type == SOCK_STREAM and !sock.connected) return 0;
+        if (sock.sock_type == SOCK_STREAM and !sock.connected and !queuedOnBacklogLocked(idx)) return 0;
         return -11; // EAGAIN
     }
 
@@ -627,6 +674,142 @@ pub fn unixClose(idx: u32) void {
     }
 
     sock.* = .{};
+}
+
+
+// ── blocking wrappers ──────────────────────────────────────────────────────
+//
+// unixRecv / unixAccept / unixSend answer EAGAIN when they cannot proceed.
+// The wake side (send, connect, close) already pops waiters off the three
+// wait stacks; these wrappers are the missing producers: a blocking socket
+// parks on the stack and re-checks after every wake-up.
+
+const np = @import("../fs/namespace_policy.zig");
+
+fn unlinkWaiter(stack: *?*WaitNode, node: *WaitNode) void {
+    var prev: ?*WaitNode = null;
+    var cur = stack.*;
+    while (cur) |n| {
+        if (n == node) {
+            if (prev) |p| p.next = n.next else stack.* = n.next;
+            n.next = null;
+            return;
+        }
+        prev = n;
+        cur = n.next;
+    }
+}
+
+const WaitKind = enum { read, write, accept };
+
+/// Park the current task on `idx`'s `kind` wait stack if the socket is still
+/// in the state the caller observed. Returns 0 after a wake-up (re-check),
+/// -4 for an actionable signal, -9 if the socket vanished.
+fn parkOn(idx: u32, kind: WaitKind, expect_empty: bool) i64 {
+    const task_mod = @import("../proc/task.zig");
+    const sched = @import("../proc/sched.zig");
+    const cur_idx = sched.currentTaskIndex() orelse return -1;
+    var node: WaitNode = .{ .task_idx = cur_idx };
+    {
+        const saved = unix_lock.acquire();
+        const sock = &unix_sockets[idx];
+        if (!sock.active) {
+            unix_lock.release(saved);
+            return -9;
+        }
+        // The condition may have changed between the caller's check and now;
+        // the wake side holds this same lock, so re-testing here loses no wake-up.
+        const still = switch (kind) {
+            .read => sock.buf_count == 0 and (sock.sock_type != SOCK_STREAM or sock.connected or queuedOnBacklogLocked(idx)),
+            .accept => sock.backlog_count == 0 and sock.listening,
+            .write => expect_empty,
+        };
+        if (!still) {
+            unix_lock.release(saved);
+            return 0;
+        }
+        const stack: *?*WaitNode = switch (kind) {
+            .read => &sock.read_waiters,
+            .write => &sock.write_waiters,
+            .accept => &sock.accept_waiters,
+        };
+        node.next = stack.*;
+        stack.* = &node;
+        task_mod.blockTask(cur_idx);
+        unix_lock.release(saved);
+    }
+
+    asm volatile ("int $240");
+    sched.repairCurrentAfterBlock();
+
+    {
+        const saved = unix_lock.acquire();
+        const sock = &unix_sockets[idx];
+        const stack: *?*WaitNode = switch (kind) {
+            .read => &sock.read_waiters,
+            .write => &sock.write_waiters,
+            .accept => &sock.accept_waiters,
+        };
+        unlinkWaiter(stack, &node);
+        unix_lock.release(saved);
+    }
+    if (task_mod.getTask(cur_idx)) |ct| {
+        const sig_mod = @import("../proc/signal.zig");
+        if (sig_mod.pendingFatal(ct)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+        if (sig_mod.pendingActionable(ct)) return -4;
+    }
+    return 0;
+}
+
+/// read/recv that waits for data when `nonblock` is false.
+pub fn unixRecvBlocking(idx: u32, buf: [*]u8, len: usize, nonblock: bool) i64 {
+    while (true) {
+        const r = unixRecv(idx, buf, len);
+        if (r != -11 or nonblock) return r;
+        const w = parkOn(idx, .read, true);
+        if (w != 0) return w;
+    }
+}
+
+/// accept that waits for a connection when `nonblock` is false.
+pub fn unixAcceptBlocking(idx: u32, nonblock: bool) i32 {
+    while (true) {
+        const r = unixAccept(idx);
+        if (r != -11 or nonblock) return r;
+        const w = parkOn(idx, .accept, true);
+        if (w != 0) return @intCast(w);
+    }
+}
+
+/// shutdown(how): SHUT_RD(0) / SHUT_WR(1) / SHUT_RDWR(2). A stream's peer sees
+/// EOF after SHUT_WR; an unconnected socket is ENOTCONN.
+pub fn unixShutdown(idx: u32, how: u32) i64 {
+    if (how > 2) return -22;
+    if (idx >= MAX_UNIX_SOCKETS) return -9;
+    var wake: EpollWake = .{};
+    defer wake.fire();
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+    const sock = &unix_sockets[idx];
+    if (!sock.active) return -9;
+    if (!sock.connected) return -107; // ENOTCONN
+    if (how == 0) return 0;
+    // SHUT_WR / SHUT_RDWR: the peer reads EOF from now on. Closing the sending
+    // direction is modelled by disconnecting the peer's view of this socket.
+    if (sock.peer_idx < MAX_UNIX_SOCKETS) {
+        const peer = &unix_sockets[sock.peer_idx];
+        if (peer.active and peer.peer_idx == @as(u8, @intCast(idx))) {
+            wake.hup |= EpollWake.bit(sock.peer_idx);
+            var cur = peer.read_waiters;
+            while (cur) |node| {
+                cur = node.next;
+                @atomicStore(bool, &node.granted, true, .release);
+                @import("../proc/task.zig").unblockTask(node.task_idx);
+            }
+            peer.read_waiters = null;
+        }
+    }
+    return 0;
 }
 
 fn purgeFromBacklogsLocked(idx: u32) void {

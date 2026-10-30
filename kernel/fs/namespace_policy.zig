@@ -120,3 +120,86 @@ pub fn dupFdFlags(source_flags: u32, want_cloexec: bool) u32 {
 pub fn pipeStatusFlags(write_end: bool) u32 {
     return if (write_end) 1 else 0;
 }
+
+/// What a socket operation that cannot make progress right now should do.
+pub const SockWait = enum { proceed, wait, eagain, eof };
+
+/// MSG_DONTWAIT (0x40) on this call, or O_NONBLOCK (0x800) on the descriptor.
+pub fn nonblockRequested(status_flags: u32, msg_flags: u32) bool {
+    return (status_flags & 0x800) != 0 or (msg_flags & 0x40) != 0;
+}
+
+/// Receive with an empty queue. `peer_gone`: a stream whose peer is closed or
+/// never connected can never get data, which is end-of-file and never a wait.
+pub fn recvWait(nonblock: bool, queue_empty: bool, peer_gone: bool) SockWait {
+    if (!queue_empty) return .proceed;
+    if (peer_gone) return .eof;
+    return if (nonblock) .eagain else .wait;
+}
+
+/// accept with an empty backlog.
+pub fn acceptWait(nonblock: bool) SockWait {
+    return if (nonblock) .eagain else .wait;
+}
+
+/// Send when the peer's buffer may be full.
+pub fn sendWait(nonblock: bool, buffer_full: bool) SockWait {
+    if (!buffer_full) return .proceed;
+    return if (nonblock) .eagain else .wait;
+}
+
+pub const SocketArgs = struct { sock_type: u32, cloexec: bool, nonblock: bool };
+
+const SOCK_NONBLOCK_FLAG: u32 = 0x800;
+const SOCK_CLOEXEC_FLAG: u32 = 0x80000;
+
+/// socket(domain, type, protocol): split the type from its SOCK_CLOEXEC /
+/// SOCK_NONBLOCK flags and validate the combination as Linux does.
+pub fn socketArgs(domain: u32, type_and_flags: u32, protocol: u32) union(enum) { ok: SocketArgs, err: i64 } {
+    if (domain != 1 and domain != 2 and domain != 10) return .{ .err = -97 }; // EAFNOSUPPORT
+    const flags = SOCK_NONBLOCK_FLAG | SOCK_CLOEXEC_FLAG;
+    if ((type_and_flags & ~(flags | 0xf)) != 0) return .{ .err = -22 };
+    const t = type_and_flags & 0xf;
+    if (t < 1 or t > 3) return .{ .err = -22 }; // STREAM, DGRAM, RAW
+    if (domain == 1) {
+        if (t == 3) return .{ .err = -22 };
+        if (protocol != 0) return .{ .err = -93 }; // EPROTONOSUPPORT
+    } else if (t == 1) {
+        if (protocol != 0 and protocol != 6) return .{ .err = -93 };
+    } else if (t == 2) {
+        if (protocol != 0 and protocol != 17) return .{ .err = -93 };
+    }
+    return .{ .ok = .{ .sock_type = t, .cloexec = (type_and_flags & SOCK_CLOEXEC_FLAG) != 0, .nonblock = (type_and_flags & SOCK_NONBLOCK_FLAG) != 0 } };
+}
+
+/// The errno for a descriptor argument of a socket call.
+pub fn socketFdErrno(fd_open: bool, is_socket: bool) i64 {
+    if (!fd_open) return -9; // EBADF
+    return if (is_socket) 0 else -88; // ENOTSOCK
+}
+
+pub const StreamView = struct { connected: bool, queued: bool };
+pub const StreamSend = enum { deliver, queue_pending, not_connected };
+
+/// A stream client whose connect() succeeded but which the listener has not
+/// accepted yet is `queued`: it may send (the bytes wait for accept) and its
+/// reads must wait. Only a socket that is neither connected nor queued is
+/// really unconnected (ENOTCONN on send, EOF on read).
+pub fn streamSendState(v: StreamView) StreamSend {
+    if (v.connected) return .deliver;
+    return if (v.queued) .queue_pending else .not_connected;
+}
+
+pub fn streamRecvState(v: StreamView, nonblock: bool) SockWait {
+    if (v.connected) return if (nonblock) .eagain else .wait;
+    if (v.queued) return if (nonblock) .eagain else .wait;
+    return .eof;
+}
+
+/// send() on a stream socket that is not delivering. A socket that was once
+/// connected and whose peer has since closed is EPIPE; one that never was
+/// connected is ENOTCONN.
+pub fn streamSendErrno(was_connected: bool, peer_alive: bool) i64 {
+    if (peer_alive) return 0;
+    return if (was_connected) -32 else -107;
+}
