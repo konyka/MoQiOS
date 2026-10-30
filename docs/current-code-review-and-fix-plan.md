@@ -5454,3 +5454,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 变异：非终端不再返回 ENOTTY → hello141 A 段 7 项 FAIL，恢复后 PASS。
 - 验证：host 782/782；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL（shell 等使用 stdin ioctl 的测试无回归）；stress（SMP=2）5/5 PASS。
+
+### SCM_RIGHTS 传递文件描述符（hello142）
+
+- 问题：AF_UNIX 的 `sendmsg`/`recvmsg` 返回 ENOTSOCK，`msg_control` 被忽略，进程之间无法传递描述符（D-Bus、Wayland、systemd 风格的服务都依赖它）。
+- 修复：`net/scm_policy.zig`（纯策略：解析/构造 `SCM_RIGHTS`、`readPlan` 读边界）；`vfs.snapshotForPassing/installPassed/releaseDescriptor`（带引用的描述符快照、安装、归还）；`unix_socket` 增加 `rx_pos` 和 8 组在途集合池，`unixSendRights`/`unixRecvRights`/`unixRecvBlockingRights`，接收端关闭时僵尸化并在锁外 `reapZombies`；`socket_syscall` 新增 `unixSendmsg`/`unixRecvmsg`。
+- 已知差异：每组最多 8 个描述符，全系统最多 8 组在途；不支持 `SCM_CREDENTIALS`；`sendmsg` 到尚未被 `accept` 的连接（排队中）返回 ENOTCONN；只对 `SOCK_STREAM` 和已连接的 `SOCK_DGRAM` 工作，`msg_name` 被忽略；数据报的描述符集合绑定在数据报的长度前缀上，被截断读取时随之丢弃。
+- 排查过程（如实）：第一轮探测只有 `recvmsg` 无控制缓冲区时没报 `MSG_CTRUNC` 一项失败，改为总是请求集合再在 `recvmsg` 里按需释放；随后冒烟挂在 G 段，是探测的问题——G 段所有发送都失败，之后我又去读空的套接字，阻塞住了，删掉多余的读取后通过。`unixClose` 里释放描述符可能再次进入 `unix_lock`，所以集合是先打僵尸标记、解锁后再释放，并且释放前先把槽位置空，避免重入时重复释放。
+- TDD：host 新增 2 个测试（解析/构造/读边界）；hello142（35 项）在 HEAD 上 23 行 FAIL，新内核 PASS。
+
+- 变异：`readPlan` 不再在集合边界前截断 → hello142 H 段 `a read for control data stops before the bytes that carry a set` FAIL（后续检查随之无法完成），host 的 `readPlan` 测试同样失败；恢复后 PASS。
+- 验证：host 784/784；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

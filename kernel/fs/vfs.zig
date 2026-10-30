@@ -1884,7 +1884,7 @@ pub const FdTable = struct {
         }
         if (desc.fd_type == .unix_socket) {
             const unix_mod = @import("../net/unix_socket.zig");
-            unix_mod.unixClose(desc.unix_sock_idx);
+            unix_mod.unixCloseAndReap(desc.unix_sock_idx);
         }
         if (desc.fd_type == .timerfd) {
             const timerfd_mod = @import("../ipc/timerfd.zig");
@@ -2140,6 +2140,82 @@ pub fn freeFdTable(table: *FdTable) void {
     _ = @atomicRmw(u64, &fd_table_gen[slot], .Add, 1, .seq_cst);
     while (@atomicLoad(u32, &fd_table_pins[slot], .seq_cst) != 0) std.atomic.spinLoopHint();
     _ = @atomicRmw(u64, &fd_table_used, .And, ~bit, .acq_rel);
+}
+
+/// Kinds whose reference is held per descriptor (every dup'd fd owns one);
+/// all others hold one reference per distinct resource per table.
+fn refIsPerFd(t: FdType) bool {
+    return t == .pipe_read or t == .pipe_write or t == .fat32_file;
+}
+
+/// Take one more reference to the resource behind `desc`. False for kinds that
+/// are not reference counted and therefore cannot outlive their descriptor.
+fn retainResource(desc: *const FileDescriptor) bool {
+    switch (desc.fd_type) {
+        .pipe_read, .pipe_write => return pipeRetain(desc.pipe_idx, desc.fd_type == .pipe_write),
+        .ext2_file => @import("ext2.zig").retainFile(desc.ext2_file_idx),
+        .fat32_file => @import("fat32.zig").retainFile(desc.fat32_file_idx),
+        .tmpfs_file => @import("tmpfs.zig").tmpfsRetain(@intCast(desc.tmpfs_idx)),
+        .tcp_socket => @import("../net/tcp.zig").tcpRetain(desc.tcb_idx),
+        .udp_socket => @import("../net/udp.zig").retainPort(desc.udp_port),
+        .epoll => @import("../net/epoll.zig").epollRetain(desc.epoll_idx),
+        .unix_socket => @import("../net/unix_socket.zig").unixRetain(desc.unix_sock_idx),
+        .timerfd => @import("../ipc/timerfd.zig").timerfdRetain(desc.timerfd_idx),
+        .eventfd => @import("eventfd.zig").eventfdRetain(desc.eventfd_idx),
+        .ramdisk_file, .special, .devfs, .proc_file, .pidfd, .rofs_file => {},
+        else => return false,
+    }
+    return true;
+}
+
+/// Drop one reference taken by retainResource.
+fn releaseResource(desc: *const FileDescriptor) void {
+    switch (desc.fd_type) {
+        .pipe_read, .pipe_write => pipeClose(desc.pipe_idx, desc.fd_type == .pipe_write),
+        .ext2_file => @import("ext2.zig").closeFile(desc.ext2_file_idx),
+        .fat32_file => @import("fat32.zig").closeFile(desc.fat32_file_idx),
+        .tmpfs_file => @import("tmpfs.zig").tmpfsClose(@intCast(desc.tmpfs_idx)),
+        .tcp_socket => _ = @import("../net/tcp.zig").tcpClose(desc.tcb_idx),
+        .udp_socket => @import("../net/udp.zig").releasePort(desc.udp_port),
+        .epoll => @import("../net/epoll.zig").epollDestroy(desc.epoll_idx),
+        .unix_socket => @import("../net/unix_socket.zig").unixCloseAndReap(desc.unix_sock_idx),
+        .timerfd => @import("../ipc/timerfd.zig").timerfdClose(desc.timerfd_idx),
+        .eventfd => @import("eventfd.zig").eventfdClose(desc.eventfd_idx),
+        else => {},
+    }
+}
+
+/// A descriptor that was snapshotted for passing but never installed (its
+/// socket closed, or the receiver had no room): give back everything it held.
+pub fn releaseDescriptor(desc: *const FileDescriptor) void {
+    releaseResource(desc);
+    releaseOffsetSlot(desc.offset_slot);
+}
+
+/// Copy of `table.fds[fd]` for passing to another process, holding its own
+/// references (resource and shared offset). Null for a closed fd or a kind
+/// that cannot be passed.
+pub fn snapshotForPassing(table: *FdTable, fd: u32) ?FileDescriptor {
+    if (fd >= MAX_FDS or !table.acquireTransferFd(fd)) return null;
+    defer table.releaseTransferFd(fd);
+    var copy = table.fds[fd];
+    if (!retainResource(&copy)) return null;
+    copy.offset_slot = shareOffsetFor(&table.fds[fd]);
+    copy.fd_flags = 0;
+    return copy;
+}
+
+/// Install a passed descriptor into the lowest free slot of `table`; the
+/// caller still owns `desc`'s references when this returns null. A resource
+/// the table already references keeps a single reference (close tears it down
+/// once per table), so the extra one is dropped here.
+pub fn installPassed(table: *FdTable, desc: FileDescriptor, cloexec: bool) ?u32 {
+    const slot = table.allocFd() orelse return null;
+    table.fds[slot] = desc;
+    table.fds[slot].fd_flags = if (cloexec) 1 else 0;
+    table.publishFd(slot);
+    if (!refIsPerFd(desc.fd_type) and table.hasSharedRef(slot)) releaseResource(&desc);
+    return slot;
 }
 
 /// v53.44 fix: fork/clone used to copy fd tables without refcounting shared

@@ -752,6 +752,171 @@ pub fn shutdown(fd: u32, how: u32) i64 {
     return result;
 }
 
+/// Gather an iovec array into `dst`; returns the byte count or a negative errno.
+fn gatherIov(iov_ptr: u64, iov_len: u64, dst: []u8) i64 {
+    var total: usize = 0;
+    var i: usize = 0;
+    while (i < iov_len and total < dst.len) : (i += 1) {
+        var iov_buf: [16]u8 = undefined;
+        if (copy.copyFromUser(&iov_buf, @ptrFromInt(iov_ptr + @as(u64, @intCast(i)) * 16), 16) != 16) return -14;
+        const base = bo.readU64At(&iov_buf, 0);
+        const sz: usize = @intCast(@min(bo.readU64At(&iov_buf, 8), dst.len - total));
+        if (sz == 0) continue;
+        if (base == 0 or base >= 0x0000_8000_0000_0000) return -14;
+        if (copy.copyFromUser(dst[total..][0..sz], @ptrFromInt(base), sz) != sz) return -14;
+        total += sz;
+    }
+    return @intCast(total);
+}
+
+/// sendmsg on an AF_UNIX socket: the iovec bytes plus optional SCM_RIGHTS.
+fn unixSendmsg(cur: *task_mod.Task, fd: u32, msghdr: *const [56]u8) i64 {
+    const sp = @import("scm_policy.zig");
+    const iov_ptr: u64 = bo.readU64At(msghdr, 16);
+    const iov_len: u64 = bo.readU64At(msghdr, 24);
+    const ctl_ptr: u64 = bo.readU64At(msghdr, 32);
+    const ctl_len: u64 = bo.readU64At(msghdr, 40);
+    if (iov_len > 1024) return -22;
+    if (iov_len != 0 and (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000)) return -14;
+
+    var rights: net_mod.unix_socket.RightsIn = .{};
+    if (ctl_ptr != 0 and ctl_len != 0) {
+        if (ctl_len > 256 or ctl_ptr >= 0x0000_8000_0000_0000) return -22;
+        var ctl: [256]u8 = undefined;
+        const n: usize = @intCast(ctl_len);
+        if (copy.copyFromUser(ctl[0..n], @ptrFromInt(ctl_ptr), n) != n) return -14;
+        const parsed = switch (sp.parseRights(ctl[0..n])) {
+            .ok => |p| p,
+            .err => |e| return if (e == .too_many) @as(i64, -22) else @as(i64, -22),
+        };
+        for (parsed.fds[0..parsed.count]) |raw| {
+            if (raw < 0 or @as(u32, @intCast(raw)) >= vfs_mod.MAX_FDS) {
+                releaseRights(&rights);
+                return -9; // EBADF
+            }
+            const snap = vfs_mod.snapshotForPassing(cur.fd_table, @intCast(raw)) orelse {
+                releaseRights(&rights);
+                return -9; // EBADF (closed, or a kind that cannot be passed)
+            };
+            rights.descs[rights.count] = snap;
+            rights.count += 1;
+        }
+    }
+
+    var data: [8192]u8 = undefined;
+    const got = gatherIov(iov_ptr, iov_len, &data);
+    if (got < 0) {
+        releaseRights(&rights);
+        return got;
+    }
+    const idx = cur.fd_table.fds[fd].unix_sock_idx;
+    // A descriptor set rides on at least one data byte.
+    if (rights.count > 0 and got == 0) {
+        releaseRights(&rights);
+        return -22;
+    }
+    const sent = net_mod.unix_socket.unixSendRights(idx, &data, @intCast(got), &rights);
+    releaseRights(&rights); // still held only if the send did not take them
+    return sent;
+}
+
+fn releaseRights(r: *net_mod.unix_socket.RightsIn) void {
+    for (r.descs[0..r.count]) |*d| vfs_mod.releaseDescriptor(d);
+    r.count = 0;
+}
+
+/// recvmsg on an AF_UNIX socket: scatter the bytes, install received
+/// descriptors, and write the control message, msg_controllen and msg_flags.
+fn unixRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8, flags: u32) i64 {
+    const sp = @import("scm_policy.zig");
+    const iov_ptr: u64 = bo.readU64At(msghdr, 16);
+    const iov_len: u64 = bo.readU64At(msghdr, 24);
+    const ctl_ptr: u64 = bo.readU64At(msghdr, 32);
+    const ctl_len: u64 = bo.readU64At(msghdr, 40);
+    if (iov_len > 1024) return -22;
+    if (iov_len != 0 and (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000)) return -14;
+    const want_ctl = ctl_ptr != 0 and ctl_len >= sp.HDR;
+
+    // Total room across the iovecs.
+    var room: usize = 0;
+    var i: usize = 0;
+    while (i < iov_len) : (i += 1) {
+        var iov_buf: [16]u8 = undefined;
+        if (copy.copyFromUser(&iov_buf, @ptrFromInt(iov_ptr + @as(u64, @intCast(i)) * 16), 16) != 16) return -14;
+        room += @intCast(@min(bo.readU64At(&iov_buf, 8), 8192));
+        if (room >= 8192) {
+            room = 8192;
+            break;
+        }
+    }
+    if (room == 0) return 0;
+
+    var data: [8192]u8 = undefined;
+    var out: net_mod.unix_socket.RightsOut = .{};
+    const idx = cur.fd_table.fds[fd].unix_sock_idx;
+    const nonblock = @import("../fs/namespace_policy.zig").nonblockRequested(cur.fd_table.fds[fd].status_flags, flags);
+    // Always ask for the set: a receiver without a control buffer still must
+    // learn (MSG_CTRUNC) that descriptors were dropped.
+    const n = net_mod.unix_socket.unixRecvBlockingRights(idx, &data, room, nonblock, &out);
+    if (n < 0) return n;
+
+    // Scatter the bytes.
+    var done: usize = 0;
+    i = 0;
+    while (i < iov_len and done < @as(usize, @intCast(n))) : (i += 1) {
+        var iov_buf: [16]u8 = undefined;
+        if (copy.copyFromUser(&iov_buf, @ptrFromInt(iov_ptr + @as(u64, @intCast(i)) * 16), 16) != 16) break;
+        const base = bo.readU64At(&iov_buf, 0);
+        const sz: usize = @intCast(@min(bo.readU64At(&iov_buf, 8), @as(u64, @intCast(n)) - done));
+        if (sz == 0) continue;
+        if (copy.copyToUser(@ptrFromInt(base), data[done..][0..sz], sz) != sz) break;
+        done += sz;
+    }
+
+    // Install the descriptors and build the control message.
+    var out_flags: u32 = 0;
+    var written: usize = 0;
+    if (out.count > 0 and !want_ctl) {
+        for (out.descs[0..out.count]) |*d| vfs_mod.releaseDescriptor(d);
+        out_flags |= sp.MSG_CTRUNC;
+    } else if (out.count > 0) {
+        const cloexec = (flags & sp.MSG_CMSG_CLOEXEC) != 0;
+        var newfds: [sp.MAX_FDS]i32 = undefined;
+        var installed: usize = 0;
+        for (out.descs[0..out.count]) |d| {
+            if (installed >= @as(usize, @intCast(@min(ctl_len -| sp.HDR, 4 * sp.MAX_FDS))) / 4) {
+                vfs_mod.releaseDescriptor(&d);
+                out_flags |= sp.MSG_CTRUNC;
+                continue;
+            }
+            if (vfs_mod.installPassed(cur.fd_table, d, cloexec)) |slot| {
+                newfds[installed] = @intCast(slot);
+                installed += 1;
+            } else {
+                vfs_mod.releaseDescriptor(&d);
+                out_flags |= sp.MSG_CTRUNC;
+            }
+        }
+        if (installed > 0) {
+            var ctl: [256]u8 = undefined;
+            const b = sp.buildRights(newfds[0..installed], @intCast(@min(ctl_len, 256)), &ctl);
+            written = b.written;
+            if (written > 0 and copy.copyToUser(@ptrFromInt(ctl_ptr), ctl[0..written], written) != written) {
+                for (newfds[0..installed]) |nf| _ = cur.fd_table.close(@intCast(nf));
+                return -14;
+            }
+        }
+    }
+    // msg_controllen and msg_flags
+    var tail: [8]u8 = undefined;
+    bo.writeU64Le(&tail, written);
+    _ = copy.copyToUser(@ptrFromInt(msg_ptr + 40), &tail, 8);
+    var fl: [4]u8 = undefined;
+    bo.writeU32Le(&fl, out_flags);
+    _ = copy.copyToUser(@ptrFromInt(msg_ptr + 48), &fl, 4);
+    return n;
+}
+
 /// sendmsg(fd, msg_ptr, flags) → bytes sent or -errno
 pub fn sendmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
     _ = flags;
@@ -760,6 +925,11 @@ pub fn sendmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
+    if (fd < vfs_mod.MAX_FDS and cur.fd_table.fds[fd].fd_type == .unix_socket) {
+        var hdr: [56]u8 = undefined;
+        if (copy.copyFromUser(&hdr, @ptrFromInt(msg_ptr), 56) != 56) return -14;
+        return unixSendmsg(cur, fd, &hdr);
+    }
     if (fd >= vfs_mod.MAX_FDS or cur.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
 
     var msghdr_buf: [56]u8 = undefined;
@@ -795,12 +965,17 @@ pub fn sendmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
 
 /// recvmsg(fd, msg_ptr, flags) → bytes received or -errno
 pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
-    if (flags != 0) return -22;
     if (msg_ptr == 0 or msg_ptr >= 0x0000_8000_0000_0000) return -14;
 
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
+    if (fd < vfs_mod.MAX_FDS and cur.fd_table.fds[fd].fd_type == .unix_socket) {
+        var hdr: [56]u8 = undefined;
+        if (copy.copyFromUser(&hdr, @ptrFromInt(msg_ptr), 56) != 56) return -14;
+        return unixRecvmsg(cur, fd, msg_ptr, &hdr, flags);
+    }
+    if (flags != 0) return -22;
     if (fd >= vfs_mod.MAX_FDS or cur.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
 
     var msghdr_buf: [56]u8 = undefined;

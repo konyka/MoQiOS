@@ -13,6 +13,8 @@
 ///   - STREAM sockets: connect establishes a peer pair; send writes to peer's buffer
 ///   - DGRAM sockets: send writes to peer's buffer directly (no connect required if bound)
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+const vfs = @import("../fs/vfs.zig");
+const scm = @import("scm_policy.zig");
 
 pub const AF_UNIX: u32 = 1;
 pub const SOCK_STREAM: u32 = 1;
@@ -73,6 +75,9 @@ pub const UnixSocket = struct {
     buf_read: u32 = 0,
     buf_write: u32 = 0,
     buf_count: u32 = 0,
+    /// Bytes ever read out of this socket's ring: the stream position that
+    /// in-flight descriptor sets (SCM_RIGHTS) are attached to.
+    rx_pos: u64 = 0,
     // Bytes a stream client sent after connect() but before the listener accepted:
     // they wait here and move to the accepted socket's ring at accept().
     pending: [UNIX_PENDING_MAX]u8 = @splat(0),
@@ -92,6 +97,134 @@ pub const UnixSocket = struct {
 
 var unix_sockets: [MAX_UNIX_SOCKETS]UnixSocket = @splat(.{});
 var unix_lock: IrqSpinlock = .{};
+
+// ── SCM_RIGHTS: descriptors in flight ──────────────────────────────────────
+//
+// A sendmsg with SCM_RIGHTS takes a reference on each descriptor and parks the
+// copies in a set attached to the receiving socket at the stream position of
+// the message's first byte. The read that consumes that byte delivers the set;
+// a plain read, or closing the socket, releases it. Sets are pooled globally
+// (guarded by unix_lock); a set whose descriptors must be released is marked
+// zombie under the lock and reaped after it is dropped, because releasing a
+// descriptor may close a socket and take the lock again.
+
+pub const MAX_RIGHTS_SETS: usize = 8;
+pub const MAX_RIGHTS_FDS: usize = scm.MAX_FDS;
+
+const RightsSet = struct {
+    used: bool,
+    zombie: bool,
+    owner: u8,
+    pos: u64,
+    count: u8,
+    descs: [MAX_RIGHTS_FDS]vfs.FileDescriptor,
+};
+
+var rights_pool: [MAX_RIGHTS_SETS]RightsSet = undefined;
+var rights_ready: bool = false;
+
+fn rightsInitLocked() void {
+    if (rights_ready) return;
+    rights_ready = true;
+    for (&rights_pool) |*s| {
+        s.used = false;
+        s.zombie = false;
+        s.count = 0;
+    }
+}
+
+fn freeRightsSlotLocked() ?usize {
+    rightsInitLocked();
+    for (&rights_pool, 0..) |*s, i| if (!s.used) return i;
+    return null;
+}
+
+/// Descriptors handed to sendmsg (already referenced by the caller).
+pub const RightsIn = struct {
+    count: usize = 0,
+    descs: [MAX_RIGHTS_FDS]vfs.FileDescriptor = undefined,
+};
+
+/// Descriptors a recvmsg is handing back; the caller installs or releases them.
+pub const RightsOut = struct {
+    /// True when a set was attached to the bytes just read but could not be
+    /// handed over (no control buffer): the caller reports MSG_CTRUNC.
+    dropped: bool = false,
+    count: usize = 0,
+    descs: [MAX_RIGHTS_FDS]vfs.FileDescriptor = undefined,
+};
+
+/// Mark every set owned by `owner` zombie (its socket is closing).
+fn zombieOwnedLocked(owner: u32) void {
+    rightsInitLocked();
+    for (&rights_pool) |*s| {
+        if (s.used and !s.zombie and s.owner == owner) s.zombie = true;
+    }
+}
+
+/// Mark sets of `owner` that a read already passed (pos < rx_pos) zombie.
+fn zombiePassedLocked(owner: u32, rx_pos: u64) void {
+    rightsInitLocked();
+    for (&rights_pool) |*s| {
+        if (s.used and !s.zombie and s.owner == owner and s.pos < rx_pos) s.zombie = true;
+    }
+}
+
+var zombies_flag: bool = false;
+
+fn anyZombieLocked() bool {
+    for (&rights_pool) |*s| if (s.used and s.zombie) return true;
+    return false;
+}
+
+/// Release the descriptors of every zombie set and free the slots. Call with
+/// unix_lock NOT held.
+pub fn reapZombies() void {
+    if (!@atomicLoad(bool, &zombies_flag, .acquire)) return;
+    @atomicStore(bool, &zombies_flag, false, .release);
+    while (true) {
+        var victim: RightsSet = undefined;
+        var idx: usize = MAX_RIGHTS_SETS;
+        {
+            const saved = unix_lock.acquire();
+            rightsInitLocked();
+            for (&rights_pool, 0..) |*s, i| {
+                if (s.used and s.zombie) {
+                    idx = i;
+                    victim = s.*;
+                    // Free the slot before releasing: a release may close a
+                    // socket, whose own reap must not see this set again.
+                    s.used = false;
+                    s.zombie = false;
+                    break;
+                }
+            }
+            unix_lock.release(saved);
+        }
+        if (idx == MAX_RIGHTS_SETS) return;
+        for (victim.descs[0..victim.count]) |*d| vfs.releaseDescriptor(d);
+    }
+}
+
+/// Positions of the first and second queued sets for `owner` (distance from rx_pos).
+fn queuedRightsLocked(owner: u32, rx_pos: u64) struct { first: ?u64, second: ?u64, first_slot: usize } {
+    rightsInitLocked();
+    var first: ?u64 = null;
+    var second: ?u64 = null;
+    var first_slot: usize = MAX_RIGHTS_SETS;
+    for (&rights_pool, 0..) |*s, i| {
+        if (!s.used or s.zombie or s.owner != owner or s.pos < rx_pos) continue;
+        const rel = s.pos - rx_pos;
+        if (first == null or rel < first.?) {
+            second = first;
+            first = rel;
+            first_slot = i;
+        } else if (second == null or rel < second.?) {
+            second = rel;
+        }
+    }
+    return .{ .first = first, .second = second, .first_slot = first_slot };
+}
 
 /// epoll notifications collected under unix_lock and fired after it is
 /// released (epoll's pool_lock -> inst.spin never nests inside unix_lock).
@@ -408,6 +541,13 @@ pub fn unixAccept(idx: u32) i32 {
 /// For DGRAM: writes to peer's ring buffer (uses peer_idx).
 /// Returns bytes sent, or negative errno on failure.
 pub fn unixSend(idx: u32, data: [*]const u8, len: usize) i64 {
+    return unixSendRights(idx, data, len, null);
+}
+
+/// unixSend that can attach descriptors (SCM_RIGHTS). `rights.count` is set to
+/// 0 when the set was queued (ownership moved to the socket); when it is still
+/// non-zero on return the caller must release the descriptors itself.
+pub fn unixSendRights(idx: u32, data: [*]const u8, len: usize, rights: ?*RightsIn) i64 {
     if (idx >= MAX_UNIX_SOCKETS) return -9; // EBADF
 
     var wake: EpollWake = .{};
@@ -417,9 +557,11 @@ pub fn unixSend(idx: u32, data: [*]const u8, len: usize) i64 {
 
     const sock = &unix_sockets[idx];
     if (!sock.active) return -9; // EBADF
+    const carrying = if (rights) |r| r.count > 0 else false;
 
     if (sock.sock_type == SOCK_STREAM) {
         if (!sock.connected) {
+            if (carrying) return -107; // ENOTCONN: descriptors cannot wait for accept()
             // connect() succeeded but the listener has not accepted yet: keep the bytes.
             const queued = queuedOnBacklogLocked(idx);
             switch (np.streamSendState(.{ .connected = false, .queued = queued })) {
@@ -443,6 +585,13 @@ pub fn unixSend(idx: u32, data: [*]const u8, len: usize) i64 {
         // name an unrelated socket — never deliver data to it.
         if (!peer.connected or peer.peer_idx != @as(u8, @intCast(idx))) return -32; // EPIPE
         const n: usize = @min(len, UNIX_SOCK_BUF_SIZE - peer.buf_count);
+        if (carrying and n > 0) {
+            const slot = freeRightsSlotLocked() orelse return -105; // ENOBUFS
+            const r = rights.?;
+            rights_pool[slot] = .{ .used = true, .zombie = false, .owner = @intCast(peer_i), .pos = peer.rx_pos + peer.buf_count, .count = @intCast(r.count), .descs = undefined };
+            @memcpy(rights_pool[slot].descs[0..r.count], r.descs[0..r.count]);
+            r.count = 0;
+        }
         ringWrite(&peer.buffer, peer.buf_write, data, n);
         peer.buf_write = (peer.buf_write + @as(u32, @intCast(n))) % UNIX_SOCK_BUF_SIZE;
         peer.buf_count += @as(u32, @intCast(n));
@@ -470,6 +619,13 @@ pub fn unixSend(idx: u32, data: [*]const u8, len: usize) i64 {
         // For DGRAM, write the datagram length prefix (2 bytes LE) + data
         const total = 2 + len;
         if (peer.buf_count + total > UNIX_SOCK_BUF_SIZE) return -11; // EAGAIN
+        if (carrying) {
+            const slot = freeRightsSlotLocked() orelse return -105; // ENOBUFS
+            const r = rights.?;
+            rights_pool[slot] = .{ .used = true, .zombie = false, .owner = @intCast(peer_i), .pos = peer.rx_pos + peer.buf_count, .count = @intCast(r.count), .descs = undefined };
+            @memcpy(rights_pool[slot].descs[0..r.count], r.descs[0..r.count]);
+            r.count = 0;
+        }
 
         // Write length prefix (2 bytes LE)
         const dgram_len: u16 = @intCast(len);
@@ -518,6 +674,16 @@ pub fn unixReadable(idx: u32) u32 {
 }
 
 pub fn unixRecv(idx: u32, buf: [*]u8, len: usize) i64 {
+    const r = unixRecvRights(idx, buf, len, null);
+    reapZombies();
+    return r;
+}
+
+/// unixRecv that can hand descriptors back. With `out` set, a read never
+/// crosses a descriptor-set boundary (see scm.readPlan) and the set attached
+/// to the bytes it consumed lands in `out`. Without it, sets the read passes
+/// are released. Call reapZombies() afterwards (unixRecv does).
+pub fn unixRecvRights(idx: u32, buf: [*]u8, len_in: usize, out: ?*RightsOut) i64 {
     if (idx >= MAX_UNIX_SOCKETS) return -9; // EBADF
 
     var wake: EpollWake = .{};
@@ -534,11 +700,35 @@ pub fn unixRecv(idx: u32, buf: [*]u8, len: usize) i64 {
         return -11; // EAGAIN
     }
 
+    const wants = out != null;
+    const queued = queuedRightsLocked(idx, sock.rx_pos);
+    var len = len_in;
+    var deliver_slot: ?usize = null;
+    if (sock.sock_type == SOCK_STREAM) {
+        const plan = scm.readPlan(len_in, queued.first, queued.second, wants);
+        len = plan.cap;
+        if (plan.deliver) deliver_slot = queued.first_slot;
+    } else if (wants and queued.first != null and queued.first.? == 0) {
+        deliver_slot = queued.first_slot;
+    }
+    defer {
+        if (deliver_slot) |ds| {
+            const o = out.?;
+            const set = &rights_pool[ds];
+            o.count = set.count;
+            @memcpy(o.descs[0..set.count], set.descs[0..set.count]);
+            set.used = false;
+        }
+        zombiePassedLocked(idx, sock.rx_pos);
+        if (anyZombieLocked()) @atomicStore(bool, &zombies_flag, true, .release);
+    }
+
     if (sock.sock_type == SOCK_STREAM) {
         const n: usize = @min(len, sock.buf_count);
         ringRead(&sock.buffer, sock.buf_read, buf, n);
         sock.buf_read = (sock.buf_read + @as(u32, @intCast(n))) % UNIX_SOCK_BUF_SIZE;
         sock.buf_count -= @as(u32, @intCast(n));
+        sock.rx_pos += n;
 
         if (n > 0 and sock.peer_idx < MAX_UNIX_SOCKETS) {
             const peer = &unix_sockets[sock.peer_idx];
@@ -567,6 +757,7 @@ pub fn unixRecv(idx: u32, buf: [*]u8, len: usize) i64 {
         const hi = sock.buffer[sock.buf_read];
         sock.buf_read = (sock.buf_read + 1) % UNIX_SOCK_BUF_SIZE;
         sock.buf_count -= 2;
+        sock.rx_pos += 2;
         // A length prefix larger than what is buffered can only come from
         // stray bytes in the ring; never trust it past buf_count.
         const dgram_len: usize = @min(@as(usize, lo) | (@as(usize, hi) << 8), @as(usize, sock.buf_count));
@@ -575,12 +766,14 @@ pub fn unixRecv(idx: u32, buf: [*]u8, len: usize) i64 {
         ringRead(&sock.buffer, sock.buf_read, buf, to_read);
         sock.buf_read = (sock.buf_read + @as(u32, @intCast(to_read))) % UNIX_SOCK_BUF_SIZE;
         sock.buf_count -= @as(u32, @intCast(to_read));
+        sock.rx_pos += to_read;
         // Discard remaining bytes of this datagram if buf was too small
         const discard: usize = dgram_len - to_read;
         if (discard > 0) {
             const actual_discard = @min(discard, sock.buf_count);
             sock.buf_read = (sock.buf_read + @as(u32, @intCast(actual_discard))) % UNIX_SOCK_BUF_SIZE;
             sock.buf_count -= @as(u32, @intCast(actual_discard));
+            sock.rx_pos += actual_discard;
         }
         wake.out |= sendersIntoLocked(idx);
 
@@ -622,6 +815,9 @@ pub fn unixClose(idx: u32) void {
         return;
     }
     sock.ref_count = 0;
+    // Descriptors still in flight to this socket can never be received now.
+    zombieOwnedLocked(idx);
+    @atomicStore(bool, &zombies_flag, true, .release);
 
     // Wake any waiters
     {
@@ -689,6 +885,12 @@ pub fn unixClose(idx: u32) void {
     }
 
     sock.* = .{};
+}
+
+/// unixClose then release any descriptors that were in flight to the socket.
+pub fn unixCloseAndReap(idx: u32) void {
+    unixClose(idx);
+    reapZombies();
 }
 
 
@@ -778,8 +980,14 @@ fn parkOn(idx: u32, kind: WaitKind, expect_empty: bool) i64 {
 
 /// read/recv that waits for data when `nonblock` is false.
 pub fn unixRecvBlocking(idx: u32, buf: [*]u8, len: usize, nonblock: bool) i64 {
+    return unixRecvBlockingRights(idx, buf, len, nonblock, null);
+}
+
+/// unixRecvBlocking that can hand descriptors back (recvmsg).
+pub fn unixRecvBlockingRights(idx: u32, buf: [*]u8, len: usize, nonblock: bool, out: ?*RightsOut) i64 {
     while (true) {
-        const r = unixRecv(idx, buf, len);
+        const r = unixRecvRights(idx, buf, len, out);
+        reapZombies();
         if (r != -11 or nonblock) return r;
         const w = parkOn(idx, .read, true);
         if (w != 0) return w;

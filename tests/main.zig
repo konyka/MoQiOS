@@ -7658,3 +7658,47 @@ test "ioctl: terminal requests need a terminal, FIONREAD on files counts bytes a
     try std.testing.expectEqual(@as(u32, 0), ip.fileReadable(10, 10));
     try std.testing.expectEqual(@as(u32, 0), ip.fileReadable(10, 99));
 }
+
+test "scm_rights: parse and build control messages" {
+    const sp = kt.scm_policy;
+    var buf: [24]u8 = @splat(0);
+    std.mem.writeInt(u64, buf[0..8], 20, .little);
+    std.mem.writeInt(i32, buf[8..12], sp.SOL_SOCKET, .little);
+    std.mem.writeInt(i32, buf[12..16], sp.SCM_RIGHTS, .little);
+    std.mem.writeInt(i32, buf[16..20], 7, .little);
+    const r = sp.parseRights(&buf).ok;
+    try std.testing.expectEqual(@as(usize, 1), r.count);
+    try std.testing.expectEqual(@as(i32, 7), r.fds[0]);
+    std.mem.writeInt(u64, buf[0..8], 8, .little);
+    try std.testing.expect(sp.parseRights(&buf).err == .invalid);
+    std.mem.writeInt(u64, buf[0..8], 20, .little);
+    std.mem.writeInt(i32, buf[12..16], 2, .little);
+    try std.testing.expect(sp.parseRights(&buf).err == .invalid);
+
+    var out: [64]u8 = @splat(0xAA);
+    const b = sp.buildRights(&[_]i32{9}, 64, &out);
+    try std.testing.expectEqual(@as(usize, 24), b.written);
+    try std.testing.expectEqual(@as(u64, 20), std.mem.readInt(u64, out[0..8], .little));
+    try std.testing.expectEqual(@as(u8, 0), out[20]);
+    const none = sp.buildRights(&[_]i32{ 1, 2 }, 8, &out);
+    try std.testing.expect(none.truncated and none.written == 0);
+    const partial = sp.buildRights(&[_]i32{ 1, 2, 3 }, 24, &out);
+    try std.testing.expectEqual(@as(usize, 2), partial.fits);
+    try std.testing.expect(partial.truncated);
+    try std.testing.expect(sp.deliveredBy(0, 1));
+    try std.testing.expect(!sp.deliveredBy(5, 5));
+}
+
+test "scm_rights: a read for control data stops at descriptor boundaries" {
+    const sp = kt.scm_policy;
+    try std.testing.expectEqual(@as(usize, 100), sp.readPlan(100, null, null, true).cap);
+    const front = sp.readPlan(100, 10, null, true);
+    try std.testing.expectEqual(@as(usize, 10), front.cap);
+    try std.testing.expect(!front.deliver);
+    const own = sp.readPlan(100, 0, 30, true);
+    try std.testing.expectEqual(@as(usize, 30), own.cap);
+    try std.testing.expect(own.deliver);
+    const plain = sp.readPlan(100, 0, 30, false);
+    try std.testing.expectEqual(@as(usize, 100), plain.cap);
+    try std.testing.expect(!plain.deliver);
+}
