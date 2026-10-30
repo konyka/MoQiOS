@@ -11,6 +11,7 @@ pub fn Pool(comptime N: usize) type {
     return struct {
         const Self = @This();
         offsets: [N + 1]u64 = @splat(0),
+        status: [N + 1]u32 = @splat(0),
         refs: [N + 1]u16 = @splat(0),
 
         /// Move `offset` into a fresh slot with one holder. Null when the pool is full.
@@ -20,6 +21,7 @@ pub fn Pool(comptime N: usize) type {
                 if (self.refs[i] == 0) {
                     self.refs[i] = 1;
                     self.offsets[i] = offset;
+                    self.status[i] = 0;
                     return @intCast(i);
                 }
             }
@@ -44,6 +46,15 @@ pub fn Pool(comptime N: usize) type {
 
         pub fn store(self: *Self, slot: u16, v: u64) void {
             self.offsets[slot] = v;
+        }
+
+        /// File status flags (O_NONBLOCK, O_APPEND, ...) of the shared description.
+        pub fn flags(self: *const Self, slot: u16) u32 {
+            return self.status[slot];
+        }
+
+        pub fn setFlags(self: *Self, slot: u16, v: u32) void {
+            self.status[slot] = v;
         }
     };
 }

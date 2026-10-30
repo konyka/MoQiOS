@@ -62,6 +62,15 @@ pub const Policy = struct {
         return .replace;
     }
 
+    /// dup2/dup3 failure as an errno: an unopened source or a target beyond
+    /// RLIMIT_NOFILE is EBADF (the source case used to leak out as a bare -1).
+    pub fn dupExplicitErrno(r: DupExplicit) i64 {
+        return switch (r) {
+            .bad_old, .bad_target => -9, // EBADF
+            .no_op, .replace => 0,
+        };
+    }
+
     pub fn linuxAlias(is_linux: bool, syscall_nr: u64) ?LinuxAlias {
         if (!is_linux) return null;
         return switch (syscall_nr) {

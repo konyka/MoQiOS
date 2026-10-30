@@ -925,6 +925,11 @@ const SchedStats = struct {
 - `EPOLL_CTL_ADD` 沿 child epoll 链（`nestedChainReaches`，visited bitmap 有界）检测间接环，构成环返回 `ELOOP`——环上就绪互相传播会使 `epoll_wait` 永久 busy-loop。（§6.51）
 - MoqIPC receive 被信号/`moqipc_notify` 踢醒时统一清理 `waiting_receiver` 注册并按唤醒来源分类返回：endpoint 失效才报 `invalid_endpoint`，存活 endpoint 的无投递唤醒报 EINTR（信号）/EAGAIN（notify）——注册残留曾让 endpoint 对所有 sender 永久报废。（§6.51）
 - `alarm`/`itimer` deadline 字段与 per-CPU run-queue 的 `nr_running` 计数全部原子访问（tick 扫描器跨 CPU 与 syscall 上下文并发）。（§6.51）
+- **fcntl / dup / pipe 的描述符语义（hello130）**：(1) `dup2`/`dup3` 的副本此前整个拷贝源描述符，把源的 `FD_CLOEXEC` 也带过去（`dup3(.., 0)` 本应清零）；现在副本的描述符标志恰好是调用者要求的（`namespace_policy.dupFdFlags`，
+  `dup`/`dup2`/`F_DUPFD` 为 0，`dup3(O_CLOEXEC)`/`F_DUPFD_CLOEXEC` 为 `FD_CLOEXEC`）。(2) 源描述符未打开时 `dup*` 返回 EBADF（原先裸 `-1`，`rlimit.Policy.dupExplicitErrno`）。(3) **文件状态标志属于打开文件描述**：
+  `O_NONBLOCK`/`O_APPEND` 与偏移一起存在共享池的同一个槽里（`shared_offset.Pool.flags/setFlags`），`F_SETFL` 经 `vfs.setStatusFlags` 写入共享值、`F_GETFL` 经 `vfs.statusFlagsOf` 读，所以通过 dup 修改对原描述符可见；
+  读写路径在 `syncOffsetIn` 里取到最新标志。(4) 管道两端用 `pipeStatusFlags` 报告访问模式（读端 `O_RDONLY`，写端 `O_WRONLY`），`F_GETFL` 不再对两端都返回 0。管道语义（空管道非阻塞读 EAGAIN、写端全关后读 EOF、读端全关后写 EPIPE、
+  满管道非阻塞写 EAGAIN、`pipe2` 标志）已核对无误。
 - **ext2 读写一致性与偏移语义（hello129）**：ext2 的写先暂存在 writeback 缓冲里，读只在**读起点恰好等于某个暂存区起点**时才能命中；`pread` 读刚写入的数据（起点落在暂存区中间）
   于是读到旧的磁盘内容或 0，洞里的字节也不是 0。现在读路径统一走 `FdTable.ext2ReadMerged`：先读磁盘（缓冲预清零，洞读 0），再用 `writeback.overlayStaged` 把所有相交的暂存区叠上去
   （纯算术在 `fs/writeback_overlap.zig`：起点在区内、区前伸入、越过区尾、完全不相交、不回绕），`read` 与 `pread` 共用。`pread`/`pwrite` 的偏移是有符号 off_t，最高位为 1 是 EINVAL

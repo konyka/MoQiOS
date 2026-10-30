@@ -54,14 +54,15 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
             return 0;
         },
         F_GETFL => {
-            return @intCast(t.fd_table.fds[fd].status_flags);
+            return @intCast(vfs.statusFlagsOf(&t.fd_table.fds[fd]));
         },
         F_SETFL => {
             // Only O_NONBLOCK and O_APPEND can be modified via F_SETFL
             const allowed: u32 = O_NONBLOCK | O_APPEND;
             const new_flags: u32 = @as(u32, @truncate(arg)) & allowed;
             // Preserve non-modifiable bits
-            t.fd_table.fds[fd].status_flags = (t.fd_table.fds[fd].status_flags & ~allowed) | new_flags;
+            const cur_flags = vfs.statusFlagsOf(&t.fd_table.fds[fd]);
+            vfs.setStatusFlags(&t.fd_table.fds[fd], (cur_flags & ~allowed) | new_flags);
             return 0;
         },
         F_DUPFD_CLOEXEC => {

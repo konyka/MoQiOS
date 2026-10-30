@@ -7338,3 +7338,35 @@ test "shared open-file offset pool: promote, share, release, reuse" {
     // slot 0 means "private" and is never allocated
     for (held[0..n]) |s| try std.testing.expect(s != 0);
 }
+
+test "dup2/dup3 errors and descriptor flags: EBADF for a bad source, close-on-exec never inherited" {
+    const rl = kt.rlimit;
+    // a source that is not open is EBADF (it used to be a bare -1)
+    try std.testing.expectEqual(@as(i64, -9), rl.Policy.dupExplicitErrno(.bad_old));
+    try std.testing.expectEqual(@as(i64, -9), rl.Policy.dupExplicitErrno(.bad_target));
+    try std.testing.expectEqual(@as(i64, 0), rl.Policy.dupExplicitErrno(.replace));
+    // the copy's descriptor flags are exactly what the caller asked for, never the source's
+    const np = kt.namespace_policy;
+    try std.testing.expectEqual(@as(u32, 0), np.dupFdFlags(1, false));
+    try std.testing.expectEqual(@as(u32, 1), np.dupFdFlags(0, true));
+    try std.testing.expectEqual(@as(u32, 1), np.dupFdFlags(1, true));
+    // pipe ends report their access mode through F_GETFL
+    try std.testing.expectEqual(@as(u32, 0), np.pipeStatusFlags(false));
+    try std.testing.expectEqual(@as(u32, 1), np.pipeStatusFlags(true));
+}
+
+test "shared open-file description: status flags live next to the offset" {
+    const sp = kt.shared_offset;
+    var pool = sp.Pool(4){};
+    const s = pool.promote(0).?;
+    pool.setFlags(s, 0x802);
+    try std.testing.expectEqual(@as(u32, 0x802), pool.flags(s));
+    pool.retain(s);
+    pool.setFlags(s, 0x400);
+    try std.testing.expectEqual(@as(u32, 0x400), pool.flags(s));
+    _ = pool.release(s);
+    try std.testing.expect(pool.release(s));
+    // a recycled slot starts with clean flags
+    const t = pool.promote(0).?;
+    try std.testing.expectEqual(@as(u32, 0), pool.flags(t));
+}

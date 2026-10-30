@@ -502,6 +502,7 @@ fn shareOffsetFor(desc: *FileDescriptor) u16 {
     defer shared_offsets_lock.release(f);
     if (desc.offset_slot == 0) {
         const slot = shared_offsets.promote(desc.offset) orelse return 0;
+        shared_offsets.setFlags(slot, desc.status_flags);
         desc.offset_slot = slot; // the original is the first holder
     }
     shared_offsets.retain(desc.offset_slot); // the copy is the next
@@ -514,6 +515,24 @@ pub fn syncOffsetIn(desc: *FileDescriptor) void {
     const f = shared_offsets_lock.acquire();
     defer shared_offsets_lock.release(f);
     desc.offset = shared_offsets.load(desc.offset_slot);
+    desc.status_flags = shared_offsets.flags(desc.offset_slot);
+}
+
+/// F_SETFL: change the status flags of the whole open file description.
+pub fn setStatusFlags(desc: *FileDescriptor, v: u32) void {
+    desc.status_flags = v;
+    if (desc.offset_slot == 0) return;
+    const f = shared_offsets_lock.acquire();
+    defer shared_offsets_lock.release(f);
+    shared_offsets.setFlags(desc.offset_slot, v);
+}
+
+/// F_GETFL: the status flags of the whole open file description.
+pub fn statusFlagsOf(desc: *FileDescriptor) u32 {
+    if (desc.offset_slot == 0) return desc.status_flags;
+    const f = shared_offsets_lock.acquire();
+    defer shared_offsets_lock.release(f);
+    return shared_offsets.flags(desc.offset_slot);
 }
 
 /// Publish the descriptor's offset to everyone who shares it.
@@ -1910,9 +1929,9 @@ pub const FdTable = struct {
             return -24; // EMFILE
         };
 
-        self.fds[read_fd] = .{ .fd_type = .pipe_read, .pipe_idx = pipe_idx };
+        self.fds[read_fd] = .{ .fd_type = .pipe_read, .pipe_idx = pipe_idx, .status_flags = @import("namespace_policy.zig").pipeStatusFlags(false) };
         self.publishFd(read_fd);
-        self.fds[write_fd] = .{ .fd_type = .pipe_write, .pipe_idx = pipe_idx, .writable = true };
+        self.fds[write_fd] = .{ .fd_type = .pipe_write, .pipe_idx = pipe_idx, .writable = true, .status_flags = @import("namespace_policy.zig").pipeStatusFlags(true) };
         self.publishFd(write_fd);
         return @as(i64, read_fd) | (@as(i64, write_fd) << 16);
     }
@@ -1969,12 +1988,12 @@ pub const FdTable = struct {
         const old_valid = oldfd < MAX_FDS and
             slotLifecycle(@atomicLoad(u32, &self.transfer_state[oldfd], .acquire)) == SLOT_LIVE;
         switch (RlimitPolicy.dupExplicit(old_valid, oldfd, newfd, self.alloc_limit, MAX_FDS)) {
-            .bad_old => return -1,
+            .bad_old => return RlimitPolicy.dupExplicitErrno(.bad_old),
             .no_op => return newfd,
-            .bad_target => return -9, // EBADF
+            .bad_target => return RlimitPolicy.dupExplicitErrno(.bad_target),
             .replace => {},
         }
-        if (!self.acquireTransferFd(oldfd)) return -1;
+        if (!self.acquireTransferFd(oldfd)) return -9; // EBADF: closed under us
         defer self.releaseTransferFd(oldfd);
         if (!self.reserveFdForDup2(newfd)) return -9; // EBADF
         const source = self.fds[oldfd];
@@ -1988,6 +2007,7 @@ pub const FdTable = struct {
             @import("fat32.zig").retainFile(source.fat32_file_idx);
         }
         var copy = source;
+        copy.fd_flags = @import("namespace_policy.zig").dupFdFlags(source.fd_flags, false);
         copy.offset_slot = shareOffsetFor(&self.fds[oldfd]);
         self.fds[newfd] = copy;
         self.publishFd(newfd);
@@ -1996,11 +2016,11 @@ pub const FdTable = struct {
 
     /// Duplicate into the lowest available slot at or above min_fd.
     pub fn dupFdAtLeast(self: *FdTable, oldfd: u32, min_fd: u32, new_flags: u32) i64 {
-        if (oldfd >= MAX_FDS or !self.acquireTransferFd(oldfd)) return -1;
+        if (oldfd >= MAX_FDS or !self.acquireTransferFd(oldfd)) return -9; // EBADF
         defer self.releaseTransferFd(oldfd);
         const slot = self.allocFdAtLeast(min_fd) orelse return -24;
         self.fds[slot] = self.fds[oldfd];
-        self.fds[slot].fd_flags = new_flags;
+        self.fds[slot].fd_flags = @import("namespace_policy.zig").dupFdFlags(self.fds[oldfd].fd_flags, new_flags != 0);
         self.fds[slot].offset_slot = shareOffsetFor(&self.fds[oldfd]);
         if (self.fds[slot].fd_type == .pipe_read or self.fds[slot].fd_type == .pipe_write) {
             if (self.fds[slot].pipe_idx < 16)

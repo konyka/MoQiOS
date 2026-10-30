@@ -105,3 +105,18 @@ pub fn truncateTail(new_size: u32, block_size: u32) ?TailZero {
     const from = new_size % block_size;
     return .{ .block = new_size / block_size, .from = from, .len = block_size - from };
 }
+
+const FD_CLOEXEC: u32 = 1;
+
+/// Descriptor flags of a duplicate: FD_CLOEXEC is a property of the descriptor,
+/// not of the open file, so a copy gets exactly what the caller asked for and
+/// never inherits the source's bit.
+pub fn dupFdFlags(source_flags: u32, want_cloexec: bool) u32 {
+    _ = source_flags;
+    return if (want_cloexec) FD_CLOEXEC else 0;
+}
+
+/// F_GETFL access mode of a pipe end: O_RDONLY (0) for the read end, O_WRONLY (1) for the write end.
+pub fn pipeStatusFlags(write_end: bool) u32 {
+    return if (write_end) 1 else 0;
+}

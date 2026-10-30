@@ -5328,3 +5328,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 验证：host 758/758；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）3/3 PASS。
 - 变异（共享偏移）：fork 不再共享 → hello129 恰好 `a read in the forked child moves the parent's offset` FAIL（两个文件系统各一次），恢复后 PASS。
 - 验证（共享偏移）：host 759/759；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS（这项改动会碰到 shell 管道与重定向，所以多跑了两轮）。
+
+### fcntl / dup3 / pipe 描述符语义（hello130）
+
+- 问题：(1) `dup3(old, new, 0)` 给副本留下源的 `FD_CLOEXEC`——exec 之后本应保留的描述符被意外关闭；(2) `dup3`/`dup` 对未打开的源返回裸 `-1`（EPERM），应为 EBADF；
+  (3) 通过 dup 出的描述符做 `F_SETFL(O_NONBLOCK)`，原描述符看不到——状态标志被当成每个描述符私有，而 POSIX 里它们属于打开文件描述；(4) 管道读端和写端 `F_GETFL` 都报告访问模式 0。
+- 修复：`namespace_policy.dupFdFlags/pipeStatusFlags`、`rlimit.Policy.dupExplicitErrno`、共享池增加状态标志、`vfs.setStatusFlags/statusFlagsOf`、`fcntl` 的 `F_GETFL/F_SETFL` 走共享值。
+- TDD：host 新增 2 个测试（dup 标志与错误码、池里的标志）先编译失败后通过；hello130（35 项）在 HEAD 上 4 项 FAIL，新内核 PASS。其余 fcntl/pipe 行为（`F_DUPFD` 最小值、`F_DUPFD_CLOEXEC`、`O_APPEND` 经 `F_SETFL` 清除、
+  管道 EAGAIN/EOF/EPIPE、`pipe2` 标志、满管道短写）核对无误。
+- 变异：副本继承源的描述符标志 → hello130 3 项 FAIL，恢复后 PASS。
+- 验证：host 761/761；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
