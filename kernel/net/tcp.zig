@@ -862,6 +862,22 @@ pub fn tcpSetOptions(tcb_idx: u32, opts: socket_opt.SocketOptions) bool {
     return true;
 }
 
+/// True when the socket is an IPv6 (dual-stack) endpoint (SO_DOMAIN).
+pub fn tcpIsV6(tcb_idx: u32) bool {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return false;
+    return tcbs[tcb_idx].is_v6;
+}
+
+/// True when the socket is in the LISTEN state (SO_ACCEPTCONN).
+pub fn tcpIsListening(tcb_idx: u32) bool {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return false;
+    return tcbs[tcb_idx].state == .listen;
+}
+
 /// Clear SO_ERROR only if it still matches the value delivered to userspace.
 pub fn tcpClearSoErrorIfEqual(tcb_idx: u32, expected: i32) void {
     const lock_flags = tcp_lock.acquire();

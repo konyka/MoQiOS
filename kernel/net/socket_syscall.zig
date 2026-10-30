@@ -78,6 +78,7 @@ fn socketCreate(domain: u32, sock_type: u32) i64 {
         // AF_UNIX
         const sock_idx = net_mod.unix_socket.unixSocket(sock_type);
         if (sock_idx < 0) return @as(i64, sock_idx);
+        net_mod.unix_socket.unixSetCred(@intCast(sock_idx), .{ .pid = @intCast(if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid), .uid = t.euid, .gid = t.egid });
         const fd = allocUnixFd(t.fd_table, @intCast(sock_idx));
         if (fd < 0) {
             net_mod.unix_socket.unixClose(@intCast(sock_idx));
@@ -319,6 +320,7 @@ pub fn accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) i64 {
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
         const new_sock_idx = net_mod.unix_socket.unixAcceptBlocking(unix_idx, @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, 0));
         if (new_sock_idx < 0) return @as(i64, new_sock_idx);
+        net_mod.unix_socket.unixSetCred(@intCast(new_sock_idx), .{ .pid = @intCast(if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid), .uid = t.euid, .gid = t.egid });
         const new_fd = allocUnixFd(t.fd_table, @intCast(new_sock_idx));
         if (new_fd < 0) {
             net_mod.unix_socket.unixClose(@intCast(new_sock_idx));
@@ -1036,6 +1038,9 @@ pub fn socketpair(domain: u32, sock_type: u32, protocol: u32, sv_ptr: u64) i64 {
     if (pair_result < 0) return if (pair_result == -24) -24 else -12;
     const first_idx: u32 = @intCast(pair_result & 0xff);
     const second_idx: u32 = @intCast((@as(u32, @intCast(pair_result)) >> 8) & 0xff);
+    const pair_cred: @import("sockopt_policy.zig").Cred = .{ .pid = @intCast(if (cur.is_thread and cur.parent_tid != 0) cur.parent_tid else cur.tid), .uid = cur.euid, .gid = cur.egid };
+    net_mod.unix_socket.unixSetCred(first_idx, pair_cred);
+    net_mod.unix_socket.unixSetCred(second_idx, pair_cred);
     const first_fd = cur.fd_table.allocFd() orelse {
         net_mod.unix_socket.unixClose(first_idx);
         net_mod.unix_socket.unixClose(second_idx);

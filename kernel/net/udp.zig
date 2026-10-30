@@ -43,6 +43,24 @@ var queues: [MAX_PORTS][QUEUE_DEPTH]UdpEntry = @splat(@splat(.{
 }));
 var num_ports: u16 = 0;
 var udp_lock: IrqSpinlock = .{};
+/// SOL_SOCKET options per registered port (travels with the port slot).
+var port_opts: [MAX_PORTS]@import("sockopt_policy.zig").Stored = @splat(.{});
+
+/// Options of the socket bound to `port`, or null if it is not registered.
+pub fn getPortOpts(port: u16) ?@import("sockopt_policy.zig").Stored {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(port) orelse return null;
+    return port_opts[i];
+}
+
+pub fn setPortOpts(port: u16, opts: @import("sockopt_policy.zig").Stored) bool {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(port) orelse return false;
+    port_opts[i] = opts;
+    return true;
+}
 
 /// Lookup with the lock already held. Callers that use the returned index to
 /// touch `queues` MUST stay in the same critical section: releasePort's
@@ -68,6 +86,7 @@ pub fn ensurePort(port: u16) u16 {
     const idx = num_ports;
     ports[idx] = port;
     port_refs[idx] = 1;
+    port_opts[idx] = .{};
     num_ports += 1;
     return @intCast(idx);
 }
@@ -86,6 +105,7 @@ pub fn ensurePortExclusive(port: u16) u16 {
     const idx = num_ports;
     ports[idx] = port;
     port_refs[idx] = 1;
+    port_opts[idx] = .{};
     num_ports += 1;
     return @intCast(idx);
 }
@@ -118,6 +138,7 @@ pub fn releasePort(port: u16) void {
             num_ports -= 1;
             ports[i] = ports[num_ports];
             port_refs[i] = port_refs[num_ports];
+            port_opts[i] = port_opts[num_ports];
             queues[i] = queues[num_ports];
             ports[num_ports] = 0;
             port_refs[num_ports] = 0;

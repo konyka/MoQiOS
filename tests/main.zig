@@ -7702,3 +7702,40 @@ test "scm_rights: a read for control data stops at descriptor boundaries" {
     try std.testing.expectEqual(@as(usize, 100), plain.cap);
     try std.testing.expect(!plain.deliver);
 }
+
+test "sockopt policy: identity, read-only options, buffers, ucred, timeval" {
+    const p = kt.sockopt_policy;
+    try std.testing.expectEqual(@as(u32, 6), p.identity(.tcp, false).protocol);
+    try std.testing.expectEqual(@as(u32, 10), p.identity(.udp, true).domain);
+    try std.testing.expectEqual(@as(u32, 1), p.identity(.unix_stream, false).domain);
+    try std.testing.expect(p.readOnly(p.SO_TYPE) and p.readOnly(p.SO_PEERCRED));
+    try std.testing.expect(!p.readOnly(p.SO_REUSEADDR));
+    try std.testing.expectEqual(@as(?u16, 8), p.flagBit(p.SO_REUSEPORT));
+    try std.testing.expectEqual(@as(u32, 131072), p.bufferValue(65536, p.SOCK_MIN_RCVBUF));
+    try std.testing.expectEqual(p.SOCK_MIN_SNDBUF, p.bufferValue(1, p.SOCK_MIN_SNDBUF));
+    const raw = p.encodeCred(.{ .pid = 42, .uid = 7, .gid = 9 });
+    try std.testing.expectEqual(@as(u8, 42), raw[0]);
+    try std.testing.expectEqual(@as(u8, 0xFF), p.encodeCred(.{})[4]);
+    try std.testing.expectEqual(@as(?u32, 2500), p.timevalMs(2, 500_000));
+    try std.testing.expectEqual(@as(?u32, null), p.timevalMs(0, 1_000_000));
+}
+
+test "sockopt policy: applySet/encodeGet round trip and rejections" {
+    const p = kt.sockopt_policy;
+    var s: p.Stored = .{};
+    var one = [_]u8{ 1, 0, 0, 0 };
+    var out: [16]u8 = undefined;
+    const f: p.Facts = .{ .id = p.identity(.udp, false) };
+    try std.testing.expectEqual(@as(i64, 0), p.applySet(&s, p.SO_REUSEPORT, &one));
+    try std.testing.expectEqual(@as(?usize, 4), p.encodeGet(s, f, p.SO_REUSEPORT, &out));
+    try std.testing.expectEqual(@as(u8, 1), out[0]);
+    try std.testing.expectEqual(@as(i64, -92), p.applySet(&s, p.SO_TYPE, &one));
+    try std.testing.expectEqual(@as(i64, -22), p.applySet(&s, p.SO_REUSEADDR, one[0..2]));
+    var big = [_]u8{ 0x00, 0x00, 0x01, 0x00 };
+    try std.testing.expectEqual(@as(i64, 0), p.applySet(&s, p.SO_RCVBUF, &big));
+    _ = p.encodeGet(s, f, p.SO_RCVBUF, &out);
+    try std.testing.expectEqual(@as(u32, 131072), std.mem.readInt(u32, out[0..4], .little));
+    const cred_f: p.Facts = .{ .id = p.identity(.unix_stream, false), .cred = .{ .pid = 5, .uid = 6, .gid = 7 } };
+    try std.testing.expectEqual(@as(?usize, 12), p.encodeGet(s, cred_f, p.SO_PEERCRED, &out));
+    try std.testing.expectEqual(@as(?usize, null), p.encodeGet(s, f, p.SO_PEERCRED, &out));
+}

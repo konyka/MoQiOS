@@ -5465,3 +5465,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 变异：`readPlan` 不再在集合边界前截断 → hello142 H 段 `a read for control data stops before the bytes that carry a set` FAIL（后续检查随之无法完成），host 的 `readPlan` 测试同样失败；恢复后 PASS。
 - 验证：host 784/784；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### socket 选项覆盖所有套接字类型（hello143）
+
+- 问题：`setsockopt`/`getsockopt` 只对 TCP 套接字有效；UDP、AF_UNIX、raw 套接字 ENOTSOCK，已关闭的 fd 也是 ENOTSOCK 而非 EBADF；缺少 `SO_TYPE/SO_DOMAIN/SO_PROTOCOL/SO_ACCEPTCONN/SO_PEERCRED/SO_REUSEPORT/SO_BROADCAST/SO_DEBUG`。
+- 修复：新增 `net/sockopt_policy.zig`（纯策略：`Stored`/`Facts`/`applySet`/`encodeGet`、缓冲区大小规则、`ucred` 编码、timeval 换算）；`socket_opt` 的两个入口先按描述符种类解析（EBADF/ENOTSOCK），再分发到 TCP（保留 SOL_TCP 与 `SO_ERROR` 清除）、UDP（`udp.port_opts`）、AF_UNIX（`unix_socket.opts`/`cred`）、raw；`tcpIsListening/tcpIsV6` 供 `SO_ACCEPTCONN/SO_DOMAIN`；AF_UNIX 在创建/accept/socketpair 时记录凭据。
+- 已知差异：`SO_RCVBUF/SO_SNDBUF` 只保存数值，TCP/UDP/AF_UNIX 实际缓冲区大小不随之变化；`SO_RCVTIMEO/SO_SNDTIMEO` 只有 TCP 的 `recv` 真正使用，UDP 与 AF_UNIX 保存但不生效；`SO_LINGER` 只有 TCP 生效；`SO_REUSEPORT` 不改变 bind 行为；`SO_PEERCRED` 的凭据取套接字创建（或 accept）时的 euid/egid，不是 `connect` 时。
+- 排查过程（如实）：探测一次写完 37 项，对新实现一次通过，没有需要修的失败；唯一的取舍是 `getsockopt` 在较小缓冲区下写回的 `optlen` 取实际复制的长度（沿用 Linux 对大多数选项的行为），而旧 TCP 路径写回的是选项本身的长度。现在 SOL_SOCKET 层面（所有套接字类型）统一为实际复制的长度；`IPPROTO_TCP` 层的选项仍走旧路径、写回选项本身的长度，这是遗留的不一致。
+- TDD：host 新增 2 个测试（identity/只读/缓冲区/ucred/timeval，applySet/encodeGet 往返与拒绝）；hello143（37 个检查点，AF_UNIX 与 UDP 复用同一组 15 项通用检查）在 HEAD 上 47 行 FAIL，新内核 PASS。
+
+- 变异：缓冲区大小规则由“乘 2”改成“除以 2” → hello143 的 `SO_RCVBUF/SO_SNDBUF is at least what was asked` 在 AF_UNIX、UDP 两种套接字上都 FAIL（host 测试同样失败），恢复后 PASS。
+- 验证：host 786/786；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）第一次 5 轮中第 5 轮出现 `hello108` 的已知间歇性失败（基线最大间隔 949 µs，回收窗口最大间隔 3761 µs，超过 3000 µs 的预算，窗口内 CPU0 中断总耗时 5.4 ms，最长单次中断 89 ms 发生在开机早期，向量 14，与既有的“缺页路径关中断读盘”限制一致）；本改动不涉及调度/回收，立即重跑 5 轮全部 PASS。没有为此放宽 hello108 的阈值。

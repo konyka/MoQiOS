@@ -44,6 +44,8 @@ pub const SocketOptions = struct {
     keep_idle: u32 = 7200, // seconds before first keepalive probe
     keep_intvl: u32 = 75, // seconds between keepalive probes
     keep_cnt: u32 = 9, // number of keepalive probes before dropping
+    /// SO_REUSEPORT / SO_BROADCAST / SO_DEBUG bits (sockopt_policy.flagBit).
+    extra_flags: u16 = 0,
     so_error: i32 = 0,
     linger_on: bool = false,
     linger_sec: u32 = 0,
@@ -76,10 +78,83 @@ fn resolveTcpIdx(fd: u64) ?u32 {
 
 // v53.14: resolveTcpOpts removed — use resolveTcpIdx + tcpGetOptions/tcpSetOptions instead
 
+// ─── Dispatch by socket kind ──────────────────────────────────────────────
+//
+// SOL_SOCKET options live in sockopt_policy.Stored for UDP and AF_UNIX
+// sockets and in the TCB (SocketOptions) for TCP; the policy module defines
+// the semantics for all of them. IPPROTO_TCP options exist only on TCP.
+
+const sp = @import("sockopt_policy.zig");
+
+const SockRef = union(enum) {
+    tcp: u32,
+    udp: u16,
+    unix: u32,
+    raw,
+};
+
+/// The socket behind `fd`: EBADF (-9) for a closed / out-of-range descriptor,
+/// ENOTSOCK (-88) for anything that is not a socket.
+fn resolveSocket(fd: u64) union(enum) { ok: SockRef, err: i64, v6: SockRef } {
+    const vfs_mod = @import("../fs/vfs.zig");
+    if (fd >= vfs_mod.MAX_FDS) return .{ .err = -9 };
+    const sched_mod = @import("../proc/sched.zig");
+    const task_mod = @import("../proc/task.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse return .{ .err = -9 };
+    const t = task_mod.getTask(cur_idx) orelse return .{ .err = -9 };
+    const d = &t.fd_table.fds[@intCast(fd)];
+    return switch (d.fd_type) {
+        .none => .{ .err = -9 },
+        .tcp_socket => .{ .ok = .{ .tcp = d.tcb_idx } },
+        .udp_socket => if (d.udp_is_v6) .{ .v6 = .{ .udp = d.udp_port } } else .{ .ok = .{ .udp = d.udp_port } },
+        .unix_socket => .{ .ok = .{ .unix = d.unix_sock_idx } },
+        .raw_socket => .{ .ok = .raw },
+        else => .{ .err = -88 },
+    };
+}
+
+fn readOptval(optval_ptr: u64, optlen: u64, buf: *[16]u8) i64 {
+    const copy_mod = @import("../mm/copy_from_user.zig");
+    if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT
+    if (optlen == 0) return -22; // EINVAL
+    const n: usize = @intCast(@min(optlen, buf.len));
+    if (copy_mod.copyFromUser(buf[0..n], @ptrFromInt(optval_ptr), n) != n) return -14;
+    return @intCast(n);
+}
+
+fn storedFromTcp(o: SocketOptions) sp.Stored {
+    return .{
+        .flags = (if (o.reuse_addr) @as(u16, 1) else 0) | (if (o.keep_alive) @as(u16, 2) else 0) | o.extra_flags,
+        .rcv_ms = o.rcv_timeout_ms,
+        .snd_ms = o.snd_timeout_ms,
+        .rcvbuf = o.rcv_buf_size,
+        .sndbuf = o.snd_buf_size,
+        .linger_on = o.linger_on,
+        .linger_sec = o.linger_sec,
+    };
+}
+
+fn applyStoredToTcp(o: *SocketOptions, st: sp.Stored) void {
+    o.reuse_addr = st.flags & 1 != 0;
+    o.keep_alive = st.flags & 2 != 0;
+    o.extra_flags = st.flags & ~@as(u16, 3);
+    o.rcv_timeout_ms = st.rcv_ms;
+    o.snd_timeout_ms = st.snd_ms;
+    o.rcv_buf_size = st.rcvbuf;
+    o.snd_buf_size = st.sndbuf;
+    o.linger_on = st.linger_on;
+    o.linger_sec = st.linger_sec;
+}
+
+fn currentCred() sp.Cred {
+    const sched_mod = @import("../proc/sched.zig");
+    const t = sched_mod.currentTask() orelse return .{};
+    return .{ .pid = @intCast(if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid), .uid = t.euid, .gid = t.egid };
+}
+
 // ─── setsockopt syscall ───────────────────────────────────────────────────
 
-pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen: u64) i64 {
-    const tcb_idx = resolveTcpIdx(fd) orelse return -88; // ENOTSOCK
+fn setTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen: u64) i64 {
     const tcp_mod = @import("tcp.zig");
     // v53.14: Work on a copy, write back under lock at the end — no raw pointer escape
     var opts = tcp_mod.tcpGetOptions(tcb_idx) orelse return -88;
@@ -213,8 +288,7 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
 
 // ─── getsockopt syscall ───────────────────────────────────────────────────
 
-pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_ptr: u64) i64 {
-    const tcb_idx = resolveTcpIdx(fd) orelse return -88; // ENOTSOCK
+fn getTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen_ptr: u64) i64 {
     const tcp_mod = @import("tcp.zig");
     // v53.14: Work on a locked copy — no raw pointer escape
     const opts = tcp_mod.tcpGetOptions(tcb_idx) orelse return -88;
@@ -328,5 +402,121 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
         tcp_mod.tcpClearSoErrorIfEqual(tcb_idx, opts.so_error);
     }
 
+    return 0;
+}
+
+// ─── public entry points ──────────────────────────────────────────────────
+
+pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen: u64) i64 {
+    const ref: SockRef = switch (resolveSocket(fd)) {
+        .ok, .v6 => |r| r,
+        .err => |e| return e,
+    };
+    if (level != SOL_SOCKET and level != SOL_TCP) return -92; // ENOPROTOOPT
+    switch (ref) {
+        .tcp => |idx| {
+            if (level == SOL_SOCKET and sp.flagBit(optname) != null and optname != SO_REUSEADDR and optname != SO_KEEPALIVE) {
+                // The bits TCP keeps in extra_flags (REUSEPORT / BROADCAST / DEBUG).
+                var raw: [16]u8 = undefined;
+                const n = readOptval(optval_ptr, optlen, &raw);
+                if (n < 0) return n;
+                const tcp_mod = @import("tcp.zig");
+                var o = tcp_mod.tcpGetOptions(idx) orelse return -9;
+                var st = storedFromTcp(o);
+                const rc = sp.applySet(&st, optname, raw[0..@intCast(n)]);
+                if (rc != 0) return rc;
+                applyStoredToTcp(&o, st);
+                return if (tcp_mod.tcpSetOptions(idx, o)) 0 else -9;
+            }
+            if (level == SOL_SOCKET and sp.readOnly(optname)) return -92;
+            return setTcpSockopt(idx, level, optname, optval_ptr, optlen);
+        },
+        .udp => |port| {
+            if (level != SOL_SOCKET) return -92;
+            var raw: [16]u8 = undefined;
+            const n = readOptval(optval_ptr, optlen, &raw);
+            if (n < 0) return n;
+            const udp_mod = @import("udp.zig");
+            var st = udp_mod.getPortOpts(port) orelse return -9;
+            const rc = sp.applySet(&st, optname, raw[0..@intCast(n)]);
+            if (rc != 0) return rc;
+            return if (udp_mod.setPortOpts(port, st)) 0 else -9;
+        },
+        .unix => |idx| {
+            if (level != SOL_SOCKET) return -92;
+            var raw: [16]u8 = undefined;
+            const n = readOptval(optval_ptr, optlen, &raw);
+            if (n < 0) return n;
+            const um = @import("unix_socket.zig");
+            const view = um.unixOptView(idx) orelse return -9;
+            var st = view.opts;
+            const rc = sp.applySet(&st, optname, raw[0..@intCast(n)]);
+            if (rc != 0) return rc;
+            return if (um.unixSetOpts(idx, st)) 0 else -9;
+        },
+        .raw => {
+            if (level != SOL_SOCKET) return -92;
+            var raw: [16]u8 = undefined;
+            const n = readOptval(optval_ptr, optlen, &raw);
+            if (n < 0) return n;
+            var st: sp.Stored = .{};
+            return sp.applySet(&st, optname, raw[0..@intCast(n)]);
+        },
+    }
+}
+
+pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_ptr: u64) i64 {
+    const resolved = resolveSocket(fd);
+    const ref: SockRef = switch (resolved) {
+        .ok, .v6 => |r| r,
+        .err => |e| return e,
+    };
+    const v6 = resolved == .v6;
+    if (level != SOL_SOCKET and level != SOL_TCP) return -92; // ENOPROTOOPT
+    // TCP keeps its own SOL_TCP set and its SO_ERROR clearing.
+    if (ref == .tcp and level == SOL_TCP) return getTcpSockopt(ref.tcp, level, optname, optval_ptr, optlen_ptr);
+    if (level != SOL_SOCKET) return -92;
+
+    const copy_mod = @import("../mm/copy_from_user.zig");
+    if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14;
+    if (optlen_ptr == 0 or optlen_ptr >= 0x0000_8000_0000_0000) return -14;
+    if (!copy_mod.validateUserBuffer(optlen_ptr, 4) or !copy_mod.validateUserBufferWritable(optlen_ptr, 4)) return -14;
+    var len_buf: [4]u8 = undefined;
+    if (copy_mod.copyFromUser(&len_buf, @ptrFromInt(optlen_ptr), 4) != 4) return -14;
+    const user_optlen = bo.readU32Le(&len_buf);
+
+    var stored: sp.Stored = .{};
+    var facts: sp.Facts = .{ .id = sp.identity(.raw, v6) };
+    var tcp_idx: ?u32 = null;
+    switch (ref) {
+        .tcp => |idx| {
+            const tcp_mod = @import("tcp.zig");
+            const o = tcp_mod.tcpGetOptions(idx) orelse return -9;
+            stored = storedFromTcp(o);
+            facts = .{ .id = sp.identity(.tcp, tcp_mod.tcpIsV6(idx)), .accepting = tcp_mod.tcpIsListening(idx), .so_error = o.so_error };
+            tcp_idx = idx;
+        },
+        .udp => |port| {
+            stored = @import("udp.zig").getPortOpts(port) orelse return -9;
+            facts = .{ .id = sp.identity(.udp, v6) };
+        },
+        .unix => |idx| {
+            const view = @import("unix_socket.zig").unixOptView(idx) orelse return -9;
+            stored = view.opts;
+            facts = .{ .id = sp.identity(if (view.stream) .unix_stream else .unix_dgram, false), .accepting = view.listening, .cred = view.peer_cred };
+        },
+        .raw => {},
+    }
+
+    var val: [16]u8 = undefined;
+    const val_len = sp.encodeGet(stored, facts, optname, &val) orelse return -92;
+    const to_copy = @min(val_len, user_optlen);
+    if (to_copy > 0 and copy_mod.copyToUser(@ptrFromInt(optval_ptr), val[0..to_copy], to_copy) != to_copy) return -14;
+    var len_out: [4]u8 = undefined;
+    bo.writeU32Le(&len_out, @intCast(to_copy));
+    if (copy_mod.copyToUser(@ptrFromInt(optlen_ptr), &len_out, 4) != 4) return -14;
+    if (optname == SO_ERROR) {
+        if (tcp_idx) |idx| @import("tcp.zig").tcpClearSoErrorIfEqual(idx, facts.so_error);
+    }
     return 0;
 }

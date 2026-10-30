@@ -78,6 +78,9 @@ pub const UnixSocket = struct {
     /// Bytes ever read out of this socket's ring: the stream position that
     /// in-flight descriptor sets (SCM_RIGHTS) are attached to.
     rx_pos: u64 = 0,
+    /// SOL_SOCKET options and the creator's credentials (SO_PEERCRED).
+    opts: @import("sockopt_policy.zig").Stored = .{},
+    cred: @import("sockopt_policy.zig").Cred = .{},
     // Bytes a stream client sent after connect() but before the listener accepted:
     // they wait here and move to the accepted socket's ring at accept().
     pending: [UNIX_PENDING_MAX]u8 = @splat(0),
@@ -320,6 +323,42 @@ pub fn unixSocketPair() i32 {
         .peer_idx = @intCast(first_idx),
     };
     return @as(i32, @intCast(first_idx)) | (@as(i32, @intCast(second_idx)) << 8);
+}
+
+/// Record the credentials of the process that created / accepted socket `idx`.
+pub fn unixSetCred(idx: u32, cred: @import("sockopt_policy.zig").Cred) void {
+    if (idx >= MAX_UNIX_SOCKETS) return;
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+    if (unix_sockets[idx].active) unix_sockets[idx].cred = cred;
+}
+
+pub const OptView = struct {
+    opts: @import("sockopt_policy.zig").Stored,
+    stream: bool,
+    listening: bool,
+    peer_cred: ?@import("sockopt_policy.zig").Cred,
+};
+
+/// Snapshot of the option-relevant state of socket `idx`.
+pub fn unixOptView(idx: u32) ?OptView {
+    if (idx >= MAX_UNIX_SOCKETS) return null;
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+    const sock = &unix_sockets[idx];
+    if (!sock.active) return null;
+    var peer: ?@import("sockopt_policy.zig").Cred = null;
+    if (sock.peer_idx < MAX_UNIX_SOCKETS and unix_sockets[sock.peer_idx].active) peer = unix_sockets[sock.peer_idx].cred;
+    return .{ .opts = sock.opts, .stream = sock.sock_type == SOCK_STREAM, .listening = sock.listening, .peer_cred = peer orelse .{} };
+}
+
+pub fn unixSetOpts(idx: u32, opts: @import("sockopt_policy.zig").Stored) bool {
+    if (idx >= MAX_UNIX_SOCKETS) return false;
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+    if (!unix_sockets[idx].active) return false;
+    unix_sockets[idx].opts = opts;
+    return true;
 }
 
 /// Add a cross-process reference (fork/clone fd-table copy).
