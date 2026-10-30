@@ -7,6 +7,7 @@
 /// into a 4 KB kernel bounce buffer and written to the destination, never
 /// crossing the user/kernel boundary.
 const vfs = @import("vfs.zig");
+const vfs_mod = vfs;
 const tcp = @import("../net/tcp.zig");
 const copy = @import("../mm/copy_from_user.zig");
 const dac = @import("dac.zig");
@@ -348,7 +349,7 @@ pub fn sysSendfile(out_fd: u32, in_fd: u32, offset_ptr: u64, count: u64) i64 {
         update_user_offset = true;
     } else {
         // Use the fd's current offset
-        offset = fd_table.fds[in_fd].offset;
+        offset = vfs_mod.offsetOf(&fd_table.fds[in_fd]);
     }
 
     // The file implementations use 32-bit offsets. Check the requested
@@ -373,7 +374,7 @@ pub fn sysSendfile(out_fd: u32, in_fd: u32, offset_ptr: u64, count: u64) i64 {
 
     // An explicit offset is independent of the open file description's
     // position. Only the NULL-offset form advances the descriptor offset.
-    if (!update_user_offset) fd_table.fds[in_fd].offset = offset;
+    if (!update_user_offset) vfs_mod.setOffsetOf(&fd_table.fds[in_fd], offset);
 
     // Write back the new offset even when no bytes were accepted. The pointer
     // was preflighted above, and a writeback fault must not be hidden.
@@ -498,7 +499,7 @@ fn spliceFileToPipe(fd_table: *vfs.FdTable, file_fd: u32, off_in: u64, pipe_fd: 
         offset = readUserOffset(off_in) orelse return EFAULT;
         update_user_offset = true;
     } else {
-        offset = fd_table.fds[file_fd].offset;
+        offset = vfs_mod.offsetOf(&fd_table.fds[file_fd]);
     }
 
     if (offset > 0xFFFF_FFFF or len > 0xFFFF_FFFF - offset) return EINVAL;
@@ -550,7 +551,7 @@ fn spliceFileToPipe(fd_table: *vfs.FdTable, file_fd: u32, off_in: u64, pipe_fd: 
     }
 
     if (!update_user_offset) {
-        fd_table.fds[file_fd].offset = offset;
+        vfs_mod.setOffsetOf(&fd_table.fds[file_fd], offset);
     } else if (!writeUserOffset(off_in, offset)) {
         return if (total > 0) total else EFAULT;
     }
@@ -559,7 +560,7 @@ fn spliceFileToPipe(fd_table: *vfs.FdTable, file_fd: u32, off_in: u64, pipe_fd: 
 
 /// pipe → file: read from pipe, write to file.
 fn splicePipeToFile(fd_table: *vfs.FdTable, pipe_fd: u32, file_fd: u32, off_out: u64, len: u64, flags: u32) i64 {
-    var file_offset = fd_table.fds[file_fd].offset;
+    var file_offset = vfs_mod.offsetOf(&fd_table.fds[file_fd]);
     var explicit_offset = false;
     if (off_out != 0) {
         file_offset = readUserOffset(off_out) orelse return EFAULT;
@@ -597,7 +598,7 @@ fn splicePipeToFile(fd_table: *vfs.FdTable, pipe_fd: u32, file_fd: u32, off_out:
 
             const accepted = @min(nwritten, @as(i64, @intCast(to_write)));
             _ = vfs.pipeCommitRead(reservation, @intCast(accepted));
-            file_offset = if (explicit_offset) read_state else fd_table.fds[file_fd].offset;
+            file_offset = if (explicit_offset) read_state else vfs_mod.offsetOf(&fd_table.fds[file_fd]);
             if (explicit_offset) file_offset = read_state + @as(u64, @intCast(accepted));
             total += accepted;
             const done: u64 = @intCast(accepted);

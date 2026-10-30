@@ -930,7 +930,10 @@ const SchedStats = struct {
   （纯算术在 `fs/writeback_overlap.zig`：起点在区内、区前伸入、越过区尾、完全不相交、不回绕），`read` 与 `pread` 共用。`pread`/`pwrite` 的偏移是有符号 off_t，最高位为 1 是 EINVAL
   （`namespace_policy.positionedOffsetErrno`）。`truncate`/`ftruncate` 缩小后，保留的最后一块里超出新大小的字节现在会清零（`namespace_policy.truncateTail` + `ext2.zeroTruncatedTail`），
   否则之后再扩大会把已“删除”的数据读回来。`lseek`（SEEK_SET/CUR/END、负位置/非法 whence EINVAL、坏 fd EBADF）、`O_APPEND`、`O_TRUNC`、只读描述符 `ftruncate` 失败在 ext2 与 tmpfs 上都已核对无误。
-  **未做**：`dup` 出的描述符与原描述符不共享偏移（每个槽位各存一份 `offset`）；POSIX 要求共享同一个打开文件描述，需要引入共享的 open-file description，记入待办。
+  **dup/fork 共享打开文件描述的偏移（已补）**：`dup`、`dup2/3`、`fcntl(F_DUPFD)` 与 `fork`/`clone`（复制 fd 表）之后，两端读写同一个位置。实现为 `fs/shared_offset.zig` 的带引用计数的偏移池（512 项，
+  池满时退回各自私有偏移）：描述符第一次被复制时，它的 `offset` 被“升格”进池，原件与副本都带上同一个 `offset_slot`；`read`/`write`/`lseek`/`getdents` 在操作前后用 `syncOffsetIn/Out`
+  与池同步，`close` 释放持有；`aio`、`splice`、`copy_file_range` 通过 `offsetOf/setOffsetOf` 读写。适用的描述符种类：ramdisk、FAT32、ext2、tmpfs、只读卷、procfs 文件；管道/套接字没有偏移。
+  同时 `ftruncate` 不再把文件偏移截到新长度内（POSIX 不改偏移）。限制：同一个描述被两个进程在两个 CPU 上同时读写时，读-改-写不是原子的（与本内核其它描述符状态一致）。
 - **read/write/rename/readlink 与超长路径的错误码（hello128）**：`write()`/`pwrite()` 对不可写描述符（含只读打开的目录）现在是 EBADF（原先裸 `-1`=EPERM），`FdTable.write`
   入口统一经 `namespace_policy.writeGate`；`read()` 目录是 EISDIR（ext2 之前会返回 8 字节目录内容，tmpfs 返回 0）；`readlink` 对存在但不是符号链接的名字是 EINVAL
   （`ext2.readlinkPath` 区分 `not_symlink`/`missing`，tmpfs 存在的条目也是 EINVAL）；`rename` 源不存在是 ENOENT（原先被改写成 EXDEV，现在只有 FAT32 根下的名字才保留 EXDEV），

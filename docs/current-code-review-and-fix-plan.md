@@ -5320,8 +5320,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修复：`fs/writeback_overlap.zig`（纯区间相交）、`writeback.overlayStaged`、`FdTable.ext2ReadMerged`（read 与 pread 共用）、`namespace_policy.positionedOffsetErrno`、
   `namespace_policy.truncateTail` 与 `ext2.zeroTruncatedTail`（truncateFile、truncateByInode 缩小路径）。
 - TDD：host 新增 3 个测试（区间相交、偏移符号、尾部清零）先编译失败后通过；hello129（ext2 与 tmpfs 各 28 项）在 HEAD 上 5 项 FAIL，新内核 PASS。
-- **已知偏差、未修**：`dup` 不共享偏移。`FileDescriptor` 里每个槽位自带一份 `offset`，`dup`/`fork` 复制的是值；POSIX 要求 `dup`、`fork` 之后两端共享同一个打开文件描述（含偏移与状态标志）。
-  正确做法是把 offset/status_flags 挪到一个带引用计数的共享对象里，会触及 `fork`、`dup*`、`close`、`aio`、`splice`、`copy_file_range` 等所有直接读写 `fds[i].offset` 的路径（约 55 处），单独成一个任务。
-  hello129 里相应的断言先去掉，并在源码里留了说明，不把它算作通过。
+- **dup/fork 不共享偏移——已修复（同一轮后续提交）**：`FileDescriptor` 新增 `offset_slot`，偏移被升格进 `shared_offset.Pool` 后由所有复制品共用；
+  `FdTable.read/write`、`lseek`、`getdents`、`aio`、`splice`、`copy_file_range` 都经过 `syncOffsetIn/Out` 或 `offsetOf/setOffsetOf`。
+  host 测试（池的升格/共享/释放/复用/耗尽）先编译失败后通过；hello129 恢复 dup 断言并加了 fork、独立 open、关闭副本后位置保持三项，
+  在 HEAD 上 4 项（×2 个文件系统）FAIL，新内核 PASS。`ftruncate` 顺带不再改文件偏移。
 - 变异：暂存区相交只认“起点相同”→ hello129 的 `pread reads at its own offset` FAIL，恢复后 PASS。
 - 验证：host 758/758；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）3/3 PASS。
+- 变异（共享偏移）：fork 不再共享 → hello129 恰好 `a read in the forked child moves the parent's offset` FAIL（两个文件系统各一次），恢复后 PASS。
+- 验证（共享偏移）：host 759/759；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS（这项改动会碰到 shell 管道与重定向，所以多跑了两轮）。

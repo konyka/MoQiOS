@@ -3484,6 +3484,8 @@ fn syscallLseek(fd: u32, offset: u64, whence: u32) i64 {
     if (fd >= vfs_mod.MAX_FDS) return -9; // EBADF
     const desc = &cur.fd_table.fds[fd];
     if (desc.fd_type == .none) return -9;
+    vfs_mod.syncOffsetIn(desc);
+    defer vfs_mod.syncOffsetOut(desc);
     // offset of a rofs directory is the getdents resume cookie, not a byte
     // position; only rewinding it (lseek(fd, 0, SEEK_SET)) is meaningful.
     if (desc.fd_type == .rofs_file and desc.rofs_is_dir) {
@@ -3813,7 +3815,6 @@ fn truncateDesc(desc: *vfs_mod.FileDescriptor, length: u64) i64 {
         else => return -22, // EINVAL — ramdisk/proc and special fds are not truncatable
     }
     desc.file_size = new_size;
-    if (desc.offset > new_size) desc.offset = new_size;
     return 0;
 }
 

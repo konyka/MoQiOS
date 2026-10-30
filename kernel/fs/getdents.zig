@@ -23,6 +23,10 @@ pub fn getdents64(fd: u32, buf_ptr: u64, buf_size: u64) i64 {
     const desc = &cur.fd_table.fds[fd];
     if (desc.fd_type == .none) return -9;
 
+    // A directory cursor is part of the open file description: dup()/fork() share it.
+    vfs_mod.syncOffsetIn(desc);
+    defer vfs_mod.syncOffsetOut(desc);
+
     // ext2 directory
     if (desc.fd_type == .ext2_file) {
         return getdents64Ext2(desc, buf_ptr, buf_size);

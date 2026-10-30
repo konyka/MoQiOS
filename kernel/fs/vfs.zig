@@ -479,10 +479,77 @@ pub fn pipeClose(pipe_idx: u32, write_end: bool) void {
     epoll_c.epollNotify(.pipe_write, pipe_idx, epoll_c.EPOLLERR);
 }
 
+
+// ── shared open-file offsets (dup/fork) ────────────────────────────────────
+const shared_offset = @import("shared_offset.zig");
+var shared_offsets: shared_offset.Pool(512) = .{};
+var shared_offsets_lock: IrqSpinlock = .{};
+
+/// Descriptor kinds whose position is a byte offset into a regular object.
+fn usesSharedOffset(t: FdType) bool {
+    return switch (t) {
+        .ramdisk_file, .fat32_file, .ext2_file, .tmpfs_file, .rofs_file, .proc_file => true,
+        else => false,
+    };
+}
+
+/// Make `desc` share its offset with the descriptor about to be copied from
+/// it, and count that copy as a holder. Returns the slot the copy must carry
+/// (0 = copy privately: not an offset-bearing kind, or the pool is full).
+fn shareOffsetFor(desc: *FileDescriptor) u16 {
+    if (!usesSharedOffset(desc.fd_type)) return 0;
+    const f = shared_offsets_lock.acquire();
+    defer shared_offsets_lock.release(f);
+    if (desc.offset_slot == 0) {
+        const slot = shared_offsets.promote(desc.offset) orelse return 0;
+        desc.offset_slot = slot; // the original is the first holder
+    }
+    shared_offsets.retain(desc.offset_slot); // the copy is the next
+    return desc.offset_slot;
+}
+
+/// Bring the descriptor's offset up to date with the shared one (no-op for a private offset).
+pub fn syncOffsetIn(desc: *FileDescriptor) void {
+    if (desc.offset_slot == 0) return;
+    const f = shared_offsets_lock.acquire();
+    defer shared_offsets_lock.release(f);
+    desc.offset = shared_offsets.load(desc.offset_slot);
+}
+
+/// Publish the descriptor's offset to everyone who shares it.
+pub fn syncOffsetOut(desc: *FileDescriptor) void {
+    if (desc.offset_slot == 0) return;
+    const f = shared_offsets_lock.acquire();
+    defer shared_offsets_lock.release(f);
+    shared_offsets.store(desc.offset_slot, desc.offset);
+}
+
+/// The current position of `desc`, shared or private.
+pub fn offsetOf(desc: *FileDescriptor) u64 {
+    syncOffsetIn(desc);
+    return desc.offset;
+}
+
+/// Set the position of `desc`; a shared position changes for everyone who shares it.
+pub fn setOffsetOf(desc: *FileDescriptor, v: u64) void {
+    desc.offset = v;
+    syncOffsetOut(desc);
+}
+
+fn releaseOffsetSlot(slot: u16) void {
+    if (slot == 0) return;
+    const f = shared_offsets_lock.acquire();
+    defer shared_offsets_lock.release(f);
+    _ = shared_offsets.release(slot);
+}
+
 /// Open file descriptor.
 pub const FileDescriptor = struct {
     fd_type: FdType = .none,
     offset: u64 = 0,
+    /// Nonzero: the offset lives in `shared_offsets` and is common to every
+    /// descriptor that came from dup()/fork() of the same open file.
+    offset_slot: u16 = 0,
     file_size: u64 = 0,
     file_data: u64 = 0,
     fat32_file_idx: u32 = 0,
@@ -705,6 +772,9 @@ pub const FdTable = struct {
             child.free_bm = child_free_bm;
             for (0..MAX_FDS) |i| {
                 if (!held[i]) continue;
+                // fork shares the open file description: promote the parent's offset
+                // (once) and give the child the same slot.
+                snapshot[i].offset_slot = shareOffsetFor(&self.fds[i]);
                 child.installInheritedFd(@intCast(i), snapshot[i], self.fd_generations[i]);
                 switch (snapshot[i].fd_type) {
                     .pipe_read, .pipe_write => {
@@ -1146,6 +1216,18 @@ pub const FdTable = struct {
     /// Returns number of bytes read, 0 on EOF, -1 on error.
     pub fn read(self: *FdTable, fd: u32, buf: [*]u8, count: usize) i64 {
         if (fd >= MAX_FDS) return -1;
+        const d = &self.fds[fd];
+        // A shared offset is read-modify-written around the operation. Two
+        // processes reading one description at once could still interleave
+        // their updates; that matches this kernel's other descriptor state.
+        syncOffsetIn(d);
+        const r = self.readInner(fd, buf, count);
+        syncOffsetOut(d);
+        return r;
+    }
+
+    fn readInner(self: *FdTable, fd: u32, buf: [*]u8, count: usize) i64 {
+        if (fd >= MAX_FDS) return -1;
         const desc = &self.fds[fd];
         if (!@import("dac.zig").descriptorCanRead(desc.status_flags)) return -9; // EBADF
 
@@ -1353,6 +1435,15 @@ pub const FdTable = struct {
     /// Write to a file descriptor from a kernel buffer.
     /// Returns number of bytes written, -1 on error.
     pub fn write(self: *FdTable, fd: u32, buf: [*]const u8, count: usize) i64 {
+        if (fd >= MAX_FDS) return -9;
+        const d = &self.fds[fd];
+        syncOffsetIn(d);
+        const r = self.writeInner(fd, buf, count);
+        syncOffsetOut(d);
+        return r;
+    }
+
+    fn writeInner(self: *FdTable, fd: u32, buf: [*]const u8, count: usize) i64 {
         if (fd >= MAX_FDS) return -9; // EBADF
         const desc = &self.fds[fd];
         if (desc.fd_type == .none) return -9;
@@ -1707,6 +1798,9 @@ pub const FdTable = struct {
         const flags = self.slot_locks[fd].acquire();
         var desc = self.fds[fd];
         const fd_generation = self.fd_generations[fd];
+        // This descriptor stops holding its shared offset (the slot is reusable
+        // once every holder is gone).
+        releaseOffsetSlot(desc.offset_slot);
         // Elect the owner while this slot is still CLOSING. CLEANING is an
         // owner marker, not another live reference: a peer that closes after
         // this decision must drop its slot rather than skip teardown too.
@@ -1893,7 +1987,9 @@ pub const FdTable = struct {
         if (source.fd_type == .fat32_file) {
             @import("fat32.zig").retainFile(source.fat32_file_idx);
         }
-        self.fds[newfd] = source;
+        var copy = source;
+        copy.offset_slot = shareOffsetFor(&self.fds[oldfd]);
+        self.fds[newfd] = copy;
         self.publishFd(newfd);
         return newfd;
     }
@@ -1905,6 +2001,7 @@ pub const FdTable = struct {
         const slot = self.allocFdAtLeast(min_fd) orelse return -24;
         self.fds[slot] = self.fds[oldfd];
         self.fds[slot].fd_flags = new_flags;
+        self.fds[slot].offset_slot = shareOffsetFor(&self.fds[oldfd]);
         if (self.fds[slot].fd_type == .pipe_read or self.fds[slot].fd_type == .pipe_write) {
             if (self.fds[slot].pipe_idx < 16)
                 _ = pipeRetain(self.fds[slot].pipe_idx, self.fds[slot].fd_type == .pipe_write);

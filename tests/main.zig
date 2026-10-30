@@ -7306,3 +7306,35 @@ test "truncate tail zeroing: bytes past the new size in the last kept block must
     // 4 KiB blocks
     try std.testing.expectEqual(np.TailZero{ .block = 0, .from = 100, .len = 3996 }, np.truncateTail(100, 4096).?);
 }
+
+test "shared open-file offset pool: promote, share, release, reuse" {
+    const sp = kt.shared_offset;
+    var pool = sp.Pool(4){};
+    // A private descriptor (slot 0) keeps its own offset; promoting moves it into the pool.
+    const a = pool.promote(100).?;
+    try std.testing.expect(a != 0);
+    try std.testing.expectEqual(@as(u64, 100), pool.load(a));
+    pool.store(a, 250);
+    try std.testing.expectEqual(@as(u64, 250), pool.load(a));
+    // sharing bumps the count; both holders see one offset
+    pool.retain(a);
+    pool.store(a, 300);
+    try std.testing.expectEqual(@as(u64, 300), pool.load(a));
+    // releasing one holder keeps the slot, the last release frees it
+    try std.testing.expect(!pool.release(a));
+    try std.testing.expectEqual(@as(u64, 300), pool.load(a));
+    try std.testing.expect(pool.release(a));
+    // a freed slot is reused and starts from the new offset
+    const b = pool.promote(7).?;
+    try std.testing.expectEqual(@as(u64, 7), pool.load(b));
+    // exhaustion returns null, and a held slot is never handed out twice
+    var held: [4]u16 = undefined;
+    var n: usize = 0;
+    var p2 = sp.Pool(4){};
+    while (p2.promote(0)) |s| : (n += 1) held[n] = s;
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expect(p2.promote(0) == null);
+    for (held[0..n], 0..) |s, i| for (held[0..n], 0..) |t, j| if (i != j) try std.testing.expect(s != t);
+    // slot 0 means "private" and is never allocated
+    for (held[0..n]) |s| try std.testing.expect(s != 0);
+}

@@ -48,6 +48,8 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_EXIT      2
 #define SYS_OPEN      9
 #define SYS_READ      10
+#define SYS_WAITPID   6
+#define SYS_FORK      57
 #define SYS_CLOSE     11
 #define SYS_FSTAT     110
 #define SYS_UNLINK    87
@@ -137,9 +139,35 @@ static void suite(const char *tag, const char *path) {
     int64_t d = syscall1(SYS_DUP, (uint64_t)fd);
     check(d >= 0, "dup");
     check(syscall3(SYS_READ, (uint64_t)fd, (uint64_t)b, 2) == 2, "read 2 through the original");
-    /* POSIX: the dup shares the offset (SEEK_CUR == 2). Needs shared open-file
-     * descriptions; tracked in docs/current-code-review-and-fix-plan.md. */
+    check(syscall3(SYS_LSEEK, (uint64_t)d, 0, SEEK_CUR) == 2, "the dup shares the offset");
+    check(syscall3(SYS_READ, (uint64_t)d, (uint64_t)b, 1) == 1 && syscall3(SYS_LSEEK, (uint64_t)fd, 0, SEEK_CUR) == 3, "reading through the dup moves the original too");
+    check(syscall3(SYS_LSEEK, (uint64_t)fd, 6, SEEK_SET) == 6 && syscall3(SYS_LSEEK, (uint64_t)d, 0, SEEK_CUR) == 6, "lseek through the original moves the dup");
+
+    /* an independent open() of the same file keeps its own offset */
+    {
+        int64_t other = syscall3(SYS_OPEN, (uint64_t)path, O_RDONLY, 0);
+        check(other >= 0 && syscall3(SYS_LSEEK, (uint64_t)other, 0, SEEK_CUR) == 0, "a separate open() starts at 0, not at the dup's offset");
+        if (other >= 0) syscall1(SYS_CLOSE, (uint64_t)other);
+    }
+    /* after the dup is closed the original still works and keeps the position */
+    check(syscall3(SYS_LSEEK, (uint64_t)fd, 0, SEEK_CUR) == 6, "the position survives closing the dup (checked before close)");
     syscall1(SYS_CLOSE, (uint64_t)d);
+    check(syscall3(SYS_LSEEK, (uint64_t)fd, 0, SEEK_CUR) == 6, "and after it");
+    check(syscall3(SYS_READ, (uint64_t)fd, (uint64_t)b, 1) == 1, "reads keep working");
+    /* fork: parent and child share the description */
+    {
+        check(syscall3(SYS_LSEEK, (uint64_t)fd, 0, SEEK_SET) == 0, "rewind before fork");
+        int64_t pid = syscall1(SYS_FORK, 0);
+        if (pid == 0) {
+            char c[2];
+            syscall3(SYS_READ, (uint64_t)fd, (uint64_t)c, 2);
+            syscall1(SYS_EXIT, 0);
+            for (;;) {}
+        }
+        int status = 0;
+        syscall3(SYS_WAITPID, (uint64_t)pid, (uint64_t)&status, 0);
+        check(syscall3(SYS_LSEEK, (uint64_t)fd, 0, SEEK_CUR) == 2, "a read in the forked child moves the parent's offset");
+    }
     syscall1(SYS_CLOSE, (uint64_t)fd);
 
     /* O_APPEND and O_TRUNC */

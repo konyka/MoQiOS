@@ -4,6 +4,7 @@
 const copy = @import("../mm/copy_from_user.zig");
 const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
+const vfs_mod = @import("vfs.zig");
 
 const EBADF: i64 = -9;
 const EFAULT: i64 = -14;
@@ -54,14 +55,14 @@ pub fn copyFileRange(fd_in: u32, off_in_ptr: u64, fd_out: u32, off_out_ptr: u64,
 
     // Explicit offsets temporarily replace the descriptor positions. Restore both
     // descriptor offsets from one cleanup path, including all error returns.
-    const orig_in = cur.fd_table.fds[fd_in].offset;
-    const orig_out = cur.fd_table.fds[fd_out].offset;
+    const orig_in = vfs_mod.offsetOf(&cur.fd_table.fds[fd_in]);
+    const orig_out = vfs_mod.offsetOf(&cur.fd_table.fds[fd_out]);
     defer {
-        if (use_off_in) cur.fd_table.fds[fd_in].offset = orig_in;
-        if (use_off_out) cur.fd_table.fds[fd_out].offset = orig_out;
+        if (use_off_in) vfs_mod.setOffsetOf(&cur.fd_table.fds[fd_in], orig_in);
+        if (use_off_out) vfs_mod.setOffsetOf(&cur.fd_table.fds[fd_out], orig_out);
     }
-    if (use_off_in) cur.fd_table.fds[fd_in].offset = off_in_val;
-    if (use_off_out) cur.fd_table.fds[fd_out].offset = off_out_val;
+    if (use_off_in) vfs_mod.setOffsetOf(&cur.fd_table.fds[fd_in], off_in_val);
+    if (use_off_out) vfs_mod.setOffsetOf(&cur.fd_table.fds[fd_out], off_out_val);
 
     // Copy in 8KB chunks
     const n: usize = @intCast(@min(len, 0x7FFFFFFF));
@@ -81,13 +82,13 @@ pub fn copyFileRange(fd_in: u32, off_in_ptr: u64, fd_out: u32, off_out_ptr: u64,
 
     // Write back updated offsets if pointer was provided
     if (use_off_in) {
-        const new_off = cur.fd_table.fds[fd_in].offset;
+        const new_off = vfs_mod.offsetOf(&cur.fd_table.fds[fd_in]);
         var buf: [8]u8 = @bitCast(new_off);
         // Data already copied is observable, so preserve its partial-copy result.
         if (copy.copyToUser(@ptrFromInt(off_in_ptr), &buf, 8) != 8) return if (total > 0) @intCast(total) else EFAULT;
     }
     if (use_off_out) {
-        const new_off = cur.fd_table.fds[fd_out].offset;
+        const new_off = vfs_mod.offsetOf(&cur.fd_table.fds[fd_out]);
         var buf: [8]u8 = @bitCast(new_off);
         if (copy.copyToUser(@ptrFromInt(off_out_ptr), &buf, 8) != 8) return if (total > 0) @intCast(total) else EFAULT;
     }

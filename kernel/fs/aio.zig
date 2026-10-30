@@ -223,7 +223,8 @@ pub fn ioCancel(ctx_id: u64, iocb: u64, result: u64) i64 {
 
 fn executePread(iocb: *const IoCb) i64 {
     const sched_mod = @import("../proc/sched.zig");
-    const task_mod = @import("../proc/task.zig");
+    const vfs_mod = @import("vfs.zig");
+const task_mod = @import("../proc/task.zig");
     const copy_mod = @import("../mm/copy_from_user.zig");
 
     const cur_idx = sched_mod.currentTaskIndex() orelse return EINVAL;
@@ -237,8 +238,8 @@ fn executePread(iocb: *const IoCb) i64 {
     if (iocb.aio_offset < 0) return EINVAL;
 
     // Save offset, set to requested position, read via VFS, restore
-    const saved_offset = cur.fd_table.fds[fd].offset;
-    cur.fd_table.fds[fd].offset = @intCast(iocb.aio_offset);
+    const saved_offset = vfs_mod.offsetOf(&cur.fd_table.fds[fd]);
+    vfs_mod.setOffsetOf(&cur.fd_table.fds[fd], @intCast(iocb.aio_offset));
 
     var remaining: usize = @intCast(@min(iocb.aio_nbytes, 0x7FFFFFFF));
     var total: usize = 0;
@@ -259,11 +260,12 @@ fn executePread(iocb: *const IoCb) i64 {
         if (n < @as(i64, @intCast(chunk)) or written < @as(usize, @intCast(n))) break;
     }
 
-    cur.fd_table.fds[fd].offset = saved_offset;
+    vfs_mod.setOffsetOf(&cur.fd_table.fds[fd], saved_offset);
     return @intCast(total);
 }
 
 fn executePwrite(iocb: *const IoCb) i64 {
+    const vfs_mod = @import("vfs.zig");
     const sched_mod = @import("../proc/sched.zig");
     const task_mod = @import("../proc/task.zig");
     const copy_mod = @import("../mm/copy_from_user.zig");
@@ -279,8 +281,8 @@ fn executePwrite(iocb: *const IoCb) i64 {
     if (iocb.aio_offset < 0) return EINVAL;
 
     // Save offset, set to requested position, write via VFS, restore
-    const saved_offset = cur.fd_table.fds[fd].offset;
-    cur.fd_table.fds[fd].offset = @intCast(iocb.aio_offset);
+    const saved_offset = vfs_mod.offsetOf(&cur.fd_table.fds[fd]);
+    vfs_mod.setOffsetOf(&cur.fd_table.fds[fd], @intCast(iocb.aio_offset));
 
     var remaining: usize = @intCast(@min(iocb.aio_nbytes, 0x7FFFFFFF));
     var total: usize = 0;
@@ -299,7 +301,7 @@ fn executePwrite(iocb: *const IoCb) i64 {
         if (n < @as(i64, @intCast(copied))) break;
     }
 
-    cur.fd_table.fds[fd].offset = saved_offset;
+    vfs_mod.setOffsetOf(&cur.fd_table.fds[fd], saved_offset);
     return @intCast(total);
 }
 
