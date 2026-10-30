@@ -143,6 +143,35 @@ pub fn acceptWait(nonblock: bool) SockWait {
 }
 
 /// Send when the peer's buffer may be full.
+/// What a stream write loop does after one attempt put `result` bytes (or a
+/// negative errno) into the peer's ring, `done` bytes already sent of `total`.
+/// Blocking writes keep going until everything is sent; a non-blocking write
+/// reports what fitted (EAGAIN only when nothing did); an error after some
+/// progress reports the progress.
+pub const WriteStep = enum { done, again, wait, partial, fail };
+
+pub fn writeProgress(total: usize, done: usize, result: i64, nonblock: bool) WriteStep {
+    if (total == 0) return .done;
+    if (result > 0) {
+        const sent = done + @as(usize, @intCast(result));
+        if (sent >= total) return .done;
+        return if (nonblock) .partial else .again;
+    }
+    if (result == -11) {
+        if (nonblock) return if (done > 0) .partial else .fail;
+        return .wait;
+    }
+    return if (done > 0) .partial else .fail;
+}
+
+/// A datagram is sent whole or not at all: it can never be larger than the ring
+/// (the receiver could never hold it), and otherwise only waits for room.
+pub const DGRAM_PREFIX: usize = 2;
+
+pub fn dgramFits(len: usize, ring_size: usize) bool {
+    return len + DGRAM_PREFIX <= ring_size;
+}
+
 pub fn sendWait(nonblock: bool, buffer_full: bool) SockWait {
     if (!buffer_full) return .proceed;
     return if (nonblock) .eagain else .wait;

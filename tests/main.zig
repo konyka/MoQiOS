@@ -7822,3 +7822,30 @@ test "fd stat policy: type bits, permissions, link counts and synthetic inodes" 
     try std.testing.expect(fp.syntheticIno(1, 3) != fp.syntheticIno(2, 3));
     try std.testing.expect(fp.syntheticIno(1, 3) != fp.syntheticIno(1, 4));
 }
+
+test "stream write loop: blocking writes finish, non-blocking report progress" {
+    const np = kt.namespace_policy;
+    // everything went in
+    try std.testing.expectEqual(np.WriteStep.done, np.writeProgress(100, 0, 100, false));
+    try std.testing.expectEqual(np.WriteStep.done, np.writeProgress(100, 60, 40, true));
+    try std.testing.expectEqual(np.WriteStep.done, np.writeProgress(0, 0, 0, false));
+    // short: a blocking write goes on, a non-blocking one returns what fitted
+    try std.testing.expectEqual(np.WriteStep.again, np.writeProgress(100, 0, 40, false));
+    try std.testing.expectEqual(np.WriteStep.partial, np.writeProgress(100, 0, 40, true));
+    // ring full: blocking waits; non-blocking is EAGAIN unless something went in already
+    try std.testing.expectEqual(np.WriteStep.wait, np.writeProgress(100, 0, -11, false));
+    try std.testing.expectEqual(np.WriteStep.wait, np.writeProgress(100, 40, -11, false));
+    try std.testing.expectEqual(np.WriteStep.fail, np.writeProgress(100, 0, -11, true));
+    try std.testing.expectEqual(np.WriteStep.partial, np.writeProgress(100, 40, -11, true));
+    // other errors: progress wins over the error
+    try std.testing.expectEqual(np.WriteStep.fail, np.writeProgress(100, 0, -32, false));
+    try std.testing.expectEqual(np.WriteStep.partial, np.writeProgress(100, 40, -32, false));
+}
+
+test "datagram size must fit the ring with its length prefix" {
+    const np = kt.namespace_policy;
+    try std.testing.expect(np.dgramFits(100, 8192));
+    try std.testing.expect(np.dgramFits(8190, 8192));
+    try std.testing.expect(!np.dgramFits(8191, 8192));
+    try std.testing.expect(!np.dgramFits(70000, 8192));
+}

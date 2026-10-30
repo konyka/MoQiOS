@@ -920,6 +920,15 @@ pub fn unixClose(idx: u32) void {
                 task_mod.unblockTask(node.task_idx);
             }
             peer.read_waiters = null;
+            // A writer blocked on a full ring must learn the reader is gone
+            // (its next attempt gets EPIPE) instead of sleeping forever.
+            var wcur = peer.write_waiters;
+            while (wcur) |node| {
+                wcur = node.next;
+                @atomicStore(bool, &node.granted, true, .release);
+                @import("../proc/task.zig").unblockTask(node.task_idx);
+            }
+            peer.write_waiters = null;
         }
     }
 
@@ -961,7 +970,7 @@ const WaitKind = enum { read, write, accept };
 /// Park the current task on `idx`'s `kind` wait stack if the socket is still
 /// in the state the caller observed. Returns 0 after a wake-up (re-check),
 /// -4 for an actionable signal, -9 if the socket vanished.
-fn parkOn(idx: u32, kind: WaitKind, expect_empty: bool) i64 {
+fn parkOn(idx: u32, kind: WaitKind, min_room: u32) i64 {
     const task_mod = @import("../proc/task.zig");
     const sched = @import("../proc/sched.zig");
     const cur_idx = sched.currentTaskIndex() orelse return -1;
@@ -978,7 +987,9 @@ fn parkOn(idx: u32, kind: WaitKind, expect_empty: bool) i64 {
         const still = switch (kind) {
             .read => sock.buf_count == 0 and (sock.sock_type != SOCK_STREAM or sock.connected or queuedOnBacklogLocked(idx)),
             .accept => sock.backlog_count == 0 and sock.listening,
-            .write => expect_empty,
+            // A writer waits while the peer's ring has no room; with no peer
+            // to wait for the caller re-tries and gets the real error.
+            .write => if (sendRoomLocked(idx)) |room| room < min_room else false,
         };
         if (!still) {
             unix_lock.release(saved);
@@ -1040,7 +1051,7 @@ pub fn unixRecvBlockingRights(idx: u32, buf: [*]u8, len: usize, nonblock: bool, 
             armed = true;
         }
         if (deadline == null) {
-            const w = parkOn(idx, .read, true);
+            const w = parkOn(idx, .read, 0);
             if (w != 0) return w;
             continue;
         }
@@ -1094,12 +1105,57 @@ fn parkTimed(idx: u32, deadline: u64) i64 {
     return 0;
 }
 
+/// Write `data` to socket `idx`, waiting for room when the ring is full and the
+/// socket is blocking. STREAM: everything is sent (a write reports progress in
+/// the ring); DGRAM: the datagram is sent whole, or EAGAIN when it does not fit.
+pub fn unixSendBlocking(idx: u32, data: [*]const u8, len: usize, nonblock: bool) i64 {
+    if (idx >= MAX_UNIX_SOCKETS) return -9;
+    const stream = blk: {
+        const saved = unix_lock.acquire();
+        defer unix_lock.release(saved);
+        if (!unix_sockets[idx].active) return -9;
+        break :blk unix_sockets[idx].sock_type == SOCK_STREAM;
+    };
+    if (!stream) {
+        // One datagram: it fits the ring or it never will.
+        const fits = blk: {
+            const saved = unix_lock.acquire();
+            defer unix_lock.release(saved);
+            const room = sendRoomLocked(idx) orelse return unixSendRights(idx, data, len, null);
+            break :blk np.dgramFits(len, UNIX_SOCK_BUF_SIZE) and room >= len + np.DGRAM_PREFIX;
+        };
+        if (fits) return unixSendRights(idx, data, len, null);
+        if (nonblock) return -11;
+        // Wait until the whole datagram fits, then try again.
+        const w = parkOn(idx, .write, @intCast(len + np.DGRAM_PREFIX));
+        if (w != 0) return w;
+        return unixSendBlocking(idx, data, len, false);
+    }
+
+    var done: usize = 0;
+    while (true) {
+        const result = unixSendRights(idx, data + done, len - done, null);
+        switch (np.writeProgress(len, done, result, nonblock)) {
+            .done => return @intCast(len),
+            .again => {
+                done += @intCast(result);
+                continue;
+            },
+            .partial => return @intCast(done + @as(usize, @intCast(@max(result, 0)))),
+            .fail => return result,
+            .wait => {},
+        }
+        const w = parkOn(idx, .write, 1);
+        if (w != 0) return w;
+    }
+}
+
 /// accept that waits for a connection when `nonblock` is false.
 pub fn unixAcceptBlocking(idx: u32, nonblock: bool) i32 {
     while (true) {
         const r = unixAccept(idx);
         if (r != -11 or nonblock) return r;
-        const w = parkOn(idx, .accept, true);
+        const w = parkOn(idx, .accept, 0);
         if (w != 0) return @intCast(w);
     }
 }

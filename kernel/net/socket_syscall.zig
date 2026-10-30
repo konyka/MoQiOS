@@ -377,7 +377,6 @@ pub fn accept4(fd: u32, addr_ptr: u64, addr_len_ptr: u64, flags: u32) i64 {
 
 /// sendto(fd, buf, len, flags, addr_ptr, addr_len) → bytes sent or -errno
 pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: u32) i64 {
-    _ = flags;
     if (!@import("socket_address_policy.zig").optionalUserAddressValid(addr_ptr, 0x0000_8000_0000_0000)) return -14;
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
@@ -453,7 +452,7 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         const n_unix = copy.copyFromUser(&tmp_unix, @ptrFromInt(buf), to_copy_unix);
         if (n_unix == 0) return -1;
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
-        return net_mod.unix_socket.unixSend(unix_idx, &tmp_unix, n_unix);
+        return net_mod.unix_socket.unixSendBlocking(unix_idx, &tmp_unix, n_unix, @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, flags));
     } else {
         // Not a socket — use regular write
         var tmp_buf: [4096]u8 = undefined;

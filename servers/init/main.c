@@ -276,6 +276,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello146"); /* sendmmsg / recvmmsg */
     run_test("hello147"); /* directory fd follows its directory across rename */
     run_test("hello148"); /* fstat file types for every descriptor kind */
+    run_test("hello150"); /* blocking AF_UNIX stream writes */
 
     start_persistent_services();
 

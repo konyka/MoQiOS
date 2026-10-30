@@ -1514,7 +1514,7 @@ pub const FdTable = struct {
             .unix_socket => {
                 // write() on an AF_UNIX socket sends to the connected peer.
                 const unix_mod = @import("../net/unix_socket.zig");
-                return unix_mod.unixSend(desc.unix_sock_idx, buf, count);
+                return unix_mod.unixSendBlocking(desc.unix_sock_idx, buf, count, @import("namespace_policy.zig").nonblockRequested(desc.status_flags, 0));
             },
             .timerfd => return -1, // timerfd is read-only
             .devfs => {

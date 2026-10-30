@@ -5562,3 +5562,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 因此上面的结论仍然只是“排除了 TLB/PCID/定时器/UDP 路径”，没有根因，也没有修复。要继续，需要先找回一个稳定复现的版本（用最初那个 `mk_addr` + 非 `volatile` 数组的程序，一次只加一处观测），再决定是否值得继续——它到目前为止只在 SMP=8 的 QEMU 上、而且依赖宿主机负载，出现频率约 1/4。
 - 已做：`user/hello149.c`（复现程序，只放进 ramdisk，不在 init/冒烟里运行，也没有在 shell 里单独跑过；它的头部注释已按上面的结论更正）；`tools/gdb_stall_probe.sh` 增加 `EXTRA_GDB` 钩子，停顿时额外执行一个 gdb 脚本；`tools/gdb_stall_probe.sh` 现在在停顿时先对每个 CPU 的中断计数连续采样两次（`IRQ_SAMPLE_SECS`），并列出所有带睡眠截止时间的任务，之前 `pending` 的格式化宽度也修正了。诊断用的 UDP/lo 计数器和多处 `[DIAG]` 打印已经撤掉，没有留在内核里。
 - 没做：没有修复，也没有改 `hello144` 或任何阈值/超时。`hello144` D 段在 SMP=8 上因此仍有约 1/4 的停顿概率；这个风险是真实的，会让 SMP=8 门禁偶发超时。
+
+### AF_UNIX 阻塞写等待空间（hello150）
+
+- 问题：`write`/`sendto` 对 AF_UNIX 套接字是非阻塞的。环形缓冲（8 KB）满了就返回短写/`EAGAIN`，即使套接字是阻塞的，所以向 `socketpair` 写 30000 字节的程序（常见的“把一大块数据塞进管道式套接字”）会得到短写或错误，而不是阻塞到读者读完。
+- 修复：新增 `unix_socket.unixSendBlocking`。流套接字循环写，由纯策略 `namespace_policy.writeProgress(total, done, result, nonblock)` 决定继续/等待/短写返回/失败；环满时 `parkOn(.write, min_room)` 睡眠（`parkOn` 的第三个参数由 `expect_empty: bool` 改为 `min_room: u32`，写等待者按 `sendRoomLocked` 判断是否仍然没有空间）。数据报要整条放下（`dgramFits`），否则非阻塞 `EAGAIN`、阻塞等到有空间。`unixClose` 现在同时唤醒对端的写等待者。`vfs.write` 与 `sendto` 都走这条路径，`MSG_DONTWAIT`/`O_NONBLOCK` 保持立即返回。
+- 已知差异：AF_UNIX 阻塞写没有 `SO_SNDTIMEO` 超时；数据报的容量判断与 Linux 的 `sk_sndbuf` 不同。
+- 排查过程（如实）：最初的 D 段（读者关闭时阻塞写者被唤醒）在旧内核上也通过——因为旧内核写根本不阻塞，所以它不能证明唤醒修复。我把 D 段改成子进程先确认写确实阻塞了至少 80 ms 再被唤醒，然后用变异验证（见下）。
+- TDD：host 新增 2 个测试（写循环、数据报大小）；hello150（A 阻塞 30000 字节、B 非阻塞短写后 `EAGAIN`、C `MSG_DONTWAIT`、D 读者关闭唤醒写者）在 HEAD 上 A 段 3 项 FAIL，新内核 PASS。
+- 变异：去掉 `unixClose` 里对写等待者的唤醒 → hello150 D 段写者永远睡着，冒烟超时；恢复后 PASS。
+- 验证：host 792/792；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello150 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
