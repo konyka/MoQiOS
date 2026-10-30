@@ -3490,6 +3490,43 @@ pub fn openMeta(file_idx: u32) ?@import("dac.zig").Metadata {
     return .{ .mode = inode.mode, .uid = inodeUid(&inode), .gid = inodeGid(&inode) };
 }
 
+/// utimensat on inode `inode_num`: apply atime/mtime and stamp ctime. The
+/// caller has already parsed the request; permission is judged here against
+/// the inode under fs_lock (owner / CAP_FOWNER, or write access for "now").
+pub fn setTimes(inode_num: u32, specs: [2]@import("utimens_policy.zig").Spec, who: Who) i64 {
+    const up = @import("utimens_policy.zig");
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active) return -5;
+    var inode: Ext2Inode = undefined;
+    if (!readInode(inode_num, &inode)) return -5;
+    const dac = @import("dac.zig");
+    const rc = up.authorize(specs, inodeUid(&inode) == who.euid, who.cap_fowner, dac.allows(inodeMeta(&inode), who.creds(), dac.Access.write));
+    if (rc != 0) return rc;
+    if (up.nothingToDo(specs)) return 0;
+    const t = nowSeconds();
+    switch (specs[0]) {
+        .keep => {},
+        .now => inode.atime = t,
+        .set => |v| inode.atime = v,
+    }
+    switch (specs[1]) {
+        .keep => {},
+        .now => inode.mtime = t,
+        .set => |v| inode.mtime = v,
+    }
+    inode.ctime = t;
+    if (!writeInode(inode_num, &inode)) return -5;
+    for (0..open_count) |i| {
+        if (open_files[i].inode_num == inode_num) {
+            open_files[i].inode.atime = inode.atime;
+            open_files[i].inode.mtime = inode.mtime;
+            open_files[i].inode.ctime = inode.ctime;
+        }
+    }
+    return 0;
+}
+
 /// Get inode number from an open ext2 file index.
 pub fn getInodeNumFromOpen(file_idx: u32) u32 {
     const flags = fs_lock.acquire();

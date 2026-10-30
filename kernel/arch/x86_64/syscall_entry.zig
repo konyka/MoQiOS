@@ -2621,6 +2621,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         488 => { // setgroups(size, list) — CAP_SETGID
             frame.rax = @bitCast(cred_mod.setgroups(@bitCast(frame.rdi), frame.rsi));
         },
+        489 => { // utimensat(dirfd, pathname, times, flags) — pathname NULL = futimens(dirfd)
+            frame.rax = @bitCast(syscallUtimensat(dirfdArg(frame.rdi), frame.rsi, frame.rdx, @truncate(frame.r10)));
+        },
         else => {
             serial.writeString("[syscall] unknown syscall: 0x");
             fmt.writeHex(syscall_nr);
@@ -2801,6 +2804,65 @@ fn ext2Who() @import("../../fs/ext2.zig").Who {
         .cap_dac_override = cur.effective_caps.cap_dac_override,
         .groups = cur.groups[0..cur.ngroups],
     };
+}
+
+/// utimensat(dirfd, pathname, times, flags). Only ext2 keeps timestamps;
+/// tmpfs, FAT32 and the read-only volumes answer EPERM/EROFS as the file
+/// cannot record them.
+fn syscallUtimensat(dirfd: i64, path_ptr: u64, times_ptr: u64, flags: u32) i64 {
+    const up = @import("../../fs/utimens_policy.zig");
+    const copy = @import("../../mm/copy_from_user.zig");
+    const ext2_mod = @import("../../fs/ext2.zig");
+    const at_path = @import("../../fs/at_path.zig");
+    if ((flags & ~@as(u32, 0x100)) != 0) return -22; // only AT_SYMLINK_NOFOLLOW
+    var parsed: ?[2]up.Timespec = null;
+    if (times_ptr != 0) {
+        var raw: [32]u8 = undefined;
+        if (times_ptr >= 0x0000_8000_0000_0000 or copy.copyFromUser(raw[0..], @ptrFromInt(times_ptr), 32) != 32) return -14;
+        const bo = @import("../../lib/byte_order.zig");
+        parsed = .{
+            .{ .sec = @bitCast(bo.readU64Le(raw[0..8])), .nsec = @bitCast(bo.readU64Le(raw[8..16])) },
+            .{ .sec = @bitCast(bo.readU64Le(raw[16..24])), .nsec = @bitCast(bo.readU64Le(raw[24..32])) },
+        };
+    }
+    const specs = switch (up.parse(parsed)) {
+        .ok => |v| v,
+        .err => |e| return e,
+    };
+    const cur = @import("../../proc/sched.zig").currentTask() orelse return -1;
+
+    if (path_ptr == 0) { // futimens: dirfd is the file
+        if (dirfd < 0 or dirfd >= vfs_mod.MAX_FDS) return -9;
+        const d = &cur.fd_table.fds[@intCast(dirfd)];
+        return switch (d.fd_type) {
+            .none => -9,
+            .ext2_file => ext2_mod.setTimes(ext2_mod.getInodeNum(d.ext2_file_idx), specs, ext2Who()),
+            .rofs_file => -30,
+            else => -1,
+        };
+    }
+    var name_buf: [256]u8 = undefined;
+    const n = copy.copyPathFromUser(&name_buf, path_ptr, 255);
+    if (n == 0) return -14;
+    name_buf[if (n < 255) n else 255] = 0;
+    var len: usize = 0;
+    while (len < 255 and name_buf[len] != 0) : (len += 1) {}
+    if (len == 0) return -2;
+    var joined: [256]u8 = undefined;
+    const name = switch (at_path.resolve(cur, dirfd, name_buf[0..len], &joined)) {
+        .keep => name_buf[0..len],
+        .path => |p| p,
+        .err => |e| return e,
+    };
+    var norm: [256]u8 = undefined;
+    if (vfs_mod.normalizeAbs(if (name[0] == '/') name else "/", &norm)) |abs| {
+        if (vfs_mod.rofsRoute(abs) != null) return -30; // EROFS
+    }
+    if (tmpfsPath(name)) return -1; // tmpfs keeps no timestamps
+    if (!ext2_mod.isActive()) return -1;
+    const follow = (flags & 0x100) == 0;
+    const inode_num = ext2_mod.walkPathToInodeAs(name, ext2Who(), follow) catch |e| return if (e == error.DacDenied) -13 else -2;
+    return ext2_mod.setTimes(inode_num, specs, ext2Who());
 }
 
 /// A path argument relative to `dirfd` (AT_FDCWD = the working directory),

@@ -6445,8 +6445,8 @@ test "credentials: uid changes follow capabilities(7) and CAP_SETUID gates arbit
     try std.testing.expectEqual(@as(u32, 4), c4.effective);
 }
 
-test "only hello115 and hello119 start as root with just the ID capabilities" {
-    for ([_][]const u8{ "hello115", "hello119" }) |name| {
+test "only hello115, hello119 and hello123 start as root with just the ID capabilities" {
+    for ([_][]const u8{ "hello115", "hello119", "hello123" }) |name| {
         const p = capability_profile.profileForLaunch(name, true, false);
         try std.testing.expectEqual(@as(u32, 0), p.uid);
         try std.testing.expect(p.caps.cap_setuid and p.caps.cap_setgid);
@@ -6989,4 +6989,35 @@ test "exec reports ENOEXEC for a ramdisk file that is not ELF before loading it"
     const enoexec = std.mem.indexOfPos(u8, src, find, "parseHeader(file.data, file.size) == null) return .{ .err = policy.errno(.bad_format) }").?;
     const load = std.mem.indexOfPos(u8, src, find, "loader.loadProgramForExec(").?;
     try std.testing.expect(enoexec < load);
+}
+
+test "utimensat policy: nsec validation, UTIME_NOW/OMIT and who may set what" {
+    const up = kt.utimens_policy;
+    const NOW = up.UTIME_NOW;
+    const OMIT = up.UTIME_OMIT;
+    // NULL times = both now.
+    const nul = up.parse(null).ok;
+    try std.testing.expect(nul[0] == .now and nul[1] == .now);
+    const a = up.parse(.{ .{ .sec = 100, .nsec = 5 }, .{ .sec = 200, .nsec = NOW } }).ok;
+    try std.testing.expectEqual(@as(u32, 100), a[0].set);
+    try std.testing.expect(a[1] == .now);
+    try std.testing.expect(up.parse(.{ .{ .sec = 1, .nsec = OMIT }, .{ .sec = 1, .nsec = OMIT } }).ok[0] == .keep);
+    try std.testing.expectEqual(@as(i64, -22), up.parse(.{ .{ .sec = 1, .nsec = 1_000_000_000 }, .{ .sec = 1, .nsec = 0 } }).err);
+    try std.testing.expectEqual(@as(i64, -22), up.parse(.{ .{ .sec = 1, .nsec = 0 }, .{ .sec = 1, .nsec = -1 } }).err);
+    try std.testing.expectEqual(@as(i64, -75), up.parse(.{ .{ .sec = -1, .nsec = 0 }, .{ .sec = 1, .nsec = 0 } }).err);
+    try std.testing.expectEqual(@as(i64, -75), up.parse(.{ .{ .sec = 0x1_0000_0000, .nsec = 0 }, .{ .sec = 1, .nsec = 0 } }).err);
+    // A keep slot's seconds are ignored (not range checked).
+    try std.testing.expect(up.parse(.{ .{ .sec = -5, .nsec = OMIT }, .{ .sec = 7, .nsec = 0 } }).ok[0] == .keep);
+    try std.testing.expect(up.nothingToDo(.{ .keep, .keep }));
+    try std.testing.expect(!up.nothingToDo(.{ .keep, .now }));
+
+    // Explicit times: owner or CAP_FOWNER only (EPERM), write access is not enough.
+    const set = [2]up.Spec{ .{ .set = 5 }, .now };
+    try std.testing.expectEqual(@as(i64, 0), up.authorize(set, true, false, false));
+    try std.testing.expectEqual(@as(i64, 0), up.authorize(set, false, true, false));
+    try std.testing.expectEqual(@as(i64, -1), up.authorize(set, false, false, true));
+    // Now-only: owner, CAP_FOWNER, or write access (EACCES otherwise).
+    const now = [2]up.Spec{ .now, .keep };
+    try std.testing.expectEqual(@as(i64, 0), up.authorize(now, false, false, true));
+    try std.testing.expectEqual(@as(i64, -13), up.authorize(now, false, false, false));
 }

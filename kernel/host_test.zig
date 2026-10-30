@@ -113,6 +113,7 @@ pub const memfd_policy = @import("fs/memfd_policy.zig");
 pub const rename_policy = @import("fs/rename_policy.zig");
 pub const at_join_policy = @import("fs/at_join_policy.zig");
 pub const exec_policy = @import("proc/exec_policy.zig");
+pub const utimens_policy = @import("fs/utimens_policy.zig");
 pub const sched_claim = @import("proc/sched_claim.zig");
 pub const sched_queue_policy = @import("proc/sched_queue_policy.zig");
 pub const sched_getaffinity_policy = @import("proc/sched_getaffinity_policy.zig");

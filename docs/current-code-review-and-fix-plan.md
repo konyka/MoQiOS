@@ -5238,3 +5238,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   第一版 hello122 用 hello2 作 exec 目标，新旧内核 B 段都失败，查明后改用 ELF 程序 hello11（同样以 42 退出）——如实记录。
 - RED/GREEN：hello122（16 项）在未改动的内核上 12 项 FAIL，新内核 PASS。变异：解析后的名字不再使用（直接用原始名字）→ 3 项 FAIL。
 - 验证：host 743/743；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）3/3 PASS。
+
+### utimensat / futimens（hello123）
+
+- 问题：内核没有任何修改文件时间戳的系统调用（第十九轮记录“utime 系列根本没有实现”），`touch`、`cp -p`、构建工具无法工作。
+- 实现：原生 #489 `utimensat`（`path == NULL` 为 futimens），纯策略 `fs/utimens_policy.zig`，`ext2.setTimes`；细节见 kernel-subsystems.md。
+  Linux 的 #280 编号已被别的调用占用，所以用新编号，与 #486–#488 一样属于 MoQiOS 原生扩展。
+- TDD：host 测试（解析、UTIME_NOW/OMIT、EINVAL/EOVERFLOW、授权矩阵）先编译失败后通过；hello123（22 项）在 HEAD 上 21 项 FAIL，新内核 PASS。
+  hello123 与 hello115/119 一样以 uid 0 + 仅 ID 能力启动，由降到 uid 1000 的子进程检查授权。
+- 限制：tmpfs 与 FAT32 没有时间戳字段，utimensat 在它们上返回 EPERM；atime 只在显式设置时更新（没有 relatime 式的读访问更新）。
+- 变异：`setTimes` 的授权改为恒允许 → hello123 D 段 3 项 FAIL，恢复后 PASS。
+- 验证：host 744/744；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）3/3 PASS。

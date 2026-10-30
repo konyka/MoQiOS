@@ -925,6 +925,12 @@ const SchedStats = struct {
 - `EPOLL_CTL_ADD` 沿 child epoll 链（`nestedChainReaches`，visited bitmap 有界）检测间接环，构成环返回 `ELOOP`——环上就绪互相传播会使 `epoll_wait` 永久 busy-loop。（§6.51）
 - MoqIPC receive 被信号/`moqipc_notify` 踢醒时统一清理 `waiting_receiver` 注册并按唤醒来源分类返回：endpoint 失效才报 `invalid_endpoint`，存活 endpoint 的无投递唤醒报 EINTR（信号）/EAGAIN（notify）——注册残留曾让 endpoint 对所有 sender 永久报废。（§6.51）
 - `alarm`/`itimer` deadline 字段与 per-CPU run-queue 的 `nr_running` 计数全部原子访问（tick 扫描器跨 CPU 与 syscall 上下文并发）。（§6.51）
+- **utimensat / futimens（原生 #489，hello123）**：此前内核没有任何改时间戳的调用。`utimensat(dirfd, path, times, flags)`，
+  `path == NULL` 即 futimens（dirfd 就是文件）；flags 只认 `AT_SYMLINK_NOFOLLOW`，其它 EINVAL。纯策略在 `fs/utimens_policy.zig`：
+  `times == NULL` 两项都是现在；`UTIME_NOW` / `UTIME_OMIT`；`tv_nsec` 超界 EINVAL；显式时间必须落在磁盘的 32 位秒数内，
+  否则 EOVERFLOW（不静默回绕）；两项都 OMIT 是成功的空操作。授权在 `ext2.setTimes` 里持 `fs_lock` 判定：显式时间需要属主或
+  CAP_FOWNER（EPERM，只有写权限不够），仅“现在”还接受写权限（否则 EACCES）；设置后 ctime 记为现在，并同步所有指向该 inode 的打开槽。
+  只有 ext2 保存时间戳：tmpfs/FAT32 路径返回 EPERM（文件无法记录），只读卷 EROFS。路径经 `at_path.resolve`，所以 cwd 与任意目录 fd 都可用。
 - execve/execveat（hello122）：两者共用 `execve.prepareExecAt` → `prepareExecName`（此前 execveat 有一份复制的实现，
   漏掉了 `posix_mq.closeCloexecForTask`，带 O_CLOEXEC 的消息队列描述符会穿过 execveat 留下来）。名字经 `dirfd_name.resolve`
   按 cwd 或 dirfd 解析（任意文件系统的目录 fd；空闲 fd EBADF，非目录 ENOTDIR），再由 `proc/exec_policy.programName` 映射到
