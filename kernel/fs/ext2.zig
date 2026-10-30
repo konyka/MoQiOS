@@ -4099,11 +4099,18 @@ pub fn touchModified(file_idx: u32) void {
 
 /// lstat-style lookup: the inode `path` names, without following a final
 /// symlink. Null when ext2 is inactive; DAC on the directories walked applies.
-pub fn statPathNoFollow(path: []const u8, who: Who) ?union(enum) { ok: @import("stat_info.zig").StatInfo, err: i64 } {
+pub const StatPathResult = union(enum) { ok: @import("stat_info.zig").StatInfo, err: i64 };
+
+pub fn statPathNoFollow(path: []const u8, who: Who) ?StatPathResult {
+    return statPath(path, who, false);
+}
+
+/// Inode metadata for `path`; a final symlink is followed when `follow`.
+pub fn statPath(path: []const u8, who: Who, follow: bool) ?StatPathResult {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (!active) return null;
-    const inode_num = walkPathToInodeAsUnlocked(path, who, false) catch |e| return .{ .err = if (e == error.DacDenied) -13 else -2 };
+    const inode_num = walkPathToInodeAsUnlocked(path, who, follow) catch |e| return .{ .err = if (e == error.DacDenied) -13 else -2 };
     var inode: Ext2Inode = undefined;
     if (!readInode(inode_num, &inode)) return .{ .err = -5 };
     return .{ .ok = @import("stat_info.zig").fromExt2(inode_num, .{

@@ -253,6 +253,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello123"); /* utimensat/futimens */
     run_test("hello124"); /* linkat/symlinkat/fchownat */
     run_test("hello125"); /* statx fields and flags */
+    run_test("hello126"); /* access/faccessat/faccessat2 */
 
     start_persistent_services();
 

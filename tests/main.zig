@@ -6444,8 +6444,8 @@ test "credentials: uid changes follow capabilities(7) and CAP_SETUID gates arbit
     try std.testing.expectEqual(@as(u32, 4), c4.effective);
 }
 
-test "only hello115, hello119 and hello123 start as root with just the ID capabilities" {
-    for ([_][]const u8{ "hello115", "hello119", "hello123" }) |name| {
+test "only hello115, hello119, hello123 and hello126 start as root with just the ID capabilities" {
+    for ([_][]const u8{ "hello115", "hello119", "hello123", "hello126" }) |name| {
         const p = capability_profile.profileForLaunch(name, true, false);
         try std.testing.expectEqual(@as(u32, 0), p.uid);
         try std.testing.expect(p.caps.cap_setuid and p.caps.cap_setgid);
@@ -7086,4 +7086,41 @@ test "statx layout reports exactly the fields it fills and rejects bad flags/mas
     try std.testing.expectEqual(@as(i64, -22), sp.checkStatxArgs(0, 0x8000_0000).err_or_zero());
     try std.testing.expect(sp.checkStatxArgs(0x1000, 0).empty_path);
     try std.testing.expect(!sp.checkStatxArgs(0, 0).empty_path);
+}
+
+test "access(2) policy: mode bits, real vs effective ids, faccessat2 flags" {
+    const ap = kt.access_policy;
+    const file = ap.Meta{ .mode = 0o100640, .uid = 1000, .gid = 50 };
+    const owner = ap.Creds{ .euid = 1000, .egid = 1000 };
+    const group = ap.Creds{ .euid = 2000, .egid = 50 };
+    const other = ap.Creds{ .euid = 3000, .egid = 3000 };
+    try std.testing.expectEqual(ap.Verdict.ok, ap.verdict(file, owner, ap.R | ap.W));
+    try std.testing.expectEqual(ap.Verdict.denied, ap.verdict(file, owner, ap.X));
+    try std.testing.expectEqual(ap.Verdict.ok, ap.verdict(file, group, ap.R));
+    try std.testing.expectEqual(ap.Verdict.denied, ap.verdict(file, group, ap.W));
+    try std.testing.expectEqual(ap.Verdict.denied, ap.verdict(file, other, ap.R));
+    try std.testing.expectEqual(ap.Verdict.ok, ap.verdict(file, other, 0)); // F_OK needs nothing
+    try std.testing.expectEqual(ap.Verdict.invalid, ap.verdict(file, owner, 8));
+    // CAP_DAC_OVERRIDE bypasses R/W, but X still needs an execute bit somewhere.
+    const root = ap.Creds{ .euid = 0, .egid = 0, .cap_dac_override = true };
+    try std.testing.expectEqual(ap.Verdict.ok, ap.verdict(file, root, ap.R | ap.W));
+    try std.testing.expectEqual(ap.Verdict.denied, ap.verdict(file, root, ap.X));
+    try std.testing.expectEqual(ap.Verdict.ok, ap.verdict(.{ .mode = 0o100700, .uid = 1, .gid = 1 }, root, ap.X));
+    try std.testing.expectEqual(ap.Verdict.ok, ap.verdict(.{ .mode = 0o040000, .uid = 1, .gid = 1 }, root, ap.X)); // directories: search
+
+    // Real ids are the default; AT_EACCES (0x200) switches to the effective ids.
+    const c = ap.credsFor(.{ .uid = 1000, .gid = 1000, .euid = 0, .egid = 0, .cap_dac_override = true }, false);
+    try std.testing.expectEqual(@as(u32, 1000), c.euid);
+    try std.testing.expect(!c.cap_dac_override); // privilege belongs to the effective identity
+    const e = ap.credsFor(.{ .uid = 1000, .gid = 1000, .euid = 0, .egid = 0, .cap_dac_override = true }, true);
+    try std.testing.expectEqual(@as(u32, 0), e.euid);
+    try std.testing.expect(e.cap_dac_override);
+    const same = ap.credsFor(.{ .uid = 5, .gid = 6, .euid = 5, .egid = 6, .cap_dac_override = true }, false);
+    try std.testing.expect(same.cap_dac_override); // ids agree: nothing to drop
+
+    try std.testing.expectEqual(@as(i64, 0), ap.checkFlags(0).err_or_zero());
+    try std.testing.expect(ap.checkFlags(0x200).effective);
+    try std.testing.expect(!ap.checkFlags(0x100).follow);
+    try std.testing.expectEqual(@as(i64, -22), ap.checkFlags(0x4).err_or_zero());
+    try std.testing.expect(ap.checkFlags(0x1000).empty_path);
 }

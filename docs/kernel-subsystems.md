@@ -925,6 +925,12 @@ const SchedStats = struct {
 - `EPOLL_CTL_ADD` 沿 child epoll 链（`nestedChainReaches`，visited bitmap 有界）检测间接环，构成环返回 `ELOOP`——环上就绪互相传播会使 `epoll_wait` 永久 busy-loop。（§6.51）
 - MoqIPC receive 被信号/`moqipc_notify` 踢醒时统一清理 `waiting_receiver` 注册并按唤醒来源分类返回：endpoint 失效才报 `invalid_endpoint`，存活 endpoint 的无投递唤醒报 EINTR（信号）/EAGAIN（notify）——注册残留曾让 endpoint 对所有 sender 永久报废。（§6.51）
 - `alarm`/`itimer` deadline 字段与 per-CPU run-queue 的 `nr_running` 计数全部原子访问（tick 扫描器跨 CPU 与 syscall 上下文并发）。（§6.51）
+- **access / faccessat / faccessat2 在 ext2 与 tmpfs 上判定权限位（hello126）**：此前只有只读卷按文件真实 mode 判定，ext2/tmpfs 只回答“能否打开”，
+  `X_OK` 对 0640 文件也成功、非法 mode 位不报错。现在 `fs/access_policy.zig` 统一规则：`F_OK` 只要存在；R/W/X 按属主/属组/其他类判定（补充组参与）；
+  `CAP_DAC_OVERRIDE` 放行 R/W，但 X 仍要求至少一个执行位（目录除外）；mode 含 R/W/X 之外的位 EINVAL。**身份**：`access`/`faccessat` 按**真实** uid/gid 判定，
+  而特权来自有效身份，所以真实≠有效时丢掉 DAC 特权；`faccessat2(AT_EACCESS)` 改用有效 id。flags：`AT_SYMLINK_NOFOLLOW`、`AT_EACCESS`、`AT_EMPTY_PATH`
+  （空名字检查 dirfd 本身），其它位 EINVAL。ext2 取 `ext2.statPath`，tmpfs 取 `tmpfsMetadataByPath`；其它文件系统（FAT32、ramdisk、devfs）仍只判断存在。
+  顺带：分发层传入 faccessat2 的 flags（原先 flags 被丢弃）。
 - **statx 的字段与标志（hello125）**：此前 `statx` 的 mask 声称 `STATX_BASIC_STATS`，却不写 blocks 和任何时间戳（全是 0），还忽略 flags 与 mask。
   现在 `stat_info.packStatx` 按 struct statx 偏移精确打包，mask 只包含真正填写的字段：ext2、只读卷报告 atime/mtime/ctime 与 blocks，FAT32 只有一个写入时间
   （三者同值），tmpfs 没有时间戳和块数所以 mask 不含它们、字节为 0（不伪造 1970 年）。flags：`AT_EMPTY_PATH`（空名字描述 dirfd 本身，含目录 fd；不带该标志的空名字 ENOENT，坏 fd EBADF）、

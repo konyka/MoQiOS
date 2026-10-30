@@ -5268,3 +5268,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：hello125（17 项）在 HEAD 上 10 项 FAIL，新内核 PASS；hello87（statx 输出故障与临时 fd 清理）仍 PASS。
 - 变异：`AT_SYMLINK_NOFOLLOW` 分支停用 → hello125 1 项 FAIL，恢复后 PASS。
 - 验证：host 746/746；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL（hello87 同样 PASS）；stress（SMP=2）3/3 PASS。
+
+### access 系列在 ext2/tmpfs 上判定权限位（hello126）
+
+- 问题：`syscallAccessAt` 对非卷路径“只看能否打开”：`access(path, X_OK)` 对没有执行位的文件返回成功，`R_OK|W_OK` 不看 mode，非法 mode 位不报错，
+  真实/有效 uid 不分；`faccessat2` 的 flags 被丢弃。依赖 `access` 做权限预检的程序（shell 的 PATH 搜索、`test -x`）得到错误结果。
+- 修复：纯策略 `fs/access_policy.zig`（`verdict`、`credsFor`、`checkFlags`），`ext2.statPath`、`tmpfs.tmpfsMetadataByPath`，分发层传 flags。
+- TDD：host 测试（权限矩阵、特权与执行位、真实/有效身份、flags）先编译失败后通过；hello126（20 项）在 HEAD 上 8 项 FAIL，新内核 PASS。
+  hello126 以 uid 0 + 仅 ID 能力启动，由 `setresuid(1000,0,0)` 的子进程构造“真实≠有效”。
+- 限制：FAT32、ramdisk、devfs 仍只回答存在性（它们没有属主/权限模型）。
+- 变异：`credsFor` 一律按有效身份判定 → hello126 C 段 2 项 FAIL，恢复后 PASS。
+- 验证：host 747/747；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）3/3 PASS。

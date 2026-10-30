@@ -819,6 +819,15 @@ pub fn tmpfsDirPath(idx: u32, out: *[256]u8) union(enum) { ok: []const u8, err: 
     return .{ .ok = out[0..n] };
 }
 
+/// Owner and mode of the entry `path` names (no open reference taken).
+pub fn tmpfsMetadataByPath(path: []const u8) ?Metadata {
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    const idx = lookupLocked(path) orelse return null;
+    const e = &entries[idx];
+    return .{ .mode = e.mode, .uid = e.uid, .gid = e.gid, .is_dir = e.is_dir };
+}
+
 pub fn tmpfsGetMetadata(idx: u8) ?Metadata {
     if (idx >= MAX_FILES) return null;
     const state_held = tmpfs_lock.acquire();

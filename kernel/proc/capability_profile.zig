@@ -110,8 +110,9 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
     // so dropping them is observable through capget.
     // hello119 (rename) uses it the same way: a root-owned /tmp file, then a
     // child dropping to uid 1000 meets the sticky-directory rule. hello123
-    // (utimensat) drops to uid 1000 in a child to check who may set times.
-    if (std.mem.eql(u8, name, "hello115") or std.mem.eql(u8, name, "hello119") or std.mem.eql(u8, name, "hello123")) {
+    // (utimensat) drops to uid 1000 in a child to check who may set times; hello126
+    // (access) splits real and effective ids in a child.
+    if (std.mem.eql(u8, name, "hello115") or std.mem.eql(u8, name, "hello119") or std.mem.eql(u8, name, "hello123") or std.mem.eql(u8, name, "hello126")) {
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_setuid = true, .cap_setgid = true }, .initial_init = false };
     }
     if (std.mem.eql(u8, name, "hello95") or std.mem.eql(u8, name, "hello114")) {
