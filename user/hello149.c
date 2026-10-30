@@ -1,21 +1,16 @@
-/// hello149: reproducer for an intermittent kernel/user disagreement about a forked
-/// child's stack (seen on SMP=8 only so far). NOT run by init or the smoke test; it is
-/// only in the ramdisk so it can be started by hand. Untested from the shell.
+/// hello149: reproducer for an intermittent bug seen on SMP=8 only. NOT run by init or the
+/// smoke test; it is only in the ramdisk so it can be started by hand (untested from the shell).
 ///
-/// A forked child builds a sockaddr_in on its own stack and passes it to sendto().
-/// In the SMP=8 smoke harness (inserted before hello148) about 2 of 3 runs hit 3 bad
-/// iterations within 60: sendto() fails because the kernel's copyFromUser sees an
-/// all-zero sockaddr. What was observed on those failures:
-///   - the child itself reads back the correct values just before the syscall;
-///   - at the syscall the PTE is present and writable (0x...67, no COW bit), the
-///     frame refcount is 1, and CR3 equals the task's page table;
-///   - the frame that PTE names, read through the kernel's direct map, holds the
-///     process's initial stack (ELF aux-vector words near the sockaddr), with the
-///     child's stores missing;
-///   - an invlpg of the page followed by a second copyFromUser still reads zeros,
-///     and building the kernel with PCID disabled changes nothing.
-/// The cause is NOT known. One unverified hypothesis is that the child's stores
-/// reach a different frame than the one the page table names now.
+/// A forked child builds a sockaddr_in on its own stack and passes it to sendto(). In the
+/// SMP=8 smoke harness, with the loop inserted before hello148, about 2 of 3 runs hit 3 bad
+/// iterations within 60: sendto() fails because the kernel's copyFromUser sees an all-zero
+/// sockaddr. Measured on those failures:
+///   - the PTE for the stack page is present and writable (no COW bit), CR3 is the task's;
+///   - an invlpg and a second copyFromUser still read zeros;
+///   - it still fails with PCID disabled, and with an unconditional CR3 reload on every switch;
+///   - in the PTE-event trace, parent and child COW-fault the same shared stack frame on two
+///     CPUs within microseconds of each other (each under its own vm_lock).
+/// The cause is NOT known; no explanation has been verified.
 
 #include <stdint.h>
 

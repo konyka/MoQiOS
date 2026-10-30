@@ -125,6 +125,9 @@ EOF2
             gdb -batch -x "$IRQ_CMDS" zig-out/bin/moqi-kernel.elf 2>&1 | grep -a "^irq \|^freq_mhz\|^sleeper " >>"$OUT_DIR/run-$iter.irq.txt" || true
             sleep "${IRQ_SAMPLE_SECS:-3}"
         done
+        if [ -n "${EXTRA_GDB:-}" ] && [ -f "$EXTRA_GDB" ]; then
+            gdb -batch -x "$EXTRA_GDB" zig-out/bin/moqi-kernel.elf >"$OUT_DIR/run-$iter.extra.txt" 2>&1 || true
+        fi
         gdb -batch -x "$GDB_CMDS" zig-out/bin/moqi-kernel.elf \
             >"$OUT_DIR/run-$iter.gdb.txt" 2>&1 || true
         echo "[probe] gdb dump: $OUT_DIR/run-$iter.gdb.txt"
