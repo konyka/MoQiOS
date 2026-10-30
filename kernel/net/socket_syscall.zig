@@ -953,6 +953,125 @@ fn unixRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8
     return n;
 }
 
+/// sendmsg on a UDP socket: gather the iovecs into one datagram and send it
+/// through sendto (destination from msg_name, or the connected peer).
+fn udpSendmsg(fd: u32, msghdr: *const [56]u8) i64 {
+    const name_ptr: u64 = bo.readU64At(msghdr, 0);
+    const name_len: u32 = bo.readU32Le(msghdr[8..12]);
+    const iov_ptr: u64 = bo.readU64At(msghdr, 16);
+    const iov_len: u64 = bo.readU64At(msghdr, 24);
+    if (iov_len > 1024) return -22;
+    if (iov_len != 0 and (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000)) return -14;
+    var data: [1472]u8 = undefined;
+    const got = gatherIov(iov_ptr, iov_len, &data);
+    if (got < 0) return got;
+    if (got == 0) return 0;
+    return udpSendBytes(fd, data[0..@intCast(got)], name_ptr, name_len);
+}
+
+/// Send `payload` as one datagram on UDP socket `fd` (the sendto UDP path
+/// without the user-buffer copy).
+fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32) i64 {
+    const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
+    const t = task_mod.getTask(cur_idx) orelse return -1;
+    const d = &t.fd_table.fds[fd];
+    const src_port = d.udp_port;
+    if (d.udp_is_v6) {
+        var dst6: [16]u8 = @splat(0);
+        var dst_port6: u16 = 0;
+        if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000) {
+            if (addr_len < sa.SOCKADDR_IN6_LEN) return -22;
+            var sa6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
+            if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) < sa.SOCKADDR_IN6_LEN) return -22;
+            const parsed = sa.parseInet6(&sa6) orelse return -97;
+            dst6 = parsed.addr;
+            dst_port6 = parsed.port;
+        } else if (d.udp_connected) {
+            dst6 = d.udp_dst_ip6;
+            dst_port6 = d.udp_dst_port;
+        } else return -89;
+        const n6 = @min(payload.len, 1232);
+        return if (udp.sendToV6(dst6, dst_port6, src_port, payload.ptr, @intCast(n6))) @intCast(n6) else -1;
+    }
+    var dst_ip: [4]u8 = .{ 0, 0, 0, 0 };
+    var dst_port: u16 = 0;
+    if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000) {
+        if (addr_len < SOCKADDR_IN_MIN_LEN) return -22;
+        var sa_buf: [16]u8 = undefined;
+        if (copy.copyFromUser(sa_buf[0..SOCKADDR_IN_MIN_LEN], @ptrFromInt(addr_ptr), SOCKADDR_IN_MIN_LEN) != SOCKADDR_IN_MIN_LEN) return -14;
+        dst_port = bo.readU16BeAt(&sa_buf, 2);
+        dst_ip = .{ sa_buf[4], sa_buf[5], sa_buf[6], sa_buf[7] };
+    } else if (d.udp_connected) {
+        dst_ip = d.udp_dst_ip;
+        dst_port = d.udp_dst_port;
+    } else return -89;
+    const n = @min(payload.len, 1472);
+    return if (udp.sendTo(dst_ip, dst_port, src_port, payload.ptr, @intCast(n))) @intCast(n) else -1;
+}
+
+/// recvmsg on a UDP socket: wait like recvfrom, scatter the datagram over the
+/// iovecs, fill msg_name, and report MSG_TRUNC in msg_flags.
+fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8, flags: u32) i64 {
+    const name_ptr: u64 = bo.readU64At(msghdr, 0);
+    const name_len: u32 = bo.readU32Le(msghdr[8..12]);
+    const iov_ptr: u64 = bo.readU64At(msghdr, 16);
+    const iov_len: u64 = bo.readU64At(msghdr, 24);
+    if (iov_len > 1024) return -22;
+    if (iov_len != 0 and (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000)) return -14;
+    const d = &cur.fd_table.fds[fd];
+    const is_v6 = d.udp_is_v6;
+    const port = d.udp_port;
+    const wait_rc = udpWaitForDatagram(port, is_v6, @import("../fs/namespace_policy.zig").nonblockRequested(d.status_flags, flags));
+    if (wait_rc != 0) return wait_rc;
+
+    var data: [1472]u8 = undefined;
+    var full: u16 = 0;
+    var got: i64 = 0;
+    var src4: [4]u8 = .{ 0, 0, 0, 0 };
+    var src6: [16]u8 = @splat(0);
+    var src_port: u16 = 0;
+    const peek = (flags & 0x02) != 0;
+    if (is_v6) {
+        got = udp.recvFromV6Ex(port, &data, @intCast(data.len), &src6, &src_port, &full, peek);
+    } else {
+        got = udp.recvFromEx(port, &data, @intCast(data.len), &src4, &src_port, &full, peek);
+    }
+    if (got < 0) return got;
+
+    // Scatter.
+    var done: usize = 0;
+    var i: usize = 0;
+    while (i < iov_len and done < @as(usize, @intCast(got))) : (i += 1) {
+        var iov_buf: [16]u8 = undefined;
+        if (copy.copyFromUser(&iov_buf, @ptrFromInt(iov_ptr + @as(u64, @intCast(i)) * 16), 16) != 16) break;
+        const base = bo.readU64At(&iov_buf, 0);
+        const sz: usize = @intCast(@min(bo.readU64At(&iov_buf, 8), @as(u64, @intCast(got)) - done));
+        if (sz == 0) continue;
+        if (base == 0 or base >= 0x0000_8000_0000_0000) return -14;
+        if (copy.copyToUser(@ptrFromInt(base), data[done..][0..sz], sz) != sz) return -14;
+        done += sz;
+    }
+
+    // msg_name / msg_namelen
+    if (name_ptr != 0 and name_ptr < 0x0000_8000_0000_0000) {
+        var out: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
+        const alen: u32 = if (is_v6) sa.writeInet6(&out, src_port, src6, 0) else sa.writeInet4(&out, src_port, src4);
+        const n = @min(name_len, alen);
+        if (n != 0 and copy.copyToUser(@ptrFromInt(name_ptr), out[0..n], n) != n) return -14;
+        var al: [4]u8 = undefined;
+        bo.writeU32Le(&al, alen);
+        _ = copy.copyToUser(@ptrFromInt(msg_ptr + 8), &al, 4);
+    }
+    // msg_controllen and msg_flags
+    var z8: [8]u8 = @splat(0);
+    _ = copy.copyToUser(@ptrFromInt(msg_ptr + 40), &z8, 8);
+    const truncated = @as(usize, full) > done;
+    var fl: [4]u8 = undefined;
+    bo.writeU32Le(&fl, if (truncated) @as(u32, 0x20) else 0);
+    _ = copy.copyToUser(@ptrFromInt(msg_ptr + 48), &fl, 4);
+    return if ((flags & 0x20) != 0) @as(i64, full) else @intCast(done);
+}
+
 /// sendmsg(fd, msg_ptr, flags) → bytes sent or -errno
 pub fn sendmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
     _ = flags;
@@ -965,6 +1084,11 @@ pub fn sendmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
         var hdr: [56]u8 = undefined;
         if (copy.copyFromUser(&hdr, @ptrFromInt(msg_ptr), 56) != 56) return -14;
         return unixSendmsg(cur, fd, &hdr);
+    }
+    if (fd < vfs_mod.MAX_FDS and cur.fd_table.fds[fd].fd_type == .udp_socket) {
+        var hdr: [56]u8 = undefined;
+        if (copy.copyFromUser(&hdr, @ptrFromInt(msg_ptr), 56) != 56) return -14;
+        return udpSendmsg(fd, &hdr);
     }
     if (fd >= vfs_mod.MAX_FDS or cur.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
 
@@ -1010,6 +1134,11 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
         var hdr: [56]u8 = undefined;
         if (copy.copyFromUser(&hdr, @ptrFromInt(msg_ptr), 56) != 56) return -14;
         return unixRecvmsg(cur, fd, msg_ptr, &hdr, flags);
+    }
+    if (fd < vfs_mod.MAX_FDS and cur.fd_table.fds[fd].fd_type == .udp_socket) {
+        var hdr: [56]u8 = undefined;
+        if (copy.copyFromUser(&hdr, @ptrFromInt(msg_ptr), 56) != 56) return -14;
+        return udpRecvmsg(cur, fd, msg_ptr, &hdr, flags);
     }
     if (flags != 0) return -22;
     if (fd >= vfs_mod.MAX_FDS or cur.fd_table.fds[fd].fd_type != .tcp_socket) return -88;

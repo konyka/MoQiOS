@@ -1022,15 +1022,76 @@ pub fn unixRecvBlocking(idx: u32, buf: [*]u8, len: usize, nonblock: bool) i64 {
     return unixRecvBlockingRights(idx, buf, len, nonblock, null);
 }
 
-/// unixRecvBlocking that can hand descriptors back (recvmsg).
+/// unixRecvBlocking that can hand descriptors back (recvmsg). SO_RCVTIMEO
+/// (sockopt_policy.Stored.rcv_ms) bounds the wait: the task sleeps in short
+/// slices and gives up with EAGAIN once the deadline has passed.
 pub fn unixRecvBlockingRights(idx: u32, buf: [*]u8, len: usize, nonblock: bool, out: ?*RightsOut) i64 {
+    const urp = @import("udp_recv_policy.zig");
+    const tsc = @import("../arch/arch.zig").tsc;
+    var deadline: ?u64 = null;
+    var armed = false;
     while (true) {
         const r = unixRecvRights(idx, buf, len, out);
         reapZombies();
         if (r != -11 or nonblock) return r;
-        const w = parkOn(idx, .read, true);
+        if (!armed) {
+            const ms = if (unixOptView(idx)) |v| v.opts.rcv_ms else 0;
+            deadline = urp.deadlineNs(tsc.nanos(), ms);
+            armed = true;
+        }
+        if (deadline == null) {
+            const w = parkOn(idx, .read, true);
+            if (w != 0) return w;
+            continue;
+        }
+        if (urp.timedOut(deadline, tsc.nanos())) return -11;
+        const w = parkTimed(idx, deadline.?);
         if (w != 0) return w;
     }
+}
+
+/// Park on the read stack until a wake-up or `deadline`; the sleep timer
+/// (sched.sleepTimerTick) wakes the task at the deadline. 0 = re-check.
+fn parkTimed(idx: u32, deadline: u64) i64 {
+    const task_mod = @import("../proc/task.zig");
+    const sched = @import("../proc/sched.zig");
+    const cur_idx = sched.currentTaskIndex() orelse return -1;
+    const cur = task_mod.getTask(cur_idx) orelse return -1;
+    var node: WaitNode = .{ .task_idx = cur_idx };
+    const bit = @as(u64, 1) << @intCast(cur_idx);
+    {
+        const saved = unix_lock.acquire();
+        const sock = &unix_sockets[idx];
+        if (!sock.active) {
+            unix_lock.release(saved);
+            return -9;
+        }
+        const still = sock.buf_count == 0 and (sock.sock_type != SOCK_STREAM or sock.connected or queuedOnBacklogLocked(idx));
+        if (!still) {
+            unix_lock.release(saved);
+            return 0;
+        }
+        node.next = sock.read_waiters;
+        sock.read_waiters = &node;
+        // Publish the deadline before blocking so the tick can wake us.
+        @atomicStore(u64, &cur.sleep_deadline_ns, deadline, .release);
+        _ = @atomicRmw(u64, &sched.sleep_bm, .Or, bit, .seq_cst);
+        task_mod.blockTask(cur_idx);
+        unix_lock.release(saved);
+    }
+    asm volatile ("int $240");
+    sched.repairCurrentAfterBlock();
+    {
+        const saved = unix_lock.acquire();
+        unlinkWaiter(&unix_sockets[idx].read_waiters, &node);
+        unix_lock.release(saved);
+    }
+    cur.sleep_deadline_ns = 0;
+    _ = @atomicRmw(u64, &sched.sleep_bm, .And, ~bit, .seq_cst);
+    const sig_mod = @import("../proc/signal.zig");
+    if (sig_mod.pendingFatal(cur)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+    if (sig_mod.pendingActionable(cur)) return -4;
+    return 0;
 }
 
 /// accept that waits for a connection when `nonblock` is false.

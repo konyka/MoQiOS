@@ -5487,3 +5487,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 变异：非阻塞套接字空队列不再返回 EAGAIN（改为一直等）→ host 测试 `udp receive policy` 失败（786/787）；在 QEMU 里同一变异使 hello144 A 段第一次非阻塞接收永远等待，冒烟超时（没有 FAIL 行，因为进程根本没返回），恢复后 PASS。
 - 验证：host 787/787；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### UDP sendmsg/recvmsg 与 AF_UNIX 接收超时（hello145）
+
+- 问题：UDP 的 `sendmsg`/`recvmsg` 返回 ENOTSOCK；AF_UNIX 的 `SO_RCVTIMEO` 只保存不生效（hello143/144 的已知缺口）。
+- 修复：`udpSendmsg`/`udpSendBytes`/`udpRecvmsg`（与 `sendto`/`recvfrom` 共享等待逻辑和地址编码）；`unix_socket.unixRecvBlockingRights` 在设置了 `SO_RCVTIMEO` 时用 `parkTimed`（挂在读等待栈上并把截止时间交给 `sleep_bm`）。
+- 已知差异：UDP `recvmsg` 不返回控制消息（`msg_controllen` 恒为 0，不支持 `IP_PKTINFO`/`SCM_TIMESTAMP`）；`sendmsg` 的控制消息被忽略；数据报最长 1472（IPv4）/1232（IPv6）字节；`recvmmsg`/`sendmmsg` 仍按旧路径走 TCP；`SO_SNDTIMEO` 在 AF_UNIX/UDP 上仍不生效（发送端从不阻塞或使用 EAGAIN）。
+- 排查过程（如实）：探测只剩一项失败，是我把 `sockaddr_in` 的偏移记错了——`sa_family` 占前两个字节（小端，`02 00`），端口在偏移 2–3（大端），我原先检查的是 `src[1] == AF_INET`；打印出实际字节后确认内核是对的，改探测。没有发现内核缺陷。
+- TDD：hello145（19 项）在 HEAD 上 11 项 FAIL，新内核 PASS。
+
+- 变异：UDP `recvmsg` 不再设置 `MSG_TRUNC` → hello145 B 段 `msg_flags has MSG_TRUNC` FAIL，恢复后 PASS。
+- 验证：host 787/787；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
