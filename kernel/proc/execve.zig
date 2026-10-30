@@ -41,10 +41,10 @@ pub fn prepareExecAt(dirfd: i64, name_ptr: u64, argv_ptr: u64, envp_ptr: u64, fl
     const copy = @import("../mm/copy_from_user.zig");
     var raw: [256]u8 = undefined;
     const n = copy.copyPathFromUser(raw[0..], name_ptr, 255);
-    if (n == 0) return .{ .err = policy.errno(.fault) };
-    raw[if (n < 255) n else 255] = 0;
-    var len: usize = 0;
-    while (len < 255 and raw[len] != 0) : (len += 1) {}
+    const len = switch (@import("../fs/namespace_policy.zig").pathFromCopy(raw[0..], n, 255)) {
+        .ok => |p| p.len,
+        .err => |e| return .{ .err = e },
+    };
     var joined: [256]u8 = undefined;
     const resolved = switch (@import("../fs/dirfd_name.zig").resolve(dirfd, raw[0..len], &joined)) {
         .ok => |p| p,

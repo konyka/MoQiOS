@@ -7216,3 +7216,52 @@ test "path-length classification: a copy with no NUL inside the limit is ENAMETO
     // nothing copied is a fault, handled by the caller (EFAULT)
     try std.testing.expectEqual(@as(i64, -14), np.pathCopyErrno(&fits, 0, 255));
 }
+
+test "pathFromCopy: NUL-terminated name slice or the errno" {
+    const np = kt.namespace_policy;
+    var buf: [256]u8 = @splat(0);
+    @memcpy(buf[0..4], "abc\x00");
+    switch (np.pathFromCopy(&buf, 4, 255)) {
+        .ok => |p| try std.testing.expectEqualStrings("abc", p),
+        .err => return error.TestUnexpectedResult,
+    }
+    // empty string: copied 1 (just the NUL) is a zero-length name, not an error here
+    buf[0] = 0;
+    switch (np.pathFromCopy(&buf, 1, 255)) {
+        .ok => |p| try std.testing.expectEqual(@as(usize, 0), p.len),
+        .err => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(i64, -14), np.pathFromCopy(&buf, 0, 255).err);
+    var full: [256]u8 = @splat('x');
+    try std.testing.expectEqual(@as(i64, -36), np.pathFromCopy(&full, 255, 255).err);
+    // a smaller limit (names of 15/63/127 bytes) is judged against its own window
+    var small: [16]u8 = @splat('y');
+    try std.testing.expectEqual(@as(i64, -36), np.pathFromCopy(&small, 15, 15).err);
+    small[14] = 0;
+    switch (np.pathFromCopy(&small, 15, 15)) {
+        .ok => |p| try std.testing.expectEqual(@as(usize, 14), p.len),
+        .err => return error.TestUnexpectedResult,
+    }
+}
+
+test "syscall_entry reads user paths through the checked helper (no raw 255-byte truncating copies)" {
+    const src = kt.syscall_entry_source;
+    // Every remaining direct call is either the helper itself, a fixed-size non-path
+    // name where truncation is the specified behaviour (PR_SET_NAME), the memfd name
+    // (length checked explicitly), or wrapped in namespace_policy.pathCopyErrno (mount/umount).
+    var pos: usize = 0;
+    var raw: usize = 0;
+    while (std.mem.indexOfPos(u8, src, pos, "copy.copyPathFromUser(")) |i| {
+        pos = i + 1;
+        const line_start = if (std.mem.lastIndexOfScalar(u8, src[0..i], '\n')) |nl| nl + 1 else 0;
+        const line_end = std.mem.indexOfScalarPos(u8, src, i, '\n') orelse src.len;
+        const line = src[line_start..line_end];
+        const ok = std.mem.indexOf(u8, line, "pathCopyErrno(") != null or
+            std.mem.indexOf(u8, line, "pathFromCopy(") != null or
+            std.mem.indexOf(u8, line, "&name_buf, arg2, 15") != null or // PR_SET_NAME (comm is 15 bytes)
+            std.mem.indexOf(u8, line, "&name_buf, name_ptr, 251") != null; // memfd_create: explicit NUL/length check follows
+        if (!ok) raw += 1;
+    }
+    // The helper (userPathResult) is the only unchecked 255-byte reader left.
+    try std.testing.expectEqual(@as(usize, 1), raw);
+}

@@ -59,6 +59,10 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_CHMOD     90
 #define SYS_CHOWN     92
 #define SYS_TRUNCATE  210
+#define SYS_ACCESS    198
+#define SYS_UTIMENSAT 489
+#define SYS_EXECVE    59
+#define SYS_MOUNT     288
 #define SYS_FTRUNCATE 77
 #define O_RDWR_CREAT  0x42
 #define O_RDONLY      0
@@ -144,6 +148,18 @@ static void suite(const char *tag, const char *dir, int has_symlinks) {
         check(r == -ENAMETOOLONG_, "mkdir with a path longer than 255 bytes is ENAMETOOLONG");
         r = syscall1(SYS_UNLINK, (uint64_t)longpath);
         check(r == -ENAMETOOLONG_, "unlink with a path longer than 255 bytes is ENAMETOOLONG");
+        /* every other path-taking call refuses instead of acting on a truncated name */
+        check(syscall2(SYS_CHMOD, (uint64_t)longpath, 0644) == -ENAMETOOLONG_, "chmod with an over-long path is ENAMETOOLONG");
+        check(syscall3(SYS_CHOWN, (uint64_t)longpath, 0, 0) == -ENAMETOOLONG_, "chown with an over-long path is ENAMETOOLONG");
+        check(syscall2(SYS_TRUNCATE, (uint64_t)longpath, 0) == -ENAMETOOLONG_, "truncate with an over-long path is ENAMETOOLONG");
+        check(syscall2(SYS_ACCESS, (uint64_t)longpath, 0) == -ENAMETOOLONG_, "access with an over-long path is ENAMETOOLONG");
+        check(syscall2(SYS_RENAME, (uint64_t)longpath, (uint64_t)f) == -ENAMETOOLONG_, "rename with an over-long source is ENAMETOOLONG");
+        check(syscall2(SYS_RENAME, (uint64_t)f, (uint64_t)longpath) == -ENAMETOOLONG_, "rename with an over-long target is ENAMETOOLONG");
+        check(syscall2(SYS_LINK, (uint64_t)f, (uint64_t)longpath) == -ENAMETOOLONG_, "link with an over-long new name is ENAMETOOLONG");
+        check(syscall2(SYS_SYMLINK, (uint64_t)f, (uint64_t)longpath) == -ENAMETOOLONG_, "symlink with an over-long link path is ENAMETOOLONG");
+        check(syscall4(SYS_UTIMENSAT, (uint64_t)-100, (uint64_t)longpath, 0, 0) == -ENAMETOOLONG_, "utimensat with an over-long path is ENAMETOOLONG");
+        check(syscall3(SYS_READLINK, (uint64_t)longpath, (uint64_t)buf, 15) == -ENAMETOOLONG_, "readlink with an over-long path is ENAMETOOLONG");
+        check(syscall3(SYS_EXECVE, (uint64_t)longpath, 0, 0) == -ENAMETOOLONG_, "execve with an over-long path is ENAMETOOLONG");
     }
     if (has_symlinks) {
         syscall2(SYS_SYMLINK, (uint64_t)l2, (uint64_t)l1);

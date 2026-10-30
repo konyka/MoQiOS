@@ -5304,6 +5304,10 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 回归（如实）：smoke 卡住不结束，原因是 `hello41` 断言 `copy_file_range` 写只读目标得 `-1`；这是旧行为被写进了测试，Linux 答案是 EBADF，已更正断言。
   第一次运行把 smoke 放进 300 秒前台限制被转为后台，未影响结果。
 - TDD：host 新增 3 个测试（读写闸门、`pathCopyErrno`、源码守卫）先 RED；hello128（ext2 15 项 + tmpfs 11 项）在 HEAD 上 14 项 FAIL，新内核 PASS。
-- 未做：约 36 个 `copyPathFromUser` 调用点（主要是 syscall_entry.zig 里的 chmod/chown/link/symlink/xattr/execve 等）仍会截断超长路径；需要统一成一个带错误码的路径读取函数。
+- 后续（已完成）：剩下约 36 个 `copyPathFromUser` 调用点统一成 `userPath`/`userPathResult`/`pathFromCopy`（chmod/chown/link/symlink/rename/truncate/access/utimensat/xattr-at/chroot/swap/mount/inotify/execve），
+  超长路径一律 ENAMETOOLONG；host 增加 `pathFromCopy` 测试和“只剩受控调用点”的源码守卫（先 RED：直接调用 25+ 处），hello128 再加 10 项运行时检查（chmod/chown/truncate/access/rename 两端/link/symlink/utimensat/readlink/execve），
+  新增项在 HEAD 上 FAIL。
 - 变异：`writeGate` 恒放行 → hello128 4 项 FAIL（ext2、tmpfs 各 2）加 hello41 的新断言 FAIL；恢复后 PASS。
 - 验证：host 753/753；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL（hello41 同样 PASS）；stress（SMP=2）3/3 PASS。
+- 变异：`pathCopyErrno` 不再拒绝超长路径 → hello128 共 23 行 FAIL（两个文件系统各一轮），恢复后 PASS。
+- 验证：host 755/755；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）3/3 PASS。

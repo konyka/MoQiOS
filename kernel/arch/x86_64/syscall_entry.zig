@@ -1352,17 +1352,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(readlink_mod.readlinkAt(dirfdArg(frame.rdi), frame.rsi, frame.rdx, frame.r10));
         },
         260 => { // fchmodat(dirfd, pathname, mode, flags) — chmod via path
-            const copy = @import("../../mm/copy_from_user.zig");
             const ext2_mod = @import("../../fs/ext2.zig");
             var path_buf: [256]u8 = undefined;
-            const pc = copy.copyPathFromUser(path_buf[0..], frame.rsi, 255);
-            if (pc == 0) {
-                frame.rax = @bitCast(@as(i64, -14));
-                return;
-            }
-            path_buf[if (pc < 255) pc else 255] = 0;
-            var plen: usize = 0;
-            while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
+            const path_buf_slice = userPath(frame, frame.rsi, &path_buf) orelse return;
+            const plen: usize = path_buf_slice.len;
             var at_join: [256]u8 = undefined;
             const at_name = switch (@import("../../fs/dirfd_name.zig").resolve(dirfdArg(frame.rdi), path_buf[0..plen], &at_join)) {
                 .ok => |n| n,
@@ -1824,17 +1817,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(readlink_mod.readlink(frame.rdi, frame.rsi, frame.rdx));
         },
         90 => { // chmod(pathname, mode)
-            const copy = @import("../../mm/copy_from_user.zig");
             const ext2_mod = @import("../../fs/ext2.zig");
             var path_buf: [256]u8 = undefined;
-            const pc = copy.copyPathFromUser(path_buf[0..], frame.rdi, 255);
-            if (pc == 0) {
-                frame.rax = @bitCast(@as(i64, -14));
-                return;
-            }
-            path_buf[if (pc < 255) pc else 255] = 0;
-            var plen: usize = 0;
-            while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
+            const path_buf_slice = userPath(frame, frame.rdi, &path_buf) orelse return;
+            const plen: usize = path_buf_slice.len;
             var cwd_join: [256]u8 = undefined;
             const name = atName(frame, -100, path_buf[0..plen], &cwd_join) orelse return;
             if (tmpfsPath(name)) {
@@ -1976,22 +1962,13 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(getdents_mod.getdents64(@truncate(frame.rdi), frame.rsi, frame.rdx));
         },
         86 => { // link(oldpath, newpath) — hard link
-            const copy = @import("../../mm/copy_from_user.zig");
             const ext2_mod = @import("../../fs/ext2.zig");
             var old_buf: [256]u8 = undefined;
             var new_buf: [256]u8 = undefined;
-            const oc = copy.copyPathFromUser(old_buf[0..], frame.rdi, 255);
-            const nc = copy.copyPathFromUser(new_buf[0..], frame.rsi, 255);
-            if (oc == 0 or nc == 0) {
-                frame.rax = @bitCast(@as(i64, -14));
-                return;
-            }
-            old_buf[if (oc < 255) oc else 255] = 0;
-            new_buf[if (nc < 255) nc else 255] = 0;
-            var ol: usize = 0;
-            while (ol < 256 and old_buf[ol] != 0) : (ol += 1) {}
-            var nl: usize = 0;
-            while (nl < 256 and new_buf[nl] != 0) : (nl += 1) {}
+            const old_buf_slice = userPath(frame, frame.rdi, &old_buf) orelse return;
+            const new_buf_slice = userPath(frame, frame.rsi, &new_buf) orelse return;
+            const ol: usize = old_buf_slice.len;
+            const nl: usize = new_buf_slice.len;
             var old_join: [256]u8 = undefined;
             var new_join: [256]u8 = undefined;
             const old_name = atName(frame, -100, old_buf[0..ol], &old_join) orelse return;
@@ -2003,22 +1980,13 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             }
         },
         88 => { // symlink(target, linkpath) — symbolic link
-            const copy = @import("../../mm/copy_from_user.zig");
             const ext2_mod = @import("../../fs/ext2.zig");
             var tgt_buf: [256]u8 = undefined;
             var lnk_buf: [256]u8 = undefined;
-            const tc = copy.copyPathFromUser(tgt_buf[0..], frame.rdi, 255);
-            const lc = copy.copyPathFromUser(lnk_buf[0..], frame.rsi, 255);
-            if (tc == 0 or lc == 0) {
-                frame.rax = @bitCast(@as(i64, -14));
-                return;
-            }
-            tgt_buf[if (tc < 255) tc else 255] = 0;
-            lnk_buf[if (lc < 255) lc else 255] = 0;
-            var tl: usize = 0;
-            while (tl < 256 and tgt_buf[tl] != 0) : (tl += 1) {}
-            var ll: usize = 0;
-            while (ll < 256 and lnk_buf[ll] != 0) : (ll += 1) {}
+            const tgt_buf_slice = userPath(frame, frame.rdi, &tgt_buf) orelse return;
+            const lnk_buf_slice = userPath(frame, frame.rsi, &lnk_buf) orelse return;
+            const tl: usize = tgt_buf_slice.len;
+            const ll: usize = lnk_buf_slice.len;
             var lnk_join: [256]u8 = undefined;
             const lnk_name = atName(frame, -100, lnk_buf[0..ll], &lnk_join) orelse return;
             if (ext2_mod.isActive()) {
@@ -2028,17 +1996,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             }
         },
         92 => { // chown(pathname, owner, group)
-            const copy = @import("../../mm/copy_from_user.zig");
             const ext2_mod = @import("../../fs/ext2.zig");
             var path_buf: [256]u8 = undefined;
-            const pc = copy.copyPathFromUser(path_buf[0..], frame.rdi, 255);
-            if (pc == 0) {
-                frame.rax = @bitCast(@as(i64, -14));
-                return;
-            }
-            path_buf[if (pc < 255) pc else 255] = 0;
-            var plen: usize = 0;
-            while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
+            const path_buf_slice = userPath(frame, frame.rdi, &path_buf) orelse return;
+            const plen: usize = path_buf_slice.len;
             var cwd_join: [256]u8 = undefined;
             const name = atName(frame, -100, path_buf[0..plen], &cwd_join) orelse return;
             if (tmpfsPath(name)) {
@@ -2072,17 +2033,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(ext2_mod.setOwnerByInode(inode_num, @truncate(frame.rsi), @truncate(frame.rdx), ext2Who()));
         },
         94 => { // lchown(pathname, owner, group) — does NOT follow symlink
-            const copy = @import("../../mm/copy_from_user.zig");
             const ext2_mod = @import("../../fs/ext2.zig");
             var path_buf: [256]u8 = undefined;
-            const pc = copy.copyPathFromUser(path_buf[0..], frame.rdi, 255);
-            if (pc == 0) {
-                frame.rax = @bitCast(@as(i64, -14));
-                return;
-            }
-            path_buf[if (pc < 255) pc else 255] = 0;
-            var plen: usize = 0;
-            while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
+            const path_buf_slice = userPath(frame, frame.rdi, &path_buf) orelse return;
+            const plen: usize = path_buf_slice.len;
             var cwd_join: [256]u8 = undefined;
             const name = atName(frame, -100, path_buf[0..plen], &cwd_join) orelse return;
             frame.rax = @bitCast(ext2_mod.setOwnerNoFollow(name, @truncate(frame.rsi), @truncate(frame.rdx), ext2Who()));
@@ -2095,22 +2049,13 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallSetitimer(@truncate(frame.rdi), frame.rsi, frame.rdx));
         },
         329 => { // link(oldpath, newpath) — same as #86
-            const copy = @import("../../mm/copy_from_user.zig");
             const ext2_mod = @import("../../fs/ext2.zig");
             var old_buf: [256]u8 = undefined;
             var new_buf: [256]u8 = undefined;
-            const oc = copy.copyPathFromUser(old_buf[0..], frame.rdi, 255);
-            const nc = copy.copyPathFromUser(new_buf[0..], frame.rsi, 255);
-            if (oc == 0 or nc == 0) {
-                frame.rax = @bitCast(@as(i64, -14));
-                return;
-            }
-            old_buf[if (oc < 255) oc else 255] = 0;
-            new_buf[if (nc < 255) nc else 255] = 0;
-            var ol: usize = 0;
-            while (ol < 256 and old_buf[ol] != 0) : (ol += 1) {}
-            var nl: usize = 0;
-            while (nl < 256 and new_buf[nl] != 0) : (nl += 1) {}
+            const old_buf_slice = userPath(frame, frame.rdi, &old_buf) orelse return;
+            const new_buf_slice = userPath(frame, frame.rsi, &new_buf) orelse return;
+            const ol: usize = old_buf_slice.len;
+            const nl: usize = new_buf_slice.len;
             var old_join: [256]u8 = undefined;
             var new_join: [256]u8 = undefined;
             const old_name = atName(frame, -100, old_buf[0..ol], &old_join) orelse return;
@@ -2118,22 +2063,13 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(ext2_mod.createHardlink(old_name, new_name, ext2Who()));
         },
         330 => { // symlink(target, linkpath) — same as #88
-            const copy = @import("../../mm/copy_from_user.zig");
             const ext2_mod = @import("../../fs/ext2.zig");
             var tgt_buf: [256]u8 = undefined;
             var lnk_buf: [256]u8 = undefined;
-            const tc = copy.copyPathFromUser(tgt_buf[0..], frame.rdi, 255);
-            const lc = copy.copyPathFromUser(lnk_buf[0..], frame.rsi, 255);
-            if (tc == 0 or lc == 0) {
-                frame.rax = @bitCast(@as(i64, -14));
-                return;
-            }
-            tgt_buf[if (tc < 255) tc else 255] = 0;
-            lnk_buf[if (lc < 255) lc else 255] = 0;
-            var tl: usize = 0;
-            while (tl < 256 and tgt_buf[tl] != 0) : (tl += 1) {}
-            var ll: usize = 0;
-            while (ll < 256 and lnk_buf[ll] != 0) : (ll += 1) {}
+            const tgt_buf_slice = userPath(frame, frame.rdi, &tgt_buf) orelse return;
+            const lnk_buf_slice = userPath(frame, frame.rsi, &lnk_buf) orelse return;
+            const tl: usize = tgt_buf_slice.len;
+            const ll: usize = lnk_buf_slice.len;
             var lnk_join: [256]u8 = undefined;
             const lnk_name = atName(frame, -100, lnk_buf[0..ll], &lnk_join) orelse return;
             frame.rax = @bitCast(ext2_mod.createSymlink(tgt_buf[0..tl], lnk_name, ext2Creator(), ext2Who()));
@@ -2300,17 +2236,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(syscallCachestat(@truncate(frame.rdi), frame.rsi, frame.rdx, @truncate(frame.r10)));
         },
         452 => { // fchmodat2(dfd, filename, mode, flags) — Linux #452
-            const copy = @import("../../mm/copy_from_user.zig");
             const ext2_mod = @import("../../fs/ext2.zig");
             var path_buf: [256]u8 = undefined;
-            const pc = copy.copyPathFromUser(path_buf[0..], frame.rsi, 255);
-            if (pc == 0) {
-                frame.rax = @bitCast(@as(i64, -14));
-                return;
-            }
-            path_buf[if (pc < 255) pc else 255] = 0;
-            var plen: usize = 0;
-            while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
+            const path_buf_slice = userPath(frame, frame.rsi, &path_buf) orelse return;
+            const plen: usize = path_buf_slice.len;
             var at_join: [256]u8 = undefined;
             const at_name = switch (@import("../../fs/dirfd_name.zig").resolve(dirfdArg(frame.rdi), path_buf[0..plen], &at_join)) {
                 .ok => |n| n,
@@ -2375,24 +2304,12 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             const ext2_mod = @import("../../fs/ext2.zig");
             // Copy path
             var path_buf: [256]u8 = undefined;
-            const pc = copy.copyPathFromUser(path_buf[0..], frame.rsi, 255);
-            if (pc == 0) {
-                frame.rax = @bitCast(@as(i64, -14));
-                return;
-            }
-            path_buf[if (pc < 255) pc else 255] = 0;
-            var plen: usize = 0;
-            while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
+            const path_buf_slice = userPath(frame, frame.rsi, &path_buf) orelse return;
+            const plen: usize = path_buf_slice.len;
             // Copy name (skip "user." prefix if present)
             var name_buf: [256]u8 = undefined;
-            const nc = copy.copyPathFromUser(name_buf[0..], frame.r10, 255);
-            if (nc == 0) {
-                frame.rax = @bitCast(@as(i64, -14));
-                return;
-            }
-            name_buf[if (nc < 255) nc else 255] = 0;
-            var nlen: usize = 0;
-            while (nlen < 256 and name_buf[nlen] != 0) : (nlen += 1) {}
+            const name_buf_slice = userPath(frame, frame.r10, &name_buf) orelse return;
+            const nlen: usize = name_buf_slice.len;
             var actual_name = name_buf[0..nlen];
             if (nlen >= 5 and name_buf[0] == 'u' and name_buf[1] == 's' and name_buf[2] == 'e' and name_buf[3] == 'r' and name_buf[4] == '.') {
                 actual_name = name_buf[5..nlen];
@@ -2429,23 +2346,11 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             const copy = @import("../../mm/copy_from_user.zig");
             const ext2_mod = @import("../../fs/ext2.zig");
             var path_buf: [256]u8 = undefined;
-            const pc = copy.copyPathFromUser(path_buf[0..], frame.rsi, 255);
-            if (pc == 0) {
-                frame.rax = @bitCast(@as(i64, -14));
-                return;
-            }
-            path_buf[if (pc < 255) pc else 255] = 0;
-            var plen: usize = 0;
-            while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
+            const path_buf_slice = userPath(frame, frame.rsi, &path_buf) orelse return;
+            const plen: usize = path_buf_slice.len;
             var name_buf: [256]u8 = undefined;
-            const nc = copy.copyPathFromUser(name_buf[0..], frame.r10, 255);
-            if (nc == 0) {
-                frame.rax = @bitCast(@as(i64, -14));
-                return;
-            }
-            name_buf[if (nc < 255) nc else 255] = 0;
-            var nlen: usize = 0;
-            while (nlen < 256 and name_buf[nlen] != 0) : (nlen += 1) {}
+            const name_buf_slice = userPath(frame, frame.r10, &name_buf) orelse return;
+            const nlen: usize = name_buf_slice.len;
             var actual_name = name_buf[0..nlen];
             if (nlen >= 5 and name_buf[0] == 'u' and name_buf[1] == 's' and name_buf[2] == 'e' and name_buf[3] == 'r' and name_buf[4] == '.') {
                 actual_name = name_buf[5..nlen];
@@ -2477,14 +2382,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             const copy = @import("../../mm/copy_from_user.zig");
             const ext2_mod = @import("../../fs/ext2.zig");
             var path_buf: [256]u8 = undefined;
-            const pc = copy.copyPathFromUser(path_buf[0..], frame.rsi, 255);
-            if (pc == 0) {
-                frame.rax = @bitCast(@as(i64, -14));
-                return;
-            }
-            path_buf[if (pc < 255) pc else 255] = 0;
-            var plen: usize = 0;
-            while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
+            const path_buf_slice = userPath(frame, frame.rsi, &path_buf) orelse return;
+            const plen: usize = path_buf_slice.len;
             var at_join: [256]u8 = undefined;
             const at_name = atName(frame, dirfdArg(frame.rdi), path_buf[0..plen], &at_join) orelse return;
             // AT_SYMLINK_NOFOLLOW (0x100): act on a final symlink itself.
@@ -2505,26 +2404,13 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(result);
         },
         466 => { // removexattrat(dfd, path, flags, name)
-            const copy = @import("../../mm/copy_from_user.zig");
             const ext2_mod = @import("../../fs/ext2.zig");
             var path_buf: [256]u8 = undefined;
-            const pc = copy.copyPathFromUser(path_buf[0..], frame.rsi, 255);
-            if (pc == 0) {
-                frame.rax = @bitCast(@as(i64, -14));
-                return;
-            }
-            path_buf[if (pc < 255) pc else 255] = 0;
-            var plen: usize = 0;
-            while (plen < 256 and path_buf[plen] != 0) : (plen += 1) {}
+            const path_buf_slice = userPath(frame, frame.rsi, &path_buf) orelse return;
+            const plen: usize = path_buf_slice.len;
             var name_buf: [256]u8 = undefined;
-            const nc = copy.copyPathFromUser(name_buf[0..], frame.r10, 255);
-            if (nc == 0) {
-                frame.rax = @bitCast(@as(i64, -14));
-                return;
-            }
-            name_buf[if (nc < 255) nc else 255] = 0;
-            var nlen: usize = 0;
-            while (nlen < 256 and name_buf[nlen] != 0) : (nlen += 1) {}
+            const name_buf_slice = userPath(frame, frame.r10, &name_buf) orelse return;
+            const nlen: usize = name_buf_slice.len;
             var actual_name = name_buf[0..nlen];
             if (nlen >= 5 and name_buf[0] == 'u' and name_buf[1] == 's' and name_buf[2] == 'e' and name_buf[3] == 'r' and name_buf[4] == '.') {
                 actual_name = name_buf[5..nlen];
@@ -2818,14 +2704,13 @@ fn ext2Who() @import("../../fs/ext2.zig").Who {
 /// Copy a user path into `buf`, resolve it under `dirfd`, and return the name
 /// to look up (or a negative errno).
 fn atPathArg(dirfd: i64, ptr: u64, buf: *[256]u8, join: *[256]u8) union(enum) { ok: []const u8, err: i64 } {
-    const copy = @import("../../mm/copy_from_user.zig");
     const cur = @import("../../proc/sched.zig").currentTask() orelse return .{ .err = -1 };
     if (ptr == 0 or ptr >= 0x0000_8000_0000_0000) return .{ .err = -14 };
-    const n = copy.copyPathFromUser(buf, ptr, 255);
-    if (n == 0) return .{ .err = -14 };
-    buf[if (n < 255) n else 255] = 0;
-    var len: usize = 0;
-    while (len < 255 and buf[len] != 0) : (len += 1) {}
+    const raw = switch (userPathResult(ptr, buf)) {
+        .ok => |p| p,
+        .err => |e| return .{ .err = e },
+    };
+    const len = raw.len;
     if (len == 0) return .{ .err = -2 };
     return switch (@import("../../fs/at_path.zig").resolve(cur, dirfd, buf[0..len], join)) {
         .keep => .{ .ok = buf[0..len] },
@@ -2867,15 +2752,13 @@ fn syscallLinkat(old_dirfd: i64, old_ptr: u64, new_dirfd: i64, new_ptr: u64, fla
 }
 
 fn syscallSymlinkat(target_ptr: u64, new_dirfd: i64, link_ptr: u64) i64 {
-    const copy = @import("../../mm/copy_from_user.zig");
     const fp = @import("../../fs/at_flags_policy.zig");
     if (target_ptr == 0 or target_ptr >= 0x0000_8000_0000_0000) return -14;
     var tgt: [256]u8 = undefined;
-    const tc = copy.copyPathFromUser(&tgt, target_ptr, 255);
-    if (tc == 0) return -14;
-    tgt[if (tc < 255) tc else 255] = 0;
-    var tl: usize = 0;
-    while (tl < 255 and tgt[tl] != 0) : (tl += 1) {}
+    const tl = switch (userPathResult(target_ptr, &tgt)) {
+        .ok => |p| p.len,
+        .err => |e| return e,
+    };
     if (tl == 0) return -2;
     var lb: [256]u8 = undefined;
     var lj: [256]u8 = undefined;
@@ -2958,11 +2841,10 @@ fn syscallUtimensat(dirfd: i64, path_ptr: u64, times_ptr: u64, flags: u32) i64 {
         };
     }
     var name_buf: [256]u8 = undefined;
-    const n = copy.copyPathFromUser(&name_buf, path_ptr, 255);
-    if (n == 0) return -14;
-    name_buf[if (n < 255) n else 255] = 0;
-    var len: usize = 0;
-    while (len < 255 and name_buf[len] != 0) : (len += 1) {}
+    const len = switch (userPathResult(path_ptr, &name_buf)) {
+        .ok => |p| p.len,
+        .err => |e| return e,
+    };
     if (len == 0) return -2;
     var joined: [256]u8 = undefined;
     const name = switch (at_path.resolve(cur, dirfd, name_buf[0..len], &joined)) {
@@ -2979,6 +2861,26 @@ fn syscallUtimensat(dirfd: i64, path_ptr: u64, times_ptr: u64, flags: u32) i64 {
     const follow = (flags & 0x100) == 0;
     const inode_num = ext2_mod.walkPathToInodeAs(name, ext2Who(), follow) catch |e| return if (e == error.DacDenied) -13 else -2;
     return ext2_mod.setTimes(inode_num, specs, ext2Who());
+}
+
+/// Read a NUL-terminated user path (up to 255 bytes) into `buf`. On failure
+/// sets frame.rax to EFAULT / ENAMETOOLONG and returns null: a path that does
+/// not fit is an error, never silently truncated and acted on.
+fn userPath(frame: *SyscallFrame, ptr: u64, buf: *[256]u8) ?[]const u8 {
+    return switch (userPathResult(ptr, buf)) {
+        .ok => |p| p,
+        .err => |e| {
+            frame.rax = @bitCast(e);
+            return null;
+        },
+    };
+}
+
+fn userPathResult(ptr: u64, buf: *[256]u8) @import("../../fs/namespace_policy.zig").PathCopy {
+    const copy = @import("../../mm/copy_from_user.zig");
+    const n = copy.copyPathFromUser(buf, ptr, 255);
+    const r = @import("../../fs/namespace_policy.zig").pathFromCopy(buf, n, 255);
+    return r;
 }
 
 /// A path argument relative to `dirfd` (AT_FDCWD = the working directory),
@@ -3616,16 +3518,14 @@ fn syscallAccessAt(dirfd: i64, pathname_ptr: u64, mode: u32, flags: u32) i64 {
     const fl = ap.checkFlags(flags);
     if (fl.err != 0) return fl.err;
     if (pathname_ptr == 0 or pathname_ptr >= 0x0000_8000_0000_0000) return -14;
-    const copy = @import("../../mm/copy_from_user.zig");
     const sched = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
     var name_buf: [256]u8 = undefined;
-    const n = copy.copyPathFromUser(&name_buf, pathname_ptr, 255);
-    if (n == 0) return -14;
-    name_buf[if (n < 255) n else 255] = 0;
-    var len: usize = 0;
-    while (len < 256 and name_buf[len] != 0) : (len += 1) {}
-    const name = name_buf[0..len];
+    const name = switch (userPathResult(pathname_ptr, &name_buf)) {
+        .ok => |p| p,
+        .err => |e| return e,
+    };
+    const len = name.len;
 
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = tm.getTask(cur_idx) orelse return -1;
@@ -3839,16 +3739,15 @@ fn syscallGetsid(pid: u32) i64 {
 /// truncate(path, length) — truncate a file by path.
 fn syscallTruncate(path_ptr: u64, length: u64) i64 {
     if (path_ptr == 0 or path_ptr >= 0x0000_8000_0000_0000) return -14;
-    const copy = @import("../../mm/copy_from_user.zig");
     const sched = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
     var name_buf: [256]u8 = undefined;
-    const n = copy.copyPathFromUser(&name_buf, path_ptr, 255);
-    if (n == 0) return -14;
-    name_buf[if (n < 255) n else 255] = 0;
-    var len: usize = 0;
-    while (len < 256 and name_buf[len] != 0) : (len += 1) {}
-    const name = name_buf[0..len];
+    const name = switch (userPathResult(path_ptr, &name_buf)) {
+        .ok => |p| p,
+        .err => |e| return e,
+    };
+    const len = name.len;
+    _ = len;
 
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = tm.getTask(cur_idx) orelse return -1;
@@ -3939,18 +3838,16 @@ fn syscallRenameFlagsAt(old_dirfd: i64, old_ptr: u64, new_dirfd: i64, new_ptr: u
     };
     if (old_ptr == 0 or old_ptr >= 0x0000_8000_0000_0000 or
         new_ptr == 0 or new_ptr >= 0x0000_8000_0000_0000) return -14;
-    const copy = @import("../../mm/copy_from_user.zig");
     var old_buf: [256]u8 = undefined;
     var new_buf: [256]u8 = undefined;
-    const on = copy.copyPathFromUser(&old_buf, old_ptr, 255);
-    const nn = copy.copyPathFromUser(&new_buf, new_ptr, 255);
-    if (on == 0 or nn == 0) return -14;
-    old_buf[if (on < 255) on else 255] = 0;
-    new_buf[if (nn < 255) nn else 255] = 0;
-    var old_len: usize = 0;
-    while (old_len < 256 and old_buf[old_len] != 0) : (old_len += 1) {}
-    var new_len: usize = 0;
-    while (new_len < 256 and new_buf[new_len] != 0) : (new_len += 1) {}
+    const old_len = switch (userPathResult(old_ptr, &old_buf)) {
+        .ok => |p| p.len,
+        .err => |e| return e,
+    };
+    const new_len = switch (userPathResult(new_ptr, &new_buf)) {
+        .ok => |p| p.len,
+        .err => |e| return e,
+    };
     var old_join: [256]u8 = undefined;
     var new_join: [256]u8 = undefined;
     const old_path = switch (@import("../../fs/dirfd_name.zig").resolve(old_dirfd, old_buf[0..old_len], &old_join)) {
@@ -4890,11 +4787,11 @@ fn syscallChroot(path_ptr: u64) i64 {
     // For now, validate path exists and accept
     // Real chroot requires a root_path field in Task struct
     if (path_ptr == 0 or path_ptr >= 0x0000_8000_0000_0000) return -14;
-    const copy = @import("../../mm/copy_from_user.zig");
     var path_buf: [256]u8 = undefined;
-    const copied = copy.copyPathFromUser(path_buf[0..], path_ptr, 255);
-    if (copied == 0) return -14;
-    path_buf[if (copied < 255) copied else 255] = 0;
+    const copied = switch (userPathResult(path_ptr, &path_buf)) {
+        .ok => |p| p.len,
+        .err => |e| return e,
+    };
     // Accept chroot — just log it for now
     serial.writeString("[chroot] path: ");
     serial.writeString(path_buf[0..copied]);
@@ -5140,13 +5037,18 @@ fn syscallMount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64, flags: u64) i
     var tgt_buf: [128]u8 = .{0} ** 128;
     var fst_buf: [16]u8 = .{0} ** 16;
 
+    const np = @import("../../fs/namespace_policy.zig");
     if (source_ptr != 0 and source_ptr < 0x0000_8000_0000_0000) {
-        if (copy.copyPathFromUser(src_buf[0..], source_ptr, 63) == 0) return -14;
+        const rc = np.pathCopyErrno(src_buf[0..], copy.copyPathFromUser(src_buf[0..], source_ptr, 63), 63);
+        if (rc != 0) return rc;
     }
     if (target_ptr == 0 or target_ptr >= 0x0000_8000_0000_0000) return -14;
-    if (copy.copyPathFromUser(tgt_buf[0..], target_ptr, 127) == 0) return -14;
+    // A target that does not fit must fail: truncating it would mount somewhere else.
+    const trc = np.pathCopyErrno(tgt_buf[0..], copy.copyPathFromUser(tgt_buf[0..], target_ptr, 127), 127);
+    if (trc != 0) return trc;
     if (fstype_ptr != 0 and fstype_ptr < 0x0000_8000_0000_0000) {
-        if (copy.copyPathFromUser(fst_buf[0..], fstype_ptr, 15) == 0) return -14;
+        const rc = np.pathCopyErrno(fst_buf[0..], copy.copyPathFromUser(fst_buf[0..], fstype_ptr, 15), 15);
+        if (rc != 0) return rc;
     }
 
     // Find string lengths
@@ -5162,7 +5064,8 @@ fn syscallUmount2(target_ptr: u64, flags: u32) i64 {
     if (target_ptr == 0 or target_ptr >= 0x0000_8000_0000_0000) return -14;
     const copy = @import("../../mm/copy_from_user.zig");
     var tgt_buf: [128]u8 = .{0} ** 128;
-    if (copy.copyPathFromUser(tgt_buf[0..], target_ptr, 127) == 0) return -14;
+    const urc = @import("../../fs/namespace_policy.zig").pathCopyErrno(tgt_buf[0..], copy.copyPathFromUser(tgt_buf[0..], target_ptr, 127), 127);
+    if (urc != 0) return urc;
     const tgt_len = strLen(tgt_buf[0..]);
 
     return vfs_mod.umountFs(tgt_buf[0..tgt_len], flags);
@@ -6074,17 +5977,14 @@ fn syscallSwapon(path_ptr: u64, flags: u32) i64 {
     const swap = @import("../../mm/swap.zig");
     const swap_policy = @import("../../mm/swap_policy.zig");
     const block_dev = @import("../../drivers/block_dev.zig");
-    const copy = @import("../../mm/copy_from_user.zig");
 
     if (!swap_policy.flagsValid(flags)) return -22; // EINVAL
 
     var path_buf: [256]u8 = undefined;
-    const pc = copy.copyPathFromUser(path_buf[0..], path_ptr, 255);
-    if (pc == 0) return -14; // EFAULT
-    const plen = if (pc < 255) pc else 255;
-    path_buf[plen] = 0;
-    var path_len: usize = 0;
-    while (path_len < plen and path_buf[path_len] != 0) : (path_len += 1) {}
+    const path_len = switch (userPathResult(path_ptr, &path_buf)) {
+        .ok => |p| p.len,
+        .err => |e| return e,
+    };
 
     const name = swap_policy.deviceName(path_buf[0..path_len]);
     if (name.len == 0) return -19; // ENODEV
@@ -6119,16 +6019,13 @@ fn syscallSwapoff(path_ptr: u64) i64 {
     const swap = @import("../../mm/swap.zig");
     const swap_policy = @import("../../mm/swap_policy.zig");
     const block_dev = @import("../../drivers/block_dev.zig");
-    const copy = @import("../../mm/copy_from_user.zig");
     const sched = @import("../../proc/sched.zig");
 
     var path_buf: [256]u8 = undefined;
-    const pc = copy.copyPathFromUser(path_buf[0..], path_ptr, 255);
-    if (pc == 0) return -14; // EFAULT
-    const plen = if (pc < 255) pc else 255;
-    path_buf[plen] = 0;
-    var path_len: usize = 0;
-    while (path_len < plen and path_buf[path_len] != 0) : (path_len += 1) {}
+    const path_len = switch (userPathResult(path_ptr, &path_buf)) {
+        .ok => |p| p.len,
+        .err => |e| return e,
+    };
 
     const name = swap_policy.deviceName(path_buf[0..path_len]);
     if (name.len == 0) return -19; // ENODEV

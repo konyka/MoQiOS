@@ -929,7 +929,9 @@ const SchedStats = struct {
   入口统一经 `namespace_policy.writeGate`；`read()` 目录是 EISDIR（ext2 之前会返回 8 字节目录内容，tmpfs 返回 0）；`readlink` 对存在但不是符号链接的名字是 EINVAL
   （`ext2.readlinkPath` 区分 `not_symlink`/`missing`，tmpfs 存在的条目也是 EINVAL）；`rename` 源不存在是 ENOENT（原先被改写成 EXDEV，现在只有 FAT32 根下的名字才保留 EXDEV），
   tmpfs 的 `rename` 路径经过文件是 ENOTDIR；路径超过 255 字节时 open/mkdir/unlink/rmdir/statx/readlink/chdir 返回 ENAMETOOLONG，而不是截断后对截断的名字操作
-  （`namespace_policy.pathCopyErrno` 判断“拷满窗口且没有结尾 NUL”）。其余 `copyPathFromUser` 调用点（约 36 处，多在 syscall_entry.zig）仍会截断，已记入待办。
+  （`namespace_policy.pathCopyErrno` 判断“拷满窗口且没有结尾 NUL”，`pathFromCopy` 返回名字切片或 errno）。**所有**读用户路径的调用点都经过它：syscall_entry.zig 里统一的 `userPath`/`userPathResult`
+  （chmod/chown/lchown/fchmodat(2)/link/symlink/symlinkat/linkat/fchownat/rename/renameat2/truncate/access/utimensat/xattr-at/chroot/swapon/swapoff）、mount/umount2 的目标与来源（窗口 127/63/15）、
+  inotify_add_watch、execve。仍直接调用的只有 `PR_SET_NAME`（comm 就是 15 字节，截断是规定行为）、memfd 名字（随后显式检查长度）与 `userPathResult` 本身；源码守卫测试数着这个清单。
   `hello41` 原先断言 `copy_file_range` 写入只读目标得 `-1`，Linux 的答案是 EBADF，断言随之更正。
 - **命名空间调用在 ext2/tmpfs 上返回 Linux 错误码（hello127）**：此前 unlink、rmdir、mkdir、open 的大多数失败都是裸 `-1`（用户态看到 EPERM）。
   纯策略 `fs/namespace_policy.zig` 给出规则，两个文件系统共用：`unlink` 目录 EISDIR；`rmdir` 非目录 ENOTDIR、非空 ENOTEMPTY；`mkdir` 已存在

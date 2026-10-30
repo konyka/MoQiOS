@@ -80,10 +80,10 @@ pub fn addWatch(fd: u32, path_ptr: u64, mask: u32) i64 {
     if (path_ptr == 0 or path_ptr >= 0x0000_8000_0000_0000) return -14;
     var path_buf: [256]u8 = undefined;
     const n = copy.copyPathFromUser(path_buf[0..], path_ptr, 255);
-    if (n == 0) return -14;
-    path_buf[if (n < 255) n else 255] = 0;
-    var path_len: usize = 0;
-    while (path_len < 256 and path_buf[path_len] != 0) : (path_len += 1) {}
+    const path_len = switch (@import("namespace_policy.zig").pathFromCopy(path_buf[0..], n, 255)) {
+        .ok => |p| p.len,
+        .err => |e| return e,
+    };
 
     // Use hash of path as inode_id for watch tracking
     const inode_id = inotify_policy.hashPathId(path_buf[0..path_len]);

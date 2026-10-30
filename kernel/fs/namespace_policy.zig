@@ -76,3 +76,15 @@ pub fn pathCopyErrno(buf: []const u8, copied: usize, max: usize) i64 {
     // copied == max: fits only if the last copied byte is the terminator
     return if (buf[copied - 1] == 0) 0 else -36;
 }
+
+pub const PathCopy = union(enum) { ok: []const u8, err: i64 };
+
+/// The NUL-terminated name inside `buf` after a `copyPathFromUser(buf, ptr, max)`
+/// that returned `copied`, or EFAULT / ENAMETOOLONG (see pathCopyErrno).
+pub fn pathFromCopy(buf: []const u8, copied: usize, max: usize) PathCopy {
+    const rc = pathCopyErrno(buf, copied, max);
+    if (rc != 0) return .{ .err = rc };
+    var n: usize = 0;
+    while (n < copied and buf[n] != 0) : (n += 1) {}
+    return .{ .ok = buf[0..n] };
+}
