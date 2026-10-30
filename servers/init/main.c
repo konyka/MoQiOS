@@ -273,6 +273,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello143"); /* socket options on every socket kind */
     run_test("hello144"); /* UDP receive: blocking, timeout, non-blocking */
     run_test("hello145"); /* UDP sendmsg/recvmsg, AF_UNIX receive timeout */
+    run_test("hello146"); /* sendmmsg / recvmmsg */
 
     start_persistent_services();
 

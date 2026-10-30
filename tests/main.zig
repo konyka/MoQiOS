@@ -1811,12 +1811,21 @@ test "socketpair policy rejects unsupported combinations before allocation" {
     try std.testing.expectEqual(kt.errno.EINVAL, socketpair_policy.validate(1, 1 | 0x400, 0));
 }
 
-test "message batch policy bounds TCP batches without reading timeout" {
-    try std.testing.expectEqual(@as(i64, 0), message_batch_policy.validate(0, 0, 0));
-    try std.testing.expectEqual(@as(i64, 0), message_batch_policy.validate(message_batch_policy.MAX_MESSAGES, 0, 0));
-    try std.testing.expectEqual(kt.errno.EINVAL, message_batch_policy.validate(message_batch_policy.MAX_MESSAGES + 1, 0, 0));
-    try std.testing.expectEqual(kt.errno.EINVAL, message_batch_policy.validate(1, 1, 0));
-    try std.testing.expectEqual(kt.errno.EINVAL, message_batch_policy.validate(1, 0, 0x0000_7fff_ffff_fff0));
+test "message batch policy: vlen clamp, flags, WAITFORONE, results and timeout" {
+    const mp = message_batch_policy;
+    try std.testing.expectEqual(mp.MAX_MESSAGES, mp.clampVlen(5000));
+    try std.testing.expectEqual(@as(u64, 3), mp.clampVlen(3));
+    try std.testing.expectEqual(@as(i64, 0), mp.validateRecvFlags(mp.MSG_DONTWAIT | mp.MSG_WAITFORONE));
+    try std.testing.expectEqual(kt.errno.EINVAL, mp.validateRecvFlags(0x1000_0000));
+    try std.testing.expectEqual(@as(i64, 0), mp.validateSendFlags(mp.MSG_NOSIGNAL));
+    try std.testing.expectEqual(kt.errno.EINVAL, mp.validateSendFlags(mp.MSG_WAITFORONE));
+    try std.testing.expectEqual(@as(u32, 0), mp.messageFlags(mp.MSG_WAITFORONE, 0));
+    try std.testing.expectEqual(mp.MSG_DONTWAIT, mp.messageFlags(mp.MSG_WAITFORONE, 1));
+    try std.testing.expectEqual(@as(i64, 3), mp.batchResult(3, -11));
+    try std.testing.expectEqual(@as(i64, -11), mp.batchResult(0, -11));
+    try std.testing.expect(mp.timeoutDeadline(false, 0, 0, 5) == .none);
+    try std.testing.expect(mp.timeoutDeadline(true, 0, 1_000_000_000, 5) == .invalid);
+    try std.testing.expectEqual(@as(u64, 5 + 1_500_000_000), mp.timeoutDeadline(true, 1, 500_000_000, 5).deadline);
 }
 
 test "creation metadata masks requested permissions to nine mode bits" {

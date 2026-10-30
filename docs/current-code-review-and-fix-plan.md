@@ -5498,3 +5498,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 变异：UDP `recvmsg` 不再设置 `MSG_TRUNC` → hello145 B 段 `msg_flags has MSG_TRUNC` FAIL，恢复后 PASS。
 - 验证：host 787/787；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### sendmmsg / recvmmsg（hello146）
+
+- 问题：`vlen>16` 是 EINVAL；只接受 `flags==0`、超时指针必须为 NULL；`sendmmsg` 不写 `msg_len`；不认识 `MSG_WAITFORONE`；UDP 与 AF_UNIX 套接字 ENOTSOCK。
+- 修复：`message_batch_policy.zig` 重写成纯策略（`clampVlen`、`validateRecvFlags/validateSendFlags`、`messageFlags`、`batchResult`、`timeoutDeadline/expired`）；`recvmmsg`/`sendmmsg` 用 `batchEntryOk` 预检每条消息，支持 timespec 超时与 `MSG_WAITFORONE`，两者都写 `msg_len`；UDP/AF_UNIX 通过 hello142/145 已有的 `sendmsg`/`recvmsg` 工作。
+- 已知差异：批次最多 16 条（Linux 是 1024）；`recvmmsg` 的超时只在两条消息之间检查，不会打断一条正在阻塞的接收（Linux 同样只在消息之间检查，但内核里还会为阻塞的单条接收设定剩余时间）；超时不写回。
+- 排查过程（如实）：探测一次写完，只有预期内的失败；实现后 `hello81` 失败了——它断言旧行为（`vlen=17` 为 EINVAL）。Linux 对过大的 `vlen` 是截断而不是报错，所以这是旧断言的问题，改成“截断后遇到 NULL 向量得到 EFAULT”，并加了一条极大 `vlen` 的断言，这是有意的语义变更。
+- TDD：host 的批处理策略测试改写为 4 组断言（原测试针对旧语义）；hello146（15 项）在 HEAD 上 10 项 FAIL，新内核 PASS。
+
+- 变异：`MSG_WAITFORONE` 不再让后续消息变成非阻塞 → host 的批处理策略测试失败（786/787）；在 QEMU 里同一变异使 hello146 B 段的 `recvmmsg(MSG_WAITFORONE)` 永远等第二条数据报，冒烟超时（没有 FAIL 行，因为进程根本没返回），恢复后 PASS。
+- 验证：host 787/787；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

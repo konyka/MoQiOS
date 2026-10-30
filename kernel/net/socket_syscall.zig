@@ -1263,91 +1263,103 @@ pub fn netPoll() i64 {
     return @intCast(count);
 }
 
+/// Validate one mmsghdr of a batch: the header and its iovec array must be
+/// readable; for receives the buffers must be writable, for sends readable.
+fn batchEntryOk(entry_ptr: u64, receiving: bool) i64 {
+    if (!copy.validateUserBuffer(entry_ptr, 56)) return -14;
+    if (receiving and !copy.validateUserBufferWritable(entry_ptr + 56, 4)) return -14;
+    if (!receiving and !copy.validateUserBuffer(entry_ptr + 56, 4)) return -14;
+    var header: [56]u8 = undefined;
+    if (copy.copyFromUser(&header, @ptrFromInt(entry_ptr), 56) < 32) return -14;
+    const iov_ptr = bo.readU64At(&header, 16);
+    const iov_len = bo.readU64At(&header, 24);
+    if (iov_len == 0) return 0; // an empty message (no buffers) is legal
+    if (iov_len > 1024 or iov_ptr == 0 or iov_ptr > 0x0000_8000_0000_0000 -| iov_len * 16) return -22;
+    if (!copy.validateUserBuffer(iov_ptr, @intCast(iov_len * 16))) return -14;
+    for (0..@as(usize, @intCast(iov_len))) |j| {
+        var iov: [16]u8 = undefined;
+        if (copy.copyFromUser(&iov, @ptrFromInt(iov_ptr + @as(u64, @intCast(j)) * 16), 16) != 16) return -14;
+        const base = bo.readU64At(&iov, 0);
+        const len = bo.readU64At(&iov, 8);
+        if (len == 0) continue;
+        if (base == 0 or base >= 0x0000_8000_0000_0000 or len > 0x0000_8000_0000_0000 - base) return if (receiving) -14 else -22;
+        const n: usize = @intCast(@min(len, 0xFFFF_FFFF));
+        if (receiving) {
+            if (!copy.validateUserBufferWritable(base, n)) return -14;
+        } else if (!copy.validateUserBuffer(base, n)) return -14;
+    }
+    return 0;
+}
+
 /// recvmmsg(sockfd, msgvec, vlen, flags, timeout) → count or -errno
-pub fn recvmmsg(sockfd: u32, msgvec_ptr: u64, vlen: u64, flags: u32, timeout: u64) i64 {
-    const policy_result = message_batch_policy.validate(vlen, flags, timeout);
-    if (policy_result != 0) return policy_result;
+pub fn recvmmsg(sockfd: u32, msgvec_ptr: u64, vlen_raw: u64, flags: u32, timeout: u64) i64 {
+    const mp = message_batch_policy;
+    const flag_rc = mp.validateRecvFlags(flags);
+    if (flag_rc != 0) return flag_rc;
+    const vlen = mp.clampVlen(vlen_raw);
     if (vlen == 0) return 0;
     if (msgvec_ptr == 0 or msgvec_ptr >= 0x0000_8000_0000_0000) return -14;
+
+    // Optional struct timespec: the batch ends between messages once it passed.
+    const tsc = @import("../arch/arch.zig").tsc;
+    var deadline: ?u64 = null;
+    if (timeout != 0) {
+        var raw: [16]u8 = undefined;
+        if (!copy.validateUserBuffer(timeout, 16) or copy.copyFromUser(&raw, @ptrFromInt(timeout), 16) != 16) return -14;
+        switch (mp.timeoutDeadline(true, @bitCast(bo.readU64Le(raw[0..8])), @bitCast(bo.readU64Le(raw[8..16])), tsc.nanos())) {
+            .none => {},
+            .deadline => |d| deadline = d,
+            .invalid => return -22,
+        }
+    }
 
     // Preflight every entry so a first-message failure cannot leave a partial
     // batch of user-visible writes behind.
     for (0..@as(usize, @intCast(vlen))) |i| {
-        const entry_ptr = msgvec_ptr + @as(u64, @intCast(i)) * 64;
-        if (!copy.validateUserBuffer(entry_ptr, 56) or
-            !copy.validateUserBufferWritable(entry_ptr + 56, 4)) return -14;
-        var header: [56]u8 = undefined;
-        if (copy.copyFromUser(&header, @ptrFromInt(entry_ptr), 56) < 32) return -14;
-        const iov_ptr = bo.readU64At(&header, 16);
-        const iov_len = bo.readU64At(&header, 24);
-        if (iov_ptr == 0 or iov_len == 0 or iov_len > 1024 or
-            iov_ptr > 0x0000_8000_0000_0000 -| iov_len * 16) return -22;
-        if (!copy.validateUserBuffer(iov_ptr, @intCast(iov_len * 16))) return -14;
-        for (0..@as(usize, @intCast(iov_len))) |j| {
-            var iov: [16]u8 = undefined;
-            const ptr = iov_ptr + @as(u64, @intCast(j)) * 16;
-            if (copy.copyFromUser(&iov, @ptrFromInt(ptr), 16) != 16) return -14;
-            const base = bo.readU64At(&iov, 0);
-            const len = bo.readU64At(&iov, 8);
-            if (base == 0 or len == 0 or base >= 0x0000_8000_0000_0000 or
-                len > 0x0000_8000_0000_0000 - base) return -14;
-            if (!copy.validateUserBufferWritable(base, @intCast(@min(len, 0xFFFF_FFFF)))) return -14;
-        }
+        const rc = batchEntryOk(msgvec_ptr + @as(u64, @intCast(i)) * 64, true);
+        if (rc != 0) return rc;
     }
 
-    var count: i64 = 0;
+    var count: u64 = 0;
     for (0..@as(usize, @intCast(vlen))) |i| {
         const entry_ptr = msgvec_ptr + @as(u64, @intCast(i)) * 64;
-        const result = recvmsg(sockfd, entry_ptr, flags);
-        if (result < 0) return if (count == 0) result else count;
+        const result = recvmsg(sockfd, entry_ptr, mp.messageFlags(flags, count));
+        if (result < 0) return mp.batchResult(count, result);
 
         var len_buf: [4]u8 = undefined;
         bo.writeU32Le(&len_buf, @intCast(result));
-        if (copy.copyToUser(@ptrFromInt(entry_ptr + 56), &len_buf, 4) != 4) {
-            return if (count == 0) -14 else count;
-        }
+        if (copy.copyToUser(@ptrFromInt(entry_ptr + 56), &len_buf, 4) != 4) return mp.batchResult(count, -14);
         count += 1;
+        if (mp.expired(deadline, tsc.nanos())) break;
     }
-    return count;
+    return @intCast(count);
 }
 
 /// sendmmsg(sockfd, msgvec, vlen, flags) → count or -errno
-pub fn sendmmsg(sockfd: u32, msgvec_ptr: u64, vlen: u64, flags: u32) i64 {
-    const policy_result = message_batch_policy.validate(vlen, flags, 0);
-    if (policy_result != 0) return policy_result;
+pub fn sendmmsg(sockfd: u32, msgvec_ptr: u64, vlen_raw: u64, flags: u32) i64 {
+    const mp = message_batch_policy;
+    const flag_rc = mp.validateSendFlags(flags);
+    if (flag_rc != 0) return flag_rc;
+    const vlen = mp.clampVlen(vlen_raw);
     if (vlen == 0) return 0;
     if (msgvec_ptr == 0 or msgvec_ptr >= 0x0000_8000_0000_0000) return -14;
 
     // Validate every header and its iovec descriptors before sending anything;
     // this preserves the no-mutation-on-first-failure contract.
     for (0..@as(usize, @intCast(vlen))) |i| {
-        const entry_ptr = msgvec_ptr + @as(u64, @intCast(i)) * 64;
-        if (!copy.validateUserBuffer(entry_ptr, 56)) return -14;
-        var header: [56]u8 = undefined;
-        if (copy.copyFromUser(&header, @ptrFromInt(entry_ptr), 56) < 32) return -14;
-        const iov_ptr = bo.readU64At(&header, 16);
-        const iov_len = bo.readU64At(&header, 24);
-        if (iov_ptr == 0 or iov_len == 0 or iov_len > 1024 or
-            iov_ptr > 0x0000_8000_0000_0000 -| iov_len * 16) return -22;
-        if (!copy.validateUserBuffer(iov_ptr, @intCast(iov_len * 16))) return -14;
-        for (0..@as(usize, @intCast(iov_len))) |j| {
-            var iov: [16]u8 = undefined;
-            const ptr = iov_ptr + @as(u64, @intCast(j)) * 16;
-            if (copy.copyFromUser(&iov, @ptrFromInt(ptr), 16) != 16) return -14;
-            const base = bo.readU64At(&iov, 0);
-            const len = bo.readU64At(&iov, 8);
-            if (base == 0 or len == 0 or base >= 0x0000_8000_0000_0000 or
-                len > 0x0000_8000_0000_0000 - base) return -22;
-            if (!copy.validateUserBuffer(base, @intCast(@min(len, 0xFFFF_FFFF)))) return -14;
-        }
+        const rc = batchEntryOk(msgvec_ptr + @as(u64, @intCast(i)) * 64, false);
+        if (rc != 0) return rc;
     }
 
-    var count: i64 = 0;
+    var count: u64 = 0;
     for (0..@as(usize, @intCast(vlen))) |i| {
         const entry_ptr = msgvec_ptr + @as(u64, @intCast(i)) * 64;
         const result = sendmsg(sockfd, entry_ptr, flags);
-        if (result < 0) return if (count == 0) result else count;
+        if (result < 0) return mp.batchResult(count, result);
+        var len_buf: [4]u8 = undefined;
+        bo.writeU32Le(&len_buf, @intCast(result));
+        if (copy.copyToUser(@ptrFromInt(entry_ptr + 56), &len_buf, 4) != 4) return mp.batchResult(count, -14);
         count += 1;
     }
-    return count;
+    return @intCast(count);
 }
