@@ -465,6 +465,38 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
     }
 }
 
+/// Wait until a datagram is queued for `port`. Returns 0 when one is there (or
+/// may be: the caller re-checks), -EAGAIN for a non-blocking socket or an
+/// expired SO_RCVTIMEO, -EINTR when a signal ended the wait. The wait is a
+/// series of short sleeps that also pump the loopback device, so a datagram
+/// sent from another process on 127/8 arrives without an explicit net_poll.
+fn udpWaitForDatagram(port: u16, is_v6: bool, nonblock: bool) i64 {
+    const urp = @import("udp_recv_policy.zig");
+    const tsc = @import("../arch/arch.zig").tsc;
+    const lo = @import("lo.zig");
+    const se = @import("../arch/x86_64/syscall_entry.zig");
+    var deadline: ?u64 = null;
+    var armed = false;
+    while (true) {
+        if (!armed) {
+            const ms = if (udp.getPortOpts(port)) |o| o.rcv_ms else 0;
+            deadline = urp.deadlineNs(tsc.nanos(), ms);
+            armed = true;
+        }
+        _ = lo.drain();
+        const step = urp.step(udp.hasQueuedDatagramFor(port, is_v6), nonblock, urp.timedOut(deadline, tsc.nanos()));
+        switch (step) {
+            .deliver => return 0,
+            .eagain => return -11,
+            .wait => {},
+        }
+        const now = tsc.nanos();
+        const slice = now +| 5 * 1_000_000;
+        const rc = se.sleepUntil(if (deadline) |d| @min(slice, d) else slice, 0);
+        if (rc < 0) return rc;
+    }
+}
+
 /// recvfrom(fd, buf, len, flags, addr_ptr, addr_len_ptr) → bytes received or -errno
 pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len_ptr: u64) i64 {
     // UDP honors MSG_PEEK (leave the datagram queued) and MSG_TRUNC (report
@@ -506,6 +538,8 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         const is_v6 = t.fd_table.fds[fd].udp_is_v6;
         const src_port = t.fd_table.fds[fd].udp_port;
+        const wait_rc = udpWaitForDatagram(src_port, is_v6, @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, flags));
+        if (wait_rc != 0) return wait_rc;
         var user_addr_len: u32 = 0;
         if (addr_ptr != 0) {
             if (addr_len_ptr == 0 or !copy.validateUserBufferWritable(addr_len_ptr, 4)) return -14;

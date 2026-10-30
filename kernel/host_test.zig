@@ -154,6 +154,7 @@ pub const poll_policy = @import("fs/poll_policy.zig");
 pub const ioctl_policy = @import("fs/ioctl_policy.zig");
 pub const scm_policy = @import("net/scm_policy.zig");
 pub const sockopt_policy = @import("net/sockopt_policy.zig");
+pub const udp_recv_policy = @import("net/udp_recv_policy.zig");
 pub const sigaltstack_policy = @import("proc/sigaltstack_policy.zig");
 pub const kill_broadcast_policy = @import("proc/kill_broadcast_policy.zig");
 pub const segment_copy_policy = @import("proc/segment_copy_policy.zig");

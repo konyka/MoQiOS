@@ -271,6 +271,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello141"); /* ioctl requests */
     run_test("hello142"); /* SCM_RIGHTS fd passing */
     run_test("hello143"); /* socket options on every socket kind */
+    run_test("hello144"); /* UDP receive: blocking, timeout, non-blocking */
 
     start_persistent_services();
 

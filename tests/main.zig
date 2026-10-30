@@ -7739,3 +7739,15 @@ test "sockopt policy: applySet/encodeGet round trip and rejections" {
     try std.testing.expectEqual(@as(?usize, 12), p.encodeGet(s, cred_f, p.SO_PEERCRED, &out));
     try std.testing.expectEqual(@as(?usize, null), p.encodeGet(s, f, p.SO_PEERCRED, &out));
 }
+
+test "udp receive policy: empty queue waits, fails with EAGAIN or delivers" {
+    const up = kt.udp_recv_policy;
+    try std.testing.expectEqual(up.Step.deliver, up.step(true, false, false));
+    try std.testing.expectEqual(up.Step.wait, up.step(false, false, false));
+    try std.testing.expectEqual(up.Step.eagain, up.step(false, true, false));
+    try std.testing.expectEqual(up.Step.eagain, up.step(false, false, true));
+    try std.testing.expectEqual(@as(?u64, null), up.deadlineNs(100, 0));
+    try std.testing.expectEqual(@as(?u64, 100 + 5_000_000), up.deadlineNs(100, 5));
+    try std.testing.expect(up.timedOut(10, 10));
+    try std.testing.expect(!up.timedOut(null, 1 << 60));
+}

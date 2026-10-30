@@ -257,9 +257,9 @@ static void worker(int w) {
             if (recv_pumped_flags(u, (uint8_t *)rcv2, UDP_LEN / 2, MSG_TRUNC, src, &srclen) != UDP_LEN)
                 worker_fail(w, "udp trunc len");
             if (!verify_pat(rcv2, UDP_LEN / 16, w, 77)) worker_fail(w, "udp trunc verify");
-            /* Queue drained: an immediate recv finds nothing. */
-            if (syscall6(SYS_RECVFROM, (uint64_t)u, (uint64_t)rcv2, UDP_LEN, 0,
-                         (uint64_t)src, (uint64_t)&srclen) != 0)
+            /* Queue drained: a non-blocking recv finds nothing (EAGAIN). */
+            if (syscall6(SYS_RECVFROM, (uint64_t)u, (uint64_t)rcv2, UDP_LEN, 0x40 /* MSG_DONTWAIT */,
+                         (uint64_t)src, (uint64_t)&srclen) != -11)
                 worker_fail(w, "udp trunc consumed");
         }
         if (syscall1(SYS_CLOSE, (uint64_t)u) != 0) worker_fail(w, "udp close");

@@ -5476,3 +5476,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 变异：缓冲区大小规则由“乘 2”改成“除以 2” → hello143 的 `SO_RCVBUF/SO_SNDBUF is at least what was asked` 在 AF_UNIX、UDP 两种套接字上都 FAIL（host 测试同样失败），恢复后 PASS。
 - 验证：host 786/786；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）第一次 5 轮中第 5 轮出现 `hello108` 的已知间歇性失败（基线最大间隔 949 µs，回收窗口最大间隔 3761 µs，超过 3000 µs 的预算，窗口内 CPU0 中断总耗时 5.4 ms，最长单次中断 89 ms 发生在开机早期，向量 14，与既有的“缺页路径关中断读盘”限制一致）；本改动不涉及调度/回收，立即重跑 5 轮全部 PASS。没有为此放宽 hello108 的阈值。
+
+### UDP 接收：阻塞、超时、非阻塞（hello144）
+
+- 问题：UDP `recvfrom` 空队列立即返回 0（数据报没有 EOF，这是错的）；阻塞套接字不等待；`O_NONBLOCK`/`MSG_DONTWAIT` 得不到 EAGAIN；`SO_RCVTIMEO` 不生效；跨进程的回环数据报依赖调用方 `netpoll`。hello143 的“`SO_RCVTIMEO` 在 UDP 上只保存不生效”缺口就是它。
+- 修复：新增 `net/udp_recv_policy.zig`（纯策略：`step`/`deadlineNs`/`timedOut`）；`socket_syscall.udpWaitForDatagram`：5 ms 一片的 `sleepUntil`，每片前 `lo.drain()`；`recvfrom` 的 UDP 路径在取数据前先等待。
+- 已知差异：`recvmsg`/`recvmmsg` 在 UDP 上仍是 ENOTSOCK（它们只支持 TCP 和 AF_UNIX）；等待是 5 ms 轮询而不是挂在端口的等待队列上（最坏多 5 ms 延迟）；`SO_RCVTIMEO` 对 AF_UNIX 套接字仍不生效；等待函数按地址族判断队列里有没有数据（`udp.hasQueuedDatagramFor`），所以一个 IPv6 套接字不会被排在同一端口上的 IPv4 数据报唤醒。
+- 排查过程（如实）：探测第一次就直接给出 7 个预期内的 FAIL，实现后全部通过；`hello50` 有一处旧断言依赖“空队列返回 0”，按新语义改成 `MSG_DONTWAIT` 返回 EAGAIN，这是有意的行为变更，不是回归。
+- TDD：host 新增 1 个测试；hello144（10 项）在 HEAD 上 7 项 FAIL，新内核 PASS。
+
+- 变异：非阻塞套接字空队列不再返回 EAGAIN（改为一直等）→ host 测试 `udp receive policy` 失败（786/787）；在 QEMU 里同一变异使 hello144 A 段第一次非阻塞接收永远等待，冒烟超时（没有 FAIL 行，因为进程根本没返回），恢复后 PASS。
+- 验证：host 787/787；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

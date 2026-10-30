@@ -150,6 +150,17 @@ pub fn releasePort(port: u16) void {
     }
 }
 
+/// True when a datagram of the given address family is queued for `port`.
+pub fn hasQueuedDatagramFor(port: u16, is_v6: bool) bool {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const port_idx = findPortIdxLocked(port) orelse return false;
+    for (0..QUEUE_DEPTH) |i| {
+        if (queues[port_idx][i].valid and queues[port_idx][i].is_v6 == is_v6) return true;
+    }
+    return false;
+}
+
 /// True when a datagram is queued for `port` (epoll readiness).
 pub fn hasQueuedDatagram(port: u16) bool {
     const saved = udp_lock.acquire();
