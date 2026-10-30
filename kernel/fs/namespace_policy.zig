@@ -164,6 +164,12 @@ pub fn writeProgress(total: usize, done: usize, result: i64, nonblock: bool) Wri
     return if (done > 0) .partial else .fail;
 }
 
+/// Result of a blocking write whose SO_SNDTIMEO ran out: what was already sent,
+/// or EAGAIN when nothing was.
+pub fn sendTimeoutResult(done: usize) i64 {
+    return if (done > 0) @intCast(done) else -11;
+}
+
 /// A datagram is sent whole or not at all: it can never be larger than the ring
 /// (the receiver could never hold it), and otherwise only waits for room.
 pub const DGRAM_PREFIX: usize = 2;

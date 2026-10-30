@@ -5572,3 +5572,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 新增 2 个测试（写循环、数据报大小）；hello150（A 阻塞 30000 字节、B 非阻塞短写后 `EAGAIN`、C `MSG_DONTWAIT`、D 读者关闭唤醒写者）在 HEAD 上 A 段 3 项 FAIL，新内核 PASS。
 - 变异：去掉 `unixClose` 里对写等待者的唤醒 → hello150 D 段写者永远睡着，冒烟超时；恢复后 PASS。
 - 验证：host 792/792；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello150 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### AF_UNIX `SO_SNDTIMEO`（hello150 E 段）
+
+- 问题：设置了 `SO_SNDTIMEO` 的 AF_UNIX 套接字，阻塞写在环形缓冲满时一直睡下去，超时不生效（hello150 的“已知差异”）。
+- 修复：`unixSendBlocking` 在需要等待时按 `snd_ms` 算出截止时间并带它调用 `parkOn`；`parkOn` 增加 `deadline: ?u64` 参数（睡眠位图与 `sleep_deadline_ns` 的处理从原来的 `parkTimed` 搬进来，`parkTimed` 删除，接收超时走同一条路径）。超时后返回已写字节数，一个字节没写则 `EAGAIN`。
+- 已知差异：UDP 发送不阻塞故无超时需求；TCP 的 `SO_SNDTIMEO` 没有检查。
+- TDD：host 新增 1 个测试（`sendTimeoutResult`）；hello150 E 段（设置超时、写 30000 字节返回部分字节且约 150 ms、下一次写 `EAGAIN`、读者腾出空间后立即写成功）在 HEAD 上因写永远阻塞而冒烟超时，新内核 PASS。
+- 变异：让 `snd_ms` 恒为 0（不取套接字的发送超时）→ hello150 E 段的写永远阻塞，冒烟超时；恢复后 PASS。
+- 验证：host 793/793；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、GPT SMP=2 hello150 PASS、0 FAIL；SMP=8 第一次运行停在 hello144 D 段（已知的间歇性停顿，0 个 FAIL），重跑 PASS；stress（SMP=2）5/5 PASS。

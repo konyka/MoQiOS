@@ -7849,3 +7849,8 @@ test "datagram size must fit the ring with its length prefix" {
     try std.testing.expect(!np.dgramFits(8191, 8192));
     try std.testing.expect(!np.dgramFits(70000, 8192));
 }
+
+test "a timed-out blocking write reports what was sent, else EAGAIN" {
+    try std.testing.expectEqual(@as(i64, -11), kt.namespace_policy.sendTimeoutResult(0));
+    try std.testing.expectEqual(@as(i64, 8192), kt.namespace_policy.sendTimeoutResult(8192));
+}

@@ -970,10 +970,12 @@ const WaitKind = enum { read, write, accept };
 /// Park the current task on `idx`'s `kind` wait stack if the socket is still
 /// in the state the caller observed. Returns 0 after a wake-up (re-check),
 /// -4 for an actionable signal, -9 if the socket vanished.
-fn parkOn(idx: u32, kind: WaitKind, min_room: u32) i64 {
+fn parkOn(idx: u32, kind: WaitKind, min_room: u32, deadline: ?u64) i64 {
     const task_mod = @import("../proc/task.zig");
     const sched = @import("../proc/sched.zig");
     const cur_idx = sched.currentTaskIndex() orelse return -1;
+    const cur = task_mod.getTask(cur_idx) orelse return -1;
+    const bit = @as(u64, 1) << @intCast(cur_idx);
     var node: WaitNode = .{ .task_idx = cur_idx };
     {
         const saved = unix_lock.acquire();
@@ -1002,12 +1004,21 @@ fn parkOn(idx: u32, kind: WaitKind, min_room: u32) i64 {
         };
         node.next = stack.*;
         stack.* = &node;
+        if (deadline) |d| {
+            // Publish the deadline before blocking so the tick can wake us.
+            @atomicStore(u64, &cur.sleep_deadline_ns, d, .release);
+            _ = @atomicRmw(u64, &sched.sleep_bm, .Or, bit, .seq_cst);
+        }
         task_mod.blockTask(cur_idx);
         unix_lock.release(saved);
     }
 
     asm volatile ("int $240");
     sched.repairCurrentAfterBlock();
+    if (deadline != null) {
+        cur.sleep_deadline_ns = 0;
+        _ = @atomicRmw(u64, &sched.sleep_bm, .And, ~bit, .seq_cst);
+    }
 
     {
         const saved = unix_lock.acquire();
@@ -1051,101 +1062,67 @@ pub fn unixRecvBlockingRights(idx: u32, buf: [*]u8, len: usize, nonblock: bool, 
             armed = true;
         }
         if (deadline == null) {
-            const w = parkOn(idx, .read, 0);
+            const w = parkOn(idx, .read, 0, null);
             if (w != 0) return w;
             continue;
         }
         if (urp.timedOut(deadline, tsc.nanos())) return -11;
-        const w = parkTimed(idx, deadline.?);
+        const w = parkOn(idx, .read, 0, deadline);
         if (w != 0) return w;
     }
-}
-
-/// Park on the read stack until a wake-up or `deadline`; the sleep timer
-/// (sched.sleepTimerTick) wakes the task at the deadline. 0 = re-check.
-fn parkTimed(idx: u32, deadline: u64) i64 {
-    const task_mod = @import("../proc/task.zig");
-    const sched = @import("../proc/sched.zig");
-    const cur_idx = sched.currentTaskIndex() orelse return -1;
-    const cur = task_mod.getTask(cur_idx) orelse return -1;
-    var node: WaitNode = .{ .task_idx = cur_idx };
-    const bit = @as(u64, 1) << @intCast(cur_idx);
-    {
-        const saved = unix_lock.acquire();
-        const sock = &unix_sockets[idx];
-        if (!sock.active) {
-            unix_lock.release(saved);
-            return -9;
-        }
-        const still = sock.buf_count == 0 and (sock.sock_type != SOCK_STREAM or sock.connected or queuedOnBacklogLocked(idx));
-        if (!still) {
-            unix_lock.release(saved);
-            return 0;
-        }
-        node.next = sock.read_waiters;
-        sock.read_waiters = &node;
-        // Publish the deadline before blocking so the tick can wake us.
-        @atomicStore(u64, &cur.sleep_deadline_ns, deadline, .release);
-        _ = @atomicRmw(u64, &sched.sleep_bm, .Or, bit, .seq_cst);
-        task_mod.blockTask(cur_idx);
-        unix_lock.release(saved);
-    }
-    asm volatile ("int $240");
-    sched.repairCurrentAfterBlock();
-    {
-        const saved = unix_lock.acquire();
-        unlinkWaiter(&unix_sockets[idx].read_waiters, &node);
-        unix_lock.release(saved);
-    }
-    cur.sleep_deadline_ns = 0;
-    _ = @atomicRmw(u64, &sched.sleep_bm, .And, ~bit, .seq_cst);
-    const sig_mod = @import("../proc/signal.zig");
-    if (sig_mod.pendingFatal(cur)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
-    if (sig_mod.pendingActionable(cur)) return -4;
-    return 0;
 }
 
 /// Write `data` to socket `idx`, waiting for room when the ring is full and the
 /// socket is blocking. STREAM: everything is sent (a write reports progress in
 /// the ring); DGRAM: the datagram is sent whole, or EAGAIN when it does not fit.
+/// SO_SNDTIMEO bounds the total wait: once it passes, the bytes already sent are
+/// reported, or EAGAIN when nothing was.
 pub fn unixSendBlocking(idx: u32, data: [*]const u8, len: usize, nonblock: bool) i64 {
     if (idx >= MAX_UNIX_SOCKETS) return -9;
+    const urp = @import("udp_recv_policy.zig");
+    const tsc = @import("../arch/arch.zig").tsc;
     const stream = blk: {
         const saved = unix_lock.acquire();
         defer unix_lock.release(saved);
         if (!unix_sockets[idx].active) return -9;
         break :blk unix_sockets[idx].sock_type == SOCK_STREAM;
     };
-    if (!stream) {
-        // One datagram: it fits the ring or it never will.
-        const fits = blk: {
-            const saved = unix_lock.acquire();
-            defer unix_lock.release(saved);
-            const room = sendRoomLocked(idx) orelse return unixSendRights(idx, data, len, null);
-            break :blk np.dgramFits(len, UNIX_SOCK_BUF_SIZE) and room >= len + np.DGRAM_PREFIX;
-        };
-        if (fits) return unixSendRights(idx, data, len, null);
-        if (nonblock) return -11;
-        // Wait until the whole datagram fits, then try again.
-        const w = parkOn(idx, .write, @intCast(len + np.DGRAM_PREFIX));
-        if (w != 0) return w;
-        return unixSendBlocking(idx, data, len, false);
-    }
-
+    var deadline: ?u64 = null;
+    var armed = false;
     var done: usize = 0;
     while (true) {
-        const result = unixSendRights(idx, data + done, len - done, null);
-        switch (np.writeProgress(len, done, result, nonblock)) {
-            .done => return @intCast(len),
-            .again => {
-                done += @intCast(result);
-                continue;
-            },
-            .partial => return @intCast(done + @as(usize, @intCast(@max(result, 0)))),
-            .fail => return result,
-            .wait => {},
+        var need: u32 = 1;
+        if (stream) {
+            const result = unixSendRights(idx, data + done, len - done, null);
+            switch (np.writeProgress(len, done, result, nonblock)) {
+                .done => return @intCast(len),
+                .again => {
+                    done += @intCast(result);
+                    continue;
+                },
+                .partial => return @intCast(done + @as(usize, @intCast(@max(result, 0)))),
+                .fail => return result,
+                .wait => {},
+            }
+        } else {
+            // One datagram: it fits the ring or it never will.
+            const fits = blk: {
+                const saved = unix_lock.acquire();
+                defer unix_lock.release(saved);
+                const room = sendRoomLocked(idx) orelse return unixSendRights(idx, data, len, null);
+                break :blk np.dgramFits(len, UNIX_SOCK_BUF_SIZE) and room >= len + np.DGRAM_PREFIX;
+            };
+            if (fits) return unixSendRights(idx, data, len, null);
+            if (nonblock) return -11;
+            need = @intCast(len + np.DGRAM_PREFIX);
         }
-        const w = parkOn(idx, .write, 1);
+        if (!armed) {
+            const ms = if (unixOptView(idx)) |v| v.opts.snd_ms else 0;
+            deadline = urp.deadlineNs(tsc.nanos(), ms);
+            armed = true;
+        }
+        if (urp.timedOut(deadline, tsc.nanos())) return np.sendTimeoutResult(done);
+        const w = parkOn(idx, .write, need, deadline);
         if (w != 0) return w;
     }
 }
@@ -1155,7 +1132,7 @@ pub fn unixAcceptBlocking(idx: u32, nonblock: bool) i32 {
     while (true) {
         const r = unixAccept(idx);
         if (r != -11 or nonblock) return r;
-        const w = parkOn(idx, .accept, 0);
+        const w = parkOn(idx, .accept, 0, null);
         if (w != 0) return @intCast(w);
     }
 }

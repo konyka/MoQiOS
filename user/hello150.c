@@ -1,4 +1,4 @@
-/// hello135: signal call argument and errno rules.
+/// hello150: blocking AF_UNIX stream writes.
 
 #include <stdint.h>
 
@@ -55,6 +55,9 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_CLOCK_GETTIME 228
 #define SYS_SENDTO    121
 #define SYS_RECVFROM  122
+#define SYS_SETSOCKOPT 132
+#define SOL_SOCKET 1
+#define SO_SNDTIMEO 21
 #define AF_UNIX 1
 #define SOCK_STREAM 1
 #define F_SETFL 4
@@ -65,6 +68,7 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define BIG 30000
 
 struct ts { int64_t s, n; };
+struct tv { int64_t s, us; };
 static void print(const char *s) {
     uint64_t n = 0;
     while (s[n]) n++;
@@ -170,6 +174,30 @@ void _start(void) {
         int64_t t0 = now_ms();
         syscall3(SYS_WAITPID, (uint64_t)child, (uint64_t)&st, 0);
         check(st == 0 && now_ms() - t0 < 2000, "D: the writer really blocked, then was woken when the reader closed (EPIPE or a short count)");
+    }
+
+    /* E: SO_SNDTIMEO bounds a blocking write */
+    {
+        int sv[2];
+        syscall4(SYS_SOCKETPAIR, AF_UNIX, SOCK_STREAM, 0, (uint64_t)sv);
+        struct tv t = { 0, 150000 };
+        check(syscall5(SYS_SETSOCKOPT, (uint64_t)sv[0], SOL_SOCKET, SO_SNDTIMEO, (uint64_t)&t, 16) == 0, "E: set SO_SNDTIMEO on a socketpair end");
+        int64_t t0 = now_ms();
+        int64_t w1 = syscall3(SYS_WRITE, sv[0], (uint64_t)big, BIG);
+        int64_t dt1 = now_ms() - t0;
+        check(w1 > 0 && w1 < BIG, "E: a write larger than the ring returns the bytes sent when the timeout expires");
+        check(dt1 >= 120 && dt1 < 600, "E: after about 150 ms");
+        t0 = now_ms();
+        int64_t w2 = syscall3(SYS_WRITE, sv[0], (uint64_t)big, 100);
+        int64_t dt2 = now_ms() - t0;
+        check(w2 == -EAGAIN_ && dt2 >= 120 && dt2 < 600, "E: the next write on the full ring is EAGAIN after the timeout");
+        char b[64];
+        syscall3(SYS_READ, sv[1], (uint64_t)b, 64);
+        t0 = now_ms();
+        int64_t w3 = syscall3(SYS_WRITE, sv[0], (uint64_t)big, 50);
+        check(w3 == 50 && now_ms() - t0 < 100, "E: once the reader made room the write completes at once");
+        syscall1(SYS_CLOSE, sv[0]);
+        syscall1(SYS_CLOSE, sv[1]);
     }
 
     print(failures == 0 ? "hello150: PASS\n" : "hello150: FAIL\n");
