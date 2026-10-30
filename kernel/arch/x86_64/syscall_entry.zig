@@ -3670,7 +3670,7 @@ fn syscallNanosleep(req_ptr: u64, rem_ptr: u64) i64 {
 /// and sleepTimerTick wakes it, so the CPU keeps taking ticks, running other
 /// tasks and delivering signals for the whole sleep. A zero `rem_ptr` skips
 /// every remaining-time write (TIMER_ABSTIME).
-fn sleepUntil(deadline: u64, rem_ptr: u64) i64 {
+pub fn sleepUntil(deadline: u64, rem_ptr: u64) i64 {
     const sleep_policy = @import("../../proc/sleep_policy.zig");
     const tsc = @import("../../arch/x86_64/tsc.zig");
     const sched = @import("../../proc/sched.zig");

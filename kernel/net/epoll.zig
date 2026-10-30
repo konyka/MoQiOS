@@ -738,6 +738,12 @@ fn kmsgCursorForItem(inst: *const EpollInstance, fd: i32) u64 {
     return klog.kmsgNewestPos();
 }
 
+/// Current readiness of a descriptor in epoll event bits (the poll/select
+/// bit values are identical), shared with fs/poll.zig and fs/select.zig.
+pub fn descriptorEvents(desc: *const vfs.FileDescriptor) u32 {
+    return computeCurrentEvents(desc.fd_type, resourceIdxFromDesc(desc), desc.offset);
+}
+
 fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32, kmsg_cursor: u64) u32 {
     var revents: u32 = 0;
     switch (fd_type) {

@@ -7593,3 +7593,44 @@ test "child and fault siginfo codes" {
     try std.testing.expectEqual(sp.BUS_ADRERR, sp.faultInfo(true, false, 0x10).code);
     try std.testing.expectEqual(@as(u64, 0x10), sp.faultInfo(false, false, 0x10).a);
 }
+
+test "poll timeout: negative waits forever, zero polls once" {
+    const pp = kt.poll_policy;
+    try std.testing.expect(pp.pollTimeout(0xFFFF_FFFF_FFFF_FFFF) == .forever);
+    try std.testing.expect(pp.pollTimeout(0xFFFF_FFFF) == .forever);
+    try std.testing.expectEqual(@as(u64, 0), pp.pollTimeout(0).ms);
+    try std.testing.expectEqual(@as(u64, 120), pp.pollTimeout(120).ms);
+}
+
+test "select timeout validation and rounding" {
+    const pp = kt.poll_policy;
+    try std.testing.expect(pp.selectTimeout(-1, 0) == null);
+    try std.testing.expect(pp.selectTimeout(0, -1) == null);
+    try std.testing.expect(pp.selectTimeout(0, 1_000_000) == null);
+    try std.testing.expectEqual(@as(u64, 0), pp.selectTimeout(0, 0).?.ms);
+    try std.testing.expectEqual(@as(u64, 1), pp.selectTimeout(0, 1).?.ms);
+    try std.testing.expectEqual(@as(u64, 100), pp.selectTimeout(0, 100_000).?.ms);
+    try std.testing.expectEqual(@as(u64, 2500), pp.selectTimeout(2, 500_000).?.ms);
+    try std.testing.expect(pp.selectTimeout(std.math.maxInt(i64), 0).? == .forever);
+}
+
+test "poll revents always reports errors and hangups, only requested data events" {
+    const pp = kt.poll_policy;
+    try std.testing.expectEqual(pp.POLLIN, pp.revents(pp.POLLIN | pp.POLLOUT, pp.POLLIN));
+    try std.testing.expectEqual(@as(u32, 0), pp.revents(pp.POLLIN, pp.POLLOUT));
+    try std.testing.expectEqual(pp.POLLHUP, pp.revents(pp.POLLHUP, 0));
+    try std.testing.expectEqual(pp.POLLERR | pp.POLLOUT, pp.revents(pp.POLLERR | pp.POLLOUT, pp.POLLOUT));
+    try std.testing.expectEqual(pp.POLLIN | pp.POLLRDNORM, pp.revents(pp.POLLIN, pp.POLLRDNORM));
+}
+
+test "select readiness and wait slicing" {
+    const pp = kt.poll_policy;
+    try std.testing.expect(pp.selectReadable(pp.POLLHUP));
+    try std.testing.expect(!pp.selectReadable(pp.POLLOUT));
+    try std.testing.expect(pp.selectWritable(pp.POLLERR));
+    try std.testing.expect(!pp.selectWritable(pp.POLLIN));
+    try std.testing.expect(pp.nfdsValid(64, 64));
+    try std.testing.expect(!pp.nfdsValid(65, 64));
+    try std.testing.expectEqual(@as(u64, 5_000_000), pp.sliceDeadline(0, null, 5));
+    try std.testing.expectEqual(@as(u64, 2_000_000), pp.sliceDeadline(0, 2_000_000, 5));
+}

@@ -266,6 +266,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello136"); /* real-time signals 32..64 */
     run_test("hello137"); /* siginfo and ucontext */
     run_test("hello138"); /* uname, hostname, rlimit, sysinfo */
+    run_test("hello139"); /* poll and select readiness and timeouts */
 
     start_persistent_services();
 

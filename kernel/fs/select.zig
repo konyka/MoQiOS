@@ -1,122 +1,86 @@
 /// select — I/O multiplexing via fd_set bitmaps.
 ///
-/// Extracted from syscall_entry.zig (v18.8).
-const std = @import("std");
+/// Readiness comes from poll.descEvents (the epoll per-descriptor function),
+/// waits park the task in short sleep slices, and the timeout / EBADF /
+/// EINVAL rules live in poll_policy.zig.
 const copy = @import("../mm/copy_from_user.zig");
 const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const vfs_mod = @import("../fs/vfs.zig");
-const tcp_mod = @import("../net/tcp.zig");
 const bo = @import("../lib/byte_order.zig");
+const poll_mod = @import("poll.zig");
+const pp = @import("poll_policy.zig");
+
+const SET_BYTES: usize = 16;
 
 /// select(nfds, readfds_ptr, writefds_ptr, exceptfds_ptr, timeout_ptr) -> ready count or -errno.
-pub fn select(nfds: u64, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr: u64, timeout_ptr: u64) i64 {
-    if (nfds > vfs_mod.MAX_FDS) return -22; // -EINVAL
+pub fn select(nfds_raw: u64, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr: u64, timeout_ptr: u64) i64 {
+    if (nfds_raw > 0x7FFF_FFFF) return -22; // negative nfds
+    // Linux clamps nfds to the descriptor table size.
+    const nfds: usize = @intCast(@min(nfds_raw, vfs_mod.MAX_FDS));
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    if (readfds_ptr != 0 and !copy.validateUserBufferWritable(readfds_ptr, 16)) return -14;
-    if (writefds_ptr != 0 and !copy.validateUserBufferWritable(writefds_ptr, 16)) return -14;
-    if (exceptfds_ptr != 0 and !copy.validateUserBufferWritable(exceptfds_ptr, 16)) return -14;
+    if (readfds_ptr != 0 and !copy.validateUserBufferWritable(readfds_ptr, SET_BYTES)) return -14;
+    if (writefds_ptr != 0 and !copy.validateUserBufferWritable(writefds_ptr, SET_BYTES)) return -14;
+    if (exceptfds_ptr != 0 and !copy.validateUserBufferWritable(exceptfds_ptr, SET_BYTES)) return -14;
     if (timeout_ptr != 0 and !copy.validateUserBuffer(timeout_ptr, 16)) return -14;
 
-    var timeout_ms: u64 = 0;
+    var wait: pp.Wait = .forever;
     if (timeout_ptr != 0) {
         var tv: [16]u8 = undefined;
         if (copy.copyFromUser(&tv, @ptrFromInt(timeout_ptr), 16) != 16) return -14;
-        const sec: u64 = bo.readU64Le(tv[0..8]);
-        const usec: u64 = bo.readU64Le(tv[8..16]);
-        const usec_ms = usec / 1000;
-        if (usec >= 1_000_000 or sec > (std.math.maxInt(u64) - usec_ms) / 1000) return -22;
-        timeout_ms = sec * 1000 + usec_ms;
+        const sec: i64 = @bitCast(bo.readU64Le(tv[0..8]));
+        const usec: i64 = @bitCast(bo.readU64Le(tv[8..16]));
+        wait = pp.selectTimeout(sec, usec) orelse return -22;
     }
 
-    var read_fds: [16]u8 = @splat(0);
-    var write_fds: [16]u8 = @splat(0);
-    if (readfds_ptr != 0) {
-        if (copy.copyFromUser(&read_fds, @ptrFromInt(readfds_ptr), 16) != 16) return -14;
-    }
-    if (writefds_ptr != 0) {
-        if (copy.copyFromUser(&write_fds, @ptrFromInt(writefds_ptr), 16) != 16) return -14;
-    }
+    var read_fds: [SET_BYTES]u8 = @splat(0);
+    var write_fds: [SET_BYTES]u8 = @splat(0);
+    var except_fds: [SET_BYTES]u8 = @splat(0);
+    if (readfds_ptr != 0 and copy.copyFromUser(&read_fds, @ptrFromInt(readfds_ptr), SET_BYTES) != SET_BYTES) return -14;
+    if (writefds_ptr != 0 and copy.copyFromUser(&write_fds, @ptrFromInt(writefds_ptr), SET_BYTES) != SET_BYTES) return -14;
+    if (exceptfds_ptr != 0 and copy.copyFromUser(&except_fds, @ptrFromInt(exceptfds_ptr), SET_BYTES) != SET_BYTES) return -14;
 
-    const max_checks = if (timeout_ms == 0) 1 else @max(timeout_ms / 10, 1);
-    var checks: u64 = 0;
-    while (checks < max_checks) : (checks += 1) {
-        var read_out: [16]u8 = @splat(0);
-        var write_out: [16]u8 = @splat(0);
+    const tsc = @import("../arch/x86_64/tsc.zig");
+    const deadline = poll_mod.deadlineFor(wait, tsc.nanos());
+    const poll_once = wait == .ms and wait.ms == 0;
+
+    while (true) {
+        var read_out: [SET_BYTES]u8 = @splat(0);
+        var write_out: [SET_BYTES]u8 = @splat(0);
         var total_ready: u64 = 0;
 
-        for (0..@min(nfds, 128)) |fd_i| {
-            const fd: u32 = @intCast(fd_i);
-            if (fd >= vfs_mod.MAX_FDS) continue;
-            const desc = &cur.fd_table.fds[fd];
-            if (desc.fd_type == .none) continue;
+        for (0..nfds) |fd_i| {
             const byte_idx = fd_i / 8;
-            const bit_idx: u3 = @intCast(fd_i % 8);
-
-            if (read_fds[byte_idx] & (@as(u8, 1) << bit_idx) != 0) {
-                var rdy = false;
-                switch (desc.fd_type) {
-                    .tcp_socket => {
-                        if (tcp_mod.tcpRecvAvailable(desc.tcb_idx) > 0 or tcp_mod.tcpIsClosing(desc.tcb_idx)) rdy = true;
-                    },
-                    .pipe_read => {
-                        if (vfs_mod.pipeState(desc.pipe_idx)) |state| rdy = state.readable > 0;
-                    },
-                    .devfs_ctrl => {
-                        // Owner end of a userspace devfs node: readable
-                        // only while a request is queued (mirrors epoll).
-                        const dpx = @import("devfs_proxy.zig");
-                        rdy = dpx.ctrlHasQueued(desc.devfs_ctrl_idx);
-                    },
-                    else => rdy = true,
-                }
-                if (rdy) {
-                    read_out[byte_idx] |= @as(u8, 1) << bit_idx;
-                    total_ready += 1;
-                }
+            const mask = @as(u8, 1) << @intCast(fd_i % 8);
+            const want_r = read_fds[byte_idx] & mask != 0;
+            const want_w = write_fds[byte_idx] & mask != 0;
+            const want_e = except_fds[byte_idx] & mask != 0;
+            if (!want_r and !want_w and !want_e) continue;
+            const desc = &cur.fd_table.fds[fd_i];
+            if (desc.fd_type == .none) return -9; // EBADF
+            const ev = poll_mod.descEvents(desc);
+            if (want_r and pp.selectReadable(ev)) {
+                read_out[byte_idx] |= mask;
+                total_ready += 1;
             }
-            if (write_fds[byte_idx] & (@as(u8, 1) << bit_idx) != 0) {
-                var rdy = false;
-                switch (desc.fd_type) {
-                    .tcp_socket => {
-                        if (tcp_mod.isEstablished(desc.tcb_idx) and tcp_mod.tcpSendSpace(desc.tcb_idx) > 0) rdy = true;
-                    },
-                    else => rdy = true,
-                }
-                if (rdy) {
-                    write_out[byte_idx] |= @as(u8, 1) << bit_idx;
-                    total_ready += 1;
-                }
+            if (want_w and pp.selectWritable(ev)) {
+                write_out[byte_idx] |= mask;
+                total_ready += 1;
             }
         }
 
-        if (total_ready > 0 or timeout_ms == 0) {
-            if (readfds_ptr != 0 and copy.copyToUser(@ptrFromInt(readfds_ptr), &read_out, 16) != 16) return -14;
-            if (writefds_ptr != 0 and copy.copyToUser(@ptrFromInt(writefds_ptr), &write_out, 16) != 16) return -14;
-            if (exceptfds_ptr != 0) {
-                var z: [16]u8 = @splat(0);
-                if (copy.copyToUser(@ptrFromInt(exceptfds_ptr), &z, 16) != 16) return -14;
-            }
+        const expired = if (deadline) |d| tsc.nanos() >= d else false;
+        if (total_ready > 0 or poll_once or expired) {
+            const zero: [SET_BYTES]u8 = @splat(0);
+            if (readfds_ptr != 0 and copy.copyToUser(@ptrFromInt(readfds_ptr), &read_out, SET_BYTES) != SET_BYTES) return -14;
+            if (writefds_ptr != 0 and copy.copyToUser(@ptrFromInt(writefds_ptr), &write_out, SET_BYTES) != SET_BYTES) return -14;
+            if (exceptfds_ptr != 0 and copy.copyToUser(@ptrFromInt(exceptfds_ptr), &zero, SET_BYTES) != SET_BYTES) return -14;
             return @intCast(total_ready);
         }
-        for (0..100000) |_| {
-            asm volatile ("pause");
-        }
-    }
 
-    if (readfds_ptr != 0 and readfds_ptr < 0x0000_8000_0000_0000) {
-        var z: [16]u8 = @splat(0);
-        if (copy.copyToUser(@ptrFromInt(readfds_ptr), &z, 16) != 16) return -14;
+        const rc = poll_mod.waitSlice(deadline);
+        if (rc < 0) return rc;
     }
-    if (writefds_ptr != 0 and writefds_ptr < 0x0000_8000_0000_0000) {
-        var z: [16]u8 = @splat(0);
-        if (copy.copyToUser(@ptrFromInt(writefds_ptr), &z, 16) != 16) return -14;
-    }
-    if (exceptfds_ptr != 0) {
-        var z: [16]u8 = @splat(0);
-        if (copy.copyToUser(@ptrFromInt(exceptfds_ptr), &z, 16) != 16) return -14;
-    }
-    return 0; // timeout
 }

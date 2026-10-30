@@ -5421,3 +5421,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 变异：`uname` 改回写死的默认主机名 → hello138 B/C 段 4 项 FAIL，恢复后 PASS。
 - 验证：host 776/776；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）3/3 PASS。
+
+### poll/select 就绪与超时（hello139）
+
+- 问题：`poll`/`select` 各带一份简化的就绪判断，AF_UNIX 套接字永远可读、关闭的 fd 被静默跳过、EOF 管道在 select 中不可读；等待用 `pause` 忙等且 `poll(-1)` 被当作 30 秒；`poll(NULL,0,ms)` 返回 EINVAL 而不是睡眠；`poll` 的 `nfds` 固定上限 128，不跟 `RLIMIT_NOFILE`。
+- 修复：新增 `kernel/fs/poll_policy.zig`（纯策略），`poll`/`select` 改用 `epoll.descriptorEvents`（暴露 epoll 的按类型就绪函数）并以 5 ms 的 `sleepUntil` 片等待；`sleepUntil` 改为 `pub`。
+- 已知差异：等待是 5 ms 轮询而不是挂在各 fd 的等待队列上（最坏多 5 ms 延迟）；`select` 的 `exceptfds` 总是返回空集；`ppoll`/`pselect6` 仍未实现。
+- 排查过程（如实）：探测第一版有两处写错——`eventfd2` 的编号是 169 不是 290，以及 200 项的 `poll` 在 `RLIMIT_NOFILE=64` 下按 Linux 本就应该是 EINVAL；改探测后内核通过。最初的失败里 eventfd 三项是探测的编号错误，不是内核缺陷。
+- TDD：host 新增 4 个测试；hello139（37 项）在 HEAD 上 11 项 FAIL，新内核 PASS。
+
+- 变异：`selectReadable` 去掉 `POLLHUP` → hello139 A 段 `select calls it readable (EOF)` FAIL，恢复后 PASS。
+- 验证：host 780/780；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
