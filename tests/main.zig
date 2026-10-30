@@ -7388,3 +7388,27 @@ test "mprotect/mremap argument rules: zero length, holes and unmapped sources" {
     try std.testing.expectEqual(@as(i64, -14), mp.remapSourceErrno(2, 1));
     try std.testing.expectEqual(@as(i64, -14), mp.remapSourceErrno(2, 0));
 }
+
+test "clock ids: which clock reads which time source, and which ones sleep/timers accept" {
+    const ts = kt.clock_ids;
+    const K = ts.Source;
+    try std.testing.expectEqual(K.realtime, ts.sourceOf(0).?);
+    try std.testing.expectEqual(K.monotonic, ts.sourceOf(1).?);
+    try std.testing.expectEqual(K.process_cpu, ts.sourceOf(2).?);
+    try std.testing.expectEqual(K.thread_cpu, ts.sourceOf(3).?);
+    try std.testing.expectEqual(K.monotonic, ts.sourceOf(4).?); // MONOTONIC_RAW
+    try std.testing.expectEqual(K.realtime, ts.sourceOf(5).?); // REALTIME_COARSE
+    try std.testing.expectEqual(K.monotonic, ts.sourceOf(6).?); // MONOTONIC_COARSE
+    try std.testing.expectEqual(K.monotonic, ts.sourceOf(7).?); // BOOTTIME (no suspend here)
+    try std.testing.expect(ts.sourceOf(8) == null);
+    try std.testing.expect(ts.sourceOf(99) == null);
+    // negative clock ids are dynamic clocks (fd-based): not supported
+    try std.testing.expect(ts.sourceOf(@bitCast(@as(i64, -1))) == null);
+    // only the wall-clock and monotonic families can be slept on or used for timers
+    try std.testing.expect(ts.sleepable(0) and ts.sleepable(1) and ts.sleepable(4) and ts.sleepable(5) and ts.sleepable(6) and ts.sleepable(7));
+    try std.testing.expect(!ts.sleepable(2) and !ts.sleepable(3) and !ts.sleepable(8));
+    // coarse clocks report a coarser resolution than the precise ones
+    try std.testing.expectEqual(@as(u64, 1), ts.resolutionNs(1));
+    try std.testing.expectEqual(@as(u64, 1_000_000), ts.resolutionNs(6));
+    try std.testing.expectEqual(@as(u64, 1_000_000), ts.resolutionNs(5));
+}

@@ -4303,11 +4303,14 @@ fn syscallClockNanosleep(clockid: u32, flags: u32, req_ptr: u64, rem_ptr: u64) i
     const time_policy = @import("../../ipc/time_policy.zig");
     const sleep_policy = @import("../../proc/sleep_policy.zig");
     const tsc = @import("../../arch/x86_64/tsc.zig");
-    if (clockid != time_policy.CLOCK_REALTIME and clockid != time_policy.CLOCK_MONOTONIC) return -22;
+    const clock_ids = @import("../../proc/clock_ids.zig");
+    if (!clock_ids.sleepable(clockid)) return -22;
     if (flags & ~time_policy.TIMER_ABSTIME != 0) return -22;
     const ts = readUserTimespec(req_ptr) orelse return -14;
+    // The whole realtime family waits against the wall clock, the rest against the monotonic one.
+    const base_clock: u32 = if (clock_ids.sourceOf(clockid).? == .realtime) time_policy.CLOCK_REALTIME else time_policy.CLOCK_MONOTONIC;
     const plan = sleep_policy.planClock(
-        clockid,
+        base_clock,
         flags,
         ts.sec,
         ts.nsec,
@@ -4524,7 +4527,7 @@ fn syscallClockGetres(clockid: u32, res_ptr: u64) i64 {
     // Report 1ns resolution (TSC-based high precision)
     var ts: [16]u8 = undefined;
     const sec: u64 = 0;
-    const nsec: u64 = 1; // 1 nanosecond resolution
+    const nsec: u64 = @import("../../proc/clock_ids.zig").resolutionNs(clockid);
     @memcpy(ts[0..8], @as([*]const u8, @ptrCast(&sec))[0..8]);
     @memcpy(ts[8..16], @as([*]const u8, @ptrCast(&nsec))[0..8]);
     return if (copy.copyToUser(@ptrFromInt(res_ptr), &ts, 16) == 16) 0 else -14;

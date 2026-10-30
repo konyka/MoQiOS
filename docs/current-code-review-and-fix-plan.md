@@ -5347,3 +5347,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 测试先编译失败后通过；hello131（31 项，覆盖 mmap/munmap/mprotect/mremap/brk）在 HEAD 上 4 项 FAIL，新内核 PASS。mmap/munmap/brk 的 20 余项参数规则核对无误，未改动。
 - 变异：`coverageErrno` 恒返回 0 → hello131 2 项 FAIL，恢复后 PASS。
 - 验证：host 762/762；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL（hello74 同样 PASS）；stress（SMP=2）5/5 PASS。
+
+### 时钟 id 与睡眠（hello132）
+
+- 问题：只支持 2 个时钟 id；`CLOCK_MONOTONIC_RAW`、`CLOCK_BOOTTIME`、`CLOCK_REALTIME_COARSE`、`CLOCK_MONOTONIC_COARSE` 与两个 CPU 时间时钟全部 EINVAL，`clock_getres` 同样；
+  `gettimeofday(NULL, NULL)` 返回 EFAULT。Rust/Go/glibc 的运行时启动时就会读这些时钟。
+- 修复：`proc/clock_ids.zig`（`sourceOf`、`sleepable`、`resolutionNs`），`time_syscall.clock_gettime` 按来源分派，CPU 时钟用 `rusage_policy.runtimeUs` 加上当前时间片，`clock_getres` 与 `clock_nanosleep` 同表。
+- TDD：host 测试先编译失败后通过；hello132（35 项）在 HEAD 上 9 项 FAIL（4 个新时钟 id、2 个 CPU 时钟、MONOTONIC_RAW 单调性、`gettimeofday(NULL)`、`clock_getres(RAW)`），新内核 PASS。第一版探测曾含 `time()`，但它在原生编号 #201 上是 getuid，探测写错了，已去掉。nanosleep 的无效参数（nsec 越界、负数、NULL）、绝对截止时间在过去/未来、`gettimeofday` 与 `CLOCK_REALTIME` 一致等核对无误。
+- 变异：从映射表里去掉 `CLOCK_MONOTONIC_RAW` → hello132 3 项 FAIL，恢复后 PASS。
+- 验证：host 763/763；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）3/3 PASS。

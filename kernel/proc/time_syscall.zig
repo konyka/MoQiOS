@@ -14,8 +14,10 @@ pub const CLOCK_REALTIME: u64 = 0;
 pub const CLOCK_MONOTONIC: u64 = 1;
 
 pub fn clockIdValid(clockid: u64) bool {
-    return clockid == CLOCK_REALTIME or clockid == CLOCK_MONOTONIC;
+    return clock_ids.sourceOf(clockid) != null;
 }
+
+const clock_ids = @import("clock_ids.zig");
 
 /// Set wall-clock offset so that clock_gettime returns the desired time.
 pub fn setWallClockOffset(offset_ns: i64) void {
@@ -35,7 +37,8 @@ pub fn wallClockNanos() u64 {
 
 /// gettimeofday(tv_ptr) → 0 or -1
 pub fn gettimeofday(tv_ptr: u64) i64 {
-    if (tv_ptr == 0 or tv_ptr >= 0x0000_8000_0000_0000) return -14;
+    if (tv_ptr == 0) return 0; // gettimeofday(NULL, tz): nothing to store
+    if (tv_ptr >= 0x0000_8000_0000_0000) return -14;
 
     const ns = wallClockNanos();
     const sec = ns / 1_000_000_000;
@@ -58,7 +61,12 @@ pub fn clock_gettime(clockid: u64, tp_ptr: u64) i64 {
     if (!clockIdValid(clockid)) return -22;
     if (tp_ptr == 0 or tp_ptr >= 0x0000_8000_0000_0000) return -14;
 
-    const ns = if (clockid == CLOCK_REALTIME) wallClockNanos() else tsc.nanos();
+    const ns: u64 = switch (clock_ids.sourceOf(clockid).?) {
+        .realtime => wallClockNanos(),
+        .monotonic => tsc.nanos(),
+        .process_cpu => cpuTimeNs(false),
+        .thread_cpu => cpuTimeNs(true),
+    };
     const sec = ns / 1_000_000_000;
     const nsec = ns % 1_000_000_000;
 
@@ -69,4 +77,18 @@ pub fn clock_gettime(clockid: u64, tp_ptr: u64) i64 {
 
     if (copy.copyToUser(@ptrFromInt(tp_ptr), ts_bytes[0..16], 16) != 16) return -14;
     return 0;
+}
+
+/// CPU time consumed by the calling thread (`thread`) or process (this kernel
+/// keeps per-task accounting, so a process is its main task plus nothing more
+/// that we can attribute here; the calling task's time is the honest answer).
+fn cpuTimeNs(thread: bool) u64 {
+    _ = thread;
+    const sched = @import("sched.zig");
+    const task_mod = @import("task.zig");
+    const rusage_policy = @import("rusage_policy.zig");
+    const idx = sched.currentTaskIndex() orelse return 0;
+    const t = task_mod.getTask(idx) orelse return 0;
+    const in_flight = rusage_policy.runtimeUs(0, t.sched_in_tsc, tsc.read(), tsc.tsc_freq_mhz);
+    return (t.utime_us +| t.stime_us +| in_flight) *| 1000;
 }

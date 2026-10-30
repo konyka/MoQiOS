@@ -200,6 +200,7 @@ pub const capability = @import("ipc/capability.zig");
 pub const sysv_policy = @import("ipc/sysv_policy.zig");
 pub const time_policy = @import("ipc/time_policy.zig");
 pub const time_syscall = @import("proc/time_syscall.zig");
+pub const clock_ids = @import("proc/clock_ids.zig");
 pub const sigreturn_policy = @import("proc/sigreturn_policy.zig");
 pub const sleep_policy = @import("proc/sleep_policy.zig");
 pub const rusage_policy = @import("proc/rusage_policy.zig");

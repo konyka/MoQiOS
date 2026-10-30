@@ -925,6 +925,11 @@ const SchedStats = struct {
 - `EPOLL_CTL_ADD` 沿 child epoll 链（`nestedChainReaches`，visited bitmap 有界）检测间接环，构成环返回 `ELOOP`——环上就绪互相传播会使 `epoll_wait` 永久 busy-loop。（§6.51）
 - MoqIPC receive 被信号/`moqipc_notify` 踢醒时统一清理 `waiting_receiver` 注册并按唤醒来源分类返回：endpoint 失效才报 `invalid_endpoint`，存活 endpoint 的无投递唤醒报 EINTR（信号）/EAGAIN（notify）——注册残留曾让 endpoint 对所有 sender 永久报废。（§6.51）
 - `alarm`/`itimer` deadline 字段与 per-CPU run-queue 的 `nr_running` 计数全部原子访问（tick 扫描器跨 CPU 与 syscall 上下文并发）。（§6.51）
+- **时钟 id 与睡眠（hello132）**：`clock_gettime`/`clock_getres`/`clock_nanosleep` 此前只认 `CLOCK_REALTIME`(0) 与 `CLOCK_MONOTONIC`(1)，其余全是 EINVAL，而 glibc/musl/运行时普遍会读
+  `CLOCK_MONOTONIC_RAW`、`CLOCK_BOOTTIME`、`CLOCK_*_COARSE` 与 CPU 时间时钟。现在 `proc/clock_ids.zig`（纯，host 测试）给出映射：`REALTIME` 与 `REALTIME_COARSE` 读墙钟（RTC 起点 + TSC），
+  `MONOTONIC`、`MONOTONIC_RAW`、`MONOTONIC_COARSE`、`BOOTTIME` 读单调时钟（本内核不做时间校正也不挂起，所以彼此一致），`PROCESS_CPUTIME_ID`/`THREAD_CPUTIME_ID` 读调用任务的 CPU 时间
+  （utime + stime + 当前时间片）；未知 id、负的动态时钟 id 是 EINVAL。`clock_getres`：COARSE 时钟报 1 ms，其余 1 ns。`clock_nanosleep` 只接受 `sleepable` 的时钟（墙钟族、单调族），
+  CPU 时间时钟 EINVAL。`gettimeofday(NULL, tz)` 此前是 EFAULT，现在成功（没有要写的东西）。限制：进程 CPU 时钟只统计调用任务，不汇总同进程其它线程。
 - **mprotect / mremap 的参数与错误码（hello131）**：`mprotect(addr, 0, prot)` 此前是 EINVAL，Linux 里是成功的空操作（先检查对齐，再看长度，最后才检查 `prot` 位；`mprotect_policy.early`）。
   范围里有未映射的洞时，`mprotect` 应返回 ENOMEM（已有页仍按请求修改，所以在提交之后才报告；`mprotect_policy.coverageErrno`），原先对不存在的页直接静默跳过、返回 0。
   `mremap` 的源地址对齐但根本没有映射时是 EFAULT（`remapSourceErrno`），原先是 EINVAL；不是区域起点的地址仍是 EINVAL。`mmap` 的参数校验（长度 0、`MAP_SHARED|MAP_PRIVATE` 同时/都没有、未知 `PROT` 位、
