@@ -883,7 +883,7 @@ pub const FdTable = struct {
         // tmpfs: paths starting with /tmp/
         if (name.len >= 4 and name[0] == '/' and name[1] == 't' and name[2] == 'm' and name[3] == 'p' and (name.len == 4 or name[4] == '/')) {
             const tmpfs = @import("tmpfs.zig");
-            const is_dir = o_creat and (flags & 0o100000) != 0; // O_DIRECTORY
+            const is_dir = o_creat and (flags & 0x10000) != 0; // O_DIRECTORY (Linux x86_64: 0o200000)
             const result = tmpfs.tmpfsOpenAuthorized(name, o_creat, is_dir, euid, egid, effective_caps, flags, requested_mode, umask_val);
             if (result >= 0) {
                 const idx: u32 = @intCast(result);
@@ -1047,15 +1047,26 @@ pub const FdTable = struct {
             }
         }
 
+        var ext2_errno: i64 = -2;
         const ext2 = @import("ext2.zig");
         if (ext2.isActive()) {
-            const fi = ext2.openFileAs(name, .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override, .groups = @import("../proc/current_groups.zig").forCaller(euid, egid) });
+            const nofollow = (flags & 0x20000) != 0;
+            const fi = ext2.openFileFollow(name, .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override, .groups = @import("../proc/current_groups.zig").forCaller(euid, egid) }, !nofollow);
             if (fi == -13) {
                 self.freeFd(slot);
                 return -13; // EACCES: a directory on the path denies search
             }
             if (fi >= 0) {
                 const idx: u32 = @intCast(fi);
+                // Linux's order: O_CREAT|O_EXCL, O_NOFOLLOW on a link, then the
+                // directory rules (see namespace_policy.zig).
+                const kind = ext2.openFileKind(idx) orelse .file;
+                const verdict = @import("namespace_policy.zig").openExisting(kind, flags);
+                if (verdict != 0) {
+                    ext2.closeFile(idx);
+                    self.freeFd(slot);
+                    return verdict;
+                }
                 // Existing ext2 file: judge the requested access against the
                 // inode's owner and mode bits before truncating or publishing
                 // (same decision tmpfs uses). Search permission on the
@@ -1105,11 +1116,16 @@ pub const FdTable = struct {
                     self.publishFd(slot);
                     return @intCast(slot);
                 }
+                self.freeFd(slot);
+                return ci; // the errno createFile reported
             }
+            // A name that is not on ext2 may still be a FAT32 file; keep the
+            // precise errno for when nothing else claims it.
+            ext2_errno = fi;
         }
 
         self.freeFd(slot);
-        return -1;
+        return ext2_errno; // ENOENT, or the errno the ext2 lookup reported (ENOTDIR, ELOOP, ...)
     }
 
     // Parse a proc task ID without wrapping it onto another task.

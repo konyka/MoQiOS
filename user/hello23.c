@@ -50,7 +50,8 @@ void _start(void) {
     print_dec(r);
     print("\n");
 
-    if (r != 0) {
+    /* testdir may already exist on the disk image: EEXIST is the right answer then. */
+    if (r != 0 && r != -17) {
         print("hello23: mkdir failed\n");
         goto done;
     }
@@ -58,7 +59,7 @@ void _start(void) {
     int64_t r2 = syscall2(SYS_MKDIR, (uint64_t)"testdir", 0x1FF);
     print("hello23: mkdir-again=");
     print_dec(r2);
-    print(" (idempotent)\n");
+    print(r2 == -17 ? " (EEXIST)\n" : " (unexpected: a second mkdir must be EEXIST)\n");
 
     int64_t r3 = syscall2(SYS_MKDIR, (uint64_t)"anotherdir", 0x1FF);
     print("hello23: mkdir2=");

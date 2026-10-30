@@ -53,17 +53,19 @@ pub fn unlinkName(name: []const u8) i64 {
     // tmpfs: /tmp paths route there, mirroring the open path in vfs.zig.
     if (name.len >= 4 and name[0] == '/' and name[1] == 't' and name[2] == 'm' and name[3] == 'p' and (name.len == 4 or name[4] == '/')) {
         const tmpfs = @import("../fs/tmpfs.zig");
-        return tmpfs.tmpfsUnlinkAuthorized(name, tmpfsCaller());
+        return tmpfs.tmpfsRemove(name, tmpfsCaller(), .file);
     }
 
     // Try ext2 first
     if (ext2.isActive()) {
         const r = ext2.unlinkFile(name, caller());
-        if (r == 0 or r == -13) return r;
+        // Any answer except "no such name" is final; a missing name may still
+        // be a FAT32 file in the shared root namespace.
+        if (r != -2) return r;
     }
 
     // Try FAT32
-    if (!fat32.isActive()) return -1;
+    if (!fat32.isActive()) return -2;
 
     const file_count = fat32.getFileCount();
     var found_idx: ?u32 = null;
@@ -80,7 +82,7 @@ pub fn unlinkName(name: []const u8) i64 {
 
     if (found_idx == null) return -2; // -ENOENT
     if (fat32.deleteFile(found_idx.?)) return 0;
-    return -1;
+    return -5; // EIO
 }
 
 /// rmdir(path_ptr) -> 0 or -errno. Empty-directory removal with POSIX
@@ -94,11 +96,11 @@ pub fn rmdirName(name: []const u8) i64 {
 
     if (name.len >= 4 and name[0] == '/' and name[1] == 't' and name[2] == 'm' and name[3] == 'p' and (name.len == 4 or name[4] == '/')) {
         const tmpfs = @import("../fs/tmpfs.zig");
-        return tmpfs.tmpfsUnlinkAuthorized(name, tmpfsCaller());
+        return tmpfs.tmpfsRemove(name, tmpfsCaller(), .dir);
     }
 
     if (ext2.isActive()) {
         return ext2.rmdirFile(name, caller());
     }
-    return -1;
+    return -2;
 }

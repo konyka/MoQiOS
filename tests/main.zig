@@ -7124,3 +7124,64 @@ test "access(2) policy: mode bits, real vs effective ids, faccessat2 flags" {
     try std.testing.expectEqual(@as(i64, -22), ap.checkFlags(0x4).err_or_zero());
     try std.testing.expect(ap.checkFlags(0x1000).empty_path);
 }
+
+test "the ramdisk file-count limit leaves room to grow" {
+    const rd = kt.ramdisk_source;
+    const k_pos = std.mem.indexOf(u8, rd, "pub const MAX_FILES: u32 = ").?;
+    const k_end = std.mem.indexOfScalarPos(u8, rd, k_pos, ';').?;
+    const kernel_limit = try std.fmt.parseInt(u32, rd[k_pos + "pub const MAX_FILES: u32 = ".len .. k_end], 10);
+    // 121+ programs are packed today; a limit with no headroom stops the next test program.
+    try std.testing.expect(kernel_limit >= 256);
+}
+
+test "namespace errno policy: unlink, rmdir, mkdir and open on an existing object" {
+    const np = kt.namespace_policy;
+    const K = np.Kind;
+    // unlink: a directory is EISDIR, anything else goes; missing is ENOENT.
+    try std.testing.expectEqual(@as(i64, 0), np.unlink(.file));
+    try std.testing.expectEqual(@as(i64, 0), np.unlink(.symlink));
+    try std.testing.expectEqual(@as(i64, -21), np.unlink(.directory));
+    try std.testing.expectEqual(@as(i64, -2), np.unlink(.missing));
+    // rmdir: a non-directory is ENOTDIR, a non-empty directory ENOTEMPTY.
+    try std.testing.expectEqual(@as(i64, 0), np.rmdir(.directory, true));
+    try std.testing.expectEqual(@as(i64, -39), np.rmdir(.directory, false));
+    try std.testing.expectEqual(@as(i64, -20), np.rmdir(.file, true));
+    try std.testing.expectEqual(@as(i64, -20), np.rmdir(.symlink, true));
+    try std.testing.expectEqual(@as(i64, -2), np.rmdir(.missing, true));
+    // mkdir: any existing name is EEXIST.
+    try std.testing.expectEqual(@as(i64, -17), np.mkdir(.directory));
+    try std.testing.expectEqual(@as(i64, -17), np.mkdir(.file));
+    try std.testing.expectEqual(@as(i64, -17), np.mkdir(.symlink));
+    try std.testing.expectEqual(@as(i64, 0), np.mkdir(.missing));
+
+    const O_WRONLY: u32 = 1;
+    const O_RDWR: u32 = 2;
+    const O_CREAT: u32 = 0x40;
+    const O_EXCL: u32 = 0x80;
+    const O_TRUNC: u32 = 0x200;
+    const O_DIRECTORY: u32 = 0x10000;
+    const O_NOFOLLOW: u32 = 0x20000;
+    // open on an existing object.
+    try std.testing.expectEqual(@as(i64, 0), np.openExisting(.file, 0));
+    try std.testing.expectEqual(@as(i64, -17), np.openExisting(.file, O_CREAT | O_EXCL));
+    try std.testing.expectEqual(@as(i64, -17), np.openExisting(.directory, O_CREAT | O_EXCL));
+    try std.testing.expectEqual(@as(i64, -20), np.openExisting(.file, O_DIRECTORY));
+    try std.testing.expectEqual(@as(i64, 0), np.openExisting(.directory, O_DIRECTORY));
+    try std.testing.expectEqual(@as(i64, -21), np.openExisting(.directory, O_WRONLY));
+    try std.testing.expectEqual(@as(i64, -21), np.openExisting(.directory, O_RDWR));
+    try std.testing.expectEqual(@as(i64, -21), np.openExisting(.directory, O_TRUNC));
+    try std.testing.expectEqual(@as(i64, 0), np.openExisting(.directory, 0));
+    try std.testing.expectEqual(@as(i64, -40), np.openExisting(.symlink, O_NOFOLLOW));
+    try std.testing.expectEqual(@as(i64, 0), np.openExisting(.symlink, 0));
+    // O_NOFOLLOW|O_DIRECTORY on a symlink is ENOTDIR on Linux (the link is not a directory).
+    try std.testing.expectEqual(@as(i64, -20), np.openExisting(.symlink, O_NOFOLLOW | O_DIRECTORY));
+    // open of a missing name: ENOENT unless O_CREAT.
+    try std.testing.expectEqual(@as(i64, -2), np.openMissing(0));
+    try std.testing.expectEqual(@as(i64, 0), np.openMissing(O_CREAT));
+    _ = K;
+}
+
+test "vfs uses the Linux x86_64 O_DIRECTORY value (0x10000), not O_LARGEFILE's 0x8000" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "(flags & 0o100000)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "o_creat and (flags & 0x10000) != 0") != null);
+}

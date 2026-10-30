@@ -542,12 +542,17 @@ pub fn openFile(name: []const u8) i64 {
 /// Open by path, checking search permission on every directory traversed
 /// when `who` is given. -13 (EACCES) on a denied directory, -1 otherwise.
 pub fn openFileAs(name: []const u8, who: ?Who) i64 {
+    return openFileFollow(name, who, true);
+}
+
+/// Like openFileAs; `follow_final` false opens a final symlink itself.
+pub fn openFileFollow(name: []const u8, who: ?Who, follow_final: bool) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
-    if (!active) return -1;
+    if (!active) return -2;
 
     // Start from root inode (2)
-    const result = walkPathInner(2, name, 0, who);
+    const result = walkPathFollow(2, name, 0, who, follow_final);
     if (result >= 0) {
         // Store the path for *at() directory-descriptor resolution
         const idx: usize = @intCast(result);
@@ -564,6 +569,11 @@ fn walkPath(start_inode: u32, path: []const u8) i64 {
 
 /// Inner walkPath with symlink depth tracking (max 8 levels).
 fn walkPathInner(start_inode: u32, path: []const u8, depth: u32, who: ?Who) i64 {
+    return walkPathFollow(start_inode, path, depth, who, true);
+}
+
+/// `follow_final` false opens a final symlink itself (O_NOFOLLOW).
+fn walkPathFollow(start_inode: u32, path: []const u8, depth: u32, who: ?Who, follow_final: bool) i64 {
     if (depth > 8) return -40; // ELOOP: too many symlinks
 
     var current_inode = start_inode;
@@ -582,20 +592,20 @@ fn walkPathInner(start_inode: u32, path: []const u8, depth: u32, who: ?Who) i64 
 
         // Read inode
         var inode: Ext2Inode = undefined;
-        if (!readInode(current_inode, &inode)) return -1;
+        if (!readInode(current_inode, &inode)) return -5;
 
         // Must be a directory
-        if (!eu.isDirectory(inode.mode)) return -1;
+        if (!eu.isDirectory(inode.mode)) return -20; // ENOTDIR
         if (who) |w| {
             if (!@import("dac.zig").allows(inodeMeta(&inode), w.creds(), @import("dac.zig").Access.search)) return -13;
         }
 
         // Search directory entries for component (K1: dcache hit skips the scan)
-        const found = findDirEntryCached(current_inode, &inode, component) orelse return -1;
+        const found = findDirEntryCached(current_inode, &inode, component) orelse return -2; // ENOENT
 
         // Check if the found entry is a symlink
         var found_inode: Ext2Inode = undefined;
-        if (readInode(found, &found_inode) and eu.isSymlink(found_inode.mode)) {
+        if (readInode(found, &found_inode) and eu.isSymlink(found_inode.mode) and (!is_last or follow_final)) {
             // It's a symlink — read target
             const target = readSymlinkTarget(&found_inode) orelse return -5;
 
@@ -621,10 +631,10 @@ fn walkPathInner(start_inode: u32, path: []const u8, depth: u32, who: ?Who) i64 
     }
 
     // Open the file
-    if (current_inode == start_inode) return -1; // path was just "/"
+    if (current_inode == start_inode) return -21; // path was just "/": a directory, not a file
 
     var inode: Ext2Inode = undefined;
-    if (!readInode(current_inode, &inode)) return -1;
+    if (!readInode(current_inode, &inode)) return -5;
 
     // Allocate slot
     for (0..MAX_OPEN_FILES) |i| {
@@ -638,7 +648,7 @@ fn walkPathInner(start_inode: u32, path: []const u8, depth: u32, who: ?Who) i64 
             return @intCast(i);
         }
     }
-    return -1;
+    return -23; // ENFILE: no free open-file slot
 }
 
 /// Read the target of a symlink inode.
@@ -675,7 +685,18 @@ fn readSymlinkTarget(inode: *const Ext2Inode) ?[]const u8 {
 /// legacy unauthorized lookup for read-only callers.
 const ParentRef = struct { parent: u32, name: []const u8 };
 
-const ParentError = error{ DacDenied, Invalid };
+const ParentError = error{ DacDenied, Invalid, NotDir };
+
+/// errno for a failed parent resolution: EACCES, ENOTDIR when a component
+/// is not a directory, otherwise ENOENT (`fallback` keeps callers that
+/// historically answered something else, such as EPERM, unchanged).
+fn parentErrno(e: ParentError) i64 {
+    return switch (e) {
+        error.DacDenied => -13,
+        error.NotDir => -20,
+        error.Invalid => -2,
+    };
+}
 
 fn resolveParentChecked(path: []const u8, who: ?Who, access: @import("dac.zig").Access, must_exist: bool) ParentError!ParentRef {
     // Find the last '/' to split parent path from filename
@@ -703,7 +724,7 @@ fn resolveParentChecked(path: []const u8, who: ?Who, access: @import("dac.zig").
 
             var inode: Ext2Inode = undefined;
             if (!readInode(parent_inode, &inode)) return error.Invalid;
-            if (!eu.isDirectory(inode.mode)) return error.Invalid;
+            if (!eu.isDirectory(inode.mode)) return error.NotDir;
             if (who) |w| {
                 if (!@import("dac.zig").allows(inodeMeta(&inode), w.creds(), @import("dac.zig").Access.search)) return error.DacDenied;
             }
@@ -731,7 +752,7 @@ fn resolveParentChecked(path: []const u8, who: ?Who, access: @import("dac.zig").
     if (who) |w| {
         var pino: Ext2Inode = undefined;
         if (!readInode(parent_inode, &pino)) return error.Invalid;
-        if (!eu.isDirectory(pino.mode)) return error.Invalid;
+        if (!eu.isDirectory(pino.mode)) return error.NotDir;
         if (!@import("dac.zig").allows(inodeMeta(&pino), w.creds(), access)) {
             // Removing/renaming a name ext2 does not have is not an ext2
             // permission question: report "not here" so the caller can try the
@@ -2232,7 +2253,7 @@ pub fn createFile(name: []const u8, creator: Creator, who: ?Who) i64 {
     }
 
     // Resolve parent directory and filename
-    const resolved = resolveParentChecked(name, who, @import("dac.zig").Access.write_search, false) catch |e| return if (e == error.DacDenied) -13 else -1;
+    const resolved = resolveParentChecked(name, who, @import("dac.zig").Access.write_search, false) catch |e| return parentErrno(e);
     const parent_inode_num = resolved.parent;
     const filename = resolved.name;
 
@@ -2393,18 +2414,19 @@ pub fn createDir(name: []const u8, creator: Creator, who: ?Who) i64 {
     // Check if already exists
     const existing_idx = walkPath(2, name);
     if (existing_idx >= 0) {
-        // Already exists — return 0 (idempotent mkdir)
-        return 0;
+        // POSIX: mkdir on an existing name is EEXIST (file or directory).
+        _ = closeFileUnlocked(@intCast(existing_idx));
+        return -17;
     }
 
     // Resolve parent directory and directory name
-    const resolved = resolveParentChecked(name, who, @import("dac.zig").Access.write_search, false) catch |e| return if (e == error.DacDenied) -13 else -1;
+    const resolved = resolveParentChecked(name, who, @import("dac.zig").Access.write_search, false) catch |e| return parentErrno(e);
     const parent_inode_num = resolved.parent;
     const dirname = resolved.name;
 
     // Allocate a new inode (from group 0)
     const new_inode_num = allocInode(0);
-    if (new_inode_num == 0) return -1;
+    if (new_inode_num == 0) return -28; // ENOSPC
 
     // Initialize as a directory inode
     var new_inode: Ext2Inode = undefined;
@@ -2417,14 +2439,14 @@ pub fn createDir(name: []const u8, creator: Creator, who: ?Who) i64 {
 
     // Allocate a data block for the directory entries (. and ..)
     const dir_block = allocBlock(0, false);
-    if (dir_block == 0) return -1;
+    if (dir_block == 0) return -28; // ENOSPC
 
     new_inode.block[0] = dir_block;
     new_inode.blocks = block_size / 512;
     new_inode.size = block_size;
 
     // Write "." and ".." entries into the new directory block
-    const buf_phys = pmm.allocPage() orelse return -1;
+    const buf_phys = pmm.allocPage() orelse return -12; // ENOMEM
     defer pmm.freePage(buf_phys);
     const buf: [*]u8 = @ptrFromInt(hhdm.physToVirt(buf_phys));
     @memset(buf[0..block_size], 0);
@@ -2446,13 +2468,13 @@ pub fn createDir(name: []const u8, creator: Creator, who: ?Who) i64 {
     buf[12 + @sizeOf(Ext2DirEntry)] = '.';
     buf[12 + @sizeOf(Ext2DirEntry) + 1] = '.';
 
-    if (!writeBlock(dir_block, buf)) return -1;
+    if (!writeBlock(dir_block, buf)) return -5; // EIO
 
     // Write the new inode
-    if (!writeNewInode(new_inode_num, &new_inode)) return -1;
+    if (!writeNewInode(new_inode_num, &new_inode)) return -5; // EIO
 
     // Add entry to parent directory
-    if (!addDirEntry(parent_inode_num, new_inode_num, dirname, 2)) return -1; // file_type=2 (dir)
+    if (!addDirEntry(parent_inode_num, new_inode_num, dirname, 2)) return -28; // ENOSPC (file_type=2: dir)
     {
         const gds: [*]Ext2GroupDesc = @ptrFromInt(group_descs_virt);
         if (groupForInode(new_inode_num)) |g| {
@@ -2747,24 +2769,24 @@ pub fn unlinkFile(path: []const u8, who: ?Who) i64 {
     if (!active) return -1;
 
     // Resolve parent directory and filename
-    const resolved = resolveParentChecked(path, who, @import("dac.zig").Access.write_search, true) catch |e| return if (e == error.DacDenied) -13 else -1;
+    const resolved = resolveParentChecked(path, who, @import("dac.zig").Access.write_search, true) catch |e| return parentErrno(e);
     const parent_inode_num = resolved.parent;
     const filename = resolved.name;
 
     // Find the file's inode number via findDirEntry on parent
     var parent_inode: Ext2Inode = undefined;
     if (!readInode(parent_inode_num, &parent_inode)) return -1;
-    const file_inode_num = findDirEntryCached(parent_inode_num, &parent_inode, filename) orelse return -1;
+    const file_inode_num = findDirEntryCached(parent_inode_num, &parent_inode, filename) orelse return -2;
 
     // Read file inode
     var file_inode: Ext2Inode = undefined;
-    if (!readInode(file_inode_num, &file_inode)) return -1;
+    if (!readInode(file_inode_num, &file_inode)) return -5;
 
     // POSIX: unlink() must refuse directories (EISDIR). Unlinking one here
     // freed its blocks while every child entry became an orphan and the
     // parent's links_count stayed incremented — fsck-level corruption.
     // Directories go through rmdirFile.
-    if (eu.isDirectory(file_inode.mode)) return -1;
+    if (eu.isDirectory(file_inode.mode)) return -21; // EISDIR
 
     // v50.0: decrement links_count for hardlinked files; the last link is
     // freed now or, if still open, on the last close.
@@ -2889,12 +2911,12 @@ pub fn renameFileMode(old_path: []const u8, new_path: []const u8, who: ?Who, nor
     if (!active) return -1;
 
     // Resolve source: parent dir + old filename
-    const old_resolved = resolveParentChecked(old_path, who, @import("dac.zig").Access.write_search, true) catch |e| return if (e == error.DacDenied) -13 else -1;
+    const old_resolved = resolveParentChecked(old_path, who, @import("dac.zig").Access.write_search, true) catch |e| return parentErrno(e);
     const old_parent_inode = old_resolved.parent;
     const old_filename = old_resolved.name;
 
     // Resolve destination: parent dir + new filename
-    const new_resolved = resolveParentChecked(new_path, who, @import("dac.zig").Access.write_search, false) catch |e| return if (e == error.DacDenied) -13 else -1;
+    const new_resolved = resolveParentChecked(new_path, who, @import("dac.zig").Access.write_search, false) catch |e| return parentErrno(e);
     const new_parent_inode = new_resolved.parent;
     const new_filename = new_resolved.name;
 
@@ -3152,19 +3174,19 @@ pub fn rmdirFile(path: []const u8, who: ?Who) i64 {
     defer fs_lock.release(flags);
     if (!active) return -1;
 
-    const resolved = resolveParentChecked(path, who, @import("dac.zig").Access.write_search, true) catch |e| return if (e == error.DacDenied) -13 else -1;
+    const resolved = resolveParentChecked(path, who, @import("dac.zig").Access.write_search, true) catch |e| return parentErrno(e);
     const parent_inode_num = resolved.parent;
     const filename = resolved.name;
 
     var parent_inode: Ext2Inode = undefined;
     if (!readInode(parent_inode_num, &parent_inode)) return -1;
-    const dir_inode_num = findDirEntryCached(parent_inode_num, &parent_inode, filename) orelse return -1;
+    const dir_inode_num = findDirEntryCached(parent_inode_num, &parent_inode, filename) orelse return -2;
 
     var dir_inode: Ext2Inode = undefined;
-    if (!readInode(dir_inode_num, &dir_inode)) return -1;
-    if (!eu.isDirectory(dir_inode.mode)) return -1; // ENOTDIR
+    if (!readInode(dir_inode_num, &dir_inode)) return -5;
+    if (!eu.isDirectory(dir_inode.mode)) return -20; // ENOTDIR
 
-    if (!dirIsEmpty(&dir_inode)) return -1; // ENOTEMPTY (or unreadable)
+    if (!dirIsEmpty(&dir_inode)) return -39; // ENOTEMPTY (or unreadable)
 
     // v53.51-style bookkeeping around the frees (flush superblock/group
     // descriptors at batch end, coalesced discards).
@@ -4033,6 +4055,17 @@ pub fn getOpenFilePath(file_idx: u32) ?[]const u8 {
     while (len < 256 and open_file_paths[file_idx][len] != 0) : (len += 1) {}
     if (len == 0) return null;
     return open_file_paths[file_idx][0..len];
+}
+
+/// namespace_policy.Kind of an open slot.
+pub fn openFileKind(file_idx: u32) ?@import("namespace_policy.zig").Kind {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active or file_idx >= open_count or open_files[file_idx].inode_num == 0) return null;
+    const m = open_files[file_idx].inode.mode;
+    if (eu.isDirectory(m)) return .directory;
+    if (eu.isSymlink(m)) return .symlink;
+    return .file;
 }
 
 /// Is the open slot a directory? Null for a free or invalid slot.

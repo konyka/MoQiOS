@@ -254,6 +254,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello124"); /* linkat/symlinkat/fchownat */
     run_test("hello125"); /* statx fields and flags */
     run_test("hello126"); /* access/faccessat/faccessat2 */
+    run_test("hello127"); /* namespace errnos */
 
     start_persistent_services();
 

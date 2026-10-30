@@ -292,7 +292,7 @@ pub fn build(b: *std.Build) void {
         "hello90",  "hello91",  "hello92", "hello93", "hello94",
         "hello95",  "hello96",  "hello97", "hello98", "hello99",
         "hello100", "hello101", "hello102", "hello103", "hello104",
-        "hello105", "hello106", "hello107", "hello108", "hello109", "hello110", "hello111", "hello112", "hello113", "hello114", "hello115", "hello116", "hello117", "hello118", "hello119", "hello120", "hello121", "hello122", "hello123", "hello124", "hello125", "hello126",
+        "hello105", "hello106", "hello107", "hello108", "hello109", "hello110", "hello111", "hello112", "hello113", "hello114", "hello115", "hello116", "hello117", "hello118", "hello119", "hello120", "hello121", "hello122", "hello123", "hello124", "hello125", "hello126", "hello127",
     };
     for (c_programs) |name| addCUserProgram(b, name);
 
@@ -397,6 +397,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_limine_bootstrap_tests.step);
     const run_disk_fixture_tests = b.addSystemCommand(&.{ "bash", "tools/tests/test_disk_fixture.sh" });
     test_step.dependOn(&run_disk_fixture_tests.step);
+    const run_mkramdisk_tests = b.addSystemCommand(&.{ "bash", "tools/tests/test_mkramdisk.sh" });
+    test_step.dependOn(&run_mkramdisk_tests.step);
     const run_observe_duration_tests = b.addSystemCommand(&.{ "python3", "tools/tests/test_observe_test_duration.py" });
     test_step.dependOn(&run_observe_duration_tests.step);
 }

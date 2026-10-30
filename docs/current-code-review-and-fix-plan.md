@@ -5279,3 +5279,17 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 限制：FAT32、ramdisk、devfs 仍只回答存在性（它们没有属主/权限模型）。
 - 变异：`credsFor` 一律按有效身份判定 → hello126 C 段 2 项 FAIL，恢复后 PASS。
 - 验证：host 747/747；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）3/3 PASS。
+
+### 命名空间调用的错误码（hello127）
+
+- 问题：探测程序在 ext2 与 tmpfs 上共 24 项错误码不符：`unlink` 目录、`rmdir` 文件/非空目录/缺失名字、`mkdir` 已存在、`O_EXCL`、`O_DIRECTORY`、
+  `O_NOFOLLOW`、以写方式打开目录、缺失名字、路径中间是文件，几乎全部返回裸 `-1`（EPERM）。`mkdir` 对已存在目录“成功”，对文件则失败。
+  vfs 的 `O_DIRECTORY` 常量写错（`0o100000` 是 `O_LARGEFILE`）。ramdisk 只能装 128 个程序，hello127 是第 129 个，装不进镜像。
+- 修复：`fs/namespace_policy.zig`（纯规则）；ext2 的 `walkPathFollow`/`parentErrno`/`createDir`/`unlinkFile`/`rmdirFile`；tmpfs 的 `tmpfsRemove`/`resolveErrno`/
+  `tmpfsOpenAuthorized`；vfs 的 ext2 打开路径用 `openFileFollow`（`O_NOFOLLOW`）并返回真实 errno；ramdisk 上限 256。
+- 回归（如实）：第一次运行 hello114 的 U、V 段共 20 项失败——原因是 `hello23` 创建夹具的第一步 `mkdir("testdir")` 在镜像已有该目录时现在返回 EEXIST，
+  它把非 0 当成失败而整体跳过夹具。改为接受 EEXIST 后恢复。这是行为变更（POSIX 本来如此），不是内核缺陷。
+- TDD：host 新增 3 个测试（命名空间规则表、`O_DIRECTORY` 常量、ramdisk 余量）和 `tools/tests/test_mkramdisk.sh`（先 RED：余量项 FAIL）；
+  hello127（32 项：ext2 16、tmpfs 15 加一个总结）在 HEAD 上 24 项 FAIL，新内核 PASS。tmpfs 没有符号链接，所以 ELOOP 项只测 ext2。
+- 变异：目录以写方式打开不再 EISDIR → hello127 4 项 FAIL（ext2、tmpfs 各 2），恢复后 PASS。
+- 验证：host 750/750（含新增 mkramdisk 脚本测试）；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL（hello114 的 U/V 段同样 PASS）；stress（SMP=2）3/3 PASS。

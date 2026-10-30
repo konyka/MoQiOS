@@ -208,6 +208,30 @@ fn resolvePath(path: []const u8, out_name: *[MAX_NAME_LEN]u8, out_name_len: *u8)
     return null;
 }
 
+/// Why `resolvePath` failed: ENOTDIR when an intermediate component exists but
+/// is a file, ENAMETOOLONG for an over-long final name, otherwise ENOENT.
+fn resolveErrno(path: []const u8) i64 {
+    const inner = stripPrefix(path);
+    var parent: u8 = 0;
+    var start: usize = if (inner.len > 0 and inner[0] == '/') 1 else 0;
+    var i = start;
+    while (i <= inner.len) : (i += 1) {
+        if (i == inner.len or inner[i] == '/') {
+            const comp = inner[start..i];
+            if (comp.len == 0) {
+                start = i + 1;
+                continue;
+            }
+            if (i == inner.len) return if (comp.len > MAX_NAME_LEN) -36 else -2;
+            const dir_idx = findEntry(comp, parent) orelse return -2;
+            if (!entries[dir_idx].is_dir) return -20;
+            parent = dir_idx;
+            start = i + 1;
+        }
+    }
+    return -2;
+}
+
 pub fn init() void {
     // Idempotent: subsystem_boot / main / SK-34 may all call this.
     if (initialized) return;
@@ -253,7 +277,7 @@ pub fn init() void {
 }
 
 /// Open a file under /tmp/. Creates if it does not exist.
-/// Returns entry index on success, -1 on error.
+/// Returns entry index on success, a negative errno on error.
 pub fn tmpfsOpen(path: []const u8, create: bool, is_dir: bool) i64 {
     return tmpfsOpenAuthorized(path, create, is_dir, 0, 0, .{}, 0, null, creation_metadata.DEFAULT_UMASK);
 }
@@ -290,10 +314,12 @@ pub fn tmpfsOpenAuthorized(path: []const u8, create: bool, is_dir: bool, euid: u
 
     var name_buf: [MAX_NAME_LEN]u8 = undefined;
     var name_len: u8 = 0;
-    const parent = resolvePath(path, &name_buf, &name_len) orelse return -1;
+    const parent = resolvePath(path, &name_buf, &name_len) orelse return resolveErrno(path);
 
     if (name_len == 1 and name_buf[0] == '/') {
         if (creation_metadata.exclusiveCreateRejectsExisting(create, flags)) return -17;
+        const root_rule = @import("namespace_policy.zig").openExisting(.directory, flags);
+        if (root_rule != 0) return root_rule;
         entries[0].open_count +|= 1;
         return 0;
     }
@@ -302,6 +328,8 @@ pub fn tmpfsOpenAuthorized(path: []const u8, create: bool, is_dir: bool, euid: u
     if (findEntry(name, parent)) |idx| {
         if (creation_metadata.exclusiveCreateRejectsExisting(create, flags)) return -17;
         const entry = &entries[idx];
+        const rule = @import("namespace_policy.zig").openExisting(if (entry.is_dir) .directory else .file, flags);
+        if (rule != 0) return rule;
         if (!entry.is_dir) {
             const decision = dac.decideExistingOpen(
                 .{ .mode = entry.mode, .uid = entry.uid, .gid = entry.gid },
@@ -317,11 +345,11 @@ pub fn tmpfsOpenAuthorized(path: []const u8, create: bool, is_dir: bool, euid: u
 
     if (create) {
         if (!dac.allows(dirMeta(parent), .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override, .groups = @import("../proc/current_groups.zig").forCaller(euid, egid) }, dac.Access.write_search)) return -13;
-        const idx = createEntryLocked(name, name_len, parent, is_dir, requested_mode, umask_val, euid, egid) orelse return -1;
+        const idx = createEntryLocked(name, name_len, parent, is_dir, requested_mode, umask_val, euid, egid) orelse return -28; // ENOSPC: no free entry
         return @intCast(idx);
     }
 
-    return -1;
+    return -2; // ENOENT
 }
 
 /// Read from a tmpfs file.
@@ -543,18 +571,33 @@ pub const Remover = struct {
 /// a sticky directory only the entry's owner, the directory's owner, uid 0 or
 /// CAP_FOWNER (dac.mayRemoveEntry). -13 (EACCES) when refused.
 pub fn tmpfsUnlinkAuthorized(path: []const u8, who: ?Remover) i64 {
+    return tmpfsRemove(path, who, .any);
+}
+
+/// What the caller asked to remove: unlink(2) refuses directories (EISDIR),
+/// rmdir(2) refuses everything else (ENOTDIR); `.any` keeps the old combined
+/// behaviour for in-kernel callers.
+pub const RemoveKind = enum { any, file, dir };
+
+pub fn tmpfsRemove(path: []const u8, who: ?Remover, want: RemoveKind) i64 {
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
 
     var name_buf: [MAX_NAME_LEN]u8 = undefined;
     var name_len: u8 = 0;
-    const parent = resolvePath(path, &name_buf, &name_len) orelse return -1;
+    const parent = resolvePath(path, &name_buf, &name_len) orelse return -2;
 
-    if (name_len == 1 and name_buf[0] == '/') return -1; // cannot unlink root
+    if (name_len == 1 and name_buf[0] == '/') return -16; // EBUSY: the root cannot be removed
 
     const name = name_buf[0..name_len];
-    const idx = findEntry(name, parent) orelse return -1;
+    const idx = findEntry(name, parent) orelse return -2;
     const entry = &entries[idx];
+
+    switch (want) {
+        .any => {},
+        .file => if (entry.is_dir) return -21, // EISDIR
+        .dir => if (!entry.is_dir) return -20, // ENOTDIR
+    }
 
     if (who) |w| {
         const creds: dac.Credentials = .{ .euid = w.euid, .egid = w.egid, .cap_dac_override = w.effective_caps.cap_dac_override, .groups = @import("../proc/current_groups.zig").forCaller(w.euid, w.egid) };
@@ -570,7 +613,7 @@ pub fn tmpfsUnlinkAuthorized(path: []const u8, who: ?Remover) i64 {
             const ci: u8 = @intCast(bit);
             if (entries[ci].deleted) continue;
             if (entries[ci].parent_idx == idx) {
-                return -1; // ENOTEMPTY
+                return -39; // ENOTEMPTY
             }
         }
     }

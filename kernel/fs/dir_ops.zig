@@ -224,8 +224,8 @@ fn mkdirName(name: []const u8, requested_mode: ?u32) i64 {
             ext2.closeFile(@intCast(result));
             return 0;
         }
-        if (result == 0) return 0;
+        return result; // 0, or the errno ext2 reported (EEXIST, ENOENT, ENOTDIR, EACCES, ...)
     }
 
-    return -1;
+    return -38; // ENOSYS: no filesystem mounted to create it on
 }

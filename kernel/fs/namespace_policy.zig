@@ -1,0 +1,53 @@
+//! Pure errno rules for the namespace calls on a filesystem that has
+//! directories, files and symlinks (ext2, tmpfs): what unlink, rmdir, mkdir
+//! and open answer for an object that exists, or does not.
+
+pub const Kind = enum { missing, file, directory, symlink };
+
+const O_ACCMODE: u32 = 0x3;
+const O_CREAT: u32 = 0x40;
+const O_EXCL: u32 = 0x80;
+const O_TRUNC: u32 = 0x200;
+const O_DIRECTORY: u32 = 0x10000;
+const O_NOFOLLOW: u32 = 0x20000;
+
+pub fn unlink(k: Kind) i64 {
+    return switch (k) {
+        .missing => -2, // ENOENT
+        .directory => -21, // EISDIR
+        .file, .symlink => 0,
+    };
+}
+
+pub fn rmdir(k: Kind, empty: bool) i64 {
+    return switch (k) {
+        .missing => -2,
+        .file, .symlink => -20, // ENOTDIR
+        .directory => if (empty) 0 else -39, // ENOTEMPTY
+    };
+}
+
+pub fn mkdir(k: Kind) i64 {
+    return if (k == .missing) 0 else -17; // EEXIST
+}
+
+/// open() of an object that exists. Order follows Linux: O_CREAT|O_EXCL first,
+/// then O_NOFOLLOW on a symlink, then the directory rules.
+pub fn openExisting(k: Kind, flags: u32) i64 {
+    if ((flags & O_CREAT) != 0 and (flags & O_EXCL) != 0) return -17;
+    if (k == .symlink and (flags & O_NOFOLLOW) != 0) {
+        return if ((flags & O_DIRECTORY) != 0) -20 else -40; // ENOTDIR / ELOOP
+    }
+    switch (k) {
+        .directory => {
+            if ((flags & O_ACCMODE) != 0 or (flags & O_TRUNC) != 0) return -21; // EISDIR
+            return 0;
+        },
+        .file => return if ((flags & O_DIRECTORY) != 0) -20 else 0,
+        else => return 0,
+    }
+}
+
+pub fn openMissing(flags: u32) i64 {
+    return if ((flags & O_CREAT) != 0) 0 else -2;
+}

@@ -925,6 +925,14 @@ const SchedStats = struct {
 - `EPOLL_CTL_ADD` 沿 child epoll 链（`nestedChainReaches`，visited bitmap 有界）检测间接环，构成环返回 `ELOOP`——环上就绪互相传播会使 `epoll_wait` 永久 busy-loop。（§6.51）
 - MoqIPC receive 被信号/`moqipc_notify` 踢醒时统一清理 `waiting_receiver` 注册并按唤醒来源分类返回：endpoint 失效才报 `invalid_endpoint`，存活 endpoint 的无投递唤醒报 EINTR（信号）/EAGAIN（notify）——注册残留曾让 endpoint 对所有 sender 永久报废。（§6.51）
 - `alarm`/`itimer` deadline 字段与 per-CPU run-queue 的 `nr_running` 计数全部原子访问（tick 扫描器跨 CPU 与 syscall 上下文并发）。（§6.51）
+- **命名空间调用在 ext2/tmpfs 上返回 Linux 错误码（hello127）**：此前 unlink、rmdir、mkdir、open 的大多数失败都是裸 `-1`（用户态看到 EPERM）。
+  纯策略 `fs/namespace_policy.zig` 给出规则，两个文件系统共用：`unlink` 目录 EISDIR；`rmdir` 非目录 ENOTDIR、非空 ENOTEMPTY；`mkdir` 已存在
+  EEXIST（原先对已存在的目录“幂等成功”，对文件则创建失败为 EPERM）；缺失 ENOENT；`open`：`O_CREAT|O_EXCL` 已存在 EEXIST，`O_DIRECTORY` 对文件 ENOTDIR，
+  `O_NOFOLLOW` 遇符号链接 ELOOP（与 `O_DIRECTORY` 同用则 ENOTDIR），目录以写/`O_TRUNC` 打开 EISDIR，路径中间分量是文件 ENOTDIR（`ParentError.NotDir`、
+  `walkPathFollow`），槽位用尽 ENFILE，分配失败 ENOSPC/ENOMEM/EIO。tmpfs 的 `tmpfsRemove(.file/.dir)` 区分 unlink 与 rmdir；`resolveErrno` 区分 ENOENT/ENOTDIR/ENAMETOOLONG。
+  `unlinkName` 只在 ext2 报“没有这个名字”时才继续找 FAT32。顺带修复：vfs 把 `O_DIRECTORY` 写成 `0o100000`（那是 `O_LARGEFILE`），正确值 `0x10000`；
+  ramdisk 文件数上限 128→256（`ramdisk.MAX_FILES` 与 `tools/mkramdisk.sh` 同步，`tools/tests/test_mkramdisk.sh` 守卫一致性与余量，之前第 129 个测试程序根本打不进镜像）。
+  行为变化：`hello23` 的 `mkdir("testdir")` 在镜像已有该目录时现在是 EEXIST，该测试的前置步骤随之改为接受 EEXIST。
 - **access / faccessat / faccessat2 在 ext2 与 tmpfs 上判定权限位（hello126）**：此前只有只读卷按文件真实 mode 判定，ext2/tmpfs 只回答“能否打开”，
   `X_OK` 对 0640 文件也成功、非法 mode 位不报错。现在 `fs/access_policy.zig` 统一规则：`F_OK` 只要存在；R/W/X 按属主/属组/其他类判定（补充组参与）；
   `CAP_DAC_OVERRIDE` 放行 R/W，但 X 仍要求至少一个执行位（目录除外）；mode 含 R/W/X 之外的位 EINVAL。**身份**：`access`/`faccessat` 按**真实** uid/gid 判定，
