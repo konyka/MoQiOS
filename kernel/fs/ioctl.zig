@@ -9,6 +9,7 @@ const task_mod = @import("../proc/task.zig");
 const sched = @import("../proc/sched.zig");
 const vfs = @import("vfs.zig");
 const pgrp = @import("../proc/pgrp.zig");
+const ip = @import("ioctl_policy.zig");
 
 // ── Terminal ioctl command numbers (Linux x86_64 values) ──
 
@@ -60,10 +61,25 @@ var default_termios: Termios = .{
 /// Foreground process group ID for the controlling terminal.
 /// （作业控制 v1 起，真值统一由 kernel/proc/jobctl.zig 的 foreground_pgid 持有。）
 
+/// Is this descriptor a terminal? The console (stdio specials) and /dev/tty.
+fn targetOf(desc: *const vfs.FileDescriptor) ip.Target {
+    return switch (desc.fd_type) {
+        .special => .terminal,
+        .devfs => if (desc.devfs_idx == @import("devfs_nodes.zig").ttyNodeIdx()) .terminal else .other,
+        else => .other,
+    };
+}
+
 /// sysIoctl(fd, cmd, arg) → 0 on success, negative errno on failure
 pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
     // Validate fd range
     if (fd >= vfs.MAX_FDS) return -9; // EBADF
+    const cur_idx0 = sched.currentTaskIndex() orelse return -3;
+    const cur0 = task_mod.getTask(cur_idx0) orelse return -3;
+    const desc0 = &cur0.fd_table.fds[@intCast(fd)];
+    if (desc0.fd_type == .none) return -9; // EBADF
+    const rc_tty = ip.terminalCheck(cmd, targetOf(desc0));
+    if (rc_tty != 0) return rc_tty;
 
     switch (cmd) {
         TIOCGWINSZ => {
@@ -150,6 +166,15 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
                         const udp_mod = @import("../net/udp.zig");
                         nread = @intCast(udp_mod.nextDatagramLen(desc.udp_port, desc.udp_is_v6));
                     },
+                    .unix_socket => {
+                        const unix_mod = @import("../net/unix_socket.zig");
+                        nread = @intCast(unix_mod.unixReadable(desc.unix_sock_idx));
+                    },
+                    // Regular files: the bytes between the offset and the end.
+                    .ramdisk_file, .fat32_file, .ext2_file, .tmpfs_file, .rofs_file => {
+                        vfs.syncOffsetIn(&cur.fd_table.fds[fd_idx]);
+                        nread = @intCast(ip.fileReadable(desc.file_size, cur.fd_table.fds[fd_idx].offset));
+                    },
                     // Other fd types have no readable-byte count to report.
                     else => {},
                 }
@@ -178,6 +203,15 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
                 cur.fd_table.fds[fd_idx].status_flags |= 0x800; // O_NONBLOCK
             } else {
                 cur.fd_table.fds[fd_idx].status_flags &= ~@as(u32, 0x800);
+            }
+            return 0;
+        },
+        ip.FIOCLEX, ip.FIONCLEX => {
+            const fd_idx: u32 = @intCast(fd);
+            if (cmd == ip.FIOCLEX) {
+                cur0.fd_table.fds[fd_idx].fd_flags |= 1; // FD_CLOEXEC
+            } else {
+                cur0.fd_table.fds[fd_idx].fd_flags &= ~@as(u32, 1);
             }
             return 0;
         },

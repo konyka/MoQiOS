@@ -52,11 +52,18 @@ pub fn init() void {
     _ = devfs.register("urandom", random_node_ops);
     kmsg_idx = devfs.register("kmsg", kmsg_node_ops) orelse devfs.DIR_IDX;
     _ = devfs.register("pci", pci_node_ops);
-    _ = devfs.register("tty", tty_node_ops);
+    tty_idx = devfs.register("tty", tty_node_ops) orelse devfs.DIR_IDX;
     watch_idx = devfs.register("devfs-watch", watch_node_ops) orelse devfs.DIR_IDX;
     fb0_idx = devfs.register("fb0", fb0_node_ops) orelse devfs.DIR_IDX;
     _ = devfs.register("fbinfo", fbinfo_node_ops);
     _ = devfs.register("mouse", mouse_node_ops);
+}
+
+/// devfs slot of /dev/tty (a terminal for ioctl purposes); DIR_IDX = not registered.
+var tty_idx: u32 = devfs.DIR_IDX;
+
+pub fn ttyNodeIdx() u32 {
+    return tty_idx;
 }
 
 /// devfs slot of /dev/fb0 — mmap() (mm/mmap.zig) compares a mapped devfs

@@ -7645,3 +7645,16 @@ test "ppoll and pselect6 timespec timeouts round up and reject bad fields" {
     try std.testing.expectEqual(@as(u64, 1500), pp.timespecWait(1, 500_000_000).?.ms);
     try std.testing.expect(pp.timespecWait(std.math.maxInt(i64), 0).? == .forever);
 }
+
+test "ioctl: terminal requests need a terminal, FIONREAD on files counts bytes after the offset" {
+    const ip = kt.ioctl_policy;
+    try std.testing.expectEqual(@as(i64, -25), ip.terminalCheck(ip.TCGETS, .other));
+    try std.testing.expectEqual(@as(i64, -25), ip.terminalCheck(ip.TIOCGWINSZ, .other));
+    try std.testing.expectEqual(@as(i64, -25), ip.terminalCheck(ip.TIOCGPGRP, .other));
+    try std.testing.expectEqual(@as(i64, 0), ip.terminalCheck(ip.TCGETS, .terminal));
+    try std.testing.expectEqual(@as(i64, 0), ip.terminalCheck(ip.FIONREAD, .other));
+    try std.testing.expectEqual(@as(i64, 0), ip.terminalCheck(ip.FIOCLEX, .other));
+    try std.testing.expectEqual(@as(u32, 6), ip.fileReadable(10, 4));
+    try std.testing.expectEqual(@as(u32, 0), ip.fileReadable(10, 10));
+    try std.testing.expectEqual(@as(u32, 0), ip.fileReadable(10, 99));
+}

@@ -502,6 +502,21 @@ pub fn unixSend(idx: u32, data: [*]const u8, len: usize) i64 {
 /// For STREAM: reads bytes from buffer.
 /// For DGRAM: reads one datagram (length-prefixed).
 /// Returns bytes read, or negative errno on failure.
+/// FIONREAD: bytes a read would return now — the queued bytes of a stream, the
+/// length of the next datagram of a datagram socket.
+pub fn unixReadable(idx: u32) u32 {
+    if (idx >= MAX_UNIX_SOCKETS) return 0;
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+    const sock = &unix_sockets[idx];
+    if (!sock.active) return 0;
+    if (sock.sock_type == SOCK_STREAM) return sock.buf_count;
+    if (sock.buf_count < 2) return 0;
+    const lo = sock.buffer[sock.buf_read];
+    const hi = sock.buffer[(sock.buf_read + 1) % UNIX_SOCK_BUF_SIZE];
+    return @min(@as(u32, lo) | (@as(u32, hi) << 8), sock.buf_count - 2);
+}
+
 pub fn unixRecv(idx: u32, buf: [*]u8, len: usize) i64 {
     if (idx >= MAX_UNIX_SOCKETS) return -9; // EBADF
 

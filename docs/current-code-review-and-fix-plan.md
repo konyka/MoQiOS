@@ -5443,3 +5443,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 变异：第一次尝试把“正常返回时恢复旧掩码”改坏，居然没有测试失败（探测只覆盖了被信号打断的路径）——补上 A2 段（带全屏蔽临时掩码的正常返回后掩码必须不变）后，同一变异让 A2 两项 FAIL，恢复后 PASS。
 - 验证：host 781/781；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS（门禁在补充 A2 检查之前跑完，补充后又单独跑了 SMP=2 冒烟 PASS）。
+
+### ioctl 请求（hello141）
+
+- 问题：终端类 ioctl 对管道、普通文件、套接字、eventfd、`/dev/null` 都返回成功，`isatty()` 永远为真；`FIONREAD` 对 AF_UNIX 套接字和普通文件恒为 0；`FIOCLEX`/`FIONCLEX` 缺失。
+- 修复：新增 `fs/ioctl_policy.zig`（纯策略：终端请求分类、`terminalCheck`、`fileReadable`）；`sysIoctl` 先校验 fd（EBADF），再对非终端返回 ENOTTY（终端 = stdio `special` 与 `/dev/tty`，`devfs_nodes.ttyNodeIdx`）；`FIONREAD` 增加 AF_UNIX（`unix_socket.unixReadable`）与普通文件；新增 `FIOCLEX`/`FIONCLEX`。
+- 已知差异：终端状态（termios、winsize）仍是全局单份而非每个终端一份；`TCSETSW/TCSETSF` 只做分类，没有实现写入语义；`TIOCGPGRP` 在没有控制终端的会话里仍返回当前进程组而不是 ENOTTY。
+- 排查过程（如实）：探测里的 `lseek` 一开始写成了系统调用 8，实际是原生 #197；`FIONREAD` 的文件检查由此失败了一次，改探测后内核通过。
+- TDD：host 新增 1 个测试；hello141（28 项）在 HEAD 上 11 项 FAIL，新内核 PASS。
+
+- 变异：非终端不再返回 ENOTTY → hello141 A 段 7 项 FAIL，恢复后 PASS。
+- 验证：host 782/782；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL（shell 等使用 stdin ioctl 的测试无回归）；stress（SMP=2）5/5 PASS。

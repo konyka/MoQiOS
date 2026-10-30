@@ -268,6 +268,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello138"); /* uname, hostname, rlimit, sysinfo */
     run_test("hello139"); /* poll and select readiness and timeouts */
     run_test("hello140"); /* ppoll and pselect6 */
+    run_test("hello141"); /* ioctl requests */
 
     start_persistent_services();
 
