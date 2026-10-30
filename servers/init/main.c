@@ -265,6 +265,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello135"); /* signal call argument and errno rules */
     run_test("hello136"); /* real-time signals 32..64 */
     run_test("hello137"); /* siginfo and ucontext */
+    run_test("hello138"); /* uname, hostname, rlimit, sysinfo */
 
     start_persistent_services();
 

@@ -4414,18 +4414,7 @@ fn syscallMincore(addr: u64, length: u64, vec_ptr: u64) i64 {
     return 0;
 }
 
-// ── v34.0: Global hostname / domainname ──────────────────────────────────────
-var kernel_hostname: [64]u8 = .{0} ** 64;
-var kernel_hostname_len: u32 = 0;
-var kernel_domainname: [64]u8 = .{0} ** 64;
-var kernel_domainname_len: u32 = 0;
-
-// Initialize default hostname
-fn initHostname() void {
-    const default = "moqios";
-    @memcpy(kernel_hostname[0..default.len], default);
-    kernel_hostname_len = default.len;
-}
+const uts = @import("../../proc/uts.zig");
 
 // ── v34.0: Syscall function implementations ───────────────────────────────────
 
@@ -4446,24 +4435,24 @@ fn syscallWait4(pid: u64, status_ptr: u64, options: u32, rusage_ptr: u64) i64 {
 fn syscallSethostname(name_ptr: u64, len: u32) i64 {
     if (name_ptr == 0 or name_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT
     if (len > 64) return -22; // EINVAL
-    if (kernel_hostname_len == 0) initHostname();
+    uts.ensureInit();
     const copy = @import("../../mm/copy_from_user.zig");
     var buf: [64]u8 = .{0} ** 64;
     const copied = copy.copyFromUser(&buf, @ptrFromInt(name_ptr), len);
     if (copied < len) return -14;
-    @memcpy(&kernel_hostname, &buf);
-    kernel_hostname_len = len;
+    @memcpy(&uts.hostname, &buf);
+    uts.hostname_len = len;
     return 0;
 }
 
 /// #265 gethostname(name, len)
 fn syscallGethostname(name_ptr: u64, len: u32) i64 {
     if (name_ptr == 0 or name_ptr >= 0x0000_8000_0000_0000) return -14;
-    if (kernel_hostname_len == 0) initHostname();
+    uts.ensureInit();
     const copy = @import("../../mm/copy_from_user.zig");
-    const to_copy = @min(len, kernel_hostname_len);
+    const to_copy = @min(len, uts.hostname_len);
     if (!copy.validateUserBufferWritable(name_ptr, if (to_copy < len) to_copy + 1 else to_copy)) return -14;
-    if (copy.copyToUser(@ptrFromInt(name_ptr), kernel_hostname[0..to_copy], to_copy) != to_copy) return -14;
+    if (copy.copyToUser(@ptrFromInt(name_ptr), uts.hostname[0..to_copy], to_copy) != to_copy) return -14;
     // NUL-terminate if space
     if (to_copy < len) {
         const zero: u8 = 0;
@@ -4480,8 +4469,8 @@ fn syscallSetdomainname(name_ptr: u64, len: u32) i64 {
     var buf: [64]u8 = .{0} ** 64;
     const copied = copy.copyFromUser(&buf, @ptrFromInt(name_ptr), len);
     if (copied < len) return -14;
-    @memcpy(&kernel_domainname, &buf);
-    kernel_domainname_len = len;
+    @memcpy(&uts.domainname, &buf);
+    uts.domainname_len = len;
     return 0;
 }
 
@@ -4489,10 +4478,10 @@ fn syscallSetdomainname(name_ptr: u64, len: u32) i64 {
 fn syscallGetdomainname(name_ptr: u64, len: u32) i64 {
     if (name_ptr == 0 or name_ptr >= 0x0000_8000_0000_0000) return -14;
     const copy = @import("../../mm/copy_from_user.zig");
-    const to_copy = @min(len, kernel_domainname_len);
+    const to_copy = @min(len, uts.domainname_len);
     if (!copy.validateUserBufferWritable(name_ptr, if (to_copy < len) to_copy + 1 else to_copy)) return -14;
     if (to_copy > 0) {
-        if (copy.copyToUser(@ptrFromInt(name_ptr), kernel_domainname[0..to_copy], to_copy) != to_copy) return -14;
+        if (copy.copyToUser(@ptrFromInt(name_ptr), uts.domainname[0..to_copy], to_copy) != to_copy) return -14;
     }
     if (to_copy < len) {
         const zero: u8 = 0;

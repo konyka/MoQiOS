@@ -5411,3 +5411,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 变异：`rt_sigqueueinfo` 改回不带 info 的 `sendSignal` → hello137 C 段 2 项 FAIL，恢复后 PASS。
 - 验证：host 771/771；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### uname 与主机名（hello138）
+
+- 问题：`uname` 的 nodename/domainname 写死，不随 `sethostname`/`setdomainname` 变化；`uname(NULL)` 返回 `-1`（EPERM）而不是 EFAULT。rlimit 与 sysinfo 的 40 余项探测没有发现偏差。
+- 修复：新增 `kernel/proc/uts.zig`（UTS 名字的唯一存放处 + 纯函数 `unameBytes`），`sethostname/gethostname/setdomainname/getdomainname/uname` 共用；`uname` 对 NULL/坏指针返回 EFAULT；允许空主机名。
+- 排查过程（如实）：第一轮探测里 `sethostname` 与“把已降低的硬限制再调高”报 EPERM，是因为 hello138 以无特权的默认用户启动——这是内核的正确行为，不是缺陷；在 `capability_profile.zig` 给 hello138 `cap_sys_admin`（与 swap 测试同类），并把 rlimit 的无特权检查改成 EPERM 断言。另外第一版修复里我对 `uname(0)` 的 `@ptrFromInt(0)` 触发了“cast causes pointer to be null”内核 panic，补上 NULL 判断后消失——说明其它直接把用户指针转成指针的地方都应先判空，已在 `uname` 修复。
+- TDD：host 新增 5 个测试（uname 字段、64 字节名、siginfo 布局/权限/子进程与故障码）；hello138（41 项）在 HEAD 上 6 项 FAIL，新内核 PASS。
+
+- 变异：`uname` 改回写死的默认主机名 → hello138 B/C 段 4 项 FAIL，恢复后 PASS。
+- 验证：host 776/776；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1/2/8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）3/3 PASS。

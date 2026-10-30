@@ -83,30 +83,11 @@ pub fn spawn(name_ptr: u64) i64 {
 }
 
 /// Syscall #63: uname(buf)
-/// RDI = pointer to user buffer (390 bytes: 6 fields × 65 bytes)
+/// RDI = pointer to user buffer (390 bytes: 6 fields × 65 bytes); nodename and
+/// domainname follow sethostname/setdomainname (uts.zig).
 pub fn uname(buf_ptr: u64) i64 {
-    if (buf_ptr == 0 or buf_ptr >= 0x0000_8000_0000_0000) return -1;
-
+    if (buf_ptr == 0) return -14;
     const copy = @import("../mm/copy_from_user.zig");
-
-    var ubuf: [390]u8 = undefined;
-    @memset(&ubuf, 0);
-
-    const fields = [_][]const u8{
-        "MoQiOS", // sysname
-        "moqios", // nodename
-        "0.1.0", // release
-        "MoQiOS 0.1.0", // version
-        "x86_64", // machine
-        "", // domainname
-    };
-
-    var offset: usize = 0;
-    for (fields) |f| {
-        const copy_len = @min(f.len, 64);
-        @memcpy(ubuf[offset .. offset + copy_len], f[0..copy_len]);
-        offset += 65;
-    }
-
+    const ubuf = @import("uts.zig").currentUname();
     return if (copy.copyToUser(@ptrFromInt(buf_ptr), &ubuf, ubuf.len) == ubuf.len) 0 else -14;
 }

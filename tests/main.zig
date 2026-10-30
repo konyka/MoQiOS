@@ -7534,3 +7534,62 @@ test "siginfo policy is reachable from the host test root" {
     try std.testing.expectEqual(@as(usize, 128), sp.SIGINFO_SIZE);
     try std.testing.expectEqual(@as(usize, 432), @sizeOf(sp.UContext));
 }
+
+test "uname image carries the mutable names in the right fields" {
+    const u = kt.uts;
+    const b = u.unameBytes("box", "lan");
+    try std.testing.expectEqualStrings("MoQiOS", std.mem.sliceTo(b[0..u.FIELD], 0));
+    try std.testing.expectEqualStrings("box", std.mem.sliceTo(b[u.FIELD .. 2 * u.FIELD], 0));
+    try std.testing.expectEqualStrings("x86_64", std.mem.sliceTo(b[4 * u.FIELD .. 5 * u.FIELD], 0));
+    try std.testing.expectEqualStrings("lan", std.mem.sliceTo(b[5 * u.FIELD .. 6 * u.FIELD], 0));
+    const empty = u.unameBytes("", "");
+    try std.testing.expectEqual(@as(u8, 0), empty[u.FIELD]);
+    try std.testing.expectEqual(@as(u8, 0), empty[5 * u.FIELD]);
+}
+
+test "a 64-byte hostname fits its uname field with the NUL terminator" {
+    const u = kt.uts;
+    const long: [64]u8 = @splat('h');
+    const b = u.unameBytes(&long, "");
+    try std.testing.expectEqual(@as(u8, 'h'), b[u.FIELD + 63]);
+    try std.testing.expectEqual(@as(u8, 0), b[u.FIELD + 64]);
+    try std.testing.expect(u.nameLenValid(64));
+    try std.testing.expect(!u.nameLenValid(65));
+}
+
+test "siginfo encodes the Linux x86-64 siginfo_t layout" {
+    const sp = kt.siginfo_policy;
+    const b = sp.encode(10, .{ .code = sp.SI_QUEUE, .a = sp.pidUid(77, 5), .b = 0xdeadbeef });
+    try std.testing.expectEqual(@as(u8, 10), b[0]);
+    try std.testing.expectEqual(@as(u8, 0xff), b[8]); // si_code -1
+    try std.testing.expectEqual(@as(u8, 77), b[16]);
+    try std.testing.expectEqual(@as(u8, 5), b[20]);
+    try std.testing.expectEqual(@as(u8, 0xef), b[24]);
+    try std.testing.expectEqual(@as(u8, 0), b[100]);
+    const round = sp.decode(&b);
+    try std.testing.expectEqual(sp.SI_QUEUE, round.code);
+    try std.testing.expectEqual(@as(u64, 0xdeadbeef), round.b);
+}
+
+test "rt_sigqueueinfo may only forge negative codes towards other processes" {
+    const sp = kt.siginfo_policy;
+    try std.testing.expect(sp.queueinfoAllowed(sp.SI_QUEUE, false));
+    try std.testing.expect(!sp.queueinfoAllowed(sp.SI_USER, false));
+    try std.testing.expect(!sp.queueinfoAllowed(sp.SI_KERNEL, false));
+    try std.testing.expect(!sp.queueinfoAllowed(sp.SI_TKILL, false));
+    try std.testing.expect(sp.queueinfoAllowed(sp.SI_USER, true));
+}
+
+test "child and fault siginfo codes" {
+    const sp = kt.siginfo_policy;
+    const exited = sp.childInfo(9, 0, 7, true);
+    try std.testing.expectEqual(sp.CLD_EXITED, exited.code);
+    try std.testing.expectEqual(@as(u64, 7), exited.b);
+    const killed = sp.childInfo(9, 0, 128 + 11, false);
+    try std.testing.expectEqual(sp.CLD_KILLED, killed.code);
+    try std.testing.expectEqual(@as(u64, 11), killed.b);
+    try std.testing.expectEqual(sp.SEGV_MAPERR, sp.faultInfo(false, false, 0x10).code);
+    try std.testing.expectEqual(sp.SEGV_ACCERR, sp.faultInfo(false, true, 0x10).code);
+    try std.testing.expectEqual(sp.BUS_ADRERR, sp.faultInfo(true, false, 0x10).code);
+    try std.testing.expectEqual(@as(u64, 0x10), sp.faultInfo(false, false, 0x10).a);
+}

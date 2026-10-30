@@ -102,7 +102,7 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
     // Swap acceptance tests enable and drain swap devices (system-wide state).
     if (std.mem.eql(u8, name, "hello96") or std.mem.eql(u8, name, "hello98") or
         std.mem.eql(u8, name, "hello99") or std.mem.eql(u8, name, "hello100") or
-        std.mem.eql(u8, name, "hello101"))
+        std.mem.eql(u8, name, "hello101") or std.mem.eql(u8, name, "hello138"))
     {
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_sys_admin = true }, .initial_init = false };
     }
