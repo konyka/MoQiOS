@@ -94,6 +94,37 @@ for ((iter = 1; iter <= MAX_ITER; iter++)); do
     echo "[probe] iteration $iter: $outcome"
 
     if [ "$outcome" = "stall" ]; then
+        # Interrupt-liveness sample first, while the guest still runs: per-CPU
+        # interrupt counts twice, IRQ_SAMPLE_SECS apart. A CPU whose count does
+        # not advance is not receiving timer interrupts.
+        IRQ_CMDS="$OUT_DIR/irq.gdb"
+        cat > "$IRQ_CMDS" <<'EOF2'
+set pagination off
+target remote :1234
+set $c = 0
+while $c < 8
+  printf "irq cpu%d count=%lu depth=%u last_tsc=%lu\n", $c, 'arch.x86_64.idt.irq_acc'[$c].count, 'arch.x86_64.idt.irq_acc'[$c].depth, 'arch.x86_64.idt.irq_acc'[$c].start_tsc
+  set $c = $c + 1
+end
+printf "freq_mhz=%lu sleep_bm=0x%lx\n", 'arch.x86_64.tsc.tsc_freq_mhz', 'proc.sched.sleep_bm'
+set $i = 0
+while $i < 64
+  if ('proc.task.slot_bitmap' >> $i) & 1
+    set $t = &'proc.task.tasks'[$i]
+    if $t.sleep_deadline_ns != 0
+      printf "sleeper slot=%d tid=%d state=%d deadline_ns=%lu\n", $i, $t.tid, $t.state, $t.sleep_deadline_ns
+    end
+  end
+  set $i = $i + 1
+end
+detach
+quit
+EOF2
+        for sample in 1 2; do
+            echo "=== irq sample $sample ===" >>"$OUT_DIR/run-$iter.irq.txt"
+            gdb -batch -x "$IRQ_CMDS" zig-out/bin/moqi-kernel.elf 2>&1 | grep -a "^irq \|^freq_mhz\|^sleeper " >>"$OUT_DIR/run-$iter.irq.txt" || true
+            sleep "${IRQ_SAMPLE_SECS:-3}"
+        done
         gdb -batch -x "$GDB_CMDS" zig-out/bin/moqi-kernel.elf \
             >"$OUT_DIR/run-$iter.gdb.txt" 2>&1 || true
         echo "[probe] gdb dump: $OUT_DIR/run-$iter.gdb.txt"

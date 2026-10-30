@@ -5542,12 +5542,17 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异：`typeBits(.socket)` 改成 `S_IFREG` → host 的 `fd stat policy` 测试失败；QEMU 里同一类变异使 hello148 A 段的 socket 检查 FAIL，恢复后 PASS。
 - 验证：host 790/790；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=2 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS；SMP=8 见下一节：该配置有一个与本改动无关的间歇性停顿，第一次门禁运行因它超时，之后用本改动连跑 5 次 SMP=8 全部通过。
 
-#### 门禁中发现的既有间歇性停顿：SMP=8 在 hello144 D 段（与本改动无关，未修复）
+#### SMP=8 间歇性停顿：已定位到“内核读到全零的 sockaddr”，根因未查明（与 hello148 无关，未修复）
 
-- 现象：本轮 SMP=8 冒烟第一次超时（200 s 没有出现结束标记），日志停在 `hello144` C 段之后、D 段“阻塞接收被另一进程发来的数据报唤醒”的 `fork` 之后（`[fork] parent=433 child=434`、`[exit] task exited`，然后再无输出），0 个 FAIL 行。
-- 它不是本改动引入的：把本改动 `git stash` 掉，在 HEAD 上连跑 4 次 SMP=8，第 3 次同样停在同一位置（rc=1）。用本改动再跑 5 次 SMP=8 全部通过，另有 3 次中 2 次通过——即约 1/4 到 1/5 的概率，与有无本改动无关。
-- 用 `tools/gdb_stall_probe.sh`（PROBE_SMP=8）抓到一次现场：8 个 CPU 全部停在 `kernelIdleLoop`（`hlt`，`IF=1`），没有任何 CPU 在运行用户任务；父进程（slot 11，tid 433）是 `state=2 blocked`，`sleep_deadline_ns=310266773022`、`sleep_bm=0x800`（恰好是它的位）、`pending=0x10000`；子进程（tid 434）已是 `state=3 zombie`，它的父进程（tid 433）正在 `udpWaitForDatagram` 里 5 ms 一片地 `sleepUntil`。也就是说：睡眠位在、截止时间也在，但没有任何 CPU 的定时器 tick 把它叫醒。
-- 已排除/已知：8 个 CPU 全在 `hlt` 且中断开着；`sleepTimerTick` 在每个 CPU 的每次 tick 上都会运行，所以应当被某个 CPU 的下一次 LAPIC 定时器中断唤醒；我另外在 SMP=8 上给每个 CPU 读 `clock_gettime`，各 CPU 的单调时钟一致（相差 <1 ms，只有个别窗口出现 ~240 ms 的跳变，说明 vCPU 偶尔被宿主机挂起，不是各 CPU 时钟不同步）。
-- 没有查明根因：怀疑是“8 个 vCPU 同时 `hlt` 且全部错过了 LAPIC 定时器中断”或 QEMU 在宿主机负载下丢了定时器中断（宿主机负载平均约 1–3）。需要 `-d int` 或 LAPIC 计数器才能继续确认。这一项我记为待办，没有放宽任何阈值，也没有改超时。
-- 与 hello144 的关系：hello144 的 D 段是唯一一个“父进程在内核里 5 ms 一片轮询睡眠、同时等待另一个进程发 UDP”的测试，所以最容易暴露“睡眠唤醒丢失”；在 SMP=1/2 上从未出现。
-
+- 现象：SMP=8 冒烟偶尔在 `hello144` D 段（父进程阻塞接收、子进程 fork 后发一个 UDP 数据报）之后无输出直到超时，0 个 FAIL 行。基线（没有 hello148 的改动）上同样出现，约 1/4 的概率；SMP=1/2 上从未出现。
+- 先排除的假设（有数据）：
+  - 丢定时器中断：不是。停顿现场对每个 CPU 连续两次采样 `irq_acc`，计数都在增加（每 CPU 约 100 次/秒），全部 CPU 都在 `hlt` 且 `IF=1`，睡眠位在、截止时间在、`sleepTimerTick` 每次 tick 都会运行。
+  - 各 CPU 时钟不一致：不是。每个 CPU 读 `clock_gettime`，差异 <1 ms。
+  - 回环/UDP 路径丢包：不是。停顿时 lo 队列为空、`enqueued==drained`，UDP 的 `rx_no_port/rx_bad/rx_queue_full` 全为 0。
+- 真正的原因链：父进程在 `recvfrom` 里（`udpWaitForDatagram`，没有 `SO_RCVTIMEO` 就一直等）等数据报；子进程的 `sendto` **失败返回 -1**，数据报根本没发出去，所以父进程永远等不到——表现为“停顿”。`hello144` D 段只是恰好是第一个会暴露它的场景。
+- `sendto` 为什么失败：内核在 `copyFromUser` 读子进程栈上的 `sockaddr_in` 时拿到的是**全零**（目标地址 0.0.0.0），于是 `udp.sendTo` 走到“没有 ARP 项”的分支返回 false。我写了独立的复现程序（见 `user/hello149.c`，不被 init 运行）：子进程在自己栈上构造 sockaddr 再 `sendto`，在 SMP=8 的冒烟环境里约 2/3 的运行会在 60 次迭代内出现 3 次失败；同一程序在 SMP=1/2 没有失败。
+- 失败时的现场（均为实测）：子进程自己在 syscall 之前读回的值是对的；syscall 时 PTE 存在且可写（`...67`，没有 COW 位），该页物理帧引用计数为 1，`CR3` 等于任务的页表；通过内核直映区读这个 PTE 指向的物理帧，里面是进程**初始栈**的内容（带 ELF 辅助向量风格的字：`3 0x1000040 5 6 6 …`），子进程的栈写入不在里面；对该页 `invlpg` 后重新 `copyFromUser` 仍读到全零；用 `pcid_enable=false` 重新构建，问题照旧（所以不是 PCID）。
+- 没有查明的部分：为什么子进程的栈写入没有落在 PTE 当前指向的物理帧里。我**没有**验证任何解释。一个没有证据支持的假设是：写入落到了另一个物理帧（例如 fork 的 COW 解除、写保护缺页处理或换页与另一个 CPU 并发时换了帧，而写入发生在换帧之前）；需要在缺页路径和 COW 路径上记录“谁在什么时候把哪个页的哪个帧换成了哪个帧”才能确认。
+- 已做：`user/hello149.c`（复现程序，只放进 ramdisk，不在 init/冒烟里运行，也没有在 shell 里单独跑过）；`tools/gdb_stall_probe.sh` 现在在停顿时先对每个 CPU 的中断计数连续采样两次（`IRQ_SAMPLE_SECS`），并列出所有带睡眠截止时间的任务，之前 `pending` 的格式化宽度也修正了。诊断用的 UDP/lo 计数器和多处 `[DIAG]` 打印已经撤掉，没有留在内核里。
+- 没做：没有修复，也没有改 `hello144` 或任何阈值/超时。`hello144` D 段在 SMP=8 上因此仍有约 1/4 的停顿概率；这个风险是真实的，会让 SMP=8 门禁偶发超时。
+- 下一步：在 fork 后的缺页/COW/换页路径上加受控的事件日志（页地址、旧帧、新帧、CPU、任务），用 `hello149` 在 SMP=8 上复现，核对“写入发生时 PTE 指向哪个帧”和“读取时 PTE 指向哪个帧”。

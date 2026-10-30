@@ -292,7 +292,7 @@ pub fn build(b: *std.Build) void {
         "hello90",  "hello91",  "hello92", "hello93", "hello94",
         "hello95",  "hello96",  "hello97", "hello98", "hello99",
         "hello100", "hello101", "hello102", "hello103", "hello104",
-        "hello105", "hello106", "hello107", "hello108", "hello109", "hello110", "hello111", "hello112", "hello113", "hello114", "hello115", "hello116", "hello117", "hello118", "hello119", "hello120", "hello121", "hello122", "hello123", "hello124", "hello125", "hello126", "hello127", "hello128", "hello129", "hello130", "hello131", "hello132", "hello133", "hello134", "hello135", "hello136", "hello137", "hello138", "hello139", "hello140", "hello141", "hello142", "hello143", "hello144", "hello145", "hello146", "hello147", "hello148",
+        "hello105", "hello106", "hello107", "hello108", "hello109", "hello110", "hello111", "hello112", "hello113", "hello114", "hello115", "hello116", "hello117", "hello118", "hello119", "hello120", "hello121", "hello122", "hello123", "hello124", "hello125", "hello126", "hello127", "hello128", "hello129", "hello130", "hello131", "hello132", "hello133", "hello134", "hello135", "hello136", "hello137", "hello138", "hello139", "hello140", "hello141", "hello142", "hello143", "hello144", "hello145", "hello146", "hello147", "hello148", "hello149",
     };
     for (c_programs) |name| addCUserProgram(b, name);
 
