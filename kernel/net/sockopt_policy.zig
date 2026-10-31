@@ -17,6 +17,7 @@ pub const SO_RCVBUF: u64 = 8;
 pub const SO_KEEPALIVE: u64 = 9;
 pub const SO_LINGER: u64 = 13;
 pub const SO_REUSEPORT: u64 = 15;
+pub const SO_PASSCRED: u64 = 16;
 pub const SO_PEERCRED: u64 = 17;
 pub const SO_RCVTIMEO: u64 = 20;
 pub const SO_SNDTIMEO: u64 = 21;
@@ -64,6 +65,7 @@ pub fn flagBit(optname: u64) ?u16 {
         SO_BROADCAST => 4,
         SO_REUSEPORT => 8,
         SO_DEBUG => 16,
+        SO_PASSCRED => 32,
         else => null,
     };
 }

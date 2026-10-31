@@ -290,6 +290,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello161"); /* UDP port unreachable on loopback */
     run_test("hello162"); /* remaining timeout written back by ppoll/pselect6/select */
     run_test("hello163"); /* socketpair(AF_UNIX, SOCK_DGRAM) */
+    run_test("hello164"); /* SCM_CREDENTIALS / SO_PASSCRED */
 
     start_persistent_services();
 

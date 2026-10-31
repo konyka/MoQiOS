@@ -9,6 +9,8 @@ const std = @import("std");
 
 pub const SOL_SOCKET: i32 = 1;
 pub const SCM_RIGHTS: i32 = 1;
+pub const SCM_CREDENTIALS: i32 = 2;
+pub const UCRED_LEN: usize = 12;
 pub const HDR: usize = 16;
 pub const MAX_FDS: usize = 8;
 
@@ -30,6 +32,11 @@ pub fn cmsgSpace(payload: usize) usize {
 pub const Parsed = struct {
     count: usize = 0,
     fds: [MAX_FDS]i32 = @splat(-1),
+    /// An explicit SCM_CREDENTIALS from the sender, if one was supplied.
+    has_cred: bool = false,
+    cred_pid: i32 = 0,
+    cred_uid: u32 = 0,
+    cred_gid: u32 = 0,
 };
 
 pub const ParseError = enum { invalid, too_many };
@@ -45,6 +52,15 @@ pub fn parseRights(control: []const u8) union(enum) { ok: Parsed, err: ParseErro
         const level = std.mem.readInt(i32, control[off + 8 ..][0..4], .little);
         const typ = std.mem.readInt(i32, control[off + 12 ..][0..4], .little);
         if (len < HDR or len > control.len - off) return .{ .err = .invalid };
+        if (level == SOL_SOCKET and typ == SCM_CREDENTIALS) {
+            if (len - HDR != UCRED_LEN) return .{ .err = .invalid };
+            out.has_cred = true;
+            out.cred_pid = std.mem.readInt(i32, control[off + HDR ..][0..4], .little);
+            out.cred_uid = std.mem.readInt(u32, control[off + HDR + 4 ..][0..4], .little);
+            out.cred_gid = std.mem.readInt(u32, control[off + HDR + 8 ..][0..4], .little);
+            off += align8(@intCast(len));
+            continue;
+        }
         if (level != SOL_SOCKET or typ != SCM_RIGHTS) return .{ .err = .invalid };
         const payload: usize = @intCast(len - HDR);
         if (payload % 4 != 0) return .{ .err = .invalid };
@@ -84,6 +100,33 @@ pub fn buildRights(fds: []const i32, cap: usize, out: []u8) Built {
     var pad = HDR + fits * 4;
     while (pad < total and pad < out.len) : (pad += 1) out[pad] = 0;
     return .{ .written = total, .fits = fits, .truncated = fits < fds.len };
+}
+
+/// Lay out one SCM_CREDENTIALS message ({i32 pid; u32 uid; u32 gid}) in a
+/// buffer of `cap` bytes. A buffer too small for the whole message yields
+/// nothing and truncation (the credentials are never cut in half).
+pub fn buildCredentials(pid: i32, uid: u32, gid: u32, cap: usize, out: []u8) Built {
+    const space = cmsgSpace(UCRED_LEN);
+    if (cap < cmsgLen(UCRED_LEN) or out.len < space) return .{ .written = 0, .fits = 0, .truncated = true };
+    std.mem.writeInt(u64, out[0..8], cmsgLen(UCRED_LEN), .little);
+    std.mem.writeInt(i32, out[8..12], SOL_SOCKET, .little);
+    std.mem.writeInt(i32, out[12..16], SCM_CREDENTIALS, .little);
+    std.mem.writeInt(i32, out[16..20], pid, .little);
+    std.mem.writeInt(u32, out[20..24], uid, .little);
+    std.mem.writeInt(u32, out[24..28], gid, .little);
+    var pad: usize = 28;
+    while (pad < space) : (pad += 1) out[pad] = 0;
+    return .{ .written = @min(space, cap), .fits = 1, .truncated = false };
+}
+
+/// Whether the ids in a sender-supplied SCM_CREDENTIALS are acceptable: a
+/// process may only claim its own pid/uid/gid unless it holds the matching
+/// capability (CAP_SYS_ADMIN for the pid, CAP_SETUID / CAP_SETGID for ids).
+pub fn credsAcceptable(claim_pid: i32, claim_uid: u32, claim_gid: u32, own_pid: i32, own_uid: u32, own_gid: u32, can_pid: bool, can_uid: bool, can_gid: bool) bool {
+    if (claim_pid != own_pid and !can_pid) return false;
+    if (claim_uid != own_uid and !can_uid) return false;
+    if (claim_gid != own_gid and !can_gid) return false;
+    return true;
 }
 
 pub const ReadPlan = struct {
@@ -135,7 +178,7 @@ test "parse rejects short, overlong and foreign messages" {
     std.mem.writeInt(i32, buf[8..12], 6, .little); // not SOL_SOCKET
     try std.testing.expect(parseRights(&buf).err == .invalid);
     std.mem.writeInt(i32, buf[8..12], SOL_SOCKET, .little);
-    std.mem.writeInt(i32, buf[12..16], 2, .little); // SCM_CREDENTIALS
+    std.mem.writeInt(i32, buf[12..16], 3, .little); // SCM_SECURITY: unsupported
     try std.testing.expect(parseRights(&buf).err == .invalid);
     std.mem.writeInt(i32, buf[12..16], SCM_RIGHTS, .little);
     std.mem.writeInt(u64, buf[0..8], 19, .little); // payload not a multiple of 4

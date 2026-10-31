@@ -8368,3 +8368,79 @@ test "a datagram send never calls a lock-taking helper from inside the lock" {
     try std.testing.expect(std.mem.indexOf(u8, body, "orelse return unixSendRights") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "orelse break :blk true") != null);
 }
+
+test "SCM_CREDENTIALS: message layout, parsing and claim validation" {
+    const sp = kt.scm_policy;
+    // Layout: CMSG_LEN 28, CMSG_SPACE 32, {pid, uid, gid} little endian.
+    var out: [64]u8 = @splat(0xAA);
+    const b = sp.buildCredentials(1234, 1000, 100, 64, &out);
+    try std.testing.expectEqual(@as(usize, 32), b.written);
+    try std.testing.expect(!b.truncated);
+    try std.testing.expectEqual(@as(u64, 28), std.mem.readInt(u64, out[0..8], .little));
+    try std.testing.expectEqual(@as(i32, 1), std.mem.readInt(i32, out[8..12], .little));
+    try std.testing.expectEqual(@as(i32, 2), std.mem.readInt(i32, out[12..16], .little));
+    try std.testing.expectEqual(@as(i32, 1234), std.mem.readInt(i32, out[16..20], .little));
+    try std.testing.expectEqual(@as(u32, 1000), std.mem.readInt(u32, out[20..24], .little));
+    try std.testing.expectEqual(@as(u32, 100), std.mem.readInt(u32, out[24..28], .little));
+    try std.testing.expectEqual(@as(u8, 0), out[31]); // padding is zeroed
+    // A buffer that cannot hold the whole message gets none of it.
+    const small = sp.buildCredentials(1, 2, 3, 20, &out);
+    try std.testing.expect(small.truncated);
+    try std.testing.expectEqual(@as(usize, 0), small.written);
+    // Exactly CMSG_LEN is enough (the trailing padding may be cut).
+    const exact = sp.buildCredentials(1, 2, 3, 28, &out);
+    try std.testing.expect(!exact.truncated);
+    try std.testing.expectEqual(@as(usize, 28), exact.written);
+
+    // Parsing a sender-supplied message.
+    var ctl: [32]u8 = @splat(0);
+    std.mem.writeInt(u64, ctl[0..8], 28, .little);
+    std.mem.writeInt(i32, ctl[8..12], 1, .little);
+    std.mem.writeInt(i32, ctl[12..16], 2, .little);
+    std.mem.writeInt(i32, ctl[16..20], 77, .little);
+    std.mem.writeInt(u32, ctl[20..24], 5, .little);
+    std.mem.writeInt(u32, ctl[24..28], 6, .little);
+    const p = sp.parseRights(&ctl).ok;
+    try std.testing.expect(p.has_cred);
+    try std.testing.expectEqual(@as(i32, 77), p.cred_pid);
+    try std.testing.expectEqual(@as(u32, 5), p.cred_uid);
+    try std.testing.expectEqual(@as(u32, 6), p.cred_gid);
+    try std.testing.expectEqual(@as(usize, 0), p.count);
+    // A credentials message of the wrong size is invalid.
+    std.mem.writeInt(u64, ctl[0..8], 24, .little);
+    try std.testing.expect(sp.parseRights(&ctl).err == .invalid);
+    // Too long is invalid as well (never read past the 12 bytes of ucred).
+    var long: [40]u8 = @splat(0);
+    std.mem.writeInt(u64, long[0..8], 32, .little);
+    std.mem.writeInt(i32, long[8..12], 1, .little);
+    std.mem.writeInt(i32, long[12..16], 2, .little);
+    try std.testing.expect(sp.parseRights(&long).err == .invalid);
+
+    // Claims: own ids are always fine; anything else needs the capability.
+    try std.testing.expect(sp.credsAcceptable(10, 1000, 100, 10, 1000, 100, false, false, false));
+    try std.testing.expect(!sp.credsAcceptable(11, 1000, 100, 10, 1000, 100, false, false, false));
+    try std.testing.expect(!sp.credsAcceptable(10, 0, 100, 10, 1000, 100, false, false, false));
+    try std.testing.expect(!sp.credsAcceptable(10, 1000, 0, 10, 1000, 100, false, false, false));
+    try std.testing.expect(sp.credsAcceptable(11, 1000, 100, 10, 1000, 100, true, false, false));
+    try std.testing.expect(sp.credsAcceptable(10, 0, 100, 10, 1000, 100, false, true, false));
+    try std.testing.expect(sp.credsAcceptable(10, 1000, 0, 10, 1000, 100, false, false, true));
+    // The capability for one id does not cover another.
+    try std.testing.expect(!sp.credsAcceptable(11, 0, 100, 10, 1000, 100, true, false, false));
+    // Neither does a different capability cover the pid.
+    try std.testing.expect(!sp.credsAcceptable(11, 1000, 100, 10, 1000, 100, false, true, true));
+    try std.testing.expect(!sp.credsAcceptable(10, 0, 100, 10, 1000, 100, true, false, true));
+    try std.testing.expect(!sp.credsAcceptable(10, 1000, 0, 10, 1000, 100, true, true, false));
+}
+
+test "SO_PASSCRED is a stored boolean and the receive path honours it" {
+    const spo = kt.sockopt_policy;
+    try std.testing.expectEqual(@as(u64, 16), spo.SO_PASSCRED);
+    try std.testing.expect(spo.flagBit(spo.SO_PASSCRED) != null);
+    try std.testing.expect(!spo.readOnly(spo.SO_PASSCRED));
+    // Its bit differs from every other boolean option.
+    for ([_]u64{ spo.SO_REUSEADDR, spo.SO_KEEPALIVE, spo.SO_BROADCAST, spo.SO_REUSEPORT, spo.SO_DEBUG }) |o| {
+        try std.testing.expect(spo.flagBit(o).? != spo.flagBit(spo.SO_PASSCRED).?);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "sp.buildCredentials(out.cred.pid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "rights.cred_override") != null);
+}

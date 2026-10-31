@@ -5715,3 +5715,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 新增 2 个测试（`validate` 的类型矩阵与调用传参、数据报发送不在锁内调用取锁函数）并更新了 1 个旧测试（它把“DGRAM 被拒绝”钉死了，这正是本次要改变的行为）；hello163（A 创建、B 消息边界与双向、C 短缓冲截断、D 空队列 EAGAIN、E 标志与其它类型仍被拒、F 阻塞读被唤醒与发送到已关闭对端）在 HEAD 上 A 段失败（后续各项无法进行），新内核 PASS。
 - 变异（逐个确认失败的是具名测试，不是编译错误）：策略只接受 STREAM、策略放行 SEQPACKET、把数据报分支改回锁内调用 `unixSendRights`、`socketpair` 系统调用把类型写死为 STREAM，各自被对应的 host 测试抓住。
 - 验证：host 826/826；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello163 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### AF_UNIX 的 SO_PASSCRED 与 SCM_CREDENTIALS（hello164）
+
+- 问题：已知限制里的“`SCM_CREDENTIALS` 未实现”。`SO_PASSCRED` 被拒绝，`recvmsg` 不带凭据，`sendmsg` 带凭据消息被当成非法。
+- 修复：见 `docs/kernel-subsystems.md` 的 hello164 条：`SO_PASSCRED` 布尔选项；`UnixSocket.sender_cred`；`scm_policy.buildCredentials/credsAcceptable` 与 `parseRights` 接受 `SCM_CREDENTIALS`；`recvmsg` 把凭据放在控制数据最前面；`sendmsg` 校验声明。
+- 已知差异：流套接字按“最近一个写入者”记录凭据；`SCM_SECURITY`、`SCM_PIDFD` 未实现。
+- 排查过程（如实）：第一次运行 B/D 段的 uid/gid 比较失败，但内核没错：探测里我用的 `getuid`/`getgid` 系统调用号写成了 102/104，本内核是 201/202。改号后全部通过。另一处是 `recvmsg` 的描述符安装循环原来按整个控制缓冲区算容量，凭据占用之后会算多，改成先扣除已写入部分。
+- TDD：host 新增 2 个测试（凭据消息布局、截断、解析、声明校验与能力隔离；`SO_PASSCRED` 位与接线）；hello164（A 未设置时不带控制数据、B 设置后附带 12 字节凭据且值正确、C 控制缓冲区太小得 `MSG_CTRUNC`、D 显式凭据与伪造 pid、E 数据报逐条携带）在 HEAD 上 8 项 FAIL，新内核 PASS。
+- 变异：凭据的 gid 字段写错、uid 声明被别的能力放行、pid 声明被 uid 能力放行、缓冲区下限放宽、`written` 不按 `cap` 截断、`SO_PASSCRED` 位与别的选项冲突，都被具名 host 测试抓住。**最初有两个变异没被抓住**：“pid 声明只要有 uid 能力就放行”和“接受长度超过 12 字节的凭据载荷”，说明测试缺少“别的能力不能顶替 pid 能力”和“超长载荷无效”两类用例，已补；补后前者被具名测试抓住，后者让测试以 `ABRT` 崩溃（越界读）被抓住——崩溃也算抓住，但不是具名断言失败。我最初的变异脚本只认 “failed” 字样，把崩溃和编译错误都误报成“未抓住”，另有一次变异因多余参数编译失败不算证据，已逐个重做并核对输出。
+- 验证：host 828/828；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello164 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

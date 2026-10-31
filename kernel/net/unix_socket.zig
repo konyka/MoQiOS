@@ -85,6 +85,9 @@ pub const UnixSocket = struct {
     // they wait here and move to the accepted socket's ring at accept().
     pending: [UNIX_PENDING_MAX]u8 = @splat(0),
     pending_len: u16 = 0,
+    /// Credentials of whoever sent the bytes now in this socket's ring (the
+    /// latest sender); delivered by recvmsg when SO_PASSCRED is set.
+    sender_cred: @import("sockopt_policy.zig").Cred = .{},
     /// Set on connect/accept and kept after the peer closes, so a later send says
     /// EPIPE rather than ENOTCONN.
     was_connected: bool = false,
@@ -103,6 +106,20 @@ pub const UnixSocket = struct {
 
 var unix_sockets: [MAX_UNIX_SOCKETS]UnixSocket = @splat(.{});
 var unix_lock: IrqSpinlock = .{};
+
+/// The credentials of the task making the current send: its tgid and real ids.
+fn currentSenderCred() @import("sockopt_policy.zig").Cred {
+    const t = @import("../proc/sched.zig").currentTask() orelse return .{};
+    return .{ .pid = @intCast(if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid), .uid = t.uid, .gid = t.gid };
+}
+
+/// Credentials of the latest sender into socket `idx`.
+pub fn unixSenderCred(idx: u32) @import("sockopt_policy.zig").Cred {
+    if (idx >= MAX_UNIX_SOCKETS) return .{};
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+    return unix_sockets[idx].sender_cred;
+}
 
 /// Half-close view of stream socket `idx` and the peer it is paired with (unix_lock held).
 fn halfCloseLocked(idx: u32) np.HalfClose {
@@ -166,6 +183,9 @@ fn freeRightsSlotLocked() ?usize {
 
 /// Descriptors handed to sendmsg (already referenced by the caller).
 pub const RightsIn = struct {
+    /// Credentials to record for this send instead of the caller's own
+    /// (already validated by the sendmsg path); null = the calling task.
+    cred_override: ?@import("sockopt_policy.zig").Cred = null,
     count: usize = 0,
     descs: [MAX_RIGHTS_FDS]vfs.FileDescriptor = undefined,
 };
@@ -175,6 +195,8 @@ pub const RightsOut = struct {
     /// True when a set was attached to the bytes just read but could not be
     /// handed over (no control buffer): the caller reports MSG_CTRUNC.
     dropped: bool = false,
+    /// Credentials of the sender of the bytes just read.
+    cred: @import("sockopt_policy.zig").Cred = .{},
     count: usize = 0,
     descs: [MAX_RIGHTS_FDS]vfs.FileDescriptor = undefined,
 };
@@ -655,6 +677,7 @@ pub fn unixSendRights(idx: u32, data: [*]const u8, len: usize, rights: ?*RightsI
             @memcpy(rights_pool[slot].descs[0..r.count], r.descs[0..r.count]);
             r.count = 0;
         }
+        if (n > 0) peer.sender_cred = if (rights) |r| (r.cred_override orelse currentSenderCred()) else currentSenderCred();
         ringWrite(&peer.buffer, peer.buf_write, data, n);
         peer.buf_write = (peer.buf_write + @as(u32, @intCast(n))) % UNIX_SOCK_BUF_SIZE;
         peer.buf_count += @as(u32, @intCast(n));
@@ -698,6 +721,7 @@ pub fn unixSendRights(idx: u32, data: [*]const u8, len: usize, rights: ?*RightsI
         peer.buf_write = (peer.buf_write + 1) % UNIX_SOCK_BUF_SIZE;
         peer.buf_count += 2;
 
+        peer.sender_cred = if (rights) |r| (r.cred_override orelse currentSenderCred()) else currentSenderCred();
         // Write data
         ringWrite(&peer.buffer, peer.buf_write, data, len);
         peer.buf_write = (peer.buf_write + @as(u32, @intCast(len))) % UNIX_SOCK_BUF_SIZE;
@@ -765,6 +789,7 @@ pub fn unixRecvRights(idx: u32, buf: [*]u8, len_in: usize, out: ?*RightsOut) i64
     }
 
     const wants = out != null;
+    if (out) |o| o.cred = sock.sender_cred;
     const queued = queuedRightsLocked(idx, sock.rx_pos);
     var len = len_in;
     var deliver_slot: ?usize = null;

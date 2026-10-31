@@ -842,6 +842,12 @@ fn unixSendmsg(cur: *task_mod.Task, fd: u32, msghdr: *const [56]u8) i64 {
             .ok => |p| p,
             .err => |e| return if (e == .too_many) @as(i64, -22) else @as(i64, -22),
         };
+        if (parsed.has_cred) {
+            const own_pid: i32 = @intCast(if (cur.is_thread and cur.parent_tid != 0) cur.parent_tid else cur.tid);
+            const caps = cur.effective_caps;
+            if (!sp.credsAcceptable(parsed.cred_pid, parsed.cred_uid, parsed.cred_gid, own_pid, cur.uid, cur.gid, caps.cap_sys_admin, caps.cap_setuid, caps.cap_setgid)) return -1; // EPERM
+            rights.cred_override = .{ .pid = parsed.cred_pid, .uid = parsed.cred_uid, .gid = parsed.cred_gid };
+        }
         for (parsed.fds[0..parsed.count]) |raw| {
             if (raw < 0 or @as(u32, @intCast(raw)) >= vfs_mod.MAX_FDS) {
                 releaseRights(&rights);
@@ -926,18 +932,31 @@ fn unixRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8
         done += sz;
     }
 
-    // Install the descriptors and build the control message.
+    // SO_PASSCRED: the sender's credentials come first in the control data.
     var out_flags: u32 = 0;
     var written: usize = 0;
+    var ctl_buf: [256]u8 = undefined;
+    const pass_cred = (net_mod.unix_socket.unixOptView(idx) orelse return -9).opts.flags & 32 != 0;
+    if (pass_cred) {
+        const cb = sp.buildCredentials(out.cred.pid, out.cred.uid, out.cred.gid, if (want_ctl) @intCast(@min(ctl_len, 256)) else 0, &ctl_buf);
+        if (cb.truncated) {
+            out_flags |= sp.MSG_CTRUNC;
+        } else {
+            written = cb.written;
+        }
+    }
+
+    // Install the descriptors and build the control message.
+    var newfds: [sp.MAX_FDS]i32 = undefined;
+    var installed: usize = 0;
     if (out.count > 0 and !want_ctl) {
         for (out.descs[0..out.count]) |*d| vfs_mod.releaseDescriptor(d);
         out_flags |= sp.MSG_CTRUNC;
     } else if (out.count > 0) {
         const cloexec = (flags & sp.MSG_CMSG_CLOEXEC) != 0;
-        var newfds: [sp.MAX_FDS]i32 = undefined;
-        var installed: usize = 0;
+        const room_for_fds = @as(usize, @intCast(@min((ctl_len -| written) -| sp.HDR, 4 * sp.MAX_FDS))) / 4;
         for (out.descs[0..out.count]) |d| {
-            if (installed >= @as(usize, @intCast(@min(ctl_len -| sp.HDR, 4 * sp.MAX_FDS))) / 4) {
+            if (installed >= room_for_fds) {
                 vfs_mod.releaseDescriptor(&d);
                 out_flags |= sp.MSG_CTRUNC;
                 continue;
@@ -951,13 +970,17 @@ fn unixRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8
             }
         }
         if (installed > 0) {
-            var ctl: [256]u8 = undefined;
-            const b = sp.buildRights(newfds[0..installed], @intCast(@min(ctl_len, 256)), &ctl);
-            written = b.written;
-            if (written > 0 and copy.copyToUser(@ptrFromInt(ctl_ptr), ctl[0..written], written) != written) {
-                for (newfds[0..installed]) |nf| _ = cur.fd_table.close(@intCast(nf));
-                return -14;
-            }
+            const base = written;
+            const bl = sp.buildRights(newfds[0..installed], @intCast(@min(ctl_len, 256) -| base), ctl_buf[base..]);
+            written = base + bl.written;
+            if (bl.truncated) out_flags |= sp.MSG_CTRUNC;
+        }
+    }
+    if (written > 0) {
+        if (copy.copyToUser(@ptrFromInt(ctl_ptr), ctl_buf[0..written], written) != written) {
+            // Descriptors installed for the control message must not leak.
+            for (newfds[0..installed]) |nf| _ = cur.fd_table.close(@intCast(nf));
+            return -14;
         }
     }
     // msg_controllen and msg_flags
