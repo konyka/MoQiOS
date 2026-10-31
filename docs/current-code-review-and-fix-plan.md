@@ -5695,4 +5695,4 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异：去掉“仅回环”、去掉“端口未绑定”、匹配时忽略对端端口、不检查被引用协议为 UDP、固定 IHL 为 20，五个变异都被 host 测试抓住（全部是测试失败）。
 - 验证：host 821/821；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello161 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
 
-- 后续补充（同一提交序列）：UDP `send` 现在也会因待决的 `ECONNREFUSED` 失败一次（hello161 A2 段，旧内核 1 项 FAIL）。变异：去掉 `sendto` 里读取待决错误 → host 测试 `udp: the pending error is consulted…` 失败；恢复后通过。验证：host 821/821；构建三架构通过；冒烟 SMP=1、SMP=8、GPT SMP=2 均 hello161 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+- 后续补充（同一提交序列）：UDP `send` 现在也会因待决的 `ECONNREFUSED` 失败一次（hello161 A2 段，旧内核 1 项 FAIL）。变异：把 `sendto` 里读取待决错误改成恒为 0 → host 测试 `udp: the pending error is consulted…` 失败（第一次变异因多余的 `_ = src_port` 编译失败，不算证据，用能编译的变异重做后确认）；恢复后通过。验证：host 821/821；构建三架构通过；冒烟 SMP=1、SMP=8、GPT SMP=2 均 hello161 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
