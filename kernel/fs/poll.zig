@@ -26,12 +26,7 @@ const WAKE_SLICE_MS: u64 = 5;
 /// Current readiness of an open descriptor in POLL* bits.
 pub fn descEvents(desc: *const vfs_mod.FileDescriptor) u32 {
     if (desc.fd_type == .tcp_socket) {
-        var ev: u32 = 0;
-        const closing = tcp_mod.tcpIsClosing(desc.tcb_idx);
-        if (tcp_mod.tcpRecvAvailable(desc.tcb_idx) > 0 or closing) ev |= pp.POLLIN;
-        if (closing) ev |= pp.POLLHUP;
-        if (tcp_mod.isEstablished(desc.tcb_idx) and tcp_mod.tcpSendSpace(desc.tcb_idx) > 0) ev |= pp.POLLOUT;
-        return ev;
+        return tcp_mod.tcpReadiness(desc.tcb_idx);
     }
     return epoll_mod.descriptorEvents(desc);
 }

@@ -748,18 +748,7 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32, kmsg_cursor: u64
     var revents: u32 = 0;
     switch (fd_type) {
         .tcp_socket => {
-            const tcb_idx = resource_idx;
-            if (tcp.tcpIsClosing(tcb_idx)) {
-                revents |= EPOLLHUP;
-                if (tcp.tcpRecvAvailable(tcb_idx) > 0) revents |= EPOLLIN;
-                revents |= EPOLLERR;
-                return revents;
-            }
-            if (tcp.tcpRecvAvailable(tcb_idx) > 0) revents |= EPOLLIN;
-            if (tcp.isEstablished(tcb_idx) and tcp.tcpSendSpace(tcb_idx) > 0) {
-                revents |= EPOLLOUT;
-            }
-            revents |= EPOLLERR;
+            revents = tcp.tcpReadiness(resource_idx);
         },
         .pipe_read => {
             const state = vfs.pipeState(resource_idx) orelse return EPOLLERR;

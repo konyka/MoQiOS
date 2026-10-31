@@ -5646,3 +5646,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 新增 1 个测试；hello156（A：已排队数据与之后到达的数据都读到 EOF、本端仍可发送且对端收到；B：对端写仍成功，本端读 EOF）在 HEAD 上 3 项 FAIL，新内核 PASS。
 - 变异：`processIncomingData` 里的 `shut_rd` 分支永不进入 → host 测试失败（有效证据）；把 `shutRdEof` 改成恒假的变异使测试步骤编译失败（多出的辅助函数），不算有效证据，该判定由 hello156 的运行时断言覆盖。
 - 验证：host 811/811；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello156 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### TCP 套接字的 poll/epoll 就绪状态（hello157）
+
+- 问题：`epoll.computeCurrentEvents` 对所有 TCP 套接字无条件 `EPOLLERR`；`CLOSE_WAIT` 不可写（对端半关闭后本端要回复，轮询者永远等不到可写）；本端 `SHUT_RD` 之后不报可读；poll 与 epoll 的 TCP 判断各写一份且不一致（poll 把 `CLOSE_WAIT` 报 `POLLHUP`，epoll 还加 `EPOLLERR`）。这是 hello156 记录的已知差异。
+- 修复：新增纯函数 `tcp_ready_policy.events(Snapshot)`（规则见 `docs/kernel-subsystems.md` 的 hello157 条），`tcp.tcpReadiness` 取快照，`poll.descEvents` 与 `epoll.computeCurrentEvents` 共用。
+- 已知差异：`EPOLLRDHUP` 不单独上报；`EPOLLPRI`（带外数据）没有实现。
+- 排查过程（如实）：探测第一版读不到数据时在阻塞的 `read` 里挂住，看不出是 poll 报错还是数据没到；改成非阻塞套接字加有界等待的轮询，才得到清楚的失败列表。
+- TDD：host 新增 2 个测试（`events` 覆盖空闲/有数据/发送环满/CLOSE_WAIT/SHUT_RD/双向结束/FIN_WAIT_2/已关闭/已回收/RST/握手中/监听，以及 poll 与 epoll 都调用 `tcpReadiness`）；hello157（空闲连接 poll 只报 POLLOUT 且 epoll 无 EPOLLERR、数据可读、对端 FIN 后可读可写无错误、本端 SHUT_RD 后 poll/epoll 都报可读）在 HEAD 上 4 项 FAIL，新内核 PASS。
+- 变异：`ERR` 恒为真、可读判断去掉 `shut_rd`、`close_wait` 不算对端已 FIN、`HUP` 只看 `read_done`，四个变异都被 host 测试抓住（全部是测试失败，不是编译错误）。
+- 验证：host 813/813；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello157 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

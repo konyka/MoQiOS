@@ -283,6 +283,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello154"); /* TCP write errors and half-close */
     run_test("hello155"); /* SIGPIPE on sockets */
     run_test("hello156"); /* TCP shutdown(SHUT_RD) */
+    run_test("hello157"); /* TCP poll/epoll readiness */
 
     start_persistent_services();
 

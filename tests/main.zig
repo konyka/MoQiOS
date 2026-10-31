@@ -8081,3 +8081,62 @@ test "tcp: shutdown(SHUT_RD) makes reads EOF and is wired into the data path" {
     try std.testing.expect(std.mem.indexOf(u8, src, "if (tcb.shut_rd) {\n        tcb.rcv_nxt +%= len;") != null);
     try std.testing.expect(std.mem.count(u8, src, "tcb.shut_rd = true;") >= 2);
 }
+
+test "tcp readiness: idle, data, peer EOF, our SHUT_RD, reset, closed" {
+    const rd = kt.tcp_ready_policy;
+    const S = kt.tcp_recv_policy.TcpState;
+    const idle: rd.Snapshot = .{ .active = true, .state = S.established, .recv_bytes = 0, .send_space = 100, .reset_by_peer = false, .shut_rd = false, .fin_pending = false };
+    // An idle connection is writable only: no error, no hang-up.
+    try std.testing.expectEqual(@as(u32, rd.OUT), rd.events(idle));
+    // Queued data is readable.
+    var data = idle;
+    data.recv_bytes = 5;
+    try std.testing.expectEqual(@as(u32, rd.IN | rd.OUT), rd.events(data));
+    // A full send ring is not writable.
+    var full = idle;
+    full.send_space = 0;
+    try std.testing.expectEqual(@as(u32, 0), rd.events(full));
+    // Peer sent FIN (CLOSE_WAIT): readable (EOF) and still writable, no hang-up yet.
+    var cw = idle;
+    cw.state = S.close_wait;
+    try std.testing.expectEqual(@as(u32, rd.IN | rd.OUT), rd.events(cw));
+    // Our SHUT_RD: a read returns EOF at once.
+    var sr = idle;
+    sr.shut_rd = true;
+    try std.testing.expectEqual(@as(u32, rd.IN | rd.OUT), rd.events(sr));
+    // Both sides finished: hang-up.
+    var both = idle;
+    both.state = S.last_ack;
+    try std.testing.expect(rd.events(both) & rd.HUP != 0);
+    var fw2 = idle;
+    fw2.state = S.fin_wait_2;
+    try std.testing.expect(rd.events(fw2) & rd.HUP == 0); // our side closed, peer may still send
+    // Closed connection and a reaped slot.
+    var closed = idle;
+    closed.state = S.closed;
+    try std.testing.expect(rd.events(closed) & rd.HUP != 0);
+    try std.testing.expect(rd.events(closed) & rd.IN != 0);
+    var gone = idle;
+    gone.active = false;
+    try std.testing.expect(rd.events(gone) & rd.HUP != 0);
+    // RST is the only thing that reports ERR.
+    var rst = idle;
+    rst.reset_by_peer = true;
+    rst.state = S.closed;
+    try std.testing.expect(rd.events(rst) & rd.ERR != 0);
+    try std.testing.expect(rd.events(idle) & rd.ERR == 0);
+    // Handshake in progress / listener.
+    var syn = idle;
+    syn.state = S.syn_sent;
+    try std.testing.expectEqual(@as(u32, 0), rd.events(syn));
+    var lst = idle;
+    lst.state = S.listen;
+    try std.testing.expectEqual(@as(u32, 0), rd.events(lst));
+    lst.recv_bytes = 1;
+    try std.testing.expectEqual(@as(u32, rd.IN), rd.events(lst));
+}
+
+test "poll and epoll share the TCP readiness function" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.poll_source, "tcp_mod.tcpReadiness(desc.tcb_idx)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.epoll_source, "tcp.tcpReadiness(resource_idx)") != null);
+}

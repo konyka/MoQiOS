@@ -4021,6 +4021,22 @@ pub fn tcpSendSpace(tcb_idx: u32) u32 {
     return ringAvailable(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
 }
 
+/// poll/epoll readiness of a TCP socket (lock-free snapshot, like the other status queries).
+pub fn tcpReadiness(tcb_idx: u32) u32 {
+    const ready = @import("tcp_ready_policy.zig");
+    if (tcb_idx >= MAX_CONNECTIONS) return ready.events(.{ .active = false, .state = .closed, .recv_bytes = 0, .send_space = 0, .reset_by_peer = false, .shut_rd = false, .fin_pending = false });
+    const tcb = &tcbs[tcb_idx];
+    return ready.events(.{
+        .active = tcb.active,
+        .state = tcb.state,
+        .recv_bytes = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE),
+        .send_space = ringAvailable(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE),
+        .reset_by_peer = tcb.reset_by_peer,
+        .shut_rd = tcb.shut_rd,
+        .fin_pending = tcb.fin_pending,
+    });
+}
+
 /// Check if the TCP connection is in a closing state.
 pub fn tcpIsClosing(tcb_idx: u32) bool {
     // v53.46: Lock-free read — status query.
