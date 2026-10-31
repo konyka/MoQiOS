@@ -5705,3 +5705,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 新增 2 个测试（剩余时间算术、单位拆分、输入解析与饱和；三个入口都接线）；hello162（`ppoll` 超时后剩余≈0、提前就绪后剩余≈900 ms、`pselect6` 与 `select` 超时后≈0、无效描述符时剩余不超过原值）在 HEAD 上 4 项 FAIL，新内核 PASS。
 - 变异：剩余时间改成相加、改成回绕减法、`timeval` 不换算微秒、超时输入的上界判断改成 `>`、`EINTR` 不写回，其中前四个被 host 测试抓住；**第五个（`EINTR` 不写回）最初没有被任何测试抓住**（我的脚本把测试输出里无关的 “failed” 字样当成了失败，实际跑 `zig build test` 仍然 823/823 通过），说明写回条件缺测试。已把条件抽成纯函数 `poll_policy.writesBackTimeout` 并加了对应 host 测试，之后“只在 rc>=0 时写回”的变异被该测试抓住。
 - 验证：host 824/824；x86_64/riscv64/aarch64 构建通过（重构后重新验证）；冒烟 SMP=1 与 GPT SMP=2 hello162 PASS、0 FAIL；SMP=8 第一次停在 hello144 D 段（已知的间歇性停顿，0 个 FAIL），重跑 PASS、0 FAIL；stress（SMP=2）5/5 PASS；重构后 SMP=2 冒烟再次 PASS。
+
+### socketpair(AF_UNIX, SOCK_DGRAM)（hello163）
+
+- 问题：已知限制里的“`socketpair` 只支持 STREAM”。数据报 `socketpair` 返回 `EINVAL`。
+- 修复：`socketpair_policy.validate` 接受 DGRAM；`unixSocketPair(sock_type)` 创建互为对端的数据报套接字；`socketpair` 系统调用传入类型。
+- 排查过程（如实）：接上之后读写都正常，唯独 F 段“向已关闭对端发送”永远不返回，hello163 在这一步卡死。原因是预先就存在的缺陷：`unixSendBlocking` 的数据报分支在 `unix_lock` 持有期间，对没有对端的情形直接 `return unixSendRights(...)`，而它自己也要取 `unix_lock`（单核上自旋死锁）。以前没人触发是因为数据报套接字总要先 `connect`，对端关闭后再发送的路径没有测试。已改成锁内只做判断、锁外再发送。
+- 已知差异：`SOCK_SEQPACKET`（socketpair）未实现。
+- TDD：host 新增 2 个测试（`validate` 的类型矩阵与调用传参、数据报发送不在锁内调用取锁函数）并更新了 1 个旧测试（它把“DGRAM 被拒绝”钉死了，这正是本次要改变的行为）；hello163（A 创建、B 消息边界与双向、C 短缓冲截断、D 空队列 EAGAIN、E 标志与其它类型仍被拒、F 阻塞读被唤醒与发送到已关闭对端）在 HEAD 上 A 段失败（后续各项无法进行），新内核 PASS。
+- 变异（逐个确认失败的是具名测试，不是编译错误）：策略只接受 STREAM、策略放行 SEQPACKET、把数据报分支改回锁内调用 `unixSendRights`、`socketpair` 系统调用把类型写死为 STREAM，各自被对应的 host 测试抓住。
+- 验证：host 826/826；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello163 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

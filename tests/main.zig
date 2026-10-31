@@ -1807,7 +1807,8 @@ test "socketpair policy rejects unsupported combinations before allocation" {
     try std.testing.expectEqual(@as(i64, 0), socketpair_policy.validate(1, 1 | socketpair_policy.TYPE_FLAGS, 0));
     try std.testing.expectEqual(kt.errno.EINVAL, socketpair_policy.validate(2, 1, 0));
     try std.testing.expectEqual(kt.errno.EINVAL, socketpair_policy.validate(1, 1, 6));
-    try std.testing.expectEqual(kt.errno.EINVAL, socketpair_policy.validate(1, 2, 0));
+    try std.testing.expectEqual(@as(i64, 0), socketpair_policy.validate(1, 2, 0)); // SOCK_DGRAM is supported since hello163
+    try std.testing.expectEqual(kt.errno.EINVAL, socketpair_policy.validate(1, 5, 0)); // SOCK_SEQPACKET is not
     try std.testing.expectEqual(kt.errno.EINVAL, socketpair_policy.validate(1, 1 | 0x400, 0));
 }
 
@@ -8345,4 +8346,25 @@ test "ppoll, pselect6 and select write the remaining timeout back" {
     try std.testing.expect(std.mem.indexOf(u8, kt.select_source, "poll_mod.beginTimeout(timeout_ptr, 1000)") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.select_source, "poll_mod.beginTimeout(timeout_ptr, 1)") != null);
     try std.testing.expect(std.mem.count(u8, kt.select_source, "finishTimeout(back, rc)") >= 2);
+}
+
+test "socketpair accepts stream and datagram, nothing else" {
+    const sp = kt.socketpair_policy;
+    try std.testing.expectEqual(@as(i64, 0), sp.validate(1, 1, 0));
+    try std.testing.expectEqual(@as(i64, 0), sp.validate(1, 2, 0));
+    try std.testing.expectEqual(@as(i64, 0), sp.validate(1, 2 | sp.SOCK_NONBLOCK | sp.SOCK_CLOEXEC, 0));
+    try std.testing.expectEqual(@as(i64, -22), sp.validate(1, 3, 0));
+    try std.testing.expectEqual(@as(i64, -22), sp.validate(1, 5, 0));
+    try std.testing.expectEqual(@as(i64, -22), sp.validate(2, 2, 0));
+    try std.testing.expectEqual(@as(i64, -22), sp.validate(1, 2, 7));
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "unixSocketPair(sock_type & 0xff)") != null);
+}
+
+test "a datagram send never calls a lock-taking helper from inside the lock" {
+    const src = kt.unix_socket_source;
+    const at = std.mem.indexOf(u8, src, "// One datagram: it fits the ring or it never will.").?;
+    const body = src[at .. at + 900];
+    // The fits check must not return through unixSendRights while unix_lock is held.
+    try std.testing.expect(std.mem.indexOf(u8, body, "orelse return unixSendRights") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "orelse break :blk true") != null);
 }

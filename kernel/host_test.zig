@@ -131,6 +131,7 @@ pub const epoll_policy = @import("net/epoll_policy.zig");
 pub const epoll_lifecycle_policy = @import("net/epoll_lifecycle_policy.zig");
 pub const epoll_source = @embedFile("net/epoll.zig");
 pub const poll_source = @embedFile("fs/poll.zig");
+pub const unix_socket_source = @embedFile("net/unix_socket.zig");
 pub const select_source = @embedFile("fs/select.zig");
 pub const hhdm = @import("mm/hhdm.zig");
 pub const user_stack = @import("proc/user_stack.zig");

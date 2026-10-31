@@ -312,7 +312,8 @@ pub const UnixSocketPair = struct {
 };
 
 /// Allocate and connect both endpoints while holding the pool lock.
-pub fn unixSocketPair() i32 {
+pub fn unixSocketPair(sock_type: u32) i32 {
+    if (sock_type != SOCK_STREAM and sock_type != SOCK_DGRAM) return -22;
     const saved = unix_lock.acquire();
     defer unix_lock.release(saved);
 
@@ -332,14 +333,14 @@ pub fn unixSocketPair() i32 {
     const second_idx = second orelse return -24;
     unix_sockets[first_idx] = .{
         .active = true,
-        .sock_type = SOCK_STREAM,
+        .sock_type = sock_type,
         .connected = true,
         .was_connected = true,
         .peer_idx = @intCast(second_idx),
     };
     unix_sockets[second_idx] = .{
         .active = true,
-        .sock_type = SOCK_STREAM,
+        .sock_type = sock_type,
         .connected = true,
         .was_connected = true,
         .peer_idx = @intCast(first_idx),
@@ -1130,10 +1131,13 @@ pub fn unixSendBlocking(idx: u32, data: [*]const u8, len: usize, nonblock: bool)
             }
         } else {
             // One datagram: it fits the ring or it never will.
+            // sendRoomLocked answers null when there is no peer: let the real
+            // send report the error. Never call it with unix_lock held — it
+            // takes the lock itself.
             const fits = blk: {
                 const saved = unix_lock.acquire();
                 defer unix_lock.release(saved);
-                const room = sendRoomLocked(idx) orelse return unixSendRights(idx, data, len, null);
+                const room = sendRoomLocked(idx) orelse break :blk true;
                 break :blk np.dgramFits(len, UNIX_SOCK_BUF_SIZE) and room >= len + np.DGRAM_PREFIX;
             };
             if (fits) return unixSendRights(idx, data, len, null);

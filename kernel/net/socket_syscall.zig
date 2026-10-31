@@ -1217,7 +1217,7 @@ pub fn socketpair(domain: u32, sock_type: u32, protocol: u32, sv_ptr: u64) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    const pair_result = net_mod.unix_socket.unixSocketPair();
+    const pair_result = net_mod.unix_socket.unixSocketPair(sock_type & 0xff);
     if (pair_result < 0) return if (pair_result == -24) -24 else -12;
     const first_idx: u32 = @intCast(pair_result & 0xff);
     const second_idx: u32 = @intCast((@as(u32, @intCast(pair_result)) >> 8) & 0xff);

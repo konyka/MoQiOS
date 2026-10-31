@@ -289,6 +289,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello160"); /* TCP connect to a closed port */
     run_test("hello161"); /* UDP port unreachable on loopback */
     run_test("hello162"); /* remaining timeout written back by ppoll/pselect6/select */
+    run_test("hello163"); /* socketpair(AF_UNIX, SOCK_DGRAM) */
 
     start_persistent_services();
 
