@@ -8306,3 +8306,43 @@ test "udp: the pending error is consulted by recv, SO_ERROR and readiness" {
     try std.testing.expect(std.mem.count(u8, kt.socket_syscall_source, "udp.setPeerPort(") >= 2);
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "pending_send_err = udp.takePendingError(src_port)") != null);
 }
+
+test "poll timeout write-back: remaining time arithmetic and unit split" {
+    const pp = kt.poll_policy;
+    // remaining = original - elapsed, never below zero.
+    try std.testing.expectEqual(@as(u64, 850_000_000), pp.remainingNs(1_000_000_000, 150_000_000));
+    try std.testing.expectEqual(@as(u64, 0), pp.remainingNs(100, 100));
+    try std.testing.expectEqual(@as(u64, 0), pp.remainingNs(100, 5_000_000_000));
+    // timespec (ns) and timeval (us) fractions.
+    const ts = pp.splitNs(2_500_000_123, 1);
+    try std.testing.expectEqual(@as(i64, 2), ts.sec);
+    try std.testing.expectEqual(@as(i64, 500_000_123), ts.frac);
+    const tv = pp.splitNs(2_500_000_123, 1000);
+    try std.testing.expectEqual(@as(i64, 2), tv.sec);
+    try std.testing.expectEqual(@as(i64, 500_000), tv.frac);
+    // Parsing the caller's value back into nanoseconds.
+    try std.testing.expectEqual(@as(?u64, 1_500_000_000), pp.timeoutNs(1, 500_000_000, 1));
+    try std.testing.expectEqual(@as(?u64, 1_000_500_000), pp.timeoutNs(1, 500, 1000));
+    try std.testing.expectEqual(@as(?u64, null), pp.timeoutNs(-1, 0, 1));
+    try std.testing.expectEqual(@as(?u64, null), pp.timeoutNs(0, 1_000_000_000, 1));
+    try std.testing.expectEqual(@as(?u64, null), pp.timeoutNs(0, 1_000_000, 1000));
+    // Overflow saturates instead of wrapping.
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), pp.timeoutNs(std.math.maxInt(i64), 0, 1));
+}
+
+test "timeout write-back happens on success and EINTR, not on argument errors" {
+    const pp = kt.poll_policy;
+    try std.testing.expect(pp.writesBackTimeout(0));
+    try std.testing.expect(pp.writesBackTimeout(3));
+    try std.testing.expect(pp.writesBackTimeout(-4)); // EINTR
+    try std.testing.expect(!pp.writesBackTimeout(-14)); // EFAULT
+    try std.testing.expect(!pp.writesBackTimeout(-22)); // EINVAL
+    try std.testing.expect(!pp.writesBackTimeout(-9)); // EBADF
+}
+
+test "ppoll, pselect6 and select write the remaining timeout back" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.poll_source, "finishTimeout(back, rc)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.select_source, "poll_mod.beginTimeout(timeout_ptr, 1000)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.select_source, "poll_mod.beginTimeout(timeout_ptr, 1)") != null);
+    try std.testing.expect(std.mem.count(u8, kt.select_source, "finishTimeout(back, rc)") >= 2);
+}

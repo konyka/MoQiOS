@@ -64,6 +64,43 @@ pub fn readTimespecWait(ptr: u64) union(enum) { ok: pp.Wait, err: i64 } {
     return .{ .ok = pp.timespecWait(sec, nsec) orelse return .{ .err = -22 } };
 }
 
+/// A timeout argument the caller expects to be updated with the time left.
+pub const TimeoutBack = struct {
+    ptr: u64 = 0,
+    orig_ns: u64 = 0,
+    start_ns: u64 = 0,
+    unit_ns: u64 = 1,
+};
+
+/// Record the timeout at `ptr` (a timespec for unit_ns == 1, a timeval for
+/// 1000) so `finishTimeout` can write the remainder back. A null pointer or
+/// an unreadable/invalid value records nothing.
+pub fn beginTimeout(ptr: u64, unit_ns: u64) TimeoutBack {
+    if (ptr == 0) return .{};
+    const bo = @import("../lib/byte_order.zig");
+    var raw: [16]u8 = undefined;
+    if (!copy.validateUserBuffer(ptr, 16) or copy.copyFromUser(&raw, @ptrFromInt(ptr), 16) != 16) return .{};
+    const sec: i64 = @bitCast(bo.readU64Le(raw[0..8]));
+    const frac: i64 = @bitCast(bo.readU64Le(raw[8..16]));
+    const ns = pp.timeoutNs(sec, frac, unit_ns) orelse return .{};
+    return .{ .ptr = ptr, .orig_ns = ns, .start_ns = @import("../arch/x86_64/tsc.zig").nanos(), .unit_ns = unit_ns };
+}
+
+/// Write the time left back to the caller's timeout, as Linux does when the
+/// wait finished normally or was interrupted. Errors that never waited
+/// (EFAULT, EINVAL, EBADF) leave it untouched.
+pub fn finishTimeout(tb: TimeoutBack, rc: i64) void {
+    if (tb.ptr == 0) return;
+    if (!pp.writesBackTimeout(rc)) return;
+    const bo = @import("../lib/byte_order.zig");
+    const elapsed = @import("../arch/x86_64/tsc.zig").nanos() -| tb.start_ns;
+    const left = pp.splitNs(pp.remainingNs(tb.orig_ns, elapsed), tb.unit_ns);
+    var raw: [16]u8 = undefined;
+    bo.writeU64Le(raw[0..8], @bitCast(left.sec));
+    bo.writeU64Le(raw[8..16], @bitCast(left.frac));
+    _ = copy.copyToUser(@ptrFromInt(tb.ptr), &raw, 16);
+}
+
 /// ppoll(fds, nfds, tmo_p, sigmask, sigsetsize): poll with a timespec
 /// timeout and a temporary signal mask installed for the wait.
 pub fn ppoll(fds_ptr: u64, nfds: u64, tmo_ptr: u64, sigmask_ptr: u64, sigsetsize: u64) i64 {
@@ -76,9 +113,11 @@ pub fn ppoll(fds_ptr: u64, nfds: u64, tmo_ptr: u64, sigmask_ptr: u64, sigsetsize
         .ok => |w| w,
         .err => |e| return e,
     };
+    const back = beginTimeout(tmo_ptr, 1);
     const saved = beginTempMask(m);
     const rc = pollWait(fds_ptr, nfds, wait);
     endTempMask(saved, rc);
+    finishTimeout(back, rc);
     return rc;
 }
 

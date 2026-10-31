@@ -24,7 +24,10 @@ pub fn select(nfds_raw: u64, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr:
         const usec: i64 = @bitCast(bo.readU64Le(tv[8..16]));
         wait = pp.selectTimeout(sec, usec) orelse return -22;
     }
-    return selectWait(nfds_raw, readfds_ptr, writefds_ptr, exceptfds_ptr, wait);
+    const back = poll_mod.beginTimeout(timeout_ptr, 1000);
+    const rc = selectWait(nfds_raw, readfds_ptr, writefds_ptr, exceptfds_ptr, wait);
+    poll_mod.finishTimeout(back, rc);
+    return rc;
 }
 
 /// pselect6(nfds, r, w, e, timespec, {sigmask, size}): select with a timespec
@@ -46,9 +49,11 @@ pub fn pselect6(nfds_raw: u64, readfds_ptr: u64, writefds_ptr: u64, exceptfds_pt
         .ok => |w| w,
         .err => |e| return e,
     };
+    const back = poll_mod.beginTimeout(timeout_ptr, 1);
     const saved = poll_mod.beginTempMask(mask);
     const rc = selectWait(nfds_raw, readfds_ptr, writefds_ptr, exceptfds_ptr, wait);
     poll_mod.endTempMask(saved, rc);
+    poll_mod.finishTimeout(back, rc);
     return rc;
 }
 

@@ -46,6 +46,40 @@ pub fn timespecWait(sec: i64, nsec: i64) ?Wait {
     return .{ .ms = whole +| (@as(u64, @intCast(nsec)) + 999_999) / 1_000_000 };
 }
 
+/// Time left of a wait that asked for `orig_ns` and has run for `elapsed_ns`
+/// (what ppoll/pselect6/select write back to their timeout argument).
+pub fn remainingNs(orig_ns: u64, elapsed_ns: u64) u64 {
+    return orig_ns -| elapsed_ns;
+}
+
+/// Whether a wait that returned `rc` updates the caller's timeout: after a
+/// normal return and after EINTR (the caller resumes with what is left); not
+/// after an argument error that never waited.
+pub fn writesBackTimeout(rc: i64) bool {
+    return rc >= 0 or rc == -4;
+}
+
+pub const SecFrac = struct { sec: i64, frac: i64 };
+
+/// Split nanoseconds into seconds and a fraction in units of `unit_ns`
+/// (1 for a timespec's nanoseconds, 1000 for a timeval's microseconds).
+pub fn splitNs(ns: u64, unit_ns: u64) SecFrac {
+    const sec = ns / 1_000_000_000;
+    return .{
+        .sec = @intCast(@min(sec, @as(u64, @intCast(std.math.maxInt(i64))))),
+        .frac = @intCast((ns % 1_000_000_000) / unit_ns),
+    };
+}
+
+/// A timeout argument as nanoseconds (null if the fields are invalid).
+pub fn timeoutNs(sec: i64, frac: i64, unit_ns: u64) ?u64 {
+    if (sec < 0 or frac < 0) return null;
+    const limit: i64 = @intCast(1_000_000_000 / unit_ns);
+    if (frac >= limit) return null;
+    const whole = std.math.mul(u64, @intCast(sec), 1_000_000_000) catch return std.math.maxInt(u64);
+    return whole +| @as(u64, @intCast(frac)) * unit_ns;
+}
+
 pub fn nfdsValid(nfds: u64, nofile_limit: u64) bool {
     return nfds <= nofile_limit;
 }

@@ -5437,7 +5437,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 问题：`ppoll`、`pselect6` 都未实现（ENOSYS）；现代 libc 的 `poll`/`select`/`pselect` 默认走这两个调用。
 - 修复：`poll`/`select` 拆成 `pollWait`/`selectWait` 核心，加上 `ppoll`/`pselect6` 入口（timespec 超时 + 临时信号掩码，`poll_policy.timespecWait`、`poll.readTempMask/beginTempMask/endTempMask`）；新增原生编号 #493/#494；返回前 `checkSignalsOnSyscallReturn`，使被临时掩码放行的信号在调用返回前运行 handler。
-- 已知差异：不更新用户的 timeout（Linux 的 `pselect6` 会写回剩余时间，ppoll 也会）；`exceptfds` 仍恒为空。
+- 已知差异：`exceptfds` 仍恒为空。（原先记录的“不更新用户的 timeout”已在 hello162 修复。）
 - 排查过程（如实）：探测 D 段的“已关闭 fd 为 EBADF”最初用了 fd 77，大于 fd 表大小（64），按 Linux 语义 `nfds` 被截断所以应当被忽略——这是探测写错，不是内核缺陷，改用表内的已关闭 fd 40。
 - TDD：host 新增 1 个测试（timespec 超时），hello140（26 项）在 HEAD 上 19 项 FAIL（ENOSYS），新内核 PASS。
 
@@ -5696,3 +5696,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 验证：host 821/821；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello161 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
 
 - 后续补充（同一提交序列）：UDP `send` 现在也会因待决的 `ECONNREFUSED` 失败一次（hello161 A2 段，旧内核 1 项 FAIL）。变异：把 `sendto` 里读取待决错误改成恒为 0 → host 测试 `udp: the pending error is consulted…` 失败（第一次变异因多余的 `_ = src_port` 编译失败，不算证据，用能编译的变异重做后确认）；恢复后通过。验证：host 821/821；构建三架构通过；冒烟 SMP=1、SMP=8、GPT SMP=2 均 hello161 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### ppoll / pselect6 / select 写回剩余超时（hello162）
+
+- 问题：hello140 记录的已知差异：三个调用都不更新调用者的超时参数。Linux 把没用完的时间写回，裸系统调用的使用者（包括 musl 的内部实现之外的一些事件循环）靠它在被信号打断或提前就绪后继续只等剩余时间。
+- 修复：`poll_policy.remainingNs/splitNs/timeoutNs`（纯函数，含单位与饱和）；`poll.beginTimeout/finishTimeout`；`ppoll`、`pselect6`（timespec）和 `select`（timeval）在等待前后调用。
+- 已知差异：`poll(2)` 的毫秒超时不涉及；`epoll_wait` 没有写回语义。
+- TDD：host 新增 2 个测试（剩余时间算术、单位拆分、输入解析与饱和；三个入口都接线）；hello162（`ppoll` 超时后剩余≈0、提前就绪后剩余≈900 ms、`pselect6` 与 `select` 超时后≈0、无效描述符时剩余不超过原值）在 HEAD 上 4 项 FAIL，新内核 PASS。
+- 变异：剩余时间改成相加、改成回绕减法、`timeval` 不换算微秒、超时输入的上界判断改成 `>`、`EINTR` 不写回，其中前四个被 host 测试抓住；**第五个（`EINTR` 不写回）最初没有被任何测试抓住**（我的脚本把测试输出里无关的 “failed” 字样当成了失败，实际跑 `zig build test` 仍然 823/823 通过），说明写回条件缺测试。已把条件抽成纯函数 `poll_policy.writesBackTimeout` 并加了对应 host 测试，之后“只在 rc>=0 时写回”的变异被该测试抓住。
+- 验证：host 824/824；x86_64/riscv64/aarch64 构建通过（重构后重新验证）；冒烟 SMP=1 与 GPT SMP=2 hello162 PASS、0 FAIL；SMP=8 第一次停在 hello144 D 段（已知的间歇性停顿，0 个 FAIL），重跑 PASS、0 FAIL；stress（SMP=2）5/5 PASS；重构后 SMP=2 冒烟再次 PASS。

@@ -288,6 +288,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello159"); /* AF_UNIX EPOLLRDHUP and POLLRDHUP */
     run_test("hello160"); /* TCP connect to a closed port */
     run_test("hello161"); /* UDP port unreachable on loopback */
+    run_test("hello162"); /* remaining timeout written back by ppoll/pselect6/select */
 
     start_persistent_services();
 
