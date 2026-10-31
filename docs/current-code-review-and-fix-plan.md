@@ -5690,7 +5690,9 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 问题：回环上发往无人绑定端口的 UDP 数据报被静默丢弃，没有任何 ICMP；已 `connect` 的 UDP 套接字拿不到 `ECONNREFUSED`，`SO_ERROR` 恒为 0，`poll` 不报错。依赖它的程序（DNS 解析器探测本地缓存、`connect`+`send`+`recv` 的探活）会一直等到超时。
 - 修复：`net/icmp_unreach_policy.zig`（`shouldReply`、`quoteLen`、`parseQuote`、`matchesConnected`）；`udp.zig` 的 `portBound/setPeerPort/peekPendingError/takePendingError/clearPendingErrorIfEqual/notifyUnreachable` 与逐端口的 `port_err/port_peer`（随端口槽位一起 swap-remove）；`udp.handlePacket` 发 ICMP；`icmp.handlePacket` 处理 type 3 code 3；`connect` 记录对端端口；`recvfrom`、`getsockopt(SO_ERROR)`、epoll 就绪读取待决错误。
-- 已知差异：只对回环回应；IPv6 没有 ICMPv6 目的不可达；`sendto` 不返回待决错误（Linux 也会在下一次 `send` 失败），只有 `recvfrom`、`SO_ERROR`、poll 看到它。
+- 已知差异：只对回环回应；IPv6 没有 ICMPv6 目的不可达。（原先记录的“`sendto` 不返回待决错误”已修复：下一次 `send` 返回一次 `ECONNREFUSED`，hello161 A2 段覆盖。）
 - TDD：host 新增 2 个测试（回复决策、引用长度、`parseQuote` 的格式/协议/长度/IHL 边界、匹配规则，以及三个入口都读待决错误）；hello161（A 已连接套接字：poll 报 `POLLERR`、`recv` 返回 `ECONNREFUSED` 且只一次、`SO_ERROR` 可读并清零；B 未连接套接字不受影响；C 绑定端口正常投递且发送方无错误）在 HEAD 上 3 项 FAIL，新内核 PASS。
 - 变异：去掉“仅回环”、去掉“端口未绑定”、匹配时忽略对端端口、不检查被引用协议为 UDP、固定 IHL 为 20，五个变异都被 host 测试抓住（全部是测试失败）。
 - 验证：host 821/821；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello161 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+- 后续补充（同一提交序列）：UDP `send` 现在也会因待决的 `ECONNREFUSED` 失败一次（hello161 A2 段，旧内核 1 项 FAIL）。变异：去掉 `sendto` 里读取待决错误 → host 测试 `udp: the pending error is consulted…` 失败；恢复后通过。验证：host 821/821；构建三架构通过；冒烟 SMP=1、SMP=8、GPT SMP=2 均 hello161 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

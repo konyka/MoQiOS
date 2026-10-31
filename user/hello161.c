@@ -144,6 +144,21 @@ void _start(void) {
         syscall1(SYS_CLOSE, u);
     }
 
+    /* A2: the error also fails the next send, once */
+    {
+        int64_t u = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+        uint8_t me[16];
+        mk_addr(me, 24993);
+        syscall3(SYS_BIND, (uint64_t)u, (uint64_t)me, 16);
+        syscall3(SYS_CONNECT, (uint64_t)u, (uint64_t)dead, 16);
+        syscall3(SYS_FCNTL, (uint64_t)u, F_SETFL, O_NONBLOCK);
+        syscall6(SYS_SENDTO, (uint64_t)u, (uint64_t)"ping", 4, 0, 0, 0);
+        pump(100);
+        check(syscall6(SYS_SENDTO, (uint64_t)u, (uint64_t)"ping", 4, 0, 0, 0) == -ECONNREFUSED_, "A2: the next send reports ECONNREFUSED");
+        check(syscall6(SYS_SENDTO, (uint64_t)u, (uint64_t)"ping", 4, 0, 0, 0) == 4, "A2: and the one after is accepted again");
+        syscall1(SYS_CLOSE, u);
+    }
+
     /* B: an unconnected socket is not told (Linux does not report it either) */
     {
         int64_t u = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);

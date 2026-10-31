@@ -391,6 +391,9 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         const is_v6 = t.fd_table.fds[fd].udp_is_v6;
         const src_port = t.fd_table.fds[fd].udp_port;
+        // A pending ICMP error (port unreachable) fails this send, once.
+        const pending_send_err = udp.takePendingError(src_port);
+        if (pending_send_err != 0) return -@as(i64, pending_send_err);
         if (is_v6) {
             var tmp6: [1232]u8 = undefined;
             const to_copy6 = @min(len, 1232);

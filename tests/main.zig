@@ -8304,4 +8304,5 @@ test "udp: the pending error is consulted by recv, SO_ERROR and readiness" {
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "udp.takePendingError(src_port)") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.epoll_source, "peekPendingError(@intCast(resource_idx))") != null);
     try std.testing.expect(std.mem.count(u8, kt.socket_syscall_source, "udp.setPeerPort(") >= 2);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "pending_send_err = udp.takePendingError(src_port)") != null);
 }
