@@ -51,6 +51,7 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_WAITPID   6
 #define SYS_NANOSLEEP 35
 #define SYS_SHUTDOWN  48
+#define SYS_SENDTO    121
 #define SYS_SOCKETPAIR 53
 #define SYS_FCNTL     142
 #define SYS_CLOCK_GETTIME 228
@@ -107,7 +108,7 @@ void _start(void) {
         check(syscall2(SYS_SHUTDOWN, sv[0], SHUT_WR) == 0, "A: shutdown(SHUT_WR) succeeds");
         check(syscall3(SYS_READ, sv[1], (uint64_t)b, 16) == 3, "A: the peer still reads the bytes sent before the shutdown");
         check(syscall3(SYS_READ, sv[1], (uint64_t)b, 16) == 0, "A: and then reads EOF (0), not EAGAIN");
-        check(syscall3(SYS_WRITE, sv[0], (uint64_t)"x", 1) == -EPIPE_, "A: writing after SHUT_WR is EPIPE");
+        check(syscall6(SYS_SENDTO, (uint64_t)sv[0], (uint64_t)"x", 1, 0x4000 /* MSG_NOSIGNAL */, 0, 0) == -EPIPE_, "A: writing after SHUT_WR is EPIPE");
         check(syscall3(SYS_WRITE, sv[1], (uint64_t)"hi", 2) == 2, "A: the other direction still accepts data");
         check(syscall3(SYS_READ, sv[0], (uint64_t)b, 16) == 2, "A: and the half-closed end still reads it");
         syscall1(SYS_CLOSE, sv[0]);
@@ -120,7 +121,7 @@ void _start(void) {
         pair(sv, 1);
         check(syscall2(SYS_SHUTDOWN, sv[0], SHUT_RD) == 0, "B: shutdown(SHUT_RD) succeeds");
         check(syscall3(SYS_READ, sv[0], (uint64_t)b, 16) == 0, "B: a read after SHUT_RD is EOF (0)");
-        check(syscall3(SYS_WRITE, sv[1], (uint64_t)"x", 1) == -EPIPE_, "B: the peer's write is EPIPE");
+        check(syscall6(SYS_SENDTO, (uint64_t)sv[1], (uint64_t)"x", 1, 0x4000 /* MSG_NOSIGNAL */, 0, 0) == -EPIPE_, "B: the peer's write is EPIPE");
         check(syscall3(SYS_WRITE, sv[0], (uint64_t)"y", 1) == 1, "B: the shut-down end can still send");
         check(syscall3(SYS_READ, sv[1], (uint64_t)b, 16) == 1, "B: and the peer receives it");
         syscall1(SYS_CLOSE, sv[0]);
@@ -133,9 +134,9 @@ void _start(void) {
         pair(sv, 1);
         check(syscall2(SYS_SHUTDOWN, sv[0], SHUT_RDWR) == 0, "C: shutdown(SHUT_RDWR) succeeds");
         check(syscall3(SYS_READ, sv[0], (uint64_t)b, 16) == 0, "C: local read is EOF");
-        check(syscall3(SYS_WRITE, sv[0], (uint64_t)"x", 1) == -EPIPE_, "C: local write is EPIPE");
+        check(syscall6(SYS_SENDTO, (uint64_t)sv[0], (uint64_t)"x", 1, 0x4000 /* MSG_NOSIGNAL */, 0, 0) == -EPIPE_, "C: local write is EPIPE");
         check(syscall3(SYS_READ, sv[1], (uint64_t)b, 16) == 0, "C: the peer reads EOF");
-        check(syscall3(SYS_WRITE, sv[1], (uint64_t)"x", 1) == -EPIPE_, "C: the peer's write is EPIPE");
+        check(syscall6(SYS_SENDTO, (uint64_t)sv[1], (uint64_t)"x", 1, 0x4000 /* MSG_NOSIGNAL */, 0, 0) == -EPIPE_, "C: the peer's write is EPIPE");
         syscall1(SYS_CLOSE, sv[0]);
         syscall1(SYS_CLOSE, sv[1]);
     }

@@ -144,7 +144,7 @@ void _start(void) {
         pump(100);
         check(syscall3(SYS_READ, s, (uint64_t)b, 16) == 3, "A: the peer reads the bytes sent before the shutdown");
         check(syscall3(SYS_READ, s, (uint64_t)b, 16) == 0, "A: then reads EOF (0)");
-        check(syscall3(SYS_WRITE, c, (uint64_t)"x", 1) == -EPIPE_, "A: write after SHUT_WR is EPIPE");
+        check(syscall6(SYS_SENDTO, (uint64_t)c, (uint64_t)"x", 1, 0x4000 /* MSG_NOSIGNAL */, 0, 0) == -EPIPE_, "A: write after SHUT_WR is EPIPE");
         check(syscall6(SYS_SENDTO, (uint64_t)c, (uint64_t)"x", 1, MSG_NOSIGNAL, 0, 0) == -EPIPE_, "A: sendto after SHUT_WR is EPIPE");
         check(syscall3(SYS_WRITE, s, (uint64_t)"hi", 2) == 2, "A: the peer can still send");
         pump(100);
@@ -171,7 +171,7 @@ void _start(void) {
     /* C: write on a socket that is not connected */
     {
         int64_t u = syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
-        int64_t w = syscall3(SYS_WRITE, u, (uint64_t)"x", 1);
+        int64_t w = syscall6(SYS_SENDTO, (uint64_t)u, (uint64_t)"x", 1, MSG_NOSIGNAL, 0, 0);
         check(w == -ENOTCONN_ || w == -EPIPE_, "C: write on an unconnected TCP socket is ENOTCONN (or EPIPE)");
         char rb[4];
         int64_t r = syscall3(SYS_READ, u, (uint64_t)rb, 4);

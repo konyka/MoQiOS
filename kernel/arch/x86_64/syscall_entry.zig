@@ -626,6 +626,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         121 => {
             syscallSendto(frame);
+            // A send that failed with EPIPE queued SIGPIPE: deliver it now.
+            checkSignalsOnSyscallReturn(frame);
         },
         122 => {
             syscallRecvfrom(frame);
@@ -654,6 +656,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         129 => { // sendmsg(fd, msg, flags)
             frame.rax = @bitCast(socket_mod.sendmsg(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));
+            checkSignalsOnSyscallReturn(frame);
         },
         130 => { // recvmsg(fd, msg, flags)
             frame.rax = @bitCast(socket_mod.recvmsg(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));

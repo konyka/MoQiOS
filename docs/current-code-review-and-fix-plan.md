@@ -5621,8 +5621,19 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 问题：TCP 套接字 `write`/`sendto` 在不能发送时返回裸 `-1`（被用户态当成 `EPERM`），不区分“从未连接”“已 `SHUT_WR`”“对端已走”“被 RST”；`tcpSend` 只在 `ESTABLISHED` 允许发送，因此对端 `shutdown(SHUT_WR)` 之后（本端进入 `CLOSE_WAIT`）本端再也不能回复，而这正是半关闭协议（发完请求关写端、等回复）的核心；对端 `close()` 之后，本端继续写的数据被孤儿连接静默吞掉，写者永远收不到错误；从未连接的套接字 `read` 返回 0（EOF）。
 - 修复：`tcp_recv_policy.canQueueSend/sendErrno/recvNeverConnected`；`TcpTcb.was_established`；`tcpSend`/`tcpSendFromUser`/`waitSendSpace` 改用 `canQueueSend`，`tcpSendBlocking` 的失败经 `sendFailure` 映射成具体 errno；`FIN_WAIT_1/2` 的孤儿连接对新数据回 `RST` 并关闭（`tcp_util.orphanRejectsData`）。
-- 已知差异：写 `EPIPE` 不发 `SIGPIPE`；`SHUT_RD` 之后到达的数据仍然入队。
+- 已知差异：`SHUT_RD` 之后到达的数据仍然入队（写 `EPIPE` 不发 `SIGPIPE` 的差异已在 hello155 修复）。
 - 排查过程（如实）：B 段（对端 `close()` 后继续写）一开始 8 次发送都成功，没有任何错误：对端的 `close()` 之后进入 `FIN_WAIT_2` 的孤儿连接，收到数据既不 ACK 也不 RST，发送方的数据被一直当成在途重传；要给孤儿回 RST 才能让发送方得到 `ECONNRESET`/`EPIPE`。探测里我临时加过一行打印最后一次发送的返回值（`-32`，第 2 次发送），确认后已删除。
 - TDD：host 新增 2 个测试（`sendErrno/canQueueSend/recvNeverConnected`、`orphanRejectsData`）；hello154（A 半关闭：对端读到数据后 EOF、本端写 `EPIPE`、反方向可用；B 对端已关闭后写；C 未连接套接字的读写）在 HEAD 上多项 FAIL，新内核 PASS。
 - 变异：`canQueueSend` 去掉 `close_wait`、`sendErrno` 里 RST 改回 `EPIPE`、`orphanRejectsData` 去掉 `len == 0` 判断、把边界改成 `or seq == rcv_nxt - 1`，各自被 host 测试抓住；前两次对 `orphanRejectsData` 的变异最初没被抓住（测试缺边界和零长度用例），补了边界、零长度、keepalive、回绕用例后抓住；另有两个变异因未使用参数编译失败，不算证据，已重做。
 - 验证：host 808/808；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello154 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### 套接字发送遇到 EPIPE 时发 SIGPIPE（hello155）
+
+- 问题：hello154 里记录的已知差异“TCP 写在 `EPIPE` 时不发 `SIGPIPE`”，AF_UNIX 同样如此。依赖 `SIGPIPE` 终止写者的程序（对端提前关闭时）不会被终止；`MSG_NOSIGNAL` 也就没有意义。
+- 修复：`namespace_policy.raisesSigpipe/sendResult`；`vfs.write`、`sendto`、`sendmsg` 的 TCP/AF_UNIX 路径统一包装；`sendto`/`sendmsg` 的系统调用分发加 `checkSignalsOnSyscallReturn`，使信号在返回用户态前投递。
+- 排查过程（如实）：第一次实现后 `write()` 能触发 SIGPIPE，`sendto()` 却不能：原来 `sendto`/`sendmsg` 的分发没有 `checkSignalsOnSyscallReturn`，信号排队了却要等到下一次投递点；补上之后通过。
+- 连带修正的旧探测（都是“期待 `write` 直接返回 EPIPE”，在正确的 SIGPIPE 语义下会被杀）：hello150 D 段（改用 `sendto(MSG_NOSIGNAL)`，并且因为 `sendto` 一次最多拷贝 8192 字节，改成先填满环再发第二次才会阻塞，否则第一次就返回，子进程根本没阻塞）、hello153 的 4 处写、hello154 的 3 处写。这些探测之前能通过只是因为内核没发信号，现在是探测按真实语义改写，不是放宽断言。
+- 已知差异：UDP/raw 套接字不会 `EPIPE`；`SIGPIPE` 被忽略或有处理函数时，发送仍返回 `-EPIPE`（与 Linux 一致）。
+- TDD：host 新增 2 个测试（`raisesSigpipe`、入口都经过 `sendResult`）；hello155（TCP `SHUT_WR` 后 `write`/`sendto` 被 SIGPIPE 杀死、`MSG_NOSIGNAL` 得到 EPIPE 并存活，AF_UNIX 同样）在 HEAD 上 4 项 FAIL，新内核 PASS。
+- 变异：`raisesSigpipe` 对所有负结果都发信号、`sendmsg` 的 AF_UNIX 路径不经过 `sendResult`，各自被 host 测试抓住；“去掉 `MSG_NOSIGNAL` 判断”的变异因未使用参数编译失败，不算证据。
+- 验证：host 810/810；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello150–hello155 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

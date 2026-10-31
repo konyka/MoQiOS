@@ -164,6 +164,24 @@ pub fn writeProgress(total: usize, done: usize, result: i64, nonblock: bool) Wri
     return if (done > 0) .partial else .fail;
 }
 
+/// A socket send that failed with EPIPE also raises SIGPIPE at the caller,
+/// unless the call passed MSG_NOSIGNAL (POSIX / Linux).
+pub const MSG_NOSIGNAL: u32 = 0x4000;
+
+pub fn raisesSigpipe(result: i64, msg_flags: u32) bool {
+    return result == -32 and (msg_flags & MSG_NOSIGNAL) == 0;
+}
+
+/// Pass `result` through, raising SIGPIPE on the current task first when the
+/// send policy asks for it.
+pub fn sendResult(result: i64, msg_flags: u32) i64 {
+    if (raisesSigpipe(result, msg_flags)) {
+        const sig_mod = @import("../proc/signal.zig");
+        sig_mod.raiseSelf(sig_mod.SIGPIPE);
+    }
+    return result;
+}
+
 /// Whether read() asks the descriptor for another chunk after a full one.
 /// Regular files always have the next bytes; a pipe, socket or device may have
 /// none yet, and a blocking read would then wait for data the caller never

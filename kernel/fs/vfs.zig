@@ -1511,7 +1511,7 @@ pub const FdTable = struct {
             .tcp_socket => {
                 // write() on a TCP socket is send(): all bytes queued, waiting for ring space.
                 const tcp = @import("../net/tcp.zig");
-                return tcp.tcpSendBlocking(desc.tcb_idx, @intFromPtr(buf), false, @intCast(count), @import("namespace_policy.zig").nonblockRequested(desc.status_flags, 0));
+                return @import("namespace_policy.zig").sendResult(tcp.tcpSendBlocking(desc.tcb_idx, @intFromPtr(buf), false, @intCast(count), @import("namespace_policy.zig").nonblockRequested(desc.status_flags, 0)), 0);
             },
             .udp_socket => return -1, // UDP sockets use sendto/recvfrom syscalls
             .epoll => return -1,
@@ -1522,7 +1522,7 @@ pub const FdTable = struct {
             .unix_socket => {
                 // write() on an AF_UNIX socket sends to the connected peer.
                 const unix_mod = @import("../net/unix_socket.zig");
-                return unix_mod.unixSendBlocking(desc.unix_sock_idx, buf, count, @import("namespace_policy.zig").nonblockRequested(desc.status_flags, 0));
+                return @import("namespace_policy.zig").sendResult(unix_mod.unixSendBlocking(desc.unix_sock_idx, buf, count, @import("namespace_policy.zig").nonblockRequested(desc.status_flags, 0)), 0);
             },
             .timerfd => return -1, // timerfd is read-only
             .devfs => {

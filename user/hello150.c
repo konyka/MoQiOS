@@ -161,10 +161,12 @@ void _start(void) {
         if (child == 0) {
             syscall1(SYS_CLOSE, sv[1]);
             /* the reader never reads: this write blocks, then the parent closes its end */
+            /* sendto copies at most 8192 bytes: fill the ring, then the next send blocks */
+            syscall6(SYS_SENDTO, (uint64_t)sv[0], (uint64_t)big, 8192, 0x4000 /* MSG_NOSIGNAL */, 0, 0);
             int64_t tw = now_ms();
-            int64_t w = syscall3(SYS_WRITE, sv[0], (uint64_t)big, BIG);
+            int64_t w = syscall6(SYS_SENDTO, (uint64_t)sv[0], (uint64_t)big, 8192, 0x4000 /* MSG_NOSIGNAL */, 0, 0);
             int blocked = now_ms() - tw >= 80;
-            syscall1(SYS_EXIT, blocked && ((w < 0 && -w == EPIPE_) || (w > 0 && w < BIG)) ? 0 : 1);
+            syscall1(SYS_EXIT, blocked && ((w < 0 && -w == EPIPE_) || (w > 0 && w < 8192)) ? 0 : 1);
             for (;;) {}
         }
         syscall1(SYS_CLOSE, sv[0]);

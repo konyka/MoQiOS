@@ -386,7 +386,7 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
     if (t.fd_table.fds[fd].fd_type == .tcp_socket) {
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         const tcb_idx = t.fd_table.fds[fd].tcb_idx;
-        return net_mod.tcp.tcpSendBlocking(tcb_idx, buf, true, len, net_mod.tcp_recv_policy.nonblockRequested(t.fd_table.fds[fd].status_flags, flags));
+        return @import("../fs/namespace_policy.zig").sendResult(net_mod.tcp.tcpSendBlocking(tcb_idx, buf, true, len, net_mod.tcp_recv_policy.nonblockRequested(t.fd_table.fds[fd].status_flags, flags)), flags);
     } else if (t.fd_table.fds[fd].fd_type == .udp_socket) {
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         const is_v6 = t.fd_table.fds[fd].udp_is_v6;
@@ -452,7 +452,7 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         const n_unix = copy.copyFromUser(&tmp_unix, @ptrFromInt(buf), to_copy_unix);
         if (n_unix == 0) return -1;
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
-        return net_mod.unix_socket.unixSendBlocking(unix_idx, &tmp_unix, n_unix, @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, flags));
+        return @import("../fs/namespace_policy.zig").sendResult(net_mod.unix_socket.unixSendBlocking(unix_idx, &tmp_unix, n_unix, @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, flags)), flags);
     } else {
         // Not a socket — use regular write
         var tmp_buf: [4096]u8 = undefined;
@@ -1081,7 +1081,7 @@ pub fn sendmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
     if (fd < vfs_mod.MAX_FDS and cur.fd_table.fds[fd].fd_type == .unix_socket) {
         var hdr: [56]u8 = undefined;
         if (copy.copyFromUser(&hdr, @ptrFromInt(msg_ptr), 56) != 56) return -14;
-        return unixSendmsg(cur, fd, &hdr);
+        return @import("../fs/namespace_policy.zig").sendResult(unixSendmsg(cur, fd, &hdr), flags);
     }
     if (fd < vfs_mod.MAX_FDS and cur.fd_table.fds[fd].fd_type == .udp_socket) {
         var hdr: [56]u8 = undefined;
@@ -1116,7 +1116,7 @@ pub fn sendmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
         const to_send: u32 = @intCast(@min(iov_sz, @as(u64, 0xffff_ffff)));
         const result = net_mod.tcp.tcpSendBlocking(tcb_idx, iov_base, true, to_send, net_mod.tcp_recv_policy.nonblockRequested(cur.fd_table.fds[fd].status_flags, flags));
         if (result <= 0) {
-            if (total == 0) return result;
+            if (total == 0) return @import("../fs/namespace_policy.zig").sendResult(result, flags);
             break;
         }
         total += @intCast(result);

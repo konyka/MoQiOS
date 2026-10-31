@@ -8054,3 +8054,20 @@ test "tcp: an orphaned connection answers new data with RST, not with silence" {
     // Wrap-around: rcv_nxt just below 2^32, segment crossing zero.
     try std.testing.expect(tu.orphanRejectsData(true, true, 0xffff_fff0, 0x20, 0xffff_fff8));
 }
+
+test "socket send: EPIPE raises SIGPIPE unless MSG_NOSIGNAL" {
+    const np = kt.namespace_policy;
+    try std.testing.expect(np.raisesSigpipe(-32, 0));
+    try std.testing.expect(!np.raisesSigpipe(-32, np.MSG_NOSIGNAL));
+    try std.testing.expect(np.raisesSigpipe(-32, 0x40)); // MSG_DONTWAIT does not suppress it
+    // Only EPIPE raises the signal.
+    try std.testing.expect(!np.raisesSigpipe(-11, 0));
+    try std.testing.expect(!np.raisesSigpipe(-104, 0));
+    try std.testing.expect(!np.raisesSigpipe(5, 0));
+    try std.testing.expectEqual(@as(u32, 0x4000), np.MSG_NOSIGNAL);
+}
+
+test "every socket send entry point routes its result through sendResult" {
+    try std.testing.expect(std.mem.count(u8, kt.vfs_source, "sendResult(") >= 2);
+    try std.testing.expect(std.mem.count(u8, kt.socket_syscall_source, "sendResult(") >= 4);
+}
