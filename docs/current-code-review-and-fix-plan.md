@@ -5666,3 +5666,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 新增 2 个测试（`RDHUP` 随对端 FIN 的所有状态而置位、本端自己的 `SHUT_RD`/`SHUT_WR` 不置位、唤醒带 RDHUP）；hello158（空闲连接不报、对端 `SHUT_WR` 后 epoll 与 poll 报 RDHUP 并带 IN、未请求时不报）在 HEAD 上 2 项 FAIL，新内核 PASS。
 - 变异：`RDHUP` 改成跟随 `read_done`（本端 `SHUT_RD` 也会触发）、`RDHUP` 去掉 `closed` 状态，各自被 host 测试抓住（均为测试失败）。已有的 hello157 host 测试在加入 `RDHUP` 后需要同步（`CLOSE_WAIT` 现在带 RDHUP），已更新。
 - 验证：host 815/815；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1 与 GPT SMP=2 hello158 PASS、0 FAIL；SMP=8 第一次停在 hello144 D 段（已知的间歇性停顿，0 个 FAIL），重跑 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### AF_UNIX 的 EPOLLRDHUP / POLLRDHUP（hello159）
+
+- 问题：hello158 记录的已知差异：只有 TCP 报 `RDHUP`，AF_UNIX 的 `shutdown(SHUT_WR)` 与对端关闭在 epoll/poll 里看不出来（同一个事件循环里 TCP 与 AF_UNIX 套接字行为不一致）。
+- 修复：`unix_epoll_policy.State.peer_shut_wr` 与 `EPOLLRDHUP`；`unixEpollEvents` 填充 `peer_shut_wr`（来自 hello153 的半关闭状态）；`EpollWake.fire` 的 `hup` 分支带 `EPOLLRDHUP`。
+- 已知差异：AF_UNIX 数据报套接字没有 `RDHUP`。
+- TDD：host 新增 1 个测试（RDHUP 随对端 `SHUT_WR`/断开、不随本端自己的标志、数据报与监听不报）；hello159（空闲对不报、对端 `SHUT_WR`、对端关闭，epoll 与 poll）在 HEAD 上 4 项 FAIL，新内核 PASS。
+- 变异：`RDHUP` 对数据报也上报、对 `read_eof`（本端自己的 SHUT_RD）也上报、断开时不带 `RDHUP`，各自被 host 测试抓住（均为测试失败）。`tests/unix_epoll_test.zig` 里“对端关闭”的掩码测试需要同步包含 `EPOLLRDHUP`，已更新。
+- 验证：host 816/816；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1 与 GPT SMP=2 hello159 PASS、0 FAIL；SMP=8 前两次停在 hello144 D 段（已知的间歇性停顿，日志停在同一行，0 个 FAIL），第三次 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

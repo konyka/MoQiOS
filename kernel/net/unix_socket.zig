@@ -280,7 +280,7 @@ const EpollWake = struct {
             if (self.out & b != 0) events |= epoll.EPOLLOUT;
             // epollNotify filters by interest and HUP is rarely requested;
             // a hang-up also makes read (EOF) and send (error) non-blocking.
-            if (self.hup & b != 0) events |= epoll.EPOLLIN | epoll.EPOLLOUT | epoll.EPOLLHUP;
+            if (self.hup & b != 0) events |= epoll.EPOLLIN | epoll.EPOLLOUT | epoll.EPOLLHUP | epoll.EPOLLRDHUP;
             epoll.epollNotify(.unix_socket, i, events);
         }
     }
@@ -1242,6 +1242,7 @@ pub fn unixEpollEvents(idx: u32) u32 {
         .disconnected = !sock.connected or (sock.sock_type == SOCK_STREAM and np.halfCloseReadEof(halfCloseLocked(idx)) and np.halfCloseSendBroken(halfCloseLocked(idx))),
         .read_eof = sock.sock_type == SOCK_STREAM and np.halfCloseReadEof(halfCloseLocked(idx)),
         .send_broken = sock.sock_type == SOCK_STREAM and np.halfCloseSendBroken(halfCloseLocked(idx)),
+        .peer_shut_wr = sock.sock_type == SOCK_STREAM and halfCloseLocked(idx).peer_shut_wr,
         .connect_pending = sock.sock_type == SOCK_STREAM and !sock.connected and queuedOnBacklogLocked(idx),
         .peer_free = sendRoomLocked(idx),
     });

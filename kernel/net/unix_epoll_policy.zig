@@ -5,6 +5,7 @@
 pub const EPOLLIN: u32 = 0x001;
 pub const EPOLLOUT: u32 = 0x004;
 pub const EPOLLHUP: u32 = 0x010;
+pub const EPOLLRDHUP: u32 = 0x2000;
 
 /// A datagram send needs its 2-byte length prefix plus at least one byte.
 pub const DGRAM_MIN_ROOM: u32 = 3;
@@ -25,6 +26,8 @@ pub const State = struct {
     read_eof: bool = false,
     /// STREAM only: a send fails at once (shutdown) - writable.
     send_broken: bool = false,
+    /// STREAM only: the peer shut its writing side (shutdown(SHUT_WR)).
+    peer_shut_wr: bool = false,
     /// Free bytes in the ring of the peer this socket sends into; null when
     /// there is no valid peer to block on (send fails immediately instead).
     peer_free: ?u32,
@@ -40,7 +43,8 @@ pub fn events(s: State) u32 {
         return ev;
     }
     if (s.stream and s.connect_pending) return ev;
-    if (s.stream and s.disconnected) return ev | EPOLLIN | EPOLLOUT | EPOLLHUP;
+    if (s.stream and s.peer_shut_wr) ev |= EPOLLRDHUP;
+    if (s.stream and s.disconnected) return ev | EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP;
     if (s.peer_free) |free| {
         const min_room: u32 = if (s.stream) 1 else DGRAM_MIN_ROOM;
         if (free >= min_room) ev |= EPOLLOUT;

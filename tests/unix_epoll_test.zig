@@ -37,7 +37,7 @@ test "peer close reports HUP and EOF-readable even with an empty ring" {
     s.disconnected = true;
     s.peer_free = null;
     // read() returns 0 and send() fails with EPIPE: neither blocks.
-    try std.testing.expectEqual(p.EPOLLIN | p.EPOLLOUT | p.EPOLLHUP, p.events(s));
+    try std.testing.expectEqual(p.EPOLLIN | p.EPOLLOUT | p.EPOLLHUP | p.EPOLLRDHUP, p.events(s));
 }
 
 test "listener is readable only with a pending connection, never HUP or writable" {

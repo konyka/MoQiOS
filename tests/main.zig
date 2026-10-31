@@ -8168,3 +8168,33 @@ test "tcp readiness: RDHUP follows the peer's FIN, not our own shutdown" {
 test "epoll wakes a waiter on the peer's FIN with RDHUP" {
     try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "epoll.EPOLLIN | epoll.EPOLLHUP | epoll.EPOLLRDHUP") != null);
 }
+
+test "unix epoll: RDHUP follows the peer's SHUT_WR or disconnect, not our own state" {
+    const up = kt.unix_epoll_policy;
+    const base: up.State = .{ .stream = true, .rx_bytes = 0, .listening = false, .pending_connections = 0, .disconnected = false, .peer_free = 100 };
+    try std.testing.expectEqual(@as(u32, 0), up.events(base) & up.EPOLLRDHUP);
+    var psw = base;
+    psw.peer_shut_wr = true;
+    psw.read_eof = true;
+    try std.testing.expect(up.events(psw) & up.EPOLLRDHUP != 0);
+    try std.testing.expect(up.events(psw) & up.EPOLLIN != 0);
+    // Our own shutdown flags (read_eof / send_broken) alone are not a peer hang-up.
+    var own = base;
+    own.read_eof = true;
+    own.send_broken = true;
+    try std.testing.expectEqual(@as(u32, 0), up.events(own) & up.EPOLLRDHUP);
+    // The peer closed.
+    var gone = base;
+    gone.disconnected = true;
+    try std.testing.expect(up.events(gone) & up.EPOLLRDHUP != 0);
+    // Datagram sockets and listeners never report it.
+    var dg = base;
+    dg.stream = false;
+    dg.peer_shut_wr = true;
+    try std.testing.expectEqual(@as(u32, 0), up.events(dg) & up.EPOLLRDHUP);
+    var ls = base;
+    ls.listening = true;
+    ls.peer_shut_wr = true;
+    try std.testing.expectEqual(@as(u32, 0), up.events(ls) & up.EPOLLRDHUP);
+    try std.testing.expectEqual(@as(u32, 0x2000), up.EPOLLRDHUP);
+}
