@@ -164,6 +164,14 @@ pub fn writeProgress(total: usize, done: usize, result: i64, nonblock: bool) Wri
     return if (done > 0) .partial else .fail;
 }
 
+/// Whether read() asks the descriptor for another chunk after a full one.
+/// Regular files always have the next bytes; a pipe, socket or device may have
+/// none yet, and a blocking read would then wait for data the caller never
+/// needed to have (POSIX: a stream read returns what is available).
+pub fn readContinues(regular_file: bool, ready: bool) bool {
+    return regular_file or ready;
+}
+
 /// Result of a blocking write whose SO_SNDTIMEO ran out: what was already sent,
 /// or EAGAIN when nothing was.
 pub fn sendTimeoutResult(done: usize) i64 {

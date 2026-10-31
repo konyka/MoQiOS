@@ -5597,3 +5597,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 又一个缺陷（循环验证时才暴露）：带宽时延积（BDP）算出的窗口在回环上只有几个字节（亚毫秒 RTT、稀疏速率样本），BBR 的 Startup/ProbeBW/ProbeRTT 退出把它直接当作 `cwnd`/`ssthresh`，发送方一次只发几个字节（追踪里 `cwnd=9`、`ssthresh=13`），B 段约 1/10 的运行在超时内写不完。`tcp_util.bdpWindow` 给这些路径加上两个 SMSS 的下限。
 - 变异：去掉 `dataSegmentCap` 的选项扣减、`bumpDupAck` 改回回绕加法、`oooReport` 对领先段改成报告、RTO 不清记分板，各自被对应的 host 测试抓住（`dataSegmentCap` 变异报 `expected 1448, found 1460`）；`prrCwnd`/`bdpWindow` 的变异使测试编译失败（多余变量），不算有效证据，这两项靠各自的数值断言覆盖。
 - 验证：host 802/802；x86_64/riscv64/aarch64 构建通过；hello151 在循环冒烟里 10/10 PASS（修复 `bdpWindow` 前约 1/3 的运行 B 段停住）；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### read() 返回当前可读的数据（hello152）
+
+- 问题：`file_io.read` 按 4 KB 一块循环，一块读满后无条件再读下一块。对流式描述符，第二次读在没有数据时阻塞：对端只写了 4096 字节、调用者要 8192 字节，`read` 就永远不返回（POSIX 要求流读取返回当前可得的数据）。这是在做 hello151 时观察到的“只有 4096 倍数的写入会让读者挂住”的同一类现象。
+- 修复：`namespace_policy.readContinues(regular, ready)`；普通文件总是继续读，其它描述符仅当 `poll.descEvents` 报告 `POLLIN` 才取下一块。
+- 已知差异：判断用的是 poll 的就绪位，对 `devfs` 之类没有就绪语义的节点退化为“有数据才继续”，不会比以前多读。
+- 排查过程（如实）：我最初把管道也放进探测（4096/8192 字节），实际上管道缓冲只有 4095 字节，写 4096 会短写，这一项探测本身是错的，改成 3000 字节；TCP 一项最初用固定睡眠等待数据到达，对端以 MSS 为单位分段 + 延迟 ACK，睡眠不够就读到 2896/4344/5544 字节（这是探测时序问题，不是 `read` 的问题），改为用 `FIONREAD` 等到数据全部到达再读。
+- TDD：host 新增 2 个测试；hello152（管道 3000、AF_UNIX 4096/8192、TCP 4096/8192 字节，读取量大于已排队字节数，读者在子进程里以便超时可控）在 HEAD 上停在 AF_UNIX 一项，新内核 PASS（连续 3 次）。
+- 变异：`readContinues` 恒返回 true → host 测试失败；恢复后通过。
+- 验证：host 804/804；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello152 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

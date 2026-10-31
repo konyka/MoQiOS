@@ -137,6 +137,14 @@ pub fn read(fd: u32, buf_ptr: u64, count: u64) i64 {
             break;
         }
         if (got < chunk) break;
+        if (pos < n) {
+            const desc = &cur.fd_table.fds[fd];
+            const regular = switch (desc.fd_type) {
+                .ramdisk_file, .fat32_file, .ext2_file, .tmpfs_file, .rofs_file, .proc_file => true,
+                else => false,
+            };
+            if (!@import("namespace_policy.zig").readContinues(regular, regular or (@import("poll.zig").descEvents(desc) & 1) != 0)) break;
+        }
     }
     if (faulted and pos == 0) return -EFAULT;
     // A genuine error is returned, never re-issued: re-reading after an error

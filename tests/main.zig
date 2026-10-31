@@ -7957,3 +7957,17 @@ test "tcp: every BBR path that assigns a BDP window applies the floor" {
     try std.testing.expect(std.mem.indexOf(u8, src, "tcb.cwnd = bdp;") == null);
     try std.testing.expect(std.mem.indexOf(u8, src, "tcp_util.bdpWindow(probeBbrCycleCwnd(bdp, gain)") != null);
 }
+
+test "read(): a full chunk only asks for another one when it cannot block" {
+    const np = kt.namespace_policy;
+    // Regular files always have the next bytes.
+    try std.testing.expect(np.readContinues(true, false));
+    // A pipe, socket or device continues only if data is already waiting.
+    try std.testing.expect(np.readContinues(false, true));
+    try std.testing.expect(!np.readContinues(false, false));
+}
+
+test "file_io.read consults readiness before a follow-up chunk on non-file descriptors" {
+    const src = kt.file_io_source;
+    try std.testing.expect(std.mem.indexOf(u8, src, "readContinues(regular") != null);
+}
