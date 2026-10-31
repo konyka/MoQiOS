@@ -86,6 +86,33 @@ pub fn timedOut(deadline_ns: ?u64, now_ns: u64) bool {
     return now_ns >= d;
 }
 
+/// send() on a TCB that cannot queue data (state, FIN request, reset). A
+/// connection that never carried data is ENOTCONN; one that was shut down for
+/// writing (or whose peer vanished) is EPIPE; a peer RST is ECONNRESET.
+/// `established_ever` stays set once the handshake finished.
+pub fn sendErrno(state: TcpState, fin_pending: bool, reset_by_peer: bool, established_ever: bool) i64 {
+    if (reset_by_peer) return errno.ECONNRESET;
+    if (fin_pending) return errno.EPIPE;
+    return switch (state) {
+        .established, .close_wait => 0,
+        .closed, .syn_sent, .syn_received, .listen => if (established_ever) errno.EPIPE else errno.ENOTCONN,
+        .fin_wait_1, .fin_wait_2, .closing, .last_ack, .time_wait => errno.EPIPE,
+    };
+}
+
+/// Data may be queued for sending while the connection is open for writing:
+/// ESTABLISHED, and CLOSE_WAIT (the peer shut down its sending side; ours is
+/// still open and the peer is waiting for the reply).
+pub fn canQueueSend(state: TcpState, fin_pending: bool) bool {
+    return (state == .established or state == .close_wait) and !fin_pending;
+}
+
+/// read() on a connection that never got established (socket(), or a failed
+/// connect) is ENOTCONN, not an orderly EOF.
+pub fn recvNeverConnected(state: TcpState, established_ever: bool) bool {
+    return state == .closed and !established_ever;
+}
+
 /// recv() return value for a decision that copies no data.
 pub fn emptyResult(decision: RecvDecision) i64 {
     return switch (decision) {

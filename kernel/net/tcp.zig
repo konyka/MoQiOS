@@ -318,6 +318,8 @@ const TcpTcb = struct {
     /// A valid RST tore the connection down: a drained recv reports
     /// ECONNRESET instead of EOF.
     reset_by_peer: bool = false,
+    /// The handshake finished at some point (stays set after close/reset).
+    was_established: bool = false,
     /// local_port was set by bind(); otherwise connect() treats it as stale.
     bound_explicitly: bool = false,
     /// Zero-window persist probe timer (SK-110).
@@ -791,6 +793,7 @@ fn initTcbState(t: *TcpTcb) void {
     t.nagle_pending = false;
     t.fin_pending = false;
     t.reset_by_peer = false;
+    t.was_established = false;
     t.bound_explicitly = false;
     t.persist_timer_ms = 0;
     t.persist_rto_ms = RETRANSMIT_MS;
@@ -2187,6 +2190,7 @@ fn driveTcbStateMachine(
                 tcb.snd_una = ack_num;
                 tcb.snd_wnd = window;
                 tcb.state = .established;
+                tcb.was_established = true;
 
                 // Negotiate Window Scaling from SYN-ACK options
                 if (opts.ws_shift) |peer_ws| {
@@ -2247,6 +2251,7 @@ fn driveTcbStateMachine(
                 tcb.snd_una = ack_num;
                 tcb.snd_wnd = window;
                 tcb.state = .established;
+                tcb.was_established = true;
                 tcb.retransmit_timer = 0;
                 tcpLog("[tcp] server: connection established (ACK received)\n");
 
@@ -2544,6 +2549,12 @@ fn driveTcbStateMachine(
             maybeSendPendingFin(tcb);
         },
         .fin_wait_1 => {
+            if (tcp_util.orphanRejectsData(tcb.ref_count == 0, true, seq_num, payload_len, tcb.rcv_nxt)) {
+                _ = sendSegment(tcb, RST | ACK, undefined, 0);
+                closeTcbRemote(tcb);
+                tcpLog("[tcp] data for a closed connection → RST\n");
+                return;
+            }
             if (flags & FIN != 0) {
                 // RFC 9293: a FIN is only consumable at exactly RCV.NXT —
                 // the established branch enforces this and the close states
@@ -2586,6 +2597,12 @@ fn driveTcbStateMachine(
             }
         },
         .fin_wait_2 => {
+            if (tcp_util.orphanRejectsData(tcb.ref_count == 0, true, seq_num, payload_len, tcb.rcv_nxt)) {
+                _ = sendSegment(tcb, RST | ACK, undefined, 0);
+                closeTcbRemote(tcb);
+                tcpLog("[tcp] data for a closed connection → RST\n");
+                return;
+            }
             if (payload_len > 0) {
                 processIncomingData(tcb, data + payload_offset, payload_len, seq_num);
                 pending_events.* |= epoll.EPOLLIN;
@@ -2892,7 +2909,7 @@ pub fn tcpSend(tcb_idx: u32, data: [*]const u8, len: u32) i64 {
     defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
-    if (!tcb.active or tcb.state != .established or tcb.fin_pending) return -1;
+    if (!tcb.active or !tcp_recv_policy.canQueueSend(tcb.state, tcb.fin_pending)) return -1;
 
     // Copy data to send ring buffer (batched @memcpy)
     const used = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
@@ -2942,7 +2959,7 @@ pub fn tcpSendFromUser(tcb_idx: u32, user_addr: u64, len: u32) i64 {
 
         const lock_flags = tcp_lock.acquire();
         const tcb = &tcbs[tcb_idx];
-        if (!tcb.active or tcb.state != .established or tcb.fin_pending) {
+        if (!tcb.active or !tcp_recv_policy.canQueueSend(tcb.state, tcb.fin_pending)) {
             tcp_lock.release(lock_flags);
             return if (total > 0) @intCast(total) else -1;
         }
@@ -2963,7 +2980,7 @@ pub fn tcpSendFromUser(tcb_idx: u32, user_addr: u64, len: u32) i64 {
             const lock_flags = tcp_lock.acquire();
             defer tcp_lock.release(lock_flags);
             const tcb = &tcbs[tcb_idx];
-            if (tcb.active and tcb.state == .established) flushSendBuffer(tcb);
+            if (tcb.active and (tcb.state == .established or tcb.state == .close_wait)) flushSendBuffer(tcb);
             loop_dst = tcb.active and !tcb.is_v6 and netif.isLoopback(tcb.remote_ip);
         }
         // A 127/8 peer may be blocked in recv waiting for these segments and
@@ -3277,7 +3294,7 @@ fn waitSendSpace(tcb_idx: u32, st: *SendWait) i64 {
         }
         // A connection that can no longer send, or a ring with room: retry
         // now, the send reports the real error / progress.
-        if (tcb.state != .established or tcb.fin_pending) return 0;
+        if (!tcp_recv_policy.canQueueSend(tcb.state, tcb.fin_pending)) return 0;
         const used = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
         if (SEND_BUF_SIZE - 1 - used > 0) return 0;
         if (tcp_recv_policy.timedOut(st.deadline, tsc.nanos())) return -11;
@@ -3314,6 +3331,17 @@ fn tcpSendKernel(tcb_idx: u32, data: [*]const u8, len: u32) i64 {
     return r;
 }
 
+/// The errno for a send that could not queue anything (`raw` is the -1 of the
+/// low-level send; EFAULT and friends pass through).
+fn sendFailure(tcb_idx: u32, raw: i64) i64 {
+    if (raw != -1) return raw;
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active) return -9; // EBADF: slot torn down
+    return tcp_recv_policy.sendErrno(tcb.state, tcb.fin_pending, tcb.reset_by_peer, tcb.was_established);
+}
+
 /// write()/send() on a TCP socket: queue all `len` bytes, sleeping while the
 /// send ring is full (blocking sockets), until SO_SNDTIMEO runs out or a
 /// signal arrives. A non-blocking call, or one cut short after progress,
@@ -3338,7 +3366,7 @@ pub fn tcpSendBlocking(tcb_idx: u32, addr: u64, is_user: bool, len: u32, nonbloc
                 continue;
             },
             .partial => return @as(i64, done) + @max(result, 0),
-            .fail => return result,
+            .fail => return sendFailure(tcb_idx, result),
             .wait => {},
         }
         const w = waitSendSpace(tcb_idx, &st);
@@ -3385,7 +3413,10 @@ pub fn recvTimerTick(now_ns: u64) void {
 fn recvLocked(tcb: *TcpTcb, buf: [*]u8, len: u32) i64 {
     const available = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
     const decision = tcp_recv_policy.decide(tcb.state, available, tcb.reset_by_peer);
-    if (decision != .read_data) return tcp_recv_policy.emptyResult(decision);
+    if (decision != .read_data) {
+        if (decision == .eof and tcp_recv_policy.recvNeverConnected(tcb.state, tcb.was_established)) return -107; // ENOTCONN
+        return tcp_recv_policy.emptyResult(decision);
+    }
 
     const to_read = @min(available, len);
     ringRead(&tcb.recv_buf, RECV_BUF_SIZE, tcb.recv_head, buf, to_read);

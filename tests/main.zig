@@ -8006,3 +8006,51 @@ test "unix epoll: a shut-down stream is readable (EOF) and writable (EPIPE)" {
     broken.peer_free = null;
     try std.testing.expectEqual(@as(u32, up.EPOLLOUT), up.events(broken));
 }
+
+test "tcp send errors: ENOTCONN before a connection, EPIPE after shutdown, ECONNRESET after RST" {
+    const rp = kt.tcp_recv_policy;
+    const S = rp.TcpState;
+    // Open for writing: no error (established, or the peer only closed its side).
+    try std.testing.expectEqual(@as(i64, 0), rp.sendErrno(S.established, false, false, true));
+    try std.testing.expectEqual(@as(i64, 0), rp.sendErrno(S.close_wait, false, false, true));
+    // Never connected: ENOTCONN; was connected and is gone: EPIPE.
+    try std.testing.expectEqual(@as(i64, -107), rp.sendErrno(S.closed, false, false, false));
+    try std.testing.expectEqual(@as(i64, -32), rp.sendErrno(S.closed, false, false, true));
+    // Shutdown for writing (FIN requested or sent): EPIPE.
+    try std.testing.expectEqual(@as(i64, -32), rp.sendErrno(S.established, true, false, true));
+    try std.testing.expectEqual(@as(i64, -32), rp.sendErrno(S.fin_wait_2, false, false, true));
+    // Peer RST wins.
+    try std.testing.expectEqual(@as(i64, -104), rp.sendErrno(S.closed, false, true, true));
+    // What may be queued.
+    try std.testing.expect(rp.canQueueSend(S.established, false));
+    try std.testing.expect(rp.canQueueSend(S.close_wait, false));
+    try std.testing.expect(!rp.canQueueSend(S.established, true));
+    try std.testing.expect(!rp.canQueueSend(S.fin_wait_1, false));
+    // read() on a socket that never connected is ENOTCONN, not EOF.
+    try std.testing.expect(rp.recvNeverConnected(S.closed, false));
+    try std.testing.expect(!rp.recvNeverConnected(S.closed, true));
+    try std.testing.expect(!rp.recvNeverConnected(S.established, false));
+}
+
+test "tcp: an orphaned connection answers new data with RST, not with silence" {
+    const tu = tcp_util;
+    // Closed by the application (orphan), in a FIN_WAIT state, new payload.
+    try std.testing.expect(tu.orphanRejectsData(true, true, 1000, 10, 1000));
+    // A pure duplicate of data already received is not new.
+    try std.testing.expect(!tu.orphanRejectsData(true, true, 900, 100, 1000));
+    // No payload, not an orphan, or not in a FIN_WAIT state: unaffected.
+    try std.testing.expect(!tu.orphanRejectsData(true, true, 1000, 0, 1000));
+    try std.testing.expect(!tu.orphanRejectsData(false, true, 1000, 10, 1000));
+    try std.testing.expect(!tu.orphanRejectsData(true, false, 1000, 10, 1000));
+    // Boundaries: the segment ends exactly at rcv_nxt (all old) vs one byte past it.
+    try std.testing.expect(!tu.orphanRejectsData(true, true, 990, 10, 1000));
+    try std.testing.expect(tu.orphanRejectsData(true, true, 990, 11, 1000));
+    // A zero-length segment ahead of rcv_nxt carries nothing to reject.
+    try std.testing.expect(!tu.orphanRejectsData(true, true, 2000, 0, 1000));
+    // A zero-length segment at rcv_nxt - 1 (keepalive) is not data either.
+    try std.testing.expect(!tu.orphanRejectsData(true, true, 999, 0, 1000));
+    // A one-byte duplicate just below rcv_nxt (a keepalive probe) is old data.
+    try std.testing.expect(!tu.orphanRejectsData(true, true, 999, 1, 1000));
+    // Wrap-around: rcv_nxt just below 2^32, segment crossing zero.
+    try std.testing.expect(tu.orphanRejectsData(true, true, 0xffff_fff0, 0x20, 0xffff_fff8));
+}

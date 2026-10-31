@@ -147,6 +147,16 @@ pub fn bdpWindow(bdp: u32, smss: u32) u32 {
     return @max(bdp, floor);
 }
 
+/// A connection the application already close()d (an orphan in FIN_WAIT_1 or
+/// FIN_WAIT_2) can never deliver data to anyone: new payload arriving for it is
+/// answered with RST (RFC 9293 §3.10.7.4), which is how the sender learns its
+/// peer is gone (EPIPE on the next write) instead of writing into the void.
+/// Pure duplicates of data already received are not "new" and are just ACKed.
+pub fn orphanRejectsData(orphan: bool, fin_wait: bool, seq: u32, len: u32, rcv_nxt: u32) bool {
+    if (!orphan or !fin_wait or len == 0) return false;
+    return seqLt(rcv_nxt, seq +% len);
+}
+
 /// Payload bytes one data segment may carry: the MSS is the bound on TCP
 /// payload, but every segment also carries its options (timestamps, SACK
 /// blocks) inside the same MTU, so a full-MSS payload would be refused by the
