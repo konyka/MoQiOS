@@ -193,6 +193,7 @@ pub const nvme_queue = @import("drivers/nvme_queue.zig");
 pub const nvme_mailbox = @import("drivers/nvme_mailbox.zig");
 pub const virtio_net_queue = @import("drivers/virtio_net_queue.zig");
 pub const socketpair_policy = @import("net/socketpair_policy.zig");
+pub const recv_flags_policy = @import("net/recv_flags_policy.zig");
 pub const message_batch_policy = @import("net/message_batch_policy.zig");
 pub const slab_mag = @import("mm/slab_mag.zig");
 pub const dcache = @import("fs/dcache.zig");

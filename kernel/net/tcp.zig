@@ -3283,6 +3283,25 @@ pub fn tcpRecv(tcb_idx: u32, buf: [*]u8, len: u32) i64 {
     return recvLocked(tcb, buf, len);
 }
 
+/// Sleep until the receive ring has data, the peer closes or resets, or a
+/// signal arrives; 0 = look again. Used by a blocking MSG_PEEK.
+/// MSG_PEEK: copy up to `len` queued bytes without consuming them or touching
+/// the window. Returns the count; EOF/EAGAIN/errors as tcpRecv.
+pub fn tcpPeek(tcb_idx: u32, buf: [*]u8, len: u32) i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS) return -1;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active) return -1;
+    if (tcp_recv_policy.shutRdEof(tcb.shut_rd)) return 0;
+    const available = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
+    const decision = tcp_recv_policy.decide(tcb.state, available, tcb.reset_by_peer);
+    if (decision != .read_data) return tcp_recv_policy.emptyResult(decision);
+    const to_read = @min(available, len);
+    ringRead(&tcb.recv_buf, RECV_BUF_SIZE, tcb.recv_head, buf, to_read);
+    return @intCast(to_read);
+}
+
 /// Blocking recv: identical to tcpRecv when data, EOF or an error is
 /// available, or when `nonblock` is set; otherwise sleeps until the ring
 /// gets data, the peer closes or resets, a signal arrives (-EINTR), the
@@ -3302,6 +3321,28 @@ pub fn tcpRecvBlocking(tcb_idx: u32, buf: [*]u8, len: u32, nonblock: bool) i64 {
     // instead of waiting for the maintenance tick.
     if (r > 0) _ = lo_dev.drain();
     return r;
+}
+
+/// Sleep until the receive ring has data, the peer closes or resets, or a
+/// signal arrives; 0 = look again. Used by a blocking MSG_PEEK, which must
+/// leave the data in place (so it cannot reuse the consuming wait).
+pub fn tcpWaitReadable(tcb_idx: u32) i64 {
+    while (true) {
+        {
+            const lock_flags = tcp_lock.acquire();
+            defer tcp_lock.release(lock_flags);
+            if (tcb_idx >= MAX_CONNECTIONS) return -1;
+            const tcb = &tcbs[tcb_idx];
+            if (!tcb.active) return -9;
+            if (tcp_recv_policy.shutRdEof(tcb.shut_rd)) return 0;
+            const available = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
+            const decision = tcp_recv_policy.decide(tcb.state, available, tcb.reset_by_peer);
+            if (decision != .would_block) return 0;
+        }
+        _ = lo_dev.drain();
+        const w = @import("../fs/poll.zig").waitSlice(null);
+        if (w < 0) return w;
+    }
 }
 
 fn tcpRecvBlockingWait(tcb_idx: u32, buf: [*]u8, len: u32, nonblock: bool) i64 {

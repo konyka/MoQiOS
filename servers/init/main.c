@@ -291,6 +291,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello162"); /* remaining timeout written back by ppoll/pselect6/select */
     run_test("hello163"); /* socketpair(AF_UNIX, SOCK_DGRAM) */
     run_test("hello164"); /* SCM_CREDENTIALS / SO_PASSCRED */
+    run_test("hello165"); /* MSG_PEEK / MSG_WAITALL / MSG_TRUNC */
 
     start_persistent_services();
 

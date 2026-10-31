@@ -197,6 +197,8 @@ pub const RightsOut = struct {
     dropped: bool = false,
     /// Credentials of the sender of the bytes just read.
     cred: @import("sockopt_policy.zig").Cred = .{},
+    /// Real length of the datagram just read (it may exceed what fitted).
+    full_len: usize = 0,
     count: usize = 0,
     descs: [MAX_RIGHTS_FDS]vfs.FileDescriptor = undefined,
 };
@@ -760,6 +762,51 @@ pub fn unixReadable(idx: u32) u32 {
     return @min(@as(u32, lo) | (@as(u32, hi) << 8), sock.buf_count - 2);
 }
 
+/// MSG_PEEK: copy what a read would return without consuming it. A stream
+/// peek returns up to `len` of the queued bytes; a datagram peek the head of
+/// the next message. Returns the count (the datagram's real length in
+/// `full_len`), 0 at EOF, -EAGAIN when nothing is queued. No wake-ups, no
+/// descriptor sets delivered or released: the state is left exactly as it was.
+pub fn unixPeek(idx: u32, buf: [*]u8, len: usize, full_len: *usize) i64 {
+    if (idx >= MAX_UNIX_SOCKETS) return -9;
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+    const sock = &unix_sockets[idx];
+    if (!sock.active) return -9;
+    if (sock.buf_count == 0) {
+        if (sock.sock_type == SOCK_STREAM and !sock.connected and !queuedOnBacklogLocked(idx)) return 0;
+        if (shutEofLocked(idx)) return 0;
+        return -11;
+    }
+    if (sock.sock_type == SOCK_STREAM) {
+        const n = @min(len, @as(usize, sock.buf_count));
+        ringRead(&sock.buffer, sock.buf_read, buf, n);
+        full_len.* = sock.buf_count;
+        return @intCast(n);
+    }
+    if (sock.buf_count < 2) return -11;
+    const lo = sock.buffer[sock.buf_read];
+    const hi = sock.buffer[(sock.buf_read + 1) % UNIX_SOCK_BUF_SIZE];
+    const dgram_len: usize = @min(@as(usize, lo) | (@as(usize, hi) << 8), @as(usize, sock.buf_count) - 2);
+    const n = @min(len, dgram_len);
+    ringRead(&sock.buffer, (sock.buf_read + 2) % UNIX_SOCK_BUF_SIZE, buf, n);
+    full_len.* = dgram_len;
+    return @intCast(n);
+}
+
+/// True when socket `idx` is a stream socket (MSG_WAITALL applies).
+pub fn unixIsStream(idx: u32) bool {
+    if (idx >= MAX_UNIX_SOCKETS) return false;
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+    return unix_sockets[idx].active and unix_sockets[idx].sock_type == SOCK_STREAM;
+}
+
+/// Sleep until socket `idx` has something to read (or EOF); 0 = look again.
+pub fn unixWaitReadable(idx: u32) i64 {
+    return parkOn(idx, .read, 0, null);
+}
+
 pub fn unixRecv(idx: u32, buf: [*]u8, len: usize) i64 {
     const r = unixRecvRights(idx, buf, len, null);
     reapZombies();
@@ -858,6 +905,7 @@ pub fn unixRecvRights(idx: u32, buf: [*]u8, len_in: usize, out: ?*RightsOut) i64
         sock.rx_pos += to_read;
         // Discard remaining bytes of this datagram if buf was too small
         const discard: usize = dgram_len - to_read;
+        if (out) |o| o.full_len = dgram_len;
         if (discard > 0) {
             const actual_discard = @min(discard, sock.buf_count);
             sock.buf_read = (sock.buf_read + @as(u32, @intCast(actual_discard))) % UNIX_SOCK_BUF_SIZE;

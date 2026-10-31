@@ -925,6 +925,11 @@ const SchedStats = struct {
 - `EPOLL_CTL_ADD` 沿 child epoll 链（`nestedChainReaches`，visited bitmap 有界）检测间接环，构成环返回 `ELOOP`——环上就绪互相传播会使 `epoll_wait` 永久 busy-loop。（§6.51）
 - MoqIPC receive 被信号/`moqipc_notify` 踢醒时统一清理 `waiting_receiver` 注册并按唤醒来源分类返回：endpoint 失效才报 `invalid_endpoint`，存活 endpoint 的无投递唤醒报 EINTR（信号）/EAGAIN（notify）——注册残留曾让 endpoint 对所有 sender 永久报废。（§6.51）
 - `alarm`/`itimer` deadline 字段与 per-CPU run-queue 的 `nr_running` 计数全部原子访问（tick 扫描器跨 CPU 与 syscall 上下文并发）。（§6.51）
+- **TCP / AF_UNIX 的 `MSG_PEEK`、`MSG_WAITALL` 与 AF_UNIX 数据报的 `MSG_TRUNC`（hello165）**：此前这几个 `recv` 标志只在 UDP 上生效。TCP 与 AF_UNIX 的 `MSG_PEEK` 把数据**消费掉**（协议解析器先 peek 报文头再决定读多少的做法因此全部读丢数据）；`MSG_WAITALL` 在第一个数据块到达就返回；AF_UNIX 数据报的 `MSG_TRUNC` 不报告真实长度。现在：
+  - `MSG_PEEK`：新增不改状态的 `unixPeek`（流：看队列前 n 字节；数据报：看下一条消息头部并给出真实长度）与 `tcpPeek`，不动读指针/`rx_pos`/窗口/ACK、不交付也不释放描述符集；阻塞套接字上的 peek 会睡到有东西可看（`unixWaitReadable`/`tcpWaitReadable`，后者不消费数据，也每个切片泵一次回环队列）。
+  - `MSG_WAITALL`（`recv_flags_policy.waitAll`：仅流套接字、仅阻塞、不与 `MSG_PEEK` 同用）：循环读到缓冲区装满；中途遇到 EOF、错误或信号就返回已读到的字节（`waitAllStep`）。
+  - `MSG_TRUNC`：AF_UNIX 数据报读取时 `RightsOut.full_len` 带回消息真实长度，缓冲区更小则返回真实长度。
+  已知差异：`recvmsg` 的 `MSG_PEEK`/`MSG_WAITALL` 未接（`recvfrom` 路径已接）；`MSG_TRUNC` 对流套接字无意义。
 - **AF_UNIX 的 `SO_PASSCRED` 与 `SCM_CREDENTIALS`（hello164）**：此前 `setsockopt(SO_PASSCRED)` 返回 `ENOPROTOOPT`，`recvmsg` 永远不带凭据，`sendmsg` 带 `SCM_CREDENTIALS` 直接 `EINVAL`；依赖它识别对端的守护进程（D-Bus、systemd 风格的 socket 激活服务）无法工作（只有连接时快照的 `SO_PEERCRED` 可用）。现在：
   - `SO_PASSCRED`（16）是普通布尔选项（`sockopt_policy.flagBit` 新增位 32），可 set/get。
   - 每个 AF_UNIX 套接字记录写入其环的**最近一个发送者**的凭据（`sender_cred`：线程组 id、真实 uid/gid；`sendmsg` 带显式 `SCM_CREDENTIALS` 时记录经校验的那组），`unixRecvRights` 读出时随数据一并取走。

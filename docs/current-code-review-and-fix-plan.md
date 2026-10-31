@@ -5725,3 +5725,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 新增 2 个测试（凭据消息布局、截断、解析、声明校验与能力隔离；`SO_PASSCRED` 位与接线）；hello164（A 未设置时不带控制数据、B 设置后附带 12 字节凭据且值正确、C 控制缓冲区太小得 `MSG_CTRUNC`、D 显式凭据与伪造 pid、E 数据报逐条携带）在 HEAD 上 8 项 FAIL，新内核 PASS。
 - 变异：凭据的 gid 字段写错、uid 声明被别的能力放行、pid 声明被 uid 能力放行、缓冲区下限放宽、`written` 不按 `cap` 截断、`SO_PASSCRED` 位与别的选项冲突，都被具名 host 测试抓住。**最初有两个变异没被抓住**：“pid 声明只要有 uid 能力就放行”和“接受长度超过 12 字节的凭据载荷”，说明测试缺少“别的能力不能顶替 pid 能力”和“超长载荷无效”两类用例，已补；补后前者被具名测试抓住，后者让测试以 `ABRT` 崩溃（越界读）被抓住——崩溃也算抓住，但不是具名断言失败。我最初的变异脚本只认 “failed” 字样，把崩溃和编译错误都误报成“未抓住”，另有一次变异因多余参数编译失败不算证据，已逐个重做并核对输出。
 - 验证：host 828/828；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello164 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### TCP / AF_UNIX 的 MSG_PEEK、MSG_WAITALL 与 AF_UNIX 数据报的 MSG_TRUNC（hello165）
+
+- 问题：这三个 `recv` 标志只对 UDP 生效（hello144 起）；TCP/AF_UNIX 上 `MSG_PEEK` 会消费数据、`MSG_WAITALL` 不等满、AF_UNIX 数据报 `MSG_TRUNC` 不报真实长度。按“先 peek 头部再读整包”写的协议解析器会丢数据。
+- 修复：`net/recv_flags_policy.zig`（`peek/truncReportsFullLength/waitAll/waitAllStep`）；`unixPeek`、`tcpPeek`、`unixWaitReadable`、`tcpWaitReadable`；`recvfrom` 的 AF_UNIX 与 TCP 分支接入；`RightsOut.full_len`。
+- 已知差异：`recvmsg` 未接 `MSG_PEEK`/`MSG_WAITALL`。
+- TDD：host 新增 2 个测试（标志规则与 WAITALL 循环状态机；peek 函数体中不出现任何会推进读指针的语句）；hello165（A AF_UNIX 流 peek 不消费且可再读、B 数据报 peek 与 `MSG_TRUNC`、C TCP peek、D 两种流上 `MSG_WAITALL` 等两段到齐、E 对端提前关闭时 `WAITALL` 返回已有字节不挂住）在 HEAD 上 7 项 FAIL，新内核 PASS。
+- 变异（逐个核对失败的是具名测试）：`WAITALL` 忽略 `PEEK`、`WAITALL` 用于数据报、非阻塞也 `WAITALL`、循环终止条件 `>=` 改 `>`、`0` 字节也继续循环、`unixPeek` 消费数据、`tcpPeek` 推进读指针，七个变异全部被具名 host 测试抓住。过程中我的第一个变异脚本把正则写错（转义），把全部结果都报成“未抓住”，另有两个变异因多余参数编译失败；修好脚本、改用能编译的变异后重做并核对了输出，才有上述结论。
+- 验证：host 830/830；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello165 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

@@ -8444,3 +8444,42 @@ test "SO_PASSCRED is a stored boolean and the receive path honours it" {
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "sp.buildCredentials(out.cred.pid") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "rights.cred_override") != null);
 }
+
+test "recv flags: peek, truncation report and MSG_WAITALL rules" {
+    const rf = kt.recv_flags_policy;
+    try std.testing.expect(rf.peek(0x2));
+    try std.testing.expect(rf.peek(0x2 | 0x40));
+    try std.testing.expect(!rf.peek(0x40));
+    try std.testing.expect(rf.truncReportsFullLength(0x20));
+    try std.testing.expect(!rf.truncReportsFullLength(0x2));
+    // WAITALL: streams only, blocking only, never with PEEK.
+    try std.testing.expect(rf.waitAll(0x100, true, false));
+    try std.testing.expect(!rf.waitAll(0x100, false, false));
+    try std.testing.expect(!rf.waitAll(0x100, true, true));
+    try std.testing.expect(!rf.waitAll(0x100 | 0x2, true, false));
+    try std.testing.expect(!rf.waitAll(0, true, false));
+    // The loop: done when full, again while short, stop on EOF / error / signal.
+    try std.testing.expectEqual(rf.Step.done, rf.waitAllStep(8, 3, 5));
+    try std.testing.expectEqual(rf.Step.done, rf.waitAllStep(8, 0, 8));
+    try std.testing.expectEqual(rf.Step.again, rf.waitAllStep(8, 3, 2));
+    try std.testing.expectEqual(rf.Step.again, rf.waitAllStep(8, 3, 1));
+    try std.testing.expectEqual(rf.Step.stop, rf.waitAllStep(8, 3, 0));
+    try std.testing.expectEqual(rf.Step.stop, rf.waitAllStep(8, 3, -4));
+    try std.testing.expectEqual(rf.Step.stop, rf.waitAllStep(8, 3, -11));
+}
+
+test "peek never consumes: the peek entry points do not advance the read cursors" {
+    const us = kt.unix_socket_source;
+    const at = std.mem.indexOf(u8, us, "pub fn unixPeek").?;
+    const end = std.mem.indexOfPos(u8, us, at, "pub fn unixIsStream").?;
+    const body = us[at..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "buf_read = ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "buf_count -= ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "rx_pos +=") == null);
+    const ts = kt.tcp_source;
+    const tat = std.mem.indexOf(u8, ts, "pub fn tcpPeek").?;
+    const tend = std.mem.indexOfPos(u8, ts, tat, "pub fn tcpRecvBlocking").?;
+    const tbody = ts[tat..tend];
+    try std.testing.expect(std.mem.indexOf(u8, tbody, "recv_head = ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tbody, "sendSegment") == null);
+}

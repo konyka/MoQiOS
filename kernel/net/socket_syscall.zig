@@ -517,10 +517,42 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         const to_read = @min(len, 8192);
         if (!copy.validateUserBufferWritable(buf, to_read)) return -14; // EFAULT
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
-        const result = net_mod.unix_socket.unixRecvBlocking(unix_idx, &tmp_buf, to_read, @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, flags));
+        const rf = @import("recv_flags_policy.zig");
+        const nonblock_u = @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, flags);
+        var full_len_u: usize = 0;
+        var result: i64 = undefined;
+        if (rf.peek(flags)) {
+            result = net_mod.unix_socket.unixPeek(unix_idx, &tmp_buf, to_read, &full_len_u);
+            // Like a blocking read, a peek waits for something to look at.
+            while (result == -11 and !nonblock_u) {
+                const w = net_mod.unix_socket.unixWaitReadable(unix_idx);
+                if (w != 0) return w;
+                result = net_mod.unix_socket.unixPeek(unix_idx, &tmp_buf, to_read, &full_len_u);
+            }
+        } else {
+            var rights_out: net_mod.unix_socket.RightsOut = .{};
+            const is_stream_u = net_mod.unix_socket.unixIsStream(unix_idx);
+            result = net_mod.unix_socket.unixRecvBlockingRights(unix_idx, &tmp_buf, to_read, nonblock_u, &rights_out);
+            full_len_u = rights_out.full_len;
+            for (rights_out.descs[0..rights_out.count]) |*d| vfs_mod.releaseDescriptor(d);
+            // MSG_WAITALL: keep reading until the buffer is full (stream only).
+            if (result > 0 and rf.waitAll(flags, is_stream_u, nonblock_u)) {
+                var got: usize = @intCast(result);
+                while (rf.waitAllStep(to_read, got, 1) == .again) {
+                    var more: net_mod.unix_socket.RightsOut = .{};
+                    const r2 = net_mod.unix_socket.unixRecvBlockingRights(unix_idx, @as([*]u8, @ptrCast(&tmp_buf)) + got, to_read - got, false, &more);
+                    for (more.descs[0..more.count]) |*d| vfs_mod.releaseDescriptor(d);
+                    if (rf.waitAllStep(to_read, got, r2) == .stop) break;
+                    got += @intCast(r2);
+                }
+                result = @intCast(got);
+            }
+        }
         if (result > 0) {
             const copied = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf))[0..@intCast(result)], @intCast(result));
             if (copied != @as(usize, @intCast(result))) return -14; // EFAULT
+            // MSG_TRUNC on a datagram socket reports the real message length.
+            if (rf.truncReportsFullLength(flags) and full_len_u > @as(usize, @intCast(result))) return @intCast(full_len_u);
         }
         return result;
     } else if (t.fd_table.fds[fd].fd_type == .tcp_socket) {
@@ -530,7 +562,28 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         if (!copy.validateUserBufferWritable(buf, to_read)) return -14; // EFAULT
         const tcb_idx = t.fd_table.fds[fd].tcb_idx;
         const nonblock = net_mod.tcp_recv_policy.nonblockRequested(t.fd_table.fds[fd].status_flags, flags);
-        const result = net_mod.tcp.tcpRecvBlocking(tcb_idx, &tmp_buf, to_read, nonblock);
+        const rf = @import("recv_flags_policy.zig");
+        var result: i64 = undefined;
+        if (rf.peek(flags)) {
+            result = net_mod.tcp.tcpPeek(tcb_idx, &tmp_buf, to_read);
+            while (result == -11 and !nonblock) {
+                const w = net_mod.tcp.tcpWaitReadable(tcb_idx);
+                if (w != 0) return w;
+                result = net_mod.tcp.tcpPeek(tcb_idx, &tmp_buf, to_read);
+            }
+        } else {
+            result = net_mod.tcp.tcpRecvBlocking(tcb_idx, &tmp_buf, to_read, nonblock);
+            // MSG_WAITALL: keep reading until the buffer is full or the stream ends.
+            if (result > 0 and rf.waitAll(flags, true, nonblock)) {
+                var got: usize = @intCast(result);
+                while (rf.waitAllStep(to_read, got, 1) == .again) {
+                    const r2 = net_mod.tcp.tcpRecvBlocking(tcb_idx, @as([*]u8, @ptrCast(&tmp_buf)) + got, @intCast(to_read - got), false);
+                    if (rf.waitAllStep(to_read, got, r2) == .stop) break;
+                    got += @intCast(r2);
+                }
+                result = @intCast(got);
+            }
+        }
         if (result > 0) {
             const copied = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf))[0..@intCast(result)], @intCast(result));
             if (copied != @as(usize, @intCast(result))) return -14; // EFAULT
