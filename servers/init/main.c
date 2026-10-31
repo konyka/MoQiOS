@@ -279,6 +279,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello150"); /* blocking AF_UNIX stream writes */
     run_test("hello151"); /* read/write on TCP socket descriptors */
     run_test("hello152"); /* read() returns what is available */
+    run_test("hello153"); /* AF_UNIX shutdown half-close semantics */
 
     start_persistent_services();
 

@@ -5607,3 +5607,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 新增 2 个测试；hello152（管道 3000、AF_UNIX 4096/8192、TCP 4096/8192 字节，读取量大于已排队字节数，读者在子进程里以便超时可控）在 HEAD 上停在 AF_UNIX 一项，新内核 PASS（连续 3 次）。
 - 变异：`readContinues` 恒返回 true → host 测试失败；恢复后通过。
 - 验证：host 804/804；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello152 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### AF_UNIX shutdown(2) 半关闭语义（hello153）
+
+- 问题：`unixShutdown` 不保存任何状态。`shutdown(SHUT_WR)` 后对端读到的是 `EAGAIN` 而不是 EOF，阻塞读者被唤醒后重新睡下；本端继续写还能成功；`SHUT_RD` 什么也不做。依赖半关闭做“请求结束”信号的程序（客户端发完请求后 `shutdown(SHUT_WR)` 再等回复）会永远等不到对端的 EOF。（已知限制里“AF_UNIX `SHUT_WR` 的 EOF 语义”一项。）
+- 修复：`UnixSocket` 增加 `shut_rd`/`shut_wr`；纯策略 `halfCloseReadEof`/`halfCloseSendBroken` 由接收（空环读 EOF）、发送（EPIPE）、`parkOn` 读条件、`sendRoomLocked`、epoll 就绪共用；`unixShutdown` 唤醒本端与对端的读/写等待者。
+- 已知差异：数据报套接字没有半关闭状态；`SHUT_WR` 之后本端挂起的阻塞写者被唤醒后得到 `EPIPE`。
+- TDD：host 新增 2 个测试（半关闭判定、epoll 就绪）；hello153（A `SHUT_WR`：对端先读完已发数据再读 EOF、本端写 `EPIPE`、反方向可用；B `SHUT_RD`；C `SHUT_RDWR`；D 阻塞读者被对端 `SHUT_WR` 唤醒）在 HEAD 上 10 项 FAIL，新内核 PASS。
+- 变异：`halfCloseReadEof` 去掉 `peer_shut_wr` 一项 → host 测试 `shutdown half-close` 失败；恢复后通过。
+- 验证：host 806/806；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello153 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

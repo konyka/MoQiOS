@@ -7971,3 +7971,38 @@ test "file_io.read consults readiness before a follow-up chunk on non-file descr
     const src = kt.file_io_source;
     try std.testing.expect(std.mem.indexOf(u8, src, "readContinues(regular") != null);
 }
+
+test "shutdown half-close: EOF and EPIPE follow the shut direction only" {
+    const np = kt.namespace_policy;
+    const none: np.HalfClose = .{};
+    try std.testing.expect(!np.halfCloseReadEof(none));
+    try std.testing.expect(!np.halfCloseSendBroken(none));
+    // This end SHUT_WR: it cannot send; its own reads are unaffected.
+    const wr: np.HalfClose = .{ .shut_wr = true };
+    try std.testing.expect(np.halfCloseSendBroken(wr));
+    try std.testing.expect(!np.halfCloseReadEof(wr));
+    // The peer SHUT_WR: this end reads EOF once drained, and can still send.
+    const peer_wr: np.HalfClose = .{ .peer_shut_wr = true };
+    try std.testing.expect(np.halfCloseReadEof(peer_wr));
+    try std.testing.expect(!np.halfCloseSendBroken(peer_wr));
+    // This end SHUT_RD: reads EOF locally; the peer's sends fail (seen from the peer as peer_shut_rd).
+    const rd: np.HalfClose = .{ .shut_rd = true };
+    try std.testing.expect(np.halfCloseReadEof(rd));
+    try std.testing.expect(!np.halfCloseSendBroken(rd));
+    const peer_rd: np.HalfClose = .{ .peer_shut_rd = true };
+    try std.testing.expect(np.halfCloseSendBroken(peer_rd));
+    try std.testing.expect(!np.halfCloseReadEof(peer_rd));
+}
+
+test "unix epoll: a shut-down stream is readable (EOF) and writable (EPIPE)" {
+    const up = kt.unix_epoll_policy;
+    const base: up.State = .{ .stream = true, .rx_bytes = 0, .listening = false, .pending_connections = 0, .disconnected = false, .peer_free = 100 };
+    try std.testing.expectEqual(@as(u32, up.EPOLLOUT), up.events(base));
+    var eof = base;
+    eof.read_eof = true;
+    try std.testing.expectEqual(@as(u32, up.EPOLLIN | up.EPOLLOUT), up.events(eof));
+    var broken = base;
+    broken.send_broken = true;
+    broken.peer_free = null;
+    try std.testing.expectEqual(@as(u32, up.EPOLLOUT), up.events(broken));
+}

@@ -88,6 +88,9 @@ pub const UnixSocket = struct {
     /// Set on connect/accept and kept after the peer closes, so a later send says
     /// EPIPE rather than ENOTCONN.
     was_connected: bool = false,
+    /// shutdown(SHUT_RD) / shutdown(SHUT_WR) happened on this end.
+    shut_rd: bool = false,
+    shut_wr: bool = false,
     // Wait queues
     read_waiters: ?*WaitNode = null,
     write_waiters: ?*WaitNode = null,
@@ -100,6 +103,25 @@ pub const UnixSocket = struct {
 
 var unix_sockets: [MAX_UNIX_SOCKETS]UnixSocket = @splat(.{});
 var unix_lock: IrqSpinlock = .{};
+
+/// Half-close view of stream socket `idx` and the peer it is paired with (unix_lock held).
+fn halfCloseLocked(idx: u32) np.HalfClose {
+    const sock = &unix_sockets[idx];
+    var h: np.HalfClose = .{ .shut_rd = sock.shut_rd, .shut_wr = sock.shut_wr };
+    if (sock.peer_idx < MAX_UNIX_SOCKETS) {
+        const peer = &unix_sockets[sock.peer_idx];
+        if (peer.active and peer.peer_idx == @as(u8, @intCast(idx))) {
+            h.peer_shut_rd = peer.shut_rd;
+            h.peer_shut_wr = peer.shut_wr;
+        }
+    }
+    return h;
+}
+
+/// An empty ring on stream `idx` reads EOF because of a shutdown (unix_lock held).
+fn shutEofLocked(idx: u32) bool {
+    return unix_sockets[idx].sock_type == SOCK_STREAM and np.halfCloseReadEof(halfCloseLocked(idx));
+}
 
 // ── SCM_RIGHTS: descriptors in flight ──────────────────────────────────────
 //
@@ -623,6 +645,7 @@ pub fn unixSendRights(idx: u32, data: [*]const u8, len: usize, rights: ?*RightsI
         // Validate the back-reference: after a slot realloc, peer_idx could
         // name an unrelated socket — never deliver data to it.
         if (!peer.connected or peer.peer_idx != @as(u8, @intCast(idx))) return -32; // EPIPE
+        if (np.halfCloseSendBroken(halfCloseLocked(idx))) return -32; // EPIPE: shutdown(SHUT_WR) here or SHUT_RD at the peer
         const n: usize = @min(len, UNIX_SOCK_BUF_SIZE - peer.buf_count);
         if (carrying and n > 0) {
             const slot = freeRightsSlotLocked() orelse return -105; // ENOBUFS
@@ -736,6 +759,7 @@ pub fn unixRecvRights(idx: u32, buf: [*]u8, len_in: usize, out: ?*RightsOut) i64
         // STREAM with no peer (never connected, or peer closed): no data can
         // ever arrive — report EOF instead of EAGAIN.
         if (sock.sock_type == SOCK_STREAM and !sock.connected and !queuedOnBacklogLocked(idx)) return 0;
+        if (shutEofLocked(idx)) return 0;
         return -11; // EAGAIN
     }
 
@@ -987,7 +1011,7 @@ fn parkOn(idx: u32, kind: WaitKind, min_room: u32, deadline: ?u64) i64 {
         // The condition may have changed between the caller's check and now;
         // the wake side holds this same lock, so re-testing here loses no wake-up.
         const still = switch (kind) {
-            .read => sock.buf_count == 0 and (sock.sock_type != SOCK_STREAM or sock.connected or queuedOnBacklogLocked(idx)),
+            .read => sock.buf_count == 0 and !shutEofLocked(idx) and (sock.sock_type != SOCK_STREAM or sock.connected or queuedOnBacklogLocked(idx)),
             .accept => sock.backlog_count == 0 and sock.listening,
             // A writer waits while the peer's ring has no room; with no peer
             // to wait for the caller re-tries and gets the real error.
@@ -1137,8 +1161,22 @@ pub fn unixAcceptBlocking(idx: u32, nonblock: bool) i32 {
     }
 }
 
-/// shutdown(how): SHUT_RD(0) / SHUT_WR(1) / SHUT_RDWR(2). A stream's peer sees
-/// EOF after SHUT_WR; an unconnected socket is ENOTCONN.
+/// Wake every task parked on a wait list (unix_lock held).
+fn wakeWaitList(head: *?*WaitNode) void {
+    var cur = head.*;
+    while (cur) |node| {
+        cur = node.next;
+        @atomicStore(bool, &node.granted, true, .release);
+        @import("../proc/task.zig").unblockTask(node.task_idx);
+    }
+    head.* = null;
+}
+
+/// shutdown(how): SHUT_RD(0) / SHUT_WR(1) / SHUT_RDWR(2). The flags are kept
+/// per end: SHUT_WR makes this end's sends fail (EPIPE) and the peer read EOF
+/// once its ring is drained; SHUT_RD makes this end read EOF and the peer's
+/// sends fail. The opposite direction keeps working. An unconnected socket is
+/// ENOTCONN.
 pub fn unixShutdown(idx: u32, how: u32) i64 {
     if (how > 2) return -22;
     if (idx >= MAX_UNIX_SOCKETS) return -9;
@@ -1149,20 +1187,25 @@ pub fn unixShutdown(idx: u32, how: u32) i64 {
     const sock = &unix_sockets[idx];
     if (!sock.active) return -9;
     if (!sock.connected) return -107; // ENOTCONN
-    if (how == 0) return 0;
-    // SHUT_WR / SHUT_RDWR: the peer reads EOF from now on. Closing the sending
-    // direction is modelled by disconnecting the peer's view of this socket.
+    const shut_rd = how == 0 or how == 2;
+    const shut_wr = how == 1 or how == 2;
+    if (sock.sock_type == SOCK_STREAM) {
+        if (shut_rd) sock.shut_rd = true;
+        if (shut_wr) sock.shut_wr = true;
+    }
+    // Everyone whose wait condition just changed: this end's readers (EOF) and
+    // writers (EPIPE), and the same on the peer.
+    if (shut_rd or shut_wr) {
+        wake.hup |= EpollWake.bit(idx);
+        wakeWaitList(&sock.read_waiters);
+        wakeWaitList(&sock.write_waiters);
+    }
     if (sock.peer_idx < MAX_UNIX_SOCKETS) {
         const peer = &unix_sockets[sock.peer_idx];
         if (peer.active and peer.peer_idx == @as(u8, @intCast(idx))) {
             wake.hup |= EpollWake.bit(sock.peer_idx);
-            var cur = peer.read_waiters;
-            while (cur) |node| {
-                cur = node.next;
-                @atomicStore(bool, &node.granted, true, .release);
-                @import("../proc/task.zig").unblockTask(node.task_idx);
-            }
-            peer.read_waiters = null;
+            wakeWaitList(&peer.read_waiters);
+            wakeWaitList(&peer.write_waiters);
         }
     }
     return 0;
@@ -1196,7 +1239,9 @@ pub fn unixEpollEvents(idx: u32) u32 {
         .rx_bytes = sock.buf_count,
         .listening = sock.listening,
         .pending_connections = sock.backlog_count,
-        .disconnected = !sock.connected,
+        .disconnected = !sock.connected or (sock.sock_type == SOCK_STREAM and np.halfCloseReadEof(halfCloseLocked(idx)) and np.halfCloseSendBroken(halfCloseLocked(idx))),
+        .read_eof = sock.sock_type == SOCK_STREAM and np.halfCloseReadEof(halfCloseLocked(idx)),
+        .send_broken = sock.sock_type == SOCK_STREAM and np.halfCloseSendBroken(halfCloseLocked(idx)),
         .connect_pending = sock.sock_type == SOCK_STREAM and !sock.connected and queuedOnBacklogLocked(idx),
         .peer_free = sendRoomLocked(idx),
     });
@@ -1211,6 +1256,7 @@ fn sendRoomLocked(idx: u32) ?u32 {
     const peer = &unix_sockets[peer_i];
     if (sock.sock_type == SOCK_STREAM) {
         if (!sock.connected or !peer.connected or peer.peer_idx != @as(u8, @intCast(idx))) return null;
+        if (np.halfCloseSendBroken(halfCloseLocked(idx))) return null;
     }
     return UNIX_SOCK_BUF_SIZE - peer.buf_count;
 }

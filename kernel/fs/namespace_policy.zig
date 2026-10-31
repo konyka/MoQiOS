@@ -221,6 +221,22 @@ pub fn socketFdErrno(fd_open: bool, is_socket: bool) i64 {
     return if (is_socket) 0 else -88; // ENOTSOCK
 }
 
+/// Half-close state of a stream socket pair (shutdown(2)). `shut_rd`/`shut_wr`
+/// are this end's flags, `peer_*` the other end's.
+pub const HalfClose = struct { shut_rd: bool = false, shut_wr: bool = false, peer_shut_rd: bool = false, peer_shut_wr: bool = false };
+
+/// An empty receive ring reads EOF once this end shut its read side or the
+/// peer shut its write side (the peer's earlier bytes are still delivered first).
+pub fn halfCloseReadEof(h: HalfClose) bool {
+    return h.shut_rd or h.peer_shut_wr;
+}
+
+/// A send fails with EPIPE once this end shut its write side or the peer shut
+/// its read side.
+pub fn halfCloseSendBroken(h: HalfClose) bool {
+    return h.shut_wr or h.peer_shut_rd;
+}
+
 pub const StreamView = struct { connected: bool, queued: bool };
 pub const StreamSend = enum { deliver, queue_pending, not_connected };
 

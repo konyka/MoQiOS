@@ -21,6 +21,10 @@ pub const State = struct {
     /// STREAM only: connect() queued this socket on a listener's backlog and
     /// accept() has not run yet; it is neither readable, writable nor hung up.
     connect_pending: bool = false,
+    /// STREAM only: an empty ring reads EOF (shutdown) - readable.
+    read_eof: bool = false,
+    /// STREAM only: a send fails at once (shutdown) - writable.
+    send_broken: bool = false,
     /// Free bytes in the ring of the peer this socket sends into; null when
     /// there is no valid peer to block on (send fails immediately instead).
     peer_free: ?u32,
@@ -28,7 +32,8 @@ pub const State = struct {
 
 pub fn events(s: State) u32 {
     var ev: u32 = 0;
-    if (s.rx_bytes > 0) ev |= EPOLLIN;
+    if (s.rx_bytes > 0 or s.read_eof) ev |= EPOLLIN;
+    if (s.send_broken) ev |= EPOLLOUT;
     if (s.stream and s.listening) {
         // Linux never reports a listening socket writable or hung up.
         if (s.pending_connections > 0) ev |= EPOLLIN;
