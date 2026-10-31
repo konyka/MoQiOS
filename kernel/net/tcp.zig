@@ -2542,7 +2542,7 @@ fn driveTcbStateMachine(
                     _ = sendSegment(tcb, ACK, undefined, 0);
                     tcpLog("[tcp] remote closed (FIN received)\n");
                     // v53.41: Defer epoll notification outside tcp_lock
-                    pending_events.* |= epoll.EPOLLIN | epoll.EPOLLHUP;
+                    pending_events.* |= epoll.EPOLLIN | epoll.EPOLLHUP | epoll.EPOLLRDHUP;
                     pending_idx.* = tcbIdx(tcb);
                 }
                 // else: FIN deferred — peer will retransmit after we ACK the partial data

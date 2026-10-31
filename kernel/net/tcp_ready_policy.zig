@@ -8,6 +8,9 @@ pub const IN: u32 = 0x001;
 pub const OUT: u32 = 0x004;
 pub const ERR: u32 = 0x008;
 pub const HUP: u32 = 0x010;
+/// The peer shut down its writing side (or the connection is gone): reported
+/// as EPOLLRDHUP / POLLRDHUP, only when asked for.
+pub const RDHUP: u32 = 0x2000;
 
 pub const Snapshot = struct {
     /// false = the slot is gone (closed and reaped).
@@ -46,6 +49,7 @@ pub fn events(s: Snapshot) u32 {
     };
     const read_done = peer_fin or s.shut_rd or s.state == .closed;
     if (s.recv_bytes > 0 or read_done) ev |= IN;
+    if (peer_fin or s.state == .closed) ev |= RDHUP;
     if (we_fin) {
         ev |= OUT;
     } else if (s.send_space > 0) {

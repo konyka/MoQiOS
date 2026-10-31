@@ -5656,3 +5656,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 新增 2 个测试（`events` 覆盖空闲/有数据/发送环满/CLOSE_WAIT/SHUT_RD/双向结束/FIN_WAIT_2/已关闭/已回收/RST/握手中/监听，以及 poll 与 epoll 都调用 `tcpReadiness`）；hello157（空闲连接 poll 只报 POLLOUT 且 epoll 无 EPOLLERR、数据可读、对端 FIN 后可读可写无错误、本端 SHUT_RD 后 poll/epoll 都报可读）在 HEAD 上 4 项 FAIL，新内核 PASS。
 - 变异：`ERR` 恒为真、可读判断去掉 `shut_rd`、`close_wait` 不算对端已 FIN、`HUP` 只看 `read_done`，四个变异都被 host 测试抓住（全部是测试失败，不是编译错误）。
 - 验证：host 813/813；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello157 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### EPOLLRDHUP / POLLRDHUP（hello158）
+
+- 问题：hello157 记录的已知差异：`EPOLLRDHUP` 不存在，epoll/poll 无法在不读的情况下发现对端半关闭；在 Linux 上这是 `epoll` 事件循环（libevent、nginx、tokio 等）检测对端 `shutdown(SHUT_WR)` 的标准手段。
+- 修复：`tcp_ready_policy.RDHUP`（0x2000）与 `events` 中对端 FIN/已关闭状态置位；`epoll.EPOLLRDHUP` 常量；收到对端 FIN 时唤醒带 `EPOLLRDHUP`；请求过滤沿用既有的“就绪位与兴趣掩码相交”。
+- 已知差异：AF_UNIX 没有 `RDHUP`；`EPOLLPRI` 仍未实现。
+- 排查过程（如实）：探测第一次运行时 A 段全部失败，原因是我选的端口 18160 落在 hello155 用的 18160–18163 范围里（前一个测试的 TIME_WAIT 连接还占着），不是内核问题，换成 18170 后 A 段通过，真正的红灯只有 B 段 2 项。
+- TDD：host 新增 2 个测试（`RDHUP` 随对端 FIN 的所有状态而置位、本端自己的 `SHUT_RD`/`SHUT_WR` 不置位、唤醒带 RDHUP）；hello158（空闲连接不报、对端 `SHUT_WR` 后 epoll 与 poll 报 RDHUP 并带 IN、未请求时不报）在 HEAD 上 2 项 FAIL，新内核 PASS。
+- 变异：`RDHUP` 改成跟随 `read_done`（本端 `SHUT_RD` 也会触发）、`RDHUP` 去掉 `closed` 状态，各自被 host 测试抓住（均为测试失败）。已有的 hello157 host 测试在加入 `RDHUP` 后需要同步（`CLOSE_WAIT` 现在带 RDHUP），已更新。
+- 验证：host 815/815；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1 与 GPT SMP=2 hello158 PASS、0 FAIL；SMP=8 第一次停在 hello144 D 段（已知的间歇性停顿，0 个 FAIL），重跑 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

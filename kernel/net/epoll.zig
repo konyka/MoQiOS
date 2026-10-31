@@ -31,6 +31,7 @@ pub const EPOLLIN: u32 = 0x001;
 pub const EPOLLOUT: u32 = 0x004;
 pub const EPOLLERR: u32 = 0x008;
 pub const EPOLLHUP: u32 = 0x010;
+pub const EPOLLRDHUP: u32 = 0x2000;
 pub const EPOLLET: u32 = 0x80000000;
 pub const EPOLLONESHOT: u32 = 0x40000000;
 

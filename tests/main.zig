@@ -8099,7 +8099,7 @@ test "tcp readiness: idle, data, peer EOF, our SHUT_RD, reset, closed" {
     // Peer sent FIN (CLOSE_WAIT): readable (EOF) and still writable, no hang-up yet.
     var cw = idle;
     cw.state = S.close_wait;
-    try std.testing.expectEqual(@as(u32, rd.IN | rd.OUT), rd.events(cw));
+    try std.testing.expectEqual(@as(u32, rd.IN | rd.OUT | rd.RDHUP), rd.events(cw));
     // Our SHUT_RD: a read returns EOF at once.
     var sr = idle;
     sr.shut_rd = true;
@@ -8139,4 +8139,32 @@ test "tcp readiness: idle, data, peer EOF, our SHUT_RD, reset, closed" {
 test "poll and epoll share the TCP readiness function" {
     try std.testing.expect(std.mem.indexOf(u8, kt.poll_source, "tcp_mod.tcpReadiness(desc.tcb_idx)") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.epoll_source, "tcp.tcpReadiness(resource_idx)") != null);
+}
+
+test "tcp readiness: RDHUP follows the peer's FIN, not our own shutdown" {
+    const rd = kt.tcp_ready_policy;
+    const S = kt.tcp_recv_policy.TcpState;
+    const idle: rd.Snapshot = .{ .active = true, .state = S.established, .recv_bytes = 0, .send_space = 100, .reset_by_peer = false, .shut_rd = false, .fin_pending = false };
+    try std.testing.expectEqual(@as(u32, 0), rd.events(idle) & rd.RDHUP);
+    // Peer closed its writing side: CLOSE_WAIT and every state after it.
+    for ([_]S{ S.close_wait, S.last_ack, S.closing, S.time_wait, S.closed }) |st| {
+        var s = idle;
+        s.state = st;
+        try std.testing.expect(rd.events(s) & rd.RDHUP != 0);
+    }
+    // Our own SHUT_RD / SHUT_WR do not make the peer "hang up".
+    var sr = idle;
+    sr.shut_rd = true;
+    try std.testing.expectEqual(@as(u32, 0), rd.events(sr) & rd.RDHUP);
+    var sw = idle;
+    sw.fin_pending = true;
+    try std.testing.expectEqual(@as(u32, 0), rd.events(sw) & rd.RDHUP);
+    var fw = idle;
+    fw.state = S.fin_wait_2;
+    try std.testing.expectEqual(@as(u32, 0), rd.events(fw) & rd.RDHUP);
+    try std.testing.expectEqual(@as(u32, 0x2000), rd.RDHUP);
+}
+
+test "epoll wakes a waiter on the peer's FIN with RDHUP" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "epoll.EPOLLIN | epoll.EPOLLHUP | epoll.EPOLLRDHUP") != null);
 }
