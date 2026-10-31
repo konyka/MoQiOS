@@ -240,3 +240,16 @@ pub fn checksumV6(
     const folded: u16 = @truncate(~sum);
     return if (folded == 0) 0xFFFF else folded;
 }
+
+/// What to put in the reset sent for a segment that matches no connection
+/// (RFC 9293 §3.10.7.1). A segment carrying ACK is answered with
+/// SEQ = its ACK number and no ACK; one without gets SEQ 0 and an ACK that
+/// covers it (its sequence number plus its length, a SYN counting as one).
+/// A segment that is itself a RST is never answered.
+pub const ResetReply = struct { seq: u32, ack: u32, with_ack: bool };
+
+pub fn resetReply(has_ack: bool, ack_num: u32, seq_num: u32, payload_len: u32, syn: bool, fin: bool) ResetReply {
+    if (has_ack) return .{ .seq = ack_num, .ack = 0, .with_ack = false };
+    const extra: u32 = (if (syn) @as(u32, 1) else 0) +% (if (fin) @as(u32, 1) else 0);
+    return .{ .seq = 0, .ack = seq_num +% payload_len +% extra, .with_ack = true };
+}

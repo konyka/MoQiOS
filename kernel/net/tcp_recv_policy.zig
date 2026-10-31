@@ -113,6 +113,34 @@ pub fn shutRdEof(shut_rd: bool) bool {
     return shut_rd;
 }
 
+/// connect() on a socket that is not in the closed state it needs to start.
+/// A handshake in progress is EALREADY; anything else (established, closing,
+/// listening) is EISCONN.
+pub fn connectRejection(state: TcpState) i64 {
+    return switch (state) {
+        .closed => 0,
+        .syn_sent, .syn_received => errno.EALREADY,
+        else => errno.EISCONN,
+    };
+}
+
+pub const ConnectWait = enum { keep_waiting, connected, failed };
+
+/// Where a blocking connect() stands: still handshaking, done, or reset/timed out.
+pub fn connectProgress(state: TcpState) ConnectWait {
+    return switch (state) {
+        .syn_sent, .syn_received => .keep_waiting,
+        .closed => .failed,
+        else => .connected,
+    };
+}
+
+/// errno of a failed connect: what the connection recorded (refused, timed
+/// out), ECONNREFUSED if it recorded nothing.
+pub fn connectFailure(so_error: i32) i64 {
+    return if (so_error > 0) -@as(i64, so_error) else errno.ECONNREFUSED;
+}
+
 /// read() on a connection that never got established (socket(), or a failed
 /// connect) is ENOTCONN, not an orderly EOF.
 pub fn recvNeverConnected(state: TcpState, established_ever: bool) bool {

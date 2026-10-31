@@ -8198,3 +8198,54 @@ test "unix epoll: RDHUP follows the peer's SHUT_WR or disconnect, not our own st
     try std.testing.expectEqual(@as(u32, 0), up.events(ls) & up.EPOLLRDHUP);
     try std.testing.expectEqual(@as(u32, 0x2000), up.EPOLLRDHUP);
 }
+
+test "tcp: a closed port answers with RST per RFC 9293" {
+    const tu = tcp_util;
+    // SYN without ACK: SEQ 0, ACK = seq + 1.
+    const r1 = tu.resetReply(false, 0, 1000, 0, true, false);
+    try std.testing.expectEqual(@as(u32, 0), r1.seq);
+    try std.testing.expectEqual(@as(u32, 1001), r1.ack);
+    try std.testing.expect(r1.with_ack);
+    // Data without ACK: ACK covers the payload.
+    const r2 = tu.resetReply(false, 0, 1000, 20, false, false);
+    try std.testing.expectEqual(@as(u32, 1020), r2.ack);
+    // SYN + FIN + payload each count.
+    const r3 = tu.resetReply(false, 0, 10, 5, true, true);
+    try std.testing.expectEqual(@as(u32, 17), r3.ack);
+    // A segment with ACK: SEQ is its ACK number, no ACK in the reset.
+    const r4 = tu.resetReply(true, 5555, 1000, 0, false, false);
+    try std.testing.expectEqual(@as(u32, 5555), r4.seq);
+    try std.testing.expect(!r4.with_ack);
+    // Wrap-around of the acknowledged range.
+    const r5 = tu.resetReply(false, 0, 0xffff_ffff, 0, true, false);
+    try std.testing.expectEqual(@as(u32, 0), r5.ack);
+}
+
+test "tcp connect: rejection, progress and failure mapping" {
+    const rp = kt.tcp_recv_policy;
+    const S = rp.TcpState;
+    try std.testing.expectEqual(@as(i64, 0), rp.connectRejection(S.closed));
+    try std.testing.expectEqual(@as(i64, -114), rp.connectRejection(S.syn_sent));
+    try std.testing.expectEqual(@as(i64, -114), rp.connectRejection(S.syn_received));
+    try std.testing.expectEqual(@as(i64, -106), rp.connectRejection(S.established));
+    try std.testing.expectEqual(@as(i64, -106), rp.connectRejection(S.listen));
+    try std.testing.expectEqual(rp.ConnectWait.keep_waiting, rp.connectProgress(S.syn_sent));
+    try std.testing.expectEqual(rp.ConnectWait.connected, rp.connectProgress(S.established));
+    try std.testing.expectEqual(rp.ConnectWait.failed, rp.connectProgress(S.closed));
+    try std.testing.expectEqual(@as(i64, -111), rp.connectFailure(111));
+    try std.testing.expectEqual(@as(i64, -110), rp.connectFailure(110));
+    try std.testing.expectEqual(@as(i64, -111), rp.connectFailure(0));
+}
+
+test "tcp readiness: a pending SO_ERROR is reported as ERR" {
+    const rd = kt.tcp_ready_policy;
+    const S = kt.tcp_recv_policy.TcpState;
+    const refused: rd.Snapshot = .{ .active = true, .state = S.closed, .recv_bytes = 0, .send_space = 0, .reset_by_peer = false, .shut_rd = false, .fin_pending = false, .so_error = 111 };
+    try std.testing.expect(rd.events(refused) & rd.ERR != 0);
+    try std.testing.expect(rd.events(refused) & rd.HUP != 0);
+    var ok = refused;
+    ok.so_error = 0;
+    ok.state = S.established;
+    ok.send_space = 10;
+    try std.testing.expect(rd.events(ok) & rd.ERR == 0);
+}

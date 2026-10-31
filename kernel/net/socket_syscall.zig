@@ -692,7 +692,7 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) < sa.SOCKADDR_IN6_LEN)
             return -22;
         const parsed = sa.parseInet6(&sa6) orelse return -97;
-        return net_mod.tcp.tcpConnectSocketV6(tcb_idx, parsed.addr, parsed.port);
+        return finishTcpConnect(t, fd, net_mod.tcp.tcpConnectSocketV6(tcb_idx, parsed.addr, parsed.port));
     }
     if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, false)) return -22;
     var sock_addr: [8]u8 = undefined;
@@ -700,7 +700,16 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     if (!@import("socket_address_policy.zig").inet4FamilyValid(bo.readU16BeAt(&sock_addr, 0))) return -97;
     const port = bo.readU16BeAt(&sock_addr, 2);
     const ip = [4]u8{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] };
-    return net_mod.tcp.tcpConnectSocket(tcb_idx, ip, port);
+    return finishTcpConnect(t, fd, net_mod.tcp.tcpConnectSocket(tcb_idx, ip, port));
+}
+
+/// connect() returns once the handshake is started: EINPROGRESS for a
+/// non-blocking socket (completion shows up as POLLOUT, or POLLERR with the
+/// reason in SO_ERROR), otherwise it waits for the outcome.
+fn finishTcpConnect(t: *task_mod.Task, fd: u32, started: i64) i64 {
+    if (started != 0) return started;
+    if (net_mod.tcp_recv_policy.nonblockRequested(t.fd_table.fds[fd].status_flags, 0)) return -115; // EINPROGRESS
+    return net_mod.tcp.tcpWaitConnected(t.fd_table.fds[fd].tcb_idx);
 }
 
 fn copySockaddrToUser(addr_ptr: u64, addrlen_ptr: u64, sa_buf: []const u8, alen: u32) i64 {

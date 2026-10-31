@@ -21,6 +21,8 @@ pub const Snapshot = struct {
     reset_by_peer: bool,
     shut_rd: bool,
     fin_pending: bool,
+    /// Pending socket error (a refused or timed-out connect): reported as ERR.
+    so_error: i32 = 0,
 };
 
 /// Linux tcp_poll semantics:
@@ -33,7 +35,7 @@ pub const Snapshot = struct {
 pub fn events(s: Snapshot) u32 {
     if (!s.active) return HUP | OUT;
     var ev: u32 = 0;
-    if (s.reset_by_peer) ev |= ERR;
+    if (s.reset_by_peer or s.so_error != 0) ev |= ERR;
     switch (s.state) {
         .listen => return if (s.recv_bytes > 0) IN else 0,
         .syn_sent, .syn_received => return ev,

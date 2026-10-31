@@ -322,6 +322,8 @@ const TcpTcb = struct {
     was_established: bool = false,
     /// shutdown(SHUT_RD) happened: reads see EOF, later data is dropped.
     shut_rd: bool = false,
+    /// A RST answered our SYN: connect() fails with ECONNREFUSED.
+    refused: bool = false,
     /// local_port was set by bind(); otherwise connect() treats it as stale.
     bound_explicitly: bool = false,
     /// Zero-window persist probe timer (SK-110).
@@ -797,6 +799,7 @@ fn initTcbState(t: *TcpTcb) void {
     t.reset_by_peer = false;
     t.was_established = false;
     t.shut_rd = false;
+    t.refused = false;
     t.bound_explicitly = false;
     t.persist_timer_ms = 0;
     t.persist_rto_ms = RETRANSMIT_MS;
@@ -2157,6 +2160,8 @@ fn driveTcbStateMachine(
         if (tcb.state == .syn_sent) {
             // RFC 793 §3.4: RST in SYN_SENT is valid if ack_num == iss+1
             if (ack_num == tcb.iss +% 1) {
+                tcb.options.so_error = 111; // ECONNREFUSED
+                tcb.refused = true;
                 closeTcbRemote(tcb);
                 tcpLog("[tcp] RST in SYN_SENT, connection reset\n");
                 return;
@@ -2721,13 +2726,64 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, e
     const tcb = findTcbByTuple(dst_port, src_port, src_ip) orelse {
         // No matching connection — check if any socket is listening on this port
         if (flags & SYN != 0) {
+            const before = pendingBacklogCount();
             handleIncomingSyn(src_ip, src_port, dst_port, seq_num, raw_window, opts, flags);
+            // Nobody listens on the port: a loopback peer is told at once
+            // (RFC 9293 §3.10.7.1) instead of retransmitting its SYN.
+            if (pendingBacklogCount() == before and !hasListener(dst_port, false)) {
+                sendLoopbackReset(src_ip, dst_ip, src_port, dst_port, flags, ack_num, seq_num, payload_len);
+            }
         }
-        // Otherwise send RST (or just ignore)
         return;
     };
 
     driveTcbStateMachine(tcb, seq_num, ack_num, flags, raw_window, opts, data, @intCast(payload_offset), payload_len, &pending_events, &pending_idx, ecn_ce);
+}
+
+/// Listen-backlog entries across all listeners (to tell whether a SYN was accepted).
+fn pendingBacklogCount() u32 {
+    var n: u32 = 0;
+    var lbm = listen_active_bitmap;
+    while (lbm != 0) {
+        const i = @ctz(lbm);
+        lbm &= lbm - 1;
+        n +%= listen_slots[i].pending_tail -% listen_slots[i].pending_head;
+    }
+    return n;
+}
+
+fn hasListener(port: u16, is_v6: bool) bool {
+    var lbm = listen_active_bitmap;
+    while (lbm != 0) {
+        const i = @ctz(lbm);
+        lbm &= lbm - 1;
+        if (listen_slots[i].local_port == port and listen_slots[i].is_v6 == is_v6) return true;
+    }
+    return false;
+}
+
+/// Answer a segment that matches no connection with a RST — loopback only: it
+/// needs no ARP, and a remote host's retransmitted SYNs are not worth a
+/// reflected reset from a host that may be rate-limited or filtered.
+fn sendLoopbackReset(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16, flags: u8, ack_num: u32, seq_num: u32, payload_len: u32) void {
+    if (flags & RST != 0) return;
+    if (!netif.isLoopback(src_ip) or !netif.isLoopback(dst_ip)) return;
+    const reply = tcp_util.resetReply(flags & ACK != 0, ack_num, seq_num, payload_len, flags & SYN != 0, flags & FIN != 0);
+    var pkt: [1518]u8 = undefined;
+    const tcp_off: u16 = 34;
+    @memset(pkt[0 .. tcp_off + 20], 0);
+    bo.writeU16BeAt(&pkt, tcp_off + 0, dst_port);
+    bo.writeU16BeAt(&pkt, tcp_off + 2, src_port);
+    bo.writeU32BeAt(&pkt, tcp_off + 4, reply.seq);
+    bo.writeU32BeAt(&pkt, tcp_off + 8, reply.ack);
+    pkt[tcp_off + 12] = 5 << 4;
+    pkt[tcp_off + 13] = if (reply.with_ack) RST | ACK else RST;
+    const csum = tcpChecksum(dst_ip, src_ip, pkt[tcp_off..].ptr, 20);
+    bo.writeU16BeAt(&pkt, tcp_off + 16, csum);
+    ipv4.buildHeader(pkt[14..].ptr, dst_ip, src_ip, ipv4.PROTO_TCP, 20);
+    const mac = netif.getMac();
+    const frame_len = eth.buildFrame(&pkt, mac, mac, eth.ETHERTYPE_IPV4, 20 + 20);
+    _ = lo_dev.sendPacket(&pkt, frame_len);
 }
 
 fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) void {
@@ -2835,7 +2891,9 @@ pub fn tcpConnectSocket(tcb_idx: u32, remote_ip: [4]u8, remote_port: u16) i64 {
     defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
-    if (!tcb.active or tcb.state != .closed or tcb.is_v6) return -1;
+    if (!tcb.active or tcb.is_v6) return -1;
+    if (tcb.state != .closed) return tcp_recv_policy.connectRejection(tcb.state);
+    tcb.refused = false;
 
     // A nonzero port bind() did not set is a leftover of the slot's previous
     // connection; reusing it could collide with a live TCB's 4-tuple.
@@ -2870,7 +2928,9 @@ pub fn tcpConnectSocketV6(tcb_idx: u32, remote_ip6: [16]u8, remote_port: u16) i6
     defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
-    if (!tcb.active or tcb.state != .closed or !tcb.is_v6) return -1;
+    if (!tcb.active or !tcb.is_v6) return -1;
+    if (tcb.state != .closed) return tcp_recv_policy.connectRejection(tcb.state);
+    tcb.refused = false;
 
     // A nonzero port bind() did not set is a leftover of the slot's previous
     // connection; reusing it could collide with a live TCB's 4-tuple.
@@ -2897,6 +2957,36 @@ pub fn tcpConnectSocketV6(tcb_idx: u32, remote_ip6: [16]u8, remote_port: u16) i6
 
     tcpLog("[tcp] connect v6: SYN sent\n");
     return 0;
+}
+
+/// Block until the handshake started by tcpConnectSocket finishes: 0 when the
+/// connection is established, a negative errno when it was refused or timed
+/// out (the recorded SO_ERROR is consumed), -EINTR on a signal (the handshake
+/// keeps running). The loopback queue is pumped on every pass: a 127/8 peer
+/// answers only when its segments are delivered.
+pub fn tcpWaitConnected(tcb_idx: u32) i64 {
+    if (tcb_idx >= MAX_CONNECTIONS) return -1;
+    const poll = @import("../fs/poll.zig");
+    while (true) {
+        {
+            const lock_flags = tcp_lock.acquire();
+            defer tcp_lock.release(lock_flags);
+            const tcb = &tcbs[tcb_idx];
+            if (!tcb.active) return -9;
+            switch (tcp_recv_policy.connectProgress(tcb.state)) {
+                .connected => return 0,
+                .failed => {
+                    const e = tcp_recv_policy.connectFailure(tcb.options.so_error);
+                    tcb.options.so_error = 0;
+                    return e;
+                },
+                .keep_waiting => {},
+            }
+        }
+        _ = lo_dev.drain();
+        const w = poll.waitSlice(null);
+        if (w < 0) return w;
+    }
 }
 
 /// Poll for connection state. Returns:
@@ -3639,6 +3729,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             if (tcb.retransmit_count > 5) {
                 // Give up
                 tcpLog("[tcp] retransmit timeout, closing\n");
+                if (tcb.state == .syn_sent) tcb.options.so_error = 110; // ETIMEDOUT: connect() fails
                 closeTcbRemote(tcb);
                 return;
             }
@@ -4034,6 +4125,7 @@ pub fn tcpReadiness(tcb_idx: u32) u32 {
         .reset_by_peer = tcb.reset_by_peer,
         .shut_rd = tcb.shut_rd,
         .fin_pending = tcb.fin_pending,
+        .so_error = tcb.options.so_error,
     });
 }
 

@@ -5675,3 +5675,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 新增 1 个测试（RDHUP 随对端 `SHUT_WR`/断开、不随本端自己的标志、数据报与监听不报）；hello159（空闲对不报、对端 `SHUT_WR`、对端关闭，epoll 与 poll）在 HEAD 上 4 项 FAIL，新内核 PASS。
 - 变异：`RDHUP` 对数据报也上报、对 `read_eof`（本端自己的 SHUT_RD）也上报、断开时不带 `RDHUP`，各自被 host 测试抓住（均为测试失败）。`tests/unix_epoll_test.zig` 里“对端关闭”的掩码测试需要同步包含 `EPOLLRDHUP`，已更新。
 - 验证：host 816/816；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1 与 GPT SMP=2 hello159 PASS、0 FAIL；SMP=8 前两次停在 hello144 D 段（已知的间歇性停顿，日志停在同一行，0 个 FAIL），第三次 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### TCP connect() 的完成与失败语义（hello160）
+
+- 问题：`connect()` 发 SYN 后立刻返回 0；对没有监听者的端口，阻塞与非阻塞套接字都看不到失败（`SO_ERROR` 恒为 0、非阻塞没有 `EINPROGRESS`、`poll` 不报错），没有监听者的 SYN 也没有人回 RST，只能等 SYN 重传超限；已连接/握手中的套接字再次 `connect` 得到裸 `-1`。（原“`SO_ERROR` 恒为 0”的已知限制。）
+- 修复：见 `docs/kernel-subsystems.md` 的 hello160 条：`tcp_util.resetReply`、`sendLoopbackReset`、`SYN_SENT` 收到 RST 记 `ECONNREFUSED`、SYN 超限记 `ETIMEDOUT`、`tcpWaitConnected`、非阻塞 `EINPROGRESS`、`tcp_ready_policy` 的 `so_error → ERR`、`connectRejection`（`EISCONN`/`EALREADY`）。
+- 已知差异：非回环目标不回 RST；IPv6 不回 RST；`connect` 超时不受 `SO_SNDTIMEO` 控制。
+- 排查过程（如实）：改完后 hello160 立刻通过，但冒烟里 hello27 变成 `connect=-110`：它连的是 QEMU 用户网络网关 10.0.2.2:80，那里没有 TCP 服务，阻塞 `connect` 如今会等完 SYN 重传（`ETIMEDOUT`），而 hello27 原本靠“connect 立刻返回 0”通过。我没有放宽 hello27 的判断，而是让它用非阻塞 connect（它测的是 socket API 客户端路径，不是握手结果），并在文件里写明原因。hello19 走的是旧的 `tcp_connect` 系统调用，不受影响。
+- TDD：host 新增 3 个测试（`resetReply` 的 RFC 用例含回绕、`connectRejection/connectProgress/connectFailure`、`so_error` 报 `ERR`）；hello160（A：阻塞连关闭端口得 `ECONNREFUSED` 且不等 SYN 超时；B：非阻塞 `EINPROGRESS`、poll 报 `POLLERR`、`SO_ERROR=ECONNREFUSED` 且读后清零）在 HEAD 上 5 项 FAIL，新内核 PASS。
+- 变异：RST 带 ACK 标志、`resetReply` 不计 FIN、`EALREADY` 改 `EISCONN`、`connectFailure` 忽略记录的 errno、`so_error` 不报 `ERR`，五个变异都被 host 测试抓住（全部是测试失败，不是编译错误）。
+- 验证：host 819/819；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello160 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

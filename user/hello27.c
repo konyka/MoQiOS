@@ -49,6 +49,10 @@ static inline int64_t syscall3(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_CONNECT  124
 #define SYS_SENDTO   121
 #define SYS_RECVFROM 122
+#define SYS_FCNTL    142
+#define F_SETFL      4
+#define O_NONBLOCK   0x800
+#define EINPROGRESS_ 115
 
 static void print(const char *s) {
     int len = 0;
@@ -87,10 +91,15 @@ void _start(void) {
     addr[0] = 0x00; addr[1] = 0x02;  /* AF_INET */
     addr[2] = 0x00; addr[3] = 0x50;  /* port 80 big-endian */
     addr[4] = 10; addr[5] = 0; addr[6] = 2; addr[7] = 2;  /* 10.0.2.2 */
+    /* Non-blocking: QEMU's user-mode network has no TCP server behind
+     * 10.0.2.2:80, so a blocking connect() would wait out the whole SYN
+     * retransmission schedule (about two minutes). */
+    syscall3(SYS_FCNTL, (uint64_t)fd, F_SETFL, O_NONBLOCK);
     int64_t cr = syscall3(SYS_CONNECT, (uint64_t)fd, (uint64_t)addr, 16);
     print("hello27: connect=");
     print_dec(cr);
     print("\n");
+    if (cr == -EINPROGRESS_) cr = 0;
     if (cr < 0) {
         print("hello27: connect failed\n");
         ok = 0;

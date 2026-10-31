@@ -286,6 +286,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello157"); /* TCP poll/epoll readiness */
     run_test("hello158"); /* EPOLLRDHUP and POLLRDHUP */
     run_test("hello159"); /* AF_UNIX EPOLLRDHUP and POLLRDHUP */
+    run_test("hello160"); /* TCP connect to a closed port */
 
     start_persistent_services();
 
