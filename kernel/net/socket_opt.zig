@@ -488,6 +488,7 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
     var stored: sp.Stored = .{};
     var facts: sp.Facts = .{ .id = sp.identity(.raw, v6) };
     var tcp_idx: ?u32 = null;
+    var udp_clear: ?u16 = null;
     switch (ref) {
         .tcp => |idx| {
             const tcp_mod = @import("tcp.zig");
@@ -498,7 +499,8 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
         },
         .udp => |port| {
             stored = @import("udp.zig").getPortOpts(port) orelse return -9;
-            facts = .{ .id = sp.identity(.udp, v6) };
+            facts = .{ .id = sp.identity(.udp, v6), .so_error = @import("udp.zig").peekPendingError(port) };
+            udp_clear = port;
         },
         .unix => |idx| {
             const view = @import("unix_socket.zig").unixOptView(idx) orelse return -9;
@@ -517,6 +519,7 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
     if (copy_mod.copyToUser(@ptrFromInt(optlen_ptr), &len_out, 4) != 4) return -14;
     if (optname == SO_ERROR) {
         if (tcp_idx) |idx| @import("tcp.zig").tcpClearSoErrorIfEqual(idx, facts.so_error);
+        if (udp_clear) |p| @import("udp.zig").clearPendingErrorIfEqual(p, facts.so_error);
     }
     return 0;
 }

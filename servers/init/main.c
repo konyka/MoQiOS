@@ -287,6 +287,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello158"); /* EPOLLRDHUP and POLLRDHUP */
     run_test("hello159"); /* AF_UNIX EPOLLRDHUP and POLLRDHUP */
     run_test("hello160"); /* TCP connect to a closed port */
+    run_test("hello161"); /* UDP port unreachable on loopback */
 
     start_persistent_services();
 

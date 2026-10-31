@@ -8249,3 +8249,59 @@ test "tcp readiness: a pending SO_ERROR is reported as ERR" {
     ok.send_space = 10;
     try std.testing.expect(rd.events(ok) & rd.ERR == 0);
 }
+
+test "icmp port unreachable: reply decision, quote length and matching" {
+    const up = kt.icmp_unreach_policy;
+    // Only loopback datagrams that found no socket are answered.
+    try std.testing.expect(up.shouldReply(true, false, false));
+    try std.testing.expect(!up.shouldReply(false, false, false));
+    try std.testing.expect(!up.shouldReply(true, true, false));
+    try std.testing.expect(!up.shouldReply(true, false, true));
+    // IP header plus the first 8 payload bytes, never more than the datagram has.
+    try std.testing.expectEqual(@as(u32, 28), up.quoteLen(20, 100));
+    try std.testing.expectEqual(@as(u32, 24), up.quoteLen(20, 24));
+    try std.testing.expectEqual(@as(u32, 32), up.quoteLen(24, 100));
+
+    // A well-formed message: ICMP header, quoted IP header (UDP), quoted UDP header.
+    var msg: [8 + 20 + 8]u8 = @splat(0);
+    msg[0] = 3;
+    msg[1] = 3;
+    msg[8] = 0x45;
+    msg[8 + 9] = 17;
+    std.mem.writeInt(u16, msg[28..30], 24990, .big);
+    std.mem.writeInt(u16, msg[30..32], 24999, .big);
+    const q = up.parseQuote(&msg).?;
+    try std.testing.expectEqual(@as(u16, 24990), q.src_port);
+    try std.testing.expectEqual(@as(u16, 24999), q.dst_port);
+    // Wrong code, wrong quoted protocol, too short: ignored.
+    var bad = msg;
+    bad[1] = 4;
+    try std.testing.expect(up.parseQuote(&bad) == null);
+    bad = msg;
+    bad[8 + 9] = 6;
+    try std.testing.expect(up.parseQuote(&bad) == null);
+    try std.testing.expect(up.parseQuote(msg[0..30]) == null);
+    // A longer quoted header (IHL 6) moves the UDP header.
+    var long: [8 + 24 + 8]u8 = @splat(0);
+    long[0] = 3;
+    long[1] = 3;
+    long[8] = 0x46;
+    long[8 + 9] = 17;
+    std.mem.writeInt(u16, long[32..34], 1111, .big);
+    std.mem.writeInt(u16, long[34..36], 2222, .big);
+    const ql = up.parseQuote(&long).?;
+    try std.testing.expectEqual(@as(u16, 1111), ql.src_port);
+    try std.testing.expectEqual(@as(u16, 2222), ql.dst_port);
+
+    // Only a socket connected to exactly that peer is affected.
+    try std.testing.expect(up.matchesConnected(q, 24990, true, 24999));
+    try std.testing.expect(!up.matchesConnected(q, 24990, false, 24999));
+    try std.testing.expect(!up.matchesConnected(q, 24990, true, 25000));
+    try std.testing.expect(!up.matchesConnected(q, 24991, true, 24999));
+}
+
+test "udp: the pending error is consulted by recv, SO_ERROR and readiness" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "udp.takePendingError(src_port)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.epoll_source, "peekPendingError(@intCast(resource_idx))") != null);
+    try std.testing.expect(std.mem.count(u8, kt.socket_syscall_source, "udp.setPeerPort(") >= 2);
+}

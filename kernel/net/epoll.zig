@@ -816,6 +816,8 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32, kmsg_cursor: u64
             const udp_mod = @import("udp.zig");
             if (udp_mod.hasQueuedDatagram(@intCast(resource_idx))) revents |= EPOLLIN;
             revents |= EPOLLOUT; // datagram sockets are always writable
+            // A pending ICMP error (port unreachable) is an error condition.
+            if (udp_mod.peekPendingError(@intCast(resource_idx)) != 0) revents |= EPOLLERR;
         },
         .inotify => {
             revents |= EPOLLIN | EPOLLOUT;

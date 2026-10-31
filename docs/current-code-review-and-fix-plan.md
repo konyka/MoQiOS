@@ -5685,3 +5685,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 新增 3 个测试（`resetReply` 的 RFC 用例含回绕、`connectRejection/connectProgress/connectFailure`、`so_error` 报 `ERR`）；hello160（A：阻塞连关闭端口得 `ECONNREFUSED` 且不等 SYN 超时；B：非阻塞 `EINPROGRESS`、poll 报 `POLLERR`、`SO_ERROR=ECONNREFUSED` 且读后清零）在 HEAD 上 5 项 FAIL，新内核 PASS。
 - 变异：RST 带 ACK 标志、`resetReply` 不计 FIN、`EALREADY` 改 `EISCONN`、`connectFailure` 忽略记录的 errno、`so_error` 不报 `ERR`，五个变异都被 host 测试抓住（全部是测试失败，不是编译错误）。
 - 验证：host 819/819；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello160 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### UDP 的 ICMP 端口不可达与 ECONNREFUSED（hello161）
+
+- 问题：回环上发往无人绑定端口的 UDP 数据报被静默丢弃，没有任何 ICMP；已 `connect` 的 UDP 套接字拿不到 `ECONNREFUSED`，`SO_ERROR` 恒为 0，`poll` 不报错。依赖它的程序（DNS 解析器探测本地缓存、`connect`+`send`+`recv` 的探活）会一直等到超时。
+- 修复：`net/icmp_unreach_policy.zig`（`shouldReply`、`quoteLen`、`parseQuote`、`matchesConnected`）；`udp.zig` 的 `portBound/setPeerPort/peekPendingError/takePendingError/clearPendingErrorIfEqual/notifyUnreachable` 与逐端口的 `port_err/port_peer`（随端口槽位一起 swap-remove）；`udp.handlePacket` 发 ICMP；`icmp.handlePacket` 处理 type 3 code 3；`connect` 记录对端端口；`recvfrom`、`getsockopt(SO_ERROR)`、epoll 就绪读取待决错误。
+- 已知差异：只对回环回应；IPv6 没有 ICMPv6 目的不可达；`sendto` 不返回待决错误（Linux 也会在下一次 `send` 失败），只有 `recvfrom`、`SO_ERROR`、poll 看到它。
+- TDD：host 新增 2 个测试（回复决策、引用长度、`parseQuote` 的格式/协议/长度/IHL 边界、匹配规则，以及三个入口都读待决错误）；hello161（A 已连接套接字：poll 报 `POLLERR`、`recv` 返回 `ECONNREFUSED` 且只一次、`SO_ERROR` 可读并清零；B 未连接套接字不受影响；C 绑定端口正常投递且发送方无错误）在 HEAD 上 3 项 FAIL，新内核 PASS。
+- 变异：去掉“仅回环”、去掉“端口未绑定”、匹配时忽略对端端口、不检查被引用协议为 UDP、固定 IHL 为 20，五个变异都被 host 测试抓住（全部是测试失败）。
+- 验证：host 821/821；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello161 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

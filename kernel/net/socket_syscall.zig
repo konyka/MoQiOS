@@ -537,6 +537,10 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         const is_v6 = t.fd_table.fds[fd].udp_is_v6;
         const src_port = t.fd_table.fds[fd].udp_port;
+        // An ICMP port-unreachable for what this connected socket sent is
+        // reported once, before any queued data (Linux: the next call fails).
+        const pending = udp.takePendingError(src_port);
+        if (pending != 0) return -@as(i64, pending);
         const wait_rc = udpWaitForDatagram(src_port, is_v6, @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, flags));
         if (wait_rc != 0) return wait_rc;
         var user_addr_len: u32 = 0;
@@ -667,6 +671,7 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
             t.fd_table.fds[fd].udp_connected = true;
             t.fd_table.fds[fd].udp_dst_ip6 = parsed.addr;
             t.fd_table.fds[fd].udp_dst_port = parsed.port;
+            udp.setPeerPort(t.fd_table.fds[fd].udp_port, parsed.port);
             return 0;
         }
         if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, false)) return -22;
@@ -678,6 +683,7 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         t.fd_table.fds[fd].udp_connected = true;
         t.fd_table.fds[fd].udp_dst_ip = dst_ip;
         t.fd_table.fds[fd].udp_dst_port = dst_port;
+        udp.setPeerPort(t.fd_table.fds[fd].udp_port, dst_port);
         return 0;
     }
 

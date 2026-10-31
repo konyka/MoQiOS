@@ -89,6 +89,11 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
         var pkt: [echo_policy.FRAME_BUF_LEN]u8 = undefined;
         const frame_len = buildEchoReplyMtu(&pkt, data, len, netif.getMtu(), dst_ip, src_ip, our_mac, dst_mac);
         _ = nic.sendPacket(&pkt, frame_len);
+    } else if (icmp_type == 3 and icmp_code == 3) {
+        // Port unreachable for a UDP datagram we sent: tell the connected socket.
+        const unreach = @import("icmp_unreach_policy.zig");
+        const q = unreach.parseQuote(data[0..len]) orelse return;
+        @import("udp.zig").notifyUnreachable(q.src_port, q.dst_port);
     } else if (icmp_type == 3 and icmp_code == 4) {
         // SK-101: Fragmentation Needed → Path MTU.
         const msg = parseFragNeeded(data, len) orelse return;

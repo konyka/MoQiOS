@@ -45,6 +45,10 @@ var num_ports: u16 = 0;
 var udp_lock: IrqSpinlock = .{};
 /// SOL_SOCKET options per registered port (travels with the port slot).
 var port_opts: [MAX_PORTS]@import("sockopt_policy.zig").Stored = @splat(.{});
+/// Pending asynchronous error per port (ICMP port unreachable → ECONNREFUSED,
+/// positive errno) and the peer port a connect() fixed, 0 when unconnected.
+var port_err: [MAX_PORTS]i32 = @splat(0);
+var port_peer: [MAX_PORTS]u16 = @splat(0);
 
 /// Options of the socket bound to `port`, or null if it is not registered.
 pub fn getPortOpts(port: u16) ?@import("sockopt_policy.zig").Stored {
@@ -60,6 +64,62 @@ pub fn setPortOpts(port: u16, opts: @import("sockopt_policy.zig").Stored) bool {
     const i = findPortIdxLocked(port) orelse return false;
     port_opts[i] = opts;
     return true;
+}
+
+/// connect() fixed the peer port of the socket bound to `port`.
+pub fn setPeerPort(port: u16, peer_port: u16) void {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(port) orelse return;
+    port_peer[i] = peer_port;
+    port_err[i] = 0;
+}
+
+/// The pending error (positive errno) of the socket bound to `port`, 0 if none.
+pub fn peekPendingError(port: u16) i32 {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(port) orelse return 0;
+    return port_err[i];
+}
+
+/// Take (return and clear) the pending error of the socket bound to `port`.
+pub fn takePendingError(port: u16) i32 {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(port) orelse return 0;
+    const e = port_err[i];
+    port_err[i] = 0;
+    return e;
+}
+
+/// Clear the pending error only if it still equals `expected` (SO_ERROR read).
+pub fn clearPendingErrorIfEqual(port: u16, expected: i32) void {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(port) orelse return;
+    if (port_err[i] == expected) port_err[i] = 0;
+}
+
+/// An ICMP port-unreachable quoted a datagram sent from `local_port` to
+/// `peer_port`: a socket connected to that peer fails with ECONNREFUSED.
+pub fn notifyUnreachable(local_port: u16, peer_port: u16) void {
+    const hit = blk: {
+        const saved = udp_lock.acquire();
+        defer udp_lock.release(saved);
+        const i = findPortIdxLocked(local_port) orelse break :blk false;
+        if (!@import("icmp_unreach_policy.zig").matchesConnected(.{ .src_port = local_port, .dst_port = peer_port }, local_port, port_peer[i] != 0, port_peer[i])) break :blk false;
+        port_err[i] = 111; // ECONNREFUSED
+        break :blk true;
+    };
+    if (hit) @import("epoll.zig").epollNotify(.udp_socket, local_port, @import("epoll.zig").EPOLLERR);
+}
+
+/// True when a socket is bound to `port`.
+pub fn portBound(port: u16) bool {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    return findPortIdxLocked(port) != null;
 }
 
 /// Lookup with the lock already held. Callers that use the returned index to
@@ -87,6 +147,8 @@ pub fn ensurePort(port: u16) u16 {
     ports[idx] = port;
     port_refs[idx] = 1;
     port_opts[idx] = .{};
+    port_err[idx] = 0;
+    port_peer[idx] = 0;
     num_ports += 1;
     return @intCast(idx);
 }
@@ -106,6 +168,8 @@ pub fn ensurePortExclusive(port: u16) u16 {
     ports[idx] = port;
     port_refs[idx] = 1;
     port_opts[idx] = .{};
+    port_err[idx] = 0;
+    port_peer[idx] = 0;
     num_ports += 1;
     return @intCast(idx);
 }
@@ -139,6 +203,10 @@ pub fn releasePort(port: u16) void {
             ports[i] = ports[num_ports];
             port_refs[i] = port_refs[num_ports];
             port_opts[i] = port_opts[num_ports];
+            port_err[i] = port_err[num_ports];
+            port_peer[i] = port_peer[num_ports];
+            port_err[num_ports] = 0;
+            port_peer[num_ports] = 0;
             queues[i] = queues[num_ports];
             ports[num_ports] = 0;
             port_refs[num_ports] = 0;
@@ -236,7 +304,33 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
     if (8 + actual_payload > len) return;
     var ip16: [16]u8 = @splat(0);
     @memcpy(ip16[0..4], &src_ip);
+    const bound = portBound(hdr.dst_port);
     enqueue(hdr.dst_port, ip16, hdr.src_port, hdr.dst_port, data[8..][0..actual_payload], false);
+    const unreach = @import("icmp_unreach_policy.zig");
+    if (unreach.shouldReply(netif.isLoopback(src_ip) and netif.isLoopback(dst_ip), false, bound)) {
+        sendPortUnreachable(src_ip, dst_ip, data, hdr.udp_len);
+    }
+}
+
+/// ICMP port unreachable (type 3 code 3) for a loopback datagram nobody
+/// receives: carries the offending IP header and first 8 payload bytes.
+fn sendPortUnreachable(src_ip: [4]u8, dst_ip: [4]u8, udp: [*]const u8, udp_len: u16) void {
+    const lo_dev = @import("lo.zig");
+    const icmp_mod = @import("icmp.zig");
+    var pkt: [128]u8 = @splat(0);
+    const quote_udp: u16 = @min(udp_len, 8);
+    // ICMP at 34: header (8) + quoted IP header (20) + quoted UDP bytes.
+    ipv4.buildHeader(pkt[34 + 8 ..].ptr, src_ip, dst_ip, ipv4.PROTO_UDP, udp_len);
+    @memcpy(pkt[34 + 8 + 20 ..][0..quote_udp], udp[0..quote_udp]);
+    pkt[34] = 3;
+    pkt[35] = 3;
+    const icmp_len: u16 = 8 + 20 + quote_udp;
+    bo.writeU16BeAt(&pkt, 36, ipv4.checksum(pkt[34..].ptr, icmp_len));
+    ipv4.buildHeader(pkt[14..].ptr, dst_ip, src_ip, ipv4.PROTO_ICMP, icmp_len);
+    const mac = netif.getMac();
+    const frame_len = eth.buildFrame(&pkt, mac, mac, eth.ETHERTYPE_IPV4, 20 + icmp_len);
+    _ = lo_dev.sendPacket(&pkt, frame_len);
+    _ = icmp_mod;
 }
 
 /// IPv6 UDP receive (SK-70). Bound-port-only; checksum verified when non-zero.
