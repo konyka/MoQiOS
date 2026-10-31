@@ -282,6 +282,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello153"); /* AF_UNIX shutdown half-close semantics */
     run_test("hello154"); /* TCP write errors and half-close */
     run_test("hello155"); /* SIGPIPE on sockets */
+    run_test("hello156"); /* TCP shutdown(SHUT_RD) */
 
     start_persistent_services();
 

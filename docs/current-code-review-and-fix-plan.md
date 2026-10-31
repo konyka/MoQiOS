@@ -5637,3 +5637,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 新增 2 个测试（`raisesSigpipe`、入口都经过 `sendResult`）；hello155（TCP `SHUT_WR` 后 `write`/`sendto` 被 SIGPIPE 杀死、`MSG_NOSIGNAL` 得到 EPIPE 并存活，AF_UNIX 同样）在 HEAD 上 4 项 FAIL，新内核 PASS。
 - 变异：`raisesSigpipe` 对所有负结果都发信号、`sendmsg` 的 AF_UNIX 路径不经过 `sendResult`，各自被 host 测试抓住；“去掉 `MSG_NOSIGNAL` 判断”的变异因未使用参数编译失败，不算证据。
 - 验证：host 810/810；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello150–hello155 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### TCP shutdown(SHUT_RD)（hello156）
+
+- 问题：`tcpShutdown(SHUT_RD)` 只把接收环清空，没有任何状态；之后 `read` 仍然返回新到达的数据，永远读不到 EOF（hello154 的已知差异）。
+- 修复：`TcpTcb.shut_rd`；`SHUT_RD`/`SHUT_RDWR` 置位并唤醒阻塞读者；`recvLocked`、阻塞 recv 等待循环按 `tcp_recv_policy.shutRdEof` 返回 EOF；`processIncomingData` 对之后到达的数据只推进 `rcv_nxt` 并 ACK。
+- 已知差异：poll/epoll 对 `SHUT_RD` 之后的 TCP 套接字未单独报告“可读（EOF）”，由 `tcpRecvAvailable`/状态判断决定。
+- TDD：host 新增 1 个测试；hello156（A：已排队数据与之后到达的数据都读到 EOF、本端仍可发送且对端收到；B：对端写仍成功，本端读 EOF）在 HEAD 上 3 项 FAIL，新内核 PASS。
+- 变异：`processIncomingData` 里的 `shut_rd` 分支永不进入 → host 测试失败（有效证据）；把 `shutRdEof` 改成恒假的变异使测试步骤编译失败（多出的辅助函数），不算有效证据，该判定由 hello156 的运行时断言覆盖。
+- 验证：host 811/811；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8 与 GPT SMP=2 均 hello156 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

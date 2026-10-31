@@ -320,6 +320,8 @@ const TcpTcb = struct {
     reset_by_peer: bool = false,
     /// The handshake finished at some point (stays set after close/reset).
     was_established: bool = false,
+    /// shutdown(SHUT_RD) happened: reads see EOF, later data is dropped.
+    shut_rd: bool = false,
     /// local_port was set by bind(); otherwise connect() treats it as stale.
     bound_explicitly: bool = false,
     /// Zero-window persist probe timer (SK-110).
@@ -794,6 +796,7 @@ fn initTcbState(t: *TcpTcb) void {
     t.fin_pending = false;
     t.reset_by_peer = false;
     t.was_established = false;
+    t.shut_rd = false;
     t.bound_explicitly = false;
     t.persist_timer_ms = 0;
     t.persist_rto_ms = RETRANSMIT_MS;
@@ -2747,6 +2750,16 @@ fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) void
         return;
     }
 
+    // shutdown(SHUT_RD): the data is acknowledged (so the peer does not
+    // retransmit) but nobody will read it.
+    if (tcb.shut_rd) {
+        tcb.rcv_nxt +%= len;
+        tcb.delayed_ack_pending = false;
+        tcb.delayed_ack_ms = 0;
+        _ = sendSegment(tcb, ACK, undefined, 0);
+        return;
+    }
+
     // Copy to receive ring buffer (batched @memcpy)
     const recv_free = RECV_BUF_SIZE - 1 - ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
     const to_copy = @min(len, recv_free);
@@ -3227,6 +3240,7 @@ fn tcpRecvBlockingWait(tcb_idx: u32, buf: [*]u8, len: u32, nonblock: bool) i64 {
                 deadline_set = true;
             }
 
+            if (tcp_recv_policy.shutRdEof(tcb.shut_rd)) return 0;
             const available = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
             const decision = tcp_recv_policy.decide(tcb.state, available, tcb.reset_by_peer);
             if (!tcp_recv_policy.shouldBlock(decision, nonblock, tcp_recv_policy.timedOut(deadline, tsc.nanos())))
@@ -3411,6 +3425,7 @@ pub fn recvTimerTick(now_ns: u64) void {
 
 /// recv body shared by the blocking and non-blocking entry points (tcp_lock held).
 fn recvLocked(tcb: *TcpTcb, buf: [*]u8, len: u32) i64 {
+    if (tcp_recv_policy.shutRdEof(tcb.shut_rd)) return 0;
     const available = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
     const decision = tcp_recv_policy.decide(tcb.state, available, tcb.reset_by_peer);
     if (decision != .read_data) {
@@ -4073,8 +4088,10 @@ pub fn tcpShutdown(tcb_idx: u32, how: u32) i64 {
     switch (how) {
         0 => {
             // SHUT_RD: discard further received data
-            // Just advance rcv_nxt to effectively ignore future data
-            tcb.recv_head = tcb.recv_tail; // drain recv buffer
+            // The ring is emptied, reads see EOF and later data is dropped.
+            tcb.recv_head = tcb.recv_tail;
+            tcb.shut_rd = true;
+            markRecvWake(tcb);
         },
         1 => {
             // SHUT_WR: send FIN
@@ -4086,6 +4103,8 @@ pub fn tcpShutdown(tcb_idx: u32, how: u32) i64 {
         2 => {
             // SHUT_RDWR: shutdown both directions
             tcb.recv_head = tcb.recv_tail;
+            tcb.shut_rd = true;
+            markRecvWake(tcb);
             switch (tcb.state) {
                 .established, .close_wait => requestFin(tcb),
                 .listen => {

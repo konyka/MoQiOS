@@ -8071,3 +8071,13 @@ test "every socket send entry point routes its result through sendResult" {
     try std.testing.expect(std.mem.count(u8, kt.vfs_source, "sendResult(") >= 2);
     try std.testing.expect(std.mem.count(u8, kt.socket_syscall_source, "sendResult(") >= 4);
 }
+
+test "tcp: shutdown(SHUT_RD) makes reads EOF and is wired into the data path" {
+    try std.testing.expect(kt.tcp_recv_policy.shutRdEof(true));
+    try std.testing.expect(!kt.tcp_recv_policy.shutRdEof(false));
+    const src = kt.tcp_source;
+    // read side, blocking wait, incoming data and the shutdown call all consult the flag.
+    try std.testing.expect(std.mem.count(u8, src, "shutRdEof(tcb.shut_rd)") >= 2);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (tcb.shut_rd) {\n        tcb.rcv_nxt +%= len;") != null);
+    try std.testing.expect(std.mem.count(u8, src, "tcb.shut_rd = true;") >= 2);
+}

@@ -107,6 +107,12 @@ pub fn canQueueSend(state: TcpState, fin_pending: bool) bool {
     return (state == .established or state == .close_wait) and !fin_pending;
 }
 
+/// After shutdown(SHUT_RD) a read reports EOF whatever the ring holds, and
+/// data that arrives later is acknowledged but not kept.
+pub fn shutRdEof(shut_rd: bool) bool {
+    return shut_rd;
+}
+
 /// read() on a connection that never got established (socket(), or a failed
 /// connect) is ENOTCONN, not an orderly EOF.
 pub fn recvNeverConnected(state: TcpState, established_ever: bool) bool {
