@@ -315,6 +315,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello186"); /* epoll errno and layout conformance */
     run_test("hello187"); /* fcntl errno and flag conformance */
     run_test("hello188"); /* memory-management errno conformance */
+    run_test("hello189"); /* signal errno conformance */
 
     start_persistent_services();
 

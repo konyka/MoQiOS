@@ -50,14 +50,19 @@ pub fn maySignal(sender: *task_mod.Task, target: *task_mod.Task) bool {
 /// -ESRCH when no target exists, -EPERM when every target was refused.
 pub fn killPosix(pid: i64, signum: u32) i64 {
     const id_policy = @import("proc_id_policy.zig");
-    if (signum > 64) return -22;
     const cur = sched.currentTask() orelse return -3;
-    if (pid == -1) return killAll(cur, signum);
+    // Linux finds the target first: a missing process is ESRCH whatever the signal number is, and an
+    // invalid number (EINVAL) is only reported for a process that exists (see killSignalErrno).
+    if (pid == -1) {
+        if (signum > 64) return -22;
+        return killAll(cur, signum);
+    }
 
     if (pid > 0) {
         const tid = id_policy.killTargetTid(pid) orelse return -3;
         const idx = task_mod.findTaskByTid(tid) orelse return -3;
         const target = task_mod.getTask(idx) orelse return -3;
+        if (signum > 64) return -22;
         if (!maySignal(cur, target)) return -1;
         if (signum == 0) return 0;
         return if (sig_mod.sendSignal(tid, signum)) 0 else -3;
@@ -74,6 +79,7 @@ pub fn killPosix(pid: i64, signum: u32) i64 {
         allowed = true;
     }
     if (!found) return -3;
+    if (signum > 64) return -22;
     if (!allowed) return -1;
     if (signum == 0) return 0;
     _ = sig_mod.sendSignalToPgrpFiltered(pgid, signum, cur);
@@ -183,8 +189,11 @@ pub fn sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64, sigsetsize: u64) i64
 
     const width: usize = if (sigsetsize >= 8) 8 else 4;
 
-    if (oldset_ptr != 0 and !copy.validateUserBufferWritable(oldset_ptr, width)) return -14;
+    // Linux order: read the new set (EFAULT), then reject an unknown `how` (EINVAL), then write the old mask
+    // out (EFAULT). A call that fails with EINVAL therefore leaves the caller's old-mask buffer alone.
     if (set_ptr != 0 and !copy.validateUserBuffer(set_ptr, width)) return -14;
+    if (set_ptr != 0 and how > 2) return -22;
+    if (oldset_ptr != 0 and !copy.validateUserBufferWritable(oldset_ptr, width)) return -14;
     if (oldset_ptr != 0 and copy.copyToUser(@ptrFromInt(oldset_ptr), @as([*]const u8, @ptrCast(&old_mask))[0..width], width) != width) return -14;
 
     if (set_ptr != 0) {
@@ -410,9 +419,9 @@ pub fn rtSigsuspend(mask_ptr: u64, sigsetsize: u64) i64 {
 /// rt_sigtimedwait(sigset_ptr, info_ptr, timeout_ptr, sigset_size) → signal number or -errno
 pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_size: u64) i64 {
     const si = @import("siginfo_policy.zig");
-    if (info_ptr != 0 and !copy.validateUserBufferWritable(info_ptr, si.SIGINFO_SIZE)) return -14;
 
-    if (sigset_size == 0 or sigset_ptr == 0 or sigset_ptr >= 0x0000_8000_0000_0000) return -22;
+    if (sigset_size == 0) return -22;
+    if (sigset_ptr == 0 or sigset_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT
 
     var mask_buf: [8]u8 = @splat(0);
     const width: usize = @intCast(@min(sigset_size, @as(u64, 8)));
@@ -443,6 +452,9 @@ pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_s
         // races with sendSignal's atomic Rmw on another CPU.
         const pending = @atomicLoad(u64, &cur.pending_signals, .seq_cst) & mask;
         if (pending != 0) {
+            // The info buffer is only needed (and only checked) once a signal is about to be taken; checking
+            // before consuming keeps the signal pending if the buffer is bad.
+            if (info_ptr != 0 and !copy.validateUserBufferWritable(info_ptr, si.SIGINFO_SIZE)) return -14;
             const bit: u6 = @intCast(@ctz(pending));
             _ = @atomicRmw(u64, &cur.pending_signals, .And, ~(@as(u64, 1) << bit), .seq_cst);
             const taken = cur.sig_info[bit];
@@ -471,9 +483,11 @@ pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_s
 /// rt_sigqueueinfo(tgid, sig, uinfo_ptr) → 0 or -errno
 pub fn rtSigqueueinfo(tgid: u32, sig: u32, uinfo_ptr: u64) i64 {
     const si = @import("siginfo_policy.zig");
-    if (sig > 64) return -22;
+    // Linux reads the siginfo first: an unreadable (or NULL) pointer is EFAULT whatever the signal number.
     var raw: [si.SIGINFO_SIZE]u8 = undefined;
+    if (uinfo_ptr == 0 or !copy.validateUserBuffer(uinfo_ptr, raw.len)) return -14;
     if (copy.copyFromUser(&raw, @ptrFromInt(uinfo_ptr), raw.len) != raw.len) return -14;
+    if (sig > 64) return -22;
     const info = si.decode(&raw);
     const cur = sched.currentTask();
     const to_self = if (cur) |c| threadGroupId(c) == tgid else true;
@@ -488,9 +502,11 @@ pub fn rtSigqueueinfo(tgid: u32, sig: u32, uinfo_ptr: u64) i64 {
 /// tkill(tid, sig) → 0 or -errno
 pub fn tkill(tid_arg: i64, sig: u32) i64 {
     const id_policy = @import("proc_id_policy.zig");
-    if (sig > 64) return -22;
+    // Linux: a tid that is not positive is EINVAL first; then the thread must exist (ESRCH); only then is
+    // the signal number checked (EINVAL).
     const tid = id_policy.tkillTargetTid(tid_arg) orelse return -22;
     _ = task_mod.findTaskByTid(tid) orelse return -3; // ESRCH
+    if (sig > 64) return -22;
     if (!currentMaySignalTask(tid)) return -1; // EPERM
     if (sig == 0) return 0; // existence and permission probe
     var info = sig_mod.senderInfo();

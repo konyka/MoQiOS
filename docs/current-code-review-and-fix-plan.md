@@ -5986,3 +5986,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 变异（具名测试核对）：`alignUp` 溢出处理、`inUserSpace` 的边界与页数、`madviseSpan`/`mincoreSpan`/`lockSpan` 的检查顺序与错误码、`madviseSupported` 的取值（去掉 `MADV_FREE`、误加 `MADV_DONTFORK`/`MADV_REMOVE`）、`mlockallFlagsValid` 的三个条件、`munmap_policy` 的取整与溢出、`HINT_FLAGS`/`FIXED_NOREPLACE` 的接受、`normalizeProt`、`fileOffsetOverflows` 的两个条件、`mmap.zig` 的偏移对齐/保护位规范化/长度上限/`EOVERFLOW`/`EACCES`/`EEXIST`/`MAP_FIXED` 先拆旧映射、`mremap` 溢出码、`mprotect` 越界码、`syscall_entry` 里 `madvise`/`mlock`/`munlock`/`munlockall` 的接线，共 40 个，全部被 `memory-management argument rules…` 抓住。第一轮有 3 个存活（`inUserSpace` 的 `>` 与 `>=` 边界、`fileOffsetOverflows` 对"长度取整溢出"的处理、`munlockall` 的返回值），补强断言后重跑全部抓住；另有 2 个因编译失败（未声明标识符、未使用参数）改成可编译形式后抓住；恢复后 `grep -c MUTATION` 为 0。
 - 验证：host 860/860；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello188 PASS、0 个 FAIL（含更新后的 hello71/74/114/131）；stress（SMP=2）5/5 PASS。
+
+### 信号系统调用的检查顺序，以及第二个用户可触发的内核 panic（hello189）
+
+- 问题：①`rt_sigqueueinfo(tgid, sig, NULL)` 使内核 panic（`cast causes pointer to be null`）：`copyFromUser(&raw, @ptrFromInt(uinfo_ptr), …)` 在指针为 0 时先于任何检查执行 `@ptrFromInt(0)`。和 hello188 的 `mmap` 溢出一样，是用户态一行系统调用就能让内核停机。②`rt_sigprocmask`/`kill`/`tkill`/`rt_sigtimedwait` 的错误检查顺序与 Linux 不同（见 `docs/kernel-subsystems.md` 的 hello189 条）。
+- 方法：宿主机取 76 项真实 Linux 返回值，生成 hello189；70 项本来一致，说明信号子系统比前几轮的文件、epoll、内存管理子系统覆盖得更充分。panic 是探测跑到 `sigqueueinfo: bad info pointer` 之后日志出现 `KERNEL PANIC` 才发现的。
+- 修复：`proc/signal_syscall.zig` 里五个函数调整检查顺序；`rtSigqueueinfo` 先验证指针。
+- 已知差异：`sigsetsize` 没有按 Linux 要求恒为 8（为兼容旧的 4 字节调用者）；`rt_tgsigqueueinfo` 忽略 tid；`pidfd_send_signal` 忽略 `info`/`flags`；`rt_sigtimedwait` 的睡眠仍然以 10 ms 的节拍轮询。
+- TDD：host 新增 1 个测试（用源码内位置钉住 `sigprocmask`、`kill`、`tkill`、`rt_sigtimedwait`、`rt_sigqueueinfo` 的检查顺序）；hello189（76 项）在旧内核上 5 项 FAIL 外加一次内核 panic，新内核 PASS。
+
+- 变异（具名测试核对）：`sigprocmask` 的 `how` 上界、三个检查的先后（旧掩码缓冲区先于 `how`、`how` 先于新集合）、`kill` 的信号号检查位置（目标之前、权限之后、删除、进程组分支删除、`-1` 分支删除）、`tkill` 的三个检查的先后、`rt_sigtimedwait` 的集合指针错误码与 `sigsetsize == 0` 的错误码、`info` 检查被删除、`rt_sigqueueinfo` 的 NULL 检查被删除/失效、信号号检查移到读取之前，共 15 个，全部被 `signal errnos follow…` 抓住；恢复后 `grep -c MUTATION` 为 0。
+- 验证：host 861/861；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello189 PASS、0 个 FAIL；stress（SMP=2）5/5 PASS。

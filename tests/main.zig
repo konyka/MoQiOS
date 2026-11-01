@@ -1585,6 +1585,54 @@ test "munmap and SysV SHM policy validation" {
     try std.testing.expect(shm_policy.rangeEnd(0x7000_0000, 4096, munmap_policy.USER_ADDR_MAX) != null);
 }
 
+test "signal errnos follow Linux's order of checks, and a NULL siginfo no longer panics" {
+    const src = kt.signal_syscall_source;
+    const idx = std.mem.indexOf;
+    // sigprocmask: new set read (EFAULT) -> unknown how (EINVAL) -> old mask written (EFAULT).
+    const sp = idx(u8, src, "pub fn sigprocmask(").?;
+    const read_set = idx(u8, src[sp..], "if (set_ptr != 0 and !copy.validateUserBuffer(set_ptr, width)) return -14;").?;
+    const bad_how = idx(u8, src[sp..], "if (set_ptr != 0 and how > 2) return -22;").?;
+    const old_ok = idx(u8, src[sp..], "if (oldset_ptr != 0 and !copy.validateUserBufferWritable(oldset_ptr, width)) return -14;").?;
+    const old_write = idx(u8, src[sp..], "if (oldset_ptr != 0 and copy.copyToUser(").?;
+    try std.testing.expect(read_set < bad_how and bad_how < old_ok and old_ok < old_write);
+
+    // kill: the target is found (ESRCH) before an out-of-range signal number is rejected (EINVAL).
+    const kp = idx(u8, src, "pub fn killPosix(").?;
+    const body = src[kp..];
+    try std.testing.expect(idx(u8, body, "if (signum > 64) return -22;\n    const cur") == null); // no up-front check any more
+    const find_target = idx(u8, body, "const target = task_mod.getTask(idx) orelse return -3;").?;
+    const sig_check = idx(u8, body, "if (signum > 64) return -22;\n        if (!maySignal(cur, target)) return -1;").?;
+    try std.testing.expect(find_target < sig_check);
+    try std.testing.expect(idx(u8, body, "if (!found) return -3;\n    if (signum > 64) return -22;") != null);
+    try std.testing.expect(idx(u8, body, "if (pid == -1) {\n        if (signum > 64) return -22;\n        return killAll(cur, signum);") != null);
+
+    // tkill: bad tid (EINVAL) -> missing thread (ESRCH) -> bad signal (EINVAL).
+    const tk = idx(u8, src, "pub fn tkill(").?;
+    const tb = src[tk..];
+    const tid_ok = idx(u8, tb, "id_policy.tkillTargetTid(tid_arg) orelse return -22;").?;
+    const tid_exists = idx(u8, tb, "task_mod.findTaskByTid(tid) orelse return -3; // ESRCH").?;
+    const tsig = idx(u8, tb, "if (sig > 64) return -22;").?;
+    try std.testing.expect(tid_ok < tid_exists and tid_exists < tsig);
+
+    // rt_sigtimedwait: a NULL or bad set pointer is EFAULT (size 0 stays EINVAL); the info buffer is
+    // checked only when a signal is about to be taken, before it is consumed.
+    const tw = idx(u8, src, "pub fn rtSigtimedwait(").?;
+    const wb = src[tw..];
+    try std.testing.expect(idx(u8, wb, "if (sigset_size == 0) return -22;\n    if (sigset_ptr == 0 or sigset_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT") != null);
+    const taking = idx(u8, wb, "if (info_ptr != 0 and !copy.validateUserBufferWritable(info_ptr, si.SIGINFO_SIZE)) return -14;").?;
+    const consume = idx(u8, wb, "_ = @atomicRmw(u64, &cur.pending_signals, .And").?;
+    try std.testing.expect(taking < consume);
+
+    // rt_sigqueueinfo: a NULL siginfo used to reach @ptrFromInt(0) and panic the kernel; it is EFAULT, and the
+    // read comes before the signal-number check.
+    const qi = idx(u8, src, "pub fn rtSigqueueinfo(").?;
+    const qb = src[qi..];
+    const null_check = idx(u8, qb, "if (uinfo_ptr == 0 or !copy.validateUserBuffer(uinfo_ptr, raw.len)) return -14;").?;
+    const copy_in = idx(u8, qb, "if (copy.copyFromUser(&raw, @ptrFromInt(uinfo_ptr), raw.len) != raw.len) return -14;").?;
+    const qsig = idx(u8, qb, "if (sig > 64) return -22;").?;
+    try std.testing.expect(null_check < copy_in and copy_in < qsig);
+}
+
 test "memory-management argument rules follow Linux: ranges, rounding, flags, mlockall" {
     const rp = kt.range_policy;
     const E = kt.errno;
