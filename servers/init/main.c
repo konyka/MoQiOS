@@ -308,6 +308,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello179"); /* SO_PRIORITY / SO_MARK / SO_BINDTODEVICE ... */
     run_test("hello180"); /* getsockname / getpeername on AF_UNIX */
     run_test("hello181"); /* AF_UNIX datagram sendto with an address */
+    run_test("hello182"); /* poll vs epoll wake-up latency */
 
     start_persistent_services();
 

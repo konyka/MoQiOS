@@ -395,6 +395,8 @@ pub fn epollWait(epfd_idx: u32, events_buf: u64, max_events: u32, timeout_ms: i3
 
 /// Notification callback — called by TCP, pipe, etc. when state changes.
 pub fn epollNotify(fd_type: vfs.FdType, resource_idx: u32, ready_events: u32) void {
+    // poll()/select() waiters wake on every readiness change (they rescan; the sleep slice is the fallback).
+    @import("../fs/poll_wake.zig").notify();
     // Hold pool_lock for the whole sweep: create/destroy mutate valid_epoll_bm
     // and instance storage, and may run concurrently on another CPU.
     const psaved = pool_lock.acquire();

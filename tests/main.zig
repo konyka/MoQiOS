@@ -9328,3 +9328,45 @@ test "AF_UNIX datagram sendto / sendmsg with an address, and EMSGSIZE" {
     try std.testing.expect(std.mem.indexOf(u8, fi, "return !@import(\"../net/unix_socket.zig\").unixIsStream(d.unix_sock_idx);") != null);
     try std.testing.expect(std.mem.indexOf(u8, fi, "const MESSAGE_WRITE_MAX: usize = 8192;") != null);
 }
+
+test "poll/select wake-up protocol: generation snapshot, waiter bitmap, wiring" {
+    const w = kt.poll_wake_policy;
+    // A notification since the snapshot means: do not sleep, rescan.
+    try std.testing.expect(!w.mustSkipSleep(7, 7));
+    try std.testing.expect(w.mustSkipSleep(7, 8));
+    try std.testing.expect(w.mustSkipSleep(0xFFFF_FFFF, 0));
+    // The generation wraps without losing the "changed" property.
+    try std.testing.expectEqual(@as(u32, 0), w.nextGeneration(0xFFFF_FFFF));
+    try std.testing.expect(w.mustSkipSleep(0xFFFF_FFFF, w.nextGeneration(0xFFFF_FFFF)));
+    // One bit per task slot; slot numbers wrap into the 64-bit map.
+    try std.testing.expectEqual(@as(u64, 1), w.waiterBit(0));
+    try std.testing.expectEqual(@as(u64, 1) << 63, w.waiterBit(63));
+    try std.testing.expectEqual(@as(u64, 1), w.waiterBit(64));
+    // A notification takes every waiter and leaves none; each re-arms itself.
+    const t = w.takeAll(0b1010_0001);
+    try std.testing.expectEqual(@as(u64, 0b1010_0001), t.wake);
+    try std.testing.expectEqual(@as(u64, 0), t.remaining);
+    try std.testing.expectEqual(@as(u64, 0), w.takeAll(0).wake);
+
+    // Wiring: every readiness notification bumps the generation first; a waiter snapshots BEFORE it scans and
+    // passes the snapshot to the sleep, in both poll and select.
+    try std.testing.expect(std.mem.indexOf(u8, kt.epoll_source, "pub fn epollNotify(fd_type: vfs.FdType, resource_idx: u32, ready_events: u32) void {\n    // poll()/select() waiters wake on every readiness change (they rescan; the sleep slice is the fallback).\n    @import(\"../fs/poll_wake.zig\").notify();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.poll_source, "    while (true) {\n        const seen = poll_wake.generation();\n        var ready: u64 = 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.poll_source, "const rc = waitSliceSeen(seen, deadline);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.select_source, "const seen = @import(\"poll_wake.zig\").generation();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.select_source, "const rc = poll_mod.waitSliceSeen(seen, deadline);") != null);
+    // The short slice is still the upper bound of one sleep: sources that never notify keep working.
+    try std.testing.expect(std.mem.indexOf(u8, kt.poll_source, "return poll_wake.waitUntil(seen, pp.sliceDeadline(now, deadline, WAKE_SLICE_MS));") != null);
+    // The sleep publishes itself before blocking and re-checks the generation after.
+    const pw = kt.poll_wake_source;
+    try std.testing.expect(std.mem.indexOf(u8, pw, "_ = @atomicRmw(u64, &waiter_bm, .Or, bit, .seq_cst);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pw, "if (!pw.mustSkipSleep(seen, generation())) {\n        sched.forceReschedule();\n    }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pw, "sched.repairCurrentAfterBlock();") != null);
+    // On the way out the waiter clears its own slot from both the sleep map and the waiter map, and a
+    // pending signal is looked at both before sleeping and after waking.
+    try std.testing.expect(std.mem.indexOf(u8, pw, "_ = @atomicRmw(u64, &sched.sleep_bm, .And, ~bit, .seq_cst);\n    _ = @atomicRmw(u64, &waiter_bm, .And, ~bit, .seq_cst);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pw, "if (sig_mod.pendingActionable(cur)) return -4;\n    if (tsc.nanos() >= deadline_ns) return 0;") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, pw, "if (sig_mod.pendingActionable(cur)) return -4;"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, pw, "if (sig_mod.pendingFatal(cur)) |s| task_mod.exitTask(128 + @as(i32, @intCast(s)));"));
+    try std.testing.expect(std.mem.indexOf(u8, pw, "_ = @atomicRmw(u32, &generation_counter, .Add, 1, .seq_cst);\n    if (@atomicLoad(u64, &waiter_bm, .seq_cst) == 0) return;") != null);
+}

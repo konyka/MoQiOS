@@ -80,6 +80,7 @@ fn selectWait(nfds_raw: u64, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr:
     const poll_once = wait == .ms and wait.ms == 0;
 
     while (true) {
+        const seen = @import("poll_wake.zig").generation();
         var read_out: [SET_BYTES]u8 = @splat(0);
         var write_out: [SET_BYTES]u8 = @splat(0);
         var total_ready: u64 = 0;
@@ -113,7 +114,7 @@ fn selectWait(nfds_raw: u64, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr:
             return @intCast(total_ready);
         }
 
-        const rc = poll_mod.waitSlice(deadline);
+        const rc = poll_mod.waitSliceSeen(seen, deadline);
         if (rc < 0) return rc;
     }
 }

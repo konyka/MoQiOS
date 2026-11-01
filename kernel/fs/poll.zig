@@ -12,6 +12,7 @@ const tcp_mod = @import("../net/tcp.zig");
 const epoll_mod = @import("../net/epoll.zig");
 const copy = @import("../mm/copy_from_user.zig");
 const pp = @import("poll_policy.zig");
+const poll_wake = @import("poll_wake.zig");
 
 /// Linux pollfd structure.
 pub const pollfd = extern struct {
@@ -42,10 +43,15 @@ pub fn deadlineFor(w: pp.Wait, now_ns: u64) ?u64 {
 /// Sleep one slice of a poll/select wait. Returns 0 to rescan, or a negative
 /// errno (-EINTR) when a signal ended the wait.
 pub fn waitSlice(deadline: ?u64) i64 {
+    return waitSliceSeen(poll_wake.generation(), deadline);
+}
+
+/// waitSlice for a caller that snapshotted `poll_wake.generation()` before it
+/// scanned: a readiness change since then ends the wait at once.
+pub fn waitSliceSeen(seen: u32, deadline: ?u64) i64 {
     const tsc = @import("../arch/x86_64/tsc.zig");
-    const se = @import("../arch/x86_64/syscall_entry.zig");
     const now = tsc.nanos();
-    return se.sleepUntil(pp.sliceDeadline(now, deadline, WAKE_SLICE_MS), 0);
+    return poll_wake.waitUntil(seen, pp.sliceDeadline(now, deadline, WAKE_SLICE_MS));
 }
 
 /// poll(2): the timeout is a C int of milliseconds.
@@ -176,6 +182,7 @@ fn pollWait(fds_ptr: u64, nfds: u64, wait: pp.Wait) i64 {
     const poll_once = wait == .ms and wait.ms == 0;
 
     while (true) {
+        const seen = poll_wake.generation();
         var ready: u64 = 0;
         for (0..n) |i| {
             pfds[i].revents = 0;
@@ -201,7 +208,7 @@ fn pollWait(fds_ptr: u64, nfds: u64, wait: pp.Wait) i64 {
             return @intCast(ready);
         }
 
-        const rc = waitSlice(deadline);
+        const rc = waitSliceSeen(seen, deadline);
         if (rc < 0) return rc;
     }
 }
