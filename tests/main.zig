@@ -9015,3 +9015,140 @@ test "TCP socket options: MAXSEG / INFO / CONGESTION wiring" {
     // MAXSEG is settable only while the connection has not been established.
     try std.testing.expect(std.mem.indexOf(u8, ts, ".closed, .listen, .syn_sent => true,\n        else => false,") != null);
 }
+
+test "ip_opt policy: validation, readback and the patched header bytes" {
+    const p = kt.ip_opt_policy;
+    const v4 = kt.ipv4;
+    // Option numbers and levels are Linux's.
+    try std.testing.expectEqual(@as(u64, 0), p.SOL_IP);
+    try std.testing.expectEqual(@as(u64, 41), p.SOL_IPV6);
+    try std.testing.expectEqual(@as(u64, 1), p.IP_TOS);
+    try std.testing.expectEqual(@as(u64, 2), p.IP_TTL);
+    try std.testing.expectEqual(@as(u64, 16), p.IPV6_UNICAST_HOPS);
+    try std.testing.expectEqual(@as(u64, 26), p.IPV6_V6ONLY);
+    try std.testing.expectEqual(@as(u64, 67), p.IPV6_TCLASS);
+    // A socket answers only the level of its own family.
+    try std.testing.expect(p.levelApplies(p.SOL_IP, .v4) and !p.levelApplies(p.SOL_IPV6, .v4));
+    try std.testing.expect(p.levelApplies(p.SOL_IPV6, .v6) and !p.levelApplies(p.SOL_IP, .v6));
+    // Value decoding: a 4-byte int, or a single byte; anything else is invalid.
+    try std.testing.expectEqual(@as(?i32, 17), p.readInt(&.{ 17, 0, 0, 0 }));
+    try std.testing.expectEqual(@as(?i32, -1), p.readInt(&.{ 0xFF, 0xFF, 0xFF, 0xFF }));
+    try std.testing.expectEqual(@as(?i32, 200), p.readInt(&.{200}));
+    try std.testing.expectEqual(@as(?i32, null), p.readInt(&.{ 1, 2 }));
+    try std.testing.expectEqual(@as(?i32, null), p.readInt(&.{}));
+    const none: p.IpOpts = .{};
+    const opt = struct {
+        fn set(cur: p.IpOpts, name: u64, v: i32) kt.ip_opt_policy.SetResult {
+            var b: [4]u8 = undefined;
+            std.mem.writeInt(i32, &b, v, .little);
+            return kt.ip_opt_policy.applySet(cur, kt.ip_opt_policy.SOL_IP, name, &b);
+        }
+        fn set6(cur: p.IpOpts, name: u64, v: i32) kt.ip_opt_policy.SetResult {
+            var b: [4]u8 = undefined;
+            std.mem.writeInt(i32, &b, v, .little);
+            return kt.ip_opt_policy.applySet(cur, kt.ip_opt_policy.SOL_IPV6, name, &b);
+        }
+    };
+    // IP_TTL: 1..255 sets, -1 restores the default, everything else is EINVAL.
+    try std.testing.expectEqual(@as(u8, 17), opt.set(none, p.IP_TTL, 17).ok.ttl);
+    try std.testing.expectEqual(@as(u8, 1), opt.set(none, p.IP_TTL, 1).ok.ttl);
+    try std.testing.expectEqual(@as(u8, 255), opt.set(none, p.IP_TTL, 255).ok.ttl);
+    try std.testing.expectEqual(@as(u8, 0), opt.set(.{ .ttl = 9 }, p.IP_TTL, -1).ok.ttl);
+    try std.testing.expectEqual(@as(i64, -22), opt.set(none, p.IP_TTL, 0).err);
+    try std.testing.expectEqual(@as(i64, -22), opt.set(none, p.IP_TTL, 256).err);
+    try std.testing.expectEqual(@as(i64, -22), opt.set(none, p.IP_TTL, -2).err);
+    // IP_TOS: low byte only, ECN bits cleared.
+    try std.testing.expectEqual(@as(u8, 0x10), opt.set(none, p.IP_TOS, 0x10).ok.tos);
+    try std.testing.expectEqual(@as(u8, 0x10), opt.set(none, p.IP_TOS, 0x13).ok.tos);
+    try std.testing.expectEqual(@as(u8, 0xB8), opt.set(none, p.IP_TOS, 0x1B8).ok.tos);
+    // IPv6 hop limit and traffic class.
+    try std.testing.expectEqual(@as(u8, 9), opt.set6(none, p.IPV6_UNICAST_HOPS, 9).ok.hops);
+    try std.testing.expectEqual(@as(i64, -22), opt.set6(none, p.IPV6_UNICAST_HOPS, 256).err);
+    try std.testing.expectEqual(@as(i64, -22), opt.set6(none, p.IPV6_UNICAST_HOPS, -2).err);
+    try std.testing.expectEqual(@as(u8, 0), opt.set6(.{ .hops = 9 }, p.IPV6_UNICAST_HOPS, -1).ok.hops);
+    try std.testing.expectEqual(@as(u8, 0xB8), opt.set6(none, p.IPV6_TCLASS, 0xBB).ok.tclass);
+    try std.testing.expectEqual(@as(i64, -22), opt.set6(none, p.IPV6_TCLASS, 256).err);
+    // V6ONLY: always on here; asking for dual-stack cannot be honoured.
+    try std.testing.expectEqual(@as(i64, -22), opt.set6(none, p.IPV6_V6ONLY, 0).err);
+    _ = opt.set6(none, p.IPV6_V6ONLY, 1).ok;
+    // Unknown options / levels.
+    try std.testing.expectEqual(@as(i64, -92), opt.set(none, 99, 1).err);
+    try std.testing.expectEqual(@as(i64, -92), p.applySet(none, 7, p.IP_TTL, &.{ 1, 0, 0, 0 }).err);
+    try std.testing.expectEqual(@as(i64, -22), p.applySet(none, p.SOL_IP, p.IP_TTL, &.{ 1, 2 }).err);
+    // Readback: defaults when unset.
+    try std.testing.expectEqual(@as(?i32, 64), p.getValue(none, p.SOL_IP, p.IP_TTL));
+    try std.testing.expectEqual(@as(?i32, 33), p.getValue(.{ .ttl = 33 }, p.SOL_IP, p.IP_TTL));
+    try std.testing.expectEqual(@as(?i32, 0x28), p.getValue(.{ .tos = 0x28 }, p.SOL_IP, p.IP_TOS));
+    try std.testing.expectEqual(@as(?i32, 64), p.getValue(none, p.SOL_IPV6, p.IPV6_UNICAST_HOPS));
+    try std.testing.expectEqual(@as(?i32, 12), p.getValue(.{ .hops = 12 }, p.SOL_IPV6, p.IPV6_UNICAST_HOPS));
+    try std.testing.expectEqual(@as(?i32, 0x20), p.getValue(.{ .tclass = 0x20 }, p.SOL_IPV6, p.IPV6_TCLASS));
+    try std.testing.expectEqual(@as(?i32, 1), p.getValue(none, p.SOL_IPV6, p.IPV6_V6ONLY));
+    try std.testing.expectEqual(@as(?i32, null), p.getValue(none, p.SOL_IP, 99));
+    // Nothing set: the header is left exactly as built.
+    try std.testing.expect(!p.ipv4NeedsPatch(none) and !p.ipv6NeedsPatch(none));
+    try std.testing.expect(p.ipv4NeedsPatch(.{ .ttl = 5 }) and p.ipv4NeedsPatch(.{ .tos = 4 }));
+    try std.testing.expect(p.ipv6NeedsPatch(.{ .hops = 5 }) and p.ipv6NeedsPatch(.{ .tclass = 4 }));
+
+    // IPv4 header patch: TTL at byte 8, TOS at byte 1 with the existing ECN bits kept, and the checksum recomputed so
+    // that the header sums to zero. An ECT(0) mark (0x02) survives the patch.
+    var h4: [20]u8 = undefined;
+    v4.buildHeader(&h4, .{ 10, 0, 2, 15 }, .{ 10, 0, 2, 2 }, v4.PROTO_TCP, 100);
+    h4[1] = 0x02;
+    p.patchIpv4(&h4, .{ .ttl = 5, .tos = 0xB8 }, v4.checksum);
+    try std.testing.expectEqual(@as(u8, 5), h4[8]);
+    try std.testing.expectEqual(@as(u8, 0xBA), h4[1]);
+    try std.testing.expectEqual(@as(u16, 0), v4.checksum(&h4, 20));
+    // Only the TTL set: TOS keeps its ECN bits and stays otherwise zero.
+    v4.buildHeader(&h4, .{ 10, 0, 2, 15 }, .{ 10, 0, 2, 2 }, v4.PROTO_UDP, 40);
+    p.patchIpv4(&h4, .{ .ttl = 200 }, v4.checksum);
+    try std.testing.expectEqual(@as(u8, 200), h4[8]);
+    try std.testing.expectEqual(@as(u8, 0), h4[1]);
+    try std.testing.expectEqual(@as(u16, 0), v4.checksum(&h4, 20));
+    // Only the TOS set: the default TTL is written back.
+    v4.buildHeader(&h4, .{ 10, 0, 2, 15 }, .{ 10, 0, 2, 2 }, v4.PROTO_UDP, 40);
+    p.patchIpv4(&h4, .{ .tos = 0x20 }, v4.checksum);
+    try std.testing.expectEqual(@as(u8, 64), h4[8]);
+    try std.testing.expectEqual(@as(u8, 0x20), h4[1]);
+    try std.testing.expectEqual(@as(u16, 0), v4.checksum(&h4, 20));
+    // IPv6 header patch: hop limit at byte 7, traffic class spans bytes 0/1, ECN bits kept, address bytes untouched.
+    var h6: [40]u8 = undefined;
+    kt.ipv6.buildHeader(&h6, @splat(1), @splat(2), kt.ipv6.PROTO_TCP, 100);
+    kt.ipv6.setEct0(&h6);
+    p.patchIpv6(&h6, .{ .hops = 9, .tclass = 0xB8 });
+    try std.testing.expectEqual(@as(u8, 9), h6[7]);
+    const tc: u8 = ((h6[0] & 0x0f) << 4) | (h6[1] >> 4);
+    try std.testing.expectEqual(@as(u8, 0xBA), tc);
+    try std.testing.expectEqual(@as(u8, 0x60), h6[0] & 0xF0);
+    try std.testing.expectEqual(@as(u8, 1), h6[8]);
+    try std.testing.expectEqual(@as(u8, 2), h6[39]);
+    // Only the hop limit set: the traffic class is left alone.
+    kt.ipv6.buildHeader(&h6, @splat(1), @splat(2), kt.ipv6.PROTO_UDP, 40);
+    p.patchIpv6(&h6, .{ .hops = 3 });
+    try std.testing.expectEqual(@as(u8, 3), h6[7]);
+    try std.testing.expectEqual(@as(u8, 0x60), h6[0]);
+    try std.testing.expectEqual(@as(u8, 0), h6[1]);
+    // Only the class set: the default hop limit is written back.
+    kt.ipv6.buildHeader(&h6, @splat(1), @splat(2), kt.ipv6.PROTO_UDP, 40);
+    p.patchIpv6(&h6, .{ .tclass = 0x28 });
+    try std.testing.expectEqual(@as(u8, 64), h6[7]);
+    try std.testing.expectEqual(@as(u8, 0x28), ((h6[0] & 0x0f) << 4) | (h6[1] >> 4));
+}
+
+test "IP socket options: dispatch and send-path wiring" {
+    const so = kt.socket_opt_source;
+    // SOL_IP / SOL_IPV6 are routed before the SOL_SOCKET/SOL_TCP-only guard in both directions.
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (level == ipo.SOL_IP or level == ipo.SOL_IPV6) return setIpOpt(ref, resolved_v6, level, optname, optval_ptr, optlen);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (level == ipo.SOL_IP or level == ipo.SOL_IPV6) return getIpOpt(ref, v6, level, optname, optval_ptr, optlen_ptr);") != null);
+    // Only the level that matches the socket's family applies.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, so, "if (!ipo.levelApplies(level, fam)) return -92;"));
+    // The SOL_SOCKET round trip for TCP carries the IP options so a REUSEPORT/BROADCAST/DEBUG set does not wipe them.
+    try std.testing.expect(std.mem.indexOf(u8, so, "        .ip = o.ip,\n    };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "    o.ip = st.ip;\n}") != null);
+    // The send paths patch the finished header before ECN marking (TCP) / before framing (UDP).
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (ip_opt_policy.ipv4NeedsPatch(tcb.options.ip)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], tcb.options.ip, ipv4.checksum);\n    // SK-131/143: ECT(1) for AccECN/L4S, else ECT(0) for classic ECN.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (ip_opt_policy.ipv6NeedsPatch(tcb.options.ip)) ip_opt_policy.patchIpv6(send_pkt[14..][0..40], tcb.options.ip);\n    // SK-131/143: ECT(1) for AccECN/L4S, else ECT(0) for classic ECN.") != null);
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (ip_opt_policy.ipv4NeedsPatch(po.ip)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], po.ip, ipv4.checksum);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (ip_opt_policy.ipv6NeedsPatch(po.ip)) ip_opt_policy.patchIpv6(send_pkt[14..][0..40], po.ip);") != null);
+}

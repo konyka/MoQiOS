@@ -121,6 +121,7 @@ pub const Stored = struct {
     sndbuf: u32 = DEFAULT_BUF,
     linger_on: bool = false,
     linger_sec: u32 = 0,
+    ip: @import("ip_opt_policy.zig").IpOpts = .{},
 };
 
 fn rd32(b: []const u8) u32 {

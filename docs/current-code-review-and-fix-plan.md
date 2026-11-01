@@ -5870,3 +5870,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异（具名测试核对）：窗口缩放半字节互换、`TCP_MAXSEG` 无上限、用户上限能抬高 MSS、`established` 映射错、`snd_cwnd` 写错偏移、cwnd 不折成段数、毫秒不转微秒、已连接时仍可设 `TCP_MAXSEG`、任何拥塞算法名都接受、`TCP_INFO` 无视用户长度、MSS 忽略用户上限、`established` 状态也允许设 `TCP_MAXSEG`，共 12 个，全部被 `tcp_info policy…` 或 `TCP socket options…` 抓住（“cwnd 不折成段数”第一次因未使用参数编译失败，改成可编译形式后抓住）；恢复后 `grep -c MUTATION` 为 0。
 - 验证：host 847/847；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello177 PASS、0 个 FAIL；stress（SMP=2）5/5 PASS。
 
+### IP 层套接字选项（hello178）
+
+- 问题：`SOL_IP`/`SOL_IPV6` 层的所有选项一律 `ENOPROTOOPT`（`IP_TTL`、`IP_TOS`、`IPV6_UNICAST_HOPS`、`IPV6_TCLASS`、`IPV6_V6ONLY`），发出的报文 TTL/TOS 永远是默认值。
+- 修复：见 `docs/kernel-subsystems.md` 的 hello178 条。
+- 已知差异：只支持这五个选项（没有 `IP_MULTICAST_*`、`IP_PKTINFO`、`IP_RECVERR`、`IP_MTU_DISCOVER`、`IPV6_RECVPKTINFO`、`IPV6_MULTICAST_*` 等）；`IPV6_V6ONLY` 不可关；UDP 的 IP 选项按**源端口**查找，同一端口号只对应一个套接字，所以和其它 UDP 选项一样随端口走；TTL/TOS 只作用于 TCP 和 UDP，对 ICMP 回复、RST 等内核自发报文不生效；`IPV6_UNICAST_HOPS` 设为 0 记为 1（Linux 允许 0）。
+- 过程说明（如实）：第一次想只还原 `socket_opt.zig` 取红灯，构建失败（`tcp.zig` 引用了它新增的字段），改为把四个改动的内核文件一起暂存，旧代码上 hello178 有 24 项 FAIL，再恢复。探测用的端口（18878、18879、24878–24881）我先检查过与其它探测不冲突——吸取了 hello177 端口冲突的教训。
+- TDD：host 新增 2 个测试（选项号与层、各选项的接受/拒绝/读回、单字节和过短的值、IPv4/IPv6 报头补丁后的确切字节与校验和归零、ECN 位保留、未设置时不动；分发与发送路径的接线形状）；hello178（A IPv4 TCP 默认值/设置/ECN 位/范围/恢复默认/双向收发与层不匹配，B IPv6 TCP 同样加 V6ONLY，C UDP 两个地址族，D 未知选项）在旧内核上 24 项 FAIL，新内核 PASS。
+- 变异（具名测试核对）：`IP_TTL` 接受 0、`IP_TOS` 保留 ECN 位、`IPV6_V6ONLY` 可关、`IPV6_V6ONLY` 读回 0、IPv4 套接字响应 IPv6 层、IPv4 补丁丢 ECN 位、IPv4 补丁不重算校验和、只设 TOS 时 TTL 不恢复默认、IPv6 补丁丢 ECN 位、只设流量类别时不应用、单字节值被符号扩展、TCP 的 `SOL_SOCKET` 往返丢掉 `ip`、TCP 发送路径忽略 IP 选项、UDP IPv6 发送路径忽略 IP 选项，共 14 个，全部被 `ip_opt policy…` 或 `IP socket options…` 抓住（“IPv6 补丁丢 ECN 位”第一次因未使用变量编译失败，改成可编译形式后抓住）；恢复后 `grep -c MUTATION` 为 0。
+- 验证：host 849/849；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello178 PASS、0 个 FAIL；stress（SMP=2）5/5 PASS。
+- 备注：这一轮的 SMP=8 连续 3 次没有出现 hello152/hello174 之类的偶发失败（hello152 `loopback connection` 的原因仍未知）。
+

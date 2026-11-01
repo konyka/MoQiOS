@@ -28,6 +28,7 @@ const socket_opt = @import("socket_opt.zig");
 const bo = @import("../lib/byte_order.zig");
 const tcp_util = @import("tcp_util.zig");
 const tcp_info_policy = @import("tcp_info_policy.zig");
+const ip_opt_policy = @import("ip_opt_policy.zig");
 const tcp_recv_policy = @import("tcp_recv_policy.zig");
 const tcp_port_policy = @import("tcp_port_policy.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
@@ -1213,6 +1214,8 @@ fn sendSegmentSeq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16, 
     const csum = tcpChecksum(our_ip, tcb.remote_ip, send_pkt[tcp_off..].ptr, tcp_total);
     bo.writeU16BeAt(&send_pkt, tcp_off + 16, csum);
     ipv4.buildHeader(send_pkt[14..].ptr, our_ip, tcb.remote_ip, ipv4.PROTO_TCP, tcp_total);
+    // IP_TTL / IP_TOS (applied before ECN, which owns the low two TOS bits).
+    if (ip_opt_policy.ipv4NeedsPatch(tcb.options.ip)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], tcb.options.ip, ipv4.checksum);
     // SK-131/143: ECT(1) for AccECN/L4S, else ECT(0) for classic ECN.
     if (tcb.ecn_ok and (flags & SYN) == 0) {
         if (tcb.accecn_ok) ipv4.setEct1(send_pkt[14..].ptr) else ipv4.setEct0(send_pkt[14..].ptr);
@@ -1263,6 +1266,8 @@ fn sendSegmentV6Seq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16
     const csum = tcpChecksumV6(our_ip, tcb.remote_ip6, send_pkt[tcp_off..].ptr, tcp_total);
     bo.writeU16BeAt(&send_pkt, tcp_off + 16, csum);
     ipv6.buildHeader(send_pkt[14..].ptr, our_ip, tcb.remote_ip6, ipv6.PROTO_TCP, tcp_total);
+    // IPV6_UNICAST_HOPS / IPV6_TCLASS (applied before ECN, which owns the low two bits).
+    if (ip_opt_policy.ipv6NeedsPatch(tcb.options.ip)) ip_opt_policy.patchIpv6(send_pkt[14..][0..40], tcb.options.ip);
     // SK-131/143: ECT(1) for AccECN/L4S, else ECT(0) for classic ECN.
     if (tcb.ecn_ok and (flags & SYN) == 0) {
         if (tcb.accecn_ok) ipv6.setEct1(send_pkt[14..].ptr) else ipv6.setEct0(send_pkt[14..].ptr);

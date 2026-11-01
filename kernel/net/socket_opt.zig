@@ -41,6 +41,8 @@ pub const SocketOptions = struct {
     snd_timeout_ms: u32 = 0,
     rcv_buf_size: u32 = 16384,
     snd_buf_size: u32 = 16384,
+    /// IP_TTL / IP_TOS / IPV6_UNICAST_HOPS / IPV6_TCLASS (0 = default).
+    ip: @import("ip_opt_policy.zig").IpOpts = .{},
     /// TCP_MAXSEG set by the user (0 = none): caps the segment size.
     user_mss: u32 = 0,
     /// SO_RCVBUF / SO_SNDBUF were set: the sizes above then bound the TCP buffering.
@@ -138,6 +140,7 @@ fn storedFromTcp(o: SocketOptions) sp.Stored {
         .sndbuf = o.snd_buf_size,
         .linger_on = o.linger_on,
         .linger_sec = o.linger_sec,
+        .ip = o.ip,
     };
 }
 
@@ -151,6 +154,7 @@ fn applyStoredToTcp(o: *SocketOptions, st: sp.Stored) void {
     o.snd_buf_size = st.sndbuf;
     o.linger_on = st.linger_on;
     o.linger_sec = st.linger_sec;
+    o.ip = st.ip;
 }
 
 fn currentCred() sp.Cred {
@@ -464,11 +468,80 @@ fn getTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen
 
 // ─── public entry points ──────────────────────────────────────────────────
 
+const ipo = @import("ip_opt_policy.zig");
+
+fn socketFamily(ref: SockRef, v6_hint: bool) ?ipo.Family {
+    return switch (ref) {
+        .tcp => |idx| if (@import("tcp.zig").tcpIsV6(idx)) .v6 else .v4,
+        .udp => if (v6_hint) .v6 else .v4,
+        else => null,
+    };
+}
+
+/// setsockopt at SOL_IP / SOL_IPV6: only IP sockets, and only the level that matches their family.
+fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u64, optlen: u64) i64 {
+    const fam = socketFamily(ref, v6_hint) orelse return -92;
+    if (!ipo.levelApplies(level, fam)) return -92;
+    var raw: [16]u8 = undefined;
+    const n = readOptval(optval_ptr, optlen, &raw);
+    if (n < 0) return n;
+    switch (ref) {
+        .tcp => |idx| {
+            const tcp_mod = @import("tcp.zig");
+            var o = tcp_mod.tcpGetOptions(idx) orelse return -9;
+            switch (ipo.applySet(o.ip, level, optname, raw[0..@intCast(n)])) {
+                .err => |e| return e,
+                .ok => |v| o.ip = v,
+            }
+            return if (tcp_mod.tcpSetOptions(idx, o)) 0 else -9;
+        },
+        .udp => |port| {
+            const udp_mod = @import("udp.zig");
+            var st = udp_mod.getPortOpts(port) orelse return -9;
+            switch (ipo.applySet(st.ip, level, optname, raw[0..@intCast(n)])) {
+                .err => |e| return e,
+                .ok => |v| st.ip = v,
+            }
+            return if (udp_mod.setPortOpts(port, st)) 0 else -9;
+        },
+        else => return -92,
+    }
+}
+
+fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u64, optlen_ptr: u64) i64 {
+    const fam = socketFamily(ref, v6_hint) orelse return -92;
+    if (!ipo.levelApplies(level, fam)) return -92;
+    const cur: ipo.IpOpts = switch (ref) {
+        .tcp => |idx| (@import("tcp.zig").tcpGetOptions(idx) orelse return -9).ip,
+        .udp => |port| (@import("udp.zig").getPortOpts(port) orelse return -9).ip,
+        else => return -92,
+    };
+    const v = ipo.getValue(cur, level, optname) orelse return -92;
+    const copy_mod = @import("../mm/copy_from_user.zig");
+    if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14;
+    if (optlen_ptr == 0 or optlen_ptr >= 0x0000_8000_0000_0000) return -14;
+    if (!copy_mod.validateUserBuffer(optlen_ptr, 4) or !copy_mod.validateUserBufferWritable(optlen_ptr, 4)) return -14;
+    var len_buf: [4]u8 = undefined;
+    if (copy_mod.copyFromUser(&len_buf, @ptrFromInt(optlen_ptr), 4) != 4) return -14;
+    const user_len = bo.readU32Le(&len_buf);
+    var out: [4]u8 = undefined;
+    bo.writeU32Le(&out, @bitCast(v));
+    const n: u32 = @min(user_len, 4);
+    if (n > 0 and copy_mod.copyToUser(@ptrFromInt(optval_ptr), out[0..n], n) != n) return -14;
+    var len_out: [4]u8 = undefined;
+    bo.writeU32Le(&len_out, n);
+    if (copy_mod.copyToUser(@ptrFromInt(optlen_ptr), &len_out, 4) != 4) return -14;
+    return 0;
+}
+
 pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen: u64) i64 {
-    const ref: SockRef = switch (resolveSocket(fd)) {
+    const resolved = resolveSocket(fd);
+    const ref: SockRef = switch (resolved) {
         .ok, .v6 => |r| r,
         .err => |e| return e,
     };
+    const resolved_v6 = resolved == .v6;
+    if (level == ipo.SOL_IP or level == ipo.SOL_IPV6) return setIpOpt(ref, resolved_v6, level, optname, optval_ptr, optlen);
     if (level != SOL_SOCKET and level != SOL_TCP) return -92; // ENOPROTOOPT
     switch (ref) {
         .tcp => |idx| {
@@ -529,6 +602,7 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
         .err => |e| return e,
     };
     const v6 = resolved == .v6;
+    if (level == ipo.SOL_IP or level == ipo.SOL_IPV6) return getIpOpt(ref, v6, level, optname, optval_ptr, optlen_ptr);
     if (level != SOL_SOCKET and level != SOL_TCP) return -92; // ENOPROTOOPT
     // TCP keeps its own SOL_TCP set and its SO_ERROR clearing.
     if (ref == .tcp and level == SOL_TCP) return getTcpSockopt(ref.tcp, level, optname, optval_ptr, optlen_ptr);
