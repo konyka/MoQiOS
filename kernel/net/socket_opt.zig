@@ -505,7 +505,7 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
         .unix => |idx| {
             const view = @import("unix_socket.zig").unixOptView(idx) orelse return -9;
             stored = view.opts;
-            facts = .{ .id = sp.identity(if (view.stream) .unix_stream else .unix_dgram, false), .accepting = view.listening, .cred = view.peer_cred };
+            facts = .{ .id = sp.identity(if (view.sock_type == 5) .unix_seqpacket else if (view.stream) .unix_stream else .unix_dgram, false), .accepting = view.listening, .cred = view.peer_cred };
         },
         .raw => {},
     }

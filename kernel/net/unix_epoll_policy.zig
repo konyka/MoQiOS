@@ -28,6 +28,9 @@ pub const State = struct {
     send_broken: bool = false,
     /// STREAM only: the peer shut its writing side (shutdown(SHUT_WR)).
     peer_shut_wr: bool = false,
+    /// Records keep their boundaries (datagram, seqpacket): a send needs room for
+    /// the length prefix plus a byte, even on a connection-oriented socket.
+    msg_boundaries: bool = false,
     /// Free bytes in the ring of the peer this socket sends into; null when
     /// there is no valid peer to block on (send fails immediately instead).
     peer_free: ?u32,
@@ -46,7 +49,7 @@ pub fn events(s: State) u32 {
     if (s.stream and s.peer_shut_wr) ev |= EPOLLRDHUP;
     if (s.stream and s.disconnected) return ev | EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP;
     if (s.peer_free) |free| {
-        const min_room: u32 = if (s.stream) 1 else DGRAM_MIN_ROOM;
+        const min_room: u32 = if (s.stream and !s.msg_boundaries) 1 else DGRAM_MIN_ROOM;
         if (free >= min_room) ev |= EPOLLOUT;
     } else {
         ev |= EPOLLOUT;

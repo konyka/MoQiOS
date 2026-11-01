@@ -19,6 +19,13 @@ const scm = @import("scm_policy.zig");
 pub const AF_UNIX: u32 = 1;
 pub const SOCK_STREAM: u32 = 1;
 pub const SOCK_DGRAM: u32 = 2;
+pub const SOCK_SEQPACKET: u32 = 5;
+
+/// Connected types (a closed peer is EOF/EPIPE, not "nothing yet"): stream and
+/// seqpacket. Seqpacket keeps record boundaries like a datagram socket.
+fn connectionOriented(sock_type: u32) bool {
+    return sock_type == SOCK_STREAM or sock_type == SOCK_SEQPACKET;
+}
 
 pub const UNIX_SOCK_BUF_SIZE: u32 = 8192;
 pub const MAX_UNIX_SOCKETS: u32 = 32;
@@ -337,7 +344,7 @@ pub const UnixSocketPair = struct {
 
 /// Allocate and connect both endpoints while holding the pool lock.
 pub fn unixSocketPair(sock_type: u32) i32 {
-    if (sock_type != SOCK_STREAM and sock_type != SOCK_DGRAM) return -22;
+    if (sock_type != SOCK_STREAM and sock_type != SOCK_DGRAM and sock_type != SOCK_SEQPACKET) return -22;
     const saved = unix_lock.acquire();
     defer unix_lock.release(saved);
 
@@ -382,6 +389,7 @@ pub fn unixSetCred(idx: u32, cred: @import("sockopt_policy.zig").Cred) void {
 
 pub const OptView = struct {
     opts: @import("sockopt_policy.zig").Stored,
+    sock_type: u32 = SOCK_STREAM,
     stream: bool,
     listening: bool,
     peer_cred: ?@import("sockopt_policy.zig").Cred,
@@ -396,7 +404,7 @@ pub fn unixOptView(idx: u32) ?OptView {
     if (!sock.active) return null;
     var peer: ?@import("sockopt_policy.zig").Cred = null;
     if (sock.peer_idx < MAX_UNIX_SOCKETS and unix_sockets[sock.peer_idx].active) peer = unix_sockets[sock.peer_idx].cred;
-    return .{ .opts = sock.opts, .stream = sock.sock_type == SOCK_STREAM, .listening = sock.listening, .peer_cred = peer orelse .{} };
+    return .{ .opts = sock.opts, .sock_type = sock.sock_type, .stream = sock.sock_type == SOCK_STREAM, .listening = sock.listening, .peer_cred = peer orelse .{} };
 }
 
 pub fn unixSetOpts(idx: u32, opts: @import("sockopt_policy.zig").Stored) bool {
@@ -701,7 +709,10 @@ pub fn unixSendRights(idx: u32, data: [*]const u8, len: usize, rights: ?*RightsI
     } else {
         // DGRAM
         const peer_i: u32 = sock.peer_idx;
-        if (peer_i >= MAX_UNIX_SOCKETS or !unix_sockets[peer_i].active) return -107; // ENOTCONN
+        if (peer_i >= MAX_UNIX_SOCKETS or !unix_sockets[peer_i].active) {
+            // A seqpacket socket was connected: a vanished peer is EPIPE.
+            return if (sock.sock_type == SOCK_SEQPACKET and sock.was_connected) -32 else -107;
+        }
 
         const peer = &unix_sockets[peer_i];
         // For DGRAM, write the datagram length prefix (2 bytes LE) + data
@@ -774,7 +785,7 @@ pub fn unixPeek(idx: u32, buf: [*]u8, len: usize, full_len: *usize) i64 {
     const sock = &unix_sockets[idx];
     if (!sock.active) return -9;
     if (sock.buf_count == 0) {
-        if (sock.sock_type == SOCK_STREAM and !sock.connected and !queuedOnBacklogLocked(idx)) return 0;
+        if (connectionOriented(sock.sock_type) and !sock.connected and !queuedOnBacklogLocked(idx)) return 0;
         if (shutEofLocked(idx)) return 0;
         return -11;
     }
@@ -830,7 +841,7 @@ pub fn unixRecvRights(idx: u32, buf: [*]u8, len_in: usize, out: ?*RightsOut) i64
     if (sock.buf_count == 0) {
         // STREAM with no peer (never connected, or peer closed): no data can
         // ever arrive — report EOF instead of EAGAIN.
-        if (sock.sock_type == SOCK_STREAM and !sock.connected and !queuedOnBacklogLocked(idx)) return 0;
+        if (connectionOriented(sock.sock_type) and !sock.connected and !queuedOnBacklogLocked(idx)) return 0;
         if (shutEofLocked(idx)) return 0;
         return -11; // EAGAIN
     }
@@ -1085,7 +1096,7 @@ fn parkOn(idx: u32, kind: WaitKind, min_room: u32, deadline: ?u64) i64 {
         // The condition may have changed between the caller's check and now;
         // the wake side holds this same lock, so re-testing here loses no wake-up.
         const still = switch (kind) {
-            .read => sock.buf_count == 0 and !shutEofLocked(idx) and (sock.sock_type != SOCK_STREAM or sock.connected or queuedOnBacklogLocked(idx)),
+            .read => sock.buf_count == 0 and !shutEofLocked(idx) and (!connectionOriented(sock.sock_type) or sock.connected or queuedOnBacklogLocked(idx)),
             .accept => sock.backlog_count == 0 and sock.listening,
             // A writer waits while the peer's ring has no room; with no peer
             // to wait for the caller re-tries and gets the real error.
@@ -1312,7 +1323,8 @@ pub fn unixEpollEvents(idx: u32) u32 {
     const sock = &unix_sockets[idx];
     if (!sock.active) return EPOLLERR;
     return policy.events(.{
-        .stream = sock.sock_type == SOCK_STREAM,
+        .stream = connectionOriented(sock.sock_type),
+        .msg_boundaries = sock.sock_type != SOCK_STREAM,
         .rx_bytes = sock.buf_count,
         .listening = sock.listening,
         .pending_connections = sock.backlog_count,
@@ -1320,7 +1332,7 @@ pub fn unixEpollEvents(idx: u32) u32 {
         .read_eof = sock.sock_type == SOCK_STREAM and np.halfCloseReadEof(halfCloseLocked(idx)),
         .send_broken = sock.sock_type == SOCK_STREAM and np.halfCloseSendBroken(halfCloseLocked(idx)),
         .peer_shut_wr = sock.sock_type == SOCK_STREAM and halfCloseLocked(idx).peer_shut_wr,
-        .connect_pending = sock.sock_type == SOCK_STREAM and !sock.connected and queuedOnBacklogLocked(idx),
+        .connect_pending = connectionOriented(sock.sock_type) and !sock.connected and queuedOnBacklogLocked(idx),
         .peer_free = sendRoomLocked(idx),
     });
 }

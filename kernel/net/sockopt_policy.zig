@@ -31,10 +31,11 @@ pub const AF_INET6: u32 = 10;
 pub const SOCK_STREAM: u32 = 1;
 pub const SOCK_DGRAM: u32 = 2;
 pub const SOCK_RAW: u32 = 3;
+pub const SOCK_SEQPACKET: u32 = 5;
 pub const IPPROTO_TCP: u32 = 6;
 pub const IPPROTO_UDP: u32 = 17;
 
-pub const Kind = enum { tcp, udp, unix_stream, unix_dgram, raw };
+pub const Kind = enum { tcp, udp, unix_stream, unix_dgram, unix_seqpacket, raw };
 
 pub const Identity = struct { domain: u32, sock_type: u32, protocol: u32 };
 
@@ -45,6 +46,7 @@ pub fn identity(kind: Kind, v6: bool) Identity {
         .udp => .{ .domain = inet, .sock_type = SOCK_DGRAM, .protocol = IPPROTO_UDP },
         .unix_stream => .{ .domain = AF_UNIX, .sock_type = SOCK_STREAM, .protocol = 0 },
         .unix_dgram => .{ .domain = AF_UNIX, .sock_type = SOCK_DGRAM, .protocol = 0 },
+        .unix_seqpacket => .{ .domain = AF_UNIX, .sock_type = SOCK_SEQPACKET, .protocol = 0 },
         .raw => .{ .domain = inet, .sock_type = SOCK_RAW, .protocol = 0 },
     };
 }

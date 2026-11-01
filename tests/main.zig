@@ -1808,7 +1808,7 @@ test "socketpair policy rejects unsupported combinations before allocation" {
     try std.testing.expectEqual(kt.errno.EINVAL, socketpair_policy.validate(2, 1, 0));
     try std.testing.expectEqual(kt.errno.EINVAL, socketpair_policy.validate(1, 1, 6));
     try std.testing.expectEqual(@as(i64, 0), socketpair_policy.validate(1, 2, 0)); // SOCK_DGRAM is supported since hello163
-    try std.testing.expectEqual(kt.errno.EINVAL, socketpair_policy.validate(1, 5, 0)); // SOCK_SEQPACKET is not
+    try std.testing.expectEqual(kt.errno.EINVAL, socketpair_policy.validate(1, 9, 0)); // not a socket type
     try std.testing.expectEqual(kt.errno.EINVAL, socketpair_policy.validate(1, 1 | 0x400, 0));
 }
 
@@ -8348,13 +8348,15 @@ test "ppoll, pselect6 and select write the remaining timeout back" {
     try std.testing.expect(std.mem.count(u8, kt.select_source, "finishTimeout(back, rc)") >= 2);
 }
 
-test "socketpair accepts stream and datagram, nothing else" {
+test "socketpair accepts stream, datagram and seqpacket, nothing else" {
     const sp = kt.socketpair_policy;
     try std.testing.expectEqual(@as(i64, 0), sp.validate(1, 1, 0));
     try std.testing.expectEqual(@as(i64, 0), sp.validate(1, 2, 0));
     try std.testing.expectEqual(@as(i64, 0), sp.validate(1, 2 | sp.SOCK_NONBLOCK | sp.SOCK_CLOEXEC, 0));
     try std.testing.expectEqual(@as(i64, -22), sp.validate(1, 3, 0));
-    try std.testing.expectEqual(@as(i64, -22), sp.validate(1, 5, 0));
+    try std.testing.expectEqual(@as(i64, 0), sp.validate(1, 5, 0)); // SOCK_SEQPACKET since hello168
+    try std.testing.expectEqual(@as(i64, -22), sp.validate(1, 4, 0)); // SOCK_RDM
+    try std.testing.expectEqual(@as(i64, -22), sp.validate(1, 9, 0));
     try std.testing.expectEqual(@as(i64, -22), sp.validate(2, 2, 0));
     try std.testing.expectEqual(@as(i64, -22), sp.validate(1, 2, 7));
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "unixSocketPair(sock_type & 0xff)") != null);
@@ -8523,4 +8525,38 @@ test "recvmsg honours MSG_PEEK / MSG_WAITALL / MSG_TRUNC on AF_UNIX and TCP" {
     // The old per-iovec consume-then-copy loop must not come back: iovecs are validated first.
     const at = std.mem.indexOf(u8, src, "// Validate every iovec and total the room first").?;
     try std.testing.expect(at > 0);
+}
+
+test "seqpacket: identity, epoll room rule and the connection-oriented paths" {
+    const spo = kt.sockopt_policy;
+    try std.testing.expectEqual(@as(u32, 5), spo.identity(.unix_seqpacket, false).sock_type);
+    try std.testing.expectEqual(@as(u32, 1), spo.identity(.unix_seqpacket, false).domain);
+    try std.testing.expectEqual(@as(u32, 1), spo.identity(.unix_stream, false).sock_type);
+    try std.testing.expectEqual(@as(u32, 2), spo.identity(.unix_dgram, false).sock_type);
+
+    // A connected seqpacket socket sends records: it needs room for the
+    // length prefix, like a datagram, not a single byte like a stream.
+    const up = kt.unix_epoll_policy;
+    const seq: up.State = .{ .stream = true, .msg_boundaries = true, .rx_bytes = 0, .listening = false, .pending_connections = 0, .disconnected = false, .peer_free = 2 };
+    try std.testing.expectEqual(@as(u32, 0), up.events(seq) & up.EPOLLOUT);
+    var roomy = seq;
+    roomy.peer_free = 3;
+    try std.testing.expect(up.events(roomy) & up.EPOLLOUT != 0);
+    var strm = seq;
+    strm.msg_boundaries = false;
+    strm.peer_free = 1;
+    try std.testing.expect(up.events(strm) & up.EPOLLOUT != 0);
+
+    const src = kt.unix_socket_source;
+    try std.testing.expect(std.mem.indexOf(u8, src, "fn connectionOriented(sock_type: u32) bool") != null);
+    // connectionOriented is exactly {stream, seqpacket}: a datagram socket is not.
+    try std.testing.expect(std.mem.indexOf(u8, src, "return sock_type == SOCK_STREAM or sock_type == SOCK_SEQPACKET;") != null);
+    // socketpair really builds a seqpacket pair (the type check admits all three).
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (sock_type != SOCK_STREAM and sock_type != SOCK_DGRAM and sock_type != SOCK_SEQPACKET) return -22;\n    const saved") != null);
+    // Both receive paths (read and peek) report EOF for a connection-oriented socket with no peer.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, "if (connectionOriented(sock.sock_type) and !sock.connected and !queuedOnBacklogLocked(idx)) return 0;"));
+    // A blocking read waits only while a peer may still send.
+    try std.testing.expect(std.mem.indexOf(u8, src, "(!connectionOriented(sock.sock_type) or sock.connected or queuedOnBacklogLocked(idx))") != null);
+    // A vanished seqpacket peer is EPIPE, not ENOTCONN.
+    try std.testing.expect(std.mem.indexOf(u8, src, "sock.sock_type == SOCK_SEQPACKET and sock.was_connected) -32 else -107") != null);
 }

@@ -5765,3 +5765,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 新增 1 个测试（两条路径都接了对应的入口与标志集；先校验 iovec）；hello167（A AF_UNIX 流 peek 不消费、B 数据报 peek/`MSG_TRUNC`/`msg_flags`、C TCP peek、D 两种流上 `MSG_WAITALL` 填满两个 iovec、E 对端提前关闭时不挂住）在 HEAD 上 9 项 FAIL，新内核 PASS。
 - 变异（核对原始输出）：`MSG_TRUNC` 不置 `msg_flags`、`MSG_TRUNC` 不返回真实长度、TCP `recvmsg` 恢复接受任意标志、TCP `MSG_WAITALL` 关掉、TCP peek 改走消费型 `tcpRecv`、AF_UNIX `MSG_WAITALL` 关掉，都被具名 host 测试抓住。**最初 AF_UNIX `MSG_WAITALL` 关掉的变异没被抓住**（测试只检查标志名字出现过），我把检查收紧为必须出现“got 且 WAITALL 才进入循环 / 循环按 `waitAllStep` 继续 / 继续读用非阻塞=false” 这三处形状后才抓住；“AF_UNIX peek 改走消费路径”那个变异因参数不匹配编译失败，不算证据。
 - 验证：host 832/832；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（240 s 超时）与 GPT SMP=2 均 hello167 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### socketpair(AF_UNIX, SOCK_SEQPACKET)（hello168）
+
+- 问题：hello163 记录的已知差异：`SOCK_SEQPACKET` 的 `socketpair` 未实现（`EINVAL`）。
+- 修复：见 `docs/kernel-subsystems.md` 的 hello168 条：复用数据报环形缓冲的记录格式，但按“面向连接”处理 EOF/EPIPE/阻塞读唤醒/epoll 断开；`SO_TYPE` 报 5。
+- 已知差异：只有 `socketpair` 能创建；`socket(AF_UNIX, SOCK_SEQPACKET)` + `listen/accept` 仍然 `EINVAL`。
+- TDD：host 新增 1 个测试（身份、epoll 余量规则、`connectionOriented` 的接线）并更新了 2 个把“SEQPACKET 被拒绝”钉死的旧测试（这正是要改变的行为）；hello168（A 创建与 `SO_TYPE`、B 记录边界与双向、C `MSG_TRUNC` 与丢弃余量、D 对端关闭后 EOF 与 poll、E 阻塞读被关闭唤醒、F 标志与 `SOCK_RAW` 仍被拒）在 HEAD 上 A 段失败（后续各项无法进行），新内核 PASS。
+- 变异（具名测试核对）：seqpacket 对端消失返回 `ENOTCONN`、epoll 沿用流的“1 字节”余量、`socketpair` 策略拒绝 seqpacket、`SO_TYPE` 身份写错，被 host 测试抓住。**最初有两个变异没被抓住**：把 `connectionOriented` 改成只含 STREAM、把 `unixSocketPair` 的类型检查改回只放行 STREAM/DGRAM（测试只检查函数名存在）；已把测试收紧为检查它们的确切返回表达式和类型检查，之后两个都被具名测试抓住。
+- 验证：host 833/833；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（240 s）与 GPT SMP=2 均 hello168 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
