@@ -374,7 +374,7 @@ gdb zig-out/bin/moqi-kernel.elf
 | `MOQI_SMP` | QEMU 传给内核的 CPU 核数（正整数）；smoke/smoke-smp/smoke-smp-stress 均读此变量 | `1`（smoke），`2`（smoke-smp/smoke-smp-stress） |
 | `MOQI_SMOKE_MATRIX_CPUS` | smoke-smp-matrix 要依次测试的核数列表（空格分隔） | `"1 2 3 4 6 8"` |
 | `MOQI_SMOKE_RUNS` | smoke-smp-stress 连续运行次数 | `5` |
-| `MOQI_SMOKE_TIMEOUT` | 单次 smoke 超时秒数；TCG 下跑 16 核建议设为 600。§6.49 起默认值随套件规模上调（hello96-100 的 swap/reclaim 压力测试加入后，空载宿主机全套约 190s 含构建） | `900` |
+| `MOQI_SMOKE_TIMEOUT` | 单次 smoke 超时秒数；TCG 下跑 16 核建议设为 600。§6.49 起默认值随套件规模上调（hello96-100 的 swap/reclaim 压力测试加入后，空载宿主机全套约 190s 含构建）。到 hello166 时，SMP=8 的完整套件仅运行就需约 95–115 秒（不含构建），SMP=1/2 约 50–80 秒；手工设置的超时低于 200 秒会把“刚好跑到 shell”的正常运行误判为超时 | `900` |
 | `MOQI_SMOKE_STRICT_SMP` | `1`：smoke 检查 "N CPUs online" 与请求核数一致（可因 MADT/资源降级）；`0`：允许部分上线 | `1` |
 
 ### 9.2 Host test duration observation
