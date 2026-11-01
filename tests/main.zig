@@ -8758,3 +8758,68 @@ test "TCP delivery-rate samples: only bulk, recent acknowledgements measure the 
     // And the wiring: the sampler consults the rule instead of accepting any positive elapsed time.
     try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "if (tcp_util.deliverySampleUsable(delivered, mssForTcb(tcb), elapsed)) {") != null);
 }
+
+test "SO_SNDBUF / SO_RCVBUF values: doubling, minimums and the rmem_max cap never overflow" {
+    const p = kt.sockopt_policy;
+    // Runtime-known requests: with comptime arguments the whole call folds at compile time and hides a narrowed integer type.
+    var req: u32 = 8192;
+    std.mem.doNotOptimizeAway(&req);
+    try std.testing.expectEqual(@as(u32, 16384), p.bufferValue(req, p.SOCK_MIN_SNDBUF));
+    req = 100;
+    try std.testing.expectEqual(@as(u32, 4608), p.bufferValue(req, p.SOCK_MIN_SNDBUF));
+    try std.testing.expectEqual(@as(u32, 2304), p.bufferValue(req, p.SOCK_MIN_RCVBUF));
+    req = 0;
+    try std.testing.expectEqual(@as(u32, 0), p.bufferValue(req, 0));
+    // Requests at and above rmem_max are capped, then doubled: 2 * 212992 does not fit in the 18 bits that
+    // @min(request, RMEM_MAX) would narrow to.
+    req = p.RMEM_MAX;
+    try std.testing.expectEqual(@as(u32, 2 * p.RMEM_MAX), p.bufferValue(req, p.SOCK_MIN_RCVBUF));
+    req = 131072;
+    try std.testing.expectEqual(@as(u32, 262144), p.bufferValue(req, p.SOCK_MIN_RCVBUF));
+    req = 1 << 20;
+    try std.testing.expectEqual(@as(u32, 2 * p.RMEM_MAX), p.bufferValue(req, p.SOCK_MIN_SNDBUF));
+    req = 1 << 30;
+    try std.testing.expectEqual(@as(u32, 2 * p.RMEM_MAX), p.bufferValue(req, p.SOCK_MIN_SNDBUF));
+    req = std.math.maxInt(u32);
+    try std.testing.expectEqual(@as(u32, 2 * p.RMEM_MAX), p.bufferValue(req, p.SOCK_MIN_SNDBUF));
+}
+
+test "TCP buffer limits: SO_SNDBUF / SO_RCVBUF bound the rings only when set" {
+    const tu = kt.tcp_util;
+    // Never set: the whole ring (one slot is reserved).
+    try std.testing.expectEqual(@as(u32, 65535), tu.bufferLimit(false, 16384, 65536));
+    // Set: half of the stored (doubled) value, never more than the ring.
+    try std.testing.expectEqual(@as(u32, 8192), tu.bufferLimit(true, 16384, 65536));
+    try std.testing.expectEqual(@as(u32, 2304), tu.bufferLimit(true, 4608, 65536));
+    try std.testing.expectEqual(@as(u32, 65535), tu.bufferLimit(true, 425984, 65536));
+    try std.testing.expectEqual(@as(u32, 0), tu.bufferLimit(true, 0, 65536));
+    // Room under a limit saturates: a limit lowered below what is queued leaves no room, never a huge wrapped one.
+    try std.testing.expectEqual(@as(u32, 4096), tu.roomUnder(4096, 8192));
+    try std.testing.expectEqual(@as(u32, 0), tu.roomUnder(8192, 8192));
+    try std.testing.expectEqual(@as(u32, 0), tu.roomUnder(9000, 8192));
+
+    // Wiring: every place that sizes the send ring or the window goes through the limit.
+    const src = kt.tcp_source;
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, "const free_space = tcp_util.roomUnder(used, sendLimit(tcb));"));
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (tcp_util.roomUnder(used, sendLimit(tcb)) > 0) return 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "return tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, ".send_space = tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb)),") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, "RECV_BUF_SIZE), rcvWindowCap(tcb));"));
+    try std.testing.expect(std.mem.indexOf(u8, src, "return @min(TCP_WINDOW, tcp_util.bufferLimit(tcb.options.rcv_buf_set, tcb.options.rcv_buf_size, RECV_BUF_SIZE));") != null);
+    // The option setter stores the doubled, clamped value and records that the option was set.
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, "opts.snd_buf_size = sp.bufferValue(bo.readU32Le(&buf), sp.SOCK_MIN_SNDBUF);\n                opts.snd_buf_set = true;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "opts.rcv_buf_size = sp.bufferValue(bo.readU32Le(&buf), sp.SOCK_MIN_RCVBUF);\n                opts.rcv_buf_set = true;") != null);
+}
+
+test "TCP delivery-rate sampling restarts after the connection goes idle" {
+    const tu = kt.tcp_util;
+    // Everything acknowledged: the next sample has no base (it only seeds one).
+    try std.testing.expectEqual(@as(u32, 0), tu.sampleBaseAfterAck(true, 12345));
+    // Data still in flight: the sample base is now.
+    try std.testing.expectEqual(@as(u32, 12345), tu.sampleBaseAfterAck(false, 12345));
+    // A zero base means the sampler skips the next sample.
+    const src = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, src, "tcb.rate_sample_ms = tcp_util.sampleBaseAfterAck(tcb.snd_una == tcb.snd_nxt, now);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (tcb.rate_sample_ms != 0) {\n        const elapsed = now -% tcb.rate_sample_ms;") != null);
+}

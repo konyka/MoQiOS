@@ -300,6 +300,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello171"); /* TCP connect to a closed IPv6 loopback port */
     run_test("hello172"); /* UDP ICMPv6 port unreachable on loopback */
     run_test("hello173"); /* ioctl(TIOCOUTQ) on sockets */
+    run_test("hello174"); /* SO_SNDBUF / SO_RCVBUF on TCP */
 
     start_persistent_services();
 

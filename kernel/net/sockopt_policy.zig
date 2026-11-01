@@ -78,8 +78,10 @@ pub const SOCK_MIN_SNDBUF: u32 = 4608;
 
 /// SO_RCVBUF / SO_SNDBUF: the value getsockopt reports after a set.
 pub fn bufferValue(requested: u32, min: u32) u32 {
-    const capped = @min(requested, RMEM_MAX);
-    return @max(capped * 2, min);
+    // @min against a comptime constant narrows its result type to the bits that
+    // constant needs, and doubling the capped value then overflows it: widen first.
+    const capped: u32 = @min(requested, RMEM_MAX);
+    return @max(capped *| 2, min);
 }
 
 /// The value getsockopt reports for a buffer that was never set.

@@ -1716,7 +1716,7 @@ fn noteDelivery(tcb: *TcpTcb, delivered: u32) void {
             }
         }
     }
-    tcb.rate_sample_ms = now;
+    tcb.rate_sample_ms = tcp_util.sampleBaseAfterAck(tcb.snd_una == tcb.snd_nxt, now);
 }
 
 /// Close an AccECN RTT sample into the CE-rate EWMA when due (SK-146).
@@ -2854,7 +2854,7 @@ fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) void
     // v53.3: only advance rcv_nxt by actually buffered bytes
     // (if recv_buf is full, to_copy < len, so we don't skip unbuffered seq nums)
     tcb.rcv_nxt +%= to_copy;
-    tcb.rcv_wnd = tcp_util.rcvWindowFromBuffered(ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE), TCP_WINDOW);
+    tcb.rcv_wnd = tcp_util.rcvWindowFromBuffered(ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE), rcvWindowCap(tcb));
 
     // Delayed ACK: every-other-segment rule (disabled by TCP_QUICKACK)
     if (tcb.options.tcp_quickack) {
@@ -3044,7 +3044,7 @@ pub fn tcpSend(tcb_idx: u32, data: [*]const u8, len: u32) i64 {
 
     // Copy data to send ring buffer (batched @memcpy)
     const used = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
-    const free_space = SEND_BUF_SIZE - 1 - used;
+    const free_space = tcp_util.roomUnder(used, sendLimit(tcb));
     const to_copy = @min(len, free_space);
     ringWrite(&tcb.send_buf, SEND_BUF_SIZE, tcb.send_tail, data, to_copy);
     tcb.send_tail = (tcb.send_tail + to_copy) % SEND_BUF_SIZE;
@@ -3095,7 +3095,7 @@ pub fn tcpSendFromUser(tcb_idx: u32, user_addr: u64, len: u32) i64 {
             return if (total > 0) @intCast(total) else -1;
         }
         const used = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
-        const free_space = SEND_BUF_SIZE - 1 - used;
+        const free_space = tcp_util.roomUnder(used, sendLimit(tcb));
         const to_copy = @min(chunk, free_space);
         ringWrite(&tcb.send_buf, SEND_BUF_SIZE, tcb.send_tail, &stage, to_copy);
         tcb.send_tail = (tcb.send_tail + to_copy) % SEND_BUF_SIZE;
@@ -3469,7 +3469,7 @@ fn waitSendSpace(tcb_idx: u32, st: *SendWait) i64 {
         // now, the send reports the real error / progress.
         if (!tcp_recv_policy.canQueueSend(tcb.state, tcb.fin_pending)) return 0;
         const used = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
-        if (SEND_BUF_SIZE - 1 - used > 0) return 0;
+        if (tcp_util.roomUnder(used, sendLimit(tcb)) > 0) return 0;
         if (tcp_recv_policy.timedOut(st.deadline, tsc.nanos())) return -11;
 
         node.task_idx = cur_idx;
@@ -3596,7 +3596,7 @@ fn recvLocked(tcb: *TcpTcb, buf: [*]u8, len: u32) i64 {
     ringRead(&tcb.recv_buf, RECV_BUF_SIZE, tcb.recv_head, buf, to_read);
     tcb.recv_head = (tcb.recv_head + to_read) % RECV_BUF_SIZE;
 
-    tcb.rcv_wnd = tcp_util.rcvWindowFromBuffered(ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE), TCP_WINDOW);
+    tcb.rcv_wnd = tcp_util.rcvWindowFromBuffered(ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE), rcvWindowCap(tcb));
 
     // Flush delayed ACK when app reads data (advertises updated window promptly).
     // Also sends a window update if a significant amount was consumed.
@@ -4172,6 +4172,16 @@ pub fn tcpRecvAvailable(tcb_idx: u32) u32 {
     return ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
 }
 
+/// Payload the send ring may hold: SO_SNDBUF (when set) bounds it.
+fn sendLimit(tcb: *const TcpTcb) u32 {
+    return tcp_util.bufferLimit(tcb.options.snd_buf_set, tcb.options.snd_buf_size, SEND_BUF_SIZE);
+}
+
+/// Receive window ceiling: SO_RCVBUF (when set) lowers it below TCP_WINDOW.
+fn rcvWindowCap(tcb: *const TcpTcb) u32 {
+    return @min(TCP_WINDOW, tcp_util.bufferLimit(tcb.options.rcv_buf_set, tcb.options.rcv_buf_size, RECV_BUF_SIZE));
+}
+
 /// Bytes in the send ring: data written but not yet acknowledged by the peer
 /// (sent or not), what SIOCOUTQ reports. Lock-free, like tcpRecvAvailable.
 pub fn tcpSendQueued(tcb_idx: u32) u32 {
@@ -4187,7 +4197,7 @@ pub fn tcpSendSpace(tcb_idx: u32) u32 {
     if (tcb_idx >= MAX_CONNECTIONS) return 0;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return 0;
-    return ringAvailable(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
+    return tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb));
 }
 
 /// poll/epoll readiness of a TCP socket (lock-free snapshot, like the other status queries).
@@ -4199,7 +4209,7 @@ pub fn tcpReadiness(tcb_idx: u32) u32 {
         .active = tcb.active,
         .state = tcb.state,
         .recv_bytes = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE),
-        .send_space = ringAvailable(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE),
+        .send_space = tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb)),
         .reset_by_peer = tcb.reset_by_peer,
         .shut_rd = tcb.shut_rd,
         .fin_pending = tcb.fin_pending,

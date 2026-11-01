@@ -41,6 +41,9 @@ pub const SocketOptions = struct {
     snd_timeout_ms: u32 = 0,
     rcv_buf_size: u32 = 16384,
     snd_buf_size: u32 = 16384,
+    /// SO_RCVBUF / SO_SNDBUF were set: the sizes above then bound the TCP buffering.
+    rcv_buf_set: bool = false,
+    snd_buf_set: bool = false,
     keep_idle: u32 = 7200, // seconds before first keepalive probe
     keep_intvl: u32 = 75, // seconds between keepalive probes
     keep_cnt: u32 = 9, // number of keepalive probes before dropping
@@ -202,13 +205,15 @@ fn setTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen
                 if (optlen < 4) return -22;
                 var buf: [4]u8 = undefined;
                 if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
-                opts.rcv_buf_size = bo.readU32Le(&buf);
+                opts.rcv_buf_size = sp.bufferValue(bo.readU32Le(&buf), sp.SOCK_MIN_RCVBUF);
+                opts.rcv_buf_set = true;
             },
             SO_SNDBUF => {
                 if (optlen < 4) return -22;
                 var buf: [4]u8 = undefined;
                 if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
-                opts.snd_buf_size = bo.readU32Le(&buf);
+                opts.snd_buf_size = sp.bufferValue(bo.readU32Le(&buf), sp.SOCK_MIN_SNDBUF);
+                opts.snd_buf_set = true;
             },
             SO_LINGER => {
                 // struct linger { l_onoff: i32, l_linger: i32 } = 8 bytes

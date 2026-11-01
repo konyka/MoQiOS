@@ -85,6 +85,32 @@ pub fn deliverySampleUsable(delivered: u32, smss: u32, elapsed_ms: u32) bool {
     return delivered > @max(smss, 1);
 }
 
+/// Payload bytes a ring may hold. SO_SNDBUF / SO_RCVBUF store the doubled
+/// value (the extra half covers per-skb bookkeeping on Linux); the payload the
+/// buffer holds is half of it, never more than the ring itself (one slot is
+/// reserved). A socket that never set the option uses the whole ring.
+pub fn bufferLimit(set: bool, stored: u32, ring_size: u32) u32 {
+    const max = ring_size -| 1;
+    if (!set) return max;
+    return @min(stored / 2, max);
+}
+
+/// Free payload room under `limit` when `used` bytes are queued (saturating:
+/// the limit may have been lowered below what is already queued).
+pub fn roomUnder(used: u32, limit: u32) u32 {
+    return limit -| used;
+}
+
+/// Where the next delivery-rate sample starts. Once every sent byte has been
+/// acknowledged the connection is idle: the time until the next ACK would be
+/// counted from the previous sample although nothing was in flight for most of
+/// it, so a burst after a pause would measure "one burst per pause" and pace
+/// the connection at that. Returning 0 means "no base": the next ACK only
+/// seeds the base and produces no sample (Linux's app-limited samples).
+pub fn sampleBaseAfterAck(all_acked: bool, now_ms: u32) u32 {
+    return if (all_acked) 0 else now_ms;
+}
+
 /// Advance the ephemeral port counter with wrap: 65535 → 49152. Saturating
 /// (`+|=`) would park the counter at 65535 and alias every later 4-tuple.
 pub fn nextEphemeralPort(cur: u16) u16 {
