@@ -8581,7 +8581,7 @@ test "socket(AF_UNIX, SOCK_SEQPACKET): type matrix and the listen/connect/accept
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "if (!connectionOriented(sock.sock_type)) return -22; // EINVAL\n    if (!sock.bound) return -22;"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "if (!connectionOriented(sock.sock_type)) return -22; // EINVAL\n    if (!sock.listening) return -22;"));
     // connect: a listener of another type is EPROTOTYPE, and a seqpacket client queues on the listener like a stream client.
-    try std.testing.expect(std.mem.indexOf(u8, src, "if (peer.sock_type != sock.sock_type) return -91; // EPROTOTYPE\n    if (connectionOriented(sock.sock_type)) {\n        if (!peer.listening) return -111;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (peer.sock_type != sock.sock_type) return -91; // EPROTOTYPE\n    if (connectionOriented(sock.sock_type) and !peer.listening) return -111; // ECONNREFUSED") != null);
     // accept: the new socket takes the listener's type, and only same-type connectors are accepted.
     try std.testing.expect(std.mem.indexOf(u8, src, "queued.sock_type != sock.sock_type or queued.connected or queued.listening") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, ".sock_type = sock.sock_type,\n        .connected = true,\n        .was_connected = true,\n        .peer_idx = @intCast(conn_idx),") != null);
@@ -9251,4 +9251,42 @@ test "SOL_SOCKET extras: wiring and the hello179 capability profile" {
     try std.testing.expect(std.mem.indexOf(u8, so, "sp.storedOnly(optname) or (sp.flagBit(optname) != null") != null);
     try std.testing.expect(std.mem.indexOf(u8, so, "        .priority = o.priority,\n        .mark = o.mark,\n        .bound_if = o.bound_if,\n    };") != null);
     try std.testing.expect(std.mem.indexOf(u8, so, "    o.priority = st.priority;\n    o.mark = st.mark;\n    o.bound_if = st.bound_if;\n}") != null);
+}
+
+test "AF_UNIX getsockname / getpeername: address encoding and wiring" {
+    const sa = kt.socket_address_policy;
+    var out: [2 + 108 + 1]u8 = undefined;
+    // The unnamed address is just the family.
+    try std.testing.expectEqual(@as(u32, 2), sa.unixNameEncode("", &out));
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, out[0..2], .little));
+    // A named address is family + path + NUL, and the length counts the NUL.
+    @memset(&out, 0x55);
+    try std.testing.expectEqual(@as(u32, 2 + 14 + 1), sa.unixNameEncode("/tmp/h180.sock", &out));
+    try std.testing.expectEqualStrings("/tmp/h180.sock", out[2..16]);
+    try std.testing.expectEqual(@as(u8, 0), out[16]);
+    // The longest path the kernel stores (108 bytes) still fits.
+    const long = [_]u8{'a'} ** 108;
+    try std.testing.expectEqual(@as(u32, 2 + 108 + 1), sa.unixNameEncode(&long, &out));
+    try std.testing.expectEqual(@as(u8, 0), out[110]);
+
+    const us = kt.unix_socket_source;
+    // The accepted socket answers getsockname with the listener's address but owns no address.
+    try std.testing.expect(std.mem.indexOf(u8, us, "unix_sockets[new_idx].name_only = true;\n    unix_sockets[new_idx].path_len = sock.path_len;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (sock.bound or sock.name_only) return -22; // EINVAL") != null);
+    // connect() remembers the address it resolved, for both stream and datagram sockets.
+    try std.testing.expect(std.mem.indexOf(u8, us, "sock.peer_path_len = @intCast(path_len);\n    @memcpy(sock.peer_path[0..path_len], path[0..path_len]);") != null);
+    // A queued (not yet accepted) stream client already has the listener's address as its peer.
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (s.peer_path_len > 0 and queuedOnBacklogLocked(idx)) {") != null);
+    // Streams verify the back-reference; a datagram target must still be bound to the resolved address.
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (connectionOriented(s.sock_type) and peer.peer_idx != @as(u8, @intCast(idx))) return .{ .ok = false };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (!connectionOriented(s.sock_type) and !(peer.bound and peer.path_len == s.peer_path_len and") != null);
+    // No live peer is ENOTCONN, not a name.
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (!s.connected or s.peer_idx >= MAX_UNIX_SOCKETS) return .{ .ok = false };") == null);
+    // A target that has been freed answers nothing.
+    try std.testing.expect(std.mem.indexOf(u8, us, "    if (!peer.active) return .{ .ok = false };\n    if (connectionOriented(s.sock_type) and peer.peer_idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (s.peer_idx >= MAX_UNIX_SOCKETS) return .{ .ok = false };") != null);
+
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const n = net_mod.unix_socket.unixSockName(desc.unix_sock_idx) orelse return -9;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const n = net_mod.unix_socket.unixPeerName(desc.unix_sock_idx) orelse return -9;\n        if (!n.ok) return ENOTCONN;") != null);
 }

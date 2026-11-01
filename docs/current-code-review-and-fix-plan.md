@@ -5891,3 +5891,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异（具名测试核对）：负的优先级也免特权、非特权上限改成 7、被拒绝的优先级仍被存下、`SO_MARK` 免特权、未知设备变成解除绑定、空名字变 `ENODEV`、没有网卡也能绑 `eth0`、`SO_SNDLOWAT` 读回错值、`SO_OOBINLINE` 与 `SO_PASSCRED` 共用标志位、`SO_BINDTODEVICE` 不走 TCP 的存储往返、AF_UNIX 也能绑设备、TCP 往返丢掉 `bound_if`、hello179 的档案过宽，共 13 个，全部被 `SOL_SOCKET priority…` 或 `SOL_SOCKET extras…` 抓住（“没有网卡也能绑 eth0”与“AF_UNIX 也能绑设备”第一次因未使用参数编译失败，改成可编译形式后抓住；中间我还因为改脚本时把元组改坏了两次，最后直接写了一个只含这两个变异的脚本）；恢复后 `grep -c MUTATION` 为 0。
 - 验证：host 851/851；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello179 PASS、0 个 FAIL；stress（SMP=2）5/5 PASS。
 
+### AF_UNIX 的 getsockname / getpeername（hello180）
+
+- 问题：两个调用对 AF_UNIX 套接字都是 `ENOTSOCK`。
+- 修复：见 `docs/kernel-subsystems.md` 的 hello180 条。
+- 已知差异：不支持抽象命名空间地址（以 NUL 开头的路径）——`bind` 本来就按 NUL 截断路径；`SO_PEERSEC` 没有；没有 `getsockname` 对已删除的文件系统节点的特殊处理（本内核的 AF_UNIX 地址不对应文件系统节点，只是内核表里的名字）。
+- 过程说明（如实）：①红灯 17 项 FAIL 里有一部分是我自己的探测错误——`accept` 的系统调用号我写成了 130（那是 `recvmsg`），导致 C 段 `accept` 失败，红灯数据不可靠；改成 43 后重跑得到 16 项 FAIL，红灯才可信。②实现过程中连续碰到三个"目标不止一种"的问题：客户端已 `connect` 但监听者还没 `accept` 时，对端地址是什么（答：它连接的路径，所以要在 `connect` 时就记下）；accept 出来的套接字是否算"已绑定"（答：不算，所以新增 `name_only`，否则对它 `bind` 会得到错误的结果、路径占用检查也会误判）；数据报 `connect` 是单向的，不能像流那样检查互指（答：检查目标槽位是否仍绑定在当初解析的路径上）。每一个都是先在 hello180 里失败，再改实现。③写 host 测试时还发现 `socket_address_policy.zig` 里有一个内联 `test` 块（从没跑过），为了给文件加 `std` 导入而删掉了它——它的内容（`inetLengthValid` 等）已经被 `tests/main.zig` 里的 `socket()` 与 `connect` 测试覆盖。④hello169 的一条 host 断言编码了旧的嵌套形状（`if (connectionOriented) { if (!peer.listening) ...`），因我把监听检查提到前面（为了无论流还是数据报都先记下地址）而失败；行为（非监听的流目标 `ECONNREFUSED`）没变，已改断言到新形状。
+- TDD：host 新增 1 个测试（未命名/命名/最大长度地址的编码，接线形状：accept 出来的套接字的 `name_only`、`connect` 记下路径、排队中客户端的对端、流与数据报的不同校验、没有存活对端时 `ENOTCONN`）；hello180（A 未绑定套接字的未命名地址与 `ENOTCONN`，B 绑定后的路径与长度与短缓冲，C 连接对：客户端的对端是服务路径、accept 出来的套接字自己的名字是监听者路径、其对端是未命名客户端，D `socketpair` 与对端关闭后的 `ENOTCONN`，E 数据报）在旧内核上 16 项 FAIL，新内核 PASS。
+- 变异（具名测试核对）：未命名地址长度错、长度漏掉 NUL、没有 NUL 终止符、accept 出来的套接字不是 `name_only`、accept 出来的套接字可以 `bind`、`connect` 不记下地址、未被接受的客户端不检查是否排在队里、流式反向引用不检查、数据报目标槽位被复用不检查、已关闭的对端也应答、`getpeername` 永不返回 `ENOTCONN`，共 11 个。**第一轮有 1 个变异没被抓住**（"已关闭的对端也应答"，即去掉 `!peer.active` 判断）：我的 host 断言没钉住这一行，hello180 也没有构造"数据报目标已关闭"的场景；我补了探测（目标关闭后 `ENOTCONN`，以及新建套接字复用槽位后不会被当作对端）和一条 host 断言，之后 11 个全部被 `AF_UNIX getsockname / getpeername…` 抓住；恢复后 `grep -c MUTATION` 为 0。
+- 验证：host 852/852；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次，hello169 与 hello180 均 PASS）与 GPT SMP=2 通过；stress（SMP=2）5/5 PASS；补充探测后 SMP=2 复跑 hello180 PASS（内核代码在补探测前后相同）。
+

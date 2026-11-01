@@ -73,6 +73,13 @@ pub const UnixSocket = struct {
     ref_count: u32 = 1,
     sock_type: u32 = 0,
     bound: bool = false,
+    /// The path is only a reported name (an accepted socket carries its
+    /// listener's address) — the socket is not bound and owns no address.
+    name_only: bool = false,
+    /// The address connect() succeeded against (getpeername before the listener
+    /// accepts, and after a datagram peer closed): the target's bound path.
+    peer_path: [UNIX_PATH_MAX]u8 = @splat(0),
+    peer_path_len: u8 = 0,
     path: [UNIX_PATH_MAX]u8 = @splat(0),
     path_len: u8 = 0,
     connected: bool = false,
@@ -379,6 +386,60 @@ pub fn unixSocketPair(sock_type: u32) i32 {
     return @as(i32, @intCast(first_idx)) | (@as(i32, @intCast(second_idx)) << 8);
 }
 
+pub const NameResult = struct { len: u8 = 0, path: [UNIX_PATH_MAX]u8 = @splat(0), ok: bool = true };
+
+/// getsockname: the socket's own address (empty = unnamed).
+pub fn unixSockName(idx: u32) ?NameResult {
+    if (idx >= MAX_UNIX_SOCKETS) return null;
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+    const s = &unix_sockets[idx];
+    if (!s.active) return null;
+    var r: NameResult = .{ .len = s.path_len };
+    @memcpy(r.path[0..s.path_len], s.path[0..s.path_len]);
+    return r;
+}
+
+/// getpeername: the connected peer's address, or `ok = false` (ENOTCONN) when
+/// there is no live peer. The peer's back-reference is verified: after a slot
+/// realloc `peer_idx` could name an unrelated socket.
+pub fn unixPeerName(idx: u32) ?NameResult {
+    if (idx >= MAX_UNIX_SOCKETS) return null;
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+    const s = &unix_sockets[idx];
+    if (!s.active) return null;
+    // A stream client that connect()ed but has not been accepted yet is "connected" as far as
+    // the user is concerned: the listener's address is already its peer.
+    if (!s.connected) {
+        if (s.peer_path_len > 0 and queuedOnBacklogLocked(idx)) {
+            var q: NameResult = .{ .len = s.peer_path_len };
+            @memcpy(q.path[0..s.peer_path_len], s.peer_path[0..s.peer_path_len]);
+            return q;
+        }
+        return .{ .ok = false };
+    }
+    if (s.peer_idx >= MAX_UNIX_SOCKETS) return .{ .ok = false };
+    const peer = &unix_sockets[s.peer_idx];
+    // Connected streams point at each other; a datagram connect() is one-way, so only the slot being
+    // live (and still carrying the address we connected to) can be checked there.
+    if (!peer.active) return .{ .ok = false };
+    if (connectionOriented(s.sock_type) and peer.peer_idx != @as(u8, @intCast(idx))) return .{ .ok = false };
+    // A datagram socket's target may have closed and its slot been reused by an unrelated socket: only
+    // answer when the slot is still bound to the address connect() resolved.
+    if (!connectionOriented(s.sock_type) and !(peer.bound and peer.path_len == s.peer_path_len and
+        @import("std").mem.eql(u8, peer.path[0..peer.path_len], s.peer_path[0..s.peer_path_len]))) return .{ .ok = false };
+    // The peer's own address when it has one (a bound datagram target, an accepted socket's listener
+    // path); the address we connected to when the peer is an unnamed client.
+    if (peer.path_len > 0) {
+        var r: NameResult = .{ .len = peer.path_len };
+        @memcpy(r.path[0..peer.path_len], peer.path[0..peer.path_len]);
+        return r;
+    }
+    // An accepted socket's peer is the client: unnamed unless it bound.
+    return .{ .len = 0 };
+}
+
 /// Record the credentials of the process that created / accepted socket `idx`.
 pub fn unixSetCred(idx: u32, cred: @import("sockopt_policy.zig").Cred) void {
     if (idx >= MAX_UNIX_SOCKETS) return;
@@ -436,7 +497,7 @@ pub fn unixBind(idx: u32, path: [*]const u8, path_len: usize) i32 {
 
     const sock = &unix_sockets[idx];
     if (!sock.active) return -9; // EBADF
-    if (sock.bound) return -22; // EINVAL — already bound
+    if (sock.bound or sock.name_only) return -22; // EINVAL — already bound (or an accepted socket)
 
     // Check if path is already bound by another socket
     for (&unix_sockets) |*other| {
@@ -516,8 +577,11 @@ pub fn unixConnect(idx: u32, path: [*]const u8, path_len: usize) i32 {
     const peer = &unix_sockets[peer_i];
 
     if (peer.sock_type != sock.sock_type) return -91; // EPROTOTYPE
+    if (connectionOriented(sock.sock_type) and !peer.listening) return -111; // ECONNREFUSED
+    // Remember the address connected to; getpeername answers with it.
+    sock.peer_path_len = @intCast(path_len);
+    @memcpy(sock.peer_path[0..path_len], path[0..path_len]);
     if (connectionOriented(sock.sock_type)) {
-        if (!peer.listening) return -111; // ECONNREFUSED
 
         // Check backlog
         if (peer.backlog_count >= UNIX_BACKLOG_MAX) return -11; // EAGAIN
@@ -600,6 +664,11 @@ pub fn unixAccept(idx: u32) i32 {
         .was_connected = true,
         .peer_idx = @intCast(conn_idx),
     };
+    // The accepted socket answers getsockname with the listener's address; it is
+    // not itself bound (a second bind() on it stays EINVAL via `name_only`).
+    unix_sockets[new_idx].name_only = true;
+    unix_sockets[new_idx].path_len = sock.path_len;
+    @memcpy(unix_sockets[new_idx].path[0..sock.path_len], sock.path[0..sock.path_len]);
 
     // Mark the connector as connected to the new socket
     const conn_sock = &unix_sockets[conn_idx];

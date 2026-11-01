@@ -791,6 +791,12 @@ fn copySockaddrToUser(addr_ptr: u64, addrlen_ptr: u64, sa_buf: []const u8, alen:
     return 0;
 }
 
+/// A sockaddr_un for `n`: the family, then — for a named socket — the path and its NUL.
+/// The unnamed address is the family alone (2 bytes).
+fn unixNameBytes(n: net_mod.unix_socket.NameResult, out: []u8) u32 {
+    return @import("socket_address_policy.zig").unixNameEncode(n.path[0..n.len], out);
+}
+
 /// getsockname(fd, addr_ptr, addrlen_ptr) → 0 or -errno
 pub fn getsockname(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
@@ -807,6 +813,13 @@ pub fn getsockname(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
         const alen = sa.encodeUdpName(desc.udp_is_v6, desc.udp_port, our4, our6, &sa_buf);
         if (alen == 0) return -1;
         return copySockaddrToUser(addr_ptr, addrlen_ptr, sa_buf[0..alen], alen);
+    }
+
+    if (desc.fd_type == .unix_socket) {
+        const n = net_mod.unix_socket.unixSockName(desc.unix_sock_idx) orelse return -9;
+        var ub: [2 + net_mod.unix_socket.UNIX_PATH_MAX + 1]u8 = undefined;
+        const ulen = unixNameBytes(n, &ub);
+        return copySockaddrToUser(addr_ptr, addrlen_ptr, ub[0..ulen], ulen);
     }
 
     if (desc.fd_type != .tcp_socket) return -88;
@@ -832,6 +845,14 @@ pub fn getpeername(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
         const alen = sa.encodeUdpName(desc.udp_is_v6, desc.udp_dst_port, desc.udp_dst_ip, desc.udp_dst_ip6, &sa_buf);
         if (alen == 0) return -1;
         return copySockaddrToUser(addr_ptr, addrlen_ptr, sa_buf[0..alen], alen);
+    }
+
+    if (desc.fd_type == .unix_socket) {
+        const n = net_mod.unix_socket.unixPeerName(desc.unix_sock_idx) orelse return -9;
+        if (!n.ok) return ENOTCONN;
+        var ub: [2 + net_mod.unix_socket.UNIX_PATH_MAX + 1]u8 = undefined;
+        const ulen = unixNameBytes(n, &ub);
+        return copySockaddrToUser(addr_ptr, addrlen_ptr, ub[0..ulen], ulen);
     }
 
     if (desc.fd_type != .tcp_socket) return -88;
