@@ -115,6 +115,11 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
     if (std.mem.eql(u8, name, "hello115") or std.mem.eql(u8, name, "hello119") or std.mem.eql(u8, name, "hello123") or std.mem.eql(u8, name, "hello126")) {
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_setuid = true, .cap_setgid = true }, .initial_init = false };
     }
+    // Socket-option acceptance test: holds CAP_NET_ADMIN (SO_MARK, SO_PRIORITY > 6) as uid 0 so that
+    // setuid() in a child drops it and the unprivileged refusals are observable.
+    if (std.mem.eql(u8, name, "hello179")) {
+        return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_admin = true, .cap_setuid = true }, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello95") or std.mem.eql(u8, name, "hello114")) {
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_sys_mount = true }, .initial_init = false };
     }

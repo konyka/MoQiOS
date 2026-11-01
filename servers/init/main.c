@@ -305,6 +305,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello176"); /* sleeping is not CPU time */
     run_test("hello177"); /* TCP_INFO / TCP_MAXSEG / TCP_CONGESTION */
     run_test("hello178"); /* IP_TTL / IP_TOS / IPV6_* socket options */
+    run_test("hello179"); /* SO_PRIORITY / SO_MARK / SO_BINDTODEVICE ... */
 
     start_persistent_services();
 

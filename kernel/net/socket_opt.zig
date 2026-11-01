@@ -41,6 +41,10 @@ pub const SocketOptions = struct {
     snd_timeout_ms: u32 = 0,
     rcv_buf_size: u32 = 16384,
     snd_buf_size: u32 = 16384,
+    /// SO_PRIORITY / SO_MARK / SO_BINDTODEVICE (see sockopt_policy.Stored).
+    priority: i32 = 0,
+    mark: u32 = 0,
+    bound_if: u8 = 0,
     /// IP_TTL / IP_TOS / IPV6_UNICAST_HOPS / IPV6_TCLASS (0 = default).
     ip: @import("ip_opt_policy.zig").IpOpts = .{},
     /// TCP_MAXSEG set by the user (0 = none): caps the segment size.
@@ -141,6 +145,9 @@ fn storedFromTcp(o: SocketOptions) sp.Stored {
         .linger_on = o.linger_on,
         .linger_sec = o.linger_sec,
         .ip = o.ip,
+        .priority = o.priority,
+        .mark = o.mark,
+        .bound_if = o.bound_if,
     };
 }
 
@@ -155,6 +162,26 @@ fn applyStoredToTcp(o: *SocketOptions, st: sp.Stored) void {
     o.linger_on = st.linger_on;
     o.linger_sec = st.linger_sec;
     o.ip = st.ip;
+    o.priority = st.priority;
+    o.mark = st.mark;
+    o.bound_if = st.bound_if;
+}
+
+fn ifaceCount() usize {
+    return if (@import("nic.zig").isActive()) 2 else 1;
+}
+
+fn callerNetAdmin() bool {
+    const sched_mod = @import("../proc/sched.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse return false;
+    return @import("../ipc/capability.zig").hasSysCap(cur_idx, "cap_net_admin");
+}
+
+/// SOL_SOCKET set with the caller's privileges and this kernel's interface list.
+/// AF_UNIX sockets have no devices to bind to.
+fn applySol(st: *sp.Stored, optname: u64, val: []const u8, is_inet: bool) i64 {
+    if (!is_inet and optname == sp.SO_BINDTODEVICE) return -92;
+    return sp.applySetPriv(st, optname, val, callerNetAdmin(), ifaceCount());
 }
 
 fn currentCred() sp.Cred {
@@ -545,7 +572,7 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
     if (level != SOL_SOCKET and level != SOL_TCP) return -92; // ENOPROTOOPT
     switch (ref) {
         .tcp => |idx| {
-            if (level == SOL_SOCKET and sp.flagBit(optname) != null and optname != SO_REUSEADDR and optname != SO_KEEPALIVE) {
+            if (level == SOL_SOCKET and (sp.storedOnly(optname) or (sp.flagBit(optname) != null and optname != SO_REUSEADDR and optname != SO_KEEPALIVE))) {
                 // The bits TCP keeps in extra_flags (REUSEPORT / BROADCAST / DEBUG).
                 var raw: [16]u8 = undefined;
                 const n = readOptval(optval_ptr, optlen, &raw);
@@ -553,7 +580,7 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
                 const tcp_mod = @import("tcp.zig");
                 var o = tcp_mod.tcpGetOptions(idx) orelse return -9;
                 var st = storedFromTcp(o);
-                const rc = sp.applySet(&st, optname, raw[0..@intCast(n)]);
+                const rc = applySol(&st, optname, raw[0..@intCast(n)], true);
                 if (rc != 0) return rc;
                 applyStoredToTcp(&o, st);
                 return if (tcp_mod.tcpSetOptions(idx, o)) 0 else -9;
@@ -568,7 +595,7 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
             if (n < 0) return n;
             const udp_mod = @import("udp.zig");
             var st = udp_mod.getPortOpts(port) orelse return -9;
-            const rc = sp.applySet(&st, optname, raw[0..@intCast(n)]);
+            const rc = applySol(&st, optname, raw[0..@intCast(n)], true);
             if (rc != 0) return rc;
             return if (udp_mod.setPortOpts(port, st)) 0 else -9;
         },
@@ -580,7 +607,7 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
             const um = @import("unix_socket.zig");
             const view = um.unixOptView(idx) orelse return -9;
             var st = view.opts;
-            const rc = sp.applySet(&st, optname, raw[0..@intCast(n)]);
+            const rc = applySol(&st, optname, raw[0..@intCast(n)], false);
             if (rc != 0) return rc;
             return if (um.unixSetOpts(idx, st)) 0 else -9;
         },
@@ -590,7 +617,7 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
             const n = readOptval(optval_ptr, optlen, &raw);
             if (n < 0) return n;
             var st: sp.Stored = .{};
-            return sp.applySet(&st, optname, raw[0..@intCast(n)]);
+            return applySol(&st, optname, raw[0..@intCast(n)], true);
         },
     }
 }

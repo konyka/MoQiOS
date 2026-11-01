@@ -5881,3 +5881,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 验证：host 849/849；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello178 PASS、0 个 FAIL；stress（SMP=2）5/5 PASS。
 - 备注：这一轮的 SMP=8 连续 3 次没有出现 hello152/hello174 之类的偶发失败（hello152 `loopback connection` 的原因仍未知）。
 
+### SO_PRIORITY / SO_MARK / SO_OOBINLINE / SO_BINDTODEVICE / SO_SNDLOWAT（hello179）
+
+- 问题：这五个 `SOL_SOCKET` 选项全部 `ENOPROTOOPT`。
+- 修复：见 `docs/kernel-subsystems.md` 的 hello179 条。
+- 已知差异：只存取和校验，不影响报文（`SO_PRIORITY` 不影响排队，`SO_MARK` 不影响路由，`SO_BINDTODEVICE` 不限制收发）；`SO_RCVLOWAT`、`SO_TIMESTAMP*`、`SO_PEEK_OFF`、`SO_BUSY_POLL` 等仍 `ENOPROTOOPT`；`SO_BINDTODEVICE` 不要求特权（Linux 要 `CAP_NET_RAW`）。
+- 过程说明（如实）：①红灯 33 项 FAIL，实现后只剩“root 设置特权值”两项失败——不是实现错，而是 hello179 以默认 uid 1000 无特权档案启动，根本不是 root；于是给它在 `capability_profile` 里配 uid 0 + `cap_net_admin` + `cap_setuid`（与 hello115 等测试的做法一致），随后通过。②写 host 测试时 hello178 里的两处“确切代码形状”断言因本次在同一结构体里追加了字段而失败（`.ip = o.ip,\n    };`、`o.ip = st.ip;\n}`），这是断言写得太死，已放宽到只检查那一行本身；这也说明“检查确切代码形状”的测试在相邻修改时会误报，需要平衡。
+- TDD：host 新增 2 个测试（选项号与标志位、优先级特权规则含边界、`SO_MARK` 特权、读回、`SO_SNDLOWAT` 与 `SO_RCVLOWAT`、设备名解析/读回/失败保持旧绑定/解除绑定、能力档案与接线形状）；hello179（TCP/UDP/AF_UNIX 三种套接字的相同行为、root 的特权值、setuid 到 1000 的子进程的拒绝与不改变值、`SO_BINDTODEVICE` 全流程）在旧内核上 33 项 FAIL，新内核 PASS。
+- 变异（具名测试核对）：负的优先级也免特权、非特权上限改成 7、被拒绝的优先级仍被存下、`SO_MARK` 免特权、未知设备变成解除绑定、空名字变 `ENODEV`、没有网卡也能绑 `eth0`、`SO_SNDLOWAT` 读回错值、`SO_OOBINLINE` 与 `SO_PASSCRED` 共用标志位、`SO_BINDTODEVICE` 不走 TCP 的存储往返、AF_UNIX 也能绑设备、TCP 往返丢掉 `bound_if`、hello179 的档案过宽，共 13 个，全部被 `SOL_SOCKET priority…` 或 `SOL_SOCKET extras…` 抓住（“没有网卡也能绑 eth0”与“AF_UNIX 也能绑设备”第一次因未使用参数编译失败，改成可编译形式后抓住；中间我还因为改脚本时把元组改坏了两次，最后直接写了一个只含这两个变异的脚本）；恢复后 `grep -c MUTATION` 为 0。
+- 验证：host 851/851；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello179 PASS、0 个 FAIL；stress（SMP=2）5/5 PASS。
+

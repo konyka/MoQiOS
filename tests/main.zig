@@ -9142,8 +9142,8 @@ test "IP socket options: dispatch and send-path wiring" {
     // Only the level that matches the socket's family applies.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, so, "if (!ipo.levelApplies(level, fam)) return -92;"));
     // The SOL_SOCKET round trip for TCP carries the IP options so a REUSEPORT/BROADCAST/DEBUG set does not wipe them.
-    try std.testing.expect(std.mem.indexOf(u8, so, "        .ip = o.ip,\n    };") != null);
-    try std.testing.expect(std.mem.indexOf(u8, so, "    o.ip = st.ip;\n}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "        .ip = o.ip,\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "    o.ip = st.ip;\n") != null);
     // The send paths patch the finished header before ECN marking (TCP) / before framing (UDP).
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (ip_opt_policy.ipv4NeedsPatch(tcb.options.ip)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], tcb.options.ip, ipv4.checksum);\n    // SK-131/143: ECT(1) for AccECN/L4S, else ECT(0) for classic ECN.") != null);
@@ -9151,4 +9151,104 @@ test "IP socket options: dispatch and send-path wiring" {
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "if (ip_opt_policy.ipv4NeedsPatch(po.ip)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], po.ip, ipv4.checksum);") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "if (ip_opt_policy.ipv6NeedsPatch(po.ip)) ip_opt_policy.patchIpv6(send_pkt[14..][0..40], po.ip);") != null);
+}
+
+test "SOL_SOCKET priority / mark / device binding / flag rules" {
+    const p = kt.sockopt_policy;
+    try std.testing.expectEqual(@as(u64, 10), p.SO_OOBINLINE);
+    try std.testing.expectEqual(@as(u64, 12), p.SO_PRIORITY);
+    try std.testing.expectEqual(@as(u64, 19), p.SO_SNDLOWAT);
+    try std.testing.expectEqual(@as(u64, 25), p.SO_BINDTODEVICE);
+    try std.testing.expectEqual(@as(u64, 36), p.SO_MARK);
+    // OOBINLINE is a plain boolean flag with its own bit; the others live in Stored fields.
+    try std.testing.expectEqual(@as(?u16, 64), p.flagBit(p.SO_OOBINLINE));
+    try std.testing.expect(p.storedOnly(p.SO_PRIORITY) and p.storedOnly(p.SO_MARK) and p.storedOnly(p.SO_BINDTODEVICE));
+    try std.testing.expect(!p.storedOnly(p.SO_OOBINLINE) and !p.storedOnly(p.SO_RCVBUF));
+    // SO_PRIORITY: 0..6 for anyone, anything else needs CAP_NET_ADMIN.
+    try std.testing.expect(!p.priorityNeedsAdmin(0) and !p.priorityNeedsAdmin(6));
+    try std.testing.expect(p.priorityNeedsAdmin(7) and p.priorityNeedsAdmin(-1) and p.priorityNeedsAdmin(std.math.maxInt(i32)) and p.priorityNeedsAdmin(std.math.minInt(i32)));
+    var s: p.Stored = .{};
+    var v: [4]u8 = undefined;
+    std.mem.writeInt(i32, &v, 6, .little);
+    try std.testing.expectEqual(@as(i64, 0), p.applySetPriv(&s, p.SO_PRIORITY, &v, false, 1));
+    try std.testing.expectEqual(@as(i32, 6), s.priority);
+    std.mem.writeInt(i32, &v, 7, .little);
+    try std.testing.expectEqual(@as(i64, -1), p.applySetPriv(&s, p.SO_PRIORITY, &v, false, 1));
+    try std.testing.expectEqual(@as(i32, 6), s.priority); // a refused set changes nothing
+    try std.testing.expectEqual(@as(i64, 0), p.applySetPriv(&s, p.SO_PRIORITY, &v, true, 1));
+    try std.testing.expectEqual(@as(i32, 7), s.priority);
+    std.mem.writeInt(i32, &v, -3, .little);
+    try std.testing.expectEqual(@as(i64, -1), p.applySetPriv(&s, p.SO_PRIORITY, &v, false, 1));
+    try std.testing.expectEqual(@as(i64, 0), p.applySetPriv(&s, p.SO_PRIORITY, &v, true, 1));
+    try std.testing.expectEqual(@as(i32, -3), s.priority);
+    try std.testing.expectEqual(@as(i64, -22), p.applySetPriv(&s, p.SO_PRIORITY, v[0..2], true, 1));
+    // SO_MARK: privileged always.
+    std.mem.writeInt(u32, &v, 0xABCD, .little);
+    try std.testing.expectEqual(@as(i64, -1), p.applySetPriv(&s, p.SO_MARK, &v, false, 1));
+    try std.testing.expectEqual(@as(u32, 0), s.mark);
+    try std.testing.expectEqual(@as(i64, 0), p.applySetPriv(&s, p.SO_MARK, &v, true, 1));
+    try std.testing.expectEqual(@as(u32, 0xABCD), s.mark);
+    // Readback.
+    var out: [16]u8 = undefined;
+    const f: p.Facts = .{ .id = p.identity(.tcp, false) };
+    try std.testing.expectEqual(@as(?usize, 4), p.encodeGet(s, f, p.SO_PRIORITY, &out));
+    try std.testing.expectEqual(@as(i32, -3), std.mem.readInt(i32, out[0..4], .little));
+    try std.testing.expectEqual(@as(?usize, 4), p.encodeGet(s, f, p.SO_MARK, &out));
+    try std.testing.expectEqual(@as(u32, 0xABCD), std.mem.readInt(u32, out[0..4], .little));
+    try std.testing.expectEqual(@as(?usize, 4), p.encodeGet(s, f, p.SO_SNDLOWAT, &out));
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, out[0..4], .little));
+    // SO_SNDLOWAT is read-only in effect (Linux refuses to set it); SO_RCVLOWAT is not offered at all.
+    try std.testing.expectEqual(@as(i64, -92), p.applySetPriv(&s, p.SO_SNDLOWAT, &v, true, 1));
+    try std.testing.expectEqual(@as(?usize, null), p.encodeGet(s, f, 18, &out));
+    // SO_BINDTODEVICE names: lo always, eth0 only when a NIC is up; empty unbinds; anything else is ENODEV.
+    try std.testing.expectEqual(@as(?u8, 1), p.deviceIndex("lo", 1));
+    try std.testing.expectEqual(@as(?u8, 1), p.deviceIndex("lo\x00junk", 1));
+    try std.testing.expectEqual(@as(?u8, 0), p.deviceIndex("", 1));
+    try std.testing.expectEqual(@as(?u8, 0), p.deviceIndex("\x00", 1));
+    try std.testing.expectEqual(@as(?u8, null), p.deviceIndex("eth0", 1));
+    try std.testing.expectEqual(@as(?u8, 2), p.deviceIndex("eth0", 2));
+    try std.testing.expectEqual(@as(?u8, null), p.deviceIndex("eth", 2));
+    try std.testing.expectEqual(@as(?u8, null), p.deviceIndex("lo0", 2));
+    try std.testing.expectEqual(@as(?u8, null), p.deviceIndex("nosuch9", 2));
+    try std.testing.expectEqualStrings("lo", p.deviceName(1));
+    try std.testing.expectEqualStrings("eth0", p.deviceName(2));
+    try std.testing.expectEqualStrings("", p.deviceName(0));
+    try std.testing.expectEqualStrings("", p.deviceName(9));
+    // Bind / read back / unbind through the policy, including the failed-bind-keeps-old-binding rule.
+    try std.testing.expectEqual(@as(i64, 0), p.applySetPriv(&s, p.SO_BINDTODEVICE, "lo\x00", false, 1));
+    try std.testing.expectEqual(@as(u8, 1), s.bound_if);
+    try std.testing.expectEqual(@as(i64, -19), p.applySetPriv(&s, p.SO_BINDTODEVICE, "nosuch9\x00", false, 1));
+    try std.testing.expectEqual(@as(u8, 1), s.bound_if);
+    try std.testing.expectEqual(@as(?usize, 3), p.encodeGet(s, f, p.SO_BINDTODEVICE, &out));
+    try std.testing.expectEqualStrings("lo\x00", out[0..3]);
+    try std.testing.expectEqual(@as(i64, 0), p.applySetPriv(&s, p.SO_BINDTODEVICE, "\x00", false, 1));
+    try std.testing.expectEqual(@as(?usize, 0), p.encodeGet(s, f, p.SO_BINDTODEVICE, &out));
+    // Everything else still goes through the old rules.
+    try std.testing.expectEqual(@as(i64, -92), p.applySetPriv(&s, p.SO_TYPE, &v, true, 1));
+    try std.testing.expectEqual(@as(i64, 0), p.applySetPriv(&s, p.SO_OOBINLINE, &.{ 1, 0, 0, 0 }, false, 1));
+    try std.testing.expect(s.flags & 64 != 0);
+}
+
+test "SOL_SOCKET extras: wiring and the hello179 capability profile" {
+    const cp = kt.capability_profile;
+    const h = cp.profileForLaunch("hello179", true, false);
+    try std.testing.expect(h.caps.cap_net_admin and h.caps.cap_setuid);
+    try std.testing.expectEqual(@as(u32, 0), h.uid);
+    // No other net/privileged cap rides along, and an ordinary program has none of it.
+    try std.testing.expect(!h.caps.cap_net_raw and !h.caps.cap_sys_admin);
+    try std.testing.expect(!cp.profileForLaunch("hello178", true, false).caps.cap_net_admin);
+
+    const so = kt.socket_opt_source;
+    // All four SOL_SOCKET set paths use the privilege-aware entry; none calls the bare one.
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, so, "sp.applySet(&st"));
+    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, so, "applySol("));
+    // AF_UNIX has no devices to bind to.
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (!is_inet and optname == sp.SO_BINDTODEVICE) return -92;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "return @import(\"../ipc/capability.zig\").hasSysCap(cur_idx, \"cap_net_admin\");") != null);
+    // eth0 exists as a device only when the NIC does.
+    try std.testing.expect(std.mem.indexOf(u8, so, "return if (@import(\"nic.zig\").isActive()) 2 else 1;") != null);
+    // TCP routes the stored-only options through the same round trip as REUSEPORT/BROADCAST/DEBUG, and carries them.
+    try std.testing.expect(std.mem.indexOf(u8, so, "sp.storedOnly(optname) or (sp.flagBit(optname) != null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "        .priority = o.priority,\n        .mark = o.mark,\n        .bound_if = o.bound_if,\n    };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "    o.priority = st.priority;\n    o.mark = st.mark;\n    o.bound_if = st.bound_if;\n}") != null);
 }

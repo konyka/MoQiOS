@@ -15,13 +15,18 @@ pub const SO_BROADCAST: u64 = 6;
 pub const SO_SNDBUF: u64 = 7;
 pub const SO_RCVBUF: u64 = 8;
 pub const SO_KEEPALIVE: u64 = 9;
+pub const SO_OOBINLINE: u64 = 10;
+pub const SO_PRIORITY: u64 = 12;
 pub const SO_LINGER: u64 = 13;
 pub const SO_REUSEPORT: u64 = 15;
 pub const SO_PASSCRED: u64 = 16;
 pub const SO_PEERCRED: u64 = 17;
+pub const SO_SNDLOWAT: u64 = 19;
 pub const SO_RCVTIMEO: u64 = 20;
 pub const SO_SNDTIMEO: u64 = 21;
+pub const SO_BINDTODEVICE: u64 = 25;
 pub const SO_ACCEPTCONN: u64 = 30;
+pub const SO_MARK: u64 = 36;
 pub const SO_PROTOCOL: u64 = 38;
 pub const SO_DOMAIN: u64 = 39;
 
@@ -59,6 +64,11 @@ pub fn readOnly(optname: u64) bool {
     };
 }
 
+/// Options kept in Stored fields that are not plain flag bits.
+pub fn storedOnly(optname: u64) bool {
+    return optname == SO_PRIORITY or optname == SO_MARK or optname == SO_BINDTODEVICE;
+}
+
 /// Flag bit for a boolean option, or null.
 pub fn flagBit(optname: u64) ?u16 {
     return switch (optname) {
@@ -68,6 +78,7 @@ pub fn flagBit(optname: u64) ?u16 {
         SO_REUSEPORT => 8,
         SO_DEBUG => 16,
         SO_PASSCRED => 32,
+        SO_OOBINLINE => 64,
         else => null,
     };
 }
@@ -122,13 +133,72 @@ pub const Stored = struct {
     linger_on: bool = false,
     linger_sec: u32 = 0,
     ip: @import("ip_opt_policy.zig").IpOpts = .{},
+    priority: i32 = 0,
+    mark: u32 = 0,
+    /// SO_BINDTODEVICE: 0 = none, else the interface index it is bound to.
+    bound_if: u8 = 0,
 };
+
+/// SO_PRIORITY above this (or negative) needs CAP_NET_ADMIN.
+pub const MAX_UNPRIVILEGED_PRIORITY: i32 = 6;
+
+/// Whether a SO_PRIORITY value can be set without CAP_NET_ADMIN.
+pub fn priorityNeedsAdmin(v: i32) bool {
+    return v < 0 or v > MAX_UNPRIVILEGED_PRIORITY;
+}
+
+/// Names of the interfaces a socket can be bound to, in index order starting at 1.
+pub const IF_NAMES = [_][]const u8{ "lo", "eth0" };
+
+/// SO_BINDTODEVICE value → interface index: 0 = unbind (empty name), null = no such device.
+/// `name` is the option bytes; a trailing NUL (and anything after it) is not part of the name.
+pub fn deviceIndex(name: []const u8, iface_count: usize) ?u8 {
+    const len = std.mem.indexOfScalar(u8, name, 0) orelse name.len;
+    if (len == 0) return 0;
+    for (IF_NAMES[0..@min(iface_count, IF_NAMES.len)], 0..) |n, i| {
+        if (std.mem.eql(u8, n, name[0..len])) return @intCast(i + 1);
+    }
+    return null;
+}
+
+/// The name SO_BINDTODEVICE reads back for an interface index (empty when unbound).
+pub fn deviceName(idx: u8) []const u8 {
+    if (idx == 0 or idx > IF_NAMES.len) return "";
+    return IF_NAMES[idx - 1];
+}
 
 fn rd32(b: []const u8) u32 {
     return std.mem.readInt(u32, b[0..4], .little);
 }
 
-/// setsockopt(SOL_SOCKET, optname, val) on `s`: 0 or -errno.
+/// setsockopt(SOL_SOCKET, optname, val) on `s`: 0 or -errno. SO_PRIORITY above 6 and
+/// SO_MARK need CAP_NET_ADMIN (`net_admin`), SO_BINDTODEVICE needs the interface count.
+pub fn applySetPriv(s: *Stored, optname: u64, val: []const u8, net_admin: bool, iface_count: usize) i64 {
+    switch (optname) {
+        SO_PRIORITY => {
+            if (val.len < 4) return -22;
+            const v = std.mem.readInt(i32, val[0..4], .little);
+            if (priorityNeedsAdmin(v) and !net_admin) return -1; // EPERM
+            s.priority = v;
+            return 0;
+        },
+        SO_MARK => {
+            if (val.len < 4) return -22;
+            if (!net_admin) return -1; // EPERM
+            s.mark = rd32(val);
+            return 0;
+        },
+        SO_BINDTODEVICE => {
+            // Linux needs CAP_NET_RAW for this since 5.7; the net stack here has one flat namespace, so
+            // anyone may bind to a device they can name.
+            const idx = deviceIndex(val, iface_count) orelse return -19; // ENODEV
+            s.bound_if = idx;
+            return 0;
+        },
+        else => return applySet(s, optname, val),
+    }
+}
+
 pub fn applySet(s: *Stored, optname: u64, val: []const u8) i64 {
     if (readOnly(optname)) return -92; // ENOPROTOOPT
     if (flagBit(optname)) |bit| {
@@ -192,6 +262,19 @@ pub fn encodeGet(s: Stored, f: Facts, optname: u64, out: *[16]u8) ?usize {
         },
         SO_RCVBUF => return put.int(out, s.rcvbuf),
         SO_SNDBUF => return put.int(out, s.sndbuf),
+        SO_PRIORITY => {
+            std.mem.writeInt(i32, out[0..4], s.priority, .little);
+            return 4;
+        },
+        SO_MARK => return put.int(out, s.mark),
+        SO_SNDLOWAT => return put.int(out, 1),
+        SO_BINDTODEVICE => {
+            const n = deviceName(s.bound_if);
+            if (n.len == 0) return 0;
+            @memcpy(out[0..n.len], n);
+            out[n.len] = 0;
+            return n.len + 1;
+        },
         SO_RCVTIMEO, SO_SNDTIMEO => {
             const ms = if (optname == SO_RCVTIMEO) s.rcv_ms else s.snd_ms;
             std.mem.writeInt(i64, out[0..8], ms / 1000, .little);
