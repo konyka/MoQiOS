@@ -179,12 +179,14 @@ void _start(void) {
     }
     {
         int c, s;
-        if (make_pair(18152, &c, &s) == 0) {
+        int mp = make_pair(18152, &c, &s);
+        if (mp == 0) {
             probe("C: TCP: read(8192) with exactly 4096 queued returns 4096", c, s, 4096, 8192, 3000);
             probe("C: TCP: read(20000) with 8192 queued returns 8192", c, s, 8192, 20000, 3000);
             syscall1(SYS_CLOSE, c);
             syscall1(SYS_CLOSE, s);
         } else {
+            { char code[4] = { 'm', 'p', (char)('0' + (-mp > 9 ? 9 : -mp)), 0 }; print("hello152: make_pair failed, code -"); print(code + 2); print("\n"); }
             check(0, "C: loopback connection");
         }
     }

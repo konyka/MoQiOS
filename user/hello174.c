@@ -210,6 +210,11 @@ void _start(void) {
         long total = fill(c);
         int avail = ioctl_int(s, FIONREAD);
         check(avail > 0 && avail <= 16384 + 1460, "C: with SO_RCVBUF 16384 the receiver buffers at most ~16 KiB");
+        if (!(total < big_total - 8192)) {
+            long vals[2] = { total, big_total }; char d[64]; int k = 0; print("hello174: C totals (rcvbuf-limited, default):");
+            for (int q = 0; q < 2; q++) { long x = vals[q]; char r[24]; int m = 0; if (x == 0) r[m++]='0'; while (x > 0) { r[m++] = '0' + x % 10; x /= 10; } d[k++]=' '; while (m > 0) d[k++] = r[--m]; }
+            d[k++]='\n'; d[k]=0; print(d);
+        }
         check(total < big_total - 8192, "C: and the sender is stopped earlier than with the default window");
         char drain[4096];
         long got = 0;

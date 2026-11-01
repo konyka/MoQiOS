@@ -4,6 +4,7 @@
 /// Terminal ioctls (TCGETS, TIOCGWINSZ, etc.) operate on a default terminal
 /// state. FIONREAD and FIONBIO operate on fd-level state.
 
+const std = @import("std");
 const copy = @import("../mm/copy_from_user.zig");
 const task_mod = @import("../proc/task.zig");
 const sched = @import("../proc/sched.zig");
@@ -69,6 +70,87 @@ fn targetOf(desc: *const vfs.FileDescriptor) ip.Target {
         .devfs => if (desc.devfs_idx == @import("devfs_nodes.zig").ttyNodeIdx()) .terminal else .other,
         else => .other,
     };
+}
+
+const ifr = @import("../net/ifreq_policy.zig");
+
+/// The interfaces this kernel has: the loopback device, plus eth0 once a NIC is up.
+fn collectIfaces(out: *[ifr.MAX_IFACES]ifr.Iface) usize {
+    const netif = @import("../net/netif.zig");
+    const nic = @import("../net/nic.zig");
+    var n: usize = 0;
+    out[n] = .{
+        .name = ifr.makeName("lo"),
+        .index = 1,
+        .flags = ifr.IFF_UP | ifr.IFF_LOOPBACK | ifr.IFF_RUNNING,
+        .ip = .{ 127, 0, 0, 1 },
+        .netmask = .{ 255, 0, 0, 0 },
+        .mtu = 65536,
+        .loopback = true,
+    };
+    n += 1;
+    if (nic.isActive()) {
+        out[n] = .{
+            .name = ifr.makeName("eth0"),
+            .index = 2,
+            .flags = ifr.IFF_UP | ifr.IFF_BROADCAST | ifr.IFF_RUNNING | ifr.IFF_MULTICAST,
+            .ip = netif.getOurIp(),
+            .netmask = netif.getNetmask(),
+            .mac = netif.getMac(),
+            .mtu = netif.getMtu(),
+        };
+        n += 1;
+    }
+    return n;
+}
+
+fn netdeviceIoctl(cmd: u64, arg: u64) i64 {
+    var ifs: [ifr.MAX_IFACES]ifr.Iface = undefined;
+    const count = collectIfaces(&ifs);
+    if (cmd == ifr.SIOCGIFCONF) return ifconf(ifs[0..count], arg);
+
+    // The other requests take and return a struct ifreq.
+    if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14;
+    var req: [ifr.IFREQ_SIZE]u8 = undefined;
+    if (copy.copyFromUser(&req, @ptrFromInt(arg), ifr.IFREQ_SIZE) != ifr.IFREQ_SIZE) return -14;
+    const idx = if (cmd == ifr.SIOCGIFNAME)
+        ifr.findByIndex(ifs[0..count], std.mem.readInt(u32, req[16..20], .little))
+    else
+        ifr.findByName(ifs[0..count], req[0..ifr.IFNAMSIZ]);
+    const found = idx orelse return ifr.ENODEV;
+    // The answer keeps the caller's name field; only SIOCGIFNAME rewrites it.
+    const rc = ifr.answer(cmd, ifs[found], &req);
+    if (rc != 0) return rc;
+    if (copy.copyToUser(@ptrFromInt(arg), &req, ifr.IFREQ_SIZE) != ifr.IFREQ_SIZE) return -14;
+    return 0;
+}
+
+/// SIOCGIFCONF: struct ifconf { int ifc_len; (pad) char *ifc_buf; }. Fills as
+/// many ifreq records as ifc_buf holds and sets ifc_len to the bytes written;
+/// a NULL ifc_buf asks only for the size needed.
+fn ifconf(ifs: []const ifr.Iface, arg: u64) i64 {
+    if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14;
+    var hdr: [16]u8 = undefined;
+    if (copy.copyFromUser(&hdr, @ptrFromInt(arg), 16) != 16) return -14;
+    const len_in = std.mem.readInt(i32, hdr[0..4], .little);
+    const buf_ptr = std.mem.readInt(u64, hdr[8..16], .little);
+    if (len_in < 0) return -22;
+    var written: usize = 0;
+    if (buf_ptr == 0) {
+        written = ifr.confSize(ifs.len);
+    } else {
+        if (buf_ptr >= 0x0000_8000_0000_0000) return -14;
+        const fit = ifr.confFit(ifs.len, @intCast(len_in));
+        var rec: [ifr.IFREQ_SIZE]u8 = undefined;
+        for (ifs[0..fit], 0..) |i, k| {
+            ifr.confRecord(i, &rec);
+            if (copy.copyToUser(@ptrFromInt(buf_ptr + k * ifr.IFREQ_SIZE), &rec, ifr.IFREQ_SIZE) != ifr.IFREQ_SIZE) return -14;
+        }
+        written = fit * ifr.IFREQ_SIZE;
+    }
+    std.mem.writeInt(i32, hdr[0..4], @intCast(written), .little);
+    if (copy.copyToUser(@ptrFromInt(arg), hdr[0..4], 4) != 4) return -14;
+    return 0;
 }
 
 /// sysIoctl(fd, cmd, arg) → 0 on success, negative errno on failure
@@ -200,6 +282,14 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
             const v_bytes: [*]const u8 = @ptrCast(&v);
             if (copy.copyToUser(@ptrFromInt(arg), v_bytes[0..4], 4) != 4) return -14;
             return 0;
+        },
+        ifr.SIOCGIFNAME, ifr.SIOCGIFCONF, ifr.SIOCGIFFLAGS, ifr.SIOCGIFADDR, ifr.SIOCGIFBRDADDR, ifr.SIOCGIFNETMASK, ifr.SIOCGIFMTU, ifr.SIOCGIFHWADDR, ifr.SIOCGIFINDEX => {
+            // netdevice(7): only meaningful on a socket.
+            switch (desc0.fd_type) {
+                .tcp_socket, .udp_socket, .unix_socket, .raw_socket => {},
+                else => return -25, // ENOTTY
+            }
+            return netdeviceIoctl(cmd, arg);
         },
         FIONBIO => {
             if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14;

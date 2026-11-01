@@ -8823,3 +8823,117 @@ test "TCP delivery-rate sampling restarts after the connection goes idle" {
     try std.testing.expect(std.mem.indexOf(u8, src, "tcb.rate_sample_ms = tcp_util.sampleBaseAfterAck(tcb.snd_una == tcb.snd_nxt, now);") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "if (tcb.rate_sample_ms != 0) {\n        const elapsed = now -% tcb.rate_sample_ms;") != null);
 }
+
+test "netdevice ioctls: request set and ioctl wiring" {
+    const f = kt.ifreq_policy;
+    // The request numbers are Linux's.
+    try std.testing.expectEqual(@as(u64, 0x8910), f.SIOCGIFNAME);
+    try std.testing.expectEqual(@as(u64, 0x8912), f.SIOCGIFCONF);
+    try std.testing.expectEqual(@as(u64, 0x8913), f.SIOCGIFFLAGS);
+    try std.testing.expectEqual(@as(u64, 0x8915), f.SIOCGIFADDR);
+    try std.testing.expectEqual(@as(u64, 0x8919), f.SIOCGIFBRDADDR);
+    try std.testing.expectEqual(@as(u64, 0x891b), f.SIOCGIFNETMASK);
+    try std.testing.expectEqual(@as(u64, 0x8921), f.SIOCGIFMTU);
+    try std.testing.expectEqual(@as(u64, 0x8927), f.SIOCGIFHWADDR);
+    try std.testing.expectEqual(@as(u64, 0x8933), f.SIOCGIFINDEX);
+    try std.testing.expectEqual(@as(usize, 40), f.IFREQ_SIZE);
+    // They are not terminal requests: a socket must reach the handler.
+    try std.testing.expect(!kt.ioctl_policy.isTerminalRequest(f.SIOCGIFADDR));
+
+    const src = kt.ioctl_source;
+    // Only socket descriptors answer; everything else is ENOTTY.
+    try std.testing.expect(std.mem.indexOf(u8, src, ".tcp_socket, .udp_socket, .unix_socket, .raw_socket => {},\n                else => return -25, // ENOTTY\n            }\n            return netdeviceIoctl(cmd, arg);") != null);
+    // eth0 only exists once a NIC is up; lo is always there with index 1.
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (nic.isActive()) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, ".index = 1,") != null);
+    // An unknown name or index is ENODEV, a bad user pointer EFAULT, a negative ifc_len EINVAL.
+    try std.testing.expect(std.mem.indexOf(u8, src, "const found = idx orelse return ifr.ENODEV;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (len_in < 0) return -22;") != null);
+    // SIOCGIFCONF reports the bytes written back in ifc_len, and only whole records.
+    try std.testing.expect(std.mem.indexOf(u8, src, "const fit = ifr.confFit(ifs.len, @intCast(len_in));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "written = ifr.confSize(ifs.len);") != null);
+    // eth0 is added only inside the nic.isActive() branch, after lo; with no NIC the count stays 1.
+    try std.testing.expect(std.mem.indexOf(u8, src, "    n += 1;\n    if (nic.isActive()) {\n        out[n] = .{\n            .name = ifr.makeName(\"eth0\"),") != null);
+    // SIOCGIFCONF copies exactly the whole records that fit, then writes the byte count back.
+    try std.testing.expect(std.mem.indexOf(u8, src, "written = fit * ifr.IFREQ_SIZE;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "std.mem.writeInt(i32, hdr[0..4], @intCast(written), .little);") != null);
+    // All nine requests reach the handler through one dispatch arm.
+    try std.testing.expect(std.mem.indexOf(u8, src, "ifr.SIOCGIFNAME, ifr.SIOCGIFCONF, ifr.SIOCGIFFLAGS, ifr.SIOCGIFADDR, ifr.SIOCGIFBRDADDR, ifr.SIOCGIFNETMASK, ifr.SIOCGIFMTU, ifr.SIOCGIFHWADDR, ifr.SIOCGIFINDEX => {") != null);
+    // SIOCGIFNAME looks up by index; every other request by name.
+    try std.testing.expect(std.mem.indexOf(u8, src, "ifr.findByIndex(ifs[0..count], std.mem.readInt(u32, req[16..20], .little))") != null);
+}
+
+test "ifreq policy: interface lookup and request encodings" {
+    const f = kt.ifreq_policy;
+    const lo_if: f.Iface = .{ .name = f.makeName("lo"), .index = 1, .flags = f.IFF_UP | f.IFF_LOOPBACK | f.IFF_RUNNING, .ip = .{ 127, 0, 0, 1 }, .netmask = .{ 255, 0, 0, 0 }, .mtu = 65536, .loopback = true };
+    const eth_if: f.Iface = .{ .name = f.makeName("eth0"), .index = 2, .flags = f.IFF_UP | f.IFF_BROADCAST | f.IFF_RUNNING | f.IFF_MULTICAST, .ip = .{ 10, 0, 2, 15 }, .netmask = .{ 255, 255, 255, 0 }, .mac = .{ 0x52, 0x54, 0, 0x12, 0x34, 0x56 }, .mtu = 1500 };
+    const ifs = [_]f.Iface{ lo_if, eth_if };
+    try std.testing.expectEqual(@as(?usize, 1), f.findByName(&ifs, &f.makeName("eth0")));
+    try std.testing.expectEqual(@as(?usize, null), f.findByName(&ifs, &f.makeName("eth1")));
+    try std.testing.expectEqual(@as(?usize, null), f.findByName(&ifs, &f.makeName("")));
+    // A name that fills all 16 bytes with no terminator names nothing, and a prefix of a real name is not a match.
+    try std.testing.expectEqual(@as(?usize, null), f.findByName(&ifs, &([_]u8{'e'} ** f.IFNAMSIZ)));
+    try std.testing.expectEqual(@as(?usize, null), f.findByName(&ifs, &f.makeName("eth")));
+    try std.testing.expectEqual(@as(?usize, 0), f.findByIndex(&ifs, 1));
+    try std.testing.expectEqual(@as(?usize, null), f.findByIndex(&ifs, 9));
+    var buf: [f.IFREQ_SIZE]u8 = @splat(0xAA);
+    try std.testing.expectEqual(@as(i64, 0), f.answer(f.SIOCGIFADDR, eth_if, &buf));
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, buf[16..18], .little));
+    try std.testing.expectEqualSlices(u8, &.{ 10, 0, 2, 15 }, buf[20..24]);
+    try std.testing.expectEqual(@as(u8, 0), buf[39]); // the rest of the union is zeroed
+    try std.testing.expectEqual(@as(i64, 0), f.answer(f.SIOCGIFBRDADDR, eth_if, &buf));
+    try std.testing.expectEqualSlices(u8, &.{ 10, 0, 2, 255 }, buf[20..24]);
+    try std.testing.expectEqual(f.EADDRNOTAVAIL, f.answer(f.SIOCGIFBRDADDR, lo_if, &buf));
+    try std.testing.expectEqual(@as(i64, 0), f.answer(f.SIOCGIFHWADDR, eth_if, &buf));
+    try std.testing.expectEqual(f.ARPHRD_ETHER, std.mem.readInt(u16, buf[16..18], .little));
+    try std.testing.expectEqualSlices(u8, &eth_if.mac, buf[18..24]);
+    try std.testing.expectEqual(@as(i64, 0), f.answer(f.SIOCGIFHWADDR, lo_if, &buf));
+    try std.testing.expectEqual(f.ARPHRD_LOOPBACK, std.mem.readInt(u16, buf[16..18], .little));
+    try std.testing.expectEqual(@as(i64, 0), f.answer(f.SIOCGIFMTU, lo_if, &buf));
+    try std.testing.expectEqual(@as(u32, 65536), std.mem.readInt(u32, buf[16..20], .little));
+    try std.testing.expectEqual(@as(i64, 0), f.answer(f.SIOCGIFINDEX, eth_if, &buf));
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, buf[16..20], .little));
+    try std.testing.expectEqual(@as(i64, 0), f.answer(f.SIOCGIFFLAGS, lo_if, &buf));
+    try std.testing.expectEqual(@as(u16, 0x49), std.mem.readInt(u16, buf[16..18], .little));
+    try std.testing.expectEqual(@as(i64, 0), f.answer(f.SIOCGIFFLAGS, eth_if, &buf));
+    try std.testing.expectEqual(@as(u16, 0x1043), std.mem.readInt(u16, buf[16..18], .little));
+    try std.testing.expectEqual(@as(i64, 0), f.answer(f.SIOCGIFNETMASK, lo_if, &buf));
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 0 }, buf[20..24]);
+    try std.testing.expectEqual(@as(i64, 0), f.answer(f.SIOCGIFNAME, eth_if, &buf));
+    try std.testing.expectEqualSlices(u8, &eth_if.name, buf[0..16]);
+    try std.testing.expectEqual(f.EINVAL, f.answer(0x1234, eth_if, &buf));
+    // SIOCGIFCONF sizing: whole 40-byte records only.
+    try std.testing.expectEqual(@as(usize, 80), f.confSize(2));
+    try std.testing.expectEqual(@as(usize, 2), f.confFit(2, 80));
+    try std.testing.expectEqual(@as(usize, 1), f.confFit(2, 79));
+    try std.testing.expectEqual(@as(usize, 0), f.confFit(2, 39));
+    try std.testing.expectEqual(@as(usize, 2), f.confFit(2, 4000));
+    var rec: [f.IFREQ_SIZE]u8 = undefined;
+    f.confRecord(eth_if, &rec);
+    try std.testing.expectEqualSlices(u8, &eth_if.name, rec[0..16]);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 0, 2, 15 }, rec[20..24]);
+    // Every request the ioctl dispatches on is recognised; others are not.
+    for ([_]u64{ f.SIOCGIFNAME, f.SIOCGIFCONF, f.SIOCGIFFLAGS, f.SIOCGIFADDR, f.SIOCGIFBRDADDR, f.SIOCGIFNETMASK, f.SIOCGIFMTU, f.SIOCGIFHWADDR, f.SIOCGIFINDEX }) |cmd| {
+        try std.testing.expect(f.isRequest(cmd));
+    }
+    try std.testing.expect(!f.isRequest(0x8914)); // SIOCSIFADDR: the set requests are not implemented
+    // A 16-byte name with no NUL names nothing even when an interface shares its 15-byte prefix; the empty name too.
+    const odd: f.Iface = .{ .name = ([_]u8{'a'} ** 15) ++ [_]u8{0}, .index = 7 };
+    try std.testing.expectEqual(@as(?usize, null), f.findByName(&[_]f.Iface{odd}, &(([_]u8{'a'} ** 15) ++ [_]u8{'a'})));
+    try std.testing.expectEqual(@as(?usize, 0), f.findByName(&[_]f.Iface{odd}, &(([_]u8{'a'} ** 15) ++ [_]u8{0})));
+    // Even an interface whose stored name fills all 16 bytes is not selected by an unterminated request name.
+    const full: f.Iface = .{ .name = [_]u8{'b'} ** f.IFNAMSIZ, .index = 8 };
+    try std.testing.expectEqual(@as(?usize, null), f.findByName(&[_]f.Iface{full}, &([_]u8{'b'} ** f.IFNAMSIZ)));
+    // A loopback interface has no broadcast address even if the BROADCAST flag were set on it.
+    const lo_bc: f.Iface = .{ .name = f.makeName("lo"), .index = 1, .flags = f.IFF_UP | f.IFF_BROADCAST, .ip = .{ 127, 0, 0, 1 }, .netmask = .{ 255, 0, 0, 0 }, .loopback = true };
+    try std.testing.expectEqual(@as(?[4]u8, null), f.broadcast(lo_bc));
+    try std.testing.expectEqual(f.EADDRNOTAVAIL, f.answer(f.SIOCGIFBRDADDR, lo_bc, &buf));
+    // An interface without the BROADCAST flag has none either.
+    var plain = eth_if;
+    plain.flags = f.IFF_UP;
+    try std.testing.expectEqual(@as(?[4]u8, null), f.broadcast(plain));
+    // confFit is bounded by both the interface count and the caller's buffer.
+    try std.testing.expectEqual(@as(usize, 2), f.confFit(2, 1 << 20));
+    try std.testing.expectEqual(@as(usize, 3), f.confFit(5, 3 * f.IFREQ_SIZE + 39));
+    try std.testing.expect(f.isRequest(f.SIOCGIFCONF) and !f.isRequest(0x541B));
+}

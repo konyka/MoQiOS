@@ -5835,3 +5835,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异（具名测试核对）：未设置/已设置判断反了、不取一半、空间减法不饱和、采样基准不清零、阻塞发送忽略上限、通告窗口忽略 `SO_RCVBUF`、poll 的可写空间忽略 `SO_SNDBUF`、发送缓冲没标记“已设置”、接收缓冲存原始值、`bufferValue` 的溢出写法恢复，共 10 个，全部被 `TCP buffer limits…`、`TCP delivery-rate sampling…` 或 `SO_SNDBUF / SO_RCVBUF values…` 抓住（“采样基准不清零”与“窗口忽略 `SO_RCVBUF`”第一次因未使用参数编译失败，改成可编译形式后抓住）；恢复后 `grep -c MUTATION` 为 0。
 - 验证：host 843/843；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（240 s，连续 3 次）与 GPT SMP=2 均 hello174 PASS、0 FAIL；stress（SMP=2）5/5 PASS；修复采样后 hello174 在 SMP=2 上连续 10 次 PASS（修复前约三分之一的运行失败）。
 
+### 网络接口 ioctl（hello175）
+
+- 问题：`SIOCGIFCONF`/`SIOCGIFADDR`/`SIOCGIFFLAGS`/`SIOCGIFMTU`/`SIOCGIFHWADDR`/`SIOCGIFINDEX`/`SIOCGIFNAME`/`SIOCGIFNETMASK`/`SIOCGIFBRDADDR` 全部是 `ENOTTY`，依赖接口枚举的程序无法工作。
+- 修复：见 `docs/kernel-subsystems.md` 的 hello175 条。
+- 已知差异：只实现读取类请求（`SIOCSIF*` 仍 `ENOTTY`）；没有 IPv6 地址枚举（`SIOCGIFADDR` 只回 IPv4；`getifaddrs` 在 Linux 上走 netlink，本内核没有 netlink）；接口只有 `lo` 与单个 `eth0`；`SIOCGIFFLAGS` 不反映混杂模式、链路状态变化；`eth0` 的 MTU 取 `netif.getMtu()`（可被路径 MTU 实验改动）。
+- 过程说明（如实）：这一轮先写了实现再补探测，不是严格先红后绿；为补上红灯证据，我把 `kernel/fs/ioctl.zig` 暂时还原到旧版本跑 hello175，得到 23 项 FAIL，再恢复。另外在写 host 测试时发现，`ifreq_policy.zig` 里随手写的内联 `test` 块根本不会运行（host 测试只跑 `tests/main.zig`），所以把它们挪到 `tests/main.zig`。
+- TDD：host 新增 2 个测试（请求号与 ioctl 接线形状；`ifreq` 编码、名字/索引查找、`SIOCGIFCONF` 分块）；hello175（A `SIOCGIFCONF` 的大小查询/填充/过小缓冲，B `lo` 的 flags/地址/掩码/MTU/索引/硬件地址族/无广播，C 名字与索引互查，D 未知名字、无终止符、NULL、非套接字，E 有网卡时 `eth0` 的一致性）在旧 `ioctl.zig` 上 23 项 FAIL，新代码 PASS。
+- 变异（具名测试核对）：未终止的名字被接受、前缀匹配、广播地址算错、`lo` 也有广播地址、`SIOCGIFCONF` 不看缓冲区大小、`lo` 的硬件地址族写成以太网、漏掉 `SIOCGIFINDEX`、非套接字也回答、负 `ifc_len` 被接受、`eth0` 无网卡也出现，共 10 个，全部被 `ifreq policy…` 或 `netdevice ioctls…` 抓住。**第一轮有 3 个变异没被抓住**（未终止名字、`lo` 带广播、漏掉 `SIOCGIFINDEX`），另有 2 个因未使用变量编译失败；我补了测试（存储名字占满 16 字节的接口、带 BROADCAST 标志的回环、所有请求号逐个识别、`confFit` 同时受接口数与缓冲区限制、`eth0` 只在 `nic.isActive()` 分支里加入的确切代码形状），并把两个变异改成可编译形式，之后 10 个全部被抓住；恢复后 `grep -c MUTATION` 为 0。
+- **门禁里出现的两次偶发失败（原因未证实）**：在这个改动的 SMP=8 运行里，16 次中出现 2 次失败：一次 `hello152: FAIL C: loopback connection`（TCP 回环连接建立失败，`make_pair` 的返回码当时没打印），一次 `hello174: FAIL C: and the sender is stopped earlier than with the default window`（一个依赖时序的数量比较）。**我没有查清原因**：hello152 的失败发生在这次启动里 hello175 运行之前，而本次内核改动只是 `ioctl.zig` 里新增的、这些探测不会走到的代码，所以不太可能是逻辑上的因果；不加这个改动的基线（上一个提交）连续 6 次 SMP=8 全部干净，加了失败时的诊断输出后又连续 8 次干净。样本量不足以区分“这个改动改变了时序”与“本来就有的低概率问题”（若真实失败率约 12%，基线连续 6 次干净的概率仍有约 45%）。处理：给 hello152 增加 `make_pair` 失败码输出、给 hello174 增加两个总量的失败时输出，以便下次出现时能直接看到原因；**这是已知未解决的偶发问题**，不是已修复。
+- 验证：host 845/845；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、GPT SMP=2 通过，SMP=8 共 16 次（含上面 2 次偶发失败）其余全部 0 个 FAIL、hello175 全部 PASS；stress（SMP=2）5/5 PASS。riscv64/aarch64 构建与 stress 是在后来只改了用户态探测（hello152/hello174 的失败输出）和 host 测试之前跑的，内核代码相同。
+
