@@ -8649,3 +8649,24 @@ test "process CPU time wiring: reap folds children and threads, readers use the 
     const ts = kt.time_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (!thread) return task_mod.processCpuTimes(idx, tsc.read(), tsc.tsc_freq_mhz).selfUs() *| 1000;") != null);
 }
+
+test "TCP over IPv6 loopback: a SYN to a port nobody listens on is answered with a RST" {
+    const src = kt.tcp_source;
+    // The v6 receive path resets a ::1 SYN that created no connection and has no listener.
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (pendingBacklogCount() == before and !hasListener(dst_port, true)) {\n                sendLoopbackResetV6(src_ip, dst_ip, src_port, dst_port, flags, ack_num, seq_num, payload_len);") != null);
+    // The IPv4 rule is unchanged (v4 listeners only).
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (pendingBacklogCount() == before and !hasListener(dst_port, false)) {\n                sendLoopbackReset(") != null);
+    // The reply is ::1 only, never answers a RST, goes back out through lo, and is checksummed for IPv6.
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (!netif.isLoopbackV6(src_ip) or !netif.isLoopbackV6(dst_ip)) return;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "fn sendLoopbackResetV6(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const csum = tcpChecksumV6(dst_ip, src_ip, pkt[tcp_off..].ptr, 20);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const frame_len = eth.buildFrame(&pkt, mac, mac, eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + 20);\n    _ = lo_dev.sendPacket(&pkt, frame_len);") != null);
+    // Same RFC 9293 reply rule as IPv4: a segment carrying an ACK is answered by RST with seq = ack, otherwise RST|ACK.
+    const tu = kt.tcp_util;
+    const with_ack = tu.resetReply(true, 1000, 5, 0, false, false);
+    try std.testing.expectEqual(@as(u32, 1000), with_ack.seq);
+    try std.testing.expect(!with_ack.with_ack);
+    const syn = tu.resetReply(false, 0, 77, 0, true, false);
+    try std.testing.expectEqual(@as(u32, 78), syn.ack);
+    try std.testing.expect(syn.with_ack);
+}

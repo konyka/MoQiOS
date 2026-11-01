@@ -5794,3 +5794,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异（具名测试核对）：当前时间片记到错误的态、`reapedUsage` 漏掉孙进程的系统时间、`inheritFromChild` 覆盖而非累加、释放槽前不折算线程、退出时不清 `sched_in_tsc`、成员不按线程组判定、wait4 在失败时也写 rusage、`RUSAGE_CHILDREN` 误报自身、阻塞回收路径丢 usage、进程时钟反向判断（`!thread` 改 `thread`），共 10 个，全部被 `cpu_time_policy…` 或 `process CPU time wiring…` 抓住（最后一个第一次因去掉 `if (false)` 后的未用变量编译失败，改成反向判断后抓住）；恢复后 `grep -c MUTATION` 为 0。这些 host 测试是规则与表达式形状检查，行为证据来自 hello170。
 - 验证：host 836/836；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（240 s）与 GPT SMP=2 均 hello170 与 hello102 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
 
+### IPv6 回环上 TCP 连接到关闭端口（hello171）
+
+- 问题：hello160 的已知差异“IPv6 不回 RST”。实测在旧内核上 hello171 的 A 段 `connect(::1, 关闭端口)` 阻塞不返回（冒烟日志停在 A 段第一项之后，需要手动杀 qemu），因为 `handlePacketV6` 对无连接又无监听者的 SYN 直接 `return`。
+- 修复：见 `docs/kernel-subsystems.md` 的 hello171 条：`handlePacketV6` 与 IPv4 同样判定，新增 `sendLoopbackResetV6`，仅 `::1`。
+- 已知差异：非回环 IPv6 目的仍不回 RST（需要 NDP 与限速）；也没有 ICMPv6 目的不可达（UDP/TCP 都没有）。
+- TDD：host 新增 1 个测试（v6 路径的接线形状：判定条件、`::1` 限定、校验和、经 `lo` 发出，IPv4 规则不变，`resetReply` 两种形态）；hello171（A 阻塞 `connect` 立即 `ECONNREFUSED`、B 非阻塞 `POLLERR`/`SO_ERROR` 读后清零、C 有监听者的 `::1` 端口仍然连得上）在旧内核上 A 段阻塞挂住（红灯），新内核全部 PASS。
+- 变异（具名测试核对）：监听者族判断写成 IPv4、不检查目的是 `::1`、伪首部源/目的互换、积压判断反向，共 4 个，全部被 `TCP over IPv6 loopback…` 抓住（“去掉积压判断”那个变异第一次因未使用变量编译失败，改成反向判断后抓住）；恢复后 `grep -c MUTATION` 为 0。host 测试是接线形状检查，行为证据来自 hello171。
+- 验证：host 837/837；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（240 s）与 GPT SMP=2 均 hello171 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+

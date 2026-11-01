@@ -1385,7 +1385,13 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
 
     const tcb = findTcbByTupleV6(dst_port, src_port, src_ip) orelse {
         if (flags & SYN != 0) {
+            const before = pendingBacklogCount();
             handleIncomingSynV6(src_ip, src_port, dst_port, seq_num, raw_window, opts, flags);
+            // Nobody listens on the port: a ::1 peer is told at once (RFC 9293
+            // §3.10.7.1) instead of retransmitting its SYN.
+            if (pendingBacklogCount() == before and !hasListener(dst_port, true)) {
+                sendLoopbackResetV6(src_ip, dst_ip, src_port, dst_port, flags, ack_num, seq_num, payload_len);
+            }
         }
         return;
     };
@@ -2783,6 +2789,28 @@ fn sendLoopbackReset(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16,
     ipv4.buildHeader(pkt[14..].ptr, dst_ip, src_ip, ipv4.PROTO_TCP, 20);
     const mac = netif.getMac();
     const frame_len = eth.buildFrame(&pkt, mac, mac, eth.ETHERTYPE_IPV4, 20 + 20);
+    _ = lo_dev.sendPacket(&pkt, frame_len);
+}
+
+/// IPv6 twin of sendLoopbackReset: ::1 only (no NDP needed).
+fn sendLoopbackResetV6(src_ip: [16]u8, dst_ip: [16]u8, src_port: u16, dst_port: u16, flags: u8, ack_num: u32, seq_num: u32, payload_len: u32) void {
+    if (flags & RST != 0) return;
+    if (!netif.isLoopbackV6(src_ip) or !netif.isLoopbackV6(dst_ip)) return;
+    const reply = tcp_util.resetReply(flags & ACK != 0, ack_num, seq_num, payload_len, flags & SYN != 0, flags & FIN != 0);
+    var pkt: [1518]u8 = undefined;
+    const tcp_off: u16 = 14 + ipv6.HEADER_LEN;
+    @memset(pkt[0 .. tcp_off + 20], 0);
+    bo.writeU16BeAt(&pkt, tcp_off + 0, dst_port);
+    bo.writeU16BeAt(&pkt, tcp_off + 2, src_port);
+    bo.writeU32BeAt(&pkt, tcp_off + 4, reply.seq);
+    bo.writeU32BeAt(&pkt, tcp_off + 8, reply.ack);
+    pkt[tcp_off + 12] = 5 << 4;
+    pkt[tcp_off + 13] = if (reply.with_ack) RST | ACK else RST;
+    const csum = tcpChecksumV6(dst_ip, src_ip, pkt[tcp_off..].ptr, 20);
+    bo.writeU16BeAt(&pkt, tcp_off + 16, csum);
+    ipv6.buildHeader(pkt[14..].ptr, dst_ip, src_ip, ipv6.PROTO_TCP, 20);
+    const mac = netif.getMac();
+    const frame_len = eth.buildFrame(&pkt, mac, mac, eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + 20);
     _ = lo_dev.sendPacket(&pkt, frame_len);
 }
 
