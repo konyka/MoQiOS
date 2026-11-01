@@ -5997,3 +5997,15 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 变异（具名测试核对）：`sigprocmask` 的 `how` 上界、三个检查的先后（旧掩码缓冲区先于 `how`、`how` 先于新集合）、`kill` 的信号号检查位置（目标之前、权限之后、删除、进程组分支删除、`-1` 分支删除）、`tkill` 的三个检查的先后、`rt_sigtimedwait` 的集合指针错误码与 `sigsetsize == 0` 的错误码、`info` 检查被删除、`rt_sigqueueinfo` 的 NULL 检查被删除/失效、信号号检查移到读取之前，共 15 个，全部被 `signal errnos follow…` 抓住；恢复后 `grep -c MUTATION` 为 0。
 - 验证：host 861/861；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello189 PASS、0 个 FAIL；stress（SMP=2）5/5 PASS。
+
+### 全系统调用的恶意参数扫描，以及 3 个用户可触发的缺陷（hello190）
+
+- 动机：连续两轮（hello188、hello189）逐个对照 Linux 时，都顺带发现了"一行用户态调用让内核 panic"的缺陷（`mmap` 长度溢出、`rt_sigqueueinfo(NULL)`）。这说明按 Linux 行为逐项对照的办法只覆盖了人想到要测的路径；需要一个对全部系统调用号、不依赖人工挑选路径的兜底。
+- 方法：hello190 对 512 个系统调用号（去掉 59 个会故意结束运行的）各用 7 组恶意参数调用一次，共 3185 次，每次放在 fork 出的子进程里，调用前打印号与参数组；内核必须给出结果或 errno，阻塞者必须能被杀掉，之后内核还要能 fork 和回收。第二部分是一个定时断言：四个范围调用对 128 TiB 范围必须 2 秒内返回。
+- 发现与修复：①NULL 用户指针 panic（`sendto(0, 0, …)`，根因是 `copyFromUser(…, @ptrFromInt(user_value), …)` 在调用点对 0 触发 Zig 安全检查，约 300 个调用点同源）：`copyFromUser`/`copyToUser` 的指针形参改成 `[*]allowzero`，一处修改覆盖全部调用点；②`munmap`/`mprotect`/`madvise`/`msync` 对 128 TiB 范围逐页遍历（`munmap` 12.7 秒，`mprotect` 实际不返回）：新增 `mmap.skipHole`，所有逐页循环和 `huge_user_impl` 的 2 MiB 步长循环都跳过没有页表的区域，结果 207/75/75/75 毫秒；③hello188 已修的 `mmap` 溢出是同类。
+- 过程说明（如实）：第一次整个扫描跑了 240 秒才到系统调用 12 号，原因是每个子进程等待用 10 ms 睡眠轮询；第二次到 45 号时 panic（上面的①）；修好后第三次到 45 号时超时，改成先 `sched_yield` 轮询再睡眠，并把参数组从 10 组减到 7 组，才在约 150 秒内跑完全部；hello190 的 `calls=3185`，阻塞并被杀的 4 个都是 `select`/`ppoll`/`pselect6`（没有超时也没有可等事件时 Linux 也阻塞）。
+- 已知差异与局限：参数模式固定（不是随机或覆盖率引导）；只能发现"对恶意输入不设防"，不能发现逻辑错误；59 个会故意结束运行的调用没有测（`exit`、`kill`、`mount`、`reboot`、`fork`、`clone`、`execve`、`swapon`、`clock_settime`、`sethostname` 等）；阻塞型调用只验证能被杀。
+- TDD：host 新增 1 个测试（`copyFromUser`/`copyToUser` 的 `allowzero` 签名、`skipHole` 的各使用点、`mprotect` 与 `huge_user_impl` 里的 1 GiB 跳跃）；hello190 在修复前依次因 panic 和 12.7 秒的 `munmap` 而失败，修复后 PASS。
+
+- 变异（具名测试核对）：`copyFromUser`/`copyToUser` 的 `allowzero` 去掉各一个、`validateUserRange` 的 0 地址检查去掉、`unmapRange`/`firstMappedPage`/`fixedReplaceable`/`mprotect` 四个循环的跳洞各去掉、`prescanHuge`/`demoteRange` 的 1 GiB 跳跃去掉，共 12 个，全部被 `hostile user pointers…` 抓住；恢复后 `grep -c MUTATION` 为 0。注意这个 host 测试只钉住源码形状；"128 TiB 范围在 2 秒内返回"的行为断言在 hello190 里，由冒烟覆盖。
+- 验证：host 862/862；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello190 PASS（3185 次调用、4 个阻塞并被杀、0 次 panic）、0 个 FAIL；stress（SMP=2）5/5 PASS。

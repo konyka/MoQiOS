@@ -50,6 +50,33 @@ const rofs = @import("../fs/rofs.zig");
 /// TLB safety: collects physical frames during unmapping, performs the
 /// synchronous shootdown, then frees frames — ensures no remote CPU can
 /// reference a freed frame via stale TLB entries.
+/// Where to resume a page-by-page walk of an address space after finding that `virt` holds nothing.
+/// A missing page-directory-pointer or page-directory level means no page below it can be mapped, so the
+/// walk jumps to the next 1 GiB or 2 MiB boundary instead of visiting every 4 KiB page (munmap or mprotect
+/// of a 128 TiB range would otherwise spin for hours inside one system call). With `stop_at_regions` the
+/// jump never passes the base of a tracked region, for callers that also count demand-faulted mappings.
+/// Always returns more than `virt`, page aligned.
+pub fn skipHole(task: *task_mod.Task, virt: u64, stop_at_regions: bool) u64 {
+    const page = user_space.PAGE_SIZE;
+    var limit = virt + page;
+    const pde = paging_mod.getPdEntry(task.page_table_phys, virt);
+    if (pde) |entry| {
+        if (!entry.present and !entry.huge_page) limit = (virt | (2 * 1024 * 1024 - 1)) + 1;
+    } else {
+        limit = (virt | (1024 * 1024 * 1024 - 1)) + 1;
+    }
+    if (stop_at_regions and limit > virt + page) {
+        var bits = task.mmap_active_bm;
+        while (bits != 0) {
+            const i: u6 = @truncate(@ctz(bits));
+            bits &= bits - 1;
+            const r_base = task.mmap_regions[i].base;
+            if (r_base > virt and r_base < limit) limit = r_base;
+        }
+    }
+    return limit;
+}
+
 pub fn unmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
     if (num_pages == 0) return;
 
@@ -81,7 +108,8 @@ pub fn unmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
         }
     }.call;
 
-    for (0..num_pages) |p| {
+    var p: u64 = 0;
+    while (p < num_pages) : (p += 1) {
         const virt = base + p * 4096;
         if (paging_mod.unmapPage(task.page_table_phys, virt)) |phys| {
             // L1: pages of a no_free region (user-MMIO / framework DMA) are
@@ -164,6 +192,10 @@ pub fn unmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
                     }
                 },
             }
+        } else {
+            // No page table below this address: nothing in the next stretch can be mapped either.
+            const resume_at = skipHole(task, virt, false);
+            p += (resume_at - virt) / 4096 - 1;
         }
     }
 
@@ -557,14 +589,17 @@ fn rangesOverlap(a_base: u64, a_pages: u64, b_base: u64, b_pages: u64) bool {
 /// loaded image, the stack, break pages — so a placement search cannot land on a
 /// live mapping, and lets the search skip straight past a conflict.
 fn firstMappedPage(task: *task_mod.Task, base: u64, num_pages: u64) ?u64 {
-    for (0..num_pages) |p| {
+    var p: u64 = 0;
+    while (p < num_pages) : (p += 1) {
         // isPageOccupied, not isPageMapped: swap entries and PROT_NONE
         // reservations are non-present but the address is still owned —
         // placing a new mapping there would destroy the swap entry (the
         // evicted page's only reference). Pre-swap this equalled present-only.
-        if (paging_mod.isPageOccupied(task.page_table_phys, base + p * user_space.PAGE_SIZE)) {
+        const va = base + p * user_space.PAGE_SIZE;
+        if (paging_mod.isPageOccupied(task.page_table_phys, va)) {
             return p;
         }
+        p += (skipHole(task, va, false) - va) / user_space.PAGE_SIZE - 1;
     }
     return null;
 }
@@ -709,6 +744,7 @@ fn fixedReplaceable(task: *task_mod.Task, base: u64, num_pages: u64) bool {
     while (p < num_pages) : (p += 1) {
         const va = base + p * page;
         if (paging_mod.isPageOccupied(task.page_table_phys, va) and !hasMmapOverlap(task, va, 1)) return false;
+        p += (skipHole(task, va, false) - va) / page - 1;
     }
     if (@import("../ipc/sysv_shm.zig").overlapsAttachment(task.page_table_phys, base, num_pages)) return false;
     return canTrackReplacement(task, base, num_pages);

@@ -1585,6 +1585,28 @@ test "munmap and SysV SHM policy validation" {
     try std.testing.expect(shm_policy.rangeEnd(0x7000_0000, 4096, munmap_policy.USER_ADDR_MAX) != null);
 }
 
+test "hostile user pointers cannot panic the copy helpers, and huge ranges skip absent page tables" {
+    const c = kt.copy_from_user_source;
+    // A NULL user pointer reaches validateUserRange (and fails it) instead of tripping Zig's "cast causes
+    // pointer to be null" safety panic at the @ptrFromInt call site: the parameters accept address zero.
+    try std.testing.expect(std.mem.indexOf(u8, c, "pub fn copyFromUser(dst: []u8, src_user: [*]allowzero const u8, count: usize) usize {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "pub fn copyToUser(dst_user: [*]allowzero u8, src: []const u8, count: usize) usize {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "if (addr == 0) return false;") != null); // and address zero is refused
+
+    // A range walk jumps over a stretch that has no page table instead of visiting every 4 KiB page; without
+    // the jump munmap of 128 TiB ran for ~13 s (and mprotect effectively forever) inside one system call.
+    const m = kt.mmap_source;
+    try std.testing.expect(std.mem.indexOf(u8, m, "pub fn skipHole(task: *task_mod.Task, virt: u64, stop_at_regions: bool) u64 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "const resume_at = skipHole(task, virt, false);") != null); // unmapRange
+    try std.testing.expect(std.mem.indexOf(u8, m, "p += (skipHole(task, va, false) - va) / user_space.PAGE_SIZE - 1;") != null); // firstMappedPage
+    try std.testing.expect(std.mem.indexOf(u8, m, "p += (skipHole(task, va, false) - va) / page - 1;") != null); // fixedReplaceable
+    const mp = kt.mprotect_source;
+    try std.testing.expect(std.mem.count(u8, mp, "skipHole(cur,") >= 3);
+    try std.testing.expect(std.mem.indexOf(u8, mp, "block = ((block | (1024 * 1024 * 1024 - 1)) + 1) - paging.PAGE_2MB;") != null);
+    const h = kt.huge_user_impl_source;
+    try std.testing.expect(std.mem.count(u8, h, "1024 * 1024 * 1024 - 1") >= 4); // prescanHuge, demoteRange, both protectHugeOverlaps
+}
+
 test "signal errnos follow Linux's order of checks, and a NULL siginfo no longer panics" {
     const src = kt.signal_syscall_source;
     const idx = std.mem.indexOf;

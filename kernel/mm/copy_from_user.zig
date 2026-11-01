@@ -125,11 +125,13 @@ pub fn validateUserRange(addr: u64, len: usize) bool {
 /// Returns the number of bytes successfully copied.
 /// Validates that the source range is in user space before copying.
 /// Uses @memcpy for efficient bulk copy (compiler generates SSE/AVX).
-pub fn copyFromUser(dst: []u8, src_user: [*]const u8, count: usize) usize {
+pub fn copyFromUser(dst: []u8, src_user: [*]allowzero const u8, count: usize) usize {
     const copy_len = if (count > dst.len) dst.len else count;
     if (copy_len == 0) return 0;
 
-    // Validate user-space address range
+    // Validate user-space address range. `allowzero` matters: callers build the pointer with
+    // @ptrFromInt(user_value), and a NULL user pointer must reach this check (and fail it) instead of
+    // tripping the "cast causes pointer to be null" safety panic at the call site.
     const src_addr: u64 = @intFromPtr(src_user);
     if (!validateUserRange(src_addr, copy_len)) return 0;
     // Ensure the source pages are actually mapped and user-accessible before
@@ -137,7 +139,7 @@ pub fn copyFromUser(dst: []u8, src_user: [*]const u8, count: usize) usize {
     if (!userRangeMapped(src_addr, copy_len)) return 0;
 
     paging.userAccessBegin();
-    const copied = copyBytes(dst.ptr, src_user, copy_len);
+    const copied = copyBytes(dst.ptr, @ptrCast(src_user), copy_len);
     paging.userAccessEnd();
     return copied;
 }
@@ -198,7 +200,7 @@ pub fn copyPathFromUser(dst: []u8, src_user: u64, max: usize) usize {
 /// Returns the number of bytes successfully copied.
 /// Validates that the destination range is in user space before copying.
 /// Uses @memcpy for efficient bulk copy.
-pub fn copyToUser(dst_user: [*]u8, src: []const u8, count: usize) usize {
+pub fn copyToUser(dst_user: [*]allowzero u8, src: []const u8, count: usize) usize {
     const copy_len = if (count > src.len) src.len else count;
     if (copy_len == 0) return 0;
 
@@ -210,7 +212,7 @@ pub fn copyToUser(dst_user: [*]u8, src: []const u8, count: usize) usize {
     if (!userRangeWritable(dst_addr, copy_len)) return 0;
 
     paging.userAccessBegin();
-    const copied = copyBytes(dst_user, src.ptr, copy_len);
+    const copied = copyBytes(@ptrCast(dst_user), src.ptr, copy_len);
     paging.userAccessEnd();
     return copied;
 }

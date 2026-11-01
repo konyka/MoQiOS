@@ -28,7 +28,12 @@ const x86 = struct {
         const end = base + num_pages * huge.PAGE_SIZE;
         var blk = base & ~(huge.HUGE_BYTES - 1);
         while (blk < end) : (blk += huge.HUGE_BYTES) {
-            const pde = paging.getPdEntry(cr3, blk) orelse continue;
+            const pde = paging.getPdEntry(cr3, blk) orelse {
+                // No page directory here (or a 1 GiB page): nothing below it is a 2 MiB block, so jump to
+                // the next 1 GiB boundary rather than test every 2 MiB slot of an absent gigabyte.
+                blk = ((blk | (1024 * 1024 * 1024 - 1)) + 1) - huge.HUGE_BYTES;
+                continue;
+            };
             if (!pde.huge_page) continue;
             if (!pde.present and pde.getPhysAddr() == 0) continue;
             if (blk >= base and blk + huge.HUGE_BYTES <= end) {
@@ -67,6 +72,10 @@ const x86 = struct {
         const end = base + num_pages * huge.PAGE_SIZE;
         var blk = base & ~(huge.HUGE_BYTES - 1);
         while (blk < end) : (blk += huge.HUGE_BYTES) {
+            if (paging.getPdEntry(cr3, blk) == null) {
+                blk = ((blk | (1024 * 1024 * 1024 - 1)) + 1) - huge.HUGE_BYTES; // no page directory: skip the gigabyte
+                continue;
+            }
             try paging.demoteHugePage(cr3, blk); // no-op unless a huge PDE
         }
     }
@@ -80,7 +89,11 @@ const x86 = struct {
     fn protectHugeOverlaps(cr3: u64, addr: u64, end: u64, prot: u64) !void {
         var blk = addr & ~(huge.HUGE_BYTES - 1);
         while (blk < end) : (blk += huge.HUGE_BYTES) {
-            const pde = paging.getPdEntry(cr3, blk) orelse continue;
+            const pde = paging.getPdEntry(cr3, blk) orelse {
+                // No page directory here: nothing in this gigabyte is a 2 MiB block.
+                blk = ((blk | (1024 * 1024 * 1024 - 1)) + 1) - huge.HUGE_BYTES;
+                continue;
+            };
             if (!pde.huge_page) continue;
             if (blk >= addr and blk + huge.HUGE_BYTES <= end) {
                 if (prot == 0) { // PROT_NONE
@@ -103,7 +116,11 @@ const x86 = struct {
         var used: u32 = 0;
         var blk = addr & ~(huge.HUGE_BYTES - 1);
         while (blk < end) : (blk += huge.HUGE_BYTES) {
-            const pde = paging.getPdEntry(cr3, blk) orelse continue;
+            const pde = paging.getPdEntry(cr3, blk) orelse {
+                // No page directory here: nothing in this gigabyte is a 2 MiB block.
+                blk = ((blk | (1024 * 1024 * 1024 - 1)) + 1) - huge.HUGE_BYTES;
+                continue;
+            };
             if (!pde.huge_page) continue;
             if (blk >= addr and blk + huge.HUGE_BYTES <= end) {
                 if (prot == 0) {

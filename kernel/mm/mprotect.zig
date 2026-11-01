@@ -101,7 +101,12 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
         var pg: u64 = 0;
         while (pg < len_pages) : (pg += 1) {
             const va = addr + pg * paging.PAGE_SIZE;
-            if (paging.isPageOccupied(cur.page_table_phys, va) or @import("mmap.zig").hasMmapOverlap(cur, va, 1)) mapped_pages += 1;
+            if (paging.isPageOccupied(cur.page_table_phys, va) or @import("mmap.zig").hasMmapOverlap(cur, va, 1)) {
+                mapped_pages += 1;
+                continue;
+            }
+            // Nothing here: jump over the stretch with no page table, but never past a tracked region.
+            pg += (@import("mmap.zig").skipHole(cur, va, true) - va) / paging.PAGE_SIZE - 1;
         }
     }
 
@@ -150,7 +155,11 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     var huge_demotions: u32 = 0;
     var block = addr & ~(paging.PAGE_2MB - 1);
     while (block < end) : (block += paging.PAGE_2MB) {
-        const pde = paging.getPdEntry(cur.page_table_phys, block) orelse continue;
+        const pde = paging.getPdEntry(cur.page_table_phys, block) orelse {
+            // No page directory here, so none of the next 1 GiB can hold a huge page.
+            block = ((block | (1024 * 1024 * 1024 - 1)) + 1) - paging.PAGE_2MB;
+            continue;
+        };
         if (!pde.huge_page) continue;
         if (!(block >= addr and block + paging.PAGE_2MB <= end)) huge_demotions += 1;
     }
@@ -159,7 +168,10 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     if ((prot & PROT_WRITE) != 0) {
         var scan = addr;
         while (scan < end) : (scan += paging.PAGE_SIZE) {
-            const pte = paging.getProtectionPageEntry(cur.page_table_phys, scan) orelse continue;
+            const pte = paging.getProtectionPageEntry(cur.page_table_phys, scan) orelse {
+                scan = @import("mmap.zig").skipHole(cur, scan, false) - paging.PAGE_SIZE;
+                continue;
+            };
             const raw: u64 = @bitCast(pte.*);
             if (cow_pte.isCow(raw) and pmm.getRefCount(raw & paging.ADDR_MASK) > 1) cow_copies += 1;
         }
@@ -205,7 +217,11 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
 
     while (v < end) : (v += paging.PAGE_SIZE) {
         const pte_opt = paging.getProtectionPageEntry(cur.page_table_phys, v);
-        const pte = pte_opt orelse continue; // skip unmapped pages
+        const pte = pte_opt orelse {
+            // Skip unmapped pages, and jump over any stretch with no page table at all.
+            v = @import("mmap.zig").skipHole(cur, v, false) - paging.PAGE_SIZE;
+            continue;
+        };
 
         // Swap entries (non-present + bit-11 marker; the frame is on disk):
         // the generic rewrite below would set present=1 on the swap slot and
