@@ -293,6 +293,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello164"); /* SCM_CREDENTIALS / SO_PASSCRED */
     run_test("hello165"); /* MSG_PEEK / MSG_WAITALL / MSG_TRUNC */
     run_test("hello166"); /* SSE register state across fork */
+    run_test("hello167"); /* recvmsg MSG_PEEK / MSG_WAITALL / MSG_TRUNC */
 
     start_persistent_services();
 

@@ -967,9 +967,46 @@ fn unixRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8
     var out: net_mod.unix_socket.RightsOut = .{};
     const idx = cur.fd_table.fds[fd].unix_sock_idx;
     const nonblock = @import("../fs/namespace_policy.zig").nonblockRequested(cur.fd_table.fds[fd].status_flags, flags);
-    // Always ask for the set: a receiver without a control buffer still must
-    // learn (MSG_CTRUNC) that descriptors were dropped.
-    const n = net_mod.unix_socket.unixRecvBlockingRights(idx, &data, room, nonblock, &out);
+    const rf = @import("recv_flags_policy.zig");
+    const is_stream = net_mod.unix_socket.unixIsStream(idx);
+    var n: i64 = undefined;
+    if (rf.peek(flags)) {
+        // MSG_PEEK: look without consuming; no descriptor set is delivered.
+        var full: usize = 0;
+        n = net_mod.unix_socket.unixPeek(idx, &data, room, &full);
+        while (n == -11 and !nonblock) {
+            const w = net_mod.unix_socket.unixWaitReadable(idx);
+            if (w != 0) return w;
+            n = net_mod.unix_socket.unixPeek(idx, &data, room, &full);
+        }
+        out.full_len = full;
+        out.cred = net_mod.unix_socket.unixSenderCred(idx);
+    } else {
+        // Always ask for the set: a receiver without a control buffer still must
+        // learn (MSG_CTRUNC) that descriptors were dropped.
+        n = net_mod.unix_socket.unixRecvBlockingRights(idx, &data, room, nonblock, &out);
+        // MSG_WAITALL: keep reading until the iovecs are full (stream only). A
+        // descriptor set that arrives after the first one cannot be delivered
+        // in the same call: it is dropped and reported as MSG_CTRUNC.
+        if (n > 0 and rf.waitAll(flags, is_stream, nonblock)) {
+            var got: usize = @intCast(n);
+            while (rf.waitAllStep(room, got, 1) == .again) {
+                var more: net_mod.unix_socket.RightsOut = .{};
+                const r2 = net_mod.unix_socket.unixRecvBlockingRights(idx, @as([*]u8, @ptrCast(&data)) + got, room - got, false, &more);
+                if (more.count > 0) {
+                    if (out.count == 0) {
+                        out = more;
+                    } else {
+                        for (more.descs[0..more.count]) |*d| vfs_mod.releaseDescriptor(d);
+                        out.dropped = true;
+                    }
+                }
+                if (rf.waitAllStep(room, got, r2) == .stop) break;
+                got += @intCast(r2);
+            }
+            n = @intCast(got);
+        }
+    }
     if (n < 0) return n;
 
     // Scatter the bytes.
@@ -1036,6 +1073,11 @@ fn unixRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8
             return -14;
         }
     }
+    if (out.dropped) out_flags |= sp.MSG_CTRUNC;
+    // A datagram longer than the buffers is cut: say so (Linux sets MSG_TRUNC
+    // in msg_flags whenever data was discarded).
+    const cut_datagram = out.full_len > @as(usize, @intCast(n));
+    if (cut_datagram) out_flags |= rf.MSG_TRUNC;
     // msg_controllen and msg_flags
     var tail: [8]u8 = undefined;
     bo.writeU64Le(&tail, written);
@@ -1043,6 +1085,8 @@ fn unixRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8
     var fl: [4]u8 = undefined;
     bo.writeU32Le(&fl, out_flags);
     _ = copy.copyToUser(@ptrFromInt(msg_ptr + 48), &fl, 4);
+    // MSG_TRUNC as an input flag returns the real datagram length.
+    if (rf.truncReportsFullLength(flags) and cut_datagram) return @intCast(out.full_len);
     return n;
 }
 
@@ -1236,7 +1280,9 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
         if (copy.copyFromUser(&hdr, @ptrFromInt(msg_ptr), 56) != 56) return -14;
         return udpRecvmsg(cur, fd, msg_ptr, &hdr, flags);
     }
-    if (flags != 0) return -22;
+    const rf_tcp = @import("recv_flags_policy.zig");
+    // Supported TCP recvmsg flags: MSG_PEEK, MSG_DONTWAIT, MSG_WAITALL.
+    if (flags & ~(rf_tcp.MSG_PEEK | net_mod.tcp_recv_policy.MSG_DONTWAIT | rf_tcp.MSG_WAITALL) != 0) return -22;
     if (fd >= vfs_mod.MAX_FDS or cur.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
 
     var msghdr_buf: [56]u8 = undefined;
@@ -1250,38 +1296,72 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
     if (iov_len == 0 or iov_len > 1024) return -22;
 
     const tcb_idx = cur.fd_table.fds[fd].tcb_idx;
-    var total: usize = 0;
+    const base_nonblock = net_mod.tcp_recv_policy.nonblockRequested(cur.fd_table.fds[fd].status_flags, flags);
+    const want_all = rf_tcp.waitAll(flags, true, base_nonblock);
 
+    // Validate every iovec and total the room first (nothing is consumed yet).
+    const IovSeg = struct { base: u64, len: u32 };
+    var segs: [16]IovSeg = undefined;
+    var nsegs: usize = 0;
+    var room: u32 = 0;
     for (0..@as(usize, @intCast(iov_len))) |i| {
         var iov_buf: [16]u8 = undefined;
         const src: [*]const u8 = @ptrFromInt(iov_ptr + @as(u64, @intCast(i)) * 16);
-        const iov_copied = copy.copyFromUser(&iov_buf, src, 16);
-        if (iov_copied != iov_buf.len) return -14;
-
+        if (copy.copyFromUser(&iov_buf, src, 16) != iov_buf.len) return -14;
         const iov_base: u64 = bo.readU64At(&iov_buf, 0);
         const iov_sz: u64 = bo.readU64At(&iov_buf, 8);
-
         if (iov_base == 0 or iov_base >= 0x0000_8000_0000_0000) return -14;
         if (iov_sz == 0) return -22;
-
-        var tmp: [4096]u8 = undefined;
-        const to_read: u32 = @intCast(@min(iov_sz, 4096));
-        if (!copy.validateUserBufferWritable(iov_base, to_read)) return if (total == 0) -14 else @intCast(total);
-        // Only the first segment may wait: once bytes were delivered, a
-        // further empty ring ends the call with the short count (stream
-        // semantics), never a second sleep.
-        const nonblock = total != 0 or net_mod.tcp_recv_policy.nonblockRequested(cur.fd_table.fds[fd].status_flags, 0);
-        const result = net_mod.tcp.tcpRecvBlocking(tcb_idx, &tmp, to_read, nonblock);
-        if (result > 0) {
-            const copied = copy.copyToUser(@ptrFromInt(iov_base), &tmp, @intCast(result));
-            if (copied != @as(usize, @intCast(result))) return if (total == 0) -14 else @intCast(total);
-            total += @intCast(result);
+        if (nsegs == segs.len or room >= 4096) break;
+        const take: u32 = @intCast(@min(iov_sz, @as(u64, 4096 - room)));
+        if (!copy.validateUserBufferWritable(iov_base, take)) {
+            if (nsegs == 0) return -14;
+            break;
         }
-        // An empty-ring -EAGAIN must not collapse into a 0 (EOF) return.
-        if (result < 0 and total == 0) return result;
-        if (result <= 0) break;
+        segs[nsegs] = .{ .base = iov_base, .len = take };
+        nsegs += 1;
+        room += take;
     }
-    return @intCast(total);
+    if (nsegs == 0) return -22;
+
+    var tmp: [4096]u8 = undefined;
+    var got: u32 = 0;
+    if (rf_tcp.peek(flags)) {
+        var r = net_mod.tcp.tcpPeek(tcb_idx, &tmp, room);
+        while (r == -11 and !base_nonblock) {
+            const w = net_mod.tcp.tcpWaitReadable(tcb_idx);
+            if (w != 0) return w;
+            r = net_mod.tcp.tcpPeek(tcb_idx, &tmp, room);
+        }
+        if (r <= 0) return r;
+        got = @intCast(r);
+    } else {
+        // The first read may wait; later ones only with MSG_WAITALL (and then
+        // until the iovecs are full, the stream ends, or a signal arrives).
+        while (got < room) {
+            const nonblock = if (want_all) false else (got != 0 or base_nonblock);
+            const r = net_mod.tcp.tcpRecvBlocking(tcb_idx, @as([*]u8, @ptrCast(&tmp)) + got, room - got, nonblock);
+            if (r > 0) {
+                got += @intCast(r);
+                if (!want_all) break;
+            } else {
+                // An empty-ring -EAGAIN must not collapse into a 0 (EOF) return.
+                if (r < 0 and got == 0) return r;
+                break;
+            }
+        }
+    }
+    if (got == 0) return 0;
+
+    // Scatter across the iovecs.
+    var off: u32 = 0;
+    for (segs[0..nsegs]) |sg| {
+        if (off >= got) break;
+        const n = @min(sg.len, got - off);
+        if (copy.copyToUser(@ptrFromInt(sg.base), tmp[off..][0..n], n) != n) return if (off == 0) -14 else @intCast(off);
+        off += n;
+    }
+    return @intCast(off);
 }
 
 /// socketpair(domain, type, protocol, sv_ptr) → 0 or -errno

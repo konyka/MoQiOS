@@ -8502,3 +8502,25 @@ test "fork and clone give the child the parent's SSE/x87 state" {
     try std.testing.expect(std.mem.indexOf(u8, body, "child.fpu_owned = false") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "child.fpu_initialized = true") != null);
 }
+
+test "recvmsg honours MSG_PEEK / MSG_WAITALL / MSG_TRUNC on AF_UNIX and TCP" {
+    const src = kt.socket_syscall_source;
+    // AF_UNIX path
+    try std.testing.expect(std.mem.indexOf(u8, src, "net_mod.unix_socket.unixPeek(idx, &data, room, &full)") != null);
+    // WAITALL really loops: the guard is exactly "got something and WAITALL applies",
+    // and the loop keeps reading while the step policy says "again".
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (n > 0 and rf.waitAll(flags, is_stream, nonblock)) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "while (rf.waitAllStep(room, got, 1) == .again) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "unixRecvBlockingRights(idx, @as([*]u8, @ptrCast(&data)) + got, room - got, false, &more)") != null);
+    // A peek never reaches the consuming read.
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (rf.peek(flags)) {\n        // MSG_PEEK: look without consuming; no descriptor set is delivered.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "out_flags |= rf.MSG_TRUNC") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "rf.truncReportsFullLength(flags) and cut_datagram") != null);
+    // TCP path: only the supported flags are accepted, and a peek goes through tcpPeek.
+    try std.testing.expect(std.mem.indexOf(u8, src, "rf_tcp.MSG_PEEK | net_mod.tcp_recv_policy.MSG_DONTWAIT | rf_tcp.MSG_WAITALL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "net_mod.tcp.tcpPeek(tcb_idx, &tmp, room)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "rf_tcp.waitAll(flags, true, base_nonblock)") != null);
+    // The old per-iovec consume-then-copy loop must not come back: iovecs are validated first.
+    const at = std.mem.indexOf(u8, src, "// Validate every iovec and total the room first").?;
+    try std.testing.expect(at > 0);
+}

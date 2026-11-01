@@ -5756,3 +5756,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 在 SMP=8、240 s 超时下连续跑 12 次，hello108 12/12 通过。回收窗口里最长的单次间隙依次为 459、1127、543、500、466、559、557、534、547、577、577、812 µs；窗口内 CPU0 最长的单次中断都是向量 240（LAPIC 定时器），最长 1036 µs；`nvcsw`/`nivcsw` 全程为 0，即 RT 任务没有被调度器切走，损失的时间发生在它仍是当前任务期间。阈值是 4 ms（`MAX_GAP_NS`、`MAX_STOLEN_NS`），最坏情形用掉约 28%。
 - 这与此前记录的偶发失败一致的解读是：真实失败发生在窗口里出现了 >4 ms 的单次损失，而本内核的最长单次中断只有约 1 ms，所以超过阈值的那部分时间更可能是 vCPU 被宿主机调走（宿主机负载），而不是内核在 CPU0 上做了超长工作。**这仍是推断，不是证实**：没有抓到一次失败现场，所以没有改阈值、没有改内核，也没有红灯可写。要抓现场需要在失败那一刻同时读 `/proc/irqwindow` 与 `/proc/irqtime`（hello108 已打印），下一次出现时直接看 `cpu0_win_irq_max_us` 是否接近 4 ms 即可区分“内核中断过长”与“宿主机偷时间”。
+
+### recvmsg 的 MSG_PEEK / MSG_WAITALL / MSG_TRUNC（hello167）
+
+- 问题：hello165 记录的已知差异：只接了 `recvfrom`。`recvmsg`（libc 的 `recv` 在多 iovec 路径、很多事件库都用它）上，AF_UNIX 的 `MSG_PEEK` 会消费数据，TCP 对任何标志都 `EINVAL`；TCP 的 iovec 循环还是“边校验边消费”，第二个 iovec 地址非法时前面的数据已经读走。
+- 修复：见 `docs/kernel-subsystems.md` 的 hello167 条。TCP `recvmsg` 重写为“先校验所有 iovec、再读、再散布”；AF_UNIX 复用 `unixPeek`/`unixWaitReadable` 和 `recv_flags_policy`。
+- 已知差异：TCP 单次 4096 字节、16 段上限。
+- TDD：host 新增 1 个测试（两条路径都接了对应的入口与标志集；先校验 iovec）；hello167（A AF_UNIX 流 peek 不消费、B 数据报 peek/`MSG_TRUNC`/`msg_flags`、C TCP peek、D 两种流上 `MSG_WAITALL` 填满两个 iovec、E 对端提前关闭时不挂住）在 HEAD 上 9 项 FAIL，新内核 PASS。
+- 变异（核对原始输出）：`MSG_TRUNC` 不置 `msg_flags`、`MSG_TRUNC` 不返回真实长度、TCP `recvmsg` 恢复接受任意标志、TCP `MSG_WAITALL` 关掉、TCP peek 改走消费型 `tcpRecv`、AF_UNIX `MSG_WAITALL` 关掉，都被具名 host 测试抓住。**最初 AF_UNIX `MSG_WAITALL` 关掉的变异没被抓住**（测试只检查标志名字出现过），我把检查收紧为必须出现“got 且 WAITALL 才进入循环 / 循环按 `waitAllStep` 继续 / 继续读用非阻塞=false” 这三处形状后才抓住；“AF_UNIX peek 改走消费路径”那个变异因参数不匹配编译失败，不算证据。
+- 验证：host 832/832；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（240 s 超时）与 GPT SMP=2 均 hello167 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
