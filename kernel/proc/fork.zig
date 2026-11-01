@@ -57,6 +57,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
     // CPU as the parent (warm cache), then participates in work-stealing.
     child.cpu_affinity = parent.cpu_affinity;
     child.last_cpu = parent.last_cpu;
+    @import("../arch/x86_64/context_switch.zig").inheritFpuState(parent, child);
 
     child.brk_current = parent.brk_current;
     child.brk_start = parent.brk_start;

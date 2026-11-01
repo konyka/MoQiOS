@@ -165,6 +165,30 @@ pub fn initCpu() void {
         ::: .{ .rax = true, .memory = true }); // incoherent) for the whole boot.
 }
 
+/// fork()/clone(): give `child` the parent's SSE/x87 state. The ABI says a
+/// system call preserves the vector registers, and the child resumes as if it
+/// had returned from that call, so it must see the parent's registers, not a
+/// fresh `fninit` state. `parent` is the calling task: if this CPU holds its
+/// live state it is saved into the parent's area first (the registers are the
+/// source of truth); otherwise the area already holds it. The child restores
+/// from its own area when first scheduled (onSwitchIn).
+pub fn inheritFpuState(parent: *task.Task, child: *task.Task) void {
+    if (builtin.cpu.arch != .x86_64) return;
+    const my_cpu = syscall_entry.getPerCpu().cpu_id;
+    if (parent.fpu_owned and parent.fpu_home_cpu == my_cpu + 1) {
+        asm volatile ("fxsave (%[buf])"
+            :
+            : [buf] "r" (@as([*]u8, @ptrCast(&parent.fpu_state))),
+            : .{ .memory = true });
+        parent.fpu_initialized = true;
+    }
+    if (!parent.fpu_initialized) return;
+    @memcpy(&child.fpu_state, &parent.fpu_state);
+    child.fpu_initialized = true;
+    child.fpu_owned = false;
+    child.fpu_home_cpu = 0;
+}
+
 /// Called from the scheduler immediately before it reroutes the per-CPU
 /// stack anchor from `old` to a new task. If `old` owns the FPU on this
 /// CPU we fxsave its state. EAGER restore model: the incoming task's state

@@ -8483,3 +8483,22 @@ test "peek never consumes: the peek entry points do not advance the read cursors
     try std.testing.expect(std.mem.indexOf(u8, tbody, "recv_head = ") == null);
     try std.testing.expect(std.mem.indexOf(u8, tbody, "sendSegment") == null);
 }
+
+test "fork and clone give the child the parent's SSE/x87 state" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.fork_source, "inheritFpuState(parent, child)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "inheritFpuState(parent, child)") != null);
+    // The helper saves the live registers of the calling task before copying,
+    // and hands the child a clean ownership state so it restores from its area.
+    const cs = kt.context_switch_source;
+    const at = std.mem.indexOf(u8, cs, "pub fn inheritFpuState").?;
+    // The body ends at the first closing brace in column 0.
+    const end = std.mem.indexOfPos(u8, cs, at, "\n}\n").?;
+    const body = cs[at..end];
+    // The live registers of the calling task are saved into ITS area first.
+    try std.testing.expect(std.mem.indexOf(u8, body, "fxsave (%[buf])") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "@ptrCast(&parent.fpu_state)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "parent.fpu_owned and parent.fpu_home_cpu == my_cpu + 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "@memcpy(&child.fpu_state, &parent.fpu_state)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "child.fpu_owned = false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "child.fpu_initialized = true") != null);
+}

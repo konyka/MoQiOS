@@ -324,6 +324,7 @@ pub fn clone(
         parent.fSize_max,
     ) orelse return -12;
     const child = task_mod.getTask(child_idx).?;
+    @import("context_switch.zig").inheritFpuState(parent, child);
     child.clear_tid_ptr = if (flags & clone_flags_policy.CLONE_CHILD_CLEARTID != 0) child_tid_ptr else 0;
     child.nofile_cur = parent.nofile_cur;
     child.nofile_max = parent.nofile_max;
