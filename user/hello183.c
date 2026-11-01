@@ -61,6 +61,7 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define AF_INET 2
 #define AF_INET6 10
 #define SOCK_STREAM 1
+#define SOCK_DGRAM 2
 #define SOL_SOCKET 1
 #define SO_REUSEADDR 2
 #define EACCES_ 13
@@ -157,6 +158,17 @@ void _start(void) {
         int64_t s = sock4();
         check(bind4(s, 80) == -EACCES_, "D: an unprivileged bind to port 80 is EACCES");
         check(bind4(s, 18386) == 0, "D: and the socket is still usable for an ordinary port");
+        {
+            uint8_t ua[16], ua6[28];
+            mk_addr(ua, 53);
+            mk_addr6(ua6, 53);
+            int64_t u4 = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+            check(syscall3(SYS_BIND, (uint64_t)u4, (uint64_t)ua, 16) == -EACCES_, "D: an unprivileged UDP bind to port 53 is EACCES");
+            mk_addr(ua, 24383);
+            check(syscall3(SYS_BIND, (uint64_t)u4, (uint64_t)ua, 16) == 0, "D: and an ordinary UDP port is fine");
+            int64_t u6 = syscall3(SYS_SOCKET, AF_INET6, SOCK_DGRAM, 0);
+            check(syscall3(SYS_BIND, (uint64_t)u6, (uint64_t)ua6, 28) == -EACCES_, "D: an unprivileged IPv6 UDP bind to port 53 is EACCES");
+        }
         syscall1(SYS_EXIT, failures == 0 ? 0 : 1);
         for (;;) {}
     }

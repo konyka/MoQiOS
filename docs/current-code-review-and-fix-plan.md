@@ -5925,9 +5925,10 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 问题：TCP `bind` 所有失败都返回 `-1`（EPERM）：端口被占用应是 `EADDRINUSE`，特权端口无权限应是 `EACCES`，重复绑定应是 `EINVAL`。程序依赖这些错误码来决定“换个端口重试”还是“放弃”。
 - 修复：见 `docs/kernel-subsystems.md` 的 hello183 条。
-- 已知差异：UDP 的特权端口没有权限时仍返回 `-1`（本轮只改了 TCP；UDP 的 `EADDRINUSE` 早就有）；`SO_REUSEPORT` 不参与 TCP 端口共享判断；`bind` 到非本机地址不检查（`EADDRNOTAVAIL` 未实现）；`EADDRINUSE` 只看端口号，不看本地地址（不同本地地址、同一端口也算冲突）。
+- 已知差异：UDP 的特权端口无权限在后续小改动里也改为 `EACCES`（见本节末尾的补充）；`SO_REUSEPORT` 不参与 TCP 端口共享判断；`bind` 到非本机地址不检查（`EADDRNOTAVAIL` 未实现）；`EADDRINUSE` 只看端口号，不看本地地址（不同本地地址、同一端口也算冲突）。
 - 过程说明（如实）：红灯 8 项 FAIL，其中 C 段“a connection to the listener”在旧内核上失败、新内核上通过，但它测的是 connect/accept 而不是 bind 的错误码，**我没有查它在旧内核上失败的原因**（可能与 A/B 段里旧内核返回 `-1` 后探测的后续状态有关，只是猜测），所以这一项不应当被算作 bind 错误码修复的证据。D 段给 hello183 配了“uid 0 + 仅 `CAP_SETUID`”的启动档案以便子进程 `setuid(1000)` 后观察 `EACCES`。
 - TDD：host 新增 1 个测试（三个错误码、特权端口边界 0/1/1023/1024、`reuseMayShare` 的四种组合、`tcpBind` 的判定形状、两条路径的 `EACCES`、hello183 的能力档案）；hello183（A 占用/重复绑定/换端口，B 监听端口即使双方 `SO_REUSEADDR` 也不可共享，C 监听者关闭后在旧连接残留时仍可重新绑定，D 非特权用户绑 80 得 `EACCES`，E IPv6 同样）在旧内核上 8 项 FAIL，新内核 PASS。
 - 变异（具名测试核对）：端口 0 也算特权、特权端口上限差一、`SO_REUSEADDR` 可与非 TIME_WAIT 占用者共享、`EACCES` 改回 `-1`、重复绑定被允许、`EADDRINUSE` 改回 `-1`、与自己槽位里的旧端口冲突、端口 0 参与冲突判断、IPv6 与 IPv4 各自去掉特权检查，共 10 个，全部被 `TCP bind errors and SO_REUSEADDR sharing` 抓住（“可与非 TIME_WAIT 占用者共享”第一次因未使用参数编译失败，改成可编译形式后抓住）；恢复后 `grep -c MUTATION` 为 0。
 - 验证：host 855/855；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello183 PASS、0 个 FAIL；stress（SMP=2）5/5 PASS。
+- 补充（UDP 特权端口）：同一节的后续小改动把 UDP（IPv4 与 IPv6）绑定特权端口无权限时的 `-1` 也改成 `EACCES`，复用 `bindNeedsPrivilege`。hello183 D 段增加 3 项（UDP 端口 53 的 IPv4/IPv6 `EACCES`，普通 UDP 端口仍可绑），旧代码上 3 项中 2 项失败（普通端口那项本来就通过）；host 断言钉住两处 UDP 调用的确切形状，并断言整个 `socket_syscall.zig` 里不再有 `...cap_net_bind")) return -1;`。变异 3 个（IPv6 回退 `-1`、IPv4 回退 `-1`、IPv4 检查被禁用）全部被抓住。验证：host 855/855；三架构构建通过；冒烟 SMP=1、SMP=8（2 次）、GPT SMP=2 通过，hello183 PASS、0 个 FAIL；stress 5/5。
 

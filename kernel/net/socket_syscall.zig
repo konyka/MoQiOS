@@ -229,7 +229,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
             const n = copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN);
             if (n < sa.SOCKADDR_IN6_LEN) return -22; // EINVAL
             const parsed = sa.parseInet6(&sa6) orelse return -97; // EAFNOSUPPORT
-            if (parsed.port != 0 and parsed.port < 1024 and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return -1;
+            if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
             const cur_port = t.fd_table.fds[fd].udp_port;
             if (parsed.port != cur_port) {
                 // EADDRINUSE when another socket owns the port (0xFFFE) or the
@@ -246,7 +246,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         if (n4 < SOCKADDR_IN_MIN_LEN) return -22;
         // Accept legacy callers that only filled port+addr; family may be unset.
         const new_port = bo.readU16BeAt(&sock_addr, 2);
-        if (new_port != 0 and new_port < 1024 and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return -1;
+        if (net_mod.tcp_port_policy.bindNeedsPrivilege(new_port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
         const cur_port = t.fd_table.fds[fd].udp_port;
         if (new_port != cur_port) {
             // EADDRINUSE when another socket owns the port (0xFFFE) or the

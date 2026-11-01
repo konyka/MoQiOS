@@ -9397,6 +9397,10 @@ test "TCP bind errors and SO_REUSEADDR sharing" {
     const ss = kt.socket_syscall_source;
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n        return net_mod.tcp.tcpBind(tcb_idx, parsed.port);"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n    return net_mod.tcp.tcpBind(tcb_idx, port);"));
+    // UDP (IPv4 and IPv6) refuses a privileged port the same way; no bare -1 is left in any bind path.
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n            const cur_port = t.fd_table.fds[fd].udp_port;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(new_port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;") != null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ss, "!cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return -1;"));
     // hello183 runs as uid 0 with only CAP_SETUID so the child's setuid leaves it unprivileged.
     const h = kt.capability_profile.profileForLaunch("hello183", true, false);
     try std.testing.expect(h.caps.cap_setuid and !h.caps.cap_net_bind and !h.caps.cap_net_admin);
