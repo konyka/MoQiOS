@@ -303,6 +303,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello174"); /* SO_SNDBUF / SO_RCVBUF on TCP */
     run_test("hello175"); /* netdevice ioctls */
     run_test("hello176"); /* sleeping is not CPU time */
+    run_test("hello177"); /* TCP_INFO / TCP_MAXSEG / TCP_CONGESTION */
 
     start_persistent_services();
 

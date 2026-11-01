@@ -41,6 +41,8 @@ pub const SocketOptions = struct {
     snd_timeout_ms: u32 = 0,
     rcv_buf_size: u32 = 16384,
     snd_buf_size: u32 = 16384,
+    /// TCP_MAXSEG set by the user (0 = none): caps the segment size.
+    user_mss: u32 = 0,
     /// SO_RCVBUF / SO_SNDBUF were set: the sizes above then bound the TCP buffering.
     rcv_buf_set: bool = false,
     snd_buf_set: bool = false,
@@ -87,7 +89,9 @@ fn resolveTcpIdx(fd: u64) ?u32 {
 // sockets and in the TCB (SocketOptions) for TCP; the policy module defines
 // the semantics for all of them. IPPROTO_TCP options exist only on TCP.
 
+const std = @import("std");
 const sp = @import("sockopt_policy.zig");
+const tip = @import("tcp_info_policy.zig");
 
 const SockRef = union(enum) {
     tcp: u32,
@@ -278,6 +282,31 @@ fn setTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen
                 // Clamp like Linux (MAX_TCP_KEEPCNT = 32767).
                 opts.keep_cnt = @min(bo.readU32Le(&buf), 32767);
             },
+            tip.TCP_MAXSEG => {
+                if (optlen < 4) return -22;
+                var buf: [4]u8 = undefined;
+                if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
+                const v = bo.readU32Le(&buf);
+                if (!tip.maxsegValid(v)) return -22;
+                // Linux: only before the connection is established.
+                if (!tcp_mod.tcpMaxsegSettable(tcb_idx)) return -22;
+                opts.user_mss = v;
+            },
+            tip.TCP_USER_TIMEOUT, tip.TCP_DEFER_ACCEPT, tip.TCP_SYNCNT, tip.TCP_LINGER2, tip.TCP_NOTSENT_LOWAT => {
+                // Accepted and ignored: the behaviour they tune does not exist here.
+                if (optlen < 4) return -22;
+                var buf: [4]u8 = undefined;
+                if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
+                if (@as(i32, @bitCast(bo.readU32Le(&buf))) < 0 and optname != tip.TCP_LINGER2) return -22;
+            },
+            tip.TCP_CONGESTION => {
+                // Only the algorithm this stack runs can be selected.
+                var name: [16]u8 = @splat(0);
+                const n: usize = @intCast(@min(optlen, name.len));
+                if (copy_mod.copyFromUser(name[0..n], @ptrFromInt(optval_ptr), n) != n) return -14;
+                const len = std.mem.indexOfScalar(u8, name[0..n], 0) orelse n;
+                if (!std.mem.eql(u8, name[0..len], tip.CONGESTION_NAME)) return -2; // ENOENT
+            },
             else => return -92, // ENOPROTOOPT
         }
     } else {
@@ -385,6 +414,29 @@ fn getTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen
             TCP_KEEPCNT => {
                 val_len = 4;
                 bo.writeU32Le(val_buf[0..4], opts.keep_cnt);
+            },
+            tip.TCP_MAXSEG => {
+                val_len = 4;
+                bo.writeU32Le(val_buf[0..4], tcp_mod.tcpEffectiveMss(tcb_idx));
+            },
+            tip.TCP_USER_TIMEOUT, tip.TCP_DEFER_ACCEPT, tip.TCP_SYNCNT, tip.TCP_LINGER2, tip.TCP_NOTSENT_LOWAT => {
+                val_len = 4;
+                bo.writeU32Le(val_buf[0..4], 0);
+            },
+            tip.TCP_CONGESTION => {
+                val_len = tip.CONGESTION_NAME.len + 1;
+                @memset(val_buf[0..16], 0);
+                @memcpy(val_buf[0..tip.CONGESTION_NAME.len], tip.CONGESTION_NAME);
+            },
+            tip.TCP_INFO => {
+                var info: [tip.TCP_INFO_LEN]u8 = undefined;
+                tip.encode(tcp_mod.tcpInfoSnapshot(tcb_idx) orelse return -88, &info);
+                const n: u32 = @intCast(@min(@as(usize, user_optlen), info.len));
+                if (n > 0 and copy_mod.copyToUser(@ptrFromInt(optval_ptr), info[0..n], n) != n) return -14;
+                var len_out_info: [4]u8 = undefined;
+                bo.writeU32Le(&len_out_info, n);
+                if (copy_mod.copyToUser(@ptrFromInt(optlen_ptr), &len_out_info, 4) != 4) return -14;
+                return 0;
             },
             else => return -92, // ENOPROTOOPT
         }

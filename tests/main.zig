@@ -8937,3 +8937,81 @@ test "ifreq policy: interface lookup and request encodings" {
     try std.testing.expectEqual(@as(usize, 3), f.confFit(5, 3 * f.IFREQ_SIZE + 39));
     try std.testing.expect(f.isRequest(f.SIOCGIFCONF) and !f.isRequest(0x541B));
 }
+
+test "tcp_info policy: option numbers, MAXSEG rules, state mapping and the TCP_INFO layout" {
+    const t = kt.tcp_info_policy;
+    // Linux's numbers.
+    try std.testing.expectEqual(@as(u64, 2), t.TCP_MAXSEG);
+    try std.testing.expectEqual(@as(u64, 7), t.TCP_SYNCNT);
+    try std.testing.expectEqual(@as(u64, 8), t.TCP_LINGER2);
+    try std.testing.expectEqual(@as(u64, 9), t.TCP_DEFER_ACCEPT);
+    try std.testing.expectEqual(@as(u64, 11), t.TCP_INFO);
+    try std.testing.expectEqual(@as(u64, 13), t.TCP_CONGESTION);
+    try std.testing.expectEqual(@as(u64, 18), t.TCP_USER_TIMEOUT);
+    try std.testing.expectEqual(@as(u64, 25), t.TCP_NOTSENT_LOWAT);
+    // TCP_MAXSEG range: 88..1460 inclusive.
+    try std.testing.expect(!t.maxsegValid(87) and t.maxsegValid(88) and t.maxsegValid(1460) and !t.maxsegValid(1461) and !t.maxsegValid(0));
+    // The user ceiling only ever lowers the path MSS; 0 means none.
+    try std.testing.expectEqual(@as(u32, 1460), t.effectiveMss(1460, 0));
+    try std.testing.expectEqual(@as(u32, 536), t.effectiveMss(1460, 536));
+    try std.testing.expectEqual(@as(u32, 1000), t.effectiveMss(1000, 1400));
+    // Our states map to Linux's numbering.
+    const S = kt.tcp_recv_policy.TcpState;
+    try std.testing.expectEqual(t.LinuxState.established, t.linuxState(S.established));
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(t.linuxState(S.established)));
+    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(t.linuxState(S.syn_sent)));
+    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(t.linuxState(S.syn_received)));
+    try std.testing.expectEqual(@as(u8, 4), @intFromEnum(t.linuxState(S.fin_wait_1)));
+    try std.testing.expectEqual(@as(u8, 5), @intFromEnum(t.linuxState(S.fin_wait_2)));
+    try std.testing.expectEqual(@as(u8, 6), @intFromEnum(t.linuxState(S.time_wait)));
+    try std.testing.expectEqual(@as(u8, 7), @intFromEnum(t.linuxState(S.closed)));
+    try std.testing.expectEqual(@as(u8, 8), @intFromEnum(t.linuxState(S.close_wait)));
+    try std.testing.expectEqual(@as(u8, 9), @intFromEnum(t.linuxState(S.last_ack)));
+    try std.testing.expectEqual(@as(u8, 10), @intFromEnum(t.linuxState(S.listen)));
+    try std.testing.expectEqual(@as(u8, 11), @intFromEnum(t.linuxState(S.closing)));
+    // struct tcp_info layout: byte fields, then 32-bit fields at Linux's offsets, everything else zero.
+    var out: [t.TCP_INFO_LEN]u8 = undefined;
+    t.encode(.{ .state = .established, .retransmits = 3, .ts = true, .sack = true, .wscale = true, .ecn = true, .snd_wscale = 7, .rcv_wscale = 2, .rto_us = 200_000, .snd_mss = 1448, .rcv_mss = 1400, .unacked = 4096, .pmtu = 1500, .rtt_us = 1000, .rttvar_us = 500, .snd_ssthresh = 65535, .snd_cwnd_segs = 10, .rcv_space = 32768 }, &out);
+    try std.testing.expectEqual(@as(u8, 1), out[0]);
+    try std.testing.expectEqual(@as(u8, 3), out[2]);
+    try std.testing.expectEqual(@as(u8, 0xF), out[5]); // TS | SACK | WSCALE | ECN
+    try std.testing.expectEqual(@as(u8, 0x27), out[6]); // rcv_wscale in the high nibble, snd_wscale in the low
+    try std.testing.expectEqual(@as(u32, 200_000), std.mem.readInt(u32, out[8..12], .little));
+    try std.testing.expectEqual(@as(u32, 1448), std.mem.readInt(u32, out[16..20], .little));
+    try std.testing.expectEqual(@as(u32, 1400), std.mem.readInt(u32, out[20..24], .little));
+    try std.testing.expectEqual(@as(u32, 4096), std.mem.readInt(u32, out[24..28], .little));
+    try std.testing.expectEqual(@as(u32, 1500), std.mem.readInt(u32, out[60..64], .little));
+    try std.testing.expectEqual(@as(u32, 1000), std.mem.readInt(u32, out[68..72], .little));
+    try std.testing.expectEqual(@as(u32, 500), std.mem.readInt(u32, out[72..76], .little));
+    try std.testing.expectEqual(@as(u32, 65535), std.mem.readInt(u32, out[76..80], .little));
+    try std.testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, out[80..84], .little));
+    try std.testing.expectEqual(@as(u32, 32768), std.mem.readInt(u32, out[96..100], .little));
+    try std.testing.expectEqual(@as(u8, 0), out[1]);
+    try std.testing.expectEqual(@as(u8, 0), out[103]);
+    // Unit helpers: ms to us saturates, cwnd in whole segments, zero MSS never divides by zero.
+    try std.testing.expectEqual(@as(u32, 5000), t.msToUs(5));
+    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), t.msToUs(0xFFFF_FFFF));
+    try std.testing.expectEqual(@as(u32, 10), t.cwndSegments(14600, 1460));
+    try std.testing.expectEqual(@as(u32, 3), t.cwndSegments(4500, 1460));
+    try std.testing.expectEqual(@as(u32, 7), t.cwndSegments(7, 0));
+}
+
+test "TCP socket options: MAXSEG / INFO / CONGESTION wiring" {
+    const so = kt.socket_opt_source;
+    // MAXSEG: validated, only before the connection is up, stored as a ceiling.
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (!tip.maxsegValid(v)) return -22;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (!tcp_mod.tcpMaxsegSettable(tcb_idx)) return -22;\n                opts.user_mss = v;") != null);
+    // CONGESTION: only the algorithm that runs; anything else is ENOENT.
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (!std.mem.eql(u8, name[0..len], tip.CONGESTION_NAME)) return -2; // ENOENT") != null);
+    // The inert options reject a negative value (except LINGER2, where negative means "no FIN_WAIT_2").
+    try std.testing.expect(std.mem.indexOf(u8, so, "< 0 and optname != tip.TCP_LINGER2) return -22;") != null);
+    // TCP_INFO truncates to the caller's length and reports the length written.
+    try std.testing.expect(std.mem.indexOf(u8, so, "const n: u32 = @intCast(@min(@as(usize, user_optlen), info.len));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "tcp_mod.tcpInfoSnapshot(tcb_idx) orelse return -88") != null);
+
+    const ts = kt.tcp_source;
+    // The sender's MSS honours the user ceiling.
+    try std.testing.expect(std.mem.indexOf(u8, ts, "return @intCast(tcp_info_policy.effectiveMss(path, tcb.options.user_mss));") != null);
+    // MAXSEG is settable only while the connection has not been established.
+    try std.testing.expect(std.mem.indexOf(u8, ts, ".closed, .listen, .syn_sent => true,\n        else => false,") != null);
+}

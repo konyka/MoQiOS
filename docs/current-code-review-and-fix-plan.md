@@ -5860,3 +5860,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 过程说明：D 场景我第一版把自旋线程绑到 CPU1，结果与 hello170 的现场（不绑核）不一致，已改成不绑核，使它与出问题的场景一致。
 - TDD：不适用（探测在旧内核上本来就通过）；hello176 是回归保护。
 
+### TCP_INFO / TCP_MAXSEG / TCP_CONGESTION 等 TCP 选项（hello177）
+
+- 问题：这些 `SOL_TCP` 选项全部 `ENOPROTOOPT`；监控与库代码常在启动或出错路径上读 `TCP_INFO`、设 `TCP_NODELAY` 之外的选项，拿到 `ENOPROTOOPT` 时有的会直接当作错误。
+- 修复：见 `docs/kernel-subsystems.md` 的 hello177 条。
+- 已知差异：`TCP_INFO` 只填到 `tcpi_rcv_space` 之前的常用字段（104 字节），Linux 较新版本的更长结构（`tcpi_delivery_rate`、`tcpi_bytes_acked` 等）没有；`tcpi_ca_state`、`tcpi_probes`、`tcpi_backoff`、`tcpi_reordering`、`tcpi_last_*` 时间戳恒为 0；`TCP_CONGESTION` 只有 `cubic`（本栈实际同时有 BBR 式的发送节拍，但对外只报一个名字）；`TCP_USER_TIMEOUT` 等是“接受但不生效”；`TCP_MAXSEG` 在 `listen` 套接字上设置后，接受出来的连接不继承该上限。
+- 过程说明（如实）：①探测第一次全部 FAIL，原因是 hello177 与 hello174 的 C 段用了同一个端口 18177，前一个测试的连接可能还在 `TIME_WAIT`，这是探测的端口冲突，与功能无关；改用独立端口 18877 后通过。**这提醒了一个潜在风险：不同探测之间端口复用可能造成偶发的 `bind`/`connect` 失败，这很可能就是未解决的 hello152 `loopback connection` 偶发失败的类型**（它用 18152，我没有在其它探测里找到同号，所以只是一个旁证，不是结论）。②`snd_wscale`/`rcv_wscale` 是 C 位域 `snd_wscale : 4, rcv_wscale : 4`，先声明的在低半字节，第一版我写反了，host 测试的 `0x27` 断言按正确布局固定下来。
+- TDD：host 新增 2 个测试（选项号、MAXSEG 范围、有效 MSS、11 个状态映射、`tcp_info` 的字节布局与零填充、单位换算；`socket_opt`/`tcp` 里的接线形状）；hello177（A 建连，B `TCP_INFO` 的长度/状态/选项位/MSS/cwnd/pmtu/短缓冲截断，C `TCP_MAXSEG` 读写规则，D `TCP_CONGESTION`，E 接受但惰性的选项与仍存在的 `ENOPROTOOPT`，F 之后连接仍能传数据）在旧内核上 16 项 FAIL，新内核 PASS。
+- 变异（具名测试核对）：窗口缩放半字节互换、`TCP_MAXSEG` 无上限、用户上限能抬高 MSS、`established` 映射错、`snd_cwnd` 写错偏移、cwnd 不折成段数、毫秒不转微秒、已连接时仍可设 `TCP_MAXSEG`、任何拥塞算法名都接受、`TCP_INFO` 无视用户长度、MSS 忽略用户上限、`established` 状态也允许设 `TCP_MAXSEG`，共 12 个，全部被 `tcp_info policy…` 或 `TCP socket options…` 抓住（“cwnd 不折成段数”第一次因未使用参数编译失败，改成可编译形式后抓住）；恢复后 `grep -c MUTATION` 为 0。
+- 验证：host 847/847；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello177 PASS、0 个 FAIL；stress（SMP=2）5/5 PASS。
+

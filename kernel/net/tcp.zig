@@ -27,6 +27,7 @@ const icmpv6 = @import("icmpv6.zig");
 const socket_opt = @import("socket_opt.zig");
 const bo = @import("../lib/byte_order.zig");
 const tcp_util = @import("tcp_util.zig");
+const tcp_info_policy = @import("tcp_info_policy.zig");
 const tcp_recv_policy = @import("tcp_recv_policy.zig");
 const tcp_port_policy = @import("tcp_port_policy.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
@@ -1087,11 +1088,11 @@ fn localMssForTcb(tcb: *const TcpTcb) u16 {
     return @min(TCP_MSS, pmtu - TCP_IPV6_OVERHEAD);
 }
 
-/// Sender MSS for this TCB (SK-98/100): min(local SMSS, peer MSS).
+/// Sender MSS for this TCB (SK-98/100): min(local SMSS, peer MSS, TCP_MAXSEG).
 fn mssForTcb(tcb: *const TcpTcb) u16 {
     const local = localMssForTcb(tcb);
-    if (tcb.peer_mss != 0 and tcb.peer_mss < local) return tcb.peer_mss;
-    return local;
+    const path: u16 = if (tcb.peer_mss != 0 and tcb.peer_mss < local) tcb.peer_mss else local;
+    return @intCast(tcp_info_policy.effectiveMss(path, tcb.options.user_mss));
 }
 
 /// Probe helper (SK-98): IPv6 SMSS for `dst` from the Path MTU cache.
@@ -4180,6 +4181,54 @@ fn sendLimit(tcb: *const TcpTcb) u32 {
 /// Receive window ceiling: SO_RCVBUF (when set) lowers it below TCP_WINDOW.
 fn rcvWindowCap(tcb: *const TcpTcb) u32 {
     return @min(TCP_WINDOW, tcp_util.bufferLimit(tcb.options.rcv_buf_set, tcb.options.rcv_buf_size, RECV_BUF_SIZE));
+}
+
+/// TCP_MAXSEG may be set only before the connection is established.
+pub fn tcpMaxsegSettable(tcb_idx: u32) bool {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return false;
+    return switch (tcbs[tcb_idx].state) {
+        .closed, .listen, .syn_sent => true,
+        else => false,
+    };
+}
+
+/// The MSS getsockopt(TCP_MAXSEG) reports.
+pub fn tcpEffectiveMss(tcb_idx: u32) u32 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return 0;
+    return mssForTcb(&tcbs[tcb_idx]);
+}
+
+/// Snapshot of the connection for TCP_INFO.
+pub fn tcpInfoSnapshot(tcb_idx: u32) ?tcp_info_policy.Snapshot {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return null;
+    const t = &tcbs[tcb_idx];
+    const mss: u32 = mssForTcb(t);
+    return .{
+        .state = tcp_info_policy.linuxState(t.state),
+        .retransmits = t.retransmit_count,
+        .ts = t.ts_enabled,
+        .sack = t.sack_permitted,
+        .wscale = t.ws_enabled,
+        .ecn = t.ecn_ok,
+        .snd_wscale = t.snd_wnd_scale,
+        .rcv_wscale = t.rcv_wnd_scale,
+        .rto_us = tcp_info_policy.msToUs(t.rto),
+        .snd_mss = mss,
+        .rcv_mss = mss,
+        .unacked = t.snd_nxt -% t.snd_una,
+        .pmtu = if (t.is_v6) ipv6.getPathMtu(t.remote_ip6) else ipv4.getPathMtu(t.remote_ip),
+        .rtt_us = tcp_info_policy.msToUs(t.srtt),
+        .rttvar_us = tcp_info_policy.msToUs(t.rttvar),
+        .snd_ssthresh = t.ssthresh,
+        .snd_cwnd_segs = tcp_info_policy.cwndSegments(t.cwnd, mss),
+        .rcv_space = t.rcv_wnd,
+    };
 }
 
 /// Bytes in the send ring: data written but not yet acknowledged by the peer
