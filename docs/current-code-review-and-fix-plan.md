@@ -5846,3 +5846,9 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - **门禁里出现的两次偶发失败（原因未证实）**：在这个改动的 SMP=8 运行里，16 次中出现 2 次失败：一次 `hello152: FAIL C: loopback connection`（TCP 回环连接建立失败，`make_pair` 的返回码当时没打印），一次 `hello174: FAIL C: and the sender is stopped earlier than with the default window`（一个依赖时序的数量比较）。**我没有查清原因**：hello152 的失败发生在这次启动里 hello175 运行之前，而本次内核改动只是 `ioctl.zig` 里新增的、这些探测不会走到的代码，所以不太可能是逻辑上的因果；不加这个改动的基线（上一个提交）连续 6 次 SMP=8 全部干净，加了失败时的诊断输出后又连续 8 次干净。样本量不足以区分“这个改动改变了时序”与“本来就有的低概率问题”（若真实失败率约 12%，基线连续 6 次干净的概率仍有约 45%）。处理：给 hello152 增加 `make_pair` 失败码输出、给 hello174 增加两个总量的失败时输出，以便下次出现时能直接看到原因；**这是已知未解决的偶发问题**，不是已修复。
 - 验证：host 845/845；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、GPT SMP=2 通过，SMP=8 共 16 次（含上面 2 次偶发失败）其余全部 0 个 FAIL、hello175 全部 PASS；stress（SMP=2）5/5 PASS。riscv64/aarch64 构建与 stress 是在后来只改了用户态探测（hello152/hello174 的失败输出）和 host 测试之前跑的，内核代码相同。
 
+### hello174 C 段偶发失败的定位（探测的比较方式有误；hello152 的那次仍未解决）
+
+- 现象：hello175 提交后的 SMP=8 复跑里，hello174 `C: and the sender is stopped earlier than with the default window` 再次出现（12 次中 1 次），这次探测已打印两个总量：`rcvbuf 限定的发送总量 = 66983`，`默认窗口 = 65535`——限定接收缓冲的那次反而比默认更大。
+- 原因（探测假设错误，不是内核缺陷）：`total` 是“发送方在 `fill()` 的空闲窗口内被发送环接受了多少字节”，它由发送环容量（64 KiB）加上期间延迟 ACK 腾出的发送环空间共同决定，而不由接收窗口单独决定；两次相差几 KiB 属于时序噪声。真正被 `SO_RCVBUF` 限定的量是**接收方缓冲了多少**（`FIONREAD`）。所以把这条断言改成直接测接收方：限定后的接收方在最多约 5 秒内缓冲到 ≥14000 字节、再等 500 ms 后仍不超过 16384+1460，而同一时刻没设该选项的接收方缓冲 >20000 字节（`big_avail`）。改后在 SMP=8 上连续 12 次 0 个 FAIL。
+- 仍未解决：`hello152: FAIL C: loopback connection`（TCP 回环连接建立偶发失败）在随后的 20 次 SMP=8 运行（8 次加 12 次）里没有再出现，`make_pair` 的失败码输出已就位但没有触发，所以**原因仍未知**。
+

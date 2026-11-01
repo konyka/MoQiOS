@@ -179,10 +179,12 @@ void _start(void) {
 
     /* B: SO_SNDBUF bounds how much a non-reading peer lets the sender queue */
     long big_total, small_total;
+    int big_avail;
     {
         int c, s;
         make_pair(18175, &c, &s);
         big_total = fill(c);
+        big_avail = ioctl_int(s, FIONREAD);
         syscall1(SYS_CLOSE, c);
         syscall1(SYS_CLOSE, s);
     }
@@ -208,14 +210,15 @@ void _start(void) {
         syscall3(SYS_WRITE, (uint64_t)c, (uint64_t)buf, 1);
         pump(300); /* the receiver's ACK carries the smaller window before the bulk write */
         long total = fill(c);
+        /* The receiver fills up to its allowance and no further: wait (up to ~5 s) for it to get there, then
+         * give a buggy over-advertising window time to overshoot before checking the cap. */
         int avail = ioctl_int(s, FIONREAD);
-        check(avail > 0 && avail <= 16384 + 1460, "C: with SO_RCVBUF 16384 the receiver buffers at most ~16 KiB");
-        if (!(total < big_total - 8192)) {
-            long vals[2] = { total, big_total }; char d[64]; int k = 0; print("hello174: C totals (rcvbuf-limited, default):");
-            for (int q = 0; q < 2; q++) { long x = vals[q]; char r[24]; int m = 0; if (x == 0) r[m++]='0'; while (x > 0) { r[m++] = '0' + x % 10; x /= 10; } d[k++]=' '; while (m > 0) d[k++] = r[--m]; }
-            d[k++]='\n'; d[k]=0; print(d);
-        }
-        check(total < big_total - 8192, "C: and the sender is stopped earlier than with the default window");
+        for (int i = 0; i < 100 && avail < 14000; i++) { pump(50); avail = ioctl_int(s, FIONREAD); }
+        check(avail >= 14000, "C: the receiver buffers up to roughly its SO_RCVBUF allowance (>= 14000 bytes)");
+        pump(500);
+        avail = ioctl_int(s, FIONREAD);
+        check(avail > 0 && avail <= 16384 + 1460, "C: and never more than ~16 KiB (SO_RCVBUF 16384)");
+        check(big_avail > 20000, "C: while a receiver that never set SO_RCVBUF buffers more than that (> 20000)");
         char drain[4096];
         long got = 0;
         syscall3(SYS_FCNTL, (uint64_t)s, F_SETFL, O_NONBLOCK);
