@@ -92,7 +92,7 @@ static uint8_t in[20000];
 
 static void mk_addr(uint8_t *a, int port) {
     for (int i = 0; i < 16; i++) a[i] = 0;
-    a[1] = 2; a[2] = (uint8_t)(port >> 8); a[3] = (uint8_t)port; a[4] = 127; a[7] = 1;
+    a[0] = 2; a[2] = (uint8_t)(port >> 8); a[3] = (uint8_t)port; a[4] = 127; a[7] = 1;
 }
 static int make_pair(int port, int *cli, int *srv) {
     uint8_t sa[16];

@@ -5932,3 +5932,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 验证：host 855/855；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello183 PASS、0 个 FAIL；stress（SMP=2）5/5 PASS。
 - 补充（UDP 特权端口）：同一节的后续小改动把 UDP（IPv4 与 IPv6）绑定特权端口无权限时的 `-1` 也改成 `EACCES`，复用 `bindNeedsPrivilege`。hello183 D 段增加 3 项（UDP 端口 53 的 IPv4/IPv6 `EACCES`，普通 UDP 端口仍可绑），旧代码上 3 项中 2 项失败（普通端口那项本来就通过）；host 断言钉住两处 UDP 调用的确切形状，并断言整个 `socket_syscall.zig` 里不再有 `...cap_net_bind")) return -1;`。变异 3 个（IPv6 回退 `-1`、IPv4 回退 `-1`、IPv4 检查被禁用）全部被抓住。验证：host 855/855；三架构构建通过；冒烟 SMP=1、SMP=8（2 次）、GPT SMP=2 通过，hello183 PASS、0 个 FAIL；stress 5/5。
 
+### TCP 套接字状态错误码与 sockaddr_in 字节序（hello184）
+
+- 问题：①`accept`/`listen`/`shutdown`/`getpeername`/`send`/`bind` 在不对的套接字状态下返回的错误码与 Linux 不同（8 处）；②（这一轮最重要的发现）`sockaddr_in.sin_family` 被当成大端读取：Linux 程序存的字节是 `02 00`，内核却只接受 `00 02`，所以真实的 Linux 程序调用 TCP `connect` 会失败。
+- 方法（如实）：这一轮没有凭记忆写预期值，而是先在宿主机上用 `gcc` 写了对照程序跑真实 Linux，取它的返回值当标准，再写 hello184；这避免了我自己记错 errno（例如我原先以为 `shutdown` 在监听者上也要 `ENOTCONN`，对照后发现 Linux 返回 0）。
+- 修复：见 `docs/kernel-subsystems.md` 的 hello184 条。
+- 排查过程（如实）：①第一次跑 hello184 的 8 项失败里，B 段“bind 非 AF_INET 地址”那一项一开始让我以为是 bind 漏检；加了 B2 段（用真实布局 `02 00` 的地址 bind/listen/connect）后，B2 的 `connect` 失败了，这才暴露字节序问题：`connect` 的地址族检查在读 `00 02` 之外一律拒绝。②改了读取字节序以后，**hello22/hello26/hello27/hello85 立刻失败**（它们的地址写成 `00 02`，一直在靠错误的字节序通过），说明这些旧测试是在固化 bug；我把它们的地址改成 `02 00`，连同 23 个把地址写成 `a[1] = 2` 的探测程序一起改。③`sendErrno` 里 `established_ever` 参数不再影响结果（现在两种情况都是 `EPIPE`），保留参数只是为了不改调用方，函数里用 `_ = established_ever;` 丢弃。
+- 已知差异：UDP `sendto` 的地址、`sendmsg` 的 `msg_name` 对 IPv4 地址族不做检查（`SOCKADDR_IN_MIN_LEN` 以上直接取端口和地址）；`connect` 到不可达地址的 errno 取决于网络栈；`getsockname` 对新套接字返回内核自己的地址表示（Linux 返回 `0.0.0.0:0`，这里返回本机 IP 和端口 0），没有改。
+- TDD：host 新增 1 个测试（五个状态规则对全部 11 个状态的穷举、地址族字节序、三处小端读取与零处大端读取、各入口的接线）并更新了 `sendErrno` 的旧测试（旧断言“从未连接是 `ENOTCONN`”与 Linux 不符）；hello184（A 未连接的套接字、B 地址族与短地址、B2 真实布局的地址、C 监听者、D 已建立连接、E `SHUT_WR` 之后）在旧内核上 8 项 FAIL（B2 的 connect 也失败），新内核 PASS。
+- 变异（具名测试核对）：`accept`/`listen`/`shutdown` 在任何状态都成功、监听者有对端、`shutdown` 不看状态、未连接的 `send` 又变回 `ENOTCONN`、四个入口里各自的检查被删（`accept`、`listen`、`shutdown`、`getpeername`）、`bind` 不检查地址族、UDP `connect` 按大端读地址族，共 12 个，全部被 `TCP socket-state errnos…`（一个同时被旧的 `tcp send errors…` 抓住）抓住。其中 3 个第一次因未使用参数编译失败，改成可编译形式后抓住；恢复后 `grep -c MUTATION` 为 0。
+- 验证：host 856/856；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello184 PASS，**且 hello22/26/27/85 以及其余所有 TCP/UDP 探测在新的地址族字节序下全部 PASS**、0 个 FAIL；stress（SMP=2）5/5 PASS。
+

@@ -277,6 +277,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, false)) return -22;
     var sock_addr: [8]u8 = undefined;
     if (copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), SOCKADDR_IN_MIN_LEN) != SOCKADDR_IN_MIN_LEN) return -14;
+    if (!@import("socket_address_policy.zig").inet4FamilyValid(bo.readU16Le(sock_addr[0..2]))) return -97; // EAFNOSUPPORT
     const port = bo.readU16BeAt(&sock_addr, 2);
     if (net_mod.tcp_port_policy.bindNeedsPrivilege(port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
     return net_mod.tcp.tcpBind(tcb_idx, port);
@@ -760,7 +761,7 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, false)) return -22;
         var sock_addr: [8]u8 = undefined;
         if (copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), 8) != 8) return -14;
-        if (bo.readU16BeAt(&sock_addr, 0) != 2) return -97;
+        if (!@import("socket_address_policy.zig").inet4FamilyValid(bo.readU16Le(sock_addr[0..2]))) return -97;
         const dst_port = bo.readU16BeAt(&sock_addr, 2);
         const dst_ip = [4]u8{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] };
         t.fd_table.fds[fd].udp_connected = true;
@@ -786,7 +787,7 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, false)) return -22;
     var sock_addr: [8]u8 = undefined;
     if (copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), 8) != 8) return -14;
-    if (!@import("socket_address_policy.zig").inet4FamilyValid(bo.readU16BeAt(&sock_addr, 0))) return -97;
+    if (!@import("socket_address_policy.zig").inet4FamilyValid(bo.readU16Le(sock_addr[0..2]))) return -97;
     const port = bo.readU16BeAt(&sock_addr, 2);
     const ip = [4]u8{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] };
     return finishTcpConnect(t, fd, net_mod.tcp.tcpConnectSocket(tcb_idx, ip, port));
@@ -883,6 +884,8 @@ pub fn getpeername(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
     }
 
     if (desc.fd_type != .tcp_socket) return -88;
+    const peer_rc = net_mod.tcp.tcpPeerErrno(desc.tcb_idx);
+    if (peer_rc != 0) return peer_rc;
     const info = net_mod.tcp.tcpGetAddrInfo(desc.tcb_idx) orelse return -1;
 
     var sa_buf: [sa.SOCKADDR_IN6_LEN]u8 = undefined;

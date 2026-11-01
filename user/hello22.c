@@ -56,8 +56,8 @@ void _start(void) {
         goto done;
     }
 
-    // sockaddr_in: {family=2, port=8080 big-endian, ip=0.0.0.0}
-    uint8_t addr[8] = { 0x00, 0x02, 0x1F, 0x90, 0x00, 0x00, 0x00, 0x00 };
+    // sockaddr_in: {family=2 little-endian (02 00), port=8080 big-endian, ip=0.0.0.0}
+    uint8_t addr[8] = { 0x02, 0x00, 0x1F, 0x90, 0x00, 0x00, 0x00, 0x00 };
     int64_t br = syscall3(SYS_BIND, (uint64_t)fd, (uint64_t)addr, 16);
     print("hello22: bind=");
     print_dec(br);

@@ -88,7 +88,7 @@ void _start(void) {
     /* 2. connect to 10.0.2.2:80 via socket API (syscall #124) */
     uint8_t addr[16];
     for (int i = 0; i < 16; i++) addr[i] = 0;
-    addr[0] = 0x00; addr[1] = 0x02;  /* AF_INET */
+    addr[0] = 0x02; addr[1] = 0x00;  /* AF_INET (little-endian, as Linux) */
     addr[2] = 0x00; addr[3] = 0x50;  /* port 80 big-endian */
     addr[4] = 10; addr[5] = 0; addr[6] = 2; addr[7] = 2;  /* 10.0.2.2 */
     /* Non-blocking: QEMU's user-mode network has no TCP server behind

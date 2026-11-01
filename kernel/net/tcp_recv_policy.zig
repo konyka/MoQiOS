@@ -86,16 +86,19 @@ pub fn timedOut(deadline_ns: ?u64, now_ns: u64) bool {
     return now_ns >= d;
 }
 
-/// send() on a TCB that cannot queue data (state, FIN request, reset). A
-/// connection that never carried data is ENOTCONN; one that was shut down for
-/// writing (or whose peer vanished) is EPIPE; a peer RST is ECONNRESET.
-/// `established_ever` stays set once the handshake finished.
+/// send() on a TCB that cannot queue data (state, FIN request, reset). A peer
+/// RST is ECONNRESET; everything else is EPIPE — Linux answers EPIPE (not
+/// ENOTCONN) for a socket that never connected, a listening one, one shut down
+/// for writing and one whose peer vanished. (recv() is the call that reports
+/// ENOTCONN for a socket that never connected.) `established_ever` is kept in
+/// the signature for callers; it no longer changes the answer.
 pub fn sendErrno(state: TcpState, fin_pending: bool, reset_by_peer: bool, established_ever: bool) i64 {
+    _ = established_ever;
     if (reset_by_peer) return errno.ECONNRESET;
     if (fin_pending) return errno.EPIPE;
     return switch (state) {
         .established, .close_wait => 0,
-        .closed, .syn_sent, .syn_received, .listen => if (established_ever) errno.EPIPE else errno.ENOTCONN,
+        .closed, .syn_sent, .syn_received, .listen => errno.EPIPE,
         .fin_wait_1, .fin_wait_2, .closing, .last_ack, .time_wait => errno.EPIPE,
     };
 }
@@ -156,3 +159,39 @@ pub fn emptyResult(decision: RecvDecision) i64 {
         .reset => errno.ECONNRESET,
     };
 }
+
+/// Which calls a stream socket's state admits, as the errno Linux gives when it does not.
+pub const EINVAL: i64 = -22;
+pub const ENOTCONN: i64 = -107;
+pub const EISCONN: i64 = -106;
+
+/// A connection that exists or is being set up (getpeername has an answer once the handshake began).
+pub fn hasPeer(state: TcpState) bool {
+    return switch (state) {
+        .closed, .listen => false,
+        else => true,
+    };
+}
+
+/// accept(): only a listening socket.
+pub fn acceptErrno(state: TcpState) i64 {
+    return if (state == .listen) 0 else EINVAL;
+}
+
+/// listen(): a fresh (closed) or already listening socket; a connected one is EINVAL.
+pub fn listenErrno(state: TcpState) i64 {
+    return if (state == .closed or state == .listen) 0 else EINVAL;
+}
+
+/// shutdown(): a listener accepts it (it stops listening); a socket that never connected is ENOTCONN
+/// for every `how`; one that was connected, or is being, is fine.
+pub fn shutdownErrno(state: TcpState, established_ever: bool) i64 {
+    if (state == .listen) return 0;
+    return if (hasPeer(state) or established_ever) 0 else ENOTCONN;
+}
+
+/// getpeername(): only with a peer (including a handshake in progress); a listener has none.
+pub fn peernameErrno(state: TcpState, established_ever: bool) i64 {
+    return if (hasPeer(state) or established_ever) 0 else ENOTCONN;
+}
+

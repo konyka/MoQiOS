@@ -26,7 +26,7 @@ static inline int64_t syscall6(uint64_t n, uint64_t a, uint64_t b, uint64_t c, u
 
 static void print(const char *s) { uint64_t n=0; while(s[n]) n++; syscall3(SYS_WRITE,1,(uint64_t)s,n); }
 static int check(int ok,const char *s){if(!ok){print("hello85: FAIL ");print(s);print("\n");return 1;}return 0;}
-static void addr(uint8_t *a){for(int i=0;i<16;i++)a[i]=0;a[0]=0; a[1]=2; a[2]=(uint8_t)(TCP_PORT>>8); a[3]=(uint8_t)TCP_PORT; a[4]=127;a[7]=1;}
+static void addr(uint8_t *a){for(int i=0;i<16;i++)a[i]=0;a[0]=2; a[1]=0; a[2]=(uint8_t)(TCP_PORT>>8); a[3]=(uint8_t)TCP_PORT; a[4]=127;a[7]=1;}
 __attribute__((noreturn)) static void exit_raw(int x){syscall1(SYS_EXIT,(uint64_t)x);for(;;){}}
 
 void _start(void){

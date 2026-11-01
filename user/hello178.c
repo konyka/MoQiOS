@@ -98,7 +98,7 @@ static void pump(int ms) {
 }
 static void mk_addr(uint8_t *a, int port) {
     for (int i = 0; i < 16; i++) a[i] = 0;
-    a[1] = 2; a[2] = (uint8_t)(port >> 8); a[3] = (uint8_t)port; a[4] = 127; a[7] = 1;
+    a[0] = 2; a[2] = (uint8_t)(port >> 8); a[3] = (uint8_t)port; a[4] = 127; a[7] = 1;
 }
 static void mk_addr6(uint8_t *a, int port) {
     for (int i = 0; i < 28; i++) a[i] = 0;

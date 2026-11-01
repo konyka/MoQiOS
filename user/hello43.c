@@ -93,7 +93,7 @@ static int64_t now_ms(void) {
 /* sockaddr_in, 16 bytes: family(2) port(2, BE) addr(4) zero(8) */
 static void mk_addr(uint8_t *a, uint16_t port) {
     for (int i = 0; i < 16; i++) a[i] = 0;
-    a[0] = 0x00; a[1] = AF_INET;
+    a[0] = AF_INET; a[1] = 0x00;
     a[2] = (uint8_t)(port >> 8); a[3] = (uint8_t)(port & 0xff);
     a[4] = 127; a[5] = 0; a[6] = 0; a[7] = 1;
 }

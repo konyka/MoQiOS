@@ -86,7 +86,7 @@ void _start(void) {
     /* 2. bind to 0.0.0.0:9090 */
     uint8_t addr[16];
     for (int i = 0; i < 16; i++) addr[i] = 0;
-    addr[0] = 0x00; addr[1] = 0x02;  /* AF_INET */
+    addr[0] = 0x02; addr[1] = 0x00;  /* AF_INET (little-endian, as Linux) */
     addr[2] = 0x23; addr[3] = 0x82;  /* port 9090 big-endian */
     int64_t br = syscall3(SYS_BIND, (uint64_t)server_fd, (uint64_t)addr, 16);
     print("hello26: bind=");

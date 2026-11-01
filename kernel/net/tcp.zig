@@ -4041,7 +4041,8 @@ pub fn tcpListen(tcb_idx: u32) i64 {
     // Only a fresh (closed) or already-listening socket may listen; turning a
     // connected TCB into a listener would silently kill its traffic and
     // re-bind the port's backlog to the wrong owner (EISCONN).
-    if (tcb.state != .closed and tcb.state != .listen) return -1;
+    const lis_rc = tcp_recv_policy.listenErrno(tcb.state);
+    if (lis_rc != 0) return lis_rc;
 
     tcb.state = .listen;
 
@@ -4122,7 +4123,9 @@ pub fn tcpAccept(tcb_idx: u32, owner_task: u32) i64 {
     defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
-    if (!tcb.active or tcb.state != .listen) return -1;
+    if (!tcb.active) return -1;
+    const acc_rc = tcp_recv_policy.acceptErrno(tcb.state);
+    if (acc_rc != 0) return acc_rc;
 
     // Find the listen slot for this TCB (bitmap-driven)
     var slot: ?*ListenSlot = null;
@@ -4299,6 +4302,14 @@ pub const AddrInfo = struct {
 };
 
 /// Get address info for a TCB (for getsockname/getpeername).
+/// getpeername(): 0 when the socket has (or is getting) a peer, else -ENOTCONN.
+pub fn tcpPeerErrno(tcb_idx: u32) i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return -9;
+    return tcp_recv_policy.peernameErrno(tcbs[tcb_idx].state, tcbs[tcb_idx].was_established);
+}
+
 pub fn tcpGetAddrInfo(tcb_idx: u32) ?AddrInfo {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
@@ -4337,6 +4348,8 @@ pub fn tcpShutdown(tcb_idx: u32, how: u32) i64 {
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return -1;
+    const sd_rc = tcp_recv_policy.shutdownErrno(tcb.state, tcb.was_established);
+    if (sd_rc != 0) return sd_rc;
 
     switch (how) {
         0 => {

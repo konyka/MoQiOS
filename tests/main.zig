@@ -8014,8 +8014,9 @@ test "tcp send errors: ENOTCONN before a connection, EPIPE after shutdown, ECONN
     // Open for writing: no error (established, or the peer only closed its side).
     try std.testing.expectEqual(@as(i64, 0), rp.sendErrno(S.established, false, false, true));
     try std.testing.expectEqual(@as(i64, 0), rp.sendErrno(S.close_wait, false, false, true));
-    // Never connected: ENOTCONN; was connected and is gone: EPIPE.
-    try std.testing.expectEqual(@as(i64, -107), rp.sendErrno(S.closed, false, false, false));
+    // Never connected, listening, or connected and gone: EPIPE (Linux; recv is the call that says ENOTCONN).
+    try std.testing.expectEqual(@as(i64, -32), rp.sendErrno(S.closed, false, false, false));
+    try std.testing.expectEqual(@as(i64, -32), rp.sendErrno(S.listen, false, false, false));
     try std.testing.expectEqual(@as(i64, -32), rp.sendErrno(S.closed, false, false, true));
     // Shutdown for writing (FIN requested or sent): EPIPE.
     try std.testing.expectEqual(@as(i64, -32), rp.sendErrno(S.established, true, false, true));
@@ -9405,4 +9406,53 @@ test "TCP bind errors and SO_REUSEADDR sharing" {
     const h = kt.capability_profile.profileForLaunch("hello183", true, false);
     try std.testing.expect(h.caps.cap_setuid and !h.caps.cap_net_bind and !h.caps.cap_net_admin);
     try std.testing.expectEqual(@as(u32, 0), h.uid);
+}
+
+test "TCP socket-state errnos: accept, listen, shutdown, getpeername, and the AF_INET family byte order" {
+    const rp = kt.tcp_recv_policy;
+    const S = rp.TcpState;
+    // accept: only a listener.
+    try std.testing.expectEqual(@as(i64, 0), rp.acceptErrno(S.listen));
+    for ([_]S{ S.closed, S.syn_sent, S.syn_received, S.established, S.fin_wait_1, S.fin_wait_2, S.closing, S.time_wait, S.close_wait, S.last_ack }) |st| {
+        try std.testing.expectEqual(@as(i64, -22), rp.acceptErrno(st));
+    }
+    // listen: a fresh or already-listening socket; anything else EINVAL.
+    try std.testing.expectEqual(@as(i64, 0), rp.listenErrno(S.closed));
+    try std.testing.expectEqual(@as(i64, 0), rp.listenErrno(S.listen));
+    for ([_]S{ S.syn_sent, S.syn_received, S.established, S.fin_wait_1, S.fin_wait_2, S.closing, S.time_wait, S.close_wait, S.last_ack }) |st| {
+        try std.testing.expectEqual(@as(i64, -22), rp.listenErrno(st));
+    }
+    // shutdown: a listener is fine; a never-connected socket is ENOTCONN; a connected (or once-connected) one is fine.
+    try std.testing.expectEqual(@as(i64, 0), rp.shutdownErrno(S.listen, false));
+    try std.testing.expectEqual(@as(i64, -107), rp.shutdownErrno(S.closed, false));
+    try std.testing.expectEqual(@as(i64, 0), rp.shutdownErrno(S.closed, true));
+    try std.testing.expectEqual(@as(i64, 0), rp.shutdownErrno(S.established, true));
+    try std.testing.expectEqual(@as(i64, 0), rp.shutdownErrno(S.syn_sent, false));
+    // getpeername: a peer, or a handshake in progress; a fresh socket and a listener have none.
+    try std.testing.expectEqual(@as(i64, -107), rp.peernameErrno(S.closed, false));
+    try std.testing.expectEqual(@as(i64, -107), rp.peernameErrno(S.listen, false));
+    try std.testing.expectEqual(@as(i64, 0), rp.peernameErrno(S.established, true));
+    try std.testing.expectEqual(@as(i64, 0), rp.peernameErrno(S.syn_sent, false));
+    try std.testing.expectEqual(@as(i64, 0), rp.peernameErrno(S.time_wait, true));
+    // send on a listener / never-connected socket is EPIPE; a peer RST still wins.
+    try std.testing.expectEqual(@as(i64, -32), rp.sendErrno(S.listen, false, false, false));
+    try std.testing.expectEqual(@as(i64, -104), rp.sendErrno(S.listen, false, true, false));
+
+    // The family field of a sockaddr_in is a little-endian u16: a Linux program stores 02 00.
+    const sa = kt.socket_address_policy;
+    try std.testing.expect(sa.inet4FamilyValid(std.mem.readInt(u16, &[_]u8{ 2, 0 }, .little)));
+    try std.testing.expect(!sa.inet4FamilyValid(std.mem.readInt(u16, &[_]u8{ 0, 2 }, .little)));
+    const ss = kt.socket_syscall_source;
+    // Every IPv4 address parse that checks the family reads it little-endian (the old reads were big-endian).
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, ss, "inet4FamilyValid(bo.readU16Le(sock_addr[0..2]))"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ss, "readU16BeAt(&sock_addr, 0)"));
+    // TCP bind refuses a non-AF_INET address before looking at the port.
+    try std.testing.expect(std.mem.indexOf(u8, ss, "inet4FamilyValid(bo.readU16Le(sock_addr[0..2]))) return -97; // EAFNOSUPPORT\n    const port = bo.readU16BeAt(&sock_addr, 2);") != null);
+    // getpeername asks the state first.
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const peer_rc = net_mod.tcp.tcpPeerErrno(desc.tcb_idx);\n    if (peer_rc != 0) return peer_rc;") != null);
+    // The kernel entry points use the policy.
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const acc_rc = tcp_recv_policy.acceptErrno(tcb.state);\n    if (acc_rc != 0) return acc_rc;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const lis_rc = tcp_recv_policy.listenErrno(tcb.state);\n    if (lis_rc != 0) return lis_rc;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const sd_rc = tcp_recv_policy.shutdownErrno(tcb.state, tcb.was_established);\n    if (sd_rc != 0) return sd_rc;") != null);
 }
