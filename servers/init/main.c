@@ -302,6 +302,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello173"); /* ioctl(TIOCOUTQ) on sockets */
     run_test("hello174"); /* SO_SNDBUF / SO_RCVBUF on TCP */
     run_test("hello175"); /* netdevice ioctls */
+    run_test("hello176"); /* sleeping is not CPU time */
 
     start_persistent_services();
 
