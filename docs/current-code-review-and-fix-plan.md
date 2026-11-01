@@ -5774,3 +5774,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 新增 1 个测试（身份、epoll 余量规则、`connectionOriented` 的接线）并更新了 2 个把“SEQPACKET 被拒绝”钉死的旧测试（这正是要改变的行为）；hello168（A 创建与 `SO_TYPE`、B 记录边界与双向、C `MSG_TRUNC` 与丢弃余量、D 对端关闭后 EOF 与 poll、E 阻塞读被关闭唤醒、F 标志与 `SOCK_RAW` 仍被拒）在 HEAD 上 A 段失败（后续各项无法进行），新内核 PASS。
 - 变异（具名测试核对）：seqpacket 对端消失返回 `ENOTCONN`、epoll 沿用流的“1 字节”余量、`socketpair` 策略拒绝 seqpacket、`SO_TYPE` 身份写错，被 host 测试抓住。**最初有两个变异没被抓住**：把 `connectionOriented` 改成只含 STREAM、把 `unixSocketPair` 的类型检查改回只放行 STREAM/DGRAM（测试只检查函数名存在）；已把测试收紧为检查它们的确切返回表达式和类型检查，之后两个都被具名测试抓住。
 - 验证：host 833/833；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（240 s）与 GPT SMP=2 均 hello168 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### socket(AF_UNIX, SOCK_SEQPACKET) 与 listen/connect/accept（hello169）
+
+- 问题：hello168 记录的已知差异：只有 `socketpair` 能创建 seqpacket，`socket(AF_UNIX, SOCK_SEQPACKET)` 与 `bind/listen/connect/accept` 路径是 `EINVAL`；而且就算放行类型，`unixConnect` 会把 seqpacket 当数据报处理（直接设默认对端、不进监听者队列），`unixAccept` 新建的套接字类型被写死为 STREAM。
+- 修复：见 `docs/kernel-subsystems.md` 的 hello169 条。`socketArgs` 放行 AF_UNIX 的类型 5；`listen/accept` 面向连接的类型都可用；`connect` 类型不匹配 `EPROTOTYPE`；accept 出来的套接字沿用监听者类型；accept 之前发送的记录连同长度前缀存进 `pending` 缓冲；半关闭/发送余量/epoll 状态统一用 `connectionOriented`。
+- 已知差异：accept 之前发送的记录总量受 1024 字节的 `pending` 缓冲限制（流套接字同样）；accept 之前不能携带描述符；`SHUT_WR` 对 seqpacket 与流一样按字节流半关闭处理（Linux 同样对 seqpacket 的 `SHUT_WR` 使对端读到 EOF）。
+- TDD：host 新增 1 个测试（`socketArgs` 的类型矩阵：AF_UNIX 放行 5、AF_INET/INET6 拒绝 5、协议非 0 拒绝、4 与 6 仍无效、RAW 仍拒绝；`unix_socket.zig` 里 listen/accept/connect/pending/半关闭各处的确切表达式）；hello169（A 创建、`SO_TYPE`、AF_INET 仍被拒；B listen/accept 的前置条件与 `ECONNREFUSED`；C 流客户端连 seqpacket 监听者 `EPROTOTYPE`；D 子进程 connect 后立即发送、服务端 accept 后记录整条到达、双向、`MSG_TRUNC`、对端关闭后 EOF）在旧内核上 A 段 `socket()` 失败，新内核 PASS。
+- 变异（具名测试核对）：AF_INET 接受 seqpacket、去掉 `EPROTOTYPE`、accept 总建流套接字、listen 只允许流、pending 余量判断漏掉长度前缀、shutdown 只处理流、accept 只接受排队的流连接者，共 7 个，全部被 `socket(AF_UNIX, SOCK_SEQPACKET): type matrix and the listen/connect/accept paths` 抓住；恢复后 `grep -c MUTATION` 为 0。注意这个 host 测试是“表达式形状”检查，行为层面的证据来自 hello169。
+- 验证：host 834/834；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（240 s）与 GPT SMP=2 均 hello169 PASS、0 FAIL；stress（SMP=2）5/5 PASS。

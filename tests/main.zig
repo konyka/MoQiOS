@@ -8560,3 +8560,37 @@ test "seqpacket: identity, epoll room rule and the connection-oriented paths" {
     // A vanished seqpacket peer is EPIPE, not ENOTCONN.
     try std.testing.expect(std.mem.indexOf(u8, src, "sock.sock_type == SOCK_SEQPACKET and sock.was_connected) -32 else -107") != null);
 }
+
+test "socket(AF_UNIX, SOCK_SEQPACKET): type matrix and the listen/connect/accept paths" {
+    const np = kt.namespace_policy;
+    // SEQPACKET (5) is an AF_UNIX type only, with the usual flags on top.
+    try std.testing.expectEqual(@as(u32, 5), np.socketArgs(1, 5 | 0x80000 | 0x800, 0).ok.sock_type);
+    try std.testing.expect(np.socketArgs(1, 5 | 0x80000 | 0x800, 0).ok.cloexec);
+    try std.testing.expectEqual(@as(i64, -22), np.socketArgs(2, 5, 0).err);
+    try std.testing.expectEqual(@as(i64, -22), np.socketArgs(10, 5, 0).err);
+    try std.testing.expectEqual(@as(i64, -93), np.socketArgs(1, 5, 7).err);
+    // Types 4 and 6.. stay invalid, RAW stays invalid for AF_UNIX.
+    try std.testing.expectEqual(@as(i64, -22), np.socketArgs(1, 4, 0).err);
+    try std.testing.expectEqual(@as(i64, -22), np.socketArgs(1, 6, 0).err);
+    try std.testing.expectEqual(@as(i64, -22), np.socketArgs(1, 3, 0).err);
+
+    const src = kt.unix_socket_source;
+    // socket() admits all three types.
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (sock_type != SOCK_STREAM and sock_type != SOCK_DGRAM and sock_type != SOCK_SEQPACKET) return -22; // EINVAL\n\n    const saved") != null);
+    // listen and accept work on connection-oriented sockets only.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "if (!connectionOriented(sock.sock_type)) return -22; // EINVAL\n    if (!sock.bound) return -22;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "if (!connectionOriented(sock.sock_type)) return -22; // EINVAL\n    if (!sock.listening) return -22;"));
+    // connect: a listener of another type is EPROTOTYPE, and a seqpacket client queues on the listener like a stream client.
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (peer.sock_type != sock.sock_type) return -91; // EPROTOTYPE\n    if (connectionOriented(sock.sock_type)) {\n        if (!peer.listening) return -111;") != null);
+    // accept: the new socket takes the listener's type, and only same-type connectors are accepted.
+    try std.testing.expect(std.mem.indexOf(u8, src, "queued.sock_type != sock.sock_type or queued.connected or queued.listening") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, ".sock_type = sock.sock_type,\n        .connected = true,\n        .was_connected = true,\n        .peer_idx = @intCast(conn_idx),") != null);
+    // A record sent between connect() and accept() is parked, length-prefixed, in the pending buffer.
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (sock.sock_type == SOCK_SEQPACKET and !sock.connected) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (2 + len > UNIX_PENDING_MAX) return -90; // EMSGSIZE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (sock.pending_len + 2 + len > UNIX_PENDING_MAX) return -11; // EAGAIN") != null);
+    // Half-close, send room and epoll treat seqpacket like a stream.
+    try std.testing.expect(std.mem.indexOf(u8, src, "return connectionOriented(unix_sockets[idx].sock_type) and np.halfCloseReadEof(halfCloseLocked(idx));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (connectionOriented(sock.sock_type)) {\n        if (!sock.connected or !peer.connected or peer.peer_idx != @as(u8, @intCast(idx))) return null;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (connectionOriented(sock.sock_type)) {\n        if (shut_rd) sock.shut_rd = true;") != null);
+}

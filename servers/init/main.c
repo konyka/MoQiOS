@@ -295,6 +295,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello166"); /* SSE register state across fork */
     run_test("hello167"); /* recvmsg MSG_PEEK / MSG_WAITALL / MSG_TRUNC */
     run_test("hello168"); /* socketpair(AF_UNIX, SOCK_SEQPACKET) */
+    run_test("hello169"); /* socket(AF_UNIX, SOCK_SEQPACKET) listen/connect/accept */
 
     start_persistent_services();
 

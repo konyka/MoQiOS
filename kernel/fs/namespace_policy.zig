@@ -221,7 +221,8 @@ pub fn socketArgs(domain: u32, type_and_flags: u32, protocol: u32) union(enum) {
     const flags = SOCK_NONBLOCK_FLAG | SOCK_CLOEXEC_FLAG;
     if ((type_and_flags & ~(flags | 0xf)) != 0) return .{ .err = -22 };
     const t = type_and_flags & 0xf;
-    if (t < 1 or t > 3) return .{ .err = -22 }; // STREAM, DGRAM, RAW
+    if (t < 1 or (t > 3 and t != 5)) return .{ .err = -22 }; // STREAM, DGRAM, RAW, SEQPACKET
+    if (t == 5 and domain != 1) return .{ .err = -22 }; // SEQPACKET exists for AF_UNIX only
     if (domain == 1) {
         if (t == 3) return .{ .err = -22 };
         if (protocol != 0) return .{ .err = -93 }; // EPROTONOSUPPORT

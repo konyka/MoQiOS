@@ -144,7 +144,7 @@ fn halfCloseLocked(idx: u32) np.HalfClose {
 
 /// An empty ring on stream `idx` reads EOF because of a shutdown (unix_lock held).
 fn shutEofLocked(idx: u32) bool {
-    return unix_sockets[idx].sock_type == SOCK_STREAM and np.halfCloseReadEof(halfCloseLocked(idx));
+    return connectionOriented(unix_sockets[idx].sock_type) and np.halfCloseReadEof(halfCloseLocked(idx));
 }
 
 // ── SCM_RIGHTS: descriptors in flight ──────────────────────────────────────
@@ -320,7 +320,7 @@ const EpollWake = struct {
 /// Create a new Unix domain socket.
 /// Returns socket index (>= 0) or negative errno on failure.
 pub fn unixSocket(sock_type: u32) i32 {
-    if (sock_type != SOCK_STREAM and sock_type != SOCK_DGRAM) return -22; // EINVAL
+    if (sock_type != SOCK_STREAM and sock_type != SOCK_DGRAM and sock_type != SOCK_SEQPACKET) return -22; // EINVAL
 
     const saved = unix_lock.acquire();
     defer unix_lock.release(saved);
@@ -469,7 +469,7 @@ pub fn unixListen(idx: u32, backlog: u32) i32 {
 
     const sock = &unix_sockets[idx];
     if (!sock.active) return -9; // EBADF
-    if (sock.sock_type != SOCK_STREAM) return -22; // EINVAL
+    if (!connectionOriented(sock.sock_type)) return -22; // EINVAL
     if (!sock.bound) return -22; // EINVAL — must be bound
     if (sock.listening) return 0; // already listening
 
@@ -515,7 +515,8 @@ pub fn unixConnect(idx: u32, path: [*]const u8, path_len: usize) i32 {
     const peer_i = peer_found orelse return -111; // ECONNREFUSED
     const peer = &unix_sockets[peer_i];
 
-    if (sock.sock_type == SOCK_STREAM) {
+    if (peer.sock_type != sock.sock_type) return -91; // EPROTOTYPE
+    if (connectionOriented(sock.sock_type)) {
         if (!peer.listening) return -111; // ECONNREFUSED
 
         // Check backlog
@@ -556,7 +557,7 @@ pub fn unixAccept(idx: u32) i32 {
 
     const sock = &unix_sockets[idx];
     if (!sock.active) return -9; // EBADF
-    if (sock.sock_type != SOCK_STREAM) return -22; // EINVAL
+    if (!connectionOriented(sock.sock_type)) return -22; // EINVAL
     if (!sock.listening) return -22; // EINVAL
 
     if (sock.backlog_count == 0) return -11; // EAGAIN
@@ -577,7 +578,7 @@ pub fn unixAccept(idx: u32) i32 {
     if (conn_idx >= MAX_UNIX_SOCKETS) return -103; // ECONNABORTED
     {
         const queued = &unix_sockets[conn_idx];
-        if (!queued.active or queued.sock_type != SOCK_STREAM or queued.connected or queued.listening)
+        if (!queued.active or queued.sock_type != sock.sock_type or queued.connected or queued.listening)
             return -103; // ECONNABORTED
     }
 
@@ -594,7 +595,7 @@ pub fn unixAccept(idx: u32) i32 {
     // Initialize the new accepted socket
     unix_sockets[new_idx] = .{
         .active = true,
-        .sock_type = SOCK_STREAM,
+        .sock_type = sock.sock_type,
         .connected = true,
         .was_connected = true,
         .peer_idx = @intCast(conn_idx),
@@ -707,7 +708,26 @@ pub fn unixSendRights(idx: u32, data: [*]const u8, len: usize, rights: ?*RightsI
         if (n == 0 and len > 0) return -11; // EAGAIN
         return @intCast(n);
     } else {
-        // DGRAM
+        // DGRAM / SEQPACKET
+        if (sock.sock_type == SOCK_SEQPACKET and !sock.connected) {
+            if (carrying) return -107; // ENOTCONN: descriptors cannot wait for accept()
+            // connect() succeeded but the listener has not accepted yet: keep the
+            // record, already length-prefixed, until accept() moves it to the ring.
+            switch (np.streamSendState(.{ .connected = false, .queued = queuedOnBacklogLocked(idx) })) {
+                .not_connected => return np.streamSendErrno(sock.was_connected, false),
+                .deliver => unreachable,
+                .queue_pending => {
+                    if (2 + len > UNIX_PENDING_MAX) return -90; // EMSGSIZE
+                    if (sock.pending_len + 2 + len > UNIX_PENDING_MAX) return -11; // EAGAIN
+                    const dl: u16 = @intCast(len);
+                    sock.pending[sock.pending_len] = @truncate(dl);
+                    sock.pending[sock.pending_len + 1] = @truncate(dl >> 8);
+                    @memcpy(sock.pending[sock.pending_len + 2 ..][0..len], data[0..len]);
+                    sock.pending_len += @intCast(2 + len);
+                    return @intCast(len);
+                },
+            }
+        }
         const peer_i: u32 = sock.peer_idx;
         if (peer_i >= MAX_UNIX_SOCKETS or !unix_sockets[peer_i].active) {
             // A seqpacket socket was connected: a vanished peer is EPIPE.
@@ -715,6 +735,10 @@ pub fn unixSendRights(idx: u32, data: [*]const u8, len: usize, rights: ?*RightsI
         }
 
         const peer = &unix_sockets[peer_i];
+        if (sock.sock_type == SOCK_SEQPACKET) {
+            if (!peer.connected or peer.peer_idx != @as(u8, @intCast(idx))) return -32; // EPIPE
+            if (np.halfCloseSendBroken(halfCloseLocked(idx))) return -32; // EPIPE: shutdown(SHUT_WR) here or SHUT_RD at the peer
+        }
         // For DGRAM, write the datagram length prefix (2 bytes LE) + data
         const total = 2 + len;
         if (peer.buf_count + total > UNIX_SOCK_BUF_SIZE) return -11; // EAGAIN
@@ -1277,7 +1301,7 @@ pub fn unixShutdown(idx: u32, how: u32) i64 {
     if (!sock.connected) return -107; // ENOTCONN
     const shut_rd = how == 0 or how == 2;
     const shut_wr = how == 1 or how == 2;
-    if (sock.sock_type == SOCK_STREAM) {
+    if (connectionOriented(sock.sock_type)) {
         if (shut_rd) sock.shut_rd = true;
         if (shut_wr) sock.shut_wr = true;
     }
@@ -1328,10 +1352,10 @@ pub fn unixEpollEvents(idx: u32) u32 {
         .rx_bytes = sock.buf_count,
         .listening = sock.listening,
         .pending_connections = sock.backlog_count,
-        .disconnected = !sock.connected or (sock.sock_type == SOCK_STREAM and np.halfCloseReadEof(halfCloseLocked(idx)) and np.halfCloseSendBroken(halfCloseLocked(idx))),
-        .read_eof = sock.sock_type == SOCK_STREAM and np.halfCloseReadEof(halfCloseLocked(idx)),
-        .send_broken = sock.sock_type == SOCK_STREAM and np.halfCloseSendBroken(halfCloseLocked(idx)),
-        .peer_shut_wr = sock.sock_type == SOCK_STREAM and halfCloseLocked(idx).peer_shut_wr,
+        .disconnected = !sock.connected or (connectionOriented(sock.sock_type) and np.halfCloseReadEof(halfCloseLocked(idx)) and np.halfCloseSendBroken(halfCloseLocked(idx))),
+        .read_eof = connectionOriented(sock.sock_type) and np.halfCloseReadEof(halfCloseLocked(idx)),
+        .send_broken = connectionOriented(sock.sock_type) and np.halfCloseSendBroken(halfCloseLocked(idx)),
+        .peer_shut_wr = connectionOriented(sock.sock_type) and halfCloseLocked(idx).peer_shut_wr,
         .connect_pending = connectionOriented(sock.sock_type) and !sock.connected and queuedOnBacklogLocked(idx),
         .peer_free = sendRoomLocked(idx),
     });
@@ -1344,7 +1368,7 @@ fn sendRoomLocked(idx: u32) ?u32 {
     const peer_i: u32 = sock.peer_idx;
     if (peer_i >= MAX_UNIX_SOCKETS or !unix_sockets[peer_i].active) return null;
     const peer = &unix_sockets[peer_i];
-    if (sock.sock_type == SOCK_STREAM) {
+    if (connectionOriented(sock.sock_type)) {
         if (!sock.connected or !peer.connected or peer.peer_idx != @as(u8, @intCast(idx))) return null;
         if (np.halfCloseSendBroken(halfCloseLocked(idx))) return null;
     }
