@@ -71,7 +71,7 @@ pub fn writeGate(writable: bool) i64 {
 /// no terminator means the path is longer than the kernel accepts (ENAMETOOLONG)
 /// rather than something to truncate and act on.
 pub fn pathCopyErrno(buf: []const u8, copied: usize, max: usize) i64 {
-    if (copied == 0) return -14; // EFAULT
+    if (copied == 0) return -14; // EFAULT: nothing could be read at the pointer
     if (copied < max) return 0;
     // copied == max: fits only if the last copied byte is the terminator
     return if (buf[copied - 1] == 0) 0 else -36;

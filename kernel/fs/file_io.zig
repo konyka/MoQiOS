@@ -101,6 +101,8 @@ pub fn openAt(dirfd: i64, name_ptr: u64, flags: u32, requested_mode: ?u32) i64 {
     var len: usize = 0;
     while (len < copied and name_buf[len] != 0) : (len += 1) {}
     const name = name_buf[0..len];
+    // An empty path names nothing (ENOENT); it must not fall through to the cwd.
+    if (name.len == 0) return -2;
 
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;

@@ -311,6 +311,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello182"); /* poll vs epoll wake-up latency */
     run_test("hello183"); /* TCP bind errors */
     run_test("hello184"); /* TCP errno conformance */
+    run_test("hello185"); /* fd/path errno conformance */
 
     start_persistent_services();
 

@@ -24,6 +24,12 @@ const RlimitPolicy = @import("../proc/rlimit.zig").Policy;
 /// SK-39: non-x86 bring-up exercises no fd-based syscalls, and the per-fd
 /// descriptor array dominates what is left of Task after SK-37/38. Keep a
 /// minimal table there; x86 stays at 64.
+/// Whether lseek() applies: regular files, directories, procfs and device nodes with a position.
+/// Pipes, sockets and eventfd/timerfd/epoll/inotify/pidfd descriptors are ESPIPE.
+pub fn fdTypeSeekable(t: FdType) bool {
+    return @import("fd_seek_policy.zig").seekable(@tagName(t));
+}
+
 pub const MAX_FDS: u32 = if (@import("builtin").cpu.arch == .x86_64) 64 else 8;
 pub const FD_STDIN: u32 = 0;
 pub const FD_STDOUT: u32 = 1;
@@ -1236,7 +1242,7 @@ pub const FdTable = struct {
     /// Read from a file descriptor into a kernel buffer.
     /// Returns number of bytes read, 0 on EOF, -1 on error.
     pub fn read(self: *FdTable, fd: u32, buf: [*]u8, count: usize) i64 {
-        if (fd >= MAX_FDS) return -1;
+        if (fd >= MAX_FDS) return -9; // EBADF
         const d = &self.fds[fd];
         // A shared offset is read-modify-written around the operation. Two
         // processes reading one description at once could still interleave
@@ -1248,12 +1254,12 @@ pub const FdTable = struct {
     }
 
     fn readInner(self: *FdTable, fd: u32, buf: [*]u8, count: usize) i64 {
-        if (fd >= MAX_FDS) return -1;
+        if (fd >= MAX_FDS) return -9; // EBADF
         const desc = &self.fds[fd];
         if (!@import("dac.zig").descriptorCanRead(desc.status_flags)) return -9; // EBADF
 
         switch (desc.fd_type) {
-            .none => return -1, // EBADF
+            .none => return -9, // EBADF
             .special => {
                 // stdin (fd 0): read from keyboard buffer
                 if (fd == FD_STDIN) {
@@ -1808,7 +1814,7 @@ pub const FdTable = struct {
         const state = @atomicLoad(u32, &self.transfer_state[fd], .acquire);
         if (slotLifecycle(state) != SLOT_LIVE) {
             self.slot_locks[fd].release(flags);
-            return if (slotLifecycle(state) == SLOT_CLOSING) 0 else -1;
+            return if (slotLifecycle(state) == SLOT_CLOSING) 0 else -9; // EBADF: not an open descriptor
         }
         @atomicStore(u32, &self.transfer_state[fd], SLOT_CLOSING | (state & TRANSFER_HOLD_MASK), .release);
         self.slot_locks[fd].release(flags);

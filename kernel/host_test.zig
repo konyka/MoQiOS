@@ -119,6 +119,7 @@ pub const utimens_policy = @import("fs/utimens_policy.zig");
 pub const at_flags_policy = @import("fs/at_flags_policy.zig");
 pub const access_policy = @import("fs/access_policy.zig");
 pub const namespace_policy = @import("fs/namespace_policy.zig");
+pub const fd_seek_policy = @import("fs/fd_seek_policy.zig");
 pub const writeback_overlap = @import("fs/writeback_overlap.zig");
 pub const shared_offset = @import("fs/shared_offset.zig");
 pub const sched_claim = @import("proc/sched_claim.zig");

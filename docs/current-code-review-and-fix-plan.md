@@ -5943,3 +5943,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异（具名测试核对）：`accept`/`listen`/`shutdown` 在任何状态都成功、监听者有对端、`shutdown` 不看状态、未连接的 `send` 又变回 `ENOTCONN`、四个入口里各自的检查被删（`accept`、`listen`、`shutdown`、`getpeername`）、`bind` 不检查地址族、UDP `connect` 按大端读地址族，共 12 个，全部被 `TCP socket-state errnos…`（一个同时被旧的 `tcp send errors…` 抓住）抓住。其中 3 个第一次因未使用参数编译失败，改成可编译形式后抓住；恢复后 `grep -c MUTATION` 为 0。
 - 验证：host 856/856；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello184 PASS，**且 hello22/26/27/85 以及其余所有 TCP/UDP 探测在新的地址族字节序下全部 PASS**、0 个 FAIL；stress（SMP=2）5/5 PASS。
 
+### 文件描述符与路径的错误码（hello185）
+
+- 问题：4 处与真实 Linux 的偏差（见 `docs/kernel-subsystems.md` 的 hello185 条）：`read` 在坏描述符上 `-1`、重复 `close` 为 `-1`、`lseek` 在管道上成功、`open("")` 成功。
+- 方法：先在宿主机编译并运行对照程序（约 55 项），再写 hello185；hello185 在旧内核上 4 项 FAIL，其余 51 项本来就一致，所以这一轮的“新发现率”（约 7%）比 hello184（TCP 状态机，约 14 项里 8 项）低，说明文件层此前已经被较好地覆盖过。
+- 过程说明（如实）：①第一次运行对照程序时它没有输出就被 SIGPIPE 杀掉（我的测试故意往读端已关的管道里写），这是对照程序本身的问题，加 `signal(SIGPIPE, SIG_IGN)` 后正常；②host 测试第一版直接引用 `kt.vfs`，但 `vfs.zig` 依赖架构代码，不能在 host 测试里导入，所以把 `lseek` 的规则抽到 `fd_seek_policy.zig`，用 `@tagName` 判断；为防止 `FdType` 改名后规则悄悄失效，测试同时断言 `vfs.zig` 里这些变体的确切声明。
+- 已知差异：`lseek` 对终端（`special`）仍当作可寻址（Linux 返回 `ESPIPE`）；`read(fd, NULL, n)` 返回 -1，Linux 对 `n>0` 的 `NULL` 缓冲区返回 `EFAULT`（这里没有对照测，仍沿用旧行为）；`open` 的符号链接环、`ELOOP`、`ENAMETOOLONG` 的边界未对照。
+- TDD：host 新增 1 个测试（不可寻址类型的穷举、可寻址类型的穷举、变体名真实存在、`read`/`close`/`open`/`lseek` 四处的确切形状）；hello185（55 项对照）在旧内核上 4 项 FAIL，新内核 PASS。
+
+- 变异（具名测试核对）：`read` 越界回 -1、`readInner` 越界回 -1、`.none` 回 -1、`close` 回 -1、`open("")` 检查失效、`lseek` 的 `ESPIPE` 检查失效、`seekable` 恒为真，以及 `UNSEEKABLE` 列表里 12 个类型逐个改名，共 19 个，全部被 `descriptor errnos…` 抓住；恢复后 `grep -c MUTATION` 为 0。
+- 验证：host 857/857；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello185 PASS、0 个 FAIL；stress（SMP=2）5/5 PASS。

@@ -9456,3 +9456,35 @@ test "TCP socket-state errnos: accept, listen, shutdown, getpeername, and the AF
     try std.testing.expect(std.mem.indexOf(u8, ts, "const lis_rc = tcp_recv_policy.listenErrno(tcb.state);\n    if (lis_rc != 0) return lis_rc;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "const sd_rc = tcp_recv_policy.shutdownErrno(tcb.state, tcb.was_established);\n    if (sd_rc != 0) return sd_rc;") != null);
 }
+
+test "descriptor errnos: EBADF for closed/out-of-range fds, ESPIPE for unseekable types, ENOENT for an empty path" {
+    // Which descriptor kinds lseek() applies to (by FdType tag).
+    const sk = kt.fd_seek_policy;
+    for ([_][]const u8{ "pipe_read", "pipe_write", "tcp_socket", "udp_socket", "unix_socket", "raw_socket", "epoll", "eventfd", "timerfd", "inotify", "pidfd", "devfs_ctrl" }) |t| {
+        try std.testing.expect(!sk.seekable(t));
+    }
+    for ([_][]const u8{ "ramdisk_file", "fat32_file", "ext2_file", "tmpfs_file", "proc_file", "devfs", "rofs_file", "special", "none" }) |t| {
+        try std.testing.expect(sk.seekable(t));
+    }
+    // The policy's names are real FdType tags: a renamed variant would otherwise silently become seekable.
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "    pipe_read = 4,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "    pidfd = 18,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "    devfs_ctrl = 21,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "return @import(\"fd_seek_policy.zig\").seekable(@tagName(t));") != null);
+
+    const v = kt.vfs_source;
+    // read(): an out-of-range or unused descriptor is EBADF in all three places that used to say -1.
+    try std.testing.expect(std.mem.indexOf(u8, v, "pub fn read(self: *FdTable, fd: u32, buf: [*]u8, count: usize) i64 {\n        if (fd >= MAX_FDS) return -9; // EBADF") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "fn readInner(self: *FdTable, fd: u32, buf: [*]u8, count: usize) i64 {\n        if (fd >= MAX_FDS) return -9; // EBADF") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "            .none => return -9, // EBADF\n            .special => {\n                // stdin (fd 0): read from keyboard buffer") != null);
+    // close(): a descriptor that is not open is EBADF; one already closing stays a quiet success.
+    try std.testing.expect(std.mem.indexOf(u8, v, "return if (slotLifecycle(state) == SLOT_CLOSING) 0 else -9; // EBADF: not an open descriptor") != null);
+
+    // open(""): ENOENT, before the cwd-relative resolution can turn it into the current directory.
+    const f = kt.file_io_source;
+    try std.testing.expect(std.mem.indexOf(u8, f, "    if (name.len == 0) return -2;\n\n    const cur_idx = sched_mod.currentTaskIndex() orelse return -1;") != null);
+
+    // lseek on an unseekable descriptor is ESPIPE, decided before the offset is touched.
+    const s = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, s, "    if (!vfs_mod.fdTypeSeekable(desc.fd_type)) return -29;\n    vfs_mod.syncOffsetIn(desc);") != null);
+}
