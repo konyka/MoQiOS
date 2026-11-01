@@ -5956,7 +5956,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 ### epoll 的错误码与事件布局（hello186）
 
-- 问题：①`EpollEvent` 在内核里是 16 字节（`data` 对齐到偏移 8），Linux x86_64 的 `struct epoll_event` 是 packed 的 12 字节（`data` 在偏移 4）；单个事件恰好不受影响（`events` 与 `data` 的起点碰巧一致，我自己早先的 hello 探测又都用 `__attribute__((packed))` 的 12 字节结构或只取一个事件），但 `epoll_wait` 一次返回多个事件时，第二个事件起全部错位，glibc/musl 程序读到的是垃圾。②`epoll_ctl`/`epoll_wait` 的错误码与 Linux 不一致，共约 33 项（见 `docs/kernel-subsystems.md` 的 hello186 条）。
+- 问题：①`EpollEvent` 在内核里是 16 字节（`data` 对齐到偏移 8），Linux x86_64 的 `struct epoll_event` 是 packed 的 12 字节（`data` 在偏移 4）；单个事件的 `events` 恰好在同一位置；早先的 hello 探测里 hello157–160/182/105 用 `__attribute__((packed))` 的 12 字节结构，hello89 与 hello112 却用未 packed 的 16 字节结构，它们的 `data` 是“注册时写入、返回时读出”，两侧用同一种错位，所以靠巧合读回了原值（改成 12 字节布局后依然通过，但这两个探测本身用的是错误的 ABI，没有改动）。但 `epoll_wait` 一次返回多个事件时，第二个事件起全部错位，glibc/musl 程序读到的是垃圾。②`epoll_ctl`/`epoll_wait` 的错误码与 Linux 不一致，共约 33 项（见 `docs/kernel-subsystems.md` 的 hello186 条）。
 - 方法：先在宿主机编译运行对照程序取 67 项真实 Linux 返回值（`/tmp/lx`，用完删除），再用同一份表生成 hello186，逐项对照。旧内核约 33 项 FAIL，34 项本来一致。
 - 修复：纯策略放进 `net/epoll_policy.zig`（`ctlPrecheck`、`waitErrno`、`pollable`、`MAX_WAIT_EVENTS`、`EVENT_SIZE`，host 可测）；`net/epoll.zig` 新增 `epfdKind`（epfd 是关闭/非 epoll/epoll）与 `epollWaitFd`，`epollCtl` 的入口先读事件、钉住目标描述符、调 `ctlPrecheck`，再借用实例；`syscall_entry.zig` 的 `epollCtlFd`/`epollWaitFd` 直接转给 `net/epoll.zig`，`maxevents` 以 `i32` 传（以前截成 `u32`，`-1` 变成 4294967295）；删掉不再使用的 `epollFdIndex`。
 - 已知差异：`EPOLLWAKEUP` 没有特殊处理（Linux 对没有 `CAP_BLOCK_SUSPEND` 的进程悄悄清掉）；`EPOLLPRI` 没有任何描述符会报（带外数据仍未实现）；嵌套深度上限（Linux `EP_MAX_NESTS = 4`）没有实现，环检测保留原有的链式检查；`epoll_wait` 对无事件时的缓冲区只做范围检查，和 Linux 一致，但有事件时写入失败仍是 `EFAULT`，Linux 在已经消费了边沿触发事件后才报错，这个差异没有对照。
