@@ -5803,3 +5803,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异（具名测试核对）：监听者族判断写成 IPv4、不检查目的是 `::1`、伪首部源/目的互换、积压判断反向，共 4 个，全部被 `TCP over IPv6 loopback…` 抓住（“去掉积压判断”那个变异第一次因未使用变量编译失败，改成反向判断后抓住）；恢复后 `grep -c MUTATION` 为 0。host 测试是接线形状检查，行为证据来自 hello171。
 - 验证：host 837/837；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（240 s）与 GPT SMP=2 均 hello171 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
 
+### IPv6 回环上 UDP 的 ICMPv6 端口不可达（hello172）
+
+- 问题：hello161 记录的已知差异“IPv6 不回 ICMPv6 不可达”（UDP 部分）。旧内核上 hello172 的 A 段：`poll` 无 `POLLERR`、`recv` 不报 `ECONNREFUSED`、`SO_ERROR` 为 0；B 段下一次发送不失败。
+- 修复：见 `docs/kernel-subsystems.md` 的 hello172 条：`handlePacketV6` 回 ICMPv6 type 1 code 4（仅 `::1`），`icmpv6.handlePacket` 解析引用并通知 UDP 套接字，复用 hello161 的错误传递。
+- 已知差异：非回环 IPv6 目的仍不回不可达；TCP 经 RST 已处理（hello171），其它 ICMPv6 不可达代码（无路由、禁止等）不解析；引用里带扩展头的 UDP 包不识别（只认 `next header = UDP`）。
+- TDD：host 新增 1 个测试（`parseQuoteV6` 的接受与四种拒绝加长度不足、`shouldReplyV6` 的四种组合、发送与分发的接线形状）；hello172（A 已连接套接字的 `POLLERR`/`ECONNREFUSED` 一次/`SO_ERROR` 清零、B 下一次发送失败一次、C 未连接套接字不受影响、D 已绑定目的正常投递且发送方无错误）在旧内核上 4 项 FAIL，新内核 PASS，hello161 仍 PASS。
+- 变异（具名测试核对）：回复规则不要求目的是 `::1`、引用不检查下一头是 UDP、不检查 IP 版本、忽略 code、校验和伪首部不互换、回复 code 写错、ICMPv6 分发被摘掉，共 7 个，全部被 `ICMPv6 port unreachable for UDP over ::1…` 抓住（第一个变异第一次因未使用参数编译失败，改成等价但可编译的形式后抓住）；恢复后 `grep -c MUTATION` 为 0。host 测试的解析与规则部分是行为级断言，发送与分发部分是接线形状检查，端到端证据来自 hello172。
+- 验证：host 838/838；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（240 s）与 GPT SMP=2 均 hello172 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+

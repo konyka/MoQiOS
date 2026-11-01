@@ -298,6 +298,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello169"); /* socket(AF_UNIX, SOCK_SEQPACKET) listen/connect/accept */
     run_test("hello170"); /* process CPU time: threads and waited-for children */
     run_test("hello171"); /* TCP connect to a closed IPv6 loopback port */
+    run_test("hello172"); /* UDP ICMPv6 port unreachable on loopback */
 
     start_persistent_services();
 

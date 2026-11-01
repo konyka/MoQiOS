@@ -47,3 +47,30 @@ pub fn parseQuote(msg: []const u8) ?Quoted {
 pub fn matchesConnected(q: Quoted, local_port: u16, connected: bool, peer_port: u16) bool {
     return connected and q.src_port == local_port and q.dst_port == peer_port;
 }
+
+pub const V6_TYPE_DEST_UNREACH: u8 = 1;
+pub const V6_CODE_PORT_UNREACH: u8 = 4;
+const V6_IP_HEADER_LEN: usize = 40;
+
+/// ICMPv6 destination-unreachable / port-unreachable (RFC 4443 §3.1) quoting
+/// a UDP datagram. `msg` starts at the ICMPv6 header; the invoking IPv6 header
+/// follows the 8-byte ICMPv6 header, then the UDP header.
+pub fn parseQuoteV6(msg: []const u8) ?Quoted {
+    if (msg.len < 8 + V6_IP_HEADER_LEN + 8) return null;
+    if (msg[0] != V6_TYPE_DEST_UNREACH or msg[1] != V6_CODE_PORT_UNREACH) return null;
+    if ((msg[8] >> 4) != 6) return null;
+    if (msg[8 + 6] != 17) return null; // the quoted packet must carry UDP directly
+    const u = 8 + V6_IP_HEADER_LEN;
+    return .{
+        .src_port = std.mem.readInt(u16, msg[u..][0..2], .big),
+        .dst_port = std.mem.readInt(u16, msg[u + 2 ..][0..2], .big),
+    };
+}
+
+/// Whether an IPv6 datagram that found no socket is answered: ::1 to ::1 only
+/// (no neighbour discovery needed, and no reflection of unsolicited traffic
+/// from remote hosts), never when a socket is bound to the port.
+pub fn shouldReplyV6(src_is_loopback: bool, dst_is_loopback: bool, port_bound: bool) bool {
+    return src_is_loopback and dst_is_loopback and !port_bound;
+}
+

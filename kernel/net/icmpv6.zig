@@ -19,6 +19,8 @@ const bo = @import("../lib/byte_order.zig");
 // ── ICMPv6 message types (RFC 4443 + RFC 4861) ─────────────────────────────
 /// RFC 4443 Packet Too Big (SK-97).
 pub const PACKET_TOO_BIG: u8 = 2;
+/// RFC 4443 Destination Unreachable (code 4 = port unreachable).
+pub const DEST_UNREACHABLE: u8 = 1;
 pub const ECHO_REQUEST: u8 = 128;
 pub const ECHO_REPLY: u8 = 129;
 pub const ROUTER_SOLICITATION: u8 = 133;
@@ -104,6 +106,11 @@ pub fn handlePacket(
         NEIGHBOR_ADVERTISEMENT => handleNeighborAdvertisement(src_ip, data, len),
         REDIRECT => handleRedirect(src_ip, data, len),
         PACKET_TOO_BIG => handlePacketTooBig(data, len),
+        DEST_UNREACHABLE => {
+            // Port unreachable for a UDP datagram we sent: tell the connected socket.
+            const q = @import("icmp_unreach_policy.zig").parseQuoteV6(data[0..len]) orelse return;
+            @import("udp.zig").notifyUnreachable(q.src_port, q.dst_port);
+        },
         else => {},
     }
 }

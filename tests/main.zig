@@ -8670,3 +8670,49 @@ test "TCP over IPv6 loopback: a SYN to a port nobody listens on is answered with
     try std.testing.expectEqual(@as(u32, 78), syn.ack);
     try std.testing.expect(syn.with_ack);
 }
+
+test "ICMPv6 port unreachable for UDP over ::1: quote parsing, reply rule and wiring" {
+    const up = kt.icmp_unreach_policy;
+    // ICMPv6 header (8) + invoking IPv6 header (40) + UDP header (8): ports 24890 -> 24899.
+    var msg: [56]u8 = @splat(0);
+    msg[0] = 1; // destination unreachable
+    msg[1] = 4; // port unreachable
+    msg[8] = 0x60; // version 6
+    msg[8 + 6] = 17; // next header UDP
+    msg[48] = 0x61;
+    msg[49] = 0x3a; // 24890
+    msg[50] = 0x61;
+    msg[51] = 0x43; // 24899
+    const q = up.parseQuoteV6(&msg).?;
+    try std.testing.expectEqual(@as(u16, 24890), q.src_port);
+    try std.testing.expectEqual(@as(u16, 24899), q.dst_port);
+    // Wrong type/code, non-UDP quote, wrong IP version and short messages are rejected.
+    var bad = msg;
+    bad[0] = 3;
+    try std.testing.expect(up.parseQuoteV6(&bad) == null);
+    bad = msg;
+    bad[1] = 3;
+    try std.testing.expect(up.parseQuoteV6(&bad) == null);
+    bad = msg;
+    bad[8 + 6] = 6;
+    try std.testing.expect(up.parseQuoteV6(&bad) == null);
+    bad = msg;
+    bad[8] = 0x40;
+    try std.testing.expect(up.parseQuoteV6(&bad) == null);
+    try std.testing.expect(up.parseQuoteV6(msg[0..55]) == null);
+    // The reply is ::1 to ::1 only, and never when the port is bound.
+    try std.testing.expect(up.shouldReplyV6(true, true, false));
+    try std.testing.expect(!up.shouldReplyV6(true, true, true));
+    try std.testing.expect(!up.shouldReplyV6(false, true, false));
+    try std.testing.expect(!up.shouldReplyV6(true, false, false));
+
+    // Wiring: the v6 receive path replies, the checksum covers the reply's own pseudo header, ICMPv6 dispatches to the UDP socket.
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "shouldReplyV6(netif.isLoopbackV6(src_ip), netif.isLoopbackV6(dst_ip), bound)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "icmpv6.checksum(dst_ip, src_ip, pkt[icmp_off..].ptr, icmp_len)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "pkt[icmp_off] = 1;\n    pkt[icmp_off + 1] = 4;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + icmp_len);\n    _ = lo.sendPacket(&pkt, frame_len);") != null);
+    const v6src = kt.icmpv6_source;
+    try std.testing.expect(std.mem.indexOf(u8, v6src, "DEST_UNREACHABLE => {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v6src, "@import(\"udp.zig\").notifyUnreachable(q.src_port, q.dst_port);") != null);
+}

@@ -346,7 +346,31 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
 
     const actual_payload = @min(hdr.payload_len, @as(u16, MAX_UDP_PAYLOAD_V6));
     if (8 + actual_payload > len) return;
+    const bound = portBound(hdr.dst_port);
     enqueue(hdr.dst_port, src_ip, hdr.src_port, hdr.dst_port, data[8..][0..actual_payload], true);
+    if (@import("icmp_unreach_policy.zig").shouldReplyV6(netif.isLoopbackV6(src_ip), netif.isLoopbackV6(dst_ip), bound)) {
+        sendPortUnreachableV6(src_ip, dst_ip, data, hdr.udp_len);
+    }
+}
+
+/// ICMPv6 port unreachable (type 1 code 4) for a ::1 datagram nobody receives:
+/// carries the offending IPv6 header and the first 8 bytes of the UDP header.
+fn sendPortUnreachableV6(src_ip: [16]u8, dst_ip: [16]u8, udp: [*]const u8, udp_len: u16) void {
+    var pkt: [160]u8 = @splat(0);
+    const icmp_off: u16 = 14 + ipv6.HEADER_LEN;
+    const quote_udp: u16 = @min(udp_len, 8);
+    // ICMPv6: type, code, checksum, 4 unused bytes, then the invoking packet.
+    pkt[icmp_off] = 1;
+    pkt[icmp_off + 1] = 4;
+    ipv6.buildHeader(pkt[icmp_off + 8 ..].ptr, src_ip, dst_ip, ipv6.PROTO_UDP, udp_len);
+    @memcpy(pkt[icmp_off + 8 + ipv6.HEADER_LEN ..][0..quote_udp], udp[0..quote_udp]);
+    const icmp_len: u16 = 8 + ipv6.HEADER_LEN + quote_udp;
+    // The reply travels from the destination back to the sender (both ::1).
+    bo.writeU16BeAt(&pkt, icmp_off + 2, icmpv6.checksum(dst_ip, src_ip, pkt[icmp_off..].ptr, icmp_len));
+    ipv6.buildHeader(pkt[14..].ptr, dst_ip, src_ip, ipv6.PROTO_ICMPV6, icmp_len);
+    const mac = netif.getMac();
+    const frame_len = eth.buildFrame(&pkt, mac, mac, eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + icmp_len);
+    _ = lo.sendPacket(&pkt, frame_len);
 }
 
 pub fn recvFrom(port: u16, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, out_src_port: *u16) i64 {
