@@ -67,7 +67,7 @@ static inline int64_t syscall6(uint64_t n, uint64_t a, uint64_t b, uint64_t c,
 struct epoll_event {
     uint32_t events;
     uint64_t data;
-};
+} __attribute__((packed));
 
 struct sigaction_raw {
     uint64_t handler;

@@ -299,7 +299,7 @@ void _start(void) {
         int32_t pfd[2] = { -1, -1 };
         int64_t ep = syscall1(SYS_EPOLL_CREATE1, 0);
         check(syscall1(SYS_PIPE, (uint64_t)pfd) == 0 && ep >= 0, "J: pipe + epoll_create1");
-        struct { uint32_t events; uint64_t data; } ev = { 1 /* EPOLLIN */, 77 }, out = { 0, 0 };
+        struct { uint32_t events; uint64_t data; } __attribute__((packed)) ev = { 1 /* EPOLLIN */, 77 }, out = { 0, 0 };
         check(syscall4_(SYS_EPOLL_CTL, (uint64_t)ep, 1 /* ADD */, (uint64_t)pfd[0], (uint64_t)&ev) == 0, "J: register pipe read end");
         int64_t c = syscall1(SYS_FORK, 0);
         if (c == 0) {
