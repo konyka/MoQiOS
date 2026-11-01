@@ -8594,3 +8594,58 @@ test "socket(AF_UNIX, SOCK_SEQPACKET): type matrix and the listen/connect/accept
     try std.testing.expect(std.mem.indexOf(u8, src, "if (connectionOriented(sock.sock_type)) {\n        if (!sock.connected or !peer.connected or peer.peer_idx != @as(u8, @intCast(idx))) return null;") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "if (connectionOriented(sock.sock_type)) {\n        if (shut_rd) sock.shut_rd = true;") != null);
 }
+
+test "cpu_time_policy: process totals, reclaimed threads and waited-for children" {
+    const ct = kt.cpu_time_policy;
+    // Two members: one stopped, one running a slice (user mode, 1000 ticks at 1000 MHz-equivalent = 1 us/tick-mhz).
+    var total: ct.Times = .{};
+    total = ct.addMember(total, .{ .user_us = 100, .sys_us = 10, .running = false, .is_user = true, .sched_in_tsc = 0 }, 5000, 1000);
+    total = ct.addMember(total, .{ .user_us = 200, .sys_us = 20, .running = true, .is_user = true, .sched_in_tsc = 2000 }, 5000, 1000);
+    try std.testing.expectEqual(@as(u64, 100 + 200 + 3), total.user_us); // 3000 tsc / 1000 mhz = 3 us in flight
+    try std.testing.expectEqual(@as(u64, 30), total.sys_us);
+    // A running kernel-mode task charges its slice to system time.
+    const k = ct.addMember(.{}, .{ .user_us = 0, .sys_us = 0, .running = true, .is_user = false, .sched_in_tsc = 1000 }, 5000, 1000);
+    try std.testing.expectEqual(@as(u64, 4), k.sys_us);
+    try std.testing.expectEqual(@as(u64, 0), k.user_us);
+    // A reclaimed thread's time moves to the leader.
+    const dead = ct.foldDeadThread(.{ .user_us = 5, .sys_us = 6 }, 250_000, 1_000);
+    try std.testing.expectEqual(@as(u64, 250_005), dead.user_us);
+    try std.testing.expectEqual(@as(u64, 1_006), dead.sys_us);
+    // wait4 reports the child's group plus the children it had waited for; the waiter inherits that.
+    const usage = ct.reapedUsage(.{ .user_us = 100, .sys_us = 10, .child_user_us = 40, .child_sys_us = 4 });
+    try std.testing.expectEqual(@as(u64, 140), usage.user_us);
+    try std.testing.expectEqual(@as(u64, 14), usage.sys_us);
+    const waiter = ct.inheritFromChild(.{ .child_user_us = 1, .child_sys_us = 2 }, usage);
+    try std.testing.expectEqual(@as(u64, 141), waiter.child_user_us);
+    try std.testing.expectEqual(@as(u64, 16), waiter.child_sys_us);
+    // Saturating, never wrapping.
+    const sat = ct.foldDeadThread(.{ .user_us = std.math.maxInt(u64) }, 1, 0);
+    try std.testing.expectEqual(std.math.maxInt(u64), sat.user_us);
+}
+
+test "process CPU time wiring: reap folds children and threads, readers use the group totals" {
+    const task_src = kt.task_source;
+    // A reclaimed thread's time is folded into its leader before its slot is freed or detached.
+    try std.testing.expect(std.mem.indexOf(u8, task_src, "fn freeSlotLocked(i: u32, t: *Task) void {\n    foldThreadTimeLocked(i, t);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, task_src, "fn detachLocked(i: u32, t: *Task, waiter: u32) void {\n    foldThreadTimeLocked(i, t);") != null);
+    // Reaping a child adds its usage to the waiter's group leader.
+    try std.testing.expect(std.mem.indexOf(u8, task_src, "const inherited = cpu_time_policy.inheritFromChild(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, task_src, "tasks[li].child_utime_us = inherited.child_user_us;") != null);
+    // An exiting task folds its running slice before it becomes a zombie.
+    try std.testing.expect(std.mem.indexOf(u8, task_src, "if (t.is_user) t.utime_us +|= slice else t.stime_us +|= slice;\n        t.sched_in_tsc = 0;") != null);
+    // Members count by group: threads by parent_tid, the leader by tid.
+    try std.testing.expect(std.mem.indexOf(u8, task_src, "const in_group = if (m.is_thread) m.parent_tid == gid else m.tid == gid;") != null);
+
+    const wp = kt.waitpid_source;
+    // Every reap path reports the usage, including the blocking one.
+    try std.testing.expect(std.mem.indexOf(u8, wp, "if (usage_out) |u| u.* = reaped.usage;") != null);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, wp, "task_mod.waitpid(cur_idx, pid, &exit_code, usage_out)"));
+
+    const sc = kt.syscall_entry_source;
+    // wait4 fills the rusage only when a child was reaped; RUSAGE_SELF/CHILDREN use the process totals.
+    try std.testing.expect(std.mem.indexOf(u8, sc, "if (rusage_ptr != 0 and rc > 0) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sc, "if (who != .thread) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sc, "user_us = pt.child_user_us;") != null);
+    const ts = kt.time_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!thread) return task_mod.processCpuTimes(idx, tsc.read(), tsc.tsc_freq_mhz).selfUs() *| 1000;") != null);
+}

@@ -5783,3 +5783,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 新增 1 个测试（`socketArgs` 的类型矩阵：AF_UNIX 放行 5、AF_INET/INET6 拒绝 5、协议非 0 拒绝、4 与 6 仍无效、RAW 仍拒绝；`unix_socket.zig` 里 listen/accept/connect/pending/半关闭各处的确切表达式）；hello169（A 创建、`SO_TYPE`、AF_INET 仍被拒；B listen/accept 的前置条件与 `ECONNREFUSED`；C 流客户端连 seqpacket 监听者 `EPROTOTYPE`；D 子进程 connect 后立即发送、服务端 accept 后记录整条到达、双向、`MSG_TRUNC`、对端关闭后 EOF）在旧内核上 A 段 `socket()` 失败，新内核 PASS。
 - 变异（具名测试核对）：AF_INET 接受 seqpacket、去掉 `EPROTOTYPE`、accept 总建流套接字、listen 只允许流、pending 余量判断漏掉长度前缀、shutdown 只处理流、accept 只接受排队的流连接者，共 7 个，全部被 `socket(AF_UNIX, SOCK_SEQPACKET): type matrix and the listen/connect/accept paths` 抓住；恢复后 `grep -c MUTATION` 为 0。注意这个 host 测试是“表达式形状”检查，行为层面的证据来自 hello169。
 - 验证：host 834/834；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（240 s）与 GPT SMP=2 均 hello169 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+
+### 进程 CPU 时间覆盖所有线程与已回收的子进程（hello170）
+
+- 问题：此前记录的已知限制“进程 CPU 时钟只统计调用任务”。实测更宽：`getrusage(RUSAGE_SELF)`、`CLOCK_PROCESS_CPUTIME_ID` 只含调用线程（线程自旋 250 ms，进程时钟只涨 3–4 ms）；`RUSAGE_CHILDREN` 恒为 0；`wait4` 的 `rusage` 被清零；退出任务最后一个时间片的 CPU 时间丢失（`exitTask` 先置僵尸，切出统计见到非运行状态/`sched_in_tsc` 后跳过）。
+- 修复：见 `docs/kernel-subsystems.md` 的 hello170 条：`cpu_time_policy.zig`（汇总、折算已回收线程、`reapedUsage/inheritFromChild`）；`task.zig` 的 `groupTimesLocked/processCpuTimes/foldThreadTimeLocked`；`waitpidScanLocked` 回收时累加到等待者；`wait4` 填 `rusage`；`exitTask` 折算最后时间片。
+- 排查过程（如实）：第一版只做了汇总和回收折算，hello170 D 段仍只涨 3–4 ms；在线程里打印 `RUSAGE_THREAD` 与进程时钟得到 249 ms 与 404 ms，说明读取没问题、是线程退出后那个槽的时间没算进去——因为僵尸线程仍是 CPU 的当前任务，切出统计对它不再累计，最后一个时间片丢了。这就是 `exitTask` 折算那一处。
+- 已知差异：`RUSAGE_CHILDREN` 只含 **wait 过** 的子进程（与 Linux 一致）；`ru_maxrss`、缺页、上下文切换计数等其他 `rusage` 字段 `wait4` 仍为 0；`times(2)` 系统调用本内核没有；以 SIGCHLD 忽略自动回收的子进程（`parent_ignores_sigchld`）其时间不计入父进程（Linux 同样不计入）；线程时间在组长先退出且槽被回收后不再有地方可并（极少见，时间丢失而不是重复）。
+- TDD：host 新增 2 个测试（汇总规则：运行中成员的当前时间片按用户/内核态归属、回收线程折算、`reapedUsage` 含孙进程、饱和不回绕；接线：回收/分离前折算线程、回收子进程累加到等待者、退出折算最后时间片、成员按组判定、三条回收路径都带出 usage、`wait4` 仅在真回收时填 rusage、`RUSAGE_SELF/CHILDREN` 与 `CLOCK_PROCESS_CPUTIME_ID` 走进程总量）；hello170（A 子进程回收前后 `RUSAGE_CHILDREN`、`wait4` 的 rusage 与之吻合、`RUSAGE_SELF` 不含子进程；B 孙进程时间沿链上传；C `wait4` 的 NULL rusage；D 线程自旋后进程时钟与 `RUSAGE_SELF` 涨 ≥180 ms 而线程时钟/`RUSAGE_THREAD` 不含他人；E 线程槽回收后时间不丢）在旧内核上 8 项 FAIL，新内核 PASS，hello102 仍 PASS。
+- 变异（具名测试核对）：当前时间片记到错误的态、`reapedUsage` 漏掉孙进程的系统时间、`inheritFromChild` 覆盖而非累加、释放槽前不折算线程、退出时不清 `sched_in_tsc`、成员不按线程组判定、wait4 在失败时也写 rusage、`RUSAGE_CHILDREN` 误报自身、阻塞回收路径丢 usage、进程时钟反向判断（`!thread` 改 `thread`），共 10 个，全部被 `cpu_time_policy…` 或 `process CPU time wiring…` 抓住（最后一个第一次因去掉 `if (false)` 后的未用变量编译失败，改成反向判断后抓住）；恢复后 `grep -c MUTATION` 为 0。这些 host 测试是规则与表达式形状检查，行为证据来自 hello170。
+- 验证：host 836/836；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（240 s）与 GPT SMP=2 均 hello170 与 hello102 PASS、0 FAIL；stress（SMP=2）5/5 PASS。
+

@@ -5,6 +5,7 @@ const copy = @import("../mm/copy_from_user.zig");
 const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const se = @import("../arch/arch.zig").syscall;
+const cpu_time_policy = @import("cpu_time_policy.zig");
 
 /// waitpid(pid, status_ptr) -> child tid or -errno.
 /// pid: -1 (any child) or >0 (specific child).
@@ -15,6 +16,11 @@ pub fn waitpid(pid_raw: u64, status_ptr: u64) i64 {
 /// waitpidWithOptions — core implementation with WNOHANG support.
 /// options: bit 0 = WNOHANG (return 0 immediately if no zombie child)
 pub fn waitpidWithOptions(pid_raw: u64, status_ptr: u64, options: u32) i64 {
+    return waitpidUsage(pid_raw, status_ptr, options, null);
+}
+
+/// waitpidWithOptions that also reports the reaped child's CPU time (wait4's rusage).
+pub fn waitpidUsage(pid_raw: u64, status_ptr: u64, options: u32, usage_out: ?*cpu_time_policy.Usage) i64 {
     const pid: i32 = if (pid_raw == @as(u64, @bitCast(@as(i64, -1))))
         @as(i32, -1)
     else if (pid_raw > 0x7FFFFFFF)
@@ -30,7 +36,7 @@ pub fn waitpidWithOptions(pid_raw: u64, status_ptr: u64, options: u32) i64 {
     if (!task_mod.hasMatchingChild(cur_idx, pid)) return -10; // -ECHILD: nothing waitpid(pid) could select
 
     var exit_code: i32 = 0;
-    if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {
+    if (task_mod.waitpid(cur_idx, pid, &exit_code, usage_out)) |child_tid| {
         if (!writeStatus(status_ptr, exit_code)) return -14;
         return child_tid;
     }
@@ -66,6 +72,7 @@ pub fn waitpidWithOptions(pid_raw: u64, status_ptr: u64, options: u32) i64 {
                 parent.waiting_for_child = false;
                 task_mod.unlockTask(tflags);
                 task_mod.finishReap(reaped);
+                if (usage_out) |u| u.* = reaped.usage;
                 if (!writeStatus(status_ptr, exit_code)) return -14;
                 return reaped.tid;
             },
@@ -74,7 +81,7 @@ pub fn waitpidWithOptions(pid_raw: u64, status_ptr: u64, options: u32) i64 {
                 // ran already), so never block: spin-reap outside the lock.
                 parent.waiting_for_child = false;
                 task_mod.unlockTask(tflags);
-                if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {
+                if (task_mod.waitpid(cur_idx, pid, &exit_code, usage_out)) |child_tid| {
                     if (!writeStatus(status_ptr, exit_code)) return -14;
                     return child_tid;
                 }
@@ -120,7 +127,7 @@ pub fn waitpidWithOptions(pid_raw: u64, status_ptr: u64, options: u32) i64 {
         // Woken up — a child may have exited. Reap first: a pending signal
         // only aborts the wait when no child status is available, so an
         // EINTR'd (or killed) waitpid never consumes the child's exit status.
-        if (task_mod.waitpid(cur_idx, pid, &exit_code)) |child_tid| {
+        if (task_mod.waitpid(cur_idx, pid, &exit_code, usage_out)) |child_tid| {
             if (!writeStatus(status_ptr, exit_code)) return -14;
             return child_tid;
         }

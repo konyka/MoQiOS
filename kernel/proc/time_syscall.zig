@@ -83,12 +83,12 @@ pub fn clock_gettime(clockid: u64, tp_ptr: u64) i64 {
 /// keeps per-task accounting, so a process is its main task plus nothing more
 /// that we can attribute here; the calling task's time is the honest answer).
 fn cpuTimeNs(thread: bool) u64 {
-    _ = thread;
     const sched = @import("sched.zig");
     const task_mod = @import("task.zig");
     const rusage_policy = @import("rusage_policy.zig");
     const idx = sched.currentTaskIndex() orelse return 0;
     const t = task_mod.getTask(idx) orelse return 0;
+    if (!thread) return task_mod.processCpuTimes(idx, tsc.read(), tsc.tsc_freq_mhz).selfUs() *| 1000;
     const in_flight = rusage_policy.runtimeUs(0, t.sched_in_tsc, tsc.read(), tsc.tsc_freq_mhz);
     return (t.utime_us +| t.stime_us +| in_flight) *| 1000;
 }

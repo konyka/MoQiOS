@@ -26,6 +26,7 @@ const Mm = @import("../mm/mm.zig").Mm;
 const task_slot_lifetime = @import("task_slot_lifetime.zig");
 const reap_policy = @import("reap_policy.zig");
 const reaper = @import("reaper.zig");
+const cpu_time_policy = @import("cpu_time_policy.zig");
 
 const PAGE_SIZE: u64 = 4096;
 const KERNEL_STACK_PAGES: u64 = 32;
@@ -294,6 +295,12 @@ pub const Task = struct {
     utime_us: u64 = 0,
     /// CPU time consumed in user mode (microseconds, approximated).
     stime_us: u64 = 0,
+    /// Thread-group leader only: CPU time of threads that were reclaimed, and of
+    /// the children this process waited for (getrusage(RUSAGE_CHILDREN)).
+    dead_utime_us: u64 = 0,
+    dead_stime_us: u64 = 0,
+    child_utime_us: u64 = 0,
+    child_stime_us: u64 = 0,
     /// Last TSC value when this task was scheduled in (for CPU time accounting).
     sched_in_tsc: u64 = 0,
     /// Number of voluntary context switches.
@@ -1193,6 +1200,15 @@ pub fn exitTask(exit_code: i32) void {
     @import("../ipc/posix_mq.zig").closeRefsForTask(idx);
     @import("../ipc/ipc.zig").clearEndpointsForTask(idx);
 
+    // A zombie stays current on its CPU until the next tick switches away, and
+    // is no longer "running": fold the slice it ran so far into its CPU time now
+    // (the switch-out accounting skips a task whose sched_in_tsc is 0).
+    {
+        const tsc_mod = @import("../arch/arch.zig").tsc;
+        const slice = @import("rusage_policy.zig").runtimeUs(0, t.sched_in_tsc, tsc_mod.read(), tsc_mod.tsc_freq_mhz);
+        if (t.is_user) t.utime_us +|= slice else t.stime_us +|= slice;
+        t.sched_in_tsc = 0;
+    }
     const flags = task_lock.acquire();
     t.exit_code = exit_code;
     sched_claim.store(&t.state, .zombie);
@@ -1391,7 +1407,70 @@ fn teardownResources(t: *Task) void {
     freeKernelStack(t.kernel_stack);
 }
 
+/// The live, non-thread task whose tid is `gid` (task_lock held), other than slot `skip`.
+fn groupLeaderLocked(gid: u32, skip: u32) ?u32 {
+    var bits = slot_bitmap;
+    while (bits != 0) {
+        const j: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        if (j != skip and tasks[j].tid == gid and !tasks[j].is_thread) return j;
+    }
+    return null;
+}
+
+/// CPU time of the thread group `gid` (task_lock held): every live member,
+/// the time of reclaimed threads, and the children the leader waited for.
+fn groupTimesLocked(gid: u32, now_tsc: u64, tsc_mhz: u64) cpu_time_policy.Times {
+    var total: cpu_time_policy.Times = .{};
+    var bits = slot_bitmap;
+    while (bits != 0) {
+        const j: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const m = &tasks[j];
+        const in_group = if (m.is_thread) m.parent_tid == gid else m.tid == gid;
+        if (!in_group) continue;
+        total = cpu_time_policy.addMember(total, .{
+            .user_us = m.utime_us,
+            .sys_us = m.stime_us,
+            .running = sched_claim.load(&m.state) == .running,
+            .is_user = m.is_user,
+            .sched_in_tsc = m.sched_in_tsc,
+        }, now_tsc, tsc_mhz);
+        if (!m.is_thread) {
+            total.user_us +|= m.dead_utime_us;
+            total.sys_us +|= m.dead_stime_us;
+            total.child_user_us = m.child_utime_us;
+            total.child_sys_us = m.child_stime_us;
+        }
+    }
+    return total;
+}
+
+/// CPU time of the calling task's whole process (all threads, reclaimed
+/// threads included) and of the children it has waited for.
+pub fn processCpuTimes(cur_idx: u32, now_tsc: u64, tsc_mhz: u64) cpu_time_policy.Times {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    const t = getTask(cur_idx) orelse return .{};
+    const gid = if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid;
+    return groupTimesLocked(gid, now_tsc, tsc_mhz);
+}
+
+/// A thread is being reclaimed: its CPU time moves to the group leader, and
+/// the slot's own counters are cleared so a second call adds nothing.
+fn foldThreadTimeLocked(i: u32, t: *Task) void {
+    if (!t.is_thread or t.parent_tid == 0) return;
+    if (groupLeaderLocked(t.parent_tid, i)) |li| {
+        const dead = cpu_time_policy.foldDeadThread(.{ .user_us = tasks[li].dead_utime_us, .sys_us = tasks[li].dead_stime_us }, t.utime_us, t.stime_us);
+        tasks[li].dead_utime_us = dead.user_us;
+        tasks[li].dead_stime_us = dead.sys_us;
+        t.utime_us = 0;
+        t.stime_us = 0;
+    }
+}
+
 fn freeSlotLocked(i: u32, t: *Task) void {
+    foldThreadTimeLocked(i, t);
     slot_bitmap &= ~(@as(u64, 1) << @intCast(i));
     task_count -= 1;
     uidTaskCountRemoveLocked(t.uid);
@@ -1449,6 +1528,7 @@ pub fn abortUnpublishedChild(slot: u32) bool {
 /// the parent makes the slot invisible to waitpid / hasChildren scans while
 /// the teardown is in flight.
 fn detachLocked(i: u32, t: *Task, waiter: u32) void {
+    foldThreadTimeLocked(i, t);
     t.reap_pending = true;
     t.parent_tid = 0;
     const waiter_token: reap_policy.WaiterToken = if (waiter != reap_policy.NO_WAITER) blk: {
@@ -1843,6 +1923,8 @@ pub const Reaped = struct {
     slot: u32,
     /// Teardown handed to the reaper thread.
     deferred: bool,
+    /// CPU time of the reaped child's process, including children it waited for.
+    usage: cpu_time_policy.Usage = .{},
 };
 
 /// Expose task_lock for waitpid's atomic block protocol: the waiter must hold
@@ -1890,13 +1972,22 @@ pub fn waitpidScanLocked(parent_idx: u32, pid: i32, status: *i32) WaitScan {
         const wsp = @import("wait_status_policy.zig");
         status.* = wsp.encode(wsp.fromInternal(t.exit_code, t.exited_via_syscall));
         const child_tid = t.tid;
+        // The child's CPU time (its threads and the children it waited for)
+        // becomes part of the waiter's RUSAGE_CHILDREN.
+        const usage = cpu_time_policy.reapedUsage(groupTimesLocked(child_tid, @import("../arch/arch.zig").tsc.read(), @import("../arch/arch.zig").tsc.tsc_freq_mhz));
+        const waiter_gid = if (parent.is_thread and parent.parent_tid != 0) parent.parent_tid else parent.tid;
+        if (groupLeaderLocked(waiter_gid, MAX_TASKS)) |li| {
+            const inherited = cpu_time_policy.inheritFromChild(.{ .child_user_us = tasks[li].child_utime_us, .child_sys_us = tasks[li].child_stime_us }, usage);
+            tasks[li].child_utime_us = inherited.child_user_us;
+            tasks[li].child_stime_us = inherited.child_sys_us;
+        }
         if (reaper.isActive()) {
             detachLocked(i, t, parent_idx);
-            return .{ .reaped = .{ .tid = child_tid, .slot = i, .deferred = true } };
+            return .{ .reaped = .{ .tid = child_tid, .slot = i, .deferred = true, .usage = usage } };
         }
         teardownResources(t);
         freeSlotLocked(i, t);
-        return .{ .reaped = .{ .tid = child_tid, .slot = i, .deferred = false } };
+        return .{ .reaped = .{ .tid = child_tid, .slot = i, .deferred = false, .usage = usage } };
     }
     return if (busy_child) .busy else .none;
 }
@@ -1911,7 +2002,7 @@ pub fn finishReap(r: Reaped) void {
 /// Wait for a child process to exit. Returns the child's TID, or null if no
 /// child has exited yet (WNOHANG behavior). Writes the exit code to *status.
 /// pid == -1 means wait for any child; pid > 0 means wait for specific child.
-pub fn waitpid(parent_idx: u32, pid: i32, status: *i32) ?u32 {
+pub fn waitpid(parent_idx: u32, pid: i32, status: *i32, usage_out: ?*cpu_time_policy.Usage) ?u32 {
     // Retry loop: a zombie child may still be "current" on another CPU for up
     // to one timer tick after exit. Reaping in that window frees a kstack the
     // owner CPU is still executing on, so wait (lock released) until it has
@@ -1924,6 +2015,7 @@ pub fn waitpid(parent_idx: u32, pid: i32, status: *i32) ?u32 {
         switch (r) {
             .reaped => |reaped| {
                 finishReap(reaped);
+                if (usage_out) |u| u.* = reaped.usage;
                 return reaped.tid;
             },
             .none => return null,

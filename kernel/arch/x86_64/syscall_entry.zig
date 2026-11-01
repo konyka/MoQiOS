@@ -4433,13 +4433,22 @@ const uts = @import("../../proc/uts.zig");
 fn syscallWait4(pid: u64, status_ptr: u64, options: u32, rusage_ptr: u64) i64 {
     const copy = @import("../../mm/copy_from_user.zig");
     if (rusage_ptr != 0 and !copy.validateUserBufferWritable(rusage_ptr, 144)) return -14;
-    // Zero rusage if provided
-    if (rusage_ptr != 0) {
-        var zero_buf: [144]u8 = .{0} ** 144; // struct rusage is ~144 bytes
-        if (copy.copyToUser(@ptrFromInt(rusage_ptr), &zero_buf, 144) != 144) return -14;
+    var usage: @import("../../proc/cpu_time_policy.zig").Usage = .{};
+    const rc = waitpid_mod.waitpidUsage(pid, status_ptr, options, &usage);
+    // The rusage buffer is only filled when a child was actually reaped.
+    if (rusage_ptr != 0 and rc > 0) {
+        const rusage_policy = @import("../../proc/rusage_policy.zig");
+        const bo = @import("../../lib/byte_order.zig");
+        var buf: [144]u8 = @splat(0);
+        const user = rusage_policy.timeval(usage.user_us);
+        const sys = rusage_policy.timeval(usage.sys_us);
+        bo.writeU64Le(buf[0..8], user.sec);
+        bo.writeU64Le(buf[8..16], user.usec);
+        bo.writeU64Le(buf[16..24], sys.sec);
+        bo.writeU64Le(buf[24..32], sys.usec);
+        if (copy.copyToUser(@ptrFromInt(rusage_ptr), &buf, 144) != 144) return -14;
     }
-
-    return waitpid_mod.waitpidWithOptions(pid, status_ptr, options);
+    return rc;
 }
 
 /// #264 sethostname(name, len)
@@ -6092,12 +6101,6 @@ fn syscallGetrusage(who_raw: u64, usage_ptr: u64) i64 {
     // struct rusage: ru_utime(16) + ru_stime(16) + rest zeroed
     var buf: [144]u8 = @splat(0);
 
-    // Children are not accumulated into their parent yet: report zero usage
-    // rather than inventing numbers.
-    if (who == .children) {
-        return if (copy.copyToUser(@ptrFromInt(usage_ptr), &buf, 144) == 144) 0 else -14;
-    }
-
     const cur_idx = sched.currentTaskIndex() orelse {
         return if (copy.copyToUser(@ptrFromInt(usage_ptr), &buf, 144) == 144) 0 else -14;
     };
@@ -6108,8 +6111,22 @@ fn syscallGetrusage(who_raw: u64, usage_ptr: u64) i64 {
     // Context-switch accounting folds each slice into utime/stime by
     // privilege class; add the slice this task is running right now.
     const in_flight = rusage_policy.runtimeUs(0, cur.sched_in_tsc, tsc.read(), tsc.tsc_freq_mhz);
-    const user = rusage_policy.timeval(if (cur.is_user) cur.utime_us +| in_flight else cur.utime_us);
-    const sys = rusage_policy.timeval(if (cur.is_user) cur.stime_us else cur.stime_us +| in_flight);
+    var user_us: u64 = if (cur.is_user) cur.utime_us +| in_flight else cur.utime_us;
+    var sys_us: u64 = if (cur.is_user) cur.stime_us else cur.stime_us +| in_flight;
+    if (who != .thread) {
+        // RUSAGE_SELF / RUSAGE_CHILDREN are process-wide: every thread, and
+        // the children this process has waited for.
+        const pt = tm.processCpuTimes(cur_idx, tsc.read(), tsc.tsc_freq_mhz);
+        if (who == .children) {
+            user_us = pt.child_user_us;
+            sys_us = pt.child_sys_us;
+        } else {
+            user_us = pt.user_us;
+            sys_us = pt.sys_us;
+        }
+    }
+    const user = rusage_policy.timeval(user_us);
+    const sys = rusage_policy.timeval(sys_us);
     bo.writeU64Le(buf[0..8], user.sec);
     bo.writeU64Le(buf[8..16], user.usec);
     bo.writeU64Le(buf[16..24], sys.sec);
