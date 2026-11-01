@@ -70,6 +70,7 @@ pub const shared_mapping_policy = @import("mm/shared_mapping_policy.zig");
 pub const pte_kind = @import("mm/pte_kind.zig");
 pub const munmap_policy = @import("mm/munmap_policy.zig");
 pub const range_policy = @import("mm/range_policy.zig");
+pub const itimer_policy = @import("proc/itimer_policy.zig");
 pub const process_vm_policy = @import("mm/process_vm_policy.zig");
 pub const mm = @import("mm/mm.zig");
 pub const vm_lock_policy = @import("mm/vm_lock_policy.zig");

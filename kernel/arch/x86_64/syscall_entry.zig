@@ -3024,6 +3024,7 @@ fn withTemporaryEpollMask(fd: u32, events: u64, max_events: i32, timeout: i32, m
 }
 
 // Module imports for extracted syscall implementations
+const itimer_policy = @import("../../proc/itimer_policy.zig");
 const waitpid_mod = @import("../../proc/waitpid.zig");
 const brk_mod = @import("../../mm/brk.zig");
 const mmap_mod = @import("../../mm/mmap.zig");
@@ -6197,7 +6198,7 @@ fn syscallAlarm(seconds: u32) i64 {
         // v53.47: Atomic RMW — alarm_bm is read by BSP timerTick on another CPU
         _ = @atomicRmw(u64, &sched.alarm_bm, .And, ~(@as(u64, 1) << @intCast(cur_idx)), .seq_cst);
     } else {
-        @atomicStore(u64, &cur.alarm_deadline, now_ns + @as(u64, seconds) * 1_000_000_000, .monotonic);
+        @atomicStore(u64, &cur.alarm_deadline, itimer_policy.deadlineNs(now_ns, itimer_policy.alarmNs(seconds)), .monotonic);
         _ = @atomicRmw(u64, &sched.alarm_bm, .Or, @as(u64, 1) << @intCast(cur_idx), .seq_cst);
         // SIGALRM will be delivered by BSP timer tick when deadline expires
     }
@@ -6209,7 +6210,8 @@ fn syscallAlarm(seconds: u32) i64 {
 /// which: 0=ITIMER_REAL, 1=ITIMER_VIRTUAL, 2=ITIMER_PROF.
 /// Fills struct itimerval (32 bytes): it_interval(tv_sec,tv_usec) + it_value(tv_sec,tv_usec).
 fn syscallGetitimer(which: u32, curr_value_ptr: u64) i64 {
-    if (curr_value_ptr == 0 or curr_value_ptr >= 0x0000_8000_0000_0000) return -22;
+    if (!itimer_policy.whichValid(which)) return -22;
+    if (curr_value_ptr == 0 or curr_value_ptr >= 0x0000_8000_0000_0000) return -14;
     const copy = @import("../../mm/copy_from_user.zig");
     const tsc = @import("tsc.zig");
     const sched = @import("../../proc/sched.zig");
@@ -6250,40 +6252,41 @@ fn syscallGetitimer(which: u32, curr_value_ptr: u64) i64 {
 /// setitimer(which, new_value, old_value) — set interval timer.
 /// which: 0=ITIMER_REAL, 1=ITIMER_VIRTUAL, 2=ITIMER_PROF.
 fn syscallSetitimer(which: u32, new_value_ptr: u64, old_value_ptr: u64) i64 {
-    if (new_value_ptr == 0 or new_value_ptr >= 0x0000_8000_0000_0000) return -22;
     const copy = @import("../../mm/copy_from_user.zig");
     const tsc = @import("tsc.zig");
     const sched = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
+    const bo = @import("../../lib/byte_order.zig");
 
-    // Read old value first if requested
-    if (old_value_ptr != 0 and old_value_ptr < 0x0000_8000_0000_0000) {
-        _ = syscallGetitimer(which, old_value_ptr);
+    // Linux order: read and validate the new value (EFAULT, EINVAL), then the timer number (EINVAL), then
+    // write the old value out (EFAULT). A NULL new value is treated as all zeros (disarm).
+    var buf: [32]u8 = @splat(0);
+    if (new_value_ptr != 0) {
+        if (copy.copyFromUser(&buf, @ptrFromInt(new_value_ptr), 32) < 32) return -14;
     }
+    const interval: itimer_policy.Timeval = .{ .sec = @bitCast(bo.readU64Le(buf[0..8])), .usec = @bitCast(bo.readU64Le(buf[8..16])) };
+    const value: itimer_policy.Timeval = .{ .sec = @bitCast(bo.readU64Le(buf[16..24])), .usec = @bitCast(bo.readU64Le(buf[24..32])) };
+    if (!itimer_policy.timevalValid(interval) or !itimer_policy.timevalValid(value)) return -22;
+    if (!itimer_policy.whichValid(which)) return -22;
 
-    // Read new value
-    var buf: [32]u8 = undefined;
-    if (copy.copyFromUser(&buf, @ptrFromInt(new_value_ptr), 32) < 32) return -14;
+    if (old_value_ptr != 0) {
+        const rc = syscallGetitimer(which, old_value_ptr);
+        if (rc != 0) return rc;
+    }
 
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = tm.getTask(cur_idx) orelse return -1;
 
-    if (which == 0) {
-        // ITIMER_REAL
-        const int_sec: u64 = @bitCast(buf[0..8].*);
-        const int_usec: u64 = @bitCast(buf[8..16].*);
-        const val_sec: u64 = @bitCast(buf[16..24].*);
-        const val_usec: u64 = @bitCast(buf[24..32].*);
-
-        cur.itimer_real_interval = int_sec * 1_000_000_000 + int_usec * 1000;
-        const val_ns = val_sec * 1_000_000_000 + val_usec * 1000;
+    if (which == itimer_policy.ITIMER_REAL) {
+        cur.itimer_real_interval = itimer_policy.timevalNs(interval);
+        const val_ns = itimer_policy.timevalNs(value);
 
         if (val_ns == 0) {
             @atomicStore(u64, &cur.itimer_real_value, 0, .monotonic); // Disarm
             // v53.47: Atomic RMW — itimer_bm is read by BSP timerTick on another CPU
             _ = @atomicRmw(u64, &sched.itimer_bm, .And, ~(@as(u64, 1) << @intCast(cur_idx)), .seq_cst);
         } else {
-            @atomicStore(u64, &cur.itimer_real_value, tsc.nanos() + val_ns, .monotonic);
+            @atomicStore(u64, &cur.itimer_real_value, itimer_policy.deadlineNs(tsc.nanos(), val_ns), .monotonic);
             _ = @atomicRmw(u64, &sched.itimer_bm, .Or, @as(u64, 1) << @intCast(cur_idx), .seq_cst);
         }
     }

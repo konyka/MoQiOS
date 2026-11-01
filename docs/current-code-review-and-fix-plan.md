@@ -6009,3 +6009,15 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 变异（具名测试核对）：`copyFromUser`/`copyToUser` 的 `allowzero` 去掉各一个、`validateUserRange` 的 0 地址检查去掉、`unmapRange`/`firstMappedPage`/`fixedReplaceable`/`mprotect` 四个循环的跳洞各去掉、`prescanHuge`/`demoteRange` 的 1 GiB 跳跃去掉，共 12 个，全部被 `hostile user pointers…` 抓住；恢复后 `grep -c MUTATION` 为 0。注意这个 host 测试只钉住源码形状；"128 TiB 范围在 2 秒内返回"的行为断言在 hello190 里，由冒烟覆盖。
 - 验证：host 862/862；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello190 PASS（3185 次调用、4 个阻塞并被杀、0 次 panic）、0 个 FAIL；stress（SMP=2）5/5 PASS。
+
+### 第二轮扫描：能通过校验的恶意参数，以及 `setitimer` 的整数溢出 panic（hello191）
+
+- 动机：hello190 的参数全是坏指针，大多数调用止步于 `EFAULT`。它测不到"参数合法之后"的代码，所以需要一轮参数能通过校验的扫描。
+- 方法：hello191 对同一份系统调用清单（512 个号，去掉 59 个故意结束运行的）每个号跑若干轮，参数由 xorshift 伪随机混合：指向已映射缓冲区的指针、小整数、0–7 的文件描述符、少量边界值；种子由（调用号、轮次）决定，日志里的 `fz nr/round` 可完整复现。提交里每个号 8 轮；手工跑过 40 轮共 18200 次。
+- 发现与修复：`setitimer` 对 `it_value`/`it_interval` 做无检查的无符号乘加，溢出时 panic；`it_interval` 很大时 panic 会延后到调度器在时钟中断里重新装填定时器（`now + interval`），后果更严重。按 Linux 的 `timeval_valid` 加校验，饱和算术，修正检查顺序，`alarm` 与调度器的两处重新装填也改成饱和加法。
+- 过程说明（如实）：第一次 40 轮运行在 `recvfrom` 处停住，两个 CPU 都在 `hlt`，起初怀疑是丢失唤醒；用 GDB 看任务表后发现是后台进程组读控制台触发的 `SIGTTIN` 把整个进程组停住，这是正确的作业控制行为，所以修的是 hello191（子进程先 `setsid`），不是内核。我先写了一个最小复现程序（作为 init 的直接子进程，只做那一次 `recvfrom`），它正常返回，没有挂住，所以不是 `recvfrom` 本身的问题，而是"在父进程所在的进程组里读控制台"这个条件；复现程序用完已删除。
+- 已知局限：伪随机而非覆盖率引导；59 个调用没测；多线程并发下的恶意调用没测；参数组合是每个调用独立的，没有"先创建一个 socket / 文件 / 映射，再对它调用"的有状态序列（这会走到更深的代码，是下一步值得做的）。
+- TDD：host 新增 1 个测试（`itimer_policy` 的全部规则、`setitimer` 里读取、校验、编号检查、写旧值的先后顺序、`getitimer` 的错误码、调度器重新装填的饱和加法）；hello191 在修复前于 `setitimer` 处 panic，修复后 PASS。
+
+- 变异（具名测试核对）：`timevalValid` 的三个条件各去掉一个与上界取等、`timevalNs` 的两处换算、`deadlineNs` 的饱和改回环绕、`whichValid` 的上下界、`alarmNs` 的换算、`setitimer` 里读取/校验/编号检查/旧值写出的先后与每一项被删除、NULL 新值的判断、`getitimer` 的 `EFAULT`、`setitimer`/`alarm`/调度器三处改回无检查的加法，共 18 个，全部被 `setitimer: Linux validation…` 抓住；恢复后 `grep -c MUTATION` 为 0。
+- 验证：host 863/863；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello191 PASS（每次 3640 次调用、1 个阻塞并被杀、0 次 panic）、0 个 FAIL；stress（SMP=2）5/5 PASS；另外手工跑了 40 轮共 18200 次的 hello191，无 panic、无内核异常。每次冒烟现在约 7 分钟（hello190 加 hello191）。

@@ -1585,6 +1585,50 @@ test "munmap and SysV SHM policy validation" {
     try std.testing.expect(shm_policy.rangeEnd(0x7000_0000, 4096, munmap_policy.USER_ADDR_MAX) != null);
 }
 
+test "setitimer: Linux validation, saturating arithmetic, and the check order" {
+    const ip = kt.itimer_policy;
+    const max: i64 = std.math.maxInt(i64);
+    // timeval_valid: non-negative seconds, 0 <= usec < 1,000,000.
+    try std.testing.expect(ip.timevalValid(.{ .sec = 0, .usec = 0 }));
+    try std.testing.expect(ip.timevalValid(.{ .sec = max, .usec = 999_999 }));
+    try std.testing.expect(!ip.timevalValid(.{ .sec = -1, .usec = 0 }));
+    try std.testing.expect(!ip.timevalValid(.{ .sec = 0, .usec = -1 }));
+    try std.testing.expect(!ip.timevalValid(.{ .sec = 0, .usec = 1_000_000 }));
+    try std.testing.expect(!ip.timevalValid(.{ .sec = std.math.minInt(i64), .usec = 0 }));
+    // Nanoseconds saturate rather than overflow (these used to be unchecked u64 arithmetic, a kernel panic).
+    try std.testing.expectEqual(@as(u64, 1_500_000_000), ip.timevalNs(.{ .sec = 1, .usec = 500_000 }));
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), ip.timevalNs(.{ .sec = max, .usec = 999_999 }));
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), ip.timevalNs(.{ .sec = 0x4000000000000000, .usec = 0 }));
+    try std.testing.expectEqual(@as(u64, 0), ip.timevalNs(.{ .sec = 0, .usec = 0 }));
+    // A deadline saturates at "never".
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), ip.deadlineNs(1_000, std.math.maxInt(u64)));
+    try std.testing.expectEqual(@as(u64, 1_500), ip.deadlineNs(1_000, 500));
+    // alarm(0xffffffff) is about 136 years: fine in u64 nanoseconds, and never overflows.
+    try std.testing.expectEqual(@as(u64, 0xffffffff) * 1_000_000_000, ip.alarmNs(0xffffffff));
+    try std.testing.expect(ip.whichValid(0) and ip.whichValid(1) and ip.whichValid(2));
+    try std.testing.expect(!ip.whichValid(3) and !ip.whichValid(0xffffffff));
+
+    // The syscall reads and validates the new value before it looks at `which`, and writes the old value
+    // only after both; a NULL new value means "disarm" and an old-value fault reports EFAULT.
+    const src = kt.syscall_entry_source;
+    const f = std.mem.indexOf(u8, src, "fn syscallSetitimer(").?;
+    const body = src[f..];
+    const read = std.mem.indexOf(u8, body, "if (copy.copyFromUser(&buf, @ptrFromInt(new_value_ptr), 32) < 32) return -14;").?;
+    const valid = std.mem.indexOf(u8, body, "if (!itimer_policy.timevalValid(interval) or !itimer_policy.timevalValid(value)) return -22;").?;
+    const which = std.mem.indexOf(u8, body, "if (!itimer_policy.whichValid(which)) return -22;").?;
+    const old = std.mem.indexOf(u8, body, "const rc = syscallGetitimer(which, old_value_ptr);").?;
+    try std.testing.expect(read < valid and valid < which and which < old);
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (new_value_ptr != 0) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "itimer_policy.deadlineNs(tsc.nanos(), val_ns)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "itimer_policy.deadlineNs(now_ns, itimer_policy.alarmNs(seconds))") != null);
+    // getitimer: a NULL or bad pointer is EFAULT (EINVAL is for the timer number).
+    const g = std.mem.indexOf(u8, src, "fn syscallGetitimer(").?;
+    try std.testing.expect(std.mem.indexOf(u8, src[g..], "if (!itimer_policy.whichValid(which)) return -22;\n    if (curr_value_ptr == 0 or curr_value_ptr >= 0x0000_8000_0000_0000) return -14;") != null);
+    // The scheduler re-arms a periodic timer with a saturating add: a huge interval used to panic the tick.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.sched_source, "now_ns +| t.itimer_real_interval"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, kt.sched_source, "now_ns + t.itimer_real_interval"));
+}
+
 test "hostile user pointers cannot panic the copy helpers, and huge ranges skip absent page tables" {
     const c = kt.copy_from_user_source;
     // A NULL user pointer reaches validateUserRange (and fails it) instead of tripping Zig's "cast causes

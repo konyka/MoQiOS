@@ -51,6 +51,7 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 
 
 #define SYS_WRITE     1
+#define SYS_SETSID    206
 #define SYS_EXIT      2
 #define SYS_NANOSLEEP 35
 #define SYS_FORK      57
@@ -123,6 +124,8 @@ void _start(void) {
             args_for(set, a);
             int64_t pid = syscall1(SYS_FORK, 0);
             if (pid == 0) {
+                /* Own session: a console read by fd 0 must not SIGTTIN-stop the parent along with the child. */
+                syscall1(SYS_SETSID, 0);
                 print("fz "); print_num((uint64_t)nr); print("/"); print_num((uint64_t)set); print("\n");
                 rawcall(nr, a);
                 syscall1(SYS_EXIT, 0);

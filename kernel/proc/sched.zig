@@ -376,7 +376,7 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
                     _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << 13, .seq_cst);
                     if (t.itimer_real_interval != 0) {
                         // Recurring: reschedule next expiration
-                        @atomicStore(u64, &t.itimer_real_value, now_ns + t.itimer_real_interval, .monotonic);
+                        @atomicStore(u64, &t.itimer_real_value, now_ns +| t.itimer_real_interval, .monotonic);
                     } else {
                         // One-shot: clear after firing
                         @atomicStore(u64, &t.itimer_real_value, 0, .monotonic);
@@ -654,7 +654,7 @@ fn alarmTimerTick(now_ns: u64) void {
         if (@atomicLoad(u64, &t.itimer_real_value, .monotonic) != 0 and now_ns >= @atomicLoad(u64, &t.itimer_real_value, .monotonic)) {
             _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << 13, .seq_cst);
             if (t.itimer_real_interval != 0) {
-                @atomicStore(u64, &t.itimer_real_value, now_ns + t.itimer_real_interval, .monotonic);
+                @atomicStore(u64, &t.itimer_real_value, now_ns +| t.itimer_real_interval, .monotonic);
             } else {
                 @atomicStore(u64, &t.itimer_real_value, 0, .monotonic);
                 _ = @atomicRmw(u64, &itimer_bm, .And, ~(@as(u64, 1) << i), .seq_cst);
