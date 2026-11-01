@@ -62,6 +62,8 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_LISTEN    50
 #define SYS_GETPEERNAME 127
 #define SYS_SENDMSG   46
+#define SYS_SENDMMSG  135
+#define SYS_RECVMMSG  134
 #define AF_UNIX 1
 #define SOCK_STREAM 1
 #define SOCK_DGRAM 2
@@ -217,6 +219,31 @@ void _start(void) {
         check(done && ((st >> 8) & 0xff) == 0, "G: and a blocking write of one returns EMSGSIZE instead of waiting forever");
         syscall1(SYS_CLOSE, sv[0]);
         syscall1(SYS_CLOSE, sv[1]);
+    }
+
+    /* H: sendmmsg / recvmmsg carry addresses and message boundaries on AF_UNIX datagram sockets */
+    {
+        struct mm { struct msghdr h; uint32_t len; uint32_t pad; };
+        struct iovec i1 = { "one", 3 }, i2 = { "second", 6 };
+        struct mm out[2];
+        for (unsigned k = 0; k < sizeof(out); k++) ((char *)out)[k] = 0;
+        out[0].h.name = &ra; out[0].h.namelen = (uint32_t)la; out[0].h.iov = &i1; out[0].h.iovlen = 1;
+        out[1].h.name = &rb; out[1].h.namelen = (uint32_t)lb; out[1].h.iov = &i2; out[1].h.iovlen = 1;
+        check(syscall4(SYS_SENDMMSG, tx, (uint64_t)out, 2, 0) == 2, "H: sendmmsg of two addressed datagrams returns 2");
+        check(out[0].len == 3 && out[1].len == 6, "H: and fills msg_len for each");
+        check(recv_(r1, b, 64) == 3 && b[0] == 'o', "H: the first went to the first receiver");
+        check(recv_(r2, b, 64) == 6 && b[0] == 's', "H: the second to the second receiver");
+        /* two datagrams to one receiver, read back in ONE recvmmsg as two messages */
+        out[1].h.name = &ra; out[1].h.namelen = (uint32_t)la;
+        check(syscall4(SYS_SENDMMSG, tx, (uint64_t)out, 2, 0) == 2, "H: two datagrams to one receiver");
+        char ba[16], bb[16];
+        struct iovec ia = { ba, 16 }, ib = { bb, 16 };
+        struct mm in[2];
+        for (unsigned k = 0; k < sizeof(in); k++) ((char *)in)[k] = 0;
+        in[0].h.iov = &ia; in[0].h.iovlen = 1;
+        in[1].h.iov = &ib; in[1].h.iovlen = 1;
+        int64_t n = syscall5(SYS_RECVMMSG, r1, (uint64_t)in, 2, MSG_DONTWAIT, 0);
+        check(n == 2 && in[0].len == 3 && in[1].len == 6, "H: recvmmsg returns them as two messages with their own lengths (boundaries kept)");
     }
 
     print(failures == 0 ? "hello181: PASS\n" : "hello181: FAIL\n");
