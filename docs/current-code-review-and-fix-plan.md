@@ -5953,3 +5953,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 变异（具名测试核对）：`read` 越界回 -1、`readInner` 越界回 -1、`.none` 回 -1、`close` 回 -1、`open("")` 检查失效、`lseek` 的 `ESPIPE` 检查失效、`seekable` 恒为真，以及 `UNSEEKABLE` 列表里 12 个类型逐个改名，共 19 个，全部被 `descriptor errnos…` 抓住；恢复后 `grep -c MUTATION` 为 0。
 - 验证：host 857/857；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello185 PASS、0 个 FAIL；stress（SMP=2）5/5 PASS。
+
+### epoll 的错误码与事件布局（hello186）
+
+- 问题：①`EpollEvent` 在内核里是 16 字节（`data` 对齐到偏移 8），Linux x86_64 的 `struct epoll_event` 是 packed 的 12 字节（`data` 在偏移 4）；单个事件恰好不受影响（`events` 与 `data` 的起点碰巧一致，我自己早先的 hello 探测又都用 `__attribute__((packed))` 的 12 字节结构或只取一个事件），但 `epoll_wait` 一次返回多个事件时，第二个事件起全部错位，glibc/musl 程序读到的是垃圾。②`epoll_ctl`/`epoll_wait` 的错误码与 Linux 不一致，共约 33 项（见 `docs/kernel-subsystems.md` 的 hello186 条）。
+- 方法：先在宿主机编译运行对照程序取 67 项真实 Linux 返回值（`/tmp/lx`，用完删除），再用同一份表生成 hello186，逐项对照。旧内核约 33 项 FAIL，34 项本来一致。
+- 修复：纯策略放进 `net/epoll_policy.zig`（`ctlPrecheck`、`waitErrno`、`pollable`、`MAX_WAIT_EVENTS`、`EVENT_SIZE`，host 可测）；`net/epoll.zig` 新增 `epfdKind`（epfd 是关闭/非 epoll/epoll）与 `epollWaitFd`，`epollCtl` 的入口先读事件、钉住目标描述符、调 `ctlPrecheck`，再借用实例；`syscall_entry.zig` 的 `epollCtlFd`/`epollWaitFd` 直接转给 `net/epoll.zig`，`maxevents` 以 `i32` 传（以前截成 `u32`，`-1` 变成 4294967295）；删掉不再使用的 `epollFdIndex`。
+- 已知差异：`EPOLLWAKEUP` 没有特殊处理（Linux 对没有 `CAP_BLOCK_SUSPEND` 的进程悄悄清掉）；`EPOLLPRI` 没有任何描述符会报（带外数据仍未实现）；嵌套深度上限（Linux `EP_MAX_NESTS = 4`）没有实现，环检测保留原有的链式检查；`epoll_wait` 对无事件时的缓冲区只做范围检查，和 Linux 一致，但有事件时写入失败仍是 `EFAULT`，Linux 在已经消费了边沿触发事件后才报错，这个差异没有对照。
+- TDD：host 新增 1 个测试（`ctlPrecheck` 的全部顺序、`EPOLLEXCLUSIVE` 各种组合、`pollable` 的穷举、`waitErrno` 的顺序与 `maxevents` 边界、事件布局常量与接线形状），并更新了旧的 "epoll MOD … self cycles" 测试（旧断言“自己加自己返回 `ELOOP`”与 Linux 不符）；hello186（67 项）在旧内核上约 33 项 FAIL，新内核 PASS。
+
+- 变异（具名测试核对）：`ctlPrecheck` 里 EFAULT/两处 EBADF/EPERM/EINVAL（自己、非 epoll）/`EPOLLEXCLUSIVE` 的三个条件/`EXCLUSIVE_OK_BITS` 少一位/`ctlHasEvent` 改成只看 ADD 与 MOD、`pollable` 的 6 个类型各去掉一个、`waitErrno` 的 EBADF/`maxevents` 下界/上界改成 128/缓冲区范围/非 epoll 检查、事件大小与偏移常量、`EpollEvent` 去掉 `align(1)`、`epollCtl` 不读事件、MOD 的 `EPOLLEXCLUSIVE` 检查、`.same_file` 恒为假、`epollWaitFd` 接线、`syscall_entry` 里 `maxevents` 被替换，共 29 个，其中 27 个被具名测试 `epoll errnos follow Linux's order…`（或更新后的 `epoll MOD advances…`）抓住，另有 2 个是等价变异：`events_ptr > USER_LIMIT` 与 `>=` 的差别只在恰好等于上限时，而那时 `bytes > USER_LIMIT - events_ptr` 已经返回 `EFAULT`；`ADD` 里的 `event orelse return …` 在 `ctlPrecheck` 已经对不可读事件返回 `EFAULT` 之后不可达。3 个变异第一次因编译失败/未使用参数被换成可编译形式后重跑并抓住；恢复后 `grep -c MUTATION` 为 0。
+- 验证：host 858/858；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello186 PASS、0 个 FAIL（hello89/105/112/157/158/159/160/182 等所有已有 epoll 探测均 PASS）；stress（SMP=2）5/5 PASS。

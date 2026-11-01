@@ -17,6 +17,7 @@
 /// Notification flow:
 ///   Resource state change -> epollNotify() -> scan all active epoll
 ///   instances for matching items -> add to ready list -> wake waiter.
+const std = @import("std");
 const sched = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
@@ -43,6 +44,7 @@ pub const EPOLL_CTL_MOD: i32 = 3;
 /// Error codes (Linux-compatible negative values).
 const errno = @import("../lib/errno.zig");
 const EBADF = errno.EBADF;
+const EFAULT = errno.EFAULT;
 const EEXIST = errno.EEXIST;
 const EINVAL = errno.EINVAL;
 const ENOENT = errno.ENOENT;
@@ -56,11 +58,15 @@ pub const MAX_EPOLL_ITEMS: u8 = 128;
 
 // Timed epoll waits need an external wakeup: a blocked waiter cannot run
 // its in-line deadline check until timerTick makes it runnable.
-/// EpollEvent — matches Linux struct epoll_event (8 bytes payload).
+/// EpollEvent — Linux's x86_64 `struct epoll_event`: packed, `events` at 0 and `data` at 4, 12 bytes.
 pub const EpollEvent = extern struct {
-    events: u32,
-    data: u64,
+    events: u32 align(1),
+    data: u64 align(1),
 };
+comptime {
+    std.debug.assert(@sizeOf(EpollEvent) == epoll_policy.EVENT_SIZE);
+    std.debug.assert(@offsetOf(EpollEvent, "data") == epoll_policy.EVENT_DATA_OFFSET);
+}
 
 /// WaitNode for epoll_wait blocking — stack-allocated on the
 /// waiter's kernel stack, modelled after eventfd.zig.
@@ -209,23 +215,61 @@ pub fn epollCreate() i32 {
     return @intCast(i);
 }
 
-/// Control an epoll instance — add, modify, or delete an fd registration.
-pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
-    var borrow = acquireInstance(epfd_idx) orelse return EBADF;
-    defer borrow.release();
-    const inst = borrow.instance;
-    if (fd < 0) return EBADF;
+/// What descriptor `fd` of the calling task refers to, as far as epoll is concerned.
+fn epfdKind(fd: u32) epoll_policy.Epfd {
+    const cur_idx = sched.currentTaskIndex() orelse return .closed;
+    const cur = task_mod.getTask(cur_idx) orelse return .closed;
+    const identity = cur.fd_table.snapshotFdIdentity(fd) orelse return .closed;
+    if (identity.desc.fd_type != .epoll) return .not_epoll;
+    return .{ .epoll = identity.desc.epoll_idx };
+}
+
+/// Control an epoll instance — add, modify, or delete an fd registration. Argument checks follow
+/// Linux's order (see epoll_policy.ctlPrecheck).
+pub fn epollCtl(epfd: u32, op: i32, fd: i32, event_ptr: u64) i64 {
+    var event: ?EpollEvent = null;
+    if (epoll_policy.ctlHasEvent(op)) event = copyEventFromUser(event_ptr);
 
     const cur_idx = sched.currentTaskIndex() orelse return EBADF;
     const cur = task_mod.getTask(cur_idx) orelse return EBADF;
-    if (fd >= @as(i32, @intCast(vfs.MAX_FDS))) return EBADF;
-    if (!cur.fd_table.acquireTransferFd(@intCast(fd))) return EBADF;
-    defer cur.fd_table.releaseTransferFd(@intCast(fd));
-    const identity = cur.fd_table.snapshotFdIdentity(@intCast(fd)) orelse return EBADF;
+    const kind = epfdKind(epfd);
+
+    var pinned = false;
+    if (fd >= 0 and fd < @as(i32, @intCast(vfs.MAX_FDS))) pinned = cur.fd_table.acquireTransferFd(@intCast(fd));
+    defer if (pinned) cur.fd_table.releaseTransferFd(@intCast(fd));
+    var identity: vfs.FdTable.FdIdentity = undefined;
+    if (pinned) {
+        identity = cur.fd_table.snapshotFdIdentity(@intCast(fd)) orelse return EBADF;
+    }
+
+    const target_is_epoll = pinned and identity.desc.fd_type == .epoll;
+    const same_file = target_is_epoll and switch (kind) {
+        .epoll => |own| own == identity.desc.epoll_idx,
+        else => false,
+    };
+    const pre = epoll_policy.ctlPrecheck(.{
+        .op = op,
+        .event_readable = event != null,
+        .events = if (event) |e| e.events else 0,
+        .epfd = kind,
+        .target_open = pinned,
+        .target_pollable = !pinned or epoll_policy.pollable(@tagName(identity.desc.fd_type)),
+        .target_is_epoll = target_is_epoll,
+        .same_file = same_file,
+    });
+    if (pre != 0) return pre;
+    const epfd_idx: u32 = switch (kind) {
+        .epoll => |i| i,
+        else => return EBADF,
+    };
+
+    var borrow = acquireInstance(epfd_idx) orelse return EBADF;
+    defer borrow.release();
+    const inst = borrow.instance;
+
     const desc = &identity.desc;
     var target_epoll_generation: u64 = 0;
     if (desc.fd_type == .epoll) {
-        if (resourceIdxFromDesc(desc) == epfd_idx) return ELOOP;
         const target = acquireInstance(resourceIdxFromDesc(desc)) orelse return EBADF;
         target_epoll_generation = target.generation;
         // Linux rejects a registration that would create a cycle. Beyond the
@@ -274,7 +318,7 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
                 break;
             }
             const s = slot orelse return ENOSPC;
-            const ev = copyEventFromUser(event_ptr) orelse return EINVAL;
+            const ev = event orelse return EFAULT;
 
             inst.items[s] = .{
                 .fd = fd,
@@ -311,7 +355,9 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
                     if (item.fd == fd and item.fd_generation == identity.generation and
                         item.fd_type == desc.fd_type and item.resource_idx == resourceIdxFromDesc(desc))
                     {
-                        const ev = copyEventFromUser(event_ptr) orelse return EINVAL;
+                        // Linux: a registration made with EPOLLEXCLUSIVE can never be modified.
+                        if ((item.events & epoll_policy.EPOLLEXCLUSIVE) != 0) return EINVAL;
+                        const ev = event orelse return EFAULT;
                         item.events = ev.events;
                         item.data = ev.data;
                         item.is_et = (ev.events & EPOLLET) != 0;
@@ -355,6 +401,19 @@ pub fn epollCtl(epfd_idx: u32, op: i32, fd: i32, event_ptr: u64) i64 {
         else => return EINVAL,
     }
     return 0;
+}
+
+/// epoll_wait/epoll_pwait entry: Linux's argument checks (epoll_policy.waitErrno), then the wait.
+pub fn epollWaitFd(fd: u32, events_buf: u64, max_events: i32, timeout_ms: i32) i64 {
+    const kind = epfdKind(fd);
+    const pre = epoll_policy.waitErrno(kind, max_events, events_buf);
+    if (pre != 0) return pre;
+    const idx: u32 = switch (kind) {
+        .epoll => |i| i,
+        else => return EBADF,
+    };
+    const clamped: u32 = @intCast(@min(max_events, @as(i32, MAX_EPOLL_ITEMS)));
+    return epollWait(idx, events_buf, clamped, timeout_ms);
 }
 
 /// Wait for events on an epoll instance.

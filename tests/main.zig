@@ -277,10 +277,12 @@ test "epoll wake state and nested readiness use synchronized loads" {
     try std.testing.expect(std.mem.indexOf(u8, source, "@atomicLoad(bool, &inst.valid, .acquire)") != null);
 }
 
-test "epoll MOD advances registration incarnation and rejects self cycles" {
+test "epoll MOD advances registration incarnation; adding an epoll fd to itself is EINVAL, a longer loop ELOOP" {
     const source = kt.epoll_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "item.registration_generation +%= 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "if (resourceIdxFromDesc(desc) == epfd_idx) return ELOOP") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "if (nestedChainReaches(target.instance, epfd_idx)) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "if (resourceIdxFromDesc(desc) == epfd_idx) return ELOOP") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, ".same_file = same_file,") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "const child_empty = child_inst.ready_head == null") != null);
 }
 
@@ -1580,6 +1582,107 @@ test "munmap and SysV SHM policy validation" {
     try std.testing.expect(shm_policy.flagsValid(shm_policy.SHM_RDONLY | shm_policy.SHM_EXEC));
     try std.testing.expect(!shm_policy.flagsValid(1));
     try std.testing.expect(shm_policy.rangeEnd(0x7000_0000, 4096, munmap_policy.USER_ADDR_MAX) != null);
+}
+
+test "epoll errnos follow Linux's order: EFAULT, EBADF, EPERM, EINVAL; wait checks maxevents before the buffer" {
+    const ep = kt.epoll_policy;
+    const E = kt.errno;
+    const base: ep.CtlFacts = .{
+        .op = ep.CTL_ADD, .event_readable = true, .events = ep.EPOLLIN, .epfd = .{ .epoll = 0 },
+        .target_open = true, .target_pollable = true, .target_is_epoll = false, .same_file = false,
+    };
+    try std.testing.expectEqual(@as(i64, 0), ep.ctlPrecheck(base));
+    // The event is read first, so an unreadable one beats a bad descriptor ...
+    var f = base;
+    f.event_readable = false;
+    f.epfd = .closed;
+    try std.testing.expectEqual(E.EFAULT, ep.ctlPrecheck(f));
+    // ... but DEL carries no event, so there the descriptors decide.
+    f.op = ep.CTL_DEL;
+    try std.testing.expectEqual(E.EBADF, ep.ctlPrecheck(f));
+    f.epfd = .{ .epoll = 0 };
+    f.target_open = false;
+    try std.testing.expectEqual(E.EBADF, ep.ctlPrecheck(f));
+    // A bad epfd and a bad target are both EBADF; a target that cannot poll is EPERM even when epfd is not epoll.
+    f = base;
+    f.epfd = .not_epoll;
+    f.target_pollable = false;
+    try std.testing.expectEqual(E.EPERM, ep.ctlPrecheck(f));
+    f.target_pollable = true;
+    try std.testing.expectEqual(E.EINVAL, ep.ctlPrecheck(f));
+    f = base;
+    f.same_file = true;
+    try std.testing.expectEqual(E.EINVAL, ep.ctlPrecheck(f));
+    // An unknown op still has its event read; it is EINVAL only after the descriptors check out.
+    f = base;
+    f.op = 9;
+    try std.testing.expectEqual(@as(i64, 0), ep.ctlPrecheck(f));
+    f.event_readable = false;
+    try std.testing.expectEqual(E.EFAULT, ep.ctlPrecheck(f));
+    // EPOLLEXCLUSIVE: not with MOD, not on an epoll target, not with bits outside IN/OUT/ERR/HUP/WAKEUP/ET.
+    f = base;
+    f.events = ep.EPOLLIN | ep.EPOLLEXCLUSIVE;
+    try std.testing.expectEqual(@as(i64, 0), ep.ctlPrecheck(f));
+    f.events = ep.EPOLLOUT | ep.EPOLLEXCLUSIVE | ep.EPOLLET;
+    try std.testing.expectEqual(@as(i64, 0), ep.ctlPrecheck(f));
+    f.events = ep.EPOLLIN | ep.EPOLLEXCLUSIVE | 0x40000000; // EPOLLONESHOT
+    try std.testing.expectEqual(E.EINVAL, ep.ctlPrecheck(f));
+    f.events = ep.EPOLLIN | ep.EPOLLEXCLUSIVE | 0x2000; // EPOLLRDHUP
+    try std.testing.expectEqual(E.EINVAL, ep.ctlPrecheck(f));
+    f.events = ep.EPOLLIN | ep.EPOLLEXCLUSIVE | 0x002; // EPOLLPRI
+    try std.testing.expectEqual(E.EINVAL, ep.ctlPrecheck(f));
+    f.events = ep.EPOLLIN | ep.EPOLLEXCLUSIVE;
+    f.target_is_epoll = true;
+    try std.testing.expectEqual(E.EINVAL, ep.ctlPrecheck(f));
+    f.target_is_epoll = false;
+    f.op = ep.CTL_MOD;
+    try std.testing.expectEqual(E.EINVAL, ep.ctlPrecheck(f));
+    f.events = ep.EPOLLIN; // without the flag MOD is fine
+    try std.testing.expectEqual(@as(i64, 0), ep.ctlPrecheck(f));
+
+    // Targets with no poll operation.
+    for ([_][]const u8{ "ramdisk_file", "fat32_file", "ext2_file", "tmpfs_file", "proc_file", "rofs_file" }) |t| {
+        try std.testing.expect(!ep.pollable(t));
+    }
+    for ([_][]const u8{ "pipe_read", "pipe_write", "tcp_socket", "udp_socket", "unix_socket", "eventfd", "timerfd", "epoll", "inotify", "pidfd", "special", "devfs" }) |t| {
+        try std.testing.expect(ep.pollable(t));
+    }
+
+    // epoll_wait: epfd, then maxevents, then the buffer's range, then "is it epoll".
+    const ok: ep.Epfd = .{ .epoll = 3 };
+    try std.testing.expectEqual(@as(i64, 0), ep.waitErrno(ok, 1, 0x1000));
+    try std.testing.expectEqual(E.EBADF, ep.waitErrno(.closed, 0, 0xffff800000000000));
+    try std.testing.expectEqual(E.EINVAL, ep.waitErrno(ok, 0, 0x1000));
+    try std.testing.expectEqual(E.EINVAL, ep.waitErrno(ok, -1, 0x1000));
+    try std.testing.expectEqual(E.EINVAL, ep.waitErrno(.not_epoll, 0, 0xffff800000000000));
+    try std.testing.expectEqual(E.EFAULT, ep.waitErrno(.not_epoll, 4, 0xffff800000000000));
+    try std.testing.expectEqual(E.EINVAL, ep.waitErrno(.not_epoll, 4, 0x1000));
+    try std.testing.expectEqual(E.EFAULT, ep.waitErrno(ok, 4, 0xffff800000000000));
+    // The buffer is range-checked only: NULL and a small bad address pass, the top of user space does not.
+    try std.testing.expectEqual(@as(i64, 0), ep.waitErrno(ok, 4, 0));
+    try std.testing.expectEqual(@as(i64, 0), ep.waitErrno(ok, 4, 8));
+    try std.testing.expectEqual(E.EFAULT, ep.waitErrno(ok, 1000, 0x00007ffffffff000));
+    try std.testing.expectEqual(@as(i64, 0), ep.waitErrno(ok, 1, 0x00007ffffffff000));
+    // maxevents ceiling is INT_MAX / 12, not the 128 slots the kernel keeps.
+    try std.testing.expectEqual(@as(i32, 178956970), ep.MAX_WAIT_EVENTS);
+    try std.testing.expectEqual(@as(i64, 0), ep.waitErrno(ok, 129, 0x1000));
+    try std.testing.expectEqual(@as(i64, 0), ep.waitErrno(ok, 1024, 0x1000));
+    try std.testing.expectEqual(@as(i64, 0), ep.waitErrno(ok, ep.MAX_WAIT_EVENTS, 0x1000));
+    try std.testing.expectEqual(E.EINVAL, ep.waitErrno(ok, ep.MAX_WAIT_EVENTS + 1, 0x1000));
+
+    // struct epoll_event is the packed 12-byte x86_64 layout, and the entry points use the policy.
+    try std.testing.expectEqual(@as(usize, 12), ep.EVENT_SIZE);
+    try std.testing.expectEqual(@as(usize, 4), ep.EVENT_DATA_OFFSET);
+    const src = kt.epoll_source;
+    try std.testing.expect(std.mem.indexOf(u8, src, "events: u32 align(1),\n    data: u64 align(1),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "std.debug.assert(@sizeOf(EpollEvent) == epoll_policy.EVENT_SIZE);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const pre = epoll_policy.ctlPrecheck(.{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const pre = epoll_policy.waitErrno(kind, max_events, events_buf);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (epoll_policy.ctlHasEvent(op)) event = copyEventFromUser(event_ptr);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if ((item.events & epoll_policy.EPOLLEXCLUSIVE) != 0) return EINVAL;") != null);
+    const se = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, se, "return @import(\"../../net/epoll.zig\").epollCtl(fd, op, target, event);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "return @import(\"../../net/epoll.zig\").epollWaitFd(fd, events, max_events, timeout);") != null);
 }
 
 test "epoll_create1 accepts only zero or EPOLL_CLOEXEC" {

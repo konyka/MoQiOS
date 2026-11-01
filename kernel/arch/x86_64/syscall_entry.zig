@@ -754,7 +754,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         148 => { // epoll_wait(epfd, events, maxevents, timeout)
             const epfd_idx: u32 = @truncate(frame.rdi);
-            const max_ev: u32 = @truncate(frame.rdx);
+            const max_ev: i32 = @bitCast(@as(u32, @truncate(frame.rdx)));
             const timeout: i32 = @bitCast(@as(u32, @truncate(frame.r10)));
             frame.rax = @bitCast(epollWaitFd(epfd_idx, frame.rsi, max_ev, timeout));
         },
@@ -1306,7 +1306,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         248 => { // epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)
             const epfd_idx: u32 = @truncate(frame.rdi);
-            const max_ev: u32 = @truncate(frame.rdx);
+            const max_ev: i32 = @bitCast(@as(u32, @truncate(frame.rdx)));
             const timeout: i32 = @bitCast(@as(u32, @truncate(frame.r10)));
             frame.rax = @bitCast(syscallEpollPwait(epfd_idx, frame.rsi, max_ev, timeout, frame.r8, frame.r9));
             checkSignalsOnSyscallReturn(frame);
@@ -2199,7 +2199,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         441 => { // epoll_pwait2(epfd, events, maxevents, timeout_ts, sigmask, sigsetsize)
             const epfd_idx: u32 = @truncate(frame.rdi);
-            const max_ev: u32 = @truncate(frame.rdx);
+            const max_ev: i32 = @bitCast(@as(u32, @truncate(frame.rdx)));
             frame.rax = @bitCast(syscallEpollPwait2(epfd_idx, frame.rsi, max_ev, frame.r10, frame.r8, frame.r9));
             checkSignalsOnSyscallReturn(frame);
         },
@@ -2960,26 +2960,15 @@ fn syscallClose(frame: *SyscallFrame) void {
 
 const paging = @import("../../arch/x86_64/paging.zig");
 
-fn epollFdIndex(fd: u32) ?u32 {
-    const sched = @import("../../proc/sched.zig");
-    const task_mod = @import("../../proc/task.zig");
-    const idx = sched.currentTaskIndex() orelse return null;
-    const task = task_mod.getTask(idx) orelse return null;
-    if (fd >= task.fd_table.fds.len or task.fd_table.fds[fd].fd_type != .epoll) return null;
-    return task.fd_table.fds[fd].epoll_idx;
-}
-
 fn epollCtlFd(fd: u32, op: i32, target: i32, event: u64) i64 {
-    const epoll_mod = @import("../../net/epoll.zig");
-    return if (epollFdIndex(fd)) |idx| epoll_mod.epollCtl(idx, op, target, event) else -9;
+    return @import("../../net/epoll.zig").epollCtl(fd, op, target, event);
 }
 
-fn epollWaitFd(fd: u32, events: u64, max_events: u32, timeout: i32) i64 {
-    const epoll_mod = @import("../../net/epoll.zig");
-    return if (epollFdIndex(fd)) |idx| epoll_mod.epollWait(idx, events, max_events, timeout) else -9;
+fn epollWaitFd(fd: u32, events: u64, max_events: i32, timeout: i32) i64 {
+    return @import("../../net/epoll.zig").epollWaitFd(fd, events, max_events, timeout);
 }
 
-fn syscallEpollPwait(fd: u32, events: u64, max_events: u32, timeout: i32, sigmask_ptr: u64, sigsetsize: u64) i64 {
+fn syscallEpollPwait(fd: u32, events: u64, max_events: i32, timeout: i32, sigmask_ptr: u64, sigsetsize: u64) i64 {
     if (epoll_policy.validateTemporaryMask(sigmask_ptr, sigsetsize) != 0) return errno.EINVAL;
     var temporary_mask: u64 = 0;
     if (sigmask_ptr != 0) {
@@ -2990,7 +2979,7 @@ fn syscallEpollPwait(fd: u32, events: u64, max_events: u32, timeout: i32, sigmas
     return withTemporaryEpollMask(fd, events, max_events, timeout, if (sigmask_ptr == 0) null else temporary_mask);
 }
 
-fn syscallEpollPwait2(fd: u32, events: u64, max_events: u32, timeout_ptr: u64, sigmask_ptr: u64, sigsetsize: u64) i64 {
+fn syscallEpollPwait2(fd: u32, events: u64, max_events: i32, timeout_ptr: u64, sigmask_ptr: u64, sigsetsize: u64) i64 {
     if (epoll_policy.validateTemporaryMask(sigmask_ptr, sigsetsize) != 0) return errno.EINVAL;
     var timeout_ms: i32 = -1;
     if (timeout_ptr != 0) {
@@ -3014,7 +3003,7 @@ fn syscallEpollPwait2(fd: u32, events: u64, max_events: u32, timeout_ptr: u64, s
     return withTemporaryEpollMask(fd, events, max_events, timeout_ms, if (sigmask_ptr == 0) null else temporary_mask);
 }
 
-fn withTemporaryEpollMask(fd: u32, events: u64, max_events: u32, timeout: i32, mask: ?u64) i64 {
+fn withTemporaryEpollMask(fd: u32, events: u64, max_events: i32, timeout: i32, mask: ?u64) i64 {
     if (mask == null) return epollWaitFd(fd, events, max_events, timeout);
     const sched = @import("../../proc/sched.zig");
     const current = sched.currentTask() orelse return -1;

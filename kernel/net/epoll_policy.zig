@@ -49,6 +49,94 @@ pub fn timeoutMilliseconds(tv_sec: i64, tv_nsec: i64) TimespecResult {
     return .{ .milliseconds = @intCast(@min(with_nsec, max_ms)) };
 }
 
+/// `struct epoll_event` as the x86_64 Linux ABI lays it out: `events` at offset 0, `data` at offset 4,
+/// 12 bytes in all (the structure is packed on this architecture only).
+pub const EVENT_SIZE: usize = 12;
+pub const EVENT_DATA_OFFSET: usize = 4;
+
+/// Largest `maxevents` epoll_wait accepts (Linux: INT_MAX / sizeof(struct epoll_event)).
+pub const MAX_WAIT_EVENTS: i32 = 0x7fffffff / @as(i32, EVENT_SIZE);
+pub const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
+
+pub const CTL_ADD: i32 = 1;
+pub const CTL_DEL: i32 = 2;
+pub const CTL_MOD: i32 = 3;
+
+pub const EPOLLIN: u32 = 0x001;
+pub const EPOLLOUT: u32 = 0x004;
+pub const EPOLLERR: u32 = 0x008;
+pub const EPOLLHUP: u32 = 0x010;
+pub const EPOLLWAKEUP: u32 = 0x20000000;
+pub const EPOLLEXCLUSIVE: u32 = 0x10000000;
+pub const EPOLLET: u32 = 0x80000000;
+
+/// Bits EPOLLEXCLUSIVE may be combined with (Linux EPOLLEXCLUSIVE_OK_BITS).
+pub const EXCLUSIVE_OK_BITS: u32 = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLWAKEUP | EPOLLET | EPOLLEXCLUSIVE;
+
+/// What an epoll descriptor number refers to.
+pub const Epfd = union(enum) {
+    closed,
+    not_epoll,
+    epoll: u32,
+};
+
+/// Descriptor kinds with no poll operation (regular files and directories, named by their FdType tag
+/// so the rule is host-testable without the arch-bound vfs module): epoll_ctl refuses them with EPERM.
+const NOT_POLLABLE = [_][]const u8{ "ramdisk_file", "fat32_file", "ext2_file", "tmpfs_file", "proc_file", "rofs_file" };
+
+pub fn pollable(tag: []const u8) bool {
+    for (NOT_POLLABLE) |n| {
+        if (std.mem.eql(u8, n, tag)) return false;
+    }
+    return true;
+}
+
+/// EPOLL_CTL_ADD and EPOLL_CTL_MOD (and any unknown op) carry a struct epoll_event; only DEL does not.
+pub fn ctlHasEvent(op: i32) bool {
+    return op != CTL_DEL;
+}
+
+pub const CtlFacts = struct {
+    op: i32,
+    /// The event structure could be read (irrelevant when the op carries none).
+    event_readable: bool,
+    events: u32,
+    epfd: Epfd,
+    target_open: bool,
+    target_pollable: bool,
+    target_is_epoll: bool,
+    /// The target is the epoll instance itself (itself, or a duplicate of it).
+    same_file: bool,
+};
+
+/// The checks Linux's epoll_ctl makes before it looks at the registration itself, in Linux's order:
+/// EFAULT (event), EBADF (epfd, target), EPERM (target cannot poll), EINVAL (self / epfd is not epoll /
+/// EPOLLEXCLUSIVE misuse). 0 means go on to the loop check and the registration.
+pub fn ctlPrecheck(f: CtlFacts) i64 {
+    if (ctlHasEvent(f.op) and !f.event_readable) return errno.EFAULT;
+    if (f.epfd == .closed) return errno.EBADF;
+    if (!f.target_open) return errno.EBADF;
+    if (!f.target_pollable) return errno.EPERM;
+    if (f.same_file or f.epfd == .not_epoll) return errno.EINVAL;
+    if (ctlHasEvent(f.op) and (f.events & EPOLLEXCLUSIVE) != 0) {
+        if (f.op == CTL_MOD) return errno.EINVAL;
+        if (f.op == CTL_ADD and (f.target_is_epoll or (f.events & ~EXCLUSIVE_OK_BITS) != 0)) return errno.EINVAL;
+    }
+    return 0;
+}
+
+/// The checks Linux's epoll_wait makes before it waits: EBADF (epfd), EINVAL (maxevents), EFAULT (the
+/// buffer would leave user space), EINVAL (epfd is not an epoll descriptor). Note the buffer is only
+/// range-checked here, not touched.
+pub fn waitErrno(epfd: Epfd, maxevents: i32, events_ptr: u64) i64 {
+    if (epfd == .closed) return errno.EBADF;
+    if (maxevents <= 0 or maxevents > MAX_WAIT_EVENTS) return errno.EINVAL;
+    const bytes: u64 = @as(u64, @intCast(maxevents)) * EVENT_SIZE;
+    if (events_ptr >= USER_LIMIT or bytes > USER_LIMIT - events_ptr) return errno.EFAULT;
+    if (epfd == .not_epoll) return errno.EINVAL;
+    return 0;
+}
+
 test "epoll_create1 accepts zero and EPOLL_CLOEXEC" {
     try std.testing.expectEqual(@as(i64, 0), validate(0));
     try std.testing.expectEqual(@as(i64, 0), validate(EPOLL_CLOEXEC));
