@@ -36,6 +36,25 @@ pub fn pickEphemeralPort(start: u16, in_use: []const u16) ?u16 {
     return null;
 }
 
+/// bind() errors (negative errno).
+pub const BIND_EADDRINUSE: i64 = -98;
+pub const BIND_EINVAL: i64 = -22;
+pub const BIND_EACCES: i64 = -13;
+
+/// First port a process needs CAP_NET_BIND_SERVICE for is below this.
+pub const PRIVILEGED_PORT_LIMIT: u16 = 1024;
+
+/// bind() to `port` without the capability: EACCES for a privileged port.
+pub fn bindNeedsPrivilege(port: u16) bool {
+    return port != 0 and port < PRIVILEGED_PORT_LIMIT;
+}
+
+/// A bound port held by another socket can still be taken when the new socket
+/// asked for SO_REUSEADDR and the holder is only a TIME_WAIT leftover.
+pub fn reuseMayShare(new_has_reuseaddr: bool, holder_is_time_wait: bool) bool {
+    return new_has_reuseaddr and holder_is_time_wait;
+}
+
 /// connect() keeps the TCB's local port only when bind() set it; any other
 /// nonzero value is left over from a previous occupant of the slot.
 pub fn connectNeedsEphemeral(local_port: u16, bound_explicitly: bool) bool {

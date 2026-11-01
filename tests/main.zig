@@ -9370,3 +9370,35 @@ test "poll/select wake-up protocol: generation snapshot, waiter bitmap, wiring" 
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, pw, "if (sig_mod.pendingFatal(cur)) |s| task_mod.exitTask(128 + @as(i32, @intCast(s)));"));
     try std.testing.expect(std.mem.indexOf(u8, pw, "_ = @atomicRmw(u32, &generation_counter, .Add, 1, .seq_cst);\n    if (@atomicLoad(u64, &waiter_bm, .seq_cst) == 0) return;") != null);
 }
+
+test "TCP bind errors and SO_REUSEADDR sharing" {
+    const p = kt.tcp_port_policy;
+    try std.testing.expectEqual(@as(i64, -98), p.BIND_EADDRINUSE);
+    try std.testing.expectEqual(@as(i64, -22), p.BIND_EINVAL);
+    try std.testing.expectEqual(@as(i64, -13), p.BIND_EACCES);
+    // Ports below 1024 need the capability; 0 (ephemeral) and 1024 do not.
+    try std.testing.expect(p.bindNeedsPrivilege(1) and p.bindNeedsPrivilege(80) and p.bindNeedsPrivilege(1023));
+    try std.testing.expect(!p.bindNeedsPrivilege(0) and !p.bindNeedsPrivilege(1024) and !p.bindNeedsPrivilege(49152));
+    // A held port is shareable only with SO_REUSEADDR on the new socket AND a TIME_WAIT holder.
+    try std.testing.expect(p.reuseMayShare(true, true));
+    try std.testing.expect(!p.reuseMayShare(false, true));
+    try std.testing.expect(!p.reuseMayShare(true, false));
+    try std.testing.expect(!p.reuseMayShare(false, false));
+
+    const ts = kt.tcp_source;
+    // A socket that already has an address, or is not CLOSED, is EINVAL; a plain conflict is EADDRINUSE.
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.state != .closed or tcb.bound_explicitly) return tcp_port_policy.BIND_EINVAL;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "return tcp_port_policy.BIND_EADDRINUSE;") != null);
+    // Port 0 (let the kernel choose) never conflicts, and the socket's own slot is skipped.
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (i == tcb_idx) continue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcbs[i].local_port == port and port != 0) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "tcp_port_policy.reuseMayShare(tcb.options.reuse_addr, @intFromEnum(tcbs[i].state) == @intFromEnum(TcpState.time_wait))") != null);
+    // Both bind paths (IPv4 and IPv6) refuse a privileged port without the capability with EACCES.
+    const ss = kt.socket_syscall_source;
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n        return net_mod.tcp.tcpBind(tcb_idx, parsed.port);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n    return net_mod.tcp.tcpBind(tcb_idx, port);"));
+    // hello183 runs as uid 0 with only CAP_SETUID so the child's setuid leaves it unprivileged.
+    const h = kt.capability_profile.profileForLaunch("hello183", true, false);
+    try std.testing.expect(h.caps.cap_setuid and !h.caps.cap_net_bind and !h.caps.cap_net_admin);
+    try std.testing.expectEqual(@as(u32, 0), h.uid);
+}

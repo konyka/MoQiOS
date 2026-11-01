@@ -1,0 +1,185 @@
+/// hello183: TCP bind() errors (EADDRINUSE, EACCES, EINVAL) and SO_REUSEADDR rules.
+
+#include <stdint.h>
+
+static inline int64_t syscall1(uint64_t nr, uint64_t a1) {
+    int64_t ret;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1) : "rcx", "r11", "memory");
+    return ret;
+}
+static inline int64_t syscall2(uint64_t nr, uint64_t a1, uint64_t a2) {
+    int64_t ret;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2) : "rcx", "r11", "memory");
+    return ret;
+}
+static inline int64_t syscall3(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3) {
+    int64_t ret;
+    register uint64_t rdx __asm__("rdx") = a3;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx) : "rcx", "r11", "memory");
+    return ret;
+}
+static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
+    int64_t ret;
+    register uint64_t rdx __asm__("rdx") = a3;
+    register uint64_t r10 __asm__("r10") = a4;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx), "r"(r10) : "rcx", "r11", "memory");
+    return ret;
+}
+static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+    int64_t ret;
+    register uint64_t rdx __asm__("rdx") = a3;
+    register uint64_t r10 __asm__("r10") = a4;
+    register uint64_t r8 __asm__("r8") = a5;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx), "r"(r10), "r"(r8) : "rcx", "r11", "memory");
+    return ret;
+}
+static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
+    int64_t ret;
+    register uint64_t rdx __asm__("rdx") = a3;
+    register uint64_t r10 __asm__("r10") = a4;
+    register uint64_t r8 __asm__("r8") = a5;
+    register uint64_t r9 __asm__("r9") = a6;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx), "r"(r10), "r"(r8), "r"(r9) : "rcx", "r11", "memory");
+    return ret;
+}
+
+#define SYS_WRITE     1
+#define SYS_EXIT      2
+#define SYS_CLOSE     11
+#define SYS_FORK      57
+#define SYS_WAITPID   6
+#define SYS_NANOSLEEP 35
+#define SYS_NETPOLL   104
+#define SYS_SOCKET    117
+#define SYS_BIND      118
+#define SYS_LISTEN    119
+#define SYS_SENDTO    121
+#define SYS_CONNECT   124
+#define SYS_ACCEPT4   131
+#define SYS_SETSOCKOPT 132
+#define SYS_SETUID    174
+#define AF_INET 2
+#define AF_INET6 10
+#define SOCK_STREAM 1
+#define SOL_SOCKET 1
+#define SO_REUSEADDR 2
+#define EACCES_ 13
+#define EINVAL_ 22
+#define EADDRINUSE_ 98
+
+struct ts { int64_t s, n; };
+static void print(const char *s) {
+    uint64_t n = 0;
+    while (s[n]) n++;
+    syscall3(SYS_WRITE, 1, (uint64_t)s, n);
+}
+static int failures = 0;
+static void check(int ok, const char *what) {
+    print(ok ? "hello183:   ok   " : "hello183:   FAIL ");
+    print(what);
+    print("\n");
+    if (!ok) failures++;
+}
+static void sleep_ms(int ms) {
+    struct ts t = { 0, (int64_t)ms * 1000000 };
+    syscall2(SYS_NANOSLEEP, (uint64_t)&t, 0);
+}
+static void pump(int ms) {
+    for (int i = 0; i < ms; i += 10) { syscall1(SYS_NETPOLL, 0); sleep_ms(10); }
+}
+static void mk_addr(uint8_t *a, int port) {
+    for (int i = 0; i < 16; i++) a[i] = 0;
+    a[1] = 2; a[2] = (uint8_t)(port >> 8); a[3] = (uint8_t)port; a[4] = 127; a[7] = 1;
+}
+static void mk_addr6(uint8_t *a, int port) {
+    for (int i = 0; i < 28; i++) a[i] = 0;
+    a[0] = AF_INET6;
+    a[2] = (uint8_t)(port >> 8); a[3] = (uint8_t)port;
+    a[8 + 15] = 1;
+}
+static int64_t sock4(void) { return syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM, 0); }
+static int64_t bind4(int64_t s, int port) {
+    uint8_t sa[16];
+    mk_addr(sa, port);
+    return syscall3(SYS_BIND, (uint64_t)s, (uint64_t)sa, 16);
+}
+static void reuse(int64_t s) {
+    int one = 1;
+    syscall5(SYS_SETSOCKOPT, (uint64_t)s, SOL_SOCKET, SO_REUSEADDR, (uint64_t)&one, 4);
+}
+
+void _start(void) {
+    print("hello183: TCP bind errors and SO_REUSEADDR\n");
+
+    /* A: a port held by another socket is EADDRINUSE */
+    int64_t a = sock4();
+    check(bind4(a, 18383) == 0, "A: bind a free port");
+    int64_t b = sock4();
+    check(bind4(b, 18383) == -EADDRINUSE_, "A: binding the same port again is EADDRINUSE");
+    check(bind4(a, 18384) == -EINVAL_, "A: rebinding an already bound socket is EINVAL");
+    check(bind4(b, 18385) == 0, "A: a different port is fine");
+    syscall1(SYS_CLOSE, b);
+
+    /* B: a listening socket's port is not shareable even with SO_REUSEADDR on both */
+    reuse(a);
+    check(syscall2(SYS_LISTEN, (uint64_t)a, 4) == 0, "B: listen");
+    int64_t c = sock4();
+    reuse(c);
+    check(bind4(c, 18383) == -EADDRINUSE_, "B: SO_REUSEADDR does not let a second socket bind a listening port");
+    syscall1(SYS_CLOSE, c);
+
+    /* C: after the listener closes the port can be bound again (with SO_REUSEADDR, even with connections in TIME_WAIT) */
+    {
+        uint8_t sa[16];
+        mk_addr(sa, 18383);
+        int64_t cl = sock4();
+        int64_t r = syscall3(SYS_CONNECT, (uint64_t)cl, (uint64_t)sa, 16);
+        for (int i = 0; i < 20 && r < 0; i++) { syscall1(SYS_NETPOLL, 0); r = syscall3(SYS_CONNECT, (uint64_t)cl, (uint64_t)sa, 16); if (r == -106) { r = 0; break; } }
+        int64_t acc = -1;
+        for (int i = 0; i < 20 && acc < 0; i++) { syscall1(SYS_NETPOLL, 0); acc = syscall4(SYS_ACCEPT4, (uint64_t)a, 0, 0, 0); }
+        check(r == 0 && acc >= 0, "C: a connection to the listener");
+        syscall1(SYS_CLOSE, (uint64_t)acc);
+        syscall1(SYS_CLOSE, (uint64_t)cl);
+        pump(100);
+        syscall1(SYS_CLOSE, a);
+        pump(100);
+        int64_t d = sock4();
+        reuse(d);
+        check(bind4(d, 18383) == 0, "C: with SO_REUSEADDR the port can be rebound while old connections linger");
+        syscall1(SYS_CLOSE, d);
+    }
+
+    /* D: privileged ports need CAP_NET_BIND_SERVICE */
+    int64_t kid = syscall1(SYS_FORK, 0);
+    if (kid == 0) {
+        failures = 0;
+        syscall1(SYS_SETUID, 1000);
+        int64_t s = sock4();
+        check(bind4(s, 80) == -EACCES_, "D: an unprivileged bind to port 80 is EACCES");
+        check(bind4(s, 18386) == 0, "D: and the socket is still usable for an ordinary port");
+        syscall1(SYS_EXIT, failures == 0 ? 0 : 1);
+        for (;;) {}
+    }
+    int st = 0;
+    syscall3(SYS_WAITPID, (uint64_t)kid, (uint64_t)&st, 0);
+    check(((st >> 8) & 0xff) == 0 && (st & 0x7f) == 0, "D: the unprivileged child's checks all passed");
+
+    /* E: IPv6 sockets report the same errors */
+    {
+        uint8_t s6a[28];
+        mk_addr6(s6a, 18387);
+        int64_t x = syscall3(SYS_SOCKET, AF_INET6, SOCK_STREAM, 0);
+        int64_t y = syscall3(SYS_SOCKET, AF_INET6, SOCK_STREAM, 0);
+        check(syscall3(SYS_BIND, (uint64_t)x, (uint64_t)s6a, 28) == 0, "E: IPv6 bind");
+        check(syscall3(SYS_BIND, (uint64_t)y, (uint64_t)s6a, 28) == -EADDRINUSE_, "E: the same IPv6 port again is EADDRINUSE");
+        check(syscall3(SYS_BIND, (uint64_t)x, (uint64_t)s6a, 28) == -EINVAL_, "E: rebinding an IPv6 socket is EINVAL");
+        syscall1(SYS_CLOSE, x);
+        syscall1(SYS_CLOSE, y);
+    }
+
+    syscall1(SYS_CLOSE, b);
+    print(failures == 0 ? "hello183: PASS\n" : "hello183: FAIL\n");
+    print("hello183 done\n");
+    syscall1(SYS_EXIT, failures == 0 ? 0 : 1);
+    for (;;) {}
+}

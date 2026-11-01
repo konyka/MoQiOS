@@ -270,7 +270,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) < sa.SOCKADDR_IN6_LEN)
             return -22;
         const parsed = sa.parseInet6(&sa6) orelse return -97; // EAFNOSUPPORT
-        if (parsed.port != 0 and parsed.port < 1024 and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return -1;
+        if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
         return net_mod.tcp.tcpBind(tcb_idx, parsed.port);
     }
     if (addr_len < SOCKADDR_IN_MIN_LEN) return -22;
@@ -278,7 +278,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     var sock_addr: [8]u8 = undefined;
     if (copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), SOCKADDR_IN_MIN_LEN) != SOCKADDR_IN_MIN_LEN) return -14;
     const port = bo.readU16BeAt(&sock_addr, 2);
-    if (port != 0 and port < 1024 and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return -1;
+    if (net_mod.tcp_port_policy.bindNeedsPrivilege(port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
     return net_mod.tcp.tcpBind(tcb_idx, port);
 }
 

@@ -4006,7 +4006,9 @@ pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
     defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
-    if (!tcb.active or tcb.state != .closed) return -1;
+    if (!tcb.active) return -1;
+    // bind() on a socket that already has an address, or is past CLOSED, is EINVAL.
+    if (tcb.state != .closed or tcb.bound_explicitly) return tcp_port_policy.BIND_EINVAL;
 
     // Check if port is already in use (bitmap-driven scan)
     // SO_REUSEADDR allows binding to a port in TIME_WAIT state
@@ -4014,11 +4016,12 @@ pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
     while (bm != 0) {
         const i = @ctz(bm);
         bm &= bm - 1;
-        if (tcbs[i].local_port == port) {
-            if (tcb.options.reuse_addr and tcbs[i].state == .time_wait) {
+        if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict
+        if (tcbs[i].local_port == port and port != 0) {
+            if (tcp_port_policy.reuseMayShare(tcb.options.reuse_addr, @intFromEnum(tcbs[i].state) == @intFromEnum(TcpState.time_wait))) {
                 continue;
             }
-            return -1;
+            return tcp_port_policy.BIND_EADDRINUSE;
         }
     }
 
