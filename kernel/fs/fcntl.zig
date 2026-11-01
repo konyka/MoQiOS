@@ -6,6 +6,7 @@
 ///   - F_GETFL / F_SETFL: get/set file status flags (O_NONBLOCK, O_APPEND)
 ///   - F_DUPFD_CLOEXEC: duplicate fd with FD_CLOEXEC set
 const vfs = @import("vfs.zig");
+const policy = @import("fcntl_policy.zig");
 
 pub const F_DUPFD: u64 = 0;
 pub const F_GETFD: u64 = 1;
@@ -15,7 +16,10 @@ pub const F_SETFL: u64 = 4;
 pub const F_GETLK: u64 = 5;
 pub const F_SETLK: u64 = 6;
 pub const F_SETLKW: u64 = 7;
+pub const F_GETLEASE: u64 = 1025;
 pub const F_DUPFD_CLOEXEC: u64 = 1030;
+pub const F_SETPIPE_SZ: u64 = 1031;
+pub const F_GETPIPE_SZ: u64 = 1032;
 pub const F_ADD_SEALS: u64 = 1033;
 pub const F_GET_SEALS: u64 = 1034;
 
@@ -50,20 +54,25 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
             return @intCast(t.fd_table.fds[fd].fd_flags);
         },
         F_SETFD => {
-            t.fd_table.fds[fd].fd_flags = @truncate(arg);
+            t.fd_table.fds[fd].fd_flags = policy.fdFlagsFromSetfd(arg);
             return 0;
         },
         F_GETFL => {
-            return @intCast(vfs.statusFlagsOf(&t.fd_table.fds[fd]));
+            const d = &t.fd_table.fds[fd];
+            return @intCast(policy.reportedFlags(@tagName(d.fd_type), vfs.statusFlagsOf(d)));
         },
         F_SETFL => {
-            // Only O_NONBLOCK and O_APPEND can be modified via F_SETFL
-            const allowed: u32 = O_NONBLOCK | O_APPEND;
-            const new_flags: u32 = @as(u32, @truncate(arg)) & allowed;
-            // Preserve non-modifiable bits
             const cur_flags = vfs.statusFlagsOf(&t.fd_table.fds[fd]);
-            vfs.setStatusFlags(&t.fd_table.fds[fd], (cur_flags & ~allowed) | new_flags);
+            vfs.setStatusFlags(&t.fd_table.fds[fd], policy.applySetfl(cur_flags, arg));
             return 0;
+        },
+        F_GETLEASE => return policy.F_UNLCK, // leases are not supported: none is ever held
+        F_GETPIPE_SZ, F_SETPIPE_SZ => {
+            switch (t.fd_table.fds[fd].fd_type) {
+                .pipe_read, .pipe_write => {},
+                else => return -9, // EBADF: not a pipe
+            }
+            return if (cmd == F_GETPIPE_SZ) @as(i64, policy.PIPE_SIZE) else policy.setPipeSize(arg);
         },
         F_DUPFD_CLOEXEC => {
             return dupFd(t.fd_table, fd, arg, FD_CLOEXEC);

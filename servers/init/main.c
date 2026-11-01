@@ -313,6 +313,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello184"); /* TCP errno conformance */
     run_test("hello185"); /* fd/path errno conformance */
     run_test("hello186"); /* epoll errno and layout conformance */
+    run_test("hello187"); /* fcntl errno and flag conformance */
 
     start_persistent_services();
 

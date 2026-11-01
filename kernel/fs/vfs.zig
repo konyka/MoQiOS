@@ -923,8 +923,8 @@ pub const FdTable = struct {
         const is_writable = (flags & 0x03) != 0;
         const o_creat = (flags & 0x40) != 0;
         const o_trunc = (flags & 0x200) != 0; // O_TRUNC
-        // Status flags visible via F_GETFL: access mode + O_APPEND + O_NONBLOCK.
-        const status = flags & (0x03 | 0x400 | 0x800);
+        // Status flags visible via F_GETFL (access mode, O_APPEND, O_NONBLOCK, O_SYNC, ...).
+        const status = flags & @import("fcntl_policy.zig").OPEN_STATUS_MASK;
 
         // Mounted ext4/NTFS volumes (fs/rofs.zig). Checked first so a mount
         // target shadows same-named paths of the flat filesystems, as a

@@ -5964,3 +5964,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 变异（具名测试核对）：`ctlPrecheck` 里 EFAULT/两处 EBADF/EPERM/EINVAL（自己、非 epoll）/`EPOLLEXCLUSIVE` 的三个条件/`EXCLUSIVE_OK_BITS` 少一位/`ctlHasEvent` 改成只看 ADD 与 MOD、`pollable` 的 6 个类型各去掉一个、`waitErrno` 的 EBADF/`maxevents` 下界/上界改成 128/缓冲区范围/非 epoll 检查、事件大小与偏移常量、`EpollEvent` 去掉 `align(1)`、`epollCtl` 不读事件、MOD 的 `EPOLLEXCLUSIVE` 检查、`.same_file` 恒为假、`epollWaitFd` 接线、`syscall_entry` 里 `maxevents` 被替换，共 29 个，其中 27 个被具名测试 `epoll errnos follow Linux's order…`（或更新后的 `epoll MOD advances…`）抓住，另有 2 个是等价变异：`events_ptr > USER_LIMIT` 与 `>=` 的差别只在恰好等于上限时，而那时 `bytes > USER_LIMIT - events_ptr` 已经返回 `EFAULT`；`ADD` 里的 `event orelse return …` 在 `ctlPrecheck` 已经对不可读事件返回 `EFAULT` 之后不可达。3 个变异第一次因编译失败/未使用参数被换成可编译形式后重跑并抓住；恢复后 `grep -c MUTATION` 为 0。
 - 验证：host 858/858；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello186 PASS、0 个 FAIL（hello89/105/112/157/158/159/160/182 等所有已有 epoll 探测均 PASS）；stress（SMP=2）5/5 PASS。
+
+### fcntl 与 open 标志（hello187）
+
+- 问题：见 `docs/kernel-subsystems.md` 的 hello187 条。最严重的是 `open(O_CLOEXEC)` 完全没有生效（`execve` 后该描述符仍然开着，会泄漏给被执行的程序）；其余是 `F_SETFD`/`F_GETFL`/`F_SETFL` 的位处理和几个没有实现的命令。
+- 方法：宿主机取 77 项真实 Linux 返回值（对 `O_LARGEFILE`——libc 在 64 位上自动加的 0x8000——在对照程序里屏蔽，因为裸系统调用看不到它），生成 hello187 逐项对照；旧内核 21 项 FAIL。
+- 修复：规则抽到 `fs/fcntl_policy.zig`（`fdFlagsFromSetfd`、`applySetfl`、`reportedFlags`、`OPEN_STATUS_MASK`、`setPipeSize`），`fcntl.zig`、`vfs.zig`（open 的状态位掩码）、`file_io.zig`（`O_CLOEXEC`）使用。
+- 已知差异：`F_SETPIPE_SZ` 无法放大管道（内核管道缓冲区固定 4096 字节；Linux 允许到 1 MiB）；`F_GETFL` 不报 `O_LARGEFILE`（Linux 内核对 64 位程序会报 0x8000，对照程序屏蔽了它，生成的程序也没有该位）；`F_SETLEASE`、`F_NOTIFY`、`F_SETOWN/GETOWN`、`F_SETSIG/GETSIG`、`F_GET_RW_HINT` 等没有对照也没有实现（落到 `EINVAL`）；`O_PATH`、`O_TMPFILE` 的打开语义没有对照；`O_NOATIME` 的存在性检查（非属主返回 `EPERM`）没有对照。
+- TDD：host 新增 1 个测试（各规则函数的穷举与边界、各入口的接线形状）；hello187（77 项）在旧内核上 21 项 FAIL，新内核 PASS。
+
+- 变异（具名测试核对）：`F_SETFD` 不掩码（两种）、`SETFL_MASK` 少/多位（4 种）、`applySetfl` 丢掉当前位、`OPEN_STATUS_MASK` 少 `O_SYNC`/`O_DIRECT`/`O_DIRECTORY`/`O_NOFOLLOW`/`O_NOATIME` 各一位以及多出 `O_CLOEXEC`、`alwaysReadWrite` 的 7 个类型各去掉一个、`reportedFlags` 不补 `O_RDWR`/不替换原访问模式、`PIPE_SIZE`/`setPipeSize` 的边界、`F_UNLCK` 值、`fcntl.zig` 与 `vfs.zig` 与 `file_io.zig` 的接线，共 34 个，全部被 `fcntl flags: …` 抓住。第一轮有 3 个存活（`reportedFlags` 只检查了存储为 0 的情形、`F_UNLCK` 的值、`O_CLOEXEC` 条件取反——最后一个是因为断言只查了 `fd_flags = FD_CLOEXEC` 这一行，没有带上前一行条件），已补强断言（存储为 1 的套接字、`F_UNLCK == 2`、带上完整条件行）后重跑全部抓住；1 个因编译失败（未使用变量）改成可编译形式后抓住；恢复后 `grep -c MUTATION` 为 0。
+- 验证：host 859/859；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello187 PASS、0 个 FAIL；stress（SMP=2）5/5 PASS。

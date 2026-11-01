@@ -1584,6 +1584,58 @@ test "munmap and SysV SHM policy validation" {
     try std.testing.expect(shm_policy.rangeEnd(0x7000_0000, 4096, munmap_policy.USER_ADDR_MAX) != null);
 }
 
+test "fcntl flags: FD_CLOEXEC is one bit, F_SETFL touches only APPEND/NONBLOCK/DIRECT/NOATIME, open keeps SYNC/DIRECTORY/NOFOLLOW/NOATIME" {
+    const fp = kt.fcntl_policy;
+    // F_SETFD keeps only FD_CLOEXEC.
+    try std.testing.expectEqual(@as(u32, 1), fp.fdFlagsFromSetfd(1));
+    try std.testing.expectEqual(@as(u32, 1), fp.fdFlagsFromSetfd(0xff));
+    try std.testing.expectEqual(@as(u32, 0), fp.fdFlagsFromSetfd(2));
+    try std.testing.expectEqual(@as(u32, 0), fp.fdFlagsFromSetfd(0));
+    // F_SETFL: access mode and creation flags are never changed, the four settable ones are.
+    const rdwr: u32 = 2;
+    try std.testing.expectEqual(rdwr | 0x800, fp.applySetfl(rdwr, 0x800));
+    try std.testing.expectEqual(rdwr, fp.applySetfl(rdwr | 0x800, 0));
+    try std.testing.expectEqual(rdwr | 0x800, fp.applySetfl(rdwr, 0 | 0x800 | 1)); // O_WRONLY in arg is ignored
+    try std.testing.expectEqual(rdwr, fp.applySetfl(rdwr, 0x40 | 0x200 | 0x80)); // O_CREAT|O_TRUNC|O_EXCL
+    try std.testing.expectEqual(rdwr | 0x400, fp.applySetfl(rdwr, 0x400));
+    try std.testing.expectEqual(rdwr | 0x4000, fp.applySetfl(rdwr, 0x4000));
+    try std.testing.expectEqual(rdwr | 0x40000, fp.applySetfl(rdwr, 0x40000));
+    try std.testing.expectEqual(@as(u32, 1), fp.applySetfl(1 | 0x400, 0)); // clearing O_APPEND keeps O_WRONLY
+    try std.testing.expectEqual(rdwr | 0x10000, fp.applySetfl(rdwr | 0x10000, 0x800 & 0)); // O_DIRECTORY survives
+    // open() keeps the flags F_GETFL reports, and drops the creation-time ones.
+    try std.testing.expectEqual(@as(u32, 0x3 | 0x400 | 0x800 | 0x101000 | 0x4000 | 0x10000 | 0x20000 | 0x40000), fp.OPEN_STATUS_MASK);
+    try std.testing.expectEqual(@as(u32, 0), fp.OPEN_STATUS_MASK & (0x40 | 0x80 | 0x100 | 0x200 | 0x80000));
+    // Sockets, epoll, eventfd and timerfd report O_RDWR; files and pipes report what open() stored.
+    for ([_][]const u8{ "tcp_socket", "udp_socket", "unix_socket", "raw_socket", "epoll", "eventfd", "timerfd" }) |t| {
+        try std.testing.expect(fp.alwaysReadWrite(t));
+        try std.testing.expectEqual(@as(u32, 2), fp.reportedFlags(t, 0));
+        try std.testing.expectEqual(@as(u32, 2 | 0x800), fp.reportedFlags(t, 0x800));
+    }
+    for ([_][]const u8{ "pipe_read", "pipe_write", "tmpfs_file", "special", "devfs", "ext2_file", "rofs_file" }) |t| {
+        try std.testing.expect(!fp.alwaysReadWrite(t));
+        try std.testing.expectEqual(@as(u32, 1), fp.reportedFlags(t, 1));
+    }
+    try std.testing.expectEqual(@as(u32, 2), fp.reportedFlags("tcp_socket", 1)); // any stored access mode is replaced
+    try std.testing.expectEqual(@as(i64, 2), fp.F_UNLCK);
+    // Pipes have one fixed page: asking for more is ENOMEM, asking for less (or nothing) rounds up to it.
+    try std.testing.expectEqual(@as(i64, 4096), fp.setPipeSize(4096));
+    try std.testing.expectEqual(@as(i64, 4096), fp.setPipeSize(1));
+    try std.testing.expectEqual(@as(i64, 4096), fp.setPipeSize(0));
+    try std.testing.expectEqual(@as(i64, -12), fp.setPipeSize(4097));
+    try std.testing.expectEqual(@as(i64, -12), fp.setPipeSize(1 << 30));
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "pub const PIPE_BUF_SIZE: u32 = 4096;") != null); // fcntl_policy.PIPE_SIZE mirrors it
+
+    // The entry points use the policy.
+    const fc = kt.fcntl_source;
+    try std.testing.expect(std.mem.indexOf(u8, fc, "t.fd_table.fds[fd].fd_flags = policy.fdFlagsFromSetfd(arg);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fc, "vfs.setStatusFlags(&t.fd_table.fds[fd], policy.applySetfl(cur_flags, arg));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fc, "policy.reportedFlags(@tagName(d.fd_type), vfs.statusFlagsOf(d))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fc, "F_GETLEASE => return policy.F_UNLCK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fc, "else => return -9, // EBADF: not a pipe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "const status = flags & @import(\"fcntl_policy.zig\").OPEN_STATUS_MASK;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.file_io_source, "if (result >= 0 and (flags & @import(\"fcntl_policy.zig\").O_CLOEXEC) != 0 and result < vfs_mod.MAX_FDS) {\n        cur.fd_table.fds[@intCast(result)].fd_flags = @import(\"fcntl_policy.zig\").FD_CLOEXEC;") != null);
+}
+
 test "epoll errnos follow Linux's order: EFAULT, EBADF, EPERM, EINVAL; wait checks maxevents before the buffer" {
     const ep = kt.epoll_policy;
     const E = kt.errno;
