@@ -307,6 +307,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello178"); /* IP_TTL / IP_TOS / IPV6_* socket options */
     run_test("hello179"); /* SO_PRIORITY / SO_MARK / SO_BINDTODEVICE ... */
     run_test("hello180"); /* getsockname / getpeername on AF_UNIX */
+    run_test("hello181"); /* AF_UNIX datagram sendto with an address */
 
     start_persistent_services();
 

@@ -18,6 +18,17 @@ fn fdIndex(fd: u64) u32 {
     return if (fd > 0xFFFF_FFFF) 0xFFFF_FFFF else @intCast(fd);
 }
 
+/// Largest single message a write() on a message socket can carry; anything bigger can
+/// never fit the receive ring and is EMSGSIZE.
+const MESSAGE_WRITE_MAX: usize = 8192;
+
+fn isMessageSocket(cur: *task_mod.Task, fd: u32) bool {
+    if (fd >= vfs_mod.MAX_FDS) return false;
+    const d = &cur.fd_table.fds[fd];
+    if (d.fd_type != .unix_socket) return false;
+    return !@import("../net/unix_socket.zig").unixIsStream(d.unix_sock_idx);
+}
+
 pub fn write(fd: u64, buf: u64, count: u64) i64 {
     if (buf == 0 or buf >= 0x0000_8000_0000_0000 or count > 0x7FFFFFFF) return -1;
     const n: usize = @intCast(count);
@@ -32,6 +43,15 @@ pub fn write(fd: u64, buf: u64, count: u64) i64 {
     // VFS write
     if (sched_mod.currentTaskIndex()) |cur_idx| {
         if (task_mod.getTask(cur_idx)) |cur| {
+            // A message socket (AF_UNIX datagram / seqpacket) takes the whole write as ONE
+            // message: chunking it into 4 KiB pieces would turn one write into several
+            // datagrams and lose the record boundary.
+            if (isMessageSocket(cur, fdIndex(fd))) {
+                if (n > MESSAGE_WRITE_MAX) return -90; // EMSGSIZE
+                var mbuf: [MESSAGE_WRITE_MAX]u8 = undefined;
+                if (copy.copyFromUser(mbuf[0..n], @ptrFromInt(buf), n) != n) return -14;
+                return cur.fd_table.write(fdIndex(fd), &mbuf, n);
+            }
             var pos: usize = 0;
             while (pos < n) {
                 const chunk = @min(n - pos, 4096);

@@ -9290,3 +9290,41 @@ test "AF_UNIX getsockname / getpeername: address encoding and wiring" {
     try std.testing.expect(std.mem.indexOf(u8, ss, "const n = net_mod.unix_socket.unixSockName(desc.unix_sock_idx) orelse return -9;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "const n = net_mod.unix_socket.unixPeerName(desc.unix_sock_idx) orelse return -9;\n        if (!n.ok) return ENOTCONN;") != null);
 }
+
+test "AF_UNIX datagram sendto / sendmsg with an address, and EMSGSIZE" {
+    const np = kt.namespace_policy;
+    // A datagram plus its 2-byte length prefix must fit the ring; otherwise it can never be delivered.
+    try std.testing.expect(np.dgramFits(8190, 8192));
+    try std.testing.expect(!np.dgramFits(8191, 8192));
+    try std.testing.expect(!np.dgramFits(8192, 8192));
+    try std.testing.expect(np.dgramFits(0, 8192));
+
+    const us = kt.unix_socket_source;
+    // The addressed variant is the one implementation; the plain entry point is a thin wrapper.
+    try std.testing.expect(std.mem.indexOf(u8, us, "return unixSendRightsTo(idx, data, len, rights, null);") != null);
+    // Only datagram sockets take an address: streams are EISCONN/EOPNOTSUPP, seqpacket ignores it.
+    try std.testing.expect(std.mem.indexOf(u8, us, "SOCK_DGRAM => dest_in,\n        SOCK_SEQPACKET => null,\n        else => if (dest_in != null) return if (sock.connected) @as(i64, -106) else @as(i64, -95) else null,") != null);
+    // The target is whoever is bound to that path now; no one is ECONNREFUSED, another socket type EPROTOTYPE.
+    try std.testing.expect(std.mem.indexOf(u8, us, "peer_i = findBoundLocked(d) orelse return -111; // ECONNREFUSED\n            if (unix_sockets[peer_i].sock_type != sock.sock_type) return -91; // EPROTOTYPE") != null);
+    // A datagram larger than the whole ring is EMSGSIZE in both the immediate and the blocking path.
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (!np.dgramFits(len, UNIX_SOCK_BUF_SIZE)) return -90; // EMSGSIZE") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, us, "if (!np.dgramFits(len, UNIX_SOCK_BUF_SIZE)) return -90; // EMSGSIZE"));
+    // The blocking addressed send retries in short sleeps with the socket's send timeout, and only on EAGAIN.
+    try std.testing.expect(std.mem.indexOf(u8, us, "const r = unixSendRightsTo(idx, data, len, null, dest);\n        if (r != -11 or nonblock) return r;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (urp.timedOut(deadline, tsc.nanos())) return -11;\n        const w = @import(\"../fs/poll.zig\").waitSlice(deadline);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "const ms = if (unixOptView(idx)) |v| v.opts.snd_ms else 0;\n            deadline = urp.deadlineNs(tsc.nanos(), ms);\n            armed = true;\n        }\n        if (urp.timedOut(deadline, tsc.nanos())) return -11;") != null);
+
+    const ss = kt.socket_syscall_source;
+    // sendto and sendmsg both resolve the destination through the one parser, and the parser checks family and length.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "unixDestPath(") - 1);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (bo.readU16Le(out[0..2]) != 1) return .{ .err = -97 }; // EAFNOSUPPORT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (n == 0) return .{ .err = -22 };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "unixSendRightsTo(idx, &data, @intCast(got), &rights, dest)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "unixSendToBlocking(unix_idx, &tmp_unix, n_unix, dest_buf[2..][0..dlen]") != null);
+
+    // write() on a message socket is one message, never chunked into several datagrams.
+    const fi = kt.file_io_source;
+    try std.testing.expect(std.mem.indexOf(u8, fi, "if (isMessageSocket(cur, fdIndex(fd))) {\n                if (n > MESSAGE_WRITE_MAX) return -90; // EMSGSIZE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fi, "return !@import(\"../net/unix_socket.zig\").unixIsStream(d.unix_sock_idx);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fi, "const MESSAGE_WRITE_MAX: usize = 8192;") != null);
+}

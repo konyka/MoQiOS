@@ -375,6 +375,24 @@ pub fn accept4(fd: u32, addr_ptr: u64, addr_len_ptr: u64, flags: u32) i64 {
     return result;
 }
 
+/// Read a sockaddr_un destination into `out` (family at 0..2, path from 2); returns the path
+/// length (to the first NUL). Errors are negative errnos.
+const UnixDest = union(enum) { ok: usize, err: i64 };
+
+fn unixDestPath(addr_ptr: u64, addr_len: u32, out: *[110]u8) UnixDest {
+    const ap = @import("socket_address_policy.zig");
+    if (addr_ptr >= 0x0000_8000_0000_0000) return .{ .err = -14 };
+    if (!ap.unixLengthValid(addr_len, SOCKADDR_UN_PATH_OFFSET)) return .{ .err = -22 };
+    const to_copy = @min(@as(usize, addr_len), out.len);
+    const copied = copy.copyFromUser(out[0..to_copy], @ptrFromInt(addr_ptr), to_copy);
+    if (copied != to_copy) return .{ .err = -14 };
+    if (bo.readU16Le(out[0..2]) != 1) return .{ .err = -97 }; // EAFNOSUPPORT (AF_UNIX, little endian)
+    var n: usize = 0;
+    while (2 + n < copied and out[2 + n] != 0) n += 1;
+    if (n == 0) return .{ .err = -22 };
+    return .{ .ok = n };
+}
+
 /// sendto(fd, buf, len, flags, addr_ptr, addr_len) → bytes sent or -errno
 pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: u32) i64 {
     if (!@import("socket_address_policy.zig").optionalUserAddressValid(addr_ptr, 0x0000_8000_0000_0000)) return -14;
@@ -455,6 +473,15 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         const n_unix = copy.copyFromUser(&tmp_unix, @ptrFromInt(buf), to_copy_unix);
         if (n_unix == 0) return -1;
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
+        // sendto(addr): an explicit destination path (datagram sockets).
+        if (addr_ptr != 0 and addr_len != 0) {
+            var dest_buf: [110]u8 = undefined;
+            const dlen = switch (unixDestPath(addr_ptr, addr_len, &dest_buf)) {
+                .ok => |n| n,
+                .err => |e| return e,
+            };
+            return @import("../fs/namespace_policy.zig").sendResult(net_mod.unix_socket.unixSendToBlocking(unix_idx, &tmp_unix, n_unix, dest_buf[2..][0..dlen], @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, flags)), flags);
+        }
         return @import("../fs/namespace_policy.zig").sendResult(net_mod.unix_socket.unixSendBlocking(unix_idx, &tmp_unix, n_unix, @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, flags)), flags);
     } else {
         // Not a socket — use regular write
@@ -948,7 +975,22 @@ fn unixSendmsg(cur: *task_mod.Task, fd: u32, msghdr: *const [56]u8) i64 {
         releaseRights(&rights);
         return -22;
     }
-    const sent = net_mod.unix_socket.unixSendRights(idx, &data, @intCast(got), &rights);
+    // msg_name / msg_namelen (offsets 0 and 8): an explicit destination path.
+    const name_ptr: u64 = bo.readU64At(msghdr, 0);
+    const name_len: u32 = @truncate(bo.readU64At(msghdr, 8));
+    var dest_buf: [110]u8 = undefined;
+    var dest: ?[]const u8 = null;
+    if (name_ptr != 0 and name_len != 0) {
+        const dlen = switch (unixDestPath(name_ptr, name_len, &dest_buf)) {
+            .ok => |n| n,
+            .err => |e| {
+                releaseRights(&rights);
+                return e;
+            },
+        };
+        dest = dest_buf[2..][0..dlen];
+    }
+    const sent = net_mod.unix_socket.unixSendRightsTo(idx, &data, @intCast(got), &rights, dest);
     releaseRights(&rights); // still held only if the send did not take them
     return sent;
 }

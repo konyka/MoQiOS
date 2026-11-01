@@ -5901,3 +5901,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异（具名测试核对）：未命名地址长度错、长度漏掉 NUL、没有 NUL 终止符、accept 出来的套接字不是 `name_only`、accept 出来的套接字可以 `bind`、`connect` 不记下地址、未被接受的客户端不检查是否排在队里、流式反向引用不检查、数据报目标槽位被复用不检查、已关闭的对端也应答、`getpeername` 永不返回 `ENOTCONN`，共 11 个。**第一轮有 1 个变异没被抓住**（"已关闭的对端也应答"，即去掉 `!peer.active` 判断）：我的 host 断言没钉住这一行，hello180 也没有构造"数据报目标已关闭"的场景；我补了探测（目标关闭后 `ENOTCONN`，以及新建套接字复用槽位后不会被当作对端）和一条 host 断言，之后 11 个全部被 `AF_UNIX getsockname / getpeername…` 抓住；恢复后 `grep -c MUTATION` 为 0。
 - 验证：host 852/852；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次，hello169 与 hello180 均 PASS）与 GPT SMP=2 通过；stress（SMP=2）5/5 PASS；补充探测后 SMP=2 复跑 hello180 PASS（内核代码在补探测前后相同）。
 
+### AF_UNIX 数据报的 sendto/sendmsg 带地址与 EMSGSIZE（hello181）
+
+- 问题：①`sendto`/`sendmsg` 忽略 AF_UNIX 的目的地址；②超过整个接收环的数据报：非阻塞 `EAGAIN`（误导）、阻塞则永久等待；③`write` 把消息套接字的大写入拆成多个数据报。
+- 修复：见 `docs/kernel-subsystems.md` 的 hello181 条。
+- 已知差异：地址只支持文件系统风格的路径（以 NUL 开头的抽象地址不支持，`bind` 也不支持）；阻塞的地址发送用短睡眠重试而不是挂在目标的等待链上（可能多出最多一个睡眠片的延迟）；`SOCK_SEQPACKET` 已连接时忽略地址，与 Linux 一致，但未连接的 seqpacket 带地址不报 `EOPNOTSUPP`；`sendmmsg` 对 AF_UNIX 仍未实现。
+- 过程说明（如实）：①探测里 `waitpid` 我先用了系统调用 6 加 `WNOHANG`，但那个入口只有 3 个参数，非阻塞等待要用 `wait4`（61），改后红灯/绿灯才可信。②红灯 16 项 FAIL（有 7 项恰好因为当前的错误行为与期望一致而"ok"，不算红）。③实现后依次只剩两处失败：`sendmsg` 的 `msg_name`（`unixSendmsg` 没有读它）和阻塞 `write` 的 `EMSGSIZE`（`write` 经 `file_io.write` 的 4096 字节分块，走不到我加的判断），第二处顺带暴露了上面的第三个既有缺陷。④`unixDestPath` 第一版我写成了占位实现（返回错误）再填充，这是一个会让所有地址发送失败的中间状态，没有被提交。
+- TDD：host 新增 1 个测试（`dgramFits` 的边界，地址发送的类型规则与 `ECONNREFUSED`/`EPROTOTYPE`、`EMSGSIZE` 在两条路径里、阻塞重试的形状，`sendto`/`sendmsg` 共用解析函数、`write` 的整块消息）；hello181（A 未连接的发送方按路径发给绑定的接收者且不被连接、B 同一发送方换目标、C 已连接套接字带地址发给该地址而普通 write 仍走对端、D `sendmsg` 的 `msg_name`、E 无人绑定/类型不符/未连接的流带地址、F 满的接收者 `EAGAIN` 且读后恢复、G 超大数据报 `EMSGSIZE` 且阻塞 `write` 不再永久等待）在旧内核上 16 项 FAIL，新内核 PASS，hello134/145/152/153/159/163/164/165/167/168/169/180 仍 PASS。
+- 变异（具名测试核对）：数据报忽略地址、seqpacket 接受地址、流的两个 errno 互换、无人绑定的目标错 errno、不检查目标类型、立即路径缺 `EMSGSIZE`、阻塞路径缺 `EMSGSIZE`、非阻塞的地址发送也等待、地址发送不理 `SO_SNDTIMEO`、不检查地址族、接受空路径、`sendmsg` 忽略 `msg_name`、`write` 又把消息拆成块、`write` 上限差一，共 14 个，全部被 `AF_UNIX datagram sendto / sendmsg…` 抓住。**第一轮有 3 个没被抓住或没编译**：“地址发送不理 `SO_SNDTIMEO`”（断言只检查了 `waitSlice` 调用，没钉住它前面的超时判断）、“非阻塞的地址发送也等待”（`if (r != -11 or nonblock) return r;` 这行在文件里出现 3 次，我的断言只检查了子串存在，被另外两处满足）、“不检查地址族”（编译失败）；我把两条断言收紧为包含前一行上下文的确切片段，并把编译失败的变异改成可编译形式，之后全部被抓住。另外变异脚本里有一个模式没写对（上下文串不匹配）导致脚本中途报错，修正后重跑，恢复后 `grep -c MUTATION` 为 0。
+- 验证：host 853/853；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello181 PASS、0 个 FAIL；stress（SMP=2）5/5 PASS。
+

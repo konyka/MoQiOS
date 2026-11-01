@@ -712,6 +712,22 @@ pub fn unixSend(idx: u32, data: [*]const u8, len: usize) i64 {
 /// 0 when the set was queued (ownership moved to the socket); when it is still
 /// non-zero on return the caller must release the descriptors itself.
 pub fn unixSendRights(idx: u32, data: [*]const u8, len: usize, rights: ?*RightsIn) i64 {
+    return unixSendRightsTo(idx, data, len, rights, null);
+}
+
+/// The bound socket named `path`, or null (unix_lock held).
+fn findBoundLocked(path: []const u8) ?u32 {
+    for (&unix_sockets, 0..) |*o, i| {
+        if (!o.active or !o.bound or o.path_len != path.len) continue;
+        if (@import("std").mem.eql(u8, o.path[0..o.path_len], path)) return @intCast(i);
+    }
+    return null;
+}
+
+/// unixSendRights with an explicit destination address (sendto / sendmsg with msg_name).
+/// Only datagram sockets take one: a connected stream socket answers EISCONN and an
+/// unconnected one EOPNOTSUPP; a connected seqpacket socket ignores the address (as Linux does).
+pub fn unixSendRightsTo(idx: u32, data: [*]const u8, len: usize, rights: ?*RightsIn, dest_in: ?[]const u8) i64 {
     if (idx >= MAX_UNIX_SOCKETS) return -9; // EBADF
 
     var wake: EpollWake = .{};
@@ -722,6 +738,11 @@ pub fn unixSendRights(idx: u32, data: [*]const u8, len: usize, rights: ?*RightsI
     const sock = &unix_sockets[idx];
     if (!sock.active) return -9; // EBADF
     const carrying = if (rights) |r| r.count > 0 else false;
+    const dest: ?[]const u8 = switch (sock.sock_type) {
+        SOCK_DGRAM => dest_in,
+        SOCK_SEQPACKET => null,
+        else => if (dest_in != null) return if (sock.connected) @as(i64, -106) else @as(i64, -95) else null,
+    };
 
     if (sock.sock_type == SOCK_STREAM) {
         if (!sock.connected) {
@@ -797,13 +818,20 @@ pub fn unixSendRights(idx: u32, data: [*]const u8, len: usize, rights: ?*RightsI
                 },
             }
         }
-        const peer_i: u32 = sock.peer_idx;
+        var peer_i: u32 = sock.peer_idx;
+        if (dest) |d| {
+            // Addressed datagram: the target is whoever is bound to that path right now.
+            peer_i = findBoundLocked(d) orelse return -111; // ECONNREFUSED
+            if (unix_sockets[peer_i].sock_type != sock.sock_type) return -91; // EPROTOTYPE
+        }
         if (peer_i >= MAX_UNIX_SOCKETS or !unix_sockets[peer_i].active) {
             // A seqpacket socket was connected: a vanished peer is EPIPE.
             return if (sock.sock_type == SOCK_SEQPACKET and sock.was_connected) -32 else -107;
         }
 
         const peer = &unix_sockets[peer_i];
+        // A datagram larger than the whole ring can never be delivered: not "try again later".
+        if (!np.dgramFits(len, UNIX_SOCK_BUF_SIZE)) return -90; // EMSGSIZE
         if (sock.sock_type == SOCK_SEQPACKET) {
             if (!peer.connected or peer.peer_idx != @as(u8, @intCast(idx))) return -32; // EPIPE
             if (np.halfCloseSendBroken(halfCloseLocked(idx))) return -32; // EPIPE: shutdown(SHUT_WR) here or SHUT_RD at the peer
@@ -1325,11 +1353,13 @@ pub fn unixSendBlocking(idx: u32, data: [*]const u8, len: usize, nonblock: bool)
             // sendRoomLocked answers null when there is no peer: let the real
             // send report the error. Never call it with unix_lock held — it
             // takes the lock itself.
+            // A datagram that exceeds the whole ring can never fit: report it instead of waiting.
+            if (!np.dgramFits(len, UNIX_SOCK_BUF_SIZE)) return -90; // EMSGSIZE
             const fits = blk: {
                 const saved = unix_lock.acquire();
                 defer unix_lock.release(saved);
                 const room = sendRoomLocked(idx) orelse break :blk true;
-                break :blk np.dgramFits(len, UNIX_SOCK_BUF_SIZE) and room >= len + np.DGRAM_PREFIX;
+                break :blk room >= len + np.DGRAM_PREFIX;
             };
             if (fits) return unixSendRights(idx, data, len, null);
             if (nonblock) return -11;
@@ -1343,6 +1373,30 @@ pub fn unixSendBlocking(idx: u32, data: [*]const u8, len: usize, nonblock: bool)
         if (urp.timedOut(deadline, tsc.nanos())) return np.sendTimeoutResult(done);
         const w = parkOn(idx, .write, need, deadline);
         if (w != 0) return w;
+    }
+}
+
+/// sendto / sendmsg with a destination path on a datagram socket. A full receiver is EAGAIN for
+/// a non-blocking sender; a blocking one retries in short sleeps (the wait lists belong to the
+/// sender's own peer, which an addressed send does not use) until it fits, a signal arrives or
+/// SO_SNDTIMEO passes.
+pub fn unixSendToBlocking(idx: u32, data: [*]const u8, len: usize, dest: []const u8, nonblock: bool) i64 {
+    if (idx >= MAX_UNIX_SOCKETS) return -9;
+    const urp = @import("udp_recv_policy.zig");
+    const tsc = @import("../arch/arch.zig").tsc;
+    var deadline: ?u64 = null;
+    var armed = false;
+    while (true) {
+        const r = unixSendRightsTo(idx, data, len, null, dest);
+        if (r != -11 or nonblock) return r;
+        if (!armed) {
+            const ms = if (unixOptView(idx)) |v| v.opts.snd_ms else 0;
+            deadline = urp.deadlineNs(tsc.nanos(), ms);
+            armed = true;
+        }
+        if (urp.timedOut(deadline, tsc.nanos())) return -11;
+        const w = @import("../fs/poll.zig").waitSlice(deadline);
+        if (w < 0) return w;
     }
 }
 
