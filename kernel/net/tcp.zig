@@ -1707,7 +1707,7 @@ fn noteDelivery(tcb: *TcpTcb, delivered: u32) void {
     const now = timestampMs();
     if (tcb.rate_sample_ms != 0) {
         const elapsed = now -% tcb.rate_sample_ms;
-        if (elapsed > 0) {
+        if (tcp_util.deliverySampleUsable(delivered, mssForTcb(tcb), elapsed)) {
             const inst = probeDeliveryRateBps(delivered, elapsed);
             if (inst >= tcb.delivery_rate) {
                 tcb.delivery_rate = inst;
@@ -4170,6 +4170,15 @@ pub fn tcpRecvAvailable(tcb_idx: u32) u32 {
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return 0;
     return ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
+}
+
+/// Bytes in the send ring: data written but not yet acknowledged by the peer
+/// (sent or not), what SIOCOUTQ reports. Lock-free, like tcpRecvAvailable.
+pub fn tcpSendQueued(tcb_idx: u32) u32 {
+    if (tcb_idx >= MAX_CONNECTIONS) return 0;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active) return 0;
+    return ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
 }
 
 /// Return the number of bytes of free space in the send buffer.

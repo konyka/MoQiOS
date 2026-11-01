@@ -109,8 +109,13 @@ static void spin_ms(int ms) {
 }
 
 static volatile int thread_done;
+static volatile int64_t thread_clk_before, thread_clk_after, thread_ru_before, thread_ru_after;
 static __attribute__((noinline, noreturn)) void thread_main(void) {
+    thread_clk_before = clock_ms(CLOCK_THREAD_CPUTIME_ID);
+    thread_ru_before = ru_ms(RUSAGE_THREAD);
     spin_ms(250);
+    thread_clk_after = clock_ms(CLOCK_THREAD_CPUTIME_ID);
+    thread_ru_after = ru_ms(RUSAGE_THREAD);
     thread_done = 1;
     syscall1(SYS_EXIT, 0);
     for (;;) {}
@@ -132,13 +137,15 @@ void _start(void) {
     struct rusage cru;
     for (int i = 0; i < 18; i++) ((int64_t *)&cru)[i] = 0;
     int st = -1;
+    int64_t self_before = ru_ms(RUSAGE_SELF);
     check(syscall4(SYS_WAIT4, (uint64_t)c, (uint64_t)&st, 0, (uint64_t)&cru) == c, "A: wait4 reaps the child");
     int64_t child_ms = (cru.ut_s + cru.st_s) * 1000 + (cru.ut_us + cru.st_us) / 1000;
     check(child_ms >= 180, "A: wait4 fills ru_utime/ru_stime with the child's CPU time (>= 180 ms)");
     int64_t kids = ru_ms(RUSAGE_CHILDREN);
     check(kids >= 180, "A: RUSAGE_CHILDREN now includes the waited-for child (>= 180 ms)");
     check(kids >= child_ms - 5 && kids <= child_ms + 50, "A: and matches what wait4 reported");
-    check(ru_ms(RUSAGE_SELF) < 120, "A: RUSAGE_SELF does not include the child");
+    /* Not an absolute bound: a task that sleeps while it is alone on its CPU is charged for the sleep. */
+    check(ru_ms(RUSAGE_SELF) - self_before < 100, "A: reaping the child does not add its time to RUSAGE_SELF");
 
     /* B: a grandchild's time reaches the grandparent through the child's own waited children */
     int64_t before = ru_ms(RUSAGE_CHILDREN);
@@ -181,8 +188,12 @@ void _start(void) {
         while (!thread_done) sleep_ms(20);
         check(clock_ms(CLOCK_PROCESS_CPUTIME_ID) - proc0 >= 180, "D: CLOCK_PROCESS_CPUTIME_ID includes the thread's spin (>= 180 ms)");
         check(ru_ms(RUSAGE_SELF) - self0 >= 180, "D: getrusage(RUSAGE_SELF) includes the thread's spin (>= 180 ms)");
-        check(clock_ms(CLOCK_THREAD_CPUTIME_ID) < proc0 + 120, "D: CLOCK_THREAD_CPUTIME_ID stays this thread's own");
-        check(ru_ms(RUSAGE_THREAD) < self0 + 120, "D: RUSAGE_THREAD stays this thread's own");
+        /* Measured inside the new thread: it starts at zero (the process had already used 100+ ms)
+         * and its own spin is all it accrues. */
+        check(thread_clk_before < 50, "D: a new thread's CLOCK_THREAD_CPUTIME_ID starts near zero, not at the process total");
+        check(thread_clk_after - thread_clk_before >= 180 && thread_clk_after - thread_clk_before <= 450, "D: and counts the thread's own 250 ms spin");
+        check(thread_ru_before < 50, "D: RUSAGE_THREAD of a new thread starts near zero");
+        check(thread_ru_after - thread_ru_before >= 180 && thread_ru_after - thread_ru_before <= 450, "D: and counts the thread's own spin");
 
         /* E: once the exited thread's slot is reclaimed its time is not lost */
         sleep_ms(300);

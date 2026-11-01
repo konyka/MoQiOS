@@ -8716,3 +8716,45 @@ test "ICMPv6 port unreachable for UDP over ::1: quote parsing, reply rule and wi
     try std.testing.expect(std.mem.indexOf(u8, v6src, "DEST_UNREACHABLE => {") != null);
     try std.testing.expect(std.mem.indexOf(u8, v6src, "@import(\"udp.zig\").notifyUnreachable(q.src_port, q.dst_port);") != null);
 }
+
+test "ioctl(TIOCOUTQ): socket send-queue reporting and its wiring" {
+    const ip = kt.ioctl_policy;
+    try std.testing.expectEqual(@as(u64, 0x5411), ip.TIOCOUTQ);
+    // It is not a terminal-only request: a socket must reach the handler.
+    try std.testing.expect(!ip.isTerminalRequest(ip.TIOCOUTQ));
+    try std.testing.expectEqual(@as(i64, 0), ip.terminalCheck(ip.TIOCOUTQ, .other));
+
+    const src = kt.ioctl_source;
+    try std.testing.expect(std.mem.indexOf(u8, src, ".tcp_socket => @import(\"../net/tcp.zig\").tcpSendQueued(desc.tcb_idx),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, ".unix_socket => @import(\"../net/unix_socket.zig\").unixSendQueued(desc.unix_sock_idx),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, ".udp_socket => 0,\n                else => return -25, // ENOTTY") != null);
+    // The counter is clamped to a non-negative int before copy-out.
+    try std.testing.expect(std.mem.indexOf(u8, src, "const v: i32 = @intCast(@min(queued, 0x7FFF_FFFF));") != null);
+
+    // TCP counts the whole send ring (unsent + unacknowledged); AF_UNIX counts the peer's ring after validating the back-reference.
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "pub fn tcpSendQueued(tcb_idx: u32) u32 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "return ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);\n}\n\n/// Return the number of bytes of free space in the send buffer.") != null);
+    const us = kt.unix_socket_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (!sock.active or !sock.connected or sock.peer_idx >= MAX_UNIX_SOCKETS) return 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (!peer.active or peer.peer_idx != @as(u8, @intCast(idx))) return 0;\n    return peer.buf_count;") != null);
+}
+
+test "TCP delivery-rate samples: only bulk, recent acknowledgements measure the path" {
+    const tu = kt.tcp_util;
+    // A lone small write acknowledged after the delayed-ACK interval says nothing about bandwidth.
+    try std.testing.expect(!tu.deliverySampleUsable(100, 1460, 400));
+    // At most one segment is application-limited, however quick.
+    try std.testing.expect(!tu.deliverySampleUsable(1460, 1460, 5));
+    // More than one segment, soon after the previous sample: a real sample.
+    try std.testing.expect(tu.deliverySampleUsable(2921, 1460, 5));
+    try std.testing.expect(tu.deliverySampleUsable(65536, 1460, 1000));
+    // Across an idle gap the sender set the pace.
+    try std.testing.expect(!tu.deliverySampleUsable(65536, 1460, 1001));
+    // No time elapsed: no rate; a zero SMSS never divides or underflows.
+    try std.testing.expect(!tu.deliverySampleUsable(65536, 1460, 0));
+    try std.testing.expect(tu.deliverySampleUsable(2, 0, 10));
+    try std.testing.expect(!tu.deliverySampleUsable(1, 0, 10));
+    // And the wiring: the sampler consults the rule instead of accepting any positive elapsed time.
+    try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "if (tcp_util.deliverySampleUsable(delivered, mssForTcb(tcb), elapsed)) {") != null);
+}

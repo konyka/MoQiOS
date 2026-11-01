@@ -829,6 +829,20 @@ pub fn unixPeek(idx: u32, buf: [*]u8, len: usize, full_len: *usize) i64 {
     return @intCast(n);
 }
 
+/// SIOCOUTQ: bytes socket `idx` has sent that its peer has not read yet — the
+/// peer's ring contents. 0 without a valid peer (back-reference checked: after
+/// a slot realloc `peer_idx` may name an unrelated socket).
+pub fn unixSendQueued(idx: u32) u32 {
+    if (idx >= MAX_UNIX_SOCKETS) return 0;
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+    const sock = &unix_sockets[idx];
+    if (!sock.active or !sock.connected or sock.peer_idx >= MAX_UNIX_SOCKETS) return 0;
+    const peer = &unix_sockets[sock.peer_idx];
+    if (!peer.active or peer.peer_idx != @as(u8, @intCast(idx))) return 0;
+    return peer.buf_count;
+}
+
 /// True when socket `idx` is a stream socket (MSG_WAITALL applies).
 pub fn unixIsStream(idx: u32) bool {
     if (idx >= MAX_UNIX_SOCKETS) return false;

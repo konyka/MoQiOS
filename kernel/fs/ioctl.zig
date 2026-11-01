@@ -20,6 +20,7 @@ pub const TIOCSWINSZ = 0x5414; // Set window size
 pub const TIOCGPGRP = 0x540F; // Get foreground process group
 pub const TIOCSPGRP = 0x5410; // Set foreground process group
 pub const FIONREAD = 0x541B; // Get number of readable bytes
+pub const TIOCOUTQ = 0x5411; // Bytes sent on a socket that the peer has not consumed (SIOCOUTQ)
 pub const FIONBIO = 0x5421; // Set/clear non-blocking mode
 
 // ── Terminal data structures ──
@@ -182,6 +183,22 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
 
             const nr_bytes: [*]const u8 = @ptrCast(&nread);
             if (copy.copyToUser(@ptrFromInt(arg), nr_bytes[0..4], 4) != 4) return -14;
+            return 0;
+        },
+        TIOCOUTQ => {
+            // SIOCOUTQ: sockets answer with the data still queued toward the
+            // peer; every other descriptor is not a socket (ENOTTY).
+            if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14;
+            const desc = &cur0.fd_table.fds[@intCast(fd)];
+            const queued: u32 = switch (desc.fd_type) {
+                .tcp_socket => @import("../net/tcp.zig").tcpSendQueued(desc.tcb_idx),
+                .unix_socket => @import("../net/unix_socket.zig").unixSendQueued(desc.unix_sock_idx),
+                .udp_socket => 0,
+                else => return -25, // ENOTTY
+            };
+            const v: i32 = @intCast(@min(queued, 0x7FFF_FFFF));
+            const v_bytes: [*]const u8 = @ptrCast(&v);
+            if (copy.copyToUser(@ptrFromInt(arg), v_bytes[0..4], 4) != 4) return -14;
             return 0;
         },
         FIONBIO => {

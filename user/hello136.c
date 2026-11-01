@@ -142,9 +142,11 @@ void _start(void) {
     /* E: the lowest-numbered pending signal goes first */
     {
         uint64_t both = (1ULL << (35 - 1)) | (1ULL << (10 - 1)) | (1ULL << (33 - 1));
-        sigact(10, (uint64_t)handler, 0, 0);
-        sigact(33, (uint64_t)handler, 0, 0);
-        sigact(35, (uint64_t)handler, 0, 0);
+        /* sa_mask = both: the handler records order[] non-atomically, so another of the three
+         * must not be delivered inside it (a timer-tick delivery could otherwise interleave). */
+        sigact(10, (uint64_t)handler, 0, both);
+        sigact(33, (uint64_t)handler, 0, both);
+        sigact(35, (uint64_t)handler, 0, both);
         syscall4(SYS_SIGPROCMASK, SIG_BLOCK, (uint64_t)&both, 0, 8);
         syscall2(SYS_KILL, self(), 35);
         syscall2(SYS_KILL, self(), 33);

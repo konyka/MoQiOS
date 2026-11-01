@@ -13,6 +13,7 @@ pub const TIOCGPGRP: u64 = 0x540F;
 pub const TIOCSPGRP: u64 = 0x5410;
 pub const TIOCGWINSZ: u64 = 0x5413;
 pub const TIOCSWINSZ: u64 = 0x5414;
+pub const TIOCOUTQ: u64 = 0x5411;
 pub const FIONREAD: u64 = 0x541B;
 pub const FIONBIO: u64 = 0x5421;
 pub const FIONCLEX: u64 = 0x5450;

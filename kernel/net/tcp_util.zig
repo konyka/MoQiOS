@@ -70,6 +70,21 @@ pub fn rcvWindowFromBuffered(buffered: u32, window: u32) u32 {
     return if (buffered < window) window - buffered else 0;
 }
 
+/// Longest gap between two delivery-rate samples that still measures the path:
+/// across a longer idle period the sender, not the network, set the pace.
+pub const DELIVERY_SAMPLE_MAX_GAP_MS: u32 = 1000;
+
+/// Whether `delivered` bytes acknowledged `elapsed_ms` after the previous
+/// sample say anything about the path's bandwidth. A sample of at most one
+/// segment (an application-limited write, a lone delayed ACK) or one taken
+/// across an idle gap measures the application, not the network; pacing at
+/// that "rate" throttles the connection to a few bytes per second, and since
+/// the paced sends produce the next samples it never recovers.
+pub fn deliverySampleUsable(delivered: u32, smss: u32, elapsed_ms: u32) bool {
+    if (elapsed_ms == 0 or elapsed_ms > DELIVERY_SAMPLE_MAX_GAP_MS) return false;
+    return delivered > @max(smss, 1);
+}
+
 /// Advance the ephemeral port counter with wrap: 65535 → 49152. Saturating
 /// (`+|=`) would park the counter at 65535 and alias every later 4-tuple.
 pub fn nextEphemeralPort(cur: u16) u16 {
