@@ -77,8 +77,9 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     // 3. Reject kernel-half ranges — kernel stacks and DMA pages share PML4
     // entries 256-511, so flipping U/S+writable there must not be possible.
     // Mirrors the munmap check in mmap.zig.
-    if (addr >= user_space.USER_ADDR_MAX) return EINVAL;
-    if (len > user_space.USER_ADDR_MAX - addr) return EINVAL;
+    // Linux: a range that leaves user space (or wraps when rounded up) is ENOMEM, not EINVAL.
+    if (addr >= user_space.USER_ADDR_MAX) return ENOMEM;
+    if (len > user_space.USER_ADDR_MAX - addr) return ENOMEM;
     // The TLB shootdown API takes a u32 page count; reject larger requests
     // before any preflight work rather than allowing a truncating cast.
     const len_pages = policy.pageCount(len);

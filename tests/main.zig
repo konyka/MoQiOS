@@ -590,7 +590,7 @@ test "sleep timer wiring preserves legacy scheduler wakeups and zero deadlines" 
     try std.testing.expect(std.mem.indexOf(u8, sleep_body, "deadline != 0 and now_ns >= deadline") != null);
 }
 
-test "mmap rejects unsupported flags and protection bits" {
+test "mmap rejects unsupported flags; unknown protection bits are ignored as on Linux" {
     try std.testing.expect(
         mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | mmap_policy.MAP_ANONYMOUS),
     );
@@ -598,9 +598,10 @@ test "mmap rejects unsupported flags and protection bits" {
         !mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | mmap_policy.MAP_SHARED),
     );
     try std.testing.expect(!mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | (1 << 63)));
-    try std.testing.expect(!mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | 0x8000));
-    try std.testing.expect(mmap_policy.protValid(0));
-    try std.testing.expect(!mmap_policy.protValid(0x8));
+    try std.testing.expect(!mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | 0x2000)); // MAP_LOCKED
+    try std.testing.expect(mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | 0x8000)); // MAP_POPULATE is only a hint
+    try std.testing.expectEqual(@as(u64, 0), mmap_policy.normalizeProt(0));
+    try std.testing.expectEqual(@as(u64, 0), mmap_policy.normalizeProt(0x8));
     try std.testing.expect(mmap_policy.anonymousFlagsValid(mmap_policy.MAP_PRIVATE | mmap_policy.MAP_ANONYMOUS));
     try std.testing.expect(mmap_policy.anonymousFlagsValid(mmap_policy.MAP_SHARED | mmap_policy.MAP_ANONYMOUS));
     try std.testing.expect(!mmap_policy.isAnonymous(mmap_policy.MAP_PRIVATE));
@@ -1582,6 +1583,94 @@ test "munmap and SysV SHM policy validation" {
     try std.testing.expect(shm_policy.flagsValid(shm_policy.SHM_RDONLY | shm_policy.SHM_EXEC));
     try std.testing.expect(!shm_policy.flagsValid(1));
     try std.testing.expect(shm_policy.rangeEnd(0x7000_0000, 4096, munmap_policy.USER_ADDR_MAX) != null);
+}
+
+test "memory-management argument rules follow Linux: ranges, rounding, flags, mlockall" {
+    const rp = kt.range_policy;
+    const E = kt.errno;
+    // alignUp wraps to null where Linux's PAGE_ALIGN wraps to 0.
+    try std.testing.expectEqual(@as(?u64, 0), rp.alignUp(0));
+    try std.testing.expectEqual(@as(?u64, 4096), rp.alignUp(1));
+    try std.testing.expectEqual(@as(?u64, 8192), rp.alignUp(4097));
+    try std.testing.expectEqual(@as(?u64, null), rp.alignUp(0xffff_ffff_ffff_f001));
+    try std.testing.expectEqual(@as(?u64, null), rp.alignUp(std.math.maxInt(u64)));
+    // inUserSpace
+    try std.testing.expect(rp.inUserSpace(0x1000, 1));
+    try std.testing.expect(!rp.inUserSpace(0xffff800000000000, 1));
+    try std.testing.expect(!rp.inUserSpace(0x00007ffffffff000, 2));
+    try std.testing.expect(rp.inUserSpace(0x00007ffffffff000, 1));
+    try std.testing.expect(!rp.inUserSpace(0x1000, std.math.maxInt(u64)));
+    // madvise: alignment, then wrap (EINVAL); zero length succeeds; leaving user space is ENOMEM.
+    try std.testing.expectEqual(rp.Span{ .err = E.EINVAL }, rp.madviseSpan(0x1001, 4096));
+    try std.testing.expectEqual(rp.Span{ .err = E.EINVAL }, rp.madviseSpan(0x1000, std.math.maxInt(u64)));
+    try std.testing.expectEqual(rp.Span.empty, rp.madviseSpan(0x1000, 0));
+    try std.testing.expectEqual(rp.Span{ .err = E.EINVAL }, rp.madviseSpan(0x1001, 0)); // alignment is checked first
+    try std.testing.expectEqual(rp.Span{ .err = E.ENOMEM }, rp.madviseSpan(0xffff800000000000, 4096));
+    try std.testing.expectEqual(rp.Span{ .pages = 2 }, rp.madviseSpan(0x1000, 4097));
+    for ([_]u32{ 0, 1, 2, 3, 4, 8 }) |a| try std.testing.expect(rp.madviseSupported(a));
+    for ([_]u32{ 5, 9, 10, 11, 12, 14, 100, 9999 }) |a| try std.testing.expect(!rp.madviseSupported(a));
+    // mincore: alignment EINVAL; a wrapping length or a range outside user space is ENOMEM; zero length is empty.
+    try std.testing.expectEqual(rp.Span{ .err = E.EINVAL }, rp.mincoreSpan(0x1001, 4096));
+    try std.testing.expectEqual(rp.Span{ .err = E.ENOMEM }, rp.mincoreSpan(0x1000, std.math.maxInt(u64)));
+    try std.testing.expectEqual(rp.Span{ .err = E.ENOMEM }, rp.mincoreSpan(0xffff800000000000, 4096));
+    try std.testing.expectEqual(rp.Span.empty, rp.mincoreSpan(0x1000, 0));
+    try std.testing.expectEqual(rp.Span{ .pages = 1 }, rp.mincoreSpan(0x1000, 1));
+    // mlock: zero length is a no-op; the start rounds down and the length grows by the part page.
+    try std.testing.expectEqual(rp.Span.empty, rp.lockSpan(0x30000000, 0));
+    try std.testing.expectEqual(rp.Span{ .pages = 1 }, rp.lockSpan(0x1000, 4096));
+    try std.testing.expectEqual(rp.Span{ .pages = 2 }, rp.lockSpan(0x1fff, 2)); // straddles a page boundary
+    try std.testing.expectEqual(rp.Span{ .err = E.ENOMEM }, rp.lockSpan(0x1000, std.math.maxInt(u64)));
+    try std.testing.expectEqual(rp.Span{ .err = E.ENOMEM }, rp.lockSpan(0xffff800000000000, 4096));
+    try std.testing.expect(!rp.inUserSpace(0x0000_8000_0000_0000, 0)); // the limit itself is outside
+    // mlockall flags
+    try std.testing.expect(!rp.mlockallFlagsValid(0));
+    try std.testing.expect(rp.mlockallFlagsValid(1));
+    try std.testing.expect(rp.mlockallFlagsValid(2));
+    try std.testing.expect(rp.mlockallFlagsValid(3));
+    try std.testing.expect(!rp.mlockallFlagsValid(4)); // MCL_ONFAULT alone
+    try std.testing.expect(rp.mlockallFlagsValid(5));
+    try std.testing.expect(!rp.mlockallFlagsValid(8));
+
+    // munmap rounds the length up instead of refusing it, and an unaligned address stays EINVAL.
+    const mp = kt.munmap_policy;
+    try std.testing.expectEqual(@as(u64, 1), mp.validate(0x4000, 1).?.num_pages);
+    try std.testing.expectEqual(@as(u64, 2), mp.validate(0x4000, 4097).?.num_pages);
+    try std.testing.expect(mp.validate(0x4000, 0) == null);
+    try std.testing.expect(mp.validate(0x4001, 4096) == null);
+    try std.testing.expect(mp.validate(0x4000, std.math.maxInt(u64)) == null);
+
+    // mmap: the extra flags are accepted, MAP_LOCKED is not; unknown protection bits are dropped.
+    const m = kt.mmap_policy;
+    try std.testing.expect(m.flagsValid(m.MAP_PRIVATE | m.MAP_ANONYMOUS | m.MAP_FIXED_NOREPLACE));
+    try std.testing.expect(m.flagsValid(m.MAP_PRIVATE | m.MAP_ANONYMOUS | m.MAP_GROWSDOWN | m.MAP_STACK | m.MAP_POPULATE | m.MAP_NORESERVE));
+    try std.testing.expect(!m.flagsValid(m.MAP_PRIVATE | 0x2000));
+    try std.testing.expectEqual(@as(u64, 3), m.normalizeProt(3 | 0x01000000));
+    // File offsets: past the largest file size is EOVERFLOW; a length that wraps when rounded is the caller's ENOMEM.
+    try std.testing.expect(!m.fileOffsetOverflows(0, 4096));
+    try std.testing.expect(!m.fileOffsetOverflows(1 << 40, 1 << 20));
+    try std.testing.expect(m.fileOffsetOverflows(0xffff_ffff_ffff_f000, 4096)); // offset -4096
+    try std.testing.expect(m.fileOffsetOverflows(m.MAX_FILE_BYTES - 4095, 8192));
+    try std.testing.expect(!m.fileOffsetOverflows(m.MAX_FILE_BYTES - 8191, 4096));
+    try std.testing.expect(!m.fileOffsetOverflows(0, 0xffff_ffff_ffff_ffff));
+    try std.testing.expect(!m.fileOffsetOverflows(4096, 0xffff_ffff_ffff_f001));
+
+    // The entry points use the policy (order matters: see the comments next to each).
+    const mmsrc = kt.mmap_source;
+    try std.testing.expect(std.mem.indexOf(u8, mmsrc, "if (offset % user_space.PAGE_SIZE != 0) return -22; // EINVAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mmsrc, "const prot = mmap_policy.normalizeProt(prot_raw);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mmsrc, "if (length > user_space.USER_ADDR_MAX) return -12; // ENOMEM") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mmsrc, "return -75; // EOVERFLOW") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mmsrc, "if ((desc.status_flags & 0x03) == 1) return -13; // EACCES") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mmsrc, "if (is_noreplace and (hasMmapOverlap(cur, base, num_pages) or !pagesFree(cur, base, num_pages))) return -17; // EEXIST") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mmsrc, "if (!fixedReplaceable(cur, base, num_pages)) return -12;\n            unmapRange(cur, base, num_pages);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mmsrc, "if (old_size > 0xFFFFFFFF_FFFFF000 or new_size > 0xFFFFFFFF_FFFFF000) return -22; // EINVAL") != null);
+    const se = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, se, "if (!rp.madviseSupported(advice)) return -22; // EINVAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "if (!@import(\"../../mm/mmap.zig\").rangeMapped(addr, length)) return -12; // ENOMEM: a hole in the range") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "if (!@import(\"../../mm/range_policy.zig\").mlockallFlagsValid(flags)) return -22;\n    return if (@import(\"../../mm/mlock_policy.zig\").userMlockUnsupported()) -38 else unreachable;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "fn syscallMunlockall() i64 {\n    return 0;\n}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "if (rc != 0 or len == 0) return rc;\n    return if (@import(\"../../mm/mlock_policy.zig\").userMlockUnsupported()) -38 else unreachable;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.mprotect_source, "if (addr >= user_space.USER_ADDR_MAX) return ENOMEM;") != null);
 }
 
 test "fcntl flags: FD_CLOEXEC is one bit, F_SETFL touches only APPEND/NONBLOCK/DIRECT/NOATIME, open keeps SYNC/DIRECTORY/NOFOLLOW/NOATIME" {

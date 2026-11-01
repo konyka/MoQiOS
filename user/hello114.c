@@ -1140,7 +1140,7 @@ void _start(void) {
         syscall1(SYS_CLOSE, (uint64_t)mfd);
         {
             int64_t dfd = syscall2(SYS_OPEN, (uint64_t)"/mnt/mm/dir", O_RDONLY);
-            check(syscall6(SYS_MMAP, 0, 4096, PROT_READ, MAP_PRIVATE, (uint64_t)dfd, 0) == -19, "P: mmap of a directory is ENODEV");
+            check(syscall6(SYS_MMAP, 0, 4096, PROT_READ, MAP_PRIVATE, (uint64_t)dfd, 0) == -13, "P: mmap of a directory is EACCES (measured on Linux)");
             syscall1(SYS_CLOSE, (uint64_t)dfd);
         }
         /* a private writable mapping is a copy: writes stay in memory, the file is unchanged */

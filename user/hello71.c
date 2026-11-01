@@ -38,14 +38,14 @@ int main(int argc, char **argv, char **envp) {
         CHECK(syscall2(SYS_mlock, page, PAGE_SIZE) == -ENOSYS,
               "mlock returns ENOSYS");
         CHECK(*word == 0x68656c6c6f3731UL, "mlock preserves sentinel");
-        CHECK(syscall2(SYS_munlock, page, PAGE_SIZE) == -ENOSYS,
-              "munlock returns ENOSYS");
+        CHECK(syscall2(SYS_munlock, page, PAGE_SIZE) == 0,
+              "munlock succeeds (nothing is ever locked)");
         CHECK(*word == 0x68656c6c6f3731UL, "munlock preserves sentinel");
         CHECK(syscall1(SYS_mlockall, MCL_CURRENT | MCL_FUTURE) == -ENOSYS,
               "mlockall current future returns ENOSYS");
         CHECK(*word == 0x68656c6c6f3731UL, "mlockall preserves sentinel");
-        CHECK(syscall0(SYS_munlockall) == -ENOSYS,
-              "munlockall returns ENOSYS");
+        CHECK(syscall0(SYS_munlockall) == 0,
+              "munlockall succeeds (nothing is ever locked)");
         CHECK(*word == 0x68656c6c6f3731UL, "munlockall preserves sentinel");
 
         const long replaced = mmap_raw(page, PAGE_SIZE, PROT_RW,

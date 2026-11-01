@@ -10,15 +10,15 @@ pub const Range = struct {
 };
 
 pub fn validate(addr: u64, length: u64) ?Range {
-    // This kernel keeps unmapRange page-granular. Reject an unaligned length
-    // rather than rounding it up and unmapping bytes outside the request.
-    if (length == 0 or addr % PAGE_SIZE != 0 or length % PAGE_SIZE != 0) return null;
-    const raw_end = @addWithOverflow(addr, length);
+    // Linux rounds the length up to whole pages: the partial last page is unmapped too.
+    if (length == 0 or addr % PAGE_SIZE != 0) return null;
+    const rounded = @addWithOverflow(length, PAGE_SIZE - 1);
+    if (rounded[1] != 0) return null;
+    const len = rounded[0] & ~(PAGE_SIZE - 1);
+    const raw_end = @addWithOverflow(addr, len);
     if (raw_end[1] != 0 or raw_end[0] > USER_ADDR_MAX) return null;
-    const rounded_end = @addWithOverflow(raw_end[0], PAGE_SIZE - 1);
-    if (rounded_end[1] != 0) return null;
-    const end = rounded_end[0] / PAGE_SIZE * PAGE_SIZE;
-    if (end > USER_ADDR_MAX or end <= addr) return null;
+    const end = raw_end[0];
+    if (end <= addr) return null;
     return .{ .base = addr, .num_pages = (end - addr) / PAGE_SIZE };
 }
 
@@ -43,7 +43,9 @@ pub fn canUntrack(split_slots_needed: u32, free_slots: u32) bool {
 test "munmap policy requires alignment and rejects overflow" {
     const std = @import("std");
     try std.testing.expect(validate(0x4000, PAGE_SIZE).?.num_pages == 1);
-    try std.testing.expect(validate(0x4000, 1) == null);
+    try std.testing.expect(validate(0x4000, 1).?.num_pages == 1); // rounded up, as Linux does
+    try std.testing.expect(validate(0x4000, PAGE_SIZE + 1).?.num_pages == 2);
+    try std.testing.expect(validate(0x4000, 0) == null);
     try std.testing.expect(validate(0x4001, PAGE_SIZE) == null);
     try std.testing.expect(validate(USER_ADDR_MAX - PAGE_SIZE, PAGE_SIZE * 2) == null);
     try std.testing.expect(validate(std.math.maxInt(u64) - PAGE_SIZE, PAGE_SIZE) == null);

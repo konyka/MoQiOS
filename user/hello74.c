@@ -56,6 +56,7 @@ static inline s64 syscall6(u64 nr, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a
 #define MAP_ANONYMOUS 0x20
 #define MAP_FIXED 0x10
 #define EINVAL 22
+#define ENOMEM 12
 #define USER_ADDR_MAX 0x0000800000000000UL
 
 static u64 strlen_raw(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
@@ -118,8 +119,8 @@ void _start(void) {
                           "unaligned address is EINVAL");
         failures += check(syscall3(SYS_MPROTECT, (u64)base, PAGE, 8) == -EINVAL,
                           "unknown protection bits are EINVAL");
-        failures += check(syscall3(SYS_MPROTECT, USER_ADDR_MAX, PAGE, PROT_READ) == -EINVAL,
-                          "kernel-half address is EINVAL");
+        failures += check(syscall3(SYS_MPROTECT, USER_ADDR_MAX, PAGE, PROT_READ) == -ENOMEM,
+                          "kernel-half address is ENOMEM (measured on Linux)");
         base[0] = 0x91; base[PAGE] = 0x92; base[2 * PAGE] = 0x93;
         failures += check(syscall3(SYS_MPROTECT, (u64)(base + PAGE), PAGE, PROT_RW) == 0,
                           "invalid requests leave mapping usable");

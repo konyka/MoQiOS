@@ -18,7 +18,7 @@ pub const Verdict = enum { ok, invalid, no_device, access, no_memory };
 /// proceed. Order follows Linux: a bad offset is EINVAL before anything else.
 pub fn admit(is_dir: bool, offset: u64, length: u64, prot: u64, shared: bool) Verdict {
     if (offset % PAGE != 0) return .invalid;
-    if (is_dir) return .no_device;
+    if (is_dir) return .access; // Linux: mapping a directory is EACCES (it has no mmap operation but also no read access)
     // The volume is read-only: a shared writable mapping could never be
     // written back, which is what EACCES on a read-only descriptor means.
     if (shared and prot & 2 != 0) return .access;

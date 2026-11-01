@@ -673,6 +673,47 @@ fn mapZeroedPage(task: *task_mod.Task, virt: u64, flags: paging_mod.MapFlags) bo
 /// writes validated PTE slots, shoots down the old translations, then releases
 /// their frames. Unsupported occupied MAP_FIXED ranges are rejected by the
 /// caller rather than falling back to unmap-before-allocation.
+/// Whether [base, base+num_pages) is exactly one tracked private anonymous region (the case
+/// replaceFixedAnonymous swaps in place).
+fn exactAnonymousRegion(task: *task_mod.Task, base: u64, num_pages: u64) bool {
+    var bits = task.mmap_active_bm;
+    while (bits != 0) {
+        const i: u6 = @truncate(@ctz(bits));
+        bits &= bits - 1;
+        const r = &task.mmap_regions[i];
+        if (r.base == base and r.num_pages == num_pages) return r.file_kind == 0 and !r.shared and !r.no_free;
+    }
+    return false;
+}
+
+/// MAP_FIXED over existing mappings: every occupied page of the range must belong to a tracked region
+/// that can be unmapped (no device/DMA memory, no huge region cut mid-way is a problem because
+/// unmapRange demotes first), the cut must fit the region table, and the replacement must still be
+/// representable afterwards. Nothing is changed here.
+fn fixedReplaceable(task: *task_mod.Task, base: u64, num_pages: u64) bool {
+    const page = user_space.PAGE_SIZE;
+    var bits = task.mmap_active_bm;
+    var split_slots: u32 = 0;
+    while (bits != 0) {
+        const i: u6 = @truncate(@ctz(bits));
+        bits &= bits - 1;
+        const r = &task.mmap_regions[i];
+        if (!rangesOverlap(base, num_pages, r.base, r.num_pages)) continue;
+        if (r.no_free) return false;
+        if (munmap_policy.needsSplitSlot(r.base, r.num_pages, base, num_pages)) split_slots += 1;
+    }
+    const free_slots: u32 = @intCast(task.mmap_regions.len - @popCount(task.mmap_active_bm));
+    if (!munmap_policy.canUntrack(split_slots, free_slots)) return false;
+    // A page that is mapped but belongs to no tracked region (loaded image, stack, brk) cannot be taken.
+    var p: u64 = 0;
+    while (p < num_pages) : (p += 1) {
+        const va = base + p * page;
+        if (paging_mod.isPageOccupied(task.page_table_phys, va) and !hasMmapOverlap(task, va, 1)) return false;
+    }
+    if (@import("../ipc/sysv_shm.zig").overlapsAttachment(task.page_table_phys, base, num_pages)) return false;
+    return canTrackReplacement(task, base, num_pages);
+}
+
 fn replaceFixedAnonymous(
     task: *task_mod.Task,
     base: u64,
@@ -939,12 +980,18 @@ fn mapPrefetched(cur: *task_mod.Task, base: u64, pf: *Prefetch, prot: u64) bool 
 }
 
 /// Core mmap implementation. Returns mapped base address or -errno.
-pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset: u64) i64 {
-    if (!mmap_policy.flagsValid(flags) or !mmap_policy.protValid(prot)) return -22; // EINVAL
+pub fn mmap(addr_hint: u64, length: u64, prot_raw: u64, flags: u64, fd: i64, offset: u64) i64 {
+    if (!mmap_policy.flagsValid(flags)) return -22; // EINVAL
     if (length == 0) return -22; // EINVAL
+    // The offset must be page aligned for every mapping, anonymous ones included (Linux checks it in the
+    // syscall wrapper, before anything else).
+    if (offset % user_space.PAGE_SIZE != 0) return -22; // EINVAL
+    // Linux ignores protection bits it does not know (PROT_GROWSDOWN and the like).
+    const prot = mmap_policy.normalizeProt(prot_raw);
 
     const is_anonymous = mmap_policy.isAnonymous(flags);
-    const is_fixed = (flags & MAP_FIXED != 0);
+    const is_noreplace = (flags & mmap_policy.MAP_FIXED_NOREPLACE) != 0;
+    const is_fixed = (flags & MAP_FIXED != 0) or is_noreplace;
     if (is_anonymous and !mmap_policy.anonymousFlagsValid(flags)) return -22; // EINVAL
 
     const cur_idx = sched.currentTaskIndex() orelse return -1;
@@ -967,7 +1014,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
                 .access => return -13,
                 .no_memory => return -12,
             }
-            if ((vd.status_flags & 0x03) == 1) return -9; // O_WRONLY
+            if ((vd.status_flags & 0x03) == 1) return -13; // O_WRONLY: EACCES (a file must be readable to be mapped)
             const r = prefetchVolumeFile(vd.rofs_mount, vd.rofs_gen, vd.rofs_ref, vd.file_size, offset, length, &pf);
             if (r != 0) return r;
         }
@@ -996,10 +1043,12 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     // metadata below drives the page-fault path (handleFileFault in idt.zig).
     var meta: ?RegionFileMeta = null;
     if (!is_anonymous and pf.list_phys == 0) {
-        // Linux: the offset must be page-aligned.
         if (!filemap.offsetValid(offset)) return -22; // EINVAL
         if (fd < 0 or fd >= vfs.MAX_FDS) return -9; // EBADF
         const desc = &cur.fd_table.fds[@intCast(fd)];
+        if (desc.fd_type == .none) return -9; // EBADF: closed descriptor
+        // An offset (a "negative" one from user space, say) whose mapping would pass the largest file size.
+        if (mmap_policy.fileOffsetOverflows(offset, length)) return -75; // EOVERFLOW
         const kind: filemap.FsKind = switch (desc.fd_type) {
             .ramdisk_file => .ramdisk,
             .tmpfs_file => .tmpfs,
@@ -1008,8 +1057,14 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
             // Pipes, sockets and special files are not mappable.
             else => return -19, // ENODEV
         };
-        // The fd must be readable (status_flags & 3 == 1 is O_WRONLY).
-        if ((desc.status_flags & 0x03) == 1) return -9; // EBADF
+        // Measured on Linux: mapping a directory is EACCES (a directory descriptor has no read access to map).
+        if (kind == .tmpfs) {
+            if (tmpfs.tmpfsGetMetadata(@intCast(desc.tmpfs_idx))) |md| {
+                if (md.is_dir) return -13; // EACCES
+            }
+        }
+        // The fd must be readable (status_flags & 3 == 1 is O_WRONLY): EACCES, for shared and private alike.
+        if ((desc.status_flags & 0x03) == 1) return -13; // EACCES
         const shared = (flags & MAP_SHARED) != 0;
         if (shared and (prot & 2) != 0) {
             // The ramdisk is immutable Limine module memory — writable shared
@@ -1072,24 +1127,34 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     }
 
     // v53.2: reject overflow-inducing length values
-    if (length > 0xFFFFFFFF_FFFFF000) return -12; // ENOMEM
+    if (length > user_space.USER_ADDR_MAX) return -12; // ENOMEM (a length near 2^64 used to overflow the page rounding below)
     const num_pages = (length + user_space.PAGE_SIZE - 1) / user_space.PAGE_SIZE;
 
     // Determine base address
     var base: u64 = undefined;
     if (is_fixed) {
+        // Linux: a range that does not fit in user space is ENOMEM; only then is a misaligned address EINVAL.
+        // A kernel-half base would underflow USER_ADDR_MAX - base (panic in safe builds) or unmap kernel
+        // pages in ReleaseFast, so it is refused here first.
+        if (addr_hint >= user_space.USER_ADDR_MAX) return -12; // ENOMEM
+        if (num_pages > (user_space.USER_ADDR_MAX - addr_hint) / user_space.PAGE_SIZE) return -12; // ENOMEM
         if (addr_hint == 0 or addr_hint % user_space.PAGE_SIZE != 0) return -22; // EINVAL
         base = addr_hint;
         if (base < user_space.PAGE_SIZE) return -22; // EINVAL
-        // A kernel-half base would underflow USER_ADDR_MAX - base below
-        // (panic in safe builds) or unmap kernel pages in ReleaseFast.
-        if (base >= user_space.USER_ADDR_MAX) return -22; // EINVAL
-        if (num_pages > (user_space.USER_ADDR_MAX - base) / user_space.PAGE_SIZE) return -12; // ENOMEM
+        if (is_noreplace and (hasMmapOverlap(cur, base, num_pages) or !pagesFree(cur, base, num_pages))) return -17; // EEXIST
         if (@import("../ipc/sysv_shm.zig").overlapsAttachment(cur.page_table_phys, base, num_pages)) return -22; // EINVAL
         if (mm_mod.Mm.sealed(cur.mm, base, num_pages * user_space.PAGE_SIZE)) return -1; // EPERM: mseal
         if (hasMmapOverlap(cur, base, num_pages)) {
-            if (meta != null or pf.list_phys != 0) return -12;
-            return replaceFixedAnonymous(cur, base, num_pages, prot, flags);
+            // Replacing exactly one private anonymous read-write region keeps the atomic path.
+            if (meta == null and pf.list_phys == 0 and exactAnonymousRegion(cur, base, num_pages))
+                return replaceFixedAnonymous(cur, base, num_pages, prot, flags);
+            // Anything else MAP_FIXED lands on is unmapped first, as Linux does: the old mappings in the
+            // range go away (a region it only partly covers is cut) and the new one takes their place.
+            // Every check that can refuse runs before the first change.
+            if (!fixedReplaceable(cur, base, num_pages)) return -12;
+            unmapRange(cur, base, num_pages);
+            untrackMmapRange(cur, base, num_pages);
+            @import("../drivers/fbdev.zig").noteUnmap(cur, base, num_pages);
         }
         if (!pagesFree(cur, base, num_pages)) return -12;
         if (!canTrackReplacement(cur, base, num_pages)) return -12;
@@ -1223,6 +1288,25 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
     return @bitCast(base);
 }
 
+/// Whether every page of [addr, addr + length) (length rounded up to pages) is mapped in the calling
+/// task: the check Linux's madvise/msync/mincore/mlock make before acting. Occupied pages count (swap
+/// entries and PROT_NONE reservations are still mappings).
+pub fn rangeMapped(addr: u64, length: u64) bool {
+    const cur_idx = sched.currentTaskIndex() orelse return false;
+    const cur = task_mod.getTask(cur_idx) orelse return false;
+    const up = @addWithOverflow(length, user_space.PAGE_SIZE - 1);
+    if (up[1] != 0) return false;
+    const pages = (up[0] & ~(user_space.PAGE_SIZE - 1)) / user_space.PAGE_SIZE;
+    if (addr % user_space.PAGE_SIZE != 0 or addr >= user_space.USER_ADDR_MAX) return false;
+    if (pages > (user_space.USER_ADDR_MAX - addr) / user_space.PAGE_SIZE) return false;
+    var p: u64 = 0;
+    while (p < pages) : (p += 1) {
+        const va = addr + p * user_space.PAGE_SIZE;
+        if (!paging_mod.isPageOccupied(cur.page_table_phys, va) and !hasMmapOverlap(cur, va, 1)) return false;
+    }
+    return true;
+}
+
 /// Core munmap implementation. Returns 0 or -errno.
 /// MADV_DONTNEED: drop the pages of [addr, addr+length) while keeping the
 /// mapping itself (regions, protections, RLIMIT accounting untouched).
@@ -1233,10 +1317,9 @@ pub fn mmap(addr_hint: u64, length: u64, prot: u64, flags: u64, fd: i64, offset:
 /// attachments and no-free (MMIO/DMA) regions are refused because their
 /// frames are owned elsewhere.
 pub fn madviseDontneed(addr: u64, length: u64) i64 {
-    // madvise rounds a non-page-multiple length up (addr must be aligned).
-    if (length > 0xFFFF_FFFF_FFFF_F000) return -22;
-    const rounded = (length + user_space.PAGE_SIZE - 1) & ~(user_space.PAGE_SIZE - 1);
-    const range = munmap_policy.validate(addr, rounded) orelse return -22;
+    // The caller (syscallMadvise) has already applied range_policy.madviseSpan: addr is page aligned and
+    // the range lies in user space. munmap_policy.validate rounds the length up for us.
+    const range = munmap_policy.validate(addr, length) orelse return -22;
     const base = range.base;
     const num_pages = range.num_pages;
 
@@ -1395,7 +1478,8 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
 
     // Same cap as mmap(): larger sizes wrap the page-count computation,
     // which would process a grow as a shrink.
-    if (old_size > 0xFFFFFFFF_FFFFF000 or new_size > 0xFFFFFFFF_FFFFF000) return -12; // ENOMEM
+    // Measured on Linux: a size whose page rounding wraps is EINVAL (the rounded length is 0).
+    if (old_size > 0xFFFFFFFF_FFFFF000 or new_size > 0xFFFFFFFF_FFFFF000) return -22; // EINVAL
 
     const old_pages = (old_size + PAGE - 1) / PAGE;
     const new_pages = (new_size + PAGE - 1) / PAGE;

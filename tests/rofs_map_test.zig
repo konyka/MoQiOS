@@ -8,7 +8,8 @@ test "admission follows the Linux order of errors" {
     try std.testing.expectEqual(p.Verdict.invalid, p.admit(false, 100, 4096, 1, false));
     // a bad offset wins over every other complaint
     try std.testing.expectEqual(p.Verdict.invalid, p.admit(true, 1, 1 << 40, 3, true));
-    try std.testing.expectEqual(p.Verdict.no_device, p.admit(true, 0, 4096, 1, false));
+    // Measured on real Linux (hello188): mapping a directory is EACCES, not ENODEV.
+    try std.testing.expectEqual(p.Verdict.access, p.admit(true, 0, 4096, 1, false));
     try std.testing.expectEqual(p.Verdict.access, p.admit(false, 0, 4096, 2, true));
     try std.testing.expectEqual(p.Verdict.access, p.admit(false, 0, 4096, 3, true));
 }

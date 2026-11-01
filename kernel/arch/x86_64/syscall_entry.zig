@@ -3888,8 +3888,15 @@ fn syscallRenameFlagsAt(old_dirfd: i64, old_ptr: u64, new_dirfd: i64, new_ptr: u
 /// madvise(addr, length, advice) — advise on memory usage.
 /// Simplified: accept advice, return 0 for valid mapped regions.
 fn syscallMadvise(addr: u64, length: u64, advice: u32) i64 {
-    if (addr == 0 or addr >= 0x0000_8000_0000_0000) return -14; // EFAULT
-    if (length == 0) return -22; // EINVAL
+    const rp = @import("../../mm/range_policy.zig");
+    // Linux order: advice value, then the range, then the mappings.
+    if (!rp.madviseSupported(advice)) return -22; // EINVAL
+    switch (rp.madviseSpan(addr, length)) {
+        .err => |e| return e,
+        .empty => return 0,
+        .pages => {},
+    }
+    if (!@import("../../mm/mmap.zig").rangeMapped(addr, length)) return -12; // ENOMEM: a hole in the range
     const sched = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
     const page_cache = @import("../../fs/page_cache.zig");
@@ -3935,6 +3942,7 @@ fn syscallMadvise(addr: u64, length: u64, advice: u32) i64 {
                 }
             }
         },
+        8 => {}, // MADV_FREE — only a hint: the pages are simply kept
         4 => { // MADV_DONTNEED — drop the pages, keep the mapping
             // Linux semantics: private anonymous pages read back zero-filled,
             // file pages are re-faulted. This used to be a silent no-op, so
@@ -4392,14 +4400,16 @@ fn syscallPipe2(pipefd_ptr: u64, flags: u32) i64 {
 /// mincore(addr, length, vec_ptr) — check if pages are resident in RAM.
 /// Simplified: report all pages as resident (1) for mapped regions.
 fn syscallMincore(addr: u64, length: u64, vec_ptr: u64) i64 {
-    if (addr == 0 or addr >= 0x0000_8000_0000_0000) return -14;
-    if (length == 0) return 0;
-    if (vec_ptr == 0 or vec_ptr >= 0x0000_8000_0000_0000) return -14;
-    if (addr & 0xFFF != 0) return -22; // EINVAL: not page-aligned
-
+    const rp = @import("../../mm/range_policy.zig");
     const copy = @import("../../mm/copy_from_user.zig");
-    const num_pages = (length + 4095) / 4096;
+    // Linux: alignment (EINVAL), the range in user space (ENOMEM), then the vector (EFAULT), then the mappings.
+    const num_pages: u64 = switch (rp.mincoreSpan(addr, length)) {
+        .err => |e| return e,
+        .empty => return 0,
+        .pages => |n| n,
+    };
     if (!copy.validateUserBufferWritable(vec_ptr, @intCast(num_pages))) return -14;
+    if (!@import("../../mm/mmap.zig").rangeMapped(addr, length)) return -12; // ENOMEM: a hole in the range
 
     // Bit 0 = resident: a present 4K PTE or a present huge PDE. Swapped-out,
     // never-faulted and PROT_NONE-reserved pages report 0.
@@ -5250,6 +5260,7 @@ fn syscallMsync(addr: u64, length: u64, flags: u32) i64 {
     if (msync_policy.validate(addr, flags)) |err| return err;
     if (msync_policy.pageSpan(addr, length) == null) return -12; // ENOMEM
     if (length == 0) return 0;
+    if (!@import("../../mm/mmap.zig").rangeMapped(addr, length)) return -12; // ENOMEM: a hole in the range
 
     // Flush all dirty buffers to disk (writeback + page_cache).
     // This is the simplest correct implementation: a full sync.
@@ -5258,18 +5269,29 @@ fn syscallMsync(addr: u64, length: u64, flags: u32) i64 {
     return 0;
 }
 
-/// mlock(addr, len) — user page pinning is not implemented.
+/// mlock(addr, len): the arguments are checked like Linux's (zero length is a no-op, a range outside user
+/// space or with a hole is ENOMEM). A valid request still fails with ENOSYS: the kernel cannot pin user pages,
+/// and reporting success would let a caller believe its secrets stay out of swap.
 fn syscallMlock(addr: u64, len: u64) i64 {
-    _ = addr;
-    _ = len;
+    const rc = checkLockRange(addr, len);
+    if (rc != 0 or len == 0) return rc;
     return if (@import("../../mm/mlock_policy.zig").userMlockUnsupported()) -38 else unreachable;
 }
 
-/// munlock(addr, len) — user page pinning is not implemented.
+/// munlock(addr, len): same argument checks; unlocking succeeds because nothing is ever locked.
 fn syscallMunlock(addr: u64, len: u64) i64 {
-    _ = addr;
-    _ = len;
-    return if (@import("../../mm/mlock_policy.zig").userMlockUnsupported()) -38 else unreachable;
+    return checkLockRange(addr, len);
+}
+
+fn checkLockRange(addr: u64, len: u64) i64 {
+    const rp = @import("../../mm/range_policy.zig");
+    switch (rp.lockSpan(addr, len)) {
+        .err => |e| return e,
+        .empty => return 0,
+        .pages => {},
+    }
+    if (!@import("../../mm/mmap.zig").rangeMapped(addr & ~@as(u64, 0xFFF), len + (addr & 0xFFF))) return -12; // ENOMEM
+    return 0;
 }
 
 /// posix_fadvise(fd, offset, len, advice) — provide readahead hints.
@@ -5801,15 +5823,16 @@ fn syscallClockSettime(clockid: u32, tp_ptr: u64) i64 {
     return 0;
 }
 
-/// mlockall(flags) — user page pinning is not implemented.
+/// mlockall(flags): the flags are validated like Linux's; a valid request fails with ENOSYS for the reason
+/// given at syscallMlock.
 fn syscallMlockall(flags: u32) i64 {
-    _ = flags;
+    if (!@import("../../mm/range_policy.zig").mlockallFlagsValid(flags)) return -22;
     return if (@import("../../mm/mlock_policy.zig").userMlockUnsupported()) -38 else unreachable;
 }
 
-/// munlockall() — user page pinning is not implemented.
+/// munlockall(): succeeds, nothing is ever locked.
 fn syscallMunlockall() i64 {
-    return if (@import("../../mm/mlock_policy.zig").userMlockUnsupported()) -38 else unreachable;
+    return 0;
 }
 
 // ── v38.0: MoQiOS capability syscalls ────────────────────────────────────

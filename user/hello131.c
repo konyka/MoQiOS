@@ -96,7 +96,7 @@ void _start(void) {
     check(syscall6(SYS_MMAP, 0, 0, PROT_READ, MAP_PRIVATE | MAP_ANON, (uint64_t)-1, 0) == -EINVAL_, "A: length 0 is EINVAL");
     check(syscall6(SYS_MMAP, 0, PAGE, PROT_READ, 0, (uint64_t)-1, 0) == -EINVAL_, "A: neither MAP_SHARED nor MAP_PRIVATE is EINVAL");
     check(syscall6(SYS_MMAP, 0, PAGE, PROT_READ, MAP_SHARED | MAP_PRIVATE | MAP_ANON, (uint64_t)-1, 0) == -EINVAL_, "A: both MAP_SHARED and MAP_PRIVATE is EINVAL");
-    check(syscall6(SYS_MMAP, 0, PAGE, 0x100, MAP_PRIVATE | MAP_ANON, (uint64_t)-1, 0) == -EINVAL_, "A: unknown PROT bits are EINVAL");
+    check(syscall6(SYS_MMAP, 0, PAGE, 0x100, MAP_PRIVATE | MAP_ANON, (uint64_t)-1, 0) > 0, "A: unknown PROT bits are ignored (measured on Linux)");
     check(syscall6(SYS_MMAP, 0x1001, PAGE, PROT_READ, MAP_PRIVATE | MAP_ANON | MAP_FIXED, (uint64_t)-1, 0) == -EINVAL_, "A: MAP_FIXED with an unaligned address is EINVAL");
     check(syscall6(SYS_MMAP, 0, PAGE, PROT_READ, MAP_PRIVATE, 999, 0) == -EBADF_, "A: a file mapping with a bad fd is EBADF");
     check(syscall6(SYS_MMAP, 0, 0x7FFFFFFFFFFFF000ULL, PROT_READ, MAP_PRIVATE | MAP_ANON, (uint64_t)-1, 0) == -ENOMEM_, "A: an absurd length is ENOMEM");
