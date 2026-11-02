@@ -108,6 +108,73 @@ static void s_mremap(void) {
     check(mremap(dst2, 2 * PG, 2 * PG, MREMAP_MAYMOVE | MREMAP_FIXED, dst2) == MAP_FAILED && errno == EINVAL, "C: moving a mapping onto itself is EINVAL");
 }
 
+static int mapped(const void *p) {
+    unsigned char v;
+    return mincore((void *)p, PG, &v) == 0;
+}
+
+/* A private anonymous mapping with an unmapped page on each side. Neighbouring anonymous mappings with the same
+ * protection merge into one tracked region, and the kernel only moves whole regions (a move of part of one is
+ * EINVAL), so the probe keeps its mappings apart. */
+static char *gmap(unsigned long pages) {
+    char *m = (char *)mmap((void *)0, (pages + 2) * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    munmap(m, PG);
+    munmap(m + (pages + 1) * PG, PG);
+    return m + PG;
+}
+
+/* MREMAP_FIXED onto existing mappings replaces them (Linux, measured): only the moved size is replaced, the rest of a
+ * bigger destination survives, the source is gone, locks follow the mapping. */
+static void s_mremap_replace(void) {
+    char *src = gmap(3);
+    char *dst = gmap(5);
+    src[0] = 7; src[2 * PG] = 9; dst[0] = 1; dst[4 * PG] = 2;
+    char *r = (char *)mremap(src, 3 * PG, 3 * PG, MREMAP_MAYMOVE | MREMAP_FIXED, dst);
+    check(r == dst && dst[0] == 7 && dst[2 * PG] == 9, "F: MREMAP_FIXED onto a bigger existing mapping replaces its first 3 pages");
+    check(mapped(dst + 3 * PG) && dst[4 * PG] == 2, "F: the destination's remaining 2 pages survive untouched");
+    check(!mapped(src), "F: the source range is gone");
+
+    char *big = gmap(8);
+    char *small = gmap(2);
+    big[3 * PG] = 99; big[5 * PG] = 4; small[0] = 5;
+    r = (char *)mremap(small, 2 * PG, 2 * PG, MREMAP_MAYMOVE | MREMAP_FIXED, big + 3 * PG);
+    check(r == big + 3 * PG && r[0] == 5 && mapped(big) && mapped(big + 7 * PG), "F: moving into the middle of an 8 page mapping splits it");
+    check(big[5 * PG] == 4 && mapped(big + 2 * PG) && mapped(big + 5 * PG), "F: both halves keep their pages");
+
+    char *whole = gmap(3);
+    char *holey = gmap(3);
+    munmap(holey + PG, PG);
+    check((char *)mremap(whole, 3 * PG, 3 * PG, MREMAP_MAYMOVE | MREMAP_FIXED, holey) == holey, "F: a destination with a hole in it is fine");
+
+    char *u = gmap(3);
+    errno = 0;
+    check(mremap(u, 3 * PG, 3 * PG, MREMAP_MAYMOVE | MREMAP_FIXED, (void *)0x7ffffffff000UL) == MAP_FAILED && errno == EINVAL,
+          "F: a destination that runs past the end of user space is EINVAL");
+    errno = 0;
+    check(mremap(u, 3 * PG, 3 * PG, MREMAP_MAYMOVE | MREMAP_FIXED, (void *)0xffff800000000000UL) == MAP_FAILED && errno == EINVAL,
+          "F: a kernel address is EINVAL");
+    check(mapped(u), "F: and a refused move leaves the source mapped");
+}
+
+/* Locks follow a MREMAP_FIXED move; the replaced destination's locks are released. */
+static void s_mremap_locks(void) {
+    limit_pages(8);
+    char *dst = gmap(4);
+    char *src = gmap(4);
+    check(mlock(dst, 4 * PG) == 0 && mlock(src, 4 * PG) == 0, "G: both mappings locked, 8 of 8 pages");
+    check(mremap(src, 4 * PG, 4 * PG, MREMAP_MAYMOVE | MREMAP_FIXED, dst) == dst, "G: move the locked source onto the locked destination");
+    errno = 0;
+    check(madvise(dst, PG, MADV_DONTNEED) == -1 && errno == EINVAL, "G: the moved pages are locked");
+    char *e = (char *)mmap((void *)0, PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check(mlock(e, PG) == 0, "G: the replaced destination's quota was released (4 locked, so one more fits)");
+    char *lo = gmap(4);
+    char *a = gmap(2);
+    check(mlock(a, 2 * PG) == 0, "G: lock a 2 page source (4 + 1 + 2 = 7)");
+    char *moved = (char *)mremap(a, 2 * PG, 2 * PG, MREMAP_MAYMOVE | MREMAP_FIXED, lo + PG);
+    check(moved == lo + PG && madvise(moved, PG, MADV_DONTNEED) == -1, "G: a locked source moved onto an unlocked destination stays locked");
+    check(madvise(lo, PG, MADV_DONTNEED) == 0, "G: the unlocked neighbour is still unlocked");
+}
+
 static void s_lock(void) {
     limit_pages(8);
     char *p = (char *)mmap((void *)0, 12 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -156,6 +223,8 @@ int main(int argc, char **argv, char **envp) {
     scenario(s_basic, "scenario A: the usual calls");
     scenario(s_errors, "scenario B: errors and errno");
     scenario(s_mremap, "scenario C: mremap");
+    scenario(s_mremap_replace, "scenario F: MREMAP_FIXED replaces existing mappings");
+    scenario(s_mremap_locks, "scenario G: locks follow a MREMAP_FIXED move");
     scenario(s_lock, "scenario D: mlock family");
     scenario(s_lockall, "scenario E: mlockall / MAP_LOCKED");
 

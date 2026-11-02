@@ -2610,8 +2610,8 @@ test "mlock is wired into reclaim, madvise and every path that removes or moves 
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "(advice == 4 or advice == 8) and @import(\"../../mm/mm.zig\").Mm.locked(") != null);
     // munmap, MAP_FIXED (two paths), mremap shrink and mremap move all adjust the table.
     const mm_src = kt.mmap_mlock_source;
-    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, mm_src, "m.locks.releaseLossy("));
-    try std.testing.expect(std.mem.indexOf(u8, mm_src, "m.locks.moved(") != null);
+    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, mm_src, "m.locks.releaseLossy(")); // + the MREMAP_FIXED destination
+    try std.testing.expect(std.mem.indexOf(u8, mm_src, "base_table.moved(") != null);
     try std.testing.expect(std.mem.indexOf(u8, mm_src, "m.locks = t;") != null);
 }
 
@@ -2779,6 +2779,31 @@ test "mremap(MREMAP_FIXED) moves the mapping even when it does not grow; the in-
     try std.testing.expect(std.mem.indexOf(u8, body, "moveOrNoMem(") != null);
     // A file-backed region cannot be moved (it would be unshared), same refusal as the growing path.
     try std.testing.expect(std.mem.indexOf(u8, body, "if (r.file_kind != 0) return -12;") != null);
+}
+
+test "mremap(MREMAP_FIXED) onto existing mappings replaces them, like MAP_FIXED, after every refusing check" {
+    // Measured on Linux: the destination of MREMAP_FIXED may already be mapped; it is unmapped and the source takes
+    // its place. Mappings that cannot be taken (device/no_free, SysV SHM, untracked image/stack/brk pages, or no
+    // region slot for a split) are refused before anything changes, exactly as for MAP_FIXED (fixedReplaceable).
+    const src = kt.mmap_mlock_source;
+    const fn_start = std.mem.indexOf(u8, src, "fn moveOrNoMem(") orelse return error.TestUnexpectedResult;
+    const fn_end = std.mem.indexOfPos(u8, src, fn_start, "\nconst PAGE_SZ") orelse return error.TestUnexpectedResult;
+    const body = src[fn_start..fn_end];
+    const taken = std.mem.indexOf(u8, body, "if (!fixedReplaceable(task, new_base, new_pages)) return -12;") orelse return error.TestUnexpectedResult;
+    const unmap = std.mem.indexOfPos(u8, body, taken, "unmapRange(task, new_base, new_pages);") orelse return error.TestUnexpectedResult;
+    const untrack = std.mem.indexOfPos(u8, body, unmap, "untrackMmapRange(task, new_base, new_pages);") orelse return error.TestUnexpectedResult;
+    const locks = std.mem.indexOfPos(u8, body, untrack, "m.locks.releaseLossy(new_base / PAGE_SZ, new_pages)") orelse return error.TestUnexpectedResult;
+    const mv = std.mem.indexOfPos(u8, body, locks, "const moved_to = moveMapping(") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(taken < unmap and unmap < untrack and untrack < locks and locks < mv);
+    // Every check that can refuse (charges, the relocated lock table) runs before the destination is unmapped.
+    const charges = std.mem.indexOf(u8, body, "if (!moveChargesOk(task, region, old_pages, new_pages)) return -12;") orelse return error.TestUnexpectedResult;
+    const reloc = std.mem.indexOf(u8, body, "base_table.moved(") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(charges < unmap and reloc < unmap);
+    // Only for MREMAP_FIXED: a kernel-chosen destination is still searched in free space.
+    try std.testing.expect(std.mem.indexOf(u8, body[0..taken], "(mflags & MREMAP_FIXED) != 0") != null);
+    // The overlap-with-self refusal stays ahead of any replacement.
+    const selfov = std.mem.indexOf(u8, body, "if (rangesOverlap(region.base, old_pages, new_base, new_pages)) return -22;") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(selfov < taken);
 }
 
 test "MAP_LOCKED is a real mmap flag now: it is accepted, and acted on rather than ignored" {

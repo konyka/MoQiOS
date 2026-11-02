@@ -6257,4 +6257,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 目标上验证：`hello200`（5 个场景）经 libc 封装走真实内核：`mmap` 返回地址且不改 `errno`；`MAP_FAILED`/`EINVAL`/`ENOMEM`/`EFAULT`；`mremap` 增长、原地缩小、`MREMAP_FIXED` 读第五个参数；`mlock`/`mlock2`/`munlock` 与限额；`mlockall(MCL_FUTURE)` 下超限是 `EAGAIN`，限额 0 时 `MAP_LOCKED` 是 `EPERM`。
 - 如实说明：①`resource.h` 缺 `RLIMIT_MEMLOCK` 是做 `hello200` 时发现的，先补测试（`test_rlimit_abi.c` 对新编号的断言先失败）再补头文件；②只有 mman.h 遵循 glibc 约定，其它封装仍返回 -errno；③没有文件映射的便利封装、`posix_madvise`、`shm_open`。
 - **经由这层封装发现的内核缺陷（已修）**：`hello200` 第一次在目标上跑时，`mremap(..., MREMAP_MAYMOVE | MREMAP_FIXED, dst)` 在**新大小不大于旧大小**时返回旧地址，什么也没搬——原因是 `mremapRegion` 里"缩小/不变"分支（原地缩小，直接返回 `old_addr`）排在 `MREMAP_FIXED` 的搬移路径之前，只有"增长"才会走到搬移。先在宿主机 gcc 测了真实 Linux（`/tmp/mla/mr.c`）：同大小和缩小的 `MREMAP_FIXED` 都会把内容搬到 `new_addr`，旧范围整个被取消映射（缩小时连尾页也没了），新范围只有新大小那么多页；`MREMAP_FIXED` 不带 `MAYMOVE`、搬到自己身上、与自己重叠都是 `EINVAL`。修复：`mremapRegion` 里在原地缩小分支之前加 `MREMAP_FIXED and new_pages <= old_pages` 的分支，文件映射仍 `ENOMEM`（和增长路径一致，搬动会破坏共享），其余走 `moveOrNoMem`。TDD：host 测试先写（源码文本断言：路由在原地缩小分支之前、含 `moveOrNoMem`、含文件映射拒绝），红灯后再改；两个变异（去掉路由、去掉文件映射拒绝）都被抓住。目标上 `hello200` 多 4 项（搬移后内容保留且旧范围取消映射、缩小搬移的尾页也没了、`FIXED` 不带 `MAYMOVE` 与搬到自己身上是 `EINVAL`）。**这个缺陷此前没被发现**，是因为 `hello131`/`hello188` 只覆盖了 `MREMAP_FIXED` 的错误返回，没有一个成功路径的测试。
-- 另有一个已知的、没有修的差异：Linux 允许 `MREMAP_FIXED` 把一个映射**搬到另一个已有映射上**（旧映射被覆盖），这里 `rangeAvailable` 会拒绝（`ENOMEM`）；也允许对映射中间的子范围做 `MREMAP_FIXED` 搬移，这里要求 `old_size` 覆盖整个跟踪区域（否则 `EINVAL`）。
+- 当时记下的两个已知差异里，第一个（`MREMAP_FIXED` 搬到已有映射上）在下一节修了；第二个（对映射中间子范围做 `MREMAP_FIXED` 搬移，这里要求 `old_size` 覆盖整个跟踪区域，否则 `EINVAL`）仍在。
+
+## mremap(MREMAP_FIXED) 搬到已有映射之上
+
+- 先在宿主机测 Linux（`/tmp/mla/mr2.c`）：目标范围里已有的映射会被取消映射，源映射顶替它们；只替换被搬的那么多页，更大的目标映射剩下的页保留；搬进一个映射的中间会把它一分为二；目标范围里有洞也行；锁跟着被搬的映射走（锁着的源搬到没锁的目标上仍是锁着的），被替换目标的锁被释放（配额回来）；目标超出用户空间（`0x7ffffffff000` 起 3 页）或是内核地址是 `EINVAL`，目标是 `0x1000` 是 `EPERM`（`mmap_min_addr`，这里没做）。
+- 实现：`moveOrNoMem` 里 `MREMAP_FIXED` 不再走 `rangeAvailable`/`pagesFree`（那是"只能搬到空闲处"的检查），改成和 `MAP_FIXED` 一样的 `fixedReplaceable`（拒绝设备/SysV SHM 映射、区域表之外的映像/栈/brk 页、没有空槽容纳拆分），所有会拒绝的检查——包括 RLIMIT_AS/DATA（抽成 `moveChargesOk`）和搬迁后的锁表——都在第一次改动之前做完，之后才 `unmapRange`/`untrackMmapRange`/释放锁/通知 fbdev，再 `moveMapping`。目标超出用户空间是 `EINVAL`（不是 `ENOMEM`）。内核自己挑目标地址的搬移保持原样。
+- TDD：host 测试先写（源码文本断言：`fixedReplaceable` 先于 `unmapRange`，`unmapRange` 先于 `untrackMmapRange`，其后释放锁再 `moveMapping`，且 `moveChargesOk` 和重定位后的锁表都在 `unmapRange` 之前），红灯后实现；一处旧断言（`releaseLossy` 出现 4 次）按新增的一处改成 5。
+- 变异（host）：去掉 `fixedReplaceable`、去掉 `moveChargesOk` 都被抓住；**"先把目标的锁从表里去掉再算搬迁后的表"这一步的变异没有被 host 测试抓住**（`base_table.releaseLossy` 去掉后全部 1000 个测试仍通过）。这一步的效果只能在目标上看到（`hello200` 的 G 场景：满额锁定下把锁着的源搬到锁着的目标上、之后还能再锁一页），所以那里是它唯一的防线。
+- 目标上验证：`hello200` 67 项全部通过。第一次跑时 F、G 两组失败，原因是探针自己的缺陷：相邻的匿名映射（同保护位）会合并成一个跟踪区域，而内核只搬整个区域（搬其中一部分是 `EINVAL`），所以我把探针用的映射用 `munmap` 隔开（`gmap`），内核没改。
+- 如实说明：①对映射**中间子范围**做 `MREMAP_FIXED` 搬移仍是 `EINVAL`（Linux 能搬），探针为此要隔开映射，这是一个真实的功能缺口；②`mmap_min_addr`（搬到 `0x1000` 的 `EPERM`）没做，这里是 `ENOMEM`/`EINVAL`；③上面说的锁表变异只在目标上才有防线。

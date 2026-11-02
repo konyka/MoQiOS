@@ -892,23 +892,25 @@ fn replaceFixedAnonymous(
     return @bitCast(base);
 }
 
+/// RLIMIT_AS / RLIMIT_DATA preflight of a move: a growing move charges the delta before any page is copied, and a
+/// writable-private move must never partially mutate the address space before discovering that its growth exceeds
+/// the data soft limit. Also run before a MREMAP_FIXED destination is replaced, so a refusal changes nothing.
+fn moveChargesOk(task: *task_mod.Task, region: *task_mod.MmapRegion, old_pages: u64, new_pages: u64) bool {
+    const page = user_space.PAGE_SIZE;
+    if (new_pages <= old_pages) return true;
+    const rl = @import("../proc/rlimit.zig");
+    if (!rl.Policy.asChargeOk(task.as_used, (new_pages - old_pages) * page, task.as_cur)) return false;
+    if ((region.prot & 2) != 0 and !region.shared and
+        !rl.Policy.dataChargeOk(task.data_used, (new_pages - old_pages) * page, task.data_cur)) return false;
+    return true;
+}
+
 fn moveMapping(task: *task_mod.Task, region: *task_mod.MmapRegion, new_base: u64, old_pages: u64, new_pages: u64) i64 {
     const page = user_space.PAGE_SIZE;
     const default_flags = paging_mod.MapFlags{ .writable = true, .user = true, .no_execute = true };
     const old_base = region.base;
     if (rangesOverlap(old_base, old_pages, new_base, new_pages)) return -22;
-    // RLIMIT_AS: a growing move charges the delta before any page is copied.
-    if (new_pages > old_pages and
-        !@import("../proc/rlimit.zig").Policy.asChargeOk(task.as_used, (new_pages - old_pages) * page, task.as_cur)) return -12; // ENOMEM
-    // RLIMIT_DATA: apply the same preflight before demotion or page copying;
-    // a writable-private move must never partially mutate the address space
-    // before discovering that its growth exceeds the data soft limit.
-    if (new_pages > old_pages and (region.prot & 2) != 0 and !region.shared and
-        !@import("../proc/rlimit.zig").Policy.dataChargeOk(
-            task.data_used,
-            (new_pages - old_pages) * page,
-            task.data_cur,
-        )) return -12; // ENOMEM
+    if (!moveChargesOk(task, region, old_pages, new_pages)) return -12; // ENOMEM
     var mapped: u64 = 0;
 
     // I1: the 4K copy loop below cannot read huge PDEs (getPageEntry
@@ -988,18 +990,41 @@ fn moveOrNoMem(task: *task_mod.Task, region: *task_mod.MmapRegion, old_pages: u6
     else
         (findFreeMmapRange(task, new_pages, region.base) orelse return -12);
     if (rangesOverlap(region.base, old_pages, new_base, new_pages)) return -22; // EINVAL
-    if (!rangeAvailable(task, new_base, new_pages, region.base)) return -12;
-    // rangeAvailable only consults the tracked region list; MREMAP_FIXED may
-    // target untracked live pages (image, stack, brk) and mapPage overwrites a
-    // live PTE silently, so gate on the actual page tables too.
-    if (!pagesFree(task, new_base, new_pages)) return -12; // ENOMEM
+    const fixed = (mflags & MREMAP_FIXED) != 0;
+    if (fixed) {
+        // Linux unmaps whatever is at a MREMAP_FIXED destination and puts the source there, exactly as MAP_FIXED
+        // does. The same refusals apply (device and SysV SHM mappings, untracked image/stack/brk pages, no region
+        // slot for a split), all checked before the first change. rangeAvailable is only for a kernel-chosen spot.
+        // A destination outside user space (or below the first page) is EINVAL on Linux, not ENOMEM.
+        if (new_base < user_space.PAGE_SIZE or new_base >= user_space.USER_ADDR_MAX or
+            new_pages > (user_space.USER_ADDR_MAX - new_base) / user_space.PAGE_SIZE) return -22;
+        if (!fixedReplaceable(task, new_base, new_pages)) return -12;
+    } else {
+        if (!rangeAvailable(task, new_base, new_pages, region.base)) return -12;
+        // rangeAvailable only consults the tracked region list; a kernel-chosen spot could still hit untracked
+        // live pages (image, stack, brk) and mapPage overwrites a live PTE silently, so gate on the actual page
+        // tables too.
+        if (!pagesFree(task, new_base, new_pages)) return -12; // ENOMEM
+    }
+    if (!moveChargesOk(task, region, old_pages, new_pages)) return -12; // ENOMEM
     // Locked pages stay locked at their new address (Linux moves VM_LOCKED with the mapping). The relocated
-    // table is built first so that a table with no spare slot fails the mremap before anything is moved.
+    // table is built first, against the table as it will be once the destination's own locks are gone, so that a
+    // table with no spare slot fails the mremap before anything is changed.
     var relocated: ?@import("mlock_policy.zig").Table = null;
     if (task.mm) |m| {
-        if (m.locks.touches(region.base / PAGE_SZ, old_pages)) {
-            relocated = m.locks.moved(region.base / PAGE_SZ, old_pages, new_base / PAGE_SZ, new_pages) orelse return -12;
+        var base_table = m.locks;
+        if (fixed) base_table.releaseLossy(new_base / PAGE_SZ, new_pages);
+        if (base_table.touches(region.base / PAGE_SZ, old_pages)) {
+            relocated = base_table.moved(region.base / PAGE_SZ, old_pages, new_base / PAGE_SZ, new_pages) orelse return -12;
+        } else if (fixed) {
+            relocated = base_table;
         }
+    }
+    if (fixed) {
+        unmapRange(task, new_base, new_pages);
+        untrackMmapRange(task, new_base, new_pages);
+        if (task.mm) |m| m.locks.releaseLossy(new_base / PAGE_SZ, new_pages);
+        @import("../drivers/fbdev.zig").noteUnmap(task, new_base, new_pages);
     }
     const moved_to = moveMapping(task, region, new_base, old_pages, new_pages);
     if (moved_to >= 0) if (relocated) |t| if (task.mm) |m| {
