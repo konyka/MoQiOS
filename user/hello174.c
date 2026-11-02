@@ -75,6 +75,19 @@ static void print(const char *s) {
     while (s[n]) n++;
     syscall3(SYS_WRITE, 1, (uint64_t)s, n);
 }
+static void print_dec(int64_t v) {
+    char b[24]; int n = 0;
+    if (v < 0) { print("-"); v = -v; }
+    if (v == 0) b[n++] = '0';
+    while (v > 0) { b[n++] = (char)('0' + v % 10); v /= 10; }
+    char o[24]; int k = 0;
+    while (n > 0) o[k++] = b[--n];
+    o[k] = 0;
+    print(o);
+}
+static void note(const char *label, int64_t v) {
+    print("hello174:   .. "); print(label); print("="); print_dec(v); print("\n");
+}
 static int failures = 0;
 static void check(int ok, const char *what) {
     print(ok ? "hello174:   ok   " : "hello174:   FAIL ");
@@ -143,6 +156,7 @@ static int make_pair(int port, int *cli, int *srv) {
     return 0;
 }
 
+static int port_off;
 static char buf[4096];
 
 /* Write until the socket stops taking data (peer never reads); returns the total accepted. */
@@ -162,12 +176,13 @@ static long fill(int fd) {
 
 void _start(void) {
     print("hello174: SO_SNDBUF / SO_RCVBUF on TCP\n");
+    port_off = (int)((syscall1(39, 0) * 7) % 5000); /* a different port set per process: repeated runs must not collide in TIME_WAIT */
     for (int i = 0; i < 4096; i++) buf[i] = (char)i;
 
     /* A: values are doubled for bookkeeping overhead, with Linux's minimums */
     {
         int c, s;
-        check(make_pair(18174, &c, &s) == 0, "A: loopback connection");
+        check(make_pair(18174 + port_off, &c, &s) == 0, "A: loopback connection");
         check(set_int(c, SO_SNDBUF, 8192) == 0 && get_int(c, SO_SNDBUF) == 16384, "A: SO_SNDBUF 8192 reads back as 16384 (doubled)");
         check(set_int(c, SO_RCVBUF, 16384) == 0 && get_int(c, SO_RCVBUF) == 32768, "A: SO_RCVBUF 16384 reads back as 32768 (doubled)");
         check(set_int(c, SO_SNDBUF, 100) == 0 && get_int(c, SO_SNDBUF) == 4608, "A: a tiny SO_SNDBUF is raised to the minimum (4608)");
@@ -182,7 +197,7 @@ void _start(void) {
     int big_avail;
     {
         int c, s;
-        make_pair(18175, &c, &s);
+        make_pair(18175 + port_off, &c, &s);
         big_total = fill(c);
         big_avail = ioctl_int(s, FIONREAD);
         syscall1(SYS_CLOSE, c);
@@ -190,7 +205,7 @@ void _start(void) {
     }
     {
         int c, s;
-        make_pair(18176, &c, &s);
+        make_pair(18176 + port_off, &c, &s);
         set_int(c, SO_SNDBUF, 8192);
         small_total = fill(c);
         int q = ioctl_int(c, TIOCOUTQ);
@@ -204,7 +219,7 @@ void _start(void) {
     /* C: SO_RCVBUF bounds what the receiver buffers for a reader that does not read */
     {
         int c, s;
-        make_pair(18177, &c, &s);
+        make_pair(18177 + port_off, &c, &s);
         set_int(s, SO_RCVBUF, 16384);
         syscall3(SYS_FCNTL, (uint64_t)c, F_SETFL, O_NONBLOCK);
         syscall3(SYS_WRITE, (uint64_t)c, (uint64_t)buf, 1);
@@ -214,10 +229,16 @@ void _start(void) {
          * give a buggy over-advertising window time to overshoot before checking the cap. */
         int avail = ioctl_int(s, FIONREAD);
         for (int i = 0; i < 100 && avail < 14000; i++) { pump(50); avail = ioctl_int(s, FIONREAD); }
+        int avail_first = avail;
         check(avail >= 14000, "C: the receiver buffers up to roughly its SO_RCVBUF allowance (>= 14000 bytes)");
         pump(500);
         avail = ioctl_int(s, FIONREAD);
-        check(avail > 0 && avail <= 16384 + 1460, "C: and never more than ~16 KiB (SO_RCVBUF 16384)");
+        int cap_ok = avail > 0 && avail <= 16384 + 1460;
+        check(cap_ok, "C: and never more than ~16 KiB (SO_RCVBUF 16384)");
+        if (!cap_ok || avail_first < 14000) {
+            note("avail_first", avail_first); note("avail_after_500ms", avail); note("sender_accepted", total);
+            note("sender_outq", ioctl_int(c, TIOCOUTQ));
+        }
         check(big_avail > 20000, "C: while a receiver that never set SO_RCVBUF buffers more than that (> 20000)");
         char drain[4096];
         long got = 0;
