@@ -6125,3 +6125,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 测试：`tests/main.zig` 新增 3 个（各队列大小的偏移/页数、`sizeSupported`、驱动结构守卫），并更新了一个原来断言 `qsize > QUEUE_SIZE` 源码文本的旧测试。变异：把 used 偏移的页对齐去掉，具名的布局测试失败；已还原，`grep MUTATION` 为 0。
 - 如实说明：①接收是轮询，没有让 virtio-net 的中断真正工作（需要给 PIC/IOAPIC 路由和取消屏蔽，e1000 同样没有，行为一致），所以 TX/RX 负载大时依赖协议栈的轮询频率；②只在 QEMU 的 virtio-net-pci（legacy，I/O 端口）上验证，没有 virtio 1.0 modern 传输；③没有压力测试 virtio-net 的吞吐，RX 队列满时设备丢帧；④默认仍是 e1000，virtio-net 只在 `MOQI_NIC=virtio|both` 下启用。
 - TDD：红灯 = `MOQI_NIC=virtio` 的 `BadQueue`（第 1 层），之后每修一层才暴露下一层（第 4 层的红灯是"init 成功但 `[dhcp] No OFFER received`"），绿灯 = 拿到 lease。
+
+## gettimeofday 的 tz 参数被完全忽略（hello197）
+
+- 怎么想到的：上一轮的候选清单里有"给 `gettimeofday(NULL)` 补测试"。读代码发现 hello132 已经测了 NULL/NULL，但 `time_syscall.zig` 的 `gettimeofday(tv_ptr)` **根本没有接收 `tz` 参数**。用宿主机 gcc 直接调 `syscall(SYS_gettimeofday, ...)` 取真实 Linux 的返回值：坏 `tz` 指针是 EFAULT（即使 `tv` 正常、或 `tv` 为 NULL）；成功时 `tz` 被写成两个 `int` 的 `{0, 0}`（共 8 字节；我用 `long tz[2]={7,7}` 探测时只有 `tz[0]` 变成 0，这正是 8 字节被清零的结果）。
+- 红灯：hello197（12 项）在旧内核上 5 项 FAIL（good tv + bad tz、NULL tv + bad tz、NULL tv + 内核半区 tz 三个本应 EFAULT 却成功；两个"tz 被写成 0/0"没写）。
+- 修复：`gettimeofday(tv_ptr, tz_ptr)`：先对两个指针做范围检查（`>= 0x0000_8000_0000_0000` 即 EFAULT），再分别写 tv（非 NULL 时）与 tz（非 NULL 时写 8 个零字节）；`syscall_entry.zig` 传入 `frame.rsi`。
+- 测试：hello197 接入 `build.zig`、`qemu_run.sh`、`servers/init/main.c`、`qemu_smoke.sh`；`tests/main.zig` 新增一个源码守卫测试。
+- 如实说明：①零 `tz` 在内核没有时区概念的前提下是对的；`settimeofday` 设时区、`CLOCK_REALTIME` 的时区偏移都没做；②守卫测试是源码文本断言，真正的行为由 hello197 在 QEMU 里验证。

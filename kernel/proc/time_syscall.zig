@@ -35,21 +35,30 @@ pub fn wallClockNanos() u64 {
     return @intCast(@max(adjusted, 0));
 }
 
-/// gettimeofday(tv_ptr) → 0 or -1
-pub fn gettimeofday(tv_ptr: u64) i64 {
-    if (tv_ptr == 0) return 0; // gettimeofday(NULL, tz): nothing to store
-    if (tv_ptr >= 0x0000_8000_0000_0000) return -14;
+/// gettimeofday(tv_ptr, tz_ptr) → 0 or -EFAULT
+/// Linux semantics: a bad `tv` or a bad `tz` is EFAULT (checked before anything is written), `tz` is filled
+/// with {tz_minuteswest = 0, tz_dsttime = 0} (the kernel keeps no timezone, so UTC), and NULL pointers skip
+/// the corresponding write.
+pub fn gettimeofday(tv_ptr: u64, tz_ptr: u64) i64 {
+    const user_top: u64 = 0x0000_8000_0000_0000;
+    if (tv_ptr >= user_top or tz_ptr >= user_top) return -14;
 
-    const ns = wallClockNanos();
-    const sec = ns / 1_000_000_000;
-    const usec = (ns % 1_000_000_000) / 1000;
+    if (tv_ptr != 0) {
+        const ns = wallClockNanos();
+        const sec = ns / 1_000_000_000;
+        const usec = (ns % 1_000_000_000) / 1000;
 
-    var tv_bytes: [16]u8 = undefined;
-    bo.writeU64Le(tv_bytes[0..8], sec);
-    const usec_i64: i64 = @intCast(usec);
-    bo.writeI64Le(tv_bytes[8..16], usec_i64);
+        var tv_bytes: [16]u8 = undefined;
+        bo.writeU64Le(tv_bytes[0..8], sec);
+        const usec_i64: i64 = @intCast(usec);
+        bo.writeI64Le(tv_bytes[8..16], usec_i64);
 
-    if (copy.copyToUser(@ptrFromInt(tv_ptr), tv_bytes[0..16], 16) != 16) return -14;
+        if (copy.copyToUser(@ptrFromInt(tv_ptr), tv_bytes[0..16], 16) != 16) return -14;
+    }
+    if (tz_ptr != 0) {
+        const tz_bytes = [_]u8{0} ** 8;
+        if (copy.copyToUser(@ptrFromInt(tz_ptr), tz_bytes[0..8], 8) != 8) return -14;
+    }
     return 0;
 }
 

@@ -3101,9 +3101,9 @@ fn syscallMunmap(frame: *SyscallFrame) void {
 }
 
 /// Syscall #96: gettimeofday(tv, tz)
-/// RDI = pointer to struct timeval in user space, RSI = timezone (ignored)
+/// RDI = pointer to struct timeval in user space, RSI = pointer to struct timezone (zeroed: UTC)
 fn syscallGettimeofday(frame: *SyscallFrame) void {
-    frame.rax = @bitCast(time_mod.gettimeofday(frame.rdi));
+    frame.rax = @bitCast(time_mod.gettimeofday(frame.rdi, frame.rsi));
 }
 
 /// Syscall #228: clock_gettime(clockid, tp)

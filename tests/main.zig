@@ -503,6 +503,18 @@ test "virtio-net uses one contiguous ring block, half as many RX buffers as desc
     try std.testing.expect(std.mem.indexOf(u8, nic, "drivers.virtio_net.receivePacket(buf, max_len)") != null);
 }
 
+test "gettimeofday validates and fills the timezone pointer like Linux" {
+    const src = kt.time_syscall_source;
+    const start = std.mem.indexOf(u8, src, "pub fn gettimeofday(tv_ptr: u64, tz_ptr: u64) i64") orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, src, start, "pub fn clock_gettime(") orelse return error.TestUnexpectedResult;
+    const body = src[start..end];
+    // Both pointers are range-checked before anything is written, so a bad tz cannot leave tv half-delivered.
+    try std.testing.expect(std.mem.indexOf(u8, body, "tv_ptr >= user_top or tz_ptr >= user_top") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (tz_ptr != 0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "copyToUser(@ptrFromInt(tz_ptr)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "time_mod.gettimeofday(frame.rdi, frame.rsi)") != null);
+}
+
 test "non-x86 identity init failure is an explicit fatal no-retry contract" {
     const aarch = kt.aarch64_paging_source;
     try std.testing.expect(std.mem.indexOf(u8, aarch, "Failure contract: fatal, no retry") != null);

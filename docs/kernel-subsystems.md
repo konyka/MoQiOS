@@ -1030,7 +1030,7 @@ const SchedStats = struct {
   `CLOCK_MONOTONIC_RAW`、`CLOCK_BOOTTIME`、`CLOCK_*_COARSE` 与 CPU 时间时钟。现在 `proc/clock_ids.zig`（纯，host 测试）给出映射：`REALTIME` 与 `REALTIME_COARSE` 读墙钟（RTC 起点 + TSC），
   `MONOTONIC`、`MONOTONIC_RAW`、`MONOTONIC_COARSE`、`BOOTTIME` 读单调时钟（本内核不做时间校正也不挂起，所以彼此一致），`PROCESS_CPUTIME_ID`/`THREAD_CPUTIME_ID` 读调用任务的 CPU 时间
   （utime + stime + 当前时间片）；未知 id、负的动态时钟 id 是 EINVAL。`clock_getres`：COARSE 时钟报 1 ms，其余 1 ns。`clock_nanosleep` 只接受 `sleepable` 的时钟（墙钟族、单调族），
-  CPU 时间时钟 EINVAL。`gettimeofday(NULL, tz)` 此前是 EFAULT，现在成功（没有要写的东西）。限制：进程 CPU 时钟只统计调用任务，不汇总同进程其它线程。
+  CPU 时间时钟 EINVAL。`gettimeofday(NULL, tz)` 此前是 EFAULT，现在成功（没有要写的东西）。`tz` 指针（第二个参数）原来被完全忽略；现在与 Linux 一致：坏的 `tz`（含 `tv` 为 NULL 时）是 EFAULT，成功时写 `{tz_minuteswest=0, tz_dsttime=0}`（内核不保存时区，即 UTC），两个指针都先做范围检查再写，hello197 覆盖。限制：进程 CPU 时钟只统计调用任务，不汇总同进程其它线程。
 - **mprotect / mremap 的参数与错误码（hello131）**：`mprotect(addr, 0, prot)` 此前是 EINVAL，Linux 里是成功的空操作（先检查对齐，再看长度，最后才检查 `prot` 位；`mprotect_policy.early`）。
   范围里有未映射的洞时，`mprotect` 应返回 ENOMEM（已有页仍按请求修改，所以在提交之后才报告；`mprotect_policy.coverageErrno`），原先对不存在的页直接静默跳过、返回 0。
   `mremap` 的源地址对齐但根本没有映射时是 EFAULT（`remapSourceErrno`），原先是 EINVAL；不是区域起点的地址仍是 EINVAL。`mmap` 的参数校验（长度 0、`MAP_SHARED|MAP_PRIVATE` 同时/都没有、未知 `PROT` 位、
