@@ -2852,7 +2852,8 @@ fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) void
 
     // Copy to receive ring buffer (batched @memcpy)
     const recv_free = RECV_BUF_SIZE - 1 - ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
-    const to_copy = @min(len, recv_free);
+    const window_room = tcp_util.acceptableBytes(len, ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE), rcvWindowCap(tcb));
+    const to_copy = @min(window_room, recv_free);
     ringWrite(&tcb.recv_buf, RECV_BUF_SIZE, tcb.recv_tail, data, to_copy);
     tcb.recv_tail = (tcb.recv_tail + to_copy) % RECV_BUF_SIZE;
     if (to_copy > 0) markRecvWake(tcb);

@@ -70,6 +70,14 @@ pub fn rcvWindowFromBuffered(buffered: u32, window: u32) u32 {
     return if (buffered < window) window - buffered else 0;
 }
 
+/// How many of `len` payload bytes the receiver may take in: no more than the room left under the window it
+/// advertised (`window_cap` minus what is buffered, saturating at 0). The ring is larger than the window, so the
+/// ring alone does not enforce the advertised window: a sender that raced past a zero window (a window update
+/// still in flight on another CPU) would otherwise be accepted beyond what SO_RCVBUF allows.
+pub fn acceptableBytes(len: u32, buffered: u32, window_cap: u32) u32 {
+    return @min(len, rcvWindowFromBuffered(buffered, window_cap));
+}
+
 /// Longest gap between two delivery-rate samples that still measures the path:
 /// across a longer idle period the sender, not the network, set the pace.
 pub const DELIVERY_SAMPLE_MAX_GAP_MS: u32 = 1000;

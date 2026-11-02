@@ -3515,6 +3515,28 @@ test "eth frame build writes header fields and reports total length" {
     try std.testing.expectEqual(eth.ETHERTYPE_IPV6, eth.parseEthertype(&buf));
 }
 
+test "tcp receiver accepts no more payload than the window it advertised" {
+    const u = tcp_util;
+    // room = window cap minus what is already buffered, saturating at 0
+    try std.testing.expectEqual(@as(u32, 16384), u.acceptableBytes(100000, 0, 16384));
+    try std.testing.expectEqual(@as(u32, 1448), u.acceptableBytes(1448, 0, 16384));
+    try std.testing.expectEqual(@as(u32, 455), u.acceptableBytes(1448, 15929, 16384));
+    try std.testing.expectEqual(@as(u32, 0), u.acceptableBytes(1448, 16384, 16384));
+    // a sender that kept sending after a zero window must not be accepted (hello174's failing trace: 17377 buffered)
+    try std.testing.expectEqual(@as(u32, 0), u.acceptableBytes(1448, 17377, 16384));
+    try std.testing.expectEqual(@as(u32, 0), u.acceptableBytes(452, 18825, 16384));
+    // a zero-window probe byte is not accepted either
+    try std.testing.expectEqual(@as(u32, 0), u.acceptableBytes(1, 16384, 16384));
+    // never more than was sent, and a zero-length segment accepts nothing
+    try std.testing.expectEqual(@as(u32, 0), u.acceptableBytes(0, 0, 16384));
+    try std.testing.expectEqual(@as(u32, 10), u.acceptableBytes(10, 0, 32768));
+    // wired into the receive path: the copy length comes from the advertised cap, not the ring size
+    const src = kt.tcp_source;
+    const start = std.mem.indexOf(u8, src, "fn processIncomingData(") orelse return error.TestUnexpectedResult;
+    const body = src[start .. start + 6000];
+    try std.testing.expect(std.mem.indexOf(u8, body, "tcp_util.acceptableBytes(len, ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE), rcvWindowCap(tcb));\n    const to_copy = @min(window_room, recv_free);") != null);
+}
+
 test "tcp sequence comparisons wrap around the u32 boundary" {
     // 0xffffffff is "before" 0 in RFC 793 modular sequence space.
     try std.testing.expect(tcp_util.seqLt(0xffff_ffff, 0));
@@ -9491,7 +9513,8 @@ test "TCP buffer limits: SO_SNDBUF / SO_RCVBUF bound the rings only when set" {
     try std.testing.expect(std.mem.indexOf(u8, src, "if (tcp_util.roomUnder(used, sendLimit(tcb)) > 0) return 0;") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "return tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb));") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, ".send_space = tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb)),") != null);
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, "RECV_BUF_SIZE), rcvWindowCap(tcb));"));
+    // two window recomputations (data arrival, recv) plus the new acceptance bound in processIncomingData
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, src, "RECV_BUF_SIZE), rcvWindowCap(tcb));"));
     try std.testing.expect(std.mem.indexOf(u8, src, "return @min(TCP_WINDOW, tcp_util.bufferLimit(tcb.options.rcv_buf_set, tcb.options.rcv_buf_size, RECV_BUF_SIZE));") != null);
     // The option setter stores the doubled, clamped value and records that the option was set.
     const so = kt.socket_opt_source;
