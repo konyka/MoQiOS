@@ -194,6 +194,8 @@ static const char *const gai_messages_head[] = {
     "Servname not supported for ai_socktype",
     "Address family for hostname not supported",
     "Memory allocation failure",
+    "System error",
+    "Result too large for supplied buffer",
 };
 
 const char *gai_strerror(int code) {
@@ -308,5 +310,55 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
         tail = &e->ai_next;
     }
     *res = head;
+    return 0;
+}
+
+/* ---- getnameinfo --------------------------------------------------------------------------------------------- */
+
+#define NI_KNOWN_FLAGS 0xFF
+
+static int copy_text(char *dst, unsigned int dst_len, const char *text) {
+    size_t n = strlen(text);
+    if (n + 1 > dst_len) return EAI_OVERFLOW;
+    memcpy(dst, text, n + 1);
+    return 0;
+}
+
+int getnameinfo(const uint8_t *sa, unsigned int salen, char *host, unsigned int hostlen, char *serv,
+                unsigned int servlen, int flags) {
+    if ((unsigned int)flags & ~(unsigned int)NI_KNOWN_FLAGS) return EAI_BADFLAGS;
+    if (!sa || salen < 16 || sa[0] != 2 || sa[1] != 0) return EAI_FAMILY;
+    uint16_t port = (uint16_t)(((unsigned)sa[2] << 8) | sa[3]);
+    const uint8_t *addr = sa + 4;
+
+    if (host && hostlen > 0) {
+        const char *text = (const char *)0;
+        char dotted[16];
+        if (!(flags & NI_NUMERICHOST) && addr[0] == 127 && addr[1] == 0 && addr[2] == 0 && addr[3] == 1) text = "localhost";
+        if (!text) {
+            if (flags & NI_NAMEREQD) return EAI_NONAME;
+            ipv4_to_text(addr, dotted, sizeof(dotted));
+            text = dotted;
+        }
+        int rc = copy_text(host, hostlen, text);
+        if (rc) return rc;
+    }
+    if (serv && servlen > 0) {
+        const char *text = (const char *)0;
+        char digits[8];
+        if (!(flags & NI_NUMERICSERV)) {
+            for (unsigned i = 0; i < sizeof(service_table) / sizeof(service_table[0]); i++)
+                if (service_table[i].port == port) { text = service_table[i].name; break; }
+        }
+        if (!text) {
+            unsigned pos = sizeof(digits) - 1;
+            digits[pos] = 0;
+            unsigned v = port;
+            do { digits[--pos] = (char)('0' + v % 10); v /= 10; } while (v);
+            text = digits + pos;
+        }
+        int rc = copy_text(serv, servlen, text);
+        if (rc) return rc;
+    }
     return 0;
 }

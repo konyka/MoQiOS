@@ -93,6 +93,7 @@ struct hostent *gethostbyname(const char *name);
 #define EAI_SOCKTYPE -7
 #define EAI_SERVICE  -8
 #define EAI_MEMORY   -10
+#define EAI_OVERFLOW -12
 
 struct addrinfo {
     int              ai_flags;
@@ -115,5 +116,26 @@ void freeaddrinfo(struct addrinfo *res);
 
 /* Text for an EAI_* code (never NULL). */
 const char *gai_strerror(int code);
+
+/* ---- getnameinfo() (IPv4 only) ------------------------------------------------------------------------------ */
+
+#define NI_NUMERICHOST 1
+#define NI_NUMERICSERV 2
+#define NI_NOFQDN      4
+#define NI_NAMEREQD    8
+#define NI_DGRAM       16
+
+#define NI_MAXHOST 1025
+#define NI_MAXSERV 32
+
+/* Turn a 16-byte sockaddr_in into text. `host` and `serv` are optional: NULL or a zero length means "do not
+ * return that part". The host is "localhost" for 127.0.0.1 and dotted decimal otherwise (there is no reverse DNS);
+ * NI_NUMERICHOST forces the dotted form and NI_NAMEREQD turns "no name" into EAI_NONAME. The service is a known
+ * name (see getaddrinfo) unless NI_NUMERICSERV, else the decimal port. NI_NOFQDN, NI_DGRAM and the IDN bits
+ * (0x20, 0x40, 0x80) are accepted and change nothing; any other bit is EAI_BADFLAGS. A NULL, short (< 16 bytes) or
+ * non-AF_INET address is EAI_FAMILY; a buffer too small for the text plus its NUL is EAI_OVERFLOW. The host is
+ * written before the service is looked at. Returns 0 or an EAI_* code. */
+int getnameinfo(const uint8_t *sa, unsigned int salen, char *host, unsigned int hostlen, char *serv,
+                unsigned int servlen, int flags);
 
 #endif /* MOQI_NETDB_H */

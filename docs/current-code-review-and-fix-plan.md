@@ -6229,3 +6229,10 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 过程中自己的错误：①在 `-fno-builtin` 的测试里让 `malloc` 调 `__builtin_malloc`，结果无限递归，测试挂起，改成自带 bump 分配器；②第一次用 python 打补丁时锚点写错，没有应用就继续往下跑，后来靠 `grep` 发现。
 - 目标上验证：`hello196` 多 6 项——用 `getaddrinfo("127.0.0.1","9199")` 的 `ai_addr` 做 bind/listen；`getaddrinfo("localhost","9199")` 的条目 socket+connect，监听方 `accept4` 到连接；坏服务名是 `EAI_SERVICE`、node 与 service 都为空是 `EAI_NONAME`；`gai_strerror` 返回文本。全部 PASS。
 - 如实说明：①只做 IPv4；`AF_INET6` 返回 `EAI_FAMILY`，glibc 对 v4 名字会返回 -9；②`AI_V4MAPPED/ALL/ADDRCONFIG` 接受但忽略；③服务名表只有 11 项，不读 `/etc/services`；④不做大小写规范化，`1.2.3` 当名字解析；⑤没有 `getnameinfo`；⑥**没有改内核**，所以没有重跑完整 smoke/stress。
+
+## libc 的 getnameinfo（IPv4）
+
+- 做的事：补上和 `getaddrinfo` 配套的 `getnameinfo`（`include/netdb.h`、`src/netdb.c`），新增 `NI_*` 标志、`NI_MAXHOST`/`NI_MAXSERV`、`EAI_OVERFLOW`，`gai_strerror` 补 -11/-12。先在宿主机用 glibc 把边界都量了一遍（`/tmp/gni/gni*.c`）：缓冲区长度的边界（`localhost` 需要 10 字节、`8` 位点分地址需要 9）、NULL/零长度缓冲区、IDN 位 0x20/0x40/0x80 被接受而 0x100/0x200/0x400/0x8000 是 `EAI_BADFLAGS`、标志检查先于地址检查、`NI_NAMEREQD` 只在要求主机时才报错、短 sockaddr 是 `EAI_FAMILY`、主机在服务之前写入。
+- TDD：host 测试先写，`getnameinfo` 没声明所以编译失败=红。变异：把已知标志掩码放宽、`NI_NUMERICHOST` 不压制 localhost、缓冲区边界少算 NUL、去掉 `NI_NAMEREQD` 检查、短 sockaddr 门槛放宽、`NI_NUMERICSERV` 无效、NULL 主机缓冲区不跳过、不检查 `sa[1]`、去掉 `System error` 消息，共 9 个，全部被抓住（abort）。
+- 目标上验证：`hello196` 多 5 项（localhost/http、数字标志、无名地址与端口、`NI_NAMEREQD`/溢出/短 sockaddr、读回 `getaddrinfo` 产生的地址）。
+- 如实说明：①没有反向 DNS，只认 `127.0.0.1`，glibc 对 `127.0.0.2` 会通过 /etc/hosts 给出主机名（我在宿主机量到 `fedora`，这是宿主机配置，不是可移植行为）；②`sa` 参数是 `const uint8_t *`，与 `getaddrinfo` 的 `ai_addr` 一致，不是标准的 `struct sockaddr *`，所以和现有 C 代码源码级兼容需要一次强转；③没有 IPv6；④没有改内核，所以没有重跑完整 smoke/stress。

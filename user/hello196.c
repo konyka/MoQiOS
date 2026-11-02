@@ -123,6 +123,31 @@ int main(int argc, char **argv, char **envp) {
         if (gp >= 0) syscall1(SYS_close, gp);
         if (gc >= 0) syscall1(SYS_close, gc);
         if (gl >= 0) syscall1(SYS_close, gl);
+        {
+            char host[NI_MAXHOST], serv[NI_MAXSERV];
+            uint8_t gw[4] = {10, 0, 2, 2};
+            uint8_t lo[4] = {127, 0, 0, 1};
+            uint8_t sa[16];
+            ipv4_sockaddr(lo, 80, sa);
+            int a = getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), 0);
+            check(a == 0 && strcmp(host, "localhost") == 0 && strcmp(serv, "http") == 0,
+                  "getnameinfo(127.0.0.1:80) is localhost / http");
+            int b = getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NUMERICHOST | NI_NUMERICSERV);
+            check(b == 0 && strcmp(host, "127.0.0.1") == 0 && strcmp(serv, "80") == 0,
+                  "NI_NUMERICHOST|NI_NUMERICSERV give 127.0.0.1 / 80");
+            ipv4_sockaddr(gw, 9199, sa);
+            check(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), 0) == 0 &&
+                      strcmp(host, "10.0.2.2") == 0 && strcmp(serv, "9199") == 0,
+                  "an address without a name is dotted decimal, a port without a name is decimal");
+            check(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NAMEREQD) == EAI_NONAME &&
+                      getnameinfo(sa, 16, host, 8, serv, sizeof(serv), NI_NUMERICHOST) == EAI_OVERFLOW &&
+                      getnameinfo(sa, 8, host, sizeof(host), serv, sizeof(serv), 0) == EAI_FAMILY,
+                  "NI_NAMEREQD, a short host buffer and a short sockaddr are reported");
+            check(res && getnameinfo(res->ai_addr, res->ai_addrlen, host, sizeof(host), serv, sizeof(serv),
+                                     NI_NUMERICHOST | NI_NUMERICSERV) == 0 &&
+                      strcmp(host, "127.0.0.1") == 0 && strcmp(serv, "9199") == 0,
+                  "getnameinfo reads back what getaddrinfo produced");
+        }
         if (res) freeaddrinfo(res);
         if (named) freeaddrinfo(named);
     }

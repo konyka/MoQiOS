@@ -508,6 +508,154 @@ int main(void) {
         assert(ipv4_to_text(in, text, sizeof(text)) > 0);
         assert(ipv4_from_text(text, back) == 1 && memcmp(in, back, 4) == 0);
     }
+    /* ---- getnameinfo: the values below were measured against glibc 2.x on the host ---------------------------- */
+    {
+        uint8_t sa[16];
+        char host[64], serv[32];
+        const uint8_t gw[4] = {10, 0, 2, 2};
+        const uint8_t lo[4] = {127, 0, 0, 1};
+        const uint8_t zero[4] = {0, 0, 0, 0};
+        const uint8_t bcast[4] = {255, 255, 255, 255};
+
+        assert(NI_NUMERICHOST == 1 && NI_NUMERICSERV == 2 && NI_NOFQDN == 4 && NI_NAMEREQD == 8 && NI_DGRAM == 16);
+        assert(NI_MAXHOST == 1025 && NI_MAXSERV == 32 && EAI_OVERFLOW == -12);
+
+        /* Numeric host and service; a service without a name is its decimal port. */
+        ipv4_sockaddr(gw, 65000, sa);
+        memset(host, 'H', sizeof(host)); memset(serv, 'S', sizeof(serv));
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), 0) == 0);
+        assert(strcmp(host, "10.0.2.2") == 0 && strcmp(serv, "65000") == 0);
+
+        /* Known service names are used unless NI_NUMERICSERV is set. */
+        ipv4_sockaddr(gw, 80, sa);
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), 0) == 0);
+        assert(strcmp(serv, "http") == 0);
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NUMERICSERV) == 0);
+        assert(strcmp(serv, "80") == 0);
+        {
+            static const struct { uint16_t port; const char *name; } svc[] = {
+                {7, "echo"}, {21, "ftp"}, {22, "ssh"}, {23, "telnet"}, {25, "smtp"}, {53, "domain"}, {80, "http"},
+                {110, "pop3"}, {123, "ntp"}, {143, "imap"}, {443, "https"}, {0, "0"}, {65535, "65535"}, {9199, "9199"},
+            };
+            for (unsigned i = 0; i < sizeof(svc) / sizeof(svc[0]); i++) {
+                ipv4_sockaddr(gw, svc[i].port, sa);
+                assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), 0) == 0);
+                assert(strcmp(serv, svc[i].name) == 0);
+                /* NI_DGRAM changes nothing for these names. */
+                assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_DGRAM) == 0);
+                assert(strcmp(serv, svc[i].name) == 0);
+            }
+        }
+
+        /* Loopback has a name; NI_NUMERICHOST turns it off. Everything else is numeric (no reverse DNS here). */
+        ipv4_sockaddr(lo, 80, sa);
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), 0) == 0);
+        assert(strcmp(host, "localhost") == 0 && strcmp(serv, "http") == 0);
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NUMERICHOST) == 0);
+        assert(strcmp(host, "127.0.0.1") == 0 && strcmp(serv, "http") == 0);
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NUMERICHOST | NI_NUMERICSERV) == 0);
+        assert(strcmp(host, "127.0.0.1") == 0 && strcmp(serv, "80") == 0);
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NUMERICSERV) == 0);
+        assert(strcmp(host, "localhost") == 0 && strcmp(serv, "80") == 0);
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NAMEREQD) == 0);
+        assert(strcmp(host, "localhost") == 0);
+        {
+            uint8_t other[4] = {127, 0, 0, 2};
+            ipv4_sockaddr(other, 80, sa);
+            assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), 0) == 0);
+            assert(strcmp(host, "127.0.0.2") == 0);
+        }
+        ipv4_sockaddr(zero, 0, sa);
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), 0) == 0);
+        assert(strcmp(host, "0.0.0.0") == 0 && strcmp(serv, "0") == 0);
+        ipv4_sockaddr(bcast, 0, sa);
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NUMERICHOST) == 0);
+        assert(strcmp(host, "255.255.255.255") == 0);
+
+        /* NI_NAMEREQD: no name is EAI_NONAME, but only when a host buffer was asked for. */
+        ipv4_sockaddr(gw, 80, sa);
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NAMEREQD) == EAI_NONAME);
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NAMEREQD | NI_NUMERICHOST) == EAI_NONAME);
+        assert(getnameinfo(sa, 16, host, 0, serv, sizeof(serv), NI_NAMEREQD) == 0);
+        assert(getnameinfo(sa, 16, (char *)0, 0, serv, sizeof(serv), NI_NAMEREQD) == 0 && strcmp(serv, "http") == 0);
+        ipv4_sockaddr(lo, 80, sa);
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NAMEREQD | NI_NUMERICHOST) == EAI_NONAME);
+
+        /* A NULL or zero-length buffer means "do not return that part". */
+        ipv4_sockaddr(gw, 80, sa);
+        memset(host, 'H', sizeof(host)); memset(serv, 'S', sizeof(serv));
+        assert(getnameinfo(sa, 16, (char *)0, 64, serv, sizeof(serv), NI_NUMERICHOST) == 0);
+        assert(host[0] == 'H' && strcmp(serv, "http") == 0);
+        assert(getnameinfo(sa, 16, host, 0, serv, sizeof(serv), NI_NUMERICHOST) == 0 && host[0] == 'H');
+        memset(serv, 'S', sizeof(serv));
+        assert(getnameinfo(sa, 16, host, sizeof(host), (char *)0, 32, NI_NUMERICHOST) == 0);
+        assert(strcmp(host, "10.0.2.2") == 0 && serv[0] == 'S');
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, 0, NI_NUMERICHOST) == 0 && serv[0] == 'S');
+        assert(getnameinfo(sa, 16, (char *)0, 0, (char *)0, 0, 0) == 0);
+        assert(getnameinfo(sa, 16, (char *)0, 0, (char *)0, 0, 0xFFFF) == EAI_BADFLAGS);
+
+        /* Buffer sizes: the text plus its NUL must fit, otherwise EAI_OVERFLOW. */
+        assert(getnameinfo(sa, 16, host, 8, serv, sizeof(serv), NI_NUMERICHOST) == EAI_OVERFLOW);
+        assert(getnameinfo(sa, 16, host, 9, serv, sizeof(serv), NI_NUMERICHOST) == 0 && strcmp(host, "10.0.2.2") == 0);
+        assert(getnameinfo(sa, 16, host, 5, serv, sizeof(serv), NI_NUMERICHOST) == EAI_OVERFLOW);
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, 4, 0) == EAI_OVERFLOW);
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, 5, 0) == 0 && strcmp(serv, "http") == 0);
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, 2, NI_NUMERICSERV) == EAI_OVERFLOW);
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, 3, NI_NUMERICSERV) == 0 && strcmp(serv, "80") == 0);
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, 1, 0) == EAI_OVERFLOW);
+        ipv4_sockaddr(lo, 80, sa);
+        assert(getnameinfo(sa, 16, host, 9, serv, sizeof(serv), 0) == EAI_OVERFLOW);
+        assert(getnameinfo(sa, 16, host, 10, serv, sizeof(serv), 0) == 0 && strcmp(host, "localhost") == 0);
+        assert(getnameinfo(sa, 16, host, 10, serv, sizeof(serv), NI_NUMERICHOST) == 0 && strcmp(host, "127.0.0.1") == 0);
+
+        /* The host is already written when the service buffer turns out to be too small (glibc order). */
+        ipv4_sockaddr(lo, 80, sa);
+        memset(host, 'H', sizeof(host));
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, 4, 0) == EAI_OVERFLOW);
+        assert(strcmp(host, "localhost") == 0);
+        /* ...and a host that does not fit stops before the service is touched. */
+        memset(serv, 'S', sizeof(serv));
+        assert(getnameinfo(sa, 16, host, 4, serv, sizeof(serv), 0) == EAI_OVERFLOW && serv[0] == 'S');
+        ipv4_sockaddr(gw, 80, sa);
+
+        /* Flags: NOFQDN and the IDN bits are accepted and change nothing; bits glibc rejects are EAI_BADFLAGS. */
+        ipv4_sockaddr(gw, 80, sa);
+        {
+            static const int ok[] = {NI_NOFQDN, 0x20, 0x40, 0x80, NI_DGRAM};
+            for (unsigned i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
+                assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), ok[i]) == 0);
+                assert(strcmp(host, "10.0.2.2") == 0 && strcmp(serv, "http") == 0);
+            }
+            static const int bad[] = {0x100, 0x200, 0x400, 0x8000, -1};
+            for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+                assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), bad[i]) == EAI_BADFLAGS);
+            /* The flag check comes before the address check. */
+            uint8_t v6[16] = {10, 0};
+            assert(getnameinfo(v6, 16, host, sizeof(host), serv, sizeof(serv), 0x8000) == EAI_BADFLAGS);
+            assert(getnameinfo(sa, 8, host, sizeof(host), serv, sizeof(serv), 0x8000) == EAI_BADFLAGS);
+        }
+
+        /* Address validation: NULL, short, or non-AF_INET sockaddrs are EAI_FAMILY; a longer one is fine. */
+        assert(getnameinfo((const uint8_t *)0, 16, host, sizeof(host), serv, sizeof(serv), 0) == EAI_FAMILY);
+        assert(getnameinfo(sa, 0, host, sizeof(host), serv, sizeof(serv), 0) == EAI_FAMILY);
+        assert(getnameinfo(sa, 8, host, sizeof(host), serv, sizeof(serv), 0) == EAI_FAMILY);
+        assert(getnameinfo(sa, 15, host, sizeof(host), serv, sizeof(serv), 0) == EAI_FAMILY);
+        assert(getnameinfo(sa, 100, host, sizeof(host), serv, sizeof(serv), 0) == 0 && strcmp(host, "10.0.2.2") == 0);
+        {
+            uint8_t v6[28];
+            memset(v6, 0, sizeof(v6));
+            v6[0] = 10;
+            assert(getnameinfo(v6, 28, host, sizeof(host), serv, sizeof(serv), NI_NUMERICHOST) == EAI_FAMILY);
+            memcpy(v6, sa, 16);
+            v6[1] = 1; /* family 0x0102 */
+            assert(getnameinfo(v6, 16, host, sizeof(host), serv, sizeof(serv), NI_NUMERICHOST) == EAI_FAMILY);
+        }
+
+        /* gai_strerror knows the two codes getnameinfo adds. */
+        assert(strcmp(gai_strerror(EAI_OVERFLOW), "Result too large for supplied buffer") == 0);
+        assert(strcmp(gai_strerror(-11), "System error") == 0);
+        assert(strcmp(gai_strerror(-13), "Unknown error") == 0);
+    }
     /* Every list that getaddrinfo built was released: nothing leaked, nothing freed twice. */
     assert(live_allocs == 0);
     return 0;
