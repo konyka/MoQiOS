@@ -2844,8 +2844,8 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 | **架构抽象** | `kernel/arch/arch.zig` 多 ISA 接口 | ✅ M4；渐进迁移中 | 中（移植效率，非热路径） |
 | **riscv64** | M2–M7 ✅；共享内核复用待续 | ✅ M7 blk+net | N/A（第二 ISA） |
 | **aarch64** | M9-1…M9-7 ✅（…EL0/SVC + preempt sched） | ✅ M9-7 | N/A（第三 ISA） |
-| **未集成脚手架** | `futex`/`select`/`inotify`/`clone`/`mprotect`/SysV IPC/`aio`/`splice`/`dhcp`/`dns` 等 | 🧩 源文件在树中，未 `@import` | 低（按需接入） |
-| **缺页恢复** | 内核态 per-instruction fixup | ⚠️ 页表预检替代 | 中 |
+| **未集成脚手架** | `futex`/`select`/`inotify`/`clone`/`mprotect`/SysV IPC/`aio`/`splice`/`dhcp`/`dns` 等 | ✅ 均已接入系统调用分发或网络栈（`dns` 在 hello195 里才有了用户可见的 `dns_resolve` 系统调用，之前只有 host 测试和链接检查引用它） | 低（按需接入） |
+| **缺页恢复** | 内核态 per-instruction fixup | ✅ `arch/x86_64/user_copy.zig`：单条 `rep movsb` + 缺页处理里的 RIP 修复（`user/hello36.c` 用线程在拷贝中途 `munmap` 来验证）；页表预检仍保留，用于不可逆出队前的判断 | 中 |
 | **单元测试** | `zig build test`（host helpers） | ✅ 有基础用例 | 低（质量门） |
 
 ### 5.2 性能优先原则
@@ -2897,4 +2897,4 @@ Phase G — 按需 syscall 脚手架  ⬜ futex/select/clone…（按应用需�
 | P2 | `arch/x86_64/clone.zig` | 线程库前置 |
 | P2 | `mm/mprotect.zig` | W^X / JIT |
 | P3 | SysV IPC、`inotify`、`aio`、`splice` | 兼容层，非热路径 |
-| P3 | `net/dhcp.zig` / `net/dns.zig` | 网络自动化，非内核热路径 |
+| P3 | `net/dhcp.zig` / `net/dns.zig` | 网络自动化，非内核热路径（dhcp 在启动时运行；dns 已有 `dns_resolve` 系统调用，见 hello195） |

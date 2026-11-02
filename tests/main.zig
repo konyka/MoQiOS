@@ -1585,6 +1585,70 @@ test "munmap and SysV SHM policy validation" {
     try std.testing.expect(shm_policy.rangeEnd(0x7000_0000, 4096, munmap_policy.USER_ADDR_MAX) != null);
 }
 
+test "dns_resolve: hostname syntax, error codes, and the order of checks" {
+    const hp = kt.hostname_policy;
+    const V = hp.Verdict;
+    try std.testing.expectEqual(V.ok, hp.check("localhost"));
+    try std.testing.expectEqual(V.ok, hp.check("LocalHost"));
+    try std.testing.expectEqual(V.ok, hp.check("example.com"));
+    try std.testing.expectEqual(V.ok, hp.check("a.b.c.d"));
+    try std.testing.expectEqual(V.ok, hp.check("my-host_1.example.org"));
+    try std.testing.expectEqual(V.ok, hp.check("example.com.")); // one trailing dot: fully qualified
+    try std.testing.expectEqual(V.ok, hp.check("192.168.7.9")); // dotted decimal is a valid name here
+    try std.testing.expectEqual(V.empty, hp.check(""));
+    try std.testing.expectEqual(V.invalid, hp.check("."));
+    try std.testing.expectEqual(V.invalid, hp.check("a..b"));
+    try std.testing.expectEqual(V.invalid, hp.check(".a"));
+    try std.testing.expectEqual(V.invalid, hp.check("a.b.."));
+    try std.testing.expectEqual(V.invalid, hp.check("-a.example"));
+    try std.testing.expectEqual(V.invalid, hp.check("a-.example"));
+    try std.testing.expectEqual(V.invalid, hp.check("a.-b"));
+    try std.testing.expectEqual(V.invalid, hp.check("a.b-"));
+    try std.testing.expectEqual(V.invalid, hp.check("bad name!"));
+    try std.testing.expectEqual(V.invalid, hp.check("a b"));
+    try std.testing.expectEqual(V.invalid, hp.check("a/b"));
+    try std.testing.expectEqual(V.invalid, hp.check("\xc3\xa9.example")); // non-ASCII
+    // Label length: 63 is the limit.
+    const l63 = "a" ** 63;
+    const l64 = "a" ** 64;
+    try std.testing.expectEqual(V.ok, hp.check(l63));
+    try std.testing.expectEqual(V.invalid, hp.check(l64));
+    try std.testing.expectEqual(V.ok, hp.check(l63 ++ "." ++ l63));
+    // Whole-name length: 253 is the limit (with or without a trailing dot), longer is ENAMETOOLONG.
+    const n253 = l63 ++ "." ++ l63 ++ "." ++ l63 ++ "." ++ ("b" ** 61);
+    try std.testing.expectEqual(@as(usize, 253), n253.len);
+    try std.testing.expectEqual(V.ok, hp.check(n253));
+    try std.testing.expectEqual(V.ok, hp.check(n253 ++ "."));
+    try std.testing.expectEqual(V.too_long, hp.check(n253 ++ "b"));
+    try std.testing.expectEqual(V.too_long, hp.check(n253 ++ ".b")); // 255 bytes: past the first bound too
+    try std.testing.expectEqual(V.too_long, hp.check(n253 ++ "bb")); // 255 bytes, no trailing dot
+    try std.testing.expectEqual(V.invalid, hp.check("a.-b.c")); // a hyphen-led label in the middle
+    try std.testing.expectEqual(V.invalid, hp.check("a-.b.c")); // a hyphen-ended label in the middle (the dot rule)
+    try std.testing.expectEqual(V.invalid, hp.check("a-")); // a hyphen-ended last label
+    try std.testing.expectEqual(V.too_long, hp.check("a" ** 300));
+    try std.testing.expectEqualStrings("example.com", hp.stripTrailingDot("example.com."));
+    try std.testing.expectEqualStrings("example.com", hp.stripTrailingDot("example.com"));
+    try std.testing.expectEqualStrings(".", hp.stripTrailingDot("."));
+
+    // The system call checks the output pointer before it can wait on the network, then the name, and
+    // writes the output only on success; the three resolver tiers it relies on are already host-tested.
+    const src = kt.syscall_entry_source;
+    const f = std.mem.indexOf(u8, src, "fn syscallDnsResolve(").?;
+    const body = src[f..];
+    const out_ok = std.mem.indexOf(u8, body, "if (!copy.validateUserBufferWritable(out_ptr, 4)) return -14;").?;
+    const name_in = std.mem.indexOf(u8, body, "const name = switch (userPathResult(name_ptr, &buf)) {").?;
+    const verdict = std.mem.indexOf(u8, body, "switch (hp.check(name)) {").?;
+    const resolve = std.mem.indexOf(u8, body, "@import(\"../../net/dns.zig\").resolve(hp.stripTrailingDot(name))").?;
+    const write = std.mem.indexOf(u8, body, "if (copy.copyToUser(@ptrFromInt(out_ptr), &ip, 4) != 4) return -14;").?;
+    try std.testing.expect(out_ok < name_in and name_in < verdict and verdict < resolve and resolve < write);
+    try std.testing.expect(std.mem.indexOf(u8, body, ".empty => return -2, // ENOENT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, ".too_long => return -36, // ENAMETOOLONG") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, ".invalid => return -22, // EINVAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "return -2; // ENOENT: did not resolve") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "495 => { // dns_resolve(name, out4)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.moqi_syscalls_header, "#define SYS_dns_resolve 495") != null);
+}
+
 test "setitimer: Linux validation, saturating arithmetic, and the check order" {
     const ip = kt.itimer_policy;
     const max: i64 = std.math.maxInt(i64);

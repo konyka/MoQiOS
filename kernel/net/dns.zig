@@ -128,8 +128,17 @@ fn queryDns(hostname: []const u8, dns_server: [4]u8) [4]u8 {
     pkt[offset + 3] = 0x01; // CLASS_IN
     offset += 4;
 
-    // Send query
-    const sent = udp.sendTo(dns_server, DNS_PORT, 12345, &pkt, @intCast(offset));
+    // Send query. udp.sendTo does not wait: with no ARP entry for the server it only broadcasts an ARP request
+    // and returns false, so the first attempt on a cold ARP cache always fails. Pump the NIC so the reply is
+    // processed and try again until the query goes out or the deadline passes.
+    const send_start = idt.getTickCount();
+    var sent = false;
+    while (!sent and idt.getTickCount() - send_start < DNS_QUERY_TIMEOUT) {
+        sent = udp.sendTo(dns_server, DNS_PORT, 12345, &pkt, @intCast(offset));
+        if (sent) break;
+        pumpRx();
+        cpu.pause();
+    }
     if (!sent) {
         serial.writeString("[DNS] Failed to send query\n");
         return .{ 0, 0, 0, 0 };

@@ -157,6 +157,7 @@ pub const icmpv6_source = @embedFile("net/icmpv6.zig");
 pub const ndp_na_policy = @import("net/ndp_na_policy.zig");
 pub const ps2_policy = @import("drivers/ps2_policy.zig");
 pub const dns_policy = @import("net/dns_policy.zig");
+pub const hostname_policy = @import("net/hostname_policy.zig");
 pub const proc_id_policy = @import("proc/proc_id_policy.zig");
 pub const signal_perm_policy = @import("proc/signal_perm_policy.zig");
 pub const signal_action_policy = @import("proc/signal_action_policy.zig");

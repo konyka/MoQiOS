@@ -2526,6 +2526,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(poll_mod.ppoll(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8));
             checkSignalsOnSyscallReturn(frame);
         },
+        495 => { // dns_resolve(name, out4) — hostname to IPv4 through the kernel resolver
+            frame.rax = @bitCast(syscallDnsResolve(frame.rdi, frame.rsi));
+        },
         494 => { // pselect6(nfds, readfds, writefds, exceptfds, timespec, {sigmask, size})
             frame.rax = @bitCast(select_mod.pselect6(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9));
             checkSignalsOnSyscallReturn(frame);
@@ -6292,6 +6295,32 @@ fn syscallSetitimer(which: u32, new_value_ptr: u64, old_value_ptr: u64) i64 {
     }
     // ITIMER_VIRTUAL/PROF: accept but don't track
 
+    return 0;
+}
+
+/// dns_resolve(name_ptr, out_ptr): look `name` up (static table, dotted decimal, cache, then the network) and
+/// store the 4-byte IPv4 address at `out_ptr`. 0 on success; -EFAULT for a bad pointer, -ENOENT for an empty
+/// name or one that did not resolve, -ENAMETOOLONG, -EINVAL for a malformed hostname. The output is written
+/// only on success.
+fn syscallDnsResolve(name_ptr: u64, out_ptr: u64) i64 {
+    const copy = @import("../../mm/copy_from_user.zig");
+    const hp = @import("../../net/hostname_policy.zig");
+    if (!copy.validateUserBufferWritable(out_ptr, 4)) return -14; // EFAULT, before any network wait
+    // The shared path reader: a 256-byte buffer, 255 bytes of name, EFAULT / ENAMETOOLONG decided for us.
+    var buf: [256]u8 = undefined;
+    const name = switch (userPathResult(name_ptr, &buf)) {
+        .ok => |n| n,
+        .err => |e| return e,
+    };
+    switch (hp.check(name)) {
+        .ok => {},
+        .empty => return -2, // ENOENT
+        .too_long => return -36, // ENAMETOOLONG
+        .invalid => return -22, // EINVAL
+    }
+    const ip = @import("../../net/dns.zig").resolve(hp.stripTrailingDot(name));
+    if (ip[0] == 0 and ip[1] == 0 and ip[2] == 0 and ip[3] == 0) return -2; // ENOENT: did not resolve
+    if (copy.copyToUser(@ptrFromInt(out_ptr), &ip, 4) != 4) return -14;
     return 0;
 }
 
