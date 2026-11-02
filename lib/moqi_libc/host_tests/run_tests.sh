@@ -13,7 +13,7 @@ OUT=${MOQI_TEST_OUT:-/tmp/moqi-libc-test-bin}
 mkdir -p "$OUT"
 
 CC="zig cc"
-CFLAGS="-O1 -g -Wall -Wextra -Werror -fno-builtin"
+CFLAGS="-O1 -g -Wall -Wextra -Werror -fno-builtin -UNDEBUG"
 
 fail=0
 for t in test_string test_format test_malloc test_stdlib test_args test_pthread_dead_reap test_pthread_join_claim; do
@@ -31,6 +31,11 @@ echo "== test_rlimit_abi =="
 $CC $CFLAGS -c ../src/rlimit.c -o "$OUT/rlimit.o"
 $CC $CFLAGS -o "$OUT/test_rlimit_abi" test_rlimit_abi.c "$OUT/rlimit.o"
 "$OUT/test_rlimit_abi" || fail=1
+
+echo "== test_netdb_abi =="
+$CC $CFLAGS -DMOQI_HOST_TEST_SYSCALL -c ../src/netdb.c -o "$OUT/netdb.o"
+$CC $CFLAGS -o "$OUT/test_netdb_abi" test_netdb_abi.c "$OUT/netdb.o"
+"$OUT/test_netdb_abi" || fail=1
 
 if [ "$fail" -eq 0 ]; then
     echo "ALL HOST TESTS PASS"

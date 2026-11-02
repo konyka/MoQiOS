@@ -520,6 +520,10 @@ POSIX 消息队列的属性决策属于主机测试覆盖：测试验证 `O_CREA
 `run_tests.sh` 中的测试列表。该脚本已注册到 `zig build test`，不需要额外修改 CI 或创建独立
 入口；失败退出码会传播到本地命令和 GitHub CI。
 
+**断言真的会执行吗**：`zig cc -O1` 默认定义 `NDEBUG`，会把 `assert` 编译成空操作。`run_tests.sh` 在这个问题被发现之前没有 `-UNDEBUG`，所以 `test_mkdir_abi.c`、`test_rlimit_abi.c` 和 `test_stdlib.c` 里只靠 `assert` 的检查**从来没有执行过**（它们一直"通过"，因为什么都没检查）；现在 `CFLAGS` 里加了 `-UNDEBUG`。以后写新测试时不必再自己 `#undef NDEBUG`。
+
+**需要不跑真实 `syscall` 指令的包装器测试**（如 `netdb.c`）：源文件里用 `#ifdef MOQI_HOST_TEST_SYSCALL` 把系统调用换成一个由测试提供的桩函数（`moqi_test_syscall2`），`run_tests.sh` 对这个源文件加 `-DMOQI_HOST_TEST_SYSCALL` 单独编译。这样能在宿主机上检查参数顺序、错误码原样透传、NULL 参数被包装器拒绝，而不需要内核。
+
 GitHub CI 还分三个层次运行 QEMU：`smoke-qemu` 保持 x86_64 的单核/双核
 boot-to-shell 测试（安装 `qemu-system-x86` 与 `xorriso`）；`smoke-cross-arch`
 安装 `qemu-system-misc`（riscv64）与 `qemu-system-arm`（aarch64）并串行运行当前稳定的 `smoke-riscv` 与

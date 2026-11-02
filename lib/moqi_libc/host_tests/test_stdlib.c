@@ -26,7 +26,9 @@ int main(void) {
     assert(strcmp(getenv("PATH"), "/bin") == 0);
     /* Prefix-only names must NOT match the longer entry. */
     assert(getenv("PATH_EX") == (char *)0);
-    assert(getenv("PATH_EXTRA") == (char *)0);
+    /* ...and the longer name matches its own entry, not the shorter "PATH". */
+    assert(strcmp(getenv("PATH_EXTRA"), "/oops") == 0);
+    assert(strcmp(getenv("PATH"), "/bin") == 0);
     /* Empty value is still found. */
     assert(strcmp(getenv("EMPTY"), "") == 0);
     /* An entry without '=' is never a match, and does not stop the scan. */

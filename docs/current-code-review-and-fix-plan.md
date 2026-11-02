@@ -6085,3 +6085,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 这一轮的结论：**没有发现新的运行缺陷**；发现的是"测试通过但不能说明什么"的区域（见上面槽位复用那一条），这对以后读 host 测试的人是有用的信息，已写进文档。
 - 验证：三个架构构建通过；host 864/864；x86_64 内核 ELF 的 SHA-256 前 16 位在"有这两个文件"和"删掉这两个文件"两种状态下**完全相同**（`b25685c665368fa4`），所以删除没有改变内核二进制，这是测量，不是推断。因此没有重跑 QEMU 冒烟和 stress（它们跑的是同一个二进制）。
 
+### moqi_libc 的 `gethostbyname_ipv4`，以及 libc 宿主机测试里的 `assert` 一直是空操作（hello196）
+
+- 做的事：给 `dns_resolve` 加 libc 包装（`include/netdb.h`、`src/netdb.c`），`gethostbyname_ipv4` 和 `ipv4_to_text`；宿主机测试 `test_netdb_abi.c`（用桩替换系统调用）；QEMU 探针 `hello196`；`build.zig` 的 `moqi_libc_sources` 和 `libc_programs` 加上它们。
+- **冒出来的一个真实问题：libc 宿主机测试里的 `assert` 一直不执行。** 我写完 `test_netdb_abi.c` 第一次编译，`-Werror` 报"未使用的变量"——这说明 `assert` 被编译成了空操作。核实：`zig cc -O1` 默认定义 `NDEBUG`；对一个 `assert(1 == 2)` 的小程序，默认编译后运行退出码为 0，加 `-UNDEBUG` 后才触发断言失败。`run_tests.sh` 的 `CFLAGS` 没有 `-UNDEBUG`，所以**只靠 `assert` 做检查的宿主机测试从来没检查过任何东西**。我数了每个测试文件里 `assert(` 的次数：只有三个文件受影响——`test_stdlib.c`（15 处）、`test_rlimit_abi.c`（16 处）、`test_mkdir_abi.c`（2 处）；其余的（`test_string`、`test_format`、`test_malloc`、`test_args`、两个 `test_pthread_*`）用的是自己的计数检查和 `checks, failures` 输出，不受影响。加上 `-UNDEBUG` 之后，`test_stdlib.c` **立即失败**：它断言 `getenv("PATH_EXTRA") == NULL`，而 fixture 里明明有 `"PATH_EXTRA=/oops"`，`getenv` 的实现是对的（返回 `"/oops"`），**是测试写错了**——它本意是"前缀名 `PATH_EX` 不能匹配更长的条目"（那一行是对的），但下一行把完整名字也断言成了不存在。我把这一行改成断言它返回 `"/oops"`，并补上 `PATH` 仍返回 `/bin`。`getenv` 本身没有缺陷；这个发现是**测试的缺陷，不是被测代码的缺陷**。
+- 过程说明（如实）：①第一次变异检查里有一个变异"存活"——不是测试漏了，而是我把检查写成 `text[0] == '1' && text[10] == '9'`，分隔符变成逗号时完全不影响这两个字符；改成对整个字符串做 `strcmp` 后抓住。②另一个变异（`digits[d-- - 1]`）"存活"，我手工模拟后确认它与原式**等价**（只是换了写法），不是漏洞。③我的一个 sed 变异没匹配上（`NOCHANGE`），改写后重跑。④缓冲区长度的边界（`n + 1 > buf_len`，12 字节放得下 11 个字符加 NUL，11 字节放不下）一开始没有被精确测到，补了 `edge[12]` 的用例后，`n > buf_len` 和 `n + 2 > buf_len` 两个变异都被抓住。
+- 如实说明：①`getaddrinfo`/`hostent` 没有做；②libc 的 `ipv4_to_text` 没有对应的 QEMU 级别测试之外的覆盖（`hello196` 里只验证了 `127.0.0.1` 一种），其余由宿主机测试覆盖；③这个改动没有对 `libc_programs` 之外的程序造成影响（构建通过，三个架构）。
+- 红灯：`netdb.c` 不存在时 `run_tests.sh` 在编译 `test_netdb_abi` 这一步失败（`../src/netdb.c: CacheCheckFailed`）；`-UNDEBUG` 的红灯是 `test_stdlib.c` 立即失败。
+
+- 验证：host 864/864（其中包含 libc 宿主机测试，现在 `assert` 真的会执行）；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello196 通过、0 个 FAIL、0 次 panic；stress（SMP=2）5/5 PASS。变异（netdb.c，手工 sed）：`n + 1 > buf_len` 改成 `n >` 和 `n + 2 >`、去掉 NULL 检查之一、错误码换成别的、参数顺序对调、字节序反转、分隔符换成逗号、数字偏移、结尾 NUL 换成别的、位数循环条件，共 12 个，全部被宿主机测试抓住（过程中有 1 个存活，是测试断言太弱，补强；1 个与原式等价）。
