@@ -1935,9 +1935,9 @@ test "memory-management argument rules follow Linux: ranges, rounding, flags, ml
     const se = kt.syscall_entry_source;
     try std.testing.expect(std.mem.indexOf(u8, se, "if (!rp.madviseSupported(advice)) return -22; // EINVAL") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "if (!@import(\"../../mm/mmap.zig\").rangeMapped(addr, length)) return -12; // ENOMEM: a hole in the range") != null);
-    try std.testing.expect(std.mem.indexOf(u8, se, "if (!@import(\"../../mm/range_policy.zig\").mlockallFlagsValid(flags)) return -22;\n    return if (@import(\"../../mm/mlock_policy.zig\").userMlockUnsupported()) -38 else unreachable;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, se, "fn syscallMunlockall() i64 {\n    return 0;\n}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, se, "if (rc != 0 or len == 0) return rc;\n    return if (@import(\"../../mm/mlock_policy.zig\").userMlockUnsupported()) -38 else unreachable;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "if (!@import(\"../../mm/range_policy.zig\").mlockallFlagsValid(flags)) return -22;\n    return -38;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "return @import(\"../../mm/mlock.zig\").munlockall();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "return @import(\"../../mm/mlock.zig\").mlock(addr, len);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.mprotect_source, "if (addr >= user_space.USER_ADDR_MAX) return ENOMEM;") != null);
 }
 
@@ -2487,8 +2487,164 @@ test "AIO cancellation is unsupported when submissions complete synchronously" {
     try std.testing.expect(aio_policy.cancelUnsupported());
 }
 
-test "user memory locking is explicitly unsupported" {
-    try std.testing.expect(mlock_policy.userMlockUnsupported());
+test "mlock table: ranges merge, split, count pages and never exceed their capacity" {
+    const T = mlock_policy.Table;
+    var t = T{};
+    // Pages are page numbers. Locking is idempotent and counts each page once.
+    try std.testing.expect(t.lock(10, 4));
+    try std.testing.expectEqual(@as(u64, 4), t.total());
+    try std.testing.expect(t.lock(12, 4)); // overlaps 12..13, adds 14..15
+    try std.testing.expectEqual(@as(u64, 6), t.total());
+    try std.testing.expect(t.lock(16, 2)); // adjacent: merges into one range
+    try std.testing.expectEqual(@as(usize, 1), t.count);
+    try std.testing.expectEqual(@as(u64, 8), t.total());
+    try std.testing.expectEqual(@as(u64, 3), t.overlapPages(8, 5)); // 10,11,12
+    try std.testing.expectEqual(@as(u64, 0), t.overlapPages(20, 5));
+    try std.testing.expect(t.contains(10) and t.contains(17));
+    try std.testing.expect(!t.contains(9) and !t.contains(18));
+    try std.testing.expect(t.covers(11, 3));
+    try std.testing.expect(!t.covers(9, 3));
+    // Releasing a hole in the middle splits the range in two.
+    try std.testing.expect(t.release(12, 2));
+    try std.testing.expectEqual(@as(usize, 2), t.count);
+    try std.testing.expectEqual(@as(u64, 6), t.total());
+    try std.testing.expect(!t.contains(12) and !t.contains(13));
+    try std.testing.expect(t.contains(11) and t.contains(14));
+    // Releasing from an end truncates; releasing everything empties.
+    try std.testing.expect(t.release(10, 2));
+    try std.testing.expect(t.release(14, 100));
+    try std.testing.expectEqual(@as(usize, 0), t.count);
+    try std.testing.expectEqual(@as(u64, 0), t.total());
+    // Releasing what is not locked is fine.
+    try std.testing.expect(t.release(500, 3));
+
+    // Capacity: MAX_RANGES separate ranges fit, one more does not and leaves the table unchanged.
+    var full = T{};
+    var i: u64 = 0;
+    while (i < mlock_policy.MAX_RANGES) : (i += 1) try std.testing.expect(full.lock(i * 10, 1));
+    try std.testing.expect(!full.lock(1000, 1));
+    try std.testing.expectEqual(@as(u64, mlock_policy.MAX_RANGES), full.total());
+    // A lock that merges with an existing range needs no new slot even when full.
+    try std.testing.expect(full.lock(1, 1)); // adjacent to the range at page 0
+    // A hole that would split a range cannot be recorded when full: release reports it and changes nothing.
+    var split = T{};
+    try std.testing.expect(split.lock(100, 10));
+    i = 1;
+    while (i < mlock_policy.MAX_RANGES) : (i += 1) try std.testing.expect(split.lock(1000 + i * 10, 1));
+    try std.testing.expectEqual(mlock_policy.MAX_RANGES, split.count);
+    try std.testing.expect(!split.canRelease(103, 2));
+    try std.testing.expect(!split.release(103, 2));
+    try std.testing.expectEqual(@as(u64, 10 + mlock_policy.MAX_RANGES - 1), split.total());
+    try std.testing.expect(split.canRelease(100, 2)); // an end needs no slot
+    t = T{};
+    t.clear();
+    try std.testing.expectEqual(@as(usize, 0), t.count);
+    // Zero-length operations touch nothing.
+    try std.testing.expect(t.lock(5, 0));
+    try std.testing.expectEqual(@as(usize, 0), t.count);
+    try std.testing.expect(t.release(5, 0));
+}
+
+test "mlock table: a forced release keeps the left piece when a split has no free slot; moved() relocates locks transactionally" {
+    const T = mlock_policy.Table;
+    var t = T{};
+    try std.testing.expect(t.lock(100, 10));
+    var i: u64 = 1;
+    while (i < mlock_policy.MAX_RANGES) : (i += 1) try std.testing.expect(t.lock(1000 + i * 10, 1));
+    // No slot for the right-hand piece: the forced release drops it rather than failing.
+    t.releaseLossy(103, 2);
+    try std.testing.expectEqual(@as(usize, mlock_policy.MAX_RANGES), t.count);
+    try std.testing.expect(t.contains(100) and t.contains(102));
+    try std.testing.expect(!t.contains(103) and !t.contains(106));
+    // With a free slot it splits exactly like release().
+    var u = T{};
+    try std.testing.expect(u.lock(100, 10));
+    u.releaseLossy(103, 2);
+    try std.testing.expect(u.contains(102) and !u.contains(103) and !u.contains(104) and u.contains(105) and u.contains(109));
+    try std.testing.expectEqual(@as(u64, 8), u.total());
+
+    // moved(): the locked pages of the old range reappear at the new address, the rest of the table is untouched.
+    var m = T{};
+    try std.testing.expect(m.lock(10, 2)); // 10,11
+    try std.testing.expect(m.lock(13, 1)); // 13
+    try std.testing.expect(m.lock(500, 4)); // elsewhere
+    const moved = m.moved(10, 4, 200, 4).?;
+    try std.testing.expect(moved.covers(200, 2) and !moved.contains(202) and moved.contains(203));
+    try std.testing.expect(!moved.touches(10, 4));
+    try std.testing.expect(moved.covers(500, 4));
+    try std.testing.expectEqual(@as(u64, 7), moved.total());
+    // The original is not modified (the caller commits only on success).
+    try std.testing.expect(m.covers(10, 2) and m.contains(13));
+    // A shrinking move keeps only what still fits.
+    const shrunk = m.moved(10, 4, 200, 2).?;
+    try std.testing.expect(shrunk.covers(200, 2) and !shrunk.contains(203));
+    try std.testing.expectEqual(@as(u64, 6), shrunk.total());
+    // No slots for the relocated pieces: null, and nothing changed.
+    var full = T{};
+    try std.testing.expect(full.lock(10, 2));
+    try std.testing.expect(full.lock(13, 1));
+    i = 0;
+    while (full.count < mlock_policy.MAX_RANGES) : (i += 1) try std.testing.expect(full.lock(1000 + i * 10, 1));
+    // The two old pieces free two slots before the two new ones are added, so a full table can still move.
+    const ok = full.moved(10, 4, 200, 4).?;
+    try std.testing.expectEqual(@as(usize, mlock_policy.MAX_RANGES), ok.count);
+    try std.testing.expect(ok.covers(200, 2) and ok.contains(203));
+    // Fan one old range out into two new pieces on a full table: 1 slot freed, 2 needed.
+    var fan = T{};
+    try std.testing.expect(fan.lock(10, 4));
+    i = 0;
+    while (fan.count < mlock_policy.MAX_RANGES) : (i += 1) try std.testing.expect(fan.lock(1000 + i * 10, 1));
+    try std.testing.expect(fan.release(11, 1) == false); // splitting the range itself needs a slot too
+    try std.testing.expectEqual(@as(usize, mlock_policy.MAX_RANGES), fan.count);
+}
+
+test "mlock is wired into reclaim, madvise and every path that removes or moves pages" {
+    // swap reclaim must skip locked pages, inside the scan loop that picks victims.
+    const swap_src = kt.swap_source;
+    const scan = std.mem.indexOf(u8, swap_src, "fn reclaimScanPass") orelse return error.TestUnexpectedResult;
+    const skip = std.mem.indexOf(u8, swap_src, "if (mm.locks.contains(virt_addr / 4096)) continue;") orelse return error.TestUnexpectedResult;
+    const swap_out = std.mem.indexOfPos(u8, swap_src, scan, "if (swapOut(pml4_phys, virt_addr, &pt[pt_idx]))") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(skip > scan and skip < swap_out);
+    // madvise refuses DONTNEED/FREE on a locked range before acting.
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "(advice == 4 or advice == 8) and @import(\"../../mm/mm.zig\").Mm.locked(") != null);
+    // munmap, MAP_FIXED (two paths), mremap shrink and mremap move all adjust the table.
+    const mm_src = kt.mmap_mlock_source;
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, mm_src, "m.locks.releaseLossy("));
+    try std.testing.expect(std.mem.indexOf(u8, mm_src, "m.locks.moved(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mm_src, "m.locks = t;") != null);
+}
+
+test "Mm still fits the 1024-byte slab class after gaining the mlock table" {
+    // Mm is kmalloc'ed. Past 1024 bytes the slab hands out a whole page per address space instead.
+    try std.testing.expect(@sizeOf(kt.mm.Mm) <= 1024);
+}
+
+test "mlock limit rules follow Linux: EPERM only when there is no limit and no privilege, ENOMEM over the limit" {
+    const mp = mlock_policy;
+    const inf = std.math.maxInt(u64);
+    // Linux can_do_mlock: CAP_IPC_LOCK or a non-zero RLIMIT_MEMLOCK.
+    try std.testing.expect(!mp.mayAttempt(0, false));
+    try std.testing.expect(mp.mayAttempt(0, true));
+    try std.testing.expect(mp.mayAttempt(4096, false));
+    try std.testing.expect(mp.mayAttempt(inf, false));
+    // New total (already locked + request) against the limit in pages; pages already locked inside the request
+    // are not charged twice.
+    try std.testing.expect(mp.fitsLimit(2 * 4096, false, 0, 2, 0));
+    try std.testing.expect(!mp.fitsLimit(2 * 4096, false, 0, 3, 0));
+    try std.testing.expect(!mp.fitsLimit(2 * 4096, false, 2, 1, 0));
+    try std.testing.expect(mp.fitsLimit(2 * 4096, false, 2, 2, 2)); // relocking what is locked
+    try std.testing.expect(mp.fitsLimit(2 * 4096, false, 1, 2, 1)); // 1 locked inside the request: 1 + 2 - 1 = 2
+    try std.testing.expect(!mp.fitsLimit(2 * 4096, false, 2, 2, 1)); // 2 + 2 - 1 = 3
+    try std.testing.expect(mp.fitsLimit(2 * 4096, true, 2, 100, 0)); // CAP_IPC_LOCK ignores the limit
+    try std.testing.expect(mp.fitsLimit(inf, false, 1 << 40, 1 << 20, 0));
+    try std.testing.expect(mp.fitsLimit(4096 + 1, false, 0, 1, 0)); // the limit rounds down to whole pages
+    try std.testing.expect(!mp.fitsLimit(4095, false, 0, 1, 0));
+}
+
+test "lockSpan counts the page an unaligned zero-length range starts in, like Linux" {
+    const rp = kt.range_policy;
+    try std.testing.expectEqual(rp.Span.empty, rp.lockSpan(0x30000000, 0));
+    try std.testing.expectEqual(rp.Span{ .pages = 1 }, rp.lockSpan(0x30000064, 0));
 }
 
 test "ioprio policy validates process scope and encoded classes" {

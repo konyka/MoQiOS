@@ -3907,6 +3907,9 @@ fn syscallMadvise(addr: u64, length: u64, advice: u32) i64 {
     const cur_idx = sched.currentTaskIndex() orelse return 0;
     const cur = tm.getTask(cur_idx) orelse return 0;
 
+    // Linux: discarding advice on a VM_LOCKED range is EINVAL, whole call, nothing discarded.
+    if ((advice == 4 or advice == 8) and @import("../../mm/mm.zig").Mm.locked(cur.mm, addr, length + (addr & 0xFFF))) return -22;
+
     switch (advice) {
         0 => {}, // MADV_NORMAL — default behavior
         1 => {}, // MADV_RANDOM — no special action
@@ -5273,29 +5276,15 @@ fn syscallMsync(addr: u64, length: u64, flags: u32) i64 {
     return 0;
 }
 
-/// mlock(addr, len): the arguments are checked like Linux's (zero length is a no-op, a range outside user
-/// space or with a hole is ENOMEM). A valid request still fails with ENOSYS: the kernel cannot pin user pages,
-/// and reporting success would let a caller believe its secrets stay out of swap.
+/// mlock(addr, len): Linux's order of checks (privilege/limit EPERM, range and mapping ENOMEM, quota ENOMEM). The
+/// locked pages are excluded from swap reclaim and from MADV_DONTNEED; see mm/mlock.zig.
 fn syscallMlock(addr: u64, len: u64) i64 {
-    const rc = checkLockRange(addr, len);
-    if (rc != 0 or len == 0) return rc;
-    return if (@import("../../mm/mlock_policy.zig").userMlockUnsupported()) -38 else unreachable;
+    return @import("../../mm/mlock.zig").mlock(addr, len);
 }
 
-/// munlock(addr, len): same argument checks; unlocking succeeds because nothing is ever locked.
+/// munlock(addr, len): same range checks; no privilege needed, unlocking unlocked pages succeeds.
 fn syscallMunlock(addr: u64, len: u64) i64 {
-    return checkLockRange(addr, len);
-}
-
-fn checkLockRange(addr: u64, len: u64) i64 {
-    const rp = @import("../../mm/range_policy.zig");
-    switch (rp.lockSpan(addr, len)) {
-        .err => |e| return e,
-        .empty => return 0,
-        .pages => {},
-    }
-    if (!@import("../../mm/mmap.zig").rangeMapped(addr & ~@as(u64, 0xFFF), len + (addr & 0xFFF))) return -12; // ENOMEM
-    return 0;
+    return @import("../../mm/mlock.zig").munlock(addr, len);
 }
 
 /// posix_fadvise(fd, offset, len, advice) — provide readahead hints.
@@ -5827,16 +5816,17 @@ fn syscallClockSettime(clockid: u32, tp_ptr: u64) i64 {
     return 0;
 }
 
-/// mlockall(flags): the flags are validated like Linux's; a valid request fails with ENOSYS for the reason
-/// given at syscallMlock.
+/// mlockall(flags): the flags are validated like Linux's; a valid request fails with ENOSYS, because MCL_FUTURE
+/// would need every mapping path to lock new mappings, and a call that silently ignored it would let a caller
+/// believe its future memory stays out of swap.
 fn syscallMlockall(flags: u32) i64 {
     if (!@import("../../mm/range_policy.zig").mlockallFlagsValid(flags)) return -22;
-    return if (@import("../../mm/mlock_policy.zig").userMlockUnsupported()) -38 else unreachable;
+    return -38;
 }
 
-/// munlockall(): succeeds, nothing is ever locked.
+/// munlockall(): drops every lock of the address space.
 fn syscallMunlockall() i64 {
-    return 0;
+    return @import("../../mm/mlock.zig").munlockall();
 }
 
 // ── v38.0: MoQiOS capability syscalls ────────────────────────────────────

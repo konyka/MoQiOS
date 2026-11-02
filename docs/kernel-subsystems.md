@@ -1145,10 +1145,7 @@ const SchedStats = struct {
   `ENOSYS`，不再成功 no-op 或修改用户 word；完整共享 futex/PI donation 需独立状态
   模型后再实现。`futex_waitv` 同样返回 `ENOSYS`，直到每个 vector entry 都可携带
   address-space-qualified private key；不再将第一个匹配项错误地入队到 bucket。
-- **memory-lock ABI（2026-08）**：用户 `mlock`、`munlock`、`mlockall` 和
-  `munlockall` 当前统一返回 `ENOSYS`，不检查映射也不修改 `MmapRegion.locked`。
-  内核的 `.locked` 仍仅表示 device/no-free 映射内部不参与 swap/reclaim；真实用户页
-  pinning 需要 prefault、swap exclusion、MCL_FUTURE 和 RLIMIT_MEMLOCK 模型后再实现。
+- **memory-lock（`mlock`/`munlock`/`munlockall`，hello198）**：`mm/mlock.zig` + `mm/mlock_policy.zig`。每个 `Mm` 有一张最多 16 段的锁定页表（`Mm.locks`，页号区间，`vm_lock` 保护；exec 与 fork 子进程从空表开始，和 Linux 一样不继承；CLONE_VM 线程共享）。检查顺序对照真实 Linux：RLIMIT_MEMLOCK 为 0 且没有 `CAP_IPC_LOCK` 时先 `EPERM`（长度 0 也是），然后范围/映射（含 `PROT_NONE` 页）`ENOMEM`，然后配额（已锁页 + 新增页 > 限额按页数向下取整）`ENOMEM`；已锁页不重复计费；非对齐的零长度 `mlock(p+100, 0)` 会锁住起始页。`munlock` 不需要权限，解锁没锁的页成功。锁定页的效果：swap 回收（`swap.zig`）跳过；`MADV_DONTNEED`/`MADV_FREE` 对锁定范围整体 `EINVAL`（Linux 同）。`munmap`、`MAP_FIXED` 覆盖（通用路径与原子替换路径）、`mremap` 缩小会释放对应的锁（表满导致无法记录切分时丢掉右半段，即解锁，方向安全）；`mremap` 移动会把锁随页搬到新地址（先算好新表，移动成功才提交）。**限制**：`mlockall` 仍返回 `ENOSYS`（`MCL_FUTURE` 需要每个映射路径都自动锁新页，静默忽略会让调用者误以为后续内存不会被换出）；表只有 16 段，超过返回 `ENOMEM`；匿名映射本来就是 eager 填充，所以没有"预取"步骤，锁的实际效果只有"不被换出、不被 DONTNEED"；`MmapRegion.locked` 仍只表示设备/no-free 映射。
 - **v1 限制**：~~CLONE_FILES 真共享 fd 表未实现（创建时复制）~~（6.27 已实现）；~~`__thread`（PT_TLS）未实现~~（6.28 已实现）；线程私有数据仍可用 getspecific；~~detached 线程不 join 时栈描述符泄漏~~（v2 已回收，见下）。
 - **v2（2026-08-13）**：`pthread_detach` + detached 栈惰性回收——退出线程把 TCB+栈块压入无锁死栈链（CAS push），下一次 `pthread_create` 排空 free（退出线程无法安全释放自己仍在运行的栈；压链后以纯寄存器内联 exit syscall，不再触碰本栈）。join-detached 与重复 detach 返回 EINVAL；join 与并发 detach 竞速时复见 detached 即放弃 free（所有权归死栈链，杜绝 double-free）。malloc/free 增加 test-and-set 自旋锁，多线程并发 create/join 不再竞争堆空闲链。验收：hello57 增加 8 detached + double-detach/join-detached EINVAL + 排空触发的断言组。
 - **v2 续（2026-08-13，CLONE_FILES）**：FdTable 从 Task 内嵌（约 57KB/任务）移入静态池（64 槽 + 原子位图），`Task.fd_table` 改为指针；表带原子引用计数，`clone(CLONE_FILES)` 共享指针（跳过复制与 retainSharedResources），`exitTask` 仅在末引用时关闭全部 fd 并归还池。fd 位图操作原子化（allocFdAtLeast 抢位循环 / freeFd 原子 Or），无表级锁；close 与并发使用的描述符内容竞态为记录的弱语义。pthread_create 加传 CLONE_FILES，线程组获得真共享 fd 表与共享 NOFILE 上限。验收：hello57 新增跨线程 fd 共享读 + close 后 EBADF 断言。
@@ -1958,7 +1955,7 @@ The native `Message` ABI is an exactly 256-byte extern struct: `sender:u64`, `re
 - shmctl: IPC_STAT/IPC_RMID/IPC_SET（mode 与属主 uid/gid，见下）
 - `IPC_STAT` 元数据先在 `shm_lock` 内快照，再在锁外 copyout；`IPC_SET` 先锁外 copyin，再锁内校验权限并提交，避免用户页访问运行在 IRQ 关闭状态。负 `key` 以原始 i64 位模式写入 ABI 缓冲区。
 - task exit 只有在存在 `Mm` 且成功取得 VM mutation guard 时才执行 SHM detach；guard 获取失败或任务无 `Mm` 时跳过该 detach，但继续完成其余退出清理，避免无保护修改页表。
-- `mlock/mlockall/munlock/munlockall` 当前保持明确的 `ENOSYS` ABI 契约；真实实现必须先补 per-MM lock accounting、`RLIMIT_MEMLOCK`、prefault/pin、swap/reclaim exclusion、MCL_FUTURE 及 clone/exit/munmap 交互，不能用简单 VMA 标志伪装完成。
+- `mlock/munlock/munlockall` 已实现（per-Mm 锁表、`RLIMIT_MEMLOCK`、swap 排除、`munmap`/`MAP_FIXED`/`mremap` 交互，见上文 memory-lock 一节）；`mlockall` 仍是明确的 `ENOSYS`（缺 `MCL_FUTURE` 的自动锁定）。
 - findFreeRegion: next_free_hint O(n) 扫描，freeSegment 自动重置 hint
 - 系统调用: #29 (shmget), #30 (shmat), #31 (shmctl), #67 (shmdt)
 

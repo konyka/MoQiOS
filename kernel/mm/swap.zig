@@ -409,6 +409,10 @@ fn reclaimScanPass(mm: *Mm, target: u32) u32 {
                         (@as(u64, pd_idx) << 21) |
                         (@as(u64, pt_idx) << 12);
 
+                    // mlock: a locked page is never swapped out. The caller holds this mm's vm_lock (via
+                    // beginReclaimCritical), which is also what guards the table.
+                    if (mm.locks.contains(virt_addr / 4096)) continue;
+
                     if (swapOut(pml4_phys, virt_addr, &pt[pt_idx])) {
                         swapped += 1;
                         // v53.12: Advance clock hand atomically — next reclaim starts from here

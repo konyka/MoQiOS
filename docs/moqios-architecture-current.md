@@ -979,8 +979,8 @@ LAPIC Timer 中断
 | 249 | getcpu | 获取当前CPU/NUMA节点 |
 | 250 | pipe2 | 创建管道 (O_CLOEXEC) |
 | 251 | mincore | 检查页面驻留 |
-| 252 | mlock | 当前返回 ENOSYS（用户 pinning 未实现） |
-| 253 | munlock | 当前返回 ENOSYS（用户 pinning 未实现） |
+| 252 | mlock | 已实现：per-Mm 锁表 + RLIMIT_MEMLOCK + swap 排除（`mm/mlock.zig`） |
+| 253 | munlock | 已实现（无需权限；解锁未锁页成功） |
 | 254 | msync | 同步内存映射 |
 | 255 | openat | 打开文件 (相对dirfd) |
 | 256 | unlinkat | 删除文件 (相对dirfd) |
@@ -998,8 +998,8 @@ LAPIC Timer 中断
 | 268 | personality | 获取/设置进程personality |
 | 269 | clock_getres | 获取时钟精度 |
 | 270 | clock_settime | 设置时钟 (stub) |
-| 271 | mlockall | 当前返回 ENOSYS（用户 pinning 未实现） |
-| 272 | munlockall | 当前返回 ENOSYS（用户 pinning 未实现） |
+| 271 | mlockall | 仍返回 ENOSYS（参数先按 Linux 校验；缺 MCL_FUTURE 自动锁定） |
+| 272 | munlockall | 已实现（清空本地址空间的锁表） |
 | 273 | sched_setaffinity | 设置CPU亲和性 |
 | 274 | fallocate | 预分配文件空间 (no-op) |
 | 275 | posix_fadvise | 文件访问建议 (no-op) |

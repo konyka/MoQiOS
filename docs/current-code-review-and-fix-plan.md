@@ -6161,3 +6161,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 做的事：新增头文件 `include/byteorder.h`，四个 `static inline` 函数，并用 `#if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__ → #error` 保证三个小端目标之外不会悄悄出错；`ipv4_sockaddr` 改为用 `htons`。
 - TDD：`test_byteorder.c` 先写（头文件缺失，编译失败=红），期望值来自宿主机 glibc 的 `htons/htonl`（`0x1234→0x3412`、`0x12345678→0x78563412` 等），加上 0/最大值/往返和"端口字节在内存里是网络序"的检查；变异：`htons` 不交换、`htonl` 漏掉 `v << 24`，各自让具名断言失败，已还原；`hello196` 多 1 项在目标上核对。
 - 如实说明：没有 `struct in_addr`/`inet_addr`/`inet_ntoa` 等 BSD socket 头；没有改内核。
+
+## mlock / munlock / munlockall 实现（hello198）
+
+- 怎么想到的：逐条核对文档里"明确未实现"的项，`mlock` 家族一直是 `ENOSYS`。理由写得很清楚：真实实现需要 per-MM 计账、`RLIMIT_MEMLOCK`、swap 排除、与 clone/exit/munmap 的交互，"不能用简单 VMA 标志伪装完成"。这些前置条件其实都已经具备（`Mm` 上已有 mseal 表这个先例，`RLIMIT_MEMLOCK` 已经被 getrlimit/setrlimit 记录，swap 回收有一个单一的扫描点），所以这次把它做完整，而不是只做标志位。
+- 先取对照标准：写了 9 个宿主机 gcc 程序，每个场景在独立子进程里跑（避免上一个场景降低的硬限制污染下一个），取真实 Linux 的返回值。测得的规则：①限额为 0 且无 `CAP_IPC_LOCK` 时 `mlock` 一律 `EPERM`，长度为 0 和未映射范围也一样；②范围未映射（含空洞、`PROT_NONE` 页）是 `ENOMEM`，失败的调用**不会**留下部分锁定；③已锁页不重复计费，限额按页向下取整；④`munmap`、`MAP_FIXED` 覆盖、`mremap` 缩小都会释放配额，`mprotect` 不会；⑤fork 子进程不继承锁；⑥对锁定范围做 `MADV_DONTNEED`/`MADV_FREE` 整体 `EINVAL`；⑦非对齐的零长度 `mlock(p+100, 0)` 会锁住起始页，对齐的零长度什么也不做；⑧`munlock` 不需要权限。
+- 红灯：`hello198`（62 项）在旧内核上 36 项 FAIL（全部 `mlock` 成功路径与配额），另有 3 个 host 测试先因 `Table`/`mayAttempt` 不存在而编译失败，`lockSpan` 对非对齐零长度的 host 断言也先失败（它原来对任何零长度返回 empty，与 Linux 不符，这是一个独立的小缺陷，一并改正）。
+- 实现：`mm/mlock_policy.zig`（纯逻辑：最多 16 段的页区间表，`lock` 合并相邻/重叠段，`release` 截断或切分，`releaseLossy`/`moved` 给不能失败的内部路径用，`mayAttempt`/`fitsLimit` 是 Linux 的限额规则）、`mm/mlock.zig`（三个系统调用）、`Mm.locks`（与 `seals` 并列，`vm_lock` 保护）。接线：`swap.zig` 的回收扫描跳过锁定页（持有同一把 `vm_lock`）；`madvise` 的 DONTNEED/FREE 对锁定范围 `EINVAL`；`munmap`、`MAP_FIXED` 的两条路径、`mremap` 缩小释放锁；`mremap` 移动把锁带到新地址（先算好新表，移动成功才提交）。`Mm` 仍在 1024 字节的 slab 档内（有测试固定）。
+- 验证：host 988/988（新增 6 个测试，更新 1 个原来断言 ENOSYS 源码文本的旧测试）；`hello198` 在 QEMU 里 PASS；`hello71` 里"mlock 返回 ENOSYS"的两项断言已按新行为改为成功，`mlockall` 仍断言 ENOSYS。
+- 如实说明：①`mlockall` 仍是 `ENOSYS`，原因是 `MCL_FUTURE` 需要每个映射路径都自动锁新页；②表只有 16 段，满了返回 `ENOMEM`，释放时若切分没有空槽则丢掉右半段（解锁方向，安全）；③匿名映射本来就是 eager 填充，所以没有"预取"，锁的实际效果只有"不被换出、不被 DONTNEED"；④没有做 `mlock2`（`MLOCK_ONFAULT`）；⑤`pmm` 的回收只处理 x86_64，没有改非 x86 的路径（它们没有 swap）。

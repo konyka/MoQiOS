@@ -1,4 +1,4 @@
-// hello71 - mlock ABI rejection and MAP_FIXED metadata independence acceptance.
+// hello71 - mlock basics, mlockall still ENOSYS, and MAP_FIXED metadata independence acceptance.
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
 #include "../lib/moqi_libc/include/stdio.h"
 #include "../lib/moqi_libc/include/unistd.h"
@@ -35,17 +35,17 @@ int main(int argc, char **argv, char **envp) {
         volatile unsigned long *word = (volatile unsigned long *)page;
         *word = 0x68656c6c6f3731UL;
 
-        CHECK(syscall2(SYS_mlock, page, PAGE_SIZE) == -ENOSYS,
-              "mlock returns ENOSYS");
+        CHECK(syscall2(SYS_mlock, page, PAGE_SIZE) == 0,
+              "mlock locks the page (default RLIMIT_MEMLOCK is unlimited)");
         CHECK(*word == 0x68656c6c6f3731UL, "mlock preserves sentinel");
         CHECK(syscall2(SYS_munlock, page, PAGE_SIZE) == 0,
-              "munlock succeeds (nothing is ever locked)");
+              "munlock succeeds");
         CHECK(*word == 0x68656c6c6f3731UL, "munlock preserves sentinel");
         CHECK(syscall1(SYS_mlockall, MCL_CURRENT | MCL_FUTURE) == -ENOSYS,
               "mlockall current future returns ENOSYS");
         CHECK(*word == 0x68656c6c6f3731UL, "mlockall preserves sentinel");
         CHECK(syscall0(SYS_munlockall) == 0,
-              "munlockall succeeds (nothing is ever locked)");
+              "munlockall succeeds");
         CHECK(*word == 0x68656c6c6f3731UL, "munlockall preserves sentinel");
 
         const long replaced = mmap_raw(page, PAGE_SIZE, PROT_RW,

@@ -45,11 +45,20 @@ pub const Mm = struct {
     /// mseal(2) ranges. Written under vm_lock; a fresh address space (exec)
     /// starts empty, fork copies the parent's (Linux: seals are inherited).
     seals: @import("mseal_policy.zig").Table = .{},
+    /// mlock ranges (page numbers). Written under vm_lock; a fresh address space (exec, fork child) starts empty,
+    /// like Linux, where VM_LOCKED is not inherited across fork.
+    locks: @import("mlock_policy.zig").Table = .{},
 
     /// Whether [base, base+len) touches a sealed range (caller holds vm_lock).
     pub fn sealed(mm: ?*Mm, base: u64, len: u64) bool {
         const m = mm orelse return false;
         return m.seals.overlaps(base, len);
+    }
+
+    /// Whether any page of [base, base+len) is mlocked (caller holds vm_lock, or is the reclaim guard).
+    pub fn locked(mm: ?*Mm, base: u64, len: u64) bool {
+        const m = mm orelse return false;
+        return m.locks.touches(base / 4096, (len + 4095) / 4096);
     }
 
     pub fn acquire(page_table_phys: u64, finalizer: *const fn (*Mm) void) ?*Mm {

@@ -63,10 +63,11 @@ pub fn mincoreSpan(addr: u64, len: u64) Span {
     return .{ .pages = pages };
 }
 
-/// mlock/munlock: the start is rounded down and the length grows by the part of a page it started in;
-/// a zero length does nothing; the range must be in user space (ENOMEM) and mapped (ENOMEM).
+/// mlock/munlock: the start is rounded down and the length grows by the part of a page it started in, so a
+/// zero length at an unaligned address still covers the page it starts in (Linux measured: mlock(p+100, 0) locks
+/// that page); an aligned zero length does nothing; the range must be in user space (ENOMEM) and mapped (ENOMEM).
 pub fn lockSpan(addr: u64, len: u64) Span {
-    if (len == 0) return .empty;
+    if (len == 0 and addr % PAGE == 0) return .empty;
     const start = addr & ~(PAGE - 1);
     const total = @addWithOverflow(len, addr - start);
     if (total[1] != 0) return .{ .err = ENOMEM };

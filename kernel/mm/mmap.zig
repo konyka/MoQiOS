@@ -608,6 +608,16 @@ fn pagesFree(task: *task_mod.Task, base: u64, num_pages: u64) bool {
     return firstMappedPage(task, base, num_pages) == null;
 }
 
+/// Whether any page of the range is a PROT_NONE reservation (non-present, holds a frame). mlock refuses those.
+pub fn hasReservedPage(task: *task_mod.Task, base: u64, num_pages: u64) bool {
+    var p: u64 = 0;
+    while (p < num_pages) : (p += 1) {
+        const raw = paging_mod.getPageEntryRaw(task.page_table_phys, base + p * user_space.PAGE_SIZE) orelse continue;
+        if (pte_kind.classify(raw) == .prot_none) return true;
+    }
+    return false;
+}
+
 pub fn hasMmapOverlap(task: *task_mod.Task, base: u64, num_pages: u64) bool {
     vma_runtime_stats.recordScan(task.mmap_active_bm);
     var bits = task.mmap_active_bm;
@@ -924,8 +934,22 @@ fn moveOrNoMem(task: *task_mod.Task, region: *task_mod.MmapRegion, old_pages: u6
     // target untracked live pages (image, stack, brk) and mapPage overwrites a
     // live PTE silently, so gate on the actual page tables too.
     if (!pagesFree(task, new_base, new_pages)) return -12; // ENOMEM
-    return moveMapping(task, region, new_base, old_pages, new_pages);
+    // Locked pages stay locked at their new address (Linux moves VM_LOCKED with the mapping). The relocated
+    // table is built first so that a table with no spare slot fails the mremap before anything is moved.
+    var relocated: ?@import("mlock_policy.zig").Table = null;
+    if (task.mm) |m| {
+        if (m.locks.touches(region.base / PAGE_SZ, old_pages)) {
+            relocated = m.locks.moved(region.base / PAGE_SZ, old_pages, new_base / PAGE_SZ, new_pages) orelse return -12;
+        }
+    }
+    const moved_to = moveMapping(task, region, new_base, old_pages, new_pages);
+    if (moved_to >= 0) if (relocated) |t| if (task.mm) |m| {
+        m.locks = t;
+    };
+    return moved_to;
 }
+
+const PAGE_SZ: u64 = user_space.PAGE_SIZE;
 
 /// Pages of a mounted-volume file, copied into private frames BEFORE the VM
 /// lock is taken: reading the volume can sleep (its lock, an NVMe completion),
@@ -1182,14 +1206,19 @@ pub fn mmap(addr_hint: u64, length: u64, prot_raw: u64, flags: u64, fd: i64, off
         if (mm_mod.Mm.sealed(cur.mm, base, num_pages * user_space.PAGE_SIZE)) return -1; // EPERM: mseal
         if (hasMmapOverlap(cur, base, num_pages)) {
             // Replacing exactly one private anonymous read-write region keeps the atomic path.
-            if (meta == null and pf.list_phys == 0 and exactAnonymousRegion(cur, base, num_pages))
-                return replaceFixedAnonymous(cur, base, num_pages, prot, flags);
+            if (meta == null and pf.list_phys == 0 and exactAnonymousRegion(cur, base, num_pages)) {
+                const replaced = replaceFixedAnonymous(cur, base, num_pages, prot, flags);
+                // The fresh zero pages replace the old ones, so the old pages' locks go with them.
+                if (replaced >= 0) if (cur.mm) |m| m.locks.releaseLossy(base / user_space.PAGE_SIZE, num_pages);
+                return replaced;
+            }
             // Anything else MAP_FIXED lands on is unmapped first, as Linux does: the old mappings in the
             // range go away (a region it only partly covers is cut) and the new one takes their place.
             // Every check that can refuse runs before the first change.
             if (!fixedReplaceable(cur, base, num_pages)) return -12;
             unmapRange(cur, base, num_pages);
             untrackMmapRange(cur, base, num_pages);
+            if (cur.mm) |m| m.locks.releaseLossy(base / user_space.PAGE_SIZE, num_pages);
             @import("../drivers/fbdev.zig").noteUnmap(cur, base, num_pages);
         }
         if (!pagesFree(cur, base, num_pages)) return -12;
@@ -1496,6 +1525,7 @@ pub fn munmap(addr: u64, length: u64) i64 {
     // Unmap pages and free physical memory
     unmapRange(cur, base, num_pages);
     untrackMmapRange(cur, base, num_pages);
+    if (cur.mm) |m| m.locks.releaseLossy(base / user_space.PAGE_SIZE, num_pages);
     // fb0: clip any framebuffer mapping registry entries covered by this
     // range — the console mirror is restored once the last one goes away.
     @import("../drivers/fbdev.zig").noteUnmap(cur, base, num_pages);
@@ -1560,6 +1590,7 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
                     if (!munmap_policy.canUntrack(split_slots, free_slots)) return -12;
                     unmapRange(cur, cut_base, cut_pages);
                     untrackMmapRange(cur, cut_base, cut_pages);
+                    if (cur.mm) |m| m.locks.releaseLossy(cut_base / PAGE, cut_pages);
                     @import("../drivers/fbdev.zig").noteUnmap(cur, cut_base, cut_pages);
                 }
                 return @bitCast(old_addr);
