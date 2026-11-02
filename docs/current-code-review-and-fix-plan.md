@@ -6133,3 +6133,9 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修复：`gettimeofday(tv_ptr, tz_ptr)`：先对两个指针做范围检查（`>= 0x0000_8000_0000_0000` 即 EFAULT），再分别写 tv（非 NULL 时）与 tz（非 NULL 时写 8 个零字节）；`syscall_entry.zig` 传入 `frame.rsi`。
 - 测试：hello197 接入 `build.zig`、`qemu_run.sh`、`servers/init/main.c`、`qemu_smoke.sh`；`tests/main.zig` 新增一个源码守卫测试。
 - 如实说明：①零 `tz` 在内核没有时区概念的前提下是对的；`settimeofday` 设时区、`CLOCK_REALTIME` 的时区偏移都没做；②守卫测试是源码文本断言，真正的行为由 hello197 在 QEMU 里验证。
+
+## 抽查 113 个刚接上的内联测试：自动变异（clone_flags_policy 死代码）
+
+- 怎么想到的：上一轮把 55 个文件里从未运行的内联测试接上后，我如实写过"它们是否有意义没有审查"。这一轮先做两个廉价的静态检查：没有零断言的测试、没有 `expect(true)`、没有 `expectEqual(x, x)` 式的自比较（都是 0 处）。然后写了一个一次性脚本：对每个文件，在第一个 `test` 之前的非测试代码里找第一处 `if/return/while` 比较运算符，翻转它（`>=`→`<`、`==`→`!=` 等），跑 `zig build test`，看套件是否失败，再还原。
+- 结果：53 个文件里有变异点，52 个被杀死；**1 个存活：`mm/clone_flags_policy.zig:20` 的 `pointerRequired`**。查全仓库，`pointerRequired` 没有任何调用者（kernel 和 tests 里都没有），是死代码，所以变异不可能改变行为。删除它（host 984/984，内核 `.text+.rodata+.data` 哈希前后相同）。另有 `proc/task_slot_lifetime.zig`、`ipc/sysv_shm_lifecycle_policy.zig` 两个文件脚本没找到符合模式的变异点，没有被覆盖。
+- 如实说明：①每个文件只变异了**一处**（第一个匹配的比较），不是全面变异测试；②"被杀死"只说明至少有一个测试依赖该行，不说明断言足够全面；③脚本是一次性的，没有入库；④没有改任何运行时行为。

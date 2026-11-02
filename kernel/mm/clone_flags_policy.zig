@@ -16,10 +16,6 @@ pub const CLONE_CHILD_CLEARTID: u64 = 0x200000;
 pub const IMPLEMENTED_FLAGS: u64 = CLONE_VM | CLONE_FILES | CLONE_THREAD | CLONE_SETTLS;
 pub const TID_FLAGS: u64 = CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
 
-pub fn pointerRequired(flags: u64, bit: u64) bool {
-    return flags & bit != 0;
-}
-
 pub fn valid(flags: u64, has_mm: bool) bool {
     if (flags & ~(IMPLEMENTED_FLAGS | TID_FLAGS) != 0) return false;
     if (flags & (TID_FLAGS | CLONE_THREAD) != 0 and flags & CLONE_VM == 0) return false;
