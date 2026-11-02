@@ -43,6 +43,8 @@ const MAP_FIXED: u64 = 0x10;
 const MREMAP_MAYMOVE: u32 = 0x1;
 const MREMAP_FIXED: u32 = 0x2;
 const mmap_policy = @import("mmap_policy.zig");
+const mlock_gate = @import("mlock_gate.zig");
+const mlock_policy = @import("mlock_policy.zig");
 const rofs_map = @import("rofs_map_policy.zig");
 const rofs = @import("../fs/rofs.zig");
 
@@ -606,6 +608,63 @@ fn firstMappedPage(task: *task_mod.Task, base: u64, num_pages: u64) ?u64 {
 
 fn pagesFree(task: *task_mod.Task, base: u64, num_pages: u64) bool {
     return firstMappedPage(task, base, num_pages) == null;
+}
+
+/// End address of the tracked mapping that covers `va`, or null when no tracked mapping does.
+fn trackedEnd(task: *task_mod.Task, va: u64) ?u64 {
+    var bits = task.mmap_active_bm;
+    while (bits != 0) {
+        const i: u6 = @truncate(@ctz(bits));
+        bits &= bits - 1;
+        const r = &task.mmap_regions[i];
+        const r_end = r.base + r.num_pages * user_space.PAGE_SIZE;
+        if (va >= r.base and va < r_end) return r_end;
+    }
+    return null;
+}
+
+/// mlockall(MCL_CURRENT): add to `table` every user page the address space holds. Tracked mappings are added
+/// whole (demand-paged file pages and swapped-out pages included); the page tables are then walked, below the
+/// mmap ceiling, for what the region list does not know (program image, stack, break). Device (no_free)
+/// mappings are left out, as in Linux (VM_IO / VM_PFNMAP); PROT_NONE mappings are locked and counted. False when
+/// the pages need more separate ranges than the table has. Pages above the mmap ceiling that no tracked mapping
+/// covers (a SysV SHM attachment placed there) are not locked.
+pub fn lockEverything(task: *task_mod.Task, table: *mlock_policy.Table) bool {
+    const PAGE = user_space.PAGE_SIZE;
+    var bits = task.mmap_active_bm;
+    while (bits != 0) {
+        const i: u6 = @truncate(@ctz(bits));
+        bits &= bits - 1;
+        const r = &task.mmap_regions[i];
+        if (r.no_free) continue;
+        if (!table.lock(r.base / PAGE, r.num_pages)) return false;
+    }
+    var run_start: u64 = 0;
+    var run_pages: u64 = 0;
+    var va: u64 = 0;
+    while (va < user_space.USER_MMAP_MAX) {
+        if (trackedEnd(task, va)) |end| {
+            if (run_pages != 0) {
+                if (!table.lock(run_start, run_pages)) return false;
+                run_pages = 0;
+            }
+            va = end;
+            continue;
+        }
+        if (paging_mod.isPageOccupied(task.page_table_phys, va)) {
+            if (run_pages == 0) run_start = va / PAGE;
+            run_pages += 1;
+            va += PAGE;
+            continue;
+        }
+        if (run_pages != 0) {
+            if (!table.lock(run_start, run_pages)) return false;
+            run_pages = 0;
+        }
+        va = skipHole(task, va, false);
+    }
+    if (run_pages != 0 and !table.lock(run_start, run_pages)) return false;
+    return true;
 }
 
 /// Whether any page of the range is a PROT_NONE reservation (non-present, holds a frame). mlock refuses those.
@@ -1189,6 +1248,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot_raw: u64, flags: u64, fd: i64, off
     // v53.2: reject overflow-inducing length values
     if (length > user_space.USER_ADDR_MAX) return -12; // ENOMEM (a length near 2^64 used to overflow the page rounding below)
     const num_pages = (length + user_space.PAGE_SIZE - 1) / user_space.PAGE_SIZE;
+    const lock_requested = (flags & mmap_policy.MAP_LOCKED) != 0;
 
     // Determine base address
     var base: u64 = undefined;
@@ -1203,13 +1263,20 @@ pub fn mmap(addr_hint: u64, length: u64, prot_raw: u64, flags: u64, fd: i64, off
         if (base < user_space.PAGE_SIZE) return -22; // EINVAL
         if (is_noreplace and (hasMmapOverlap(cur, base, num_pages) or !pagesFree(cur, base, num_pages))) return -17; // EEXIST
         if (@import("../ipc/sysv_shm.zig").overlapsAttachment(cur.page_table_phys, base, num_pages)) return -22; // EINVAL
+        // MAP_LOCKED / mlockall(MCL_FUTURE): EPERM or EAGAIN before the old mapping is touched; Linux does not credit
+        // the locked pages the new mapping replaces.
+        const fixed_gate = mlock_gate.mapGate(cur, lock_requested, base / user_space.PAGE_SIZE, num_pages);
+        if (fixed_gate != 0) return fixed_gate;
         if (mm_mod.Mm.sealed(cur.mm, base, num_pages * user_space.PAGE_SIZE)) return -1; // EPERM: mseal
         if (hasMmapOverlap(cur, base, num_pages)) {
             // Replacing exactly one private anonymous read-write region keeps the atomic path.
             if (meta == null and pf.list_phys == 0 and exactAnonymousRegion(cur, base, num_pages)) {
                 const replaced = replaceFixedAnonymous(cur, base, num_pages, prot, flags);
                 // The fresh zero pages replace the old ones, so the old pages' locks go with them.
-                if (replaced >= 0) if (cur.mm) |m| m.locks.releaseLossy(base / user_space.PAGE_SIZE, num_pages);
+                if (replaced >= 0) {
+                    if (cur.mm) |m| m.locks.releaseLossy(base / user_space.PAGE_SIZE, num_pages);
+                    if (lock_requested or mm_mod.Mm.futureLocking(cur.mm)) mlock_gate.recordLocked(cur, base / user_space.PAGE_SIZE, num_pages);
+                }
                 return replaced;
             }
             // Anything else MAP_FIXED lands on is unmapped first, as Linux does: the old mappings in the
@@ -1253,6 +1320,13 @@ pub fn mmap(addr_hint: u64, length: u64, prot_raw: u64, flags: u64, fd: i64, off
                     findFreeRangeFrom(cur, user_space.USER_MMAP_BASE, num_pages, null) orelse
                     return -12); // ENOMEM
         }
+    }
+
+    // The same gate for a mapping the kernel placed (the MAP_FIXED branch ran it before replacing anything). It
+    // comes before RLIMIT_AS, so a locked mapping over the limit is EAGAIN, not ENOMEM.
+    if (!is_fixed) {
+        const placed_gate = mlock_gate.mapGate(cur, lock_requested, base / user_space.PAGE_SIZE, num_pages);
+        if (placed_gate != 0) return placed_gate;
     }
 
     // RLIMIT_AS: refuse the mapping when its length would push the charged
@@ -1346,6 +1420,9 @@ pub fn mmap(addr_hint: u64, length: u64, prot_raw: u64, flags: u64, fd: i64, off
 
     // Track the mapping region for munmap (records backing metadata for G2).
     trackMmapRegion(cur, base, num_pages, meta, @intCast(prot & 7), shared, huge_count);
+    // MAP_LOCKED / mlockall(MCL_FUTURE): the new pages are locked from the start. The gate above checked the quota
+    // and that the table has room, so this records the whole mapping (a PROT_NONE one included, as in Linux).
+    if (lock_requested or mm_mod.Mm.futureLocking(cur.mm)) mlock_gate.recordLocked(cur, base / user_space.PAGE_SIZE, num_pages);
 
     // The break is deliberately left alone. Dragging it up to cover mmap
     // placements made brk(2) report a break spanning memory it does not own, and
@@ -1559,6 +1636,26 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
     if (mm_mod.Mm.sealed(cur.mm, old_addr, old_pages * PAGE)) return -1; // EPERM: mseal
     if ((mflags & MREMAP_FIXED) != 0 and mm_mod.Mm.sealed(cur.mm, new_addr_hint, new_pages * PAGE)) return -1;
 
+    // A mapping whose last page is locked keeps the whole mapping locked when it grows (Linux copies VM_LOCKED to
+    // the grown vma). The growth must fit RLIMIT_MEMLOCK first (EAGAIN); mremapRegion reports, through
+    // `extend_lock`, that the grown tail is to be locked once the call has succeeded.
+    var extend_lock = false;
+    if (new_pages > old_pages and mlock_gate.tailLocked(cur, old_addr / PAGE + old_pages - 1)) {
+        const grown = mlock_gate.growGate(cur, new_pages - old_pages);
+        if (grown != 0) return grown;
+        extend_lock = true;
+    }
+    const result = mremapRegion(cur, old_addr, old_pages, new_pages, mflags, new_addr_hint);
+    if (extend_lock and result >= 0) {
+        const new_base_page = @as(u64, @bitCast(result)) / PAGE;
+        mlock_gate.recordLocked(cur, new_base_page + old_pages, new_pages - old_pages);
+    }
+    return result;
+}
+
+/// The part of mremap that runs under the VM lock once the arguments are validated.
+fn mremapRegion(cur: *task_mod.Task, old_addr: u64, old_pages: u64, new_pages: u64, mflags: u32, new_addr_hint: u64) i64 {
+    const PAGE: u64 = 4096;
     // Find the mapping region through the occupancy bitmap.
     var bits = cur.mmap_active_bm;
     while (bits != 0) {

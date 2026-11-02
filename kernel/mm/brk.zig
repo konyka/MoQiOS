@@ -9,6 +9,7 @@ const hhdm_mod = @import("../mm/hhdm.zig");
 const mmap_mod = @import("mmap.zig");
 const paging_mod = @import("../arch/arch.zig").paging;
 const mm_mod = @import("mm.zig");
+const mlock_gate = @import("mlock_gate.zig");
 
 const PAGE = user_space.PAGE_SIZE;
 
@@ -70,6 +71,12 @@ pub fn brk(addr: u64) i64 {
             return @bitCast(cur.brk_current);
         }
 
+        // mlockall(MCL_FUTURE): the new heap pages are locked, so the growth must fit RLIMIT_MEMLOCK (Linux
+        // check_brk_limits: EAGAIN, which brk reports as the unchanged break).
+        if (mlock_gate.mapGate(cur, false, old_page, new_page - old_page) != 0) {
+            return @bitCast(cur.brk_current);
+        }
+
         // Refuse to grow across pages that are already mapped. mapPage
         // overwrites a live PTE without complaint, which would strand the old
         // frame and hand the heap a region the process is still using
@@ -118,11 +125,13 @@ pub fn brk(addr: u64) i64 {
         }
         cur.as_used += delta_bytes; // RLIMIT_AS charge (checked above)
         cur.data_used += delta_bytes; // RLIMIT_DATA charge (checked above)
+        mlock_gate.recordIfFuture(cur, old_page, new_page - old_page);
     } else if (new_page < old_page) {
         // Give the released pages back. The growth loop used to run
         // `old_page..new_page` unconditionally, so a shrinking break reversed
         // the range and panicked the kernel computing its length.
         releasePages(cur, new_page, old_page);
+        if (cur.mm) |m| m.locks.releaseLossy(new_page, old_page - new_page); // the pages are gone, so are their locks
         cur.as_used -|= (old_page - new_page) * PAGE; // RLIMIT_AS refund
         cur.data_used -|= (old_page - new_page) * PAGE; // RLIMIT_DATA refund
     }

@@ -998,8 +998,8 @@ LAPIC Timer 中断
 | 268 | personality | 获取/设置进程personality |
 | 269 | clock_getres | 获取时钟精度 |
 | 270 | clock_settime | 设置时钟 (stub) |
-| 271 | mlockall | 仍返回 ENOSYS（参数先按 Linux 校验；缺 MCL_FUTURE 自动锁定） |
-| 272 | munlockall | 已实现（清空本地址空间的锁表） |
+| 271 | mlockall | 已实现：`MCL_CURRENT` 锁现有页、`MCL_FUTURE` 让 mmap/brk/mremap 增长锁新页，`RLIMIT_MEMLOCK` 超限 mmap 为 `EAGAIN`；`MAP_LOCKED` 同理（hello199） |
+| 272 | munlockall | 已实现（清空本地址空间的锁表，并清掉 `MCL_FUTURE`） |
 | 273 | sched_setaffinity | 设置CPU亲和性 |
 | 274 | fallocate | 预分配文件空间 (no-op) |
 | 275 | posix_fadvise | 文件访问建议 (no-op) |

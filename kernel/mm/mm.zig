@@ -48,11 +48,20 @@ pub const Mm = struct {
     /// mlock ranges (page numbers). Written under vm_lock; a fresh address space (exec, fork child) starts empty,
     /// like Linux, where VM_LOCKED is not inherited across fork.
     locks: @import("mlock_policy.zig").Table = .{},
+    /// mlockall(MCL_FUTURE): every mapping made from now on is locked (and charged to RLIMIT_MEMLOCK). Written under
+    /// vm_lock; a fresh address space (exec, fork child) starts without it, like Linux where it is not inherited.
+    lock_future: bool = false,
 
     /// Whether [base, base+len) touches a sealed range (caller holds vm_lock).
     pub fn sealed(mm: ?*Mm, base: u64, len: u64) bool {
         const m = mm orelse return false;
         return m.seals.overlaps(base, len);
+    }
+
+    /// Whether new mappings of this address space are locked (mlockall MCL_FUTURE). Caller holds vm_lock.
+    pub fn futureLocking(mm: ?*Mm) bool {
+        const m = mm orelse return false;
+        return m.lock_future;
     }
 
     /// Whether any page of [base, base+len) is mlocked (caller holds vm_lock, or is the reclaim guard).

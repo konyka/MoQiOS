@@ -1,6 +1,6 @@
 /// hello198: mlock / munlock / munlockall with RLIMIT_MEMLOCK, checked against real Linux (host gcc runs; every
 /// expected value below was measured there). Runs unprivileged (all capabilities dropped) so the limit applies.
-/// mlockall stays ENOSYS (MCL_FUTURE has no auto-lock hook in mmap yet); hello71 pins that. mlock2 is MoQiOS number 496.
+/// mlockall is hello199's subject (here only its limit-0 EPERM). mlock2 is MoQiOS number 496.
 
 #include <stdint.h>
 
@@ -55,7 +55,6 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define EPERM_ (-1)
 #define ENOMEM_ (-12)
 #define EINVAL_ (-22)
-#define ENOSYS_ (-38)
 
 static void print(const char *s) {
     uint64_t n = 0;
@@ -179,7 +178,7 @@ void _start(void) {
     check(MUNLOCK(q, PG) == 0, "H: munlock needs no privilege");
     check(MUNLOCK(0x30000000ULL, PG) == ENOMEM_, "H: munlock of an unmapped range is ENOMEM");
     check(MUNLOCKALL() == 0, "H: munlockall");
-    check(syscall1(SYS_MLOCKALL, 1) == ENOSYS_, "I: mlockall is still not implemented (ENOSYS; real Linux says EPERM at limit 0)");
+    check(syscall1(SYS_MLOCKALL, 1) == EPERM_, "I: mlockall with a zero limit is EPERM, like mlock");
 
     check(syscall3(SYS_MLOCK2, q, PG, 0) == EPERM_ && syscall3(SYS_MLOCK2, q, PG, 1) == EPERM_, "J: a zero limit is EPERM for valid flags");
     check(syscall3(SYS_MLOCK2, q, PG, 2) == EINVAL_, "J: but a bad flag is EINVAL even at limit 0");

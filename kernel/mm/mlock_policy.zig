@@ -3,14 +3,14 @@
 //!
 //! What "locked" means here: the pages are excluded from swap reclaim (swap.zig skips them) and MADV_DONTNEED /
 //! MADV_FREE refuse them (EINVAL, as Linux does for VM_LOCKED). The table is per Mm: a fork child starts empty,
-//! like Linux, and CLONE_VM threads share it. mlockall (MCL_FUTURE needs a hook in every mapping path) is not
-//! implemented and stays ENOSYS.
+//! like Linux, and CLONE_VM threads share it. mlockall(MCL_CURRENT) records every page the address space holds
+//! right now; MCL_FUTURE sets Mm.lock_future, after which mmap, brk and mremap growth lock what they create.
 
 /// Most separate locked ranges one address space can hold. A call that would need more fails with ENOMEM and
-/// leaves the table unchanged.
-pub const MAX_RANGES: usize = 16;
+/// leaves the table unchanged. (Mm must stay within the 1024-byte slab class: tests/main.zig checks it.)
+pub const MAX_RANGES: usize = 24;
 
-const Range = struct { start: u64 = 0, pages: u64 = 0 };
+pub const Range = struct { start: u64 = 0, pages: u64 = 0 };
 
 pub const Table = struct {
     ranges: [MAX_RANGES]Range = [_]Range{.{}} ** MAX_RANGES,
@@ -84,6 +84,16 @@ pub const Table = struct {
         @memcpy(self.ranges[0..kept], keep[0..kept]);
         self.count = kept;
         return true;
+    }
+
+    /// Whether lock(start, pages) would succeed: it needs a free slot only when it touches no existing range.
+    pub fn canLock(self: *const Table, start: u64, pages: u64) bool {
+        if (pages == 0 or self.count < MAX_RANGES) return true;
+        const hi = start +| pages;
+        for (self.ranges[0..self.count]) |r| {
+            if (r.start <= hi and start <= end(r)) return true;
+        }
+        return false;
     }
 
     /// Whether releasing [start, start+pages) fits: only a hole strictly inside one range adds a range.
@@ -190,4 +200,31 @@ pub fn fitsLimit(limit_bytes: u64, cap_ipc_lock: bool, locked: u64, request: u64
     const next = @addWithOverflow(locked, added);
     if (next[1] != 0) return false;
     return next[0] <= limit_pages;
+}
+
+/// What a mapping that is to be locked (MAP_LOCKED, or any mapping while mlockall(MCL_FUTURE) is in force) is
+/// told before it is made.
+pub const Gate = enum { ok, eperm, eagain };
+
+/// Linux do_mmap(): MAP_LOCKED needs can_do_mlock() (EPERM) before anything is charged; then mlock_future_ok():
+/// the locked total plus the new pages must fit RLIMIT_MEMLOCK (EAGAIN, not ENOMEM), unless the caller holds
+/// CAP_IPC_LOCK. MCL_FUTURE alone never reports EPERM. A mapping that is not locked is never looked at.
+pub fn mapGate(map_locked: bool, future: bool, limit_bytes: u64, cap_ipc_lock: bool, locked: u64, new_pages: u64) Gate {
+    if (!map_locked and !future) return .ok;
+    if (map_locked and !mayAttempt(limit_bytes, cap_ipc_lock)) return .eperm;
+    if (!fitsLimit(limit_bytes, cap_ipc_lock, locked, new_pages, 0)) return .eagain;
+    return .ok;
+}
+
+/// Linux mremap(): growing a mapping whose pages are locked must keep the locked total within RLIMIT_MEMLOCK,
+/// else EAGAIN (mlock_future_ok with the VMA's own VM_LOCKED). A mapping that is not locked grows freely.
+pub fn growGate(tail_locked: bool, limit_bytes: u64, cap_ipc_lock: bool, locked: u64, add_pages: u64) Gate {
+    return mapGate(false, tail_locked, limit_bytes, cap_ipc_lock, locked, add_pages);
+}
+
+/// Linux mlockall(MCL_CURRENT): ENOMEM unless everything the address space holds fits RLIMIT_MEMLOCK (Linux compares
+/// total_vm; here it is the number of pages that would be locked). CAP_IPC_LOCK is not limited.
+pub fn currentFits(limit_bytes: u64, cap_ipc_lock: bool, total_pages: u64) bool {
+    if (cap_ipc_lock) return true;
+    return total_pages <= limit_bytes / 4096;
 }

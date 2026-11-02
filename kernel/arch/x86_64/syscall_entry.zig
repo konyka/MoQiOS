@@ -1417,10 +1417,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         270 => { // clock_settime(clockid, tp) — set wall clock
             frame.rax = @bitCast(syscallClockSettime(@truncate(frame.rdi), frame.rsi));
         },
-        271 => { // mlockall(flags) — unsupported user page pinning
+        271 => { // mlockall(flags)
             frame.rax = @bitCast(syscallMlockall(@truncate(frame.rdi)));
         },
-        272 => { // munlockall() — unsupported user page pinning
+        272 => { // munlockall()
             frame.rax = @bitCast(syscallMunlockall());
         },
         273 => { // sched_setaffinity(pid, cpusetsize, mask)
@@ -5819,12 +5819,10 @@ fn syscallClockSettime(clockid: u32, tp_ptr: u64) i64 {
     return 0;
 }
 
-/// mlockall(flags): the flags are validated like Linux's; a valid request fails with ENOSYS, because MCL_FUTURE
-/// would need every mapping path to lock new mappings, and a call that silently ignored it would let a caller
-/// believe its future memory stays out of swap.
+/// mlockall(flags): MCL_CURRENT locks what the address space holds, MCL_FUTURE makes mmap, brk and mremap growth
+/// lock what they create (mm/mlock.zig).
 fn syscallMlockall(flags: u32) i64 {
-    if (!@import("../../mm/range_policy.zig").mlockallFlagsValid(flags)) return -22;
-    return -38;
+    return @import("../../mm/mlock.zig").mlockall(flags);
 }
 
 /// munlockall(): drops every lock of the address space.

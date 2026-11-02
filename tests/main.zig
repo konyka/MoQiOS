@@ -654,7 +654,7 @@ test "mmap rejects unsupported flags; unknown protection bits are ignored as on 
         !mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | mmap_policy.MAP_SHARED),
     );
     try std.testing.expect(!mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | (1 << 63)));
-    try std.testing.expect(!mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | 0x2000)); // MAP_LOCKED
+    try std.testing.expect(mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | 0x2000)); // MAP_LOCKED is acted on (mm/mlock.zig)
     try std.testing.expect(mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | 0x8000)); // MAP_POPULATE is only a hint
     try std.testing.expectEqual(@as(u64, 0), mmap_policy.normalizeProt(0));
     try std.testing.expectEqual(@as(u64, 0), mmap_policy.normalizeProt(0x8));
@@ -1907,11 +1907,11 @@ test "memory-management argument rules follow Linux: ranges, rounding, flags, ml
     try std.testing.expect(mp.validate(0x4001, 4096) == null);
     try std.testing.expect(mp.validate(0x4000, std.math.maxInt(u64)) == null);
 
-    // mmap: the extra flags are accepted, MAP_LOCKED is not; unknown protection bits are dropped.
+    // mmap: the extra flags are accepted, MAP_LOCKED included (it is acted on); unknown protection bits are dropped.
     const m = kt.mmap_policy;
     try std.testing.expect(m.flagsValid(m.MAP_PRIVATE | m.MAP_ANONYMOUS | m.MAP_FIXED_NOREPLACE));
     try std.testing.expect(m.flagsValid(m.MAP_PRIVATE | m.MAP_ANONYMOUS | m.MAP_GROWSDOWN | m.MAP_STACK | m.MAP_POPULATE | m.MAP_NORESERVE));
-    try std.testing.expect(!m.flagsValid(m.MAP_PRIVATE | 0x2000));
+    try std.testing.expect(m.flagsValid(m.MAP_PRIVATE | 0x2000));
     try std.testing.expectEqual(@as(u64, 3), m.normalizeProt(3 | 0x01000000));
     // File offsets: past the largest file size is EOVERFLOW; a length that wraps when rounded is the caller's ENOMEM.
     try std.testing.expect(!m.fileOffsetOverflows(0, 4096));
@@ -1935,7 +1935,8 @@ test "memory-management argument rules follow Linux: ranges, rounding, flags, ml
     const se = kt.syscall_entry_source;
     try std.testing.expect(std.mem.indexOf(u8, se, "if (!rp.madviseSupported(advice)) return -22; // EINVAL") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "if (!@import(\"../../mm/mmap.zig\").rangeMapped(addr, length)) return -12; // ENOMEM: a hole in the range") != null);
-    try std.testing.expect(std.mem.indexOf(u8, se, "if (!@import(\"../../mm/range_policy.zig\").mlockallFlagsValid(flags)) return -22;\n    return -38;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "return @import(\"../../mm/mlock.zig\").mlockall(flags);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "return -38;\n}\n\n/// munlockall()") == null);
     try std.testing.expect(std.mem.indexOf(u8, se, "return @import(\"../../mm/mlock.zig\").munlockall();") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "return @import(\"../../mm/mlock.zig\").mlock(addr, len);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.mprotect_source, "if (addr >= user_space.USER_ADDR_MAX) return ENOMEM;") != null);
@@ -2657,6 +2658,118 @@ test "mlock2 flags: only MLOCK_ONFAULT is accepted, and the flag check precedes 
     const gate = std.mem.indexOfPos(u8, ml, flags_check, "if (!policy.mayAttempt(") orelse return error.TestUnexpectedResult;
     try std.testing.expect(flags_check < gate);
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "496 => { // mlock2(addr, len, flags)") != null);
+}
+
+test "mlock table: canLock predicts lock() exactly, including against a full table" {
+    const T = mlock_policy.Table;
+    var t = T{};
+    try std.testing.expect(t.canLock(5, 3)); // empty table
+    var i: u64 = 0;
+    while (i < mlock_policy.MAX_RANGES) : (i += 1) try std.testing.expect(t.lock(1000 + i * 10, 2));
+    try std.testing.expectEqual(@as(usize, mlock_policy.MAX_RANGES), t.count);
+    // Full table: a new disjoint range needs a slot and has none; touching or overlapping one needs none.
+    try std.testing.expect(!t.canLock(5, 3));
+    try std.testing.expect(!t.canLock(1004, 2)); // gap of 2 pages after 1000..1001 and before 1010
+    try std.testing.expect(t.canLock(1002, 2)); // adjacent to 1000..1001: merges
+    try std.testing.expect(t.canLock(1001, 1)); // already inside
+    try std.testing.expect(t.canLock(998, 2)); // ends where 1000 starts: merges
+    try std.testing.expect(t.canLock(5, 0)); // nothing to lock
+    // And the prediction agrees with the real thing, without changing the table when it says no.
+    const before = t;
+    try std.testing.expect(!t.lock(5, 3));
+    try std.testing.expectEqual(before.count, t.count);
+    try std.testing.expectEqual(before.total(), t.total());
+    try std.testing.expect(t.lock(1002, 2));
+}
+
+test "mapGate: MAP_LOCKED needs the privilege/limit gate, a locking mapping must fit RLIMIT_MEMLOCK (EAGAIN, not ENOMEM)" {
+    const mp = mlock_policy;
+    const inf = std.math.maxInt(u64);
+    // Neither MAP_LOCKED nor MCL_FUTURE: nothing is checked, whatever the limit is.
+    try std.testing.expectEqual(mp.Gate.ok, mp.mapGate(false, false, 0, false, 1 << 30, 1 << 30));
+    // MAP_LOCKED with a zero limit and no CAP_IPC_LOCK: EPERM, before the quota is looked at.
+    try std.testing.expectEqual(mp.Gate.eperm, mp.mapGate(true, false, 0, false, 0, 1));
+    try std.testing.expectEqual(mp.Gate.ok, mp.mapGate(true, false, 0, true, 0, 1)); // the capability lifts it
+    // MCL_FUTURE alone never reports EPERM (Linux only asks can_do_mlock for MAP_LOCKED): a zero limit is EAGAIN.
+    try std.testing.expectEqual(mp.Gate.eagain, mp.mapGate(false, true, 0, false, 0, 1));
+    // Quota: locked + new <= limit in pages (limit rounds down), measured: 8 + 9 > 16 but 8 + 8 = 16.
+    try std.testing.expectEqual(mp.Gate.ok, mp.mapGate(false, true, 16 * 4096, false, 8, 8));
+    try std.testing.expectEqual(mp.Gate.eagain, mp.mapGate(false, true, 16 * 4096, false, 8, 9));
+    try std.testing.expectEqual(mp.Gate.ok, mp.mapGate(true, false, 16 * 4096, false, 16, 0));
+    try std.testing.expectEqual(mp.Gate.eagain, mp.mapGate(true, false, 16 * 4096, false, 16, 1));
+    try std.testing.expectEqual(mp.Gate.ok, mp.mapGate(false, true, 16 * 4096 + 4095, false, 0, 16)); // rounds down
+    try std.testing.expectEqual(mp.Gate.eagain, mp.mapGate(false, true, 16 * 4096 + 4095, false, 0, 17));
+    // Unlimited and privileged callers always fit; a huge request cannot wrap around the sum.
+    try std.testing.expectEqual(mp.Gate.ok, mp.mapGate(true, true, inf, false, 1 << 40, 1 << 20));
+    try std.testing.expectEqual(mp.Gate.ok, mp.mapGate(true, true, 4096, true, 1 << 40, 1 << 20));
+    try std.testing.expectEqual(mp.Gate.eagain, mp.mapGate(false, true, 4096, false, std.math.maxInt(u64), 1));
+}
+
+test "growGate: growing a locked mapping must fit RLIMIT_MEMLOCK (EAGAIN); an unlocked one grows freely" {
+    const mp = mlock_policy;
+    // Measured: limit 16 pages, 12 locked, grow by 8 -> EAGAIN; by 4 -> fine.
+    try std.testing.expectEqual(mp.Gate.eagain, mp.growGate(true, 16 * 4096, false, 12, 8));
+    try std.testing.expectEqual(mp.Gate.ok, mp.growGate(true, 16 * 4096, false, 12, 4));
+    try std.testing.expectEqual(mp.Gate.eagain, mp.growGate(true, 16 * 4096, false, 12, 5));
+    // A mapping whose tail is not locked is never gated, however far over the limit the address space is.
+    try std.testing.expectEqual(mp.Gate.ok, mp.growGate(false, 0, false, 1 << 30, 1 << 30));
+    // The privileged are not limited, and a zero limit is EAGAIN, never EPERM (only MAP_LOCKED reports EPERM).
+    try std.testing.expectEqual(mp.Gate.ok, mp.growGate(true, 0, true, 1 << 30, 1 << 30));
+    try std.testing.expectEqual(mp.Gate.eagain, mp.growGate(true, 0, false, 0, 1));
+}
+
+test "mlockall(MCL_CURRENT) fits when everything mapped is within the limit; the privileged are not limited" {
+    const mp = mlock_policy;
+    const inf = std.math.maxInt(u64);
+    try std.testing.expect(mp.currentFits(16 * 4096, false, 16));
+    try std.testing.expect(!mp.currentFits(16 * 4096, false, 17));
+    try std.testing.expect(mp.currentFits(16 * 4096 + 4095, false, 16));
+    try std.testing.expect(!mp.currentFits(0, false, 1));
+    try std.testing.expect(mp.currentFits(0, false, 0));
+    try std.testing.expect(mp.currentFits(0, true, 1 << 30));
+    try std.testing.expect(mp.currentFits(inf, false, 1 << 40));
+}
+
+test "mlockall and MAP_LOCKED are wired into mmap, brk, mremap and the syscall table" {
+    const ml = kt.mlock_source;
+    try std.testing.expect(std.mem.indexOf(u8, ml, "pub fn mlockall(flags: u32) i64 {") != null);
+    // Validation and privilege come first, the limit check precedes the commit, FUTURE is recorded last.
+    const valid = std.mem.indexOf(u8, ml, "range_policy.mlockallFlagsValid(flags)") orelse return error.TestUnexpectedResult;
+    const gate = std.mem.indexOfPos(u8, ml, valid, "policy.mayAttempt(") orelse return error.TestUnexpectedResult;
+    const fits = std.mem.indexOfPos(u8, ml, gate, "policy.currentFits(") orelse return error.TestUnexpectedResult;
+    const commit = std.mem.indexOfPos(u8, ml, fits, "mm.locks = next;") orelse return error.TestUnexpectedResult;
+    const future = std.mem.indexOfPos(u8, ml, commit, "mm.lock_future = ") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(valid < gate and gate < fits and fits < commit and commit < future);
+    // munlockall also forgets MCL_FUTURE.
+    const unl = std.mem.indexOf(u8, ml, "pub fn munlockall() i64 {") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOfPos(u8, ml, unl, "mm.lock_future = false;") != null);
+    // mmap: the gate runs before a MAP_FIXED replacement is touched (fixed branch) and after base selection (other
+    // branch), and every successful mapping is recorded in the table.
+    const mm_src = kt.mmap_mlock_source;
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, mm_src, "mlock_gate.mapGate("));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, mm_src, "mlock_gate.recordLocked("));
+    const fixed_gate = std.mem.indexOf(u8, mm_src, "const fixed_gate = mlock_gate.mapGate(") orelse return error.TestUnexpectedResult;
+    const first_unmap = std.mem.indexOfPos(u8, mm_src, fixed_gate, "unmapRange(cur, base, num_pages);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(fixed_gate < first_unmap); // the gate runs before a MAP_FIXED replacement touches anything
+    // mremap growth of a locked mapping is gated (EAGAIN) and extends the lock only after the call succeeded.
+    const grow = std.mem.indexOf(u8, mm_src, "mlock_gate.growGate(") orelse return error.TestUnexpectedResult;
+    const call = std.mem.indexOfPos(u8, mm_src, grow, "const result = mremapRegion(") orelse return error.TestUnexpectedResult;
+    const record = std.mem.indexOfPos(u8, mm_src, call, "mlock_gate.recordLocked(") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(grow < call and call < record);
+    // brk: growth under MCL_FUTURE is gated, a shrink releases the locks of the pages it gives back.
+    const brk_src = kt.brk_source;
+    try std.testing.expect(std.mem.indexOf(u8, brk_src, "mlock_gate.mapGate(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, brk_src, "m.locks.releaseLossy(") != null);
+    // The flag lives in Mm and every new address space starts without it.
+    try std.testing.expect(std.mem.indexOf(u8, kt.mm_source, "lock_future: bool = false,") != null);
+    try std.testing.expect(@sizeOf(kt.mm.Mm) <= 1024);
+    try std.testing.expect(!kt.mm.Mm.futureLocking(null));
+}
+
+test "MAP_LOCKED is a real mmap flag now: it is accepted, and acted on rather than ignored" {
+    try std.testing.expect(mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | mmap_policy.MAP_ANONYMOUS | mmap_policy.MAP_LOCKED));
+    try std.testing.expectEqual(@as(u64, 0x2000), mmap_policy.MAP_LOCKED);
+    try std.testing.expect((mmap_policy.HINT_FLAGS & mmap_policy.MAP_LOCKED) == 0);
 }
 
 test "lockSpan counts the page an unaligned zero-length range starts in, like Linux" {

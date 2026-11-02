@@ -4,6 +4,7 @@ pub const MAP_SHARED: u64 = 0x1;
 pub const MAP_PRIVATE: u64 = 0x2;
 pub const MAP_FIXED: u64 = 0x10;
 pub const MAP_ANONYMOUS: u64 = 0x20;
+pub const MAP_LOCKED: u64 = 0x2000;
 pub const MAP_GROWSDOWN: u64 = 0x100;
 pub const MAP_DENYWRITE: u64 = 0x800;
 pub const MAP_EXECUTABLE: u64 = 0x1000;
@@ -17,8 +18,9 @@ pub const MAP_FIXED_NOREPLACE: u64 = 0x100000;
 /// MAP_GROWSDOWN is accepted but the mapping does not grow downwards on a fault below it.
 pub const HINT_FLAGS: u64 = MAP_GROWSDOWN | MAP_DENYWRITE | MAP_EXECUTABLE | MAP_NORESERVE | MAP_POPULATE | MAP_NONBLOCK | MAP_STACK;
 
+/// MAP_LOCKED is not a hint: the mapping is recorded as locked (mm/mlock.zig) and charged to RLIMIT_MEMLOCK.
 pub const SUPPORTED_MAP_FLAGS: u64 = MAP_SHARED | MAP_PRIVATE | MAP_FIXED |
-    MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | HINT_FLAGS;
+    MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_LOCKED | HINT_FLAGS;
 pub const SUPPORTED_PROT_FLAGS: u64 = 0x1 | 0x2 | 0x4;
 
 pub fn flagsValid(flags: u64) bool {
@@ -67,7 +69,7 @@ test "mmap policy rejects unknown flag bits and conflicting sharing modes, ignor
     try std.testing.expect(flagsValid(MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE));
     try std.testing.expect(!flagsValid(MAP_PRIVATE | MAP_SHARED));
     try std.testing.expect(!flagsValid(MAP_PRIVATE | (1 << 63)));
-    try std.testing.expect(!flagsValid(MAP_PRIVATE | 0x2000)); // MAP_LOCKED: pinning is not implemented
+    try std.testing.expect(flagsValid(MAP_PRIVATE | MAP_ANONYMOUS | MAP_LOCKED)); // acted on, see mm/mlock.zig
     try std.testing.expect(flagsValid(MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN)); // accepted as a hint
     try std.testing.expectEqual(@as(u64, 0), normalizeProt(0));
     try std.testing.expectEqual(@as(u64, 7), normalizeProt(0x1 | 0x2 | 0x4));

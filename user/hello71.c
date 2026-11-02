@@ -1,4 +1,4 @@
-// hello71 - mlock basics, mlockall still ENOSYS, and MAP_FIXED metadata independence acceptance.
+// hello71 - mlock basics, mlockall, and MAP_FIXED metadata independence acceptance.
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
 #include "../lib/moqi_libc/include/stdio.h"
 #include "../lib/moqi_libc/include/unistd.h"
@@ -10,7 +10,6 @@ static int failures;
 #define SYS_munlock 253
 #define SYS_mlockall 271
 #define SYS_munlockall 272
-#define ENOSYS 38
 
 #define PAGE_SIZE 4096
 #define PROT_RW 3
@@ -41,8 +40,8 @@ int main(int argc, char **argv, char **envp) {
         CHECK(syscall2(SYS_munlock, page, PAGE_SIZE) == 0,
               "munlock succeeds");
         CHECK(*word == 0x68656c6c6f3731UL, "munlock preserves sentinel");
-        CHECK(syscall1(SYS_mlockall, MCL_CURRENT | MCL_FUTURE) == -ENOSYS,
-              "mlockall current future returns ENOSYS");
+        CHECK(syscall1(SYS_mlockall, MCL_CURRENT | MCL_FUTURE) == 0,
+              "mlockall current future succeeds (default RLIMIT_MEMLOCK is unlimited)");
         CHECK(*word == 0x68656c6c6f3731UL, "mlockall preserves sentinel");
         CHECK(syscall0(SYS_munlockall) == 0,
               "munlockall succeeds");
