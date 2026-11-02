@@ -117,11 +117,24 @@ static __attribute__((noinline, noreturn)) void spin_main(void) {
     for (;;) {}
 }
 
+/* The largest single nap's charge seen by the last charged_while_sleeping(), and how many naps were
+ * charged more than 5 ms: when the total is high, these say whether one nap absorbed it (an accounting
+ * boundary missed once) or every nap was overcharged a little. */
+static int64_t worst_nap_charge, naps_over_5ms, nap_count;
+
 /* Sleep for `total` ms in `step` ms naps; return the thread CPU time charged meanwhile. */
 static int64_t charged_while_sleeping(int total, int step) {
     int64_t c0 = thread_ms(), r0 = ru_thread_ms();
     int64_t t0 = now_ms();
-    while (now_ms() - t0 < total) sleep_ms(step);
+    worst_nap_charge = 0; naps_over_5ms = 0; nap_count = 0;
+    while (now_ms() - t0 < total) {
+        int64_t before = thread_ms();
+        sleep_ms(step);
+        int64_t d = thread_ms() - before;
+        nap_count++;
+        if (d > worst_nap_charge) worst_nap_charge = d;
+        if (d > 5) naps_over_5ms++;
+    }
     int64_t c = thread_ms() - c0, r = ru_thread_ms() - r0;
     return c > r ? c : r;
 }
@@ -143,6 +156,11 @@ void _start(void) {
         while (!spin_started) sleep_ms(5);
         d = charged_while_sleeping(300, 20);
         print_num("hello176: 20 ms naps with an unpinned spinner, charged ms: ", d);
+        if (d >= 60) {
+            print_num("hello176:   naps: ", nap_count);
+            print_num("hello176:   worst single nap charged ms: ", worst_nap_charge);
+            print_num("hello176:   naps charged over 5 ms: ", naps_over_5ms);
+        }
         stop_spin = 1;
     }
     check(a < 60, "A: one long nap is charged almost nothing");
