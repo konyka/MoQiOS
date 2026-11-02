@@ -1406,10 +1406,10 @@ pub const FdTable = struct {
             .inotify => return -1, // inotify uses read via special syscall path
             .raw_socket => {
                 // Raw socket: receive raw ethernet frame
-                const e1000 = @import("../drivers/e1000.zig");
-                if (!e1000.isActive()) return -1;
+                const nic = @import("../net/nic.zig");
+                if (!nic.isActive()) return -1;
                 const max: u32 = @intCast(@min(count, 2048));
-                const n = e1000.receivePacket(buf, max);
+                const n = nic.receivePacket(buf, max);
                 return @intCast(n);
             },
         }
@@ -1564,11 +1564,11 @@ pub const FdTable = struct {
             .inotify => return -1, // inotify is read-only via special path
             .raw_socket => {
                 // Raw socket: send raw ethernet frame
-                const e1000 = @import("../drivers/e1000.zig");
-                if (!e1000.isActive()) return -1;
+                const nic = @import("../net/nic.zig");
+                if (!nic.isActive()) return -1;
                 if (count > 2048) return -22; // EMSGSIZE
                 const len: u32 = @intCast(count);
-                if (e1000.sendPacket(buf, len)) {
+                if (nic.sendPacket(buf, len)) {
                     return @intCast(count);
                 }
                 return -1;

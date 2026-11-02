@@ -6111,3 +6111,17 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：这一轮的"红灯"是反向的——先证明套件**不会**发现被破坏的内联测试（红），再接上并证明它**会**发现（绿）；另外两个被暴露的问题各自是红（编译失败/断言失败）→改→绿。
 
 - 验证：host 980/980（原 864 个主套件、115 个内联测试、1 个守卫测试）；x86_64/riscv64/aarch64 构建通过（riscv64/aarch64 也在清空缓存后重建过）；内核代码/只读数据/数据与改动前一致（见上）。
+
+## virtio-net 在 QEMU 下从来不可用（环大小、环布局、缺少轮询接收）
+
+- 怎么想到的：逐个核对"文档说有、实际没接上"的东西。文档把 virtio-net 写成 ✅，但整个 smoke 一直用 e1000，从没用 `-device virtio-net-pci` 跑过。我给 `tools/qemu_run.sh` 加了 `MOQI_NIC=e1000|virtio|both`（默认 e1000，行为不变），用 virtio 启动，立刻得到 `[virtio-net] Init failed: BadQueue`。
+- 根因有四层，前一层不修就看不到后一层：
+  1. 驱动 `QUEUE_SIZE=128` 且拒绝设备报告更大的队列；QEMU 10.2 的 virtio-net-pci 报告 256，并且只允许 256..1024，所以**驱动在 QEMU 下永远初始化失败**。
+  2. 三页（描述符/avail/used）是三次独立的 `allocPage()` 再各自映射。legacy virtio 只收一个 PFN，按队列大小在固定偏移找 avail/used 环，所以三页必须物理连续；avail/used 偏移还写死成 2048/8192，只对 128 项正确。
+  3. `populateRxQueue` 每个缓冲用 2 个描述符，却循环 `num` 次，描述符会在一半处耗尽。
+  4. 初始化成功后 DHCP 仍无 lease：`nic.receivePacket` 对 virtio-net 返回 0（注释写着"靠驱动自己推送"），但 PIC 上 NIC 的中断线是屏蔽的，ISR 路径从不触发，协议栈的 `pumpRx` 轮询永远收不到帧。
+- 修复：新增 `kernel/drivers/virtio_queue_layout.zig`（纯算术：各偏移、页数、`sizeSupported`），`QUEUE_SIZE` 128→256，环内存改为一次 `pmm.allocContiguous`，偏移按 `vq.num` 计算，RX 缓冲数 = `min(num, QUEUE_SIZE)/2`；新增 `virtio_net.receivePacket`（`rx_lock` 保护，取帧、拷出、回收描述符并通知），`nic.receivePacket` 对 virtio-net 也调用它，ISR 路径复用它；`vfs.zig` 的 raw socket 读写原来写死 e1000，改走 `nic.zig`；`virtio_net_queue.MAX_QUEUE_SIZE` 128→256 与驱动对齐。
+- 实测：`MOQI_NIC=virtio` 下 `[dhcp] Configured: IP=10.0.2.15 ...`、`[DHCP] lease: 10.0.2.15`；完整 smoke（SMP=1）在 virtio 下**除 hello51 外所有标记都出现**（hello51 是"用户态驱动驱动 e1000"，找不到 e1000 是设计如此，所以该配置下 smoke 总体判定为超时失败，这是预期，不是缺陷）；hello14（ARP）、hello195（DNS）、hello196 在 virtio-net 上均 PASS。`MOQI_NIC=both` 的完整 smoke 通过（e1000 优先）。
+- 测试：`tests/main.zig` 新增 3 个（各队列大小的偏移/页数、`sizeSupported`、驱动结构守卫），并更新了一个原来断言 `qsize > QUEUE_SIZE` 源码文本的旧测试。变异：把 used 偏移的页对齐去掉，具名的布局测试失败；已还原，`grep MUTATION` 为 0。
+- 如实说明：①接收是轮询，没有让 virtio-net 的中断真正工作（需要给 PIC/IOAPIC 路由和取消屏蔽，e1000 同样没有，行为一致），所以 TX/RX 负载大时依赖协议栈的轮询频率；②只在 QEMU 的 virtio-net-pci（legacy，I/O 端口）上验证，没有 virtio 1.0 modern 传输；③没有压力测试 virtio-net 的吞吐，RX 队列满时设备丢帧；④默认仍是 e1000，virtio-net 只在 `MOQI_NIC=virtio|both` 下启用。
+- TDD：红灯 = `MOQI_NIC=virtio` 的 `BadQueue`（第 1 层），之后每修一层才暴露下一层（第 4 层的红灯是"init 成功但 `[dhcp] No OFFER received`"），绿灯 = 拿到 lease。

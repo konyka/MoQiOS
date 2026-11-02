@@ -40,7 +40,8 @@ const VIRTIO_STATUS_FAILED: u8 = 128;
 const VIRTIO_NET_F_MAC: u32 = 0x20; // Device has given MAC address
 const VIRTIO_NET_F_STATUS: u32 = 0x10; // Device status available
 
-const QUEUE_SIZE: u32 = 128;
+/// Largest queue the driver supports. QEMU's virtio-net-pci offers 256 by default and accepts only 256..1024.
+const QUEUE_SIZE: u32 = 256;
 
 /// Virtqueue descriptor.
 const VqDesc = extern struct {
@@ -50,6 +51,7 @@ const VqDesc = extern struct {
     next: u16,
 };
 
+const layout = @import("virtio_queue_layout.zig");
 const VQ_DESC_NEXT: u16 = virtio_queue.VQ_DESC_NEXT;
 const VQ_DESC_WRITE: u16 = 2; // device-writable
 
@@ -70,10 +72,10 @@ const VqUsed = extern struct {
     ring: [QUEUE_SIZE]VqUsedElem,
 };
 
-// Virtqueue layout offsets (for 128-entry queue)
+// Virtqueue layout offsets (legacy virtio, see virtio_queue_layout.zig). The device is given the queue size it
+// advertises and computes the ring offsets from that size, so the offsets must be computed from the SAME size,
+// not from the driver's maximum; vq.num holds it.
 const VQ_DESC_OFF: u32 = 0;
-const VQ_AVAIL_OFF: u32 = QUEUE_SIZE * 16; // 2048
-const VQ_USED_OFF: u32 = 8192; // after avail + padding to 4K
 
 /// Virtio-net header (12 bytes with mergeable rx buffers disabled).
 const VirtioNetHdr = extern struct {
@@ -88,7 +90,8 @@ const VirtioNetHdr = extern struct {
 const Virtqueue = struct {
     phys: u64,
     virt: u64,
-    ring_phys: [3]u64,
+    /// Pages in the one contiguous block that holds the descriptor table and both rings.
+    ring_pages: u32,
     num: u32,
     free_head: u16,
     free_count: u16,
@@ -109,6 +112,9 @@ const Virtqueue = struct {
 // current-code-review-and-fix-plan.md §6.36.
 var tx_lock: IrqSpinlock = .{};
 
+/// Guards the RX queue: receivePacket runs from the stack's poll points on any CPU and from the ISR.
+var rx_lock: IrqSpinlock = .{};
+
 const VirtioNetDevice = struct {
     io_base: u64,
     active: bool,
@@ -128,7 +134,7 @@ var device: VirtioNetDevice = .{
     .rx_queue = .{
         .phys = 0,
         .virt = 0,
-        .ring_phys = .{0} ** 3,
+        .ring_pages = 0,
         .num = 0,
         .free_head = 0,
         .free_count = 0,
@@ -138,7 +144,7 @@ var device: VirtioNetDevice = .{
     .tx_queue = .{
         .phys = 0,
         .virt = 0,
-        .ring_phys = .{0} ** 3,
+        .ring_pages = 0,
         .num = 0,
         .free_head = 0,
         .free_count = 0,
@@ -170,11 +176,11 @@ fn vqGetDesc(vq: *Virtqueue, idx: u32) *volatile VqDesc {
 }
 
 fn vqGetAvail(vq: *Virtqueue) *volatile VqAvailable {
-    return @ptrFromInt(vq.virt + VQ_AVAIL_OFF);
+    return @ptrFromInt(vq.virt + layout.availOffset(vq.num));
 }
 
 fn vqGetUsed(vq: *Virtqueue) *volatile VqUsed {
-    return @ptrFromInt(vq.virt + VQ_USED_OFF);
+    return @ptrFromInt(vq.virt + layout.usedOffset(vq.num));
 }
 
 fn vqAllocDesc(vq: *Virtqueue) ?u16 {
@@ -195,9 +201,7 @@ fn vqFreeDesc(vq: *Virtqueue, idx: u16) void {
 
 fn queueIsReleased(vq: *const Virtqueue) bool {
     if (vq.phys != 0 or vq.virt != 0 or vq.num != 0 or vq.free_count != 0) return false;
-    for (vq.ring_phys) |phys| {
-        if (phys != 0) return false;
-    }
+    if (vq.ring_pages != 0) return false;
     for (vq.buf_phys) |phys| {
         if (phys != 0) return false;
     }
@@ -210,16 +214,11 @@ fn resetVirtqueue(vq: *Virtqueue) void {
     for (vq.buf_phys) |phys| {
         if (phys != 0) pmm.freePage(phys);
     }
-    const pml4 = paging.getKernelPml4();
-    _ = paging.unmapPage(pml4, vq.virt + paging.PAGE_SIZE);
-    _ = paging.unmapPage(pml4, vq.virt + 2 * paging.PAGE_SIZE);
-    pmm.freePage(vq.ring_phys[2]);
-    pmm.freePage(vq.ring_phys[1]);
-    pmm.freePage(vq.ring_phys[0]);
+    pmm.freeContiguous(vq.phys, vq.ring_pages);
     vq.* = .{
         .phys = 0,
         .virt = 0,
-        .ring_phys = .{0} ** 3,
+        .ring_pages = 0,
         .num = 0,
         .free_head = 0,
         .free_count = 0,
@@ -250,49 +249,20 @@ fn initVirtqueue(vq: *Virtqueue, io_base: u64, queue_idx: u16) !void {
     const base = io_base;
     io.outw(@intCast(base + VIRTIO_PCI_QUEUE_SEL), queue_idx);
     const qsize = io.inw(@intCast(base + VIRTIO_PCI_QUEUE_NUM));
-    if (qsize == 0 or qsize > QUEUE_SIZE) return error.BadQueue;
+    if (!layout.sizeSupported(qsize, QUEUE_SIZE)) return error.BadQueue;
     vq.num = qsize;
 
-    // Allocate 3 pages for desc+avail+used
-    const p1 = pmm.allocPage() orelse return error.OutOfMemory;
-    const p2 = pmm.allocPage() orelse {
-        pmm.freePage(p1);
-        return error.OutOfMemory;
-    };
-    const p3 = pmm.allocPage() orelse {
-        pmm.freePage(p2);
-        pmm.freePage(p1);
-        return error.OutOfMemory;
-    };
-    const virt = hhdm.physToVirt(p1);
-    const pml4 = paging.getKernelPml4();
-    const flags = paging.MapFlags{
-        .writable = true,
-        .user = false,
-        .no_execute = true,
-        .global = true,
-    };
-    paging.mapPage(pml4, virt + paging.PAGE_SIZE, p2, flags) catch |err| {
-        pmm.freePage(p3);
-        pmm.freePage(p2);
-        pmm.freePage(p1);
-        return err;
-    };
-    paging.mapPage(pml4, virt + 2 * paging.PAGE_SIZE, p3, flags) catch |err| {
-        _ = paging.unmapPage(pml4, virt + paging.PAGE_SIZE);
-        pmm.freePage(p3);
-        pmm.freePage(p2);
-        pmm.freePage(p1);
-        return err;
-    };
-
-    // Zero 3 pages
+    // One physically contiguous block: a legacy device is given a single base address and finds the available and
+    // used rings at offsets it computes from the queue size it advertised (virtio_queue_layout.zig).
+    const pages = layout.totalPages(qsize);
+    const phys = pmm.allocContiguous(pages) orelse return error.OutOfMemory;
+    const virt = hhdm.physToVirt(phys);
     const ptr: [*]u8 = @ptrFromInt(virt);
-    @memset(ptr[0 .. paging.PAGE_SIZE * 3], 0);
+    @memset(ptr[0 .. paging.PAGE_SIZE * pages], 0);
 
-    vq.phys = p1;
+    vq.phys = phys;
     vq.virt = virt;
-    vq.ring_phys = .{ p1, p2, p3 };
+    vq.ring_pages = @intCast(pages);
     vq.free_head = 0;
     vq.free_count = @intCast(qsize);
     vq.last_used_idx = 0;
@@ -305,7 +275,7 @@ fn initVirtqueue(vq: *Virtqueue, io_base: u64, queue_idx: u16) !void {
 
     // Register queue with device
     io.outw(@intCast(base + VIRTIO_PCI_QUEUE_SEL), queue_idx);
-    io.outl(@intCast(base + VIRTIO_PCI_QUEUE_PFN), @truncate(p1 / paging.PAGE_SIZE));
+    io.outl(@intCast(base + VIRTIO_PCI_QUEUE_PFN), @truncate(phys / paging.PAGE_SIZE));
 }
 
 // ─── Initialization ──────────────────────────────────────────────────────────
@@ -417,7 +387,9 @@ fn initDevice(dev: *const pci.PciDevice) !void {
 /// Pre-populate the RX queue with empty buffers.
 fn populateRxQueue() !void {
     const vq = &device.rx_queue;
-    const num_bufs = @min(vq.num, QUEUE_SIZE);
+    // Each receive buffer is a header descriptor chained to a data descriptor, so a queue of N descriptors holds
+    // N / 2 buffers. (This used to loop N times and run out of descriptors halfway through.)
+    const num_bufs = @min(vq.num, QUEUE_SIZE) / 2;
 
     for (0..num_bufs) |_| {
         // Each RX entry: header (12 bytes) + data buffer (1514 bytes) = 2 descriptors
@@ -578,7 +550,50 @@ pub fn sendPacket(pkt: [*]const u8, len: u32) bool {
     return false;
 }
 
-// ─── Receive (interrupt-driven) ──────────────────────────────────────────────
+// ─── Receive ─────────────────────────────────────────────────────────────────
+
+/// Take one received frame off the RX queue, copy it into `buf` and hand the buffer back to the device. Returns the
+/// frame length, or 0 when nothing is ready (or the frame is empty/oversized and was dropped).
+///
+/// The stack polls this through nic.receivePacket exactly like e1000. The PIC leaves the NIC's line masked, so the
+/// interrupt path below is not what delivers frames in practice.
+pub fn receivePacket(buf: [*]u8, max_len: u32) u32 {
+    if (!device.active) return 0;
+    const flags = rx_lock.acquire();
+    defer rx_lock.release(flags);
+
+    const vq = &device.rx_queue;
+    const used = vqGetUsed(vq);
+    if (vq.last_used_idx == used.idx) return 0;
+    asm volatile ("" ::: .{ .memory = true });
+
+    const elem = used.ring[vq.last_used_idx % QUEUE_SIZE];
+    var pkt_len: u32 = 0;
+    if (elem.id < vq.num) {
+        const hdr_desc = vqGetDesc(vq, elem.id);
+        const data_virt = hhdm.physToVirt(vq.buf_phys[hdr_desc.next]);
+        const total_len = elem.len;
+        if (total_len > @sizeOf(VirtioNetHdr)) pkt_len = total_len - @sizeOf(VirtioNetHdr);
+        if (pkt_len > 1514 or pkt_len > max_len) {
+            pkt_len = 0;
+        } else if (pkt_len > 0) {
+            const src: [*]const u8 = @ptrFromInt(data_virt);
+            @memcpy(buf[0..pkt_len], src[0..pkt_len]);
+        }
+    }
+
+    // Recycle the same descriptors: the buffer pages are reused.
+    if (elem.id < vq.num) {
+        const avail = vqGetAvail(vq);
+        const avail_idx = avail.idx;
+        avail.ring[avail_idx % QUEUE_SIZE] = @intCast(elem.id);
+        asm volatile ("" ::: .{ .memory = true });
+        avail.idx = avail_idx +% 1;
+        io.outw(@intCast(device.io_base + VIRTIO_PCI_QUEUE_NOTIFY), 0);
+    }
+    vq.last_used_idx +%= 1;
+    return pkt_len;
+}
 
 /// Handle virtio-net interrupt. Called from IDT IRQ handler.
 pub fn handleInterrupt() void {
@@ -588,53 +603,14 @@ pub fn handleInterrupt() void {
     const isr = io.inb(@intCast(device.io_base + VIRTIO_PCI_ISR));
     if (isr == 0) return;
 
-    // Process RX completions
-    processRxQueue();
-}
-
-fn processRxQueue() void {
-    const vq = &device.rx_queue;
-    const used = vqGetUsed(vq);
-
-    while (vq.last_used_idx != used.idx) {
-        const elem = used.ring[vq.last_used_idx % QUEUE_SIZE];
-        const total_len = elem.len;
-
-        // The data starts after the virtio-net header in the second descriptor
-        const hdr_desc = vqGetDesc(vq, elem.id);
-        const data_desc_idx = hdr_desc.next;
-        const data_virt = hhdm.physToVirt(vq.buf_phys[data_desc_idx]);
-
-        // Packet length = total_len - header_size
-        const pkt_len: u32 = if (total_len > @sizeOf(VirtioNetHdr))
-            total_len - @sizeOf(VirtioNetHdr)
-        else
-            0;
-
-        if (pkt_len > 0 and pkt_len <= 1514) {
-            // Pass to network stack
-            const net = @import("../net/mod.zig");
-            const pkt_ptr: [*]const u8 = @ptrFromInt(data_virt);
-            net.handleRxPacket(pkt_ptr, pkt_len);
-        }
-
-        // Recycle: re-submit the same descriptors back to the RX queue
-        // (buffer pages are reused, no alloc/free needed)
-        const avail = vqGetAvail(vq);
-        const avail_idx = avail.idx;
-        avail.ring[avail_idx % QUEUE_SIZE] = @intCast(elem.id);
-        asm volatile ("" ::: .{ .memory = true });
-        avail.idx = avail_idx +% 1;
-
-        vq.last_used_idx +%= 1;
+    const net = @import("../net/mod.zig");
+    var rx_tmp: [2048]u8 = undefined;
+    var count: u32 = 0;
+    while (count < QUEUE_SIZE) : (count += 1) {
+        const n = receivePacket(&rx_tmp, 2048);
+        if (n == 0) break;
+        net.handleRxPacket(&rx_tmp, n);
     }
-
-    // Notify device of new RX buffers
-    if (used.idx != vq.last_used_idx) {
-        io.outw(@intCast(device.io_base + VIRTIO_PCI_QUEUE_NOTIFY), 0);
-    }
-    // Always notify after recycling
-    io.outw(@intCast(device.io_base + VIRTIO_PCI_QUEUE_NOTIFY), 0);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

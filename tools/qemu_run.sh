@@ -132,6 +132,7 @@ echo "========================================="
 #   MOQI_ISO_FILE    generated ISO path (default: moqios.iso)
 #   MOQI_USER_BIN_DIR ramdisk input directory (default: user_bin)
 #   MOQI_USER_SRC_DIR built user-program directory (default: zig-out/user)
+#   MOQI_NIC         network card: e1000 (default) | virtio | both
 #   MOQI_EXTRA_QEMU  extra QEMU args (e.g. "-d int,cpu_reset -D /tmp/qint.log")
 SERIAL_TARGET="${MOQI_SERIAL:-stdio}"
 SMP_COUNT="${MOQI_SMP:-2}"
@@ -139,6 +140,15 @@ CPU_MODEL="${MOQI_CPU:-qemu64,+smep,+umip,+smap}"
 MACHINE="${MOQI_MACHINE:-q35}"
 NVME_IMAGE="${MOQI_NVME_IMG:-nvme.img}"
 AHCI_IMAGE="${MOQI_AHCI_IMG:-ahci.img}"
+# MOQI_NIC selects the network card on the user-mode netdev: e1000 (default, what the smoke runs use),
+# virtio (virtio-net-pci only, to exercise the virtio-net driver on its own) or both.
+case "${MOQI_NIC:-e1000}" in
+    e1000)  NIC_ARGS=(-device e1000,netdev=net0) ;;
+    virtio) NIC_ARGS=(-device virtio-net-pci,netdev=net0) ;;
+    both)   NIC_ARGS=(-device e1000,netdev=net0 -netdev user,id=net1 -device virtio-net-pci,netdev=net1) ;;
+    *) echo "ERROR: MOQI_NIC must be e1000, virtio or both (got '${MOQI_NIC}')."; exit 2 ;;
+esac
+
 EXTRA_QEMU_ARGS=()
 if [ -n "${MOQI_EXTRA_QEMU:-}" ]; then
     # Split an explicitly documented space-delimited option string once; array
@@ -206,7 +216,7 @@ exec qemu-system-x86_64 \
     "${AHCI_ARGS[@]}" \
     "${DATA_ARGS[@]}" \
     -netdev user,id=net0 \
-    -device e1000,netdev=net0 \
+    "${NIC_ARGS[@]}" \
     -smp "$SMP_COUNT" \
     -serial "$SERIAL_TARGET" \
     -display none \

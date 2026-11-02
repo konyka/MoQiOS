@@ -1119,7 +1119,7 @@ const SchedStats = struct {
 - 非 x86 `isUserAccessible` 与 `isUserWritable` 分离：只读 user 页不能通过 kernel copy-to-user 写入检查；AArch64 timer service 由 trap 单一拥有者驱动，GIC 只负责 acknowledge/EOI。
 - AArch64 `isUserWritable` 同时要求页表 AP 的 EL0 access bit（AP[1]）和 RW 状态（AP[2] 清零）；EL1-only RW（AP=00）不能作为用户写目标。
 - RISC-V Sv39 在 map/unmap 修改 PTE 后执行本地 `sfence.vma`，避免旧 invalid/old translation 在重映射后继续生效。
-- virtio-net advertised queue size 必须为 `1..128`；驱动拒绝超过静态 descriptor/avail/used ring 存储的设备值，避免 DMA/ring 数组越界。
+- virtio-net advertised queue size 必须是 `1..256` 的 2 的幂（`virtio_queue_layout.sizeSupported`）；驱动拒绝超过静态存储的设备值，避免 DMA/ring 数组越界。QEMU 的 virtio-net-pci 默认就是 256（只允许 256..1024），所以旧的上限 128 让驱动在 QEMU 下永远初始化失败。
 - AArch64/RISC-V `initIdentity` 失败是 fatal no-retry 契约：boot caller 立即 halt/shutdown，失败前分配的 root/中间页表帧有意不释放；不给早期启动失败路径添加表遍历 teardown。
 - AArch64/RISC-V 尚未实现 2 MiB huge-page backend 时，`mapHugePage` 显式返回 `UnsupportedHugePage`，不会静默只映射一个 4 KiB base page。
 - mmap fault 使用 `insertPageOwnedOrGet` 区分 cache full、刚插入和已存在 frame；duplicate 命中返回已在锁内 pin 的现有物理帧，incoming scratch frame 由 fault path 释放，不会误判为 cache full。
@@ -2267,17 +2267,20 @@ const SysCap = packed struct {
   解码、消息地址/数据组合），由 `tests/main.zig` 经 `kernel/host_test.zig`
   做主机单元测试
 
-### 6.8 virtio-net 网卡 ✅ Virtqueue RX/TX + 中断驱动
+### 6.8 virtio-net 网卡 ✅ Virtqueue RX/TX + 轮询接收
 
-文件: `virtio_net.zig` (548 行)
+文件: `virtio_net.zig`, `virtio_queue_layout.zig`（环布局算术）, `virtio_net_queue.zig`（TX 记账）
 
-- Virtio 1.0 Legacy PCI 接口 (vendor 0x1AF4, device 0x1000)
-- RX 队列 (queue 0): 128 描述符，中断驱动
-- TX 队列 (queue 1): 128 描述符，同步发送
+- Virtio Legacy PCI 接口 (vendor 0x1AF4, device 0x1000)
+- RX 队列 (queue 0) 与 TX 队列 (queue 1)：按设备报告的大小（QEMU 默认 256，驱动最大 256）
+- 环内存是**一块物理连续内存**（`pmm.allocContiguous`）：legacy 设备只拿到一个 PFN，按自己报告的队列大小在固定偏移找 avail 环（紧跟描述符表）和 used 环（avail 之后的下一个 4 KiB 边界）。256 项 = 描述符 4096 B、avail 偏移 4096、used 偏移 8192、共 3 页；偏移由 `virtio_queue_layout.zig` 按 `vq.num` 计算，不再写死
+- RX：每个缓冲 = 头描述符 + 数据描述符两个描述符，所以 N 项队列预置 N/2 个缓冲
+- 接收走**轮询**：`virtio_net.receivePacket(buf, max)` 取一帧、拷出、回收描述符并通知设备，`net/nic.zig:receivePacket` 对 e1000 和 virtio-net 都调用它（`pumpRx`/raw socket 都经 `nic.zig`）。PIC 上 NIC 的中断线是屏蔽的，所以中断路径（`handleInterrupt`，同样用 `receivePacket`）实际上不是帧的来源
+- TX 同步发送，`tx_lock` 保护整个事务；RX 用 `rx_lock`（ISR 与轮询点可能同时进入）
 - virtio_net_hdr: 10 字节头部 (flags, gso_type, checksum)
-- 中断处理: ISR 读取 + 清除，调用 net.handleRxPacket
 - 内存屏障: `asm volatile("" ::: .{ .memory = true })` 替代 @fence
 - PCI 配置: Bus Master + INTx 启用
+- 选用：`MOQI_NIC=e1000`（默认）| `virtio` | `both`（`tools/qemu_run.sh`）；两块卡都在时 e1000 优先
 
 **API**: `init()` / `isActive()` / `getIrqLine()` / `handleInterrupt()` / `sendPacket()` / `receivePacket()`
 

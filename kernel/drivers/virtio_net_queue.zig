@@ -25,7 +25,7 @@ const std = @import("std");
 pub const VQ_DESC_NEXT: u16 = 1;
 
 /// Maximum descriptors in one virtqueue.
-pub const MAX_QUEUE_SIZE: usize = 128;
+pub const MAX_QUEUE_SIZE: usize = 256;
 
 /// Descriptor table entry tracked by the accounting layer. `next` is the
 /// free-list/chain successor, `used` is true while the descriptor is

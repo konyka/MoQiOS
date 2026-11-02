@@ -453,10 +453,54 @@ test "fat32 truncate preserves old metadata on failed directory update" {
 
 test "virtio net queue rejects sizes beyond fixed ring storage" {
     const source = kt.virtio_net_source;
-    try std.testing.expect(std.mem.indexOf(u8, source, "qsize == 0 or qsize > QUEUE_SIZE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "layout.sizeSupported(qsize, QUEUE_SIZE)") != null);
     const policy = kt.virtio_net_queue_source;
     try std.testing.expect(std.mem.indexOf(u8, policy, "size == 0 or size > MAX_QUEUE_SIZE") != null);
     try std.testing.expect(std.mem.indexOf(u8, policy, "pub fn init(state: *QueueState, size: u16) bool") != null);
+}
+
+test "virtio queue layout matches the legacy ring offsets for every size the device may offer" {
+    const l = kt.virtio_queue_layout;
+    // N=128 (the old size): descriptors 2048 B, avail ends at 2310, used page-aligned at 4096.
+    try std.testing.expectEqual(@as(usize, 2048), l.availOffset(128));
+    try std.testing.expectEqual(@as(usize, 4096), l.usedOffset(128));
+    try std.testing.expectEqual(@as(usize, 2), l.totalPages(128));
+    // N=256 (QEMU's default): avail 4096, used 8192, three pages.
+    try std.testing.expectEqual(@as(usize, 4096), l.availOffset(256));
+    try std.testing.expectEqual(@as(usize, 8192), l.usedOffset(256));
+    try std.testing.expectEqual(@as(usize, 3), l.totalPages(256));
+    // N=1024 (QEMU's maximum).
+    try std.testing.expectEqual(@as(usize, 16384), l.availOffset(1024));
+    try std.testing.expectEqual(@as(usize, 20480), l.usedOffset(1024));
+    try std.testing.expectEqual(@as(usize, 8), l.totalPages(1024));
+    // The used ring always starts on a page boundary and the block always holds the whole used ring.
+    var n: usize = 1;
+    while (n <= 1024) : (n *= 2) {
+        try std.testing.expectEqual(@as(usize, 0), l.usedOffset(n) % 4096);
+        try std.testing.expect(l.usedOffset(n) >= l.availOffset(n) + l.availBytes(n));
+        try std.testing.expect(l.totalBytes(n) >= l.usedOffset(n) + l.usedBytes(n));
+    }
+}
+
+test "virtio queue sizes: only powers of two up to the driver maximum are accepted" {
+    const l = kt.virtio_queue_layout;
+    try std.testing.expect(!l.sizeSupported(0, 256));
+    try std.testing.expect(!l.sizeSupported(3, 256));
+    try std.testing.expect(!l.sizeSupported(100, 256));
+    try std.testing.expect(!l.sizeSupported(512, 256));
+    try std.testing.expect(l.sizeSupported(1, 256));
+    try std.testing.expect(l.sizeSupported(128, 256));
+    try std.testing.expect(l.sizeSupported(256, 256));
+}
+
+test "virtio-net uses one contiguous ring block, half as many RX buffers as descriptors, and a pollable RX path" {
+    const src = kt.virtio_net_source;
+    try std.testing.expect(std.mem.indexOf(u8, src, "pmm.allocContiguous(pages)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "VQ_AVAIL_OFF") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "@min(vq.num, QUEUE_SIZE) / 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "pub fn receivePacket(") != null);
+    const nic = kt.nic_source;
+    try std.testing.expect(std.mem.indexOf(u8, nic, "drivers.virtio_net.receivePacket(buf, max_len)") != null);
 }
 
 test "non-x86 identity init failure is an explicit fatal no-retry contract" {

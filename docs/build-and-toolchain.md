@@ -82,6 +82,10 @@ canonical fixture check is mandatory. A non-empty `MOQI_DISK` bypasses manifest 
 and retains the existing regular-file requirement, so custom images are not rejected for
 having a different hash. The RISC-V, AArch64, and NVMe paths are unchanged.
 
+`MOQI_NIC` selects the x86 network card: `e1000` (default), `virtio` (virtio-net-pci only) or
+`both`. The default smoke run always uses e1000; `hello51` (the userspace-driver test) requires an
+e1000, so it fails by design under `MOQI_NIC=virtio`.
+
 The fixture is expected to be internally consistent: `fsck.fat -n disk.img` and
 `e2fsck -fn "disk.img?offset=16777216"` both exit 0 (the FAT32 volume starts at LBA 0, the ext2
 volume at LBA 32768). After the kernel fixes of 2026-10 the image was rebuilt from the previous

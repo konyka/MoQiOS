@@ -4,9 +4,8 @@
 //! `drivers/e1000.zig` for every transmit, so a machine with only a
 //! virtio-net NIC could initialise the stack but never send a frame. This
 //! facade dispatches TX / MAC / liveness to whichever NIC is active,
-//! preferring e1000 when both are present. RX stays driver-specific: e1000
-//! is polled via `receivePacket` (raw_net/socket_syscall) while virtio-net
-//! pushes frames straight into `net.handleRxPacket` from its own path.
+//! preferring e1000 when both are present. RX is polled through
+//! `receivePacket` for both drivers (the NIC IRQ lines stay masked).
 
 const builtin = @import("builtin");
 
@@ -48,13 +47,12 @@ pub fn sendPacket(data: [*]const u8, len: u32) bool {
 }
 
 /// Poll one frame off the active NIC's RX ring into `buf`; returns bytes
-/// copied (0 = nothing ready). Only e1000 is pollable — virtio-net has no
-/// poll API and pushes RX straight into `net.handleRxPacket` from its own
-/// path, so a virtio-net-only machine still receives, it just returns 0
-/// here and callers rely on the driver's push path instead.
+/// copied (0 = nothing ready). Both drivers are polled; the NIC interrupt
+/// lines stay masked on the PIC, so polling is the delivery path.
 pub fn receivePacket(buf: [*]u8, max_len: u32) u32 {
     if (comptime builtin.cpu.arch == .x86_64) {
         if (drivers.e1000.isActive()) return drivers.e1000.receivePacket(buf, max_len);
+        if (drivers.virtio_net.isActive()) return drivers.virtio_net.receivePacket(buf, max_len);
     }
     return 0;
 }
