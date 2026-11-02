@@ -6154,3 +6154,10 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 过程中的一个失误：做端口变异后我用 `git checkout src/netdb.c` 还原，把这个文件里**还没提交的新函数**一起回退了；发现后补回并重跑测试通过。以后对有未提交改动的文件还原变异要用反向 `sed`，不能用 `git checkout`。
 - 目标上验证：hello196 多 4 项，其中 `bind()` 用造出的地址，说明内核接受这个布局（MoQiOS 的 socket/bind 系统调用号是 117/118，不是 Linux 的 41/49，我第一版写错过）。
 - 如实说明：①只有 IPv4/UDP-TCP 通用的 `sockaddr_in`，没有 `struct addrinfo`/`getaddrinfo`/`hostent`/IPv6；②`resolve_ipv4_sockaddr` 会阻塞在 `dns_resolve` 上（最长是内核的 DNS 超时），没有异步版本；③没有改内核。
+
+## libc 缺 `htons/ntohs/htonl/ntohl`（byteorder.h）
+
+- 怎么想到的：做 `ipv4_sockaddr` 时发现 libc 里没有任何字节序函数（`grep htons lib/moqi_libc user` 为空），`ipv4_sockaddr` 自己手写了端口移位；而 hello22/145 等探测都在手算端口字节。
+- 做的事：新增头文件 `include/byteorder.h`，四个 `static inline` 函数，并用 `#if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__ → #error` 保证三个小端目标之外不会悄悄出错；`ipv4_sockaddr` 改为用 `htons`。
+- TDD：`test_byteorder.c` 先写（头文件缺失，编译失败=红），期望值来自宿主机 glibc 的 `htons/htonl`（`0x1234→0x3412`、`0x12345678→0x78563412` 等），加上 0/最大值/往返和"端口字节在内存里是网络序"的检查；变异：`htons` 不交换、`htonl` 漏掉 `v << 24`，各自让具名断言失败，已还原；`hello196` 多 1 项在目标上核对。
+- 如实说明：没有 `struct in_addr`/`inet_addr`/`inet_ntoa` 等 BSD socket 头；没有改内核。

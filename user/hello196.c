@@ -3,6 +3,7 @@
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
 #include "../lib/moqi_libc/include/stdio.h"
 #include "../lib/moqi_libc/include/netdb.h"
+#include "../lib/moqi_libc/include/byteorder.h"
 
 static int failures;
 static void check(int ok, const char *what) {
@@ -48,6 +49,9 @@ int main(int argc, char **argv, char **envp) {
     uint8_t sb[16];
     check(resolve_ipv4_sockaddr("localhost", 80, sb) == 0 && sb[4] == 127 && sb[7] == 1 && sb[3] == 80,
           "resolve_ipv4_sockaddr resolves a name through dns_resolve");
+
+    check(htons(8080) == 0x901F && ntohs(0x901F) == 8080 && htonl(0x0A000202u) == 0x0202000Au && ntohl(0x0202000Au) == 0x0A000202u,
+          "htons/ntohs/htonl/ntohl swap bytes on the target");
 
     print(failures == 0 ? "hello196: PASS\n" : "hello196: FAIL\n");
     print("hello196 done\n");

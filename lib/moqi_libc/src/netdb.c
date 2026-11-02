@@ -1,5 +1,6 @@
 /* netdb.c — hostname resolution wrappers (see include/netdb.h). */
 #include "../include/netdb.h"
+#include "../include/byteorder.h"
 
 /* The host unit test links this file against a recording stub instead of the real `syscall` instruction. */
 #ifdef MOQI_HOST_TEST_SYSCALL
@@ -60,8 +61,9 @@ int ipv4_from_text(const char *text, uint8_t out[4]) {
 void ipv4_sockaddr(const uint8_t addr[4], uint16_t port, uint8_t out[16]) {
     out[0] = 2; /* AF_INET, little-endian u16 */
     out[1] = 0;
-    out[2] = (uint8_t)(port >> 8);
-    out[3] = (uint8_t)(port & 0xFF);
+    uint16_t be = htons(port);
+    out[2] = (uint8_t)(be & 0xFF); /* first byte in memory of the big-endian value */
+    out[3] = (uint8_t)(be >> 8);
     for (int i = 0; i < 4; i++) out[4 + i] = addr[i];
     for (int i = 8; i < 16; i++) out[i] = 0;
 }

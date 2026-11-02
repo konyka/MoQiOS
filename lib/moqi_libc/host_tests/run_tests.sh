@@ -32,6 +32,10 @@ $CC $CFLAGS -c ../src/rlimit.c -o "$OUT/rlimit.o"
 $CC $CFLAGS -o "$OUT/test_rlimit_abi" test_rlimit_abi.c "$OUT/rlimit.o"
 "$OUT/test_rlimit_abi" || fail=1
 
+echo "== test_byteorder =="
+$CC $CFLAGS -o "$OUT/test_byteorder" test_byteorder.c
+"$OUT/test_byteorder" || fail=1
+
 echo "== test_netdb_abi =="
 $CC $CFLAGS -DMOQI_HOST_TEST_SYSCALL -c ../src/netdb.c -o "$OUT/netdb.o"
 $CC $CFLAGS -o "$OUT/test_netdb_abi" test_netdb_abi.c "$OUT/netdb.o"
