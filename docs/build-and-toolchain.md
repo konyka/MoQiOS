@@ -520,6 +520,8 @@ POSIX 消息队列的属性决策属于主机测试覆盖：测试验证 `O_CREA
 `run_tests.sh` 中的测试列表。该脚本已注册到 `zig build test`，不需要额外修改 CI 或创建独立
 入口；失败退出码会传播到本地命令和 GitHub CI。
 
+**kernel 源文件里的内联 `test` 块也曾经全部不运行**：Zig 只运行"测试根"或被某个 `test {}` 块引用到的文件里的 `test` 块。`kernel/host_test.zig` 用 `pub const x = @import("...")` 重新导出模块给 `tests/main.zig` 用，这种导入**不会**让被导入文件里的 `test` 块运行；`tests/main.zig` 自己 `@import("kernel_shared")` 也不会。我用一个会失败的内联测试验证过：把 `ipc_endpoint_policy.zig` 里的一条期望改反，`zig build test` 仍报告全部通过。结果是 57 个 kernel 文件里的 119 个内联 `test` 块（570 处检查）从来没有运行过。现在 `kernel/host_test.zig` 末尾有一个 `test {}` 块，列出所有能在宿主机上编译的、带内联测试的 kernel 文件（55 个），`build.zig` 把这个模块也作为一个独立的测试根运行（`zig build test` 的输出里是第二行 `run test`，目前 115 个测试）。同样的改反实验现在会让 `zig build test` 失败。新增带内联 `test` 的 kernel 文件时，要把它加进那个 `test {}` 块；`tests/main.zig` 里有一个守卫测试（"every kernel file with inline tests is listed in host_test.zig's test{} block"）遍历整个 `kernel/` 目录，对任何有 `test "..."` 但没列进去的文件报错并打印该加的那一行。我用新增一个未列出的文件验证过它：未列出时失败，列出后通过。不能在宿主机上分析的两个（`arch/x86_64/clone.zig`、`mm/process_vm.zig`，它们的导入闭包里有 x86 内联汇编）仍然不运行。
+
 **断言真的会执行吗**：`zig cc -O1` 默认定义 `NDEBUG`，会把 `assert` 编译成空操作。`run_tests.sh` 在这个问题被发现之前没有 `-UNDEBUG`，所以 `test_mkdir_abi.c`、`test_rlimit_abi.c` 和 `test_stdlib.c` 里只靠 `assert` 的检查**从来没有执行过**（它们一直"通过"，因为什么都没检查）；现在 `CFLAGS` 里加了 `-UNDEBUG`。以后写新测试时不必再自己 `#undef NDEBUG`。
 
 **需要不跑真实 `syscall` 指令的包装器测试**（如 `netdb.c`）：源文件里用 `#ifdef MOQI_HOST_TEST_SYSCALL` 把系统调用换成一个由测试提供的桩函数（`moqi_test_syscall2`），`run_tests.sh` 对这个源文件加 `-DMOQI_HOST_TEST_SYSCALL` 单独编译。这样能在宿主机上检查参数顺序、错误码原样透传、NULL 参数被包装器拒绝，而不需要内核。

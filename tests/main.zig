@@ -1585,6 +1585,40 @@ test "munmap and SysV SHM policy validation" {
     try std.testing.expect(shm_policy.rangeEnd(0x7000_0000, 4096, munmap_policy.USER_ADDR_MAX) != null);
 }
 
+test "every kernel file with inline tests is listed in host_test.zig's test{} block (or is a known exception)" {
+    // Zig runs a `test` block only in a file reached from a `test {}` block of a test root. A kernel file that gains
+    // inline tests but is not listed there compiles fine and never runs them: that is how 113 inline tests went
+    // unrun for a long time. This test walks the kernel source tree and fails for any file that has `test "..."`
+    // blocks but no `_ = @import("<path>");` line in kernel/host_test.zig.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, "kernel", .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+    const host_test = kt.host_test_source;
+    // Files whose import closure reaches x86 inline assembly cannot be analysed on the host.
+    const exceptions = [_][]const u8{ "arch/x86_64/clone.zig", "mm/process_vm.zig" };
+    var missing: usize = 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig")) continue;
+        if (std.mem.eql(u8, entry.path, "host_test.zig")) continue;
+        const src = try dir.readFileAlloc(io, entry.path, allocator, .limited(4 * 1024 * 1024));
+        defer allocator.free(src);
+        if (std.mem.indexOf(u8, src, "\ntest \"") == null and !std.mem.startsWith(u8, src, "test \"")) continue;
+        var exempt = false;
+        for (exceptions) |e| exempt = exempt or std.mem.eql(u8, e, entry.path);
+        if (exempt) continue;
+        var needle_buf: [256]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&needle_buf, "_ = @import(\"{s}\");", .{entry.path});
+        if (std.mem.indexOf(u8, host_test, needle) == null) {
+            std.debug.print("inline tests never run: kernel/{s} (add `_ = @import(\"{s}\");` to the test block in kernel/host_test.zig)\n", .{ entry.path, entry.path });
+            missing += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), missing);
+}
+
 test "dns_resolve: hostname syntax, error codes, and the order of checks" {
     const hp = kt.hostname_policy;
     const V = hp.Verdict;

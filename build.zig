@@ -367,6 +367,8 @@ pub fn build(b: *std.Build) void {
     const host_test_modules = [_]struct { name: []const u8, path: []const u8 }{
         .{ .name = "kernel_shared", .path = "kernel/host_test.zig" },
     };
+    var host_test_roots: [host_test_modules.len]*std.Build.Module = undefined;
+    var host_test_root_count: usize = 0;
     for (host_test_modules) |m| {
         const host_module = b.createModule(.{
             .root_source_file = b.path(m.path),
@@ -379,6 +381,8 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("lib/moqi_libc/include/moqi_syscalls.h"),
         });
         test_module.addImport(m.name, host_module);
+        host_test_roots[host_test_root_count] = host_module;
+        host_test_root_count += 1;
     }
     const lib_test = b.addTest(.{
         .root_module = test_module,
@@ -386,6 +390,12 @@ pub fn build(b: *std.Build) void {
     const run_lib_tests = b.addRunArtifact(lib_test);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_lib_tests.step);
+    // The inline `test` blocks that live inside the kernel files are only discovered when the module that
+    // contains them is itself a test root; importing it from tests/main.zig does not run them.
+    for (host_test_roots[0..host_test_root_count]) |root| {
+        const inline_tests = b.addTest(.{ .root_module = root });
+        test_step.dependOn(&b.addRunArtifact(inline_tests).step);
+    }
     const run_libc_host_tests = b.addSystemCommand(&.{"./lib/moqi_libc/host_tests/run_tests.sh"});
     test_step.dependOn(&run_libc_host_tests.step);
     const run_init_supervisor_tests = b.addSystemCommand(&.{"./tools/tests/test_init_supervisor.sh"});

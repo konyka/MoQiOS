@@ -158,6 +158,7 @@ pub const ndp_na_policy = @import("net/ndp_na_policy.zig");
 pub const ps2_policy = @import("drivers/ps2_policy.zig");
 pub const dns_policy = @import("net/dns_policy.zig");
 pub const hostname_policy = @import("net/hostname_policy.zig");
+pub const host_test_source = @embedFile("host_test.zig");
 pub const proc_id_policy = @import("proc/proc_id_policy.zig");
 pub const signal_perm_policy = @import("proc/signal_perm_policy.zig");
 pub const signal_action_policy = @import("proc/signal_action_policy.zig");
@@ -291,3 +292,68 @@ pub const ramdisk_source = @embedFile("fs/ramdisk.zig");
 pub const unlink_source = @embedFile("fs/unlink.zig");
 pub const dir_ops_source = @embedFile("fs/dir_ops.zig");
 pub const readv_source = @embedFile("fs/readv.zig");
+
+// Every kernel file with inline `test` blocks that compiles on the host. Zig runs a test block only in a file
+// that is reached from a `test {}` block of a test root: the `pub const x = @import(..)` re-exports above do not
+// count, and tests/main.zig reaching this module as an import does not either. build.zig therefore also runs this
+// module as a test root of its own. Before that, these inline tests were never executed.
+//
+// Left out because they cannot be analysed on the host (arch inline assembly in their import closure):
+// arch/x86_64/clone.zig and mm/process_vm.zig.
+test {
+    _ = @import("arch/x86_64/irq_time_policy.zig");
+    _ = @import("mm/munmap_policy.zig");
+    _ = @import("mm/mmap_policy.zig");
+    _ = @import("mm/shared_mapping_policy.zig");
+    _ = @import("mm/clone_flags_policy.zig");
+    _ = @import("drivers/virtio_net_queue.zig");
+    _ = @import("drivers/nvme_flush_policy.zig");
+    _ = @import("proc/sched_getaffinity_policy.zig");
+    _ = @import("proc/close_range_policy.zig");
+    _ = @import("proc/move_pages_policy.zig");
+    _ = @import("proc/time_set_policy.zig");
+    _ = @import("proc/clone3_policy.zig");
+    _ = @import("proc/pidfd_policy.zig");
+    _ = @import("proc/pidfd_signal_policy.zig");
+    _ = @import("proc/time_pointer_policy.zig");
+    _ = @import("proc/sigreturn_policy.zig");
+    _ = @import("proc/task_lifetime_policy.zig");
+    _ = @import("proc/task_slot_lifetime.zig");
+    _ = @import("proc/reap_policy.zig");
+    _ = @import("proc/sched_queue_policy.zig");
+    _ = @import("proc/siginfo_policy.zig");
+    _ = @import("proc/uts.zig");
+    _ = @import("ipc/sysv_policy.zig");
+    _ = @import("ipc/posix_timer_policy.zig");
+    _ = @import("ipc/posix_mq_policy.zig");
+    _ = @import("ipc/posix_mq_receive_policy.zig");
+    _ = @import("ipc/posix_mq_priority_policy.zig");
+    _ = @import("ipc/posix_mq_ownership_policy.zig");
+    _ = @import("ipc/sysv_shm_policy.zig");
+    _ = @import("ipc/sysv_shm_lifecycle_policy.zig");
+    _ = @import("ipc/posix_mq_attr_policy.zig");
+    _ = @import("ipc/ipc_lifecycle_policy.zig");
+    _ = @import("ipc/capability_policy.zig");
+    _ = @import("ipc/capability_lifecycle_policy.zig");
+    _ = @import("ipc/ipc_call_reply_policy.zig");
+    _ = @import("ipc/capability_generation_policy.zig");
+    _ = @import("ipc/ipc_timeout_policy.zig");
+    _ = @import("ipc/posix_mq_wait_policy.zig");
+    _ = @import("ipc/posix_mq_descriptor_policy.zig");
+    _ = @import("ipc/shm_policy.zig");
+    _ = @import("ipc/ipc_endpoint_policy.zig");
+    _ = @import("fs/poll_policy.zig");
+    _ = @import("fs/ext2_dirpath.zig");
+    _ = @import("fs/fd_stat_policy.zig");
+    _ = @import("fs/ioctl_policy.zig");
+    _ = @import("net/message_batch_policy.zig");
+    _ = @import("net/epoll_policy.zig");
+    _ = @import("net/accept4_policy.zig");
+    _ = @import("net/socket_policy.zig");
+    _ = @import("net/epoll_lifecycle_policy.zig");
+    _ = @import("net/udp_recv_policy.zig");
+    _ = @import("net/scm_policy.zig");
+    _ = @import("net/recv_flags_policy.zig");
+    _ = @import("net/socketpair_policy.zig");
+    _ = @import("net/sockopt_policy.zig");
+}

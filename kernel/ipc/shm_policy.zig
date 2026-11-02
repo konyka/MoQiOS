@@ -50,8 +50,22 @@ test "shared-memory policy rejects unknown flags and wrapped ranges" {
     try std.testing.expect(!flagsValid(1));
     try std.testing.expect(rangeEnd(0x7000_0000, 4096, 0x8000_0000_0000) != null);
     try std.testing.expect(rangeEnd(std.math.maxInt(u64) - 4095, 8192, std.math.maxInt(u64)) == null);
+    // Mode 0640: the owner (shift 6) may read and write, the group (shift 3) may only read, others (shift 0)
+    // nothing. (This test used to assert that the OWNER could not write a 0640 segment, which is wrong; it never
+    // ran, so nobody noticed. modeAllows itself matches sysv_policy.modeAllows and POSIX.)
     try std.testing.expect(modeAllows(0o640, 6, 0o4));
-    try std.testing.expect(!modeAllows(0o640, 6, 0o2));
+    try std.testing.expect(modeAllows(0o640, 6, 0o2));
+    try std.testing.expect(modeAllows(0o640, 6, 0o6));
+    try std.testing.expect(modeAllows(0o640, 3, 0o4));
+    try std.testing.expect(!modeAllows(0o640, 3, 0o2));
+    try std.testing.expect(!modeAllows(0o640, 3, 0o6));
+    try std.testing.expect(!modeAllows(0o640, 0, 0o4));
+    try std.testing.expect(!modeAllows(0o640, 0, 0o2));
+    // Execute is a separate bit: 0640 grants it to nobody.
+    try std.testing.expect(!modeAllows(0o640, 6, 0o1));
+    try std.testing.expect(modeAllows(0o750, 3, 0o5));
+    // Nothing requested is always allowed.
+    try std.testing.expect(modeAllows(0, 0, 0));
 }
 
 test "existing shmget lookup preserves exclusive and access semantics" {

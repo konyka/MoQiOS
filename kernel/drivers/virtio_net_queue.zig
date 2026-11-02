@@ -147,7 +147,7 @@ pub fn eql(a: *const QueueState, b: *const QueueState) bool {
 // Host tests live here so the module is self-contained under `zig build test`.
 test "virtio-net queue: alloc-until-full hands out unique descriptors" {
     var q: QueueState = .{};
-    init(&q, 8);
+    try std.testing.expect(init(&q, 8));
     var seen = [_]bool{false} ** MAX_QUEUE_SIZE;
     var allocated: usize = 0;
     while (allocated < 8) : (allocated += 1) {
@@ -161,10 +161,10 @@ test "virtio-net queue: alloc-until-full hands out unique descriptors" {
 
 test "virtio-net queue: free restores capacity and reuses the head" {
     var q: QueueState = .{};
-    init(&q, 8);
+    try std.testing.expect(init(&q, 8));
     const a = allocDescriptor(&q).?;
     const b = allocDescriptor(&q).?;
-    freeDescriptor(&q, a);
+    try std.testing.expect(freeDescriptor(&q, a));
     try std.testing.expectEqual(@as(u16, 7), q.free_count);
     try std.testing.expect(allocDescriptor(&q) == a);
     _ = b;
@@ -172,7 +172,7 @@ test "virtio-net queue: free restores capacity and reuses the head" {
 
 test "virtio-net queue: free of an already-free descriptor is a no-op" {
     var q: QueueState = .{};
-    init(&q, 8);
+    try std.testing.expect(init(&q, 8));
     const snap = q;
     // A free descriptor (0) that was never handed out: the reclaim must not
     // mutate the free list (double-free protection).
@@ -188,7 +188,7 @@ test "virtio-net queue: free of an already-free descriptor is a no-op" {
 
 test "virtio-net queue: zero-size queue never allocates and bounds-safe" {
     var q: QueueState = .{};
-    init(&q, 0);
+    try std.testing.expect(!init(&q, 0));
     try std.testing.expect(allocDescriptor(&q) == null);
     // publish/record on a zero-size queue must not divide by zero; the
     // driver never drives a zero-size queue, but the pure model stays safe.
@@ -200,7 +200,7 @@ test "virtio-net queue: zero-size queue never allocates and bounds-safe" {
 
 test "virtio-net queue: publishAvail writes one slot and advances once" {
     var q: QueueState = .{};
-    init(&q, 8);
+    try std.testing.expect(init(&q, 8));
     const before = q.avail_idx;
     publishAvail(&q, 3);
     try std.testing.expectEqual(before +% 1, q.avail_idx);
@@ -209,7 +209,7 @@ test "virtio-net queue: publishAvail writes one slot and advances once" {
 
 test "virtio-net queue: recordCompletion advances exactly once" {
     var q: QueueState = .{};
-    init(&q, 8);
+    try std.testing.expect(init(&q, 8));
     q.used_ring[0] = 5;
     const before = q.last_used_idx;
     const head = recordCompletion(&q, 0);
@@ -219,7 +219,7 @@ test "virtio-net queue: recordCompletion advances exactly once" {
 
 test "virtio-net queue: second-descriptor allocation failure rolls back" {
     var q: QueueState = .{};
-    init(&q, 8);
+    try std.testing.expect(init(&q, 8));
     const snap = q;
     const first = allocDescriptor(&q).?; // first desc claimed
     try std.testing.expect(!eql(&snap, &q));
@@ -231,7 +231,7 @@ test "virtio-net queue: second-descriptor allocation failure rolls back" {
 
 test "virtio-net queue: RX recycle consumes once and republishes once" {
     var q: QueueState = .{};
-    init(&q, 8);
+    try std.testing.expect(init(&q, 8));
     q.used_ring[0] = 2;
     const avail_before = q.avail_idx;
     recycleRx(&q, 0);
