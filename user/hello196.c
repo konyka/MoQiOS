@@ -75,6 +75,22 @@ int main(int argc, char **argv, char **envp) {
         if (ls >= 0) syscall1(SYS_close, ls);
     }
 
+    {
+        struct hostent *h = gethostbyname("localhost");
+        check(h != (struct hostent *)0 && h->h_addrtype == AF_INET && h->h_length == 4 &&
+              (uint8_t)h->h_addr_list[0][0] == 127 && (uint8_t)h->h_addr_list[0][3] == 1 && h->h_addr_list[1] == (char *)0,
+              "gethostbyname(\"localhost\") returns 127.0.0.1 in a glibc-shaped hostent");
+        check(h != (struct hostent *)0 && h->h_name[0] == 'l' && h->h_aliases[0] == (char *)0 && h_errno == 0,
+              "its h_name is the name asked for, no aliases, h_errno 0");
+        h = gethostbyname("no-such-host.invalid");
+        check(h == (struct hostent *)0 && (h_errno == HOST_NOT_FOUND || h_errno == TRY_AGAIN),
+              "an unknown name returns NULL with HOST_NOT_FOUND or TRY_AGAIN");
+        h = gethostbyname("bad name!");
+        check(h == (struct hostent *)0 && h_errno == HOST_NOT_FOUND, "a malformed name is NULL / HOST_NOT_FOUND");
+        h = gethostbyname((const char *)0);
+        check(h == (struct hostent *)0 && h_errno == HOST_NOT_FOUND, "a NULL name fails cleanly instead of faulting");
+    }
+
     print(failures == 0 ? "hello196: PASS\n" : "hello196: FAIL\n");
     print("hello196 done\n");
     return failures;

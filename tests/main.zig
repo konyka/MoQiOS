@@ -3515,6 +3515,29 @@ test "eth frame build writes header fields and reports total length" {
     try std.testing.expectEqual(eth.ETHERTYPE_IPV6, eth.parseEthertype(&buf));
 }
 
+test "dns query wait expires on TSC time or an iteration backstop, never on timer ticks alone" {
+    const dp = kt.dns_policy;
+    // Within a system call the timer interrupt does not run (SFMASK clears IF), so a tick-based deadline never
+    // expires; the wait is bounded by real time from the TSC, plus a hard cap on iterations in case it is unreadable.
+    try std.testing.expectEqual(@as(u64, 2_000_000_000), dp.QUERY_TIMEOUT_NS);
+    try std.testing.expect(!dp.waitExpired(1_000, 1_000, 0));
+    try std.testing.expect(!dp.waitExpired(1_000, 1_000 + dp.QUERY_TIMEOUT_NS - 1, 10));
+    try std.testing.expect(dp.waitExpired(1_000, 1_000 + dp.QUERY_TIMEOUT_NS, 10));
+    try std.testing.expect(dp.waitExpired(1_000, 1_000 + 3 * dp.QUERY_TIMEOUT_NS, 10));
+    // A clock that does not move (nanos() is 0 until the TSC is calibrated) is bounded by the iteration cap.
+    try std.testing.expect(!dp.waitExpired(0, 0, dp.MAX_POLL_ITERS - 1));
+    try std.testing.expect(dp.waitExpired(0, 0, dp.MAX_POLL_ITERS));
+    // The clock counter wrapping does not make the wait last forever or expire at once.
+    try std.testing.expect(!dp.waitExpired(std.math.maxInt(u64) - 5, 10, 0));
+    try std.testing.expect(dp.waitExpired(std.math.maxInt(u64) - 5, 10 + dp.QUERY_TIMEOUT_NS, 0));
+    // Wiring: neither wait loop in queryDns consults the tick counter any more.
+    const src = kt.dns_source;
+    const q = std.mem.indexOf(u8, src, "fn queryDns(") orelse return error.TestUnexpectedResult;
+    const body = src[q .. q + 5000];
+    try std.testing.expect(std.mem.indexOf(u8, body, "getTickCount") == null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, body, "dns_policy.waitExpired("));
+}
+
 test "tcp receiver accepts no more payload than the window it advertised" {
     const u = tcp_util;
     // room = window cap minus what is already buffered, saturating at 0

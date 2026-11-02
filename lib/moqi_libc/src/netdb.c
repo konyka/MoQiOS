@@ -108,3 +108,51 @@ long tcp_connect_host(const char *host, uint16_t port) {
     }
     return fd;
 }
+
+/* ---- gethostbyname ------------------------------------------------------------------------------------------ */
+
+int h_errno;
+
+#define HOSTENT_NAME_MAX 256
+
+static struct hostent hostent_result;
+static char hostent_name[HOSTENT_NAME_MAX];
+static char hostent_addr[4];
+static char *hostent_aliases[1];
+static char *hostent_addr_list[2];
+
+struct hostent *gethostbyname(const char *name) {
+    if (!name) {
+        h_errno = HOST_NOT_FOUND;
+        return (struct hostent *)0;
+    }
+    uint8_t addr[4];
+    if (!ipv4_from_text(name, addr)) {
+        long r = gethostbyname_ipv4(name, addr);
+        if (r < 0) {
+            /* A name that does not exist, is malformed, or is too long is a definitive "no such host"; a timeout
+             * or any other failure is worth retrying. */
+            h_errno = (r == -2 /* ENOENT */ || r == -22 /* EINVAL */ || r == -36 /* ENAMETOOLONG */)
+                          ? HOST_NOT_FOUND
+                          : TRY_AGAIN;
+            return (struct hostent *)0;
+        }
+    }
+    size_t n = 0;
+    while (name[n] && n + 1 < HOSTENT_NAME_MAX) {
+        hostent_name[n] = name[n];
+        n++;
+    }
+    hostent_name[n] = 0;
+    for (int i = 0; i < 4; i++) hostent_addr[i] = (char)addr[i];
+    hostent_aliases[0] = (char *)0;
+    hostent_addr_list[0] = hostent_addr;
+    hostent_addr_list[1] = (char *)0;
+    hostent_result.h_name = hostent_name;
+    hostent_result.h_aliases = hostent_aliases;
+    hostent_result.h_addrtype = AF_INET;
+    hostent_result.h_length = 4;
+    hostent_result.h_addr_list = hostent_addr_list;
+    h_errno = 0;
+    return &hostent_result;
+}

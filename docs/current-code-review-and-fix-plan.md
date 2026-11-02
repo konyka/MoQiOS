@@ -6211,3 +6211,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 目标上验证：`hello196` 多 6 项——用 `resolve_ipv4_sockaddr("127.0.0.1", 9197)` 的地址开一个回环监听器，`tcp_connect_host("localhost", 9197)` 返回已连接 socket，监听器 `accept4` 到这条连接；畸形名字是 `-22`；`NULL` 主机是 `-22`；连到没人监听的端口失败。
 - 验证结果：libc 宿主机测试全过，host 991/991（共 14 步），riscv64/aarch64 构建通过，hello196 在 QEMU 里全 PASS。**没有改内核**，所以没有重跑完整 smoke/stress。
 - 如实说明：①只做 IPv4 TCP，没有 `struct addrinfo`/`getaddrinfo`/IPv6/多地址回退；②重试界限固定为 20 次，没有可配置的超时；③"连到没人监听的端口"只断言失败（< 0），没有断言具体 errno，因为这个栈对不同路径返回的值我没有逐个对照真实 Linux。
+
+## libc 的 gethostbyname，以及它暴露的 DNS 永久卡死（根因：系统调用里 tick 不走）
+
+- 做的事：给 libc 加 glibc 兼容的 `struct hostent` / `h_errno` / `gethostbyname`（`include/netdb.h`、`src/netdb.c`）。先在宿主机用 glibc 取真实行为：`sizeof(struct hostent)` 32、偏移 0/8/16/20/24；`localhost` 的 `h_name` 是 `localhost`、一个地址、无别名；字面量不查询；`"bad name!"`、`"a..b"`、`"-x.com"`、400 字符名字、`"1.2.3.4.5"`、`"256.1.1.1"` 都是 `HOST_NOT_FOUND`；`NULL` 名字**在 glibc 里段错误**（子进程被信号 11 杀掉）；结果在静态存储里被后续调用复用。
+- TDD：host 测试先写（`struct hostent` 不完整类型，编译失败=红）；变异：错误码映射、成功时不清 `h_errno`、地址列表不以 NULL 结尾、`h_length` 写成 16，各被具名断言抓住。
+- 过程中自己的错误：①errno 映射里把 `ENAMETOOLONG` 写成 -34，实际 Linux 是 36（34 是 `ERANGE`），**最初的 host 测试也写成 -34，与实现一起错**，用目标上的内核实际返回值核对时才发现，改成 -36 并加了"-34 是 `TRY_AGAIN`"的反向断言；②启动目标验证时多次留着旧的后台循环，它们到期后杀掉了新的 QEMU，后来每次启动前都先查进程。
+- 冒出来的真实缺陷：`hello196` 里 `gethostbyname("no-such-host.invalid")` 在目标上**永久卡死**（5 分钟以上、没有 `[DNS] Query timeout` 日志）。加了前后两行临时标记打印确认卡在解析里。根因是 `dns.zig` 的等待循环按定时器节拍计时，但它们跑在系统调用里，`SFMASK` 清了 IF，定时器中断不在系统调用里执行，节拍计数不动，超时永远不到期（DHCP 早就为同一个原因加了迭代上限，DNS 没有）。没有可达 DNS 服务器、或解析一个不存在的名字时就会卡死；`hello195` 没覆盖到，因为它只测不依赖网络的部分。
+- 修复：`dns_policy` 增加 `QUERY_TIMEOUT_NS`（2 秒）、`MAX_POLL_ITERS`（5000 万，TSC 未校准时的后备）和纯函数 `waitExpired(start, now, iters)`；`queryDns` 的发送重试和等应答两个循环改用 `tsc.nanos()`。TDD：host 测试先因 `QUERY_TIMEOUT_NS` 不存在而编译失败，覆盖 2 秒边界、时钟不动时靠迭代上限、计数器回绕，以及源码断言 `queryDns` 里没有 `getTickCount` 且两个循环都走 `waitExpired`。
+- 目标上验证：`hello196` 全 PASS，未知名字的查询约 2 秒后返回，日志有 `[DNS] Query timeout for no-such-host.invalid`，`gethostbyname` 返回 `NULL`，`h_errno` 为 `HOST_NOT_FOUND` 或 `TRY_AGAIN`。完整 smoke/stress 的结果见本次提交说明。
+- 如实说明：①`gethostbyname` 不做大小写规范化，`1.2.3` 当名字解析（glibc 当地址）；②只做 IPv4 A 记录，没有 `getaddrinfo`/`struct addrinfo`/IPv6；③等待是忙等（最多 2 秒），系统调用期间不让出 CPU；④`hello196` 里“未知名字返回 NULL”这一项的 `h_errno` 允许 `HOST_NOT_FOUND` 或 `TRY_AGAIN` 两者之一，因为在 QEMU 用户网络下超时时给的是后者，而有可达服务器返回 NXDOMAIN 时会是前者，测试不依赖外部 DNS。

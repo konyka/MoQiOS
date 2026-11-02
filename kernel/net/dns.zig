@@ -11,12 +11,12 @@ const cpu = @import("../arch/arch.zig").cpu;
 const udp = @import("udp.zig");
 const netif = @import("netif.zig");
 const idt = @import("../arch/arch.zig").interrupts;
+const tsc = @import("../arch/arch.zig").tsc;
 const bo = @import("../lib/byte_order.zig");
 const dns_policy = @import("dns_policy.zig");
 
 const DNS_PORT: u16 = dns_policy.DNS_PORT;
 const DNS_CACHE_SIZE: u32 = 16;
-const DNS_QUERY_TIMEOUT: u64 = 200; // ticks (~2 seconds)
 
 // DNS record types
 const TYPE_A: u16 = 1;
@@ -131,9 +131,10 @@ fn queryDns(hostname: []const u8, dns_server: [4]u8) [4]u8 {
     // Send query. udp.sendTo does not wait: with no ARP entry for the server it only broadcasts an ARP request
     // and returns false, so the first attempt on a cold ARP cache always fails. Pump the NIC so the reply is
     // processed and try again until the query goes out or the deadline passes.
-    const send_start = idt.getTickCount();
+    const send_start = tsc.nanos();
+    var send_iters: u32 = 0;
     var sent = false;
-    while (!sent and idt.getTickCount() - send_start < DNS_QUERY_TIMEOUT) {
+    while (!sent and !dns_policy.waitExpired(send_start, tsc.nanos(), send_iters)) : (send_iters += 1) {
         sent = udp.sendTo(dns_server, DNS_PORT, 12345, &pkt, @intCast(offset));
         if (sent) break;
         pumpRx();
@@ -145,8 +146,9 @@ fn queryDns(hostname: []const u8, dns_server: [4]u8) [4]u8 {
     }
 
     // Wait for response
-    const start = idt.getTickCount();
-    while (idt.getTickCount() - start < DNS_QUERY_TIMEOUT) {
+    const start = tsc.nanos();
+    var wait_iters: u32 = 0;
+    while (!dns_policy.waitExpired(start, tsc.nanos(), wait_iters)) : (wait_iters += 1) {
         pumpRx(); // replies only reach the UDP queue when the NIC is polled
         var buf: [512]u8 = @splat(0);
         var src_ip: [4]u8 = .{ 0, 0, 0, 0 };

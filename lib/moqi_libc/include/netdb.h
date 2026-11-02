@@ -41,4 +41,31 @@ long resolve_ipv4_sockaddr(const char *host, uint16_t port, uint8_t out[16]);
  * socket that fails to connect is closed, never leaked. */
 long tcp_connect_host(const char *host, uint16_t port);
 
+/* ---- glibc-compatible gethostbyname() (IPv4 only) ----------------------------------------------------------- */
+
+#define AF_INET 2
+
+/* h_errno values (glibc numbering). */
+#define HOST_NOT_FOUND 1
+#define TRY_AGAIN      2
+#define NO_RECOVERY    3
+#define NO_DATA        4
+
+struct hostent {
+    char  *h_name;       /* the name asked for */
+    char **h_aliases;    /* NULL-terminated; always empty here */
+    int    h_addrtype;   /* AF_INET */
+    int    h_length;     /* 4 */
+    char **h_addr_list;  /* NULL-terminated; exactly one address */
+};
+#define h_addr h_addr_list[0]
+
+extern int h_errno;
+
+/* Look `name` up: a dotted-decimal literal, or a name through the kernel resolver. The result is in static
+ * storage that the next call overwrites (as in glibc), so it is not thread-safe. NULL on failure with h_errno set:
+ * HOST_NOT_FOUND for a name that does not exist or is malformed or a NULL name, TRY_AGAIN when the server did
+ * not answer or the lookup failed for another reason. h_errno is reset to 0 on success. */
+struct hostent *gethostbyname(const char *name);
+
 #endif /* MOQI_NETDB_H */

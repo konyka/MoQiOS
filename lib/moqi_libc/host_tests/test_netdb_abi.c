@@ -235,6 +235,67 @@ int main(void) {
     stub_connect_replies[0] = -111; /* ECONNREFUSED */
     assert(tcp_connect_host("10.1.2.3", 80) == -111);
     assert(stub_count(SYS_connect) == 21 && stub_count(SYS_close) == 1); /* 1 try + 20 retries */
+
+    /* gethostbyname(): a glibc-compatible struct hostent over the IPv4 resolver. Layout and results measured with
+     * glibc: 32 bytes, h_name 0, h_aliases 8, h_addrtype 16, h_length 20, h_addr_list 24. */
+    assert(sizeof(struct hostent) == 32);
+    assert(offsetof(struct hostent, h_name) == 0 && offsetof(struct hostent, h_aliases) == 8);
+    assert(offsetof(struct hostent, h_addrtype) == 16 && offsetof(struct hostent, h_length) == 20);
+    assert(offsetof(struct hostent, h_addr_list) == 24);
+    assert(AF_INET == 2 && HOST_NOT_FOUND == 1 && TRY_AGAIN == 2 && NO_RECOVERY == 3 && NO_DATA == 4);
+
+    /* A dotted-decimal literal: the name is the literal, one address, no aliases, no lookup. */
+    stub_reset();
+    moqi_test_last_nr = 0;
+    struct hostent *he = gethostbyname("1.2.3.4");
+    assert(he != (struct hostent *)0 && moqi_test_last_nr == 0);
+    assert(strcmp(he->h_name, "1.2.3.4") == 0 && he->h_addrtype == 2 && he->h_length == 4);
+    assert(he->h_aliases != (char **)0 && he->h_aliases[0] == (char *)0);
+    assert(he->h_addr_list[0] != (char *)0 && he->h_addr_list[1] == (char *)0);
+    assert((uint8_t)he->h_addr_list[0][0] == 1 && (uint8_t)he->h_addr_list[0][3] == 4);
+    assert(he->h_addr == he->h_addr_list[0]);
+    assert(h_errno == 0);
+
+    /* A name goes through dns_resolve; h_name is the name asked for. */
+    moqi_test_reply = 0;
+    moqi_test_fill[0] = 10; moqi_test_fill[1] = 0; moqi_test_fill[2] = 2; moqi_test_fill[3] = 2;
+    he = gethostbyname("gateway");
+    assert(he != (struct hostent *)0 && moqi_test_last_nr == 495);
+    assert(strcmp(he->h_name, "gateway") == 0 && (uint8_t)he->h_addr_list[0][0] == 10 && (uint8_t)he->h_addr_list[0][3] == 2);
+
+    /* The result lives in static storage, as in glibc: a second call reuses it. */
+    struct hostent *first = gethostbyname("1.2.3.4");
+    struct hostent *second = gethostbyname("5.6.7.8");
+    assert(first == second && (uint8_t)second->h_addr_list[0][0] == 5);
+
+    /* Failures return NULL and set h_errno. A name that does not exist, is malformed or is too long is
+     * HOST_NOT_FOUND (glibc measured: "bad name!", "a..b", a 399-character name all give HOST_NOT_FOUND); a
+     * timeout or any other failure is TRY_AGAIN. A NULL name makes glibc crash (SIGSEGV, measured); here it fails
+     * cleanly with HOST_NOT_FOUND instead of faulting. */
+    moqi_test_reply = -2;
+    h_errno = 0;
+    assert(gethostbyname("nope.invalid") == (struct hostent *)0 && h_errno == HOST_NOT_FOUND);
+    moqi_test_reply = -22;
+    h_errno = 0;
+    assert(gethostbyname("bad name!") == (struct hostent *)0 && h_errno == HOST_NOT_FOUND);
+    moqi_test_reply = -36; /* ENAMETOOLONG (Linux 36; -34 is ERANGE, which is a retry-worthy failure here) */
+    h_errno = 0;
+    assert(gethostbyname("x") == (struct hostent *)0 && h_errno == HOST_NOT_FOUND);
+    moqi_test_reply = -34; /* ERANGE is not a "no such host" answer */
+    h_errno = 0;
+    assert(gethostbyname("x") == (struct hostent *)0 && h_errno == TRY_AGAIN);
+    moqi_test_reply = -110; /* ETIMEDOUT: the server did not answer */
+    h_errno = 0;
+    assert(gethostbyname("slow.example") == (struct hostent *)0 && h_errno == TRY_AGAIN);
+    moqi_test_reply = -5; /* EIO */
+    h_errno = 0;
+    assert(gethostbyname("broken.example") == (struct hostent *)0 && h_errno == TRY_AGAIN);
+    moqi_test_reply = 0;
+    h_errno = 0;
+    assert(gethostbyname((const char *)0) == (struct hostent *)0 && h_errno == HOST_NOT_FOUND);
+    /* A failed call does not clobber the previous successful result's contents beyond reuse: success resets h_errno. */
+    h_errno = HOST_NOT_FOUND;
+    assert(gethostbyname("9.9.9.9") != (struct hostent *)0 && h_errno == 0);
     /* Round trip with the formatter. */
     for (int a = 0; a < 256; a += 51) {
         uint8_t in[4] = {(uint8_t)a, (uint8_t)(255 - a), (uint8_t)(a ^ 0x5A), (uint8_t)(a / 2)};
