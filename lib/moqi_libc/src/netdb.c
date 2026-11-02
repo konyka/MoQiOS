@@ -30,3 +30,29 @@ long ipv4_to_text(const uint8_t addr[4], char *buf, size_t buf_len) {
     buf[n] = 0;
     return (long)n;
 }
+
+int ipv4_from_text(const char *text, uint8_t out[4]) {
+    if (!text || !out) return 0;
+    uint8_t parsed[4];
+    for (int field = 0; field < 4; field++) {
+        if (text[0] < '0' || text[0] > '9') return 0;
+        unsigned value = 0;
+        int digits = 0;
+        int leading_zero = text[0] == '0';
+        while (*text >= '0' && *text <= '9') {
+            value = value * 10 + (unsigned)(*text - '0');
+            digits++;
+            if (digits > 3 || value > 255) return 0;
+            text++;
+        }
+        if (leading_zero && digits > 1) return 0;
+        parsed[field] = (uint8_t)value;
+        if (field < 3) {
+            if (*text != '.') return 0;
+            text++;
+        }
+    }
+    if (*text != 0) return 0;
+    for (int i = 0; i < 4; i++) out[i] = parsed[i];
+    return 1;
+}

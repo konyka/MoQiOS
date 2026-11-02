@@ -77,5 +77,37 @@ int main(void) {
     assert(ipv4_to_text(addr, edge, 12) == 11);
     assert(edge[11] == 0 && edge[10] == '9');
     assert(ipv4_to_text(addr, edge, 0) == -34);
+
+    /* Parsing helper: inet_pton(AF_INET) semantics, checked against glibc. Strict dotted decimal, exactly four
+     * fields, 0..255, no leading zeros, no whitespace, no trailing junk. 1 = parsed, 0 = not an address. */
+    static const struct { const char *text; int ok; uint8_t v[4]; } cases[] = {
+        {"1.2.3.4", 1, {1, 2, 3, 4}}, {"0.0.0.0", 1, {0, 0, 0, 0}}, {"255.255.255.255", 1, {255, 255, 255, 255}},
+        {"1.2.3.0", 1, {1, 2, 3, 0}}, {"1.2.3.255", 1, {1, 2, 3, 255}}, {"10.0.2.15", 1, {10, 0, 2, 15}},
+        {"256.1.1.1", 0, {0}}, {"1.2.3", 0, {0}}, {"1.2.3.4.5", 0, {0}}, {"01.2.3.4", 0, {0}},
+        {"1.2.3.04", 0, {0}}, {"1..2.3", 0, {0}}, {"1.2.3.", 0, {0}}, {"", 0, {0}}, {".1.2.3", 0, {0}},
+        {"1.2.3.4 ", 0, {0}}, {" 1.2.3.4", 0, {0}}, {"1.2.3.-4", 0, {0}}, {"a.b.c.d", 0, {0}},
+        {"0x1.2.3.4", 0, {0}}, {"1.2.3.4\n", 0, {0}}, {"00.0.0.0", 0, {0}}, {"0.0.0.00", 0, {0}},
+        {"1.2.3.1000", 0, {0}}, {"999.0.0.0", 0, {0}}, {"1.2.3.256", 0, {0}}, {"192.168.001.1", 0, {0}},
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint8_t got[4] = {0xAA, 0xAA, 0xAA, 0xAA};
+        int r = ipv4_from_text(cases[i].text, got);
+        assert(r == cases[i].ok);
+        if (cases[i].ok) {
+            assert(memcmp(got, cases[i].v, 4) == 0);
+        } else {
+            /* A failed parse leaves the output untouched. */
+            assert(got[0] == 0xAA && got[1] == 0xAA && got[2] == 0xAA && got[3] == 0xAA);
+        }
+    }
+    assert(ipv4_from_text((const char *)0, ip) == 0);
+    assert(ipv4_from_text("1.2.3.4", (uint8_t *)0) == 0);
+    /* Round trip with the formatter. */
+    for (int a = 0; a < 256; a += 51) {
+        uint8_t in[4] = {(uint8_t)a, (uint8_t)(255 - a), (uint8_t)(a ^ 0x5A), (uint8_t)(a / 2)};
+        uint8_t back[4];
+        assert(ipv4_to_text(in, text, sizeof(text)) > 0);
+        assert(ipv4_from_text(text, back) == 1 && memcmp(in, back, 4) == 0);
+    }
     return 0;
 }

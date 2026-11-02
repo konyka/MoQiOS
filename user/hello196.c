@@ -33,6 +33,11 @@ int main(int argc, char **argv, char **envp) {
     check(gethostbyname_ipv4((const char *)0, ip) == -22, "a NULL name is refused by the wrapper");
     check(gethostbyname_ipv4("localhost", (uint8_t *)0) == -22, "a NULL output is refused by the wrapper");
 
+    uint8_t parsed[4] = {0, 0, 0, 0};
+    check(ipv4_from_text("10.0.2.15", parsed) == 1 && parsed[0] == 10 && parsed[1] == 0 && parsed[2] == 2 && parsed[3] == 15,
+          "ipv4_from_text parses 10.0.2.15");
+    check(ipv4_from_text("10.0.2.015", parsed) == 0 && ipv4_from_text("10.0.2", parsed) == 0, "ipv4_from_text rejects leading zeros and short forms");
+
     print(failures == 0 ? "hello196: PASS\n" : "hello196: FAIL\n");
     print("hello196 done\n");
     return failures;

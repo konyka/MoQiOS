@@ -21,4 +21,9 @@ long gethostbyname_ipv4(const char *name, uint8_t out[4]);
  * (-34) when `buf` cannot hold the text plus its NUL, in which case `buf` is not written. */
 long ipv4_to_text(const uint8_t addr[4], char *buf, size_t buf_len);
 
+/* Parse "a.b.c.d" into 4 bytes (network order), with inet_pton(AF_INET) semantics: exactly four decimal fields of
+ * 0..255, no leading zeros, no whitespace, no trailing text. Returns 1 on success, 0 when `text` is not an IPv4
+ * address (NULL arguments included). `out` is written only on success. */
+int ipv4_from_text(const char *text, uint8_t out[4]);
+
 #endif /* MOQI_NETDB_H */

@@ -6139,3 +6139,10 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 怎么想到的：上一轮把 55 个文件里从未运行的内联测试接上后，我如实写过"它们是否有意义没有审查"。这一轮先做两个廉价的静态检查：没有零断言的测试、没有 `expect(true)`、没有 `expectEqual(x, x)` 式的自比较（都是 0 处）。然后写了一个一次性脚本：对每个文件，在第一个 `test` 之前的非测试代码里找第一处 `if/return/while` 比较运算符，翻转它（`>=`→`<`、`==`→`!=` 等），跑 `zig build test`，看套件是否失败，再还原。
 - 结果：53 个文件里有变异点，52 个被杀死；**1 个存活：`mm/clone_flags_policy.zig:20` 的 `pointerRequired`**。查全仓库，`pointerRequired` 没有任何调用者（kernel 和 tests 里都没有），是死代码，所以变异不可能改变行为。删除它（host 984/984，内核 `.text+.rodata+.data` 哈希前后相同）。另有 `proc/task_slot_lifetime.zig`、`ipc/sysv_shm_lifecycle_policy.zig` 两个文件脚本没找到符合模式的变异点，没有被覆盖。
 - 如实说明：①每个文件只变异了**一处**（第一个匹配的比较），不是全面变异测试；②"被杀死"只说明至少有一个测试依赖该行，不说明断言足够全面；③脚本是一次性的，没有入库；④没有改任何运行时行为。
+
+## libc 的 `ipv4_from_text`（`getaddrinfo`/`hostent` 方向的第一步）
+
+- 做的事：`gethostbyname_ipv4` 的反方向缺一个解析函数，调用方要把 `"10.0.2.15"` 变成 `sockaddr_in` 的字节只能自己写。新增 `ipv4_from_text`（`include/netdb.h`、`src/netdb.c`），语义对齐 `inet_pton(AF_INET)`。
+- TDD：先在宿主机用 gcc 的 `inet_pton` 取 27 个边界输入的真实结果（前导零 `01.2.3.4`、`1.2.3.04`、`192.168.001.1` 都拒绝；`256`、`1000`、三段/五段、空串、首尾空格、尾部换行、`0x1`、负号都拒绝；`0.0.0.0`、`255.255.255.255`、`1.2.3.0` 接受），写进 `test_netdb_abi.c`，在函数不存在时编译失败（红），实现后通过；`ipv4_to_text` 与它做了往返检查；`hello196` 在目标上多两项。
+- 变异：去掉前导零检查、去掉尾随文本检查，各自让 `test_netdb_abi` 的具名断言失败；已还原，`grep MUTATION` 为 0。
+- 如实说明：①只做 IPv4 点分十进制，不接受 `inet_aton` 的宽松形式（`127.1`、八进制、十六进制）——这与 `inet_pton` 一致；②没有做 `getaddrinfo`/`struct hostent`/IPv6，它们仍是候选；③这一步没有改内核。
