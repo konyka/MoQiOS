@@ -25,6 +25,15 @@
 #define SYS_brk         7
 #define SYS_mmap        8
 #define SYS_munmap      12
+#define SYS_mremap      25
+#define SYS_mprotect    164
+#define SYS_madvise     235
+#define SYS_mincore     251
+#define SYS_mlock       252
+#define SYS_munlock     253
+#define SYS_msync       254
+#define SYS_mlockall    271
+#define SYS_munlockall  272
 
 /* File I/O */
 #define SYS_write       1

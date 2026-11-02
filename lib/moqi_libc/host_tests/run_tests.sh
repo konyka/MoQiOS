@@ -41,6 +41,11 @@ $CC $CFLAGS -DMOQI_HOST_TEST_SYSCALL -c ../src/netdb.c -o "$OUT/netdb.o"
 $CC $CFLAGS -o "$OUT/test_netdb_abi" test_netdb_abi.c "$OUT/netdb.o"
 "$OUT/test_netdb_abi" || fail=1
 
+echo "== test_mman_abi =="
+$CC $CFLAGS -DMOQI_HOST_TEST_SYSCALL -c ../src/mman.c -o "$OUT/mman.o"
+$CC $CFLAGS -o "$OUT/test_mman_abi" test_mman_abi.c "$OUT/mman.o"
+"$OUT/test_mman_abi" || fail=1
+
 if [ "$fail" -eq 0 ]; then
     echo "ALL HOST TESTS PASS"
 else

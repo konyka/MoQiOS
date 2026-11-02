@@ -1663,6 +1663,13 @@ fn mremapRegion(cur: *task_mod.Task, old_addr: u64, old_pages: u64, new_pages: u
         bits &= bits - 1;
         const r = &cur.mmap_regions[i];
         if (r.base == old_addr and r.num_pages >= old_pages) {
+            // MREMAP_FIXED relocates the mapping whatever its new size (measured on Linux: same-size and shrinking
+            // moves keep the contents at new_addr and unmap the whole old range). The in-place shrink below would
+            // just return old_addr and leave the caller believing the mapping moved.
+            if ((mflags & MREMAP_FIXED) != 0 and new_pages <= old_pages) {
+                if (r.file_kind != 0) return -12; // ENOMEM: a file mapping cannot be moved (see the growth path)
+                return moveOrNoMem(cur, r, old_pages, new_pages, mflags, new_addr_hint);
+            }
             if (new_pages <= old_pages) {
                 // Shrink: unmap only the validated old range, not the whole
                 // tracked region — a tail beyond old_size stays mapped.

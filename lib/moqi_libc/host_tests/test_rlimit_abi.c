@@ -31,6 +31,9 @@ int main(void) {
     assert(RLIMIT_STACK == 3);
     assert(RLIMIT_FSIZE == 1);
     assert(RLIMIT_RSS == 5);
+    assert(RLIMIT_CPU == 0 && RLIMIT_MEMLOCK == 8 && RLIMIT_AS == 9 && RLIMIT_LOCKS == 10);
+    assert(RLIMIT_SIGPENDING == 11 && RLIMIT_MSGQUEUE == 12 && RLIMIT_NICE == 13);
+    assert(RLIMIT_RTPRIO == 14 && RLIMIT_RTTIME == 15);
     assert(RLIM_INFINITY == (rlim_t)~0ULL);
     return 0;
 }

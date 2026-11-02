@@ -2766,6 +2766,21 @@ test "mlockall and MAP_LOCKED are wired into mmap, brk, mremap and the syscall t
     try std.testing.expect(!kt.mm.Mm.futureLocking(null));
 }
 
+test "mremap(MREMAP_FIXED) moves the mapping even when it does not grow; the in-place shrink path must not swallow it" {
+    // Measured on Linux: same-size and shrinking MREMAP_FIXED both move the mapping to new_addr (contents kept, the
+    // whole old range unmapped). The in-place shrink block returns old_addr, so the FIXED case has to be routed to the
+    // move path before it.
+    const src = kt.mmap_mlock_source;
+    const fn_start = std.mem.indexOf(u8, src, "fn mremapRegion(") orelse return error.TestUnexpectedResult;
+    const route = std.mem.indexOfPos(u8, src, fn_start, "if ((mflags & MREMAP_FIXED) != 0 and new_pages <= old_pages) {") orelse return error.TestUnexpectedResult;
+    const shrink = std.mem.indexOfPos(u8, src, fn_start, "if (new_pages <= old_pages) {") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(route < shrink);
+    const body = src[route..shrink];
+    try std.testing.expect(std.mem.indexOf(u8, body, "moveOrNoMem(") != null);
+    // A file-backed region cannot be moved (it would be unshared), same refusal as the growing path.
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (r.file_kind != 0) return -12;") != null);
+}
+
 test "MAP_LOCKED is a real mmap flag now: it is accepted, and acted on rather than ignored" {
     try std.testing.expect(mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | mmap_policy.MAP_ANONYMOUS | mmap_policy.MAP_LOCKED));
     try std.testing.expectEqual(@as(u64, 0x2000), mmap_policy.MAP_LOCKED);
