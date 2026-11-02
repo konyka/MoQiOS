@@ -6137,7 +6137,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 ## 抽查 113 个刚接上的内联测试：自动变异（clone_flags_policy 死代码）
 
 - 怎么想到的：上一轮把 55 个文件里从未运行的内联测试接上后，我如实写过"它们是否有意义没有审查"。这一轮先做两个廉价的静态检查：没有零断言的测试、没有 `expect(true)`、没有 `expectEqual(x, x)` 式的自比较（都是 0 处）。然后写了一个一次性脚本：对每个文件，在第一个 `test` 之前的非测试代码里找第一处 `if/return/while` 比较运算符，翻转它（`>=`→`<`、`==`→`!=` 等），跑 `zig build test`，看套件是否失败，再还原。
-- 结果：53 个文件里有变异点，52 个被杀死；**1 个存活：`mm/clone_flags_policy.zig:20` 的 `pointerRequired`**。查全仓库，`pointerRequired` 没有任何调用者（kernel 和 tests 里都没有），是死代码，所以变异不可能改变行为。删除它（host 984/984，内核 `.text+.rodata+.data` 哈希前后相同）。另有 `proc/task_slot_lifetime.zig`、`ipc/sysv_shm_lifecycle_policy.zig` 两个文件脚本没找到符合模式的变异点，没有被覆盖。
+- 结果：53 个文件里有变异点，52 个被杀死；**1 个存活：`mm/clone_flags_policy.zig:20` 的 `pointerRequired`**。查全仓库，`pointerRequired` 没有任何调用者（kernel 和 tests 里都没有），是死代码，所以变异不可能改变行为。删除它（host 984/984，内核 `.text+.rodata+.data` 哈希前后相同）。另有 `proc/task_slot_lifetime.zig`、`ipc/sysv_shm_lifecycle_policy.zig` 两个文件脚本没找到符合模式的变异点；后来手工补做：把 `unmapOnExit` 的 `!` 去掉、把 `resetPreservingIncarnation` 恢复的 incarnation 加 1，各自让具名的内联测试失败（已还原）。同时发现 `sysv_shm_lifecycle_policy.detachAllowed` 在生产代码里没有调用者（只被测试引用，`tests/main.zig` 和内联测试都有），属于只有测试在用的模型，我没有删除它（删除会让这两处测试消失，且上一节已说明这类模型保留的理由）。
 - 如实说明：①每个文件只变异了**一处**（第一个匹配的比较），不是全面变异测试；②"被杀死"只说明至少有一个测试依赖该行，不说明断言足够全面；③脚本是一次性的，没有入库；④没有改任何运行时行为。
 
 ## libc 的 `ipv4_from_text`（`getaddrinfo`/`hostent` 方向的第一步）
