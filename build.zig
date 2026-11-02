@@ -410,6 +410,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_disk_fixture_tests.step);
     const run_mkramdisk_tests = b.addSystemCommand(&.{ "bash", "tools/tests/test_mkramdisk.sh" });
     test_step.dependOn(&run_mkramdisk_tests.step);
+    const run_smoke_keeps_log_tests = b.addSystemCommand(&.{ "bash", "tools/tests/test_qemu_smoke_keeps_failure_log.sh" });
+    test_step.dependOn(&run_smoke_keeps_log_tests.step);
     const run_observe_duration_tests = b.addSystemCommand(&.{ "python3", "tools/tests/test_observe_test_duration.py" });
     test_step.dependOn(&run_observe_duration_tests.step);
 }

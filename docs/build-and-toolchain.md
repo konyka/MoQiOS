@@ -82,6 +82,10 @@ canonical fixture check is mandatory. A non-empty `MOQI_DISK` bypasses manifest 
 and retains the existing regular-file requirement, so custom images are not rejected for
 having a different hash. The RISC-V, AArch64, and NVMe paths are unchanged.
 
+`tools/qemu_smoke.sh` keeps the serial log of a failing run at `MOQI_SMOKE_KEEP_FAIL_LOG` (default
+`/tmp/moqios-smoke-last-failure-smp<N>.log`); its work directory is still removed on exit, and a passing
+run keeps nothing.
+
 `MOQI_NIC` selects the x86 network card: `e1000` (default), `virtio` (virtio-net-pci only) or
 `both`. The default smoke run always uses e1000; `hello51` (the userspace-driver test) requires an
 e1000, so it fails by design under `MOQI_NIC=virtio`.

@@ -106,7 +106,21 @@ MOQI_USER_BIN_DIR="$SMOKE_USER_BIN_DIR" \
 ./tools/qemu_run.sh >"$RUN_LOG" 2>&1 &
 QEMU_PID=$!
 
+# A failing run prints "Serial log: <path>", but the work directory holding it is removed on exit, so an
+# intermittent failure used to leave nothing to look at. Copy the log out first. MOQI_SMOKE_KEEP_FAIL_LOG names the
+# destination (default /tmp/moqios-smoke-last-failure-smpN.log); a passing run keeps nothing.
+keep_failed_log() {
+    local status="$1"
+    [ "$status" -ne 0 ] || return 0
+    [ -f "$LOG_FILE" ] || return 0
+    local dest="${MOQI_SMOKE_KEEP_FAIL_LOG:-/tmp/moqios-smoke-last-failure-smp${SMP_COUNT}.log}"
+    cp -f "$LOG_FILE" "$dest" 2>/dev/null || return 0
+    echo "Failing serial log kept at: $dest" >&2
+}
+
 cleanup() {
+    local status=$?
+    keep_failed_log "$status"
     if kill -0 "$QEMU_PID" 2>/dev/null; then
         kill "$QEMU_PID" 2>/dev/null || true
         for _ in 1 2 3 4 5; do

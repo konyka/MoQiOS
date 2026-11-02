@@ -6195,3 +6195,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 没拿到数值：smoke 脚本在失败后清掉了串口日志，所以 `hello176` 里为此加的三行诊断（小睡总数、最大单次小睡被计入多少、超过 5 ms 的次数）这次没有被看到。
 - 复现尝试：临时让 init 连续跑 60 次 `hello176`（SMP=8），**60 次全部通过、0 次失败**；D 项被计入 4～9 ms（中位数 5 ms），A 项 1 ms，B 项 4～5 ms，C 项 22～25 ms。这与上一轮 61 次（4～6 ms）的结果一致。两轮合计 121 次无失败，而完整 smoke 里 SMP=8 的运行已累计失败 3 次，说明触发它需要完整 smoke 里的某种背景负载，而不是单独反复跑这个探针。
 - 处理：没有改内核，没有改 `hello176`。**这是已知未解决的偶发问题（现已 3 个样本）**。下一步最有用的做法是让 smoke 脚本在失败时保留串口日志（现在会被清掉），这样下一次失败就能看到那三行数值：见下一条。
+
+## smoke 失败时保留串口日志（tools/qemu_smoke.sh）
+
+- 怎么想到的：连续几轮的偶发失败（`hello174`、`hello176`）里，失败的 smoke 都会打印 `Serial log: /tmp/moqios-smoke-smp8-XXXX/serial.log`，但脚本退出时的 cleanup 陷阱把整个工作目录删了，指向的文件已经不存在。所以 `hello176` 为排查加的三行诊断数值虽然被打印了，我却看不到。这是工具问题，不是内核问题。
+- TDD：`tools/tests/test_qemu_smoke_keeps_failure_log.sh` 先写（脚本里没有 `keep_failed_log`，3 项失败=红），检查：①有保留钩子；②`cleanup()` 调用它；③行为——失败状态把串口日志拷到目标路径，通过状态什么也不保留，日志不存在时不报错。已接入 `zig build test`。
+- 实现：`keep_failed_log <status>`：状态非 0 且日志存在时，拷贝到 `MOQI_SMOKE_KEEP_FAIL_LOG`（默认 `/tmp/moqios-smoke-last-failure-smp<N>.log`），并在 stderr 打印 `Failing serial log kept at: ...`；`cleanup()` 用 `$?` 调它，再做原来的清理。
+- 验证：新脚本 5 项通过；`zig build test` 991/991 且多了这个脚本（14/14 步）；用真实脚本和一个 8 秒的超时强制一次失败，确认日志被保留在 `/tmp/moqios-smoke-last-failure-smp1.log`；通过路径只靠单元测试（状态 0 不保留）和代码里的 `|| return 0`，没有另外跑一次完整的 10 分钟通过 smoke。
+- 如实说明：①默认路径是固定文件名，同一核数的下一次失败会覆盖上一次；②`MOQI_SMOKE_WORK_DIR` 由调用方给定时目录本来就保留，这个钩子仍会多拷一份，无害；③这只是为了让**下一次**偶发失败能被看清，没有解决 `hello176`。
