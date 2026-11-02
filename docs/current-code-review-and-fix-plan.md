@@ -6170,3 +6170,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：`mm/mlock_policy.zig`（纯逻辑：最多 16 段的页区间表，`lock` 合并相邻/重叠段，`release` 截断或切分，`releaseLossy`/`moved` 给不能失败的内部路径用，`mayAttempt`/`fitsLimit` 是 Linux 的限额规则）、`mm/mlock.zig`（三个系统调用）、`Mm.locks`（与 `seals` 并列，`vm_lock` 保护）。接线：`swap.zig` 的回收扫描跳过锁定页（持有同一把 `vm_lock`）；`madvise` 的 DONTNEED/FREE 对锁定范围 `EINVAL`；`munmap`、`MAP_FIXED` 的两条路径、`mremap` 缩小释放锁；`mremap` 移动把锁带到新地址（先算好新表，移动成功才提交）。`Mm` 仍在 1024 字节的 slab 档内（有测试固定）。
 - 验证：host 988/988（新增 6 个测试，更新 1 个原来断言 ENOSYS 源码文本的旧测试）；`hello198` 在 QEMU 里 PASS；`hello71` 里"mlock 返回 ENOSYS"的两项断言已按新行为改为成功，`mlockall` 仍断言 ENOSYS。
 - 如实说明：①`mlockall` 仍是 `ENOSYS`，原因是 `MCL_FUTURE` 需要每个映射路径都自动锁新页；②表只有 16 段，满了返回 `ENOMEM`，释放时若切分没有空槽则丢掉右半段（解锁方向，安全）；③匿名映射本来就是 eager 填充，所以没有"预取"，锁的实际效果只有"不被换出、不被 DONTNEED"；④没有做 `mlock2`（`MLOCK_ONFAULT`）；⑤`pmm` 的回收只处理 x86_64，没有改非 x86 的路径（它们没有 swap）。
+
+## mlock2（MLOCK_ONFAULT）
+
+- 做的事：上一节把 `mlock2` 列为未做。宿主机取了真实 Linux 的行为：flags 只接受 0 和 `MLOCK_ONFAULT`(1)，其余位（2、3、0x100、全 1）都是 `EINVAL`；flags 检查先于一切——长度 0、未映射范围、限额为 0 时，坏 flags 都是 `EINVAL`，而有效 flags 在限额为 0 时是 `EPERM`；其余与 `mlock` 相同，ONFAULT 锁定的页同样拒绝 `MADV_DONTNEED`。
+- 实现：MoQiOS 用自己的系统调用号（`mlock` 是 252），`mlock2` 用 496（原来空着，`moqi_syscalls.h` 加了 `SYS_mlock2`）；`mlock_policy.mlock2FlagsValid`；`mlock.zig:mlock2`（flags 当 `unsigned int` 截断后校验，再调 `mlock`）。
+- TDD：host 测试先因 `mlock2FlagsValid` 不存在而编译失败；`hello198` 加了 15 项（J 组），在没有 496 号调用的内核上全部 FAIL。变异：去掉 flags 检查，具名测试失败，已还原。
+- 如实说明：`MLOCK_ONFAULT` 与普通锁没有可观察差别（匿名内存 eager 填充）；没有用 Linux 的 325 号，因为这里 325 是 `dup`。
+- 门禁里的一次偶发失败（`mlock2` 这次提交）：SMP=8 三次中第 1 次出现 `hello174: FAIL C: and never more than ~16 KiB (SO_RCVBUF 16384)`，同一构建紧接着的第 2、3 次 SMP=8 通过，SMP=1、GPT 数据盘、SMP=2 的 5 连 stress 全部通过。这是 §6.65 记过的 `hello174` 偶发失败的第二个已记录样本（那次是另一条 C 组断言）。**原因仍未查清，不是已修复**：这次改动只碰 `mlock*.zig`、一个分发条目和一个 libc 常量，走不到 TCP 路径，所以我判断它不是这次改动引起的，但没有做基线对照来证明。另记一个流程教训：这轮的第一次 gate 因为我遗留了两个后台 `green3.sh` 循环而被杀掉 QEMU，重跑前要先确认没有残留进程。

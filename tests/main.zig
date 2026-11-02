@@ -2641,6 +2641,24 @@ test "mlock limit rules follow Linux: EPERM only when there is no limit and no p
     try std.testing.expect(!mp.fitsLimit(4095, false, 0, 1, 0));
 }
 
+test "mlock2 flags: only MLOCK_ONFAULT is accepted, and the flag check precedes every other check" {
+    const mp = mlock_policy;
+    try std.testing.expect(mp.mlock2FlagsValid(0));
+    try std.testing.expect(mp.mlock2FlagsValid(mp.MLOCK_ONFAULT));
+    try std.testing.expect(!mp.mlock2FlagsValid(2));
+    try std.testing.expect(!mp.mlock2FlagsValid(3));
+    try std.testing.expect(!mp.mlock2FlagsValid(0x100));
+    try std.testing.expect(!mp.mlock2FlagsValid(0xFFFF_FFFF));
+    try std.testing.expectEqual(@as(u32, 1), mp.MLOCK_ONFAULT);
+    // The syscall truncates the flags register to 32 bits like the kernel's unsigned int argument, then
+    // validates before touching the limit gate, the range, or the table.
+    const ml = kt.mlock_source;
+    const flags_check = std.mem.indexOf(u8, ml, "if (!policy.mlock2FlagsValid(@truncate(flags))) return -22;") orelse return error.TestUnexpectedResult;
+    const gate = std.mem.indexOfPos(u8, ml, flags_check, "if (!policy.mayAttempt(") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(flags_check < gate);
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "496 => { // mlock2(addr, len, flags)") != null);
+}
+
 test "lockSpan counts the page an unaligned zero-length range starts in, like Linux" {
     const rp = kt.range_policy;
     try std.testing.expectEqual(rp.Span.empty, rp.lockSpan(0x30000000, 0));

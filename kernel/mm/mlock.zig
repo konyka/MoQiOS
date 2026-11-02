@@ -20,6 +20,13 @@ fn memlockLimit(task: *const task_mod.Task) u64 {
     return task.recorded_limits.get(slot).cur;
 }
 
+/// mlock2(addr, len, flags) -> 0 or -errno. The flags (an unsigned int in the kernel's ABI, so only the low
+/// 32 bits of the register count) are validated first, then it is mlock.
+pub fn mlock2(addr: u64, len: u64, flags: u64) i64 {
+    if (!policy.mlock2FlagsValid(@truncate(flags))) return -22;
+    return mlock(addr, len);
+}
+
 /// mlock(addr, len) -> 0 or -errno. Linux order: privilege/limit gate (EPERM), the range (ENOMEM), then the
 /// per-address-space quota (ENOMEM). Nothing is recorded unless the whole request succeeds.
 pub fn mlock(addr: u64, len: u64) i64 {

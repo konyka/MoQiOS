@@ -2526,6 +2526,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(poll_mod.ppoll(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8));
             checkSignalsOnSyscallReturn(frame);
         },
+        496 => { // mlock2(addr, len, flags) — mlock with MLOCK_ONFAULT accepted
+            frame.rax = @bitCast(@import("../../mm/mlock.zig").mlock2(frame.rdi, frame.rsi, frame.rdx));
+        },
         495 => { // dns_resolve(name, out4) — hostname to IPv4 through the kernel resolver
             frame.rax = @bitCast(syscallDnsResolve(frame.rdi, frame.rsi));
         },

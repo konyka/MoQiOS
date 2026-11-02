@@ -1,6 +1,6 @@
 /// hello198: mlock / munlock / munlockall with RLIMIT_MEMLOCK, checked against real Linux (host gcc runs; every
 /// expected value below was measured there). Runs unprivileged (all capabilities dropped) so the limit applies.
-/// mlockall stays ENOSYS (MCL_FUTURE has no auto-lock hook in mmap yet); hello71 pins that.
+/// mlockall stays ENOSYS (MCL_FUTURE has no auto-lock hook in mmap yet); hello71 pins that. mlock2 is MoQiOS number 496.
 
 #include <stdint.h>
 
@@ -44,6 +44,7 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_MLOCKALL 271
 #define SYS_MUNLOCKALL 272
 #define SYS_CAPSET 307
+#define SYS_MLOCK2 496
 
 #define RLIMIT_MEMLOCK 8
 #define PG 4096ULL
@@ -155,6 +156,21 @@ void _start(void) {
     check(MLOCK(q + 2 * PG, PG) == 0, "G: freeing it made room");
     check(MUNLOCKALL() == 0, "G: munlockall");
 
+    /* ---- mlock2 (MoQiOS number 496; flags: only MLOCK_ONFAULT = 1, anything else EINVAL) ---- */
+    /* still at limit 2 (a process cannot raise its hard limit again); the quota checks below fit in 2 pages */
+    check(syscall3(SYS_MLOCK2, q, PG, 0) == 0, "J: mlock2 flags 0 locks like mlock");
+    check(syscall3(SYS_MLOCK2, q + PG, PG, 1) == 0, "J: MLOCK_ONFAULT is accepted (the second of the 2 allowed pages)");
+    check(syscall3(SYS_MLOCK2, q + 2 * PG, PG, 1) == ENOMEM_, "J: and ONFAULT is charged like any lock: a 3rd page is ENOMEM");
+    check(syscall3(SYS_MLOCK2, q, PG, 2) == EINVAL_, "J: an unknown flag is EINVAL");
+    check(syscall3(SYS_MLOCK2, q, PG, 3) == EINVAL_, "J: ONFAULT with an unknown flag is EINVAL");
+    check(syscall3(SYS_MLOCK2, q, PG, 0x100) == EINVAL_, "J: 0x100 is EINVAL");
+    check(syscall3(SYS_MLOCK2, q, PG, 0xFFFFFFFFu) == EINVAL_, "J: all bits is EINVAL");
+    check(syscall3(SYS_MLOCK2, q, 0, 0) == 0 && syscall3(SYS_MLOCK2, q, 0, 1) == 0, "J: length 0 with valid flags succeeds");
+    check(syscall3(SYS_MLOCK2, q, 0, 2) == EINVAL_, "J: length 0 with a bad flag is EINVAL (flags first)");
+    check(syscall3(SYS_MLOCK2, 0x30000000ULL, PG, 2) == EINVAL_, "J: flags are checked before the range");
+    check(syscall3(SYS_MLOCK2, 0x30000000ULL, PG, 0) == ENOMEM_, "J: an unmapped range is ENOMEM");
+    check(MADV(q, PG, 4) == EINVAL_, "J: an mlock2-locked page refuses MADV_DONTNEED");
+    check(MUNLOCKALL() == 0, "J: munlockall");
     /* ---- limit 0: no privilege, no locking ---- */
     LIMIT(0);
     check(MLOCK(q, 0) == EPERM_, "H: mlock with a zero limit is EPERM even for length 0");
@@ -164,6 +180,10 @@ void _start(void) {
     check(MUNLOCK(0x30000000ULL, PG) == ENOMEM_, "H: munlock of an unmapped range is ENOMEM");
     check(MUNLOCKALL() == 0, "H: munlockall");
     check(syscall1(SYS_MLOCKALL, 1) == ENOSYS_, "I: mlockall is still not implemented (ENOSYS; real Linux says EPERM at limit 0)");
+
+    check(syscall3(SYS_MLOCK2, q, PG, 0) == EPERM_ && syscall3(SYS_MLOCK2, q, PG, 1) == EPERM_, "J: a zero limit is EPERM for valid flags");
+    check(syscall3(SYS_MLOCK2, q, PG, 2) == EINVAL_, "J: but a bad flag is EINVAL even at limit 0");
+    check(syscall3(SYS_MLOCK2, q, 0, 2) == EINVAL_, "J: and for length 0");
 
     print(failures == 0 ? "hello198: PASS\n" : "hello198: FAIL\n");
     syscall1(SYS_EXIT, failures ? 1 : 0);

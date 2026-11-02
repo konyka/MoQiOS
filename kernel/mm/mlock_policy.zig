@@ -166,6 +166,15 @@ pub const Table = struct {
     }
 };
 
+/// mlock2's only flag: lock when the page is first touched instead of now. Anonymous memory here is populated
+/// eagerly, so the pages are already resident and the flag changes nothing observable besides being accepted.
+pub const MLOCK_ONFAULT: u32 = 1;
+
+/// mlock2 accepts MLOCK_ONFAULT or nothing; any other bit is EINVAL, checked before anything else.
+pub fn mlock2FlagsValid(flags: u32) bool {
+    return flags & ~MLOCK_ONFAULT == 0;
+}
+
 /// Linux can_do_mlock(): the call is allowed at all when the task holds CAP_IPC_LOCK or RLIMIT_MEMLOCK is not zero.
 /// Otherwise it fails with EPERM before anything else is looked at (even for a zero length).
 pub fn mayAttempt(limit_bytes: u64, cap_ipc_lock: bool) bool {

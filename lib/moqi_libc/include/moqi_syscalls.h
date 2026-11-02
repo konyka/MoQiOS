@@ -97,6 +97,7 @@ static inline long syscall3(long n, long a1, long a2, long a3) {
 #define SYS_moqipc_grant_cap 311
 #define SYS_moqipc_grant_cap_to 486
 #define SYS_dns_resolve 495
+#define SYS_mlock2 496
 
 static inline long moqi_ipc_create_ep(void) { return syscall0(SYS_moqipc_create_ep); }
 static inline long moqi_ipc_destroy_ep(unsigned endpoint) { return syscall1(SYS_moqipc_destroy_ep, endpoint); }
