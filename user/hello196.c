@@ -53,6 +53,28 @@ int main(int argc, char **argv, char **envp) {
     check(htons(8080) == 0x901F && ntohs(0x901F) == 8080 && htonl(0x0A000202u) == 0x0202000Au && ntohl(0x0202000Au) == 0x0A000202u,
           "htons/ntohs/htonl/ntohl swap bytes on the target");
 
+    /* tcp_connect_host(): resolve + socket + connect against a loopback listener this test opens itself. */
+    {
+        uint8_t la[16];
+        resolve_ipv4_sockaddr("127.0.0.1", 9197, la);
+        long ls = syscall3(SYS_socket, 2, 1, 0);
+        check(ls >= 0 && syscall3(SYS_bind, ls, (long)la, 16) == 0 && syscall3(SYS_listen, ls, 4, 0) == 0,
+              "a loopback listener opens on 127.0.0.1:9197");
+        long cs = tcp_connect_host("localhost", 9197);
+        check(cs >= 0, "tcp_connect_host(\"localhost\", 9197) returns a connected socket");
+        long peer = -1;
+        for (int i = 0; i < 20 && peer < 0; i++) { syscall1(SYS_netpoll, 0); peer = syscall4(SYS_accept4, ls, 0, 0, 0); }
+        check(peer >= 0, "the listener accepts that connection");
+        if (cs >= 0) syscall1(SYS_close, cs);
+        if (peer >= 0) syscall1(SYS_close, peer);
+        long bad = tcp_connect_host("bad name!", 9197);
+        check(bad == -22, "tcp_connect_host with a malformed name is EINVAL and opens no socket");
+        check(tcp_connect_host((const char *)0, 80) == -22, "a NULL host is EINVAL");
+        long refused = tcp_connect_host("127.0.0.1", 9198);
+        check(refused < 0, "connecting to a port nobody listens on fails");
+        if (ls >= 0) syscall1(SYS_close, ls);
+    }
+
     print(failures == 0 ? "hello196: PASS\n" : "hello196: FAIL\n");
     print("hello196 done\n");
     return failures;

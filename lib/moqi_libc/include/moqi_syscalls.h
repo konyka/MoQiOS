@@ -96,6 +96,12 @@ static inline long syscall3(long n, long a1, long a2, long a3) {
 #define SYS_moqipc_get_notify 304
 #define SYS_moqipc_grant_cap 311
 #define SYS_moqipc_grant_cap_to 486
+#define SYS_socket      117
+#define SYS_bind        118
+#define SYS_listen      119
+#define SYS_connect     124
+#define SYS_accept4     131
+#define SYS_netpoll     104
 #define SYS_dns_resolve 495
 #define SYS_mlock2 496
 

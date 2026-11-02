@@ -35,4 +35,10 @@ void ipv4_sockaddr(const uint8_t addr[4], uint16_t port, uint8_t out[16]);
  * failure; -EINVAL (-22) for a NULL argument. `out` is written only on success. */
 long resolve_ipv4_sockaddr(const char *host, uint16_t port, uint8_t out[16]);
 
+/* Resolve `host`, open a TCP socket and connect it to host:port. Returns the connected socket descriptor (>= 0),
+ * or -errno: the resolver's error for a bad or unknown name, -EINVAL for a NULL host, or the socket()/connect()
+ * error. A connect that is still in progress is polled for a short while (the stack is driven by netpoll); a
+ * socket that fails to connect is closed, never leaked. */
+long tcp_connect_host(const char *host, uint16_t port);
+
 #endif /* MOQI_NETDB_H */

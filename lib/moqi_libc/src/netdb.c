@@ -78,3 +78,33 @@ long resolve_ipv4_sockaddr(const char *host, uint16_t port, uint8_t out[16]) {
     ipv4_sockaddr(addr, port, out);
     return 0;
 }
+
+/* The socket syscalls only exist on the target; the host unit test links a recording stub instead. */
+#ifdef MOQI_HOST_TEST_SYSCALL
+extern long moqi_test_syscall3(long nr, long a1, long a2, long a3);
+#define NETDB_SYSCALL3(nr, a1, a2, a3) moqi_test_syscall3((nr), (a1), (a2), (a3))
+#define NETDB_SYSCALL1(nr, a1) moqi_test_syscall3((nr), (a1), 0, 0)
+#else
+#define NETDB_SYSCALL3(nr, a1, a2, a3) syscall3((nr), (a1), (a2), (a3))
+#define NETDB_SYSCALL1(nr, a1) syscall1((nr), (a1))
+#endif
+
+long tcp_connect_host(const char *host, uint16_t port) {
+    uint8_t sa[16];
+    long r = resolve_ipv4_sockaddr(host, port, sa);
+    if (r < 0) return r;
+    long fd = NETDB_SYSCALL3(SYS_socket, 2 /* AF_INET */, 1 /* SOCK_STREAM */, 0);
+    if (fd < 0) return fd;
+    long c = NETDB_SYSCALL3(SYS_connect, fd, (long)sa, 16);
+    /* The stack is driven by netpoll: a connect that has not completed yet (EINPROGRESS or any early error) is
+     * retried a bounded number of times, and EISCONN means the earlier attempt finished. */
+    for (int i = 0; i < 20 && c < 0 && c != -106 /* EISCONN */; i++) {
+        NETDB_SYSCALL1(SYS_netpoll, 0);
+        c = NETDB_SYSCALL3(SYS_connect, fd, (long)sa, 16);
+    }
+    if (c < 0 && c != -106) {
+        NETDB_SYSCALL1(SYS_close, fd);
+        return c;
+    }
+    return fd;
+}

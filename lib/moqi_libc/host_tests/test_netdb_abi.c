@@ -25,6 +25,38 @@ long moqi_test_syscall2(long nr, long a1, long a2) {
     return moqi_test_reply;
 }
 
+/* Scripted socket layer for tcp_connect_host(): records every call number in order and answers per call number. */
+#define STUB_LOG_MAX 64
+long stub_log[STUB_LOG_MAX];
+int stub_log_n;
+long stub_socket_reply = 7;      /* the fd socket() returns (or a -errno) */
+long stub_connect_replies[8];    /* successive connect() results; the last one repeats */
+int stub_connect_n, stub_connect_calls;
+long stub_last_connect_addr[2];
+
+long moqi_test_syscall3(long nr, long a1, long a2, long a3) {
+    (void)a3;
+    if (stub_log_n < STUB_LOG_MAX) stub_log[stub_log_n++] = nr;
+    if (nr == SYS_socket) return stub_socket_reply;
+    if (nr == SYS_connect) {
+        stub_last_connect_addr[0] = a1;
+        stub_last_connect_addr[1] = a2;
+        int k = stub_connect_calls < stub_connect_n ? stub_connect_calls : stub_connect_n - 1;
+        stub_connect_calls++;
+        return stub_connect_replies[k];
+    }
+    return 0;
+}
+
+static int stub_count(long nr) {
+    int n = 0;
+    for (int i = 0; i < stub_log_n; i++) if (stub_log[i] == nr) n++;
+    return n;
+}
+static void stub_reset(void) {
+    stub_log_n = 0; stub_connect_calls = 0; stub_connect_n = 1; stub_connect_replies[0] = 0; stub_socket_reply = 7;
+}
+
 int main(void) {
     /* The number is the kernel's. */
     assert(SYS_dns_resolve == 495);
@@ -149,6 +181,60 @@ int main(void) {
     assert(sa[0] == 0xEE);
     assert(resolve_ipv4_sockaddr((const char *)0, 80, sa) == -22);
     assert(resolve_ipv4_sockaddr("localhost", 80, (uint8_t *)0) == -22);
+
+    /* tcp_connect_host(): resolves, opens a stream socket, connects, and returns the descriptor. */
+    stub_reset();
+    moqi_test_last_nr = 0;
+    assert(tcp_connect_host("10.1.2.3", 8080) == 7);
+    assert(stub_count(SYS_socket) == 1 && stub_count(SYS_connect) == 1);
+    assert(stub_count(SYS_dns_resolve) == 0 && moqi_test_last_nr == 0); /* a literal never reaches the resolver */
+    assert(stub_count(SYS_close) == 0);
+
+    /* A name goes through dns_resolve first (the 2-argument stub), then the socket calls. */
+    stub_reset();
+    moqi_test_reply = 0;
+    moqi_test_fill[0] = 1; moqi_test_fill[1] = 2; moqi_test_fill[2] = 3; moqi_test_fill[3] = 4;
+    assert(tcp_connect_host("example.com", 80) == 7);
+    assert(moqi_test_last_nr == 495 && stub_count(SYS_socket) == 1 && stub_count(SYS_connect) == 1);
+
+    /* A failed lookup stops before any socket exists. */
+    stub_reset();
+    moqi_test_reply = -2;
+    assert(tcp_connect_host("nope.invalid", 80) == -2);
+    assert(stub_count(SYS_socket) == 0 && stub_count(SYS_connect) == 0);
+    moqi_test_reply = 0;
+
+    /* NULL host is EINVAL without touching the socket layer. */
+    stub_reset();
+    assert(tcp_connect_host((const char *)0, 80) == -22);
+    assert(stub_log_n == 0);
+
+    /* socket() failing is returned as is, and nothing is connected or closed. */
+    stub_reset();
+    stub_socket_reply = -24; /* EMFILE */
+    assert(tcp_connect_host("10.1.2.3", 80) == -24);
+    assert(stub_count(SYS_connect) == 0 && stub_count(SYS_close) == 0);
+
+    /* An in-progress connect is retried (with a netpoll between tries) until it succeeds. */
+    stub_reset();
+    stub_connect_n = 3;
+    stub_connect_replies[0] = -115; stub_connect_replies[1] = -115; stub_connect_replies[2] = 0;
+    assert(tcp_connect_host("10.1.2.3", 80) == 7);
+    assert(stub_count(SYS_connect) == 3 && stub_count(SYS_netpoll) == 2 && stub_count(SYS_close) == 0);
+
+    /* EISCONN on a retry means the earlier attempt completed. */
+    stub_reset();
+    stub_connect_n = 2;
+    stub_connect_replies[0] = -115; stub_connect_replies[1] = -106;
+    assert(tcp_connect_host("10.1.2.3", 80) == 7);
+    assert(stub_count(SYS_close) == 0);
+
+    /* A connect that never succeeds is bounded, reports the error, and closes the socket (no leak). */
+    stub_reset();
+    stub_connect_n = 1;
+    stub_connect_replies[0] = -111; /* ECONNREFUSED */
+    assert(tcp_connect_host("10.1.2.3", 80) == -111);
+    assert(stub_count(SYS_connect) == 21 && stub_count(SYS_close) == 1); /* 1 try + 20 retries */
     /* Round trip with the formatter. */
     for (int a = 0; a < 256; a += 51) {
         uint8_t in[4] = {(uint8_t)a, (uint8_t)(255 - a), (uint8_t)(a ^ 0x5A), (uint8_t)(a / 2)};

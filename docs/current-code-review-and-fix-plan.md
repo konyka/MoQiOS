@@ -6203,3 +6203,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：`keep_failed_log <status>`：状态非 0 且日志存在时，拷贝到 `MOQI_SMOKE_KEEP_FAIL_LOG`（默认 `/tmp/moqios-smoke-last-failure-smp<N>.log`），并在 stderr 打印 `Failing serial log kept at: ...`；`cleanup()` 用 `$?` 调它，再做原来的清理。
 - 验证：新脚本 5 项通过；`zig build test` 991/991 且多了这个脚本（14/14 步）；用真实脚本和一个 8 秒的超时强制一次失败，确认日志被保留在 `/tmp/moqios-smoke-last-failure-smp1.log`；通过路径只靠单元测试（状态 0 不保留）和代码里的 `|| return 0`，没有另外跑一次完整的 10 分钟通过 smoke。
 - 如实说明：①默认路径是固定文件名，同一核数的下一次失败会覆盖上一次；②`MOQI_SMOKE_WORK_DIR` 由调用方给定时目录本来就保留，这个钩子仍会多拷一份，无害；③这只是为了让**下一次**偶发失败能被看清，没有解决 `hello176`。
+
+## libc 的 `tcp_connect_host`（getaddrinfo 方向的第三步）
+
+- 做的事：有了名字解析和 `sockaddr_in` 之后，调用方连一个 `host:port` 仍要自己写 socket + connect + 重试 + 失败关闭。新增 `tcp_connect_host(host, port)`（`include/netdb.h`、`src/netdb.c`），并把 `socket/bind/listen/connect/accept4/netpoll` 的 MoQiOS 系统调用号加进 `moqi_syscalls.h`（117/118/119/124/131/104；netpoll 我第一版猜成 113，查了用户程序才改成 104）。
+- TDD：宿主机测试先写——`tcp_connect_host` 未声明所以先编译失败；用 `moqi_test_syscall3` 脚本化 socket 层，覆盖字面量不进解析器、名字先走 `dns_resolve`、解析失败不创建 socket、`NULL` 主机 `EINVAL` 且不碰 socket 层、`socket()` 失败原样返回且不 connect 不 close、`EINPROGRESS` 重试且每次之间 netpoll、重试中遇到 `EISCONN` 视为成功、持续失败有界（1 次 + 20 次重试）并且关闭 socket。变异：去掉失败时的 close、把重试界限从 20 改 5、让 `EISCONN` 不被特殊处理，三者各让具名断言失败；已还原，无残留标记。
+- 目标上验证：`hello196` 多 6 项——用 `resolve_ipv4_sockaddr("127.0.0.1", 9197)` 的地址开一个回环监听器，`tcp_connect_host("localhost", 9197)` 返回已连接 socket，监听器 `accept4` 到这条连接；畸形名字是 `-22`；`NULL` 主机是 `-22`；连到没人监听的端口失败。
+- 验证结果：libc 宿主机测试全过，host 991/991（共 14 步），riscv64/aarch64 构建通过，hello196 在 QEMU 里全 PASS。**没有改内核**，所以没有重跑完整 smoke/stress。
+- 如实说明：①只做 IPv4 TCP，没有 `struct addrinfo`/`getaddrinfo`/IPv6/多地址回退；②重试界限固定为 20 次，没有可配置的超时；③"连到没人监听的端口"只断言失败（< 0），没有断言具体 errno，因为这个栈对不同路径返回的值我没有逐个对照真实 Linux。
