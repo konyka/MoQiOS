@@ -6067,3 +6067,21 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 变异（具名测试核对）：`MAX_NAME`/`MAX_LABEL` 各加一、空名字改判 `invalid`、结尾点的判断被破坏、"只有一个点"的判断、整名长度检查被删、空标签检查失效、连字符开头/结尾检查失效、字符集少一类/多一个字符、`stripTrailingDot` 的边界、`syscallDnsResolve` 的输出指针检查被删、四个错误码各被换成别的、`stripTrailingDot` 没被使用、输出没写、系统调用号错位，共 24 个。第一轮有 3 个存活：①结尾处"必须在标签内结束"的检查（`label_len == 0`）在中间的点的分支里也有一份（我最初把这行误缩进了循环里的点分支，等于写了两遍，其中一份是死代码），补了 `a.-b.c`、`a-.b.c`、`a-` 三个用例并把重复的那行改回"连字符不能结尾"；②`MAX_NAME + 1` 的第一道长度检查：它被后面"去掉一个点后 `s.len > MAX_NAME`"完全覆盖，我对长度 0–300、带和不带结尾点两种情况穷举比较了两种写法，**没有任何输入使结果不同**，所以这个存活的变异是等价变异，我把这道冗余检查删除而不是为它写一个不可能失败的测试。③`label_len == 0 or prev == '-'` 中 `prev == '-'` 的一半，补用例后抓住。1 个因上下文不匹配（我自己改过那行）被跳过，用最终代码重写后抓住；恢复后 `grep -c MUTATION` 为 0。
 - 验证：host 864/864；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello195 PASS、0 个 FAIL、0 次 panic；stress（SMP=2）5/5 PASS。关于 `dns_resolve` 本身，host 测试里的变异检查和上面的冒烟是自动化的；冷 ARP 缓存下的重试修复只有那次手工探针验证（见上）。
+
+### 孤立模块的系统性核对：两个死文件已删，14 个"只被 host 测试引用"的策略模块逐个分类（无内核行为改动）
+
+- 做法：hello195 之后，我用同样的思路机械地找"文档说有、实际没接上"的东西——遍历 `kernel/` 下每个 `.zig`，列出除 host 测试模块根以外没有任何文件引用的。得到 23 个文件，逐个核对。
+- **删除 2 个**：`arch/x86_64/user_mode.zig`（`jumpToUser`）已被 `sched.setupInitialFrame` 取代，全树无调用者；`arch/x86_64/vga.zig` 已被串口加帧缓冲控制台取代，`main.zig` 里写明 "VGA skipped (serial-only mode)"。两者只出现在第一个提交里，从未再被改动。`docs/build-and-toolchain.md` 里本来就把它们标为"疑似被取代、确认后可清理"，现在确认了。删除后三个架构构建和 host 测试（864/864）通过。这个改动没有跑 QEMU 冒烟：内核二进制的哈希在删除前后相同（见下面的验证），所以冒烟跑的就是同一个二进制。
+- **保留并如实标注**：`sync/rwlock.zig`、`sync/seqlock.zig`、`sync/ticket_spinlock.zig`（文档已说明"尚无树内使用者"，不是新发现）；`mm/rss_stats.zig`（只有 host 测试，`/proc/PID/rss` 实际用的是 `paging.residentUserPages`，自己做了同样的统计，没有引用这个纯模型）；`drivers/nvme_mailbox.zig`（有 `tests/nvme_mailbox_test.zig`，被设计成"纯状态转移以便穷举所有交错"，是否就是 NVMe 驱动里实际的邮箱逻辑我没有逐行核对）。
+- **14 个"只被 host 测试引用"的 `*_policy.zig`**：`ipc/` 下的 `capability_policy`、`capability_generation_policy`、`capability_lifecycle_policy`、`ipc_call_reply_policy`、`ipc_endpoint_policy`、`ipc_lifecycle_policy`、`ipc_timeout_policy`、`posix_mq_ownership_policy`、`sysv_shm_policy`，加上 `lib/deadline_timer_policy`、`net/epoll_lifecycle_policy`、`proc/task_lifetime_policy`、`proc/task_op_policy`、`proc/time_pointer_policy`。134 个策略模块里有 120 个被内核代码引用，这 14 个没有。它们的 host 测试验证的是**模型**，不是运行的代码——如果真实实现是另写了一份，那么这些测试通过并不说明内核正确。我对其中几个把模型和真实代码逐行对照了：
+  - `task_op_policy.select` 与 `task.zig:pinTaskMmByTid` **一致**（顺序：跳过僵尸 → 引用数溢出 → 无 mm；`MAX_OPERATION_REFS` 同为 1024）。
+  - `ipc_endpoint_policy.canDestroy` 与 `capability_policy.grantAllowed` 比真实实现**宽松**：真实的 `ipc.zig` 还检查 `owner_tid`（防止槽位复用后误认）和 `exiting`，模型只比较槽位索引。所以这两个测试通过，**不能**证明"槽位复用后不会误授权"——那一点只由真实代码保证。
+  - `capability_generation_policy.matches` 多了一个 `!= 0` 保护，真实的 `capability.zig:107` 没有；我读代码判断这个差异是否可达：端点代数在创建时 `+%= 1` 后若为 0 则改为 1，授予能力的两处调用（`ipc.zig:560`、`:576`）都取活动端点的代数，所以代数 0 的能力应当造不出来，两者行为应当一致。**这是读代码得出的推断，没有写测试或运行去验证。**
+  - `time_pointer_policy.invalidPointerErrno` 把 NULL 和 `>= limit` 都判为 `EFAULT`，与 `clock_gettime`（`time_syscall.zig:62`）一致，但与 `gettimeofday`（`:41`，只判 `>= limit`，NULL 被允许，这符合 Linux）**不一致**；模型适用于哪个调用没有说明。
+  - `ipc_timeout_policy` 描述的是"截止时间 + 唤醒结果"的接口，而真实的 `ipc.zig:timeoutTick` 是直接用 `IPC_TIMEOUT_TICKS` 常量扫描任务表，没有用这个接口；所以这个模型描述的是**另一种**机制。
+  - `deadline_timer_policy`：文档早就说明"未接 LAPIC"（见 `realtime-security-hardening-plan.md` 8.6），不是新发现；它也是唯一一个在 `tests/main.zig` 里完全没有引用的。
+  - 其余（`ipc_call_reply_policy`、`ipc_lifecycle_policy`、`capability_lifecycle_policy`、`posix_mq_ownership_policy`、`sysv_shm_policy`、`epoll_lifecycle_policy`、`task_lifetime_policy`）我只做了存在性检查和前两项的粗读，**没有逐行对照**，不对它们与真实代码是否一致作任何判断。
+- 没有做的事（刻意）：①没有删除这 14 个策略模块——删除会让它们的 host 测试消失，而这些测试记录了设计意图，且我无法证明它们是死的；②没有把真实实现改成调用它们——那是一次涉及 IPC/调度核心路径的重构，风险远大于收益，而且没有发现任何一处模型与实现的差异会造成错误行为；③没有给 `gettimeofday` 的 NULL 行为改动——它符合 Linux。
+- 这一轮的结论：**没有发现新的运行缺陷**；发现的是"测试通过但不能说明什么"的区域（见上面槽位复用那一条），这对以后读 host 测试的人是有用的信息，已写进文档。
+- 验证：三个架构构建通过；host 864/864；x86_64 内核 ELF 的 SHA-256 前 16 位在"有这两个文件"和"删掉这两个文件"两种状态下**完全相同**（`b25685c665368fa4`），所以删除没有改变内核二进制，这是测量，不是推断。因此没有重跑 QEMU 冒烟和 stress（它们跑的是同一个二进制）。
+

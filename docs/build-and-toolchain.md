@@ -466,7 +466,7 @@ no `duration_ms`. This P1 mode does not provide QEMU runtime samples.
 |---|---|---|
 | 同步原语 | `sync/rwlock.zig` `sync/seqlock.zig` `sync/ticket_spinlock.zig` | 多种锁实现（尚无树内使用者，2026-08 已修复其缺陷） |
 | 内存 | `mm/process_vm.zig` | x86_64 self-only process_vm_readv/writev（syscall #283/#284）；最多 4096 字节内核 staging，跨进程 mm 生命周期/refcount/COW 与非 x86 覆盖未实现 |
-| 其他 | `arch/x86_64/user_mode.zig` `arch/x86_64/vga.zig` | 疑似被现有实现取代的早期模块 |
+| 其他 | ~~`arch/x86_64/user_mode.zig` `arch/x86_64/vga.zig`~~ | 已确认被取代并删除（见下） |
 
 （`shared/sk5.zig` 与 `kernel/boot_info.zig` 经确认无引用，已于 2026-08 删除。另：
 `kernel/host_test.zig` 是 `zig build test` 的专用模块根，只被测试构建引用、刻意不进内核
@@ -477,7 +477,7 @@ no `duration_ms`. This P1 mode does not provide QEMU runtime samples.
 1. **不要直接删除**：这些是作者的在制功能（WIP），删除会丢失已完成工作。
 2. **按需逐个集成**：需要某个能力时，将对应文件 `@import` 进相关模块，`zig build` 修正类型
    不匹配，最后补一个 `hello*` 运行时测试。
-3. **`vga.zig` / `user_mode.zig`** 需先确认是否已被现有实现取代，若确认废弃可单独清理。
+3. ~~**`vga.zig` / `user_mode.zig`** 需先确认是否已被现有实现取代，若确认废弃可单独清理。~~ **已确认并删除**：`user_mode.zig`（`jumpToUser`，手工构造 `iretq` 帧）早已被 `sched.setupInitialFrame` 取代，后者为新用户任务直接构造 `iretq` 帧（`rip = user_entry`、`ss = 0x23`），全树没有任何调用者；`vga.zig`（VGA 文本模式输出）早已被串口加帧缓冲控制台取代，`main.zig` 明确写着"VGA skipped (serial-only mode)"，全树没有任何引用。两者都只在第一个提交（`43c50f3`）里出现过，之后从未被修改或使用。删除后三个架构的构建和 host 测试均通过。
 4. 在集成前，这些文件**不应**被视为"已支持的功能"——以"可达即编译"的 317 个文件为准。
 
 ---
