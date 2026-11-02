@@ -6221,3 +6221,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修复：`dns_policy` 增加 `QUERY_TIMEOUT_NS`（2 秒）、`MAX_POLL_ITERS`（5000 万，TSC 未校准时的后备）和纯函数 `waitExpired(start, now, iters)`；`queryDns` 的发送重试和等应答两个循环改用 `tsc.nanos()`。TDD：host 测试先因 `QUERY_TIMEOUT_NS` 不存在而编译失败，覆盖 2 秒边界、时钟不动时靠迭代上限、计数器回绕，以及源码断言 `queryDns` 里没有 `getTickCount` 且两个循环都走 `waitExpired`。
 - 目标上验证：`hello196` 全 PASS，未知名字的查询约 2 秒后返回，日志有 `[DNS] Query timeout for no-such-host.invalid`，`gethostbyname` 返回 `NULL`，`h_errno` 为 `HOST_NOT_FOUND` 或 `TRY_AGAIN`。完整 smoke/stress 的结果见本次提交说明。
 - 如实说明：①`gethostbyname` 不做大小写规范化，`1.2.3` 当名字解析（glibc 当地址）；②只做 IPv4 A 记录，没有 `getaddrinfo`/`struct addrinfo`/IPv6；③等待是忙等（最多 2 秒），系统调用期间不让出 CPU；④`hello196` 里“未知名字返回 NULL”这一项的 `h_errno` 允许 `HOST_NOT_FOUND` 或 `TRY_AGAIN` 两者之一，因为在 QEMU 用户网络下超时时给的是后者，而有可达服务器返回 NXDOMAIN 时会是前者，测试不依赖外部 DNS。
+
+## libc 的 getaddrinfo / freeaddrinfo / gai_strerror（IPv4）
+
+- 做的事：在 `gethostbyname`、`tcp_connect_host` 之后补上 `getaddrinfo` 家族（`include/netdb.h`、`src/netdb.c`）。先在宿主机用 glibc 取真实行为（`/tmp/gai*.c`）：`struct addrinfo` 48 字节，偏移 0/4/8/12/16/24/32/40（注意 `ai_addr` 在 24，不是 BSD 的顺序）；数字服务按 strtol 风格解析，65536 回绕成 0；无 socktype 时依次返回 STREAM/DGRAM/RAW 三项；`AI_CANONNAME` 必须有 node，canonname 只挂在首项；NULL hints 回显 flags=0x40。
+- TDD：host 测试先写，`struct addrinfo` 是不完整类型，编译失败=红。测试里带一个计数 bump 分配器，`main` 末尾断言 `live_allocs == 0` 查泄漏。变异：不释放 `ai_addr`、没 node 也给 canonname、超时映射成 `EAI_NONAME`、端口不回绕、DGRAM 排在 STREAM 前，都被具名断言抓住；"每个条目都带 canonname"这个变异最初没被抓到，补了"只有首项带 canonname"的断言后才被抓住。
+- 过程中自己的错误：①在 `-fno-builtin` 的测试里让 `malloc` 调 `__builtin_malloc`，结果无限递归，测试挂起，改成自带 bump 分配器；②第一次用 python 打补丁时锚点写错，没有应用就继续往下跑，后来靠 `grep` 发现。
+- 目标上验证：`hello196` 多 6 项——用 `getaddrinfo("127.0.0.1","9199")` 的 `ai_addr` 做 bind/listen；`getaddrinfo("localhost","9199")` 的条目 socket+connect，监听方 `accept4` 到连接；坏服务名是 `EAI_SERVICE`、node 与 service 都为空是 `EAI_NONAME`；`gai_strerror` 返回文本。全部 PASS。
+- 如实说明：①只做 IPv4；`AF_INET6` 返回 `EAI_FAMILY`，glibc 对 v4 名字会返回 -9；②`AI_V4MAPPED/ALL/ADDRCONFIG` 接受但忽略；③服务名表只有 11 项，不读 `/etc/services`；④不做大小写规范化，`1.2.3` 当名字解析；⑤没有 `getnameinfo`；⑥**没有改内核**，所以没有重跑完整 smoke/stress。

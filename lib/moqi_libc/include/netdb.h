@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 #include "moqi_syscalls.h"
 
@@ -67,5 +68,52 @@ extern int h_errno;
  * HOST_NOT_FOUND for a name that does not exist or is malformed or a NULL name, TRY_AGAIN when the server did
  * not answer or the lookup failed for another reason. h_errno is reset to 0 on success. */
 struct hostent *gethostbyname(const char *name);
+
+/* ---- getaddrinfo() (IPv4 only) ------------------------------------------------------------------------------ */
+
+#define AF_UNSPEC 0
+
+#define SOCK_STREAM 1
+#define SOCK_DGRAM  2
+#define SOCK_RAW    3
+
+#define IPPROTO_TCP 6
+#define IPPROTO_UDP 17
+
+#define AI_PASSIVE     0x0001
+#define AI_CANONNAME   0x0002
+#define AI_NUMERICHOST 0x0004
+#define AI_NUMERICSERV 0x0400
+
+#define EAI_BADFLAGS -1
+#define EAI_NONAME   -2
+#define EAI_AGAIN    -3
+#define EAI_FAIL     -4
+#define EAI_FAMILY   -6
+#define EAI_SOCKTYPE -7
+#define EAI_SERVICE  -8
+#define EAI_MEMORY   -10
+
+struct addrinfo {
+    int              ai_flags;
+    int              ai_family;
+    int              ai_socktype;
+    int              ai_protocol;
+    unsigned int     ai_addrlen;
+    uint8_t         *ai_addr;       /* a 16-byte sockaddr_in */
+    char            *ai_canonname;
+    struct addrinfo *ai_next;
+};
+
+/* Resolve `node` and `service` into a list of addresses for socket()/connect()/bind(). IPv4 only: AF_UNSPEC and
+ * AF_INET are served, anything else is EAI_FAMILY. Returns 0 and a list in *res (free it with freeaddrinfo), or
+ * an EAI_* code. glibc-compatible in the cases that were measured: see test_netdb_abi.c. */
+int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res);
+
+/* Release a list returned by getaddrinfo. NULL is a no-op. */
+void freeaddrinfo(struct addrinfo *res);
+
+/* Text for an EAI_* code (never NULL). */
+const char *gai_strerror(int code);
 
 #endif /* MOQI_NETDB_H */

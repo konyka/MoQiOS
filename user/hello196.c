@@ -91,6 +91,42 @@ int main(int argc, char **argv, char **envp) {
         check(h == (struct hostent *)0 && h_errno == HOST_NOT_FOUND, "a NULL name fails cleanly instead of faulting");
     }
 
+    {
+        /* getaddrinfo(): the standard resolve-then-connect pattern, end to end, against the loopback listener. */
+        struct addrinfo hints, *res = (struct addrinfo *)0;
+        for (unsigned i = 0; i < sizeof(hints); i++) ((char *)&hints)[i] = 0;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        int r = getaddrinfo("127.0.0.1", "9199", &hints, &res);
+        check(r == 0 && res != (struct addrinfo *)0 && res->ai_addrlen == 16 && res->ai_protocol == IPPROTO_TCP &&
+                  res->ai_next == (struct addrinfo *)0,
+              "getaddrinfo(\"127.0.0.1\", \"9199\") returns one TCP entry with a 16-byte address");
+        long gl = syscall3(SYS_socket, 2, 1, 0);
+        check(res && gl >= 0 && syscall3(SYS_bind, gl, (long)res->ai_addr, 16) == 0 && syscall3(SYS_listen, gl, 4, 0) == 0,
+              "its ai_addr is accepted by the kernel's bind/listen");
+        struct addrinfo *named = (struct addrinfo *)0;
+        r = getaddrinfo("localhost", "9199", &hints, &named);
+        long gc = (r == 0 && named) ? syscall3(SYS_socket, named->ai_family, named->ai_socktype, named->ai_protocol) : -1;
+        long cr = gc >= 0 ? syscall3(SYS_connect, gc, (long)named->ai_addr, named->ai_addrlen) : -1;
+        for (int i = 0; i < 20 && cr < 0 && cr != -106; i++) {
+            syscall1(SYS_netpoll, 0);
+            cr = syscall3(SYS_connect, gc, (long)named->ai_addr, named->ai_addrlen);
+        }
+        check(gc >= 0 && (cr == 0 || cr == -106), "connecting with an entry from getaddrinfo(\"localhost\") succeeds");
+        long gp = -1;
+        for (int i = 0; i < 20 && gp < 0; i++) { syscall1(SYS_netpoll, 0); gp = syscall4(SYS_accept4, gl, 0, 0, 0); }
+        check(gp >= 0, "the listener accepts that connection");
+        check(getaddrinfo("1.2.3.4", "nosuchsvc", &hints, &named) == EAI_SERVICE &&
+                  getaddrinfo((const char *)0, (const char *)0, &hints, &named) == EAI_NONAME,
+              "a bad service and a missing node/service give EAI_SERVICE and EAI_NONAME");
+        check(gai_strerror(EAI_NONAME)[0] == 'N', "gai_strerror returns text");
+        if (gp >= 0) syscall1(SYS_close, gp);
+        if (gc >= 0) syscall1(SYS_close, gc);
+        if (gl >= 0) syscall1(SYS_close, gl);
+        if (res) freeaddrinfo(res);
+        if (named) freeaddrinfo(named);
+    }
+
     print(failures == 0 ? "hello196: PASS\n" : "hello196: FAIL\n");
     print("hello196 done\n");
     return failures;

@@ -156,3 +156,157 @@ struct hostent *gethostbyname(const char *name) {
     h_errno = 0;
     return &hostent_result;
 }
+
+/* ---- getaddrinfo --------------------------------------------------------------------------------------------- */
+
+#include "../include/stdlib.h"
+
+/* Service names this library knows, with their port (TCP and UDP share them, as in glibc's /etc/services for these). */
+static const struct { const char *name; uint16_t port; } service_table[] = {
+    {"echo", 7}, {"ftp", 21}, {"ssh", 22}, {"telnet", 23}, {"smtp", 25}, {"domain", 53}, {"http", 80},
+    {"pop3", 110}, {"ntp", 123}, {"imap", 143}, {"https", 443},
+};
+
+/* Parse a decimal service the way strtol would (optional leading blanks and sign), wrapping to 16 bits like glibc.
+ * Returns 1 and the port when the whole string is a number, 0 otherwise. */
+static int parse_numeric_service(const char *s, uint16_t *port) {
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\v' || *s == '\f' || *s == '\r') s++;
+    int neg = 0;
+    if (*s == '+' || *s == '-') { neg = *s == '-'; s++; }
+    if (*s < '0' || *s > '9') return 0;
+    unsigned long long v = 0;
+    while (*s >= '0' && *s <= '9') { v = v * 10 + (unsigned long long)(*s - '0'); s++; }
+    if (*s != 0) return 0;
+    if (neg) return 0;
+    *port = (uint16_t)(v & 0xFFFF);
+    return 1;
+}
+
+static const char *const gai_messages_head[] = {
+    "Success",
+    "Bad value for ai_flags",
+    "Name or service not known",
+    "Temporary failure in name resolution",
+    "Non-recoverable failure in name resolution",
+    "No address associated with hostname",
+    "ai_family not supported",
+    "ai_socktype not supported",
+    "Servname not supported for ai_socktype",
+    "Address family for hostname not supported",
+    "Memory allocation failure",
+};
+
+const char *gai_strerror(int code) {
+    int idx = -code;
+    if (idx >= 0 && idx < (int)(sizeof(gai_messages_head) / sizeof(gai_messages_head[0]))) return gai_messages_head[idx];
+    return "Unknown error";
+}
+
+void freeaddrinfo(struct addrinfo *res) {
+    while (res) {
+        struct addrinfo *next = res->ai_next;
+        if (res->ai_canonname) free(res->ai_canonname);
+        if (res->ai_addr) free(res->ai_addr);
+        free(res);
+        res = next;
+    }
+}
+
+static struct addrinfo *make_entry(const uint8_t addr[4], uint16_t port, int socktype, int protocol, int flags,
+                                   const char *canon) {
+    struct addrinfo *e = (struct addrinfo *)malloc(sizeof(struct addrinfo));
+    if (!e) return (struct addrinfo *)0;
+    memset(e, 0, sizeof(*e));
+    e->ai_addr = (uint8_t *)malloc(16);
+    if (!e->ai_addr) { free(e); return (struct addrinfo *)0; }
+    ipv4_sockaddr(addr, port, e->ai_addr);
+    e->ai_flags = flags;
+    e->ai_family = AF_INET;
+    e->ai_socktype = socktype;
+    e->ai_protocol = protocol;
+    e->ai_addrlen = 16;
+    if (canon) {
+        size_t n = strlen(canon);
+        e->ai_canonname = (char *)malloc(n + 1);
+        if (!e->ai_canonname) { free(e->ai_addr); free(e); return (struct addrinfo *)0; }
+        memcpy(e->ai_canonname, canon, n + 1);
+    }
+    return e;
+}
+
+int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
+    int flags = 0, family = AF_UNSPEC, socktype = 0, protocol = 0;
+    if (hints) {
+        flags = hints->ai_flags;
+        family = hints->ai_family;
+        socktype = hints->ai_socktype;
+        protocol = hints->ai_protocol;
+    }
+    /* The caller's flags are validated; AI_V4MAPPED (8), AI_ALL (16) and AI_ADDRCONFIG (32) are accepted and ignored. */
+    const int known_flags = AI_PASSIVE | AI_CANONNAME | AI_NUMERICHOST | AI_NUMERICSERV | 0x08 | 0x10 | 0x20;
+    if (flags & ~known_flags) return EAI_BADFLAGS;
+    /* With no hints at all glibc echoes 0x40 in the entries (its internal default); mirror that. */
+    int echoed_flags = hints ? flags : 0x40;
+    if ((flags & AI_CANONNAME) && !node) return EAI_BADFLAGS;
+    if (!node && !service) return EAI_NONAME;
+    if (family != AF_UNSPEC && family != AF_INET) return EAI_FAMILY;
+
+    /* Which socket types to emit: (socktype, protocol) pairs, in glibc order. */
+    int types[3], protos[3], ntypes = 0;
+    if (socktype == SOCK_STREAM || socktype == 0) {
+        if (protocol == 0 || protocol == IPPROTO_TCP) { types[ntypes] = SOCK_STREAM; protos[ntypes++] = IPPROTO_TCP; }
+    }
+    if (socktype == SOCK_DGRAM || socktype == 0) {
+        if (protocol == 0 || protocol == IPPROTO_UDP) { types[ntypes] = SOCK_DGRAM; protos[ntypes++] = IPPROTO_UDP; }
+    }
+    if ((socktype == SOCK_RAW || socktype == 0) && protocol == 0) { types[ntypes] = SOCK_RAW; protos[ntypes++] = 0; }
+    if (ntypes == 0) {
+        if (socktype != 0 && socktype != SOCK_STREAM && socktype != SOCK_DGRAM && socktype != SOCK_RAW) return EAI_SOCKTYPE;
+        if (socktype == 0) return EAI_SERVICE; /* a protocol this library does not serve */
+        return EAI_SOCKTYPE;                   /* socktype and protocol disagree */
+    }
+
+    uint16_t port = 0;
+    if (service && service[0]) {
+        if (!parse_numeric_service(service, &port)) {
+            if (flags & AI_NUMERICSERV) return EAI_NONAME;
+            int found = 0;
+            for (unsigned i = 0; i < sizeof(service_table) / sizeof(service_table[0]); i++) {
+                if (strcmp(service, service_table[i].name) == 0) { port = service_table[i].port; found = 1; break; }
+            }
+            if (!found) return EAI_SERVICE;
+        }
+    }
+    if (ntypes == 1 && types[0] == SOCK_RAW && service && service[0] && socktype == SOCK_RAW) {
+        /* A named service has no meaning for a raw socket. */
+        uint16_t tmp;
+        if (!parse_numeric_service(service, &tmp)) return EAI_SERVICE;
+    }
+
+    uint8_t addr[4];
+    const char *canon = (const char *)0;
+    if (!node) {
+        if (flags & AI_PASSIVE) { addr[0] = addr[1] = addr[2] = addr[3] = 0; }
+        else { addr[0] = 127; addr[1] = 0; addr[2] = 0; addr[3] = 1; }
+    } else if (ipv4_from_text(node, addr)) {
+        if (flags & AI_CANONNAME) canon = node;
+    } else {
+        if (flags & AI_NUMERICHOST) return EAI_NONAME;
+        long r = gethostbyname_ipv4(node, addr);
+        if (r < 0) {
+            return (r == -2 || r == -22 || r == -36) ? EAI_NONAME : EAI_AGAIN;
+        }
+        if (flags & AI_CANONNAME) canon = node;
+    }
+
+    struct addrinfo *head = (struct addrinfo *)0, **tail = &head;
+    for (int i = 0; i < ntypes; i++) {
+        /* Only the first entry carries the canonical name, as in glibc. */
+        struct addrinfo *e = make_entry(addr, port, types[i], protos[i], echoed_flags, i == 0 ? canon : (const char *)0);
+        if (!e) { freeaddrinfo(head); return EAI_MEMORY; }
+        *tail = e;
+        tail = &e->ai_next;
+    }
+    *res = head;
+    return 0;
+}

@@ -25,6 +25,24 @@ long moqi_test_syscall2(long nr, long a1, long a2) {
     return moqi_test_reply;
 }
 
+/* getaddrinfo allocates through malloc/free; the host test links only netdb.o, so it supplies a counting bump
+ * allocator. (It cannot forward to the host malloc: with -fno-builtin that would call back into this function.) */
+#include <stdlib.h>
+static unsigned char arena[1 << 16];
+static size_t arena_used;
+static int live_allocs;
+void *malloc(size_t n) {
+    n = (n + 15) & ~(size_t)15;
+    if (arena_used + n > sizeof(arena)) return (void *)0;
+    void *p = arena + arena_used;
+    arena_used += n;
+    live_allocs++;
+    return p;
+}
+void free(void *p) {
+    if (p) live_allocs--;
+}
+
 /* Scripted socket layer for tcp_connect_host(): records every call number in order and answers per call number. */
 #define STUB_LOG_MAX 64
 long stub_log[STUB_LOG_MAX];
@@ -296,6 +314,193 @@ int main(void) {
     /* A failed call does not clobber the previous successful result's contents beyond reuse: success resets h_errno. */
     h_errno = HOST_NOT_FOUND;
     assert(gethostbyname("9.9.9.9") != (struct hostent *)0 && h_errno == 0);
+
+    /* getaddrinfo(): IPv4 only, glibc-measured behaviour. Layout: 48 bytes; flags 0, family 4, socktype 8,
+     * protocol 12, addrlen 16, addr 24, canonname 32, next 40. */
+    assert(sizeof(struct addrinfo) == 48);
+    assert(offsetof(struct addrinfo, ai_flags) == 0 && offsetof(struct addrinfo, ai_family) == 4);
+    assert(offsetof(struct addrinfo, ai_socktype) == 8 && offsetof(struct addrinfo, ai_protocol) == 12);
+    assert(offsetof(struct addrinfo, ai_addrlen) == 16 && offsetof(struct addrinfo, ai_addr) == 24);
+    assert(offsetof(struct addrinfo, ai_canonname) == 32 && offsetof(struct addrinfo, ai_next) == 40);
+    assert(AI_PASSIVE == 1 && AI_CANONNAME == 2 && AI_NUMERICHOST == 4 && AI_NUMERICSERV == 1024);
+    assert(EAI_BADFLAGS == -1 && EAI_NONAME == -2 && EAI_AGAIN == -3 && EAI_FAIL == -4 && EAI_FAMILY == -6);
+    assert(EAI_SOCKTYPE == -7 && EAI_SERVICE == -8 && EAI_MEMORY == -10);
+    assert(SOCK_STREAM == 1 && SOCK_DGRAM == 2 && SOCK_RAW == 3);
+    assert(IPPROTO_TCP == 6 && IPPROTO_UDP == 17);
+
+    struct addrinfo hints, *res;
+    #define HINTS(fam, type, proto, fl) do { memset(&hints, 0, sizeof hints); hints.ai_family = (fam); \
+        hints.ai_socktype = (type); hints.ai_protocol = (proto); hints.ai_flags = (fl); } while (0)
+    #define SA(p) ((const uint8_t *)(p)->ai_addr)
+    #define PORT(p) ((unsigned)(SA(p)[2] << 8 | SA(p)[3]))
+
+    /* A literal with a stream socktype: one entry, TCP, port from the service, family 2, 16-byte sockaddr. */
+    stub_reset();
+    moqi_test_last_nr = 0;
+    HINTS(AF_INET, SOCK_STREAM, 0, 0);
+    assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == 0 && res != (struct addrinfo *)0);
+    assert(moqi_test_last_nr == 0); /* a literal never reaches the resolver */
+    assert(res->ai_family == AF_INET && res->ai_socktype == SOCK_STREAM && res->ai_protocol == IPPROTO_TCP);
+    assert(res->ai_addrlen == 16 && res->ai_canonname == (char *)0 && res->ai_next == (struct addrinfo *)0);
+    assert(res->ai_flags == 0 && SA(res)[0] == 2 && SA(res)[1] == 0 && PORT(res) == 80);
+    assert(SA(res)[4] == 1 && SA(res)[5] == 2 && SA(res)[6] == 3 && SA(res)[7] == 4);
+    freeaddrinfo(res);
+
+    /* No socktype: three entries in the order STREAM(6), DGRAM(17), RAW(0). */
+    HINTS(AF_INET, 0, 0, 0);
+    assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == 0);
+    assert(res->ai_socktype == SOCK_STREAM && res->ai_protocol == IPPROTO_TCP);
+    assert(res->ai_next->ai_socktype == SOCK_DGRAM && res->ai_next->ai_protocol == IPPROTO_UDP);
+    assert(res->ai_next->ai_next->ai_socktype == SOCK_RAW && res->ai_next->ai_next->ai_protocol == 0);
+    assert(res->ai_next->ai_next->ai_next == (struct addrinfo *)0);
+    freeaddrinfo(res);
+
+    /* NULL hints behave as family UNSPEC, socktype 0, and the entries carry flags AI_V4MAPPED|AI_ADDRCONFIG = 0x40. */
+    assert(getaddrinfo("1.2.3.4", "80", (const struct addrinfo *)0, &res) == 0);
+    assert(res->ai_flags == 0x40 && res->ai_socktype == SOCK_STREAM && res->ai_next != (struct addrinfo *)0);
+    freeaddrinfo(res);
+
+    /* DGRAM selects UDP; an explicit matching protocol is accepted; a mismatching one is EAI_SOCKTYPE. */
+    HINTS(AF_INET, SOCK_DGRAM, 0, 0);
+    assert(getaddrinfo("1.2.3.4", "53", &hints, &res) == 0 && res->ai_protocol == IPPROTO_UDP && res->ai_next == (struct addrinfo *)0);
+    freeaddrinfo(res);
+    HINTS(AF_INET, SOCK_DGRAM, IPPROTO_UDP, 0);
+    assert(getaddrinfo("1.2.3.4", "53", &hints, &res) == 0);
+    freeaddrinfo(res);
+    HINTS(AF_INET, SOCK_STREAM, IPPROTO_UDP, 0);
+    assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == EAI_SOCKTYPE);
+    HINTS(AF_INET, SOCK_DGRAM, IPPROTO_TCP, 0);
+    assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == EAI_SOCKTYPE);
+    /* Protocol only: the protocol picks the socktype. */
+    HINTS(AF_INET, 0, IPPROTO_TCP, 0);
+    assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == 0 && res->ai_socktype == SOCK_STREAM && res->ai_next == (struct addrinfo *)0);
+    freeaddrinfo(res);
+    HINTS(AF_INET, 0, IPPROTO_UDP, 0);
+    assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == 0 && res->ai_socktype == SOCK_DGRAM && res->ai_next == (struct addrinfo *)0);
+    freeaddrinfo(res);
+    /* An unknown protocol, or a socktype this library does not serve, is rejected. */
+    HINTS(AF_INET, 0, 99, 0);
+    assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == EAI_SERVICE);
+    HINTS(AF_INET, 77, 0, 0);
+    assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == EAI_SOCKTYPE);
+
+    /* Family: UNSPEC and INET work, anything else is EAI_FAMILY (glibc says -9 for INET6 + a v4 name; this stack
+     * has no IPv6 so it is EAI_FAMILY too). */
+    HINTS(AF_UNSPEC, SOCK_STREAM, 0, 0);
+    assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == 0);
+    freeaddrinfo(res);
+    HINTS(1 /* AF_UNIX */, SOCK_STREAM, 0, 0);
+    assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == EAI_FAMILY);
+    HINTS(10 /* AF_INET6 */, SOCK_STREAM, 0, 0);
+    assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == EAI_FAMILY);
+
+    /* Services: numeric (decimal, leading/trailing forms the strtol accepts), a small name table, NULL is port 0. */
+    HINTS(AF_INET, SOCK_STREAM, 0, 0);
+    assert(getaddrinfo("1.2.3.4", (const char *)0, &hints, &res) == 0 && PORT(res) == 0);
+    freeaddrinfo(res);
+    static const struct { const char *svc; unsigned port; } svcs[] = {
+        {"0", 0}, {"80", 80}, {"65535", 65535}, {"080", 80}, {"+80", 80}, {" 80", 80}, {"", 0},
+        {"http", 80}, {"https", 443}, {"ssh", 22}, {"domain", 53}, {"ftp", 21}, {"echo", 7}, {"smtp", 25},
+        {"telnet", 23}, {"ntp", 123}, {"pop3", 110}, {"imap", 143},
+    };
+    for (unsigned i = 0; i < sizeof(svcs) / sizeof(svcs[0]); i++) {
+        assert(getaddrinfo("1.2.3.4", svcs[i].svc, &hints, &res) == 0);
+        assert(PORT(res) == svcs[i].port);
+        freeaddrinfo(res);
+    }
+    /* Port numbers that overflow 16 bits wrap like glibc (65536 -> 0, 99999999999 -> 59391). */
+    assert(getaddrinfo("1.2.3.4", "65536", &hints, &res) == 0 && PORT(res) == 0);
+    freeaddrinfo(res);
+    assert(getaddrinfo("1.2.3.4", "99999999999", &hints, &res) == 0 && PORT(res) == 59391);
+    freeaddrinfo(res);
+    /* Names that are neither numbers nor in the table, or have trailing junk, are EAI_SERVICE. */
+    assert(getaddrinfo("1.2.3.4", "nosuchsvc", &hints, &res) == EAI_SERVICE);
+    assert(getaddrinfo("1.2.3.4", "80x", &hints, &res) == EAI_SERVICE);
+    assert(getaddrinfo("1.2.3.4", "-1", &hints, &res) == EAI_SERVICE);
+    assert(getaddrinfo("1.2.3.4", "0x50", &hints, &res) == EAI_SERVICE);
+    assert(getaddrinfo("1.2.3.4", "HTTP", &hints, &res) == EAI_SERVICE); /* case-sensitive */
+    /* UDP services: domain is 53, http is still 80 (glibc's /etc/services lists both protocols). */
+    HINTS(AF_INET, SOCK_DGRAM, 0, 0);
+    assert(getaddrinfo("1.2.3.4", "domain", &hints, &res) == 0 && PORT(res) == 53);
+    freeaddrinfo(res);
+    /* AI_NUMERICSERV: a service name is EAI_NONAME, a number is fine and the flag is echoed. */
+    HINTS(AF_INET, SOCK_STREAM, 0, AI_NUMERICSERV);
+    assert(getaddrinfo("1.2.3.4", "http", &hints, &res) == EAI_NONAME);
+    assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == 0 && res->ai_flags == AI_NUMERICSERV);
+    freeaddrinfo(res);
+
+    /* Both node and service NULL is EAI_NONAME; an empty node is EAI_NODATA-like (-5) in glibc, which this
+     * library reports as EAI_NONAME because it has no distinct NODATA code. */
+    HINTS(AF_INET, SOCK_STREAM, 0, 0);
+    assert(getaddrinfo((const char *)0, (const char *)0, &hints, &res) == EAI_NONAME);
+
+    /* NULL node: loopback by default, the wildcard address with AI_PASSIVE. */
+    assert(getaddrinfo((const char *)0, "80", &hints, &res) == 0 && SA(res)[4] == 127 && SA(res)[7] == 1);
+    freeaddrinfo(res);
+    HINTS(AF_INET, SOCK_STREAM, 0, AI_PASSIVE);
+    assert(getaddrinfo((const char *)0, "80", &hints, &res) == 0 && SA(res)[4] == 0 && SA(res)[5] == 0 && SA(res)[6] == 0 && SA(res)[7] == 0);
+    assert(res->ai_flags == AI_PASSIVE);
+    freeaddrinfo(res);
+    /* AI_PASSIVE with a node ignores the passive meaning for the address but keeps the flag. */
+    assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == 0 && SA(res)[4] == 1 && res->ai_flags == AI_PASSIVE);
+    freeaddrinfo(res);
+
+    /* AI_CANONNAME: a node is required (glibc EAI_BADFLAGS with a NULL node); the canonical name is the node. */
+    HINTS(AF_INET, SOCK_STREAM, 0, AI_CANONNAME);
+    assert(getaddrinfo((const char *)0, "80", &hints, &res) == EAI_BADFLAGS);
+    assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == 0);
+    assert(res->ai_flags == AI_CANONNAME && res->ai_canonname != (char *)0 && strcmp(res->ai_canonname, "1.2.3.4") == 0);
+    freeaddrinfo(res);
+
+    /* With several entries only the first one carries the canonical name (glibc, measured with localhost). */
+    HINTS(AF_INET, 0, 0, AI_CANONNAME);
+    assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == 0);
+    assert(res->ai_canonname != (char *)0 && strcmp(res->ai_canonname, "1.2.3.4") == 0);
+    assert(res->ai_next != (struct addrinfo *)0 && res->ai_next->ai_canonname == (char *)0);
+    assert(res->ai_next->ai_next != (struct addrinfo *)0 && res->ai_next->ai_next->ai_canonname == (char *)0);
+    freeaddrinfo(res);
+
+    /* Flags: an unknown bit is EAI_BADFLAGS before anything else is looked at. */
+    HINTS(AF_INET, SOCK_STREAM, 0, 0x4000);
+    assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == EAI_BADFLAGS);
+
+    /* AI_NUMERICHOST: a name is EAI_NONAME without any lookup; a literal is accepted. */
+    HINTS(AF_INET, SOCK_STREAM, 0, AI_NUMERICHOST);
+    stub_reset();
+    moqi_test_last_nr = 0;
+    assert(getaddrinfo("localhost", "80", &hints, &res) == EAI_NONAME && moqi_test_last_nr == 0);
+    assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == 0 && res->ai_flags == AI_NUMERICHOST);
+    freeaddrinfo(res);
+
+    /* A name goes through the resolver; its failures map to EAI codes (ENOENT/EINVAL/too long -> NONAME, any other
+     * failure such as a timeout -> AGAIN). */
+    HINTS(AF_INET, SOCK_STREAM, 0, 0);
+    moqi_test_reply = 0;
+    moqi_test_fill[0] = 10; moqi_test_fill[1] = 0; moqi_test_fill[2] = 2; moqi_test_fill[3] = 2;
+    assert(getaddrinfo("gateway", "80", &hints, &res) == 0 && moqi_test_last_nr == 495 && SA(res)[4] == 10 && SA(res)[7] == 2);
+    freeaddrinfo(res);
+    moqi_test_reply = -2;
+    assert(getaddrinfo("nope.invalid", "80", &hints, &res) == EAI_NONAME);
+    moqi_test_reply = -22;
+    assert(getaddrinfo("bad name!", "80", &hints, &res) == EAI_NONAME);
+    moqi_test_reply = -36;
+    assert(getaddrinfo("x", "80", &hints, &res) == EAI_NONAME);
+    moqi_test_reply = -110;
+    assert(getaddrinfo("slow.example", "80", &hints, &res) == EAI_AGAIN);
+    moqi_test_reply = -5;
+    assert(getaddrinfo("broken.example", "80", &hints, &res) == EAI_AGAIN);
+    moqi_test_reply = 0;
+
+    /* freeaddrinfo(NULL) is a no-op; gai_strerror gives text for every code and for an unknown one. */
+    freeaddrinfo((struct addrinfo *)0);
+    assert(strcmp(gai_strerror(EAI_NONAME), "Name or service not known") == 0);
+    assert(strcmp(gai_strerror(EAI_SERVICE), "Servname not supported for ai_socktype") == 0);
+    assert(strcmp(gai_strerror(EAI_BADFLAGS), "Bad value for ai_flags") == 0);
+    assert(strcmp(gai_strerror(EAI_AGAIN), "Temporary failure in name resolution") == 0);
+    assert(strcmp(gai_strerror(EAI_FAMILY), "ai_family not supported") == 0);
+    assert(strcmp(gai_strerror(EAI_SOCKTYPE), "ai_socktype not supported") == 0);
+    assert(strcmp(gai_strerror(0), "Success") == 0);
+    assert(gai_strerror(-12345) != (const char *)0);
     /* Round trip with the formatter. */
     for (int a = 0; a < 256; a += 51) {
         uint8_t in[4] = {(uint8_t)a, (uint8_t)(255 - a), (uint8_t)(a ^ 0x5A), (uint8_t)(a / 2)};
@@ -303,5 +508,7 @@ int main(void) {
         assert(ipv4_to_text(in, text, sizeof(text)) > 0);
         assert(ipv4_from_text(text, back) == 1 && memcmp(in, back, 4) == 0);
     }
+    /* Every list that getaddrinfo built was released: nothing leaked, nothing freed twice. */
+    assert(live_allocs == 0);
     return 0;
 }
