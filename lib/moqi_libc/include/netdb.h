@@ -26,4 +26,13 @@ long ipv4_to_text(const uint8_t addr[4], char *buf, size_t buf_len);
  * address (NULL arguments included). `out` is written only on success. */
 int ipv4_from_text(const char *text, uint8_t out[4]);
 
+/* Build a Linux `struct sockaddr_in` (16 bytes) for bind/connect/sendto: family AF_INET (2) as a little-endian
+ * u16, `port` in network byte order, the 4 address bytes, 8 bytes of zero padding. */
+void ipv4_sockaddr(const uint8_t addr[4], uint16_t port, uint8_t out[16]);
+
+/* Resolve `host` (a dotted-decimal literal, or a name for dns_resolve) and build the sockaddr_in for `port` in
+ * `out`. A valid dotted literal never reaches the kernel. 0 on success; -errno from dns_resolve on a lookup
+ * failure; -EINVAL (-22) for a NULL argument. `out` is written only on success. */
+long resolve_ipv4_sockaddr(const char *host, uint16_t port, uint8_t out[16]);
+
 #endif /* MOQI_NETDB_H */

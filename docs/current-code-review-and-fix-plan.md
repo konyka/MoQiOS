@@ -6146,3 +6146,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：先在宿主机用 gcc 的 `inet_pton` 取 27 个边界输入的真实结果（前导零 `01.2.3.4`、`1.2.3.04`、`192.168.001.1` 都拒绝；`256`、`1000`、三段/五段、空串、首尾空格、尾部换行、`0x1`、负号都拒绝；`0.0.0.0`、`255.255.255.255`、`1.2.3.0` 接受），写进 `test_netdb_abi.c`，在函数不存在时编译失败（红），实现后通过；`ipv4_to_text` 与它做了往返检查；`hello196` 在目标上多两项。
 - 变异：去掉前导零检查、去掉尾随文本检查，各自让 `test_netdb_abi` 的具名断言失败；已还原，`grep MUTATION` 为 0。
 - 如实说明：①只做 IPv4 点分十进制，不接受 `inet_aton` 的宽松形式（`127.1`、八进制、十六进制）——这与 `inet_pton` 一致；②没有做 `getaddrinfo`/`struct hostent`/IPv6，它们仍是候选；③这一步没有改内核。
+
+## libc 的 `ipv4_sockaddr` / `resolve_ipv4_sockaddr`（getaddrinfo 方向的第二步）
+
+- 做的事：有了 `ipv4_from_text` 和 `gethostbyname_ipv4` 之后，调用方要连一个 `host:port` 仍得自己手搭 16 字节 `sockaddr_in`（hello22/145/184 都手写字节数组）。新增 `ipv4_sockaddr(addr, port, out)` 与 `resolve_ipv4_sockaddr(host, port, out)`：字面量不进内核，名字走 `dns_resolve`，一步得到可直接交给 `bind`/`connect`/`sendto` 的结构。
+- TDD：宿主机测试先写（`ipv4_sockaddr` 未声明，编译失败=红），覆盖布局（端口 0/80/0x1234/8080/65535 的字节序，8 字节零填充）、字面量不触发系统调用、名字触发 495、非法字面量 `1.2.3.256` 被当作名字交给内核而不是被猜测、失败不写输出、NULL 参数。变异：把端口的两个字节写反，布局断言失败；让字面量也走内核，`resolve_ipv4_sockaddr("192.168.7.9")` 的断言失败；已还原，`grep MUTATION` 为 0。
+- 过程中的一个失误：做端口变异后我用 `git checkout src/netdb.c` 还原，把这个文件里**还没提交的新函数**一起回退了；发现后补回并重跑测试通过。以后对有未提交改动的文件还原变异要用反向 `sed`，不能用 `git checkout`。
+- 目标上验证：hello196 多 4 项，其中 `bind()` 用造出的地址，说明内核接受这个布局（MoQiOS 的 socket/bind 系统调用号是 117/118，不是 Linux 的 41/49，我第一版写错过）。
+- 如实说明：①只有 IPv4/UDP-TCP 通用的 `sockaddr_in`，没有 `struct addrinfo`/`getaddrinfo`/`hostent`/IPv6；②`resolve_ipv4_sockaddr` 会阻塞在 `dns_resolve` 上（最长是内核的 DNS 超时），没有异步版本；③没有改内核。

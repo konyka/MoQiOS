@@ -38,6 +38,17 @@ int main(int argc, char **argv, char **envp) {
           "ipv4_from_text parses 10.0.2.15");
     check(ipv4_from_text("10.0.2.015", parsed) == 0 && ipv4_from_text("10.0.2", parsed) == 0, "ipv4_from_text rejects leading zeros and short forms");
 
+    uint8_t sa[16];
+    check(resolve_ipv4_sockaddr("0.0.0.0", 9196, sa) == 0 && sa[0] == 2 && sa[1] == 0 && sa[2] == 0x23 && sa[3] == 0xEC,
+          "resolve_ipv4_sockaddr builds a sockaddr_in for 0.0.0.0:9196");
+    long us = syscall3(117, 2, 2, 0); /* socket(AF_INET, SOCK_DGRAM, 0), MoQiOS number */
+    check(us >= 0, "a UDP socket opens");
+    check(us >= 0 && syscall3(118, us, (long)sa, 16) == 0, "the kernel accepts the built sockaddr_in in bind()");
+    if (us >= 0) syscall1(SYS_close, us);
+    uint8_t sb[16];
+    check(resolve_ipv4_sockaddr("localhost", 80, sb) == 0 && sb[4] == 127 && sb[7] == 1 && sb[3] == 80,
+          "resolve_ipv4_sockaddr resolves a name through dns_resolve");
+
     print(failures == 0 ? "hello196: PASS\n" : "hello196: FAIL\n");
     print("hello196 done\n");
     return failures;

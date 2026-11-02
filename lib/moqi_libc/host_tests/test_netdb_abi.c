@@ -102,6 +102,53 @@ int main(void) {
     }
     assert(ipv4_from_text((const char *)0, ip) == 0);
     assert(ipv4_from_text("1.2.3.4", (uint8_t *)0) == 0);
+
+    /* sockaddr_in builder: Linux layout, 16 bytes: family (u16 little-endian) = AF_INET, port in network byte
+     * order, 4 address bytes, 8 zero bytes. */
+    uint8_t sa[16];
+    for (int i = 0; i < 16; i++) sa[i] = 0xEE;
+    uint8_t sip[4] = {10, 0, 2, 2};
+    ipv4_sockaddr(sip, 8080, sa);
+    static const uint8_t want_sa[16] = {2, 0, 0x1F, 0x90, 10, 0, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0};
+    assert(memcmp(sa, want_sa, 16) == 0);
+    ipv4_sockaddr(sip, 0, sa);
+    assert(sa[2] == 0 && sa[3] == 0);
+    ipv4_sockaddr(sip, 65535, sa);
+    assert(sa[2] == 0xFF && sa[3] == 0xFF);
+    ipv4_sockaddr(sip, 80, sa);
+    assert(sa[2] == 0 && sa[3] == 80);
+    ipv4_sockaddr(sip, 0x1234, sa);
+    assert(sa[2] == 0x12 && sa[3] == 0x34);
+
+    /* resolve_ipv4_sockaddr: a dotted-decimal host never reaches the kernel; any other host goes through
+     * dns_resolve; failures are -errno from the kernel, or -EINVAL for NULL arguments. */
+    for (int i = 0; i < 16; i++) sa[i] = 0xEE;
+    moqi_test_last_nr = 0;
+    assert(resolve_ipv4_sockaddr("192.168.7.9", 443, sa) == 0);
+    assert(moqi_test_last_nr == 0);
+    static const uint8_t want_num[16] = {2, 0, 0x01, 0xBB, 192, 168, 7, 9, 0, 0, 0, 0, 0, 0, 0, 0};
+    assert(memcmp(sa, want_num, 16) == 0);
+
+    moqi_test_reply = 0;
+    moqi_test_fill[0] = 1; moqi_test_fill[1] = 2; moqi_test_fill[2] = 3; moqi_test_fill[3] = 4;
+    assert(resolve_ipv4_sockaddr("example.com", 53, sa) == 0);
+    assert(moqi_test_last_nr == 495);
+    static const uint8_t want_dns[16] = {2, 0, 0, 53, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0};
+    assert(memcmp(sa, want_dns, 16) == 0);
+
+    /* A dotted-looking but invalid literal is NOT a number, so it is looked up as a name (and the kernel rejects
+     * or resolves it); the helper does not guess. */
+    moqi_test_last_nr = 0;
+    moqi_test_reply = -22;
+    for (int i = 0; i < 16; i++) sa[i] = 0xEE;
+    assert(resolve_ipv4_sockaddr("1.2.3.256", 80, sa) == -22);
+    assert(moqi_test_last_nr == 495);
+    assert(sa[0] == 0xEE && sa[15] == 0xEE); /* output untouched on failure */
+    moqi_test_reply = -2;
+    assert(resolve_ipv4_sockaddr("nope.invalid", 80, sa) == -2);
+    assert(sa[0] == 0xEE);
+    assert(resolve_ipv4_sockaddr((const char *)0, 80, sa) == -22);
+    assert(resolve_ipv4_sockaddr("localhost", 80, (uint8_t *)0) == -22);
     /* Round trip with the formatter. */
     for (int a = 0; a < 256; a += 51) {
         uint8_t in[4] = {(uint8_t)a, (uint8_t)(255 - a), (uint8_t)(a ^ 0x5A), (uint8_t)(a / 2)};

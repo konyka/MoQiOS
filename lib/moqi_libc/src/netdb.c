@@ -56,3 +56,23 @@ int ipv4_from_text(const char *text, uint8_t out[4]) {
     for (int i = 0; i < 4; i++) out[i] = parsed[i];
     return 1;
 }
+
+void ipv4_sockaddr(const uint8_t addr[4], uint16_t port, uint8_t out[16]) {
+    out[0] = 2; /* AF_INET, little-endian u16 */
+    out[1] = 0;
+    out[2] = (uint8_t)(port >> 8);
+    out[3] = (uint8_t)(port & 0xFF);
+    for (int i = 0; i < 4; i++) out[4 + i] = addr[i];
+    for (int i = 8; i < 16; i++) out[i] = 0;
+}
+
+long resolve_ipv4_sockaddr(const char *host, uint16_t port, uint8_t out[16]) {
+    if (!host || !out) return -22; /* EINVAL */
+    uint8_t addr[4];
+    if (!ipv4_from_text(host, addr)) {
+        long r = gethostbyname_ipv4(host, addr);
+        if (r < 0) return r;
+    }
+    ipv4_sockaddr(addr, port, out);
+    return 0;
+}
