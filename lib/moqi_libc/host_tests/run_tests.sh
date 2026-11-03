@@ -56,6 +56,11 @@ $CC $CFLAGS -c ../src/timeconv.c -o "$OUT/timeconv.o"
 $CC $CFLAGS -o "$OUT/test_timeconv_abi" test_timeconv_abi.c "$OUT/timeconv.o"
 "$OUT/test_timeconv_abi" || fail=1
 
+echo "== test_strptime_abi =="
+$CC $CFLAGS -c ../src/timeconv.c -o "$OUT/timeconv_sp.o"
+$CC $CFLAGS -o "$OUT/test_strptime_abi" test_strptime_abi.c "$OUT/timeconv_sp.o"
+"$OUT/test_strptime_abi" || fail=1
+
 if [ "$fail" -eq 0 ]; then
     echo "ALL HOST TESTS PASS"
 else

@@ -212,6 +212,97 @@ int main(void) {
             }
         }
     }
+
+    /* asctime / ctime and the _r forms (measured with glibc; the _r forms write at most 26 bytes). */
+    {
+        char b[64];
+        struct tm a;
+        memset(&a, 0, sizeof a);
+        a.tm_year = 123; a.tm_mon = 10; a.tm_mday = 14; a.tm_hour = 22; a.tm_min = 13; a.tm_sec = 20; a.tm_wday = 2;
+        assert(strcmp(asctime(&a), "Tue Nov 14 22:13:20 2023\n") == 0);
+        assert(asctime_r(&a, b) == b && strcmp(b, "Tue Nov 14 22:13:20 2023\n") == 0);
+        assert(asctime(&a) == asctime(&a)); /* one static buffer */
+        /* Names out of range are "???"; numbers are %3d / %.2d, so negatives keep their sign. */
+        struct { int wd, mo, d, h, mi, s, y; const char *want; } c[] = {
+            {0, 0, 1, 0, 0, 0, 70, "Sun Jan  1 00:00:00 1970\n"},
+            {9, 15, 5, 7, 4, 9, 124, "??? ???  5 07:04:09 2024\n"},
+            {-1, -1, 100, 100, 100, 100, 100, "??? ???100 100:100:100 2000\n"},
+            {3, 5, 5, 5, 5, 5, -1900, "Wed Jun  5 05:05:05 0\n"},
+            {3, 5, 5, 5, 5, 5, -1901, "Wed Jun  5 05:05:05 -1\n"},
+            {3, 5, 5, 5, 5, 5, 8100, "Wed Jun  5 05:05:05 10000\n"},
+            {3, 5, -5, -5, -5, -5, 100, "Wed Jun -5 -05:-05:-05 2000\n"},
+            {3, 5, 12345, 12345, 12345, 12345, 100, "Wed Jun12345 12345:12345:12345 2000\n"},
+            {3, 5, 5, 5, 5, 5, -2147483647 - 1, "Wed Jun  5 05:05:05 -2147481748\n"},
+        };
+        for (unsigned i = 0; i < sizeof c / sizeof c[0]; i++) {
+            memset(&a, 0, sizeof a);
+            a.tm_wday = c[i].wd; a.tm_mon = c[i].mo; a.tm_mday = c[i].d; a.tm_hour = c[i].h; a.tm_min = c[i].mi;
+            a.tm_sec = c[i].s; a.tm_year = c[i].y;
+            assert(strcmp(asctime(&a), c[i].want) == 0);
+        }
+        /* The widest and narrowest texts still fit the static buffer. */
+        memset(&a, 0, sizeof a);
+        a.tm_mday = 2147483647; a.tm_hour = 2147483647; a.tm_min = 2147483647; a.tm_sec = 2147483647; a.tm_year = 2147483647 - 1900;
+        assert(strcmp(asctime(&a), "Sun Jan2147483647 2147483647:2147483647:2147483647 2147483647\n") == 0);
+        memset(&a, 0, sizeof a);
+        a.tm_mday = -2147483647 - 1; a.tm_hour = -2147483647 - 1; a.tm_min = -2147483647 - 1; a.tm_sec = -2147483647 - 1;
+        a.tm_year = -2147483647 - 1;
+        assert(strcmp(asctime(&a), "Sun Jan-2147483648 -2147483648:-2147483648:-2147483648 -2147481748\n") == 0);
+        /* tm_year above INT_MAX - 1900 would overflow the printed year: EOVERFLOW, nothing written. */
+        memset(&a, 0, sizeof a);
+        a.tm_year = 2147483647 - 1899;
+        errno_slot = 0;
+        assert(asctime(&a) == (char *)0 && errno_slot == EOVERFLOW);
+        memset(b, '#', sizeof b); errno_slot = 0;
+        assert(asctime_r(&a, b) == (char *)0 && errno_slot == EOVERFLOW && b[0] == '#');
+        /* A NULL tm is EINVAL (this is what makes ctime of an unrepresentable time EINVAL, not EOVERFLOW). */
+        errno_slot = 0;
+        assert(asctime((const struct tm *)0) == (char *)0 && errno_slot == EINVAL);
+        errno_slot = 0;
+        assert(asctime_r((const struct tm *)0, b) == (char *)0 && errno_slot == EINVAL);
+        /* asctime_r uses 26 bytes at most: a text of 26 characters or more does not fit, the buffer holds the first 25
+         * characters and a NUL, and the result is NULL / EOVERFLOW. */
+        memset(&a, 0, sizeof a); a.tm_year = 8100; a.tm_mday = 1;
+        memset(b, '#', sizeof b); errno_slot = 0;
+        assert(asctime_r(&a, b) == (char *)0 && errno_slot == EOVERFLOW);
+        assert(strcmp(b, "Sun Jan  1 00:00:00 10000") == 0 && b[26] == '#');
+        memset(&a, 0, sizeof a); a.tm_year = 2147483647 - 1900; a.tm_mday = 1;
+        memset(b, '#', sizeof b); errno_slot = 0;
+        assert(asctime_r(&a, b) == (char *)0 && errno_slot == EOVERFLOW && strcmp(b, "Sun Jan  1 00:00:00 21474") == 0);
+        memset(&a, 0, sizeof a); a.tm_year = 8099; a.tm_mday = 1;
+        assert(asctime_r(&a, b) == b && strcmp(b, "Sun Jan  1 00:00:00 9999\n") == 0);
+
+        /* ctime: localtime then asctime. */
+        time_t v = 1700000000;
+        assert(strcmp(ctime(&v), "Tue Nov 14 22:13:20 2023\n") == 0);
+        assert(ctime_r(&v, b) == b && strcmp(b, "Tue Nov 14 22:13:20 2023\n") == 0);
+        v = -1;           assert(strcmp(ctime(&v), "Wed Dec 31 23:59:59 1969\n") == 0);
+        v = 253402300799L; assert(strcmp(ctime(&v), "Fri Dec 31 23:59:59 9999\n") == 0);
+        assert(ctime_r(&v, b) == b && strcmp(b, "Fri Dec 31 23:59:59 9999\n") == 0);
+        v = 253402300800L; assert(strcmp(ctime(&v), "Sat Jan  1 00:00:00 10000\n") == 0);
+        errno_slot = 0;   assert(ctime_r(&v, b) == (char *)0 && errno_slot == EOVERFLOW); /* 26 characters: too long for _r */
+        v = -62135596800L; assert(strcmp(ctime(&v), "Mon Jan  1 00:00:00 1\n") == 0);
+        v = -62135596801L; assert(strcmp(ctime(&v), "Sun Dec 31 23:59:59 0\n") == 0);
+        v = -70000000000L; assert(strcmp(ctime(&v), "Fri Oct 15 19:33:20 -249\n") == 0);
+        assert(ctime_r(&v, b) == b && strcmp(b, "Fri Oct 15 19:33:20 -249\n") == 0);
+        /* A time that cannot be broken down is EINVAL (localtime's EOVERFLOW is replaced by asctime(NULL)'s EINVAL). */
+        v = (time_t)1 << 62;  errno_slot = 0; assert(ctime(&v) == (char *)0 && errno_slot == EINVAL);
+        errno_slot = 0;       assert(ctime_r(&v, b) == (char *)0 && errno_slot == EINVAL);
+        v = -((time_t)1 << 62); errno_slot = 0; assert(ctime(&v) == (char *)0 && errno_slot == EINVAL);
+        v = 67768036191676800L; errno_slot = 0; assert(ctime(&v) == (char *)0 && errno_slot == EINVAL);
+        v = -67768040609740801L; errno_slot = 0; assert(ctime(&v) == (char *)0 && errno_slot == EINVAL);
+        /* A representable time whose text is not: EOVERFLOW (the year is past what asctime can print). */
+        v = 67768036191676799L; errno_slot = 0; assert(ctime(&v) == (char *)0 && errno_slot == EOVERFLOW);
+        errno_slot = 0;         assert(ctime_r(&v, b) == (char *)0 && errno_slot == EOVERFLOW);
+        v = 67768036160140800L; errno_slot = 0; assert(ctime(&v) == (char *)0 && errno_slot == EOVERFLOW);
+        /* The first representable second: ctime prints it (static buffer), ctime_r cannot (the text is too long). */
+        v = -67768040609740800L;
+        assert(ctime(&v) != (char *)0);
+        errno_slot = 0; assert(ctime_r(&v, b) == (char *)0 && errno_slot == EOVERFLOW);
+        /* ctime and asctime(gmtime) share one static buffer. */
+        v = 0;
+        { char *c1 = ctime(&v); struct tm *g = gmtime(&v); assert(asctime(g) == c1); }
+    }
     assert(difftime(10, 3) == 7.0 && difftime(3, 10) == -7.0);
 
     /* strftime, C locale: every conversion on 2023-11-14 22:13:20 UTC (a Tuesday). */

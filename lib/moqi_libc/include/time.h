@@ -90,6 +90,21 @@ time_t mktime(struct tm *tm);
 
 double difftime(time_t end, time_t begin);
 
+/* Parse `buf` by `format` into `tm` (C locale, glibc behavior): returns a pointer to the first unparsed character, or
+ * NULL when the input does not match. Only the fields a conversion parses are written; tm_wday and tm_yday are
+ * recomputed when the date makes them known. See timeconv.c for the exact rules. */
+char *strptime(const char *buf, const char *format, struct tm *tm);
+
+/* "Tue Nov 14 22:13:20 2023\n" (names out of range are "???"). The static forms share one buffer with ctime. The _r
+ * forms write at most 26 bytes: a longer text is cut to 25 characters and a NUL and the result is NULL with errno
+ * EOVERFLOW. tm_year above INT_MAX - 1900, or a text that cannot be formed, is NULL / EOVERFLOW with nothing written;
+ * a NULL tm is NULL / EINVAL. */
+char *asctime(const struct tm *tm);
+char *asctime_r(const struct tm *tm, char *buf);
+/* asctime(localtime(t)); a time that cannot be broken down is NULL with errno EINVAL (not localtime's EOVERFLOW). */
+char *ctime(const time_t *t);
+char *ctime_r(const time_t *t, char *buf);
+
 /* strftime in the C locale with glibc's flags (- _ 0 ^ #), field widths and E/O modifiers. A result that does not fit
  * in `max` bytes including the terminating NUL is 0 (and the buffer contents are unspecified). Unknown conversions
  * are copied through as written. */
