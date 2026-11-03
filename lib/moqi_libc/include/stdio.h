@@ -9,8 +9,11 @@
  *   conversion  d i u o x X b B (binary, as glibc 2.35+)  c s p n m  C S  %
  * %lc %ls %C %S (and any length from l up on c and s) are wide: ASCII only, anything else fails with EILSEQ. %m is
  * strerror(errno). %p prints (nil) for NULL. A NULL %s prints (null) unless the precision is under 6. An unknown
- * conversion is written back as it was meant to be read (see format.c). No floating point (%e %f %g %a) and no
- * positional arguments (%1$d).
+ * conversion is written back as it was meant to be read (see format.c).
+ * Floating point: f F e E g G a A take a double and print it from its exact decimal (or hexadecimal) expansion, so the
+ * text is glibc's digit for digit, ties and carries included; inf and nan print as inf/nan (INF/NAN for the capitals),
+ * without zero padding. h and l are accepted and ignored; L (long double) is not supported: it fails with EINVAL.
+ * No positional arguments (%1$d).
  *
  * Failure is -1 with errno: EINVAL (the format ends inside a conversion), EILSEQ (non-ASCII wide character), EOVERFLOW
  * (the result, a width or a precision does not fit an int), ENOMEM (asprintf), or the error of write(). Output that was

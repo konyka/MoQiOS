@@ -8,13 +8,16 @@
  * glibc): % [flags # 0 - + space ' I] [width | *] [. precision | .*] [length hh h l ll L q z Z j t] conversion, with
  * d i u o x X b B c s p n m % C S. A conversion it does not know is echoed the way glibc echoes it: '%', the flags in
  * glibc's fixed order, the width, ".precision", then the conversion character, with the length modifier dropped.
- * Floating point (e f g a) and positional arguments (%1$d) are not supported; they are echoed as unknown conversions.
+ * Floating point (f F e E g G a A) is formatted from the exact decimal or hexadecimal expansion of the double, so results
+ * match glibc digit for digit, ties included; `long double` (%Lf) is not supported and fails with EINVAL. Positional arguments
+ * (%1$d) are not supported; they are echoed as unknown conversions.
  * Failure is -1: EINVAL when the format ends inside a conversion, EILSEQ for a wide character that is not ASCII (this
  * is the C locale), EOVERFLOW when the result would not fit an int or a width/precision does not.
  */
 #include "../include/errno.h"
 #include "../include/stdio.h"
 #include "../include/string.h"
+#include "fpfmt.h"
 
 #define FMT_INT_MAX 2147483647ULL
 
@@ -101,6 +104,7 @@ struct spec {
     long long width;  /* never negative: a negative '*' width sets left */
     long long prec;   /* -1: none */
     int len;
+    int ldbl; /* the L length modifier */
 };
 
 static int len_is_wide(int len) { return len == LEN_L || len == LEN_LL || len == LEN_OTHER; }
@@ -204,6 +208,199 @@ static void echo_unknown(struct fmt_out *o, const struct spec *s, char conv) {
 
 static const char null_text[] = "(null)";
 
+/* ---- floating point ------------------------------------------------------------------------------------------------ */
+
+static int fp_digit(const struct fp_round *r, long long e) {
+    long long i = (long long)r->x - e;
+    if (r->rn == 0 || i < 0 || i >= r->rn) return 0;
+    return r->r[i];
+}
+
+static unsigned long long dec_digits(unsigned v) {
+    unsigned long long n = 1;
+    while (v >= 10) {
+        v /= 10;
+        n++;
+    }
+    return n;
+}
+
+/* inf and nan: no zero padding, the sign character follows the sign bit (or the + / space flag). */
+static void emit_nonfinite(struct fmt_out *o, const struct spec *s, int upper, int is_nan, char sign) {
+    const char *t = is_nan ? (upper ? "NAN" : "nan") : (upper ? "INF" : "inf");
+    unsigned long long total = (sign ? 1ULL : 0ULL) + 3;
+    unsigned long long pad = (unsigned long long)s->width > total ? (unsigned long long)s->width - total : 0;
+    if (!s->left) out_fill(o, ' ', pad);
+    if (sign) out_char(o, sign);
+    out_bytes(o, t, 3);
+    if (s->left) out_fill(o, ' ', pad);
+}
+
+/* %a / %A: the significand in hexadecimal, the exponent in decimal (a power of two). A subnormal is not normalized
+ * (0x0.0000000000001p-1022), as glibc prints it. */
+static void emit_hexfloat(struct fmt_out *o, const struct spec *s, int upper, char sign, fp_u64 bits) {
+    unsigned bexp = (unsigned)((bits >> 52) & 0x7ff);
+    fp_u64 frac = bits & ((((fp_u64)1) << 52) - 1);
+    fp_u64 M;
+    int e;
+    if (bexp == 0) {
+        M = frac;
+        e = frac ? -1022 : 0;
+    } else {
+        M = frac | (((fp_u64)1) << 52);
+        e = (int)bexp - 1023;
+    }
+    fp_u64 fv; /* the fraction digits, fvn hex digits of them */
+    int fvn;
+    int lead;
+    long long nd; /* digits printed after the point */
+    if (s->prec < 0) {
+        lead = (int)(M >> 52);
+        fv = frac;
+        fvn = 13;
+        nd = 13;
+        while (nd > 0 && ((fv >> (4 * (13 - nd))) & 0xf) == 0) nd--;
+    } else if (s->prec >= 13) {
+        lead = (int)(M >> 52);
+        fv = frac;
+        fvn = 13;
+        nd = s->prec;
+    } else {
+        int P = (int)s->prec;
+        int shift = (13 - P) * 4;
+        fp_u64 q = M >> shift;
+        fp_u64 rem = M & ((((fp_u64)1) << shift) - 1);
+        fp_u64 half = ((fp_u64)1) << (shift - 1);
+        if (rem > half || (rem == half && (q & 1))) q++;
+        lead = (int)(q >> (4 * P));
+        fv = P ? (q & ((((fp_u64)1) << (4 * P)) - 1)) : 0;
+        fvn = P;
+        nd = P;
+    }
+    unsigned ae = (unsigned)(e < 0 ? -e : e);
+    int point = nd > 0 || s->alt;
+    unsigned long long total = (sign ? 1ULL : 0ULL) + 2 + 1 + (point ? 1ULL : 0ULL) + (unsigned long long)nd + 2 + dec_digits(ae);
+    unsigned long long pad = (unsigned long long)s->width > total ? (unsigned long long)s->width - total : 0;
+    if (!s->left && !s->zero) out_fill(o, ' ', pad);
+    if (sign) out_char(o, sign);
+    out_char(o, '0');
+    out_char(o, upper ? 'X' : 'x');
+    if (!s->left && s->zero) out_fill(o, '0', pad);
+    out_char(o, (char)('0' + lead));
+    if (point) out_char(o, '.');
+    const char *hx = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    for (long long j = 0; j < nd; j++) {
+        int d = j < fvn ? (int)((fv >> (4 * (fvn - 1 - (int)j))) & 0xf) : 0;
+        out_char(o, hx[d]);
+    }
+    out_char(o, upper ? 'P' : 'p');
+    out_char(o, e < 0 ? '-' : '+');
+    out_dec(o, ae);
+    if (s->left) out_fill(o, ' ', pad);
+}
+
+static void emit_double(struct fmt_out *o, const struct spec *s, char conv, double v) {
+    union {
+        double d;
+        fp_u64 u;
+    } c;
+    c.d = v;
+    int neg = (int)(c.u >> 63);
+    int upper = conv == 'F' || conv == 'E' || conv == 'G' || conv == 'A';
+    char lc = upper ? (char)(conv + 32) : conv;
+    unsigned bexp = (unsigned)((c.u >> 52) & 0x7ff);
+    fp_u64 frac = c.u & ((((fp_u64)1) << 52) - 1);
+    char sign = neg ? '-' : s->plus ? '+' : s->space ? ' ' : 0;
+    if (bexp == 0x7ff) {
+        emit_nonfinite(o, s, upper, frac != 0, sign);
+        return;
+    }
+    if (lc == 'a') {
+        emit_hexfloat(o, s, upper, sign, c.u);
+        return;
+    }
+
+    fp_u64 m = bexp == 0 ? frac : (frac | (((fp_u64)1) << 52));
+    int e2 = bexp == 0 ? -1074 : (int)bexp - 1075;
+    struct fp_dec dec;
+    struct fp_round rr;
+    fp_exact(m, e2, &dec);
+    int is_zero = dec.n == 0;
+    rr.rn = 0;
+    rr.x = 0;
+
+    long long P = s->prec < 0 ? 6 : s->prec;
+    int style_e = lc == 'e';
+    long long int_len = 1, frac_len = 0;
+    int exp10 = 0;
+    if (lc == 'f') {
+        if (!is_zero) fp_round_digits(&dec, (long long)dec.x + 1 + P, &rr);
+        if (rr.rn > 0 && rr.x >= 0) int_len = (long long)rr.x + 1;
+        frac_len = P;
+    } else if (lc == 'e') {
+        if (!is_zero) fp_round_digits(&dec, P + 1, &rr);
+        exp10 = rr.rn > 0 ? rr.x : 0;
+        frac_len = P;
+    } else { /* g */
+        if (P == 0) P = 1;
+        if (!is_zero) fp_round_digits(&dec, P, &rr);
+        long long X = rr.rn > 0 ? rr.x : 0;
+        long long Xpre = is_zero ? 0 : dec.x; /* the exponent before rounding */
+        if (X >= -4 && X < P) {
+            if (X >= 0) int_len = X + 1;
+            frac_len = P - 1 - X;
+        } else {
+            style_e = 1;
+            exp10 = (int)X;
+            frac_len = P - 1;
+            /* glibc quirk, measured: when rounding carries 9.99.. up to 10.. and so moves the number from the fixed
+             * style into the exponent style (999.5 with %.3g), the count of fraction digits is still the one worked out
+             * for the fixed style, P - 1 - Xpre, which is 0: "%#.3g" of 999.5 is "1.e+03", not "1.00e+03". Without '#'
+             * the zeros are dropped anyway, so it shows only there. */
+            if (Xpre >= -4 && Xpre < P) frac_len = P - 1 - Xpre;
+        }
+        if (!s->alt) {
+            while (frac_len > 0) {
+                long long ee = style_e ? (long long)exp10 - frac_len : -frac_len;
+                if (fp_digit(&rr, ee) != 0) break;
+                frac_len--;
+            }
+        }
+    }
+    int point = frac_len > 0 || s->alt;
+    unsigned aexp = (unsigned)(exp10 < 0 ? -exp10 : exp10);
+    unsigned long long explen = style_e ? 2 + (dec_digits(aexp) < 2 ? 2 : dec_digits(aexp)) : 0;
+    unsigned long long total = (sign ? 1ULL : 0ULL) + (unsigned long long)int_len + (point ? 1ULL : 0ULL) + (unsigned long long)frac_len + explen;
+    unsigned long long pad = (unsigned long long)s->width > total ? (unsigned long long)s->width - total : 0;
+
+    if (!s->left && !s->zero) out_fill(o, ' ', pad);
+    if (sign) out_char(o, sign);
+    if (!s->left && s->zero) out_fill(o, '0', pad);
+    if (style_e) {
+        out_char(o, (char)('0' + fp_digit(&rr, exp10)));
+    } else {
+        for (long long t = int_len - 1; t >= 0; t--) out_char(o, (char)('0' + fp_digit(&rr, t)));
+    }
+    if (point) out_char(o, '.');
+    for (long long j = 0; j < frac_len; j++) {
+        long long ee = style_e ? (long long)exp10 - 1 - j : -1 - j;
+        long long idx = (long long)rr.x - ee;
+        if (rr.rn == 0 || idx >= rr.rn) {
+            out_fill(o, '0', (unsigned long long)(frac_len - j)); /* nothing but zeros from here on */
+            break;
+        }
+        out_char(o, (char)('0' + fp_digit(&rr, ee)));
+    }
+    if (style_e) {
+        out_char(o, upper ? 'E' : 'e');
+        out_char(o, exp10 < 0 ? '-' : '+');
+        if (aexp < 10) out_char(o, '0');
+        out_dec(o, aexp);
+    }
+    if (s->left) out_fill(o, ' ', pad);
+}
+
+
 int __moqi_vformat(char *buf, size_t size, moqi_sink_fn sink, void *ctx, const char *fmt, va_list ap) {
     struct fmt_out o;
     o.sink = sink;
@@ -228,6 +425,7 @@ int __moqi_vformat(char *buf, size_t size, moqi_sink_fn sink, void *ctx, const c
         s.width = 0;
         s.prec = -1;
         s.len = LEN_NONE;
+        s.ldbl = 0;
 
         for (int more = 1; more;) {
             switch (*fmt) {
@@ -270,7 +468,8 @@ int __moqi_vformat(char *buf, size_t size, moqi_sink_fn sink, void *ctx, const c
         switch (*fmt) {
         case 'h': fmt++; if (*fmt == 'h') { s.len = LEN_HH; fmt++; } else s.len = LEN_H; break;
         case 'l': fmt++; if (*fmt == 'l') { s.len = LEN_LL; fmt++; } else s.len = LEN_L; break;
-        case 'L': case 'q': case 'z': case 'Z': case 'j': case 't': s.len = LEN_OTHER; fmt++; break;
+        case 'L': s.ldbl = 1; s.len = LEN_OTHER; fmt++; break;
+        case 'q': case 'z': case 'Z': case 'j': case 't': s.len = LEN_OTHER; fmt++; break;
         default: break;
         }
 
@@ -364,6 +563,15 @@ int __moqi_vformat(char *buf, size_t size, moqi_sink_fn sink, void *ctx, const c
             } else {
                 emit_number(&o, &s, 1, 0, (unsigned long long)(size_t)p, 16, 0, 1);
             }
+            break;
+        }
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A': {
+            if (s.ldbl) {
+                o.err = EINVAL; /* long double is not supported */
+                break;
+            }
+            double dv = va_arg(ap, double);
+            emit_double(&o, &s, conv, dv);
             break;
         }
         case 'n': {

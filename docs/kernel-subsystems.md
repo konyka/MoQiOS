@@ -2965,3 +2965,6 @@ fork 与不带 `CLONE_VM` 的 clone 用 `inheritCharges` 继承，`CLONE_VM` 线
 
 **libc 浮点解析（hello217）**：`lib/moqi_libc/src/strtod.c` 提供 `strtod`/`strtof`/`atof`，转换用定长大整数做精确的最近偶数舍入，内部无浮点运算；
 行为按 glibc 逐位对照（1321 行表 + 4000 万随机串差分）。无 `strtold`，无 printf 浮点转换。
+
+**libc printf 浮点转换（hello218）**：`lib/moqi_libc/src/fpfmt.h` 把 double 精确展开为十进制数字串再做十进制舍入，`format.c` 的 `f F e E g G a A` 用它输出，
+与 glibc 逐位一致（9067 行表 + 500 万随机格式差分）。无 `long double`。

@@ -219,7 +219,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | `include/crt0.h` | 初始栈解析（`moqi_parse_initial_stack`，头文件内联，可宿主机测试） |
 | `include/unistd.h` | read/write/open/close/lseek/fork/execve/waitpid/_exit/pipe/dup2/yield/nanosleep/brk/sbrk 等 + `extern char **environ` |
 | `include/string.h` | memcpy/memmove/memset/memcmp/strlen/strcmp/strncmp/strcpy/strncpy/strcat/strchr/strrchr |
-| `include/stdio.h` | printf 家族（printf/vprintf/dprintf/vdprintf/snprintf/vsnprintf/sprintf/vsprintf/asprintf/vasprintf）、puts/putchar；语法与 glibc 一致：标志 `# 0 - + 空格 ' I`、宽度、精度、`*`、长度 `hh h l ll L q z Z j t`、转换 `d i u o x X b B c s p n m C S %`；无浮点、无位置参数（`%1$d`） |
+| `include/stdio.h` | printf 家族（printf/vprintf/dprintf/vdprintf/snprintf/vsnprintf/sprintf/vsprintf/asprintf/vasprintf）、puts/putchar；语法与 glibc 一致：标志 `# 0 - + 空格 ' I`、宽度、精度、`*`、长度 `hh h l ll L q z Z j t`、转换 `d i u o x X b B c s p n m C S %`；浮点 `f F e E g G a A` 与 glibc 逐位一致，无 `long double`、无位置参数（`%1$d`） |
 | `include/stdlib.h` | malloc/free/calloc（brk 上的首次适配空闲链表）、exit、atoi、getenv |
 | `include/ctype.h` | isdigit/isalpha/isspace/toupper 等（纯头文件） |
 | `include/signal.h` | `struct ksigaction`（匹配内核读取的 28 字节布局）、sigaction、SIGINT/SIG_IGN 等 |
@@ -240,9 +240,12 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
   测试方式为 TDD：`host_tests/run_tests.sh` 用 `zig cc`（私有缓存目录，可与
   `zig build` 并行）在本机编译运行断言。
 - **malloc**：16 字节对齐的首次适配空闲链表，支持分裂与相邻块合并；扩容按
-  4KiB 粒度走 brk（syscall #7）。无 realloc，无线程安全（用户程序单线程）。
-- **printf**：格式化进 512 字节栈缓冲后一次 write 到 fd 1，超长截断；
-  无浮点、无宽度/精度修饰。
+  4KiB 粒度走 brk（syscall #7）。线程安全（自旋锁，信号重入时 malloc 返回 NULL、free 延迟）；有
+  `realloc`、`reallocarray`、`posix_memalign`、`aligned_alloc`、`memalign`，失败设 `ENOMEM`。
+- **printf 家族**：共享格式化引擎 `format.c`，语法与 glibc 一致（标志、宽度、精度、`*`、长度修饰符，
+  `d i u o x X b B c s p n m C S %` 以及 `f F e E g G a A`），`printf`/`dprintf` 经 512 字节分块的 `write`
+  输出、不缓冲；浮点转换用 double 的精确十进制展开再舍入，与 glibc 逐位一致（无 `long double`，无位置参数）。
+  另有 `sprintf`、`asprintf` 等，见 `include/stdio.h`。
 - **argc/argv/envp 与初始栈契约**：内核（`kernel/proc/user_stack.zig`
   `buildUserStack`）按 System V 布局构建进程入口栈：RSP 指向 argc（8 字节），
   其后依次是 NULL 结尾的 argv 指针数组、NULL 结尾的 envp 指针数组
@@ -274,9 +277,10 @@ init 的源文件不在 `user/` 下，构建时以显式路径调用 `addLibcUse
 
 ### 5.4 有意缺失
 
-浮点 printf、stdio 缓冲/FILE、errno 全局量、realloc、线程与 TLS、locale、
-setjmp/longjmp、完整 POSIX 信号语义、libc 侧 setenv（environ 只读；
-改环境用 `moqi_setenv`，见 5.2）。需要时请按最小需求追加，不要预先泛化。
+`FILE`/stdio 缓冲与 `fprintf`/`fputs`/`scanf`、`long double`（`strtold`、`%Lf`）、locale、
+setjmp/longjmp、完整 POSIX 信号语义。（`errno`、`realloc`、线程与 TLS、`setenv`/`putenv`、浮点
+`printf`/`strtod` 此前列在这里，现已实现，见各自的 hello 探针与 current-code-review-and-fix-plan.md。）
+需要时请按最小需求追加，不要预先泛化。
 
 `lib/zig_crt/` 另含 `start.zig`：Zig 用户程序的最小 `_start`（对齐栈 →
 `main()` → exit syscall），供 Zig 编写的 freestanding 用户程序链接，非 libc。

@@ -95,6 +95,26 @@ static void table(void) {
 #include "test_printf_rows.inc"
 }
 
+/* Floating point: a format, the bits of the double, snprintf's return value and its exact output, measured on glibc. */
+static int frow_no;
+static void check_frow(const char *fmt, unsigned long long bits, int want_n, const char *want) {
+    frow_no++;
+    double d;
+    memcpy(&d, &bits, 8);
+    static char buf[2048];
+    errno_slot = 0;
+    int n = moqi_snprintf(buf, sizeof buf, fmt, d);
+    if (n != want_n || strcmp(buf, want) != 0) {
+        fprintf(stderr, "frow %d (%s, bits %016llx): n want %d got %d\n  want [%.200s]\n  got  [%.200s]\n", frow_no, fmt, bits, want_n, n, want, buf);
+        bad++;
+    }
+}
+#define FROW(fmt, bits, n_, text) check_frow(fmt, bits, n_, text)
+
+static void ftable(void) {
+#include "test_printf_float_rows.inc"
+}
+
 static int fmt_into(char *buf, size_t size, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -105,6 +125,7 @@ static int fmt_into(char *buf, size_t size, const char *fmt, ...) {
 
 int main(void) {
     table();
+    ftable();
 
     /* %n stores the number of characters produced so far, at each size, and counts what truncation dropped. */
     {
@@ -124,6 +145,27 @@ int main(void) {
         ci = -1;
         moqi_snprintf(b, sizeof b, "%5n|", &ci);
         CHECK(ci == 0 && strcmp(b, "|") == 0);
+    }
+
+    /* Floating point arguments: the length modifiers h and l are accepted and change nothing (the argument is a double),
+     * '*' widths and precisions combine with them, and a negative '*' precision means no precision. */
+    {
+        char b[64];
+        int n = moqi_snprintf(b, sizeof b, "%lf|%hf", 2.5, 2.5);
+        CHECK(n == 17 && strcmp(b, "2.500000|2.500000") == 0);
+        n = moqi_snprintf(b, sizeof b, "%5.1f|%-8.3e|%+g", 2.5, 2.5, 2.5);
+        CHECK(n == 20 && strcmp(b, "  2.5|2.500e+00|+2.5") == 0);
+        n = moqi_snprintf(b, sizeof b, "%.*f|%*.*f|%-*.*e", 3, 2.5, 10, 2, 2.5, 12, 1, 2.5);
+        CHECK(n == 29 && strcmp(b, "2.500|      2.50|2.5e+00     ") == 0);
+        n = moqi_snprintf(b, sizeof b, "%.*f", -1, 2.5);
+        CHECK(n == 8 && strcmp(b, "2.500000") == 0);
+        /* Arguments after a float conversion are read from the right place. */
+        n = moqi_snprintf(b, sizeof b, "%f %d %s %e %c", 1.25, 7, "ab", 0.5, 'z');
+        CHECK(n == (int)strlen("1.250000 7 ab 5.000000e-01 z") && strcmp(b, "1.250000 7 ab 5.000000e-01 z") == 0);
+        /* long double is not supported: -1 and EINVAL, and what came before the conversion stays in the buffer. */
+        errno_slot = 0;
+        n = moqi_snprintf(b, sizeof b, "ab%Lf", (double)1.5);
+        CHECK(n == -1 && errno_slot == EINVAL && b[0] == 'a' && b[1] == 'b' && b[2] == 0);
     }
 
     /* Size handling: NULL with size 0 counts, size 1 only terminates, nothing is written for size 0. */
@@ -277,6 +319,6 @@ int main(void) {
     }
 
     if (bad) { fprintf(stderr, "test_printf_abi: %d failures\n", bad); return 1; }
-    fprintf(stdout, "test_printf_abi: %d rows and the failure-injection checks OK\n", row_no);
+    fprintf(stdout, "test_printf_abi: %d rows, %d floating-point rows and the failure-injection checks OK\n", row_no, frow_no);
     return 0;
 }
