@@ -34,7 +34,7 @@ const EACCES = errno.EACCES;
 /// mmap.zig's untrackMmapRange, including the ext2 open-slot retain (each
 /// piece's releaseRegionBacking balances one reference).
 fn insertRegionPiece(cur: *task.Task, base: u64, num_pages: u64, proto: *const task.MmapRegion, prot: u8, file_offset: u64) void {
-    for (&cur.mmap_regions) |*slot| {
+    for (cur.vma().regions) |*slot| {
         if (!slot.active) {
             slot.* = .{
                 .base = base,
@@ -56,9 +56,9 @@ fn insertRegionPiece(cur: *task.Task, base: u64, num_pages: u64, proto: *const t
             if (proto.file_kind == @intFromEnum(filemap.FsKind.ext2)) {
                 @import("../fs/ext2.zig").retainFile(proto.file_idx);
             }
-            cur.mmap_count += 1;
-            const idx = (@intFromPtr(slot) - @intFromPtr(&cur.mmap_regions[0])) / @sizeOf(task.MmapRegion);
-            cur.mmap_active_bm |= @as(u64, 1) << @intCast(idx);
+            cur.vma().count += 1;
+            const idx = (@intFromPtr(slot) - @intFromPtr(&cur.vma().regions[0])) / @sizeOf(task.MmapRegion);
+            cur.vma().active_bm |= @as(u64, 1) << @intCast(idx);
             return;
         }
     }
@@ -125,12 +125,12 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     // PTE rewrite would leave metadata and page tables describing different
     // permissions.
     var slots_needed: u32 = 0;
-    const free_slots: u32 = @intCast(cur.mmap_regions.len - @popCount(cur.mmap_active_bm));
-    var bits = cur.mmap_active_bm;
+    const free_slots: u32 = @intCast(cur.vma().regions.len - @popCount(cur.vma().active_bm));
+    var bits = cur.vma().active_bm;
     while (bits != 0) {
         const i: usize = @intCast(@ctz(bits));
         bits &= bits - 1;
-        const r = &cur.mmap_regions[i];
+        const r = &cur.vma().regions[i];
         if (r.file_kind == 0) continue; // anonymous faults never read prot
         const plan = filemap.planProtUpdate(r.base, r.num_pages, addr, len_pages);
         // A shared mapping of a read-only fd can never become writable:
@@ -311,7 +311,7 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     // H1: update the file regions' prot metadata (splitting on partial
     // overlaps) so later demand faults grant the new permissions.
     const new_prot: u8 = @intCast(prot & 7);
-    for (&cur.mmap_regions) |*r| {
+    for (cur.vma().regions) |*r| {
         if (!r.active or r.file_kind == 0) continue;
         const plan = filemap.planProtUpdate(r.base, r.num_pages, addr, len_pages);
         if (plan.overlap == .none) continue;

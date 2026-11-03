@@ -527,18 +527,15 @@ pub fn cleanupTask(t: *task_mod.Task, space_pml4: u64) void {
     const dflags = dma_lock.acquire();
     for (&dma_allocs[t.self_idx]) |*e| {
         if (!e.active) continue;
-        if (space_pml4 != 0) unmapNoFree(space_pml4, e.user_va, e.pages);
+        if (space_pml4 != 0) {
+            unmapNoFree(space_pml4, e.user_va, e.pages);
+            // The frames are about to be freed; the table is shared with sibling threads, so forget the region now.
+            if (t.mm != null and t.page_table_phys == space_pml4) mmap_mod.untrackRangePub(t, e.user_va, e.pages);
+        }
         freeDmaEntry(e);
     }
     dma_lock.release(dflags);
 
-    // MMIO (and any leftover no_free bookkeeping): unmap the pages so the
-    // destroyUserSpace walk never sees — let alone frees — device frames.
-    if (space_pml4 != 0) {
-        for (&t.mmap_regions) |*r| {
-            if (!r.active or !r.no_free) continue;
-            unmapNoFree(space_pml4, r.base, r.num_pages);
-            mmap_mod.untrackRangePub(t, r.base, r.num_pages);
-        }
-    }
+    // MMIO mappings are not touched here: they belong to the address space, which other threads may still be using, and
+    // the Mm finalizer (user_space.destroyMm) unmaps them, without freeing their frames, when the last thread is gone.
 }

@@ -706,7 +706,7 @@ fn findFreeRegion(task: *task_mod.Task, num_pages: u32) u64 {
     while (addr + region_size <= SHM_END) {
         // Skip past any tracked region overlapping this candidate.
         var conflict_end: u64 = 0;
-        for (task.mmap_regions) |r| {
+        for (task.vma().regions) |r| {
             if (!r.active) continue;
             const r_end = r.base + r.num_pages * PAGE_SIZE;
             if (addr < r_end and r.base < addr + region_size) {

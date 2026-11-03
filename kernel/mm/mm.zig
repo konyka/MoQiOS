@@ -56,6 +56,9 @@ pub const Mm = struct {
     /// loader left the break (it may never retreat below it); 0 in both means no heap was set up for this image.
     brk_start: u64 = 0,
     brk_current: u64 = 0,
+    /// The tracked mappings (mmap/munmap/mprotect/mlock bookkeeping) of this address space. Written under vm_lock. The
+    /// region array is one page allocated with the Mm and freed with it; a fork child gets a copy, exec an empty table.
+    vma_tab: @import("vma_table.zig").VmaTable,
 
     /// Set the initial break of a freshly built address space (loader, exec). Nobody else can see it yet.
     pub fn setBreak(mm: *Mm, brk: u64) void {
@@ -91,7 +94,14 @@ pub const Mm = struct {
         const slab = @import("slab.zig");
         const ptr = slab.kmalloc(@sizeOf(Mm)) orelse return null;
         const mm: *Mm = @ptrCast(@alignCast(ptr));
-        mm.* = .{ .page_table_phys = page_table_phys, .finalizer = finalizer };
+        const pmm = @import("pmm.zig");
+        const phys = pmm.allocPage() orelse {
+            slab.kfree(ptr);
+            return null;
+        };
+        const regions: *[@import("vma_table.zig").MAX_REGIONS]@import("vma_table.zig").MmapRegion = @ptrFromInt(@import("hhdm.zig").physToVirt(phys));
+        for (regions) |*r| r.* = .{};
+        mm.* = .{ .page_table_phys = page_table_phys, .finalizer = finalizer, .vma_tab = .{ .regions = regions } };
         return mm;
     }
 
@@ -130,6 +140,7 @@ pub const Mm = struct {
         if (self.refs.load(.acquire) != TERMINAL_REFS) return;
         if (self.finalized.swap(true, .acq_rel)) return;
         self.finalizer(self);
+        @import("pmm.zig").freePage(@import("hhdm.zig").virtToPhys(@intFromPtr(self.vma_tab.regions)));
         @import("slab.zig").kfree(self);
     }
 

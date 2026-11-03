@@ -10497,3 +10497,30 @@ test "the program break belongs to the address space: CLONE_VM threads share it,
     try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "new_mm.setBreak(result.brk);") != null);
     try std.testing.expect(@sizeOf(kt.mm.Mm) <= 1024);
 }
+
+test "the mapping table belongs to the address space: CLONE_VM threads share one table, teardown happens when the Mm dies" {
+    // The table of mappings (mmap_regions) was in Task and clone copied it, so a mapping made by one thread was missing
+    // from every other thread's table: madvise/mremap said ENOMEM/EINVAL for it, a re-map after another thread's munmap
+    // collided with a stale entry. It is in Mm now (vm_lock protects it).
+    try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "mmap_regions") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "mmap_active_bm") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.mm_source, "vma_tab: @import(\"vma_table.zig\").VmaTable,") != null);
+    // Nobody reaches for the old Task fields.
+    for ([_][]const u8{ kt.mmap_source, kt.mprotect_source, kt.clone_source, kt.fork_source, kt.idt_source, kt.syscall_entry_source }) |src| {
+        try std.testing.expect(std.mem.indexOf(u8, src, "mmap_regions") == null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "mmap_active_bm") == null);
+    }
+    // fork and a clone without CLONE_VM copy the table into the child's new Mm, taken under the parent's vm_lock
+    // together with the page-table clone; a CLONE_VM clone shares the Mm and copies nothing.
+    try std.testing.expect(std.mem.indexOf(u8, kt.fork_source, "vma_table.zig\").snapshot(parent.vma(), &vma_snap);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "vma_table.zig\").snapshot(parent.vma(), &vma_snap);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "child.vma().regions") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "if (!shares_vm) {\n        if (child.mm) |child_mm| if (parent.mm) |parent_mm| child_mm.inheritBreak(parent_mm);") != null);
+    // File references are released once, when the last user of the Mm drops it, not by each thread or by exec.
+    try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "releaseFileRefs(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "releaseFileRefs(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.user_space_source, "releaseFileRefs(&mm.vma_tab)") != null);
+    // A thread's death must not unmap device mappings the group still uses: that happens in the Mm finalizer.
+    try std.testing.expect(std.mem.indexOf(u8, kt.user_space_source, "no_free") != null);
+    try std.testing.expect(@sizeOf(kt.mm.Mm) <= 1024);
+}

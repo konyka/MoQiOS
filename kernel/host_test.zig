@@ -101,6 +101,7 @@ pub const swap_source = @embedFile("mm/swap.zig");
 pub const mmap_mlock_source = @embedFile("mm/mmap.zig");
 pub const brk_source = @embedFile("mm/brk.zig");
 pub const mm_source = @embedFile("mm/mm.zig");
+pub const user_space_source = @embedFile("mm/user_space.zig");
 pub const shm_policy = @import("ipc/shm_policy.zig");
 pub const sysv_shm_policy = @import("ipc/sysv_shm_policy.zig");
 pub const posix_mq_attr_policy = @import("ipc/posix_mq_attr_policy.zig");

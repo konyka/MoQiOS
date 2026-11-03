@@ -202,10 +202,7 @@ pub fn prepareExecName(name: []const u8, argv_ptr: u64, envp_ptr: u64) Prepared 
     // fb0: the old image's framebuffer mappings die with it — drop their
     // registry entries (restores the console mirror when none remain).
     @import("../drivers/fbdev.zig").cleanupTask(cur);
-    // G2: the old image's file mappings die with it — release their backing
-    // refs (ext2 open slots) and clear the stale region table before the old
-    // address space is destroyed.
-    @import("../mm/mmap.zig").releaseFileRefs(cur);
+    // G2: the old image's file mappings die with its Mm: their backing refs are released by the Mm finalizer.
     if (old_mm) |mm| mm.release() else if (old_pml4 != 0) user_space.destroyUserSpace(old_pml4);
     @import("../arch/arch.zig").gdt.setRsp0(getPerCpu().cpu_id, cur.kernel_stack_top);
     // ioperm: pair every per-switch RSP0 update with the IOPB load.

@@ -303,16 +303,7 @@ pub const Task = struct {
     /// Number of involuntary context switches.
     nivcsw: u64 = 0,
 
-    /// mmap region tracking — records all mmap'd address ranges for munmap.
-    /// Each entry stores (base_addr, num_pages). Max 64 regions per process.
-    /// Invariant: the region table is per-task, single-writer — only the
-    /// owning task (as current) mutates it under its Mm's vm_lock. Readers
-    /// outside that guard are safe-by-construction: fork/clone read the
-    /// PARENT's table while the parent IS the current (guarded) task, so the
-    /// post-guard copies race nothing (see fork.zig).
-    mmap_regions: [64]MmapRegion = [_]MmapRegion{.{}} ** 64,
-    mmap_count: u32 = 0,
-    mmap_active_bm: u64 = 0,
+    // The table of tracked mmap regions lives in Mm (mm/vma_table.zig): CLONE_VM threads share it. Use Task.vma().
 
     /// Per-task I/O permission bitmap (TSS IOPB, 8192 bytes / 2 PMM pages,
     /// HHDM virtual pointer). Lazily allocated on the first ioperm_set call;
@@ -384,6 +375,13 @@ pub const Task = struct {
     inheritable_caps: @import("../ipc/capability.zig").SysCap = @import("../ipc/capability.zig").NO_CAPS,
     /// Internal trust marker: only the boot-created init may delegate profiles.
     initial_init: bool = false,
+
+    /// The table of tracked mappings of this task's address space (shared by CLONE_VM threads). A task without an
+    /// address space (a kernel thread, or a reaped slot) gets one static empty table that nothing may fill.
+    pub fn vma(self: *const Task) *@import("../mm/vma_table.zig").VmaTable {
+        if (self.mm) |m| return &m.vma_tab;
+        return &no_mm_table;
+    }
 };
 
 pub const MAX_OPERATION_REFS: u32 = 1024;
@@ -568,58 +566,12 @@ pub fn snapshotDistinctMms(buf: []MmSnapshot) usize {
     return n;
 }
 
-/// Tracked mmap region for munmap support.
-pub const MmapRegion = struct {
-    base: u64 = 0,
-    num_pages: u64 = 0,
-    /// 0 = free slot
-    active: bool = false,
-    /// Whether this region is mlock'd (non-swappable).
-    locked: bool = false,
-
-    /// I1: count of 2MiB huge blocks in this region; they are always the
-    /// FIRST huge_pages*512 pages of the region (a block that falls back to
-    /// 4K at mmap ends huge allocation for the rest of the region).
-    /// Informational: every huge-page mutation path (munmap/mprotect/
-    /// mremap/fork/teardown) is driven by the page tables themselves, and
-    /// any partial mutation demotes first — this count only records what
-    /// mmap created and is recomputed conservatively on region splits.
-    huge_pages: u32 = 0,
-
-    // ─── G2: file-backed (MAP_PRIVATE) metadata ───
-    // All zero = anonymous region, so existing initialisers are unaffected.
-    /// Backing store kind (filemap.FsKind as u8); 0 = anonymous.
-    file_kind: u8 = 0,
-    /// PROT_READ/WRITE/EXEC bits captured at mmap; demand faults synthesise
-    /// page permissions from this. mprotect updates it (splitting regions).
-    prot: u8 = 0,
-    /// H1: MAP_SHARED region — faults map the backing frame writable with no
-    /// COW marker, fork keeps the frame shared, and ext2/fat32 regions flush
-    /// their dirty page-cache pages when the region is released.
-    shared: bool = false,
-    /// Linux VM_MAYWRITE for MAP_SHARED file regions: false when the fd was
-    /// opened read-only, so mprotect cannot later grant PROT_WRITE (EACCES).
-    may_write: bool = true,
-    /// Byte offset in the file that corresponds to `base`.
-    file_offset: u64 = 0,
-    /// File size snapshot taken at mmap time — drives the EOF/SIGSEGV rule.
-    file_size: u64 = 0,
-    /// FS open slot: ext2_file_idx / fat32_file_idx / tmpfs entry index.
-    file_idx: u32 = 0,
-    /// ramdisk: kernel-virtual data pointer. tmpfs: ctime generation tag.
-    file_data: u64 = 0,
-    /// Page-cache key (ext2/fat32).
-    inode_id: u64 = 0,
-
-    /// L1: the frames backing this region are NOT PMM-owned RAM (user-MMIO
-    /// from dev_map_mmio, or DMA frames owned by the user driver framework).
-    /// unmapRange must unmap such pages without returning their frames to
-    /// the PMM; the owner (userdrv) releases DMA frames itself, and MMIO
-    /// frames are never freed at all.
-    no_free: bool = false,
-};
+pub const MmapRegion = @import("../mm/vma_table.zig").MmapRegion;
 
 pub const MAX_TASKS: u32 = 64;
+
+var no_mm_regions: [64]MmapRegion = [_]MmapRegion{.{}} ** 64;
+var no_mm_table: @import("../mm/vma_table.zig").VmaTable = .{ .regions = &no_mm_regions };
 
 /// Task table. Slots are NOT optionals: a `Task` used to be ~62KB (dominated
 /// by the embedded fd table, now pooled in vfs.zig) and storing it in a
@@ -1086,11 +1038,11 @@ pub fn countSharedWritableTmpfsMaps(idx: u32, gen: u64) u32 {
         bits &= bits - 1;
         const t = &tasks[i];
         if (t.state == .zombie) continue;
-        var rb = t.mmap_active_bm;
+        var rb = t.vma().active_bm;
         while (rb != 0) {
             const ri: u6 = @truncate(@ctz(rb));
             rb &= rb - 1;
-            const r = &t.mmap_regions[ri];
+            const r = &t.vma().regions[ri];
             if (r.active and r.shared and r.prot & 2 != 0 and r.file_kind == tmpfs_kind and r.file_idx == idx and r.file_data == gen) n += 1;
         }
     }
@@ -1356,19 +1308,6 @@ fn zombieViewLocked(i: u32, t: *const Task) reap_policy.ZombieView {
     };
 }
 
-/// The region table names file-backed or device mappings (see
-/// reap_policy.Lineage.maps_objects).
-fn mapsObjects(t: *const Task) bool {
-    var bits = t.mmap_active_bm;
-    while (bits != 0) {
-        const i: u6 = @truncate(@ctz(bits));
-        bits &= bits - 1;
-        const r = &t.mmap_regions[i];
-        if (r.active and (r.no_free or r.file_kind != 0)) return true;
-    }
-    return false;
-}
-
 /// Release everything a reaped zombie owns except its slot. Runs in the
 /// reaper thread (IRQs on, no task_lock) or, before the reaper exists,
 /// inline under task_lock.
@@ -1393,9 +1332,8 @@ fn teardownResources(t: *Task) void {
         @import("../drivers/fbdev.zig").cleanupTask(t);
         // ioperm: return the TSS IOPB pages (allocated by ioperm_set).
         @import("ioperm.zig").freeBitmap(t);
-        // G2: release file-region backing refs before the address space
-        // (destroyUserSpace walks page tables, not region metadata).
-        @import("../mm/mmap.zig").releaseFileRefs(t);
+        // G2: the file-region backing refs are released with the Mm itself (user_space.destroyMm), once, when the last
+        // thread of the address space is gone.
         if (t.mm) |mm| mm.release() else @import("../mm/user_space.zig").destroyUserSpace(t.page_table_phys);
         t.mm = null;
     }
@@ -1569,7 +1507,7 @@ pub fn reapZombies() u32 {
             const lineage: reap_policy.Lineage = .{
                 .is_thread = t.is_thread,
                 .parent_alive = parent_idx != null,
-                .maps_objects = t.is_thread and mapsObjects(t),
+                .maps_objects = false, // the table is the address space's, not a thread's copy: nothing here to keep alive
                 .parent_ignores_sigchld = if (parent_idx) |pi| tasks[pi].signal_handlers[17 - 1] == 1 else false,
             };
             if (reap_policy.autoReap(zombieViewLocked(i, t), lineage) != .detach) continue;

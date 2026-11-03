@@ -282,6 +282,7 @@ pub fn clone(
 
     // CLONE_VM: share address space (thread) vs COW copy (process)
     const shares_vm = flags & CLONE_VM != 0;
+    var vma_snap: @import("../../mm/vma_table.zig").Snapshot = undefined;
     const vm_policy = lifecycle_policy.cloneVmResult(flags, parent.mm != null);
     if (vm_policy != 0) return vm_policy;
     const child_pml4 = if (shares_vm)
@@ -295,7 +296,10 @@ pub fn clone(
         clone: {
             var vm_guard = @import("../../mm/mm.zig").Mm.beginVmMutation(parent.mm, @ptrCast(parent)) catch return -12; // ENOMEM
             defer vm_guard.release();
-            break :clone cloneUserPages(parent.page_table_phys, &parent.mmap_regions) orelse return -12; // ENOMEM
+            const pml4 = cloneUserPages(parent.page_table_phys, parent.vma().regions) orelse return -12; // ENOMEM
+            // The copied address space gets a copy of the mapping table, taken in the same critical section.
+            @import("../../mm/vma_table.zig").snapshot(parent.vma(), &vma_snap);
+            break :clone pml4;
         };
 
     if (shares_vm) {
@@ -303,9 +307,7 @@ pub fn clone(
             if (!parent_mm.retain()) return -12;
         }
     } else {
-        // I1: the COW clone demoted every huge block in the parent (the
-        // walk is 4K-only) — no huge pages remain, clear the counts.
-        for (&parent.mmap_regions) |*r| r.huge_pages = 0;
+        // (The snapshot above already cleared the huge-block counts: the COW clone demoted every huge block.)
     }
 
     // parent_mm.retain() above supplies the one retained reference transferred
@@ -343,15 +345,13 @@ pub fn clone(
     // parent's, so it starts with the same charged usage.
     child.as_used = parent.as_used;
     child.data_used = parent.data_used;
-    child.mmap_regions = parent.mmap_regions;
-    child.mmap_count = parent.mmap_count;
-    child.mmap_active_bm = parent.mmap_active_bm;
-    @import("../../mm/mmap.zig").retainFileRefs(child);
-
     child.stack_limit = parent.stack_limit;
     // CLONE_VM shares the parent's Mm, and with it the program break. A copied address space gets a copy of the break.
     if (!shares_vm) {
         if (child.mm) |child_mm| if (parent.mm) |parent_mm| child_mm.inheritBreak(parent_mm);
+        // ...and of the mapping table, with its own backing references. A CLONE_VM thread shares the Mm and the table.
+        @import("../../mm/vma_table.zig").adopt(child.vma(), &vma_snap);
+        @import("../../mm/mmap.zig").retainFileRefs(child.vma());
     }
 
     if (flags & CLONE_FILES != 0) {

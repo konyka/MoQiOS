@@ -26,7 +26,7 @@ const swap_mod = @import("swap.zig");
 const builtin = @import("builtin");
 
 fn mmapRegionIndex(task: *task_mod.Task, region: *task_mod.MmapRegion) u6 {
-    return @intCast((@intFromPtr(region) - @intFromPtr(&task.mmap_regions[0])) / @sizeOf(task_mod.MmapRegion));
+    return @intCast((@intFromPtr(region) - @intFromPtr(&task.vma().regions[0])) / @sizeOf(task_mod.MmapRegion));
 }
 
 /// I1: compile-time gate for user 2MiB huge pages on anonymous mappings.
@@ -69,11 +69,11 @@ pub fn skipHole(task: *task_mod.Task, virt: u64, stop_at_regions: bool) u64 {
         limit = (virt | (1024 * 1024 * 1024 - 1)) + 1;
     }
     if (stop_at_regions and limit > virt + page) {
-        var bits = task.mmap_active_bm;
+        var bits = task.vma().active_bm;
         while (bits != 0) {
             const i: u6 = @truncate(@ctz(bits));
             bits &= bits - 1;
-            const r_base = task.mmap_regions[i].base;
+            const r_base = task.vma().regions[i].base;
             if (r_base > virt and r_base < limit) limit = r_base;
         }
     }
@@ -211,11 +211,11 @@ pub fn unmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
 /// L1: true when `virt` belongs to an active no_free region (user-MMIO or
 /// framework DMA). Scans the region table — bounded by 64 entries.
 fn isNoFreePage(task: *task_mod.Task, virt: u64) bool {
-    var bits = task.mmap_active_bm;
+    var bits = task.vma().active_bm;
     while (bits != 0) {
         const i: u6 = @truncate(@ctz(bits));
         bits &= bits - 1;
-        const r = task.mmap_regions[i];
+        const r = task.vma().regions[i];
         if (!r.no_free) continue;
         if (virt >= r.base and virt - r.base < r.num_pages * user_space.PAGE_SIZE) return true;
     }
@@ -230,13 +230,13 @@ fn isNoFreePage(task: *task_mod.Task, virt: u64) bool {
 /// "merge" that trackMmapRegion then refuses (different prot/sharing, huge
 /// or no_free neighbour) reached its `unreachable` with a full table.
 fn canTrackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, anonymous: bool, prot: u8, shared: bool) bool {
-    if (task.mmap_count < task.mmap_regions.len) return true;
+    if (task.vma().count < task.vma().regions.len) return true;
     if (!anonymous) return false;
-    var bits = task.mmap_active_bm;
+    var bits = task.vma().active_bm;
     while (bits != 0) {
         const i: u6 = @truncate(@ctz(bits));
         bits &= bits - 1;
-        if (anonMergeSide(&task.mmap_regions[i], base, num_pages, prot, shared) != .none) return true;
+        if (anonMergeSide(&task.vma().regions[i], base, num_pages, prot, shared) != .none) return true;
     }
     return false;
 }
@@ -257,15 +257,15 @@ fn anonMergeSide(r: *const task_mod.MmapRegion, base: u64, num_pages: u64, prot:
 
 /// Check the metadata capacity for MAP_FIXED before destroying old mappings.
 fn canTrackReplacement(task: *task_mod.Task, base: u64, num_pages: u64) bool {
-    vma_runtime_stats.recordScan(task.mmap_active_bm);
+    vma_runtime_stats.recordScan(task.vma().active_bm);
     const page = user_space.PAGE_SIZE;
     const end = base + num_pages * page;
     var pieces: usize = 0;
-    var bits = task.mmap_active_bm;
+    var bits = task.vma().active_bm;
     while (bits != 0) {
         const i: u6 = @truncate(@ctz(bits));
         bits &= bits - 1;
-        const r = task.mmap_regions[i];
+        const r = task.vma().regions[i];
         const r_end = r.base + r.num_pages * page;
         if (r.base >= end or r_end <= base) {
             pieces += 1;
@@ -281,7 +281,7 @@ fn canTrackReplacement(task: *task_mod.Task, base: u64, num_pages: u64) bool {
     // This is intentionally conservative: trackMmapRegion may merge an
     // adjacent piece, but reserving the unmerged upper bound keeps MAP_FIXED
     // from destroying mappings before discovering an unrepresentable layout.
-    return pieces + 1 <= task.mmap_regions.len;
+    return pieces + 1 <= task.vma().regions.len;
 }
 
 /// File-backing metadata recorded for a file region at track time (G2).
@@ -300,14 +300,14 @@ pub const RegionFileMeta = struct {
     inode: u64,
 };
 
-/// Track an mmap region in the task's mmap_regions table.
+/// Track an mmap region in the address space's region table (Mm.vma_tab).
 /// `meta` is null for anonymous regions. File regions never merge with
 /// neighbours — a merge would silently drop one side's backing metadata.
 /// I1: regions with huge blocks never merge either way — a merge would
 /// break the invariant that a region's huge blocks are its FIRST
 /// huge_pages*512 pages.
 fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, meta: ?RegionFileMeta, prot: u8, shared: bool, huge_pages: u32) void {
-    vma_runtime_stats.recordScan(task.mmap_active_bm);
+    vma_runtime_stats.recordScan(task.vma().active_bm);
     // RLIMIT_AS: every tracked region charges its full length (merged or new).
     task.as_used += num_pages * user_space.PAGE_SIZE;
     // RLIMIT_DATA: only writable private regions (anonymous or file-private)
@@ -316,7 +316,7 @@ fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, meta: ?Regio
     if (writable_private) task.data_used += num_pages * user_space.PAGE_SIZE;
     // Try to merge with an adjacent existing region (anonymous only)
     if (meta == null and huge_pages == 0) {
-        for (&task.mmap_regions) |*r| {
+        for (task.vma().regions) |*r| {
             switch (anonMergeSide(r, base, num_pages, prot, shared)) {
                 .none => continue,
                 .after => {
@@ -332,11 +332,11 @@ fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, meta: ?Regio
         }
     }
     // Find a free slot using the occupancy mask.
-    var free_bits = ~task.mmap_active_bm;
+    var free_bits = ~task.vma().active_bm;
     while (free_bits != 0) {
         const i: u6 = @truncate(@ctz(free_bits));
         free_bits &= free_bits - 1;
-        const r = &task.mmap_regions[i];
+        const r = &task.vma().regions[i];
         if (!r.active) {
             r.* = .{ .base = base, .num_pages = num_pages, .active = true, .huge_pages = huge_pages };
             r.prot = prot;
@@ -350,8 +350,8 @@ fn trackMmapRegion(task: *task_mod.Task, base: u64, num_pages: u64, meta: ?Regio
                 r.file_data = m.data;
                 r.inode_id = m.inode;
             }
-            task.mmap_count += 1;
-            task.mmap_active_bm |= @as(u64, 1) << mmapRegionIndex(task, r);
+            task.vma().count += 1;
+            task.vma().active_bm |= @as(u64, 1) << mmapRegionIndex(task, r);
             return;
         }
     }
@@ -382,7 +382,7 @@ fn releaseRegionBacking(r: *task_mod.MmapRegion) void {
 }
 
 fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
-    vma_runtime_stats.recordScan(task.mmap_active_bm);
+    vma_runtime_stats.recordScan(task.vma().active_bm);
     const page = user_space.PAGE_SIZE;
     const end = base + num_pages * page;
     // RLIMIT_AS refund: regions never overlap each other, so the sum of
@@ -393,7 +393,7 @@ fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
     var data_refunded: u64 = 0;
     defer task.data_used -|= data_refunded * page;
 
-    for (&task.mmap_regions) |*r| {
+    for (task.vma().regions) |*r| {
         if (!r.active) continue;
         const r_end = r.base + r.num_pages * page;
         if (r.base >= end or r_end <= base) continue; // no overlap
@@ -415,8 +415,8 @@ fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
         if (base <= r.base and end >= r_end) {
             releaseRegionBacking(r);
             r.active = false;
-            task.mmap_active_bm &= ~(@as(u64, 1) << mmapRegionIndex(task, r));
-            if (task.mmap_count > 0) task.mmap_count -= 1;
+            task.vma().active_bm &= ~(@as(u64, 1) << mmapRegionIndex(task, r));
+            if (task.vma().count > 0) task.vma().count -= 1;
         } else if (base <= r.base and end < r_end) {
             const removed = (end - r.base) / page;
             r.base = end;
@@ -455,11 +455,11 @@ fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
                 0;
             r.num_pages = (base - r.base) / page;
             r.huge_pages = head_huge;
-            var free_bits = ~task.mmap_active_bm;
+            var free_bits = ~task.vma().active_bm;
             while (free_bits != 0) {
                 const i: u6 = @truncate(@ctz(free_bits));
                 free_bits &= free_bits - 1;
-                const r2 = &task.mmap_regions[i];
+                const r2 = &task.vma().regions[i];
                 if (!r2.active) {
                     r2.* = .{
                         .base = tail_base,
@@ -488,8 +488,8 @@ fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
                     if (r.file_kind == @intFromEnum(filemap.FsKind.fat32)) {
                         fat32.retainFile(r.file_idx);
                     }
-                    task.mmap_count += 1;
-                    task.mmap_active_bm |= @as(u64, 1) << mmapRegionIndex(task, r2);
+                    task.vma().count += 1;
+                    task.vma().active_bm |= @as(u64, 1) << mmapRegionIndex(task, r2);
                     break;
                 }
             }
@@ -501,29 +501,28 @@ fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
 /// its region table. Called by the task teardown paths (reap/exec) right
 /// before destroyUserSpace, which only walks page tables and never consults
 /// the region metadata.
-pub fn releaseFileRefs(task: *task_mod.Task) void {
-    var bits = task.mmap_active_bm;
+pub fn releaseFileRefs(tab: *@import("vma_table.zig").VmaTable) void {
+    var bits = tab.active_bm;
     while (bits != 0) {
         const i: u6 = @truncate(@ctz(bits));
         bits &= bits - 1;
-        const r = &task.mmap_regions[i];
+        const r = &tab.regions[i];
         if (!r.active) continue;
         releaseRegionBacking(r);
         r.active = false;
     }
-    task.mmap_count = 0;
-    task.mmap_active_bm = 0;
+    tab.count = 0;
+    tab.active_bm = 0;
 }
 
-/// Retain the backing references copied into a child task's region table.
-/// Region metadata is copied by clone, so each child teardown needs its own
-/// reference even when the page tables are shared by CLONE_VM.
-pub fn retainFileRefs(task: *const task_mod.Task) void {
-    var bits = task.mmap_active_bm;
+/// Retain the backing references copied into a new address space's region table (fork, clone without CLONE_VM). A
+/// CLONE_VM thread shares the table and takes none.
+pub fn retainFileRefs(tab: *@import("vma_table.zig").VmaTable) void {
+    var bits = tab.active_bm;
     while (bits != 0) {
         const i: u6 = @truncate(@ctz(bits));
         bits &= bits - 1;
-        const r = &task.mmap_regions[i];
+        const r = &tab.regions[i];
         if (!r.active) continue;
         if (r.file_kind == @intFromEnum(filemap.FsKind.ext2)) {
             ext2.retainFile(r.file_idx);
@@ -555,7 +554,7 @@ pub fn canTrackRegionPub(task: *task_mod.Task, base: u64, num_pages: u64) bool {
 /// must have been checked with canTrackRegionPub first; returns false instead
 /// of overflowing the table.
 pub fn trackNoFreeRegion(task: *task_mod.Task, base: u64, num_pages: u64) bool {
-    for (&task.mmap_regions) |*r| {
+    for (task.vma().regions) |*r| {
         if (!r.active) {
             // RLIMIT_AS: eager device regions charge like any mapping.
             task.as_used += num_pages * user_space.PAGE_SIZE;
@@ -566,8 +565,8 @@ pub fn trackNoFreeRegion(task: *task_mod.Task, base: u64, num_pages: u64) bool {
                 .locked = true,
                 .no_free = true,
             };
-            task.mmap_count += 1;
-            task.mmap_active_bm |= @as(u64, 1) << mmapRegionIndex(task, r);
+            task.vma().count += 1;
+            task.vma().active_bm |= @as(u64, 1) << mmapRegionIndex(task, r);
             return true;
         }
     }
@@ -588,7 +587,7 @@ fn rangesOverlap(a_base: u64, a_pages: u64, b_base: u64, b_pages: u64) bool {
 }
 
 /// Offset of the first mapped page in the range, or null when every page is
-/// free. Catches everything the mmap_regions table does not know about — the
+/// free. Catches everything the region table does not know about — the
 /// loaded image, the stack, break pages — so a placement search cannot land on a
 /// live mapping, and lets the search skip straight past a conflict.
 fn firstMappedPage(task: *task_mod.Task, base: u64, num_pages: u64) ?u64 {
@@ -613,11 +612,11 @@ fn pagesFree(task: *task_mod.Task, base: u64, num_pages: u64) bool {
 
 /// End address of the tracked mapping that covers `va`, or null when no tracked mapping does.
 fn trackedEnd(task: *task_mod.Task, va: u64) ?u64 {
-    var bits = task.mmap_active_bm;
+    var bits = task.vma().active_bm;
     while (bits != 0) {
         const i: u6 = @truncate(@ctz(bits));
         bits &= bits - 1;
-        const r = &task.mmap_regions[i];
+        const r = &task.vma().regions[i];
         const r_end = r.base + r.num_pages * user_space.PAGE_SIZE;
         if (va >= r.base and va < r_end) return r_end;
     }
@@ -632,11 +631,11 @@ fn trackedEnd(task: *task_mod.Task, va: u64) ?u64 {
 /// covers (a SysV SHM attachment placed there) are not locked.
 pub fn lockEverything(task: *task_mod.Task, table: *mlock_policy.Table) bool {
     const PAGE = user_space.PAGE_SIZE;
-    var bits = task.mmap_active_bm;
+    var bits = task.vma().active_bm;
     while (bits != 0) {
         const i: u6 = @truncate(@ctz(bits));
         bits &= bits - 1;
-        const r = &task.mmap_regions[i];
+        const r = &task.vma().regions[i];
         if (r.no_free) continue;
         if (!table.lock(r.base / PAGE, r.num_pages)) return false;
     }
@@ -679,12 +678,12 @@ pub fn hasReservedPage(task: *task_mod.Task, base: u64, num_pages: u64) bool {
 }
 
 pub fn hasMmapOverlap(task: *task_mod.Task, base: u64, num_pages: u64) bool {
-    vma_runtime_stats.recordScan(task.mmap_active_bm);
-    var bits = task.mmap_active_bm;
+    vma_runtime_stats.recordScan(task.vma().active_bm);
+    var bits = task.vma().active_bm;
     while (bits != 0) {
         const i: u6 = @truncate(@ctz(bits));
         bits &= bits - 1;
-        const r = task.mmap_regions[i];
+        const r = task.vma().regions[i];
         if (rangesOverlap(base, num_pages, r.base, r.num_pages)) return true;
     }
     return false;
@@ -700,11 +699,11 @@ fn rangeAvailable(task: *task_mod.Task, base: u64, num_pages: u64, ignore_base: 
     if (base >= user_space.USER_ADDR_MAX) return false;
     if (num_pages > (user_space.USER_ADDR_MAX - base) / user_space.PAGE_SIZE) return false;
 
-    var bits = task.mmap_active_bm;
+    var bits = task.vma().active_bm;
     while (bits != 0) {
         const i: u6 = @truncate(@ctz(bits));
         bits &= bits - 1;
-        const r = task.mmap_regions[i];
+        const r = task.vma().regions[i];
         if (ignore_base != null and r.base == ignore_base.?) continue;
         if (rangesOverlap(base, num_pages, r.base, r.num_pages)) return false;
     }
@@ -781,11 +780,11 @@ fn mapZeroedPage(task: *task_mod.Task, virt: u64, flags: paging_mod.MapFlags) bo
 /// Whether [base, base+num_pages) is exactly one tracked private anonymous region (the case
 /// replaceFixedAnonymous swaps in place).
 fn exactAnonymousRegion(task: *task_mod.Task, base: u64, num_pages: u64) bool {
-    var bits = task.mmap_active_bm;
+    var bits = task.vma().active_bm;
     while (bits != 0) {
         const i: u6 = @truncate(@ctz(bits));
         bits &= bits - 1;
-        const r = &task.mmap_regions[i];
+        const r = &task.vma().regions[i];
         if (r.base == base and r.num_pages == num_pages) return r.file_kind == 0 and !r.shared and !r.no_free;
     }
     return false;
@@ -797,17 +796,17 @@ fn exactAnonymousRegion(task: *task_mod.Task, base: u64, num_pages: u64) bool {
 /// representable afterwards. Nothing is changed here.
 fn fixedReplaceable(task: *task_mod.Task, base: u64, num_pages: u64) bool {
     const page = user_space.PAGE_SIZE;
-    var bits = task.mmap_active_bm;
+    var bits = task.vma().active_bm;
     var split_slots: u32 = 0;
     while (bits != 0) {
         const i: u6 = @truncate(@ctz(bits));
         bits &= bits - 1;
-        const r = &task.mmap_regions[i];
+        const r = &task.vma().regions[i];
         if (!rangesOverlap(base, num_pages, r.base, r.num_pages)) continue;
         if (r.no_free) return false;
         if (munmap_policy.needsSplitSlot(r.base, r.num_pages, base, num_pages)) split_slots += 1;
     }
-    const free_slots: u32 = @intCast(task.mmap_regions.len - @popCount(task.mmap_active_bm));
+    const free_slots: u32 = @intCast(task.vma().regions.len - @popCount(task.vma().active_bm));
     if (!munmap_policy.canUntrack(split_slots, free_slots)) return false;
     // A page that is mapped but belongs to no tracked region (loaded image, stack, brk) cannot be taken.
     var p: u64 = 0;
@@ -831,7 +830,7 @@ fn replaceFixedAnonymous(
     if (!fixed_replacement.pageCountSupported(num_pages)) return -12;
 
     var region: ?*task_mod.MmapRegion = null;
-    for (&task.mmap_regions) |*candidate| {
+    for (task.vma().regions) |*candidate| {
         if (candidate.active and rangesOverlap(base, num_pages, candidate.base, candidate.num_pages) and
             (candidate.base != base or candidate.num_pages != num_pages)) return -12;
         if (!candidate.active or candidate.base != base or candidate.num_pages != num_pages) continue;
@@ -1505,11 +1504,11 @@ pub fn madviseDontneed(addr: u64, length: u64) i64 {
     while (p < num_pages) : (p += 1) {
         const va = base + p * page;
         var covered = false;
-        var bits = cur.mmap_active_bm;
+        var bits = cur.vma().active_bm;
         while (bits != 0) {
             const i: usize = @intCast(@ctz(bits));
             bits &= bits - 1;
-            const r = &cur.mmap_regions[i];
+            const r = &cur.vma().regions[i];
             if (va >= r.base and va < r.base + r.num_pages * page) {
                 if (r.no_free) return -22;
                 // mseal: discarding a sealed read-only private anonymous
@@ -1529,11 +1528,11 @@ pub fn madviseDontneed(addr: u64, length: u64) i64 {
 
     // Shared mappings: write dirty file pages back before dropping them, as
     // munmap does, so DONTNEED never discards data.
-    var bits = cur.mmap_active_bm;
+    var bits = cur.vma().active_bm;
     while (bits != 0) {
         const i: usize = @intCast(@ctz(bits));
         bits &= bits - 1;
-        const r = &cur.mmap_regions[i];
+        const r = &cur.vma().regions[i];
         const r_end = r.base + r.num_pages * page;
         if (r.base >= base + num_pages * page or r_end <= base) continue;
         if (r.shared and
@@ -1556,11 +1555,11 @@ pub fn madviseDontneed(addr: u64, length: u64) i64 {
     while (pg < num_pages) : (pg += 1) {
         const va = base + pg * page;
         const is_file = blk: {
-            var rb = cur.mmap_active_bm;
+            var rb = cur.vma().active_bm;
             while (rb != 0) {
                 const i: usize = @intCast(@ctz(rb));
                 rb &= rb - 1;
-                const r = &cur.mmap_regions[i];
+                const r = &cur.vma().regions[i];
                 if (va >= r.base and va < r.base + r.num_pages * page) break :blk r.file_kind != 0;
             }
             break :blk false;
@@ -1615,14 +1614,14 @@ pub fn munmap(addr: u64, length: u64) i64 {
     // Fail before any mutation (unlike mmap/mprotect, munmap had no such
     // preflight).
     var split_slots: u32 = 0;
-    var untrack_bits = cur.mmap_active_bm;
+    var untrack_bits = cur.vma().active_bm;
     while (untrack_bits != 0) {
         const i: usize = @intCast(@ctz(untrack_bits));
         untrack_bits &= untrack_bits - 1;
-        const r = &cur.mmap_regions[i];
+        const r = &cur.vma().regions[i];
         if (munmap_policy.needsSplitSlot(r.base, r.num_pages, base, num_pages)) split_slots += 1;
     }
-    const free_slots: u32 = @intCast(cur.mmap_regions.len - @popCount(cur.mmap_active_bm));
+    const free_slots: u32 = @intCast(cur.vma().regions.len - @popCount(cur.vma().active_bm));
     if (!munmap_policy.canUntrack(split_slots, free_slots)) return -12;
 
     // Unmap pages and free physical memory
@@ -1684,11 +1683,11 @@ fn regionContaining(task: *task_mod.Task, addr: u64, pages: u64) ?usize {
     const page = user_space.PAGE_SIZE;
     const end = @addWithOverflow(addr, pages *% page);
     if (end[1] != 0 or pages == 0) return null;
-    var bits = task.mmap_active_bm;
+    var bits = task.vma().active_bm;
     while (bits != 0) {
         const i: usize = @intCast(@ctz(bits));
         bits &= bits - 1;
-        const r = &task.mmap_regions[i];
+        const r = &task.vma().regions[i];
         if (r.base <= addr and end[0] <= r.base + r.num_pages * page) return i;
     }
     return null;
@@ -1700,16 +1699,16 @@ fn regionTraits(r: *const task_mod.MmapRegion) mremap_policy.Traits {
 
 /// A new region record cloned from `proto` (anonymous, so there is no file backing to retain) covering [base, +pages).
 fn insertAnonPiece(task: *task_mod.Task, proto: *const task_mod.MmapRegion, base: u64, pages: u64, huge: u32) usize {
-    var free_bits = ~task.mmap_active_bm;
+    var free_bits = ~task.vma().active_bm;
     while (free_bits != 0) {
         const i: u6 = @truncate(@ctz(free_bits));
         free_bits &= free_bits - 1;
-        const r = &task.mmap_regions[i];
+        const r = &task.vma().regions[i];
         if (r.active) continue;
         r.* = .{ .base = base, .num_pages = pages, .active = true, .locked = proto.locked, .huge_pages = huge, .no_free = proto.no_free,
                  .shared = proto.shared, .may_write = proto.may_write, .prot = proto.prot };
-        task.mmap_count += 1;
-        task.mmap_active_bm |= @as(u64, 1) << i;
+        task.vma().count += 1;
+        task.vma().active_bm |= @as(u64, 1) << i;
         return i;
     }
     unreachable; // the caller checked that enough slots were free
@@ -1722,7 +1721,7 @@ const SplitPieces = struct { head: ?usize, mid: usize, tail: ?usize };
 /// region. Only the region table changes: the pages, their charges and the locks are untouched.
 fn splitRegionForRange(task: *task_mod.Task, idx: usize, plan: mremap_policy.Plan, old_addr: u64) SplitPieces {
     const page = user_space.PAGE_SIZE;
-    const r = &task.mmap_regions[idx];
+    const r = &task.vma().regions[idx];
     const proto = r.*;
     const mid_base = old_addr;
     const tail_base = old_addr + plan.mid_pages * page;
@@ -1744,15 +1743,15 @@ fn splitRegionForRange(task: *task_mod.Task, idx: usize, plan: mremap_policy.Pla
 /// distinguishes them. Used to put back together the pieces a mremap split apart.
 fn mergeIfAdjacent(task: *task_mod.Task, a: usize, b: usize) void {
     const page = user_space.PAGE_SIZE;
-    const ra = &task.mmap_regions[a];
-    const rb = &task.mmap_regions[b];
+    const ra = &task.vma().regions[a];
+    const rb = &task.vma().regions[b];
     if (a == b or !ra.active or !rb.active) return;
     if (ra.base + ra.num_pages * page != rb.base) return;
     if (!mremap_policy.canCoalesce(regionTraits(ra), regionTraits(rb))) return;
     ra.num_pages += rb.num_pages;
     rb.active = false;
-    task.mmap_active_bm &= ~(@as(u64, 1) << @as(u6, @intCast(b)));
-    if (task.mmap_count > 0) task.mmap_count -= 1;
+    task.vma().active_bm &= ~(@as(u64, 1) << @as(u6, @intCast(b)));
+    if (task.vma().count > 0) task.vma().count -= 1;
 }
 
 /// After the operation (successful or not), re-merge the pieces of a split that ended up next to each other again.
@@ -1770,11 +1769,11 @@ fn coalesceAround(cur: *task_mod.Task, pieces: SplitPieces) void {
 fn mremapRegion(cur: *task_mod.Task, old_addr: u64, old_pages: u64, new_pages: u64, mflags: u32, new_addr_hint: u64) i64 {
     const PAGE: u64 = 4096;
     if (old_addr % PAGE == 0) if (regionContaining(cur, old_addr, old_pages)) |idx| {
-        const r = &cur.mmap_regions[idx];
+        const r = &cur.vma().regions[idx];
         if (r.file_kind == 0 and !r.no_free) {
             if (mremap_policy.plan(r.base / PAGE, r.num_pages, r.huge_pages, old_addr / PAGE, old_pages)) |plan| {
                 if (plan.needed()) {
-                    const free_slots: u32 = @intCast(cur.mmap_regions.len - @popCount(cur.mmap_active_bm));
+                    const free_slots: u32 = @intCast(cur.vma().regions.len - @popCount(cur.vma().active_bm));
                     if (plan.extraSlots() > free_slots) return -12;
                     const pieces = splitRegionForRange(cur, idx, plan, old_addr);
                     const result = mremapExact(cur, old_addr, old_pages, new_pages, mflags, new_addr_hint);
@@ -1791,11 +1790,11 @@ fn mremapRegion(cur: *task_mod.Task, old_addr: u64, old_pages: u64, new_pages: u
 fn mremapExact(cur: *task_mod.Task, old_addr: u64, old_pages: u64, new_pages: u64, mflags: u32, new_addr_hint: u64) i64 {
     const PAGE: u64 = 4096;
     // Find the mapping region through the occupancy bitmap.
-    var bits = cur.mmap_active_bm;
+    var bits = cur.vma().active_bm;
     while (bits != 0) {
         const i: u6 = @truncate(@ctz(bits));
         bits &= bits - 1;
-        const r = &cur.mmap_regions[i];
+        const r = &cur.vma().regions[i];
         if (r.base == old_addr and r.num_pages >= old_pages) {
             // MREMAP_FIXED relocates the mapping whatever its new size (measured on Linux: same-size and shrinking
             // moves keep the contents at new_addr and unmap the whole old range). The in-place shrink below would
@@ -1817,14 +1816,14 @@ fn mremapExact(cur: *task_mod.Task, old_addr: u64, old_pages: u64, new_pages: u6
                     // full untrackMmapRange would silently drop it. Fail
                     // before the first mutation (unmapRange).
                     var split_slots: u32 = 0;
-                    var untrack_bits = cur.mmap_active_bm;
+                    var untrack_bits = cur.vma().active_bm;
                     while (untrack_bits != 0) {
                         const r_i: usize = @intCast(@ctz(untrack_bits));
                         untrack_bits &= untrack_bits - 1;
-                        const r2 = &cur.mmap_regions[r_i];
+                        const r2 = &cur.vma().regions[r_i];
                         if (munmap_policy.needsSplitSlot(r2.base, r2.num_pages, cut_base, cut_pages)) split_slots += 1;
                     }
-                    const free_slots: u32 = @intCast(cur.mmap_regions.len - @popCount(cur.mmap_active_bm));
+                    const free_slots: u32 = @intCast(cur.vma().regions.len - @popCount(cur.vma().active_bm));
                     if (!munmap_policy.canUntrack(split_slots, free_slots)) return -12;
                     unmapRange(cur, cut_base, cut_pages);
                     untrackMmapRange(cur, cut_base, cut_pages);
@@ -1845,11 +1844,11 @@ fn mremapExact(cur: *task_mod.Task, old_addr: u64, old_pages: u64, new_pages: u6
             if (r.file_kind != 0) {
                 const g = filemap.fileGrowRange(old_addr, old_pages, new_pages);
                 var file_can_grow = true;
-                var other_bits = cur.mmap_active_bm & ~(@as(u64, 1) << i);
+                var other_bits = cur.vma().active_bm & ~(@as(u64, 1) << i);
                 while (other_bits != 0) {
                     const other_i: u6 = @truncate(@ctz(other_bits));
                     other_bits &= other_bits - 1;
-                    const r2 = cur.mmap_regions[other_i];
+                    const r2 = cur.vma().regions[other_i];
                     {
                         const r2_end = r2.base + r2.num_pages * PAGE;
                         if (r2.base < g.start + g.pages * PAGE and r2_end > g.start) {
@@ -1887,7 +1886,7 @@ fn mremapExact(cur: *task_mod.Task, old_addr: u64, old_pages: u64, new_pages: u6
             if ((r.prot & 2) != 0 and !r.shared and
                 !@import("../proc/rlimit.zig").Policy.dataChargeOk(cur.data_used, grow_pages * PAGE, cur.data_cur)) return -12; // ENOMEM
             var can_grow = true;
-            for (&cur.mmap_regions) |r2| {
+            for (cur.vma().regions) |r2| {
                 if (r2.active and r2.base != old_addr) {
                     const r2_end = r2.base + r2.num_pages * PAGE;
                     if (r2.base < grow_base + grow_pages * PAGE and r2_end > grow_base) {
@@ -1934,7 +1933,7 @@ fn mremapExact(cur: *task_mod.Task, old_addr: u64, old_pages: u64, new_pages: u6
         }
     }
 
-    for (&cur.mmap_regions) |*r| {
+    for (cur.vma().regions) |*r| {
         if (!r.active or r.base != old_addr) continue;
         // G2: see the grow/move guard in the main loop above.
         if (r.file_kind != 0) return -12; // ENOMEM

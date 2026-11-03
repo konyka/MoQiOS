@@ -1095,8 +1095,8 @@ fn handleFileFault(current: anytype, page_addr: u64) bool {
     // served page costs a full #PF round-trip, so a sequential scan pays
     // ~1 fault per 64 KiB instead of per 4 KiB. Prefault failures are
     // non-fatal — the page simply faults again on demand.
-    const ri = filemap.findFileRegion(task_mod.MmapRegion, &current.mmap_regions, page_addr) orelse return true;
-    const region = &current.mmap_regions[ri];
+    const ri = filemap.findFileRegion(task_mod.MmapRegion, current.vma().regions, page_addr) orelse return true;
+    const region = &current.vma().regions[ri];
     const plan0 = filemap.planFault(task_mod.MmapRegion, region, page_addr);
     // Writable shared mappings mark pages dirty at serve time; prefaulting
     // them would pay writeback for data nobody wrote (see filemap.zig).
@@ -1185,8 +1185,8 @@ fn serveFilePage(current: anytype, page_addr: u64) bool {
         if ((pte_now & 1) != 0) return true;
     }
 
-    const ri = filemap.findFileRegion(task_mod.MmapRegion, &current.mmap_regions, page_addr) orelse return false;
-    const region = &current.mmap_regions[ri];
+    const ri = filemap.findFileRegion(task_mod.MmapRegion, current.vma().regions, page_addr) orelse return false;
+    const region = &current.vma().regions[ri];
 
     var plan = filemap.planFault(task_mod.MmapRegion, region, page_addr);
     if (plan.action == .segv) {

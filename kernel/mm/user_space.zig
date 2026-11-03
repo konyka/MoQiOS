@@ -49,6 +49,23 @@ pub const USER_MMAP_BASE: u64 = 0x0000_0002_0000_0000; // 8GB
 pub const USER_MMAP_MAX: u64 = 0x0000_0004_0000_0000; // 16GB
 
 fn destroyMm(mm: *Mm) void {
+    // G2: file-region backing refs (ext2/fat32 open slots) go before the address space; destroyUserSpace walks page
+    // tables, not region metadata.
+    @import("mmap.zig").releaseFileRefs(&mm.vma_tab);
+    // Device mappings (user-driver MMIO, DMA frames owned by the driver framework) are unmapped WITHOUT freeing their
+    // frames, so the page-table walk below never sees, let alone frees, device registers. Doing it here, once, when
+    // the last thread of the address space is gone, keeps a dying thread from pulling them out from under the others.
+    {
+        var bits = mm.vma_tab.active_bm;
+        while (bits != 0) {
+            const i: u6 = @truncate(@ctz(bits));
+            bits &= bits - 1;
+            const r = &mm.vma_tab.regions[i];
+            if (!r.active or !r.no_free) continue;
+            var p: u64 = 0;
+            while (p < r.num_pages) : (p += 1) _ = paging.unmapPage(mm.page_table_phys, r.base + p * PAGE_SIZE);
+        }
+    }
     destroyUserSpace(mm.page_table_phys);
 }
 

@@ -2946,3 +2946,7 @@ This is an ABI/rollback contract only, not a throughput claim.
 现在这两个字段在 `Mm`（`vm_lock` 保护），`brk` 与页故障里的栈增长检查都读写它；`Mm.setBreak`（loader、execve）和
 `Mm.inheritBreak`（fork、不带 `CLONE_VM` 的 clone）负责初始化，`CLONE_VM` 的 clone 因共享 `Mm` 什么也不拷。
 `hello209` 覆盖线程增长、创建者看到线程的增长、之后创建的线程看到当前 break、六轮交替增长。
+
+**映射表属于 `Mm`（hello210）**：`mm/vma_table.zig` 定义 `MmapRegion` 和 `VmaTable`（区域数组一页 + 计数 + 活动位图），挂在 `Mm.vma_tab`，`vm_lock` 保护；
+`Task.vma()` 取所属 `Mm` 的表。`CLONE_VM` 线程共享同一张表；fork 与不带 `CLONE_VM` 的 clone 在克隆页表的同一临界区里拍快照并在子 `Mm` 里 `adopt`；
+文件区域后备引用与设备（`no_free`）映射在 `Mm` 终结器（`user_space.destroyMm`）里释放一次。

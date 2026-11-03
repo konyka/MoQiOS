@@ -30,10 +30,15 @@ pub fn fork(frame: *SyscallFrame) i64 {
     // CLONE_VM sibling thread. Only the clone call itself is covered —
     // createUserProcess takes task_lock (ordering violation under vm_lock)
     // and region-table inheritance is a separate follow-up.
+    // The child's copy of the parent's mapping table is taken in the same critical section as the page-table clone:
+    // CLONE_VM siblings of the parent write that table too, so it must be consistent with the cloned pages.
+    var vma_snap: @import("../mm/vma_table.zig").Snapshot = undefined;
     const child_pml4 = blk: {
         var vm_guard = @import("../mm/mm.zig").Mm.beginVmMutation(parent.mm, @ptrCast(parent)) catch return -1;
         defer vm_guard.release();
-        break :blk cloneUserPagesCow(parent.page_table_phys, &parent.mmap_regions) orelse return -1;
+        const pml4 = cloneUserPagesCow(parent.page_table_phys, parent.vma().regions) orelse return -1;
+        @import("../mm/vma_table.zig").snapshot(parent.vma(), &vma_snap);
+        break :blk pml4;
     };
 
     const child_idx = task_mod.createUserProcess(
@@ -107,32 +112,16 @@ pub fn fork(frame: *SyscallFrame) i64 {
     @memcpy(child.cwd[0..256], parent.cwd[0..256]);
     child.cwd_len = parent.cwd_len;
 
-    // v53.2: inherit mmap regions so munmap/madvise/mlock work in child
-    // I1: cloneUserPagesCow demoted every huge block it met (the COW walk is
-    // 4K-only), so neither side has huge pages anymore — clear the counts
-    // before the child inherits the region table.
-    // Safe-by-construction outside the page-table guard: region tables are
-    // per-task and single-writer, and the parent IS the current task here —
-    // its own writes happen under its vm_lock, so these reads/copies race
-    // nothing (see the mmap_regions invariant in task.zig).
-    for (&parent.mmap_regions) |*r| r.huge_pages = 0;
-    child.mmap_regions = parent.mmap_regions;
-    child.mmap_count = parent.mmap_count;
-    child.mmap_active_bm = parent.mmap_active_bm;
+    // v53.2: inherit mmap regions so munmap/madvise/mlock work in child. The snapshot was taken under the parent's
+    // vm_lock together with the page-table clone. Each file-backed region piece holds a backing reference (ext2/fat32
+    // open slot) taken at mmap time; the child's table needs its own so the fault path survives the parent's
+    // close/exit. tmpfs/ramdisk need none (see mmap.zig's RegionFileMeta comments).
+    @import("../mm/vma_table.zig").adopt(child.vma(), &vma_snap);
+    @import("../mm/mmap.zig").retainFileRefs(child.vma());
     // mseal: seals follow the copied mappings into the child.
     if (parent.mm) |pm| if (child.mm) |cm| {
         cm.seals = pm.seals;
     };
-
-    // G2: the child inherits file-backed regions. Each ext2 region piece
-    // holds an open-slot reference (taken at mmap time); the child needs its
-    // own so the fault path survives the parent's close/exit. tmpfs/fat32/
-    // ramdisk need no retain (see mmap.zig's RegionFileMeta comments).
-    for (&child.mmap_regions) |*r| {
-        if (r.active and r.file_kind == @intFromEnum(@import("../mm/filemap.zig").FsKind.ext2)) {
-            @import("../fs/ext2.zig").retainFile(r.file_idx);
-        }
-    }
 
     // v53.6: inherit POSIX-required process attributes (credentials, umask, process group)
     child.uid = parent.uid;
