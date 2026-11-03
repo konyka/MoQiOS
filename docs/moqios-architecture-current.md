@@ -651,8 +651,7 @@ Task 结构体约 6000 字节，包含：
 | rsp | u64 | 恢复时的栈指针 |
 | rflags | u64 | 恢复时的标志寄存器 |
 | fds | [32]?Fd | 文件描述符表 |
-| brk_base | u64 | brk 基地址 |
-| brk_current | u64 | 当前 brk 位置 |
+| （brk） | — | 程序 break 在 `Mm`（`brk_start`/`brk_current`），CLONE_VM 线程共享，不在 Task 里 |
 | cwd | [256]u8 | 当前工作目录 |
 | cwd_len | u32 | cwd 长度 |
 | envp | ?[*:null]?[*:0]u8 | 环境变量数组 |

@@ -156,12 +156,7 @@ pub const Task = struct {
     waiting_for_child: bool,
     /// CPU where the task blocked in waitpid (for cross-core wake IPI).
     wait_cpu: u8,
-    /// Current program break (end of heap). 0 = not initialized.
-    /// brk syscall uses this to manage the heap region.
-    brk_current: u64,
-    /// Lowest address the break may return to — the initial break set by the
-    /// loader. Shrinking past it would unmap the loaded image itself.
-    brk_start: u64,
+    // The program break lives in Mm (mm/mm.zig): CLONE_VM threads share it.
     /// Thread-local storage base for this task (x86_64 FS_BASE). Installed by
     /// the scheduler when the task is put on a CPU, so each thread sees its own
     /// TLS regardless of which CPU it lands on. 0 = no TLS.

@@ -31,32 +31,32 @@ fn releasePages(task: *task_mod.Task, from_page: u64, to_page: u64) void {
 pub fn brk(addr: u64) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return 0;
     const cur = task_mod.getTask(cur_idx) orelse return 0;
-    if (cur.mm == null) return @bitCast(cur.brk_current);
-    var vm_guard = mm_mod.Mm.beginVmMutation(cur.mm, @ptrCast(cur)) catch return @bitCast(cur.brk_current);
+    const mm = cur.mm orelse return 0;
+    var vm_guard = mm_mod.Mm.beginVmMutation(cur.mm, @ptrCast(cur)) catch return @bitCast(mm.brk_current);
     defer vm_guard.release();
 
-    if (addr == 0) return @bitCast(cur.brk_current);
+    if (addr == 0) return @bitCast(mm.brk_current);
 
-    // No loader has established a heap for this task.
-    if (cur.brk_start == 0 or cur.brk_current == 0) return @bitCast(cur.brk_current);
+    // No loader has established a heap for this address space.
+    if (mm.brk_start == 0 or mm.brk_current == 0) return @bitCast(mm.brk_current);
 
     // The break may not retreat below where the loader left it — those pages
     // hold the loaded image — nor climb past its ceiling. The previous check
     // required the break to sit under USER_STACK_TOP, but ELF images load above
     // the stack, so it rejected every legal break and left brk frozen at its
     // initial value for every C user program.
-    if (addr < cur.brk_start) return @bitCast(cur.brk_current);
+    if (addr < mm.brk_start) return @bitCast(mm.brk_current);
 
     // Flat binaries load below the stack and grow the heap up toward it, so they
     // keep the original stack-relative ceiling. ELF images sit above the stack
     // and grow into the heap window instead.
-    const ceiling = if (cur.brk_start < user_space.USER_STACK_TOP)
+    const ceiling = if (mm.brk_start < user_space.USER_STACK_TOP)
         user_space.USER_STACK_TOP - PAGE
     else
         user_space.USER_HEAP_MAX;
-    if (addr > ceiling) return @bitCast(cur.brk_current);
+    if (addr > ceiling) return @bitCast(mm.brk_current);
 
-    const old_page = pageCeil(cur.brk_current);
+    const old_page = pageCeil(mm.brk_current);
     const new_page = pageCeil(addr);
 
     if (new_page > old_page) {
@@ -64,17 +64,17 @@ pub fn brk(addr: u64) i64 {
         // break (POSIX brk failure), same as an allocation failure below.
         const delta_bytes = (new_page - old_page) * PAGE;
         if (!@import("../proc/rlimit.zig").Policy.asChargeOk(cur.as_used, delta_bytes, cur.as_cur)) {
-            return @bitCast(cur.brk_current);
+            return @bitCast(mm.brk_current);
         }
         // RLIMIT_DATA: brk heap growth charges the independent data ledger.
         if (!@import("../proc/rlimit.zig").Policy.dataChargeOk(cur.data_used, delta_bytes, cur.data_cur)) {
-            return @bitCast(cur.brk_current);
+            return @bitCast(mm.brk_current);
         }
 
         // mlockall(MCL_FUTURE): the new heap pages are locked, so the growth must fit RLIMIT_MEMLOCK (Linux
         // check_brk_limits: EAGAIN, which brk reports as the unchanged break).
         if (mlock_gate.mapGate(cur, false, old_page, new_page - old_page) != 0) {
-            return @bitCast(cur.brk_current);
+            return @bitCast(mm.brk_current);
         }
 
         // Refuse to grow across pages that are already mapped. mapPage
@@ -86,7 +86,7 @@ pub fn brk(addr: u64) i64 {
         // evicted page's only reference (same class as the mmap fix).
         for (old_page..new_page) |p| {
             if (paging_mod.isPageOccupied(cur.page_table_phys, p * PAGE)) {
-                return @bitCast(cur.brk_current);
+                return @bitCast(mm.brk_current);
             }
         }
         // Demand-paged mappings (file mmap, SysV SHM) own their range before
@@ -94,7 +94,7 @@ pub fn brk(addr: u64) i64 {
         if (mmap_mod.hasMmapOverlap(cur, old_page * PAGE, new_page - old_page) or
             @import("../ipc/sysv_shm.zig").overlapsAttachment(cur.page_table_phys, old_page * PAGE, new_page - old_page))
         {
-            return @bitCast(cur.brk_current);
+            return @bitCast(mm.brk_current);
         }
 
         const flags = paging_mod.MapFlags{
@@ -109,7 +109,7 @@ pub fn brk(addr: u64) i64 {
             const virt = p * PAGE;
             const phys = pmm_mod.allocPage() orelse {
                 releasePages(cur, old_page, p);
-                return @bitCast(cur.brk_current);
+                return @bitCast(mm.brk_current);
             };
             // The physical allocator returns frames as-is, so clear the page
             // before it becomes reachable: otherwise the heap would expose
@@ -120,7 +120,7 @@ pub fn brk(addr: u64) i64 {
             paging_mod.mapPage(cur.page_table_phys, virt, phys, flags) catch {
                 pmm_mod.freePage(phys);
                 releasePages(cur, old_page, p);
-                return @bitCast(cur.brk_current);
+                return @bitCast(mm.brk_current);
             };
         }
         cur.as_used += delta_bytes; // RLIMIT_AS charge (checked above)
@@ -131,11 +131,11 @@ pub fn brk(addr: u64) i64 {
         // `old_page..new_page` unconditionally, so a shrinking break reversed
         // the range and panicked the kernel computing its length.
         releasePages(cur, new_page, old_page);
-        if (cur.mm) |m| m.locks.releaseLossy(new_page, old_page - new_page); // the pages are gone, so are their locks
+        mm.locks.releaseLossy(new_page, old_page - new_page); // the pages are gone, so are their locks
         cur.as_used -|= (old_page - new_page) * PAGE; // RLIMIT_AS refund
         cur.data_used -|= (old_page - new_page) * PAGE; // RLIMIT_DATA refund
     }
 
-    cur.brk_current = addr;
+    mm.brk_current = addr;
     return @bitCast(addr);
 }

@@ -51,6 +51,23 @@ pub const Mm = struct {
     /// mlockall(MCL_FUTURE): every mapping made from now on is locked (and charged to RLIMIT_MEMLOCK). Written under
     /// vm_lock; a fresh address space (exec, fork child) starts without it, like Linux where it is not inherited.
     lock_future: bool = false,
+    /// The program break. It belongs to the address space, not to a thread: CLONE_VM siblings share one Mm and so one
+    /// break, and a sibling that grew the heap is seen by all the others. Written under vm_lock. brk_start is where the
+    /// loader left the break (it may never retreat below it); 0 in both means no heap was set up for this image.
+    brk_start: u64 = 0,
+    brk_current: u64 = 0,
+
+    /// Set the initial break of a freshly built address space (loader, exec). Nobody else can see it yet.
+    pub fn setBreak(mm: *Mm, brk: u64) void {
+        mm.brk_start = brk;
+        mm.brk_current = brk;
+    }
+
+    /// A new address space copied from `parent` (fork, clone without CLONE_VM) starts with the parent's break.
+    pub fn inheritBreak(mm: *Mm, parent: *const Mm) void {
+        mm.brk_start = parent.brk_start;
+        mm.brk_current = parent.brk_current;
+    }
 
     /// Whether [base, base+len) touches a sealed range (caller holds vm_lock).
     pub fn sealed(mm: ?*Mm, base: u64, len: u64) bool {

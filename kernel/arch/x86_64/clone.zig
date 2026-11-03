@@ -348,8 +348,11 @@ pub fn clone(
     child.mmap_active_bm = parent.mmap_active_bm;
     @import("../../mm/mmap.zig").retainFileRefs(child);
 
-    child.brk_current = parent.brk_current;
     child.stack_limit = parent.stack_limit;
+    // CLONE_VM shares the parent's Mm, and with it the program break. A copied address space gets a copy of the break.
+    if (!shares_vm) {
+        if (child.mm) |child_mm| if (parent.mm) |parent_mm| child_mm.inheritBreak(parent_mm);
+    }
 
     if (flags & CLONE_FILES != 0) {
         // Share the fd table with the parent (pthread v2): one atomic

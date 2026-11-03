@@ -230,8 +230,10 @@ const AddressSpace = struct {
 判断目标页是否空闲，再用 `USER_ADDR_MAX`/`USER_HEAP_MAX` 兜底。mmap 选址窗口刻意置于堆
 天花板与栈增长区间之上，使 `mmap` 不会把堆封住；`mmap` 也不再推进 `brk_current`。
 
-- `brk`: 可在 `[Task.brk_start, 天花板]` 内移动。`brk_start` 记录加载器留下的初始
-  break，收缩不能低于它（否则会解除镜像自身的映射）。增长逐页确认未被映射（`mapPage`
+- `brk`: 可在 `[Mm.brk_start, 天花板]` 内移动。`brk_start` 记录加载器留下的初始
+  break（**程序 break 属于地址空间 `Mm`，不属于线程**：`CLONE_VM` 的线程共享同一个 `Mm`，因此共享 break；
+  fork 和不带 `CLONE_VM` 的 clone 把父的 break 拷进子的新 `Mm`，loader 与 execve 在新建的 `Mm` 上设置，
+  见文末"程序 break 属于 Mm"一节），收缩不能低于它（否则会解除镜像自身的映射）。增长逐页确认未被映射（`mapPage`
   会无声覆写活跃 PTE 并泄漏旧帧）并清零新页（`pmm.allocPage` 返回的帧带有上一使用者的
   数据）；收缩释放让出的页。增长/收缩/原地是三条独立分支——早期实现无条件写
   `for (old_page..new_page)`，收缩时区间反向，直接导致内核整数溢出 panic。
@@ -2937,3 +2939,10 @@ This is an ABI/rollback contract only, not a throughput claim.
 **libc printf 家族（hello208）**：`lib/moqi_libc/src/format.c` 是共享格式化引擎（宽度/精度/标志/长度修饰符，
 语法对齐 glibc，由 `host_tests/test_printf_abi.c` 对 2473 行 glibc 实测值验证），`stdio.c` 在其上提供
 `printf/dprintf/vprintf/puts/putchar/asprintf`。输出经 512 字节分块的 `write(2)`，不缓冲、无 `FILE`；无浮点和位置参数。
+
+**程序 break 属于 `Mm`（hello209）**：`brk_current`/`brk_start` 原来在 `Task` 里，`CLONE_VM` 线程创建时只拷了 `brk_current`
+（没拷 `brk_start`，`brk` 因 `brk_start == 0` 对该线程直接拒绝移动），即使两个字段都拷了，每个线程也会各持一个
+会过期的 break，一个线程增长堆之后另一个线程仍按旧值算页，增长到别人已映射的页上而失败（`isPageOccupied`）。
+现在这两个字段在 `Mm`（`vm_lock` 保护），`brk` 与页故障里的栈增长检查都读写它；`Mm.setBreak`（loader、execve）和
+`Mm.inheritBreak`（fork、不带 `CLONE_VM` 的 clone）负责初始化，`CLONE_VM` 的 clone 因共享 `Mm` 什么也不拷。
+`hello209` 覆盖线程增长、创建者看到线程的增长、之后创建的线程看到当前 break、六轮交替增长。

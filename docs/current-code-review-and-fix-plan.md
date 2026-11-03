@@ -6360,3 +6360,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 我自己的错：①生成器第一版把参数序列化成带 `A(...)` 包装的写法，包装在表里没定义，改回裸字面量；②测试里 `%q` 单独在格式末尾是错误（`q` 是长度修饰符），我最初把它当未知转换写了期望；③`%m` 的两个期望长度我都手算错了（27 和 23），按实测值改；④hello208 里 `printf` 的返回值我先写了 51，实际是 41。以上都是测试写错，不是实现问题。
 - 目标上验证：`hello208`（28 项）在 QEMU 通过，涵盖宽度/精度/标志、长度修饰符、`%n`、`%m`、宽字符、`asprintf`（含超过 512 字节的结果）、`dprintf` 写管道并读回、对坏描述符返回内核的错误、`printf`/`puts`/`putchar` 的返回值。
 - 如实说明：①**没有浮点**（`%e %f %g %a`）：它们被当作未知转换原样写回，与 glibc 的真实输出不同，程序若用它们会得到错误输出而不是编译失败，这是已知缺口；②没有位置参数（`%1$d`）、没有 `FILE`、没有 `fprintf`/`fputs`/`fwrite`/`stdout` 这些、没有 `scanf` 家族；③`printf` 不缓冲，每次调用至少一次 `write`，长结果每 512 字节一次；④`%lc`/`%ls` 只支持 ASCII，因为只有 C 区域；⑤没有改内核，所以没有重跑完整门禁，只跑了 host 测试、libc 测试、三架构构建、目标探针和一次 SMP=1 冒烟（见提交）。
+
+## CI 抓到的真实内核缺陷：程序 break 在 Task 里，CLONE_VM 线程各持一份（hello209）
+
+- 发现：上一提交（realloc，`ba19f3d`）的 CI 在 SMP=2 冒烟里失败：`hello207: FAIL F: four threads growing their own buffers 400 times each`。**我本地只跑了 SMP=1 的冒烟，没有跑 SMP=2，所以提交时没有看到。**这是我的疏漏：这个提交的测试里有多线程的一项，应该在多核下也跑一次。
+- 调查：在本地 SMP=2 复现（4 个线程里有 3 个在第 255、324、344 次 `realloc` 时拿到 `ENOMEM`），用一个临时诊断（打印每个线程失败的轮次和 errno，已删除）确认是 `sbrk` 失败而不是分配器逻辑。读 `kernel/mm/brk.zig`：`brk` 读写 `Task.brk_current`。`clone` 对 `CLONE_VM` 线程只拷 `brk_current`，**不拷 `brk_start`**，而 `brk` 开头有 `if (cur.brk_start == 0 ...) return 当前值` 的守卫；同时每个线程各持一份 break，一个线程增长之后另一个线程还按自己的旧值判断，要映射的页已被占用就失败。
+- 先写了独立复现 `hello209`（不依赖分配器，直接用 `sbrk` 加线程），在没改内核的版本上 SMP=1 就能稳定失败：线程里 `sbrk(8192)` 返回 -1（`brk_start == 0` 守卫）。这说明之前"多线程 malloc 工作"的所有测试其实只在线程不增长堆时才成立。
+- 修复：`brk_current`/`brk_start` 从 `Task` 移到 `Mm`（`vm_lock` 保护）。`brk` 和页故障处理里的栈增长检查都改读 `Mm`；`Mm.setBreak`（loader、execve）和 `Mm.inheritBreak`（fork、不带 `CLONE_VM` 的 clone）初始化；`CLONE_VM` 的 clone 共享 `Mm`，不用拷。host 测试 `the program break belongs to the address space` 用源码文本断言钉住这个接线（没有 `Task.brk_*`、`brk.zig` 不再读 `cur.brk_*`、两个继承点、loader/execve 的 setBreak）。
+- 验证：`hello209`（10 项）红→绿；`hello207` 在 SMP=2 下通过（之前失败）；host 1003/1003（比之前多 1 个）。完整门禁全绿：SMP=1、SMP=8 三次、GPT 数据盘、SMP=2 压力 5/5（约 1.5 小时）。三架构构建通过。
+- 如实说明：①这个缺陷在 `bdf755b`（线程安全 malloc）之后一直存在，只是之前没有测试让线程增长堆；②fork 子进程和 exec 的 break 行为没有变；③我没有做变异检查（改动是字段搬家加四处接线，host 测试是文本断言，QEMU 探针 hello209 是行为检查）。

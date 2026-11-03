@@ -977,7 +977,9 @@ fn handleDemandPage(fault_addr: u64) bool {
         // Check we don't grow below USER_STACK_BOTTOM
         if (page_addr < user_space.USER_STACK_BOTTOM) return false;
         // Check we don't grow into the heap region (brk)
-        if (page_addr < current.brk_current + 4096) return false;
+        if (current.mm) |cmm| {
+            if (page_addr < cmm.brk_current + 4096) return false;
+        }
         // RLIMIT_STACK: refuse growth below the soft-limit floor → SIGSEGV.
         const rlimit = @import("../../proc/rlimit.zig");
         const floor = rlimit.Policy.stackFloor(

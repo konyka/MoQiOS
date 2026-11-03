@@ -10470,3 +10470,30 @@ test "descriptor errnos: EBADF for closed/out-of-range fds, ESPIPE for unseekabl
     const s = kt.syscall_entry_source;
     try std.testing.expect(std.mem.indexOf(u8, s, "    if (!vfs_mod.fdTypeSeekable(desc.fd_type)) return -29;\n    vfs_mod.syncOffsetIn(desc);") != null);
 }
+
+test "the program break belongs to the address space: CLONE_VM threads share it, every other path sets it on the new Mm" {
+    // The break used to live in Task, so a CLONE_VM thread got a copy of brk_current but no brk_start (brk refused to
+    // move at all) and, even with both copied, each thread would have kept its own stale break. Threads that grow the
+    // malloc heap failed with ENOMEM as soon as they ran concurrently. The state is in Mm now (vm_lock protects it).
+    var m: kt.mm.Mm = undefined;
+    m.brk_start = 0;
+    m.brk_current = 0;
+    try std.testing.expectEqual(@as(u64, 0), m.brk_current + m.brk_start);
+    try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "brk_current: u64") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "brk_start: u64") == null);
+    // brk reads and writes only through the Mm.
+    try std.testing.expect(std.mem.indexOf(u8, kt.brk_source, "cur.brk_current") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.brk_source, "cur.brk_start") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.brk_source, "mm.brk_current = addr;") != null);
+    // The stack-growth check in the page-fault handler consults the shared break too.
+    try std.testing.expect(std.mem.indexOf(u8, kt.idt_source, "current.brk_current") == null);
+    // fork and a clone without CLONE_VM copy the break into the child's new Mm; a CLONE_VM clone shares the Mm and copies nothing.
+    try std.testing.expect(std.mem.indexOf(u8, kt.fork_source, "inheritBreak(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "child.brk_current") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "if (!shares_vm) {\n        if (child.mm) |child_mm| if (parent.mm) |parent_mm| child_mm.inheritBreak(parent_mm);") != null);
+    // The loader and exec set it on the Mm they create.
+    try std.testing.expect(std.mem.indexOf(u8, kt.loader_source, "t.brk_current") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "cur.brk_current") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "new_mm.setBreak(result.brk);") != null);
+    try std.testing.expect(@sizeOf(kt.mm.Mm) <= 1024);
+}

@@ -59,8 +59,9 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.last_cpu = parent.last_cpu;
     @import("../arch/x86_64/context_switch.zig").inheritFpuState(parent, child);
 
-    child.brk_current = parent.brk_current;
-    child.brk_start = parent.brk_start;
+    if (child.mm) |child_mm| {
+        if (parent.mm) |parent_mm| child_mm.inheritBreak(parent_mm);
+    }
     // The child is a copy of the address space, so its TLS block sits at the
     // same address.
     child.tls_base = parent.tls_base;
