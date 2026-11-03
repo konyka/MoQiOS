@@ -51,6 +51,11 @@ $CC $CFLAGS -DMOQI_HOST_TEST_SYSCALL -c ../src/time.c -o "$OUT/time.o"
 $CC $CFLAGS -o "$OUT/test_time_abi" test_time_abi.c "$OUT/time.o"
 "$OUT/test_time_abi" || fail=1
 
+echo "== test_timeconv_abi =="
+$CC $CFLAGS -c ../src/timeconv.c -o "$OUT/timeconv.o"
+$CC $CFLAGS -o "$OUT/test_timeconv_abi" test_timeconv_abi.c "$OUT/timeconv.o"
+"$OUT/test_timeconv_abi" || fail=1
+
 if [ "$fail" -eq 0 ]; then
     echo "ALL HOST TESTS PASS"
 else
