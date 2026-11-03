@@ -51,6 +51,18 @@ unsigned long strtoul(const char *s, char **end, int base);
 long long strtoll(const char *s, char **end, int base);
 unsigned long long strtoull(const char *s, char **end, int base);
 
+/* Floating-point parsing with glibc's exact results (checked bit for bit against glibc): decimal and hexadecimal
+ * (0x1.8p3) forms, "inf"/"infinity" and "nan"/"nan(payload)" in any letter case, correct rounding to nearest even for
+ * every input length (the conversion is exact integer arithmetic, no floating point is used inside), subnormals, and the
+ * C99 error rules: a result that overflows is +-HUGE_VAL (infinity) with errno ERANGE; one that is subnormal and inexact,
+ * or rounds to zero, is ERANGE too (tininess is judged after rounding, as on x86). errno is otherwise left alone. When
+ * nothing can be converted the end pointer is the start of the string. strtof rounds directly to float (not through
+ * double). No strtold, no locale decimal point (always '.'), no digit grouping.
+ * atof(s) is strtod(s, NULL). */
+double strtod(const char *s, char **end);
+float strtof(const char *s, char **end);
+double atof(const char *s);
+
 int abs(int x);
 long labs(long x);
 long long llabs(long long x);

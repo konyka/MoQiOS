@@ -85,6 +85,11 @@ $CC $CFLAGS -o "$OUT/test_printf_abi" test_printf_abi.c "$OUT/strfunc_pf.o" ../s
 $CC $CFLAGS -fsanitize=undefined -fno-sanitize-trap=undefined -o "$OUT/test_printf_abi_ubsan" test_printf_abi.c "$OUT/strfunc_pf.o" ../src/string.c
 "$OUT/test_printf_abi_ubsan" || fail=1
 
+echo "== test_strtod_abi =="
+$CC $CFLAGS -c ../src/strtod.c -o "$OUT/strtod.o"
+$CC $CFLAGS -o "$OUT/test_strtod_abi" test_strtod_abi.c "$OUT/strtod.o"
+"$OUT/test_strtod_abi" || fail=1
+
 echo "== test_env_abi =="
 $CC $CFLAGS -o "$OUT/test_env_abi" test_env_abi.c ../src/string.c
 "$OUT/test_env_abi" || fail=1

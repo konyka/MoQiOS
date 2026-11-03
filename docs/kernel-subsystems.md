@@ -2962,3 +2962,6 @@ fork 与不带 `CLONE_VM` 的 clone 用 `inheritCharges` 继承，`CLONE_VM` 线
 
 **文件系统上下文属于线程组（hello214）**：`GroupState.fs`（`cwd`、`cwd_len`、`umask`）与信号处置、限额同在 `Mm.grp` 的一页里；`Task.fsctx()` 取用。
 `CLONE_VM` 线程共享（`CLONE_FS`），fork 与不带 `CLONE_VM` 的 clone 复制（`inheritFs`），exec 带到新 `Mm`。
+
+**libc 浮点解析（hello217）**：`lib/moqi_libc/src/strtod.c` 提供 `strtod`/`strtof`/`atof`，转换用定长大整数做精确的最近偶数舍入，内部无浮点运算；
+行为按 glibc 逐位对照（1321 行表 + 4000 万随机串差分）。无 `strtold`，无 printf 浮点转换。
