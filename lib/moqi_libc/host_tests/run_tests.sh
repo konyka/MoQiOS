@@ -71,6 +71,10 @@ $CC $CFLAGS -c ../src/strfunc.c -o "$OUT/strfunc.o"
 $CC $CFLAGS -o "$OUT/test_strfunc_abi" test_strfunc_abi.c "$OUT/strfunc.o"
 "$OUT/test_strfunc_abi" || fail=1
 
+echo "== test_env_abi =="
+$CC $CFLAGS -o "$OUT/test_env_abi" test_env_abi.c ../src/string.c
+"$OUT/test_env_abi" || fail=1
+
 echo "== test_algo_abi =="
 $CC $CFLAGS -c ../src/algo.c -o "$OUT/algo.o"
 $CC $CFLAGS -o "$OUT/test_algo_abi" test_algo_abi.c "$OUT/algo.o"

@@ -2923,3 +2923,8 @@ bad-output case beyond `MAX_FDS`, then opens/closes a normal file to lock the no
 whereas null pointers use and advance descriptor positions. `hello88` covers copied contents/size,
 invalid fd/nonregular/offset pointers, zero or oversized lengths, and pre-I/O no-mutation errors.
 This is an ABI/rollback contract only, not a throughput claim.
+
+**libc 环境变量写接口（hello206）**：`lib/moqi_libc/src/env.c` 提供 `setenv`/`unsetenv`/`putenv`/`clearenv`，
+行为与 glibc 对齐（实测表见 `host_tests/test_env_abi.c`）。启动时栈上的 `environ` 数组首次插入时被拷贝到堆上，
+被替换的字符串和旧数组不释放以保证 `getenv` 返回的指针持续有效；写操作之间用自旋锁，`getenv` 不加锁。
+`hello206` 验证 `execve(path, argv, environ)` 后子进程看到父进程修改后的环境。

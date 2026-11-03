@@ -69,4 +69,16 @@ void *bsearch(const void *key, const void *base, size_t nmemb, size_t size, int 
  * environ entry (do not free), or NULL if name is not present. */
 char *getenv(const char *name);
 
+/* Environment changes with glibc's behavior. setenv copies name and value; an existing name is replaced only when
+ * overwrite is non-zero. A name that is empty or contains '=' (or a NULL value) is EINVAL. putenv keeps the caller's
+ * string itself in environ (changing it later changes the environment), replaces an entry of the same name, and a
+ * string without '=' removes that name. unsetenv removes every entry of the name; clearenv empties the environment.
+ * The array that arrives with the process is copied on the first insertion, never grown in place. Allocation failure
+ * is ENOMEM with the environment unchanged. Replaced strings and old arrays are not freed, so a pointer from getenv
+ * stays valid. Safe for concurrent callers with each other; getenv does not lock. */
+int setenv(const char *name, const char *value, int overwrite);
+int unsetenv(const char *name);
+int putenv(char *string);
+int clearenv(void);
+
 #endif /* MOQI_STDLIB_H */

@@ -6328,3 +6328,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - `strfunc.c` 新增的 `memmem`/`strcasestr`/`strsignal` 也做了变异，除一个之外全部被抓住。**存活的一个**：去掉 `memmem` 里 `if (needle_len > haystack_len) return NULL;` 这一行后测试仍通过。该行在循环条件 `i + needle_len <= haystack_len` 下是冗余的（needle 比 haystack 长时循环本身不进入），我判断是等价变异，没有再用别的方式验证，保留它作为显式的早退。
 - 目标上验证：`hello205`（18 项）在 QEMU 里通过：3000 个元素在真实堆上排序（有序且稳定）、`bsearch` 对每个探到的元素命中而对不存在的返回 NULL、`rand_r` 的序列与最终状态、`memmem`/`strcasestr`/`strsignal`。
 - 如实说明：①没有 `strtod`/`atof`、`strcoll`/`strxfrm`、`qsort_r`；②`qsort` 在 `nmemb * size` 溢出时走插入排序而不是报错（glibc 在这种情况下行为我没有量过）；③没有改内核，所以没有重跑完整门禁，只跑了 host 测试、libc 测试、三个架构的构建、目标探针和一次 SMP=1 冒烟。
+
+## libc 的 setenv / unsetenv / putenv / clearenv（hello206）
+
+- 做的事：环境变量只有 `getenv`，程序没法改环境再 `execve` 给子进程。加了 `src/env.c`：`setenv`、`unsetenv`、`putenv`、`clearenv`，行为先在宿主机 glibc 上逐项量过再写。
+- 测量里值得记的：①`setenv` 的名字为空或含 `=` 是 `EINVAL`，`unsetenv` 同；②`putenv` 把**调用者给的那个字符串本身**放进 `environ`（之后改这个字符串，环境跟着变），`setenv` 则复制；③`putenv("NAME")`（没有 `=`）等于删除；④`putenv("")` 返回 0 但 errno 为 22（glibc 的怪行为，测试表照录）；⑤`unsetenv` 删除**所有**同名项（环境里有重复时）而 `setenv` 只改第一个；⑥进程启动时栈上的那个数组不会被原地扩展，第一次插入时拷贝；⑦`setenv(name, NULL, 1)` 在 glibc 里直接崩溃，这里返回 `EINVAL`（有意的差异）。
+- 实现取舍：被替换的字符串和旧数组**不释放**，因为 `getenv` 不加锁地遍历 `environ`，它返回过的指针必须继续有效（glibc 同样如此）；泄漏量以最终数组大小的两倍和被替换的字符串为界。写操作之间用一把自旋锁，`getenv` 不加锁。值相同的覆盖不分配，保持原指针。分配失败是 `ENOMEM` 且环境不变（先分配字符串、再扩数组，数组失败时把字符串还回去）。
+- TDD：`test_env_abi.c` 先写，`env.c` 不存在时编译失败=红。测试里有一张 49 行的操作序列表（setenv/unsetenv/putenv/clearenv 混合，起始环境带重复项），每行记录 glibc 的返回值、errno 和之后整个 `environ`，加上"启动数组不被原地扩展"、"putenv 保留指针、setenv 复制"、"分配失败不改环境且归还字符串"、300 个变量增删、"十个变量只分配 11 次"等专项断言；分配器在测试里自带并填充 0xA5，这样漏写终止符也会暴露。
+- 变异 22 个有效变异全部被抓住（第一版里有 1 个把 `overwrite` 变成未使用参数的变异在 `-Werror` 下编译失败，不算有效，换成 `slot || !overwrite` 才是有效变异）。过程中有几个最初存活，靠补测试抓住：覆盖相同值时是否保留指针、`NULL` 值、启动数组被原地改写、数组容量增长策略（"十个变量只分配 11 次"）、拷贝旧条目时的起点。我自己的变异脚本里有一条是恒等替换（`own_array` 替成 `own_array`），显示成"存活"，是脚本的错，已删除。
+- 目标上验证：`hello206`（15 项）在 QEMU 通过，包括 `fork` + `execve("hello206", argv, environ)` 之后子进程看到父进程设置的变量（含值里带 `=`、空值、`putenv` 的变量、被删除的变量不在）。我第一版 hello206 有一项失败，是**测试写错**（把 `"one"` 的第 4 个下标当成末尾，其实改的是 `e`），不是实现问题，已修。
+- 如实说明：①没有 `secure_getenv`、`environ` 之外的 `__environ` 别名；②`getenv` 与 `setenv` 并发时 `getenv` 可能读到被原地改写的槽位（指针大小的读写，实际不会撕裂，但没有内存序保证），与 glibc 的取舍相同；③没有改内核，所以没有重跑完整门禁，只跑了 host 测试、libc 测试、三架构构建、目标探针和一次 SMP=1 冒烟（见提交）。

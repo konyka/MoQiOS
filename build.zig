@@ -78,6 +78,7 @@ const moqi_libc_sources = [_][]const u8{
     "lib/moqi_libc/src/numconv.c",
     "lib/moqi_libc/src/strfunc.c",
     "lib/moqi_libc/src/algo.c",
+    "lib/moqi_libc/src/env.c",
 };
 
 /// C user program built against moqi_libc: same flags as addCUserProgram,
@@ -308,7 +309,7 @@ pub fn build(b: *std.Build) void {
     // (parsing the kernel's SysV initial stack) and the syscall wrappers.
     // init (PID 1) is the C replacement for user/init.S; its source lives in
     // servers/init/, everything else in user/.
-    const libc_programs = [_][]const u8{ "sh", "hello10", "hello45", "hello57", "hello58", "hello59", "hello60", "hello61", "hello62", "hello63", "hello64", "hello65", "hello66", "hello67", "hello68", "hello69", "hello70", "hello71", "hello72", "hello73", "hello84", "hello196", "hello200", "hello201", "hello202", "hello203", "hello204", "hello205" };
+    const libc_programs = [_][]const u8{ "sh", "hello10", "hello45", "hello57", "hello58", "hello59", "hello60", "hello61", "hello62", "hello63", "hello64", "hello65", "hello66", "hello67", "hello68", "hello69", "hello70", "hello71", "hello72", "hello73", "hello84", "hello196", "hello200", "hello201", "hello202", "hello203", "hello204", "hello205", "hello206" };
     for (libc_programs) |name| addLibcUserProgram(b, name, b.fmt("user/{s}.c", .{name}));
     addLibcUserProgram(b, "init", "servers/init/main.c");
     addLibcUserProgram(b, "syslogd", "servers/syslogd/main.c");
