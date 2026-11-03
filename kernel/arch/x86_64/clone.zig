@@ -343,12 +343,13 @@ pub fn clone(
     child.recorded_limits = parent.recorded_limits;
     // The clone's address space mirrors (or with CLONE_VM shares) the
     // parent's, so it starts with the same charged usage.
-    child.as_used = parent.as_used;
-    child.data_used = parent.data_used;
     child.stack_limit = parent.stack_limit;
     // CLONE_VM shares the parent's Mm, and with it the program break. A copied address space gets a copy of the break.
     if (!shares_vm) {
-        if (child.mm) |child_mm| if (parent.mm) |parent_mm| child_mm.inheritBreak(parent_mm);
+        if (child.mm) |child_mm| if (parent.mm) |parent_mm| {
+            child_mm.inheritBreak(parent_mm);
+            child_mm.inheritCharges(parent_mm);
+        };
         // ...and of the mapping table, with its own backing references. A CLONE_VM thread shares the Mm and the table.
         @import("../../mm/vma_table.zig").adopt(child.vma(), &vma_snap);
         @import("../../mm/mmap.zig").retainFileRefs(child.vma());

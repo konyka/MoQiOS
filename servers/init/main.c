@@ -333,6 +333,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello209"); /* program break shared by CLONE_VM threads */
     run_test("hello210"); /* mappings shared by CLONE_VM threads */
     run_test("hello211"); /* signal dispositions shared by threads */
+    run_test("hello212"); /* RLIMIT_AS accounting shared by threads */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

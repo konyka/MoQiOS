@@ -65,7 +65,10 @@ pub fn fork(frame: *SyscallFrame) i64 {
     @import("../arch/x86_64/context_switch.zig").inheritFpuState(parent, child);
 
     if (child.mm) |child_mm| {
-        if (parent.mm) |parent_mm| child_mm.inheritBreak(parent_mm);
+        if (parent.mm) |parent_mm| {
+            child_mm.inheritBreak(parent_mm);
+            child_mm.inheritCharges(parent_mm);
+        }
     }
     // The child is a copy of the address space, so its TLS block sits at the
     // same address.
@@ -91,8 +94,6 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.recorded_limits = parent.recorded_limits;
     // The child's address space mirrors the parent's (COW), so it starts with
     // the same charged usage.
-    child.as_used = parent.as_used;
-    child.data_used = parent.data_used;
 
     parent.fd_table.inheritFdTable(child.fd_table);
     @import("../ipc/posix_mq.zig").inheritRefs(parent_idx, child_idx);

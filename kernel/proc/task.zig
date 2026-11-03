@@ -175,17 +175,14 @@ pub const Task = struct {
     /// former stub reported.
     stack_cur: u64 = 8 * 1024 * 1024,
     stack_max: u64 = 8 * 1024 * 1024,
-    /// Per-task RLIMIT_AS in bytes over the charged address space; defaults
-    /// preserve the former stub report (unlimited). `as_used` charges brk
-    /// heap pages, mmap-tracked regions, and demand-faulted stack pages.
+    /// Per-task RLIMIT_AS in bytes over the charged address space; defaults preserve the former stub report (unlimited).
+    /// What is charged (brk heap pages, mmap-tracked regions, demand-faulted stack pages) is counted in Mm.as_used, once
+    /// per address space, so CLONE_VM threads charge the same counter.
     as_cur: u64 = @import("rlimit.zig").RLIM_INFINITY,
     as_max: u64 = @import("rlimit.zig").RLIM_INFINITY,
-    as_used: u64 = 0,
-    /// Per-task RLIMIT_DATA in bytes. `data_used` tracks brk heap pages and
-    /// writable private mmap regions independently from RLIMIT_AS.
+    /// Per-task RLIMIT_DATA in bytes; the charge (brk heap pages, writable private mmap regions) is Mm.data_used.
     data_cur: u64 = @import("rlimit.zig").RLIM_INFINITY,
     data_max: u64 = @import("rlimit.zig").RLIM_INFINITY,
-    data_used: u64 = 0,
     /// Per-task RLIMIT_NPROC soft/hard limits in task count for the real
     /// UID; defaults preserve the former stub report (unlimited). The gate
     /// lives at every task-creation chokepoint (fork/clone/spawn) before
@@ -377,6 +374,18 @@ pub const Task = struct {
     }
 
     /// The signal dispositions of this task's thread group (see Task.vma for the no-address-space case).
+    /// The RLIMIT_AS charge of this task's address space (Mm.as_used); a task without one gets a static dummy.
+    pub fn asUsed(self: *const Task) *u64 {
+        if (self.mm) |m| return &m.as_used;
+        return &no_mm_charge;
+    }
+
+    /// The RLIMIT_DATA charge of this task's address space (Mm.data_used).
+    pub fn dataUsed(self: *const Task) *u64 {
+        if (self.mm) |m| return &m.data_used;
+        return &no_mm_charge;
+    }
+
     pub fn sigact(self: *const Task) *@import("../mm/sigact_table.zig").SigActions {
         if (self.mm) |m| return m.sig;
         return &no_mm_sig;
@@ -570,6 +579,7 @@ pub const MmapRegion = @import("../mm/vma_table.zig").MmapRegion;
 pub const MAX_TASKS: u32 = 64;
 
 var no_mm_regions: [64]MmapRegion = [_]MmapRegion{.{}} ** 64;
+var no_mm_charge: u64 = 0;
 var no_mm_table: @import("../mm/vma_table.zig").VmaTable = .{ .regions = &no_mm_regions };
 var no_mm_sig: @import("../mm/sigact_table.zig").SigActions = .{ .handlers = @splat(0), .masks = @splat(0), .flags = @splat(0) };
 
@@ -1731,10 +1741,8 @@ pub fn createUserProcess(
         tasks[slot].stack_max = 8 * 1024 * 1024;
         tasks[slot].as_cur = @import("rlimit.zig").RLIM_INFINITY;
         tasks[slot].as_max = @import("rlimit.zig").RLIM_INFINITY;
-        tasks[slot].as_used = 0;
         tasks[slot].data_cur = @import("rlimit.zig").RLIM_INFINITY;
         tasks[slot].data_max = @import("rlimit.zig").RLIM_INFINITY;
-        tasks[slot].data_used = 0;
         tasks[slot].nproc_cur = @import("rlimit.zig").RLIM_INFINITY;
         tasks[slot].nproc_max = @import("rlimit.zig").RLIM_INFINITY;
         tasks[slot].fSize_cur = fsize_cur;

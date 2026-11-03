@@ -2953,3 +2953,6 @@ This is an ABI/rollback contract only, not a throughput claim.
 
 **信号处置属于线程组（hello211）**：`mm/sigact_table.zig` 定义 `SigActions`（handlers/masks/flags），挂在 `Mm.sig`；`Task.sigact()` 取它。
 `CLONE_VM` 线程共享，fork 与不带 `CLONE_VM` 的 clone 拷贝，exec 从旧 `Mm` 读出再重置（捕获的还原为默认，`SIG_IGN` 保留）。
+
+**RLIMIT_AS / RLIMIT_DATA 的已用计数属于 `Mm`（hello212）**：`Mm.as_used`/`Mm.data_used`；`Task.asUsed()`/`dataUsed()` 取所属 `Mm` 的计数器。
+fork 与不带 `CLONE_VM` 的 clone 用 `inheritCharges` 继承，`CLONE_VM` 线程共享，exec 的新 `Mm` 从 0 开始。限额本身仍在 `Task` 里（见 current-code-review-and-fix-plan.md 的剩余缺口）。

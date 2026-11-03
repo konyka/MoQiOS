@@ -10490,7 +10490,7 @@ test "the program break belongs to the address space: CLONE_VM threads share it,
     // fork and a clone without CLONE_VM copy the break into the child's new Mm; a CLONE_VM clone shares the Mm and copies nothing.
     try std.testing.expect(std.mem.indexOf(u8, kt.fork_source, "inheritBreak(") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "child.brk_current") == null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "if (!shares_vm) {\n        if (child.mm) |child_mm| if (parent.mm) |parent_mm| child_mm.inheritBreak(parent_mm);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "child_mm.inheritBreak(parent_mm);") != null);
     // The loader and exec set it on the Mm they create.
     try std.testing.expect(std.mem.indexOf(u8, kt.loader_source, "t.brk_current") == null);
     try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "cur.brk_current") == null);
@@ -10515,7 +10515,7 @@ test "the mapping table belongs to the address space: CLONE_VM threads share one
     try std.testing.expect(std.mem.indexOf(u8, kt.fork_source, "vma_table.zig\").snapshot(parent.vma(), &vma_snap);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "vma_table.zig\").snapshot(parent.vma(), &vma_snap);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "child.vma().regions") == null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "if (!shares_vm) {\n        if (child.mm) |child_mm| if (parent.mm) |parent_mm| child_mm.inheritBreak(parent_mm);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "child_mm.inheritBreak(parent_mm);") != null);
     // File references are released once, when the last user of the Mm drops it, not by each thread or by exec.
     try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "releaseFileRefs(") == null);
     try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "releaseFileRefs(") == null);
@@ -10541,5 +10541,26 @@ test "signal dispositions belong to the address space: CLONE_VM threads share on
     // A CLONE_VM clone shares the Mm and copies no dispositions; a copied address space gets a copy.
     try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "child.sigact().handlers[i] = parent.sigact().handlers[i]") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "if (!shares_vm) {\n        for (0..64) |i| {") != null);
+    try std.testing.expect(@sizeOf(kt.mm.Mm) <= 1024);
+}
+
+test "RLIMIT_AS and RLIMIT_DATA accounting belongs to the address space: CLONE_VM threads charge one counter" {
+    // as_used/data_used were per-Task counters that clone copied, so each thread of a process had its own idea of how much
+    // address space was in use and the limit could be exceeded by the number of threads. They are in Mm now, like
+    // Linux's mm->total_vm / data_vm.
+    try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "as_used: u64") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "data_used: u64") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.mm_source, "as_used: u64 = 0,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.mm_source, "data_used: u64 = 0,") != null);
+    for ([_][]const u8{ kt.mmap_source, kt.brk_source, kt.idt_source, kt.clone_source, kt.fork_source, kt.execve_source }) |src| {
+        try std.testing.expect(std.mem.indexOf(u8, src, ".as_used") == null);
+        try std.testing.expect(std.mem.indexOf(u8, src, ".data_used") == null);
+    }
+    // fork and a copied-address-space clone start the child's new Mm at the parent's charge; a CLONE_VM clone shares it.
+    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "child_mm.inheritCharges(parent_mm);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.fork_source, "child_mm.inheritCharges(parent_mm);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.mm_source, "mm.as_used = parent.as_used;") != null);
+    // exec: the new image's Mm is already at 0, nothing is reset by hand.
+    try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "asUsed()") == null);
     try std.testing.expect(@sizeOf(kt.mm.Mm) <= 1024);
 }

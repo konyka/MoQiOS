@@ -6385,3 +6385,10 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修复：新文件 `mm/sigact_table.zig`（`SigActions`：handlers/masks/flags 各 64 项，共 1.5 KB），`Mm.sig` 指向随 `Mm` 一起分配和释放的一页（放不进 1024 字节的 slab 档，所以与映射表一样用单独一页）。`Task.sigact()` 取所属 `Mm` 的表。`CLONE_VM` 线程共享；fork 和不带 `CLONE_VM` 的 clone 拷贝；**exec 读旧 `Mm` 的表**（此时 `cur` 已指向新 `Mm`，新表是空的），把被捕获的信号还原成默认、`SIG_IGN` 保留、`sa_mask`/`sa_flags` 清零。host 测试 `signal dispositions belong to the address space` 用源码文本断言钉住接线。
 - 验证：`hello211`（8 项）红→绿；host 1005/1005；三架构构建通过；完整门禁全绿（SMP=1、SMP=8 三次、GPT 数据盘、SMP=2 压力 5/5，约 1.5 小时）。
 - 如实说明：①handler 数组的读写本来就没有锁（单个字、由调用 `sigaction` 的线程写、发送/接收方读），共享之后读写双方可能在不同线程，这个无锁取舍没变，不是新引入的竞争，但也没有加锁；②`sigaltstack` 是每线程的（Linux 同），我没有动；③没做变异检查，靠完整门禁和 `hello211`。
+
+## RLIMIT_AS / RLIMIT_DATA 的计数属于地址空间：`as_used`/`data_used` 移进 Mm（hello212）
+
+- 发现：继续查线程共享状态，`as_used`/`data_used`（RLIMIT_AS/DATA 的已用字节）是 `Task` 里的计数器，`clone` 对 `CLONE_VM` 线程只是拷一份初值。结果每个线程各记各的：N 个线程可以各自映射到限额，进程总量可达 N 倍限额；一个线程 `munmap` 另一个线程映射的区域时，退款记到了错误的计数器上（并且用 `-|=` 饱和相减，悄悄丢失）。先写了 `hello212`（限额 16 MiB，工作线程与主线程轮流映射 10 MiB），旧内核上 SMP=1 失败 3 项：工作线程在主线程已占 10 MiB 时仍能再映射 10 MiB；主线程 `munmap` 之后工作线程的配额判断不变；主线程在工作线程占着 10 MiB 时也能再映射。
+- 修复：`Mm.as_used`/`Mm.data_used`（对应 Linux 的 `mm->total_vm`/`data_vm`），`vm_lock` 保护。`Task.asUsed()`/`dataUsed()` 返回所属 `Mm` 的计数器指针，约 40 处读写改过去。限额本身（`as_cur`/`as_max`/`data_cur`/`data_max`）**仍留在 `Task` 里**：Linux 的 rlimit 属于进程（`signal_struct`），这里每个任务一份，且 `setrlimit` 只改调用线程那份——这是下面如实说明的剩余缺口。生命周期：fork 和不带 `CLONE_VM` 的 clone 用 `Mm.inheritCharges` 把父的已用值带给子的新 `Mm`；`CLONE_VM` 线程共享；exec 的新 `Mm` 自然从 0 开始（原来 execve 里手动清零的两行删掉了）。host 测试 `RLIMIT_AS and RLIMIT_DATA accounting belongs to the address space`（源码文本断言）。
+- 验证：`hello212`（10 项）红→绿；host 1006/1006；三架构构建通过；完整门禁全绿（SMP=1、SMP=8 三次、GPT 数据盘、SMP=2 压力 5/5，约 1.5 小时）。
+- **如实说明的剩余缺口**：①限额（`as_cur` 等）、`nofile_cur`、`stack_cur`、`fSize_cur`、`nproc_cur`、`recorded_limits` 都还是每个线程一份。在 Linux 里 `setrlimit` 对整个进程生效；这里线程 A 调 `setrlimit(RLIMIT_AS)`，线程 B 的限额不变。`hello212` 刻意让主线程设限额、工作线程在创建之后才读，所以没有碰这个缺口（工作线程是在 `setrlimit` 之后创建的，继承到了限额）。这需要把限额也搬到线程组共享的地方，是下一轮的候选；②没做变异检查。

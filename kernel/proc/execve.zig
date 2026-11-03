@@ -179,8 +179,6 @@ pub fn prepareExecName(name: []const u8, argv_ptr: u64, envp_ptr: u64) Prepared 
     );
     // RLIMIT_AS limits are preserved, but every charged byte belonged to the
     // replaced image — the fresh image starts uncharged (see docs/rlimit.md).
-    cur.as_used = 0;
-    cur.data_used = 0;
     new_mm.setBreak(result.brk);
     // The old TLS block belonged to the replaced image. Program the CPU too:
     // execve returns straight to user space without passing through the

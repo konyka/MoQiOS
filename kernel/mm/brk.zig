@@ -63,11 +63,11 @@ pub fn brk(addr: u64) i64 {
         // RLIMIT_AS: heap growth past the soft limit reports the unchanged
         // break (POSIX brk failure), same as an allocation failure below.
         const delta_bytes = (new_page - old_page) * PAGE;
-        if (!@import("../proc/rlimit.zig").Policy.asChargeOk(cur.as_used, delta_bytes, cur.as_cur)) {
+        if (!@import("../proc/rlimit.zig").Policy.asChargeOk(cur.asUsed().*, delta_bytes, cur.as_cur)) {
             return @bitCast(mm.brk_current);
         }
         // RLIMIT_DATA: brk heap growth charges the independent data ledger.
-        if (!@import("../proc/rlimit.zig").Policy.dataChargeOk(cur.data_used, delta_bytes, cur.data_cur)) {
+        if (!@import("../proc/rlimit.zig").Policy.dataChargeOk(cur.dataUsed().*, delta_bytes, cur.data_cur)) {
             return @bitCast(mm.brk_current);
         }
 
@@ -123,8 +123,8 @@ pub fn brk(addr: u64) i64 {
                 return @bitCast(mm.brk_current);
             };
         }
-        cur.as_used += delta_bytes; // RLIMIT_AS charge (checked above)
-        cur.data_used += delta_bytes; // RLIMIT_DATA charge (checked above)
+        cur.asUsed().* += delta_bytes; // RLIMIT_AS charge (checked above)
+        cur.dataUsed().* += delta_bytes; // RLIMIT_DATA charge (checked above)
         mlock_gate.recordIfFuture(cur, old_page, new_page - old_page);
     } else if (new_page < old_page) {
         // Give the released pages back. The growth loop used to run
@@ -132,8 +132,8 @@ pub fn brk(addr: u64) i64 {
         // the range and panicked the kernel computing its length.
         releasePages(cur, new_page, old_page);
         mm.locks.releaseLossy(new_page, old_page - new_page); // the pages are gone, so are their locks
-        cur.as_used -|= (old_page - new_page) * PAGE; // RLIMIT_AS refund
-        cur.data_used -|= (old_page - new_page) * PAGE; // RLIMIT_DATA refund
+        cur.asUsed().* -|= (old_page - new_page) * PAGE; // RLIMIT_AS refund
+        cur.dataUsed().* -|= (old_page - new_page) * PAGE; // RLIMIT_DATA refund
     }
 
     mm.brk_current = addr;

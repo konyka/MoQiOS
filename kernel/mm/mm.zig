@@ -56,12 +56,23 @@ pub const Mm = struct {
     /// loader left the break (it may never retreat below it); 0 in both means no heap was set up for this image.
     brk_start: u64 = 0,
     brk_current: u64 = 0,
+    /// RLIMIT_AS / RLIMIT_DATA charge of this address space, in bytes (Linux mm->total_vm / data_vm): brk heap pages,
+    /// tracked mmap regions and demand-faulted stack pages. One counter per address space, so CLONE_VM threads charge
+    /// the same one. Written under vm_lock; a fresh address space (exec) starts at 0, a fork child at the parent's.
+    as_used: u64 = 0,
+    data_used: u64 = 0,
     /// The tracked mappings (mmap/munmap/mprotect/mlock bookkeeping) of this address space. Written under vm_lock. The
     /// region array is one page allocated with the Mm and freed with it; a fork child gets a copy, exec an empty table.
     vma_tab: @import("vma_table.zig").VmaTable,
     /// Signal dispositions of the thread group (mm/sigact_table.zig); one page-backed table shared by CLONE_VM threads,
     /// allocated with the Mm and freed with it. A fork child gets a copy, exec resets caught signals in the new image's.
     sig: *@import("sigact_table.zig").SigActions,
+
+    /// A copied address space (fork, clone without CLONE_VM) starts at the parent's RLIMIT_AS / RLIMIT_DATA charge.
+    pub fn inheritCharges(mm: *Mm, parent: *const Mm) void {
+        mm.as_used = parent.as_used;
+        mm.data_used = parent.data_used;
+    }
 
     /// Set the initial break of a freshly built address space (loader, exec). Nobody else can see it yet.
     pub fn setBreak(mm: *Mm, brk: u64) void {
