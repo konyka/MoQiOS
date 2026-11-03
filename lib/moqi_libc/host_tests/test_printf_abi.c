@@ -37,6 +37,11 @@ long test_write(int fd, const void *b, size_t n) {
     return (long)n;
 }
 
+/* Some glibc headers (Ubuntu's, with fortification) define printf, snprintf, sprintf and dprintf as macros. */
+#undef printf
+#undef snprintf
+#undef sprintf
+#undef dprintf
 #define malloc test_malloc
 #define write test_write
 #define vsnprintf moqi_vsnprintf
