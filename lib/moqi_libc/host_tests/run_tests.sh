@@ -16,7 +16,7 @@ CC="zig cc"
 CFLAGS="-O1 -g -Wall -Wextra -Werror -fno-builtin -UNDEBUG"
 
 fail=0
-for t in test_string test_format test_malloc test_stdlib test_args test_pthread_dead_reap test_pthread_join_claim; do
+for t in test_string test_malloc test_stdlib test_args test_pthread_dead_reap test_pthread_join_claim; do
     echo "== $t =="
     $CC $CFLAGS -o "$OUT/$t" "$t.c"
     "$OUT/$t" || fail=1
@@ -70,6 +70,20 @@ echo "== test_strfunc_abi =="
 $CC $CFLAGS -c ../src/strfunc.c -o "$OUT/strfunc.o"
 $CC $CFLAGS -o "$OUT/test_strfunc_abi" test_strfunc_abi.c "$OUT/strfunc.o"
 "$OUT/test_strfunc_abi" || fail=1
+
+echo "== test_format =="
+$CC $CFLAGS -c ../src/strfunc.c -o "$OUT/strfunc_fmt.o"
+$CC $CFLAGS -o "$OUT/test_format" test_format.c ../src/string.c "$OUT/strfunc_fmt.o"
+"$OUT/test_format" || fail=1
+
+echo "== test_printf_abi =="
+$CC $CFLAGS -c ../src/strfunc.c -o "$OUT/strfunc_pf.o"
+$CC $CFLAGS -o "$OUT/test_printf_abi" test_printf_abi.c "$OUT/strfunc_pf.o" ../src/string.c
+"$OUT/test_printf_abi" || fail=1
+# The same test under UBSan: the formatter indexes small scratch buffers, so an index outside them (which the output
+# alone would not show) must fail here.
+$CC $CFLAGS -fsanitize=undefined -fno-sanitize-trap=undefined -o "$OUT/test_printf_abi_ubsan" test_printf_abi.c "$OUT/strfunc_pf.o" ../src/string.c
+"$OUT/test_printf_abi_ubsan" || fail=1
 
 echo "== test_env_abi =="
 $CC $CFLAGS -o "$OUT/test_env_abi" test_env_abi.c ../src/string.c

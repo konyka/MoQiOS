@@ -219,7 +219,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | `include/crt0.h` | 初始栈解析（`moqi_parse_initial_stack`，头文件内联，可宿主机测试） |
 | `include/unistd.h` | read/write/open/close/lseek/fork/execve/waitpid/_exit/pipe/dup2/yield/nanosleep/brk/sbrk 等 + `extern char **environ` |
 | `include/string.h` | memcpy/memmove/memset/memcmp/strlen/strcmp/strncmp/strcpy/strncpy/strcat/strchr/strrchr |
-| `include/stdio.h` | print/puts/putchar/printf（%d %i %u %x %X %s %c %p %%，支持 l/ll；无浮点）+ snprintf/vsnprintf |
+| `include/stdio.h` | printf 家族（printf/vprintf/dprintf/vdprintf/snprintf/vsnprintf/sprintf/vsprintf/asprintf/vasprintf）、puts/putchar；语法与 glibc 一致：标志 `# 0 - + 空格 ' I`、宽度、精度、`*`、长度 `hh h l ll L q z Z j t`、转换 `d i u o x X b B c s p n m C S %`；无浮点、无位置参数（`%1$d`） |
 | `include/stdlib.h` | malloc/free/calloc（brk 上的首次适配空闲链表）、exit、atoi、getenv |
 | `include/ctype.h` | isdigit/isalpha/isspace/toupper 等（纯头文件） |
 | `include/signal.h` | `struct ksigaction`（匹配内核读取的 28 字节布局）、sigaction、SIGINT/SIG_IGN 等 |

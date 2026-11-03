@@ -24,6 +24,7 @@
 #define ENAMETOOLONG 36
 #define ENOSYS       38
 #define EOVERFLOW    75
+#define EILSEQ       84
 #define EOPNOTSUPP   95
 
 int *__errno_location(void);

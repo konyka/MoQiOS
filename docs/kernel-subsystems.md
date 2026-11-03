@@ -2933,3 +2933,7 @@ This is an ABI/rollback contract only, not a throughput claim.
 `reallocarray`、`posix_memalign`、`aligned_alloc`、`memalign`；分配失败设 `ENOMEM`（线程指针未装好时不写 errno）。
 `realloc` 缩小就地切分并合并、增长优先吞并后继空闲块或向系统要更多、最后才搬移，失败保持原块；对齐分配切分第一块
 够大的空闲块，前部保持空闲。`hello207` 在真实堆（brk）和多线程下验证。
+
+**libc printf 家族（hello208）**：`lib/moqi_libc/src/format.c` 是共享格式化引擎（宽度/精度/标志/长度修饰符，
+语法对齐 glibc，由 `host_tests/test_printf_abi.c` 对 2473 行 glibc 实测值验证），`stdio.c` 在其上提供
+`printf/dprintf/vprintf/puts/putchar/asprintf`。输出经 512 字节分块的 `write(2)`，不缓冲、无 `FILE`；无浮点和位置参数。
