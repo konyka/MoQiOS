@@ -1417,7 +1417,7 @@ pub const FdTable = struct {
 
     /// RLIMIT_FSIZE preflight for a regular-file write at byte position `pos`.
     /// Returns the number of bytes the write may actually perform. When the
-    /// requested write would cross `fSize_cur`, it is truncated to the allowed
+    /// requested write would cross the group's RLIMIT_FSIZE, it is truncated to the allowed
     /// prefix (`soft_limit - pos`) and SIGXFSZ is raised. A write that starts
     /// at/past the limit returns EFBIG after raising SIGXFSZ. The filesystem
     /// backends use u32 offsets, so unrepresentable ranges return EINVAL.
@@ -1427,7 +1427,7 @@ pub const FdTable = struct {
         const t = sched.currentTask() orelse return @intCast(count);
         if (count == 0) return 0;
         if (pos > 0xFFFF_FFFF or count > 0xFFFF_FFFF or @as(u64, @intCast(count)) > 0xFFFF_FFFF - pos) return -22; // EINVAL
-        const limit = t.fSize_cur;
+        const limit = t.lim().fsize.cur;
         const allowed = RlimitPolicy.fsizeWriteBytes(pos, @intCast(count), limit);
         if (allowed == count) return @intCast(count);
         const sig_mod = @import("../proc/signal.zig");

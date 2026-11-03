@@ -166,7 +166,7 @@ pub fn endTempMask(saved: SavedMask, rc: i64) void {
 fn pollWait(fds_ptr: u64, nfds: u64, wait: pp.Wait) i64 {
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
-    if (!pp.nfdsValid(nfds, @min(t.nofile_cur, MAX_POLL))) return -22; // EINVAL
+    if (!pp.nfdsValid(nfds, @min(t.lim().nofile.cur, MAX_POLL))) return -22; // EINVAL
 
     const n: usize = @intCast(nfds);
     var pfds: [MAX_POLL]pollfd = @splat(.{ .fd = -1, .events = 0, .revents = 0 });

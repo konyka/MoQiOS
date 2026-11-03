@@ -14,7 +14,7 @@ const EAGAIN: i64 = -11;
 
 pub fn memlockLimit(task: *const task_mod.Task) u64 {
     const slot = rlimit.recordedSlot(RLIMIT_MEMLOCK) orelse return rlimit.RLIM_INFINITY;
-    return task.recorded_limits.get(slot).cur;
+    return task.lim().recorded.get(slot).cur;
 }
 
 fn verdict(g: policy.Gate) i64 {

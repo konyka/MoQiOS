@@ -847,8 +847,8 @@ fn replaceFixedAnonymous(
     const old_writable_private = (old_region.prot & 2) != 0 and !old_region.shared;
     const old_charge = if (old_writable_private) num_pages * page else 0;
     const new_charge = if (writable_private) num_pages * page else 0;
-    const next_as = fixed_replacement.chargeAfterReplacement(task.asUsed().*, num_pages * page, num_pages * page, task.as_cur) orelse return -12;
-    const next_data = fixed_replacement.chargeAfterReplacement(task.dataUsed().*, old_charge, new_charge, task.data_cur) orelse return -12;
+    const next_as = fixed_replacement.chargeAfterReplacement(task.asUsed().*, num_pages * page, num_pages * page, task.lim().as.cur) orelse return -12;
+    const next_data = fixed_replacement.chargeAfterReplacement(task.dataUsed().*, old_charge, new_charge, task.lim().data.cur) orelse return -12;
 
     var old_phys: [fixed_replacement.MAX_ANON_REPLACEMENT_PAGES]u64 = undefined;
     var new_phys: [fixed_replacement.MAX_ANON_REPLACEMENT_PAGES]u64 = undefined;
@@ -899,9 +899,9 @@ fn moveChargesOk(task: *task_mod.Task, region: *task_mod.MmapRegion, old_pages: 
     const page = user_space.PAGE_SIZE;
     if (new_pages <= old_pages) return true;
     const rl = @import("../proc/rlimit.zig");
-    if (!rl.Policy.asChargeOk(task.asUsed().*, (new_pages - old_pages) * page, task.as_cur)) return false;
+    if (!rl.Policy.asChargeOk(task.asUsed().*, (new_pages - old_pages) * page, task.lim().as.cur)) return false;
     if ((region.prot & 2) != 0 and !region.shared and
-        !rl.Policy.dataChargeOk(task.dataUsed().*, (new_pages - old_pages) * page, task.data_cur)) return false;
+        !rl.Policy.dataChargeOk(task.dataUsed().*, (new_pages - old_pages) * page, task.lim().data.cur)) return false;
     return true;
 }
 
@@ -1359,7 +1359,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot_raw: u64, flags: u64, fd: i64, off
     // replacement has already refunded the range it unmapped above.
     const rlimit = @import("../proc/rlimit.zig");
     const map_bytes = num_pages * user_space.PAGE_SIZE;
-    if (!rlimit.Policy.asChargeOk(cur.asUsed().*, map_bytes, cur.as_cur)) return -12; // ENOMEM
+    if (!rlimit.Policy.asChargeOk(cur.asUsed().*, map_bytes, cur.lim().as.cur)) return -12; // ENOMEM
     // RLIMIT_DATA: writable private mappings (anonymous or file-private)
     // charge an independent data ledger on top of RLIMIT_AS.
     // A volume file is mapped as a private copy even when MAP_SHARED was
@@ -1367,7 +1367,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot_raw: u64, flags: u64, fd: i64, off
     const shared = (flags & MAP_SHARED) != 0 and pf.list_phys == 0;
     const writable_private = (prot & 2) != 0 and !shared;
     if (writable_private and
-        !rlimit.Policy.dataChargeOk(cur.dataUsed().*, map_bytes, cur.data_cur)) return -12; // ENOMEM
+        !rlimit.Policy.dataChargeOk(cur.dataUsed().*, map_bytes, cur.lim().data.cur)) return -12; // ENOMEM
 
     // I1: huge blocks are only attempted for anonymous mappings whose final
     // base is 2MiB-aligned with at least one full block. A huge region never
@@ -1862,13 +1862,13 @@ fn mremapExact(cur: *task_mod.Task, old_addr: u64, old_pages: u64, new_pages: u6
                 // (image, stack, brk) — gate on the actual page tables too.
                 if (!pagesFree(cur, g.start, g.pages)) return -12; // ENOMEM
                 // RLIMIT_AS: the grown tail charges like a fresh mapping.
-                if (!@import("../proc/rlimit.zig").Policy.asChargeOk(cur.asUsed().*, (new_pages - old_pages) * PAGE, cur.as_cur)) return -12; // ENOMEM
+                if (!@import("../proc/rlimit.zig").Policy.asChargeOk(cur.asUsed().*, (new_pages - old_pages) * PAGE, cur.lim().as.cur)) return -12; // ENOMEM
                 cur.asUsed().* += (new_pages - old_pages) * PAGE;
                 // RLIMIT_DATA: a writable private file region charges its
                 // grown tail on the independent data ledger as well.
                 if ((r.prot & 2) != 0 and !r.shared) {
                     const grow_bytes = (new_pages - old_pages) * PAGE;
-                    if (!@import("../proc/rlimit.zig").Policy.dataChargeOk(cur.dataUsed().*, grow_bytes, cur.data_cur)) return -12; // ENOMEM
+                    if (!@import("../proc/rlimit.zig").Policy.dataChargeOk(cur.dataUsed().*, grow_bytes, cur.lim().data.cur)) return -12; // ENOMEM
                     cur.dataUsed().* += grow_bytes;
                 }
                 r.num_pages = new_pages;
@@ -1882,9 +1882,9 @@ fn mremapExact(cur: *task_mod.Task, old_addr: u64, old_pages: u64, new_pages: u6
             const grow_pages = new_pages - old_pages;
             // RLIMIT_AS: refuse growth past the soft limit outright (moving
             // would hit the same charge, checked again in moveMapping).
-            if (!@import("../proc/rlimit.zig").Policy.asChargeOk(cur.asUsed().*, grow_pages * PAGE, cur.as_cur)) return -12; // ENOMEM
+            if (!@import("../proc/rlimit.zig").Policy.asChargeOk(cur.asUsed().*, grow_pages * PAGE, cur.lim().as.cur)) return -12; // ENOMEM
             if ((r.prot & 2) != 0 and !r.shared and
-                !@import("../proc/rlimit.zig").Policy.dataChargeOk(cur.dataUsed().*, grow_pages * PAGE, cur.data_cur)) return -12; // ENOMEM
+                !@import("../proc/rlimit.zig").Policy.dataChargeOk(cur.dataUsed().*, grow_pages * PAGE, cur.lim().data.cur)) return -12; // ENOMEM
             var can_grow = true;
             for (cur.vma().regions) |r2| {
                 if (r2.active and r2.base != old_addr) {

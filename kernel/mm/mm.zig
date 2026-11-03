@@ -64,14 +64,21 @@ pub const Mm = struct {
     /// The tracked mappings (mmap/munmap/mprotect/mlock bookkeeping) of this address space. Written under vm_lock. The
     /// region array is one page allocated with the Mm and freed with it; a fork child gets a copy, exec an empty table.
     vma_tab: @import("vma_table.zig").VmaTable,
-    /// Signal dispositions of the thread group (mm/sigact_table.zig); one page-backed table shared by CLONE_VM threads,
-    /// allocated with the Mm and freed with it. A fork child gets a copy, exec resets caught signals in the new image's.
-    sig: *@import("sigact_table.zig").SigActions,
+    /// Signal dispositions and resource limits of the thread group (mm/group_state.zig); one page, shared by CLONE_VM
+    /// threads, allocated with the Mm and freed with it. A fork child gets a copy, exec resets caught signals and carries
+    /// the limits over.
+    grp: *@import("group_state.zig").GroupState,
 
     /// A copied address space (fork, clone without CLONE_VM) starts at the parent's RLIMIT_AS / RLIMIT_DATA charge.
     pub fn inheritCharges(mm: *Mm, parent: *const Mm) void {
         mm.as_used = parent.as_used;
         mm.data_used = parent.data_used;
+    }
+
+    /// A new address space copied from `parent` (fork, clone without CLONE_VM) starts with the parent's resource limits; exec
+    /// carries the old image's limits into the new one. (Signal dispositions are copied separately: exec resets them.)
+    pub fn inheritLimits(mm: *Mm, parent: *const Mm) void {
+        mm.grp.lim = parent.grp.lim;
     }
 
     /// Set the initial break of a freshly built address space (loader, exec). Nobody else can see it yet.
@@ -115,14 +122,14 @@ pub const Mm = struct {
         };
         const regions: *[@import("vma_table.zig").MAX_REGIONS]@import("vma_table.zig").MmapRegion = @ptrFromInt(@import("hhdm.zig").physToVirt(phys));
         for (regions) |*r| r.* = .{};
-        const sig_phys = pmm.allocPage() orelse {
+        const grp_phys = pmm.allocPage() orelse {
             pmm.freePage(phys);
             slab.kfree(ptr);
             return null;
         };
-        const sig: *@import("sigact_table.zig").SigActions = @ptrFromInt(@import("hhdm.zig").physToVirt(sig_phys));
-        sig.* = .{ .handlers = @splat(0), .masks = @splat(0), .flags = @splat(0) };
-        mm.* = .{ .page_table_phys = page_table_phys, .finalizer = finalizer, .vma_tab = .{ .regions = regions }, .sig = sig };
+        const grp: *@import("group_state.zig").GroupState = @ptrFromInt(@import("hhdm.zig").physToVirt(grp_phys));
+        grp.* = @import("group_state.zig").GroupState.initial(@import("group_state.zig").DEFAULT_NOFILE);
+        mm.* = .{ .page_table_phys = page_table_phys, .finalizer = finalizer, .vma_tab = .{ .regions = regions }, .grp = grp };
         return mm;
     }
 
@@ -162,7 +169,7 @@ pub const Mm = struct {
         if (self.finalized.swap(true, .acq_rel)) return;
         self.finalizer(self);
         @import("pmm.zig").freePage(@import("hhdm.zig").virtToPhys(@intFromPtr(self.vma_tab.regions)));
-        @import("pmm.zig").freePage(@import("hhdm.zig").virtToPhys(@intFromPtr(self.sig)));
+        @import("pmm.zig").freePage(@import("hhdm.zig").virtToPhys(@intFromPtr(self.grp)));
         @import("slab.zig").kfree(self);
     }
 

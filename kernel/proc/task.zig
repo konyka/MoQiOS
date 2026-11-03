@@ -167,37 +167,7 @@ pub const Task = struct {
     fd_table: *@import("../fs/vfs.zig").FdTable,
     /// Per-task Linux ioprio value; independent of scheduler priority/policy.
     ioprio: u32 = @import("ioprio_policy.zig").DEFAULT,
-    /// Per-task RLIMIT_NOFILE; defaults preserve the historical MAX_FDS cap.
-    nofile_cur: u64 = @import("../fs/vfs.zig").MAX_FDS,
-    nofile_max: u64 = @import("../fs/vfs.zig").MAX_FDS,
-    /// Per-task RLIMIT_STACK in bytes; enforced as the main-stack growth
-    /// floor in the demand-paging fault path. Defaults match the values the
-    /// former stub reported.
-    stack_cur: u64 = 8 * 1024 * 1024,
-    stack_max: u64 = 8 * 1024 * 1024,
-    /// Per-task RLIMIT_AS in bytes over the charged address space; defaults preserve the former stub report (unlimited).
-    /// What is charged (brk heap pages, mmap-tracked regions, demand-faulted stack pages) is counted in Mm.as_used, once
-    /// per address space, so CLONE_VM threads charge the same counter.
-    as_cur: u64 = @import("rlimit.zig").RLIM_INFINITY,
-    as_max: u64 = @import("rlimit.zig").RLIM_INFINITY,
-    /// Per-task RLIMIT_DATA in bytes; the charge (brk heap pages, writable private mmap regions) is Mm.data_used.
-    data_cur: u64 = @import("rlimit.zig").RLIM_INFINITY,
-    data_max: u64 = @import("rlimit.zig").RLIM_INFINITY,
-    /// Per-task RLIMIT_NPROC soft/hard limits in task count for the real
-    /// UID; defaults preserve the former stub report (unlimited). The gate
-    /// lives at every task-creation chokepoint (fork/clone/spawn) before
-    /// expensive page-table work; the per-UID count is maintained in
-    /// `uid_task_count` alongside `task_count`.
-    nproc_cur: u64 = @import("rlimit.zig").RLIM_INFINITY,
-    nproc_max: u64 = @import("rlimit.zig").RLIM_INFINITY,
-    /// Per-task RLIMIT_FSIZE soft/hard limits in bytes; defaults preserve the
-    /// former stub report (unlimited). Enforced as a byte-boundary gate on
-    /// file writes in the write path.
-    fSize_cur: u64 = @import("rlimit.zig").RLIM_INFINITY,
-    fSize_max: u64 = @import("rlimit.zig").RLIM_INFINITY,
-    /// Limits without an enforcement point (CORE, RSS, CPU, ...): recorded
-    /// so get/set/prlimit64 round-trip; inherited on fork/clone and exec.
-    recorded_limits: @import("rlimit.zig").RecordedLimits = .{},
+    // Resource limits (RLIMIT_*) live in Mm.grp.lim: they belong to the thread group. Use Task.lim().
 
     /// Bitmask of pending signals (bit N = signal N+1 is pending).
     /// Signals 1-64 supported. Bit 0 = SIGHUP (1), bit 63 = SIGRTMAX (64).
@@ -212,7 +182,7 @@ pub const Task = struct {
     /// 64-bit to match the rt_* sigset_t ABI: bit N = signal N+1, 1-64.
     signal_mask: u64,
 
-    // Signal dispositions (handlers, sa_mask, sa_flags) live in Mm (mm/sigact_table.zig): CLONE_VM threads share them.
+    // Signal dispositions live in Mm.grp (mm/group_state.zig): CLONE_VM threads share them. Use Task.sigact().
     /// pselect/epoll_pwait/sigsuspend semantics (Linux TIF_RESTORE_SIGMASK):
     /// when a call that installed a temporary mask is interrupted, the
     /// original mask is restored only after the signal handler that caused
@@ -373,7 +343,20 @@ pub const Task = struct {
         return &no_mm_table;
     }
 
-    /// The signal dispositions of this task's thread group (see Task.vma for the no-address-space case).
+    /// Signal dispositions and resource limits of this task's thread group (see Task.vma for the no-address-space case).
+    pub fn grp(self: *const Task) *@import("../mm/group_state.zig").GroupState {
+        if (self.mm) |m| return m.grp;
+        return &no_mm_grp;
+    }
+
+    pub fn sigact(self: *const Task) *@import("../mm/group_state.zig").SigActions {
+        return &self.grp().sig;
+    }
+
+    pub fn lim(self: *const Task) *@import("../mm/group_state.zig").Limits {
+        return &self.grp().lim;
+    }
+
     /// The RLIMIT_AS charge of this task's address space (Mm.as_used); a task without one gets a static dummy.
     pub fn asUsed(self: *const Task) *u64 {
         if (self.mm) |m| return &m.as_used;
@@ -384,11 +367,6 @@ pub const Task = struct {
     pub fn dataUsed(self: *const Task) *u64 {
         if (self.mm) |m| return &m.data_used;
         return &no_mm_charge;
-    }
-
-    pub fn sigact(self: *const Task) *@import("../mm/sigact_table.zig").SigActions {
-        if (self.mm) |m| return m.sig;
-        return &no_mm_sig;
     }
 };
 
@@ -581,7 +559,7 @@ pub const MAX_TASKS: u32 = 64;
 var no_mm_regions: [64]MmapRegion = [_]MmapRegion{.{}} ** 64;
 var no_mm_charge: u64 = 0;
 var no_mm_table: @import("../mm/vma_table.zig").VmaTable = .{ .regions = &no_mm_regions };
-var no_mm_sig: @import("../mm/sigact_table.zig").SigActions = .{ .handlers = @splat(0), .masks = @splat(0), .flags = @splat(0) };
+var no_mm_grp: @import("../mm/group_state.zig").GroupState = @import("../mm/group_state.zig").GroupState.initial(@import("../mm/group_state.zig").DEFAULT_NOFILE);
 
 /// Task table. Slots are NOT optionals: a `Task` used to be ~62KB (dominated
 /// by the embedded fd table, now pooled in vfs.zig) and storing it in a
@@ -946,12 +924,7 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     tasks[slot].entry = entry;
     tasks[slot].personality = .native;
     tasks[slot].fd_table = fd_table;
-    tasks[slot].nofile_cur = @import("../fs/vfs.zig").MAX_FDS;
-    tasks[slot].nofile_max = @import("../fs/vfs.zig").MAX_FDS;
-    tasks[slot].fd_table.alloc_limit = tasks[slot].nofile_cur;
-    tasks[slot].fSize_cur = @import("rlimit.zig").RLIM_INFINITY;
-    tasks[slot].fSize_max = @import("rlimit.zig").RLIM_INFINITY;
-    tasks[slot].recorded_limits = .{};
+    tasks[slot].fd_table.alloc_limit = tasks[slot].lim().nofile.cur;
     tasks[slot].cwd[0] = '/';
     tasks[slot].cwd_len = 1;
     tasks[slot].cpu_affinity = affinity;
@@ -1015,12 +988,7 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     tasks[slot].entry = entry;
     tasks[slot].personality = .native;
     tasks[slot].fd_table = fd_table;
-    tasks[slot].nofile_cur = @import("../fs/vfs.zig").MAX_FDS;
-    tasks[slot].nofile_max = @import("../fs/vfs.zig").MAX_FDS;
-    tasks[slot].fd_table.alloc_limit = tasks[slot].nofile_cur;
-    tasks[slot].fSize_cur = @import("rlimit.zig").RLIM_INFINITY;
-    tasks[slot].fSize_max = @import("rlimit.zig").RLIM_INFINITY;
-    tasks[slot].recorded_limits = .{};
+    tasks[slot].fd_table.alloc_limit = tasks[slot].lim().nofile.cur;
     tasks[slot].cwd[0] = '/';
     tasks[slot].cwd_len = 1;
     tasks[slot].cpu_affinity = -1;
@@ -1737,28 +1705,17 @@ pub fn createUserProcess(
         tasks[slot].sgid = profile.gid;
         tasks[slot].user_entry = user_entry;
         tasks[slot].user_stack_top = user_stack_top;
-        tasks[slot].stack_cur = 8 * 1024 * 1024;
-        tasks[slot].stack_max = 8 * 1024 * 1024;
-        tasks[slot].as_cur = @import("rlimit.zig").RLIM_INFINITY;
-        tasks[slot].as_max = @import("rlimit.zig").RLIM_INFINITY;
-        tasks[slot].data_cur = @import("rlimit.zig").RLIM_INFINITY;
-        tasks[slot].data_max = @import("rlimit.zig").RLIM_INFINITY;
-        tasks[slot].nproc_cur = @import("rlimit.zig").RLIM_INFINITY;
-        tasks[slot].nproc_max = @import("rlimit.zig").RLIM_INFINITY;
-        tasks[slot].fSize_cur = fsize_cur;
-        tasks[slot].fSize_max = fsize_max;
-        // zeroSlot cleared the field defaults: start every recorded limit at infinity.
-        tasks[slot].recorded_limits = .{};
         tasks[slot].stack_limit = @import("rlimit.zig").Policy.initialStackLimit(
             user_stack_top,
             @import("../mm/user_space.zig").USER_STACK_BOTTOM,
-            tasks[slot].stack_cur,
+            tasks[slot].lim().stack.cur,
         );
         tasks[slot].parent_tid = parent_tid_val;
         tasks[slot].fd_table = fd_table;
-        tasks[slot].nofile_cur = @import("../fs/vfs.zig").MAX_FDS;
-        tasks[slot].nofile_max = @import("../fs/vfs.zig").MAX_FDS;
-        tasks[slot].fd_table.alloc_limit = tasks[slot].nofile_cur;
+        tasks[slot].fd_table.alloc_limit = tasks[slot].lim().nofile.cur;
+        // A spawned program inherits only the spawner's RLIMIT_FSIZE (fork/clone copy everything); its Mm is new, so the
+        // other limits start at the defaults.
+        tasks[slot].lim().fsize = .{ .cur = fsize_cur, .max = fsize_max };
         tasks[slot].cwd[0] = '/';
         tasks[slot].cwd_len = 1;
         // User processes are not pinned by default; last_cpu seeds placement.

@@ -63,11 +63,11 @@ pub fn brk(addr: u64) i64 {
         // RLIMIT_AS: heap growth past the soft limit reports the unchanged
         // break (POSIX brk failure), same as an allocation failure below.
         const delta_bytes = (new_page - old_page) * PAGE;
-        if (!@import("../proc/rlimit.zig").Policy.asChargeOk(cur.asUsed().*, delta_bytes, cur.as_cur)) {
+        if (!@import("../proc/rlimit.zig").Policy.asChargeOk(cur.asUsed().*, delta_bytes, cur.lim().as.cur)) {
             return @bitCast(mm.brk_current);
         }
         // RLIMIT_DATA: brk heap growth charges the independent data ledger.
-        if (!@import("../proc/rlimit.zig").Policy.dataChargeOk(cur.dataUsed().*, delta_bytes, cur.data_cur)) {
+        if (!@import("../proc/rlimit.zig").Policy.dataChargeOk(cur.dataUsed().*, delta_bytes, cur.lim().data.cur)) {
             return @bitCast(mm.brk_current);
         }
 

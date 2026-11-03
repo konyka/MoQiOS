@@ -985,7 +985,7 @@ fn handleDemandPage(fault_addr: u64) bool {
         const floor = rlimit.Policy.stackFloor(
             user_space.USER_STACK_TOP,
             user_space.USER_STACK_BOTTOM,
-            current.stack_cur,
+            current.lim().stack.cur,
         );
         if (page_addr < floor) return false;
         // Extend stack_limit — grow in chunks of 32 pages (128KB) for efficiency
@@ -998,7 +998,7 @@ fn handleDemandPage(fault_addr: u64) bool {
         // RLIMIT_AS: each demand-faulted stack page charges; a charge past
         // the soft limit refuses the fault exactly like crossing the stack
         // floor — the caller turns false into SIGSEGV.
-        if (!@import("../../proc/rlimit.zig").Policy.asChargeOk(current.asUsed().*, paging_mod.PAGE_SIZE, current.as_cur)) return false;
+        if (!@import("../../proc/rlimit.zig").Policy.asChargeOk(current.asUsed().*, paging_mod.PAGE_SIZE, current.lim().as.cur)) return false;
     }
     const phys = pmm.allocPage() orelse return false;
     const virt = hhdm.physToVirt(phys);

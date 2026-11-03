@@ -41,8 +41,8 @@ pub fn spawn(name_ptr: u64) i64 {
     if (sched.currentTaskIndex()) |idx| {
         if (task_mod.getTask(idx)) |cur| {
             caller_tid = cur.tid;
-            caller_fsize_cur = cur.fSize_cur;
-            caller_fsize_max = cur.fSize_max;
+            caller_fsize_cur = cur.lim().fsize.cur;
+            caller_fsize_max = cur.lim().fsize.max;
         }
     }
 
@@ -56,7 +56,7 @@ pub fn spawn(name_ptr: u64) i64 {
     // denied spawn costs nothing and leaks nothing. EAGAIN matches Linux.
     if (sched.currentTaskIndex()) |idx| {
         if (task_mod.getTask(idx)) |cur| {
-            if (!task_mod.nprocPreflight(cur.uid, cur.nproc_cur)) return -11;
+            if (!task_mod.nprocPreflight(cur.uid, cur.lim().nproc.cur)) return -11;
         }
     }
 

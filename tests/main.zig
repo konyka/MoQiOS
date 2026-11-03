@@ -7570,14 +7570,10 @@ test "rlimit: every Linux resource round-trips; out-of-range resources are EINVA
     try std.testing.expectEqual(@as(u64, 10), table.get(core).max);
 }
 
-test "rlimit: every task-creation path resets the recorded limits after zeroSlot" {
+test "rlimit: task creation no longer seeds limits per task (they come with the Mm)" {
     const src = kt.task_source;
-    // zeroSlot clears field defaults, so each place that resets fSize_max must
-    // also reset recorded_limits (else new tasks start with 0/0 limits)
-    const fs = std.mem.count(u8, src, "tasks[slot].fSize_max = ");
-    const rl = std.mem.count(u8, src, "tasks[slot].recorded_limits = .{};");
-    try std.testing.expect(fs >= 3);
-    try std.testing.expectEqual(fs, rl);
+    try std.testing.expect(std.mem.indexOf(u8, src, "recorded_limits") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "fSize_max") == null);
 }
 
 test "virtio-blk: FLUSH is negotiated when offered and fsync reaches it" {
@@ -10532,7 +10528,7 @@ test "signal dispositions belong to the address space: CLONE_VM threads share on
     try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "signal_handlers: [64]u64") == null);
     try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "signal_sa_masks: [64]u64") == null);
     try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "signal_sa_flags: [64]u64") == null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.mm_source, "sig: *") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.mm_source, "grp: *@import(\"group_state.zig\").GroupState,") != null);
     for ([_][]const u8{ kt.clone_source, kt.fork_source, kt.idt_source, kt.syscall_entry_source, kt.execve_source }) |src| {
         try std.testing.expect(std.mem.indexOf(u8, src, ".signal_handlers") == null);
         try std.testing.expect(std.mem.indexOf(u8, src, ".signal_sa_masks") == null);
@@ -10563,4 +10559,36 @@ test "RLIMIT_AS and RLIMIT_DATA accounting belongs to the address space: CLONE_V
     // exec: the new image's Mm is already at 0, nothing is reset by hand.
     try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "asUsed()") == null);
     try std.testing.expect(@sizeOf(kt.mm.Mm) <= 1024);
+}
+
+test "resource limits belong to the thread group: one Limits record in the Mm, shared by CLONE_VM threads, inherited by fork and kept by exec" {
+    // Every limit was a per-Task field that clone copied, so setrlimit in one thread was invisible to every other
+    // thread, including the ones that already existed. They live in the thread-group state page of the Mm now.
+    for ([_][]const u8{ "nofile_cur", "nofile_max", "stack_cur", "stack_max", "as_cur", "as_max", "data_cur", "data_max", "nproc_cur", "nproc_max", "fSize_cur", "fSize_max", "recorded_limits" }) |name| {
+        try std.testing.expect(std.mem.indexOf(u8, kt.task_source, name) == null);
+        for ([_][]const u8{ kt.mmap_source, kt.brk_source, kt.idt_source, kt.clone_source, kt.fork_source, kt.execve_source, kt.syscall_entry_source }) |src| {
+            try std.testing.expect(std.mem.indexOf(u8, src, name) == null);
+        }
+    }
+    try std.testing.expect(std.mem.indexOf(u8, kt.mm_source, "grp: *@import(\"group_state.zig\").GroupState,") != null);
+    // fork and a copied-address-space clone copy the limits; a CLONE_VM clone shares them; exec carries them over.
+    try std.testing.expect(std.mem.indexOf(u8, kt.fork_source, "child_mm.inheritLimits(parent_mm);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "child_mm.inheritLimits(parent_mm);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "new_mm.inheritLimits(om)") != null);
+    try std.testing.expect(@sizeOf(kt.mm.Mm) <= 1024);
+}
+
+test "a new thread-group state starts with the default limits: unlimited, except NOFILE and STACK" {
+    const gs = kt.group_state;
+    const st = gs.GroupState.initial(64);
+    try std.testing.expectEqual(@as(u64, 64), st.lim.nofile.cur);
+    try std.testing.expectEqual(@as(u64, 64), st.lim.nofile.max);
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), st.lim.stack.cur);
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), st.lim.stack.max);
+    for ([_]gs.Limit{ st.lim.as, st.lim.data, st.lim.nproc, st.lim.fsize }) |l| {
+        try std.testing.expectEqual(gs.RLIM_INFINITY, l.cur);
+        try std.testing.expectEqual(gs.RLIM_INFINITY, l.max);
+    }
+    for (st.lim.recorded.v) |l| try std.testing.expectEqual(gs.RLIM_INFINITY, l.cur);
+    for (st.sig.handlers) |h| try std.testing.expectEqual(@as(u64, 0), h);
 }

@@ -169,13 +169,16 @@ pub fn prepareExecName(name: []const u8, argv_ptr: u64, envp_ptr: u64) Prepared 
     task_mod.unlockTask(lock_flags);
     cur.user_entry = result.entry;
     cur.user_stack_top = result.stack_top;
+    // Resource limits survive exec (they belong to the process, not the image); the new Mm starts at the defaults until this copy,
+    // which has to come before anything below reads a limit.
+    if (old_mm) |om| new_mm.inheritLimits(om);
     // RLIMIT_STACK is preserved across exec (like NOFILE), but the growth
     // watermark belongs to the old image — reset it so a deep inherited
     // watermark cannot bypass the limit's floor in the fresh image.
     cur.stack_limit = @import("rlimit.zig").Policy.initialStackLimit(
         result.stack_top,
         @import("../mm/user_space.zig").USER_STACK_BOTTOM,
-        cur.stack_cur,
+        cur.lim().stack.cur,
     );
     // RLIMIT_AS limits are preserved, but every charged byte belonged to the
     // replaced image — the fresh image starts uncharged (see docs/rlimit.md).
@@ -243,7 +246,7 @@ fn commitSignalStateForExec(cur: *@import("task.zig").Task, new_pml4: u64, old_m
     // replaced image's Mm. sa_mask/sa_flags describe handlers of the old image; none survive. Mask and pending set are
     // kept.
     if (old_mm) |om| {
-        for (0..64) |i| cur.sigact().handlers[i] = exec_policy.execHandlerAfter(om.sig.handlers[i]);
+        for (0..64) |i| cur.sigact().handlers[i] = exec_policy.execHandlerAfter(om.grp.sig.handlers[i]);
     }
     cur.sigact().masks = @splat(0);
     cur.sigact().flags = @splat(0);

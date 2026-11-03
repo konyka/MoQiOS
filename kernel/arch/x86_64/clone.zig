@@ -278,7 +278,7 @@ pub fn clone(
     // against the parent's real UID (Linux counts every task). Gate before
     // COW cloning or address-space retention so a denied clone leaks
     // nothing. EAGAIN matches Linux.
-    if (!task_mod.nprocPreflight(parent.uid, parent.nproc_cur)) return -11;
+    if (!task_mod.nprocPreflight(parent.uid, parent.lim().nproc.cur)) return -11;
 
     // CLONE_VM: share address space (thread) vs COW copy (process)
     const shares_vm = flags & CLONE_VM != 0;
@@ -322,25 +322,12 @@ pub fn clone(
         threadGroupParentTid(parent, flags),
         false, // inherit general affinity
         @import("../../proc/capability_profile.zig").default_user_profile,
-        parent.fSize_cur,
-        parent.fSize_max,
+        parent.lim().fsize.cur,
+        parent.lim().fsize.max,
     ) orelse return -12;
     const child = task_mod.getTask(child_idx).?;
     @import("context_switch.zig").inheritFpuState(parent, child);
     child.clear_tid_ptr = if (flags & clone_flags_policy.CLONE_CHILD_CLEARTID != 0) child_tid_ptr else 0;
-    child.nofile_cur = parent.nofile_cur;
-    child.nofile_max = parent.nofile_max;
-    child.stack_cur = parent.stack_cur;
-    child.stack_max = parent.stack_max;
-    child.as_cur = parent.as_cur;
-    child.as_max = parent.as_max;
-    child.data_cur = parent.data_cur;
-    child.data_max = parent.data_max;
-    child.nproc_cur = parent.nproc_cur;
-    child.nproc_max = parent.nproc_max;
-    child.fSize_cur = parent.fSize_cur;
-    child.fSize_max = parent.fSize_max;
-    child.recorded_limits = parent.recorded_limits;
     // The clone's address space mirrors (or with CLONE_VM shares) the
     // parent's, so it starts with the same charged usage.
     child.stack_limit = parent.stack_limit;
@@ -349,6 +336,7 @@ pub fn clone(
         if (child.mm) |child_mm| if (parent.mm) |parent_mm| {
             child_mm.inheritBreak(parent_mm);
             child_mm.inheritCharges(parent_mm);
+            child_mm.inheritLimits(parent_mm);
         };
         // ...and of the mapping table, with its own backing references. A CLONE_VM thread shares the Mm and the table.
         @import("../../mm/vma_table.zig").adopt(child.vma(), &vma_snap);
@@ -369,7 +357,7 @@ pub fn clone(
         child.fd_table = parent.fd_table;
         if (vfs_mod.releaseFdTable(fresh)) vfs_mod.freeFdTable(fresh);
     } else {
-        child.fd_table.alloc_limit = child.nofile_cur;
+        child.fd_table.alloc_limit = child.lim().nofile.cur;
 
         // v53.50: Copy free_bm bitmap — child inherits parent's fd occupancy state.
         parent.fd_table.inheritFdTable(child.fd_table);

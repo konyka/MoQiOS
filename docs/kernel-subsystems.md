@@ -2956,3 +2956,6 @@ This is an ABI/rollback contract only, not a throughput claim.
 
 **RLIMIT_AS / RLIMIT_DATA 的已用计数属于 `Mm`（hello212）**：`Mm.as_used`/`Mm.data_used`；`Task.asUsed()`/`dataUsed()` 取所属 `Mm` 的计数器。
 fork 与不带 `CLONE_VM` 的 clone 用 `inheritCharges` 继承，`CLONE_VM` 线程共享，exec 的新 `Mm` 从 0 开始。限额本身仍在 `Task` 里（见 current-code-review-and-fix-plan.md 的剩余缺口）。
+
+**线程组状态页（hello213）**：`mm/group_state.zig` 的 `GroupState { sig, lim }`（信号处置 + RLIMIT_* 限额，一页）挂在 `Mm.grp`，`Task.sigact()`/`Task.lim()` 取用。
+`CLONE_VM` 线程共享，fork 与不带 `CLONE_VM` 的 clone 复制（`inheritLimits` + 信号表拷贝），exec 把限额从旧 `Mm` 带到新 `Mm`、信号处置按 exec 规则重置。

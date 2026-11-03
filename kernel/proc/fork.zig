@@ -22,7 +22,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
     // RLIMIT_NPROC preflight: the child counts against the parent's real
     // UID. Check before any page-table cloning so a denied fork costs
     // nothing and leaks nothing. EAGAIN matches Linux.
-    if (!task_mod.nprocPreflight(parent.uid, parent.nproc_cur)) return -11;
+    if (!task_mod.nprocPreflight(parent.uid, parent.lim().nproc.cur)) return -11;
 
     // Guard the COW page-table clone with the parent's vm_lock: it rewrites
     // parent PTEs (read-only + COW) and must not race a concurrent
@@ -49,8 +49,8 @@ pub fn fork(frame: *SyscallFrame) i64 {
         parent.tid,
         true,
         @import("capability_profile.zig").default_user_profile,
-        parent.fSize_cur,
-        parent.fSize_max,
+        parent.lim().fsize.cur,
+        parent.lim().fsize.max,
     ) orelse {
         // createUserProcess consumes and releases the child Mm/root on failure.
         return -1;
@@ -68,6 +68,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
         if (parent.mm) |parent_mm| {
             child_mm.inheritBreak(parent_mm);
             child_mm.inheritCharges(parent_mm);
+            child_mm.inheritLimits(parent_mm);
         }
     }
     // The child is a copy of the address space, so its TLS block sits at the
@@ -78,20 +79,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
     // Without this, child's free_bm stays at default (only bits 0-2 occupied),
     // causing allocFd() to return already-occupied slots and corrupt fds.
     child.fd_table.free_bm = parent.fd_table.free_bm;
-    child.nofile_cur = parent.nofile_cur;
-    child.nofile_max = parent.nofile_max;
-    child.fd_table.alloc_limit = child.nofile_cur;
-    child.stack_cur = parent.stack_cur;
-    child.stack_max = parent.stack_max;
-    child.as_cur = parent.as_cur;
-    child.as_max = parent.as_max;
-    child.data_cur = parent.data_cur;
-    child.data_max = parent.data_max;
-    child.nproc_cur = parent.nproc_cur;
-    child.nproc_max = parent.nproc_max;
-    child.fSize_cur = parent.fSize_cur;
-    child.fSize_max = parent.fSize_max;
-    child.recorded_limits = parent.recorded_limits;
+    child.fd_table.alloc_limit = parent.lim().nofile.cur;
     // The child's address space mirrors the parent's (COW), so it starts with
     // the same charged usage.
 
