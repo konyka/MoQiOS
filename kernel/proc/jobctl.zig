@@ -41,7 +41,7 @@ pub fn stdinJobCheck() i64 {
     // 后台组：SIGTTIN 被阻塞或忽略 → EIO。
     const sig_bit: u64 = @as(u64, 1) << @intCast(sig_mod.SIGTTIN - 1);
     if (cur.signal_mask & sig_bit != 0) return -5; // EIO
-    const handler = cur.signal_handlers[sig_mod.SIGTTIN - 1];
+    const handler = cur.sigact().handlers[sig_mod.SIGTTIN - 1];
     if (handler == 1) return -5; // SIG_IGN
 
     // 投递到整个后台组。POSIX：已装 handler 的进程走 EINTR 路径；

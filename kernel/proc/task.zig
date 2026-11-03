@@ -215,14 +215,7 @@ pub const Task = struct {
     /// 64-bit to match the rt_* sigset_t ABI: bit N = signal N+1, 1-64.
     signal_mask: u64,
 
-    /// Signal handler addresses. 0 = default (terminate for now).
-    /// Index 0 = signal 1 (SIGHUP), ..., index 63 = signal 64 (SIGRTMAX).
-    signal_handlers: [64]u64,
-    /// Per-signal sa_mask: added to the task mask while that handler runs
-    /// (signal_frame saves and sigreturn restores the previous mask).
-    signal_sa_masks: [64]u64 = @splat(0),
-    /// Per-signal sa_flags (SA_NODEFER, SA_RESETHAND honoured at delivery).
-    signal_sa_flags: [64]u64 = @splat(0),
+    // Signal dispositions (handlers, sa_mask, sa_flags) live in Mm (mm/sigact_table.zig): CLONE_VM threads share them.
     /// pselect/epoll_pwait/sigsuspend semantics (Linux TIF_RESTORE_SIGMASK):
     /// when a call that installed a temporary mask is interrupted, the
     /// original mask is restored only after the signal handler that caused
@@ -381,6 +374,12 @@ pub const Task = struct {
     pub fn vma(self: *const Task) *@import("../mm/vma_table.zig").VmaTable {
         if (self.mm) |m| return &m.vma_tab;
         return &no_mm_table;
+    }
+
+    /// The signal dispositions of this task's thread group (see Task.vma for the no-address-space case).
+    pub fn sigact(self: *const Task) *@import("../mm/sigact_table.zig").SigActions {
+        if (self.mm) |m| return m.sig;
+        return &no_mm_sig;
     }
 };
 
@@ -572,6 +571,7 @@ pub const MAX_TASKS: u32 = 64;
 
 var no_mm_regions: [64]MmapRegion = [_]MmapRegion{.{}} ** 64;
 var no_mm_table: @import("../mm/vma_table.zig").VmaTable = .{ .regions = &no_mm_regions };
+var no_mm_sig: @import("../mm/sigact_table.zig").SigActions = .{ .handlers = @splat(0), .masks = @splat(0), .flags = @splat(0) };
 
 /// Task table. Slots are NOT optionals: a `Task` used to be ~62KB (dominated
 /// by the embedded fd table, now pooled in vfs.zig) and storing it in a
@@ -1508,7 +1508,7 @@ pub fn reapZombies() u32 {
                 .is_thread = t.is_thread,
                 .parent_alive = parent_idx != null,
                 .maps_objects = false, // the table is the address space's, not a thread's copy: nothing here to keep alive
-                .parent_ignores_sigchld = if (parent_idx) |pi| tasks[pi].signal_handlers[17 - 1] == 1 else false,
+                .parent_ignores_sigchld = if (parent_idx) |pi| tasks[pi].sigact().handlers[17 - 1] == 1 else false,
             };
             if (reap_policy.autoReap(zombieViewLocked(i, t), lineage) != .detach) continue;
             if (deferred) {

@@ -194,7 +194,7 @@ pub fn sendSignalToPgrpFiltered(pgid: u16, signum: u32, sender: ?*task.Task) u32
         t.sig_info[signum - 1] = info;
         switch (action) {
             .stop => {
-                const h = t.signal_handlers[signum - 1];
+                const h = t.sigact().handlers[signum - 1];
                 if (signum != SIGSTOP and h == 1) {
                     // SIG_IGN：忽略该成员。
                 } else if (signum != SIGSTOP and h != 0) {
@@ -244,7 +244,7 @@ pub fn pendingFatal(t: *task.Task) ?u32 {
         const bit: u6 = @intCast(@ctz(bits));
         bits &= bits - 1;
         const signum = @as(u32, bit) + 1;
-        if (t.signal_handlers[bit] == 0 and !defaultSignalAction(signum)) return signum;
+        if (t.sigact().handlers[bit] == 0 and !defaultSignalAction(signum)) return signum;
     }
     return null;
 }
@@ -272,7 +272,7 @@ pub fn pendingActionable(t: *task.Task) bool {
     while (bits != 0) {
         const bit: u6 = @intCast(@ctz(bits));
         bits &= bits - 1;
-        if ((t.signal_handlers[bit] != 0 and t.signal_handlers[bit] != 1) or !defaultSignalAction(@as(u32, bit) + 1)) return true;
+        if ((t.sigact().handlers[bit] != 0 and t.sigact().handlers[bit] != 1) or !defaultSignalAction(@as(u32, bit) + 1)) return true;
     }
     return false;
 }
@@ -372,7 +372,7 @@ pub fn pushSignalFrame(
     user_rflags: u64,
     gprs: *const GpRegs,
 ) struct { new_rsp: u64, handler: u64, info_addr: u64 = 0, uc_addr: u64 = 0 } {
-    const handler_addr = t.signal_handlers[signum - 1];
+    const handler_addr = t.sigact().handlers[signum - 1];
 
     // Layout (stack grows down; the handler only writes BELOW its entry RSP):
     //   [SignalFrame]           at handler_rsp + 8 (above the handler's stack)
@@ -390,7 +390,7 @@ pub fn pushSignalFrame(
     // invisible to the interrupted code (signal_frame_policy.zig).
     // SA_ONSTACK handlers run on the sigaltstack unless already on it.
     const alt_policy = @import("sigaltstack_policy.zig");
-    const frame_top = alt_policy.deliveryTop(user_rsp, t.signal_sa_flags[signum - 1], .{
+    const frame_top = alt_policy.deliveryTop(user_rsp, t.sigact().flags[signum - 1], .{
         .base = t.sigaltstack_base,
         .size = t.sigaltstack_size,
     });
@@ -473,11 +473,11 @@ pub fn pushSignalFrame(
     // Commit the handler's mask and one-shot reset only once the frame is
     // on the user stack (a failed push leaves the task untouched).
     const dp = @import("signal_delivery_policy.zig");
-    const sa_mask = t.signal_sa_masks[signum - 1];
-    const sa_flags = t.signal_sa_flags[signum - 1];
+    const sa_mask = t.sigact().masks[signum - 1];
+    const sa_flags = t.sigact().flags[signum - 1];
     t.signal_mask = dp.handlerMask(t.signal_mask, signum, sa_mask, sa_flags);
     t.restore_sigmask_pending = false; // now carried by uc.sigmask
-    t.signal_handlers[signum - 1] = dp.handlerAfterDelivery(handler_addr, sa_flags);
+    t.sigact().handlers[signum - 1] = dp.handlerAfterDelivery(handler_addr, sa_flags);
 
     return .{
         .new_rsp = handler_rsp,

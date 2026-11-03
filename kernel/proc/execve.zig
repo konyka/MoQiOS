@@ -187,7 +187,7 @@ pub fn prepareExecName(name: []const u8, argv_ptr: u64, envp_ptr: u64) Prepared 
     // scheduler, so the stale base would otherwise survive into the new image.
     cur.tls_base = 0;
     syscall_entry.setUserTlsBase(0);
-    commitSignalStateForExec(cur, result.pml4);
+    commitSignalStateForExec(cur, result.pml4, old_mm);
     @import("credentials.zig").applyExec(cur);
 
     // Switch to new address space
@@ -238,14 +238,17 @@ pub fn prepareExecName(name: []const u8, argv_ptr: u64, envp_ptr: u64) Prepared 
 /// Signal and thread state that belongs to the replaced image. Runs only
 /// after the new address space is committed to `cur`, so a failed exec
 /// leaves the old image's state untouched.
-fn commitSignalStateForExec(cur: *@import("task.zig").Task, new_pml4: u64) void {
+fn commitSignalStateForExec(cur: *@import("task.zig").Task, new_pml4: u64, old_mm: ?*@import("../mm/mm.zig").Mm) void {
     const exec_policy = @import("signal_exec_policy.zig");
-    // Caught signals revert to SIG_DFL (the handler addresses pointed into
-    // the old image); SIG_IGN survives exec. Mask and pending set are kept.
-    for (&cur.signal_handlers) |*h| h.* = exec_policy.execHandlerAfter(h.*);
-    // sa_mask/sa_flags describe handlers of the old image; none survive.
-    cur.signal_sa_masks = @splat(0);
-    cur.signal_sa_flags = @splat(0);
+    // Caught signals revert to SIG_DFL (the handler addresses pointed into the old image); SIG_IGN survives exec.
+    // cur already points at the NEW address space, whose table starts empty: the old dispositions are read from the
+    // replaced image's Mm. sa_mask/sa_flags describe handlers of the old image; none survive. Mask and pending set are
+    // kept.
+    if (old_mm) |om| {
+        for (0..64) |i| cur.sigact().handlers[i] = exec_policy.execHandlerAfter(om.sig.handlers[i]);
+    }
+    cur.sigact().masks = @splat(0);
+    cur.sigact().flags = @splat(0);
     cur.sigaltstack_base = 0;
     cur.sigaltstack_size = 0;
     // CLONE_CHILD_CLEARTID address is meaningless in the new image (Linux

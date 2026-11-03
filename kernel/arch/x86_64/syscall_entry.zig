@@ -3276,7 +3276,7 @@ fn deliverSignalOnSyscallReturn(frame: *SyscallFrame, current: anytype) void {
     const signum = sig_mod.dequeueSignal(current) orelse return;
 
     // SIGSTOP 不可捕获/阻塞（与 sched.deliverSignalToRunningTask 一致）。
-    const handler_addr = if (signum == sig_mod.SIGSTOP) 0 else current.signal_handlers[signum - 1];
+    const handler_addr = if (signum == sig_mod.SIGSTOP) 0 else current.sigact().handlers[signum - 1];
 
     if (handler_addr == 0) {
         switch (sig_mod.defaultAction(signum)) {

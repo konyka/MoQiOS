@@ -2950,3 +2950,6 @@ This is an ABI/rollback contract only, not a throughput claim.
 **映射表属于 `Mm`（hello210）**：`mm/vma_table.zig` 定义 `MmapRegion` 和 `VmaTable`（区域数组一页 + 计数 + 活动位图），挂在 `Mm.vma_tab`，`vm_lock` 保护；
 `Task.vma()` 取所属 `Mm` 的表。`CLONE_VM` 线程共享同一张表；fork 与不带 `CLONE_VM` 的 clone 在克隆页表的同一临界区里拍快照并在子 `Mm` 里 `adopt`；
 文件区域后备引用与设备（`no_free`）映射在 `Mm` 终结器（`user_space.destroyMm`）里释放一次。
+
+**信号处置属于线程组（hello211）**：`mm/sigact_table.zig` 定义 `SigActions`（handlers/masks/flags），挂在 `Mm.sig`；`Task.sigact()` 取它。
+`CLONE_VM` 线程共享，fork 与不带 `CLONE_VM` 的 clone 拷贝，exec 从旧 `Mm` 读出再重置（捕获的还原为默认，`SIG_IGN` 保留）。

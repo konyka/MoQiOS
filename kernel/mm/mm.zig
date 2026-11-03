@@ -59,6 +59,9 @@ pub const Mm = struct {
     /// The tracked mappings (mmap/munmap/mprotect/mlock bookkeeping) of this address space. Written under vm_lock. The
     /// region array is one page allocated with the Mm and freed with it; a fork child gets a copy, exec an empty table.
     vma_tab: @import("vma_table.zig").VmaTable,
+    /// Signal dispositions of the thread group (mm/sigact_table.zig); one page-backed table shared by CLONE_VM threads,
+    /// allocated with the Mm and freed with it. A fork child gets a copy, exec resets caught signals in the new image's.
+    sig: *@import("sigact_table.zig").SigActions,
 
     /// Set the initial break of a freshly built address space (loader, exec). Nobody else can see it yet.
     pub fn setBreak(mm: *Mm, brk: u64) void {
@@ -101,7 +104,14 @@ pub const Mm = struct {
         };
         const regions: *[@import("vma_table.zig").MAX_REGIONS]@import("vma_table.zig").MmapRegion = @ptrFromInt(@import("hhdm.zig").physToVirt(phys));
         for (regions) |*r| r.* = .{};
-        mm.* = .{ .page_table_phys = page_table_phys, .finalizer = finalizer, .vma_tab = .{ .regions = regions } };
+        const sig_phys = pmm.allocPage() orelse {
+            pmm.freePage(phys);
+            slab.kfree(ptr);
+            return null;
+        };
+        const sig: *@import("sigact_table.zig").SigActions = @ptrFromInt(@import("hhdm.zig").physToVirt(sig_phys));
+        sig.* = .{ .handlers = @splat(0), .masks = @splat(0), .flags = @splat(0) };
+        mm.* = .{ .page_table_phys = page_table_phys, .finalizer = finalizer, .vma_tab = .{ .regions = regions }, .sig = sig };
         return mm;
     }
 
@@ -141,6 +151,7 @@ pub const Mm = struct {
         if (self.finalized.swap(true, .acq_rel)) return;
         self.finalizer(self);
         @import("pmm.zig").freePage(@import("hhdm.zig").virtToPhys(@intFromPtr(self.vma_tab.regions)));
+        @import("pmm.zig").freePage(@import("hhdm.zig").virtToPhys(@intFromPtr(self.sig)));
         @import("slab.zig").kfree(self);
     }
 

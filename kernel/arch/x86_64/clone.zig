@@ -382,11 +382,14 @@ pub fn clone(
     };
     @import("../../ipc/posix_mq.zig").inheritRefs(current_idx, child_idx);
 
-    // Signal handlers, mask, environment, cwd, pgid, sid
-    for (0..64) |i| {
-        child.signal_handlers[i] = parent.signal_handlers[i];
-        child.signal_sa_masks[i] = parent.signal_sa_masks[i];
-        child.signal_sa_flags[i] = parent.signal_sa_flags[i];
+    // Signal dispositions belong to the thread group (Mm.sig): a CLONE_VM thread shares them, a copied address space
+    // gets a copy. Then mask, environment, cwd, pgid, sid.
+    if (!shares_vm) {
+        for (0..64) |i| {
+            child.sigact().handlers[i] = parent.sigact().handlers[i];
+            child.sigact().masks[i] = parent.sigact().masks[i];
+            child.sigact().flags[i] = parent.sigact().flags[i];
+        }
     }
     child.signal_mask = parent.signal_mask;
     // A new thread on a shared address space would share the stack too, so

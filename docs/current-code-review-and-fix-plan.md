@@ -6378,3 +6378,10 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 验证：`hello210`（18 项）红→绿；host 1004/1004；三架构构建通过；完整门禁全绿（SMP=1、SMP=8 三次、GPT 数据盘、SMP=2 压力 5/5，约 1.5 小时）。
 - **门禁第一次在 SMP=8 失败，如实记录**：`hello210` 里有 24 个短命线程一个接一个创建，日志出现 `[task] no free task slots` 后冒烟超时（900 秒）。原因是线程槽位是异步回收的，突发的短命线程会让 64 个任务槽暂时用完，`pthread_create` 返回错误，而我的测试在创建失败时仍然去 `join` 一个没有启动的线程，于是永远等下去。这是**测试的写法问题**（`hello207`/`hello209` 之前已经证明这条路径在内核上没问题），不是这次内核改动引入的：我给 `run()` 加了"创建失败就让出 CPU 重试"，并在结尾打印重试次数（SMP=8 单独复现时为 0）。需要注意：我没有在改动前的内核上重现过"槽位用完"这一现象，所以"与本次内核改动无关"是依据日志中同样的现象出现在更早的 `hello106`/`hello107` 之间（`no free task slots` 在日志第 4581 行，早于 hello210）做出的判断，不是对照实验。
 - 如实说明：①这是个跨 fork/clone/exec/exit/设备映射的大改动，我没有做变异检查，靠完整门禁和 hello210 兜底；②`hello210` 里没有覆盖"线程退出时设备映射保持"和"DMA 缓冲在多线程下释放"，因为需要 `cap_sys_rawio` 的真实设备，host 里只有文本断言；③一个已知变化：此前线程各持一份表，所以每个线程退出时各自释放文件引用；现在只在最后一个线程退出时释放，进程里存活的线程更久地持有 ext2 打开槽，这与 Linux 的语义一致（引用属于地址空间）。
+
+## 信号处置属于线程组：handler、sa_mask、sa_flags 移进 Mm（hello211）
+
+- 发现：顺着"线程共享状态是不是各拷一份"继续查，`signal_handlers`/`signal_sa_masks`/`signal_sa_flags` 也是 `Task` 里的数组，`clone` 复制它们。每个 pthread 在 Linux 里都带 `CLONE_SIGHAND`，处置必须由整个线程组共享。先写了 `hello211`，在旧内核上 SMP=1 失败 2 项：线程里 `sigaction` 装的 handler，主线程再查看到的还是旧的；对进程 `kill(SIGUSR1)` 跑的是接收线程自己那份表里的 handler，而不是最后安装的那个。
+- 修复：新文件 `mm/sigact_table.zig`（`SigActions`：handlers/masks/flags 各 64 项，共 1.5 KB），`Mm.sig` 指向随 `Mm` 一起分配和释放的一页（放不进 1024 字节的 slab 档，所以与映射表一样用单独一页）。`Task.sigact()` 取所属 `Mm` 的表。`CLONE_VM` 线程共享；fork 和不带 `CLONE_VM` 的 clone 拷贝；**exec 读旧 `Mm` 的表**（此时 `cur` 已指向新 `Mm`，新表是空的），把被捕获的信号还原成默认、`SIG_IGN` 保留、`sa_mask`/`sa_flags` 清零。host 测试 `signal dispositions belong to the address space` 用源码文本断言钉住接线。
+- 验证：`hello211`（8 项）红→绿；host 1005/1005；三架构构建通过；完整门禁全绿（SMP=1、SMP=8 三次、GPT 数据盘、SMP=2 压力 5/5，约 1.5 小时）。
+- 如实说明：①handler 数组的读写本来就没有锁（单个字、由调用 `sigaction` 的线程写、发送/接收方读），共享之后读写双方可能在不同线程，这个无锁取舍没变，不是新引入的竞争，但也没有加锁；②`sigaltstack` 是每线程的（Linux 同），我没有动；③没做变异检查，靠完整门禁和 `hello211`。

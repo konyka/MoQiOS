@@ -98,9 +98,9 @@ pub fn fork(frame: *SyscallFrame) i64 {
     @import("../ipc/posix_mq.zig").inheritRefs(parent_idx, child_idx);
 
     for (0..64) |i| {
-        child.signal_handlers[i] = parent.signal_handlers[i];
-        child.signal_sa_masks[i] = parent.signal_sa_masks[i];
-        child.signal_sa_flags[i] = parent.signal_sa_flags[i];
+        child.sigact().handlers[i] = parent.sigact().handlers[i];
+        child.sigact().masks[i] = parent.sigact().masks[i];
+        child.sigact().flags[i] = parent.sigact().flags[i];
     }
     child.signal_mask = parent.signal_mask;
     child.sigaltstack_base = parent.sigaltstack_base;

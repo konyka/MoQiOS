@@ -1395,7 +1395,7 @@ pub fn deliverSignalToRunningTask(t: *task.Task, iframe: *idt.InterruptFrame) bo
     const signum = sig_mod.dequeueSignal(t) orelse return false;
 
     // SIGSTOP 不可捕获/阻塞：handler 与 handler==1(SIG_IGN) 均被 POSIX 忽略。
-    const handler_addr = if (signum == sig_mod.SIGSTOP) 0 else t.signal_handlers[signum - 1];
+    const handler_addr = if (signum == sig_mod.SIGSTOP) 0 else t.sigact().handlers[signum - 1];
 
     if (handler_addr == 0) {
         switch (sig_mod.defaultAction(signum)) {

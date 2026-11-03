@@ -127,7 +127,7 @@ pub fn sigaction(signum: u32, act_ptr: u64, oldact_ptr: u64) i64 {
     if (!action_policy.actionChangeAllowed(signum, act_ptr != 0)) return -22;
 
     const current = sched.currentTask() orelse return -1;
-    const old_handler = current.signal_handlers[signum - 1];
+    const old_handler = current.sigact().handlers[signum - 1];
 
     // Validate the optional output before changing the installed action.
     if (oldact_ptr != 0 and !copy.validateUserBufferWritable(oldact_ptr, 28)) return -14;
@@ -141,12 +141,12 @@ pub fn sigaction(signum: u32, act_ptr: u64, oldact_ptr: u64) i64 {
         @memset(&old_buf, 0);
         const handler_bytes: [*]const u8 = @ptrCast(&old_handler);
         @memcpy(old_buf[0..8], handler_bytes[0..8]);
-        const old_flags = current.signal_sa_flags[signum - 1];
+        const old_flags = current.sigact().flags[signum - 1];
         const flag_bytes: [*]const u8 = @ptrCast(&old_flags);
         @memcpy(old_buf[8..16], flag_bytes[0..8]);
         // mask@24 is 8 bytes but the legacy-sized buffer is only 28; write
         // its low 4 bytes (signals 1-32), which is every signal this kernel has.
-        const old_mask = current.signal_sa_masks[signum - 1];
+        const old_mask = current.sigact().masks[signum - 1];
         const mask_bytes: [*]const u8 = @ptrCast(&old_mask);
         @memcpy(old_buf[24..28], mask_bytes[0..4]);
         if (copy.copyToUser(@ptrFromInt(oldact_ptr), &old_buf, 28) != 28) return -14;
@@ -169,9 +169,9 @@ pub fn sigaction(signum: u32, act_ptr: u64, oldact_ptr: u64) i64 {
         if (copy.validateUserBuffer(act_ptr, 32) and copy.copyFromUser(&mask_buf, @ptrFromInt(act_ptr + 24), 8) == 8) {
             new_sa_mask = action_policy.sanitizeMask(@bitCast(mask_buf));
         }
-        current.signal_handlers[signum - 1] = new_handler;
-        current.signal_sa_masks[signum - 1] = new_sa_mask;
-        current.signal_sa_flags[signum - 1] = new_flags;
+        current.sigact().handlers[signum - 1] = new_handler;
+        current.sigact().masks[signum - 1] = new_sa_mask;
+        current.sigact().flags[signum - 1] = new_flags;
     }
 
     return 0;

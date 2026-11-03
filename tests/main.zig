@@ -10524,3 +10524,22 @@ test "the mapping table belongs to the address space: CLONE_VM threads share one
     try std.testing.expect(std.mem.indexOf(u8, kt.user_space_source, "no_free") != null);
     try std.testing.expect(@sizeOf(kt.mm.Mm) <= 1024);
 }
+
+test "signal dispositions belong to the address space: CLONE_VM threads share one table" {
+    // handlers, sa_mask and sa_flags were per-Task arrays that clone copied, so a handler installed by one thread was
+    // invisible to the others (and a signal sent to the process ran whichever handler the receiving thread happened to
+    // have). They live in Mm now, next to the mapping table.
+    try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "signal_handlers: [64]u64") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "signal_sa_masks: [64]u64") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "signal_sa_flags: [64]u64") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.mm_source, "sig: *") != null);
+    for ([_][]const u8{ kt.clone_source, kt.fork_source, kt.idt_source, kt.syscall_entry_source, kt.execve_source }) |src| {
+        try std.testing.expect(std.mem.indexOf(u8, src, ".signal_handlers") == null);
+        try std.testing.expect(std.mem.indexOf(u8, src, ".signal_sa_masks") == null);
+        try std.testing.expect(std.mem.indexOf(u8, src, ".signal_sa_flags") == null);
+    }
+    // A CLONE_VM clone shares the Mm and copies no dispositions; a copied address space gets a copy.
+    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "child.sigact().handlers[i] = parent.sigact().handlers[i]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "if (!shares_vm) {\n        for (0..64) |i| {") != null);
+    try std.testing.expect(@sizeOf(kt.mm.Mm) <= 1024);
+}

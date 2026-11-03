@@ -735,8 +735,8 @@ fn handlePageFault(frame: *InterruptFrame, cr2: u64) void {
                     const fault_sig = if (cur.fault_sigbus) sig_mod.SIGBUS else sig_mod.SIGSEGV;
                     cur.fault_sigbus = false;
                     const fault_bit = @as(u64, 1) << @intCast(fault_sig - 1);
-                    if (cur.signal_handlers[fault_sig - 1] == 1 or (cur.signal_mask & fault_bit) != 0) {
-                        cur.signal_handlers[fault_sig - 1] = 0;
+                    if (cur.sigact().handlers[fault_sig - 1] == 1 or (cur.signal_mask & fault_bit) != 0) {
+                        cur.sigact().handlers[fault_sig - 1] = 0;
                         cur.signal_mask &= ~fault_bit;
                     }
                     _ = sig_mod.sendSignalInfo(cur.tid, fault_sig, @import("../../proc/siginfo_policy.zig").faultInfo(fault_sig == sig_mod.SIGBUS, (err & 0x1) != 0, cr2));
