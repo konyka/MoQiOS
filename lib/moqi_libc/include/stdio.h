@@ -22,7 +22,13 @@
  * snprintf/vsnprintf/sprintf/vsprintf are pure formatters with no syscall dependency. The functions that write
  * (printf, dprintf, puts, putchar) issue write(2) directly: there is no stdio buffering, so output appears at once, in
  * chunks of at most 512 bytes for long results, and a failure part-way leaves what was already written written.
- * There is no FILE type: printf/puts/putchar write to fd 1.
+ * printf/puts/putchar are NOT buffered and write to fd 1 at once; they are independent of the FILE streams below. A
+ * program that mixes printf with fputs(stdout) must fflush(stdout) between them to keep the order.
+ *
+ * FILE streams (fopen, fread, fgets, fprintf, ...) follow glibc as measured: fully buffered files (4096-byte buffer), line
+ * buffered stdout, unbuffered stderr, separate sticky EOF and error flags, EBADF for an operation in the wrong direction,
+ * a read-ahead window that is given back before a write or a seek. The buffers are flushed by fflush, fclose and exit()
+ * and by returning from main. Not provided: locking, wide characters, tmpfile, popen, freopen, fgetpos/fsetpos, setbuf.
  */
 #ifndef MOQI_STDIO_H
 #define MOQI_STDIO_H
@@ -54,6 +60,48 @@ int asprintf(char **strp, const char *fmt, ...);
  * to stop with. Returns the character count or -1 (errno set). */
 typedef int (*moqi_sink_fn)(void *ctx, const char *data, size_t n);
 int __moqi_vformat(char *buf, size_t size, moqi_sink_fn sink, void *ctx, const char *fmt, va_list ap);
+
+#ifndef MOQI_STDIO_NO_FILE /* host tests that also include the host's <stdio.h> define this to skip the FILE block */
+typedef struct FILE_s FILE;
+extern FILE *stdin, *stdout, *stderr;
+#define EOF (-1)
+#define BUFSIZ 8192
+#define _IOFBF 0
+#define _IOLBF 1
+#define _IONBF 2
+#ifndef SEEK_SET
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+#endif
+
+FILE *fopen(const char *path, const char *mode);
+FILE *fdopen(int fd, const char *mode);
+int   fclose(FILE *f);
+int   fflush(FILE *f);   /* NULL flushes every open output stream */
+int   fileno(FILE *f);
+int   feof(FILE *f);
+int   ferror(FILE *f);
+void  clearerr(FILE *f);
+int   setvbuf(FILE *f, char *buf, int mode, size_t size);
+int   fgetc(FILE *f);
+int   getc(FILE *f);
+int   ungetc(int c, FILE *f);
+char *fgets(char *s, int n, FILE *f);
+size_t fread(void *ptr, size_t size, size_t nmemb, FILE *f);
+long  getline(char **lineptr, size_t *n, FILE *f);
+long  getdelim(char **lineptr, size_t *n, int delim, FILE *f);
+int   fputc(int c, FILE *f);
+int   putc(int c, FILE *f);
+int   fputs(const char *s, FILE *f);   /* a non-negative value on success, as glibc */
+size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *f);
+int   fseek(FILE *f, long off, int whence);
+long  ftell(FILE *f);
+void  rewind(FILE *f);
+int   fprintf(FILE *f, const char *fmt, ...);
+int   vfprintf(FILE *f, const char *fmt, va_list ap);
+int   fflush_all(void);   /* called by exit() */
+#endif /* MOQI_STDIO_NO_FILE */
 
 /* Output (freestanding only — these issue the write syscall). */
 void print(const char *s);

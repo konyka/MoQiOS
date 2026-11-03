@@ -3,6 +3,7 @@
  * (flags, width, precision, '*', every length modifier, wide characters, unknown conversions, output size limits); the
  * rest are checks that need pointers or failure injection, which a table cannot hold. */
 #include <stdio.h>
+#define MOQI_STDIO_NO_FILE 1
 #include <string.h>
 
 void *malloc(unsigned long n); /* the host's, reached through the wrappers below */

@@ -2938,7 +2938,8 @@ This is an ABI/rollback contract only, not a throughput claim.
 
 **libc printf 家族（hello208）**：`lib/moqi_libc/src/format.c` 是共享格式化引擎（宽度/精度/标志/长度修饰符，
 语法对齐 glibc，由 `host_tests/test_printf_abi.c` 对 2473 行 glibc 实测值验证），`stdio.c` 在其上提供
-`printf/dprintf/vprintf/puts/putchar/asprintf`。输出经 512 字节分块的 `write(2)`，不缓冲、无 `FILE`；无浮点和位置参数。
+`printf/dprintf/vprintf/puts/putchar/asprintf`。输出经 512 字节分块的 `write(2)`，不缓冲；无位置参数。浮点转换见 hello218，`FILE` 流（`fopen`/`fgets`/`fread`/`fprintf`…，
+`src/stdio_file.c`，与 `printf` 的直写 fd 1 互相独立）见 hello219 与 current-code-review-and-fix-plan.md 末节。
 
 **程序 break 属于 `Mm`（hello209）**：`brk_current`/`brk_start` 原来在 `Task` 里，`CLONE_VM` 线程创建时只拷了 `brk_current`
 （没拷 `brk_start`，`brk` 因 `brk_start == 0` 对该线程直接拒绝移动），即使两个字段都拷了，每个线程也会各持一个

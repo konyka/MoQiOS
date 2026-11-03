@@ -3,6 +3,7 @@
  * The core (src/format.c) is syscall-free, so it links and runs on the host.
  */
 #include <stdio.h>
+#define MOQI_STDIO_NO_FILE 1
 #include <string.h>
 
 /* Rename under test so it doesn't clash with the host libc snprintf. */

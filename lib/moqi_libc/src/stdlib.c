@@ -3,8 +3,11 @@
 #include "../include/unistd.h"
 #include "../include/ctype.h"
 
-/* No atexit handlers and no stdio buffers to flush: exit is _exit. */
+/* No atexit handlers; the FILE buffers are flushed first (stdio.c). */
+/* Weak, so a program (or a host test) that does not link the stdio code still gets a working exit. */
+extern int fflush_all(void) __attribute__((weak));
 void exit(int code) {
+    if (fflush_all) fflush_all();
     _exit(code);
 }
 

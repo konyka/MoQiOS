@@ -90,6 +90,12 @@ $CC $CFLAGS -c ../src/strtod.c -o "$OUT/strtod.o"
 $CC $CFLAGS -o "$OUT/test_strtod_abi" test_strtod_abi.c "$OUT/strtod.o"
 "$OUT/test_strtod_abi" || fail=1
 
+echo "== test_file_abi =="
+$CC $CFLAGS -c ../src/format.c -o "$OUT/format_file.o"
+$CC $CFLAGS -c ../src/strfunc.c -o "$OUT/strfunc_file.o"
+$CC $CFLAGS -o "$OUT/test_file_abi" test_file_abi.c "$OUT/format_file.o" ../src/string.c "$OUT/strfunc_file.o"
+"$OUT/test_file_abi" || fail=1
+
 echo "== test_env_abi =="
 $CC $CFLAGS -o "$OUT/test_env_abi" test_env_abi.c ../src/string.c
 "$OUT/test_env_abi" || fail=1

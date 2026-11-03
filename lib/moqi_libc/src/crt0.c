@@ -11,6 +11,7 @@
 #include "../include/unistd.h"
 
 extern int main(int argc, char **argv, char **envp);
+extern void exit(int code) __attribute__((noreturn));
 extern void __pthread_init_main(void);
 extern void __moqi_tls_setup(unsigned long *sp);
 
@@ -27,7 +28,7 @@ __attribute__((used)) void _start_c(unsigned long *sp) {
     moqi_parse_initial_stack(sp, &argc, &argv, &envp);
     environ = envp;
     int code = main((int)argc, argv, envp);
-    _exit(code);
+    exit(code); /* flushes the FILE buffers */
 }
 
 __attribute__((used, naked, noreturn)) void _start(void) {
