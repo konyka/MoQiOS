@@ -244,11 +244,19 @@ void _start(void) {
         long got = 0;
         syscall3(SYS_FCNTL, (uint64_t)s, F_SETFL, O_NONBLOCK);
         int64_t t0 = now_ms();
+        int64_t last_progress = t0;
+        long reads = 0, empty_reads = 0;
         while (got < total + 1 && now_ms() - t0 < 10000) {
             int64_t r = syscall3(SYS_READ, (uint64_t)s, (uint64_t)drain, 4096);
-            if (r > 0) got += r; else pump(10);
+            if (r > 0) { got += r; last_progress = now_ms(); reads++; } else { empty_reads++; pump(10); }
         }
-        check(got >= total + 1, "C: reading drains everything that was accepted within 10 s, and the window reopens");
+        int drained = got >= total + 1;
+        check(drained, "C: reading drains everything that was accepted within 10 s, and the window reopens");
+        if (!drained) {
+            note("drain_got", got); note("drain_total_plus_1", total + 1); note("drain_elapsed_ms", now_ms() - t0);
+            note("drain_stalled_for_ms", now_ms() - last_progress); note("drain_reads", reads); note("drain_empty_reads", empty_reads);
+            note("drain_receiver_fionread", ioctl_int(s, FIONREAD)); note("drain_sender_outq", ioctl_int(c, TIOCOUTQ));
+        }
         syscall1(SYS_CLOSE, c);
         syscall1(SYS_CLOSE, s);
     }
