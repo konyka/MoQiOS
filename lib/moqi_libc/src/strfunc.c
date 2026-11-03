@@ -203,3 +203,69 @@ char *strerror(int errnum) {
     unknown[n] = '\0';
     return unknown;
 }
+
+void *memmem(const void *haystack, size_t haystack_len, const void *needle, size_t needle_len) {
+    if (needle_len == 0) return (void *)haystack;
+    if (needle_len > haystack_len) return (void *)0;
+    const unsigned char *h = haystack;
+    const unsigned char *n = needle;
+    for (size_t i = 0; i + needle_len <= haystack_len; i++) {
+        size_t k = 0;
+        while (k < needle_len && h[i + k] == n[k]) k++;
+        if (k == needle_len) return (void *)(h + i);
+    }
+    return (void *)0;
+}
+
+char *strcasestr(const char *haystack, const char *needle) {
+    if (*needle == '\0') return (char *)haystack;
+    for (; *haystack; haystack++) {
+        const char *h = haystack;
+        const char *n = needle;
+        while (*n && lower((unsigned char)*h) == lower((unsigned char)*n)) {
+            h++;
+            n++;
+        }
+        if (*n == '\0') return (char *)haystack;
+    }
+    return (char *)0;
+}
+
+/* glibc's text for signals 1..31; 34..64 are "Real-time signal N" counted from SIGRTMIN (34); anything else is unknown. */
+static const char *const signal_text[32] = {
+    NULL, "Hangup", "Interrupt", "Quit", "Illegal instruction", "Trace/breakpoint trap", "Aborted", "Bus error",
+    "Floating point exception", "Killed", "User defined signal 1", "Segmentation fault", "User defined signal 2",
+    "Broken pipe", "Alarm clock", "Terminated", "Stack fault", "Child exited", "Continued", "Stopped (signal)",
+    "Stopped", "Stopped (tty input)", "Stopped (tty output)", "Urgent I/O condition", "CPU time limit exceeded",
+    "File size limit exceeded", "Virtual timer expired", "Profiling timer expired", "Window changed", "I/O possible",
+    "Power failure", "Bad system call",
+};
+
+char *strsignal(int sig) {
+    if (sig >= 0 && sig < 32 && signal_text[sig]) return (char *)signal_text[sig];
+    static char buf[40];
+    const char *prefix;
+    long value = sig;
+    if (sig >= 34 && sig <= 64) {
+        prefix = "Real-time signal ";
+        value = sig - 34;
+    } else {
+        prefix = "Unknown signal ";
+    }
+    size_t n = 0;
+    while (prefix[n]) {
+        buf[n] = prefix[n];
+        n++;
+    }
+    unsigned long v = value < 0 ? 0ul - (unsigned long)value : (unsigned long)value;
+    char digits[24];
+    size_t d = 0;
+    do {
+        digits[d++] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v);
+    if (value < 0) buf[n++] = '-';
+    while (d) buf[n++] = digits[--d];
+    buf[n] = '\0';
+    return buf;
+}

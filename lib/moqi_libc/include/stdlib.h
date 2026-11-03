@@ -55,6 +55,14 @@ lldiv_t lldiv(long long num, long long den);
 #define RAND_MAX 2147483647
 int rand(void);
 void srand(unsigned seed);
+/* POSIX's reentrant generator with glibc's exact output (three LCG steps combined into one value). */
+int rand_r(unsigned *seed);
+
+/* qsort is stable (equal elements keep their order), as glibc's merge sort is; it allocates a scratch copy of the array
+ * with malloc and falls back to an in-place insertion sort, still stable, when that fails. bsearch probes the middle
+ * ((lo + hi) / 2) first, so with duplicates it finds the same one glibc does. */
+void qsort(void *base, size_t nmemb, size_t size, int (*cmp)(const void *, const void *));
+void *bsearch(const void *key, const void *base, size_t nmemb, size_t size, int (*cmp)(const void *, const void *));
 
 /* getenv walks the process environment (environ, set by crt0 from the
  * initial stack) without any syscall. Returns a pointer into the

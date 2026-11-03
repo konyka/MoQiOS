@@ -13,6 +13,82 @@ static int errno_slot;
 int *__errno_location(void) { return &errno_slot; }
 
 struct erow { int code; const char *text; };
+struct sigrow { int sig; const char *text; };
+static const struct sigrow sigrows[] = {
+    {-2, "Unknown signal -2"},
+    {-1, "Unknown signal -1"},
+    {0, "Unknown signal 0"},
+    {1, "Hangup"},
+    {2, "Interrupt"},
+    {3, "Quit"},
+    {4, "Illegal instruction"},
+    {5, "Trace/breakpoint trap"},
+    {6, "Aborted"},
+    {7, "Bus error"},
+    {8, "Floating point exception"},
+    {9, "Killed"},
+    {10, "User defined signal 1"},
+    {11, "Segmentation fault"},
+    {12, "User defined signal 2"},
+    {13, "Broken pipe"},
+    {14, "Alarm clock"},
+    {15, "Terminated"},
+    {16, "Stack fault"},
+    {17, "Child exited"},
+    {18, "Continued"},
+    {19, "Stopped (signal)"},
+    {20, "Stopped"},
+    {21, "Stopped (tty input)"},
+    {22, "Stopped (tty output)"},
+    {23, "Urgent I/O condition"},
+    {24, "CPU time limit exceeded"},
+    {25, "File size limit exceeded"},
+    {26, "Virtual timer expired"},
+    {27, "Profiling timer expired"},
+    {28, "Window changed"},
+    {29, "I/O possible"},
+    {30, "Power failure"},
+    {31, "Bad system call"},
+    {32, "Unknown signal 32"},
+    {33, "Unknown signal 33"},
+    {34, "Real-time signal 0"},
+    {35, "Real-time signal 1"},
+    {36, "Real-time signal 2"},
+    {37, "Real-time signal 3"},
+    {38, "Real-time signal 4"},
+    {39, "Real-time signal 5"},
+    {40, "Real-time signal 6"},
+    {41, "Real-time signal 7"},
+    {42, "Real-time signal 8"},
+    {43, "Real-time signal 9"},
+    {44, "Real-time signal 10"},
+    {45, "Real-time signal 11"},
+    {46, "Real-time signal 12"},
+    {47, "Real-time signal 13"},
+    {48, "Real-time signal 14"},
+    {49, "Real-time signal 15"},
+    {50, "Real-time signal 16"},
+    {51, "Real-time signal 17"},
+    {52, "Real-time signal 18"},
+    {53, "Real-time signal 19"},
+    {54, "Real-time signal 20"},
+    {55, "Real-time signal 21"},
+    {56, "Real-time signal 22"},
+    {57, "Real-time signal 23"},
+    {58, "Real-time signal 24"},
+    {59, "Real-time signal 25"},
+    {60, "Real-time signal 26"},
+    {61, "Real-time signal 27"},
+    {62, "Real-time signal 28"},
+    {63, "Real-time signal 29"},
+    {64, "Real-time signal 30"},
+    {65, "Unknown signal 65"},
+    {66, "Unknown signal 66"},
+    {67, "Unknown signal 67"},
+    {68, "Unknown signal 68"},
+    {69, "Unknown signal 69"},
+    {70, "Unknown signal 70"},
+};
 static const struct erow erows[] = {
     {0, "Success"},
     {1, "Operation not permitted"},
@@ -283,6 +359,39 @@ int main(void) {
     }
     CHECK(strerror(-1) != (char *)0);
     CHECK(strerror(2) == strerror(2)); /* known codes point at constant text */
+
+
+    /* memmem over every haystack and needle of length 0..4 on {a, b}, against a naive scan; an empty needle matches at 0,
+     * and a needle longer than the haystack never does. */
+    for (int hn = 0; hn <= 6; hn++) for (int hc = 0; hc < (1 << hn); hc++) {
+        char h[8]; for (int i = 0; i < hn; i++) h[i] = (hc >> i) & 1 ? 'b' : 'a';
+        for (int nn = 0; nn <= 4; nn++) for (int nc = 0; nc < (1 << nn); nc++) {
+            char nd[6]; for (int i = 0; i < nn; i++) nd[i] = (nc >> i) & 1 ? 'b' : 'a';
+            const void *want = (const void *)0;
+            if (nn == 0) want = h;
+            else for (int i = 0; i + nn <= hn; i++) if (memcmp(h + i, nd, (size_t)nn) == 0) { want = h + i; break; }
+            CHECK(memmem(h, (size_t)hn, nd, (size_t)nn) == want);
+        }
+    }
+    { static const char z[] = {'a', 0, 'b', 0, 'c'}; static const char zn[] = {'b', 0, 'c'};
+      CHECK(memmem(z, 5, zn, 3) == z + 2); } /* binary data, NULs included */
+    CHECK(memmem((void *)0, 0, (void *)0, 0) == (void *)0 || 1); /* both empty: never dereferenced */
+
+    /* strcasestr: like strstr after folding case; an empty needle matches the start. */
+    { const char *h = "Hello World";
+      CHECK(strcasestr(h, "WORLD") == h + 6 && strcasestr(h, "hello") == h && strcasestr(h, "") == h);
+      CHECK(strcasestr(h, "xyz") == (char *)0 && strcasestr(h, "WORLDS") == (char *)0 && strcasestr("", "a") == (char *)0);
+      CHECK(strcasestr("aAbB", "AB") == (char *)"aAbB" + 1); }
+
+    /* strsignal: glibc's text for -2..70 (real-time signals are "Real-time signal N" from SIGRTMIN, 34). */
+    for (unsigned i = 0; i < sizeof sigrows / sizeof sigrows[0]; i++) {
+        const char *got = strsignal(sigrows[i].sig);
+        if (!got || strcmp(got, sigrows[i].text) != 0) {
+            fprintf(stderr, "strsignal(%d): want \"%s\" got \"%s\"\n", sigrows[i].sig, sigrows[i].text, got ? got : "(null)");
+            bad++;
+        }
+    }
+    CHECK(strcmp(strsignal(2147483647), "Unknown signal 2147483647") == 0 && strcmp(strsignal(-2147483647 - 1), "Unknown signal -2147483648") == 0);
 
     assert(bad == 0);
     return 0;

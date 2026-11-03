@@ -6315,4 +6315,16 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：两个 host 测试都先写，源文件不存在时编译失败=红。第一版 `rand` 实现是错的：我把状态做成了 31 个字的环并把预热写错，前几个输出就不对；对照"经典描述"的小程序（`/tmp/sc/rr.c`，用 34 个字的数组直接算）确认公式本身是对的，再把实现改成 34 个字的环，之后 4000 个种子各 200 个值 0 差异。
 - 变异：numconv 14 个、strfunc 12 个。numconv 里有两个变异存活：把 `*end` 的写法换成 `s + (used < 0 ? 0 : used)`，以及把 `div` 的 `rem` 换成 `num - quot*den + 0`。我认为前者是等价变异（`used < 0` 时两者都是 `s`），后者在数学上也相等，但**这两条我只是推理，没有逐一验证等价性，也没有给它们补测试**。strfunc 里三个第一次没被抓住的变异补了测试后抓住：`memrchr` 不把字节当 `unsigned char`（补了 `'a'+256` 的用例）、`memchr` 同理、`strncat` 不写结尾 NUL（补了先用 `'Z'` 填满目标再检查的用例）；另有一个 `strdup` 里 `strnlen` 换 `strlen` 的变异因参数未使用在 `-Werror` 下编译失败，不算有效变异，我换成 `strnlen(s, n + 1)` 重做了一次，被抓住。
 - 目标上验证：`hello204`（33 项）在 QEMU 里通过，含 `strdup/strndup` 对真实堆的分配与释放、`rand` 的 10 万项求和与 glibc 一致、`strtol` 的各种边界。
-- 如实说明：①没有 `strtod`/`atof`、`qsort`/`bsearch`、`strcoll`/`strxfrm`、`strsignal`、`memmem`/`strcasestr`、`rand_r`；②`strerror` 只有英文，且 `strtok` 的静态状态不是线程私有；③没有改内核，所以没有重跑完整门禁，只跑了 host 测试、libc 测试、三个架构的构建、目标探针和一次 SMP=1 冒烟。
+- 如实说明：①没有 `strtod`/`atof`、`strcoll`/`strxfrm`（`qsort`/`bsearch`/`rand_r`/`memmem`/`strcasestr`/`strsignal` 在下一节补上了）；②`strerror` 只有英文，且 `strtok` 的静态状态不是线程私有；③没有改内核，所以没有重跑完整门禁，只跑了 host 测试、libc 测试、三个架构的构建、目标探针和一次 SMP=1 冒烟。
+
+## libc 的 qsort / bsearch / rand_r / memmem / strcasestr / strsignal（hello205）
+
+- 做的事：上一节列为没做的几样，加上排序和二分查找（C 程序里几乎都会用）。`src/algo.c`（`qsort`、`bsearch`、`rand_r`）和 `src/strfunc.c` 里的 `memmem`、`strcasestr`、`strsignal`。仍然没读 glibc 源码，行为全部来自测量。
+- 测量里值得记的：①glibc 的 `qsort` 是**稳定**的（我对 9600 个随机数组测了，0 个不稳定），所以实现是自底向上的归并排序而不是快排，并且要求稳定；②`bsearch` 在有重复元素时的返回值取决于探测顺序，实测 `{1,3,5,5,7,9}` 找 5 得下标 3，对应 `mid = (lo + hi) / 2`；③`rand_r` 是 POSIX 示例里的三步 LCG，种子 0 照常工作（不像 `srand(0)` 当 1 用）；④`strsignal` 的实时信号文本从 SIGRTMIN=34 起编号为 0。
+- 我测量时自己犯的一个错：为了测"不同元素大小下排序是否正确"，我把 `memcmp` 当比较函数强转传给 `qsort`，而 `memcmp` 要三个参数，结果所有大小都显示 "sorted 0"。这是**测量程序的错**，不是 glibc 的行为；之后改用比较第一个字节的专用函数并用稳定插入排序做参考，才得到可靠结论。
+- TDD：`test_algo_abi.c` 先写，`algo.c` 不存在时编译失败=红；之后的第一次编译直接全绿，我因此怀疑测试不够严，就逐个做变异验证。
+- 变异的过程有几次不顺，如实记录：①第一批变异我用一个循环脚本顺序跑，其中 `bsearch` 的探测点变异会让 `bsearch` 进入死循环，整个批处理卡住了 7 分钟，我用 `TaskStop` 停掉；之后给每个变异加 `timeout 20`，超时记为"被检测到（挂起）"。②停掉任务时我用了 `pgrep -f`，这个调用把我自己的 shell 也杀了，导致那一步工具报错；之后我只检查文件状态，确认源文件是好的拷贝。③有 4 个变异最初"存活"：`nmemb < 2` 改成 `< 1`、插入排序的 `> 0` 改成 `>= 0`、`qsort` 内存不足时的退回路径、`qsort` 不 `free` 临时拷贝。前两个靠补测试抓住（可控失败的 `malloc` + "n=0/1 不分配"），后两个同样靠这个测试抓住。④为此我给测试加了一个自己的 bump `malloc`/`free`（`free` 回退指针），**第一版 `free` 什么也不做，导致测试本身在没有变异时也失败**（池被耗尽，`qsort` 走了 O(n²) 的退回路径，比较次数检查报错），那是测试的 bug，已修。
+- 变异最终 9 个（`<=` 改稳定性、少拷回、少拷尾巴、`nmemb < 1`、插入排序的 `>=`、`!tmp` 的退回、不 `free`、`bsearch` 的中点、`rand_r` 的三个位宽/状态），全部被抓住（其中 2 个是通过超时检测到的挂起）。
+- `strfunc.c` 新增的 `memmem`/`strcasestr`/`strsignal` 也做了变异，除一个之外全部被抓住。**存活的一个**：去掉 `memmem` 里 `if (needle_len > haystack_len) return NULL;` 这一行后测试仍通过。该行在循环条件 `i + needle_len <= haystack_len` 下是冗余的（needle 比 haystack 长时循环本身不进入），我判断是等价变异，没有再用别的方式验证，保留它作为显式的早退。
+- 目标上验证：`hello205`（18 项）在 QEMU 里通过：3000 个元素在真实堆上排序（有序且稳定）、`bsearch` 对每个探到的元素命中而对不存在的返回 NULL、`rand_r` 的序列与最终状态、`memmem`/`strcasestr`/`strsignal`。
+- 如实说明：①没有 `strtod`/`atof`、`strcoll`/`strxfrm`、`qsort_r`；②`qsort` 在 `nmemb * size` 溢出时走插入排序而不是报错（glibc 在这种情况下行为我没有量过）；③没有改内核，所以没有重跑完整门禁，只跑了 host 测试、libc 测试、三个架构的构建、目标探针和一次 SMP=1 冒烟。

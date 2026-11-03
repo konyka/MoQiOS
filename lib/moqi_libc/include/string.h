@@ -38,5 +38,8 @@ char  *strndup(const char *s, size_t n);
 char  *strtok(char *s, const char *delim);
 char  *strtok_r(char *s, const char *delim, char **save);
 char  *strerror(int errnum);
+char  *strsignal(int sig);
+void  *memmem(const void *haystack, size_t haystack_len, const void *needle, size_t needle_len);
+char  *strcasestr(const char *haystack, const char *needle);
 
 #endif /* MOQI_STRING_H */

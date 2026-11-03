@@ -71,6 +71,11 @@ $CC $CFLAGS -c ../src/strfunc.c -o "$OUT/strfunc.o"
 $CC $CFLAGS -o "$OUT/test_strfunc_abi" test_strfunc_abi.c "$OUT/strfunc.o"
 "$OUT/test_strfunc_abi" || fail=1
 
+echo "== test_algo_abi =="
+$CC $CFLAGS -c ../src/algo.c -o "$OUT/algo.o"
+$CC $CFLAGS -o "$OUT/test_algo_abi" test_algo_abi.c "$OUT/algo.o"
+"$OUT/test_algo_abi" || fail=1
+
 if [ "$fail" -eq 0 ]; then
     echo "ALL HOST TESTS PASS"
 else
