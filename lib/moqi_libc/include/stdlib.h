@@ -23,6 +23,18 @@ void *malloc(size_t size);
 void  free(void *ptr);
 void *calloc(size_t nmemb, size_t size);
 
+/* Failure is a NULL return with errno ENOMEM (an overflowing request, no memory, or a call from a signal handler that
+ * interrupted the allocator). realloc keeps the original block when it fails, shrinks and grows in place when it can,
+ * realloc(p, 0) frees and returns NULL, and realloc(NULL, n) is malloc(n); a pointer that is not a live allocation is
+ * refused with EINVAL instead of corrupting the heap. posix_memalign returns the error (EINVAL for an alignment that is
+ * not a power of two multiple of sizeof(void *), ENOMEM) and leaves *memptr and errno alone on failure. aligned_alloc
+ * takes any power of two (EINVAL otherwise, size need not be a multiple); memalign also rounds a non-power-of-two up. */
+void *realloc(void *ptr, size_t size);
+void *reallocarray(void *ptr, size_t nmemb, size_t size);
+int posix_memalign(void **memptr, size_t align, size_t size);
+void *aligned_alloc(size_t align, size_t size);
+void *memalign(size_t align, size_t size);
+
 void exit(int code) __attribute__((noreturn));
 
 int atoi(const char *s);

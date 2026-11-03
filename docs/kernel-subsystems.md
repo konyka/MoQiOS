@@ -2928,3 +2928,8 @@ This is an ABI/rollback contract only, not a throughput claim.
 行为与 glibc 对齐（实测表见 `host_tests/test_env_abi.c`）。启动时栈上的 `environ` 数组首次插入时被拷贝到堆上，
 被替换的字符串和旧数组不释放以保证 `getenv` 返回的指针持续有效；写操作之间用自旋锁，`getenv` 不加锁。
 `hello206` 验证 `execve(path, argv, environ)` 后子进程看到父进程修改后的环境。
+
+**libc 堆分配器接口（hello207）**：`lib/moqi_libc/src/malloc.c` 在 `malloc`/`free`/`calloc` 之外提供 `realloc`、
+`reallocarray`、`posix_memalign`、`aligned_alloc`、`memalign`；分配失败设 `ENOMEM`（线程指针未装好时不写 errno）。
+`realloc` 缩小就地切分并合并、增长优先吞并后继空闲块或向系统要更多、最后才搬移，失败保持原块；对齐分配切分第一块
+够大的空闲块，前部保持空闲。`hello207` 在真实堆（brk）和多线程下验证。

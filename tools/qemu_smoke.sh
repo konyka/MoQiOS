@@ -646,6 +646,8 @@ while [ "$SECONDS" -lt "$deadline" ]; do
            grep -q "hello205: PASS" "$LOG_FILE" &&
            ! grep -q "hello206: FAIL" "$LOG_FILE" &&
            grep -q "hello206: PASS" "$LOG_FILE" &&
+           ! grep -q "hello207: FAIL" "$LOG_FILE" &&
+           grep -q "hello207: PASS" "$LOG_FILE" &&
            grep -q "hello115: PASS" "$LOG_FILE" &&
            grep -q "hello115 done" "$LOG_FILE" &&
         grep -q "hello81: PASS" "$LOG_FILE" &&

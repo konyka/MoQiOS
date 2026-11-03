@@ -5,6 +5,7 @@
  * kernel brk syscall. Host tests override the hook with a static buffer,
  * so the alloc/free/split/coalesce logic is host-testable.
  */
+#include "../include/errno.h"
 #include "../include/stdlib.h"
 #include "../include/string.h"
 
@@ -171,32 +172,47 @@ static void split(struct block *b, size_t size) {
     b->next = rest;
 }
 
-void *malloc(size_t size) {
-    /* Reject sizes whose align_up/header additions would wrap, handing the
-     * caller a tiny block it believes is huge. The bound also keeps
-     * grow()'s payload + sizeof(struct block) from overflowing. */
-    if (size > (size_t)-1 - (ALIGN - 1) - sizeof(struct block)) return (void *)0;
-    size_t want = align_up(size == 0 ? 1 : size);
+/* errno lives in the thread control block, which exists only once crt0 has installed FS; the early TCB allocation in
+ * __pthread_init_main must not touch it (heap_self() is 1 until then). */
+static void set_errno(int e) {
+    if (heap_self() != (void *)1) errno = e;
+}
 
-    if (!heap_acquire()) return (void *)0; /* reentered from a signal handler */
+/* Sizes whose align_up/header additions would wrap hand the caller a tiny block it believes is huge; they are refused.
+ * The bound also keeps grow()'s payload + sizeof(struct block) from overflowing. */
+#define SIZE_LIMIT ((size_t)-1 - (ALIGN - 1) - sizeof(struct block))
+
+/* First fit, growing the heap when nothing fits; `want` is already rounded. Caller holds the heap lock. */
+static void *malloc_locked(size_t want) {
     for (struct block *b = heap_head; b; b = b->next) {
         if (b->free && b->size >= want) {
             split(b, want);
             b->free = 0;
-            heap_release();
             return (void *)(b + 1);
         }
     }
-
     struct block *b = grow(want);
-    if (b == (struct block *)0) {
-        heap_release();
-        return (void *)0;
-    }
+    if (b == (struct block *)0) return (void *)0;
     split(b, want);
     b->free = 0;
-    heap_release();
     return (void *)(b + 1);
+}
+
+void *malloc(size_t size) {
+    if (size > SIZE_LIMIT) {
+        set_errno(ENOMEM);
+        return (void *)0;
+    }
+    size_t want = align_up(size == 0 ? 1 : size);
+
+    if (!heap_acquire()) { /* reentered from a signal handler */
+        set_errno(ENOMEM);
+        return (void *)0;
+    }
+    void *p = malloc_locked(want);
+    heap_release();
+    if (!p) set_errno(ENOMEM);
+    return p;
 }
 
 /* Merge each free block with its successor while both are free and
@@ -242,8 +258,191 @@ void free(void *ptr) {
 
 void *calloc(size_t nmemb, size_t size) {
     size_t total = nmemb * size;
-    if (size != 0 && total / size != nmemb) return (void *)0; /* overflow */
+    if (size != 0 && total / size != nmemb) { /* overflow */
+        set_errno(ENOMEM);
+        return (void *)0;
+    }
     void *p = malloc(total);
     if (p) memset(p, 0, total);
+    return p;
+}
+
+/* The block whose payload starts exactly at ptr and is in use, or NULL (counted as a rejected pointer). */
+static struct block *find_live(void *ptr) {
+    for (struct block *b = heap_head; b; b = b->next) {
+        if ((void *)(b + 1) != ptr) continue;
+        if (b->magic != BLOCK_MAGIC || b->free) break;
+        return b;
+    }
+    free_rejected++;
+    return (struct block *)0;
+}
+
+static int adjacent(const struct block *a, const struct block *b) {
+    return (const char *)(a + 1) + a->size == (const char *)b;
+}
+
+/* Resize in place when the block shrinks, or when the free blocks right behind it (or fresh heap, if it is the last
+ * block) cover the growth; otherwise move. The original is untouched unless the call succeeds. */
+static void *realloc_locked(void *ptr, size_t want, int *err) {
+    struct block *b = find_live(ptr);
+    if (!b) {
+        *err = EINVAL;
+        return (void *)0;
+    }
+    if (b->size < want) {
+        for (int tries = 0; tries < 2; tries++) {
+            size_t avail = b->size;
+            const struct block *last = b;
+            const struct block *n = b->next;
+            while (n && n->free && adjacent(last, n) && avail < want) {
+                avail += sizeof(struct block) + n->size;
+                last = n;
+                n = n->next;
+            }
+            if (avail >= want) {
+                while (b->size < want) {
+                    struct block *gone = b->next;
+                    b->size += sizeof(struct block) + gone->size;
+                    b->next = gone->next;
+                    gone->magic = 0;
+                }
+                break;
+            }
+            if (tries == 0 && n == (const struct block *)0 && grow(want - avail)) continue;
+            break;
+        }
+    }
+    if (b->size >= want) {
+        split(b, want);
+        coalesce();
+        return ptr;
+    }
+    void *np = malloc_locked(want);
+    if (!np) {
+        *err = ENOMEM;
+        return (void *)0;
+    }
+    memcpy(np, ptr, b->size);
+    free_locked(ptr);
+    return np;
+}
+
+void *realloc(void *ptr, size_t size) {
+    if (ptr == (void *)0) return malloc(size);
+    if (size == 0) {
+        free(ptr);
+        return (void *)0;
+    }
+    if (size > SIZE_LIMIT) {
+        set_errno(ENOMEM);
+        return (void *)0;
+    }
+    size_t want = align_up(size);
+    if (!heap_acquire()) { /* reentered from a signal handler */
+        set_errno(ENOMEM);
+        return (void *)0;
+    }
+    int err = 0;
+    void *p = realloc_locked(ptr, want, &err);
+    heap_release();
+    if (!p) set_errno(err);
+    return p;
+}
+
+void *reallocarray(void *ptr, size_t nmemb, size_t size) {
+    size_t total = nmemb * size;
+    if (size != 0 && total / size != nmemb) {
+        set_errno(ENOMEM);
+        return (void *)0;
+    }
+    return realloc(ptr, total);
+}
+
+/* A block whose payload starts at a multiple of `align` (a power of two above ALIGN). The first free block with room is
+ * cut in two: the part before the aligned payload stays free, so nothing is lost and free() works on the result as on
+ * any other. Caller holds the lock. */
+static void *aligned_locked(size_t align, size_t want) {
+    for (int tries = 0; tries < 2; tries++) {
+        for (struct block *b = heap_head; b; b = b->next) {
+            if (!b->free) continue;
+            unsigned long p = (unsigned long)(b + 1);
+            unsigned long a = (p + align - 1) & ~(unsigned long)(align - 1);
+            if (a != p && a - p < sizeof(struct block)) a += align; /* no room for the new header before it */
+            if (a < p || a - p > b->size || b->size - (a - p) < want) continue;
+            if (a != p) {
+                struct block *nb = (struct block *)(a - sizeof(struct block));
+                nb->size = b->size - (a - p);
+                nb->free = 1;
+                nb->magic = BLOCK_MAGIC;
+                nb->next = b->next;
+                b->size = (size_t)(a - p) - sizeof(struct block);
+                b->next = nb;
+                b = nb;
+            }
+            split(b, want);
+            b->free = 0;
+            return (void *)(b + 1);
+        }
+        if (tries == 0 && !grow(want + align + sizeof(struct block))) break;
+    }
+    return (void *)0;
+}
+
+/* Returns 0 or an errno value; align is already known to be a power of two. */
+static int aligned_alloc_impl(void **out, size_t align, size_t size) {
+    if (align <= ALIGN) {
+        void *p = malloc(size);
+        if (!p) return ENOMEM;
+        *out = p;
+        return 0;
+    }
+    if (align > SIZE_LIMIT - sizeof(struct block) || size > SIZE_LIMIT - sizeof(struct block) - align) return ENOMEM;
+    size_t want = align_up(size == 0 ? 1 : size);
+    if (!heap_acquire()) return ENOMEM;
+    void *p = aligned_locked(align, want);
+    heap_release();
+    if (!p) return ENOMEM;
+    *out = p;
+    return 0;
+}
+
+static int is_pow2(size_t n) { return n != 0 && (n & (n - 1)) == 0; }
+
+int posix_memalign(void **memptr, size_t align, size_t size) {
+    if (!is_pow2(align) || align % sizeof(void *) != 0) return EINVAL;
+    void *p = (void *)0;
+    int rc = aligned_alloc_impl(&p, align, size);
+    if (rc == 0) *memptr = p;
+    return rc;
+}
+
+void *aligned_alloc(size_t align, size_t size) {
+    void *p = (void *)0;
+    int rc = is_pow2(align) ? aligned_alloc_impl(&p, align, size) : EINVAL;
+    if (rc != 0) {
+        set_errno(rc);
+        return (void *)0;
+    }
+    return p;
+}
+
+void *memalign(size_t align, size_t size) {
+    if (align == 0) align = 1;
+    if (!is_pow2(align)) {
+        if (align > ((size_t)1 << (sizeof(size_t) * 8 - 1))) {
+            set_errno(EINVAL);
+            return (void *)0;
+        }
+        size_t up = 1;
+        while (up < align) up <<= 1;
+        align = up;
+    }
+    void *p = (void *)0;
+    int rc = aligned_alloc_impl(&p, align, size);
+    if (rc != 0) {
+        set_errno(rc);
+        return (void *)0;
+    }
     return p;
 }
