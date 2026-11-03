@@ -6306,3 +6306,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：host 测试先写（`mremap_policy.zig` 不存在，编译失败=红），然后是接线的源码文本测试（先预检空槽、再切、再调整、合并在调整之后且不依赖成功与否、文件和设备映射不切）。变异 8 个：不计中段新槽、范围越出区域不拒绝、中段 huge 计数条件反转、合并时忽略 `locked`/文件/共享位、去掉空槽预检（第一次这个变异因变量未使用编译失败，换成 `free_slots + 99` 才是有效变异）、合并只在成功时做，全部被抓住。
 - 目标上验证：`hello200` 的 H 场景（12 项）通过，总共 87 项。第一次跑有一项失败，原因是**我的探针错了**：目标位置用 `gmap(8)` 造出来是 8 页的空洞映射，"目标位置只有 1 页"这一条在构造上就不成立；改成先 `munmap` 掉目标再让内核造，内核没改。
 - 如实说明：①文件映射和设备映射的子范围仍不支持（走原来的整区域路径，从中间开始是 `EINVAL`）；②`old_size` 超出所在映射末尾时 Linux 允许（我在宿主机上量到 `mremap(a+2PG, 9PG, ...)` 对 8 页映射成功），这里拒绝；③这是一个会改区域表的内核改动，所以走了完整门禁（结果见本次提交说明）。
+
+## libc 的 strtol 家族、rand 和 string.h 的其余部分（hello204）
+
+- 做的事：libc 的 `stdlib.h` 只有 `malloc/free/calloc/exit/atoi/getenv`，`string.h` 只有 12 个最基础的函数，所以任何稍大一点的 C 程序都编译不过。补上 `strtol/strtoul/strtoll/strtoull/atol/atoll/abs/labs/llabs/div/ldiv/lldiv/rand/srand`（`src/numconv.c`）和 `strncat/stpcpy/strnlen/strstr/memchr/memrchr/strspn/strcspn/strpbrk/strcasecmp/strncasecmp/strdup/strndup/strtok/strtok_r/strerror`（`src/strfunc.c`）。方法同前几节：先量 glibc，再写 host 测试，再实现，再做差分。
+- **这次没有读 glibc 的源码**：所有行为都来自对运行中 glibc 的测量和我自己的写法（`strtol` 用一个统一的"解析幅度"函数；`rand` 实现的是公开描述的 TYPE_3 加法反馈：31 个字由 Lehmer LCG 播种，`r[i]=r[i-31]+r[i-3]`，丢弃前 310 个）。`strerror` 的文本表是从实测输出生成的。这与 `strptime` 那一节不同，不涉及许可证问题。
+- 测量时值得记的几个行为：①`strtol` 的 `base` 非法时结束指针**不被写入**（我自己的第一个测量程序读了未初始化的指针，得出了乱数；改成哨兵值 `0x1` 才看清）；②`0b` 前缀（glibc 2.38+）只在后面有二进制数字时才算，`"0b2"` 是 0、结束位置在 `b` 之前，`"0b11"` 在 16 进制下是 0xb11；③`strtoul("-18446744073709551615")` 是 1 而 `"-18446744073709551616"` 是 `ULONG_MAX`/`ERANGE`，即先判幅度再取负；④`strtol("0x", 16)` 的结束位置在 `0` 之后；⑤`strerror(-1)`：我第一个测量程序里它打印出乱码字节，后来的测量（把 `-1`、`4096`、`INT_MAX`、`INT_MIN` 都放进表里）给出的是 `"Unknown error -1"` 这类文本，所以表里按后者写；乱码的原因我没有查清（可能是那个小程序对 `printf` 参数的处理有问题，这只是猜测，没有验证）。
+- TDD：两个 host 测试都先写，源文件不存在时编译失败=红。第一版 `rand` 实现是错的：我把状态做成了 31 个字的环并把预热写错，前几个输出就不对；对照"经典描述"的小程序（`/tmp/sc/rr.c`，用 34 个字的数组直接算）确认公式本身是对的，再把实现改成 34 个字的环，之后 4000 个种子各 200 个值 0 差异。
+- 变异：numconv 14 个、strfunc 12 个。numconv 里有两个变异存活：把 `*end` 的写法换成 `s + (used < 0 ? 0 : used)`，以及把 `div` 的 `rem` 换成 `num - quot*den + 0`。我认为前者是等价变异（`used < 0` 时两者都是 `s`），后者在数学上也相等，但**这两条我只是推理，没有逐一验证等价性，也没有给它们补测试**。strfunc 里三个第一次没被抓住的变异补了测试后抓住：`memrchr` 不把字节当 `unsigned char`（补了 `'a'+256` 的用例）、`memchr` 同理、`strncat` 不写结尾 NUL（补了先用 `'Z'` 填满目标再检查的用例）；另有一个 `strdup` 里 `strnlen` 换 `strlen` 的变异因参数未使用在 `-Werror` 下编译失败，不算有效变异，我换成 `strnlen(s, n + 1)` 重做了一次，被抓住。
+- 目标上验证：`hello204`（33 项）在 QEMU 里通过，含 `strdup/strndup` 对真实堆的分配与释放、`rand` 的 10 万项求和与 glibc 一致、`strtol` 的各种边界。
+- 如实说明：①没有 `strtod`/`atof`、`qsort`/`bsearch`、`strcoll`/`strxfrm`、`strsignal`、`memmem`/`strcasestr`、`rand_r`；②`strerror` 只有英文，且 `strtok` 的静态状态不是线程私有；③没有改内核，所以没有重跑完整门禁，只跑了 host 测试、libc 测试、三个架构的构建、目标探针和一次 SMP=1 冒烟。
