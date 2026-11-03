@@ -14,12 +14,12 @@ pub fn getcwd(buf_ptr: u64, buf_size: u64) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    const cwd_len: usize = cur.cwd_len;
+    const cwd_len: usize = cur.fsctx().cwd_len;
     const total = cwd_len + 1;
     if (total > buf_size) return -34; // -ERANGE
 
     var tmp: [257]u8 = undefined;
-    @memcpy(tmp[0..cwd_len], cur.cwd[0..cwd_len]);
+    @memcpy(tmp[0..cwd_len], cur.fsctx().cwd[0..cwd_len]);
     tmp[cwd_len] = 0;
 
     if (copy.copyToUser(@ptrFromInt(buf_ptr), tmp[0..total], total) != total) return -14;
@@ -241,14 +241,14 @@ fn mkdirName(name: []const u8, requested_mode: ?u32) i64 {
         const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
         const cur = task_mod.getTask(cur_idx) orelse return -1;
         const mode = requested_mode orelse @import("../proc/creation_metadata.zig").DEFAULT_DIRECTORY_MODE;
-        return @import("tmpfs.zig").tmpfsMkdirAuthorized(name, mode, cur.umask_val, cur.euid, cur.egid, cur.effective_caps);
+        return @import("tmpfs.zig").tmpfsMkdirAuthorized(name, mode, cur.fsctx().umask, cur.euid, cur.egid, cur.effective_caps);
     }
 
     const ext2 = @import("ext2.zig");
     if (ext2.isActive()) {
         const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
         const cur = task_mod.getTask(cur_idx) orelse return -1;
-        const cm = @import("../proc/creation_metadata.zig").decide(null, .directory, requested_mode, cur.umask_val, cur.euid, cur.egid).metadata;
+        const cm = @import("../proc/creation_metadata.zig").decide(null, .directory, requested_mode, cur.fsctx().umask, cur.euid, cur.egid).metadata;
         const result = ext2.createDir(name, .{ .uid = cm.uid, .gid = cm.gid, .perm = @truncate(cm.mode) }, .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] });
         if (result > 0) {
             ext2.closeFile(@intCast(result));

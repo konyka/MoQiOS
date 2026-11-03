@@ -114,7 +114,7 @@ pub fn openAt(dirfd: i64, name_ptr: u64, flags: u32, requested_mode: ?u32) i64 {
         .err => |e| return e,
     };
 
-    const result = cur.fd_table.openWithCreationCredentials(use_name, flags, requested_mode, cur.umask_val, cur.euid, cur.egid, cur.effective_caps);
+    const result = cur.fd_table.openWithCreationCredentials(use_name, flags, requested_mode, cur.fsctx().umask, cur.euid, cur.egid, cur.effective_caps);
     if (result >= 0 and (flags & @import("fcntl_policy.zig").O_CLOEXEC) != 0 and result < vfs_mod.MAX_FDS) {
         cur.fd_table.fds[@intCast(result)].fd_flags = @import("fcntl_policy.zig").FD_CLOEXEC;
     }

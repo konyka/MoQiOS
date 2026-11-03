@@ -30,14 +30,14 @@ pub fn chdir(path_ptr: u64) i64 {
     // terminator in Task.cwd — reject instead of truncating or writing the
     // NUL one byte past the array.
     var out_buf: [256]u8 = undefined;
-    const write_pos = chdir_policy.resolve(cur.cwd[0..cur.cwd_len], path_buf[0..path_len], &out_buf) catch return -36; // ENAMETOOLONG
+    const write_pos = chdir_policy.resolve(cur.fsctx().cwd[0..cur.fsctx().cwd_len], path_buf[0..path_len], &out_buf) catch return -36; // ENAMETOOLONG
 
     const rc = checkDirectory(cur, out_buf[0..write_pos]);
     if (rc != 0) return rc;
 
-    @memcpy(cur.cwd[0..write_pos], out_buf[0..write_pos]);
-    cur.cwd[write_pos] = 0;
-    cur.cwd_len = @intCast(write_pos);
+    @memcpy(cur.fsctx().cwd[0..write_pos], out_buf[0..write_pos]);
+    cur.fsctx().cwd[write_pos] = 0;
+    cur.fsctx().cwd_len = @intCast(write_pos);
     return 0;
 }
 
@@ -68,7 +68,7 @@ fn checkDirectory(cur: *task_mod.Task, path: []const u8) i64 {
 
 fn tmpfsDirectory(cur: *task_mod.Task, path: []const u8) i64 {
     const tmpfs = @import("tmpfs.zig");
-    const r = tmpfs.tmpfsOpenAuthorized(path, false, false, cur.euid, cur.egid, cur.effective_caps, 0, null, cur.umask_val);
+    const r = tmpfs.tmpfsOpenAuthorized(path, false, false, cur.euid, cur.egid, cur.effective_caps, 0, null, cur.fsctx().umask);
     if (r < 0) return if (r == -13) -13 else -2;
     const idx: u8 = @intCast(r);
     defer tmpfs.tmpfsClose(idx);
@@ -93,9 +93,9 @@ pub fn fchdir(fd: u32) i64 {
         .ok => |p| p,
         .err => |e| return e,
     };
-    if (path.len == 0 or path.len >= cur.cwd.len) return -36;
-    @memcpy(cur.cwd[0..path.len], path);
-    cur.cwd[path.len] = 0;
-    cur.cwd_len = @intCast(path.len);
+    if (path.len == 0 or path.len >= cur.fsctx().cwd.len) return -36;
+    @memcpy(cur.fsctx().cwd[0..path.len], path);
+    cur.fsctx().cwd[path.len] = 0;
+    cur.fsctx().cwd_len = @intCast(path.len);
     return 0;
 }

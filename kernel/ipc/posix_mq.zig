@@ -396,7 +396,7 @@ fn accessFor(oflag: u32) dac.Access {
 
 pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
     const creds = callerCreds();
-    const umask_val: u32 = if (sched.currentTask()) |cur| cur.umask_val else 0;
+    const umask_val: u32 = if (sched.currentTask()) |cur| cur.fsctx().umask else 0;
 
     // Read name and attributes BEFORE taking mq_lock: user copies walk page
     // tables and must not run with IRQs off. Linux struct mq_attr is four

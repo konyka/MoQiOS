@@ -204,9 +204,7 @@ pub const Task = struct {
     env_vars: [ENV_MAX_VARS][ENV_VAR_BYTES]u8,
     env_count: u32,
 
-    /// Current working directory (null-terminated, max 256 chars).
-    cwd: [256]u8,
-    cwd_len: u32,
+    // The current directory and umask live in Mm.grp.fs (mm/group_state.zig): CLONE_VM threads share them (CLONE_FS).
 
     /// Process group ID (inherited from parent on fork).
     pgid: u16,
@@ -244,7 +242,6 @@ pub const Task = struct {
     exit_waiters: ?*WaitNode,
 
     /// Per-process umask (file creation mode mask). Default 0o022.
-    umask_val: u32 = 0o022,
 
     /// CPU time consumed in kernel mode (microseconds, accumulated on context switch).
     utime_us: u64 = 0,
@@ -351,6 +348,10 @@ pub const Task = struct {
 
     pub fn sigact(self: *const Task) *@import("../mm/group_state.zig").SigActions {
         return &self.grp().sig;
+    }
+
+    pub fn fsctx(self: *const Task) *@import("../mm/group_state.zig").FsContext {
+        return &self.grp().fs;
     }
 
     pub fn lim(self: *const Task) *@import("../mm/group_state.zig").Limits {
@@ -914,7 +915,6 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
         freeKernelStack(stack_virt);
         return null;
     };
-    tasks[slot].umask_val = creation_metadata.initialTaskUmask();
     tasks[slot].self_idx = slot;
     tasks[slot].tid = tid;
     tasks[slot].state = .ready;
@@ -925,8 +925,6 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     tasks[slot].personality = .native;
     tasks[slot].fd_table = fd_table;
     tasks[slot].fd_table.alloc_limit = tasks[slot].lim().nofile.cur;
-    tasks[slot].cwd[0] = '/';
-    tasks[slot].cwd_len = 1;
     tasks[slot].cpu_affinity = affinity;
     tasks[slot].last_cpu = affinity;
 
@@ -978,7 +976,6 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
         freeKernelStack(stack_virt);
         return null;
     };
-    tasks[slot].umask_val = creation_metadata.initialTaskUmask();
     tasks[slot].self_idx = slot;
     tasks[slot].tid = tid;
     tasks[slot].state = .ready;
@@ -989,8 +986,6 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     tasks[slot].personality = .native;
     tasks[slot].fd_table = fd_table;
     tasks[slot].fd_table.alloc_limit = tasks[slot].lim().nofile.cur;
-    tasks[slot].cwd[0] = '/';
-    tasks[slot].cwd_len = 1;
     tasks[slot].cpu_affinity = -1;
     tasks[slot].last_cpu = 0;
     task_count += 1;
@@ -1661,7 +1656,6 @@ pub fn createUserProcess(
             owned_mm.release();
             return null;
         };
-        tasks[slot].umask_val = creation_metadata.initialTaskUmask();
         tasks[slot].self_idx = slot;
         tasks[slot].tid = tid;
         // Group and session are inherited from the spawning parent, as fork does
@@ -1716,8 +1710,6 @@ pub fn createUserProcess(
         // A spawned program inherits only the spawner's RLIMIT_FSIZE (fork/clone copy everything); its Mm is new, so the
         // other limits start at the defaults.
         tasks[slot].lim().fsize = .{ .cur = fsize_cur, .max = fsize_max };
-        tasks[slot].cwd[0] = '/';
-        tasks[slot].cwd_len = 1;
         // User processes are not pinned by default; last_cpu seeds placement.
         tasks[slot].cpu_affinity = -1;
         tasks[slot].last_cpu = assignCpuAffinity(elf);

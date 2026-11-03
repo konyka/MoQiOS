@@ -69,6 +69,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
             child_mm.inheritBreak(parent_mm);
             child_mm.inheritCharges(parent_mm);
             child_mm.inheritLimits(parent_mm);
+            child_mm.inheritFs(parent_mm);
         }
     }
     // The child is a copy of the address space, so its TLS block sits at the
@@ -98,8 +99,6 @@ pub fn fork(frame: *SyscallFrame) i64 {
     for (0..parent.env_count) |i| {
         child.env_vars[i] = parent.env_vars[i];
     }
-    @memcpy(child.cwd[0..256], parent.cwd[0..256]);
-    child.cwd_len = parent.cwd_len;
 
     // v53.2: inherit mmap regions so munmap/madvise/mlock work in child. The snapshot was taken under the parent's
     // vm_lock together with the page-table clone. Each file-backed region piece holds a backing reference (ext2/fat32
@@ -121,7 +120,6 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.sgid = parent.sgid;
     child.groups = parent.groups;
     child.ngroups = parent.ngroups;
-    child.umask_val = @import("creation_metadata.zig").inheritedTaskUmask(parent.umask_val);
     child.pgid = parent.pgid;
     child.sid = parent.sid;
     child.personality = parent.personality;

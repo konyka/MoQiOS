@@ -337,6 +337,7 @@ pub fn clone(
             child_mm.inheritBreak(parent_mm);
             child_mm.inheritCharges(parent_mm);
             child_mm.inheritLimits(parent_mm);
+            child_mm.inheritFs(parent_mm);
         };
         // ...and of the mapping table, with its own backing references. A CLONE_VM thread shares the Mm and the table.
         @import("../../mm/vma_table.zig").adopt(child.vma(), &vma_snap);
@@ -391,8 +392,6 @@ pub fn clone(
     for (0..parent.env_count) |i| {
         child.env_vars[i] = parent.env_vars[i];
     }
-    @memcpy(child.cwd[0..256], parent.cwd[0..256]);
-    child.cwd_len = parent.cwd_len;
     child.pgid = parent.pgid;
     child.sid = parent.sid;
     // CLONE_THREAD: 标记为线程——getpid 汇报 tgid，waitpid 不 reap。
@@ -406,7 +405,6 @@ pub fn clone(
     child.sgid = parent.sgid;
     child.groups = parent.groups;
     child.ngroups = parent.ngroups;
-    child.umask_val = @import("../../proc/creation_metadata.zig").inheritedTaskUmask(parent.umask_val);
     child.effective_caps = parent.effective_caps;
     child.permitted_caps = parent.permitted_caps;
     child.inheritable_caps = parent.inheritable_caps;

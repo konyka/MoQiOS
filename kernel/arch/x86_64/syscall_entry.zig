@@ -2593,7 +2593,7 @@ fn pathOnRofs(cur: anytype, dirfd: i64, ptr: u64) union(enum) { no, yes, err: i6
     var joined: [512]u8 = undefined;
     var full: []const u8 = name;
     if (name[0] != '/') {
-        const cwd = cur.cwd[0..cur.cwd_len];
+        const cwd = cur.fsctx().cwd[0..cur.fsctx().cwd_len];
         if (cwd.len + 1 + n > joined.len) return .no;
         @memcpy(joined[0..cwd.len], cwd);
         joined[cwd.len] = '/';
@@ -3609,7 +3609,7 @@ fn rofsAccess(cur: anytype, name: []const u8, mode: u32) ?i64 {
     var joined: [512]u8 = undefined;
     var full: []const u8 = name;
     if (name[0] != '/') {
-        const cwd = cur.cwd[0..cur.cwd_len];
+        const cwd = cur.fsctx().cwd[0..cur.fsctx().cwd_len];
         if (cwd.len + 1 + name.len > joined.len) return null;
         @memcpy(joined[0..cwd.len], cwd);
         joined[cwd.len] = '/';
@@ -4141,7 +4141,7 @@ fn syscallUmask(mask: u32) i64 {
     const lock_flags = task_mod.lockTask();
     defer task_mod.unlockTask(lock_flags);
     const cur = task_mod.getTask(cur_idx) orelse return -3;
-    return @intCast(policy.replaceTaskUmask(&cur.umask_val, mask));
+    return @intCast(policy.replaceTaskUmask(&cur.fsctx().umask, mask));
 }
 
 /// sysinfo(info_ptr) — system information.
@@ -4651,7 +4651,7 @@ fn rofsStatfsByPath(path_ptr: u64, buf_ptr: u64) ?i64 {
     var joined: [512]u8 = undefined;
     var full: []const u8 = raw[0..n];
     if (raw[0] != '/') {
-        const cwd = cur.cwd[0..cur.cwd_len];
+        const cwd = cur.fsctx().cwd[0..cur.fsctx().cwd_len];
         if (cwd.len + 1 + n > joined.len) return null;
         @memcpy(joined[0..cwd.len], cwd);
         joined[cwd.len] = '/';
@@ -5481,8 +5481,8 @@ fn syscallKcmp(pid1: u32, pid2: u32, kcmp_type: u32, idx1: u64, idx2: u64) i64 {
             return 2;
         },
         3 => { // KCMP_FS — compare filesystem info (cwd)
-            if (&t1.cwd == &t2.cwd) return 0;
-            if (@intFromPtr(&t1.cwd) < @intFromPtr(&t2.cwd)) return 1;
+            if (&t1.fsctx().cwd == &t2.fsctx().cwd) return 0;
+            if (@intFromPtr(&t1.fsctx().cwd) < @intFromPtr(&t2.fsctx().cwd)) return 1;
             return 2;
         },
         else => return -22, // EINVAL: unsupported type

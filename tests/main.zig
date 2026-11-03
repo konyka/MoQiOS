@@ -10592,3 +10592,37 @@ test "a new thread-group state starts with the default limits: unlimited, except
     for (st.lim.recorded.v) |l| try std.testing.expectEqual(gs.RLIM_INFINITY, l.cur);
     for (st.sig.handlers) |h| try std.testing.expectEqual(@as(u64, 0), h);
 }
+
+test "the file-system context belongs to the thread group: cwd and umask live in the shared group state" {
+    // cwd, cwd_len and umask_val were per-Task fields that clone copied, so chdir()/umask() in one thread was invisible to
+    // every other thread of the process (Linux: CLONE_FS, which every pthread has).
+    for ([_][]const u8{ "cwd: [256]u8", "cwd_len: u32", "umask_val: u32" }) |decl| {
+        try std.testing.expect(std.mem.indexOf(u8, kt.task_source, decl) == null);
+    }
+    const srcs = [_][]const u8{ kt.clone_source, kt.fork_source, kt.syscall_entry_source, kt.execve_source };
+    for (srcs) |src| {
+        // Every use goes through fsctx(); a bare task.cwd / task.cwd_len / task.umask_val is the old per-thread field.
+        for ([_][]const u8{ "cur", "child", "parent", "t1", "t2", "task", "current" }) |who| {
+            var buf: [32]u8 = undefined;
+            const cwd = try std.fmt.bufPrint(&buf, "{s}.cwd", .{who});
+            try std.testing.expect(std.mem.indexOf(u8, src, cwd) == null);
+            const um = try std.fmt.bufPrint(&buf, "{s}.umask_val", .{who});
+            try std.testing.expect(std.mem.indexOf(u8, src, um) == null);
+        }
+    }
+    try std.testing.expect(std.mem.indexOf(u8, kt.group_state_source, "fs: FsContext") != null);
+    // fork and a copied-address-space clone copy it; a CLONE_VM clone shares it.
+    try std.testing.expect(std.mem.indexOf(u8, kt.fork_source, "child_mm.inheritFs(parent_mm);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "child_mm.inheritFs(parent_mm);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "new_mm.inheritFs(om)") != null);
+}
+
+test "a new group state starts at / with umask 022" {
+    const gs = kt.group_state;
+    const st = gs.GroupState.initial(64);
+    try std.testing.expectEqual(@as(u32, 1), st.fs.cwd_len);
+    try std.testing.expectEqual(@as(u8, '/'), st.fs.cwd[0]);
+    try std.testing.expectEqual(@as(u32, 0o022), st.fs.umask);
+    // One default, two spellings: the policy module's and the group state's must agree.
+    try std.testing.expectEqual(kt.creation_metadata.DEFAULT_UMASK, gs.DEFAULT_UMASK);
+}

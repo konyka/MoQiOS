@@ -172,6 +172,8 @@ pub fn prepareExecName(name: []const u8, argv_ptr: u64, envp_ptr: u64) Prepared 
     // Resource limits survive exec (they belong to the process, not the image); the new Mm starts at the defaults until this copy,
     // which has to come before anything below reads a limit.
     if (old_mm) |om| new_mm.inheritLimits(om);
+    // The current directory and umask belong to the process too: exec keeps them.
+    if (old_mm) |om| new_mm.inheritFs(om);
     // RLIMIT_STACK is preserved across exec (like NOFILE), but the growth
     // watermark belongs to the old image — reset it so a deep inherited
     // watermark cannot bypass the limit's floor in the fresh image.

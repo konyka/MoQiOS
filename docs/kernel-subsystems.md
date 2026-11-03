@@ -2959,3 +2959,6 @@ fork 与不带 `CLONE_VM` 的 clone 用 `inheritCharges` 继承，`CLONE_VM` 线
 
 **线程组状态页（hello213）**：`mm/group_state.zig` 的 `GroupState { sig, lim }`（信号处置 + RLIMIT_* 限额，一页）挂在 `Mm.grp`，`Task.sigact()`/`Task.lim()` 取用。
 `CLONE_VM` 线程共享，fork 与不带 `CLONE_VM` 的 clone 复制（`inheritLimits` + 信号表拷贝），exec 把限额从旧 `Mm` 带到新 `Mm`、信号处置按 exec 规则重置。
+
+**文件系统上下文属于线程组（hello214）**：`GroupState.fs`（`cwd`、`cwd_len`、`umask`）与信号处置、限额同在 `Mm.grp` 的一页里；`Task.fsctx()` 取用。
+`CLONE_VM` 线程共享（`CLONE_FS`），fork 与不带 `CLONE_VM` 的 clone 复制（`inheritFs`），exec 带到新 `Mm`。

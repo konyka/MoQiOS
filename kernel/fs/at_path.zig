@@ -130,7 +130,7 @@ pub fn resolve(cur: *task_mod.Task, dirfd: i64, name: []const u8, buf: *[256]u8)
             .err => |e| .{ .err = e },
         };
     }
-    return fromJoin(at_join.underCwd(cur.cwd[0..cur.cwd_len], name, buf));
+    return fromJoin(at_join.underCwd(cur.fsctx().cwd[0..cur.fsctx().cwd_len], name, buf));
 }
 
 const at_join = @import("at_join_policy.zig");

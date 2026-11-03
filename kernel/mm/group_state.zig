@@ -1,5 +1,5 @@
-//! State shared by every thread of one thread group, kept in one page owned by the Mm: signal dispositions and resource
-//! limits. Every pthread is created with CLONE_VM | CLONE_SIGHAND, and Linux keeps both in objects the threads share
+//! State shared by every thread of one thread group, kept in one page owned by the Mm: signal dispositions, resource
+//! limits and the file-system context (current directory, umask). Every pthread is created with CLONE_VM | CLONE_SIGHAND, and Linux keeps both in objects the threads share
 //! (sighand_struct, signal_struct), so one thread's sigaction()/setrlimit() is every thread's.
 //!
 //! A fork child (new Mm) starts with a copy of both; exec resets caught signals to default and carries the limits over.
@@ -34,9 +34,20 @@ pub const Limits = struct {
     recorded: rlimit.RecordedLimits,
 };
 
+/// The file-system context (Linux fs_struct, CLONE_FS): current directory and umask.
+pub const FsContext = struct {
+    /// NUL-terminated absolute path; cwd_len excludes the NUL.
+    cwd: [256]u8,
+    cwd_len: u32,
+    umask: u32,
+};
+
+pub const DEFAULT_UMASK: u32 = 0o022; // same value as proc/creation_metadata.DEFAULT_UMASK (asserted by a host test)
+
 pub const GroupState = struct {
     sig: SigActions,
     lim: Limits,
+    fs: FsContext,
 
     pub fn initial(max_fds: u64) GroupState {
         const inf: Limit = .{ .cur = RLIM_INFINITY, .max = RLIM_INFINITY };
@@ -51,6 +62,7 @@ pub const GroupState = struct {
                 .fsize = inf,
                 .recorded = .{},
             },
+            .fs = .{ .cwd = [_]u8{'/'} ++ [_]u8{0} ** 255, .cwd_len = 1, .umask = DEFAULT_UMASK },
         };
     }
 };

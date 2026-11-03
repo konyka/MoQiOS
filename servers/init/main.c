@@ -335,6 +335,8 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello211"); /* signal dispositions shared by threads */
     run_test("hello212"); /* RLIMIT_AS accounting shared by threads */
     run_test("hello213"); /* resource limits shared by threads */
+    run_test("hello214"); /* current directory and umask shared by threads */
+    run_test("hello215"); /* thread create/join storm */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */
