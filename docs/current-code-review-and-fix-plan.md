@@ -6257,7 +6257,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 目标上验证：`hello200`（5 个场景）经 libc 封装走真实内核：`mmap` 返回地址且不改 `errno`；`MAP_FAILED`/`EINVAL`/`ENOMEM`/`EFAULT`；`mremap` 增长、原地缩小、`MREMAP_FIXED` 读第五个参数；`mlock`/`mlock2`/`munlock` 与限额；`mlockall(MCL_FUTURE)` 下超限是 `EAGAIN`，限额 0 时 `MAP_LOCKED` 是 `EPERM`。
 - 如实说明：①`resource.h` 缺 `RLIMIT_MEMLOCK` 是做 `hello200` 时发现的，先补测试（`test_rlimit_abi.c` 对新编号的断言先失败）再补头文件；②只有 mman.h 遵循 glibc 约定，其它封装仍返回 -errno；③没有文件映射的便利封装、`posix_madvise`、`shm_open`。
 - **经由这层封装发现的内核缺陷（已修）**：`hello200` 第一次在目标上跑时，`mremap(..., MREMAP_MAYMOVE | MREMAP_FIXED, dst)` 在**新大小不大于旧大小**时返回旧地址，什么也没搬——原因是 `mremapRegion` 里"缩小/不变"分支（原地缩小，直接返回 `old_addr`）排在 `MREMAP_FIXED` 的搬移路径之前，只有"增长"才会走到搬移。先在宿主机 gcc 测了真实 Linux（`/tmp/mla/mr.c`）：同大小和缩小的 `MREMAP_FIXED` 都会把内容搬到 `new_addr`，旧范围整个被取消映射（缩小时连尾页也没了），新范围只有新大小那么多页；`MREMAP_FIXED` 不带 `MAYMOVE`、搬到自己身上、与自己重叠都是 `EINVAL`。修复：`mremapRegion` 里在原地缩小分支之前加 `MREMAP_FIXED and new_pages <= old_pages` 的分支，文件映射仍 `ENOMEM`（和增长路径一致，搬动会破坏共享），其余走 `moveOrNoMem`。TDD：host 测试先写（源码文本断言：路由在原地缩小分支之前、含 `moveOrNoMem`、含文件映射拒绝），红灯后再改；两个变异（去掉路由、去掉文件映射拒绝）都被抓住。目标上 `hello200` 多 4 项（搬移后内容保留且旧范围取消映射、缩小搬移的尾页也没了、`FIXED` 不带 `MAYMOVE` 与搬到自己身上是 `EINVAL`）。**这个缺陷此前没被发现**，是因为 `hello131`/`hello188` 只覆盖了 `MREMAP_FIXED` 的错误返回，没有一个成功路径的测试。
-- 当时记下的两个已知差异里，第一个（`MREMAP_FIXED` 搬到已有映射上）在下一节修了；第二个（对映射中间子范围做 `MREMAP_FIXED` 搬移，这里要求 `old_size` 覆盖整个跟踪区域，否则 `EINVAL`）仍在。
+- 当时记下的两个已知差异里，第一个（`MREMAP_FIXED` 搬到已有映射上）在下一节修了；第二个（对映射中间子范围做 `MREMAP_FIXED` 搬移，这里要求 `old_size` 覆盖整个跟踪区域，否则 `EINVAL`）在后面的"mremap 子范围"一节修了。
 
 ## mremap(MREMAP_FIXED) 搬到已有映射之上
 
@@ -6297,3 +6297,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：`test_strptime_abi.c` 先写（`strptime` 不存在，编译失败=红），367 行 glibc 实测值硬编码；失败信息会指出哪一行哪个字段（"row 225 (input "5 7", format "%Od %Od"): consumed want -1 got 3"）。变异 16 个，被抓住 15 个：`%y` 的 69 界限、`decided` 状态机、`%I` 的 12 点、`%S` 的 61 秒、`%z` 的两位小时和分钟上限和符号、`%p` 加 12、`%U`/`%W` 的周起点和 `tm_yday` 公式、`%u` 的取模、名字匹配的大小写、组合转换的回滚；**一个变异（`%OY` 被错误地接受）开始时没被抓住**，因为表里没有 `%OY`，补了 47 个"无效修饰符"的行（`%OY %OC %OD %Oa ... %EE %OO ...`）后抓住。另一个"变异"其实是个无效变异（`(void)scratch_`）我换了一个真正改变行为的版本。
 - 目标上验证：`hello203`（29 项）在 QEMU 里通过：strptime 的各种转换、失败形态、组合转换失败不留半个 `%H`、`asctime`/`ctime` 的格式和错误，以及用内核实时时钟做的 `strftime → strptime → timegm` 往返（`%z`、`%s`、asctime 版式都往返成功，星期和 yday 也一致）。
 - 如实说明：①没有纪元支持（C locale 本来就没有）、没有 `strptime_l`、`%Z` 只读不转换（和 glibc 一样）；②glibc 的一些怪行为（缩写匹配不前进指针、`__mon_yday` 越界读）被忠实复刻，它们是 bug 级别的行为，但 libc 兼容的目标就是同样的输出；③没有改内核，所以没有重跑完整 QEMU 门禁，只跑了 host 测试、libc 测试、三个架构的构建、目标探针和一次 SMP=1 冒烟。
+
+## mremap 对映射中间子范围（hello200 H 场景）
+
+- 先在宿主机测 Linux（`/tmp/mla/sub.c`）：对一个 8 页映射的第 2..4 页做 `mremap`——`MREMAP_FIXED` 移动（内容跟着走，旧位置的 3 页消失，头 2 页和尾 3 页原地不动）；不带 `FIXED` 但增大到 6 页（尾部挡路，所以移动，留下一个洞）；不带 `MAYMOVE` 增大且被挡住是 `ENOMEM`；原地缩小只丢掉后面的页；同大小原地返回同一地址；一页搬出去同时长到 4 页；3 页缩成 1 页并 `FIXED`。
+- 之前的行为：`mremapRegion` 只找 `r.base == old_addr` 的区域，所以从映射中间开始的范围一律 `EINVAL`（"not a region start"），这是跟 Linux 的真实功能缺口。
+- 设计：区域表一个映射一条记录，所以先把区域切成头、中、尾三段，让被操作的范围成为一个整区域，然后复用已有的整区域逻辑（`mremapExact`，就是原来的函数体），最后把相邻又变得可合并的片并回去。切分与合并的布局由纯函数 `mm/mremap_policy.zig` 决定（`plan`、`extraSlots`、`canCoalesce`），所以 host 测试能把它们逐个钉住，不用构造内核任务。
+- TDD：host 测试先写（`mremap_policy.zig` 不存在，编译失败=红），然后是接线的源码文本测试（先预检空槽、再切、再调整、合并在调整之后且不依赖成功与否、文件和设备映射不切）。变异 8 个：不计中段新槽、范围越出区域不拒绝、中段 huge 计数条件反转、合并时忽略 `locked`/文件/共享位、去掉空槽预检（第一次这个变异因变量未使用编译失败，换成 `free_slots + 99` 才是有效变异）、合并只在成功时做，全部被抓住。
+- 目标上验证：`hello200` 的 H 场景（12 项）通过，总共 87 项。第一次跑有一项失败，原因是**我的探针错了**：目标位置用 `gmap(8)` 造出来是 8 页的空洞映射，"目标位置只有 1 页"这一条在构造上就不成立；改成先 `munmap` 掉目标再让内核造，内核没改。
+- 如实说明：①文件映射和设备映射的子范围仍不支持（走原来的整区域路径，从中间开始是 `EINVAL`）；②`old_size` 超出所在映射末尾时 Linux 允许（我在宿主机上量到 `mremap(a+2PG, 9PG, ...)` 对 8 页映射成功），这里拒绝；③这是一个会改区域表的内核改动，所以走了完整门禁（结果见本次提交说明）。

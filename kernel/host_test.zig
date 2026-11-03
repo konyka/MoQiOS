@@ -71,6 +71,7 @@ pub const mmap_policy = @import("mm/mmap_policy.zig");
 pub const shared_mapping_policy = @import("mm/shared_mapping_policy.zig");
 pub const pte_kind = @import("mm/pte_kind.zig");
 pub const munmap_policy = @import("mm/munmap_policy.zig");
+pub const mremap_policy = @import("mm/mremap_policy.zig");
 pub const range_policy = @import("mm/range_policy.zig");
 pub const itimer_policy = @import("proc/itimer_policy.zig");
 pub const process_vm_policy = @import("mm/process_vm_policy.zig");

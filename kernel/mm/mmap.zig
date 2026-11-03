@@ -45,6 +45,7 @@ const MREMAP_FIXED: u32 = 0x2;
 const mmap_policy = @import("mmap_policy.zig");
 const mlock_gate = @import("mlock_gate.zig");
 const mlock_policy = @import("mlock_policy.zig");
+const mremap_policy = @import("mremap_policy.zig");
 const rofs_map = @import("rofs_map_policy.zig");
 const rofs = @import("../fs/rofs.zig");
 
@@ -1678,8 +1679,116 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, mflags: u32, new_addr
     return result;
 }
 
-/// The part of mremap that runs under the VM lock once the arguments are validated.
+/// Index of the active region that wholly contains [addr, addr + pages*PAGE), if any.
+fn regionContaining(task: *task_mod.Task, addr: u64, pages: u64) ?usize {
+    const page = user_space.PAGE_SIZE;
+    const end = @addWithOverflow(addr, pages *% page);
+    if (end[1] != 0 or pages == 0) return null;
+    var bits = task.mmap_active_bm;
+    while (bits != 0) {
+        const i: usize = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const r = &task.mmap_regions[i];
+        if (r.base <= addr and end[0] <= r.base + r.num_pages * page) return i;
+    }
+    return null;
+}
+
+fn regionTraits(r: *const task_mod.MmapRegion) mremap_policy.Traits {
+    return .{ .prot = r.prot, .shared = r.shared, .may_write = r.may_write, .file_kind = r.file_kind, .no_free = r.no_free, .locked = r.locked, .huge_pages = r.huge_pages };
+}
+
+/// A new region record cloned from `proto` (anonymous, so there is no file backing to retain) covering [base, +pages).
+fn insertAnonPiece(task: *task_mod.Task, proto: *const task_mod.MmapRegion, base: u64, pages: u64, huge: u32) usize {
+    var free_bits = ~task.mmap_active_bm;
+    while (free_bits != 0) {
+        const i: u6 = @truncate(@ctz(free_bits));
+        free_bits &= free_bits - 1;
+        const r = &task.mmap_regions[i];
+        if (r.active) continue;
+        r.* = .{ .base = base, .num_pages = pages, .active = true, .locked = proto.locked, .huge_pages = huge, .no_free = proto.no_free,
+                 .shared = proto.shared, .may_write = proto.may_write, .prot = proto.prot };
+        task.mmap_count += 1;
+        task.mmap_active_bm |= @as(u64, 1) << i;
+        return i;
+    }
+    unreachable; // the caller checked that enough slots were free
+}
+
+/// The record layout the split produced, as slot indices (null where that piece does not exist).
+const SplitPieces = struct { head: ?usize, mid: usize, tail: ?usize };
+
+/// Cut the region at `idx` into head, middle and tail records around [old_addr, +old_pages) so the middle is a whole
+/// region. Only the region table changes: the pages, their charges and the locks are untouched.
+fn splitRegionForRange(task: *task_mod.Task, idx: usize, plan: mremap_policy.Plan, old_addr: u64) SplitPieces {
+    const page = user_space.PAGE_SIZE;
+    const r = &task.mmap_regions[idx];
+    const proto = r.*;
+    const mid_base = old_addr;
+    const tail_base = old_addr + plan.mid_pages * page;
+    var pieces = SplitPieces{ .head = null, .mid = idx, .tail = null };
+    if (plan.head_pages != 0) {
+        r.num_pages = plan.head_pages;
+        r.huge_pages = plan.head_huge;
+        pieces.head = idx;
+        pieces.mid = insertAnonPiece(task, &proto, mid_base, plan.mid_pages, plan.mid_huge);
+    } else {
+        r.num_pages = plan.mid_pages;
+        r.huge_pages = plan.mid_huge;
+    }
+    if (plan.tail_pages != 0) pieces.tail = insertAnonPiece(task, &proto, tail_base, plan.tail_pages, plan.tail_huge);
+    return pieces;
+}
+
+/// Merge the region at slot `b` into the one at `a` when both are still there, `b` starts where `a` ends, and nothing
+/// distinguishes them. Used to put back together the pieces a mremap split apart.
+fn mergeIfAdjacent(task: *task_mod.Task, a: usize, b: usize) void {
+    const page = user_space.PAGE_SIZE;
+    const ra = &task.mmap_regions[a];
+    const rb = &task.mmap_regions[b];
+    if (a == b or !ra.active or !rb.active) return;
+    if (ra.base + ra.num_pages * page != rb.base) return;
+    if (!mremap_policy.canCoalesce(regionTraits(ra), regionTraits(rb))) return;
+    ra.num_pages += rb.num_pages;
+    rb.active = false;
+    task.mmap_active_bm &= ~(@as(u64, 1) << @as(u6, @intCast(b)));
+    if (task.mmap_count > 0) task.mmap_count -= 1;
+}
+
+/// After the operation (successful or not), re-merge the pieces of a split that ended up next to each other again.
+fn coalesceAround(cur: *task_mod.Task, pieces: SplitPieces) void {
+    if (pieces.head) |h| mergeIfAdjacent(cur, h, pieces.mid);
+    if (pieces.tail) |t| {
+        mergeIfAdjacent(cur, pieces.mid, t);
+        if (pieces.head) |h| mergeIfAdjacent(cur, h, t);
+    }
+}
+
+/// The part of mremap that runs under the VM lock once the arguments are validated. A range that is only part of a
+/// tracked region is first split off as a region of its own (Linux splits the vma the same way), the whole-region code
+/// then moves or resizes it, and the pieces that end up adjacent again are merged back.
 fn mremapRegion(cur: *task_mod.Task, old_addr: u64, old_pages: u64, new_pages: u64, mflags: u32, new_addr_hint: u64) i64 {
+    const PAGE: u64 = 4096;
+    if (old_addr % PAGE == 0) if (regionContaining(cur, old_addr, old_pages)) |idx| {
+        const r = &cur.mmap_regions[idx];
+        if (r.file_kind == 0 and !r.no_free) {
+            if (mremap_policy.plan(r.base / PAGE, r.num_pages, r.huge_pages, old_addr / PAGE, old_pages)) |plan| {
+                if (plan.needed()) {
+                    const free_slots: u32 = @intCast(cur.mmap_regions.len - @popCount(cur.mmap_active_bm));
+                    if (plan.extraSlots() > free_slots) return -12;
+                    const pieces = splitRegionForRange(cur, idx, plan, old_addr);
+                    const result = mremapExact(cur, old_addr, old_pages, new_pages, mflags, new_addr_hint);
+                    coalesceAround(cur, pieces);
+                    return result;
+                }
+            }
+        }
+    };
+    return mremapExact(cur, old_addr, old_pages, new_pages, mflags, new_addr_hint);
+}
+
+/// mremap for a range that starts at the base of a tracked region (the whole-region logic).
+fn mremapExact(cur: *task_mod.Task, old_addr: u64, old_pages: u64, new_pages: u64, mflags: u32, new_addr_hint: u64) i64 {
     const PAGE: u64 = 4096;
     // Find the mapping region through the occupancy bitmap.
     var bits = cur.mmap_active_bm;

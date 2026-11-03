@@ -175,6 +175,64 @@ static void s_mremap_locks(void) {
     check(madvise(lo, PG, MADV_DONTNEED) == 0, "G: the unlocked neighbour is still unlocked");
 }
 
+/* mremap on a sub-range of a mapping (Linux, measured): the range is split off and moved or resized on its own; the
+ * rest of the mapping stays where it is. */
+static void s_mremap_sub(void) {
+    char *a = (char *)mmap((void *)0, 8 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    for (int i = 0; i < 8; i++) a[i * PG] = (char)(i + 1);
+    char *d = gmap(16);
+    char *r = (char *)mremap(a + 2 * PG, 3 * PG, 3 * PG, MREMAP_MAYMOVE | MREMAP_FIXED, d);
+    check(r == d && d[0] == 3 && d[PG] == 4 && d[2 * PG] == 5, "H: MREMAP_FIXED of 3 pages out of the middle of 8 moves them with their contents");
+    check(mapped(a) && mapped(a + PG) && a[0] == 1 && a[PG] == 2, "H: the head of the mapping stays");
+    check(!mapped(a + 2 * PG) && !mapped(a + 3 * PG) && !mapped(a + 4 * PG), "H: the moved pages are gone from the old place");
+    check(mapped(a + 5 * PG) && a[5 * PG] == 6 && a[6 * PG] == 7 && a[7 * PG] == 8, "H: and the tail stays too");
+
+    char *b = (char *)mmap((void *)0, 8 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    for (int i = 0; i < 8; i++) b[i * PG] = (char)(i + 11);
+    char *g = (char *)mremap(b + 2 * PG, 3 * PG, 6 * PG, MREMAP_MAYMOVE);
+    check(g != MAP_FAILED && g != b + 2 * PG && g[0] == 13 && g[PG] == 14 && g[2 * PG] == 15, "H: growing a range in the middle moves it (the tail is in the way)");
+    check(mapped(b) && mapped(b + PG) && !mapped(b + 2 * PG) && !mapped(b + 3 * PG) && !mapped(b + 4 * PG) && mapped(b + 5 * PG),
+          "H: leaving a hole between the head and the tail");
+    g[5 * PG] = 99;
+    check(g[5 * PG] == 99, "H: and the grown part is usable");
+
+    char *c = (char *)mmap((void *)0, 8 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    errno = 0;
+    check(mremap(c + 2 * PG, 3 * PG, 6 * PG, 0) == MAP_FAILED && errno == ENOMEM, "H: growing in place without MREMAP_MAYMOVE is ENOMEM when the tail blocks it");
+    check(mapped(c) && mapped(c + 7 * PG), "H: and a refused mremap leaves the mapping whole");
+
+    char *e = (char *)mmap((void *)0, 8 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    for (int i = 0; i < 8; i++) e[i * PG] = (char)(i + 21);
+    char *sh = (char *)mremap(e + 2 * PG, 3 * PG, 1 * PG, 0);
+    check(sh == e + 2 * PG && e[2 * PG] == 23, "H: shrinking a range in the middle keeps its address");
+    check(!mapped(e + 3 * PG) && !mapped(e + 4 * PG) && mapped(e) && mapped(e + 5 * PG) && e[5 * PG] == 26, "H: pages 3 and 4 go, the head and the tail stay");
+
+    char *f = (char *)mmap((void *)0, 8 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check(mremap(f + 2 * PG, 3 * PG, 3 * PG, 0) == f + 2 * PG, "H: a same-size mremap of a middle range returns the same address");
+    check(mapped(f + 2 * PG) && mapped(f + 7 * PG), "H: and changes nothing");
+
+    char *h = (char *)mmap((void *)0, 8 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    h[3 * PG] = 33;
+    char *dst = gmap(8);
+    char *m = (char *)mremap(h + 3 * PG, PG, 4 * PG, MREMAP_MAYMOVE | MREMAP_FIXED, dst);
+    check(m == dst && m[0] == 33 && !mapped(h + 3 * PG) && mapped(h) && mapped(h + 7 * PG), "H: a FIXED move of one page out of the middle that also grows it to 4");
+
+    char *j = (char *)mmap((void *)0, 8 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *dst2 = gmap(8);
+    munmap(dst2, 8 * PG); /* an empty destination, so "only 1 page exists there" means the move made one page */
+    char *mv = (char *)mremap(j + 2 * PG, 3 * PG, 1 * PG, MREMAP_MAYMOVE | MREMAP_FIXED, dst2);
+    check(mv == dst2, "H: a FIXED move of 3 pages out of the middle that shrinks them to 1 returns the new address");
+    check(!mapped(j + 2 * PG) && !mapped(j + 3 * PG) && !mapped(j + 4 * PG), "H: and all three old pages are gone from the old place");
+    check(mapped(dst2) && !mapped(dst2 + PG), "H: only 1 page exists at the new place");
+    check(mapped(j) && mapped(j + PG) && mapped(j + 5 * PG) && mapped(j + 7 * PG), "H: and the head and the tail are intact");
+
+    /* A range that ends past the mapping is not a sub-range: Linux allows it, this kernel refuses it (documented). */
+    char *k = (char *)mmap((void *)0, 4 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    errno = 0;
+    char *kr = (char *)mremap(k + 2 * PG, 4 * PG, 4 * PG, MREMAP_MAYMOVE);
+    check(kr == MAP_FAILED, "H: a range that runs past the end of its mapping is refused (this kernel; Linux accepts it)");
+}
+
 static void s_lock(void) {
     limit_pages(8);
     char *p = (char *)mmap((void *)0, 12 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -225,6 +283,7 @@ int main(int argc, char **argv, char **envp) {
     scenario(s_mremap, "scenario C: mremap");
     scenario(s_mremap_replace, "scenario F: MREMAP_FIXED replaces existing mappings");
     scenario(s_mremap_locks, "scenario G: locks follow a MREMAP_FIXED move");
+    scenario(s_mremap_sub, "scenario H: mremap on a sub-range");
     scenario(s_lock, "scenario D: mlock family");
     scenario(s_lockall, "scenario E: mlockall / MAP_LOCKED");
 

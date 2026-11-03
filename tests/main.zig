@@ -2806,6 +2806,84 @@ test "mremap(MREMAP_FIXED) onto existing mappings replaces them, like MAP_FIXED,
     try std.testing.expect(selfov < taken);
 }
 
+test "mremap on a sub-range: the region is split so the range becomes a whole region (head, middle, tail)" {
+    const mp = kt.mremap_policy;
+    const HUGE = 512;
+    // A range strictly inside an 8 page region at page 0x1000: pages 2..4 of 0..7.
+    const a = mp.plan(0x1000, 8, 0, 0x1000 + 2, 3) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 2), a.head_pages);
+    try std.testing.expectEqual(@as(u64, 3), a.mid_pages);
+    try std.testing.expectEqual(@as(u64, 3), a.tail_pages);
+    // New region-table slots: one for the middle (the original stays as the head) and one for the tail.
+    try std.testing.expectEqual(@as(u32, 2), a.extraSlots());
+    // A range at the start of the region: the original becomes the middle, only the tail is new.
+    const b = mp.plan(0x1000, 8, 0, 0x1000, 3) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0), b.head_pages);
+    try std.testing.expectEqual(@as(u64, 5), b.tail_pages);
+    try std.testing.expectEqual(@as(u32, 1), b.extraSlots());
+    // A range that ends where the region ends: the head stays, the middle is new, there is no tail.
+    const c = mp.plan(0x1000, 8, 0, 0x1000 + 5, 3) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 5), c.head_pages);
+    try std.testing.expectEqual(@as(u64, 0), c.tail_pages);
+    try std.testing.expectEqual(@as(u32, 1), c.extraSlots());
+    // The whole region: nothing to split.
+    const d = mp.plan(0x1000, 8, 0, 0x1000, 8) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 0), d.extraSlots());
+    try std.testing.expect(!d.needed());
+    try std.testing.expect(a.needed() and b.needed() and c.needed());
+    // Not inside the region: no plan (the caller keeps its existing errors).
+    try std.testing.expect(mp.plan(0x1000, 8, 0, 0x1000 - 1, 3) == null); // starts before it
+    try std.testing.expect(mp.plan(0x1000, 8, 0, 0x1000 + 6, 3) == null); // runs past its end
+    try std.testing.expect(mp.plan(0x1000, 8, 0, 0x1000 + 8, 1) == null); // starts at its end
+    try std.testing.expect(mp.plan(0x1000, 8, 0, 0x1000, 0) == null); // empty
+    try std.testing.expect(mp.plan(std.math.maxInt(u64) - 2, 8, 0, std.math.maxInt(u64) - 1, 2) == null); // no wraparound
+    // Huge blocks sit at the start of a region (huge-first): the head keeps the whole blocks it still covers, the middle
+    // only when the head is empty, the tail never.
+    const h1 = mp.plan(0x2000, 2 * HUGE, 2, 0x2000 + HUGE, HUGE) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), h1.head_huge);
+    try std.testing.expectEqual(@as(u32, 0), h1.mid_huge);
+    try std.testing.expectEqual(@as(u32, 0), h1.tail_huge);
+    const h2 = mp.plan(0x2000, 2 * HUGE, 2, 0x2000, HUGE) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 0), h2.head_huge);
+    try std.testing.expectEqual(@as(u32, 1), h2.mid_huge);
+    try std.testing.expectEqual(@as(u32, 0), h2.tail_huge);
+    // A block the cut runs through is not counted by the head.
+    const h3 = mp.plan(0x2000, 2 * HUGE, 2, 0x2000 + 10, 20) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 0), h3.head_huge);
+    // Two adjacent pieces can be merged back only when they agree on everything that matters.
+    try std.testing.expect(mp.canCoalesce(.{ .prot = 3, .shared = false, .may_write = true, .file_kind = 0, .no_free = false, .locked = false, .huge_pages = 0 },
+        .{ .prot = 3, .shared = false, .may_write = true, .file_kind = 0, .no_free = false, .locked = false, .huge_pages = 0 }));
+    try std.testing.expect(!mp.canCoalesce(.{ .prot = 3, .shared = false, .may_write = true, .file_kind = 0, .no_free = false, .locked = false, .huge_pages = 0 },
+        .{ .prot = 1, .shared = false, .may_write = true, .file_kind = 0, .no_free = false, .locked = false, .huge_pages = 0 }));
+    try std.testing.expect(!mp.canCoalesce(.{ .prot = 3, .shared = true, .may_write = true, .file_kind = 0, .no_free = false, .locked = false, .huge_pages = 0 },
+        .{ .prot = 3, .shared = false, .may_write = true, .file_kind = 0, .no_free = false, .locked = false, .huge_pages = 0 }));
+    try std.testing.expect(!mp.canCoalesce(.{ .prot = 3, .shared = false, .may_write = true, .file_kind = 2, .no_free = false, .locked = false, .huge_pages = 0 },
+        .{ .prot = 3, .shared = false, .may_write = true, .file_kind = 2, .no_free = false, .locked = false, .huge_pages = 0 })); // file pieces are not merged
+    try std.testing.expect(!mp.canCoalesce(.{ .prot = 3, .shared = false, .may_write = true, .file_kind = 0, .no_free = true, .locked = false, .huge_pages = 0 },
+        .{ .prot = 3, .shared = false, .may_write = true, .file_kind = 0, .no_free = true, .locked = false, .huge_pages = 0 }));
+    try std.testing.expect(!mp.canCoalesce(.{ .prot = 3, .shared = false, .may_write = true, .file_kind = 0, .no_free = false, .locked = false, .huge_pages = 1 },
+        .{ .prot = 3, .shared = false, .may_write = true, .file_kind = 0, .no_free = false, .locked = false, .huge_pages = 0 }));
+    try std.testing.expect(!mp.canCoalesce(.{ .prot = 3, .shared = false, .may_write = true, .file_kind = 0, .no_free = false, .locked = true, .huge_pages = 0 },
+        .{ .prot = 3, .shared = false, .may_write = true, .file_kind = 0, .no_free = false, .locked = false, .huge_pages = 0 }));
+}
+
+test "mremap splits the region before it looks for one that starts at old_addr, and merges the pieces back on failure" {
+    const src = kt.mmap_mlock_source;
+    const fn_start = std.mem.indexOf(u8, src, "fn mremapRegion(") orelse return error.TestUnexpectedResult;
+    const preflight = std.mem.indexOfPos(u8, src, fn_start, "if (plan.extraSlots() > free_slots) return -12;") orelse return error.TestUnexpectedResult;
+    const split = std.mem.indexOfPos(u8, src, fn_start, "splitRegionForRange(cur, idx, plan, old_addr)") orelse return error.TestUnexpectedResult;
+    const exact = std.mem.indexOfPos(u8, src, split, "mremapExact(cur, old_addr, old_pages, new_pages, mflags, new_addr_hint)") orelse return error.TestUnexpectedResult;
+    const back = std.mem.indexOfPos(u8, src, exact, "coalesceAround(cur,") orelse return error.TestUnexpectedResult;
+    // The free-slot preflight happens before the first change, the split before the whole-region logic, and the merge
+    // runs after it whatever its result was (it is not inside an `if (result >= 0)`).
+    try std.testing.expect(fn_start < preflight and preflight < split and split < exact and exact < back);
+    try std.testing.expect(std.mem.indexOf(u8, src[exact..back], "if (result") == null);
+    // File-backed and device regions are not split (their backing references and fault metadata stay whole-region).
+    try std.testing.expect(std.mem.indexOf(u8, src[fn_start..preflight], "r.file_kind == 0 and !r.no_free") != null);
+    // The pure policy owns the layout.
+    try std.testing.expect(std.mem.indexOf(u8, src, "mremap_policy.plan(") != null);
+}
+
 test "MAP_LOCKED is a real mmap flag now: it is accepted, and acted on rather than ignored" {
     try std.testing.expect(mmap_policy.flagsValid(mmap_policy.MAP_PRIVATE | mmap_policy.MAP_ANONYMOUS | mmap_policy.MAP_LOCKED));
     try std.testing.expectEqual(@as(u64, 0x2000), mmap_policy.MAP_LOCKED);
