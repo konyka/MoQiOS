@@ -57,6 +57,8 @@
 #define SYS_nanosleep   35
 #define SYS_gettimeofday 96
 #define SYS_clock_gettime 228
+#define SYS_clock_nanosleep 247
+#define SYS_clock_getres 269
 
 /* Environment / directories (MoQiOS-specific) */
 #define SYS_getenv      105

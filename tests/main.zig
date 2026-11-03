@@ -8298,9 +8298,28 @@ test "clock ids: which clock reads which time source, and which ones sleep/timer
     try std.testing.expect(ts.sourceOf(99) == null);
     // negative clock ids are dynamic clocks (fd-based): not supported
     try std.testing.expect(ts.sourceOf(@bitCast(@as(i64, -1))) == null);
-    // only the wall-clock and monotonic families can be slept on or used for timers
-    try std.testing.expect(ts.sleepable(0) and ts.sleepable(1) and ts.sleepable(4) and ts.sleepable(5) and ts.sleepable(6) and ts.sleepable(7));
-    try std.testing.expect(!ts.sleepable(2) and !ts.sleepable(3) and !ts.sleepable(8));
+    // which clocks clock_nanosleep accepts (verdicts below)
+    // clock_nanosleep (measured on Linux): REALTIME, MONOTONIC and BOOTTIME sleep; MONOTONIC_RAW, the two COARSE clocks
+    // and THREAD_CPUTIME are EOPNOTSUPP (95); unknown ids are EINVAL. PROCESS_CPUTIME really sleeps on Linux (until that
+    // much CPU time has passed, which never comes while asleep); here it stays EINVAL, a documented difference.
+    const V = ts.SleepVerdict;
+    try std.testing.expectEqual(V.ok, ts.sleepVerdict(0));
+    try std.testing.expectEqual(V.ok, ts.sleepVerdict(1));
+    try std.testing.expectEqual(V.ok, ts.sleepVerdict(7));
+    try std.testing.expectEqual(V.not_supported, ts.sleepVerdict(4));
+    try std.testing.expectEqual(V.not_supported, ts.sleepVerdict(5));
+    try std.testing.expectEqual(V.not_supported, ts.sleepVerdict(6));
+    try std.testing.expectEqual(V.not_supported, ts.sleepVerdict(3));
+    try std.testing.expectEqual(V.invalid, ts.sleepVerdict(2));
+    try std.testing.expectEqual(V.invalid, ts.sleepVerdict(8));
+    try std.testing.expectEqual(V.invalid, ts.sleepVerdict(99));
+    try std.testing.expectEqual(V.invalid, ts.sleepVerdict(@bitCast(@as(i64, -1))));
+    try std.testing.expectEqual(@as(i64, -95), ts.sleepErrno(ts.sleepVerdict(4)));
+    try std.testing.expectEqual(@as(i64, -22), ts.sleepErrno(ts.sleepVerdict(2)));
+    try std.testing.expectEqual(@as(i64, 0), ts.sleepErrno(ts.sleepVerdict(1)));
+    // The syscall asks for the verdict, not a bare boolean.
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "const sleep_verdict = clock_ids.sleepVerdict(clockid);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "if (sleep_verdict != .ok) return clock_ids.sleepErrno(sleep_verdict);") != null);
     // coarse clocks report a coarser resolution than the precise ones
     try std.testing.expectEqual(@as(u64, 1), ts.resolutionNs(1));
     try std.testing.expectEqual(@as(u64, 1_000_000), ts.resolutionNs(6));

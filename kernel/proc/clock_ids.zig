@@ -28,11 +28,25 @@ pub fn sourceOf(clockid: u64) ?Source {
     };
 }
 
-/// clock_nanosleep / timers: the CPU-time clocks cannot be waited on here.
-pub fn sleepable(clockid: u64) bool {
-    return switch (sourceOf(clockid) orelse return false) {
-        .realtime, .monotonic => true,
-        .process_cpu, .thread_cpu => false,
+/// What clock_nanosleep says about a clock id (measured on Linux): REALTIME, MONOTONIC and BOOTTIME sleep;
+/// MONOTONIC_RAW, REALTIME_COARSE, MONOTONIC_COARSE and THREAD_CPUTIME are EOPNOTSUPP; unknown ids are EINVAL.
+/// PROCESS_CPUTIME_ID really sleeps on Linux (until that much CPU time passes, which a sleeping process never
+/// accumulates); that cannot be modelled here, so it stays EINVAL, a documented difference.
+pub const SleepVerdict = enum { ok, not_supported, invalid };
+
+pub fn sleepVerdict(clockid: u64) SleepVerdict {
+    return switch (clockid) {
+        CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME => .ok,
+        CLOCK_MONOTONIC_RAW, CLOCK_REALTIME_COARSE, CLOCK_MONOTONIC_COARSE, CLOCK_THREAD_CPUTIME_ID => .not_supported,
+        else => .invalid,
+    };
+}
+
+pub fn sleepErrno(v: SleepVerdict) i64 {
+    return switch (v) {
+        .ok => 0,
+        .not_supported => -95,
+        .invalid => -22,
     };
 }
 

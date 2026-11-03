@@ -41,7 +41,7 @@ int main(void) {
     assert(MCL_CURRENT == 1 && MCL_FUTURE == 2 && MCL_ONFAULT == 4 && MLOCK_ONFAULT == 1);
     assert(MAP_FAILED == (void *)-1);
     assert(EPERM == 1 && ENOMEM == 12 && EAGAIN == 11 && EINVAL == 22 && EFAULT == 14 && EACCES == 13);
-    assert(EEXIST == 17 && ENODEV == 19 && ENOSYS == 38 && EBADF == 9 && EOVERFLOW == 75);
+    assert(EEXIST == 17 && ENODEV == 19 && ENOSYS == 38 && EBADF == 9 && EOVERFLOW == 75 && EOPNOTSUPP == 95);
     /* The system call numbers are the kernel's. */
     assert(SYS_mmap == 8 && SYS_munmap == 12 && SYS_mremap == 25 && SYS_mprotect == 164 && SYS_madvise == 235);
     assert(SYS_mincore == 251 && SYS_mlock == 252 && SYS_munlock == 253 && SYS_msync == 254);

@@ -6267,3 +6267,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异（host）：去掉 `fixedReplaceable`、去掉 `moveChargesOk` 都被抓住；**"先把目标的锁从表里去掉再算搬迁后的表"这一步的变异没有被 host 测试抓住**（`base_table.releaseLossy` 去掉后全部 1000 个测试仍通过）。这一步的效果只能在目标上看到（`hello200` 的 G 场景：满额锁定下把锁着的源搬到锁着的目标上、之后还能再锁一页），所以那里是它唯一的防线。
 - 目标上验证：`hello200` 67 项全部通过。第一次跑时 F、G 两组失败，原因是探针自己的缺陷：相邻的匿名映射（同保护位）会合并成一个跟踪区域，而内核只搬整个区域（搬其中一部分是 `EINVAL`），所以我把探针用的映射用 `munmap` 隔开（`gmap`），内核没改。
 - 如实说明：①对映射**中间子范围**做 `MREMAP_FIXED` 搬移仍是 `EINVAL`（Linux 能搬），探针为此要隔开映射，这是一个真实的功能缺口；②`mmap_min_addr`（搬到 `0x1000` 的 `EPERM`）没做，这里是 `ENOMEM`/`EINVAL`；③上面说的锁表变异只在目标上才有防线。
+
+## libc 的 time API（hello201）
+
+- 做的事：libc 之前没有任何时间接口（只有裸的 `nanosleep`），所以普通程序读不了时间、也无法 `sleep`。补上 `include/time.h` / `src/time.c`：`clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`sleep`、`usleep`，加 `struct timespec`/`timeval`、`CLOCK_*`。`moqi_syscalls.h` 补了 `SYS_clock_nanosleep`(247)、`SYS_clock_getres`(269)。
+- 先取对照标准（宿主机 glibc，`/tmp/tm.c`、`cn.c`、`cn2.c`）：常量值；坏时钟 `EINVAL`、`clock_getres` 的结果指针可为 NULL；`nanosleep` 的负秒/nsec≥1e9/负 nsec 都是 `EINVAL`；`clock_nanosleep` 的错误是**返回值**不是 errno；`usleep(1000000)` 在 glibc 里成功（不是 `EINVAL`）；`sleep(0)` 是 0。
+- 测量过程里的一个插曲：我的第一个测量程序对 NULL 调 glibc 的 `clock_gettime` 直接崩了（glibc 用 vDSO，不做指针检查），改成直接 `syscall()` 才得到内核的 `EFAULT`；另一个测量程序对 `CLOCK_PROCESS_CPUTIME_ID` 做 `clock_nanosleep` 卡住了 60 秒——**这本身就是结论**：Linux 上这个时钟真的会睡（等进程用掉那么多 CPU 时间），睡着的进程永远等不到。
+- TDD：`test_time_abi.c` 先写（`time.h` 不存在，编译失败=红）。变异 11 个，其中 3 个第一轮没被抓住并补了测试：去掉 `errno != EINTR` 的判断（补了"非信号失败时返回全部秒数"）、去掉 `sleep(0)` 的提前返回（补了"不进内核"）、错误窗口改成 `< 0`（补了 -4095/-4096 边界）。一个变异（把 `gettimeofday` 的 `tz` 改成 0）因参数未使用在 `-Werror` 下编译失败，不算有效变异。
+- 经由测量发现的内核差异（已修）：Linux 的 `clock_nanosleep` 对 `CLOCK_MONOTONIC_RAW`、`CLOCK_REALTIME_COARSE`、`CLOCK_MONOTONIC_COARSE`、`CLOCK_THREAD_CPUTIME_ID` 返回 `EOPNOTSUPP`(95)，这里原来把前三个当成可睡的、把后一个当 `EINVAL`。host 测试先写（`sleepVerdict`/`sleepErrno` 不存在，编译失败），再实现；`syscall_entry.zig` 里用判决值而不是布尔。`hello132`/`hello102` 只用 MONOTONIC 和未知时钟，不受影响。
+- 目标上验证：`hello201`（29 项）全部通过：时钟读数单调、各时钟 id 都能读、`gettimeofday`/`time`/`CLOCK_REALTIME` 互相一致、`nanosleep`/`usleep`/`sleep(1)`/`clock_nanosleep`（相对和 `TIMER_ABSTIME`，含已过去的绝对时间）都真的睡够了时间、错误形态正确、四个 `EOPNOTSUPP` 时钟。
+- 如实说明：①`CLOCK_PROCESS_CPUTIME_ID` 的 `clock_nanosleep` 这里仍是 `EINVAL`（Linux 会睡）；②没有 `localtime`/`gmtime`/`strftime`/`mktime`；③没有 `timer_create`、`setitimer` 封装；④`sleep` 被信号中断的路径只在宿主机用桩测了，目标探针没有触发 `EINTR`（`hello102` 在内核层测过 `alarm` 打断 `clock_nanosleep`）。

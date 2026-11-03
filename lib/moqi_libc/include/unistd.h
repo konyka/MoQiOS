@@ -8,6 +8,8 @@
 
 #include <stddef.h>
 
+#include "time.h"
+
 #define STDIN_FILENO  0
 #define STDOUT_FILENO 1
 #define STDERR_FILENO 2
@@ -28,11 +30,6 @@
  * stack (System V layout: envp array follows the NULL-terminated argv
  * array). NULL/empty when the kernel passed no environment. */
 extern char **environ;
-
-struct timespec {
-    long tv_sec;
-    long tv_nsec;
-};
 
 long read(int fd, void *buf, size_t count);
 long write(int fd, const void *buf, size_t count);
@@ -58,7 +55,6 @@ long pipe(int fds[2]);
 long dup2(int oldfd, int newfd);
 
 long yield(void);
-long nanosleep(const struct timespec *req, struct timespec *rem);
 
 void *brk(void *addr);
 void *sbrk(long increment);

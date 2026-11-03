@@ -85,10 +85,6 @@ long yield(void) {
     return syscall0(SYS_yield);
 }
 
-long nanosleep(const struct timespec *req, struct timespec *rem) {
-    return syscall2(SYS_nanosleep, (long)req, (long)rem);
-}
-
 void *brk(void *addr) {
     return (void *)syscall1(SYS_brk, (long)addr);
 }

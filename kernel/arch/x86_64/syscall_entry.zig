@@ -4326,7 +4326,8 @@ fn syscallClockNanosleep(clockid: u32, flags: u32, req_ptr: u64, rem_ptr: u64) i
     const sleep_policy = @import("../../proc/sleep_policy.zig");
     const tsc = @import("../../arch/x86_64/tsc.zig");
     const clock_ids = @import("../../proc/clock_ids.zig");
-    if (!clock_ids.sleepable(clockid)) return -22;
+    const sleep_verdict = clock_ids.sleepVerdict(clockid);
+    if (sleep_verdict != .ok) return clock_ids.sleepErrno(sleep_verdict);
     if (flags & ~time_policy.TIMER_ABSTIME != 0) return -22;
     const ts = readUserTimespec(req_ptr) orelse return -14;
     // The whole realtime family waits against the wall clock, the rest against the monotonic one.
