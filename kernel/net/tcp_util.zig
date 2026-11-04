@@ -93,6 +93,25 @@ pub fn deliverySampleUsable(delivered: u32, smss: u32, elapsed_ms: u32) bool {
     return delivered > @max(smss, 1);
 }
 
+/// The slowest pacing rate that still lets the congestion window turn over once
+/// per round trip: cwnd / RTT in bytes per second (an unmeasured RTT counts as
+/// 1 ms). Pacing below this only delays a window the sender is already allowed
+/// to use.
+pub fn paceRateFloor(cwnd: u32, srtt_ms: u32) u32 {
+    const v = (@as(u64, cwnd) * 1000) / @max(srtt_ms, 1);
+    return @intCast(@min(v, @as(u64, 0xffff_ffff)));
+}
+
+/// Pacing rate for a delivery-rate estimate `rate` (0 = no estimate, no
+/// pacing). One low estimate from a handful of delayed ACKs must not become a
+/// permanent speed limit: at a few kB/s the sender emits one segment per ACK,
+/// every sample is then a single segment and rejected, and the estimate never
+/// rises again. The window-per-RTT floor breaks that loop.
+pub fn pacedRate(rate: u32, cwnd: u32, srtt_ms: u32) u32 {
+    if (rate == 0) return 0;
+    return @max(rate, paceRateFloor(cwnd, srtt_ms));
+}
+
 /// Payload bytes a ring may hold. SO_SNDBUF / SO_RCVBUF store the doubled
 /// value (the extra half covers per-skb bookkeeping on Linux); the payload the
 /// buffer holds is half of it, never more than the ring itself (one slot is

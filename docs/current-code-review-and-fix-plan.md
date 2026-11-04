@@ -6509,3 +6509,10 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修复：`signal_syscall.zig` 新增 `waitForSignal(cur_idx, cur)`——`rtSigsuspend` 里已有的"挂起直到出现可处理的信号"循环（先检查、再标记阻塞、再检查一次以防丢信号）抽出来共用；`pause()` 用它，随后若有默认动作为终止的信号则按同样方式结束进程，否则返回 `-EINTR`，分发器随后在返回用户态前投递信号（与 `sigsuspend` 一致）。`gettid()` 用新的 497 号（原来空着）返回调用任务自己的 `tid`。host 测试（源码结构断言）：`sigsuspend` 不再自带循环、`pause` 的分发项不再含 `forceReschedule`、`gettid` 的接线。
 - 验证：`hello225` 红→绿，SMP=8 连续 5 次通过；host 1015/1015。
 - 如实说明：①`alarm()` 返回值是向下取整的剩余秒数（`itimer_policy` 里的既有行为，不是这次改的），C 组因此接受 5 或 4；②`pause()` 目前不处理 `SA_RESTART` 之类的重启语义（`pause` 本来就不重启）；③libc 一侧的 `abort`/`raise`/`atexit`/`assert`/`signal`/`sigset_t`/`getopt`/`perror`/`remove`/`rename`/`isatty` 等**还没有做**，这一轮只提交内核缺陷的修复。
+
+## hello174 排空偶发失败：发送节拍被低速率估计锁死的加固（含诊断数据）
+
+- 数据：压力门禁（SMP=2）第 2 轮 `hello174` C 组失败，首次留下了失败现场：`drain_got=55232 / total+1=81464`，`drain_elapsed_ms=10002`，`drain_receiver_fionread=0`，`drain_sender_outq=26232`，`/proc/lostats` 为 `queued=2209 delivered=2209 dropped=0`。解读：回环队列没有丢帧（"窗口更新 ACK 被队列丢掉"的推测被排除）；10 秒里平均只有约 5.5 kB/s，接收方已读空、发送方环里还剩 26 kB。这是"发送方一直慢速发送"，不是一次长停滞。
+- 机理（推断，未在失败现场直接观测）：`bbrPacedRate` 把 `delivery_rate` 当发送节拍，每段间隔 `mss*1000/rate` 毫秒；5.5 kB/s 对应约 264 ms 一段。节拍之后每个 ACK 只覆盖一个段，而 `deliverySampleUsable` 会拒绝"不超过一个 MSS"的样本（hello173 修的同一类问题），所以估计永远升不回去。hello173 的修复只挡住了"应用受限的小样本"这一条入口，没有给节拍本身设下限。
+- 修复（加固）：`tcp_util.pacedRate(rate, cwnd, srtt_ms)` 把节拍速率下限设为 `cwnd / srtt`（一个 RTT 发完一个窗口；RTT 未测时按 1 ms），`bbrPacedRate` 的两个返回路径（Startup/ProbeRTT 与 ProbeBW）都经过它；没有速率估计（`rate==0`）时仍不节拍。host 测试先红后绿（`paceRateFloor`/`pacedRate` 的数值与 `bbrPacedRate` 接线）。
+- 如实说明：①这个偶发失败只在 CI 与一次本地压力轮里各出现过，本地 12+1+3 次定向复现从未命中，所以**无法用"修复前失败、修复后通过"来证明**因果；修复依据是上面的失败现场数据与机理推断，不是复现。②`hello174` 在失败时现在还会打印每秒累计已读字节与最长读间隔，下次再失败可以直接区分"均匀慢速"与"突发"。③下限只会让发送更快，不会降低任何已有的发送速率。

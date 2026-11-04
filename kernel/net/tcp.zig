@@ -1819,10 +1819,11 @@ fn bbrCycleGainFor(tcb: *const TcpTcb) u32 {
 fn bbrPacedRate(tcb: *const TcpTcb) u32 {
     const rate = tcb.delivery_rate;
     if (rate == 0) return 0;
-    if (tcb.bbr_startup or tcb.bbr_probe_rtt) return rate;
+    if (tcb.bbr_startup or tcb.bbr_probe_rtt) return tcp_util.pacedRate(rate, tcb.cwnd, tcb.srtt);
     const gain = bbrCycleGainFor(tcb);
     const v = (@as(u64, rate) * gain) / 4;
-    return @intCast(@min(v, @as(u64, 0xffff_ffff)));
+    const v32: u32 = @intCast(@min(v, @as(u64, 0xffff_ffff)));
+    return tcp_util.pacedRate(v32, tcb.cwnd, tcb.srtt);
 }
 
 /// Record CUBIC W_max at congestion; epoch restarts on next CA (SK-124).

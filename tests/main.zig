@@ -9815,6 +9815,29 @@ test "TCP delivery-rate samples: only bulk, recent acknowledgements measure the 
     try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "if (tcp_util.deliverySampleUsable(delivered, mssForTcb(tcb), elapsed)) {") != null);
 }
 
+test "TCP pacing never drops below one congestion window per RTT, so a collapsed delivery-rate estimate cannot lock the sender" {
+    const tu = kt.tcp_util;
+    // The stuck state seen in hello174: a 5.5 kB/s estimate, a two-segment window, ~100 ms RTT (delayed ACKs).
+    // Paced at 5.5 kB/s a segment leaves every ~264 ms, each ACK covers one segment, and a one-segment
+    // sample is rejected, so the estimate can never rise again.
+    try std.testing.expectEqual(@as(u32, 29200), tu.paceRateFloor(2920, 100));
+    try std.testing.expectEqual(@as(u32, 29200), tu.pacedRate(5530, 2920, 100));
+    // At that floor a delayed ACK covers two segments and the sample is usable and higher than the stuck estimate.
+    try std.testing.expect(tu.deliverySampleUsable(2920, 1460, 100));
+    try std.testing.expect(tu.pacedRate(5530, 2920, 100) > 5530);
+    // A healthy estimate above the floor is left alone.
+    try std.testing.expectEqual(@as(u32, 1_000_000), tu.pacedRate(1_000_000, 14600, 100));
+    // No estimate yet means no pacing at all, whatever the window.
+    try std.testing.expectEqual(@as(u32, 0), tu.pacedRate(0, 14600, 100));
+    // No RTT sample yet: treat it as 1 ms rather than dividing by zero.
+    try std.testing.expectEqual(@as(u32, 2_920_000), tu.paceRateFloor(2920, 0));
+    // Saturates instead of wrapping.
+    try std.testing.expectEqual(@as(u32, 0xffff_ffff), tu.paceRateFloor(0xffff_ffff, 1));
+    try std.testing.expectEqual(@as(u32, 0), tu.paceRateFloor(0, 100));
+    // The pacer consults it.
+    try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "tcp_util.pacedRate(v32, tcb.cwnd, tcb.srtt)") != null);
+}
+
 test "SO_SNDBUF / SO_RCVBUF values: doubling, minimums and the rmem_max cap never overflow" {
     const p = kt.sockopt_policy;
     // Runtime-known requests: with comptime arguments the whole call folds at compile time and hides a narrowed integer type.
