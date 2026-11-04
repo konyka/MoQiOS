@@ -49,14 +49,21 @@ static int make_tree(const char *path) {
     return 0;
 }
 
+#define FLIPS 4000
+
+/* The run is bounded by the flipper's work, not by time: it makes FLIPS directory changes and then stops the readers. (A
+ * version that ran the readers for a fixed time ran seven minutes on one CPU, where four spinning readers starve a sleeping
+ * main thread.) */
 static void *flipper(void *arg) {
     (void)arg;
     long n = 0;
-    while (!stop) {
+    while (n < FLIPS) {
         if (chdir((n & 1) ? dir_a : dir_b) != 0) chdir_errors++;
         n++;
+        if ((n & 63) == 0) yield();
     }
     chdirs_done = n;
+    stop = 1;
     return (void *)0;
 }
 
@@ -71,6 +78,7 @@ static void *getcwd_reader(void *arg) {
             if (strlen(buf) != want || (strcmp(buf, dir_a) != 0 && strcmp(buf, dir_b) != 0)) torn++;
         }
         n++;
+        if ((n & 255) == 0) yield();
     }
     torn_getcwd += torn;
     reads_done += n;
@@ -93,6 +101,7 @@ static void *open_reader(void *arg) {
             close(fd);
         }
         n++;
+        if ((n & 63) == 0) yield();
     }
     torn_open += torn;
     opens_done += n;
@@ -133,18 +142,12 @@ int main(int argc, char **argv, char **envp) {
         while (pthread_create(&t[i], (void *)0, fns[i], (void *)0) != 0 && tries++ < 1000) yield();
         if (tries < 1000) created++;
     }
-    /* run for a fixed number of scheduler rounds of the main thread, not wall-clock time, so the load is similar everywhere */
-    for (int i = 0; i < 400; i++) {
-        yield();
-        usleep(5000);
-    }
-    stop = 1;
     for (int i = 0; i < created; i++) {
         void *rv;
         pthread_join(t[i], &rv);
     }
     check(created == 5, "B: one thread flipping the directory and four readers ran");
-    check(chdirs_done > 1000 && reads_done > 1000 && opens_done > 1000 && chdir_errors == 0, "B: and did a good number of operations each, with no chdir failing");
+    check(chdirs_done == FLIPS && reads_done > 100 && opens_done > 100 && chdir_errors == 0, "B: the flipper made all 4000 directory changes, none failed, and the readers did real work meanwhile");
     check(torn_getcwd == 0, "B: getcwd never returned a path that was half one directory and half the other");
     check(torn_open == 0, "B: a relative open never failed or opened a file from a directory that was not current");
 
