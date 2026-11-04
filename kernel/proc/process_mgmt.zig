@@ -21,6 +21,14 @@ pub fn getpid() i64 {
     return 0;
 }
 
+/// gettid() → the calling task's own tid (a thread's id, which differs from getpid() for every thread but the first).
+pub fn gettid() i64 {
+    if (sched_mod.currentTaskIndex()) |idx| {
+        if (task_mod.getTask(idx)) |current| return @intCast(current.tid);
+    }
+    return 0;
+}
+
 /// getenv(key_ptr, val_ptr, val_max) → value length or -1
 pub fn getenv(key_ptr: u64, val_ptr: u64, val_max: u64) i64 {
     if (key_ptr == 0 or key_ptr >= 0x0000_8000_0000_0000) return -22;

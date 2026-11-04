@@ -4031,6 +4031,29 @@ test "lo queue rejects empty and oversized frames" {
     try std.testing.expectEqualSlices(u8, &max_frame, &out);
 }
 
+test "pause() and sigsuspend() share one wait for a deliverable signal, and gettid() names the calling thread" {
+    // pause() used to reschedule once and return -EINTR whatever happened, so a program that paused for a signal ran on at
+    // once (hello225 saw the handler had not run, and the call returned after ~0 ms instead of ~1 s).
+    const ss = kt.signal_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "pub fn waitForSignal(cur_idx: u32, cur: *task_mod.Task) void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "pub fn pause() i64 {") != null);
+    // sigsuspend's wait loop is the shared helper, not a second copy
+    const sus = std.mem.indexOf(u8, ss, "pub fn rtSigsuspend").?;
+    const sus_end = std.mem.indexOf(u8, ss[sus..], "\n}\n").? + sus;
+    try std.testing.expect(std.mem.indexOf(u8, ss[sus..sus_end], "waitForSignal(cur_idx, cur);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss[sus..sus_end], "task_mod.blockTask") == null);
+    // the dispatcher calls pause() and delivers the signal before returning, like sigsuspend
+    const se = kt.syscall_entry_source;
+    const p34 = std.mem.indexOf(u8, se, "34 => { // pause()").?;
+    const p34_end = std.mem.indexOf(u8, se[p34..], "},").? + p34;
+    try std.testing.expect(std.mem.indexOf(u8, se[p34..p34_end], "signal_syscall_mod.pause()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se[p34..p34_end], "checkSignalsOnSyscallReturn(frame);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se[p34..p34_end], "forceReschedule") == null);
+    // gettid: syscall 497, the calling task's own tid (getpid returns the thread group id)
+    try std.testing.expect(std.mem.indexOf(u8, se, "497 => { // gettid()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.process_mgmt_source, "pub fn gettid() i64 {") != null);
+}
+
 test "lo queue counts frames queued, delivered, dropped and its high-water mark" {
     var q = lo.LoopbackQueue.init();
     const frame = [_]u8{0x42} ** 64;

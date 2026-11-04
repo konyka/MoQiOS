@@ -1897,10 +1897,12 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             const cmd: i32 = @bitCast(@as(u32, @truncate(frame.rsi)));
             frame.rax = @bitCast(shm_mod.shmctl(@truncate(frame.rdi), cmd, frame.rdx));
         },
-        34 => { // pause() — block until signal delivered
-            const sched = @import("../../proc/sched.zig");
-            sched.forceReschedule();
-            frame.rax = @bitCast(@as(i64, -4)); // EINTR: always interrupted
+        34 => { // pause() — sleep until a signal is delivered, then -EINTR
+            frame.rax = @bitCast(signal_syscall_mod.pause());
+            checkSignalsOnSyscallReturn(frame);
+        },
+        497 => { // gettid() — the calling thread's own id (getpid() is the thread group's)
+            frame.rax = @bitCast(proc_mgmt_mod.gettid());
         },
         36 => { // getitimer(which, curr_value)
             frame.rax = @bitCast(syscallGetitimer(@truncate(frame.rdi), frame.rsi));

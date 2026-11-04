@@ -259,9 +259,18 @@ void _start(void) {
         int64_t t0 = now_ms();
         int64_t last_progress = t0;
         long reads = 0, empty_reads = 0;
+        /* When bytes arrived: the receiver's total at the end of each second of the drain, and the longest silence between reads. */
+        long got_at_sec[11] = { 0 };
+        int64_t longest_gap = 0;
         while (got < total + 1 && now_ms() - t0 < 10000) {
             int64_t r = syscall3(SYS_READ, (uint64_t)s, (uint64_t)drain, 4096);
-            if (r > 0) { got += r; last_progress = now_ms(); reads++; } else { empty_reads++; pump(10); }
+            int64_t t = now_ms();
+            if (r > 0) {
+                if (t - last_progress > longest_gap) longest_gap = t - last_progress;
+                got += r; last_progress = t; reads++;
+            } else { empty_reads++; pump(10); }
+            int64_t sec = (now_ms() - t0) / 1000;
+            if (sec >= 0 && sec <= 10) got_at_sec[sec] = got;
         }
         int drained = got >= total + 1;
         check(drained, "C: reading drains everything that was accepted within 10 s, and the window reopens");
@@ -269,6 +278,8 @@ void _start(void) {
             note("drain_got", got); note("drain_total_plus_1", total + 1); note("drain_elapsed_ms", now_ms() - t0);
             note("drain_stalled_for_ms", now_ms() - last_progress); note("drain_reads", reads); note("drain_empty_reads", empty_reads);
             note("drain_receiver_fionread", ioctl_int(s, FIONREAD)); note("drain_sender_outq", ioctl_int(c, TIOCOUTQ));
+            note("drain_longest_gap_ms", longest_gap);
+            for (int k = 0; k < 11; k++) { print("hello174:   .. drain_got_by_second_"); print_dec(k); print("="); print_dec(got_at_sec[k]); print("\n"); }
         }
         print_lostats(drained ? "after the drain" : "at the failed drain");
         syscall1(SYS_CLOSE, c);

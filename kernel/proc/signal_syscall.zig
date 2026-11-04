@@ -398,11 +398,19 @@ pub fn rtSigsuspend(mask_ptr: u64, sigsetsize: u64) i64 {
     // It used to return EINTR at once and leave the temporary mask in place.
     const saved = cur.signal_mask;
     cur.signal_mask = action_policy.sanitizeMask(new_mask);
+    waitForSignal(cur_idx, cur);
+    if (sig_mod.pendingFatal(cur)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+    cur.saved_sigmask = saved;
+    cur.restore_sigmask_pending = true;
+    return -4; // EINTR
+}
+
+/// Sleep until a signal that can be acted on arrives (a handler to run, or a default action that terminates), under the
+/// task's current mask. A signal that is already pending returns at once; one raised between the check and the block is not
+/// lost (the check is repeated after the task is marked blocked, and sendSignal wakes a blocked task).
+pub fn waitForSignal(cur_idx: u32, cur: *task_mod.Task) void {
     while (!sig_mod.pendingActionable(cur) and sig_mod.pendingFatal(cur) == null) {
         task_mod.blockTask(cur_idx);
-        // sendSignal → kickIfBlocked unblocks us once the signal is pending
-        // and actionable under the current (temporary) mask. Re-check after
-        // blocking so a signal raced in before the block is not lost.
         if (sig_mod.pendingActionable(cur) or sig_mod.pendingFatal(cur) != null) {
             task_mod.unblockTask(cur_idx);
             break;
@@ -410,9 +418,15 @@ pub fn rtSigsuspend(mask_ptr: u64, sigsetsize: u64) i64 {
         sched.forceReschedule();
         sched.repairCurrentAfterBlock();
     }
+}
+
+/// pause() → -EINTR once a signal has been caught (the dispatcher runs the handler before returning to user mode). A signal
+/// whose default action terminates the process ends it here, exactly as it would anywhere else.
+pub fn pause() i64 {
+    const cur_idx = sched.currentTaskIndex() orelse return -1;
+    const cur = task_mod.getTask(cur_idx) orelse return -1;
+    waitForSignal(cur_idx, cur);
     if (sig_mod.pendingFatal(cur)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
-    cur.saved_sigmask = saved;
-    cur.restore_sigmask_pending = true;
     return -4; // EINTR
 }
 

@@ -294,6 +294,7 @@ pub const main_source = @embedFile("main.zig");
 pub const lapic_source = @embedFile("arch/x86_64/lapic.zig");
 pub const unsupported_policy = @import("proc/unsupported_policy.zig");
 pub const signal_syscall_source = @embedFile("proc/signal_syscall.zig");
+pub const process_mgmt_source = @embedFile("proc/process_mgmt.zig");
 pub const file_io_source = @embedFile("fs/file_io.zig");
 pub const mmap_source = @embedFile("mm/mmap.zig");
 pub const copy_from_user_source = @embedFile("mm/copy_from_user.zig");
