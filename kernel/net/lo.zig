@@ -22,6 +22,57 @@ const FrameSlot = struct {
     data: [MAX_FRAME]u8,
 };
 
+/// Counters of the loopback queue since boot (see /proc/lostats). A frame the full queue refuses is only counted here: nothing
+/// retransmits it at this layer, TCP's own timers do.
+pub const Stats = struct {
+    queued: u64,
+    delivered: u64,
+    dropped: u64,
+    high_water: u32,
+    depth: u32,
+};
+
+/// "queued=N delivered=N dropped=N high_water=N depth=N\n", cut off at the buffer's end; returns the length.
+pub fn formatStats(s: Stats, buf: []u8) usize {
+    var n: usize = 0;
+    const parts = [_]struct { name: []const u8, value: u64 }{
+        .{ .name = "queued=", .value = s.queued },
+        .{ .name = " delivered=", .value = s.delivered },
+        .{ .name = " dropped=", .value = s.dropped },
+        .{ .name = " high_water=", .value = s.high_water },
+        .{ .name = " depth=", .value = s.depth },
+    };
+    for (parts) |p| {
+        for (p.name) |c| {
+            if (n == buf.len) return n;
+            buf[n] = c;
+            n += 1;
+        }
+        var digits: [20]u8 = undefined;
+        var d: usize = 0;
+        var v = p.value;
+        if (v == 0) {
+            digits[0] = '0';
+            d = 1;
+        }
+        while (v != 0) : (v /= 10) {
+            digits[d] = '0' + @as(u8, @intCast(v % 10));
+            d += 1;
+        }
+        while (d > 0) {
+            d -= 1;
+            if (n == buf.len) return n;
+            buf[n] = digits[d];
+            n += 1;
+        }
+    }
+    if (n < buf.len) {
+        buf[n] = '\n';
+        n += 1;
+    }
+    return n;
+}
+
 /// Pure ring-buffer state — no locks, no arch deps (host-tested).
 pub const LoopbackQueue = struct {
     slots: [QUEUE_DEPTH]FrameSlot,
@@ -29,6 +80,9 @@ pub const LoopbackQueue = struct {
     tail: u32, // next enqueue slot
     len: u32, // queued frames
     dropped: u64, // TX drops because the queue was full
+    queued: u64, // frames accepted
+    delivered: u64, // frames handed to the receive path
+    high_water: u32, // the most frames ever waiting at once
 
     pub fn init() LoopbackQueue {
         return .{
@@ -37,7 +91,14 @@ pub const LoopbackQueue = struct {
             .tail = 0,
             .len = 0,
             .dropped = 0,
+            .queued = 0,
+            .delivered = 0,
+            .high_water = 0,
         };
+    }
+
+    pub fn stats(self: *const LoopbackQueue) Stats {
+        return .{ .queued = self.queued, .delivered = self.delivered, .dropped = self.dropped, .high_water = self.high_water, .depth = QUEUE_DEPTH };
     }
 
     pub fn pending(self: *const LoopbackQueue) u32 {
@@ -57,6 +118,8 @@ pub const LoopbackQueue = struct {
         @memcpy(slot.data[0..frame.len], frame);
         self.tail = (self.tail + 1) % QUEUE_DEPTH;
         self.len += 1;
+        self.queued += 1;
+        if (self.len > self.high_water) self.high_water = self.len;
         return true;
     }
 
@@ -69,6 +132,7 @@ pub const LoopbackQueue = struct {
         slot.len = 0;
         self.head = (self.head + 1) % QUEUE_DEPTH;
         self.len -= 1;
+        self.delivered += 1;
         return n;
     }
 };
@@ -84,6 +148,13 @@ var rx_queue: LoopbackQueue = LoopbackQueue.init();
 // TX (tcp/udp send paths) and drain (netPoll / NIC IRQ bottom half) can run
 // on different CPUs and in IRQ context.
 var lo_lock: IrqSpinlock = .{};
+
+/// A consistent copy of the counters (taken under the queue's lock).
+pub fn snapshot() Stats {
+    const saved = lo_lock.acquire();
+    defer lo_lock.release(saved);
+    return rx_queue.stats();
+}
 
 /// Reset the queue (net.init).
 pub fn init() void {

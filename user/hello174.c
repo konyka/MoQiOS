@@ -45,6 +45,7 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 
 #define SYS_WRITE     1
 #define SYS_EXIT      2
+#define SYS_OPEN      9
 #define SYS_READ      10
 #define SYS_CLOSE     11
 #define SYS_NANOSLEEP 35
@@ -87,6 +88,18 @@ static void print_dec(int64_t v) {
 }
 static void note(const char *label, int64_t v) {
     print("hello174:   .. "); print(label); print("="); print_dec(v); print("\n");
+}
+/* /proc/lostats ("queued=N delivered=N dropped=N high_water=N depth=N"): whether the loopback queue ever refused a frame. */
+static void print_lostats(const char *when) {
+    char raw[160];
+    int64_t fd = syscall3(SYS_OPEN, (uint64_t)"/proc/lostats", 0, 0);
+    if (fd < 0) { print("hello174:   .. lostats unavailable\n"); return; }
+    int64_t n = syscall3(SYS_READ, (uint64_t)fd, (uint64_t)raw, sizeof raw - 1);
+    syscall1(SYS_CLOSE, (uint64_t)fd);
+    if (n <= 0) return;
+    if (raw[n - 1] == '\n') n--;
+    raw[n] = 0;
+    print("hello174:   .. lostats "); print(when); print(": "); print(raw); print("\n");
 }
 static int failures = 0;
 static void check(int ok, const char *what) {
@@ -257,6 +270,7 @@ void _start(void) {
             note("drain_stalled_for_ms", now_ms() - last_progress); note("drain_reads", reads); note("drain_empty_reads", empty_reads);
             note("drain_receiver_fionread", ioctl_int(s, FIONREAD)); note("drain_sender_outq", ioctl_int(c, TIOCOUTQ));
         }
+        print_lostats(drained ? "after the drain" : "at the failed drain");
         syscall1(SYS_CLOSE, c);
         syscall1(SYS_CLOSE, s);
     }

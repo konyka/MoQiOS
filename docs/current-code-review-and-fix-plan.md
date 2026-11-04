@@ -6494,3 +6494,10 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 这一轮做的：读了接收路径（`recvLocked` 只在一次读超过一个 MSS 时发窗口更新，否则靠延迟 ACK 的 100 ms 计时器或发送方的零窗口探测）、零窗口探测（首次 2 s，之后每次翻倍：2 s、6 s、14 s、30 s…累计）、回环队列（深度 16 帧，满了丢帧并只计数 `dropped`，没有任何地方读它）、BBR 的发送速率采样（`deliverySampleUsable` 要求一次样本超过一个 MSS 且间隔不超过 1 s）。得到的**未验证的推测**：窗口更新 ACK 若被回环队列满而丢掉，发送方进入零窗口探测，而探测间隔 2 s、6 s、14 s 很容易让"10 秒内排空"落空；这与"只在压力下出现"吻合，但我没有证据证明丢帧真的发生过。
 - 尝试复现（全部通过，所以**没有复现**）：①SMP=2 的 QEMU 钉在两个宿主 CPU 上、再加一个同样钉在这两个 CPU 上的忙循环，连续 12 次，12/12 通过；②SMP=2 的 QEMU 钉在**一个**宿主 CPU 上（更接近 CI 的共享 runner），1 次，通过，耗时 859 s（比正常慢 4 倍）；③在 hello174 运行期间用 `SIGSTOP`/`SIGCONT` 让 QEMU 以"冻结 0.3 s、运行 0.1 s"的节奏反复停顿，3 次，3/3 通过。
 - 没有改内核：没有失败现场就改，等于凭推测改网络栈，风险大于收益。下一次它在 CI 里失败时，`hello174` 已经会打印已读字节数、总数、耗时、停滞时长、读次数、空读次数、接收方 `FIONREAD`、发送方 `TIOCOUTQ`（`6324939` 加的），能区分"一次长停滞"（支持上面的零窗口探测推测）和"全程缓慢"。若是前者，下一步是让回环队列在满时把丢帧数暴露出来（例如通过 `/proc/net/dev` 或 `SIOCGIFSTATS`），而不是调探测间隔。
+
+## 回环队列的计数与 /proc/lostats（hello224）：为 hello174 偶发失败补上的观测
+
+- 起因：上一节（hello174 排空偶发失败，三组复现共 16 次都没出现）结尾写明下一步是"让回环队列把丢帧数暴露出来"。`net/lo.zig` 的队列深度只有 16 帧，满了就丢帧并只做 `dropped += 1`，而我 `grep` 确认这个字段在内核里没有任何读取点。所以之前"窗口更新 ACK 被回环队列丢掉"这个推测，既无法证实也无法排除。
+- 做的事：先写 host 测试（`lo` 队列的 `stats()`、`formatStats()` 和 `/proc/lostats` 的接线，3 个测试，编译失败即红），再实现：`LoopbackQueue` 增加 `queued`/`delivered`/`high_water`，`lo.snapshot()` 在锁下取一致拷贝，`lo.formatStats` 把计数写成 `queued=N delivered=N dropped=N high_water=N depth=N\n`（缓冲区太小时截断而不越界），`/proc/lostats` 在 `procfs.zig` 与 `vfs.zig` 里接上。`hello224` 在 QEMU 里验证：读这个文件、5 次"发送并泵一次"得到 queued +5 / delivered +5 / dropped +0、不泵就连发 40 个 UDP 数据报得到 queued +16 / dropped +24 / high_water 16（队列确实满了，且 40 次发送每一次要么入队要么计入 dropped）、泵一次后入队的都送达。
+- `hello174` 现在在 C 组排空断言之后无条件打印一行 `lostats after the drain: …`（失败时是 `at the failed drain`）。**第一条数据**：SMP=2 的一次正常运行里是 `queued=2241 delivered=2241 dropped=0 high_water=10 depth=16`，也就是 hello174 全部流量下队列最多同时排了 10 帧，没有丢帧，离 16 的上限有余量。这说明"回环队列丢帧"需要比正常运行更重的争用才可能发生，推测没有被推翻，也没有被支持。
+- 如实说明：①这是**观测**，不是修复，hello174 的偶发失败本身仍然没有解释；②`dropped` 只数队列满的拒绝，空帧和超长帧不算；③计数在队列锁下读写，不影响收发路径的锁顺序（`tcp_lock → lo_lock`）。

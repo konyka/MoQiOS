@@ -4031,6 +4031,61 @@ test "lo queue rejects empty and oversized frames" {
     try std.testing.expectEqualSlices(u8, &max_frame, &out);
 }
 
+test "lo queue counts frames queued, delivered, dropped and its high-water mark" {
+    var q = lo.LoopbackQueue.init();
+    const frame = [_]u8{0x42} ** 64;
+    var out: [lo.MAX_FRAME]u8 = undefined;
+    var s = q.stats();
+    try std.testing.expectEqual(@as(u64, 0), s.queued);
+    try std.testing.expectEqual(@as(u64, 0), s.delivered);
+    try std.testing.expectEqual(@as(u64, 0), s.dropped);
+    try std.testing.expectEqual(@as(u32, 0), s.high_water);
+
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) try std.testing.expect(q.enqueue(&frame));
+    s = q.stats();
+    try std.testing.expectEqual(@as(u64, 5), s.queued);
+    try std.testing.expectEqual(@as(u32, 5), s.high_water);
+    _ = q.dequeue(&out);
+    _ = q.dequeue(&out);
+    s = q.stats();
+    try std.testing.expectEqual(@as(u64, 2), s.delivered);
+    try std.testing.expectEqual(@as(u32, 5), s.high_water); // the peak is kept after the queue shrinks
+
+    // fill it: queued counts only accepted frames, dropped counts the refused ones, the peak is the capacity
+    while (q.pending() < lo.QUEUE_DEPTH) try std.testing.expect(q.enqueue(&frame));
+    try std.testing.expect(!q.enqueue(&frame));
+    try std.testing.expect(!q.enqueue(&frame));
+    try std.testing.expect(!q.enqueue(&frame));
+    s = q.stats();
+    try std.testing.expectEqual(@as(u64, 3), s.dropped);
+    try std.testing.expectEqual(lo.QUEUE_DEPTH, s.high_water);
+    try std.testing.expectEqual(@as(u64, 5 + (lo.QUEUE_DEPTH - 3)), s.queued);
+    try std.testing.expectEqual(@as(u32, lo.QUEUE_DEPTH), s.depth);
+    // an empty or oversized frame is refused without being counted as a congestion drop
+    try std.testing.expect(!q.enqueue(&[_]u8{}));
+    try std.testing.expectEqual(@as(u64, 3), q.stats().dropped);
+}
+
+test "the loopback statistics are formatted as one line of name=value pairs" {
+    var buf: [256]u8 = undefined;
+    const n = lo.formatStats(.{ .queued = 12345, .delivered = 12000, .dropped = 7, .high_water = 16, .depth = 16 }, &buf);
+    try std.testing.expectEqualStrings("queued=12345 delivered=12000 dropped=7 high_water=16 depth=16\n", buf[0..n]);
+    const z = lo.formatStats(.{ .queued = 0, .delivered = 0, .dropped = 0, .high_water = 0, .depth = 16 }, &buf);
+    try std.testing.expectEqualStrings("queued=0 delivered=0 dropped=0 high_water=0 depth=16\n", buf[0..z]);
+    // a buffer that is too small gets a truncated line, never an overrun
+    var small: [10]u8 = undefined;
+    const t = lo.formatStats(.{ .queued = 1, .delivered = 1, .dropped = 1, .high_water = 1, .depth = 16 }, &small);
+    try std.testing.expectEqual(small.len, t);
+    try std.testing.expectEqualStrings("queued=1 d", small[0..t]);
+}
+
+test "the process file system exposes /proc/lostats" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, "lostats,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".lostats => generateLoStats(buf, max_len),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "str.eql(rest, \"lostats\")") != null);
+}
+
 test "lo isLoopback classifies the whole 127.0.0.0/8 block" {
     try std.testing.expect(lo.isLoopback(.{ 127, 0, 0, 1 }));
     try std.testing.expect(lo.isLoopback(.{ 127, 0, 0, 0 }));

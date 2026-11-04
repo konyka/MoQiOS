@@ -2943,6 +2943,8 @@ This is an ABI/rollback contract only, not a throughput claim.
 
 **libc scanf 家族（hello220）**：`src/scan.c` 是共享的扫描引擎 `__moqi_vscan`，从一个“带一级回退的字节源”读输入；`sscanf`/`vsscanf`（`scanf.c`）、`fscanf`/`vfscanf`（`stdio_file.c`，源是流的读窗口）、`scanf`/`vscanf`（`stdio_streams.c`，源是 `stdin`）只是传不同的源。语法与 glibc 在 C locale 下逐项一致（`host_tests/test_scanf_abi.c` 对 8235 行 glibc 实测值、`gen/diff_scanf.c` 对 glibc 的随机差分验证）；只有 `m` 修饰符会分配内存，浮点文本交给 `strtod`/`strtof`。
 
+**/proc/lostats：回环队列的计数（hello224）**：`net/lo.zig` 的 16 帧环形队列此前满了就丢帧、只在内部累加 `dropped`，没有任何地方读它，所以无从知道 TCP/UDP 的某次停滞是不是因为回环丢了帧。现在队列记录 `queued`（接受的帧）、`delivered`（交给接收路径的帧）、`dropped`（队列满而拒绝的帧）、`high_water`（同时排队的最大帧数），`/proc/lostats` 以 `queued=N delivered=N dropped=N high_water=N depth=N` 一行给出（`lo.snapshot()` 在队列锁下取一份一致的拷贝）。空帧和超长帧被拒绝但不算拥塞丢帧。`hello174` 在排空断言之后打印这一行，下次 CI 里它失败时能直接看到丢帧是否发生。
+
 **当前目录的读写在锁下（hello222）**：`FsContext`（`mm/group_state.zig`）带一把 `IrqSpinlock`，读只通过 `snapshot()`、写只通过 `set()`，两者只在拷贝期间持锁；`getcwd`、相对路径查找、`chdir`、`fchdir` 与 `fork`/`clone` 复制目录都走这两个入口。此前 `chdir` 分几步写一个 256 字节数组，同时有别的线程读它时会读到半新半旧的路径。
 
 **libc 的 ctype 与 math（hello223）**：`include/ctype.h` 补全到 glibc C locale 的全部 13 个分类函数加 `toupper`/`tolower`/`toascii`，并对 glibc 在 `EOF` 和 -128..255 的全部 384 个定义域做了逐一比对；`include/math.h` + `src/math.c` 提供结果有精确定义的双精度函数，全部用整数运算在位型上实现（不依赖舍入模式或 x87/SSE），`sqrt` 正确舍入，取整、`fmod`/`remainder`/`remquo`、`nextafter`、`ldexp`/`scalbn`/`frexp`/`modf`、`lround` 族与 glibc 逐位一致（含 errno 和 NaN 传播规则）。没有超越函数。

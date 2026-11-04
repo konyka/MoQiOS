@@ -1028,6 +1028,8 @@ pub const FdTable = struct {
                 pfile = .irqtime;
             } else if (rest.len == 9 and str.eql(rest, "irqwindow")) {
                 pfile = .irqwindow;
+            } else if (rest.len == 7 and str.eql(rest, "lostats")) {
+                pfile = .lostats;
             } else if (rest.len > 0) {
                 // /proc/[pid]/status or /proc/[pid]/maps
                 var digit_end: usize = 0;

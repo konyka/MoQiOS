@@ -20,6 +20,8 @@ pub const ProcFile = enum(u8) {
     /// Longest interrupt per CPU since the previous read of this file (a read
     /// starts a new window); `irqtime` keeps the boot-wide maxima.
     irqwindow,
+    /// Loopback queue counters: frames queued, delivered, dropped (queue full) and the queue's high-water mark.
+    lostats,
 };
 
 /// Files whose content is consumed by generating it (a read starts a new
@@ -51,6 +53,7 @@ pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
         .vma_stats => generateVmaStats(buf, max_len),
         .irqtime => generateIrqTime(buf, max_len),
         .irqwindow => generateIrqWindow(buf, max_len),
+        .lostats => generateLoStats(buf, max_len),
     };
 }
 
@@ -415,6 +418,11 @@ fn generateIrqWindow(buf: [*]u8, max_len: u32) u32 {
         pos = appendStr(buf, pos, max_len, "\n");
     }
     return pos;
+}
+
+fn generateLoStats(buf: [*]u8, max_len: u32) u32 {
+    const lo = @import("../net/lo.zig");
+    return @intCast(lo.formatStats(lo.snapshot(), buf[0..max_len]));
 }
 
 fn generateVmaStats(buf: [*]u8, max_len: u32) u32 {
