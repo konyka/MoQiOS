@@ -23,6 +23,7 @@
 #define ENFILE       23
 #define EMFILE       24
 #define ESPIPE       29
+#define EDOM         33
 #define ERANGE       34
 #define ENAMETOOLONG 36
 #define ENOSYS       38

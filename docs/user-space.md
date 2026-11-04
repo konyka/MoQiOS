@@ -278,8 +278,8 @@ init 的源文件不在 `user/` 下，构建时以显式路径调用 `addLibcUse
 ### 5.4 有意缺失
 
 宽字符流、`tmpfile`/`popen`/`freopen`/`fgetpos`/`setbuf`、文件锁、`long double`（`strtold`、`%Lf`，`scanf` 的 `%Lf` 同样拒绝）、locale、
-完整 POSIX 信号语义。（`errno`、`realloc`、线程与 TLS、`setenv`/`putenv`、浮点
-`printf`/`strtod`、`FILE` 流（`fopen`/`fgets`/`fread`/`fprintf`…）、`scanf` 族（`sscanf`/`fscanf`/`scanf`/`vsscanf`/`vfscanf`/`vscanf`）、`setjmp`/`longjmp`/`sigsetjmp`/`siglongjmp` 此前列在这里，现已实现，见各自的 hello 探针与 current-code-review-and-fix-plan.md。）
+完整 POSIX 信号语义、`<math.h>` 里的超越函数（`sin`/`cos`/`exp`/`log`/`pow`…）、`float`/`long double` 版本和 `fma`。（`errno`、`realloc`、线程与 TLS、`setenv`/`putenv`、浮点
+`printf`/`strtod`、`FILE` 流（`fopen`/`fgets`/`fread`/`fprintf`…）、`scanf` 族（`sscanf`/`fscanf`/`scanf`/`vsscanf`/`vfscanf`/`vscanf`）、`setjmp`/`longjmp`/`sigsetjmp`/`siglongjmp`、`ctype.h` 的全部分类函数和 `<math.h>` 里结果有精确定义的那部分（`sqrt`、取整、`fmod`/`remainder`/`remquo`、`fmax`/`fmin`/`fdim`、`nextafter`、`ldexp`/`frexp`/`modf`、`lround` 族、分类宏）此前列在这里或不存在，现已实现，见各自的 hello 探针与 current-code-review-and-fix-plan.md。）
 需要时请按最小需求追加，不要预先泛化。
 
 `lib/zig_crt/` 另含 `start.zig`：Zig 用户程序的最小 `_start`（对齐栈 →

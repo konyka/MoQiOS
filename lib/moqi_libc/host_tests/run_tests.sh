@@ -114,6 +114,19 @@ $CC $CFLAGS $SJ_RENAME -DMOQI_HOST_TEST_SYSCALL -c ../src/setjmp.c -o "$OUT/setj
 $CC $CFLAGS $SJ_RENAME -o "$OUT/test_setjmp_abi" test_setjmp_abi.c "$OUT/setjmp.o"
 "$OUT/test_setjmp_abi" || fail=1
 
+echo "== test_ctype_abi =="
+$CC $CFLAGS -o "$OUT/test_ctype_abi" test_ctype_abi.c
+"$OUT/test_ctype_abi" || fail=1
+
+echo "== test_math_abi =="
+$CC $CFLAGS -c ../src/math.c -o "$OUT/math.o"
+$CC $CFLAGS -o "$OUT/test_math_abi" test_math_abi.c "$OUT/math.o"
+"$OUT/test_math_abi" || fail=1
+# Bit-level code with shifts by computed amounts: the same test under UBSan.
+$CC $CFLAGS -fsanitize=undefined -fno-sanitize-trap=undefined -c ../src/math.c -o "$OUT/math_ubsan.o"
+$CC $CFLAGS -fsanitize=undefined -fno-sanitize-trap=undefined -o "$OUT/test_math_abi_ubsan" test_math_abi.c "$OUT/math_ubsan.o"
+"$OUT/test_math_abi_ubsan" || fail=1
+
 echo "== test_env_abi =="
 $CC $CFLAGS -o "$OUT/test_env_abi" test_env_abi.c ../src/string.c
 "$OUT/test_env_abi" || fail=1
