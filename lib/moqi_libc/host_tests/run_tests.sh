@@ -108,6 +108,12 @@ $CC $CFLAGS -fsanitize=undefined -fno-sanitize-trap=undefined -c ../src/scan.c -
 $CC $CFLAGS -fsanitize=undefined -fno-sanitize-trap=undefined -o "$OUT/test_scanf_abi_ubsan" test_scanf_abi.c "$OUT/scan_ubsan.o" "$OUT/strtod_sc.o"
 "$OUT/test_scanf_abi_ubsan" || fail=1
 
+echo "== test_setjmp_abi =="
+SJ_RENAME="-Dsetjmp=moqi_setjmp -Dsigsetjmp=moqi_sigsetjmp -Dlongjmp=moqi_longjmp -Dsiglongjmp=moqi_siglongjmp"
+$CC $CFLAGS $SJ_RENAME -DMOQI_HOST_TEST_SYSCALL -c ../src/setjmp.c -o "$OUT/setjmp.o"
+$CC $CFLAGS $SJ_RENAME -o "$OUT/test_setjmp_abi" test_setjmp_abi.c "$OUT/setjmp.o"
+"$OUT/test_setjmp_abi" || fail=1
+
 echo "== test_env_abi =="
 $CC $CFLAGS -o "$OUT/test_env_abi" test_env_abi.c ../src/string.c
 "$OUT/test_env_abi" || fail=1
