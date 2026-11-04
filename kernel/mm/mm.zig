@@ -83,7 +83,9 @@ pub const Mm = struct {
 
     /// A copied address space (fork, clone without CLONE_VM) starts with the parent's current directory and umask.
     pub fn inheritFs(mm: *Mm, parent: *const Mm) void {
-        mm.grp.fs = parent.grp.fs;
+        const snap = @constCast(&parent.grp.fs).snapshot();
+        _ = mm.grp.fs.set(snap.slice());
+        mm.grp.fs.umask = parent.grp.fs.umask;
     }
 
     /// Set the initial break of a freshly built address space (loader, exec). Nobody else can see it yet.

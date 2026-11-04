@@ -10617,6 +10617,83 @@ test "the file-system context belongs to the thread group: cwd and umask live in
     try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "new_mm.inheritFs(om)") != null);
 }
 
+test "the current directory is copied and replaced under the group state's lock" {
+    // chdir rewrote a 256-byte array in several steps while getcwd and every relative path lookup read it, so a reader could see
+    // half of the old path and half of the new one (hello222 caught it on the target). Reads go through snapshot(), writes
+    // through set(), and both hold the lock for the copy only.
+    const gs = kt.group_state;
+    var st = gs.GroupState.initial(64);
+    const snap0 = st.fs.snapshot();
+    try std.testing.expectEqualStrings("/", snap0.slice());
+    try std.testing.expect(st.fs.set("/tmp/some/dir"));
+    const snap1 = st.fs.snapshot();
+    try std.testing.expectEqualStrings("/tmp/some/dir", snap1.slice());
+    try std.testing.expectEqual(@as(u8, 0), st.fs.cwd[13]); // still NUL-terminated
+    try std.testing.expectEqual(@as(u32, 13), st.fs.cwd_len);
+    // a snapshot is private: a later set() does not change it
+    try std.testing.expect(st.fs.set("/x"));
+    try std.testing.expectEqualStrings("/tmp/some/dir", snap1.slice());
+    try std.testing.expectEqualStrings("/x", st.fs.snapshot().slice());
+    // the longest path that fits, and the limits
+    var long: [255]u8 = undefined;
+    @memset(&long, 'y');
+    long[0] = '/';
+    try std.testing.expect(st.fs.set(&long));
+    try std.testing.expectEqual(@as(usize, 255), st.fs.snapshot().len);
+    try std.testing.expectEqual(@as(u8, 0), st.fs.cwd[255]);
+    var too_long: [256]u8 = undefined;
+    @memset(&too_long, 'y');
+    try std.testing.expect(!st.fs.set(&too_long));
+    try std.testing.expect(!st.fs.set(""));
+    try std.testing.expectEqual(@as(usize, 255), st.fs.snapshot().len); // a refused set changed nothing
+    // Real threads: one keeps replacing the directory with one of two equally long paths that differ in every byte, the others
+    // copy it. Every copy must be one of the two paths whole.
+    const Race = struct {
+        fn flip(state: *gs.GroupState, stop: *std.atomic.Value(bool)) void {
+            var a: [200]u8 = undefined;
+            var b: [200]u8 = undefined;
+            @memset(&a, 'a');
+            @memset(&b, 'b');
+            a[0] = '/';
+            b[0] = '/';
+            var n: usize = 0;
+            while (n < 400000) : (n += 1) _ = state.fs.set(if (n & 1 == 0) &a else &b);
+            stop.store(true, .release);
+        }
+        fn read(state: *gs.GroupState, stop: *std.atomic.Value(bool), torn: *std.atomic.Value(u32), reads: *std.atomic.Value(u32)) void {
+            while (!stop.load(.acquire)) {
+                const snap = state.fs.snapshot();
+                _ = reads.fetchAdd(1, .monotonic);
+                const p = snap.slice();
+                if (p.len == 1) continue; // the initial "/", before the first set
+                var ok = p.len == 200 and p[0] == '/';
+                if (ok) {
+                    const c = p[1];
+                    ok = (c == 'a' or c == 'b');
+                    for (p[1..]) |x| ok = ok and x == c;
+                }
+                if (!ok) _ = torn.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var race_state = gs.GroupState.initial(64);
+    var stop = std.atomic.Value(bool).init(false);
+    var torn = std.atomic.Value(u32).init(0);
+    var reads = std.atomic.Value(u32).init(0);
+    const t0 = try std.Thread.spawn(.{}, Race.flip, .{ &race_state, &stop });
+    const t1 = try std.Thread.spawn(.{}, Race.read, .{ &race_state, &stop, &torn, &reads });
+    const t2 = try std.Thread.spawn(.{}, Race.read, .{ &race_state, &stop, &torn, &reads });
+    t0.join();
+    t1.join();
+    t2.join();
+    try std.testing.expectEqual(@as(u32, 0), torn.load(.monotonic));
+    try std.testing.expect(reads.load(.monotonic) > 1000);
+    // no caller reads the array directly any more
+    for ([_][]const u8{ kt.syscall_entry_source }) |src| {
+        try std.testing.expect(std.mem.indexOf(u8, src, "fsctx().cwd[0..") == null);
+    }
+}
+
 test "a new group state starts at / with umask 022" {
     const gs = kt.group_state;
     const st = gs.GroupState.initial(64);

@@ -14,12 +14,13 @@ pub fn getcwd(buf_ptr: u64, buf_size: u64) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    const cwd_len: usize = cur.fsctx().cwd_len;
+    const snap = cur.fsctx().snapshot();
+    const cwd_len: usize = snap.len;
     const total = cwd_len + 1;
     if (total > buf_size) return -34; // -ERANGE
 
     var tmp: [257]u8 = undefined;
-    @memcpy(tmp[0..cwd_len], cur.fsctx().cwd[0..cwd_len]);
+    @memcpy(tmp[0..cwd_len], snap.buf[0..cwd_len]);
     tmp[cwd_len] = 0;
 
     if (copy.copyToUser(@ptrFromInt(buf_ptr), tmp[0..total], total) != total) return -14;

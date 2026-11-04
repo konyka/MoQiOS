@@ -30,14 +30,13 @@ pub fn chdir(path_ptr: u64) i64 {
     // terminator in Task.cwd — reject instead of truncating or writing the
     // NUL one byte past the array.
     var out_buf: [256]u8 = undefined;
-    const write_pos = chdir_policy.resolve(cur.fsctx().cwd[0..cur.fsctx().cwd_len], path_buf[0..path_len], &out_buf) catch return -36; // ENAMETOOLONG
+    const base = cur.fsctx().snapshot();
+    const write_pos = chdir_policy.resolve(base.slice(), path_buf[0..path_len], &out_buf) catch return -36; // ENAMETOOLONG
 
     const rc = checkDirectory(cur, out_buf[0..write_pos]);
     if (rc != 0) return rc;
 
-    @memcpy(cur.fsctx().cwd[0..write_pos], out_buf[0..write_pos]);
-    cur.fsctx().cwd[write_pos] = 0;
-    cur.fsctx().cwd_len = @intCast(write_pos);
+    if (!cur.fsctx().set(out_buf[0..write_pos])) return -36;
     return 0;
 }
 
@@ -93,9 +92,6 @@ pub fn fchdir(fd: u32) i64 {
         .ok => |p| p,
         .err => |e| return e,
     };
-    if (path.len == 0 or path.len >= cur.fsctx().cwd.len) return -36;
-    @memcpy(cur.fsctx().cwd[0..path.len], path);
-    cur.fsctx().cwd[path.len] = 0;
-    cur.fsctx().cwd_len = @intCast(path.len);
+    if (!cur.fsctx().set(path)) return -36;
     return 0;
 }

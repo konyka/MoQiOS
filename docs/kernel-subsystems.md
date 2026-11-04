@@ -2943,6 +2943,8 @@ This is an ABI/rollback contract only, not a throughput claim.
 
 **libc scanf 家族（hello220）**：`src/scan.c` 是共享的扫描引擎 `__moqi_vscan`，从一个“带一级回退的字节源”读输入；`sscanf`/`vsscanf`（`scanf.c`）、`fscanf`/`vfscanf`（`stdio_file.c`，源是流的读窗口）、`scanf`/`vscanf`（`stdio_streams.c`，源是 `stdin`）只是传不同的源。语法与 glibc 在 C locale 下逐项一致（`host_tests/test_scanf_abi.c` 对 8235 行 glibc 实测值、`gen/diff_scanf.c` 对 glibc 的随机差分验证）；只有 `m` 修饰符会分配内存，浮点文本交给 `strtod`/`strtof`。
 
+**当前目录的读写在锁下（hello222）**：`FsContext`（`mm/group_state.zig`）带一把 `IrqSpinlock`，读只通过 `snapshot()`、写只通过 `set()`，两者只在拷贝期间持锁；`getcwd`、相对路径查找、`chdir`、`fchdir` 与 `fork`/`clone` 复制目录都走这两个入口。此前 `chdir` 分几步写一个 256 字节数组，同时有别的线程读它时会读到半新半旧的路径。
+
 **libc setjmp 家族（hello221）**：`include/setjmp.h`、`src/setjmp.c`（x86-64 汇编，四个函数共用一个实现；`jmp_buf` 保存 rbx/rbp/r12–r15、rsp、返回地址，外加是否保存了信号掩码的标志和掩码）。`setjmp` 与 `sigsetjmp(env, 0)` 不碰信号掩码，`sigsetjmp(env, 非零)` 读一次掩码、`siglongjmp`（以及对这种缓冲区调用 `longjmp`，glibc 的 `longjmp` 就是 `siglongjmp`）写回一次；读掩码失败则什么也不保存、也不恢复；`longjmp(env, 0)` 使 `setjmp` 返回 1。不保存 x87 控制字、MXCSR 与浮点寄存器（与 glibc 一致）。只有 x86-64 实现，aarch64/riscv64 的用户态 libc 没有这几个函数。
 
 **程序 break 属于 `Mm`（hello209）**：`brk_current`/`brk_start` 原来在 `Task` 里，`CLONE_VM` 线程创建时只拷了 `brk_current`

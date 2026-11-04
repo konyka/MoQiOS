@@ -2593,7 +2593,8 @@ fn pathOnRofs(cur: anytype, dirfd: i64, ptr: u64) union(enum) { no, yes, err: i6
     var joined: [512]u8 = undefined;
     var full: []const u8 = name;
     if (name[0] != '/') {
-        const cwd = cur.fsctx().cwd[0..cur.fsctx().cwd_len];
+        const cwd_snap = cur.fsctx().snapshot();
+        const cwd = cwd_snap.slice();
         if (cwd.len + 1 + n > joined.len) return .no;
         @memcpy(joined[0..cwd.len], cwd);
         joined[cwd.len] = '/';
@@ -3609,7 +3610,8 @@ fn rofsAccess(cur: anytype, name: []const u8, mode: u32) ?i64 {
     var joined: [512]u8 = undefined;
     var full: []const u8 = name;
     if (name[0] != '/') {
-        const cwd = cur.fsctx().cwd[0..cur.fsctx().cwd_len];
+        const cwd_snap = cur.fsctx().snapshot();
+        const cwd = cwd_snap.slice();
         if (cwd.len + 1 + name.len > joined.len) return null;
         @memcpy(joined[0..cwd.len], cwd);
         joined[cwd.len] = '/';
@@ -4651,7 +4653,8 @@ fn rofsStatfsByPath(path_ptr: u64, buf_ptr: u64) ?i64 {
     var joined: [512]u8 = undefined;
     var full: []const u8 = raw[0..n];
     if (raw[0] != '/') {
-        const cwd = cur.fsctx().cwd[0..cur.fsctx().cwd_len];
+        const cwd_snap = cur.fsctx().snapshot();
+        const cwd = cwd_snap.slice();
         if (cwd.len + 1 + n > joined.len) return null;
         @memcpy(joined[0..cwd.len], cwd);
         joined[cwd.len] = '/';
