@@ -142,6 +142,7 @@ long test_fcntl_getfl(int fd) {
     return fds[fd].flags;
 }
 void *test_malloc(size_t n);
+void *test_realloc(void *p, size_t n);
 void test_free(void *p);
 
 #define NAME(x) m##x
@@ -153,6 +154,7 @@ void test_free(void *p);
 #define IO_GETFL(fd) test_fcntl_getfl(fd)
 #define MEM_ALLOC(n) test_malloc(n)
 #define MEM_FREE(p) test_free(p)
+#define MEM_REALLOC(p, n) test_realloc(p, n)
 #define LIST_LOCK() (void)0
 #define LIST_UNLOCK() (void)0
 #include <stdarg.h>
@@ -172,6 +174,10 @@ void *test_malloc(size_t n) {
     return __builtin_malloc(n);
 }
 void test_free(void *p) { __builtin_free(p); }
+void *test_realloc(void *p, size_t n) {
+    if (fail_malloc) return (void *)0;
+    return __builtin_realloc(p, n);
+}
 
 static struct FILE_s std_in = { .fd = 0, .flags = F_READ | F_STATIC, .bmode = FB_FULL, .bufmode_fixed = 1 };
 static struct FILE_s std_out = { .fd = 1, .flags = F_WRITE | F_STATIC, .bmode = FB_LINE, .bufmode_fixed = 1 };
@@ -182,6 +188,7 @@ static struct FILE_s std_err = { .fd = 2, .flags = F_WRITE | F_STATIC, .bmode = 
 
 /* ---- helpers ------------------------------------------------------------------------------------------------------- */
 
+static int test_vfscanf_call(MFILE *f, const char *fmt, ...);
 static int bad;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); bad++; } } while (0)
 
@@ -1060,10 +1067,140 @@ int main(void) {
     }
     mfclose(f);
 
+
+    /* ===== fscanf: stream-level behavior, measured on glibc ===== */
+    {
+        int a = -1, b = -1;
+        char sb[32];
+        /* a write-only stream: EBADF, return -1, and no error flag (glibc does not set it for scanf) */
+        reset();
+        put_file("t", "5 6", 3);
+        f = mfopen("t", "w");
+        errno_slot = 0;
+        CHECK(mfscanf(f, "%d", &a) == -1 && errno_slot == EBADF && !mferror(f) && !mfeof(f));
+        errno_slot = 0;
+        CHECK(mfscanf(f, (const char *)0, &a) == -1 && errno_slot == EBADF);
+        mfclose(f);
+        /* a NULL format on a readable stream: EINVAL, nothing consumed */
+        reset();
+        put_file("t", "5 6", 3);
+        f = mfopen("t", "r");
+        errno_slot = 0;
+        CHECK(mfscanf(f, (const char *)0, &a) == -1 && errno_slot == EINVAL && mftell(f) == 0 && !mferror(f));
+        CHECK(mfscanf(f, "") == 0 && mftell(f) == 0);
+        /* the lookahead byte is pushed back, so the next reader sees it */
+        CHECK(mfscanf(f, "%d", &a) == 1 && a == 5 && mftell(f) == 1 && mfgetc(f) == ' ');
+        CHECK(mfscanf(f, "%d", &b) == 1 && b == 6 && mfeof(f) && mftell(f) == 3);
+        CHECK(mfscanf(f, "%d", &b) == -1 && mfeof(f) && !mferror(f));
+        mfclose(f);
+        /* a number that ends the file sets EOF; an exact match of the format does too, as the lookahead hits the end */
+        reset();
+        put_file("t", "3 4", 3);
+        f = mfopen("t", "r");
+        CHECK(mfscanf(f, "%d %d", &a, &b) == 2 && a == 3 && b == 4 && mfeof(f) && mftell(f) == 3);
+        mfclose(f);
+        /* a mismatch is not an end of file */
+        reset();
+        put_file("t", "x", 1);
+        f = mfopen("t", "r");
+        CHECK(mfscanf(f, "%d", &a) == 0 && !mfeof(f) && mftell(f) == 0 && mfgetc(f) == 'x');
+        mfclose(f);
+        /* mixed with fgets / fgetc / ungetc */
+        reset();
+        put_file("t", "5 rest of line\nnext\n", 20);
+        f = mfopen("t", "r");
+        CHECK(mfscanf(f, "%d", &a) == 1 && a == 5);
+        CHECK(mfgets(sb, sizeof sb, f) && strcmp(sb, " rest of line\n") == 0);
+        CHECK(mfgets(sb, sizeof sb, f) && strcmp(sb, "next\n") == 0);
+        mfclose(f);
+        reset();
+        put_file("t", "34", 2);
+        f = mfopen("t", "r");
+        CHECK(mungetc('9', f) == '9' && mfscanf(f, "%d", &a) == 1 && a == 934 && mftell(f) == 2);
+        mfclose(f);
+        /* a field that spans a buffer refill */
+        reset();
+        {
+            static char blk[4200];
+            memset(blk, ' ', 4094);
+            memcpy(blk + 4094, "12345 6", 7);
+            put_file("t", blk, 4101);
+            f = mfopen("t", "r");
+            CHECK(mfscanf(f, "%d %d", &a, &b) == 2 && a == 12345 && b == 6 && mftell(f) == 4101);
+            mfclose(f);
+        }
+        /* a long token is fine: the engine does not buffer strings, the caller's array does */
+        reset();
+        {
+            static char blk[6000];
+            memset(blk, '1', 5000);
+            memcpy(blk + 5000, " 7", 3);
+            put_file("t", blk, 5002);
+            static char big[6000];
+            f = mfopen("t", "r");
+            CHECK(mfscanf(f, "%5990s %d", big, &a) == 2 && strlen(big) == 5000 && a == 7);
+            mfclose(f);
+        }
+        /* a read error part-way: what was read is converted, the error flag and errno are the system's */
+        reset();
+        put_file("t", "12 34", 5);
+        f = mfopen("t", "r");
+        fail_read_after = 1;
+        errno_slot = 0;
+        CHECK(mfscanf(f, "%d", &a) == -1 && mferror(f) && errno_slot == EIO_);
+        mfclose(f);
+        /* end of file: nothing is read again from the descriptor once it was seen */
+        reset();
+        put_file("t", "7", 1);
+        f = mfopen("t", "r");
+        CHECK(mfscanf(f, "%d", &a) == 1 && a == 7 && mfeof(f));
+        io_calls_read = 0;
+        CHECK(mfscanf(f, "%d", &a) == -1 && io_calls_read == 0);
+        mfclose(f);
+        /* a stream with pending output: it goes out first, then the read starts at the end of the file */
+        reset();
+        f = mfopen("t", "w+");
+        mfputs("12 34", f);
+        errno_slot = 0;
+        a = 5;
+        CHECK(mfscanf(f, "%d", &a) == -1 && a == 5 && mfeof(f) && !mferror(f) && mftell(f) == 5 && file_size("t") == 5);
+        mrewind(f);
+        CHECK(mfscanf(f, "%d", &a) == 1 && a == 12);
+        mfclose(f);
+        /* the allocating modifier goes through the stream's allocator */
+        reset();
+        put_file("t", "hello world", 11);
+        f = mfopen("t", "r");
+        {
+            char *w1 = (char *)0, *w2 = (char *)0;
+            CHECK(mfscanf(f, "%ms %ms", &w1, &w2) == 2 && w1 && w2 && strcmp(w1, "hello") == 0 && strcmp(w2, "world") == 0);
+            test_free(w1);
+            test_free(w2);
+        }
+        mfclose(f);
+        /* vfscanf is what fscanf is built on */
+        reset();
+        put_file("t", "8 9", 3);
+        f = mfopen("t", "r");
+        {
+            int x = 0, y = 0;
+            CHECK(test_vfscanf_call(f, "%d %d", &x, &y) == 2 && x == 8 && y == 9);
+        }
+        mfclose(f);
+    }
+
     if (bad) {
         fprintf(stderr, "test_file_abi: %d failures\n", bad);
         return 1;
     }
     printf("test_file_abi OK\n");
     return 0;
+}
+
+static int test_vfscanf_call(MFILE *f, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = mvfscanf(f, fmt, ap);
+    va_end(ap);
+    return r;
 }

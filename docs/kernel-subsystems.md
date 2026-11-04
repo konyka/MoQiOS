@@ -2941,6 +2941,8 @@ This is an ABI/rollback contract only, not a throughput claim.
 `printf/dprintf/vprintf/puts/putchar/asprintf`。输出经 512 字节分块的 `write(2)`，不缓冲；无位置参数。浮点转换见 hello218，`FILE` 流（`fopen`/`fgets`/`fread`/`fprintf`…，
 `src/stdio_file.c`，与 `printf` 的直写 fd 1 互相独立）见 hello219 与 current-code-review-and-fix-plan.md 末节。
 
+**libc scanf 家族（hello220）**：`src/scan.c` 是共享的扫描引擎 `__moqi_vscan`，从一个“带一级回退的字节源”读输入；`sscanf`/`vsscanf`（`scanf.c`）、`fscanf`/`vfscanf`（`stdio_file.c`，源是流的读窗口）、`scanf`/`vscanf`（`stdio_streams.c`，源是 `stdin`）只是传不同的源。语法与 glibc 在 C locale 下逐项一致（`host_tests/test_scanf_abi.c` 对 8235 行 glibc 实测值、`gen/diff_scanf.c` 对 glibc 的随机差分验证）；只有 `m` 修饰符会分配内存，浮点文本交给 `strtod`/`strtof`。
+
 **程序 break 属于 `Mm`（hello209）**：`brk_current`/`brk_start` 原来在 `Task` 里，`CLONE_VM` 线程创建时只拷了 `brk_current`
 （没拷 `brk_start`，`brk` 因 `brk_start == 0` 对该线程直接拒绝移动），即使两个字段都拷了，每个线程也会各持一个
 会过期的 break，一个线程增长堆之后另一个线程仍按旧值算页，增长到别人已映射的页上而失败（`isPageOccupied`）。

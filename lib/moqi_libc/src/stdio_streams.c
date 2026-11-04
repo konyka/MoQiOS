@@ -19,6 +19,7 @@ extern int __moqi_vformat(char *buf, size_t size, moqi_sink_fn sink, void *ctx, 
 #define IO_GETFL(fd) syscall3(SYS_FCNTL, fd, 3, 0)
 #define MEM_ALLOC(n) malloc(n)
 #define MEM_FREE(p) free(p)
+#define MEM_REALLOC(p, n) realloc(p, n)
 
 /* The list of open streams is shared by every thread; the critical sections are a few pointer moves (and, for
  * fflush(NULL), the writes of the buffered bytes). The lock word is a plain spin lock that yields when contended. */
@@ -42,3 +43,13 @@ FILE *stdout = &std_out;
 FILE *stderr = &std_err;
 
 int fflush_all(void) { return fflush((FILE *)0); }
+
+int vscanf(const char *fmt, va_list ap) { return vfscanf(stdin, fmt, ap); }
+
+int scanf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vfscanf(stdin, fmt, ap);
+    va_end(ap);
+    return n;
+}

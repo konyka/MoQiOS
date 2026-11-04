@@ -93,8 +93,20 @@ $CC $CFLAGS -o "$OUT/test_strtod_abi" test_strtod_abi.c "$OUT/strtod.o"
 echo "== test_file_abi =="
 $CC $CFLAGS -c ../src/format.c -o "$OUT/format_file.o"
 $CC $CFLAGS -c ../src/strfunc.c -o "$OUT/strfunc_file.o"
-$CC $CFLAGS -o "$OUT/test_file_abi" test_file_abi.c "$OUT/format_file.o" ../src/string.c "$OUT/strfunc_file.o"
+$CC $CFLAGS -c ../src/scan.c -o "$OUT/scan_file.o"
+$CC $CFLAGS -c ../src/strtod.c -o "$OUT/strtod_file.o"
+$CC $CFLAGS -o "$OUT/test_file_abi" test_file_abi.c "$OUT/format_file.o" ../src/string.c "$OUT/strfunc_file.o" "$OUT/scan_file.o" "$OUT/strtod_file.o"
 "$OUT/test_file_abi" || fail=1
+
+echo "== test_scanf_abi =="
+$CC $CFLAGS -c ../src/scan.c -o "$OUT/scan.o"
+$CC $CFLAGS -c ../src/strtod.c -o "$OUT/strtod_sc.o"
+$CC $CFLAGS -o "$OUT/test_scanf_abi" test_scanf_abi.c "$OUT/scan.o" "$OUT/strtod_sc.o"
+"$OUT/test_scanf_abi" || fail=1
+# The same test under UBSan: the engine indexes a 256-entry set table and small scratch buffers by input bytes.
+$CC $CFLAGS -fsanitize=undefined -fno-sanitize-trap=undefined -c ../src/scan.c -o "$OUT/scan_ubsan.o"
+$CC $CFLAGS -fsanitize=undefined -fno-sanitize-trap=undefined -o "$OUT/test_scanf_abi_ubsan" test_scanf_abi.c "$OUT/scan_ubsan.o" "$OUT/strtod_sc.o"
+"$OUT/test_scanf_abi_ubsan" || fail=1
 
 echo "== test_env_abi =="
 $CC $CFLAGS -o "$OUT/test_env_abi" test_env_abi.c ../src/string.c

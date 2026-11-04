@@ -28,7 +28,7 @@
  * FILE streams (fopen, fread, fgets, fprintf, ...) follow glibc as measured: fully buffered files (4096-byte buffer), line
  * buffered stdout, unbuffered stderr, separate sticky EOF and error flags, EBADF for an operation in the wrong direction,
  * a read-ahead window that is given back before a write or a seek. The buffers are flushed by fflush, fclose and exit()
- * and by returning from main. Not provided: locking, wide characters, tmpfile, popen, freopen, fgetpos/fsetpos, setbuf.
+ * and by returning from main. Not provided: locking, wide-character streams, tmpfile, popen, freopen, fgetpos/fsetpos, setbuf.
  */
 #ifndef MOQI_STDIO_H
 #define MOQI_STDIO_H
@@ -101,7 +101,23 @@ void  rewind(FILE *f);
 int   fprintf(FILE *f, const char *fmt, ...);
 int   vfprintf(FILE *f, const char *fmt, va_list ap);
 int   fflush_all(void);   /* called by exit() */
+
+/* Formatted input from a stream (stdin for scanf). See the notes on scanf below. */
+int   fscanf(FILE *f, const char *fmt, ...);
+int   vfscanf(FILE *f, const char *fmt, va_list ap);
+int   scanf(const char *fmt, ...);
+int   vscanf(const char *fmt, va_list ap);
 #endif /* MOQI_STDIO_NO_FILE */
+
+/* Formatted input from a string. The scanf family follows glibc in the C locale as measured: the return value is the number
+ * of stored conversions, or -1 (EOF) when the input ended or failed before the first conversion finished; %d %i %u %o %x %X %b
+ * %p (also "(nil)") %f %e %g %a (and the capital forms, inf, nan, hexadecimal) %s %c %[...] %n %%, the modifiers hh h l ll q L
+ * j z t, the width, the assignment suppression '*', the allocating 'm', positional '%N$', w8..w64 and wf8..wf64. Integer
+ * overflow stores the clamped value and sets ERANGE; %Lf (long double) is not supported (EINVAL, nothing stored); the wide
+ * forms (%lc %ls %l[ %C %S) take ASCII only (EILSEQ otherwise); the ' and I flags have no effect. The old GNU "%as" allocating
+ * form is not provided. */
+int   sscanf(const char *s, const char *fmt, ...);
+int   vsscanf(const char *s, const char *fmt, va_list ap);
 
 /* Output (freestanding only — these issue the write syscall). */
 void print(const char *s);

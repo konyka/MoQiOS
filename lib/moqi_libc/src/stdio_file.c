@@ -3,7 +3,7 @@
  * The code is written against the hooks below, so the host test can build it with an in-memory file system:
  *   NAME(x)        the exported name (the test renames them);
  *   IO_OPEN/READ/WRITE/LSEEK/CLOSE/GETFL   system calls returning -errno;
- *   MEM_ALLOC/MEM_FREE;
+ *   MEM_ALLOC/MEM_FREE/MEM_REALLOC;
  *   LIST_LOCK/LIST_UNLOCK   guard the list of open streams (threads may fopen/fclose/fflush(NULL) at the same time).
  */
 /* The including file defines the hooks before including this one (stdio_streams.c for the system, test_file_abi.c for the
@@ -16,6 +16,7 @@
 #endif
 
 #include "stdio_file.h"
+#include "scan.h"
 
 #define O_EXCL_ 0x80
 
@@ -562,6 +563,46 @@ int NAME(fprintf)(struct FILE_s *f, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     int n = NAME(vfprintf)(f, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+/* ---- formatted input ------------------------------------------------------------------------------------------- */
+
+/* The scanf engine (scan.c) reads through these: one byte at a time out of the read window, and a byte it pushes back is
+ * simply stepped over again (it was just taken from the window, so it is still there). */
+static int scan_get(void *ctx) {
+    struct FILE_s *f = (struct FILE_s *)ctx;
+    if (f->rpos >= f->rend && fill(f) <= 0) return -1;
+    return f->buf[f->rpos++];
+}
+static void scan_unget(void *ctx, int c) {
+    (void)c;
+    ((struct FILE_s *)ctx)->rpos--;
+}
+static void *scan_alloc(void *old, size_t n) { return MEM_REALLOC(old, n); }
+static void scan_free(void *p) { MEM_FREE(p); }
+
+/* glibc: a stream that cannot be read is EBADF without the error flag, a NULL format EINVAL; pending output is written out
+ * first (the read then starts where the output ended). */
+int NAME(vfscanf)(struct FILE_s *f, const char *fmt, va_list ap) {
+    if (!(f->flags & F_READ)) {
+        errno = EBADF;
+        return -1;
+    }
+    if (!fmt) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (f->wpos && flush_out(f) != 0) return -1;
+    struct moqi_scan_src src = { scan_get, scan_unget, scan_alloc, scan_free, f };
+    return __moqi_vscan(&src, fmt, ap);
+}
+
+int NAME(fscanf)(struct FILE_s *f, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = NAME(vfscanf)(f, fmt, ap);
     va_end(ap);
     return n;
 }
