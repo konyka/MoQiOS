@@ -481,7 +481,7 @@ pub fn epollNotify(fd_type: vfs.FdType, resource_idx: u32, ready_events: u32) vo
                 if (item.resource_idx != resource_idx) continue;
 
                 const interest = item.events & ~EPOLLET & ~EPOLLONESHOT;
-                const matched = ready_events & interest;
+                const matched = @import("epoll_policy.zig").notifyMatch(ready_events, interest);
                 if (matched == 0) continue;
 
                 if (item.is_et) {

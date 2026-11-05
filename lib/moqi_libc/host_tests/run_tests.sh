@@ -149,6 +149,11 @@ $CC $CFLAGS -Dselect=moqi_select -DMOQI_HOST_TEST_SYSCALL -c ../src/select.c -o 
 $CC $CFLAGS -o "$OUT/test_select_abi" test_select_abi.c "$OUT/select.o"
 "$OUT/test_select_abi" || fail=1
 
+echo "== test_epoll_abi =="
+$CC $CFLAGS -Depoll_event=moqi_epoll_event -Depoll_data=moqi_epoll_data -Depoll_data_t=moqi_epoll_data_t -Depoll_create1=moqi_epoll_create1 -Depoll_ctl=moqi_epoll_ctl -Depoll_wait=moqi_epoll_wait -DMOQI_HOST_TEST_SYSCALL -c ../src/epoll.c -o "$OUT/epoll.o"
+$CC $CFLAGS -o "$OUT/test_epoll_abi" test_epoll_abi.c "$OUT/epoll.o"
+"$OUT/test_epoll_abi" || fail=1
+
 echo "== test_getopt_abi =="
 GO_RENAME="-Dgetopt=moqi_getopt -Dgetopt_long=moqi_getopt_long -Dgetopt_long_only=moqi_getopt_long_only -Doptarg=moqi_optarg -Doptind=moqi_optind -Dopterr=moqi_opterr -Doptopt=moqi_optopt -Dgetenv=moqi_getenv_stub"
 $CC $CFLAGS $GO_RENAME -DMOQI_HOST_TEST_SYSCALL -c ../src/getopt.c -o "$OUT/getopt.o"

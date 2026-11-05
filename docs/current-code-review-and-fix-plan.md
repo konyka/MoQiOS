@@ -6817,3 +6817,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 验证：在 Ubuntu 24.04 容器里装 `qemu-system-x86 xorriso ipxe-qemu`（无推荐依赖），`qemu-system-x86_64 -machine q35 ... -device e1000` 能启动；`xorriso` 正常。这**不是**完整的 `zig build smoke`，要靠下一次 CI 运行。
 - 如实说明：①这个 job 之前没有因此被取消过；这是第一次，之后才有了证据；②我没有改 `seabios`（`--no-install-recommends` 下 `qemu-system-x86` 的 BIOS 是否齐全，容器里 `qemu-system-x86_64` 在 q35 下能启动，但**没有**走 Limine 的完整引导流程验证）。
 
+## libc 的 `epoll_*`，以及 `EPOLLHUP`/`EPOLLERR` 在没有被请求时不唤醒 epoll_wait（hello236）
+
+- 缺口：①libc 没有 `<epoll.h>`；②写 hello236 时发现一个内核缺陷：登记时只订阅 `EPOLLIN`、之后写端全部关闭，Linux 的 `epoll_wait` 会返回 `n=1 events=0x10`（`EPOLLHUP`，我用 gcc 在宿主机实测）；这个内核返回 `n=0`，一直等到超时。原因在 `epollNotify`：通知路径用 `ready_events & interest` 判断是否让登记变成就绪，`EPOLLHUP`/`EPOLLERR` 不在 `interest` 里就被丢掉了。而 `epoll_wait` 自己的扫描路径是有的：`always_report = current & (EPOLLERR | EPOLLHUP)`，所以只要已经被唤醒就能正确报告——问题只是没人唤醒它。
+- 红灯：hello236 的 E 项（`n=0 events=0x0`），再加一个全新 epoll 实例的 E2 项排除"MOD 之后的状态"这个干扰（同样 `n=0`）。
+- 实现：`epoll_policy.zig` 新增 `ALWAYS_REPORTED` 和 `notifyMatch(ready, interest) = ready & (interest | ALWAYS_REPORTED)`，`epollNotify` 用它；host 测试 2 个。变异：把 `notifyMatch` 改回 `ready & interest`、把 `ALWAYS_REPORTED` 去掉 `EPOLLHUP`，都被抓住。
+- libc 部分：`include/epoll.h`、`src/epoll.c`（三个函数各一个系统调用，用原生编号 146/147/148；原生 `epoll_wait` 没有 sigmask 参数）。host 测试 `test_epoll_abi.c`：没有 `epoll.c` 时编译失败，写好后通过；六个变异（结构不 packed、`EPOLLET` 值错、`ctl` 的 `fd` 和 `op` 互换、`wait` 超时置零、`create1` 的 flags 置零、`errno` 不设置）全部被抓住。
+- QEMU：hello236 共 18 项全过，包括布局、`EEXIST`/`ENOENT`、超时、水平触发、`MOD`/`DEL`、`EPOLLHUP`、`EBADF`/`EINVAL`。
+- 如实说明：①我没有核对 `EPOLLHUP` 之外其它"总是报告"的情形：poll 路径（`pollWait`）是否有同类遗漏我没查，hello234 里 `poll` 在写端关闭后给 `POLLHUP`，那是 poll 自己扫描的结果；②`epoll_pwait`、`epoll_pwait2`、`epoll_create` 没有封装；③ET（边缘触发）模式下 HUP 通知的行为我没有单独测，`notifyMatch` 在 ET 分支前，所以 HUP 也会受 `last_reported` 去重影响，没有验证。
+

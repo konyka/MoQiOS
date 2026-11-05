@@ -232,6 +232,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello229 | `SA_RESTART`（`read`/`write`/`waitpid`/`wait4`/`readv`/`writev`/`accept`/`recvfrom`）、管道写阻塞、`EINTR`/`EPIPE`、`PIPE_BUF` 原子性 |
 | hello234 | `poll`/`ppoll`/`select` 的 libc 封装在真内核上：管道的 `POLLIN`/`POLLOUT`/`POLLHUP`、`POLLNVAL`、负描述符被忽略、超时、被写者唤醒、信号处理函数打断得 `EINTR`、`ppoll` 掩码挡住信号 |
 | hello235 | 被信号打断的阻塞调用在返回 `-EINTR` **之前**已经运行了处理函数：`epoll_wait`、`futex(FUTEX_WAIT)`、SysV `semop`、`rt_sigtimedwait`、`mq_timedreceive`、`recvmmsg`、`connect` |
+| hello236 | `epoll_*` 的 libc 封装在真内核上：packed 布局、`ADD`/`MOD`/`DEL`、`EEXIST`/`ENOENT`、超时、水平触发、数据字原样返回、写端关闭后的 `EPOLLHUP`、`EBADF`/`EINVAL` |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。
@@ -263,6 +264,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | `src/malloc.c` | 分配器核心（无 syscall；经弱符号 `__moqi_heap_grow` 扩容） |
 | `src/sbrk.c` | 强符号 `__moqi_heap_grow`，基于 brk 实现 |
 | `src/unistd.c` `src/stdio.c` `src/stdlib.c` | 薄 syscall 封装、fd 1 输出与 getenv（仅 freestanding） |
+| `include/epoll.h` `src/epoll.c` | `epoll_create1`/`epoll_ctl`/`epoll_wait`：`struct epoll_event` 是 **packed 的 12 字节**（`events` 偏移 0、8 字节 `data` 联合偏移 4），`EPOLLIN`…`EPOLLET` 等位与 glibc 一致；成功返回内核值，失败 -1 加 errno。没有 `epoll_create`、`epoll_pwait`、`epoll_pwait2` 的封装 |
 | `include/select.h` `src/select.c` | `select`、`fd_set`（128 字节，`FD_SETSIZE` 1024）和 `FD_ZERO/FD_SET/FD_CLR/FD_ISSET`，布局与 glibc 一致（`FD_SET(3)` 使第 0 个 64 位字等于 0x8）；失败 -1 加 errno，超时 0；内核把剩余时间写回非空的 `timeval`。宏不检查描述符是否小于 `FD_SETSIZE` |
 | `include/poll.h` `src/poll.c` | `poll`/`ppoll`：glibc 的 `struct pollfd`（8 字节）和事件位；`poll` 返回就绪描述符个数、超时 0、失败 -1 加 errno（被信号处理函数打断是 `EINTR`）；`ppoll` 的信号掩码大小固定传 8（掩码为 NULL 时传 0）。`select()` 见 `select.h` |
 | `include/errno.h` `time.h` `mman.h` `resource.h` `netdb.h` `byteorder.h` `setjmp.h` `pthread.h` `math.h` `getopt.h` `dirent.h` | 对应的 libc 头文件：`errno`（每线程）、`clock_gettime`/`nanosleep`/`strftime` 等、`mmap` 家族、`getrlimit`/`setrlimit`、`gethostbyname`/`getaddrinfo`（仅 IPv4）、`htons` 家族、`setjmp` 家族（仅 x86-64）、pthread 子集、`<math.h>` 里结果有精确定义的部分 |

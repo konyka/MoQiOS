@@ -70,6 +70,14 @@ pub const EPOLLWAKEUP: u32 = 0x20000000;
 pub const EPOLLEXCLUSIVE: u32 = 0x10000000;
 pub const EPOLLET: u32 = 0x80000000;
 
+/// Events epoll reports whether or not the registration asked for them (Linux: EPOLLERR and EPOLLHUP are always reported).
+pub const ALWAYS_REPORTED: u32 = EPOLLERR | EPOLLHUP;
+
+/// Which of the `ready` bits make a registration with interest `interest` ready: the bits it asked for plus the always-reported ones.
+pub fn notifyMatch(ready: u32, interest: u32) u32 {
+    return ready & (interest | ALWAYS_REPORTED);
+}
+
 /// Bits EPOLLEXCLUSIVE may be combined with (Linux EPOLLEXCLUSIVE_OK_BITS).
 pub const EXCLUSIVE_OK_BITS: u32 = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLWAKEUP | EPOLLET | EPOLLEXCLUSIVE;
 
@@ -162,4 +170,16 @@ test "epoll_pwait2 timeout policy handles null-style infinity and overflow" {
     try std.testing.expect(timeoutMilliseconds(-1, 0) == .invalid);
     try std.testing.expect(timeoutMilliseconds(0, -1) == .invalid);
     try std.testing.expect(timeoutMilliseconds(0, 1_000_000_000) == .invalid);
+}
+
+test "an EPOLLIN-only registration is still made ready by a hang-up or an error" {
+    try std.testing.expectEqual(@as(u32, EPOLLHUP), notifyMatch(EPOLLHUP, EPOLLIN));
+    try std.testing.expectEqual(@as(u32, EPOLLERR), notifyMatch(EPOLLERR, EPOLLOUT));
+    try std.testing.expectEqual(@as(u32, EPOLLHUP | EPOLLIN), notifyMatch(EPOLLHUP | EPOLLIN, EPOLLIN));
+}
+
+test "bits the registration did not ask for, other than ERR and HUP, do not make it ready" {
+    try std.testing.expectEqual(@as(u32, 0), notifyMatch(EPOLLOUT, EPOLLIN));
+    try std.testing.expectEqual(@as(u32, 0), notifyMatch(EPOLLIN, EPOLLOUT));
+    try std.testing.expectEqual(@as(u32, EPOLLIN), notifyMatch(EPOLLIN | EPOLLOUT, EPOLLIN));
 }
