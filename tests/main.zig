@@ -601,7 +601,16 @@ test "FIONBIO updates status flags without changing descriptor flags" {
 test "pipe write propagates status flags for full-pipe EAGAIN" {
     const source = kt.vfs_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "pipeWrite(desc.pipe_idx, buf, count, desc.status_flags)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "status_flags & 0x800 != 0) -11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "const nonblocking = (status_flags & @as(u32, 0x800)) != 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "if (n == count or nonblocking) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return if (n == 0) -11 else @intCast(n);") != null);
+}
+
+test "a blocking pipe write waits on the writers' queue and readers wake it" {
+    const source = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, source, "sched.blockOn(&pipe_write_waiters[pipe_idx]") != null);
+    // every path that makes room or removes the last reader wakes the writers
+    try std.testing.expect(std.mem.count(u8, source, "wakeAll(&pipe_write_waiters[") >= 4);
 }
 
 test "splice propagates nonblocking flags to transfer helpers" {

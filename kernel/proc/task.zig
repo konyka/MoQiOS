@@ -239,6 +239,8 @@ pub const Task = struct {
     /// Pipe reads use task-owned storage so fatal exit cannot leave a stack
     /// node in the global pipe wait queue.
     pipe_read_wait_node: WaitNode = .{ .task_idx = 0 },
+    /// Same for a writer waiting for room in a full pipe.
+    pipe_write_wait_node: WaitNode = .{ .task_idx = 0 },
     mq_waiter: MqWaiter = .{},
     mq_waiter_generation: u64 = 0,
 
@@ -1082,6 +1084,7 @@ pub fn exitTask(exit_code: i32) void {
     // LAST reference runs the close loop and returns the table to the pool;
     // a shared table (refs > 1) is left untouched for the surviving threads.
     @import("../fs/vfs.zig").detachPipeReadWaiter(&t.pipe_read_wait_node);
+    @import("../fs/vfs.zig").detachPipeWriteWaiter(&t.pipe_write_wait_node);
     {
         const vfs = @import("../fs/vfs.zig");
         if (vfs.releaseFdTable(t.fd_table)) {
@@ -1402,6 +1405,7 @@ pub fn abortUnpublishedChild(slot: u32) bool {
     };
 
     @import("../fs/vfs.zig").detachPipeReadWaiter(&t.pipe_read_wait_node);
+    @import("../fs/vfs.zig").detachPipeWriteWaiter(&t.pipe_write_wait_node);
     {
         const vfs = @import("../fs/vfs.zig");
         if (vfs.releaseFdTable(t.fd_table)) {

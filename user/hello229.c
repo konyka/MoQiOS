@@ -178,6 +178,87 @@ int main(int argc, char **argv, char **envp) {
         close(sv[1]);
     }
 
+    /* F: a blocking write to a full pipe waits for room (pipe capacity is 4095 bytes). */
+    static char big[10000];
+    for (int i = 0; i < 10000; i++) big[i] = (char)(i % 251);
+    install(0);
+    signal(SIGPIPE, SIG_IGN);
+
+    /* F1: 10000 bytes through a 4095-byte pipe to a slow reader arrive complete and in order. */
+    pipe(p);
+    kid = fork();
+    if (kid == 0) {
+        close(p[1]);
+        pause_ms(100);
+        long total = 0;
+        int ok = 1;
+        for (;;) {
+            char rb[512];
+            long n = read(p[0], rb, sizeof rb);
+            if (n <= 0) break;
+            for (long i = 0; i < n; i++) if (rb[i] != (char)((total + i) % 251)) ok = 0;
+            total += n;
+        }
+        _exit(ok && total == 10000 ? 0 : 1);
+    }
+    close(p[0]);
+    r = write(p[1], big, 10000);
+    close(p[1]);
+    st = -1;
+    waitpid(kid, &st, 0);
+    check(r == 10000, "F: a blocking write of 10000 bytes to a pipe that holds 4095 returns 10000");
+    check(((st >> 8) & 0xff) == 0 && (st & 0x7f) == 0, "F: and the slow reader got all 10000 bytes in order");
+
+    /* F2: a full pipe: a non-blocking write says EAGAIN; a blocking one waits, is interrupted by a handler without SA_RESTART
+     * (EINTR), and runs on to completion with SA_RESTART once the reader makes room. */
+    pipe(p);
+    r = write(p[1], big, 4095);
+    check(r == 4095, "F: the pipe takes 4095 bytes");
+    long fl = syscall3(142 /* fcntl */, p[1], 3 /* F_GETFL */, 0);
+    syscall3(142, p[1], 4 /* F_SETFL */, fl | 0x800 /* O_NONBLOCK */);
+    r = write(p[1], big, 10);
+    check(r == -EAGAIN, "F: a non-blocking write to a full pipe is -EAGAIN");
+    syscall3(142, p[1], 4, fl);
+
+    kid = spawn_signaller(me, -1, (const char *)0, 0);
+    r = write(p[1], big, 10);
+    check(r == -EINTR && hits == 1, "F: a blocking write to a full pipe is interrupted by a handler (EINTR, nothing written)");
+    waitpid(kid, (int *)0, 0);
+
+    install(SA_RESTART_BIT);
+    kid = fork();
+    if (kid == 0) {
+        pause_ms(60);
+        kill(me, SIGUSR1);
+        pause_ms(60);
+        char rb[5000];
+        long n = read(p[0], rb, sizeof rb);
+        _exit(n == 4095 ? 0 : 1);
+    }
+    r = write(p[1], big, 10);
+    check(r == 10 && hits == 1, "F: with SA_RESTART the blocked write waits through the handler and completes when the reader makes room");
+    st = -1;
+    waitpid(kid, &st, 0);
+    check(((st >> 8) & 0xff) == 0, "F: and the reader saw the 4095 bytes first");
+    close(p[0]);
+    close(p[1]);
+
+    /* F3: the reader goes away while the writer waits: EPIPE (SIGPIPE is ignored here). */
+    install(0);
+    pipe(p);
+    r = write(p[1], big, 4095);
+    kid = fork();
+    if (kid == 0) {
+        pause_ms(80);
+        close(p[0]);
+        _exit(0);
+    }
+    close(p[0]);
+    r = write(p[1], big, 10);
+    check(r == -32 /* EPIPE */, "F: a writer waiting on a full pipe whose last reader closes gets EPIPE");
+    waitpid(kid, (int *)0, 0);
+    close(p[1]);
+
     print(failures == 0 ? "hello229: PASS\n" : "hello229: FAIL\n");
     return failures;
 }

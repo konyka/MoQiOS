@@ -105,6 +105,28 @@ var pipes: [16]PipeBuffer = @splat(.{
 var pipe_count: u32 = 0;
 var pipe_lock: IrqSpinlock = .{};
 var pipe_read_waiters: [16]?*@import("../proc/task.zig").WaitNode = @splat(null);
+/// Writers blocked on a full pipe; woken by every read that makes room and by the last reader closing.
+var pipe_write_waiters: [16]?*@import("../proc/task.zig").WaitNode = @splat(null);
+
+/// Same as unlinkPipeReadWaiterLocked for the writers' queue. Caller holds pipe_lock.
+fn unlinkPipeWriteWaiterLocked(pipe_idx: u32, node: *@import("../proc/task.zig").WaitNode) void {
+    var prev: ?*@import("../proc/task.zig").WaitNode = null;
+    var current = pipe_write_waiters[pipe_idx];
+    while (current) |waiter| {
+        if (waiter == node) {
+            if (prev) |previous| {
+                previous.next = waiter.next;
+            } else {
+                pipe_write_waiters[pipe_idx] = waiter.next;
+            }
+            waiter.next = null;
+            return;
+        }
+        prev = waiter;
+        current = waiter.next;
+    }
+    node.next = null;
+}
 
 /// Detach a pipe reader before its stack WaitNode can be reused or returned.
 /// wakeOne/wakeAll may have already unlinked the node, so this is idempotent.
@@ -263,6 +285,7 @@ pub fn pipeRead(pipe_idx: u32, buf: [*]u8, count: usize, status_flags: u32) i64 
             pipe.head = (pipe.head + 1) % PIPE_BUF_SIZE;
             n += 1;
         }
+        if (n > 0) sched.wakeAll(&pipe_write_waiters[pipe_idx]);
         pipe_lock.release(flags);
         if (n > 0) {
             const epoll_r = @import("../net/epoll.zig");
@@ -278,6 +301,16 @@ pub fn detachPipeReadWaiter(node: *@import("../proc/task.zig").WaitNode) void {
     const flags = pipe_lock.acquire();
     for (0..pipe_read_waiters.len) |pipe_idx| {
         unlinkPipeReadWaiterLocked(@intCast(pipe_idx), node);
+    }
+    node.next = null;
+    pipe_lock.release(flags);
+}
+
+/// Remove a task-owned pipe writer before fatal task teardown.
+pub fn detachPipeWriteWaiter(node: *@import("../proc/task.zig").WaitNode) void {
+    const flags = pipe_lock.acquire();
+    for (0..pipe_write_waiters.len) |pipe_idx| {
+        unlinkPipeWriteWaiterLocked(@intCast(pipe_idx), node);
     }
     node.next = null;
     pipe_lock.release(flags);
@@ -367,6 +400,7 @@ pub fn pipeCommitRead(token: PipeReadToken, count: usize) i64 {
     const n: u32 = @intCast(@min(count, @as(usize, pipe.read_reservation)));
     pipe.head = (pipe.head + n) % PIPE_BUF_SIZE;
     pipe.read_reservation -= n;
+    if (n > 0) @import("../proc/sched.zig").wakeAll(&pipe_write_waiters[token.pipe_idx]);
     pipe_lock.release(flags);
     if (n > 0) {
         const epoll_r = @import("../net/epoll.zig");
@@ -424,6 +458,7 @@ pub fn pipeTransfer(src_idx: u32, dst_idx: u32, count: usize) i64 {
     if (n > 0) {
         const sched = @import("../proc/sched.zig");
         _ = sched.wakeOne(&pipe_read_waiters[dst_idx]);
+        sched.wakeAll(&pipe_write_waiters[src_idx]);
     }
     pipe_lock.release(flags);
     if (n > 0) {
@@ -436,38 +471,80 @@ pub fn pipeTransfer(src_idx: u32, dst_idx: u32, count: usize) i64 {
 
 pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u32) i64 {
     if (pipe_idx >= 16) return -1;
-    const flags = pipe_lock.acquire();
-    const pipe = &pipes[pipe_idx];
-    if (pipe.ref_count == 0) {
-        pipe_lock.release(flags);
-        return -1;
-    }
-    if (pipe.read_refs == 0) {
-        pipe_lock.release(flags);
-        // Read end is gone — Linux semantics: SIGPIPE to the writer, -EPIPE.
-        // Previously the data silently accumulated in the buffer.
-        const sig_mod = @import("../proc/signal.zig");
-        sig_mod.raiseSelf(sig_mod.SIGPIPE);
-        return -32; // EPIPE
-    }
+    if (count == 0) return 0;
+    const sched = @import("../proc/sched.zig");
+    const task_mod = @import("../proc/task.zig");
+    const sig_mod = @import("../proc/signal.zig");
+    const nonblocking = (status_flags & @as(u32, 0x800)) != 0;
     var n: usize = 0;
-    while (n < count) {
-        const next = (pipe.tail + 1) % PIPE_BUF_SIZE;
-        if (next == pipe.head) break;
-        pipe.buf[pipe.tail] = buf[n];
-        pipe.tail = next;
-        n += 1;
+    while (true) {
+        const flags = pipe_lock.acquire();
+        const pipe = &pipes[pipe_idx];
+        if (pipe.ref_count == 0) {
+            pipe_lock.release(flags);
+            return if (n > 0) @intCast(n) else -1;
+        }
+        if (pipe.read_refs == 0) {
+            pipe_lock.release(flags);
+            // Read end is gone -- Linux semantics: SIGPIPE to the writer, -EPIPE (or the bytes already written).
+            sig_mod.raiseSelf(sig_mod.SIGPIPE);
+            return if (n > 0) @intCast(n) else -32; // EPIPE
+        }
+        const before = n;
+        while (n < count) {
+            const next = (pipe.tail + 1) % PIPE_BUF_SIZE;
+            if (next == pipe.head) break;
+            pipe.buf[pipe.tail] = buf[n];
+            pipe.tail = next;
+            n += 1;
+        }
+        if (n > before) _ = sched.wakeOne(&pipe_read_waiters[pipe_idx]);
+        if (n == count or nonblocking) {
+            pipe_lock.release(flags);
+            if (n > before) {
+                const epoll_w = @import("../net/epoll.zig");
+                epoll_w.epollNotify(.pipe_read, pipe_idx, epoll_w.EPOLLIN);
+            }
+            return if (n == 0) -11 else @intCast(n);
+        }
+        // Full with bytes still to write: wait for a reader to make room. A signal that would be acted on ends the wait first
+        // (a fatal one kills the task; a handled one returns what was written, or EINTR when nothing was).
+        const cur = task_mod.getTask(sched.currentTaskIndex() orelse {
+            pipe_lock.release(flags);
+            return if (n > 0) @intCast(n) else -1;
+        }) orelse {
+            pipe_lock.release(flags);
+            return if (n > 0) @intCast(n) else -1;
+        };
+        if (sig_mod.pendingFatal(cur)) |sig| {
+            pipe_lock.release(flags);
+            task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+        }
+        if (sig_mod.pendingActionable(cur)) {
+            pipe_lock.release(flags);
+            if (n > before) {
+                const epoll_w = @import("../net/epoll.zig");
+                epoll_w.epollNotify(.pipe_read, pipe_idx, epoll_w.EPOLLIN);
+            }
+            return if (n > 0) @intCast(n) else -4; // EINTR
+        }
+        const node = &cur.pipe_write_wait_node;
+        node.granted = false;
+        node.next = null;
+        if (!sched.blockOn(&pipe_write_waiters[pipe_idx], node)) {
+            pipe_lock.release(flags);
+            return if (n > 0) @intCast(n) else -1;
+        }
+        pipe_lock.release(flags);
+        if (n > before) {
+            const epoll_w = @import("../net/epoll.zig");
+            epoll_w.epollNotify(.pipe_read, pipe_idx, epoll_w.EPOLLIN);
+        }
+        sched.rescheduleAfterBlock();
+        const cleanup = pipe_lock.acquire();
+        unlinkPipeWriteWaiterLocked(pipe_idx, node);
+        pipe_lock.release(cleanup);
     }
-    if (n > 0) {
-        const sched = @import("../proc/sched.zig");
-        _ = sched.wakeOne(&pipe_read_waiters[pipe_idx]);
-    }
-    pipe_lock.release(flags);
-    if (n > 0) {
-        const epoll_w = @import("../net/epoll.zig");
-        epoll_w.epollNotify(.pipe_read, pipe_idx, epoll_w.EPOLLIN);
-    }
-    return if (n == 0 and status_flags & 0x800 != 0) -11 else if (n == 0) -1 else @intCast(n);
 }
 
 /// Drop one reference to one end of a pipe; frees the slot when both ends
@@ -491,6 +568,7 @@ pub fn pipeClose(pipe_idx: u32, write_end: bool) void {
     }
     const sched = @import("../proc/sched.zig");
     _ = sched.wakeAll(&pipe_read_waiters[pipe_idx]);
+    sched.wakeAll(&pipe_write_waiters[pipe_idx]);
     pipe_lock.release(flags);
     const epoll_c = @import("../net/epoll.zig");
     epoll_c.epollNotify(.pipe_read, pipe_idx, epoll_c.EPOLLHUP);

@@ -6623,3 +6623,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异：从表里删掉 `recvfrom`(45) 并加入 `connect`(42)，host 测试抓住。
 - 如实说明：①hello229 里只验证了 `readv`、`wait4`、`recvfrom` 三个新增调用的真实行为，`accept`、`sendto`、`sendmsg`、`recvmsg`、`writev` 只靠策略表的单元测试和代码审查，**没有各自的 QEMU 用例**；②`preadv`/`pwritev`/`pread`/`pwrite` 是否阻塞取决于文件类型，未列入可重启表；③`tty` 读走的是 `read`(10)，已包含，但没有单独验证；④仍只有 x86_64 实现。
 
+## 管道写会阻塞（hello229 F 组）
+
+- 缺口：`vfs.pipeWrite` 从不阻塞。管道缓冲只有 4095 字节，阻塞模式的 `write` 遇到满管道直接返回 `-1`，大于 4095 字节的写被截短成 4095；`write` 的调用方（libc `fwrite`、shell 管道、任何大输出）看到的是短写或错误，而不是等待。这是上一轮核对 `SA_RESTART` 时发现的：阻塞的写没有"被信号打断"的可能，因为它根本不睡。
+- 红灯：hello229 新增 F 组 8 项，在改动前 6 项失败：10000 字节写入 4095 字节管道（返回值与慢读者收到的内容各一项）、满管道上被处理函数打断返回 `EINTR`、`SA_RESTART` 下写等到读者腾出空间、写者等待期间最后一个读者关闭得到 `EPIPE`；"管道能装 4095 字节""非阻塞写满管道是 `EAGAIN`""读者先看到 4095 字节"3 项旧内核本来就过。
+- 实现（`kernel/fs/vfs.zig`）：新增每管道的写者等待队列 `pipe_write_waiters` 与 `Task.pipe_write_wait_node`（任务自带的节点，致命退出时由 `detachPipeWriteWaiter` 摘除，与读者一致）；`pipeWrite` 循环：写入能写的部分，唤醒一个读者；写完或非阻塞则返回（非阻塞一个字节也没写是 `-EAGAIN`，写了一部分返回已写字节数）；否则检查信号（致命则退出任务，可处理则返回已写字节数，一个字节没写返回 `-EINTR`），在管道锁下登记到写者队列再睡，醒来后摘除并重试。`pipeRead`、`pipeCommitRead`、`pipeTransfer`、`pipeClose` 在腾出空间或最后一个读者离开时 `wakeAll` 写者。读者全部关闭：已写部分非零则返回字节数（并仍然发 `SIGPIPE`），否则 `-EPIPE`。
+- 主机测试：`tests/main.zig` 把旧的源码文本断言改成新实现的形状，并新增一条断言写者队列与至少 4 处唤醒；删掉 `pipeRead` 里的写者唤醒后该断言失败（变异被抓住）；QEMU 层面同一变异（读者不唤醒写者）让 hello229 卡死、280 秒内没有任何 PASS/FAIL 输出（脚本超时），算被发现，但不是一条干净的 FAIL 行。
+- 如实说明：①这是源码文本断言加 QEMU 行为用例的组合，没有对写者队列的纯函数单元测试（队列在内核全局状态里）；②`splice` 和 `sendfile` 通过 `pipeWrite` 写管道，它们原先拿到短写后结束，现在阻塞模式下会睡到写完——`splice` 路径事先用 `destinationCapacity` 限制了块大小，所以通常不会睡，但没有单独测；③FIFO（命名管道）、`pipe2(O_NONBLOCK)` 的 `status_flags` 沿用同一个 `0x800` 判断；④`PIPE_BUF` 原子性（不超过 4096 字节的写不与其它写者交错）**没有**保证：多个写者同时写满管道时，大写会被分段，段与段之间可能插入别的写者的数据；⑤只在 x86_64 内核上实测（管道代码本身与架构无关）。
+
