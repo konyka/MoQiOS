@@ -6873,3 +6873,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异（4 个，文件已恢复，`grep MUTATION` 为空）：掩码大小改成 16、无掩码时仍传指针、`epoll_pwait` 无掩码时仍传大小 8、超时不拷贝而直接把调用者的指针交给内核，都被 host 测试抓住。第一次的"超时不拷贝"变异因 `-Werror`（变量未使用）没编译过，不算证据，改成能编译的写法重做后才被抓住。
 - QEMU：hello238 共 12 项，第一次运行就全部通过（内核一直是对的，缺的只是封装），所以 QEMU 层是回归保护，不能证明修复前会失败；"修复前会失败"的证据是 host 层的链接失败。
 - 如实说明：①`pselect` 的 `timespec` 不写回，这是 glibc 包装的行为（Linux 系统调用本身会写回）；我没有提供写回版本；②信号掩码参数类型是 `const void *`，不是 `const sigset_t *`，以免 `select.h`/`epoll.h` 依赖 `signal.h`；③只测了管道，没有测套接字和 `timerfd`；④没有 `epoll_pwait2`。
+
+## TCP：监听套接字关闭时，已建立但未被 accept 的连接要收到 RST（hello237 I）
+
+- 缺口：客户端 `connect` 成功（握手完成，连接在服务端的 accept 队列里）而服务端没有 `accept` 就关闭了监听套接字时，Linux 对队列里每个已建立的子连接发 RST（`tcp_close` 对监听套接字的处理）。宿主机实测：客户端 `poll` 得 `0x201d`（`POLLIN|POLLOUT|POLLERR|POLLHUP|POLLRDHUP`），`recv` 先 `-ECONNRESET` 再 0；之后连接同一端口得 `ECONNREFUSED`。这个内核的 `tcpClose` 和 `tcpShutdown` 的监听分支只是 `deactivateTcb` 静默释放队列里的子连接，客户端永远以为连接还在：`poll` 只有可写（`0x4`），`recv` 是 `-EAGAIN`，一直挂着。
+- 红灯：hello237 I 项在旧内核上 `n=1 events=0x4`、`recv (-11, -11)`。
+- 实现：`tcp.zig` 新增 `dropUnacceptedChild`，两处监听关闭分支都改用它：子连接处于 `established`/`close_wait` 时先发 `RST|ACK`，再释放；半开的子连接（`syn_received`，最后一个 ACK 还没到）仍静默丢弃，与 Linux 一致（对端还没认为连接建立）。
+- 变异：把发 RST 的条件改成 `.syn_received`（等于不发），hello237 I 回到 `events=0x4`、`(-11, -11)`，被抓住，文件已恢复。
+- QEMU：hello237 共 H、I 等所有项通过（I 项第一次修复后 `0x201d`、`(-104, 0)`）。
+- 如实说明：①只测了 `tcpClose` 路径（`close`）；`tcpShutdown` 的监听分支用了同一个函数，但没有单独的用例；②IPv6 监听套接字走同一个分支，没有测；③`syn_received` 的半开子连接 Linux 不发 RST，我没有在宿主机上单独验证这一点（读自内核行为，不是实测）；④关闭后"再连同一端口得 `ECONNREFUSED`"这个行为没有新加用例，hello134/hello160 等已有 ECONNREFUSED 用例覆盖了监听不存在的端口。

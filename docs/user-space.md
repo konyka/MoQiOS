@@ -233,7 +233,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello234 | `poll`/`ppoll`/`select` 的 libc 封装在真内核上：管道的 `POLLIN`/`POLLOUT`/`POLLHUP`、`POLLNVAL`、负描述符被忽略、超时、被写者唤醒、信号处理函数打断得 `EINTR`、`ppoll` 掩码挡住信号 |
 | hello235 | 被信号打断的阻塞调用在返回 `-EINTR` **之前**已经运行了处理函数：`epoll_wait`、`futex(FUTEX_WAIT)`、SysV `semop`、`rt_sigtimedwait`、`mq_timedreceive`、`recvmmsg`、`connect` |
 | hello236 | `epoll_*` 的 libc 封装在真内核上：packed 布局、`ADD`/`MOD`/`DEL`、`EEXIST`/`ENOENT`、超时、水平触发、数据字原样返回、写端关闭后的 `EPOLLHUP`、`EBADF`/`EINVAL` |
-| hello237 | TCP 套接字上的 epoll（回环，靠 `netpoll` 推进）：`EPOLLET` 只报新边沿；正常 FIN 关闭给 `EPOLLIN\|EPOLLRDHUP`（`0x2001`）；对端关闭时带着未读数据（RST）给 `0x2019` |
+| hello237 | TCP 套接字上的 epoll（回环，靠 `netpoll` 推进）：`EPOLLET` 只报新边沿；正常 FIN 关闭给 `EPOLLIN\|EPOLLRDHUP`（`0x2001`）；对端关闭时带着未读数据（RST）给 `0x2019`；被 RST 唤醒的阻塞 `recv`；监听套接字关闭时尚未被 `accept` 的已建立连接收到 RST（`0x201d`，`recv` 先 `-ECONNRESET` 再 0） |
 | hello238 | `pselect` 与 `epoll_pwait` 的 libc 封装在真内核上：超时、`timespec` 不被改写、就绪管道；信号被阻塞且待处理时，空的临时掩码让处理函数先运行、调用以 `EINTR` 失败、旧掩码恢复；掩码为 NULL 时阻塞的信号不打断等待 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

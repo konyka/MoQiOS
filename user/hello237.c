@@ -273,6 +273,44 @@ int main(int argc, char **argv, char **envp) {
         check(0, "H: a connected loopback pair could not be made");
     }
 
+    /* I: a connection that completed the handshake but was never accepted is reset when the listener closes (Linux tcp_close on a
+     * listening socket sends RST to every queued child): the client sees EPOLLIN|EPOLLERR|EPOLLHUP|EPOLLRDHUP (0x2019) and recv
+     * gives -ECONNRESET, then 0. Measured on Linux: poll revents 0x201d with POLLOUT, recv -104, then 0. */
+    {
+        unsigned char sa[16];
+        int port = port_next++;
+        mk_addr(sa, port);
+        long ls = syscall3(SYS_socket, 2, 1, 0);
+        int ok = ls >= 0 && syscall3(SYS_bind, ls, (long)sa, 16) == 0 && syscall3(SYS_listen, ls, 4, 0) == 0;
+        long c = syscall3(SYS_socket, 2, 1, 0);
+        long r = ok ? syscall3(SYS_connect, c, (long)sa, 16) : -1;
+        for (int i = 0; ok && i < 100 && r < 0 && r != -106; i++) {
+            pump(20);
+            r = syscall3(SYS_connect, c, (long)sa, 16);
+        }
+        pump(100);
+        close((int)ls);
+        pump(100);
+        int ep9 = epoll_create1(0);
+        struct epoll_event ev9, o9[2];
+        memset(&ev9, 0, sizeof ev9);
+        ev9.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
+        ev9.data.fd = (int)c;
+        epoll_ctl(ep9, EPOLL_CTL_ADD, (int)c, &ev9);
+        memset(o9, 0, sizeof o9);
+        int n9 = wait_ev(ep9, o9, 500);
+        char what[160];
+        snprintf(what, sizeof what, "I: a never-accepted connection is reported reset when the listener closes, 0x201d (n=%d events=0x%x)", n9, n9 > 0 ? o9[0].events : 0u);
+        check(ok && r == 0 && n9 == 1 && o9[0].events == 0x201d, what);
+        char rb[8];
+        long r1 = syscall6(SYS_recvfrom, c, (long)rb, sizeof rb, 0x40 /* MSG_DONTWAIT */, 0, 0);
+        long r2 = syscall6(SYS_recvfrom, c, (long)rb, sizeof rb, 0x40, 0, 0);
+        snprintf(what, sizeof what, "I: recv gives -ECONNRESET once, then 0 (%ld, %ld)", r1, r2);
+        check(r1 == -104 && r2 == 0, what);
+        close(ep9);
+        close((int)c);
+    }
+
     print(failures == 0 ? "hello237: PASS\n" : "hello237: FAIL\n");
     return failures;
 }

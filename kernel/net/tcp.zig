@@ -506,6 +506,18 @@ inline fn deactivateTcb(tcb: *TcpTcb) void {
     markRecvWake(tcb);
 }
 
+/// A listener is closing and this child was never accepted. Linux resets a child whose handshake completed (it sits in the
+/// accept queue, so the peer believes it is connected); a half-open child (SYN-ACK sent, final ACK not yet seen) is dropped
+/// silently. Caller holds tcp_lock.
+fn dropUnacceptedChild(child: *TcpTcb) void {
+    if (child.state == .established or child.state == .close_wait) {
+        _ = sendSegment(child, RST | ACK, undefined, 0);
+        tcpLog("[tcp] unaccepted child reset on listener close\n");
+    }
+    child.state = .closed;
+    deactivateTcb(child);
+}
+
 /// Marker for a backlog ring entry whose handshake died (never a real TCB
 /// index — MAX_CONNECTIONS is 64).
 const INVALID_PENDING: u32 = 0xFFFF_FFFF;
@@ -3706,7 +3718,7 @@ pub fn tcpClose(tcb_idx: u32) i64 {
                     while (ls.pending_head != ls.pending_tail) {
                         const pidx = ls.pending_tpbs[ls.pending_head % LISTEN_BACKLOG];
                         ls.pending_head += 1;
-                        if (pidx < MAX_CONNECTIONS and tcbs[pidx].active) deactivateTcb(&tcbs[pidx]);
+                        if (pidx < MAX_CONNECTIONS and tcbs[pidx].active) dropUnacceptedChild(&tcbs[pidx]);
                     }
                     listen_active_bitmap &= ~(@as(u64, 1) << @intCast(i));
                     ls.active = false;
@@ -4411,7 +4423,7 @@ pub fn tcpShutdown(tcb_idx: u32, how: u32) i64 {
                             while (ls.pending_head != ls.pending_tail) {
                                 const pidx = ls.pending_tpbs[ls.pending_head % LISTEN_BACKLOG];
                                 ls.pending_head += 1;
-                                if (pidx < MAX_CONNECTIONS and tcbs[pidx].active) deactivateTcb(&tcbs[pidx]);
+                                if (pidx < MAX_CONNECTIONS and tcbs[pidx].active) dropUnacceptedChild(&tcbs[pidx]);
                             }
                             listen_active_bitmap &= ~(@as(u64, 1) << @intCast(i));
                             ls.active = false;
