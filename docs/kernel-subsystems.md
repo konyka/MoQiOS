@@ -902,7 +902,9 @@ const SchedStats = struct {
 - flat binary loader 当前最多接受 256 个 code pages；`sched_setaffinity` 修改 ready task 时也会迁移其 runnable entry，避免旧 CPU 队列因 affinity 过滤而丢失该任务。
 - `pipe2` 只接受 `O_CLOEXEC`/`O_NONBLOCK`；`O_CLOEXEC` 设置 close-on-exec，`O_NONBLOCK` 设置在读写两端并由 pipe I/O 返回 `EAGAIN`，未知 flags 返回 `EINVAL`。
 - `ioctl(FIONBIO)` 同样修改 descriptor 的 `status_flags` 中的 `O_NONBLOCK`，不会触碰 `fd_flags` 的 close-on-exec 状态；非零参数启用，零参数清除。
-- pipe 写端同样遵守 `O_NONBLOCK`：满 pipe 且零进度时返回 `EAGAIN`，读端关闭时仍优先返回 `EPIPE`。
+- pipe 写端同样遵守 `O_NONBLOCK`：满 pipe 且零进度时返回 `EAGAIN`，读端关闭时仍优先返回 `EPIPE`。阻塞模式下的行为见下一条。
+- **管道写阻塞与原子性（hello229 F/G 组）**：`vfs.pipeWrite` 在管道满、还有字节没写时睡在每管道的写者队列 `pipe_write_waiters` 上（节点是任务自带的 `pipe_write_wait_node`，致命退出时由 `detachPipeWriteWaiter` 摘除），`pipeRead`、`pipeCommitRead`、`pipeTransfer` 腾出空间时、`pipeClose` 关闭最后一个读者时 `wakeAll` 写者。睡之前和醒来后检查信号：致命信号 `exitTask`，可处理的信号返回已写字节数，一个字节没写返回 `-EINTR`。读者全部关闭：已写部分非零返回字节数（并发 `SIGPIPE`），否则 `-EPIPE`。管道容量是 4095 字节，不超过它的写是原子的（整块放得下才写，阻塞则等管道读空，非阻塞放不下返回 `EAGAIN`），更大的写分段放入。
+- **`SA_RESTART`（hello229）**：`proc/syscall_restart_policy.zig` 定义可重启的调用（`read/write/waitpid/wait4/readv/writev/accept/accept4/sendto/recvfrom/sendmsg/recvmsg`，含 Linux 编号），`syscallDispatch` 把调用号记进 `Task.syscall_nr`；`deliverSignalOnSyscallReturn` 在写信号帧之前，对 `-EINTR` 且处理函数带 `SA_RESTART` 的情形把保存的 rax 改回调用号、rip 退回 2 字节，`sigreturn` 后重新执行 `syscall`。这些调用的分发分支都在返回前调用 `checkSignalsOnSyscallReturn`。`pendingActionable` 对 `SIG_IGN` 的信号不再视为可打断。`connect`、`flock`、`futex`、睡眠、`pause`、`sigsuspend`、poll/epoll/select 不重启。只有 x86_64 实现。
 - splice 的 pipe→file/socket reservation 路径在阻塞模式下等待 live pipe 数据；`SPLICE_F_NONBLOCK` 或 descriptor `O_NONBLOCK` 返回零进度 `EAGAIN`，写端关闭保持 EOF。pipe→pipe 的完整阻塞 transfer 仍是后续项。
 - pipe→pipe splice 在零进度时返回 `EAGAIN`，避免 destination-full 或空源 pipe 被伪报为 EOF/成功；完整阻塞 source/destination wait queue 语义仍是后续项。
 - `fsync`/`fdatasync` 仅接受 ext2/FAT32 regular-file descriptors；pipe、socket、eventfd 等非文件描述符返回 `EINVAL`。
@@ -1610,8 +1612,8 @@ syscall #484、task reap 双站点 cleanup。
   按 seq 完成并唤醒客户端。队列满时：阻塞式客户端睡在专门的 `space_wq`
   上直到某槽释放（collect/cancel/drain 时唤醒）；`O_NONBLOCK` 客户端立即
   `-EAGAIN`——**O_NONBLOCK 只门控入队接受**，入队后的往返等待两种 fd 都
-  阻塞（与本内核 pipe 语义一致：pipeRead/pipeWrite 同样从不中途阻塞，
-  见 vfs.zig）。客户端阻塞遵循 pendingFatal/pendingActionable
+  阻塞（pipeRead 同样先睡后读；pipeWrite 现在也会在管道满时睡到读者腾出空间，
+  见 vfs.zig 与下文“管道写阻塞”）。客户端阻塞遵循 pendingFatal/pendingActionable
   协议（致命信号走 exitTask，可处理信号 `-EINTR` 并取消请求：queued 直接
   释放，inflight 标记 cancelled、迟到的响应被接受但丢弃）。阻塞期间**不持
   有任何 vfs/devfs 锁**——锁序：`alloc_lock → node.lock（IrqSpinlock）→

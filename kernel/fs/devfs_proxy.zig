@@ -34,8 +34,8 @@
 ///     slot); a dead owner always reports both (ops fail fast with -EIO).
 ///   - O_NONBLOCK gates enqueue acceptance only: a saturated queue fails
 ///     with -EAGAIN instead of blocking the client. The round-trip wait
-///     itself stays blocking either way (this kernel's pipes likewise
-///     never block mid-operation — see vfs.pipeRead/pipeWrite).
+///     itself stays blocking either way (an O_NONBLOCK pipe likewise only
+///     refuses to START waiting — see vfs.pipeRead/pipeWrite).
 ///   - Tombstoned devfs slots and drained proxy slots are reused
 ///     (oldest-first). Reuse fully resets the slot (request queue, wait
 ///     queues, owner) and is guarded by the devfs slot generation, so
@@ -465,7 +465,7 @@ fn checkSignals() ?i64 {
 /// critical sections.
 ///
 /// O_NONBLOCK gates ENQUEUE ACCEPTANCE ONLY (pipe-style, see vfs
-/// pipeRead/pipeWrite which never block either): a saturated request
+/// pipeRead/pipeWrite where O_NONBLOCK likewise refuses to start waiting): a saturated request
 /// queue fails a nonblocking client with -EAGAIN, while a blocking
 /// client sleeps on space_wq until a slot frees. Once enqueued, the
 /// round-trip wait blocks either way — a half-delivered request must not

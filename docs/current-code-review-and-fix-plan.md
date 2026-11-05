@@ -6696,3 +6696,9 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 结果：hello227 共 87 项，SMP=1 全过。
 - 如实说明：①"内核环境表写满返回 1"这条路径**没有用例**（需要先写满 ENV_MAX_VARS 个变量，x86 下是 32 个，没有写这个测试）；②`export NAME` 只是接受，不会把一个已存在于内核表而不在 `environ` 里的变量补进 `environ`；③`pwd` 在 `getcwd` 失败时仍返回 0，未改（`getcwd` 在正常运行中不会失败）。
 
+## 旧注释和文档里"管道从不阻塞"的说法（核对）
+
+- `docs/kernel-subsystems.md`（devfs 代理一节）和 `kernel/fs/devfs_proxy.zig` 的两处注释都写着"本内核的管道从不中途阻塞（pipeRead/pipeWrite）"。这在管道写阻塞（hello229 F 组）之前对写是真的，对读本来就不对（空管道读会睡）。现在三处都改成了准确的说法：O_NONBLOCK 只是拒绝开始等待。
+- `docs/kernel-subsystems.md` 新增"管道写阻塞与原子性"和"`SA_RESTART`"两条，描述实现与限制（以前这两项只在 `current-code-review-and-fix-plan.md` 的流水记录里，没有进入子系统文档）。
+- 其余引用 `pipeWrite` 的文字都是上面两节的流水记录本身，不需要改。
+
