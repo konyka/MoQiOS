@@ -6770,3 +6770,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修改：`docs/user-space.md`（init 范围、测试程序总范围）、`docs/moqios-architecture-current.md`（五处 hello2–hello101）、`README.md`、`README.en.md`（规模数字，并在测试程序表前注明表只列早期用例、完整情况看 user-space.md 第 4 节）。
 - 如实说明：①"hello2–hello229"是序列的两端，序列中间并不连续（上面那 14 个不在其中）；②规模数字是一次 `wc -l` 的取整结果，会随提交变化，所以写成"约"并注明统计口径和时间；③`docs/` 里其它文件的数字（例如各轮验证记录里的"host 720/720"）是当时的历史记录，没有改。
 
+## libc 的 `poll`/`ppoll`，以及 `poll`/`select` 被信号打断时处理函数不运行（hello234）
+
+- 缺口：①libc 没有 `poll`/`ppoll`（`<poll.h>` 不存在），用户程序只能自己写汇编式系统调用；这也是 `docs/user-space.md` 第 5.4 节"有意缺失"之外、从未被列出的缺口。②在写 hello234 的时候发现一个内核缺陷：native 编号 162（`poll`）、163 和 23（`select`）的分发分支**没有**调用 `checkSignalsOnSyscallReturn`，而 `ppoll`(493)、`pselect6`(494)、`epoll_pwait` 都调用了。所以 `poll` 在等待期间被信号打断时返回 `-EINTR`，但**信号处理函数不会在返回前运行**，要等到下一次系统调用或时钟中断才跑；对应 Linux 的行为是处理函数在 `poll` 返回 `-1/EINTR` 之前已经跑过（我在宿主机用 gcc 实测：`r=-1 errno=4 hits=1`）。
+- 红灯：先写 host 测试 `test_poll_abi.c`（`SYS_poll`/`SYS_ppoll` 编号、参数传递、错误转换、掩码大小规则），在没有 `src/poll.c` 时编译失败；写好实现后通过。hello234（QEMU）第一次跑 F 项失败：`r=-1 errno=4 hits=0`——正是上面第②点。G 项也失败过一次，但那是我的测试期望错了（我以为被掩码挡住的信号在 `ppoll` 返回后仍未投递；Linux 实测 `r=0 hits=1`，信号在恢复旧掩码后立即投递），改成与 Linux 一致的期望。
+- 实现：`include/poll.h`、`src/poll.c`（各一个系统调用，错误转换成 -1/errno）、`moqi_syscalls.h` 加 `SYS_poll=162`、`SYS_ppoll=493`、`hostsys.h` 加 `MSYS5`；内核 `syscall_entry.zig` 的 162、163、23 三个分支补上 `checkSignalsOnSyscallReturn(frame)`。
+- 变异（wrapper，host 测试）：把 `poll` 的超时参数改成常量 → 被抓住；`ppoll` 的掩码大小恒为 8 → 第一版测试**没抓住**（我只检查了有掩码时的 8，没检查无掩码时必须是 0），补上无掩码的断言后抓住；`errno` 不设置、错误返回 0、`ppoll` 用错系统调用号 → 都被抓住。
+- 如实说明：①内核补上的三个 `checkSignalsOnSyscallReturn` 没有 host 层的保护，只靠 hello234 的 F 项；②Linux 的 `poll` 号是 7，这里 7 是 `brk`，所以 `poll` 只有 native 编号 162，`select` 有 162 以外的 163 和 23 两个；③`select()` 仍然没有 libc 封装；④`pselect6`、`epoll_*` 没有 libc 封装也没有出现在头文件里。
+

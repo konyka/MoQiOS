@@ -139,6 +139,11 @@ $CC $CFLAGS $PX_RENAME -DMOQI_HOST_TEST_SYSCALL -c ../src/posix.c -o "$OUT/posix
 $CC $CFLAGS -o "$OUT/test_posix_abi" test_posix_abi.c "$OUT/posix.o"
 "$OUT/test_posix_abi" || fail=1
 
+echo "== test_poll_abi =="
+$CC $CFLAGS -Dpoll=moqi_poll -Dppoll=moqi_ppoll -DMOQI_HOST_TEST_SYSCALL -c ../src/poll.c -o "$OUT/poll.o"
+$CC $CFLAGS -o "$OUT/test_poll_abi" test_poll_abi.c "$OUT/poll.o"
+"$OUT/test_poll_abi" || fail=1
+
 echo "== test_getopt_abi =="
 GO_RENAME="-Dgetopt=moqi_getopt -Dgetopt_long=moqi_getopt_long -Dgetopt_long_only=moqi_getopt_long_only -Doptarg=moqi_optarg -Doptind=moqi_optind -Dopterr=moqi_opterr -Doptopt=moqi_optopt -Dgetenv=moqi_getenv_stub"
 $CC $CFLAGS $GO_RENAME -DMOQI_HOST_TEST_SYSCALL -c ../src/getopt.c -o "$OUT/getopt.o"

@@ -865,9 +865,11 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         // ── v31.0: Wire existing modules ─────────────────────────
         162 => { // poll(fds, nfds, timeout)
             frame.rax = @bitCast(poll_mod.poll(frame.rdi, frame.rsi, frame.rdx));
+            checkSignalsOnSyscallReturn(frame);
         },
         163 => { // select(nfds, readfds, writefds, exceptfds, timeout)
             frame.rax = @bitCast(select_mod.select(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8));
+            checkSignalsOnSyscallReturn(frame);
         },
         164 => { // mprotect(addr, len, prot)
             frame.rax = @bitCast(mprotect_mod.sysMprotect(frame.rdi, frame.rsi, frame.rdx));
@@ -1671,6 +1673,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         23 => { // select(nfds, readfds, writefds, exceptfds, timeout)
             frame.rax = @bitCast(select_mod.select(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8));
+            checkSignalsOnSyscallReturn(frame);
         },
         24 => { // sched_yield()
             const sched = @import("../../proc/sched.zig");
