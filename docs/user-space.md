@@ -213,6 +213,16 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello44 | SCHED_FIFO / SCHED_RR 实时调度类（F3） |
 | hello50 | SMP 并发压力（J1）：4 个 worker 经 sched_setaffinity 绑核（CPU 数不足返回 EINVAL 时跳过绑核、SMP=1 下共享 CPU 0），各跑 300 轮 tmpfs 文件写读校验 + pipe + loopback UDP 自收发 + 64 KiB 匿名 mmap 校验；任一轮数据错误或异常负返回 → 子进程以 10+i 退出，父进程汇总 PASS/FAIL |
 | hello45..hello101 | 当前验收门禁，覆盖 libc ABI、IPC、网络、SMP、swap 与 raw syscall；完整启动顺序以 `servers/init/main.c` 和 `tools/qemu_smoke.sh` 为准 |
+| hello196..hello199 | `gethostbyname_ipv4`/`ipv4_to_text`；`gettimeofday` 指针错误；`mlock` 与 `mlockall`/`MAP_LOCKED` 的 `RLIMIT_MEMLOCK` 门禁（期望值取自真实 Linux） |
+| hello200..hello208 | moqi_libc 在真内核上的验收：`mmap` 家族、时间 API、`gmtime_r/timegm/mktime/strftime`、`strptime/asctime/ctime`、`strtol` 家族与 `string.h`、`qsort/bsearch/rand_r`、`setenv` 家族（含传给 `execve`）、`realloc` 与对齐分配、`printf` 家族 |
+| hello209..hello215 | 线程共享的进程状态：`brk`、映射、信号处置、`RLIMIT_AS`、资源限制、`chdir`/`umask`（`CLONE_FS`）、`pthread_create`+`join` 反复 |
+| hello216..hello224 | 系统调用保持寄存器、`strtod/strtof`（含 xmm 状态跨上下文切换）、`printf` 浮点、`FILE` 流、`scanf` 族、`setjmp` 族、共享当前目录的并发、`math`/`ctype`、`/proc/lostats` |
+| hello225 | `pause`/`alarm`/`gettid` |
+| hello226 | `atexit/exit/abort/raise/assert/signal()/sigprocmask/perror/remove/rename/isatty` 与 id 调用，每个会终止进程的用例在 fork 的子进程里跑 |
+| hello227 | `system()` 与 shell：`sh -c` 的状态、命令列表 `; && \|\|`、引号与反斜杠、`$?`/`$!`/延迟变量展开、后台 `&` 与 `wait`、`<` `>>`、`export`/`env`、`ls`、`cd` 与重定向失败的状态（见第 3 节） |
+| hello228 | 线程 `join` 之后立刻复用其内存：4000 个线程，每个带栈上金丝雀 |
+| hello229 | `SA_RESTART`（`read`/`write`/`waitpid`/`wait4`/`readv`/`writev`/`accept`/`recvfrom`）、管道写阻塞、`EINTR`/`EPIPE`、`PIPE_BUF` 原子性 |
+| hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。
 

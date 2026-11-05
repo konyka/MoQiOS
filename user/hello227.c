@@ -1,5 +1,6 @@
-/* hello227: system() on the real kernel: the status of the command, a missing command, a pipeline and a redirection through
- * "sh -c", the signal state left behind, and system(NULL). */
+/* hello227: system() and the shell it starts ("sh -c") on the real kernel: the status of the command, a missing command,
+ * pipelines, command lists (; && ||), quotes and backslashes, $? and $!, background jobs and wait, input and append
+ * redirection, export and env, ls, cd and redirection failures, the signal state system() leaves behind, and system(NULL). */
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
 #include "../lib/moqi_libc/include/stdio.h"
 #include "../lib/moqi_libc/include/unistd.h"
