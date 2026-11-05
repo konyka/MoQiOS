@@ -606,6 +606,12 @@ test "pipe write propagates status flags for full-pipe EAGAIN" {
     try std.testing.expect(std.mem.indexOf(u8, source, "return if (n == 0) -11 else @intCast(n);") != null);
 }
 
+test "a pipe write that fits an empty pipe is written whole or not at all" {
+    const source = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, source, "const atomic = count <= PIPE_BUF_SIZE - 1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "if (!atomic or room >= count) {") != null);
+}
+
 test "a blocking pipe write waits on the writers' queue and readers wake it" {
     const source = kt.vfs_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "sched.blockOn(&pipe_write_waiters[pipe_idx]") != null);

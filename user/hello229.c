@@ -259,6 +259,55 @@ int main(int argc, char **argv, char **envp) {
     waitpid(kid, (int *)0, 0);
     close(p[1]);
 
+    /* G: a write of up to the pipe's capacity (4095 bytes) is atomic: it goes in whole or not at all, and while a writer waits for
+     * room nothing of its data is in the pipe for another writer's bytes to be mixed into. */
+    install(0);
+    pipe(p);
+    memset(big, 'F', 2000);
+    r = write(p[1], big, 2000);
+    long fl2 = syscall3(142, p[1], 3, 0);
+    syscall3(142, p[1], 4, fl2 | 0x800);
+    memset(big, 'N', 3000);
+    r = write(p[1], big, 3000);
+    check(r == -EAGAIN, "G: a non-blocking write that does not fit whole is -EAGAIN (nothing written)");
+    syscall3(142, p[1], 4, fl2);
+    kid = fork();
+    if (kid == 0) {
+        static char bb[3000];
+        memset(bb, 'B', sizeof bb);
+        write(p[1], bb, sizeof bb);
+        _exit(0);
+    }
+    pause_ms(80);
+    syscall3(142, p[1], 4, fl2 | 0x800);
+    memset(big, 'C', 100);
+    r = write(p[1], big, 100);
+    check(r == 100, "G: a small write goes in while a big one waits for room (the waiting writer left no partial data behind)");
+    syscall3(142, p[1], 4, fl2);
+    static char got[6000];
+    long have = 0;
+    while (have < 2100) {
+        long n = read(p[0], got + have, 2100 - have);
+        if (n <= 0) break;
+        have += n;
+    }
+    int first_ok = have == 2100;
+    for (int i = 0; i < 2000 && first_ok; i++) if (got[i] != 'F') first_ok = 0;
+    for (int i = 2000; i < 2100 && first_ok; i++) if (got[i] != 'C') first_ok = 0;
+    check(first_ok, "G: the pipe held the 2000 filler bytes and then the 100 small-write bytes");
+    have = 0;
+    while (have < 3000) {
+        long n = read(p[0], got + have, 3000 - have);
+        if (n <= 0) break;
+        have += n;
+    }
+    int second_ok = have == 3000;
+    for (int i = 0; i < 3000 && second_ok; i++) if (got[i] != 'B') second_ok = 0;
+    check(second_ok, "G: and the big write then arrived whole, 3000 bytes in one piece");
+    waitpid(kid, (int *)0, 0);
+    close(p[0]);
+    close(p[1]);
+
     print(failures == 0 ? "hello229: PASS\n" : "hello229: FAIL\n");
     return failures;
 }

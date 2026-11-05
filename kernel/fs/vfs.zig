@@ -491,12 +491,19 @@ pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u3
             return if (n > 0) @intCast(n) else -32; // EPIPE
         }
         const before = n;
-        while (n < count) {
-            const next = (pipe.tail + 1) % PIPE_BUF_SIZE;
-            if (next == pipe.head) break;
-            pipe.buf[pipe.tail] = buf[n];
-            pipe.tail = next;
-            n += 1;
+        const used: usize = if (pipe.tail >= pipe.head) pipe.tail - pipe.head else PIPE_BUF_SIZE - pipe.head + pipe.tail;
+        const room: usize = (PIPE_BUF_SIZE - 1) - used;
+        // A write that can fit in an empty pipe is atomic (POSIX PIPE_BUF): it goes in whole or not at all, so another writer's
+        // bytes are never mixed into it. Only a bigger write is let in piecemeal.
+        const atomic = count <= PIPE_BUF_SIZE - 1;
+        if (!atomic or room >= count) {
+            while (n < count) {
+                const next = (pipe.tail + 1) % PIPE_BUF_SIZE;
+                if (next == pipe.head) break;
+                pipe.buf[pipe.tail] = buf[n];
+                pipe.tail = next;
+                n += 1;
+            }
         }
         if (n > before) _ = sched.wakeOne(&pipe_read_waiters[pipe_idx]);
         if (n == count or nonblocking) {
