@@ -6728,3 +6728,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 结果：五个变异（上面四个加"argv 指针每个只算 4 字节"）全部被抓住；host 测试 1033/1033。
 - 如实说明：①字面数字来自当前 `pointerAreaBytes` 的公式（13 个 auxv 对加 AT_NULL、各 8 字节的 pad、两个 NULL 终止符和 argc），如果将来 auxv 增删条目，这些测试会按预期失败，需要同步改数字；②没有再对 `execve`/`loader` 里的调用点做变异（`fits` 的接线靠 hello227 B14 的 QEMU 用例保护，已在上一节做过去掉检查的红灯）。
 
+## SA_RESTART 的接线测试（补充）
+
+- 缺口：`syscall_restart_policy.restartable` 的表和 `syscall_entry.zig` 里各分发分支是否调用 `checkSignalsOnSyscallReturn` 是两处独立的手写列表；hello229 只实测了其中几个调用（`read`、`write`、`waitpid`、`wait4`、`readv`、`writev`、`accept`、`recvfrom`）。如果有人往表里加一个号码、却没在对应分支调用 `checkSignalsOnSyscallReturn`，该调用在纸面上可重启、实际永远不会重启，也没有任何测试能发现。
+- 实现：`tests/main.zig` 新增一个 host 测试，对 0..599 里表中的每个号码，在 `syscall_entry.zig` 里找到分发分支（形如 `\n        N => `，且分支体里有 `frame`），断言分支体含有 `checkSignalsOnSyscallReturn(frame)`；表里有号码但找不到分支也算失败。
+- 变异：①去掉 `accept`(43) 分支里的调用 → 测试失败并打印分支体；②往表里加一个没有对应分支的号码 36 → 失败。两个都被抓住，文件已恢复。
+- 结果：host 测试 1034/1034。
+- 如实说明：这是源码文本匹配，不是行为测试；它只保证"表里的号码都有投递信号的调用"，不保证调用的位置在系统调用结果写入 `frame.rax` 之后（这一点靠 hello229 的 QEMU 用例）。原来没有 QEMU 用例的 `sendto`、`sendmsg`、`recvmsg`、`accept4` 现在至少有接线保护，行为仍未实测。
+

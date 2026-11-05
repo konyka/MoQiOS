@@ -648,6 +648,37 @@ test "pipe write propagates status flags for full-pipe EAGAIN" {
     try std.testing.expect(std.mem.indexOf(u8, source, "return if (n == 0) -11 else @intCast(n);") != null);
 }
 
+test "every restartable syscall number delivers signals on its way out" {
+    // SA_RESTART is arranged where the signal frame is written (deliverSignalOnSyscallReturn), which only runs for a call whose
+    // dispatch branch calls checkSignalsOnSyscallReturn. A number in the restart table whose branch lacks that call would be
+    // restartable on paper and never restarted (and its handler would only run at the next call or timer tick).
+    const source = kt.syscall_entry_source;
+    const restart = kt.syscall_restart_policy;
+    var nr: u64 = 0;
+    while (nr < 600) : (nr += 1) {
+        if (!restart.restartable(nr)) continue;
+        var needle_buf: [32]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&needle_buf, "\n        {d} => ", .{nr});
+        var from: usize = 0;
+        var found_branch = false;
+        while (std.mem.indexOfPos(u8, source, from, needle)) |at| {
+            from = at + needle.len;
+            // The branch ends at the first line that closes it ("\n        },").
+            const end = std.mem.indexOfPos(u8, source, at, "\n        },") orelse source.len;
+            const body = source[at..end];
+            // Only the dispatch branches (they assign frame.rax or call a syscall helper); lseek's `0 => new_off` style arms
+            // inside other switches are not branches of the dispatcher.
+            if (std.mem.indexOf(u8, body, "frame") == null) continue;
+            found_branch = true;
+            if (std.mem.indexOf(u8, body, "checkSignalsOnSyscallReturn(frame)") == null) {
+                std.debug.print("restartable syscall {d}: branch has no checkSignalsOnSyscallReturn:\n{s}\n", .{ nr, body });
+                return error.RestartableBranchWithoutSignalDelivery;
+            }
+        }
+        try std.testing.expect(found_branch);
+    }
+}
+
 test "a pipe write that fits an empty pipe is written whole or not at all" {
     const source = kt.vfs_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "const atomic = count <= PIPE_BUF_SIZE - 1;") != null);
