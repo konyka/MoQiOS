@@ -179,6 +179,55 @@ int main(int argc, char **argv, char **envp) {
     st = system("hello11 & hello2 | hello11 ; exit $?");
     check(exited(st, 42), "B: a pipeline after a background job reports its own last command");
 
+    /* B7: input redirection and append. "cmd < file" feeds the file to the command's standard input, ">>" appends instead of
+     * truncating, and both work with built-ins, in pipelines and without spaces around the operator. hello230 copies its
+     * standard input to its standard output (or, with "count", exits with the byte count). */
+    unlink("/tmp/h227_in");
+    unlink("/tmp/h227_out");
+    f = fopen("/tmp/h227_in", "w");
+    if (f) { fputs("abc\n", f); fclose(f); }
+    st = system("hello230 < /tmp/h227_in > /tmp/h227_out");
+    f = fopen("/tmp/h227_out", "r");
+    memset(qb, 0, sizeof qb);
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(exited(st, 0) && strcmp(qb, "abc\n") == 0, "B: 'cmd < file > file2' copies the input file to the output file");
+    st = system("hello230 count < /tmp/h227_in");
+    check(exited(st, 4), "B: the command sees exactly the file's 4 bytes on standard input (count = 4)");
+    st = system("hello230 count</tmp/h227_in");
+    check(exited(st, 4), "B: no spaces are needed around '<'");
+    st = system("hello230 count < /tmp/h227_nonexistent");
+    check(!exited(st, 4) && !exited(st, 0), "B: a missing input file fails the command instead of reading the terminal");
+    unlink("/tmp/h227_out");
+    st = system("echo one > /tmp/h227_out ; echo two >> /tmp/h227_out");
+    f = fopen("/tmp/h227_out", "r");
+    memset(qb, 0, sizeof qb);
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(exited(st, 0) && strcmp(qb, "one\ntwo\n") == 0, "B: '>>' appends to a file (built-in echo)");
+    st = system("hello230 < /tmp/h227_in >> /tmp/h227_out");
+    f = fopen("/tmp/h227_out", "r");
+    memset(qb, 0, sizeof qb);
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(exited(st, 0) && strcmp(qb, "one\ntwo\nabc\n") == 0, "B: '>>' appends the output of an external command");
+    st = system("echo x > /tmp/h227_out ; echo y > /tmp/h227_out");
+    f = fopen("/tmp/h227_out", "r");
+    memset(qb, 0, sizeof qb);
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(exited(st, 0) && strcmp(qb, "y\n") == 0, "B: a single '>' still truncates");
+    unlink("/tmp/h227_out2");
+    st = system("hello230 < /tmp/h227_in | hello230 > /tmp/h227_out2");
+    f = fopen("/tmp/h227_out2", "r");
+    memset(qb, 0, sizeof qb);
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(exited(st, 0) && strcmp(qb, "abc\n") == 0, "B: '<' on the first command of a pipeline");
+    st = system("echo \"a < b\" > /tmp/h227_out");
+    f = fopen("/tmp/h227_out", "r");
+    memset(qb, 0, sizeof qb);
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(exited(st, 0) && strcmp(qb, "a < b\n") == 0, "B: a quoted '<' is text");
+    unlink("/tmp/h227_in");
+    unlink("/tmp/h227_out");
+    unlink("/tmp/h227_out2");
+
     /* C: the caller's signal state is exactly what it was */
     struct ksigaction a = { on_int, 0, 0, 0 };
     sigaction(SIGINT, &a, (struct ksigaction *)0);

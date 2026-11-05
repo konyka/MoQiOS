@@ -217,9 +217,10 @@ static int expand_vars(const char *src, char *dst, int max) {
 /* Execute a single command with optional redirections.
    If pipe_fd >= 0, redirect stdout to pipe_fd.
    If pipe_in >= 0, redirect stdin from pipe_in.
-   If redir_out != NULL, redirect stdout to that file.
+   If redir_in != NULL, redirect stdin from that file (a missing file ends the command with status 1).
+   If redir_out != NULL, redirect stdout to that file, appending when `append` is set and truncating otherwise.
    Never returns in the child (calls execve or exit). */
-static void run_command(const char *cmd, int pipe_in, int pipe_out, const char *redir_out) {
+static void run_command(const char *cmd, int pipe_in, int pipe_out, const char *redir_out, int append, const char *redir_in) {
     /* Extract command name */
     char name[64];
     const char *p = copy_token(name, sizeof(name), cmd);
@@ -228,9 +229,22 @@ static void run_command(const char *cmd, int pipe_in, int pipe_out, const char *
         _exit(1);
     }
 
+    /* Handle input redirection */
+    if (redir_in && redir_in[0]) {
+        long fd = open(redir_in, O_RDONLY, 0);
+        if (fd < 0) {
+            print("sh: cannot open ");
+            print(redir_in);
+            print("\n");
+            _exit(1);
+        }
+        dup2((int)fd, STDIN_FILENO);
+        close((int)fd);
+    }
+
     /* Handle output redirection */
     if (redir_out && redir_out[0]) {
-        long fd = open(redir_out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        long fd = open(redir_out, O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC), 0644);
         if (fd < 0) {
             print("sh: cannot open ");
             print(redir_out);
@@ -297,8 +311,20 @@ static int execute_pipeline(const char *line) {
         p++;
     }
 
+    /* Input redirection: "<" in the first command (its text runs up to the first '|') */
+    const char *redir_in = (void *)0;
+    char in_file[64];
+    for (const char *q = cmds[0]; *q && *q != '|'; q++) {
+        if (*q == '<') {
+            copy_token(in_file, sizeof(in_file), q + 1);
+            if (in_file[0]) redir_in = in_file;
+            break;
+        }
+    }
+
     /* Check for output redirection on the last command */
     const char *redir_out = (void *)0;
+    int append = 0;
     char redir_file[64];
     /* Scan last command for '>' */
     const char *last = cmds[ncmds - 1];
@@ -306,6 +332,10 @@ static int execute_pipeline(const char *line) {
     while (*r) {
         if (*r == '>') {
             r++;
+            if (*r == '>') {
+                append = 1;
+                r++;
+            }
             r = skip_spaces(r);
             copy_token(redir_file, sizeof(redir_file), r);
             redir_out = redir_file;
@@ -317,12 +347,12 @@ static int execute_pipeline(const char *line) {
         r++;
     }
 
-    /* "cmd args > file": the text before '>' is the command, the file is not one of its arguments. The fork-and-exec path stops
+    /* "cmd args > file" (or "< file"): the text before the first '>' or '<' is the command, the file is not one of its arguments. The fork-and-exec path stops
      * each command at '>' by itself (copy_token), but a built-in reads the raw text, so cut it here for them. */
     char single[256];
     if (ncmds == 1) {
         int n = 0;
-        while (cmds[0][n] && cmds[0][n] != '>' && n < (int)sizeof(single) - 1) { single[n] = cmds[0][n]; n++; }
+        while (cmds[0][n] && cmds[0][n] != '>' && cmds[0][n] != '<' && n < (int)sizeof(single) - 1) { single[n] = cmds[0][n]; n++; }
         while (n > 0 && (single[n - 1] == ' ' || single[n - 1] == '\t')) n--;
         single[n] = '\0';
         cmds[0] = single;
@@ -338,7 +368,7 @@ static int execute_pipeline(const char *line) {
         if (redir_out && redir_out[0] &&
             (strcmp(cmd, "pid") == 0 || strcmp(cmd, "help") == 0 || strcmp(cmd, "echo") == 0 || strcmp(cmd, "ls") == 0 ||
              strcmp(cmd, "pwd") == 0 || strcmp(cmd, "env") == 0)) {
-            long rfd = open(redir_out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            long rfd = open(redir_out, O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC), 0644);
             if (rfd < 0) {
                 print("sh: cannot open ");
                 print(redir_out);
@@ -473,7 +503,7 @@ not_builtin:;
         }
         if (pid == 0) {
             /* Child */
-            run_command(cmds[0], -1, -1, redir_out);
+            run_command(cmds[0], -1, -1, redir_out, append, redir_in);
             /* run_command never returns */
         }
         /* Parent: a background job is only recorded; a foreground one is waited for by its own pid */
@@ -529,7 +559,7 @@ not_builtin:;
             }
 
             const char *redir = is_last ? redir_out : (void *)0;
-            run_command(cmds[i], prev_pipe, is_last ? -1 : pipefd[1], redir);
+            run_command(cmds[i], prev_pipe, is_last ? -1 : pipefd[1], redir, append, i == 0 ? redir_in : (void *)0);
         }
 
         /* Parent */
