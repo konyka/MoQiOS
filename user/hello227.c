@@ -46,6 +46,28 @@ int main(int argc, char **argv, char **envp) {
     check(exited(st, 42), "B: a two-command pipeline runs and reports the last command's status");
     unlink("/tmp/h227_out");
 
+    /* B2: command lists. ';' runs both, '&&' runs the second only after success, '||' only after failure; the status is the last
+     * command that ran. hello11 exits 42 (a failure), "cd /tmp" is a silent success, and "exit N" ends the shell with N at that
+     * point, as in any shell. */
+    st = system("hello11 ; exit 7");
+    check(exited(st, 7), "B: 'a ; b' runs both (the second ends the shell with 7)");
+    st = system("cd /tmp && exit 8");
+    check(exited(st, 8), "B: '&&' runs the second command after a success");
+    st = system("hello11 && exit 9");
+    check(exited(st, 42), "B: '&&' skips the second command after a failure (42 stays)");
+    st = system("hello11 || exit 6");
+    check(exited(st, 6), "B: '||' runs the second command after a failure");
+    st = system("cd /tmp || exit 6");
+    check(exited(st, 0), "B: '||' skips the second command after a success");
+    st = system("hello11 ; cd /tmp && exit 4");
+    check(exited(st, 4), "B: a longer list is evaluated left to right");
+    st = system("hello11 || cd /tmp && exit 3");
+    check(exited(st, 3), "B: '||' then '&&': the failure runs the cd, which succeeds, so the exit runs");
+    st = system("hello2 | hello11 ; exit 3");
+    check(exited(st, 3), "B: a pipeline is one element of a list");
+    st = system("exit 2 ; exit 9");
+    check(exited(st, 2), "B: an exit ends the shell, so nothing after it runs");
+
     /* C: the caller's signal state is exactly what it was */
     struct ksigaction a = { on_int, 0, 0, 0 };
     sigaction(SIGINT, &a, (struct ksigaction *)0);

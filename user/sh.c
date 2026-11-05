@@ -408,6 +408,45 @@ not_builtin:;
     return status;
 }
 
+/* True when a wait status (or a built-in's 0) means the command succeeded: exited normally with code 0. */
+static int status_ok(int status) {
+    return status >= 0 && (status & 0x7f) == 0 && ((status >> 8) & 0xff) == 0;
+}
+
+/* Run a command list: pipelines joined by ';' (always run the next), '&&' (run it only after success) and '||' (only after
+ * failure). Evaluated left to right with no precedence and no grouping, as the shell's other syntax is just as plain. The
+ * status is that of the last pipeline that ran, in the same encoding execute_pipeline returns. A separator inside a word is not
+ * looked for (there is no quoting), and an empty element between separators counts as success. */
+static int execute_list(const char *line) {
+    char elem[256];
+    int status = 0;
+    int run_next = 1;
+    const char *p = line;
+    for (;;) {
+        int n = 0;
+        while (*p && !(*p == ';' || (*p == '&' && p[1] == '&') || (*p == '|' && p[1] == '|')) && n < (int)sizeof(elem) - 1)
+            elem[n++] = *p++;
+        elem[n] = '\0';
+        if (run_next) {
+            const char *e = skip_spaces(elem);
+            if (*e) status = execute_pipeline(e);
+            else status = 0;
+        }
+        if (*p == '\0') break;
+        if (*p == ';') {
+            run_next = 1;
+            p++;
+        } else if (*p == '&') {
+            run_next = status_ok(status) ? 1 : 0;
+            p += 2;
+        } else {
+            run_next = status_ok(status) ? 0 : 1;
+            p += 2;
+        }
+    }
+    return status;
+}
+
 int main(int argc, char **argv, char **envp) {
     (void)envp;
 
@@ -418,7 +457,7 @@ int main(int argc, char **argv, char **envp) {
         g_command_mode = 1;
         char expanded[256];
         expand_vars(argv[2], expanded, sizeof(expanded));
-        int status = execute_pipeline(expanded);
+        int status = execute_list(expanded);
         if (status < 0) return 1;
         int sig = status & 0x7f;
         return sig ? 128 + sig : (status >> 8) & 0xff;
@@ -439,6 +478,6 @@ int main(int argc, char **argv, char **envp) {
         char expanded[256];
         expand_vars(line, expanded, sizeof(expanded));
 
-        execute_pipeline(expanded);
+        execute_list(expanded);
     }
 }
