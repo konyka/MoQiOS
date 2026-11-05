@@ -6598,3 +6598,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 结果：hello227 共 39 项，SMP=1 全过。
 - 如实说明：①没有 `$(...)`、`${...}`、括号、后台 `&`、here-doc；②反斜杠换行不是续行；③手写的控制字节 1..8、14 与被保护的字符不可区分；④上面"引号"一节里"单引号内 `$X` 仍会展开"的说明已过时，以本节为准。
 
+## shell 后台任务 `&`、`$!`、`wait`（hello227）
+
+- 缺口：shell 没有后台运行；管道和单命令都用 `waitpid(-1)`，一旦有后台任务先结束，前台命令会拿到别人的状态。
+- 红灯：`hello227` 新增 9 项，在旧 shell 上 6 项失败（`cmd & next`、行尾 `&`、`&` 之后 `$?`、裸 `wait`、先结束的任务 `wait $!`、8 次"前台状态不被后台任务抢走"）；`wait $!`（旧 shell 把 `&` 当普通字符，`$!` 为空）、`wait 99999` 和"管道前有后台任务"3 项在旧 shell 上碰巧也过，约束力弱。
+- 实现：`user/sh.c`：`execute_list` 把单个 `&` 当元素结束符并设置 `g_background`；`execute_pipeline` 在后台时只记录 pid（`g_last_bg`、`g_jobs[16]`）并返回 0；前台改为按 pid `waitpid`，管道的状态取最后一个命令的；新增 `wait` 内建和 `$!` 展开；提示符前 `jobs_reap_finished`（WNOHANG）回收。
+- 结果：hello227 共 48 项，SMP=1 全过。
+- 如实说明：①没有作业控制（无 `jobs`/`fg`/`bg`/进程组），后台任务和 shell 共用终端与标准输入；②作业表满 16 个后新任务不记录；③内建命令后接 `&` 仍在前台执行（`echo hi &` 会同步输出）；④`wait` 只在单命令位置识别，管道里的 `wait` 无意义。
+

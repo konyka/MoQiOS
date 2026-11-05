@@ -144,13 +144,46 @@ static void set_last_code(int status) {
     else g_last_code = (status >> 8) & 0xff;
 }
 
+/* Background jobs: "cmd &" starts a pipeline and does not wait for it. g_background is set by execute_list for the element about
+ * to run; execute_pipeline then records the pid of its last process in g_last_bg ("$!") and in the job table, and returns 0.
+ * Foreground commands wait for their own pids, so a job that ends first is never mistaken for them; "wait" collects jobs. */
+#define MAX_JOBS 16
+static int g_background;
+static long g_last_bg;
+static long g_jobs[MAX_JOBS];
+static int g_njobs;
+
+static void job_add(long pid) {
+    if (g_njobs < MAX_JOBS) g_jobs[g_njobs++] = pid;
+}
+
+static void job_remove(long pid) {
+    for (int i = 0; i < g_njobs; i++) {
+        if (g_jobs[i] == pid) {
+            g_jobs[i] = g_jobs[--g_njobs];
+            return;
+        }
+    }
+}
+
+/* Collect the jobs that have already finished (so they do not stay zombies at the prompt). */
+static void jobs_reap_finished(void) {
+    for (int i = 0; i < g_njobs;) {
+        int st;
+        long r = waitpid(g_jobs[i], &st, 1 /* WNOHANG */);
+        if (r != 0) g_jobs[i] = g_jobs[--g_njobs];
+        else i++;
+    }
+}
+
 static int expand_vars(const char *src, char *dst, int max) {
     int si = 0, di = 0;
     while (src[si] && di < max - 1) {
-        if ((src[si] == '$' || src[si] == QUOTED_DOLLAR) && src[si + 1] == '?') {
+        if ((src[si] == '$' || src[si] == QUOTED_DOLLAR) && (src[si + 1] == '?' || src[si + 1] == '!')) {
+            int bang = src[si + 1] == '!';
             si += 2;
-            char num[8];
-            int n = snprintf(num, sizeof(num), "%d", g_last_code);
+            char num[24];
+            int n = bang ? snprintf(num, sizeof(num), "%ld", g_last_bg) : snprintf(num, sizeof(num), "%d", g_last_code);
             for (int v = 0; v < n && di < max - 1; v++) dst[di++] = num[v];
         } else if (src[si] == '$' || src[si] == QUOTED_DOLLAR) {
             int quoted = src[si] == QUOTED_DOLLAR;
@@ -317,6 +350,28 @@ static int execute_pipeline(const char *line) {
         }
 
         /* Built-in commands */
+        if (strcmp(cmd, "wait") == 0) {
+            /* "wait" collects every background job (status 0); "wait PID" collects that one and gives its status, or 127 when it
+             * is not a child of the shell. */
+            const char *rest = cmds[0];
+            int idx = 0;
+            while (rest[idx] && rest[idx] != ' ') idx++;
+            while (rest[idx] == ' ') idx++;
+            if (rest[idx] >= '0' && rest[idx] <= '9') {
+                long target = 0;
+                for (const char *d = rest + idx; *d >= '0' && *d <= '9'; d++) target = target * 10 + (*d - '0');
+                int st = 0;
+                if (waitpid(target, &st, 0) < 0) return 127 << 8;
+                job_remove(target);
+                return st;
+            }
+            while (g_njobs > 0) {
+                int st = 0;
+                waitpid(g_jobs[0], &st, 0);
+                job_remove(g_jobs[0]);
+            }
+            return 0;
+        }
         if (strcmp(cmd, "exit") == 0) {
             /* "exit N" ends the shell with status N (low 8 bits); without a number it is 0. The farewell is only for people. */
             const char *rest = cmds[0];
@@ -421,15 +476,22 @@ not_builtin:;
             run_command(cmds[0], -1, -1, redir_out);
             /* run_command never returns */
         }
-        /* Parent: wait for child */
-        int status;
-        waitpid(-1, &status, 0);
+        /* Parent: a background job is only recorded; a foreground one is waited for by its own pid */
+        if (g_background) {
+            g_last_bg = pid;
+            job_add(pid);
+            return 0;
+        }
+        int status = 0;
+        waitpid(pid, &status, 0);
         return (int)status;
     }
 
     /* Pipeline: multiple commands connected by pipes */
     int prev_pipe = -1;
     long last_pid = -1;
+    long pids[8];
+    int npids = 0;
 
     for (int i = 0; i < ncmds; i++) {
         int is_last = (i == ncmds - 1);
@@ -480,12 +542,21 @@ not_builtin:;
         }
 
         last_pid = pid;
+        pids[npids++] = pid;
     }
 
-    /* Wait for all children */
+    if (g_background) {
+        g_last_bg = last_pid;
+        job_add(last_pid);
+        return 0;
+    }
+
+    /* Wait for every process of the pipeline by pid; the status is the last command's */
     int status = 0;
-    for (int i = 0; i < ncmds; i++) {
-        waitpid(-1, &status, 0);
+    for (int i = 0; i < npids; i++) {
+        int st = 0;
+        waitpid(pids[i], &st, 0);
+        if (i == npids - 1) status = st;
     }
 
     return status;
@@ -500,7 +571,8 @@ static int status_ok(int status) {
  * failure). Evaluated left to right with no precedence and no grouping, as the shell's other syntax is just as plain. The
  * status is that of the last pipeline that ran, in the same encoding execute_pipeline returns. The line has been through
  * protect_quotes(), so a quoted separator is not seen here. Each element is variable-expanded just before it runs (so "$?" and a
- * variable exported earlier in the same line are current); an empty element between separators counts as success. */
+ * variable exported earlier in the same line are current); an empty element between separators counts as success. A single '&'
+ * ends an element like ';' does but starts it as a background job (status 0, "$!" is its pid). */
 static int execute_list(const char *line) {
     char elem[256];
     int status = 0;
@@ -508,22 +580,25 @@ static int execute_list(const char *line) {
     const char *p = line;
     for (;;) {
         int n = 0;
-        while (*p && !(*p == ';' || (*p == '&' && p[1] == '&') || (*p == '|' && p[1] == '|')) && n < (int)sizeof(elem) - 1)
+        while (*p && !(*p == ';' || *p == '&' || (*p == '|' && p[1] == '|')) && n < (int)sizeof(elem) - 1)
             elem[n++] = *p++;
         elem[n] = '\0';
+        int bg = (*p == '&' && p[1] != '&');
         if (run_next) {
             const char *e = skip_spaces(elem);
             if (*e) {
                 char expanded[256];
                 expand_vars(e, expanded, sizeof(expanded));
+                g_background = bg;
                 status = execute_pipeline(expanded);
+                g_background = 0;
             } else {
                 status = 0;
             }
             set_last_code(status);
         }
         if (*p == '\0') break;
-        if (*p == ';') {
+        if (*p == ';' || bg) {
             run_next = 1;
             p++;
         } else if (*p == '&') {
@@ -560,6 +635,7 @@ int main(int argc, char **argv, char **envp) {
     print("MoQiOS shell\n");
 
     for (;;) {
+        jobs_reap_finished();
         print("> ");
         char line[256];
         int len = read_line(line, sizeof(line));

@@ -156,6 +156,29 @@ int main(int argc, char **argv, char **envp) {
     check(exited(st, 0) && strcmp(qb, "a\\b c\\d\n") == 0, "B: a backslash stays as it is in single quotes and before an ordinary character in double quotes");
     unlink("/tmp/h227_q");
 
+    /* B6: background jobs. "cmd &" starts the pipeline and goes on without waiting (its own status there is 0); "$!" is the
+     * pid of the last one, "wait $!" waits for that job and gives its status, "wait" alone waits for all of them and gives 0,
+     * and a foreground command's status is its own, never that of a background job that happened to end first. */
+    st = system("hello11 & exit 3");
+    check(exited(st, 3), "B: 'cmd & next' starts the job and goes on to the next command");
+    st = system("hello11 &");
+    check(exited(st, 0), "B: a trailing '&' ends the line with status 0");
+    st = system("hello11 & exit $?");
+    check(exited(st, 0), "B: $? right after a background start is 0");
+    st = system("hello11 & wait $! ; exit $?");
+    check(exited(st, 42), "B: 'wait $!' returns the background job's exit status (42)");
+    st = system("hello11 & hello11 & wait ; exit $?");
+    check(exited(st, 0), "B: a bare 'wait' waits for every job and returns 0");
+    st = system("wait 99999 ; exit $?");
+    check(exited(st, 127), "B: 'wait' for a pid that is not a child of the shell is 127");
+    st = system("hello11 & hello11 ; hello11 ; wait $! ; exit $?");
+    check(exited(st, 42), "B: a job that ended before 'wait' keeps its status");
+    int fg_ok = 1;
+    for (int i = 0; i < 8; i++) fg_ok &= exited(system("hello11 & sh -c \"exit 7\""), 7);
+    check(fg_ok, "B: a foreground command's status is its own even when a background job ends first (8 runs)");
+    st = system("hello11 & hello2 | hello11 ; exit $?");
+    check(exited(st, 42), "B: a pipeline after a background job reports its own last command");
+
     /* C: the caller's signal state is exactly what it was */
     struct ksigaction a = { on_int, 0, 0, 0 };
     sigaction(SIGINT, &a, (struct ksigaction *)0);
