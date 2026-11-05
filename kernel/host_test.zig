@@ -174,6 +174,7 @@ pub const signal_action_policy = @import("proc/signal_action_policy.zig");
 pub const signal_exec_policy = @import("proc/signal_exec_policy.zig");
 pub const signal_frame_policy = @import("proc/signal_frame_policy.zig");
 pub const signal_delivery_policy = @import("proc/signal_delivery_policy.zig");
+pub const syscall_restart_policy = @import("proc/syscall_restart_policy.zig");
 pub const siginfo_policy = @import("proc/siginfo_policy.zig");
 pub const uts = @import("proc/uts.zig");
 pub const poll_policy = @import("fs/poll_policy.zig");
@@ -314,6 +315,7 @@ pub const readv_source = @embedFile("fs/readv.zig");
 // Left out because they cannot be analysed on the host (arch inline assembly in their import closure):
 // arch/x86_64/clone.zig and mm/process_vm.zig.
 test {
+    _ = @import("proc/syscall_restart_policy.zig");
     _ = @import("arch/x86_64/irq_time_policy.zig");
     _ = @import("mm/munmap_policy.zig");
     _ = @import("mm/mmap_policy.zig");

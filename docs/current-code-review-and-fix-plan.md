@@ -6606,3 +6606,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 结果：hello227 共 48 项，SMP=1 全过。
 - 如实说明：①没有作业控制（无 `jobs`/`fg`/`bg`/进程组），后台任务和 shell 共用终端与标准输入；②作业表满 16 个后新任务不记录；③内建命令后接 `&` 仍在前台执行（`echo hi &` 会同步输出）；④`wait` 只在单命令位置识别，管道里的 `wait` 无意义。
 
+## SA_RESTART（hello229，`proc/syscall_restart_policy.zig`）
+
+- 缺口：内核只记录 `SA_RESTART`，被信号处理函数打断的阻塞调用一律返回 `-EINTR`，`signal()` 请求的 BSD 语义（自动重启）名不副实；另外 `pipeRead` 在被信号唤醒后直接回去继续睡，根本不返回 `EINTR`。
+- 红灯：hello229 在改动前 A 组的"无 SA_RESTART 读被打断"失败（管道读不返回 EINTR，一直等到数据到来）；"有 SA_RESTART 的 waitpid 等待并返回子进程"也失败（返回 `-EINTR`）。
+- 实现：①`syscall_restart_policy.zig`（纯函数，host 测试 5 个）：`shouldRestart(结果, 调用号, sa_flags)` 要求结果为 `-EINTR`、`SA_RESTART`（0x10000000）置位且调用号是 `read`(10)/`write`(1)/`waitpid`(6)；②`Task.syscall_nr` 由 `syscallDispatch` 记录；③`deliverSignalOnSyscallReturn` 在写信号帧之前，对该情形把保存的上下文改成 `rax=调用号`、`rip` 退回 2 字节（`syscall` 指令），处理函数 `sigreturn` 之后调用以原参数重新执行；④`vfs.pipeRead` 在要睡之前检查：致命信号杀死任务，有处理函数的信号返回 `-EINTR`；⑤`signal.pendingActionable` 对 `SIG_IGN` 的信号不再视为可打断（以前默认动作为终止的信号即使被忽略也会打断阻塞调用——hello229 的 D 组暴露了这一点）。
+- 变异：`SYSCALL_INSN_LEN` 改 3、把 35（nanosleep）加入可重启表、去掉对 `sa_flags` 的检查，3 个都被 host 测试抓住。
+- 如实说明：①只覆盖三个调用（它们的分发路径本来就会在返回时投递信号）；`wait4`、`readv`/`writev`、`recv`/`accept`/`connect`、`flock`、`futex`、`read` 之外的阻塞读（tty、socket）**没有**覆盖，仍返回 `-EINTR`；`pipeWrite` 阻塞时的信号处理未改；②重启是"重新执行 syscall 指令"，对 `read` 在被打断前已经读到的数据没有影响（被打断时尚未返回任何数据）；③只有 x86_64 实现，riscv64/aarch64 的分发路径不同、未做；④`SA_RESTART` 与 `SA_NODEFER` 等其它标志可以组合。
+

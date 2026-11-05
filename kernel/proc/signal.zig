@@ -272,7 +272,9 @@ pub fn pendingActionable(t: *task.Task) bool {
     while (bits != 0) {
         const bit: u6 = @intCast(@ctz(bits));
         bits &= bits - 1;
-        if ((t.sigact().handlers[bit] != 0 and t.sigact().handlers[bit] != 1) or !defaultSignalAction(@as(u32, bit) + 1)) return true;
+        const handler = t.sigact().handlers[bit];
+        if (handler == 1) continue; // SIG_IGN: discarded when dequeued, whatever the default action would have been
+        if (handler != 0 or !defaultSignalAction(@as(u32, bit) + 1)) return true;
     }
     return false;
 }

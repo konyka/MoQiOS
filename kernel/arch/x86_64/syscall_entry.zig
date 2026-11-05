@@ -478,6 +478,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
     prepareSyscallCpu();
     const syscall_nr = frame.rax;
     getPerCpu().last_syscall_nr = syscall_nr; // DIAG (§6.47)
+    if (@import("../../proc/sched.zig").currentTask()) |t| t.syscall_nr = syscall_nr;
 
     if (dispatchLinuxRlimitAlias(frame, syscall_nr)) return;
     if (rofsGuard(frame, syscall_nr)) return;
@@ -3302,8 +3303,16 @@ fn deliverSignalOnSyscallReturn(frame: *SyscallFrame, current: anytype) void {
     if (handler_addr == 1) return;
 
     const user_rsp = getPerCpu().saved_user_rsp;
-    const user_rip = frame.rcx;
+    var user_rip = frame.rcx;
     const user_rflags = frame.r11;
+
+    // SA_RESTART: a restartable call that the handler interrupted is run again after sigreturn -- the saved context gets the
+    // syscall number back in rax and rip back on the `syscall` instruction; the argument registers still hold the arguments.
+    const restart = @import("../../proc/syscall_restart_policy.zig");
+    if (restart.shouldRestart(@bitCast(frame.rax), current.syscall_nr, current.sigact().flags[signum - 1])) {
+        frame.rax = current.syscall_nr;
+        user_rip = restart.restartRip(user_rip);
+    }
 
     // Full GPR set for sigreturn. rcx/r11 hold the user rip/rflags here (the
     // syscall instruction clobbered the user's originals with exactly those

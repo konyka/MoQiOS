@@ -228,6 +228,18 @@ pub fn pipeRead(pipe_idx: u32, buf: [*]u8, count: usize, status_flags: u32) i64 
                 pipe_lock.release(flags);
                 return -1;
             };
+            // Data first (checked above); with none, a signal that would be acted on ends the wait before it starts or after a
+            // wake-up: a fatal one kills the task, a handled one makes the read return EINTR so the handler runs (SA_RESTART then
+            // runs the read again).
+            const sig_mod = @import("../proc/signal.zig");
+            if (sig_mod.pendingFatal(current_task)) |sig| {
+                pipe_lock.release(flags);
+                task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+            }
+            if (sig_mod.pendingActionable(current_task)) {
+                pipe_lock.release(flags);
+                return -4; // EINTR
+            }
             const node = &current_task.pipe_read_wait_node;
             node.granted = false;
             node.next = null;

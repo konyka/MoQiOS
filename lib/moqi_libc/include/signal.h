@@ -5,8 +5,8 @@
  * set functions, signal() and raise() refuse them with EINVAL (the kernel itself would accept them).
  *
  * signal(sig, handler) installs the handler with BSD semantics, like glibc: the handler stays installed after it runs, the
- * signal is blocked while it runs, and SA_RESTART is requested (the kernel records it but does not restart interrupted
- * calls yet, so a blocking call still fails with EINTR). It returns the previous handler, or SIG_ERR with errno EINVAL for a
+ * signal is blocked while it runs, and SA_RESTART is requested (the kernel then re-runs an interrupted read, write or
+ * waitpid after the handler returns; sleeps, pause, sigsuspend and the poll/epoll waits still fail with EINTR). It returns the previous handler, or SIG_ERR with errno EINVAL for a
  * signal number outside 1..64 or the reserved 32 and 33, or for SIGKILL and SIGSTOP, which cannot be caught or ignored.
  *
  * raise(sig) sends the signal to the calling thread (not the process) and, when it is not blocked, its handler has run

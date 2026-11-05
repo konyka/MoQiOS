@@ -190,6 +190,10 @@ pub const Task = struct {
     saved_sigmask: u64 = 0,
     restore_sigmask_pending: bool = false,
 
+    /// Number of the native syscall this task is inside (set by syscallDispatch). SA_RESTART needs it on the way out, and it must
+    /// belong to the task because a blocked call can wake on a different CPU than the one that started it.
+    syscall_nr: u64 = 0,
+
     /// Set by the file-fault path when the faulting page lies wholly past
     /// EOF; the user #PF path then raises SIGBUS instead of SIGSEGV.
     fault_sigbus: bool = false,
