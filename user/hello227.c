@@ -284,6 +284,42 @@ int main(int argc, char **argv, char **envp) {
     rmdir("/tmp/h227_d");
     unlink("/tmp/h227_ls");
 
+    /* B10: cd reports failure. A directory that does not exist (or a file) is status 1 and the working directory stays where it
+     * was, so "cd X && cmd" does not run cmd and "cd X || cmd" does. "cd -" and "cd ~" are not supported and are plain failures. */
+    st = system("cd /tmp/h227_no_such_dir");
+    check(exited(st, 1), "B: 'cd' to a directory that does not exist is status 1");
+    st = system("cd /tmp/h227_no_such_dir && exit 7");
+    check(exited(st, 1), "B: and '&&' after a failed cd does not run the next command");
+    st = system("cd /tmp/h227_no_such_dir || exit 7");
+    check(exited(st, 7), "B: '||' after a failed cd runs the next command");
+    unlink("/tmp/h227_cd");
+    st = system("cd /tmp ; cd /tmp/h227_no_such_dir ; pwd > /tmp/h227_cd");
+    memset(qb, 0, sizeof qb);
+    f = fopen("/tmp/h227_cd", "r");
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(exited(st, 0) && strcmp(qb, "/tmp\n") == 0, "B: a failed cd leaves the working directory unchanged");
+    unlink("/tmp/h227_cd");
+    f = fopen("/tmp/h227_cdfile", "w");
+    if (f) { fputs("x", f); fclose(f); }
+    st = system("cd /tmp/h227_cdfile");
+    check(exited(st, 1), "B: 'cd' to a regular file is status 1");
+    unlink("/tmp/h227_cdfile");
+    st = system("cd /tmp && exit 5");
+    check(exited(st, 5), "B: a successful cd is status 0 (the next '&&' command runs)");
+    st = system("cd");
+    check(exited(st, 0), "B: 'cd' with no argument goes to / and is status 0");
+
+    /* B11: a redirection target that cannot be opened fails the command with status 1 (not a signal-looking status), for built-ins
+     * and external programs alike, and the command does not run. */
+    st = system("echo hi > /tmp/h227_no_such_dir/out");
+    check(exited(st, 1), "B: a built-in whose '>' target cannot be opened is status 1");
+    st = system("hello11 > /tmp/h227_no_such_dir/out");
+    check(exited(st, 1), "B: an external program whose '>' target cannot be opened is status 1 (it does not run, so not 42)");
+    st = system("echo hi > /tmp/h227_no_such_dir/out || exit 6");
+    check(exited(st, 6), "B: and '||' after it runs the next command");
+    st = system("echo hi > /tmp/h227_no_such_dir/out && exit 6");
+    check(exited(st, 1), "B: '&&' after it does not");
+
     /* C: the caller's signal state is exactly what it was */
     struct ksigaction a = { on_int, 0, 0, 0 };
     sigaction(SIGINT, &a, (struct ksigaction *)0);

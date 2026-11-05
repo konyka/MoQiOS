@@ -378,7 +378,7 @@ static int execute_pipeline(const char *line) {
                 print("sh: cannot open ");
                 print(redir_out);
                 print("\n");
-                return 1;
+                return 1 << 8;
             }
             redirected_fd = (int)rfd;
             g_out_fd = redirected_fd;
@@ -506,14 +506,17 @@ static int execute_pipeline(const char *line) {
             int idx = 0;
             while (rest[idx] && rest[idx] != ' ') idx++;
             while (rest[idx] == ' ') idx++;
+            long ret;
             if (!rest[idx]) {
-                long ret = chdir("/");
-                if (ret < 0) print("cd: failed\n");
+                ret = chdir("/");
             } else {
                 char dir[256];
                 unprotect(dir, rest + idx, sizeof(dir));
-                long ret = chdir(dir);
-                if (ret < 0) print("cd: failed\n");
+                ret = chdir(dir);
+            }
+            if (ret < 0) {
+                print("cd: failed\n");
+                return 1 << 8;
             }
             return 0;
         }

@@ -150,7 +150,7 @@ main():
 | `pid` | 打印当前 PID |
 | `echo [args...]` | 回显参数 |
 | `ls [path]` | 列出目录（`opendir`/`readdir`，每行一个名字，不含 `.` 和 `..`）；不带参数列工作目录；`path` 是文件则打印它的名字；打不开则报错并以状态 1 结束 |
-| `cd <path>` | 切换工作目录（`chdir`） |
+| `cd [path]` | 切换工作目录（`chdir`）；不带参数去 `/`；失败（目录不存在、是文件）打印 `cd: failed`、状态 1、工作目录不变，所以 `cd X && cmd` 在失败时不会运行 `cmd`。不支持 `cd -` 和 `cd ~` |
 | `pwd` | 打印当前工作目录（`getcwd`） |
 | `export KEY=VALUE` | 设置环境变量：同时写进内核的每任务环境表（`$NAME` 读它）和 C 库的 `environ`（shell 启动的程序继承它） |
 | `env` | 打印 `environ` 里所有的 `NAME=value`，每行一个 |
