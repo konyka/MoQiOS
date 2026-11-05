@@ -116,6 +116,46 @@ int main(int argc, char **argv, char **envp) {
     st = system("nosuchprogram_zz ; exit $?");
     check(exited(st, 127), "B: $? after a missing program is 127");
 
+    /* B5: a single quote keeps '$' literal; a backslash outside quotes (or before \\, \" or \$ inside double quotes) makes the next
+     * character plain text. */
+    unlink("/tmp/h227_q");
+    st = system("hello11 ; echo '$?' > /tmp/h227_q");
+    f = fopen("/tmp/h227_q", "r");
+    memset(qb, 0, sizeof qb);
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(exited(st, 0) && strcmp(qb, "$?\n") == 0, "B: '$?' in single quotes is not expanded");
+    unlink("/tmp/h227_q");
+    st = system("export H227S=zz ; echo '$H227S' \"$H227S\" > /tmp/h227_q");
+    f = fopen("/tmp/h227_q", "r");
+    memset(qb, 0, sizeof qb);
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(exited(st, 0) && strcmp(qb, "$H227S zz\n") == 0, "B: a single-quoted variable stays text, a double-quoted one is expanded");
+    unlink("/tmp/h227_q");
+    st = system("echo a\\;b > /tmp/h227_q");
+    f = fopen("/tmp/h227_q", "r");
+    memset(qb, 0, sizeof qb);
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(exited(st, 0) && strcmp(qb, "a;b\n") == 0, "B: a backslash makes ';' plain text");
+    unlink("/tmp/h227_q");
+    st = system("echo a\\ b > /tmp/h227_q");
+    f = fopen("/tmp/h227_q", "r");
+    memset(qb, 0, sizeof qb);
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(exited(st, 0) && strcmp(qb, "a b\n") == 0, "B: a backslash makes a space part of the word");
+    unlink("/tmp/h227_q");
+    st = system("echo \\$HOME \"q\\\"q\" > /tmp/h227_q");
+    f = fopen("/tmp/h227_q", "r");
+    memset(qb, 0, sizeof qb);
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(exited(st, 0) && strcmp(qb, "$HOME q\"q\n") == 0, "B: \\$ is a literal dollar and \\\" inside double quotes is a quote character");
+    unlink("/tmp/h227_q");
+    st = system("echo 'a\\b' \"c\\d\" > /tmp/h227_q");
+    f = fopen("/tmp/h227_q", "r");
+    memset(qb, 0, sizeof qb);
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(exited(st, 0) && strcmp(qb, "a\\b c\\d\n") == 0, "B: a backslash stays as it is in single quotes and before an ordinary character in double quotes");
+    unlink("/tmp/h227_q");
+
     /* C: the caller's signal state is exactly what it was */
     struct ksigaction a = { on_int, 0, 0, 0 };
     sigaction(SIGINT, &a, (struct ksigaction *)0);

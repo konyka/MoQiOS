@@ -56,17 +56,23 @@ static void out_str(const char *s) {
     write(g_out_fd, s, n);
 }
 
-/* Quoting. Before a line is split into list elements, pipeline commands and words, protect_quotes() rewrites it in place: the
- * quote characters are dropped, and inside them every character the splitting code would act on (space, tab, ';', '&', '|', '>',
- * '<') is replaced by a control byte 1..7 that no splitter looks for. The words that come out are turned back with unprotect(),
- * so a quoted separator ends up as plain text in the word. Single and double quotes work the same (no variable or escape
- * processing differs between them), an unterminated quote runs to the end of the line, and "" on its own makes no word. A
- * control byte 1..7 typed on the line is indistinguishable from a protected character. */
+/* Quoting. Before a line is split into list elements, pipeline commands and words, protect_quotes() rewrites it in place and
+ * drops the quote characters. Whatever the splitting code would act on (space, tab, ';', '&', '|', '>', '<') is replaced by a
+ * control byte 1..7 that no splitter looks for when it is quoted or follows a backslash; unprotect() turns the bytes back when
+ * a word is taken out, so the word holds the plain character. The rules:
+ *   - inside single quotes everything is literal, '$' included (it becomes LITERAL_DOLLAR so no variable is expanded);
+ *   - inside double quotes '$' is still expanded (QUOTED_DOLLAR, whose value stays protected), and a backslash before '\\', '"'
+ *     or '$' makes that character literal; before any other character the backslash stays;
+ *   - outside quotes a backslash makes the next character literal and is dropped (a lone backslash at the end stays);
+ *   - an unterminated quote runs to the end of the line, and "" on its own makes no word.
+ * A control byte 1..7, 14 or 8 typed on the line is indistinguishable from a protected character. */
 static const char PROTECTED_CHARS[] = " \t;&|><";
 
-/* A '$' inside quotes is written as this byte, so that expand_vars() knows the variable's value has to be protected too and the
- * value of "$X" stays one word whatever it holds. */
+/* A '$' inside double quotes is written as this byte, so that expand_vars() knows the variable's value has to be protected too
+ * and the value of "$X" stays one word whatever it holds. */
 #define QUOTED_DOLLAR '\010'
+/* A '$' that must not start an expansion (single quotes, or after a backslash). */
+#define LITERAL_DOLLAR '\016'
 
 static char protect_char(char ch) {
     for (const char *c = PROTECTED_CHARS; *c; c++)
@@ -74,18 +80,25 @@ static char protect_char(char ch) {
     return ch;
 }
 
+static char literal_char(char ch) {
+    return ch == '$' ? LITERAL_DOLLAR : protect_char(ch);
+}
+
 static void protect_quotes(char *line) {
     char *w = line;
     char quote = 0;
     for (const char *r = line; *r; r++) {
-        if (quote) {
-            if (*r == quote) {
-                quote = 0;
-                continue;
-            }
-            *w++ = *r == '$' ? QUOTED_DOLLAR : protect_char(*r);
+        if (quote == '\'') {
+            if (*r == '\'') quote = 0;
+            else *w++ = literal_char(*r);
+        } else if (quote == '"') {
+            if (*r == '"') quote = 0;
+            else if (*r == '\\' && (r[1] == '\\' || r[1] == '"' || r[1] == '$')) *w++ = literal_char(*++r);
+            else *w++ = *r == '$' ? QUOTED_DOLLAR : protect_char(*r);
         } else if (*r == '"' || *r == '\'') {
             quote = *r;
+        } else if (*r == '\\' && r[1]) {
+            *w++ = literal_char(*++r);
         } else {
             *w++ = *r;
         }
@@ -98,7 +111,8 @@ static void unprotect(char *dst, const char *src, int max) {
     int i = 0;
     for (; *src && i < max - 1; src++, i++) {
         unsigned char c = (unsigned char)*src;
-        dst[i] = (c >= 1 && c <= (unsigned char)(sizeof(PROTECTED_CHARS) - 1)) ? PROTECTED_CHARS[c - 1] : (char)c;
+        if (c == LITERAL_DOLLAR) dst[i] = '$';
+        else dst[i] = (c >= 1 && c <= (unsigned char)(sizeof(PROTECTED_CHARS) - 1)) ? PROTECTED_CHARS[c - 1] : (char)c;
     }
     dst[i] = '\0';
 }
